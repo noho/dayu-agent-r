@@ -1,0 +1,16 @@
+{
+  "pythonVersion": "3.11",
+  "include": [
+    "dayu",
+    "tests",
+    "utils"
+  ],
+  "exclude": [
+    "workspace",
+    "**/.session",
+    "**/__pycache__",
+    "**/node_modules",
+    "**/.*",
+    ".venv"
+  ]
+}
