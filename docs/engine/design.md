@@ -207,7 +207,7 @@ OLD `_compact_messages` 是规则化、确定性的本 run 应急压缩：保留
 - final response
 - SSE protocol error
 
-结论：OLD ToolTrace 是有价值的可观测性实现素材，但不应作为 NEW Engine 组件迁入。NEW Engine 只负责产出足够完整、稳定、强类型、可关联、可持久化、可重放的 `EngineEvent`；Host 负责建立事件订阅/observer 管线。tool trace 只是 Host 订阅 Engine 事件后的一个 observer，后续审计、指标、告警、调试采样、合规留痕也应复用同一事件订阅边界。trace schema 确认沿用 OLD `tool_trace_v2`。
+结论：OLD ToolTrace 是有价值的可观测性实现素材，但不应作为 NEW Engine 组件迁入。NEW Engine 只负责产出足够完整、稳定、强类型、可关联、可持久化、可重放的 `EngineEvent`；Host 负责建立事件订阅/observer 管线。tool trace 只是 Host 订阅 Engine 事件后的一个 observer，后续审计、指标、告警、调试采样、合规留痕也应复用同一事件订阅边界。OLD `tool_trace_v2` 可作为 Host observer 默认实现素材，NEW trace schema 真源由 Host/观测层迁移阶段确认。
 
 ### 2.10 Processors 与工具
 
@@ -253,6 +253,13 @@ UI -> Service -> Host -> Engine
 
 Engine 位于 Host 下游，提供 Agent、Runner、tool calling 协议等运行原语。Host 是生命周期、取消、治理、ToolRegistry、工具调度、长事务等待和 run/session 持久化真源。Engine 只消费 Host 注入的事实，不反向依赖 UI、Service、Host 的具体实现。
 
+术语固定口径：
+
+- Engine 是包/能力边界，对 Host 暴露函数式入口与稳定 contracts。
+- Agent 是 Engine 内部推理循环实现，负责 iteration、RunnerEvent 提升、tool outcome 处理和终态收口。
+- Runner 是 Engine 内部模型协议适配器，负责 provider 请求、响应流归一、usage 与资源关闭。
+- Host 稳定依赖 Engine 函数式入口和 contracts，不依赖具体 `AsyncAgent` / `AsyncOpenAIRunner` 类。
+
 设计下层组件接口时，应假设上层组件不存在。Engine 接口只能表达“运行一次 Agent 所需的输入与输出”以及“模型请求工具、工具结果回填”的抽象协议，不能泄漏 Host 如何排队、如何持久化、如何注册工具、UI 如何展示、Service 如何装配 scene。
 
 ## 5. Host -> Engine 接口文档
@@ -266,7 +273,7 @@ Engine 位于 Host 下游，提供 Agent、Runner、tool calling 协议等运行
 - Host 拥有 ToolRegistry / ToolRuntime，并把当前 run 可用工具投影为 `list[ToolSchema]` 与 ToolExecutor protocol；Engine 不注册工具、不执行工具发现。
 - Host 调用 `run_agent_messages(request)` 或等价函数式入口；该入口内部为本次 run 创建 Agent 与 Runner。
 - Engine 输出 `AsyncIterator[EngineEvent]`；Host 不直接消费 RunnerEvent/StreamEvent。
-- Host 负责消费事件、持久化 transcript、处理取消、执行工具、治理长事务等待/恢复和失败收口。
+- Host 负责消费事件、持久化 transcript、处理取消，并通过注入的 ToolExecutor / ToolRuntime 实现承担工具执行、长事务等待/恢复和失败收口。
 
 工具注册边界：
 
@@ -281,7 +288,7 @@ Engine 位于 Host 下游，提供 Agent、Runner、tool calling 协议等运行
 2. 模型返回 tool call 后，Runner 归一为 `ToolCallRequest` 事件，Agent 负责补齐 `run_id`、`iteration_id`、`tool_call_id`、参数 JSON 与调用序号。
 3. Agent 调用 Host 注入的 `ToolExecutor.execute(request)`。这是 Engine 唯一“调用工具”的方式；实际注册、校验、执行、权限、超时、审计、取消和长事务治理都在 Host ToolRuntime 内完成。
 4. ToolExecutor 返回 `ToolExecutionOutcome`：
-   - `completed`：包含 `ToolResultEnvelope`，Agent 产出 `tool_call_result` 事件，并把 LLM-facing tool message 注入下一轮 Runner 调用。
+   - `completed`：包含 `ToolResultEnvelope`，Agent 产出 `tool_result_accepted` 事件，并把 LLM-facing tool message 注入下一轮 Runner 调用。
    - `failed`：包含失败 `ToolResultEnvelope`，Agent 按普通工具失败结果注入上下文，让模型决定恢复或给出失败说明。
    - `awaiting`：包含 `ToolAwaitSpec` 与当前 job snapshot，Agent 产出 `tool_awaiting` / `run_suspended` 事件后停止本次 run；Host 记录 wait record，监控终态，并在终态后用新的 run-scoped Engine 调用恢复原始目标。
 5. Host 恢复时，不要求复用旧 Agent/Runner；Host 只需把终态工具结果作为权威消息或恢复输入放回新的 `AgentRunRequest`。
@@ -290,35 +297,20 @@ Engine 位于 Host 下游，提供 Agent、Runner、tool calling 协议等运行
 
 > 本节中的 `completed`、`failed`、`awaiting` 等名称只是文档标签。实现时 `ToolExecutionOutcome` 必须是强类型联合类型，例如 `ToolCompletedOutcome | ToolFailedOutcome | ToolAwaitingOutcome`，不能设计成 `status: str` 或字符串字面量加 payload。
 
-- `progressing`：工具仍在执行，但有进度、日志或阶段快照可报告。Engine 只转发 `tool_progress` / `tool_output_delta` 事件，不把进度文本强塞进下一轮 LLM 上下文；Host 决定 UI 展示、trace 记录和是否摘要化注入。
-- `approval_required`：工具需要用户、组织策略或安全守卫批准。Engine 产出 `tool_approval_required` / `run_suspended`，Host 负责审批 UI、超时、拒绝、恢复；批准后用新的 run-scoped Engine 调用继续。
-- `detached`：工具启动了后台任务，但当前 Agent run 不需要等待终态，可继续执行或给出“已启动”的语义回答。Host 持有 task record、通知策略、后续投递和取消入口。
-- `retry_after`：工具没有失败，但要求稍后重试，例如外部限流、上游暂不可用、市场数据窗口未到。Host 负责按 `retry_at` 或 backoff policy 唤醒，Engine 不在 LLM loop 内 sleep 或轮询。
-- `input_required`：工具需要补充人类输入或凭据绑定，不是权限批准本身。Host 产出待办/表单/对话请求；Engine 挂起本次 run，恢复时把用户补充输入作为权威消息进入新 run。
-- `cancelled` / `timed_out` / `lost`：治理型终态，区别于普通业务失败。Host 可选择注入为工具失败结果，也可直接终止 run；Engine 只保留可辨识事件和 trace。
-- `deduplicated`：Host 发现同一 session/run 已有等价活跃任务，返回已有 task/job snapshot，而不是重复启动。Engine 把它视为 `awaiting`、`detached` 或普通结果的别名投影，但 trace 保留去重事实。
-- `delegated`：工具调用被 Host 转成子任务、子 Engine run 或独立 worker。Host 管理 child run、权限、取消和结果投递；Engine 只接收委派事实、终态摘要或恢复输入。
-- `artifact_ready`：工具主结果是文件、媒体、表格、trace 或大对象引用。Engine 只接收 `ArtifactRef` 和 LLM-facing 摘要，实际存取由 Host/capability 仓储负责；财报文档仍必须通过 `dayu.fins.storage`。
-
-这些扩展是接口预留，不表示第一阶段全部实现。第一性原则上，只有与 Host 生命周期治理、取消、等待、审批、通知或 artifact 存取有关的机制才进入 ToolExecutionOutcome；具体业务状态不能直接泄漏进 Engine。
+第一阶段 Engine contract 只落地 `completed | failed | awaiting`。其它治理分支不进入初始 Engine contract，避免把 Host task ledger、审批、通知、artifact store、去重策略提前泄漏到 Engine。若后续确有需要，可在 #4 下逐个子 issue 论证并扩展强类型 outcome。
 
 扩展 outcome 的后续实现由 [issue #4](https://github.com/noho/dayu-agent-r/issues/4) 总跟踪；每个扩展分支必须单独开子 issue 明确边界、事件、Host 职责和测试策略。
 
 事件边界：
 
-- `iteration_start` 表示 Engine 新一轮 agent iteration 开始。
-- `tool_call_requested` 表示模型请求调用工具；Host 必须据此调用 Host 侧 ToolExecutor。
+- `iteration_started` 表示 Engine 新一轮 agent iteration 开始。
+- `tool_call_requested` 表示模型请求调用工具，是观测事件；Engine 随后通过 Host 注入的 `ToolExecutor.execute(request)` 调用工具，Host 不因该事件另行触发工具执行。
 - `tool_result_accepted` 表示 Host 侧 ToolExecutor 已返回结果，Engine 已接收并进入后续上下文注入。
 - `tool_awaiting` 表示工具返回长事务等待事实；Host 挂起 run、监控 job，并在终态后恢复 Agent。
 - `run_suspended` 表示 Engine 已因 Host 托管等待停止本次 run，后续恢复由 Host 重新发起。
-- `tool_progress` / `tool_output_delta` 表示 Host ToolRuntime 产出的进度或输出片段。
-- `tool_approval_required` 表示工具调用进入 Host 审批等待。
-- `tool_detached` 表示工具调用已转入 Host 后台任务账本。
-- `tool_retry_scheduled` 表示 Host 已接受稍后重试或唤醒计划。
-- `tool_artifact_ready` 表示工具产物已进入 Host/capability 仓储，Engine 只拿引用与摘要。
-- `done` 表示 Runner 单回合完成。
+- `runner_done` 表示 Runner 单回合完成，只是 EngineEvent 的观测事实，不是 run 终态。
 - `final_answer` 表示 Agent 对外最终回答完成。
-- `error` 表示运行错误事实。
+- `run_failed` 表示运行失败终态。
 - `run_cancelled` 表示 Host 取消请求已被 Engine 接受并收口为取消终态。取消不是普通 `error`，也不能伪装成工具失败或最终回答。
 
 生命周期边界：
@@ -402,12 +394,12 @@ class AsyncRunner(Protocol):
 - Runner 可接收 `list[ToolSchema]` 作为模型请求 schema，但不接收 ToolExecutor，也不执行工具。
 - Runner 负责模型请求、SSE/JSON 解析、HTTP 错误分类、usage 采集、资源关闭。
 - Runner 必须在 HTTP 建连、响应读取、SSE chunk 等待、重试 sleep 边界观察取消。
-- provider 私有 reasoning 标签只能在 Runner 边界内存在；跨过 Runner 后统一表现为 `reasoning_delta` 和 `content_complete.metadata.reasoning_content`。
+- provider 私有 reasoning 标签只能在 Runner 边界内存在；跨过 Runner 后统一表现为 `ReasoningDeltaData` 或 `ContentCompleteData.reasoning_content` 等强类型字段，不能塞进 metadata。
 
 Provider request extension 建议：
 
 - 已知 provider 参数必须建模为强类型配置，例如 OpenAI `reasoning_effort`、Anthropic `thinking`、Gemini `extra_body.google.thinking_config`、Qwen `enable_thinking`。
-- 对暂时无法统一抽象的新 provider，可以保留受控的 `ProviderRequestPatch`，但它属于 `RunnerSpec` 的 provider-specific 子结构，必须在配置加载时按 runner/provider schema 校验，不能作为 Host 或 Agent 临时透传袋。
+- 对暂时无法统一抽象的新 provider，可以在配置 adapter 内部保留受控的 `ProviderRequestPatch` 输入；公共 Engine contract 不直接接受任意 patch。
 - Runner 负责把 `RunnerSpec.provider_request` 编译成最终 HTTP request payload；Agent 和 Host 不拼 provider 私有 payload。
 
 必须重设的边界：
@@ -432,18 +424,13 @@ ToolExecutor 最小协议应由 Host 实现：
 
 ```python
 class ToolExecutor(Protocol):
-    def get_schemas(self) -> list[ToolSchema]: ...
-
     async def execute(
         self,
         request: ToolExecutionRequest,
     ) -> ToolExecutionOutcome: ...
-
-    def get_tool_display_info(
-        self,
-        name: str,
-    ) -> ToolDisplayInfo: ...
 ```
+
+`tool_schemas` 由 `AgentRunRequest` 单独提供，是本次 run 模型可见 schema 的唯一真源。Engine 不再从 ToolExecutor 读取 schema，也不读取 display info。展示名、参数摘要、UI enrichment 由 Host observer 或 UI 基于 Host ToolRegistry 自行处理。
 
 工具 schema：
 
@@ -457,12 +444,13 @@ class ToolExecutor(Protocol):
 工具执行上下文：
 
 - `run_id`
+- `session_id`
 - `iteration_id`
 - `tool_call_id`
 - `index_in_iteration`
 - `timeout_seconds`
 - `cancellation_token`
-- `trace_identity`
+- `correlation_id`：可选中性关联 ID；不是 ToolTraceRecorder 依赖。Host ToolRuntime 默认应使用 `session_id`、`run_id`、`iteration_id`、`tool_call_id` 与 EngineEvent sequence 建立关联。
 
 工具结果契约：
 
@@ -472,7 +460,7 @@ class ToolExecutor(Protocol):
 - `hint` 是给 LLM 的恢复建议。
 - `meta` 是运行时元信息。
 - `truncation` 是 Host ToolRuntime 的工具级截断续读信息。
-- `await_spec` 是 Host 托管长事务等待的稳定事实，至少包含 job identity、状态读取入口、恢复策略和超时策略；Engine 不理解具体业务 job。
+- `ToolAwaitSpec` 只能作为 `ToolAwaitingOutcome` 的显式字段返回；普通 `ToolResultEnvelope.meta` 不承载 run suspension / resume 语义。
 
 Host ToolRegistry / ToolRuntime 职责：
 
@@ -490,16 +478,49 @@ EngineEvent 稳定规则：
 - 事件必须包含 `event_id`、`sequence`、`occurred_at`、`session_id`、`run_id`、`type`、强类型 `data`。
 - iteration 相关事件必须包含 `iteration_id`；tool 相关事件必须包含 `tool_call_id`。
 - terminal event 必须明确：`final_answer`、`run_cancelled`、`run_failed`、`run_suspended`。
-- Runner usage、SSE protocol error、provider request id、raw payload 等可观测事实必须作为强类型事件 data 或 typed metadata 暴露给 Host。
-- `metadata` 只能承载扩展观察字段，不能承载显式契约语义；禁止用 `data: Any` 或开放 `metadata` 逃避类型设计。
+- Runner usage、SSE protocol error、provider request id、raw payload 等可观测事实必须作为强类型事件 data 暴露给 Host。
+- `metadata` 只能承载非契约的 debug tag、采样标记或 observer hint；禁止用 `data: Any`、开放 `metadata` 或 typed metadata 承载显式契约语义。若实现保留 metadata，其值类型必须是严格 JSON value union。
 - 事件顺序必须可恢复：同一 run 内 `sequence` 单调递增；Host observer 可依赖 `event_id` 做幂等写入。
 - `final_answer` 的 `filtered` 是受过滤完成态的稳定真源。
 
+EngineEvent data 类型草案：
+
+| Event type | Data 类型 | 必要字段 |
+| --- | --- | --- |
+| `iteration_started` | `IterationStartedData` | `iteration_id`, `iteration_index`, `message_count` |
+| `runner_content_delta` | `ContentDeltaData` | `iteration_id`, `delta` |
+| `runner_reasoning_delta` | `ReasoningDeltaData` | `iteration_id`, `delta` |
+| `runner_content_completed` | `ContentCompleteData` | `iteration_id`, `content`, `reasoning_content`, `finish_reason` |
+| `tool_call_requested` | `ToolCallRequestedData` | `iteration_id`, `tool_call_id`, `name`, `arguments`, `index_in_iteration` |
+| `tool_result_accepted` | `ToolResultAcceptedData` | `iteration_id`, `tool_call_id`, `name`, `outcome` |
+| `tool_awaiting` | `ToolAwaitingData` | `iteration_id`, `tool_call_id`, `await_spec` |
+| `context_compaction_requested` | `ContextCompactionRequestedData` | `iteration_id`, `budget_state`, `reason` |
+| `runner_usage_recorded` | `RunnerUsageData` | `iteration_id`, `prompt_tokens`, `completion_tokens`, `total_tokens` |
+| `provider_protocol_error` | `ProviderProtocolErrorData` | `iteration_id`, `error_code`, `message`, `provider_request_id`, `raw_payload` |
+| `runner_done` | `RunnerDoneData` | `iteration_id`, `finish_reason` |
+| `final_answer` | `FinalAnswerData` | `content`, `filtered`, `finish_reason` |
+| `run_suspended` | `RunSuspendedData` | `reason`, `resume_hint` |
+| `run_cancelled` | `RunCancelledData` | `reason`, `requested_at`, `accepted_at`, `finished_at` |
+| `run_failed` | `RunFailedData` | `error_code`, `message`, `recoverable` |
+
 RunnerEvent 稳定规则：
 
-- Runner 内部可产出 `RunnerEvent`，用于表达 provider 归一后的 content delta、reasoning delta、tool call delta、usage、done、SSE protocol error 等事实。
+- Runner 内部可产出 `RunnerEvent`，用于表达 provider 归一后的 content delta、reasoning delta、tool call delta、usage、runner_done、SSE protocol error 等事实。
 - `RunnerEvent` 不跨 Host 边界；Agent 必须把 RunnerEvent 提升为 EngineEvent，补齐 `session_id`、`run_id`、`iteration_id`、`event_id`、`sequence` 和 terminal 语义。
 - Runner 不产出 `final_answer`、`run_cancelled`、`run_failed`、`run_suspended` 等 Host 可见终态事件。
+
+RunnerEvent data 类型草案：
+
+| Event type | Data 类型 | 必要字段 |
+| --- | --- | --- |
+| `runner_content_delta` | `RunnerContentDeltaData` | `delta` |
+| `runner_reasoning_delta` | `RunnerReasoningDeltaData` | `delta` |
+| `runner_tool_call_delta` | `RunnerToolCallDeltaData` | `tool_call_index`, `tool_call_id`, `name_delta`, `arguments_delta` |
+| `runner_tool_calls_completed` | `RunnerToolCallsCompletedData` | `tool_calls` |
+| `runner_content_completed` | `RunnerContentCompletedData` | `content`, `reasoning_content`, `finish_reason` |
+| `runner_usage_recorded` | `RunnerUsageRecordedData` | `prompt_tokens`, `completion_tokens`, `total_tokens` |
+| `provider_protocol_error` | `RunnerProtocolErrorData` | `error_code`, `message`, `provider_request_id`, `raw_payload` |
+| `runner_done` | `RunnerDoneData` | `finish_reason` |
 
 Host 事件订阅与 Trace 稳定规则：
 
@@ -507,15 +528,16 @@ Host 事件订阅与 Trace 稳定规则：
 - Host 订阅 Engine 事件，并把事件分发给一个或多个 observer，例如 tool trace、审计、指标、告警、调试采样。
 - tool trace 是 Host observer 的一种实现，不是 Engine 组件；ToolRuntime 的工具执行 trace 也由 Host 侧合并。
 - OLD `JsonlToolTraceStore` / `V2ToolTraceRecorder` 可作为 Host 侧 tool trace observer 的实现素材复用。
-- trace schema 确认沿用 OLD `tool_trace_v2`；该 schema 由 Host/观测层维护，不属于 Engine 稳定接口。
+- OLD `tool_trace_v2` 可作为 Host observer 默认实现素材；是否作为 NEW trace schema 真源由 Host/观测层迁移阶段确认。Engine 只承诺事件事实足够重建该 schema。
 - 新增 observer 不应要求 Engine 增加反向依赖；若事件事实不足，应优先扩展稳定 EngineEvent 契约，而不是让 Engine 调用具体 observer。
 
 Cancellation 稳定规则：
 
 - Host 是取消真源，负责创建取消请求、记录取消原因和决定 run 终态。
-- NEW 第一阶段直接迁移 OLD 已有主路径：Host 发取消信号，Engine run supervisor 接收后触发 run-local cancellation token，Agent / Runner 在阻塞边界观察取消并收口。
-- Host -> Engine 取消的稳定协议是 `CancelRun(session_id, run_id, reason, requested_at)`。
-- Engine 接受取消后必须返回结构化终态：`run_cancelled` 事件或 `EngineRunOutcomeCancelled`。
+- NEW 第一阶段直接迁移 OLD 已有主路径：Host 发取消信号，Host 外层 run supervisor 或进程适配层触发 run-local cancellation token，Agent / Runner 在阻塞边界观察取消并收口。
+- Engine 公共入口不接收后续 `CancelRun(...)` 命令；`CancelRun(session_id, run_id, reason, requested_at)` 属于 Host API / 进程适配层命令，由 Host 映射为 `AgentRunRequest.cancellation_token` 的取消状态。
+- `CancellationToken` 必须能让 Engine 读取取消是否已请求、取消原因和请求时间；Engine 不读取 Host 的 cancel registry 或 run 管理表。
+- Engine 接受取消事实后必须返回结构化终态：`run_cancelled` 事件或 `EngineRunOutcomeCancelled`。
 - `EngineRunOutcomeCancelled` 至少包含 `session_id`、`run_id`、`reason`、`requested_at`、`accepted_at`、`finished_at`。
 - transport error、连接断开、RPC timeout 不是业务取消真源，只能作为 Host 治理输入，由 Host 判定是否转成取消、失败或 lost。
 - 取消优先于最终回答；Engine 收到取消后不得继续产出 `final_answer`。
@@ -546,9 +568,9 @@ Context budget 稳定规则：
 
 建议：
 
-- Core Engine 不直接拥有具体 DocumentProcessor。
-- 若需要通用文档解析能力，应迁到独立 document capability 包。
-- Fins 业务处理器、SEC/财报章节/XBRL/财务表增强规则留在 `dayu.fins`。
+- `Source`、`DocumentProcessor`、`ProcessorRegistry` 在 Engine / Host 边界不可见；Engine / Host 不直接拥有、导出、re-export、传递或匹配这些类型。
+- 文档解析与 source 类型属于 capability 内部实现；Host 只装配 capability 暴露出的 tool descriptor / schema / executor，不读取 processor registry 或 source 对象。
+- Fins 业务处理器、SEC/财报章节/XBRL/财务表增强规则留在 `dayu.fins` 或 Fins capability 内部。
 - Web tools 可作为 Host 侧可选 toolset/capability 迁移，不属于 core Engine。
 - 通用 doc tools 若迁移，只能定位为普通本地文件读取工具，必须与财报工具隔离。
 
@@ -569,8 +591,7 @@ Doc tools：
 Fins tools：
 
 - Fins 读取工具应由 `dayu.fins.tools` 暴露，并由 Host ToolRuntime 装配。
-- FinsToolService 通过 `dayu.fins.storage` 仓储协议读取公司元数据、源文档和 processed 文档。
-- 财报文档 Source 必须来自 `SourceDocumentRepositoryProtocol.get_source/get_primary_source` 等仓储入口。
+- FinsToolService 通过 `dayu.fins.storage` 仓储协议读取公司元数据、源文档和 processed 文档；source 对象是 Fins capability 内部实现事实，不进入 Engine / Host 接口。
 - 禁止任何 Engine/doc/web 工具绕过 Fins storage 直接访问财报文档目录。
 
 ## 12. OLD 接口处理建议
@@ -694,17 +715,17 @@ Engine 包根导出建议：
 - 这些类型承接 `llm_models.json` 的运行参数，但 Engine 不读取该 JSON 文件。
 - `llm_models.json` 中原 `extra_payloads` 的语义应迁为 `RunnerSpec.provider_request`，而不是进入 `Runner.call`。
 - 显式参数必须成为显式字段，不能塞进 `extra_payloads` 或 `metadata`。
-- provider 私有扩展只能进入强类型 provider extension 或受控 `ProviderRequestPatch`，不得污染公共 Agent 接口。
-- `ProviderRequestPatch` 若存在，类型应基于严格 JSON value union，且只能由配置解析层产生；业务代码不能动态拼接任意 payload。
+- provider 私有扩展只能进入强类型 provider extension；公共 Engine contract 不直接接受任意 provider patch。
+- `ProviderRequestPatch` 若存在，只能作为配置 adapter 内部输入，配置解析阶段必须校验 provider、schema_id、schema_version、允许 patch 的 JSON pointer 白名单和禁止覆盖的保留字段；业务代码不能动态拼接任意 payload。
 
 建议类型草案：
 
-- `ProviderRequestExtension = OpenAIReasoningExtension | AnthropicThinkingExtension | GeminiThinkingExtension | QwenThinkingExtension | ProviderRequestPatch`
+- `ProviderRequestExtension = OpenAIReasoningExtension | AnthropicThinkingExtension | GeminiThinkingExtension | QwenThinkingExtension | ValidatedProviderRequestExtension`
 - `OpenAIReasoningExtension`：`reasoning_effort: ReasoningEffort`
 - `AnthropicThinkingExtension`：`thinking: AnthropicThinkingConfig`，相关 beta header 仍属于 `RunnerSpec.headers`
 - `GeminiThinkingExtension`：`thinking_budget: int`、`include_thoughts: bool`
 - `QwenThinkingExtension`：`enable_thinking: bool`
-- `ProviderRequestPatch`：只用于未知或新 provider，必须带 `provider`、`schema_id`、`payload: JsonObject`
+- `ValidatedProviderRequestExtension`：只由配置 adapter 基于受控 `ProviderRequestPatch` 生成，必须带 `provider`、`schema_id`、`schema_version` 和已校验的 provider 私有字段；Agent/Host 调用 Engine 时不能传入原始 patch。
 
 ### 14.4 Tool Calling Protocol
 
@@ -716,12 +737,7 @@ Engine 包根导出建议：
 - `ToolExecutionOutcome`：ToolExecutor 返回给 Engine 的结果联合类型。
 - `ToolResultEnvelope`：普通完成/失败工具结果。
 - `ToolAwaitSpec`：Host 托管长事务等待、终态唤醒和 resume 的机器可读契约。
-- `ToolProgressSnapshot`：进度、日志、阶段、百分比、已产出 artifact 引用等非终态事实。
-- `ToolApprovalSpec`：审批请求、风险说明、允许动作、拒绝动作、超时策略。
-- `ToolDetachedTaskSpec`：Host 后台任务账本记录、通知策略、取消入口、投递目标。
-- `ToolRetrySpec`：重试时间、backoff、最大重试次数、重试原因。
-- `ToolInputRequestSpec`：需要用户补充的信息、输入 schema、超时策略。
-- `ToolArtifactRef`：Host/capability 仓储中的产物引用、摘要、MIME/type、权限域。
+- `ToolAwaitSnapshot`：Host 返回给 Engine 的等待态快照，只表达可恢复等待所需的中性治理事实，不表达 web/doc/fins 业务状态。
 
 稳定流程：
 
@@ -733,31 +749,19 @@ Engine 包根导出建议：
 6. ToolExecutor 返回普通结果时，Agent 注入下一轮 tool message。
 7. ToolExecutor 返回 `ToolAwaitSpec` 时，Agent 产出 suspended 事件并结束本次 run；Host 终态后重新调用函数式入口恢复。
 
-Outcome 联合类型建议：
+第一阶段 Outcome 联合类型建议：
 
 > 以下写法是接口语义速记，不是要求实现为字符串枚举。落地代码应使用独立 dataclass / typed class 组成封闭联合类型；序列化需要字符串时，只能在边界 adapter 使用 enum 映射。
 
 - `completed(result: ToolResultEnvelope)`
 - `failed(result: ToolResultEnvelope)`
-- `awaiting(await_spec: ToolAwaitSpec, snapshot: ToolProgressSnapshot | None)`
-- `progressing(snapshot: ToolProgressSnapshot)`
-- `approval_required(approval: ToolApprovalSpec)`
-- `detached(task: ToolDetachedTaskSpec)`
-- `retry_after(retry: ToolRetrySpec)`
-- `input_required(input_request: ToolInputRequestSpec)`
-- `cancelled(result: ToolResultEnvelope | None)`
-- `timed_out(result: ToolResultEnvelope | None)`
-- `lost(result: ToolResultEnvelope | None)`
-- `deduplicated(existing: ToolAwaitSpec | ToolDetachedTaskSpec | ToolResultEnvelope)`
-- `delegated(task: ToolDetachedTaskSpec)`
-- `artifact_ready(result: ToolResultEnvelope, artifacts: list[ToolArtifactRef])`
+- `awaiting(await_spec: ToolAwaitSpec, snapshot: ToolAwaitSnapshot | None)`
 
 约束：
 
 - `ToolExecutionOutcome` 必须是封闭可辨识联合类型，不能用 `status: str` 加任意 payload 逃避类型设计。
-- 非终态 outcome 只能让 Engine 产出事件或挂起 run，不能让 Engine 自己 sleep、轮询、审批或创建后台任务。
+- 第一阶段除 `awaiting` 外不定义其它非终态 outcome；后续治理分支必须经 #4 子 issue 单独确认。
 - Host 恢复 run 时必须提供结构化恢复输入，不依赖旧 Agent/Runner 实例仍然存活。
-- 大产物只通过引用流入 Engine；财报相关 artifact 的读取仍受 `dayu.fins.storage` 约束。
 
 ### 14.5 AsyncAgent
 
@@ -776,7 +780,7 @@ Outcome 联合类型建议：
 
 Agent tool calling 边界：
 
-- Agent 将模型 tool call 归一为 `ToolCallRequest` 事件。
+- Agent 将模型 tool call 归一为 `ToolCallRequest`，并发出 `tool_call_requested` 观测事件。
 - Agent 调用 Host 实现的 ToolExecutor 后，以 `ToolCallResultEnvelope` 或 `ToolAwaitSpec` 继续或挂起本次 run。
 - Agent 不持有 ToolRegistry，不决定工具执行并发度，不轮询外部长事务。
 
@@ -812,16 +816,16 @@ Agent tool calling 边界：
 - `ToolRegistry` 不进入 Engine；若复用 OLD 代码，只作为 Host ToolRuntime 内部实现素材。
 - 工具 metadata 由显式 descriptor 承载，减少函数对象动态属性读取。
 - 工具结果使用专用 envelope 类型，不用裸弱类型字典表达公共边界。
-- `ToolAwaitSpec` 进入工具结果 metadata，用于支持 Host 托管等待、终态唤醒与 Agent resume。
+- `ToolAwaitSpec` 只能作为 `ToolAwaitingOutcome` 的显式字段返回；普通 `ToolResultEnvelope.meta` 不承载 run suspension / resume 语义。
 
 ### 14.8 Processor
 
 建议：
 
 - 不进入 core Engine。
-- 通用文档解析迁入 document capability。
-- Fins processor 留在 `dayu.fins`。
-- Fins Source 只来自 `dayu.fins.storage`。
+- `Source`、`DocumentProcessor`、`ProcessorRegistry` 在 Engine / Host 不可见。
+- 通用文档解析属于 document capability 内部实现。
+- Fins processor 与 source 对象属于 `dayu.fins` / Fins capability 内部实现，外部只通过 `dayu.fins.storage` 仓储协议和 Fins tools 结果契约交互。
 
 ## 15. 外部 Agent 机制参考
 
@@ -855,7 +859,7 @@ Codex：
 
 对 Dayu 的接口启发：
 
-- `awaiting` 只覆盖“当前 run 等待外部长事务终态”；还需要为 `detached`、`progressing`、`approval_required`、`retry_after`、`input_required`、`cancelled/timed_out/lost`、`deduplicated`、`delegated`、`artifact_ready` 预留类型位。
+- `awaiting` 只覆盖“当前 run 等待外部长事务终态”；`detached`、`progressing`、`approval_required`、`retry_after`、`input_required`、`cancelled/timed_out/lost`、`deduplicated`、`delegated`、`artifact_ready` 等治理分支留给 issue #4 的子 issue 逐一论证，不进入第一阶段 Engine contract。
 - Host 必须拥有 task ledger、notification policy、approval UI、retry scheduler、artifact store、cleanup/maintenance；Engine 不持有这些治理真源。
 - Engine 只需要稳定事件和结构化 outcome，使 Host 能挂起、恢复、取消、审计和通知。
 
@@ -863,23 +867,25 @@ Codex：
 
 Engine 迁移顺序：
 
-1. 迁移 core contracts：强类型 EngineEvent、RunnerEvent、ToolResultEnvelope、ToolAwaitSpec、ToolCallRequest、ToolSchema、ToolExecutionContext、ToolExecutor protocol、AsyncRunner、取消辅助、context budget 原语。
-2. 新增 `RunnerSpec`、`RunnerCallOptions`、`AgentPolicy`，承接 `llm_models.json` 的运行参数；删除 `Runner.call(**extra_payloads)` 弱类型入口，但保留并强类型化模型级 provider request extension。
-3. 迁移 AsyncOpenAIRunner 的模型协议归一能力，不迁 AsyncCliRunner，不迁 Runner 工具执行职责。
-4. 重写 AsyncAgent，并拆分 iteration 调度、tool call request、tool result injection、continuation、context budget detection、fallback、duplicate guard。
-5. 实现函数式入口 `run_agent_messages` / `run_agent_and_wait`，入口内部创建 run-scoped Agent 与 Runner，并只向 Host 暴露 `EngineEvent`。
-6. 定义并实现 Host -> Engine tool calling 接口：Engine 接收 `tool_schemas` 与 `ToolExecutor` protocol，发出 `ToolExecutionRequest`，接收强类型 `ToolExecutionOutcome`，但不实现 ToolRegistry / ToolRuntime。
-7. 定义并实现 Host -> Engine 取消接口：`CancelRun(session_id, run_id, reason, requested_at)` 与 `EngineRunOutcomeCancelled` / `run_cancelled`。
-8. 定义并实现 `context_compaction_requested` / `run_suspended` 事件；Engine 只发请求，不实现 conversation memory 或语义压缩。OLD `_compact_messages` 如需迁移，只作为 emergency fallback。
-9. 在 ToolExecutionOutcome 中先落地 `completed`、`failed`、`awaiting` 和扩展位的封闭联合类型；扩展分支只定义接口，不在 Engine 阶段实现 Host 治理。
-10. 拆出 processors/tools/web/doc/fins 相关代码，不迁入 Engine core；Engine 只保留协议与事件边界。
-11. 根据实际落地同步 `dayu/engine/README.md`；涉及 Host、fins、capability 的 README 留给对应迁移阶段更新。
+1. 迁移 pure contracts：强类型 `EngineEvent`、`RunnerEvent`、`ToolResultEnvelope`、`ToolAwaitSpec`、`ToolAwaitSnapshot`、`ToolCallRequest`、`ToolSchema`、`ToolExecutionContext`、`ToolExecutionOutcome`、`ToolExecutor` protocol、`AsyncRunner`、取消观察原语、context budget 原语。
+2. 建立 Engine 包根导出与 import boundary 测试；先证明不导出兼容 wrapper / 旧 re-export，不导入 Host ToolRegistry、web/doc/fins tools、ToolTraceRecorder 或 `dayu.fins.storage` 具体实现。
+3. 新增 `RunnerSpec`、`RunnerCallOptions`、`AgentPolicy`，承接 `llm_models.json` 的运行参数；删除 `Runner.call(**extra_payloads)` 弱类型入口，并把 provider request extension 收敛为强类型配置。
+4. 迁移 AsyncOpenAIRunner 的模型协议归一能力，先只产出 `RunnerEvent`；不迁 AsyncCliRunner，不迁 Runner 工具执行职责。
+5. 实现函数式入口骨架 `run_agent_messages` / `run_agent_and_wait`，入口内部创建 run-scoped Agent 与 Runner，并只向 Host 暴露 `EngineEvent`。
+6. 实现 Agent 最小 loop：无工具场景下完成 iteration 调度、RunnerEvent 提升、usage 记录、final_answer、失败终态和资源收口。
+7. 实现 completed / failed tool loop：Engine 接收 `tool_schemas` 与 `ToolExecutor` protocol，发出 `ToolExecutionRequest`，接收 `completed` / `failed` outcome，注入下一轮 tool message；不实现 ToolRegistry / ToolRuntime。
+8. 实现 awaiting / suspended 主链路：ToolExecutor 返回 `awaiting` 时，Agent 产出 `tool_awaiting` 与 `run_suspended`，结束本次 run；恢复由后续 Host 迁移基于新 run request 完成，Engine 阶段只定义恢复输入契约。
+9. 实现取消观察主链路：`AgentRunRequest.cancellation_token` 是 Engine 可见取消入口；Engine 观察取消并产出 `run_cancelled` / `EngineRunOutcomeCancelled`。`CancelRun(session_id, run_id, reason, requested_at)` 只作为 Host API / 进程适配层命令，不进入 Engine 公共 contract。
+10. 定义并实现 `context_compaction_requested` 事件；Engine 只发请求，不实现 conversation memory 或语义压缩。OLD `_compact_messages` 如需迁移，只作为 emergency fallback。
+11. 清理 processors/tools/web/doc/fins 与 Engine core 的导入关系；`Source`、`DocumentProcessor`、`ProcessorRegistry` 对 Engine / Host 不可见，Engine 只保留协议与事件边界。
+12. 根据实际落地同步 `dayu/engine/README.md`；涉及 Host、fins、capability 的 README 留给对应迁移阶段更新。
 
 Host 接口要求：
 
-- Host 提供 `AgentRunRequest`，包括 `session_id`、`run_id`、messages、`RunnerSpec`、`RunnerCallOptions`、`AgentPolicy`、`tool_schemas`、`ToolExecutor` 和 cancellation token / cancel handle。
+- Host 提供 `AgentRunRequest`，包括 `session_id`、`run_id`、messages、`RunnerSpec`、`RunnerCallOptions`、`AgentPolicy`、`tool_schemas`、`ToolExecutor` 和 run-local cancellation token。
 - Host 消费 `AsyncIterator[EngineEvent]`，并自行决定 transcript 持久化、tool trace observer、审计、指标、UI 转发。
 - Host 实现 ToolExecutor / ToolRuntime / ToolRegistry；Engine 只依赖协议。
+- Host 外层取消命令映射为 run-local cancellation token；Engine 不持有跨 run cancel registry。
 - Host 负责 conversation memory、语义压缩、`context_compaction_requested` 后的消息重构与恢复。
 - Host 负责 `await_spec` 的 wait record、monitor、resume；Engine 只产出 awaiting/suspended 事实。
 - Host 负责 web/doc/fins toolset/capability 装配；财报文档读取仍只能通过 `dayu.fins.storage`。
