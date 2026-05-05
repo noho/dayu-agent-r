@@ -36,6 +36,10 @@ Host 稳定依赖以下表面：
 - `dayu.engine.contracts`
 - `dayu.contracts`
 
+`run_agent_messages` 返回异步生成器；调用方必须迭代至结束，或在提前
+停止消费时显式调用 `aclose()`，以触发 Runner 关闭和 run-scoped 资源
+收尾。`run_agent_and_wait` 会完整消费该事件流。
+
 Host 不应依赖以下实现细节：
 
 - 私有 `_AsyncAgent`

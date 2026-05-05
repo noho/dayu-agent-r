@@ -59,7 +59,7 @@ from dayu.engine.runners.openai.runner import AsyncOpenAIRunner
 
 _LOGGER: logging.Logger = logging.getLogger(__name__)
 
-_ITERATION_INDEX: int = 0
+_FIRST_ITERATION_INDEX: int = 0
 _FIRST_ITERATION_ORDINAL: int = 1
 _DEFAULT_CANCEL_REASON: str = "cancelled"
 _ERROR_MAX_ITERATIONS_EXCEEDED: str = "max_iterations_exceeded"
@@ -154,7 +154,7 @@ class _AsyncAgent:
         self._acquire_run_slot()
         try:
             if self._is_cancelled():
-                yield await self._make_cancelled_terminal_after_close()
+                yield await self._make_cancelled_terminal_with_close()
                 return
 
             async for event in self._run_once():
@@ -168,7 +168,7 @@ class _AsyncAgent:
 
             if not self._terminal_seen:
                 if self._is_cancelled():
-                    yield await self._make_cancelled_terminal_after_close()
+                    yield await self._make_cancelled_terminal_with_close()
                     return
                 yield self._make_terminal_failed(
                     RunFailedData(
@@ -220,14 +220,14 @@ class _AsyncAgent:
             event_type=EngineEventType.ITERATION_STARTED,
             data=IterationStartedData(
                 iteration_id=iteration_id,
-                iteration_index=_ITERATION_INDEX,
+                iteration_index=_FIRST_ITERATION_INDEX,
                 message_count=len(self._request.messages),
             ),
             occurred_at=_utc_now(),
         )
 
         if self._request.agent_policy.max_iterations < 1:
-            yield await self._make_failed_or_cancelled_after_close(
+            yield await self._make_failed_or_cancelled_terminal_with_close(
                 RunFailedData(
                     error_code=_ERROR_MAX_ITERATIONS_EXCEEDED,
                     message=_MAX_ITERATIONS_EXCEEDED_MESSAGE,
@@ -237,7 +237,7 @@ class _AsyncAgent:
             return
 
         if self._is_cancelled():
-            yield await self._make_cancelled_terminal_after_close()
+            yield await self._make_cancelled_terminal_with_close()
             return
 
         try:
@@ -263,7 +263,7 @@ class _AsyncAgent:
         except asyncio.CancelledError:
             raise
         except Exception as exc:
-            yield await self._make_failed_or_cancelled_after_close(
+            yield await self._make_failed_or_cancelled_terminal_with_close(
                 RunFailedData(
                     error_code=_ERROR_RUNNER_EXCEPTION,
                     message=type(exc).__name__,
@@ -273,14 +273,14 @@ class _AsyncAgent:
             return
 
         if self._is_cancelled():
-            yield await self._make_cancelled_terminal_after_close()
+            yield await self._make_cancelled_terminal_with_close()
             return
         if self._failure_candidate is not None:
-            yield await self._make_failed_or_cancelled_after_close(
+            yield await self._make_failed_or_cancelled_terminal_with_close(
                 self._failure_candidate
             )
             return
-        yield await self._make_failed_or_cancelled_after_close(
+        yield await self._make_failed_or_cancelled_terminal_with_close(
             RunFailedData(
                 error_code=_ERROR_RUNNER_ABNORMAL_STOP,
                 message=_RUNNER_ABNORMAL_STOP_MESSAGE,
@@ -408,18 +408,18 @@ class _AsyncAgent:
         """
 
         if self._tool_call_seen:
-            return await self._make_failed_or_cancelled_after_close(
+            return await self._make_failed_or_cancelled_terminal_with_close(
                 self._tool_call_failure()
             )
         if runner_event.type != RunnerEventType.RUNNER_DONE:
             return None
 
         if self._is_cancelled():
-            return await self._make_cancelled_terminal_after_close()
+            return await self._make_cancelled_terminal_with_close()
 
         finish_reason = self._last_finish_reason
         if finish_reason is FinishReason.ERROR:
-            return await self._make_failed_or_cancelled_after_close(
+            return await self._make_failed_or_cancelled_terminal_with_close(
                 self._failure_candidate
                 or RunFailedData(
                     error_code=_ERROR_RUNNER_ERROR_DONE_WITHOUT_DETAIL,
@@ -428,7 +428,7 @@ class _AsyncAgent:
                 )
             )
         if finish_reason is FinishReason.TOOL_CALLS:
-            return await self._make_failed_or_cancelled_after_close(
+            return await self._make_failed_or_cancelled_terminal_with_close(
                 self._tool_call_failure()
             )
         return await self._make_final_or_cancelled_after_close(
@@ -446,7 +446,7 @@ class _AsyncAgent:
         """
 
         if self._is_cancelled():
-            return await self._make_cancelled_terminal_after_close()
+            return await self._make_cancelled_terminal_with_close()
         finish_reason = self._last_finish_reason or FinishReason.STOP
         content = self._completed_content
         if content is None:
@@ -459,7 +459,7 @@ class _AsyncAgent:
             )
         )
 
-    async def _make_failed_or_cancelled_after_close(
+    async def _make_failed_or_cancelled_terminal_with_close(
         self, failure: RunFailedData
     ) -> EngineEvent:
         """按取消优先级构造失败终态。
@@ -470,10 +470,10 @@ class _AsyncAgent:
         """
 
         if self._is_cancelled():
-            return await self._make_cancelled_terminal_after_close()
+            return await self._make_cancelled_terminal_with_close()
         return self._make_terminal_failed(failure)
 
-    async def _make_cancelled_terminal_after_close(self) -> EngineEvent:
+    async def _make_cancelled_terminal_with_close(self) -> EngineEvent:
         """关闭 Runner 后构造取消终态。
 
         :returns: ``RUN_CANCELLED`` terminal。
@@ -669,7 +669,10 @@ async def run_agent_messages(
     """运行 Agent 并流式返回 EngineEvent。
 
     :param request: Agent run 请求。
-    :returns: EngineEvent 异步流。
+    :returns: EngineEvent 异步生成器。调用方必须迭代至生成器结束；若
+        提前停止消费，必须显式调用 ``aclose()``，以触发 Runner 关闭
+        与 run-scoped 资源收尾。:func:`run_agent_and_wait` 会完整消费
+        本生成器。
     :raises asyncio.CancelledError: 外层 task 被取消时透传。
     :raises Exception: Runner 构造失败时透传。
     """
