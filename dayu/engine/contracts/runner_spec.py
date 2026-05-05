@@ -21,11 +21,19 @@ from typing import TypeAlias
 
 
 class OpenAIReasoningEffort(StrEnum):
-    """OpenAI reasoning effort 枚举。"""
+    """OpenAI reasoning effort 枚举。
+
+    成员：
+
+    - ``LOW`` / ``MEDIUM`` / ``HIGH``：标准三档推理强度。
+    - ``NONE``：显式关闭推理（OLD ``llm_models.json`` 已使用
+      ``"none"`` 字面量）。
+    """
 
     LOW = "low"
     MEDIUM = "medium"
     HIGH = "high"
+    NONE = "none"
 
 
 @dataclass(frozen=True, slots=True)
@@ -96,6 +104,10 @@ class RunnerSpec:
     :param headers: 附加头映射。
     :param supports_tool_calling: 该 Runner 是否支持工具调用。
     :param supports_streaming: 该 Runner 是否支持流式输出。
+    :param supports_stream_usage: 该 Runner 在流式协议下是否支持
+        ``stream_options.include_usage``。仅当为 ``True`` 时 Runner
+        会在请求中追加 ``stream_options.include_usage=True``；为
+        ``False`` 时**不**写入该字段。
     :param default_timeout_seconds: 默认请求超时秒数。
     :param max_retries: 最大重试次数。
     :param provider_request: provider 请求扩展；为 ``None`` 表示不带扩展。
@@ -108,6 +120,7 @@ class RunnerSpec:
     headers: Mapping[str, str]
     supports_tool_calling: bool
     supports_streaming: bool
+    supports_stream_usage: bool
     default_timeout_seconds: float
     max_retries: int
     provider_request: ProviderRequestExtension | None

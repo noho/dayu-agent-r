@@ -197,3 +197,58 @@ def test_engine_event_metadata_annotation_is_mapping_jsonvalue() -> None:
     assert found == ["Mapping[str, JsonValue] | None"], (
         f"EngineEvent.metadata annotation unexpected: {found}"
     )
+
+
+def _find_field_annotation(
+    file_path: Path, class_name: str, field_name: str
+) -> str | None:
+    """返回指定 dataclass 字段的注解源代码。
+
+    :param file_path: 源码路径。
+    :param class_name: 类名。
+    :param field_name: 字段名。
+    :returns: 注解源码字符串，找不到则返回 ``None``。
+    """
+
+    source = file_path.read_text(encoding="utf-8")
+    tree = ast.parse(source)
+    for node in ast.walk(tree):
+        if isinstance(node, ast.ClassDef) and node.name == class_name:
+            for body_node in node.body:
+                if (
+                    isinstance(body_node, ast.AnnAssign)
+                    and isinstance(body_node.target, ast.Name)
+                    and body_node.target.id == field_name
+                ):
+                    return ast.unparse(body_node.annotation)
+    return None
+
+
+def test_assistant_tool_call_provider_state_annotation_is_typed_union() -> None:
+    """``AssistantToolCall.provider_state`` 必须为 ``ToolCallProviderState | None``。
+
+    严禁退化为 ``dict[str, Any]`` / ``Mapping[str, Any]`` / ``object``。
+    """
+
+    file_path = _engine_root() / "contracts" / "messages.py"
+    annotation = _find_field_annotation(
+        file_path, "AssistantToolCall", "provider_state"
+    )
+    assert annotation == "ToolCallProviderState | None", (
+        f"AssistantToolCall.provider_state annotation unexpected: {annotation}"
+    )
+
+
+def test_runner_http_error_data_error_code_annotation_is_enum() -> None:
+    """``RunnerHTTPErrorData.error_code`` 必须为 ``RunnerHTTPErrorCode`` 枚举。
+
+    严禁退化为裸 ``str``。
+    """
+
+    file_path = _engine_root() / "contracts" / "runner_events.py"
+    annotation = _find_field_annotation(
+        file_path, "RunnerHTTPErrorData", "error_code"
+    )
+    assert annotation == "RunnerHTTPErrorCode", (
+        f"RunnerHTTPErrorData.error_code annotation unexpected: {annotation}"
+    )

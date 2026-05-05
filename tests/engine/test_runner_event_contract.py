@@ -15,6 +15,7 @@ from dayu.engine.contracts.runner_events import (
     RunnerDoneData,
     RunnerEvent,
     RunnerEventType,
+    RunnerHTTPErrorData,
     RunnerProtocolErrorData,
     RunnerReasoningDeltaData,
     RunnerToolCallDeltaData,
@@ -31,6 +32,7 @@ RUNNER_EVENT_TYPE_TO_DATA: dict[RunnerEventType, type] = {
     RunnerEventType.RUNNER_CONTENT_COMPLETED: RunnerContentCompletedData,
     RunnerEventType.RUNNER_USAGE_RECORDED: RunnerUsageRecordedData,
     RunnerEventType.PROVIDER_PROTOCOL_ERROR: RunnerProtocolErrorData,
+    RunnerEventType.RUNNER_HTTP_ERROR: RunnerHTTPErrorData,
     RunnerEventType.RUNNER_DONE: RunnerDoneData,
 }
 

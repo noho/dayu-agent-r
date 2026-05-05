@@ -102,7 +102,7 @@ UI -> Service -> Host -> Engine
 - 某一层为了实现另一层内部类型而反向贴合该层的设计。
 - 公共契约中出现 `Any`、`object`、裸 `dict`、裸 `list`、开放 metadata 语义袋。
 
-## 6. Engine 契约专项
+### 5.1. Engine 契约专项
 
 检查项：
 
@@ -122,7 +122,7 @@ UI -> Service -> Host -> Engine
 - Engine contract 导出实现细节或占位入口。
 - 弱类型绕过封闭联合或事件 data。
 
-## 7. Runner 专项
+## 6. Runner 专项
 
 当仓库中存在 Runner 实现时，必须检查：
 
@@ -133,6 +133,13 @@ UI -> Service -> Host -> Engine
 - provider 私有参数必须来自强类型 provider extension 或显式字段。
 - OpenAI-compatible payload、SSE、tool call delta、usage、finish reason、HTTP error、retry/backoff、reasoning 标签处理必须以当前代码中的协议 adapter 直接证据审查。
 - cancellation 只作为阻塞边界观察；结构化取消终态由 Engine / Agent 层提升。
+- Runner 输入必须只来自 Runner 调用契约与显式运行规格，不得依赖 Host / Service 的运行状态。
+- 消息 payload 必须能正确表达 system / user / assistant / tool 等消息角色。
+- assistant message 中的 reasoning content、tool calls、provider extra content 必须能按契约进入下一轮请求。
+- tool call delta 必须能稳定聚合为完整工具调用，不得因 chunk 顺序、index 缺失、arguments 分片或 arguments null 破坏状态。
+- Runner 只能表达单次模型调用状态机，不得越界实现多轮 Agent loop。
+- stream 与 non-stream 两条路径的最终事件语义必须一致。
+- content delta、reasoning delta、tool call delta、tool calls completed、content completed、usage、done / error / cancel 边界不得存在顺序冲突。
 
 必须报告：
 
@@ -140,8 +147,10 @@ UI -> Service -> Host -> Engine
 - Runner 导入 Host / trace / fins / tools / processors。
 - Runner 把取消、失败或最终回答提升成 Host 可见终态。
 - Runner 资源关闭不完整，或取消后留下 HTTP session、response、stream task。
+- RunnerEvent 顺序无法被后续 Engine loop 无歧义消费。
+- 使用隐式布尔标记、魔法字符串或弱类型 payload 表达关键状态迁移。
 
-## 8. 状态机 Review
+## 7. 状态机 Review
 
 凡是存在“真源状态 + 触发条件 + 状态写入 + 对外事件 / 副作用 + 后续收敛”的闭环，都按状态机审查。
 
@@ -163,6 +172,22 @@ UI -> Service -> Host -> Engine
 - 已存在 Agent loop 时，检查 Agent iteration 状态机。
 - 已存在 Host 持久化和恢复能力时，检查 pending turn、reply outbox、conversation archive 等状态机。
 
+Runner 协议状态机最低检查场景：
+
+- content-only answer。
+- reasoning + content。
+- tool call streaming。
+- tool call arguments 分片。
+- usage-only chunk。
+- 正常 done。
+- 协议错误。
+- HTTP / network / timeout 错误。
+- retry 后成功。
+- retry 耗尽。
+- cancellation before request。
+- cancellation during stream。
+- close 后资源释放。
+
 必须报告：
 
 - 状态真源不唯一。
@@ -170,7 +195,7 @@ UI -> Service -> Host -> Engine
 - 异常路径和正常路径使用不同转换规则。
 - 外部事件、返回值、持久化事实互相冲突。
 
-## 9. 参数传递与生效点
+## 8. 参数传递与生效点
 
 对每个关键参数检查：
 
@@ -185,7 +210,7 @@ UI -> Service -> Host -> Engine
 - 参数在链路中被重新默认化、覆盖或丢失。
 - 显式参数被塞入 metadata、extra payload、开放 JSON 袋。
 
-## 10. 非预期输入
+## 9. 非预期输入
 
 必须主动检查：
 
@@ -206,7 +231,7 @@ UI -> Service -> Host -> Engine
 
 “碰巧没崩”“吞错继续跑”“落入正常分支但语义已错”都必须报告。
 
-## 11. README 与 docs
+## 10. README 与 docs
 
 README 只写当前已落地事实，不写未来设计。
 
@@ -219,7 +244,7 @@ README 只写当前已落地事实，不写未来设计。
 
 如果代码已经落地但文档仍停留在草案或迁移语境，应报告文档漂移。
 
-## 12. 验证要求
+## 11. 验证要求
 
 每次 code review 必须记录实际运行结果。
 
@@ -234,7 +259,7 @@ git status --short
 
 若测试或 pyright 失败，除非已有明确外部环境原因，否则作为阻塞问题。
 
-## 13. 本文档维护规则
+## 12. 本文档维护规则
 
 每次完成一个可合并的代码切片，都必须检查并更新本文档：
 
@@ -242,5 +267,3 @@ git status --short
 - 删除或降级已不适用的草案、临时表述。
 - 保持架构口径为 `UI -> Service -> Host -> Engine`。
 - 保持契约归属规则与当前代码真源一致。
-
-本文档不得超前承诺未实现能力，也不得要求 review Agent 理解迁移过程。
