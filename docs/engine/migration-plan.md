@@ -52,7 +52,7 @@
 | Phase 0 | pure contracts 与 import boundary tests | 先落地 Engine 最小稳定 contract 和包边界测试 | `design.md` 第 9、14、16 节，`review.md` 通过结论 | 强类型 contracts、包根导出约束、import boundary tests | 不迁 `AsyncAgent`、`AsyncOpenAIRunner`、ToolRegistry、doc/web/fins tools | contracts 可被测试导入；架构测试能阻止旧 re-export 和反向依赖 |
 | Phase 1 | Runner protocol 与 OpenAI-compatible Runner | 迁移 provider 协议归一能力，Runner 只产出 RunnerEvent | Phase 0 contracts，OLD `async_openai_runner.py` 可复用片段 | `AsyncRunner` protocol 当前实现、RunnerEvent 流、RunnerSpec provider extension | 不迁 `AsyncCliRunner`，不迁 Runner 工具执行，不保留 `call(**extra_payloads)` | Runner 测试证明 tool call 只产生 RunnerEvent，不调用 ToolExecutor |
 | Phase 1.5 | Log / Runner diagnostics 与 SSE idle | 引入 `dayu.runtime` 公共运行时基础设施（log 装配 + cancellation race helper），给 Phase 1 Runner 补齐运行时边界日志，落地 chunk 级 SSE idle heartbeat / hard timeout（issue #6） | Phase 1 Runner、`dayu/contracts/cancellation.py`、OLD `dayu/log.py` / `sse_parser.py` 证据 | `dayu/runtime/log.py`、`dayu/runtime/cancellation.py`、Runner 边界 logger、`RunnerSpec.stream_idle_*` 字段、idle 控制流 | 不污染 RunnerEvent / EngineEvent；不新增 Engine / Runner 公共终态异常；Engine 不 import `dayu.runtime.log`；不迁 OLD `Log` 单例 wrapper；不写 README（统一推迟到 Phase 6） | 诊断字段在 caplog 中可见；idle 测试集（disabled / heartbeat / timeout / timeout-only / cancel wins / retry / aclose / outer cancel）全绿；事件契约无 log/idle 字段污染；issue #6 可关闭 |
-| Phase 2 | Agent run loop 骨架 | 建立 run-scoped Agent 和函数式入口 | Phase 0 contracts，Phase 1 Runner，Phase 1.5 logger / cancellation runtime | `run_agent_messages` / `run_agent_and_wait` 骨架、RunnerEvent -> EngineEvent 提升、terminal 收口 | 不接入 ToolRegistry，不实现 long-running tool waiting，不迁 doc/web/fins 工具 | 无工具 run 可完成 final_answer / run_failed / run_cancelled，并关闭 Runner |
+| Phase 2 | Agent run loop 骨架 | 建立 run-scoped Agent 和函数式入口 | Phase 0 contracts，Phase 1 Runner，Phase 1.5 logger / cancellation runtime | `run_agent_messages` / `run_agent_and_wait` 骨架、RunnerEvent -> EngineEvent 提升、terminal 收口、`dayu/engine/README.md` 当前事实手册 | 不接入 ToolRegistry，不实现 long-running tool waiting，不迁 doc/web/fins 工具 | 无工具 run 可完成 final_answer / run_failed / run_cancelled，并关闭 Runner；Engine README 只写 Phase 2 已落地事实 |
 | Phase 3 | Host 注入 ToolExecutor 的 tool calling 闭环 | 建立普通工具调用闭环 | Phase 2 Agent loop，Phase 0 ToolExecutor contract | 模型 tool call -> ToolExecutionRequest -> ToolExecutionOutcome -> tool message 注入下一轮 | Engine 不注册工具，不执行权限、审计、路径白名单、长事务治理 | completed / failed 工具结果可进入下一轮；无双执行、无事件驱动工具执行 |
 | Phase 4 | completed / failed / awaiting outcome | 落地三类 outcome，awaiting 只产出挂起事实 | Phase 3 tool loop，ToolAwaitSpec / ToolAwaitSnapshot | `tool_awaiting` / `run_suspended` 事件，awaiting outcome 穷尽匹配测试 | 不实现 approval、detached、retry_after、artifact_ready 等扩展 outcome | awaiting 不轮询、不 sleep、不创建 Host wait record；只结束本次 run |
 | Phase 5 | context budget、continuation、取消收口 | 迁移确定性预算、续写、fallback、取消优先级 | Phase 2-4 Agent/Runner 主链路 | budget state、continuation/fallback 最小策略、取消 terminal 收口 | 不实现 conversation memory，不做语义压缩，不写 transcript | 取消优先于 final_answer；context_compaction_requested 只发事件 |
@@ -328,6 +328,9 @@
 - 实现 Agent 实例 fail-fast 并发保护。
 - 实现 final_answer 前取消检查。
 - 实现 basic max iteration / basic fallback / provider error 收口的最小骨架。
+- 新增 `utils/` 下的手动 smoke 脚本，用简单 prompt 真实调用多个 OpenAI-compatible provider，开启 DEBUG 日志，验证 Phase 2 AsyncAgent 主链路与 Phase 1.5 Runner diagnostics 可以协同工作。
+- smoke 脚本的 provider case 可以参考 OLD `llm_models.json` 后在脚本内写死少量非敏感配置；脚本运行时不得依赖 OLD 仓库。
+- smoke 脚本只能从环境变量读取 API key，不得把 key、headers、完整 payload、完整 prompt 或财报内容写入日志。
 
 ### 允许复用的 OLD implementation 片段
 
@@ -335,6 +338,7 @@
 - `_acquire_run_slot` 的并发 fail-fast 思路。
 - `_run_loop` 中 iteration 与 final_answer 收敛的场景判断，但必须拆分，不能照搬 God function。
 - content_filter / length finish_reason 的场景证据。
+- OLD `llm_models.json` 中少量 OpenAI-compatible provider 的 endpoint / model / provider extension 形态可作为 smoke 脚本配置证据，但不得运行时读取 OLD 文件。
 
 ### 禁止迁移项
 
@@ -346,6 +350,8 @@
 - transcript 持久化。
 - conversation memory。
 - 语义压缩。
+- smoke 脚本不得进入 `dayu/` 生产包，不得作为 pytest 常规用例，不得成为 provider 行为的单元测试真源。
+- smoke 脚本不得引入 OLD 运行时依赖或读取 OLD 仓库文件。
 
 ### 测试要求
 
@@ -357,17 +363,22 @@
 - Runner close 在 success / failure / cancellation 中都执行。
 - event_id 幂等、sequence 单调、terminal event 唯一性测试。
 - Agent 实例并发 fail-fast 测试。
+- smoke 脚本必须可通过命令行手动运行，并在缺少必要 API key 时明确跳过 / 友好报错；该脚本不纳入常规 pytest。
 
 ### pyright 要求
 
 - Agent loop 内部状态和事件提升必须有完整类型。
 - 不允许用裸 dict 传递 EngineEvent data。
 - 不允许为了简化聚合使用 `Any`。
+- smoke 脚本若纳入 pyright 检查范围，也必须保持完整类型；若因手动工具属性需要例外，必须在计划中说明边界，不得影响生产包类型质量。
 
 ### README / docs 同步要求
 
-- 若函数式入口落地，应更新 `dayu/engine/README.md` 的公共入口和生命周期说明。
-- 若包根导出实际变化，应更新对应 README 或在 PR 中说明不更新原因。
+- Phase 2 必须新建 `dayu/engine/README.md`，这是用户明确要求的 README 例外。
+- `dayu/engine/README.md` 只写 Phase 2 已经落地的当前事实：Engine 职责边界、`UI -> Service -> Host -> Engine`、Host 与 Engine 的稳定依赖表面、`run_agent_messages` / `run_agent_and_wait`、run-scoped Agent 生命周期、RunnerEvent -> EngineEvent 提升、无工具主链路状态机、`final_answer` / `run_failed` / `run_cancelled` 终态、取消优先级、Runner close、Phase 1 OpenAI-compatible Runner 与 Phase 1.5 diagnostics / SSE idle 的当前位置。
+- `dayu/engine/README.md` 不得把 ToolExecutor tool calling 闭环、awaiting / long-running tool waiting、Host ToolRegistry、trace store、transcript 持久化、conversation memory、context budget / continuation 写成可用能力。
+- 如果新增或调整测试分层且属于 `tests/README.md` 职责范围，可以更新 `tests/README.md`。
+- 除 `dayu/engine/README.md` 与必要的 `tests/README.md` 外，Phase 2 不新建、不修改其它 README；其它 README 仍统一推迟到 Phase 6 文档同步阶段。
 
 ### review Agent 审查重点
 
@@ -382,8 +393,9 @@
 
 - Phase 2 可独立形成 PR。
 - 无工具 Agent loop 可运行、可测试、可取消、可失败收口。
+- `utils/` smoke 脚本可手动验证多个 OpenAI-compatible provider 的简单 prompt，并输出 DEBUG 级别 Runner / Agent 诊断日志；缺 key 时安全跳过。
 - import boundary tests 继续通过。
-- README 同步与当前代码一致。
+- README 策略与用户决策一致：必须新建 `dayu/engine/README.md`，只写当前已落地事实；除该文件与必要的 `tests/README.md` 外不改其它 README。
 - 总控必须提醒并确认已完成 NEW / OLD AsyncAgent 与 Runner 消费边界严格对照 review；该 review 通过后，Phase 2 才能进入提交 / PR 流程。
 
 ### 用户确认点
