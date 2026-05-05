@@ -720,11 +720,13 @@ Engine 包根导出建议：
 
 建议类型草案：
 
-- `ProviderRequestExtension = OpenAIReasoningExtension | AnthropicThinkingExtension | GeminiThinkingExtension | QwenThinkingExtension | ValidatedProviderRequestExtension`
-- `OpenAIReasoningExtension`：`reasoning_effort: ReasoningEffort`
-- `AnthropicThinkingExtension`：`thinking: AnthropicThinkingConfig`，相关 beta header 仍属于 `RunnerSpec.headers`
-- `GeminiThinkingExtension`：`thinking_budget: int`、`include_thoughts: bool`
-- `QwenThinkingExtension`：`enable_thinking: bool`
+- `ProviderRequestExtension = OpenAIReasoningExtension | AnthropicThinkingExtension | DeepSeekThinkingExtension | MimoThinkingExtension | GeminiThinkingExtension | QwenThinkingExtension | ValidatedProviderRequestExtension`
+- `OpenAIReasoningExtension`：`reasoning_effort: OpenAIReasoningEffort`
+- `AnthropicThinkingExtension`：`enabled: bool`、`budget_tokens: int | None`；disabled 时不传 `budget_tokens`，相关 beta header 仍属于 `RunnerSpec.headers`
+- `DeepSeekThinkingExtension`：`enabled: bool`、`reasoning_effort: DeepSeekReasoningEffort | None`，投影为顶层 `thinking.type`，不含 `budget_tokens`
+- `MimoThinkingExtension`：`enabled: bool`，投影为顶层 `thinking.type`，不含 `budget_tokens`
+- `GeminiThinkingExtension`：`thinking_budget: int | None`、`include_thoughts: bool | None`、`thinking_level: GeminiThinkingLevel | None`
+- `QwenThinkingExtension`：`enable_thinking: bool`、`thinking_budget: int | None`
 - `ValidatedProviderRequestExtension`：只由配置 adapter 基于受控 `ProviderRequestPatch` 生成，必须带 `provider`、`schema_id`、`schema_version` 和已校验的 provider 私有字段；Agent/Host 调用 Engine 时不能传入原始 patch。
 
 ### 14.4 Tool Calling Protocol

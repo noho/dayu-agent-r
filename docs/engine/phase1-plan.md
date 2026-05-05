@@ -16,13 +16,13 @@ review §4.2 / §4.3 / §5.1 与 OLD 取证（见 §3）暴露 4 处 contract �
 | 2 | `dayu/contracts/tool_call.py` | 新增 `GeminiToolCallState(thought_signature: str)`；定义封闭联合 `TypeAlias`：`ToolCallProviderState = GeminiToolCallState`（当前单成员，未来扩展时按 PEP 604 追加 `\|`）；`ToolCallRequest` 增加 `provider_state: ToolCallProviderState \| None` 字段 | review §4.3 + OLD `sse_parser.py:738/790-794/897-899`：联合定义放在公共契约层，避免 Engine → 公共 反向依赖；`AssistantToolCall` 在 §0.1 项 #3 由 Engine 层 import 引用 |
 | 3 | `dayu/engine/contracts/messages.py` | `from dayu.contracts.tool_call import ToolCallProviderState` 引用项 #2 联合；`AssistantToolCall` 增加 `provider_state: ToolCallProviderState \| None` 字段 | 复审 §4.1 阻塞项：`AssistantToolCall` 真实归属是 `dayu/engine/contracts/messages.py:70`（不是 `dayu/contracts/tool_call.py`）；roundtrip 时由 Agent / Runner 把 `ToolCallRequest.provider_state` 透传给 `AssistantToolCall.provider_state` |
 | 4 | `dayu/engine/contracts/runner_spec.py` | `RunnerSpec` 增加 `supports_stream_usage: bool` capability 字段 | review §5.1 + OLD `async_openai_runner.py:517/584/1059-1061`：`stream_options.include_usage` 是 capability 门控，非无条件发送 |
-| 5 | `dayu/engine/contracts/runner_spec.py` | `OpenAIReasoningEffort` 枚举追加 `NONE = "none"` | OLD `llm_models.json` 已使用 `reasoning_effort: "none"` |
+| 5 | `dayu/engine/contracts/runner_spec.py` | `OpenAIReasoningEffort` 枚举追加 `NONE = "none"`，后续同步扩展 `MINIMAL` / `XHIGH` | OLD `llm_models.json` 已使用 `reasoning_effort: "none"`；官方 OpenAI 文档已列出 `minimal` / `xhigh` |
 
 ### 0.2 已锁定决策（review §11 中已决项）
 
 - **Phase 0 contract 补丁并入 Phase 1**：一次 PR 同步落地 contract + Runner，避免回退 Phase 0 流程。
 - **`provider_state` 采用封闭 provider state 联合**：当前 Phase 仅含 `GeminiToolCallState`；后续新增 provider（如 Anthropic `signature`）时扩展联合，每次扩展回到 contract 评审。
-- **`OpenAIReasoningEffort.NONE` 加入枚举**：与 OLD 真源一致，迁移 llm_models 配置无损。
+- **`OpenAIReasoningEffort.NONE` 加入枚举**：与 OLD 真源一致，迁移 llm_models 配置无损；后续同步补齐官方 `minimal` / `xhigh`。
 - **Gemini extra_content roundtrip 在 Phase 1 必须支持**：不放弃能力，由 §0.1 项 #2 contract 补丁承载。
 - **HTTP / network / timeout 终态错误新增专用事件类型**：与协议解析错误 `RunnerProtocolErrorData` 正交分离（见 §0.1 项 #1）。
 - **`AnthropicThinkingExtension` / `QwenThinkingExtension` 投影按 OLD `llm_models.json` 真源**：Anthropic / Qwen 是**顶层**字段，非 `extra_body`（详见 §6.3）。
@@ -34,7 +34,7 @@ review §4.2 / §4.3 / §5.1 与 OLD 取证（见 §3）暴露 4 处 contract �
 | `tests/contracts/test_tool_call.py`（修改） | `ToolCallRequest(provider_state=None)` / `ToolCallRequest(provider_state=GeminiToolCallState(...))` 构造与等值；`GeminiToolCallState` / `ToolCallProviderState` 联合 |
 | `tests/engine/contracts/test_messages.py`（修改） | `AssistantToolCall(provider_state=None)` / `AssistantToolCall(provider_state=GeminiToolCallState(...))` 构造与等值；`ToolCallRequest` → `AssistantToolCall` provider_state 透传一致性 |
 | `tests/engine/contracts/test_runner_events.py`（修改） | `RunnerHTTPErrorData` 构造、入 `RunnerEventData` 联合、`match RunnerEvent.data` 含 `RUNNER_HTTP_ERROR` 分支 |
-| `tests/engine/contracts/test_runner_spec.py`（修改） | `RunnerSpec.supports_stream_usage` 字段；`OpenAIReasoningEffort.NONE` 值 |
+| `tests/engine/contracts/test_runner_spec.py`（修改） | `RunnerSpec.supports_stream_usage` 字段；`OpenAIReasoningEffort` 值 |
 | `tests/engine/test_weak_typing_guard.py`（修改） | 不允许 `provider_state` 退化为 `dict[str, Any]` / `JsonValue` 万能袋 |
 
 ### 0.4 联合穷尽影响
@@ -42,7 +42,7 @@ review §4.2 / §4.3 / §5.1 与 OLD 取证（见 §3）暴露 4 处 contract �
 `assert_never` 守护点必须同步更新：
 - `match RunnerEvent.data:` → 新增 `case RunnerHTTPErrorData()` 分支（NEW 现存使用方仅 contract 测试，影响面可控）。
 - `match ToolCallProviderState:` → 新分支 `case GeminiToolCallState()` 在所有消费 provider_state 的位置必须穷尽（本 Phase 仅 Runner 内部使用）。
-- `match OpenAIReasoningEffort:` → `LOW / MEDIUM / HIGH / NONE` 四分支（payload builder 分支）。
+- `match OpenAIReasoningEffort:` → 覆盖当前枚举全部分支（payload builder 分支）。
 
 ## 1. Phase 范围
 
@@ -140,7 +140,7 @@ OLD 文件路径相对于 `~/workspace/dayu-agent/`。
 dayu/engine/contracts/runner_events.py    # +RunnerHTTPErrorCode, +RunnerEventType.RUNNER_HTTP_ERROR, +RunnerHTTPErrorData
 dayu/contracts/tool_call.py               # +GeminiToolCallState, +ToolCallProviderState; ToolCallRequest +provider_state
 dayu/engine/contracts/messages.py         # AssistantToolCall +provider_state（import ToolCallProviderState）
-dayu/engine/contracts/runner_spec.py      # RunnerSpec +supports_stream_usage; OpenAIReasoningEffort +NONE
+dayu/engine/contracts/runner_spec.py      # RunnerSpec +supports_stream_usage; OpenAIReasoningEffort 扩展
 
 # Runner 实现（新增）
 dayu/engine/runners/__init__.py
@@ -170,7 +170,7 @@ dayu/engine/runners/openai/_types.py            # 私有 TypedDict / dataclass /
 tests/contracts/test_tool_call.py                          # +ToolCallRequest.provider_state 构造、等值、None 默认；GeminiToolCallState
 tests/engine/contracts/test_messages.py                    # +AssistantToolCall.provider_state；roundtrip ToolCallRequest→AssistantToolCall provider_state 透传
 tests/engine/contracts/test_runner_events.py               # +RunnerHTTPErrorCode StrEnum、+RunnerHTTPErrorData 构造、联合穷尽
-tests/engine/contracts/test_runner_spec.py                 # +supports_stream_usage 字段、OpenAIReasoningEffort.NONE
+tests/engine/contracts/test_runner_spec.py                 # +supports_stream_usage 字段、OpenAIReasoningEffort
 tests/engine/test_weak_typing_guard.py                     # provider_state 不退化为 dict[str, Any] / 万能 JsonValue；error_code 不退化为 str
 
 # Runner 实现测试（新增）
@@ -254,10 +254,12 @@ class AsyncOpenAIRunner:
 
 | Extension | 投影位置 | OLD 证据 |
 |---|---|---|
-| `OpenAIReasoningExtension(reasoning_effort)` | **顶层** `reasoning_effort: "low" \| "medium" \| "high" \| "none"` | `llm_models.json:222/272`（`"none"` / `"high"`） |
-| `AnthropicThinkingExtension(enabled, budget_tokens)` | **顶层** `thinking = {"type": "enabled" \| "disabled", "budget_tokens": int}` | `llm_models.json:322/375`（顶层 `thinking`） |
-| `GeminiThinkingExtension(thinking_budget, include_thoughts)` | `extra_body.google.thinking_config = {"thinking_budget": int, "include_thoughts": bool}` | `llm_models.json:428-435`（`extra_body.google`） |
-| `QwenThinkingExtension(enable_thinking)` | **顶层** `enable_thinking: bool` | `llm_models.json:1306/1356`（顶层 `enable_thinking`） |
+| `OpenAIReasoningExtension(reasoning_effort)` | **顶层** `reasoning_effort: "none" \| "minimal" \| "low" \| "medium" \| "high" \| "xhigh"` | `llm_models.json:222/272`（`"none"` / `"high"`） |
+| `AnthropicThinkingExtension(enabled, budget_tokens)` | **顶层** `thinking = {"type": "enabled" \| "disabled"}`；enabled 时追加 `budget_tokens`，disabled 时不传 | `llm_models.json:322/375`（disabled 无 `budget_tokens`，thinking case 含 `budget_tokens`） |
+| `DeepSeekThinkingExtension(enabled, reasoning_effort)` | **顶层** `thinking = {"type": "enabled" \| "disabled"}`；`reasoning_effort` 非 `None` 时追加顶层 effort | `llm_models.json:15/67`（顶层 `thinking.type`，无 `budget_tokens`） |
+| `MimoThinkingExtension(enabled)` | **顶层** `thinking = {"type": "enabled" \| "disabled"}` | `llm_models.json:994/1046`（顶层 `thinking.type`，无 `budget_tokens`） |
+| `GeminiThinkingExtension(thinking_budget, include_thoughts, thinking_level)` | `extra_body.google.thinking_config`，仅写入非 `None` 字段；`thinking_budget` 与 `thinking_level` 互斥 | `llm_models.json:428-435`（`extra_body.google`） |
+| `QwenThinkingExtension(enable_thinking, thinking_budget)` | **顶层** `enable_thinking: bool`；`thinking_budget` 非 `None` 时追加顶层预算 | `llm_models.json:1306/1356`（顶层 `enable_thinking`） |
 | `provider_request is None` | 不写任何 provider 私有字段 | — |
 
 实现要点：
@@ -396,8 +398,8 @@ Phase 0 contract 补丁同步测试见 §0.3。
 - `_OpenAIRequestPayload` 等 TypedDict 用 `total=False` + `cast` 在最终发送前 freeze；构造时禁止 `dict[str, Any]`。
 - `match` + `assert_never` 守护：
   - `AgentMessage` 4 分支
-  - `ProviderRequestExtension` 4 分支
-  - `OpenAIReasoningEffort` 4 分支（含 `NONE`）
+  - `ProviderRequestExtension` 全部分支
+  - `OpenAIReasoningEffort` 全部分支（含 `NONE` / `MINIMAL` / `XHIGH`）
   - `RunnerHTTPErrorCode` 6 分支（含 `UNKNOWN_HTTP_STATUS`）
   - `RunnerEventData`（含 `RunnerHTTPErrorData`）所有消费侧
   - `ToolCallProviderState` 所有消费侧
@@ -428,7 +430,7 @@ review §11 中的 5 项决策已在 §0.2 锁定，不再列入待确认。
 
 客观信号：
 
-- §0 contract 补丁全部落地：`RunnerHTTPErrorData` / `ToolCallProviderState` / `RunnerSpec.supports_stream_usage` / `OpenAIReasoningEffort.NONE`；contract 同步测试全绿。
+- §0 contract 补丁全部落地：`RunnerHTTPErrorData` / `ToolCallProviderState` / `RunnerSpec.supports_stream_usage` / `OpenAIReasoningEffort`；contract 同步测试全绿。
 - `dayu/engine/runners/openai/` 完整落地（§5.1 全部模块），无任何 `Any` / `object` / 裸 dict / 无注解。
 - `pytest tests/contracts tests/engine -q` 全绿。
 - `pyright` 0 errors / 0 warnings 增量。

@@ -38,7 +38,11 @@ from dayu.engine.contracts.messages import (
 )
 from dayu.engine.contracts.runner_spec import (
     AnthropicThinkingExtension,
+    DeepSeekReasoningEffort,
+    DeepSeekThinkingExtension,
+    GeminiThinkingLevel,
     GeminiThinkingExtension,
+    MimoThinkingExtension,
     OpenAIReasoningEffort,
     OpenAIReasoningExtension,
     ProviderRequestExtension,
@@ -202,23 +206,53 @@ def _apply_provider_request(
         ):
             thinking: _OpenAIThinkingTopLevel = {
                 "type": "enabled" if enabled else "disabled",
-                "budget_tokens": budget_tokens,
             }
+            if budget_tokens is not None:
+                thinking["budget_tokens"] = budget_tokens
             payload["thinking"] = thinking
+        case DeepSeekThinkingExtension(
+            enabled=enabled, reasoning_effort=reasoning_effort
+        ):
+            payload["thinking"] = _top_level_thinking_enabled(enabled)
+            if reasoning_effort is not None:
+                payload["reasoning_effort"] = _deepseek_reasoning_effort_value(
+                    reasoning_effort
+                )
+        case MimoThinkingExtension(enabled=enabled):
+            payload["thinking"] = _top_level_thinking_enabled(enabled)
         case GeminiThinkingExtension(
             thinking_budget=thinking_budget,
             include_thoughts=include_thoughts,
+            thinking_level=thinking_level,
         ):
-            inner: Mapping[str, JsonValue] = {
-                "thinking_config": {
-                    "thinking_budget": thinking_budget,
-                    "include_thoughts": include_thoughts,
-                }
-            }
+            thinking_config: dict[str, JsonValue] = {}
+            if thinking_budget is not None:
+                thinking_config["thinking_budget"] = thinking_budget
+            if thinking_level is not None:
+                thinking_config["thinking_level"] = _gemini_thinking_level_value(
+                    thinking_level
+                )
+            if include_thoughts is not None:
+                thinking_config["include_thoughts"] = include_thoughts
+            inner: Mapping[str, JsonValue] = {"thinking_config": thinking_config}
             extra_body: _OpenAIExtraBody = {"google": inner}
             payload["extra_body"] = extra_body
-        case QwenThinkingExtension(enable_thinking=enable_thinking):
+        case QwenThinkingExtension(
+            enable_thinking=enable_thinking, thinking_budget=thinking_budget
+        ):
             payload["enable_thinking"] = enable_thinking
+            if thinking_budget is not None:
+                payload["thinking_budget"] = thinking_budget
+
+
+def _top_level_thinking_enabled(enabled: bool) -> _OpenAIThinkingTopLevel:
+    """构造无预算字段的顶层 ``thinking`` 开关。
+
+    :param enabled: 是否启用 thinking。
+    :returns: 仅包含 ``type`` 的顶层 ``thinking`` 字段。
+    """
+
+    return {"type": "enabled" if enabled else "disabled"}
 
 
 def _reasoning_effort_value(effort: OpenAIReasoningEffort) -> str:
@@ -229,14 +263,50 @@ def _reasoning_effort_value(effort: OpenAIReasoningEffort) -> str:
     """
 
     match effort:
+        case OpenAIReasoningEffort.MINIMAL:
+            return "minimal"
         case OpenAIReasoningEffort.LOW:
             return "low"
         case OpenAIReasoningEffort.MEDIUM:
             return "medium"
         case OpenAIReasoningEffort.HIGH:
             return "high"
+        case OpenAIReasoningEffort.XHIGH:
+            return "xhigh"
         case OpenAIReasoningEffort.NONE:
             return "none"
+
+
+def _deepseek_reasoning_effort_value(effort: DeepSeekReasoningEffort) -> str:
+    """把 :class:`DeepSeekReasoningEffort` 投影为字符串字面量。
+
+    :param effort: DeepSeek 推理强度枚举。
+    :returns: 字符串字面量。
+    """
+
+    match effort:
+        case DeepSeekReasoningEffort.HIGH:
+            return "high"
+        case DeepSeekReasoningEffort.MAX:
+            return "max"
+
+
+def _gemini_thinking_level_value(level: GeminiThinkingLevel) -> str:
+    """把 :class:`GeminiThinkingLevel` 投影为字符串字面量。
+
+    :param level: Gemini thinking level 枚举。
+    :returns: 字符串字面量。
+    """
+
+    match level:
+        case GeminiThinkingLevel.MINIMAL:
+            return "minimal"
+        case GeminiThinkingLevel.LOW:
+            return "low"
+        case GeminiThinkingLevel.MEDIUM:
+            return "medium"
+        case GeminiThinkingLevel.HIGH:
+            return "high"
 
 
 def build_request_payload(

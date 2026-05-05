@@ -1,9 +1,11 @@
 """``build_request_payload`` 投影测试。
 
-覆盖 phase1-plan.md §6.3 表格中的四种 ProviderRequestExtension：
+覆盖 OpenAI-compatible Runner 当前消费的 ProviderRequestExtension：
 
 - :class:`OpenAIReasoningExtension` → 顶层 ``reasoning_effort``。
 - :class:`AnthropicThinkingExtension` → 顶层 ``thinking``。
+- :class:`DeepSeekThinkingExtension` → 顶层 ``thinking``。
+- :class:`MimoThinkingExtension` → 顶层 ``thinking``。
 - :class:`GeminiThinkingExtension` → ``extra_body.google.thinking_config``。
 - :class:`QwenThinkingExtension` → 顶层 ``enable_thinking``。
 """
@@ -22,7 +24,11 @@ from dayu.engine.contracts.messages import (
 )
 from dayu.engine.contracts.runner_spec import (
     AnthropicThinkingExtension,
+    DeepSeekReasoningEffort,
+    DeepSeekThinkingExtension,
+    GeminiThinkingLevel,
     GeminiThinkingExtension,
+    MimoThinkingExtension,
     OpenAIReasoningEffort,
     OpenAIReasoningExtension,
     QwenThinkingExtension,
@@ -78,6 +84,27 @@ def test_openai_reasoning_none_value_serialized() -> None:
     assert payload.get("reasoning_effort") == "none"
 
 
+def test_openai_reasoning_new_effort_values_serialized() -> None:
+    """OpenAI 新增 effort 档位必须可投影为官方字面量。"""
+
+    for effort, expected in (
+        (OpenAIReasoningEffort.MINIMAL, "minimal"),
+        (OpenAIReasoningEffort.XHIGH, "xhigh"),
+    ):
+        spec = make_spec(
+            provider_request=OpenAIReasoningExtension(
+                reasoning_effort=effort
+            )
+        )
+        payload = build_request_payload(
+            messages=_basic_messages(),
+            options=make_options(stream=False),
+            tools=[],
+            spec=spec,
+        )
+        assert payload.get("reasoning_effort") == expected
+
+
 def test_anthropic_thinking_projection_to_top_level() -> None:
     """Anthropic thinking 应投影到顶层 ``thinking``，不进 ``extra_body``。"""
 
@@ -98,11 +125,41 @@ def test_anthropic_thinking_projection_to_top_level() -> None:
 
 
 def test_anthropic_thinking_disabled_branch() -> None:
-    """``enabled=False`` 应投影为 ``type='disabled'``。"""
+    """``enabled=False`` 只投影 ``type='disabled'``，不带预算字段。"""
 
     spec = make_spec(
-        provider_request=AnthropicThinkingExtension(
-            enabled=False, budget_tokens=0
+        provider_request=AnthropicThinkingExtension(enabled=False)
+    )
+    payload = build_request_payload(
+        messages=_basic_messages(),
+        options=make_options(stream=False),
+        tools=[],
+        spec=spec,
+    )
+    assert payload.get("thinking") == {"type": "disabled"}
+
+
+def test_deepseek_thinking_projection_to_top_level_without_budget() -> None:
+    """DeepSeek thinking 只写顶层 ``thinking.type``，不带预算字段。"""
+
+    spec = make_spec(provider_request=DeepSeekThinkingExtension(enabled=True))
+    payload = build_request_payload(
+        messages=_basic_messages(),
+        options=make_options(stream=False),
+        tools=[],
+        spec=spec,
+    )
+    assert payload.get("thinking") == {"type": "enabled"}
+    assert "extra_body" not in payload
+
+
+def test_deepseek_thinking_effort_projection_to_top_level() -> None:
+    """DeepSeek thinking effort 应投影为顶层 ``reasoning_effort``。"""
+
+    spec = make_spec(
+        provider_request=DeepSeekThinkingExtension(
+            enabled=True,
+            reasoning_effort=DeepSeekReasoningEffort.MAX,
         )
     )
     payload = build_request_payload(
@@ -111,10 +168,36 @@ def test_anthropic_thinking_disabled_branch() -> None:
         tools=[],
         spec=spec,
     )
-    assert payload.get("thinking") == {
-        "type": "disabled",
-        "budget_tokens": 0,
-    }
+    assert payload.get("thinking") == {"type": "enabled"}
+    assert payload.get("reasoning_effort") == "max"
+
+
+def test_deepseek_disabled_thinking_projection_has_no_effort() -> None:
+    """DeepSeek 关闭 thinking 时只写 ``thinking.type``。"""
+
+    spec = make_spec(provider_request=DeepSeekThinkingExtension(enabled=False))
+    payload = build_request_payload(
+        messages=_basic_messages(),
+        options=make_options(stream=False),
+        tools=[],
+        spec=spec,
+    )
+    assert payload.get("thinking") == {"type": "disabled"}
+    assert "reasoning_effort" not in payload
+
+
+def test_mimo_thinking_projection_to_top_level_without_budget() -> None:
+    """MiMo thinking 只写顶层 ``thinking.type``，不带预算字段。"""
+
+    spec = make_spec(provider_request=MimoThinkingExtension(enabled=True))
+    payload = build_request_payload(
+        messages=_basic_messages(),
+        options=make_options(stream=False),
+        tools=[],
+        spec=spec,
+    )
+    assert payload.get("thinking") == {"type": "enabled"}
+    assert "extra_body" not in payload
 
 
 def test_gemini_thinking_projection_to_extra_body_google() -> None:
@@ -144,6 +227,31 @@ def test_gemini_thinking_projection_to_extra_body_google() -> None:
     assert "reasoning_effort" not in payload
 
 
+def test_gemini_thinking_level_projection_to_extra_body_google() -> None:
+    """Gemini thinking level 应投影到 ``thinking_config``。"""
+
+    spec = make_spec(
+        provider_request=GeminiThinkingExtension(
+            thinking_level=GeminiThinkingLevel.MINIMAL,
+            include_thoughts=False,
+        )
+    )
+    payload = build_request_payload(
+        messages=_basic_messages(),
+        options=make_options(stream=False),
+        tools=[],
+        spec=spec,
+    )
+    assert payload.get("extra_body") == {
+        "google": {
+            "thinking_config": {
+                "thinking_level": "minimal",
+                "include_thoughts": False,
+            }
+        }
+    }
+
+
 def test_qwen_thinking_projection_to_top_level() -> None:
     """Qwen thinking 应投影到顶层 ``enable_thinking``。"""
 
@@ -160,6 +268,41 @@ def test_qwen_thinking_projection_to_top_level() -> None:
     assert "extra_body" not in payload
 
 
+def test_qwen_thinking_budget_projection_to_top_level() -> None:
+    """Qwen thinking budget 应投影到顶层 ``thinking_budget``。"""
+
+    spec = make_spec(
+        provider_request=QwenThinkingExtension(
+            enable_thinking=True,
+            thinking_budget=50,
+        )
+    )
+    payload = build_request_payload(
+        messages=_basic_messages(),
+        options=make_options(stream=False),
+        tools=[],
+        spec=spec,
+    )
+    assert payload.get("enable_thinking") is True
+    assert payload.get("thinking_budget") == 50
+
+
+def test_qwen_disabled_thinking_projection_has_no_budget() -> None:
+    """Qwen 关闭 thinking 时只写 ``enable_thinking``。"""
+
+    spec = make_spec(
+        provider_request=QwenThinkingExtension(enable_thinking=False)
+    )
+    payload = build_request_payload(
+        messages=_basic_messages(),
+        options=make_options(stream=False),
+        tools=[],
+        spec=spec,
+    )
+    assert payload.get("enable_thinking") is False
+    assert "thinking_budget" not in payload
+
+
 def test_provider_request_none_no_extension_fields() -> None:
     """``provider_request=None`` 不写入任何 provider 私有字段。"""
 
@@ -170,7 +313,13 @@ def test_provider_request_none_no_extension_fields() -> None:
         tools=[],
         spec=spec,
     )
-    for key in ("reasoning_effort", "thinking", "enable_thinking", "extra_body"):
+    for key in (
+        "reasoning_effort",
+        "thinking",
+        "enable_thinking",
+        "thinking_budget",
+        "extra_body",
+    ):
         assert key not in payload, f"unexpected provider field: {key}"
 
 

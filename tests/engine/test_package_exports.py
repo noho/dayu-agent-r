@@ -1,7 +1,7 @@
 """包根导出白名单测试。
 
-断言 :data:`dayu.engine.__all__` 与 Phase 0 锁定白名单严格相等，并
-明确禁止占位函数式入口与实现类出现在导出集合中。
+断言 :data:`dayu.engine.__all__` 与 Phase 2 锁定白名单严格相等，并
+明确只导出真实函数式入口，不导出实现类。
 """
 
 from __future__ import annotations
@@ -24,6 +24,8 @@ EXPECTED_EXPORTS: frozenset[str] = frozenset(
         "ContentDeltaData",
         "ContextBudgetSnapshot",
         "ContextCompactionRequestedData",
+        "DeepSeekReasoningEffort",
+        "DeepSeekThinkingExtension",
         "EngineEvent",
         "EngineEventData",
         "EngineEventType",
@@ -33,10 +35,12 @@ EXPECTED_EXPORTS: frozenset[str] = frozenset(
         "EngineRunOutcomeSuspended",
         "FinalAnswerData",
         "FinishReason",
+        "GeminiThinkingLevel",
         "GeminiThinkingExtension",
         "GeminiToolCallState",
         "IterationStartedData",
         "JsonValue",
+        "MimoThinkingExtension",
         "OpenAIReasoningEffort",
         "OpenAIReasoningExtension",
         "ProviderProtocolErrorData",
@@ -47,6 +51,8 @@ EXPECTED_EXPORTS: frozenset[str] = frozenset(
         "RunFailedData",
         "RunResumeHint",
         "RunSuspendedData",
+        "run_agent_and_wait",
+        "run_agent_messages",
         "RunnerCallOptions",
         "RunnerContentCompletedData",
         "RunnerContentDeltaData",
@@ -97,9 +103,8 @@ EXPECTED_EXPORTS: frozenset[str] = frozenset(
 
 FORBIDDEN_EXPORTS: frozenset[str] = frozenset(
     {
-        "run_agent_messages",
-        "run_agent_and_wait",
         "AsyncAgent",
+        "_AsyncAgent",
         "AsyncOpenAIRunner",
         "AsyncCliRunner",
         "ToolRegistry",
@@ -112,7 +117,7 @@ FORBIDDEN_EXPORTS: frozenset[str] = frozenset(
 
 
 def test_engine_all_matches_expected_set() -> None:
-    """``dayu.engine.__all__`` 必须与 Phase 0 锁定白名单严格相等。"""
+    """``dayu.engine.__all__`` 必须与 Phase 2 锁定白名单严格相等。"""
 
     actual = frozenset(engine.__all__)
     assert actual == EXPECTED_EXPORTS, (
@@ -121,7 +126,7 @@ def test_engine_all_matches_expected_set() -> None:
 
 
 def test_forbidden_symbols_not_exported() -> None:
-    """Phase 0 禁止导出的占位入口与实现类必须不在 ``__all__`` 中。"""
+    """禁止导出的实现类必须不在 ``__all__`` 中。"""
 
     actual = frozenset(engine.__all__)
     assert actual.isdisjoint(FORBIDDEN_EXPORTS), (

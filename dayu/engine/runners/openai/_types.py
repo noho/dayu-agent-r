@@ -101,7 +101,7 @@ class _OpenAIToolSchema(TypedDict, total=False):
 
 
 class _OpenAIThinkingTopLevel(TypedDict, total=False):
-    """Anthropic 顶层 ``thinking`` 字段。"""
+    """OpenAI-compatible 顶层 ``thinking`` 字段。"""
 
     type: str
     budget_tokens: int
@@ -126,6 +126,7 @@ class _OpenAIRequestPayload(TypedDict, total=False):
     reasoning_effort: str
     thinking: _OpenAIThinkingTopLevel
     enable_thinking: bool
+    thinking_budget: int
     extra_body: _OpenAIExtraBody
 
 
