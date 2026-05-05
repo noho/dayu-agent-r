@@ -6,8 +6,8 @@
 之间二选一。这**不是**兼容 wrapper：每个符号在源包中只定义一次，本
 模块仅做结构契约暴露。
 
-Phase 0 仅暴露 contract 类型；**不**导出 :func:`run_agent_messages` /
-:func:`run_agent_and_wait` 等占位函数式入口，**不**导出 ``AsyncAgent`` /
+Phase 2 起额外暴露真实函数式入口 :func:`run_agent_messages` /
+:func:`run_agent_and_wait`；**不**导出 ``AsyncAgent`` /
 ``AsyncOpenAIRunner`` 等实现类，**不**导出任何取消异常（如
 ``CancelledError``）。
 """
@@ -99,6 +99,7 @@ from dayu.engine.contracts import (
     ToolResultAcceptedData,
     UserMessage,
 )
+from dayu.engine.agent import run_agent_and_wait, run_agent_messages
 
 __all__ = [
     "AgentMessage",
@@ -138,6 +139,8 @@ __all__ = [
     "RunFailedData",
     "RunResumeHint",
     "RunSuspendedData",
+    "run_agent_and_wait",
+    "run_agent_messages",
     "RunnerCallOptions",
     "RunnerContentCompletedData",
     "RunnerContentDeltaData",
