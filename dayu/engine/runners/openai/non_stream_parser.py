@@ -188,7 +188,11 @@ def _emit_from_dict(
             outside, inside = _split_thought(content, hook=hook)
             content = outside or None
             if inside:
-                reasoning = (reasoning or "") + inside
+                # OLD `extracted_reasoning + native_reasoning` 顺序：
+                # 剥离的 ``<thought>`` 在前，provider 原生 reasoning 在后，
+                # 与 SSE 路径（先处理 content 流再处理 reasoning_content
+                # 流）保持等价。
+                reasoning = inside + (reasoning or "")
         raw_tool_calls = message.get("tool_calls")
         if isinstance(raw_tool_calls, list) and raw_tool_calls:
             tool_calls_request = _build_tool_calls(raw_tool_calls)
@@ -262,30 +266,49 @@ def _build_tool_calls(
 
     复用 :class:`ToolCallAggregator`：把每个 tool call 当作一次
     完整的 delta 投喂，再调用 finalize。
+
+    OLD 兼容点：non-stream ``function.arguments`` 既可能是 JSON string
+    也可能是 dict 形态。OLD 直接接受 dict；NEW 在喂入 aggregator
+    （只接受字符串 buffer）前先把 Mapping 序列化为 JSON string。
+    其它非法类型（list / number / bool）→ ``tool_call_arguments_not_object``
+    fatal 错误。
     """
 
     aggregator = ToolCallAggregator()
+    fatal_errors: list[RunnerProtocolErrorData] = []
     for index, raw in enumerate(raw_tool_calls):
         if not isinstance(raw, dict):
             continue
-        delta = _coerce_final_tool_call(raw, index=index)
+        delta, pre_error = _coerce_final_tool_call(raw, index=index)
+        if pre_error is not None:
+            fatal_errors.append(pre_error)
+            continue
         aggregator.feed(delta)
     result = aggregator.finalize()
+    combined_fatals: tuple[RunnerProtocolErrorData, ...] = (
+        tuple(fatal_errors) + result.fatal_errors
+    )
     return _NonStreamToolCallsResult(
         tool_calls=result.tool_calls,
-        fatal_errors=result.fatal_errors,
+        fatal_errors=combined_fatals,
         warnings=result.warnings,
     )
 
 
 def _coerce_final_tool_call(
     raw: dict[str, JsonValue], *, index: int
-) -> _OpenAIToolCallDelta:
+) -> tuple[_OpenAIToolCallDelta, RunnerProtocolErrorData | None]:
     """把非流式 tool call dict 转成可被聚合器消费的 delta 形态。
 
-    本函数返回 :class:`_OpenAIToolCallDelta`（与
-    :class:`_OpenAIToolCallFinal` 在 aggregator 入口共享同一字段子集），
-    并强制写入 ``index``，使 :class:`ToolCallAggregator` 可按顺序聚合。
+    本函数返回 ``(delta, pre_error)``：
+
+    - ``delta``：投喂 :class:`ToolCallAggregator` 的强类型形态；
+    - ``pre_error``：若发现 ``function.arguments`` 既不是字符串也不是
+      JSON object，返回 ``tool_call_arguments_not_object`` fatal 协议
+      错误；否则为 ``None``。
+
+    OLD 兼容：``function.arguments`` 为 :class:`Mapping` 时序列化为
+    JSON 字符串，避免参数被静默清空。
     """
 
     delta: _OpenAIToolCallDelta = {"index": index}
@@ -295,6 +318,7 @@ def _coerce_final_tool_call(
     delta_type = raw.get("type")
     if isinstance(delta_type, str):
         delta["type"] = delta_type
+    pre_error: RunnerProtocolErrorData | None = None
     function = raw.get("function")
     if isinstance(function, dict):
         func_payload: _OpenAIToolCallFunction = {}
@@ -304,6 +328,23 @@ def _coerce_final_tool_call(
         arguments = function.get("arguments")
         if isinstance(arguments, str):
             func_payload["arguments"] = arguments
+        elif isinstance(arguments, Mapping):
+            # OLD 行为：dict 形态参数直接保留；序列化为 JSON 字符串
+            # 后让 aggregator 沿用统一字符串 buffer 入口。
+            func_payload["arguments"] = json.dumps(dict(arguments))
+        elif arguments is not None:
+            tool_id_for_msg = (
+                delta_id if isinstance(delta_id, str) else f"#{index}"
+            )
+            pre_error = RunnerProtocolErrorData(
+                error_code="tool_call_arguments_not_object",
+                message=(
+                    f"tool call {tool_id_for_msg} arguments is neither a "
+                    "JSON string nor a JSON object"
+                ),
+                provider_request_id=None,
+                raw_payload=None,
+            )
         if func_payload:
             delta["function"] = func_payload
     extra_content = raw.get("extra_content")
@@ -314,7 +355,7 @@ def _coerce_final_tool_call(
                 cleaned[namespace] = dict(inner)
         if cleaned:
             delta["extra_content"] = cleaned
-    return delta
+    return delta, pre_error
 
 
 __all__ = ["parse_non_stream_response"]

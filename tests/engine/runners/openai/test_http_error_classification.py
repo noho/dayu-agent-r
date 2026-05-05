@@ -18,6 +18,7 @@ from dayu.engine.runners.openai.error_classifier import (
 @pytest.mark.parametrize(
     "status, expected",
     [
+        (408, RunnerHTTPErrorCode.TIMEOUT),
         (429, RunnerHTTPErrorCode.RATE_LIMIT_EXCEEDED),
         (500, RunnerHTTPErrorCode.SERVER_ERROR),
         (502, RunnerHTTPErrorCode.SERVER_ERROR),

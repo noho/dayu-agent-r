@@ -44,6 +44,7 @@ from dayu.engine.runners.openai.cancellation_helpers import (
 from dayu.engine.runners.openai.error_classifier import (
     classify_exception,
     classify_http_status,
+    is_retriable,
 )
 from dayu.engine.runners.openai.http_client import HTTPClient
 from dayu.engine.runners.openai.non_stream_parser import (
@@ -253,10 +254,7 @@ class AsyncOpenAIRunner:
                     response.headers.get("Retry-After")
                 )
                 body_preview = await self._safe_read_text(response)
-                if error_code in {
-                    RunnerHTTPErrorCode.RATE_LIMIT_EXCEEDED,
-                    RunnerHTTPErrorCode.SERVER_ERROR,
-                }:
+                if is_retriable(error_code):
                     raise _AttemptFailedRetriable(
                         error_code=error_code,
                         http_status=response.status,

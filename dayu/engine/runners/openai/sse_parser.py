@@ -303,13 +303,17 @@ class SSEParser:
             tool_calls_delta = delta.get("tool_calls")
             if isinstance(tool_calls_delta, list):
                 self._tool_calls_seen = True
-                for raw in tool_calls_delta:
+                for position, raw in enumerate(tool_calls_delta):
                     if not isinstance(raw, dict):
                         continue
                     typed_delta = self._coerce_tool_call_delta(raw)
-                    self._aggregator.feed(typed_delta)
+                    resolved_index = self._aggregator.feed(
+                        typed_delta, position=position
+                    )
                     yield _make_event(
-                        self._tool_call_delta_event(typed_delta)
+                        self._tool_call_delta_event(
+                            typed_delta, resolved_index=resolved_index
+                        )
                     )
         finish_reason = choice.get("finish_reason")
         if isinstance(finish_reason, str):
@@ -357,12 +361,25 @@ class SSEParser:
         return delta
 
     def _tool_call_delta_event(
-        self, delta: _OpenAIToolCallDelta
+        self,
+        delta: _OpenAIToolCallDelta,
+        *,
+        resolved_index: int | None,
     ) -> RunnerToolCallDeltaData:
-        """把强类型 delta 投影为 RunnerEvent data。"""
+        """把强类型 delta 投影为 RunnerEvent data。
 
-        index = delta.get("index")
-        tool_call_index = index if isinstance(index, int) else 0
+        :param delta: 流式 tool call 增量。
+        :param resolved_index: :meth:`ToolCallAggregator.feed` 返回的
+            归属 index；若 delta 无法归属（既缺 ``index`` 又缺 ``id``）
+            为 ``None``，此时回退用 ``delta.get("index")`` 或 ``0``，
+            与 OLD 行为一致。
+        """
+
+        if resolved_index is not None:
+            tool_call_index = resolved_index
+        else:
+            raw_index = delta.get("index")
+            tool_call_index = raw_index if isinstance(raw_index, int) else 0
         delta_id = delta.get("id")
         tool_call_id = delta_id if isinstance(delta_id, str) else None
         function = delta.get("function")

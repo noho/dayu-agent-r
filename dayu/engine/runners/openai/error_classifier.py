@@ -6,6 +6,8 @@
 
 分类规则（与 OLD ``async_openai_runner.py`` 一致）：
 
+- HTTP ``408`` → :attr:`RunnerHTTPErrorCode.TIMEOUT`（OLD 视为可重试
+  瞬时超时，归一到中性 ``TIMEOUT`` 类目，``http_status`` 仍保留 408）。
 - HTTP ``429`` → :attr:`RunnerHTTPErrorCode.RATE_LIMIT_EXCEEDED`。
 - HTTP ``500`` / ``502`` / ``503`` / ``504`` → :attr:`SERVER_ERROR`。
 - HTTP ``4xx`` 其它 → :attr:`CLIENT_ERROR`（不可重试）。
@@ -34,6 +36,10 @@ def classify_http_status(http_status: int) -> RunnerHTTPErrorCode:
     :returns: 对应的中性错误枚举。
     """
 
+    if http_status == 408:
+        # OLD 把 408 视为瞬时超时类可重试错误；NEW 归一到 TIMEOUT 中性
+        # 枚举，``http_status=408`` 在事件 data 中保留，便于上层诊断。
+        return RunnerHTTPErrorCode.TIMEOUT
     if http_status == 429:
         return RunnerHTTPErrorCode.RATE_LIMIT_EXCEEDED
     if http_status in _RETRYABLE_5XX:

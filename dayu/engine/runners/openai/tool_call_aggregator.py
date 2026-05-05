@@ -89,21 +89,41 @@ class ToolCallAggregator:
     def __init__(self) -> None:
         self._partials_by_index: dict[int, _PartialToolCall] = {}
         self._index_by_id: dict[str, int] = {}
-        self._next_synthetic_index: int = 1_000_000
+        # 合成 index 与真实 index 共用一个稠密命名空间，从 0 开始。
+        # 既能避免与 provider 提供的真实 ``index`` 冲突，也使 finalize
+        # 阶段按 sorted-key 顺序生成的 ``index_in_iteration`` 与本 index
+        # 在「单一来源」场景下保持一致，让 SSE delta 与 completed 事件
+        # 中的 tool_call_index 可稳定对照。
+        self._next_synthetic_index: int = 0
         self._fatal_errors: list[RunnerProtocolErrorData] = []
         self._warnings: list[RunnerProtocolErrorData] = []
 
     def _allocate_synthetic_index(self) -> int:
-        """缺失 ``index`` 但有 ``id`` 时分配的合成顺序键。"""
+        """缺失 ``index`` 但有 ``id`` 时分配的合成顺序键。
 
+        从下一个未被占用（既不在 ``_partials_by_index`` 也未被合成过）
+        的整数开始，保证不会与 provider 真实 ``index`` 冲突。
+        """
+
+        while self._next_synthetic_index in self._partials_by_index:
+            self._next_synthetic_index += 1
         index = self._next_synthetic_index
         self._next_synthetic_index += 1
         return index
 
-    def _resolve_index(self, delta: _OpenAIToolCallDelta) -> int | None:
+    def _resolve_index(
+        self,
+        delta: _OpenAIToolCallDelta,
+        *,
+        position: int | None,
+    ) -> int | None:
         """把 delta 归属到现有 partial 的 index。
 
         :param delta: 增量。
+        :param position: 当前 delta 在 ``choice.delta.tool_calls`` 数组
+            中的位置；用于 OLD 兼容的 “pos fallback continuation” 路径
+            （首帧带 ``id``/``name``，后续 arguments 帧既无 ``id`` 又无
+            ``index`` 时按数组位置归位）。
         :returns: 命中或新建后的 index；无法归属时返回 ``None``。
         """
 
@@ -118,16 +138,38 @@ class ToolCallAggregator:
             new_index = self._allocate_synthetic_index()
             self._index_by_id[delta_id] = new_index
             return new_index
+        # 无 ``id`` 也无 ``index``：若调用方提供了 ``pos``，且该位置已
+        # 有 partial，则归到该 partial（OLD ``sse_parser.py`` 的 pos
+        # fallback 行为）。
+        if (
+            position is not None
+            and position in self._partials_by_index
+        ):
+            return position
         return None
 
-    def feed(self, delta: _OpenAIToolCallDelta) -> None:
+    def feed(
+        self,
+        delta: _OpenAIToolCallDelta,
+        *,
+        position: int | None = None,
+    ) -> int | None:
         """累积一个 tool call delta。
 
         :param delta: 流式增量。
-        :returns: 无返回值。
+        :param position: ``choice.delta.tool_calls`` 数组中的位置；用于
+            OLD pos fallback continuation 归位。
+        :returns: 该 delta 归属的 resolved index；若 delta 既缺
+            ``index`` 又缺 ``id``，且无法用 ``position`` 归位，返回
+            ``None``（同时累积一条 ``tool_call_missing_index_and_id``
+            warning）。
+
+        OLD 兼容点：SSE parser 在 emit ``RunnerToolCallDeltaData`` 之前
+        必须使用本返回值作为 ``tool_call_index``；缺 ``index`` 但有 ``id``
+        的并行 tool call 才能在 delta 流中稳定区分归属。
         """
 
-        index = self._resolve_index(delta)
+        index = self._resolve_index(delta, position=position)
         if index is None:
             self._warnings.append(
                 RunnerProtocolErrorData(
@@ -137,7 +179,7 @@ class ToolCallAggregator:
                     raw_payload=None,
                 )
             )
-            return
+            return None
         partial = self._partials_by_index.setdefault(
             index, _PartialToolCall()
         )
@@ -159,6 +201,7 @@ class ToolCallAggregator:
             new_state = self._parse_provider_state(extra_content)
             if new_state is not None:
                 partial.provider_state = new_state
+        return index
 
     def _parse_provider_state(
         self, extra_content: Mapping[str, Mapping[str, JsonValue]]

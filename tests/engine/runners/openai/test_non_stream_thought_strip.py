@@ -51,7 +51,13 @@ def test_non_stream_strips_leading_thought_into_reasoning() -> None:
 
 
 def test_non_stream_thought_preserves_existing_reasoning_content() -> None:
-    """已有 ``reasoning_content`` 字段时，剥离结果应叠加而非覆盖。"""
+    """已有 ``reasoning_content`` 字段时，剥离结果应在前。
+
+    OLD ``async_openai_runner.py`` 中 non-stream 合并顺序固定为
+    ``extracted_reasoning + native_reasoning``，以与 SSE 路径
+    （先处理 content 中的 ``<thought>`` 增量，再处理 ``reasoning_content``
+    增量）保持等价。本测试守护该顺序。
+    """
 
     payload = json.dumps(
         {
@@ -76,4 +82,4 @@ def test_non_stream_thought_preserves_existing_reasoning_content() -> None:
     )
     assert isinstance(completed, RunnerContentCompletedData)
     assert completed.content == "final"
-    assert completed.reasoning_content == "prior;extra"
+    assert completed.reasoning_content == "extraprior;"

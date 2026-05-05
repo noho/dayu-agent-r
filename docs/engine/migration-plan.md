@@ -296,6 +296,7 @@
 - Runner 是否在所有终态关闭。
 - 取消是否优先于 final_answer。
 - 是否提前接入工具、trace、memory 或 Host 具体实现。
+- 常规 code review 通过后，必须再执行一轮 NEW / OLD AsyncAgent 与 Runner 消费边界的实现代码严格对照 review，确认 Phase 2 未让 OpenAI-compatible Runner 协议、事件流或状态机在 Agent 提升过程中漂移。
 
 ### 总控验收标准
 
@@ -303,6 +304,7 @@
 - 无工具 Agent loop 可运行、可测试、可取消、可失败收口。
 - import boundary tests 继续通过。
 - README 同步与当前代码一致。
+- 总控必须提醒并确认已完成 NEW / OLD AsyncAgent 与 Runner 消费边界严格对照 review；该 review 通过后，Phase 2 才能进入提交 / PR 流程。
 
 ### 用户确认点
 

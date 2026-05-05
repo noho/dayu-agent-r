@@ -72,6 +72,58 @@ def test_compute_retry_decision_uses_retry_after() -> None:
     assert decision.sleep_seconds == 3.0
 
 
+def test_rate_limit_no_retry_after_first_backoff_is_4_seconds() -> None:
+    """OLD：429 无 ``Retry-After`` 首次 backoff 4s。"""
+
+    d = compute_retry_decision(
+        error_code=RunnerHTTPErrorCode.RATE_LIMIT_EXCEEDED,
+        attempt=1,
+        max_retries=5,
+        retry_after_seconds=None,
+    )
+    assert d.should_retry is True
+    assert d.sleep_seconds == 4.0
+
+
+def test_rate_limit_no_retry_after_capped_at_60_seconds() -> None:
+    """OLD：429 无 ``Retry-After`` 指数退避 cap 60s。"""
+
+    d = compute_retry_decision(
+        error_code=RunnerHTTPErrorCode.RATE_LIMIT_EXCEEDED,
+        attempt=10,
+        max_retries=20,
+        retry_after_seconds=None,
+    )
+    assert d.should_retry is True
+    assert d.sleep_seconds == 60.0
+
+
+def test_rate_limit_retry_after_capped_at_120_seconds() -> None:
+    """OLD：429 ``Retry-After`` cap 120s。"""
+
+    d = compute_retry_decision(
+        error_code=RunnerHTTPErrorCode.RATE_LIMIT_EXCEEDED,
+        attempt=1,
+        max_retries=5,
+        retry_after_seconds=999.0,
+    )
+    assert d.should_retry is True
+    assert d.sleep_seconds == 120.0
+
+
+def test_non_rate_limit_retry_after_not_capped_by_rate_limit_rule() -> None:
+    """非 429 路径的 ``Retry-After`` 不应被 120s cap 影响（仍按原值）。"""
+
+    d = compute_retry_decision(
+        error_code=RunnerHTTPErrorCode.SERVER_ERROR,
+        attempt=1,
+        max_retries=5,
+        retry_after_seconds=999.0,
+    )
+    assert d.should_retry is True
+    assert d.sleep_seconds == 999.0
+
+
 def test_compute_retry_decision_exponential_backoff() -> None:
     """无 ``Retry-After`` 时使用 ``2 ** (attempt-1)`` 指数退避。"""
 
