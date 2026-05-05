@@ -4,85 +4,77 @@
 
 通过。
 
-本轮复审对象为 `docs/engine/phase0-plan.md`。上一版 review 提出的三项重要问题与三项建议问题均已在计划中收口：Engine/Runner 的 `runner_done` data 命名已统一，所有 StrEnum 已补明确成员名/值表，`ToolResultMeta` / `ToolAwaitSpec` / `ToolAwaitSnapshot` / `RunResumeHint` 的开放 `attributes` 字段已移除，`await_kind` 已收窄为 `ToolAwaitKind`，`AgentMessage` union 测试不再依赖运行时 TypeAlias 行为，`JsonValue` 也明确只做类型别名、不提前承担 runtime validator 或序列化职责。当前计划可作为 Phase 0 实施依据；仍需总控/用户确认的事项属于实施前决策点，不再是计划阻塞。
+本轮复审对象为 `docs/engine/phase0-plan.md`。计划已按最新契约归属范式收口：层间协作协议迁入 `dayu.contracts`，Engine 语义真源仍保留在 `dayu.engine.contracts`，并明确 `dayu.contracts` 禁止反向依赖 Engine / Host / Service / UI / fins。取消边界也已修正为只公开 `CancellationToken`，不导出 `CancelledError`，公共取消终态仍由 `RunCancelledData` / `EngineRunOutcomeCancelled` 表达。当前未发现阻塞或重要问题，可作为 Phase 0 实施依据。
 
 ## 2. 阅读范围
 
-实际阅读的 NEW 文档：
+实际阅读文件：
 
 - `docs/engine/phase0-plan.md`
 - `docs/engine/phase0-plan-review.md`
-- `docs/engine/design.md`
-- `docs/engine/review.md`
 - `docs/engine/migration-plan.md`
 - `docs/engine/migration-plan-review.md`
+- `docs/engine/design.md`
 - `AGENTS.md`
-- `pyrightconfig.json`
 
-实际核查的 OLD 源码：
+重点补读范围：
 
-- `~/workspace/dayu-agent/dayu/engine/tool_result.py`
-- `~/workspace/dayu-agent/dayu/contracts/protocols.py`
-- `~/workspace/dayu-agent/dayu/engine/events.py`
-
-额外本地验证：
-
-- 用 Python 3.11 验证过 PEP 604 union 形式可运行。
-- 用 Python 3.11 验证过函数式 `StrEnum("system","user",...)` 不是可执行写法；当前计划已改为显式 class 成员表。
+- `docs/engine/design.md` 第 9 节取消 / 事件边界
+- `docs/engine/design.md` 第 14 节接口草案
+- `docs/engine/design.md` 第 16 节迁移计划草案
 
 ## 3. 阻塞问题
 
 无。
 
-复核要点：
-
-- Phase 0 范围仍严格限定为 pure contracts、包根导出策略、import boundary tests 与 weak typing 防线。
-- 未偷跑 `AsyncAgent`、`AsyncOpenAIRunner`、ToolRegistry、doc/web/fins tools、processors 或 tool calling 闭环。
-- 未导出未实现的 `run_agent_messages` / `run_agent_and_wait`。
-- `ToolExecutor` 仍只包含 `execute(request) -> ToolExecutionOutcome`。
-- `AsyncRunner` 仍只是协议，不执行工具，不依赖 `ToolExecutor`。
-- Engine contracts 仍全面禁止导入 `dayu.fins`。
-- README 默认不创建，且明确不写未来路线图或 “待 Phase 1+” 内容。
-
 ## 4. 重要问题
 
 无。
-
-上一版重要问题复核结果：
-
-- EngineEvent data 命名：第 1 节和第 6.4 节已统一为 Engine 侧 `RunnerDoneEngineData`、Runner 侧 `RunnerDoneData`。
-- StrEnum 成员表：第 6.6 节已列出 `AgentMessageRole`、`FinishReason`、`OpenAIReasoningEffort`、`ToolAwaitKind`、`EngineEventType`、`RunnerEventType` 的成员名和值。
-- attributes 弱类型语义袋：`ToolResultMeta`、`ToolAwaitSpec`、`ToolAwaitSnapshot`、`RunResumeHint` 已全部移除开放 `attributes` 字段。
 
 ## 5. 建议问题
 
 无必须修改项。
 
-上一版建议问题复核结果：
+可选建议：后续实现时建议在 `dayu/engine/__init__.py` 的模块 docstring 中继续写清楚 `dayu.contracts` 是共享协议的 canonical home，`dayu.engine` 对其 re-export 是 Engine API surface 的结构导出，不是兼容旧路径的 facade。
 
-- `ToolAwaitSpec.await_kind` 已从 `str` 收窄为 `ToolAwaitKind`，Phase 0 只落地 `EXTERNAL_JOB = "external_job"`。
-- `test_agent_message_union.py` 已明确针对四个具体 dataclass 做运行时 `isinstance`，不依赖 `AgentMessage` TypeAlias 的运行时行为。
-- `JsonValue` 已明确 Phase 0 只落地类型别名，不实现 runtime validator 或序列化 helper，避免把后续 adapter 职责提前塞进 contracts。
+## 6. 契约归属专项结论
 
-## 6. 可接受风险
+- `dayu.contracts` 收纳范围是否合理？
+  - 合理。计划把 `CancellationToken`、`ToolExecutor`、`ToolCallRequest`、`ToolExecutionRequest`、`ToolExecutionContext`、`ToolSchema`、`ToolResultEnvelope`、`ToolExecutionOutcome`、`ToolAwaitSpec`、`ToolAwaitSnapshot`、`JsonValue` 放入 `dayu.contracts`。这些类型不是 Engine 单方调用参数，而是 Host 与 Engine 都需要独立产生、解释或持久化的协作协议。
 
-- `RunnerDoneEngineData` 命名仍需总控/用户最终接受。该命名已在计划内统一，不影响实施 Agent 按当前真源落地。
-- `ToolAwaitKind.EXTERNAL_JOB` 是 Phase 0 保守初始集合。后续若需要更多等待类型，应由消费 Phase 单独评审扩展。
-- `AgentMessage` 四元封闭联合是 Phase 0 最小形态。Phase 1 Runner 若发现不足，应按计划停止并回到总控确认，而不是在实现中自行扩字段。
-- `correlation_id` 作为 `ToolExecutionContext` 中性关联字段可接受；后续不得变成 ToolTraceRecorder 私有入口。
-- Phase 0 不创建 README 可接受；实施汇报需要说明原因。
+- `dayu.engine.contracts` 保留范围是否合理？
+  - 合理。`RunnerSpec`、`RunnerCallOptions`、`AgentRunRequest`、`AgentPolicy`、`AgentMessage`、`EngineEvent`、`RunnerEvent`、`AgentRunResult`、`FinishReason` 等仍留在 `dayu.engine.contracts`，符合 Engine 语义真源原则。Host 会 import 这些类型不构成把它们下沉到 `dayu.contracts` 的理由。
 
-## 7. 需要总控 / 用户确认的问题
+- `RunnerSpec` 是否正确保留在 Engine 契约？
+  - 是。`RunnerSpec` / `RunnerCallOptions` 描述 Engine 内 Runner 规约与调用选项，语义真源在 Engine；Host 只是装配并传入，不独立解释为 Host 协作协议。
 
+- `CancellationToken` 是否正确迁入公共契约？
+  - 是。`CancellationToken` 是 Host 产生 / 激活、Engine 观察的层间协作协议，迁入 `dayu.contracts` 合理。同时计划明确不导出取消异常，取消公共终态由 `RunCancelledData` / `EngineRunOutcomeCancelled` 表达，符合 `design.md` 的结构化取消边界。
+
+- 是否仍存在会诱导 Agent 误判共享契约的表述？
+  - 当前计划已把判断依据写成“语义真源归属”和“是否为真正层间协作协议”，没有再用“被多个层 import”作为归属依据。`dayu.engine.__init__` re-export `dayu.contracts` 符号有轻微误读风险，但计划 §1.3 已说明这是结构契约导出，不是兼容 wrapper；可接受。
+
+## 7. 可接受风险
+
+- `dayu.engine.__init__` re-export `dayu.contracts` 全部符号：可接受。它让 Engine 调用方有单一 API surface，但需保持 `dayu.contracts` 为 canonical home，并通过测试保证 `dayu.contracts` 不 import `dayu.engine`。
+- `ToolAwaitKind.EXTERNAL_JOB` 是 Phase 0 保守初始集合：可接受。后续新增等待类型必须由消费 Phase 单独评审。
+- `AgentMessage` 四元封闭联合是 Phase 0 最小形态：可接受。Phase 1 Runner 若发现不足，应按计划停止并回到总控确认。
+- `ToolExecutionContext.correlation_id` 进入公共契约：可接受，但后续不得演变成 ToolTraceRecorder 私有入口。
+- README 默认不创建：可接受。Phase 0 仍是 contract 与边界测试切片，无用户向能力变化。
+
+## 8. 需要总控 / 用户确认的问题
+
+- 是否接受 §0 / §1.1 / §1.2 的契约分层范式与具体落点。
+- 是否接受 `dayu.engine.__init__` 对 `dayu.contracts` 符号做结构导出。
 - 是否接受 Engine 侧 runner done data 固定命名为 `RunnerDoneEngineData`。
 - 是否接受 `ToolAwaitKind` Phase 0 仅落地 `EXTERNAL_JOB`。
 - 是否接受 `AgentMessage` 四元封闭联合为 Phase 0 稳定最小形态。
-- 是否接受 `correlation_id: str | None` 进入 `ToolExecutionContext`，且仅作为中性关联字段。
-- 是否确认 Phase 0 全面禁止 Engine contracts 导入 `dayu.fins` 任意子模块。
-- 是否确认 Phase 0 默认不创建 `dayu/engine/README.md`。
+- 是否接受 `ToolExecutionContext.correlation_id: str | None` 作为中性关联字段。
+- 是否确认 Phase 0 全面禁止 `dayu.fins` 任意子模块导入。
+- 是否确认 Phase 0 默认不创建 `dayu/contracts/README.md` / `dayu/engine/README.md`。
 
-## 8. 总体验收判断
+## 9. 总体验收判断
 
-- 是否允许基于当前 Phase 0 计划开始实施？允许。
-- 如果不允许，需要先修哪些部分？不适用；当前无阻塞和重要问题。
-- 如果允许，Phase 0 的最小实施范围是什么？严格按 `docs/engine/phase0-plan.md` 第 1 / 2 / 5 / 6 / 7 节：只新建 `dayu/engine/contracts/` contract 类型、`dayu.engine.__all__` contract 导出白名单，以及 `tests/engine/` 架构与类型边界测试；不实现 Agent loop、Runner 实现、ToolRegistry、doc/web/fins tools、processors，不导出未实现函数式入口。
+- 是否允许基于当前 `docs/engine/phase0-plan.md` 开始 / 继续 Phase 0 实施？允许。
+- 如果不允许，需要先修哪些章节？不适用；当前无阻塞和重要问题。
+- 如果允许，Phase 0 最小实施范围是什么？按当前计划只落地 `dayu.contracts` 与 `dayu.engine.contracts` 的 pure contracts、`dayu.contracts.__all__` / `dayu.engine.__all__` 导出白名单、`tests/contracts/` 与 `tests/engine/` 的 import boundary / weak typing / protocol surface / event-outcome 封闭测试；不实现 Runner、Agent loop、ToolRegistry、doc/web/fins tools、processors，不导出 `run_agent_messages` / `run_agent_and_wait` / `AsyncAgent` / `AsyncOpenAIRunner`，不导出任何取消异常。
