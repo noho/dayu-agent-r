@@ -8,17 +8,20 @@
   取消打断。
 
 实际的 HTTP 阶段（建连 / 读流）取消由 Runner 顶层结合
-:func:`~dayu.engine.runners.openai.cancellation_helpers.await_or_cancel`
+:func:`~dayu.runtime.cancellation.await_or_cancel`
 驱动；本模块只承担 session 生命周期。
 """
 
 from __future__ import annotations
 
 import contextlib
+import logging
 from types import TracebackType
 from typing import Self
 
 import aiohttp
+
+_LOGGER: logging.Logger = logging.getLogger(__name__)
 
 
 class HTTPClient:
@@ -69,7 +72,9 @@ class HTTPClient:
             return
         self._closed = True
         if self._session is None:
+            _LOGGER.debug("http_client.close session_was_lazy=true")
             return
+        _LOGGER.debug("http_client.close session_was_lazy=false")
         with contextlib.suppress(
             RuntimeError, ConnectionResetError, OSError
         ):

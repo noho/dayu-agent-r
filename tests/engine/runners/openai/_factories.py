@@ -29,22 +29,10 @@ def make_spec(
     default_timeout_seconds: float = 30.0,
     max_retries: int = 0,
     provider_request: ProviderRequestExtension | None = None,
+    stream_idle_timeout_seconds: float | None = None,
+    stream_idle_heartbeat_seconds: float | None = None,
 ) -> RunnerSpec:
-    """构造一个常规 :class:`RunnerSpec`。
-
-    :param provider: provider 名称。
-    :param model: 模型名。
-    :param endpoint: 端点 URL。
-    :param api_key_ref: API key 引用。
-    :param headers: 请求头映射。
-    :param supports_tool_calling: 是否支持工具调用。
-    :param supports_streaming: 是否支持流式。
-    :param supports_stream_usage: 是否支持 ``stream_options.include_usage``。
-    :param default_timeout_seconds: 默认超时秒数。
-    :param max_retries: 最大重试次数。
-    :param provider_request: provider 请求扩展。
-    :returns: :class:`RunnerSpec` 实例。
-    """
+    """构造一个常规 :class:`RunnerSpec`。"""
 
     headers_value: dict[str, str] = {} if headers is None else dict(headers)
     return RunnerSpec(
@@ -59,6 +47,8 @@ def make_spec(
         default_timeout_seconds=default_timeout_seconds,
         max_retries=max_retries,
         provider_request=provider_request,
+        stream_idle_timeout_seconds=stream_idle_timeout_seconds,
+        stream_idle_heartbeat_seconds=stream_idle_heartbeat_seconds,
     )
 
 

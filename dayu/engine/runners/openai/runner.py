@@ -20,8 +20,11 @@ from __future__ import annotations
 
 import asyncio
 import json
-from collections.abc import AsyncIterator, Sequence
+import logging
+import time
+from collections.abc import AsyncIterator, Awaitable, Sequence
 from datetime import datetime, timezone
+from typing import TypeVar
 
 import aiohttp
 
@@ -37,10 +40,7 @@ from dayu.engine.contracts.runner_events import (
     RunnerHTTPErrorData,
 )
 from dayu.engine.contracts.runner_spec import RunnerCallOptions, RunnerSpec
-from dayu.engine.runners.openai.cancellation_helpers import (
-    _RunnerInterrupted,
-    await_or_cancel,
-)
+from dayu.engine.runners.openai.cancellation_helpers import _RunnerInterrupted
 from dayu.engine.runners.openai.error_classifier import (
     classify_exception,
     classify_http_status,
@@ -60,8 +60,49 @@ from dayu.engine.runners.openai.retry_policy import (
     parse_retry_after,
 )
 from dayu.engine.runners.openai.sse_parser import SSEParser
+from dayu.runtime.cancellation import (
+    WaitCancelled,
+    WaitCompleted,
+    WaitTimedOut,
+    await_or_cancel as _runtime_await_or_cancel,
+    wait_for_or_cancel as _runtime_wait_for_or_cancel,
+)
+
+_LOGGER: logging.Logger = logging.getLogger(__name__)
 
 _SSE_CONTENT_TYPE_FRAGMENT: str = "text/event-stream"
+
+_AwaitableResult = TypeVar("_AwaitableResult")
+
+
+async def await_or_cancel(
+    awaitable: Awaitable[_AwaitableResult],
+    *,
+    token: CancellationToken,
+) -> _AwaitableResult:
+    """Runner 内部 await + cancel 适配器。
+
+    把 :func:`dayu.runtime.cancellation.await_or_cancel` 的封闭联合返回
+    翻译为 Runner 内部协作式取消信号 :class:`_RunnerInterrupted`：
+
+    - :class:`WaitCompleted` 分支返回结果值。
+    - :class:`WaitCancelled` 分支抛出 :class:`_RunnerInterrupted`，由
+      生成器顶层捕获后直接退出生成器。
+
+    :param awaitable: 需要等待的 awaitable / coroutine。
+    :param token: 取消观察 token。
+    :returns: ``awaitable`` 的返回结果。
+
+    :raises _RunnerInterrupted: 当 ``token.is_cancelled()`` 在 awaitable
+        完成前先成立时抛出。
+    :raises Exception: 透传 ``awaitable`` 自身的异常。
+    """
+
+    outcome = await _runtime_await_or_cancel(awaitable, token=token)
+    if isinstance(outcome, WaitCancelled):
+        raise _RunnerInterrupted(outcome.reason or "cancelled during await")
+    assert isinstance(outcome, WaitCompleted)
+    return outcome.value
 
 
 class _AttemptFailedRetriable(Exception):
@@ -172,11 +213,28 @@ class AsyncOpenAIRunner:
         try:
             while True:
                 attempt += 1
+                _LOGGER.debug(
+                    "runner.attempt.start provider=%s model=%s attempt=%d "
+                    "stream=%s",
+                    self._spec.provider,
+                    self._spec.model,
+                    attempt,
+                    options.stream,
+                )
                 try:
                     async for event in self._do_attempt(payload, options):
                         yield event
                     return
                 except _AttemptFailedTerminal as failure:
+                    _LOGGER.warning(
+                        "runner.attempt.terminal provider=%s model=%s "
+                        "attempt=%d error_code=%s http_status=%s",
+                        self._spec.provider,
+                        self._spec.model,
+                        attempt,
+                        failure.error_code.value,
+                        failure.http_status,
+                    )
                     yield self._make_http_error_event(
                         error_code=failure.error_code,
                         http_status=failure.http_status,
@@ -193,6 +251,15 @@ class AsyncOpenAIRunner:
                         retry_after_seconds=failure.retry_after_seconds,
                     )
                     if not decision.should_retry:
+                        _LOGGER.warning(
+                            "runner.attempt.exhausted provider=%s model=%s "
+                            "attempt=%d error_code=%s http_status=%s",
+                            self._spec.provider,
+                            self._spec.model,
+                            attempt,
+                            failure.error_code.value,
+                            failure.http_status,
+                        )
                         yield self._make_http_error_event(
                             error_code=failure.error_code,
                             http_status=failure.http_status,
@@ -201,12 +268,27 @@ class AsyncOpenAIRunner:
                         )
                         yield self._make_done_event(FinishReason.ERROR)
                         return
+                    _LOGGER.info(
+                        "runner.attempt.retry provider=%s model=%s "
+                        "attempt=%d error_code=%s sleep=%.3fs",
+                        self._spec.provider,
+                        self._spec.model,
+                        attempt,
+                        failure.error_code.value,
+                        decision.sleep_seconds,
+                    )
                     await await_or_cancel(
                         asyncio.sleep(decision.sleep_seconds),
                         token=self._token,
                     )
         except _RunnerInterrupted:
             # 取消例外：直接退出生成器，不补 RunnerDoneData。
+            _LOGGER.debug(
+                "runner.cancelled provider=%s model=%s attempt=%d",
+                self._spec.provider,
+                self._spec.model,
+                attempt,
+            )
             return
 
     async def _do_attempt(
@@ -233,6 +315,12 @@ class AsyncOpenAIRunner:
             "Content-Type": "application/json",
             **dict(self._spec.headers),
         }
+        _LOGGER.debug(
+            "runner.http.post endpoint=%s body_bytes=%d stream=%s",
+            self._spec.endpoint,
+            len(body_bytes),
+            options.stream,
+        )
         try:
             response_ctx = session.post(
                 self._spec.endpoint, data=body_bytes, headers=headers
@@ -248,6 +336,11 @@ class AsyncOpenAIRunner:
                 retry_after_seconds=None,
             ) from exc
         try:
+            _LOGGER.debug(
+                "runner.http.response status=%d content_type=%s",
+                response.status,
+                response.headers.get("Content-Type") or "",
+            )
             if response.status != 200:
                 error_code = classify_http_status(response.status)
                 retry_after = parse_retry_after(
@@ -294,6 +387,29 @@ class AsyncOpenAIRunner:
     ) -> AsyncIterator[bytes]:
         """把响应 body 包装为带取消观察的字节迭代器。
 
+        根据 :class:`RunnerSpec.stream_idle_timeout_seconds` 是否启用，
+        分派到 :meth:`_iter_response_bytes_no_idle` 或
+        :meth:`_iter_response_bytes_with_idle`。
+
+        :param response: aiohttp 响应。
+        :returns: 字节迭代器。
+
+        :raises _AttemptFailedRetriable: 网络读取失败时。
+        :raises _RunnerInterrupted: token 命中时。
+        """
+
+        if self._spec.stream_idle_timeout_seconds is None:
+            async for chunk in self._iter_response_bytes_no_idle(response):
+                yield chunk
+            return
+        async for chunk in self._iter_response_bytes_with_idle(response):
+            yield chunk
+
+    async def _iter_response_bytes_no_idle(
+        self, response: aiohttp.ClientResponse
+    ) -> AsyncIterator[bytes]:
+        """无空闲检测的字节迭代器。
+
         :param response: aiohttp 响应。
         :returns: 字节迭代器。
 
@@ -316,6 +432,126 @@ class AsyncOpenAIRunner:
             if not chunk:
                 return
             yield chunk
+
+    async def _iter_response_bytes_with_idle(
+        self, response: aiohttp.ClientResponse
+    ) -> AsyncIterator[bytes]:
+        """带空闲心跳 / timeout 的字节迭代器。
+
+        在 ``readany()`` 上做「pending vs cancellation vs heartbeat /
+        timeout」三方 race：
+
+        - 单次等待时长不超过
+          ``stream_idle_heartbeat_seconds``（若设置且小于剩余 timeout）
+          或剩余 timeout 时长。
+        - 心跳到点：发出一条 DEBUG 日志，继续等待，复用同一 readany
+          pending task（不取消、不丢弃已收到的字节）。
+        - 累计 idle 超过 ``stream_idle_timeout_seconds``：把 pending
+          取消并抛 :class:`_AttemptFailedRetriable`(TIMEOUT)。
+        - cancellation：透传 :class:`_RunnerInterrupted`。
+
+        :param response: aiohttp 响应。
+        :returns: 字节迭代器。
+
+        :raises _AttemptFailedRetriable: 网络读取失败 / idle timeout。
+        :raises _RunnerInterrupted: token 命中。
+        """
+
+        timeout_seconds = self._spec.stream_idle_timeout_seconds
+        heartbeat_seconds = self._spec.stream_idle_heartbeat_seconds
+        assert timeout_seconds is not None  # post_init 已校验
+        while True:
+            pending: asyncio.Task[bytes] = asyncio.ensure_future(
+                response.content.readany()
+            )
+            idle_started = time.monotonic()
+            # try/finally 确保 pending 在任何退出路径（外层 cancel /
+            # aclose / 心跳 timeout 终结 / 网络异常 / 正常完成）都会被
+            # 取消并 await 到收口；正常完成时 _cancel_pending_readany
+            # 会因 pending.done() 直接 no-op。
+            try:
+                try:
+                    while True:
+                        elapsed = time.monotonic() - idle_started
+                        remaining = timeout_seconds - elapsed
+                        if remaining <= 0:
+                            _LOGGER.warning(
+                                "runner.stream_idle.timeout "
+                                "elapsed=%.3fs timeout=%.3fs",
+                                elapsed,
+                                timeout_seconds,
+                            )
+                            raise _AttemptFailedRetriable(
+                                error_code=RunnerHTTPErrorCode.TIMEOUT,
+                                http_status=None,
+                                message_text=(
+                                    "stream idle timeout: no bytes "
+                                    f"received in {timeout_seconds:.3f}s"
+                                ),
+                                retry_after_seconds=None,
+                            )
+                        if (
+                            heartbeat_seconds is not None
+                            and heartbeat_seconds <= remaining
+                        ):
+                            wait_seconds = heartbeat_seconds
+                        else:
+                            wait_seconds = remaining
+
+                        outcome = await _runtime_wait_for_or_cancel(
+                            pending,
+                            token=self._token,
+                            timeout_seconds=wait_seconds,
+                        )
+                        if isinstance(outcome, WaitCancelled):
+                            raise _RunnerInterrupted(
+                                outcome.reason
+                                or "cancelled during stream"
+                            )
+                        if isinstance(outcome, WaitTimedOut):
+                            # heartbeat 命中：发心跳日志后继续等。
+                            if heartbeat_seconds is not None:
+                                _LOGGER.debug(
+                                    "runner.stream_idle.heartbeat "
+                                    "elapsed=%.3fs timeout=%.3fs",
+                                    time.monotonic() - idle_started,
+                                    timeout_seconds,
+                                )
+                            continue
+                        assert isinstance(outcome, WaitCompleted)
+                        chunk = outcome.value
+                        break
+                except (aiohttp.ClientError, asyncio.TimeoutError) as exc:
+                    # readany() 自身网络层异常：包成 retriable。
+                    raise _AttemptFailedRetriable(
+                        error_code=classify_exception(exc),
+                        http_status=None,
+                        message_text=str(exc) or type(exc).__name__,
+                        retry_after_seconds=None,
+                    ) from exc
+            finally:
+                await self._cancel_pending_readany(pending)
+            if not chunk:
+                return
+            yield chunk
+
+    @staticmethod
+    async def _cancel_pending_readany(
+        pending: asyncio.Task[bytes],
+    ) -> None:
+        """取消并等待 ``readany`` pending task 收口。
+
+        :param pending: 需要取消的 readany task。
+        :returns: 无返回值；吞掉 ``CancelledError`` 与读取异常。
+        """
+
+        if pending.done():
+            return
+        pending.cancel()
+        try:
+            await pending
+        except (asyncio.CancelledError, Exception):  # noqa: BLE001
+            pass
 
     async def _safe_read_text(
         self, response: aiohttp.ClientResponse

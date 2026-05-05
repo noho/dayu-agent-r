@@ -111,6 +111,13 @@ class RunnerSpec:
     :param default_timeout_seconds: 默认请求超时秒数。
     :param max_retries: 最大重试次数。
     :param provider_request: provider 请求扩展；为 ``None`` 表示不带扩展。
+    :param stream_idle_timeout_seconds: SSE 流字节空闲 timeout 秒数；
+        为 ``None`` 表示不启用流空闲检测。Runner 在两个连续 byte chunk
+        之间等待超过该秒数仍无新字节时，按 retriable timeout 处理。
+    :param stream_idle_heartbeat_seconds: 流空闲心跳间隔秒数；只有在
+        ``stream_idle_timeout_seconds`` 已启用时才允许设置；用于上层
+        诊断日志的节流间隔，必须 ``<= stream_idle_timeout_seconds``。
+        为 ``None`` 表示不输出心跳日志。
     """
 
     provider: str
@@ -124,6 +131,47 @@ class RunnerSpec:
     default_timeout_seconds: float
     max_retries: int
     provider_request: ProviderRequestExtension | None
+    stream_idle_timeout_seconds: float | None = None
+    stream_idle_heartbeat_seconds: float | None = None
+
+    def __post_init__(self) -> None:
+        """校验 ``stream_idle_*`` 字段的语义一致性。
+
+        - ``stream_idle_heartbeat_seconds`` 启用时 ``stream_idle_timeout_seconds``
+          必须同时启用。
+        - 两者都必须为正数（> 0）。
+        - 心跳不得大于 timeout。
+
+        :raises ValueError: 当字段语义不一致时抛出。
+        """
+
+        timeout = self.stream_idle_timeout_seconds
+        heartbeat = self.stream_idle_heartbeat_seconds
+        if timeout is None and heartbeat is not None:
+            raise ValueError(
+                "stream_idle_heartbeat_seconds requires "
+                "stream_idle_timeout_seconds to be set"
+            )
+        if timeout is not None and timeout <= 0:
+            raise ValueError(
+                "stream_idle_timeout_seconds must be > 0; "
+                f"got {timeout!r}"
+            )
+        if heartbeat is not None and heartbeat <= 0:
+            raise ValueError(
+                "stream_idle_heartbeat_seconds must be > 0; "
+                f"got {heartbeat!r}"
+            )
+        if (
+            timeout is not None
+            and heartbeat is not None
+            and heartbeat > timeout
+        ):
+            raise ValueError(
+                "stream_idle_heartbeat_seconds must be <= "
+                "stream_idle_timeout_seconds; got "
+                f"heartbeat={heartbeat!r}, timeout={timeout!r}"
+            )
 
 
 @dataclass(frozen=True, slots=True)
