@@ -827,6 +827,46 @@ async def test_private_agent_concurrent_run_fail_fast() -> None:
 
 
 @pytest.mark.asyncio
+async def test_outer_asyncio_cancelled_error_propagates_and_closes() -> None:
+    """外层 task cancel 必须透传 asyncio.CancelledError，并关闭 Runner。"""
+
+    runner = _ScriptedRunner(
+        events=(
+            _event(
+                RunnerEventType.RUNNER_CONTENT_DELTA,
+                RunnerContentDeltaData(delta="hold"),
+            ),
+            _event(
+                RunnerEventType.RUNNER_DONE,
+                RunnerDoneData(finish_reason=FinishReason.STOP),
+            ),
+        ),
+        block_after_first_event=True,
+    )
+    agent = _AsyncAgent(request=_request(), runner=runner)
+    first_event_seen = asyncio.Event()
+
+    async def consume_until_cancelled() -> None:
+        """消费事件流，直到外层 task 取消。
+
+        :returns: 无返回值。
+        :raises asyncio.CancelledError: 外层 task 被取消时透传。
+        """
+
+        async for event in agent.run_messages():
+            if event.type is EngineEventType.RUNNER_CONTENT_DELTA:
+                first_event_seen.set()
+
+    task = asyncio.create_task(consume_until_cancelled())
+    await first_event_seen.wait()
+    task.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await task
+
+    assert runner.close_count == 1
+
+
+@pytest.mark.asyncio
 async def test_run_agent_and_wait_maps_final_failed_cancelled(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:

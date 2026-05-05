@@ -387,7 +387,7 @@
 - Runner 是否在所有终态关闭。
 - 取消是否优先于 final_answer。
 - 是否提前接入工具、trace、memory 或 Host 具体实现。
-- 常规 code review 通过后，必须再执行一轮 NEW / OLD AsyncAgent 与 Runner 消费边界的实现代码严格对照 review，确认 Phase 2 未让 OpenAI-compatible Runner 协议、事件流或状态机在 Agent 提升过程中漂移。
+- 常规 code review 通过后，必须再执行一轮 NEW / OLD AsyncAgent 无工具核心状态机与 Runner 消费边界的实现代码严格对照 review，确认 Phase 2 未让 OLD 高可靠 Agent run loop 语义或 OpenAI-compatible Runner 协议、事件流、状态机在 Agent 提升过程中漂移。
 
 ### 总控验收标准
 
@@ -396,7 +396,7 @@
 - `utils/` smoke 脚本可手动验证多个 OpenAI-compatible provider 的简单 prompt，并输出 DEBUG 级别 Runner / Agent 诊断日志；缺 key 时安全跳过。
 - import boundary tests 继续通过。
 - README 策略与用户决策一致：必须新建 `dayu/engine/README.md`，只写当前已落地事实；除该文件与必要的 `tests/README.md` 外不改其它 README。
-- 总控必须提醒并确认已完成 NEW / OLD AsyncAgent 与 Runner 消费边界严格对照 review；该 review 通过后，Phase 2 才能进入提交 / PR 流程。
+- 总控必须提醒并确认已完成 NEW / OLD AsyncAgent 无工具核心状态机与 Runner 消费边界严格对照 review；该 review 通过后，Phase 2 才能进入提交 / PR 流程。
 
 ### 用户确认点
 
@@ -470,6 +470,7 @@
 - Engine 是否仍不接触 ToolRegistry。
 - tool_result_accepted 事件与 ToolResultEnvelope 是否强类型。
 - 工具失败是否被误当 run_failed。
+- 常规 code review 通过后，必须再执行一轮 NEW / OLD Agent tool calling 状态机严格对照 review。该 review 以 OLD AsyncAgent / Runner 中高度可靠的普通工具调用语义为强参考源，但必须确认 NEW 已将工具执行职责重设到 Host 注入的 ToolExecutor，不能把 OLD Runner 执行工具的职责迁回 Engine / Runner。
 
 ### 总控验收标准
 
@@ -477,6 +478,7 @@
 - completed / failed 普通工具闭环可运行。
 - 架构测试继续阻止 ToolRegistry / tools 导入。
 - review Agent 确认工具调用控制流单一。
+- 总控必须提醒并确认已完成 NEW / OLD Agent tool calling 状态机严格对照 review；该 review 通过后，Phase 3 才能进入提交 / PR 流程。
 
 ### 用户确认点
 
@@ -630,12 +632,14 @@
 - emergency fallback 是否没有成为稳定公共接口。
 - continuation / fallback 是否受 AgentPolicy 控制。
 - 是否把工具级截断误迁回 Engine。
+- 常规 code review 通过后，必须再执行一轮 NEW / OLD context budget / continuation / fallback / 取消优先级严格对照 review。该 review 以 OLD Engine 中高度可靠的 context budget 与 continuation 实现素材为强参考源，但必须确认 NEW 不迁 transcript、conversation memory、trace store 或 Host 治理职责。
 
 ### 总控验收标准
 
 - Phase 5 可独立形成 PR；若依赖 Phase 3/4 场景，可在 PR 中明确覆盖路径。
 - 取消、budget、continuation、fallback 测试通过。
 - pyright 通过。
+- 总控必须提醒并确认已完成 NEW / OLD context budget / continuation / fallback 对照 review；该 review 通过后，Phase 5 才能进入提交 / PR 流程。
 - README 与当前实现一致。
 
 ### 用户确认点
