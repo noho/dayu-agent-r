@@ -30,9 +30,7 @@ from tests.engine.runners.openai._fakes import (
 
 
 @pytest.mark.asyncio
-async def test_cancel_before_connect_returns_no_done(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
+async def test_cancel_before_connect_returns_no_done() -> None:
     """连接前 token 已取消 → 立即退出，不发出 Done。"""
 
     token = FakeCancellationToken(cancelled=True)
@@ -62,9 +60,7 @@ async def test_cancel_before_connect_returns_no_done(
 
 
 @pytest.mark.asyncio
-async def test_cancel_during_sse_chunk_wait_returns_no_done(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
+async def test_cancel_during_sse_chunk_wait_returns_no_done() -> None:
     """SSE chunk 等待中 token 触发取消 → 立即终止，不发 Done。"""
 
     token = FakeCancellationToken()

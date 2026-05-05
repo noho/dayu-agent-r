@@ -46,6 +46,7 @@ from dayu.engine.contracts.runner_events import (
 )
 from dayu.engine.runners.openai._types import (
     _OpenAIToolCallDelta,
+    _OpenAIToolCallFunction,
     _OpenAIUsage,
     _ReasoningProtocolHook,
 )
@@ -112,7 +113,6 @@ class SSEParser:
         self._content_buffer: list[str] = []
         self._reasoning_buffer: list[str] = []
         self._finish_reason: FinishReason | None = None
-        self._usage_emitted: bool = False
         self._byte_buffer: bytearray = bytearray()
         self._line_carry: str = ""
         self._data_lines: list[str] = []
@@ -341,7 +341,7 @@ class SSEParser:
             delta["type"] = delta_type
         function = raw.get("function")
         if isinstance(function, dict):
-            func_payload: dict[str, str] = {}
+            func_payload: _OpenAIToolCallFunction = {}
             name = function.get("name")
             if isinstance(name, str):
                 func_payload["name"] = name
@@ -349,7 +349,7 @@ class SSEParser:
             if isinstance(arguments, str):
                 func_payload["arguments"] = arguments
             if func_payload:
-                delta["function"] = func_payload  # type: ignore[typeddict-item]
+                delta["function"] = func_payload
         extra_content = raw.get("extra_content")
         if isinstance(extra_content, dict):
             cleaned: dict[str, dict[str, JsonValue]] = {}
@@ -426,7 +426,6 @@ class SSEParser:
             "completion_tokens": completion_tokens,
             "total_tokens": total_tokens,
         }
-        self._usage_emitted = True
         yield _make_event(
             RunnerUsageRecordedData(
                 prompt_tokens=normalized["prompt_tokens"],
