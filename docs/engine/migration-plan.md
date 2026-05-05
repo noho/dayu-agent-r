@@ -32,13 +32,13 @@
 - Dayu 是宿主强约束下的 `LLM in the loop`，不是 `LLM on the loop`。
 - 分层固定为 `UI -> Service -> Host -> Engine`。
 - Host 是 Engine 生命周期、取消、治理的强约束真源；具体覆盖 Engine 内部 Agent / AsyncAgent / AsyncOpenAIRunner 的创建、关闭、取消观察与运行治理，以及 Host 侧 ToolRegistry / ToolRuntime、长事务等待与恢复。
-- Engine 只消费 Host 注入的 run 输入、RunnerSpec、tool schema 快照、ToolExecutor protocol 和 cancellation token。
+- Engine 只消费 Host 通过 EngineWorker capability 提供的 run 输入、RunnerSpec、tool schema 快照、ToolExecutor protocol 和 cancellation token。
 - Engine 不反向依赖 Host / Service / UI 的具体实现。
 - Engine 不注册工具、不持有 ToolRegistry、不执行权限审计、不写 transcript、不写 trace store、不实现 conversation memory。
 - Runner 只负责 provider 请求、响应流归一、usage、错误分类、资源关闭和取消观察；Runner 不执行工具。
 - Agent 是 Engine 内部推理循环实现；Host 稳定依赖函数式入口和 contracts，不依赖具体 `AsyncAgent` 类。
 - EngineEvent 是 Engine -> Host 的唯一观测边界；显式契约事实必须进入强类型 data，不得塞进 metadata。
-- ToolExecutor 是 Host 与 Engine 围绕 tool calling 的最小协议，只暴露 `execute(request) -> ToolExecutionOutcome`。
+- ToolExecutor 是 Host / EngineWorker 与 Engine 围绕 tool calling 的最小协议，只暴露 `execute(request) -> ToolExecutionOutcome`；EngineWorker 只是替 Host 在选定执行环境中代持 ToolExecutor，不拥有工具治理真源。
 - 第一阶段 ToolExecutionOutcome 只落地 `completed | failed | awaiting`。
 - `Source`、`DocumentProcessor`、`ProcessorRegistry` 在 Engine / Host 公共边界不可见。
 - 财报文档存取必须且只能通过 `dayu.fins.storage` 下的仓储协议与仓储实现完成。
@@ -53,9 +53,10 @@
 | Phase 1 | Runner protocol 与 OpenAI-compatible Runner | 迁移 provider 协议归一能力，Runner 只产出 RunnerEvent | Phase 0 contracts，OLD `async_openai_runner.py` 可复用片段 | `AsyncRunner` protocol 当前实现、RunnerEvent 流、RunnerSpec provider extension | 不迁 `AsyncCliRunner`，不迁 Runner 工具执行，不保留 `call(**extra_payloads)` | Runner 测试证明 tool call 只产生 RunnerEvent，不调用 ToolExecutor |
 | Phase 1.5 | Log / Runner diagnostics 与 SSE idle | 引入 `dayu.runtime` 公共运行时基础设施（log 装配 + cancellation race helper），给 Phase 1 Runner 补齐运行时边界日志，落地 chunk 级 SSE idle heartbeat / hard timeout（issue #6） | Phase 1 Runner、`dayu/contracts/cancellation.py`、OLD `dayu/log.py` / `sse_parser.py` 证据 | `dayu/runtime/log.py`、`dayu/runtime/cancellation.py`、Runner 边界 logger、`RunnerSpec.stream_idle_*` 字段、idle 控制流 | 不污染 RunnerEvent / EngineEvent；不新增 Engine / Runner 公共终态异常；Engine 不 import `dayu.runtime.log`；不迁 OLD `Log` 单例 wrapper；不写 README（统一推迟到 Phase 6） | 诊断字段在 caplog 中可见；idle 测试集（disabled / heartbeat / timeout / timeout-only / cancel wins / retry / aclose / outer cancel）全绿；事件契约无 log/idle 字段污染；issue #6 可关闭 |
 | Phase 2 | Agent run loop 骨架 | 建立 run-scoped Agent 和函数式入口 | Phase 0 contracts，Phase 1 Runner，Phase 1.5 logger / cancellation runtime | `run_agent_messages` / `run_agent_and_wait` 骨架、RunnerEvent -> EngineEvent 提升、terminal 收口、`dayu/engine/README.md` 当前事实手册 | 不接入 ToolRegistry，不实现 long-running tool waiting，不迁 doc/web/fins 工具 | 无工具 run 可完成 final_answer / run_failed / run_cancelled，并关闭 Runner；Engine README 只写 Phase 2 已落地事实 |
-| Phase 3 | Host 注入 ToolExecutor 的 tool calling 闭环 | 建立普通工具调用闭环 | Phase 2 Agent loop，Phase 0 ToolExecutor contract | 模型 tool call -> ToolExecutionRequest -> ToolExecutionOutcome -> tool message 注入下一轮 | Engine 不注册工具，不执行权限、审计、路径白名单、长事务治理 | completed / failed 工具结果可进入下一轮；无双执行、无事件驱动工具执行 |
+| Phase 3 | EngineWorker 代持 ToolExecutor 的 tool calling 闭环 | 建立普通工具调用闭环，并按 Host capability 口径固定 EngineWorker / ToolExecutor 边界；同步落地 max_iterations force-answer 与连续失败工具批次保护 | Phase 2 Agent loop，Phase 0 ToolExecutor contract，`docs/host/design.md` | 模型 tool call -> ToolExecutionRequest -> ToolExecutionOutcome -> LLM-facing tool message 注入下一轮；默认 max_iterations force-answer；连续失败工具批次按 fallback mode 收口；测试用 fake ToolExecutor 表示 EngineWorker 替 Host 代持的执行能力 | Engine 不注册工具，不执行权限、审计、路径白名单、长事务治理；不实现 EngineWorker / RPC 生产代码；Runner 不执行工具 | completed / failed 工具结果可进入下一轮；内部 ToolResultEnvelope 不直接进入 LLM-facing content；max_iterations 默认 force-answer；连续失败批次保护可观测；无双执行、无事件驱动工具执行；计划和 review 均确认 EngineWorker 是 Host capability 且不拥有治理权 |
+| Phase 3 后置 patch | provider_state / reasoning roundtrip | 在普通工具闭环落地后，把 Phase 3 过渡性的 reasoning_content 无脑写回改为 provider-specific 策略 | Phase 3 tool loop，真实 provider smoke / NEW-OLD 对照证据 | 明确 `ToolCallProviderState` 扩展策略，判断哪些 provider 需要把 reasoning_content 纳入 provider_state 或请求投影策略 | 不把 Phase 3 的无条件写回固化为跨 provider 稳定规则 | provider_state 可避免多轮工具调用协议断链；reasoning_content 写回策略按 provider 明确 |
 | Phase 4 | completed / failed / awaiting outcome | 落地三类 outcome，awaiting 只产出挂起事实 | Phase 3 tool loop，ToolAwaitSpec / ToolAwaitSnapshot | `tool_awaiting` / `run_suspended` 事件，awaiting outcome 穷尽匹配测试 | 不实现 approval、detached、retry_after、artifact_ready 等扩展 outcome | awaiting 不轮询、不 sleep、不创建 Host wait record；只结束本次 run |
-| Phase 5 | context budget、continuation、取消收口 | 迁移确定性预算、续写、fallback、取消优先级 | Phase 2-4 Agent/Runner 主链路 | budget state、continuation/fallback 最小策略、取消 terminal 收口 | 不实现 conversation memory，不做语义压缩，不写 transcript | 取消优先于 final_answer；context_compaction_requested 只发事件 |
+| Phase 5 | context budget、continuation、broader fallback、取消收口 | 迁移确定性预算、续写、broader fallback 与更完整取消收口；不承接 Phase 3 已落地的 max_iterations force-answer / 连续失败工具批次保护 | Phase 2-4 Agent/Runner 主链路 | budget state、continuation / broader fallback 最小策略、取消 terminal 收口 | 不实现 conversation memory，不做语义压缩，不写 transcript；不把 Phase 3 force-answer 后移到本阶段 | 取消优先于 final_answer；context_compaction_requested 只发事件；Phase 3 的 max_iterations force-answer 语义保持不回退 |
 | Phase 6 | 文档同步与阶段收口 | 按实际代码同步 README 和计划状态 | Phase 0-5 已落地代码和测试 | `dayu/engine/README.md` 等必要 README，同步后的 docs 边界 | 不写未来设计进 README，不把 docs 草案当用户手册 | README 与当前代码一致；docs、测试、pyright、PR checklist 完整 |
 
 ## 5. Phase 0 详细计划
@@ -401,40 +402,62 @@
 ### 用户确认点
 
 - 是否接受函数式入口作为 Host 首选依赖表面。
-- 是否确认 Phase 3 开始接入 Host 注入的 ToolExecutor。
+- 是否确认 Phase 3 开始接入 EngineWorker 替 Host 代持并提供的 ToolExecutor。
 
 ## 8. Phase 3 详细计划
 
 ### 目标
 
-建立 Host 注入 ToolExecutor 的普通 tool calling 闭环：模型 tool call -> ToolExecutionRequest -> ToolExecutionOutcome -> tool message 注入下一轮 Runner。
+建立 EngineWorker 替 Host 代持 ToolExecutor 的普通 tool calling 闭环：模型 tool call -> ToolExecutionRequest -> ToolExecutionOutcome -> LLM-facing tool message 注入下一轮 Runner。同时在 Phase 3 内完成 max_iterations force-answer 与连续失败工具批次保护，避免把 OLD 可靠主链路拆到 Phase 5。
+
+Phase 3 不插入独立 Phase 2.5；`docs/host/design.md` 中关于 EngineWorker 的决策作为本阶段前置设计输入一并吸收：
+
+- EngineWorker 是 Host 的 capability，不是新的顶层业务层。
+- Host 仍是治理真源。
+- EngineWorker 代表 Host 持有执行环境，并替 Host 代持、提供 ToolExecutor。
+- Local Agent 表示 Engine + tools 在本地 worker 侧执行。
+- Remote Agent 表示 Engine + tools 在远程 worker 侧执行。
+- Engine 不知道 Local / Remote / RPC，只消费 ToolExecutor protocol。
+- Phase 3 测试中的 fake ToolExecutor 只表示 EngineWorker 替 Host 代持 ToolExecutor 的测试替身，不代表生产 Host 实现。
 
 ### 前置条件
 
 - Phase 2 Agent loop 已合并。
 - Phase 0 ToolExecutor、ToolExecutionRequest、ToolExecutionOutcome 已稳定。
 - Runner 已能输出 runner_tool_call_delta / runner_tool_calls_completed 或等价 RunnerEvent。
+- `docs/host/design.md` 已记录 EngineWorker 是 Host capability、ToolExecutor 由 EngineWorker 替 Host 代持并提供给 Engine 的决策。
 
 ### 迁移 Agent 任务
 
 - Agent 将 Runner tool call 归一为 ToolCallRequest。
 - Agent 发出 `tool_call_requested` EngineEvent，该事件只用于观测。
 - Agent 构造 ToolExecutionRequest，补齐 `session_id`、`run_id`、`iteration_id`、`tool_call_id`、`index_in_iteration`、`cancellation_token`、可选 `correlation_id`。
-- Agent 调用 Host 注入的 `tool_executor.execute(request)`。
-- completed / failed outcome 返回后，Agent 发出 `tool_result_accepted`，并把 LLM-facing tool message 注入下一轮 Runner。
+- Agent 调用 EngineWorker 替 Host 代持并提供的 `tool_executor.execute(request)`。
+- completed / failed outcome 返回后，Agent 发出 `tool_result_accepted`，并通过 Engine 内部专用 LLM-facing projection helper 把 tool message 注入下一轮 Runner；禁止把内部 `ToolResultEnvelope` 直接作为 `ToolMessage.content`。
 - 工具执行失败作为普通工具失败结果进入上下文，由模型继续恢复或解释。
+- 补齐 `FinalAnswerData.degraded`；force-answer 产出 `degraded=True`，content_filter 产出 `filtered=True, degraded=True`，普通 final answer 为 `degraded=False`。
+- 补齐 `AgentPolicy.fallback_mode` / `fallback_prompt` / `max_consecutive_failed_tool_batches`；默认 fallback mode 为 force-answer，连续失败工具批次阈值参考 OLD 为 2。
+- `max_iterations` 耗尽时，最后一轮允许的 tool call 照常执行并注入结果；默认追加 `UserMessage` fallback prompt、调用 Runner 时 `tools=()`、不调用 ToolExecutor，生成 `final_answer(degraded=True)`；`RAISE_ERROR` 时才 `run_failed("max_iterations_exceeded")`。
+- 连续失败工具批次达到阈值后按 fallback mode 收口：force-answer 路径追加 `UserMessage` fallback prompt、Runner 调用 `tools=()`、不调用 ToolExecutor；raise-error 路径产出明确错误码。
 - 保持 ToolSchema 快照来自 AgentRunRequest，不从 ToolExecutor 再读取 schema。
+- 新增测试用极小 fake tool（例如 `add_numbers(a, b) -> a + b`），作为 EngineWorker 替 Host 代持 ToolExecutor 的状态机护栏，证明工具只执行一次、事件只观测不触发执行、completed / failed outcome 能进入下一轮 Runner。
+- 可新增 `utils/` 下 Phase 3 手动 smoke 脚本，用真实 provider + 极小 fake tool 验证 tool calling 闭环；该脚本不进入生产包、不纳入真实联网 pytest。
 
 ### 允许复用的 OLD implementation 片段
 
 - OLD tool call ID、index、arguments 归一场景。
-- OLD ToolResultEnvelope -> LLM-facing projection 的思路，但内部契约必须保持强类型。
+- OLD `project_for_llm()` 的 LLM-facing projection 语义：成功 dict 展开、成功非 dict 包 `content`、失败只暴露 `error/message/hint`、空结果保持 tool message 配对、truncation 只保留 LLM 可执行字段；内部契约必须保持 NEW 强类型。
+- OLD max_iterations -> force-answer 默认收口语义。
+- OLD content_filter `filtered=True, degraded=True` 语义。
+- OLD 连续失败工具批次保护语义。
 - duplicate call guard 的场景证据，可作为后续 AgentPolicy 的实现素材。
 
 ### 禁止迁移项
 
 - Engine 内 ToolRegistry。
 - Engine 内工具注册、参数校验、权限、审计、路径白名单。
+- EngineWorker / LocalEngineWorker / RemoteEngineWorkerProxy / RemoteEngineWorkerStub 生产实现。
+- 远程 RPC 协议。
 - Runner 执行工具。
 - Host 根据 `tool_call_requested` 事件另行执行工具。
 - `get_schemas()` / `get_tool_display_info()` 回到 ToolExecutor。
@@ -448,9 +471,17 @@
 - `tool_call_requested` 事件不触发第二套执行路径。
 - completed outcome 注入下一轮 tool message。
 - failed outcome 注入下一轮失败工具消息。
+- LLM-facing projection 测试：成功 object 展开、成功 scalar/string 包 `content`、失败不带 `ok`、`hint=None` 省略、空结果注入非空占位、truncation 不泄漏内部治理对象。
+- max_iterations 默认 force-answer：最后一轮 tool call 照常执行并注入结果，fallback prompt 追加为 `UserMessage`，Runner 调用 `tools=()`，force-answer 不调用 ToolExecutor，final answer `degraded=True`。
+- `fallback_mode=RAISE_ERROR` 才 `run_failed("max_iterations_exceeded")`；force-answer 空内容 `run_failed("force_answer_empty")`。
+- content_filter 产出 `filtered=True, degraded=True`。
+- 连续失败工具批次达到阈值后分别覆盖 force-answer / raise-error；成功批次会清零连续失败计数。
+- max_iterations、连续失败工具批次、force-answer、content_filter 路径都必须断言 terminal event 唯一与 cancellation 优先。
 - ToolExecutionRequest 字段完整性测试。
 - ToolExecutor 异常边界测试：若 Host executor 违反契约，应进入 run_failed 或协议错误，而不是裸异常泄漏。
 - Runner 不依赖 ToolExecutor 的架构测试继续通过。
+- fake `add_numbers` 工具护栏测试：completed outcome 注入下一轮 tool message，failed outcome 注入下一轮失败工具消息，ToolExecutor 只调用一次，Engine 不持有 ToolRegistry。
+- Phase 3 smoke 脚本轻量测试：缺 key 友好跳过、参数解析、安全输出、fake tool 行为，不真实联网。
 
 ### pyright 要求
 
@@ -459,31 +490,78 @@
 
 ### README / docs 同步要求
 
-- 更新 `dayu/engine/README.md` 的 tool calling 状态机。
+- 更新 `dayu/engine/README.md` 的 tool calling 状态机时，只能明确 ToolExecutor 由 EngineWorker 替 Host 代持并提供、EngineWorker 是 Host capability。
 - 不写 Host ToolRegistry 具体实现细节。
+- 不写 EngineWorker / RPC 生产实现细节。
 - 不写 doc/web/fins 工具使用手册。
 
 ### review Agent 审查重点
 
 - 是否存在双执行风险。
+- 是否按 `docs/host/design.md` 采用 EngineWorker 口径，而不是把 ToolExecutor 写死为 Host 本进程直接执行。
 - ToolExecutor 是否保持最小协议。
 - Engine 是否仍不接触 ToolRegistry。
 - tool_result_accepted 事件与 ToolResultEnvelope 是否强类型。
+- LLM-facing projection 是否与内部 ToolResultEnvelope 分离，且没有把 `ok/value` envelope 直接塞给 LLM。
+- max_iterations 是否默认 force-answer，且 fallback prompt 是 `UserMessage`、Runner 调用 `tools=()`、不调用 ToolExecutor。
+- content_filter 是否 `filtered=True, degraded=True`。
+- 连续失败工具批次保护是否在 Agent loop 内实现，且没有误写成 Host ToolRegistry / ToolRuntime 治理。
 - 工具失败是否被误当 run_failed。
-- 常规 code review 通过后，必须再执行一轮 NEW / OLD Agent tool calling 状态机严格对照 review。该 review 以 OLD AsyncAgent / Runner 中高度可靠的普通工具调用语义为强参考源，但必须确认 NEW 已将工具执行职责重设到 Host 注入的 ToolExecutor，不能把 OLD Runner 执行工具的职责迁回 Engine / Runner。
+- 常规 code review 通过后，必须再执行一轮 NEW / OLD Agent tool calling 状态机严格对照 review。该 review 以 OLD AsyncAgent / Runner 中高度可靠的普通工具调用语义为强参考源，但必须确认 NEW 已将工具执行职责重设到 EngineWorker 替 Host 代持并提供的 ToolExecutor，不能把 OLD Runner 执行工具的职责迁回 Engine / Runner。
 
 ### 总控验收标准
 
 - Phase 3 可独立形成 PR。
 - completed / failed 普通工具闭环可运行。
+- LLM-facing projection、max_iterations force-answer、content_filter degraded、连续失败工具批次保护均按 `docs/engine/phase3-plan.md` 覆盖。
 - 架构测试继续阻止 ToolRegistry / tools 导入。
 - review Agent 确认工具调用控制流单一。
+- review Agent 确认 EngineWorker 是 Host capability 的边界未被破坏；Phase 3 未实现 EngineWorker / RPC 生产代码。
 - 总控必须提醒并确认已完成 NEW / OLD Agent tool calling 状态机严格对照 review；该 review 通过后，Phase 3 才能进入提交 / PR 流程。
 
 ### 用户确认点
 
 - 是否确认普通工具失败进入 LLM 上下文，由模型恢复或解释。
 - 是否确认 Phase 4 再处理 awaiting，不在 Phase 3 提前实现。
+
+## 8.5 Phase 3 后置 patch：provider_state / reasoning roundtrip
+
+### 动机
+
+`provider_state` 来自模型 provider 的 tool call 响应。Agent 在下一轮把 assistant tool_calls 注入给 Runner 时，需要按 provider 协议把必要状态原样带回 provider，避免某些 provider 的多轮工具调用协议断链。
+
+当前 `ToolCallProviderState` 只有一个已确认形态：`GeminiToolCallState`。Phase 3 先确保 `provider_state` 有强类型通道，并能随 tool roundtrip 保留；Phase 3 后再用专门 patch 判断是否扩展更多 provider-specific state。
+
+Phase 3 为了先落地普通工具闭环，可以按 OLD 已证明可行的行为，把 `reasoning_content` 无条件写回后续请求。这个行为的依据来自部分模型 API 文档：思考模式下多轮工具调用时，模型可能在返回 tool_calls 的同时返回 `reasoning_content`，后续请求保留历史 `reasoning_content` 可能获得更好表现。
+
+但这只是 Phase 3 过渡实现，不能直接变成 NEW 的跨 provider 稳定契约：
+
+- 有些 provider 可能要求写回 `reasoning_content`。
+- 有些 provider 可能不要求写回。
+- 有些 provider 可能拒绝带回不支持的 reasoning 字段。
+
+因此，Phase 3 后置 patch 要把 `reasoning_content` 无脑写回改为 provider-specific 非无脑写回：哪些 provider 需要写回、写到哪里、由 Agent message 承载还是由 provider_state / provider adapter 投影，都必须按 provider 明确建模。
+
+### patch 目标
+
+- 复核 Phase 3 实现中 `ToolCallProviderState` 的数据流：provider 响应 -> RunnerEvent / ToolCallRequest -> EngineEvent -> assistant tool_calls -> 下一轮 Runner 请求。
+- 基于真实 provider smoke、API 文档和 NEW / OLD 对照结果，判断哪些 provider 需要写回 `reasoning_content`，以及是否需要把它纳入 provider-specific state。
+- 如需支持 reasoning roundtrip，优先通过 `ToolCallProviderState` 的封闭联合扩展或 provider adapter 的显式请求投影表达，而不是把 `reasoning_content` 塞进 `metadata` 或长期在所有 provider 的 `AssistantMessage` 中无条件保留。
+- 明确 provider adapter 负责把 provider-specific state 投影回最终请求 payload；Agent 只传递强类型 state，不拼 provider 私有字段。
+
+### 禁止事项
+
+- 禁止把 Phase 3 的无条件写回 `reasoning_content` 过渡实现固化为 NEW 默认行为。
+- 禁止用 `metadata`、裸 dict、`Any` 或 provider 字符串分支承载 roundtrip state。
+- 禁止让 Runner 重新执行工具或依赖 ToolExecutor。
+- 禁止让 Host / EngineWorker 的治理所有权进入 provider_state。
+
+### 验收信号
+
+- 每个 provider 的 reasoning roundtrip 策略有明确证据来源：API 文档、真实 smoke 或可复现 provider 行为。
+- `ToolCallProviderState` 仍是封闭强类型联合；当前仅有 `GeminiToolCallState` 时，不提前伪造其它 provider state。
+- 不需要 reasoning roundtrip 的 provider 不会被写入多余 reasoning 字段。
+- 需要 reasoning roundtrip 的 provider 能在多轮 tool calling 中保持协议不断链。
 
 ## 9. Phase 4 详细计划
 
@@ -564,7 +642,9 @@
 
 ### 目标
 
-迁移确定性 context budget 原语、continuation / fallback 最小策略和取消收口规则。保证取消优先于 final_answer，Runner 阻塞边界和 Agent terminal 前都观察取消。
+迁移确定性 context budget 原语、continuation / broader fallback 最小策略和取消收口规则。保证取消优先于 final_answer，Runner 阻塞边界和 Agent terminal 前都观察取消。
+
+Phase 5 仍保留 context budget、continuation、provider error / broader fallback 等能力，但不得让后续 Agent 误以为 max_iterations force-answer 或连续失败工具批次保护后移到 Phase 5；这两项已是 Phase 3 blocker。
 
 ### 前置条件
 
@@ -578,7 +658,7 @@
 - Engine 只实现待注入下一轮 LLM tool message 的确定性预算裁剪；工具级截断、fetch_more cursor、TTL、scope token 仍归 Host ToolRuntime，不进入 Engine。
 - 实现 `context_compaction_requested` EngineEvent。
 - 实现最小 continuation 策略，例如 finish_reason=length 的可控续写次数。
-- 实现最小 fallback 策略，例如 content_filter / provider error 的结构化失败或降级。
+- 实现 broader fallback 策略，例如 provider error 的结构化失败或降级；不得重新定义 Phase 3 已固定的 max_iterations force-answer、连续失败工具批次保护或 content_filter degraded 语义。
 - Agent 每轮 iteration 起点检查取消。
 - Runner 阻塞边界观察取消。
 - Agent 在提交 final_answer 前再次检查取消。
@@ -608,7 +688,7 @@
 - 工具结果注入前裁剪测试。
 - context_compaction_requested 事件测试。
 - continuation 次数限制测试。
-- fallback terminal 测试。
+- broader fallback terminal 测试；max_iterations force-answer 与连续失败工具批次保护只做回归确认，不作为 Phase 5 新能力。
 - 取消优先级测试：取消与 final_answer 竞争时产出 run_cancelled。
 - Runner 阻塞取消测试。
 - Agent terminal 前取消检查测试。
@@ -630,7 +710,7 @@
 - 取消是否绝对优先于 final_answer。
 - Engine 是否只发 context_compaction_requested，不实现 memory。
 - emergency fallback 是否没有成为稳定公共接口。
-- continuation / fallback 是否受 AgentPolicy 控制。
+- continuation / broader fallback 是否受 AgentPolicy 控制，且没有覆盖 Phase 3 的 max_iterations force-answer / 连续失败工具批次语义。
 - 是否把工具级截断误迁回 Engine。
 - 常规 code review 通过后，必须再执行一轮 NEW / OLD context budget / continuation / fallback / 取消优先级严格对照 review。该 review 以 OLD Engine 中高度可靠的 context budget 与 continuation 实现素材为强参考源，但必须确认 NEW 不迁 transcript、conversation memory、trace store 或 Host 治理职责。
 
