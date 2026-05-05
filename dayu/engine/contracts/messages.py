@@ -23,6 +23,7 @@ from enum import StrEnum
 from typing import Literal, TypeAlias
 
 from dayu.contracts.json_value import JsonValue
+from dayu.contracts.tool_call import ToolCallProviderState
 
 
 class AgentMessageRole(StrEnum):
@@ -73,11 +74,18 @@ class AssistantToolCall:
     :param id: 工具调用唯一 id（与 :class:`ToolMessage.tool_call_id` 配对）。
     :param name: 工具名称。
     :param arguments: 工具参数，强类型 JSON 映射。
+    :param provider_state: provider 私有续航状态；为 ``None`` 表示当前
+        provider 不需要在 tool call roundtrip 中携带额外签名 / 上下文。
+        典型用法：Gemini 的 ``thought_signature`` 在多轮 roundtrip 中由
+        :class:`~dayu.contracts.tool_call.ToolCallRequest.provider_state`
+        透传至本字段，回写到 outbound assistant message 时再以
+        ``extra_content.google.thought_signature`` 形态发回 provider。
     """
 
     id: str
     name: str
     arguments: Mapping[str, JsonValue]
+    provider_state: ToolCallProviderState | None
 
 
 @dataclass(frozen=True, slots=True)

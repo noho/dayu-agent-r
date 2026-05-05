@@ -32,6 +32,8 @@ from dayu.contracts.tool_await import (
     ToolAwaitSpec,
 )
 from dayu.contracts.tool_call import (
+    GeminiToolCallState,
+    ToolCallProviderState,
     ToolCallRequest,
     ToolExecutionContext,
     ToolExecutionRequest,
@@ -58,11 +60,13 @@ from dayu.contracts.tool_schema import (
 
 __all__ = [
     "CancellationToken",
+    "GeminiToolCallState",
     "JsonValue",
     "ToolAwaitKind",
     "ToolAwaitSnapshot",
     "ToolAwaitSpec",
     "ToolAwaitingOutcome",
+    "ToolCallProviderState",
     "ToolCallRequest",
     "ToolCompletedOutcome",
     "ToolExecutionContext",

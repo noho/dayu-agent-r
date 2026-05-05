@@ -2,10 +2,11 @@
 
 通过 AST 扫描 ``dayu/engine/`` 下所有 ``.py`` 文件的 import 语句，确保：
 
-- Phase 0 当前禁止：``aiohttp`` / ``requests`` / ``httpx``。
-- Engine core 永久禁止：``dayu.host`` / ``dayu.service`` / ``dayu.ui`` /
-  ``dayu.fins`` / ``dayu.engine.tools`` / ``dayu.engine.processors`` /
-  任何 ``*tool_trace*`` 模块。
+- Phase 1 起 ``aiohttp`` 仅允许出现在 ``dayu/engine/runners/openai/``
+  子树（OpenAI Runner 实现）；其它子树禁止。
+- Engine core 永久禁止：``requests`` / ``httpx`` / ``dayu.host`` /
+  ``dayu.service`` / ``dayu.ui`` / ``dayu.fins`` / ``dayu.engine.tools``
+  / ``dayu.engine.processors`` / 任何 ``*tool_trace*`` 模块。
 """
 
 from __future__ import annotations
@@ -15,7 +16,10 @@ from pathlib import Path
 
 import dayu.engine as engine
 
-PHASE0_FORBIDDEN_PREFIXES: tuple[str, ...] = ("aiohttp", "requests", "httpx")
+# Phase 1：``aiohttp`` 在 OpenAI Runner 实现子树放开；其它仍禁。
+GLOBAL_FORBIDDEN_PREFIXES: tuple[str, ...] = ("requests", "httpx")
+AIOHTTP_PREFIX: str = "aiohttp"
+AIOHTTP_ALLOWED_SUBPATH: tuple[str, ...] = ("runners", "openai")
 
 ENGINE_CORE_FORBIDDEN_PREFIXES: tuple[str, ...] = (
     "dayu.host",
@@ -71,15 +75,33 @@ def _matches_substring(module: str, substrings: tuple[str, ...]) -> bool:
     return any(s in module for s in substrings)
 
 
+def _path_inside_allowed_aiohttp_subtree(file_path: Path) -> bool:
+    """文件是否位于 ``dayu/engine/runners/openai/`` 子树。"""
+
+    try:
+        rel = file_path.relative_to(_engine_root())
+    except ValueError:
+        return False
+    parts = rel.parts
+    return (
+        len(parts) >= len(AIOHTTP_ALLOWED_SUBPATH)
+        and parts[: len(AIOHTTP_ALLOWED_SUBPATH)] == AIOHTTP_ALLOWED_SUBPATH
+    )
+
+
 def test_engine_does_not_import_phase0_forbidden_modules() -> None:
-    """Phase 0 暂时禁止的运行期模块不得被 Engine 导入。"""
+    """``requests`` / ``httpx`` 全局禁止；``aiohttp`` 仅 openai runner 子树允许。"""
 
     violations: list[tuple[str, str]] = []
     for file_path in _iter_engine_python_files():
         for module in _imported_module_names(file_path.read_text(encoding="utf-8")):
-            if _matches_prefix(module, PHASE0_FORBIDDEN_PREFIXES):
+            if _matches_prefix(module, GLOBAL_FORBIDDEN_PREFIXES):
                 violations.append((str(file_path), module))
-    assert not violations, f"Phase 0 forbidden imports: {violations}"
+                continue
+            if _matches_prefix(module, (AIOHTTP_PREFIX,)):
+                if not _path_inside_allowed_aiohttp_subtree(file_path):
+                    violations.append((str(file_path), module))
+    assert not violations, f"forbidden HTTP client imports: {violations}"
 
 
 def test_engine_does_not_import_engine_core_forbidden_modules() -> None:

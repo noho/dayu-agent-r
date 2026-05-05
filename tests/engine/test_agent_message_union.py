@@ -71,7 +71,7 @@ def test_tool_message_field_set() -> None:
 
 
 def test_assistant_tool_call_field_set() -> None:
-    """``AssistantToolCall`` 字段集合必须为 ``{id, name, arguments}``。"""
+    """``AssistantToolCall`` 字段集合必须包含 ``provider_state``。"""
 
     fields = {f.name for f in dataclasses.fields(AssistantToolCall)}
-    assert fields == {"id", "name", "arguments"}
+    assert fields == {"id", "name", "arguments", "provider_state"}

@@ -1,0 +1,69 @@
+"""SSE tool_call 流式聚合测试。"""
+
+from __future__ import annotations
+
+import pytest
+
+from dayu.engine.contracts.finish_reason import FinishReason
+from dayu.engine.contracts.runner_events import (
+    RunnerEventType,
+    RunnerToolCallDeltaData,
+    RunnerToolCallsCompletedData,
+)
+
+from tests.engine.runners.openai._sse_helpers import parse_sse
+
+
+@pytest.mark.asyncio
+async def test_tool_call_aggregated_across_chunks() -> None:
+    """``name`` / ``arguments`` 在多个 chunk 上累加；最终聚合为一次完成事件。"""
+
+    chunks = [
+        (
+            b'data: {"choices":[{"delta":{"tool_calls":'
+            b'[{"index":0,"id":"call-1","type":"function",'
+            b'"function":{"name":"search"}}]}}]}\n\n'
+        ),
+        (
+            b'data: {"choices":[{"delta":{"tool_calls":'
+            b'[{"index":0,"function":{"arguments":"{\\"q\\":"}}]}}]}\n\n'
+        ),
+        (
+            b'data: {"choices":[{"delta":{"tool_calls":'
+            b'[{"index":0,"function":{"arguments":"\\"hello\\"}"}}]}}]}\n\n'
+        ),
+        b'data: {"choices":[{"finish_reason":"tool_calls","delta":{}}]}\n\n',
+        b"data: [DONE]\n\n",
+    ]
+    events = await parse_sse(chunks)
+
+    deltas = [
+        e for e in events
+        if e.type is RunnerEventType.RUNNER_TOOL_CALL_DELTA
+    ]
+    assert len(deltas) == 3
+    for d in deltas:
+        assert isinstance(d.data, RunnerToolCallDeltaData)
+        assert d.data.tool_call_index == 0
+
+    completed = [
+        e for e in events
+        if e.type is RunnerEventType.RUNNER_TOOL_CALLS_COMPLETED
+    ]
+    assert len(completed) == 1
+    data = completed[0].data
+    assert isinstance(data, RunnerToolCallsCompletedData)
+    assert len(data.tool_calls) == 1
+    tc = data.tool_calls[0]
+    assert tc.tool_call_id == "call-1"
+    assert tc.name == "search"
+    assert tc.arguments == {"q": "hello"}
+    assert tc.index_in_iteration == 0
+
+    done = [e for e in events if e.type is RunnerEventType.RUNNER_DONE]
+    assert len(done) == 1
+    # finish_reason 为 tool_calls
+    from dayu.engine.contracts.runner_events import RunnerDoneData
+
+    assert isinstance(done[0].data, RunnerDoneData)
+    assert done[0].data.finish_reason is FinishReason.TOOL_CALLS
