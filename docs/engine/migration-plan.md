@@ -51,7 +51,8 @@
 | --- | --- | --- | --- | --- | --- | --- |
 | Phase 0 | pure contracts 与 import boundary tests | 先落地 Engine 最小稳定 contract 和包边界测试 | `design.md` 第 9、14、16 节，`review.md` 通过结论 | 强类型 contracts、包根导出约束、import boundary tests | 不迁 `AsyncAgent`、`AsyncOpenAIRunner`、ToolRegistry、doc/web/fins tools | contracts 可被测试导入；架构测试能阻止旧 re-export 和反向依赖 |
 | Phase 1 | Runner protocol 与 OpenAI-compatible Runner | 迁移 provider 协议归一能力，Runner 只产出 RunnerEvent | Phase 0 contracts，OLD `async_openai_runner.py` 可复用片段 | `AsyncRunner` protocol 当前实现、RunnerEvent 流、RunnerSpec provider extension | 不迁 `AsyncCliRunner`，不迁 Runner 工具执行，不保留 `call(**extra_payloads)` | Runner 测试证明 tool call 只产生 RunnerEvent，不调用 ToolExecutor |
-| Phase 2 | Agent run loop 骨架 | 建立 run-scoped Agent 和函数式入口 | Phase 0 contracts，Phase 1 Runner | `run_agent_messages` / `run_agent_and_wait` 骨架、RunnerEvent -> EngineEvent 提升、terminal 收口 | 不接入 ToolRegistry，不实现 long-running tool waiting，不迁 doc/web/fins 工具 | 无工具 run 可完成 final_answer / run_failed / run_cancelled，并关闭 Runner |
+| Phase 1.5 | Log / Runner diagnostics 与 SSE idle | 引入 `dayu.runtime` 公共运行时基础设施（log 装配 + cancellation race helper），给 Phase 1 Runner 补齐运行时边界日志，落地 chunk 级 SSE idle heartbeat / hard timeout（issue #6） | Phase 1 Runner、`dayu/contracts/cancellation.py`、OLD `dayu/log.py` / `sse_parser.py` 证据 | `dayu/runtime/log.py`、`dayu/runtime/cancellation.py`、Runner 边界 logger、`RunnerSpec.stream_idle_*` 字段、idle 控制流 | 不污染 RunnerEvent / EngineEvent；不新增 Engine / Runner 公共终态异常；Engine 不 import `dayu.runtime.log`；不迁 OLD `Log` 单例 wrapper；不写 README（统一推迟到 Phase 6） | 诊断字段在 caplog 中可见；idle 测试集（disabled / heartbeat / timeout / timeout-only / cancel wins / retry / aclose / outer cancel）全绿；事件契约无 log/idle 字段污染；issue #6 可关闭 |
+| Phase 2 | Agent run loop 骨架 | 建立 run-scoped Agent 和函数式入口 | Phase 0 contracts，Phase 1 Runner，Phase 1.5 logger / cancellation runtime | `run_agent_messages` / `run_agent_and_wait` 骨架、RunnerEvent -> EngineEvent 提升、terminal 收口 | 不接入 ToolRegistry，不实现 long-running tool waiting，不迁 doc/web/fins 工具 | 无工具 run 可完成 final_answer / run_failed / run_cancelled，并关闭 Runner |
 | Phase 3 | Host 注入 ToolExecutor 的 tool calling 闭环 | 建立普通工具调用闭环 | Phase 2 Agent loop，Phase 0 ToolExecutor contract | 模型 tool call -> ToolExecutionRequest -> ToolExecutionOutcome -> tool message 注入下一轮 | Engine 不注册工具，不执行权限、审计、路径白名单、长事务治理 | completed / failed 工具结果可进入下一轮；无双执行、无事件驱动工具执行 |
 | Phase 4 | completed / failed / awaiting outcome | 落地三类 outcome，awaiting 只产出挂起事实 | Phase 3 tool loop，ToolAwaitSpec / ToolAwaitSnapshot | `tool_awaiting` / `run_suspended` 事件，awaiting outcome 穷尽匹配测试 | 不实现 approval、detached、retry_after、artifact_ready 等扩展 outcome | awaiting 不轮询、不 sleep、不创建 Host wait record；只结束本次 run |
 | Phase 5 | context budget、continuation、取消收口 | 迁移确定性预算、续写、fallback、取消优先级 | Phase 2-4 Agent/Runner 主链路 | budget state、continuation/fallback 最小策略、取消 terminal 收口 | 不实现 conversation memory，不做语义压缩，不写 transcript | 取消优先于 final_answer；context_compaction_requested 只发事件 |
@@ -225,6 +226,85 @@
 
 - 是否接受首个 OpenAI-compatible Runner 的 provider extension 范围。
 - 是否确认暂不迁 `AsyncCliRunner`。
+
+## 6.5 Phase 1.5 详细计划
+
+### 目标
+
+在进入 Phase 2 Agent loop 之前，引入 `dayu.runtime` 公共运行时基础设施包，给 Phase 1 OpenAI-compatible Runner 补齐运行时边界日志，并落地 chunk 级 SSE idle heartbeat / hard timeout（GitHub issue #6）。
+
+### 前置条件
+
+- Phase 1 Runner 已合并，RunnerEvent 流稳定。
+- 用户确认进入 Phase 1.5 实施。
+- 详细任务、字段语义、测试清单等真源在 `docs/engine/phase1_5-plan.md`，本节只承担总控接入说明。
+
+### 迁移 Agent 任务
+
+- 落地 `dayu/runtime/__init__.py`、`dayu/runtime/log.py`（`LogLevel` + `configure` + `set_level_from_flags`）、`dayu/runtime/cancellation.py`（`await_or_cancel` + `wait_for_or_cancel` + 封闭联合结果类型）。
+- 把 `dayu/engine/runners/openai/cancellation_helpers.py` 收缩为只持有 `_RunnerInterrupted` 私有信号；公共 race / poll 能力迁出到 `dayu.runtime.cancellation`，原文件不保留兼容 wrapper。
+- 给 OpenAI-compatible Runner / `SSEParser` / `non_stream_parser` 在运行时边界挂上 `_LOGGER = logging.getLogger(__name__)` 并按 `phase1_5-plan.md` §5 边界表挂日志。
+- `RunnerSpec` 新增 `stream_idle_timeout_seconds` / `stream_idle_heartbeat_seconds` 两个可选字段，附 `__post_init__` 校验。
+- Runner byte iterator 拆出 idle disabled / idle enabled 两条路径；idle 路径以 `wait_for_or_cancel` 实现 pending vs cancellation vs timeout 三方 race。
+
+### 允许复用的 OLD implementation 片段
+
+- OLD `dayu/log.py` 的 LogLevel 设计与 `set_level_from_flags` 入口形态。
+- OLD `async_openai_runner.py` Runner 边界日志位置与字段（按 `phase1_5-plan.md` §2 边界表筛选）。
+- OLD `sse_parser.py` 中跨循环复用 `pending = create_task(__anext__())` + `asyncio.wait` 三方 race + finally 清理的 idle 实现思路。
+- OLD `tests/engine/test_sse_parser.py` 中 `test_parse_stream_cancels_pending_task_on_early_close` / `test_parse_stream_outer_task_cancel_cleans_inflight_next_chunk_task` 的回归场景。
+
+### 禁止迁移项
+
+- OLD `Log` 单例与 `Log.debug/info/warn/error` 兼容 wrapper / 别名。
+- Tool execution、`default_extra_payloads`、Runner 层 `request_id`、模型降级路径等不在 Runner 边界的日志。
+- provider response body preview、完整 exception text、messages、payload、headers、tool arguments 等敏感字段写入 log。
+- Engine import `dayu.runtime.log`（只允许 import `dayu.runtime.cancellation` 与 stdlib `logging`）。
+- `dayu.runtime.*` 反向 import `dayu.engine` / `dayu.host` / `dayu.service` / `dayu.ui` / `dayu.fins`。
+- 新增 Engine / Runner 公共终态异常表达 cancel 或 idle timeout（idle timeout 复用 `RunnerHTTPErrorCode.TIMEOUT` 与 `_AttemptFailedRetriable`）。
+- 新增 `RunnerEventType` / `EngineEventType`、向 RunnerEvent / EngineEvent / metadata 写入 log 字段。
+
+### 测试要求
+
+- 测试清单以 `phase1_5-plan.md` §8 为真源；至少必须覆盖：
+  - `tests/runtime/*`：runtime 不反向 import 上层、`configure()` 幂等与 root 不污染、`await_or_cancel` / `wait_for_or_cancel` 行为与封闭结果类型、watcher / pending task 在 timeout / cancel / outer cancel 各路径不泄漏、cancellation 与 timeout 同时满足时 cancellation 优先。
+  - `tests/engine/test_logger_import_boundary.py`：禁止 import `dayu.runtime.log`、允许 import `dayu.runtime.cancellation`。
+  - Runner diagnostics：HTTP error / retry / protocol error / cancellation / close / 无 body preview。
+  - `tests/engine/runners/openai/test_sse_idle_*.py`：disabled / heartbeat / timeout / timeout-only / cancel wins / retry / aclose / outer cancel cleanup。
+  - `RunnerSpec` 字段 contract 测试与 `RunnerEventData` 不含 `log_*` / `idle_*` / `heartbeat_*` 字段防回流测试。
+
+### pyright 要求
+
+- `dayu/runtime/**` 与 Runner 修改面 pyright 全绿，无新增 / 扩散类型错误。
+- 公共 helper（`wait_for_or_cancel` 返回值、`RunnerSpec` 字段）必须封闭强类型，禁止 `Any` / 裸 dict。
+
+### README / docs 同步要求
+
+- 按用户决策，Phase 1.5 不修改、不新建任何 README；统一推迟到 Phase 6 文档同步阶段一次性同步。
+- 仅修改本计划与 `docs/engine/phase1_5-plan.md`。
+- PR 描述中显式说明：本期未修改 README，全部以代码 + 测试 + `docs/engine/phase1_5-plan.md` 为事实真源。
+
+### review Agent 审查重点
+
+- `dayu.runtime` 是否保持层中立、不反向 import 上层。
+- Engine Runner 是否仅 import stdlib `logging` 与 `dayu.runtime.cancellation`，不 import `dayu.runtime.log`。
+- 日志是否未污染 RunnerEvent / EngineEvent / metadata。
+- idle 是否放在 Runner byte iterator 层，`SSEParser` 是否保持纯 parser、未 import Runner 私有异常或 token。
+- 是否未新增 Engine / Runner 公共终态异常；cancel 与 idle timeout 是否仍走既有私有异常路径。
+- `RunnerSpec` idle 字段非法值是否构造期拒绝。
+- 是否未引入 OLD `Log` 单例 wrapper、未保留 `await_or_cancel` 转发 wrapper。
+
+### 总控验收标准
+
+- Phase 1.5 可独立形成 PR。
+- `tests/runtime` / `tests/engine` 受影响子集与 pyright 全绿。
+- review Agent 与总控验收通过；GitHub issue #6 可在合并后关闭。
+- README 按 §9 决策保持不变。
+
+### 用户确认点
+
+- `LogLevel` 是否保留 `VERBOSE=15`（推荐暂不保留）。
+- `dayu.runtime.cancellation` 公共结果类型采用封闭联合 / 单一判别枚举（推荐封闭联合，由 review I1 锁定）。
 
 ## 7. Phase 2 详细计划
 

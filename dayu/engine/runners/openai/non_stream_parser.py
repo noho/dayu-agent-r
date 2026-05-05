@@ -21,6 +21,7 @@
 from __future__ import annotations
 
 import json
+import logging
 from collections.abc import Iterator, Mapping
 from dataclasses import dataclass
 from datetime import datetime, timezone
@@ -55,6 +56,8 @@ _FINISH_REASON_MAP: dict[str, FinishReason] = {
     "content_filter": FinishReason.CONTENT_FILTER,
 }
 
+_LOGGER: logging.Logger = logging.getLogger(__name__)
+
 
 def _make_event(data: RunnerEventData) -> RunnerEvent:
     """包装为 :class:`RunnerEvent`。"""
@@ -87,6 +90,10 @@ def parse_non_stream_response(
     try:
         text = payload.decode("utf-8")
     except UnicodeDecodeError as exc:
+        _LOGGER.warning(
+            "non_stream.protocol_error code=invalid_utf8 detail=%s",
+            exc.__class__.__name__,
+        )
         yield _make_event(
             RunnerProtocolErrorData(
                 error_code="invalid_utf8",
@@ -100,6 +107,11 @@ def parse_non_stream_response(
     try:
         parsed = json.loads(text)
     except json.JSONDecodeError as exc:
+        _LOGGER.warning(
+            "non_stream.protocol_error code=non_stream_invalid_json "
+            "detail=%s",
+            exc.__class__.__name__,
+        )
         yield _make_event(
             RunnerProtocolErrorData(
                 error_code="non_stream_invalid_json",
@@ -111,6 +123,9 @@ def parse_non_stream_response(
         yield _make_event(RunnerDoneData(finish_reason=FinishReason.ERROR))
         return
     if not isinstance(parsed, dict):
+        _LOGGER.warning(
+            "non_stream.protocol_error code=non_stream_payload_not_object"
+        )
         yield _make_event(
             RunnerProtocolErrorData(
                 error_code="non_stream_payload_not_object",

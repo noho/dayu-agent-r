@@ -11,7 +11,7 @@ gateway / Qwen OpenAI gateway 等）下的实现。
 - :mod:`.payload`：请求 payload 构建与 ProviderRequestExtension 投影。
 - :mod:`.error_classifier`：HTTP / 异常 → :class:`RunnerHTTPErrorCode`。
 - :mod:`.retry_policy`：``Retry-After`` / 指数退避决策。
-- :mod:`.cancellation_helpers`：``await_or_cancel`` 协作式取消辅助。
+- :mod:`.cancellation_helpers`：Runner 内部协作式取消信号 ``_RunnerInterrupted``；通用 helper 在 :mod:`dayu.runtime.cancellation`。
 - :mod:`.http_client`：``aiohttp.ClientSession`` 持有与幂等关闭。
 - :mod:`.xml_tag_extractor`：流式 ``<thought>`` 标签状态机。
 - :mod:`.reasoning_protocol`：Gemini reasoning 协议探测。

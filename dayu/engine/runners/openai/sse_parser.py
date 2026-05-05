@@ -26,6 +26,7 @@ from __future__ import annotations
 import base64
 import codecs
 import json
+import logging
 from collections.abc import AsyncIterable, AsyncIterator
 from datetime import datetime, timezone
 
@@ -57,6 +58,7 @@ from dayu.engine.runners.openai.xml_tag_extractor import (
 
 _DONE_TOKEN: str = "[DONE]"
 _DATA_PREFIX: str = "data:"
+_LOGGER: logging.Logger = logging.getLogger(__name__)
 _FINISH_REASON_MAP: dict[str, FinishReason] = {
     "stop": FinishReason.STOP,
     "length": FinishReason.LENGTH,
@@ -181,6 +183,10 @@ class SSEParser:
     ) -> AsyncIterator[RunnerEvent]:
         """非法 UTF-8 chunk → 协议错误 + Done(ERROR) 收口。"""
 
+        _LOGGER.warning(
+            "sse.protocol_error code=invalid_utf8 chunk_len=%d",
+            len(chunk),
+        )
         encoded = base64.b64encode(chunk).decode("ascii")
         raw_payload: JsonValue = {"chunk_base64": encoded}
         yield _make_event(
@@ -215,12 +221,17 @@ class SSEParser:
         joined = "\n".join(self._data_lines)
         self._data_lines.clear()
         if joined.strip() == _DONE_TOKEN:
+            _LOGGER.debug("sse.done_token received")
             async for event in self._finalize_success():
                 yield event
             return
         try:
             parsed = json.loads(joined)
         except json.JSONDecodeError as exc:
+            _LOGGER.warning(
+                "sse.protocol_error code=sse_invalid_json detail=%s",
+                exc.__class__.__name__,
+            )
             yield _make_event(
                 RunnerProtocolErrorData(
                     error_code="sse_invalid_json",
