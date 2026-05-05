@@ -1,9 +1,11 @@
 """Provider 请求扩展、Runner 规约与调用选项契约。
 
-本模块提供四种已知 provider 的强类型扩展：
+本模块提供已知 provider 的强类型扩展：
 
 - :class:`OpenAIReasoningExtension`
 - :class:`AnthropicThinkingExtension`
+- :class:`DeepSeekThinkingExtension`
+- :class:`MimoThinkingExtension`
 - :class:`GeminiThinkingExtension`
 - :class:`QwenThinkingExtension`
 
@@ -25,15 +27,46 @@ class OpenAIReasoningEffort(StrEnum):
 
     成员：
 
-    - ``LOW`` / ``MEDIUM`` / ``HIGH``：标准三档推理强度。
+    - ``MINIMAL`` / ``LOW`` / ``MEDIUM`` / ``HIGH`` / ``XHIGH``：
+      推理强度。
     - ``NONE``：显式关闭推理（OLD ``llm_models.json`` 已使用
       ``"none"`` 字面量）。
     """
 
+    MINIMAL = "minimal"
     LOW = "low"
     MEDIUM = "medium"
     HIGH = "high"
+    XHIGH = "xhigh"
     NONE = "none"
+
+
+class DeepSeekReasoningEffort(StrEnum):
+    """DeepSeek thinking effort 枚举。
+
+    成员：
+
+    - ``HIGH``：默认较高推理强度。
+    - ``MAX``：更高推理强度。
+    """
+
+    HIGH = "high"
+    MAX = "max"
+
+
+class GeminiThinkingLevel(StrEnum):
+    """Gemini thinking level 枚举。
+
+    成员：
+
+    - ``MINIMAL`` / ``LOW`` / ``MEDIUM`` / ``HIGH``：Gemini 3 系列
+      thinking level。
+    """
+
+    MINIMAL = "minimal"
+    LOW = "low"
+    MEDIUM = "medium"
+    HIGH = "high"
 
 
 @dataclass(frozen=True, slots=True)
@@ -51,23 +84,102 @@ class AnthropicThinkingExtension:
     """Anthropic thinking 扩展。
 
     :param enabled: 是否启用 thinking。
-    :param budget_tokens: thinking 预算 token 数。
+    :param budget_tokens: Anthropic manual extended thinking 预算 token
+        数；``enabled=False`` 时必须为 ``None``，表示不传该字段。
     """
 
     enabled: bool
-    budget_tokens: int
+    budget_tokens: int | None = None
+
+    def __post_init__(self) -> None:
+        """校验 Anthropic manual thinking 预算字段。
+
+        :raises ValueError: enabled / budget_tokens 组合不合法时抛出。
+        """
+
+        if self.enabled and self.budget_tokens is None:
+            raise ValueError(
+                "AnthropicThinkingExtension enabled=True requires "
+                "budget_tokens"
+            )
+        if self.budget_tokens is not None and self.budget_tokens <= 0:
+            raise ValueError(
+                "AnthropicThinkingExtension budget_tokens must be > 0"
+            )
+        if not self.enabled and self.budget_tokens is not None:
+            raise ValueError(
+                "AnthropicThinkingExtension enabled=False must not set "
+                "budget_tokens"
+            )
+
+
+@dataclass(frozen=True, slots=True)
+class DeepSeekThinkingExtension:
+    """DeepSeek thinking 扩展。
+
+    :param enabled: 是否启用 DeepSeek thinking 模式。
+    :param reasoning_effort: thinking 模式下的推理强度；为 ``None``
+        表示不传该字段，沿用 provider 默认。
+    """
+
+    enabled: bool
+    reasoning_effort: DeepSeekReasoningEffort | None = None
+
+    def __post_init__(self) -> None:
+        """校验 DeepSeek thinking effort 字段。
+
+        :raises ValueError: 关闭 thinking 时仍设置 effort 则抛出。
+        """
+
+        if not self.enabled and self.reasoning_effort is not None:
+            raise ValueError(
+                "DeepSeekThinkingExtension enabled=False must not set "
+                "reasoning_effort"
+            )
+
+
+@dataclass(frozen=True, slots=True)
+class MimoThinkingExtension:
+    """MiMo thinking 扩展。
+
+    :param enabled: 是否启用 MiMo thinking 模式。
+    """
+
+    enabled: bool
 
 
 @dataclass(frozen=True, slots=True)
 class GeminiThinkingExtension:
     """Gemini thinking 扩展。
 
-    :param thinking_budget: thinking 预算。
-    :param include_thoughts: 是否在响应中包含 thoughts。
+    :param thinking_budget: Gemini 2.5 thinking 预算；``None`` 表示不传。
+    :param include_thoughts: 是否在响应中包含 thoughts summary；
+        ``None`` 表示不传。
+    :param thinking_level: Gemini 3 thinking level；``None`` 表示不传。
     """
 
-    thinking_budget: int
-    include_thoughts: bool
+    thinking_budget: int | None = None
+    include_thoughts: bool | None = None
+    thinking_level: GeminiThinkingLevel | None = None
+
+    def __post_init__(self) -> None:
+        """校验 Gemini thinking budget / level 互斥关系。
+
+        :raises ValueError: 字段组合不合法时抛出。
+        """
+
+        if self.thinking_budget is None and self.thinking_level is None:
+            if self.include_thoughts is None:
+                raise ValueError(
+                    "GeminiThinkingExtension requires at least one "
+                    "thinking field"
+                )
+            return
+        if self.thinking_budget is not None and self.thinking_level is not None:
+            raise ValueError(
+                "GeminiThinkingExtension cannot set both thinking_budget "
+                "and thinking_level"
+            )
 
 
 @dataclass(frozen=True, slots=True)
@@ -75,14 +187,32 @@ class QwenThinkingExtension:
     """Qwen thinking 扩展。
 
     :param enable_thinking: 是否启用 thinking。
+    :param thinking_budget: 思考过程最大 token 数；为 ``None`` 表示不传。
     """
 
     enable_thinking: bool
+    thinking_budget: int | None = None
+
+    def __post_init__(self) -> None:
+        """校验 Qwen thinking 预算字段。
+
+        :raises ValueError: 字段组合不合法时抛出。
+        """
+
+        if not self.enable_thinking and self.thinking_budget is not None:
+            raise ValueError(
+                "QwenThinkingExtension enable_thinking=False must not set "
+                "thinking_budget"
+            )
+        if self.thinking_budget is not None and self.thinking_budget <= 0:
+            raise ValueError("QwenThinkingExtension thinking_budget must be > 0")
 
 
 ProviderRequestExtension: TypeAlias = (
     OpenAIReasoningExtension
     | AnthropicThinkingExtension
+    | DeepSeekThinkingExtension
+    | MimoThinkingExtension
     | GeminiThinkingExtension
     | QwenThinkingExtension
 )
@@ -192,8 +322,12 @@ class RunnerCallOptions:
 
 __all__ = [
     "OpenAIReasoningEffort",
+    "DeepSeekReasoningEffort",
+    "GeminiThinkingLevel",
     "OpenAIReasoningExtension",
     "AnthropicThinkingExtension",
+    "DeepSeekThinkingExtension",
+    "MimoThinkingExtension",
     "GeminiThinkingExtension",
     "QwenThinkingExtension",
     "ProviderRequestExtension",

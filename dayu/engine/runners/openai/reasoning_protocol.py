@@ -5,9 +5,9 @@ XML 标签形式与正文混杂回传，需要在 Runner 侧探测开关并剥�
 
 本模块基于 :class:`RunnerSpec.provider_request` 中的
 :class:`GeminiThinkingExtension.include_thoughts` 标志，决定是否启用
-``<thought>`` 标签提取。其它 provider（OpenAI / Anthropic / Qwen）的
-推理链统一走 OpenAI 协议原生 ``delta.reasoning_content`` 通道，本探测
-返回「无标签」钩子。
+``<thought>`` 标签提取。其它 provider（OpenAI / Anthropic / DeepSeek /
+MiMo / Qwen）的推理链统一走 OpenAI 协议原生
+``delta.reasoning_content`` 通道，本探测返回「无标签」钩子。
 
 返回 :class:`_ReasoningProtocolHook`：
 
@@ -21,7 +21,9 @@ from __future__ import annotations
 
 from dayu.engine.contracts.runner_spec import (
     AnthropicThinkingExtension,
+    DeepSeekThinkingExtension,
     GeminiThinkingExtension,
+    MimoThinkingExtension,
     OpenAIReasoningExtension,
     ProviderRequestExtension,
     QwenThinkingExtension,
@@ -55,6 +57,8 @@ def detect_reasoning_protocol_hook(
         case (
             OpenAIReasoningExtension()
             | AnthropicThinkingExtension()
+            | DeepSeekThinkingExtension()
+            | MimoThinkingExtension()
             | QwenThinkingExtension()
         ):
             return _ReasoningProtocolHook(tag_name=None)

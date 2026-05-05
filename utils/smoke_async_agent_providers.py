@@ -1,8 +1,8 @@
 """人工验证 AsyncAgent 与 OpenAI-compatible provider 的 smoke 脚本。
 
 本脚本只服务人工验证，不属于生产链路，也不做真实联网 pytest。它只从
-环境变量读取 API key，输出 case 名、事件类型和长度类摘要，避免泄漏
-key、headers、完整 payload、完整 prompt 或业务内容。
+环境变量读取 API key，输出 case 名、事件类型、长度类摘要以及固定 smoke
+prompt 的 final answer，避免泄漏 key、headers、完整 payload 或业务内容。
 """
 
 from __future__ import annotations
@@ -23,9 +23,14 @@ from dayu.engine import (
     AgentMessageRole,
     AgentPolicy,
     AgentRunRequest,
+    DeepSeekThinkingExtension,
     EngineEvent,
     EngineEventType,
     FinalAnswerData,
+    GeminiThinkingExtension,
+    MimoThinkingExtension,
+    ProviderRequestExtension,
+    QwenThinkingExtension,
     RunnerCallOptions,
     RunnerSpec,
     ToolExecutor,
@@ -43,6 +48,8 @@ _SKIP_PREFIX: str = "SKIP"
 _CASE_PREFIX: str = "CASE"
 _EVENT_PREFIX: str = "EVENT"
 _SUMMARY_PREFIX: str = "SUMMARY"
+_FINAL_SUMMARY_PREFIX: str = "FINAL_SUMMARY"
+_GEMINI_DYNAMIC_THINKING_BUDGET: int = -1
 
 
 @dataclass(frozen=True, slots=True)
@@ -55,6 +62,7 @@ class ProviderCase:
     :param endpoint: OpenAI-compatible chat completions endpoint。
     :param model: 模型名。
     :param supports_stream_usage: 是否支持 stream usage。
+    :param provider_request: provider thinking 请求扩展。
     """
 
     name: str
@@ -63,6 +71,7 @@ class ProviderCase:
     endpoint: str
     model: str
     supports_stream_usage: bool
+    provider_request: ProviderRequestExtension
 
 
 @dataclass(frozen=True, slots=True)
@@ -79,6 +88,20 @@ class SmokeArgs:
     run_all: bool
     stream: bool
     timeout_seconds: float
+
+
+@dataclass(frozen=True, slots=True)
+class CaseFinalAnswer:
+    """单个 provider smoke 的最终回答摘要。
+
+    :param provider: provider 名称。
+    :param prompt: smoke prompt。
+    :param final_answer: 最终回答；未产出 final answer 时为 ``None``。
+    """
+
+    provider: str
+    prompt: str
+    final_answer: str | None
 
 
 class _NoopToolExecutor:
@@ -117,6 +140,7 @@ CASES: tuple[ProviderCase, ...] = (
         endpoint="https://token-plan-cn.xiaomimimo.com/v1/chat/completions",
         model="mimo-v2.5-pro",
         supports_stream_usage=False,
+        provider_request=MimoThinkingExtension(enabled=True),
     ),
     ProviderCase(
         name="deepseek-v4-flash",
@@ -125,6 +149,7 @@ CASES: tuple[ProviderCase, ...] = (
         endpoint="https://api.deepseek.com/chat/completions",
         model="deepseek-v4-flash",
         supports_stream_usage=True,
+        provider_request=DeepSeekThinkingExtension(enabled=True),
     ),
     ProviderCase(
         name="gemini-2.5-flash",
@@ -136,6 +161,10 @@ CASES: tuple[ProviderCase, ...] = (
         ),
         model="gemini-2.5-flash",
         supports_stream_usage=False,
+        provider_request=GeminiThinkingExtension(
+            thinking_budget=_GEMINI_DYNAMIC_THINKING_BUDGET,
+            include_thoughts=True,
+        ),
     ),
     ProviderCase(
         name="qwen-plus",
@@ -147,6 +176,7 @@ CASES: tuple[ProviderCase, ...] = (
         ),
         model="qwen3.6-plus",
         supports_stream_usage=True,
+        provider_request=QwenThinkingExtension(enable_thinking=True),
     ),
 )
 
@@ -232,7 +262,7 @@ def build_request(
         supports_stream_usage=case.supports_stream_usage,
         default_timeout_seconds=timeout_seconds,
         max_retries=_DEFAULT_MAX_RETRIES,
-        provider_request=None,
+        provider_request=case.provider_request,
     )
     return AgentRunRequest(
         run_id=f"{_RUN_ID_PREFIX}_{case.name}",
@@ -308,7 +338,8 @@ def safe_event_summary(event: EngineEvent) -> str:
     ):
         return (
             f"{_EVENT_PREFIX} {event.type.value} sequence={event.sequence} "
-            f"content_len={len(data.content)} filtered={data.filtered}"
+            f"content_len={len(data.content)} filtered={data.filtered} "
+            f"content={data.content!r}"
         )
     return f"{_EVENT_PREFIX} {event.type.value} sequence={event.sequence}"
 
@@ -319,14 +350,14 @@ async def run_case(
     api_key: str,
     stream: bool,
     timeout_seconds: float,
-) -> bool:
+) -> str | None:
     """运行单个 provider smoke case。
 
     :param case: provider case。
     :param api_key: API key 明文，仅进入请求头，不输出。
     :param stream: 是否启用流式。
     :param timeout_seconds: 默认请求超时秒数。
-    :returns: 收到 final answer 返回 ``True``，否则返回 ``False``。
+    :returns: final answer 文本；未收到 final answer 时返回 ``None``。
     :raises Exception: provider 请求或 Agent 运行异常时透传。
     """
 
@@ -336,14 +367,41 @@ async def run_case(
         stream=stream,
         timeout_seconds=timeout_seconds,
     )
-    final_seen = False
+    final_answer: str | None = None
     print(f"{_CASE_PREFIX} {case.name} start stream={stream}")
     async for event in run_agent_messages(request):
         print(safe_event_summary(event))
-        if event.type is EngineEventType.FINAL_ANSWER:
-            final_seen = True
-    print(f"{_SUMMARY_PREFIX} {case.name} final_seen={final_seen}")
-    return final_seen
+        data = event.data
+        if event.type is EngineEventType.FINAL_ANSWER and isinstance(
+            data, FinalAnswerData
+        ):
+            final_answer = data.content
+    print(
+        f"{_SUMMARY_PREFIX} {case.name} "
+        f"final_seen={final_answer is not None}"
+    )
+    return final_answer
+
+
+def print_final_answers(records: Sequence[CaseFinalAnswer]) -> None:
+    """打印全部 provider 的最终回答汇总。
+
+    :param records: 最终回答记录序列。
+    :returns: 无返回值。
+    :raises Exception: 不主动抛出异常。
+    """
+
+    if not records:
+        return
+    print()
+    print(f"{_FINAL_SUMMARY_PREFIX} begin")
+    for record in records:
+        print(
+            f"{_FINAL_SUMMARY_PREFIX} provider={record.provider} "
+            f"prompt={record.prompt!r} "
+            f"final_answer={record.final_answer!r}"
+        )
+    print(f"{_FINAL_SUMMARY_PREFIX} end")
 
 
 async def run_selected_cases(
@@ -358,17 +416,30 @@ async def run_selected_cases(
     """
 
     exit_code = 0
+    first_case = True
+    final_answers: list[CaseFinalAnswer] = []
     for case in select_cases(args):
+        if first_case:
+            first_case = False
+        else:
+            print()
         api_key = env.get(case.env_var)
         if not api_key:
             print(f"{_SKIP_PREFIX} {case.name} missing_env={case.env_var}")
             continue
         try:
-            final_seen = await run_case(
+            final_answer = await run_case(
                 case=case,
                 api_key=api_key,
                 stream=args.stream,
                 timeout_seconds=args.timeout_seconds,
+            )
+            final_answers.append(
+                CaseFinalAnswer(
+                    provider=case.provider,
+                    prompt=_PROMPT,
+                    final_answer=final_answer,
+                )
             )
         except Exception as exc:
             print(
@@ -377,8 +448,9 @@ async def run_selected_cases(
             )
             exit_code = 1
             continue
-        if not final_seen:
+        if final_answer is None:
             exit_code = 1
+    print_final_answers(final_answers)
     return exit_code
 
 

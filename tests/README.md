@@ -60,7 +60,7 @@ Engine contract 的细粒度测试，当前覆盖：
 
 - `messages`：AssistantMessage / AssistantToolCall 与 provider state roundtrip 契约。
 - `runner_events`：RunnerEventData 联合、RunnerHTTPErrorCode、RunnerHTTPErrorData、HTTP error 到 Done(ERROR) 的收口契约。
-- `runner_spec`：RunnerSpec 字段集合、OpenAIReasoningEffort、stream usage 能力字段与构造路径。
+- `runner_spec`：RunnerSpec 字段集合、provider reasoning / thinking extension、stream usage 能力字段与构造路径。
 - import boundary：Engine contract 子包不得越过自身契约边界引入上层依赖。
 
 ### `tests/engine/runners/openai/`

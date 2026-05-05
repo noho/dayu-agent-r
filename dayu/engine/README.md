@@ -109,6 +109,12 @@ terminal event 在单次 run 内唯一，`sequence` 从 0 起单调递增，`eve
 当前唯一内置 Runner 是 OpenAI-compatible Runner。它负责：
 
 - 构造 OpenAI 风格请求 payload。
+- 按 `RunnerSpec.provider_request` 强类型扩展投影 provider 私有请求字段：
+  `OpenAIReasoningExtension`、`AnthropicThinkingExtension`、
+  `DeepSeekThinkingExtension`、`MimoThinkingExtension`、
+  `GeminiThinkingExtension`、`QwenThinkingExtension`。
+- provider 私有字段用 `None` 表示不传；只有 provider 文档把 `0`
+  定义为显式关闭时才传 `0`。
 - 解析 SSE 与 non-stream JSON 响应。
 - 归一 content、reasoning、usage、tool call、HTTP error、protocol error 与 done 事件。
 - 执行 HTTP retry / backoff。

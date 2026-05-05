@@ -33,7 +33,7 @@
 
 ### 1.2 留在 `dayu.engine.contracts`（Engine 单向 API 表面 / Engine 内部协议；语义真源为 Engine）
 
-- 入参 / 配置：`AgentMessage` 封闭联合 + `AgentMessageRole` + `AssistantToolCall`（Runner 协议归一真源在 Engine）；`RunnerSpec`、`RunnerCallOptions`、`AgentPolicy`、`AgentRunRequest`；`OpenAIReasoningExtension` / `AnthropicThinkingExtension` / `GeminiThinkingExtension` / `QwenThinkingExtension` / `ProviderRequestExtension` 联合。
+- 入参 / 配置：`AgentMessage` 封闭联合 + `AgentMessageRole` + `AssistantToolCall`（Runner 协议归一真源在 Engine）；`RunnerSpec`、`RunnerCallOptions`、`AgentPolicy`、`AgentRunRequest`；`OpenAIReasoningExtension` / `AnthropicThinkingExtension` / `DeepSeekThinkingExtension` / `MimoThinkingExtension` / `GeminiThinkingExtension` / `QwenThinkingExtension` / `ProviderRequestExtension` 联合。
 - 出参 / 出口语义：`AgentRunResult` 封闭联合 + 四种终态 `EngineRunOutcomeFinalAnswer` / `EngineRunOutcomeFailed` / `EngineRunOutcomeCancelled` / `EngineRunOutcomeSuspended`；`ContextBudgetSnapshot`；`RunResumeHint`；`FinishReason` StrEnum。
 - 事件出口（Engine 单向定义；Host 仅持久化既定形态，不独立定义事件类型）：`EngineEventType`、`EngineEvent`、全部 EngineEvent data dataclass（`IterationStartedData` / `ContentDeltaData` / `ReasoningDeltaData` / `ContentCompleteData` / `ToolCallRequestedData` / `ToolResultAcceptedData` / `ToolAwaitingData` / `ContextCompactionRequestedData` / `RunnerUsageData` / `ProviderProtocolErrorData` / `RunnerDoneEngineData` / `FinalAnswerData` / `RunSuspendedData` / `RunCancelledData` / `RunFailedData`）、`EngineEventData` 别名、`TERMINAL_ENGINE_EVENT_TYPES`。
 - Engine 内部 Agent ↔ Runner 协议：`AsyncRunner` Protocol；`RunnerEventType` / `RunnerEvent` / `RunnerEventData` 别名 / 全部 Runner data dataclass（`RunnerContentDeltaData` / `RunnerReasoningDeltaData` / `RunnerToolCallDeltaData` / `RunnerToolCallsCompletedData` / `RunnerContentCompletedData` / `RunnerUsageRecordedData` / `RunnerProtocolErrorData` / `RunnerDoneData`）。
@@ -58,7 +58,7 @@
 - 不实现取消治理增强、watchdog、超时升级、lost 判定。
 - 不导出任何取消异常（如 `CancelledError`）；取消公共终态由 `RunCancelledData` 与 `EngineRunOutcomeCancelled` 表达。
 - 不实现 ContextBudgetState 的运算逻辑；本 Phase 仅落地 `ContextBudgetSnapshot` 最小快照 dataclass，仅作为 `ContextCompactionRequestedData.budget_state` 字段类型，不含计算逻辑、不含 soft/hard 阈值消费。
-- 不落地 `ValidatedProviderRequestExtension`（按 review §4.2 推迟，只保留四种已知 provider 强类型扩展；待配置 adapter 阶段单独评审引入）。
+- 不落地 `ValidatedProviderRequestExtension`（按 review §4.2 推迟，只保留已知 provider 强类型扩展；待配置 adapter 阶段单独评审引入）。
 - 不落地 `FallbackStrategy`、`FinalAnswerFilter`、`ResponseFormat`、`ContextBudgetLimits` 等暂无消费方的辅助类型；按 review §3.2 进入「待引入名单」，留给消费它的 Phase。
 - 不写 README 用户向手册内容；默认不创建 `dayu/engine/README.md` / `dayu/contracts/README.md`。
 
@@ -106,7 +106,7 @@
 - `dayu/engine/contracts/__init__.py`：聚合 §1.2 子模块导出。
 - `dayu/engine/contracts/messages.py`：`AgentMessageRole` / `SystemMessage` / `UserMessage` / `AssistantMessage` / `ToolMessage` / `AssistantToolCall` / `AgentMessage` 封闭联合。
 - `dayu/engine/contracts/finish_reason.py`：`FinishReason` StrEnum。
-- `dayu/engine/contracts/runner_spec.py`：`OpenAIReasoningEffort` StrEnum、四种 provider extension、`ProviderRequestExtension` 联合、`RunnerSpec`、`RunnerCallOptions`。
+- `dayu/engine/contracts/runner_spec.py`：reasoning / thinking StrEnum、provider extension、`ProviderRequestExtension` 联合、`RunnerSpec`、`RunnerCallOptions`。
 - `dayu/engine/contracts/agent_policy.py`：`AgentPolicy`（仅 `max_iterations: int`、`continuation_max_attempts: int`、`allow_tool_calls: bool`）。
 - `dayu/engine/contracts/agent_run.py`：`AgentRunRequest`、四种终态 outcome、`AgentRunResult` 联合、`ContextBudgetSnapshot`、`RunResumeHint`。
 - `dayu/engine/contracts/runner_events.py`：`RunnerEventType` + 8 个 Runner data + `RunnerEvent` + `RunnerEventData` 别名。
@@ -189,11 +189,15 @@
 - `dayu.engine.contracts.messages.AgentMessage = SystemMessage | UserMessage | AssistantMessage | ToolMessage`（PEP604 联合 + `TypeAlias`）。
 - `dayu.engine.contracts.finish_reason.FinishReason` StrEnum。
 - `dayu.engine.contracts.runner_spec.OpenAIReasoningEffort` StrEnum。
+- `dayu.engine.contracts.runner_spec.DeepSeekReasoningEffort` StrEnum。
+- `dayu.engine.contracts.runner_spec.GeminiThinkingLevel` StrEnum。
 - `dayu.engine.contracts.runner_spec.OpenAIReasoningExtension(reasoning_effort: OpenAIReasoningEffort)`。
-- `dayu.engine.contracts.runner_spec.AnthropicThinkingExtension(enabled: bool, budget_tokens: int)`。
-- `dayu.engine.contracts.runner_spec.GeminiThinkingExtension(thinking_budget: int, include_thoughts: bool)`。
-- `dayu.engine.contracts.runner_spec.QwenThinkingExtension(enable_thinking: bool)`。
-- `dayu.engine.contracts.runner_spec.ProviderRequestExtension = OpenAIReasoningExtension | AnthropicThinkingExtension | GeminiThinkingExtension | QwenThinkingExtension`。
+- `dayu.engine.contracts.runner_spec.AnthropicThinkingExtension(enabled: bool, budget_tokens: int | None)`。
+- `dayu.engine.contracts.runner_spec.DeepSeekThinkingExtension(enabled: bool, reasoning_effort: DeepSeekReasoningEffort | None)`。
+- `dayu.engine.contracts.runner_spec.MimoThinkingExtension(enabled: bool)`。
+- `dayu.engine.contracts.runner_spec.GeminiThinkingExtension(thinking_budget: int | None, include_thoughts: bool | None, thinking_level: GeminiThinkingLevel | None)`。
+- `dayu.engine.contracts.runner_spec.QwenThinkingExtension(enable_thinking: bool, thinking_budget: int | None)`。
+- `dayu.engine.contracts.runner_spec.ProviderRequestExtension = OpenAIReasoningExtension | AnthropicThinkingExtension | DeepSeekThinkingExtension | MimoThinkingExtension | GeminiThinkingExtension | QwenThinkingExtension`。
 - `dayu.engine.contracts.runner_spec.RunnerSpec(provider: str, model: str, endpoint: str, api_key_ref: str, headers: Mapping[str, str], supports_tool_calling: bool, supports_streaming: bool, default_timeout_seconds: float, max_retries: int, provider_request: ProviderRequestExtension | None)`。
 - `dayu.engine.contracts.runner_spec.RunnerCallOptions(temperature: float | None, max_tokens: int | None, top_p: float | None, stream: bool)`。
 - `dayu.engine.contracts.agent_policy.AgentPolicy(max_iterations: int, continuation_max_attempts: int, allow_tool_calls: bool)`。

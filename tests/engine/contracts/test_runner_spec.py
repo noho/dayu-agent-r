@@ -16,8 +16,14 @@ import dataclasses
 import pytest
 
 from dayu.engine.contracts.runner_spec import (
+    AnthropicThinkingExtension,
+    DeepSeekReasoningEffort,
+    DeepSeekThinkingExtension,
+    GeminiThinkingExtension,
+    GeminiThinkingLevel,
     OpenAIReasoningEffort,
     OpenAIReasoningExtension,
+    QwenThinkingExtension,
     RunnerSpec,
 )
 
@@ -41,15 +47,107 @@ def _base_spec_kwargs() -> dict[str, object]:
 
 
 def test_openai_reasoning_effort_includes_none() -> None:
-    """``OpenAIReasoningEffort`` 必须含 ``NONE`` 成员且值为 ``"none"``。"""
+    """``OpenAIReasoningEffort`` 必须覆盖当前官方 reasoning 档位。"""
 
     assert OpenAIReasoningEffort.NONE.value == "none"
     assert {m.value for m in OpenAIReasoningEffort} == {
+        "minimal",
         "low",
         "medium",
         "high",
+        "xhigh",
         "none",
     }
+
+
+def test_deepseek_reasoning_effort_values() -> None:
+    """DeepSeek thinking effort 仅表达当前官方高强度档位。"""
+
+    assert {m.value for m in DeepSeekReasoningEffort} == {"high", "max"}
+
+
+def test_gemini_thinking_level_values() -> None:
+    """Gemini thinking level 必须覆盖 Gemini 3 当前官方档位。"""
+
+    assert {m.value for m in GeminiThinkingLevel} == {
+        "minimal",
+        "low",
+        "medium",
+        "high",
+    }
+
+
+def test_anthropic_disabled_thinking_omits_budget() -> None:
+    """Anthropic disabled thinking 用 ``None`` 表达不传 ``budget_tokens``。"""
+
+    extension = AnthropicThinkingExtension(enabled=False)
+    assert extension.budget_tokens is None
+
+
+def test_anthropic_enabled_thinking_requires_budget() -> None:
+    """Anthropic manual enabled thinking 必须显式提供正数预算。"""
+
+    with pytest.raises(ValueError, match="requires"):
+        AnthropicThinkingExtension(enabled=True)
+    with pytest.raises(ValueError, match="must be > 0"):
+        AnthropicThinkingExtension(enabled=True, budget_tokens=0)
+
+
+def test_anthropic_disabled_thinking_rejects_budget() -> None:
+    """Anthropic disabled thinking 不允许携带预算。"""
+
+    with pytest.raises(ValueError, match="must not set"):
+        AnthropicThinkingExtension(enabled=False, budget_tokens=1)
+
+
+def test_deepseek_thinking_effort_defaults_to_omitted() -> None:
+    """DeepSeek reasoning effort 默认 ``None``，表示不传字段。"""
+
+    extension = DeepSeekThinkingExtension(enabled=True)
+    assert extension.reasoning_effort is None
+
+
+def test_deepseek_disabled_thinking_rejects_effort() -> None:
+    """DeepSeek 关闭 thinking 时不允许携带 effort。"""
+
+    with pytest.raises(ValueError, match="must not set"):
+        DeepSeekThinkingExtension(
+            enabled=False,
+            reasoning_effort=DeepSeekReasoningEffort.HIGH,
+        )
+
+
+def test_gemini_thinking_extension_requires_some_field() -> None:
+    """Gemini thinking extension 不能构造空 thinking_config。"""
+
+    with pytest.raises(ValueError, match="requires"):
+        GeminiThinkingExtension()
+
+
+def test_gemini_thinking_budget_and_level_are_mutually_exclusive() -> None:
+    """Gemini ``thinking_budget`` 与 ``thinking_level`` 不得同时设置。"""
+
+    with pytest.raises(ValueError, match="cannot set both"):
+        GeminiThinkingExtension(
+            thinking_budget=1024,
+            thinking_level=GeminiThinkingLevel.HIGH,
+        )
+
+
+def test_qwen_thinking_budget_defaults_to_omitted_and_must_be_positive() -> None:
+    """Qwen ``thinking_budget`` 默认不传，显式传入时必须为正数。"""
+
+    extension = QwenThinkingExtension(enable_thinking=True)
+    assert extension.thinking_budget is None
+    with pytest.raises(ValueError, match="must be > 0"):
+        QwenThinkingExtension(enable_thinking=True, thinking_budget=0)
+
+
+def test_qwen_disabled_thinking_rejects_budget() -> None:
+    """Qwen 关闭 thinking 时不允许携带预算。"""
+
+    with pytest.raises(ValueError, match="must not set"):
+        QwenThinkingExtension(enable_thinking=False, thinking_budget=1)
 
 
 def test_runner_spec_field_set_includes_supports_stream_usage() -> None:
