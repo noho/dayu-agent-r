@@ -27,7 +27,7 @@ P1 代码实现通过 code review gate。
 
 当前实现满足 P1 目标：Host public `start_run` 可以通过内部
 `LocalRunHarness -> LocalProxy -> EngineWorker -> dayu.engine.run_agent_messages`
-调用 Engine 函数式入口，并将 EngineEvent 薄翻译为 RunEvent。`start_run` 会立即创建 P1 内存后台
+调用 Engine 函数式入口，并将 EngineEvent 薄翻译为 RunEvent。`start_run` 被 await 时会立即创建 P1 内存后台
 任务，避免 lazy stream 造成后创建 run 先启动。普通 tool-call fake executor smoke 已通过内部
 harness 覆盖，未把 ToolExecutor 暴露为 Host public API。P1 还新增
 `utils/smoke_engine_worker.py` 作为人工 smoke，直接验证 EngineWorker 装配边界。
@@ -123,7 +123,7 @@ harness 覆盖，未把 ToolExecutor 暴露为 Host public API。P1 还新增
   `async for` 消费时才会调用 `LocalProxy -> EngineWorker -> run_agent_messages`。
 - 影响：如果多个 run 已被创建但事件流消费顺序不同，后创建的 run 可能先启动，破坏 Host
   `start_run` 的接纳 / 排队直觉，也不符合设计中“start_run 负责创建并启动或排队 Run”的语义。
-- 修复：`LocalRunHarness.start_run()` 现在立即创建后台 task，后台 task 调用 worker 并把翻译后的
+- 修复：`LocalRunHarness.start_run()` 被 await 时现在立即创建后台 task，后台 task 调用 worker 并把翻译后的
   `RunEvent` 写入内存队列；`RunStream.events` 只从队列消费。
 - 验证：新增 `test_start_run_eagerly_starts_before_event_stream_is_consumed`，断言未消费
   `stream.events` 前 Runner 已被后台执行触发。

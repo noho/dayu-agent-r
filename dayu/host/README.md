@@ -7,8 +7,8 @@ Phase 流程、review 过程或 PR 流程。
 
 `dayu.host` 当前落地 P1 最小 Run harness：
 
-- 包根只暴露 Run 级最小契约与 `start_run(request)`。
-- `start_run` 返回 `RunStream`，包含 `RunHandle` 与 `RunEvent` 异步流；调用时会立即启动
+- 包根只暴露 Run 级最小契约与 `await start_run(request)`。
+- `start_run` 是 async 入口，返回 `RunStream`，包含 `RunHandle` 与 `RunEvent` 异步流；被 await 时会立即启动
   P1 内存后台任务，事件流只负责消费后台任务写入的内存队列。
 - Host 内部通过 `LocalProxy -> EngineWorker -> dayu.engine.run_agent_messages` 调用 Engine 函数式入口。
 - `EngineEvent` 会被薄翻译为 `RunEvent`；P1 `RunEvent.data` 直接携带 Engine event data 联合。
@@ -54,7 +54,7 @@ Host 的职责边界是通用 Agent 执行托管、会话、运行治理、恢�
 P1 内部执行路径：
 
 ```text
-dayu.host.start_run
+await dayu.host.start_run
   -> LocalRunHarness
   -> LocalProxy
   -> EngineWorker

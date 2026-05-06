@@ -132,7 +132,7 @@ class LocalRunHarness:
 
     proxy: WorkerProxy
 
-    def start_run(self, request: StartRunRequest) -> RunStream:
+    async def start_run(self, request: StartRunRequest) -> RunStream:
         """启动 P1 内存态 Run。
 
         :param request: P1 start_run 请求。
@@ -243,7 +243,7 @@ def _default_harness() -> LocalRunHarness:
     return LocalRunHarness(proxy=LocalProxy(worker=EngineWorker(executor)))
 
 
-def start_run(request: StartRunRequest) -> RunStream:
+async def start_run(request: StartRunRequest) -> RunStream:
     """启动 P1 最小 Run。
 
     这是 public 测试入口，不暴露 EngineWorker 或 ToolExecutor。需要定制
@@ -256,7 +256,7 @@ def start_run(request: StartRunRequest) -> RunStream:
         重新抛出后台执行捕获的 Engine / WorkerProxy 异常。
     """
 
-    return _default_harness().start_run(request)
+    return await _default_harness().start_run(request)
 
 
 __all__ = ["LocalRunHarness", "start_run"]

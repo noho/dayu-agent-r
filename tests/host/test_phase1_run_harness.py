@@ -402,7 +402,7 @@ async def test_public_start_run_streams_translated_engine_events(
 
     monkeypatch.setattr(agent_module, "_build_runner", fake_build_runner)
 
-    stream = start_run(_request())
+    stream = await start_run(_request())
     events = await _collect(stream.events)
 
     assert stream.handle.state is RunState.RUNNING
@@ -420,7 +420,7 @@ async def test_public_start_run_streams_translated_engine_events(
 async def test_start_run_eagerly_starts_before_event_stream_is_consumed(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """start_run 返回后即启动后台执行，不能等 async for 才启动。"""
+    """await start_run 返回后即启动后台执行，不能等 async for 才启动。"""
 
     gate = _AsyncReleaseGate()
     runner = _ScriptedRunner(
@@ -440,7 +440,7 @@ async def test_start_run_eagerly_starts_before_event_stream_is_consumed(
 
     monkeypatch.setattr(agent_module, "_build_runner", fake_build_runner)
 
-    stream = start_run(_request())
+    stream = await start_run(_request())
     await _wait_for_runner_call(runner)
 
     assert runner.call_count == 1
@@ -473,11 +473,10 @@ async def test_local_harness_supports_tool_call_fake_executor_smoke(
         proxy=LocalProxy(worker=EngineWorker(tool_executor=executor))
     )
 
-    events = await _collect(
-        harness.start_run(
-            _request(disable_tools=False, tool_schemas=(_schema(),))
-        ).events
+    stream = await harness.start_run(
+        _request(disable_tools=False, tool_schemas=(_schema(),))
     )
+    events = await _collect(stream.events)
 
     assert RunEventType.TOOL_CALL_REQUESTED in {event.type for event in events}
     assert RunEventType.TOOL_RESULT_ACCEPTED in {event.type for event in events}
