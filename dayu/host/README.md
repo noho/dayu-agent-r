@@ -88,6 +88,8 @@ exclusive replay 和 replay-then-follow 订阅。它是单进程内存实现，�
 Host-owned canonical `RUN_FAILED` 事件；该事件 `source=HOST`，`source_engine_event_id=None`。
 翻译、append、terminal result 推导等 Host 内部错误不会伪装成 Host-owned failure；后台 task 会记录
 ERROR 日志并取回异常，完整 supervisor / governance 仍不在 P1.5 范围内。
+提前停止消费后的 worker stream 关闭失败只记录 WARNING 诊断日志，不替换原始异常，也不写入
+Host-owned failure 事件。
 
 ## 当前手工验证
 

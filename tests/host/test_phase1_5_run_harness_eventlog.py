@@ -164,6 +164,72 @@ class _FailingProxy:
 
 
 @dataclass(slots=True)
+class _ClosingFailureEngineEvents:
+    """关闭时失败的测试用 EngineEvent 异步流。"""
+
+    events: tuple[EngineEvent, ...]
+    close_error: Exception
+    iteration_error: Exception | None = None
+    _next_index: int = 0
+
+    def __aiter__(self) -> AsyncIterator[EngineEvent]:
+        """返回自身作为异步迭代器。
+
+        :returns: EngineEvent 异步迭代器。
+        :raises Exception: 不主动抛出异常。
+        """
+
+        return self
+
+    async def __anext__(self) -> EngineEvent:
+        """按顺序产出事件，并在事件耗尽后按配置失败或结束。
+
+        :returns: 下一个 EngineEvent。
+        :raises Exception: 事件耗尽且配置 ``iteration_error`` 时抛出。
+        :raises StopAsyncIteration: 事件耗尽且未配置异常时抛出。
+        """
+
+        if self._next_index < len(self.events):
+            event = self.events[self._next_index]
+            self._next_index += 1
+            return event
+        if self.iteration_error is not None:
+            raise self.iteration_error
+        raise StopAsyncIteration
+
+    async def aclose(self) -> None:
+        """模拟底层 stream 关闭失败。
+
+        :returns: 无返回值。
+        :raises Exception: 始终抛出配置的关闭异常。
+        """
+
+        raise self.close_error
+
+
+@dataclass(frozen=True, slots=True)
+class _ClosingFailureProxy:
+    """返回关闭失败 EngineEvent 流的 fake WorkerProxy。"""
+
+    engine_events: _ClosingFailureEngineEvents
+
+    def stream_engine_events(
+        self,
+        request: StartRunRequest,
+        cancellation_token: CancellationToken,
+    ) -> AsyncIterator[EngineEvent]:
+        """返回配置好的 EngineEvent 流。
+
+        :param request: Host start_run 请求。
+        :param cancellation_token: Host 注入的取消 token。
+        :returns: EngineEvent 异步流。
+        :raises Exception: 不主动抛出异常。
+        """
+
+        return self.engine_events
+
+
+@dataclass(slots=True)
 class _RecordingRunEventStore:
     """记录 append 返回事件的测试用 RunEventStore。"""
 
@@ -592,6 +658,135 @@ async def test_terminal_result_error_does_not_append_host_failure() -> None:
     )
     with pytest.raises(TypeError, match="FinalAnswerData"):
         await harness.get_run_result(run_id)
+
+
+@pytest.mark.asyncio
+async def test_stream_close_error_does_not_mask_terminal_contract_error(
+    caplog: LogCaptureFixture,
+) -> None:
+    """关闭 stream 失败不得掩盖 Host 自身契约错误。"""
+
+    run_id = "eventlog_close_error_with_contract_error"
+    store = InMemoryRunEventStore()
+    harness = LocalRunHarness(
+        proxy=_ClosingFailureProxy(
+            engine_events=_ClosingFailureEngineEvents(
+                events=(
+                    _engine_event(
+                        run_id=run_id,
+                        event_type=EngineEventType.FINAL_ANSWER,
+                        data=RunFailedData(
+                            error_code="bad_contract",
+                            message="bad",
+                            recoverable=False,
+                        ),
+                    ),
+                ),
+                close_error=RuntimeError("close failed"),
+            )
+        ),
+        event_store=store,
+    )
+
+    caplog.set_level(logging.WARNING, logger="dayu.host._run_harness")
+
+    with pytest.raises(TypeError, match="FinalAnswerData"):
+        await harness._run_to_store(_request(run_id))
+
+    events = await store.list_events(run_id=run_id, after=None)
+    close_logs = [
+        record
+        for record in caplog.records
+        if "host.run.stream_close_failed" in record.getMessage()
+    ]
+
+    assert len(events) == 1
+    assert events[0].source is RunEventSource.ENGINE
+    assert events[0].type is RunEventType.FINAL_ANSWER
+    assert all(event.source is not RunEventSource.HOST for event in events)
+    assert len(close_logs) == 1
+    assert close_logs[0].exc_info is not None
+    assert close_logs[0].exc_info[0] is RuntimeError
+
+
+@pytest.mark.asyncio
+async def test_stream_close_error_does_not_change_worker_failure_fact(
+    caplog: LogCaptureFixture,
+) -> None:
+    """关闭 stream 失败不得替换 worker/proxy 异常对应的事实事件。"""
+
+    run_id = "eventlog_close_error_with_worker_error"
+    store = InMemoryRunEventStore()
+    harness = LocalRunHarness(
+        proxy=_ClosingFailureProxy(
+            engine_events=_ClosingFailureEngineEvents(
+                events=(),
+                close_error=RuntimeError("close failed"),
+                iteration_error=ValueError("worker failed"),
+            )
+        ),
+        event_store=store,
+    )
+
+    caplog.set_level(logging.WARNING, logger="dayu.host._run_harness")
+
+    await harness._run_to_store(_request(run_id))
+
+    events = await store.list_events(run_id=run_id, after=None)
+    close_logs = [
+        record
+        for record in caplog.records
+        if "host.run.stream_close_failed" in record.getMessage()
+    ]
+    result = await harness.get_run_result(run_id)
+
+    assert len(events) == 1
+    assert events[0].source is RunEventSource.HOST
+    assert events[0].type is RunEventType.RUN_FAILED
+    assert isinstance(events[0].data, HostRunFailedData)
+    assert events[0].data.exception_type == "ValueError"
+    assert isinstance(result, RunFailedResult)
+    assert result.terminal_event_cursor == events[0].cursor
+    assert len(close_logs) == 1
+    assert close_logs[0].exc_info is not None
+    assert close_logs[0].exc_info[0] is RuntimeError
+
+
+@pytest.mark.asyncio
+async def test_stream_close_error_after_success_does_not_append_host_failure(
+    caplog: LogCaptureFixture,
+) -> None:
+    """成功终态后的关闭失败只记录日志，不生成 Host-owned failure。"""
+
+    run_id = "eventlog_close_error_after_success"
+    store = InMemoryRunEventStore()
+    harness = LocalRunHarness(
+        proxy=_ClosingFailureProxy(
+            engine_events=_ClosingFailureEngineEvents(
+                events=(_engine_final(run_id=run_id, content="done"),),
+                close_error=RuntimeError("close failed"),
+            )
+        ),
+        event_store=store,
+    )
+
+    caplog.set_level(logging.WARNING, logger="dayu.host._run_harness")
+
+    await harness._run_to_store(_request(run_id))
+
+    events = await store.list_events(run_id=run_id, after=None)
+    result = await harness.get_run_result(run_id)
+
+    assert len(events) == 1
+    assert events[0].source is RunEventSource.ENGINE
+    assert events[0].type is RunEventType.FINAL_ANSWER
+    assert isinstance(result, RunSucceededResult)
+    assert result.content == "done"
+    assert all(event.source is not RunEventSource.HOST for event in events)
+    assert any(
+        "host.run.stream_close_failed" in record.getMessage()
+        for record in caplog.records
+    )
 
 
 @pytest.mark.asyncio

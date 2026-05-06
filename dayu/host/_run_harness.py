@@ -214,7 +214,10 @@ class LocalRunHarness:
                     terminal_seen = True
                     break
         finally:
-            await _close_engine_events_if_supported(engine_events)
+            await _close_engine_events_if_supported(
+                engine_events=engine_events,
+                request=request,
+            )
             _LOGGER.debug(
                 "host.run.background_finished session_id=%s run_id=%s "
                 "event_count=%s",
@@ -295,21 +298,35 @@ class LocalRunHarness:
 
 
 async def _close_engine_events_if_supported(
+    *,
     engine_events: AsyncIterator[EngineEvent],
+    request: StartRunRequest,
 ) -> None:
     """在提前停止消费时关闭 worker stream。
 
     ``WorkerProxy`` 的稳定契约只承诺返回 ``AsyncIterator``；本 helper 通过
     运行时协议识别 async generator 等支持 ``aclose`` 的实现，避免 harness
-    在首个终态后停止消费时泄漏底层 runner close 流程。
+    在首个终态后停止消费时泄漏底层 runner close 流程。关闭失败只记录诊断
+    日志，不覆盖原始异常，也不生成 Host-owned failure 事实事件。
 
     :param engine_events: worker 返回的 EngineEvent 异步流。
+    :param request: start_run 请求，用于输出诊断上下文。
     :returns: 无返回值。
-    :raises Exception: 底层 ``aclose`` 失败时透传。
+    :raises Exception: 不主动抛出异常。
     """
 
     if isinstance(engine_events, _ClosableAsyncIterator):
-        await engine_events.aclose()
+        try:
+            await engine_events.aclose()
+        except Exception as exc:
+            _LOGGER.warning(
+                "host.run.stream_close_failed session_id=%s run_id=%s "
+                "exc_type=%s",
+                request.session_id,
+                request.run_id,
+                type(exc).__name__,
+                exc_info=(type(exc), exc, exc.__traceback__),
+            )
 
 
 _DEFAULT_HARNESS_BY_LOOP: weakref.WeakKeyDictionary[

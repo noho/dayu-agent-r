@@ -9,7 +9,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
-from collections.abc import AsyncIterator
+from collections.abc import AsyncGenerator, AsyncIterator
 from dataclasses import dataclass, field
 from typing import Protocol
 
@@ -191,7 +191,7 @@ class InMemoryRunEventStore:
         self,
         run_id: str,
         after: RunEventCursor | None,
-    ) -> AsyncIterator[RunEvent]:
+    ) -> AsyncGenerator[RunEvent, None]:
         """在同一 condition 保护下补读并等待新事件。
 
         循环先检查 ``last_seen`` 之后是否已有事件，只有确认没有新事件且

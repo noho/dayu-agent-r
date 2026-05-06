@@ -8,8 +8,8 @@
 当前总控状态：
 
 - P1 已通过 PR #16 合入 `main`，当前确认基线为 `051cf20`。
-- P1.5 已启动独立分支 `codex/host-p1-5-eventlog`，phase handoff plan 与 plan review gate 已完成。
-- P1.5 plan 已通过用户人工 review，当前进入代码实施阶段。
+- P1.5 已在分支 `codex/host-p1-5-eventlog` 完成 plan、代码实施、code review 与 PR review 修复。
+- P1.5 PR #17 已创建并更新，当前处于可合并状态；用户合入 `main` 后，总控进入 P2。
 
 每个 Phase 进入实现前，必须另写可交接的 phase plan，细化到迁移 Agent 可以直接接手：
 目标、非目标、边界、文件级改动清单、契约变化、状态机、测试清单、验证命令、review gate、
