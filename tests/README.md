@@ -31,6 +31,9 @@ pyright
 ```bash
 pytest tests/contracts -q
 pytest tests/host -q
+pytest tests/host/test_phase2_tool_runtime_truncation.py -q
+pytest tests/host/test_phase2_tool_runtime_eventlog.py -q
+pytest tests/host/test_phase2_tool_runtime_boundary.py -q
 pytest tests/engine/contracts -q
 pytest tests/engine/runners/openai/test_event_flow_ordering.py -q
 ```
@@ -59,15 +62,24 @@ Engine 契约、包根导出、事件契约与架构边界测试，覆盖 `dayu.
 
 ### `tests/host/`
 
-Host P1.5 最小 Run harness 与 RunEventStore 测试，覆盖 `dayu.host` 当前已落地的边界：
+Host P2 最小 Run harness、RunEventStore 与 ToolRuntime 测试，覆盖 `dayu.host` 当前已落地的边界：
 
 - run harness：验证 public `start_run` 可经 Host 调用 Engine 函数式入口，并把 `EngineEvent` 翻译为已 append 的 `RunEvent`。
 - event store：验证 append-only、per-run cursor、exclusive replay、replay-then-follow 订阅和 terminal 后订阅结束。
 - run harness eventlog：验证 append-before-stream、preview 不污染 terminal result、结果只从已 append terminal event 推导、
   worker / proxy 异常会落 Host-owned canonical failure 事件。
 - tool-call smoke：通过内部 `LocalRunHarness` 注入 fake ToolExecutor，覆盖 Runner tool call -> Engine 工具闭环 -> Host RunEvent stream。
+- ToolRuntime truncation：覆盖 text chars、text lines、list items、binary bytes、no-spec no-truncate、
+  explicit target only、execute-time cursor facts、single-use、TTL expired、opportunistic cleanup 与 limit clamp。
+- ToolRuntime eventlog：覆盖截断 / cursor issued / fetch_more requested / completed / failed / denied / expired
+  均通过 canonical RunEvent 表达，handle 阶段 denied / expired 写入可信 owner run，terminal 后不追加事实，
+  且 EventLog 不保存明文 scope token 或完整大结果。
+- ToolRuntime boundary：覆盖 Host 包根只导出 Run 级补读入口与契约类型，Engine 不 import Host / ToolRuntime，
+  scope token 只能通过受控 handle 交付，跨 run 补读不污染请求伪造的 run，当前 Engine projection 不恢复
+  OLD LLM-facing `fetch_more_args`。
 - public boundary：锁定 `dayu.host.__all__`，允许 Run 级 `start_run`、`stream_run_events`、`get_run_result`，
-  阻止 `EngineWorker`、`LocalProxy`、`ToolExecutor`、`run_agent_messages` 泄漏为包根 API。
+  以及 P2 Run 级 `get_tool_fetch_more_handle`、`fetch_more_tool_result`，阻止 `EngineWorker`、`LocalProxy`、
+  `ToolExecutor`、`InMemoryToolRuntime`、`ToolRuntimeToolExecutor`、`run_agent_messages` 泄漏为包根 API。
 - import boundary：阻止 Host 导入 `dayu.fins`、`dayu.service`、`dayu.ui`。
 - weak typing guard：扫描 `dayu.host` 源码，阻止 `Any`、`object`、无类型签名与裸容器注解。
 

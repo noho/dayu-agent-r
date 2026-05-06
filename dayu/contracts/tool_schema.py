@@ -12,12 +12,18 @@ schema 内的字段值（``type``、``function``）是 OpenAI 风格协议字面
   JSON Schema runtime validator。
 - ``ToolSchema`` / ``ToolFunctionSchema`` 严格遵循 OpenAI Function-call
   格式以利 Runner 直接传递；其它 provider 适配由 Phase 1+ 处理。
+- ``ToolTruncateSpec`` 是 Host ToolRuntime 使用的显式截断声明，不进入
+  LLM-facing schema projection。
+- ``binary_bytes`` 策略在 Host ToolRuntime public 结果中返回 base64 ASCII
+  字符串，因为 ``JsonValue`` 不能承载原始 ``bytes``；它不是 OLD LLM
+  projection 的 ``content_base64`` 包装对象。
 """
 
 from __future__ import annotations
 
 from collections.abc import Mapping
 from dataclasses import dataclass
+from enum import StrEnum
 from typing import Literal
 
 from dayu.contracts.json_value import JsonValue
@@ -66,4 +72,45 @@ class ToolSchema:
     function: ToolFunctionSchema
 
 
-__all__ = ["ToolSchema", "ToolFunctionSchema", "ToolParametersSchema"]
+class ToolTruncationStrategy(StrEnum):
+    """工具结果截断策略。"""
+
+    TEXT_CHARS = "text_chars"
+    TEXT_LINES = "text_lines"
+    LIST_ITEMS = "list_items"
+    BINARY_BYTES = "binary_bytes"
+
+
+@dataclass(frozen=True, slots=True)
+class ToolTruncateSpec:
+    """工具结果截断显式声明。
+
+    P2 只把该声明作为 Host ToolRuntime 的显式触发条件；无声明、未启用、
+    未知策略或非法 limit 均由 ToolRuntime 解释为不截断。
+    ``strategy="binary_bytes"`` 时，截断结果与补读结果的 ``value`` 都是
+    base64 ASCII 字符串，``unit="bytes"`` 与 value summary 表示原始字节
+    大小。
+
+    :param enabled: 是否启用截断。
+    :param strategy: 截断策略字符串。
+    :param limits: 策略对应 limit 映射。
+    :param target_field: wrapper dict 的顶层目标字段。
+    :param field_path: wrapper dict 的嵌套目标路径。
+    :param ttl_seconds: cursor 生存秒数；``None`` 表示使用 Host 默认值。
+    """
+
+    enabled: bool
+    strategy: str | None
+    limits: Mapping[str, int]
+    target_field: str | None
+    field_path: tuple[str, ...] | None
+    ttl_seconds: int | None
+
+
+__all__ = [
+    "ToolSchema",
+    "ToolFunctionSchema",
+    "ToolParametersSchema",
+    "ToolTruncateSpec",
+    "ToolTruncationStrategy",
+]

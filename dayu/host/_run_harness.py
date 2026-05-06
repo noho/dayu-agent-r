@@ -27,6 +27,10 @@ from dayu.host._event_translation import (
     translate_engine_event,
 )
 from dayu.host._proxy import LocalProxy, WorkerProxy
+from dayu.host._tool_runtime import (
+    InMemoryToolRuntime,
+    ToolRuntimeToolExecutor,
+)
 from dayu.host._worker import EngineWorker
 from dayu.host.contracts import (
     RunEvent,
@@ -36,10 +40,15 @@ from dayu.host.contracts import (
     RunState,
     RunStream,
     StartRunRequest,
+    ToolFetchMoreHandleRequest,
+    ToolFetchMoreHandleResult,
+    ToolFetchMoreRequest,
+    ToolFetchMoreResult,
 )
 
 _INITIAL_CURSOR_SEQUENCE: int = -1
 _ERROR_TOOL_EXECUTOR_NOT_CONFIGURED: str = "tool_executor_not_configured"
+_ERROR_TOOL_RUNTIME_NOT_CONFIGURED: str = "tool_runtime_not_configured"
 _LOGGER: logging.Logger = logging.getLogger(__name__)
 
 
@@ -120,10 +129,12 @@ class LocalRunHarness:
 
     :param proxy: Host 内部 worker proxy。
     :param event_store: Host 内部 RunEventStore。
+    :param tool_runtime: Host 内部 ToolRuntime。
     """
 
     proxy: WorkerProxy
     event_store: RunEventStore = field(default_factory=InMemoryRunEventStore)
+    tool_runtime: InMemoryToolRuntime | None = None
 
     async def start_run(self, request: StartRunRequest) -> RunStream:
         """启动 P1.5 内存态 Run。
@@ -296,6 +307,36 @@ class LocalRunHarness:
                 return result
         return None
 
+    async def get_tool_fetch_more_handle(
+        self,
+        request: ToolFetchMoreHandleRequest,
+    ) -> ToolFetchMoreHandleResult:
+        """读取工具补读受控 handle。
+
+        :param request: handle 读取请求。
+        :returns: handle 读取结果。
+        :raises RuntimeError: harness 未装配 ToolRuntime 时抛出。
+        """
+
+        if self.tool_runtime is None:
+            raise RuntimeError(_ERROR_TOOL_RUNTIME_NOT_CONFIGURED)
+        return await self.tool_runtime.get_tool_fetch_more_handle(request)
+
+    async def fetch_more_tool_result(
+        self,
+        request: ToolFetchMoreRequest,
+    ) -> ToolFetchMoreResult:
+        """补读已截断工具结果。
+
+        :param request: 补读请求。
+        :returns: 补读结果。
+        :raises RuntimeError: harness 未装配 ToolRuntime 时抛出。
+        """
+
+        if self.tool_runtime is None:
+            raise RuntimeError(_ERROR_TOOL_RUNTIME_NOT_CONFIGURED)
+        return await self.tool_runtime.fetch_more(request)
+
 
 async def _close_engine_events_if_supported(
     *,
@@ -373,7 +414,16 @@ def _build_default_harness() -> LocalRunHarness:
     """
 
     executor: ToolExecutor = _NoopToolExecutor()
-    return LocalRunHarness(proxy=LocalProxy(worker=EngineWorker(executor)))
+    event_store = InMemoryRunEventStore()
+    runtime = InMemoryToolRuntime(
+        executor=executor,
+        event_store=event_store,
+    )
+    return LocalRunHarness(
+        proxy=LocalProxy(worker=EngineWorker(ToolRuntimeToolExecutor(runtime))),
+        event_store=event_store,
+        tool_runtime=runtime,
+    )
 
 
 def _default_harness_for_running_loop() -> LocalRunHarness:
@@ -437,9 +487,41 @@ async def get_run_result(run_id: str) -> RunResult | None:
     )
 
 
+async def get_tool_fetch_more_handle(
+    request: ToolFetchMoreHandleRequest,
+) -> ToolFetchMoreHandleResult:
+    """读取默认 harness 中的工具补读受控 handle。
+
+    :param request: handle 读取请求。
+    :returns: handle 读取结果。
+    :raises RuntimeError: 默认 harness 未装配 ToolRuntime 时抛出。
+    """
+
+    return await _default_harness_for_running_loop().get_tool_fetch_more_handle(
+        request
+    )
+
+
+async def fetch_more_tool_result(
+    request: ToolFetchMoreRequest,
+) -> ToolFetchMoreResult:
+    """补读默认 harness 中的截断工具结果。
+
+    :param request: 补读请求。
+    :returns: 补读结果。
+    :raises RuntimeError: 默认 harness 未装配 ToolRuntime 时抛出。
+    """
+
+    return await _default_harness_for_running_loop().fetch_more_tool_result(
+        request
+    )
+
+
 __all__ = [
     "LocalRunHarness",
+    "fetch_more_tool_result",
     "get_run_result",
+    "get_tool_fetch_more_handle",
     "start_run",
     "stream_run_events",
 ]

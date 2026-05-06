@@ -8,7 +8,7 @@
 
 ## Findings
 
-### P1：初始 `scope_token` 交付通道未闭合，可能导致 public `fetch_more_tool_result` 无法被真实调用
+### P1-已修复：初始 `scope_token` 交付通道未闭合，可能导致 public `fetch_more_tool_result` 无法被真实调用
 
 **直接证据**
 
@@ -41,7 +41,7 @@ plan 同时写明 `scope_token` 不进入 RunEvent、preview、Engine projection
 P2 真实调用方限定为同进程 Host UI / Service adapter 或测试 harness，远程 UI / LLM 主动补读后移。
 测试清单已增加 handle delivery 覆盖，要求证明 RunEvent 不含明文 token 但受控调用方能拿到 handle。
 
-### P1：P2 有意不恢复 OLD LLM 可执行 `fetch_more`，验收表述需避免误称“完整继承 OLD fetch_more 语义”
+### P1-已修复：P2 有意不恢复 OLD LLM 可执行 `fetch_more`，验收表述需避免误称“完整继承 OLD fetch_more 语义”
 
 **直接证据**
 
@@ -65,7 +65,7 @@ OLD LLM-facing `fetch_more` schema、`next_action` / `fetch_more_args` projectio
 这不是 P2 阻塞，因为 P2 的架构目标是先把 Host ToolRuntime 与 canonical RunEvent 事实层闭合，
 不把不可执行半协议回流 Engine。
 
-### P2：`session_id` / `tool_call_id` 校验是 NEW 语义收紧，但 plan 未说明与 OLD 跨 iteration 续读的关系
+### P2-已修复：`session_id` / `tool_call_id` 校验是 NEW 语义收紧，但 plan 未说明与 OLD 跨 iteration 续读的关系
 
 **直接证据**
 
@@ -88,7 +88,7 @@ NEW 对 session / tool_call 的绑定更强，方向上合理，因为 public Ho
 当成新的绑定对象。测试清单已增加“同一 run / session / 原始 tool_call 后续 caller turn 仍可补读；
 跨 run / session / 原始 tool_call 被拒绝”。
 
-### P2：scope token 生成字段缺少 `session_id`，与 plan 的 session 绑定目标不一致
+### P2-已修复：scope token 生成字段缺少 `session_id`，与 plan 的 session 绑定目标不一致
 
 **直接证据**
 
@@ -110,7 +110,7 @@ NEW 对 session / tool_call 的绑定更强，方向上合理，因为 public Ho
 cursor、scope_hash、session_id、run_id、tool_call_id、created_at。测试清单已增加 token 生成材料包含
 session_id，以及跨 session 复用 cursor / token 被拒绝。
 
-### P2：测试清单没有显式覆盖“执行时产生截断事实与 cursor”，容易把 cursor 登记推迟到 `fetch_more`
+### P2-已修复：测试清单没有显式覆盖“执行时产生截断事实与 cursor”，容易把 cursor 登记推迟到 `fetch_more`
 
 **直接证据**
 
@@ -133,7 +133,7 @@ session_id，以及跨 session 复用 cursor / token 被拒绝。
 canonical `tool_result_truncated` / `tool_cursor_issued` append；不调用 fetch_more 也必须能从
 `stream_run_events` 观察到事实。
 
-### P3：截断目标选择规则仍有歧义，可能不小心保留 OLD 启发式字段选择
+### P3-已修复：截断目标选择规则仍有歧义，可能不小心保留 OLD 启发式字段选择
 
 **直接证据**
 
@@ -160,7 +160,7 @@ canonical `tool_result_truncated` / `tool_cursor_issued` append；不调用 fetc
 P2 不继承 OLD longest text / largest nested list 启发式。测试清单、不可接受临时实现、review gate
 和停止条件均已同步，若实施需要启发式必须先停止修 plan。
 
-### P3：TTL 清理策略只有过期访问测试，缺少 OLD 的创建时清理语义
+### P3-已修复：TTL 清理策略只有过期访问测试，缺少 OLD 的创建时清理语义
 
 **直接证据**
 

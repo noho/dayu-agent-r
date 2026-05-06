@@ -13,6 +13,7 @@ from datetime import datetime
 from enum import StrEnum
 from typing import TypeAlias
 
+from dayu.contracts import JsonValue
 from dayu.engine import (
     AgentMessage,
     AgentPolicy,
@@ -61,6 +62,13 @@ class RunEventType(StrEnum):
     RUN_SUSPENDED = EngineEventType.RUN_SUSPENDED.value
     RUN_CANCELLED = EngineEventType.RUN_CANCELLED.value
     RUN_FAILED = EngineEventType.RUN_FAILED.value
+    TOOL_RESULT_TRUNCATED = "tool_result_truncated"
+    TOOL_CURSOR_ISSUED = "tool_cursor_issued"
+    TOOL_FETCH_MORE_REQUESTED = "tool_fetch_more_requested"
+    TOOL_FETCH_MORE_COMPLETED = "tool_fetch_more_completed"
+    TOOL_FETCH_MORE_FAILED = "tool_fetch_more_failed"
+    TOOL_CURSOR_EXPIRED = "tool_cursor_expired"
+    TOOL_CURSOR_DENIED = "tool_cursor_denied"
 
 
 class RunEventKind(StrEnum):
@@ -109,7 +117,179 @@ class HostRunFailedData:
     exception_type: str
 
 
-RunEventData: TypeAlias = EngineEventData | HostRunFailedData
+@dataclass(frozen=True, slots=True)
+class ToolValueSizeSummary:
+    """工具结果值大小摘要。
+
+    :param unit: 摘要单位。
+    :param size: 当前值大小。
+    :param total_estimate: 原始总量估计。
+    :param fingerprint: 当前值摘要指纹。
+    """
+
+    unit: str
+    size: int
+    total_estimate: int
+    fingerprint: str
+
+
+@dataclass(frozen=True, slots=True)
+class ToolResultTruncatedData:
+    """工具结果已截断事实。
+
+    :param tool_name: 工具名。
+    :param tool_call_id: 原始工具调用 id。
+    :param strategy: 截断策略。
+    :param limit: 截断上限。
+    :param unit: 截断单位。
+    :param total_estimate: 原始总量估计。
+    :param cursor_fingerprint: cursor 指纹。
+    :param ttl_seconds: cursor TTL 秒数。
+    :param has_more: 是否仍有剩余数据。
+    :param value_summary: 截断后返回值大小摘要。
+    """
+
+    tool_name: str
+    tool_call_id: str
+    strategy: str
+    limit: int
+    unit: str
+    total_estimate: int
+    cursor_fingerprint: str
+    ttl_seconds: int
+    has_more: bool
+    value_summary: ToolValueSizeSummary
+
+
+@dataclass(frozen=True, slots=True)
+class ToolCursorIssuedData:
+    """工具补读 cursor 已签发事实。
+
+    :param tool_name: 工具名。
+    :param tool_call_id: 原始工具调用 id。
+    :param cursor_fingerprint: cursor 指纹。
+    :param scope_hash: scope 内容 hash。
+    :param parent_cursor_fingerprint: 上一页 cursor 指纹；首个 cursor 为
+        ``None``。
+    :param offset: cursor 对应的下一页起始位置。
+    :param limit: 原始截断上限。
+    :param total_estimate: 原始总量估计。
+    :param ttl_seconds: cursor TTL 秒数。
+    :param expires_at_monotonic: 单进程 monotonic 过期时间。
+    :param single_use: 是否单次有效。
+    """
+
+    tool_name: str
+    tool_call_id: str
+    cursor_fingerprint: str
+    scope_hash: str
+    parent_cursor_fingerprint: str | None
+    offset: int
+    limit: int
+    total_estimate: int
+    ttl_seconds: int
+    expires_at_monotonic: float
+    single_use: bool
+
+
+@dataclass(frozen=True, slots=True)
+class ToolFetchMoreRequestedData:
+    """工具补读请求事实。
+
+    :param tool_call_id: 原始工具调用 id。
+    :param cursor_fingerprint: cursor 指纹。
+    :param requested_limit: 调用方请求的 limit。
+    """
+
+    tool_call_id: str
+    cursor_fingerprint: str
+    requested_limit: int | None
+
+
+@dataclass(frozen=True, slots=True)
+class ToolFetchMoreCompletedData:
+    """工具补读完成事实。
+
+    :param tool_name: 工具名。
+    :param tool_call_id: 原始工具调用 id。
+    :param consumed_cursor_fingerprint: 已消费 cursor 指纹。
+    :param next_cursor_fingerprint: 下一页 cursor 指纹；无剩余为 ``None``。
+    :param limit: 实际读取 limit。
+    :param chunk_size: 本次返回元素数量。
+    :param has_more: 是否仍有剩余数据。
+    :param value_summary: 本次返回值大小摘要。
+    """
+
+    tool_name: str
+    tool_call_id: str
+    consumed_cursor_fingerprint: str
+    next_cursor_fingerprint: str | None
+    limit: int
+    chunk_size: int
+    has_more: bool
+    value_summary: ToolValueSizeSummary
+
+
+@dataclass(frozen=True, slots=True)
+class ToolFetchMoreFailedData:
+    """工具补读失败事实。
+
+    :param tool_call_id: 原始工具调用 id。
+    :param cursor_fingerprint: cursor 指纹。
+    :param error_code: 失败错误码。
+    :param message: 人类可读错误描述。
+    :param denied: 是否为权限拒绝。
+    :param expired: 是否为 cursor 过期。
+    """
+
+    tool_call_id: str
+    cursor_fingerprint: str
+    error_code: str
+    message: str
+    denied: bool
+    expired: bool
+
+
+@dataclass(frozen=True, slots=True)
+class ToolCursorExpiredData:
+    """工具补读 cursor 过期事实。
+
+    :param tool_call_id: 原始工具调用 id。
+    :param cursor_fingerprint: cursor 指纹。
+    :param expired_at_monotonic: cursor 过期时间。
+    """
+
+    tool_call_id: str
+    cursor_fingerprint: str
+    expired_at_monotonic: float
+
+
+@dataclass(frozen=True, slots=True)
+class ToolCursorDeniedData:
+    """工具补读 cursor 拒绝事实。
+
+    :param tool_call_id: 原始工具调用 id。
+    :param cursor_fingerprint: cursor 指纹。
+    :param reason: 拒绝原因。
+    """
+
+    tool_call_id: str
+    cursor_fingerprint: str
+    reason: str
+
+
+ToolRuntimeEventData: TypeAlias = (
+    ToolResultTruncatedData
+    | ToolCursorIssuedData
+    | ToolFetchMoreRequestedData
+    | ToolFetchMoreCompletedData
+    | ToolFetchMoreFailedData
+    | ToolCursorExpiredData
+    | ToolCursorDeniedData
+)
+"""ToolRuntime canonical RunEvent data 封闭联合。"""
+
+RunEventData: TypeAlias = EngineEventData | HostRunFailedData | ToolRuntimeEventData
 """Host RunEvent data 封闭联合。"""
 
 
@@ -346,8 +526,190 @@ class RunStream:
     events: AsyncIterator[RunEvent]
 
 
+@dataclass(frozen=True, slots=True)
+class ToolRuntimeCursor:
+    """Host ToolRuntime cursor 公共包装。
+
+    :param value: cursor 原文，仅通过受控 handle 交付。
+    :param fingerprint: cursor 指纹，可从 RunEvent 中观察。
+    """
+
+    value: str
+    fingerprint: str
+
+
+@dataclass(frozen=True, slots=True)
+class ToolFetchMoreHandleRequest:
+    """读取工具补读 handle 的请求。
+
+    :param session_id: 会话 id。
+    :param run_id: Run id。
+    :param tool_call_id: 原始工具调用 id。
+    :param cursor_fingerprint: RunEvent 中暴露的 cursor 指纹。
+    """
+
+    session_id: str
+    run_id: str
+    tool_call_id: str
+    cursor_fingerprint: str
+
+
+@dataclass(frozen=True, slots=True)
+class ToolFetchMoreHandle:
+    """工具补读受控 handle。
+
+    该结构不得写入 RunEvent、Engine projection 或日志。
+
+    :param session_id: 会话 id。
+    :param run_id: Run id。
+    :param tool_call_id: 原始工具调用 id。
+    :param cursor: ToolRuntime cursor。
+    :param scope_token: scope 校验 token。
+    :param expires_at_monotonic: 单进程 monotonic 过期时间。
+    """
+
+    session_id: str
+    run_id: str
+    tool_call_id: str
+    cursor: ToolRuntimeCursor
+    scope_token: str
+    expires_at_monotonic: float
+
+
+@dataclass(frozen=True, slots=True)
+class ToolFetchMoreHandleSucceededResult:
+    """工具补读 handle 读取成功结果。
+
+    :param run_id: Run id。
+    :param session_id: 会话 id。
+    :param tool_call_id: 原始工具调用 id。
+    :param handle: 受控补读 handle。
+    :param expires_at_monotonic: 单进程 monotonic 过期时间。
+    """
+
+    run_id: str
+    session_id: str
+    tool_call_id: str
+    handle: ToolFetchMoreHandle
+    expires_at_monotonic: float
+
+
+@dataclass(frozen=True, slots=True)
+class ToolFetchMoreHandleFailedResult:
+    """工具补读 handle 读取失败结果。
+
+    :param run_id: Run id。
+    :param session_id: 会话 id。
+    :param tool_call_id: 原始工具调用 id。
+    :param error_code: 失败错误码。
+    :param message: 人类可读错误描述。
+    :param denied: 是否为权限拒绝。
+    """
+
+    run_id: str
+    session_id: str
+    tool_call_id: str
+    error_code: str
+    message: str
+    denied: bool
+
+
+ToolFetchMoreHandleResult: TypeAlias = (
+    ToolFetchMoreHandleSucceededResult | ToolFetchMoreHandleFailedResult
+)
+"""工具补读 handle 读取结果封闭联合。"""
+
+
+@dataclass(frozen=True, slots=True)
+class ToolFetchMoreRequest:
+    """工具补读请求。
+
+    :param session_id: 会话 id。
+    :param run_id: Run id。
+    :param tool_call_id: 原始工具调用 id。
+    :param cursor: ToolRuntime cursor。
+    :param scope_token: 受控 handle 中携带的 scope token。
+    :param limit: 可选读取上限。
+    """
+
+    session_id: str
+    run_id: str
+    tool_call_id: str
+    cursor: ToolRuntimeCursor
+    scope_token: str
+    limit: int | None
+
+
+@dataclass(frozen=True, slots=True)
+class ToolFetchMoreSucceededResult:
+    """工具补读成功结果。
+
+    :param run_id: Run id。
+    :param session_id: 会话 id。
+    :param tool_call_id: 原始工具调用 id。
+    :param value: 补读返回值。
+    :param truncation: 若仍有剩余数据，返回下一页截断信息。
+    :param event_cursor: completed RunEvent cursor。
+    """
+
+    run_id: str
+    session_id: str
+    tool_call_id: str
+    value: JsonValue
+    truncation: ToolRuntimeCursor | None
+    event_cursor: RunEventCursor
+
+
+@dataclass(frozen=True, slots=True)
+class ToolFetchMoreFailedResult:
+    """工具补读失败结果。
+
+    :param run_id: Run id。
+    :param session_id: 会话 id。
+    :param tool_call_id: 原始工具调用 id。
+    :param error_code: 失败错误码。
+    :param message: 人类可读错误描述。
+    :param denied: 是否为权限拒绝。
+    :param event_cursor: failed RunEvent cursor；terminal 后未追加事实时为
+        ``None``。
+    """
+
+    run_id: str
+    session_id: str
+    tool_call_id: str
+    error_code: str
+    message: str
+    denied: bool
+    event_cursor: RunEventCursor | None
+
+
+ToolFetchMoreResult: TypeAlias = (
+    ToolFetchMoreSucceededResult | ToolFetchMoreFailedResult
+)
+"""工具补读结果封闭联合。"""
+
+
 __all__ = [
     "HostRunFailedData",
+    "ToolCursorDeniedData",
+    "ToolCursorExpiredData",
+    "ToolCursorIssuedData",
+    "ToolFetchMoreCompletedData",
+    "ToolFetchMoreFailedData",
+    "ToolFetchMoreFailedResult",
+    "ToolFetchMoreHandle",
+    "ToolFetchMoreHandleFailedResult",
+    "ToolFetchMoreHandleRequest",
+    "ToolFetchMoreHandleResult",
+    "ToolFetchMoreHandleSucceededResult",
+    "ToolFetchMoreRequest",
+    "ToolFetchMoreResult",
+    "ToolFetchMoreSucceededResult",
+    "ToolFetchMoreRequestedData",
+    "ToolResultTruncatedData",
+    "ToolRuntimeCursor",
+    "ToolRuntimeEventData",
+    "ToolValueSizeSummary",
     "RunCancelledResult",
     "RunEventData",
     "RunEvent",

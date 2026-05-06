@@ -9,8 +9,8 @@
 
 - P1 已通过 PR #16 合入 `main`，当前确认基线为 `051cf20`。
 - P1.5 已通过 PR #17 合入 `main`，merge commit 为 `ec1627c94f352205ee77bcd992d652e677fa0ebb`。
-- 当前进入 P2，分支为 `codex/host-p2-toolruntime-truncate`；下一步派 Agent 编写 P2 phase
-  handoff plan。
+- P2 已在分支 `codex/host-p2-toolruntime-truncate` 完成 plan、代码实施、常规 code review 与
+  OLD / NEW code review 复审；当前准备创建 PR。
 
 每个 Phase 进入实现前，必须另写可交接的 phase plan，细化到迁移 Agent 可以直接接手：
 目标、非目标、边界、文件级改动清单、契约变化、状态机、测试清单、验证命令、review gate、
@@ -52,14 +52,14 @@ codex/host-p{phase}-{short-name}
 1. 从最新主线或用户指定基线开新分支。
 2. 派 Agent 写 phase handoff plan。
 3. 派 review Agent 做 plan review，必要时派第二个 review Agent 做 OLD / NEW 对比或最佳实践 review。
-4. plan review 不通过时，派 Agent 修 plan，并在对应 review 文档标注修复状态。
+4. plan review 不通过时，派 Agent 修 plan，并在对应 review 文档的finding标题上标注修复状态。
 5. 派 review Agent 复审修复后的 plan；若仍不通过，重复步骤 4-5，直到 review Agent 明确通过。
 6. plan review 通过后，停下来等用户人工 review。
 7. 用户确认后，commit phase plan 与 review 文档。
 8. 派迁移 Agent 按通过的 plan 生成代码。
 9. 派 code review Agent 做 code review，必要时派额外 review Agent 做 OLD / NEW 对比、架构边界、
    类型安全或并发专项 review。
-10. code review 不通过时，派 Agent 修复代码，并在对应 code review 文档标注修复状态。
+10. code review 不通过时，派 Agent 修复代码，并在对应 code review 文档的finding标题上标注修复状态。
 11. 派 code review Agent 复审修复后的代码；若仍不通过，重复步骤 10-11，直到 review Agent 明确通过。
 12. code review 通过后，停下来等用户人工 review。
 13. 用户确认后，commit 代码、测试和必要 README / docs 更新。
@@ -191,7 +191,8 @@ docs/host/phase11-wait-state-review.md
 
 小数 Phase 的文件名使用下划线，例如 P1.5 对应 `phase1_5-*`，P5.5 对应 `phase5_5-*`。
 
-所有 review finding 修复后，必须在对应 review 文档写入“修复状态”章节。
+所有 review finding 修复后，必须在对应 review 文档的 finding 标题上标注修复状态；可在正文保留
+“修复状态”说明作为证据，但标题状态是必需项。
 
 ## 6. Phase Plan 必填模板
 

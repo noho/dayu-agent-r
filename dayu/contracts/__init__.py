@@ -6,7 +6,8 @@
 - :data:`JsonValue` 严格 JSON 联合。
 - :class:`CancellationToken` 取消观察 Protocol（**不**导出取消异常）。
 - :class:`ToolSchema` / :class:`ToolFunctionSchema` /
-  :class:`ToolParametersSchema` 工具 schema 三件套。
+  :class:`ToolParametersSchema` / :class:`ToolTruncateSpec` 工具 schema
+  与截断声明。
 - :class:`ToolCallRequest` / :class:`ToolExecutionContext` /
   :class:`ToolExecutionRequest`。
 - :class:`ToolResultSuccess` / :class:`ToolResultFailure` /
@@ -56,6 +57,8 @@ from dayu.contracts.tool_schema import (
     ToolFunctionSchema,
     ToolParametersSchema,
     ToolSchema,
+    ToolTruncateSpec,
+    ToolTruncationStrategy,
 )
 
 __all__ = [
@@ -81,5 +84,7 @@ __all__ = [
     "ToolResultMeta",
     "ToolResultSuccess",
     "ToolSchema",
+    "ToolTruncateSpec",
     "ToolTruncationInfo",
+    "ToolTruncationStrategy",
 ]
