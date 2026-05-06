@@ -75,7 +75,7 @@ P1 使用内存队列连接后台执行任务与 `RunStream.events`。该队列�
 P1 提供 EngineWorker 手工 smoke 脚本：
 
 ```bash
-python -m utils.smoke_engine_worker --case deepseek-v4-flash
+python utils/smoke_engine_worker.py --case deepseek-v4-flash
 ```
 
 该脚本直接调用 Host 内部 `EngineWorker` wrapper，使用真实 provider 配置与 fake `add_numbers`

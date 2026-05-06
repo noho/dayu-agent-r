@@ -5,12 +5,15 @@
 
 from __future__ import annotations
 
+import logging
 from collections.abc import AsyncIterator
 from dataclasses import dataclass
 
 from dayu.contracts import CancellationToken, ToolExecutor
 from dayu.engine import AgentRunRequest, EngineEvent, run_agent_messages
 from dayu.host.contracts import StartRunRequest
+
+_LOGGER: logging.Logger = logging.getLogger(__name__)
 
 
 @dataclass(frozen=True, slots=True)
@@ -47,6 +50,16 @@ class EngineWorker:
             tool_schemas=request.options.tool_schemas,
             tool_executor=self.tool_executor,
             cancellation_token=cancellation_token,
+        )
+        _LOGGER.debug(
+            "host.engine_worker.run_agent_messages session_id=%s run_id=%s "
+            "messages=%s tools=%s stream=%s disable_tools=%s",
+            engine_request.session_id,
+            engine_request.run_id,
+            len(engine_request.messages),
+            len(engine_request.tool_schemas),
+            engine_request.stream,
+            engine_request.disable_tools,
         )
         return run_agent_messages(engine_request)
 

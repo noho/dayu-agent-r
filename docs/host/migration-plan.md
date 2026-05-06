@@ -139,6 +139,11 @@ P5 smoke 只覆盖单进程、单调用方、顺序执行 happy path：每轮等
 P5 需要最小 Run 创建事实和 Session 下多轮顺序，但不以生产级 `start_run` 幂等、
 同 Session active Run admission policy、断线重试或并发输入仲裁为前提。这些治理能力仍留在 P7。
 
+P7 实施 `start_run` 幂等时，必须重新讨论并固定 `(session_id, client_request_id)` 如何幂等映射到
+同一个 `run_id`：包括 `run_id` 由 Host 生成还是由持久 Run 创建事实确定、重复请求返回同一
+`RunStream` / `RunHandle` 的精确语义、原 Run 已 terminal 或事件 cursor 已推进时的补读起点、
+以及该映射依赖的持久唯一约束 / compare-and-set 边界。
+
 ## 5. Phase 文档命名
 
 每个 Phase 使用固定文档命名：

@@ -7,6 +7,7 @@
 from __future__ import annotations
 
 import asyncio
+import logging
 from collections.abc import AsyncIterator
 from dataclasses import dataclass
 from datetime import datetime
@@ -30,6 +31,7 @@ from dayu.host.contracts import (
 _INITIAL_CURSOR_SEQUENCE: int = -1
 _ERROR_TOOL_EXECUTOR_NOT_CONFIGURED: str = "tool_executor_not_configured"
 _RUN_EVENT_QUEUE_MAX_SIZE: int = 256
+_LOGGER: logging.Logger = logging.getLogger(__name__)
 
 
 @dataclass(frozen=True, slots=True)
@@ -143,6 +145,12 @@ class LocalRunHarness:
             maxsize=_RUN_EVENT_QUEUE_MAX_SIZE
         )
         asyncio.create_task(self._run_to_queue(request=request, queue=queue))
+        _LOGGER.debug(
+            "host.run.start_accepted session_id=%s run_id=%s queue_max_size=%s",
+            request.session_id,
+            request.run_id,
+            _RUN_EVENT_QUEUE_MAX_SIZE,
+        )
         handle = RunHandle(
             session_id=request.session_id,
             run_id=request.run_id,
@@ -168,17 +176,39 @@ class LocalRunHarness:
         """
 
         token = _NeverCancelledToken()
+        event_count = 0
+        _LOGGER.debug(
+            "host.run.background_start session_id=%s run_id=%s",
+            request.session_id,
+            request.run_id,
+        )
         try:
             async for event in self.proxy.stream_engine_events(
                 request=request,
                 cancellation_token=token,
             ):
+                event_count += 1
                 await queue.put(
                     _RunEventQueueData(event=translate_engine_event(event))
                 )
         except Exception as exc:
+            _LOGGER.warning(
+                "host.run.background_failed session_id=%s run_id=%s "
+                "event_count=%s exc_type=%s",
+                request.session_id,
+                request.run_id,
+                event_count,
+                type(exc).__name__,
+            )
             await queue.put(_RunEventQueueError(error=exc))
         finally:
+            _LOGGER.debug(
+                "host.run.background_finished session_id=%s run_id=%s "
+                "event_count=%s",
+                request.session_id,
+                request.run_id,
+                event_count,
+            )
             await queue.put(_RunEventQueueCompleted())
 
     async def _stream_queue(

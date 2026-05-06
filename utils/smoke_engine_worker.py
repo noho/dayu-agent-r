@@ -14,23 +14,54 @@ from __future__ import annotations
 
 import argparse
 import asyncio
+import hashlib
+import json
 import os
 import sys
 from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
 from datetime import datetime
+from pathlib import Path
 from typing import Literal
 
+_REPO_ROOT_PARENT_INDEX: int = 1
+
+
+def _ensure_repo_root_on_path() -> None:
+    """确保按文件路径运行脚本时也能导入仓库顶层包。
+
+    ``python utils/smoke_engine_worker.py`` 会把 ``utils/`` 放在
+    ``sys.path[0]``，导致顶层 ``utils`` 包不可见。本函数只在直接按文件
+    路径执行时把仓库根目录补入 ``sys.path``；``python -m`` 运行时不改动。
+
+    :returns: 无返回值。
+    :raises Exception: 不主动抛出异常。
+    """
+
+    if __package__ not in (None, ""):
+        return
+    repo_root = Path(__file__).resolve().parents[_REPO_ROOT_PARENT_INDEX]
+    repo_root_text = str(repo_root)
+    if repo_root_text not in sys.path:
+        sys.path.insert(0, repo_root_text)
+
+
+_ensure_repo_root_on_path()
+
 from dayu.engine import (
+    AgentRunRequest,
     AgentMessageRole,
     AgentPolicy,
+    EngineEvent,
     EngineEventType,
     FinalAnswerData,
     RunnerCallOptions,
     RunnerSpec,
     UserMessage,
 )
+from dayu.engine.runners.openai.payload import build_request_payload
 from dayu.host import RunInput, RunOptions, StartRunRequest
+import dayu.host._worker as worker_module
 from dayu.host._worker import EngineWorker
 from dayu.runtime.log import LogLevel, configure
 from utils.smoke_async_agent_tool_call import (
@@ -38,6 +69,7 @@ from utils.smoke_async_agent_tool_call import (
     CASES,
     ProviderCase,
     add_numbers_schema,
+    build_request as build_agent_smoke_request,
     safe_event_summary,
 )
 
@@ -50,6 +82,10 @@ _SKIP_PREFIX: str = "SKIP"
 _CASE_PREFIX: str = "CASE"
 _SUMMARY_PREFIX: str = "SUMMARY"
 _FINAL_SUMMARY_PREFIX: str = "FINAL_SUMMARY"
+_DEBUG_PREFIX: str = "DEBUG_COMPARE"
+_DEBUG_API_KEY: str = "DEBUG_ONLY_API_KEY"
+_AUTHORIZATION_HEADER: str = "Authorization"
+_REDACTED_VALUE: str = "<redacted>"
 
 
 @dataclass(frozen=True, slots=True)
@@ -60,12 +96,14 @@ class SmokeArgs:
     :param run_all: 是否运行全部 case。
     :param stream: 是否启用流式。
     :param timeout_seconds: provider 默认超时秒数。
+    :param debug_compare_agent_smoke: 是否只做本地请求构造对比，不发网络。
     """
 
     case_name: str | None
     run_all: bool
     stream: bool
     timeout_seconds: float
+    debug_compare_agent_smoke: bool
 
 
 @dataclass(frozen=True, slots=True)
@@ -114,6 +152,29 @@ class _SmokeCancellationToken:
         return None
 
 
+@dataclass(frozen=True, slots=True)
+class _EmptyEngineEventStream:
+    """用于捕获 EngineWorker 装配请求的空 EngineEvent 流。"""
+
+    def __aiter__(self) -> "_EmptyEngineEventStream":
+        """返回自身作为异步迭代器。
+
+        :returns: 自身。
+        :raises Exception: 不主动抛出异常。
+        """
+
+        return self
+
+    async def __anext__(self) -> EngineEvent:
+        """结束空事件流。
+
+        :returns: 不会正常返回。
+        :raises StopAsyncIteration: 始终抛出以结束迭代。
+        """
+
+        raise StopAsyncIteration
+
+
 def parse_args(argv: Sequence[str]) -> SmokeArgs:
     """解析命令行参数。
 
@@ -134,6 +195,14 @@ def parse_args(argv: Sequence[str]) -> SmokeArgs:
         type=float,
         default=_DEFAULT_TIMEOUT_SECONDS,
     )
+    parser.add_argument(
+        "--debug-compare-agent-smoke",
+        action="store_true",
+        help=(
+            "compare local EngineWorker AgentRunRequest construction with "
+            "utils.smoke_async_agent_tool_call without sending network requests"
+        ),
+    )
     namespace = parser.parse_args(list(argv))
     stream_value: Literal["true", "false"] = namespace.stream
     return SmokeArgs(
@@ -141,6 +210,7 @@ def parse_args(argv: Sequence[str]) -> SmokeArgs:
         run_all=namespace.run_all,
         stream=stream_value == "true",
         timeout_seconds=namespace.timeout_seconds,
+        debug_compare_agent_smoke=namespace.debug_compare_agent_smoke,
     )
 
 
@@ -219,6 +289,298 @@ def build_request(
     )
 
 
+async def _capture_engine_worker_request(
+    *,
+    worker: EngineWorker,
+    request: StartRunRequest,
+) -> AgentRunRequest:
+    """捕获 EngineWorker 实际装配出的 AgentRunRequest。
+
+    本函数临时替换 ``dayu.host._worker.run_agent_messages``，只捕获
+    EngineWorker 传入 Engine 的请求，不发起 provider 网络请求。
+
+    :param worker: 待验证的 EngineWorker。
+    :param request: Host StartRunRequest。
+    :returns: EngineWorker 装配出的 AgentRunRequest。
+    :raises AssertionError: 未捕获到请求时抛出。
+    """
+
+    captured: list[AgentRunRequest] = []
+    original = worker_module.run_agent_messages
+
+    def capture_run_agent_messages(
+        engine_request: AgentRunRequest,
+    ) -> _EmptyEngineEventStream:
+        """捕获 AgentRunRequest 并返回空事件流。
+
+        :param engine_request: EngineWorker 装配出的请求。
+        :returns: 空 EngineEvent 流。
+        :raises Exception: 不主动抛出异常。
+        """
+
+        captured.append(engine_request)
+        return _EmptyEngineEventStream()
+
+    worker_module.run_agent_messages = capture_run_agent_messages
+    try:
+        async for _event in worker.run_agent_messages(
+            request=request,
+            cancellation_token=_SmokeCancellationToken(),
+        ):
+            pass
+    finally:
+        worker_module.run_agent_messages = original
+    if not captured:
+        raise AssertionError("EngineWorker did not build AgentRunRequest")
+    return captured[0]
+
+
+def _redacted_headers(headers: Mapping[str, str]) -> dict[str, str]:
+    """返回脱敏 headers。
+
+    :param headers: 原始 headers。
+    :returns: Authorization 已脱敏的 headers。
+    :raises Exception: 不主动抛出异常。
+    """
+
+    redacted: dict[str, str] = {}
+    for key, value in headers.items():
+        if key.lower() == _AUTHORIZATION_HEADER.lower():
+            redacted[key] = _REDACTED_VALUE
+        else:
+            redacted[key] = value
+    return redacted
+
+
+def _payload_json(request: AgentRunRequest) -> str:
+    """构造 Runner HTTP payload JSON 字符串。
+
+    :param request: AgentRunRequest。
+    :returns: 排序后的 JSON 字符串。
+    :raises TypeError: payload 无法 JSON 序列化时由 json 抛出。
+    """
+
+    payload = build_request_payload(
+        messages=request.messages,
+        options=request.runner_options,
+        tools=request.tool_schemas,
+        spec=request.runner_spec,
+    )
+    return json.dumps(dict(payload), ensure_ascii=False, sort_keys=True)
+
+
+def _sha256_text(value: str) -> str:
+    """计算文本 SHA256。
+
+    :param value: 输入文本。
+    :returns: SHA256 十六进制摘要。
+    :raises Exception: 不主动抛出异常。
+    """
+
+    return hashlib.sha256(value.encode("utf-8")).hexdigest()
+
+
+def _request_debug_lines(
+    *, label: str, request: AgentRunRequest
+) -> tuple[str, ...]:
+    """生成脱敏 AgentRunRequest 摘要行。
+
+    :param label: 摘要标签。
+    :param request: AgentRunRequest。
+    :returns: 摘要行元组。
+    :raises Exception: 不主动抛出异常。
+    """
+
+    payload_json = _payload_json(request)
+    tool_names = tuple(schema.function.name for schema in request.tool_schemas)
+    message_roles = tuple(message.role.value for message in request.messages)
+    headers = _redacted_headers(request.runner_spec.headers)
+    return (
+        f"{_DEBUG_PREFIX} {label}.run_id={request.run_id}",
+        f"{_DEBUG_PREFIX} {label}.session_id={request.session_id}",
+        f"{_DEBUG_PREFIX} {label}.stream={request.stream}",
+        f"{_DEBUG_PREFIX} {label}.disable_tools={request.disable_tools}",
+        f"{_DEBUG_PREFIX} {label}.message_roles={message_roles!r}",
+        f"{_DEBUG_PREFIX} {label}.tool_names={tool_names!r}",
+        f"{_DEBUG_PREFIX} {label}.executor={type(request.tool_executor).__name__}",
+        f"{_DEBUG_PREFIX} {label}.cancel_token={type(request.cancellation_token).__name__}",
+        f"{_DEBUG_PREFIX} {label}.provider={request.runner_spec.provider}",
+        f"{_DEBUG_PREFIX} {label}.model={request.runner_spec.model}",
+        f"{_DEBUG_PREFIX} {label}.endpoint={request.runner_spec.endpoint}",
+        f"{_DEBUG_PREFIX} {label}.api_key_ref={request.runner_spec.api_key_ref}",
+        f"{_DEBUG_PREFIX} {label}.headers={headers!r}",
+        f"{_DEBUG_PREFIX} {label}.provider_request={request.runner_spec.provider_request!r}",
+        f"{_DEBUG_PREFIX} {label}.payload_bytes={len(payload_json.encode('utf-8'))}",
+        f"{_DEBUG_PREFIX} {label}.payload_sha256={_sha256_text(payload_json)}",
+    )
+
+
+def _compare_field(
+    *, field_name: str, direct_value: str, worker_value: str
+) -> str | None:
+    """比较单个字符串字段。
+
+    :param field_name: 字段名。
+    :param direct_value: direct Agent smoke 字段值。
+    :param worker_value: EngineWorker smoke 字段值。
+    :returns: 差异摘要；相同返回 ``None``。
+    :raises Exception: 不主动抛出异常。
+    """
+
+    if direct_value == worker_value:
+        return None
+    return (
+        f"{_DEBUG_PREFIX} diff.{field_name} "
+        f"agent={direct_value!r} worker={worker_value!r}"
+    )
+
+
+def _material_differences(
+    *, direct_request: AgentRunRequest, worker_request: AgentRunRequest
+) -> tuple[str, ...]:
+    """返回可能影响 provider payload 的字段差异。
+
+    :param direct_request: 原 Agent smoke 请求。
+    :param worker_request: EngineWorker 装配请求。
+    :returns: 差异摘要元组。
+    :raises Exception: 不主动抛出异常。
+    """
+
+    direct_payload = _payload_json(direct_request)
+    worker_payload = _payload_json(worker_request)
+    differences: list[str] = []
+    payload_diff = _compare_field(
+        field_name="payload_sha256",
+        direct_value=_sha256_text(direct_payload),
+        worker_value=_sha256_text(worker_payload),
+    )
+    if payload_diff is not None:
+        differences.append(payload_diff)
+    for field_name, direct_value, worker_value in (
+        ("stream", str(direct_request.stream), str(worker_request.stream)),
+        (
+            "disable_tools",
+            str(direct_request.disable_tools),
+            str(worker_request.disable_tools),
+        ),
+        (
+            "runner_options",
+            repr(direct_request.runner_options),
+            repr(worker_request.runner_options),
+        ),
+        (
+            "agent_policy",
+            repr(direct_request.agent_policy),
+            repr(worker_request.agent_policy),
+        ),
+        (
+            "runner_spec",
+            repr(direct_request.runner_spec),
+            repr(worker_request.runner_spec),
+        ),
+        (
+            "messages",
+            repr(direct_request.messages),
+            repr(worker_request.messages),
+        ),
+        (
+            "tool_schemas",
+            repr(direct_request.tool_schemas),
+            repr(worker_request.tool_schemas),
+        ),
+    ):
+        diff = _compare_field(
+            field_name=field_name,
+            direct_value=direct_value,
+            worker_value=worker_value,
+        )
+        if diff is not None:
+            differences.append(diff)
+    return tuple(differences)
+
+
+async def debug_compare_agent_smoke_case(
+    *,
+    case: ProviderCase,
+    api_key: str,
+    stream: bool,
+    timeout_seconds: float,
+) -> bool:
+    """对比原 Agent smoke 与 EngineWorker smoke 的本地请求构造。
+
+    :param case: provider case。
+    :param api_key: API key 明文，仅用于构造等价 headers，不会输出。
+    :param stream: 是否启用流式。
+    :param timeout_seconds: 默认请求超时秒数。
+    :returns: 关键 provider payload 与运行参数一致返回 ``True``。
+    :raises Exception: 本地构造异常时透传。
+    """
+
+    direct_request = build_agent_smoke_request(
+        case=case,
+        api_key=api_key,
+        stream=stream,
+        timeout_seconds=timeout_seconds,
+        tool_executor=AddNumbersToolExecutor(),
+    )
+    host_request = build_request(
+        case=case,
+        api_key=api_key,
+        stream=stream,
+        timeout_seconds=timeout_seconds,
+    )
+    worker_request = await _capture_engine_worker_request(
+        worker=EngineWorker(tool_executor=AddNumbersToolExecutor()),
+        request=host_request,
+    )
+    print(f"{_DEBUG_PREFIX} case={case.name} stream={stream}")
+    for line in _request_debug_lines(label="agent", request=direct_request):
+        print(line)
+    for line in _request_debug_lines(label="worker", request=worker_request):
+        print(line)
+    differences = _material_differences(
+        direct_request=direct_request,
+        worker_request=worker_request,
+    )
+    for difference in differences:
+        print(difference)
+    print(f"{_DEBUG_PREFIX} material_diff_count={len(differences)}")
+    return len(differences) == 0
+
+
+async def debug_compare_agent_smoke(
+    *, args: SmokeArgs, env: Mapping[str, str]
+) -> int:
+    """运行本地构造对比，不发送网络请求。
+
+    :param args: smoke 参数。
+    :param env: 环境变量映射。
+    :returns: 全部 case 关键字段一致返回 0，否则返回 1。
+    :raises Exception: 不主动抛出异常；单 case 异常会转为返回码。
+    """
+
+    exit_code = 0
+    for case in select_cases(args):
+        api_key = env.get(case.env_var, _DEBUG_API_KEY)
+        try:
+            matched = await debug_compare_agent_smoke_case(
+                case=case,
+                api_key=api_key,
+                stream=args.stream,
+                timeout_seconds=args.timeout_seconds,
+            )
+        except Exception as exc:
+            print(
+                f"{_DEBUG_PREFIX} {case.name} failed "
+                f"exc_type={type(exc).__name__}"
+            )
+            exit_code = 1
+            continue
+        if not matched:
+            exit_code = 1
+    return exit_code
+
+
 async def run_case(
     *,
     case: ProviderCase,
@@ -295,6 +657,8 @@ async def run_selected_cases(
     :raises Exception: 不主动抛出异常；单 case 异常会转为返回码。
     """
 
+    if args.debug_compare_agent_smoke:
+        return await debug_compare_agent_smoke(args=args, env=env)
     exit_code = 0
     final_answers: list[CaseFinalAnswer] = []
     for case in select_cases(args):

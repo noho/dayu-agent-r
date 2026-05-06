@@ -142,7 +142,7 @@ docstring 已说明这是 P1 最小翻译策略，不代表 Host timeline / Even
 ```bash
 source .venv/bin/activate
 python -m pytest tests/host tests/engine/test_import_boundary.py tests/engine/test_package_exports.py tests/contracts -q
-python -m utils.smoke_engine_worker --help
+python utils/smoke_engine_worker.py --help
 python -m pyright
 ```
 
