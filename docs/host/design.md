@@ -610,6 +610,39 @@ RunEvent 至少需要支持：
 - append-only；已发生事实不被覆盖。
 - visibility / audience，用于区分客户端可见事件、内部审计事件、trace 事件和恢复治理事件。
 
+### 9.0 当前 P1.5 最小实现路径
+
+P1.5 已将最小 EventLog 语义接入当前 `run harness` 主链路。当前路径是：
+
+```text
+start_run
+  -> LocalRunHarness._run_to_store
+  -> WorkerProxy.stream_engine_events
+  -> EngineEvent
+  -> translate_engine_event -> RunEventDraft
+  -> RunEventStore.append -> cursor-bearing RunEvent
+  -> RunStream.events / stream_run_events
+```
+
+当前实现要点：
+
+- `RunStream.events` 与 `stream_run_events(run_id, after=cursor)` 都是 `RunEventStore` 的订阅视图。
+- `RunEvent` 必须先 append 到 store，获得 Host 分配的 per-run cursor 后，才能被事件流观察到。
+- `RunEventCursor` 由 Host store 生成，不绑定 Engine sequence。
+- `RunEventDraft` 只表示待 append 的内部草稿；对外可消费的事实是已 append 的 `RunEvent`。
+- terminal `RunResult` 只从已 append 的 canonical terminal `RunEvent` 推导。
+- worker / proxy 异常导致 Host 无法获得 Engine terminal event 时，Host 追加 Host-owned canonical
+  failure `RunEvent`；Host 自身翻译、append 或 terminal result 推导错误不能伪装成 worker / proxy failure。
+
+当前 `InMemoryRunEventStore` 是 `RunEventStore` 的单进程临时 adapter，只服务 P2-P5 smoke 与测试：
+
+- 它固定 append-before-stream、per-run cursor、exclusive replay、canonical / preview、terminal fact 等
+  最小 EventLog 语义。
+- 它不提供持久化 schema、多进程一致性、startup recovery、observer checkpoint、trace / audit /
+  timeline / outbox projection。
+- P6 落地真实持久 EventLog 时，应复用同一 `RunEventStore` 语义并扩展生产能力，而不是废弃 P1.5
+  契约后另起事实来源。
+
 ### 9.1 Canonical Event 与 Preview Event
 
 EventLog 需要区分“持久事实事件”和“展示型流式事件”。第一版可以同表不同 kind，但语义必须分层：

@@ -1,8 +1,8 @@
-"""Host P1 最小 Run 契约。
+"""Host P1.5 最小 Run 契约。
 
-本模块只定义 P1 Run harness 所需的强类型结构。它不是完整生产 Host
-接口：创建幂等、EventLog 持久 cursor、Session governance 与多进程治理
-均由后续 Phase 落地。
+本模块只定义当前 Run harness 与最小事件事实层所需的强类型结构。它不是
+完整生产 Host 接口：创建幂等、持久 EventLog schema、Session governance
+与多进程治理均由后续 Phase 落地。
 """
 
 from __future__ import annotations
@@ -27,7 +27,7 @@ from dayu.engine import (
 
 
 class RunState(StrEnum):
-    """Host P1 最小 Run 状态。"""
+    """Host 当前最小 Run 状态。"""
 
     CREATED = "created"
     RUNNING = "running"
@@ -38,10 +38,10 @@ class RunState(StrEnum):
 
 
 class RunEventType(StrEnum):
-    """Host P1 RunEvent 类型。
+    """Host RunEvent 类型。
 
-    P1 直接镜像 EngineEventType 的值，这是最小翻译策略；它不是 P1.5
-    EventLog / timeline 的最终 data contract。
+    当前类型仍与 EngineEventType 保持一一映射，Host-owned failure 也复用
+    ``RUN_FAILED``，通过 :class:`RunEventSource` 区分事实来源。
     """
 
     ITERATION_STARTED = EngineEventType.ITERATION_STARTED.value
@@ -63,11 +63,26 @@ class RunEventType(StrEnum):
     RUN_FAILED = EngineEventType.RUN_FAILED.value
 
 
+class RunEventKind(StrEnum):
+    """RunEvent 事实层级。"""
+
+    CANONICAL = "canonical"
+    PREVIEW = "preview"
+
+
+class RunEventSource(StrEnum):
+    """RunEvent 来源。"""
+
+    ENGINE = "engine"
+    HOST = "host"
+
+
 @dataclass(frozen=True, slots=True)
 class RunEventCursor:
-    """Host P1 事件 cursor。
+    """Host 事件 cursor。
 
-    P1 cursor 只映射 Engine sequence，不具备持久补读语义。
+    P1.5 cursor 由 Host RunEventStore 在同一 run 内分配，不绑定 Engine
+    sequence。
 
     :param sequence: 同一 run 内的事件序号。
     """
@@ -76,10 +91,33 @@ class RunEventCursor:
 
 
 @dataclass(frozen=True, slots=True)
+class HostRunFailedData:
+    """Host-owned run 失败事实。
+
+    该 data 只用于 worker / proxy 异常导致 Host 无法获得 Engine 终态事件
+    的路径，不代表完整 P7 生命周期治理。
+
+    :param error_code: Host 侧中性错误码。
+    :param message: 人类可读失败消息。
+    :param recoverable: 是否可恢复。
+    :param exception_type: 原始异常类型名。
+    """
+
+    error_code: str
+    message: str
+    recoverable: bool
+    exception_type: str
+
+
+RunEventData: TypeAlias = EngineEventData | HostRunFailedData
+"""Host RunEvent data 封闭联合。"""
+
+
+@dataclass(frozen=True, slots=True)
 class RunInput:
     """Run 初始输入。
 
-    P1 只承载 Engine 可直接消费的消息序列，不包含 memory、timeline 或
+    当前只承载 Engine 可直接消费的消息序列，不包含 memory、timeline 或
     context builder 语义。
 
     :param messages: 进入 Engine 的 Agent 消息元组。
@@ -110,13 +148,13 @@ class RunOptions:
 
 @dataclass(frozen=True, slots=True)
 class StartRunRequest:
-    """启动 Run 的 P1 最小请求。
+    """启动 Run 的当前最小请求。
 
-    P1 暂不包含 ``client_request_id``，因此不提供创建幂等。完整创建幂
+    当前暂不包含 ``client_request_id``，因此不提供创建幂等。完整创建幂
     等与同 Session active Run 仲裁在 P7 落地。
 
     :param session_id: 会话 id。
-    :param run_id: Run id，由调用方在 P1 测试 harness 中显式提供。
+    :param run_id: Run id，由调用方在测试 harness 中显式提供。
     :param input: Run 初始输入。
     :param options: Run 执行选项。
     """
@@ -134,7 +172,7 @@ class RunHandle:
     :param session_id: 会话 id。
     :param run_id: Run id。
     :param state: 返回句柄时的 Run 状态快照。
-    :param event_cursor: 订阅起点 cursor；P1 为非持久 cursor。
+    :param event_cursor: 订阅起点 cursor。
     """
 
     session_id: str
@@ -147,26 +185,58 @@ class RunHandle:
 class RunEvent:
     """Host Run 事件。
 
-    P1 ``data`` 允许直接携带 Engine event data 联合；这是用户确认的
-    P1 最小翻译策略，不代表 Host timeline / EventLog 的最终 data
-    contract。
+    ``RunEvent`` 只表示已经写入 Host RunEventStore 的事实，因此必须携带
+    store 生成的 cursor。Engine sequence 可保留在来源事件中，但不是 Host
+    cursor 真源。
 
     :param run_id: Run id。
     :param session_id: 会话 id。
     :param cursor: 事件 cursor。
+    :param kind: 事件事实层级。
+    :param source: 事件来源。
     :param type: Host RunEvent 类型。
     :param occurred_at: 事件发生时间。
-    :param data: Engine event data 联合。
-    :param source_engine_event_id: 来源 EngineEvent id。
+    :param data: Host RunEvent data 联合。
+    :param source_engine_event_id: 来源 EngineEvent id；Host-owned 事件为
+        ``None``。
     """
 
     run_id: str
     session_id: str
     cursor: RunEventCursor
+    kind: RunEventKind
+    source: RunEventSource
     type: RunEventType
     occurred_at: datetime
-    data: EngineEventData
-    source_engine_event_id: str
+    data: RunEventData
+    source_engine_event_id: str | None
+
+
+@dataclass(frozen=True, slots=True)
+class RunEventDraft:
+    """待写入 Host RunEventStore 的 Run 事件草稿。
+
+    ``RunEventDraft`` 不携带 cursor，cursor 只能由 store append 时生成。
+
+    :param run_id: Run id。
+    :param session_id: 会话 id。
+    :param kind: 事件事实层级。
+    :param source: 事件来源。
+    :param type: Host RunEvent 类型。
+    :param occurred_at: 事件发生时间。
+    :param data: Host RunEvent data 联合。
+    :param source_engine_event_id: 来源 EngineEvent id；Host-owned 事件为
+        ``None``。
+    """
+
+    run_id: str
+    session_id: str
+    kind: RunEventKind
+    source: RunEventSource
+    type: RunEventType
+    occurred_at: datetime
+    data: RunEventData
+    source_engine_event_id: str | None
 
 
 @dataclass(frozen=True, slots=True)
@@ -251,7 +321,17 @@ RunResult: TypeAlias = (
     | RunCancelledResult
     | RunSuspendedResult
 )
-"""P1 Run 终态结果封闭联合。"""
+"""Run 终态结果封闭联合。"""
+
+TERMINAL_RUN_EVENT_TYPES: frozenset[RunEventType] = frozenset(
+    {
+        RunEventType.FINAL_ANSWER,
+        RunEventType.RUN_FAILED,
+        RunEventType.RUN_CANCELLED,
+        RunEventType.RUN_SUSPENDED,
+    }
+)
+"""会导致 Host run 终止的 RunEvent 类型集合。"""
 
 
 @dataclass(frozen=True, slots=True)
@@ -267,9 +347,13 @@ class RunStream:
 
 
 __all__ = [
+    "HostRunFailedData",
     "RunCancelledResult",
+    "RunEventData",
     "RunEvent",
     "RunEventCursor",
+    "RunEventKind",
+    "RunEventSource",
     "RunEventType",
     "RunFailedResult",
     "RunHandle",

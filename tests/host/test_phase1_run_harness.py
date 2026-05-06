@@ -38,6 +38,8 @@ from dayu.engine import (
     UserMessage,
 )
 from dayu.host import (
+    RunEventKind,
+    RunEventSource,
     RunEvent,
     RunEventCursor,
     RunEventType,
@@ -45,6 +47,7 @@ from dayu.host import (
     RunOptions,
     RunState,
     StartRunRequest,
+    get_run_result,
     start_run,
 )
 from dayu.host._event_translation import terminal_result_from_event
@@ -402,7 +405,7 @@ async def test_public_start_run_streams_translated_engine_events(
 
     monkeypatch.setattr(agent_module, "_build_runner", fake_build_runner)
 
-    stream = await start_run(_request())
+    stream = await start_run(_request(run_id="host_run_public_stream"))
     events = await _collect(stream.events)
 
     assert stream.handle.state is RunState.RUNNING
@@ -411,8 +414,10 @@ async def test_public_start_run_streams_translated_engine_events(
     assert events[-1].type is RunEventType.FINAL_ANSWER
     result = terminal_result_from_event(events[-1])
     assert result is not None
-    assert result.run_id == "host_run"
+    assert result.run_id == "host_run_public_stream"
     assert result.session_id == "host_session"
+    stored_result = await get_run_result("host_run_public_stream")
+    assert stored_result == result
     assert runner.close_count == 1
 
 
@@ -440,7 +445,7 @@ async def test_start_run_eagerly_starts_before_event_stream_is_consumed(
 
     monkeypatch.setattr(agent_module, "_build_runner", fake_build_runner)
 
-    stream = await start_run(_request())
+    stream = await start_run(_request(run_id="host_run_eager_start"))
     await _wait_for_runner_call(runner)
 
     assert runner.call_count == 1
@@ -501,6 +506,8 @@ def test_terminal_result_maps_failed_cancelled_and_suspended() -> None:
         run_id="run",
         session_id="session",
         cursor=RunEventCursor(sequence=1),
+        kind=RunEventKind.CANONICAL,
+        source=RunEventSource.ENGINE,
         type=RunEventType.RUN_FAILED,
         occurred_at=_utc_now(),
         data=RunFailedData(
@@ -521,6 +528,8 @@ def test_terminal_result_rejects_mismatched_terminal_data() -> None:
         run_id="run",
         session_id="session",
         cursor=RunEventCursor(sequence=1),
+        kind=RunEventKind.CANONICAL,
+        source=RunEventSource.ENGINE,
         type=RunEventType.FINAL_ANSWER,
         occurred_at=_utc_now(),
         data=RunFailedData(

@@ -59,11 +59,15 @@ Engine 契约、包根导出、事件契约与架构边界测试，覆盖 `dayu.
 
 ### `tests/host/`
 
-Host P1 最小 Run harness 测试，覆盖 `dayu.host` 当前已落地的边界：
+Host P1.5 最小 Run harness 与 RunEventStore 测试，覆盖 `dayu.host` 当前已落地的边界：
 
-- run harness：验证 public `start_run` 可经 Host 调用 Engine 函数式入口，并把 `EngineEvent` 翻译为 `RunEvent`。
+- run harness：验证 public `start_run` 可经 Host 调用 Engine 函数式入口，并把 `EngineEvent` 翻译为已 append 的 `RunEvent`。
+- event store：验证 append-only、per-run cursor、exclusive replay、replay-then-follow 订阅和 terminal 后订阅结束。
+- run harness eventlog：验证 append-before-stream、preview 不污染 terminal result、结果只从已 append terminal event 推导、
+  worker / proxy 异常会落 Host-owned canonical failure 事件。
 - tool-call smoke：通过内部 `LocalRunHarness` 注入 fake ToolExecutor，覆盖 Runner tool call -> Engine 工具闭环 -> Host RunEvent stream。
-- public boundary：锁定 `dayu.host.__all__`，阻止 `EngineWorker`、`LocalProxy`、`ToolExecutor`、`run_agent_messages` 泄漏为包根 API。
+- public boundary：锁定 `dayu.host.__all__`，允许 Run 级 `start_run`、`stream_run_events`、`get_run_result`，
+  阻止 `EngineWorker`、`LocalProxy`、`ToolExecutor`、`run_agent_messages` 泄漏为包根 API。
 - import boundary：阻止 Host 导入 `dayu.fins`、`dayu.service`、`dayu.ui`。
 - weak typing guard：扫描 `dayu.host` 源码，阻止 `Any`、`object`、无类型签名与裸容器注解。
 
