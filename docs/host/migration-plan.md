@@ -5,6 +5,12 @@
 本文档是 Host 迁移总控计划草稿，用于指导总控 Agent 分阶段指挥迁移 Agent、review Agent
 完成整个 Host 迁移。它不是单阶段 handoff plan，也不是实现文档。
 
+当前总控状态：
+
+- P1 已通过 PR #16 合入 `main`，当前确认基线为 `051cf20`。
+- P1.5 已启动独立分支 `codex/host-p1-5-eventlog`，phase handoff plan 与 plan review gate 已完成。
+- P1.5 plan 已通过用户人工 review，当前进入代码实施阶段。
+
 每个 Phase 进入实现前，必须另写可交接的 phase plan，细化到迁移 Agent 可以直接接手：
 目标、非目标、边界、文件级改动清单、契约变化、状态机、测试清单、验证命令、review gate、
 停止条件、风险、待确认项、实施完成汇报格式。
@@ -43,7 +49,7 @@ codex/host-p{phase}-{short-name}
 每个 Phase 的固定节奏：
 
 1. 从最新主线或用户指定基线开新分支。
-2. 总控 Agent 写 phase handoff plan。
+2. 派 Agent 写 phase handoff plan。
 3. 派 review Agent 做 plan review，必要时派第二个 review Agent 做 OLD / NEW 对比或最佳实践 review。
 4. plan review 不通过时，派 Agent 修 plan，并在对应 review 文档标注修复状态。
 5. plan review 通过后，停下来等用户人工 review。
