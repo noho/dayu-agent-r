@@ -32,9 +32,8 @@ from typing import Final
 _NAMESPACE_LOGGER_NAME: Final[str] = "dayu"
 _HANDLER_MARKER_ATTR: Final[str] = "_dayu_runtime_log_marker"
 _HANDLER_MARKER_VALUE: Final[str] = "dayu.runtime.log:stdout"
-_LOG_FORMAT: Final[str] = (
-    "%(asctime)s %(levelname)s %(name)s %(message)s"
-)
+_LOG_FORMAT: Final[str] = "[%(asctime)s] [%(levelname)s] [%(name)s] %(message)s"
+_LOG_DATE_FORMAT: Final[str] = "%Y-%m-%d %H:%M:%S"
 _VERBOSE_LEVEL_NUMBER: Final[int] = 15
 _VERBOSE_LEVEL_NAME: Final[str] = "VERBOSE"
 
@@ -203,7 +202,7 @@ def _build_marker_handler(level: LogLevel) -> logging.Handler:
 
     handler = logging.StreamHandler(stream=sys.stdout)
     handler.setLevel(int(level))
-    handler.setFormatter(logging.Formatter(_LOG_FORMAT))
+    handler.setFormatter(logging.Formatter(_LOG_FORMAT, datefmt=_LOG_DATE_FORMAT))
     setattr(handler, _HANDLER_MARKER_ATTR, _HANDLER_MARKER_VALUE)
     return handler
 
