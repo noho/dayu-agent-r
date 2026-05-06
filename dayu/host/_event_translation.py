@@ -20,6 +20,17 @@ from dayu.host.contracts import (
     RunSuspendedResult,
 )
 
+_ERROR_FINAL_ANSWER_DATA_TYPE: str = (
+    "FINAL_ANSWER event data must be FinalAnswerData"
+)
+_ERROR_RUN_FAILED_DATA_TYPE: str = "RUN_FAILED event data must be RunFailedData"
+_ERROR_RUN_CANCELLED_DATA_TYPE: str = (
+    "RUN_CANCELLED event data must be RunCancelledData"
+)
+_ERROR_RUN_SUSPENDED_DATA_TYPE: str = (
+    "RUN_SUSPENDED event data must be RunSuspendedData"
+)
+
 
 def translate_engine_event(event: EngineEvent) -> RunEvent:
     """将 EngineEvent 翻译为 Host RunEvent。
@@ -45,12 +56,13 @@ def terminal_result_from_event(event: RunEvent) -> RunResult | None:
 
     :param event: Host RunEvent。
     :returns: 若为终态事件则返回 RunResult，否则返回 ``None``。
-    :raises AssertionError: 终态事件类型与 data 类型不一致时抛出。
+    :raises TypeError: 终态事件类型与 data 类型不一致时抛出。
     """
 
     if event.type is RunEventType.FINAL_ANSWER:
         data = event.data
-        assert isinstance(data, FinalAnswerData)
+        if not isinstance(data, FinalAnswerData):
+            raise TypeError(_ERROR_FINAL_ANSWER_DATA_TYPE)
         return RunSucceededResult(
             run_id=event.run_id,
             session_id=event.session_id,
@@ -62,7 +74,8 @@ def terminal_result_from_event(event: RunEvent) -> RunResult | None:
         )
     if event.type is RunEventType.RUN_FAILED:
         data = event.data
-        assert isinstance(data, RunFailedData)
+        if not isinstance(data, RunFailedData):
+            raise TypeError(_ERROR_RUN_FAILED_DATA_TYPE)
         return RunFailedResult(
             run_id=event.run_id,
             session_id=event.session_id,
@@ -73,7 +86,8 @@ def terminal_result_from_event(event: RunEvent) -> RunResult | None:
         )
     if event.type is RunEventType.RUN_CANCELLED:
         data = event.data
-        assert isinstance(data, RunCancelledData)
+        if not isinstance(data, RunCancelledData):
+            raise TypeError(_ERROR_RUN_CANCELLED_DATA_TYPE)
         return RunCancelledResult(
             run_id=event.run_id,
             session_id=event.session_id,
@@ -82,7 +96,8 @@ def terminal_result_from_event(event: RunEvent) -> RunResult | None:
         )
     if event.type is RunEventType.RUN_SUSPENDED:
         data = event.data
-        assert isinstance(data, RunSuspendedData)
+        if not isinstance(data, RunSuspendedData):
+            raise TypeError(_ERROR_RUN_SUSPENDED_DATA_TYPE)
         return RunSuspendedResult(
             run_id=event.run_id,
             session_id=event.session_id,

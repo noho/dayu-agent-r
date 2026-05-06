@@ -135,6 +135,9 @@ class LocalRunHarness:
     async def start_run(self, request: StartRunRequest) -> RunStream:
         """启动 P1 内存态 Run。
 
+        P1 只提供单 run smoke harness；后台 task 只由事件流队列间接观测，
+        本阶段不保存 task handle，也不提供 Host 级取消治理入口。
+
         :param request: P1 start_run 请求。
         :returns: RunStream，包含句柄与事件流。
         :raises Exception: 构造后台任务失败时透传底层异常；消费事件流时

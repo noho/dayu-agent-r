@@ -512,3 +512,24 @@ def test_terminal_result_maps_failed_cancelled_and_suspended() -> None:
     )
 
     assert terminal_result_from_event(failed) is not None
+
+
+def test_terminal_result_rejects_mismatched_terminal_data() -> None:
+    """终态翻译 helper 对类型不匹配的 data 抛出明确异常。"""
+
+    event = RunEvent(
+        run_id="run",
+        session_id="session",
+        cursor=RunEventCursor(sequence=1),
+        type=RunEventType.FINAL_ANSWER,
+        occurred_at=_utc_now(),
+        data=RunFailedData(
+            error_code="failed",
+            message="failed",
+            recoverable=False,
+        ),
+        source_engine_event_id="engine_failed",
+    )
+
+    with pytest.raises(TypeError, match="FinalAnswerData"):
+        terminal_result_from_event(event)
