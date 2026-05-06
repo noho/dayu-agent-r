@@ -41,6 +41,7 @@ from dayu.contracts import (
 )
 from dayu.engine.contracts import (
     TERMINAL_ENGINE_EVENT_TYPES,
+    AgentFallbackMode,
     AgentMessage,
     AgentMessageRole,
     AgentPolicy,
@@ -108,6 +109,7 @@ from dayu.engine.agent import run_agent_and_wait, run_agent_messages
 __all__ = [
     "AgentMessage",
     "AgentMessageRole",
+    "AgentFallbackMode",
     "AgentPolicy",
     "AgentRunRequest",
     "AgentRunResult",

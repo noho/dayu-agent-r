@@ -101,7 +101,7 @@ OLD Engine 阅读范围：
 - `get_tool_display_info(name)`
 - `register_response_middleware(callback)`
 
-结论：ToolExecutionContext 是 Engine 与 Host 侧 ToolExecutor 沟通单次工具调用事实的上下文真源。NEW 应保留强类型上下文，不退回 `dict` 式上下文。
+结论：ToolExecutionContext 是 Engine 与 Host / EngineWorker 侧 ToolExecutor 沟通单次工具调用事实的上下文真源。NEW 应保留强类型上下文，不退回 `dict` 式上下文。
 
 ### 2.3 StreamEvent
 
@@ -251,7 +251,7 @@ NEW 架构定位必须是：
 UI -> Service -> Host -> Engine
 ```
 
-Engine 位于 Host 下游，提供 Agent、Runner、tool calling 协议等运行原语。Host 是生命周期、取消、治理、ToolRegistry、工具调度、长事务等待和 run/session 持久化真源。Engine 只消费 Host 注入的事实，不反向依赖 UI、Service、Host 的具体实现。
+Engine 位于 Host 下游，提供 Agent、Runner、tool calling 协议等运行原语。Host 是生命周期、取消、治理、ToolRegistry、工具调度、长事务等待和 run/session 持久化真源。Engine 只消费 Host 通过 EngineWorker capability 提供的运行事实，不反向依赖 UI、Service、Host 的具体实现。
 
 术语固定口径：
 
@@ -264,29 +264,33 @@ Engine 位于 Host 下游，提供 Agent、Runner、tool calling 协议等运行
 
 ## 5. Host -> Engine 接口文档
 
+最新 Host / EngineWorker 边界以 `docs/host/design.md` 为准。EngineWorker 是 Host 的 capability，不是新的顶层业务层；`AgentRunRequest` 仍是 Engine 一次 run 的最小语义输入，并已包含 `session_id`、`run_id` 与 `cancellation_token`。
+
+本文档中早期“Host 注入 ToolExecutor”的表述，应统一理解为“Host 通过 EngineWorker capability 提供执行环境，并由 EngineWorker 替 Host 在该执行环境中代持、提供 `ToolExecutor`”。Host 仍是生命周期、取消、治理和工具策略真源；Engine 不知道 LocalProxy、RemoteProxy、RemoteStub、RPC 或 ToolExecutor 的真实部署位置。
+
 建议 Host -> Engine 边界：
 
-- Host 解析配置快照，创建 Host 侧 ToolExecutor 实现、事件消费者、CancellationToken。
+- Host 解析配置快照和治理输入，并通过 EngineWorker capability 提供执行环境、ToolExecutor、事件消费者与 run-local cancellation token。
 - Host 提供权威 `run_id` 与 `session_id`。
 - Host 传入已装配好的 `list[AgentMessage]`，Engine 不读取 scene、prompt 模板或配置文件。
 - Host 传入强类型 `RunnerSpec`、`RunnerCallOptions`、`AgentPolicy`，承接 `llm_models.json` 中支撑 Runner / Agent 运行的参数。
-- Host 拥有 ToolRegistry / ToolRuntime，并把当前 run 可用工具投影为 `list[ToolSchema]` 与 ToolExecutor protocol；Engine 不注册工具、不执行工具发现。
+- Host 拥有工具治理真源；EngineWorker 只是在执行环境中替 Host 代持并提供 ToolExecutor；Host / EngineWorker 把当前 run 可用工具投影为 `list[ToolSchema]` 与 ToolExecutor protocol；Engine 不注册工具、不执行工具发现。
 - Host 调用 `run_agent_messages(request)` 或等价函数式入口；该入口内部为本次 run 创建 Agent 与 Runner。
 - Engine 输出 `AsyncIterator[EngineEvent]`；Host 不直接消费 RunnerEvent/StreamEvent。
-- Host 负责消费事件、持久化 transcript、处理取消，并通过注入的 ToolExecutor / ToolRuntime 实现承担工具执行、长事务等待/恢复和失败收口。
+- Host / EngineWorker 负责消费事件、持久化 transcript、处理取消，并通过注入的 ToolExecutor / ToolRuntime 实现承担工具执行、长事务等待/恢复和失败收口。
 
 工具注册边界：
 
 - 工具注册只发生在 Host/capability 层。web、doc、fins 等 capability 向 Host ToolRegistry 注册工具 descriptor、schema、执行函数、权限策略、超时策略、截断策略和长事务等待策略。
 - Host 在创建 `AgentRunRequest` 前，根据 scene、用户权限、workspace policy、模型能力和当前 run policy 选择本次可用工具，生成稳定的 `tool_schemas: list[ToolSchema]` 快照。
-- Host 同时创建 run-scoped `ToolExecutor` handle。该 handle 只暴露 Engine 需要的协议方法，内部可以连接 Host ToolRuntime、权限审计、trace、取消、job monitor、仓储依赖。
+- Host 通过 EngineWorker capability 提供 run-scoped `ToolExecutor` handle。LocalEngineWorker 可替 Host 代持本地 ToolExecutor，RemoteEngineWorkerStub 可替 Host 代持远端 ToolExecutor；该 handle 只暴露 Engine 需要的协议方法，内部可以连接 ToolRuntime、权限审计、trace、取消、job monitor、仓储依赖。
 - Engine 不接触 ToolRegistry，不接收工具函数，不扫描 toolset，不读取工具配置文件，不保存跨 run 工具状态。
 
 工具调用与结果回填边界：
 
 1. Engine 将 `tool_schemas` 传给 Runner，Runner 只把 schema 发送给模型。
 2. 模型返回 tool call 后，Runner 归一为 `ToolCallRequest` 事件，Agent 负责补齐 `run_id`、`iteration_id`、`tool_call_id`、参数 JSON 与调用序号。
-3. Agent 调用 Host 注入的 `ToolExecutor.execute(request)`。这是 Engine 唯一“调用工具”的方式；实际注册、校验、执行、权限、超时、审计、取消和长事务治理都在 Host ToolRuntime 内完成。
+3. Agent 调用 EngineWorker 替 Host 代持并提供的 `ToolExecutor.execute(request)`。这是 Engine 唯一“调用工具”的方式；实际注册、校验、执行、权限、超时、审计、取消和长事务治理都在 Host / EngineWorker 执行环境内完成。
 4. ToolExecutor 返回 `ToolExecutionOutcome`：
    - `completed`：包含 `ToolResultEnvelope`，Agent 产出 `tool_result_accepted` 事件，并把 LLM-facing tool message 注入下一轮 Runner 调用。
    - `failed`：包含失败 `ToolResultEnvelope`，Agent 按普通工具失败结果注入上下文，让模型决定恢复或给出失败说明。
@@ -304,8 +308,8 @@ Engine 位于 Host 下游，提供 Agent、Runner、tool calling 协议等运行
 事件边界：
 
 - `iteration_started` 表示 Engine 新一轮 agent iteration 开始。
-- `tool_call_requested` 表示模型请求调用工具，是观测事件；Engine 随后通过 Host 注入的 `ToolExecutor.execute(request)` 调用工具，Host 不因该事件另行触发工具执行。
-- `tool_result_accepted` 表示 Host 侧 ToolExecutor 已返回结果，Engine 已接收并进入后续上下文注入。
+- `tool_call_requested` 表示模型请求调用工具，是观测事件；Engine 随后通过 EngineWorker 替 Host 代持并提供的 `ToolExecutor.execute(request)` 调用工具，Host 不因该事件另行触发第二套工具执行路径。
+- `tool_result_accepted` 表示 EngineWorker 替 Host 代持的 ToolExecutor 已返回结果，Engine 已接收并进入后续上下文注入。
 - `tool_awaiting` 表示工具返回长事务等待事实；Host 挂起 run、监控 job，并在终态后恢复 Agent。
 - `run_suspended` 表示 Engine 已因 Host 托管等待停止本次 run，后续恢复由 Host 重新发起。
 - `runner_done` 表示 Runner 单回合完成，只是 EngineEvent 的观测事实，不是 run 终态。
@@ -319,7 +323,7 @@ Engine 位于 Host 下游，提供 Agent、Runner、tool calling 协议等运行
 - NEW 推荐定死为 run-scoped：Host 每次 run 都创建新的 Agent；Agent 每次 run 都创建新的 Runner，或由 `run_agent_messages(request)` 在函数内部创建二者。
 - 若采用函数式入口，Engine 包稳定导出 `run_agent_messages`、`run_agent_and_wait` 与 contracts；`AsyncAgent`、`AsyncOpenAIRunner` 可以保留为包内实现类，但不作为 Host 的主依赖表面。
 - Runner 的 HTTP client、SSE stream、provider session 等资源由本次 run 所有，并在 run 达到终态时完成资源收口。
-- ToolRegistry / ToolRuntime 生命周期不跟随 Agent/Runner，由 Host 持有；Engine 只使用本次 run 的 ToolExecutor handle。
+- ToolRegistry / ToolRuntime 生命周期不跟随 Agent/Runner，由 Host / EngineWorker 执行环境持有；Engine 只使用本次 run 的 ToolExecutor handle。
 
 ## 6. Agent / AsyncAgent 接口文档
 
@@ -341,7 +345,7 @@ Engine 位于 Host 下游，提供 Agent、Runner、tool calling 协议等运行
 
 - Agent 实例级并发要 fail fast。
 - Agent 不决定工具执行并发度；多个 tool call 是否并发、队列化、限流或挂起，属于 Host ToolRuntime 治理。
-- Agent 只维护“模型请求工具 -> 调用 Host 侧 ToolExecutor -> 注入下一轮消息或挂起 run”的协议状态机。
+- Agent 只维护“模型请求工具 -> 调用 EngineWorker 替 Host 代持的 ToolExecutor -> 注入下一轮消息或挂起 run”的协议状态机。
 
 取消约束：
 
@@ -416,11 +420,11 @@ Provider request extension 建议：
 
 NEW 结论：
 
-- ToolRegistry / ToolRuntime 不属于 Engine，归 Host 所有。
-- ToolExecutor 是 Host 与 Engine 围绕 tool calling 沟通的协议边界，不是 Engine 内的默认执行器。
-- Engine 只表达模型请求的 `ToolCallRequest`、Host 侧 ToolExecutor 返回的 `ToolCallResultEnvelope`、长事务等待的 `ToolAwaitSpec`。
+- ToolRegistry / ToolRuntime 不属于 Engine，归 Host / EngineWorker 执行环境所有。
+- ToolExecutor 是 Host / EngineWorker 与 Engine 围绕 tool calling 沟通的协议边界，不是 Engine 内的默认执行器。
+- Engine 只表达模型请求的 `ToolCallRequest`、EngineWorker 替 Host 代持的 ToolExecutor 返回的 `ToolCallResultEnvelope`、长事务等待的 `ToolAwaitSpec`。
 
-ToolExecutor 最小协议应由 Host 实现：
+ToolExecutor 最小协议应由 Host / EngineWorker 执行环境实现：
 
 ```python
 class ToolExecutor(Protocol):
@@ -491,8 +495,8 @@ EngineEvent data 类型草案：
 | `runner_content_delta` | `ContentDeltaData` | `iteration_id`, `delta` |
 | `runner_reasoning_delta` | `ReasoningDeltaData` | `iteration_id`, `delta` |
 | `runner_content_completed` | `ContentCompleteData` | `iteration_id`, `content`, `reasoning_content`, `finish_reason` |
-| `tool_call_requested` | `ToolCallRequestedData` | `iteration_id`, `tool_call_id`, `name`, `arguments`, `index_in_iteration` |
-| `tool_result_accepted` | `ToolResultAcceptedData` | `iteration_id`, `tool_call_id`, `name`, `outcome` |
+| `tool_call_requested` | `ToolCallRequestedData` | `iteration_id`, `tool_call_id`, `name`, `arguments`, `index_in_iteration`, `provider_state` |
+| `tool_result_accepted` | `ToolResultAcceptedData` | `iteration_id`, `tool_call_id`, `name`, `index_in_iteration`, `outcome` |
 | `tool_awaiting` | `ToolAwaitingData` | `iteration_id`, `tool_call_id`, `await_spec` |
 | `context_compaction_requested` | `ContextCompactionRequestedData` | `iteration_id`, `budget_state`, `reason` |
 | `runner_usage_recorded` | `RunnerUsageData` | `iteration_id`, `prompt_tokens`, `completion_tokens`, `total_tokens` |
@@ -502,6 +506,14 @@ EngineEvent data 类型草案：
 | `run_suspended` | `RunSuspendedData` | `reason`, `resume_hint` |
 | `run_cancelled` | `RunCancelledData` | `reason`, `requested_at`, `accepted_at`, `finished_at` |
 | `run_failed` | `RunFailedData` | `error_code`, `message`, `recoverable` |
+
+工具事件字段规则：
+
+- `provider_state` 来自模型 provider 的 tool call 响应，是 provider tool call roundtrip 所需的显式事实；后续注入 assistant tool_calls 给 Runner 时，应按 provider 规则原样带回，避免多轮工具调用协议断链。它不能放入 `metadata`。
+- `ToolCallProviderState` 是封闭 provider-specific 联合类型；当前已确认的具体形态只有 `GeminiToolCallState`。
+- `reasoning_content` 是否需要随 assistant tool_calls 写回也属于 provider-specific roundtrip 语义。Phase 3 可以先按 OLD 已证明可行的行为无条件写回本轮 `reasoning_content`，作为普通工具闭环的过渡实现；但这不应成为 NEW 跨 provider 稳定规则。有些 provider 可能要求写回，有些 provider 可能不要求写回，也可能存在写回后被 provider 拒绝的情况。Phase 3 后需要用专门 patch 把无脑写回改为 provider-specific 非无脑写回，并评估是否把部分 provider 的 reasoning roundtrip 纳入 `provider_state`。
+- `index_in_iteration` 是本轮 tool call 排序事实，`tool_call_requested` 与 `tool_result_accepted` 都必须显式携带，observer 不应依赖回查前序事件才能重建结果顺序。
+- `tool_call_requested` 只是观测事件，不触发第二套执行路径；工具执行只能由 Agent 状态机继续调用 EngineWorker 替 Host 代持的 `ToolExecutor`。
 
 RunnerEvent 稳定规则：
 
@@ -744,7 +756,7 @@ Engine 包根导出建议：
 稳定流程：
 
 1. Host 注册工具并生成 `tool_schemas`。
-2. Host 将 `tool_schemas` 与 run-scoped `tool_executor` 放入 `AgentRunRequest`。
+2. Host / EngineWorker 将 `tool_schemas` 与 run-scoped `tool_executor` 放入 `AgentRunRequest`。
 3. Engine 把 `tool_schemas` 交给 Runner。
 4. Runner 产出模型 tool call，Agent 转成 `ToolExecutionRequest`。
 5. Agent 调用 `tool_executor.execute(request)`。
@@ -783,7 +795,7 @@ Engine 包根导出建议：
 Agent tool calling 边界：
 
 - Agent 将模型 tool call 归一为 `ToolCallRequest`，并发出 `tool_call_requested` 观测事件。
-- Agent 调用 Host 实现的 ToolExecutor 后，以 `ToolCallResultEnvelope` 或 `ToolAwaitSpec` 继续或挂起本次 run。
+- Agent 调用 EngineWorker 替 Host 代持的 ToolExecutor 后，以 `ToolCallResultEnvelope` 或 `ToolAwaitSpec` 继续或挂起本次 run。
 - Agent 不持有 ToolRegistry，不决定工具执行并发度，不轮询外部长事务。
 
 ### 14.6 AsyncRunner
@@ -884,9 +896,9 @@ Engine 迁移顺序：
 
 Host 接口要求：
 
-- Host 提供 `AgentRunRequest`，包括 `session_id`、`run_id`、messages、`RunnerSpec`、`RunnerCallOptions`、`AgentPolicy`、`tool_schemas`、`ToolExecutor` 和 run-local cancellation token。
+- Host / EngineWorker 提供 `AgentRunRequest`，包括 `session_id`、`run_id`、messages、`RunnerSpec`、`RunnerCallOptions`、`AgentPolicy`、`tool_schemas`、`ToolExecutor` 和 run-local cancellation token；该 request 是 EngineWorker 最小运行输入，不需要在 EngineWorker 方法签名里重复展开 `session_id`、`run_id` 或 `cancellation_token`。
 - Host 消费 `AsyncIterator[EngineEvent]`，并自行决定 transcript 持久化、tool trace observer、审计、指标、UI 转发。
-- Host 实现 ToolExecutor / ToolRuntime / ToolRegistry；Engine 只依赖协议。
+- Host 是 ToolRuntime / ToolRegistry 与工具治理真源；ToolExecutor 由 EngineWorker 替 Host 代持并提供，可以在本地 worker 或远程 worker 内执行；Engine 只依赖协议。
 - Host 外层取消命令映射为 run-local cancellation token；Engine 不持有跨 run cancel registry。
 - Host 负责 conversation memory、语义压缩、`context_compaction_requested` 后的消息重构与恢复。
 - Host 负责 `await_spec` 的 wait record、monitor、resume；Engine 只产出 awaiting/suspended 事实。

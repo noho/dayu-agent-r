@@ -12,7 +12,7 @@ AgentRunRequest 与终态 / RunnerEvent / EngineEvent / AsyncRunner），
 
 from __future__ import annotations
 
-from dayu.engine.contracts.agent_policy import AgentPolicy
+from dayu.engine.contracts.agent_policy import AgentFallbackMode, AgentPolicy
 from dayu.engine.contracts.agent_run import (
     AgentRunRequest,
     AgentRunResult,
@@ -88,6 +88,7 @@ from dayu.engine.contracts.runner_spec import (
 __all__ = [
     "AgentMessage",
     "AgentMessageRole",
+    "AgentFallbackMode",
     "AgentPolicy",
     "AgentRunRequest",
     "AgentRunResult",

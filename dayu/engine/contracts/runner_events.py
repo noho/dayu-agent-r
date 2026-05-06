@@ -101,9 +101,15 @@ class RunnerToolCallsCompletedData:
     """工具调用完成事件 data。
 
     :param tool_calls: 解析完成的工具调用请求元组。
+    :param content: 本轮 assistant 在请求工具前产生的完整正文；为 ``None``
+        表示无正文。
+    :param reasoning_content: 本轮 assistant 在请求工具前产生的完整推理链
+        文本；为 ``None`` 表示无推理链。
     """
 
     tool_calls: tuple[ToolCallRequest, ...]
+    content: str | None = None
+    reasoning_content: str | None = None
 
 
 @dataclass(frozen=True, slots=True)

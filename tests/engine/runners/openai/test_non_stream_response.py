@@ -72,7 +72,8 @@ def test_non_stream_tool_calls_emitted() -> None:
                     "finish_reason": "tool_calls",
                     "message": {
                         "role": "assistant",
-                        "content": None,
+                        "content": "I will call a tool.",
+                        "reasoning_content": "tool thoughts",
                         "tool_calls": [
                             {
                                 "id": "c1",
@@ -98,6 +99,8 @@ def test_non_stream_tool_calls_emitted() -> None:
     assert isinstance(data, RunnerToolCallsCompletedData)
     assert data.tool_calls[0].name == "ping"
     assert data.tool_calls[0].arguments == {"a": 1}
+    assert data.content == "I will call a tool."
+    assert data.reasoning_content == "tool thoughts"
     # 不应同时发出 ContentCompleted
     content_completed = [
         e for e in events

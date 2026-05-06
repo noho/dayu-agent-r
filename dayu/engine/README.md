@@ -14,15 +14,16 @@ Engine 当前负责：
 
 - 定义 Engine 公共契约：`AgentRunRequest`、`AgentRunResult`、`EngineEvent`、`RunnerEvent`、`AsyncRunner`、`RunnerSpec`、`AgentPolicy`。
 - 提供函数式入口：`run_agent_messages(request)` 与 `run_agent_and_wait(request)`。
-- 在私有 run-scoped Agent 中消费单次 Runner 事件流，并提升为带 `session_id`、`run_id`、`sequence`、`event_id` 的 `EngineEvent`。
-- 收口无工具主链路的三类终态：`final_answer`、`run_failed`、`run_cancelled`。
+- 在私有 run-scoped Agent 中消费 Runner 事件流，并提升为带 `session_id`、`run_id`、`sequence`、`event_id` 的 `EngineEvent`。
+- 执行普通 completed / failed tool calling 闭环：Runner tool call -> `ToolExecutionRequest` -> `ToolExecutor.execute` -> tool message 注入下一轮 Runner。
+- 收口三类终态：`final_answer`、`run_failed`、`run_cancelled`。
 - 维护 OpenAI-compatible Runner，把 provider 响应归一为 `RunnerEvent`。
 - 在 Runner 边界提供诊断日志与 SSE idle heartbeat / timeout 处理；这些诊断不进入事件契约。
 
 Engine 当前不负责：
 
 - Host ToolRegistry、工具权限、工具执行调度或长事务等待。
-- ToolExecutor tool calling 闭环。
+- awaiting / `run_suspended` 工具主链路。
 - trace store、transcript 持久化、conversation memory。
 - context budget、continuation 或语义压缩。
 - 财报文档存取；财报文档只能通过 `dayu.fins.storage` 所属仓储边界处理。
@@ -61,6 +62,8 @@ Runner 只产出 `RunnerEvent`。RunnerEvent 不包含 Host 治理字段，不�
 - `RUNNER_USAGE_RECORDED` -> `RUNNER_USAGE_RECORDED`
 - `PROVIDER_PROTOCOL_ERROR` -> `PROVIDER_PROTOCOL_ERROR`
 - `RUNNER_DONE` -> `RUNNER_DONE`
+- Runner 完整 tool call 在 Agent 确认可执行后提升为 `TOOL_CALL_REQUESTED`
+- ToolExecutor completed / failed outcome 被 Agent 接受后提升为 `TOOL_RESULT_ACCEPTED`
 
 HTTP error 当前不提升为单独 EngineEvent；Agent 将其记录为失败候选，并收口为 `run_failed`。显式契约事实不得塞进 `metadata`。
 
@@ -68,33 +71,53 @@ HTTP error 当前不提升为单独 EngineEvent；Agent 将其记录为失败候
 
 ## Run-Scoped Agent
 
-Phase 2 的 Agent 是 run-scoped 私有实现。每次函数式入口调用都会创建 Runner 与 Agent，单次 run 结束后关闭 Runner。
+当前 Agent 是 run-scoped 私有实现。每次函数式入口调用都会创建 Runner 与 Agent，单次 run 结束后关闭 Runner。
 
 生命周期：
 
 1. 申请当前 Agent 实例运行槽位，同一实例并发运行 fail-fast。
 2. 若 cancellation token 已取消，先 close Runner，再产出 `run_cancelled`。
 3. 产出 `iteration_started`。
-4. 以空工具 schema 调用 Runner。
+4. 按 `disable_tools`、`AgentPolicy.allow_tool_calls`、Runner tool calling 能力决定本轮有效工具 schema。
 5. 消费并提升 RunnerEvent。
-6. 在 `runner_done` 或错误边界后收口唯一 terminal。
-7. success / failure / cancellation 都执行 Runner close。
+6. 若 Runner 请求普通工具调用，按 `index_in_iteration` 串行调用 ToolExecutor，并注入 assistant tool_calls 与 tool messages。
+7. 若 Runner 给出普通内容或错误边界，收口唯一 terminal。
+8. 普通工具轮次耗尽或连续全失败工具批次达到阈值时，按 `AgentPolicy.fallback_mode` force-answer 或 `run_failed`。
+9. success / failure / cancellation 都执行 Runner close。
 
 Runner close 失败只记录日志，不覆盖已经确定的业务 terminal。
 
-## 无工具主链路状态机
+## Agent 状态机
 
-当前 Agent 只执行一轮无工具 LLM call：
+当前 Agent 支持多轮普通 tool calling：
 
 - `max_iterations < 1` -> `run_failed("max_iterations_exceeded")`
 - 正常 `STOP` -> `final_answer`
-- `CONTENT_FILTER` -> `final_answer(filtered=True)`
+- `CONTENT_FILTER` -> `final_answer(filtered=True, degraded=True)`
 - `LENGTH` -> `final_answer(filtered=False)`，当前不 continuation
 - `ERROR` -> `run_failed`
-- `TOOL_CALLS` 或任一 Runner tool call 事件 -> `run_failed("tool_call_not_supported_in_phase2")`
+- 工具被禁用或 Runner 不支持工具时收到 `TOOL_CALLS` -> `run_failed("tool_call_not_enabled")`
+- `TOOL_CALLS` 且工具可用 -> `tool_call_requested` -> ToolExecutor -> `tool_result_accepted` -> 注入下一轮 Runner
+- completed 工具结果和 failed 工具结果都会进入 LLM 上下文；failed outcome 不是 cancellation，也不会直接伪装成 final answer
+- ToolExecutor 返回 awaiting -> `run_failed("tool_awaiting_not_supported_in_phase3")`
 - Runner 流结束但无 `RunnerDoneData` -> `run_failed("runner_abnormal_stop")`，若此时 token 已取消则 `run_cancelled`
 
 terminal event 在单次 run 内唯一，`sequence` 从 0 起单调递增，`event_id` 以 run 内 sequence 保持唯一。
+
+## Tool Calling
+
+ToolExecutor 由 EngineWorker 替 Host 在选定执行环境中代持，并通过 `AgentRunRequest.tool_executor` 提供给 Engine。Engine 只调用 `ToolExecutor.execute(request)`，不持有 ToolRegistry，不发现工具，不执行权限、审计、路径白名单或长事务治理。
+
+工具结果注入下一轮 Runner 前会先投影成 LLM-facing JSON 字符串：
+
+- 成功且 value 是 JSON object 时展开 value，不包内部 `ok/value` 信封。
+- 成功且 value 不是 JSON object 时包成 `{"content": ...}`。
+- 失败时投影 `error` / `message`，仅在 hint 非空时投影 `hint`。
+- 当前 `ToolTruncationInfo` 只承载内部截断治理事实，不含 LLM 可执行续读动作；Phase 3 不把 `has_more`、scope token 或 scope hash 投影给 LLM。
+
+当最后一轮普通工具调用执行完后，默认 `AgentFallbackMode.FORCE_ANSWER` 会追加 `AgentPolicy.fallback_prompt` 作为 `UserMessage`，以 `tools=()` 再调用 Runner，并产出 `final_answer(degraded=True)`。`AgentFallbackMode.RAISE_ERROR` 才直接 `run_failed("max_iterations_exceeded")`。连续全失败工具批次达到 `AgentPolicy.max_consecutive_failed_tool_batches` 时使用同一 fallback mode 收口。
+
+force-answer 只尝试一次；如果该降级 Runner 仍请求工具或没有产出可用正文，Agent 直接收口为 `run_failed`，不会继续重试或再次执行工具。
 
 ## 取消优先级
 
@@ -104,6 +127,7 @@ terminal event 在单次 run 内唯一，`sequence` 从 0 起单调递增，`eve
 
 - 取消优先于 `final_answer`。
 - 取消优先于 failure terminal。
+- 取消优先于工具结果继续注入与 force-answer final。
 - Runner 因取消自然终止且没有 `RunnerDoneData` 时，Agent 收口为 `run_cancelled`。
 - `RunCancelledData.finished_at` 表示 Runner close 尝试完成后的时间。
 - 外层 `asyncio.CancelledError` 继续透传。
@@ -144,4 +168,4 @@ SSE idle heartbeat / timeout 属于 Runner 字节流读取边界：
 - 新 Runner 需要实现 `AsyncRunner`，只产出 `RunnerEvent`。
 - 新 provider 参数应进入 `RunnerSpec` / provider request extension 的强类型字段。
 - 新 EngineEvent 或 RunnerEvent 必须扩展封闭 data 联合，并补齐穷尽匹配测试。
-- 工具调用闭环、awaiting、trace store、conversation memory、context budget / continuation 尚未落地；这些能力不能通过当前 Phase 2 Agent 私自接入。
+- awaiting、trace store、conversation memory、context budget / continuation 尚未落地；这些能力不能通过当前 Agent 私自接入。
