@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import asyncio
 from dataclasses import dataclass
 from datetime import datetime
 from typing import cast
@@ -9,13 +10,19 @@ from typing import cast
 import pytest
 
 from dayu.contracts import JsonValue, ToolTruncateSpec
+from dayu.contracts.tool_await import ToolAwaitKind, ToolAwaitSpec
 from dayu.contracts.tool_call import (
     ToolCallRequest,
     ToolExecutionContext,
     ToolExecutionRequest,
 )
-from dayu.contracts.tool_outcome import ToolCompletedOutcome, ToolExecutionOutcome
-from dayu.contracts.tool_result import ToolResultSuccess
+from dayu.contracts.tool_outcome import (
+    ToolAwaitingOutcome,
+    ToolCompletedOutcome,
+    ToolExecutionOutcome,
+    ToolFailedOutcome,
+)
+from dayu.contracts.tool_result import ToolResultFailure, ToolResultSuccess
 from dayu.host import (
     RunEventType,
     ToolFetchMoreHandleRequest,
@@ -25,7 +32,8 @@ from dayu.host import (
     ToolResultTruncatedData,
 )
 from dayu.host._event_store import InMemoryRunEventStore
-from dayu.host._tool_runtime import InMemoryToolRuntime
+from dayu.host._tool_runtime import InMemoryToolRuntime, _build_chunk
+from dayu.host._tool_runtime import _CursorRecord
 
 
 @dataclass(frozen=True, slots=True)
@@ -85,6 +93,26 @@ class _Executor:
                 meta=None,
             )
         )
+
+
+@dataclass(slots=True)
+class _OutcomeExecutor:
+    """返回固定 outcome 的 fake executor。"""
+
+    outcome: ToolExecutionOutcome
+
+    async def execute(
+        self,
+        request: ToolExecutionRequest,
+    ) -> ToolExecutionOutcome:
+        """返回固定工具 outcome。
+
+        :param request: 工具执行请求。
+        :returns: 固定 outcome。
+        :raises Exception: 不主动抛出异常。
+        """
+
+        return self.outcome
 
 
 @dataclass(slots=True)
@@ -367,6 +395,86 @@ async def test_wrapper_requires_explicit_target() -> None:
 
 
 @pytest.mark.asyncio
+async def test_field_path_mismatch_does_not_return_fake_truncated_wrapper() -> None:
+    """field_path 中间路径不匹配时不生成带原始字段的截断结果。"""
+
+    value: JsonValue = {"nested": {"long": "abcdef"}}
+    runtime, store = await _runtime(
+        value=value,
+        spec=_spec(
+            "text_chars",
+            "max_chars",
+            3,
+            field_path=("nested", "missing", "long"),
+        ),
+    )
+
+    outcome = await runtime.execute_tool_call(_request())
+
+    assert isinstance(outcome, ToolCompletedOutcome)
+    assert outcome.result.value == value
+    assert await store.list_events("run_1", after=None) == ()
+
+
+@pytest.mark.asyncio
+async def test_field_path_has_priority_over_target_field() -> None:
+    """field_path 与 target_field 同时存在时优先使用 field_path。"""
+
+    value: JsonValue = {"long": "abcdef", "nested": {"long": "uvwxyz"}}
+    runtime, _store = await _runtime(
+        value=value,
+        spec=_spec(
+            "text_chars",
+            "max_chars",
+            3,
+            target_field="long",
+            field_path=("nested", "long"),
+        ),
+    )
+
+    outcome = await runtime.execute_tool_call(_request())
+
+    assert isinstance(outcome, ToolCompletedOutcome)
+    assert outcome.result.value == {"long": "abcdef", "nested": {"long": "uvw"}}
+
+
+@pytest.mark.asyncio
+async def test_non_completed_outcome_passthrough_without_cursor() -> None:
+    """失败和等待 outcome 原样透传且不创建 cursor。"""
+
+    failed = ToolFailedOutcome(
+        result=ToolResultFailure(
+            ok=False,
+            error="tool_failed",
+            message="failed",
+            hint=None,
+            meta=None,
+        )
+    )
+    awaiting = ToolAwaitingOutcome(
+        await_spec=ToolAwaitSpec(
+            await_kind=ToolAwaitKind.EXTERNAL_JOB,
+            deadline=None,
+            resume_token="resume-1",
+        ),
+        snapshot=None,
+    )
+
+    for outcome in (failed, awaiting):
+        store = InMemoryRunEventStore()
+        runtime = InMemoryToolRuntime(
+            executor=_OutcomeExecutor(outcome=outcome),
+            event_store=store,
+            truncate_specs={"demo": _spec("text_chars", "max_chars", 1)},
+        )
+
+        actual = await runtime.execute_tool_call(_request())
+
+        assert actual == outcome
+        assert await store.list_events("run_1", after=None) == ()
+
+
+@pytest.mark.asyncio
 async def test_fetch_more_single_use_limit_clamp_and_next_cursor() -> None:
     """成功补读后旧 cursor 失效，limit clamp，并在有剩余时签发新 cursor。"""
 
@@ -415,6 +523,7 @@ async def test_fetch_more_single_use_limit_clamp_and_next_cursor() -> None:
     )
     assert not isinstance(reused, ToolFetchMoreSucceededResult)
     assert reused.error_code == "cursor_not_found"
+    assert reused.denied is False
 
     next_handle = await runtime.get_tool_fetch_more_handle(
         ToolFetchMoreHandleRequest(
@@ -438,6 +547,92 @@ async def test_fetch_more_single_use_limit_clamp_and_next_cursor() -> None:
     assert isinstance(second, ToolFetchMoreSucceededResult)
     assert second.value == [5]
     assert second.truncation is None
+
+
+@pytest.mark.asyncio
+async def test_concurrent_fetch_more_same_cursor_is_single_use() -> None:
+    """同一 cursor 并发补读时只有一个成功，另一个返回 cursor_not_found。"""
+
+    runtime, store = await _runtime(
+        value=[1, 2, 3, 4],
+        spec=_spec("list_items", "max_items", 2),
+    )
+    await runtime.execute_tool_call(_request())
+    truncated = cast(
+        ToolResultTruncatedData,
+        (await store.list_events("run_1", after=None))[0].data,
+    )
+    handle = await runtime.get_tool_fetch_more_handle(
+        ToolFetchMoreHandleRequest(
+            session_id="session_1",
+            run_id="run_1",
+            tool_call_id="tc_1",
+            cursor_fingerprint=truncated.cursor_fingerprint,
+        )
+    )
+    assert isinstance(handle, ToolFetchMoreHandleSucceededResult)
+    request = ToolFetchMoreRequest(
+        session_id="session_1",
+        run_id="run_1",
+        tool_call_id="tc_1",
+        cursor=handle.handle.cursor,
+        scope_token=handle.handle.scope_token,
+        limit=None,
+    )
+
+    first, second = await asyncio.gather(
+        runtime.fetch_more(request),
+        runtime.fetch_more(request),
+    )
+
+    results = (first, second)
+    successes = [
+        result
+        for result in results
+        if isinstance(result, ToolFetchMoreSucceededResult)
+    ]
+    failures = [
+        result
+        for result in results
+        if not isinstance(result, ToolFetchMoreSucceededResult)
+    ]
+    assert len(successes) == 1
+    assert successes[0].value == [3, 4]
+    assert len(failures) == 1
+    assert failures[0].error_code == "cursor_not_found"
+    assert failures[0].denied is False
+
+
+def test_build_chunk_strategy_data_type_mismatch_returns_empty_chunk() -> None:
+    """record 策略与 data 类型不匹配时返回空块。"""
+
+    record = _CursorRecord(
+        cursor="cursor",
+        cursor_fingerprint="fingerprint",
+        scope_token="token",
+        scope_hash="scope",
+        session_id="session_1",
+        run_id="run_1",
+        tool_call_id="tc_1",
+        tool_name="demo",
+        strategy="text_chars",
+        unit="chars",
+        limit=2,
+        total=3,
+        data=[1, 2, 3],
+        offset=0,
+        template=None,
+        field_path=None,
+        created_at_monotonic=100.0,
+        expires_at_monotonic=130.0,
+        ttl_seconds=30,
+        parent_cursor_fingerprint=None,
+    )
+
+    value, size = _build_chunk(record=record, limit=2)
+
+    assert value is None
+    assert size == 0
 
 
 @pytest.mark.asyncio
@@ -478,6 +673,7 @@ async def test_ttl_expired_and_opportunistic_cleanup() -> None:
     )
     assert not isinstance(expired, ToolFetchMoreSucceededResult)
     assert expired.error_code == "cursor_expired"
+    assert expired.denied is False
 
     await runtime.execute_tool_call(_request(run_id="run_2", tool_call_id="tc_2"))
     stale_handle = await runtime.get_tool_fetch_more_handle(
@@ -490,3 +686,4 @@ async def test_ttl_expired_and_opportunistic_cleanup() -> None:
     )
     assert not isinstance(stale_handle, ToolFetchMoreHandleSucceededResult)
     assert stale_handle.error_code == "cursor_not_found"
+    assert stale_handle.denied is False

@@ -70,10 +70,11 @@ Host P2 最小 Run harness、RunEventStore 与 ToolRuntime 测试，覆盖 `dayu
   worker / proxy 异常会落 Host-owned canonical failure 事件。
 - tool-call smoke：通过内部 `LocalRunHarness` 注入 fake ToolExecutor，覆盖 Runner tool call -> Engine 工具闭环 -> Host RunEvent stream。
 - ToolRuntime truncation：覆盖 text chars、text lines、list items、binary bytes、no-spec no-truncate、
-  explicit target only、execute-time cursor facts、single-use、TTL expired、opportunistic cleanup 与 limit clamp。
+  explicit target only、field_path 优先级、路径不匹配不截断、execute-time cursor facts、非成功 outcome 不创建
+  cursor、single-use、并发 single-use、TTL expired、opportunistic cleanup、limit clamp 与策略 / data 类型不匹配。
 - ToolRuntime eventlog：覆盖截断 / cursor issued / fetch_more requested / completed / failed / denied / expired
   均通过 canonical RunEvent 表达，handle 阶段 denied / expired 写入可信 owner run，terminal 后不追加事实，
-  且 EventLog 不保存明文 scope token 或完整大结果。
+  非权限失败不标记 denied，且 EventLog 不保存明文 scope token 或完整大结果。
 - ToolRuntime boundary：覆盖 Host 包根只导出 Run 级补读入口与契约类型，Engine 不 import Host / ToolRuntime，
   scope token 只能通过受控 handle 交付，跨 run 补读不污染请求伪造的 run，当前 Engine projection 不恢复
   OLD LLM-facing `fetch_more_args`。

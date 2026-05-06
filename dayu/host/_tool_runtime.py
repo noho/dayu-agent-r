@@ -6,6 +6,7 @@ RunEvent 事实写入。它不是 Host public surface，也不实现完整 ToolR
 
 from __future__ import annotations
 
+import asyncio
 import base64
 import copy
 import hashlib
@@ -207,6 +208,7 @@ class InMemoryToolRuntime:
         default_factory=dict,
         init=False,
     )
+    _fetch_lock: asyncio.Lock = field(default_factory=asyncio.Lock, init=False)
 
     async def execute_tool_call(
         self,
@@ -288,6 +290,7 @@ class InMemoryToolRuntime:
                 request=request,
                 error_code=_ERROR_CURSOR_NOT_FOUND,
                 message="cursor not found",
+                denied=False,
             )
         terminal_cursor = await self._terminal_cursor(record.run_id)
         if terminal_cursor is not None:
@@ -295,6 +298,7 @@ class InMemoryToolRuntime:
                 request=request,
                 error_code=_ERROR_RUN_TERMINAL,
                 message="run is terminal",
+                denied=False,
             )
         denied_reason = _binding_denied_reason(
             record=record,
@@ -311,6 +315,7 @@ class InMemoryToolRuntime:
                 request=request,
                 error_code=_ERROR_CURSOR_SCOPE_MISMATCH,
                 message=denied_reason,
+                denied=True,
             )
         now = self.clock()
         if record.expires_at_monotonic <= now:
@@ -320,6 +325,7 @@ class InMemoryToolRuntime:
                 request=request,
                 error_code=_ERROR_CURSOR_EXPIRED,
                 message="cursor expired",
+                denied=False,
             )
         handle = ToolFetchMoreHandle(
             session_id=record.session_id,
@@ -351,119 +357,123 @@ class InMemoryToolRuntime:
         :raises Exception: append RunEvent 失败时透传。
         """
 
-        record = self._records_by_cursor.get(request.cursor.value)
-        if record is None:
-            return _fetch_failure_without_event(
-                request=request,
-                error_code=_ERROR_CURSOR_NOT_FOUND,
-                message="cursor not found",
-                denied=True,
+        async with self._fetch_lock:
+            record = self._records_by_cursor.get(request.cursor.value)
+            if record is None:
+                return _fetch_failure_without_event(
+                    request=request,
+                    error_code=_ERROR_CURSOR_NOT_FOUND,
+                    message="cursor not found",
+                    denied=False,
+                )
+            terminal_cursor = await self._terminal_cursor(record.run_id)
+            if terminal_cursor is not None:
+                return ToolFetchMoreFailedResult(
+                    run_id=request.run_id,
+                    session_id=request.session_id,
+                    tool_call_id=request.tool_call_id,
+                    error_code=_ERROR_RUN_TERMINAL,
+                    message="run is terminal",
+                    denied=False,
+                    event_cursor=None,
+                )
+            binding_reason = _binding_denied_reason(
+                record=record,
+                session_id=request.session_id,
+                run_id=request.run_id,
+                tool_call_id=request.tool_call_id,
             )
-        terminal_cursor = await self._terminal_cursor(record.run_id)
-        if terminal_cursor is not None:
-            return ToolFetchMoreFailedResult(
+            if binding_reason is not None:
+                await self._append_cursor_denied(
+                    record=record,
+                    reason=binding_reason,
+                )
+                return await self._fetch_failure(
+                    request=request,
+                    record=record,
+                    error_code=_ERROR_CURSOR_SCOPE_MISMATCH,
+                    message=binding_reason,
+                    denied=True,
+                    expired=False,
+                )
+            await self._append_fetch_requested(
+                request=request,
+                record=record,
+            )
+            now = self.clock()
+            if record.expires_at_monotonic <= now:
+                self._remove_cursor(record.cursor)
+                await self._append_cursor_expired(record=record)
+                return await self._fetch_failure(
+                    request=request,
+                    record=record,
+                    error_code=_ERROR_CURSOR_EXPIRED,
+                    message="cursor expired",
+                    denied=False,
+                    expired=True,
+                )
+            denied_reason = self._scope_denied_reason(
+                request=request,
+                record=record,
+            )
+            if denied_reason is not None:
+                await self._append_cursor_denied(
+                    record=record,
+                    reason=denied_reason,
+                )
+                return await self._fetch_failure(
+                    request=request,
+                    record=record,
+                    error_code=_ERROR_CURSOR_SCOPE_MISMATCH,
+                    message=denied_reason,
+                    denied=True,
+                    expired=False,
+                )
+            limit = _resolve_fetch_limit(request.limit, record.limit)
+            chunk_value, chunk_size = _build_chunk(record=record, limit=limit)
+            output_value = _apply_chunk_to_template(
+                original=record.template,
+                field_path=record.field_path,
+                chunk=chunk_value,
+            )
+            new_offset = record.offset + chunk_size
+            has_more = new_offset < record.total
+            self._remove_cursor(record.cursor)
+            next_cursor: ToolRuntimeCursor | None = None
+            next_issued_event: ToolCursorIssuedData | None = None
+            if has_more:
+                cursor_creation = self._store_cursor_from_record(
+                    record=record,
+                    offset=new_offset,
+                    parent_cursor_fingerprint=record.cursor_fingerprint,
+                )
+                next_cursor = ToolRuntimeCursor(
+                    value=cursor_creation.record.cursor,
+                    fingerprint=cursor_creation.record.cursor_fingerprint,
+                )
+                next_issued_event = cursor_creation.issued_event
+            completed_event = await self._append_fetch_completed(
+                request=request,
+                record=record,
+                next_cursor=next_cursor,
+                limit=limit,
+                chunk_size=chunk_size,
+                has_more=has_more,
+                value=output_value,
+            )
+            if next_issued_event is not None:
+                await self._append_cursor_issued(
+                    request=request,
+                    data=next_issued_event,
+                )
+            return ToolFetchMoreSucceededResult(
                 run_id=request.run_id,
                 session_id=request.session_id,
                 tool_call_id=request.tool_call_id,
-                error_code=_ERROR_RUN_TERMINAL,
-                message="run is terminal",
-                denied=True,
-                event_cursor=None,
+                value=output_value,
+                truncation=next_cursor,
+                event_cursor=completed_event,
             )
-        binding_reason = _binding_denied_reason(
-            record=record,
-            session_id=request.session_id,
-            run_id=request.run_id,
-            tool_call_id=request.tool_call_id,
-        )
-        if binding_reason is not None:
-            await self._append_cursor_denied(
-                record=record,
-                reason=binding_reason,
-            )
-            return await self._fetch_failure(
-                request=request,
-                record=record,
-                error_code=_ERROR_CURSOR_SCOPE_MISMATCH,
-                message=binding_reason,
-                denied=True,
-                expired=False,
-            )
-        await self._append_fetch_requested(
-            request=request,
-            record=record,
-        )
-        now = self.clock()
-        if record.expires_at_monotonic <= now:
-            self._remove_cursor(record.cursor)
-            await self._append_cursor_expired(record=record)
-            return await self._fetch_failure(
-                request=request,
-                record=record,
-                error_code=_ERROR_CURSOR_EXPIRED,
-                message="cursor expired",
-                denied=True,
-                expired=True,
-            )
-        denied_reason = self._fetch_denied_reason(request=request, record=record)
-        if denied_reason is not None:
-            await self._append_cursor_denied(
-                record=record,
-                reason=denied_reason,
-            )
-            return await self._fetch_failure(
-                request=request,
-                record=record,
-                error_code=_ERROR_CURSOR_SCOPE_MISMATCH,
-                message=denied_reason,
-                denied=True,
-                expired=False,
-            )
-        limit = _resolve_fetch_limit(request.limit, record.limit)
-        chunk_value, chunk_size = _build_chunk(record=record, limit=limit)
-        output_value = _apply_chunk_to_template(
-            original=record.template,
-            field_path=record.field_path,
-            chunk=chunk_value,
-        )
-        new_offset = record.offset + chunk_size
-        has_more = new_offset < record.total
-        self._remove_cursor(record.cursor)
-        next_cursor: ToolRuntimeCursor | None = None
-        next_issued_event: ToolCursorIssuedData | None = None
-        if has_more:
-            cursor_creation = self._store_cursor_from_record(
-                record=record,
-                offset=new_offset,
-                parent_cursor_fingerprint=record.cursor_fingerprint,
-            )
-            next_cursor = ToolRuntimeCursor(
-                value=cursor_creation.record.cursor,
-                fingerprint=cursor_creation.record.cursor_fingerprint,
-            )
-            next_issued_event = cursor_creation.issued_event
-        completed_event = await self._append_fetch_completed(
-            request=request,
-            record=record,
-            next_cursor=next_cursor,
-            limit=limit,
-            chunk_size=chunk_size,
-            has_more=has_more,
-            value=output_value,
-        )
-        if next_issued_event is not None:
-            await self._append_cursor_issued(
-                request=request,
-                data=next_issued_event,
-            )
-        return ToolFetchMoreSucceededResult(
-            run_id=request.run_id,
-            session_id=request.session_id,
-            tool_call_id=request.tool_call_id,
-            value=output_value,
-            truncation=next_cursor,
-            event_cursor=completed_event,
-        )
 
     def _apply_truncation(
         self,
@@ -727,13 +737,13 @@ class InMemoryToolRuntime:
         for cursor in expired:
             self._remove_cursor(cursor)
 
-    def _fetch_denied_reason(
+    def _scope_denied_reason(
         self,
         *,
         request: ToolFetchMoreRequest,
         record: _CursorRecord,
     ) -> str | None:
-        """返回补读请求被拒绝的原因。
+        """返回 cursor 指纹或 scope token 拒绝原因。
 
         :param request: 补读请求。
         :param record: cursor 记录。
@@ -741,14 +751,6 @@ class InMemoryToolRuntime:
         :raises Exception: 不主动抛出异常。
         """
 
-        binding_reason = _binding_denied_reason(
-            record=record,
-            session_id=request.session_id,
-            run_id=request.run_id,
-            tool_call_id=request.tool_call_id,
-        )
-        if binding_reason is not None:
-            return binding_reason
         if request.cursor.fingerprint != record.cursor_fingerprint:
             return "cursor fingerprint mismatch"
         if not hmac.compare_digest(request.scope_token, record.scope_token):
@@ -757,6 +759,9 @@ class InMemoryToolRuntime:
 
     async def _terminal_cursor(self, run_id: str) -> RunEventCursor | None:
         """读取 run 终态 cursor。
+
+        当前内存态 EventStore 需要读取并反向扫描 run 的全量事件，复杂度为
+        O(n)。P6 持久化 EventStore 应维护 run 级终态 cursor 索引或缓存。
 
         :param run_id: Run id。
         :returns: 已终态时返回终态 cursor，否则返回 ``None``。
@@ -1054,12 +1059,14 @@ def _handle_failure(
     request: ToolFetchMoreHandleRequest,
     error_code: str,
     message: str,
+    denied: bool,
 ) -> ToolFetchMoreHandleFailedResult:
     """构造 handle 读取失败结果。
 
     :param request: handle 读取请求。
     :param error_code: 失败错误码。
     :param message: 人类可读错误描述。
+    :param denied: 是否为权限拒绝。
     :returns: handle 读取失败结果。
     :raises Exception: 不主动抛出异常。
     """
@@ -1070,7 +1077,7 @@ def _handle_failure(
         tool_call_id=request.tool_call_id,
         error_code=error_code,
         message=message,
-        denied=True,
+        denied=denied,
     )
 
 
@@ -1255,12 +1262,12 @@ def _truncate_text_chars(
     chunk = text[:limit]
     return _TruncatedValue(
         value=_apply_chunk_to_template(original, target.field_path, chunk),
-            data=text,
-            offset=len(chunk),
-            total=total,
-            chunk_size=len(chunk),
-            template=cast(JsonValue, original) if target.field_path is not None else None,
-            field_path=target.field_path,
+        data=text,
+        offset=len(chunk),
+        total=total,
+        chunk_size=len(chunk),
+        template=cast(JsonValue, original) if target.field_path is not None else None,
+        field_path=target.field_path,
     )
 
 
@@ -1286,12 +1293,12 @@ def _truncate_text_lines(
     chunk = "".join(chunk_lines)
     return _TruncatedValue(
         value=_apply_chunk_to_template(original, target.field_path, chunk),
-            data=lines,
-            offset=len(chunk_lines),
-            total=total,
-            chunk_size=len(chunk_lines),
-            template=cast(JsonValue, original) if target.field_path is not None else None,
-            field_path=target.field_path,
+        data=lines,
+        offset=len(chunk_lines),
+        total=total,
+        chunk_size=len(chunk_lines),
+        template=cast(JsonValue, original) if target.field_path is not None else None,
+        field_path=target.field_path,
     )
 
 
@@ -1316,12 +1323,12 @@ def _truncate_list_items(
     chunk = items[:limit]
     return _TruncatedValue(
         value=_apply_chunk_to_template(original, target.field_path, chunk),
-            data=list(items),
-            offset=len(chunk),
-            total=total,
-            chunk_size=len(chunk),
-            template=cast(JsonValue, original) if target.field_path is not None else None,
-            field_path=target.field_path,
+        data=list(items),
+        offset=len(chunk),
+        total=total,
+        chunk_size=len(chunk),
+        template=cast(JsonValue, original) if target.field_path is not None else None,
+        field_path=target.field_path,
     )
 
 
@@ -1353,12 +1360,12 @@ def _truncate_binary_bytes(
     encoded = _encode_bytes(chunk)
     return _TruncatedValue(
         value=_apply_chunk_to_template(original, target.field_path, encoded),
-            data=data,
-            offset=len(chunk),
-            total=total,
-            chunk_size=len(chunk),
-            template=cast(JsonValue, original) if target.field_path is not None else None,
-            field_path=target.field_path,
+        data=data,
+        offset=len(chunk),
+        total=total,
+        chunk_size=len(chunk),
+        template=cast(JsonValue, original) if target.field_path is not None else None,
+        field_path=target.field_path,
     )
 
 
@@ -1384,7 +1391,7 @@ def _build_chunk(
     if record.strategy == "binary_bytes" and isinstance(record.data, bytes):
         chunk_bytes = record.data[record.offset : record.offset + limit]
         return _encode_bytes(chunk_bytes), len(chunk_bytes)
-    if isinstance(record.data, list):
+    if record.strategy == "list_items" and isinstance(record.data, list):
         chunk_items = record.data[record.offset : record.offset + limit]
         return chunk_items, len(chunk_items)
     return None, 0
@@ -1423,7 +1430,7 @@ def _replace_path(
     :param field_path: 字段路径。
     :param chunk: 块值。
     :returns: 替换后的 JSON 对象。
-    :raises Exception: 不主动抛出异常。
+    :raises RuntimeError: 中间路径不匹配时抛出。
     """
 
     key = field_path[0]
@@ -1438,7 +1445,8 @@ def _replace_path(
             field_path=field_path[1:],
             chunk=chunk,
         )
-    return copied
+        return copied
+    raise RuntimeError("truncate field_path does not match wrapper template")
 
 
 def _resolve_fetch_limit(requested: int | None, record_limit: int) -> int:

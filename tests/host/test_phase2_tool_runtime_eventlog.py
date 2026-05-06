@@ -389,6 +389,7 @@ async def test_terminal_run_fetch_more_returns_failure_without_new_event() -> No
     after = await store.list_events("run_1", after=None)
     assert not isinstance(result, ToolFetchMoreSucceededResult)
     assert result.error_code == "run_terminal"
+    assert result.denied is False
     assert result.event_cursor is None
     assert len(after) == len(before_terminal) + 1
 
@@ -434,4 +435,5 @@ async def test_terminal_run_handle_failure_does_not_append_event() -> None:
     after = await store.list_events("run_1", after=None)
     assert not isinstance(result, ToolFetchMoreHandleSucceededResult)
     assert result.error_code == "run_terminal"
+    assert result.denied is False
     assert len(after) == len(before_terminal) + 1

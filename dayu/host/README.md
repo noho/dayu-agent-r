@@ -32,6 +32,7 @@ Phase 流程、review 过程或 PR 流程。
   `tool_cursor_expired`、`tool_cursor_denied`。
 - `scope_token` 不进入 RunEvent、Engine projection 或日志；调用方只能通过受控
   `get_tool_fetch_more_handle(...)` 按 session / run / 原始 tool_call / cursor fingerprint 换取短期 handle。
+- 补读失败结果中的 `denied` 只表示权限 / scope 拒绝；cursor 不存在、cursor 过期和 terminal Run 都不是权限拒绝。
 - terminal Run 后 `fetch_more_tool_result(...)` 返回 typed failure，不追加新 RunEvent。
 
 当前未落地：
