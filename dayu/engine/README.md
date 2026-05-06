@@ -16,6 +16,7 @@ Engine 当前负责：
 - 提供函数式入口：`run_agent_messages(request)` 与 `run_agent_and_wait(request)`。
 - 在私有 run-scoped Agent 中消费 Runner 事件流，并提升为带 `session_id`、`run_id`、`sequence`、`event_id` 的 `EngineEvent`。
 - 执行普通 completed / failed tool calling 闭环：Runner tool call -> `ToolExecutionRequest` -> `ToolExecutor.execute` -> tool message 注入下一轮 Runner。
+- 在 `finish_reason=length` 时执行 final-answer text continuation；continuation 轮固定 `tools=()`，只续写被截断的最终回答文本。
 - 收口三类终态：`final_answer`、`run_failed`、`run_cancelled`。
 - 维护 OpenAI-compatible Runner，把 provider 响应归一为 `RunnerEvent`。
 - 在 Runner 边界提供诊断日志与 SSE idle heartbeat / timeout 处理；这些诊断不进入事件契约。
@@ -25,7 +26,7 @@ Engine 当前不负责：
 - Host ToolRegistry、工具权限、工具执行调度或长事务等待。
 - awaiting / `run_suspended` 工具主链路。
 - trace store、transcript 持久化、conversation memory。
-- context budget、continuation 或语义压缩。
+- context overflow / context compaction、OLD `TruncationManager`、`fetch_more` 或语义压缩。
 - 财报文档存取；财报文档只能通过 `dayu.fins.storage` 所属仓储边界处理。
 
 ## 稳定依赖表面
@@ -81,7 +82,7 @@ HTTP error 当前不提升为单独 EngineEvent；Agent 将其记录为失败候
 4. 按 `disable_tools`、`AgentPolicy.allow_tool_calls`、Runner tool calling 能力决定本轮有效工具 schema。
 5. 消费并提升 RunnerEvent。
 6. 若 Runner 请求普通工具调用，按 `index_in_iteration` 串行调用 ToolExecutor，并注入 assistant tool_calls 与 tool messages。
-7. 若 Runner 给出普通内容或错误边界，收口唯一 terminal。
+7. 若 Runner 给出普通内容或错误边界，按 finish reason 收口唯一 terminal；`LENGTH` 在预算内进入 continuation。
 8. 普通工具轮次耗尽或连续全失败工具批次达到阈值时，按 `AgentPolicy.fallback_mode` force-answer 或 `run_failed`。
 9. success / failure / cancellation 都执行 Runner close。
 
@@ -94,7 +95,9 @@ Runner close 失败只记录日志，不覆盖已经确定的业务 terminal。
 - `max_iterations < 1` -> `run_failed("max_iterations_exceeded")`
 - 正常 `STOP` -> `final_answer`
 - `CONTENT_FILTER` -> `final_answer(filtered=True, degraded=True)`
-- `LENGTH` -> `final_answer(filtered=False)`，当前不 continuation
+- `LENGTH` -> final-answer text continuation；continuation 轮固定 `tools=()`，不进入普通 tool loop
+- continuation 轮再次请求工具 -> `run_failed("continuation_tool_call_not_allowed")`
+- 达到 `continuation_max_attempts` 或 `max_iterations` 边界 -> `final_answer(degraded=True)`
 - `ERROR` -> `run_failed`
 - 工具被禁用或 Runner 不支持工具时收到 `TOOL_CALLS` -> `run_failed("tool_call_not_enabled")`
 - `TOOL_CALLS` 且工具可用 -> `tool_call_requested` -> ToolExecutor -> `tool_result_accepted` -> 注入下一轮 Runner
@@ -118,6 +121,14 @@ ToolExecutor 由 EngineWorker 替 Host 在选定执行环境中代持，并通�
 当最后一轮普通工具调用执行完后，默认 `AgentFallbackMode.FORCE_ANSWER` 会追加 `AgentPolicy.fallback_prompt` 作为 `UserMessage`，以 `tools=()` 再调用 Runner，并产出 `final_answer(degraded=True)`。`AgentFallbackMode.RAISE_ERROR` 才直接 `run_failed("max_iterations_exceeded")`。连续全失败工具批次达到 `AgentPolicy.max_consecutive_failed_tool_batches` 时使用同一 fallback mode 收口。
 
 force-answer 只尝试一次；如果该降级 Runner 仍请求工具或没有产出可用正文，Agent 直接收口为 `run_failed`，不会继续重试或再次执行工具。
+
+## Final Answer Continuation
+
+`finish_reason=length` 表示模型最终回答文本被 provider 截断。当前 Agent 会在 `AgentPolicy.continuation_max_attempts` 预算内追加 `AgentPolicy.continuation_prompt`，并以 `tools=()` 再调用 Runner 续写最终回答文本。多轮 continuation 的 partial content 会按顺序拼接，最终产出一个 `final_answer`。
+
+Continuation 是 final-answer text continuation，不是普通 tool loop continuation。Continuation 轮不会向 Runner 暴露工具；如果 provider 仍返回 tool calls，Agent 收口为 `run_failed("continuation_tool_call_not_allowed")`，不会调用 ToolExecutor。
+
+`CONTENT_FILTER` 不进入 continuation，直接以 `final_answer(filtered=True, degraded=True)` 收口。达到 `continuation_max_attempts` 或 `max_iterations` 边界时，Agent 使用已拼接内容产出 `final_answer(degraded=True)`。
 
 ## 取消优先级
 
@@ -168,4 +179,4 @@ SSE idle heartbeat / timeout 属于 Runner 字节流读取边界：
 - 新 Runner 需要实现 `AsyncRunner`，只产出 `RunnerEvent`。
 - 新 provider 参数应进入 `RunnerSpec` / provider request extension 的强类型字段。
 - 新 EngineEvent 或 RunnerEvent 必须扩展封闭 data 联合，并补齐穷尽匹配测试。
-- awaiting、trace store、conversation memory、context budget / continuation 尚未落地；这些能力不能通过当前 Agent 私自接入。
+- awaiting / `run_suspended`、Host resume、trace store、conversation memory、context overflow / context compaction、OLD `TruncationManager` / `fetch_more` 尚未落地；这些能力不能通过当前 Agent 私自接入。

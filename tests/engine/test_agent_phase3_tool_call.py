@@ -1,4 +1,4 @@
-"""Phase 3 Agent 普通 tool calling 闭环测试。"""
+"""Phase 3 tool calling 与 Phase 5 continuation 回归测试。"""
 
 from __future__ import annotations
 
@@ -133,6 +133,8 @@ class _ScriptedRunner:
     scripts: tuple[tuple[RunnerEvent, ...], ...]
     supports_tools: bool = True
     raise_on_call_indices: frozenset[int] = field(default_factory=frozenset)
+    token_to_cancel: _Token | None = None
+    cancel_after_call_indices: frozenset[int] = field(default_factory=frozenset)
     call_count: int = 0
     close_count: int = 0
     tools_seen: list[tuple[ToolSchema, ...]] = field(default_factory=list)
@@ -161,6 +163,8 @@ class _ScriptedRunner:
             return self._raise_runtime_error()
         if script_index >= len(self.scripts):
             return self._iter_events(())
+        if script_index in self.cancel_after_call_indices:
+            return self._iter_events_then_cancel(self.scripts[script_index])
         return self._iter_events(self.scripts[script_index])
 
     def is_supports_tool_calling(self) -> bool:
@@ -203,6 +207,21 @@ class _ScriptedRunner:
 
         raise RuntimeError("runner exploded")
         yield
+
+    async def _iter_events_then_cancel(
+        self, events: tuple[RunnerEvent, ...]
+    ) -> AsyncIterator[RunnerEvent]:
+        """产出脚本事件后触发测试 token 取消。
+
+        :param events: RunnerEvent 元组。
+        :returns: RunnerEvent 异步流。
+        :raises Exception: 不主动抛出异常。
+        """
+
+        for event in events:
+            yield event
+        if self.token_to_cancel is not None:
+            self.token_to_cancel.trigger()
 
 
 @dataclass(slots=True)
@@ -390,6 +409,8 @@ def _request(
     disable_tools: bool = False,
     allow_tool_calls: bool = True,
     max_failed_batches: int = 2,
+    continuation_max_attempts: int = 3,
+    continuation_prompt: str = "请继续。",
 ) -> AgentRunRequest:
     """构造 AgentRunRequest。
 
@@ -400,6 +421,8 @@ def _request(
     :param disable_tools: 是否禁用工具。
     :param allow_tool_calls: policy 是否允许工具。
     :param max_failed_batches: 连续失败工具批次阈值。
+    :param continuation_max_attempts: continuation 最大尝试次数。
+    :param continuation_prompt: continuation 追加用户消息。
     :returns: AgentRunRequest。
     :raises Exception: 不主动抛出异常。
     """
@@ -431,10 +454,11 @@ def _request(
         ),
         agent_policy=AgentPolicy(
             max_iterations=max_iterations,
-            continuation_max_attempts=3,
+            continuation_max_attempts=continuation_max_attempts,
             allow_tool_calls=allow_tool_calls,
             fallback_mode=fallback_mode,
             fallback_prompt="请直接回答。",
+            continuation_prompt=continuation_prompt,
             max_consecutive_failed_tool_batches=max_failed_batches,
         ),
         tool_schemas=(_schema(),),
@@ -511,15 +535,20 @@ def _final_data(events: Sequence[EngineEvent]) -> FinalAnswerData:
 def test_contract_fields_are_explicit() -> None:
     """Phase 3 contract 字段必须显式存在。"""
 
-    policy = AgentPolicy(max_iterations=1, continuation_max_attempts=0, allow_tool_calls=True)
+    policy = AgentPolicy(
+        max_iterations=1,
+        continuation_max_attempts=0,
+        allow_tool_calls=True,
+    )
 
     assert policy.fallback_mode is AgentFallbackMode.FORCE_ANSWER
     assert policy.max_consecutive_failed_tool_batches == 2
     assert policy.fallback_prompt
+    assert policy.continuation_prompt
 
 
-def test_agent_policy_rejects_invalid_failed_batch_threshold() -> None:
-    """连续失败工具批次阈值必须在 contract 构造期 fail fast。"""
+def test_agent_policy_rejects_invalid_values() -> None:
+    """AgentPolicy 非法策略值必须在 contract 构造期 fail fast。"""
 
     for threshold in (0, -1):
         with pytest.raises(ValueError):
@@ -529,6 +558,19 @@ def test_agent_policy_rejects_invalid_failed_batch_threshold() -> None:
                 allow_tool_calls=True,
                 max_consecutive_failed_tool_batches=threshold,
             )
+    with pytest.raises(ValueError):
+        AgentPolicy(
+            max_iterations=1,
+            continuation_max_attempts=-1,
+            allow_tool_calls=True,
+        )
+    with pytest.raises(ValueError):
+        AgentPolicy(
+            max_iterations=1,
+            continuation_max_attempts=0,
+            allow_tool_calls=True,
+            continuation_prompt=" ",
+        )
 
 
 def test_llm_projection_shapes() -> None:
@@ -992,6 +1034,173 @@ async def test_content_filter_is_degraded_final() -> None:
     data = _final_data(events)
     assert data.filtered is True
     assert data.degraded is True
+
+
+@pytest.mark.asyncio
+async def test_length_continuation_appends_prompt_and_joins_content() -> None:
+    """finish_reason=length 后必须禁工具续写并拼接最终内容。"""
+
+    runner = _ScriptedRunner(
+        scripts=(
+            _final_script("partial ", finish_reason=FinishReason.LENGTH),
+            _final_script("continued"),
+        )
+    )
+    events = await _collect(
+        _AsyncAgent(
+            request=_request(
+                max_iterations=3,
+                continuation_max_attempts=2,
+                continuation_prompt="请从截断处继续。",
+            ),
+            runner=runner,
+        )
+    )
+
+    data = _final_data(events)
+    assert data.content == "partial continued"
+    assert data.degraded is True
+    assert data.filtered is False
+    assert data.finish_reason is FinishReason.STOP
+    assert runner.call_count == 2
+    assert runner.tools_seen[1] == ()
+    assert isinstance(runner.messages_seen[1][-2], AssistantMessage)
+    assert runner.messages_seen[1][-2].content == "partial "
+    assert isinstance(runner.messages_seen[1][-1], UserMessage)
+    assert runner.messages_seen[1][-1].content == "请从截断处继续。"
+
+
+@pytest.mark.asyncio
+async def test_length_continuation_stops_at_attempt_limit() -> None:
+    """达到 continuation 上限后使用已累积内容降级收口。"""
+
+    runner = _ScriptedRunner(
+        scripts=(
+            _final_script("part1", finish_reason=FinishReason.LENGTH),
+            _final_script("part2", finish_reason=FinishReason.LENGTH),
+            _final_script("part3", finish_reason=FinishReason.LENGTH),
+            _final_script("unused"),
+        )
+    )
+    events = await _collect(
+        _AsyncAgent(
+            request=_request(max_iterations=5, continuation_max_attempts=2),
+            runner=runner,
+        )
+    )
+
+    data = _final_data(events)
+    assert data.content == "part1part2part3"
+    assert data.degraded is True
+    assert data.finish_reason is FinishReason.LENGTH
+    assert runner.call_count == 3
+
+
+@pytest.mark.asyncio
+async def test_length_continuation_respects_max_iterations() -> None:
+    """max_iterations 耗尽时不得进入 force-answer，而应降级 final。"""
+
+    runner = _ScriptedRunner(
+        scripts=(
+            _final_script("part1", finish_reason=FinishReason.LENGTH),
+            _final_script("part2", finish_reason=FinishReason.LENGTH),
+        )
+    )
+    events = await _collect(
+        _AsyncAgent(
+            request=_request(max_iterations=2, continuation_max_attempts=3),
+            runner=runner,
+        )
+    )
+
+    data = _final_data(events)
+    assert data.content == "part1part2"
+    assert data.degraded is True
+    assert data.finish_reason is FinishReason.LENGTH
+    assert runner.call_count == 2
+
+
+@pytest.mark.asyncio
+async def test_length_continuation_tool_call_is_fail_closed() -> None:
+    """continuation 轮返回 tool calls 时不得执行工具。"""
+
+    executor = _RecordingToolExecutor(outcomes={"tc_1": _success(5)})
+    runner = _ScriptedRunner(
+        scripts=(
+            _final_script("partial", finish_reason=FinishReason.LENGTH),
+            _tool_script(_tool_call("tc_1")),
+        )
+    )
+    events = await _collect(
+        _AsyncAgent(
+            request=_request(
+                executor=executor,
+                max_iterations=3,
+                continuation_max_attempts=2,
+            ),
+            runner=runner,
+        )
+    )
+
+    failed = _failed_data(events)
+    assert failed.error_code == "continuation_tool_call_not_allowed"
+    assert len(executor.requests) == 0
+    assert runner.tools_seen[1] == ()
+
+
+@pytest.mark.asyncio
+async def test_content_filter_does_not_trigger_continuation() -> None:
+    """content_filter 即使配置 continuation 也必须直接降级 final。"""
+
+    runner = _ScriptedRunner(
+        scripts=(
+            _final_script(
+                "filtered",
+                finish_reason=FinishReason.CONTENT_FILTER,
+            ),
+            _final_script("unused"),
+        )
+    )
+    events = await _collect(
+        _AsyncAgent(
+            request=_request(max_iterations=3, continuation_max_attempts=2),
+            runner=runner,
+        )
+    )
+
+    data = _final_data(events)
+    assert data.content == "filtered"
+    assert data.filtered is True
+    assert data.degraded is True
+    assert runner.call_count == 1
+
+
+@pytest.mark.asyncio
+async def test_cancellation_wins_before_length_continuation() -> None:
+    """截断后若 Host 已取消，下一轮 Runner 调用前必须取消收口。"""
+
+    token = _Token()
+    runner = _ScriptedRunner(
+        scripts=(
+            _final_script("partial", finish_reason=FinishReason.LENGTH),
+            _final_script("unused"),
+        ),
+        token_to_cancel=token,
+        cancel_after_call_indices=frozenset({0}),
+    )
+    events = await _collect(
+        _AsyncAgent(
+            request=_request(
+                token=token,
+                max_iterations=3,
+                continuation_max_attempts=2,
+            ),
+            runner=runner,
+        )
+    )
+
+    assert _terminal(events).type is EngineEventType.RUN_CANCELLED
+    assert runner.call_count == 1
 
 
 @pytest.mark.asyncio

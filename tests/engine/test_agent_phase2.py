@@ -727,8 +727,8 @@ async def test_tool_call_delta_and_completed_fail_closed() -> None:
 
 
 @pytest.mark.asyncio
-async def test_length_and_content_filter_are_final_without_continuation() -> None:
-    """LENGTH / CONTENT_FILTER 在 Phase 2 直接 final，不消费 continuation。"""
+async def test_length_and_content_filter_final_boundaries() -> None:
+    """LENGTH 无续写预算时降级 final；CONTENT_FILTER 不消费 continuation。"""
 
     for finish_reason in (FinishReason.LENGTH, FinishReason.CONTENT_FILTER):
         runner = _ScriptedRunner(
@@ -754,9 +754,7 @@ async def test_length_and_content_filter_are_final_without_continuation() -> Non
         assert events[-1].data.filtered is (
             finish_reason is FinishReason.CONTENT_FILTER
         )
-        assert events[-1].data.degraded is (
-            finish_reason is FinishReason.CONTENT_FILTER
-        )
+        assert events[-1].data.degraded is True
         assert runner.call_count == 1
 
 
