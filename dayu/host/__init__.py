@@ -6,7 +6,13 @@ P1.5 暴露最小 Run 级入口与事件事实读取接口。Host 内部的 ``En
 
 from __future__ import annotations
 
-from dayu.host._run_harness import get_run_result, start_run, stream_run_events
+from dayu.host._run_harness import (
+    fetch_more_tool_result,
+    get_run_result,
+    get_tool_fetch_more_handle,
+    start_run,
+    stream_run_events,
+)
 from dayu.host.contracts import (
     HostRunFailedData,
     RunCancelledResult,
@@ -26,6 +32,25 @@ from dayu.host.contracts import (
     RunSucceededResult,
     RunSuspendedResult,
     StartRunRequest,
+    ToolCursorDeniedData,
+    ToolCursorExpiredData,
+    ToolCursorIssuedData,
+    ToolFetchMoreCompletedData,
+    ToolFetchMoreFailedData,
+    ToolFetchMoreFailedResult,
+    ToolFetchMoreHandle,
+    ToolFetchMoreHandleFailedResult,
+    ToolFetchMoreHandleRequest,
+    ToolFetchMoreHandleResult,
+    ToolFetchMoreHandleSucceededResult,
+    ToolFetchMoreRequest,
+    ToolFetchMoreRequestedData,
+    ToolFetchMoreResult,
+    ToolFetchMoreSucceededResult,
+    ToolResultTruncatedData,
+    ToolRuntimeCursor,
+    ToolRuntimeEventData,
+    ToolValueSizeSummary,
 )
 
 __all__ = [
@@ -47,7 +72,28 @@ __all__ = [
     "RunSucceededResult",
     "RunSuspendedResult",
     "StartRunRequest",
+    "ToolCursorDeniedData",
+    "ToolCursorExpiredData",
+    "ToolCursorIssuedData",
+    "ToolFetchMoreCompletedData",
+    "ToolFetchMoreFailedData",
+    "ToolFetchMoreFailedResult",
+    "ToolFetchMoreHandle",
+    "ToolFetchMoreHandleFailedResult",
+    "ToolFetchMoreHandleRequest",
+    "ToolFetchMoreHandleResult",
+    "ToolFetchMoreHandleSucceededResult",
+    "ToolFetchMoreRequest",
+    "ToolFetchMoreRequestedData",
+    "ToolFetchMoreResult",
+    "ToolFetchMoreSucceededResult",
+    "ToolResultTruncatedData",
+    "ToolRuntimeCursor",
+    "ToolRuntimeEventData",
+    "ToolValueSizeSummary",
+    "fetch_more_tool_result",
     "get_run_result",
+    "get_tool_fetch_more_handle",
     "start_run",
     "stream_run_events",
 ]

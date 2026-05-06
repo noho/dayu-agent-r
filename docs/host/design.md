@@ -867,21 +867,55 @@ ToolExecutor 由 EngineWorker 替 Host 在执行环境中代持，并提供给 E
 - Engine 不知道 ToolExecutor 是本地实现还是远程 worker 内实现。
 - Engine 不注册工具、不发现工具、不持有 ToolRegistry。
 
-ToolRuntime 的具体治理面后续单独设计。设计时必须保持：
+当前 P2 已落地最小 Host-owned ToolRuntime：它代持底层业务 `ToolExecutor`，在普通工具成功返回路径上按显式
+`ToolTruncateSpec` 执行截断，生成 run-scoped、single-use、TTL-bound cursor，并把截断 / 补读治理事实写入
+canonical `RunEvent`。
+
+P2 后工具执行边界：
+
+```text
+Engine
+  -> ToolExecutor.execute(request)
+  -> Host-owned ToolRuntimeToolExecutor
+  -> InMemoryToolRuntime.execute_tool_call(request)
+      -> underlying business ToolExecutor
+      -> schema-driven truncate / cursor store
+      -> RunEventStore.append(canonical tool runtime facts)
+  -> Engine receives ToolExecutionOutcome
+```
+
+P2 后补读边界：
+
+```text
+UI / Service / test harness
+  -> get_tool_fetch_more_handle(session / run / original tool_call / cursor fingerprint)
+  -> fetch_more_tool_result(handle cursor + scope token + optional limit)
+  -> InMemoryToolRuntime.fetch_more(request)
+  -> RunEventStore.append(canonical fetch_more facts)
+  -> ToolFetchMoreResult
+```
+
+`scope_token` 只通过非 EventLog 的受控 handle 短期交付，不进入 `RunEvent`、Engine projection 或日志。
+`RunEvent` 只保存 cursor fingerprint、scope hash、limit、unit、size summary、lineage 等中性摘要，不保存完整大结果
+或 token 明文。terminal RunEvent 后的 `fetch_more` 返回 typed failure，且不追加新 RunEvent，以保持 P1.5
+terminal guard。
+
+ToolRuntime 仍必须保持：
 
 - Host / Engine 不懂业务。
 - tool execution runtime 与业务权限 / 业务规则分离。
 - 财报文档访问约束由业务工具 / tool 边界保证，不进入 Host / Engine 业务语义。
-- truncate / fetch_more / cursor / TTL / scope token 后续归 ToolRuntime 相关阶段设计。
+- truncate 只由工具 schema / metadata 的显式 spec 驱动；无 spec、未启用、未知策略或非法 limit 不截断。
+- P2 不恢复 OLD LLM-facing `fetch_more` schema，也不向 Engine projection 投影 `fetch_more_args`。
 
-ToolRuntime 最小生命周期事实需要预留，但不在当前阶段展开具体权限模型：
+ToolRuntime 最小生命周期事实当前已经覆盖截断与补读子集，完整权限模型仍未展开：
 
 - tool call proposed。
 - approved / denied / deferred。
 - started。
 - completed。
 - failed。
-- truncated / fetch_more。
+- truncated / cursor issued / fetch_more requested / completed / failed / cursor expired / cursor denied。
 - cancelled / timeout。
 
 这些事实可以投影为客户端可见 tool summary、内部 audit event 或 trace event。Host 只治理运行边界、

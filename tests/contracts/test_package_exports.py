@@ -33,7 +33,9 @@ EXPECTED_EXPORTS: frozenset[str] = frozenset(
         "ToolResultMeta",
         "ToolResultSuccess",
         "ToolSchema",
+        "ToolTruncateSpec",
         "ToolTruncationInfo",
+        "ToolTruncationStrategy",
     }
 )
 
