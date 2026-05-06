@@ -475,7 +475,11 @@ class SSEParser:
                 )
                 return
             yield _make_event(
-                RunnerToolCallsCompletedData(tool_calls=result.tool_calls)
+                RunnerToolCallsCompletedData(
+                    tool_calls=result.tool_calls,
+                    content="".join(self._content_buffer) or None,
+                    reasoning_content="".join(self._reasoning_buffer) or None,
+                )
             )
         else:
             content = "".join(self._content_buffer) or None

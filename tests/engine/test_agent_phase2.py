@@ -367,6 +367,7 @@ async def test_success_run_lifts_runner_events_and_agent_final() -> None:
     final = _final_event(events)
     assert isinstance(final.data, FinalAnswerData)
     assert final.data.content == "你好"
+    assert final.data.degraded is False
     assert runner.close_count == 1
 
 
@@ -719,7 +720,7 @@ async def test_tool_call_delta_and_completed_fail_closed() -> None:
         events = await _collect(_AsyncAgent(request=_request(), runner=runner))
         assert _final_event(events).type is EngineEventType.RUN_FAILED
         assert isinstance(events[-1].data, RunFailedData)
-        assert events[-1].data.error_code == "tool_call_not_supported_in_phase2"
+        assert events[-1].data.error_code == "runner_abnormal_stop"
         assert EngineEventType.TOOL_CALL_REQUESTED not in {
             event.type for event in events
         }
@@ -751,6 +752,9 @@ async def test_length_and_content_filter_are_final_without_continuation() -> Non
         assert isinstance(events[-1].data, FinalAnswerData)
         assert events[-1].data.finish_reason is finish_reason
         assert events[-1].data.filtered is (
+            finish_reason is FinishReason.CONTENT_FILTER
+        )
+        assert events[-1].data.degraded is (
             finish_reason is FinishReason.CONTENT_FILTER
         )
         assert runner.call_count == 1
@@ -953,7 +957,7 @@ async def test_run_agent_and_wait_rejects_unexpected_suspended(
     result = await agent_module.run_agent_and_wait(_request())
 
     assert isinstance(result, EngineRunOutcomeFailed)
-    assert result.error_code == "unexpected_suspended_in_phase2"
+    assert result.error_code == "unexpected_suspended_in_phase3"
 
 
 def _terminal_count(events: Sequence[EngineEvent]) -> int:

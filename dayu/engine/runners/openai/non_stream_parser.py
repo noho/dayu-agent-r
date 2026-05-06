@@ -222,7 +222,9 @@ def _emit_from_dict(
                 return
             yield _make_event(
                 RunnerToolCallsCompletedData(
-                    tool_calls=tool_calls_request.tool_calls
+                    tool_calls=tool_calls_request.tool_calls,
+                    content=content,
+                    reasoning_content=reasoning,
                 )
             )
             tool_calls_emitted = True

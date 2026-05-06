@@ -12,6 +12,7 @@ EXPECTED_EXPORTS: frozenset[str] = frozenset(
     {
         "AgentMessage",
         "AgentMessageRole",
+        "AgentFallbackMode",
         "AgentPolicy",
         "AgentRunRequest",
         "AgentRunResult",

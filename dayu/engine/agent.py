@@ -1,24 +1,44 @@
-"""Phase 2 run-scoped Agent 主链路实现。
+"""Phase 3 run-scoped Agent 主链路实现。
 
-本模块只承载 Engine 内部的无工具 Agent run loop：
+本模块承载 Engine 内部 Agent 状态机：
 
 - 公共调用方通过 :func:`run_agent_messages` /
   :func:`run_agent_and_wait` 使用函数式入口。
 - 私有 :class:`_AsyncAgent` 负责单次 run 内的 RunnerEvent 消费、
-  EngineEvent 提升、终态收口与 Runner close。
-- Phase 2 不执行工具、不写 trace、不做 transcript / memory /
-  continuation。
+  EngineEvent 提升、普通 tool calling 闭环、终态收口与 Runner close。
+- Engine 只消费 ToolExecutor protocol；不注册工具、不发现工具、不持有
+  ToolRegistry，也不理解 ToolExecutor 的真实部署位置。
 """
 
 from __future__ import annotations
 
 import asyncio
+import json
 import logging
 import threading
-from collections.abc import AsyncIterator, Sequence
+from collections.abc import AsyncIterator, Mapping, Sequence
+from dataclasses import dataclass
 from datetime import datetime, timezone
+from typing import TypeAlias, assert_never
 
+from dayu.contracts.json_value import JsonValue
+from dayu.contracts.tool_call import (
+    ToolCallRequest,
+    ToolExecutionContext,
+    ToolExecutionRequest,
+)
+from dayu.contracts.tool_outcome import (
+    ToolAwaitingOutcome,
+    ToolCompletedOutcome,
+    ToolExecutionOutcome,
+    ToolFailedOutcome,
+)
+from dayu.contracts.tool_result import (
+    ToolResultFailure,
+    ToolResultSuccess,
+)
 from dayu.contracts.tool_schema import ToolSchema
+from dayu.engine.contracts.agent_policy import AgentFallbackMode
 from dayu.engine.contracts.agent_run import (
     AgentRunRequest,
     AgentRunResult,
@@ -30,6 +50,7 @@ from dayu.engine.contracts.engine_events import (
     ContentCompleteData,
     ContentDeltaData,
     EngineEvent,
+    EngineEventData,
     EngineEventType,
     FinalAnswerData,
     IterationStartedData,
@@ -39,8 +60,18 @@ from dayu.engine.contracts.engine_events import (
     RunFailedData,
     RunnerDoneEngineData,
     RunnerUsageData,
+    ToolCallRequestedData,
+    ToolResultAcceptedData,
 )
 from dayu.engine.contracts.finish_reason import FinishReason
+from dayu.engine.contracts.messages import (
+    AgentMessage,
+    AgentMessageRole,
+    AssistantMessage,
+    AssistantToolCall,
+    ToolMessage,
+    UserMessage,
+)
 from dayu.engine.contracts.runner import AsyncRunner
 from dayu.engine.contracts.runner_events import (
     RunnerContentCompletedData,
@@ -56,6 +87,7 @@ from dayu.engine.contracts.runner_events import (
     RunnerUsageRecordedData,
 )
 from dayu.engine.runners.openai.runner import AsyncOpenAIRunner
+from dayu.runtime.cancellation import WaitCancelled, WaitCompleted, await_or_cancel
 
 _LOGGER: logging.Logger = logging.getLogger(__name__)
 
@@ -64,25 +96,42 @@ _FIRST_ITERATION_ORDINAL: int = 1
 _DEFAULT_CANCEL_REASON: str = "cancelled"
 _ERROR_MAX_ITERATIONS_EXCEEDED: str = "max_iterations_exceeded"
 _ERROR_RUNNER_EXCEPTION: str = "runner_exception"
-_ERROR_PROTOCOL_ERROR_ABNORMAL_STOP: str = "protocol_error_abnormal_stop"
 _ERROR_RUNNER_ABNORMAL_STOP: str = "runner_abnormal_stop"
 _ERROR_RUNNER_ERROR_DONE_WITHOUT_DETAIL: str = (
     "runner_error_done_without_detail"
 )
-_ERROR_TOOL_CALL_NOT_SUPPORTED: str = "tool_call_not_supported_in_phase2"
+_ERROR_TOOL_CALL_NOT_ENABLED: str = "tool_call_not_enabled"
 _ERROR_MISSING_TERMINAL: str = "missing_terminal"
-_ERROR_UNEXPECTED_SUSPENDED: str = "unexpected_suspended_in_phase2"
+_ERROR_UNEXPECTED_SUSPENDED: str = "unexpected_suspended_in_phase3"
+_ERROR_RUNNER_TOOL_CALLS_MISSING: str = "runner_tool_calls_missing"
+_ERROR_RUNNER_TOOL_CALLS_FINISH_REASON_MISMATCH: str = (
+    "runner_tool_calls_finish_reason_mismatch"
+)
+_ERROR_TOOL_AWAITING_NOT_SUPPORTED: str = "tool_awaiting_not_supported_in_phase3"
+_ERROR_DUPLICATE_TOOL_CALL_ID: str = "duplicate_tool_call_id"
+_ERROR_TOOL_EXECUTOR_EXCEPTION: str = "tool_executor_exception"
+_ERROR_FORCE_ANSWER_EMPTY: str = "force_answer_empty"
+_ERROR_CONSECUTIVE_FAILED_TOOL_BATCHES: str = (
+    "consecutive_failed_tool_batches"
+)
 _RUNNER_ERROR_WITHOUT_DETAIL_MESSAGE: str = (
     "runner finished with error without detail"
 )
 _RUNNER_ABNORMAL_STOP_MESSAGE: str = "runner stopped without done event"
 _MAX_ITERATIONS_EXCEEDED_MESSAGE: str = (
-    "agent policy max_iterations must be at least 1 in phase2"
+    "agent policy max_iterations must be at least 1"
 )
-_TOOL_CALL_NOT_SUPPORTED_MESSAGE: str = (
-    "tool calling is not supported by phase2 agent run loop"
+_TOOL_CALL_NOT_ENABLED_MESSAGE: str = (
+    "runner produced tool calls while tools were disabled or unavailable"
 )
 _MISSING_TERMINAL_MESSAGE: str = "agent event stream ended without terminal"
+_FORCE_ANSWER_EMPTY_MESSAGE: str = (
+    "force-answer runner did not produce final content"
+)
+
+_PlainJsonValue: TypeAlias = (
+    None | bool | int | float | str | list["_PlainJsonValue"] | dict[str, "_PlainJsonValue"]
+)
 
 
 def _utc_now() -> datetime:
@@ -96,10 +145,10 @@ def _utc_now() -> datetime:
 
 
 def _build_runner(request: AgentRunRequest) -> AsyncRunner:
-    """根据请求构造当前 Phase 2 Runner。
+    """根据请求构造当前内置 Runner。
 
-    Phase 2 只装配 OpenAI-compatible Runner；后续如果需要其它 Runner，
-    必须先新增明确的 runner 选择契约，而不是在本函数塞入开放插件机制。
+    当前只装配 OpenAI-compatible Runner；后续如果需要其它 Runner，必须先
+    新增明确的 runner 选择契约，而不是在本函数塞入开放插件机制。
 
     :param request: Agent run 请求。
     :returns: 新建的 Runner 实例。
@@ -110,6 +159,138 @@ def _build_runner(request: AgentRunRequest) -> AsyncRunner:
         spec=request.runner_spec,
         cancellation_token=request.cancellation_token,
     )
+
+
+def _plain_json_value(value: JsonValue) -> _PlainJsonValue:
+    """把严格 JSON 值转换为 ``json.dumps`` 可直接处理的内建容器。
+
+    :param value: 严格 JSON 值。
+    :returns: 仅由内建 ``dict`` / ``list`` / 标量组成的 JSON 值。
+    :raises Exception: 不主动抛出异常。
+    """
+
+    if isinstance(value, Mapping):
+        return {key: _plain_json_value(item) for key, item in value.items()}
+    if isinstance(value, list):
+        return [_plain_json_value(item) for item in value]
+    return value
+
+
+def _project_tool_success_for_llm(
+    result: ToolResultSuccess,
+) -> dict[str, _PlainJsonValue]:
+    """将成功工具结果投影为 LLM-facing JSON object。
+
+    :param result: 内部成功结果信封。
+    :returns: 可注入 ``ToolMessage.content`` 的 JSON object。
+    :raises Exception: 不主动抛出异常。
+    """
+
+    value = result.value
+    if isinstance(value, Mapping):
+        projected = {
+            key: _plain_json_value(item) for key, item in value.items()
+        }
+    else:
+        projected = {"content": _plain_json_value(value)}
+    return projected
+
+
+def _project_tool_failure_for_llm(
+    result: ToolResultFailure,
+) -> dict[str, _PlainJsonValue]:
+    """将失败工具结果投影为 LLM-facing JSON object。
+
+    :param result: 内部失败结果信封。
+    :returns: 可注入 ``ToolMessage.content`` 的 JSON object。
+    :raises Exception: 不主动抛出异常。
+    """
+
+    projected: dict[str, _PlainJsonValue] = {
+        "error": result.error,
+        "message": result.message,
+    }
+    if result.hint is not None:
+        projected["hint"] = result.hint
+    return projected
+
+
+def _project_tool_outcome_for_llm(
+    outcome: ToolCompletedOutcome | ToolFailedOutcome,
+) -> str:
+    """把工具 outcome 投影为 LLM-facing JSON 字符串。
+
+    :param outcome: completed / failed 工具 outcome。
+    :returns: JSON 字符串；内容始终非空，保证 tool message 配对完整。
+    :raises TypeError: JSON 序列化失败时抛出。
+    """
+
+    if isinstance(outcome, ToolCompletedOutcome):
+        projected = _project_tool_success_for_llm(outcome.result)
+    elif isinstance(outcome, ToolFailedOutcome):
+        projected = _project_tool_failure_for_llm(outcome.result)
+    else:
+        assert_never(outcome)
+    return json.dumps(projected, ensure_ascii=False, sort_keys=True)
+
+
+@dataclass(slots=True)
+class _IterationState:
+    """单次 Runner 调用的消费状态。"""
+
+    content_chunks: list[str]
+    reasoning_chunks: list[str]
+    completed_content: str | None
+    completed_reasoning_content: str | None
+    finish_reason: FinishReason | None
+    failure_candidate: RunFailedData | None
+    done_seen: bool
+    tool_call_signal_seen: bool
+    tool_calls: tuple[ToolCallRequest, ...] | None
+    tool_calls_content: str | None
+    tool_calls_reasoning_content: str | None
+
+
+@dataclass(frozen=True, slots=True)
+class _FinalDecision:
+    """普通最终回答决策。"""
+
+    content: str
+    filtered: bool
+    degraded: bool
+    finish_reason: FinishReason
+
+
+@dataclass(frozen=True, slots=True)
+class _ToolCallsDecision:
+    """进入工具执行阶段的决策。"""
+
+    iteration_id: str
+    iteration_index: int
+    content: str | None
+    reasoning_content: str | None
+    tool_calls: tuple[ToolCallRequest, ...]
+
+
+_IterationDecision: TypeAlias = _FinalDecision | _ToolCallsDecision | RunFailedData
+
+
+@dataclass(frozen=True, slots=True)
+class _ToolOutcomeRecord:
+    """单个工具调用执行后的 accepted outcome 记录。"""
+
+    call: ToolCallRequest
+    outcome: ToolCompletedOutcome | ToolFailedOutcome
+
+
+@dataclass(frozen=True, slots=True)
+class _ToolBatchCompleted:
+    """一批工具调用执行完成。"""
+
+    records: tuple[_ToolOutcomeRecord, ...]
+
+
+_ToolBatchResult: TypeAlias = _ToolBatchCompleted | RunFailedData
 
 
 class _AsyncAgent:
@@ -134,14 +315,10 @@ class _AsyncAgent:
         self._next_sequence: int = 0
         self._terminal_seen: bool = False
         self._closed: bool = False
-        self._content_chunks: list[str] = []
-        self._reasoning_chunks: list[str] = []
-        self._completed_content: str | None = None
-        self._completed_reasoning_content: str | None = None
-        self._last_finish_reason: FinishReason | None = None
-        self._failure_candidate: RunFailedData | None = None
-        self._runner_done_seen: bool = False
-        self._tool_call_seen: bool = False
+        self._last_iteration_state: _IterationState | None = None
+        self._last_tool_batch_result: _ToolBatchResult | None = None
+        self._executed_tool_call_ids: set[str] = set()
+        self._consecutive_failed_tool_batches: int = 0
 
     async def run_messages(self) -> AsyncIterator[EngineEvent]:
         """运行 Agent 并产出 EngineEvent 流。
@@ -156,27 +333,119 @@ class _AsyncAgent:
             if self._is_cancelled():
                 yield await self._make_cancelled_terminal_with_close()
                 return
-
-            async for event in self._run_once():
-                yield event
-                if event.type in {
-                    EngineEventType.FINAL_ANSWER,
-                    EngineEventType.RUN_FAILED,
-                    EngineEventType.RUN_CANCELLED,
-                }:
-                    return
-
-            if not self._terminal_seen:
-                if self._is_cancelled():
-                    yield await self._make_cancelled_terminal_with_close()
-                    return
-                yield self._make_terminal_failed(
+            if self._request.agent_policy.max_iterations < 1:
+                yield await self._make_failed_or_cancelled_terminal_with_close(
                     RunFailedData(
-                        error_code=_ERROR_MISSING_TERMINAL,
-                        message=_MISSING_TERMINAL_MESSAGE,
+                        error_code=_ERROR_MAX_ITERATIONS_EXCEEDED,
+                        message=_MAX_ITERATIONS_EXCEEDED_MESSAGE,
                         recoverable=False,
                     )
                 )
+                return
+
+            messages: list[AgentMessage] = list(self._request.messages)
+            ordinary_iterations = self._request.agent_policy.max_iterations
+
+            for iteration_index in range(ordinary_iterations):
+                iteration_id = self._iteration_id(iteration_index)
+                effective_tools = self._effective_tools()
+                tool_calls_enabled = len(effective_tools) > 0
+
+                async for event in self._run_runner_iteration(
+                    messages=messages,
+                    iteration_id=iteration_id,
+                    iteration_index=iteration_index,
+                    tools=effective_tools,
+                ):
+                    yield event
+                    if self._is_terminal(event):
+                        return
+
+                state = self._last_iteration_state
+                if state is None:
+                    yield await self._make_failed_or_cancelled_terminal_with_close(
+                        RunFailedData(
+                            error_code=_ERROR_MISSING_TERMINAL,
+                            message=_MISSING_TERMINAL_MESSAGE,
+                            recoverable=False,
+                        )
+                    )
+                    return
+                if self._is_cancelled():
+                    yield await self._make_cancelled_terminal_with_close()
+                    return
+
+                decision = self._classify_iteration(
+                    state=state,
+                    iteration_id=iteration_id,
+                    iteration_index=iteration_index,
+                    tool_calls_enabled=tool_calls_enabled,
+                    degraded=False,
+                )
+                if isinstance(decision, _FinalDecision):
+                    yield await self._make_final_or_cancelled_after_close(decision)
+                    return
+                if isinstance(decision, RunFailedData):
+                    yield await self._make_failed_or_cancelled_terminal_with_close(
+                        decision
+                    )
+                    return
+
+                async for event in self._execute_tool_batch(decision):
+                    yield event
+                    if self._is_terminal(event):
+                        return
+
+                batch_result = self._last_tool_batch_result
+                if batch_result is None:
+                    yield await self._make_failed_or_cancelled_terminal_with_close(
+                        RunFailedData(
+                            error_code=_ERROR_MISSING_TERMINAL,
+                            message="tool batch ended without result",
+                            recoverable=False,
+                        )
+                    )
+                    return
+                if isinstance(batch_result, RunFailedData):
+                    yield await self._make_failed_or_cancelled_terminal_with_close(
+                        batch_result
+                    )
+                    return
+
+                self._inject_tool_messages(
+                    messages=messages,
+                    decision=decision,
+                    records=batch_result.records,
+                )
+
+                if self._is_cancelled():
+                    yield await self._make_cancelled_terminal_with_close()
+                    return
+
+                if self._all_records_failed(batch_result.records):
+                    self._consecutive_failed_tool_batches += 1
+                else:
+                    self._consecutive_failed_tool_batches = 0
+
+                if self._consecutive_failed_tool_batches >= (
+                    self._request.agent_policy.max_consecutive_failed_tool_batches
+                ):
+                    async for event in self._fallback_after_tools(
+                        messages=messages,
+                        next_iteration_index=iteration_index + 1,
+                        error_code=_ERROR_CONSECUTIVE_FAILED_TOOL_BATCHES,
+                    ):
+                        yield event
+                    return
+
+                if iteration_index + 1 >= ordinary_iterations:
+                    async for event in self._fallback_after_tools(
+                        messages=messages,
+                        next_iteration_index=iteration_index + 1,
+                        error_code=_ERROR_MAX_ITERATIONS_EXCEEDED,
+                    ):
+                        yield event
+                    return
         finally:
             await self._close_runner_once()
             self._release_run_slot()
@@ -208,33 +477,46 @@ class _AsyncAgent:
             if self._active_run_id == self._request.run_id:
                 self._active_run_id = None
 
-    async def _run_once(self) -> AsyncIterator[EngineEvent]:
-        """执行 Phase 2 单轮无工具主链路。
+    async def _run_runner_iteration(
+        self,
+        *,
+        messages: Sequence[AgentMessage],
+        iteration_id: str,
+        iteration_index: int,
+        tools: Sequence[ToolSchema],
+    ) -> AsyncIterator[EngineEvent]:
+        """执行一次 Runner 调用并流式提升 RunnerEvent。
 
+        :param messages: 本轮 Runner 输入消息。
+        :param iteration_id: 当前迭代 id。
+        :param iteration_index: 当前迭代序号。
+        :param tools: 本轮暴露给 Runner 的工具 schema。
         :returns: EngineEvent 异步流。
         :raises asyncio.CancelledError: 外层 task 被取消时透传。
         """
 
-        iteration_id = self._iteration_id()
+        self._last_iteration_state = _IterationState(
+            content_chunks=[],
+            reasoning_chunks=[],
+            completed_content=None,
+            completed_reasoning_content=None,
+            finish_reason=None,
+            failure_candidate=None,
+            done_seen=False,
+            tool_call_signal_seen=False,
+            tool_calls=None,
+            tool_calls_content=None,
+            tool_calls_reasoning_content=None,
+        )
         yield self._make_event(
             event_type=EngineEventType.ITERATION_STARTED,
             data=IterationStartedData(
                 iteration_id=iteration_id,
-                iteration_index=_FIRST_ITERATION_INDEX,
-                message_count=len(self._request.messages),
+                iteration_index=iteration_index,
+                message_count=len(messages),
             ),
             occurred_at=_utc_now(),
         )
-
-        if self._request.agent_policy.max_iterations < 1:
-            yield await self._make_failed_or_cancelled_terminal_with_close(
-                RunFailedData(
-                    error_code=_ERROR_MAX_ITERATIONS_EXCEEDED,
-                    message=_MAX_ITERATIONS_EXCEEDED_MESSAGE,
-                    recoverable=False,
-                )
-            )
-            return
 
         if self._is_cancelled():
             yield await self._make_cancelled_terminal_with_close()
@@ -242,9 +524,9 @@ class _AsyncAgent:
 
         try:
             async for runner_event in self._runner.call(
-                self._request.messages,
+                messages,
                 self._request.runner_options,
-                self._effective_tools(),
+                tools,
             ):
                 engine_event = self._consume_runner_event(
                     runner_event=runner_event,
@@ -252,41 +534,14 @@ class _AsyncAgent:
                 )
                 if engine_event is not None:
                     yield engine_event
-
-                terminal = await self._terminal_after_runner_event(
-                    runner_event=runner_event,
-                    iteration_id=iteration_id,
-                )
-                if terminal is not None:
-                    yield terminal
-                    return
         except asyncio.CancelledError:
             raise
         except Exception as exc:
-            yield await self._make_failed_or_cancelled_terminal_with_close(
-                RunFailedData(
-                    error_code=_ERROR_RUNNER_EXCEPTION,
-                    message=type(exc).__name__,
-                    recoverable=False,
-                )
-            )
-            return
-
-        if self._is_cancelled():
-            yield await self._make_cancelled_terminal_with_close()
-            return
-        if self._failure_candidate is not None:
-            yield await self._make_failed_or_cancelled_terminal_with_close(
-                self._failure_candidate
-            )
-            return
-        yield await self._make_failed_or_cancelled_terminal_with_close(
-            RunFailedData(
-                error_code=_ERROR_RUNNER_ABNORMAL_STOP,
-                message=_RUNNER_ABNORMAL_STOP_MESSAGE,
+            self._last_iteration_state.failure_candidate = RunFailedData(
+                error_code=_ERROR_RUNNER_EXCEPTION,
+                message=type(exc).__name__,
                 recoverable=False,
             )
-        )
 
     def _consume_runner_event(
         self, *, runner_event: RunnerEvent, iteration_id: str
@@ -295,14 +550,18 @@ class _AsyncAgent:
 
         :param runner_event: Runner 产出的事件。
         :param iteration_id: 当前迭代 id。
-        :returns: 需要向 Host 暴露的 EngineEvent；HTTP error 仅记录失败
-            候选，返回 ``None``。
-        :raises Exception: 不主动抛出异常。
+        :returns: 需要向 Host 暴露的 EngineEvent；HTTP error 与 tool call
+            delta 仅记录状态，返回 ``None``。
+        :raises RuntimeError: 内部迭代状态缺失时抛出。
         """
+
+        state = self._last_iteration_state
+        if state is None:
+            raise RuntimeError("iteration state is not initialized")
 
         data = runner_event.data
         if isinstance(data, RunnerContentDeltaData):
-            self._content_chunks.append(data.delta)
+            state.content_chunks.append(data.delta)
             return self._make_event(
                 event_type=EngineEventType.RUNNER_CONTENT_DELTA,
                 data=ContentDeltaData(
@@ -311,7 +570,7 @@ class _AsyncAgent:
                 occurred_at=runner_event.occurred_at,
             )
         if isinstance(data, RunnerReasoningDeltaData):
-            self._reasoning_chunks.append(data.delta)
+            state.reasoning_chunks.append(data.delta)
             return self._make_event(
                 event_type=EngineEventType.RUNNER_REASONING_DELTA,
                 data=ReasoningDeltaData(
@@ -320,9 +579,9 @@ class _AsyncAgent:
                 occurred_at=runner_event.occurred_at,
             )
         if isinstance(data, RunnerContentCompletedData):
-            self._completed_content = data.content
-            self._completed_reasoning_content = data.reasoning_content
-            self._last_finish_reason = data.finish_reason
+            state.completed_content = data.content
+            state.completed_reasoning_content = data.reasoning_content
+            state.finish_reason = data.finish_reason
             return self._make_event(
                 event_type=EngineEventType.RUNNER_CONTENT_COMPLETED,
                 data=ContentCompleteData(
@@ -345,7 +604,7 @@ class _AsyncAgent:
                 occurred_at=runner_event.occurred_at,
             )
         if isinstance(data, RunnerProtocolErrorData):
-            self._failure_candidate = RunFailedData(
+            state.failure_candidate = RunFailedData(
                 error_code=data.error_code,
                 message=data.message,
                 recoverable=False,
@@ -362,15 +621,15 @@ class _AsyncAgent:
                 occurred_at=runner_event.occurred_at,
             )
         if isinstance(data, RunnerHTTPErrorData):
-            self._failure_candidate = RunFailedData(
+            state.failure_candidate = RunFailedData(
                 error_code=data.error_code.value,
                 message=data.message,
                 recoverable=False,
             )
             return None
         if isinstance(data, RunnerDoneData):
-            self._runner_done_seen = True
-            self._last_finish_reason = data.finish_reason
+            state.done_seen = True
+            state.finish_reason = data.finish_reason
             return self._make_event(
                 event_type=EngineEventType.RUNNER_DONE,
                 data=RunnerDoneEngineData(
@@ -380,82 +639,415 @@ class _AsyncAgent:
                 occurred_at=runner_event.occurred_at,
             )
         if isinstance(data, RunnerToolCallDeltaData):
-            self._tool_call_seen = True
-            self._failure_candidate = self._tool_call_failure()
+            state.tool_call_signal_seen = True
             return None
         if isinstance(data, RunnerToolCallsCompletedData):
-            self._tool_call_seen = True
-            self._failure_candidate = self._tool_call_failure()
+            state.tool_call_signal_seen = True
+            state.tool_calls = data.tool_calls
+            state.tool_calls_content = data.content
+            state.tool_calls_reasoning_content = data.reasoning_content
             return None
-        self._failure_candidate = RunFailedData(
+        state.failure_candidate = RunFailedData(
             error_code=_ERROR_RUNNER_EXCEPTION,
-            message=(
-                "runner event data did not match phase2 supported union"
-            ),
+            message="runner event data did not match supported union",
             recoverable=False,
         )
         return None
 
-    async def _terminal_after_runner_event(
-        self, *, runner_event: RunnerEvent, iteration_id: str
-    ) -> EngineEvent | None:
-        """判断当前 RunnerEvent 后是否应收口终态。
+    def _classify_iteration(
+        self,
+        *,
+        state: _IterationState,
+        iteration_id: str,
+        iteration_index: int,
+        tool_calls_enabled: bool,
+        degraded: bool,
+    ) -> _IterationDecision:
+        """根据 Runner 消费状态分类下一步动作。
 
-        :param runner_event: 刚消费的 RunnerEvent。
+        :param state: 本轮 Runner 消费状态。
         :param iteration_id: 当前迭代 id。
-        :returns: 需要立即产出的 terminal；无需终态时返回 ``None``。
+        :param iteration_index: 当前迭代序号。
+        :param tool_calls_enabled: 本轮是否允许工具调用。
+        :param degraded: 产出 final answer 时是否标记为降级。
+        :returns: final / tool calls / failed 三类决策之一。
         :raises Exception: 不主动抛出异常。
         """
 
-        if self._tool_call_seen:
-            return await self._make_failed_or_cancelled_terminal_with_close(
-                self._tool_call_failure()
+        if not state.done_seen:
+            if state.failure_candidate is not None:
+                return state.failure_candidate
+            return RunFailedData(
+                error_code=_ERROR_RUNNER_ABNORMAL_STOP,
+                message=_RUNNER_ABNORMAL_STOP_MESSAGE,
+                recoverable=False,
             )
-        if runner_event.type != RunnerEventType.RUNNER_DONE:
-            return None
 
-        if self._is_cancelled():
-            return await self._make_cancelled_terminal_with_close()
-
-        finish_reason = self._last_finish_reason
+        finish_reason = state.finish_reason or FinishReason.STOP
         if finish_reason is FinishReason.ERROR:
-            return await self._make_failed_or_cancelled_terminal_with_close(
-                self._failure_candidate
-                or RunFailedData(
-                    error_code=_ERROR_RUNNER_ERROR_DONE_WITHOUT_DETAIL,
-                    message=_RUNNER_ERROR_WITHOUT_DETAIL_MESSAGE,
+            return state.failure_candidate or RunFailedData(
+                error_code=_ERROR_RUNNER_ERROR_DONE_WITHOUT_DETAIL,
+                message=_RUNNER_ERROR_WITHOUT_DETAIL_MESSAGE,
+                recoverable=False,
+            )
+
+        if state.tool_calls is not None:
+            if finish_reason is not FinishReason.TOOL_CALLS:
+                return RunFailedData(
+                    error_code=_ERROR_RUNNER_TOOL_CALLS_FINISH_REASON_MISMATCH,
+                    message="runner completed tool calls with non-tool finish reason",
+                    recoverable=False,
+                )
+            if not tool_calls_enabled:
+                return RunFailedData(
+                    error_code=_ERROR_TOOL_CALL_NOT_ENABLED,
+                    message=_TOOL_CALL_NOT_ENABLED_MESSAGE,
+                    recoverable=False,
+                )
+            if len(state.tool_calls) == 0:
+                return RunFailedData(
+                    error_code=_ERROR_RUNNER_TOOL_CALLS_MISSING,
+                    message="runner done with empty tool calls",
+                    recoverable=False,
+                )
+            content = state.tool_calls_content
+            if content is None:
+                content = state.completed_content
+            if content is None and state.content_chunks:
+                content = "".join(state.content_chunks)
+            if content == "":
+                content = None
+            reasoning = state.tool_calls_reasoning_content
+            if reasoning is None:
+                reasoning = state.completed_reasoning_content
+            if reasoning is None and state.reasoning_chunks:
+                reasoning = "".join(state.reasoning_chunks)
+            return _ToolCallsDecision(
+                iteration_id=iteration_id,
+                iteration_index=iteration_index,
+                content=content,
+                reasoning_content=reasoning,
+                tool_calls=tuple(
+                    sorted(
+                        state.tool_calls,
+                        key=lambda call: call.index_in_iteration,
+                    )
+                ),
+            )
+
+        if finish_reason is FinishReason.TOOL_CALLS or state.tool_call_signal_seen:
+            return RunFailedData(
+                error_code=_ERROR_RUNNER_TOOL_CALLS_MISSING,
+                message="runner requested tool calls without completed tool call data",
+                recoverable=False,
+            )
+
+        content = state.completed_content
+        if content is None:
+            content = "".join(state.content_chunks)
+        filtered = finish_reason is FinishReason.CONTENT_FILTER
+        return _FinalDecision(
+            content=content,
+            filtered=filtered,
+            degraded=degraded or filtered,
+            finish_reason=finish_reason,
+        )
+
+    async def _execute_tool_batch(
+        self, decision: _ToolCallsDecision
+    ) -> AsyncIterator[EngineEvent]:
+        """串行执行一批工具调用并产出工具事件。
+
+        :param decision: 工具调用决策。
+        :returns: EngineEvent 异步流。
+        :raises asyncio.CancelledError: 外层 task 被取消时透传。
+        """
+
+        self._last_tool_batch_result = None
+        records: list[_ToolOutcomeRecord] = []
+        for call in decision.tool_calls:
+            if self._is_cancelled():
+                yield await self._make_cancelled_terminal_with_close()
+                return
+            if call.tool_call_id in self._executed_tool_call_ids:
+                self._last_tool_batch_result = RunFailedData(
+                    error_code=_ERROR_DUPLICATE_TOOL_CALL_ID,
+                    message="duplicate tool_call_id in run",
+                    recoverable=False,
+                )
+                return
+
+            yield self._make_event(
+                event_type=EngineEventType.TOOL_CALL_REQUESTED,
+                data=ToolCallRequestedData(
+                    iteration_id=decision.iteration_id,
+                    tool_call_id=call.tool_call_id,
+                    name=call.name,
+                    arguments=call.arguments,
+                    index_in_iteration=call.index_in_iteration,
+                    provider_state=call.provider_state,
+                ),
+                occurred_at=_utc_now(),
+            )
+
+            self._executed_tool_call_ids.add(call.tool_call_id)
+            tool_request = ToolExecutionRequest(
+                call=call,
+                context=ToolExecutionContext(
+                    run_id=self._request.run_id,
+                    session_id=self._request.session_id,
+                    iteration_id=decision.iteration_id,
+                    tool_call_id=call.tool_call_id,
+                    index_in_iteration=call.index_in_iteration,
+                    timeout_seconds=None,
+                    cancellation_token=self._request.cancellation_token,
+                    correlation_id=self._correlation_id(
+                        iteration_id=decision.iteration_id,
+                        tool_call_id=call.tool_call_id,
+                    ),
+                ),
+            )
+
+            outcome = await self._execute_one_tool(tool_request)
+            if isinstance(outcome, WaitCancelled):
+                yield await self._make_cancelled_terminal_with_close()
+                return
+            completed_outcome = outcome.value
+
+            if self._is_cancelled():
+                yield await self._make_cancelled_terminal_with_close()
+                return
+            if isinstance(completed_outcome, ToolAwaitingOutcome):
+                self._last_tool_batch_result = RunFailedData(
+                    error_code=_ERROR_TOOL_AWAITING_NOT_SUPPORTED,
+                    message="ToolAwaitingOutcome is not supported in phase3",
+                    recoverable=False,
+                )
+                return
+            if isinstance(completed_outcome, ToolCompletedOutcome) or isinstance(
+                completed_outcome, ToolFailedOutcome
+            ):
+                yield self._make_event(
+                    event_type=EngineEventType.TOOL_RESULT_ACCEPTED,
+                    data=ToolResultAcceptedData(
+                        iteration_id=decision.iteration_id,
+                        tool_call_id=call.tool_call_id,
+                        name=call.name,
+                        index_in_iteration=call.index_in_iteration,
+                        outcome=completed_outcome,
+                    ),
+                    occurred_at=_utc_now(),
+                )
+                records.append(
+                    _ToolOutcomeRecord(call=call, outcome=completed_outcome)
+                )
+            else:
+                assert_never(completed_outcome)
+        self._last_tool_batch_result = _ToolBatchCompleted(records=tuple(records))
+
+    async def _execute_one_tool(
+        self, tool_request: ToolExecutionRequest
+    ) -> WaitCompleted[ToolExecutionOutcome] | WaitCancelled:
+        """执行单个工具调用并处理取消与普通异常。
+
+        :param tool_request: 工具执行请求。
+        :returns: ``WaitCompleted`` 包裹的 outcome，或 ``WaitCancelled``。
+        :raises asyncio.CancelledError: 外层 task 被取消时透传。
+        """
+
+        try:
+            return await await_or_cancel(
+                self._request.tool_executor.execute(tool_request),
+                token=self._request.cancellation_token,
+            )
+        except asyncio.CancelledError:
+            raise
+        except Exception as exc:
+            return WaitCompleted(
+                value=ToolFailedOutcome(
+                    result=ToolResultFailure(
+                        ok=False,
+                        error=_ERROR_TOOL_EXECUTOR_EXCEPTION,
+                        message=type(exc).__name__,
+                        hint=None,
+                        meta=None,
+                    )
+                )
+            )
+
+    def _inject_tool_messages(
+        self,
+        *,
+        messages: list[AgentMessage],
+        decision: _ToolCallsDecision,
+        records: tuple[_ToolOutcomeRecord, ...],
+    ) -> None:
+        """向下一轮 Runner 输入注入 assistant tool_calls 与 tool messages。
+
+        :param messages: 可追加的 run-local 消息列表。
+        :param decision: 工具调用决策。
+        :param records: 已接受的工具 outcome 记录。
+        :returns: 无返回值。
+        :raises TypeError: 工具结果 JSON 投影失败时抛出。
+        """
+
+        messages.append(
+            AssistantMessage(
+                role=AgentMessageRole.ASSISTANT,
+                content=decision.content,
+                reasoning_content=decision.reasoning_content,
+                tool_calls=tuple(
+                    AssistantToolCall(
+                        id=record.call.tool_call_id,
+                        name=record.call.name,
+                        arguments=record.call.arguments,
+                        provider_state=record.call.provider_state,
+                    )
+                    for record in records
+                ),
+            )
+        )
+        for record in records:
+            messages.append(
+                ToolMessage(
+                    role=AgentMessageRole.TOOL,
+                    tool_call_id=record.call.tool_call_id,
+                    content=_project_tool_outcome_for_llm(record.outcome),
+                )
+            )
+
+    async def _fallback_after_tools(
+        self,
+        *,
+        messages: list[AgentMessage],
+        next_iteration_index: int,
+        error_code: str,
+    ) -> AsyncIterator[EngineEvent]:
+        """工具批次后按策略执行 force-answer 或 raise-error。
+
+        :param messages: 可追加的 run-local 消息列表。
+        :param next_iteration_index: fallback Runner 使用的迭代序号。
+        :param error_code: ``RAISE_ERROR`` 模式下使用的错误码。
+        :returns: EngineEvent 异步流。
+        :raises asyncio.CancelledError: 外层 task 被取消时透传。
+        """
+
+        mode = self._request.agent_policy.fallback_mode
+        if mode is AgentFallbackMode.RAISE_ERROR:
+            yield await self._make_failed_or_cancelled_terminal_with_close(
+                RunFailedData(
+                    error_code=error_code,
+                    message=error_code,
                     recoverable=False,
                 )
             )
-        if finish_reason is FinishReason.TOOL_CALLS:
-            return await self._make_failed_or_cancelled_terminal_with_close(
-                self._tool_call_failure()
+            return
+        if mode is AgentFallbackMode.FORCE_ANSWER:
+            messages.append(
+                UserMessage(
+                    role=AgentMessageRole.USER,
+                    content=self._request.agent_policy.fallback_prompt,
+                )
             )
-        return await self._make_final_or_cancelled_after_close(
-            iteration_id=iteration_id
+            async for event in self._run_force_answer(
+                messages=messages,
+                iteration_index=next_iteration_index,
+            ):
+                yield event
+            return
+        assert_never(mode)
+
+    async def _run_force_answer(
+        self,
+        *,
+        messages: Sequence[AgentMessage],
+        iteration_index: int,
+    ) -> AsyncIterator[EngineEvent]:
+        """禁用工具执行一次 force-answer Runner 调用。
+
+        :param messages: 已追加 fallback prompt 的消息序列。
+        :param iteration_index: fallback 迭代序号。
+        :returns: EngineEvent 异步流。
+        :raises asyncio.CancelledError: 外层 task 被取消时透传。
+        """
+
+        if self._is_cancelled():
+            yield await self._make_cancelled_terminal_with_close()
+            return
+        iteration_id = self._iteration_id(iteration_index)
+        async for event in self._run_runner_iteration(
+            messages=messages,
+            iteration_id=iteration_id,
+            iteration_index=iteration_index,
+            tools=(),
+        ):
+            yield event
+            if self._is_terminal(event):
+                return
+
+        state = self._last_iteration_state
+        if state is None:
+            yield await self._make_failed_or_cancelled_terminal_with_close(
+                RunFailedData(
+                    error_code=_ERROR_MISSING_TERMINAL,
+                    message=_MISSING_TERMINAL_MESSAGE,
+                    recoverable=False,
+                )
+            )
+            return
+        if self._is_cancelled():
+            yield await self._make_cancelled_terminal_with_close()
+            return
+        decision = self._classify_iteration(
+            state=state,
+            iteration_id=iteration_id,
+            iteration_index=iteration_index,
+            tool_calls_enabled=False,
+            degraded=True,
         )
+        if isinstance(decision, _ToolCallsDecision):
+            yield await self._make_failed_or_cancelled_terminal_with_close(
+                RunFailedData(
+                    error_code=_ERROR_TOOL_CALL_NOT_ENABLED,
+                    message=_TOOL_CALL_NOT_ENABLED_MESSAGE,
+                    recoverable=False,
+                )
+            )
+            return
+        if isinstance(decision, RunFailedData):
+            yield await self._make_failed_or_cancelled_terminal_with_close(
+                decision
+            )
+            return
+        if decision.content == "":
+            yield await self._make_failed_or_cancelled_terminal_with_close(
+                RunFailedData(
+                    error_code=_ERROR_FORCE_ANSWER_EMPTY,
+                    message=_FORCE_ANSWER_EMPTY_MESSAGE,
+                    recoverable=False,
+                )
+            )
+            return
+        yield await self._make_final_or_cancelled_after_close(decision)
 
     async def _make_final_or_cancelled_after_close(
-        self, *, iteration_id: str
+        self, decision: _FinalDecision
     ) -> EngineEvent:
         """构造最终回答或取消终态。
 
-        :param iteration_id: 当前迭代 id。
+        :param decision: final answer 决策。
         :returns: terminal EngineEvent。
         :raises Exception: 不主动抛出异常。
         """
 
         if self._is_cancelled():
             return await self._make_cancelled_terminal_with_close()
-        finish_reason = self._last_finish_reason or FinishReason.STOP
-        content = self._completed_content
-        if content is None:
-            content = "".join(self._content_chunks)
         return self._make_terminal_final(
             FinalAnswerData(
-                content=content,
-                filtered=finish_reason is FinishReason.CONTENT_FILTER,
-                finish_reason=finish_reason,
+                content=decision.content,
+                filtered=decision.filtered,
+                degraded=decision.degraded,
+                finish_reason=decision.finish_reason,
             )
         )
 
@@ -564,18 +1156,7 @@ class _AsyncAgent:
         self,
         *,
         event_type: EngineEventType,
-        data: (
-            IterationStartedData
-            | ContentDeltaData
-            | ReasoningDeltaData
-            | ContentCompleteData
-            | RunnerUsageData
-            | ProviderProtocolErrorData
-            | RunnerDoneEngineData
-            | FinalAnswerData
-            | RunFailedData
-            | RunCancelledData
-        ),
+        data: EngineEventData,
         occurred_at: datetime,
     ) -> EngineEvent:
         """构造普通 EngineEvent 并推进 sequence。
@@ -600,39 +1181,69 @@ class _AsyncAgent:
             metadata=None,
         )
 
-    def _iteration_id(self) -> str:
-        """返回 Phase 2 第一轮 iteration id。
+    def _iteration_id(self, iteration_index: int) -> str:
+        """返回指定迭代的 iteration id。
 
-        :returns: 当前 run 的第一轮 iteration id。
+        :param iteration_index: 从 0 起的迭代序号。
+        :returns: 当前 run 内稳定 iteration id。
         :raises Exception: 不主动抛出异常。
         """
 
-        return f"{self._request.run_id}_iteration_{_FIRST_ITERATION_ORDINAL}"
+        return (
+            f"{self._request.run_id}_iteration_"
+            f"{iteration_index + _FIRST_ITERATION_ORDINAL}"
+        )
+
+    def _correlation_id(self, *, iteration_id: str, tool_call_id: str) -> str:
+        """构造工具执行中性关联 id。
+
+        :param iteration_id: 当前迭代 id。
+        :param tool_call_id: 工具调用 id。
+        :returns: 中性 correlation id。
+        :raises Exception: 不主动抛出异常。
+        """
+
+        return f"{self._request.run_id}:{iteration_id}:{tool_call_id}"
 
     def _effective_tools(self) -> Sequence[ToolSchema]:
-        """返回 Phase 2 暴露给 Runner 的工具 schema。
+        """返回本轮暴露给 Runner 的工具 schema。
 
-        Phase 2 无工具主链路始终返回空元组，不把 request.tool_schemas
-        暴露给模型。
-
-        :returns: 空工具 schema 序列。
+        :returns: 启用工具时返回 request 中的 schema 快照，否则返回空元组。
         :raises Exception: 不主动抛出异常。
         """
 
-        return ()
+        if self._request.disable_tools:
+            return ()
+        if not self._request.agent_policy.allow_tool_calls:
+            return ()
+        if not self._runner.is_supports_tool_calling():
+            return ()
+        return self._request.tool_schemas
 
-    def _tool_call_failure(self) -> RunFailedData:
-        """构造 Phase 2 工具调用 fail-closed 失败 data。
+    def _all_records_failed(self, records: tuple[_ToolOutcomeRecord, ...]) -> bool:
+        """判断工具批次是否全失败。
 
-        :returns: ``tool_call_not_supported_in_phase2`` 失败 data。
+        :param records: 本批工具 outcome 记录。
+        :returns: 全部为 failed outcome 时返回 ``True``。
         :raises Exception: 不主动抛出异常。
         """
 
-        return RunFailedData(
-            error_code=_ERROR_TOOL_CALL_NOT_SUPPORTED,
-            message=_TOOL_CALL_NOT_SUPPORTED_MESSAGE,
-            recoverable=False,
-        )
+        return all(isinstance(record.outcome, ToolFailedOutcome) for record in records)
+
+    def _is_terminal(self, event: EngineEvent) -> bool:
+        """判断事件是否为 terminal。
+
+        :param event: EngineEvent。
+        :returns: terminal 返回 ``True``。
+        :raises Exception: 不主动抛出异常。
+        """
+
+        return event.type in {
+            EngineEventType.FINAL_ANSWER,
+            EngineEventType.RUN_FAILED,
+            EngineEventType.RUN_CANCELLED,
+            EngineEventType.RUN_SUSPENDED,
+        }
 
     def _is_cancelled(self) -> bool:
         """返回 Host cancellation token 是否已取消。
@@ -720,6 +1331,7 @@ async def run_agent_and_wait(request: AgentRunRequest) -> AgentRunResult:
             run_id=terminal.run_id,
             content=data.content,
             filtered=data.filtered,
+            degraded=data.degraded,
             finish_reason=data.finish_reason,
         )
     if terminal.type is EngineEventType.RUN_FAILED and isinstance(
@@ -747,7 +1359,7 @@ async def run_agent_and_wait(request: AgentRunRequest) -> AgentRunResult:
         session_id=request.session_id,
         run_id=request.run_id,
         error_code=_ERROR_UNEXPECTED_SUSPENDED,
-        message="run_suspended is not supported by phase2 agent run loop",
+        message="run_suspended is not supported by phase3 agent run loop",
         recoverable=False,
     )
 

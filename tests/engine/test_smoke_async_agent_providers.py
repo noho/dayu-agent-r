@@ -76,6 +76,7 @@ def test_build_request_uses_env_key_without_printing_it() -> None:
         data=FinalAnswerData(
             content="ANSWER_SENTINEL",
             filtered=False,
+            degraded=False,
             finish_reason=FinishReason.STOP,
         ),
         metadata=None,

@@ -65,7 +65,9 @@ class AgentRunRequest:
     :param runner_options: Runner 调用参数。
     :param agent_policy: Agent 策略。
     :param tool_schemas: 暴露给 LLM 的工具 schema 元组。
-    :param tool_executor: 工具执行器（由 Host 注入）。
+    :param tool_executor: 工具执行器，由 Host 通过 EngineWorker capability
+        提供；EngineWorker 替 Host 在选定执行环境中代持并提供该 protocol
+        handle。
     :param cancellation_token: 取消观察 token（由 Host 注入）。
     """
 
@@ -90,6 +92,7 @@ class EngineRunOutcomeFinalAnswer:
     :param run_id: 运行 id。
     :param content: 最终回答。
     :param filtered: 是否经过过滤器处理。
+    :param degraded: 是否为降级回答。
     :param finish_reason: 完成原因。
     """
 
@@ -97,6 +100,7 @@ class EngineRunOutcomeFinalAnswer:
     run_id: str
     content: str
     filtered: bool
+    degraded: bool
     finish_reason: FinishReason
 
 

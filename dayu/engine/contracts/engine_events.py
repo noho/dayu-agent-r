@@ -20,6 +20,7 @@ from dayu.engine.contracts.agent_run import ContextBudgetSnapshot, RunResumeHint
 from dayu.engine.contracts.finish_reason import FinishReason
 from dayu.contracts.json_value import JsonValue
 from dayu.contracts.tool_await import ToolAwaitSpec
+from dayu.contracts.tool_call import ToolCallProviderState
 from dayu.contracts.tool_outcome import (
     ToolCompletedOutcome,
     ToolFailedOutcome,
@@ -109,6 +110,7 @@ class ToolCallRequestedData:
     :param name: 工具名称。
     :param arguments: 工具参数。
     :param index_in_iteration: 工具调用在迭代内的序号。
+    :param provider_state: provider 私有续航状态。
     """
 
     iteration_id: str
@@ -116,6 +118,7 @@ class ToolCallRequestedData:
     name: str
     arguments: Mapping[str, JsonValue]
     index_in_iteration: int
+    provider_state: ToolCallProviderState | None
 
 
 @dataclass(frozen=True, slots=True)
@@ -125,6 +128,7 @@ class ToolResultAcceptedData:
     :param iteration_id: 当前迭代 id。
     :param tool_call_id: 工具调用 id。
     :param name: 工具名称。
+    :param index_in_iteration: 工具调用在迭代内的序号。
     :param outcome: 终态 outcome（仅 completed / failed；awaiting 走
         :class:`ToolAwaitingData`）。
     """
@@ -132,6 +136,7 @@ class ToolResultAcceptedData:
     iteration_id: str
     tool_call_id: str
     name: str
+    index_in_iteration: int
     outcome: ToolCompletedOutcome | ToolFailedOutcome
 
 
@@ -219,11 +224,13 @@ class FinalAnswerData:
 
     :param content: 最终回答正文。
     :param filtered: 是否经过过滤器处理。
+    :param degraded: 是否为降级回答。
     :param finish_reason: 完成原因。
     """
 
     content: str
     filtered: bool
+    degraded: bool
     finish_reason: FinishReason
 
 

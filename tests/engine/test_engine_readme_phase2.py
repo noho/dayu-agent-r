@@ -1,4 +1,4 @@
-"""Engine README Phase 2 当前事实测试。"""
+"""Engine README 当前事实测试。"""
 
 from __future__ import annotations
 
@@ -15,8 +15,8 @@ def _readme_text() -> str:
     return Path("dayu/engine/README.md").read_text(encoding="utf-8")
 
 
-def test_engine_readme_covers_phase2_facts() -> None:
-    """Engine README 必须覆盖 Phase 2 已落地事实。"""
+def test_engine_readme_covers_current_facts() -> None:
+    """Engine README 必须覆盖当前已落地事实。"""
 
     text = _readme_text()
     required_fragments = (
@@ -33,18 +33,22 @@ def test_engine_readme_covers_phase2_facts() -> None:
         "Runner close",
         "OpenAI-compatible Runner",
         "SSE idle",
+        "ToolExecutor.execute",
+        "tool_call_requested",
+        "tool_result_accepted",
+        "AgentFallbackMode.FORCE_ANSWER",
+        "final_answer(degraded=True)",
     )
 
     for fragment in required_fragments:
         assert fragment in text
 
 
-def test_engine_readme_does_not_claim_phase3_plus_as_available() -> None:
-    """Engine README 不得把 Phase 3+ 能力写成当前可用能力。"""
+def test_engine_readme_does_not_claim_future_capabilities_as_available() -> None:
+    """Engine README 不得把未来能力写成当前可用能力。"""
 
     text = _readme_text()
     forbidden_available_claims = (
-        "当前支持 ToolExecutor tool calling 闭环",
         "当前支持 awaiting",
         "当前支持 Host ToolRegistry",
         "当前支持 trace store",
