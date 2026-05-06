@@ -7,6 +7,7 @@
 from __future__ import annotations
 
 import logging
+import re
 from collections.abc import Iterator
 
 import pytest
@@ -245,7 +246,7 @@ def test_set_level_from_flags_invalid_log_level_raises() -> None:
 def test_logger_emits_to_stdout(
     capsys: pytest.CaptureFixture[str],
 ) -> None:
-    """configure 后 dayu.* logger 应通过 marker handler 写到 stdout。"""
+    """configure 后 dayu.* logger 应按 OLD 统一 prefix 写到 stdout。"""
 
     configure(level=LogLevel.INFO)
     logging.getLogger("dayu.test.subsystem").info("hello-runtime-log")
@@ -253,6 +254,11 @@ def test_logger_emits_to_stdout(
     captured = capsys.readouterr()
     assert "hello-runtime-log" in captured.out
     assert "dayu.test.subsystem" in captured.out
+    assert re.search(
+        r"^\[\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2}\] "
+        r"\[INFO\] \[dayu\.test\.subsystem\] hello-runtime-log$",
+        captured.out.strip(),
+    )
 
 
 def test_configure_disables_propagate_so_caplog_default_misses(

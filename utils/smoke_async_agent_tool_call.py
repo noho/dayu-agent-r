@@ -11,8 +11,11 @@ from __future__ import annotations
 
 import argparse
 import asyncio
+import json
+import logging
 import os
 import sys
+import time
 from collections.abc import Mapping, Sequence
 from dataclasses import dataclass, field
 from datetime import datetime
@@ -50,6 +53,7 @@ from dayu.engine import (
 )
 from dayu.runtime.log import LogLevel, configure
 
+_LOGGER: logging.Logger = logging.getLogger("dayu.utils.smoke_async_agent_tool_call")
 _PROMPT: str = "请调用工具 add_numbers 计算 2+3，然后用一句话回答结果。"
 _DEFAULT_TIMEOUT_SECONDS: float = 60.0
 _DEFAULT_MAX_RETRIES: int = 0
@@ -61,6 +65,9 @@ _EVENT_PREFIX: str = "EVENT"
 _SUMMARY_PREFIX: str = "SUMMARY"
 _FINAL_SUMMARY_PREFIX: str = "FINAL_SUMMARY"
 _GEMINI_DYNAMIC_THINKING_BUDGET: int = -1
+_MAX_ARG_STR_LEN: int = 40
+_MAX_COMPACT_ARGS_LEN: int = 120
+_MAX_SUMMARY_STR_LEN: int = 40
 
 
 @dataclass(frozen=True, slots=True)
@@ -134,20 +141,70 @@ class AddNumbersToolExecutor:
         """
 
         self.requests.append(request)
+        start_time = time.monotonic()
+        _LOGGER.info(
+            "工具调用开始: name=%s arguments=%s tool_call_id=%s "
+            "index_in_iteration=%s run_id=%s iteration_id=%s",
+            request.call.name,
+            _compact_tool_arguments(request.call.arguments),
+            request.call.tool_call_id,
+            request.call.index_in_iteration,
+            request.context.run_id,
+            request.context.iteration_id,
+        )
         if request.call.name != "add_numbers":
+            _log_tool_failure(
+                tool_name=request.call.name,
+                error="unknown_tool",
+                message=request.call.name,
+                request=request,
+                start_time=start_time,
+            )
             return _tool_failed("unknown_tool", request.call.name)
         arguments = request.call.arguments
         left = _number_argument(arguments, "a")
         right = _number_argument(arguments, "b")
         if left is None or right is None:
+            _log_tool_failure(
+                tool_name=request.call.name,
+                error="invalid_arguments",
+                message=(
+                    "add_numbers requires numeric a and b "
+                    f"a_type={_argument_type_name(arguments, 'a')} "
+                    f"b_type={_argument_type_name(arguments, 'b')}"
+                ),
+                request=request,
+                start_time=start_time,
+            )
             return _tool_failed(
                 "invalid_arguments",
                 "add_numbers requires numeric a and b",
             )
+        result = left + right
+        result_value: Mapping[str, JsonValue] = {"sum": result}
+        result_size = len(
+            json.dumps(
+                {"ok": True, "value": result_value},
+                ensure_ascii=False,
+            )
+        )
+        latency_ms = int((time.monotonic() - start_time) * 1000)
+        _LOGGER.info(
+            "工具调用完成: name=%s result=%s latency_ms=%s result_chars=%s "
+            "tool_call_id=%s index_in_iteration=%s run_id=%s iteration_id=%s",
+            request.call.name,
+            _tool_result_summary(result_value),
+            latency_ms,
+            result_size,
+            request.call.tool_call_id,
+            request.call.index_in_iteration,
+            request.context.run_id,
+            request.context.iteration_id,
+        )
         return ToolCompletedOutcome(
             result=ToolResultSuccess(
                 ok=True,
-                value={"sum": left + right},
+                value=result_value,
                 truncation=None,
                 meta=None,
             )
@@ -240,6 +297,107 @@ def _number_argument(
     if isinstance(value, int) or isinstance(value, float):
         return value
     return None
+
+
+def _compact_tool_arguments(
+    arguments: Mapping[str, JsonValue],
+    max_len: int = _MAX_COMPACT_ARGS_LEN,
+) -> str:
+    """将工具调用参数格式化为 OLD 风格的紧凑单行字符串。
+
+    :param arguments: 工具参数映射。
+    :param max_len: 输出最大字符数。
+    :returns: 形如 ``a=2, b=3`` 的参数摘要。
+    :raises Exception: 不主动抛出异常。
+    """
+
+    parts: list[str] = []
+    for key, value in arguments.items():
+        if value is None:
+            continue
+        if isinstance(value, str) and len(value) > _MAX_ARG_STR_LEN:
+            value_text = repr(value[:_MAX_ARG_STR_LEN]) + "..."
+        else:
+            value_text = repr(value)
+        parts.append(f"{key}={value_text}")
+    result = ", ".join(parts)
+    if len(result) > max_len:
+        return result[:max_len] + "..."
+    return result
+
+
+def _tool_result_summary(value: Mapping[str, JsonValue]) -> str:
+    """返回 OLD 风格的工具成功结果摘要。
+
+    :param value: 工具结果 value。
+    :returns: 紧凑结果摘要；无可展示字段时返回 ``ok``。
+    :raises Exception: 不主动抛出异常。
+    """
+
+    parts: list[str] = []
+    for key, item in value.items():
+        if len(parts) >= 4:
+            break
+        if isinstance(item, bool):
+            parts.append(f"{key}={item}")
+        elif isinstance(item, str):
+            rendered = item[:_MAX_SUMMARY_STR_LEN]
+            suffix = "..." if len(item) > _MAX_SUMMARY_STR_LEN else ""
+            parts.append(f"{key}={rendered!r}{suffix}")
+        elif isinstance(item, int) or isinstance(item, float):
+            parts.append(f"{key}={item!r}")
+    if not parts:
+        return "ok"
+    return " ".join(parts)
+
+
+def _log_tool_failure(
+    *,
+    tool_name: str,
+    error: str,
+    message: str,
+    request: ToolExecutionRequest,
+    start_time: float,
+) -> None:
+    """使用项目日志系统记录工具失败。
+
+    :param tool_name: 工具名称。
+    :param error: 工具失败错误码。
+    :param message: 工具失败消息。
+    :param request: 工具执行请求。
+    :param start_time: 工具开始执行时的单调时钟。
+    :returns: 无返回值。
+    :raises Exception: 不主动抛出异常。
+    """
+
+    latency_ms = int((time.monotonic() - start_time) * 1000)
+    _LOGGER.warning(
+        "工具调用失败: name=%s error=%s message=%s latency_ms=%s "
+        "tool_call_id=%s index_in_iteration=%s run_id=%s iteration_id=%s",
+        tool_name,
+        error,
+        message,
+        latency_ms,
+        request.call.tool_call_id,
+        request.call.index_in_iteration,
+        request.context.run_id,
+        request.context.iteration_id,
+    )
+
+
+def _argument_type_name(arguments: Mapping[str, JsonValue], name: str) -> str:
+    """返回工具参数类型名称。
+
+    :param arguments: 工具参数映射。
+    :param name: 参数名。
+    :returns: 参数缺失时返回 ``missing``，否则返回运行时类型名。
+    :raises Exception: 不主动抛出异常。
+    """
+
+    value = arguments.get(name)
+    if value is None:
+        return "missing"
+    return type(value).__name__
 
 
 def add_numbers_schema() -> ToolSchema:
