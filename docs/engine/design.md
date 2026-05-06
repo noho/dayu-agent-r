@@ -189,11 +189,11 @@ OLD Engine 阅读范围：
 
 `dayu/engine/truncation_manager.py::TruncationManager` 按工具 schema 的 `ToolTruncateSpec` 执行工具级截断，生成内存 cursor。`fetch_more` 具备 TTL、scope hash、scope token、single-use 语义。
 
-`dayu/engine/context_budget.py::ContextBudgetState / ToolResultBudgetCapper` 处理 Agent 级上下文预算，只作用于“工具结果已序列化、即将注入下一轮 tool message”的裁剪。
+`dayu/engine/context_budget.py::ContextBudgetState`、OLD `ToolResultBudgetCapper` / soft-hard capping 只作为历史证据和后续 Host 上下文治理设计素材，不作为当前 Engine 迁移范围。
 
 OLD `_compact_messages` 是规则化、确定性的本 run 应急压缩：保留 system、首条 user 和最近尾部消息，把中间历史压成一条 system summary。它不调用 LLM，也不写回 Host conversation memory。
 
-结论：工具级截断属于 Host 侧 ToolRuntime 的工具结果治理；Agent 上下文预算属于 Engine 的消息注入治理；语义压缩和 conversation memory 属于 Host 协调的会话治理。OLD `_compact_messages` 效果有限，不应作为 NEW Engine 稳定能力迁移，只能作为第一阶段 emergency fallback 参考。
+结论：工具级截断属于 Host 侧 ToolRuntime 的工具结果治理；context overflow / context compaction 属于后续 Host 上下文治理与 Engine 协作能力。当前 Engine 迁移不实现 projected tokens 早停、context overflow 强类型识别、`context_compaction_requested` 生产路径或 Engine 内 compact / retry。OLD `_compact_messages` 效果有限，不应作为 NEW Engine 稳定能力迁移；当前 Engine 阶段只把它作为 Host 后续设计参考，不作为 Phase 5 fallback 实现项。
 
 ### 2.9 ToolTrace
 
@@ -498,7 +498,7 @@ EngineEvent data 类型草案：
 | `tool_call_requested` | `ToolCallRequestedData` | `iteration_id`, `tool_call_id`, `name`, `arguments`, `index_in_iteration`, `provider_state` |
 | `tool_result_accepted` | `ToolResultAcceptedData` | `iteration_id`, `tool_call_id`, `name`, `index_in_iteration`, `outcome` |
 | `tool_awaiting` | `ToolAwaitingData` | `iteration_id`, `tool_call_id`, `await_spec` |
-| `context_compaction_requested` | `ContextCompactionRequestedData` | `iteration_id`, `budget_state`, `reason` |
+| `context_compaction_requested` | `ContextCompactionRequestedData` | `iteration_id`, `budget_state`, `reason`；后续 Host 上下文治理协作事件草案，当前 Engine 迁移不生产 |
 | `runner_usage_recorded` | `RunnerUsageData` | `iteration_id`, `prompt_tokens`, `completion_tokens`, `total_tokens` |
 | `provider_protocol_error` | `ProviderProtocolErrorData` | `iteration_id`, `error_code`, `message`, `provider_request_id`, `raw_payload` |
 | `runner_done` | `RunnerDoneData` | `iteration_id`, `finish_reason` |
@@ -557,15 +557,15 @@ Cancellation 稳定规则：
 - Host ToolRuntime 负责工具子任务取消和后台 job 治理，Engine 只接收取消事实或终态结果。
 - watchdog、取消超时升级、强制终止、lost 判定等取消治理增强不进入第一阶段迁移细节，由 [issue #3](https://github.com/noho/dayu-agent-r/issues/3) 跟踪。
 
-Context budget 稳定规则：
+Context budget / compaction 后续协作规则：
 
-- 预算参数来自 Host 已解析配置快照。
-- Engine 只负责本次 run 的预算检测、Runner usage 记录、硬阈值保护、工具结果注入前的确定性裁剪。
-- `ContextBudgetState` 记录 usage、soft/hard limit、continuation 次数和预算状态；不承担长期 conversation memory。
-- `ToolResultBudgetCapper` 只裁剪待注入下一轮消息的已序列化工具结果。
-- 当 Engine 判断需要语义压缩时，应发出 `context_compaction_requested` / `run_suspended` 事件，交由 Host 基于 conversation memory、session transcript、scene/capability 策略重新构造 `AgentRunRequest.messages` 后恢复 run。
+- context overflow / `context_compaction_requested` 不进入本轮 Engine 迁移实现范围。
+- `ContextBudgetState`、projected context tokens、trigger ratio、soft / hard limit 和工具结果 capping 只作为后续 Host 上下文治理与 Engine 协作设计素材；当前 Engine 不生产这些状态。
+- 当前 Engine 不做 Engine 内 compact / retry，不做 projected tokens 早停，不把 provider context overflow 改写成 `context_compaction_required` recoverable failure。
+- Host 未来基于 conversation_memory / transcript / tool facts 压缩后，可重新构造 `AgentRunRequest.messages` 并发起新的 run；是否需要 `context_compaction_requested`、recoverable terminal 和对应数据结构，留给后续 Host 实施时的独立 issue 决定。
+- wait / resume / monitor 的 terminal 与恢复语义留给 issue #4 后续设计。
 - Engine 不理解业务语义，也不应让 Host 内核理解业务语义；若压缩需要业务知识，应由对应 capability 提供摘要/恢复输入。
-- OLD `_compact_messages` 可作为第一阶段 emergency deterministic compaction fallback，但不得写入 conversation memory，不得作为长期稳定接口承诺。
+- OLD `_compact_messages` 只作为 context overflow 历史行为证据和后续 Host 设计参考；当前 Engine 阶段不得把它作为稳定 compact / retry 能力迁入。
 
 ## 10. Processor 与工具边界判断
 
@@ -616,7 +616,7 @@ Fins tools：
 - `ToolRegistry` 的 schema 管理、参数校验、异常信封、截断 cursor 等内部算法可作为 Host ToolRuntime 实现素材。
 - ToolTraceRecorder / JsonlToolTraceStore 的实现思路可作为 Host 侧 trace 素材。
 - Cancellation helper 的协作式取消语义。
-- ContextBudgetState 与工具结果预算裁剪原语；OLD `_compact_messages` 仅作为 emergency fallback 素材。
+- ContextBudgetState 的单 run projected token 压力判断素材；OLD `ToolResultBudgetCapper`、soft / hard capping 与 `_compact_messages` 仅作为历史证据和 Host 后续设计参考，不进入本轮 Engine 实现。
 
 建议重设：
 
@@ -624,7 +624,7 @@ Fins tools：
 - ToolRegistry / ToolRuntime 的归属：从 Engine 下沉到 Host。
 - ToolTrace 的归属：从 Engine 下沉到 Host，Engine 只产出可观测事件。
 - OLD `StreamEvent(data: Any, metadata: dict[str, Any])` 的弱类型边界；NEW 中 RunnerEvent 与 EngineEvent 都必须强类型化。
-- OLD `_compact_messages` 的归属：不作为 Engine 稳定能力；语义压缩由 Host 协调 conversation memory/capability，Engine 只发 `context_compaction_requested`。
+- OLD `_compact_messages` 的归属：不作为 Engine 稳定能力；语义压缩由 Host 协调 conversation memory/capability。是否需要 Engine 发出 `context_compaction_requested` 留给后续 Host 实施时的独立 issue。
 - toolset registrar 的装配位置：从 Engine 移到 Host/capability 装配层。
 - AsyncAgent God function。
 - `extra_payloads` 弱类型扩展袋。
@@ -720,7 +720,7 @@ Engine 包根导出建议：
 
 - `RunnerSpec`：provider、model、endpoint、API key 引用、headers、模型能力、默认超时、重试策略、stream 能力、tool calling 能力、reasoning/thinking provider request extension。
 - `RunnerCallOptions`：temperature、max tokens、top_p、response format、当前请求覆盖项。
-- `AgentPolicy`：max iterations、continuation 策略、fallback 策略、上下文预算、是否允许 tool calling、最终回答过滤策略。
+- `AgentPolicy`：max iterations、continuation 策略、fallback 策略、是否允许 tool calling、最终回答过滤策略。上下文预算 / compaction 策略不属于本轮 Engine 迁移范围，后续 Host 上下文治理实施时再确定。
 
 约束：
 
@@ -881,16 +881,16 @@ Codex：
 
 Engine 迁移顺序：
 
-1. 迁移 pure contracts：强类型 `EngineEvent`、`RunnerEvent`、`ToolResultEnvelope`、`ToolAwaitSpec`、`ToolAwaitSnapshot`、`ToolCallRequest`、`ToolSchema`、`ToolExecutionContext`、`ToolExecutionOutcome`、`ToolExecutor` protocol、`AsyncRunner`、取消观察原语、context budget 原语。
+1. 迁移 pure contracts：强类型 `EngineEvent`、`RunnerEvent`、`ToolResultEnvelope`、`ToolAwaitSpec`、`ToolAwaitSnapshot`、`ToolCallRequest`、`ToolSchema`、`ToolExecutionContext`、`ToolExecutionOutcome`、`ToolExecutor` protocol、`AsyncRunner`、取消观察原语。context budget / compaction 原语只保留为后续 Host 协作设计素材。
 2. 建立 Engine 包根导出与 import boundary 测试；先证明不导出兼容 wrapper / 旧 re-export，不导入 Host ToolRegistry、web/doc/fins tools、ToolTraceRecorder 或 `dayu.fins.storage` 具体实现。
 3. 新增 `RunnerSpec`、`RunnerCallOptions`、`AgentPolicy`，承接 `llm_models.json` 的运行参数；删除 `Runner.call(**extra_payloads)` 弱类型入口，并把 provider request extension 收敛为强类型配置。
 4. 迁移 AsyncOpenAIRunner 的模型协议归一能力，先只产出 `RunnerEvent`；不迁 AsyncCliRunner，不迁 Runner 工具执行职责。
 5. 实现函数式入口骨架 `run_agent_messages` / `run_agent_and_wait`，入口内部创建 run-scoped Agent 与 Runner，并只向 Host 暴露 `EngineEvent`。
 6. 实现 Agent 最小 loop：无工具场景下完成 iteration 调度、RunnerEvent 提升、usage 记录、final_answer、失败终态和资源收口。
 7. 实现 completed / failed tool loop：Engine 接收 `tool_schemas` 与 `ToolExecutor` protocol，发出 `ToolExecutionRequest`，接收 `completed` / `failed` outcome，注入下一轮 tool message；不实现 ToolRegistry / ToolRuntime。
-8. 实现 awaiting / suspended 主链路：ToolExecutor 返回 `awaiting` 时，Agent 产出 `tool_awaiting` 与 `run_suspended`，结束本次 run；恢复由后续 Host 迁移基于新 run request 完成，Engine 阶段只定义恢复输入契约。
+8. awaiting / suspended 主链路已取消当前 Engine 独立实施，转入 issue #4 后续拆子 issue；当前迁移不实现 `tool_awaiting` / `run_suspended` / resume。
 9. 实现取消观察主链路：`AgentRunRequest.cancellation_token` 是 Engine 可见取消入口；Engine 观察取消并产出 `run_cancelled` / `EngineRunOutcomeCancelled`。`CancelRun(session_id, run_id, reason, requested_at)` 只作为 Host API / 进程适配层命令，不进入 Engine 公共 contract。
-10. 定义并实现 `context_compaction_requested` 事件；Engine 只发请求，不实现 conversation memory 或语义压缩。OLD `_compact_messages` 如需迁移，只作为 emergency fallback。
+10. context overflow / `context_compaction_requested` 后移：当前 Engine 迁移只保留事件契约/概念草案，不实现生产路径、recoverable terminal、Engine 内 compact / retry、conversation memory 或语义压缩；后续 Host 上下文治理实施时再完善 Engine 协作事件。
 11. 清理 processors/tools/web/doc/fins 与 Engine core 的导入关系；`Source`、`DocumentProcessor`、`ProcessorRegistry` 对 Engine / Host 不可见，Engine 只保留协议与事件边界。
 12. 根据实际落地同步 `dayu/engine/README.md`；涉及 Host、fins、capability 的 README 留给对应迁移阶段更新。
 
@@ -900,14 +900,14 @@ Host 接口要求：
 - Host 消费 `AsyncIterator[EngineEvent]`，并自行决定 transcript 持久化、tool trace observer、审计、指标、UI 转发。
 - Host 是 ToolRuntime / ToolRegistry 与工具治理真源；ToolExecutor 由 EngineWorker 替 Host 代持并提供，可以在本地 worker 或远程 worker 内执行；Engine 只依赖协议。
 - Host 外层取消命令映射为 run-local cancellation token；Engine 不持有跨 run cancel registry。
-- Host 负责 conversation memory、语义压缩、`context_compaction_requested` 后的消息重构与恢复。
-- Host 负责 `await_spec` 的 wait record、monitor、resume；Engine 只产出 awaiting/suspended 事实。
+- Host 未来负责 conversation memory、语义压缩、context overflow 后的消息重构与重新发起 run；如需要 `context_compaction_requested`，由后续 Host 实施时的独立 issue 完善 Engine。
+- Host 未来负责 `await_spec` 的 wait record、monitor、resume；当前 Engine 迁移不产出 awaiting/suspended 事实，相关能力由 issue #4 后续设计。
 - Host 负责 web/doc/fins toolset/capability 装配；财报文档读取仍只能通过 `dayu.fins.storage`。
 
 测试策略：
 
 - 测试代码按 NEW Engine contracts 重写；OLD tests 不迁移为兼容测试，只作为行为证据、场景样本和回归用例来源。
-- 每个迁移切片先建立接口测试，再迁实现；接口测试必须覆盖 Host -> Engine 公共入口、输入类型、输出事件、取消、tool calling、context budget request 等稳定契约。
+- 每个迁移切片先建立接口测试，再迁实现；接口测试必须覆盖 Host -> Engine 公共入口、输入类型、输出事件、取消、tool calling 等当前稳定契约。context budget / compaction request 不作为本轮稳定实现契约。
 - 必须建立架构测试，防止边界回退：
   - 若约定 Engine 包根只导出 `run_agent_messages`、`run_agent_and_wait` 和 contract 类型，则导出更多实现类、兼容 wrapper、旧 re-export 时测试必须失败。
   - Engine 不得导入 Host 具体实现、Host ToolRegistry、web/doc/fins tools、`dayu.fins.storage` 具体实现。

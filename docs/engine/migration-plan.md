@@ -51,13 +51,12 @@
 | --- | --- | --- | --- | --- | --- | --- |
 | Phase 0 | pure contracts 与 import boundary tests | 先落地 Engine 最小稳定 contract 和包边界测试 | `design.md` 第 9、14、16 节，`review.md` 通过结论 | 强类型 contracts、包根导出约束、import boundary tests | 不迁 `AsyncAgent`、`AsyncOpenAIRunner`、ToolRegistry、doc/web/fins tools | contracts 可被测试导入；架构测试能阻止旧 re-export 和反向依赖 |
 | Phase 1 | Runner protocol 与 OpenAI-compatible Runner | 迁移 provider 协议归一能力，Runner 只产出 RunnerEvent | Phase 0 contracts，OLD `async_openai_runner.py` 可复用片段 | `AsyncRunner` protocol 当前实现、RunnerEvent 流、RunnerSpec provider extension | 不迁 `AsyncCliRunner`，不迁 Runner 工具执行，不保留 `call(**extra_payloads)` | Runner 测试证明 tool call 只产生 RunnerEvent，不调用 ToolExecutor |
-| Phase 1.5 | Log / Runner diagnostics 与 SSE idle | 引入 `dayu.runtime` 公共运行时基础设施（log 装配 + cancellation race helper），给 Phase 1 Runner 补齐运行时边界日志，落地 chunk 级 SSE idle heartbeat / hard timeout（issue #6） | Phase 1 Runner、`dayu/contracts/cancellation.py`、OLD `dayu/log.py` / `sse_parser.py` 证据 | `dayu/runtime/log.py`、`dayu/runtime/cancellation.py`、Runner 边界 logger、`RunnerSpec.stream_idle_*` 字段、idle 控制流 | 不污染 RunnerEvent / EngineEvent；不新增 Engine / Runner 公共终态异常；Engine 不 import `dayu.runtime.log`；不迁 OLD `Log` 单例 wrapper；不写 README（统一推迟到 Phase 6） | 诊断字段在 caplog 中可见；idle 测试集（disabled / heartbeat / timeout / timeout-only / cancel wins / retry / aclose / outer cancel）全绿；事件契约无 log/idle 字段污染；issue #6 可关闭 |
+| Phase 1.5 | Log / Runner diagnostics 与 SSE idle | 引入 `dayu.runtime` 公共运行时基础设施（log 装配 + cancellation race helper），给 Phase 1 Runner 补齐运行时边界日志，落地 chunk 级 SSE idle heartbeat / hard timeout（issue #6） | Phase 1 Runner、`dayu/contracts/cancellation.py`、OLD `dayu/log.py` / `sse_parser.py` 证据 | `dayu/runtime/log.py`、`dayu/runtime/cancellation.py`、Runner 边界 logger、`RunnerSpec.stream_idle_*` 字段、idle 控制流 | 不污染 RunnerEvent / EngineEvent；不新增 Engine / Runner 公共终态异常；Engine 不 import `dayu.runtime.log`；不迁 OLD `Log` 单例 wrapper；不写 README（统一推迟到 Phase 5 文档收口） | 诊断字段在 caplog 中可见；idle 测试集（disabled / heartbeat / timeout / timeout-only / cancel wins / retry / aclose / outer cancel）全绿；事件契约无 log/idle 字段污染；issue #6 可关闭 |
 | Phase 2 | Agent run loop 骨架 | 建立 run-scoped Agent 和函数式入口 | Phase 0 contracts，Phase 1 Runner，Phase 1.5 logger / cancellation runtime | `run_agent_messages` / `run_agent_and_wait` 骨架、RunnerEvent -> EngineEvent 提升、terminal 收口、`dayu/engine/README.md` 当前事实手册 | 不接入 ToolRegistry，不实现 long-running tool waiting，不迁 doc/web/fins 工具 | 无工具 run 可完成 final_answer / run_failed / run_cancelled，并关闭 Runner；Engine README 只写 Phase 2 已落地事实 |
 | Phase 3 | EngineWorker 代持 ToolExecutor 的 tool calling 闭环 | 建立普通工具调用闭环，并按 Host capability 口径固定 EngineWorker / ToolExecutor 边界；同步落地 max_iterations force-answer 与连续失败工具批次保护 | Phase 2 Agent loop，Phase 0 ToolExecutor contract，`docs/host/design.md` | 模型 tool call -> ToolExecutionRequest -> ToolExecutionOutcome -> LLM-facing tool message 注入下一轮；默认 max_iterations force-answer；连续失败工具批次按 fallback mode 收口；测试用 fake ToolExecutor 表示 EngineWorker 替 Host 代持的执行能力 | Engine 不注册工具，不执行权限、审计、路径白名单、长事务治理；不实现 EngineWorker / RPC 生产代码；Runner 不执行工具 | completed / failed 工具结果可进入下一轮；内部 ToolResultEnvelope 不直接进入 LLM-facing content；max_iterations 默认 force-answer；连续失败批次保护可观测；无双执行、无事件驱动工具执行；计划和 review 均确认 EngineWorker 是 Host capability 且不拥有治理权 |
 | Phase 3 后置 patch | provider_state / reasoning roundtrip | 在普通工具闭环落地后，把 Phase 3 过渡性的 reasoning_content 无脑写回改为 provider-specific 策略 | Phase 3 tool loop，真实 provider smoke / NEW-OLD 对照证据 | 明确 `ToolCallProviderState` 扩展策略，判断哪些 provider 需要把 reasoning_content 纳入 provider_state 或请求投影策略 | 不把 Phase 3 的无条件写回固化为跨 provider 稳定规则 | provider_state 可避免多轮工具调用协议断链；reasoning_content 写回策略按 provider 明确 |
-| Phase 4 | completed / failed / awaiting outcome | 落地三类 outcome，awaiting 只产出挂起事实 | Phase 3 tool loop，ToolAwaitSpec / ToolAwaitSnapshot | `tool_awaiting` / `run_suspended` 事件，awaiting outcome 穷尽匹配测试 | 不实现 approval、detached、retry_after、artifact_ready 等扩展 outcome | awaiting 不轮询、不 sleep、不创建 Host wait record；只结束本次 run |
-| Phase 5 | context budget、continuation、broader fallback、取消收口 | 迁移确定性预算、续写、broader fallback 与更完整取消收口；不承接 Phase 3 已落地的 max_iterations force-answer / 连续失败工具批次保护 | Phase 2-4 Agent/Runner 主链路 | budget state、continuation / broader fallback 最小策略、取消 terminal 收口 | 不实现 conversation memory，不做语义压缩，不写 transcript；不把 Phase 3 force-answer 后移到本阶段 | 取消优先于 final_answer；context_compaction_requested 只发事件；Phase 3 的 max_iterations force-answer 语义保持不回退 |
-| Phase 6 | 文档同步与阶段收口 | 按实际代码同步 README 和计划状态 | Phase 0-5 已落地代码和测试 | `dayu/engine/README.md` 等必要 README，同步后的 docs 边界 | 不写未来设计进 README，不把 docs 草案当用户手册 | README 与当前代码一致；docs、测试、pyright、PR checklist 完整 |
+| Phase 4 | 已取消：awaiting / suspend 后移 issue #4 | 不再作为独立 Engine 迁移阶段实施 | Phase 3 tool loop，issue #4 后续子 issue | 历史草案保留；`suspend` / `run_suspended` / `ToolAwaitingOutcome` 由 issue #4 重新计划 | 不把 awaiting 作为 Phase 5 前置；不实现 Host wait record / monitor / resume | migration plan 与历史草案均明确 Phase 4 已取消，后续由 issue #4 拆子 issue |
+| Phase 5 | continuation、取消收口回归 + Phase 6 文档收口 | 合并原 Phase 5/6；迁移 Engine 层剩余 Agent 自洽能力并在同一 PR 做 README / docs 验收收口 | Phase 3 普通 tool calling 主链路，Phase 1 Runner，OLD AsyncAgent / Runner 强参考源 | `finish_reason=length` 禁工具续写拼接、continuation 次数限制、content_filter 不续写、取消优先回归、README / issue 收口 | 不实现 Phase 4 suspend；不实现 context overflow / `context_compaction_requested` / trigger ratio；不实现 Engine 内 compact/retry；不迁 OLD TruncationManager / fetch_more / cursor / TTL / scope token；不实现 conversation memory / transcript / trace store / Host wait record | OLD/NEW 专项 review 与日常 review 通过；Phase 3 force-answer 与连续失败批次不回退；README 只写已落地事实；context overflow 明确后移 Host 实施时作为独立 issue 完善 |
 
 ## 5. Phase 0 详细计划
 
@@ -281,7 +280,7 @@
 
 ### README / docs 同步要求
 
-- 按用户决策，Phase 1.5 不修改、不新建任何 README；统一推迟到 Phase 6 文档同步阶段一次性同步。
+- 按用户决策，Phase 1.5 不修改、不新建任何 README；统一推迟到 Phase 5 文档收口阶段一次性同步。
 - 仅修改本计划与 `docs/engine/phase1_5-plan.md`。
 - PR 描述中显式说明：本期未修改 README，全部以代码 + 测试 + `docs/engine/phase1_5-plan.md` 为事实真源。
 
@@ -379,7 +378,7 @@
 - `dayu/engine/README.md` 只写 Phase 2 已经落地的当前事实：Engine 职责边界、`UI -> Service -> Host -> Engine`、Host 与 Engine 的稳定依赖表面、`run_agent_messages` / `run_agent_and_wait`、run-scoped Agent 生命周期、RunnerEvent -> EngineEvent 提升、无工具主链路状态机、`final_answer` / `run_failed` / `run_cancelled` 终态、取消优先级、Runner close、Phase 1 OpenAI-compatible Runner 与 Phase 1.5 diagnostics / SSE idle 的当前位置。
 - `dayu/engine/README.md` 不得把 ToolExecutor tool calling 闭环、awaiting / long-running tool waiting、Host ToolRegistry、trace store、transcript 持久化、conversation memory、context budget / continuation 写成可用能力。
 - 如果新增或调整测试分层且属于 `tests/README.md` 职责范围，可以更新 `tests/README.md`。
-- 除 `dayu/engine/README.md` 与必要的 `tests/README.md` 外，Phase 2 不新建、不修改其它 README；其它 README 仍统一推迟到 Phase 6 文档同步阶段。
+- 除 `dayu/engine/README.md` 与必要的 `tests/README.md` 外，Phase 2 不新建、不修改其它 README；其它 README 仍统一推迟到 Phase 5 文档收口阶段。
 
 ### review Agent 审查重点
 
@@ -522,7 +521,7 @@ Phase 3 不插入独立 Phase 2.5；`docs/host/design.md` 中关于 EngineWorker
 ### 用户确认点
 
 - 是否确认普通工具失败进入 LLM 上下文，由模型恢复或解释。
-- 是否确认 Phase 4 再处理 awaiting，不在 Phase 3 提前实现。
+- 是否确认 awaiting / suspend 不在 Phase 3 提前实现，后续由 issue #4 拆子 issue 处理。
 
 ## 8.5 Phase 3 后置 patch：provider_state / reasoning roundtrip
 
@@ -563,114 +562,59 @@ Phase 3 为了先落地普通工具闭环，可以按 OLD 已证明可行的行�
 - 不需要 reasoning roundtrip 的 provider 不会被写入多余 reasoning 字段。
 - 需要 reasoning roundtrip 的 provider 能在多轮 tool calling 中保持协议不断链。
 
-## 9. Phase 4 详细计划
+## 9. Phase 4 状态：已取消独立实施
+
+### 当前决策
+
+Phase 4 不再作为独立 Engine 迁移阶段实施。
+
+`suspend` / `run_suspended` / `ToolAwaitingOutcome` 已转入 GitHub issue #4 跟踪，后续必须在 issue #4 下拆分子 issue 后重新计划。`docs/engine/phase4-plan.md` 与 `docs/engine/phase4-plan-review.md` 仅作为历史草案与历史 review 记录保留，不再作为当前实施 handoff 或放行 gate。
+
+### 原因
+
+awaiting / suspend 不是单纯 Engine 事件问题。若只在 Engine 侧产出 `tool_awaiting` / `run_suspended`，但 Host wait record、monitor、resume 输入、恢复治理、取消 / 超时 / 丢失治理尚未落地，会形成半截能力。当前架构下应由 Host 后续统一设计长事务等待与恢复闭环。
+
+### 对后续 Phase 的影响
+
+- Phase 5 不得把 Phase 4 作为前置条件。
+- Phase 5 不得实现 `ToolAwaitingOutcome`、`tool_awaiting`、`run_suspended` 或 resume API。
+- Phase 5 若遇到需要 Host 后续接管的状态，必须以当前已存在的 EngineEvent 事实和保守 terminal 收口表达，不得借用 `run_suspended`。
+- issue #4 继续作为 approval、detached、retry_after、artifact_ready、awaiting / suspend / resume 等扩展 outcome 和 Host 长事务治理的总跟踪入口。
+
+## 10. Phase 5 详细计划：Phase 5 with Phase 6 doc closeout
 
 ### 目标
 
-落地第一阶段三类 outcome 中的 `awaiting` 分支。awaiting 只表达 Host 托管等待事实，使本次 Engine run 产出 `tool_awaiting` / `run_suspended` 后停止。
+合并原 Phase 5 和 Phase 6。Phase 5 是最后一个 Engine 实现收口阶段；原 Phase 6 不再作为第二个实现阶段，只作为同一 PR 中的 README / docs / issue 验收收口部分。
+
+Phase 5 目标是补齐 Engine 层剩余自洽 Agent 能力：`finish_reason=length` 受次数限制续写并拼接最终内容、continuation 轮固定 `tools=()`、`content_filter` 不续写、取消优先和 Phase 3 既有收口回归。
+
+Phase 5 完成后，NEW Engine 可以在 Engine 层进一步接近 OLD Agent / AsyncAgent 主能力对齐，但必须明确排除 Host / Service / issue #4 能力：context overflow / context compaction 协作、Host wait record、monitor、resume、ToolRuntime、ToolRegistry、conversation memory、transcript、trace store、OLD `TruncationManager` / fetch_more / cursor / TTL / scope token 等均不属于本阶段。
 
 ### 前置条件
 
-- Phase 3 tool calling 闭环已合并。
-- `ToolAwaitSpec`、`ToolAwaitSnapshot`、`ToolAwaitingOutcome` 已在 Phase 0 contract 中定义。
-- Host wait record / monitor / resume 具体实现尚未进入 Engine。
+- Phase 3 普通 completed / failed tool calling 主链路已合并。
+- Phase 4 已取消独立实施，`suspend` / `run_suspended` / `ToolAwaitingOutcome` 不作为 Phase 5 前置。
+- Phase 0 / Phase 3 既有 contracts 已稳定；若 Phase 5 需要扩展 `AgentPolicy`，必须按强类型契约演进并补测试。
+- 用户确认本轮 Engine 迁移不把 context overflow / `context_compaction_requested` 纳入范围；后续在实施 Host 上下文治理时，再作为独立 issue 完善 Engine 协作事件与状态机。
+- 用户确认 OLD `TruncationManager` / fetch_more / cursor / TTL / scope token / tool-level truncation manager 后移 Host / ToolRuntime，不进入 Phase 5。
 
 ### 迁移 Agent 任务
 
-- Agent 识别 `ToolAwaitingOutcome`。
-- 发出 `tool_awaiting` EngineEvent，data 中包含 `await_spec` 和必要 tool_call 关联事实。
-- 发出 `run_suspended` terminal event。
-- 结束本次 run 并关闭 Runner。
-- 确保 awaiting 不注入普通 tool message，除非设计明确提供 Host 恢复输入。
-- 定义 Engine 恢复输入的最小 contract：Host 后续以新的 AgentRunRequest 提供权威消息或工具终态结果。
-
-### 允许复用的 OLD implementation 片段
-
-- OLD #142 相关动机只作为场景证据。
-- OLD 工具结果信封可作为 completed / failed 语义素材。
-- 不复用 OLD 中 LLM 轮询或 sleep 的实现。
-
-### 禁止迁移项
-
-- approval、detached、retry_after、input_required、artifact_ready、delegated、deduplicated 等扩展 outcome。
-- Host wait record / monitor / resume 具体实现。
-- Engine 轮询 job 状态。
-- Engine sleep / backoff。
-- Engine 写 transcript 或 task ledger。
-- Engine 创建后台任务。
-
-### 测试要求
-
-- awaiting outcome -> `tool_awaiting` + `run_suspended`。
-- `run_suspended` 是 terminal event，之后不产出 final_answer。
-- awaiting 不导致 Engine 轮询或 sleep。
-- Runner 在 suspended 后关闭。
-- ToolAwaitSpec 不进入 ToolResultEnvelope.meta。
-- 穷尽匹配测试证明新增 outcome 必须显式处理。
-
-### pyright 要求
-
-- `ToolAwaitSpec` 与 `ToolAwaitSnapshot` 严格类型化。
-- 不用 `status: str` 加 payload 表达 awaiting。
-
-### README / docs 同步要求
-
-- 更新 `dayu/engine/README.md` 中 awaiting / suspended 状态机。
-- 只写 Engine 当前行为，不写 Host monitor 实现细节。
-- 在 docs 中保留 issue #4 作为扩展 outcome 追踪入口。
-
-### review Agent 审查重点
-
-- awaiting 是否只是治理事实，不包含业务语义。
-- Engine 是否未实现 Host wait record / monitor / resume。
-- 是否出现扩展 outcome 偷跑。
-- suspended 是否正确作为 terminal event。
-
-### 总控验收标准
-
-- Phase 4 可独立形成 PR。
-- awaiting 主链路可测试。
-- 扩展 outcome 均未进入 Engine core。
-- issue #4 仍作为扩展 outcome 总跟踪。
-
-### 用户确认点
-
-- 是否确认 awaiting 的恢复由后续 Host 迁移实现。
-- 是否需要为某个扩展 outcome 单独开子 issue。
-
-## 10. Phase 5 详细计划
-
-### 目标
-
-迁移确定性 context budget 原语、continuation / broader fallback 最小策略和取消收口规则。保证取消优先于 final_answer，Runner 阻塞边界和 Agent terminal 前都观察取消。
-
-Phase 5 仍保留 context budget、continuation、provider error / broader fallback 等能力，但不得让后续 Agent 误以为 max_iterations force-answer 或连续失败工具批次保护后移到 Phase 5；这两项已是 Phase 3 blocker。
-
-### 前置条件
-
-- Phase 2 Agent loop 已合并。
-- Phase 3 / 4 tool loop 和 awaiting 主链路已合并，或明确本 Phase 只覆盖无工具路径。
-- Phase 0 cancellation 和 context budget contract 已稳定。
-
-### 迁移 Agent 任务
-
-- 实现 `ContextBudgetState` 等确定性预算状态。
-- Engine 只实现待注入下一轮 LLM tool message 的确定性预算裁剪；工具级截断、fetch_more cursor、TTL、scope token 仍归 Host ToolRuntime，不进入 Engine。
-- 实现 `context_compaction_requested` EngineEvent。
-- 实现最小 continuation 策略，例如 finish_reason=length 的可控续写次数。
-- 实现 broader fallback 策略，例如 provider error 的结构化失败或降级；不得重新定义 Phase 3 已固定的 max_iterations force-answer、连续失败工具批次保护或 content_filter degraded 语义。
+- 扩展 `AgentPolicy` 的必要 continuation 策略入口；不得加入 `max_context_tokens`、`context_compaction_trigger_ratio` 或其它 context compaction 字段。
+- 实现 `finish_reason=length` continuation：追加 continuation prompt、下一轮 Runner 调用固定 `tools=()`、不进入普通 tool loop、不消耗连续失败工具批次保护、受 `continuation_max_attempts` 限制、拼接多次 partial content，最终产出完整 final answer；`content_filter` 不 continuation。
+- 普通 provider error、HTTP retry exhausted、Runner protocol error 仍按 Phase 2/3 既有 `run_failed` 路径收口；Phase 5 不新增开放式 provider fallback 或降级策略。
 - Agent 每轮 iteration 起点检查取消。
 - Runner 阻塞边界观察取消。
 - Agent 在提交 final_answer 前再次检查取消。
 - 取消命中后产出 run_cancelled，不产出 final_answer。
+- 在同一 PR 末尾执行原 Phase 6 文档收口：根据已落地代码更新必要 README、计划状态和 issue 汇总；README 只写当前事实，不写未来设计。
 
 ### 允许复用的 OLD implementation 片段
 
-- `context_budget.py` 的 ContextBudgetState / ToolResultBudgetCapper 思路。
-- `truncation_manager.py` 中工具结果预算与 cursor 的场景证据，但工具级 truncation 归 Host。
-- `_compact_messages` 只能作为 emergency deterministic fallback 素材，不作为稳定接口。
+- `AsyncAgent._run_loop` 中 `finish_reason=length` continuation、partial content 累积、取消优先、既有收口场景判断；必须拆分为 NEW 小函数，不能照搬 God function。
 - `cancellation.py` 的 await_or_cancel 思路。
-- `AsyncAgent._run_loop` 中 continuation / fallback 场景判断，必须拆分。
+- OLD context budget、context overflow 与 `TruncationManager` 代码只作为“哪些能力不迁入本轮 Engine”的边界证据，不作为 Phase 5 implementation 来源。
 
 ### 禁止迁移项
 
@@ -678,120 +622,71 @@ Phase 5 仍保留 context budget、continuation、provider error / broader fallb
 - 语义压缩。
 - Engine 写 transcript。
 - Engine 调用 LLM 做压缩摘要。
+- Engine 内 compact / retry。
+- provider context overflow 强类型识别。
+- `context_compaction_requested` 事件生产路径。
+- `context_compaction_required` recoverable failure 状态机。
+- `max_context_tokens`、`context_compaction_trigger_ratio` 或 projected context trigger。
+- `run_suspended` / `ToolAwaitingOutcome` / resume API。
+- Host wait record、monitor、resume、approval、detached、retry_after、artifact_ready。
 - Engine 理解 fins/doc/web 业务语义。
-- ToolRuntime 工具级截断 / fetch_more 具体实现。
+- ToolRegistry / ToolRuntime、权限、审计、路径白名单、工具超时治理。
+- OLD `TruncationManager` / fetch_more cursor / TTL / scope token / tool-level truncation manager。
+- DuplicateCallGuard 语义级重复调用策略；如需推进必须单独开 issue。
+- provider-specific reasoning roundtrip patch；继续按 Phase 3 后置 patch / issue #10 跟踪。
+- Runner response cleanup hardening；只可记录风险，不进入 Phase 5 实现。
 - watchdog、取消超时升级、lost 判定等取消治理增强；这些由 issue #3 跟踪。
 
 ### 测试要求
 
-- budget soft / hard limit 状态测试。
-- 工具结果注入前裁剪测试。
-- context_compaction_requested 事件测试。
-- continuation 次数限制测试。
-- broader fallback terminal 测试；max_iterations force-answer 与连续失败工具批次保护只做回归确认，不作为 Phase 5 新能力。
+- AgentPolicy continuation 字段构造和非法值测试。
+- continuation 次数限制、prompt 注入、partial content 拼接、最终回答完整性测试。
+- `content_filter` 不 continuation，继续产出 `filtered=True, degraded=True`。
+- continuation 达到上限 terminal、普通 provider error 既有 `run_failed` 回归测试；max_iterations force-answer 与连续失败工具批次保护只做回归确认，不作为 Phase 5 新能力。
 - 取消优先级测试：取消与 final_answer 竞争时产出 run_cancelled。
 - Runner 阻塞取消测试。
 - Agent terminal 前取消检查测试。
 - Engine 不写 transcript / memory 的架构测试。
+- Host-only 能力防回流测试：Engine 不导入 ToolRegistry / ToolRuntime / TruncationManager / trace store / transcript / conversation memory。
 
 ### pyright 要求
 
-- budget state、continuation policy、fallback policy 必须严格类型化。
+- continuation policy 和既有收口策略必须严格类型化。
 - 不允许用字符串魔法值表达终态或 budget 状态；使用 enum / 封闭类型。
 
 ### README / docs 同步要求
 
-- 更新 `dayu/engine/README.md` 的 context budget、continuation、cancel 状态机。
-- 如果涉及分层边界，应检查 `dayu/README.md` 是否需要同步。
-- 不把 conversation memory 或语义压缩写成 Engine 当前能力。
+- Phase 5 计划阶段不更新 README。
+- Phase 5 代码实现、code review、OLD/NEW 专项 review 通过后，作为同一 PR 的文档收口部分更新必要 README。
+- `dayu/engine/README.md` 只写当前已落地事实：continuation、取消优先和 Phase 3 既有回归状态。
+- `dayu/engine/README.md` 不得写 context overflow / `context_compaction_requested` 已落地。
+- README 不得写 Host wait record / monitor / resume、conversation memory、语义压缩、trace store、OLD `TruncationManager` / fetch_more / cursor 已可用。
+- 若涉及测试分层变化，只更新 `tests/README.md`；若涉及整体分层事实变化，才检查 `dayu/README.md`。
 
 ### review Agent 审查重点
 
 - 取消是否绝对优先于 final_answer。
-- Engine 是否只发 context_compaction_requested，不实现 memory。
-- emergency fallback 是否没有成为稳定公共接口。
-- continuation / broader fallback 是否受 AgentPolicy 控制，且没有覆盖 Phase 3 的 max_iterations force-answer / 连续失败工具批次语义。
-- 是否把工具级截断误迁回 Engine。
-- 常规 code review 通过后，必须再执行一轮 NEW / OLD context budget / continuation / fallback / 取消优先级严格对照 review。该 review 以 OLD Engine 中高度可靠的 context budget 与 continuation 实现素材为强参考源，但必须确认 NEW 不迁 transcript、conversation memory、trace store 或 Host 治理职责。
+- continuation 是否受 AgentPolicy 控制，且没有覆盖 Phase 3 的 max_iterations force-answer / 连续失败工具批次语义。
+- 是否把 OLD `TruncationManager`、fetch_more、cursor、TTL、scope token 或工具级截断误迁回 Engine。
+- continuation 是否真正拼接最终内容，且 `content_filter` 不 continuation。
+- Phase 5 plan review、Phase 5 code review、日常 `docs/code_review.md` review 必须通过。
+- 常规 code review 通过后，必须再执行一轮 NEW / OLD continuation / 既有收口策略 / 取消优先级严格对照 review。该 review 以 OLD AsyncAgent / Runner 高可靠实现为强参考源，但必须确认 NEW 只对齐“final answer text continuation”的可靠性目标，不机械迁 OLD context budget / context overflow / soft / hard / capping / compact，也不迁 transcript、conversation memory、trace store、Host 治理职责或 OLD `TruncationManager`。
 
 ### 总控验收标准
 
-- Phase 5 可独立形成 PR；若依赖 Phase 3/4 场景，可在 PR 中明确覆盖路径。
-- 取消、budget、continuation、fallback 测试通过。
+- Phase 5 形成一个 PR，命名口径建议为 `Phase 5 with Phase 6 doc closeout`。
+- 取消、continuation 和 Phase 3 既有 fallback 回归测试通过。
 - pyright 通过。
-- 总控必须提醒并确认已完成 NEW / OLD context budget / continuation / fallback 对照 review；该 review 通过后，Phase 5 才能进入提交 / PR 流程。
+- Phase 3 max_iterations force-answer、连续失败工具批次、普通 tool calling 回归测试通过。
+- 总控必须提醒并确认已完成 NEW / OLD continuation / 既有收口策略对照 review；该 review 通过后，Phase 5 才能进入提交 / PR 流程。
+- 原 Phase 6 文档收口已经在同一 PR 完成，README 与当前代码一致，issue #2 / issue #4 状态清楚。
 - README 与当前实现一致。
 
 ### 用户确认点
 
-- 是否接受 OLD `_compact_messages` 仅作为 emergency fallback 素材。
-- 是否需要将取消治理增强继续留在 issue #3，而不进入本 Phase。
-
-## 11. Phase 6 详细计划
-
-### 目标
-
-完成 Engine 迁移阶段的文档同步、计划状态收口和 PR 验收整理。该阶段只同步已经落地的事实，不写未来设计。
-
-### 前置条件
-
-- Phase 0-5 的实现 PR 已合并，或至少明确哪些 Phase 已落地。
-- 所有实现切片已通过 review Agent 和总控验收。
-
-### 迁移 Agent 任务
-
-- 根据当前代码更新 `dayu/engine/README.md`。
-- 若涉及整体分层、装配方式或 Host / Engine 边界变化，检查并更新 `dayu/README.md`。
-- 若新增测试分层、架构测试或运行约定，检查并更新 `tests/README.md`。
-- 清理 docs 中已过时的草案表述，保留 design / migration-plan 作为历史设计与计划依据。
-- 在 issue #2 汇总 Phase 完成状态和剩余 issue。
-
-### 允许复用的 OLD implementation 片段
-
-- 不适用。Phase 6 不迁实现代码。
-
-### 禁止迁移项
-
-- 不新增生产代码。
-- 不新增未 review 的公共接口。
-- 不把未来计划写进 README。
-- 不把 Host / fins / capability 具体实现写进 Engine README。
-
-### 测试要求
-
-- 若只改文档，至少运行 markdown / diff check。
-- 若 README 同步伴随代码收口，运行全量受影响测试和 pyright。
-- 确认架构测试仍长期保留。
-
-### pyright 要求
-
-- 若 Phase 6 不改代码，可复用上一实现 Phase 的 pyright 结果；最终收口 PR 仍建议运行 pyright。
-
-### README / docs 同步要求
-
-- `dayu/engine/README.md` 只写 Engine 当前架构、公共契约、Runner/Agent 事件流、状态机、扩展点。
-- 根 README 只在用户安装、配置、运行、CLI 或导航变化时更新。
-- `dayu/README.md` 只在整体架构或分层边界实际变化时更新。
-- `tests/README.md` 只在测试分层、运行方式、约定变化时更新。
-
-### review Agent 审查重点
-
-- README 是否写当前事实而不是未来设计。
-- 是否残留 OLD 术语、旧路径、旧入口、旧架构表述。
-- docs 是否与代码真源冲突。
-- 是否漏掉触发规则要求的 README。
-
-### 总控验收标准
-
-- Phase 6 可独立形成文档 PR，也可作为最后实现 PR 的文档收口部分。
-- README 与当前代码一致。
-- issue #2 有阶段总结。
-- 后续拆分 issue 明确。
-
-### 用户确认点
-
-- 是否确认 Engine 迁移阶段可以收口。
-- 是否确认进入 Host / ToolRuntime / capability 后续迁移。
+- 是否需要将 DuplicateCallGuard、provider-specific reasoning roundtrip、Runner response cleanup hardening 分别开后续 issue。
+- 是否需要为 context overflow / Host context compaction 协作创建后续独立 issue。
+- 是否确认 Phase 5 合并原 Phase 6 文档收口后，下一步进入 Host / ToolRuntime / capability 后续迁移。
 
 ## 12. 跨阶段架构测试
 
@@ -815,7 +710,7 @@ Phase 5 仍保留 context budget、continuation、provider error / broader fallb
 
 - issue #2 作为 Engine 迁移总控 issue，记录设计、计划、review、总控验收和阶段进展。
 - 每个 Phase 建议单独开子 issue，issue 标题格式建议为：`Engine Phase N: <名称>`。
-- 每个 Phase 原则上单独 PR，除非 Phase 6 作为某个实现 PR 的文档收口部分；若合并多个 Phase，必须由总控和用户确认。
+- 每个 Phase 原则上单独 PR。当前已确认原 Phase 6 合并为 Phase 5 的文档 / 验收收口部分；后续若再合并多个 Phase，必须由总控和用户确认。
 - 扩展 outcome 使用 issue #4 作为总跟踪，并为每个扩展分支单独开子 issue。
 - 取消治理增强使用 issue #3 跟踪，不塞进 Engine 初始迁移。
 - Host ToolRuntime / ToolRegistry 具体实现必须另开 Host 迁移 issue。
@@ -839,8 +734,8 @@ Phase 5 仍保留 context budget、continuation、provider error / broader fallb
 - Runner 需要执行工具或依赖 ToolExecutor。
 - ToolExecutor 需要恢复 `get_schemas()`、`get_tool_display_info()` 或其它 Registry 能力。
 - `ToolExecutionOutcome` 需要新增 `approval_required`、`detached`、`retry_after`、`artifact_ready` 等分支。
-- awaiting 需要 Engine sleep、轮询、创建后台任务或写 wait record。
-- context budget 需要语义压缩、conversation memory 或业务语义。
+- awaiting / suspend 需要 Engine sleep、轮询、创建后台任务、写 wait record 或新增 resume API。
+- context budget 需要 Engine 内 compact / retry、语义压缩、conversation memory 或业务语义。
 - 财报工具需要绕过 `dayu.fins.storage` 直接读文件。
 - 为了让旧测试通过而需要兼容 wrapper / facade / re-export。
 - 为了快速实现而出现 `Any`、`object`、裸 dict、开放 metadata 承载契约事实。

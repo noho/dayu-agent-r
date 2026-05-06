@@ -28,6 +28,10 @@ class AgentFallbackMode(StrEnum):
 _DEFAULT_FALLBACK_PROMPT: str = (
     "请基于目前已经获得的上下文直接给出最终回答，不要再调用工具。"
 )
+_DEFAULT_CONTINUATION_PROMPT: str = (
+    "Your previous response was truncated (finish_reason=length). "
+    "Continue from where you left off without repeating content already produced."
+)
 _DEFAULT_MAX_CONSECUTIVE_FAILED_TOOL_BATCHES: int = 2
 
 
@@ -42,6 +46,8 @@ class AgentPolicy:
     :param fallback_mode: 普通工具轮次耗尽或连续失败工具批次达到阈值后的
         收口模式。
     :param fallback_prompt: force-answer 时追加给 Runner 的用户消息。
+    :param continuation_prompt: ``finish_reason=length`` 续写时追加给
+        Runner 的用户消息。
     :param max_consecutive_failed_tool_batches: 连续全失败工具批次阈值。
     """
 
@@ -50,6 +56,7 @@ class AgentPolicy:
     allow_tool_calls: bool
     fallback_mode: AgentFallbackMode = AgentFallbackMode.FORCE_ANSWER
     fallback_prompt: str = _DEFAULT_FALLBACK_PROMPT
+    continuation_prompt: str = _DEFAULT_CONTINUATION_PROMPT
     max_consecutive_failed_tool_batches: int = (
         _DEFAULT_MAX_CONSECUTIVE_FAILED_TOOL_BATCHES
     )
@@ -57,9 +64,16 @@ class AgentPolicy:
     def __post_init__(self) -> None:
         """校验 Agent 策略边界。
 
-        :raises ValueError: 连续失败工具批次阈值小于 1 时抛出。
+        :raises ValueError: continuation 次数小于 0、continuation prompt
+            为空或连续失败工具批次阈值小于 1 时抛出。
         """
 
+        if self.continuation_max_attempts < 0:
+            raise ValueError(
+                "AgentPolicy.continuation_max_attempts must be >= 0"
+            )
+        if self.continuation_prompt.strip() == "":
+            raise ValueError("AgentPolicy.continuation_prompt must not be empty")
         if self.max_consecutive_failed_tool_batches < 1:
             raise ValueError(
                 "AgentPolicy.max_consecutive_failed_tool_batches must be >= 1"

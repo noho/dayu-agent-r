@@ -103,7 +103,19 @@ Phase 3 不实现：
 
 这些能力分别属于后续 Host / Worker / Phase 4+ 设计。
 
-## 7. EngineWorker 最小接口
+## 7. Context Compaction Early Stop 后续职责
+
+`context_compaction_requested` 是后续 Host 上下文治理可能需要的 Engine 协作事件草案，不是当前已实现能力，也不是本轮 Engine 迁移范围。
+
+后续如果 Host 实施 context overflow / compaction 治理，可按以下职责边界设计：
+
+- Engine 只暴露单 run 上下文压力的中性事实，例如当前 run、iteration、估算压力、触发原因和已观测事件。
+- Host 基于 conversation_memory、transcript、tool facts 和 session 状态压缩或重构上下文。
+- Host 以新的 `AgentRunRequest` 重新发起 run，并负责幂等、观测、审计和失败治理。
+
+该能力不是 Engine 内 compact / retry；不是 `run_suspended` / resume；也不是 issue #4 的等待型 suspend。本文只确认未来职责归属和后续实现边界，不表示 Host 当前已经实现该能力，也不要求当前 Engine 迁移实现 `context_compaction_requested`、`context_compaction_required`、`max_context_tokens` 或 trigger ratio。
+
+## 8. EngineWorker 最小接口
 
 EngineWorker 第一版采用简单接口。参数签名后续可随 Host / Worker 真实实现调整，但第一版语义先固定为：
 
@@ -135,7 +147,7 @@ class EngineWorker(Protocol):
 
 EngineWorker 不需要知道自己是被 local proxy 还是 remote proxy 调用。
 
-## 8. Proxy / Stub 边界
+## 9. Proxy / Stub 边界
 
 Host 不直接区分本地或远程 Engine 细节，而是通过 proxy 使用 EngineWorker capability。
 
@@ -168,7 +180,7 @@ Proxy / Stub 不是 Phase 3 的实现目标，但它们定义了后续远程化�
 - EngineWorker 仍保持同一语义，内部 in-process 调 Engine。
 - Remote Agent 表示 RemoteStub 侧的 EngineWorker 同时承载 Engine 和 remote ToolExecutor。
 
-## 9. HostEvent / WorkerEvent 边界
+## 10. HostEvent / WorkerEvent 边界
 
 `EngineEvent` 是 Engine 产出的业务事件事实。
 
@@ -190,7 +202,7 @@ HostEvent(worker_closed)
 - LocalProxy / RemoteProxy 后续负责把 EngineEvent 包装进 HostEvent，并补充 worker lifecycle、RPC failure、heartbeat、disconnect 等运行环境事件。
 - Phase 3 不实现 HostEvent / WorkerEvent，只需确保 Engine 和 ToolExecutor 边界不阻碍 Proxy 后续包装事件。
 
-## 10. Review 约束
+## 11. Review 约束
 
 后续 review 必须按以下口径判断：
 

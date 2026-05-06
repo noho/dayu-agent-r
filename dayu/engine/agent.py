@@ -1,11 +1,12 @@
-"""Phase 3 run-scoped Agent 主链路实现。
+"""run-scoped Agent 主链路实现。
 
 本模块承载 Engine 内部 Agent 状态机：
 
 - 公共调用方通过 :func:`run_agent_messages` /
   :func:`run_agent_and_wait` 使用函数式入口。
 - 私有 :class:`_AsyncAgent` 负责单次 run 内的 RunnerEvent 消费、
-  EngineEvent 提升、普通 tool calling 闭环、终态收口与 Runner close。
+  EngineEvent 提升、普通 tool calling 闭环、length continuation、
+  终态收口与 Runner close。
 - Engine 只消费 ToolExecutor protocol；不注册工具、不发现工具、不持有
   ToolRegistry，也不理解 ToolExecutor 的真实部署位置。
 """
@@ -114,6 +115,9 @@ _ERROR_FORCE_ANSWER_EMPTY: str = "force_answer_empty"
 _ERROR_CONSECUTIVE_FAILED_TOOL_BATCHES: str = (
     "consecutive_failed_tool_batches"
 )
+_ERROR_CONTINUATION_TOOL_CALL_NOT_ALLOWED: str = (
+    "continuation_tool_call_not_allowed"
+)
 _RUNNER_ERROR_WITHOUT_DETAIL_MESSAGE: str = (
     "runner finished with error without detail"
 )
@@ -133,6 +137,9 @@ _MAX_ITERATIONS_EXHAUSTED_MESSAGE: str = (
 )
 _CONSECUTIVE_FAILED_TOOL_BATCHES_MESSAGE: str = (
     "consecutive failed tool batches threshold reached"
+)
+_CONTINUATION_TOOL_CALL_NOT_ALLOWED_MESSAGE: str = (
+    "continuation runner call produced tool calls while tools were disabled"
 )
 _EXCEPTION_MESSAGE_REDACTED: str = "exception message redacted"
 _EXCEPTION_MESSAGE_MAX_LENGTH: int = 240
@@ -398,12 +405,20 @@ class _AsyncAgent:
 
             messages: list[AgentMessage] = list(self._request.messages)
             ordinary_iterations = self._request.agent_policy.max_iterations
+            continuation_content_parts: list[str] = []
+            continuation_attempts = 0
+            continuation_active = False
 
             for iteration_index in range(ordinary_iterations):
                 iteration_id = self._iteration_id(iteration_index)
-                effective_tools = self._effective_tools()
+                effective_tools = (
+                    () if continuation_active else self._effective_tools()
+                )
                 tool_calls_enabled = len(effective_tools) > 0
 
+                if self._is_cancelled():
+                    yield await self._make_cancelled_terminal_with_close()
+                    return
                 async for event in self._run_runner_iteration(
                     messages=messages,
                     iteration_id=iteration_id,
@@ -428,6 +443,16 @@ class _AsyncAgent:
                     yield await self._make_cancelled_terminal_with_close()
                     return
 
+                if continuation_active:
+                    continuation_failure = self._continuation_tool_call_failure(
+                        state
+                    )
+                    if continuation_failure is not None:
+                        yield await self._make_failed_or_cancelled_terminal_with_close(
+                            continuation_failure
+                        )
+                        return
+
                 decision = self._classify_iteration(
                     state=state,
                     iteration_id=iteration_id,
@@ -436,6 +461,23 @@ class _AsyncAgent:
                     degraded=False,
                 )
                 if isinstance(decision, _FinalDecision):
+                    continuation_decision = self._handle_final_decision(
+                        messages=messages,
+                        decision=decision,
+                        iteration_index=iteration_index,
+                        continuation_content_parts=continuation_content_parts,
+                        continuation_attempts=continuation_attempts,
+                        continuation_active=continuation_active,
+                    )
+                    if isinstance(continuation_decision, _FinalDecision):
+                        yield await self._make_final_or_cancelled_after_close(
+                            continuation_decision
+                        )
+                        return
+                    if continuation_decision is None:
+                        continuation_attempts += 1
+                        continuation_active = True
+                        continue
                     yield await self._make_final_or_cancelled_after_close(decision)
                     return
                 if isinstance(decision, RunFailedData):
@@ -444,6 +486,7 @@ class _AsyncAgent:
                     )
                     return
 
+                continuation_active = False
                 async for event in self._execute_tool_batch(decision):
                     yield event
                     if self._is_terminal(event):
@@ -502,6 +545,123 @@ class _AsyncAgent:
         finally:
             await self._close_runner_once()
             self._release_run_slot()
+
+    def _handle_final_decision(
+        self,
+        *,
+        messages: list[AgentMessage],
+        decision: _FinalDecision,
+        iteration_index: int,
+        continuation_content_parts: list[str],
+        continuation_attempts: int,
+        continuation_active: bool,
+    ) -> _FinalDecision | None:
+        """处理普通 final decision 与 length continuation。
+
+        :param messages: 可追加的 run-local 消息列表。
+        :param decision: 当前 Runner 调用得到的 final decision。
+        :param iteration_index: 当前迭代序号。
+        :param continuation_content_parts: 已累积的 continuation 内容片段。
+        :param continuation_attempts: 已发起的 continuation 次数。
+        :param continuation_active: 当前 Runner 调用是否为 continuation。
+        :returns: 返回 final decision 表示应终止；返回 ``None`` 表示已准备
+            下一轮 continuation。
+        :raises Exception: 不主动抛出异常。
+        """
+
+        if decision.finish_reason is FinishReason.LENGTH:
+            return self._handle_length_final_decision(
+                messages=messages,
+                decision=decision,
+                iteration_index=iteration_index,
+                continuation_content_parts=continuation_content_parts,
+                continuation_attempts=continuation_attempts,
+            )
+        if continuation_content_parts or continuation_active:
+            return _FinalDecision(
+                content="".join(
+                    [*continuation_content_parts, decision.content]
+                ),
+                filtered=decision.filtered,
+                degraded=True,
+                finish_reason=decision.finish_reason,
+            )
+        return decision
+
+    def _handle_length_final_decision(
+        self,
+        *,
+        messages: list[AgentMessage],
+        decision: _FinalDecision,
+        iteration_index: int,
+        continuation_content_parts: list[str],
+        continuation_attempts: int,
+    ) -> _FinalDecision | None:
+        """处理 ``finish_reason=length`` 的续写状态转移。
+
+        :param messages: 可追加的 run-local 消息列表。
+        :param decision: 当前 length final decision。
+        :param iteration_index: 当前迭代序号。
+        :param continuation_content_parts: 已累积的 continuation 内容片段。
+        :param continuation_attempts: 已发起的 continuation 次数。
+        :returns: 返回 final decision 表示达到边界后终止；返回 ``None``
+            表示已注入 continuation prompt，调用方应进入下一轮 Runner。
+        :raises Exception: 不主动抛出异常。
+        """
+
+        continuation_content_parts.append(decision.content)
+        can_continue = continuation_attempts < (
+            self._request.agent_policy.continuation_max_attempts
+        )
+        has_iteration_budget = (
+            iteration_index + 1 < self._request.agent_policy.max_iterations
+        )
+        if not can_continue or not has_iteration_budget:
+            return _FinalDecision(
+                content="".join(continuation_content_parts),
+                filtered=decision.filtered,
+                degraded=True,
+                finish_reason=decision.finish_reason,
+            )
+
+        if decision.content:
+            messages.append(
+                AssistantMessage(
+                    role=AgentMessageRole.ASSISTANT,
+                    content=decision.content,
+                    reasoning_content=None,
+                    tool_calls=(),
+                )
+            )
+        messages.append(
+            UserMessage(
+                role=AgentMessageRole.USER,
+                content=self._request.agent_policy.continuation_prompt,
+            )
+        )
+        return None
+
+    def _continuation_tool_call_failure(
+        self, state: _IterationState
+    ) -> RunFailedData | None:
+        """识别 continuation 轮非法工具调用。
+
+        :param state: 当前 Runner 调用消费状态。
+        :returns: 非法工具调用失败 data；未发现时返回 ``None``。
+        :raises Exception: 不主动抛出异常。
+        """
+
+        if (
+            state.tool_calls is not None
+            or state.tool_call_signal_seen
+            or state.finish_reason is FinishReason.TOOL_CALLS
+        ):
+            return RunFailedData(
+                error_code=_ERROR_CONTINUATION_TOOL_CALL_NOT_ALLOWED,
+                message=_CONTINUATION_TOOL_CALL_NOT_ALLOWED_MESSAGE,
+                recoverable=False,
+            )
+        return None
 
     def _acquire_run_slot(self) -> None:
         """申请运行槽位。
