@@ -58,7 +58,7 @@
 
 - 涉及 schema 变更时：
   - 一律按全新 schema 起库处理；禁止旧库兼容读取、兼容测试，除非当前任务明确要求兼容升级；
-  - 同时必须将旧库迁移动作作为 `workspace_migrations` 的一个插件进入`dayu-cli init` 流程。
+  <!-- - 同时必须将旧库迁移动作作为 `workspace_migrations` 的一个插件进入`dayu-cli init` 流程。 -->
 
 ## 测试与验证
 

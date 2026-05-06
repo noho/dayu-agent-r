@@ -30,6 +30,7 @@ pyright
 
 ```bash
 pytest tests/contracts -q
+pytest tests/host -q
 pytest tests/engine/contracts -q
 pytest tests/engine/runners/openai/test_event_flow_ordering.py -q
 ```
@@ -55,6 +56,16 @@ Engine 契约、包根导出、事件契约与架构边界测试，覆盖 `dayu.
 - 事件契约与消息契约：覆盖 EngineEvent、RunnerEvent、AgentMessage、metadata、终态事件集合等结构约束。
 - Agent 状态机：覆盖无工具 final / failed / cancelled、普通 completed / failed tool calling、工具结果投影、max iteration force-answer、连续失败工具批次保护、awaiting 拒绝与取消优先级。
 - smoke 脚本轻量测试：覆盖 provider smoke 与 tool-call smoke 的参数解析、缺 key 跳过、安全输出和 fake 工具行为，不做真实联网。
+
+### `tests/host/`
+
+Host P1 最小 Run harness 测试，覆盖 `dayu.host` 当前已落地的边界：
+
+- run harness：验证 public `start_run` 可经 Host 调用 Engine 函数式入口，并把 `EngineEvent` 翻译为 `RunEvent`。
+- tool-call smoke：通过内部 `LocalRunHarness` 注入 fake ToolExecutor，覆盖 Runner tool call -> Engine 工具闭环 -> Host RunEvent stream。
+- public boundary：锁定 `dayu.host.__all__`，阻止 `EngineWorker`、`LocalProxy`、`ToolExecutor`、`run_agent_messages` 泄漏为包根 API。
+- import boundary：阻止 Host 导入 `dayu.fins`、`dayu.service`、`dayu.ui`。
+- weak typing guard：扫描 `dayu.host` 源码，阻止 `Any`、`object`、无类型签名与裸容器注解。
 
 ### `tests/engine/contracts/`
 
