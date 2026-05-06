@@ -8,8 +8,9 @@
 当前总控状态：
 
 - P1 已通过 PR #16 合入 `main`，当前确认基线为 `051cf20`。
-- P1.5 已在分支 `codex/host-p1-5-eventlog` 完成 plan、代码实施、code review 与 PR review 修复。
-- P1.5 PR #17 已创建并更新，当前处于可合并状态；用户合入 `main` 后，总控进入 P2。
+- P1.5 已通过 PR #17 合入 `main`，merge commit 为 `ec1627c94f352205ee77bcd992d652e677fa0ebb`。
+- 当前进入 P2，分支为 `codex/host-p2-toolruntime-truncate`；下一步派 Agent 编写 P2 phase
+  handoff plan。
 
 每个 Phase 进入实现前，必须另写可交接的 phase plan，细化到迁移 Agent 可以直接接手：
 目标、非目标、边界、文件级改动清单、契约变化、状态机、测试清单、验证命令、review gate、
@@ -52,24 +53,28 @@ codex/host-p{phase}-{short-name}
 2. 派 Agent 写 phase handoff plan。
 3. 派 review Agent 做 plan review，必要时派第二个 review Agent 做 OLD / NEW 对比或最佳实践 review。
 4. plan review 不通过时，派 Agent 修 plan，并在对应 review 文档标注修复状态。
-5. plan review 通过后，停下来等用户人工 review。
-6. 用户确认后，commit phase plan 与 review 文档。
-7. 派迁移 Agent 按通过的 plan 生成代码。
-8. 派 code review Agent 做 code review，必要时派额外 review Agent 做 OLD / NEW 对比、架构边界、
+5. 派 review Agent 复审修复后的 plan；若仍不通过，重复步骤 4-5，直到 review Agent 明确通过。
+6. plan review 通过后，停下来等用户人工 review。
+7. 用户确认后，commit phase plan 与 review 文档。
+8. 派迁移 Agent 按通过的 plan 生成代码。
+9. 派 code review Agent 做 code review，必要时派额外 review Agent 做 OLD / NEW 对比、架构边界、
    类型安全或并发专项 review。
-9. code review 不通过时，派 Agent 修复代码，并在对应 code review 文档标注修复状态。
-10. code review 通过后，停下来等用户人工 review。
-11. 用户确认后，commit 代码、测试和必要 README / docs 更新。
-12. 准备 PR 时，确认只包含本 Phase 范围内提交，push 并创建 ready PR；不创建 draft PR，
+10. code review 不通过时，派 Agent 修复代码，并在对应 code review 文档标注修复状态。
+11. 派 code review Agent 复审修复后的代码；若仍不通过，重复步骤 10-11，直到 review Agent 明确通过。
+12. code review 通过后，停下来等用户人工 review。
+13. 用户确认后，commit 代码、测试和必要 README / docs 更新。
+14. 准备 PR 时，确认只包含本 Phase 范围内提交，push 并创建 ready PR；不创建 draft PR，
     除非用户明确要求。
-13. 派 PR code review Agent 审查 PR diff，必要时继续修复、复审、补 commit。
-14. PR review 通过后，停下来等用户确认。
-15. squash merge PR 并删除远端分支默认由用户执行；只有用户明确指示总控 Agent 执行时，
+15. 派 PR code review Agent 审查 PR diff，必要时继续修复、复审、补 commit，直到 PR review
+    Agent 明确通过。
+16. PR review 通过后，停下来等用户确认。
+17. squash merge PR 并删除远端分支默认由用户执行；只有用户明确指示总控 Agent 执行时，
     总控 Agent 才能执行 squash merge / delete branch。用户手工 merge 后，总控只记录状态。
 
 禁止事项：
 
 - 不在未通过 plan review 的情况下写生产代码。
+- 不用总控 Agent 自己的复核替代 review Agent 的通过结论。
 - 不在 review finding 未标注修复状态的情况下声称 review 通过。
 - 不把多个 Phase 的实现混进一个 PR，除非用户明确批准合并。
 - 不在用户确认前 commit / push / create PR / merge。
@@ -86,6 +91,7 @@ EngineWorker
   -> Conversation Memory
   -> context overflow / compaction 协作
   -> no-full-governance multi-turn smoke
+  -> deferred-scope reconciliation
 ```
 
 这里的“没有完整生产治理”只表示先不实现完整多进程并发、恢复、Remote、Outbox、
@@ -101,6 +107,7 @@ audit hard-gate 等生产治理；不表示可以破坏分层、跳过强类型�
 | P3 | Conversation Memory / ContextBuilder | 迁移 Host 上下文治理核心，使多轮上下文可构造 | ContextBuilder 可消费事实、客户端 timeline 展示事实、只可观测 facts 三类边界；pinned_state、memory pool、tool facts projection | 不做 context overflow 完整协作、不做 Reply Outbox、不把 reasoning 回流运行态 | 多轮 Run 可以基于 Session / memory 构造下一轮输入；reasoning 只进展示 read model |
 | P4 | Host Compact for Context Overflow | 把 OLD 中原本在 Engine 内做的 compact 搬到 Host，使 Engine context overflow 时仍能继续运行 | Host compact 入口、compact 输入 / 输出、Engine overflow 事件 / 错误映射、compact 后 attempt 输入重建 | 不实现完整 context governance；不引入 replay / validation 联动；不在 Engine 内实现 compact/retry | Engine 遇到 context overflow 时，Host 完成 compact 后继续运行或明确失败收口 |
 | P5 | No-Full-Governance Multi-Turn Smoke | 将 P1-P4 与 P1.5 串成最小纵向 smoke | smoke CLI / test harness、端到端多轮测试、必要 README / tests 文档 | 不做完整多进程治理、不做 Remote、不做 Outbox、不做 audit hard-gate；不验证 `start_run` 幂等、active Run 并发仲裁或调用重试语义 | 一个单调用方、顺序执行的无完整生产治理多轮会话可按目标事实层跑通，含工具截断补读、memory、compaction |
+| P5.5 | Deferred Scope Reconciliation | 回看 P1-P5 所有“本阶段不实现”能力，确认没有遗留能力被漏排或误排 | deferred-scope inventory、能力归属表、后续 Phase 调整建议、必要的新 Phase / issue / plan 修订 | 不写生产代码；不把未落地能力补写成已落地事实；不直接修改后续 Phase 代码边界 | P1-P5 的非目标均被明确标记为已实现、已安排到 P6+、新增 Phase / issue 承接，或经用户确认关闭 |
 | P6 | EventLog Persistence / Projection / Observers Hardening | 在 P1.5 最小事实层上建立可靠持久化与派生机制 | 持久 EventLog、projection checkpoint、tool trace observer、audit observer、timeline projection、observer retry / lag | 不把 trace 写回 Engine，不要求所有 observer hard-gate | tool trace / audit / timeline 可由 EventLog 幂等派生 |
 | P7 | Session / Run Lifecycle Governance | 完整落地 Session / Run 状态机、admission policy、取消基础治理 | SessionManager、RunManager、RunSupervisor、状态机测试、cancel_run、生产级 admission policy | 不做 issue #3 的强制终止增强、不做 wait / suspend | 同 Session 单 active Run、幂等 start_run、取消基础收口稳定 |
 | P8 | Attempt Lease / Recovery / 多进程并发 | 落地 AttemptSupervisor、lease / fencing、startup recovery | attempt 表 / store、owner token、stale cleanup、orphan recovery、多进程测试、lane runtime dependency 判断 | 不做 Remote RPC；不把 lane 实现为 Host 私有能力 | 多进程下迟到 owner 写入被拒绝，orphan / stale 可恢复或 LOST |
@@ -145,6 +152,11 @@ P5 smoke 只覆盖单进程、单调用方、顺序执行 happy path：每轮等
 P5 需要最小 Run 创建事实和 Session 下多轮顺序，但不以生产级 `start_run` 幂等、
 同 Session active Run admission policy、断线重试或并发输入仲裁为前提。这些治理能力仍留在 P7。
 
+P5.5 是非生产代码的总控核对阶段。它必须逐项回看 P1、P1.5、P2、P3、P4、P5 phase plan 中
+“本阶段不实现”“明确不做”“后移”的能力，判断每项是否已经被后续 Phase 承接、需要调整到现有
+P6+、需要新增 Phase / issue，或应经用户确认关闭。P5.5 的输出是排期与边界修订，不直接补实现；
+如果发现某个能力会改变 P6+ 的目标、非目标或验收信号，必须更新总控计划并走对应 review gate。
+
 P7 实施 `start_run` 幂等时，必须重新讨论并固定 `(session_id, client_request_id)` 如何幂等映射到
 同一个 `run_id`：包括 `run_id` 由 Host 生成还是由持久 Run 创建事实确定、重复请求返回同一
 `RunStream` / `RunHandle` 的精确语义、原 Run 已 terminal 或事件 cursor 已推进时的补读起点、
@@ -171,9 +183,13 @@ docs/host/phase{N}-{topic}-review.md
 例如：
 
 ```text
+docs/host/phase1_5-plan.md
+docs/host/phase5_5-plan.md
 docs/host/phase8-concurrency-review.md
 docs/host/phase11-wait-state-review.md
 ```
+
+小数 Phase 的文件名使用下划线，例如 P1.5 对应 `phase1_5-*`，P5.5 对应 `phase5_5-*`。
 
 所有 review finding 修复后，必须在对应 review 文档写入“修复状态”章节。
 
@@ -231,6 +247,17 @@ P1 必须增加 EngineWorker public boundary gate：
 - EngineWorker 只能作为 Host capability / 内部 protocol 被装配和测试。
 - 若 P1 代码或文档把 EngineWorker、ToolExecutor 暴露给 UI / Service 调用方，则 plan review
   或 code review 必须判定不通过。
+
+P2 必须增加 OLD / NEW code review gate：
+
+- P2 代码 review 除常规 code review Agent 外，必须额外派 OLD / NEW 对比 review Agent。
+- OLD / NEW review 必须对照 OLD `TruncationManager`、OLD `fetch_more` schema、OLD
+  `project_for_llm` 与 OLD 测试，确认 NEW 继承 cursor lifecycle、scope token、TTL、
+  single-use、limit clamp、page structure 等底层可靠语义。
+- OLD / NEW review 同时必须确认 NEW 没有误恢复 OLD LLM-facing `fetch_more` 半协议，也没有把
+  OLD Engine 归属的实现机械迁回 `dayu.engine`。
+- P2 code review 只有常规 code review 与 OLD / NEW 对比 review 均明确通过后，才允许停下来等用户
+  人工 review。
 
 review Agent 不能只按 checklist 打勾；OLD Host 中可靠行为应作为强参考源，review 应开放式寻找
 遗漏能力、边界泄漏、状态机漏洞、幂等缺口、数据丢失窗口和多进程竞争问题。
@@ -296,25 +323,16 @@ PR 创建后：
 
 ## 11. 第一批 Phase 的启动顺序
 
-当前建议先启动 P1。P1 的 handoff plan 应重点回答：
+P1 与 P1.5 已完成并合入 `main`。当前启动 P2；P2 的 handoff plan 应重点回答：
 
-- Host 最小 public surface 是否只需要 `start_run` / `stream_run_events` / `get_run_result`
-  的测试级垂直切片，还是先只实现内部 `EngineWorker` capability。
-- public API gate 如何验证：调用方只能通过 Host 的 Run 入口或测试 harness 触达 Engine；
-  `EngineWorker.run_agent_messages` 与 `ToolExecutor.execute` 不能被暴露成 Host public API。
-- EngineEvent -> RunEvent 翻译薄层放在 Host 哪个模块。
-- LocalProxy 是否在 P1 就落地，RemoteProxy 只保留边界。
-- P1 如何证明 EngineWorker 是 Host capability，不新增业务层。
+- ToolRuntime 的最小 Host 边界是什么，哪些符号属于 public Run 级接口，哪些必须保持 Host 内部。
+- truncation / fetch_more 的事实来源如何接入 P1.5 RunEventStore，避免绕过 EventLog 形成第二套
+  transcript 或 tool result 真源。
+- cursor、scope token、TTL 与权限校验的最小契约如何表达，哪些只是 P2 单进程 smoke 临时实现。
+- 工具结果截断、补读请求、补读完成 / 失败、过期 / denied 等事实进入 canonical RunEvent 还是
+  ToolRuntime 内部 fact store；若不进入 RunEvent，P6 observer 如何可追溯。
+- EngineWorker / ToolExecutor 边界如何保持：Engine 只发起工具调用语义，Host / ToolRuntime
+  负责截断、补读与治理事实。
+- P2 不提前实现完整 ToolRegistry 权限、P6 observer、P7 lifecycle governance 或多进程 recovery。
 
-P1.5 必须在 P2 前完成。P1.5 的 handoff plan 应重点回答：
-
-- 最小 EventLog / RunEventStore 的接口与落点。
-- append-before-stream 如何保证。
-- per-run cursor 与 `stream_run_events(after=cursor)` exclusive 语义。
-- canonical / preview event 分层如何表达。
-- terminal event 与最小 Run state 如何调和。
-- 哪些临时实现可接受，例如测试级简单持久 store 或 in-memory store。
-- 哪些临时实现不可接受，例如绕过 RunEvent 直接写 memory、timeline、trace 或 smoke transcript。
-- P6 如何在不倒改 P2-P5 事实来源的前提下，把最小 EventLog 演进为持久 EventLog 与 observer 机制。
-
-P1 / P1.5 plan review 通过且用户确认后，才能进入对应代码实现。
+P2 plan review 通过且用户确认后，才能进入 P2 代码实现。
