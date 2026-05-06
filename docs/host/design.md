@@ -22,21 +22,22 @@ EngineWorker 可以有两类形态：
 
 ```text
 Host
-  -> LocalEngineWorker
-      -> Engine
-      -> local ToolExecutor
+  -> LocalProxy
+      -> EngineWorker
+          -> Engine
+          -> local ToolExecutor
 ```
 
 ```text
 Host
-  -> RemoteEngineWorkerProxy
-      -> RPC
-          -> RemoteEngineWorkerStub
+  -> RemoteProxy
+      -> RemoteStub
+          -> EngineWorker
               -> Engine
               -> remote ToolExecutor
 ```
 
-Local Agent 表示 Engine 与 tools 在本地 worker 侧执行。Remote Agent 表示 Engine 与 tools 都在远程 worker 侧执行。
+Local Agent 表示 LocalProxy 通过本地 EngineWorker 让 Engine 与 tools 在本地 worker 侧执行。Remote Agent 表示 RemoteProxy 通过 RemoteStub 连接远端 EngineWorker，让 Engine 与 tools 都在远程 worker 侧执行。
 
 ## 3. ToolExecutor 归属
 
@@ -46,8 +47,8 @@ EngineWorker holds execution environment on behalf of Host。
 
 ToolExecutor 由 EngineWorker 替 Host 在执行环境中代持，并提供给 Engine：
 
-- LocalEngineWorker 替 Host 代持本地 ToolExecutor。
-- RemoteEngineWorkerStub 替 Host 代持远程 ToolExecutor。
+- 本地 EngineWorker 替 Host 代持本地 ToolExecutor。
+- RemoteStub 侧的 EngineWorker 替 Host 代持远程 ToolExecutor。
 - Engine 只消费 `ToolExecutor` protocol。
 - Engine 不知道 ToolExecutor 是本地实现还是远程 worker 内实现。
 - Engine 不注册工具、不发现工具、不持有 ToolRegistry。
@@ -78,7 +79,7 @@ Engine 的边界保持不变：
 
 - Engine 只依赖强类型 run request、RunnerSpec、ToolExecutor protocol、CancellationToken 等契约。
 - Engine 不依赖 Host / Service / UI 具体实现。
-- Engine 不知道 LocalEngineWorker / RemoteEngineWorkerProxy / RemoteEngineWorkerStub。
+- Engine 不知道 LocalProxy / RemoteProxy / RemoteStub / EngineWorker 的部署形态。
 - Engine 不关心 ToolExecutor 的真实部署位置。
 - EngineEvent 仍是 Engine 对外观测事实；网络传输协议不进入 Engine 核心。
 
@@ -97,7 +98,7 @@ Phase 3 不实现：
 - Host ToolRegistry。
 - 工具权限、审计、路径白名单。
 - 远程 RPC 协议。
-- RemoteEngineWorkerProxy / RemoteEngineWorkerStub。
+- RemoteProxy / RemoteStub。
 - awaiting / run_suspended。
 
 这些能力分别属于后续 Host / Worker / Phase 4+ 设计。
@@ -128,7 +129,7 @@ class EngineWorker(Protocol):
 
 取消语义必须按执行形态解释：
 
-- LocalProxy / LocalEngineWorker 可以直接传递 Host 创建的本地 `cancellation_token`。
+- LocalProxy / 本地 EngineWorker 可以直接传递 Host 创建的本地 `cancellation_token`。
 - RemoteProxy 不能把 Python 进程内 `cancellation_token` 对象当作跨进程序列化契约；RemoteStub 应在远端创建 worker-local cancellation token，并把 Host 的 `cancel(run_id)` 映射为远端取消信号。
 - `cancel(run_id)` 是独立控制通道。即使 `AgentRunRequest` 已携带 `cancellation_token`，远程 run 启动后仍需要通过 run id 定位并取消远端 worker 内正在执行的 run。
 

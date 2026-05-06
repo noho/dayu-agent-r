@@ -3,11 +3,13 @@
 from __future__ import annotations
 
 import json
+import logging
 from collections.abc import AsyncIterator, Mapping, Sequence
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
 
 import pytest
+from _pytest.logging import LogCaptureFixture
 
 from dayu.contracts.json_value import JsonValue
 from dayu.contracts.tool_call import (
@@ -809,7 +811,9 @@ async def test_tool_call_done_without_completed_data_is_protocol_error() -> None
 
 
 @pytest.mark.asyncio
-async def test_runner_exception_after_tool_batch_is_run_failed() -> None:
+async def test_runner_exception_after_tool_batch_is_run_failed(
+    caplog: LogCaptureFixture,
+) -> None:
     """第二轮 Runner 异常必须保留已注入工具上下文并收口 run_failed。"""
 
     executor = _RecordingToolExecutor(outcomes={"tc_1": _success({"sum": 5})})
@@ -818,11 +822,16 @@ async def test_runner_exception_after_tool_batch_is_run_failed() -> None:
         raise_on_call_indices=frozenset({1}),
     )
 
-    events = await _collect(
-        _AsyncAgent(request=_request(executor=executor), runner=runner)
-    )
+    with caplog.at_level(logging.WARNING, logger="dayu.engine.agent"):
+        events = await _collect(
+            _AsyncAgent(request=_request(executor=executor), runner=runner)
+        )
 
-    assert _failed_data(events).error_code == "runner_exception"
+    failed = _failed_data(events)
+    assert failed.error_code == "runner_exception"
+    assert failed.message == "RuntimeError: runner exploded"
+    assert "agent.runner_exception" in caplog.text
+    assert "RuntimeError: runner exploded" in caplog.text
     assert len(executor.requests) == 1
     assert len(runner.messages_seen) == 2
     second_messages = runner.messages_seen[1]
@@ -923,7 +932,9 @@ async def test_max_iterations_force_answer_and_raise_error() -> None:
             runner=_ScriptedRunner(scripts=(_tool_script(_tool_call("tc_1")),)),
         )
     )
-    assert _failed_data(raise_events).error_code == "max_iterations_exceeded"
+    raise_failed = _failed_data(raise_events)
+    assert raise_failed.error_code == "max_iterations_exceeded"
+    assert raise_failed.message == "agent policy max_iterations exhausted"
 
 
 @pytest.mark.asyncio
@@ -1024,7 +1035,11 @@ async def test_consecutive_failed_batches_force_answer_raise_and_reset() -> None
             ),
         )
     )
-    assert _failed_data(raise_events).error_code == "consecutive_failed_tool_batches"
+    raise_failed = _failed_data(raise_events)
+    assert raise_failed.error_code == "consecutive_failed_tool_batches"
+    assert raise_failed.message == (
+        "consecutive failed tool batches threshold reached"
+    )
 
     reset_executor = _RecordingToolExecutor(
         outcomes={"tc_1": _failed(), "tc_2": _success(2), "tc_3": _failed()}

@@ -128,6 +128,24 @@ _MISSING_TERMINAL_MESSAGE: str = "agent event stream ended without terminal"
 _FORCE_ANSWER_EMPTY_MESSAGE: str = (
     "force-answer runner did not produce final content"
 )
+_MAX_ITERATIONS_EXHAUSTED_MESSAGE: str = (
+    "agent policy max_iterations exhausted"
+)
+_CONSECUTIVE_FAILED_TOOL_BATCHES_MESSAGE: str = (
+    "consecutive failed tool batches threshold reached"
+)
+_EXCEPTION_MESSAGE_REDACTED: str = "exception message redacted"
+_EXCEPTION_MESSAGE_MAX_LENGTH: int = 240
+_SENSITIVE_EXCEPTION_MARKERS: tuple[str, ...] = (
+    "api_key",
+    "apikey",
+    "authorization",
+    "bearer ",
+    "header",
+    "password",
+    "secret",
+    "token",
+)
 
 _PlainJsonValue: TypeAlias = (
     None | bool | int | float | str | list["_PlainJsonValue"] | dict[str, "_PlainJsonValue"]
@@ -142,6 +160,41 @@ def _utc_now() -> datetime:
     """
 
     return datetime.now(tz=timezone.utc)
+
+
+def _exception_diagnostic_message(exc: Exception) -> str:
+    """构造可进入 run_failed 的异常诊断消息。
+
+    :param exc: 捕获到的异常。
+    :returns: 包含异常类型和安全摘要的诊断消息。
+    :raises Exception: 不主动抛出异常。
+    """
+
+    exc_type = type(exc).__name__
+    raw_message = str(exc)
+    if not raw_message:
+        return exc_type
+    lowered_message = raw_message.lower()
+    if any(marker in lowered_message for marker in _SENSITIVE_EXCEPTION_MARKERS):
+        return f"{exc_type}: {_EXCEPTION_MESSAGE_REDACTED}"
+    if len(raw_message) > _EXCEPTION_MESSAGE_MAX_LENGTH:
+        raw_message = raw_message[:_EXCEPTION_MESSAGE_MAX_LENGTH]
+    return f"{exc_type}: {raw_message}"
+
+
+def _fallback_error_message(error_code: str) -> str:
+    """返回 fallback RAISE_ERROR 模式下的人类可读失败消息。
+
+    :param error_code: fallback 触发原因错误码。
+    :returns: 面向诊断和上层展示的失败消息。
+    :raises Exception: 不主动抛出异常。
+    """
+
+    if error_code == _ERROR_MAX_ITERATIONS_EXCEEDED:
+        return _MAX_ITERATIONS_EXHAUSTED_MESSAGE
+    if error_code == _ERROR_CONSECUTIVE_FAILED_TOOL_BATCHES:
+        return _CONSECUTIVE_FAILED_TOOL_BATCHES_MESSAGE
+    return f"agent fallback raised error: {error_code}"
 
 
 def _build_runner(request: AgentRunRequest) -> AsyncRunner:
@@ -537,9 +590,16 @@ class _AsyncAgent:
         except asyncio.CancelledError:
             raise
         except Exception as exc:
+            _LOGGER.warning(
+                "agent.runner_exception run_id=%s iteration_id=%s exc_type=%s",
+                self._request.run_id,
+                iteration_id,
+                type(exc).__name__,
+                exc_info=True,
+            )
             self._last_iteration_state.failure_candidate = RunFailedData(
                 error_code=_ERROR_RUNNER_EXCEPTION,
-                message=type(exc).__name__,
+                message=_exception_diagnostic_message(exc),
                 recoverable=False,
             )
 
@@ -937,7 +997,7 @@ class _AsyncAgent:
             yield await self._make_failed_or_cancelled_terminal_with_close(
                 RunFailedData(
                     error_code=error_code,
-                    message=error_code,
+                    message=_fallback_error_message(error_code),
                     recoverable=False,
                 )
             )
