@@ -28,6 +28,7 @@ from dayu.engine.contracts.engine_events import (
     RunCancelledData,
     RunFailedData,
     RunSuspendedData,
+    TERMINAL_ENGINE_EVENT_TYPES,
 )
 from dayu.engine.contracts.finish_reason import FinishReason
 from dayu.engine.contracts.messages import (
@@ -315,6 +316,22 @@ def _final_event(events: Sequence[EngineEvent]) -> EngineEvent:
     return events[-1]
 
 
+def _assert_single_terminal_at_end(events: Sequence[EngineEvent]) -> None:
+    """断言 EngineEvent 流只有一个终态事件且终态位于最后。
+
+    :param events: 完整收集到的 EngineEvent 序列。
+    :returns: 无返回值。
+    :raises AssertionError: 事件流为空、终态数量不为一或终态不是最后一个时抛出。
+    """
+
+    assert events
+    terminal_events = [
+        event for event in events if event.type in TERMINAL_ENGINE_EVENT_TYPES
+    ]
+    assert len(terminal_events) == 1
+    assert terminal_events[0] is events[-1]
+
+
 @pytest.mark.asyncio
 async def test_success_run_lifts_runner_events_and_agent_final() -> None:
     """无工具成功 run 会提升 RunnerEvent 并由 Agent 产出 final_answer。"""
@@ -369,6 +386,7 @@ async def test_success_run_lifts_runner_events_and_agent_final() -> None:
     assert final.data.content == "你好"
     assert final.data.degraded is False
     assert runner.close_count == 1
+    _assert_single_terminal_at_end(events)
 
 
 @pytest.mark.asyncio
@@ -443,6 +461,7 @@ async def test_protocol_error_and_error_done_maps_to_run_failed() -> None:
     assert terminal.type is EngineEventType.RUN_FAILED
     assert isinstance(terminal.data, RunFailedData)
     assert terminal.data.error_code == "bad_sse"
+    _assert_single_terminal_at_end(events)
 
 
 @pytest.mark.asyncio
@@ -531,6 +550,7 @@ async def test_cancelled_before_run_closes_then_emits_cancelled() -> None:
     assert runner.close_count == 1
     assert runner.close_completed_at is not None
     assert terminal.data.finished_at >= runner.close_completed_at
+    _assert_single_terminal_at_end(events)
 
 
 @pytest.mark.asyncio
@@ -966,14 +986,4 @@ def _terminal_count(events: Sequence[EngineEvent]) -> int:
     :raises Exception: 不主动抛出异常。
     """
 
-    return sum(
-        1
-        for event in events
-        if event.type
-        in {
-            EngineEventType.FINAL_ANSWER,
-            EngineEventType.RUN_FAILED,
-            EngineEventType.RUN_CANCELLED,
-            EngineEventType.RUN_SUSPENDED,
-        }
-    )
+    return sum(1 for event in events if event.type in TERMINAL_ENGINE_EVENT_TYPES)

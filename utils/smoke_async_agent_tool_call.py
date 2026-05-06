@@ -566,11 +566,16 @@ def safe_event_summary(event: EngineEvent) -> str:
     """返回不含 key、prompt 与工具参数的事件摘要。
 
     :param event: EngineEvent。
-    :returns: 安全摘要字符串。
+    :returns: 安全摘要字符串；高频 delta 事件返回空字符串。
     :raises Exception: 不主动抛出异常。
     """
 
     data = event.data
+    if event.type in (
+        EngineEventType.RUNNER_CONTENT_DELTA,
+        EngineEventType.RUNNER_REASONING_DELTA,
+    ):
+        return ""
     if event.type is EngineEventType.TOOL_CALL_REQUESTED and isinstance(
         data, ToolCallRequestedData
     ):
@@ -626,7 +631,9 @@ async def run_case(
     final_answer: str | None = None
     print(f"{_CASE_PREFIX} {case.name} start stream={stream}")
     async for event in run_agent_messages(request):
-        print(safe_event_summary(event))
+        summary = safe_event_summary(event)
+        if summary:
+            print(summary)
         data = event.data
         if event.type is EngineEventType.FINAL_ANSWER and isinstance(
             data, FinalAnswerData

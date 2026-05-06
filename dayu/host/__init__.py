@@ -1,17 +1,20 @@
 """Host 公共入口。
 
-P1 仅暴露最小 Run harness 契约与 :func:`start_run` 测试入口。Host 内部的
-``EngineWorker``、``LocalProxy`` 与 ``ToolExecutor`` 代持不属于 public
-surface。
+P1.5 暴露最小 Run 级入口与事件事实读取接口。Host 内部的 ``EngineWorker``、
+``LocalProxy``、``WorkerProxy`` 与 ``ToolExecutor`` 代持不属于 public surface。
 """
 
 from __future__ import annotations
 
-from dayu.host._run_harness import start_run
+from dayu.host._run_harness import get_run_result, start_run, stream_run_events
 from dayu.host.contracts import (
+    HostRunFailedData,
     RunCancelledResult,
     RunEvent,
     RunEventCursor,
+    RunEventData,
+    RunEventKind,
+    RunEventSource,
     RunEventType,
     RunFailedResult,
     RunHandle,
@@ -26,9 +29,13 @@ from dayu.host.contracts import (
 )
 
 __all__ = [
+    "HostRunFailedData",
     "RunCancelledResult",
+    "RunEventData",
     "RunEvent",
     "RunEventCursor",
+    "RunEventKind",
+    "RunEventSource",
     "RunEventType",
     "RunFailedResult",
     "RunHandle",
@@ -40,5 +47,7 @@ __all__ = [
     "RunSucceededResult",
     "RunSuspendedResult",
     "StartRunRequest",
+    "get_run_result",
     "start_run",
+    "stream_run_events",
 ]

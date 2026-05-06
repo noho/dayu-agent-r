@@ -1,4 +1,4 @@
-"""Host P1 public API 边界测试。"""
+"""Host public API 边界测试。"""
 
 from __future__ import annotations
 
@@ -8,9 +8,13 @@ import dayu.host as host
 
 EXPECTED_EXPORTS: frozenset[str] = frozenset(
     {
+        "HostRunFailedData",
         "RunCancelledResult",
+        "RunEventData",
         "RunEvent",
         "RunEventCursor",
+        "RunEventKind",
+        "RunEventSource",
         "RunEventType",
         "RunFailedResult",
         "RunHandle",
@@ -22,7 +26,9 @@ EXPECTED_EXPORTS: frozenset[str] = frozenset(
         "RunSucceededResult",
         "RunSuspendedResult",
         "StartRunRequest",
+        "get_run_result",
         "start_run",
+        "stream_run_events",
     }
 )
 
@@ -37,7 +43,7 @@ FORBIDDEN_EXPORTS: frozenset[str] = frozenset(
 
 
 def test_host_all_matches_expected_p1_surface() -> None:
-    """``dayu.host.__all__`` 只暴露 P1 最小 public surface。"""
+    """``dayu.host.__all__`` 只暴露当前最小 public surface。"""
 
     actual = frozenset(host.__all__)
     assert actual == EXPECTED_EXPORTS, (
@@ -60,3 +66,10 @@ def test_public_start_run_is_async_entrypoint() -> None:
     """public start_run 必须保持 async 入口语义。"""
 
     assert inspect.iscoroutinefunction(host.start_run)
+
+
+def test_public_run_read_apis_have_expected_async_shape() -> None:
+    """Run 级读取入口保持当前 public API 形态。"""
+
+    assert not inspect.iscoroutinefunction(host.stream_run_events)
+    assert inspect.iscoroutinefunction(host.get_run_result)

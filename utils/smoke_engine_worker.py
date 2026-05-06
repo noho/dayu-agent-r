@@ -612,7 +612,9 @@ async def run_case(
         request=request,
         cancellation_token=_SmokeCancellationToken(),
     ):
-        print(safe_event_summary(event))
+        summary = safe_event_summary(event)
+        if summary:
+            print(summary)
         data = event.data
         if event.type is EngineEventType.FINAL_ANSWER and isinstance(
             data, FinalAnswerData

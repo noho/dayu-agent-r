@@ -17,7 +17,7 @@ import asyncio
 import json
 import logging
 import threading
-from collections.abc import AsyncIterator, Mapping, Sequence
+from collections.abc import AsyncGenerator, AsyncIterator, Mapping, Sequence
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from typing import TypeAlias, assert_never
@@ -380,7 +380,7 @@ class _AsyncAgent:
         self._executed_tool_call_ids: set[str] = set()
         self._consecutive_failed_tool_batches: int = 0
 
-    async def run_messages(self) -> AsyncIterator[EngineEvent]:
+    async def run_messages(self) -> AsyncGenerator[EngineEvent, None]:
         """运行 Agent 并产出 EngineEvent 流。
 
         :returns: EngineEvent 异步流。
@@ -1496,7 +1496,7 @@ class _AsyncAgent:
 
 async def run_agent_messages(
     request: AgentRunRequest,
-) -> AsyncIterator[EngineEvent]:
+) -> AsyncGenerator[EngineEvent, None]:
     """运行 Agent 并流式返回 EngineEvent。
 
     :param request: Agent run 请求。
@@ -1510,8 +1510,12 @@ async def run_agent_messages(
 
     runner = _build_runner(request)
     agent = _AsyncAgent(request=request, runner=runner)
-    async for event in agent.run_messages():
-        yield event
+    events = agent.run_messages()
+    try:
+        async for event in events:
+            yield event
+    finally:
+        await events.aclose()
 
 
 async def run_agent_and_wait(request: AgentRunRequest) -> AgentRunResult:
