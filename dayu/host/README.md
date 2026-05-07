@@ -40,7 +40,7 @@ Phase 流程、review 过程或 PR 流程。
 - `client_request_id` 创建幂等。
 - Session governance 与同 Session active Run 仲裁。
 - 持久化 schema、workspace migration、启动恢复、多进程 lease / fencing。
-- Conversation Memory、ContextBuilder、timeline projection。
+- Conversation Memory、RunInputBuilder、timeline projection。
 - 完整 ToolRegistry、工具发现、display info、middleware、业务工具迁移。
 - LLM-facing `fetch_more` schema、`fetch_more_args` projection、远程 / 多进程补读。
 - 完整取消治理、RemoteProxy、RemoteStub、Reply Outbox。

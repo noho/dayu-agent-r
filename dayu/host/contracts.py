@@ -298,7 +298,7 @@ class RunInput:
     """Run 初始输入。
 
     当前只承载 Engine 可直接消费的消息序列，不包含 memory、timeline 或
-    context builder 语义。
+    run input builder 语义。
 
     :param messages: 进入 Engine 的 Agent 消息元组。
     """

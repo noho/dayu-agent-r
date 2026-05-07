@@ -24,7 +24,7 @@ P1.5 不实现以下能力：
 - P6 的 observer、projection checkpoint、tool trace、audit、timeline projection、metrics 或 outbox。
 - P7 的 Session / Run lifecycle governance、`client_request_id` 幂等、同 Session active Run 仲裁。
 - P2 的 ToolRuntime truncation / fetch_more、cursor TTL、scope token。
-- P3 的 Conversation Memory / ContextBuilder。
+- P3 的 Conversation Memory / RunInputBuilder。
 - P4 的 context overflow compact / retry。
 - 完整取消治理、RemoteProxy、Attempt lease / fencing。
 - 对 P1 public API 做兼容性 facade；若契约需要演进，直接按新设计修改。
@@ -133,7 +133,7 @@ class RunEventKind(StrEnum):
 - canonical：lifecycle、tool call requested、tool result accepted、usage、provider protocol error、
   final answer、failed、cancelled、suspended、context compaction requested 等可恢复或治理事实。
 - preview：assistant content delta、reasoning delta 等展示型流式片段。
-- preview 可以被 stream 和未来 timeline 展示消费，但不得被 ContextBuilder、Memory pool、
+- preview 可以被 stream 和未来 timeline 展示消费，但不得被 RunInputBuilder、Memory pool、
   RunInput replay、RunResult、outbox、replay 或 recovery 消费；不得作为运行态或治理态输入。
 - 成功终态 canonical event 必须携带稳定 final answer 或等价 result payload；后续能力不能依赖从
   preview delta 拼接答案。
@@ -307,7 +307,7 @@ P1.5 是最小 EventLog 契约阶段。
 禁止：
 
 - 实现 P6 observer、tool trace sink、audit sink、timeline projection 或 outbox projection。
-- 把 preview delta 写入 Memory pool、RunInput replay 或 ContextBuilder 输入。
+- 把 preview delta 写入 Memory pool、RunInput replay 或 RunInputBuilder 输入。
 - 绕过 RunEventStore 为 P2-P5 单独建立 transcript、memory facts 或 smoke facts。
 - 把 EventLog 契约放入 `dayu.runtime`。
 
