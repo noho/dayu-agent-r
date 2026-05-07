@@ -1007,6 +1007,93 @@ P3 后执行边界：
 - 当前 `InMemoryConversationMemoryStore` 是单进程、顺序多轮 smoke/test adapter；真实持久 projection、
   observer checkpoint、多进程恢复与 cross-scope governance 留给后续 phase。
 
+P4 执行边界 / 设计约束：
+
+P3 已经提供 Conversation Memory、RunInputBuilder、`RunInputBuildTrace` 与可消费事实基础。P4 只在
+Engine / Runner 以强类型事实报告 context overflow 或 compaction required 后，由 Host 接管 compact
+决策与 attempt 重建；它不把 memory、compact 或 retry 策略放回 Engine。
+
+P4 后边界应保持为：Engine / Runner 只负责执行给定 `RunInput`、识别 context overflow /
+compaction-required，并发出强类型事实；Host 负责 compact 策略、compacted `RunInput` 构造、
+保真 / 变短验证，以及是否重建 internal attempt。后续 compact 策略演进，例如保留最近 raw turns
+数量、older turns 摘要方式、tool facts / evidence anchors 优先级、`pinned_state` 保护、retry
+上限或失败 reason 细分，都不应要求修改 Engine。Engine 的稳定协议依赖只有两项：能发出 overflow
+强类型事实；能接受 Host 提供的新 `RunInput` 并再次执行。
+
+P4 后 context overflow compact 的目标路径是：
+
+```text
+Engine / Runner observes context overflow
+  -> EngineEvent(context_compaction_requested) 或 recoverable failed(compaction_required)
+  -> WorkerProxy
+  -> Host append canonical overflow fact
+  -> Host CompactCoordinator
+      -> 读取 RunEventStore canonical facts
+      -> 读取 ConversationMemoryStore snapshot
+      -> 读取 RunInputBuildTrace 的 included / excluded 诊断
+      -> 构造 compact 输入
+      -> 执行 compact
+      -> 验证 compacted RunInput 确实变短
+      -> 验证当前用户问题 / pinned_state / evidence anchors / source cursor / 必保事实保真
+  -> Host append compact completed 或 compact failed canonical fact
+  -> same Run / new internal Engine attempt
+  -> WorkerProxy.stream_engine_events(compacted RunInput)
+```
+
+P4 compact 输入只能来自 P3 已固定的运行态事实：本 Run 的 `USER_INPUT_ACCEPTED`、canonical terminal /
+tool facts、Conversation Memory snapshot、RunInputBuilder included / excluded 诊断与可消费事实。
+reasoning、preview、delta、content completed、display timeline、客户端展示 transcript、debug sampling
+都不得进入 compact 输入，也不得参与 compact 后的 `RunInput` replay。
+
+P4 设计约束：compacted RunInput 是 Host 从既有 `USER_INPUT_ACCEPTED` 与 canonical facts 派生出的治理性
+attempt 输入，不是新的用户输入事实。context overflow compact retry 可以在同一 Run 下启动新的 internal
+Engine attempt，但不得再次 append `USER_INPUT_ACCEPTED`；memory projection 也不得把 compacted RunInput
+记成新的 raw user turn。若实现需要记录 compacted input，只能使用 compact / attempt retry canonical facts
+或 Host internal trace 表达，不能伪装成用户输入事件。
+
+Host Memory system block 与 compacted memory block 是 internal grounding context / verification context，
+不是 final answer 输出模板。RunInputBuilder 当前会把 `Host Memory`、tool fact summaries、evidence anchors
+等内容作为 system role message 注入模型；这些内容只能帮助模型定位事实、校验证据和生成受控来源说明，
+不得被原样回显为用户可见的“历史工具摘要”或内部事实表。final answer 可以包含面向用户的“证据与出处”
+或引用列表，但不得暴露 Host 内部标题、字段和治理元数据，例如 `Host Memory`、`Tool Facts`、
+`Evidence Anchors`、`历史工具摘要`、`tool_fact_id`、`cursor_fingerprint`、`source_event_cursor`、
+`tool args`、`tool result repr`、`scope_token` 或 raw EventLog metadata。P4 实施 RunInputBuilder /
+compact memory block 时，必须在提示层 / 渲染层明确标注这些内容 internal-only、不可原样输出；本设计只提出
+约束，不宣称当前 P3 代码已经具备完整保护。
+
+P4 实施 caller / Agent / app system prompt 支持或 compacted RunInput 重建时，还必须固定 system context
+顺序：caller system prompt 保持在最前，Host Memory instructions + Host Memory / compact memory 作为
+后续 system context 追加，其后才是当前 UserMessage。Host Memory / compact memory block 的开头必须先
+声明 internal grounding / not output template 约束，再渲染 `Tool Facts` / `Evidence Anchors` 或 compact
+后等价摘要。若 provider / payload builder 需要把多条 system message 合并成单条 provider payload，
+合并文本也必须保持 caller system prompt 在前、Host Memory instructions + Host Memory / compact memory
+在后。该顺序既保护 caller system prompt 的语义优先级，也使更稳定的 caller system prompt 形成更稳定的
+provider prefill cache / prompt cache 前缀；Host Memory / compact memory 每轮更易变化，放在后面可减少
+稳定前缀失效。本设计只把它作为实施约束和优化理由，不宣称当前 P3 已支持 caller system prompt，也不宣称
+已经接入任何具体 provider cache API。
+
+compact 成功不是“执行过压缩”即可成立。Host 只有在 compacted `RunInput` 的估算 token / char size
+严格小于 compact 前输入，且当前用户问题、`pinned_state`、必需 stable facts、evidence anchors、
+source cursor 与必要 tool facts 保真时，才允许启动下一次 internal attempt。compact no-op、变长、
+无法缩短，或必须丢弃当前用户问题、`pinned_state`、evidence anchors、source cursor 才能变短时，
+Host 不再重试；它应追加 Host-owned failed terminal 收口，并在 compact failed / exhausted 事实中记录
+可解释原因。
+
+P4 的估算口径应继承 OLD `conversation_memory` 更适合中英文混合财报文本的保守宽 / 窄字符近似：
+半角字符按 1 unit、全角 / 宽字符按 2 units 计入，再通过命名常量转换为 estimated tokens。
+该口径只作为 Host compact / RunInputBuilder 的预算与 before / after 相对比较工具，不是 provider tokenizer
+真源；真实 context overflow 仍以 Engine / Runner provider classifier 产出的强类型事实为准。P3
+`_APPROX_TOKEN_CHARS=4` 只能视作临时粗估，不应成为 P4 compact effectiveness gate 的最终依据。
+
+context overflow compact retry 在执行和审计上是新的 Engine attempt：新的 attempt input、新的
+worker execution context、新的事件关联与可追溯 compact 决策。但它与普通 transient retry / replay
+治理预算应区分；P4 可以使用明确的 compact retry 上限来避免无限循环，不把该局部上限写成 P7 已经
+完整落地的 attempt lifecycle governance。
+
+Engine stream 无 terminal 时的 CRITICAL log 与 Host-owned failure terminal 已是 P3 事实。P4 不重复解决
+“Engine stream 必须有 terminal”的收口问题，只消费明确的 context overflow / compaction-required
+事实并决定是否 compact。
+
 ### 12.1 背景
 
 买方财报分析的多轮记忆不是普通聊天历史回放。用户常见追问形态是：
@@ -1280,6 +1367,27 @@ system message: [Host Memory]
 -> current user message
 ```
 
+P4 及后续若支持 caller / Agent / app system prompt，实施顺序必须扩展为：
+
+```text
+system message: [caller / Agent / app system prompt]
+system message: [Host Memory or compact memory]
+   -> internal grounding / not output template instruction
+   -> pinned_state / task frame（全量，独立）
+   -> verified claim ledger
+   -> assumption register
+   -> evidence anchors / tool fact summaries
+   -> recent raw turns（语义保底）
+   -> older history pool / compacted summaries
+-> current user message
+```
+
+如果 provider 只能接收单条 system message，payload builder 的合并文本必须保持上述先后顺序；测试应覆盖
+RunInput message ordering 与合并文本 ordering。caller system prompt 通常更稳定，放在前缀有利于 provider
+prefill cache / prompt cache 的稳定前缀；Host Memory / compact memory 与工具事实更容易逐轮变化，应放在
+后段以减少稳定前缀失效。这里是设计约束，不表示当前 P3 已经落地 caller system prompt 支持或具体 provider
+cache API。
+
 最近 N 轮 raw turn 是追问连续性的语义保底，不是旧轮全文的无限 token 保底。若某轮包含超大用户粘贴、
 长工具结果或长回答，RunInputBuilder 应保留可指代的 intent、final 摘要和 evidence anchors，而不是
 让旧轮全文挤占当前财报材料窗口。
@@ -1379,6 +1487,11 @@ Conversation Memory / RunInputBuilder 的实现必须满足以下不变量：
 - 用户输入只从 canonical `USER_INPUT_ACCEPTED` 进入 memory projection 和 RunInputBuilder。
 - assistant final answer 不自动升级为 verified claim。
 - evidence anchors 不被自然语言 tool summary 替代。
+- Host Memory system block、Tool Facts、Evidence Anchors 与 compacted tool fact summaries 只作为 internal
+  grounding / verification context，不作为 final answer 模板或用户可见“历史工具摘要”。
+- final answer 可以输出面向用户的证据与出处，但不得 echo `Host Memory`、`Tool Facts`、`Evidence Anchors`、
+  `历史工具摘要`、`tool_fact_id`、`cursor_fingerprint`、`source_event_cursor`、`tool args`、
+  `tool result repr`、`scope_token` 或 raw EventLog metadata。
 - reasoning / preview / delta 不进入 `RunInput`、memory pool、verified claim ledger 或 compaction 输入。
 - recent floor 是语义保底，不是“最多 N 轮”，也不是超大旧轮全文无限保底。
 - RunInputBuilder 与测试使用同一生产路径；测试不能伪造一条比生产更干净的 path。
