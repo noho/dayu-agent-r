@@ -99,6 +99,9 @@ _ERROR_CURRENT_USER_INPUT_SHAPE_UNSUPPORTED_HISTORY: str = (
 _ERROR_RUN_INPUT_TRACE_CACHE_LIMIT_INVALID: str = (
     "run_input_trace_cache_limit_must_be_positive"
 )
+_ERROR_CONTEXT_COMPACT_RETRY_LIMIT_INVALID: str = (
+    "context_compact_retry_limit_must_be_non_negative"
+)
 _ERROR_ENGINE_STREAM_ENDED_WITHOUT_TERMINAL: str = (
     "engine_stream_ended_without_terminal"
 )
@@ -231,12 +234,15 @@ class LocalRunHarness:
     )
 
     def __post_init__(self) -> None:
-        """校验 harness 内部调试缓存配置。
+        """校验 harness 内部 compact retry 与调试缓存配置。
 
         :returns: 无返回值。
-        :raises ValueError: trace 缓存容量不是正数时抛出。
+        :raises ValueError: compact retry 上限为负数，或 trace 缓存容量
+            不是正数时抛出。
         """
 
+        if self.context_compact_retry_limit < 0:
+            raise ValueError(_ERROR_CONTEXT_COMPACT_RETRY_LIMIT_INVALID)
         if self.run_input_trace_cache_limit <= 0:
             raise ValueError(_ERROR_RUN_INPUT_TRACE_CACHE_LIMIT_INVALID)
 
@@ -332,6 +338,8 @@ class LocalRunHarness:
         try:
             while True:
                 overflow_trigger_seen = False
+                overflow_observed_seen = False
+                overflow_trigger_event: EngineEvent | None = None
                 try:
                     engine_events = self.proxy.stream_engine_events(
                         request=attempt_request,
@@ -364,6 +372,7 @@ class LocalRunHarness:
                         event_count += 1
                         if _is_context_compaction_requested(event):
                             overflow_trigger_seen = True
+                            overflow_trigger_event = event
                             await self.event_store.append(
                                 translate_engine_event(event)
                             )
@@ -375,6 +384,7 @@ class LocalRunHarness:
                                 event=event,
                                 attempt_index=attempt_index,
                             )
+                            overflow_observed_seen = True
                             break
                         if overflow_trigger_seen and _is_terminal_engine_event(
                             event
@@ -391,6 +401,15 @@ class LocalRunHarness:
                             terminal_seen = True
                             return
                     if overflow_trigger_seen:
+                        if (
+                            not overflow_observed_seen
+                            and overflow_trigger_event is not None
+                        ):
+                            await self._append_overflow_observed(
+                                request=attempt_request,
+                                event=overflow_trigger_event,
+                                attempt_index=attempt_index,
+                            )
                         if current_user_event is None:
                             raise RuntimeError(
                                 "context compact requires current_user_event"
@@ -488,10 +507,7 @@ class LocalRunHarness:
             snapshot=snapshot,
             events=current_run_events,
         )
-        previous_trace = self.last_run_input_build_trace_by_run.get(
-            request.run_id
-        )
-        if previous_trace is None:
+        if request.run_id not in self.last_run_input_build_trace_by_run:
             failed_data = self.compact_coordinator.exception_failed(
                 request=request,
                 attempt_index=attempt_index,
@@ -520,7 +536,6 @@ class LocalRunHarness:
             request=request,
             snapshot=snapshot,
             current_user_event=current_user_event,
-            previous_trace=previous_trace,
             attempt_index=attempt_index,
         )
         await self.event_store.append(
@@ -641,7 +656,9 @@ class LocalRunHarness:
         """追加 Host-owned overflow observed 事实。
 
         :param request: 当前 attempt 请求。
-        :param event: Engine terminal overflow 事件。
+        :param event: Engine overflow 触发事件；可以是 terminal
+            ``RUN_FAILED(context_compaction_required)``，也可以是非 terminal
+            ``CONTEXT_COMPACTION_REQUESTED``。
         :param attempt_index: 当前 attempt 序号。
         :returns: 无返回值。
         :raises Exception: append 失败时透传。
@@ -655,6 +672,9 @@ class LocalRunHarness:
             engine_error_code = data.error_code
             recoverable = data.recoverable
             reason = data.message
+        if isinstance(data, ContextCompactionRequestedData):
+            recoverable = True
+            reason = data.reason
         await self.event_store.append(
             context_overflow_observed_draft(
                 run_id=request.run_id,

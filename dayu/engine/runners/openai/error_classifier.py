@@ -147,6 +147,10 @@ def is_retriable(error_code: RunnerHTTPErrorCode) -> bool:
 def _parse_json_object(response_text: str) -> Mapping[str, JsonValue] | None:
     """解析 JSON object 响应。
 
+    当前只把顶层 JSON object 交给结构化 code 读取；顶层数组、字符串等
+    provider-specific 包装不在 P4 context overflow 矩阵范围内，会返回
+    ``None`` 并交由受控 message marker fallback 判断。
+
     :param response_text: provider 响应文本。
     :returns: JSON object；解析失败或非 object 时返回 ``None``。
     :raises Exception: 不主动抛出异常。
@@ -163,6 +167,10 @@ def _parse_json_object(response_text: str) -> Mapping[str, JsonValue] | None:
 
 def _payload_error_code(payload: Mapping[str, JsonValue]) -> str | None:
     """读取 provider JSON payload 中明确的结构化错误 code。
+
+    当前仅支持 ``{"error": {"code": "..."}}`` 与 ``{"code": "..."}``
+    两种已知扁平结构；``{"errors": [{"code": "..."}]}`` 等数组包装
+    属于新增 provider shape，不在当前 P4 支持范围。
 
     :param payload: provider JSON object。
     :returns: 明确非空 code；没有结构化 code 时返回 ``None``。

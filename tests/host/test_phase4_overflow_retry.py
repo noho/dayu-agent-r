@@ -59,6 +59,7 @@ from dayu.host.contracts import (
     RunEventKind,
     RunEventSource,
     RunEventType,
+    HostContextOverflowObservedData,
     RunFailedResult,
     RunInput,
     RunOptions,
@@ -221,6 +222,60 @@ class _CompactionRequestedThenFinalProxy:
                     event_type=EngineEventType.FINAL_ANSWER,
                     data=FinalAnswerData(
                         content="最终回答仍然到达。",
+                        filtered=False,
+                        degraded=False,
+                        finish_reason=FinishReason.STOP,
+                    ),
+                ),
+            )
+        )
+
+
+@dataclass(slots=True)
+class _CompactionRequestedThenEndedProxy:
+    """第一次 attempt 只请求 compact 后结束，第二次 attempt 成功。"""
+
+    requests: list[StartRunRequest] = field(default_factory=list)
+
+    def stream_engine_events(
+        self,
+        request: StartRunRequest,
+        cancellation_token: CancellationToken,
+    ) -> AsyncIterator[EngineEvent]:
+        """返回缺少 terminal overflow 的 EngineEvent 流。
+
+        :param request: Host start_run 请求。
+        :param cancellation_token: Host 注入的取消 token。
+        :returns: EngineEvent 异步流。
+        :raises Exception: 不主动抛出异常。
+        """
+
+        self.requests.append(request)
+        if len(self.requests) == 1:
+            return _iter_events(
+                (
+                    _engine_event(
+                        sequence=0,
+                        event_type=EngineEventType.CONTEXT_COMPACTION_REQUESTED,
+                        data=ContextCompactionRequestedData(
+                            iteration_id="iter-0",
+                            budget_state=ContextBudgetSnapshot(
+                                prompt_tokens=0,
+                                completion_tokens=0,
+                                total_tokens=0,
+                            ),
+                            reason="context_compaction_required",
+                        ),
+                    ),
+                )
+            )
+        return _iter_events(
+            (
+                _engine_event(
+                    sequence=1,
+                    event_type=EngineEventType.FINAL_ANSWER,
+                    data=FinalAnswerData(
+                        content="缺少 terminal 后仍已 compact retry。",
                         filtered=False,
                         degraded=False,
                         finish_reason=FinishReason.STOP,
@@ -686,6 +741,52 @@ async def test_overflow_retry_limit_fails_host_owned_terminal() -> None:
     assert [event.type for event in events].count(
         RunEventType.USER_INPUT_ACCEPTED
     ) == 1
+
+
+def test_negative_context_compact_retry_limit_is_rejected() -> None:
+    """负数 compact retry 上限必须在 harness 装配时 fail fast。"""
+
+    proxy = _OverflowThenSuccessProxy()
+
+    with pytest.raises(
+        ValueError,
+        match="context_compact_retry_limit_must_be_non_negative",
+    ):
+        LocalRunHarness(
+            proxy=proxy,
+            context_compact_retry_limit=-1,
+        )
+
+
+@pytest.mark.asyncio
+async def test_compaction_requested_then_stream_end_observes_overflow() -> None:
+    """非 terminal compact 触发路径也要追加 Host overflow observed 事实。"""
+
+    proxy = _CompactionRequestedThenEndedProxy()
+    memory_store: ConversationMemoryStore = _SnapshotMemoryStore(_large_snapshot())
+    harness = LocalRunHarness(proxy=proxy, memory_store=memory_store)
+
+    stream = await harness.start_run(_request())
+    events = await _collect(stream.events)
+    result = await harness.get_run_result("run-p4")
+
+    assert isinstance(result, RunSucceededResult)
+    assert result.content == "缺少 terminal 后仍已 compact retry。"
+    assert len(proxy.requests) == 2
+    observed_events = tuple(
+        event
+        for event in events
+        if isinstance(event.data, HostContextOverflowObservedData)
+    )
+    assert len(observed_events) == 1
+    observed_data = observed_events[0].data
+    assert isinstance(observed_data, HostContextOverflowObservedData)
+    assert observed_data.engine_event_type == (
+        EngineEventType.CONTEXT_COMPACTION_REQUESTED.value
+    )
+    assert observed_data.engine_error_code is None
+    assert observed_data.recoverable is True
+    assert observed_data.reason == "context_compaction_required"
 
 
 @pytest.mark.asyncio

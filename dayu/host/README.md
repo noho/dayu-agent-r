@@ -70,13 +70,16 @@ Host 内部 Conversation Memory / RunInputBuilder，以及 context overflow comp
   Host 不匹配 provider 错误文本。
 - `LocalRunHarness` 观察 context overflow 后，不把 recoverable Engine `RUN_FAILED` 追加成 terminal；
   它先追加 Host-owned canonical overflow / compact / retry 事实，再在同一 Run 下用 compacted `RunInput`
-  启动新的 internal Engine attempt。
+  启动新的 internal Engine attempt。若 Engine 发出 `context_compaction_requested` 后 stream 正常结束且缺少
+  terminal overflow，Host 仍会追加 `context_overflow_observed` 事实，再按同一 compact retry 路径兜底处理。
 - 若 Engine 在 `context_compaction_requested` 后意外产出非 compaction-required 终态，Host 会先追加
   Host-owned `context_compact_failed(reason=internal_error)` 事实闭合 compact 序列，再保留 Engine 原终态收口。
 - P4 当前默认 deterministic compact：保留当前 `USER_INPUT_ACCEPTED`、pinned state、stable frame、
   evidence anchors、source cursor 与 tool facts；compact 前会把本 Run 已 append 的 canonical tool facts
   临时合并进 compact 输入，避免同一 Run overflow 前刚获得的工具证据断链。compact 会丢弃旧 raw turns，
-  并在 compact memory system block 前部标注 internal-only / not-output-template 约束。
+  并在 compact memory system block 前部标注 internal-only / not-output-template 约束。compact completed 中
+  `dropped_item_count` 记录本次丢弃的 raw turns；当前 deterministic compact 不做额外“保留但降级”的动作，
+  因此 `degraded_item_count` 为 `0`。
 - compact 成功必须满足 compact 后 RunInput 的 estimated token 与 char size 都严格变短，且必保事实保真；
   no-op、变长、保真失败、trace 缓存缺失、compact 分支异常或超过 compact retry 上限都会追加
   `context_compact_failed`，再由 Host-owned `RUN_FAILED` 收口。
@@ -160,7 +163,7 @@ context overflow compact retry 路径：
 ```text
 Engine / Runner
   -> context_compaction_requested
-  -> recoverable run_failed(context_compaction_required)
+  -> recoverable run_failed(context_compaction_required) 或 stream 正常结束
   -> LocalRunHarness
   -> context_overflow_observed
   -> context_compact_requested

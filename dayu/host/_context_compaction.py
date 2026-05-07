@@ -17,7 +17,6 @@ from dayu.host._conversation_memory import (
     EvidenceAnchor,
     MemoryClaim,
 )
-from dayu.host._run_input_builder import RunInputBuildTrace
 from dayu.host._token_estimator import (
     TOKEN_ESTIMATOR_ALGORITHM_ID,
     estimate_messages_chars,
@@ -38,6 +37,11 @@ COMPACT_POLICY_ID: str = "host_deterministic_context_compact_v1"
 _NOOP_FAILURE_MESSAGE: str = "compacted RunInput is not shorter"
 _FIDELITY_FAILURE_MESSAGE: str = "compacted RunInput failed fidelity checks"
 _CURRENT_USER_FAILURE_MESSAGE: str = "current USER_INPUT_ACCEPTED fact is missing"
+_STABLE_CLAIM_SECTION_HEADER: str = "## Stable Claims"
+_EVIDENCE_ANCHORS_SECTION_HEADER: str = "## Evidence Anchors"
+_TOOL_FACTS_SECTION_HEADER: str = "## Tool Facts"
+_SOURCE_EVENT_CURSOR_FIELD: str = "source_event_cursor"
+_CURRENT_COMPACT_DEGRADED_ITEM_COUNT: int = 0
 
 
 class ContextCompactDecisionStatus(StrEnum):
@@ -77,7 +81,6 @@ class ContextCompactCoordinator:
         request: StartRunRequest,
         snapshot: ConversationMemorySnapshot,
         current_user_event: RunEvent,
-        previous_trace: RunInputBuildTrace,
         attempt_index: int,
     ) -> ContextCompactDecision:
         """构造 compact 后 RunInput 并校验是否可 retry。
@@ -85,7 +88,6 @@ class ContextCompactCoordinator:
         :param request: 当前 attempt 使用的 StartRunRequest。
         :param snapshot: 当前 session memory 快照。
         :param current_user_event: 本 Run 原始 ``USER_INPUT_ACCEPTED`` 事件。
-        :param previous_trace: 上一次 RunInputBuilder trace。
         :param attempt_index: 当前 attempt 序号。
         :returns: compact 决策。
         :raises TypeError: 当前用户事件 data 类型不匹配时抛出。
@@ -127,7 +129,7 @@ class ContextCompactCoordinator:
         dropped_count = len(snapshot.recent_raw_turns) + len(
             snapshot.older_raw_turns
         )
-        degraded_count = _count_previous_trace_degraded_items(previous_trace)
+        degraded_count = _count_current_compact_degraded_items()
         if after_tokens >= before_tokens or after_chars >= before_chars:
             return self._failed(
                 attempt_index=attempt_index,
@@ -361,10 +363,32 @@ def _render_compact_memory(snapshot: ConversationMemorySnapshot) -> str:
         _format_pinned_state(snapshot),
         _format_stable_frame(snapshot),
     ]
-    parts.extend(_format_claim(claim) for claim in snapshot.verified_claims)
-    parts.extend(_format_claim(claim) for claim in snapshot.assumptions.claims)
-    parts.extend(_format_anchor(anchor) for anchor in snapshot.evidence_anchors)
-    parts.extend(_format_tool_fact(fact) for fact in snapshot.tool_facts)
+    parts.append(
+        _format_section(
+            header=_STABLE_CLAIM_SECTION_HEADER,
+            items=tuple(
+                _format_claim(claim)
+                for claim in (
+                    *snapshot.verified_claims,
+                    *snapshot.assumptions.claims,
+                )
+            ),
+        )
+    )
+    parts.append(
+        _format_section(
+            header=_EVIDENCE_ANCHORS_SECTION_HEADER,
+            items=tuple(
+                _format_anchor(anchor) for anchor in snapshot.evidence_anchors
+            ),
+        )
+    )
+    parts.append(
+        _format_section(
+            header=_TOOL_FACTS_SECTION_HEADER,
+            items=tuple(_format_tool_fact(fact) for fact in snapshot.tool_facts),
+        )
+    )
     if snapshot.recent_raw_turns or snapshot.older_raw_turns:
         parts.append(
             "## Compacted History\n"
@@ -372,6 +396,20 @@ def _render_compact_memory(snapshot: ConversationMemorySnapshot) -> str:
             "current USER_INPUT_ACCEPTED and evidence anchors are preserved."
         )
     return "\n\n".join(part for part in parts if part)
+
+
+def _format_section(*, header: str, items: tuple[str, ...]) -> str:
+    """格式化 compact memory 中的多 item section。
+
+    :param header: section 标题。
+    :param items: section 正文条目。
+    :returns: 有条目时返回标题加正文；无条目时返回空字符串。
+    :raises Exception: 不主动抛出异常。
+    """
+
+    if not items:
+        return ""
+    return f"{header}\n" + "\n".join(items)
 
 
 def _format_pinned_state(snapshot: ConversationMemorySnapshot) -> str:
@@ -421,10 +459,9 @@ def _format_claim(claim: MemoryClaim) -> str:
     """
 
     return (
-        "## Stable Claim\n"
         f"claim_id={claim.claim_id}; status={claim.status.value}; "
         f"scope={claim.scope.value}; evidence_anchor_id={claim.evidence_anchor_id}; "
-        f"source_event_cursor={claim.source_event_cursor.sequence}; "
+        f"{_SOURCE_EVENT_CURSOR_FIELD}={claim.source_event_cursor.sequence}; "
         f"text={claim.text}"
     )
 
@@ -438,9 +475,8 @@ def _format_anchor(anchor: EvidenceAnchor) -> str:
     """
 
     return (
-        "## Evidence Anchors\n"
         f"anchor_id={anchor.anchor_id}; tool_call_id={anchor.tool_call_id}; "
-        f"source_event_cursor={anchor.origin_event_cursor.sequence}; "
+        f"{_SOURCE_EVENT_CURSOR_FIELD}={anchor.origin_event_cursor.sequence}; "
         f"source_ref={anchor.source_ref}; chunk_ref={anchor.chunk_ref}; "
         f"fingerprint={anchor.fingerprint}; summary={anchor.summary}"
     )
@@ -455,10 +491,9 @@ def _format_tool_fact(fact: ConversationToolFact) -> str:
     """
 
     return (
-        "## Tool Facts\n"
         f"tool_fact_id={fact.fact_id}; tool_name={fact.tool_name}; "
         f"tool_call_id={fact.tool_call_id}; event_type={fact.event_type.value}; "
-        f"source_event_cursor={fact.provenance.source_event_cursor.sequence}; "
+        f"{_SOURCE_EVENT_CURSOR_FIELD}={fact.provenance.source_event_cursor.sequence}; "
         f"cursor_fingerprint={fact.cursor_fingerprint}; "
         f"has_more={fact.has_more}; summary={fact.summary}"
     )
@@ -531,22 +566,24 @@ def _check_fidelity(
             anchor_id in combined for anchor_id in anchor_ids
         ),
         preserved_source_cursors=all(
-            f"source_event_cursor={cursor}" in combined
+            f"{_SOURCE_EVENT_CURSOR_FIELD}={cursor}" in combined
             for cursor in anchor_cursors + fact_cursors
         ),
         preserved_tool_facts=all(fact_id in combined for fact_id in fact_ids),
     )
 
 
-def _count_previous_trace_degraded_items(trace: RunInputBuildTrace) -> int:
-    """统计上一轮 trace 中被降级或裁剪的 item 数。
+def _count_current_compact_degraded_items() -> int:
+    """统计本次 deterministic compact 中被降级但未丢弃的 item 数。
 
-    :param trace: RunInputBuilder trace。
-    :returns: 非 included item 数。
+    当前 compact 策略只显式丢弃 raw turns，并保真渲染 pinned state、
+    claim、evidence anchor 与 tool fact；没有单独的“保留但降级”动作。
+
+    :returns: 本次 compact 降级 item 数。
     :raises Exception: 不主动抛出异常。
     """
 
-    return sum(1 for item in trace.items if item.reason != "included")
+    return _CURRENT_COMPACT_DEGRADED_ITEM_COUNT
 
 
 __all__ = [

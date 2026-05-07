@@ -170,7 +170,8 @@ Continuation 是 final-answer text continuation，不是普通 tool loop continu
 - 解析 SSE 与 non-stream JSON 响应。
 - 归一 content、reasoning、usage、tool call、HTTP error、protocol error 与 done 事件。
 - 识别 context overflow：结构化 `context_length_exceeded` 优先，结构化非 overflow code 会阻止 message
-  fallback；fallback 只覆盖已测试的 provider overflow 信号。Runner 不做 compact 或 retry。
+  fallback；当前结构化 code 只读取 `{"error":{"code":...}}` 与 `{"code":...}`，数组包装等新增
+  provider shape 不在 P4 范围；fallback 只覆盖已测试的 provider overflow 信号。Runner 不做 compact 或 retry。
 - 执行 HTTP retry / backoff。
 - 观察 cancellation token。
 - 关闭 HTTP 资源。

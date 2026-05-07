@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+from dataclasses import replace
 from datetime import datetime, timezone
 
 from dayu.engine import AgentMessageRole, RunnerCallOptions, RunnerSpec
@@ -13,11 +14,13 @@ from dayu.host._context_compaction import (
 )
 from dayu.host._conversation_memory import (
     AssumptionRegister,
+    ClaimStatus,
     ConversationMemorySnapshot,
     ConversationPinnedState,
     ConversationRawTurn,
     ConversationToolFact,
     EvidenceAnchor,
+    MemoryClaim,
     MemoryIngestionPolicy,
     MemoryProducerKind,
     MemoryProvenance,
@@ -204,7 +207,6 @@ def test_compact_preserves_current_user_pinned_state_and_evidence() -> None:
         request=_request(build.run_input),
         snapshot=snapshot,
         current_user_event=current_event,
-        previous_trace=build.trace,
         attempt_index=0,
     )
 
@@ -224,6 +226,88 @@ def test_compact_preserves_current_user_pinned_state_and_evidence() -> None:
     assert "source_event_cursor=5" in compact_text
     assert "tool_fact:run-old:5" in compact_text
     assert "INTERNAL_ONLY" in compact_text
+    assert decision.completed_data.dropped_item_count == 1
+    assert decision.completed_data.degraded_item_count == 0
+
+
+def test_compact_memory_groups_repeated_sections_once() -> None:
+    """多个 claim / anchor / tool fact 只渲染一次 section header。"""
+
+    snapshot = _snapshot()
+    provenance = _provenance(cursor=6)
+    first_anchor = snapshot.evidence_anchors[0]
+    first_fact = snapshot.tool_facts[0]
+    verified_claim = MemoryClaim(
+        claim_id="claim-verified-1",
+        status=ClaimStatus.VERIFIED,
+        text="收入增长已验证。",
+        source_run_id="run-old",
+        source_event_cursor=RunEventCursor(sequence=5),
+        evidence_anchor_id=first_anchor.anchor_id,
+        scope=MemoryScope.SESSION,
+        created_at=_utc_now(),
+        supersedes=(),
+        provenance=first_anchor.provenance,
+    )
+    assumption = MemoryClaim(
+        claim_id="claim-assumption-1",
+        status=ClaimStatus.ASSUMPTION,
+        text="增长可能来自销量提升。",
+        source_run_id="run-old",
+        source_event_cursor=RunEventCursor(sequence=6),
+        evidence_anchor_id=None,
+        scope=MemoryScope.SESSION,
+        created_at=_utc_now(),
+        supersedes=(),
+        provenance=provenance,
+    )
+    snapshot = replace(
+        snapshot,
+        verified_claims=(verified_claim,),
+        assumptions=AssumptionRegister(claims=(assumption,)),
+        evidence_anchors=(
+            first_anchor,
+            replace(
+                first_anchor,
+                anchor_id="anchor:tool_fact:run-old:6",
+                origin_event_cursor=RunEventCursor(sequence=6),
+                provenance=provenance,
+            ),
+        ),
+        tool_facts=(
+            first_fact,
+            replace(
+                first_fact,
+                fact_id="tool_fact:run-old:6",
+                provenance=provenance,
+                cursor_fingerprint="fp-safe-2",
+            ),
+        ),
+    )
+    current_event = _current_user_event()
+    build = DefaultRunInputBuilder().build(
+        snapshot=snapshot,
+        current_user_event=current_event,
+    )
+    decision = ContextCompactCoordinator().compact(
+        request=_request(build.run_input),
+        snapshot=snapshot,
+        current_user_event=current_event,
+        attempt_index=0,
+    )
+
+    assert decision.status is ContextCompactDecisionStatus.COMPLETED
+    assert decision.run_input is not None
+    compact_text = "\n".join(
+        "" if message.content is None else message.content
+        for message in decision.run_input.messages
+    )
+    assert compact_text.count("## Stable Claims") == 1
+    assert compact_text.count("## Evidence Anchors") == 1
+    assert compact_text.count("## Tool Facts") == 1
+    assert "claim_id=claim-verified-1" in compact_text
+    assert "claim_id=claim-assumption-1" in compact_text
+    assert "source_event_cursor=6" in compact_text
 
 
 def test_compact_noop_fails_without_retry_input() -> None:
@@ -243,15 +327,10 @@ def test_compact_noop_fails_without_retry_input() -> None:
             ),
         )
     )
-    build = DefaultRunInputBuilder(memory_block_char_budget=1).build(
-        snapshot=snapshot,
-        current_user_event=current_event,
-    )
     decision = ContextCompactCoordinator().compact(
         request=_request(run_input),
         snapshot=snapshot,
         current_user_event=current_event,
-        previous_trace=build.trace,
         attempt_index=0,
     )
 

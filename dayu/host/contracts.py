@@ -213,7 +213,9 @@ class HostContextCompactCompletedData:
     :param preserved_source_cursors: 来源 cursor 是否保真。
     :param preserved_tool_facts: 必要工具事实是否保真。
     :param dropped_item_count: 被确定丢弃的历史 item 数。
-    :param degraded_item_count: 被摘要降级的历史 item 数。
+    :param degraded_item_count: 本次 compact 中被保留但降级表达的历史
+        item 数；当前 deterministic compact 不做额外摘要降级，因此为
+        ``0``，被确定移除的 raw turns 只计入 ``dropped_item_count``。
     :param estimator_id: Host 估算器算法标识。
     """
 

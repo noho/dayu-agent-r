@@ -95,11 +95,13 @@ Host P3 最小 Run harness、RunEventStore、ToolRuntime 与 Conversation Memory
 - multiturn smoke：覆盖单进程顺序第二轮通过真实 `LocalRunHarness -> RunInputBuilder` 路径看到第一轮
   canonical final answer 与 tool summary。
 - P4 context compaction：覆盖 Host 内部 token estimator、deterministic compact 保留当前用户问题 /
-  pinned state / evidence anchors / source cursor / tool facts、no-op compact 不 retry、Engine overflow 后同一
+  pinned state / evidence anchors / source cursor / tool facts、compact block 多 item section 单 header、
+  当前 deterministic compact 的 `degraded_item_count=0` 语义、no-op compact 不 retry、Engine overflow 后同一
   Run 内 internal attempt retry、不重复追加 `USER_INPUT_ACCEPTED`、retry 上限耗尽后的 Host-owned terminal
-  failure、同一 Run overflow 前已 append 的工具事实进入 compacted attempt、trace 缓存缺失失败收口、
-  caller system prompt 顺序、非法入口消息拒绝、final answer 内部字段回显过滤，以及 Host public API
-  不导出 compact coordinator。
+  failure、负数 retry 上限 fail fast、非 terminal compact trigger 也写入 `context_overflow_observed`、
+  同一 Run overflow 前已 append 的工具事实进入 compacted attempt、trace 缓存缺失失败收口、caller system
+  prompt 顺序、非法入口消息拒绝、final answer 内部字段回显过滤，以及 Host public API 不导出 compact
+  coordinator。
 - P3 boundary：覆盖 Host 包根不导出 internal memory store / builder / trace，Engine 不 import Host memory，
   `USER_INPUT_ACCEPTED` append 失败不启动 Engine，入口历史 transcript 形态 fail fast 且不污染 EventLog / memory，
   Host-owned failure terminal 会触发 memory projection，reasoning / display completed 不进入 RunInput replay。
