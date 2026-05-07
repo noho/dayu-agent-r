@@ -3,12 +3,14 @@
 from __future__ import annotations
 
 import ast
+import logging
 from collections.abc import AsyncIterator
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
 
 import pytest
+from _pytest.logging import LogCaptureFixture
 
 import dayu.engine as engine
 import dayu.host as host
@@ -33,12 +35,14 @@ from dayu.host._event_translation import user_input_accepted_draft
 from dayu.host._run_harness import LocalRunHarness
 from dayu.host._run_input_builder import DefaultRunInputBuilder
 from dayu.host.contracts import (
+    HostRunFailedData,
     RunEvent,
     RunEventCursor,
     RunEventDraft,
     RunEventKind,
     RunEventSource,
     RunEventType,
+    RunFailedResult,
     RunInput,
     RunOptions,
     StartRunRequest,
@@ -388,6 +392,51 @@ async def test_host_owned_worker_failure_projects_user_input_to_memory() -> None
     assert events[-1].type is RunEventType.RUN_FAILED
     assert len(snapshot.recent_raw_turns) == 1
     assert snapshot.recent_raw_turns[0].user_text == "用户输入"
+
+
+@pytest.mark.asyncio
+async def test_engine_stream_without_terminal_fails_and_projects_memory(
+    caplog: LogCaptureFixture,
+) -> None:
+    """Engine stream 正常结束但无终态时追加 Host-owned failure 并投影。"""
+
+    caplog.set_level(logging.CRITICAL, logger="dayu.host._run_harness")
+    event_store = InMemoryRunEventStore()
+    memory_store = InMemoryConversationMemoryStore()
+    proxy = _CountingProxy()
+    harness = LocalRunHarness(
+        proxy=proxy,
+        event_store=event_store,
+        memory_store=memory_store,
+    )
+
+    stream = await harness.start_run(_request())
+    events = await _collect(stream.events)
+    result = await harness.get_run_result("run-boundary")
+    snapshot = await memory_store.get_snapshot("session-boundary")
+
+    assert proxy.call_count == 1
+    assert events[0].type is RunEventType.USER_INPUT_ACCEPTED
+    assert events[-1].type is RunEventType.RUN_FAILED
+    assert events[-1].source is RunEventSource.HOST
+    assert isinstance(events[-1].data, HostRunFailedData)
+    assert events[-1].data.error_code == "engine_stream_ended_without_terminal"
+    assert events[-1].data.exception_type == "RuntimeError"
+    assert isinstance(result, RunFailedResult)
+    assert result.error_code == "engine_stream_ended_without_terminal"
+    assert len(snapshot.recent_raw_turns) == 1
+    assert snapshot.recent_raw_turns[0].user_text == "用户输入"
+    assert snapshot.recent_raw_turns[0].terminal_summary is not None
+    assert (
+        "engine_stream_ended_without_terminal"
+        in snapshot.recent_raw_turns[0].terminal_summary
+    )
+    assert any(
+        record.levelno == logging.CRITICAL
+        and "host.run.engine_stream_ended_without_terminal"
+        in record.getMessage()
+        for record in caplog.records
+    )
 
 
 def test_host_public_api_does_not_export_internal_memory_builder() -> None:

@@ -72,7 +72,8 @@ Host P3 最小 Run harness、RunEventStore、ToolRuntime 与 Conversation Memory
 - run harness：验证 public `start_run` 可经 Host 调用 Engine 函数式入口，并把 `EngineEvent` 翻译为已 append 的 `RunEvent`。
 - event store：验证 append-only、per-run cursor、exclusive replay、replay-then-follow 订阅和 terminal 后订阅结束。
 - run harness eventlog：验证 `USER_INPUT_ACCEPTED` append-before-engine / append-before-stream、preview 不污染
-  terminal result、结果只从已 append terminal event 推导，worker / proxy 异常会落 Host-owned canonical failure 事件。
+  terminal result、结果只从已 append terminal event 推导，worker / proxy 异常和 Engine stream 无终态正常结束
+  会落 Host-owned canonical failure 事件，并验证 RunInput trace 调试缓存按容量淘汰。
 - tool-call smoke：通过内部 `LocalRunHarness` 注入 fake ToolExecutor，覆盖 Runner tool call -> Engine 工具闭环 -> Host RunEvent stream。
 - ToolRuntime truncation：覆盖 text chars、text lines、list items、binary bytes、no-spec no-truncate、
   explicit target only、field_path 优先级、路径不匹配不截断、execute-time cursor facts、非成功 outcome 不创建
@@ -86,15 +87,16 @@ Host P3 最小 Run harness、RunEventStore、ToolRuntime 与 Conversation Memory
 - Conversation Memory projection：覆盖 `USER_INPUT_ACCEPTED`、canonical final answer、ToolRuntime / Engine tool fact
   从 EventLog 投影，preview / reasoning / delta 不进入 memory，assistant final answer 不自动成为 verified claim，
   memory item 携带 provenance / trust / scope 元数据，`USER_INPUT_ACCEPTED` scope 使用封闭枚举并非法 fail fast，
-  不同 session 不串 memory。
+  非 SESSION scope clear patch fail fast，不同 session 不串 memory。
 - RunInputBuilder：覆盖 memory block 顺序、tool facts / evidence anchors 与 assistant history 分离、
-  source event cursor 输出、pinned state 预算外全量注入、older pool 新到旧消费预算后按时间顺序渲染、
-  internal-only `RunInputBuildTrace`、预算裁剪原因、超大旧轮语义降级与 current user 末尾注入。
+  tool facts 独立 section、source event cursor 输出、recent raw turns 单 section header、pinned state 预算外全量注入、
+  older pool 新到旧消费预算后按时间顺序渲染、internal-only `RunInputBuildTrace`、预算裁剪原因、
+  超大旧轮语义降级与 current user 末尾注入。
 - multiturn smoke：覆盖单进程顺序第二轮通过真实 `LocalRunHarness -> RunInputBuilder` 路径看到第一轮
   canonical final answer 与 tool summary。
 - P3 boundary：覆盖 Host 包根不导出 internal memory store / builder / trace，Engine 不 import Host memory，
   `USER_INPUT_ACCEPTED` append 失败不启动 Engine，入口历史 transcript 形态 fail fast 且不污染 EventLog / memory，
-  Host-owned worker failure terminal 会触发 memory projection，reasoning / display completed 不进入 RunInput replay。
+  Host-owned failure terminal 会触发 memory projection，reasoning / display completed 不进入 RunInput replay。
 - public boundary：锁定 `dayu.host.__all__`，允许 Run 级 `start_run`、`stream_run_events`、`get_run_result`，
   以及 P2 Run 级 `get_tool_fetch_more_handle`、`fetch_more_tool_result`，阻止 `EngineWorker`、`LocalProxy`、
   `ToolExecutor`、`InMemoryToolRuntime`、`ToolRuntimeToolExecutor`、`InMemoryConversationMemoryStore`、

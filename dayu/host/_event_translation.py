@@ -40,7 +40,7 @@ _ERROR_RUN_CANCELLED_DATA_TYPE: str = (
 _ERROR_RUN_SUSPENDED_DATA_TYPE: str = (
     "RUN_SUSPENDED event data must be RunSuspendedData"
 )
-_HOST_FAILURE_ERROR_CODE: str = "host_worker_failed"
+_HOST_WORKER_FAILURE_ERROR_CODE: str = "host_worker_failed"
 _PREVIEW_ENGINE_EVENT_TYPES: frozenset[RunEventType] = frozenset(
     {
         RunEventType.RUNNER_CONTENT_DELTA,
@@ -77,6 +77,7 @@ def host_failure_draft(
     session_id: str,
     occurred_at: datetime,
     error: Exception,
+    error_code: str = _HOST_WORKER_FAILURE_ERROR_CODE,
 ) -> RunEventDraft:
     """构造 Host-owned 失败终态事件草稿。
 
@@ -84,6 +85,7 @@ def host_failure_draft(
     :param session_id: 会话 id。
     :param occurred_at: Host 观察到异常的时间。
     :param error: worker / proxy 抛出的异常。
+    :param error_code: Host-owned 失败错误码。
     :returns: Host-owned RUN_FAILED 事件草稿。
     :raises Exception: 不主动抛出异常。
     """
@@ -96,7 +98,7 @@ def host_failure_draft(
         type=RunEventType.RUN_FAILED,
         occurred_at=occurred_at,
         data=HostRunFailedData(
-            error_code=_HOST_FAILURE_ERROR_CODE,
+            error_code=error_code,
             message=str(error),
             recoverable=False,
             exception_type=type(error).__name__,

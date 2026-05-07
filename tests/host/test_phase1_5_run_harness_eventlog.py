@@ -570,6 +570,27 @@ async def test_proxy_exception_appends_host_owned_failure_event() -> None:
 
 
 @pytest.mark.asyncio
+async def test_run_input_build_trace_cache_evicts_old_runs_fifo() -> None:
+    """RunInput 构造 trace 缓存按容量 FIFO 淘汰，避免无界增长。"""
+
+    store = InMemoryRunEventStore()
+    harness = LocalRunHarness(
+        proxy=_ScriptedProxy(events=()),
+        event_store=store,
+        run_input_trace_cache_limit=2,
+    )
+
+    for run_id in ("trace-run-1", "trace-run-2", "trace-run-3"):
+        stream = await harness.start_run(_request(run_id))
+        await _collect(stream.events)
+
+    assert tuple(harness.last_run_input_build_trace_by_run) == (
+        "trace-run-2",
+        "trace-run-3",
+    )
+
+
+@pytest.mark.asyncio
 async def test_harness_stops_after_terminal_and_keeps_views_consistent() -> None:
     """harness 看到首个终态后停止消费，三种读取视图保持同源。"""
 

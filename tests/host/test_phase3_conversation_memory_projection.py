@@ -22,6 +22,7 @@ from dayu.host._conversation_memory import (
     MemoryIngestionPolicy,
     MemoryProducerKind,
     MemoryScope,
+    ScopeClearPatch,
 )
 from dayu.host._event_store import InMemoryRunEventStore
 from dayu.host._event_translation import user_input_accepted_draft
@@ -455,6 +456,22 @@ async def test_user_input_scope_is_closed_enum_and_projection_fail_fast() -> Non
 
     with pytest.raises(ValueError, match="scope"):
         await memory_store.project_run_events((invalid_event,))
+
+
+@pytest.mark.asyncio
+async def test_scope_clear_patch_rejects_non_session_scope() -> None:
+    """P3 只支持 SESSION scope clear，非 SESSION scope 必须 fail fast。"""
+
+    memory_store = InMemoryConversationMemoryStore()
+
+    with pytest.raises(ValueError, match="scope_clear_only_supports_session"):
+        await memory_store.apply_patch(
+            ScopeClearPatch(
+                session_id="session-scope-clear",
+                scope=MemoryScope.PROJECT,
+                reason="测试非 session scope",
+            )
+        )
 
 
 @pytest.mark.asyncio

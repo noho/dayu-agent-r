@@ -1209,6 +1209,33 @@ Conversation Memory 分为两层：
     └── future episode summaries                  ← P4+ 插入位
 ```
 
+这里的“单总池”不是把所有记忆压成一个大杂烩，也不是否定常见的四层记忆架构。Dayu 后续实现应按
+以下口径吸收四层方案：
+
+- `stable layer`：`pinned_state`、`TaskFrame`、verified claims、assumptions 等稳定事实全量注入，
+  不参与历史池竞争；但它们仍计入总上下文估算，避免无限膨胀。
+- `recent floor`：最近 N 轮 raw turn 是追问连续性的语义保底。它不是“最多 N 轮”，也不是超大旧轮
+  原文无限保底；超大 turn 必须降级成 intent / final summary / evidence anchors。
+- `history candidate pool`：older raw turns、tool fact summaries、future episode summaries、future
+  retrieval hits 都作为候选项进入统一排序和预算竞争，避免 working / episodic / retrieval 各有固定小
+  预算导致总窗口失控。
+- `retrieval index`：历史 turn、episode summary、tool result chunk、evidence anchor 可进入向量 /
+  BM25 / hybrid retrieval；当前 run 只把相关 retrieval hit 作为候选项拉回，而不是无条件塞入完整摘要。
+
+后续实现不要把 P3 的 single pool 理解为“实现一个全局列表然后按时间截断”。正确方向是：stable facts
+先强约束，recent floor 保连续性，剩余历史候选再用 ranking 信号竞争预算。ranking 至少应考虑：
+
+- 与当前 user input / task frame / open questions 的相关性。
+- item 类型与信任等级，例如 verified claim、assumption、tool fact、raw turn、episode summary。
+- 来源与可追溯性，例如 `source_run_id`、`source_event_cursor`、`EvidenceAnchor`、producer kind、
+  ingestion policy。
+- 时效性与作用域，例如 session / project / user scope、是否 stale / superseded / rejected。
+- token 成本与信息密度，例如完整 raw turn、摘要、retrieval hit、tool chunk 的单位预算收益。
+
+这意味着后续 P4 / P5.5 / P6+ 的实现重点不是“再加几个池”，而是建立可解释的候选生成、ranking、
+trace 和回归测试。每次排除候选项都必须能在 `RunInputBuildTrace` 或后续 projection trace 中说明原因，
+否则财报分析场景下无法解释“为什么忘了这个假设 / 为什么没有召回这条证据”。
+
 运行态输入构造边界：
 
 ```text

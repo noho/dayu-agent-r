@@ -56,7 +56,8 @@ Phase 流程、review 过程或 PR 流程。
   older pool 预算按新到旧消费，但渲染为模型可读的时间顺序。
 - LLM-facing evidence anchor 与 tool fact 文本包含来源 event cursor，便于后续追溯到 canonical EventLog。
 - `RunInputBuildTrace` 是 Host internal-only 诊断对象，记录 included / excluded item、裁剪原因、来源
-  cursor 与估算大小；它不进入 `RunInput`，不进入 memory pool，也不作为下一轮事实真源。
+  cursor 与估算大小；`LocalRunHarness` 仅保留最近一小段 trace 缓存，避免调试数据无界增长。trace 不进入
+  `RunInput`，不进入 memory pool，也不作为下一轮事实真源。
 
 当前未落地：
 
@@ -162,8 +163,10 @@ exclusive replay 和 replay-then-follow 订阅。它是单进程内存实现，�
 已 append 的 canonical RunEvent；不同 session 不互相读取 memory。它不提供跨进程恢复、持久 projection、
 public memory 编辑或审计 UI。
 
-如果 worker / proxy 异常导致 Host 无法获得 Engine terminal event，后台任务会 append 一个
-Host-owned canonical `RUN_FAILED` 事件；该事件 `source=HOST`，`source_engine_event_id=None`。
+如果 worker / proxy 异常导致 Host 无法获得 Engine terminal event，或 Engine stream 正常结束但没有产出
+terminal event，后台任务会 append 一个 Host-owned canonical `RUN_FAILED` 事件；该事件 `source=HOST`，
+`source_engine_event_id=None`。无终态正常结束的错误码为 `engine_stream_ended_without_terminal`。
+Engine stream 无 terminal 属于 Engine / Worker 协议违约，Host 会记录 `CRITICAL` 日志。
 Host-owned failure 进入 terminal 后同样触发 memory projection，因此失败轮次的 `USER_INPUT_ACCEPTED`
 与中性 terminal summary 会进入 session memory。
 翻译、append、terminal result 推导等 Host 内部错误不会伪装成 Host-owned failure；后台 task 会记录

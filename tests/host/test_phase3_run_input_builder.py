@@ -270,6 +270,7 @@ def test_builder_orders_memory_block_and_current_user_message() -> None:
         "## Verified Claims",
         "## Assumptions",
         "## Evidence Anchors",
+        "## Tool Facts",
         "## Recent Raw Turns",
         "## Older Pool",
         "## Episode Summary Slot",
@@ -295,9 +296,39 @@ def test_tool_facts_and_evidence_anchors_do_not_enter_assistant_history() -> Non
     assert "工具事实摘要" in system_content
     assert "fingerprint-only" in system_content
     assert "source_event_cursor=4" in system_content
+    assert "## Tool Facts" in system_content
+    assert system_content.index("## Tool Facts") > system_content.index(
+        "## Evidence Anchors"
+    )
     assert "scope_token" not in system_content
     assert not any(message.role is AgentMessageRole.ASSISTANT for message in messages)
     assert not any(message.role is AgentMessageRole.TOOL for message in messages)
+
+
+def test_recent_raw_turns_share_single_section_header() -> None:
+    """多个 recent raw turns 只渲染一次 section header。"""
+
+    snapshot = _snapshot()
+    first_turn = snapshot.recent_raw_turns[0]
+    second_turn = ConversationRawTurn(
+        turn_id="turn-recent-2",
+        user_text="再上一轮用户",
+        assistant_final="再上一轮最终回答",
+        user_provenance=first_turn.user_provenance,
+        assistant_provenance=first_turn.assistant_provenance,
+    )
+    result = DefaultRunInputBuilder().build(
+        snapshot=replace(
+            snapshot,
+            recent_raw_turns=(first_turn, second_turn),
+        ),
+        current_user_event=_current_user_event(),
+    )
+    system_content = _system_content(result.run_input.messages)
+
+    assert system_content.count("## Recent Raw Turns") == 1
+    assert "上一轮用户" in system_content
+    assert "再上一轮用户" in system_content
 
 
 def test_trace_records_included_sources_and_does_not_enter_run_input() -> None:

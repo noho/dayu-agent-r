@@ -41,6 +41,9 @@ _TRACE_REASON_BUDGET_EXHAUSTED: str = "memory_block_budget_exhausted"
 _TRACE_REASON_RECENT_TURN_DOWNGRADED: str = "recent_turn_downgraded"
 _TRACE_REASON_OLDER_TURN_SUMMARIZED: str = "older_turn_summarized"
 _ERROR_SNAPSHOT_SESSION_MISMATCH: str = "snapshot_session_mismatch"
+_SECTION_RECENT_RAW_TURNS: str = "## Recent Raw Turns"
+_SECTION_OLDER_POOL: str = "## Older Pool"
+_SECTION_TOOL_FACTS: str = "## Tool Facts"
 
 
 class RunInputTraceStatus(StrEnum):
@@ -119,6 +122,20 @@ class RunInputBuildResult:
 
     run_input: RunInput
     trace: RunInputBuildTrace
+
+
+@dataclass(frozen=True, slots=True)
+class _MemoryBlockCandidate:
+    """可参与预算选择的 memory block 候选项。
+
+    :param source_id: 来源 item id。
+    :param text: 不含 section header 的正文。
+    :param provenance: 溯源元数据。
+    """
+
+    source_id: str
+    text: str
+    provenance: MemoryProvenance
 
 
 class RunInputBuilder(Protocol):
@@ -441,65 +458,127 @@ class _MemoryBlockCollector:
             )
         )
 
-    def reserve(
+    def include_chronological_section(
         self,
         *,
         kind: RunInputTraceItemKind,
-        source_id: str,
-        text: str,
-        provenance: MemoryProvenance,
+        header: str,
+        candidates: tuple[_MemoryBlockCandidate, ...],
     ) -> bool:
-        """按预算预留一个稍后渲染的 memory item。
-
-        该方法用于 older pool：预算消费按新到旧进行，但最终文本可再按
-        时间顺序渲染，保持模型可读性。
+        """按时间顺序写入同一 section 下的一组候选项。
 
         :param kind: trace item 类型。
-        :param source_id: 来源 item id。
-        :param text: 要写入的文本。
-        :param provenance: 溯源元数据。
-        :returns: 预留成功返回 ``True``。
+        :param header: section header。
+        :param candidates: 按时间顺序排列的候选项。
+        :returns: 至少写入一个候选项时返回 ``True``。
         :raises Exception: 不主动抛出异常。
         """
 
-        if not self._has_budget_for(text):
+        wrote_header = False
+        wrote_any = False
+        for candidate in candidates:
+            text = (
+                f"{header}\n{candidate.text}"
+                if not wrote_header
+                else candidate.text
+            )
+            if not self._has_budget_for(text):
+                self._items.append(
+                    _trace_item(
+                        status=RunInputTraceStatus.EXCLUDED,
+                        kind=kind,
+                        source_id=candidate.source_id,
+                        provenance=candidate.provenance,
+                        source_run_id=None,
+                        source_event_cursor=None,
+                        reason=_TRACE_REASON_BUDGET_EXHAUSTED,
+                        text=text,
+                    )
+                )
+                continue
+            self._parts.append(text)
+            self._used_chars += len(text)
             self._items.append(
                 _trace_item(
-                    status=RunInputTraceStatus.EXCLUDED,
+                    status=RunInputTraceStatus.INCLUDED,
                     kind=kind,
-                    source_id=source_id,
-                    provenance=provenance,
+                    source_id=candidate.source_id,
+                    provenance=candidate.provenance,
                     source_run_id=None,
                     source_event_cursor=None,
-                    reason=_TRACE_REASON_BUDGET_EXHAUSTED,
+                    reason=_TRACE_REASON_INCLUDED,
                     text=text,
                 )
             )
-            return False
-        self._used_chars += len(text)
-        self._items.append(
-            _trace_item(
-                status=RunInputTraceStatus.INCLUDED,
-                kind=kind,
-                source_id=source_id,
-                provenance=provenance,
-                source_run_id=None,
-                source_event_cursor=None,
-                reason=_TRACE_REASON_INCLUDED,
-                text=text,
-            )
-        )
-        return True
+            wrote_header = True
+            wrote_any = True
+        return wrote_any
 
-    def append_reserved_text(self, text: str) -> None:
-        """追加已预留预算的文本。
+    def include_newest_with_chronological_render(
+        self,
+        *,
+        kind: RunInputTraceItemKind,
+        header: str,
+        candidates: tuple[_MemoryBlockCandidate, ...],
+    ) -> bool:
+        """按新到旧竞争预算，并按时间顺序写入同一 section。
 
-        :param text: 已预留的 memory 文本。
-        :returns: 无返回值。
+        older pool 需要优先保留较新的轮次，但最终输出仍按时间顺序排列。
+        本方法把预算选择与渲染封装在同一个 helper 内，避免调用方维护
+        reserve / append 的隐式两步协议。
+
+        :param kind: trace item 类型。
+        :param header: section header。
+        :param candidates: 按时间顺序排列的候选项。
+        :returns: 至少写入一个候选项时返回 ``True``。
         :raises Exception: 不主动抛出异常。
         """
 
-        self._parts.append(text)
+        selected: list[_MemoryBlockCandidate] = []
+        wrote_header = False
+        for candidate in reversed(candidates):
+            text = (
+                f"{header}\n{candidate.text}"
+                if not wrote_header
+                else candidate.text
+            )
+            if not self._has_budget_for(text):
+                self._items.append(
+                    _trace_item(
+                        status=RunInputTraceStatus.EXCLUDED,
+                        kind=kind,
+                        source_id=candidate.source_id,
+                        provenance=candidate.provenance,
+                        source_run_id=None,
+                        source_event_cursor=None,
+                        reason=_TRACE_REASON_BUDGET_EXHAUSTED,
+                        text=text,
+                    )
+                )
+                continue
+            self._used_chars += len(text)
+            selected.append(candidate)
+            wrote_header = True
+            self._items.append(
+                _trace_item(
+                    status=RunInputTraceStatus.INCLUDED,
+                    kind=kind,
+                    source_id=candidate.source_id,
+                    provenance=candidate.provenance,
+                    source_run_id=None,
+                    source_event_cursor=None,
+                    reason=_TRACE_REASON_INCLUDED,
+                    text=text,
+                )
+            )
+        for index, candidate in enumerate(reversed(selected)):
+            text = (
+                f"{header}\n{candidate.text}"
+                if index == 0
+                else candidate.text
+            )
+            self._parts.append(text)
+        return bool(selected)
 
     def exclude(
         self,
@@ -737,9 +816,10 @@ def _append_recent_raw_turns(
         collector.include_without_provenance(
             kind=RunInputTraceItemKind.RECENT_RAW_TURN,
             source_id="recent_raw_turns_empty",
-            text="## Recent Raw Turns\n无最近会话轮次。",
+            text=f"{_SECTION_RECENT_RAW_TURNS}\n无最近会话轮次。",
         )
         return
+    candidates: list[_MemoryBlockCandidate] = []
     for turn in snapshot.recent_raw_turns:
         text = summarize_raw_turn_for_builder(turn)
         source_text = _raw_turn_source_text(turn)
@@ -751,12 +831,18 @@ def _append_recent_raw_turns(
                 provenance=turn.user_provenance,
                 reason=_TRACE_REASON_RECENT_TURN_DOWNGRADED,
             )
-        collector.include(
-            kind=RunInputTraceItemKind.RECENT_RAW_TURN,
-            source_id=turn.turn_id,
-            text=f"## Recent Raw Turns\n{text}",
-            provenance=turn.user_provenance,
+        candidates.append(
+            _MemoryBlockCandidate(
+                source_id=turn.turn_id,
+                text=text,
+                provenance=turn.user_provenance,
+            )
         )
+    collector.include_chronological_section(
+        kind=RunInputTraceItemKind.RECENT_RAW_TURN,
+        header=_SECTION_RECENT_RAW_TURNS,
+        candidates=tuple(candidates),
+    )
 
 
 def _append_older_raw_turns(
@@ -774,11 +860,11 @@ def _append_older_raw_turns(
         collector.include_without_provenance(
             kind=RunInputTraceItemKind.OLDER_RAW_TURN,
             source_id="older_pool_empty",
-            text="## Older Pool\n无更早会话池。",
+            text=f"{_SECTION_OLDER_POOL}\n无更早会话池。",
         )
         return
-    selected_texts: list[str] = []
-    for turn in reversed(snapshot.older_raw_turns):
+    candidates: list[_MemoryBlockCandidate] = []
+    for turn in snapshot.older_raw_turns:
         source_text = _raw_turn_source_text(turn)
         collector.exclude(
             kind=RunInputTraceItemKind.OLDER_RAW_TURN,
@@ -787,22 +873,21 @@ def _append_older_raw_turns(
             provenance=turn.user_provenance,
             reason=_TRACE_REASON_OLDER_TURN_SUMMARIZED,
         )
-        text = (
-            "## Older Pool\n"
-            + _truncate_text(
-                text=summarize_raw_turn_for_builder(turn),
-                limit=_OLDER_TURN_INLINE_CHAR_LIMIT,
+        candidates.append(
+            _MemoryBlockCandidate(
+                source_id=turn.turn_id,
+                text=_truncate_text(
+                    text=summarize_raw_turn_for_builder(turn),
+                    limit=_OLDER_TURN_INLINE_CHAR_LIMIT,
+                ),
+                provenance=turn.user_provenance,
             )
         )
-        if collector.reserve(
-            kind=RunInputTraceItemKind.OLDER_RAW_TURN,
-            source_id=turn.turn_id,
-            text=text,
-            provenance=turn.user_provenance,
-        ):
-            selected_texts.append(text)
-    for text in reversed(selected_texts):
-        collector.append_reserved_text(text)
+    collector.include_newest_with_chronological_render(
+        kind=RunInputTraceItemKind.OLDER_RAW_TURN,
+        header=_SECTION_OLDER_POOL,
+        candidates=tuple(candidates),
+    )
 
 
 def _format_claim(claim: MemoryClaim) -> str:
@@ -863,7 +948,7 @@ def _format_tool_fact(fact: ConversationToolFact) -> str:
     """
 
     return (
-        "## Evidence Anchors\n"
+        f"{_SECTION_TOOL_FACTS}\n"
         f"tool_fact_id={fact.fact_id}; tool_name={fact.tool_name}; "
         f"tool_call_id={fact.tool_call_id}; event_type={fact.event_type.value}; "
         f"source_event_cursor={fact.provenance.source_event_cursor.sequence}; "

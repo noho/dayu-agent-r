@@ -9,6 +9,7 @@ from __future__ import annotations
 import asyncio
 import logging
 import weakref
+from collections import OrderedDict
 from collections.abc import AsyncIterator
 from dataclasses import dataclass, field, replace
 from datetime import datetime, timezone
@@ -69,6 +70,13 @@ _ERROR_CURRENT_USER_INPUT_REQUIRED: str = "current_user_input_required"
 _ERROR_CURRENT_USER_INPUT_SINGLE_MESSAGE: str = (
     "current_user_input_must_be_single_user_message"
 )
+_ERROR_RUN_INPUT_TRACE_CACHE_LIMIT_INVALID: str = (
+    "run_input_trace_cache_limit_must_be_positive"
+)
+_ERROR_ENGINE_STREAM_ENDED_WITHOUT_TERMINAL: str = (
+    "engine_stream_ended_without_terminal"
+)
+_RUN_INPUT_TRACE_CACHE_LIMIT: int = 32
 _LOGGER: logging.Logger = logging.getLogger(__name__)
 
 
@@ -152,6 +160,7 @@ class LocalRunHarness:
     :param tool_runtime: Host 内部 ToolRuntime。
     :param memory_store: Host 内部 ConversationMemoryStore。
     :param run_input_builder: Host 内部 RunInputBuilder。
+    :param run_input_trace_cache_limit: RunInput 构造 trace 保留上限。
     """
 
     proxy: WorkerProxy
@@ -163,10 +172,23 @@ class LocalRunHarness:
     run_input_builder: RunInputBuilder = field(
         default_factory=DefaultRunInputBuilder
     )
-    last_run_input_build_trace_by_run: dict[str, RunInputBuildTrace] = field(
-        default_factory=dict,
+    run_input_trace_cache_limit: int = _RUN_INPUT_TRACE_CACHE_LIMIT
+    last_run_input_build_trace_by_run: OrderedDict[
+        str, RunInputBuildTrace
+    ] = field(
+        default_factory=OrderedDict,
         init=False,
     )
+
+    def __post_init__(self) -> None:
+        """校验 harness 内部调试缓存配置。
+
+        :returns: 无返回值。
+        :raises ValueError: trace 缓存容量不是正数时抛出。
+        """
+
+        if self.run_input_trace_cache_limit <= 0:
+            raise ValueError(_ERROR_RUN_INPUT_TRACE_CACHE_LIMIT_INVALID)
 
     async def start_run(self, request: StartRunRequest) -> RunStream:
         """启动 P1.5 内存态 Run。
@@ -197,8 +219,9 @@ class LocalRunHarness:
             snapshot=snapshot,
             current_user_event=current_user_event,
         )
-        self.last_run_input_build_trace_by_run[request.run_id] = (
-            build_result.trace
+        self._remember_run_input_build_trace(
+            run_id=request.run_id,
+            trace=build_result.trace,
         )
         engine_request = replace(request, input=build_result.run_input)
         task = asyncio.create_task(self._run_to_store(request=engine_request))
@@ -280,6 +303,14 @@ class LocalRunHarness:
                 if terminal_result_from_event(stored_event) is not None:
                     terminal_seen = True
                     break
+            if not terminal_seen:
+                terminal_seen = (
+                    await self._append_missing_terminal_failure_if_needed(
+                        request=request,
+                        event_count=event_count,
+                        terminal_seen=terminal_seen,
+                    )
+                )
         finally:
             if terminal_seen:
                 await self._project_run_events(request.run_id)
@@ -336,6 +367,45 @@ class LocalRunHarness:
         )
         return terminal_result_from_event(stored_event) is not None
 
+    async def _append_missing_terminal_failure_if_needed(
+        self,
+        *,
+        request: StartRunRequest,
+        event_count: int,
+        terminal_seen: bool,
+    ) -> bool:
+        """Engine stream 正常结束但无终态时追加 Host-owned failure。
+
+        这是 Host 对 Engine 协议缺口的治理收口：正常耗尽事件流却没有
+        terminal 时，不能把本轮投影为成功，也不能丢弃已接纳用户输入。
+
+        :param request: start_run 请求。
+        :param event_count: 已成功取得的 EngineEvent 数量。
+        :param terminal_seen: 是否已经从已 append 事件推导出终态。
+        :returns: 已存在或新追加终态时返回 ``True``。
+        :raises Exception: append Host-owned failure 失败时透传。
+        """
+
+        if terminal_seen:
+            return True
+        _LOGGER.critical(
+            "host.run.engine_stream_ended_without_terminal "
+            "session_id=%s run_id=%s event_count=%s",
+            request.session_id,
+            request.run_id,
+            event_count,
+        )
+        stored_event = await self.event_store.append(
+            host_failure_draft(
+                run_id=request.run_id,
+                session_id=request.session_id,
+                occurred_at=datetime.now(tz=timezone.utc),
+                error=RuntimeError(_ERROR_ENGINE_STREAM_ENDED_WITHOUT_TERMINAL),
+                error_code=_ERROR_ENGINE_STREAM_ENDED_WITHOUT_TERMINAL,
+            )
+        )
+        return terminal_result_from_event(stored_event) is not None
+
     async def _project_run_events(self, run_id: str) -> None:
         """将指定 run 的已落库事件投影到 memory。
 
@@ -349,6 +419,27 @@ class LocalRunHarness:
             after=None,
         )
         await self.memory_store.project_run_events(events)
+
+    def _remember_run_input_build_trace(
+        self,
+        *,
+        run_id: str,
+        trace: RunInputBuildTrace,
+    ) -> None:
+        """记录最近 RunInput 构造 trace，并按 FIFO 淘汰旧 run。
+
+        :param run_id: Run id。
+        :param trace: RunInput 构造 trace。
+        :returns: 无返回值。
+        :raises Exception: 不主动抛出异常。
+        """
+
+        traces = self.last_run_input_build_trace_by_run
+        if run_id in traces:
+            del traces[run_id]
+        traces[run_id] = trace
+        while len(traces) > self.run_input_trace_cache_limit:
+            traces.popitem(last=False)
 
     def stream_run_events(
         self,

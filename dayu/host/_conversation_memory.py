@@ -39,6 +39,7 @@ _USER_TEXT_SUMMARY_LIMIT: int = 240
 _ASSISTANT_TEXT_SUMMARY_LIMIT: int = 240
 _TERMINAL_TEXT_SUMMARY_LIMIT: int = 240
 _TOOL_FACT_SUMMARY_LIMIT: int = 360
+_ERROR_SCOPE_CLEAR_UNSUPPORTED_SCOPE: str = "scope_clear_only_supports_session"
 
 
 class MemoryScope(StrEnum):
@@ -374,7 +375,8 @@ class ConversationMemoryStore(Protocol):
 
         :param patch: memory patch。
         :returns: 无返回值。
-        :raises Exception: 具体实现应用失败时透传。
+        :raises ValueError: 当前实现不支持 patch scope 时抛出。
+        :raises Exception: 具体实现其它应用失败时透传。
         """
         ...
 
@@ -437,11 +439,12 @@ class InMemoryConversationMemoryStore:
         """应用 internal-only memory patch。
 
         P3 只实现最小内存态形状：reset / scope clear 会清空 session scope，
-        claim correction 只接纳用户确认的修正 claim。
+        claim correction 只接纳用户确认的修正 claim。P3 尚未实现非
+        SESSION scope 的清理，调用方传入其它 scope 必须 fail fast。
 
         :param patch: memory patch。
         :returns: 无返回值。
-        :raises Exception: 不主动抛出异常。
+        :raises ValueError: ScopeClearPatch 使用非 SESSION scope 时抛出。
         """
 
         match patch:
@@ -455,8 +458,10 @@ class InMemoryConversationMemoryStore:
                 self._snapshot_by_session[session_id] = _empty_snapshot(
                     session_id
                 )
-            case ScopeClearPatch():
-                return
+            case ScopeClearPatch(scope=scope):
+                raise ValueError(
+                    f"{_ERROR_SCOPE_CLEAR_UNSUPPORTED_SCOPE}: {scope.value}"
+                )
             case ClaimCorrectionPatch(
                 session_id=session_id, corrected_claim=claim
             ):
