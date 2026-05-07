@@ -94,6 +94,12 @@ Host P3 最小 Run harness、RunEventStore、ToolRuntime 与 Conversation Memory
   超大旧轮语义降级与 current user 末尾注入。
 - multiturn smoke：覆盖单进程顺序第二轮通过真实 `LocalRunHarness -> RunInputBuilder` 路径看到第一轮
   canonical final answer 与 tool summary。
+- P4 context compaction：覆盖 Host 内部 token estimator、deterministic compact 保留当前用户问题 /
+  pinned state / evidence anchors / source cursor / tool facts、no-op compact 不 retry、Engine overflow 后同一
+  Run 内 internal attempt retry、不重复追加 `USER_INPUT_ACCEPTED`、retry 上限耗尽后的 Host-owned terminal
+  failure、同一 Run overflow 前已 append 的工具事实进入 compacted attempt、trace 缓存缺失失败收口、
+  caller system prompt 顺序、非法入口消息拒绝、final answer 内部字段回显过滤，以及 Host public API
+  不导出 compact coordinator。
 - P3 boundary：覆盖 Host 包根不导出 internal memory store / builder / trace，Engine 不 import Host memory，
   `USER_INPUT_ACCEPTED` append 失败不启动 Engine，入口历史 transcript 形态 fail fast 且不污染 EventLog / memory，
   Host-owned failure terminal 会触发 memory projection，reasoning / display completed 不进入 RunInput replay。
@@ -109,7 +115,8 @@ Host P3 最小 Run harness、RunEventStore、ToolRuntime 与 Conversation Memory
 Engine contract 的细粒度测试，当前覆盖：
 
 - `messages`：AssistantMessage / AssistantToolCall 与 provider state roundtrip 契约。
-- `runner_events`：RunnerEventData 联合、RunnerHTTPErrorCode、RunnerHTTPErrorData、HTTP error 到 Done(ERROR) 的收口契约。
+- `runner_events`：RunnerEventData 联合、RunnerHTTPErrorCode、RunnerHTTPErrorData、HTTP error 与
+  context overflow 错误枚举、HTTP error 到 Done(ERROR) 的收口契约。
 - `runner_spec`：RunnerSpec 字段集合、provider reasoning / thinking extension、stream usage 能力字段与构造路径。
 - import boundary：Engine contract 子包不得越过自身契约边界引入上层依赖。
 
@@ -120,7 +127,9 @@ OpenAI-compatible Runner 的 provider 协议测试，覆盖从 payload 构建、
 - payload：消息、工具 schema、reasoning content、provider 扩展、stream usage gating、禁止额外 payload 袋。
 - SSE：content delta、reasoning delta、tool call delta、tool call 聚合、usage、`[DONE]`、多行 data、跨 chunk UTF-8、非法 UTF-8、尾部无换行、空 choices + usage。
 - non-stream：非流式响应、thought 标签处理、stream / non-stream 终态语义一致性。
-- 错误与重试：协议错误、HTTP error 分类、未知状态码、retry backoff、重试耗尽后的事件收口。
+- 错误与重试：协议错误、HTTP error 分类、context overflow classifier、未知状态码、retry backoff、
+  重试耗尽后的事件收口；context overflow 覆盖 `context_length_exceeded` 结构化 code、OLD 多 provider
+  message 信号矩阵、结构化非 overflow code 优先级与普通 client error 负例。
 - 取消与资源：取消边界、取消后不补 done 事件、close 释放资源。
 - 架构边界与协议表面：Runner 只产出 RunnerEvent，不依赖 ToolExecutor，不暴露任意 `**kwargs` 或 `set_tools`，事件流顺序保持单调并以唯一终态收口。
 

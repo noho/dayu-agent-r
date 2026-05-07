@@ -19,6 +19,8 @@ Engine 当前负责：
 - 在 `finish_reason=length` 时执行 final-answer text continuation；continuation 轮固定 `tools=()`，只续写被截断的最终回答文本。
 - 收口三类终态：`final_answer`、`run_failed`、`run_cancelled`。
 - 维护 OpenAI-compatible Runner，把 provider 响应归一为 `RunnerEvent`。
+- 在 Runner / Agent 边界识别 provider context overflow，并暴露强类型
+  `context_compaction_requested` 与 recoverable `run_failed("context_compaction_required")` 事实。
 - 在 Runner 边界提供诊断日志与 SSE idle heartbeat / timeout 处理；这些诊断不进入事件契约。
 
 Engine 当前不负责：
@@ -26,7 +28,7 @@ Engine 当前不负责：
 - Host ToolRegistry、工具权限、工具执行调度或长事务等待。
 - awaiting / `run_suspended` 工具主链路。
 - trace store、transcript 持久化、conversation memory。
-- context overflow / context compaction、OLD `TruncationManager`、`fetch_more` 或语义压缩。
+- context compact policy、memory、retry、RunInput 重建、OLD `TruncationManager`、`fetch_more` 或语义压缩。
 - 财报文档存取；财报文档只能通过 `dayu.fins.storage` 所属仓储边界处理。
 
 ## 稳定依赖表面
@@ -62,11 +64,21 @@ Runner 只产出 `RunnerEvent`。RunnerEvent 不包含 Host 治理字段，不�
 - `RUNNER_CONTENT_COMPLETED` -> `RUNNER_CONTENT_COMPLETED`
 - `RUNNER_USAGE_RECORDED` -> `RUNNER_USAGE_RECORDED`
 - `PROVIDER_PROTOCOL_ERROR` -> `PROVIDER_PROTOCOL_ERROR`
+- `RUNNER_HTTP_ERROR(context_length_exceeded)` -> `CONTEXT_COMPACTION_REQUESTED`，随后由 recoverable
+  `RUN_FAILED(context_compaction_required)` 收口；Host 决定是否 compact / retry
 - `RUNNER_DONE` -> `RUNNER_DONE`
 - Runner 完整 tool call 在 Agent 确认可执行后提升为 `TOOL_CALL_REQUESTED`
 - ToolExecutor completed / failed outcome 被 Agent 接受后提升为 `TOOL_RESULT_ACCEPTED`
 
-HTTP error 当前不提升为单独 EngineEvent；Agent 将其记录为失败候选，并收口为 `run_failed`。显式契约事实不得塞进 `metadata`。
+普通 HTTP error 当前不提升为单独 EngineEvent；Agent 将其记录为失败候选，并收口为 `run_failed`。
+context overflow 是例外：OpenAI-compatible Runner 先在 provider adapter 边界把结构化
+`error.code=context_length_exceeded` 或受控 OLD 多 provider message 信号归一为
+`RunnerHTTPErrorCode.CONTEXT_LENGTH_EXCEEDED`，Agent 再提升为 `context_compaction_requested`。若 provider
+payload 已给出明确非空结构化 `error.code` 且不是 `context_length_exceeded`，Runner 不再用 message
+marker fallback 覆盖该结构化分类。
+HTTP overflow 边界没有 provider usage 数据时，`ContextBudgetSnapshot` 使用 `0/0/0` 占位；真正的
+compact before / after 诊断由 Host estimator 记录。
+显式契约事实不得塞进 `metadata`。
 
 `final_answer` 只能由 Agent 产生，Runner 不能产生最终回答终态。
 
@@ -99,6 +111,7 @@ Runner close 失败只记录日志，不覆盖已经确定的业务 terminal。
 - continuation 轮再次请求工具 -> `run_failed("continuation_tool_call_not_allowed")`
 - 达到 `continuation_max_attempts` 或 `max_iterations` 边界 -> `final_answer(degraded=True)`
 - `ERROR` -> `run_failed`
+- provider context overflow -> `context_compaction_requested` -> `run_failed("context_compaction_required", recoverable=True)`
 - 工具被禁用或 Runner 不支持工具时收到 `TOOL_CALLS` -> `run_failed("tool_call_not_enabled")`
 - `TOOL_CALLS` 且工具可用 -> `tool_call_requested` -> ToolExecutor -> `tool_result_accepted` -> 注入下一轮 Runner
 - completed 工具结果和 failed 工具结果都会进入 LLM 上下文；failed outcome 不是 cancellation，也不会直接伪装成 final answer
@@ -156,6 +169,8 @@ Continuation 是 final-answer text continuation，不是普通 tool loop continu
   定义为显式关闭时才传 `0`。
 - 解析 SSE 与 non-stream JSON 响应。
 - 归一 content、reasoning、usage、tool call、HTTP error、protocol error 与 done 事件。
+- 识别 context overflow：结构化 `context_length_exceeded` 优先，结构化非 overflow code 会阻止 message
+  fallback；fallback 只覆盖已测试的 provider overflow 信号。Runner 不做 compact 或 retry。
 - 执行 HTTP retry / backoff。
 - 观察 cancellation token。
 - 关闭 HTTP 资源。
@@ -179,4 +194,5 @@ SSE idle heartbeat / timeout 属于 Runner 字节流读取边界：
 - 新 Runner 需要实现 `AsyncRunner`，只产出 `RunnerEvent`。
 - 新 provider 参数应进入 `RunnerSpec` / provider request extension 的强类型字段。
 - 新 EngineEvent 或 RunnerEvent 必须扩展封闭 data 联合，并补齐穷尽匹配测试。
-- awaiting / `run_suspended`、Host resume、trace store、conversation memory、context overflow / context compaction、OLD `TruncationManager` / `fetch_more` 尚未落地；这些能力不能通过当前 Agent 私自接入。
+- awaiting / `run_suspended`、Host resume、trace store、conversation memory、context compact policy、
+  OLD `TruncationManager` / `fetch_more` 尚未落地；这些能力不能通过当前 Agent 私自接入。

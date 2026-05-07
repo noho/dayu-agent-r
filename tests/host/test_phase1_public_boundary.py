@@ -8,6 +8,13 @@ import dayu.host as host
 
 EXPECTED_EXPORTS: frozenset[str] = frozenset(
     {
+        "ContextCompactFailureReason",
+        "HostContextAttemptRetryData",
+        "HostContextCompactCompletedData",
+        "HostContextCompactEventData",
+        "HostContextCompactFailedData",
+        "HostContextCompactRequestedData",
+        "HostContextOverflowObservedData",
         "HostRunFailedData",
         "RunCancelledResult",
         "RunEventData",

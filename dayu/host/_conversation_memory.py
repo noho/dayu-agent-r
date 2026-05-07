@@ -538,6 +538,41 @@ def _project_canonical_events(
     )
 
 
+def snapshot_with_transient_tool_facts(
+    *,
+    snapshot: ConversationMemorySnapshot,
+    events: tuple[RunEvent, ...],
+) -> ConversationMemorySnapshot:
+    """把当前 Run 已落库工具事实临时合并到 memory 快照。
+
+    该 helper 与正式 memory projection 共用工具事实与证据锚点投影逻辑，
+    但只合并 canonical tool facts，不投影 raw turn 或 terminal 摘要。它
+    服务 context overflow 发生在同一 Run 终态前的场景，避免 compact
+    输入等待最终 projection 才看见已接纳的工具证据。
+
+    :param snapshot: 已持久化或内存态 session 快照。
+    :param events: 当前 Run 已 append 的 RunEvent 元组。
+    :returns: 合并当前 Run 工具事实后的临时快照。
+    :raises Exception: 不主动抛出异常。
+    """
+
+    canonical_events = tuple(
+        event for event in events if event.kind is RunEventKind.CANONICAL
+    )
+    tool_facts = _project_tool_facts(canonical_events)
+    if not tool_facts:
+        return snapshot
+    evidence_anchors = tuple(_evidence_anchor_from_fact(fact) for fact in tool_facts)
+    return replace(
+        snapshot,
+        tool_facts=_merge_tool_facts(snapshot.tool_facts, tool_facts),
+        evidence_anchors=_merge_evidence_anchors(
+            snapshot.evidence_anchors,
+            evidence_anchors,
+        ),
+    )
+
+
 def _project_raw_turn(events: tuple[RunEvent, ...]) -> ConversationRawTurn | None:
     """从同一 run 事件投影 raw turn。
 
@@ -1041,5 +1076,6 @@ __all__ = [
     "TaskFrame",
     "UserPreferenceProfileRef",
     "scope_from_user_input_event",
+    "snapshot_with_transient_tool_facts",
     "summarize_raw_turn_for_builder",
 ]

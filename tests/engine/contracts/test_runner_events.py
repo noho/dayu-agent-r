@@ -2,7 +2,7 @@
 
 覆盖 Phase 1 contract 补丁（``docs/engine/phase1-plan.md`` §0.1）：
 
-- ``RunnerHTTPErrorCode`` 枚举 6 成员与 StrEnum 值。
+- ``RunnerHTTPErrorCode`` 枚举成员与 StrEnum 值。
 - ``RunnerHTTPErrorData`` 字段集合与构造。
 - ``RunnerEventType.RUNNER_HTTP_ERROR`` 枚举成员。
 - ``RunnerEventData`` 联合包含 :class:`RunnerHTTPErrorData`。
@@ -33,7 +33,7 @@ from dayu.engine.contracts.runner_events import (
 
 
 def test_runner_http_error_code_members_and_values() -> None:
-    """6 成员、StrEnum 值与契约一致。"""
+    """成员、StrEnum 值与契约一致。"""
 
     assert {m.value for m in RunnerHTTPErrorCode} == {
         "rate_limit_exceeded",
@@ -41,6 +41,7 @@ def test_runner_http_error_code_members_and_values() -> None:
         "client_error",
         "network_error",
         "timeout",
+        "context_length_exceeded",
         "unknown_http_status",
     }
 

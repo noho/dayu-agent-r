@@ -5,8 +5,8 @@ Phase 流程、review 过程或 PR 流程。
 
 ## 当前状态
 
-`dayu.host` 当前落地 P3 最小 Run harness、内存态 RunEventStore、Host-owned ToolRuntime 截断 / 补读，
-以及 Host 内部 Conversation Memory / RunInputBuilder：
+`dayu.host` 当前落地 P4 最小 Run harness、内存态 RunEventStore、Host-owned ToolRuntime 截断 / 补读，
+Host 内部 Conversation Memory / RunInputBuilder，以及 context overflow compact retry：
 
 - 包根暴露 Run 级契约与 `await start_run(request)`、`stream_run_events(run_id, after=cursor)`、
   `await get_run_result(run_id)`、`await get_tool_fetch_more_handle(request)`、
@@ -23,8 +23,9 @@ Phase 流程、review 过程或 PR 流程。
 - `get_run_result` 是非阻塞快照补查，只从已 append 的 canonical terminal RunEvent 推导结果。
 - `start_run` 会先 append Host-owned canonical `USER_INPUT_ACCEPTED`，再从 EventLog 中的该事件与
   session memory snapshot 构造交给 Engine 的 `RunInput`；该 append 失败时不会启动 Engine。
-- `StartRunRequest.input` 在入口边界只接受一条非空 `UserMessage`；system / assistant / tool 消息、多条
-  user 消息或历史 transcript 形态会 fail fast，且不会启动 Engine、写 EventLog 或污染 memory。
+- `StartRunRequest.input` 在入口边界只接受若干 leading `SystemMessage` 加末尾唯一非空 `UserMessage`；
+  assistant / tool 历史、多条 user、空 user 或 user 后追加 system 均会 fail fast，且不会启动 Engine、写
+  EventLog 或污染 memory。
 - `USER_INPUT_ACCEPTED` 使用封闭 `UserInputScope`，memory projection 从事件 data 推导 provenance scope；
   非法 scope 会在投影时失败。
 - 同一 run 的 terminal RunEvent 会封闭当前事件流；store 拒绝 terminal 后继续 append，harness 在首个
@@ -58,6 +59,30 @@ Phase 流程、review 过程或 PR 流程。
 - `RunInputBuildTrace` 是 Host internal-only 诊断对象，记录 included / excluded item、裁剪原因、来源
   cursor 与估算大小；`LocalRunHarness` 仅保留最近一小段 trace 缓存，避免调试数据无界增长。trace 不进入
   `RunInput`，不进入 memory pool，也不作为下一轮事实真源。
+- RunInputBuilder 与 context compact 使用同一个 Host 内部 token estimator：半角 / 窄字符按 1 unit，
+  全角 / 宽字符按 2 unit，再按 2 units/token 转为 estimated tokens。该估算只用于 Host
+  before / after 相对比较，不是 provider tokenizer 真源。
+- `LocalRunHarness.start_run` 当前接受若干 leading `SystemMessage` 加一条非空 current `UserMessage`；
+  caller system prompt 保持在前，Host Memory system block 追加在后，current user 始终为最后一条消息。
+  assistant / tool 历史、多条 user、空 user 或 user 后追加 system 均会 fail fast。
+- OpenAI-compatible Runner / Engine 把 provider context overflow 识别为强类型
+  `context_compaction_requested` 与 recoverable `run_failed(error_code="context_compaction_required")`；
+  Host 不匹配 provider 错误文本。
+- `LocalRunHarness` 观察 context overflow 后，不把 recoverable Engine `RUN_FAILED` 追加成 terminal；
+  它先追加 Host-owned canonical overflow / compact / retry 事实，再在同一 Run 下用 compacted `RunInput`
+  启动新的 internal Engine attempt。
+- 若 Engine 在 `context_compaction_requested` 后意外产出非 compaction-required 终态，Host 会先追加
+  Host-owned `context_compact_failed(reason=internal_error)` 事实闭合 compact 序列，再保留 Engine 原终态收口。
+- P4 当前默认 deterministic compact：保留当前 `USER_INPUT_ACCEPTED`、pinned state、stable frame、
+  evidence anchors、source cursor 与 tool facts；compact 前会把本 Run 已 append 的 canonical tool facts
+  临时合并进 compact 输入，避免同一 Run overflow 前刚获得的工具证据断链。compact 会丢弃旧 raw turns，
+  并在 compact memory system block 前部标注 internal-only / not-output-template 约束。
+- compact 成功必须满足 compact 后 RunInput 的 estimated token 与 char size 都严格变短，且必保事实保真；
+  no-op、变长、保真失败、trace 缓存缺失、compact 分支异常或超过 compact retry 上限都会追加
+  `context_compact_failed`，再由 Host-owned `RUN_FAILED` 收口。
+- Engine final answer 若明显回显内部段落标题（如 `## Host Memory`、`## Tool Facts`）或字段形式的
+  `tool_fact_id=`、`cursor_fingerprint=`、`source_event_cursor=`、`scope_token=`、raw EventLog metadata，
+  Host 会把终态内容过滤为安全占位文本，并将结果标记为 `filtered=True`、`degraded=True`。
 
 当前未落地：
 
@@ -68,7 +93,7 @@ Phase 流程、review 过程或 PR 流程。
 - 完整 ToolRegistry、工具发现、display info、middleware、业务工具迁移。
 - LLM-facing `fetch_more` schema、`fetch_more_args` projection、远程 / 多进程补读。
 - public memory edit / reset / forget API、持久 memory projection、跨 session / project / user memory。
-- P4 context overflow compaction、episode summary 生成、compaction retry。
+- episode summary 生成与 LLM compaction scene。
 - 完整取消治理、RemoteProxy、RemoteStub、Reply Outbox。
 
 不得为旧 Host 接口创建兼容 wrapper、facade 或 re-export。
@@ -89,6 +114,9 @@ Phase 流程、review 过程或 PR 流程。
   `ToolFetchMoreRequest`、`ToolFetchMoreResult`、`ToolFetchMoreSucceededResult`、
   `ToolFetchMoreFailedResult`。
 - Run 终态结果类型：`RunResult`、`RunSucceededResult`、`RunFailedResult`、`RunCancelledResult`、`RunSuspendedResult`。
+- Host context compact 事实类型：`HostContextOverflowObservedData`、`HostContextCompactRequestedData`、
+  `HostContextCompactCompletedData`、`HostContextCompactFailedData`、`HostContextAttemptRetryData`、
+  `HostContextCompactEventData`、`ContextCompactFailureReason`。
 - 最小入口：`start_run`、`stream_run_events`、`get_run_result`、`get_tool_fetch_more_handle`、
   `fetch_more_tool_result`。
 
@@ -125,6 +153,20 @@ await dayu.host.start_run
   -> RunEventDraft
   -> RunEventStore.append
   -> RunStream.events / stream_run_events
+```
+
+context overflow compact retry 路径：
+
+```text
+Engine / Runner
+  -> context_compaction_requested
+  -> recoverable run_failed(context_compaction_required)
+  -> LocalRunHarness
+  -> context_overflow_observed
+  -> context_compact_requested
+  -> context_compact_completed 或 context_compact_failed
+  -> context_attempt_retrying
+  -> WorkerProxy.stream_engine_events(compacted RunInput)
 ```
 
 工具调用执行路径：
@@ -170,7 +212,10 @@ terminal event，后台任务会 append 一个 Host-owned canonical `RUN_FAILED`
 Engine stream 无 terminal 属于 Engine / Worker 协议违约，Host 会记录 `CRITICAL` 日志。
 Host-owned failure 进入 terminal 后同样触发 memory projection，因此失败轮次的 `USER_INPUT_ACCEPTED`
 与中性 terminal summary 会进入 session memory。
-翻译、append、terminal result 推导等 Host 内部错误不会伪装成 Host-owned failure；后台 task 会记录
+context overflow compact retry 不会再次追加 `USER_INPUT_ACCEPTED`，也不会把 compacted `RunInput`
+投影成新的 raw user turn；只有最终 terminal 后，本 Run 的 canonical 事件整体进入 memory projection。
+compact 分支的 trace 缺失与异常会以 Host-owned compact failed terminal 收口，避免订阅方永久等待；
+其它翻译、append、terminal result 推导等 Host 内部错误不会伪装成 Host-owned failure；后台 task 会记录
 ERROR 日志并取回异常，完整 supervisor / governance 仍不在 P1.5 范围内。
 提前停止消费后的 worker stream 关闭失败只记录 WARNING 诊断日志，不替换原始异常，也不写入
 Host-owned failure 事件。
@@ -191,6 +236,14 @@ python utils/smoke_host_eventlog.py --case worker-failure --log-level DEBUG
 
 ```bash
 python utils/smoke_host_tool_runtime.py --log-level DEBUG
+```
+
+当前提供 Host context compaction smoke 脚本，用 fake overflow 稳定展示 P4 行为。该脚本不代表真实 provider
+overflow 覆盖，日志只输出事件类型、cursor、attempt 数量、compact 前后估算大小与终态过滤 / 降级状态等中性摘要：
+
+```bash
+python utils/smoke_host_context_compaction.py --case fake-overflow --log-level DEBUG
+python utils/smoke_host_context_compaction.py --case internal-echo-filter --log-level DEBUG
 ```
 
 当前也保留 EngineWorker 手工 smoke 脚本：

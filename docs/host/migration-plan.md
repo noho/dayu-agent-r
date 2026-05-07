@@ -11,8 +11,10 @@
 - P1.5 已通过 PR #17 合入 `main`，merge commit 为 `ec1627c94f352205ee77bcd992d652e677fa0ebb`。
 - P2 已通过 PR #18 合入 `main`，merge commit 为 `3d86eefd4bd8b99b24c638735220d9ee571255f7`。
 - P3 已通过 PR #19 合入 `main`，merge commit 为 `b20e792 Host P3 conversation memory (#19)`。
-- 当前进入 P4 plan 阶段：Host Compact for Context Overflow；当前分支为
-  `codex/host-p4-context-overflow-compact`。
+- P4 phase handoff plan、常规 plan review、OLD / NEW plan review 已通过并经用户确认。
+- P4 代码实施已完成；常规 code review、OLD / NEW code review、internal output boundary review
+  与独立 code review 均已复查通过；当前分支为 `codex/host-p4-context-overflow-compact`，
+  准备创建 PR。
 
 每个 Phase 进入实现前，必须另写可交接的 phase plan，细化到迁移 Agent 可以直接接手：
 目标、非目标、边界、文件级改动清单、契约变化、状态机、测试清单、验证命令、review gate、

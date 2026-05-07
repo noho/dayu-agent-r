@@ -43,11 +43,13 @@ from dayu.engine.contracts.agent_policy import AgentFallbackMode
 from dayu.engine.contracts.agent_run import (
     AgentRunRequest,
     AgentRunResult,
+    ContextBudgetSnapshot,
     EngineRunOutcomeCancelled,
     EngineRunOutcomeFailed,
     EngineRunOutcomeFinalAnswer,
 )
 from dayu.engine.contracts.engine_events import (
+    ContextCompactionRequestedData,
     ContentCompleteData,
     ContentDeltaData,
     EngineEvent,
@@ -80,6 +82,7 @@ from dayu.engine.contracts.runner_events import (
     RunnerDoneData,
     RunnerEvent,
     RunnerEventType,
+    RunnerHTTPErrorCode,
     RunnerHTTPErrorData,
     RunnerProtocolErrorData,
     RunnerReasoningDeltaData,
@@ -101,6 +104,7 @@ _ERROR_RUNNER_ABNORMAL_STOP: str = "runner_abnormal_stop"
 _ERROR_RUNNER_ERROR_DONE_WITHOUT_DETAIL: str = (
     "runner_error_done_without_detail"
 )
+_ERROR_CONTEXT_COMPACTION_REQUIRED: str = "context_compaction_required"
 _ERROR_TOOL_CALL_NOT_ENABLED: str = "tool_call_not_enabled"
 _ERROR_MISSING_TERMINAL: str = "missing_terminal"
 _ERROR_UNEXPECTED_SUSPENDED: str = "unexpected_suspended_in_phase3"
@@ -120,6 +124,9 @@ _ERROR_CONTINUATION_TOOL_CALL_NOT_ALLOWED: str = (
 )
 _RUNNER_ERROR_WITHOUT_DETAIL_MESSAGE: str = (
     "runner finished with error without detail"
+)
+_CONTEXT_COMPACTION_REQUIRED_MESSAGE: str = (
+    "provider context overflow requires Host compaction"
 )
 _RUNNER_ABNORMAL_STOP_MESSAGE: str = "runner stopped without done event"
 _MAX_ITERATIONS_EXCEEDED_MESSAGE: str = (
@@ -841,6 +848,25 @@ class _AsyncAgent:
                 occurred_at=runner_event.occurred_at,
             )
         if isinstance(data, RunnerHTTPErrorData):
+            if data.error_code is RunnerHTTPErrorCode.CONTEXT_LENGTH_EXCEEDED:
+                state.failure_candidate = RunFailedData(
+                    error_code=_ERROR_CONTEXT_COMPACTION_REQUIRED,
+                    message=_CONTEXT_COMPACTION_REQUIRED_MESSAGE,
+                    recoverable=True,
+                )
+                return self._make_event(
+                    event_type=EngineEventType.CONTEXT_COMPACTION_REQUESTED,
+                    data=ContextCompactionRequestedData(
+                        iteration_id=iteration_id,
+                        budget_state=ContextBudgetSnapshot(
+                            prompt_tokens=0,
+                            completion_tokens=0,
+                            total_tokens=0,
+                        ),
+                        reason=_ERROR_CONTEXT_COMPACTION_REQUIRED,
+                    ),
+                    occurred_at=runner_event.occurred_at,
+                )
             state.failure_candidate = RunFailedData(
                 error_code=data.error_code.value,
                 message=data.message,

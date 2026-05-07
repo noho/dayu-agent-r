@@ -22,6 +22,7 @@ from dayu.engine.contracts.agent_run import (
     EngineRunOutcomeFinalAnswer,
 )
 from dayu.engine.contracts.engine_events import (
+    ContextCompactionRequestedData,
     EngineEvent,
     EngineEventType,
     FinalAnswerData,
@@ -497,6 +498,46 @@ async def test_http_error_maps_to_run_failed_without_extra_engine_event() -> Non
     ]
     assert isinstance(events[-1].data, RunFailedData)
     assert events[-1].data.error_code == "rate_limit_exceeded"
+
+
+@pytest.mark.asyncio
+async def test_context_overflow_http_error_maps_to_compaction_required_fact() -> None:
+    """Runner context overflow 只生成强类型事实，不在 Engine 内 compact。"""
+
+    runner = _ScriptedRunner(
+        events=(
+            _event(
+                RunnerEventType.RUNNER_HTTP_ERROR,
+                RunnerHTTPErrorData(
+                    error_code=RunnerHTTPErrorCode.CONTEXT_LENGTH_EXCEEDED,
+                    http_status=400,
+                    message="maximum context length is 128000 tokens",
+                    provider_request_id=None,
+                    raw_payload=None,
+                    attempt=1,
+                    retried=False,
+                ),
+            ),
+            _event(
+                RunnerEventType.RUNNER_DONE,
+                RunnerDoneData(finish_reason=FinishReason.ERROR),
+            ),
+        )
+    )
+    events = await _collect(_AsyncAgent(request=_request(), runner=runner))
+
+    assert [event.type for event in events] == [
+        EngineEventType.ITERATION_STARTED,
+        EngineEventType.CONTEXT_COMPACTION_REQUESTED,
+        EngineEventType.RUNNER_DONE,
+        EngineEventType.RUN_FAILED,
+    ]
+    compact_event = events[1]
+    assert isinstance(compact_event.data, ContextCompactionRequestedData)
+    terminal = events[-1]
+    assert isinstance(terminal.data, RunFailedData)
+    assert terminal.data.error_code == "context_compaction_required"
+    assert terminal.data.recoverable
 
 
 @pytest.mark.asyncio

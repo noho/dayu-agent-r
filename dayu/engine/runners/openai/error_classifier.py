@@ -21,12 +21,24 @@
 from __future__ import annotations
 
 import asyncio
+import json
+from collections.abc import Mapping
 
 import aiohttp
 
+from dayu.contracts import JsonValue
 from dayu.engine.contracts.runner_events import RunnerHTTPErrorCode
 
 _RETRYABLE_5XX: frozenset[int] = frozenset({500, 502, 503, 504})
+_OPENAI_CONTEXT_LENGTH_ERROR_CODE: str = "context_length_exceeded"
+_CONTEXT_OVERFLOW_MESSAGE_MARKERS: tuple[str, ...] = (
+    "maximum context length is",
+    "total message token length exceed model limit",
+    "model's maximum context length",
+    "range of input length should be",
+    "model requires more context",
+    "context length exceeded",
+)
 
 
 def classify_http_status(http_status: int) -> RunnerHTTPErrorCode:
@@ -77,6 +89,34 @@ def classify_exception(exc: BaseException) -> RunnerHTTPErrorCode:
     )
 
 
+def detect_context_overflow(
+    *,
+    http_status: int,
+    response_text: str,
+) -> bool:
+    """识别 provider context overflow 响应。
+
+    本函数是 OpenAI-compatible Runner 的 provider adapter 边界：优先读取
+    结构化 ``error.code=context_length_exceeded``，再使用受控 OLD 信号
+    矩阵做 message fallback。Host 不应自行匹配 provider 文本。
+
+    :param http_status: HTTP 状态码。
+    :param response_text: provider 错误响应文本。
+    :returns: 明确为 context overflow 返回 ``True``。
+    :raises Exception: 不主动抛出异常。
+    """
+
+    if http_status < 400 or http_status >= 500:
+        return False
+    payload = _parse_json_object(response_text)
+    if payload is not None:
+        code = _payload_error_code(payload)
+        if code is not None:
+            return code == _OPENAI_CONTEXT_LENGTH_ERROR_CODE
+    lowered = response_text.lower()
+    return any(marker in lowered for marker in _CONTEXT_OVERFLOW_MESSAGE_MARKERS)
+
+
 def is_retriable(error_code: RunnerHTTPErrorCode) -> bool:
     """判断中性错误码是否可重试。
 
@@ -98,9 +138,51 @@ def is_retriable(error_code: RunnerHTTPErrorCode) -> bool:
             return True
         case (
             RunnerHTTPErrorCode.CLIENT_ERROR
+            | RunnerHTTPErrorCode.CONTEXT_LENGTH_EXCEEDED
             | RunnerHTTPErrorCode.UNKNOWN_HTTP_STATUS
         ):
             return False
 
 
-__all__ = ["classify_http_status", "classify_exception", "is_retriable"]
+def _parse_json_object(response_text: str) -> Mapping[str, JsonValue] | None:
+    """解析 JSON object 响应。
+
+    :param response_text: provider 响应文本。
+    :returns: JSON object；解析失败或非 object 时返回 ``None``。
+    :raises Exception: 不主动抛出异常。
+    """
+
+    try:
+        value = json.loads(response_text)
+    except json.JSONDecodeError:
+        return None
+    if isinstance(value, Mapping):
+        return value
+    return None
+
+
+def _payload_error_code(payload: Mapping[str, JsonValue]) -> str | None:
+    """读取 provider JSON payload 中明确的结构化错误 code。
+
+    :param payload: provider JSON object。
+    :returns: 明确非空 code；没有结构化 code 时返回 ``None``。
+    :raises Exception: 不主动抛出异常。
+    """
+
+    error = payload.get("error")
+    if isinstance(error, Mapping):
+        code = error.get("code")
+        if isinstance(code, str) and code.strip() != "":
+            return code
+    code = payload.get("code")
+    if isinstance(code, str) and code.strip() != "":
+        return code
+    return None
+
+
+__all__ = [
+    "classify_exception",
+    "classify_http_status",
+    "detect_context_overflow",
+    "is_retriable",
+]
