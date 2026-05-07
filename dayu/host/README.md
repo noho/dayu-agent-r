@@ -161,7 +161,8 @@ exclusive replay 和 replay-then-follow 订阅。它是单进程内存实现，�
 
 当前 `InMemoryConversationMemoryStore` 也是 Host 内部临时实现。它以 `session_id` 隔离 memory，只投影
 已 append 的 canonical RunEvent；不同 session 不互相读取 memory。它不提供跨进程恢复、持久 projection、
-public memory 编辑或审计 UI。
+public memory 编辑或审计 UI。同一 store 实例通过 `asyncio.Lock` 序列化 snapshot 读写，只声明单进程
+内存态一致性，不声明多进程正确性。
 
 如果 worker / proxy 异常导致 Host 无法获得 Engine terminal event，或 Engine stream 正常结束但没有产出
 terminal event，后台任务会 append 一个 Host-owned canonical `RUN_FAILED` 事件；该事件 `source=HOST`，

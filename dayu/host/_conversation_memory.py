@@ -7,6 +7,7 @@
 
 from __future__ import annotations
 
+import asyncio
 from dataclasses import dataclass, field, replace
 from datetime import datetime
 from enum import StrEnum
@@ -17,6 +18,7 @@ from dayu.contracts.tool_outcome import (
     ToolFailedOutcome,
 )
 from dayu.engine import FinalAnswerData, ToolResultAcceptedData
+from dayu.host._text import truncate_text
 from dayu.host.contracts import (
     HostRunFailedData,
     RunEvent,
@@ -389,6 +391,7 @@ class InMemoryConversationMemoryStore:
     """
 
     recent_turn_limit: int = 4
+    _lock: asyncio.Lock = field(default_factory=asyncio.Lock, init=False)
     _snapshot_by_session: dict[str, ConversationMemorySnapshot] = field(
         default_factory=dict,
         init=False,
@@ -413,15 +416,16 @@ class InMemoryConversationMemoryStore:
         if not canonical_events:
             return
         session_id = canonical_events[0].session_id
-        snapshot = self._snapshot_by_session.get(
-            session_id, _empty_snapshot(session_id)
-        )
-        snapshot = _project_canonical_events(
-            snapshot=snapshot,
-            events=canonical_events,
-            recent_turn_limit=self.recent_turn_limit,
-        )
-        self._snapshot_by_session[session_id] = snapshot
+        async with self._lock:
+            snapshot = self._snapshot_by_session.get(
+                session_id, _empty_snapshot(session_id)
+            )
+            snapshot = _project_canonical_events(
+                snapshot=snapshot,
+                events=canonical_events,
+                recent_turn_limit=self.recent_turn_limit,
+            )
+            self._snapshot_by_session[session_id] = snapshot
 
     async def get_snapshot(self, session_id: str) -> ConversationMemorySnapshot:
         """读取 session memory 快照。
@@ -431,9 +435,10 @@ class InMemoryConversationMemoryStore:
         :raises Exception: 不主动抛出异常。
         """
 
-        return self._snapshot_by_session.get(
-            session_id, _empty_snapshot(session_id)
-        )
+        async with self._lock:
+            return self._snapshot_by_session.get(
+                session_id, _empty_snapshot(session_id)
+            )
 
     async def apply_patch(self, patch: ConversationMemoryPatch) -> None:
         """应用 internal-only memory patch。
@@ -447,31 +452,32 @@ class InMemoryConversationMemoryStore:
         :raises ValueError: ScopeClearPatch 使用非 SESSION scope 时抛出。
         """
 
-        match patch:
-            case MemoryResetPatch(session_id=session_id):
-                self._snapshot_by_session[session_id] = _empty_snapshot(
-                    session_id
-                )
-            case ScopeClearPatch(
-                session_id=session_id, scope=MemoryScope.SESSION
-            ):
-                self._snapshot_by_session[session_id] = _empty_snapshot(
-                    session_id
-                )
-            case ScopeClearPatch(scope=scope):
-                raise ValueError(
-                    f"{_ERROR_SCOPE_CLEAR_UNSUPPORTED_SCOPE}: {scope.value}"
-                )
-            case ClaimCorrectionPatch(
-                session_id=session_id, corrected_claim=claim
-            ):
-                snapshot = self._snapshot_by_session.get(
-                    session_id, _empty_snapshot(session_id)
-                )
-                self._snapshot_by_session[session_id] = replace(
-                    snapshot,
-                    verified_claims=snapshot.verified_claims + (claim,),
-                )
+        async with self._lock:
+            match patch:
+                case MemoryResetPatch(session_id=session_id):
+                    self._snapshot_by_session[session_id] = _empty_snapshot(
+                        session_id
+                    )
+                case ScopeClearPatch(
+                    session_id=session_id, scope=MemoryScope.SESSION
+                ):
+                    self._snapshot_by_session[session_id] = _empty_snapshot(
+                        session_id
+                    )
+                case ScopeClearPatch(scope=scope):
+                    raise ValueError(
+                        f"{_ERROR_SCOPE_CLEAR_UNSUPPORTED_SCOPE}: {scope.value}"
+                    )
+                case ClaimCorrectionPatch(
+                    session_id=session_id, corrected_claim=claim
+                ):
+                    snapshot = self._snapshot_by_session.get(
+                        session_id, _empty_snapshot(session_id)
+                    )
+                    self._snapshot_by_session[session_id] = replace(
+                        snapshot,
+                        verified_claims=snapshot.verified_claims + (claim,),
+                    )
 
 
 def _empty_snapshot(session_id: str) -> ConversationMemorySnapshot:
@@ -611,7 +617,7 @@ def _summarize_host_failure(data: HostRunFailedData) -> str:
     :raises Exception: 不主动抛出异常。
     """
 
-    return _truncate_text(
+    return truncate_text(
         text=(
             f"run_failed: error_code={data.error_code}; "
             f"recoverable={data.recoverable}; "
@@ -801,12 +807,12 @@ def _summarize_tool_result(data: ToolResultAcceptedData) -> str:
     outcome = data.outcome
     if isinstance(outcome, ToolCompletedOutcome):
         value_text = repr(outcome.result.value)
-        return _truncate_text(
+        return truncate_text(
             text=f"工具结果已接纳：value={value_text}",
             limit=_TOOL_FACT_SUMMARY_LIMIT,
         )
     if isinstance(outcome, ToolFailedOutcome):
-        return _truncate_text(
+        return truncate_text(
             text=(
                 f"工具结果失败：error={outcome.result.error}; "
                 f"message={outcome.result.message}"
@@ -957,22 +963,6 @@ def _item_id(prefix: str, event: RunEvent) -> str:
     return f"{prefix}:{event.run_id}:{event.cursor.sequence}"
 
 
-def _truncate_text(*, text: str, limit: int) -> str:
-    """按字符数截断文本。
-
-    :param text: 原文本。
-    :param limit: 最大字符数。
-    :returns: 截断后的文本。
-    :raises Exception: 不主动抛出异常。
-    """
-
-    if limit <= 0:
-        return _EMPTY_TEXT
-    if len(text) <= limit:
-        return text
-    return text[:limit] + "...[已裁剪]"
-
-
 def summarize_raw_turn_for_builder(turn: ConversationRawTurn) -> str:
     """为 RunInputBuilder 生成 raw turn 安全摘要。
 
@@ -981,14 +971,14 @@ def summarize_raw_turn_for_builder(turn: ConversationRawTurn) -> str:
     :raises Exception: 不主动抛出异常。
     """
 
-    user_text = _truncate_text(
+    user_text = truncate_text(
         text=turn.user_text,
         limit=_USER_TEXT_SUMMARY_LIMIT,
     )
     assistant_text = (
         _EMPTY_TEXT
         if turn.assistant_final is None
-        else _truncate_text(
+        else truncate_text(
             text=turn.assistant_final,
             limit=_ASSISTANT_TEXT_SUMMARY_LIMIT,
         )
@@ -996,7 +986,7 @@ def summarize_raw_turn_for_builder(turn: ConversationRawTurn) -> str:
     terminal_text = (
         _EMPTY_TEXT
         if turn.terminal_summary is None
-        else _truncate_text(
+        else truncate_text(
             text=turn.terminal_summary,
             limit=_TERMINAL_TEXT_SUMMARY_LIMIT,
         )

@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import asyncio
 from datetime import datetime, timezone
 from typing import cast
 
@@ -18,10 +19,16 @@ from dayu.engine import (
     ToolResultAcceptedData,
 )
 from dayu.host._conversation_memory import (
+    ClaimCorrectionPatch,
+    ClaimStatus,
     InMemoryConversationMemoryStore,
+    MemoryClaim,
     MemoryIngestionPolicy,
     MemoryProducerKind,
     MemoryScope,
+    MemoryTrustLevel,
+    MemoryResetPatch,
+    MemoryProvenance,
     ScopeClearPatch,
 )
 from dayu.host._event_store import InMemoryRunEventStore
@@ -47,6 +54,43 @@ def _utc_now() -> datetime:
     """
 
     return datetime.now(tz=timezone.utc)
+
+
+def _memory_claim(
+    *,
+    claim_id: str,
+    text: str,
+    source_event: RunEvent,
+) -> MemoryClaim:
+    """构造测试用用户确认 claim。
+
+    :param claim_id: claim id。
+    :param text: claim 文本。
+    :param source_event: 来源事件。
+    :returns: MemoryClaim。
+    :raises Exception: 不主动抛出异常。
+    """
+
+    provenance = MemoryProvenance(
+        source_run_id=source_event.run_id,
+        source_event_cursor=source_event.cursor,
+        producer_kind=MemoryProducerKind.USER_CORRECTION,
+        ingestion_policy=MemoryIngestionPolicy.USER_CONFIRMED_CORRECTION,
+        scope=MemoryScope.SESSION,
+        trust_level=MemoryTrustLevel.USER_PROVIDED,
+    )
+    return MemoryClaim(
+        claim_id=claim_id,
+        status=ClaimStatus.VERIFIED,
+        text=text,
+        source_run_id=source_event.run_id,
+        source_event_cursor=source_event.cursor,
+        evidence_anchor_id=None,
+        scope=MemoryScope.SESSION,
+        created_at=_utc_now(),
+        supersedes=(),
+        provenance=provenance,
+    )
 
 
 async def _append_final(
@@ -472,6 +516,154 @@ async def test_scope_clear_patch_rejects_non_session_scope() -> None:
                 reason="测试非 session scope",
             )
         )
+
+
+@pytest.mark.asyncio
+async def test_memory_reset_patch_clears_session_snapshot() -> None:
+    """MemoryResetPatch 会清空指定 session 的 snapshot。"""
+
+    event_store = InMemoryRunEventStore()
+    memory_store = InMemoryConversationMemoryStore()
+    user_event = await event_store.append(
+        user_input_accepted_draft(
+            run_id="run-reset",
+            session_id="session-reset",
+            occurred_at=_utc_now(),
+            turn_id="run-reset",
+            content="重置前问题",
+        )
+    )
+    await _append_final(
+        event_store,
+        session_id="session-reset",
+        run_id="run-reset",
+        content="重置前回答",
+    )
+    await memory_store.project_run_events(
+        await event_store.list_events("run-reset", after=None)
+    )
+    await memory_store.apply_patch(
+        ClaimCorrectionPatch(
+            session_id="session-reset",
+            corrected_claim=_memory_claim(
+                claim_id="claim-reset",
+                text="重置前确认事实",
+                source_event=user_event,
+            ),
+            reason="测试重置前 claim",
+        )
+    )
+
+    await memory_store.apply_patch(
+        MemoryResetPatch(
+            session_id="session-reset",
+            scope=MemoryScope.SESSION,
+            reason="测试清空 session memory",
+        )
+    )
+    snapshot = await memory_store.get_snapshot("session-reset")
+
+    assert snapshot.recent_raw_turns == ()
+    assert snapshot.older_raw_turns == ()
+    assert snapshot.tool_facts == ()
+    assert snapshot.evidence_anchors == ()
+    assert snapshot.verified_claims == ()
+
+
+@pytest.mark.asyncio
+async def test_claim_correction_patch_appends_verified_claim() -> None:
+    """ClaimCorrectionPatch 会追加用户确认 claim。"""
+
+    event_store = InMemoryRunEventStore()
+    memory_store = InMemoryConversationMemoryStore()
+    user_event = await event_store.append(
+        user_input_accepted_draft(
+            run_id="run-claim",
+            session_id="session-claim",
+            occurred_at=_utc_now(),
+            turn_id="run-claim",
+            content="确认事实",
+        )
+    )
+    first_claim = _memory_claim(
+        claim_id="claim-1",
+        text="收入同比增长。",
+        source_event=user_event,
+    )
+    second_claim = _memory_claim(
+        claim_id="claim-2",
+        text="毛利率保持稳定。",
+        source_event=user_event,
+    )
+
+    await memory_store.apply_patch(
+        ClaimCorrectionPatch(
+            session_id="session-claim",
+            corrected_claim=first_claim,
+            reason="测试追加第一条 claim",
+        )
+    )
+    await memory_store.apply_patch(
+        ClaimCorrectionPatch(
+            session_id="session-claim",
+            corrected_claim=second_claim,
+            reason="测试追加第二条 claim",
+        )
+    )
+    snapshot = await memory_store.get_snapshot("session-claim")
+
+    assert snapshot.verified_claims == (first_claim, second_claim)
+
+
+@pytest.mark.asyncio
+async def test_concurrent_projection_keeps_same_session_turns() -> None:
+    """同 session 并发投影不会丢失简单 raw turn 更新。"""
+
+    event_store = InMemoryRunEventStore()
+    memory_store = InMemoryConversationMemoryStore(recent_turn_limit=8)
+    await event_store.append(
+        user_input_accepted_draft(
+            run_id="run-concurrent-a",
+            session_id="session-concurrent",
+            occurred_at=_utc_now(),
+            turn_id="turn-concurrent-a",
+            content="并发问题 A",
+        )
+    )
+    await _append_final(
+        event_store,
+        session_id="session-concurrent",
+        run_id="run-concurrent-a",
+        content="并发回答 A",
+    )
+    await event_store.append(
+        user_input_accepted_draft(
+            run_id="run-concurrent-b",
+            session_id="session-concurrent",
+            occurred_at=_utc_now(),
+            turn_id="turn-concurrent-b",
+            content="并发问题 B",
+        )
+    )
+    await _append_final(
+        event_store,
+        session_id="session-concurrent",
+        run_id="run-concurrent-b",
+        content="并发回答 B",
+    )
+
+    events_a = await event_store.list_events("run-concurrent-a", after=None)
+    events_b = await event_store.list_events("run-concurrent-b", after=None)
+    await asyncio.gather(
+        memory_store.project_run_events(events_a),
+        memory_store.project_run_events(events_b),
+    )
+    snapshot = await memory_store.get_snapshot("session-concurrent")
+    turn_by_id = {turn.turn_id: turn for turn in snapshot.recent_raw_turns}
+
+    assert set(turn_by_id) == {"turn-concurrent-a", "turn-concurrent-b"}
+    assert turn_by_id["turn-concurrent-a"].assistant_final == "并发回答 A"
+    assert turn_by_id["turn-concurrent-b"].assistant_final == "并发回答 B"
 
 
 @pytest.mark.asyncio

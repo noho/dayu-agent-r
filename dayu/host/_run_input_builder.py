@@ -21,6 +21,7 @@ from dayu.host._conversation_memory import (
     MemoryProvenance,
     summarize_raw_turn_for_builder,
 )
+from dayu.host._text import truncate_text
 from dayu.host.contracts import (
     RunEvent,
     RunEventKind,
@@ -876,7 +877,7 @@ def _append_older_raw_turns(
         candidates.append(
             _MemoryBlockCandidate(
                 source_id=turn.turn_id,
-                text=_truncate_text(
+                text=truncate_text(
                     text=summarize_raw_turn_for_builder(turn),
                     limit=_OLDER_TURN_INLINE_CHAR_LIMIT,
                 ),
@@ -1017,22 +1018,6 @@ def _trace_item(
         char_size=char_size,
         token_estimate=_estimate_tokens(char_size),
     )
-
-
-def _truncate_text(*, text: str, limit: int) -> str:
-    """按字符数截断文本。
-
-    :param text: 原文本。
-    :param limit: 最大字符数。
-    :returns: 截断后的文本。
-    :raises Exception: 不主动抛出异常。
-    """
-
-    if limit <= 0:
-        return ""
-    if len(text) <= limit:
-        return text
-    return text[:limit] + "...[已裁剪]"
 
 
 def _estimate_tokens(char_size: int) -> int:
