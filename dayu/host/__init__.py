@@ -51,6 +51,8 @@ from dayu.host.contracts import (
     ToolRuntimeCursor,
     ToolRuntimeEventData,
     ToolValueSizeSummary,
+    UserInputAcceptedData,
+    UserInputScope,
 )
 
 __all__ = [
@@ -91,6 +93,8 @@ __all__ = [
     "ToolRuntimeCursor",
     "ToolRuntimeEventData",
     "ToolValueSizeSummary",
+    "UserInputAcceptedData",
+    "UserInputScope",
     "fetch_more_tool_result",
     "get_run_result",
     "get_tool_fetch_more_handle",

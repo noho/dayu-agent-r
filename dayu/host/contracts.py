@@ -45,6 +45,7 @@ class RunEventType(StrEnum):
     ``RUN_FAILED``，通过 :class:`RunEventSource` 区分事实来源。
     """
 
+    USER_INPUT_ACCEPTED = "user_input_accepted"
     ITERATION_STARTED = EngineEventType.ITERATION_STARTED.value
     RUNNER_CONTENT_DELTA = EngineEventType.RUNNER_CONTENT_DELTA.value
     RUNNER_REASONING_DELTA = EngineEventType.RUNNER_REASONING_DELTA.value
@@ -85,6 +86,12 @@ class RunEventSource(StrEnum):
     HOST = "host"
 
 
+class UserInputScope(StrEnum):
+    """用户输入接纳事件的 memory 可见范围。"""
+
+    SESSION = "session"
+
+
 @dataclass(frozen=True, slots=True)
 class RunEventCursor:
     """Host 事件 cursor。
@@ -115,6 +122,25 @@ class HostRunFailedData:
     message: str
     recoverable: bool
     exception_type: str
+
+
+@dataclass(frozen=True, slots=True)
+class UserInputAcceptedData:
+    """Host 已接纳用户输入事实。
+
+    该事件是 RunInputBuilder、memory projection、replay 与 display timeline
+    读取本轮用户输入的唯一 canonical 真源。``StartRunRequest.input`` 只
+    作为入口材料用于写入此事件，不作为后续投影旁路。
+
+    :param turn_id: 同一 session 内调用方或 Host 分配的 turn id。P3 最小
+        实现使用 run id 作为稳定 turn id。
+    :param content: 规范化后的用户输入正文。
+    :param scope: memory scope；P3 仅写入 ``SESSION``。
+    """
+
+    turn_id: str
+    content: str
+    scope: UserInputScope
 
 
 @dataclass(frozen=True, slots=True)
@@ -289,7 +315,12 @@ ToolRuntimeEventData: TypeAlias = (
 )
 """ToolRuntime canonical RunEvent data 封闭联合。"""
 
-RunEventData: TypeAlias = EngineEventData | HostRunFailedData | ToolRuntimeEventData
+RunEventData: TypeAlias = (
+    EngineEventData
+    | HostRunFailedData
+    | UserInputAcceptedData
+    | ToolRuntimeEventData
+)
 """Host RunEvent data 封闭联合。"""
 
 
@@ -691,6 +722,8 @@ ToolFetchMoreResult: TypeAlias = (
 
 __all__ = [
     "HostRunFailedData",
+    "UserInputAcceptedData",
+    "UserInputScope",
     "ToolCursorDeniedData",
     "ToolCursorExpiredData",
     "ToolCursorIssuedData",

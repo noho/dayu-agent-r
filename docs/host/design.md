@@ -935,6 +935,78 @@ evidence、timeline、tool cursor 或 compaction。
 本节是 Conversation Memory / RunInputBuilder 的独立设计说明。它吸收 OLD issue
 `https://github.com/noho/dayu-agent/issues/48` 的结论，但不要求读者另行打开该 issue 才能理解设计。
 
+当前 P3 已落地的事实：
+
+- `RunEventType.USER_INPUT_ACCEPTED` 与 `UserInputAcceptedData` 已成为 Host-owned canonical 用户输入事实，
+  `UserInputScope` 是封闭 scope 类型。
+- `LocalRunHarness.start_run` 只接受一条非空 `UserMessage` 作为当前轮 ingress；历史 transcript、
+  system / assistant / tool message 或多条 user message 会在 append 前 fail fast。
+- `LocalRunHarness.start_run` 会先 append `USER_INPUT_ACCEPTED`，append 失败时不启动 Engine。
+- Engine 实际消费的 `RunInput` 由 Host 内部 `DefaultRunInputBuilder` 从当前用户输入事件与
+  `ConversationMemorySnapshot` 构造，不从 `StartRunRequest.input` 旁路回放用户输入。
+- Host 内部 `InMemoryConversationMemoryStore` 只从已 append canonical RunEvent 投影 session memory；
+  preview / reasoning / delta / content completed 不进入 memory pool。
+- Engine terminal 或 Host-owned worker / proxy failure terminal 后，当前 run 的 canonical events 才会投影
+  到 memory；失败轮次的用户输入事实和中性 terminal summary 都会进入下一轮 memory。
+- 当前只实现单进程、顺序多轮、`session` scope 的 memory；类型上预留 direct user、group、project、
+  user scope。
+- 当前已预留 `ConversationPinnedState`、`TaskFrame`、`MemoryClaim`、`ClaimStatus`、`EvidenceAnchor`、
+  `AssumptionRegister`、`UserPreferenceProfileRef`、`memory_reset`、`claim_correction`、`scope_clear`
+  的 internal 结构。
+- `ConversationPinnedState` 包含 `current_goal`、`confirmed_subjects`、`user_constraints`、
+  `open_questions` 四槽，并在 RunInputBuilder stable layer 中全量注入。
+- verified claim ledger 与 assumption register 也属于 stable layer，当前实现全量注入且不参与历史 pool
+  预算竞争。
+- assistant final answer 只进入 raw turn / assistant conclusion 路径，不自动进入 verified claim ledger。
+- `RunInputBuildTrace` 已实现为 internal-only 诊断对象，不进入 `RunInput`、memory pool 或下一轮事实真源。
+
+### 12.0 当前 P3 最小实现路径
+
+P3 已将最小 Conversation Memory / RunInputBuilder 接入当前 `run harness` 主链路。当前路径是：
+
+```text
+LocalRunHarness.start_run(StartRunRequest)
+  -> _extract_current_user_text
+      -> 只接受一条非空 UserMessage
+      -> 拒绝历史 transcript / system / assistant / tool / 多 user message
+  -> user_input_accepted_draft
+  -> RunEventStore.append(USER_INPUT_ACCEPTED)
+      -> 获得 Host 分配的 RunEventCursor
+  -> ConversationMemoryStore.get_snapshot(session_id)
+  -> DefaultRunInputBuilder.build(snapshot, current_user_event)
+      -> pinned_state / task frame 全量 stable layer
+      -> verified claims / assumptions
+      -> evidence anchors / tool facts（保留 source event cursor）
+      -> recent raw turns 语义保底
+      -> older raw turns 按预算从新到旧消费、按时间顺序渲染
+      -> episode summary 插入位
+      -> RunInput(system Host Memory + current user message)
+      -> RunInputBuildTrace（internal-only）
+  -> WorkerProxy.stream_engine_events(replace(request, input=built_run_input))
+  -> Engine consumes built RunInput
+  -> EngineEvent
+  -> translate_engine_event -> RunEventStore.append
+  -> terminal RunEvent 或 Host-owned worker / proxy failure RunEvent
+  -> ConversationMemoryStore.project_run_events(canonical events)
+  -> 下一轮 start_run 读取新的 ConversationMemorySnapshot
+```
+
+P3 后执行边界：
+
+- `StartRunRequest.input` 在 Host P3 最小入口中只作为“当前轮用户输入 ingress 材料”，不是可回放
+  transcript，也不是 memory projection 输入。
+- `USER_INPUT_ACCEPTED` 是用户输入 canonical 真源；append 失败时 Engine 不启动，append 前校验失败时
+  EventLog 与 memory 都不被污染。
+- Engine 从未看到原始 `StartRunRequest.input`；Engine 只看到 Host 重新构造后的 `RunInput.messages`。
+- `ConversationMemoryStore` 只消费同一 run 已落库的 canonical `RunEvent`，不消费 preview、reasoning、
+  display timeline 或 debug trace。
+- `RunInputBuilder` 只读 `ConversationMemorySnapshot` 与当前 `USER_INPUT_ACCEPTED` 事件；不读取
+  ToolRuntime cursor store，不持有 `ToolFetchMoreHandle`，不消费 `scope_token`。
+- `RunInputBuildTrace` 只用于 Host 内部诊断与测试；它不写入 EventLog，不进入模型上下文，也不作为下一轮
+  memory 真源。
+- 当前 `InMemoryConversationMemoryStore` 是单进程、顺序多轮 smoke/test adapter；真实持久 projection、
+  observer checkpoint、多进程恢复与 cross-scope governance 留给后续 phase。
+
 ### 12.1 背景
 
 买方财报分析的多轮记忆不是普通聊天历史回放。用户常见追问形态是：
@@ -1011,13 +1083,13 @@ canonical EventLog。
 `USER_INPUT_ACCEPTED` 是 Host-owned canonical RunEvent，表示 Host 已接受本轮用户输入。它必须在
 Engine run / stream 启动前 append。append 失败时不得启动 Engine。
 
-该事件至少需要表达：
+当前事件表达：
 
 - `session_id`。
 - `run_id`。
-- `turn_id` 或等价 session-local 顺序。
-- normalized user text 或强类型 user message reference。
-- memory scope / visibility metadata。
+- `turn_id`：P3 最小实现使用 `run_id`。
+- normalized user text：P3 从入口 `RunInput` 中唯一一条非空 `UserMessage` 规范化后写入事件。
+- memory scope：P3 写入封闭 `UserInputScope.SESSION`。
 
 display timeline、memory projection、RunInputBuilder、future compaction、replay 和 audit 都从 EventLog
 读取该事实，不从 preview stream 或展示 transcript 反推。
@@ -1033,10 +1105,26 @@ display timeline、memory projection、RunInputBuilder、future compaction、rep
 - 当前输出目标和用户约束。
 - 当前比较基准，例如同行公司或历史期间。
 
-`TaskFrame` 与 `pinned_state` 同属稳定运行态输入。P3 可以先用 seed / patch 或测试 fixture 构造，
-自动抽取和 compaction 更新后移。
+`TaskFrame` 与 `pinned_state` 同属稳定运行态输入。当前 P3 已落地并可由测试 fixture / internal snapshot
+承载；自动抽取和 compaction 更新未落地。
 
-#### 12.4.3 `MemoryClaim` 与 `ClaimStatus`
+#### 12.4.3 `ConversationPinnedState`
+
+`ConversationPinnedState` 是从 OLD / issue #48 继承下来的会话稳定目标路径。它不是普通历史池成员，
+必须在 RunInputBuilder stable layer 中全量渲染。当前四槽是：
+
+- `current_goal`：当前会话目标。
+- `confirmed_subjects`：用户或系统已确认的研究对象、比较对象或其他中性 subject 引用。
+- `user_constraints`：用户显式给出的口径、格式、限制、假设或偏好约束。
+- `open_questions`：仍未解决、需要后续回答或工具验证的问题。
+
+`ConversationPinnedState` 与 `TaskFrame` 并列：前者表达会话目标和用户约束，后者表达分析任务框架引用。
+二者都属于 stable layer，不参与 older history pool 竞争。
+
+自动从用户输入、tool facts 或 compaction 产出 pinned state patch 尚未落地；P3 只固定结构、注入路径和
+不变量。
+
+#### 12.4.4 `MemoryClaim` 与 `ClaimStatus`
 
 `MemoryClaim` 是可被后续 Run 复用的事实或结论条目。它至少应包含：
 
@@ -1062,7 +1150,7 @@ display timeline、memory projection、RunInputBuilder、future compaction、rep
 参与追问连续性，但不能自动升级为 `verified` claim。只有 evidence-backed tool facts、用户显式确认、
 或后续受控 projection / compaction 产出的结构化事实，才能进入 verified claim ledger。
 
-#### 12.4.4 `EvidenceAnchor`
+#### 12.4.5 `EvidenceAnchor`
 
 `EvidenceAnchor` 是事实来源锚点。它至少应包含：
 
@@ -1078,18 +1166,18 @@ Host 不解释 `source_ref` 或 `chunk_ref` 的财报业务含义。页码、章
 quote hash 等应由 fins / tool 侧以 typed reference 或 opaque reference 产生。Host 只保证 anchor
 不会被自然语言 summary 替代。
 
-#### 12.4.5 `AssumptionRegister`
+#### 12.4.6 `AssumptionRegister`
 
 `AssumptionRegister` 保存未验证假设和用户临时假设。它与 verified claim 分离。后续用户纠错或工具事实
 覆盖时，应通过 claim correction / supersession 把假设转为 verified、rejected 或 superseded。
 
-#### 12.4.6 `UserPreferenceProfileRef`
+#### 12.4.7 `UserPreferenceProfileRef`
 
 `UserPreferenceProfileRef` 是用户长期偏好或输出风格的引用位。P3 只预留 slot，不做跨 session durable
 preference memory，不在 headless / one-shot Run 中隐式注入用户偏好。跨 user / project / group 的作用域
 策略必须等权限和审计设计明确后再落地。
 
-#### 12.4.7 `RunInputBuildTrace`
+#### 12.4.8 `RunInputBuildTrace`
 
 RunInputBuilder 必须产生 internal-only build trace，用于测试、debug 和未来 audit observer。trace 至少记录：
 
@@ -1124,11 +1212,10 @@ Conversation Memory 分为两层：
 运行态输入构造边界：
 
 ```text
-StartRunRequest
+StartRunRequest.input（仅作为 ingress 材料）
   -> append USER_INPUT_ACCEPTED
   -> RunInputBuilder
-      -> canonical RunEvents
-      -> ToolRuntime canonical facts
+      -> USER_INPUT_ACCEPTED RunEvent
       -> ConversationMemorySnapshot
       -> RunInputBuildTrace
   -> RunInput(messages=...)
@@ -1143,25 +1230,26 @@ RunEventStore canonical + preview events
   -> client
 ```
 
-display timeline 不是 RunInputBuilder 输入。reasoning、preview delta、content delta、debug sampling、
-trace-only payload 只能进入展示 / 观测视图，不得流回运行态。
+display timeline 不是 RunInputBuilder 输入。当前 P3 已通过投影与 builder 测试保证 reasoning、preview delta、
+content delta、content completed 不进入 memory pool 或 RunInput replay；debug sampling / timeline observer
+尚未落地。
 
 ### 12.6 RunInputBuilder 输入顺序
 
 RunInputBuilder 的输出是 Engine 已经理解的 `RunInput.messages`。它不能读取 ToolRuntime cursor store，
 不能持有 `ToolFetchMoreHandle`，不能消费 `scope_token`、cursor 原文、完整大工具结果或 reasoning。
 
-推荐的运行态输入顺序：
+当前 P3 运行态输入顺序：
 
 ```text
-system prompt
--> [Conversation Memory]
-   -> task frame / pinned state（全量，独立）
+system message: [Host Memory]
+   -> pinned_state / task frame（全量，独立）
    -> verified claim ledger
    -> assumption register
    -> evidence anchors / tool fact summaries
    -> recent raw turns（语义保底）
-   -> older history pool / future episode summaries
+   -> older history pool
+   -> episode summary 插入位（当前只占位，不生成 summary）
 -> current user message
 ```
 
@@ -1226,7 +1314,7 @@ scope 规则：
 财报分析中的纠错是常态。用户可能说“刚才那个公司不是 A，是 B”“这个 WACC 假设先删掉”“换成 IFRS
 口径重算”。因此 memory 不能只追加自然语言修正。
 
-P3 至少预留 internal patch / event 形状：
+当前 P3 已预留 internal patch 形状：
 
 - `claim_correction`：修正旧 claim，并通过 `supersedes` 或等价字段标记旧 claim。
 - `memory_reset`：重置本 session memory 的内部指令形状。
@@ -1237,15 +1325,19 @@ P3 不暴露 public forget / reset API，不做 UI，不做持久治理；但数
 
 ### 12.10 P3 最小落地与后移能力
 
-P3 可以只落地单进程、顺序多轮的最小 memory projection，但结构上必须为以下能力预留位置：
+P3 已落地单进程、顺序多轮的最小 memory projection，并预留以下结构：
 
 - `USER_INPUT_ACCEPTED` canonical event。
-- Host 中立 `TaskFrame`、`MemoryClaim`、`ClaimStatus`、`EvidenceAnchor`、`AssumptionRegister`、
-  `UserPreferenceProfileRef`。
+- Host 中立 `ConversationPinnedState`、`TaskFrame`、`MemoryClaim`、`ClaimStatus`、`EvidenceAnchor`、
+  `AssumptionRegister`、`UserPreferenceProfileRef`。
 - `RunInputBuildTrace`。
 - session scope 与 producer / ingestion policy 元数据。
+- `claim_correction`、`memory_reset`、`scope_clear` internal patch 形状。
+
+当前仍未落地：
+
 - context overflow compact / retry 与 episode summary 生成。
-- `ConversationPinnedStatePatch` 三态合并、claim correction、supersession、forget / reset patch。
+- `ConversationPinnedStatePatch` 三态合并、完整 supersession、public forget / reset API。
 - persistent EventLog projection、observer checkpoint、audit / timeline 派生。
 - 用户可编辑 memory、跨 session / project / user 作用域策略、group/direct 隐私治理。
 - domain fact ledger 的自动抽取、冲突检测和长期 retrieval index。

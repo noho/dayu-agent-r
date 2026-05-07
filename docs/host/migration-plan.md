@@ -11,7 +11,9 @@
 - P1.5 已通过 PR #17 合入 `main`，merge commit 为 `ec1627c94f352205ee77bcd992d652e677fa0ebb`。
 - P2 已通过 PR #18 合入 `main`，merge commit 为 `3d86eefd4bd8b99b24c638735220d9ee571255f7`。
 - P3 phase handoff plan、常规 plan review、OLD / NEW review、最佳实践 review、最优方案 review
-  均已通过并经用户确认；当前分支为 `codex/host-p3-conversation-memory`，下一步进入 P3 代码实施。
+  均已通过并经用户确认；当前分支为 `codex/host-p3-conversation-memory`。
+- P3 代码实施已完成，常规 code review 与 OLD / #48 语义 code review 均已复查通过；本地提交后等待
+  用户确认是否 push / create PR。
 
 每个 Phase 进入实现前，必须另写可交接的 phase plan，细化到迁移 Agent 可以直接接手：
 目标、非目标、边界、文件级改动清单、契约变化、状态机、测试清单、验证命令、review gate、

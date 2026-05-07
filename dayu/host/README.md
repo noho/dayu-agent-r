@@ -5,7 +5,8 @@ Phase 流程、review 过程或 PR 流程。
 
 ## 当前状态
 
-`dayu.host` 当前落地 P2 最小 Run harness、内存态 RunEventStore 与 Host-owned ToolRuntime 截断 / 补读：
+`dayu.host` 当前落地 P3 最小 Run harness、内存态 RunEventStore、Host-owned ToolRuntime 截断 / 补读，
+以及 Host 内部 Conversation Memory / RunInputBuilder：
 
 - 包根暴露 Run 级契约与 `await start_run(request)`、`stream_run_events(run_id, after=cursor)`、
   `await get_run_result(run_id)`、`await get_tool_fetch_more_handle(request)`、
@@ -20,6 +21,12 @@ Phase 流程、review 过程或 PR 流程。
 - RunEvent 已区分 `canonical` / `preview`：content delta、reasoning delta、content completed 为 preview；
   终态、工具、usage、provider protocol error、lifecycle 等当前事件为 canonical。
 - `get_run_result` 是非阻塞快照补查，只从已 append 的 canonical terminal RunEvent 推导结果。
+- `start_run` 会先 append Host-owned canonical `USER_INPUT_ACCEPTED`，再从 EventLog 中的该事件与
+  session memory snapshot 构造交给 Engine 的 `RunInput`；该 append 失败时不会启动 Engine。
+- `StartRunRequest.input` 在入口边界只接受一条非空 `UserMessage`；system / assistant / tool 消息、多条
+  user 消息或历史 transcript 形态会 fail fast，且不会启动 Engine、写 EventLog 或污染 memory。
+- `USER_INPUT_ACCEPTED` 使用封闭 `UserInputScope`，memory projection 从事件 data 推导 provenance scope；
+  非法 scope 会在投影时失败。
 - 同一 run 的 terminal RunEvent 会封闭当前事件流；store 拒绝 terminal 后继续 append，harness 在首个
   terminal 后关闭 worker stream。
 - Host 内部 `InMemoryToolRuntime` 通过 `ToolRuntimeToolExecutor` 适配为 Engine 唯一可见的
@@ -34,15 +41,33 @@ Phase 流程、review 过程或 PR 流程。
   `get_tool_fetch_more_handle(...)` 按 session / run / 原始 tool_call / cursor fingerprint 换取短期 handle。
 - 补读失败结果中的 `denied` 只表示权限 / scope 拒绝；cursor 不存在、cursor 过期和 terminal Run 都不是权限拒绝。
 - terminal Run 后 `fetch_more_tool_result(...)` 返回 typed failure，不追加新 RunEvent。
+- Host 内部 `InMemoryConversationMemoryStore` 只从 canonical RunEvent 投影 session memory；preview、
+  reasoning delta、content delta 与 content completed 不进入 memory pool 或 RunInputBuilder replay。
+- 当前 memory 结构预留 `ConversationPinnedState`、`TaskFrame`、`MemoryClaim`、`ClaimStatus`、
+  `EvidenceAnchor`、`AssumptionRegister`、`UserPreferenceProfileRef`，但 Host 不解释财报业务语义。
+- `ConversationPinnedState` 包含 `current_goal`、`confirmed_subjects`、`user_constraints`、
+  `open_questions` 四槽，并由 `DefaultRunInputBuilder` 全量注入；该 stable block 不参与历史 pool 预算竞争。
+- verified claims 与 assumptions 属于 stable ledger，同样全量注入且不参与历史 pool 预算竞争。
+- assistant final answer 只作为 raw turn / assistant conclusion 参与连续性，不会自动升级为 verified claim。
+- Host-owned worker / proxy failure 终态会以中性 terminal summary 进入 raw turn；该摘要不被当作
+  assistant final answer。
+- `DefaultRunInputBuilder` 注入顺序为 pinned state、stable frame、verified claims、assumptions、
+  evidence anchors / tool facts、recent raw turns、older pool、episode summary 插入位、current user；
+  older pool 预算按新到旧消费，但渲染为模型可读的时间顺序。
+- LLM-facing evidence anchor 与 tool fact 文本包含来源 event cursor，便于后续追溯到 canonical EventLog。
+- `RunInputBuildTrace` 是 Host internal-only 诊断对象，记录 included / excluded item、裁剪原因、来源
+  cursor 与估算大小；它不进入 `RunInput`，不进入 memory pool，也不作为下一轮事实真源。
 
 当前未落地：
 
 - `client_request_id` 创建幂等。
 - Session governance 与同 Session active Run 仲裁。
 - 持久化 schema、workspace migration、启动恢复、多进程 lease / fencing。
-- Conversation Memory、RunInputBuilder、timeline projection。
+- timeline projection。
 - 完整 ToolRegistry、工具发现、display info、middleware、业务工具迁移。
 - LLM-facing `fetch_more` schema、`fetch_more_args` projection、远程 / 多进程补读。
+- public memory edit / reset / forget API、持久 memory projection、跨 session / project / user memory。
+- P4 context overflow compaction、episode summary 生成、compaction retry。
 - 完整取消治理、RemoteProxy、RemoteStub、Reply Outbox。
 
 不得为旧 Host 接口创建兼容 wrapper、facade 或 re-export。
@@ -54,7 +79,7 @@ Phase 流程、review 过程或 PR 流程。
 - Run 请求与选项：`StartRunRequest`、`RunInput`、`RunOptions`。
 - Run 句柄与事件：`RunHandle`、`RunStream`、`RunEvent`、`RunEventCursor`、`RunEventType`、
   `RunEventKind`、`RunEventSource`、`RunEventData`、`RunState`。
-- Host-owned failure data：`HostRunFailedData`。
+- Host-owned event data：`HostRunFailedData`、`UserInputAcceptedData`、`UserInputScope`。
 - ToolRuntime fact data：`ToolResultTruncatedData`、`ToolCursorIssuedData`、`ToolFetchMoreRequestedData`、
   `ToolFetchMoreCompletedData`、`ToolFetchMoreFailedData`、`ToolCursorExpiredData`、`ToolCursorDeniedData`、
   `ToolRuntimeEventData`、`ToolValueSizeSummary`。
@@ -67,7 +92,8 @@ Phase 流程、review 过程或 PR 流程。
   `fetch_more_tool_result`。
 
 `EngineWorker`、`LocalProxy`、`WorkerProxy`、`ToolExecutor`、`InMemoryToolRuntime`、
-`ToolRuntimeToolExecutor` 与 `run_agent_messages` 不属于 Host public API。
+`ToolRuntimeToolExecutor`、`InMemoryConversationMemoryStore`、`DefaultRunInputBuilder`、
+`RunInputBuildTrace` 与 `run_agent_messages` 不属于 Host public API。
 
 ## 稳定边界
 
@@ -88,6 +114,9 @@ Host 的职责边界是通用 Agent 执行托管、会话、运行治理、恢�
 ```text
 await dayu.host.start_run
   -> LocalRunHarness
+  -> RunEventStore.append(USER_INPUT_ACCEPTED)
+  -> ConversationMemoryStore.get_snapshot
+  -> RunInputBuilder.build
   -> LocalProxy
   -> EngineWorker
   -> dayu.engine.run_agent_messages
@@ -129,8 +158,14 @@ LocalRunHarness / default harness
 exclusive replay 和 replay-then-follow 订阅。它是单进程内存实现，不提供持久化 schema、多进程恢复
 或 observer checkpoint。
 
+当前 `InMemoryConversationMemoryStore` 也是 Host 内部临时实现。它以 `session_id` 隔离 memory，只投影
+已 append 的 canonical RunEvent；不同 session 不互相读取 memory。它不提供跨进程恢复、持久 projection、
+public memory 编辑或审计 UI。
+
 如果 worker / proxy 异常导致 Host 无法获得 Engine terminal event，后台任务会 append 一个
 Host-owned canonical `RUN_FAILED` 事件；该事件 `source=HOST`，`source_engine_event_id=None`。
+Host-owned failure 进入 terminal 后同样触发 memory projection，因此失败轮次的 `USER_INPUT_ACCEPTED`
+与中性 terminal summary 会进入 session memory。
 翻译、append、terminal result 推导等 Host 内部错误不会伪装成 Host-owned failure；后台 task 会记录
 ERROR 日志并取回异常，完整 supervisor / governance 仍不在 P1.5 范围内。
 提前停止消费后的 worker stream 关闭失败只记录 WARNING 诊断日志，不替换原始异常，也不写入

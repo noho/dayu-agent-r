@@ -10,7 +10,7 @@ import asyncio
 import logging
 import weakref
 from collections.abc import AsyncIterator
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from datetime import datetime, timezone
 from functools import partial
 from typing import Protocol, runtime_checkable
@@ -19,14 +19,30 @@ from dayu.contracts import ToolExecutor
 from dayu.contracts.tool_call import ToolExecutionRequest
 from dayu.contracts.tool_outcome import ToolExecutionOutcome, ToolFailedOutcome
 from dayu.contracts.tool_result import ToolResultFailure
-from dayu.engine import EngineEvent
+from dayu.engine import (
+    AssistantMessage,
+    EngineEvent,
+    SystemMessage,
+    ToolMessage,
+    UserMessage,
+)
+from dayu.host._conversation_memory import (
+    ConversationMemoryStore,
+    InMemoryConversationMemoryStore,
+)
 from dayu.host._event_store import InMemoryRunEventStore, RunEventStore
 from dayu.host._event_translation import (
     host_failure_draft,
     terminal_result_from_event,
     translate_engine_event,
+    user_input_accepted_draft,
 )
 from dayu.host._proxy import LocalProxy, WorkerProxy
+from dayu.host._run_input_builder import (
+    DefaultRunInputBuilder,
+    RunInputBuildTrace,
+    RunInputBuilder,
+)
 from dayu.host._tool_runtime import (
     InMemoryToolRuntime,
     ToolRuntimeToolExecutor,
@@ -49,6 +65,10 @@ from dayu.host.contracts import (
 _INITIAL_CURSOR_SEQUENCE: int = -1
 _ERROR_TOOL_EXECUTOR_NOT_CONFIGURED: str = "tool_executor_not_configured"
 _ERROR_TOOL_RUNTIME_NOT_CONFIGURED: str = "tool_runtime_not_configured"
+_ERROR_CURRENT_USER_INPUT_REQUIRED: str = "current_user_input_required"
+_ERROR_CURRENT_USER_INPUT_SINGLE_MESSAGE: str = (
+    "current_user_input_must_be_single_user_message"
+)
 _LOGGER: logging.Logger = logging.getLogger(__name__)
 
 
@@ -130,42 +150,76 @@ class LocalRunHarness:
     :param proxy: Host 内部 worker proxy。
     :param event_store: Host 内部 RunEventStore。
     :param tool_runtime: Host 内部 ToolRuntime。
+    :param memory_store: Host 内部 ConversationMemoryStore。
+    :param run_input_builder: Host 内部 RunInputBuilder。
     """
 
     proxy: WorkerProxy
     event_store: RunEventStore = field(default_factory=InMemoryRunEventStore)
     tool_runtime: InMemoryToolRuntime | None = None
+    memory_store: ConversationMemoryStore = field(
+        default_factory=InMemoryConversationMemoryStore
+    )
+    run_input_builder: RunInputBuilder = field(
+        default_factory=DefaultRunInputBuilder
+    )
+    last_run_input_build_trace_by_run: dict[str, RunInputBuildTrace] = field(
+        default_factory=dict,
+        init=False,
+    )
 
     async def start_run(self, request: StartRunRequest) -> RunStream:
         """启动 P1.5 内存态 Run。
 
         后台 task 将 EngineEvent 翻译为 RunEventDraft 并先 append 到
-        RunEventStore；返回的事件流只是 store 的订阅视图。
+        RunEventStore；返回的事件流只是 store 的订阅视图。P3 起，本方法
+        会先追加 Host-owned ``USER_INPUT_ACCEPTED`` 事件，并从 EventLog
+        与 memory snapshot 构造真正交给 Engine 的 RunInput；若追加失败，
+        不会启动 Engine。
 
         :param request: start_run 请求。
         :returns: RunStream，包含句柄与事件流。
         :raises Exception: 构造后台任务失败时透传底层异常。
         """
 
-        task = asyncio.create_task(self._run_to_store(request=request))
+        current_user_text = _extract_current_user_text(request=request)
+        current_user_event = await self.event_store.append(
+            user_input_accepted_draft(
+                run_id=request.run_id,
+                session_id=request.session_id,
+                occurred_at=datetime.now(tz=timezone.utc),
+                turn_id=request.run_id,
+                content=current_user_text,
+            )
+        )
+        snapshot = await self.memory_store.get_snapshot(request.session_id)
+        build_result = self.run_input_builder.build(
+            snapshot=snapshot,
+            current_user_event=current_user_event,
+        )
+        self.last_run_input_build_trace_by_run[request.run_id] = (
+            build_result.trace
+        )
+        engine_request = replace(request, input=build_result.run_input)
+        task = asyncio.create_task(self._run_to_store(request=engine_request))
         task.add_done_callback(
-            partial(_log_background_task_failure, request)
+            partial(_log_background_task_failure, engine_request)
         )
         _LOGGER.debug(
             "host.run.start_accepted session_id=%s run_id=%s",
-            request.session_id,
-            request.run_id,
+            engine_request.session_id,
+            engine_request.run_id,
         )
         handle = RunHandle(
-            session_id=request.session_id,
-            run_id=request.run_id,
+            session_id=engine_request.session_id,
+            run_id=engine_request.run_id,
             state=RunState.RUNNING,
             event_cursor=RunEventCursor(sequence=_INITIAL_CURSOR_SEQUENCE),
         )
         return RunStream(
             handle=handle,
             events=self.event_store.subscribe(
-                run_id=request.run_id,
+                run_id=engine_request.run_id,
                 after=handle.event_cursor,
             ),
         )
@@ -196,12 +250,14 @@ class LocalRunHarness:
                 cancellation_token=token,
             )
         except Exception as exc:
-            await self._append_worker_failure_if_needed(
+            terminal_seen = await self._append_worker_failure_if_needed(
                 request=request,
                 error=exc,
                 event_count=event_count,
                 terminal_seen=terminal_seen,
             )
+            if terminal_seen:
+                await self._project_run_events(request.run_id)
             return
         try:
             while True:
@@ -210,7 +266,7 @@ class LocalRunHarness:
                 except StopAsyncIteration:
                     break
                 except Exception as exc:
-                    await self._append_worker_failure_if_needed(
+                    terminal_seen = await self._append_worker_failure_if_needed(
                         request=request,
                         error=exc,
                         event_count=event_count,
@@ -225,6 +281,8 @@ class LocalRunHarness:
                     terminal_seen = True
                     break
         finally:
+            if terminal_seen:
+                await self._project_run_events(request.run_id)
             await _close_engine_events_if_supported(
                 engine_events=engine_events,
                 request=request,
@@ -244,7 +302,7 @@ class LocalRunHarness:
         error: Exception,
         event_count: int,
         terminal_seen: bool,
-    ) -> None:
+    ) -> bool:
         """按 worker / proxy 异常追加 Host-owned failure。
 
         本 helper 只应从 worker / proxy 取事件边界调用；Host 自身翻译、
@@ -254,7 +312,7 @@ class LocalRunHarness:
         :param error: worker / proxy 抛出的异常。
         :param event_count: 已成功取得的 EngineEvent 数量。
         :param terminal_seen: 是否已经从已 append 事件推导出终态。
-        :returns: 无返回值。
+        :returns: 已存在或新追加终态时返回 ``True``。
         :raises Exception: append Host-owned failure 失败时透传。
         """
 
@@ -267,8 +325,8 @@ class LocalRunHarness:
             type(error).__name__,
         )
         if terminal_seen:
-            return
-        await self.event_store.append(
+            return True
+        stored_event = await self.event_store.append(
             host_failure_draft(
                 run_id=request.run_id,
                 session_id=request.session_id,
@@ -276,6 +334,21 @@ class LocalRunHarness:
                 error=error,
             )
         )
+        return terminal_result_from_event(stored_event) is not None
+
+    async def _project_run_events(self, run_id: str) -> None:
+        """将指定 run 的已落库事件投影到 memory。
+
+        :param run_id: Run id。
+        :returns: 无返回值。
+        :raises Exception: 读取事件或投影失败时透传。
+        """
+
+        events = await self.event_store.list_events(
+            run_id=run_id,
+            after=None,
+        )
+        await self.memory_store.project_run_events(events)
 
     def stream_run_events(
         self,
@@ -515,6 +588,32 @@ async def fetch_more_tool_result(
     return await _default_harness_for_running_loop().fetch_more_tool_result(
         request
     )
+
+
+def _extract_current_user_text(*, request: StartRunRequest) -> str:
+    """从入口 RunInput 中提取当前用户输入正文。
+
+    该函数只位于 ingress 边界，用于在 Engine 启动前写入 Host-owned
+    ``USER_INPUT_ACCEPTED``。后续 memory projection、RunInputBuilder 与
+    replay 均不得继续从 ``StartRunRequest.input`` 读取用户输入。
+
+    :param request: start_run 请求。
+    :returns: 当前用户输入正文。
+    :raises ValueError: 请求中不是且仅有一条非空 UserMessage 时抛出。
+    """
+
+    messages = request.input.messages
+    if len(messages) != 1:
+        raise ValueError(_ERROR_CURRENT_USER_INPUT_SINGLE_MESSAGE)
+    message = messages[0]
+    if isinstance(message, (SystemMessage, AssistantMessage, ToolMessage)):
+        raise ValueError(_ERROR_CURRENT_USER_INPUT_SINGLE_MESSAGE)
+    if not isinstance(message, UserMessage):
+        raise ValueError(_ERROR_CURRENT_USER_INPUT_SINGLE_MESSAGE)
+    content = message.content.strip()
+    if content == "":
+        raise ValueError(_ERROR_CURRENT_USER_INPUT_REQUIRED)
+    return content
 
 
 __all__ = [
