@@ -14,6 +14,13 @@ from dayu.host._run_harness import (
     stream_run_events,
 )
 from dayu.host.contracts import (
+    ContextCompactFailureReason,
+    HostContextAttemptRetryData,
+    HostContextCompactCompletedData,
+    HostContextCompactEventData,
+    HostContextCompactFailedData,
+    HostContextCompactRequestedData,
+    HostContextOverflowObservedData,
     HostRunFailedData,
     RunCancelledResult,
     RunEvent,
@@ -56,6 +63,13 @@ from dayu.host.contracts import (
 )
 
 __all__ = [
+    "ContextCompactFailureReason",
+    "HostContextAttemptRetryData",
+    "HostContextCompactCompletedData",
+    "HostContextCompactEventData",
+    "HostContextCompactFailedData",
+    "HostContextCompactRequestedData",
+    "HostContextOverflowObservedData",
     "HostRunFailedData",
     "RunCancelledResult",
     "RunEventData",

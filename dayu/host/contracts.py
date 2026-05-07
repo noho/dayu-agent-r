@@ -1,4 +1,4 @@
-"""Host P1.5 最小 Run 契约。
+"""Host 最小 Run 契约。
 
 本模块只定义当前 Run harness 与最小事件事实层所需的强类型结构。它不是
 完整生产 Host 接口：创建幂等、持久 EventLog schema、Session governance
@@ -63,6 +63,11 @@ class RunEventType(StrEnum):
     RUN_SUSPENDED = EngineEventType.RUN_SUSPENDED.value
     RUN_CANCELLED = EngineEventType.RUN_CANCELLED.value
     RUN_FAILED = EngineEventType.RUN_FAILED.value
+    CONTEXT_OVERFLOW_OBSERVED = "context_overflow_observed"
+    CONTEXT_COMPACT_REQUESTED = "context_compact_requested"
+    CONTEXT_COMPACT_COMPLETED = "context_compact_completed"
+    CONTEXT_COMPACT_FAILED = "context_compact_failed"
+    CONTEXT_ATTEMPT_RETRYING = "context_attempt_retrying"
     TOOL_RESULT_TRUNCATED = "tool_result_truncated"
     TOOL_CURSOR_ISSUED = "tool_cursor_issued"
     TOOL_FETCH_MORE_REQUESTED = "tool_fetch_more_requested"
@@ -90,6 +95,17 @@ class UserInputScope(StrEnum):
     """用户输入接纳事件的 memory 可见范围。"""
 
     SESSION = "session"
+
+
+class ContextCompactFailureReason(StrEnum):
+    """Host context compact 失败原因。"""
+
+    RETRY_LIMIT_EXCEEDED = "retry_limit_exceeded"
+    NOT_REDUCED = "not_reduced"
+    FIDELITY_FAILED = "fidelity_failed"
+    CURRENT_USER_NOT_FOUND = "current_user_not_found"
+    TRACE_MISSING = "trace_missing"
+    INTERNAL_ERROR = "internal_error"
 
 
 @dataclass(frozen=True, slots=True)
@@ -141,6 +157,135 @@ class UserInputAcceptedData:
     turn_id: str
     content: str
     scope: UserInputScope
+
+
+@dataclass(frozen=True, slots=True)
+class HostContextOverflowObservedData:
+    """Host 已观察到 Engine context overflow 事实。
+
+    :param attempt_index: 同一 Run 内 Engine attempt 序号，从 ``0`` 起。
+    :param engine_event_type: 触发该事实的 Engine event type。
+    :param engine_error_code: Engine 失败错误码；非 terminal trigger 为
+        ``None``。
+    :param recoverable: Engine 是否声明该失败可恢复。
+    :param reason: 中性触发原因。
+    """
+
+    attempt_index: int
+    engine_event_type: str
+    engine_error_code: str | None
+    recoverable: bool
+    reason: str
+
+
+@dataclass(frozen=True, slots=True)
+class HostContextCompactRequestedData:
+    """Host context compact 已请求事实。
+
+    :param attempt_index: 触发 compact 的 attempt 序号。
+    :param policy_id: Host compact policy 标识。
+    :param before_token_estimate: compact 前 RunInput 估算 token。
+    :param before_char_size: compact 前 RunInput 字符数。
+    :param estimator_id: Host 估算器算法标识。
+    """
+
+    attempt_index: int
+    policy_id: str
+    before_token_estimate: int
+    before_char_size: int
+    estimator_id: str
+
+
+@dataclass(frozen=True, slots=True)
+class HostContextCompactCompletedData:
+    """Host context compact 成功事实。
+
+    :param attempt_index: 触发 compact 的 attempt 序号。
+    :param policy_id: Host compact policy 标识。
+    :param before_token_estimate: compact 前估算 token。
+    :param after_token_estimate: compact 后估算 token。
+    :param before_char_size: compact 前字符数。
+    :param after_char_size: compact 后字符数。
+    :param reduced: compact 后是否严格变短；成功事实必须为 ``True``。
+    :param preserved_current_user: 当前用户问题是否保真。
+    :param preserved_pinned_state: pinned state 是否保真。
+    :param preserved_evidence_anchors: 证据锚点是否保真。
+    :param preserved_source_cursors: 来源 cursor 是否保真。
+    :param preserved_tool_facts: 必要工具事实是否保真。
+    :param dropped_item_count: 被确定丢弃的历史 item 数。
+    :param degraded_item_count: 本次 compact 中被保留但降级表达的历史
+        item 数；当前 deterministic compact 不做额外摘要降级，因此为
+        ``0``，被确定移除的 raw turns 只计入 ``dropped_item_count``。
+    :param estimator_id: Host 估算器算法标识。
+    """
+
+    attempt_index: int
+    policy_id: str
+    before_token_estimate: int
+    after_token_estimate: int
+    before_char_size: int
+    after_char_size: int
+    reduced: bool
+    preserved_current_user: bool
+    preserved_pinned_state: bool
+    preserved_evidence_anchors: bool
+    preserved_source_cursors: bool
+    preserved_tool_facts: bool
+    dropped_item_count: int
+    degraded_item_count: int
+    estimator_id: str
+
+
+@dataclass(frozen=True, slots=True)
+class HostContextCompactFailedData:
+    """Host context compact 失败事实。
+
+    :param attempt_index: 触发 compact 的 attempt 序号。
+    :param policy_id: Host compact policy 标识。
+    :param reason: 强类型失败原因。
+    :param message: 中性可读说明。
+    :param before_token_estimate: compact 前估算 token。
+    :param after_token_estimate: compact 后估算 token；未生成时为 ``None``。
+    :param before_char_size: compact 前字符数。
+    :param after_char_size: compact 后字符数；未生成时为 ``None``。
+    :param estimator_id: Host 估算器算法标识。
+    """
+
+    attempt_index: int
+    policy_id: str
+    reason: ContextCompactFailureReason
+    message: str
+    before_token_estimate: int
+    after_token_estimate: int | None
+    before_char_size: int
+    after_char_size: int | None
+    estimator_id: str
+
+
+@dataclass(frozen=True, slots=True)
+class HostContextAttemptRetryData:
+    """Host context compact 后即将重试 attempt 的事实。
+
+    :param from_attempt_index: 触发 compact 的 attempt 序号。
+    :param next_attempt_index: 下一次 internal Engine attempt 序号。
+    :param policy_id: Host compact policy 标识。
+    :param reason: 中性重试原因。
+    """
+
+    from_attempt_index: int
+    next_attempt_index: int
+    policy_id: str
+    reason: str
+
+
+HostContextCompactEventData: TypeAlias = (
+    HostContextOverflowObservedData
+    | HostContextCompactRequestedData
+    | HostContextCompactCompletedData
+    | HostContextCompactFailedData
+    | HostContextAttemptRetryData
+)
+"""Host context compact canonical RunEvent data 封闭联合。"""
 
 
 @dataclass(frozen=True, slots=True)
@@ -319,6 +464,7 @@ RunEventData: TypeAlias = (
     EngineEventData
     | HostRunFailedData
     | UserInputAcceptedData
+    | HostContextCompactEventData
     | ToolRuntimeEventData
 )
 """Host RunEvent data 封闭联合。"""
@@ -721,6 +867,13 @@ ToolFetchMoreResult: TypeAlias = (
 
 
 __all__ = [
+    "ContextCompactFailureReason",
+    "HostContextAttemptRetryData",
+    "HostContextCompactCompletedData",
+    "HostContextCompactEventData",
+    "HostContextCompactFailedData",
+    "HostContextCompactRequestedData",
+    "HostContextOverflowObservedData",
     "HostRunFailedData",
     "UserInputAcceptedData",
     "UserInputScope",

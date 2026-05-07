@@ -1,4 +1,4 @@
-"""Host P1.5 最小 Run harness。
+"""Host P4 最小 Run harness。
 
 本模块提供 public ``start_run`` 的内存态测试入口，以及内部
 ``LocalRunHarness``。它不提供生产级 Session / Run governance。
@@ -22,17 +22,31 @@ from dayu.contracts.tool_outcome import ToolExecutionOutcome, ToolFailedOutcome
 from dayu.contracts.tool_result import ToolResultFailure
 from dayu.engine import (
     AssistantMessage,
+    ContextCompactionRequestedData,
     EngineEvent,
+    EngineEventType,
+    RunFailedData,
     SystemMessage,
     ToolMessage,
     UserMessage,
 )
+from dayu.host._context_compaction import (
+    ContextCompactCoordinator,
+    ContextCompactDecisionStatus,
+)
 from dayu.host._conversation_memory import (
     ConversationMemoryStore,
     InMemoryConversationMemoryStore,
+    snapshot_with_transient_tool_facts,
 )
 from dayu.host._event_store import InMemoryRunEventStore, RunEventStore
 from dayu.host._event_translation import (
+    context_attempt_retrying_draft,
+    context_compact_completed_draft,
+    context_compact_failed_draft,
+    context_compact_requested_draft,
+    context_overflow_observed_draft,
+    host_context_compact_failure_terminal_draft,
     host_failure_draft,
     terminal_result_from_event,
     translate_engine_event,
@@ -50,6 +64,9 @@ from dayu.host._tool_runtime import (
 )
 from dayu.host._worker import EngineWorker
 from dayu.host.contracts import (
+    ContextCompactFailureReason,
+    HostContextAttemptRetryData,
+    HostContextOverflowObservedData,
     RunEvent,
     RunEventCursor,
     RunHandle,
@@ -67,16 +84,34 @@ _INITIAL_CURSOR_SEQUENCE: int = -1
 _ERROR_TOOL_EXECUTOR_NOT_CONFIGURED: str = "tool_executor_not_configured"
 _ERROR_TOOL_RUNTIME_NOT_CONFIGURED: str = "tool_runtime_not_configured"
 _ERROR_CURRENT_USER_INPUT_REQUIRED: str = "current_user_input_required"
-_ERROR_CURRENT_USER_INPUT_SINGLE_MESSAGE: str = (
-    "current_user_input_must_be_single_user_message"
+_ERROR_CURRENT_USER_INPUT_SHAPE_EMPTY: str = (
+    "start_run_input_requires_trailing_non_empty_user_message"
+)
+_ERROR_CURRENT_USER_INPUT_SHAPE_TRAILING_USER: str = (
+    "start_run_input_must_end_with_single_current_user_message"
+)
+_ERROR_CURRENT_USER_INPUT_SHAPE_MULTIPLE_USER: str = (
+    "start_run_input_allows_only_one_trailing_current_user_message"
+)
+_ERROR_CURRENT_USER_INPUT_SHAPE_UNSUPPORTED_HISTORY: str = (
+    "start_run_input_allows_only_leading_system_messages_before_current_user"
 )
 _ERROR_RUN_INPUT_TRACE_CACHE_LIMIT_INVALID: str = (
     "run_input_trace_cache_limit_must_be_positive"
+)
+_ERROR_CONTEXT_COMPACT_RETRY_LIMIT_INVALID: str = (
+    "context_compact_retry_limit_must_be_non_negative"
 )
 _ERROR_ENGINE_STREAM_ENDED_WITHOUT_TERMINAL: str = (
     "engine_stream_ended_without_terminal"
 )
 _RUN_INPUT_TRACE_CACHE_LIMIT: int = 32
+_CONTEXT_COMPACT_RETRY_LIMIT: int = 1
+_ERROR_CONTEXT_COMPACTION_REQUIRED: str = "context_compaction_required"
+_COMPACT_TRACE_MISSING_MESSAGE: str = "run input build trace is missing"
+_UNEXPECTED_COMPACTION_TERMINAL_MESSAGE: str = (
+    "engine produced terminal event after context compaction request"
+)
 _LOGGER: logging.Logger = logging.getLogger(__name__)
 
 
@@ -152,6 +187,18 @@ class _NoopToolExecutor:
 
 
 @dataclass(frozen=True, slots=True)
+class _AcceptedStartInput:
+    """Host ingress 接纳后的消息结构。
+
+    :param current_user_text: 当前用户输入正文。
+    :param caller_system_messages: 调用方提供的 leading system prompt。
+    """
+
+    current_user_text: str
+    caller_system_messages: tuple[SystemMessage, ...]
+
+
+@dataclass(frozen=True, slots=True)
 class LocalRunHarness:
     """Host 内部本地 Run harness。
 
@@ -160,6 +207,8 @@ class LocalRunHarness:
     :param tool_runtime: Host 内部 ToolRuntime。
     :param memory_store: Host 内部 ConversationMemoryStore。
     :param run_input_builder: Host 内部 RunInputBuilder。
+    :param compact_coordinator: Host 内部 context compact coordinator。
+    :param context_compact_retry_limit: context overflow compact retry 上限。
     :param run_input_trace_cache_limit: RunInput 构造 trace 保留上限。
     """
 
@@ -172,6 +221,10 @@ class LocalRunHarness:
     run_input_builder: RunInputBuilder = field(
         default_factory=DefaultRunInputBuilder
     )
+    compact_coordinator: ContextCompactCoordinator = field(
+        default_factory=ContextCompactCoordinator
+    )
+    context_compact_retry_limit: int = _CONTEXT_COMPACT_RETRY_LIMIT
     run_input_trace_cache_limit: int = _RUN_INPUT_TRACE_CACHE_LIMIT
     last_run_input_build_trace_by_run: OrderedDict[
         str, RunInputBuildTrace
@@ -181,12 +234,15 @@ class LocalRunHarness:
     )
 
     def __post_init__(self) -> None:
-        """校验 harness 内部调试缓存配置。
+        """校验 harness 内部 compact retry 与调试缓存配置。
 
         :returns: 无返回值。
-        :raises ValueError: trace 缓存容量不是正数时抛出。
+        :raises ValueError: compact retry 上限为负数，或 trace 缓存容量
+            不是正数时抛出。
         """
 
+        if self.context_compact_retry_limit < 0:
+            raise ValueError(_ERROR_CONTEXT_COMPACT_RETRY_LIMIT_INVALID)
         if self.run_input_trace_cache_limit <= 0:
             raise ValueError(_ERROR_RUN_INPUT_TRACE_CACHE_LIMIT_INVALID)
 
@@ -197,34 +253,41 @@ class LocalRunHarness:
         RunEventStore；返回的事件流只是 store 的订阅视图。P3 起，本方法
         会先追加 Host-owned ``USER_INPUT_ACCEPTED`` 事件，并从 EventLog
         与 memory snapshot 构造真正交给 Engine 的 RunInput；若追加失败，
-        不会启动 Engine。
+        不会启动 Engine。P4 起，context overflow 后可在同一 Run 下启动
+        compacted internal attempt，但不会再次追加 ``USER_INPUT_ACCEPTED``。
 
         :param request: start_run 请求。
         :returns: RunStream，包含句柄与事件流。
         :raises Exception: 构造后台任务失败时透传底层异常。
         """
 
-        current_user_text = _extract_current_user_text(request=request)
+        accepted_input = _extract_accepted_start_input(request=request)
         current_user_event = await self.event_store.append(
             user_input_accepted_draft(
                 run_id=request.run_id,
                 session_id=request.session_id,
                 occurred_at=datetime.now(tz=timezone.utc),
                 turn_id=request.run_id,
-                content=current_user_text,
+                content=accepted_input.current_user_text,
             )
         )
         snapshot = await self.memory_store.get_snapshot(request.session_id)
         build_result = self.run_input_builder.build(
             snapshot=snapshot,
             current_user_event=current_user_event,
+            caller_system_messages=accepted_input.caller_system_messages,
         )
         self._remember_run_input_build_trace(
             run_id=request.run_id,
             trace=build_result.trace,
         )
         engine_request = replace(request, input=build_result.run_input)
-        task = asyncio.create_task(self._run_to_store(request=engine_request))
+        task = asyncio.create_task(
+            self._run_to_store(
+                request=engine_request,
+                current_user_event=current_user_event,
+            )
+        )
         task.add_done_callback(
             partial(_log_background_task_failure, engine_request)
         )
@@ -250,16 +313,21 @@ class LocalRunHarness:
     async def _run_to_store(
         self,
         request: StartRunRequest,
+        current_user_event: RunEvent | None = None,
     ) -> None:
         """立即执行 Engine 事件流并写入 RunEventStore。
 
         :param request: start_run 请求。
+        :param current_user_event: 本 Run 原始 USER_INPUT_ACCEPTED 事件；仅
+            context compact retry 路径必需。
         :returns: 无返回值。
         :raises Exception: 翻译、append 或终态结果推导失败时暴露底层错误；
             worker / proxy 取事件异常会转为 Host-owned failure RunEvent。
         """
 
         token = _NeverCancelledToken()
+        attempt_request = request
+        attempt_index = 0
         event_count = 0
         terminal_seen = False
         _LOGGER.debug(
@@ -268,56 +336,121 @@ class LocalRunHarness:
             request.run_id,
         )
         try:
-            engine_events = self.proxy.stream_engine_events(
-                request=request,
-                cancellation_token=token,
-            )
-        except Exception as exc:
-            terminal_seen = await self._append_worker_failure_if_needed(
-                request=request,
-                error=exc,
-                event_count=event_count,
-                terminal_seen=terminal_seen,
-            )
-            if terminal_seen:
-                await self._project_run_events(request.run_id)
-            return
-        try:
             while True:
+                overflow_trigger_seen = False
+                overflow_observed_seen = False
+                overflow_trigger_event: EngineEvent | None = None
                 try:
-                    event = await anext(engine_events)
-                except StopAsyncIteration:
-                    break
+                    engine_events = self.proxy.stream_engine_events(
+                        request=attempt_request,
+                        cancellation_token=token,
+                    )
                 except Exception as exc:
                     terminal_seen = await self._append_worker_failure_if_needed(
-                        request=request,
+                        request=attempt_request,
                         error=exc,
                         event_count=event_count,
                         terminal_seen=terminal_seen,
                     )
-                    break
-                event_count += 1
-                stored_event = await self.event_store.append(
-                    translate_engine_event(event)
-                )
-                if terminal_result_from_event(stored_event) is not None:
-                    terminal_seen = True
-                    break
-            if not terminal_seen:
-                terminal_seen = (
-                    await self._append_missing_terminal_failure_if_needed(
-                        request=request,
-                        event_count=event_count,
-                        terminal_seen=terminal_seen,
+                    return
+                try:
+                    while True:
+                        try:
+                            event = await anext(engine_events)
+                        except StopAsyncIteration:
+                            break
+                        except Exception as exc:
+                            terminal_seen = (
+                                await self._append_worker_failure_if_needed(
+                                    request=attempt_request,
+                                    error=exc,
+                                    event_count=event_count,
+                                    terminal_seen=terminal_seen,
+                                )
+                            )
+                            return
+                        event_count += 1
+                        if _is_context_compaction_requested(event):
+                            overflow_trigger_seen = True
+                            overflow_trigger_event = event
+                            await self.event_store.append(
+                                translate_engine_event(event)
+                            )
+                            continue
+                        if _is_context_compaction_required_terminal(event):
+                            overflow_trigger_seen = True
+                            await self._append_overflow_observed(
+                                request=attempt_request,
+                                event=event,
+                                attempt_index=attempt_index,
+                            )
+                            overflow_observed_seen = True
+                            break
+                        if overflow_trigger_seen and _is_terminal_engine_event(
+                            event
+                        ):
+                            await self._append_unexpected_compaction_terminal_closure(
+                                request=attempt_request,
+                                event=event,
+                                attempt_index=attempt_index,
+                            )
+                        stored_event = await self.event_store.append(
+                            translate_engine_event(event)
+                        )
+                        if terminal_result_from_event(stored_event) is not None:
+                            terminal_seen = True
+                            return
+                    if overflow_trigger_seen:
+                        if (
+                            not overflow_observed_seen
+                            and overflow_trigger_event is not None
+                        ):
+                            await self._append_overflow_observed(
+                                request=attempt_request,
+                                event=overflow_trigger_event,
+                                attempt_index=attempt_index,
+                            )
+                        if current_user_event is None:
+                            raise RuntimeError(
+                                "context compact requires current_user_event"
+                            )
+                        try:
+                            next_request = await self._compact_or_fail(
+                                request=attempt_request,
+                                current_user_event=current_user_event,
+                                attempt_index=attempt_index,
+                            )
+                        except Exception as exc:
+                            terminal_seen = (
+                                await self._append_compact_exception_failure(
+                                    request=attempt_request,
+                                    attempt_index=attempt_index,
+                                    error=exc,
+                                )
+                            )
+                            return
+                        if next_request is None:
+                            terminal_seen = True
+                            return
+                        attempt_request = next_request
+                        attempt_index += 1
+                        continue
+                    terminal_seen = (
+                        await self._append_missing_terminal_failure_if_needed(
+                            request=attempt_request,
+                            event_count=event_count,
+                            terminal_seen=terminal_seen,
+                        )
                     )
-                )
+                    return
+                finally:
+                    await _close_engine_events_if_supported(
+                        engine_events=engine_events,
+                        request=attempt_request,
+                    )
         finally:
             if terminal_seen:
                 await self._project_run_events(request.run_id)
-            await _close_engine_events_if_supported(
-                engine_events=engine_events,
-                request=request,
-            )
             _LOGGER.debug(
                 "host.run.background_finished session_id=%s run_id=%s "
                 "event_count=%s",
@@ -325,6 +458,281 @@ class LocalRunHarness:
                 request.run_id,
                 event_count,
             )
+
+    async def _compact_or_fail(
+        self,
+        *,
+        request: StartRunRequest,
+        current_user_event: RunEvent,
+        attempt_index: int,
+    ) -> StartRunRequest | None:
+        """执行 Host-owned compact 并返回下一次 attempt 请求。
+
+        :param request: 当前 attempt 请求。
+        :param current_user_event: 本 Run 原始用户输入事件。
+        :param attempt_index: 当前 attempt 序号。
+        :returns: 成功返回 compact 后请求；失败返回 ``None``。
+        :raises Exception: append 事件或 compact 失败时透传。
+        """
+
+        if attempt_index >= self.context_compact_retry_limit:
+            failed_data = self.compact_coordinator.retry_limit_failed(
+                request=request,
+                attempt_index=attempt_index,
+            )
+            await self.event_store.append(
+                context_compact_failed_draft(
+                    run_id=request.run_id,
+                    session_id=request.session_id,
+                    occurred_at=datetime.now(tz=timezone.utc),
+                    data=failed_data,
+                )
+            )
+            await self.event_store.append(
+                host_context_compact_failure_terminal_draft(
+                    run_id=request.run_id,
+                    session_id=request.session_id,
+                    occurred_at=datetime.now(tz=timezone.utc),
+                    reason=failed_data.reason,
+                    message=failed_data.message,
+                )
+            )
+            return None
+        snapshot = await self.memory_store.get_snapshot(request.session_id)
+        current_run_events = await self.event_store.list_events(
+            run_id=request.run_id,
+            after=None,
+        )
+        snapshot = snapshot_with_transient_tool_facts(
+            snapshot=snapshot,
+            events=current_run_events,
+        )
+        if request.run_id not in self.last_run_input_build_trace_by_run:
+            failed_data = self.compact_coordinator.exception_failed(
+                request=request,
+                attempt_index=attempt_index,
+                reason=ContextCompactFailureReason.TRACE_MISSING,
+                message=_COMPACT_TRACE_MISSING_MESSAGE,
+            )
+            await self.event_store.append(
+                context_compact_failed_draft(
+                    run_id=request.run_id,
+                    session_id=request.session_id,
+                    occurred_at=datetime.now(tz=timezone.utc),
+                    data=failed_data,
+                )
+            )
+            await self.event_store.append(
+                host_context_compact_failure_terminal_draft(
+                    run_id=request.run_id,
+                    session_id=request.session_id,
+                    occurred_at=datetime.now(tz=timezone.utc),
+                    reason=failed_data.reason,
+                    message=failed_data.message,
+                )
+            )
+            return None
+        decision = self.compact_coordinator.compact(
+            request=request,
+            snapshot=snapshot,
+            current_user_event=current_user_event,
+            attempt_index=attempt_index,
+        )
+        await self.event_store.append(
+            context_compact_requested_draft(
+                run_id=request.run_id,
+                session_id=request.session_id,
+                occurred_at=datetime.now(tz=timezone.utc),
+                data=decision.requested_data,
+            )
+        )
+        if decision.status is ContextCompactDecisionStatus.FAILED:
+            failed_data = decision.failed_data
+            if failed_data is None:
+                raise RuntimeError("context compact failed without failed_data")
+            await self.event_store.append(
+                context_compact_failed_draft(
+                    run_id=request.run_id,
+                    session_id=request.session_id,
+                    occurred_at=datetime.now(tz=timezone.utc),
+                    data=failed_data,
+                )
+            )
+            await self.event_store.append(
+                host_context_compact_failure_terminal_draft(
+                    run_id=request.run_id,
+                    session_id=request.session_id,
+                    occurred_at=datetime.now(tz=timezone.utc),
+                    reason=failed_data.reason,
+                    message=failed_data.message,
+                )
+            )
+            return None
+        completed_data = decision.completed_data
+        compacted_input = decision.run_input
+        if completed_data is None or compacted_input is None:
+            raise RuntimeError("context compact completed without run_input")
+        await self.event_store.append(
+            context_compact_completed_draft(
+                run_id=request.run_id,
+                session_id=request.session_id,
+                occurred_at=datetime.now(tz=timezone.utc),
+                data=completed_data,
+            )
+        )
+        next_attempt_index = attempt_index + 1
+        await self.event_store.append(
+            context_attempt_retrying_draft(
+                run_id=request.run_id,
+                session_id=request.session_id,
+                occurred_at=datetime.now(tz=timezone.utc),
+                data=HostContextAttemptRetryData(
+                    from_attempt_index=attempt_index,
+                    next_attempt_index=next_attempt_index,
+                    policy_id=completed_data.policy_id,
+                    reason="context_overflow_compacted",
+                ),
+            )
+        )
+        return replace(request, input=compacted_input)
+
+    async def _append_compact_exception_failure(
+        self,
+        *,
+        request: StartRunRequest,
+        attempt_index: int,
+        error: Exception,
+    ) -> bool:
+        """将 compact 分支异常收口为 Host-owned 失败终态。
+
+        :param request: 当前 attempt 请求。
+        :param attempt_index: 当前 attempt 序号。
+        :param error: compact 分支抛出的异常。
+        :returns: 已追加终态时返回 ``True``。
+        :raises Exception: append 失败时透传。
+        """
+
+        _LOGGER.error(
+            "host.run.context_compact_failed session_id=%s run_id=%s "
+            "attempt_index=%s exc_type=%s",
+            request.session_id,
+            request.run_id,
+            attempt_index,
+            type(error).__name__,
+            exc_info=(type(error), error, error.__traceback__),
+        )
+        failed_data = self.compact_coordinator.exception_failed(
+            request=request,
+            attempt_index=attempt_index,
+            reason=ContextCompactFailureReason.INTERNAL_ERROR,
+            message=str(error),
+        )
+        await self.event_store.append(
+            context_compact_failed_draft(
+                run_id=request.run_id,
+                session_id=request.session_id,
+                occurred_at=datetime.now(tz=timezone.utc),
+                data=failed_data,
+            )
+        )
+        stored_event = await self.event_store.append(
+            host_context_compact_failure_terminal_draft(
+                run_id=request.run_id,
+                session_id=request.session_id,
+                occurred_at=datetime.now(tz=timezone.utc),
+                reason=failed_data.reason,
+                message=failed_data.message,
+            )
+        )
+        return terminal_result_from_event(stored_event) is not None
+
+    async def _append_overflow_observed(
+        self,
+        *,
+        request: StartRunRequest,
+        event: EngineEvent,
+        attempt_index: int,
+    ) -> None:
+        """追加 Host-owned overflow observed 事实。
+
+        :param request: 当前 attempt 请求。
+        :param event: Engine overflow 触发事件；可以是 terminal
+            ``RUN_FAILED(context_compaction_required)``，也可以是非 terminal
+            ``CONTEXT_COMPACTION_REQUESTED``。
+        :param attempt_index: 当前 attempt 序号。
+        :returns: 无返回值。
+        :raises Exception: append 失败时透传。
+        """
+
+        data = event.data
+        engine_error_code: str | None = None
+        recoverable = False
+        reason = "engine_context_compaction_required"
+        if isinstance(data, RunFailedData):
+            engine_error_code = data.error_code
+            recoverable = data.recoverable
+            reason = data.message
+        if isinstance(data, ContextCompactionRequestedData):
+            recoverable = True
+            reason = data.reason
+        await self.event_store.append(
+            context_overflow_observed_draft(
+                run_id=request.run_id,
+                session_id=request.session_id,
+                occurred_at=datetime.now(tz=timezone.utc),
+                data=HostContextOverflowObservedData(
+                    attempt_index=attempt_index,
+                    engine_event_type=event.type.value,
+                    engine_error_code=engine_error_code,
+                    recoverable=recoverable,
+                    reason=reason,
+                ),
+            )
+        )
+
+    async def _append_unexpected_compaction_terminal_closure(
+        self,
+        *,
+        request: StartRunRequest,
+        event: EngineEvent,
+        attempt_index: int,
+    ) -> None:
+        """闭合 Engine context compaction requested 后的意外终态序列。
+
+        Engine 契约要求 ``CONTEXT_COMPACTION_REQUESTED`` 后跟
+        recoverable ``RUN_FAILED(context_compaction_required)``。若 Engine
+        产出其它终态，Host 先追加 Host-owned ``CONTEXT_COMPACT_FAILED``
+        事实闭合 compact 序列，再保留 Engine 原终态作为本 Run 终态。
+
+        :param request: 当前 attempt 请求。
+        :param event: Engine 意外终态事件。
+        :param attempt_index: 当前 attempt 序号。
+        :returns: 无返回值。
+        :raises Exception: append 失败时透传。
+        """
+
+        _LOGGER.warning(
+            "host.run.context_compact_unexpected_terminal "
+            "session_id=%s run_id=%s attempt_index=%s engine_event_type=%s",
+            request.session_id,
+            request.run_id,
+            attempt_index,
+            event.type.value,
+        )
+        failed_data = self.compact_coordinator.exception_failed(
+            request=request,
+            attempt_index=attempt_index,
+            reason=ContextCompactFailureReason.INTERNAL_ERROR,
+            message=_UNEXPECTED_COMPACTION_TERMINAL_MESSAGE,
+        )
+        await self.event_store.append(
+            context_compact_failed_draft(
+                run_id=request.run_id,
+                session_id=request.session_id,
+                occurred_at=datetime.now(tz=timezone.utc),
+                data=failed_data,
+            )
+        )
 
     async def _append_worker_failure_if_needed(
         self,
@@ -681,30 +1089,87 @@ async def fetch_more_tool_result(
     )
 
 
-def _extract_current_user_text(*, request: StartRunRequest) -> str:
-    """从入口 RunInput 中提取当前用户输入正文。
+def _extract_accepted_start_input(*, request: StartRunRequest) -> _AcceptedStartInput:
+    """从入口 RunInput 中提取 caller system prompt 与当前用户输入。
 
     该函数只位于 ingress 边界，用于在 Engine 启动前写入 Host-owned
     ``USER_INPUT_ACCEPTED``。后续 memory projection、RunInputBuilder 与
     replay 均不得继续从 ``StartRunRequest.input`` 读取用户输入。
 
     :param request: start_run 请求。
-    :returns: 当前用户输入正文。
-    :raises ValueError: 请求中不是且仅有一条非空 UserMessage 时抛出。
+    :returns: 接纳后的当前用户输入和 caller system prompt。
+    :raises ValueError: 请求不是若干 leading SystemMessage 加一条非空
+        UserMessage 时抛出。
     """
 
     messages = request.input.messages
-    if len(messages) != 1:
-        raise ValueError(_ERROR_CURRENT_USER_INPUT_SINGLE_MESSAGE)
-    message = messages[0]
-    if isinstance(message, (SystemMessage, AssistantMessage, ToolMessage)):
-        raise ValueError(_ERROR_CURRENT_USER_INPUT_SINGLE_MESSAGE)
-    if not isinstance(message, UserMessage):
-        raise ValueError(_ERROR_CURRENT_USER_INPUT_SINGLE_MESSAGE)
-    content = message.content.strip()
+    if not messages:
+        raise ValueError(_ERROR_CURRENT_USER_INPUT_SHAPE_EMPTY)
+    trailing_message = messages[-1]
+    if not isinstance(trailing_message, UserMessage):
+        raise ValueError(_ERROR_CURRENT_USER_INPUT_SHAPE_TRAILING_USER)
+    caller_system_messages: list[SystemMessage] = []
+    for message in messages[:-1]:
+        if isinstance(message, SystemMessage):
+            caller_system_messages.append(message)
+            continue
+        if isinstance(message, UserMessage):
+            raise ValueError(_ERROR_CURRENT_USER_INPUT_SHAPE_MULTIPLE_USER)
+        raise ValueError(_ERROR_CURRENT_USER_INPUT_SHAPE_UNSUPPORTED_HISTORY)
+    content = trailing_message.content.strip()
     if content == "":
         raise ValueError(_ERROR_CURRENT_USER_INPUT_REQUIRED)
-    return content
+    return _AcceptedStartInput(
+        current_user_text=content,
+        caller_system_messages=tuple(caller_system_messages),
+    )
+
+
+def _is_terminal_engine_event(event: EngineEvent) -> bool:
+    """判断 EngineEvent 是否为 Engine 终态事件。
+
+    :param event: EngineEvent。
+    :returns: 是 final / failed / cancelled / suspended 终态时返回 ``True``。
+    :raises Exception: 不主动抛出异常。
+    """
+
+    return event.type in {
+        EngineEventType.FINAL_ANSWER,
+        EngineEventType.RUN_FAILED,
+        EngineEventType.RUN_CANCELLED,
+        EngineEventType.RUN_SUSPENDED,
+    }
+
+
+def _is_context_compaction_requested(event: EngineEvent) -> bool:
+    """判断 Engine 事件是否为强类型 context compaction requested。
+
+    :param event: EngineEvent。
+    :returns: 是 context compaction requested 返回 ``True``。
+    :raises Exception: 不主动抛出异常。
+    """
+
+    return event.type is EngineEventType.CONTEXT_COMPACTION_REQUESTED and isinstance(
+        event.data,
+        ContextCompactionRequestedData,
+    )
+
+
+def _is_context_compaction_required_terminal(event: EngineEvent) -> bool:
+    """判断 Engine terminal 是否为可 compact 的 context overflow。
+
+    :param event: EngineEvent。
+    :returns: 可由 Host compact 接管返回 ``True``。
+    :raises Exception: 不主动抛出异常。
+    """
+
+    data = event.data
+    return (
+        event.type is EngineEventType.RUN_FAILED
+        and isinstance(data, RunFailedData)
+        and data.recoverable
+        and data.error_code == _ERROR_CONTEXT_COMPACTION_REQUIRED
+    )
 
 
 __all__ = [

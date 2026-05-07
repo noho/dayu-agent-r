@@ -44,6 +44,7 @@ from dayu.engine.runners.openai.cancellation_helpers import _RunnerInterrupted
 from dayu.engine.runners.openai.error_classifier import (
     classify_exception,
     classify_http_status,
+    detect_context_overflow,
     is_retriable,
 )
 from dayu.engine.runners.openai.http_client import HTTPClient
@@ -347,6 +348,16 @@ class AsyncOpenAIRunner:
                     response.headers.get("Retry-After")
                 )
                 body_preview = await self._safe_read_text(response)
+                if detect_context_overflow(
+                    http_status=response.status,
+                    response_text=body_preview,
+                ):
+                    raise _AttemptFailedTerminal(
+                        error_code=RunnerHTTPErrorCode.CONTEXT_LENGTH_EXCEEDED,
+                        http_status=response.status,
+                        message_text=body_preview
+                        or f"HTTP {response.status}",
+                    )
                 if is_retriable(error_code):
                     raise _AttemptFailedRetriable(
                         error_code=error_code,

@@ -22,6 +22,7 @@ from dayu.host._conversation_memory import (
     summarize_raw_turn_for_builder,
 )
 from dayu.host._text import truncate_text
+from dayu.host._token_estimator import estimate_text_tokens
 from dayu.host.contracts import (
     RunEvent,
     RunEventKind,
@@ -31,7 +32,6 @@ from dayu.host.contracts import (
     UserInputAcceptedData,
 )
 
-_APPROX_TOKEN_CHARS: int = 4
 _MEMORY_BLOCK_CHAR_BUDGET: int = 6000
 _RECENT_TURN_INLINE_CHAR_LIMIT: int = 900
 _OLDER_TURN_INLINE_CHAR_LIMIT: int = 360
@@ -147,11 +147,13 @@ class RunInputBuilder(Protocol):
         *,
         snapshot: ConversationMemorySnapshot,
         current_user_event: RunEvent,
+        caller_system_messages: tuple[SystemMessage, ...] = (),
     ) -> RunInputBuildResult:
         """构造 Engine RunInput。
 
         :param snapshot: session memory 快照。
         :param current_user_event: 已 append 的当前用户输入事件。
+        :param caller_system_messages: 调用方提供的 leading system prompt。
         :returns: RunInput 与 internal trace。
         :raises TypeError: 当前用户输入事件 data 类型不匹配时抛出。
         :raises ValueError: 当前事件不是 canonical Host 用户输入事件时抛出。
@@ -173,16 +175,19 @@ class DefaultRunInputBuilder:
         *,
         snapshot: ConversationMemorySnapshot,
         current_user_event: RunEvent,
+        caller_system_messages: tuple[SystemMessage, ...] = (),
     ) -> RunInputBuildResult:
         """构造 Engine RunInput。
 
         memory block 内部顺序固定为 pinned state / stable frame /
         verified claims / assumptions / evidence anchors / recent raw turns /
-        older pool / episode summary 插入位；当前用户输入作为最后一条
-        user message。
+        older pool / episode summary 插入位；调用方 system prompt 保持前缀
+        顺序，Host Memory 追加在其后，当前用户输入作为最后一条 user
+        message。
 
         :param snapshot: session memory 快照。
         :param current_user_event: 已 append 的当前用户输入事件。
+        :param caller_system_messages: 调用方提供的 leading system prompt。
         :returns: RunInput 与 internal trace。
         :raises TypeError: 当前用户输入事件 data 类型不匹配时抛出。
         :raises ValueError: 当前事件不是 canonical Host 用户输入事件，或
@@ -231,9 +236,24 @@ class DefaultRunInputBuilder:
             text=memory_block,
         )
         trace_items = collector.items + (memory_block_trace, current_user_trace)
-        total_chars = len(memory_block) + len(current_user_text)
+        caller_system_text = _messages_text(caller_system_messages)
+        total_chars = (
+            len(caller_system_text) + len(memory_block) + len(current_user_text)
+        )
+        total_tokens = estimate_text_tokens(
+            "\n".join(
+                text
+                for text in (
+                    caller_system_text,
+                    memory_block,
+                    current_user_text,
+                )
+                if text != ""
+            )
+        )
         run_input = RunInput(
             messages=(
+                *caller_system_messages,
                 SystemMessage(
                     role=AgentMessageRole.SYSTEM,
                     content=memory_block,
@@ -251,7 +271,7 @@ class DefaultRunInputBuilder:
                 run_id=current_user_event.run_id,
                 items=trace_items,
                 total_char_size=total_chars,
-                total_token_estimate=_estimate_tokens(total_chars),
+                total_token_estimate=total_tokens,
             ),
         )
 
@@ -621,9 +641,15 @@ class _MemoryBlockCollector:
         :raises Exception: 不主动抛出异常。
         """
 
+        prefix = (
+            "## Host Memory\n"
+            "INTERNAL_ONLY: 此区块仅供模型做上下文 grounding 与校验；"
+            "它不是最终回答模板，禁止原样输出标题、字段名、工具元数据、"
+            "cursor、scope 或 raw EventLog metadata。"
+        )
         if not self._parts:
-            return "## Host Memory\n当前 session 没有可注入 memory。"
-        return "## Host Memory\n" + "\n\n".join(self._parts)
+            return f"{prefix}\n当前 session 没有可注入 memory。"
+        return prefix + "\n\n" + "\n\n".join(self._parts)
 
     def _has_budget_for(self, text: str) -> bool:
         """判断剩余预算是否足够。
@@ -655,6 +681,17 @@ def _current_user_text(event: RunEvent) -> str:
     if not isinstance(data, UserInputAcceptedData):
         raise TypeError("USER_INPUT_ACCEPTED data must be UserInputAcceptedData")
     return data.content
+
+
+def _messages_text(messages: tuple[SystemMessage, ...]) -> str:
+    """拼接 system message 正文用于 Host 内部估算。
+
+    :param messages: system message 元组。
+    :returns: 按顺序拼接的正文。
+    :raises Exception: 不主动抛出异常。
+    """
+
+    return "\n".join(message.content for message in messages)
 
 
 def _append_stable_frame(
@@ -1016,21 +1053,8 @@ def _trace_item(
         source_event_cursor=resolved_cursor,
         reason=reason,
         char_size=char_size,
-        token_estimate=_estimate_tokens(char_size),
+        token_estimate=estimate_text_tokens(text),
     )
-
-
-def _estimate_tokens(char_size: int) -> int:
-    """用字符数估算 token 数。
-
-    :param char_size: 字符数。
-    :returns: 估算 token 数。
-    :raises Exception: 不主动抛出异常。
-    """
-
-    if char_size <= 0:
-        return 0
-    return (char_size + _APPROX_TOKEN_CHARS - 1) // _APPROX_TOKEN_CHARS
 
 
 __all__ = [

@@ -48,6 +48,9 @@ class RunnerHTTPErrorCode(StrEnum):
     - ``CLIENT_ERROR``：HTTP 4xx 客户端错误（非 429，且不可重试）。
     - ``NETWORK_ERROR``：连接 / DNS / TLS 等网络层异常。
     - ``TIMEOUT``：请求或读流超时。
+    - ``CONTEXT_LENGTH_EXCEEDED``：provider 明确报告上下文长度超限；
+      Engine 会提升为 context compaction required 事实，是否 compact 由
+      Host 决定。
     - ``UNKNOWN_HTTP_STATUS``:无法归类的 HTTP 状态码（如 1xx / 3xx
       未跟随重定向、自定义状态码）。
     """
@@ -57,6 +60,7 @@ class RunnerHTTPErrorCode(StrEnum):
     CLIENT_ERROR = "client_error"
     NETWORK_ERROR = "network_error"
     TIMEOUT = "timeout"
+    CONTEXT_LENGTH_EXCEEDED = "context_length_exceeded"
     UNKNOWN_HTTP_STATUS = "unknown_http_status"
 
 
