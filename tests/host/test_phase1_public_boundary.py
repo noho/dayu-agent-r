@@ -45,6 +45,8 @@ EXPECTED_EXPORTS: frozenset[str] = frozenset(
         "ToolRuntimeCursor",
         "ToolRuntimeEventData",
         "ToolValueSizeSummary",
+        "UserInputAcceptedData",
+        "UserInputScope",
         "fetch_more_tool_result",
         "get_run_result",
         "get_tool_fetch_more_handle",

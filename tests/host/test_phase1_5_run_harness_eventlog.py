@@ -497,7 +497,11 @@ async def test_run_stream_reads_events_after_store_append() -> None:
     first_from_stream = await _next_event(stream.events)
     assert store.appended_events
     assert first_from_stream == store.appended_events[0]
-    assert first_from_stream.kind is RunEventKind.PREVIEW
+    assert first_from_stream.kind is RunEventKind.CANONICAL
+    assert first_from_stream.type is RunEventType.USER_INPUT_ACCEPTED
+    second_from_stream = await _next_event(stream.events)
+    assert second_from_stream == store.appended_events[1]
+    assert second_from_stream.kind is RunEventKind.PREVIEW
 
     gate.release()
     remaining = await _collect(stream.events)
@@ -523,7 +527,7 @@ async def test_result_snapshot_only_uses_appended_terminal_event() -> None:
     )
 
     stream = await harness.start_run(_request(run_id))
-    await _wait_for_store_count(store, run_id=run_id, expected_count=1)
+    await _wait_for_store_count(store, run_id=run_id, expected_count=2)
 
     assert await harness.get_run_result(run_id) is None
 
@@ -551,8 +555,9 @@ async def test_proxy_exception_appends_host_owned_failure_event() -> None:
     events = await _collect(stream.events)
     result = await harness.get_run_result(run_id)
 
-    assert len(events) == 1
-    failure = events[0]
+    assert len(events) == 2
+    assert events[0].type is RunEventType.USER_INPUT_ACCEPTED
+    failure = events[-1]
     assert failure.kind is RunEventKind.CANONICAL
     assert failure.source is RunEventSource.HOST
     assert failure.source_engine_event_id is None
@@ -562,6 +567,27 @@ async def test_proxy_exception_appends_host_owned_failure_event() -> None:
     assert isinstance(result, RunFailedResult)
     assert result.error_code == "host_worker_failed"
     assert result.terminal_event_cursor == failure.cursor
+
+
+@pytest.mark.asyncio
+async def test_run_input_build_trace_cache_evicts_old_runs_fifo() -> None:
+    """RunInput 构造 trace 缓存按容量 FIFO 淘汰，避免无界增长。"""
+
+    store = InMemoryRunEventStore()
+    harness = LocalRunHarness(
+        proxy=_ScriptedProxy(events=()),
+        event_store=store,
+        run_input_trace_cache_limit=2,
+    )
+
+    for run_id in ("trace-run-1", "trace-run-2", "trace-run-3"):
+        stream = await harness.start_run(_request(run_id))
+        await _collect(stream.events)
+
+    assert tuple(harness.last_run_input_build_trace_by_run) == (
+        "trace-run-2",
+        "trace-run-3",
+    )
 
 
 @pytest.mark.asyncio
@@ -582,18 +608,19 @@ async def test_harness_stops_after_terminal_and_keeps_views_consistent() -> None
     events = await _collect(stream.events)
     listed = await store.list_events(run_id=run_id, after=None)
     after_terminal = await _collect(
-        harness.stream_run_events(run_id=run_id, after=events[0].cursor)
+        harness.stream_run_events(run_id=run_id, after=events[-1].cursor)
     )
     result = await harness.get_run_result(run_id)
 
     assert proxy.yielded_count == 1
     assert events == list(listed)
-    assert len(events) == 1
-    assert events[0].type is RunEventType.FINAL_ANSWER
+    assert len(events) == 2
+    assert events[0].type is RunEventType.USER_INPUT_ACCEPTED
+    assert events[-1].type is RunEventType.FINAL_ANSWER
     assert after_terminal == []
     assert isinstance(result, RunSucceededResult)
     assert result.content == "first terminal"
-    assert result.terminal_event_cursor == events[0].cursor
+    assert result.terminal_event_cursor == events[-1].cursor
 
 
 @pytest.mark.asyncio
@@ -617,10 +644,11 @@ async def test_harness_ignores_second_terminal_after_first_terminal() -> None:
 
     assert proxy.yielded_count == 1
     assert events == list(listed)
-    assert len(events) == 1
+    assert len(events) == 2
+    assert events[0].type is RunEventType.USER_INPUT_ACCEPTED
     assert isinstance(result, RunSucceededResult)
     assert result.content == "first terminal"
-    assert result.terminal_event_cursor == events[0].cursor
+    assert result.terminal_event_cursor == events[-1].cursor
 
 
 @pytest.mark.asyncio
@@ -823,14 +851,18 @@ async def test_start_run_logs_background_contract_error(
     )
     stored_events = await store.list_events(run_id=run_id, after=None)
 
-    assert len(events) == 1
+    assert len(events) == 2
     assert stored_events == tuple(events)
-    assert events[0].source is RunEventSource.ENGINE
-    assert events[0].type is RunEventType.FINAL_ANSWER
+    assert events[0].type is RunEventType.USER_INPUT_ACCEPTED
+    assert events[-1].source is RunEventSource.ENGINE
+    assert events[-1].type is RunEventType.FINAL_ANSWER
     assert record.exc_info is not None
     assert record.exc_info[0] is TypeError
     assert "FinalAnswerData" in str(record.exc_info[1])
-    assert all(event.source is not RunEventSource.HOST for event in stored_events)
+    engine_events = [
+        event for event in stored_events if event.type is not RunEventType.USER_INPUT_ACCEPTED
+    ]
+    assert all(event.source is not RunEventSource.HOST for event in engine_events)
 
 
 def test_engine_event_kind_classification_matrix() -> None:

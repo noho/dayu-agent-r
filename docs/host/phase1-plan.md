@@ -23,7 +23,7 @@ P1 不实现以下能力：
 - 完整 Session governance、同 Session active Run 仲裁、`client_request_id` 幂等。
 - P1.5 的最小 EventLog / RunEventStore append-before-stream 真源。
 - 持久化 schema、workspace migration、启动恢复、多进程 lease / fencing。
-- Conversation Memory、ContextBuilder、timeline projection。
+- Conversation Memory、RunInputBuilder、timeline projection。
 - ToolRuntime truncate / fetch_more、cursor、scope token、TTL。
 - 完整 ToolRegistry、工具权限、工具审计、业务工具迁移。
 - 完整取消治理、`cancel_run` 状态机、watchdog、强制终止。

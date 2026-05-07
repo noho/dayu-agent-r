@@ -9,8 +9,11 @@
 
 - P1 已通过 PR #16 合入 `main`，当前确认基线为 `051cf20`。
 - P1.5 已通过 PR #17 合入 `main`，merge commit 为 `ec1627c94f352205ee77bcd992d652e677fa0ebb`。
-- P2 已在分支 `codex/host-p2-toolruntime-truncate` 完成 plan、代码实施、常规 code review 与
-  OLD / NEW code review 复审；当前准备创建 PR。
+- P2 已通过 PR #18 合入 `main`，merge commit 为 `3d86eefd4bd8b99b24c638735220d9ee571255f7`。
+- P3 phase handoff plan、常规 plan review、OLD / NEW review、最佳实践 review、最优方案 review
+  均已通过并经用户确认；当前分支为 `codex/host-p3-conversation-memory`。
+- P3 代码实施已完成，常规 code review 与 OLD / #48 语义 code review 均已复查通过；本地提交后等待
+  用户确认是否 push / create PR。
 
 每个 Phase 进入实现前，必须另写可交接的 phase plan，细化到迁移 Agent 可以直接接手：
 目标、非目标、边界、文件级改动清单、契约变化、状态机、测试清单、验证命令、review gate、
@@ -104,7 +107,7 @@ audit hard-gate 等生产治理；不表示可以破坏分层、跳过强类型�
 | P1 | EngineWorker + 最小 Run Harness | 落地与 Engine 最接近的 Host capability：Local EngineWorker、最小 WorkerProxy、最小 Run 执行装配 | `dayu.host` 最小入口、LocalProxy、EngineWorker wrapper、EngineEvent -> RunEvent 翻译薄层、最小 `start_run` 测试入口 | 不做 Remote RPC、不做完整 Session governance、不做 memory、不做 truncate/fetch_more | 单 Run 可通过 Host 调 Engine 函数式入口并流出事件；EngineWorker / ToolExecutor 不暴露为 Host public API |
 | P1.5 | Minimal EventLog / RunEventStore | 固定 P2-P5 共同依赖的最小事件事实层，避免旁路 transcript / memory facts | append-before-stream EventLog 契约、per-run cursor、canonical / preview 分层、最小 Run state 调和 | 不做完整 observer、不做 trace / audit sink、不做完整多进程 recovery | P2-P5 只能依赖 RunEventStore / canonical facts，不需要未来 P6 倒改事实来源 |
 | P2 | ToolRuntime truncate / fetch_more | 把 OLD TruncationManager / cursor / TTL / scope token 迁到 Host / ToolRuntime 边界 | 工具结果截断契约、fetch_more 调用路径、cursor storage、TTL / scope token 测试、ToolRuntime 最小运行事实 | 不做完整 ToolRegistry 权限、不做业务工具迁移、不让 Engine 持有 cursor 管理；不实现 tool trace / audit / timeline observer | 工具结果可被截断，后续 fetch_more 可补读；截断 / 补读不是不可审计黑盒 |
-| P3 | Conversation Memory / ContextBuilder | 迁移 Host 上下文治理核心，使多轮上下文可构造 | ContextBuilder 可消费事实、客户端 timeline 展示事实、只可观测 facts 三类边界；pinned_state、memory pool、tool facts projection | 不做 context overflow 完整协作、不做 Reply Outbox、不把 reasoning 回流运行态 | 多轮 Run 可以基于 Session / memory 构造下一轮输入；reasoning 只进展示 read model |
+| P3 | Conversation Memory / RunInputBuilder | 迁移 Host 上下文治理核心，使多轮上下文可构造 | RunInputBuilder 可消费事实、客户端 timeline 展示事实、只可观测 facts 三类边界；pinned_state、memory pool、tool facts projection | 不做 context overflow 完整协作、不做 Reply Outbox、不把 reasoning 回流运行态 | 多轮 Run 可以基于 Session / memory 构造下一轮输入；reasoning 只进展示 read model |
 | P4 | Host Compact for Context Overflow | 把 OLD 中原本在 Engine 内做的 compact 搬到 Host，使 Engine context overflow 时仍能继续运行 | Host compact 入口、compact 输入 / 输出、Engine overflow 事件 / 错误映射、compact 后 attempt 输入重建 | 不实现完整 context governance；不引入 replay / validation 联动；不在 Engine 内实现 compact/retry | Engine 遇到 context overflow 时，Host 完成 compact 后继续运行或明确失败收口 |
 | P5 | No-Full-Governance Multi-Turn Smoke | 将 P1-P4 与 P1.5 串成最小纵向 smoke | smoke CLI / test harness、端到端多轮测试、必要 README / tests 文档 | 不做完整多进程治理、不做 Remote、不做 Outbox、不做 audit hard-gate；不验证 `start_run` 幂等、active Run 并发仲裁或调用重试语义 | 一个单调用方、顺序执行的无完整生产治理多轮会话可按目标事实层跑通，含工具截断补读、memory、compaction |
 | P5.5 | Deferred Scope Reconciliation | 回看 P1-P5 所有“本阶段不实现”能力，确认没有遗留能力被漏排或误排 | deferred-scope inventory、能力归属表、后续 Phase 调整建议、必要的新 Phase / issue / plan 修订 | 不写生产代码；不把未落地能力补写成已落地事实；不直接修改后续 Phase 代码边界 | P1-P5 的非目标均被明确标记为已实现、已安排到 P6+、新增 Phase / issue 承接，或经用户确认关闭 |
@@ -135,16 +138,16 @@ P2 需要保证的是 ToolRuntime 最小运行事实不成为黑盒，例如：
 
 P3 的 Conversation Memory 必须提前对齐 EventLog / projection 边界。P3 phase plan 必须显式列出：
 
-- ContextBuilder 可消费事实，例如 pinned_state、memory pool、结构化 tool facts、
+- RunInputBuilder 可消费事实，例如 pinned_state、memory pool、结构化 tool facts、
   evidence anchors、source references。
 - 客户端 timeline 展示事实，例如 answer、reasoning 展示字段、tool summary、warnings/errors。
 - 只可观测 / audit / trace 事实，例如内部治理事件、trace-only payload、debug sampling。
 
 reasoning / preview delta 只能进入展示 read model，不得进入 RunInput replay、Memory pool 或
-ContextBuilder 运行态输入。P3 不能绕过 P1.5 的 RunEventStore 直接制造独立 transcript 真源。
+RunInputBuilder 运行态输入。P3 不能绕过 P1.5 的 RunEventStore 直接制造独立 transcript 真源。
 
 P4 到 smoke 阶段只迁移 compact 的归属：把 OLD 中原本在 Engine 内完成的上下文压缩搬到 Host。
-它的目标只是让 Engine 遇到 context overflow 时，Host 能基于 P3 的 ContextBuilder 可消费事实
+它的目标只是让 Engine 遇到 context overflow 时，Host 能基于 P3 的 RunInputBuilder 可消费事实
 完成 compact，并用 compact 后的输入重建 attempt 继续运行。P4 不牵扯 replay、validation、
 OutputContract 或完整 context governance。
 
@@ -324,16 +327,20 @@ PR 创建后：
 
 ## 11. 第一批 Phase 的启动顺序
 
-P1 与 P1.5 已完成并合入 `main`。当前启动 P2；P2 的 handoff plan 应重点回答：
+P1、P1.5 与 P2 已完成并合入 `main`。当前启动 P3；P3 的 handoff plan 应重点回答：
 
-- ToolRuntime 的最小 Host 边界是什么，哪些符号属于 public Run 级接口，哪些必须保持 Host 内部。
-- truncation / fetch_more 的事实来源如何接入 P1.5 RunEventStore，避免绕过 EventLog 形成第二套
-  transcript 或 tool result 真源。
-- cursor、scope token、TTL 与权限校验的最小契约如何表达，哪些只是 P2 单进程 smoke 临时实现。
-- 工具结果截断、补读请求、补读完成 / 失败、过期 / denied 等事实进入 canonical RunEvent 还是
-  ToolRuntime 内部 fact store；若不进入 RunEvent，P6 observer 如何可追溯。
-- EngineWorker / ToolExecutor 边界如何保持：Engine 只发起工具调用语义，Host / ToolRuntime
-  负责截断、补读与治理事实。
-- P2 不提前实现完整 ToolRegistry 权限、P6 observer、P7 lifecycle governance 或多进程 recovery。
+- RunInputBuilder 可消费哪些 canonical RunEvent / ToolRuntime facts，哪些事实只进入展示 read model。
+- Conversation Memory 的最小 Host 边界是什么，哪些属于 public Run / Session 级接口，哪些必须保持
+  Host 内部 projection / store。
+- P3 如何强参考 GitHub issue #48 与 OLD `conversation_memory.py` / `conversation_store.py` /
+  `conversation_session_archive.py` / `scene_preparer.py`，守住 `pinned_state` 全量独立、历史单总池、
+  最近 N 轮 raw turn 下限保底、memory 克制等财报 Agent 记忆不变量。
+- preview / reasoning / delta 是否严格禁止进入 RunInput replay、Memory pool 与 RunInputBuilder 运行态输入。
+- P3 如何使用 P1.5 EventLog 与 P2 ToolRuntime facts，避免旁路 transcript、memory facts 或 tool result
+  真源。
+- 多轮 Session 的最小顺序 smoke 如何表达，且不提前实现 P7 active Run admission、幂等或完整 lifecycle
+  governance。
+- P3 不提前实现 P4 context overflow compact、P6 persistent projection / observer、P7 lifecycle governance、
+  P9 outbox 或完整多进程 recovery。
 
-P2 plan review 通过且用户确认后，才能进入 P2 代码实现。
+P3 plan review 通过且用户确认后，才能进入 P3 代码实现。

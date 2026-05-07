@@ -23,6 +23,8 @@ from dayu.host.contracts import (
     RunResult,
     RunSucceededResult,
     RunSuspendedResult,
+    UserInputScope,
+    UserInputAcceptedData,
 )
 
 _ERROR_FINAL_ANSWER_DATA_TYPE: str = (
@@ -38,7 +40,7 @@ _ERROR_RUN_CANCELLED_DATA_TYPE: str = (
 _ERROR_RUN_SUSPENDED_DATA_TYPE: str = (
     "RUN_SUSPENDED event data must be RunSuspendedData"
 )
-_HOST_FAILURE_ERROR_CODE: str = "host_worker_failed"
+_HOST_WORKER_FAILURE_ERROR_CODE: str = "host_worker_failed"
 _PREVIEW_ENGINE_EVENT_TYPES: frozenset[RunEventType] = frozenset(
     {
         RunEventType.RUNNER_CONTENT_DELTA,
@@ -75,6 +77,7 @@ def host_failure_draft(
     session_id: str,
     occurred_at: datetime,
     error: Exception,
+    error_code: str = _HOST_WORKER_FAILURE_ERROR_CODE,
 ) -> RunEventDraft:
     """构造 Host-owned 失败终态事件草稿。
 
@@ -82,6 +85,7 @@ def host_failure_draft(
     :param session_id: 会话 id。
     :param occurred_at: Host 观察到异常的时间。
     :param error: worker / proxy 抛出的异常。
+    :param error_code: Host-owned 失败错误码。
     :returns: Host-owned RUN_FAILED 事件草稿。
     :raises Exception: 不主动抛出异常。
     """
@@ -94,10 +98,45 @@ def host_failure_draft(
         type=RunEventType.RUN_FAILED,
         occurred_at=occurred_at,
         data=HostRunFailedData(
-            error_code=_HOST_FAILURE_ERROR_CODE,
+            error_code=error_code,
             message=str(error),
             recoverable=False,
             exception_type=type(error).__name__,
+        ),
+        source_engine_event_id=None,
+    )
+
+
+def user_input_accepted_draft(
+    *,
+    run_id: str,
+    session_id: str,
+    occurred_at: datetime,
+    turn_id: str,
+    content: str,
+) -> RunEventDraft:
+    """构造 Host-owned 用户输入接纳事件草稿。
+
+    :param run_id: Run id。
+    :param session_id: 会话 id。
+    :param occurred_at: Host 接纳用户输入的时间。
+    :param turn_id: 会话内 turn id。
+    :param content: 规范化后的用户输入正文。
+    :returns: Host-owned ``USER_INPUT_ACCEPTED`` 事件草稿。
+    :raises Exception: 不主动抛出异常。
+    """
+
+    return RunEventDraft(
+        run_id=run_id,
+        session_id=session_id,
+        kind=RunEventKind.CANONICAL,
+        source=RunEventSource.HOST,
+        type=RunEventType.USER_INPUT_ACCEPTED,
+        occurred_at=occurred_at,
+        data=UserInputAcceptedData(
+            turn_id=turn_id,
+            content=content,
+            scope=UserInputScope.SESSION,
         ),
         source_engine_event_id=None,
     )
@@ -193,4 +232,5 @@ __all__ = [
     "host_failure_draft",
     "terminal_result_from_event",
     "translate_engine_event",
+    "user_input_accepted_draft",
 ]

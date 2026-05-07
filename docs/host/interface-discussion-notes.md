@@ -175,7 +175,7 @@ Host
   - RunManager
   - RunSupervisor
   - AttemptSupervisor
-  - ContextBuilder / MemoryManager
+  - RunInputBuilder / MemoryManager
   - ToolRuntime
   - EventLog
   - Policy/Governance
@@ -195,7 +195,7 @@ EngineWorker
 - `RunManager`：管理对外可见的 Run 状态、创建、查询、取消请求和结果读取。
 - `RunSupervisor`：协调一次 Run 的完整生命周期，对外隐藏内部 attempt。
 - `AttemptSupervisor`：管理内部 attempt 的启动、失败、恢复、重试、取消和资源释放。
-- `ContextBuilder / MemoryManager`：从 Session、transcript、memory、tool facts 构造上下文。
+- `RunInputBuilder / MemoryManager`：从 Session、transcript、memory、tool facts 构造上下文。
 - `ToolRuntime`：Host 侧工具运行治理边界，包括生命周期、审计、截断、超时和取消；
   具体业务权限与业务规则不进入 Host / Engine。
 - `EventLog`：Run 的 append-only 事件事实源；EventBus 若存在，只是推送实现。
@@ -425,7 +425,7 @@ Conversation Memory 当前讨论倾向：OLD 的设计令人满意，后续 NEW 
 
 - Conversation Memory 属于 Host 上下文治理，不属于 Engine。
 - MemoryManager 可以是 Host 内部能力，但不应污染 Host 最小 public interface。
-- ContextBuilder 应消费 memory 结果来构造 Run / Attempt 输入。
+- RunInputBuilder 应消费 memory 结果来构造 Run / Attempt 输入。
 - 具体 schema 仍需按 NEW 全新 schema 起库处理，不做旧库兼容读取。
 
 ### 6.5.1 客户端读取聊天记录与思考过程
@@ -438,8 +438,8 @@ Conversation Memory 当前讨论倾向：OLD 的设计令人满意，后续 NEW 
 - read model 应包含用户输入、assistant answer、可展示 reasoning、tool 摘要、warnings/errors、
   时间、关联 run_id 等。
 - reasoning 可作为展示字段持久化，但在设计上必须与运行态上下文隔离，没有机会流回
-  `ContextBuilder / MemoryManager` 或参与 `RunInput` 重放。
-- 运行态上下文由 `ContextBuilder / MemoryManager` 决定，不等同于客户端 transcript 全量回放。
+  `RunInputBuilder / MemoryManager` 或参与 `RunInput` 重放。
+- 运行态上下文由 `RunInputBuilder / MemoryManager` 决定，不等同于客户端 transcript 全量回放。
 - 客户端读模型和 Host 内部 memory / context 构造必须分离，避免为了展示需求污染 Agent 输入。
 
 待讨论：
