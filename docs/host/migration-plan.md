@@ -11,10 +11,15 @@
 - P1.5 已通过 PR #17 合入 `main`，merge commit 为 `ec1627c94f352205ee77bcd992d652e677fa0ebb`。
 - P2 已通过 PR #18 合入 `main`，merge commit 为 `3d86eefd4bd8b99b24c638735220d9ee571255f7`。
 - P3 已通过 PR #19 合入 `main`，merge commit 为 `b20e792 Host P3 conversation memory (#19)`。
-- P4 phase handoff plan、常规 plan review、OLD / NEW plan review 已通过并经用户确认。
-- P4 代码实施已完成；常规 code review、OLD / NEW code review、internal output boundary review
-  与独立 code review 均已复查通过；当前分支为 `codex/host-p4-context-overflow-compact`，
-  准备创建 PR。
+- P4 已通过 PR #21 合入 `main`，merge commit 为 `843fb99 Host P4 context overflow compact (#21)`。
+- 当前进入 P5 plan 修订阶段：No-Full-Governance Multi-Turn Smoke；当前分支为
+  `codex/host-p5-multiturn-smoke`。P5 phase handoff plan、常规 plan review 与 OLD / NEW
+  纵向语义 review 曾复审通过；用户人工 review 后先提出 tool declaration 方向调整，又进一步将 smoke tool
+  目标改为真实 provider `mimo-v2.5-pro-plan` + `huge_echo` tool calling。P5 huge_echo plan review
+  的两个非阻断实现 gate 已写回 P5 plan 并复审通过；旧 `double_echo` 临时方向废弃，
+  `huge_echo` 必须通过公共 `@tool(..., truncate=ToolTruncateSpec(...))` 声明，并跑通真实 Host ToolRuntime
+  truncate / fetch_more。当前决策记录见 `docs/host/phase5-huge-echo-plan-note.md`，review gate 见
+  `docs/host/phase5-huge-echo-plan-review.md`；当前等待用户人工 review。
 
 每个 Phase 进入实现前，必须另写可交接的 phase plan，细化到迁移 Agent 可以直接接手：
 目标、非目标、边界、文件级改动清单、契约变化、状态机、测试清单、验证命令、review gate、
@@ -110,7 +115,7 @@ audit hard-gate 等生产治理；不表示可以破坏分层、跳过强类型�
 | P2 | ToolRuntime truncate / fetch_more | 把 OLD TruncationManager / cursor / TTL / scope token 迁到 Host / ToolRuntime 边界 | 工具结果截断契约、fetch_more 调用路径、cursor storage、TTL / scope token 测试、ToolRuntime 最小运行事实 | 不做完整 ToolRegistry 权限、不做业务工具迁移、不让 Engine 持有 cursor 管理；不实现 tool trace / audit / timeline observer | 工具结果可被截断，后续 fetch_more 可补读；截断 / 补读不是不可审计黑盒 |
 | P3 | Conversation Memory / RunInputBuilder | 迁移 Host 上下文治理核心，使多轮上下文可构造 | RunInputBuilder 可消费事实、客户端 timeline 展示事实、只可观测 facts 三类边界；pinned_state、memory pool、tool facts projection | 不做 context overflow 完整协作、不做 Reply Outbox、不把 reasoning 回流运行态 | 多轮 Run 可以基于 Session / memory 构造下一轮输入；reasoning 只进展示 read model |
 | P4 | Host Compact for Context Overflow | 把 OLD 中原本在 Engine 内做的 compact 搬到 Host，使 Engine context overflow 时仍能继续运行 | Host compact 入口、compact 输入 / 输出、Engine overflow 事件 / 错误映射、compact 后 attempt 输入重建 | 不实现完整 context governance；不引入 replay / validation 联动；不在 Engine 内实现 compact/retry | Engine 遇到 context overflow 时，Host 完成 compact 后继续运行或明确失败收口 |
-| P5 | No-Full-Governance Multi-Turn Smoke | 将 P1-P4 与 P1.5 串成最小纵向 smoke | smoke CLI / test harness、端到端多轮测试、必要 README / tests 文档 | 不做完整多进程治理、不做 Remote、不做 Outbox、不做 audit hard-gate；不验证 `start_run` 幂等、active Run 并发仲裁或调用重试语义 | 一个单调用方、顺序执行的无完整生产治理多轮会话可按目标事实层跑通，含工具截断补读、memory、compaction |
+| P5 | No-Full-Governance Multi-Turn Smoke | 将 P1-P4 与 P1.5 串成最小纵向 smoke，并落地最小公共 tool declaration 能力 | smoke CLI / test harness、端到端多轮测试、公共 `@tool` declaration / `ToolDefinition`、必要 README / tests 文档 | 不做完整多进程治理、不做 Remote、不做 Outbox、不做 audit hard-gate；不验证 `start_run` 幂等、active Run 并发仲裁或调用重试语义；不做完整 ToolRegistry / 权限治理 / 业务工具迁移 | 一个单调用方、顺序执行的无完整生产治理多轮会话可按目标事实层跑通，含工具截断补读、memory、compaction；手工 smoke 真实向 `mimo-v2.5-pro-plan` 发送 prompt，由模型调用公共声明的 `huge_echo` 并跑通 Host ToolRuntime truncate / fetch_more |
 | P5.5 | Deferred Scope Reconciliation | 回看 P1-P5 所有“本阶段不实现”能力，确认没有遗留能力被漏排或误排 | deferred-scope inventory、能力归属表、后续 Phase 调整建议、必要的新 Phase / issue / plan 修订 | 不写生产代码；不把未落地能力补写成已落地事实；不直接修改后续 Phase 代码边界 | P1-P5 的非目标均被明确标记为已实现、已安排到 P6+、新增 Phase / issue 承接，或经用户确认关闭 |
 | P6 | EventLog Persistence / Projection / Observers Hardening | 在 P1.5 最小事实层上建立可靠持久化与派生机制 | 持久 EventLog、projection checkpoint、tool trace observer、audit observer、timeline projection、observer retry / lag | 不把 trace 写回 Engine，不要求所有 observer hard-gate | tool trace / audit / timeline 可由 EventLog 幂等派生 |
 | P7 | Session / Run Lifecycle Governance | 完整落地 Session / Run 状态机、admission policy、取消基础治理 | SessionManager、RunManager、RunSupervisor、状态机测试、cancel_run、生产级 admission policy | 不做 issue #3 的强制终止增强、不做 wait / suspend | 同 Session 单 active Run、幂等 start_run、取消基础收口稳定 |
@@ -155,6 +160,12 @@ OutputContract 或完整 context governance。
 P5 smoke 只覆盖单进程、单调用方、顺序执行 happy path：每轮等待上一轮 terminal 后再启动下一轮。
 P5 需要最小 Run 创建事实和 Session 下多轮顺序，但不以生产级 `start_run` 幂等、
 同 Session active Run admission policy、断线重试或并发输入仲裁为前提。这些治理能力仍留在 P7。
+用户人工 review 后，P5 同时承接最小公共 tool declaration 能力：OLD-like
+`@tool(..., truncate=ToolTruncateSpec(...))` 需要产出强类型 `ToolDefinition` / `ToolBundle`，
+同源携带 LLM-facing schema、executor binding、Host ToolRuntime truncate metadata 与 display metadata。
+这不是完整 ToolRegistry，也不恢复 LLM-facing `fetch_more`；`huge_echo` 是该声明能力的首个 smoke/test 工具。
+用户人工 review 已将手工 smoke 主目标改为真实 provider `mimo-v2.5-pro-plan` tool calling，缺配置应清晰失败，
+不能把 fake provider 或 scripted WorkerProxy 作为主 smoke 成功证据。
 
 P5.5 是非生产代码的总控核对阶段。它必须逐项回看 P1、P1.5、P2、P3、P4、P5 phase plan 中
 “本阶段不实现”“明确不做”“后移”的能力，判断每项是否已经被后续 Phase 承接、需要调整到现有
