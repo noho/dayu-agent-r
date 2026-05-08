@@ -112,9 +112,12 @@ class AttemptRecord:
 def extended_state_from_run_state(state: RunState) -> ExtendedRunState:
     """将 public ``RunState`` 映射到持久 ``ExtendedRunState``。
 
+    ``RunState`` 是封闭枚举，``match`` 已穷举全部成员；新增成员时静态类型
+    检查会立即报错，无需运行时 wildcard fallback。
+
     :param state: public RunState。
     :returns: 对应 ExtendedRunState。
-    :raises ValueError: 出现未知 RunState 时抛出。
+    :raises Exception: 不主动抛出异常。
     """
 
     match state:

@@ -23,6 +23,8 @@ P6 的存储层基础设施（`DurableRunEventStore`、`HostStorageTransaction`�
 
 ### F-01: LocalRunHarness 绕过 ProjectionCoordinator，直接投影 memory
 
+**状态**: [已修复] —— `LocalRunHarness.coordinator` 字段已注入；`_run_to_store` 在 terminal/finally 路径调用 `_project_terminal_run`，durable 路径走 `coordinator.drain()`，仅 legacy in-memory 路径保留 `_project_run_events` fallback。`build_durable_harness` 显式注入 coordinator。
+
 **严重级别**: HIGH
 
 **证据**:
@@ -60,6 +62,8 @@ async def _project_run_events(self, run_id: str) -> None:
 ---
 
 ### F-02: build_durable_harness 装配的 memory_store 与 LocalRunHarness 内部 memory_store 不一致
+
+**状态**: [已修复] —— `build_durable_harness` 现在以 `memory_store=actual_memory` 装配 `LocalRunHarness`，与 `MemoryProjectionObserver` 共享同一实例；新增 `test_durable_harness_shares_memory_store_with_observer` 验证 split-brain 已消除。
 
 **严重级别**: HIGH
 
@@ -107,6 +111,8 @@ memory_store: ConversationMemoryStore = field(
 
 ### F-03: terminal snapshot / RunResult 未在同一事务写入
 
+**状态**: [已修复] —— `DurableRunEventStore._append_in_transaction` 在 terminal 事件 append 时调用 `_write_terminal_result_snapshot`，与事件 append + Run state 推进共享同一 `HostStorageTransaction`；新增四种终态(SUCCEEDED/FAILED/CANCELLED/SUSPENDED)的 round-trip 测试。
+
 **严重级别**: HIGH
 
 **证据**:
@@ -143,6 +149,8 @@ if is_terminal:
 
 ### F-04: smoke 未覆盖真实 run path
 
+**状态**: [已修复] —— `utils/smoke_host_p6_durable_eventlog.py` 改为通过 `harness.start_run` + stub `WorkerProxy` 走完整路径(USER_INPUT_ACCEPTED → RunInputBuilder → proxy → append → terminal → coordinator.drain)；新增 `tests/host/test_phase6_durable_harness_integration.py` 在测试套件层面持续验证。
+
 **严重级别**: MEDIUM
 
 **证据**:
@@ -163,6 +171,8 @@ if is_terminal:
 ---
 
 ### F-05: AttemptStateStore 未进入主路径
+
+**状态**: [已修复] —— `LocalRunHarness` 增加 `attempt_state_store` / `storage` 字段；`_run_to_store` 在 attempt 起点 (`_begin_attempt_if_durable`)、terminal、context overflow compact retry、finally 路径调用 `_finish_attempt_if_durable`。compact retry 把旧 attempt 标记为 `STALE_DIAGNOSTIC` 并以新 attempt_id 起新 attempt。P6 范围不引入 owner lease/fencing(留给 P8)。
 
 **严重级别**: MEDIUM
 
@@ -188,6 +198,8 @@ if is_terminal:
 
 ### F-06: `_run_event_serializer.py` 处理 P7 tool cursor 事件类型
 
+**状态**: [无需修复-说明] —— 这些事件类型(`ToolResultTruncatedData` 等)在 P1-P5 即已进入 `RunEventType`，serializer 覆盖它们是稳定契约的内在要求；P7 真正待补的是 tool trace projection / sink，本审查项不阻塞 P6。
+
 **严重级别**: LOW
 
 **证据**:
@@ -205,6 +217,8 @@ if is_terminal:
 ---
 
 ### F-07: `extended_state_from_run_state` 缺少 wildcard match
+
+**状态**: [无需修复-说明] —— `RunState` 是闭合 `StrEnum`，``match`` 已枚举所有变体；显式增加 wildcard 会被 pyright 标记为 unreachable。docstring 已更新为说明"match 对当前闭合枚举为穷尽，新增变体由 pyright 拦截"，由静态类型检查替代运行时 wildcard。
 
 **严重级别**: LOW
 
@@ -236,6 +250,8 @@ def extended_state_from_run_state(state: RunState) -> ExtendedRunState:
 
 ### F-08: `_must_str` / `_must_bool` 重复定义
 
+**状态**: [无需修复-说明] —— 两份 helper 处于不同业务边界(serializer 与 run state store)，签名一致但耦合不同；P6 内提取公共模块会扩散修改面，且不影响 P6 验收标准。建议留到 P7 与新增 store/sink 一起统一抽取。
+
 **严重级别**: LOW
 
 **证据**:
@@ -254,6 +270,8 @@ def extended_state_from_run_state(state: RunState) -> ExtendedRunState:
 
 ### F-09: `_encode_fields` / `_decode_fields` 为 god function
 
+**状态**: [无需修复-说明] —— 当前每个 if/elif 分支体仅数行，dispatch table 重构会显著增加间接层；该项原审查级别 LOW 且非 P6 验收阻断项,留作后续重构清单。
+
 **严重级别**: LOW
 
 **证据**:
@@ -271,6 +289,8 @@ def extended_state_from_run_state(state: RunState) -> ExtendedRunState:
 ---
 
 ### F-10: 生产代码使用 bare assert
+
+**状态**: [已修复] —— `_event_observer.py` 中所有 `assert refreshed is not None` 已替换为 `if refreshed is None: raise RuntimeError(...)`，明确错误来源(caught_up / retryable / blocked 三个 phase)，`python -O` 下不再静默通过。
 
 **严重级别**: LOW
 
@@ -294,6 +314,8 @@ assert refreshed is not None
 
 ### F-11: `_durable_event_store.py` 整合了 4 张表的 schema DDL
 
+**状态**: [无需修复-说明] —— P6 装配阶段集中 DDL 是 `ensure_host_schema` 的稳定入口；拆分到各 store 会引入跨模块顺序约束，对当前 4 张表不划算。建议在 P7/P8 引入新表时一并重构。
+
 **严重级别**: LOW
 
 **证据**:
@@ -311,6 +333,8 @@ assert refreshed is not None
 ---
 
 ### F-12: `dayu.engine` 类型导入到 `dayu.host` 层
+
+**状态**: [无需修复-说明] —— 架构硬约束禁止的是 `dayu.runtime → dayu.engine/host/...` 反向依赖;Host 层依赖 Engine 类型属于正向分层调用。`RunResult` 等共享类型是否下沉到 `dayu.contracts` 不在 P6 范围。
 
 **严重级别**: LOW
 
@@ -333,29 +357,43 @@ P6 范围内可接受——Host 需要知道 Engine 事件类型才能序列化�
 
 ### R-01: projection checkpoint 幂等重放测试缺失
 
+**状态**: [已修复] —— `tests/host/test_phase6_review_fixes.py::test_advance_success_idempotent_replay` 与 `test_advance_success_regression_raises` 同时覆盖幂等重放与禁止倒退。
+
 当前测试验证了 checkpoint 不允许倒退（`test_projection_store_advance_regression_rejected`），但没有显式测试"drain 相同事件两次产生相同 checkpoint"的幂等语义。
 
 ### R-02: RunStateStore 非成功终态转换测试缺失
+
+**状态**: [已修复] —— 新增 `test_terminal_persists_run_result_failed/cancelled/suspended` 三项,覆盖三种非 SUCCEEDED 终态的事务内 result 快照持久化。
 
 `test_phase6_run_state_store.py` 只测试了 `SUCCEEDED`（via `FINAL_ANSWER`）。`RUN_FAILED`、`CANCELLED`、`SUSPENDED` 的 state 转换未在 `RunStateStore` 层面测试。
 
 ### R-03: `ProjectionStore.ensure` upsert 幂等测试缺失
 
+**状态**: [无需修复-说明] —— `INSERT OR IGNORE` 语义由 SQLite 内建保证;P6 范围内未发现错位行为,该 gap 留作 P7 read model 补强清单。
+
 没有测试对同一 observer 调用两次 `ensure` 的行为（应为幂等 upsert）。
 
 ### R-04: 多 observer 不同 lag 测试缺失
+
+**状态**: [无需修复-说明] —— `_lag_events_for` 实现按行独立计算,逻辑无 observer 间耦合;P6 验收标准未要求差异化 lag 测试,留作 P7 补充。
 
 当前测试只验证单个 observer 的 lag 计算，没有测试多个 observer 持有不同 `last_success_position` 时的 lag 差异。
 
 ### R-05: memory rebuild 多 run 交错测试缺失
 
+**状态**: [无需修复-说明] —— 现有 memory rebuild 测试已覆盖 fail/suspended 等终态切换;同 session 多 run 交错属于 P9 admission/governance 验收范围,P6 不阻断。
+
 `test_phase6_memory_rebuild.py` 每个测试只涉及单个 run。同一 session 下两个 run 交错的场景未覆盖。
 
 ### R-06: serializer `RunSuspendedData` round-trip 测试缺失
 
+**状态**: [已修复] —— `test_terminal_persists_run_result_suspended` 通过 durable append 路径同时验证 `RunSuspendedData` 编解码 round-trip(serializer + RunResult 快照解码)。
+
 `test_phase6_run_event_serializer.py` 覆盖了 `ContentDeltaData`、`FinalAnswerData`、`RunFailedData`、`RunCancelledData`、`UserInputAcceptedData`，但没有 `RunSuspendedData` 的 round-trip 测试。
 
 ### R-07: `_run_to_store` 中 `result_payload` 持久化的故障注入缺失
+
+**状态**: [已修复] —— F-03 已经把 result snapshot 写入与 event append/Run state 共享同一 `HostStorageTransaction`;`test_transaction_rollback_on_exception_preserves_state` 与 `test_post_commit_hook_failure_does_not_break_transaction` 验证回滚与 hook 失败的事务语义,等价覆盖故障回滚路径。
 
 没有测试验证 terminal event append 成功但 `result_payload` 写入失败时的回滚行为（当前因为 `result_payload` 根本不在事务中，所以这个场景不存在——但这也正是 F-03 的问题所在）。
 

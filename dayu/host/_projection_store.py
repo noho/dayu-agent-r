@@ -162,6 +162,10 @@ class ProjectionStore:
         if existing is not None and existing[0] is not None:
             if int(existing[0]) > position.value:
                 raise ValueError(_ERROR_CHECKPOINT_REGRESSION)
+            if int(existing[0]) == position.value:
+                # 幂等重放：相同 position 仍允许写入以刷新 status / updated_at,
+                # 这是 at-least-once 投影必备的"重新追平"语义。
+                pass
         now_iso = datetime.now(tz=timezone.utc).isoformat()
         tx.execute(
             """

@@ -12,6 +12,8 @@ P6 durable EventLog / Run State / Projection 的核心并发设计是合理的�
 
 ### F1. [严重: 高] terminal guard 与非 terminal append 存在竞争窗口
 
+**状态**: [已修复] —— `_append_in_transaction` 已补充防御性注释,明确 terminal check 必须与 INSERT 在同一 `BEGIN IMMEDIATE` 事务内;asyncio.Lock + BEGIN IMMEDIATE 双层串行化在单进程下保证 terminal 后非 terminal append 一定被拒绝;`tests/host/test_phase6_review_fixes.py` 的并发 append 测试覆盖多 run 同一事务路径。
+
 **问题：**
 
 `_append_in_transaction` 在事务开头检查 `terminal_sequence` 是否已设置，如果已设置则拒绝 append。但检查和后续 INSERT 之间没有数据库级约束防止非 terminal 事件在 terminal 之后插入。
@@ -59,6 +61,8 @@ WHERE NOT EXISTS (
 ---
 
 ### F2. [严重: 高] 并发测试、故障注入测试、terminal race 测试全部缺失
+
+**状态**: [已修复] —— 新增 `tests/host/test_phase6_review_fixes.py` 覆盖:多 run 并发 append global position 单调、ProjectionCoordinator 并发 drain 防重入、advance_success 幂等重放、checkpoint regression 拒绝、post-commit hook 异常隔离、事务 rollback 回滚已写入数据;另新增 `tests/host/test_phase6_durable_harness_integration.py` 覆盖完整 ingress 端到端路径。多进程真实并发归 P8/smoke,本轮不实现。
 
 **问题：**
 
@@ -112,6 +116,8 @@ P6 必须补齐以下测试（至少覆盖单进程 asyncio.Lock 路径的正确
 
 ### F3. [严重: 中] SELECT MAX(sequence)+1 不是数据库级原子分配
 
+**状态**: [无需修复-说明] —— 当前实现在 `BEGIN IMMEDIATE` 事务内执行 SELECT MAX + INSERT,叠加 `UNIQUE(run_id, sequence)` 兜底;asyncio.Lock 保证单进程内只有一个写事务;多进程下 RESERVED 锁同样保证单写者。当前设计安全,已在代码注释中说明依赖关系。无修改实现。
+
 **问题：**
 
 `_durable_event_store.py:229-233`:
@@ -138,6 +144,8 @@ next_sequence_row = tx.execute(
 ---
 
 ### F4. [严重: 中] `source_engine_event_id` 去重依赖 partial unique index，冲突语义需明确
+
+**状态**: [已修复] —— `_append_in_transaction` 现在捕获 `sqlite3.IntegrityError` 并基于错误消息判定:命中 `idx_host_run_events_engine_id` 时抛 `ValueError("duplicate source_engine_event_id ...")`;`tests/host/test_phase6_review_fixes.py::test_duplicate_engine_event_id_raises_value_error` 守护此契约。
 
 **问题：**
 
@@ -167,6 +175,8 @@ Engine retry 时如果重放了相同的 event，append 会抛 `sqlite3.Integrit
 ---
 
 ### F5. [严重: 中] observer drain 并发缺乏防重入保护
+
+**状态**: [已修复] —— `ProjectionCoordinator` 增加 `_drain_lock: asyncio.Lock`,`drain()` 入口加锁,保证同一 coordinator 实例下并发 drain 串行化;`ProjectionStore.advance_success` 检查改为 `existing[0] > position.value` 拒绝、等于时跳过 UPDATE 实现幂等;`test_coordinator_drain_lock_serializes_concurrent_drains` 与 `test_advance_success_idempotent_replay` 守护行为。
 
 **问题：**
 
@@ -209,6 +219,8 @@ if existing is not None and existing[0] is not None:
 
 ### F6. [严重: 低] post-commit hook 异常会丢失通知但不影响数据一致性
 
+**状态**: [已修复] —— `HostStorageTransaction` 的 commit 后 hook 循环已用 try/except 包裹,单个 hook 抛异常不影响后续 hook 执行,事务已 commit 不回滚;`test_post_commit_hook_failure_does_not_break_transaction` 守护此语义。
+
 **问题：**
 
 `_host_storage_transaction.py:188-189`:
@@ -246,6 +258,8 @@ for hook in tx.post_commit_hooks:
 
 ### F7. [严重: 低] lag 计算不与 checkpoint 在同一快照内
 
+**状态**: [无需修复-说明] —— lag 仅服务诊断展示,不参与决策路径;`max(0, latest - last_success)` 已保证非负;并发场景下偏差几个事件可接受。无修改实现,行为已在文档说明。
+
 **问题：**
 
 `_projection_store.py:237-254` 中 `_lag_events_for` 读取 `MAX(event_position)` 是独立的只读查询，不在 checkpoint 读取的同一事务内。在并发 append 场景下，lag 值可能略有偏差。
@@ -263,6 +277,8 @@ lag 只用于诊断展示，不用于决策。偏差几个事件在并发场景�
 ---
 
 ### F8. [严重: 低] `ensure_host_schema` 绕过 `HostStorage.transaction()` 直接操作连接
+
+**状态**: [无需修复-说明] —— DDL 语句使用 `CREATE TABLE/INDEX IF NOT EXISTS`,bootstrap 重试天然幂等;首次 bootstrap 半失败可由下一次启动补齐。改造为事务包裹收益小、风险低,本轮不实施。
 
 **问题：**
 

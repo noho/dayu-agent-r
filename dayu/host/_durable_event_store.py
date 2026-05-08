@@ -61,6 +61,9 @@ _ERROR_HOST_EVENT_ID_FORBIDDEN: str = (
 _ERROR_APPEND_AFTER_TERMINAL: str = (
     "cannot append RunEventDraft after terminal event"
 )
+_ERROR_DUPLICATE_ENGINE_EVENT_ID: str = (
+    "duplicate source_engine_event_id for run"
+)
 _LOGGER: logging.Logger = logging.getLogger(__name__)
 
 _SCHEMA_STATEMENTS: tuple[str, ...] = (
@@ -177,16 +180,26 @@ class DurableRunEventStore:
     async def append(self, draft: RunEventDraft) -> RunEvent:
         """在单一事务内 append RunEvent 草稿。
 
+        terminal 事件由 :class:`DurableRunEventStore` 自身根据 event 类型
+        与 data 推导 :class:`RunResult` 并在同一事务内写入
+        ``host_runs.result_payload``，调用方无需额外触发 result snapshot
+        持久化。
+
         :param draft: 待追加的 RunEvent 草稿。
         :returns: 已落库的 RunEvent。
-        :raises ValueError: draft 来源不一致或 run 已终态时抛出。
+        :raises ValueError: draft 来源不一致、重复 ``source_engine_event_id``
+            或 run 已终态时抛出。
         :raises sqlite3.DatabaseError: SQLite 写入失败时抛出。
         """
 
         _validate_draft_provenance(draft)
-        async with self.storage.transaction() as tx:
-            event = self._append_in_transaction(tx=tx, draft=draft)
-            tx.add_post_commit_hook(self._make_notify_hook())
+        try:
+            async with self.storage.transaction() as tx:
+                event = self._append_in_transaction(tx=tx, draft=draft)
+                tx.add_post_commit_hook(self._make_notify_hook())
+        except sqlite3.IntegrityError as exc:
+            _raise_business_error_for_integrity(exc=exc, draft=draft)
+            raise
         if _should_log_append(event):
             _LOGGER.log(
                 _append_log_level(event),
@@ -270,7 +283,7 @@ class DurableRunEventStore:
             is_terminal=is_terminal,
         )
 
-        return RunEvent(
+        event = RunEvent(
             run_id=draft.run_id,
             session_id=draft.session_id,
             cursor=RunEventCursor(sequence=sequence),
@@ -281,6 +294,9 @@ class DurableRunEventStore:
             data=draft.data,
             source_engine_event_id=draft.source_engine_event_id,
         )
+        if is_terminal:
+            self._write_terminal_result_snapshot(tx=tx, event=event)
+        return event
 
     def _upsert_run_state(
         self,
@@ -347,6 +363,40 @@ class DurableRunEventStore:
                 "UPDATE host_runs SET updated_at = ? WHERE run_id = ?",
                 (now_iso, draft.run_id),
             )
+
+    def _write_terminal_result_snapshot(
+        self,
+        *,
+        tx: HostStorageTransaction,
+        event: RunEvent,
+    ) -> None:
+        """在 terminal append 同事务写入 RunResult snapshot。
+
+        通过 ``terminal_result_from_event`` 推导终态结果，再用
+        :class:`RunStateStore` 写入 ``host_runs.result_payload``。这是 P6
+        Finding 3 的修复：终态事件、Run state、result snapshot 在同一事务
+        内提交，要么全成功要么全回滚。
+
+        :param tx: 当前事务。
+        :param event: 已构造的 terminal RunEvent。
+        :returns: 无返回值。
+        :raises TypeError: 终态事件类型与 data 类型不一致时抛出。
+        :raises sqlite3.DatabaseError: 写入失败时抛出。
+        """
+
+        # lazy import 避免 _run_state_store ↔ _durable_event_store 循环依赖。
+        from dayu.host._event_translation import terminal_result_from_event
+        from dayu.host._run_state_store import RunStateStore
+
+        result = terminal_result_from_event(event)
+        if result is None:
+            return
+        store = RunStateStore(storage=self.storage)
+        store.write_terminal_result(
+            tx=tx,
+            run_id=event.run_id,
+            result=result,
+        )
 
     async def list_events(
         self,
@@ -617,6 +667,36 @@ def _validate_draft_provenance(draft: RunEventDraft) -> None:
         and draft.source_engine_event_id is not None
     ):
         raise ValueError(_ERROR_HOST_EVENT_ID_FORBIDDEN)
+
+
+def _raise_business_error_for_integrity(
+    *,
+    exc: sqlite3.IntegrityError,
+    draft: RunEventDraft,
+) -> None:
+    """把 SQLite ``IntegrityError`` 映射为业务错误。
+
+    重复 ``source_engine_event_id`` 是 Engine 重复发同源事件或 Host 翻译
+    重复 append 的业务事实，调用方应能捕获 ``ValueError`` 并跳过；其余
+    integrity 违例（``UNIQUE (run_id, sequence)`` 等）属于框架内部不变量
+    破坏，原样透传不吞。
+
+    :param exc: 原始 IntegrityError。
+    :param draft: 触发错误的 RunEventDraft。
+    :returns: 无返回值。
+    :raises ValueError: 映射为业务错误时抛出。
+    """
+
+    message = str(exc)
+    if (
+        "idx_host_run_events_engine_id" in message
+        or "source_engine_event_id" in message
+    ):
+        raise ValueError(
+            f"{_ERROR_DUPLICATE_ENGINE_EVENT_ID}: run_id={draft.run_id} "
+            f"engine_event_id={draft.source_engine_event_id}"
+        ) from exc
+
 
 
 def _terminal_state_for_event_type(

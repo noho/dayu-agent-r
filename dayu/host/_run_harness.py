@@ -8,6 +8,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import uuid
 import weakref
 from collections import OrderedDict
 from collections.abc import AsyncIterator
@@ -40,6 +41,7 @@ from dayu.host._conversation_memory import (
     InMemoryConversationMemoryStore,
     snapshot_with_transient_tool_facts,
 )
+from dayu.host._event_observer import ProjectionCoordinator
 from dayu.host._event_store import InMemoryRunEventStore, RunEventStore
 from dayu.host._event_translation import (
     context_attempt_retrying_draft,
@@ -53,12 +55,18 @@ from dayu.host._event_translation import (
     translate_engine_event,
     user_input_accepted_draft,
 )
+from dayu.host._host_storage_transaction import HostStorage
+from dayu.host._internal_contracts import (
+    AttemptState,
+    GlobalEventPosition,
+)
 from dayu.host._proxy import LocalProxy, WorkerProxy
 from dayu.host._run_input_builder import (
     DefaultRunInputBuilder,
     RunInputBuildTrace,
     RunInputBuilder,
 )
+from dayu.host._run_state_store import AttemptStateStore
 from dayu.host._tool_runtime import (
     InMemoryToolRuntime,
     ToolRuntimeToolExecutor,
@@ -70,6 +78,7 @@ from dayu.host.contracts import (
     HostContextOverflowObservedData,
     RunEvent,
     RunEventCursor,
+    RunEventType,
     RunHandle,
     RunResult,
     RunState,
@@ -215,6 +224,16 @@ class LocalRunHarness:
     :param memory_store: Host 内部 ConversationMemoryStore。
     :param run_input_builder: Host 内部 RunInputBuilder。
     :param compact_coordinator: Host 内部 context compact coordinator。
+    :param coordinator: 可选 :class:`ProjectionCoordinator`；durable 路径下
+        必须注入,terminal 后由 harness 调用 ``coordinator.drain()`` 推进
+        observer checkpoint / required projection；为 ``None`` 时退化为
+        legacy 内存路径,直接调用 ``memory_store.project_run_events``。
+    :param attempt_state_store: 可选 :class:`AttemptStateStore`；当 durable
+        EventLog + HostStorage 在场时由调用方注入,以便 harness 在每个
+        attempt 起止处持久化 attempt 最小状态。
+    :param storage: 可选 :class:`HostStorage`；attempt_state_store 写入需要
+        共享事务,因此 harness 持有 storage handle 以开启短事务。仅 durable
+        路径需要注入。
     :param context_compact_retry_limit: context overflow compact retry 上限。
     :param run_input_trace_cache_limit: RunInput 构造 trace 保留上限。
     :param run_input_message_cache_limit: RunInput 消息诊断缓存保留上限。
@@ -232,6 +251,9 @@ class LocalRunHarness:
     compact_coordinator: ContextCompactCoordinator = field(
         default_factory=ContextCompactCoordinator
     )
+    coordinator: ProjectionCoordinator | None = None
+    attempt_state_store: AttemptStateStore | None = None
+    storage: HostStorage | None = None
     context_compact_retry_limit: int = _CONTEXT_COMPACT_RETRY_LIMIT
     run_input_trace_cache_limit: int = _RUN_INPUT_TRACE_CACHE_LIMIT
     run_input_message_cache_limit: int = _RUN_INPUT_MESSAGE_CACHE_LIMIT
@@ -357,6 +379,10 @@ class LocalRunHarness:
         attempt_index = 0
         event_count = 0
         terminal_seen = False
+        current_attempt_id: str | None = await self._begin_attempt_if_durable(
+            request=request,
+            attempt_index=attempt_index,
+        )
         _LOGGER.log(
             VERBOSE_LOG_LEVEL,
             "host.run.background_start session_id=%s run_id=%s",
@@ -459,6 +485,11 @@ class LocalRunHarness:
                                 stored_event.cursor.sequence,
                             )
                             terminal_seen = True
+                            await self._finish_attempt_if_durable(
+                                attempt_id=current_attempt_id,
+                                terminal_event=stored_event,
+                            )
+                            current_attempt_id = None
                             return
                     if overflow_trigger_seen:
                         if (
@@ -491,9 +522,31 @@ class LocalRunHarness:
                             return
                         if next_request is None:
                             terminal_seen = True
+                            await self._finish_attempt_if_durable(
+                                attempt_id=current_attempt_id,
+                                terminal_event=None,
+                                state=AttemptState.FAILED,
+                                failure_summary="context_compact_failed",
+                            )
+                            current_attempt_id = None
                             return
+                        # 当前 attempt 因 context overflow 关闭,准备启动下一
+                        # attempt: 旧 attempt 状态推进为 STALE_DIAGNOSTIC,
+                        # 然后为新 attempt 创建持久记录。
+                        await self._finish_attempt_if_durable(
+                            attempt_id=current_attempt_id,
+                            terminal_event=None,
+                            state=AttemptState.STALE_DIAGNOSTIC,
+                            failure_summary="context_overflow_compacted",
+                        )
                         attempt_request = next_request
                         attempt_index += 1
+                        current_attempt_id = (
+                            await self._begin_attempt_if_durable(
+                                request=attempt_request,
+                                attempt_index=attempt_index,
+                            )
+                        )
                         continue
                     terminal_seen = (
                         await self._append_missing_terminal_failure_if_needed(
@@ -509,8 +562,24 @@ class LocalRunHarness:
                         request=attempt_request,
                     )
         finally:
+            if current_attempt_id is not None:
+                await self._finish_attempt_if_durable(
+                    attempt_id=current_attempt_id,
+                    terminal_event=None,
+                    state=(
+                        AttemptState.FAILED
+                        if terminal_seen
+                        else AttemptState.STALE_DIAGNOSTIC
+                    ),
+                    failure_summary=(
+                        "attempt_closed_by_terminal_event"
+                        if terminal_seen
+                        else "run_terminated_without_terminal_event"
+                    ),
+                )
+                current_attempt_id = None
             if terminal_seen:
-                await self._project_run_events(request.run_id)
+                await self._project_terminal_run(request.run_id)
             _LOGGER.info(
                 "host.run.background_finished session_id=%s run_id=%s "
                 "event_count=%s terminal_seen=%s",
@@ -934,8 +1003,37 @@ class LocalRunHarness:
         )
         return terminal_result_from_event(stored_event) is not None
 
+    async def _project_terminal_run(self, run_id: str) -> None:
+        """terminal 后驱动 read model 投影。
+
+        durable 路径下调用 ``ProjectionCoordinator.drain`` 推进 observer
+        checkpoint / required projection（含 memory / timeline / audit）。
+        legacy 内存路径（``coordinator is None``）退化为直接读取已落库事件
+        并调用 ``memory_store.project_run_events``,以保持 P3-P5
+        ``InMemoryRunEventStore`` 测试入口的兼容。
+
+        :param run_id: Run id。
+        :returns: 无返回值。
+        :raises Exception: 投影失败时透传。
+        """
+
+        if self.coordinator is not None:
+            await self.coordinator.drain()
+            _LOGGER.log(
+                VERBOSE_LOG_LEVEL,
+                "host.run.coordinator_drained run_id=%s",
+                run_id,
+            )
+            return
+        await self._project_run_events(run_id)
+
     async def _project_run_events(self, run_id: str) -> None:
-        """将指定 run 的已落库事件投影到 memory。
+        """legacy 内存路径下的 memory 投影 fallback。
+
+        仅在 ``coordinator is None``(P3-P5 ``InMemoryRunEventStore`` 路径)
+        被使用。durable 路径已统一走 ``coordinator.drain``,该方法不会被调
+        用,保留是为了保证非 durable 装配的 harness 仍能完成最小 read
+        model 投影。
 
         :param run_id: Run id。
         :returns: 无返回值。
@@ -952,6 +1050,103 @@ class LocalRunHarness:
             "host.run.memory_projected run_id=%s event_count=%s",
             run_id,
             len(events),
+        )
+
+    async def _begin_attempt_if_durable(
+        self,
+        *,
+        request: StartRunRequest,
+        attempt_index: int,
+    ) -> str | None:
+        """durable 路径下创建 attempt 最小记录并返回 attempt id。
+
+        legacy 内存路径不写 ``host_attempts``,直接返回 ``None``。
+
+        :param request: 当前 attempt 的 start 请求。
+        :param attempt_index: 同一 run 内 attempt 序号。
+        :returns: 新创建 attempt id；非 durable 路径返回 ``None``。
+        :raises Exception: 写入失败时透传。
+        """
+
+        if self.attempt_state_store is None or self.storage is None:
+            return None
+        attempt_id = (
+            f"attempt-{request.run_id}-{attempt_index}-{uuid.uuid4().hex[:8]}"
+        )
+        async with self.storage.transaction() as tx:
+            self.attempt_state_store.create(
+                tx=tx,
+                attempt_id=attempt_id,
+                run_id=request.run_id,
+                attempt_index=attempt_index,
+            )
+            self.attempt_state_store.update_state(
+                tx=tx,
+                attempt_id=attempt_id,
+                state=AttemptState.RUNNING,
+            )
+        _LOGGER.log(
+            VERBOSE_LOG_LEVEL,
+            "host.run.attempt_created run_id=%s attempt_id=%s "
+            "attempt_index=%s",
+            request.run_id,
+            attempt_id,
+            attempt_index,
+        )
+        return attempt_id
+
+    async def _finish_attempt_if_durable(
+        self,
+        *,
+        attempt_id: str | None,
+        terminal_event: RunEvent | None,
+        state: AttemptState | None = None,
+        failure_summary: str | None = None,
+    ) -> None:
+        """durable 路径下推进 attempt 终态。
+
+        :param attempt_id: 当前 attempt id；``None`` 表示无 durable attempt
+            可推进,直接返回。
+        :param terminal_event: 关联的 terminal RunEvent；提供时由事件类型
+            推导默认 attempt state。
+        :param state: 显式 attempt state；与 ``terminal_event`` 二选一。
+        :param failure_summary: 失败摘要;成功终态可为 ``None``。
+        :returns: 无返回值。
+        :raises Exception: 写入失败时透传。
+        """
+
+        if (
+            attempt_id is None
+            or self.attempt_state_store is None
+            or self.storage is None
+        ):
+            return
+        resolved_state = state
+        terminal_position: GlobalEventPosition | None = None
+        resolved_failure = failure_summary
+        if terminal_event is not None:
+            resolved_state = _attempt_state_from_terminal(terminal_event)
+            if resolved_state in (
+                AttemptState.FAILED,
+                AttemptState.CANCELLED,
+                AttemptState.SUSPENDED,
+            ) and resolved_failure is None:
+                resolved_failure = terminal_event.type.value
+        if resolved_state is None:
+            resolved_state = AttemptState.FAILED
+        async with self.storage.transaction() as tx:
+            self.attempt_state_store.update_state(
+                tx=tx,
+                attempt_id=attempt_id,
+                state=resolved_state,
+                terminal_event_position=terminal_position,
+                failure_summary=resolved_failure,
+            )
+        _LOGGER.log(
+            VERBOSE_LOG_LEVEL,
+            "host.run.attempt_finished attempt_id=%s state=%s",
+            attempt_id,
+            resolved_state.value,
         )
 
     def _remember_run_input_build_trace(
@@ -1297,6 +1492,37 @@ def _extract_accepted_start_input(*, request: StartRunRequest) -> _AcceptedStart
         current_user_text=content,
         caller_system_messages=tuple(caller_system_messages),
     )
+
+
+_ERROR_NON_TERMINAL_RUN_EVENT_FOR_ATTEMPT: str = (
+    "attempt state mapping requires a terminal RunEvent"
+)
+
+
+def _attempt_state_from_terminal(event: RunEvent) -> AttemptState:
+    """从 terminal RunEvent 推导 attempt 终态。
+
+    映射关系：``FINAL_ANSWER`` -> ``SUCCEEDED``、``RUN_FAILED`` -> ``FAILED``、
+    ``RUN_CANCELLED`` -> ``CANCELLED``、``RUN_SUSPENDED`` -> ``SUSPENDED``。
+    本 helper 假定调用方已经通过 ``terminal_result_from_event`` 验证了
+    传入事件确实是终态;若入参为非终态事件,直接抛出 ``ValueError``。
+
+    :param event: 已 append 的终态 RunEvent。
+    :returns: 对应 attempt 终态。
+    :raises ValueError: 入参事件不是终态类型时抛出。
+    """
+
+    match event.type:
+        case RunEventType.FINAL_ANSWER:
+            return AttemptState.SUCCEEDED
+        case RunEventType.RUN_FAILED:
+            return AttemptState.FAILED
+        case RunEventType.RUN_CANCELLED:
+            return AttemptState.CANCELLED
+        case RunEventType.RUN_SUSPENDED:
+            return AttemptState.SUSPENDED
+        case _:
+            raise ValueError(_ERROR_NON_TERMINAL_RUN_EVENT_FOR_ATTEMPT)
 
 
 def _is_terminal_engine_event(event: EngineEvent) -> bool:

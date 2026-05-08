@@ -18,8 +18,9 @@ EngineEvent iterator；不实现完整 MQ / claim / lease。
 
 from __future__ import annotations
 
+import asyncio
 import logging
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import Protocol
 
 from dayu.host._durable_event_store import DurableRunEventStore
@@ -120,6 +121,10 @@ class ProjectionCoordinator:
     projection_store: ProjectionStore
     observers: tuple[ObserverSink, ...]
     batch_limit: int = _DEFAULT_BATCH_LIMIT
+    _drain_lock: asyncio.Lock = field(
+        default_factory=asyncio.Lock,
+        init=False,
+    )
 
     async def initialize(self) -> None:
         """确保所有 observer 都有 checkpoint 行。
@@ -141,16 +146,20 @@ class ProjectionCoordinator:
     async def drain(self) -> tuple[ProjectionCheckpoint, ...]:
         """对每个 observer 推进到当前最新 position。
 
+        ``_drain_lock`` 防止同一进程内并发 drain 互相干扰：本调用在锁内
+        串行执行 ``initialize`` + 逐 observer ``run_once``，避免重入。
+
         :returns: 每个 observer 推进后的最新 checkpoint。
         :raises sqlite3.DatabaseError: 写入失败时抛出。
         """
 
-        await self.initialize()
-        snapshots: list[ProjectionCheckpoint] = []
-        for observer in self.observers:
-            checkpoint = await self.run_once(observer=observer)
-            snapshots.append(checkpoint)
-        return tuple(snapshots)
+        async with self._drain_lock:
+            await self.initialize()
+            snapshots: list[ProjectionCheckpoint] = []
+            for observer in self.observers:
+                checkpoint = await self._run_once_locked(observer=observer)
+                snapshots.append(checkpoint)
+            return tuple(snapshots)
 
     async def run_once(
         self,
@@ -158,6 +167,21 @@ class ProjectionCoordinator:
         observer: ObserverSink,
     ) -> ProjectionCheckpoint:
         """对单个 observer 执行一次 drain 直到追平。
+
+        :param observer: Observer / sink。
+        :returns: 最终 checkpoint。
+        :raises sqlite3.DatabaseError: 写入失败时抛出。
+        """
+
+        async with self._drain_lock:
+            return await self._run_once_locked(observer=observer)
+
+    async def _run_once_locked(
+        self,
+        *,
+        observer: ObserverSink,
+    ) -> ProjectionCheckpoint:
+        """``_drain_lock`` 内的 run_once 实现。
 
         :param observer: Observer / sink。
         :returns: 最终 checkpoint。
@@ -198,7 +222,11 @@ class ProjectionCoordinator:
                     projection_name=desc.projection_name,
                     schema_version=desc.schema_version,
                 )
-                assert refreshed is not None
+                if refreshed is None:
+                    raise RuntimeError(
+                        f"projection checkpoint disappeared after caught_up: "
+                        f"observer={desc.observer_id}"
+                    )
                 return refreshed
             envelopes = tuple(
                 ProjectionEventEnvelope(position=position, event=event)
@@ -240,7 +268,11 @@ class ProjectionCoordinator:
                     projection_name=desc.projection_name,
                     schema_version=desc.schema_version,
                 )
-                assert refreshed is not None
+                if refreshed is None:
+                    raise RuntimeError(
+                        f"projection checkpoint disappeared after retryable: "
+                        f"observer={desc.observer_id}"
+                    )
                 return refreshed
             except Exception as exc:  # noqa: BLE001
                 async with self.storage.transaction() as tx:
@@ -266,7 +298,11 @@ class ProjectionCoordinator:
                     projection_name=desc.projection_name,
                     schema_version=desc.schema_version,
                 )
-                assert refreshed is not None
+                if refreshed is None:
+                    raise RuntimeError(
+                        f"projection checkpoint disappeared after blocked: "
+                        f"observer={desc.observer_id}"
+                    )
                 return refreshed
 
 

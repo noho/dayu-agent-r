@@ -121,8 +121,18 @@ P6 已落地：
 - `RunEventData` 序列化注册表（`schema_version=1`）按封闭 type↔data 映射强校验，
   `RUN_FAILED` 同时支持 Engine `RunFailedData` 与 Host `HostRunFailedData` 两个变体。
 - `RunStateStore` / `AttemptStateStore` 写 run 终态结果与 attempt 生命周期。
+  Run 终态 `RunResult` 快照在 terminal RunEvent 入库的同一事务内由
+  `DurableRunEventStore` 持久化，避免事件 / 快照分离失败。
+  `LocalRunHarness` 在每个 attempt 起点写入 `CREATED → RUNNING`，终态写入
+  `SUCCEEDED / FAILED / CANCELLED / SUSPENDED`；context overflow compact retry
+  会把旧 attempt 标记为 `STALE_DIAGNOSTIC` 后开新 attempt。`attempt_id` 形如
+  `attempt-<run_id>-<index>-<short_uuid>`，owner lease / fencing 留给 P8。
 - `ProjectionStore` + `ProjectionCoordinator` 驱动 at-least-once observer，记录
-  per-observer checkpoint、`status`、`retry_count`、`lag_events`；checkpoint 不允许倒退。
+  per-observer checkpoint、`status`、`retry_count`、`lag_events`；checkpoint 不允许倒退，
+  相同 position 重放幂等。`ProjectionCoordinator.drain()` 内置 `_drain_lock`
+  防止并发 drain 重入，sink + checkpoint 同事务保证 at-least-once。
+  `LocalRunHarness` 在 run 终态后调用 `coordinator.drain()` 推进所有 read model；
+  无 coordinator 装配时退化为内存 fallback 仅用于 legacy `InMemoryRunEventStore` 测试路径。
 - 自带三个 observer：memory（required）、timeline（非 required）、audit（非 required）。
   memory observer 写入用户输入永不丢失，成功终态写 assistant final，Engine `RUN_FAILED`
   与 Host-owned `RUN_FAILED` 写中性 terminal summary，cancelled / suspended 仅保留

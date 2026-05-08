@@ -6,14 +6,15 @@ projection checkpoint 等写入必须共享同一 SQLite connection / transactio
 
 设计要点：
 
-- 单连接 + WAL 模式：保证多进程读时不阻塞写，写时通过 ``BEGIN IMMEDIATE``
+- 单连接 + WAL 模式：保证多进程读时不阻塞写,写时通过 ``BEGIN IMMEDIATE``
   获取 RESERVED 锁。
-- ``transaction()`` 异步上下文管理：在协程内串行获取写事务，事务体内可调
+- ``transaction()`` 异步上下文管理：在协程内串行获取写事务,事务体内可调
   用 :class:`HostStorageTransaction` 上挂载的内部 store writer。
-- 事务体 ``raise`` 时自动 ``ROLLBACK``，正常退出时 ``COMMIT``。
+- 事务体 ``raise`` 时自动 ``ROLLBACK``,正常退出时 ``COMMIT``。
 - commit 后的 post-commit hook 用于通知本进程订阅者；hook 在 commit 之前
-  采集，commit 失败时不触发。
-- 本模块只暴露 internal 类型，禁止进入 ``dayu.host.__all__``。
+  采集,commit 失败时不触发。任意 hook 抛出异常会被记录后吞掉,不污染下
+  一个 hook 也不再向调用方传播,避免一个失败的订阅者诊断干扰事务语义。
+- 本模块只暴露 internal 类型,禁止进入 ``dayu.host.__all__``。
 
 :py:class:`HostStorage` 自身不写业务字段；具体 schema 由 P6 各 store 模块
 ``ensure_schema`` 完成。
@@ -22,12 +23,15 @@ projection checkpoint 等写入必须共享同一 SQLite connection / transactio
 from __future__ import annotations
 
 import asyncio
+import logging
 import sqlite3
 import threading
 from collections.abc import AsyncGenerator, Callable, Iterable
 from contextlib import asynccontextmanager
 from dataclasses import dataclass, field
 from typing import TypeAlias
+
+_LOGGER: logging.Logger = logging.getLogger(__name__)
 
 _PRAGMA_SETUP: tuple[str, ...] = (
     "PRAGMA journal_mode=WAL",
@@ -186,7 +190,16 @@ class HostStorage:
                 raise
             await asyncio.to_thread(self._commit, connection)
             for hook in tx.post_commit_hooks:
-                hook()
+                try:
+                    hook()
+                except Exception as exc:  # noqa: BLE001
+                    # post-commit hook 仅做诊断/通知；任意一个 hook 失败不应
+                    # 阻断后续 hook,也不应反向传播污染调用方的事务语义。
+                    _LOGGER.error(
+                        "host.storage.post_commit_hook_failed exc_type=%s",
+                        type(exc).__name__,
+                        exc_info=(type(exc), exc, exc.__traceback__),
+                    )
 
     def execute_read(
         self,

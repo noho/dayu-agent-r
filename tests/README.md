@@ -154,6 +154,15 @@ Host 当前 Run harness、RunEventStore、ToolRuntime、Conversation Memory / Ru
     cancelled / suspended 仅保留用户输入。
   - `timeline_audit_projection`：timeline observer 仅累积 canonical 事件且按 cursor sequence
     升序，audit observer 按 global position 升序累积元数据并对 preview kind 跳过。
+  - `review_fixes`：覆盖本轮 P6 review 修复 —— 四种终态 RunResult 快照与 terminal event
+    同事务持久化、`source_engine_event_id` 唯一约束违反映射为 `ValueError`、
+    `ProjectionStore.advance_success` 同 position 重放幂等且严格拒绝倒退、
+    `ProjectionCoordinator._drain_lock` 防并发 drain 重入、多 run 并发 append global
+    position 单调、post-commit hook 抛异常不污染事务、事务体异常 ROLLBACK。
+  - `durable_harness_integration`：通过 `build_durable_harness` 注入 stub `WorkerProxy`,
+    覆盖 `harness.start_run` -> Engine event stream -> append -> terminal -> coordinator.drain
+    端到端路径,守护 attempt 终态写入、observer caught_up、共享 memory store 无 split-brain、
+    RunResult 快照可读。
 - public boundary：锁定 `dayu.host.__all__`，允许 Run 级 `start_run`、`stream_run_events`、`get_run_result`，
   以及 P2 Run 级 `get_tool_fetch_more_handle`、`fetch_more_tool_result`，阻止 `EngineWorker`、`LocalProxy`、
   `ToolExecutor`、`InMemoryToolRuntime`、`ToolRuntimeToolExecutor`、`InMemoryConversationMemoryStore`、

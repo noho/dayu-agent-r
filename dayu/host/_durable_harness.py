@@ -32,12 +32,13 @@ from dayu.host._event_observer import ProjectionCoordinator
 from dayu.host._host_storage_transaction import HostStorage
 from dayu.host._memory_projection import MemoryProjectionObserver
 from dayu.host._projection_store import ProjectionStore
+from dayu.host._proxy import LocalProxy, WorkerProxy
 from dayu.host._run_harness import (
     EngineWorker,
-    LocalProxy,
     LocalRunHarness,
     _NoopToolExecutor,
 )
+from dayu.host._run_state_store import AttemptStateStore, RunStateStore
 from dayu.host._timeline_projection import TimelineProjectionObserver
 from dayu.host._tool_runtime import (
     InMemoryToolRuntime,
@@ -56,6 +57,8 @@ class DurableHarnessBundle:
     :param memory_store: 内存对话 read model。
     :param timeline_observer: timeline observer 实例（非 required）。
     :param audit_observer: audit observer 实例（非 required）。
+    :param run_state_store: Run minimal state durable store。
+    :param attempt_state_store: Attempt minimal state durable store。
     :param close: 释放 storage 的回调。
     """
 
@@ -66,6 +69,8 @@ class DurableHarnessBundle:
     memory_store: ConversationMemoryStore
     timeline_observer: TimelineProjectionObserver
     audit_observer: AuditProjectionObserver
+    run_state_store: RunStateStore
+    attempt_state_store: AttemptStateStore
     close: Callable[[], None]
 
 
@@ -74,6 +79,7 @@ def build_durable_harness(
     database_path: str,
     executor: ToolExecutor | None = None,
     memory_store: ConversationMemoryStore | None = None,
+    proxy: WorkerProxy | None = None,
 ) -> DurableHarnessBundle:
     """装配 durable :class:`LocalRunHarness`。
 
@@ -81,6 +87,8 @@ def build_durable_harness(
     :param executor: 自定义 ToolExecutor；默认为 ``_NoopToolExecutor``。
     :param memory_store: 自定义对话 memory store；默认为
         :class:`InMemoryConversationMemoryStore`。
+    :param proxy: 自定义 WorkerProxy；默认装配本地 EngineWorker + LocalProxy。
+        smoke / 测试可注入 stub proxy 跳过真实 Engine。
     :returns: :class:`DurableHarnessBundle`。
     :raises Exception: 装配失败时透传底层异常。
     """
@@ -110,12 +118,20 @@ def build_durable_harness(
         executor=actual_executor,
         event_store=event_store,
     )
+    run_state_store = RunStateStore(storage=storage)
+    attempt_state_store = AttemptStateStore(storage=storage)
+    actual_proxy: WorkerProxy = (
+        proxy if proxy is not None
+        else LocalProxy(worker=EngineWorker(ToolRuntimeToolExecutor(runtime)))
+    )
     harness = LocalRunHarness(
-        proxy=LocalProxy(
-            worker=EngineWorker(ToolRuntimeToolExecutor(runtime))
-        ),
+        proxy=actual_proxy,
         event_store=event_store,
         tool_runtime=runtime,
+        memory_store=actual_memory,
+        coordinator=coordinator,
+        attempt_state_store=attempt_state_store,
+        storage=storage,
     )
 
     return DurableHarnessBundle(
@@ -126,6 +142,8 @@ def build_durable_harness(
         memory_store=actual_memory,
         timeline_observer=timeline_observer,
         audit_observer=audit_observer,
+        run_state_store=run_state_store,
+        attempt_state_store=attempt_state_store,
         close=storage.close,
     )
 

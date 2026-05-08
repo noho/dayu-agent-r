@@ -116,6 +116,8 @@ durable 基础设施即可在实际 run 中生效。Finding 2-4 为次要改进�
 
 ### Finding 1 [严重]: LocalRunHarness 未接入 ProjectionCoordinator
 
+**状态**: [已修复] —— `LocalRunHarness` 增加 `coordinator: ProjectionCoordinator | None`、`storage`、`attempt_state_store` 三个可选字段;`_run_to_store.finally` 调用新增的 `_project_terminal_run`,durable 路径走 `coordinator.drain()`,legacy 路径退化为 `_project_run_events` fallback;`build_durable_harness` 已显式注入 coordinator 与 storage。
+
 **问题：** `LocalRunHarness._run_to_store` 在 run 终态后直接调用
 `_project_run_events`，该方法从 `event_store.list_events` 读取事件后
 直接调用 `memory_store.project_run_events`，完全绕过
@@ -156,6 +158,8 @@ audit projection、retry / lag 机制在实际 run 中不生效。
 
 ### Finding 2 [严重]: AttemptStateStore 未接入主路径
 
+**状态**: [已修复] —— `_run_to_store` 在 attempt 起点调用 `_begin_attempt_if_durable`(create + RUNNING),terminal 调用 `_finish_attempt_if_durable` 写入终态,context overflow compact retry 把旧 attempt 标记为 `STALE_DIAGNOSTIC` 后开新 attempt,finally 路径兜底关闭未推进 attempt;attempt_id 形如 `attempt-<run_id>-<index>-<short_uuid>`;P8 owner lease/fencing 不在本范围。
+
 **问题：** `AttemptStateStore.create` 和 `update_state` 从未在
 `_run_to_store` 或任何 run 执行路径中被调用。`host_attempts` 表在
 生产路径中永远为空。
@@ -186,6 +190,8 @@ audit projection、retry / lag 机制在实际 run 中不生效。
 
 ### Finding 3 [中等]: RunStateStore.write_terminal_result 未接入
 
+**状态**: [已修复] —— `DurableRunEventStore._append_in_transaction` 在 terminal 事件入库时同步调用 `_write_terminal_result_snapshot`,通过共享 `HostStorageTransaction` 与事件 append + Run state 推进同事务持久化;`tests/host/test_phase6_review_fixes.py` 覆盖四种终态。
+
 **问题：** `_run_to_store` 终态后未调用
 `RunStateStore.write_terminal_result`，导致 `host_runs.result_payload`
 始终为 NULL。`RunStateStore.get_terminal_result` 永远返回 None。
@@ -208,6 +214,8 @@ audit projection、retry / lag 机制在实际 run 中不生效。
 2. 或在 `_run_to_store` 终态后、projection drain 前调用。
 
 ### Finding 4 [中等]: Smoke 测试未覆盖真实执行路径
+
+**状态**: [已修复] —— smoke 改为 `harness.start_run` + stub `WorkerProxy`,完整覆盖 USER_INPUT_ACCEPTED → proxy → translate → append → terminal → coordinator.drain → memory/timeline/audit 投影 + RunResult 持久化;`tests/host/test_phase6_durable_harness_integration.py` 在测试套件层面持续守护。
 
 **问题：** `utils/smoke_host_p6_durable_eventlog.py` 只测试手动
 `event_store.append` + 手动 `coordinator.drain()`，未覆盖真实的
@@ -234,6 +242,8 @@ audit projection、retry / lag 机制在实际 run 中不生效。
    checkpoint 未前进。
 
 ### Finding 5 [低]: _project_run_events 应删除或收窄
+
+**状态**: [已修复] —— `_project_terminal_run` 现在统一负责终态投影:有 coordinator 时调用 `coordinator.drain()`,否则降级到 `_project_run_events`(legacy `InMemoryRunEventStore` 路径);保留 fallback 以维持非 durable 装配的最小行为,并在 docstring 中明确职责边界。
 
 **问题：** `phase6-plan.md` 5.2 要求"删除或收窄 `_project_run_events`
 的职责"。当前该方法仍完整存在于 `_run_harness.py:937-955`。
