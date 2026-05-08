@@ -106,13 +106,39 @@ compact retry，以及公共 tool declaration 契约：
 
 - `client_request_id` 创建幂等。
 - Session governance 与同 Session active Run 仲裁。
-- 持久化 schema、workspace migration、启动恢复、多进程 lease / fencing。
-- timeline projection。
+- workspace migration、多进程 lease / fencing 治理（已具备 SQLite WAL durable EventLog，
+  恢复仅覆盖单进程重启，不含跨进程仲裁）。
 - 完整 ToolRegistry、工具发现、权限治理、middleware、业务工具迁移。
 - 远程 / 多进程补读。
-- public memory edit / reset / forget API、持久 memory projection、跨 session / project / user memory。
+- public memory edit / reset / forget API、跨 session / project / user memory。
 - episode summary 生成与 LLM compaction scene。
 - 完整取消治理、RemoteProxy、RemoteStub、Reply Outbox。
+
+P6 已落地：
+
+- `DurableRunEventStore` 提供 SQLite WAL 后端的 append-before-stream 持久 EventLog；
+  per-run cursor 单调，跨 run 全局 position 单调。
+- `RunEventData` 序列化注册表（`schema_version=1`）按封闭 type↔data 映射强校验，
+  `RUN_FAILED` 同时支持 Engine `RunFailedData` 与 Host `HostRunFailedData` 两个变体。
+- `RunStateStore` / `AttemptStateStore` 写 run 终态结果与 attempt 生命周期。
+  Run 终态 `RunResult` 快照在 terminal RunEvent 入库的同一事务内由
+  `DurableRunEventStore` 持久化，避免事件 / 快照分离失败。
+  `LocalRunHarness` 在每个 attempt 起点写入 `CREATED → RUNNING`，终态写入
+  `SUCCEEDED / FAILED / CANCELLED / SUSPENDED`；context overflow compact retry
+  会把旧 attempt 标记为 `STALE_DIAGNOSTIC` 后开新 attempt。`attempt_id` 形如
+  `attempt-<run_id>-<index>-<short_uuid>`，owner lease / fencing 留给 P8。
+- `ProjectionStore` + `ProjectionCoordinator` 驱动 at-least-once observer，记录
+  per-observer checkpoint、`status`、`retry_count`、`lag_events`；checkpoint 不允许倒退，
+  相同 position 重放幂等。`ProjectionCoordinator.drain()` 内置 `_drain_lock`
+  防止并发 drain 重入，sink + checkpoint 同事务保证 at-least-once。
+  `LocalRunHarness` 在 run 终态后调用 `coordinator.drain()` 推进所有 read model；
+  无 coordinator 装配时退化为内存 fallback 仅用于 legacy `InMemoryRunEventStore` 测试路径。
+- 自带三个 observer：memory（required）、timeline（非 required）、audit（非 required）。
+  memory observer 写入用户输入永不丢失，成功终态写 assistant final，Engine `RUN_FAILED`
+  与 Host-owned `RUN_FAILED` 写中性 terminal summary，cancelled / suspended 仅保留
+  用户输入。
+- `dayu.host._durable_harness.build_durable_harness` 装配 durable 路径的
+  `LocalRunHarness` + `ProjectionCoordinator` + 默认 observer。
 
 不得为旧 Host 接口创建兼容 wrapper、facade 或 re-export。
 
@@ -245,9 +271,23 @@ LocalRunHarness / default harness
 默认 public `start_run` 不暴露 ToolExecutor 配置入口。需要 fake ToolExecutor 的 Host 测试使用内部
 `LocalRunHarness` 装配，避免把 `ToolExecutor.execute` 提升为 Host public API。
 
-当前 `InMemoryRunEventStore` 是 Host 内部临时实现，提供 append-only、per-run cursor、
-exclusive replay 和 replay-then-follow 订阅。它是单进程内存实现，不提供持久化 schema、多进程恢复
-或 observer checkpoint。
+当前 `InMemoryRunEventStore` 是 Host 内部 runtime 临时实现；P6 起新增 SQLite WAL 后端的
+`DurableRunEventStore`（位于 `dayu.host._durable_event_store`），同样实现 append-only、
+per-run cursor、exclusive replay 与 replay-then-follow 订阅，并对外暴露
+`fetch_events_by_position` / `latest_event_position` 以服务 observer。durable 路径通过
+`dayu.host._durable_harness.build_durable_harness` 显式装配，会同时返回
+`HostStorage`、`DurableRunEventStore`、`ProjectionCoordinator` 与三个默认 observer
+（memory required、timeline、audit）。每个 observer 在 `ProjectionStore` 中保存
+checkpoint、`status`、`retry_count`、`last_error_code`、`lag_events`；checkpoint 不允许
+倒退。`DurableHarnessBundle.startup_reconcile()` 是装配后的显式追平入口：进程崩溃可能
+停在 terminal 事件已持久化但 `coordinator.drain()` 尚未执行的瞬间，重启后调用方需要
+在自己的 async 上下文内 `await bundle.startup_reconcile()`，本方法委派
+`ProjectionCoordinator.startup_reconcile`，串行 drain 至 `CAUGHT_UP`，不引入新 event
+loop / 线程，也不与 terminal 后的 `drain()` 重入冲突。`DurableRunEventStore` 写入
+RunEventData 时通过封闭 type↔data 映射的序列化注册表
+（`dayu.host._run_event_serializer`，`schema_version=1`）做 fail-fast 校验；schema 变化按
+全新起库处理，不维护旧库兼容。当前实现仍是单进程：未提供跨进程 lease / fencing 与多进程
+恢复。
 
 Host 已落地主路径使用日志表达执行边界：`VERBOSE` 覆盖 `start_run` 接纳、background task、attempt、
 EngineWorker 调用、terminal append、context overflow / compact / retry、ToolRuntime 调用边界、
@@ -288,6 +328,16 @@ cursor、replay 与 Host-owned failure 行为：
 ```bash
 python utils/smoke_host_eventlog.py --case success --log-level DEBUG
 python utils/smoke_host_eventlog.py --case worker-failure --log-level DEBUG
+```
+
+当前提供 Host P6 durable EventLog 手工 smoke 脚本，用于观察 SQLite 后端 append、
+`ProjectionCoordinator` drain、checkpoint 推进与 memory / timeline / audit observer 行为。
+脚本默认启用 `VERBOSE` 日志以展示 P6 执行路径；需要更细诊断时可传 `--log-level DEBUG`，
+只看摘要时可传 `--log-level INFO`：
+
+```bash
+python utils/smoke_host_p6_durable_eventlog.py
+python utils/smoke_host_p6_durable_eventlog.py --log-level DEBUG
 ```
 
 当前提供 Host ToolRuntime smoke 脚本，用于观察 P2 schema-driven truncate、cursor issued、

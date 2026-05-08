@@ -23,7 +23,15 @@
 - P5.5 deferred scope reconciliation 已完成文档收口：已把 P1-P5 漏排 / 误排 / 已落地的 deferred
   能力重新安排到 P6+，并经开放式架构 review 讨论后补充最小 observer / sink、`LocalRunHarness`
   防 God Object、OLD public interface 调研前置、代表性 web tool smoke、P12-P14 保留等总控约束。
-  当前分支为 `migration/host-p5_5-deferred-scope-reconciliation`，准备创建 PR 等用户人工 PR review。
+- P5.5 已通过 PR #25 合入 `main`，merge commit 为 `758fd4a Host P5.5 deferred scope reconciliation (#25)`。
+- P6 Durable EventLog / Run State / Projection 已完成实现、修复与复审：落地 SQLite WAL durable
+  `RunEventStore`、Run / Attempt 最小持久状态、同事务 terminal result snapshot、ProjectionCoordinator、
+  memory / timeline / audit observer、checkpoint / retry / lag 观察、真实 `harness.start_run` 路径
+  smoke。P6 code / architecture / concurrency review findings 已在
+  `docs/host/phase6-code-review.md`、`docs/host/phase6-architecture-review.md`、
+  `docs/host/phase6-concurrency-review.md` 标注修复状态；复审结果见
+  `docs/host/phase6-fix-rereview.md`，结论通过。当前分支为
+  `migration/host-p6-durable-eventlog`，准备创建 PR 等用户人工 PR review。
 
 每个 Phase 进入实现前，必须另写可交接的 phase plan，细化到迁移 Agent 可以直接接手：
 目标、非目标、边界、文件级改动清单、契约变化、状态机、测试清单、验证命令、review gate、
@@ -128,6 +136,12 @@ phase 落地；随后建立多进程 attempt ownership，并在该基础上落�
 完整 ToolRegistry、validation replay、outbox、remote、wait / suspend / resume、治理 hardening
 与最终 full-governance smoke。
 
+从 P6 开始，每新增一项 Host 治理能力，必须同步新增或更新一个 `utils/` 下的手工 smoke。该 smoke
+用于让用户通过日志和关键摘要直接观察新增治理能力的真实执行路径；它不能替代单元 / 并发 / 恢复测试，
+也不能输出大块 delta、大工具结果、scope token 或内部大 prompt。P5 的
+`utils/smoke_host_multiturn_no_governance.py` 是 no-full-governance 纵向基线；P6+ 的每个治理
+phase 都应提供对应 smoke，P16 再把这些验证面收束为 Full-Governance Multi-Turn Smoke。
+
 | Phase | 名称 | 目标 | 主要输出 | 明确不做 | 验收信号 |
 | --- | --- | --- | --- | --- | --- |
 | P0 | 计划与议题同步 | 固定 Host 迁移总控计划，创建 / 更新必要 issue 与 review prompt 事实 | 本文档、plan review、必要 issue comment | 不写生产代码 | 用户确认可以进入 P1 |
@@ -138,17 +152,18 @@ phase 落地；随后建立多进程 attempt ownership，并在该基础上落�
 | P4 | Host Compact for Context Overflow | 把 OLD 中原本在 Engine 内做的 compact 搬到 Host，使 Engine context overflow 时仍能继续运行 | Host compact 入口、compact 输入 / 输出、Engine overflow 事件 / 错误映射、compact 后 attempt 输入重建 | 不实现完整 context governance；不引入 replay / validation 联动；不在 Engine 内实现 compact/retry | Engine 遇到 context overflow 时，Host 完成 compact 后继续运行或明确失败收口 |
 | P5 | No-Full-Governance Multi-Turn Smoke | 将 P1-P4 与 P1.5 串成最小纵向 smoke，并落地最小公共 tool declaration 与 framework `fetch_more` 能力 | smoke CLI / test harness、端到端多轮测试、公共 `@tool` declaration / `ToolDefinition`、LLM-facing truncation hint、framework `fetch_more` schema、必要 README / tests 文档 | 不做完整多进程治理、不做 Remote、不做 Outbox、不做 audit hard-gate；不验证 `start_run` 幂等、active Run 并发仲裁或调用重试语义；不做完整 ToolRegistry / 权限治理 / 业务工具迁移；不做自动透明补读 | 一个单调用方、顺序执行的无完整生产治理多轮会话可按目标事实层跑通，含工具截断补读、memory、compaction；手工 smoke 真实向 `mimo-v2.5-pro-plan` 发送 prompt，由模型调用公共声明的 `huge_echo`，再由模型根据 `truncation.next_action=fetch_more` 调用 framework `fetch_more` |
 | P5.5 | Deferred Scope Reconciliation | 回看 P1-P5 所有“本阶段不实现”能力，确认没有遗留能力被漏排或误排 | deferred-scope inventory、能力归属表、后续 Phase 调整建议、必要的新 Phase / issue / plan 修订 | 不写生产代码；不把未落地能力补写成已落地事实；不直接修改后续 Phase 代码边界 | P1-P5 的非目标均被明确标记为已实现、已安排到 P6+、新增 Phase / issue 承接，或经用户确认关闭 |
-| P6 | Durable EventLog / Run State / Projection | 在 P1.5 最小事实层上建立多进程共享的 durable facts、projection checkpoint 与 observer / sink 基础 | 持久 EventLog、Run / Attempt 最小持久状态、atomic append / cursor allocation、projection checkpoint、最小 observer / sink protocol、audit / timeline / memory projection 重建基础、observer retry / lag | 不实现 attempt lease / fencing；不落地具体 tool trace schema；不把 trace 写回 Engine；不要求所有 observer hard-gate；不把 observer / sink 做成完整消息队列消费者框架 | EventLog storage 本身具备多进程安全的 append / replay / checkpoint 语义；Host 具备足以支撑 tool trace / audit / timeline / memory projection 的最小 observer / sink 基础 |
-| P7 | Tool Trace Projection / Sink | 在 P6 observer / sink 基础上落地 tool trace，继承 OLD tool trace schema 的关键语义 | tool trace observer、tool trace sink / store、OLD tool trace schema 对齐、tool call / result / iteration usage / final response / protocol error 投影测试、redaction 与 retention 边界 | 不恢复 Engine 私有 recorder / store；不扩大 ToolRegistry 权限治理；不实现 audit hard-gate | tool trace 不再由 Engine recorder 落盘，而由 Host observer / sink 从 Engine / ToolRuntime canonical events 幂等派生，schema 语义可对照 OLD trace 消费 |
-| P8 | Attempt Lease / Recovery / 多进程并发基础 | 落地 AttemptSupervisor、lease / fencing、startup recovery，使多进程执行具备 owner 真源 | attempt store、owner token、lease renew、stale cleanup、orphan recovery、late write fencing、多进程测试、lane runtime dependency 判断 | 不做 Remote RPC；不实现完整 Session / Run admission；不把 lane 实现为 Host 私有能力 | 多进程下同一 attempt 只有有效 owner 可写入，迟到 owner 写入被拒绝，orphan / stale 可恢复或 LOST |
-| P9 | Session / Run Lifecycle Governance / Public Interface 固定 | 在 durable facts 与 attempt ownership 上完整落地 Session / Run 状态机、admission policy、取消基础治理，并固定 Host public interface | SessionManager、RunManager、RunSupervisor、`client_request_id` 幂等、同 Session active Run 仲裁、cancel_run、状态机测试、生产级 admission policy、Host public interface 契约、OLD wechat / web / prompt / interactive 调用需求调研 | 不做 issue #3 的强制终止增强；不做 wait / suspend / resume；不做 Remote RPC；不迁移业务工具 | 同 Session 单 active Run、幂等 start_run、跨进程 admission、取消基础收口稳定；`docs/host/design.md` 的 Public Interface 口径与 `dayu.host` public exports 固定，且已对照 OLD wechat / web / prompt / interactive 需求验证 |
-| P10 | ToolRegistry Governance | 在 P5 最小 tool declaration 之上落地完整通用工具注册与治理能力 | ToolRegistry / tool catalog、display metadata 治理、permission policy、middleware chain、framework tool registration、schema / binding 校验、registry audit facts | 不迁移 business fins / doc / web 工具；不让 Host / Engine 承载财报业务语义；不让 Engine 持有 registry | 通用工具可被发现、注册、授权、middleware 处理与审计；Engine 仍只接收 `ToolSchema` projection 与 `ToolExecutor` 协议 |
-| P11 | OutputContract / Validation Replay | 补齐输出契约、验证决策与 replay attempt，使财报回答可靠性有可验收闭环 | OutputContractRef、ValidationDecision fact、validator execution boundary、replay attempt policy、replay 上限、恢复 / 失败收口测试 | 不把 validation 混入 P4 compact retry；不把 audit hard-gate 当成 validation replay；不实现业务 validator 全量规则库 | final answer 可按契约验证，失败可产生可审计 replay attempt 或明确失败终态，恢复后不会丢失 validation decision |
-| P12 | Reply Outbox | 将 RunResult / final answer 可靠投影到外部信道 outbox | Outbox 状态机、delivery key、claim / retry / reconcile | 不实现具体 WeChat / Web delivery 业务适配 | final answer 到 outbox 无丢失窗口，重复 projection 不重复投递 |
-| P13 | RemoteProxy / RemoteStub | 落地远程执行边界 | RemoteProxy、RemoteStub、cursor / ack / reconnect、remote cancel | 不让远程 Engine 回调 Host 执行工具 | Remote Agent = Engine + tools execute remotely |
-| P14 | Wait / Suspend / Resume 协作 | 基于 Engine suspended outcome 与 Host durable governance 落地等待协作能力 | WaitRecord、awaiting outcome、自动 resume、状态机与恢复测试、取消 / 超时语义 | 不把 `resume_run` 暴露为普通 public API；不把 wait 伪装成普通 tool failure | 等待型工具 / 长事务可 suspend、恢复、取消、超时，且多进程恢复后语义稳定 |
-| P15 | Governance Hardening | 补齐取消增强、policy hard-gate、audit hard-gate、运行治理 | issue #3 增强、watchdog、强制终止、required projection、运维可观测性 | 不扩大 Host 业务语义；不补 business tools 迁移 | Host 可作为强约束真源运行生产治理 |
-| P16 | Full-Governance Multi-Turn Smoke / 文档收口 / 接口冻结 | 在 P6-P15 完整治理能力打开后，按 P5 同一验证面跑最终纵向 smoke，固定 Engine / Host 接口，并更新当前事实文档、归档迁移过程文档 | full-governance smoke CLI / test harness、与 P5 对齐的验证面清单、代表性 web tool 通过完整 ToolRegistry / ToolRuntime / trace / memory / governance 链路的 smoke、Engine / Host interface freeze 方案、契约变更治理规则、`docs/code_review.md` 当前事实专项、必要 README、issue / PR 收口、phase 文档归档策略 | 不新增治理能力；不写未来设计为已落地事实；不误删 review 证据；不把 smoke failure 用文档绕过；不允许未走接口变更流程的 Engine / Host 契约修改；不迁移 fins / doc 全量业务工具 | Full-Governance Multi-Turn Smoke 覆盖 P5 同一语义面：真实模型 tool calling、ToolRuntime truncate / framework `fetch_more`、Conversation Memory、context compact、durable EventLog / observers、tool trace、attempt lease / recovery、lifecycle / admission、ToolRegistry governance、validation replay、outbox / remote / wait / audit hard-gate，并至少覆盖一个代表性 web tool；Engine / Host public contracts、protocols、events、result types、错误码和 package exports 被明确冻结，后续变更必须走设计更新、兼容性取舍、测试和专项 review；日常 review prompt 与 README 均只描述当前已落地事实，迁移审计记录可追溯 |
+| P6 | Durable EventLog / Run State / Projection | 在 P1.5 最小事实层上建立多进程共享的 durable facts、projection checkpoint 与 observer / sink 基础 | 持久 EventLog、Run / Attempt 最小持久状态、atomic append / cursor allocation、projection checkpoint、最小 observer / sink protocol、audit / timeline / memory projection 重建基础、observer retry / lag、`utils/smoke_host_p6_durable_eventlog.py` | 不实现 attempt lease / fencing；不落地具体 tool trace schema；不把 trace 写回 Engine；不要求所有 observer hard-gate；不把 observer / sink 做成完整消息队列消费者框架 | EventLog storage 本身具备多进程安全的 append / replay / checkpoint 语义；Host 具备足以支撑 tool trace / audit / timeline / memory projection 的最小 observer / sink 基础；P6 smoke 可观察 durable append / replay / projection / checkpoint |
+| P7 | Tool Trace Projection / Sink | 在 P6 observer / sink 基础上落地 tool trace，继承 OLD tool trace schema 的关键语义 | tool trace observer、tool trace sink / store、OLD tool trace schema 对齐、tool call / result / iteration usage / final response / protocol error 投影测试、redaction 与 retention 边界、`utils/smoke_host_p7_tool_trace.py` | 不恢复 Engine 私有 recorder / store；不扩大 ToolRegistry 权限治理；不实现 audit hard-gate | tool trace 不再由 Engine recorder 落盘，而由 Host observer / sink 从 Engine / ToolRuntime canonical events 幂等派生，schema 语义可对照 OLD trace 消费；P7 smoke 可观察 trace projection |
+| P8 | Attempt Lease / Recovery / 多进程并发基础 | 落地 AttemptSupervisor、lease / fencing、startup recovery，使多进程执行具备 owner 真源 | attempt store、owner token、lease renew、stale cleanup、orphan recovery、late write fencing、真实多进程 stress / terminal race / observer drain 验证、lane runtime dependency 判断、`utils/smoke_host_p8_attempt_lease.py` | 不做 Remote RPC；不实现完整 Session / Run admission；不把 lane 实现为 Host 私有能力 | 多进程下同一 attempt 只有有效 owner 可写入，迟到 owner 写入被拒绝，orphan / stale 可恢复或 LOST；真实多进程 append / terminal / recovery stress 不破坏 durable facts；P8 smoke 可观察 owner / fencing / recovery |
+| P9 | Session / Run Lifecycle Governance / Public Interface 固定 | 在 durable facts 与 attempt ownership 上完整落地 Session / Run 状态机、admission policy、取消基础治理，并固定 Host public interface | SessionManager、RunManager、RunSupervisor、`client_request_id` 幂等、同 Session active Run 仲裁、cancel_run、状态机测试、生产级 admission policy、Host public interface 契约、OLD wechat / web / prompt / interactive 调用需求调研、`utils/smoke_host_p9_lifecycle.py` | 不做 issue #3 的强制终止增强；不做 wait / suspend / resume；不做 Remote RPC；不迁移业务工具 | 同 Session 单 active Run、幂等 start_run、跨进程 admission、取消基础收口稳定；`docs/host/design.md` 的 Public Interface 口径与 `dayu.host` public exports 固定，且已对照 OLD wechat / web / prompt / interactive 需求验证；P9 smoke 可观察 lifecycle/admission/cancel |
+| P10 | ToolRegistry Governance | 在 P5 最小 tool declaration 之上落地完整通用工具注册与治理能力 | ToolRegistry / tool catalog、display metadata 治理、permission policy、middleware chain、framework tool registration、schema / binding 校验、registry audit facts、`utils/smoke_host_p10_tool_registry.py` | 不迁移 business fins / doc / web 工具；不让 Host / Engine 承载财报业务语义；不让 Engine 持有 registry | 通用工具可被发现、注册、授权、middleware 处理与审计；Engine 仍只接收 `ToolSchema` projection 与 `ToolExecutor` 协议；P10 smoke 可观察 registry governance |
+| P10.5 | Web Tools Migration Smoke | 在 P10 后立即迁移代表性 web tools 到 Host ToolRegistry，趁热验证真实业务工具可走完整通用工具治理链路 | web tool `@tool` declaration、ToolRegistry 注册、permission / middleware / display metadata 对接、ToolRuntime truncate / fetch_more 适配、tool trace / memory facts 验证 smoke、必要 web tool README / docs 更新、`utils/smoke_host_p10_5_web_tools.py` | 不迁移 fins / doc 全量业务工具；不把 web 业务语义塞进 Host / Engine；不扩大 P10 ToolRegistry 契约；不实现 P11 validation replay | 至少一个代表性 web tool 可通过 Host ToolRegistry 被模型真实调用，并产出可审计 ToolRuntime / trace / memory facts；P10 通用治理链路在真实工具上通过 smoke 验证 |
+| P11 | OutputContract / Validation Replay | 补齐输出契约、验证决策与 replay attempt，使财报回答可靠性有可验收闭环 | OutputContractRef、ValidationDecision fact、validator execution boundary、replay attempt policy、replay 上限、恢复 / 失败收口测试、`utils/smoke_host_p11_validation_replay.py` | 不把 validation 混入 P4 compact retry；不把 audit hard-gate 当成 validation replay；不实现业务 validator 全量规则库 | final answer 可按契约验证，失败可产生可审计 replay attempt 或明确失败终态，恢复后不会丢失 validation decision；P11 smoke 可观察 validation decision / replay |
+| P12 | Reply Outbox | 将 RunResult / final answer 可靠投影到外部信道 outbox | Outbox 状态机、delivery key、claim / retry / reconcile、`utils/smoke_host_p12_reply_outbox.py` | 不实现具体 WeChat / Web delivery 业务适配 | final answer 到 outbox 无丢失窗口，重复 projection 不重复投递；P12 smoke 可观察 outbox claim / retry / reconcile |
+| P13 | RemoteProxy / RemoteStub | 落地远程执行边界 | RemoteProxy、RemoteStub、cursor / ack / reconnect、remote cancel、`utils/smoke_host_p13_remote_proxy.py` | 不让远程 Engine 回调 Host 执行工具 | Remote Agent = Engine + tools execute remotely；P13 smoke 可观察 remote cursor / ack / reconnect / cancel |
+| P14 | Wait / Suspend / Resume 协作 | 基于 Engine suspended outcome 与 Host durable governance 落地等待协作能力 | WaitRecord、awaiting outcome、自动 resume、状态机与恢复测试、取消 / 超时语义、`utils/smoke_host_p14_wait_resume.py` | 不把 `resume_run` 暴露为普通 public API；不把 wait 伪装成普通 tool failure | 等待型工具 / 长事务可 suspend、恢复、取消、超时，且多进程恢复后语义稳定；P14 smoke 可观察 suspend / resume / timeout |
+| P15 | Governance Hardening | 补齐取消增强、policy hard-gate、audit hard-gate、运行治理 | issue #3 增强、watchdog、强制终止、required projection、schema bootstrap 严格事务化 / 半失败治理评估、运维可观测性、`utils/smoke_host_p15_governance_hardening.py` | 不扩大 Host 业务语义；不补 business tools 迁移 | Host 可作为强约束真源运行生产治理；schema bootstrap 半失败有明确恢复 / 报警 / 初始化策略；P15 smoke 可观察 hard-gate / watchdog / 强制终止 |
+| P16 | Full-Governance Multi-Turn Smoke / 文档收口 / 接口冻结 | 在 P6-P15 完整治理能力打开后，按 P5 与 P10.5 同一验证面跑最终纵向 smoke，固定 Engine / Host 接口，并更新当前事实文档、归档迁移过程文档 | full-governance smoke CLI / test harness、与 P5 / P10.5 对齐的验证面清单、代表性 web tool 通过完整 ToolRegistry / ToolRuntime / trace / memory / governance 链路的 smoke、`InMemoryRunEventStore` 收口决策、Engine / Host interface freeze 方案、契约变更治理规则、`docs/code_review.md` 当前事实专项、必要 README、issue / PR 收口、phase 文档归档策略 | 不新增治理能力；不写未来设计为已落地事实；不误删 review 证据；不把 smoke failure 用文档绕过；不允许未走接口变更流程的 Engine / Host 契约修改；不迁移 fins / doc 全量业务工具 | Full-Governance Multi-Turn Smoke 覆盖 P5 与 P10.5 同一语义面：真实模型 tool calling、真实 web tool、ToolRuntime truncate / framework `fetch_more`、Conversation Memory、context compact、durable EventLog / observers、tool trace、attempt lease / recovery、lifecycle / admission、ToolRegistry governance、validation replay、outbox / remote / wait / audit hard-gate；`InMemoryRunEventStore` 不再作为生产默认装配，必须被删除、迁移到测试 helper / explicit local adapter，或经专项理由保留为非生产 adapter；Engine / Host public contracts、protocols、events、result types、错误码和 package exports 被明确冻结，后续变更必须走设计更新、兼容性取舍、测试和专项 review；日常 review prompt 与 README 均只描述当前已落地事实，迁移审计记录可追溯 |
 
 ### 4.1 第一批能力边界
 
@@ -210,7 +225,8 @@ P5.5 人工 review 固定以下总控判断：
   对齐由 P7 单独承接。
 - business fins / doc / web 工具迁移不属于 Host 迁移主线；Host 只提供通用工具注册、执行、治理边界，
   财报文档存取仍由业务工具通过 `dayu.fins.storage` 保证。为证明 Host 治理链路能承载真实业务工具，
-  P16 只要求接入代表性 web tool 做 full-governance smoke，不要求迁移 fins / doc 全量业务工具。
+  P10.5 在 P10 后立即迁移代表性 web tools 做 smoke，趁热验证 P10 ToolRegistry；P16 复用该
+  代表性 web tool 做 full-governance smoke。不要求迁移 fins / doc 全量业务工具。
 - P12 Reply Outbox、P13 RemoteProxy / RemoteStub、P14 Wait / Suspend / Resume 经用户确认保留在
   Host 迁移后半段计划中，不从 P6+ 主计划删除。后续 phase plan 可以按实际需求控制最小实现边界，
   但不能把这些能力从总目标中悄悄移除。
@@ -238,6 +254,69 @@ P5.5 人工 review 固定以下总控判断：
 - P6 的 observer / sink 先按最小 durable protocol 与 checkpoint 能力落地，避免一次性做成完整
   消息队列消费者框架。claim / lease / fencing、独立 observer worker、projection lag monitor 等
   生产级增强只有在对应 phase plan 证明必要时才进入实现。
+
+### 4.2 P6 残余风险追踪
+
+P6 code / architecture / concurrency review 修复后，若仍存在不阻断 P6 语义成立但必须后续追踪的
+残余风险，必须在本节登记；不得只写在实施报告中口头记忆。总控判断每项残余风险时，必须按
+`accepted`、`deferred-with-owner`、`rejected-with-reason` 或 `needs-more-evidence` 标注。
+
+当前 P6 残余风险追踪如下：
+
+- `deferred-with-owner: P8`：真实多进程 stress 测试。P6 只要求 durable storage 具备事务、唯一约束、
+  cursor / global position 分配和 projection checkpoint 的并发安全基础；真实跨进程 append、
+  terminal race、observer drain / recovery stress 必须在 P8 Attempt Lease / Recovery 阶段补齐，
+  并进入 P8 smoke 或测试验收信号。
+- `deferred-with-owner: P8`：owner lease / fencing / orphan attempt recovery。P6 可以落地
+  AttemptStateStore 最小状态与承载空间，但不能宣称具备生产级 owner 真源。P8 必须实现 owner token、
+  lease renew、late write fencing、stale cleanup、orphan recovery 与对应恢复测试。
+- `deferred-with-owner: P8`：attempt `terminal_event_position` 写入。P6 的
+  `_finish_attempt_if_durable` 只写入 attempt 终态，`terminal_event_position` 作为 P8 recovery /
+  fencing 的预留字段保持 `NULL`；P8 落地 attempt recovery 时必须从 durable EventLog 的
+  global position 真源补齐 terminal attempt 与 terminal event 的关联。
+- `deferred-with-owner: P15`：schema bootstrap 半失败治理。P6 可用 `CREATE ... IF NOT EXISTS`
+  与全新 schema 起库假设保证当前开发 / smoke 路径；若生产需要严格事务化 DDL、半初始化检测、
+  初始化锁或运维报警，统一在 P15 Governance Hardening 阶段评估并收口。
+- `deferred-with-owner: P15`：compact 成功但后续 EventLog append 失败时的诊断事件精度。
+  当前 `_append_compact_exception_failure` 会把 compact 分支异常统一收口为
+  `context_compact_failed(reason=INTERNAL_ERROR)` 与 Host-owned failed terminal；若真实根因是
+  compact 已成功但写入 `context_compact_completed` / `context_attempt_retrying` 失败，持久化诊断
+  可能把存储层 append failure 误读为 compact 内部错误。该场景通常意味着 durable write 已不可用，
+  后续 failure append 也大概率失败，不阻塞 P6；P15 hardening 需要评估是否引入更精确的
+  storage failure diagnostic / alert 语义。
+- `deferred-with-owner: P15`：observer 在无事件且 `last_success_position is None` 时
+  无法转 `CAUGHT_UP`。`ProjectionCoordinator._run_once_locked` 当前要求 `advance_success`
+  携带具体 position；首次 initialize 后若 EventLog 为空，observer 状态保持 `IDLE`，
+  对运维状态视图可能误读为“未启动”。不影响 projection 正确性。需要在 P15 Governance
+  Hardening 阶段为 `ProjectionStore` 增加无 position 的 `set_status` 入口，或引入哨兵
+  position 显式表达 "已追平且尚无事件"。
+- `deferred-with-owner: P7/P8`：`ObserverSink.process` 是否升级为 async 协议。P6 当前保留同步
+  observer 协议，并由 `MemoryProjectionObserver._run_async` 桥接 async `ConversationMemoryStore`
+  接口；这保证 P6 diff 边界小，但每个 terminal projection 会引入 thread + event loop 桥接开销。
+  P7 新增 tool trace observer / sink、P8 引入 lease / recovery 后，必须重新评估 observer 协议是否
+  改为 async，或为 memory projection 提供同步 sink 写入接口，避免长期保留 sync-async impedance
+  mismatch。
+- `deferred-with-owner: P9`：`startup_reconcile` 进入 Host 启动流程。P6 只提供
+  `DurableHarnessBundle.startup_reconcile()` 显式入口，用于在 terminal event 已持久化但 terminal 后
+  `drain()` 尚未执行就崩溃的场景中追平 read model。由于 `build_durable_harness()` 是同步装配函数，
+  P6 不能在构造时直接 `await`；P9 落地 Session / Run Lifecycle 与生产 Host bootstrap 时，必须把
+  startup reconcile 收进 Host 启动 / durable harness 装配流程，避免 UI / Service 业务调用方需要知道并
+  主动调用该恢复入口。
+- `accepted: P6 re-review passed`：post-commit hook 异常隔离。`docs/host/phase6-fix-rereview.md`
+  已确认 hook 是 best-effort in-memory `Condition.notify_all()` 唤醒，数据在 hook 执行前已 commit
+  到 SQLite；hook 失败只会错过即时唤醒，不影响 durable drain、replay 或后续读路径。P6 接受
+  `try/except + logger.error` 隔离。
+- `accepted: P6 re-review passed`：`_project_run_events` fallback。`docs/host/phase6-fix-rereview.md`
+  已确认 durable harness 注入 `ProjectionCoordinator` 后，terminal projection path 走
+  `coordinator.drain()` 并 return，不会执行 fallback；`_project_run_events` 仅服务非 durable
+  `InMemoryRunEventStore` 测试 / 过渡装配，P6 可接受。
+- `accepted: P6/P15 scope`：observer lag 近似。P6 可以只提供最小 lag / caught-up 观察信号，
+  不宣称生产级 projection lag SLA；P15 若需要 required projection、lag monitor 或 hard-gate，
+  必须重新定义严格指标与报警语义。
+- `deferred-with-owner: P16`：`InMemoryRunEventStore` 收口。P6 后它只作为 P1.5-P5 单元测试、
+  no-full-governance smoke 与非 durable 过渡装配使用，不再代表生产事实层。P16 interface freeze /
+  文档收口时必须决定：删除它、迁移到测试 helper / explicit local adapter，或用专项理由保留为
+  非生产 adapter；不得继续作为 Host 生产默认装配或 public interface 暗含依赖。
 
 P9 实施 `start_run` 幂等时，必须重新讨论并固定 `(session_id, client_request_id)` 如何幂等映射到
 同一个 `run_id`：包括 `run_id` 由 Host 生成还是由持久 Run 创建事实确定、重复请求返回同一
@@ -422,6 +501,8 @@ PR 创建后：
 每个 Phase 结束前，总控 Agent 必须确认：
 
 - Phase 目标已完成，非目标未被偷做。
+- P6 及以后每项新增治理能力都有对应 `utils/` 手工 smoke，且 smoke 输出足以观察新增治理能力的
+  执行路径，不刷屏、不泄露 scope token、不打印大块 prompt / delta / tool result。
 - 没有旧接口兼容 wrapper / facade / re-export。
 - 没有 Engine -> Host / Service / UI 反向依赖。
 - 没有 Host / Engine 内嵌业务知识。
@@ -444,18 +525,29 @@ P5.5 用户确认后，后续启动顺序必须遵守以下依赖：
   提供 durable facts 和最小 observer / sink 基础；P6 不一次性实现完整消息队列消费者治理。
 - P7 在 P6 observer / sink 基础上单独落地 tool trace projection / sink，并对齐 OLD tool trace schema。
 - P8 再落地 Attempt Lease / Recovery / fencing。P8 是多进程并发 Full-Governance Multi-Turn 的
-  必要基础，必须证明 owner token、lease renew、late write fencing、orphan / stale recovery 语义稳定。
+  必要基础，必须证明 owner token、lease renew、late write fencing、orphan / stale recovery 语义稳定；
+  同时承接 P6 残余风险中的真实多进程 stress，覆盖跨进程 append、terminal race、observer drain
+  与 recovery 路径。
 - P9 在 P6 durable facts 与 P8 attempt ownership 之上落地 Session / Run lifecycle governance。
   `client_request_id` 幂等与同 Session active Run admission 可以用数据库唯一约束 / 行锁建模，但
-  生产级 attempt ownership、recovery 与跨进程 cancel 基础收口必须建立在 P8 owner 真源之上。
+  生产级 attempt ownership、recovery 与跨进程 cancel 基础收口必须建立在 P8 owner 真源之上。P9 同时
+  必须把 P6 的 `startup_reconcile` 显式入口收进 Host 启动 / bootstrap 流程，使 durable read model
+  崩溃恢复成为 Host 内部治理能力，而不是 UI / Service 业务调用方的使用要求。
 - P10 落地完整通用 ToolRegistry governance，但不迁移 business fins / doc / web 工具。
+- P10.5 紧接 P10 迁移代表性 web tools 到 Host ToolRegistry，立即验证 P10 的真实工具注册、
+  permission / middleware / display metadata、ToolRuntime、tool trace 与 memory facts 链路；P10.5
+  不迁移 fins / doc 全量业务工具。
 - P11 落地 OutputContract / Validation Replay，不能把 validation replay 混入 P4 compact retry 或
   P15 audit hard-gate。
 - P12-P15 依次补齐 Reply Outbox、RemoteProxy / RemoteStub、Wait / Suspend / Resume、
-  Governance Hardening；P12 / P13 / P14 经用户确认保留，不从主计划删除。
+  Governance Hardening；P12 / P13 / P14 经用户确认保留，不从主计划删除。P15 同时承接 P6
+  残余风险中的 schema bootstrap 半失败治理评估，决定是否需要严格事务化 DDL、初始化锁、
+  半初始化检测或运维报警。
 - P16 才执行 Full-Governance Multi-Turn Smoke / 文档收口 / 接口冻结；P16 不新增治理能力，只验证
-  P6-P15 已落地能力的最终纵向闭环，并固定 Engine / Host 接口。P16 smoke 至少接入一个代表性
-  web tool 通过完整治理链路，不要求迁移 fins / doc 全量业务工具。
+  P6-P15 与 P10.5 已落地能力的最终纵向闭环，并固定 Engine / Host 接口。P16 smoke 复用 P10.5
+  迁移的代表性 web tool 通过完整治理链路，不要求迁移 fins / doc 全量业务工具。P16 同时收口
+  `InMemoryRunEventStore`：确认它被删除、移动到测试 helper / explicit local adapter，或以明确
+  非生产 adapter 身份保留，且不再是 Host 默认生产装配。
 
 P16 必须产出明确的 Engine / Host interface freeze 方案。该方案至少包括：
 
@@ -470,3 +562,23 @@ P16 必须产出明确的 Engine / Host interface freeze 方案。该方案至�
   不得把 Host ToolRuntime / ToolRegistry / memory / trace / governance 语义塞回 Engine。
 - 守护测试：package export 测试、protocol/import boundary 测试、事件契约 exhaustiveness 测试、
   public interface smoke 与 full-governance smoke 必须成为后续接口变更的回归门槛。
+
+## 12. P16 后 CI / Smoke Follow-up
+
+P16 完成 full-governance smoke 与 Engine / Host interface freeze 后，必须评估是否立即启动下一份
+migration plan，或追加 P17 建立 GitHub CI workflow。该事项不阻塞 P6-P16 主迁移，但不能遗忘。
+
+基础 CI 方向如下：
+
+- 必跑质量门：`pytest` 全量通过；`pyright` 全量通过。
+- 必跑离线 smoke：从 P5-P16 各 phase 的 `utils/` smoke 中抽取不依赖真实 provider、网络、外部密钥、
+  时间敏感资源或大模型非确定行为的 smoke，作为 CI 必跑 smoke 集合。
+- 可选集成 smoke：依赖真实 provider、真实 web tool、网络、GitHub / 外部服务或密钥的 smoke，不直接进入
+  PR 必跑门；可放入手动 workflow、nightly workflow 或带 secrets 的受控集成 workflow。
+- smoke 分层要求：每个 smoke 必须声明自己属于 `offline-deterministic`、`integration-with-secrets`、
+  `manual-observation` 中哪一类；CI 只能默认运行第一类。
+- 输出要求：CI smoke 不打印 delta、大工具结果、scope token、内部大 prompt 或真实密钥；失败输出必须足以定位
+  phase 能力边界。
+
+该 CI follow-up 的目标不是替代 code review，而是把 P16 后已冻结的契约、测试、类型检查和关键 smoke
+变成持续回归门槛。

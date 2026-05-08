@@ -508,7 +508,7 @@ class StartRunRequest:
     """启动 Run 的当前最小请求。
 
     当前暂不包含 ``client_request_id``，因此不提供创建幂等。完整创建幂
-    等与同 Session active Run 仲裁在 P7 落地。
+    等与同 Session active Run 仲裁在 P9 落地。
 
     :param session_id: 会话 id。
     :param run_id: Run id，由调用方在测试 harness 中显式提供。

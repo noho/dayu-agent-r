@@ -610,38 +610,69 @@ RunEvent 至少需要支持：
 - append-only；已发生事实不被覆盖。
 - visibility / audience，用于区分客户端可见事件、内部审计事件、trace 事件和恢复治理事件。
 
-### 9.0 当前 P1.5 最小实现路径
+### 9.0 P6 后 Durable EventLog 执行路径
 
-P1.5 已将最小 EventLog 语义接入当前 `run harness` 主链路。当前路径是：
+P1.5 已固定的 append-before-stream、per-run cursor、exclusive replay、canonical / preview、
+terminal guard 语义在 P6 后继续保留。P6 不另起事实来源，而是把 P1.5 的内存态 `RunEventStore`
+升级为 durable facts 层，并在 Host 内部增加 Run / Attempt 最小持久状态、internal global event position、
+projection checkpoint 与最小 observer / sink protocol。
+
+P6 后目标路径是：
 
 ```text
 start_run
-  -> LocalRunHarness._run_to_store
+  -> append Host-owned USER_INPUT_ACCEPTED
+      -> Host durable Unit of Work / transaction owner
+          -> allocate per-run RunEventCursor
+          -> allocate internal global event position
+          -> insert durable RunEvent row
+          -> update minimal Run / Attempt state
+          -> commit before stream visibility
+  -> RunStream.events / stream_run_events observes appended event
+  -> LocalRunHarness thin orchestration
   -> WorkerProxy.stream_engine_events
   -> EngineEvent
   -> translate_engine_event -> RunEventDraft
-  -> RunEventStore.append -> cursor-bearing RunEvent
+  -> DurableRunEventStore.append
+      -> Host durable Unit of Work / transaction owner
+          -> allocate per-run RunEventCursor
+          -> allocate internal global event position
+          -> insert durable RunEvent row
+          -> update minimal Run / Attempt state / terminal snapshot when needed
+          -> commit before stream visibility
   -> RunStream.events / stream_run_events
+  -> ProjectionCoordinator drains durable EventLog
+      -> observer checkpoint / retry / lag
+      -> memory / timeline / audit read models
 ```
 
-当前实现要点：
+P6 后实现要点：
 
 - `RunStream.events` 与 `stream_run_events(run_id, after=cursor)` 都是 `RunEventStore` 的订阅视图。
 - `RunEvent` 必须先 append 到 store，获得 Host 分配的 per-run cursor 后，才能被事件流观察到。
 - `RunEventCursor` 由 Host store 生成，不绑定 Engine sequence。
+- internal global event position 只服务 observer / projection checkpoint，不等同于 public
+  `RunEventCursor`，也不泄漏给普通调用方。
 - `RunEventDraft` 只表示待 append 的内部草稿；对外可消费的事实是已 append 的 `RunEvent`。
 - terminal `RunResult` 只从已 append 的 canonical terminal `RunEvent` 推导。
+- terminal event、minimal Run / Attempt state 与 terminal snapshot / reconcile 标记必须由同一个
+  Host durable Unit of Work 或等价事务 helper 保证一致；`LocalRunHarness` 不能按顺序组合多个
+  store commit 拼出一致性。
 - worker / proxy 异常导致 Host 无法获得 Engine terminal event 时，Host 追加 Host-owned canonical
   failure `RunEvent`；Host 自身翻译、append 或 terminal result 推导错误不能伪装成 worker / proxy failure。
+- observer 默认消费 durable EventLog，不消费进程内 `AsyncIterator[EngineEvent]`；projection 写入必须
+  幂等，checkpoint 只能在 sink 成功后前进。
+- `LocalRunHarness` 在 P6 后只做 run orchestration 与薄委托：durable schema、checkpoint、observer
+  dispatch、memory / timeline / audit rebuild 不应继续堆入 `_run_harness.py`。
 
-当前 `InMemoryRunEventStore` 是 `RunEventStore` 的单进程临时 adapter，只服务 P2-P5 smoke 与测试：
+`InMemoryRunEventStore` 在 P6 后只作为单元测试 / 小型 smoke adapter 保留：
 
 - 它固定 append-before-stream、per-run cursor、exclusive replay、canonical / preview、terminal fact 等
   最小 EventLog 语义。
 - 它不提供持久化 schema、多进程一致性、startup recovery、observer checkpoint、trace / audit /
   timeline / outbox projection。
-- P6 落地真实持久 EventLog 时，应复用同一 `RunEventStore` 语义并扩展生产能力，而不是废弃 P1.5
-  契约后另起事实来源。
+- 生产路径默认应使用 durable EventLog 实现；P6 后的 memory / timeline / audit 示例 projection
+  必须能从 durable EventLog replay / rebuild，不依赖进程内缓存。
 
 ### 9.1 Canonical Event 与 Preview Event
 
