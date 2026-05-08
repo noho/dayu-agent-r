@@ -270,9 +270,20 @@ P6 code / architecture / concurrency review 修复后，若仍存在不阻断 P6
 - `deferred-with-owner: P8`：owner lease / fencing / orphan attempt recovery。P6 可以落地
   AttemptStateStore 最小状态与承载空间，但不能宣称具备生产级 owner 真源。P8 必须实现 owner token、
   lease renew、late write fencing、stale cleanup、orphan recovery 与对应恢复测试。
+- `deferred-with-owner: P8`：attempt `terminal_event_position` 写入。P6 的
+  `_finish_attempt_if_durable` 只写入 attempt 终态，`terminal_event_position` 作为 P8 recovery /
+  fencing 的预留字段保持 `NULL`；P8 落地 attempt recovery 时必须从 durable EventLog 的
+  global position 真源补齐 terminal attempt 与 terminal event 的关联。
 - `deferred-with-owner: P15`：schema bootstrap 半失败治理。P6 可用 `CREATE ... IF NOT EXISTS`
   与全新 schema 起库假设保证当前开发 / smoke 路径；若生产需要严格事务化 DDL、半初始化检测、
   初始化锁或运维报警，统一在 P15 Governance Hardening 阶段评估并收口。
+- `deferred-with-owner: P15`：compact 成功但后续 EventLog append 失败时的诊断事件精度。
+  当前 `_append_compact_exception_failure` 会把 compact 分支异常统一收口为
+  `context_compact_failed(reason=INTERNAL_ERROR)` 与 Host-owned failed terminal；若真实根因是
+  compact 已成功但写入 `context_compact_completed` / `context_attempt_retrying` 失败，持久化诊断
+  可能把存储层 append failure 误读为 compact 内部错误。该场景通常意味着 durable write 已不可用，
+  后续 failure append 也大概率失败，不阻塞 P6；P15 hardening 需要评估是否引入更精确的
+  storage failure diagnostic / alert 语义。
 - `deferred-with-owner: P15`：observer 在无事件且 `last_success_position is None` 时
   无法转 `CAUGHT_UP`。`ProjectionCoordinator._run_once_locked` 当前要求 `advance_success`
   携带具体 position；首次 initialize 后若 EventLog 为空，observer 状态保持 `IDLE`，
