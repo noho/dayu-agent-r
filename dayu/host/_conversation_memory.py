@@ -19,6 +19,7 @@ from dayu.contracts.tool_outcome import (
     ToolFailedOutcome,
 )
 from dayu.engine import FinalAnswerData, ToolResultAcceptedData
+from dayu.engine.contracts.engine_events import RunFailedData
 from dayu.host._text import truncate_text
 from dayu.host.contracts import (
     HostRunFailedData,
@@ -601,6 +602,7 @@ def _project_raw_turn(events: tuple[RunEvent, ...]) -> ConversationRawTurn | Non
     user_event: RunEvent | None = None
     final_event: RunEvent | None = None
     host_failure_event: RunEvent | None = None
+    engine_failure_event: RunEvent | None = None
     for event in events:
         if (
             event.type is RunEventType.USER_INPUT_ACCEPTED
@@ -617,6 +619,11 @@ def _project_raw_turn(events: tuple[RunEvent, ...]) -> ConversationRawTurn | Non
             and isinstance(event.data, HostRunFailedData)
         ):
             host_failure_event = event
+        elif (
+            event.type is RunEventType.RUN_FAILED
+            and isinstance(event.data, RunFailedData)
+        ):
+            engine_failure_event = event
     if user_event is None or not isinstance(
         user_event.data, UserInputAcceptedData
     ):
@@ -644,6 +651,18 @@ def _project_raw_turn(events: tuple[RunEvent, ...]) -> ConversationRawTurn | Non
             ingestion_policy=MemoryIngestionPolicy.PRIMARY_SESSION_CANONICAL,
             trust_level=MemoryTrustLevel.HOST_OBSERVED,
         )
+    elif engine_failure_event is not None and isinstance(
+        engine_failure_event.data, RunFailedData
+    ):
+        terminal_summary = _summarize_engine_failure(engine_failure_event.data)
+        terminal_provenance = _provenance(
+            event=engine_failure_event,
+            producer_kind=MemoryProducerKind.HOST_PROJECTION,
+            ingestion_policy=MemoryIngestionPolicy.PRIMARY_SESSION_CANONICAL,
+            trust_level=MemoryTrustLevel.HOST_OBSERVED,
+        )
+    # 注意：cancelled / suspended 在 P6 不写 assistant terminal summary。
+    # memory 只保留用户输入；这些治理 / 协作语义留到 P9 / P14。
     return ConversationRawTurn(
         turn_id=user_event.data.turn_id,
         user_text=user_event.data.content,
@@ -674,6 +693,27 @@ def _summarize_host_failure(data: HostRunFailedData) -> str:
             f"run_failed: error_code={data.error_code}; "
             f"recoverable={data.recoverable}; "
             f"exception_type={data.exception_type}; message={data.message}"
+        ),
+        limit=_TERMINAL_TEXT_SUMMARY_LIMIT,
+    )
+
+
+def _summarize_engine_failure(data: RunFailedData) -> str:
+    """生成 Engine RUN_FAILED 的中性终态摘要。
+
+    summary 只包含可展示的失败类别 / 摘要，不含 stack、prompt、scope token、
+    cursor 原文或大工具结果。
+
+    :param data: Engine 派发的 run 失败事实。
+    :returns: 供下一轮追问连续性使用的中性摘要。
+    :raises Exception: 不主动抛出异常。
+    """
+
+    return truncate_text(
+        text=(
+            f"run_failed: error_code={data.error_code}; "
+            f"recoverable={data.recoverable}; "
+            f"message={data.message}"
         ),
         limit=_TERMINAL_TEXT_SUMMARY_LIMIT,
     )

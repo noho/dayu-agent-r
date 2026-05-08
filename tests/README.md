@@ -134,6 +134,26 @@ Host 当前 Run harness、RunEventStore、ToolRuntime、Conversation Memory / Ru
 - P3 boundary：覆盖 Host 包根不导出 internal memory store / builder / trace，Engine 不 import Host memory，
   `USER_INPUT_ACCEPTED` append 失败不启动 Engine，入口历史 transcript 形态 fail fast 且不污染 EventLog / memory，
   Host-owned failure terminal 会触发 memory projection，reasoning / display completed 不进入 RunInput replay。
+- P6 durable EventLog / projection（`tests/host/test_phase6_*.py`）：
+  - `host_storage_transaction`：post-commit hook 仅在 COMMIT 后触发，事务体异常时回滚不触发，
+    并发写者通过 `asyncio.Lock` 串行化。
+  - `durable_event_store`：per-run cursor 单调、跨 run global position 单调，terminal 之后
+    append fail-fast，subscribe 先 replay 已有事件再阻塞并在 terminal 后结束，按 global position
+    分页消费，engine 来源缺 `source_engine_event_id` 时拒绝，`latest_event_position` 跟踪最大值。
+  - `run_event_serializer`：常见 RunEventData round trip，`RUN_FAILED` 在 Engine `RunFailedData`
+    与 Host `HostRunFailedData` 之间靠 `exception_type` 区分，type↔data 不匹配 fail-fast，
+    `schema_version` 不匹配 fail-fast，`type_name` 与 `event_type` 不匹配 fail-fast。
+  - `run_state_store`：FINAL_ANSWER append 后 run state 自动转 SUCCEEDED 并记录 terminal cursor，
+    terminal `RunResult` JSON encode/decode round trip，attempt 创建 + 状态推进 + 终态字段写入。
+  - `projection_checkpoint`：observer drain 后 checkpoint 推进到最新 position，
+    `RetryableProjectionError` 标 RETRYABLE_FAILED 不前进 success position，普通异常进入
+    BLOCKED_FAILED 并记录错误码，`ProjectionStore.advance_success` 拒绝倒退，`lag_events`
+    等于 MAX(position) - last_success_position。
+  - `memory_rebuild`：required memory projection 满足 USER_INPUT_ACCEPTED 永不丢失、成功终态
+    写 assistant final、Engine `RUN_FAILED` 与 Host-owned `RUN_FAILED` 写中性 terminal summary、
+    cancelled / suspended 仅保留用户输入。
+  - `timeline_audit_projection`：timeline observer 仅累积 canonical 事件且按 cursor sequence
+    升序，audit observer 按 global position 升序累积元数据并对 preview kind 跳过。
 - public boundary：锁定 `dayu.host.__all__`，允许 Run 级 `start_run`、`stream_run_events`、`get_run_result`，
   以及 P2 Run 级 `get_tool_fetch_more_handle`、`fetch_more_tool_result`，阻止 `EngineWorker`、`LocalProxy`、
   `ToolExecutor`、`InMemoryToolRuntime`、`ToolRuntimeToolExecutor`、`InMemoryConversationMemoryStore`、
