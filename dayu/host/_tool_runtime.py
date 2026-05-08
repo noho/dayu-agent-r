@@ -12,6 +12,7 @@ import copy
 import hashlib
 import hmac
 import json
+import logging
 import secrets
 import time
 from collections.abc import Mapping
@@ -19,7 +20,12 @@ from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from typing import Protocol, TypeAlias, cast
 
-from dayu.contracts import JsonValue, ToolExecutor, ToolTruncateSpec
+from dayu.contracts import (
+    FRAMEWORK_FETCH_MORE_TOOL_NAME,
+    JsonValue,
+    ToolExecutor,
+    ToolTruncateSpec,
+)
 from dayu.contracts.tool_call import ToolExecutionRequest
 from dayu.contracts.tool_outcome import (
     ToolAwaitingOutcome,
@@ -61,13 +67,18 @@ from dayu.host.contracts import (
 )
 
 _DEFAULT_CURSOR_TTL_SECONDS: int = 300
+_LOGGER: logging.Logger = logging.getLogger(__name__)
 _ERROR_CURSOR_NOT_FOUND: str = "cursor_not_found"
 _ERROR_CURSOR_EXPIRED: str = "cursor_expired"
 _ERROR_CURSOR_SCOPE_MISMATCH: str = "cursor_scope_mismatch"
 _ERROR_RUN_TERMINAL: str = "run_terminal"
 _ERROR_TOOL_RUNTIME_FAILED: str = "tool_runtime_failed"
+_ERROR_INVALID_FETCH_MORE_ARGS: str = "invalid_fetch_more_args"
 _FINGERPRINT_LENGTH: int = 16
 _TOKEN_BYTES: int = 32
+_FETCH_MORE_CURSOR_ARG: str = "cursor"
+_FETCH_MORE_SCOPE_TOKEN_ARG: str = "scope_token"
+_FETCH_MORE_LIMIT_ARG: str = "limit"
 _LIMIT_BY_STRATEGY: Mapping[str, str] = {
     "text_chars": "max_chars",
     "text_lines": "max_lines",
@@ -214,16 +225,39 @@ class InMemoryToolRuntime:
         self,
         request: ToolExecutionRequest,
     ) -> ToolExecutionOutcome:
-        """执行底层工具并在成功结果上应用截断。
+        """执行工具调用并在成功结果上应用截断或 framework 补读。
 
         :param request: 工具执行请求。
         :returns: 截断后的工具执行 outcome。
         :raises Exception: 不主动抛出异常，ToolRuntime 自身异常转失败 outcome。
         """
 
+        is_framework_fetch_more = request.call.name == FRAMEWORK_FETCH_MORE_TOOL_NAME
+        _LOGGER.debug(
+            "host.tool_runtime.tool_call_start "
+            "session_id=%s run_id=%s tool_name=%s tool_call_id=%s "
+            "framework=%s",
+            request.context.session_id,
+            request.context.run_id,
+            request.call.name,
+            request.context.tool_call_id,
+            is_framework_fetch_more,
+        )
         try:
+            if is_framework_fetch_more:
+                return await self._execute_framework_fetch_more(request)
             outcome = await self.executor.execute(request)
             if not isinstance(outcome, ToolCompletedOutcome):
+                _LOGGER.debug(
+                    "host.tool_runtime.tool_call_finished "
+                    "session_id=%s run_id=%s tool_name=%s tool_call_id=%s "
+                    "framework=False outcome=%s truncated=False",
+                    request.context.session_id,
+                    request.context.run_id,
+                    request.call.name,
+                    request.context.tool_call_id,
+                    _tool_outcome_name(outcome),
+                )
                 return outcome
             spec = self.truncate_specs.get(request.call.name)
             truncated = self._apply_truncation(
@@ -232,6 +266,15 @@ class InMemoryToolRuntime:
                 spec=spec,
             )
             if truncated is None:
+                _LOGGER.debug(
+                    "host.tool_runtime.tool_call_finished "
+                    "session_id=%s run_id=%s tool_name=%s tool_call_id=%s "
+                    "framework=False outcome=completed truncated=False",
+                    request.context.session_id,
+                    request.context.run_id,
+                    request.call.name,
+                    request.context.tool_call_id,
+                )
                 return outcome
             cursor_creation = self._store_cursor(
                 request=request,
@@ -249,20 +292,53 @@ class InMemoryToolRuntime:
                 request=request,
                 data=cursor_creation.issued_event,
             )
-            return ToolCompletedOutcome(
+            completed = ToolCompletedOutcome(
                 result=ToolResultSuccess(
                     ok=True,
                     value=truncated.value,
                     truncation=ToolTruncationInfo(
-                        scope_token="",
+                        cursor=cursor_creation.record.cursor,
+                        scope_token=cursor_creation.record.scope_token,
                         scope_hash=cursor_creation.record.scope_hash,
                         has_more=True,
+                        limit=cursor_creation.record.limit,
                         ttl_seconds=cursor_creation.record.ttl_seconds,
                     ),
                     meta=outcome.result.meta,
                 )
             )
+            _LOGGER.debug(
+                "host.tool_runtime.tool_call_finished "
+                "session_id=%s run_id=%s tool_name=%s tool_call_id=%s "
+                "framework=False outcome=completed truncated=True "
+                "strategy=%s limit=%s unit=%s chunk_size=%s total=%s "
+                "cursor_fingerprint=%s field_path=%s ttl_seconds=%s",
+                request.context.session_id,
+                request.context.run_id,
+                request.call.name,
+                request.context.tool_call_id,
+                cursor_creation.record.strategy,
+                cursor_creation.record.limit,
+                cursor_creation.record.unit,
+                truncated.chunk_size,
+                truncated.total,
+                cursor_creation.record.cursor_fingerprint,
+                _format_field_path(truncated.field_path),
+                cursor_creation.record.ttl_seconds,
+            )
+            return completed
         except Exception as exc:
+            _LOGGER.debug(
+                "host.tool_runtime.tool_call_finished "
+                "session_id=%s run_id=%s tool_name=%s tool_call_id=%s "
+                "framework=%s outcome=failed error=%s",
+                request.context.session_id,
+                request.context.run_id,
+                request.call.name,
+                request.context.tool_call_id,
+                is_framework_fetch_more,
+                type(exc).__name__,
+            )
             return ToolFailedOutcome(
                 result=ToolResultFailure(
                     ok=False,
@@ -272,6 +348,146 @@ class InMemoryToolRuntime:
                     meta=None,
                 )
             )
+
+    async def _execute_framework_fetch_more(
+        self,
+        request: ToolExecutionRequest,
+    ) -> ToolExecutionOutcome:
+        """执行 framework ``fetch_more`` 工具调用。
+
+        该路径只消费模型按 LLM-facing hint 回传的普通 JSON 参数，不调用
+        底层业务 executor；RunEvent facts 仍归属原始业务工具 cursor。
+
+        :param request: Engine 发起的 framework 工具执行请求。
+        :returns: 配对当前 framework tool call 的工具 outcome。
+        :raises Exception: 不主动抛出异常，失败以 ``ToolFailedOutcome`` 返回。
+        """
+
+        parsed = self._parse_framework_fetch_more_request(request)
+        if isinstance(parsed, ToolFailedOutcome):
+            _LOGGER.debug(
+                "host.tool_runtime.tool_call_finished "
+                "session_id=%s run_id=%s tool_name=%s tool_call_id=%s "
+                "framework=True outcome=failed error=%s",
+                request.context.session_id,
+                request.context.run_id,
+                request.call.name,
+                request.context.tool_call_id,
+                parsed.result.error,
+            )
+            return parsed
+        fetch_result = await self.fetch_more(parsed)
+        if isinstance(fetch_result, ToolFetchMoreFailedResult):
+            failed = ToolFailedOutcome(
+                result=ToolResultFailure(
+                    ok=False,
+                    error=fetch_result.error_code,
+                    message=fetch_result.message,
+                    hint=None,
+                    meta=None,
+                )
+            )
+            _LOGGER.debug(
+                "host.tool_runtime.tool_call_finished "
+                "session_id=%s run_id=%s tool_name=%s tool_call_id=%s "
+                "framework=True outcome=failed owner_tool_call_id=%s "
+                "cursor_fingerprint=%s error=%s denied=%s event_cursor=%s",
+                request.context.session_id,
+                request.context.run_id,
+                request.call.name,
+                request.context.tool_call_id,
+                fetch_result.tool_call_id,
+                parsed.cursor.fingerprint,
+                fetch_result.error_code,
+                fetch_result.denied,
+                _format_event_cursor(fetch_result.event_cursor),
+            )
+            return failed
+        truncation: ToolTruncationInfo | None = None
+        if fetch_result.truncation is not None:
+            next_record = self._records_by_cursor.get(
+                fetch_result.truncation.value
+            )
+            if next_record is not None:
+                truncation = ToolTruncationInfo(
+                    cursor=next_record.cursor,
+                    scope_token=next_record.scope_token,
+                    scope_hash=next_record.scope_hash,
+                    has_more=True,
+                    limit=next_record.limit,
+                    ttl_seconds=next_record.ttl_seconds,
+                )
+        completed = ToolCompletedOutcome(
+            result=ToolResultSuccess(
+                ok=True,
+                value=fetch_result.value,
+                truncation=truncation,
+                meta=None,
+            )
+        )
+        _LOGGER.debug(
+            "host.tool_runtime.tool_call_finished "
+            "session_id=%s run_id=%s tool_name=%s tool_call_id=%s "
+            "framework=True outcome=completed owner_tool_call_id=%s "
+            "cursor_fingerprint=%s has_more=%s event_cursor=%s",
+            request.context.session_id,
+            request.context.run_id,
+            request.call.name,
+            request.context.tool_call_id,
+            fetch_result.tool_call_id,
+            parsed.cursor.fingerprint,
+            fetch_result.truncation is not None,
+            _format_event_cursor(fetch_result.event_cursor),
+        )
+        return completed
+
+    def _parse_framework_fetch_more_request(
+        self,
+        request: ToolExecutionRequest,
+    ) -> ToolFetchMoreRequest | ToolFailedOutcome:
+        """解析模型回传的 framework ``fetch_more`` 参数。
+
+        :param request: Engine 工具执行请求。
+        :returns: Host ToolRuntime 补读请求；参数非法时返回失败 outcome。
+        :raises Exception: 不主动抛出异常。
+        """
+
+        cursor_value = request.call.arguments.get(_FETCH_MORE_CURSOR_ARG)
+        scope_token = request.call.arguments.get(_FETCH_MORE_SCOPE_TOKEN_ARG)
+        limit = request.call.arguments.get(_FETCH_MORE_LIMIT_ARG)
+        if not isinstance(cursor_value, str) or not cursor_value:
+            return _framework_fetch_more_failed(
+                message="cursor is required",
+            )
+        if not isinstance(scope_token, str) or not scope_token:
+            return _framework_fetch_more_failed(
+                message="scope_token is required",
+            )
+        if limit is not None and (
+            not isinstance(limit, int) or isinstance(limit, bool) or limit <= 0
+        ):
+            return _framework_fetch_more_failed(
+                message="limit must be a positive integer",
+            )
+        record = self._records_by_cursor.get(cursor_value)
+        cursor_fingerprint = (
+            record.cursor_fingerprint
+            if record is not None
+            else _fingerprint_text(cursor_value)
+        )
+        return ToolFetchMoreRequest(
+            session_id=request.context.session_id,
+            run_id=request.context.run_id,
+            tool_call_id=(
+                record.tool_call_id if record is not None else request.context.tool_call_id
+            ),
+            cursor=ToolRuntimeCursor(
+                value=cursor_value,
+                fingerprint=cursor_fingerprint,
+            ),
+            scope_token=scope_token,
+            limit=limit if isinstance(limit, int) and not isinstance(limit, bool) else None,
+        )
 
     async def get_tool_fetch_more_handle(
         self,
@@ -365,7 +581,7 @@ class InMemoryToolRuntime:
                     error_code=_ERROR_CURSOR_NOT_FOUND,
                     message="cursor not found",
                     denied=False,
-                )
+            )
             terminal_cursor = await self._terminal_cursor(record.run_id)
             if terminal_cursor is not None:
                 return ToolFetchMoreFailedResult(
@@ -1109,6 +1325,68 @@ def _fetch_failure_without_event(
         message=message,
         denied=denied,
         event_cursor=None,
+    )
+
+
+def _format_event_cursor(cursor: RunEventCursor | None) -> int | None:
+    """返回日志用 RunEvent cursor 序号。
+
+    :param cursor: RunEvent cursor；``None`` 表示本次没有追加事件。
+    :returns: cursor 序号或 ``None``。
+    :raises Exception: 不主动抛出异常。
+    """
+
+    if cursor is None:
+        return None
+    return cursor.sequence
+
+
+def _format_field_path(field_path: tuple[str, ...] | None) -> str | None:
+    """返回日志用截断字段路径。
+
+    :param field_path: 截断目标字段路径。
+    :returns: 点号连接的字段路径；无路径返回 ``None``。
+    :raises Exception: 不主动抛出异常。
+    """
+
+    if field_path is None:
+        return None
+    return ".".join(field_path)
+
+
+def _tool_outcome_name(outcome: ToolExecutionOutcome) -> str:
+    """返回日志用工具执行 outcome 名称。
+
+    :param outcome: 工具执行 outcome。
+    :returns: ``completed``、``failed`` 或 ``awaiting``。
+    :raises Exception: 不主动抛出异常。
+    """
+
+    if isinstance(outcome, ToolCompletedOutcome):
+        return "completed"
+    if isinstance(outcome, ToolFailedOutcome):
+        return "failed"
+    if isinstance(outcome, ToolAwaitingOutcome):
+        return "awaiting"
+    return "unknown"
+
+
+def _framework_fetch_more_failed(*, message: str) -> ToolFailedOutcome:
+    """构造 framework ``fetch_more`` 参数错误 outcome。
+
+    :param message: 人类可读错误描述。
+    :returns: 工具失败 outcome。
+    :raises Exception: 不主动抛出异常。
+    """
+
+    return ToolFailedOutcome(
+        result=ToolResultFailure(
+            ok=False,
+            error=_ERROR_INVALID_FETCH_MORE_ARGS,
+            message=message,
+            hint=None,
+            meta=None,
+        )
     )
 
 

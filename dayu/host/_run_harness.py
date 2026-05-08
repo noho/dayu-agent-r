@@ -14,13 +14,14 @@ from collections.abc import AsyncIterator
 from dataclasses import dataclass, field, replace
 from datetime import datetime, timezone
 from functools import partial
-from typing import Protocol, runtime_checkable
+from typing import Protocol, TypeVar, runtime_checkable
 
 from dayu.contracts import ToolExecutor
 from dayu.contracts.tool_call import ToolExecutionRequest
 from dayu.contracts.tool_outcome import ToolExecutionOutcome, ToolFailedOutcome
 from dayu.contracts.tool_result import ToolResultFailure
 from dayu.engine import (
+    AgentMessage,
     AssistantMessage,
     ContextCompactionRequestedData,
     EngineEvent,
@@ -113,6 +114,7 @@ _UNEXPECTED_COMPACTION_TERMINAL_MESSAGE: str = (
     "engine produced terminal event after context compaction request"
 )
 _LOGGER: logging.Logger = logging.getLogger(__name__)
+_RunCacheValue = TypeVar("_RunCacheValue")
 
 
 @runtime_checkable
@@ -232,6 +234,12 @@ class LocalRunHarness:
         default_factory=OrderedDict,
         init=False,
     )
+    last_run_input_messages_by_run: OrderedDict[
+        str, tuple[AgentMessage, ...]
+    ] = field(
+        default_factory=OrderedDict,
+        init=False,
+    )
 
     def __post_init__(self) -> None:
         """校验 harness 内部 compact retry 与调试缓存配置。
@@ -280,6 +288,10 @@ class LocalRunHarness:
         self._remember_run_input_build_trace(
             run_id=request.run_id,
             trace=build_result.trace,
+        )
+        self._remember_run_input_messages(
+            run_id=request.run_id,
+            messages=build_result.run_input.messages,
         )
         engine_request = replace(request, input=build_result.run_input)
         task = asyncio.create_task(
@@ -842,12 +854,36 @@ class LocalRunHarness:
         :raises Exception: 不主动抛出异常。
         """
 
-        traces = self.last_run_input_build_trace_by_run
-        if run_id in traces:
-            del traces[run_id]
-        traces[run_id] = trace
-        while len(traces) > self.run_input_trace_cache_limit:
-            traces.popitem(last=False)
+        _remember_lru_run_cache_item(
+            cache=self.last_run_input_build_trace_by_run,
+            run_id=run_id,
+            value=trace,
+            limit=self.run_input_trace_cache_limit,
+        )
+
+    def _remember_run_input_messages(
+        self,
+        *,
+        run_id: str,
+        messages: tuple[AgentMessage, ...],
+    ) -> None:
+        """记录最近 RunInput 消息，用于 P5 内部 smoke 观察。
+
+        该缓存是 Host internal-only 诊断材料，不进入 public API，不作为
+        memory 真源；事实真源仍是 EventLog 与 memory projection。
+
+        :param run_id: Run id。
+        :param messages: 已交给 Engine 的 RunInput 消息。
+        :returns: 无返回值。
+        :raises Exception: 不主动抛出异常。
+        """
+
+        _remember_lru_run_cache_item(
+            cache=self.last_run_input_messages_by_run,
+            run_id=run_id,
+            value=messages,
+            limit=self.run_input_trace_cache_limit,
+        )
 
     def stream_run_events(
         self,
@@ -908,6 +944,30 @@ class LocalRunHarness:
         if self.tool_runtime is None:
             raise RuntimeError(_ERROR_TOOL_RUNTIME_NOT_CONFIGURED)
         return await self.tool_runtime.fetch_more(request)
+
+
+def _remember_lru_run_cache_item(
+    *,
+    cache: OrderedDict[str, _RunCacheValue],
+    run_id: str,
+    value: _RunCacheValue,
+    limit: int,
+) -> None:
+    """记录 Run 级调试缓存项，并按插入顺序淘汰最旧项。
+
+    :param cache: Run id 到缓存值的有序字典。
+    :param run_id: Run id。
+    :param value: 需要缓存的值。
+    :param limit: 最大缓存条数。
+    :returns: 无返回值。
+    :raises Exception: 不主动抛出异常。
+    """
+
+    if run_id in cache:
+        del cache[run_id]
+    cache[run_id] = value
+    while len(cache) > limit:
+        cache.popitem(last=False)
 
 
 async def _close_engine_events_if_supported(

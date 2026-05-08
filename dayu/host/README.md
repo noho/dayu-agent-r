@@ -5,8 +5,9 @@ Phase 流程、review 过程或 PR 流程。
 
 ## 当前状态
 
-`dayu.host` 当前落地 P4 最小 Run harness、内存态 RunEventStore、Host-owned ToolRuntime 截断 / 补读，
-Host 内部 Conversation Memory / RunInputBuilder，以及 context overflow compact retry：
+`dayu.host` 当前落地 P5 no-full-governance 纵向 smoke 所需的最小 Run harness、内存态 RunEventStore、
+Host-owned ToolRuntime 截断 / 补读、Host 内部 Conversation Memory / RunInputBuilder、context overflow
+compact retry，以及公共 tool declaration 契约：
 
 - 包根暴露 Run 级契约与 `await start_run(request)`、`stream_run_events(run_id, after=cursor)`、
   `await get_run_result(run_id)`、`await get_tool_fetch_more_handle(request)`、
@@ -32,14 +33,26 @@ Host 内部 Conversation Memory / RunInputBuilder，以及 context overflow comp
   terminal 后关闭 worker stream。
 - Host 内部 `InMemoryToolRuntime` 通过 `ToolRuntimeToolExecutor` 适配为 Engine 唯一可见的
   `ToolExecutor.execute`，Engine 不感知 cursor store、TTL、scope token 或补读实现。
+- P5 smoke/test 工具使用公共 `ToolDefinition` / `ToolBundle` 声明：工具现场通过
+  `@tool(..., truncate=ToolTruncateSpec(...))` 同源声明 LLM-facing `ToolSchema`、Host ToolRuntime
+  `ToolTruncateSpec`、executor binding 与 `ToolDisplayInfo` 展示 metadata。Engine / Runner request
+  只接收 `tuple[ToolSchema, ...]`，不会接收 definition / bundle、truncate spec、display metadata、
+  tags、callable 或 executor binding。
 - ToolRuntime 只按工具显式 `ToolTruncateSpec` 截断；无 spec、未启用、未知策略或非法 limit 不截断。
 - `binary_bytes` 截断与补读在 Host public `JsonValue` 结果中返回 base64 ASCII 字符串；`unit="bytes"` 与
   `value_summary` 表示原始字节大小，不使用 OLD LLM projection 的 `content_base64` 包装结构。
 - 截断与补读事实写入 canonical RunEvent：`tool_result_truncated`、`tool_cursor_issued`、
   `tool_fetch_more_requested`、`tool_fetch_more_completed`、`tool_fetch_more_failed`、
   `tool_cursor_expired`、`tool_cursor_denied`。
-- `scope_token` 不进入 RunEvent、Engine projection 或日志；调用方只能通过受控
+- LLM-facing 截断 tool result 会携带 `truncation.next_action="fetch_more"` 与
+  `truncation.fetch_more_args={cursor, scope_token, limit?}`；Host 在写入 RunEvent 前会移除 framework
+  `fetch_more` 调用参数中的 cursor 原文 / `scope_token`，并移除 accepted outcome 中仅供 LLM roundtrip 使用的
+  截断凭证。
+- `scope_token` 不进入 RunEvent、memory projection 或日志；Host public 调用方只能通过受控
   `get_tool_fetch_more_handle(...)` 按 session / run / 原始 tool_call / cursor fingerprint 换取短期 handle。
+- framework `fetch_more` 作为最小 LLM-facing schema 与业务工具 schema 一起传给 Engine / Runner；
+  `ToolRuntimeToolExecutor -> InMemoryToolRuntime.execute_tool_call` 会识别该工具名并路由到 Host ToolRuntime
+  补读，不调用业务 executor，也不把它提升为完整 ToolRegistry / governance。
 - 补读失败结果中的 `denied` 只表示权限 / scope 拒绝；cursor 不存在、cursor 过期和 terminal Run 都不是权限拒绝。
 - terminal Run 后 `fetch_more_tool_result(...)` 返回 typed failure，不追加新 RunEvent。
 - Host 内部 `InMemoryConversationMemoryStore` 只从 canonical RunEvent 投影 session memory；preview、
@@ -49,8 +62,8 @@ Host 内部 Conversation Memory / RunInputBuilder，以及 context overflow comp
 - `ConversationPinnedState` 包含 `current_goal`、`confirmed_subjects`、`user_constraints`、
   `open_questions` 四槽，并由 `DefaultRunInputBuilder` 全量注入；该 stable block 不参与历史 pool 预算竞争。
 - verified claims 与 assumptions 属于 stable ledger，同样全量注入且不参与历史 pool 预算竞争。
-- assistant final answer 只作为 raw turn / assistant conclusion 参与连续性，不会自动升级为 verified claim。
-- Host-owned worker / proxy failure 终态会以中性 terminal summary 进入 raw turn；该摘要不被当作
+- assistant final answer 只作为原始对话记录 / assistant conclusion 参与连续性，不会自动升级为 verified claim。
+- Host-owned worker / proxy failure 终态会以中性 terminal summary 进入原始对话记录；该摘要不被当作
   assistant final answer。
 - `DefaultRunInputBuilder` 注入顺序为 pinned state、stable frame、verified claims、assumptions、
   evidence anchors / tool facts、recent raw turns、older pool、episode summary 插入位、current user；
@@ -93,8 +106,8 @@ Host 内部 Conversation Memory / RunInputBuilder，以及 context overflow comp
 - Session governance 与同 Session active Run 仲裁。
 - 持久化 schema、workspace migration、启动恢复、多进程 lease / fencing。
 - timeline projection。
-- 完整 ToolRegistry、工具发现、display info、middleware、业务工具迁移。
-- LLM-facing `fetch_more` schema、`fetch_more_args` projection、远程 / 多进程补读。
+- 完整 ToolRegistry、工具发现、权限治理、middleware、业务工具迁移。
+- 远程 / 多进程补读。
 - public memory edit / reset / forget API、持久 memory projection、跨 session / project / user memory。
 - episode summary 生成与 LLM compaction scene。
 - 完整取消治理、RemoteProxy、RemoteStub、Reply Outbox。
@@ -158,6 +171,23 @@ await dayu.host.start_run
   -> RunStream.events / stream_run_events
 ```
 
+P5 sequential smoke 主路径：
+
+```text
+LocalRunHarness.start_run(run_index=1)
+  -> Engine Agent tool loop emits huge_echo tool call
+  -> ToolExecutor.execute
+  -> ToolRuntimeToolExecutor -> InMemoryToolRuntime -> huge_echo executor
+  -> truncate / cursor facts
+  -> Engine injects truncated tool result with fetch_more hint
+  -> model emits framework fetch_more tool call
+  -> ToolRuntime routes framework fetch_more and appends fetch_more facts
+  -> final terminal
+  -> memory projection
+LocalRunHarness.start_run(run_index=2 after terminal)
+  -> RunInputBuilder sees previous user / final / tool / fetch_more facts
+```
+
 context overflow compact retry 路径：
 
 ```text
@@ -184,7 +214,20 @@ Engine
   -> RunEventStore.append
 ```
 
-补读路径：
+framework 补读路径：
+
+```text
+Model
+  -> tool_call fetch_more(cursor, scope_token, limit?)
+  -> Engine Agent tool loop
+  -> ToolExecutor.execute
+  -> ToolRuntimeToolExecutor
+  -> InMemoryToolRuntime.execute_tool_call
+  -> InMemoryToolRuntime.fetch_more
+  -> RunEventStore.append(fetch_more facts for original business tool)
+```
+
+Host public 补读路径：
 
 ```text
 LocalRunHarness / default harness
@@ -216,7 +259,7 @@ Engine stream 无 terminal 属于 Engine / Worker 协议违约，Host 会记录 
 Host-owned failure 进入 terminal 后同样触发 memory projection，因此失败轮次的 `USER_INPUT_ACCEPTED`
 与中性 terminal summary 会进入 session memory。
 context overflow compact retry 不会再次追加 `USER_INPUT_ACCEPTED`，也不会把 compacted `RunInput`
-投影成新的 raw user turn；只有最终 terminal 后，本 Run 的 canonical 事件整体进入 memory projection。
+投影成新的原始用户记录；只有最终 terminal 后，本 Run 的 canonical 事件整体进入 memory projection。
 compact 分支的 trace 缺失与异常会以 Host-owned compact failed terminal 收口，避免订阅方永久等待；
 其它翻译、append、terminal result 推导等 Host 内部错误不会伪装成 Host-owned failure；后台 task 会记录
 ERROR 日志并取回异常，完整 supervisor / governance 仍不在 P1.5 范围内。
@@ -247,6 +290,28 @@ overflow 覆盖，日志只输出事件类型、cursor、attempt 数量、compac
 ```bash
 python utils/smoke_host_context_compaction.py --case fake-overflow --log-level DEBUG
 python utils/smoke_host_context_compaction.py --case internal-echo-filter --log-level DEBUG
+```
+
+当前提供 Host P5 no-full-governance 多轮 smoke 脚本。`--case real-provider` 与 `--case all`
+按 `utils/` 下 provider smoke 的既有范式，在脚本内写死 `mimo-v2.5-pro-plan`
+`ProviderCase`，不读取 `dayu/config/llm_models.json` 或 `workspace/config`，也不充当配置
+adapter；`MimoThinkingExtension(enabled=True)` 是该 hardcoded ProviderCase 的有意组成部分。缺
+`MIMO_PLAN_API_KEY`、endpoint、model 或 tool calling capability 时清晰失败并返回
+非零。真实 provider 主路径会向模型暴露 `huge_echo` 与 framework `fetch_more` schema，模型必须先调用
+`huge_echo`，再根据截断 tool result 中的 hint 调用 `fetch_more`；脚本不会用 Host public API 代替模型成功补读。
+fake provider / scripted WorkerProxy 只用于 integration 与 compact retry 辅助诊断，不能替代
+真实 provider smoke 成功。默认不回显 provider thinking / reasoning；需要观察真实 provider 返回的
+reasoning 诊断时，显式传 `--thinking`。该开关对齐 OLD `prompt --thinking` 的终端回显语义，
+只读取 real-provider 路径中 provider 返回的 reasoning 字段，在消费 Host `RunEvent` 流时即时输出
+provider reasoning delta；当前轮没有 delta 时才回退聚合 reasoning。`--thinking` 下的 thinking delta 与
+final answer 使用前后空行分隔的观察块，不使用 `SMOKE ...` 单行日志格式；final answer 只显示前 320 个字符；
+不读取 content preview、工具结果、RunInput 或 prompt：
+
+```bash
+python utils/smoke_host_multiturn_no_governance.py --case all --log-level INFO
+python utils/smoke_host_multiturn_no_governance.py --case real-provider --log-level DEBUG
+python utils/smoke_host_multiturn_no_governance.py --case real-provider --log-level DEBUG --thinking
+python utils/smoke_host_multiturn_no_governance.py --case compact-retry --log-level DEBUG
 ```
 
 当前也保留 EngineWorker 手工 smoke 脚本：

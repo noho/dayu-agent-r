@@ -14,6 +14,10 @@ Dayu 配置分两层：
 `dayu/config/*`。因此日常运行不应直接修改包内默认配置，项目级模型、
 超时、API key 占位符和运行参数应放在 `workspace/config/`。
 
+当前 `dayu.config` 不提供公共 Python loader，也不提供
+`llm_models.json -> RunnerSpec` 的统一模型配置 adapter。模型字段、
+`provider_request` 等业务 schema 由各调用入口在自身边界内解释。
+
 ## 当前文件
 
 ```text
@@ -53,8 +57,10 @@ OpenAI-compatible runner 形态。
 | `runtime_hints.temperature_profiles` | 不同 scene / 任务类别的温度建议 |
 
 禁止在默认配置中使用开放 `extra_payloads` 弱类型配置袋。Provider 私有参数
-必须放入 `provider_request`，由配置 adapter 转换为
-`RunnerSpec.provider_request` 的强类型扩展。
+必须放入 `provider_request`，其配置 schema 与 Engine contract 对齐。
+当前 `dayu.config` 不负责构造 `RunnerSpec.provider_request`；具体解析由消费方
+在自身边界内完成。`utils/` 下的人工 smoke 脚本遵循脚本内固定
+`ProviderCase` 的范式，不作为配置 adapter。
 
 ### provider_request
 

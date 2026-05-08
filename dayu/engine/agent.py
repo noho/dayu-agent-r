@@ -35,6 +35,7 @@ from dayu.contracts.tool_outcome import (
     ToolFailedOutcome,
 )
 from dayu.contracts.tool_result import (
+    ToolTruncationInfo,
     ToolResultFailure,
     ToolResultSuccess,
 )
@@ -164,6 +165,7 @@ _SENSITIVE_EXCEPTION_MARKERS: tuple[str, ...] = (
 _PlainJsonValue: TypeAlias = (
     None | bool | int | float | str | list["_PlainJsonValue"] | dict[str, "_PlainJsonValue"]
 )
+_TRUNCATION_NEXT_ACTION_FETCH_MORE: str = "fetch_more"
 
 
 def _utc_now() -> datetime:
@@ -260,6 +262,37 @@ def _project_tool_success_for_llm(
         }
     else:
         projected = {"content": _plain_json_value(value)}
+    if result.truncation is not None:
+        projected["truncation"] = _project_truncation_for_llm(
+            result.truncation
+        )
+    return projected
+
+
+def _project_truncation_for_llm(
+    truncation: ToolTruncationInfo,
+) -> dict[str, _PlainJsonValue]:
+    """将截断信息投影为 LLM 可执行的补读 hint。
+
+    :param truncation: 工具截断信息。
+    :returns: ``ToolMessage.content`` 中的 ``truncation`` JSON object。
+    :raises Exception: 不主动抛出异常。
+    """
+
+    projected: dict[str, _PlainJsonValue] = {
+        "has_more": truncation.has_more,
+    }
+    if truncation.has_more:
+        fetch_more_args: dict[str, _PlainJsonValue] = {
+            "cursor": truncation.cursor,
+            "scope_token": truncation.scope_token,
+        }
+        if truncation.limit is not None:
+            fetch_more_args["limit"] = truncation.limit
+        projected["next_action"] = _TRUNCATION_NEXT_ACTION_FETCH_MORE
+        projected["fetch_more_args"] = fetch_more_args
+    if truncation.ttl_seconds is not None:
+        projected["ttl_seconds"] = truncation.ttl_seconds
     return projected
 
 

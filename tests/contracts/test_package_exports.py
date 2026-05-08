@@ -12,20 +12,25 @@ import dayu.contracts as contracts
 EXPECTED_EXPORTS: frozenset[str] = frozenset(
     {
         "CancellationToken",
+        "FRAMEWORK_FETCH_MORE_TOOL_NAME",
         "GeminiToolCallState",
         "JsonValue",
         "ToolAwaitKind",
         "ToolAwaitSnapshot",
         "ToolAwaitSpec",
         "ToolAwaitingOutcome",
+        "ToolBundle",
         "ToolCallProviderState",
         "ToolCallRequest",
         "ToolCompletedOutcome",
+        "ToolDefinition",
+        "ToolDisplayInfo",
         "ToolExecutionContext",
         "ToolExecutionOutcome",
         "ToolExecutionRequest",
         "ToolExecutor",
         "ToolFailedOutcome",
+        "ToolFunctionCallable",
         "ToolFunctionSchema",
         "ToolParametersSchema",
         "ToolResultEnvelope",
@@ -36,6 +41,9 @@ EXPECTED_EXPORTS: frozenset[str] = frozenset(
         "ToolTruncateSpec",
         "ToolTruncationInfo",
         "ToolTruncationStrategy",
+        "FunctionToolExecutor",
+        "framework_fetch_more_tool_schema",
+        "tool",
     }
 )
 

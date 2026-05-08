@@ -38,6 +38,8 @@ pytest tests/host/test_phase3_conversation_memory_projection.py -q
 pytest tests/host/test_phase3_run_input_builder.py -q
 pytest tests/host/test_phase3_multiturn_smoke.py -q
 pytest tests/host/test_phase3_boundary.py -q
+pytest tests/contracts/test_tool_declaration.py -q
+pytest tests/host/test_phase5_multiturn_no_governance_smoke.py -q
 pytest tests/engine/contracts -q
 pytest tests/engine/runners/openai/test_event_flow_ordering.py -q
 ```
@@ -52,6 +54,10 @@ pytest tests/engine/runners/openai/test_event_flow_ordering.py -q
 - import boundary：阻止公共契约层反向依赖 Engine、Host、Service、UI、fins 或运行期 HTTP 客户端。
 - weak typing guard：通过 AST 扫描阻止 `Any`、`object`、无类型签名与裸容器注解进入公共契约源码。
 - ToolExecutionOutcome / ToolResult / ToolCall 等契约测试：覆盖工具调用 provider state、工具结果信封、工具执行 outcome 封闭联合与穷尽匹配。
+- tool declaration：覆盖 P5 最小 `@tool(..., truncate=ToolTruncateSpec(...))` 声明能力，确认
+  `ToolDefinition` / `ToolBundle` 只投影 `ToolSchema` 给 Engine，`ToolTruncateSpec`、`ToolDisplayInfo`
+  展示 metadata、tags 与 executor binding 不进入 LLM-facing schema，并拒绝工具名与 schema 名错位或
+  bundle 内重复工具名。
 
 ### `tests/engine/`
 
@@ -66,8 +72,8 @@ Engine 契约、包根导出、事件契约与架构边界测试，覆盖 `dayu.
 
 ### `tests/host/`
 
-Host P3 最小 Run harness、RunEventStore、ToolRuntime 与 Conversation Memory / RunInputBuilder 测试，
-覆盖 `dayu.host` 当前已落地的边界：
+Host 当前 Run harness、RunEventStore、ToolRuntime、Conversation Memory / RunInputBuilder、P4 context compact
+与 P5 no-full-governance integration guard 测试，覆盖 `dayu.host` 当前已落地的边界：
 
 - run harness：验证 public `start_run` 可经 Host 调用 Engine 函数式入口，并把 `EngineEvent` 翻译为已 append 的 `RunEvent`。
 - event store：验证 append-only、per-run cursor、exclusive replay、replay-then-follow 订阅和 terminal 后订阅结束。
@@ -82,8 +88,8 @@ Host P3 最小 Run harness、RunEventStore、ToolRuntime 与 Conversation Memory
   均通过 canonical RunEvent 表达，handle 阶段 denied / expired 写入可信 owner run，terminal 后不追加事实，
   非权限失败不标记 denied，且 EventLog 不保存明文 scope token 或完整大结果。
 - ToolRuntime boundary：覆盖 Host 包根只导出 Run 级补读入口与契约类型，Engine 不 import Host / ToolRuntime，
-  scope token 只能通过受控 handle 交付，跨 run 补读不污染请求伪造的 run，当前 Engine projection 不恢复
-  OLD LLM-facing `fetch_more_args`。
+  Host public scope token 只能通过受控 handle 交付，跨 run 补读不污染请求伪造的 run，Engine LLM-facing
+  projection 会为截断结果生成 `fetch_more_args`。
 - Conversation Memory projection：覆盖 `USER_INPUT_ACCEPTED`、canonical final answer、ToolRuntime / Engine tool fact
   从 EventLog 投影，preview / reasoning / delta 不进入 memory，assistant final answer 不自动成为 verified claim，
   memory item 携带 provenance / trust / scope 元数据，`USER_INPUT_ACCEPTED` scope 使用封闭枚举并非法 fail fast，
@@ -92,7 +98,7 @@ Host P3 最小 Run harness、RunEventStore、ToolRuntime 与 Conversation Memory
   tool facts 独立 section、source event cursor 输出、recent raw turns 单 section header、pinned state 预算外全量注入、
   older pool 新到旧消费预算后按时间顺序渲染、internal-only `RunInputBuildTrace`、预算裁剪原因、
   超大旧轮语义降级与 current user 末尾注入。
-- multiturn smoke：覆盖单进程顺序第二轮通过真实 `LocalRunHarness -> RunInputBuilder` 路径看到第一轮
+- multiturn smoke：覆盖单进程顺序第二个 Run 通过真实 `LocalRunHarness -> RunInputBuilder` 路径看到 previous run
   canonical final answer 与 tool summary。
 - P4 context compaction：覆盖 Host 内部 token estimator、deterministic compact 保留当前用户问题 /
   pinned state / evidence anchors / source cursor / tool facts、compact block 多 item section 单 header、
@@ -102,6 +108,18 @@ Host P3 最小 Run harness、RunEventStore、ToolRuntime 与 Conversation Memory
   同一 Run overflow 前已 append 的工具事实进入 compacted attempt、trace 缓存缺失失败收口、caller system
   prompt 顺序、非法入口消息拒绝、final answer 内部字段回显过滤，以及 Host public API 不导出 compact
   coordinator。
+- P5 no-full-governance smoke：覆盖公共 `huge_echo` 工具通过 `ToolDefinition` / `ToolBundle` 声明、
+  fake provider 只模拟 LLM tool call output、真实 Engine Agent tool loop 调用 `ToolExecutor.execute`、
+  `ToolRuntimeToolExecutor -> InMemoryToolRuntime -> huge_echo executor` 产生 truncate / cursor facts、
+  截断 ToolMessage 包含 LLM-readable `truncation.next_action="fetch_more"` 与 `fetch_more_args`、模型在同一 run
+  内通过 Engine tool loop 发起 framework `fetch_more`、Host ToolRuntime 路由 framework 补读并在 terminal 前追加
+  fetch_more facts、terminal 后 Host public `fetch_more_tool_result` typed failure 不追加 EventLog、
+  后续 Run 的 RunInputBuilder 看到 previous run user / final / tool / fetch_more facts 与 source cursor、
+  compact retry 不重复 `USER_INPUT_ACCEPTED`，真实 provider smoke 按 `utils/` smoke 既有范式写死
+  `mimo-v2.5-pro-plan` `ProviderCase` 且不读取配置层级，并显式锁定
+  `MimoThinkingExtension(enabled=True)` 属于 hardcoded ProviderCase，`--thinking` 只在 real-provider 路径回显
+  provider reasoning delta、无 delta 时回退聚合 reasoning、final answer 前缀，覆盖 reasoning delta 在 final
+  event 到达前随 RunEvent 流即时输出，以及 preview / reasoning 不进入下一轮运行态输入。
 - P3 boundary：覆盖 Host 包根不导出 internal memory store / builder / trace，Engine 不 import Host memory，
   `USER_INPUT_ACCEPTED` append 失败不启动 Engine，入口历史 transcript 形态 fail fast 且不污染 EventLog / memory，
   Host-owned failure terminal 会触发 memory projection，reasoning / display completed 不进入 RunInput replay。

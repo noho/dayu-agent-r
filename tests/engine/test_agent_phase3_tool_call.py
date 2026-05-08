@@ -586,9 +586,11 @@ def test_llm_projection_shapes() -> None:
                 ok=True,
                 value={},
                 truncation=ToolTruncationInfo(
+                    cursor="cursor-value",
                     scope_token="secret_token",
                     scope_hash="secret_hash",
                     has_more=True,
+                    limit=30,
                     ttl_seconds=60,
                 ),
                 meta=None,
@@ -604,10 +606,19 @@ def test_llm_projection_shapes() -> None:
     }
     assert json.loads(failure_with_hint)["hint"] == "retry"
     truncated_payload = json.loads(truncated)
-    assert "truncation" not in truncated_payload
-    assert "secret_token" not in truncated
+    assert truncated_payload["truncation"] == {
+        "fetch_more_args": {
+            "cursor": "cursor-value",
+            "limit": 30,
+            "scope_token": "secret_token",
+        },
+        "has_more": True,
+        "next_action": "fetch_more",
+        "ttl_seconds": 60,
+    }
+    assert "secret_token" in truncated
     assert "secret_hash" not in truncated
-    assert "has_more" not in truncated
+    assert "has_more" in truncated
     assert "ok" not in success_object
     assert failure_without_hint
 

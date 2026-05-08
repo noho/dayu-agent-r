@@ -310,8 +310,8 @@ async def test_cross_run_fetch_more_does_not_pollute_claimed_run() -> None:
     ]
 
 
-def test_engine_tool_projection_still_omits_truncation_token() -> None:
-    """Engine LLM projection 不恢复 OLD fetch_more 半协议。"""
+def test_engine_tool_projection_includes_llm_fetch_more_hint() -> None:
+    """Engine LLM projection 只在 tool message 中携带补读凭证。"""
 
     from dayu.engine.agent import _project_tool_outcome_for_llm
 
@@ -321,9 +321,11 @@ def test_engine_tool_projection_still_omits_truncation_token() -> None:
                 ok=True,
                 value={"preview": "abc"},
                 truncation=ToolTruncationInfo(
+                    cursor="cursor-value",
                     scope_token="secret-token",
                     scope_hash="secret-hash",
                     has_more=True,
+                    limit=None,
                     ttl_seconds=30,
                 ),
                 meta=None,
@@ -331,8 +333,19 @@ def test_engine_tool_projection_still_omits_truncation_token() -> None:
         )
     )
     payload = json.loads(projected)
-    assert payload == {"preview": "abc"}
-    assert "fetch_more_args" not in projected
-    assert "scope_token" not in projected
-    assert "secret-token" not in projected
+    assert payload == {
+        "preview": "abc",
+        "truncation": {
+            "fetch_more_args": {
+                "cursor": "cursor-value",
+                "scope_token": "secret-token",
+            },
+            "has_more": True,
+            "next_action": "fetch_more",
+            "ttl_seconds": 30,
+        },
+    }
+    assert "fetch_more_args" in projected
+    assert "scope_token" in projected
+    assert "secret-token" in projected
     assert "secret-hash" not in projected
