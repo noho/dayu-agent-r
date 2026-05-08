@@ -960,10 +960,15 @@ class _AsyncAgent:
                 )
                 if engine_event is not None:
                     yield engine_event
-            self._log_runner_call_completed(
+            runner_call_completed_failure = self._log_runner_call_completed(
                 iteration_id=iteration_id,
                 iteration_index=iteration_index,
             )
+            if runner_call_completed_failure is not None:
+                yield await self._make_failed_or_cancelled_terminal_with_close(
+                    runner_call_completed_failure
+                )
+                return
         except asyncio.CancelledError:
             raise
         except Exception as exc:
@@ -974,7 +979,27 @@ class _AsyncAgent:
                 type(exc).__name__,
                 exc_info=True,
             )
-            self._last_iteration_state.failure_candidate = RunFailedData(
+            state = self._last_iteration_state
+            if state is None:
+                _LOGGER.critical(
+                    "engine.agent.missing_iteration_state session_id=%s "
+                    "run_id=%s iteration_id=%s iteration_index=%s "
+                    "runner_exception=true exc_type=%s",
+                    self._request.session_id,
+                    self._request.run_id,
+                    iteration_id,
+                    iteration_index,
+                    type(exc).__name__,
+                )
+                yield await self._make_failed_or_cancelled_terminal_with_close(
+                    RunFailedData(
+                        error_code=_ERROR_MISSING_TERMINAL,
+                        message=_MISSING_TERMINAL_MESSAGE,
+                        recoverable=False,
+                    )
+                )
+                return
+            state.failure_candidate = RunFailedData(
                 error_code=_ERROR_RUNNER_EXCEPTION,
                 message=_exception_diagnostic_message(exc),
                 recoverable=False,
@@ -1936,18 +1961,31 @@ class _AsyncAgent:
         *,
         iteration_id: str,
         iteration_index: int,
-    ) -> None:
+    ) -> RunFailedData | None:
         """记录 Runner 调用完成边界。
 
         :param iteration_id: 当前迭代 id。
         :param iteration_index: 当前迭代序号。
-        :returns: 无返回值。
-        :raises RuntimeError: 迭代状态尚未初始化时抛出。
+        :returns: 状态缺失时返回受控失败 data，否则返回 ``None``。
+        :raises Exception: 不主动抛出异常。
         """
 
         state = self._last_iteration_state
         if state is None:
-            raise RuntimeError("iteration state is not initialized")
+            _LOGGER.critical(
+                "engine.agent.missing_iteration_state session_id=%s "
+                "run_id=%s iteration_id=%s iteration_index=%s "
+                "runner_call_completed=true",
+                self._request.session_id,
+                self._request.run_id,
+                iteration_id,
+                iteration_index,
+            )
+            return RunFailedData(
+                error_code=_ERROR_MISSING_TERMINAL,
+                message=_MISSING_TERMINAL_MESSAGE,
+                recoverable=False,
+            )
         finish_reason = (
             state.finish_reason.value
             if state.finish_reason is not None
@@ -1969,6 +2007,7 @@ class _AsyncAgent:
             _tool_call_count(state.tool_calls),
             state.failure_candidate is not None,
         )
+        return None
 
 
 async def run_agent_messages(

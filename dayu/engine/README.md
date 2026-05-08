@@ -135,7 +135,10 @@ ToolExecutor 由 EngineWorker 替 Host 在选定执行环境中代持，并通�
 - 成功且 value 是 JSON object 时展开 value，不包内部 `ok/value` 信封。
 - 成功且 value 不是 JSON object 时包成 `{"content": ...}`。
 - 失败时投影 `error` / `message`，仅在 hint 非空时投影 `hint`。
-- 当前 `ToolTruncationInfo` 只承载内部截断治理事实，不含 LLM 可执行续读动作；Phase 3 不把 `has_more`、scope token 或 scope hash 投影给 LLM。
+- 截断成功结果会投影 `truncation.has_more`；当 `has_more=True` 时投影
+  `truncation.next_action="fetch_more"` 与 `truncation.fetch_more_args={cursor, scope_token, limit?}`，
+  让模型可在下一轮发起 framework `fetch_more`。`scope_hash` 不投影给 LLM；当 `has_more=False` 时不投影
+  `next_action`、`fetch_more_args` 或 `ttl_seconds`。
 
 当最后一轮普通工具调用执行完后，默认 `AgentFallbackMode.FORCE_ANSWER` 会追加 `AgentPolicy.fallback_prompt` 作为 `UserMessage`，以 `tools=()` 再调用 Runner，并产出 `final_answer(degraded=True)`。`AgentFallbackMode.RAISE_ERROR` 才直接 `run_failed("max_iterations_exceeded")`。连续全失败工具批次达到 `AgentPolicy.max_consecutive_failed_tool_batches` 时使用同一 fallback mode 收口。
 

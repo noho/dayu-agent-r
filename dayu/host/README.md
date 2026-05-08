@@ -72,6 +72,8 @@ compact retry，以及公共 tool declaration 契约：
 - `RunInputBuildTrace` 是 Host internal-only 诊断对象，记录 included / excluded item、裁剪原因、来源
   cursor 与估算大小；`LocalRunHarness` 仅保留最近一小段 trace 缓存，避免调试数据无界增长。trace 不进入
   `RunInput`，不进入 memory pool，也不作为下一轮事实真源。
+- `LocalRunHarness` 另有更小的 RunInput 消息诊断缓存，仅用于内部 smoke 观察最近 run 的实际输入；它与
+  trace 缓存独立裁剪，不进入 public API、memory pool 或事实真源。
 - RunInputBuilder 与 context compact 使用同一个 Host 内部 token estimator：半角 / 窄字符按 1 unit，
   全角 / 宽字符按 2 unit，再按 2 units/token 转为 estimated tokens。该估算只用于 Host
   before / after 相对比较，不是 provider tokenizer 真源。

@@ -90,7 +90,7 @@ Host 当前 Run harness、RunEventStore、ToolRuntime、Conversation Memory / Ru
   raw cursor 或 `scope_token`；验证 EventStore 在 DEBUG 下不刷 preview append、subscribe wait / batch。
 - run harness eventlog：验证 `USER_INPUT_ACCEPTED` append-before-engine / append-before-stream、preview 不污染
   terminal result、结果只从已 append terminal event 推导，worker / proxy 异常和 Engine stream 无终态正常结束
-  会落 Host-owned canonical failure 事件，并验证 RunInput trace 调试缓存按容量淘汰。
+  会落 Host-owned canonical failure 事件，并验证 RunInput trace 调试缓存与更小的消息诊断缓存分别按容量淘汰。
 - tool-call smoke：通过内部 `LocalRunHarness` 注入 fake ToolExecutor，覆盖 Runner tool call -> Engine 工具闭环 -> Host RunEvent stream。
 - ToolRuntime truncation：覆盖 text chars、text lines、list items、binary bytes、no-spec no-truncate、
   explicit target only、field_path 优先级、路径不匹配不截断、execute-time cursor facts、非成功 outcome 不创建

@@ -101,6 +101,9 @@ _ERROR_CURRENT_USER_INPUT_SHAPE_UNSUPPORTED_HISTORY: str = (
 _ERROR_RUN_INPUT_TRACE_CACHE_LIMIT_INVALID: str = (
     "run_input_trace_cache_limit_must_be_positive"
 )
+_ERROR_RUN_INPUT_MESSAGE_CACHE_LIMIT_INVALID: str = (
+    "run_input_message_cache_limit_must_be_positive"
+)
 _ERROR_CONTEXT_COMPACT_RETRY_LIMIT_INVALID: str = (
     "context_compact_retry_limit_must_be_non_negative"
 )
@@ -108,6 +111,7 @@ _ERROR_ENGINE_STREAM_ENDED_WITHOUT_TERMINAL: str = (
     "engine_stream_ended_without_terminal"
 )
 _RUN_INPUT_TRACE_CACHE_LIMIT: int = 32
+_RUN_INPUT_MESSAGE_CACHE_LIMIT: int = 3
 _CONTEXT_COMPACT_RETRY_LIMIT: int = 1
 _ERROR_CONTEXT_COMPACTION_REQUIRED: str = "context_compaction_required"
 _COMPACT_TRACE_MISSING_MESSAGE: str = "run input build trace is missing"
@@ -213,6 +217,7 @@ class LocalRunHarness:
     :param compact_coordinator: Host 内部 context compact coordinator。
     :param context_compact_retry_limit: context overflow compact retry 上限。
     :param run_input_trace_cache_limit: RunInput 构造 trace 保留上限。
+    :param run_input_message_cache_limit: RunInput 消息诊断缓存保留上限。
     """
 
     proxy: WorkerProxy
@@ -229,6 +234,7 @@ class LocalRunHarness:
     )
     context_compact_retry_limit: int = _CONTEXT_COMPACT_RETRY_LIMIT
     run_input_trace_cache_limit: int = _RUN_INPUT_TRACE_CACHE_LIMIT
+    run_input_message_cache_limit: int = _RUN_INPUT_MESSAGE_CACHE_LIMIT
     last_run_input_build_trace_by_run: OrderedDict[
         str, RunInputBuildTrace
     ] = field(
@@ -246,7 +252,7 @@ class LocalRunHarness:
         """校验 harness 内部 compact retry 与调试缓存配置。
 
         :returns: 无返回值。
-        :raises ValueError: compact retry 上限为负数，或 trace 缓存容量
+        :raises ValueError: compact retry 上限为负数，或调试缓存容量
             不是正数时抛出。
         """
 
@@ -254,6 +260,8 @@ class LocalRunHarness:
             raise ValueError(_ERROR_CONTEXT_COMPACT_RETRY_LIMIT_INVALID)
         if self.run_input_trace_cache_limit <= 0:
             raise ValueError(_ERROR_RUN_INPUT_TRACE_CACHE_LIMIT_INVALID)
+        if self.run_input_message_cache_limit <= 0:
+            raise ValueError(_ERROR_RUN_INPUT_MESSAGE_CACHE_LIMIT_INVALID)
 
     async def start_run(self, request: StartRunRequest) -> RunStream:
         """启动 P1.5 内存态 Run。
@@ -988,7 +996,7 @@ class LocalRunHarness:
             cache=self.last_run_input_messages_by_run,
             run_id=run_id,
             value=messages,
-            limit=self.run_input_trace_cache_limit,
+            limit=self.run_input_message_cache_limit,
         )
 
     def stream_run_events(

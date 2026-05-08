@@ -666,6 +666,38 @@ async def test_run_input_build_trace_cache_evicts_old_runs_fifo() -> None:
 
 
 @pytest.mark.asyncio
+async def test_run_input_message_cache_uses_independent_smaller_limit() -> None:
+    """RunInput 消息诊断缓存使用独立容量，不能跟 trace 缓存一起膨胀。
+
+    :returns: 无返回值。
+    :raises AssertionError: trace 与消息缓存淘汰边界不符合预期时抛出。
+    """
+
+    store = InMemoryRunEventStore()
+    harness = LocalRunHarness(
+        proxy=_ScriptedProxy(events=()),
+        event_store=store,
+        run_input_trace_cache_limit=4,
+        run_input_message_cache_limit=2,
+    )
+
+    for run_id in ("message-run-1", "message-run-2", "message-run-3"):
+        stream = await harness.start_run(_request(run_id))
+        await _collect(stream.events)
+
+    assert tuple(harness.last_run_input_build_trace_by_run) == (
+        "message-run-1",
+        "message-run-2",
+        "message-run-3",
+    )
+    assert tuple(harness.last_run_input_messages_by_run) == (
+        "message-run-2",
+        "message-run-3",
+    )
+    assert harness.last_run_input_messages_by_run["message-run-3"]
+
+
+@pytest.mark.asyncio
 async def test_harness_stops_after_terminal_and_keeps_views_consistent() -> None:
     """harness 看到首个终态后停止消费，三种读取视图保持同源。"""
 
