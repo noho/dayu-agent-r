@@ -247,6 +247,18 @@ LocalRunHarness / default harness
 exclusive replay 和 replay-then-follow 订阅。它是单进程内存实现，不提供持久化 schema、多进程恢复
 或 observer checkpoint。
 
+Host 已落地主路径使用日志表达执行边界：`VERBOSE` 覆盖 `start_run` 接纳、background task、attempt、
+EngineWorker 调用、terminal append、context overflow / compact / retry、ToolRuntime 调用边界、
+RunInputBuilder 构造完成、Conversation Memory 投影与订阅起止；`DEBUG` 只保留有界细节，例如 canonical
+EventStore append、ToolRuntime 截断策略 / cursor fingerprint、compact 失败估算；`INFO` 记录 run finished
+摘要；`WARNING` 记录可恢复或不覆盖原始结果的异常边界；`ERROR` 记录本次操作失败；`CRITICAL` 记录
+Engine stream 无 terminal 等 contract / invariant 破坏。日志不得输出 prompt、preview delta 全量、工具参数、
+工具结果、raw cursor 或 `scope_token`。Host 内部发出 `VERBOSE` 日志时只读取
+`dayu.runtime.log_levels` 的层中立常量，不导入日志装配模块。
+
+`InMemoryRunEventStore` 在 DEBUG 下不逐条打印 preview delta append，也不打印 subscribe wait / batch 轮询；
+terminal append、subscribe start / complete 与 canonical append 边界仍可观察。
+
 当前 `InMemoryConversationMemoryStore` 也是 Host 内部临时实现。它以 `session_id` 隔离 memory，只投影
 已 append 的 canonical RunEvent；不同 session 不互相读取 memory。它不提供跨进程恢复、持久 projection、
 public memory 编辑或审计 UI。同一 store 实例通过 `asyncio.Lock` 序列化 snapshot 读写，只声明单进程

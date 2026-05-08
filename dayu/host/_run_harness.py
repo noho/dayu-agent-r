@@ -80,6 +80,7 @@ from dayu.host.contracts import (
     ToolFetchMoreRequest,
     ToolFetchMoreResult,
 )
+from dayu.runtime.log_levels import VERBOSE_LOG_LEVEL
 
 _INITIAL_CURSOR_SEQUENCE: int = -1
 _ERROR_TOOL_EXECUTOR_NOT_CONFIGURED: str = "tool_executor_not_configured"
@@ -303,10 +304,16 @@ class LocalRunHarness:
         task.add_done_callback(
             partial(_log_background_task_failure, engine_request)
         )
-        _LOGGER.debug(
-            "host.run.start_accepted session_id=%s run_id=%s",
+        _LOGGER.log(
+            VERBOSE_LOG_LEVEL,
+            "host.run.start_accepted session_id=%s run_id=%s "
+            "caller_system_count=%s run_input_message_count=%s "
+            "current_user_cursor=%s",
             engine_request.session_id,
             engine_request.run_id,
+            len(accepted_input.caller_system_messages),
+            len(build_result.run_input.messages),
+            current_user_event.cursor.sequence,
         )
         handle = RunHandle(
             session_id=engine_request.session_id,
@@ -342,7 +349,8 @@ class LocalRunHarness:
         attempt_index = 0
         event_count = 0
         terminal_seen = False
-        _LOGGER.debug(
+        _LOGGER.log(
+            VERBOSE_LOG_LEVEL,
             "host.run.background_start session_id=%s run_id=%s",
             request.session_id,
             request.run_id,
@@ -352,6 +360,15 @@ class LocalRunHarness:
                 overflow_trigger_seen = False
                 overflow_observed_seen = False
                 overflow_trigger_event: EngineEvent | None = None
+                _LOGGER.log(
+                    VERBOSE_LOG_LEVEL,
+                    "host.run.attempt_start session_id=%s run_id=%s "
+                    "attempt_index=%s message_count=%s",
+                    attempt_request.session_id,
+                    attempt_request.run_id,
+                    attempt_index,
+                    len(attempt_request.input.messages),
+                )
                 try:
                     engine_events = self.proxy.stream_engine_events(
                         request=attempt_request,
@@ -385,6 +402,16 @@ class LocalRunHarness:
                         if _is_context_compaction_requested(event):
                             overflow_trigger_seen = True
                             overflow_trigger_event = event
+                            _LOGGER.log(
+                                VERBOSE_LOG_LEVEL,
+                                "host.run.context_overflow_triggered "
+                                "session_id=%s run_id=%s attempt_index=%s "
+                                "engine_event_type=%s",
+                                attempt_request.session_id,
+                                attempt_request.run_id,
+                                attempt_index,
+                                event.type.value,
+                            )
                             await self.event_store.append(
                                 translate_engine_event(event)
                             )
@@ -410,6 +437,19 @@ class LocalRunHarness:
                             translate_engine_event(event)
                         )
                         if terminal_result_from_event(stored_event) is not None:
+                            _LOGGER.log(
+                                VERBOSE_LOG_LEVEL,
+                                "host.run.terminal_appended session_id=%s "
+                                "run_id=%s attempt_index=%s "
+                                "engine_event_type=%s event_count=%s "
+                                "event_cursor=%s",
+                                attempt_request.session_id,
+                                attempt_request.run_id,
+                                attempt_index,
+                                event.type.value,
+                                event_count,
+                                stored_event.cursor.sequence,
+                            )
                             terminal_seen = True
                             return
                     if overflow_trigger_seen:
@@ -463,12 +503,13 @@ class LocalRunHarness:
         finally:
             if terminal_seen:
                 await self._project_run_events(request.run_id)
-            _LOGGER.debug(
+            _LOGGER.info(
                 "host.run.background_finished session_id=%s run_id=%s "
-                "event_count=%s",
+                "event_count=%s terminal_seen=%s",
                 request.session_id,
                 request.run_id,
                 event_count,
+                terminal_seen,
             )
 
     async def _compact_or_fail(
@@ -488,6 +529,14 @@ class LocalRunHarness:
         """
 
         if attempt_index >= self.context_compact_retry_limit:
+            _LOGGER.error(
+                "host.run.context_compact_retry_limit_exceeded "
+                "session_id=%s run_id=%s attempt_index=%s retry_limit=%s",
+                request.session_id,
+                request.run_id,
+                attempt_index,
+                self.context_compact_retry_limit,
+            )
             failed_data = self.compact_coordinator.retry_limit_failed(
                 request=request,
                 attempt_index=attempt_index,
@@ -520,6 +569,13 @@ class LocalRunHarness:
             events=current_run_events,
         )
         if request.run_id not in self.last_run_input_build_trace_by_run:
+            _LOGGER.error(
+                "host.run.context_compact_trace_missing session_id=%s "
+                "run_id=%s attempt_index=%s",
+                request.session_id,
+                request.run_id,
+                attempt_index,
+            )
             failed_data = self.compact_coordinator.exception_failed(
                 request=request,
                 attempt_index=attempt_index,
@@ -562,6 +618,17 @@ class LocalRunHarness:
             failed_data = decision.failed_data
             if failed_data is None:
                 raise RuntimeError("context compact failed without failed_data")
+            _LOGGER.error(
+                "host.run.context_compact_decision_failed session_id=%s "
+                "run_id=%s attempt_index=%s reason=%s before_tokens=%s "
+                "after_tokens=%s",
+                request.session_id,
+                request.run_id,
+                attempt_index,
+                failed_data.reason.value,
+                failed_data.before_token_estimate,
+                failed_data.after_token_estimate,
+            )
             await self.event_store.append(
                 context_compact_failed_draft(
                     run_id=request.run_id,
@@ -584,6 +651,18 @@ class LocalRunHarness:
         compacted_input = decision.run_input
         if completed_data is None or compacted_input is None:
             raise RuntimeError("context compact completed without run_input")
+        _LOGGER.log(
+            VERBOSE_LOG_LEVEL,
+            "host.run.context_compact_completed session_id=%s run_id=%s "
+            "attempt_index=%s before_tokens=%s after_tokens=%s "
+            "dropped_item_count=%s",
+            request.session_id,
+            request.run_id,
+            attempt_index,
+            completed_data.before_token_estimate,
+            completed_data.after_token_estimate,
+            completed_data.dropped_item_count,
+        )
         await self.event_store.append(
             context_compact_completed_draft(
                 run_id=request.run_id,
@@ -593,6 +672,15 @@ class LocalRunHarness:
             )
         )
         next_attempt_index = attempt_index + 1
+        _LOGGER.log(
+            VERBOSE_LOG_LEVEL,
+            "host.run.attempt_retrying session_id=%s run_id=%s "
+            "from_attempt_index=%s next_attempt_index=%s",
+            request.session_id,
+            request.run_id,
+            attempt_index,
+            next_attempt_index,
+        )
         await self.event_store.append(
             context_attempt_retrying_draft(
                 run_id=request.run_id,
@@ -687,6 +775,18 @@ class LocalRunHarness:
         if isinstance(data, ContextCompactionRequestedData):
             recoverable = True
             reason = data.reason
+        _LOGGER.log(
+            VERBOSE_LOG_LEVEL,
+            "host.run.context_overflow_observed session_id=%s run_id=%s "
+            "attempt_index=%s engine_event_type=%s engine_error_code=%s "
+            "recoverable=%s",
+            request.session_id,
+            request.run_id,
+            attempt_index,
+            event.type.value,
+            engine_error_code,
+            recoverable,
+        )
         await self.event_store.append(
             context_overflow_observed_draft(
                 run_id=request.run_id,
@@ -767,7 +867,7 @@ class LocalRunHarness:
         :raises Exception: append Host-owned failure 失败时透传。
         """
 
-        _LOGGER.warning(
+        _LOGGER.error(
             "host.run.background_failed session_id=%s run_id=%s "
             "event_count=%s exc_type=%s",
             request.session_id,
@@ -839,6 +939,12 @@ class LocalRunHarness:
             after=None,
         )
         await self.memory_store.project_run_events(events)
+        _LOGGER.log(
+            VERBOSE_LOG_LEVEL,
+            "host.run.memory_projected run_id=%s event_count=%s",
+            run_id,
+            len(events),
+        )
 
     def _remember_run_input_build_trace(
         self,

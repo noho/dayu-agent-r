@@ -65,6 +65,7 @@ from dayu.host.contracts import (
     ToolRuntimeCursor,
     ToolValueSizeSummary,
 )
+from dayu.runtime.log_levels import VERBOSE_LOG_LEVEL
 
 _DEFAULT_CURSOR_TTL_SECONDS: int = 300
 _LOGGER: logging.Logger = logging.getLogger(__name__)
@@ -233,7 +234,8 @@ class InMemoryToolRuntime:
         """
 
         is_framework_fetch_more = request.call.name == FRAMEWORK_FETCH_MORE_TOOL_NAME
-        _LOGGER.debug(
+        _LOGGER.log(
+            VERBOSE_LOG_LEVEL,
             "host.tool_runtime.tool_call_start "
             "session_id=%s run_id=%s tool_name=%s tool_call_id=%s "
             "framework=%s",
@@ -248,7 +250,8 @@ class InMemoryToolRuntime:
                 return await self._execute_framework_fetch_more(request)
             outcome = await self.executor.execute(request)
             if not isinstance(outcome, ToolCompletedOutcome):
-                _LOGGER.debug(
+                _LOGGER.log(
+                    VERBOSE_LOG_LEVEL,
                     "host.tool_runtime.tool_call_finished "
                     "session_id=%s run_id=%s tool_name=%s tool_call_id=%s "
                     "framework=False outcome=%s truncated=False",
@@ -266,7 +269,8 @@ class InMemoryToolRuntime:
                 spec=spec,
             )
             if truncated is None:
-                _LOGGER.debug(
+                _LOGGER.log(
+                    VERBOSE_LOG_LEVEL,
                     "host.tool_runtime.tool_call_finished "
                     "session_id=%s run_id=%s tool_name=%s tool_call_id=%s "
                     "framework=False outcome=completed truncated=False",
@@ -307,6 +311,16 @@ class InMemoryToolRuntime:
                     meta=outcome.result.meta,
                 )
             )
+            _LOGGER.log(
+                VERBOSE_LOG_LEVEL,
+                "host.tool_runtime.tool_call_finished "
+                "session_id=%s run_id=%s tool_name=%s tool_call_id=%s "
+                "framework=False outcome=completed truncated=True",
+                request.context.session_id,
+                request.context.run_id,
+                request.call.name,
+                request.context.tool_call_id,
+            )
             _LOGGER.debug(
                 "host.tool_runtime.tool_call_finished "
                 "session_id=%s run_id=%s tool_name=%s tool_call_id=%s "
@@ -328,7 +342,7 @@ class InMemoryToolRuntime:
             )
             return completed
         except Exception as exc:
-            _LOGGER.debug(
+            _LOGGER.error(
                 "host.tool_runtime.tool_call_finished "
                 "session_id=%s run_id=%s tool_name=%s tool_call_id=%s "
                 "framework=%s outcome=failed error=%s",
@@ -365,7 +379,8 @@ class InMemoryToolRuntime:
 
         parsed = self._parse_framework_fetch_more_request(request)
         if isinstance(parsed, ToolFailedOutcome):
-            _LOGGER.debug(
+            _LOGGER.log(
+                VERBOSE_LOG_LEVEL,
                 "host.tool_runtime.tool_call_finished "
                 "session_id=%s run_id=%s tool_name=%s tool_call_id=%s "
                 "framework=True outcome=failed error=%s",
@@ -386,6 +401,18 @@ class InMemoryToolRuntime:
                     hint=None,
                     meta=None,
                 )
+            )
+            _LOGGER.log(
+                VERBOSE_LOG_LEVEL,
+                "host.tool_runtime.tool_call_finished "
+                "session_id=%s run_id=%s tool_name=%s tool_call_id=%s "
+                "framework=True outcome=failed error=%s denied=%s",
+                request.context.session_id,
+                request.context.run_id,
+                request.call.name,
+                request.context.tool_call_id,
+                fetch_result.error_code,
+                fetch_result.denied,
             )
             _LOGGER.debug(
                 "host.tool_runtime.tool_call_finished "
@@ -424,6 +451,17 @@ class InMemoryToolRuntime:
                 truncation=truncation,
                 meta=None,
             )
+        )
+        _LOGGER.log(
+            VERBOSE_LOG_LEVEL,
+            "host.tool_runtime.tool_call_finished "
+            "session_id=%s run_id=%s tool_name=%s tool_call_id=%s "
+            "framework=True outcome=completed has_more=%s",
+            request.context.session_id,
+            request.context.run_id,
+            request.call.name,
+            request.context.tool_call_id,
+            fetch_result.truncation is not None,
         )
         _LOGGER.debug(
             "host.tool_runtime.tool_call_finished "
@@ -479,14 +517,20 @@ class InMemoryToolRuntime:
             session_id=request.context.session_id,
             run_id=request.context.run_id,
             tool_call_id=(
-                record.tool_call_id if record is not None else request.context.tool_call_id
+                record.tool_call_id
+                if record is not None
+                else request.context.tool_call_id
             ),
             cursor=ToolRuntimeCursor(
                 value=cursor_value,
                 fingerprint=cursor_fingerprint,
             ),
             scope_token=scope_token,
-            limit=limit if isinstance(limit, int) and not isinstance(limit, bool) else None,
+            limit=(
+                limit
+                if isinstance(limit, int) and not isinstance(limit, bool)
+                else None
+            ),
         )
 
     async def get_tool_fetch_more_handle(
@@ -581,7 +625,7 @@ class InMemoryToolRuntime:
                     error_code=_ERROR_CURSOR_NOT_FOUND,
                     message="cursor not found",
                     denied=False,
-            )
+                )
             terminal_cursor = await self._terminal_cursor(record.run_id)
             if terminal_cursor is not None:
                 return ToolFetchMoreFailedResult(

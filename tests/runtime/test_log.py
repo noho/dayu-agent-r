@@ -17,6 +17,14 @@ from dayu.runtime.log import (
     configure,
     set_level_from_flags,
 )
+from dayu.runtime.log_levels import (
+    CRITICAL_LOG_LEVEL,
+    DEBUG_LOG_LEVEL,
+    ERROR_LOG_LEVEL,
+    INFO_LOG_LEVEL,
+    VERBOSE_LOG_LEVEL,
+    WARN_LOG_LEVEL,
+)
 
 _NAMESPACE = "dayu"
 _MARKER_ATTR = "_dayu_runtime_log_marker"
@@ -162,15 +170,30 @@ def test_set_level_from_flags_verbose_maps_to_verbose() -> None:
         quiet=False,
     )
     assert resolved is LogLevel.VERBOSE
-    assert int(resolved) == 15
+    assert int(resolved) == VERBOSE_LOG_LEVEL
 
 
 def test_log_level_verbose_registered_with_stdlib() -> None:
     """``logging.getLevelName(15)`` 必须返回 ``VERBOSE``。"""
 
-    assert logging.getLevelName(15) == "VERBOSE"
-    assert int(LogLevel.VERBOSE) == 15
+    assert logging.getLevelName(VERBOSE_LOG_LEVEL) == "VERBOSE"
+    assert int(LogLevel.VERBOSE) == VERBOSE_LOG_LEVEL
     assert LogLevel.DEBUG < LogLevel.VERBOSE < LogLevel.INFO
+
+
+def test_log_level_enum_uses_runtime_level_constants() -> None:
+    """``LogLevel`` 枚举必须统一引用 runtime 日志级别常量。
+
+    :returns: 无返回值。
+    :raises AssertionError: ``LogLevel`` 与公共常量真源不一致时抛出。
+    """
+
+    assert int(LogLevel.DEBUG) == DEBUG_LOG_LEVEL
+    assert int(LogLevel.VERBOSE) == VERBOSE_LOG_LEVEL
+    assert int(LogLevel.INFO) == INFO_LOG_LEVEL
+    assert int(LogLevel.WARN) == WARN_LOG_LEVEL
+    assert int(LogLevel.ERROR) == ERROR_LOG_LEVEL
+    assert int(LogLevel.CRITICAL) == CRITICAL_LOG_LEVEL
 
 
 def test_set_level_from_flags_log_level_string_verbose_legal() -> None:
@@ -186,6 +209,28 @@ def test_set_level_from_flags_log_level_string_verbose_legal() -> None:
     assert resolved is LogLevel.VERBOSE
 
 
+def test_set_level_from_flags_log_level_string_critical_legal() -> None:
+    """``log_level='critical'`` 字符串解析为 stdlib CRITICAL 级别。"""
+
+    resolved = set_level_from_flags(
+        log_level="critical",
+        debug=True,
+        verbose=True,
+        info=True,
+        quiet=True,
+    )
+    assert resolved is LogLevel.CRITICAL
+    assert int(resolved) == CRITICAL_LOG_LEVEL
+
+
+def test_log_level_critical_matches_stdlib() -> None:
+    """Dayu CRITICAL 级别必须沿用 stdlib logging.CRITICAL 语义。"""
+
+    assert int(LogLevel.CRITICAL) == CRITICAL_LOG_LEVEL
+    assert CRITICAL_LOG_LEVEL == logging.CRITICAL
+    assert LogLevel.ERROR < LogLevel.CRITICAL
+
+
 def test_configure_default_suppresses_third_party() -> None:
     """``configure()`` 默认把 aiohttp / asyncio / urllib3 调到 WARNING。"""
 
@@ -195,7 +240,7 @@ def test_configure_default_suppresses_third_party() -> None:
     configure(level=LogLevel.DEBUG)
     for name in ("aiohttp", "asyncio", "urllib3"):
         assert (
-            logging.getLogger(name).level == logging.WARNING
+            logging.getLogger(name).level == WARN_LOG_LEVEL
         ), f"third-party {name} should be suppressed to WARNING"
 
 

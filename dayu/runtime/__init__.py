@@ -14,7 +14,8 @@
 - ``dayu.engine`` **不得** ``import dayu.runtime.log``：Engine 仅用 stdlib
   ``logging.getLogger(__name__)`` 获得 logger，由上层（Host / CLI）通过
   :mod:`dayu.runtime.log` 装配；Engine **允许** ``import``
-  :mod:`dayu.runtime.cancellation`。
+  :mod:`dayu.runtime.cancellation` 与无装配副作用的
+  :mod:`dayu.runtime.log_levels`。
 
 本包不导出业务语义、不持有 Host 治理状态、不持有 Engine 协议状态机。
 """

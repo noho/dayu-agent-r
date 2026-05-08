@@ -894,6 +894,62 @@ async def test_runner_exception_after_tool_batch_is_run_failed(
 
 
 @pytest.mark.asyncio
+async def test_verbose_logs_engine_main_path_without_tool_payloads(
+    caplog: LogCaptureFixture,
+) -> None:
+    """VERBOSE 能串起 Engine 主路径与工具闭环，且不泄漏参数 / 结果。"""
+
+    secret_argument = "raw-cursor-and-scope-token-secret"
+    secret_result = "tool-result-secret"
+    executor = _RecordingToolExecutor(
+        outcomes={
+            "tc_1": _success(
+                {
+                    "answer": secret_result,
+                    "cursor": "raw-cursor-secret",
+                    "scope_token": "scope-token-secret",
+                }
+            )
+        }
+    )
+    runner = _ScriptedRunner(
+        scripts=(
+            _tool_script(
+                _tool_call("tc_1", arguments={"query": secret_argument})
+            ),
+            _final_script("done"),
+        )
+    )
+
+    with caplog.at_level(15, logger="dayu.engine.agent"):
+        events = await _collect(
+            _AsyncAgent(request=_request(executor=executor), runner=runner)
+        )
+
+    assert _terminal(events).type is EngineEventType.FINAL_ANSWER
+    log_text = caplog.text
+    assert "engine.agent.run_start" in log_text
+    assert "engine.agent.iteration_start" in log_text
+    assert "engine.agent.runner_call_start" in log_text
+    assert "engine.agent.runner_call_completed" in log_text
+    assert "decision=tool_calls" in log_text
+    assert "engine.agent.tool_loop_start" in log_text
+    assert "engine.agent.tool_call_requested" in log_text
+    assert "engine.agent.tool_batch_completed" in log_text
+    assert "engine.agent.tool_messages_injected" in log_text
+    assert "engine.agent.final_ready" in log_text
+    assert "engine.agent.continuation_terminal" not in log_text
+    assert "engine.agent.terminal" in log_text
+    assert "session_id=session_phase3" in log_text
+    assert "run_id=run_phase3" in log_text
+    assert "iteration_id=run_phase3_iteration_1" in log_text
+    assert secret_argument not in log_text
+    assert secret_result not in log_text
+    assert "raw-cursor-secret" not in log_text
+    assert "scope-token-secret" not in log_text
+
+
+@pytest.mark.asyncio
 async def test_awaiting_duplicate_and_executor_exception_paths() -> None:
     """awaiting、duplicate、executor exception 均有明确 Phase 3 收口。"""
 

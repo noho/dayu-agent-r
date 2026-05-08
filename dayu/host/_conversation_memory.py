@@ -8,6 +8,7 @@
 from __future__ import annotations
 
 import asyncio
+import logging
 from dataclasses import dataclass, field, replace
 from datetime import datetime
 from enum import StrEnum
@@ -35,6 +36,7 @@ from dayu.host.contracts import (
     UserInputAcceptedData,
     UserInputScope,
 )
+from dayu.runtime.log_levels import VERBOSE_LOG_LEVEL
 
 _EMPTY_TEXT: str = ""
 _USER_TEXT_SUMMARY_LIMIT: int = 240
@@ -42,6 +44,7 @@ _ASSISTANT_TEXT_SUMMARY_LIMIT: int = 240
 _TERMINAL_TEXT_SUMMARY_LIMIT: int = 240
 _TOOL_FACT_SUMMARY_LIMIT: int = 360
 _ERROR_SCOPE_CLEAR_UNSUPPORTED_SCOPE: str = "scope_clear_only_supports_session"
+_LOGGER: logging.Logger = logging.getLogger(__name__)
 
 
 class MemoryScope(StrEnum):
@@ -416,6 +419,7 @@ class InMemoryConversationMemoryStore:
         if not canonical_events:
             return
         session_id = canonical_events[0].session_id
+        run_id = canonical_events[0].run_id
         async with self._lock:
             snapshot = self._snapshot_by_session.get(
                 session_id, _empty_snapshot(session_id)
@@ -426,6 +430,19 @@ class InMemoryConversationMemoryStore:
                 recent_turn_limit=self.recent_turn_limit,
             )
             self._snapshot_by_session[session_id] = snapshot
+            _LOGGER.log(
+                VERBOSE_LOG_LEVEL,
+                "host.conversation_memory.projected session_id=%s run_id=%s "
+                "event_count=%s canonical_count=%s recent_turn_count=%s "
+                "older_turn_count=%s tool_fact_count=%s",
+                session_id,
+                run_id,
+                len(events),
+                len(canonical_events),
+                len(snapshot.recent_raw_turns),
+                len(snapshot.older_raw_turns),
+                len(snapshot.tool_facts),
+            )
 
     async def get_snapshot(self, session_id: str) -> ConversationMemorySnapshot:
         """读取 session memory 快照。

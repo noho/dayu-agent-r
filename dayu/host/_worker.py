@@ -12,6 +12,7 @@ from dataclasses import dataclass
 from dayu.contracts import CancellationToken, ToolExecutor
 from dayu.engine import AgentRunRequest, EngineEvent, run_agent_messages
 from dayu.host.contracts import StartRunRequest
+from dayu.runtime.log_levels import VERBOSE_LOG_LEVEL
 
 _LOGGER: logging.Logger = logging.getLogger(__name__)
 
@@ -51,7 +52,8 @@ class EngineWorker:
             tool_executor=self.tool_executor,
             cancellation_token=cancellation_token,
         )
-        _LOGGER.debug(
+        _LOGGER.log(
+            VERBOSE_LOG_LEVEL,
             "host.engine_worker.run_agent_messages session_id=%s run_id=%s "
             "messages=%s tools=%s stream=%s disable_tools=%s",
             engine_request.session_id,

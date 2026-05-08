@@ -46,6 +46,15 @@ pytest tests/engine/runners/openai/test_event_flow_ordering.py -q
 
 ## 当前测试分层
 
+### `tests/runtime/`
+
+运行时基础设施测试，覆盖 `dayu.runtime` 的层中立边界、取消 helper 与日志装配：
+
+- import boundary：阻止 runtime 反向依赖 Engine、Host、Service、UI、fins 或引入运行期 HTTP 客户端。
+- cancellation：覆盖取消等待 helper 的完成、取消与异常传播语义。
+- logging：验证 `dayu.runtime.log` 的 logger 装配、CLI 风格级别解析、`VERBOSE` / `CRITICAL` 级别契约，
+  并验证 `dayu.runtime.log_levels` 只提供公共日志级别常量、不注册 stdlib logging level。
+
 ### `tests/contracts/`
 
 公共协作契约测试，覆盖 `dayu.contracts` 的稳定边界：
@@ -77,6 +86,8 @@ Host 当前 Run harness、RunEventStore、ToolRuntime、Conversation Memory / Ru
 
 - run harness：验证 public `start_run` 可经 Host 调用 Engine 函数式入口，并把 `EngineEvent` 翻译为已 append 的 `RunEvent`。
 - event store：验证 append-only、per-run cursor、exclusive replay、replay-then-follow 订阅和 terminal 后订阅结束。
+- host logging：验证 `VERBOSE` 可串起已落地 Host 主路径，且不泄漏用户输入、final answer、工具参数 / 结果、
+  raw cursor 或 `scope_token`；验证 EventStore 在 DEBUG 下不刷 preview append、subscribe wait / batch。
 - run harness eventlog：验证 `USER_INPUT_ACCEPTED` append-before-engine / append-before-stream、preview 不污染
   terminal result、结果只从已 append terminal event 推导，worker / proxy 异常和 Engine stream 无终态正常结束
   会落 Host-owned canonical failure 事件，并验证 RunInput trace 调试缓存按容量淘汰。

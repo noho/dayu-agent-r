@@ -4,11 +4,14 @@ from __future__ import annotations
 
 import asyncio
 import json
-from collections.abc import AsyncIterator
+import logging
+from collections.abc import AsyncIterator, Iterator
+from contextlib import contextmanager
+from dataclasses import dataclass
 from datetime import datetime, timezone
 
 import pytest
-from typing import TypeVar
+from typing import Final, TypeVar
 
 import dayu.engine.agent as agent_module
 from dayu.contracts import FRAMEWORK_FETCH_MORE_TOOL_NAME, ToolSchema
@@ -51,6 +54,7 @@ from dayu.host.contracts import (
     ToolResultTruncatedData,
 )
 from dayu.host._run_harness import LocalRunHarness
+from dayu.runtime.log_levels import VERBOSE_LOG_LEVEL
 from utils.smoke_host_multiturn_no_governance import (
     HUGE_ECHO_DEFINITION,
     MIMO_PLAN_PROVIDER_CASE,
@@ -79,6 +83,137 @@ _RUN_1: str = "phase5-test-run-1"
 _RUN_2: str = "phase5-test-run-2"
 _COMPACT_RUN: str = "phase5-test-compact"
 _T = TypeVar("_T")
+_ROOT_LOGGER_NAME: Final[str] = ""
+_DAYU_LOGGER_NAME: Final[str] = "dayu"
+_ENGINE_AGENT_LOGGER_NAME: Final[str] = "dayu.engine.agent"
+_ENGINE_WARNING_PROBE_MESSAGE: Final[str] = (
+    "phase5-smoke-after-warning-caplog-probe"
+)
+_ENGINE_VERBOSE_PROBE_MESSAGE: Final[str] = (
+    "phase5-smoke-after-verbose-caplog-probe"
+)
+_SMOKE_CONFIGURE_THIRD_PARTY_LOGGER_NAMES: Final[tuple[str, ...]] = (
+    "aiohttp",
+    "aiohttp.access",
+    "aiohttp.client",
+    "aiohttp.internal",
+    "aiohttp.server",
+    "aiohttp.web",
+    "aiohttp.websocket",
+    "asyncio",
+    "urllib3",
+    "httpx",
+    "httpcore",
+)
+_SMOKE_LOGGING_STATE_LOGGER_NAMES: Final[tuple[str, ...]] = (
+    _ROOT_LOGGER_NAME,
+    _DAYU_LOGGER_NAME,
+    *_SMOKE_CONFIGURE_THIRD_PARTY_LOGGER_NAMES,
+)
+
+
+@dataclass(frozen=True, slots=True)
+class _LoggerState:
+    """logger 可变状态快照，用于隔离会主动装配日志的 smoke 入口。"""
+
+    level: int
+    propagate: bool
+    handlers: tuple[logging.Handler, ...]
+    disabled: bool
+
+
+def _target_logger(name: str) -> logging.Logger:
+    """按约定名称返回目标 logger。
+
+    :param name: logger 名称；空字符串表示 root logger。
+    :returns: 对应的 ``logging.Logger`` 实例。
+    :raises Exception: 不主动抛出异常。
+    """
+
+    if name == _ROOT_LOGGER_NAME:
+        return logging.getLogger()
+    return logging.getLogger(name)
+
+
+def _snapshot_logging_state(
+    logger_names: tuple[str, ...],
+) -> dict[str, _LoggerState]:
+    """保存一组 logger 的关键可变状态。
+
+    :param logger_names: 需要保存状态的 logger 名称集合。
+    :returns: 以 logger 名称为键的状态快照。
+    :raises Exception: 不主动抛出异常。
+    """
+
+    snapshots: dict[str, _LoggerState] = {}
+    for name in logger_names:
+        logger = _target_logger(name)
+        snapshots[name] = _LoggerState(
+            level=logger.level,
+            propagate=logger.propagate,
+            handlers=tuple(logger.handlers),
+            disabled=logger.disabled,
+        )
+    return snapshots
+
+
+def _restore_logging_state(
+    snapshots: dict[str, _LoggerState],
+) -> None:
+    """恢复 logger 的关键可变状态。
+
+    :param snapshots: ``_snapshot_logging_state`` 返回的状态快照。
+    :returns: 无返回值。
+    :raises Exception: 不主动抛出异常。
+    """
+
+    for name, state in snapshots.items():
+        logger = _target_logger(name)
+        logger.handlers = list(state.handlers)
+        logger.setLevel(state.level)
+        logger.propagate = state.propagate
+        logger.disabled = state.disabled
+
+
+@contextmanager
+def _preserve_smoke_logging_state() -> Iterator[None]:
+    """隔离 ``smoke_main`` 的全局 logging 装配副作用。
+
+    :returns: 上下文管理器迭代器。
+    :raises Exception: 上下文内异常会在恢复日志状态后透传。
+    """
+
+    snapshots = _snapshot_logging_state(_SMOKE_LOGGING_STATE_LOGGER_NAMES)
+    try:
+        yield
+    finally:
+        _restore_logging_state(snapshots)
+
+
+def _assert_engine_caplog_still_captures(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """确认 smoke 后 Engine logger 仍能通过 pytest caplog 捕获。
+
+    :param caplog: pytest 日志捕获 fixture。
+    :returns: 无返回值。
+    :raises AssertionError: 当 WARNING 或 VERBOSE 探针日志未被捕获时抛出。
+    """
+
+    engine_logger = logging.getLogger(_ENGINE_AGENT_LOGGER_NAME)
+
+    caplog.clear()
+    with caplog.at_level(logging.WARNING, logger=_ENGINE_AGENT_LOGGER_NAME):
+        engine_logger.warning(_ENGINE_WARNING_PROBE_MESSAGE)
+    assert _ENGINE_WARNING_PROBE_MESSAGE in caplog.text
+
+    caplog.clear()
+    with caplog.at_level(VERBOSE_LOG_LEVEL, logger=_ENGINE_AGENT_LOGGER_NAME):
+        engine_logger.log(
+            VERBOSE_LOG_LEVEL,
+            _ENGINE_VERBOSE_PROBE_MESSAGE,
+        )
+    assert _ENGINE_VERBOSE_PROBE_MESSAGE in caplog.text
 
 
 def _runner_event(
@@ -683,12 +818,21 @@ async def test_phase5_preview_and_reasoning_do_not_enter_next_run(
 def test_phase5_smoke_script_reports_clear_missing_key(
     monkeypatch: pytest.MonkeyPatch,
     capsys: pytest.CaptureFixture[str],
+    caplog: pytest.LogCaptureFixture,
 ) -> None:
-    """真实 provider 缺 key 时 clear failure，且不输出敏感材料。"""
+    """真实 provider 缺 key 时 clear failure，且不输出敏感材料。
+
+    :param monkeypatch: pytest 环境变量 patch fixture。
+    :param capsys: pytest stdout / stderr 捕获 fixture。
+    :param caplog: pytest 日志捕获 fixture。
+    :returns: 无返回值。
+    :raises AssertionError: 当失败输出、敏感信息过滤或日志隔离断言不满足时抛出。
+    """
 
     monkeypatch.delenv("MIMO_PLAN_API_KEY", raising=False)
 
-    exit_code = smoke_main(["--case", "real-provider", "--log-level", "INFO"])
+    with _preserve_smoke_logging_state():
+        exit_code = smoke_main(["--case", "real-provider", "--log-level", "INFO"])
     output = capsys.readouterr().out
 
     assert exit_code == 1
@@ -702,6 +846,7 @@ def test_phase5_smoke_script_reports_clear_missing_key(
     assert "case=real-provider final_answer " not in output
     assert "scope_token" not in output
     assert "Bearer " not in output
+    _assert_engine_caplog_still_captures(caplog)
 
 
 def test_phase5_smoke_thinking_flag_defaults_to_false() -> None:

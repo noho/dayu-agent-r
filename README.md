@@ -287,7 +287,7 @@ dayu-cli <subcommand> [参数]
 | `--base` | 全部主命令 | 工作区根目录，默认 `./workspace` |
 | `--config` | 全部主命令 | 配置目录，默认 `workspace/config` |
 | `--ticker` | `prompt` `write` | 股票代码；传入后会把该 `ticker` 作为当前研究对象 |
-| `--log-level` | 全部主命令 | 直接指定日志级别，可选 `debug`、`verbose`、`info`、`warn`、`error` |
+| `--log-level` | 全部主命令 | 直接指定日志级别，可选 `debug`、`verbose`、`info`、`warn`、`error`、`critical` |
 | `--debug` | 全部主命令 | 把日志级别设为 `DEBUG` |
 | `--verbose` | 全部主命令 | 把日志级别设为 `VERBOSE` |
 | `--info` | 全部主命令 | 把日志级别设为 `INFO` |

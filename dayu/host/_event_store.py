@@ -18,8 +18,10 @@ from dayu.host.contracts import (
     RunEvent,
     RunEventCursor,
     RunEventDraft,
+    RunEventKind,
     RunEventSource,
 )
+from dayu.runtime.log_levels import VERBOSE_LOG_LEVEL
 
 _FIRST_EVENT_SEQUENCE: int = 0
 _ERROR_ENGINE_EVENT_ID_REQUIRED: str = (
@@ -137,16 +139,18 @@ class InMemoryRunEventStore:
             ):
                 self._terminal_cursor_by_run[draft.run_id] = event.cursor
             self._condition.notify_all()
-            _LOGGER.debug(
-                "host.event_store.appended run_id=%s cursor=%s type=%s "
-                "kind=%s source=%s terminal=%s",
-                event.run_id,
-                event.cursor.sequence,
-                event.type.value,
-                event.kind.value,
-                event.source.value,
-                event.type in TERMINAL_RUN_EVENT_TYPES,
-            )
+            if _should_log_append(event):
+                _LOGGER.log(
+                    _append_log_level(event),
+                    "host.event_store.appended run_id=%s cursor=%s type=%s "
+                    "kind=%s source=%s terminal=%s",
+                    event.run_id,
+                    event.cursor.sequence,
+                    event.type.value,
+                    event.kind.value,
+                    event.source.value,
+                    event.type in TERMINAL_RUN_EVENT_TYPES,
+                )
             return event
 
     async def list_events(
@@ -164,12 +168,6 @@ class InMemoryRunEventStore:
 
         async with self._condition:
             events = self._events_after_locked(run_id=run_id, after=after)
-            _LOGGER.debug(
-                "host.event_store.list run_id=%s after=%s count=%s",
-                run_id,
-                _cursor_sequence(after),
-                len(events),
-            )
             return events
 
     def subscribe(
@@ -205,7 +203,8 @@ class InMemoryRunEventStore:
         """
 
         last_seen = after
-        _LOGGER.debug(
+        _LOGGER.log(
+            VERBOSE_LOG_LEVEL,
             "host.event_store.subscribe_start run_id=%s after=%s",
             run_id,
             _cursor_sequence(after),
@@ -218,40 +217,27 @@ class InMemoryRunEventStore:
                         after=last_seen,
                     )
                     if events:
-                        _LOGGER.debug(
-                            "host.event_store.subscribe_batch run_id=%s "
-                            "after=%s count=%s first_cursor=%s "
-                            "last_cursor=%s",
-                            run_id,
-                            _cursor_sequence(last_seen),
-                            len(events),
-                            events[0].cursor.sequence,
-                            events[-1].cursor.sequence,
-                        )
                         break
                     if self._terminal_reached_locked(
                         run_id=run_id,
                         after=last_seen,
                     ):
-                        _LOGGER.debug(
+                        _LOGGER.log(
+                            VERBOSE_LOG_LEVEL,
                             "host.event_store.subscribe_complete run_id=%s "
                             "after=%s reason=terminal_seen",
                             run_id,
                             _cursor_sequence(last_seen),
                         )
                         return
-                    _LOGGER.debug(
-                        "host.event_store.subscribe_wait run_id=%s after=%s",
-                        run_id,
-                        _cursor_sequence(last_seen),
-                    )
                     await self._condition.wait()
                 last_seen = events[-1].cursor
 
             for event in events:
                 yield event
                 if event.type in TERMINAL_RUN_EVENT_TYPES:
-                    _LOGGER.debug(
+                    _LOGGER.log(
+                        VERBOSE_LOG_LEVEL,
                         "host.event_store.subscribe_complete run_id=%s "
                         "after=%s reason=terminal_yielded",
                         run_id,
@@ -352,6 +338,39 @@ def _cursor_sequence(cursor: RunEventCursor | None) -> int | None:
     if cursor is None:
         return None
     return cursor.sequence
+
+
+def _should_log_append(event: RunEvent) -> bool:
+    """判断 append 事件是否值得进入 DEBUG 存储诊断日志。
+
+    preview delta 会在流式输出场景中高频出现，默认 DEBUG 不逐条记录；
+    canonical 与 terminal 事实仍保留，便于定位事实层边界。
+
+    :param event: 已追加的 RunEvent。
+    :returns: 应记录日志返回 ``True``。
+    :raises Exception: 不主动抛出异常。
+    """
+
+    return (
+        event.kind is RunEventKind.CANONICAL
+        or event.type in TERMINAL_RUN_EVENT_TYPES
+    )
+
+
+def _append_log_level(event: RunEvent) -> int:
+    """返回 append 诊断日志级别。
+
+    terminal append 属于执行路径边界，使用 VERBOSE；其它 canonical
+    append 属于存储细节，保留 DEBUG。
+
+    :param event: 已追加的 RunEvent。
+    :returns: stdlib logging 级别整数。
+    :raises Exception: 不主动抛出异常。
+    """
+
+    if event.type in TERMINAL_RUN_EVENT_TYPES:
+        return VERBOSE_LOG_LEVEL
+    return logging.DEBUG
 
 
 __all__ = ["InMemoryRunEventStore", "RunEventStore"]

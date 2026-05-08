@@ -186,7 +186,14 @@ Runner 不执行工具，不依赖 `ToolExecutor` / ToolRegistry，不产出 `En
 
 ## Diagnostics 与 SSE Idle
 
-Runner 使用标准库 `logging.getLogger(__name__)` 记录运行边界诊断。日志装配入口在 `dayu.runtime.log`，Engine 代码不导入 `dayu.runtime.log`。
+Runner 与 Agent 使用标准库 `logging.getLogger(__name__)` 记录运行边界诊断。日志装配入口在
+`dayu.runtime.log`，Engine 代码不导入 `dayu.runtime.log`；`VERBOSE` 级别数值只从无装配副作用的
+`dayu.runtime.log_levels` 常量模块读取。
+
+Agent 的 `VERBOSE` 日志覆盖 run 开始、iteration 开始、Runner 调用开始 / 完成、iteration 决策、tool loop、
+tool batch、tool message 注入、fallback / continuation 与 terminal。`DEBUG` 日志只记录有界分类细节，例如
+Runner event 类型、finish reason、usage token 计数、工具 outcome 分类；不输出 prompt、delta 全量、工具参数或工具结果。
+Agent 发现 terminal invariant 被破坏时记录 `CRITICAL`。
 
 SSE idle heartbeat / timeout 属于 Runner 字节流读取边界：
 

@@ -5,7 +5,7 @@ from __future__ import annotations
 import asyncio
 import logging
 from collections.abc import AsyncIterator, Sequence
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from datetime import datetime, timezone
 
 import pytest
@@ -473,6 +473,27 @@ async def _wait_for_background_error_log(
     raise AssertionError("background task error log was not captured")
 
 
+async def _wait_for_log_text(
+    records: Sequence[logging.LogRecord],
+    *,
+    expected_text: str,
+) -> str:
+    """等待 caplog 捕获指定文本并返回完整日志文本。
+
+    :param records: caplog 捕获的日志记录序列。
+    :param expected_text: 期望出现的文本。
+    :returns: 拼接后的日志文本。
+    :raises AssertionError: 等待后仍未捕获时抛出。
+    """
+
+    for _ in range(_POLL_LIMIT):
+        log_text = "\n".join(record.getMessage() for record in records)
+        if expected_text in log_text:
+            return log_text
+        await asyncio.sleep(0)
+    raise AssertionError(f"log text was not captured: {expected_text}")
+
+
 @pytest.mark.asyncio
 async def test_run_stream_reads_events_after_store_append() -> None:
     """RunStream.events 只能观察到已 append 的 RunEvent。"""
@@ -506,6 +527,60 @@ async def test_run_stream_reads_events_after_store_append() -> None:
     gate.release()
     remaining = await _collect(stream.events)
     assert remaining[-1].type is RunEventType.FINAL_ANSWER
+
+
+@pytest.mark.asyncio
+async def test_host_verbose_logs_main_path_without_payloads(
+    caplog: LogCaptureFixture,
+) -> None:
+    """Host VERBOSE 日志串起已落地主路径，且不泄漏输入或输出正文。"""
+
+    run_id = "eventlog_host_verbose"
+    secret_input = "host-secret-user-input"
+    secret_final = "host-secret-final-answer"
+    request = replace(
+        _request(run_id),
+        input=RunInput(
+            messages=(
+                UserMessage(
+                    role=AgentMessageRole.USER,
+                    content=secret_input,
+                ),
+            )
+        ),
+    )
+    harness = LocalRunHarness(
+        proxy=_ScriptedProxy(
+            events=(
+                _engine_content_delta(run_id=run_id),
+                _engine_final(run_id=run_id, content=secret_final),
+            ),
+        ),
+    )
+
+    with caplog.at_level(15, logger="dayu.host"):
+        stream = await harness.start_run(request)
+        events = await _collect(stream.events)
+        log_text = await _wait_for_log_text(
+            caplog.records,
+            expected_text="host.run.background_finished",
+        )
+
+    assert events[-1].type is RunEventType.FINAL_ANSWER
+    assert "host.run.start_accepted" in log_text
+    assert "host.run.background_start" in log_text
+    assert "host.run.attempt_start" in log_text
+    assert "host.run.terminal_appended" in log_text
+    assert "host.run.background_finished" in log_text
+    assert "host.run.memory_projected" in log_text
+    assert "host.event_store.subscribe_start" in log_text
+    assert "host.event_store.subscribe_complete" in log_text
+    assert "host.run_input_builder.build_completed" in log_text
+    assert "host.conversation_memory.projected" in log_text
+    assert "session_id=session" in log_text
+    assert f"run_id={run_id}" in log_text
+    assert secret_input not in log_text
+    assert secret_final not in log_text
 
 
 @pytest.mark.asyncio
