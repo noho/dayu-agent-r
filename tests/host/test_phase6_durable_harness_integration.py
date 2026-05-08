@@ -31,7 +31,10 @@ from dayu.engine import (
     RunnerSpec,
     UserMessage,
 )
-from dayu.host._durable_harness import build_durable_harness
+from dayu.host._durable_harness import (
+    DurableHarnessConfig,
+    build_durable_harness,
+)
 from dayu.host._internal_contracts import AttemptState, ObserverStatus
 from dayu.host.contracts import (
     RunInput,
@@ -204,7 +207,7 @@ async def test_durable_harness_start_run_drains_to_read_models() -> None:
     """build_durable_harness + start_run 完整路径应推进 read model 与 attempt 状态。"""
 
     bundle = build_durable_harness(
-        database_path=":memory:",
+        config=DurableHarnessConfig(database_path=":memory:"),
         proxy=_StubProxy(
             events=(_final_event(run_id="r1", session_id="s1"),),
         ),
@@ -246,7 +249,7 @@ async def test_durable_harness_shares_memory_store_with_observer() -> None:
 
     shared = InMemoryConversationMemoryStore()
     bundle = build_durable_harness(
-        database_path=":memory:",
+        config=DurableHarnessConfig(database_path=":memory:"),
         memory_store=shared,
         proxy=_StubProxy(
             events=(_final_event(run_id="r2", session_id="s2"),),

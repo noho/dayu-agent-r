@@ -266,9 +266,16 @@ P7 只新增一个 observer 的状态推进，不新增 Run terminal gate。
 
 ## 9. 数据持久化 / Schema 变化
 
+> **状态：本节原始 SQLite 双表方案已被 JSONL 真源方案取代** `[已修复 / 已被取代]`。
+> P7 落地实现：`docs/host/phase7-implementation-plan.md` 与 `docs/host/design.md` §9.4 已记录
+> "tool trace 完全走文件系统（JSONL + raw blob 文件），0 张新 SQLite 表"；`RUN_INPUT_CONTEXT_SNAPSHOT_BUILT`
+> raw payload 内联在 fact `data` 中，事务边界收敛到单条 `append_in_transaction`。下面段落保留作为
+> 早期方案历史依据，**不再代表当前真源**；analyzer/observer 实现以 design.md §9.4 与 implementation
+> plan 为准。
+
 P7 涉及 Host durable schema 变更，按全新 schema 起库处理，不做旧库兼容读取。
 
-建议新增表：
+~~建议新增表~~（**已被取代**，下列字段现作为 JSONL record 字段在 `dayu/host/_tool_trace_jsonl_sink.py` 中等价承载）：
 
 - `host_tool_trace_records`
   - `trace_record_id TEXT PRIMARY KEY`

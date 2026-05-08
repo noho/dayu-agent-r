@@ -35,8 +35,10 @@
 - P7 Tool Trace Projection / Sink plan gate 已通过：plan 见 `docs/host/phase7-plan.md`，
   plan review 见 `docs/host/phase7-plan-review.md`，复审见
   `docs/host/phase7-plan-rereview.md`，结论通过。计划阶段提交为
-  `f55f5ac docs: finalize host p7 tool trace plan`。当前进入 P7 代码实施指导 prompt 阶段，
-  由用户手工派实施 Agent 执行代码。
+  `f55f5ac docs: finalize host p7 tool trace plan`。P7 代码实施、常规 code review、
+  OLD / NEW review、架构边界 review、review fix 与复审均已完成，复审见
+  `docs/host/phase7-fix-rereview.md`，结论通过；残余风险已拆分到 GitHub issues #29-#35。
+  当前进入 P7 实现提交与 PR 前收口阶段。
 
 每个 Phase 进入实现前，必须另写可交接的 phase plan，细化到迁移 Agent 可以直接接手：
 目标、非目标、边界、文件级改动清单、契约变化、状态机、测试清单、验证命令、review gate、
@@ -322,6 +324,44 @@ P6 code / architecture / concurrency review 修复后，若仍存在不阻断 P6
   no-full-governance smoke 与非 durable 过渡装配使用，不再代表生产事实层。P16 interface freeze /
   文档收口时必须决定：删除它、迁移到测试 helper / explicit local adapter，或用专项理由保留为
   非生产 adapter；不得继续作为 Host 生产默认装配或 public interface 暗含依赖。
+
+### 4.3 P7 残余风险追踪
+
+P7 落地后，仍需后续阶段追踪的残余风险：
+
+- `accepted: P7 scope`：`ToolTraceObserver` 是同步 sink。每行 `flush + fsync` + raw payload
+  `tmp + os.replace` 的写入完全发生在文件系统、不动 SQLite、不阻塞 Engine 事件产生，但会
+  阻塞 terminal `coordinator.drain()`。当 trace root 处于慢速文件系统时 terminal completion 可能
+  被拉长；后续若 P8 / P15 需要更强 SLA，可在 observer 协议升级为 async 时统一评估。
+- `accepted: P7 scope`：JSONL 与 EventLog checkpoint 非原子。每行 trace 在 EventLog 已 commit
+  之后由 observer 写入；进程在两步之间崩溃，replay 后会产生重复行。靠行内 sha256[:32]
+  `idempotency_key` 让 analyzer 去重消化崩溃窗口；P7 不引入跨子系统二阶段提交。
+- `deferred-with-owner: P7-followup`：ToolRuntime 路径 trace 真实化。当前 stub smoke 不能注入
+  `TOOL_RESULT_TRUNCATED` / `TOOL_FETCH_MORE_*` 这类 Host-owned canonical fact；该路径需要
+  真实 ToolRuntime smoke 或 truncation 专属 smoke 串通，并在 trace 中验证 `truncation_*` /
+  `fetch_more_*` 维度的 idempotency_key + cursor 链路。
+- `deferred-with-owner: P7-followup`：ToolRuntime 派生事件未携带 `iteration_id`。当前
+  `_iteration_id_for_tool_runtime` 用空字符串占位作为 group key 维度，与 OLD 行为一致；
+  待 ToolRuntime 事件携带 iteration_id 后切换。
+- `deferred-with-owner: P7-followup`：compact 重试路径合成 `RunInputContextSnapshotBuiltData`
+  时的 `iteration_index` / `attempt_index` 取值需要与真实 Engine attempt 元信息对齐验证，
+  避免 trace `iteration_context_snapshot` 字段在 compact retry 后语义偏移。
+- `deferred-with-owner: P8`：partial tool calls 完整语义。Engine 在 SSE 中途失败造成的部分
+  tool call 当前不会进入 P7 trace 的 `tool_call` record（因为缺 `TOOL_RESULT_ACCEPTED`），
+  observer 会在 batch 内抛 `ProjectionSchemaError`；P8 owner fencing / recovery 落地后需要重新
+  定义 partial tool call 的 trace 语义（独立 record vs. failed outcome）。
+- `accepted: P7 scope, mid-term-evaluate`：`RUN_INPUT_CONTEXT_SNAPSHOT_BUILT` fact `data` payload
+  内联完整 `raw_input_messages_json` / `raw_tool_schemas_json`。该方案让 raw payload 与 fact
+  落库收敛到单条 `append_in_transaction`，天然消除"fact 已落但 raw ref 缺失"窗口；trade-off 是
+  `run_events` 行体积可达数十 KB ~ 数百 KB，长期会让 EventLog 变成冷热混合存储、影响
+  `ProjectionCoordinator.drain()` 反序列化吞吐与未来 retention / compaction。当 Run 体量或 tool
+  schema 数量显著增长后，应评估把 raw payload 外迁到独立表 / 文件、fact 仅保留 ref。
+- `accepted: P7 baseline, defer-to-P8/P9`：`LocalRunHarness` 已承载 16 字段 / 43 方法，横跨 Run
+  生命周期管理、Engine 事件翻译、context compact、memory projection、attempt state 持久化、
+  P7 fact append 等多个职责；P7 增量虽克制（builder 抽到 `_run_input_context_fact.py`、harness
+  仅装配 + `append_in_transaction`），但基线已接近 God Object 阈值。后续 P8 / P9 应评估按职责
+  拆分为更小组件（如 `AttemptManager` / `ContextCompactHandler` / `RunInputContextFactAppender`）；
+  不属于 P7 阻断项。
 
 P9 实施 `start_run` 幂等时，必须重新讨论并固定 `(session_id, client_request_id)` 如何幂等映射到
 同一个 `run_id`：包括 `run_id` 由 Host 生成还是由持久 Run 创建事实确定、重复请求返回同一

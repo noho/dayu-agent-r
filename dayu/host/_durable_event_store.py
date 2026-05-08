@@ -306,6 +306,27 @@ class DurableRunEventStore:
             event_position=GlobalEventPosition(value=event_position),
         )
 
+    def append_in_transaction(
+        self,
+        *,
+        tx: HostStorageTransaction,
+        draft: RunEventDraft,
+    ) -> RunEvent:
+        """在外层 :class:`HostStorageTransaction` 内追加 RunEvent。
+
+        本方法是 :meth:`_append_in_transaction` 的 thin 公共包装，供 Host
+        其它子系统在已有事务上下文内同事务追加 Host-owned canonical fact
+        （例如 P7 ``RUN_INPUT_CONTEXT_SNAPSHOT_BUILT``）。
+
+        :param tx: 当前 :class:`HostStorageTransaction`。
+        :param draft: RunEvent 草稿。
+        :returns: 已落库的 RunEvent。
+        :raises ValueError: run 已终态时抛出。
+        """
+
+        appended = self._append_in_transaction(tx=tx, draft=draft)
+        return appended.event
+
     def _upsert_run_state(
         self,
         *,

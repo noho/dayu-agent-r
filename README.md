@@ -993,6 +993,61 @@ python -m utils.analyze_tool_trace \
 - 各 run / turn 的工具调用链与 trace 完整性检查
 - 面向工具设计的优化建议
 
+### 5.0 Host P7 durable trace（NEW，schema `tool_trace_v2_host`）
+
+Host P6/P7 路径下的 durable EventLog 自带一条**新的** trace 落盘通道，
+用于人工排查 EventLog 与 LLM-facing 上下文的真实事实。装配入口：
+
+```python
+from dayu.host._durable_harness import (
+    DurableHarnessConfig,
+    build_durable_harness,
+)
+
+bundle = build_durable_harness(
+    config=DurableHarnessConfig(
+        database_path="workspace/host.sqlite",
+        tool_trace_path="workspace/output/host_tool_trace",
+    ),
+)
+```
+
+- `tool_trace_path` 非空时装配 `ToolTraceObserver` + `ToolTraceJsonlSink`，
+  trace 会以 JSONL 写入
+  `<root>/sessions/<session_id>/tool_calls_NNNNNN.jsonl`（约 10MB 滚动），
+  `RUN_INPUT_CONTEXT_SNAPSHOT_BUILT` 内联的完整 input / tool schema raw
+  payload 拆为 `<root>/raw_payloads/<run_id>_<iteration_id>/<blob_id>.json`，
+  先写 tmp + `os.replace` 原子落地。
+- schema 字面量为 `tool_trace_v2_host`，**与旧 `tool_trace_v2` 不兼容**，
+  治理边界、字段集合、idempotency_key 计算方式都不同。
+- 行内 sha256[:32] `idempotency_key` 让重复 replay 的孤儿副本可以被 analyzer
+  去重；P7 没有在 SQLite 引入 `host_tool_trace_*` 表。
+
+人工 smoke：
+
+```bash
+source .venv/bin/activate
+python utils/smoke_host_p7_tool_trace.py
+# 末尾会自动调 analyzer，并打印 tmp 目录路径供 inspect。
+```
+
+独立 analyzer：
+
+```bash
+python utils/analyze_tool_trace_host.py <trace_root>
+```
+
+`utils/analyze_tool_trace_host.py` 仅识别 `tool_trace_v2_host` schema，
+遇到 OLD `tool_trace_v2` 文件直接抛 `ValueError`；它输出去重后的 record
+计数、重复 tool_call、truncation 后未续读 fetch_more、fetch_more 引用未知
+cursor、`provider_protocol_error` 数量、`final_response` 是否存在，以及同
+run 内 `source_event_position` 是否单调。
+
+> 5.0 与 5（`utils.analyze_tool_trace`）面向**两条不同的 trace 路径**：
+> 5 是 CLI 历史 OLD trace，沿用 `tool_trace_v2` schema 与既有 markdown
+> 报告；5.0 是 Host durable harness 的 NEW trace。两条路径不互通，分析
+> 工具不应混用。
+
 ### 5.1 网页抓取诊断
 
 当你遇到“浏览器能打开，但 `fetch_web_page` / `requests` / Playwright 访问失败”的 URL 时，可以用下面的脚本把同源证据导出成 JSON：

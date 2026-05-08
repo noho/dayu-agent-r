@@ -140,6 +140,42 @@ P6 已落地：
 - `dayu.host._durable_harness.build_durable_harness` 装配 durable 路径的
   `LocalRunHarness` + `ProjectionCoordinator` + 默认 observer。
 
+P7 已落地：
+
+- EventLog 是 trace 唯一来源：``RUN_INPUT_CONTEXT_SNAPSHOT_BUILT`` canonical
+  fact 在 RunInputBuilder 完成、Engine attempt 启动前由 `LocalRunHarness`
+  同事务追加，内联完整 ``raw_input_messages_json`` /
+  ``raw_tool_schemas_json`` 与 ``raw_*_blob_id``。compact 重试路径合成
+  trace 后追加；启用开关由 `tool_trace_context_fact_enabled` 控制，关闭
+  时行为与 P6 完全一致。
+- `RunInputContextFactBuilder`（位于 `dayu.host._run_input_context_fact`）
+  把 `RunInput` / 当前 user 事件 / 工具 schemas 派生为强类型
+  `RunInputContextSnapshotBuiltData`，包含 message / tool schema 摘要、
+  ``content_hash``、``role_sequence``、``current_user_*`` 维度，
+  ``raw_*_blob_id`` 跨 replay 稳定（相同输入产出相同 id）。
+- `ToolTraceObserver`（位于 `dayu.host._tool_trace_projection`）把 EventLog
+  canonical 事实派发为 5 类 trace record：``tool_call``、
+  ``iteration_context_snapshot``、``iteration_usage``、``final_response``、
+  ``provider_protocol_error``；同 batch 内按 ``(iteration_id, tool_call_id)``
+  配对 ``TOOL_CALL_REQUESTED`` + ``TOOL_RESULT_ACCEPTED``，缺对抛
+  `ProjectionSchemaError` -> `BLOCKED_FAILED`。``record_role`` /
+  ``source_event_position`` 进入 sha256[:32] ``idempotency_key`` 让
+  analyzer 去重重放副本。
+- `ToolTraceJsonlSink` 落 ``<root>/sessions/<session_id>/tool_calls_*.jsonl``
+  并按 ~10MB 滚动；每行 ``flush + fsync``。
+  ``RUN_INPUT_CONTEXT_SNAPSHOT_BUILT`` 内联的 raw payload 写入
+  ``<root>/raw_payloads/<run_id>_<iteration_id>/<blob_id>.json``，先 tmp +
+  ``os.replace`` 原子落地。``PROVIDER_PROTOCOL_ERROR`` 的 ``raw_payload``
+  在落盘前由 `_scrub_provider_secret` 替换 ``Authorization`` /
+  ``api_key`` / ``cookie`` / ``x-api-key`` 等敏感键为 ``"***"``；缺失
+  payload 时 fallback 到 ``{"reason": "omitted_no_payload"}``。其它字段
+  （prompt、tool result、scope_token / cursor）按 OLD 热/冷分层保留。
+- 装配开关：`DurableHarnessConfig.tool_trace_path` 非空字符串时装配
+  `ToolTraceObserver`（非 required projection）并把 fact 开关传给
+  `LocalRunHarness`；``None`` / 空字符串等价于未配置 trace，coordinator
+  observer 元组与 EventLog 都不会出现 trace fact 与 trace observer。
+  P7 不在 SQLite 引入任何 ``host_tool_trace_*`` 表。
+
 不得为旧 Host 接口创建兼容 wrapper、facade 或 re-export。
 
 ## 当前公开接口

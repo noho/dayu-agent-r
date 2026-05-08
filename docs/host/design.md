@@ -787,10 +787,12 @@ RunInputBuilder builds RunInput
 RunInputBuilder 的决策。它必须在 RunInputBuilder 产物确定后、Engine attempt 启动前写入；否则
 tool trace 会重新退化为进程内缓存诊断，无法 crash replay。
 
-`RUN_INPUT_CONTEXT_SNAPSHOT_BUILT` 的冷层 raw payload 与 EventLog fact 必须作为同一个 durable unit of
-work 提交。Host 应先在同一事务中写入完整 model input / tool schemas raw payload，再 append fact
-引用这些 raw refs；任一写入失败时 transaction 回滚，Engine attempt 不启动。禁止留下“fact 已落库但
-raw ref 缺失”的可见状态。
+`RUN_INPUT_CONTEXT_SNAPSHOT_BUILT` 的 raw payload 与 EventLog fact 必须作为同一个 durable unit of
+work 提交。P7 落地的实现方式：fact `data` payload 直接内联完整 `raw_input_messages_json` 与
+`raw_tool_schemas_json`（SQLite TEXT 列无大小硬上限），事务边界收敛到单条 `append_in_transaction`
+原子写入；不再单独写"先 raw blob 再 append fact ref"两阶段。该方式天然消除"fact 已落库但 raw
+ref 缺失"窗口；trade-off 是 EventLog 行体积增大，已在 `docs/host/migration-plan.md` §4.3 登记为
+中期评估项（必要时再外迁到独立表 / 文件）。
 
 P7 trace payload 采用 OLD 的热 / 冷分层，而不是默认做业务内容过滤：
 
@@ -812,6 +814,25 @@ P7 固定采用 `tool_trace_v2_host` 作为 Host trace schema version。OLD `too
 exporter / adapter 输入输出素材，但 Host 内部 read model 不伪装成完全 OLD-compatible schema。durable
 harness 在配置了 `ToolTraceStore` / trace storage path 时默认注册 `tool_trace_observer`；未配置 trace
 store 时不注册，避免无意义 observer 状态面。
+
+P7 落地后的硬事实：
+
+- JSONL 文件是 trace 的真源；P7 不在 SQLite 引入任何 `host_tool_trace_*` 表。`docs/host/phase7-plan.md`
+  §9 原先建议的 `host_tool_trace_records` / `host_tool_trace_raw_payloads` 双表方案已被 JSONL 真源方案取代。
+- `RUN_INPUT_CONTEXT_SNAPSHOT_BUILT` 是 P6 EventLog 的事实补齐 patch，由 Host 同事务追加；
+  内联 `raw_input_messages_json` / `raw_tool_schemas_json` 与 `raw_*_blob_id`，让 trace observer
+  无需回查 EventLog 即可重建 raw payload。
+- `ToolTraceObserver` 是当前唯一 sink 同步阻塞 terminal drain 的 observer：sink 每行 `flush + fsync`、
+  raw payload `tmp + os.replace` 原子落地，但写入完全在文件系统，**不动 SQLite**，不阻塞 Engine 事件
+  产生；`tx` 参数仅为满足 `ObserverSink` 协议而保留。projection 采用 best-effort 语义：JSONL append
+  与 `ProjectionCoordinator` checkpoint 推进非原子，crash 窗口可能产生孤儿副本，依赖行内
+  `idempotency_key` 在 analyzer 阶段去重，至少一次 + 去重而非 exactly-once。
+- 行内 `idempotency_key`（sha256[:32], 包含 `schema_version | trace_type | run_id | iteration_id |
+  tool_call_id | source_event_position | record_role`）是 analyzer 去重崩溃 replay 副本的依据；
+  `analyzer` 严格拒绝 OLD `tool_trace_v2` 文件，不做兼容读取。
+- provider secret scrub 仅作用于 `PROVIDER_PROTOCOL_ERROR.raw_payload`（`Authorization` /
+  `api_key` / `cookie` / `x-api-key` / `openai-organization` / `anthropic-api-key` 等键替换为 `***`）；
+  `scope_token` / `cursor` / prompt / tool result 仍按 OLD 热 / 冷分层保留进 trace，用于真实故障定位。
 
 ### 9.5 Wait / Suspend 预留契约
 

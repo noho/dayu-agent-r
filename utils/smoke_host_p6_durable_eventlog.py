@@ -60,7 +60,10 @@ from dayu.engine import (  # noqa: E402
     RunnerSpec,
     UserMessage,
 )
-from dayu.host._durable_harness import build_durable_harness  # noqa: E402
+from dayu.host._durable_harness import (  # noqa: E402
+    DurableHarnessConfig,
+    build_durable_harness,
+)
 from dayu.host.contracts import (  # noqa: E402
     RunInput,
     RunOptions,
@@ -264,7 +267,7 @@ async def _run_smoke() -> None:
     """
 
     bundle = build_durable_harness(
-        database_path=":memory:",
+        config=DurableHarnessConfig(database_path=":memory:"),
         proxy=_StubProxy(events=_build_engine_events()),
     )
     try:

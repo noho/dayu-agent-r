@@ -75,6 +75,7 @@ class RunEventType(StrEnum):
     TOOL_FETCH_MORE_FAILED = "tool_fetch_more_failed"
     TOOL_CURSOR_EXPIRED = "tool_cursor_expired"
     TOOL_CURSOR_DENIED = "tool_cursor_denied"
+    RUN_INPUT_CONTEXT_SNAPSHOT_BUILT = "run_input_context_snapshot_built"
 
 
 class RunEventKind(StrEnum):
@@ -460,12 +461,111 @@ ToolRuntimeEventData: TypeAlias = (
 )
 """ToolRuntime canonical RunEvent data 封闭联合。"""
 
+
+@dataclass(frozen=True, slots=True)
+class RunInputMessageSummary:
+    """RunInput 单条消息的热层摘要。
+
+    :param role: Engine AgentMessage role 字面量。
+    :param source_kind: 消息来源类别（current_user / memory_block / system /
+        caller_system 等），用于 trace 诊断分组。
+    :param excerpt: 已按 Host bounded 策略截断的文本预览。
+    :param content_hash: 原文 sha256 16-byte 前缀十六进制摘要，用于跨 run /
+        replay 比对一致性。
+    :param char_size: 原文字符数。
+    :param token_estimate: 估算 token 数。
+    """
+
+    role: str
+    source_kind: str
+    excerpt: str
+    content_hash: str
+    char_size: int
+    token_estimate: int
+
+
+@dataclass(frozen=True, slots=True)
+class RunInputToolSchemaSummary:
+    """RunInput 暴露给 Engine 的工具 schema 摘要。
+
+    :param name: 工具名称。
+    :param schema_hash: 工具 schema 序列化后 sha256 16-byte 前缀十六进制。
+    """
+
+    name: str
+    schema_hash: str
+
+
+@dataclass(frozen=True, slots=True)
+class RunInputContextMeta:
+    """RunInput 整体上下文摘要。
+
+    :param message_count: 进入 RunInput 的消息总数。
+    :param role_sequence: 按顺序的消息 role 元组（hot 层快速诊断）。
+    :param total_char_size: 估算字符总数。
+    :param total_token_estimate: 估算 token 总数。
+    :param memory_item_count: 来自 conversation memory 的 item 数量。
+    :param current_user_run_id: 当前 user 输入对应的 run id。
+    """
+
+    message_count: int
+    role_sequence: tuple[str, ...]
+    total_char_size: int
+    total_token_estimate: int
+    memory_item_count: int
+    current_user_run_id: str
+
+
+@dataclass(frozen=True, slots=True)
+class RunInputContextSnapshotBuiltData:
+    """RunInputBuilder 完成、Engine attempt 启动前的 Host-owned 事实。
+
+    本 fact 在 Host RunInputBuilder 完成后、Engine attempt 启动前同事务追
+    加到 EventLog；崩溃 replay 时由 P7 ``ToolTraceObserver`` 派生为 OLD
+    `iteration_context_snapshot` 的等价 record。完整 model_input_messages
+    与 tool_schemas 的 raw JSON 内联在 ``raw_input_messages_json`` /
+    ``raw_tool_schemas_json`` 中（EventLog ``data`` TEXT 列无大小硬限制）；
+    observer 阶段把它们拆成 ``raw_payloads/`` 文件，hot 层只保留摘要。
+
+    :param iteration_id: 当前 Engine iteration id。
+    :param iteration_index: Engine iteration index（attempt 内自增）。
+    :param attempt_index: Host attempt index（retry / compact 后 +1）。
+    :param current_user_excerpt: 当前 user 输入截断预览。
+    :param current_user_content_hash: 当前 user 输入 sha256 摘要前缀。
+    :param current_user_source_cursor: 当前 user 输入 RunEvent cursor.sequence；
+        若来源事件未携带 cursor 则 ``None``。
+    :param message_summaries: 每条 model_input message 的热层摘要。
+    :param tool_schema_summaries: 暴露给 Engine 的工具 schema 摘要。
+    :param context_meta: 整体上下文摘要。
+    :param raw_input_messages_json: 完整 model_input_messages 的 JSON 字符串。
+    :param raw_tool_schemas_json: 完整 tool_schemas 的 JSON 字符串。
+    :param raw_input_blob_id: observer 写 raw_input 文件时使用的稳定标识。
+    :param raw_tool_schemas_blob_id: observer 写 raw_tool_schemas 文件时使用的
+        稳定标识。
+    """
+
+    iteration_id: str
+    iteration_index: int
+    attempt_index: int
+    current_user_excerpt: str
+    current_user_content_hash: str
+    current_user_source_cursor: int | None
+    message_summaries: tuple[RunInputMessageSummary, ...]
+    tool_schema_summaries: tuple[RunInputToolSchemaSummary, ...]
+    context_meta: RunInputContextMeta
+    raw_input_messages_json: str
+    raw_tool_schemas_json: str
+    raw_input_blob_id: str
+    raw_tool_schemas_blob_id: str
+
+
 RunEventData: TypeAlias = (
     EngineEventData
     | HostRunFailedData
     | UserInputAcceptedData
     | HostContextCompactEventData
     | ToolRuntimeEventData
+    | RunInputContextSnapshotBuiltData
 )
 """Host RunEvent data 封闭联合。"""
 
@@ -906,6 +1006,10 @@ __all__ = [
     "RunFailedResult",
     "RunHandle",
     "RunInput",
+    "RunInputContextMeta",
+    "RunInputContextSnapshotBuiltData",
+    "RunInputMessageSummary",
+    "RunInputToolSchemaSummary",
     "RunOptions",
     "RunResult",
     "RunState",

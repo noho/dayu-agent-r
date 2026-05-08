@@ -41,6 +41,7 @@ from dayu.host._conversation_memory import (
     InMemoryConversationMemoryStore,
     snapshot_with_transient_tool_facts,
 )
+from dayu.host._durable_event_store import DurableRunEventStore
 from dayu.host._event_observer import ProjectionCoordinator
 from dayu.host._event_store import InMemoryRunEventStore, RunEventStore
 from dayu.host._event_translation import (
@@ -66,6 +67,7 @@ from dayu.host._run_input_builder import (
     RunInputBuildTrace,
     RunInputBuilder,
 )
+from dayu.host._run_input_context_fact import RunInputContextFactBuilder
 from dayu.host._run_state_store import AttemptStateStore
 from dayu.host._tool_runtime import (
     InMemoryToolRuntime,
@@ -78,8 +80,12 @@ from dayu.host.contracts import (
     HostContextOverflowObservedData,
     RunEvent,
     RunEventCursor,
+    RunEventDraft,
+    RunEventKind,
+    RunEventSource,
     RunEventType,
     RunHandle,
+    RunInput,
     RunResult,
     RunState,
     RunStream,
@@ -129,6 +135,74 @@ _UNEXPECTED_COMPACTION_TERMINAL_MESSAGE: str = (
 )
 _LOGGER: logging.Logger = logging.getLogger(__name__)
 _RunCacheValue = TypeVar("_RunCacheValue")
+_RUN_INPUT_CONTEXT_FACT_BUILDER_REQUIRED: str = (
+    "run_input_context_fact_builder must be provided when "
+    "tool_trace_context_fact_enabled is True"
+)
+
+
+def _iteration_id_for_attempt(*, run_id: str, attempt_index: int) -> str:
+    """派生 attempt 启动前的占位 iteration_id。
+
+    Engine attempt 的 iteration id 在首个 ``ITERATION_STARTED`` 事件前不
+    可见，但 P7 trace observer 需要把 RunInput context snapshot 与
+    iteration 0 关联用于 raw payload 拆文件路径。本函数派生稳定占位
+    ``f"{run_id}-attempt-{attempt_index:02d}"``，跨 replay 一致。
+
+    :param run_id: Run id。
+    :param attempt_index: Host attempt 序号。
+    :returns: 占位 iteration_id。
+    :raises Exception: 不主动抛出异常。
+    """
+
+    return f"{run_id}-attempt-{attempt_index:02d}"
+
+
+def _synthesize_compact_trace(
+    *,
+    request: StartRunRequest,
+    compacted_input: RunInput,
+    after_token_estimate: int,
+) -> RunInputBuildTrace:
+    """compact 路径下合成 :class:`RunInputBuildTrace`。
+
+    compact 不再经过 :class:`RunInputBuilder`，所以没有原生 trace。本函数
+    合成一个最小 trace：``items`` 留空，``total_token_estimate`` 取
+    ``completed_data.after_token_estimate``，``total_char_size`` 由 compact
+    后消息文本累加而成。该 trace 仅用于 P7 Host-owned context snapshot
+    fact 的元信息字段，不参与 RunInputBuilder 自身行为。
+
+    :param request: compact 前的 attempt 请求；提供 session_id / run_id。
+    :param compacted_input: compact 后的 :class:`RunInput`。
+    :param after_token_estimate: compact 完成后估算 token 总数。
+    :returns: 合成的 :class:`RunInputBuildTrace`。
+    :raises Exception: 不主动抛出异常。
+    """
+
+    total_char_size = sum(
+        len(_message_text_for_trace(message))
+        for message in compacted_input.messages
+    )
+    return RunInputBuildTrace(
+        session_id=request.session_id,
+        run_id=request.run_id,
+        items=(),
+        total_char_size=total_char_size,
+        total_token_estimate=after_token_estimate,
+    )
+
+
+def _message_text_for_trace(message: AgentMessage) -> str:
+    """读取 AgentMessage 正文用于字符数累加。
+
+    :param message: AgentMessage。
+    :returns: 文本正文；AssistantMessage.content 为 ``None`` 时返回空串。
+    :raises Exception: 不主动抛出异常。
+    """
+
+    if isinstance(message, AssistantMessage):
+        return "" if message.content is None else message.content
+    return message.content
 
 
 @runtime_checkable
@@ -234,6 +308,13 @@ class LocalRunHarness:
     :param storage: 可选 :class:`HostStorage`；attempt_state_store 写入需要
         共享事务,因此 harness 持有 storage handle 以开启短事务。仅 durable
         路径需要注入。
+    :param tool_trace_context_fact_enabled: P7 开关，启用后 harness 在每个
+        attempt 启动前同事务追加 ``RUN_INPUT_CONTEXT_SNAPSHOT_BUILT``
+        canonical fact。仅 durable 路径生效（要求
+        ``event_store`` 是 :class:`DurableRunEventStore` 且 ``storage`` 非
+        ``None``）。
+    :param run_input_context_fact_builder: P7 RunInput context fact 构造器；
+        ``tool_trace_context_fact_enabled`` 启用后必须注入。
     :param context_compact_retry_limit: context overflow compact retry 上限。
     :param run_input_trace_cache_limit: RunInput 构造 trace 保留上限。
     :param run_input_message_cache_limit: RunInput 消息诊断缓存保留上限。
@@ -254,6 +335,8 @@ class LocalRunHarness:
     coordinator: ProjectionCoordinator | None = None
     attempt_state_store: AttemptStateStore | None = None
     storage: HostStorage | None = None
+    tool_trace_context_fact_enabled: bool = False
+    run_input_context_fact_builder: RunInputContextFactBuilder | None = None
     context_compact_retry_limit: int = _CONTEXT_COMPACT_RETRY_LIMIT
     run_input_trace_cache_limit: int = _RUN_INPUT_TRACE_CACHE_LIMIT
     run_input_message_cache_limit: int = _RUN_INPUT_MESSAGE_CACHE_LIMIT
@@ -325,6 +408,16 @@ class LocalRunHarness:
             messages=build_result.run_input.messages,
         )
         engine_request = replace(request, input=build_result.run_input)
+        await self._append_run_input_context_snapshot_fact(
+            request=engine_request,
+            build_trace=build_result.trace,
+            current_user_event=current_user_event,
+            attempt_index=0,
+            iteration_index=0,
+            iteration_id=_iteration_id_for_attempt(
+                run_id=engine_request.run_id, attempt_index=0
+            ),
+        )
         task = asyncio.create_task(
             self._run_to_store(
                 request=engine_request,
@@ -506,7 +599,7 @@ class LocalRunHarness:
                                 "context compact requires current_user_event"
                             )
                         try:
-                            next_request = await self._compact_or_fail(
+                            next_request_with_trace = await self._compact_or_fail(
                                 request=attempt_request,
                                 current_user_event=current_user_event,
                                 attempt_index=attempt_index,
@@ -520,7 +613,7 @@ class LocalRunHarness:
                                 )
                             )
                             return
-                        if next_request is None:
+                        if next_request_with_trace is None:
                             terminal_seen = True
                             await self._finish_attempt_if_durable(
                                 attempt_id=current_attempt_id,
@@ -530,6 +623,7 @@ class LocalRunHarness:
                             )
                             current_attempt_id = None
                             return
+                        next_request, compact_trace = next_request_with_trace
                         # 当前 attempt 因 context overflow 关闭,准备启动下一
                         # attempt: 旧 attempt 状态推进为 STALE_DIAGNOSTIC,
                         # 然后为新 attempt 创建持久记录。
@@ -546,6 +640,17 @@ class LocalRunHarness:
                                 request=attempt_request,
                                 attempt_index=attempt_index,
                             )
+                        )
+                        await self._append_run_input_context_snapshot_fact(
+                            request=attempt_request,
+                            build_trace=compact_trace,
+                            current_user_event=current_user_event,
+                            attempt_index=attempt_index,
+                            iteration_index=0,
+                            iteration_id=_iteration_id_for_attempt(
+                                run_id=attempt_request.run_id,
+                                attempt_index=attempt_index,
+                            ),
                         )
                         continue
                     terminal_seen = (
@@ -595,13 +700,17 @@ class LocalRunHarness:
         request: StartRunRequest,
         current_user_event: RunEvent,
         attempt_index: int,
-    ) -> StartRunRequest | None:
-        """执行 Host-owned compact 并返回下一次 attempt 请求。
+    ) -> tuple[StartRunRequest, RunInputBuildTrace] | None:
+        """执行 Host-owned compact 并返回下一次 attempt 请求与合成 trace。
 
         :param request: 当前 attempt 请求。
         :param current_user_event: 本 Run 原始用户输入事件。
         :param attempt_index: 当前 attempt 序号。
-        :returns: 成功返回 compact 后请求；失败返回 ``None``。
+        :returns: 成功返回 ``(compact 后请求, 合成 RunInputBuildTrace)``；失败
+            返回 ``None``。合成 trace 的 ``items`` 为空（compact 路径不再来自
+            RunInputBuilder），``total_token_estimate`` 取
+            ``completed_data.after_token_estimate``，``total_char_size`` 由
+            compact 后消息正文重新累加。
         :raises Exception: append 事件或 compact 失败时透传。
         """
 
@@ -771,7 +880,11 @@ class LocalRunHarness:
                 ),
             )
         )
-        return replace(request, input=compacted_input)
+        return replace(request, input=compacted_input), _synthesize_compact_trace(
+            request=request,
+            compacted_input=compacted_input,
+            after_token_estimate=completed_data.after_token_estimate,
+        )
 
     async def _append_compact_exception_failure(
         self,
@@ -1199,6 +1312,76 @@ class LocalRunHarness:
             run_id=run_id,
             value=messages,
             limit=self.run_input_message_cache_limit,
+        )
+
+    async def _append_run_input_context_snapshot_fact(
+        self,
+        *,
+        request: StartRunRequest,
+        build_trace: RunInputBuildTrace,
+        current_user_event: RunEvent,
+        attempt_index: int,
+        iteration_index: int,
+        iteration_id: str,
+    ) -> None:
+        """同事务追加 ``RUN_INPUT_CONTEXT_SNAPSHOT_BUILT`` canonical fact。
+
+        非 durable 路径（``event_store`` 不是 :class:`DurableRunEventStore`
+        或 ``storage is None``）以及 ``tool_trace_context_fact_enabled`` 未开
+        启时直接 no-op，保持 P6 行为不变。
+
+        :param request: 当前 attempt 的 start 请求；其 ``input.messages`` 为
+            实际交给 Engine 的消息序列。
+        :param build_trace: RunInputBuilder 产出的 trace；compact 路径下由
+            调用方合成。
+        :param current_user_event: 本 Run 原始用户输入事件。
+        :param attempt_index: 当前 attempt 序号。
+        :param iteration_index: 即将启动的 iteration 序号；attempt 启动前固
+            定为 0。
+        :param iteration_id: 占位 iteration_id（见
+            :func:`_iteration_id_for_attempt`）。
+        :returns: 无返回值。
+        :raises ValueError: 启用 fact 但未注入 builder 时抛出。
+        :raises Exception: 同事务 append 失败时透传。
+        """
+
+        if not self.tool_trace_context_fact_enabled:
+            return
+        if not isinstance(self.event_store, DurableRunEventStore):
+            return
+        if self.storage is None:
+            return
+        if self.run_input_context_fact_builder is None:
+            raise ValueError(_RUN_INPUT_CONTEXT_FACT_BUILDER_REQUIRED)
+        data = self.run_input_context_fact_builder.build(
+            run_input=request.input,
+            build_trace=build_trace,
+            current_user_event=current_user_event,
+            tool_schemas=request.options.tool_schemas,
+            attempt_index=attempt_index,
+            iteration_index=iteration_index,
+            iteration_id=iteration_id,
+        )
+        draft = RunEventDraft(
+            run_id=request.run_id,
+            session_id=request.session_id,
+            kind=RunEventKind.CANONICAL,
+            source=RunEventSource.HOST,
+            type=RunEventType.RUN_INPUT_CONTEXT_SNAPSHOT_BUILT,
+            occurred_at=datetime.now(tz=timezone.utc),
+            data=data,
+            source_engine_event_id=None,
+        )
+        async with self.storage.transaction() as tx:
+            self.event_store.append_in_transaction(tx=tx, draft=draft)
+        _LOGGER.log(
+            VERBOSE_LOG_LEVEL,
+            "host.run.run_input_context_snapshot_built run_id=%s "
+            "attempt_index=%s iteration_id=%s message_count=%s",
+            request.run_id,
+            attempt_index,
+            iteration_id,
+            len(request.input.messages),
         )
 
     def stream_run_events(
