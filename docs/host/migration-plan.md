@@ -32,9 +32,11 @@
   `docs/host/phase6-concurrency-review.md` 标注修复状态；复审结果见
   `docs/host/phase6-fix-rereview.md`，结论通过。P6 已通过 PR #26 合入 `main`，
   merge commit 为 `499b9b1 Host P6 durable EventLog (#26)`。
-- 当前进入 P7 Tool Trace Projection / Sink 的 plan gate，分支为
-  `migration/host-p7-tool-trace-projection`；P7 plan Agent 正在编写
-  `docs/host/phase7-plan.md`。
+- P7 Tool Trace Projection / Sink plan gate 已通过：plan 见 `docs/host/phase7-plan.md`，
+  plan review 见 `docs/host/phase7-plan-review.md`，复审见
+  `docs/host/phase7-plan-rereview.md`，结论通过。计划阶段提交为
+  `f55f5ac docs: finalize host p7 tool trace plan`。当前进入 P7 代码实施指导 prompt 阶段，
+  由用户手工派实施 Agent 执行代码。
 
 每个 Phase 进入实现前，必须另写可交接的 phase plan，细化到迁移 Agent 可以直接接手：
 目标、非目标、边界、文件级改动清单、契约变化、状态机、测试清单、验证命令、review gate、
