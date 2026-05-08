@@ -16,6 +16,9 @@ Engine 当前负责：
 - 提供函数式入口：`run_agent_messages(request)` 与 `run_agent_and_wait(request)`。
 - 在私有 run-scoped Agent 中消费 Runner 事件流，并提升为带 `session_id`、`run_id`、`sequence`、`event_id` 的 `EngineEvent`。
 - 执行普通 completed / failed tool calling 闭环：Runner tool call -> `ToolExecutionRequest` -> `ToolExecutor.execute` -> tool message 注入下一轮 Runner。
+- 若 ToolExecutor 返回的成功结果携带截断信息，Agent 会把它投影为 LLM-facing
+  `truncation.next_action="fetch_more"` 与 `truncation.fetch_more_args`；Engine 不持有 cursor store，也不解释
+  `scope_token`。
 - 在 `finish_reason=length` 时执行 final-answer text continuation；continuation 轮固定 `tools=()`，只续写被截断的最终回答文本。
 - 收口三类终态：`final_answer`、`run_failed`、`run_cancelled`。
 - 维护 OpenAI-compatible Runner，把 provider 响应归一为 `RunnerEvent`。
@@ -28,7 +31,8 @@ Engine 当前不负责：
 - Host ToolRegistry、工具权限、工具执行调度或长事务等待。
 - awaiting / `run_suspended` 工具主链路。
 - trace store、transcript 持久化、conversation memory。
-- context compact policy、memory、retry、RunInput 重建、OLD `TruncationManager`、`fetch_more` 或语义压缩。
+- context compact policy、memory、retry、RunInput 重建、OLD `TruncationManager`、framework `fetch_more` 路由
+  或语义压缩。
 - 财报文档存取；财报文档只能通过 `dayu.fins.storage` 所属仓储边界处理。
 
 ## 稳定依赖表面
@@ -115,6 +119,8 @@ Runner close 失败只记录日志，不覆盖已经确定的业务 terminal。
 - 工具被禁用或 Runner 不支持工具时收到 `TOOL_CALLS` -> `run_failed("tool_call_not_enabled")`
 - `TOOL_CALLS` 且工具可用 -> `tool_call_requested` -> ToolExecutor -> `tool_result_accepted` -> 注入下一轮 Runner
 - completed 工具结果和 failed 工具结果都会进入 LLM 上下文；failed outcome 不是 cancellation，也不会直接伪装成 final answer
+- framework `fetch_more` 对 Engine 仍只是普通 tool call：Engine 负责发出 `ToolExecutionRequest` 与注入
+  ToolMessage，实际路由、cursor 校验、EventLog facts 与敏感参数 redaction 由 Host ToolRuntime / Host 翻译层负责。
 - ToolExecutor 返回 awaiting -> `run_failed("tool_awaiting_not_supported_in_phase3")`
 - Runner 流结束但无 `RunnerDoneData` -> `run_failed("runner_abnormal_stop")`，若此时 token 已取消则 `run_cancelled`
 
@@ -129,7 +135,10 @@ ToolExecutor 由 EngineWorker 替 Host 在选定执行环境中代持，并通�
 - 成功且 value 是 JSON object 时展开 value，不包内部 `ok/value` 信封。
 - 成功且 value 不是 JSON object 时包成 `{"content": ...}`。
 - 失败时投影 `error` / `message`，仅在 hint 非空时投影 `hint`。
-- 当前 `ToolTruncationInfo` 只承载内部截断治理事实，不含 LLM 可执行续读动作；Phase 3 不把 `has_more`、scope token 或 scope hash 投影给 LLM。
+- 截断成功结果会投影 `truncation.has_more`；当 `has_more=True` 时投影
+  `truncation.next_action="fetch_more"` 与 `truncation.fetch_more_args={cursor, scope_token, limit?}`，
+  让模型可在下一轮发起 framework `fetch_more`。`scope_hash` 不投影给 LLM；当 `has_more=False` 时不投影
+  `next_action`、`fetch_more_args` 或 `ttl_seconds`。
 
 当最后一轮普通工具调用执行完后，默认 `AgentFallbackMode.FORCE_ANSWER` 会追加 `AgentPolicy.fallback_prompt` 作为 `UserMessage`，以 `tools=()` 再调用 Runner，并产出 `final_answer(degraded=True)`。`AgentFallbackMode.RAISE_ERROR` 才直接 `run_failed("max_iterations_exceeded")`。连续全失败工具批次达到 `AgentPolicy.max_consecutive_failed_tool_batches` 时使用同一 fallback mode 收口。
 
@@ -180,7 +189,14 @@ Runner 不执行工具，不依赖 `ToolExecutor` / ToolRegistry，不产出 `En
 
 ## Diagnostics 与 SSE Idle
 
-Runner 使用标准库 `logging.getLogger(__name__)` 记录运行边界诊断。日志装配入口在 `dayu.runtime.log`，Engine 代码不导入 `dayu.runtime.log`。
+Runner 与 Agent 使用标准库 `logging.getLogger(__name__)` 记录运行边界诊断。日志装配入口在
+`dayu.runtime.log`，Engine 代码不导入 `dayu.runtime.log`；`VERBOSE` 级别数值只从无装配副作用的
+`dayu.runtime.log_levels` 常量模块读取。
+
+Agent 的 `VERBOSE` 日志覆盖 run 开始、iteration 开始、Runner 调用开始 / 完成、iteration 决策、tool loop、
+tool batch、tool message 注入、fallback / continuation 与 terminal。`DEBUG` 日志只记录有界分类细节，例如
+Runner event 类型、finish reason、usage token 计数、工具 outcome 分类；不输出 prompt、delta 全量、工具参数或工具结果。
+Agent 发现 terminal invariant 被破坏时记录 `CRITICAL`。
 
 SSE idle heartbeat / timeout 属于 Runner 字节流读取边界：
 
@@ -196,4 +212,4 @@ SSE idle heartbeat / timeout 属于 Runner 字节流读取边界：
 - 新 provider 参数应进入 `RunnerSpec` / provider request extension 的强类型字段。
 - 新 EngineEvent 或 RunnerEvent 必须扩展封闭 data 联合，并补齐穷尽匹配测试。
 - awaiting / `run_suspended`、Host resume、trace store、conversation memory、context compact policy、
-  OLD `TruncationManager` / `fetch_more` 尚未落地；这些能力不能通过当前 Agent 私自接入。
+  OLD `TruncationManager` 与 framework `fetch_more` 路由不属于 Engine；这些能力不能通过当前 Agent 私自接入。

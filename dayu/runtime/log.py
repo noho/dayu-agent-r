@@ -29,12 +29,20 @@ from collections.abc import Mapping
 from enum import IntEnum
 from typing import Final
 
+from dayu.runtime.log_levels import (
+    CRITICAL_LOG_LEVEL,
+    DEBUG_LOG_LEVEL,
+    ERROR_LOG_LEVEL,
+    INFO_LOG_LEVEL,
+    VERBOSE_LOG_LEVEL,
+    WARN_LOG_LEVEL,
+)
+
 _NAMESPACE_LOGGER_NAME: Final[str] = "dayu"
 _HANDLER_MARKER_ATTR: Final[str] = "_dayu_runtime_log_marker"
 _HANDLER_MARKER_VALUE: Final[str] = "dayu.runtime.log:stdout"
 _LOG_FORMAT: Final[str] = "[%(asctime)s] [%(levelname)s] [%(name)s] %(message)s"
 _LOG_DATE_FORMAT: Final[str] = "%Y-%m-%d %H:%M:%S"
-_VERBOSE_LEVEL_NUMBER: Final[int] = 15
 _VERBOSE_LEVEL_NAME: Final[str] = "VERBOSE"
 
 # 默认静默的第三方 logger（迁移自 OLD 行为）：避免 aiohttp / asyncio /
@@ -53,32 +61,35 @@ _DEFAULT_THIRD_PARTY_SUPPRESSIONS: Final[tuple[str, ...]] = (
     "httpx",
     "httpcore",
 )
-_DEFAULT_THIRD_PARTY_LEVEL: Final[int] = logging.WARNING
+_DEFAULT_THIRD_PARTY_LEVEL: Final[int] = WARN_LOG_LEVEL
 
 
 # 在模块导入时注册 VERBOSE level 到 stdlib logging，确保
 # logging.getLevelName(15) 返回 "VERBOSE"。
-logging.addLevelName(_VERBOSE_LEVEL_NUMBER, _VERBOSE_LEVEL_NAME)
+logging.addLevelName(VERBOSE_LOG_LEVEL, _VERBOSE_LEVEL_NAME)
 
 
 class LogLevel(IntEnum):
     """Dayu 日志级别枚举。
 
-    数值与 stdlib ``logging`` 保持一致以便直接传入 ``setLevel``：
+    数值由 :mod:`dayu.runtime.log_levels` 统一提供，标准级别与 stdlib
+    ``logging`` 保持一致以便直接传入 ``setLevel``：
 
-    - :attr:`DEBUG` = 10
-    - :attr:`VERBOSE` = 15（迁移自 OLD ``VERBOSE``，介于 DEBUG 与 INFO
-      之间；CLI ``--verbose`` 映射到此级别）
-    - :attr:`INFO` = 20
-    - :attr:`WARN` = 30
-    - :attr:`ERROR` = 40
+    - :attr:`DEBUG` 对应 ``DEBUG_LOG_LEVEL``。
+    - :attr:`VERBOSE` 对应 ``VERBOSE_LOG_LEVEL``，介于 DEBUG 与 INFO
+      之间；CLI ``--verbose`` 映射到此级别。
+    - :attr:`INFO` 对应 ``INFO_LOG_LEVEL``。
+    - :attr:`WARN` 对应 ``WARN_LOG_LEVEL``。
+    - :attr:`ERROR` 对应 ``ERROR_LOG_LEVEL``。
+    - :attr:`CRITICAL` 对应 ``CRITICAL_LOG_LEVEL``。
     """
 
-    DEBUG = 10
-    VERBOSE = 15
-    INFO = 20
-    WARN = 30
-    ERROR = 40
+    DEBUG = DEBUG_LOG_LEVEL
+    VERBOSE = VERBOSE_LOG_LEVEL
+    INFO = INFO_LOG_LEVEL
+    WARN = WARN_LOG_LEVEL
+    ERROR = ERROR_LOG_LEVEL
+    CRITICAL = CRITICAL_LOG_LEVEL
 
 
 def configure(

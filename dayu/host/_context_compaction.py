@@ -7,6 +7,7 @@ Engine 运行状态机，也不改变原始 ``USER_INPUT_ACCEPTED`` 真源。
 
 from __future__ import annotations
 
+import logging
 from dataclasses import dataclass
 from enum import StrEnum
 
@@ -32,6 +33,7 @@ from dayu.host.contracts import (
     StartRunRequest,
     UserInputAcceptedData,
 )
+from dayu.runtime.log_levels import VERBOSE_LOG_LEVEL
 
 COMPACT_POLICY_ID: str = "host_deterministic_context_compact_v1"
 _NOOP_FAILURE_MESSAGE: str = "compacted RunInput is not shorter"
@@ -42,6 +44,7 @@ _EVIDENCE_ANCHORS_SECTION_HEADER: str = "## Evidence Anchors"
 _TOOL_FACTS_SECTION_HEADER: str = "## Tool Facts"
 _SOURCE_EVENT_CURSOR_FIELD: str = "source_event_cursor"
 _CURRENT_COMPACT_DEGRADED_ITEM_COUNT: int = 0
+_LOGGER: logging.Logger = logging.getLogger(__name__)
 
 
 class ContextCompactDecisionStatus(StrEnum):
@@ -95,6 +98,18 @@ class ContextCompactCoordinator:
 
         before_tokens = estimate_messages_tokens(request.input.messages)
         before_chars = estimate_messages_chars(request.input.messages)
+        _LOGGER.log(
+            VERBOSE_LOG_LEVEL,
+            "host.context_compact.start session_id=%s run_id=%s "
+            "attempt_index=%s policy_id=%s before_tokens=%s "
+            "before_chars=%s",
+            request.session_id,
+            request.run_id,
+            attempt_index,
+            self.policy_id,
+            before_tokens,
+            before_chars,
+        )
         requested = HostContextCompactRequestedData(
             attempt_index=attempt_index,
             policy_id=self.policy_id,
@@ -104,7 +119,7 @@ class ContextCompactCoordinator:
         )
         current_user = _current_user_text(current_user_event)
         if current_user is None:
-            return self._failed(
+            decision = self._failed(
                 attempt_index=attempt_index,
                 requested_data=requested,
                 reason=ContextCompactFailureReason.CURRENT_USER_NOT_FOUND,
@@ -114,6 +129,8 @@ class ContextCompactCoordinator:
                 after_token_estimate=None,
                 after_char_size=None,
             )
+            _log_compact_decision(request=request, decision=decision)
+            return decision
         compacted_input = _build_compacted_run_input(
             previous_input=request.input,
             snapshot=snapshot,
@@ -131,7 +148,7 @@ class ContextCompactCoordinator:
         )
         degraded_count = _count_current_compact_degraded_items()
         if after_tokens >= before_tokens or after_chars >= before_chars:
-            return self._failed(
+            decision = self._failed(
                 attempt_index=attempt_index,
                 requested_data=requested,
                 reason=ContextCompactFailureReason.NOT_REDUCED,
@@ -141,8 +158,10 @@ class ContextCompactCoordinator:
                 after_token_estimate=after_tokens,
                 after_char_size=after_chars,
             )
+            _log_compact_decision(request=request, decision=decision)
+            return decision
         if not fidelity.preserved_all:
-            return self._failed(
+            decision = self._failed(
                 attempt_index=attempt_index,
                 requested_data=requested,
                 reason=ContextCompactFailureReason.FIDELITY_FAILED,
@@ -152,6 +171,8 @@ class ContextCompactCoordinator:
                 after_token_estimate=after_tokens,
                 after_char_size=after_chars,
             )
+            _log_compact_decision(request=request, decision=decision)
+            return decision
         completed = HostContextCompactCompletedData(
             attempt_index=attempt_index,
             policy_id=self.policy_id,
@@ -169,13 +190,15 @@ class ContextCompactCoordinator:
             degraded_item_count=degraded_count,
             estimator_id=TOKEN_ESTIMATOR_ALGORITHM_ID,
         )
-        return ContextCompactDecision(
+        decision = ContextCompactDecision(
             status=ContextCompactDecisionStatus.COMPLETED,
             requested_data=requested,
             completed_data=completed,
             failed_data=None,
             run_input=compacted_input,
         )
+        _log_compact_decision(request=request, decision=decision)
+        return decision
 
     def retry_limit_failed(
         self,
@@ -308,6 +331,58 @@ class _FidelityCheck:
             and self.preserved_source_cursors
             and self.preserved_tool_facts
         )
+
+
+def _log_compact_decision(
+    *,
+    request: StartRunRequest,
+    decision: ContextCompactDecision,
+) -> None:
+    """记录 compact 决策的有界诊断信息。
+
+    :param request: 当前 attempt 请求。
+    :param decision: compact 决策。
+    :returns: 无返回值。
+    :raises Exception: 不主动抛出异常。
+    """
+
+    if decision.status is ContextCompactDecisionStatus.COMPLETED:
+        completed = decision.completed_data
+        if completed is None:
+            return
+        _LOGGER.log(
+            VERBOSE_LOG_LEVEL,
+            "host.context_compact.completed session_id=%s run_id=%s "
+            "attempt_index=%s before_tokens=%s after_tokens=%s "
+            "before_chars=%s after_chars=%s dropped_item_count=%s "
+            "degraded_item_count=%s",
+            request.session_id,
+            request.run_id,
+            completed.attempt_index,
+            completed.before_token_estimate,
+            completed.after_token_estimate,
+            completed.before_char_size,
+            completed.after_char_size,
+            completed.dropped_item_count,
+            completed.degraded_item_count,
+        )
+        return
+    failed = decision.failed_data
+    if failed is None:
+        return
+    _LOGGER.debug(
+        "host.context_compact.failed session_id=%s run_id=%s "
+        "attempt_index=%s reason=%s before_tokens=%s after_tokens=%s "
+        "before_chars=%s after_chars=%s",
+        request.session_id,
+        request.run_id,
+        failed.attempt_index,
+        failed.reason.value,
+        failed.before_token_estimate,
+        failed.after_token_estimate,
+        failed.before_char_size,
+        failed.after_char_size,
+    )
 
 
 def _build_compacted_run_input(

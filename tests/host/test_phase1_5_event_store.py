@@ -3,11 +3,13 @@
 from __future__ import annotations
 
 import asyncio
+import logging
 from collections.abc import AsyncIterator
 from dataclasses import replace
 from datetime import datetime, timezone
 
 import pytest
+from _pytest.logging import LogCaptureFixture
 
 from dayu.engine import ContentDeltaData, FinalAnswerData, FinishReason
 from dayu.host._event_store import InMemoryRunEventStore
@@ -246,3 +248,39 @@ async def test_append_rejects_host_source_with_engine_event_id() -> None:
 
     with pytest.raises(ValueError, match="must not set source_engine_event_id"):
         await store.append(draft)
+
+
+@pytest.mark.asyncio
+async def test_debug_logs_skip_preview_append_and_subscribe_polling(
+    caplog: LogCaptureFixture,
+) -> None:
+    """DEBUG 日志保留存储边界，但不刷 preview append 与 subscribe 轮询。"""
+
+    store = InMemoryRunEventStore()
+    caplog.set_level(logging.DEBUG, logger="dayu.host._event_store")
+
+    events = store.subscribe(run_id="run", after=None)
+    first_task = asyncio.create_task(_next_event(events))
+    await asyncio.sleep(0)
+
+    preview = await store.append(_content_draft(delta="preview-secret"))
+    assert await first_task == preview
+
+    terminal_task = asyncio.create_task(_next_event(events))
+    await asyncio.sleep(0)
+    terminal = await store.append(_final_draft(content="done"))
+    assert await terminal_task == terminal
+    with pytest.raises(StopAsyncIteration):
+        await _next_event(events)
+
+    messages = [record.getMessage() for record in caplog.records]
+    log_text = "\n".join(messages)
+    assert "host.event_store.subscribe_start" in log_text
+    assert "host.event_store.subscribe_complete" in log_text
+    assert "host.event_store.appended" in log_text
+    assert "type=final_answer" in log_text
+    assert "terminal=True" in log_text
+    assert "type=runner_content_delta" not in log_text
+    assert "preview-secret" not in log_text
+    assert "host.event_store.subscribe_wait" not in log_text
+    assert "host.event_store.subscribe_batch" not in log_text

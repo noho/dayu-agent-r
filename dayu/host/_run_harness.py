@@ -14,13 +14,14 @@ from collections.abc import AsyncIterator
 from dataclasses import dataclass, field, replace
 from datetime import datetime, timezone
 from functools import partial
-from typing import Protocol, runtime_checkable
+from typing import Protocol, TypeVar, runtime_checkable
 
 from dayu.contracts import ToolExecutor
 from dayu.contracts.tool_call import ToolExecutionRequest
 from dayu.contracts.tool_outcome import ToolExecutionOutcome, ToolFailedOutcome
 from dayu.contracts.tool_result import ToolResultFailure
 from dayu.engine import (
+    AgentMessage,
     AssistantMessage,
     ContextCompactionRequestedData,
     EngineEvent,
@@ -79,6 +80,7 @@ from dayu.host.contracts import (
     ToolFetchMoreRequest,
     ToolFetchMoreResult,
 )
+from dayu.runtime.log_levels import VERBOSE_LOG_LEVEL
 
 _INITIAL_CURSOR_SEQUENCE: int = -1
 _ERROR_TOOL_EXECUTOR_NOT_CONFIGURED: str = "tool_executor_not_configured"
@@ -99,6 +101,9 @@ _ERROR_CURRENT_USER_INPUT_SHAPE_UNSUPPORTED_HISTORY: str = (
 _ERROR_RUN_INPUT_TRACE_CACHE_LIMIT_INVALID: str = (
     "run_input_trace_cache_limit_must_be_positive"
 )
+_ERROR_RUN_INPUT_MESSAGE_CACHE_LIMIT_INVALID: str = (
+    "run_input_message_cache_limit_must_be_positive"
+)
 _ERROR_CONTEXT_COMPACT_RETRY_LIMIT_INVALID: str = (
     "context_compact_retry_limit_must_be_non_negative"
 )
@@ -106,6 +111,7 @@ _ERROR_ENGINE_STREAM_ENDED_WITHOUT_TERMINAL: str = (
     "engine_stream_ended_without_terminal"
 )
 _RUN_INPUT_TRACE_CACHE_LIMIT: int = 32
+_RUN_INPUT_MESSAGE_CACHE_LIMIT: int = 3
 _CONTEXT_COMPACT_RETRY_LIMIT: int = 1
 _ERROR_CONTEXT_COMPACTION_REQUIRED: str = "context_compaction_required"
 _COMPACT_TRACE_MISSING_MESSAGE: str = "run input build trace is missing"
@@ -113,6 +119,7 @@ _UNEXPECTED_COMPACTION_TERMINAL_MESSAGE: str = (
     "engine produced terminal event after context compaction request"
 )
 _LOGGER: logging.Logger = logging.getLogger(__name__)
+_RunCacheValue = TypeVar("_RunCacheValue")
 
 
 @runtime_checkable
@@ -210,6 +217,7 @@ class LocalRunHarness:
     :param compact_coordinator: Host 内部 context compact coordinator。
     :param context_compact_retry_limit: context overflow compact retry 上限。
     :param run_input_trace_cache_limit: RunInput 构造 trace 保留上限。
+    :param run_input_message_cache_limit: RunInput 消息诊断缓存保留上限。
     """
 
     proxy: WorkerProxy
@@ -226,8 +234,15 @@ class LocalRunHarness:
     )
     context_compact_retry_limit: int = _CONTEXT_COMPACT_RETRY_LIMIT
     run_input_trace_cache_limit: int = _RUN_INPUT_TRACE_CACHE_LIMIT
+    run_input_message_cache_limit: int = _RUN_INPUT_MESSAGE_CACHE_LIMIT
     last_run_input_build_trace_by_run: OrderedDict[
         str, RunInputBuildTrace
+    ] = field(
+        default_factory=OrderedDict,
+        init=False,
+    )
+    last_run_input_messages_by_run: OrderedDict[
+        str, tuple[AgentMessage, ...]
     ] = field(
         default_factory=OrderedDict,
         init=False,
@@ -237,7 +252,7 @@ class LocalRunHarness:
         """校验 harness 内部 compact retry 与调试缓存配置。
 
         :returns: 无返回值。
-        :raises ValueError: compact retry 上限为负数，或 trace 缓存容量
+        :raises ValueError: compact retry 上限为负数，或调试缓存容量
             不是正数时抛出。
         """
 
@@ -245,6 +260,8 @@ class LocalRunHarness:
             raise ValueError(_ERROR_CONTEXT_COMPACT_RETRY_LIMIT_INVALID)
         if self.run_input_trace_cache_limit <= 0:
             raise ValueError(_ERROR_RUN_INPUT_TRACE_CACHE_LIMIT_INVALID)
+        if self.run_input_message_cache_limit <= 0:
+            raise ValueError(_ERROR_RUN_INPUT_MESSAGE_CACHE_LIMIT_INVALID)
 
     async def start_run(self, request: StartRunRequest) -> RunStream:
         """启动 P1.5 内存态 Run。
@@ -281,6 +298,10 @@ class LocalRunHarness:
             run_id=request.run_id,
             trace=build_result.trace,
         )
+        self._remember_run_input_messages(
+            run_id=request.run_id,
+            messages=build_result.run_input.messages,
+        )
         engine_request = replace(request, input=build_result.run_input)
         task = asyncio.create_task(
             self._run_to_store(
@@ -291,10 +312,16 @@ class LocalRunHarness:
         task.add_done_callback(
             partial(_log_background_task_failure, engine_request)
         )
-        _LOGGER.debug(
-            "host.run.start_accepted session_id=%s run_id=%s",
+        _LOGGER.log(
+            VERBOSE_LOG_LEVEL,
+            "host.run.start_accepted session_id=%s run_id=%s "
+            "caller_system_count=%s run_input_message_count=%s "
+            "current_user_cursor=%s",
             engine_request.session_id,
             engine_request.run_id,
+            len(accepted_input.caller_system_messages),
+            len(build_result.run_input.messages),
+            current_user_event.cursor.sequence,
         )
         handle = RunHandle(
             session_id=engine_request.session_id,
@@ -330,7 +357,8 @@ class LocalRunHarness:
         attempt_index = 0
         event_count = 0
         terminal_seen = False
-        _LOGGER.debug(
+        _LOGGER.log(
+            VERBOSE_LOG_LEVEL,
             "host.run.background_start session_id=%s run_id=%s",
             request.session_id,
             request.run_id,
@@ -340,6 +368,15 @@ class LocalRunHarness:
                 overflow_trigger_seen = False
                 overflow_observed_seen = False
                 overflow_trigger_event: EngineEvent | None = None
+                _LOGGER.log(
+                    VERBOSE_LOG_LEVEL,
+                    "host.run.attempt_start session_id=%s run_id=%s "
+                    "attempt_index=%s message_count=%s",
+                    attempt_request.session_id,
+                    attempt_request.run_id,
+                    attempt_index,
+                    len(attempt_request.input.messages),
+                )
                 try:
                     engine_events = self.proxy.stream_engine_events(
                         request=attempt_request,
@@ -373,6 +410,16 @@ class LocalRunHarness:
                         if _is_context_compaction_requested(event):
                             overflow_trigger_seen = True
                             overflow_trigger_event = event
+                            _LOGGER.log(
+                                VERBOSE_LOG_LEVEL,
+                                "host.run.context_overflow_triggered "
+                                "session_id=%s run_id=%s attempt_index=%s "
+                                "engine_event_type=%s",
+                                attempt_request.session_id,
+                                attempt_request.run_id,
+                                attempt_index,
+                                event.type.value,
+                            )
                             await self.event_store.append(
                                 translate_engine_event(event)
                             )
@@ -398,6 +445,19 @@ class LocalRunHarness:
                             translate_engine_event(event)
                         )
                         if terminal_result_from_event(stored_event) is not None:
+                            _LOGGER.log(
+                                VERBOSE_LOG_LEVEL,
+                                "host.run.terminal_appended session_id=%s "
+                                "run_id=%s attempt_index=%s "
+                                "engine_event_type=%s event_count=%s "
+                                "event_cursor=%s",
+                                attempt_request.session_id,
+                                attempt_request.run_id,
+                                attempt_index,
+                                event.type.value,
+                                event_count,
+                                stored_event.cursor.sequence,
+                            )
                             terminal_seen = True
                             return
                     if overflow_trigger_seen:
@@ -451,12 +511,13 @@ class LocalRunHarness:
         finally:
             if terminal_seen:
                 await self._project_run_events(request.run_id)
-            _LOGGER.debug(
+            _LOGGER.info(
                 "host.run.background_finished session_id=%s run_id=%s "
-                "event_count=%s",
+                "event_count=%s terminal_seen=%s",
                 request.session_id,
                 request.run_id,
                 event_count,
+                terminal_seen,
             )
 
     async def _compact_or_fail(
@@ -476,6 +537,14 @@ class LocalRunHarness:
         """
 
         if attempt_index >= self.context_compact_retry_limit:
+            _LOGGER.error(
+                "host.run.context_compact_retry_limit_exceeded "
+                "session_id=%s run_id=%s attempt_index=%s retry_limit=%s",
+                request.session_id,
+                request.run_id,
+                attempt_index,
+                self.context_compact_retry_limit,
+            )
             failed_data = self.compact_coordinator.retry_limit_failed(
                 request=request,
                 attempt_index=attempt_index,
@@ -508,6 +577,13 @@ class LocalRunHarness:
             events=current_run_events,
         )
         if request.run_id not in self.last_run_input_build_trace_by_run:
+            _LOGGER.error(
+                "host.run.context_compact_trace_missing session_id=%s "
+                "run_id=%s attempt_index=%s",
+                request.session_id,
+                request.run_id,
+                attempt_index,
+            )
             failed_data = self.compact_coordinator.exception_failed(
                 request=request,
                 attempt_index=attempt_index,
@@ -550,6 +626,17 @@ class LocalRunHarness:
             failed_data = decision.failed_data
             if failed_data is None:
                 raise RuntimeError("context compact failed without failed_data")
+            _LOGGER.error(
+                "host.run.context_compact_decision_failed session_id=%s "
+                "run_id=%s attempt_index=%s reason=%s before_tokens=%s "
+                "after_tokens=%s",
+                request.session_id,
+                request.run_id,
+                attempt_index,
+                failed_data.reason.value,
+                failed_data.before_token_estimate,
+                failed_data.after_token_estimate,
+            )
             await self.event_store.append(
                 context_compact_failed_draft(
                     run_id=request.run_id,
@@ -572,6 +659,18 @@ class LocalRunHarness:
         compacted_input = decision.run_input
         if completed_data is None or compacted_input is None:
             raise RuntimeError("context compact completed without run_input")
+        _LOGGER.log(
+            VERBOSE_LOG_LEVEL,
+            "host.run.context_compact_completed session_id=%s run_id=%s "
+            "attempt_index=%s before_tokens=%s after_tokens=%s "
+            "dropped_item_count=%s",
+            request.session_id,
+            request.run_id,
+            attempt_index,
+            completed_data.before_token_estimate,
+            completed_data.after_token_estimate,
+            completed_data.dropped_item_count,
+        )
         await self.event_store.append(
             context_compact_completed_draft(
                 run_id=request.run_id,
@@ -581,6 +680,15 @@ class LocalRunHarness:
             )
         )
         next_attempt_index = attempt_index + 1
+        _LOGGER.log(
+            VERBOSE_LOG_LEVEL,
+            "host.run.attempt_retrying session_id=%s run_id=%s "
+            "from_attempt_index=%s next_attempt_index=%s",
+            request.session_id,
+            request.run_id,
+            attempt_index,
+            next_attempt_index,
+        )
         await self.event_store.append(
             context_attempt_retrying_draft(
                 run_id=request.run_id,
@@ -675,6 +783,18 @@ class LocalRunHarness:
         if isinstance(data, ContextCompactionRequestedData):
             recoverable = True
             reason = data.reason
+        _LOGGER.log(
+            VERBOSE_LOG_LEVEL,
+            "host.run.context_overflow_observed session_id=%s run_id=%s "
+            "attempt_index=%s engine_event_type=%s engine_error_code=%s "
+            "recoverable=%s",
+            request.session_id,
+            request.run_id,
+            attempt_index,
+            event.type.value,
+            engine_error_code,
+            recoverable,
+        )
         await self.event_store.append(
             context_overflow_observed_draft(
                 run_id=request.run_id,
@@ -755,7 +875,7 @@ class LocalRunHarness:
         :raises Exception: append Host-owned failure 失败时透传。
         """
 
-        _LOGGER.warning(
+        _LOGGER.error(
             "host.run.background_failed session_id=%s run_id=%s "
             "event_count=%s exc_type=%s",
             request.session_id,
@@ -827,6 +947,12 @@ class LocalRunHarness:
             after=None,
         )
         await self.memory_store.project_run_events(events)
+        _LOGGER.log(
+            VERBOSE_LOG_LEVEL,
+            "host.run.memory_projected run_id=%s event_count=%s",
+            run_id,
+            len(events),
+        )
 
     def _remember_run_input_build_trace(
         self,
@@ -842,12 +968,36 @@ class LocalRunHarness:
         :raises Exception: 不主动抛出异常。
         """
 
-        traces = self.last_run_input_build_trace_by_run
-        if run_id in traces:
-            del traces[run_id]
-        traces[run_id] = trace
-        while len(traces) > self.run_input_trace_cache_limit:
-            traces.popitem(last=False)
+        _remember_lru_run_cache_item(
+            cache=self.last_run_input_build_trace_by_run,
+            run_id=run_id,
+            value=trace,
+            limit=self.run_input_trace_cache_limit,
+        )
+
+    def _remember_run_input_messages(
+        self,
+        *,
+        run_id: str,
+        messages: tuple[AgentMessage, ...],
+    ) -> None:
+        """记录最近 RunInput 消息，用于 P5 内部 smoke 观察。
+
+        该缓存是 Host internal-only 诊断材料，不进入 public API，不作为
+        memory 真源；事实真源仍是 EventLog 与 memory projection。
+
+        :param run_id: Run id。
+        :param messages: 已交给 Engine 的 RunInput 消息。
+        :returns: 无返回值。
+        :raises Exception: 不主动抛出异常。
+        """
+
+        _remember_lru_run_cache_item(
+            cache=self.last_run_input_messages_by_run,
+            run_id=run_id,
+            value=messages,
+            limit=self.run_input_message_cache_limit,
+        )
 
     def stream_run_events(
         self,
@@ -908,6 +1058,30 @@ class LocalRunHarness:
         if self.tool_runtime is None:
             raise RuntimeError(_ERROR_TOOL_RUNTIME_NOT_CONFIGURED)
         return await self.tool_runtime.fetch_more(request)
+
+
+def _remember_lru_run_cache_item(
+    *,
+    cache: OrderedDict[str, _RunCacheValue],
+    run_id: str,
+    value: _RunCacheValue,
+    limit: int,
+) -> None:
+    """记录 Run 级调试缓存项，并按插入顺序淘汰最旧项。
+
+    :param cache: Run id 到缓存值的有序字典。
+    :param run_id: Run id。
+    :param value: 需要缓存的值。
+    :param limit: 最大缓存条数。
+    :returns: 无返回值。
+    :raises Exception: 不主动抛出异常。
+    """
+
+    if run_id in cache:
+        del cache[run_id]
+    cache[run_id] = value
+    while len(cache) > limit:
+        cache.popitem(last=False)
 
 
 async def _close_engine_events_if_supported(

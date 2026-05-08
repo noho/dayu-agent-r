@@ -3,7 +3,8 @@
 按 ``docs/engine/phase1_5-plan.md``：``dayu.engine`` 各模块**只能**通过
 stdlib ``logging.getLogger(__name__)`` 获得 logger，logger 装配由上层
 （Host / CLI）通过 :mod:`dayu.runtime.log` 完成。Engine **允许**
-``import dayu.runtime.cancellation``。
+``import dayu.runtime.cancellation`` 与无装配副作用的
+``dayu.runtime.log_levels``。
 
 本测试通过 AST 扫描 ``dayu/engine/`` 下所有 ``.py`` 文件的 ``import``
 语句，确保没有任何 Engine 模块直接依赖 :mod:`dayu.runtime.log`。

@@ -7,6 +7,7 @@
 
 from __future__ import annotations
 
+import logging
 from dataclasses import dataclass
 from enum import StrEnum
 from typing import Protocol
@@ -31,6 +32,7 @@ from dayu.host.contracts import (
     RunInput,
     UserInputAcceptedData,
 )
+from dayu.runtime.log_levels import VERBOSE_LOG_LEVEL
 
 _MEMORY_BLOCK_CHAR_BUDGET: int = 6000
 _RECENT_TURN_INLINE_CHAR_LIMIT: int = 900
@@ -45,6 +47,7 @@ _ERROR_SNAPSHOT_SESSION_MISMATCH: str = "snapshot_session_mismatch"
 _SECTION_RECENT_RAW_TURNS: str = "## Recent Raw Turns"
 _SECTION_OLDER_POOL: str = "## Older Pool"
 _SECTION_TOOL_FACTS: str = "## Tool Facts"
+_LOGGER: logging.Logger = logging.getLogger(__name__)
 
 
 class RunInputTraceStatus(StrEnum):
@@ -263,6 +266,21 @@ class DefaultRunInputBuilder:
                     content=current_user_text,
                 ),
             )
+        )
+        _LOGGER.log(
+            VERBOSE_LOG_LEVEL,
+            "host.run_input_builder.build_completed session_id=%s run_id=%s "
+            "message_count=%s caller_system_count=%s trace_item_count=%s "
+            "total_char_size=%s total_token_estimate=%s "
+            "memory_block_char_budget=%s",
+            current_user_event.session_id,
+            current_user_event.run_id,
+            len(run_input.messages),
+            len(caller_system_messages),
+            len(trace_items),
+            total_chars,
+            total_tokens,
+            self.memory_block_char_budget,
         )
         return RunInputBuildResult(
             run_input=run_input,

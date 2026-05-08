@@ -225,6 +225,70 @@ class _ScriptedRunner:
 
 
 @dataclass(slots=True)
+class _StateClearingRunner:
+    """完成 RunnerEvent 产出后清空 Agent 迭代状态的 fake Runner。
+
+    :param events: 需要产出的 RunnerEvent 序列。
+    :param agent: 需要破坏迭代状态的 Agent。
+    :param call_count: Runner 调用次数。
+    :param close_count: Runner close 调用次数。
+    """
+
+    events: tuple[RunnerEvent, ...]
+    agent: _AsyncAgent | None = None
+    call_count: int = 0
+    close_count: int = 0
+
+    def call(
+        self,
+        messages: Sequence[AgentMessage],
+        options: RunnerCallOptions,
+        tools: Sequence[ToolSchema],
+    ) -> AsyncIterator[RunnerEvent]:
+        """返回会破坏迭代状态不变量的 RunnerEvent 流。
+
+        :param messages: Agent 消息。
+        :param options: Runner 调用参数。
+        :param tools: 本轮工具 schema。
+        :returns: RunnerEvent 异步流。
+        :raises Exception: 不主动抛出异常。
+        """
+
+        self.call_count += 1
+        return self._iter_events()
+
+    def is_supports_tool_calling(self) -> bool:
+        """返回是否支持工具调用。
+
+        :returns: 始终返回 ``True``。
+        :raises Exception: 不主动抛出异常。
+        """
+
+        return True
+
+    async def close(self) -> None:
+        """记录 close 调用。
+
+        :returns: 无返回值。
+        :raises Exception: 不主动抛出异常。
+        """
+
+        self.close_count += 1
+
+    async def _iter_events(self) -> AsyncIterator[RunnerEvent]:
+        """产出脚本事件后清空 Agent 迭代状态。
+
+        :returns: RunnerEvent 异步流。
+        :raises Exception: 不主动抛出异常。
+        """
+
+        for event in self.events:
+            yield event
+        if self.agent is not None:
+            self.agent._last_iteration_state = None
+
+
+@dataclass(slots=True)
 class _RecordingToolExecutor:
     """记录请求并返回预设 outcome 的 fake ToolExecutor。"""
 
@@ -586,9 +650,11 @@ def test_llm_projection_shapes() -> None:
                 ok=True,
                 value={},
                 truncation=ToolTruncationInfo(
+                    cursor="cursor-value",
                     scope_token="secret_token",
                     scope_hash="secret_hash",
                     has_more=True,
+                    limit=30,
                     ttl_seconds=60,
                 ),
                 meta=None,
@@ -604,12 +670,55 @@ def test_llm_projection_shapes() -> None:
     }
     assert json.loads(failure_with_hint)["hint"] == "retry"
     truncated_payload = json.loads(truncated)
-    assert "truncation" not in truncated_payload
-    assert "secret_token" not in truncated
+    assert truncated_payload["truncation"] == {
+        "fetch_more_args": {
+            "cursor": "cursor-value",
+            "limit": 30,
+            "scope_token": "secret_token",
+        },
+        "has_more": True,
+        "next_action": "fetch_more",
+        "ttl_seconds": 60,
+    }
+    assert "secret_token" in truncated
     assert "secret_hash" not in truncated
-    assert "has_more" not in truncated
+    assert "has_more" in truncated
     assert "ok" not in success_object
     assert failure_without_hint
+
+
+def test_llm_truncation_projection_without_more_hides_fetch_hint() -> None:
+    """has_more=False 时 LLM projection 不暴露续读动作、TTL 与内部 scope。
+
+    :returns: 无返回值。
+    :raises AssertionError: projection 结构不符合预期时抛出。
+    """
+
+    projected = _project_tool_outcome_for_llm(
+        ToolCompletedOutcome(
+            result=ToolResultSuccess(
+                ok=True,
+                value={},
+                truncation=ToolTruncationInfo(
+                    cursor="cursor-value",
+                    scope_token="secret_token",
+                    scope_hash="secret_hash",
+                    has_more=False,
+                    limit=None,
+                    ttl_seconds=60,
+                ),
+                meta=None,
+            )
+        )
+    )
+
+    payload = json.loads(projected)
+    assert payload["truncation"] == {"has_more": False}
+    assert "next_action" not in payload["truncation"]
+    assert "fetch_more_args" not in payload["truncation"]
+    assert "ttl_seconds" not in payload["truncation"]
+    assert "secret_token" not in projected
+    assert "secret_hash" not in projected
 
 
 @pytest.mark.asyncio
@@ -880,6 +989,89 @@ async def test_runner_exception_after_tool_batch_is_run_failed(
     assert isinstance(second_messages[-2], AssistantMessage)
     assert isinstance(second_messages[-1], ToolMessage)
     assert json.loads(second_messages[-1].content) == {"sum": 5}
+
+
+@pytest.mark.asyncio
+async def test_runner_call_completed_missing_state_is_controlled_failure(
+    caplog: LogCaptureFixture,
+) -> None:
+    """Runner 完成边界发现状态缺失时必须产出可控失败终态。
+
+    :param caplog: pytest 日志捕获 fixture。
+    :returns: 无返回值。
+    :raises AssertionError: 终态或诊断日志不符合预期时抛出。
+    """
+
+    runner = _StateClearingRunner(events=_final_script("done"))
+    agent = _AsyncAgent(request=_request(), runner=runner)
+    runner.agent = agent
+
+    with caplog.at_level(logging.CRITICAL, logger="dayu.engine.agent"):
+        events = await _collect(agent)
+
+    failed = _failed_data(events)
+    assert failed.error_code == "missing_terminal"
+    assert failed.recoverable is False
+    assert "engine.agent.missing_iteration_state" in caplog.text
+    assert "runner_call_completed=true" in caplog.text
+    assert "iteration_index=0" in caplog.text
+    assert runner.close_count == 1
+
+
+@pytest.mark.asyncio
+async def test_verbose_logs_engine_main_path_without_tool_payloads(
+    caplog: LogCaptureFixture,
+) -> None:
+    """VERBOSE 能串起 Engine 主路径与工具闭环，且不泄漏参数 / 结果。"""
+
+    secret_argument = "raw-cursor-and-scope-token-secret"
+    secret_result = "tool-result-secret"
+    executor = _RecordingToolExecutor(
+        outcomes={
+            "tc_1": _success(
+                {
+                    "answer": secret_result,
+                    "cursor": "raw-cursor-secret",
+                    "scope_token": "scope-token-secret",
+                }
+            )
+        }
+    )
+    runner = _ScriptedRunner(
+        scripts=(
+            _tool_script(
+                _tool_call("tc_1", arguments={"query": secret_argument})
+            ),
+            _final_script("done"),
+        )
+    )
+
+    with caplog.at_level(15, logger="dayu.engine.agent"):
+        events = await _collect(
+            _AsyncAgent(request=_request(executor=executor), runner=runner)
+        )
+
+    assert _terminal(events).type is EngineEventType.FINAL_ANSWER
+    log_text = caplog.text
+    assert "engine.agent.run_start" in log_text
+    assert "engine.agent.iteration_start" in log_text
+    assert "engine.agent.runner_call_start" in log_text
+    assert "engine.agent.runner_call_completed" in log_text
+    assert "decision=tool_calls" in log_text
+    assert "engine.agent.tool_loop_start" in log_text
+    assert "engine.agent.tool_call_requested" in log_text
+    assert "engine.agent.tool_batch_completed" in log_text
+    assert "engine.agent.tool_messages_injected" in log_text
+    assert "engine.agent.final_ready" in log_text
+    assert "engine.agent.continuation_terminal" not in log_text
+    assert "engine.agent.terminal" in log_text
+    assert "session_id=session_phase3" in log_text
+    assert "run_id=run_phase3" in log_text
+    assert "iteration_id=run_phase3_iteration_1" in log_text
+    assert secret_argument not in log_text
+    assert secret_result not in log_text
+    assert "raw-cursor-secret" not in log_text
+    assert "scope-token-secret" not in log_text
 
 
 @pytest.mark.asyncio

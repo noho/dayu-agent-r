@@ -27,15 +27,20 @@ from dayu.contracts.json_value import JsonValue
 class ToolTruncationInfo:
     """工具级截断元信息（中性事实）。
 
+    :param cursor: 截断补读 cursor 原文；只允许短期进入 LLM-facing tool
+        result projection，不得写入 Host RunEvent / memory / 日志。
     :param scope_token: 截断 scope 唯一 token。
     :param scope_hash: 截断 scope 内容 hash。
     :param has_more: 是否还有未取回数据。
+    :param limit: 建议 ``fetch_more`` 单次读取上限；``None`` 表示不投影。
     :param ttl_seconds: scope 的有效期秒数；``None`` 表示由 Host 决定。
     """
 
+    cursor: str
     scope_token: str
     scope_hash: str
     has_more: bool
+    limit: int | None
     ttl_seconds: int | None
 
 

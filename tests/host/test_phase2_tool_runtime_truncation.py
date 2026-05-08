@@ -3,13 +3,14 @@
 from __future__ import annotations
 
 import asyncio
-from dataclasses import dataclass
+import logging
+from dataclasses import dataclass, replace
 from datetime import datetime
 from typing import cast
 
 import pytest
 
-from dayu.contracts import JsonValue, ToolTruncateSpec
+from dayu.contracts import FRAMEWORK_FETCH_MORE_TOOL_NAME, JsonValue, ToolTruncateSpec
 from dayu.contracts.tool_await import ToolAwaitKind, ToolAwaitSpec
 from dayu.contracts.tool_call import (
     ToolCallRequest,
@@ -148,6 +149,31 @@ class _Tokens:
         return f"cursor-{self.next_index}"
 
 
+class _ListLogHandler(logging.Handler):
+    """测试用本地日志 handler。"""
+
+    def __init__(self, messages: list[str]) -> None:
+        """初始化测试日志 handler。
+
+        :param messages: 用于收集日志文本的列表。
+        :returns: 无返回值。
+        :raises Exception: 不主动抛出异常。
+        """
+
+        super().__init__()
+        self.messages = messages
+
+    def emit(self, record: logging.LogRecord) -> None:
+        """记录格式化后的日志文本。
+
+        :param record: logging 记录。
+        :returns: 无返回值。
+        :raises Exception: 不主动抛出异常。
+        """
+
+        self.messages.append(self.format(record))
+
+
 def _spec(
     strategy: str,
     limit_key: str,
@@ -263,7 +289,9 @@ async def test_truncates_text_chars_and_issues_execute_time_cursor() -> None:
     assert isinstance(outcome, ToolCompletedOutcome)
     assert outcome.result.value == "abc"
     assert outcome.result.truncation is not None
-    assert outcome.result.truncation.scope_token == ""
+    assert outcome.result.truncation.cursor
+    assert outcome.result.truncation.scope_token
+    assert outcome.result.truncation.limit == 3
 
     events = await store.list_events("run_1", after=None)
     assert [event.type for event in events] == [
@@ -274,6 +302,62 @@ async def test_truncates_text_chars_and_issues_execute_time_cursor() -> None:
     assert isinstance(truncated, ToolResultTruncatedData)
     assert truncated.cursor_fingerprint
     assert truncated.total_estimate == 6
+
+
+@pytest.mark.asyncio
+async def test_tool_runtime_debug_logs_tool_call_boundary_without_secret() -> None:
+    """ToolRuntime 统一记录工具调用边界，且不泄漏补读凭证明文。"""
+
+    logger = logging.getLogger("dayu.host._tool_runtime")
+    messages: list[str] = []
+    handler = _ListLogHandler(messages=messages)
+    handler.setFormatter(logging.Formatter("%(message)s"))
+    original_level = logger.level
+    original_propagate = logger.propagate
+    logger.addHandler(handler)
+    logger.setLevel(logging.DEBUG)
+    logger.propagate = False
+    runtime, _store = await _runtime(
+        value="abcdef",
+        spec=_spec("text_chars", "max_chars", 3),
+    )
+    try:
+        outcome = await runtime.execute_tool_call(_request())
+        assert isinstance(outcome, ToolCompletedOutcome)
+        truncation = outcome.result.truncation
+        assert truncation is not None
+        fetch_request_base = _request(
+            tool_call_id="fetch_call_1",
+            tool_name=FRAMEWORK_FETCH_MORE_TOOL_NAME,
+        )
+        fetch_request = replace(
+            fetch_request_base,
+            call=replace(
+                fetch_request_base.call,
+                arguments={
+                    "cursor": truncation.cursor,
+                    "scope_token": truncation.scope_token,
+                    "limit": 1,
+                },
+            ),
+        )
+
+        fetch_outcome = await runtime.execute_tool_call(fetch_request)
+    finally:
+        logger.removeHandler(handler)
+        logger.setLevel(original_level)
+        logger.propagate = original_propagate
+
+    assert isinstance(fetch_outcome, ToolCompletedOutcome)
+    log_text = "\n".join(messages)
+    assert "host.tool_runtime.tool_call_start" in log_text
+    assert "host.tool_runtime.tool_call_finished" in log_text
+    assert "tool_name=demo" in log_text
+    assert f"tool_name={FRAMEWORK_FETCH_MORE_TOOL_NAME}" in log_text
+    assert "truncated=True" in log_text
+    assert "framework=True" in log_text
+    assert "cursor-1" not in log_text
+    assert truncation.scope_token not in log_text
 
 
 @pytest.mark.asyncio

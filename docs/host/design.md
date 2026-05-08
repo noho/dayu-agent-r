@@ -895,10 +895,17 @@ UI / Service / test harness
   -> ToolFetchMoreResult
 ```
 
-`scope_token` 只通过非 EventLog 的受控 handle 短期交付，不进入 `RunEvent`、Engine projection 或日志。
-`RunEvent` 只保存 cursor fingerprint、scope hash、limit、unit、size summary、lineage 等中性摘要，不保存完整大结果
-或 token 明文。terminal RunEvent 后的 `fetch_more` 返回 typed failure，且不追加新 RunEvent，以保持 P1.5
+P2 Host public handle 的边界是：`scope_token` 只通过调用方持有的非 EventLog 受控 handle 短期交付，
+不写入 EventLog / memory / 日志 / smoke 输出，也不写入任何文档或 smoke 的大块结果输出。`RunEvent`
+只保存 cursor fingerprint、scope hash、limit、unit、size summary、lineage 等中性摘要，不保存完整大结果或
+token 明文。terminal RunEvent 后的 `fetch_more` 返回 typed failure，且不追加新 RunEvent，以保持 P1.5
 terminal guard。
+
+P5 LLM-facing truncated tool result 的边界是：截断后的普通 tool result 可以短期携带
+`truncation.fetch_more_args.scope_token` 给模型，只用于同一 run 内由模型发起的 framework `fetch_more`
+tool call。该 token 仍不得写入 RunEvent canonical data、memory projection、日志或文档 / smoke 大块输出。
+Engine 仍不拥有、不解释 `scope_token`；它只把 token 当作普通 tool result JSON 注入给模型，再把模型发起的
+普通 tool args 回传给 Host。
 
 ToolRuntime 仍必须保持：
 
@@ -906,7 +913,41 @@ ToolRuntime 仍必须保持：
 - tool execution runtime 与业务权限 / 业务规则分离。
 - 财报文档访问约束由业务工具 / tool 边界保证，不进入 Host / Engine 业务语义。
 - truncate 只由工具 schema / metadata 的显式 spec 驱动；无 spec、未启用、未知策略或非法 limit 不截断。
-- P2 不恢复 OLD LLM-facing `fetch_more` schema，也不向 Engine projection 投影 `fetch_more_args`。
+- `ToolTruncateSpec` 必须继续支持 OLD 已覆盖的多种截断策略，例如 `text_chars`、`text_lines`、
+  `list_items`、`binary_bytes`，并支持 `target_field` / `field_path` 等定位方式；P5 不能把实现收窄成
+  只服务 `huge_echo` 的单一文本截断。
+- P2 最小实现只提供 Host public `fetch_more` 路径；P5 修订目标是在不引入完整 ToolRegistry / 权限治理的前提下，
+  恢复 OLD 的 LLM-facing framework `fetch_more` 行为，让模型在同一个 run 内自行通过 tool calling 补读。
+
+P5 后目标的 LLM-facing truncate / fetch_more 执行路径是：
+
+```text
+Model -> tool_call huge_echo(...)
+  -> Engine treats it as ordinary LLM tool call
+  -> ToolExecutor.execute
+  -> ToolRuntimeToolExecutor -> InMemoryToolRuntime
+  -> huge_echo returns a large result
+  -> ToolRuntime applies ToolTruncateSpec
+      -> supports text_chars / text_lines / list_items / binary_bytes
+      -> supports target_field / field_path where declared
+      -> stores run-scoped single-use cursor + scope token
+      -> appends canonical truncated / cursor-issued facts
+  -> Engine injects truncated tool result back to the model
+      -> includes LLM-readable truncation hint
+      -> truncation.next_action = "fetch_more"
+      -> truncation.fetch_more_args = {cursor, scope_token, limit?}
+Model -> tool_call fetch_more(cursor, scope_token, limit?)
+  -> Engine still treats it as ordinary LLM tool call
+  -> Host ToolExecutor / ToolRuntime routes framework fetch_more
+      instead of business executor
+  -> ToolRuntime consumes cursor, appends fetch_more requested / completed facts
+  -> returns next chunk and, if needed, next cursor hint
+Model -> repeats fetch_more if needed, then emits final answer
+```
+
+因此 `fetch_more` 本身应作为 framework tool 暴露给 LLM，但它不是业务工具，不进入完整业务 ToolRegistry
+治理目标。Engine 只看到普通 tool call 与普通 tool result；cursor 存储、scope 校验、single-use、TTL、
+lineage 与审计事实仍由 Host ToolRuntime 拥有。
 
 ToolRuntime 最小生命周期事实当前已经覆盖截断与补读子集，完整权限模型仍未展开：
 
@@ -1039,6 +1080,51 @@ Engine / Runner observes context overflow
   -> same Run / new internal Engine attempt
   -> WorkerProxy.stream_engine_events(compacted RunInput)
 ```
+
+P5 修订目标是把 P1-P4 当前内存态能力串成一条单进程、单调用方、顺序多轮的 no-full-governance 纵向验证路径。
+该路径只证明当前 happy path 的事实链路同源协作，不代表生产级 Session / Run lifecycle governance 已落地：
+
+```text
+LocalRunHarness.start_run(turn 1)
+  -> append USER_INPUT_ACCEPTED
+  -> RunInputBuilder.build
+  -> LocalProxy -> EngineWorker -> Engine Agent tool loop
+  -> model tool_call huge_echo
+  -> ToolExecutor.execute
+  -> ToolRuntimeToolExecutor -> InMemoryToolRuntime -> huge_echo executor
+  -> ToolRuntime append truncate / cursor facts
+  -> Engine injects truncated tool result with next_action=fetch_more hint
+  -> model tool_call fetch_more
+  -> ToolRuntime routes framework fetch_more
+      -> append fetch_more requested / completed before terminal
+      -> return next chunk / next cursor hint if needed
+  -> Engine final terminal
+  -> ConversationMemoryStore.project_run_events
+LocalRunHarness.start_run(turn 2 after turn 1 terminal)
+  -> RunInputBuilder sees previous user / final / tool facts / source cursors
+  -> terminal
+compact retry auxiliary case
+  -> same Run internal attempt retry
+  -> no second USER_INPUT_ACCEPTED
+```
+
+P5 同时需要落地最小公共 tool declaration 契约：工具现场可以用
+`@tool(..., truncate=ToolTruncateSpec(...))` 同源声明 LLM-facing `ToolSchema`、Host ToolRuntime
+`ToolTruncateSpec`、callable / executor binding 与 `ToolDisplayInfo` / `tags` 展示 metadata。该契约只提供
+`ToolDefinition` / `ToolBundle` 与明确的 `ToolSchema` projection；进入 Engine / Runner / WorkerProxy request
+的仍只能是 `tuple[ToolSchema, ...]`。`ToolTruncateSpec`、display metadata、tags、callable 与 executor binding
+不得进入 Engine request。P5 只额外暴露 framework `fetch_more` 的 LLM-facing schema 和执行路由；这不等同于
+完整 ToolRegistry / 权限治理 / 业务工具迁移。
+
+P5 手工 smoke 的主路径沿用 `utils/` provider smoke 范式，在脚本内写死
+`mimo-v2.5-pro-plan` `ProviderCase`，不读取 `dayu/config/llm_models.json` 或 `workspace/config`；
+其中 `MimoThinkingExtension(enabled=True)` 是 hardcoded ProviderCase 的有意选择。该 smoke 真实向 provider
+发送 prompt，并要求模型通过 LLM tool calling 调用 `huge_echo`。fake provider / scripted WorkerProxy 只服务
+CI integration 与 compact retry 辅助诊断，不能替代真实 provider smoke 的成功证明。
+
+P5 后仍未落地的生产治理包括：`client_request_id` 创建幂等、同 Session active Run admission、多进程恢复、
+持久 EventLog / projection、RemoteProxy、Reply Outbox、audit hard-gate、完整 ToolRegistry / 权限治理 /
+middleware 与业务工具迁移。
 
 P4 compact 输入只来自 P3 已固定的运行态事实：本 Run 的 `USER_INPUT_ACCEPTED`、canonical overflow /
 tool facts、Conversation Memory snapshot、RunInputBuilder included / excluded 诊断与可消费事实。由于
@@ -1475,9 +1561,14 @@ P3 已落地单进程、顺序多轮的最小 memory projection，并预留以�
 - session scope 与 producer / ingestion policy 元数据。
 - `claim_correction`、`memory_reset`、`scope_clear` internal patch 形状。
 
+P3 当时仍未落地、但 P4 已补齐当前最小路径：
+
+- context overflow compact / retry：P4 已落地 Host-owned deterministic compact、同 Run internal attempt retry、
+  terminal 前工具事实临时合并与必保事实保真验证；它仍不是完整生产 context governance。
+
 当前仍未落地：
 
-- context overflow compact / retry 与 episode summary 生成。
+- episode summary 生成。
 - `ConversationPinnedStatePatch` 三态合并、完整 supersession、public forget / reset API。
 - persistent EventLog projection、observer checkpoint、audit / timeline 派生。
 - 用户可编辑 memory、跨 session / project / user 作用域策略、group/direct 隐私治理。

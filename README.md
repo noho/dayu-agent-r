@@ -287,7 +287,7 @@ dayu-cli <subcommand> [参数]
 | `--base` | 全部主命令 | 工作区根目录，默认 `./workspace` |
 | `--config` | 全部主命令 | 配置目录，默认 `workspace/config` |
 | `--ticker` | `prompt` `write` | 股票代码；传入后会把该 `ticker` 作为当前研究对象 |
-| `--log-level` | 全部主命令 | 直接指定日志级别，可选 `debug`、`verbose`、`info`、`warn`、`error` |
+| `--log-level` | 全部主命令 | 直接指定日志级别，可选 `debug`、`verbose`、`info`、`warn`、`error`、`critical` |
 | `--debug` | 全部主命令 | 把日志级别设为 `DEBUG` |
 | `--verbose` | 全部主命令 | 把日志级别设为 `VERBOSE` |
 | `--info` | 全部主命令 | 把日志级别设为 `INFO` |
@@ -1311,6 +1311,7 @@ dayu-render workspace/draft/AAPL/AAPL_qual_report.md report.html
 
 - 用户手册（当前文档）：[README.md](README.md)
 - 开发手册总览：[dayu/README.md](dayu/README.md)
+- Host 包开发手册：[dayu/host/README.md](dayu/host/README.md)
 - Engine 包开发手册：[dayu/engine/README.md](dayu/engine/README.md)
 - Fins 包开发手册：[dayu/fins/README.md](dayu/fins/README.md)
 - 配置说明手册：[dayu/config/README.md](dayu/config/README.md)
