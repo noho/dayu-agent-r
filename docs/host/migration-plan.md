@@ -12,13 +12,14 @@
 - P2 已通过 PR #18 合入 `main`，merge commit 为 `3d86eefd4bd8b99b24c638735220d9ee571255f7`。
 - P3 已通过 PR #19 合入 `main`，merge commit 为 `b20e792 Host P3 conversation memory (#19)`。
 - P4 已通过 PR #21 合入 `main`，merge commit 为 `843fb99 Host P4 context overflow compact (#21)`。
-- 当前 P5 代码实现与 code review 修复已完成，当前分支为
-  `codex/host-p5-multiturn-smoke`，准备创建 ready PR。P5 已落地 No-Full-Governance
+- 当前 P5 代码实现、code review 修复与 PR review 修复复核均已完成，当前分支为
+  `codex/host-p5-multiturn-smoke`，PR #22 已创建并更新，等待用户 merge。P5 已落地 No-Full-Governance
   Multi-Turn Smoke、公共 `@tool` / `ToolDefinition` 声明、LLM-facing truncation hint、
   framework `fetch_more`、真实 provider `mimo-v2.5-pro-plan` + `huge_echo` tool calling
   smoke、Host / Engine P1-P5 日志可观测性梳理与 review 修复。P5 code review findings
   已在 `docs/reviews/code-review-20260508-1039.md` 与
-  `docs/reviews/code-review-20260508-1122.md` 标注修复状态；当前等待 PR review。
+  `docs/reviews/code-review-20260508-1122.md` 标注修复状态；PR review findings 已在
+  `docs/reviews/pr-22-review-20260508-1211.md` 标注修复状态，用户复核通过。
 
 每个 Phase 进入实现前，必须另写可交接的 phase plan，细化到迁移 Agent 可以直接接手：
 目标、非目标、边界、文件级改动清单、契约变化、状态机、测试清单、验证命令、review gate、
@@ -75,7 +76,8 @@ migration/host-p{phase}-{short-name}
     除非用户明确要求。
 15. 派 PR code review Agent 审查 PR diff，必要时继续修复、复审、补 commit，直到 PR review
     Agent 明确通过。
-16. PR review 通过后，停下来等用户确认。
+16. PR review 通过后，停下来等用户确认。若 review 由用户本人完成，则对应修复也必须由用户本人复核；
+    总控 Agent 与其它 review Agent 不得替代用户复核结论。
 17. squash merge PR 并删除远端分支默认由用户执行；只有用户明确指示总控 Agent 执行时，
     总控 Agent 才能执行 squash merge / delete branch。用户手工 merge 后，总控只记录状态。
 
