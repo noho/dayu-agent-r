@@ -2,8 +2,9 @@
 
 ## 1. 计划状态
 
-本文档是 Host 迁移总控计划草稿，用于指导总控 Agent 分阶段指挥迁移 Agent、review Agent
-完成整个 Host 迁移。它不是单阶段 handoff plan，也不是实现文档。
+本文档是 Host 迁移总控计划草稿，用于指导总控 Agent 分阶段派 Agent 编写 / 修复 phase plan，
+并生成代码实施、代码修复与 review prompt，由用户手工派 Agent 完成代码实施、代码修复与 review。
+它不是单阶段 handoff plan，也不是实现文档。
 
 当前总控状态：
 
@@ -65,25 +66,28 @@ migration/host-p{phase}-{short-name}
 
 1. 从最新主线或用户指定基线开新分支。
 2. 派 Agent 写 phase handoff plan。
-3. 总控 Agent 生成 plan review 指导 prompt，交给用户手工执行 review；必要时额外生成 OLD / NEW
-   对比、最佳实践、架构边界或并发专项 review prompt。
-4. 用户提交 review 结果后，总控 Agent 判断 finding 是否成立；成立时派 Agent 修 plan，并在对应
+3. 派 review Agent 做 plan review；必要时派额外 review Agent 做 OLD / NEW 对比、最佳实践、
+   架构边界或并发专项 review。
+4. 总控 Agent 读取 plan review 结果并判断 finding 是否成立；成立时派 Agent 修 plan，修复 Agent 必须在对应
    review 文档的 finding 标题上标注修复状态。
-5. 总控 Agent 生成复审 prompt，交给用户手工执行复审；若仍不通过，重复步骤 4-5，直到用户复审通过。
+5. 派 review Agent 复审修复后的 plan；若仍不通过，重复步骤 4-5，直到 review Agent 明确通过。
 6. plan review 通过后，停下来等用户人工确认。
 7. 用户确认后，commit phase plan 与 review 文档。
-8. 派迁移 Agent 按通过的 plan 生成代码。
-9. 总控 Agent 生成 code review 指导 prompt，交给用户手工执行 code review；必要时额外生成 OLD / NEW
+8. 总控 Agent 生成按通过 plan 实施代码的指导 prompt，交给用户手工派迁移 Agent 生成代码。
+9. 总控 Agent 生成 code review 指导 prompt，交给用户手工派 Agent 执行 code review；必要时额外生成 OLD / NEW
    对比、架构边界、类型安全或并发专项 review prompt。
-10. 用户提交 code review 结果后，总控 Agent 判断 finding 是否成立；成立时派 Agent 修复代码，并在对应
-    code review 文档的 finding 标题上标注修复状态。
-11. 总控 Agent 生成复审 prompt，交给用户手工执行复审；若仍不通过，重复步骤 10-11，直到用户复审通过。
+10. 用户提交 code review 结果后，总控 Agent 判断 finding 是否成立；成立时生成代码修复 prompt，
+    交给用户手工派 Agent 修复代码。修复 Agent 必须在对应 code review 文档的 finding 标题上标注
+    修复状态，总控 Agent 负责检查标注是否到位。
+11. 总控 Agent 生成复审 prompt，交给用户手工派 Agent 执行复审；若仍不通过，重复步骤 10-11，
+    直到用户复审通过。
 12. code review 通过后，停下来等用户人工 review。
 13. 用户确认后，commit 代码、测试和必要 README / docs 更新。
 14. 准备 PR 时，确认只包含本 Phase 范围内提交，push 并创建 ready PR；不创建 draft PR，
-    除非用户明确要求。
-15. 总控 Agent 生成 PR review 指导 prompt，交给用户手工执行 PR diff review；必要时继续修复、生成
-    复审 prompt、补 commit，直到用户复审通过。
+    除非用户明确要求。PR 创建后停下来等用户人工 PR review。
+15. 用户提交 PR review 结果后，总控 Agent 判断 finding 是否成立；成立时生成代码修复 prompt，
+    交给用户手工派 Agent 修复代码。修复 Agent 必须在对应 PR review 文档的 finding 标题上标注
+    修复状态，总控 Agent 负责检查标注是否到位。
 16. PR review 通过后，停下来等用户确认。若 review 由用户本人完成，则对应修复也必须由用户本人复核；
     总控 Agent 与其它 review Agent 不得替代用户复核结论。
 17. squash merge PR 并删除远端分支默认由用户执行；只有用户明确指示总控 Agent 执行时，
@@ -92,8 +96,8 @@ migration/host-p{phase}-{short-name}
 禁止事项：
 
 - 不在未通过 plan review 的情况下写生产代码。
-- 不用总控 Agent 自己的复核替代用户 review / 复审结论；总控只负责生成 review prompt、判断 finding
-  是否成立、派修复 Agent 和维护修复状态。
+- 不用总控 Agent 自己的复核替代用户 review / 复审结论；总控只负责派 Agent 写 / 修 phase plan、
+  生成代码实施 / 代码修复 / review prompt、判断 finding 是否成立和维护修复状态。
 - 不在 review finding 未标注修复状态的情况下声称 review 通过。
 - 不把多个 Phase 的实现混进一个 PR，除非用户明确批准合并。
 - 不在用户确认前 commit / push / create PR / merge。
@@ -312,8 +316,12 @@ docs/host/phase14-wait-state-review.md
 - plan review gate。
 - code review gate。
 
-总控 Agent 不再负责派 review Agent 执行 review。总控 Agent 只负责为每个 gate 生成可直接交给
-review Agent 的指导 prompt，由用户手工执行 review / 复审，并把 review 结果交回总控处理。
+总控 Agent 仍负责自动派 Agent 编写 / 修复 phase plan，并自动派 Agent 执行 plan review / 复审。
+总控 Agent 不再负责直接派代码实施 Agent、代码修复 Agent 或 code review Agent；PR 创建后也不生成
+PR review 指导 prompt，而是停下来等用户人工 PR review。总控 Agent 只负责为 code implementation /
+code fix / code review gate 生成可直接交给对应 Agent 的指导 prompt，由用户手工派 Agent 执行代码实施、
+代码修复、code review 与复审，并把结果交回总控处理。代码修复 Agent 负责同步标注对应 review 文档
+finding 的修复状态，总控 Agent 负责检查标注是否完整。
 
 必要时增加：
 
@@ -385,8 +393,9 @@ PR 准备前必须确认：
 
 PR 创建后：
 
-- 派 PR review Agent 审查 PR diff。
-- PR review 不通过时，继续修复、补 review 修复状态、补 commit、复审。
+- 总控 Agent 停下来等用户人工 PR review，不生成 PR review 指导 prompt。
+- 用户提交 PR review 结果后，总控 Agent 判断 finding 是否成立；成立时生成修复 prompt，
+  用户手工派 Agent 修复和复审；修复 Agent 标注 review finding 修复状态，总控检查标注并补 commit。
 - PR review 通过后停下来等用户确认。
 - squash merge PR 并删除远端分支默认由用户执行；只有用户明确指示总控 Agent 执行时，
   总控 Agent 才能执行 squash merge / delete branch。
