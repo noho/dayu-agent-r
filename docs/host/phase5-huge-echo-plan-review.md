@@ -12,8 +12,8 @@ ToolRuntime truncate / cursor / `fetch_more`。当前 plan 已基本准确反映
 
 通过条件是：实现与 code review 必须直接证明 real-provider smoke 的 gating / stream control 的确把成功
 `fetch_more` 放在 owner run terminal 前，而且不绕过 Engine / Agent tool loop；同时必须固定
-`mimo-v2.5-pro-plan` provider 配置真源，避免 smoke helper 与 `dayu/config/llm_models.json` 之间的配置漂移变成
-语义错位。
+`mimo-v2.5-pro-plan` 的 hardcoded ProviderCase smoke 范式，避免把 utils smoke 误升级成读取
+`dayu/config/llm_models.json` 的配置 adapter。
 
 ## Findings
 
@@ -55,41 +55,36 @@ failure；若 gating 通过手写 tool facts、替换 scripted WorkerProxy 或�
 - 如果只能在 terminal 后补读，或只能用 fake provider / scripted WorkerProxy 冒充 real-provider 成功，应按
   `docs/host/phase5-plan.md:811-814` 停止。
 
-### P3 中：[已修订] `mimo-v2.5-pro-plan` 配置真源需要在实现中固定，避免 helper 配置和模型配置漂移
+### P3 中：[已修订] `mimo-v2.5-pro-plan` ProviderCase 范式需要在实现中固定，避免误读配置层
 
 状态：非阻断，实现 gate。
 
-修订状态：已写回 `docs/host/phase5-plan.md` 的文件级改动清单、实现步骤、手工 smoke 要求、Code review gate
-与停止条件。P5 plan 已固定 `dayu/config/llm_models.json` 的 `mimo-v2.5-pro-plan` 为配置真源，要求复用项目当前
-模型配置入口 / 解析逻辑；若与 `utils/smoke_async_agent_providers.py` 既有同名 case 的 provider_request 存在差异，
-必须以配置真源为准或在 smoke 输出与 review 中显式说明。
+修订状态：已按后续总控裁决纠偏。P5 smoke 与 `utils/smoke_async_agent_providers.py` 一样使用脚本内
+hardcoded `ProviderCase`，不读取 `dayu/config/llm_models.json` 或 `workspace/config`，也不新增配置 loader。
+`MimoThinkingExtension(enabled=True)` 是该 ProviderCase 的有意组成部分，代码、输出和 review 均需显式标注。
 
 直接证据：
 
 - `dayu/config/llm_models.json:1012-1026` 的 `mimo-v2.5-pro-plan` 配置包含 endpoint、model、
   `MIMO_PLAN_API_KEY` header、`supports_stream=true`、`supports_tool_calling=true`、`supports_stream_usage=false`。
-- 同一配置中 provider request 为 `mimo_thinking enabled=false`：`dayu/config/llm_models.json:1057-1060`。
 - 既有 `utils/smoke_async_agent_tool_call.py:214-223` 的同名 case 使用相同 env / endpoint / model，但
   `MimoThinkingExtension(enabled=True)`。
-- `docs/host/phase5-plan.md:249-255` 要求从现有 provider case 读取 endpoint/model/key 配置；
-  `docs/host/phase5-plan.md:691-695` 又要求复用现有 smoke 脚本中的 Mimo provider 配置口径。
+- `docs/host/phase5-fix-review.md` 已记录用户纠偏：P5 real-provider smoke 应与 utils 下其它 smoke 一样写死
+  `ProviderCase`，不为 utils smoke 新增公共配置层级读取能力。
 
 影响：
 
-这不阻断 plan，因为 endpoint、model、env 和 tool calling capability 的关键目标是一致的。但用户明确要求读取
-`dayu/config/llm_models.json` 中的 `mimo-v2.5-pro-plan` 配置；如果实现实际复用旧 smoke helper 的
-provider_request 开关，就可能出现“文档声称使用模型配置，实际请求 payload 使用 helper 硬编码”的 semantic vs
-implementation mismatch。该差异也会让后续失败诊断变模糊：到底是模型 tool calling、thinking 开关，还是 smoke
-装配本身出了问题。
+这不阻断 plan，因为 endpoint、model、env 和 tool calling capability 的关键目标是一致的。当前风险已从
+“配置漂移”改为“文档或输出没有说明 thinking extension 来自 hardcoded ProviderCase”，从而让读者误以为 P5
+smoke 是生产配置入口。
 
 实现 gate：
 
-- P5 smoke 应明确选一个真源。更稳妥的是以 `dayu/config/llm_models.json` 的 `mimo-v2.5-pro-plan` 为真源，旧 smoke
-  helper 只可作为 env / endpoint / model 口径参考。
+- P5 smoke 应明确使用 hardcoded ProviderCase，旧 smoke helper 只作为范式参考。
 - 输出摘要应包含 provider case、model、endpoint 摘要、`supports_tool_calling` 与 provider request 开关摘要，但不得输出
   key、headers 或完整 payload。
-- 若实现故意沿用 helper 中的 `MimoThinkingExtension(enabled=True)`，必须在 review 中说明这是有意差异，并证明没有背离
-  “真实 `mimo-v2.5-pro-plan` provider 配置”这个用户目标。
+- 输出与 review 必须说明 `MimoThinkingExtension(enabled=True)` 是 hardcoded ProviderCase 的有意选择，不读取
+  `llm_models.json`。
 
 ## 复核要点
 
@@ -199,37 +194,25 @@ Engine / Agent tool loop 与 Host ToolRuntime 路径，而不是手写 facts、s
 后续实现仍需在 code review 中核验证据字段是否真由 wrapper / 事件观测产生，而不是 smoke 输出硬编码；但这是实现期
 审查，不再是 plan 阻断。
 
-### 2. `mimo-v2.5-pro-plan` 配置真源 gate
+### 2. `mimo-v2.5-pro-plan` ProviderCase gate
 
 通过。
 
-P5 plan 已明确要求 `mimo-v2.5-pro-plan` 的配置真源必须是 `dayu/config/llm_models.json` 中的同名配置，并复用项目
-当前配置入口 / 解析逻辑；旧 smoke helper 只能作为差异检查或历史参考，不能静默覆盖配置真源。
+P5 plan 已按后续总控裁决改为 hardcoded ProviderCase 范式：`mimo-v2.5-pro-plan` 由
+`utils/smoke_host_multiturn_no_governance.py` 脚本内常量维护，`MimoThinkingExtension(enabled=True)` 是该
+ProviderCase 的有意选择，不读取 `dayu/config/llm_models.json` 或 `workspace/config`。
 
 直接证据：
 
-- `docs/host/phase5-plan.md:249-255` 在文件级改动清单中固定配置真源为
-  `dayu/config/llm_models.json:mimo-v2.5-pro-plan`，并要求读取 endpoint、model、headers/env、
-  `supports_stream`、`supports_tool_calling`、`supports_stream_usage` 与 `provider_request`。
-- `docs/host/phase5-plan.md:262-267` 要求 smoke 输出 provider case、model、endpoint 摘要、capability 与
-  `provider_request` 摘要、`config_source=dayu/config/llm_models.json:mimo-v2.5-pro-plan`，并在 helper 差异存在时输出
-  `helper_config_diff` 或显式说明差异理由。
-- `docs/host/phase5-plan.md:597-604` 在实现步骤中要求 `--case real-provider` / `--case all` 通过项目当前模型配置入口
-  读取配置，缺 key / model / endpoint / capability 时 clear failure；若旧 helper 的
-  `MimoThinkingExtension(enabled=True)` 与配置真源的 `mimo_thinking enabled=false` 不一致，必须以配置真源为准或显式说明
-  有意差异。
-- `docs/host/phase5-plan.md:712-719` 在手工 smoke 章节具体锁定 env、case 名、endpoint、model、
-  `supports_tool_calling=true`、`supports_stream_usage=false` 与 `provider_request=mimo_thinking enabled=false`，
-  并禁止 helper 覆盖配置真源。
-- `docs/host/phase5-plan.md:815-816` 已把配置真源与 helper 差异处理写入 code review gate。
-- `docs/host/phase5-plan.md:848-849` 已把无法以 `llm_models.json` 作为配置真源、或只能静默沿用旧 helper 中不一致
-  `provider_request` 列为停止条件。
+- `docs/host/phase5-plan.md` 已要求 P5 smoke 使用脚本内 hardcoded `ProviderCase`，只从环境变量读取 API key。
+- `docs/host/phase5-plan.md` 已要求输出 `case_source=hardcoded_provider_case`，并显式说明
+  `MimoThinkingExtension(enabled=True)` 属于 hardcoded ProviderCase。
+- `docs/host/phase5-fix-review.md` 已记录“不读取配置层级、不新增公共配置 loader”的纠偏。
 
 清晰度判断：
 
-该 gate 已足够清晰。计划已经同时约束配置来源、读取方式、输出摘要、helper 差异处理、code review 检查与停止条件；
-后续 code review 只需核对实现是否真的复用项目配置入口 / 解析逻辑，并且没有用旧 smoke helper 的硬编码 payload
-覆盖 `llm_models.json`。
+该 gate 已足够清晰。后续 code review 只需核对实现是否保持 hardcoded ProviderCase 范式，并且没有把
+`llm_models.json` 读取或配置 loader 引入 utils smoke。
 
 ### 复审后的 remaining findings
 

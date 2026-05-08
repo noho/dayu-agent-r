@@ -51,7 +51,7 @@ context overflow 治理回流到 Engine。
 每个 Phase 都必须使用独立分支。默认分支名：
 
 ```text
-codex/host-p{phase}-{short-name}
+migration/host-p{phase}-{short-name}
 ```
 
 如果用户指定其它分支名，以用户指令为准。
@@ -115,7 +115,7 @@ audit hard-gate 等生产治理；不表示可以破坏分层、跳过强类型�
 | P2 | ToolRuntime truncate / fetch_more | 把 OLD TruncationManager / cursor / TTL / scope token 迁到 Host / ToolRuntime 边界 | 工具结果截断契约、fetch_more 调用路径、cursor storage、TTL / scope token 测试、ToolRuntime 最小运行事实 | 不做完整 ToolRegistry 权限、不做业务工具迁移、不让 Engine 持有 cursor 管理；不实现 tool trace / audit / timeline observer | 工具结果可被截断，后续 fetch_more 可补读；截断 / 补读不是不可审计黑盒 |
 | P3 | Conversation Memory / RunInputBuilder | 迁移 Host 上下文治理核心，使多轮上下文可构造 | RunInputBuilder 可消费事实、客户端 timeline 展示事实、只可观测 facts 三类边界；pinned_state、memory pool、tool facts projection | 不做 context overflow 完整协作、不做 Reply Outbox、不把 reasoning 回流运行态 | 多轮 Run 可以基于 Session / memory 构造下一轮输入；reasoning 只进展示 read model |
 | P4 | Host Compact for Context Overflow | 把 OLD 中原本在 Engine 内做的 compact 搬到 Host，使 Engine context overflow 时仍能继续运行 | Host compact 入口、compact 输入 / 输出、Engine overflow 事件 / 错误映射、compact 后 attempt 输入重建 | 不实现完整 context governance；不引入 replay / validation 联动；不在 Engine 内实现 compact/retry | Engine 遇到 context overflow 时，Host 完成 compact 后继续运行或明确失败收口 |
-| P5 | No-Full-Governance Multi-Turn Smoke | 将 P1-P4 与 P1.5 串成最小纵向 smoke，并落地最小公共 tool declaration 能力 | smoke CLI / test harness、端到端多轮测试、公共 `@tool` declaration / `ToolDefinition`、必要 README / tests 文档 | 不做完整多进程治理、不做 Remote、不做 Outbox、不做 audit hard-gate；不验证 `start_run` 幂等、active Run 并发仲裁或调用重试语义；不做完整 ToolRegistry / 权限治理 / 业务工具迁移 | 一个单调用方、顺序执行的无完整生产治理多轮会话可按目标事实层跑通，含工具截断补读、memory、compaction；手工 smoke 真实向 `mimo-v2.5-pro-plan` 发送 prompt，由模型调用公共声明的 `huge_echo` 并跑通 Host ToolRuntime truncate / fetch_more |
+| P5 | No-Full-Governance Multi-Turn Smoke | 将 P1-P4 与 P1.5 串成最小纵向 smoke，并落地最小公共 tool declaration 与 framework `fetch_more` 能力 | smoke CLI / test harness、端到端多轮测试、公共 `@tool` declaration / `ToolDefinition`、LLM-facing truncation hint、framework `fetch_more` schema、必要 README / tests 文档 | 不做完整多进程治理、不做 Remote、不做 Outbox、不做 audit hard-gate；不验证 `start_run` 幂等、active Run 并发仲裁或调用重试语义；不做完整 ToolRegistry / 权限治理 / 业务工具迁移；不做自动透明补读 | 一个单调用方、顺序执行的无完整生产治理多轮会话可按目标事实层跑通，含工具截断补读、memory、compaction；手工 smoke 真实向 `mimo-v2.5-pro-plan` 发送 prompt，由模型调用公共声明的 `huge_echo`，再由模型根据 `truncation.next_action=fetch_more` 调用 framework `fetch_more` |
 | P5.5 | Deferred Scope Reconciliation | 回看 P1-P5 所有“本阶段不实现”能力，确认没有遗留能力被漏排或误排 | deferred-scope inventory、能力归属表、后续 Phase 调整建议、必要的新 Phase / issue / plan 修订 | 不写生产代码；不把未落地能力补写成已落地事实；不直接修改后续 Phase 代码边界 | P1-P5 的非目标均被明确标记为已实现、已安排到 P6+、新增 Phase / issue 承接，或经用户确认关闭 |
 | P6 | EventLog Persistence / Projection / Observers Hardening | 在 P1.5 最小事实层上建立可靠持久化与派生机制 | 持久 EventLog、projection checkpoint、tool trace observer、audit observer、timeline projection、observer retry / lag | 不把 trace 写回 Engine，不要求所有 observer hard-gate | tool trace / audit / timeline 可由 EventLog 幂等派生 |
 | P7 | Session / Run Lifecycle Governance | 完整落地 Session / Run 状态机、admission policy、取消基础治理 | SessionManager、RunManager、RunSupervisor、状态机测试、cancel_run、生产级 admission policy | 不做 issue #3 的强制终止增强、不做 wait / suspend | 同 Session 单 active Run、幂等 start_run、取消基础收口稳定 |
@@ -124,7 +124,7 @@ audit hard-gate 等生产治理；不表示可以破坏分层、跳过强类型�
 | P10 | RemoteProxy / RemoteStub | 落地远程执行边界 | RemoteProxy、RemoteStub、cursor / ack / reconnect、remote cancel | 不让远程 Engine 回调 Host 执行工具 | Remote Agent = Engine + tools execute remotely |
 | P11 | Wait / Suspend / Resume 协作 | 按 issue #4 拆子设计并落地等待协作能力 | WaitRecord、awaiting outcome、自动 resume、状态机与恢复测试 | 不把 `resume_run` 暴露为普通 public API | 等待型工具 / 长事务可 suspend、恢复、取消、超时 |
 | P12 | Governance Hardening | 补齐取消增强、policy hard-gate、audit hard-gate、运行治理 | issue #3 增强、watchdog、强制终止、required projection、运维可观测性 | 不扩大 Host 业务语义 | Host 可作为强约束真源运行生产治理 |
-| P13 | 文档收口 / PR 收束 | 更新当前事实文档，归档迁移过程文档 | `docs/code_review.md` 当前事实专项、必要 README、issue / PR 收口、phase 文档归档策略 | 不写未来设计为已落地事实；不误删 review 证据 | 日常 review prompt 与 README 均只描述当前已落地事实，迁移审计记录可追溯 |
+| P13 | Full-Governance Multi-Turn Smoke / 文档收口 | 在 P6-P12 完整治理能力打开后，按 P5 同一验证面跑最终纵向 smoke，并更新当前事实文档、归档迁移过程文档 | full-governance smoke CLI / test harness、与 P5 对齐的验证面清单、`docs/code_review.md` 当前事实专项、必要 README、issue / PR 收口、phase 文档归档策略 | 不新增治理能力；不写未来设计为已落地事实；不误删 review 证据；不把 smoke failure 用文档绕过 | Full-Governance Multi-Turn Smoke 覆盖 P5 同一语义面：真实模型 tool calling、ToolRuntime truncate / framework `fetch_more`、Conversation Memory、context compact、EventLog persistence / observers、lifecycle / admission / recovery / audit hard-gate；日常 review prompt 与 README 均只描述当前已落地事实，迁移审计记录可追溯 |
 
 ### 4.1 第一批能力边界
 
@@ -160,10 +160,12 @@ OutputContract 或完整 context governance。
 P5 smoke 只覆盖单进程、单调用方、顺序执行 happy path：每轮等待上一轮 terminal 后再启动下一轮。
 P5 需要最小 Run 创建事实和 Session 下多轮顺序，但不以生产级 `start_run` 幂等、
 同 Session active Run admission policy、断线重试或并发输入仲裁为前提。这些治理能力仍留在 P7。
-用户人工 review 后，P5 同时承接最小公共 tool declaration 能力：OLD-like
+用户人工 review 后，P5 同时承接最小公共 tool declaration 与 framework `fetch_more` 能力：OLD-like
 `@tool(..., truncate=ToolTruncateSpec(...))` 需要产出强类型 `ToolDefinition` / `ToolBundle`，
 同源携带 LLM-facing schema、executor binding、Host ToolRuntime truncate metadata 与 display metadata。
-这不是完整 ToolRegistry，也不恢复 LLM-facing `fetch_more`；`huge_echo` 是该声明能力的首个 smoke/test 工具。
+这不是完整 ToolRegistry，也不恢复权限治理 / middleware / 业务工具迁移；但 P5 必须恢复 OLD 语义中的
+LLM-facing truncation hint 与 framework `fetch_more` tool，使模型在同一个 run 内自行补读。
+`huge_echo` 是该声明能力的首个 smoke/test 工具。
 用户人工 review 已将手工 smoke 主目标改为真实 provider `mimo-v2.5-pro-plan` tool calling，缺配置应清晰失败，
 不能把 fake provider 或 scripted WorkerProxy 作为主 smoke 成功证据。
 
@@ -270,8 +272,9 @@ P2 必须增加 OLD / NEW code review gate：
 - OLD / NEW review 必须对照 OLD `TruncationManager`、OLD `fetch_more` schema、OLD
   `project_for_llm` 与 OLD 测试，确认 NEW 继承 cursor lifecycle、scope token、TTL、
   single-use、limit clamp、page structure 等底层可靠语义。
-- OLD / NEW review 同时必须确认 NEW 没有误恢复 OLD LLM-facing `fetch_more` 半协议，也没有把
-  OLD Engine 归属的实现机械迁回 `dayu.engine`。
+- OLD / NEW review 同时必须确认 P2 不误恢复 OLD LLM-facing `fetch_more` 半协议，也没有把
+  OLD Engine 归属的实现机械迁回 `dayu.engine`。P5 若恢复 framework `fetch_more`，必须走 Host ToolRuntime
+  ownership 与 Engine 普通 tool call 边界，不能恢复 OLD 完整 ToolRegistry / Engine-owned cursor manager。
 - P2 code review 只有常规 code review 与 OLD / NEW 对比 review 均明确通过后，才允许停下来等用户
   人工 review。
 

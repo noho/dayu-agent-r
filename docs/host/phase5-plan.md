@@ -8,7 +8,9 @@ guard，把当前 Host 已落地的单进程能力串成一个真实执行路径
 ```text
 USER_INPUT_ACCEPTED
   -> RunEventStore append-before-stream
-  -> ToolRuntime truncate / cursor / fetch_more
+  -> LLM tool_call huge_echo
+  -> ToolRuntime truncate / cursor / LLM-facing fetch_more hint
+  -> LLM tool_call fetch_more in the same run
   -> Conversation Memory projection
   -> RunInputBuilder 构造下一轮输入
   -> context overflow compact / retry
@@ -22,7 +24,8 @@ smoke。
 本阶段必须产出：
 
 - `utils/smoke_host_multiturn_no_governance.py` 手工 smoke：主目标必须真实向 `mimo-v2.5-pro-plan`
-  发送 prompt，由模型通过 LLM tool calling 调用 `huge_echo`；输出关键事件、cursor、
+  发送 prompt，由模型通过 LLM tool calling 调用 `huge_echo`，再由模型根据截断 hint 在同一 run 内调用
+  framework `fetch_more`；输出关键事件、cursor、
   memory / compact / fetch_more 摘要，不打印 delta、大工具结果、scope token 或内部大块 prompt。
 - P5 端到端测试：覆盖单调用方顺序多轮，证明第二轮看见第一轮 canonical 用户输入、final answer 与 tool fact，
   第三轮或同轮 overflow 路径能 compact / retry，并且不会重复追加 `USER_INPUT_ACCEPTED`。
@@ -30,8 +33,9 @@ smoke。
   ConversationMemoryStore -> DefaultRunInputBuilder -> ContextCompactCoordinator`，不能伪造一条比生产更干净的捷径。
 - 主 happy path 的硬验收：`utils/smoke_host_multiturn_no_governance.py` 必须真的使用现有
   `mimo-v2.5-pro-plan` provider 配置向模型发送 prompt，并由模型通过 LLM tool calling 机制调用
-  `huge_echo`。对应 P5 integration 测试可以使用 fake provider 验证不可联网路径，但 fake 只能模拟
-  provider 输出，工具调用仍必须经 Engine tool loop、`ToolExecutor.execute`、`ToolRuntimeToolExecutor`、
+  `huge_echo`，再由模型根据 `truncation.next_action="fetch_more"` 与 `fetch_more_args` 调用 framework
+  `fetch_more`。对应 P5 integration 测试可以使用 fake provider 验证不可联网路径，但 fake 只能模拟
+  provider 输出，两个工具调用仍必须经 Engine tool loop、`ToolExecutor.execute`、`ToolRuntimeToolExecutor`、
   `InMemoryToolRuntime` 与 `huge_echo` executor；不能由 scripted WorkerProxy 直接手写 tool result facts，
   也不能直接调用 `InMemoryToolRuntime.execute_tool_call()` 替代主用例。
 - P5 后文档：在 `docs/host/design.md` 写回 P5 后执行边界 / 执行路径；在 `dayu/host/README.md` 写当前事实与
@@ -53,13 +57,12 @@ P5 不实现以下能力：
   governance。
 - 调用重试语义、普通 transient retry、validation replay、OutputContract。
 - public memory edit / reset / forget API、持久 memory projection、跨 session / project / user memory。
-- LLM-facing `fetch_more` schema 或 `fetch_more_args` projection；P5 仍使用 Host public `fetch_more_tool_result`
-  路径验证补读。
+- 完整 ToolRegistry、权限治理、tool middleware、业务工具迁移或 Service 层工具 catalog 装配；P5 只暴露最小
+  framework `fetch_more` tool，使模型能在同一 run 内按截断 hint 补读，不把它扩展成生产治理注册中心。
 - 真实 provider overflow 作为必跑验收。P5 手工 smoke 的主目标只要求真实 `mimo-v2.5-pro-plan`
   tool calling、Host ToolRuntime truncate / fetch_more 与多轮接续；overflow / compact 子 case 可以使用
   deterministic fake provider 或 scripted WorkerProxy 作为辅助诊断。
-- 完整 ToolRegistry、权限治理、tool middleware、业务工具迁移或 Service 层工具 catalog 装配；P5 只落地最小公共
-  tool declaration / definition 能力，不把它扩展成生产治理注册中心。
+- 自动替模型补读、透明分页或 Host-side continuation 策略；P5 必须证明补读动作来自模型发起的 LLM tool calling。
 
 以下问题若出现，不能在 P5 直接当作 bug 要求修生产治理：
 
@@ -98,7 +101,11 @@ P5 需要强参考 OLD 行为，但不得写兼容性代码。
 - OLD `conversation_memory.py` / issue #48：多轮追问连续性依赖 pinned state、tool summary、recent raw turn 与
   display / runtime 隔离；P5 smoke 需要观察这些事实在 NEW 路径中是否真实接续。
 - OLD `TruncationManager` 与 `fetch_more`：截断由工具 schema 声明驱动，旧 cursor 成功补读后失效，若还有剩余内容
-  颁发下一页新 cursor；P5 需要在纵向 smoke 中至少走一次截断和一次补读。
+  颁发下一页新 cursor；截断后的 tool result 会给 LLM 投影 `truncation.next_action="fetch_more"` 与
+  `truncation.fetch_more_args`，并自动暴露 framework `fetch_more` tool。P5 需要在纵向 smoke 中证明模型在同一
+  run 内自己调用 `fetch_more` 补读，而不是由 smoke 脚本代调 Host public API。
+- OLD `ToolTruncateSpec` 支持多种截断方式；NEW P5 不能把截断实现收窄成 `huge_echo` 专用文本截断，至少要保持
+  `text_chars`、`text_lines`、`list_items`、`binary_bytes` 与 `target_field` / `field_path` 的设计兼容性。
 - OLD `@tool(..., truncate=ToolTruncateSpec(...))` 可读声明方式：工具函数现场同时能看到 LLM schema 与截断声明，
   但 NEW 必须把 LLM-facing schema、Host runtime metadata、executor binding 和 display metadata 分清楚，并产出
   强类型 `ToolDefinition` / `ToolBundle`。
@@ -110,7 +117,8 @@ P5 需要强参考 OLD 行为，但不得写兼容性代码。
 不得照搬：
 
 - OLD Engine 内 compact / retry；NEW Engine 只报告 overflow 并消费 Host 生成的 `RunInput`。
-- OLD LLM-facing `fetch_more` schema；NEW P2 当前只承诺 Host public 补读入口。
+- OLD 完整 ToolRegistry / 权限治理 / middleware；NEW P5 只恢复最小 framework `fetch_more` tool 与 LLM-facing
+  truncation hint，不恢复完整注册中心或业务工具治理。
 - OLD `_create_xxx_tool(registry, service, limits)` / registry 参数范式；NEW 不把工具声明建立在外部可变 registry
   参数上，推荐无 registry factory，例如 `_get_xxx_tool_definition(...)`。若只返回 `ToolSchema` 才可命名为
   `_get_xxx_tool_schema(...)`；P5 目标返回 schema、callable / executor binding、truncate 与 display metadata，
@@ -141,20 +149,22 @@ Smoke script / test harness
       -> ToolExecutor.execute
       -> ToolRuntimeToolExecutor -> InMemoryToolRuntime -> huge_echo business executor
       -> RunEventStore.append(tool truncation / cursor facts)
-      -> Agent injects tool result message into next Runner / provider iteration
-      -> provider prepares final answer
-      -> pause before final terminal
-  -> get_tool_fetch_more_handle while owner run is not terminal
-  -> fetch_more_tool_result while owner run is not terminal
+      -> Agent injects truncated tool result into next Runner / provider iteration
+         with truncation.next_action="fetch_more"
+         and truncation.fetch_more_args={cursor, scope_token, limit?}
+      -> model emits LLM tool call for framework fetch_more
+      -> Engine tool loop emits TOOL_CALL_REQUESTED(fetch_more)
+      -> ToolExecutor.execute
+      -> Host ToolRuntime routes fetch_more instead of business executor
       -> RunEventStore.append(fetch_more requested / completed)
-  -> release gated final-answer continuation
+      -> Agent injects fetched chunk into next Runner / provider iteration
+      -> if needed, fetched chunk carries next fetch_more hint
+      -> model emits final answer after it has enough result
       -> RunEventStore.append(final terminal)
       -> ConversationMemoryStore.project_run_events
-  -> fetch_more_tool_result after terminal
-      -> typed failure(run_terminal), denied=False, event_cursor=None, EventLog count unchanged
   -> LocalRunHarness.start_run(turn 2 after turn 1 terminal)
       -> append USER_INPUT_ACCEPTED
-      -> RunInputBuilder sees turn 1 user / final / tool fact / fetch_more fact
+      -> RunInputBuilder sees turn 1 user / final / tool facts / source cursor
       -> terminal
       -> memory projection
   -> LocalRunHarness.start_run(turn 3 or overflow run)
@@ -188,7 +198,8 @@ Smoke script / test harness
   `denied=False`、`event_cursor=None`、EventLog 事件数不增加。
 - 单个 Run 内 context overflow compact retry 可以产生新的 internal attempt；这不是新用户 turn，不得再 append
   `USER_INPUT_ACCEPTED`。
-- `fetch_more_tool_result` 是 Host public 补读路径，P5 不让 Engine / LLM 主动调用 `fetch_more`。
+- `fetch_more_tool_result` 仍是 Host public API / framework tool 内部路由可复用的 Host 边界；P5 主路径的成功
+  补读 actor 必须是模型发起的 LLM `fetch_more` tool call，不是 smoke 脚本旁路代调。
 - `scope_token`、cursor 原文、完整大工具结果不得出现在 smoke 日志、RunInput memory block 断言输出或 README 示例。
 - preview / reasoning / delta 不能进入 memory、RunInputBuilder、compact 输入或 P5 smoke 语义断言。
 - P5 不改变 `dayu.runtime`，不新增 runtime helper。
@@ -209,8 +220,9 @@ P5 需要落地：
   - callable / executor binding。
   - LLM-facing `ToolSchema`。
   - Host ToolRuntime `ToolTruncateSpec`。
-  - display metadata，例如 `display_name` / `tags`，供未来 UI 展示友好 tool 调用信息。
-- `display_name` 不进入 LLM schema，不影响模型可见工具描述；它只属于展示 metadata。
+  - display metadata，例如 `ToolDisplayInfo` / `tags`，供未来 UI 展示友好 tool 调用信息。
+- `@tool(..., display_name="...")` 的声明入口保留，内部转换为 `ToolDisplayInfo(name=...)`；
+  display metadata 不进入 LLM schema，不影响模型可见工具描述。
 - `ToolDefinition` / `ToolBundle` 必须提供明确的 Engine input projection，例如 `to_tool_schema()` 或只读
   `schema` 属性。该 projection 只能返回 `ToolSchema`；进入 Engine / Runner 的必须始终是
   `tuple[ToolSchema, ...]`，不能把整个 definition / bundle 传给 `AgentRunRequest.tool_schemas` 或
@@ -226,8 +238,8 @@ P5 需要落地：
 P5 不需要落地：
 
 - 完整 `ToolRegistry`、tool catalog、权限治理、middleware、调用审计 hard-gate 或业务工具迁移。
-- LLM-facing `fetch_more` schema、`fetch_more_args` projection 或让 LLM 主动补读；P5 仍通过 Host public
-  `fetch_more_tool_result` 验证补读。
+- 自动透明补读、Host-side continuation 策略或完整业务 tool registry；P5 需要的只是 framework
+  `fetch_more` schema、LLM-facing `truncation` hint 与 Host ToolRuntime 路由。
 - OLD `_create_xxx_tool(registry, service, limits)` 风格。NEW 推荐无 registry factory：
   - 若只返回 LLM schema，可命名为 `_get_xxx_tool_schema(...)`。
   - 若返回 schema、callable / executor binding、truncate spec 与 display metadata，推荐
@@ -246,25 +258,22 @@ P5 不需要落地：
   - 不 import `dayu.host` / `dayu.engine` / `dayu.service` / `dayu.ui` / `dayu.fins`，不进入 `dayu.runtime`。
   - 不实现完整 registry、权限治理、tool trace observer、audit hard-gate 或业务工具迁移。
 - `utils/smoke_host_multiturn_no_governance.py`
-  - 手工 smoke 主路径必须真实使用 `mimo-v2.5-pro-plan`：配置真源固定为
-    `dayu/config/llm_models.json` 中的同名模型配置，必须复用项目当前模型配置入口 / 解析逻辑读取 endpoint、
-    model、headers/env、`supports_stream`、`supports_tool_calling`、`supports_stream_usage` 与
-    `provider_request`，真实向模型发送 prompt，并要求模型通过 LLM tool calling 调用 `huge_echo`。
-    `utils/smoke_async_agent_providers.py` 既有同名 case 只可作为历史 smoke helper 参考；若其
-    `provider_request` 或 capability 与 `llm_models.json` 不一致，P5 smoke 默认以 `llm_models.json`
-    为准，或在输出与 review 中显式说明该差异及理由。
+  - 手工 smoke 主路径必须真实使用 `mimo-v2.5-pro-plan`：与 `utils/` 下其它 provider smoke 保持一致，
+    在脚本内写死 `ProviderCase`，只从环境变量读取 API key，不读取 `dayu/config/llm_models.json` 或
+    `workspace/config`，也不充当配置 adapter。该 hardcoded ProviderCase 明确包含
+    `MimoThinkingExtension(enabled=True)`，这是 P5 smoke 的有意选择。
   - 主 happy path 必须经 Engine / Agent tool loop、`ToolExecutor.execute`、`ToolRuntimeToolExecutor`、
     `InMemoryToolRuntime`、`huge_echo` executor 与 Host ToolRuntime truncate / fetch_more 路径完成；
     scripted WorkerProxy 只能作为辅助 / 诊断 case。
   - 建议支持 `--case all|real-provider|compact-retry`；`all` 必须包含 real-provider 主路径。缺少
-    `MIMO_PLAN_API_KEY`、model 配置或 endpoint 配置时输出 clear failure 并返回非零，不能 skip 为成功。
+    `MIMO_PLAN_API_KEY`、model、endpoint 或 tool calling capability 时输出 clear failure 并返回非零，
+    不能 skip 为成功。
   - 输出建议包括：
     - 每轮 `run_id`、terminal type、terminal cursor。
     - provider case、model、endpoint 摘要、是否真实发送 provider request、`supports_tool_calling` 与
       `provider_request` 开关摘要；不得输出 API key、headers 或完整 payload。
-    - 配置来源，例如 `config_source=dayu/config/llm_models.json:mimo-v2.5-pro-plan`；如与
-      `utils/smoke_async_agent_providers.py` 同名 case 存在 provider_request 差异，输出
-      `helper_config_diff=...` 摘要并以配置真源为准，或显式说明本次 smoke 采用差异配置的理由。
+    - ProviderCase 来源，例如 `case_source=hardcoded_provider_case`，并显式输出
+      `MimoThinkingExtension(enabled=True)` 属于 hardcoded ProviderCase，不以 `llm_models.json` 为真源。
     - `huge_echo` tool call 是否来自 Engine / Agent LLM tool calling，是否观察到 `ToolExecutor.execute`。
     - 每轮 `USER_INPUT_ACCEPTED` cursor，证明同一 Run 只有一次用户输入。
     - owner run 未 terminal 时成功补读的 tool truncate / cursor issued / fetch_more completed event cursor，并能从
@@ -286,8 +295,9 @@ P5 不需要落地：
     诊断，不能替代该测试。
 - `tests/contracts/test_tool_declaration.py` 或并入 P5 Host 测试的等价覆盖
   - 覆盖 `@tool(..., truncate=ToolTruncateSpec(...))` 生成 `ToolDefinition` / `ToolBundle`。
-  - 断言 `display_name` / `tags` 不进入 LLM-facing schema。
-  - 断言 `ToolTruncateSpec` 由 Host ToolRuntime metadata 路径消费，不恢复 LLM-facing `fetch_more`。
+  - 断言 `ToolDisplayInfo` / `tags` 不进入 LLM-facing schema。
+  - 断言 `ToolTruncateSpec` 由 Host ToolRuntime metadata 路径消费；spec 本体不进入 LLM schema，但截断结果会投影
+    LLM-facing `truncation` hint。
 
 计划修改：
 
@@ -299,9 +309,9 @@ P5 不需要落地：
     提供已有内部缓存的更稳健访问方式。
   - 不新增 public governance API，不新增 active Run admission。
 - `dayu/host/_tool_runtime.py`
-  - 仅当纵向 smoke 发现 Host public handle / fetch_more 无法在 terminal 前成功补读、或 terminal 后 typed failure
-    不符合当前契约时修复真实 bug。
-  - 不恢复 LLM-facing fetch_more。
+  - 需要补齐 framework `fetch_more` 路由、LLM-facing truncation hint projection 与 cursor single-use 语义。
+  - Host public handle / `fetch_more_tool_result` 仍可作为底层边界或负例；P5 主成功路径不能由 smoke 脚本代调。
+  - 若 terminal 后 typed failure 不符合当前契约，则修复真实 bug。
 - `dayu/host/_conversation_memory.py` / `dayu/host/_run_input_builder.py`
   - 仅当纵向 smoke 发现 P3 facts 没有真实进入下一轮 RunInput、或 trace 不能定位 included / excluded item 时修复。
   - 不实现 episode summary 生成或 persistent projection。
@@ -328,7 +338,7 @@ P5 不需要落地：
 
 P5 原则上不新增 Host public 运行契约，不新增 RunEvent 类型，不新增状态机状态。
 
-P5 会新增或固定一个公共 tool declaration 契约：
+P5 会新增或固定一个公共 tool declaration 契约，并暴露一个 framework `fetch_more` tool：
 
 - `ToolDefinition` / `ToolBundle` 是工具声明输出，不是 Host runtime governance API。
 - `ToolSchema` 仍是 LLM-facing schema；`ToolTruncateSpec` 仍是 Host ToolRuntime metadata。
@@ -336,8 +346,9 @@ P5 会新增或固定一个公共 tool declaration 契约：
 - definition / bundle 到 Engine / Runner 的边界必须经过显式 projection：`to_tool_schema()` 或只读 `schema`
   只能产出 `ToolSchema`，Host 装配侧再组成 `tuple[ToolSchema, ...]`。Engine / Runner request 不得接收、
   保存或检查 `ToolDefinition` / `ToolBundle` 本体。
-- `display_name` / `tags` 只服务 UI / smoke 展示，不进入 LLM schema。
-- 不新增 LLM-facing `fetch_more` schema，不改变 P2 Host public `fetch_more_tool_result` 路径。
+- `ToolDisplayInfo` / `tags` 只服务 UI / smoke 展示，不进入 LLM schema。
+- 新增 LLM-facing framework `fetch_more` schema 与 truncation hint projection；不改变 P2 Host public
+  `fetch_more_tool_result` 的底层语义，只把它接入 Engine tool loop 可调用的 framework tool 路径。
 
 P5 需要锁住以下既有契约：
 
@@ -432,21 +443,24 @@ then start_run(turn n + 1)
   memory、compact 或 display metadata。
 - `ToolDefinition` / `ToolBundle` 是 Host 装配输入；Engine / Runner 只能接收由 `to_tool_schema()` 或只读
   `schema` 投影得到的 `ToolSchema` tuple。WorkerProxy request / `AgentRunRequest.tool_schemas` 中不得出现
-  `ToolTruncateSpec`、`display_name`、`tags`、callable 或 executor binding。
+  `ToolTruncateSpec`、display metadata、`tags`、callable 或 executor binding。
 - P5 手工 smoke 主 happy path 不接受 fake provider、fake LLM 或 fake WorkerProxy 直接产出 scripted tool result
   `EngineEvent` 作为证明；必须使用真实 `mimo-v2.5-pro-plan` provider、真实 EngineWorker / Engine / Agent tool loop，
   并让模型真实产出 `huge_echo` tool call 与后续 final answer。
-- P5 手工 smoke 必须证明 real-provider gating / stream control 的暂停点在 owner run terminal 前：证据必须显示
-  cursor facts 已由 `ToolRuntimeToolExecutor -> InMemoryToolRuntime` 产生，随后 Host public
-  `get_tool_fetch_more_handle` / `fetch_more_tool_result` 成功补读并 append completed fact，最后才释放或观察到
-  final terminal。该证据必须来自实际事件 / wrapper 观测，不能是脚本常量、手写 facts、直接调用
-  `InMemoryToolRuntime.execute_tool_call()` 或 scripted WorkerProxy。
+- P5 手工 smoke 必须证明 real-provider 主路径里 success `fetch_more` 的 actor 是模型：证据必须显示
+  cursor facts 已由 `ToolRuntimeToolExecutor -> InMemoryToolRuntime` 产生，截断 tool result 注入给模型时包含
+  LLM-readable `truncation.next_action="fetch_more"` 与 `fetch_more_args`，随后模型发出 `fetch_more` tool call，
+  Host ToolRuntime 路由并 append completed fact，最后才观察到 final terminal。该证据必须来自实际事件 /
+  wrapper 观测，不能是脚本常量、手写 facts、直接调用 `InMemoryToolRuntime.execute_tool_call()`、
+  直接调用 Host public `fetch_more_tool_result()` 或 scripted WorkerProxy。
 - P5 integration 测试可以让 fake provider / fake LLM 只负责产出 tool call 与 final answer，用于 CI /
   不可联网路径；该 fake 边界不能被手工 smoke 当作成功证明。
 - P5 辅助 / 诊断 case 可以使用 fake WorkerProxy 产出 scripted `EngineEvent`，但不能跳过 `LocalRunHarness`，
   不能手写 tool runtime facts，且不能替代主 happy path。
-- ToolRuntime 仍只作为 Engine 可见 `ToolExecutor` adapter 背后的 Host 内部能力。
-- ToolRuntime 从 `ToolDefinition` / `ToolBundle` 中消费 `ToolTruncateSpec`，但不把该 spec 投影给 LLM。
+- ToolRuntime 仍只作为 Engine 可见 `ToolExecutor` adapter 背后的 Host 内部能力；Engine 只看见普通
+  `huge_echo` / `fetch_more` tool call 与普通 tool result。
+- ToolRuntime 从 `ToolDefinition` / `ToolBundle` 中消费 `ToolTruncateSpec`；spec 本体不投影给 LLM，但截断结果必须
+  投影出 LLM 可执行的 `truncation.next_action` / `fetch_more_args`。
 - P5 主用例必须使用真实 Engine loop + real provider smoke 或 fake-provider integration test，并验证调用链是
   `Runner tool call -> Agent -> ToolExecutor.execute -> ToolRuntimeToolExecutor -> InMemoryToolRuntime ->
   huge_echo executor`。`InMemoryToolRuntime.execute_tool_call()` 的直接调用只允许出现在辅助回归或诊断中，
@@ -463,7 +477,7 @@ P5 依赖 P1.5 EventLog 语义，不新增 projection。
 P5 必须验证：
 
 - 每轮首个可观察 canonical 事实包含 `USER_INPUT_ACCEPTED`，其 cursor 是本 run per-run cursor。
-- 工具截断、cursor issued、owner run 未 terminal 时的 fetch_more requested/completed 都是 canonical facts，且可通过
+- 工具截断、cursor issued、模型发起的 fetch_more requested/completed 都是 canonical facts，且可通过
   `stream_run_events(after=...)` 补读观察；terminal 后 fetch_more typed failure 不追加 canonical fact。
 - terminal result 只从 terminal RunEvent 推导。
 - memory projection 在 terminal 后读取同一 run canonical facts。
@@ -540,7 +554,8 @@ P5 不新增 `dayu.runtime` 能力，不涉及 lane。
    - 选择 contracts 层或等价公共契约位置，避免放入 `dayu.runtime` 或 Host 业务层。
    - 提供 `@tool` decorator / declaration helper 与强类型 `ToolDefinition` / `ToolBundle`。
    - 确认 `ToolSchema`、callable / executor binding、`ToolTruncateSpec` 与 display metadata 同源声明但职责分离。
-   - 明确 `display_name` / `tags` 不进入 LLM schema，`ToolTruncateSpec` 不恢复 LLM-facing `fetch_more`。
+   - 明确 `ToolDisplayInfo` / `tags` 不进入 LLM schema；`ToolTruncateSpec` 本体不进入 LLM schema，但截断后的
+     tool result 必须投影 LLM-readable `truncation.next_action` / `fetch_more_args`。
    - 明确 Engine input projection API，例如 `to_tool_schema()` 或只读 `schema`，并约束 Host 装配只把
      `tuple[ToolSchema, ...]` 传给 Engine / Runner。
    - 命名上优先使用 `_get_xxx_tool_definition(...)` / `_get_xxx_tool_bundle(...)`；只有纯 schema factory 才使用
@@ -574,16 +589,19 @@ P5 不新增 `dayu.runtime` 能力，不涉及 lane。
      tool calling 闭环，调用 `ToolExecutor.execute`。
    - `ToolRuntimeToolExecutor` 调用真实 `InMemoryToolRuntime`，`huge_echo` executor 返回长结果，Host ToolRuntime
      按 `ToolTruncateSpec` 产生 truncation / cursor facts。
-   - fake provider / fake LLM 在工具结果注入后的 final terminal 前暂停；手工 smoke 则必须用 gating /
-     stream control 达到同等时序。
-   - owner run 未 terminal 时，通过 Host public `get_tool_fetch_more_handle` + `fetch_more_tool_result` 成功补读一次，
-     append fetch_more requested / completed。
-   - 释放 fake provider / fake LLM final-answer continuation 或真实 provider gating，继续产出 final terminal，
-     并等待 memory projection。
-   - terminal 后再次调用旧 cursor 或剩余 cursor，断言返回 `run_terminal` typed failure、`denied=False`、
-     `event_cursor=None`，且 EventLog 事件数不增加。
+   - Engine 注入给模型的 tool result 必须包含 `truncation.next_action="fetch_more"` 与可直接照抄的
+     `fetch_more_args`。
+   - fake provider / fake LLM 或真实 provider 必须在同一 run 内继续产出 `fetch_more` tool call；Engine /
+     Agent 将其作为普通 LLM tool call 执行，Host ToolRuntime 识别 framework tool 并 append fetch_more
+     requested / completed。
+   - 如果还有剩余内容，`fetch_more` 返回结果继续带下一页 cursor hint；测试至少覆盖一次成功 fetch_more，
+     并验证旧 cursor single-use。
+   - 模型拿到足够内容后继续产出 final terminal，并等待 memory projection。
+   - terminal 后再次调用旧 cursor 或剩余 cursor 可作为负例：断言返回 `run_terminal` typed failure、
+     `denied=False`、`event_cursor=None`，且 EventLog 事件数不增加。
    - turn 2：等待 turn 1 terminal 后启动，断言 Engine 收到的 RunInput / trace 包含上一轮 user、final、
-     tool truncation fact、fetch_more completed fact、source cursor、pinned_state / task frame 与 recent raw turn。
+     tool truncation fact、模型发起的 fetch_more completed fact、source cursor、pinned_state / task frame 与
+     recent raw turn。
 6. 实现 compact retry 组合测试：
    - 在已有 memory / tool facts 后启动一轮 scripted overflow。
    - 第一次 attempt 产出 `CONTEXT_COMPACTION_REQUESTED` + recoverable
@@ -595,15 +613,13 @@ P5 不新增 `dayu.runtime` 能力，不涉及 lane。
 7. 实现手工 smoke：
    - 输出格式稳定、短行、适合人工观察。
    - 默认 `--case all` 必须先跑真实 `mimo-v2.5-pro-plan` 主路径，再跑 compact retry 辅助 case。
-   - `--case real-provider` / `--case all` 必须通过项目当前模型配置入口 / 解析逻辑读取
-     `dayu/config/llm_models.json` 的 `mimo-v2.5-pro-plan` 配置；缺 `MIMO_PLAN_API_KEY`、model、endpoint、
-     `supports_tool_calling=true` 或必要 provider request 配置时输出 clear failure，不返回成功。
-   - `utils/smoke_async_agent_providers.py` 的同名 case 若与配置真源存在差异，例如
-     `MimoThinkingExtension(enabled=True)` 与 `llm_models.json` 的 `mimo_thinking enabled=false` 不一致，
-     smoke 实现必须以配置真源为准，或在 smoke 输出和 review 中显式说明有意差异，不能静默沿用 helper 硬编码。
-   - 主路径必须向模型发送明确 prompt，要求模型调用 `huge_echo`，并在观察到 cursor issued 后通过 gating /
-     stream control 先执行 Host public fetch_more，再允许 final terminal。若真实模型直接 final 或未调用工具，
-     smoke 必须失败，不能用 scripted WorkerProxy 补造成功。
+   - `--case real-provider` / `--case all` 必须使用脚本内 hardcoded `ProviderCase`；缺 `MIMO_PLAN_API_KEY`、
+     model、endpoint、`supports_tool_calling=true` 或必要 provider request 配置时输出 clear failure，不返回成功。
+   - `MimoThinkingExtension(enabled=True)` 是 hardcoded ProviderCase 的一部分，smoke 输出和 review 必须显式说明
+     该选择不读取、也不以 `llm_models.json` 为真源。
+   - 主路径必须向模型发送明确 prompt，要求模型调用 `huge_echo`，并在收到截断 hint 后继续调用 `fetch_more`。
+     若真实模型直接 final、未调用 `huge_echo`、未根据 hint 调用 `fetch_more`，smoke 必须失败，不能用
+     scripted WorkerProxy 或 smoke 脚本代调 Host public API 补造成功。
 8. 文档同步：
    - `docs/host/design.md` 增加 “P5 后 no-full-governance multi-turn smoke 执行路径”。
    - `dayu/host/README.md` 更新当前状态与 smoke 命令。
@@ -628,30 +644,35 @@ P5 不新增 `dayu.runtime` 能力，不涉及 lane。
   - fake WorkerProxy 不得手写 `ToolResultTruncatedData`、`ToolCursorIssuedData` 或 `TOOL_RESULT_ACCEPTED`
     冒充 tool runtime facts；scripted WorkerProxy 只能用于辅助 / 诊断 case。
   - turn 1 terminal 后 memory projection 发生。
-  - turn 2 RunInputBuilder 看到 turn 1 user / final / tool truncation fact / fetch_more completed fact /
+  - turn 2 RunInputBuilder 看到 turn 1 user / final / tool truncation fact / 模型发起的 fetch_more completed fact /
     source cursor。
   - turn 2 RunInputBuilder 同时看到 fixture 预置的 pinned_state / task frame 与上一轮 recent raw turn。
-- `test_phase5_fetch_more_uses_host_public_path_and_preserves_single_use`
+- `test_phase5_model_fetch_more_tool_call_uses_framework_runtime_and_preserves_single_use`
   - 截断由 schema spec 驱动；`huge_echo` 默认返回足够大的文本，辅助测试可返回 list / JSON wrapper，
     以稳定制造长结果；`huge_echo` 的 schema / metadata 由 P5 公共 OLD-like `@tool(...)` declaration 声明，
     并产出当前 NEW 的强类型 `ToolDefinition` / `ToolBundle`。
   - `huge_echo` 必须在主 happy path 中由 Engine / Agent LLM tool calling 调用，不能由测试直接调用
     `InMemoryToolRuntime.execute_tool_call()` 完成主证明。
+  - 截断后的 LLM-facing tool result 必须包含 `truncation.next_action="fetch_more"` 与 `fetch_more_args`。
+  - `fetch_more` 必须作为 framework tool 暴露给 LLM，且由模型在同一个 run 内再次 tool calling；测试不能用
+    `harness.fetch_more_tool_result()` 替代 success path。
   - handle 读取不泄漏 scope token 到 EventLog。
-  - owner run 未 terminal 时 fetch_more completed 有 event cursor。
+  - owner run 未 terminal 时模型发起的 fetch_more completed 有 event cursor。
   - terminal 后补读返回 `run_terminal` typed failure、`denied=False`、`event_cursor=None`，且 EventLog 事件数不增加。
 - `test_tool_declaration_keeps_schema_runtime_and_display_metadata_separate`
   - `@tool(..., truncate=ToolTruncateSpec(...))` 同现场声明 LLM schema 与 Host truncate metadata。
-  - 返回值包含 name、callable / executor binding、`ToolSchema`、`ToolTruncateSpec`、`display_name` / `tags`。
+  - 返回值包含 name、callable / executor binding、`ToolSchema`、`ToolTruncateSpec`、`ToolDisplayInfo` / `tags`。
   - definition / bundle 提供显式 schema projection，例如 `to_tool_schema()` 或只读 `schema`。
-  - definition / bundle 投影给 Engine 的结果只能是 `ToolSchema`，不包含 `ToolTruncateSpec`、`display_name`、
+  - definition / bundle 投影给 Engine 的结果只能是 `ToolSchema`，不包含 `ToolTruncateSpec`、display metadata、
     `tags`、callable 或 executor binding。
-  - `display_name` / `tags` 不进入 LLM schema。
-  - 不生成 LLM-facing `fetch_more`。
+  - `ToolDisplayInfo` / `tags` 不进入 LLM schema。
+  - `ToolTruncateSpec` 不进入 LLM schema；截断 result projection 生成 LLM-facing `truncation` hint。
+  - framework `fetch_more` schema 与业务工具 schema 一起暴露给 Engine / Runner，但它不携带业务
+    `ToolDefinition` / display metadata。
 - `test_phase5_engine_and_worker_requests_only_receive_tool_schema_tuple`
   - `AgentRunRequest.tool_schemas` 与 WorkerProxy request 只含 `ToolSchema` tuple。
   - request 中不得出现 `ToolDefinition` / `ToolBundle`。
-  - request 中不得出现 `ToolTruncateSpec`、`display_name`、`tags`、callable 或 executor binding。
+  - request 中不得出现 `ToolTruncateSpec`、display metadata、`tags`、callable 或 executor binding。
 - `test_phase5_compact_retry_is_same_run_internal_attempt_not_new_user_turn`
   - overflow run 只 append 一次 `USER_INPUT_ACCEPTED`。
   - compact requested / completed / attempt retry facts 顺序可观察。
@@ -692,7 +713,8 @@ SMOKE turn=1 user_input_accepted.cursor=0
 SMOKE turn=1 llm_tool_call tool=huge_echo via_engine_tool_loop=True executor_execute_called=True
 SMOKE turn=1 tool_truncated.cursor=...
 SMOKE turn=1 cursor_issued fingerprint=... event_cursor=...
-SMOKE fetch_more pre_terminal completed items=... has_more=... event_cursor=...
+SMOKE turn=1 llm_tool_call tool=fetch_more via_engine_tool_loop=True
+SMOKE fetch_more completed actor=model has_more=... event_cursor=...
 SMOKE turn=1 terminal type=final_answer cursor=...
 SMOKE fetch_more post_terminal result=run_terminal denied=False event_cursor=None event_count_unchanged=True
 SMOKE turn=2 user_input_accepted.cursor=0
@@ -709,19 +731,18 @@ SMOKE compact terminal type=final_answer cursor=...
 
 `--case real-provider` / `--case all` 要求：
 
-- 必须复用项目当前模型配置入口 / 解析逻辑，并以 `dayu/config/llm_models.json` 的
-  `mimo-v2.5-pro-plan` 为配置真源：env 使用 `MIMO_PLAN_API_KEY`，case 名为 `mimo-v2.5-pro-plan`，
-  endpoint 为 `https://token-plan-cn.xiaomimimo.com/v1/chat/completions`，model 为 `mimo-v2.5-pro`，
-  `supports_tool_calling=true`，`supports_stream_usage=false`，`provider_request` 为
-  `mimo_thinking enabled=false`。
-- `utils/smoke_async_agent_providers.py` 既有同名 case 可作为 helper 差异检查对象，但不能覆盖配置真源；
-  若继续沿用 helper 的 `MimoThinkingExtension(enabled=True)`，必须在 smoke 输出与 review 中显式标明这是有意差异，
-  并证明没有背离真实 `mimo-v2.5-pro-plan` 配置目标。
+- 必须使用脚本内 hardcoded `ProviderCase`：env 使用 `MIMO_PLAN_API_KEY`，case 名为
+  `mimo-v2.5-pro-plan`，endpoint 为 `https://token-plan-cn.xiaomimimo.com/v1/chat/completions`，
+  model 为 `mimo-v2.5-pro`，`supports_tool_calling=true`，`supports_stream_usage=false`，
+  `provider_request` 为 `MimoThinkingExtension(enabled=True)`。
+- `utils/smoke_async_agent_providers.py` 既有同名 case 只作为范式参考；P5 smoke 不读取
+  `dayu/config/llm_models.json` 或 `workspace/config`，并在输出与 review 中显式说明
+  `MimoThinkingExtension(enabled=True)` 是 hardcoded ProviderCase 的有意选择。
 - 缺 key、缺 model 或缺 endpoint 时输出 `SMOKE real_provider=failed reason=missing_config` 并返回非零。
 - prompt 必须明确要求模型调用 `huge_echo`；若模型直接 final、拒绝 tool calling 或调用其它工具，smoke 失败。
-- 成功 fetch_more 必须发生在 owner run terminal 前；若真实模型太快给 final，harness 必须在 cursor issued 后通过
-  gating / stream control 先补读，再允许 final terminal；smoke 输出和测试 / 人工检查必须能观察该证据，并证明
-  没有绕过 Engine / Agent tool loop。
+- 成功 fetch_more 必须发生在 owner run terminal 前，且 actor 必须是模型发起的 `fetch_more` tool call；若真实模型
+  太快给 final 或忽略截断 hint，smoke 必须失败。smoke 输出和测试 / 人工检查必须能观察该证据，并证明没有绕过
+  Engine / Agent tool loop。
 
 ## 验证命令
 
@@ -800,20 +821,21 @@ Code review gate：
   - 是否错误暴露 internal API。
   - 是否把 P7+ 治理能力写成当前事实。
   - 是否把 `utils` 局部 smoke registry 当成最终 P5 目标，而不是迁移到公共 `@tool` declaration 能力。
-  - 是否保持 `display_name` / `tags` 与 LLM-facing schema 分离，且未恢复 LLM-facing `fetch_more`。
+  - 是否保持 `ToolDisplayInfo` / `tags` 与 LLM-facing schema 分离，同时只恢复最小 framework `fetch_more`
+    tool 与 truncation hint，没有滑向完整 ToolRegistry / 权限治理。
   - 是否通过 `to_tool_schema()` 或只读 `schema` 等明确 projection 把 definition / bundle 降为
     `ToolSchema` tuple 后再传入 Engine / Runner。
   - 是否断言 Engine request / WorkerProxy request 不含 `ToolTruncateSpec`、display metadata、tags、callable
     或 executor binding。
   - 手工 smoke 是否真实向 `mimo-v2.5-pro-plan` 发送 prompt，并由模型发起 `huge_echo` tool calling；
     缺配置、直接 final 或未调用 `huge_echo` 时是否 clear failure，而不是 fake 成功。
-  - 成功 fetch_more 是否在 owner run terminal 前经 Host public `get_tool_fetch_more_handle` /
-    `fetch_more_tool_result` 完成；若需要 gating / stream control，是否没有绕过 Engine / Agent tool loop。
-  - smoke 输出和测试 / 人工检查是否能直接观察 real-provider gating 证据：cursor facts 来自真实
-    `ToolRuntimeToolExecutor -> InMemoryToolRuntime`，`fetch_more completed` cursor 早于 terminal cursor，
+  - 成功 fetch_more 是否在 owner run terminal 前由模型通过 LLM tool calling 完成；若实现仍由 smoke 脚本直接调用
+    Host public `fetch_more_tool_result`，review 必须判定不通过。
+  - smoke 输出和测试 / 人工检查是否能直接观察 real-provider 主路径证据：cursor facts 来自真实
+    `ToolRuntimeToolExecutor -> InMemoryToolRuntime`，模型发起的 `fetch_more completed` cursor 早于 terminal cursor，
     `via_engine_tool_loop=True` / `executor_execute_called=True` 等字段来自实际观测而非脚本常量。
-  - `mimo-v2.5-pro-plan` 配置是否以 `dayu/config/llm_models.json` 为真源，并复用项目当前配置入口 / 解析逻辑；
-    如与 `utils/smoke_async_agent_providers.py` 既有 case 的 `provider_request` 不一致，是否以配置真源为准或已显式说明。
+  - `mimo-v2.5-pro-plan` 是否沿用 `utils/` provider smoke 的 hardcoded ProviderCase 范式，不读取
+    `llm_models.json`；`MimoThinkingExtension(enabled=True)` 是否在代码、输出和 review 中被标注为有意选择。
   - 是否覆盖 semantic vs implementation mismatch，例如 `start_run` 语义上启动 run，但实际必须 await 后已启动；
     compact retry 语义上是 internal attempt，但实现不能追加第二个 `USER_INPUT_ACCEPTED`。
 
@@ -841,12 +863,12 @@ PR review gate：
   `RunInputBuilder` / `ContextCompactCoordinator`，只能靠手工构造 facts。
 - 手工 smoke 无法真实调用 `mimo-v2.5-pro-plan`，或只能用 fake provider / scripted WorkerProxy 替代模型
   `huge_echo` tool calling。
-- 无法在 owner run terminal 前通过 Host public `get_tool_fetch_more_handle` / `fetch_more_tool_result` 完成成功补读，
-  只能 terminal 后补读或手写 fetch_more facts。
-- 无法证明 `fetch_more completed` 发生在 final terminal 前，或证明该 tool call / fetch_more 证据来自真实
+- 无法在 owner run terminal 前由模型通过 LLM `fetch_more` tool call 完成成功补读，只能由 smoke 脚本代调
+  Host public API、terminal 后补读或手写 fetch_more facts。
+- 无法证明模型发起的 `fetch_more completed` 发生在 final terminal 前，或证明该 tool call / fetch_more 证据来自真实
   Engine / Agent tool loop 与 ToolRuntime 路径。
-- 无法以 `dayu/config/llm_models.json` 的 `mimo-v2.5-pro-plan` 作为配置真源，或只能静默沿用旧 smoke helper 中与
-  配置真源不一致的 provider_request。
+- hardcoded `ProviderCase` 的 endpoint、model、capability 或 `MimoThinkingExtension(enabled=True)` 不能被代码、
+  输出和 review 明确说明，导致 P5 smoke 口径重新混同为配置 adapter。
 - 发现 P1-P4 文档声称已落地，但代码路径直接证据不支持。
 - 为了组合 smoke 需要打印 scope token、raw cursor、完整大工具结果或完整 prompt。
 - `pyright` 出现新增或扩散错误。
@@ -863,13 +885,13 @@ PR review gate：
   smoke 口径。
 - terminal 后 fetch_more 的当前契约可能限制“先 terminal 再补读”观察。缓解：按 P2 当前事实设计 smoke；
   如果需要 terminal 后补读审计，应后移 P6 / P7，不在 P5 偷改。
-- 真实模型可能直接 final、调用其它工具或在 cursor issued 后快速进入 terminal。缓解：prompt 明确要求调用
-  `huge_echo`，并在 harness 中设计 gating / stream control，确保 cursor issued 后先通过 Host public 路径
-  fetch_more，再允许 final terminal；无法做到则 smoke 清晰失败。
+- 真实模型可能直接 final、调用其它工具或忽略截断 hint。缓解：prompt 明确要求调用 `huge_echo` 并根据
+  `truncation.next_action="fetch_more"` 继续调用 framework `fetch_more`；无法做到则 smoke 清晰失败，不能由脚本
+  代调 Host public API 补造成功。
 - context compact 默认 deterministic 策略可能丢弃 older raw turns，使 smoke 对“多轮连续性”的期望过强。缓解：
   P5 对 compact 只断言必保事实，不断言旧 raw turn 全量保留。
-- `@tool` declaration 容易滑向完整 registry。缓解：P5 只定义 declaration / definition 输出，明确不做权限治理、
-  middleware、业务发现、Service catalog 或 LLM-facing `fetch_more`。
+- `@tool` declaration 与 framework `fetch_more` 容易滑向完整 registry。缓解：P5 只定义 declaration /
+  definition 输出和 framework fetch_more 路由，明确不做权限治理、middleware、业务发现或 Service catalog。
 
 回滚：
 

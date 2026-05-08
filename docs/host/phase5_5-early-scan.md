@@ -7,10 +7,14 @@
 离“Host + Engine 作为可工作 Agent runtime，只要接入 tool 就能工作”，除生产治理外还缺三类非治理能力：
 
 1. 真实 tool 接入面：public `start_run` 默认只装配 `_NoopToolExecutor`，没有面向 Service / app 的 ToolExecutor / tool catalog 装配入口；真实工具只能通过内部 `LocalRunHarness` 注入。
-2. LLM 主动补读闭环：P2/P5 明确不恢复 LLM-facing `fetch_more` schema / `fetch_more_args` projection；如果“能工作”要求模型在看到截断后自行补读，当前做不到。
+2. LLM 主动补读闭环：早期扫描时 P2/P5 仍未恢复 LLM-facing `fetch_more` schema / `fetch_more_args`
+   projection；后续 revised P5 已承接最小 framework `fetch_more` tool 与 truncation hint，使模型能在
+   同一个 run 内自行补读。P5.5 只复核该能力是否落地、是否仍停留在最小实现、是否需要升级到完整
+   ToolRegistry / governance。
 3. P5 纵向 smoke 证据：当前没有 P5 smoke 脚本与 P5 integration test，尚未证明真实 `LocalRunHarness -> RunEventStore -> ToolRuntime -> MemoryStore -> RunInputBuilder -> CompactCoordinator` 在同一用例中串通。
 
-所以，ToolRuntime truncate / fetch_more 不是唯一明显缺口；它的底层 Host public 补读路径已落地，真正缺的是“工具接入装配 + LLM 可见补读协议 + P5 纵向证明”三者的组合。
+所以，ToolRuntime truncate / fetch_more 不是唯一明显缺口；它的底层 Host public 补读路径已落地，revised P5
+已承接 LLM 可见补读协议，真正缺的是“工具接入装配 + P5 纵向证明 + P5.5 复核升级边界”三者的组合。
 
 ## 目标成立性判断
 
@@ -29,7 +33,7 @@
 | Reply Outbox | P3、P5 非目标 | P6+ 已安排；非 Agent runtime 核心阻塞 | P9 已安排 | P9 |
 | 完整 ToolRegistry：发现、注册中心、display info、middleware、重复调用治理 | P1、P2、P5 非目标 | 未落地；对“只要接入 tool”有非治理影响 | Host public 不导出 ToolRuntime/ToolExecutor；默认 harness 不提供工具配置入口 | P5.5 需决定：拆最小 tool catalog 装配，完整治理留后 |
 | 业务工具迁移 / fins 工具接入 | P2、P3 非目标 | 未落地；对真实财报 Agent 可用性有影响 | P2 明确 doc/web/fins 工具不迁入；当前 utils/test 使用 fake executor | P5.5 或单独业务工具 phase |
-| LLM-facing `fetch_more` schema / `fetch_more_args` projection | P2、P3、P5 非目标 | 未安排明确 phase；这是主要非治理缺口 | Engine projection 测试断言不投影 `fetch_more_args` / token；P2 plan 只说后续明确设计 | 新增 P5.5/P6 前置议题或 P6+ 子 phase |
+| LLM-facing `fetch_more` schema / `fetch_more_args` projection | 早期 P2/P5 非目标，revised P5 目标 | 已由 revised P5 承接；P5.5 复核是否落地、是否仍停留最小实现、是否要升级到完整 ToolRegistry / governance | P2 plan 只保留 Host public 补读；revised P5 要求恢复最小 framework `fetch_more` tool 与 truncation hint | P5 落地，P5.5 复核升级边界 |
 | Host public `fetch_more_tool_result` | P2 目标 | 已落地 | `InMemoryToolRuntime.fetch_more`、Host public exports、P2 测试覆盖 single-use / terminal guard | 已落地，P5 纵向验证 |
 | Conversation Memory / RunInputBuilder | P1/P1.5 非目标，P3 目标 | 已落地最小版 | memory 只投影 canonical RunEvent，RunInputBuilder 注入 Host memory + current user | 已落地，P5 纵向验证 |
 | preview / reasoning 隔离 | P1/P3/P5 语义要求 | 已落地并有测试 | event translation 将 delta / content completed 归为 preview；memory 只消费 canonical | 已落地，继续守护 |
@@ -49,7 +53,10 @@
 - Host 内部真实 tool adapter 存在：`ToolRuntimeToolExecutor.execute()` 调到 `InMemoryToolRuntime.execute_tool_call()`，再按工具名读取 `truncate_specs`。见 `dayu/host/_tool_runtime.py:168`、`dayu/host/_tool_runtime.py:224`、`dayu/host/_tool_runtime.py:228`。
 - Engine tool loop 确实只通过 `ToolExecutor.execute` 执行工具，并把 outcome 注入下一轮 Runner。见 `dayu/engine/agent.py:1002`、`dayu/engine/agent.py:1040`、`dayu/engine/agent.py:1104`、`dayu/engine/agent.py:1124`。
 - Tool schema 与 truncate spec 的来源存在语义缝隙：`ToolTruncateSpec` 位于 `dayu.contracts.tool_schema`，但它“不进入 LLM-facing schema projection”；Host runtime 另有 `truncate_specs: Mapping[str, ToolTruncateSpec]`。见 `dayu/contracts/tool_schema.py:15`、`dayu/host/_tool_runtime.py:198`。
-- LLM-facing fetch_more 明确没有恢复：P2 plan 不注册 `fetch_more` schema、不投影 `fetch_more_args`；测试也断言 Engine projection 只输出 `{"preview": "abc"}` 且不含 token/hash。见 `docs/host/phase2-plan.md:39`、`tests/host/test_phase2_tool_runtime_boundary.py:313`。
+- 早期扫描证据显示，当时 P2 plan 不注册 LLM-facing `fetch_more` schema、不投影
+  `fetch_more_args`；测试也断言 Engine projection 只输出 `{"preview": "abc"}` 且不含 token/hash。该状态已由
+  revised P5 承接为最小 framework `fetch_more` tool 与 truncation hint，P5.5 只复核落地质量和升级边界。见
+  `docs/host/phase2-plan.md:39`、`tests/host/test_phase2_tool_runtime_boundary.py:313`。
 - context overflow 不是 Host 字符串猜测：Runner classifier 优先结构化 code，再受控 message fallback；Agent 将 `CONTEXT_LENGTH_EXCEEDED` 提升为 `CONTEXT_COMPACTION_REQUESTED`。见 `dayu/engine/runners/openai/error_classifier.py:92`、`dayu/engine/agent.py:850`。
 - memory 只投影 terminal 后 canonical facts：Run harness 在 `terminal_seen` 后调用 `_project_run_events`，memory store 过滤 canonical event；assistant final answer 进入 raw turn，不自动成为 verified claim。见 `dayu/host/_run_harness.py:451`、`dayu/host/_conversation_memory.py:400`、`dayu/host/_conversation_memory.py:612`。
 
@@ -81,20 +88,21 @@ P4 前曾有“只能 fake”的风险；当前代码已经有 OpenAI-compatible
 
 ### 6. Engine README 有残留口径风险
 
-`dayu/engine/README.md` 当前仍写“OLD `TruncationManager` / `fetch_more` 尚未落地；这些能力不能通过当前 Agent 私自接入”。从 Engine 视角“Engine 不负责 fetch_more”是对的，但“尚未落地”容易误读为 Host P2 也未落地。P5/P5.5 后建议改成“Engine 不落地；Host ToolRuntime 已落地 Host public 补读路径，但 LLM-facing fetch_more 未落地”。
+`dayu/engine/README.md` 当前仍写“OLD `TruncationManager` / `fetch_more` 尚未落地；这些能力不能通过当前 Agent 私自接入”。从 Engine 视角“Engine 不负责 fetch_more”是对的，但“尚未落地”容易误读为 Host P2 也未落地。P5/P5.5 后建议改成“Engine 不拥有 fetch_more 语义；Host ToolRuntime 已落地 Host public 补读路径，revised P5 承接 LLM-facing framework `fetch_more` 的最小闭环”。
 
 ## 建议进入 P5 / P5.5 / P6+ 的事项
 
 ### P5 必须进入
 
 - 实施 P5 smoke 与 integration test。当前这是最直接阻塞：没有它，就没有纵向证据证明 P1-P4 同链路可工作。
-- P5 主用例至少覆盖：真实 ToolRuntime 截断、pre-terminal Host public fetch_more、terminal 后 typed failure、第二轮 memory 看到上一轮 user/final/tool/fetch_more fact、overflow compact retry 不重复 `USER_INPUT_ACCEPTED`。
+- P5 主用例至少覆盖：真实 ToolRuntime 截断、截断 tool result 含 LLM 可理解的 `fetch_more` hint、模型在同一个 run 内经 Engine tool loop 主动调用 framework `fetch_more`、terminal 后 Host public `fetch_more_tool_result()` typed failure、第二轮 memory 看到上一轮 user/final/tool/fetch_more fact、overflow compact retry 不重复 `USER_INPUT_ACCEPTED`。
+- Host public `fetch_more_tool_result()` 只能作为 framework tool 路由复用的底层边界和 terminal 后 negative path；不能作为 P5 success path actor。
 - P5 不应试图解决 public tool registry；若主路径需要真实 tool executor，仍可用内部 harness 装配，但报告必须明确这只是测试装配，不代表应用接入面已完成。
 
 ### P5.5 应作为边界修订进入
 
 - 定义“最小 tool 接入契约”：`ToolSchema`、`ToolExecutor`、`ToolTruncateSpec` / metadata 的同源绑定方式。可以不做完整 ToolRegistry，但要避免未来 Service 接入工具时只接了 LLM schema 而漏接 Host truncation metadata。
-- 明确 LLM-facing `fetch_more` 是否属于“Agent runtime 可工作”的必要条件。如果是，新增 phase/issue；如果否，文档必须把当前语义写成“人类/Service 可通过 Host public fetch_more 补读，LLM 不能主动补读”。
+- P5 修订后已确认 LLM-facing framework `fetch_more` 属于“Agent runtime 可工作”的必要条件；P5.5 只需要回看它是否已经按 revised P5 落地、是否仍停留在最小实现，以及是否需要升级为完整 ToolRegistry / governance 能力。
 - 给 OutputContract / validation replay 找归属。design 已有 replay / OutputContract 设计，但 P6-P13 表中没有独立承接；对财报分析 Agent，输出契约不是生产治理本身，而是回答可靠性的非治理能力。
 
 ### P6+ 保持后移
@@ -112,13 +120,14 @@ P4 前曾有“只能 fake”的风险；当前代码已经有 OpenAI-compatible
 ### 阻塞“P5 目标成立”的事项
 
 - P5 smoke/test 文件缺失，纵向 smoke 尚未落地。
-- P5 没有证明同一主路径同时经过真实 ToolRuntime、fetch_more、memory projection 与 compact retry。
+- P5 没有证明同一主路径同时经过真实 ToolRuntime、模型发起的 framework `fetch_more`、memory projection 与 compact retry。
 
 ### 阻塞“只要接入 tool 就能工作”的事项
 
 - 缺少 public 或稳定组合根形式的工具接入装配面。
 - `ToolSchema` 与 `ToolTruncateSpec` / Host metadata 缺少同源绑定契约。
-- 若要求模型自主补读，则 LLM-facing `fetch_more` schema / projection 缺失也是阻塞。
+- revised P5 已承接模型自主补读；若落地结果仍没有模型经 Engine tool loop 发起的 framework `fetch_more`
+  tool call，则 P5 success path 不成立。
 
 ### 非阻塞 no-full-governance smoke 的事项
 

@@ -119,6 +119,21 @@
 - **修复结论**：`docs/host/migration-plan.md` 已明确 phase plan / review / code review 默认保留为迁移
   审计记录；迁移结束后只有经用户确认才归档或移动。P13 也已改为“归档迁移过程文档”，并明确不误删 review 证据。
 
+### 10-已修复-中-P13 应补 Full-Governance Multi-Turn Smoke，验证面对齐 P5
+
+- **位置**：`docs/host/migration-plan.md` P5、P13。
+- **问题**：P5 已定义 `No-Full-Governance Multi-Turn Smoke`，用于证明 P1-P4 / P1.5 的最小纵向链路；
+  P13 原本只有文档收口，没有一个在 P6-P12 完整治理能力打开后复跑同一验证面的最终 smoke。
+  这会导致迁移结束时只能证明“无完整治理链路可跑”和“各治理阶段分段通过”，但缺少
+  “完整治理打开后，多轮 Agent 仍按同一语义面端到端可跑”的证据。
+- **建议**：P13 增加 `Full-Governance Multi-Turn Smoke`，验证面与 P5 对齐：真实模型 tool calling、
+  ToolRuntime truncate / framework `fetch_more`、Conversation Memory、context compact；同时打开 P6-P12
+  已落地的 EventLog persistence / observers、Session / Run lifecycle、attempt recovery、outbox、remote / wait
+  协作和 governance hard-gate。P13 只验证和收口，不新增治理能力。
+- **修复结论**：`docs/host/migration-plan.md` P13 已改为
+  `Full-Governance Multi-Turn Smoke / 文档收口`，明确 P13 smoke 必须按 P5 同一验证面复跑，
+  并额外覆盖完整治理打开后的 persistence / observers / lifecycle / admission / recovery / audit hard-gate。
+
 ## 可选改进
 
 - 可以考虑增加 P1.5：`Minimal EventLog / Run Store`。这样不改变用户期望的前半段能力顺序，又能让 P2-P5 都基于同一事实层推进。
@@ -140,6 +155,7 @@ EngineWorker
   -> no-governance multi-turn smoke
   -> EventLog persistence / Observers hardening
   -> 完整治理能力
+  -> full-governance multi-turn smoke / docs 收口
 ```
 
 在阻塞 finding 修复前，不建议让迁移 Agent 进入 P1 生产代码实现；可以继续进行人工 review 和计划修订。
@@ -174,3 +190,4 @@ EngineWorker
   Host public API，只能作为 Host capability / 内部 protocol 被装配和测试。
 - Finding 8 已修复：P8 已补充 lane runtime dependency 判断，且明确 lane 不能成为 Host 私有能力。
 - Finding 9 已修复：P13 已补充迁移文档归档策略，phase plan / review / code review 默认保留为审计记录。
+- Finding 10 已修复：P13 已补充 Full-Governance Multi-Turn Smoke，验证面对齐 P5，并只作为完整治理落地后的最终纵向验证与文档收口，不新增治理能力。

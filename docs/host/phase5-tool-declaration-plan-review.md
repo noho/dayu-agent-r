@@ -111,9 +111,10 @@ no-full-governance scope 内。
 
 - `ToolSchema` 只投影给 LLM。
 - `ToolTruncateSpec` 是 Host ToolRuntime metadata，不进入 LLM schema。
-- `display_name` / `tags` 是展示 metadata，不影响模型可见描述。
-- P5 不恢复 LLM-facing `fetch_more` schema 或 `fetch_more_args` projection，仍通过 Host public
-  `fetch_more_tool_result` 验证补读。
+- `@tool(..., display_name="...")` 是可读声明入口，内部展示 metadata 为 `ToolDisplayInfo` / `tags`；
+  这些信息不影响模型可见描述。
+- P5 修订后会恢复最小 framework `fetch_more` schema 与 LLM-facing truncation hint；`ToolTruncateSpec`
+  本体仍是 Host ToolRuntime metadata，不进入 LLM schema。
 
 ### 3. `dayu/contracts/tool_declaration.py` 落点是否合理
 
@@ -163,7 +164,8 @@ P5 plan 可以在新增 tool declaration scope 下进入实现；无需因该修
 
 - 公共能力只做 declaration / definition，不做 registry / governance。
 - Engine / Runner 只接收 `ToolSchema`，不接收 `ToolDefinition` / `ToolBundle`。
-- `ToolTruncateSpec`、display metadata 与 LLM-facing schema 全程分离，不恢复 LLM-facing `fetch_more`。
+- `ToolTruncateSpec`、display metadata 与 LLM-facing schema 全程分离；framework `fetch_more` 只作为最小运行时
+  tool 暴露，不滑向完整 ToolRegistry / 权限治理。
 
 ## 复审结论（2026-05-07）
 
@@ -184,7 +186,7 @@ P5 plan 可以在新增 tool declaration scope 下进入实现；无需因该修
 - 契约变化段再次固定：definition / bundle 是工具声明输出，不是 Host runtime governance API；Engine / Runner
   request 不得接收、保存或检查 `ToolDefinition` / `ToolBundle` 本体。
 - ToolRuntime / EngineWorker / Engine 边界段明确：WorkerProxy request / `AgentRunRequest.tool_schemas` 中不得出现
-  `ToolTruncateSpec`、`display_name`、`tags`、callable 或 executor binding；ToolRuntime 可以从 definition /
+  `ToolTruncateSpec`、display metadata、`tags`、callable 或 executor binding；ToolRuntime 可以从 definition /
   bundle 消费 `ToolTruncateSpec`，但不得把该 spec 投影给 LLM。
 - 测试清单新增 `test_tool_declaration_keeps_schema_runtime_and_display_metadata_separate` 与
   `test_phase5_engine_and_worker_requests_only_receive_tool_schema_tuple`，覆盖 schema projection、metadata 分离、
