@@ -279,7 +279,12 @@ per-run cursor、exclusive replay 与 replay-then-follow 订阅，并对外暴�
 `HostStorage`、`DurableRunEventStore`、`ProjectionCoordinator` 与三个默认 observer
 （memory required、timeline、audit）。每个 observer 在 `ProjectionStore` 中保存
 checkpoint、`status`、`retry_count`、`last_error_code`、`lag_events`；checkpoint 不允许
-倒退。`DurableRunEventStore` 写入 RunEventData 时通过封闭 type↔data 映射的序列化注册表
+倒退。`DurableHarnessBundle.startup_reconcile()` 是装配后的显式追平入口：进程崩溃可能
+停在 terminal 事件已持久化但 `coordinator.drain()` 尚未执行的瞬间，重启后调用方需要
+在自己的 async 上下文内 `await bundle.startup_reconcile()`，本方法委派
+`ProjectionCoordinator.startup_reconcile`，串行 drain 至 `CAUGHT_UP`，不引入新 event
+loop / 线程，也不与 terminal 后的 `drain()` 重入冲突。`DurableRunEventStore` 写入
+RunEventData 时通过封闭 type↔data 映射的序列化注册表
 （`dayu.host._run_event_serializer`，`schema_version=1`）做 fail-fast 校验；schema 变化按
 全新起库处理，不维护旧库兼容。当前实现仍是单进程：未提供跨进程 lease / fencing 与多进程
 恢复。

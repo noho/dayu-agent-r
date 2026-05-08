@@ -143,6 +143,24 @@ class ProjectionCoordinator:
                     schema_version=desc.schema_version,
                 )
 
+    async def startup_reconcile(self) -> tuple[ProjectionCheckpoint, ...]:
+        """启动 / 重新装配后追平 read model。
+
+        进程崩溃在 terminal 事件持久化成功之后、``drain()`` 执行之前时，
+        EventLog 已含 terminal 与 RunResult，但 observer checkpoint 仍落
+        后。Host durable 装配完成后，调用方必须在自己的 async 上下文中
+        显式 ``await`` 本方法；P6 不在同步 ``build_durable_harness()``
+        内自动执行恢复。方法会按当前 checkpoint 与 EventLog 比较，对
+        落后的 observer 触发 ``drain()`` 推进至 ``CAUGHT_UP``。本方法
+        语义与 ``drain()`` 一致；保留独立入口是为了让调用方从语义上
+        区分“启动追平”与“terminal 后追平”。
+
+        :returns: 每个 observer 推进后的最新 checkpoint。
+        :raises sqlite3.DatabaseError: 写入失败时抛出。
+        """
+
+        return await self.drain()
+
     async def drain(self) -> tuple[ProjectionCheckpoint, ...]:
         """对每个 observer 推进到当前最新 position。
 

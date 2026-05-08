@@ -82,27 +82,52 @@ class MemoryProjectionObserver:
         """
 
         del tx
+        # at-least-once 不变量：sink 失败时 ``_pending_by_run`` 不能被破坏。
+        # 因此先把本批次新增事件累积到一个临时副本中，sink 全部成功后再
+        # 整体提交回 ``_pending_by_run``，并在 terminal 事件成功投影后才
+        # 删除该 run 的累积条目。这样即使 ``project_run_events`` 抛异常被
+        # 上层标记为 ``RETRYABLE_FAILED`` / ``BLOCKED_FAILED``，下次 drain
+        # / 重放时 observer 仍能用同一批 envelope 重放并重新累积，用户
+        # 输入与 final 不会因 pop-before-sink 永久丢失。
+        staged: dict[str, list[RunEvent]] = {
+            run_id: list(events)
+            for run_id, events in self._pending_by_run.items()
+        }
+        terminal_run_ids: list[str] = []
         for envelope in batch:
             event = envelope.event
             if event.kind is not RunEventKind.CANONICAL:
                 continue
-            self._pending_by_run.setdefault(event.run_id, []).append(event)
+            staged.setdefault(event.run_id, []).append(event)
             if event.type in TERMINAL_RUN_EVENT_TYPES:
-                events = tuple(self._pending_by_run.pop(event.run_id))
+                events = tuple(staged[event.run_id])
                 # 同步路径：memory store 是 asyncio 协程接口，但 observer
                 # 在事务内同步运行；采用 ``run_until_complete`` 兼容内存实
                 # 现的 Lock。
                 _run_async(
                     self.memory_store.project_run_events(events)
                 )
+                terminal_run_ids.append(event.run_id)
+        # sink 全部成功后才把 staged 状态写回真源，并清掉已 terminal 的
+        # run 条目；任何一次 ``_run_async`` 抛异常时控制流不会到达此处，
+        # ``_pending_by_run`` 维持调用前的累积视图。
+        self._pending_by_run = staged
+        for run_id in terminal_run_ids:
+            self._pending_by_run.pop(run_id, None)
 
     def rebuild_from_events(
         self,
         events: tuple[RunEvent, ...],
     ) -> None:
-        """从 durable EventLog 全量 rebuild memory。
+        """测试 helper：从给定事件批量 rebuild memory。
 
-        测试 / projection rebuild 入口：按 run_id 切片整批投影。
+        生产路径不调用本方法。生产 startup / 崩溃恢复路径由
+        :meth:`ProjectionCoordinator.startup_reconcile` 经由 ``drain()``
+        + observer ``process()`` 完成，复用同一份 at-least-once 累积逻辑。
+        本 helper 仅供 ``tests/host/test_phase6_memory_rebuild.py`` 直接以
+        canonical RunEvent 序列驱动 ``InMemoryConversationMemoryStore``，
+        作为 memory required projection 五条事实（成功 / engine failed /
+        host failed / cancelled / suspended）的最小行为契约。
 
         :param events: 全部 RunEvent。
         :returns: 无返回值。

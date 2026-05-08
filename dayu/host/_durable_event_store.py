@@ -156,12 +156,7 @@ def ensure_host_schema(storage: HostStorage) -> None:
     :raises sqlite3.DatabaseError: schema bootstrap 失败时抛出。
     """
 
-    storage.open()
-    connection = storage._connection  # noqa: SLF001
-    if connection is None:
-        raise RuntimeError("host storage connection unavailable")
-    for statement in _SCHEMA_STATEMENTS:
-        connection.execute(statement)
+    storage.apply_schema(_SCHEMA_STATEMENTS)
 
 
 @dataclass(slots=True)
@@ -765,30 +760,14 @@ def _append_log_level(event: RunEvent) -> int:
     return logging.DEBUG
 
 
-# 让 sqlite3 row 支持按列名访问。
-def _configure_row_factory(storage: HostStorage) -> None:
-    """开启行工厂便于按列名访问。
-
-    :param storage: HostStorage。
-    :returns: 无返回值。
-    :raises Exception: 不主动抛出异常。
-    """
-
-    storage.open()
-    if storage._connection is not None:  # noqa: SLF001
-        storage._connection.row_factory = sqlite3.Row  # noqa: SLF001
-
-
 __all__ = [
     "DurableRunEventStore",
     "ensure_host_schema",
 ]
 
 
-# 默认在模块导入时不打开任何连接；调用方需要在创建 HostStorage 后显式
-# ``_configure_row_factory(storage)``，再实例化 :class:`DurableRunEventStore`。
-# 实际初始化通过 ``open_durable_event_store`` 完成，以保证 row_factory 与
-# schema 都先行配置。
+# row_factory 已由 :meth:`HostStorage.open` 内部统一配置，外部模块不再持有
+# raw connection；本入口只负责确保 schema 已就绪。
 def open_durable_event_store(storage: HostStorage) -> DurableRunEventStore:
     """打开并初始化 durable event store。
 
@@ -797,5 +776,5 @@ def open_durable_event_store(storage: HostStorage) -> DurableRunEventStore:
     :raises sqlite3.DatabaseError: schema bootstrap 失败时抛出。
     """
 
-    _configure_row_factory(storage)
+    storage.open()
     return DurableRunEventStore(storage=storage)

@@ -73,6 +73,22 @@ class DurableHarnessBundle:
     attempt_state_store: AttemptStateStore
     close: Callable[[], None]
 
+    async def startup_reconcile(self) -> None:
+        """启动 / 重新装配后显式追平 read model。
+
+        进程崩溃可能停在 terminal 事件已持久化、但 ``coordinator.drain``
+        尚未执行的瞬间。重启后 EventLog 中 terminal 与 RunResult 都在，
+        但 memory / timeline / audit checkpoint 仍落后。本方法委派
+        :meth:`ProjectionCoordinator.startup_reconcile`，在 caller 的
+        async 上下文内串行 drain 至 ``CAUGHT_UP``，不引入新 event loop /
+        线程，也不与 terminal 后的 ``drain()`` 重入冲突。
+
+        :returns: 无返回值。
+        :raises sqlite3.DatabaseError: 写入失败时抛出。
+        """
+
+        await self.coordinator.startup_reconcile()
+
 
 def build_durable_harness(
     *,

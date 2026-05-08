@@ -529,4 +529,217 @@ def _drafts_for(*, run_id: str, n: int) -> Iterable[RunEventDraft]:
         yield _content_draft(run_id=run_id, idx=idx)
 
 
+# ---------------------------------------------------------------------------
+# 本轮 PR review 修复回归用例
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_memory_observer_sink_failure_preserves_pending_for_replay() -> None:
+    """P0 修复：sink 抛异常时 ``_pending_by_run`` 不被破坏；下一次重放成功投影。
+
+    模拟 ``ConversationMemoryStore.project_run_events`` 第一次失败、第二次成功，
+    验证终态 batch 内的 USER_INPUT_ACCEPTED 与 FINAL_ANSWER 都没有丢失。
+    """
+
+    from dayu.engine import FinalAnswerData, FinishReason
+    from dayu.host._conversation_memory import (
+        ConversationMemorySnapshot,
+        ConversationMemoryStore,
+    )
+    from dayu.host._event_observer import ProjectionEventEnvelope
+    from dayu.host._internal_contracts import GlobalEventPosition
+    from dayu.host._memory_projection import MemoryProjectionObserver
+    from dayu.host.contracts import (
+        RunEvent,
+        RunEventCursor,
+        UserInputAcceptedData,
+        UserInputScope,
+    )
+
+    class _FlakyMemoryStore:
+        """前 N 次抛异常的 fake memory store。"""
+
+        def __init__(self, fail_times: int) -> None:
+            """构造 fake。
+
+            :param fail_times: 失败次数。
+            :returns: 无返回值。
+            :raises Exception: 不主动抛出异常。
+            """
+
+            self._remaining = fail_times
+            self.projected: list[tuple[RunEvent, ...]] = []
+
+        async def project_run_events(
+            self, events: tuple[RunEvent, ...]
+        ) -> None:
+            """模拟 sink。
+
+            :param events: 事件元组。
+            :returns: 无返回值。
+            :raises RuntimeError: 在剩余失败计数 > 0 时抛出。
+            """
+
+            if self._remaining > 0:
+                self._remaining -= 1
+                raise RuntimeError("sink failure")
+            self.projected.append(events)
+
+        async def get_snapshot(
+            self, session_id: str
+        ) -> ConversationMemorySnapshot:
+            """未使用，仅满足协议。
+
+            :param session_id: 会话 id。
+            :returns: 永不调用，返回 None 即可。
+            :raises NotImplementedError: 始终。
+            """
+
+            del session_id
+            raise NotImplementedError
+
+    flaky: ConversationMemoryStore = _FlakyMemoryStore(fail_times=1)  # type: ignore[assignment]
+    observer = MemoryProjectionObserver(memory_store=flaky)
+
+    user_event = RunEvent(
+        run_id="rX",
+        session_id="s",
+        cursor=RunEventCursor(sequence=0),
+        kind=RunEventKind.CANONICAL,
+        source=RunEventSource.HOST,
+        type=RunEventType.USER_INPUT_ACCEPTED,
+        occurred_at=_utc(),
+        data=UserInputAcceptedData(
+            turn_id="rX", content="hello", scope=UserInputScope.SESSION
+        ),
+        source_engine_event_id=None,
+    )
+    final_event = RunEvent(
+        run_id="rX",
+        session_id="s",
+        cursor=RunEventCursor(sequence=1),
+        kind=RunEventKind.CANONICAL,
+        source=RunEventSource.ENGINE,
+        type=RunEventType.FINAL_ANSWER,
+        occurred_at=_utc(),
+        data=FinalAnswerData(
+            content="world",
+            filtered=False,
+            degraded=False,
+            finish_reason=FinishReason.STOP,
+        ),
+        source_engine_event_id="engine_rX_final",
+    )
+    batch = (
+        ProjectionEventEnvelope(
+            position=GlobalEventPosition(value=1), event=user_event
+        ),
+        ProjectionEventEnvelope(
+            position=GlobalEventPosition(value=2), event=final_event
+        ),
+    )
+
+    storage = HostStorage(database_path=":memory:")
+    storage.open()
+    try:
+        # 第一次：sink 抛 RuntimeError；observer 不能因失败破坏内部状态，
+        # 即使 _pending_by_run 之前已累积过其他 run 的事件，也必须保留。
+        observer._pending_by_run["other_run"] = []  # noqa: SLF001
+        with pytest.raises(RuntimeError, match="sink failure"):
+            async with storage.transaction() as tx:
+                observer.process(tx=tx, batch=batch)
+        # 关键不变量：失败后 _pending_by_run 不能被破坏（之前累积的 run 仍在）。
+        assert "other_run" in observer._pending_by_run  # noqa: SLF001
+
+        # 第二次重放：sink 成功；coordinator 会用同一 batch 重放，整批应被完整投影。
+        async with storage.transaction() as tx:
+            observer.process(tx=tx, batch=batch)
+        assert len(flaky.projected) == 1  # type: ignore[attr-defined]
+        projected_events = flaky.projected[0]  # type: ignore[attr-defined]
+        types = [e.type for e in projected_events]
+        assert RunEventType.USER_INPUT_ACCEPTED in types
+        assert RunEventType.FINAL_ANSWER in types
+        # terminal 投影成功后 pending 必须被清掉，避免无限累积。
+        assert "rX" not in observer._pending_by_run  # noqa: SLF001
+    finally:
+        storage.close()
+
+
+@pytest.mark.asyncio
+async def test_durable_bundle_startup_reconcile_catches_up_after_crash() -> None:
+    """P1 修复：模拟崩溃后只剩 EventLog + RunResult，``startup_reconcile`` 追平 read model。"""
+
+    from dayu.host._conversation_memory import InMemoryConversationMemoryStore
+    from dayu.host._durable_harness import build_durable_harness
+    from dayu.host.contracts import UserInputAcceptedData, UserInputScope
+
+    memory = InMemoryConversationMemoryStore()
+    bundle_a = build_durable_harness(
+        database_path=":memory:",
+        memory_store=memory,
+    )
+    storage = bundle_a.storage
+    try:
+        # 写入完整 terminal run（用户输入 + final answer）但 *不* 调用 coordinator.drain()。
+        user_draft = RunEventDraft(
+            run_id="rZ",
+            session_id="s",
+            kind=RunEventKind.CANONICAL,
+            source=RunEventSource.HOST,
+            type=RunEventType.USER_INPUT_ACCEPTED,
+            occurred_at=_utc(),
+            data=UserInputAcceptedData(
+                turn_id="rZ", content="hi", scope=UserInputScope.SESSION
+            ),
+            source_engine_event_id=None,
+        )
+        await bundle_a.event_store.append(user_draft)
+        await bundle_a.event_store.append(_final_draft(run_id="rZ"))
+        # memory store 此刻应为空（没有任何 projection 调用过）。
+        snapshot = await memory.get_snapshot("s")
+        assert snapshot.recent_raw_turns == ()
+
+        # 启动追平：startup_reconcile 必须把 memory 推进到含本轮 raw turns 的状态。
+        await bundle_a.startup_reconcile()
+        snapshot = await memory.get_snapshot("s")
+        assert snapshot.recent_raw_turns != ()
+    finally:
+        storage.close()
+
+
+@pytest.mark.asyncio
+async def test_finish_attempt_if_durable_rejects_terminal_event_and_state_together() -> None:
+    """``_finish_attempt_if_durable`` 同时传 terminal_event 与 state 时抛 ValueError。"""
+
+    from dayu.host._durable_harness import build_durable_harness
+    from dayu.host._run_state_store import AttemptState
+    from dayu.host.contracts import RunEvent, RunEventCursor
+
+    bundle = build_durable_harness(database_path=":memory:")
+    try:
+        harness = bundle.harness
+        fake_event = RunEvent(
+            run_id="rA",
+            session_id="s",
+            cursor=RunEventCursor(sequence=0),
+            kind=RunEventKind.CANONICAL,
+            source=RunEventSource.ENGINE,
+            type=RunEventType.RUN_FAILED,
+            occurred_at=_utc(),
+            data=RunFailedData(
+                error_code="x", message="y", recoverable=False
+            ),
+            source_engine_event_id="engine_rA_failed",
+        )
+        with pytest.raises(ValueError, match="terminal_event"):
+            await harness._finish_attempt_if_durable(  # noqa: SLF001
+                attempt_id="att_1",
+                terminal_event=fake_event,
+                state=AttemptState.FAILED,
+            )
+    finally:
+        bundle.close()
+
+
 __all__ = ["_drafts_for"]

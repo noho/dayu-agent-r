@@ -273,6 +273,24 @@ P6 code / architecture / concurrency review 修复后，若仍存在不阻断 P6
 - `deferred-with-owner: P15`：schema bootstrap 半失败治理。P6 可用 `CREATE ... IF NOT EXISTS`
   与全新 schema 起库假设保证当前开发 / smoke 路径；若生产需要严格事务化 DDL、半初始化检测、
   初始化锁或运维报警，统一在 P15 Governance Hardening 阶段评估并收口。
+- `deferred-with-owner: P15`：observer 在无事件且 `last_success_position is None` 时
+  无法转 `CAUGHT_UP`。`ProjectionCoordinator._run_once_locked` 当前要求 `advance_success`
+  携带具体 position；首次 initialize 后若 EventLog 为空，observer 状态保持 `IDLE`，
+  对运维状态视图可能误读为“未启动”。不影响 projection 正确性。需要在 P15 Governance
+  Hardening 阶段为 `ProjectionStore` 增加无 position 的 `set_status` 入口，或引入哨兵
+  position 显式表达 "已追平且尚无事件"。
+- `deferred-with-owner: P7/P8`：`ObserverSink.process` 是否升级为 async 协议。P6 当前保留同步
+  observer 协议，并由 `MemoryProjectionObserver._run_async` 桥接 async `ConversationMemoryStore`
+  接口；这保证 P6 diff 边界小，但每个 terminal projection 会引入 thread + event loop 桥接开销。
+  P7 新增 tool trace observer / sink、P8 引入 lease / recovery 后，必须重新评估 observer 协议是否
+  改为 async，或为 memory projection 提供同步 sink 写入接口，避免长期保留 sync-async impedance
+  mismatch。
+- `deferred-with-owner: P9`：`startup_reconcile` 进入 Host 启动流程。P6 只提供
+  `DurableHarnessBundle.startup_reconcile()` 显式入口，用于在 terminal event 已持久化但 terminal 后
+  `drain()` 尚未执行就崩溃的场景中追平 read model。由于 `build_durable_harness()` 是同步装配函数，
+  P6 不能在构造时直接 `await`；P9 落地 Session / Run Lifecycle 与生产 Host bootstrap 时，必须把
+  startup reconcile 收进 Host 启动 / durable harness 装配流程，避免 UI / Service 业务调用方需要知道并
+  主动调用该恢复入口。
 - `accepted: P6 re-review passed`：post-commit hook 异常隔离。`docs/host/phase6-fix-rereview.md`
   已确认 hook 是 best-effort in-memory `Condition.notify_all()` 唤醒，数据在 hook 执行前已 commit
   到 SQLite；hook 失败只会错过即时唤醒，不影响 durable drain、replay 或后续读路径。P6 接受
@@ -501,7 +519,9 @@ P5.5 用户确认后，后续启动顺序必须遵守以下依赖：
   与 recovery 路径。
 - P9 在 P6 durable facts 与 P8 attempt ownership 之上落地 Session / Run lifecycle governance。
   `client_request_id` 幂等与同 Session active Run admission 可以用数据库唯一约束 / 行锁建模，但
-  生产级 attempt ownership、recovery 与跨进程 cancel 基础收口必须建立在 P8 owner 真源之上。
+  生产级 attempt ownership、recovery 与跨进程 cancel 基础收口必须建立在 P8 owner 真源之上。P9 同时
+  必须把 P6 的 `startup_reconcile` 显式入口收进 Host 启动 / bootstrap 流程，使 durable read model
+  崩溃恢复成为 Host 内部治理能力，而不是 UI / Service 业务调用方的使用要求。
 - P10 落地完整通用 ToolRegistry governance，但不迁移 business fins / doc / web 工具。
 - P10.5 紧接 P10 迁移代表性 web tools 到 Host ToolRegistry，立即验证 P10 的真实工具注册、
   permission / middleware / display metadata、ToolRuntime、tool trace 与 memory facts 链路；P10.5

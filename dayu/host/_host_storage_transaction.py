@@ -133,7 +133,8 @@ class HostStorage:
     def open(self) -> None:
         """打开 SQLite 连接并配置 PRAGMA。
 
-        重复调用是幂等的。
+        重复调用是幂等的。打开时同时把行工厂设为 :class:`sqlite3.Row`，
+        便于上层按列名访问；外部模块不得直接修改 ``row_factory``。
 
         :returns: 无返回值。
         :raises sqlite3.DatabaseError: 打开失败时抛出。
@@ -149,6 +150,7 @@ class HostStorage:
             )
             for pragma in _PRAGMA_SETUP:
                 connection.execute(pragma)
+            connection.row_factory = sqlite3.Row
             self._connection = connection
 
     def close(self) -> None:
@@ -227,6 +229,35 @@ class HostStorage:
                 return list(cursor.fetchall())
             finally:
                 cursor.close()
+
+    def apply_schema(self, statements: Iterable[str]) -> None:
+        """在 ``_connection_lock`` 内串行执行一组 DDL 语句。
+
+        schema bootstrap 是非事务路径：DDL 在 SQLite autocommit 模式下立
+        即生效，但仍需要 :class:`HostStorage` 协调连接生命周期。本方法是
+        外部 store 模块的唯一 schema 入口，承担两件事：
+
+        1. 调用 :meth:`open` 确保连接可用，避免每个 store 自己处理懒加载。
+        2. 在 ``_connection_lock`` 内顺序执行 DDL，避免与并发只读 / 写事
+           务竞争同一连接对象。
+
+        外部模块禁止直接读取 ``_connection`` 自行执行 DDL；这是
+        :class:`HostStorage` 封装的稳定入口。
+
+        :param statements: DDL 语句序列；以 ``CREATE TABLE IF NOT EXISTS``
+            等幂等语句为前提。
+        :returns: 无返回值。
+        :raises sqlite3.DatabaseError: 执行失败时抛出。
+        """
+
+        if self._connection is None:
+            self.open()
+        connection = self._connection
+        if connection is None:
+            raise RuntimeError("host storage connection unavailable")
+        with self._connection_lock:
+            for statement in statements:
+                connection.execute(statement)
 
     def _begin_immediate(self, connection: sqlite3.Connection) -> None:
         """在当前线程开启 IMMEDIATE 事务。

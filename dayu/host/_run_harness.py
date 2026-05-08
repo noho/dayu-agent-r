@@ -1112,9 +1112,16 @@ class LocalRunHarness:
         :param state: 显式 attempt state；与 ``terminal_event`` 二选一。
         :param failure_summary: 失败摘要;成功终态可为 ``None``。
         :returns: 无返回值。
+        :raises ValueError: 同时显式提供 ``terminal_event`` 与 ``state`` 时
+            抛出；二者语义互斥，调用方必须明确意图，禁止隐式优先级。
         :raises Exception: 写入失败时透传。
         """
 
+        if terminal_event is not None and state is not None:
+            raise ValueError(
+                "_finish_attempt_if_durable 不允许同时传入 terminal_event "
+                "与 state；二者互斥，调用方需明确终态来源。"
+            )
         if (
             attempt_id is None
             or self.attempt_state_store is None
