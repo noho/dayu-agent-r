@@ -766,6 +766,53 @@ OLD `ToolTraceRecorder` / `JsonlToolTraceStore` / `tool_trace_v2` 可以作为 H
 但 NEW trace schema 真源应在 Host / observability 阶段确认。Host 当前设计只固定事件订阅与可靠
 projection 边界。
 
+P7 后 tool trace 的架构边界固定为：
+
+```text
+RunInputBuilder builds RunInput
+  -> Host writes RUN_INPUT_CONTEXT_SNAPSHOT_BUILT fact
+      -> hot summary: message roles / source cursors / hashes / context budget / tool schema names
+      -> cold refs: full model input / full tool schemas
+  -> Engine consumes RunInput
+  -> Engine emits tool / usage / final / protocol events
+  -> Host translates to canonical RunEvent facts
+  -> Durable EventLog persists facts and source positions
+  -> ProjectionCoordinator drains EventLog
+  -> tool_trace_observer writes ToolTraceStore hot records + cold raw payloads
+  -> analyzer / smoke reads ToolTraceStore
+```
+
+`RUN_INPUT_CONTEXT_SNAPSHOT_BUILT` 是 Host-owned diagnostic fact，用来回答“这一轮模型到底看到了什么
+上下文”。它不是 EngineEvent，不进入 Engine 契约，不参与 Conversation Memory 下一轮事实池，也不改变
+RunInputBuilder 的决策。它必须在 RunInputBuilder 产物确定后、Engine attempt 启动前写入；否则
+tool trace 会重新退化为进程内缓存诊断，无法 crash replay。
+
+`RUN_INPUT_CONTEXT_SNAPSHOT_BUILT` 的冷层 raw payload 与 EventLog fact 必须作为同一个 durable unit of
+work 提交。Host 应先在同一事务中写入完整 model input / tool schemas raw payload，再 append fact
+引用这些 raw refs；任一写入失败时 transaction 回滚，Engine attempt 不启动。禁止留下“fact 已落库但
+raw ref 缺失”的可见状态。
+
+P7 trace payload 采用 OLD 的热 / 冷分层，而不是默认做业务内容过滤：
+
+- 热层 trace record 保存可检索摘要、状态、source cursor / global position、大小、hash、schema version。
+- 冷层 raw payload 保存完整 model input、tool schemas、tool result、provider protocol raw payload，以及
+  `fetch_more` 诊断所需的 `scope_token` / `cursor`。
+- `scope_token` / `cursor` 是定位 `fetch_more` 重复调用、错 token、错 cursor 的关键诊断字段，必须能在
+  trace 冷层或 tool call arguments 中回放；但不得进入 Conversation Memory、RunInputBuilder 输入、
+  普通日志、README 示例或 smoke 大块输出。
+- provider secret、Authorization header、API key、cookie 不得进入 trace；若 provider raw payload
+  混入这些能力凭据，Host 必须只 scrub 这类 provider secret，不扩大到业务 prompt、tool result、
+  `scope_token` 或 `cursor`。
+
+OLD `utils/analyze_tool_trace.py` 中业务无关的诊断能力应随 P7 迁移或提供等价 adapter，包括重复工具调用、
+截断后未续读、`fetch_more` 参数 / 质量、trace 完整性、context 压力、provider protocol error 与 final
+response presence。财报 / web 业务专项分析不属于 P7 Host 主线。
+
+P7 固定采用 `tool_trace_v2_host` 作为 Host trace schema version。OLD `tool_trace_v2` 可作为语义参考和
+exporter / adapter 输入输出素材，但 Host 内部 read model 不伪装成完全 OLD-compatible schema。durable
+harness 在配置了 `ToolTraceStore` / trace storage path 时默认注册 `tool_trace_observer`；未配置 trace
+store 时不注册，避免无意义 observer 状态面。
+
 ### 9.5 Wait / Suspend 预留契约
 
 GitHub issue #4 跟踪 `ToolExecutionOutcome` 扩展分支，包括 `awaiting` /
@@ -927,14 +974,16 @@ UI / Service / test harness
 ```
 
 P2 Host public handle 的边界是：`scope_token` 只通过调用方持有的非 EventLog 受控 handle 短期交付，
-不写入 EventLog / memory / 日志 / smoke 输出，也不写入任何文档或 smoke 的大块结果输出。`RunEvent`
-只保存 cursor fingerprint、scope hash、limit、unit、size summary、lineage 等中性摘要，不保存完整大结果或
-token 明文。terminal RunEvent 后的 `fetch_more` 返回 typed failure，且不追加新 RunEvent，以保持 P1.5
-terminal guard。
+不写入 memory、普通日志或 smoke 大块输出，也不进入 RunInputBuilder。P2/P5 最小运行事实可以只在
+RunEvent 中保存 cursor fingerprint、scope hash、limit、unit、size summary、lineage 等中性摘要，不保存完整
+大结果。P7 tool trace 落地后，`scope_token` / raw cursor 作为 `fetch_more` 诊断字段进入 trace 冷层或
+tool call raw payload；这属于 debug / trace read model，不是 memory 或模型上下文真源。terminal RunEvent
+后的 `fetch_more` 返回 typed failure，且不追加新 RunEvent，以保持 terminal guard。
 
 P5 LLM-facing truncated tool result 的边界是：截断后的普通 tool result 可以短期携带
 `truncation.fetch_more_args.scope_token` 给模型，只用于同一 run 内由模型发起的 framework `fetch_more`
-tool call。该 token 仍不得写入 RunEvent canonical data、memory projection、日志或文档 / smoke 大块输出。
+tool call。该 token 仍不得写入 memory projection、普通日志或文档 / smoke 大块输出。P7 起，trace 冷层
+必须能够保留该 token 与 cursor，用来诊断模型是否重复 `fetch_more`、传错 `scope_token` 或传错 cursor。
 Engine 仍不拥有、不解释 `scope_token`；它只把 token 当作普通 tool result JSON 注入给模型，再把模型发起的
 普通 tool args 回传给 Host。
 
@@ -1076,6 +1125,10 @@ P3 后执行边界：
   ToolRuntime cursor store，不持有 `ToolFetchMoreHandle`，不消费 `scope_token`。
 - `RunInputBuildTrace` 只用于 Host 内部诊断与测试；它不写入 EventLog，不进入模型上下文，也不作为下一轮
   memory 真源。
+- P7 起，Host 在 RunInputBuilder 完成后追加 `RUN_INPUT_CONTEXT_SNAPSHOT_BUILT` diagnostic fact，使
+  tool trace 可持久重建 `iteration_context_snapshot`。该 fact 只服务 trace / audit / replay 诊断，
+  不进入 ConversationMemory projection，不参与下一轮 RunInputBuilder 输入，也不影响 Engine 看到的
+  `RunInput.messages`。
 - 当前 `InMemoryConversationMemoryStore` 是单进程、顺序多轮 smoke/test adapter；真实持久 projection、
   observer checkpoint、多进程恢复与 cross-scope governance 留给后续 phase。
 
