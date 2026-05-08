@@ -12,14 +12,16 @@
 - P2 已通过 PR #18 合入 `main`，merge commit 为 `3d86eefd4bd8b99b24c638735220d9ee571255f7`。
 - P3 已通过 PR #19 合入 `main`，merge commit 为 `b20e792 Host P3 conversation memory (#19)`。
 - P4 已通过 PR #21 合入 `main`，merge commit 为 `843fb99 Host P4 context overflow compact (#21)`。
-- 当前 P5 代码实现、code review 修复与 PR review 修复复核均已完成，当前分支为
-  `codex/host-p5-multiturn-smoke`，PR #22 已创建并更新，等待用户 merge。P5 已落地 No-Full-Governance
-  Multi-Turn Smoke、公共 `@tool` / `ToolDefinition` 声明、LLM-facing truncation hint、
-  framework `fetch_more`、真实 provider `mimo-v2.5-pro-plan` + `huge_echo` tool calling
-  smoke、Host / Engine P1-P5 日志可观测性梳理与 review 修复。P5 code review findings
+- P5 已通过 PR #22 合入 `main`，merge commit 为 `a825b4c Host P5 no-governance multiturn smoke (#22)`。
+  P5 已落地 No-Full-Governance Multi-Turn Smoke、公共 `@tool` / `ToolDefinition` 声明、
+  LLM-facing truncation hint、framework `fetch_more`、真实 provider `mimo-v2.5-pro-plan` +
+  `huge_echo` tool calling smoke、Host / Engine P1-P5 日志可观测性梳理与 review 修复。P5 code review findings
   已在 `docs/reviews/code-review-20260508-1039.md` 与
   `docs/reviews/code-review-20260508-1122.md` 标注修复状态；PR review findings 已在
   `docs/reviews/pr-22-review-20260508-1211.md` 标注修复状态，用户复核通过。
+- 当前推进 P5.5。P5.5 的目标不是继续扩大实现，而是把 P1-P5 漏排 / 误排 / 已落地的 deferred
+  能力重新安排到 P6+，确保迁移后的系统总目标明确收束为：支持多进程并发
+  Full-Governance Multi-Turn。
 
 每个 Phase 进入实现前，必须另写可交接的 phase plan，细化到迁移 Agent 可以直接接手：
 目标、非目标、边界、文件级改动清单、契约变化、状态机、测试清单、验证命令、review gate、
@@ -38,7 +40,10 @@
 - `docs/engine/design.md`
 - `docs/engine/migration-plan.md`
 - GitHub issue #3：取消治理增强。
-- GitHub issue #4：wait / suspend / resume 协作。
+- GitHub issue #4：ToolExecutionOutcome 扩展分支跟踪。
+- GitHub issue #20：Host token estimator 接入 provider 官方 token 计数算法。
+- GitHub issue #23：Host context governance 跟踪。
+- GitHub issue #24：Host memory governance、长期记忆与 public memory edit / reset / forget 跟踪。
 - OLD conversation memory 设计：`https://github.com/noho/dayu-agent/issues/48`
 - `AGENTS.md`
 
@@ -60,22 +65,25 @@ migration/host-p{phase}-{short-name}
 
 1. 从最新主线或用户指定基线开新分支。
 2. 派 Agent 写 phase handoff plan。
-3. 派 review Agent 做 plan review，必要时派第二个 review Agent 做 OLD / NEW 对比或最佳实践 review。
-4. plan review 不通过时，派 Agent 修 plan，并在对应 review 文档的finding标题上标注修复状态。
-5. 派 review Agent 复审修复后的 plan；若仍不通过，重复步骤 4-5，直到 review Agent 明确通过。
-6. plan review 通过后，停下来等用户人工 review。
+3. 总控 Agent 生成 plan review 指导 prompt，交给用户手工执行 review；必要时额外生成 OLD / NEW
+   对比、最佳实践、架构边界或并发专项 review prompt。
+4. 用户提交 review 结果后，总控 Agent 判断 finding 是否成立；成立时派 Agent 修 plan，并在对应
+   review 文档的 finding 标题上标注修复状态。
+5. 总控 Agent 生成复审 prompt，交给用户手工执行复审；若仍不通过，重复步骤 4-5，直到用户复审通过。
+6. plan review 通过后，停下来等用户人工确认。
 7. 用户确认后，commit phase plan 与 review 文档。
 8. 派迁移 Agent 按通过的 plan 生成代码。
-9. 派 code review Agent 做 code review，必要时派额外 review Agent 做 OLD / NEW 对比、架构边界、
-   类型安全或并发专项 review。
-10. code review 不通过时，派 Agent 修复代码，并在对应 code review 文档的finding标题上标注修复状态。
-11. 派 code review Agent 复审修复后的代码；若仍不通过，重复步骤 10-11，直到 review Agent 明确通过。
+9. 总控 Agent 生成 code review 指导 prompt，交给用户手工执行 code review；必要时额外生成 OLD / NEW
+   对比、架构边界、类型安全或并发专项 review prompt。
+10. 用户提交 code review 结果后，总控 Agent 判断 finding 是否成立；成立时派 Agent 修复代码，并在对应
+    code review 文档的 finding 标题上标注修复状态。
+11. 总控 Agent 生成复审 prompt，交给用户手工执行复审；若仍不通过，重复步骤 10-11，直到用户复审通过。
 12. code review 通过后，停下来等用户人工 review。
 13. 用户确认后，commit 代码、测试和必要 README / docs 更新。
 14. 准备 PR 时，确认只包含本 Phase 范围内提交，push 并创建 ready PR；不创建 draft PR，
     除非用户明确要求。
-15. 派 PR code review Agent 审查 PR diff，必要时继续修复、复审、补 commit，直到 PR review
-    Agent 明确通过。
+15. 总控 Agent 生成 PR review 指导 prompt，交给用户手工执行 PR diff review；必要时继续修复、生成
+    复审 prompt、补 commit，直到用户复审通过。
 16. PR review 通过后，停下来等用户确认。若 review 由用户本人完成，则对应修复也必须由用户本人复核；
     总控 Agent 与其它 review Agent 不得替代用户复核结论。
 17. squash merge PR 并删除远端分支默认由用户执行；只有用户明确指示总控 Agent 执行时，
@@ -84,7 +92,8 @@ migration/host-p{phase}-{short-name}
 禁止事项：
 
 - 不在未通过 plan review 的情况下写生产代码。
-- 不用总控 Agent 自己的复核替代 review Agent 的通过结论。
+- 不用总控 Agent 自己的复核替代用户 review / 复审结论；总控只负责生成 review prompt、判断 finding
+  是否成立、派修复 Agent 和维护修复状态。
 - 不在 review finding 未标注修复状态的情况下声称 review 通过。
 - 不把多个 Phase 的实现混进一个 PR，除非用户明确批准合并。
 - 不在用户确认前 commit / push / create PR / merge。
@@ -108,6 +117,12 @@ EngineWorker
 audit hard-gate 等生产治理；不表示可以破坏分层、跳过强类型契约、绕过
 `dayu.fins.storage`、绕过 append-before-stream EventLog 事实层，或把 Host 职责塞回 Engine。
 
+P5.5 人工 review 后，P6 及以后阶段的总目标重写为：支持多进程并发 Full-Governance
+Multi-Turn。后半段必须先建立 durable facts 与 observer / sink 基础，再把 tool trace 作为独立
+phase 落地；随后建立多进程 attempt ownership，并在该基础上落地 Session / Run lifecycle、
+完整 ToolRegistry、validation replay、outbox、remote、wait / suspend / resume、治理 hardening
+与最终 full-governance smoke。
+
 | Phase | 名称 | 目标 | 主要输出 | 明确不做 | 验收信号 |
 | --- | --- | --- | --- | --- | --- |
 | P0 | 计划与议题同步 | 固定 Host 迁移总控计划，创建 / 更新必要 issue 与 review prompt 事实 | 本文档、plan review、必要 issue comment | 不写生产代码 | 用户确认可以进入 P1 |
@@ -118,19 +133,23 @@ audit hard-gate 等生产治理；不表示可以破坏分层、跳过强类型�
 | P4 | Host Compact for Context Overflow | 把 OLD 中原本在 Engine 内做的 compact 搬到 Host，使 Engine context overflow 时仍能继续运行 | Host compact 入口、compact 输入 / 输出、Engine overflow 事件 / 错误映射、compact 后 attempt 输入重建 | 不实现完整 context governance；不引入 replay / validation 联动；不在 Engine 内实现 compact/retry | Engine 遇到 context overflow 时，Host 完成 compact 后继续运行或明确失败收口 |
 | P5 | No-Full-Governance Multi-Turn Smoke | 将 P1-P4 与 P1.5 串成最小纵向 smoke，并落地最小公共 tool declaration 与 framework `fetch_more` 能力 | smoke CLI / test harness、端到端多轮测试、公共 `@tool` declaration / `ToolDefinition`、LLM-facing truncation hint、framework `fetch_more` schema、必要 README / tests 文档 | 不做完整多进程治理、不做 Remote、不做 Outbox、不做 audit hard-gate；不验证 `start_run` 幂等、active Run 并发仲裁或调用重试语义；不做完整 ToolRegistry / 权限治理 / 业务工具迁移；不做自动透明补读 | 一个单调用方、顺序执行的无完整生产治理多轮会话可按目标事实层跑通，含工具截断补读、memory、compaction；手工 smoke 真实向 `mimo-v2.5-pro-plan` 发送 prompt，由模型调用公共声明的 `huge_echo`，再由模型根据 `truncation.next_action=fetch_more` 调用 framework `fetch_more` |
 | P5.5 | Deferred Scope Reconciliation | 回看 P1-P5 所有“本阶段不实现”能力，确认没有遗留能力被漏排或误排 | deferred-scope inventory、能力归属表、后续 Phase 调整建议、必要的新 Phase / issue / plan 修订 | 不写生产代码；不把未落地能力补写成已落地事实；不直接修改后续 Phase 代码边界 | P1-P5 的非目标均被明确标记为已实现、已安排到 P6+、新增 Phase / issue 承接，或经用户确认关闭 |
-| P6 | EventLog Persistence / Projection / Observers Hardening | 在 P1.5 最小事实层上建立可靠持久化与派生机制 | 持久 EventLog、projection checkpoint、tool trace observer、audit observer、timeline projection、observer retry / lag | 不把 trace 写回 Engine，不要求所有 observer hard-gate | tool trace / audit / timeline 可由 EventLog 幂等派生 |
-| P7 | Session / Run Lifecycle Governance | 完整落地 Session / Run 状态机、admission policy、取消基础治理 | SessionManager、RunManager、RunSupervisor、状态机测试、cancel_run、生产级 admission policy | 不做 issue #3 的强制终止增强、不做 wait / suspend | 同 Session 单 active Run、幂等 start_run、取消基础收口稳定 |
-| P8 | Attempt Lease / Recovery / 多进程并发 | 落地 AttemptSupervisor、lease / fencing、startup recovery | attempt 表 / store、owner token、stale cleanup、orphan recovery、多进程测试、lane runtime dependency 判断 | 不做 Remote RPC；不把 lane 实现为 Host 私有能力 | 多进程下迟到 owner 写入被拒绝，orphan / stale 可恢复或 LOST |
-| P9 | Reply Outbox | 将 RunResult / final answer 可靠投影到外部信道 outbox | Outbox 状态机、delivery key、claim / retry / reconcile | 不实现具体 WeChat / Web delivery 业务适配 | final answer 到 outbox 无丢失窗口，重复 projection 不重复投递 |
-| P10 | RemoteProxy / RemoteStub | 落地远程执行边界 | RemoteProxy、RemoteStub、cursor / ack / reconnect、remote cancel | 不让远程 Engine 回调 Host 执行工具 | Remote Agent = Engine + tools execute remotely |
-| P11 | Wait / Suspend / Resume 协作 | 按 issue #4 拆子设计并落地等待协作能力 | WaitRecord、awaiting outcome、自动 resume、状态机与恢复测试 | 不把 `resume_run` 暴露为普通 public API | 等待型工具 / 长事务可 suspend、恢复、取消、超时 |
-| P12 | Governance Hardening | 补齐取消增强、policy hard-gate、audit hard-gate、运行治理 | issue #3 增强、watchdog、强制终止、required projection、运维可观测性 | 不扩大 Host 业务语义 | Host 可作为强约束真源运行生产治理 |
-| P13 | Full-Governance Multi-Turn Smoke / 文档收口 | 在 P6-P12 完整治理能力打开后，按 P5 同一验证面跑最终纵向 smoke，并更新当前事实文档、归档迁移过程文档 | full-governance smoke CLI / test harness、与 P5 对齐的验证面清单、`docs/code_review.md` 当前事实专项、必要 README、issue / PR 收口、phase 文档归档策略 | 不新增治理能力；不写未来设计为已落地事实；不误删 review 证据；不把 smoke failure 用文档绕过 | Full-Governance Multi-Turn Smoke 覆盖 P5 同一语义面：真实模型 tool calling、ToolRuntime truncate / framework `fetch_more`、Conversation Memory、context compact、EventLog persistence / observers、lifecycle / admission / recovery / audit hard-gate；日常 review prompt 与 README 均只描述当前已落地事实，迁移审计记录可追溯 |
+| P6 | Durable EventLog / Run State / Projection | 在 P1.5 最小事实层上建立多进程共享的 durable facts、projection checkpoint 与 observer / sink 基础 | 持久 EventLog、Run / Attempt 最小持久状态、atomic append / cursor allocation、projection checkpoint、observer / sink protocol、audit / timeline / memory projection 重建基础、observer retry / lag | 不实现 attempt lease / fencing；不落地具体 tool trace schema；不把 trace 写回 Engine；不要求所有 observer hard-gate | EventLog storage 本身具备多进程安全的 append / replay / checkpoint 语义；Host 具备足以支撑 tool trace / audit / timeline / memory projection 的 observer / sink 基础 |
+| P7 | Tool Trace Projection / Sink | 在 P6 observer / sink 基础上落地 tool trace，继承 OLD tool trace schema 的关键语义 | tool trace observer、tool trace sink / store、OLD tool trace schema 对齐、tool call / result / iteration usage / final response / protocol error 投影测试、redaction 与 retention 边界 | 不恢复 Engine 私有 recorder / store；不扩大 ToolRegistry 权限治理；不实现 audit hard-gate | tool trace 不再由 Engine recorder 落盘，而由 Host observer / sink 从 Engine / ToolRuntime canonical events 幂等派生，schema 语义可对照 OLD trace 消费 |
+| P8 | Attempt Lease / Recovery / 多进程并发基础 | 落地 AttemptSupervisor、lease / fencing、startup recovery，使多进程执行具备 owner 真源 | attempt store、owner token、lease renew、stale cleanup、orphan recovery、late write fencing、多进程测试、lane runtime dependency 判断 | 不做 Remote RPC；不实现完整 Session / Run admission；不把 lane 实现为 Host 私有能力 | 多进程下同一 attempt 只有有效 owner 可写入，迟到 owner 写入被拒绝，orphan / stale 可恢复或 LOST |
+| P9 | Session / Run Lifecycle Governance / Public Interface 固定 | 在 durable facts 与 attempt ownership 上完整落地 Session / Run 状态机、admission policy、取消基础治理，并固定 Host public interface | SessionManager、RunManager、RunSupervisor、`client_request_id` 幂等、同 Session active Run 仲裁、cancel_run、状态机测试、生产级 admission policy、Host public interface 契约、OLD wechat / web / prompt / interactive 调用需求调研 | 不做 issue #3 的强制终止增强；不做 wait / suspend / resume；不做 Remote RPC；不迁移业务工具 | 同 Session 单 active Run、幂等 start_run、跨进程 admission、取消基础收口稳定；`docs/host/design.md` 的 Public Interface 口径与 `dayu.host` public exports 固定，且已对照 OLD wechat / web / prompt / interactive 需求验证 |
+| P10 | ToolRegistry Governance | 在 P5 最小 tool declaration 之上落地完整通用工具注册与治理能力 | ToolRegistry / tool catalog、display metadata 治理、permission policy、middleware chain、framework tool registration、schema / binding 校验、registry audit facts | 不迁移 business fins / doc / web 工具；不让 Host / Engine 承载财报业务语义；不让 Engine 持有 registry | 通用工具可被发现、注册、授权、middleware 处理与审计；Engine 仍只接收 `ToolSchema` projection 与 `ToolExecutor` 协议 |
+| P11 | OutputContract / Validation Replay | 补齐输出契约、验证决策与 replay attempt，使财报回答可靠性有可验收闭环 | OutputContractRef、ValidationDecision fact、validator execution boundary、replay attempt policy、replay 上限、恢复 / 失败收口测试 | 不把 validation 混入 P4 compact retry；不把 audit hard-gate 当成 validation replay；不实现业务 validator 全量规则库 | final answer 可按契约验证，失败可产生可审计 replay attempt 或明确失败终态，恢复后不会丢失 validation decision |
+| P12 | Reply Outbox | 将 RunResult / final answer 可靠投影到外部信道 outbox | Outbox 状态机、delivery key、claim / retry / reconcile | 不实现具体 WeChat / Web delivery 业务适配 | final answer 到 outbox 无丢失窗口，重复 projection 不重复投递 |
+| P13 | RemoteProxy / RemoteStub | 落地远程执行边界 | RemoteProxy、RemoteStub、cursor / ack / reconnect、remote cancel | 不让远程 Engine 回调 Host 执行工具 | Remote Agent = Engine + tools execute remotely |
+| P14 | Wait / Suspend / Resume 协作 | 基于 Engine suspended outcome 与 Host durable governance 落地等待协作能力 | WaitRecord、awaiting outcome、自动 resume、状态机与恢复测试、取消 / 超时语义 | 不把 `resume_run` 暴露为普通 public API；不把 wait 伪装成普通 tool failure | 等待型工具 / 长事务可 suspend、恢复、取消、超时，且多进程恢复后语义稳定 |
+| P15 | Governance Hardening | 补齐取消增强、policy hard-gate、audit hard-gate、运行治理 | issue #3 增强、watchdog、强制终止、required projection、运维可观测性 | 不扩大 Host 业务语义；不补 business tools 迁移 | Host 可作为强约束真源运行生产治理 |
+| P16 | Full-Governance Multi-Turn Smoke / 文档收口 / 接口冻结 | 在 P6-P15 完整治理能力打开后，按 P5 同一验证面跑最终纵向 smoke，固定 Engine / Host 接口，并更新当前事实文档、归档迁移过程文档 | full-governance smoke CLI / test harness、与 P5 对齐的验证面清单、Engine / Host interface freeze 方案、契约变更治理规则、`docs/code_review.md` 当前事实专项、必要 README、issue / PR 收口、phase 文档归档策略 | 不新增治理能力；不写未来设计为已落地事实；不误删 review 证据；不把 smoke failure 用文档绕过；不允许未走接口变更流程的 Engine / Host 契约修改 | Full-Governance Multi-Turn Smoke 覆盖 P5 同一语义面：真实模型 tool calling、ToolRuntime truncate / framework `fetch_more`、Conversation Memory、context compact、durable EventLog / observers、tool trace、attempt lease / recovery、lifecycle / admission、ToolRegistry governance、validation replay、outbox / remote / wait / audit hard-gate；Engine / Host public contracts、protocols、events、result types、错误码和 package exports 被明确冻结，后续变更必须走设计更新、兼容性取舍、测试和专项 review；日常 review prompt 与 README 均只描述当前已落地事实，迁移审计记录可追溯 |
 
 ### 4.1 第一批能力边界
 
-P2 的 `truncate / fetch_more` 不绑定 P6 的 tool trace observer、audit observer 或 timeline projection。
-这些 observer 只是后续阅读者，不能反向决定 P2 的实现形状。
+P2 的 `truncate / fetch_more` 不绑定 P6 的 observer / sink 基础，也不绑定 P7 tool trace、
+P15 audit hard-gate 或 timeline projection。这些 observer / sink 只是后续阅读者，不能反向决定
+P2 的实现形状。
 
 P2 需要保证的是 ToolRuntime 最小运行事实不成为黑盒，例如：
 
@@ -160,7 +179,8 @@ OutputContract 或完整 context governance。
 
 P5 smoke 只覆盖单进程、单调用方、顺序执行 happy path：每轮等待上一轮 terminal 后再启动下一轮。
 P5 需要最小 Run 创建事实和 Session 下多轮顺序，但不以生产级 `start_run` 幂等、
-同 Session active Run admission policy、断线重试或并发输入仲裁为前提。这些治理能力仍留在 P7。
+同 Session active Run admission policy、断线重试或并发输入仲裁为前提。这些治理能力仍留在 P9，
+并依赖 P8 attempt ownership。
 用户人工 review 后，P5 同时承接最小公共 tool declaration 与 framework `fetch_more` 能力：OLD-like
 `@tool(..., truncate=ToolTruncateSpec(...))` 需要产出强类型 `ToolDefinition` / `ToolBundle`，
 同源携带 LLM-facing schema、executor binding、Host ToolRuntime truncate metadata 与 display metadata。
@@ -175,10 +195,52 @@ P5.5 是非生产代码的总控核对阶段。它必须逐项回看 P1、P1.5�
 P6+、需要新增 Phase / issue，或应经用户确认关闭。P5.5 的输出是排期与边界修订，不直接补实现；
 如果发现某个能力会改变 P6+ 的目标、非目标或验收信号，必须更新总控计划并走对应 review gate。
 
-P7 实施 `start_run` 幂等时，必须重新讨论并固定 `(session_id, client_request_id)` 如何幂等映射到
+P5.5 人工 review 固定以下总控判断：
+
+- 完整 ToolRegistry / tool catalog / display metadata governance / permission / middleware 是
+  Full-Governance Multi-Turn 的通用基础能力，P5 只落地最小 declaration，后续必须单独安排。
+- tool trace 已从 Engine 私有 recorder/store 中移出。NEW 架构保留“Engine 发出强类型事件，Host 提供
+  sink / observer 能力，audit / tool trace / timeline 从 EventLog facts 派生”的方向；P6 只提供
+  tool trace 能工作的 observer / sink 基础，具体 tool trace projection / sink 与 OLD tool trace schema
+  对齐由 P7 单独承接。
+- business fins / doc / web 工具迁移不属于 Host 迁移主线；Host 只提供通用工具注册、执行、治理边界，
+  财报文档存取仍由业务工具通过 `dayu.fins.storage` 保证。
+- P3 已落地同 session 多轮所需的 Conversation Memory / RunInputBuilder 结构；加入“多进程”定语后，
+  P3 的内存态实现不够，P6 必须把 memory projection / read model 变成可由 durable EventLog
+  幂等重建或持久派生的事实层。长期记忆、跨 session / project / user memory、public edit /
+  reset / forget 不阻塞 Full-Governance Multi-Turn，后续由 GitHub issue #24 跟踪。
+- context governance 不阻塞 P6+ 主迁移，已由 GitHub issue #23 跟踪；provider 官方 token
+  estimator 已由 GitHub issue #20 跟踪。P4 / P5 的 Host 内部估算与 compact retry 只作为当前
+  no-full-governance 能力，不宣称 provider tokenizer 真源。
+- P5 已落地的是 LLM-facing framework `fetch_more`：模型根据 truncation hint 在同一个 run 内
+  自行调用 framework `fetch_more`。Host-side transparent continuation 不是 Full-Governance
+  Multi-Turn 必需项，后续如需改善 UX 再单独讨论。
+- Attempt lease / recovery / fencing 是多进程并发 Full-Governance Multi-Turn 的必要能力。
+  P6 durable EventLog 不依赖 lease，但 P6 自身必须提供多进程安全的存储语义，例如 atomic append、
+  cursor / sequence 唯一约束、事务边界与 projection checkpoint 并发安全；生产级 Session / Run
+  lifecycle、admission、recovery 与跨进程 cancel 收口必须建立在 attempt ownership 之上，因此 P8
+  落地 Attempt Lease / Recovery，P9 再落地 Session / Run Lifecycle Governance。
+
+P9 实施 `start_run` 幂等时，必须重新讨论并固定 `(session_id, client_request_id)` 如何幂等映射到
 同一个 `run_id`：包括 `run_id` 由 Host 生成还是由持久 Run 创建事实确定、重复请求返回同一
 `RunStream` / `RunHandle` 的精确语义、原 Run 已 terminal 或事件 cursor 已推进时的补读起点、
 以及该映射依赖的持久唯一约束 / compare-and-set 边界。
+
+P9 同时是 Host public interface 固定点。当前 `dayu.host.__init__` 暴露的是 P5 no-full-governance
+smoke surface，不等同于最终 public contract。P9 phase plan 必须先调查 OLD wechat / web / prompt /
+interactive 对 Host / Service / Agent 入口的真实需求，再固定 `docs/host/design.md` 第 5 节
+Public Interface 口径与 `dayu.host` public exports。调查至少覆盖：
+
+- WeChat / Web 对异步启动、断线重连、cursor 补读、重复提交、取消、终态获取和外部投递的需求。
+- `prompt` / `interactive` 对同步等待、流式输出、会话 label / session 绑定、历史接续、thinking /
+  reasoning 展示和错误收口的需求。
+- Service 层如何装配 caller / agent / app system prompt、tool catalog、RunOptions、`client_request_id`
+  与 session scope；Host public interface 不得泄漏 fins/doc/web 业务语义。
+- `start_run`、`stream_run_events`、`get_run_result`、`cancel_run`、`RunStream`、`RunHandle`、
+  `RunEventCursor` 与错误/拒绝结果的最终稳定语义。
+
+P9 不能闭门造车固定接口；若 OLD 调研发现 `docs/host/design.md` 第 5 节需要修订，必须在 P9 plan
+review 前把修订建议和取舍理由写清楚。
 
 ## 5. Phase 文档命名
 
@@ -204,7 +266,7 @@ docs/host/phase{N}-{topic}-review.md
 docs/host/phase1_5-plan.md
 docs/host/phase5_5-plan.md
 docs/host/phase8-concurrency-review.md
-docs/host/phase11-wait-state-review.md
+docs/host/phase14-wait-state-review.md
 ```
 
 小数 Phase 的文件名使用下划线，例如 P1.5 对应 `phase1_5-*`，P5.5 对应 `phase5_5-*`。
@@ -250,6 +312,9 @@ docs/host/phase11-wait-state-review.md
 - plan review gate。
 - code review gate。
 
+总控 Agent 不再负责派 review Agent 执行 review。总控 Agent 只负责为每个 gate 生成可直接交给
+review Agent 的指导 prompt，由用户手工执行 review / 复审，并把 review 结果交回总控处理。
+
 必要时增加：
 
 - OLD / NEW 对比 review。
@@ -269,18 +334,19 @@ P1 必须增加 EngineWorker public boundary gate：
 
 P2 必须增加 OLD / NEW code review gate：
 
-- P2 代码 review 除常规 code review Agent 外，必须额外派 OLD / NEW 对比 review Agent。
+- P2 代码 review 除常规 code review prompt 外，必须额外生成 OLD / NEW 对比 review prompt。
 - OLD / NEW review 必须对照 OLD `TruncationManager`、OLD `fetch_more` schema、OLD
   `project_for_llm` 与 OLD 测试，确认 NEW 继承 cursor lifecycle、scope token、TTL、
   single-use、limit clamp、page structure 等底层可靠语义。
 - OLD / NEW review 同时必须确认 P2 不误恢复 OLD LLM-facing `fetch_more` 半协议，也没有把
   OLD Engine 归属的实现机械迁回 `dayu.engine`。P5 若恢复 framework `fetch_more`，必须走 Host ToolRuntime
   ownership 与 Engine 普通 tool call 边界，不能恢复 OLD 完整 ToolRegistry / Engine-owned cursor manager。
-- P2 code review 只有常规 code review 与 OLD / NEW 对比 review 均明确通过后，才允许停下来等用户
-  人工 review。
+- P2 code review 只有用户手工执行的常规 code review 与 OLD / NEW 对比 review 均明确通过后，
+  才允许停下来等用户人工确认。
 
-review Agent 不能只按 checklist 打勾；OLD Host 中可靠行为应作为强参考源，review 应开放式寻找
-遗漏能力、边界泄漏、状态机漏洞、幂等缺口、数据丢失窗口和多进程竞争问题。
+总控生成的 review prompt 不能只让 review Agent 按 checklist 打勾；必须要求 review Agent 以 OLD
+Host 中可靠行为作为强参考源，开放式寻找遗漏能力、边界泄漏、状态机漏洞、幂等缺口、数据丢失窗口和
+多进程竞争问题。
 
 ## 8. 验证与文档规则
 
@@ -341,22 +407,40 @@ PR 创建后：
 - `docs/code_review.md` 与 README 的触发判断已完成。
 - phase plan / review / code review 默认保留为迁移审计记录；迁移结束后只有经用户确认才归档或移动。
 
-## 11. 第一批 Phase 的启动顺序
+## 11. 后半段 Phase 的启动顺序
 
-P1、P1.5 与 P2 已完成并合入 `main`。当前启动 P3；P3 的 handoff plan 应重点回答：
+P1、P1.5、P2、P3、P4、P5 已完成并合入 `main`。当前启动 P5.5；P5.5 只做
+deferred-scope reconciliation 与总控计划写回，不写生产代码。
 
-- RunInputBuilder 可消费哪些 canonical RunEvent / ToolRuntime facts，哪些事实只进入展示 read model。
-- Conversation Memory 的最小 Host 边界是什么，哪些属于 public Run / Session 级接口，哪些必须保持
-  Host 内部 projection / store。
-- P3 如何强参考 GitHub issue #48 与 OLD `conversation_memory.py` / `conversation_store.py` /
-  `conversation_session_archive.py` / `scene_preparer.py`，守住 `pinned_state` 全量独立、历史单总池、
-  最近 N 轮 raw turn 下限保底、memory 克制等财报 Agent 记忆不变量。
-- preview / reasoning / delta 是否严格禁止进入 RunInput replay、Memory pool 与 RunInputBuilder 运行态输入。
-- P3 如何使用 P1.5 EventLog 与 P2 ToolRuntime facts，避免旁路 transcript、memory facts 或 tool result
+P5.5 用户确认后，后续启动顺序必须遵守以下依赖：
+
+- P6 先落地 durable EventLog / Run state / projection。P6 是多进程事实层基础，不依赖 attempt
+  lease，但必须为 tool trace、attempt ownership、session lifecycle、memory projection 与 observer replay
+  提供 durable facts 和 observer / sink 基础。
+- P7 在 P6 observer / sink 基础上单独落地 tool trace projection / sink，并对齐 OLD tool trace schema。
+- P8 再落地 Attempt Lease / Recovery / fencing。P8 是多进程并发 Full-Governance Multi-Turn 的
+  必要基础，必须证明 owner token、lease renew、late write fencing、orphan / stale recovery 语义稳定。
+- P9 在 P6 durable facts 与 P8 attempt ownership 之上落地 Session / Run lifecycle governance。
+  `start_run` 幂等、同 Session active Run admission、跨进程 cancel 基础收口不得早于 P8 的 owner
   真源。
-- 多轮 Session 的最小顺序 smoke 如何表达，且不提前实现 P7 active Run admission、幂等或完整 lifecycle
-  governance。
-- P3 不提前实现 P4 context overflow compact、P6 persistent projection / observer、P7 lifecycle governance、
-  P9 outbox 或完整多进程 recovery。
+- P10 落地完整通用 ToolRegistry governance，但不迁移 business fins / doc / web 工具。
+- P11 落地 OutputContract / Validation Replay，不能把 validation replay 混入 P4 compact retry 或
+  P15 audit hard-gate。
+- P12-P15 依次补齐 Reply Outbox、RemoteProxy / RemoteStub、Wait / Suspend / Resume、
+  Governance Hardening。
+- P16 才执行 Full-Governance Multi-Turn Smoke / 文档收口 / 接口冻结；P16 不新增治理能力，只验证
+  P6-P15 已落地能力的最终纵向闭环，并固定 Engine / Host 接口。
 
-P3 plan review 通过且用户确认后，才能进入 P3 代码实现。
+P16 必须产出明确的 Engine / Host interface freeze 方案。该方案至少包括：
+
+- 默认规则：P16 之后 Engine / Host public interface 视为稳定契约，默认不允许随意修改；任何例外都必须
+  先完成接口变更提案、专项 review 与回归守护测试，不能在普通 feature PR 中顺手改动。
+- 冻结范围：Engine public contracts / protocols / package exports、Host public interface / package exports、
+  EngineEvent / RunEvent / RunResult / ToolExecutor / ToolSchema / ToolRuntime-facing contracts、错误码、
+  retry / terminal / suspended / cancel outcome 语义。
+- 变更流程：P16 后任何 Engine / Host 接口变更都必须先更新设计文档，说明动机、兼容性取舍、
+  schema / migration 影响、上下游调用方影响和替代方案；再补契约测试、边界测试与专项 review。
+- 禁止项：不得用兼容 wrapper / facade / re-export 偷改接口；不得让 Engine 反向依赖 Host；
+  不得把 Host ToolRuntime / ToolRegistry / memory / trace / governance 语义塞回 Engine。
+- 守护测试：package export 测试、protocol/import boundary 测试、事件契约 exhaustiveness 测试、
+  public interface smoke 与 full-governance smoke 必须成为后续接口变更的回归门槛。
