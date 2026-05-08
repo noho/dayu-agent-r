@@ -66,6 +66,15 @@ _ERROR_DUPLICATE_ENGINE_EVENT_ID: str = (
 )
 _LOGGER: logging.Logger = logging.getLogger(__name__)
 
+
+@dataclass(frozen=True, slots=True)
+class _AppendedRunEvent:
+    """事务内 append 后的 RunEvent 与 internal global position。"""
+
+    event: RunEvent
+    event_position: GlobalEventPosition
+
+
 _SCHEMA_STATEMENTS: tuple[str, ...] = (
     """
     CREATE TABLE IF NOT EXISTS host_run_events (
@@ -195,11 +204,12 @@ class DurableRunEventStore:
         _validate_draft_provenance(draft)
         try:
             async with self.storage.transaction() as tx:
-                event = self._append_in_transaction(tx=tx, draft=draft)
+                appended = self._append_in_transaction(tx=tx, draft=draft)
                 tx.add_post_commit_hook(self._make_notify_hook())
         except sqlite3.IntegrityError as exc:
             _raise_business_error_for_integrity(exc=exc, draft=draft)
             raise
+        event = appended.event
         if _should_log_append(event):
             _LOGGER.log(
                 _append_log_level(event),
@@ -207,7 +217,7 @@ class DurableRunEventStore:
                 "position=%s type=%s kind=%s source=%s terminal=%s",
                 event.run_id,
                 event.cursor.sequence,
-                _position_value(event),
+                appended.event_position.value,
                 event.type.value,
                 event.kind.value,
                 event.source.value,
@@ -220,12 +230,12 @@ class DurableRunEventStore:
         *,
         tx: HostStorageTransaction,
         draft: RunEventDraft,
-    ) -> RunEvent:
+    ) -> _AppendedRunEvent:
         """事务内执行 append；调用方负责事务上下文。
 
         :param tx: 当前 :class:`HostStorageTransaction`。
         :param draft: RunEvent 草稿。
-        :returns: 已落库的 RunEvent。
+        :returns: 已落库的 RunEvent 及 internal global position。
         :raises ValueError: run 已终态时抛出。
         """
 
@@ -296,7 +306,10 @@ class DurableRunEventStore:
         )
         if is_terminal:
             self._write_terminal_result_snapshot(tx=tx, event=event)
-        return event
+        return _AppendedRunEvent(
+            event=event,
+            event_position=GlobalEventPosition(value=event_position),
+        )
 
     def _upsert_run_state(
         self,
@@ -750,20 +763,6 @@ def _append_log_level(event: RunEvent) -> int:
     if event.type in TERMINAL_RUN_EVENT_TYPES:
         return VERBOSE_LOG_LEVEL
     return logging.DEBUG
-
-
-def _position_value(event: RunEvent) -> int | None:
-    """从 event 容器中读取 position；P6 中 RunEvent 不携带 position。
-
-    占位 helper，方便 log。
-
-    :param event: RunEvent。
-    :returns: ``None``，因 RunEvent 不携带 internal position。
-    :raises Exception: 不主动抛出异常。
-    """
-
-    _ = event
-    return None
 
 
 # 让 sqlite3 row 支持按列名访问。

@@ -326,10 +326,13 @@ python utils/smoke_host_eventlog.py --case worker-failure --log-level DEBUG
 ```
 
 当前提供 Host P6 durable EventLog 手工 smoke 脚本，用于观察 SQLite 后端 append、
-`ProjectionCoordinator` drain、checkpoint 推进与 memory / timeline / audit observer 行为：
+`ProjectionCoordinator` drain、checkpoint 推进与 memory / timeline / audit observer 行为。
+脚本默认启用 `VERBOSE` 日志以展示 P6 执行路径；需要更细诊断时可传 `--log-level DEBUG`，
+只看摘要时可传 `--log-level INFO`：
 
 ```bash
 python utils/smoke_host_p6_durable_eventlog.py
+python utils/smoke_host_p6_durable_eventlog.py --log-level DEBUG
 ```
 
 当前提供 Host ToolRuntime smoke 脚本，用于观察 P2 schema-driven truncate、cursor issued、

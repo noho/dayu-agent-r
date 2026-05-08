@@ -23,7 +23,15 @@
 - P5.5 deferred scope reconciliation 已完成文档收口：已把 P1-P5 漏排 / 误排 / 已落地的 deferred
   能力重新安排到 P6+，并经开放式架构 review 讨论后补充最小 observer / sink、`LocalRunHarness`
   防 God Object、OLD public interface 调研前置、代表性 web tool smoke、P12-P14 保留等总控约束。
-  当前分支为 `migration/host-p5_5-deferred-scope-reconciliation`，准备创建 PR 等用户人工 PR review。
+- P5.5 已通过 PR #25 合入 `main`，merge commit 为 `758fd4a Host P5.5 deferred scope reconciliation (#25)`。
+- P6 Durable EventLog / Run State / Projection 已完成实现、修复与复审：落地 SQLite WAL durable
+  `RunEventStore`、Run / Attempt 最小持久状态、同事务 terminal result snapshot、ProjectionCoordinator、
+  memory / timeline / audit observer、checkpoint / retry / lag 观察、真实 `harness.start_run` 路径
+  smoke。P6 code / architecture / concurrency review findings 已在
+  `docs/host/phase6-code-review.md`、`docs/host/phase6-architecture-review.md`、
+  `docs/host/phase6-concurrency-review.md` 标注修复状态；复审结果见
+  `docs/host/phase6-fix-rereview.md`，结论通过。当前分支为
+  `migration/host-p6-durable-eventlog`，准备创建 PR 等用户人工 PR review。
 
 每个 Phase 进入实现前，必须另写可交接的 phase plan，细化到迁移 Agent 可以直接接手：
 目标、非目标、边界、文件级改动清单、契约变化、状态机、测试清单、验证命令、review gate、
@@ -523,3 +531,23 @@ P16 必须产出明确的 Engine / Host interface freeze 方案。该方案至�
   不得把 Host ToolRuntime / ToolRegistry / memory / trace / governance 语义塞回 Engine。
 - 守护测试：package export 测试、protocol/import boundary 测试、事件契约 exhaustiveness 测试、
   public interface smoke 与 full-governance smoke 必须成为后续接口变更的回归门槛。
+
+## 12. P16 后 CI / Smoke Follow-up
+
+P16 完成 full-governance smoke 与 Engine / Host interface freeze 后，必须评估是否立即启动下一份
+migration plan，或追加 P17 建立 GitHub CI workflow。该事项不阻塞 P6-P16 主迁移，但不能遗忘。
+
+基础 CI 方向如下：
+
+- 必跑质量门：`pytest` 全量通过；`pyright` 全量通过。
+- 必跑离线 smoke：从 P5-P16 各 phase 的 `utils/` smoke 中抽取不依赖真实 provider、网络、外部密钥、
+  时间敏感资源或大模型非确定行为的 smoke，作为 CI 必跑 smoke 集合。
+- 可选集成 smoke：依赖真实 provider、真实 web tool、网络、GitHub / 外部服务或密钥的 smoke，不直接进入
+  PR 必跑门；可放入手动 workflow、nightly workflow 或带 secrets 的受控集成 workflow。
+- smoke 分层要求：每个 smoke 必须声明自己属于 `offline-deterministic`、`integration-with-secrets`、
+  `manual-observation` 中哪一类；CI 只能默认运行第一类。
+- 输出要求：CI smoke 不打印 delta、大工具结果、scope token、内部大 prompt 或真实密钥；失败输出必须足以定位
+  phase 能力边界。
+
+该 CI follow-up 的目标不是替代 code review，而是把 P16 后已冻结的契约、测试、类型检查和关键 smoke
+变成持续回归门槛。

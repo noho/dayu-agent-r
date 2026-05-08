@@ -20,9 +20,10 @@ RunInputBuilder -> proxy -> append -> terminal -> coordinator.drain)。
 
 from __future__ import annotations
 
+import argparse
 import asyncio
 import sys
-from collections.abc import AsyncIterator
+from collections.abc import AsyncIterator, Sequence
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
@@ -65,12 +66,42 @@ from dayu.host.contracts import (  # noqa: E402
     RunOptions,
     StartRunRequest,
 )
+from dayu.runtime.log import LogLevel, configure  # noqa: E402
 
 _SMOKE_RUN_ID: str = "smoke_run_1"
 _SMOKE_SESSION_ID: str = "smoke_session"
 _SMOKE_USER_TEXT: str = "问题1"
 _SMOKE_FINAL_TEXT: str = "答案1"
 _TERMINAL_TIMEOUT_SECONDS: float = 5.0
+
+
+@dataclass(frozen=True, slots=True)
+class _SmokeArgs:
+    """P6 smoke 命令行参数。"""
+
+    log_level: LogLevel
+
+
+def _parse_args(argv: Sequence[str]) -> _SmokeArgs:
+    """解析 smoke 命令行参数。
+
+    :param argv: 不含程序名的命令行参数。
+    :returns: 解析后的 smoke 参数。
+    :raises SystemExit: 参数非法时由 argparse 抛出。
+    """
+
+    parser = argparse.ArgumentParser(
+        description="Run manual Host P6 durable EventLog smoke checks."
+    )
+    parser.add_argument(
+        "--log-level",
+        choices=tuple(level.name for level in LogLevel),
+        default=LogLevel.VERBOSE.name,
+        help="Dayu namespace log level; default: VERBOSE.",
+    )
+    namespace = parser.parse_args(list(argv))
+    log_level_name: str = namespace.log_level
+    return _SmokeArgs(log_level=LogLevel[log_level_name])
 
 
 def _utc() -> datetime:
@@ -305,13 +336,16 @@ async def _run_smoke() -> None:
         bundle.close()
 
 
-def main() -> None:
+def main(argv: Sequence[str] | None = None) -> None:
     """脚本入口。
 
+    :param argv: 不含程序名的命令行参数；为 ``None`` 时读取 ``sys.argv``。
     :returns: 无返回值。
     :raises Exception: 子组件异常时透传。
     """
 
+    args = _parse_args(sys.argv[1:] if argv is None else argv)
+    configure(level=args.log_level)
     asyncio.run(_run_smoke())
 
 
