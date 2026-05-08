@@ -688,7 +688,7 @@ def test_llm_projection_shapes() -> None:
 
 
 def test_llm_truncation_projection_without_more_hides_fetch_hint() -> None:
-    """has_more=False 时 LLM projection 不暴露续读动作与内部 scope。
+    """has_more=False 时 LLM projection 不暴露续读动作、TTL 与内部 scope。
 
     :returns: 无返回值。
     :raises AssertionError: projection 结构不符合预期时抛出。
@@ -705,7 +705,7 @@ def test_llm_truncation_projection_without_more_hides_fetch_hint() -> None:
                     scope_hash="secret_hash",
                     has_more=False,
                     limit=None,
-                    ttl_seconds=None,
+                    ttl_seconds=60,
                 ),
                 meta=None,
             )

@@ -352,7 +352,7 @@ def _should_log_append(event: RunEvent) -> bool:
     """
 
     return (
-        event.kind is RunEventKind.CANONICAL
+        event.kind == RunEventKind.CANONICAL
         or event.type in TERMINAL_RUN_EVENT_TYPES
     )
 

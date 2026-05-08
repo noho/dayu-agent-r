@@ -292,8 +292,8 @@ def _project_truncation_for_llm(
             fetch_more_args["limit"] = truncation.limit
         projected["next_action"] = _TRUNCATION_NEXT_ACTION_FETCH_MORE
         projected["fetch_more_args"] = fetch_more_args
-    if truncation.ttl_seconds is not None:
-        projected["ttl_seconds"] = truncation.ttl_seconds
+        if truncation.ttl_seconds is not None:
+            projected["ttl_seconds"] = truncation.ttl_seconds
     return projected
 
 
