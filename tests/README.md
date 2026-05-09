@@ -206,7 +206,22 @@ Host 当前 Run harness、RunEventStore、ToolRuntime、Conversation Memory / Ru
   scope 内返回 `AttemptScopedRunEventAppender` / scope 外退化为 `PlainRunEventAppender`，
   以及 ToolRuntime fact `run_id` mismatch 命中
   `AttemptFencingError(reason=OWNER_MISMATCH)` 且 EventLog 不残留 fact、错误文本不
-  暴露 owner secret。
+  暴露 owner secret。同时覆盖 P8-S6 补齐的 framework `fetch_more` 端到端 fenced 断言：
+  合法 owner scope 下 `InMemoryToolRuntime.fetch_more` 写入
+  `TOOL_FETCH_MORE_REQUESTED` / `TOOL_FETCH_MORE_COMPLETED` facts；cursor 绑定旧 run、
+  owner scope 绑定新 run 时端到端命中
+  `AttemptFencingError(reason=OWNER_MISMATCH)` 且 EventLog 在两个 run 中均不残留
+  fetch_more fact、错误文本不暴露 owner secret。
+- P8-S6 stale / orphan recovery 主路径（`tests/host/test_phase8_attempt_recovery.py`）：
+  覆盖 `AttemptSupervisor.recover_stale_attempts` 全部 typed 决策——
+  `RUNNING` lease 过期推到 `MARK_RECOVERING_AND_CREATE_ATTEMPT`（旧 attempt CAS 推
+  `RECOVERING`、新 recovery attempt RUNNING + 严格更大 fencing token +
+  `recovered_from_attempt_id` 链接、旧 owner 再次 `verify_owner` 仍 fenced）；run terminal
+  推到 `MARK_LOST` 不创建恢复 attempt；`CREATED` 孤儿（无 owner / 无 fencing token）推
+  `MARK_LOST`；fencing token 在 scan 与短事务之间被改写时直接调用
+  `mark_recovering_and_create_attempt` 命中 `NOOP_TERMINAL` 安全分支，不创建恢复行也
+  不覆盖旧行；recovery scan 不修改 `host_projection_checkpoints`、不写诊断 RunEvent。
+  fake clock 替代真实 ``time.sleep`` 推进 lease 过期。
 - public boundary：锁定 `dayu.host.__all__`，允许 Run 级 `start_run`、`stream_run_events`、`get_run_result`，
   以及 P2 Run 级 `get_tool_fetch_more_handle`、`fetch_more_tool_result`，阻止 `EngineWorker`、`LocalProxy`、
   `ToolExecutor`、`InMemoryToolRuntime`、`ToolRuntimeToolExecutor`、`InMemoryConversationMemoryStore`、

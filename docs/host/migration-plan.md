@@ -58,8 +58,12 @@
   `docs/host/phase8-s4-code-review.md`、`docs/host/phase8-s4-fix-rereview.md`，结论通过；
   下一入口是 P8-S5：Attempt-scoped Append 与 ToolRuntime Fencing。
   P8-S5 Attempt-scoped Append 与 ToolRuntime Fencing 已完成实施与 code review，
-  review 见 `docs/host/phase8-s5-code-review.md`，结论通过。下一入口是 P8-S6：
-  Stale / Orphan Recovery 新 Attempt 主路径。
+  review 见 `docs/host/phase8-s5-code-review.md`，结论通过。
+  P8-S6 Stale / Orphan Recovery 新 Attempt 主路径已完成内部显式入口实施：
+  `AttemptSupervisor.recover_stale_attempts` 覆盖 `MARK_RECOVERING_AND_CREATE_ATTEMPT` /
+  `MARK_LOST` (run terminal / orphan CREATED) / `NOOP_TERMINAL` 全部 typed 决策；
+  P8-S5 deferred 端到端 framework `fetch_more` fenced 测试同步补齐。下一入口是 P8-S7：
+  Multi-process 默认 deterministic 测试。
 
 每个 Phase 进入实现前，必须另写可交接的 phase plan，细化到迁移 Agent 可以直接接手：
 目标、非目标、边界、文件级改动清单、契约变化、状态机、测试清单、验证命令、review gate、
@@ -478,13 +482,24 @@ P16 收口项。
   在同一 `BEGIN IMMEDIATE` 事务内执行 `verify_owner` CAS + `append_with_position_in_transaction`；
   `ToolRuntimeOwnerScope` ContextVar 保证 ToolRuntime helper 读取当前 attempt owner。
   framework `fetch_more` 端到端 fenced 测试作为 P8-S6 residual risk 补强。
-- `deferred-with-owner: P8-S6`：recovery scan / `MARK_RECOVERING_AND_CREATE_ATTEMPT` 仍未实现；
-  stale / orphan attempt 的恢复必须在新 recovery attempt 中继续，不 takeover 同一 attempt。
-- `deferred-with-owner: P8-S6`：framework `fetch_more` 端到端 fenced 测试。P8-S5 组件级测试已证明
-  `ToolRuntimeOwnerScope` + `AttemptScopedRunEventAppender` 的 fencing contract，但缺少从
-  `InMemoryToolRuntime.fetch_more()` 入口到 EventLog 的端到端 fenced 断言；P8-S6 补强。
+- `completed: P8-S6`：Stale / orphan attempt 恢复主路径 (`MARK_RECOVERING_AND_CREATE_ATTEMPT` /
+  `MARK_LOST` / `NOOP_TERMINAL`) 已通过内部显式入口 `AttemptSupervisor.recover_stale_attempts`
+  落地：候选扫描使用短读事务 + per-candidate `BEGIN IMMEDIATE` CAS；旧 attempt CAS 推到
+  `RECOVERING` / `LOST`，新 recovery attempt 持有严格更大 fencing token 与 `recovered_from_attempt_id`
+  反向链接；run terminal 与 orphan `CREATED` 走 `MARK_LOST` 不创建恢复 attempt；`fencing_token`
+  在 scan 与短事务之间被改写时返回 `NOOP_TERMINAL`，不残留改写。recovery scan 不写诊断 RunEvent，
+  也不修改 `host_projection_checkpoints`。该入口尚未自动 wire 进 `build_durable_harness`，由 P8-S7
+  / 后续装配阶段决策 wiring 时机。
+- `completed: P8-S6`：framework `fetch_more` 端到端 fenced 断言已落地于
+  `tests/host/test_phase8_tool_runtime_fencing.py`：合法 owner 路径下 `InMemoryToolRuntime.fetch_more`
+  写入 `TOOL_FETCH_MORE_REQUESTED` / `TOOL_FETCH_MORE_COMPLETED` facts；cursor 绑定到旧 run、owner
+  scope 绑定到新 run 时 `_append_fetch_requested` 在 `_verify_run_id_matches` 早抛
+  `AttemptFencingError(OWNER_MISMATCH)`，EventLog 不残留 fact，错误文本不含 owner secret。
 - `deferred-with-owner: P8-S7 / issue #38`：默认 deterministic multiprocessing 测试仍未落地；
   慢硬盘 + Docker Linux stress 作为增强手工压力测试由 GitHub issue #38 跟踪。
+- `deferred-with-owner: P8-S7`：`AttemptSupervisor.recover_stale_attempts` 自动 wire 进 Host
+  bootstrap (`build_durable_harness` / Session 生命周期) 由 P8-S7 推进；当前为内部显式入口，
+  允许测试与运营手动调用，不影响生产 Host 启动 (因为 P8-S6 之前也无自动 recovery)。
 - `deferred-with-owner: P16`：P8-S3 测试 fake 当前用 `cast(AttemptSupervisor, ...)` 桥接具体类；
   interface freeze 前应评估是否抽 `AttemptSupervisorPort` 这类 Host internal protocol，避免测试替身
   长期依赖具体实现。

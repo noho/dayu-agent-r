@@ -44,12 +44,15 @@ from dayu.host._tool_runtime import (
     PlainRunEventAppender,
     ToolRuntimeOwnerScope,
     active_tool_runtime_appender,
+    _CursorRecord,
 )
 from dayu.host.contracts import (
     RunEventDraft,
     RunEventKind,
     RunEventSource,
     RunEventType,
+    ToolFetchMoreRequest,
+    ToolRuntimeCursor,
 )
 
 
@@ -293,5 +296,192 @@ async def test_scoped_appender_run_id_mismatch_blocks_tool_runtime_fact() -> Non
                 assert (
                     owner_context.owner_token.value not in str(excinfo.value)
                 )
+    finally:
+        storage.close()
+
+
+def _build_cursor_record(
+    *,
+    cursor_value: str,
+    run_id: str,
+    session_id: str,
+    tool_call_id: str,
+) -> _CursorRecord:
+    """构造一个最小可用的 ``_CursorRecord`` 用于 fetch_more 端到端 fencing 测试。
+
+    本工厂仅用于 P8-S5 deferred 端到端 fenced 复现; 数据载荷选用足以让
+    framework ``fetch_more`` 进入 ``_append_fetch_requested`` append 路径
+    的最小集合 (列表数据 + offset, 仍有剩余)。
+
+    :param cursor_value: cursor 原文。
+    :param run_id: cursor 绑定 run id。
+    :param session_id: cursor 绑定 session id。
+    :param tool_call_id: cursor 绑定 tool_call_id。
+    :returns: 内存态 :class:`_CursorRecord`。
+    :raises Exception: 不主动抛出异常。
+    """
+
+    return _CursorRecord(
+        cursor=cursor_value,
+        cursor_fingerprint=f"fp-{cursor_value}",
+        scope_token="scope-token",
+        scope_hash="scope-hash",
+        session_id=session_id,
+        run_id=run_id,
+        tool_call_id=tool_call_id,
+        tool_name="my_tool",
+        strategy="length",
+        unit="char",
+        limit=4,
+        total=10,
+        data="abcdefghij",
+        offset=4,
+        template=None,
+        field_path=None,
+        created_at_monotonic=0.0,
+        expires_at_monotonic=1e9,
+        ttl_seconds=600,
+        parent_cursor_fingerprint=None,
+    )
+
+
+@pytest.mark.asyncio
+async def test_fetch_more_under_owner_scope_appends_facts_normally() -> None:
+    """合法 owner: ``fetch_more`` 通过 scoped appender 写入 facts。
+
+    cursor 绑定与 owner scope 同一 ``run_id`` 时, ``_append_fetch_requested``
+    / ``_append_fetch_completed`` 走 :class:`AttemptScopedRunEventAppender`,
+    EventLog 命中 ``TOOL_FETCH_MORE_REQUESTED`` / ``TOOL_FETCH_MORE_COMPLETED``
+    并可附带派生 cursor 的 ``TOOL_CURSOR_ISSUED`` fact。
+    """
+
+    storage = _open_storage()
+    try:
+        await _seed_run(storage, run_id="r1")
+        clock = _FakeClock()
+        supervisor = _build_supervisor(storage=storage, clock=clock)
+
+        async def _noop_executor(*args: object, **kwargs: object) -> object:
+            del args, kwargs
+            return None
+
+        runtime = InMemoryToolRuntime(
+            executor=_noop_executor,  # type: ignore[arg-type]
+            event_store=supervisor.event_store,
+        )
+        # 构造一个 cursor 绑定到 run_id=r1, 与 owner scope 一致。
+        record = _build_cursor_record(
+            cursor_value="cursor-legal",
+            run_id="r1",
+            session_id="s",
+            tool_call_id="tc-1",
+        )
+        runtime._records_by_cursor[record.cursor] = record  # noqa: SLF001
+
+        async with supervisor.lease_context(
+            run_id="r1", attempt_index=0
+        ) as owner_context:
+            scoped = supervisor.scoped_appender(owner_context)
+            async with ToolRuntimeOwnerScope(scoped):
+                request = ToolFetchMoreRequest(
+                    session_id="s",
+                    run_id="r1",
+                    iteration_id="iter-1",
+                    tool_call_id="tc-1",
+                    cursor=ToolRuntimeCursor(
+                        value=record.cursor,
+                        fingerprint=record.cursor_fingerprint,
+                    ),
+                    scope_token=record.scope_token,
+                    limit=2,
+                )
+                result = await runtime.fetch_more(request)
+        # 期望: 至少出现 TOOL_FETCH_MORE_REQUESTED 与 TOOL_FETCH_MORE_COMPLETED;
+        # 仍有剩余时还会出现 TOOL_CURSOR_ISSUED。
+        events = await supervisor.event_store.list_events(
+            run_id="r1", after=None
+        )
+        types = {event.type for event in events}
+        assert RunEventType.TOOL_FETCH_MORE_REQUESTED in types
+        assert RunEventType.TOOL_FETCH_MORE_COMPLETED in types
+        # 无 fencing 异常: result 不应是 failed (binding / fencing 都 OK)。
+        assert result is not None
+    finally:
+        storage.close()
+
+
+@pytest.mark.asyncio
+async def test_fetch_more_run_id_mismatch_is_fenced_end_to_end() -> None:
+    """旧 cursor 跨 run race: ``fetch_more`` 必须在 fact append 时被 fencing 拒绝。
+
+    cursor 绑定到 ``r_other``, owner scope 绑定到 ``r1``;
+    ``request.run_id == r_other`` 通过 cursor binding 校验后,
+    ``_append_fetch_requested`` 的 draft.run_id == r_other != owner.run_id == r1,
+    :class:`AttemptScopedRunEventAppender._verify_run_id_matches` 抛
+    :class:`AttemptFencingError(reason=OWNER_MISMATCH)`, EventLog 不残留任何
+    fetch_more fact。
+    """
+
+    storage = _open_storage()
+    try:
+        await _seed_run(storage, run_id="r1")
+        await _seed_run(storage, run_id="r_other")
+        clock = _FakeClock()
+        supervisor = _build_supervisor(storage=storage, clock=clock)
+
+        async def _noop_executor(*args: object, **kwargs: object) -> object:
+            del args, kwargs
+            return None
+
+        runtime = InMemoryToolRuntime(
+            executor=_noop_executor,  # type: ignore[arg-type]
+            event_store=supervisor.event_store,
+        )
+        # 旧 cursor 绑定到 r_other (上一个 attempt 留下的); request 也指向
+        # r_other, 因此 cursor binding 不会拒绝, 但 owner scope 仍是 r1。
+        record = _build_cursor_record(
+            cursor_value="cursor-stale",
+            run_id="r_other",
+            session_id="s",
+            tool_call_id="tc-stale",
+        )
+        runtime._records_by_cursor[record.cursor] = record  # noqa: SLF001
+
+        async with supervisor.lease_context(
+            run_id="r1", attempt_index=0
+        ) as owner_context:
+            scoped = supervisor.scoped_appender(owner_context)
+            async with ToolRuntimeOwnerScope(scoped):
+                request = ToolFetchMoreRequest(
+                    session_id="s",
+                    run_id="r_other",
+                    iteration_id="iter-stale",
+                    tool_call_id="tc-stale",
+                    cursor=ToolRuntimeCursor(
+                        value=record.cursor,
+                        fingerprint=record.cursor_fingerprint,
+                    ),
+                    scope_token=record.scope_token,
+                    limit=2,
+                )
+                with pytest.raises(AttemptFencingError) as excinfo:
+                    await runtime.fetch_more(request)
+                assert (
+                    excinfo.value.reason
+                    is AttemptFencingReason.OWNER_MISMATCH
+                )
+                assert (
+                    owner_context.owner_token.value
+                    not in str(excinfo.value)
+                )
+        # 端到端断言: 任一 run 都不应残留 fetch_more fact。
+        events_r1 = await supervisor.event_store.list_events(
+            run_id="r1", after=None
+        )
+        assert events_r1 == ()
+        events_other = await supervisor.event_store.list_events(
+            run_id="r_other", after=None
+        )
+        assert events_other == ()
     finally:
         storage.close()

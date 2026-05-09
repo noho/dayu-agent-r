@@ -54,6 +54,8 @@ from dayu.host._attempt_lease import (
     AttemptLeaseResult,
     AttemptOwnerContext,
     AttemptOwnerToken,
+    AttemptRecoveryAction,
+    AttemptRecoveryDecision,
     AttemptTerminalLink,
     UtcClock,
 )
@@ -65,8 +67,15 @@ from dayu.host._host_storage_transaction import (
     HostStorage,
     HostStorageTransaction,
 )
-from dayu.host._internal_contracts import AttemptState, GlobalEventPosition
-from dayu.host._run_state_store import AttemptLeaseStore
+from dayu.host._internal_contracts import (
+    AttemptRecord,
+    AttemptState,
+    GlobalEventPosition,
+)
+from dayu.host._run_state_store import (
+    AttemptIndexCollisionError,
+    AttemptLeaseStore,
+)
 from dayu.host.contracts import (
     TERMINAL_RUN_EVENT_TYPES,
     RunEvent,
@@ -82,6 +91,14 @@ _ERROR_TERMINAL_DRAFT_TERMINAL_TYPE: str = (
     "AttemptScopedRunEventAppender.append cannot accept terminal "
     "RunEventType; use append_terminal_and_close"
 )
+_RECOVERY_REASON_RUN_TERMINAL: str = "run_terminal_lost"
+"""recovery 原因: run 已 terminal, 旧 attempt 标记为 LOST。"""
+_RECOVERY_REASON_ORPHAN_LOST: str = "orphan_created_lost"
+"""recovery 原因: ``CREATED`` 孤儿行无 owner, 直接标记为 LOST。"""
+_RECOVERY_REASON_UNIQUE_INDEX_COLLISION: str = "unique_index_collision"
+"""recovery 原因: 新 recovery attempt INSERT 命中 ``UNIQUE(run_id, attempt_index)`` 冲突, 整事务已回滚。"""
+_RECOVERY_OWNER_ID_PREFIX_SUFFIX: str = "recovery"
+"""recovery owner_id_prefix 复用 lease_config.owner_id_prefix 并加 suffix。"""
 
 
 class AttemptOwnerLossReason(StrEnum):
@@ -696,6 +713,199 @@ class AttemptSupervisor:
             lease_store=self.lease_store,
             owner_context=owner_context,
         )
+
+    async def recover_stale_attempts(
+        self,
+        *,
+        run_id: str | None = None,
+    ) -> tuple[AttemptRecoveryDecision, ...]:
+        """对过期 / orphan attempt 执行 recovery scan, 返回 typed 决策序列。
+
+        本方法是 P8-S6 的内部显式入口, 仅供 host 内部测试 / 治理调用,
+        不暴露到 public Host API; 也不会自动接入 ``build_durable_harness``
+        bootstrap 流程。每个候选 attempt 在独立 ``BEGIN IMMEDIATE`` 短事务
+        内处理, 失败原子回滚, 不影响其它候选。
+
+        判定矩阵:
+
+        - run 已 terminal -> ``MARK_LOST`` (旧 attempt 标记 LOST, 不创建
+          recovery attempt);
+        - ``CREATED`` 孤儿行 (无 owner / 无 fencing token) -> ``MARK_LOST``;
+        - ``RUNNING`` 且 ``lease_expires_at <= now`` 且 fencing token 存在
+          -> ``MARK_RECOVERING_AND_CREATE_ATTEMPT`` (CAS 旧行为 RECOVERING,
+          同事务 INSERT 新 attempt 并分配新 fencing token + 新 owner secret +
+          ``recovered_from_attempt_id``);
+        - 任一 CAS 命中失败 -> ``NOOP_TERMINAL`` (其它进程已推进, 本轮跳过)。
+
+        本方法严格遵守 P8-S6 scope:
+
+        - 不写 EventLog 诊断 RunEvent;
+        - 不推进 projection / outbox checkpoint;
+        - 不接管同一 attempt (recovery 必须用新 ``attempt_index`` /
+          ``attempt_id`` / fencing token);
+        - 不暴露 owner secret 明文; 所有日志使用 masked token。
+
+        :param run_id: 限定 run; ``None`` 表示扫描全库 (诊断用)。
+        :returns: 各候选的 typed :class:`AttemptRecoveryDecision` 元组,
+            按候选 ``started_at`` 升序; 无候选返回空元组。
+        :raises sqlite3.DatabaseError: 非冲突 SQLite 错误时透传。
+        """
+
+        now = self.clock.now()
+        async with self.storage.transaction() as scan_tx:
+            candidates = self.lease_store.list_recovery_candidates(
+                tx=scan_tx,
+                run_id=run_id,
+                now=now,
+            )
+        decisions: list[AttemptRecoveryDecision] = []
+        for candidate in candidates:
+            decision = await self._process_recovery_candidate(candidate)
+            decisions.append(decision)
+            _LOGGER.info(
+                "host.attempt.recovery_decision run_id=%s "
+                "source_attempt_id=%s action=%s "
+                "recovery_attempt_id=%s reason=%s",
+                candidate.run_id,
+                candidate.attempt_id,
+                decision.action.value,
+                decision.recovery_attempt_id,
+                decision.reason,
+            )
+        return tuple(decisions)
+
+    async def _process_recovery_candidate(
+        self, candidate: AttemptRecord
+    ) -> AttemptRecoveryDecision:
+        """在独立短事务内处理单个 recovery 候选。
+
+        本方法把 store 层 typed 决策视为唯一真源, 只在两类情况下不直接
+        透传 store decision:
+
+        - run 已 terminal 或 候选为 ``CREATED`` 孤儿: 不进入 ``mark_recovering_and_create_attempt``,
+          走 :meth:`AttemptLeaseStore.mark_stale_or_lost`, 由 supervisor
+          决定 ``MARK_LOST`` reason 文案 (``run_terminal_lost`` /
+          ``orphan_created_lost``);
+        - INSERT 命中 ``UNIQUE(run_id, attempt_index)`` 冲突: store 层抛
+          :class:`AttemptIndexCollisionError`, 由外层 ``async with
+          storage.transaction()`` 回滚整事务 (旧 attempt 的
+          ``RECOVERING`` CAS 一并回滚), supervisor 在事务外捕获并返回
+          typed ``NOOP_TERMINAL(reason="unique_index_collision")``。
+
+        其它路径下, store 层返回的 :class:`AttemptRecoveryDecision`
+        (含 ``MARK_RECOVERING_AND_CREATE_ATTEMPT`` / ``NOOP_TERMINAL``)
+        必须原样返回, 包括其 ``reason`` 字段; supervisor 不允许静默改写
+        store decision 以保留 store 层 CAS 真源的诊断粒度。
+
+        :param candidate: ``list_recovery_candidates`` 返回的旧 attempt 行。
+        :returns: typed :class:`AttemptRecoveryDecision`。
+        :raises sqlite3.DatabaseError: 非冲突 SQLite 错误时透传。
+        """
+
+        try:
+            async with self.storage.transaction() as tx:
+                if self.lease_store.is_run_terminal(
+                    tx=tx, run_id=candidate.run_id
+                ):
+                    return self.lease_store.mark_stale_or_lost(
+                        tx=tx,
+                        source_attempt_id=candidate.attempt_id,
+                        source_fencing_token=(
+                            None
+                            if candidate.fencing_token is None
+                            else candidate.fencing_token.value
+                        ),
+                        target_state=AttemptState.LOST,
+                        reason=_RECOVERY_REASON_RUN_TERMINAL,
+                    )
+                if (
+                    candidate.state is AttemptState.CREATED
+                    or candidate.fencing_token is None
+                ):
+                    return self.lease_store.mark_stale_or_lost(
+                        tx=tx,
+                        source_attempt_id=candidate.attempt_id,
+                        source_fencing_token=None,
+                        target_state=AttemptState.LOST,
+                        reason=_RECOVERY_REASON_ORPHAN_LOST,
+                    )
+                recovery_attempt_index = self.lease_store.next_attempt_index(
+                    tx=tx, run_id=candidate.run_id
+                )
+                recovery_attempt_id = _default_attempt_id(
+                    run_id=candidate.run_id,
+                    attempt_index=recovery_attempt_index,
+                )
+                owner_token = AttemptOwnerToken.new()
+                owner_id = _default_owner_id(
+                    f"{self.lease_config.owner_id_prefix}-"
+                    f"{_RECOVERY_OWNER_ID_PREFIX_SUFFIX}"
+                )
+                lease_expires_at = self._compute_lease_expiry()
+                decision = (
+                    self.lease_store.mark_recovering_and_create_attempt(
+                        tx=tx,
+                        source_attempt_id=candidate.attempt_id,
+                        source_fencing_token=candidate.fencing_token.value,
+                        run_id=candidate.run_id,
+                        recovery_attempt_id=recovery_attempt_id,
+                        recovery_attempt_index=recovery_attempt_index,
+                        owner_id=owner_id,
+                        owner_token=owner_token,
+                        lease_expires_at=lease_expires_at,
+                    )
+                )
+                if (
+                    decision.action
+                    is AttemptRecoveryAction.MARK_RECOVERING_AND_CREATE_ATTEMPT
+                ):
+                    _LOGGER.debug(
+                        "host.attempt.recovery_started run_id=%s "
+                        "source_attempt_id=%s recovery_attempt_id=%s "
+                        "recovery_attempt_index=%s owner_id=%s "
+                        "owner_token=%s lease_expires_at=%s",
+                        candidate.run_id,
+                        candidate.attempt_id,
+                        recovery_attempt_id,
+                        recovery_attempt_index,
+                        owner_id,
+                        owner_token.masked(),
+                        lease_expires_at.isoformat(),
+                    )
+                    return decision
+                # 非 MARK_RECOVERING_AND_CREATE_ATTEMPT 必须由 store 决定
+                # action / reason: 当前 store 实现仅返回
+                # NOOP_TERMINAL(reason=cas_failed_noop), 但 supervisor
+                # 不在此处覆盖, 以保留 store 层 typed decision 的诊断粒度,
+                # 也让未来 store 扩展新 action 时不被 supervisor 静默吞掉。
+                _LOGGER.debug(
+                    "host.attempt.recovery_store_decision "
+                    "source_attempt_id=%s action=%s reason=%s",
+                    candidate.attempt_id,
+                    decision.action.value,
+                    decision.reason,
+                )
+                return decision
+        except AttemptIndexCollisionError as exc:
+            # 整事务已被外层 ``async with storage.transaction()`` 回滚,
+            # 旧 attempt 的 ``RECOVERING`` CAS 与新 recovery attempt
+            # INSERT 同时未提交, 不存在半状态。supervisor 必须把 typed
+            # 冲突收口为 ``NOOP_TERMINAL(reason="unique_index_collision")``,
+            # 避免裸 ``sqlite3.IntegrityError`` 泄漏给上层调用方。
+            _LOGGER.warning(
+                "host.attempt.recovery_unique_index_collision run_id=%s "
+                "source_attempt_id=%s recovery_attempt_index=%s",
+                exc.run_id,
+                exc.source_attempt_id,
+                exc.attempt_index,
+            )
+            return AttemptRecoveryDecision(
+                action=AttemptRecoveryAction.NOOP_TERMINAL,
+                source_attempt_id=candidate.attempt_id,
+                recovery_attempt_id=None,
+                recovery_attempt_index=None,
+                reason=_RECOVERY_REASON_UNIQUE_INDEX_COLLISION,
+            )
 
     async def _acquire_in_transaction(
         self,

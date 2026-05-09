@@ -359,7 +359,17 @@ RunEvent。`AttemptSupervisor.scoped_appender(owner_context)` 是构造该 appen
 `ToolRuntimeOwnerScope`（基于 `contextvars.ContextVar`）把 scoped appender 注入到
 `InMemoryToolRuntime`，使框架级 `fetch_more` 也按 originating attempt 的 owner
 落库，避免跨 attempt 写错 run。`ToolExecutionContext` 不变，不向 ToolExecutor 暴露
-任何 owner secret。当前 recovery scan 与多进程稳态仍未落地，分别归 P8-S6 / P8-S7。
+任何 owner secret。P8-S6 已提供 stale / orphan recovery 主路径内部显式入口
+`AttemptSupervisor.recover_stale_attempts(*, run_id=None)`：候选扫描使用短读事务挑选
+`state IN ('running','created') AND lease_expires_at <= now` 的 attempt，
+随后逐候选用独立 `BEGIN IMMEDIATE` 事务通过 `AttemptLeaseStore` CAS 决策落地：
+旧 RUNNING attempt 在同一事务内 CAS 推到 `RECOVERING` 并 INSERT 新 recovery attempt（持有严格更大
+fencing token、独立 owner secret hash、`recovered_from_attempt_id` 反向链接）；run 已 terminal 或
+`CREATED` 孤儿则走 `MARK_LOST` 不创建恢复 attempt；fencing token 在 scan 与短事务之间被改写时
+CAS rowcount=0 命中 `NOOP_TERMINAL` 安全分支不残留改写。recovery scan 不修改
+`host_projection_checkpoints`，不写诊断 RunEvent，所有决策以 typed `AttemptRecoveryDecision`
+返回。该入口当前只是内部入口，未自动 wire 进 `build_durable_harness` 或 Session 生命周期，
+自动装配时机由 P8-S7 决定。多进程稳态仍归 P8-S7。
 
 Host 已落地主路径使用日志表达执行边界：`VERBOSE` 覆盖 `start_run` 接纳、background task、attempt、
 EngineWorker 调用、terminal append、context overflow / compact / retry、ToolRuntime 调用边界、
