@@ -37,6 +37,10 @@ from dayu.engine import (
 )
 from dayu.host._event_observer import ProjectionEventEnvelope
 from dayu.host._internal_contracts import GlobalEventPosition
+from dayu.host._run_event_serializer import (
+    deserialize_run_event_data,
+    serialize_run_event_data,
+)
 from dayu.host._tool_trace_jsonl_sink import ToolTraceJsonlSink
 from dayu.host._tool_trace_projection import (
     ProjectionSchemaError,
@@ -53,6 +57,11 @@ from dayu.host.contracts import (
     RunInputContextSnapshotBuiltData,
     RunInputMessageSummary,
     RunInputToolSchemaSummary,
+    ToolCursorDeniedData,
+    ToolCursorExpiredData,
+    ToolFetchMoreCompletedData,
+    ToolResultTruncatedData,
+    ToolValueSizeSummary,
 )
 
 
@@ -431,3 +440,332 @@ def test_idempotency_key_stable_across_redrain(tmp_path: Path) -> None:
     lines = _read_jsonl_lines(tmp_path)
     assert len(lines) == 2
     assert lines[0]["idempotency_key"] == lines[1]["idempotency_key"]
+
+
+def _requested_env(*, position: int = 1) -> ProjectionEventEnvelope:
+    """构造标准 TOOL_CALL_REQUESTED envelope。
+
+    :param position: 全局 position。
+    :returns: envelope。
+    :raises Exception: 不主动抛出异常。
+    """
+
+    return _envelope(
+        position=position,
+        event_type=RunEventType.TOOL_CALL_REQUESTED,
+        data=ToolCallRequestedData(
+            iteration_id="iter-1",
+            tool_call_id="call-1",
+            name="echo",
+            arguments={},
+            index_in_iteration=0,
+            provider_state=None,
+        ),
+    )
+
+
+def _accepted_env(*, position: int = 2) -> ProjectionEventEnvelope:
+    """构造标准 TOOL_RESULT_ACCEPTED envelope。
+
+    :param position: 全局 position。
+    :returns: envelope。
+    :raises Exception: 不主动抛出异常。
+    """
+
+    return _envelope(
+        position=position,
+        event_type=RunEventType.TOOL_RESULT_ACCEPTED,
+        data=ToolResultAcceptedData(
+            iteration_id="iter-1",
+            tool_call_id="call-1",
+            name="echo",
+            index_in_iteration=0,
+            outcome=_completed_outcome(),
+        ),
+    )
+
+
+def test_tool_call_with_truncated_pairs_into_record(tmp_path: Path) -> None:
+    """``TOOL_CALL_REQUESTED + TOOL_RESULT_ACCEPTED + TOOL_RESULT_TRUNCATED``
+    依赖共同 ``iteration_id`` 配对，写入截断维度字段。"""
+
+    sink = ToolTraceJsonlSink(root_path=tmp_path)
+    observer = ToolTraceObserver(jsonl_sink=sink)
+    truncated = _envelope(
+        position=3,
+        event_type=RunEventType.TOOL_RESULT_TRUNCATED,
+        data=ToolResultTruncatedData(
+            iteration_id="iter-1",
+            tool_name="echo",
+            tool_call_id="call-1",
+            strategy="preview_with_cursor",
+            limit=10,
+            unit="char",
+            total_estimate=100,
+            cursor_fingerprint="cursor-abc",
+            ttl_seconds=60,
+            has_more=True,
+            value_summary=ToolValueSizeSummary(
+                unit="char",
+                size=10,
+                total_estimate=100,
+                fingerprint="fp-x",
+            ),
+        ),
+    )
+    observer.process(
+        tx=cast(object, None),  # type: ignore[arg-type]
+        batch=(_requested_env(), _accepted_env(), truncated),
+    )
+    lines = _read_jsonl_lines(tmp_path)
+    assert len(lines) == 1
+    rec = lines[0]
+    assert rec["trace_type"] == "tool_call"
+    assert rec["truncation_scope_token"] == "preview_with_cursor"
+    assert rec["truncation_cursor"] == "cursor-abc"
+    assert rec["truncation_has_more"] is True
+    assert rec["truncation_limit"] == 10
+
+
+def test_tool_call_with_fetch_more_completed_pairs(tmp_path: Path) -> None:
+    """``TOOL_FETCH_MORE_COMPLETED`` 同 batch 配对写 fetch_more 维度字段。"""
+
+    sink = ToolTraceJsonlSink(root_path=tmp_path)
+    observer = ToolTraceObserver(jsonl_sink=sink)
+    fetch_completed = _envelope(
+        position=4,
+        event_type=RunEventType.TOOL_FETCH_MORE_COMPLETED,
+        data=ToolFetchMoreCompletedData(
+            iteration_id="iter-1",
+            tool_name="echo",
+            tool_call_id="call-1",
+            consumed_cursor_fingerprint="cursor-old",
+            next_cursor_fingerprint="cursor-new",
+            limit=20,
+            chunk_size=15,
+            has_more=False,
+            value_summary=ToolValueSizeSummary(
+                unit="char",
+                size=10,
+                total_estimate=100,
+                fingerprint="fp-x",
+            ),
+        ),
+    )
+    observer.process(
+        tx=cast(object, None),  # type: ignore[arg-type]
+        batch=(_requested_env(), _accepted_env(), fetch_completed),
+    )
+    lines = _read_jsonl_lines(tmp_path)
+    assert len(lines) == 1
+    rec = lines[0]
+    assert rec["fetch_more_consumed_cursor"] == "cursor-old"
+    assert rec["fetch_more_next_cursor"] == "cursor-new"
+    assert rec["fetch_more_chunk_size"] == 15
+    assert rec["fetch_more_has_more"] is False
+
+
+def test_tool_call_with_cursor_denied_records_reason(tmp_path: Path) -> None:
+    """``TOOL_CURSOR_DENIED`` 同 batch 配对写入 ``cursor_denial_reason``。"""
+
+    sink = ToolTraceJsonlSink(root_path=tmp_path)
+    observer = ToolTraceObserver(jsonl_sink=sink)
+    denied = _envelope(
+        position=5,
+        event_type=RunEventType.TOOL_CURSOR_DENIED,
+        data=ToolCursorDeniedData(
+            iteration_id="iter-1",
+            tool_call_id="call-1",
+            cursor_fingerprint="cursor-abc",
+            reason="cursor_scope_mismatch",
+        ),
+    )
+    observer.process(
+        tx=cast(object, None),  # type: ignore[arg-type]
+        batch=(_requested_env(), _accepted_env(), denied),
+    )
+    lines = _read_jsonl_lines(tmp_path)
+    assert lines[0]["cursor_denial_reason"] == "cursor_scope_mismatch"
+
+
+def test_tool_call_with_cursor_expired_records_time(tmp_path: Path) -> None:
+    """``TOOL_CURSOR_EXPIRED`` 同 batch 配对写入 ``cursor_expired_at_monotonic``。"""
+
+    sink = ToolTraceJsonlSink(root_path=tmp_path)
+    observer = ToolTraceObserver(jsonl_sink=sink)
+    expired = _envelope(
+        position=6,
+        event_type=RunEventType.TOOL_CURSOR_EXPIRED,
+        data=ToolCursorExpiredData(
+            iteration_id="iter-1",
+            tool_call_id="call-1",
+            cursor_fingerprint="cursor-abc",
+            expired_at_monotonic=131.5,
+        ),
+    )
+    observer.process(
+        tx=cast(object, None),  # type: ignore[arg-type]
+        batch=(_requested_env(), _accepted_env(), expired),
+    )
+    lines = _read_jsonl_lines(tmp_path)
+    assert lines[0]["cursor_expired_at_monotonic"] == 131.5
+
+
+def test_truncated_alone_without_request_raises(tmp_path: Path) -> None:
+    """单独出现 ``TOOL_RESULT_TRUNCATED`` 缺 requested/accepted 抛 schema error。"""
+
+    sink = ToolTraceJsonlSink(root_path=tmp_path)
+    observer = ToolTraceObserver(jsonl_sink=sink)
+    truncated = _envelope(
+        position=3,
+        event_type=RunEventType.TOOL_RESULT_TRUNCATED,
+        data=ToolResultTruncatedData(
+            iteration_id="iter-1",
+            tool_name="echo",
+            tool_call_id="call-1",
+            strategy="preview_with_cursor",
+            limit=10,
+            unit="char",
+            total_estimate=100,
+            cursor_fingerprint="cursor-abc",
+            ttl_seconds=60,
+            has_more=True,
+            value_summary=ToolValueSizeSummary(
+                unit="char",
+                size=10,
+                total_estimate=100,
+                fingerprint="fp-x",
+            ),
+        ),
+    )
+    with pytest.raises(ProjectionSchemaError):
+        observer.process(
+            tx=cast(object, None),  # type: ignore[arg-type]
+            batch=(truncated,),
+        )
+
+
+def test_truncate_then_fetch_more_real_sequence(tmp_path: Path) -> None:
+    """真实序列：requested + accepted + truncated + fetch_more_completed
+    四事件同 batch，trace 同时记录截断与补读维度。"""
+
+    sink = ToolTraceJsonlSink(root_path=tmp_path)
+    observer = ToolTraceObserver(jsonl_sink=sink)
+    truncated = _envelope(
+        position=3,
+        event_type=RunEventType.TOOL_RESULT_TRUNCATED,
+        data=ToolResultTruncatedData(
+            iteration_id="iter-1",
+            tool_name="echo",
+            tool_call_id="call-1",
+            strategy="preview_with_cursor",
+            limit=10,
+            unit="char",
+            total_estimate=100,
+            cursor_fingerprint="cursor-abc",
+            ttl_seconds=60,
+            has_more=True,
+            value_summary=ToolValueSizeSummary(
+                unit="char",
+                size=10,
+                total_estimate=100,
+                fingerprint="fp-x",
+            ),
+        ),
+    )
+    fetch_completed = _envelope(
+        position=4,
+        event_type=RunEventType.TOOL_FETCH_MORE_COMPLETED,
+        data=ToolFetchMoreCompletedData(
+            iteration_id="iter-1",
+            tool_name="echo",
+            tool_call_id="call-1",
+            consumed_cursor_fingerprint="cursor-abc",
+            next_cursor_fingerprint=None,
+            limit=20,
+            chunk_size=20,
+            has_more=False,
+            value_summary=ToolValueSizeSummary(
+                unit="char",
+                size=10,
+                total_estimate=100,
+                fingerprint="fp-x",
+            ),
+        ),
+    )
+    observer.process(
+        tx=cast(object, None),  # type: ignore[arg-type]
+        batch=(_requested_env(), _accepted_env(), truncated, fetch_completed),
+    )
+    lines = _read_jsonl_lines(tmp_path)
+    assert len(lines) == 1
+    rec = lines[0]
+    assert rec["truncation_cursor"] == "cursor-abc"
+    assert rec["fetch_more_consumed_cursor"] == "cursor-abc"
+    assert rec["fetch_more_has_more"] is False
+
+
+def test_serializer_roundtrip_preserves_iteration_id() -> None:
+    """durable EventLog roundtrip 保留 ToolRuntime 事件 ``iteration_id``。"""
+
+    cases: tuple[RunEventData, ...] = (
+        ToolResultTruncatedData(
+            iteration_id="iter-x",
+            tool_name="echo",
+            tool_call_id="call-9",
+            strategy="preview_with_cursor",
+            limit=10,
+            unit="char",
+            total_estimate=100,
+            cursor_fingerprint="cursor-abc",
+            ttl_seconds=60,
+            has_more=True,
+            value_summary=ToolValueSizeSummary(
+                unit="char",
+                size=10,
+                total_estimate=100,
+                fingerprint="fp-x",
+            ),
+        ),
+        ToolFetchMoreCompletedData(
+            iteration_id="iter-y",
+            tool_name="echo",
+            tool_call_id="call-9",
+            consumed_cursor_fingerprint="cursor-old",
+            next_cursor_fingerprint=None,
+            limit=20,
+            chunk_size=20,
+            has_more=False,
+            value_summary=ToolValueSizeSummary(
+                unit="char",
+                size=10,
+                total_estimate=100,
+                fingerprint="fp-x",
+            ),
+        ),
+        ToolCursorDeniedData(
+            iteration_id="iter-z",
+            tool_call_id="call-9",
+            cursor_fingerprint="cursor-abc",
+            reason="cursor_scope_mismatch",
+        ),
+        ToolCursorExpiredData(
+            iteration_id="iter-w",
+            tool_call_id="call-9",
+            cursor_fingerprint="cursor-abc",
+            expired_at_monotonic=42.0,
+        ),
+    )
+    type_map: dict[type[RunEventData], RunEventType] = {
+        ToolResultTruncatedData: RunEventType.TOOL_RESULT_TRUNCATED,
+        ToolFetchMoreCompletedData: RunEventType.TOOL_FETCH_MORE_COMPLETED,
+        ToolCursorDeniedData: RunEventType.TOOL_CURSOR_DENIED,
+        ToolCursorExpiredData: RunEventType.TOOL_CURSOR_EXPIRED,
+    }
+    for data in cases:
+        event_type = type_map[type(data)]
+        encoded = serialize_run_event_data(event_type=event_type, data=data)
+        decoded = deserialize_run_event_data(
+            event_type=event_type, raw=encoded
+        )
+        assert decoded == data

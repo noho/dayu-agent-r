@@ -221,6 +221,7 @@ async def _main() -> None:
 
     handle_result = await harness.get_tool_fetch_more_handle(
         ToolFetchMoreHandleRequest(
+            iteration_id="smoke_iter_1",
             session_id=_SESSION_ID,
             run_id=_RUN_ID,
             tool_call_id=_TOOL_CALL_ID,
@@ -237,6 +238,7 @@ async def _main() -> None:
 
     fetch_result = await harness.fetch_more_tool_result(
         ToolFetchMoreRequest(
+            iteration_id="smoke_iter_1",
             session_id=_SESSION_ID,
             run_id=_RUN_ID,
             tool_call_id=_TOOL_CALL_ID,
@@ -258,6 +260,7 @@ async def _main() -> None:
 
     reused = await harness.fetch_more_tool_result(
         ToolFetchMoreRequest(
+            iteration_id="smoke_iter_1",
             session_id=_SESSION_ID,
             run_id=_RUN_ID,
             tool_call_id=_TOOL_CALL_ID,

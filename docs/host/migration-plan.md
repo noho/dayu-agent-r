@@ -37,7 +37,9 @@
   `docs/host/phase7-plan-rereview.md`，结论通过。计划阶段提交为
   `f55f5ac docs: finalize host p7 tool trace plan`。P7 代码实施、常规 code review、
   OLD / NEW review、架构边界 review、review fix 与复审均已完成，复审见
-  `docs/host/phase7-fix-rereview.md`，结论通过；残余风险已拆分到 GitHub issues #29-#35。
+  `docs/host/phase7-fix-rereview.md`，结论通过；ToolRuntime `iteration_id` root-cause
+  follow-up review 见 `docs/reviews/code-review-20260508-001.md`，Finding 001 / 003 已修复并复审通过；
+  残余风险已拆分到 GitHub issues #29-#35。
   当前进入 P7 实现提交与 PR 前收口阶段。
 
 每个 Phase 进入实现前，必须另写可交接的 phase plan，细化到迁移 Agent 可以直接接手：
@@ -336,13 +338,6 @@ P7 落地后，仍需后续阶段追踪的残余风险：
 - `accepted: P7 scope`：JSONL 与 EventLog checkpoint 非原子。每行 trace 在 EventLog 已 commit
   之后由 observer 写入；进程在两步之间崩溃，replay 后会产生重复行。靠行内 sha256[:32]
   `idempotency_key` 让 analyzer 去重消化崩溃窗口；P7 不引入跨子系统二阶段提交。
-- `deferred-with-owner: P7-followup`：ToolRuntime 路径 trace 真实化。当前 stub smoke 不能注入
-  `TOOL_RESULT_TRUNCATED` / `TOOL_FETCH_MORE_*` 这类 Host-owned canonical fact；该路径需要
-  真实 ToolRuntime smoke 或 truncation 专属 smoke 串通，并在 trace 中验证 `truncation_*` /
-  `fetch_more_*` 维度的 idempotency_key + cursor 链路。
-- `deferred-with-owner: P7-followup`：ToolRuntime 派生事件未携带 `iteration_id`。当前
-  `_iteration_id_for_tool_runtime` 用空字符串占位作为 group key 维度，与 OLD 行为一致；
-  待 ToolRuntime 事件携带 iteration_id 后切换。
 - `deferred-with-owner: P7-followup`：compact 重试路径合成 `RunInputContextSnapshotBuiltData`
   时的 `iteration_index` / `attempt_index` 取值需要与真实 Engine attempt 元信息对齐验证，
   避免 trace `iteration_context_snapshot` 字段在 compact retry 后语义偏移。

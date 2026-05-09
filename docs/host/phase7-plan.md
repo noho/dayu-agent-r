@@ -369,6 +369,8 @@ P7 observer 只消费：
 - `RunEventType.RUN_INPUT_CONTEXT_SNAPSHOT_BUILT`
 - 必要时读取 Host-owned failure terminal 作为 close / missing result 补偿信号。
 
+> ToolRuntime 派生事件（`TOOL_RESULT_TRUNCATED` / `TOOL_CURSOR_ISSUED` / `TOOL_FETCH_MORE_*` / `TOOL_CURSOR_EXPIRED` / `TOOL_CURSOR_DENIED`）的 data payload 必须携带 `iteration_id` 字段：业务工具截断/cursor 事件用 ToolExecutionRequest.context 的 iteration_id；framework `fetch_more` 自身派生事件用 fetch_more 这次 framework tool call 的 iteration_id（与原始业务工具的 iteration_id 通过 cursor / scope_token / parent_cursor 关联，但事件归属解耦）。`_tool_call_group_key` 以 `(iteration_id, tool_call_id)` 作为 group 真源。
+
 P7 不消费 preview delta、reasoning delta、content delta 全量，避免 trace 变成大内容仓库。
 
 需要特别测试：

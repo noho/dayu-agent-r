@@ -61,7 +61,6 @@ from dayu.host._tool_trace_jsonl_sink import (
     now_iso,
 )
 from dayu.host.contracts import (
-    RunEvent,
     RunEventKind,
     RunEventSource,
     RunEventType,
@@ -606,38 +605,17 @@ def _tool_call_group_key(
     if isinstance(data, ToolResultAcceptedData):
         return (data.iteration_id, data.tool_call_id)
     if isinstance(data, ToolResultTruncatedData):
-        return (_iteration_id_for_tool_runtime(envelope=envelope),
-                data.tool_call_id)
+        return (data.iteration_id, data.tool_call_id)
     if isinstance(data, ToolFetchMoreCompletedData):
-        return (_iteration_id_for_tool_runtime(envelope=envelope),
-                data.tool_call_id)
+        return (data.iteration_id, data.tool_call_id)
     if isinstance(data, ToolCursorDeniedData):
-        return (_iteration_id_for_tool_runtime(envelope=envelope),
-                data.tool_call_id)
+        return (data.iteration_id, data.tool_call_id)
     if isinstance(data, ToolCursorExpiredData):
-        return (_iteration_id_for_tool_runtime(envelope=envelope),
-                data.tool_call_id)
+        return (data.iteration_id, data.tool_call_id)
     raise ProjectionSchemaError(
         f"unexpected tool-dimension event data type: "
         f"{type(data).__name__}"
     )
-
-
-def _iteration_id_for_tool_runtime(
-    *, envelope: ProjectionEventEnvelope
-) -> str:
-    """ToolRuntime 事件不携带 iteration_id；用空字符串作为 group key 维度。
-
-    后续 P7 若 ToolRuntime 事件携带 iteration_id，可在此切换。当前
-    OLD trace 也按 ``(tool_call_id)`` 维度聚合，行为一致。
-
-    :param envelope: 事件 envelope。
-    :returns: iteration_id 占位值。
-    :raises Exception: 不主动抛出异常。
-    """
-
-    _ = envelope
-    return ""
 
 
 def _summarize_outcome(

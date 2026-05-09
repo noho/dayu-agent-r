@@ -309,6 +309,9 @@ class ToolValueSizeSummary:
 class ToolResultTruncatedData:
     """工具结果已截断事实。
 
+    :param iteration_id: 工具调用所属 Engine iteration id。语义上该截断事实
+        归属于发起 tool call 的那一次 iteration，与 ``ToolCallRequestedData``
+        的 ``iteration_id`` 同源。
     :param tool_name: 工具名。
     :param tool_call_id: 原始工具调用 id。
     :param strategy: 截断策略。
@@ -321,6 +324,7 @@ class ToolResultTruncatedData:
     :param value_summary: 截断后返回值大小摘要。
     """
 
+    iteration_id: str
     tool_name: str
     tool_call_id: str
     strategy: str
@@ -337,6 +341,9 @@ class ToolResultTruncatedData:
 class ToolCursorIssuedData:
     """工具补读 cursor 已签发事实。
 
+    :param iteration_id: cursor 签发所属 Engine iteration id。首次截断时与
+        发起原始 tool call 的 iteration 同源；fetch_more 派生 cursor 时与
+        framework ``fetch_more`` 这次 tool call 的 iteration 同源。
     :param tool_name: 工具名。
     :param tool_call_id: 原始工具调用 id。
     :param cursor_fingerprint: cursor 指纹。
@@ -351,6 +358,7 @@ class ToolCursorIssuedData:
     :param single_use: 是否单次有效。
     """
 
+    iteration_id: str
     tool_name: str
     tool_call_id: str
     cursor_fingerprint: str
@@ -368,11 +376,15 @@ class ToolCursorIssuedData:
 class ToolFetchMoreRequestedData:
     """工具补读请求事实。
 
+    :param iteration_id: 发起 framework ``fetch_more`` tool call 所在 Engine
+        iteration id。``fetch_more`` 是模型在某个 iteration 主动发起的普通
+        tool call，因此事件归属该 iteration，而不是原始截断业务工具的 iteration。
     :param tool_call_id: 原始工具调用 id。
     :param cursor_fingerprint: cursor 指纹。
     :param requested_limit: 调用方请求的 limit。
     """
 
+    iteration_id: str
     tool_call_id: str
     cursor_fingerprint: str
     requested_limit: int | None
@@ -382,6 +394,8 @@ class ToolFetchMoreRequestedData:
 class ToolFetchMoreCompletedData:
     """工具补读完成事实。
 
+    :param iteration_id: 发起 framework ``fetch_more`` tool call 所在 Engine
+        iteration id。
     :param tool_name: 工具名。
     :param tool_call_id: 原始工具调用 id。
     :param consumed_cursor_fingerprint: 已消费 cursor 指纹。
@@ -392,6 +406,7 @@ class ToolFetchMoreCompletedData:
     :param value_summary: 本次返回值大小摘要。
     """
 
+    iteration_id: str
     tool_name: str
     tool_call_id: str
     consumed_cursor_fingerprint: str
@@ -406,6 +421,8 @@ class ToolFetchMoreCompletedData:
 class ToolFetchMoreFailedData:
     """工具补读失败事实。
 
+    :param iteration_id: 发起 framework ``fetch_more`` tool call 所在 Engine
+        iteration id。
     :param tool_call_id: 原始工具调用 id。
     :param cursor_fingerprint: cursor 指纹。
     :param error_code: 失败错误码。
@@ -414,6 +431,7 @@ class ToolFetchMoreFailedData:
     :param expired: 是否为 cursor 过期。
     """
 
+    iteration_id: str
     tool_call_id: str
     cursor_fingerprint: str
     error_code: str
@@ -426,11 +444,15 @@ class ToolFetchMoreFailedData:
 class ToolCursorExpiredData:
     """工具补读 cursor 过期事实。
 
+    :param iteration_id: 触发过期检测的 Engine iteration id；由发起 framework
+        ``fetch_more`` 的 iteration 携带，与 ``ToolFetchMoreRequestedData``
+        同源。
     :param tool_call_id: 原始工具调用 id。
     :param cursor_fingerprint: cursor 指纹。
     :param expired_at_monotonic: cursor 过期时间。
     """
 
+    iteration_id: str
     tool_call_id: str
     cursor_fingerprint: str
     expired_at_monotonic: float
@@ -440,11 +462,14 @@ class ToolCursorExpiredData:
 class ToolCursorDeniedData:
     """工具补读 cursor 拒绝事实。
 
+    :param iteration_id: 触发拒绝检测的 Engine iteration id；由发起 framework
+        ``fetch_more`` 或 handle 读取的 iteration 携带。
     :param tool_call_id: 原始工具调用 id。
     :param cursor_fingerprint: cursor 指纹。
     :param reason: 拒绝原因。
     """
 
+    iteration_id: str
     tool_call_id: str
     cursor_fingerprint: str
     reason: str
@@ -821,12 +846,15 @@ class ToolFetchMoreHandleRequest:
 
     :param session_id: 会话 id。
     :param run_id: Run id。
+    :param iteration_id: 当前调用方所在 Engine iteration id；用于 ToolRuntime
+        派生事件携带准确的 iteration 维度，避免 trace projection 失配。
     :param tool_call_id: 原始工具调用 id。
     :param cursor_fingerprint: RunEvent 中暴露的 cursor 指纹。
     """
 
     session_id: str
     run_id: str
+    iteration_id: str
     tool_call_id: str
     cursor_fingerprint: str
 
@@ -903,6 +931,8 @@ class ToolFetchMoreRequest:
 
     :param session_id: 会话 id。
     :param run_id: Run id。
+    :param iteration_id: 当前调用方所在 Engine iteration id；用于 ToolRuntime
+        派生事件携带准确的 iteration 维度。
     :param tool_call_id: 原始工具调用 id。
     :param cursor: ToolRuntime cursor。
     :param scope_token: 受控 handle 中携带的 scope token。
@@ -911,6 +941,7 @@ class ToolFetchMoreRequest:
 
     session_id: str
     run_id: str
+    iteration_id: str
     tool_call_id: str
     cursor: ToolRuntimeCursor
     scope_token: str

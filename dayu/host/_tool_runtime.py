@@ -516,6 +516,7 @@ class InMemoryToolRuntime:
         return ToolFetchMoreRequest(
             session_id=request.context.session_id,
             run_id=request.context.run_id,
+            iteration_id=request.context.iteration_id,
             tool_call_id=(
                 record.tool_call_id
                 if record is not None
@@ -570,6 +571,7 @@ class InMemoryToolRuntime:
             await self._append_cursor_denied(
                 record=record,
                 reason=denied_reason,
+                iteration_id=request.iteration_id,
             )
             return _handle_failure(
                 request=request,
@@ -580,7 +582,10 @@ class InMemoryToolRuntime:
         now = self.clock()
         if record.expires_at_monotonic <= now:
             self._remove_cursor(record.cursor)
-            await self._append_cursor_expired(record=record)
+            await self._append_cursor_expired(
+                record=record,
+                iteration_id=request.iteration_id,
+            )
             return _handle_failure(
                 request=request,
                 error_code=_ERROR_CURSOR_EXPIRED,
@@ -647,6 +652,7 @@ class InMemoryToolRuntime:
                 await self._append_cursor_denied(
                     record=record,
                     reason=binding_reason,
+                    iteration_id=request.iteration_id,
                 )
                 return await self._fetch_failure(
                     request=request,
@@ -663,7 +669,10 @@ class InMemoryToolRuntime:
             now = self.clock()
             if record.expires_at_monotonic <= now:
                 self._remove_cursor(record.cursor)
-                await self._append_cursor_expired(record=record)
+                await self._append_cursor_expired(
+                    record=record,
+                    iteration_id=request.iteration_id,
+                )
                 return await self._fetch_failure(
                     request=request,
                     record=record,
@@ -680,6 +689,7 @@ class InMemoryToolRuntime:
                 await self._append_cursor_denied(
                     record=record,
                     reason=denied_reason,
+                    iteration_id=request.iteration_id,
                 )
                 return await self._fetch_failure(
                     request=request,
@@ -706,6 +716,7 @@ class InMemoryToolRuntime:
                     record=record,
                     offset=new_offset,
                     parent_cursor_fingerprint=record.cursor_fingerprint,
+                    iteration_id=request.iteration_id,
                 )
                 next_cursor = ToolRuntimeCursor(
                     value=cursor_creation.record.cursor,
@@ -802,6 +813,7 @@ class InMemoryToolRuntime:
         return self._create_cursor(
             session_id=request.context.session_id,
             run_id=request.context.run_id,
+            iteration_id=request.context.iteration_id,
             tool_call_id=request.context.tool_call_id,
             tool_name=request.call.name,
             strategy=spec.strategy,
@@ -823,12 +835,15 @@ class InMemoryToolRuntime:
         record: _CursorRecord,
         offset: int,
         parent_cursor_fingerprint: str,
+        iteration_id: str,
     ) -> _CursorCreation:
         """从旧 cursor 记录派生下一页 cursor。
 
         :param record: 已消费 cursor 记录。
         :param offset: 下一页起始 offset。
         :param parent_cursor_fingerprint: 父 cursor 指纹。
+        :param iteration_id: 派生 cursor 所属 Engine iteration id；通常为
+            正在调用 framework ``fetch_more`` 的 iteration。
         :returns: 新 cursor 创建结果。
         :raises Exception: 不主动抛出异常。
         """
@@ -836,6 +851,7 @@ class InMemoryToolRuntime:
         return self._create_cursor(
             session_id=record.session_id,
             run_id=record.run_id,
+            iteration_id=iteration_id,
             tool_call_id=record.tool_call_id,
             tool_name=record.tool_name,
             strategy=record.strategy,
@@ -857,6 +873,7 @@ class InMemoryToolRuntime:
         *,
         session_id: str,
         run_id: str,
+        iteration_id: str,
         tool_call_id: str,
         tool_name: str,
         strategy: str,
@@ -940,6 +957,7 @@ class InMemoryToolRuntime:
         return _CursorCreation(
             record=record,
             issued_event=ToolCursorIssuedData(
+                iteration_id=iteration_id,
                 tool_name=tool_name,
                 tool_call_id=tool_call_id,
                 cursor_fingerprint=cursor_fingerprint,
@@ -1061,6 +1079,7 @@ class InMemoryToolRuntime:
                 type=RunEventType.TOOL_RESULT_TRUNCATED,
                 occurred_at=datetime.now(tz=timezone.utc),
                 data=ToolResultTruncatedData(
+                    iteration_id=request.context.iteration_id,
                     tool_name=record.tool_name,
                     tool_call_id=record.tool_call_id,
                     strategy=record.strategy,
@@ -1137,6 +1156,7 @@ class InMemoryToolRuntime:
                 type=RunEventType.TOOL_FETCH_MORE_REQUESTED,
                 occurred_at=datetime.now(tz=timezone.utc),
                 data=ToolFetchMoreRequestedData(
+                    iteration_id=request.iteration_id,
                     tool_call_id=record.tool_call_id,
                     cursor_fingerprint=record.cursor_fingerprint,
                     requested_limit=request.limit,
@@ -1179,6 +1199,7 @@ class InMemoryToolRuntime:
                 type=RunEventType.TOOL_FETCH_MORE_COMPLETED,
                 occurred_at=datetime.now(tz=timezone.utc),
                 data=ToolFetchMoreCompletedData(
+                    iteration_id=request.iteration_id,
                     tool_name=record.tool_name,
                     tool_call_id=record.tool_call_id,
                     consumed_cursor_fingerprint=record.cursor_fingerprint,
@@ -1204,10 +1225,13 @@ class InMemoryToolRuntime:
         self,
         *,
         record: _CursorRecord,
+        iteration_id: str,
     ) -> RunEventCursor:
         """追加 cursor 过期事实。
 
         :param record: cursor 记录。
+        :param iteration_id: 触发过期检测的 Engine iteration id；语义上属于
+            正在调用 framework ``fetch_more`` 或 handle 读取路径的 iteration。
         :returns: RunEvent cursor。
         :raises Exception: append 失败时透传。
         """
@@ -1221,6 +1245,7 @@ class InMemoryToolRuntime:
                 type=RunEventType.TOOL_CURSOR_EXPIRED,
                 occurred_at=datetime.now(tz=timezone.utc),
                 data=ToolCursorExpiredData(
+                    iteration_id=iteration_id,
                     tool_call_id=record.tool_call_id,
                     cursor_fingerprint=record.cursor_fingerprint,
                     expired_at_monotonic=record.expires_at_monotonic,
@@ -1235,11 +1260,13 @@ class InMemoryToolRuntime:
         *,
         record: _CursorRecord,
         reason: str,
+        iteration_id: str,
     ) -> RunEventCursor:
         """追加 cursor 拒绝事实。
 
         :param record: cursor owner 记录。
         :param reason: 拒绝原因。
+        :param iteration_id: 触发拒绝检测的 Engine iteration id。
         :returns: RunEvent cursor。
         :raises Exception: append 失败时透传。
         """
@@ -1253,6 +1280,7 @@ class InMemoryToolRuntime:
                 type=RunEventType.TOOL_CURSOR_DENIED,
                 occurred_at=datetime.now(tz=timezone.utc),
                 data=ToolCursorDeniedData(
+                    iteration_id=iteration_id,
                     tool_call_id=record.tool_call_id,
                     cursor_fingerprint=record.cursor_fingerprint,
                     reason=reason,
@@ -1293,6 +1321,7 @@ class InMemoryToolRuntime:
                 type=RunEventType.TOOL_FETCH_MORE_FAILED,
                 occurred_at=datetime.now(tz=timezone.utc),
                 data=ToolFetchMoreFailedData(
+                    iteration_id=request.iteration_id,
                     tool_call_id=record.tool_call_id,
                     cursor_fingerprint=record.cursor_fingerprint,
                     error_code=error_code,

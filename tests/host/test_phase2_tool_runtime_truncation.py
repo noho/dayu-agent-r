@@ -405,6 +405,7 @@ async def test_binary_bytes_fetch_more_returns_base64_json_string() -> None:
     )
     handle = await runtime.get_tool_fetch_more_handle(
         ToolFetchMoreHandleRequest(
+            iteration_id="iter_1",
             session_id="session_1",
             run_id="run_1",
             tool_call_id="tc_1",
@@ -415,6 +416,7 @@ async def test_binary_bytes_fetch_more_returns_base64_json_string() -> None:
 
     result = await runtime.fetch_more(
         ToolFetchMoreRequest(
+            iteration_id="iter_1",
             session_id="session_1",
             run_id="run_1",
             tool_call_id="tc_1",
@@ -573,6 +575,7 @@ async def test_fetch_more_single_use_limit_clamp_and_next_cursor() -> None:
     )
     handle_result = await runtime.get_tool_fetch_more_handle(
         ToolFetchMoreHandleRequest(
+            iteration_id="iter_1",
             session_id="session_1",
             run_id="run_1",
             tool_call_id="tc_1",
@@ -583,6 +586,7 @@ async def test_fetch_more_single_use_limit_clamp_and_next_cursor() -> None:
 
     first = await runtime.fetch_more(
         ToolFetchMoreRequest(
+            iteration_id="iter_1",
             session_id="session_1",
             run_id="run_1",
             tool_call_id="tc_1",
@@ -597,6 +601,7 @@ async def test_fetch_more_single_use_limit_clamp_and_next_cursor() -> None:
 
     reused = await runtime.fetch_more(
         ToolFetchMoreRequest(
+            iteration_id="iter_1",
             session_id="session_1",
             run_id="run_1",
             tool_call_id="tc_1",
@@ -611,6 +616,7 @@ async def test_fetch_more_single_use_limit_clamp_and_next_cursor() -> None:
 
     next_handle = await runtime.get_tool_fetch_more_handle(
         ToolFetchMoreHandleRequest(
+            iteration_id="iter_1",
             session_id="session_1",
             run_id="run_1",
             tool_call_id="tc_1",
@@ -620,6 +626,7 @@ async def test_fetch_more_single_use_limit_clamp_and_next_cursor() -> None:
     assert isinstance(next_handle, ToolFetchMoreHandleSucceededResult)
     second = await runtime.fetch_more(
         ToolFetchMoreRequest(
+            iteration_id="iter_1",
             session_id="session_1",
             run_id="run_1",
             tool_call_id="tc_1",
@@ -648,6 +655,7 @@ async def test_concurrent_fetch_more_same_cursor_is_single_use() -> None:
     )
     handle = await runtime.get_tool_fetch_more_handle(
         ToolFetchMoreHandleRequest(
+            iteration_id="iter_1",
             session_id="session_1",
             run_id="run_1",
             tool_call_id="tc_1",
@@ -656,6 +664,7 @@ async def test_concurrent_fetch_more_same_cursor_is_single_use() -> None:
     )
     assert isinstance(handle, ToolFetchMoreHandleSucceededResult)
     request = ToolFetchMoreRequest(
+        iteration_id="iter_1",
         session_id="session_1",
         run_id="run_1",
         tool_call_id="tc_1",
@@ -736,6 +745,7 @@ async def test_ttl_expired_and_opportunistic_cleanup() -> None:
     )
     handle = await runtime.get_tool_fetch_more_handle(
         ToolFetchMoreHandleRequest(
+            iteration_id="iter_1",
             session_id="session_1",
             run_id="run_1",
             tool_call_id="tc_1",
@@ -747,6 +757,7 @@ async def test_ttl_expired_and_opportunistic_cleanup() -> None:
 
     expired = await runtime.fetch_more(
         ToolFetchMoreRequest(
+            iteration_id="iter_1",
             session_id="session_1",
             run_id="run_1",
             tool_call_id="tc_1",
@@ -762,6 +773,7 @@ async def test_ttl_expired_and_opportunistic_cleanup() -> None:
     await runtime.execute_tool_call(_request(run_id="run_2", tool_call_id="tc_2"))
     stale_handle = await runtime.get_tool_fetch_more_handle(
         ToolFetchMoreHandleRequest(
+            iteration_id="iter_1",
             session_id="session_1",
             run_id="run_1",
             tool_call_id="tc_1",

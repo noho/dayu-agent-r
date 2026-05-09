@@ -396,6 +396,7 @@ def _encode_fields(
         }
     if isinstance(data, ToolResultTruncatedData):
         return {
+            "iteration_id": data.iteration_id,
             "tool_name": data.tool_name,
             "tool_call_id": data.tool_call_id,
             "strategy": data.strategy,
@@ -409,6 +410,7 @@ def _encode_fields(
         }
     if isinstance(data, ToolCursorIssuedData):
         return {
+            "iteration_id": data.iteration_id,
             "tool_name": data.tool_name,
             "tool_call_id": data.tool_call_id,
             "cursor_fingerprint": data.cursor_fingerprint,
@@ -423,12 +425,14 @@ def _encode_fields(
         }
     if isinstance(data, ToolFetchMoreRequestedData):
         return {
+            "iteration_id": data.iteration_id,
             "tool_call_id": data.tool_call_id,
             "cursor_fingerprint": data.cursor_fingerprint,
             "requested_limit": data.requested_limit,
         }
     if isinstance(data, ToolFetchMoreCompletedData):
         return {
+            "iteration_id": data.iteration_id,
             "tool_name": data.tool_name,
             "tool_call_id": data.tool_call_id,
             "consumed_cursor_fingerprint": data.consumed_cursor_fingerprint,
@@ -440,6 +444,7 @@ def _encode_fields(
         }
     if isinstance(data, ToolFetchMoreFailedData):
         return {
+            "iteration_id": data.iteration_id,
             "tool_call_id": data.tool_call_id,
             "cursor_fingerprint": data.cursor_fingerprint,
             "error_code": data.error_code,
@@ -449,12 +454,14 @@ def _encode_fields(
         }
     if isinstance(data, ToolCursorExpiredData):
         return {
+            "iteration_id": data.iteration_id,
             "tool_call_id": data.tool_call_id,
             "cursor_fingerprint": data.cursor_fingerprint,
             "expired_at_monotonic": data.expired_at_monotonic,
         }
     if isinstance(data, ToolCursorDeniedData):
         return {
+            "iteration_id": data.iteration_id,
             "tool_call_id": data.tool_call_id,
             "cursor_fingerprint": data.cursor_fingerprint,
             "reason": data.reason,
@@ -660,6 +667,7 @@ def _decode_fields(
         )
     if event_type is RunEventType.TOOL_RESULT_TRUNCATED:
         return ToolResultTruncatedData(
+            iteration_id=_get_str(fields, "iteration_id"),
             tool_name=_get_str(fields, "tool_name"),
             tool_call_id=_get_str(fields, "tool_call_id"),
             strategy=_get_str(fields, "strategy"),
@@ -673,6 +681,7 @@ def _decode_fields(
         )
     if event_type is RunEventType.TOOL_CURSOR_ISSUED:
         return ToolCursorIssuedData(
+            iteration_id=_get_str(fields, "iteration_id"),
             tool_name=_get_str(fields, "tool_name"),
             tool_call_id=_get_str(fields, "tool_call_id"),
             cursor_fingerprint=_get_str(fields, "cursor_fingerprint"),
@@ -689,12 +698,14 @@ def _decode_fields(
         )
     if event_type is RunEventType.TOOL_FETCH_MORE_REQUESTED:
         return ToolFetchMoreRequestedData(
+            iteration_id=_get_str(fields, "iteration_id"),
             tool_call_id=_get_str(fields, "tool_call_id"),
             cursor_fingerprint=_get_str(fields, "cursor_fingerprint"),
             requested_limit=_get_optional_int(fields, "requested_limit"),
         )
     if event_type is RunEventType.TOOL_FETCH_MORE_COMPLETED:
         return ToolFetchMoreCompletedData(
+            iteration_id=_get_str(fields, "iteration_id"),
             tool_name=_get_str(fields, "tool_name"),
             tool_call_id=_get_str(fields, "tool_call_id"),
             consumed_cursor_fingerprint=_get_str(
@@ -710,6 +721,7 @@ def _decode_fields(
         )
     if event_type is RunEventType.TOOL_FETCH_MORE_FAILED:
         return ToolFetchMoreFailedData(
+            iteration_id=_get_str(fields, "iteration_id"),
             tool_call_id=_get_str(fields, "tool_call_id"),
             cursor_fingerprint=_get_str(fields, "cursor_fingerprint"),
             error_code=_get_str(fields, "error_code"),
@@ -719,12 +731,14 @@ def _decode_fields(
         )
     if event_type is RunEventType.TOOL_CURSOR_EXPIRED:
         return ToolCursorExpiredData(
+            iteration_id=_get_str(fields, "iteration_id"),
             tool_call_id=_get_str(fields, "tool_call_id"),
             cursor_fingerprint=_get_str(fields, "cursor_fingerprint"),
             expired_at_monotonic=_get_float(fields, "expired_at_monotonic"),
         )
     if event_type is RunEventType.TOOL_CURSOR_DENIED:
         return ToolCursorDeniedData(
+            iteration_id=_get_str(fields, "iteration_id"),
             tool_call_id=_get_str(fields, "tool_call_id"),
             cursor_fingerprint=_get_str(fields, "cursor_fingerprint"),
             reason=_get_str(fields, "reason"),

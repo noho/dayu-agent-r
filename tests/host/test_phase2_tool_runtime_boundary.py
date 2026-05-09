@@ -206,6 +206,7 @@ async def test_scope_token_delivered_only_by_handle_not_eventlog() -> None:
     truncated = cast(ToolResultTruncatedData, events[0].data)
     handle = await runtime.get_tool_fetch_more_handle(
         ToolFetchMoreHandleRequest(
+            iteration_id="iter_1",
             session_id="session_1",
             run_id="run_1",
             tool_call_id="tc_1",
@@ -217,6 +218,7 @@ async def test_scope_token_delivered_only_by_handle_not_eventlog() -> None:
 
     result = await runtime.fetch_more(
         ToolFetchMoreRequest(
+            iteration_id="iter_1",
             session_id="session_1",
             run_id="run_1",
             tool_call_id="tc_1",
@@ -241,6 +243,7 @@ async def test_scope_binding_rejects_cross_session_run_or_tool_call() -> None:
     )
     good = await runtime.get_tool_fetch_more_handle(
         ToolFetchMoreHandleRequest(
+            iteration_id="iter_1",
             session_id="session_1",
             run_id="run_1",
             tool_call_id="tc_1",
@@ -256,6 +259,7 @@ async def test_scope_binding_rejects_cross_session_run_or_tool_call() -> None:
     ):
         denied = await runtime.fetch_more(
             ToolFetchMoreRequest(
+                iteration_id="iter_1",
                 session_id=session_id,
                 run_id=run_id,
                 tool_call_id=tool_call_id,
@@ -280,6 +284,7 @@ async def test_cross_run_fetch_more_does_not_pollute_claimed_run() -> None:
     )
     good = await runtime.get_tool_fetch_more_handle(
         ToolFetchMoreHandleRequest(
+            iteration_id="iter_1",
             session_id="session_1",
             run_id="run_1",
             tool_call_id="tc_1",
@@ -290,6 +295,7 @@ async def test_cross_run_fetch_more_does_not_pollute_claimed_run() -> None:
 
     denied = await runtime.fetch_more(
         ToolFetchMoreRequest(
+            iteration_id="iter_1",
             session_id="session_1",
             run_id="run_2",
             tool_call_id="tc_1",

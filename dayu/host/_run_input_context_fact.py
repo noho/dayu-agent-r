@@ -197,11 +197,10 @@ def _build_message_summaries(
 
     summaries: list[RunInputMessageSummary] = []
     seen_first_system = False
-    for index, message in enumerate(messages):
+    for message in messages:
         text = _message_text(message)
         source_kind = _resolve_source_kind(
             message=message,
-            index=index,
             seen_first_system=seen_first_system,
         )
         if isinstance(message, SystemMessage) and not seen_first_system:
@@ -222,7 +221,6 @@ def _build_message_summaries(
 def _resolve_source_kind(
     *,
     message: AgentMessage,
-    index: int,
     seen_first_system: bool,
 ) -> str:
     """判定消息来源类别。
@@ -234,7 +232,6 @@ def _resolve_source_kind(
     ToolMessage 归 ``tool_result``。
 
     :param message: 当前消息。
-    :param index: 消息位置。
     :param seen_first_system: 在当前位置之前是否已出现过 SystemMessage。
     :returns: source_kind 字面量。
     :raises Exception: 不主动抛出异常。
@@ -242,8 +239,6 @@ def _resolve_source_kind(
 
     if isinstance(message, SystemMessage):
         # 第一条 SystemMessage 视作 caller_system；其余视为 memory_block。
-        if not seen_first_system and index == 0:
-            return _SOURCE_KIND_CALLER_SYSTEM
         if not seen_first_system:
             return _SOURCE_KIND_CALLER_SYSTEM
         return _SOURCE_KIND_MEMORY_BLOCK
