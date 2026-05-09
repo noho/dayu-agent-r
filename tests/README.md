@@ -163,12 +163,27 @@ Host 当前 Run harness、RunEventStore、ToolRuntime、Conversation Memory / Ru
     覆盖 `harness.start_run` -> Engine event stream -> append -> terminal -> coordinator.drain
     端到端路径,守护 attempt 终态写入、observer caught_up、共享 memory store 无 split-brain、
     RunResult 快照可读。
+- P7 tool trace projection（`tests/host/test_phase7_*.py`）：覆盖
+  `RunInputContextFactBuilder` 派生 ``RUN_INPUT_CONTEXT_SNAPSHOT_BUILT`` canonical
+  fact、`ToolTraceJsonlSink` JSONL + raw payload blob 落盘、provider secret
+  scrub、`ToolTraceObserver` 5 类 record 派发、``DurableHarnessConfig.tool_trace_path``
+  装配开关与 ``tool_trace_v2_host`` schema 字面量边界。
 - public boundary：锁定 `dayu.host.__all__`，允许 Run 级 `start_run`、`stream_run_events`、`get_run_result`，
   以及 P2 Run 级 `get_tool_fetch_more_handle`、`fetch_more_tool_result`，阻止 `EngineWorker`、`LocalProxy`、
   `ToolExecutor`、`InMemoryToolRuntime`、`ToolRuntimeToolExecutor`、`InMemoryConversationMemoryStore`、
   `DefaultRunInputBuilder`、`RunInputBuildTrace`、`run_agent_messages` 泄漏为包根 API。
 - import boundary：阻止 Host 导入 `dayu.fins`、`dayu.service`、`dayu.ui`。
 - weak typing guard：扫描 `dayu.host` 源码，阻止 `Any`、`object`、无类型签名与裸容器注解。
+
+### `tests/utils/`
+
+`utils/` 下分析脚本的单元测试，覆盖：
+
+- `test_analyze_tool_trace_host.py`：验证 P7 trace analyzer
+  (`utils/analyze_tool_trace_host.py`) 按 ``idempotency_key`` 去重、严格拒绝
+  OLD ``tool_trace_v2`` schema、检测重复 tool_call、truncation 后未续读
+  fetch_more、fetch_more 引用未知 cursor、provider_protocol_error 计数、
+  final_response 是否存在与同 run 内 ``source_event_position`` 单调性。
 
 ### `tests/engine/contracts/`
 

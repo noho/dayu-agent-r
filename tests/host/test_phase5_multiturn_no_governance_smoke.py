@@ -523,6 +523,7 @@ async def test_phase5_sequential_multiturn_stitches_eventlog_toolruntime_memory(
     assert fetch_completed.next_cursor_fingerprint is not None
     next_handle = await harness.get_tool_fetch_more_handle(
         ToolFetchMoreHandleRequest(
+            iteration_id="iter-0",
             session_id=_SESSION_ID,
             run_id=_RUN_1,
             tool_call_id=cursor.tool_call_id,
@@ -537,6 +538,7 @@ async def test_phase5_sequential_multiturn_stitches_eventlog_toolruntime_memory(
     event_count_before = len(await harness.event_store.list_events(_RUN_1, after=None))
     post_terminal = await harness.fetch_more_tool_result(
         ToolFetchMoreRequest(
+            iteration_id="iter-0",
             session_id=_SESSION_ID,
             run_id=_RUN_1,
             tool_call_id=cursor.tool_call_id,

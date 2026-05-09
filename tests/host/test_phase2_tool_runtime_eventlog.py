@@ -193,6 +193,7 @@ async def test_fetch_more_event_order_and_return_event_cursor() -> None:
     truncated = cast(ToolResultTruncatedData, first_event.data)
     handle = await runtime.get_tool_fetch_more_handle(
         ToolFetchMoreHandleRequest(
+            iteration_id="iter_1",
             session_id="session_1",
             run_id="run_1",
             tool_call_id="tc_1",
@@ -203,6 +204,7 @@ async def test_fetch_more_event_order_and_return_event_cursor() -> None:
 
     result = await runtime.fetch_more(
         ToolFetchMoreRequest(
+            iteration_id="iter_1",
             session_id="session_1",
             run_id="run_1",
             tool_call_id="tc_1",
@@ -242,6 +244,7 @@ async def test_denied_fetch_more_appends_denied_and_failed_facts() -> None:
     )
     handle = await runtime.get_tool_fetch_more_handle(
         ToolFetchMoreHandleRequest(
+            iteration_id="iter_1",
             session_id="session_1",
             run_id="run_1",
             tool_call_id="tc_1",
@@ -252,6 +255,7 @@ async def test_denied_fetch_more_appends_denied_and_failed_facts() -> None:
 
     result = await runtime.fetch_more(
         ToolFetchMoreRequest(
+            iteration_id="iter_1",
             session_id="session_1",
             run_id="run_1",
             tool_call_id="tc_1",
@@ -287,6 +291,7 @@ async def test_handle_denied_appends_owner_cursor_denied_fact() -> None:
 
     denied = await runtime.get_tool_fetch_more_handle(
         ToolFetchMoreHandleRequest(
+            iteration_id="iter_1",
             session_id="session_1",
             run_id="run_2",
             tool_call_id="tc_1",
@@ -324,6 +329,7 @@ async def test_handle_expired_appends_owner_cursor_expired_fact() -> None:
 
     expired = await runtime.get_tool_fetch_more_handle(
         ToolFetchMoreHandleRequest(
+            iteration_id="iter_1",
             session_id="session_1",
             run_id="run_1",
             tool_call_id="tc_1",
@@ -349,6 +355,7 @@ async def test_terminal_run_fetch_more_returns_failure_without_new_event() -> No
     )
     handle = await runtime.get_tool_fetch_more_handle(
         ToolFetchMoreHandleRequest(
+            iteration_id="iter_1",
             session_id="session_1",
             run_id="run_1",
             tool_call_id="tc_1",
@@ -377,6 +384,7 @@ async def test_terminal_run_fetch_more_returns_failure_without_new_event() -> No
 
     result = await runtime.fetch_more(
         ToolFetchMoreRequest(
+            iteration_id="iter_1",
             session_id="session_1",
             run_id="run_1",
             tool_call_id="tc_1",
@@ -425,6 +433,7 @@ async def test_terminal_run_handle_failure_does_not_append_event() -> None:
 
     result = await runtime.get_tool_fetch_more_handle(
         ToolFetchMoreHandleRequest(
+            iteration_id="iter_1",
             session_id="session_2",
             run_id="run_1",
             tool_call_id="tc_1",

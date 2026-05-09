@@ -1,4 +1,4 @@
-"""Host P6 durable harness 装配入口。
+"""Host P6/P7 durable harness 装配入口。
 
 本模块为上层（Service / smoke / 测试）提供以 :class:`DurableRunEventStore`
 为后端、并自动驱动 :class:`ProjectionCoordinator` 的 :class:`LocalRunHarness`
@@ -11,12 +11,16 @@
 - 必须在调用方使用完毕后通过返回的 ``close`` 回调释放 ``HostStorage``。
 - 默认绑定 memory / timeline / audit 三个 observer；其中 memory 是
   required projection。
+- P7：``DurableHarnessConfig.tool_trace_path`` 非空（且非空字符串）时，
+  装配 :class:`ToolTraceObserver` + :class:`ToolTraceJsonlSink` 并附加进
+  observer 元组；为 ``None`` / 空时不装配，行为与 P6 完全一致。
 """
 
 from __future__ import annotations
 
 from collections.abc import Callable
 from dataclasses import dataclass
+from pathlib import Path
 
 from dayu.contracts import ToolExecutor
 from dayu.host._audit_projection import AuditProjectionObserver
@@ -28,7 +32,7 @@ from dayu.host._durable_event_store import (
     DurableRunEventStore,
     open_durable_event_store,
 )
-from dayu.host._event_observer import ProjectionCoordinator
+from dayu.host._event_observer import ObserverSink, ProjectionCoordinator
 from dayu.host._host_storage_transaction import HostStorage
 from dayu.host._memory_projection import MemoryProjectionObserver
 from dayu.host._projection_store import ProjectionStore
@@ -38,12 +42,29 @@ from dayu.host._run_harness import (
     LocalRunHarness,
     _NoopToolExecutor,
 )
+from dayu.host._run_input_context_fact import RunInputContextFactBuilder
 from dayu.host._run_state_store import AttemptStateStore, RunStateStore
 from dayu.host._timeline_projection import TimelineProjectionObserver
 from dayu.host._tool_runtime import (
     InMemoryToolRuntime,
     ToolRuntimeToolExecutor,
 )
+from dayu.host._tool_trace_jsonl_sink import ToolTraceJsonlSink
+from dayu.host._tool_trace_projection import ToolTraceObserver
+
+
+@dataclass(frozen=True, slots=True)
+class DurableHarnessConfig:
+    """durable harness 装配配置。
+
+    :param database_path: SQLite 路径（``":memory:"`` 用于测试）。
+    :param tool_trace_path: P7 tool trace JSONL 输出根目录；``None`` 或空字
+        符串视为未配置 trace，不装配 :class:`ToolTraceObserver`，文件系统
+        也不会被创建。
+    """
+
+    database_path: str
+    tool_trace_path: str | None = None
 
 
 @dataclass(slots=True)
@@ -57,6 +78,8 @@ class DurableHarnessBundle:
     :param memory_store: 内存对话 read model。
     :param timeline_observer: timeline observer 实例（非 required）。
     :param audit_observer: audit observer 实例（非 required）。
+    :param tool_trace_observer: P7 tool trace observer；未配置 trace 时为
+        ``None``。
     :param run_state_store: Run minimal state durable store。
     :param attempt_state_store: Attempt minimal state durable store。
     :param close: 释放 storage 的回调。
@@ -69,6 +92,7 @@ class DurableHarnessBundle:
     memory_store: ConversationMemoryStore
     timeline_observer: TimelineProjectionObserver
     audit_observer: AuditProjectionObserver
+    tool_trace_observer: ToolTraceObserver | None
     run_state_store: RunStateStore
     attempt_state_store: AttemptStateStore
     close: Callable[[], None]
@@ -92,14 +116,14 @@ class DurableHarnessBundle:
 
 def build_durable_harness(
     *,
-    database_path: str,
+    config: DurableHarnessConfig,
     executor: ToolExecutor | None = None,
     memory_store: ConversationMemoryStore | None = None,
     proxy: WorkerProxy | None = None,
 ) -> DurableHarnessBundle:
     """装配 durable :class:`LocalRunHarness`。
 
-    :param database_path: SQLite 路径（``":memory:"`` 用于测试）。
+    :param config: durable harness 装配配置。
     :param executor: 自定义 ToolExecutor；默认为 ``_NoopToolExecutor``。
     :param memory_store: 自定义对话 memory store；默认为
         :class:`InMemoryConversationMemoryStore`。
@@ -109,22 +133,41 @@ def build_durable_harness(
     :raises Exception: 装配失败时透传底层异常。
     """
 
-    storage = HostStorage(database_path=database_path)
+    storage = HostStorage(database_path=config.database_path)
     event_store = open_durable_event_store(storage)
 
     actual_memory: ConversationMemoryStore = (
-        memory_store if memory_store is not None else InMemoryConversationMemoryStore()
+        memory_store if memory_store is not None
+        else InMemoryConversationMemoryStore()
     )
     memory_observer = MemoryProjectionObserver(memory_store=actual_memory)
     timeline_observer = TimelineProjectionObserver()
     audit_observer = AuditProjectionObserver()
+
+    tool_trace_observer: ToolTraceObserver | None = None
+    if config.tool_trace_path is not None and config.tool_trace_path != "":
+        jsonl_sink = ToolTraceJsonlSink(
+            root_path=Path(config.tool_trace_path)
+        )
+        tool_trace_observer = ToolTraceObserver(jsonl_sink=jsonl_sink)
+
+    observers: tuple[ObserverSink, ...]
+    if tool_trace_observer is None:
+        observers = (memory_observer, timeline_observer, audit_observer)
+    else:
+        observers = (
+            memory_observer,
+            timeline_observer,
+            audit_observer,
+            tool_trace_observer,
+        )
 
     projection_store = ProjectionStore(storage=storage)
     coordinator = ProjectionCoordinator(
         storage=storage,
         event_store=event_store,
         projection_store=projection_store,
-        observers=(memory_observer, timeline_observer, audit_observer),
+        observers=observers,
     )
 
     actual_executor: ToolExecutor = (
@@ -140,6 +183,7 @@ def build_durable_harness(
         proxy if proxy is not None
         else LocalProxy(worker=EngineWorker(ToolRuntimeToolExecutor(runtime)))
     )
+    tool_trace_enabled = tool_trace_observer is not None
     harness = LocalRunHarness(
         proxy=actual_proxy,
         event_store=event_store,
@@ -148,6 +192,10 @@ def build_durable_harness(
         coordinator=coordinator,
         attempt_state_store=attempt_state_store,
         storage=storage,
+        tool_trace_context_fact_enabled=tool_trace_enabled,
+        run_input_context_fact_builder=(
+            RunInputContextFactBuilder() if tool_trace_enabled else None
+        ),
     )
 
     return DurableHarnessBundle(
@@ -158,6 +206,7 @@ def build_durable_harness(
         memory_store=actual_memory,
         timeline_observer=timeline_observer,
         audit_observer=audit_observer,
+        tool_trace_observer=tool_trace_observer,
         run_state_store=run_state_store,
         attempt_state_store=attempt_state_store,
         close=storage.close,
@@ -166,5 +215,6 @@ def build_durable_harness(
 
 __all__ = [
     "DurableHarnessBundle",
+    "DurableHarnessConfig",
     "build_durable_harness",
 ]

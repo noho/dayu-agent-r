@@ -671,12 +671,15 @@ async def test_durable_bundle_startup_reconcile_catches_up_after_crash() -> None
     """P1 修复：模拟崩溃后只剩 EventLog + RunResult，``startup_reconcile`` 追平 read model。"""
 
     from dayu.host._conversation_memory import InMemoryConversationMemoryStore
-    from dayu.host._durable_harness import build_durable_harness
+    from dayu.host._durable_harness import (
+        DurableHarnessConfig,
+        build_durable_harness,
+    )
     from dayu.host.contracts import UserInputAcceptedData, UserInputScope
 
     memory = InMemoryConversationMemoryStore()
     bundle_a = build_durable_harness(
-        database_path=":memory:",
+        config=DurableHarnessConfig(database_path=":memory:"),
         memory_store=memory,
     )
     storage = bundle_a.storage
@@ -712,11 +715,16 @@ async def test_durable_bundle_startup_reconcile_catches_up_after_crash() -> None
 async def test_finish_attempt_if_durable_rejects_terminal_event_and_state_together() -> None:
     """``_finish_attempt_if_durable`` 同时传 terminal_event 与 state 时抛 ValueError。"""
 
-    from dayu.host._durable_harness import build_durable_harness
+    from dayu.host._durable_harness import (
+        DurableHarnessConfig,
+        build_durable_harness,
+    )
     from dayu.host._run_state_store import AttemptState
     from dayu.host.contracts import RunEvent, RunEventCursor
 
-    bundle = build_durable_harness(database_path=":memory:")
+    bundle = build_durable_harness(
+        config=DurableHarnessConfig(database_path=":memory:")
+    )
     try:
         harness = bundle.harness
         fake_event = RunEvent(

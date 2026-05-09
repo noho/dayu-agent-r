@@ -639,6 +639,7 @@ def _tool_truncated_draft(
         type=RunEventType.TOOL_RESULT_TRUNCATED,
         occurred_at=_utc_now(),
         data=ToolResultTruncatedData(
+            iteration_id="iter-0",
             tool_name="fins.lookup",
             tool_call_id="call-current",
             strategy="preview_with_cursor",

@@ -70,6 +70,10 @@ from dayu.host.contracts import (
     HostRunFailedData,
     RunEventData,
     RunEventType,
+    RunInputContextMeta,
+    RunInputContextSnapshotBuiltData,
+    RunInputMessageSummary,
+    RunInputToolSchemaSummary,
     ToolCursorDeniedData,
     ToolCursorExpiredData,
     ToolCursorIssuedData,
@@ -392,6 +396,7 @@ def _encode_fields(
         }
     if isinstance(data, ToolResultTruncatedData):
         return {
+            "iteration_id": data.iteration_id,
             "tool_name": data.tool_name,
             "tool_call_id": data.tool_call_id,
             "strategy": data.strategy,
@@ -405,6 +410,7 @@ def _encode_fields(
         }
     if isinstance(data, ToolCursorIssuedData):
         return {
+            "iteration_id": data.iteration_id,
             "tool_name": data.tool_name,
             "tool_call_id": data.tool_call_id,
             "cursor_fingerprint": data.cursor_fingerprint,
@@ -419,12 +425,14 @@ def _encode_fields(
         }
     if isinstance(data, ToolFetchMoreRequestedData):
         return {
+            "iteration_id": data.iteration_id,
             "tool_call_id": data.tool_call_id,
             "cursor_fingerprint": data.cursor_fingerprint,
             "requested_limit": data.requested_limit,
         }
     if isinstance(data, ToolFetchMoreCompletedData):
         return {
+            "iteration_id": data.iteration_id,
             "tool_name": data.tool_name,
             "tool_call_id": data.tool_call_id,
             "consumed_cursor_fingerprint": data.consumed_cursor_fingerprint,
@@ -436,6 +444,7 @@ def _encode_fields(
         }
     if isinstance(data, ToolFetchMoreFailedData):
         return {
+            "iteration_id": data.iteration_id,
             "tool_call_id": data.tool_call_id,
             "cursor_fingerprint": data.cursor_fingerprint,
             "error_code": data.error_code,
@@ -445,16 +454,20 @@ def _encode_fields(
         }
     if isinstance(data, ToolCursorExpiredData):
         return {
+            "iteration_id": data.iteration_id,
             "tool_call_id": data.tool_call_id,
             "cursor_fingerprint": data.cursor_fingerprint,
             "expired_at_monotonic": data.expired_at_monotonic,
         }
     if isinstance(data, ToolCursorDeniedData):
         return {
+            "iteration_id": data.iteration_id,
             "tool_call_id": data.tool_call_id,
             "cursor_fingerprint": data.cursor_fingerprint,
             "reason": data.reason,
         }
+    if isinstance(data, RunInputContextSnapshotBuiltData):
+        return _encode_run_input_context_snapshot(data)
     raise ValueError(f"{_ERROR_UNKNOWN_TYPE}: {type(data).__name__}")
 
 
@@ -654,6 +667,7 @@ def _decode_fields(
         )
     if event_type is RunEventType.TOOL_RESULT_TRUNCATED:
         return ToolResultTruncatedData(
+            iteration_id=_get_str(fields, "iteration_id"),
             tool_name=_get_str(fields, "tool_name"),
             tool_call_id=_get_str(fields, "tool_call_id"),
             strategy=_get_str(fields, "strategy"),
@@ -667,6 +681,7 @@ def _decode_fields(
         )
     if event_type is RunEventType.TOOL_CURSOR_ISSUED:
         return ToolCursorIssuedData(
+            iteration_id=_get_str(fields, "iteration_id"),
             tool_name=_get_str(fields, "tool_name"),
             tool_call_id=_get_str(fields, "tool_call_id"),
             cursor_fingerprint=_get_str(fields, "cursor_fingerprint"),
@@ -683,12 +698,14 @@ def _decode_fields(
         )
     if event_type is RunEventType.TOOL_FETCH_MORE_REQUESTED:
         return ToolFetchMoreRequestedData(
+            iteration_id=_get_str(fields, "iteration_id"),
             tool_call_id=_get_str(fields, "tool_call_id"),
             cursor_fingerprint=_get_str(fields, "cursor_fingerprint"),
             requested_limit=_get_optional_int(fields, "requested_limit"),
         )
     if event_type is RunEventType.TOOL_FETCH_MORE_COMPLETED:
         return ToolFetchMoreCompletedData(
+            iteration_id=_get_str(fields, "iteration_id"),
             tool_name=_get_str(fields, "tool_name"),
             tool_call_id=_get_str(fields, "tool_call_id"),
             consumed_cursor_fingerprint=_get_str(
@@ -704,6 +721,7 @@ def _decode_fields(
         )
     if event_type is RunEventType.TOOL_FETCH_MORE_FAILED:
         return ToolFetchMoreFailedData(
+            iteration_id=_get_str(fields, "iteration_id"),
             tool_call_id=_get_str(fields, "tool_call_id"),
             cursor_fingerprint=_get_str(fields, "cursor_fingerprint"),
             error_code=_get_str(fields, "error_code"),
@@ -713,16 +731,20 @@ def _decode_fields(
         )
     if event_type is RunEventType.TOOL_CURSOR_EXPIRED:
         return ToolCursorExpiredData(
+            iteration_id=_get_str(fields, "iteration_id"),
             tool_call_id=_get_str(fields, "tool_call_id"),
             cursor_fingerprint=_get_str(fields, "cursor_fingerprint"),
             expired_at_monotonic=_get_float(fields, "expired_at_monotonic"),
         )
     if event_type is RunEventType.TOOL_CURSOR_DENIED:
         return ToolCursorDeniedData(
+            iteration_id=_get_str(fields, "iteration_id"),
             tool_call_id=_get_str(fields, "tool_call_id"),
             cursor_fingerprint=_get_str(fields, "cursor_fingerprint"),
             reason=_get_str(fields, "reason"),
         )
+    if event_type is RunEventType.RUN_INPUT_CONTEXT_SNAPSHOT_BUILT:
+        return _decode_run_input_context_snapshot(fields)
     raise ValueError(f"{_ERROR_UNKNOWN_TYPE}: {event_type.value}")
 
 
@@ -1085,6 +1107,195 @@ def _decode_value_summary(value: JsonValue) -> ToolValueSizeSummary:
     )
 
 
+def _encode_run_input_message_summary(
+    summary: RunInputMessageSummary,
+) -> Mapping[str, JsonValue]:
+    """编码 RunInputMessageSummary。
+
+    :param summary: 单条消息摘要。
+    :returns: JSON 表达。
+    :raises Exception: 不主动抛出异常。
+    """
+
+    return {
+        "role": summary.role,
+        "source_kind": summary.source_kind,
+        "excerpt": summary.excerpt,
+        "content_hash": summary.content_hash,
+        "char_size": summary.char_size,
+        "token_estimate": summary.token_estimate,
+    }
+
+
+def _decode_run_input_message_summary(
+    value: JsonValue,
+) -> RunInputMessageSummary:
+    """解码 RunInputMessageSummary。
+
+    :param value: JSON 表达。
+    :returns: RunInputMessageSummary。
+    :raises ValueError: 字段非法时抛出。
+    """
+
+    if not isinstance(value, dict):
+        raise ValueError(_ERROR_INVALID_FIELDS)
+    return RunInputMessageSummary(
+        role=_get_str(value, "role"),
+        source_kind=_get_str(value, "source_kind"),
+        excerpt=_get_str(value, "excerpt"),
+        content_hash=_get_str(value, "content_hash"),
+        char_size=_get_int(value, "char_size"),
+        token_estimate=_get_int(value, "token_estimate"),
+    )
+
+
+def _encode_run_input_tool_schema_summary(
+    summary: RunInputToolSchemaSummary,
+) -> Mapping[str, JsonValue]:
+    """编码 RunInputToolSchemaSummary。
+
+    :param summary: 工具 schema 摘要。
+    :returns: JSON 表达。
+    :raises Exception: 不主动抛出异常。
+    """
+
+    return {"name": summary.name, "schema_hash": summary.schema_hash}
+
+
+def _decode_run_input_tool_schema_summary(
+    value: JsonValue,
+) -> RunInputToolSchemaSummary:
+    """解码 RunInputToolSchemaSummary。
+
+    :param value: JSON 表达。
+    :returns: RunInputToolSchemaSummary。
+    :raises ValueError: 字段非法时抛出。
+    """
+
+    if not isinstance(value, dict):
+        raise ValueError(_ERROR_INVALID_FIELDS)
+    return RunInputToolSchemaSummary(
+        name=_get_str(value, "name"),
+        schema_hash=_get_str(value, "schema_hash"),
+    )
+
+
+def _encode_run_input_context_meta(
+    meta: RunInputContextMeta,
+) -> Mapping[str, JsonValue]:
+    """编码 RunInputContextMeta。
+
+    :param meta: 上下文摘要。
+    :returns: JSON 表达。
+    :raises Exception: 不主动抛出异常。
+    """
+
+    return {
+        "message_count": meta.message_count,
+        "role_sequence": list(meta.role_sequence),
+        "total_char_size": meta.total_char_size,
+        "total_token_estimate": meta.total_token_estimate,
+        "memory_item_count": meta.memory_item_count,
+        "current_user_run_id": meta.current_user_run_id,
+    }
+
+
+def _decode_run_input_context_meta(value: JsonValue) -> RunInputContextMeta:
+    """解码 RunInputContextMeta。
+
+    :param value: JSON 表达。
+    :returns: RunInputContextMeta。
+    :raises ValueError: 字段非法时抛出。
+    """
+
+    if not isinstance(value, dict):
+        raise ValueError(_ERROR_INVALID_FIELDS)
+    raw_seq = value.get("role_sequence")
+    if not isinstance(raw_seq, list):
+        raise ValueError(_ERROR_INVALID_FIELDS)
+    role_sequence = tuple(_must_str(item) for item in raw_seq)
+    return RunInputContextMeta(
+        message_count=_get_int(value, "message_count"),
+        role_sequence=role_sequence,
+        total_char_size=_get_int(value, "total_char_size"),
+        total_token_estimate=_get_int(value, "total_token_estimate"),
+        memory_item_count=_get_int(value, "memory_item_count"),
+        current_user_run_id=_get_str(value, "current_user_run_id"),
+    )
+
+
+def _encode_run_input_context_snapshot(
+    data: RunInputContextSnapshotBuiltData,
+) -> Mapping[str, JsonValue]:
+    """编码 RunInputContextSnapshotBuiltData。
+
+    :param data: Host-owned context snapshot fact data。
+    :returns: JSON 字段映射。
+    :raises Exception: 不主动抛出异常。
+    """
+
+    return {
+        "iteration_id": data.iteration_id,
+        "iteration_index": data.iteration_index,
+        "attempt_index": data.attempt_index,
+        "current_user_excerpt": data.current_user_excerpt,
+        "current_user_content_hash": data.current_user_content_hash,
+        "current_user_source_cursor": data.current_user_source_cursor,
+        "message_summaries": [
+            _encode_run_input_message_summary(item)
+            for item in data.message_summaries
+        ],
+        "tool_schema_summaries": [
+            _encode_run_input_tool_schema_summary(item)
+            for item in data.tool_schema_summaries
+        ],
+        "context_meta": _encode_run_input_context_meta(data.context_meta),
+        "raw_input_messages_json": data.raw_input_messages_json,
+        "raw_tool_schemas_json": data.raw_tool_schemas_json,
+        "raw_input_blob_id": data.raw_input_blob_id,
+        "raw_tool_schemas_blob_id": data.raw_tool_schemas_blob_id,
+    }
+
+
+def _decode_run_input_context_snapshot(
+    fields: Mapping[str, JsonValue],
+) -> RunInputContextSnapshotBuiltData:
+    """解码 RunInputContextSnapshotBuiltData。
+
+    :param fields: JSON 字段映射。
+    :returns: RunInputContextSnapshotBuiltData。
+    :raises ValueError: 字段非法时抛出。
+    """
+
+    raw_messages = fields.get("message_summaries")
+    if not isinstance(raw_messages, list):
+        raise ValueError(_ERROR_INVALID_FIELDS)
+    raw_schemas = fields.get("tool_schema_summaries")
+    if not isinstance(raw_schemas, list):
+        raise ValueError(_ERROR_INVALID_FIELDS)
+    return RunInputContextSnapshotBuiltData(
+        iteration_id=_get_str(fields, "iteration_id"),
+        iteration_index=_get_int(fields, "iteration_index"),
+        attempt_index=_get_int(fields, "attempt_index"),
+        current_user_excerpt=_get_str(fields, "current_user_excerpt"),
+        current_user_content_hash=_get_str(fields, "current_user_content_hash"),
+        current_user_source_cursor=_get_optional_int(
+            fields, "current_user_source_cursor"
+        ),
+        message_summaries=tuple(
+            _decode_run_input_message_summary(item) for item in raw_messages
+        ),
+        tool_schema_summaries=tuple(
+            _decode_run_input_tool_schema_summary(item) for item in raw_schemas
+        ),
+        context_meta=_decode_run_input_context_meta(fields.get("context_meta")),
+        raw_input_messages_json=_get_str(fields, "raw_input_messages_json"),
+        raw_tool_schemas_json=_get_str(fields, "raw_tool_schemas_json"),
+        raw_input_blob_id=_get_str(fields, "raw_input_blob_id"),
+        raw_tool_schemas_blob_id=_get_str(fields, "raw_tool_schemas_blob_id"),
+    )
+
+
 def _decode_finish_reason(
     fields: Mapping[str, JsonValue],
     key: str,
@@ -1267,6 +1478,9 @@ _DATA_CLASS_BY_TYPE: Mapping[RunEventType, type] = {
     RunEventType.TOOL_FETCH_MORE_FAILED: ToolFetchMoreFailedData,
     RunEventType.TOOL_CURSOR_EXPIRED: ToolCursorExpiredData,
     RunEventType.TOOL_CURSOR_DENIED: ToolCursorDeniedData,
+    RunEventType.RUN_INPUT_CONTEXT_SNAPSHOT_BUILT: (
+        RunInputContextSnapshotBuiltData
+    ),
 }
 """RunEventType 到强类型 data 的封闭映射。"""
 

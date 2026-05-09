@@ -30,8 +30,16 @@
   smoke。P6 code / architecture / concurrency review findings 已在
   `docs/host/phase6-code-review.md`、`docs/host/phase6-architecture-review.md`、
   `docs/host/phase6-concurrency-review.md` 标注修复状态；复审结果见
-  `docs/host/phase6-fix-rereview.md`，结论通过。当前分支为
-  `migration/host-p6-durable-eventlog`，准备创建 PR 等用户人工 PR review。
+  `docs/host/phase6-fix-rereview.md`，结论通过。P6 已通过 PR #26 合入 `main`，
+  merge commit 为 `499b9b1 Host P6 durable EventLog (#26)`。
+- P7 Tool Trace Projection / Sink plan gate 已通过：plan 见 `docs/host/phase7-plan.md`，
+  plan review 见 `docs/host/phase7-plan-review.md`，复审见
+  `docs/host/phase7-plan-rereview.md`，结论通过。计划阶段提交为
+  `f55f5ac docs: finalize host p7 tool trace plan`。P7 代码实施、常规 code review、
+  OLD / NEW review、架构边界 review、review fix 与复审均已完成，复审见
+  `docs/host/phase7-fix-rereview.md`，结论通过；ToolRuntime `iteration_id` root-cause
+  follow-up review 见 `docs/reviews/code-review-20260508-001.md`，Finding 001 / 003 已修复并复审通过；
+  残余风险已拆分到 GitHub issues #29-#36。P7 PR #37 已创建，当前等待用户人工 PR review。
 
 每个 Phase 进入实现前，必须另写可交接的 phase plan，细化到迁移 Agent 可以直接接手：
 目标、非目标、边界、文件级改动清单、契约变化、状态机、测试清单、验证命令、review gate、
@@ -71,35 +79,56 @@ migration/host-p{phase}-{short-name}
 
 如果用户指定其它分支名，以用户指令为准。
 
+当前仓库远端名是 `github`，不是 `origin`。总控 Agent 执行 push / PR 前必须先用
+`git remote -v` 或等价命令确认远端名，禁止假设远端一定叫 `origin`。本仓库默认 push
+形态为 `git push -u github <branch>`。
+
 每个 Phase 的固定节奏：
 
 1. 从最新主线或用户指定基线开新分支。
-2. 派 Agent 写 phase handoff plan。
+2. 派 Agent 写 phase handoff plan。除纯文档 / 极小修复外，plan 必须拆成若干可独立交付的
+   implementation stage / slice。每个 slice 必须足够小，原则上一个实施 Agent pass 加一个
+   review pass 可以完成；若 slice 太大、无法干净 review，必须先拆分再实施。每个 slice 必须
+   写明：slice id、短标题、目标、预期用户可见或契约可见结果、文件 / 模块 ownership、
+   允许修改、明确非目标、前置依赖、测试 / 验证命令、完成信号、停止条件和预计上下文压力。
+   slices 必须按依赖和风险排序；优先使用每步后系统仍可工作的 vertical slice。只有文件
+   ownership 与契约边界完全不重叠时，才允许并行 slice。禁止只写一个覆盖整个 phase 的大实施任务。
 3. 派 review Agent 做 plan review；必要时派额外 review Agent 做 OLD / NEW 对比、最佳实践、
-   架构边界或并发专项 review。
+   架构边界或并发专项 review。plan review 必须检查 slice 是否过粗、ownership 是否清晰、
+   测试是否只堆到最后、顺序是否容易诱导实施 Agent 提前做未来 slice；不合格时必须要求修 plan。
 4. 总控 Agent 读取 plan review 结果并判断 finding 是否成立；成立时派 Agent 修 plan，修复 Agent 必须在对应
    review 文档的 finding 标题上标注修复状态。
 5. 派 review Agent 复审修复后的 plan；若仍不通过，重复步骤 4-5，直到 review Agent 明确通过。
 6. plan review 通过后，停下来等用户人工确认。
 7. 用户确认后，commit phase plan 与 review 文档。
-8. 总控 Agent 生成按通过 plan 实施代码的指导 prompt，交给用户手工派迁移 Agent 生成代码。
-9. 总控 Agent 生成 code review 指导 prompt，交给用户手工派 Agent 执行 code review；必要时额外生成 OLD / NEW
+8. 总控 Agent 按通过 plan 的 implementation stage / slice 逐个生成实施指导 prompt，交给用户
+   手工派迁移 Agent 生成代码。每个实施 Agent 只能执行当前 stage，不得提前实现后续 stage；
+   若实施中发现当前 stage 过大、上下文窗口不足或需要跨 stage 改契约，必须停止并回报总控拆分 /
+   修 plan，不得硬做。
+9. 每个 stage 完成后，迁移 Agent 必须报告改动文件、验证结果、未覆盖项和是否触碰后续 stage。
+   总控 Agent 判断是否进入下一 stage；对契约 / schema / state-machine / 并发 / durable storage /
+   public interface 等高风险 stage，必须先生成 stage-level code review prompt 并完成修复 / 复审后，
+   才能进入下一 stage。
+10. 所有 stage 完成后，总控 Agent 生成 phase-level code review 指导 prompt，交给用户手工派
+    Agent 执行整体 code review；必要时额外生成 OLD / NEW
    对比、架构边界、类型安全或并发专项 review prompt。
-10. 用户提交 code review 结果后，总控 Agent 判断 finding 是否成立；成立时生成代码修复 prompt，
+11. 用户提交 code review 结果后，总控 Agent 判断 finding 是否成立；成立时生成代码修复 prompt，
     交给用户手工派 Agent 修复代码。修复 Agent 必须在对应 code review 文档的 finding 标题上标注
     修复状态，总控 Agent 负责检查标注是否到位。
-11. 总控 Agent 生成复审 prompt，交给用户手工派 Agent 执行复审；若仍不通过，重复步骤 10-11，
+12. 总控 Agent 生成复审 prompt，交给用户手工派 Agent 执行复审；若仍不通过，重复步骤 11-12，
     直到用户复审通过。
-12. code review 通过后，停下来等用户人工 review。
-13. 用户确认后，commit 代码、测试和必要 README / docs 更新。
-14. 准备 PR 时，确认只包含本 Phase 范围内提交，push 并创建 ready PR；不创建 draft PR，
+13. code review 通过后，停下来等用户人工 review。
+14. 用户确认后，commit 代码、测试和必要 README / docs 更新。若 Phase 被拆成多个高风险
+    stage，总控可在用户确认后按 stage 分别 commit，或在 phase 收口时统一 commit；无论哪种方式，
+    每个 commit 都必须只包含已通过对应 review gate 的改动。
+15. 准备 PR 时，确认只包含本 Phase 范围内提交，push 并创建 ready PR；不创建 draft PR，
     除非用户明确要求。PR 创建后停下来等用户人工 PR review。
-15. 用户提交 PR review 结果后，总控 Agent 判断 finding 是否成立；成立时生成代码修复 prompt，
+16. 用户提交 PR review 结果后，总控 Agent 判断 finding 是否成立；成立时生成代码修复 prompt，
     交给用户手工派 Agent 修复代码。修复 Agent 必须在对应 PR review 文档的 finding 标题上标注
     修复状态，总控 Agent 负责检查标注是否到位。
-16. PR review 通过后，停下来等用户确认。若 review 由用户本人完成，则对应修复也必须由用户本人复核；
+17. PR review 通过后，停下来等用户确认。若 review 由用户本人完成，则对应修复也必须由用户本人复核；
     总控 Agent 与其它 review Agent 不得替代用户复核结论。
-17. squash merge PR 并删除远端分支默认由用户执行；只有用户明确指示总控 Agent 执行时，
+18. squash merge PR 并删除远端分支默认由用户执行；只有用户明确指示总控 Agent 执行时，
     总控 Agent 才能执行 squash merge / delete branch。用户手工 merge 后，总控只记录状态。
 
 禁止事项：
@@ -108,6 +137,10 @@ migration/host-p{phase}-{short-name}
 - 不用总控 Agent 自己的复核替代用户 review / 复审结论；总控只负责派 Agent 写 / 修 phase plan、
   生成代码实施 / 代码修复 / review prompt、判断 finding 是否成立和维护修复状态。
 - 不在 review finding 未标注修复状态的情况下声称 review 通过。
+- 不把大 Phase 一次性塞给单个实施 Agent；若计划中已有多个 stage，必须按 stage 逐段实施、
+  逐段验证。若实施 Agent 报告上下文窗口不足，总控必须拆分 stage 或修 plan。
+- 不让实施 Agent 在当前 slice 中提前实现未来 slice；除非已通过 plan 明确授权多个 disjoint
+  slice 并行，否则发现 drift 必须停止并回到总控。
 - 不把多个 Phase 的实现混进一个 PR，除非用户明确批准合并。
 - 不在用户确认前 commit / push / create PR / merge。
 - 不把迁移过程要求写进 `docs/code_review.md`；该文档只写日常 review 当前事实专项。
@@ -153,7 +186,7 @@ phase 都应提供对应 smoke，P16 再把这些验证面收束为 Full-Governa
 | P5 | No-Full-Governance Multi-Turn Smoke | 将 P1-P4 与 P1.5 串成最小纵向 smoke，并落地最小公共 tool declaration 与 framework `fetch_more` 能力 | smoke CLI / test harness、端到端多轮测试、公共 `@tool` declaration / `ToolDefinition`、LLM-facing truncation hint、framework `fetch_more` schema、必要 README / tests 文档 | 不做完整多进程治理、不做 Remote、不做 Outbox、不做 audit hard-gate；不验证 `start_run` 幂等、active Run 并发仲裁或调用重试语义；不做完整 ToolRegistry / 权限治理 / 业务工具迁移；不做自动透明补读 | 一个单调用方、顺序执行的无完整生产治理多轮会话可按目标事实层跑通，含工具截断补读、memory、compaction；手工 smoke 真实向 `mimo-v2.5-pro-plan` 发送 prompt，由模型调用公共声明的 `huge_echo`，再由模型根据 `truncation.next_action=fetch_more` 调用 framework `fetch_more` |
 | P5.5 | Deferred Scope Reconciliation | 回看 P1-P5 所有“本阶段不实现”能力，确认没有遗留能力被漏排或误排 | deferred-scope inventory、能力归属表、后续 Phase 调整建议、必要的新 Phase / issue / plan 修订 | 不写生产代码；不把未落地能力补写成已落地事实；不直接修改后续 Phase 代码边界 | P1-P5 的非目标均被明确标记为已实现、已安排到 P6+、新增 Phase / issue 承接，或经用户确认关闭 |
 | P6 | Durable EventLog / Run State / Projection | 在 P1.5 最小事实层上建立多进程共享的 durable facts、projection checkpoint 与 observer / sink 基础 | 持久 EventLog、Run / Attempt 最小持久状态、atomic append / cursor allocation、projection checkpoint、最小 observer / sink protocol、audit / timeline / memory projection 重建基础、observer retry / lag、`utils/smoke_host_p6_durable_eventlog.py` | 不实现 attempt lease / fencing；不落地具体 tool trace schema；不把 trace 写回 Engine；不要求所有 observer hard-gate；不把 observer / sink 做成完整消息队列消费者框架 | EventLog storage 本身具备多进程安全的 append / replay / checkpoint 语义；Host 具备足以支撑 tool trace / audit / timeline / memory projection 的最小 observer / sink 基础；P6 smoke 可观察 durable append / replay / projection / checkpoint |
-| P7 | Tool Trace Projection / Sink | 在 P6 observer / sink 基础上落地 tool trace，继承 OLD tool trace schema 的关键语义 | tool trace observer、tool trace sink / store、OLD tool trace schema 对齐、tool call / result / iteration usage / final response / protocol error 投影测试、redaction 与 retention 边界、`utils/smoke_host_p7_tool_trace.py` | 不恢复 Engine 私有 recorder / store；不扩大 ToolRegistry 权限治理；不实现 audit hard-gate | tool trace 不再由 Engine recorder 落盘，而由 Host observer / sink 从 Engine / ToolRuntime canonical events 幂等派生，schema 语义可对照 OLD trace 消费；P7 smoke 可观察 trace projection |
+| P7 | Tool Trace Projection / Sink | 在 P6 observer / sink 基础上落地 tool trace，继承 OLD tool trace schema 的关键语义 | tool trace observer、tool trace sink / store、Host-owned RunInput context fact、OLD tool trace schema 对齐、OLD analyzer 业务无关能力迁移、tool call / result / iteration usage / final response / protocol error 投影测试、provider secret 排除与 trace 热/冷分层、`utils/smoke_host_p7_tool_trace.py` | 不恢复 Engine 私有 recorder / store；不扩大 ToolRegistry 权限治理；不实现 audit hard-gate | tool trace 不再由 Engine recorder 落盘，而由 Host observer / sink 从 Engine / ToolRuntime canonical events 幂等派生；`iteration_context_snapshot` 由 Host-owned durable fact 支撑；scope token / cursor / prompt / tool result 按 OLD 热/冷分层保留以便诊断，provider secret 不进 trace；P7 smoke 可观察 trace projection |
 | P8 | Attempt Lease / Recovery / 多进程并发基础 | 落地 AttemptSupervisor、lease / fencing、startup recovery，使多进程执行具备 owner 真源 | attempt store、owner token、lease renew、stale cleanup、orphan recovery、late write fencing、真实多进程 stress / terminal race / observer drain 验证、lane runtime dependency 判断、`utils/smoke_host_p8_attempt_lease.py` | 不做 Remote RPC；不实现完整 Session / Run admission；不把 lane 实现为 Host 私有能力 | 多进程下同一 attempt 只有有效 owner 可写入，迟到 owner 写入被拒绝，orphan / stale 可恢复或 LOST；真实多进程 append / terminal / recovery stress 不破坏 durable facts；P8 smoke 可观察 owner / fencing / recovery |
 | P9 | Session / Run Lifecycle Governance / Public Interface 固定 | 在 durable facts 与 attempt ownership 上完整落地 Session / Run 状态机、admission policy、取消基础治理，并固定 Host public interface | SessionManager、RunManager、RunSupervisor、`client_request_id` 幂等、同 Session active Run 仲裁、cancel_run、状态机测试、生产级 admission policy、Host public interface 契约、OLD wechat / web / prompt / interactive 调用需求调研、`utils/smoke_host_p9_lifecycle.py` | 不做 issue #3 的强制终止增强；不做 wait / suspend / resume；不做 Remote RPC；不迁移业务工具 | 同 Session 单 active Run、幂等 start_run、跨进程 admission、取消基础收口稳定；`docs/host/design.md` 的 Public Interface 口径与 `dayu.host` public exports 固定，且已对照 OLD wechat / web / prompt / interactive 需求验证；P9 smoke 可观察 lifecycle/admission/cancel |
 | P10 | ToolRegistry Governance | 在 P5 最小 tool declaration 之上落地完整通用工具注册与治理能力 | ToolRegistry / tool catalog、display metadata 治理、permission policy、middleware chain、framework tool registration、schema / binding 校验、registry audit facts、`utils/smoke_host_p10_tool_registry.py` | 不迁移 business fins / doc / web 工具；不让 Host / Engine 承载财报业务语义；不让 Engine 持有 registry | 通用工具可被发现、注册、授权、middleware 处理与审计；Engine 仍只接收 `ToolSchema` projection 与 `ToolExecutor` 协议；P10 smoke 可观察 registry governance |
@@ -317,6 +350,41 @@ P6 code / architecture / concurrency review 修复后，若仍存在不阻断 P6
   no-full-governance smoke 与非 durable 过渡装配使用，不再代表生产事实层。P16 interface freeze /
   文档收口时必须决定：删除它、迁移到测试 helper / explicit local adapter，或用专项理由保留为
   非生产 adapter；不得继续作为 Host 生产默认装配或 public interface 暗含依赖。
+
+### 4.3 P7 残余风险追踪
+
+P7 落地后，仍需后续阶段追踪的残余风险：
+
+- `accepted: P7 scope`：`ToolTraceObserver` 是同步 sink。每行 `flush + fsync` + raw payload
+  `tmp + os.replace` 的写入完全发生在文件系统、不动 SQLite、不阻塞 Engine 事件产生，但会
+  阻塞 terminal `coordinator.drain()`。当 trace root 处于慢速文件系统时 terminal completion 可能
+  被拉长；后续若 P8 / P15 需要更强 SLA，可在 observer 协议升级为 async 时统一评估。
+- `accepted: P7 scope`：JSONL 与 EventLog checkpoint 非原子。每行 trace 在 EventLog 已 commit
+  之后由 observer 写入；进程在两步之间崩溃，replay 后会产生重复行。靠行内 sha256[:32]
+  `idempotency_key` 让 analyzer 去重消化崩溃窗口；P7 不引入跨子系统二阶段提交。
+- `deferred-with-owner: issue #36`：Tool Trace JSONL 文件滚动边界。`_select_jsonl_file`
+  当前在 append 前按现有文件大小选择分片，crash replay / duplicate append 可能让接近阈值的
+  `tool_calls_*.jsonl` 分片超过目标大小。正确性由 analyzer `idempotency_key` 去重保证，
+  但长期文件管理可预测性与运维体验需要在 #36 跟踪治理。
+- `deferred-with-owner: P7-followup`：compact 重试路径合成 `RunInputContextSnapshotBuiltData`
+  时的 `iteration_index` / `attempt_index` 取值需要与真实 Engine attempt 元信息对齐验证，
+  避免 trace `iteration_context_snapshot` 字段在 compact retry 后语义偏移。
+- `deferred-with-owner: P8`：partial tool calls 完整语义。Engine 在 SSE 中途失败造成的部分
+  tool call 当前不会进入 P7 trace 的 `tool_call` record（因为缺 `TOOL_RESULT_ACCEPTED`），
+  observer 会在 batch 内抛 `ProjectionSchemaError`；P8 owner fencing / recovery 落地后需要重新
+  定义 partial tool call 的 trace 语义（独立 record vs. failed outcome）。
+- `accepted: P7 scope, mid-term-evaluate`：`RUN_INPUT_CONTEXT_SNAPSHOT_BUILT` fact `data` payload
+  内联完整 `raw_input_messages_json` / `raw_tool_schemas_json`。该方案让 raw payload 与 fact
+  落库收敛到单条 `append_in_transaction`，天然消除"fact 已落但 raw ref 缺失"窗口；trade-off 是
+  `run_events` 行体积可达数十 KB ~ 数百 KB，长期会让 EventLog 变成冷热混合存储、影响
+  `ProjectionCoordinator.drain()` 反序列化吞吐与未来 retention / compaction。当 Run 体量或 tool
+  schema 数量显著增长后，应评估把 raw payload 外迁到独立表 / 文件、fact 仅保留 ref。
+- `accepted: P7 baseline, defer-to-P8/P9`：`LocalRunHarness` 已承载 16 字段 / 43 方法，横跨 Run
+  生命周期管理、Engine 事件翻译、context compact、memory projection、attempt state 持久化、
+  P7 fact append 等多个职责；P7 增量虽克制（builder 抽到 `_run_input_context_fact.py`、harness
+  仅装配 + `append_in_transaction`），但基线已接近 God Object 阈值。后续 P8 / P9 应评估按职责
+  拆分为更小组件（如 `AttemptManager` / `ContextCompactHandler` / `RunInputContextFactAppender`）；
+  不属于 P7 阻断项。
 
 P9 实施 `start_run` 幂等时，必须重新讨论并固定 `(session_id, client_request_id)` 如何幂等映射到
 同一个 `run_id`：包括 `run_id` 由 Host 生成还是由持久 Run 创建事实确定、重复请求返回同一
@@ -501,6 +569,10 @@ PR 创建后：
 每个 Phase 结束前，总控 Agent 必须确认：
 
 - Phase 目标已完成，非目标未被偷做。
+- phase plan 已按 implementation stage / slice 拆分；每个非平凡 slice 都有 slice id、短标题、
+  目标、预期可见结果、文件 / 模块 ownership、前置依赖、明确非目标、测试命令、完成信号和
+  停止条件。实际实施记录能对应到这些 slice，未把整个大 Phase 一次性交给单个实施 Agent，
+  也未在当前 slice 中偷做未来 slice。
 - P6 及以后每项新增治理能力都有对应 `utils/` 手工 smoke，且 smoke 输出足以观察新增治理能力的
   执行路径，不刷屏、不泄露 scope token、不打印大块 prompt / delta / tool result。
 - 没有旧接口兼容 wrapper / facade / re-export。
