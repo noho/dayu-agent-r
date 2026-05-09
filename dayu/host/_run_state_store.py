@@ -525,6 +525,72 @@ class AttemptLeaseStore:
             now=now,
         )
 
+    def update_state_owner_aware(
+        self,
+        *,
+        tx: HostStorageTransaction,
+        owner_context: AttemptOwnerContext,
+        state: AttemptState,
+        failure_summary: str | None,
+        terminal_event_position: GlobalEventPosition | None,
+    ) -> bool:
+        """对 attempt 做 owner-aware 的诊断态 / 终态写入。
+
+        本方法只接受 ``host_attempts`` 当前行 ``state='running' AND
+        owner_token_hash=? AND fencing_token=?`` 时才更新; 不要求
+        ``lease_expires_at > now``, 因为 owner-aware 诊断 close 路径在
+        owner 已被 fenced / lease expired 后仍需要把 attempt 从
+        ``RUNNING`` 收口为 STALE / FAILED / LOST 等诊断态。owner_token /
+        fencing_token 是真源, 防止 recovery 后被旧 owner 覆盖未来状态。
+
+        本方法是 P8-S3 supervisor diagnostic close 的最小依赖; terminal
+        event append 与 ``terminal_event_position`` 的同事务原子写入仍
+        归 P8-S4 实现。当 ``terminal_event_position`` 为 ``None`` 时本
+        方法只更新 state / finished_at / failure_summary, 不动 terminal
+        event position 字段。
+
+        :param tx: 当前事务。
+        :param owner_context: 当前 owner 句柄。
+        :param state: 期望写入的新状态; 应是诊断态 / 终态枚举之一。
+        :param failure_summary: 失败摘要; 成功诊断态可为 ``None``。
+        :param terminal_event_position: terminal 事件全局位置; P8-S3 调
+            用方应传 ``None``, 终态原子写入归 P8-S4。
+        :returns: CAS 命中并写入返回 ``True``; rowcount==0 时返回
+            ``False`` (owner 已被替换 / 行已不在 RUNNING 状态)。
+        :raises sqlite3.DatabaseError: 写入失败时抛出。
+        """
+
+        finished_at_iso = (
+            datetime.now(tz=timezone.utc).isoformat()
+            if state in _ATTEMPT_FINISHED_STATES
+            else None
+        )
+        position_value = (
+            None if terminal_event_position is None
+            else terminal_event_position.value
+        )
+        cursor = tx.execute(
+            """
+            UPDATE host_attempts SET state = ?, finished_at = ?,
+                terminal_event_position = ?, failure_summary = ?
+            WHERE attempt_id = ?
+              AND state = ?
+              AND owner_token_hash = ?
+              AND fencing_token = ?
+            """,
+            (
+                state.value,
+                finished_at_iso,
+                position_value,
+                failure_summary,
+                owner_context.attempt_id,
+                AttemptState.RUNNING.value,
+                owner_context.owner_token.digest(),
+                owner_context.fencing_token.value,
+            ),
+        )
+        return cursor.rowcount == 1
+
     def verify_owner(
         self,
         *,

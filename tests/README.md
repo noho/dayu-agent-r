@@ -40,6 +40,7 @@ pytest tests/host/test_phase3_multiturn_smoke.py -q
 pytest tests/host/test_phase3_boundary.py -q
 pytest tests/contracts/test_tool_declaration.py -q
 pytest tests/host/test_phase5_multiturn_no_governance_smoke.py -q
+pytest tests/host/test_phase8_attempt_supervisor.py -q
 pytest tests/engine/contracts -q
 pytest tests/engine/runners/openai/test_event_flow_ordering.py -q
 ```
@@ -168,6 +169,16 @@ Host 当前 Run harness、RunEventStore、ToolRuntime、Conversation Memory / Ru
   fact、`ToolTraceJsonlSink` JSONL + raw payload blob 落盘、provider secret
   scrub、`ToolTraceObserver` 5 类 record 派发、``DurableHarnessConfig.tool_trace_path``
   装配开关与 ``tool_trace_v2_host`` schema 字面量边界。
+- P8-S3 attempt supervisor（`tests/host/test_phase8_attempt_supervisor.py`）：覆盖
+  `AttemptSupervisor.lease_context` 正常 acquire / yield / 退出清理；renew loop 在 fake
+  clock 下 renew 成功保持 fencing token 不变、刷新 `lease_expires_at`；renew 命中
+  `FENCED` 后 session 失活并通过 `wait_owner_lost` 暴露 typed `FENCED`；renew 抛 storage
+  异常时映射为 typed `STORAGE_ERROR`，masked 日志覆盖且 owner secret 明文不泄漏；
+  `DurableHarnessConfig.attempt_lease_config` 装配入口可覆盖默认 TTL / interval / prefix；
+  `LocalRunHarness` 仅薄委托 supervisor，并在 `_finish_attempt_if_durable` 通过
+  `close_attempt_with_diagnostic_state` 完成 owner-aware 收口；owner CAS 命中失败时
+  diagnostic close 返回 `False` 且不覆盖未来状态；harness 在 owner-lost 后停止从 Engine
+  拉取 / append late event。
 - public boundary：锁定 `dayu.host.__all__`，允许 Run 级 `start_run`、`stream_run_events`、`get_run_result`，
   以及 P2 Run 级 `get_tool_fetch_more_handle`、`fetch_more_tool_result`，阻止 `EngineWorker`、`LocalProxy`、
   `ToolExecutor`、`InMemoryToolRuntime`、`ToolRuntimeToolExecutor`、`InMemoryConversationMemoryStore`、

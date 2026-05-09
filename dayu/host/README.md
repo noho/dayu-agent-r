@@ -324,8 +324,17 @@ loop / 线程，也不与 terminal 后的 `drain()` 重入冲突。`DurableRunEv
 RunEventData 时通过封闭 type↔data 映射的序列化注册表
 （`dayu.host._run_event_serializer`，`schema_version=1`）做 fail-fast 校验；schema 变化按
 全新起库处理，不维护旧库兼容。P8-S1 已提供 internal attempt lease / fencing store 基础；
-当前 `LocalRunHarness` 主路径、supervisor、renew loop、recovery scan 与 public lifecycle
-governance 仍未接入。
+P8-S3 已经把 `AttemptSupervisor` 接入 `DurableHarnessConfig.attempt_lease_config` 装配入口，
+在 `LocalRunHarness` 主路径上完成 owner lease acquire、renew heartbeat 与 owner-aware
+diagnostic close：renew 命中 `FENCED / TERMINAL / BUSY` 或抛出 storage 异常时
+supervisor 暴露 typed `AttemptOwnerLossReason`（`FENCED` / `STORAGE_ERROR`），
+`LocalRunHarness` 在等待 Engine event 时与该信号 race，一旦 owner 失活立即停止
+后续 EventLog append、调用 `AttemptSupervisor.close_attempt_with_diagnostic_state`
+做 owner_token + fencing_token CAS 收口，不再退回到 legacy 非 owner-aware update。
+public `StartRunRequest` / `start_run` 不暴露 lease TTL，owner secret token 明文不入库、
+不进入日志、不进入 EventLog payload。当前 terminal event append + attempt close 的同
+事务原子写入、ToolRuntime / EventLog 事务级 CAS append、recovery scan 与多进程稳态
+仍未落地，分别归 P8-S4 / P8-S5 / P8-S6 / P8-S7。
 
 Host 已落地主路径使用日志表达执行边界：`VERBOSE` 覆盖 `start_run` 接纳、background task、attempt、
 EngineWorker 调用、terminal append、context overflow / compact / retry、ToolRuntime 调用边界、

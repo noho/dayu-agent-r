@@ -719,6 +719,7 @@ async def test_finish_attempt_if_durable_rejects_terminal_event_and_state_togeth
         DurableHarnessConfig,
         build_durable_harness,
     )
+    from dayu.host._run_harness import _ActiveAttempt
     from dayu.host._run_state_store import AttemptState
     from dayu.host.contracts import RunEvent, RunEventCursor
 
@@ -740,9 +741,14 @@ async def test_finish_attempt_if_durable_rejects_terminal_event_and_state_togeth
             ),
             source_engine_event_id="engine_rA_failed",
         )
+        active = _ActiveAttempt(
+            attempt_id="att_1",
+            owner_context=None,
+            lease_exit_stack=None,
+        )
         with pytest.raises(ValueError, match="terminal_event"):
             await harness._finish_attempt_if_durable(  # noqa: SLF001
-                attempt_id="att_1",
+                active_attempt=active,
                 terminal_event=fake_event,
                 state=AttemptState.FAILED,
             )

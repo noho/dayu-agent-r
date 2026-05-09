@@ -42,8 +42,19 @@
   PR review 见 `docs/reviews/pr-37-review-20260509-0829.md`，finding 已修复。残余风险已拆分到
   GitHub issues #29-#36。P7 已通过 PR #37 合入 `main`，merge commit 为
   `5fccad4 Host P7 tool trace projection (#37)`。
-- 当前进入 P8 Attempt Lease / Recovery / 多进程并发基础 plan gate；工作分支为
-  `migration/host-p8-attempt-lease-recovery`。
+- 当前处于 P8 Attempt Lease / Recovery / 多进程并发基础实施阶段；工作分支为
+  `migration/host-p8-attempt-lease-recovery`。P8 plan gate 已通过，plan 见
+  `docs/host/phase8-plan.md`，plan review / rereview / 开放式 review / 架构 review / 最优方案 review
+  分别见 `docs/host/phase8-plan-review.md`、`docs/host/phase8-plan-rereview.md`、
+  `docs/host/phase8-open-review.md`、`docs/host/phase8-architecture-review.md`、
+  `docs/host/phase8-optimal-review.md`。P8-S1 Attempt lease store 已提交为
+  `a3bd247 host: add p8 attempt lease store`，S1 code review 见
+  `docs/host/phase8-s1-code-review.md`。P8-S2 async observer sink 已提交为
+  `29dee8b host: make observer sinks async`，S2 code review 见
+  `docs/host/phase8-s2-code-review.md`。P8-S3 AttemptSupervisor Lease Context 与 Renew
+  Loop 已完成实施与修复复审，review / rereview 见 `docs/host/phase8-s3-code-review.md`、
+  `docs/host/phase8-s3-fix-rereview.md`，结论为有条件通过；下一入口是 P8-S4：
+  Terminal Append + Close 原子垂直片。
 
 每个 Phase 进入实现前，必须另写可交接的 phase plan，细化到迁移 Agent 可以直接接手：
 目标、非目标、边界、文件级改动清单、契约变化、状态机、测试清单、验证命令、review gate、
@@ -79,6 +90,40 @@ context overflow 治理回流到 Engine。
 commit、PR 与收口。本文档不另造一套与 Gateflow 冲突的流程，只记录 Dayu Host 迁移对
 Gateflow 的项目级扩展和固定约束。若本文档某条流程与 `$gateflow` 的通用 gate 冲突，
 优先按 `$gateflow` 的 gate 语义执行，再叠加本节明确写出的 Dayu Host 扩展。
+
+### 3.1 总控会话边界
+
+每个 Phase 默认新开一个总控会话。旧总控会话的长上下文不得成为隐形状态源；新总控必须能只靠
+仓库内文件与 Git 状态恢复当前迁移状态。若单个 Phase 被拆成很多高风险 slice，且实施 / review
+上下文持续膨胀，总控可以在同一 Phase 内按 slice 分段新开会话，但必须先把当前 slice 状态写回
+phase plan、review 文档或本总控计划。
+
+新总控会话启动时，至少读取以下材料：
+
+- `AGENTS.md`
+- `$gateflow` skill：`/Users/leo/.codex/skills/gateflow/SKILL.md`
+- `docs/host/migration-plan.md`
+- 当前 Phase plan，例如 `docs/host/phase{N}-plan.md`
+- 当前 Phase 已有 review / rereview / code review 文档
+- `docs/host/design.md` 与必要时 `docs/engine/design.md`
+- `git status --short`
+- `git log --oneline -8`
+
+新总控启动后必须先确认：
+
+- 当前 Phase、当前分支、最新提交与 PR / merge 状态。
+- 当前 gate：plan、plan review、implementation slice、code review、commit、PR、PR review 或 closeout。
+- 已 accepted / rejected / deferred / unresolved findings 及其 owner。
+- 当前 slice 的允许修改范围、非目标、验证命令和停止条件。
+- 是否存在未提交工作树；若有，必须区分是用户 / 实施 Agent 已完成改动，还是总控自己待收口改动。
+
+每个 Phase 结束或长会话即将切换时，总控必须确保迁移状态已经写回文件，而不是只留在对话里：
+
+- `docs/host/migration-plan.md` 的“当前总控状态”或残余风险追踪已更新。
+- 当前 phase plan / review 文档已标注 finding 状态。
+- 必要时新增 `docs/host/phase{N}-controller-handoff.md` 记录当前 slice、commit、验证结果和下一步入口；
+  但优先把长期状态写回 `migration-plan.md` 或 phase plan，handoff 文件只用于临时复杂 phase。
+- 已提交的 slice 以 Git commit 作为恢复边界；未提交的工作必须在 handoff 中明确说明。
 
 Gateflow 当前没有“一开始开独立分支”的前置步骤；Dayu Host 迁移额外要求每个 Phase 在进入
 plan gate 前先从最新主线或用户指定基线创建独立分支。
@@ -407,6 +452,31 @@ P7 落地后，仍需后续阶段追踪的残余风险：
   仅装配 + `append_in_transaction`），但基线已接近 God Object 阈值。后续 P8 / P9 应评估按职责
   拆分为更小组件（如 `AttemptManager` / `ContextCompactHandler` / `RunInputContextFactAppender`）；
   不属于 P7 阻断项。
+
+### 4.4 P8 残余风险追踪
+
+P8 按 stage 实施；每个 stage 的残余风险必须在进入下一 stage 前归属到后续 stage、issue 或
+P16 收口项。
+
+- `deferred-with-owner: P8-S4`：P8-S3 复审 Low-3。owner-lost 路径目前覆盖了
+  `_next_engine_event_or_lose_owner` helper 级 race，证明 owner-lost 先到时不会继续拉取 / append
+  late Engine event；但尚缺 `_run_to_store` 端到端集成测试，覆盖 proxy stream -> owner lost ->
+  `_handle_owner_lost` -> Host failure terminal append -> EventLog 不含 stale Engine fact ->
+  owner-aware diagnostic close 的完整路径。P8-S4 实施 terminal event append + attempt close
+  同事务原子写入时，必须把该端到端测试与 terminal position 测试一起补齐。
+- `deferred-with-owner: P8-S4`：terminal event append、owner fencing、attempt terminal close、
+  `terminal_event_position` 写入仍需同一个 `BEGIN IMMEDIATE` 事务固定；P8-S3 只做 owner-aware
+  diagnostic close，`terminal_event_position` 仍为 `NULL`。
+- `deferred-with-owner: P8-S5`：Engine-sourced EventLog append、context facts 与 ToolRuntime
+  Host-owned canonical facts 仍需统一走 attempt-scoped append port，在事务内执行
+  `verify_owner` CAS；P8-S3 只提供运行时 owner-lost 停止信号，不替代 S5 的事务级 fencing。
+- `deferred-with-owner: P8-S6`：recovery scan / `MARK_RECOVERING_AND_CREATE_ATTEMPT` 仍未实现；
+  stale / orphan attempt 的恢复必须在新 recovery attempt 中继续，不 takeover 同一 attempt。
+- `deferred-with-owner: P8-S7 / issue #38`：默认 deterministic multiprocessing 测试仍未落地；
+  慢硬盘 + Docker Linux stress 作为增强手工压力测试由 GitHub issue #38 跟踪。
+- `deferred-with-owner: P16`：P8-S3 测试 fake 当前用 `cast(AttemptSupervisor, ...)` 桥接具体类；
+  interface freeze 前应评估是否抽 `AttemptSupervisorPort` 这类 Host internal protocol，避免测试替身
+  长期依赖具体实现。
 
 P9 实施 `start_run` 幂等时，必须重新讨论并固定 `(session_id, client_request_id)` 如何幂等映射到
 同一个 `run_id`：包括 `run_id` 由 Host 生成还是由持久 Run 创建事实确定、重复请求返回同一

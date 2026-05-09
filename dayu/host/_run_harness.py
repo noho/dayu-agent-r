@@ -12,6 +12,7 @@ import uuid
 import weakref
 from collections import OrderedDict
 from collections.abc import AsyncIterator
+from contextlib import AsyncExitStack
 from dataclasses import dataclass, field, replace
 from datetime import datetime, timezone
 from functools import partial
@@ -29,8 +30,14 @@ from dayu.engine import (
     EngineEventType,
     RunFailedData,
     SystemMessage,
-    ToolMessage,
     UserMessage,
+)
+from dayu.host._attempt_lease import (
+    AttemptOwnerContext,
+)
+from dayu.host._attempt_supervisor import (
+    AttemptOwnerLossReason,
+    AttemptSupervisor,
 )
 from dayu.host._context_compaction import (
     ContextCompactCoordinator,
@@ -125,6 +132,7 @@ _ERROR_CONTEXT_COMPACT_RETRY_LIMIT_INVALID: str = (
 _ERROR_ENGINE_STREAM_ENDED_WITHOUT_TERMINAL: str = (
     "engine_stream_ended_without_terminal"
 )
+_ERROR_ATTEMPT_LEASE_LOST: str = "attempt_lease_lost"
 _RUN_INPUT_TRACE_CACHE_LIMIT: int = 32
 _RUN_INPUT_MESSAGE_CACHE_LIMIT: int = 3
 _CONTEXT_COMPACT_RETRY_LIMIT: int = 1
@@ -135,6 +143,33 @@ _UNEXPECTED_COMPACTION_TERMINAL_MESSAGE: str = (
 )
 _LOGGER: logging.Logger = logging.getLogger(__name__)
 _RunCacheValue = TypeVar("_RunCacheValue")
+
+
+class _OwnerLostDuringEngineWait(Exception):
+    """harness 等待 Engine event 期间 owner-lost 命中的内部信号。
+
+    本异常仅在 :meth:`LocalRunHarness._next_engine_event_or_lose_owner`
+    的 race 命中 owner-lost 时构造, 用于把控制权交回 ``_run_to_store``
+    主循环, 让其按 owner-lost 路径关闭 engine iterator、停止后续
+    EventLog append 并执行 owner-aware diagnostic close。
+
+    本异常不进入 Engine、不进入 EventLog payload、不暴露 owner secret
+    token; 只携带 typed :class:`AttemptOwnerLossReason` 用于日志与诊断
+    分支判断。
+    """
+
+    def __init__(self, *, loss_reason: AttemptOwnerLossReason) -> None:
+        """构造 owner-lost 信号。
+
+        :param loss_reason: typed owner-lost 原因。
+        :returns: 无返回值。
+        :raises Exception: 不主动抛出异常。
+        """
+
+        super().__init__(f"attempt owner lost: {loss_reason.value}")
+        self.loss_reason: AttemptOwnerLossReason = loss_reason
+
+
 _RUN_INPUT_CONTEXT_FACT_BUILDER_REQUIRED: str = (
     "run_input_context_fact_builder must be provided when "
     "tool_trace_context_fact_enabled is True"
@@ -277,6 +312,32 @@ class _NoopToolExecutor:
 
 
 @dataclass(frozen=True, slots=True)
+class _ActiveAttempt:
+    """Host attempt 运行期句柄。
+
+    durable 路径下, ``_begin_attempt_if_durable`` 在 attempt 启动边界返回
+    本句柄, ``_run_to_store`` 与 ``_finish_attempt_if_durable`` 通过它在
+    attempt 内串联状态:
+
+    - ``attempt_id``: attempt 标识, 由 supervisor (P8-S3) 或 legacy
+      ``attempt_state_store.create`` (P6) 分配。
+    - ``owner_context``: supervisor 路径下当前 owner 句柄;
+      legacy attempt_state_store 路径为 ``None``。
+    - ``lease_exit_stack``: 持有 :meth:`AttemptSupervisor.lease_context`
+      的 :class:`AsyncExitStack`; finish 时 ``aclose`` 触发 supervisor
+      退出 / 取消 renew loop。legacy 路径为 ``None``。
+
+    :param attempt_id: attempt 标识。
+    :param owner_context: supervisor 路径下的 owner 句柄。
+    :param lease_exit_stack: lease_context 的 ``AsyncExitStack``。
+    """
+
+    attempt_id: str
+    owner_context: AttemptOwnerContext | None
+    lease_exit_stack: AsyncExitStack | None
+
+
+@dataclass(frozen=True, slots=True)
 class _AcceptedStartInput:
     """Host ingress 接纳后的消息结构。
 
@@ -304,7 +365,14 @@ class LocalRunHarness:
         legacy 内存路径,直接调用 ``memory_store.project_run_events``。
     :param attempt_state_store: 可选 :class:`AttemptStateStore`；当 durable
         EventLog + HostStorage 在场时由调用方注入,以便 harness 在每个
-        attempt 起止处持久化 attempt 最小状态。
+        attempt 起止处持久化 attempt 最小状态。仅当未注入
+        ``attempt_supervisor`` 时使用; 注入 supervisor 后 attempt 创建/收
+        口由 supervisor 经 lease store 完成, 本字段仅作 P6 legacy 兼容入
+        口。
+    :param attempt_supervisor: 可选 :class:`AttemptSupervisor`；P8-S3 起,
+        durable 装配层通过装配 :class:`AttemptLeaseConfig` 注入 supervisor,
+        harness 只在 attempt 边界薄委托 ``lease_context``, 自身不写 lease
+        SQL、不计算 TTL、不实现 renew loop, 也不处理 fencing 逻辑。
     :param storage: 可选 :class:`HostStorage`；attempt_state_store 写入需要
         共享事务,因此 harness 持有 storage handle 以开启短事务。仅 durable
         路径需要注入。
@@ -334,6 +402,7 @@ class LocalRunHarness:
     )
     coordinator: ProjectionCoordinator | None = None
     attempt_state_store: AttemptStateStore | None = None
+    attempt_supervisor: AttemptSupervisor | None = None
     storage: HostStorage | None = None
     tool_trace_context_fact_enabled: bool = False
     run_input_context_fact_builder: RunInputContextFactBuilder | None = None
@@ -472,9 +541,11 @@ class LocalRunHarness:
         attempt_index = 0
         event_count = 0
         terminal_seen = False
-        current_attempt_id: str | None = await self._begin_attempt_if_durable(
-            request=request,
-            attempt_index=attempt_index,
+        current_active_attempt: _ActiveAttempt | None = (
+            await self._begin_attempt_if_durable(
+                request=request,
+                attempt_index=attempt_index,
+            )
         )
         _LOGGER.log(
             VERBOSE_LOG_LEVEL,
@@ -512,9 +583,24 @@ class LocalRunHarness:
                 try:
                     while True:
                         try:
-                            event = await anext(engine_events)
+                            event = await self._next_engine_event_or_lose_owner(
+                                engine_events=engine_events,
+                                active_attempt=current_active_attempt,
+                            )
                         except StopAsyncIteration:
                             break
+                        except _OwnerLostDuringEngineWait as lost:
+                            terminal_seen = (
+                                await self._handle_owner_lost(
+                                    request=attempt_request,
+                                    active_attempt=current_active_attempt,
+                                    loss_reason=lost.loss_reason,
+                                    event_count=event_count,
+                                    terminal_seen=terminal_seen,
+                                )
+                            )
+                            current_active_attempt = None
+                            return
                         except Exception as exc:
                             terminal_seen = (
                                 await self._append_worker_failure_if_needed(
@@ -579,10 +665,10 @@ class LocalRunHarness:
                             )
                             terminal_seen = True
                             await self._finish_attempt_if_durable(
-                                attempt_id=current_attempt_id,
+                                active_attempt=current_active_attempt,
                                 terminal_event=stored_event,
                             )
-                            current_attempt_id = None
+                            current_active_attempt = None
                             return
                     if overflow_trigger_seen:
                         if (
@@ -616,26 +702,26 @@ class LocalRunHarness:
                         if next_request_with_trace is None:
                             terminal_seen = True
                             await self._finish_attempt_if_durable(
-                                attempt_id=current_attempt_id,
+                                active_attempt=current_active_attempt,
                                 terminal_event=None,
                                 state=AttemptState.FAILED,
                                 failure_summary="context_compact_failed",
                             )
-                            current_attempt_id = None
+                            current_active_attempt = None
                             return
                         next_request, compact_trace = next_request_with_trace
                         # 当前 attempt 因 context overflow 关闭,准备启动下一
                         # attempt: 旧 attempt 状态推进为 STALE,
                         # 然后为新 attempt 创建持久记录。
                         await self._finish_attempt_if_durable(
-                            attempt_id=current_attempt_id,
+                            active_attempt=current_active_attempt,
                             terminal_event=None,
                             state=AttemptState.STALE,
                             failure_summary="context_overflow_compacted",
                         )
                         attempt_request = next_request
                         attempt_index += 1
-                        current_attempt_id = (
+                        current_active_attempt = (
                             await self._begin_attempt_if_durable(
                                 request=attempt_request,
                                 attempt_index=attempt_index,
@@ -667,9 +753,9 @@ class LocalRunHarness:
                         request=attempt_request,
                     )
         finally:
-            if current_attempt_id is not None:
+            if current_active_attempt is not None:
                 await self._finish_attempt_if_durable(
-                    attempt_id=current_attempt_id,
+                    active_attempt=current_active_attempt,
                     terminal_event=None,
                     state=(
                         AttemptState.FAILED
@@ -682,7 +768,7 @@ class LocalRunHarness:
                         else "run_terminated_without_terminal_event"
                     ),
                 )
-                current_attempt_id = None
+                current_active_attempt = None
             if terminal_seen:
                 await self._project_terminal_run(request.run_id)
             _LOGGER.info(
@@ -693,6 +779,144 @@ class LocalRunHarness:
                 event_count,
                 terminal_seen,
             )
+
+    async def _next_engine_event_or_lose_owner(
+        self,
+        *,
+        engine_events: AsyncIterator[EngineEvent],
+        active_attempt: "_ActiveAttempt | None",
+    ) -> EngineEvent:
+        """等待下一个 Engine event, 与 owner-lost signal race。
+
+        无 supervisor / 无 owner_context (legacy 内存路径或 P6 兼容路径)
+        时, 直接 ``anext(engine_events)``, 与本 slice 之前行为一致。
+
+        supervisor 路径下, harness 与 supervisor 的 owner-lost signal
+        做 race:
+
+        - Engine event 先到: 正常返回, 调用方继续翻译并 append。
+        - owner-lost 先到: 抛 :class:`_OwnerLostDuringEngineWait`,
+          调用方负责取消 engine iterator、停止后续 append 并走 owner-
+          aware diagnostic close 路径。
+        - 两者都已就绪时, owner-lost 优先, 防止旧 owner 把已经 fenced
+          后到达的 stale Engine event 写进 EventLog。
+
+        :param engine_events: worker 返回的 EngineEvent 异步流。
+        :param active_attempt: 当前 active attempt 句柄。
+        :returns: 下一个 EngineEvent。
+        :raises StopAsyncIteration: Engine stream 正常耗尽时透传。
+        :raises _OwnerLostDuringEngineWait: owner-lost 命中时抛出。
+        :raises Exception: 透传 Engine iterator 自身异常。
+        """
+
+        if (
+            self.attempt_supervisor is None
+            or active_attempt is None
+            or active_attempt.owner_context is None
+        ):
+            return await anext(engine_events)
+        owner_context = active_attempt.owner_context
+        # 进入 race 前先做无锁快照检查: 已失活直接抛, 不再尝试拉取
+        # Engine event。
+        if not self.attempt_supervisor.is_owner_active(owner_context):
+            loss_reason = await self.attempt_supervisor.wait_owner_lost(
+                owner_context
+            )
+            raise _OwnerLostDuringEngineWait(loss_reason=loss_reason)
+        next_event_task: asyncio.Task[EngineEvent] = asyncio.ensure_future(
+            anext(engine_events)
+        )
+        owner_lost_task: asyncio.Task[AttemptOwnerLossReason] = (
+            asyncio.ensure_future(
+                self.attempt_supervisor.wait_owner_lost(owner_context)
+            )
+        )
+        try:
+            done, _ = await asyncio.wait(
+                {next_event_task, owner_lost_task},
+                return_when=asyncio.FIRST_COMPLETED,
+            )
+            if owner_lost_task in done:
+                loss_reason = owner_lost_task.result()
+                raise _OwnerLostDuringEngineWait(loss_reason=loss_reason)
+            return next_event_task.result()
+        finally:
+            if not owner_lost_task.done():
+                owner_lost_task.cancel()
+                try:
+                    await owner_lost_task
+                except (asyncio.CancelledError, Exception):  # noqa: BLE001
+                    pass
+            if not next_event_task.done():
+                next_event_task.cancel()
+                try:
+                    await next_event_task
+                except (asyncio.CancelledError, Exception):  # noqa: BLE001
+                    pass
+
+    async def _handle_owner_lost(
+        self,
+        *,
+        request: StartRunRequest,
+        active_attempt: "_ActiveAttempt | None",
+        loss_reason: AttemptOwnerLossReason,
+        event_count: int,
+        terminal_seen: bool,
+    ) -> bool:
+        """attempt owner-lost 后停止 append 并 owner-aware 收口。
+
+        本 helper 是 P8-S3 owner-lost 路径的统一收口入口:
+
+        - 不再向 EventLog append 任何 attempt-scoped fact。
+        - 通过 ``terminal_seen`` 区分: 若此前已经写入终态, 不再追加 Host-
+          owned failure (避免覆盖 Engine 终态);
+          否则追加诊断 ``RUN_FAILED(error_code=attempt_lease_lost)``,
+          让上层订阅方与 Run 结果有确定终态可读。
+        - 通过 :meth:`_finish_attempt_if_durable` (在调用方 ``return`` 后
+          的 ``finally`` 块中) 走 supervisor owner-aware diagnostic
+          close 路径; 本 helper 自身不直接 update_state, 由后续
+          :meth:`_finish_attempt_if_durable` 的 active_attempt 路径完成。
+
+        :param request: 当前 attempt 请求。
+        :param active_attempt: 当前 active attempt 句柄, 仅用于诊断字段。
+        :param loss_reason: typed owner-lost 原因。
+        :param event_count: 已成功取得的 EngineEvent 数量。
+        :param terminal_seen: 是否已经从已 append 事件推导出终态。
+        :returns: 已存在或新追加终态时返回 ``True``。
+        :raises Exception: append Host-owned failure 失败时透传。
+        """
+
+        attempt_id = (
+            "<none>" if active_attempt is None else active_attempt.attempt_id
+        )
+        _LOGGER.error(
+            "host.run.attempt_lease_lost session_id=%s run_id=%s "
+            "attempt_id=%s loss_reason=%s event_count=%s",
+            request.session_id,
+            request.run_id,
+            attempt_id,
+            loss_reason.value,
+            event_count,
+        )
+        if active_attempt is not None:
+            await self._finish_attempt_if_durable(
+                active_attempt=active_attempt,
+                terminal_event=None,
+                state=AttemptState.LOST,
+                failure_summary=f"{_ERROR_ATTEMPT_LEASE_LOST}:{loss_reason.value}",
+            )
+        if terminal_seen:
+            return True
+        stored_event = await self.event_store.append(
+            host_failure_draft(
+                run_id=request.run_id,
+                session_id=request.session_id,
+                occurred_at=datetime.now(tz=timezone.utc),
+                error=RuntimeError(_ERROR_ATTEMPT_LEASE_LOST),
+                error_code=_ERROR_ATTEMPT_LEASE_LOST,
+            )
+        )
+        return terminal_result_from_event(stored_event) is not None
 
     async def _compact_or_fail(
         self,
@@ -1170,17 +1394,57 @@ class LocalRunHarness:
         *,
         request: StartRunRequest,
         attempt_index: int,
-    ) -> str | None:
-        """durable 路径下创建 attempt 最小记录并返回 attempt id。
+    ) -> "_ActiveAttempt | None":
+        """durable 路径下创建 attempt 最小记录并返回 active attempt 句柄。
 
-        legacy 内存路径不写 ``host_attempts``,直接返回 ``None``。
+        当 :class:`AttemptSupervisor` 已注入时, harness 不再直接写
+        ``host_attempts``, 而是薄委托 :meth:`AttemptSupervisor.lease_context`:
+        supervisor 在事务内 acquire owner、分配全局单调 fencing token、写入
+        ``host_attempts`` ``state='running'``、启动 renew heartbeat。本方
+        法只持有 :class:`AsyncExitStack` 来跟踪 lease context 的退出, 不
+        计算 TTL、不写 lease SQL、不感知 owner secret token。
+
+        legacy 路径(P6 兼容): 仅有 ``attempt_state_store`` 而无 supervisor
+        时, 保持原 ``CREATED -> RUNNING`` 行为, 等待后续 slice 收口。
+
+        legacy 内存路径(无 ``attempt_state_store``)直接返回 ``None``。
 
         :param request: 当前 attempt 的 start 请求。
         :param attempt_index: 同一 run 内 attempt 序号。
-        :returns: 新创建 attempt id；非 durable 路径返回 ``None``。
-        :raises Exception: 写入失败时透传。
+        :returns: :class:`_ActiveAttempt` 句柄; 非 durable 路径返回
+            ``None``。
+        :raises AttemptFencingError: supervisor acquire 命中非 ACQUIRED
+            决策时透传(P8-S3 主路径首个 attempt 不应出现, 由 P8-S6
+            recovery 路径处理)。
+        :raises Exception: 其它写入失败时透传。
         """
 
+        if self.attempt_supervisor is not None:
+            stack = AsyncExitStack()
+            owner_context = await stack.enter_async_context(
+                self.attempt_supervisor.lease_context(
+                    run_id=request.run_id,
+                    attempt_index=attempt_index,
+                    recovered_from_attempt_id=None,
+                )
+            )
+            _LOGGER.log(
+                VERBOSE_LOG_LEVEL,
+                "host.run.attempt_lease_acquired run_id=%s attempt_id=%s "
+                "attempt_index=%s owner_id=%s owner_token=%s "
+                "fencing_token=%s",
+                request.run_id,
+                owner_context.attempt_id,
+                attempt_index,
+                owner_context.owner_id,
+                owner_context.owner_token.masked(),
+                owner_context.fencing_token.value,
+            )
+            return _ActiveAttempt(
+                attempt_id=owner_context.attempt_id,
+                owner_context=owner_context,
+                lease_exit_stack=stack,
+            )
         if self.attempt_state_store is None or self.storage is None:
             return None
         attempt_id = (
@@ -1206,20 +1470,40 @@ class LocalRunHarness:
             attempt_id,
             attempt_index,
         )
-        return attempt_id
+        return _ActiveAttempt(
+            attempt_id=attempt_id,
+            owner_context=None,
+            lease_exit_stack=None,
+        )
 
     async def _finish_attempt_if_durable(
         self,
         *,
-        attempt_id: str | None,
+        active_attempt: "_ActiveAttempt | None",
         terminal_event: RunEvent | None,
         state: AttemptState | None = None,
         failure_summary: str | None = None,
     ) -> None:
-        """durable 路径下推进 attempt 终态。
+        """durable 路径下推进 attempt 终态 / 诊断态。
 
-        :param attempt_id: 当前 attempt id；``None`` 表示无 durable attempt
-            可推进,直接返回。
+        supervisor 路径:
+
+        - 先尝试 owner-aware diagnostic close: 通过
+          :meth:`AttemptSupervisor.close_attempt_with_diagnostic_state`
+          在同事务内对 ``host_attempts`` 做 owner_token + fencing_token
+          CAS 更新; CAS 命中失败说明 owner 已被 recovery 替换, harness
+          直接放弃覆盖未来状态, 不再退化到 legacy 非 owner-aware update。
+        - 然后才调用 :meth:`AsyncExitStack.aclose` 让
+          :meth:`AttemptSupervisor.lease_context` 退出 (取消 renew loop /
+          清理 supervisor 内部 session)。这样可以保证 CAS 在 supervisor
+          仍持有 session 时执行, 避免 "先丢弃 session 再写库" 的窗口。
+        - terminal event position 的同事务原子写入归 P8-S4 实现, 本
+          slice 仍传 ``None``。
+
+        legacy 路径(无 supervisor): 与 P6 行为一致, 直接更新状态字段。
+
+        :param active_attempt: 当前 active attempt 句柄；``None`` 表示无
+            durable attempt 可推进, 直接返回。
         :param terminal_event: 关联的 terminal RunEvent；提供时由事件类型
             推导默认 attempt state。
         :param state: 显式 attempt state；与 ``terminal_event`` 二选一。
@@ -1235,14 +1519,9 @@ class LocalRunHarness:
                 "_finish_attempt_if_durable 不允许同时传入 terminal_event "
                 "与 state；二者互斥，调用方需明确终态来源。"
             )
-        if (
-            attempt_id is None
-            or self.attempt_state_store is None
-            or self.storage is None
-        ):
+        if active_attempt is None:
             return
         resolved_state = state
-        terminal_position: GlobalEventPosition | None = None
         resolved_failure = failure_summary
         if terminal_event is not None:
             resolved_state = _attempt_state_from_terminal(terminal_event)
@@ -1254,10 +1533,36 @@ class LocalRunHarness:
                 resolved_failure = terminal_event.type.value
         if resolved_state is None:
             resolved_state = AttemptState.FAILED
+        if (
+            self.attempt_supervisor is not None
+            and active_attempt.owner_context is not None
+            and active_attempt.lease_exit_stack is not None
+        ):
+            # owner-aware diagnostic close: 必须在 lease_context 退出前
+            # 完成 CAS 写入, 否则 session 被移除后 verify_owner / 后续
+            # owner-lost signal 都会立即视为已失活。terminal event
+            # position 的同事务原子写入归 P8-S4。
+            await self.attempt_supervisor.close_attempt_with_diagnostic_state(
+                owner_context=active_attempt.owner_context,
+                state=resolved_state,
+                failure_summary=resolved_failure,
+                terminal_event_position=None,
+            )
+            await active_attempt.lease_exit_stack.aclose()
+            _LOGGER.log(
+                VERBOSE_LOG_LEVEL,
+                "host.run.attempt_finished attempt_id=%s state=%s",
+                active_attempt.attempt_id,
+                resolved_state.value,
+            )
+            return
+        if self.attempt_state_store is None or self.storage is None:
+            return
+        terminal_position: GlobalEventPosition | None = None
         async with self.storage.transaction() as tx:
             self.attempt_state_store.update_state(
                 tx=tx,
-                attempt_id=attempt_id,
+                attempt_id=active_attempt.attempt_id,
                 state=resolved_state,
                 terminal_event_position=terminal_position,
                 failure_summary=resolved_failure,
@@ -1265,7 +1570,7 @@ class LocalRunHarness:
         _LOGGER.log(
             VERBOSE_LOG_LEVEL,
             "host.run.attempt_finished attempt_id=%s state=%s",
-            attempt_id,
+            active_attempt.attempt_id,
             resolved_state.value,
         )
 

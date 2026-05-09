@@ -14,15 +14,27 @@
 - P7：``DurableHarnessConfig.tool_trace_path`` 非空（且非空字符串）时，
   装配 :class:`ToolTraceObserver` + :class:`ToolTraceJsonlSink` 并附加进
   observer 元组；为 ``None`` / 空时不装配，行为与 P6 完全一致。
+- P8-S3：``DurableHarnessConfig.attempt_lease_config`` 通过装配层注入
+  attempt lease TTL / renew interval / owner_id 前缀；store 层不持有
+  TTL，public ``start_run`` 也不暴露 TTL。装配产物包含
+  :class:`AttemptLeaseStore` 与 :class:`AttemptSupervisor`，由
+  :class:`LocalRunHarness` 薄委托使用。
 """
 
 from __future__ import annotations
 
 from collections.abc import Callable
 from dataclasses import dataclass
+from datetime import datetime, timezone
 from pathlib import Path
 
 from dayu.contracts import ToolExecutor
+from dayu.host._attempt_lease import (
+    DEFAULT_ATTEMPT_LEASE_CONFIG,
+    AttemptLeaseConfig,
+    UtcClock,
+)
+from dayu.host._attempt_supervisor import AttemptSupervisor
 from dayu.host._audit_projection import AuditProjectionObserver
 from dayu.host._conversation_memory import (
     ConversationMemoryStore,
@@ -43,7 +55,11 @@ from dayu.host._run_harness import (
     _NoopToolExecutor,
 )
 from dayu.host._run_input_context_fact import RunInputContextFactBuilder
-from dayu.host._run_state_store import AttemptStateStore, RunStateStore
+from dayu.host._run_state_store import (
+    AttemptLeaseStore,
+    AttemptStateStore,
+    RunStateStore,
+)
 from dayu.host._timeline_projection import TimelineProjectionObserver
 from dayu.host._tool_runtime import (
     InMemoryToolRuntime,
@@ -51,6 +67,24 @@ from dayu.host._tool_runtime import (
 )
 from dayu.host._tool_trace_jsonl_sink import ToolTraceJsonlSink
 from dayu.host._tool_trace_projection import ToolTraceObserver
+
+
+class _SystemUtcClock:
+    """系统级 UTC clock 默认实现。
+
+    生产装配默认使用本实现; 测试 / smoke 可替换为 fake clock。
+
+    :returns: timezone-aware UTC ``datetime``。
+    """
+
+    def now(self) -> datetime:
+        """返回当前 timezone-aware UTC 时间。
+
+        :returns: timezone-aware UTC datetime。
+        :raises Exception: 不主动抛出异常。
+        """
+
+        return datetime.now(tz=timezone.utc)
 
 
 @dataclass(frozen=True, slots=True)
@@ -61,10 +95,14 @@ class DurableHarnessConfig:
     :param tool_trace_path: P7 tool trace JSONL 输出根目录；``None`` 或空字
         符串视为未配置 trace，不装配 :class:`ToolTraceObserver`，文件系统
         也不会被创建。
+    :param attempt_lease_config: P8-S3 attempt lease 治理配置；默认使用
+        :data:`DEFAULT_ATTEMPT_LEASE_CONFIG`。装配层是 lease TTL / renew
+        interval 真源, public ``start_run`` 不暴露 TTL。
     """
 
     database_path: str
     tool_trace_path: str | None = None
+    attempt_lease_config: AttemptLeaseConfig = DEFAULT_ATTEMPT_LEASE_CONFIG
 
 
 @dataclass(slots=True)
@@ -82,6 +120,10 @@ class DurableHarnessBundle:
         ``None``。
     :param run_state_store: Run minimal state durable store。
     :param attempt_state_store: Attempt minimal state durable store。
+    :param attempt_lease_store: P8-S3 owner lease CAS store。
+    :param attempt_supervisor: P8-S3 attempt 生命周期编排器；
+        :class:`LocalRunHarness` 通过它薄委托 acquire / renew / 收口。
+    :param attempt_lease_config: 当前装配生效的 :class:`AttemptLeaseConfig`。
     :param close: 释放 storage 的回调。
     """
 
@@ -95,6 +137,9 @@ class DurableHarnessBundle:
     tool_trace_observer: ToolTraceObserver | None
     run_state_store: RunStateStore
     attempt_state_store: AttemptStateStore
+    attempt_lease_store: AttemptLeaseStore
+    attempt_supervisor: AttemptSupervisor
+    attempt_lease_config: AttemptLeaseConfig
     close: Callable[[], None]
 
     async def startup_reconcile(self) -> None:
@@ -120,6 +165,7 @@ def build_durable_harness(
     executor: ToolExecutor | None = None,
     memory_store: ConversationMemoryStore | None = None,
     proxy: WorkerProxy | None = None,
+    clock: UtcClock | None = None,
 ) -> DurableHarnessBundle:
     """装配 durable :class:`LocalRunHarness`。
 
@@ -129,12 +175,15 @@ def build_durable_harness(
         :class:`InMemoryConversationMemoryStore`。
     :param proxy: 自定义 WorkerProxy；默认装配本地 EngineWorker + LocalProxy。
         smoke / 测试可注入 stub proxy 跳过真实 Engine。
+    :param clock: 可选 :class:`UtcClock`; 默认使用 :class:`_SystemUtcClock`,
+        测试 / smoke 可注入 fake clock 推进 lease 过期, 不依赖真实 sleep。
     :returns: :class:`DurableHarnessBundle`。
     :raises Exception: 装配失败时透传底层异常。
     """
 
     storage = HostStorage(database_path=config.database_path)
     event_store = open_durable_event_store(storage)
+    actual_clock: UtcClock = clock if clock is not None else _SystemUtcClock()
 
     actual_memory: ConversationMemoryStore = (
         memory_store if memory_store is not None
@@ -179,6 +228,15 @@ def build_durable_harness(
     )
     run_state_store = RunStateStore(storage=storage)
     attempt_state_store = AttemptStateStore(storage=storage)
+    attempt_lease_store = AttemptLeaseStore(
+        storage=storage, clock=actual_clock
+    )
+    attempt_supervisor = AttemptSupervisor(
+        storage=storage,
+        lease_store=attempt_lease_store,
+        lease_config=config.attempt_lease_config,
+        clock=actual_clock,
+    )
     actual_proxy: WorkerProxy = (
         proxy if proxy is not None
         else LocalProxy(worker=EngineWorker(ToolRuntimeToolExecutor(runtime)))
@@ -191,6 +249,7 @@ def build_durable_harness(
         memory_store=actual_memory,
         coordinator=coordinator,
         attempt_state_store=attempt_state_store,
+        attempt_supervisor=attempt_supervisor,
         storage=storage,
         tool_trace_context_fact_enabled=tool_trace_enabled,
         run_input_context_fact_builder=(
@@ -209,6 +268,9 @@ def build_durable_harness(
         tool_trace_observer=tool_trace_observer,
         run_state_store=run_state_store,
         attempt_state_store=attempt_state_store,
+        attempt_lease_store=attempt_lease_store,
+        attempt_supervisor=attempt_supervisor,
+        attempt_lease_config=config.attempt_lease_config,
         close=storage.close,
     )
 
