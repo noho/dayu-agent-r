@@ -24,6 +24,7 @@ from datetime import datetime, timedelta, timezone
 import pytest
 
 from dayu.engine import FinalAnswerData, FinishReason
+from dayu.engine.contracts.engine_events import IterationStartedData
 from dayu.host._attempt_lease import (
     AttemptFencingError,
     AttemptFencingReason,
@@ -396,12 +397,13 @@ async def test_append_terminal_and_close_validates_run_id_and_type() -> None:
                 ),
                 source_engine_event_id="engine_final_other",
             )
-            with pytest.raises(ValueError):
+            with pytest.raises(AttemptFencingError) as exc_info:
                 await supervisor.append_terminal_and_close(
                     owner_context=owner_context,
                     draft=mismatched,
                     failure_summary=None,
                 )
+            assert exc_info.value.reason == AttemptFencingReason.OWNER_MISMATCH
             non_terminal = RunEventDraft(
                 run_id="r1",
                 session_id="s",
@@ -427,5 +429,169 @@ async def test_append_terminal_and_close_validates_run_id_and_type() -> None:
                 run_id="other_run", after=None
             )
             assert events_other == ()
+    finally:
+        storage.close()
+
+
+def _engine_event_draft(*, run_id: str, engine_event_id: str) -> RunEventDraft:
+    """构造一个非 terminal Engine 来源 RunEvent 草稿用于 scoped append 测试。
+
+    :param run_id: Run id。
+    :param engine_event_id: 事件 id, 多次调用必须显式区分以避免 unique 冲突。
+    :returns: :class:`RunEventDraft`。
+    :raises Exception: 不主动抛出异常。
+    """
+
+    return RunEventDraft(
+        run_id=run_id,
+        session_id="s",
+        kind=RunEventKind.CANONICAL,
+        source=RunEventSource.ENGINE,
+        type=RunEventType.ITERATION_STARTED,
+        occurred_at=datetime.now(tz=timezone.utc),
+        data=IterationStartedData(
+            iteration_id="iter-0",
+            iteration_index=0,
+            message_count=1,
+        ),
+        source_engine_event_id=engine_event_id,
+    )
+
+
+@pytest.mark.asyncio
+async def test_scoped_appender_blocks_terminal_drafts() -> None:
+    """``AttemptScopedRunEventAppender.append`` 不接受 terminal draft。
+
+    terminal RunEvent 必须走 :meth:`append_terminal_and_close`, 否则 attempt
+    close 与 terminal append 失去原子性。
+    """
+
+    storage = _open_storage()
+    try:
+        await _seed_run(storage)
+        clock = _FakeClock()
+        supervisor = _build_supervisor(storage=storage, clock=clock)
+        async with supervisor.lease_context(
+            run_id="r1", attempt_index=0
+        ) as owner_context:
+            appender = supervisor.scoped_appender(owner_context)
+            with pytest.raises(ValueError):
+                await appender.append(_final_answer_draft(run_id="r1"))
+            events = await supervisor.event_store.list_events(
+                run_id="r1", after=None
+            )
+            assert events == ()
+    finally:
+        storage.close()
+
+
+@pytest.mark.asyncio
+async def test_scoped_appender_rejects_run_id_mismatch() -> None:
+    """draft.run_id 与 owner_context.run_id 不一致时抛 OWNER_MISMATCH 不写入。"""
+
+    storage = _open_storage()
+    try:
+        await _seed_run(storage)
+        clock = _FakeClock()
+        supervisor = _build_supervisor(storage=storage, clock=clock)
+        async with supervisor.lease_context(
+            run_id="r1", attempt_index=0
+        ) as owner_context:
+            appender = supervisor.scoped_appender(owner_context)
+            mismatch = _engine_event_draft(
+                run_id="other_run", engine_event_id="engine_other"
+            )
+            with pytest.raises(AttemptFencingError) as excinfo:
+                await appender.append(mismatch)
+            assert excinfo.value.reason == AttemptFencingReason.OWNER_MISMATCH
+            assert excinfo.value.attempt_id == owner_context.attempt_id
+            events = await supervisor.event_store.list_events(
+                run_id="r1", after=None
+            )
+            assert events == ()
+            other_events = await supervisor.event_store.list_events(
+                run_id="other_run", after=None
+            )
+            assert other_events == ()
+            # 错误文本不含 owner secret 明文
+            assert owner_context.owner_token.value not in str(excinfo.value)
+    finally:
+        storage.close()
+
+
+@pytest.mark.asyncio
+async def test_scoped_appender_rejects_when_owner_fenced() -> None:
+    """owner 被外部替换后, 非 terminal append 也必须 CAS miss + 整事务回滚。
+
+    这是 Engine event / context fact / ToolRuntime fact 共享的 fencing 路径
+    总入口 (``AttemptScopedRunEventAppender.append``)。任何 stale owner 试图
+    写入都应抛 :class:`AttemptFencingError`, EventLog 不残留 fact。
+    """
+
+    storage = _open_storage()
+    try:
+        await _seed_run(storage)
+        clock = _FakeClock()
+        supervisor = _build_supervisor(storage=storage, clock=clock)
+        async with supervisor.lease_context(
+            run_id="r1", attempt_index=0
+        ) as owner_context:
+            appender = supervisor.scoped_appender(owner_context)
+            # 外部把 fencing_token 改掉: stale owner 视角下 CAS 必然 miss
+            other_owner_token = AttemptOwnerToken.new()
+            async with storage.transaction() as tx:
+                tx.execute(
+                    "UPDATE host_attempts SET owner_token_hash = ?, "
+                    "fencing_token = ? WHERE attempt_id = ?",
+                    (
+                        other_owner_token.digest(),
+                        owner_context.fencing_token.value + 5000,
+                        owner_context.attempt_id,
+                    ),
+                )
+            with pytest.raises(AttemptFencingError) as excinfo:
+                await appender.append(
+                    _engine_event_draft(
+                        run_id="r1", engine_event_id="engine_preview_late"
+                    )
+                )
+            assert excinfo.value.reason in (
+                AttemptFencingReason.OWNER_MISMATCH,
+                AttemptFencingReason.FENCING_TOKEN_MISMATCH,
+            )
+            events = await supervisor.event_store.list_events(
+                run_id="r1", after=None
+            )
+            assert events == ()
+            # 错误文本不含 owner secret 明文
+            assert owner_context.owner_token.value not in str(excinfo.value)
+    finally:
+        storage.close()
+
+
+@pytest.mark.asyncio
+async def test_scoped_appender_appends_when_owner_active() -> None:
+    """owner 仍 active 时, scoped append 在同事务完成 verify_owner + EventLog 写入。"""
+
+    storage = _open_storage()
+    try:
+        await _seed_run(storage)
+        clock = _FakeClock()
+        supervisor = _build_supervisor(storage=storage, clock=clock)
+        async with supervisor.lease_context(
+            run_id="r1", attempt_index=0
+        ) as owner_context:
+            appender = supervisor.scoped_appender(owner_context)
+            event = await appender.append(
+                _engine_event_draft(
+                    run_id="r1", engine_event_id="engine_preview_ok"
+                )
+            )
+            assert event.type == RunEventType.ITERATION_STARTED
+            events = await supervisor.event_store.list_events(
+                run_id="r1", after=None
+            )
+            assert len(events) == 1
+            assert events[0].source_engine_event_id == "engine_preview_ok"
     finally:
         storage.close()

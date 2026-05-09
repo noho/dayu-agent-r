@@ -190,12 +190,23 @@ Host 当前 Run harness、RunEventStore、ToolRuntime、Conversation Memory / Ru
   覆盖 `AttemptSupervisor.append_terminal_and_close` 单 `BEGIN IMMEDIATE` 事务内同时
   完成 owner 校验、terminal RunEvent append 与 attempt 终态 close 的原子语义。正常
   owner 路径断言 `host_attempts.terminal_event_position` 与 EventLog 终态 RunEvent
-  全局 position 一致、`host_runs` 同事务推进到终态并写出 `RunResult` 快照；owner 已被
+  全局 position 一致、`host_runs` 同事务推进到终态并写出 `RunResult` 快照;owner 已被
   替换 / fencing token 不一致 / lease 过期路径断言抛 typed `AttemptFencingError` 且整
   事务回滚（EventLog 不残留 terminal RunEvent，`host_attempts.state` 不被旧 owner 覆盖
-  未来状态，错误文本不暴露 owner secret 明文）；draft 与 owner_context 不一致或非
-  terminal RunEventType 时抛 `ValueError` 且 EventLog 无写入。fake clock 替代真实
+  未来状态，错误文本不暴露 owner secret 明文）;非 terminal RunEventType 时抛 `ValueError`
+  且 EventLog 无写入；draft 与 owner_context 的 `run_id` 不一致时抛
+  `AttemptFencingError(reason=OWNER_MISMATCH)`，同时覆盖 P8-S5 引入的
+  `AttemptScopedRunEventAppender.append` 非 terminal 路径（terminal draft 抛 `ValueError`、
+  run_id mismatch 抛 OWNER_MISMATCH、stale owner / fenced fencing token 抛
+  AttemptFencingError、正常 owner 单事务 verify+append 落库）。fake clock 替代真实
   ``time.sleep`` 推进 lease 过期。
+- P8-S5 ToolRuntime owner fencing（`tests/host/test_phase8_tool_runtime_fencing.py`）：
+  覆盖 `ToolRuntimeOwnerScope` ContextVar 安装 / 恢复（含异常路径）、
+  `active_tool_runtime_appender` scope 外返回 `None`、`InMemoryToolRuntime._resolve_appender`
+  scope 内返回 `AttemptScopedRunEventAppender` / scope 外退化为 `PlainRunEventAppender`，
+  以及 ToolRuntime fact `run_id` mismatch 命中
+  `AttemptFencingError(reason=OWNER_MISMATCH)` 且 EventLog 不残留 fact、错误文本不
+  暴露 owner secret。
 - public boundary：锁定 `dayu.host.__all__`，允许 Run 级 `start_run`、`stream_run_events`、`get_run_result`，
   以及 P2 Run 级 `get_tool_fetch_more_handle`、`fetch_more_tool_result`，阻止 `EngineWorker`、`LocalProxy`、
   `ToolExecutor`、`InMemoryToolRuntime`、`ToolRuntimeToolExecutor`、`InMemoryConversationMemoryStore`、

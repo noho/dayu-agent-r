@@ -8,6 +8,7 @@ from __future__ import annotations
 
 import asyncio
 import base64
+import contextvars
 import copy
 import hashlib
 import hmac
@@ -15,7 +16,8 @@ import json
 import logging
 import secrets
 import time
-from collections.abc import Mapping
+from collections.abc import AsyncGenerator, Mapping
+from contextlib import asynccontextmanager
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from typing import Protocol, TypeAlias, cast
@@ -41,6 +43,7 @@ from dayu.contracts.tool_result import (
 from dayu.host._event_store import RunEventStore
 from dayu.host._event_translation import terminal_result_from_event
 from dayu.host.contracts import (
+    RunEvent,
     RunEventCursor,
     RunEventDraft,
     RunEventKind,
@@ -119,6 +122,139 @@ class _TokenGenerator(Protocol):
         :raises Exception: 具体生成器失败时透传。
         """
         ...
+
+
+class ToolRuntimeEventAppender(Protocol):
+    """ToolRuntime canonical fact append port。
+
+    本 Protocol 是 ToolRuntime 写入 ``TOOL_RESULT_TRUNCATED`` /
+    ``TOOL_CURSOR_*`` / ``TOOL_FETCH_MORE_*`` 等 Host-owned canonical
+    fact 的唯一入口; ``InMemoryToolRuntime`` 的 7 个 ``_append_*``
+    helper 不再直接调用 :class:`RunEventStore.append`, 全部通过当前
+    active appender 落库。
+
+    P8-S5 装配规则:
+
+    - durable 路径: 由 :class:`ToolRuntimeOwnerScope` 在每个 attempt
+      生命周期内安装绑定 owner 的
+      :class:`AttemptScopedRunEventAppender`, 每条 fact append 都在同
+      一 ``BEGIN IMMEDIATE`` 事务内完成 ``verify_owner`` + EventLog
+      append; stale owner / fenced owner 命中时抛
+      ``AttemptFencingError``, 不写诊断 RunEvent;
+    - 非 durable / 测试路径: 退化为 :class:`PlainRunEventAppender`,
+      仅做 ``RunEventStore.append`` 透传, 不引入 owner 校验;
+    - 不允许把 :class:`AttemptOwnerToken` / 任何 owner secret 暴露给
+      ToolExecutor 或工具实现, 也不通过 ``ToolExecutionContext`` 传递
+      owner 句柄。
+
+    Protocol 只承诺 ``await append(draft)`` 返回 :class:`RunEvent`;
+    fenced 失败由具体实现以 ``AttemptFencingError`` 透传给上层 harness,
+    Protocol 不暴露 fencing 状态。
+    """
+
+    async def append(self, draft: RunEventDraft) -> RunEvent:
+        """append 一条 ToolRuntime canonical RunEvent。
+
+        :param draft: RunEvent 草稿。
+        :returns: 已落库的 :class:`RunEvent`。
+        :raises Exception: 实现自身错误透传; durable 实现可能抛
+            ``AttemptFencingError`` / SQLite 错误。
+        """
+        ...
+
+
+@dataclass(frozen=True, slots=True)
+class PlainRunEventAppender:
+    """非 fencing 的 ToolRuntime fact append 实现。
+
+    本实现仅在非 durable / 测试 / bootstrap-without-supervisor 路径下
+    使用, 直接透传到 :class:`RunEventStore.append`, 不做 owner CAS,
+    也不开 ``BEGIN IMMEDIATE`` 事务。durable 路径必须使用
+    :class:`AttemptScopedRunEventAppender`。
+
+    :param event_store: 底层 :class:`RunEventStore`。
+    """
+
+    event_store: RunEventStore
+
+    async def append(self, draft: RunEventDraft) -> RunEvent:
+        """直接通过 :class:`RunEventStore.append` 落库。
+
+        :param draft: RunEvent 草稿。
+        :returns: 已落库的 :class:`RunEvent`。
+        :raises Exception: 底层 EventStore 错误透传。
+        """
+
+        return await self.event_store.append(draft)
+
+
+_ACTIVE_TOOL_RUNTIME_APPENDER: contextvars.ContextVar[
+    ToolRuntimeEventAppender | None
+] = contextvars.ContextVar("dayu_host_tool_runtime_appender", default=None)
+"""ToolRuntime 当前 attempt 绑定的 fencing-aware appender。
+
+:class:`ToolRuntimeOwnerScope` 进入时把 owner 绑定的
+:class:`AttemptScopedRunEventAppender` 注入本 ContextVar; 退出时恢复
+旧值, 异常路径同样恢复。``ContextVar`` 保证并发 run / 嵌套 attempt
+不会互相污染, 也避免把 owner secret 通过 ``ToolExecutionContext``
+泄漏到工具实现。
+"""
+
+
+@asynccontextmanager
+async def ToolRuntimeOwnerScope(  # noqa: N802
+    appender: ToolRuntimeEventAppender,
+) -> AsyncGenerator[None, None]:
+    """以 ContextVar 形式安装 attempt-scoped fencing appender。
+
+    本 async context manager 在每个 attempt 生命周期 (``_run_to_store``)
+    外侧被 :mod:`dayu.host._durable_harness` / :mod:`dayu.host._run_harness`
+    包裹一次, 进入时把 ``appender`` (通常是
+    :class:`AttemptScopedRunEventAppender`) 注入
+    :data:`_ACTIVE_TOOL_RUNTIME_APPENDER`, 离开时无条件恢复旧值, 异常
+    也不例外。
+
+    并发约束:
+
+    - 不通过模块级 dict / 全局变量保存 appender, 避免跨 attempt /
+      跨进程 race;
+    - 使用 :class:`contextvars.ContextVar` 让每个 asyncio Task 持有独立
+      副本; ``run_in_executor`` 路径会自动复制, 不需要额外封装;
+    - framework ``fetch_more`` 嵌套调用本 scope 时, 内层 token 取代外
+      层, 退出后还原, 满足 "framework fetch_more 使用发起 fetch_more
+      的当前 attempt owner" 的语义。
+
+    本 scope 不持有 owner secret 明文; ``appender`` 只暴露
+    :meth:`ToolRuntimeEventAppender.append`, owner token 仅 owner 自己
+    持有, 不会通过 ToolRuntime 流向 ToolExecutor。
+
+    :param appender: 当前 attempt 的 fencing-aware appender。
+    :yields: 无 yield 值; 在 ``with`` 内部 ToolRuntime 的所有 fact
+        append 都会路由到 ``appender``。
+    :raises Exception: yield 内部异常透传; 退出时无条件恢复旧 token。
+    """
+
+    token = _ACTIVE_TOOL_RUNTIME_APPENDER.set(appender)
+    try:
+        yield
+    finally:
+        _ACTIVE_TOOL_RUNTIME_APPENDER.reset(token)
+
+
+def active_tool_runtime_appender() -> ToolRuntimeEventAppender | None:
+    """返回当前 :class:`ToolRuntimeOwnerScope` 安装的 appender。
+
+    供 :class:`LocalRunHarness` 内部 helper 在不显式持有
+    ``_ActiveAttempt`` 句柄时, 仍能命中当前 attempt scope 内的
+    fencing-aware appender; 没有 scope 时返回 ``None``, 调用方需自行
+    退化到 plain append 路径。
+
+    :returns: 当前生效的 :class:`ToolRuntimeEventAppender`; 无 scope 时
+        返回 ``None``。
+    :raises Exception: 不主动抛出异常。
+    """
+
+    return _ACTIVE_TOOL_RUNTIME_APPENDER.get()
 
 
 @dataclass(frozen=True, slots=True)
@@ -201,7 +337,10 @@ class InMemoryToolRuntime:
     """单进程内存态 ToolRuntime。
 
     :param executor: 底层业务 ToolExecutor。
-    :param event_store: Host RunEventStore。
+    :param event_store: Host RunEventStore; 仅用作 ``list_events`` 终态
+        cursor 检测以及无 owner scope 路径的回退 fact append。
+        canonical fact 写入由 :class:`ToolRuntimeEventAppender`
+        统一承担。
     :param truncate_specs: 按工具名注入的显式截断声明。
     :param clock: monotonic clock。
     :param token_generator: cursor 原文生成器。
@@ -221,6 +360,25 @@ class InMemoryToolRuntime:
         init=False,
     )
     _fetch_lock: asyncio.Lock = field(default_factory=asyncio.Lock, init=False)
+
+    def _resolve_appender(self) -> ToolRuntimeEventAppender:
+        """返回当前 attempt scope 内的 fact appender。
+
+        - 若 :class:`ToolRuntimeOwnerScope` 已安装 fencing-aware
+          appender, 直接返回该 appender, 后续 fact append 在同一
+          ``BEGIN IMMEDIATE`` 事务内做 ``verify_owner`` + EventLog
+          append, fenced owner 命中时抛 ``AttemptFencingError``;
+        - 否则退化为 :class:`PlainRunEventAppender`, 直接调用
+          底层 :class:`RunEventStore.append`, 不做 owner CAS。
+
+        :returns: 当前生效的 :class:`ToolRuntimeEventAppender`。
+        :raises Exception: 不主动抛出异常。
+        """
+
+        active = _ACTIVE_TOOL_RUNTIME_APPENDER.get()
+        if active is not None:
+            return active
+        return PlainRunEventAppender(event_store=self.event_store)
 
     async def execute_tool_call(
         self,
@@ -1070,7 +1228,7 @@ class InMemoryToolRuntime:
         :raises Exception: append 失败时透传。
         """
 
-        event = await self.event_store.append(
+        event = await self._resolve_appender().append(
             RunEventDraft(
                 run_id=request.context.run_id,
                 session_id=request.context.session_id,
@@ -1115,7 +1273,7 @@ class InMemoryToolRuntime:
         :raises Exception: append 失败时透传。
         """
 
-        event = await self.event_store.append(
+        event = await self._resolve_appender().append(
             RunEventDraft(
                 run_id=request.context.run_id
                 if isinstance(request, ToolExecutionRequest)
@@ -1147,7 +1305,7 @@ class InMemoryToolRuntime:
         :raises Exception: append 失败时透传。
         """
 
-        event = await self.event_store.append(
+        event = await self._resolve_appender().append(
             RunEventDraft(
                 run_id=record.run_id,
                 session_id=record.session_id,
@@ -1190,7 +1348,7 @@ class InMemoryToolRuntime:
         :raises Exception: append 失败时透传。
         """
 
-        event = await self.event_store.append(
+        event = await self._resolve_appender().append(
             RunEventDraft(
                 run_id=record.run_id,
                 session_id=record.session_id,
@@ -1236,7 +1394,7 @@ class InMemoryToolRuntime:
         :raises Exception: append 失败时透传。
         """
 
-        event = await self.event_store.append(
+        event = await self._resolve_appender().append(
             RunEventDraft(
                 run_id=record.run_id,
                 session_id=record.session_id,
@@ -1271,7 +1429,7 @@ class InMemoryToolRuntime:
         :raises Exception: append 失败时透传。
         """
 
-        event = await self.event_store.append(
+        event = await self._resolve_appender().append(
             RunEventDraft(
                 run_id=record.run_id,
                 session_id=record.session_id,
@@ -1312,7 +1470,7 @@ class InMemoryToolRuntime:
         :raises Exception: append 失败时透传。
         """
 
-        event = await self.event_store.append(
+        event = await self._resolve_appender().append(
             RunEventDraft(
                 run_id=record.run_id,
                 session_id=record.session_id,

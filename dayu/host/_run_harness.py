@@ -11,8 +11,8 @@ import logging
 import uuid
 import weakref
 from collections import OrderedDict
-from collections.abc import AsyncIterator
-from contextlib import AsyncExitStack
+from collections.abc import AsyncGenerator, AsyncIterator
+from contextlib import AbstractAsyncContextManager, AsyncExitStack, asynccontextmanager
 from dataclasses import dataclass, field, replace
 from datetime import datetime, timezone
 from functools import partial
@@ -81,7 +81,11 @@ from dayu.host._run_input_context_fact import RunInputContextFactBuilder
 from dayu.host._run_state_store import AttemptStateStore
 from dayu.host._tool_runtime import (
     InMemoryToolRuntime,
+    PlainRunEventAppender,
+    ToolRuntimeEventAppender,
+    ToolRuntimeOwnerScope,
     ToolRuntimeToolExecutor,
+    active_tool_runtime_appender,
 )
 from dayu.host._worker import EngineWorker
 from dayu.host.contracts import (
@@ -195,6 +199,22 @@ def _iteration_id_for_attempt(*, run_id: str, attempt_index: int) -> str:
     """
 
     return f"{run_id}-attempt-{attempt_index:02d}"
+
+
+@asynccontextmanager
+async def _null_attempt_owner_scope() -> AsyncGenerator[None, None]:
+    """no-op attempt owner scope, 用于 legacy / 无 supervisor 路径。
+
+    与 :class:`ToolRuntimeOwnerScope` 等价的 async context manager 接口,
+    但不修改 ToolRuntime active appender, 也不引入任何 owner CAS。这样
+    ``LocalRunHarness._run_to_store`` 可以无条件用同一形态的
+    ``async with`` 包裹 attempt 体, 不必 if/else 分支。
+
+    :yields: 无 yield 值。
+    :raises Exception: 不主动抛出异常。
+    """
+
+    yield
 
 
 def _synthesize_compact_trace(
@@ -441,6 +461,90 @@ class LocalRunHarness:
         if self.run_input_message_cache_limit <= 0:
             raise ValueError(_ERROR_RUN_INPUT_MESSAGE_CACHE_LIMIT_INVALID)
 
+    def _resolve_attempt_appender(
+        self,
+        active_attempt: "_ActiveAttempt | None",
+    ) -> ToolRuntimeEventAppender:
+        """返回当前 attempt 的 fencing-aware fact appender。
+
+        - durable + supervisor 路径: 返回
+          :class:`AttemptScopedRunEventAppender`,
+          每条 fact append 在同 ``BEGIN IMMEDIATE`` 事务内做
+          ``verify_owner`` + EventLog append, fenced owner 命中时抛
+          :class:`AttemptFencingError`, EventLog 不残留;
+        - legacy / 无 supervisor 路径 (或 ``active_attempt is None``):
+          退化为 :class:`PlainRunEventAppender`, 直接透传
+          :class:`RunEventStore.append`, 与 P6/P7 行为一致。
+
+        :param active_attempt: 当前 active attempt 句柄; 为 ``None`` 表
+            示 run-level 或 lease-lost 之后的非 attempt-scoped 写入。
+        :returns: 当前生效的 :class:`ToolRuntimeEventAppender`。
+        :raises Exception: 不主动抛出异常。
+        """
+
+        if (
+            self.attempt_supervisor is not None
+            and active_attempt is not None
+            and active_attempt.owner_context is not None
+        ):
+            return self.attempt_supervisor.scoped_appender(
+                active_attempt.owner_context
+            )
+        return PlainRunEventAppender(event_store=self.event_store)
+
+    def _scope_appender(self) -> ToolRuntimeEventAppender:
+        """从 ToolRuntime active scope 解析当前 attempt 的 fact appender。
+
+        本 helper 与 :meth:`_resolve_attempt_appender` 互补: 后者要求显
+        式持有 :class:`_ActiveAttempt`, 前者读取由
+        :class:`ToolRuntimeOwnerScope` 安装的 ContextVar, 让
+        ``_compact_or_fail`` 等不直接持有 ``active_attempt`` 的 helper
+        也能命中 attempt-scoped append, 不必把 ``active_attempt`` 显式
+        穿透到所有签名。
+
+        :returns: 当前生效的 :class:`ToolRuntimeEventAppender`; 没有
+            scope 时退化为 :class:`PlainRunEventAppender`。
+        :raises Exception: 不主动抛出异常。
+        """
+
+        active = active_tool_runtime_appender()
+        if active is not None:
+            return active
+        return PlainRunEventAppender(event_store=self.event_store)
+
+    def _attempt_owner_scope(
+        self,
+        active_attempt: "_ActiveAttempt | None",
+    ) -> AbstractAsyncContextManager[None]:
+        """构造当前 attempt 的 ``ToolRuntimeOwnerScope`` 包装。
+
+        durable + supervisor 路径返回真正的
+        :class:`ToolRuntimeOwnerScope`, 在 attempt 生命周期内把绑定
+        owner 的 :class:`AttemptScopedRunEventAppender` 注入到
+        :class:`InMemoryToolRuntime` 的 active appender ContextVar,
+        使 ToolRuntime canonical fact append (``TOOL_RESULT_TRUNCATED``
+        / ``TOOL_CURSOR_*`` / ``TOOL_FETCH_MORE_*``) 与 Engine 翻译事件
+        统一走 fencing-aware 同事务路径; legacy / 无 supervisor / 无
+        ``owner_context`` 路径返回 :func:`_null_attempt_owner_scope`,
+        退化为 P6/P7 行为, 不修改 ToolRuntime active appender。
+
+        :param active_attempt: 当前 attempt 句柄。
+        :returns: async context manager。
+        :raises Exception: 不主动抛出异常。
+        """
+
+        if (
+            self.attempt_supervisor is not None
+            and active_attempt is not None
+            and active_attempt.owner_context is not None
+        ):
+            return ToolRuntimeOwnerScope(
+                self.attempt_supervisor.scoped_appender(
+                    active_attempt.owner_context
+                )
+            )
+        return _null_attempt_owner_scope()
+
     async def start_run(self, request: StartRunRequest) -> RunStream:
         """启动 P1.5 内存态 Run。
 
@@ -585,192 +689,196 @@ class LocalRunHarness:
                     )
                     return
                 try:
-                    while True:
-                        try:
-                            event = await self._next_engine_event_or_lose_owner(
-                                engine_events=engine_events,
-                                active_attempt=current_active_attempt,
-                            )
-                        except StopAsyncIteration:
-                            break
-                        except _OwnerLostDuringEngineWait as lost:
-                            terminal_seen = (
-                                await self._handle_owner_lost(
-                                    request=attempt_request,
+                    async with self._attempt_owner_scope(current_active_attempt):
+                        while True:
+                            try:
+                                event = await self._next_engine_event_or_lose_owner(
+                                    engine_events=engine_events,
                                     active_attempt=current_active_attempt,
-                                    loss_reason=lost.loss_reason,
-                                    event_count=event_count,
-                                    terminal_seen=terminal_seen,
                                 )
-                            )
-                            current_active_attempt = None
-                            return
-                        except Exception as exc:
-                            terminal_seen = (
-                                await self._append_worker_failure_if_needed(
-                                    request=attempt_request,
-                                    error=exc,
-                                    event_count=event_count,
-                                    terminal_seen=terminal_seen,
+                            except StopAsyncIteration:
+                                break
+                            except _OwnerLostDuringEngineWait as lost:
+                                terminal_seen = (
+                                    await self._handle_owner_lost(
+                                        request=attempt_request,
+                                        active_attempt=current_active_attempt,
+                                        loss_reason=lost.loss_reason,
+                                        event_count=event_count,
+                                        terminal_seen=terminal_seen,
+                                    )
                                 )
-                            )
-                            return
-                        event_count += 1
-                        if _is_context_compaction_requested(event):
-                            overflow_trigger_seen = True
-                            overflow_trigger_event = event
-                            _LOGGER.log(
-                                VERBOSE_LOG_LEVEL,
-                                "host.run.context_overflow_triggered "
-                                "session_id=%s run_id=%s attempt_index=%s "
-                                "engine_event_type=%s",
-                                attempt_request.session_id,
-                                attempt_request.run_id,
-                                attempt_index,
-                                event.type.value,
-                            )
-                            await self.event_store.append(
-                                translate_engine_event(event)
-                            )
-                            continue
-                        if _is_context_compaction_required_terminal(event):
-                            overflow_trigger_seen = True
-                            await self._append_overflow_observed(
-                                request=attempt_request,
-                                event=event,
-                                attempt_index=attempt_index,
-                            )
-                            overflow_observed_seen = True
-                            break
-                        if overflow_trigger_seen and _is_terminal_engine_event(
-                            event
-                        ):
-                            await self._append_unexpected_compaction_terminal_closure(
-                                request=attempt_request,
-                                event=event,
-                                attempt_index=attempt_index,
-                            )
-                        draft = translate_engine_event(event)
-                        atomic_attempt = (
-                            current_active_attempt
-                            if (
-                                draft.type in TERMINAL_RUN_EVENT_TYPES
-                                and current_active_attempt is not None
-                                and self._can_atomic_terminal_close(
+                                current_active_attempt = None
+                                return
+                            except Exception as exc:
+                                terminal_seen = (
+                                    await self._append_worker_failure_if_needed(
+                                        request=attempt_request,
+                                        error=exc,
+                                        event_count=event_count,
+                                        terminal_seen=terminal_seen,
+                                    )
+                                )
+                                return
+                            event_count += 1
+                            if _is_context_compaction_requested(event):
+                                overflow_trigger_seen = True
+                                overflow_trigger_event = event
+                                _LOGGER.log(
+                                    VERBOSE_LOG_LEVEL,
+                                    "host.run.context_overflow_triggered "
+                                    "session_id=%s run_id=%s attempt_index=%s "
+                                    "engine_event_type=%s",
+                                    attempt_request.session_id,
+                                    attempt_request.run_id,
+                                    attempt_index,
+                                    event.type.value,
+                                )
+                                await self._resolve_attempt_appender(
                                     current_active_attempt
+                                ).append(translate_engine_event(event))
+                                continue
+                            if _is_context_compaction_required_terminal(event):
+                                overflow_trigger_seen = True
+                                await self._append_overflow_observed(
+                                    request=attempt_request,
+                                    event=event,
+                                    attempt_index=attempt_index,
                                 )
-                            )
-                            else None
-                        )
-                        if atomic_attempt is not None:
-                            stored_event = (
-                                await self._append_terminal_and_close(
-                                    active_attempt=atomic_attempt,
-                                    draft=draft,
+                                overflow_observed_seen = True
+                                break
+                            if overflow_trigger_seen and _is_terminal_engine_event(
+                                event
+                            ):
+                                await self._append_unexpected_compaction_terminal_closure(
+                                    request=attempt_request,
+                                    event=event,
+                                    attempt_index=attempt_index,
                                 )
+                            draft = translate_engine_event(event)
+                            atomic_attempt = (
+                                current_active_attempt
+                                if (
+                                    draft.type in TERMINAL_RUN_EVENT_TYPES
+                                    and current_active_attempt is not None
+                                    and self._can_atomic_terminal_close(
+                                        current_active_attempt
+                                    )
+                                )
+                                else None
                             )
-                        else:
-                            stored_event = await self.event_store.append(draft)
-                        if terminal_result_from_event(stored_event) is not None:
-                            _LOGGER.log(
-                                VERBOSE_LOG_LEVEL,
-                                "host.run.terminal_appended session_id=%s "
-                                "run_id=%s attempt_index=%s "
-                                "engine_event_type=%s event_count=%s "
-                                "event_cursor=%s",
-                                attempt_request.session_id,
-                                attempt_request.run_id,
-                                attempt_index,
-                                event.type.value,
-                                event_count,
-                                stored_event.cursor.sequence,
-                            )
-                            terminal_seen = True
-                            if atomic_attempt is None:
-                                # legacy / 非 supervisor 路径仍走旧 close。
+                            if atomic_attempt is not None:
+                                stored_event = (
+                                    await self._append_terminal_and_close(
+                                        active_attempt=atomic_attempt,
+                                        draft=draft,
+                                    )
+                                )
+                            else:
+                                stored_event = await self._resolve_attempt_appender(
+                                    current_active_attempt
+                                ).append(draft)
+                            if terminal_result_from_event(stored_event) is not None:
+                                _LOGGER.log(
+                                    VERBOSE_LOG_LEVEL,
+                                    "host.run.terminal_appended session_id=%s "
+                                    "run_id=%s attempt_index=%s "
+                                    "engine_event_type=%s event_count=%s "
+                                    "event_cursor=%s",
+                                    attempt_request.session_id,
+                                    attempt_request.run_id,
+                                    attempt_index,
+                                    event.type.value,
+                                    event_count,
+                                    stored_event.cursor.sequence,
+                                )
+                                terminal_seen = True
+                                if atomic_attempt is None:
+                                    # legacy / 非 supervisor 路径仍走旧 close。
+                                    await self._finish_attempt_if_durable(
+                                        active_attempt=current_active_attempt,
+                                        terminal_event=stored_event,
+                                    )
+                                current_active_attempt = None
+                                return
+                        if overflow_trigger_seen:
+                            if (
+                                not overflow_observed_seen
+                                and overflow_trigger_event is not None
+                            ):
+                                await self._append_overflow_observed(
+                                    request=attempt_request,
+                                    event=overflow_trigger_event,
+                                    attempt_index=attempt_index,
+                                )
+                            if current_user_event is None:
+                                raise RuntimeError(
+                                    "context compact requires current_user_event"
+                                )
+                            try:
+                                next_request_with_trace = await self._compact_or_fail(
+                                    request=attempt_request,
+                                    current_user_event=current_user_event,
+                                    attempt_index=attempt_index,
+                                )
+                            except Exception as exc:
+                                terminal_seen = (
+                                    await self._append_compact_exception_failure(
+                                        request=attempt_request,
+                                        attempt_index=attempt_index,
+                                        error=exc,
+                                    )
+                                )
+                                return
+                            if next_request_with_trace is None:
+                                terminal_seen = True
                                 await self._finish_attempt_if_durable(
                                     active_attempt=current_active_attempt,
-                                    terminal_event=stored_event,
+                                    terminal_event=None,
+                                    state=AttemptState.FAILED,
+                                    failure_summary="context_compact_failed",
                                 )
-                            current_active_attempt = None
-                            return
-                    if overflow_trigger_seen:
-                        if (
-                            not overflow_observed_seen
-                            and overflow_trigger_event is not None
-                        ):
-                            await self._append_overflow_observed(
-                                request=attempt_request,
-                                event=overflow_trigger_event,
-                                attempt_index=attempt_index,
-                            )
-                        if current_user_event is None:
-                            raise RuntimeError(
-                                "context compact requires current_user_event"
-                            )
-                        try:
-                            next_request_with_trace = await self._compact_or_fail(
-                                request=attempt_request,
-                                current_user_event=current_user_event,
-                                attempt_index=attempt_index,
-                            )
-                        except Exception as exc:
-                            terminal_seen = (
-                                await self._append_compact_exception_failure(
-                                    request=attempt_request,
-                                    attempt_index=attempt_index,
-                                    error=exc,
-                                )
-                            )
-                            return
-                        if next_request_with_trace is None:
-                            terminal_seen = True
+                                current_active_attempt = None
+                                return
+                            next_request, compact_trace = next_request_with_trace
+                            # 当前 attempt 因 context overflow 关闭,准备启动下一
+                            # attempt: 旧 attempt 状态推进为 STALE,
+                            # 然后为新 attempt 创建持久记录。
                             await self._finish_attempt_if_durable(
                                 active_attempt=current_active_attempt,
                                 terminal_event=None,
-                                state=AttemptState.FAILED,
-                                failure_summary="context_compact_failed",
+                                state=AttemptState.STALE,
+                                failure_summary="context_overflow_compacted",
                             )
-                            current_active_attempt = None
-                            return
-                        next_request, compact_trace = next_request_with_trace
-                        # 当前 attempt 因 context overflow 关闭,准备启动下一
-                        # attempt: 旧 attempt 状态推进为 STALE,
-                        # 然后为新 attempt 创建持久记录。
-                        await self._finish_attempt_if_durable(
-                            active_attempt=current_active_attempt,
-                            terminal_event=None,
-                            state=AttemptState.STALE,
-                            failure_summary="context_overflow_compacted",
-                        )
-                        attempt_request = next_request
-                        attempt_index += 1
-                        current_active_attempt = (
-                            await self._begin_attempt_if_durable(
+                            attempt_request = next_request
+                            attempt_index += 1
+                            current_active_attempt = (
+                                await self._begin_attempt_if_durable(
+                                    request=attempt_request,
+                                    attempt_index=attempt_index,
+                                )
+                            )
+                            await self._append_run_input_context_snapshot_fact(
                                 request=attempt_request,
+                                build_trace=compact_trace,
+                                current_user_event=current_user_event,
                                 attempt_index=attempt_index,
+                                iteration_index=0,
+                                iteration_id=_iteration_id_for_attempt(
+                                    run_id=attempt_request.run_id,
+                                    attempt_index=attempt_index,
+                                ),
+                                active_attempt=current_active_attempt,
+                            )
+                            continue
+                        terminal_seen = (
+                            await self._append_missing_terminal_failure_if_needed(
+                                request=attempt_request,
+                                event_count=event_count,
+                                terminal_seen=terminal_seen,
                             )
                         )
-                        await self._append_run_input_context_snapshot_fact(
-                            request=attempt_request,
-                            build_trace=compact_trace,
-                            current_user_event=current_user_event,
-                            attempt_index=attempt_index,
-                            iteration_index=0,
-                            iteration_id=_iteration_id_for_attempt(
-                                run_id=attempt_request.run_id,
-                                attempt_index=attempt_index,
-                            ),
-                        )
-                        continue
-                    terminal_seen = (
-                        await self._append_missing_terminal_failure_if_needed(
-                            request=attempt_request,
-                            event_count=event_count,
-                            terminal_seen=terminal_seen,
-                        )
-                    )
-                    return
+                        return
                 finally:
                     await _close_engine_events_if_supported(
                         engine_events=engine_events,
@@ -975,7 +1083,7 @@ class LocalRunHarness:
                 request=request,
                 attempt_index=attempt_index,
             )
-            await self.event_store.append(
+            await self._scope_appender().append(
                 context_compact_failed_draft(
                     run_id=request.run_id,
                     session_id=request.session_id,
@@ -983,7 +1091,7 @@ class LocalRunHarness:
                     data=failed_data,
                 )
             )
-            await self.event_store.append(
+            await self._scope_appender().append(
                 host_context_compact_failure_terminal_draft(
                     run_id=request.run_id,
                     session_id=request.session_id,
@@ -1016,7 +1124,7 @@ class LocalRunHarness:
                 reason=ContextCompactFailureReason.TRACE_MISSING,
                 message=_COMPACT_TRACE_MISSING_MESSAGE,
             )
-            await self.event_store.append(
+            await self._scope_appender().append(
                 context_compact_failed_draft(
                     run_id=request.run_id,
                     session_id=request.session_id,
@@ -1024,7 +1132,7 @@ class LocalRunHarness:
                     data=failed_data,
                 )
             )
-            await self.event_store.append(
+            await self._scope_appender().append(
                 host_context_compact_failure_terminal_draft(
                     run_id=request.run_id,
                     session_id=request.session_id,
@@ -1040,7 +1148,7 @@ class LocalRunHarness:
             current_user_event=current_user_event,
             attempt_index=attempt_index,
         )
-        await self.event_store.append(
+        await self._scope_appender().append(
             context_compact_requested_draft(
                 run_id=request.run_id,
                 session_id=request.session_id,
@@ -1063,7 +1171,7 @@ class LocalRunHarness:
                 failed_data.before_token_estimate,
                 failed_data.after_token_estimate,
             )
-            await self.event_store.append(
+            await self._scope_appender().append(
                 context_compact_failed_draft(
                     run_id=request.run_id,
                     session_id=request.session_id,
@@ -1071,7 +1179,7 @@ class LocalRunHarness:
                     data=failed_data,
                 )
             )
-            await self.event_store.append(
+            await self._scope_appender().append(
                 host_context_compact_failure_terminal_draft(
                     run_id=request.run_id,
                     session_id=request.session_id,
@@ -1097,7 +1205,7 @@ class LocalRunHarness:
             completed_data.after_token_estimate,
             completed_data.dropped_item_count,
         )
-        await self.event_store.append(
+        await self._scope_appender().append(
             context_compact_completed_draft(
                 run_id=request.run_id,
                 session_id=request.session_id,
@@ -1115,7 +1223,7 @@ class LocalRunHarness:
             attempt_index,
             next_attempt_index,
         )
-        await self.event_store.append(
+        await self._scope_appender().append(
             context_attempt_retrying_draft(
                 run_id=request.run_id,
                 session_id=request.session_id,
@@ -1165,7 +1273,7 @@ class LocalRunHarness:
             reason=ContextCompactFailureReason.INTERNAL_ERROR,
             message=str(error),
         )
-        await self.event_store.append(
+        await self._scope_appender().append(
             context_compact_failed_draft(
                 run_id=request.run_id,
                 session_id=request.session_id,
@@ -1173,7 +1281,7 @@ class LocalRunHarness:
                 data=failed_data,
             )
         )
-        stored_event = await self.event_store.append(
+        stored_event = await self._scope_appender().append(
             host_context_compact_failure_terminal_draft(
                 run_id=request.run_id,
                 session_id=request.session_id,
@@ -1225,7 +1333,7 @@ class LocalRunHarness:
             engine_error_code,
             recoverable,
         )
-        await self.event_store.append(
+        await self._scope_appender().append(
             context_overflow_observed_draft(
                 run_id=request.run_id,
                 session_id=request.session_id,
@@ -1275,7 +1383,7 @@ class LocalRunHarness:
             reason=ContextCompactFailureReason.INTERNAL_ERROR,
             message=_UNEXPECTED_COMPACTION_TERMINAL_MESSAGE,
         )
-        await self.event_store.append(
+        await self._scope_appender().append(
             context_compact_failed_draft(
                 run_id=request.run_id,
                 session_id=request.session_id,
@@ -1315,7 +1423,7 @@ class LocalRunHarness:
         )
         if terminal_seen:
             return True
-        stored_event = await self.event_store.append(
+        stored_event = await self._scope_appender().append(
             host_failure_draft(
                 run_id=request.run_id,
                 session_id=request.session_id,
@@ -1353,7 +1461,7 @@ class LocalRunHarness:
             request.run_id,
             event_count,
         )
-        stored_event = await self.event_store.append(
+        stored_event = await self._scope_appender().append(
             host_failure_draft(
                 run_id=request.run_id,
                 session_id=request.session_id,
@@ -1750,12 +1858,19 @@ class LocalRunHarness:
         attempt_index: int,
         iteration_index: int,
         iteration_id: str,
+        active_attempt: "_ActiveAttempt | None" = None,
     ) -> None:
         """同事务追加 ``RUN_INPUT_CONTEXT_SNAPSHOT_BUILT`` canonical fact。
 
         非 durable 路径（``event_store`` 不是 :class:`DurableRunEventStore`
         或 ``storage is None``）以及 ``tool_trace_context_fact_enabled`` 未开
         启时直接 no-op，保持 P6 行为不变。
+
+        当 ``active_attempt`` 非 ``None`` 且 supervisor 路径生效时, 改走
+        :class:`AttemptScopedRunEventAppender.append_in_transaction`,
+        在同 ``BEGIN IMMEDIATE`` 内执行 ``verify_owner`` + EventLog
+        append; 其它路径退化为 :meth:`DurableRunEventStore.append_in_transaction`,
+        与 P6 行为一致 (start_run 阶段尚未开 attempt, 不参与 fencing)。
 
         :param request: 当前 attempt 的 start 请求；其 ``input.messages`` 为
             实际交给 Engine 的消息序列。
@@ -1767,8 +1882,11 @@ class LocalRunHarness:
             定为 0。
         :param iteration_id: 占位 iteration_id（见
             :func:`_iteration_id_for_attempt`）。
+        :param active_attempt: 当前 active attempt; 非 ``None`` 时启用 owner
+            fencing。
         :returns: 无返回值。
         :raises ValueError: 启用 fact 但未注入 builder 时抛出。
+        :raises AttemptFencingError: scoped 路径下 owner CAS 失败。
         :raises Exception: 同事务 append 失败时透传。
         """
 
@@ -1799,8 +1917,20 @@ class LocalRunHarness:
             data=data,
             source_engine_event_id=None,
         )
+        scoped = (
+            self.attempt_supervisor.scoped_appender(active_attempt.owner_context)
+            if (
+                self.attempt_supervisor is not None
+                and active_attempt is not None
+                and active_attempt.owner_context is not None
+            )
+            else None
+        )
         async with self.storage.transaction() as tx:
-            self.event_store.append_in_transaction(tx=tx, draft=draft)
+            if scoped is not None:
+                scoped.append_in_transaction(tx=tx, draft=draft)
+            else:
+                self.event_store.append_in_transaction(tx=tx, draft=draft)
         _LOGGER.log(
             VERBOSE_LOG_LEVEL,
             "host.run.run_input_context_snapshot_built run_id=%s "

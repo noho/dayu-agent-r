@@ -57,6 +57,9 @@
   Close 原子垂直片已完成实施、code review、修复与复审，review / rereview 见
   `docs/host/phase8-s4-code-review.md`、`docs/host/phase8-s4-fix-rereview.md`，结论通过；
   下一入口是 P8-S5：Attempt-scoped Append 与 ToolRuntime Fencing。
+  P8-S5 Attempt-scoped Append 与 ToolRuntime Fencing 已完成实施与 code review，
+  review 见 `docs/host/phase8-s5-code-review.md`，结论通过。下一入口是 P8-S6：
+  Stale / Orphan Recovery 新 Attempt 主路径。
 
 每个 Phase 进入实现前，必须另写可交接的 phase plan，细化到迁移 Agent 可以直接接手：
 目标、非目标、边界、文件级改动清单、契约变化、状态机、测试清单、验证命令、review gate、
@@ -469,11 +472,17 @@ P16 收口项。
   `terminal_event_position` 写入已通过 `AttemptSupervisor.append_terminal_and_close(...)`
   固定到同一个 `BEGIN IMMEDIATE` 事务；`terminal_event_position` 与 terminal RunEvent
   global position 同源。
-- `deferred-with-owner: P8-S5`：Engine-sourced EventLog append、context facts 与 ToolRuntime
-  Host-owned canonical facts 仍需统一走 attempt-scoped append port，在事务内执行
-  `verify_owner` CAS；P8-S3 只提供运行时 owner-lost 停止信号，不替代 S5 的事务级 fencing。
+- `completed: P8-S5`：Engine-sourced EventLog append、context facts（含
+  `RUN_INPUT_CONTEXT_SNAPSHOT_BUILT`）与 ToolRuntime Host-owned canonical facts（truncate /
+  cursor / fetch_more）已统一走 attempt-scoped append port；`AttemptScopedRunEventAppender`
+  在同一 `BEGIN IMMEDIATE` 事务内执行 `verify_owner` CAS + `append_with_position_in_transaction`；
+  `ToolRuntimeOwnerScope` ContextVar 保证 ToolRuntime helper 读取当前 attempt owner。
+  framework `fetch_more` 端到端 fenced 测试作为 P8-S6 residual risk 补强。
 - `deferred-with-owner: P8-S6`：recovery scan / `MARK_RECOVERING_AND_CREATE_ATTEMPT` 仍未实现；
   stale / orphan attempt 的恢复必须在新 recovery attempt 中继续，不 takeover 同一 attempt。
+- `deferred-with-owner: P8-S6`：framework `fetch_more` 端到端 fenced 测试。P8-S5 组件级测试已证明
+  `ToolRuntimeOwnerScope` + `AttemptScopedRunEventAppender` 的 fencing contract，但缺少从
+  `InMemoryToolRuntime.fetch_more()` 入口到 EventLog 的端到端 fenced 断言；P8-S6 补强。
 - `deferred-with-owner: P8-S7 / issue #38`：默认 deterministic multiprocessing 测试仍未落地；
   慢硬盘 + Docker Linux stress 作为增强手工压力测试由 GitHub issue #38 跟踪。
 - `deferred-with-owner: P16`：P8-S3 测试 fake 当前用 `cast(AttemptSupervisor, ...)` 桥接具体类；

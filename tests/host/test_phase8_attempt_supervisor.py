@@ -55,6 +55,7 @@ from dayu.host._attempt_lease import (
 )
 from dayu.host._attempt_supervisor import (
     AttemptOwnerLossReason,
+    AttemptScopedRunEventAppender,
     AttemptSupervisor,
 )
 from dayu.host._durable_event_store import (
@@ -1026,6 +1027,11 @@ class _RecordingDiagnosticSupervisor:
 
     def is_owner_active(self, owner_context: AttemptOwnerContext) -> bool:
         return self.inner.is_owner_active(owner_context)
+
+    def scoped_appender(
+        self, owner_context: AttemptOwnerContext
+    ) -> AttemptScopedRunEventAppender:
+        return self.inner.scoped_appender(owner_context)
 
     async def wait_owner_lost(
         self, owner_context: AttemptOwnerContext

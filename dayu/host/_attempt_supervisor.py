@@ -61,16 +61,27 @@ from dayu.host._attempt_state_mapping import (
     attempt_state_from_terminal_event_type,
 )
 from dayu.host._durable_event_store import DurableRunEventStore
-from dayu.host._host_storage_transaction import HostStorage
+from dayu.host._host_storage_transaction import (
+    HostStorage,
+    HostStorageTransaction,
+)
 from dayu.host._internal_contracts import AttemptState, GlobalEventPosition
 from dayu.host._run_state_store import AttemptLeaseStore
 from dayu.host.contracts import (
     TERMINAL_RUN_EVENT_TYPES,
+    RunEvent,
     RunEventCursor,
     RunEventDraft,
 )
 
 _LOGGER: logging.Logger = logging.getLogger(__name__)
+_ERROR_TERMINAL_REQUIRES_TERMINAL_TYPE: str = (
+    "append_terminal_and_close requires terminal RunEventType"
+)
+_ERROR_TERMINAL_DRAFT_TERMINAL_TYPE: str = (
+    "AttemptScopedRunEventAppender.append cannot accept terminal "
+    "RunEventType; use append_terminal_and_close"
+)
 
 
 class AttemptOwnerLossReason(StrEnum):
@@ -152,6 +163,230 @@ def _default_attempt_id(*, run_id: str, attempt_index: int) -> str:
     """
 
     return f"attempt-{run_id}-{attempt_index}-{uuid.uuid4().hex[:8]}"
+
+
+@dataclass(frozen=True, slots=True)
+class AttemptScopedRunEventAppender:
+    """绑定 owner 的 attempt-scoped RunEvent append port。
+
+    本类型是 P8-S5 attempt-scoped append 的强类型入口: 所有由当前
+    attempt owner 写入的 canonical fact (Engine-sourced event、context
+    overflow / compact facts、``RUN_INPUT_CONTEXT_SNAPSHOT_BUILT``、
+    ToolRuntime ``TOOL_RESULT_TRUNCATED`` / ``TOOL_CURSOR_*`` /
+    ``TOOL_FETCH_MORE_*``) 都通过本类型在同一个 ``BEGIN IMMEDIATE``
+    事务内执行 :meth:`AttemptLeaseStore.verify_owner` + EventLog append,
+    任意 owner CAS 命中失败抛 :class:`AttemptFencingError` 整事务回滚,
+    EventLog 不残留 stale fact。
+
+    构造约束:
+
+    - 由 :meth:`AttemptSupervisor.scoped_appender` 构造, 调用方不应直接
+      持有 ``DurableRunEventStore`` / ``AttemptLeaseStore`` 自行组装事务;
+    - ``owner_context`` 是当前 attempt 的 owner 句柄, 不允许跨 attempt /
+      跨 run 复用;
+    - 所有 append 在内部对 ``draft.run_id`` 与 ``owner_context.run_id``
+      做严格相等校验, 不一致时抛
+      :class:`AttemptFencingError(reason=OWNER_MISMATCH)`, 防止 ToolRuntime
+      在 attempt 边界 race 期间把旧 cursor 的 fact 写到错误 run。
+
+    fencing 真源仍是 :meth:`AttemptLeaseStore.verify_owner` 的事务内 CAS,
+    本类型不缓存任何 lease 状态、不旁路 SQL CAS, 也不写诊断 RunEvent;
+    fenced late write 直接通过 ``AttemptFencingError`` 透传给上层, 由调
+    用方负责 masked 日志 + typed 收口。
+
+    :param storage: 共享 :class:`HostStorage`。
+    :param event_store: durable :class:`DurableRunEventStore`; 同事务内
+        通过 :meth:`append_with_position_in_transaction` 落库。
+    :param lease_store: P8-S1 已落地的 :class:`AttemptLeaseStore`,
+        承载 ``verify_owner`` / ``close_terminal`` CAS。
+    :param owner_context: 绑定的 owner 句柄。
+    """
+
+    storage: HostStorage
+    event_store: DurableRunEventStore
+    lease_store: AttemptLeaseStore
+    owner_context: AttemptOwnerContext
+
+    async def append(self, draft: RunEventDraft) -> RunEvent:
+        """在 ``BEGIN IMMEDIATE`` 事务内 append 非 terminal RunEvent。
+
+        步骤:
+
+        1. 校验 ``draft.run_id == owner_context.run_id``, 不一致时抛
+           :class:`AttemptFencingError(reason=OWNER_MISMATCH)`;
+        2. 校验 ``draft.type`` 不属于 :data:`TERMINAL_RUN_EVENT_TYPES`,
+           terminal RunEvent 必须走 :meth:`append_terminal_and_close`,
+           否则 attempt close 与 terminal append 失去原子性;
+        3. 在同一事务内调用 :meth:`AttemptLeaseStore.verify_owner` +
+           :meth:`DurableRunEventStore.append_with_position_in_transaction`,
+           任一 CAS 失败抛 :class:`AttemptFencingError`, 整事务回滚。
+
+        非 terminal append 的全局 ``GlobalEventPosition`` 不向调用方暴
+        露, 由 ``AppendedRunEvent`` 内部使用; 这与 P6 行为保持一致。
+
+        :param draft: RunEvent 草稿。
+        :returns: 已落库的 :class:`RunEvent`。
+        :raises ValueError: draft 类型为 terminal 时抛出。
+        :raises AttemptFencingError: ``run_id`` 不匹配或 owner CAS 失败。
+        :raises sqlite3.DatabaseError: 非冲突 SQLite 错误透传。
+        """
+
+        if draft.type in TERMINAL_RUN_EVENT_TYPES:
+            raise ValueError(_ERROR_TERMINAL_DRAFT_TERMINAL_TYPE)
+        self._verify_run_id_matches(draft=draft)
+        async with self.storage.transaction() as tx:
+            self.lease_store.verify_owner(
+                tx=tx,
+                owner_context=self.owner_context,
+            )
+            appended = self.event_store.append_with_position_in_transaction(
+                tx=tx,
+                draft=draft,
+            )
+        return appended.event
+
+    def append_in_transaction(
+        self,
+        *,
+        tx: HostStorageTransaction,
+        draft: RunEventDraft,
+    ) -> RunEvent:
+        """在外层事务内同事务 append 非 terminal RunEvent。
+
+        本方法供已经持有 ``HostStorageTransaction`` 的调用方使用 (例如
+        ``LocalRunHarness._append_run_input_context_snapshot_fact`` 之
+        前已自行开事务的路径), 保证 ``verify_owner`` 与 append 仍在同一
+        ``BEGIN IMMEDIATE`` 事务内, 不允许跨事务组合。
+
+        :param tx: 调用方提供的事务上下文。
+        :param draft: RunEvent 草稿。
+        :returns: 已落库的 :class:`RunEvent`。
+        :raises ValueError: draft 类型为 terminal 时抛出。
+        :raises AttemptFencingError: ``run_id`` 不匹配或 owner CAS 失败。
+        :raises sqlite3.DatabaseError: 非冲突 SQLite 错误透传。
+        """
+
+        if draft.type in TERMINAL_RUN_EVENT_TYPES:
+            raise ValueError(_ERROR_TERMINAL_DRAFT_TERMINAL_TYPE)
+        self._verify_run_id_matches(draft=draft)
+        self.lease_store.verify_owner(
+            tx=tx,
+            owner_context=self.owner_context,
+        )
+        appended = self.event_store.append_with_position_in_transaction(
+            tx=tx,
+            draft=draft,
+        )
+        return appended.event
+
+    async def append_terminal_and_close(
+        self,
+        *,
+        draft: RunEventDraft,
+        failure_summary: str | None = None,
+    ) -> AttemptTerminalLink:
+        """同事务原子 terminal RunEvent append + attempt 终态 close。
+
+        与 :meth:`AttemptSupervisor.append_terminal_and_close` 语义一致:
+        在单一 ``BEGIN IMMEDIATE`` 事务内顺序完成
+        :meth:`AttemptLeaseStore.verify_owner` ->
+        :meth:`DurableRunEventStore.append_with_position_in_transaction` ->
+        :meth:`AttemptLeaseStore.close_terminal`, 任一 CAS 命中失败抛
+        :class:`AttemptFencingError` 整事务回滚, EventLog 不残留 stale
+        terminal RunEvent。
+
+        :param draft: terminal RunEvent 草稿; 类型必须属于
+            :data:`TERMINAL_RUN_EVENT_TYPES`。
+        :param failure_summary: 失败摘要; 成功 / 取消 / 暂停诊断为
+            ``None``。
+        :returns: :class:`AttemptTerminalLink` 含 attempt id、run id、
+            terminal state、cursor 与全局 position。
+        :raises ValueError: draft 与 owner_context 不一致或 draft 非
+            terminal type 时抛出。
+        :raises AttemptFencingError: 任一 owner CAS 命中失败时抛出, 整
+            事务回滚, EventLog 不残留 terminal RunEvent。
+        :raises sqlite3.DatabaseError: 非冲突 SQLite 错误透传。
+        """
+
+        if draft.type not in TERMINAL_RUN_EVENT_TYPES:
+            raise ValueError(_ERROR_TERMINAL_REQUIRES_TERMINAL_TYPE)
+        self._verify_run_id_matches(draft=draft)
+        terminal_state = attempt_state_from_terminal_event_type(draft.type)
+        async with self.storage.transaction() as tx:
+            self.lease_store.verify_owner(
+                tx=tx,
+                owner_context=self.owner_context,
+            )
+            appended = self.event_store.append_with_position_in_transaction(
+                tx=tx,
+                draft=draft,
+            )
+            self.lease_store.close_terminal(
+                tx=tx,
+                owner_context=self.owner_context,
+                state=terminal_state,
+                terminal_event_position=appended.event_position,
+                failure_summary=failure_summary,
+            )
+        _LOGGER.debug(
+            "host.attempt.terminal_close_applied attempt_id=%s "
+            "owner_id=%s owner_token=%s fencing_token=%s state=%s "
+            "event_position=%s sequence=%s",
+            self.owner_context.attempt_id,
+            self.owner_context.owner_id,
+            self.owner_context.owner_token.masked(),
+            self.owner_context.fencing_token.value,
+            terminal_state.value,
+            appended.event_position.value,
+            appended.event.cursor.sequence,
+        )
+        return AttemptTerminalLink(
+            attempt_id=self.owner_context.attempt_id,
+            run_id=self.owner_context.run_id,
+            terminal_state=terminal_state,
+            event=appended.event,
+            event_cursor=RunEventCursor(
+                sequence=appended.event.cursor.sequence
+            ),
+            event_position=appended.event_position,
+        )
+
+    def _verify_run_id_matches(self, *, draft: RunEventDraft) -> None:
+        """校验 draft.run_id 与 owner_context.run_id 严格相等。
+
+        与 store 层 ``verify_owner`` 不同, 本检查是 attempt-scoped append
+        的第一道防线: 旧 owner 不应该用绑定它的 appender 写入到其它 run
+        的 EventLog, ToolRuntime 在 attempt 边界 race 期间也不应让旧
+        cursor 写入新 run。命中失败映射为
+        :class:`AttemptFencingError(reason=OWNER_MISMATCH)`, 不写诊断
+        RunEvent, 由调用方按 typed refusal 收口。
+
+        :param draft: 待校验的 RunEvent 草稿。
+        :returns: 无返回值。
+        :raises AttemptFencingError: ``run_id`` 不匹配时抛出。
+        """
+
+        if draft.run_id == self.owner_context.run_id:
+            return
+        _LOGGER.warning(
+            "host.attempt.scoped_append_run_id_mismatch "
+            "attempt_id=%s owner_run_id=%s draft_run_id=%s "
+            "owner_id=%s owner_token=%s fencing_token=%s",
+            self.owner_context.attempt_id,
+            self.owner_context.run_id,
+            draft.run_id,
+            self.owner_context.owner_id,
+            self.owner_context.owner_token.masked(),
+            self.owner_context.fencing_token.value,
+        )
+        raise AttemptFencingError(
+            attempt_id=self.owner_context.attempt_id,
+            run_id=self.owner_context.run_id,
+            reason=AttemptFencingReason.OWNER_MISMATCH,
+            current_state=AttemptState.RUNNING,
+            owner_id=self.owner_context.owner_id,
+            fencing_token=self.owner_context.fencing_token,
+        )
 
 
 @dataclass(slots=True)
@@ -433,54 +668,33 @@ class AttemptSupervisor:
         :raises sqlite3.DatabaseError: 非冲突 SQLite 错误透传。
         """
 
-        if draft.run_id != owner_context.run_id:
-            raise ValueError(
-                "RunEventDraft.run_id does not match owner_context.run_id"
-            )
-        if draft.type not in TERMINAL_RUN_EVENT_TYPES:
-            raise ValueError(
-                "append_terminal_and_close requires terminal RunEventType"
-            )
-        terminal_state = attempt_state_from_terminal_event_type(draft.type)
-        async with self.storage.transaction() as tx:
-            self.lease_store.verify_owner(
-                tx=tx,
-                owner_context=owner_context,
-            )
-            appended = (
-                self.event_store.append_with_position_in_transaction(
-                    tx=tx,
-                    draft=draft,
-                )
-            )
-            self.lease_store.close_terminal(
-                tx=tx,
-                owner_context=owner_context,
-                state=terminal_state,
-                terminal_event_position=appended.event_position,
-                failure_summary=failure_summary,
-            )
-        _LOGGER.debug(
-            "host.attempt.terminal_close_applied attempt_id=%s "
-            "owner_id=%s owner_token=%s fencing_token=%s state=%s "
-            "event_position=%s sequence=%s",
-            owner_context.attempt_id,
-            owner_context.owner_id,
-            owner_context.owner_token.masked(),
-            owner_context.fencing_token.value,
-            terminal_state.value,
-            appended.event_position.value,
-            appended.event.cursor.sequence,
+        appender = self.scoped_appender(owner_context)
+        return await appender.append_terminal_and_close(
+            draft=draft,
+            failure_summary=failure_summary,
         )
-        return AttemptTerminalLink(
-            attempt_id=owner_context.attempt_id,
-            run_id=owner_context.run_id,
-            terminal_state=terminal_state,
-            event=appended.event,
-            event_cursor=RunEventCursor(
-                sequence=appended.event.cursor.sequence
-            ),
-            event_position=appended.event_position,
+
+    def scoped_appender(
+        self, owner_context: AttemptOwnerContext
+    ) -> "AttemptScopedRunEventAppender":
+        """构造绑定指定 owner 的 :class:`AttemptScopedRunEventAppender`。
+
+        本工厂是 P8-S5 attempt-scoped append 的唯一公开入口: harness /
+        ToolRuntime owner scope / supervisor 自身的 terminal close 都通过
+        本方法构造 appender, 不允许调用方直接持有
+        :class:`DurableRunEventStore` 或 :class:`AttemptLeaseStore` 自行
+        组装事务。
+
+        :param owner_context: 当前 owner 句柄。
+        :returns: 绑定 owner 的 attempt-scoped append port。
+        :raises Exception: 不主动抛出异常。
+        """
+
+        return AttemptScopedRunEventAppender(
+            storage=self.storage,
+            event_store=self.event_store,
+            lease_store=self.lease_store,
+            owner_context=owner_context,
         )
 
     async def _acquire_in_transaction(
@@ -789,5 +1003,6 @@ class AttemptSupervisor:
 
 __all__ = [
     "AttemptOwnerLossReason",
+    "AttemptScopedRunEventAppender",
     "AttemptSupervisor",
 ]

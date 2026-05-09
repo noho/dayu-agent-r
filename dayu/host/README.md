@@ -345,8 +345,21 @@ owner_context + lease_exit_stack 时通过 `_can_atomic_terminal_close` 路由�
 完成后立即 `aclose` lease_exit_stack 退出 supervisor lease_context；非 supervisor 装配
 路径退化为既有的 `event_store.append` + `_finish_attempt_if_durable` 两步。
 public `StartRunRequest` / `start_run` 不暴露 lease TTL，owner secret token 明文不入库、
-不进入日志、不进入 EventLog payload。当前 ToolRuntime / EventLog 事务级 attempt-scoped
-CAS append、recovery scan 与多进程稳态仍未落地，分别归 P8-S5 / P8-S6 / P8-S7。
+不进入日志、不进入 EventLog payload。P8-S5 进一步把 attempt-scoped append 收敛到
+`AttemptScopedRunEventAppender`：所有由当前 attempt owner 写入的 canonical fact
+（Engine-sourced 翻译事件、`CONTEXT_OVERFLOW_OBSERVED` / `CONTEXT_COMPACT_*` /
+`CONTEXT_ATTEMPT_RETRYING`、`RUN_INPUT_CONTEXT_SNAPSHOT_BUILT`、ToolRuntime
+`TOOL_RESULT_TRUNCATED` / `TOOL_CURSOR_*` / `TOOL_FETCH_MORE_*`）都通过该 appender
+在同一 `BEGIN IMMEDIATE` 事务内执行 `verify_owner` + EventLog append；
+`draft.run_id` 与 `owner_context.run_id` 不一致直接抛 typed
+`AttemptFencingError(reason=OWNER_MISMATCH)`，stale owner / fencing token 不一致 / lease
+过期同样抛 `AttemptFencingError` 整事务回滚，EventLog 不残留 stale fact，也不写诊断
+RunEvent。`AttemptSupervisor.scoped_appender(owner_context)` 是构造该 appender 的唯一
+公开入口；`LocalRunHarness._run_to_store` 在每个 attempt 生命周期内通过
+`ToolRuntimeOwnerScope`（基于 `contextvars.ContextVar`）把 scoped appender 注入到
+`InMemoryToolRuntime`，使框架级 `fetch_more` 也按 originating attempt 的 owner
+落库，避免跨 attempt 写错 run。`ToolExecutionContext` 不变，不向 ToolExecutor 暴露
+任何 owner secret。当前 recovery scan 与多进程稳态仍未落地，分别归 P8-S6 / P8-S7。
 
 Host 已落地主路径使用日志表达执行边界：`VERBOSE` 覆盖 `start_run` 接纳、background task、attempt、
 EngineWorker 调用、terminal append、context overflow / compact / retry、ToolRuntime 调用边界、
