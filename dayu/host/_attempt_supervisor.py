@@ -54,11 +54,21 @@ from dayu.host._attempt_lease import (
     AttemptLeaseResult,
     AttemptOwnerContext,
     AttemptOwnerToken,
+    AttemptTerminalLink,
     UtcClock,
 )
+from dayu.host._attempt_state_mapping import (
+    attempt_state_from_terminal_event_type,
+)
+from dayu.host._durable_event_store import DurableRunEventStore
 from dayu.host._host_storage_transaction import HostStorage
 from dayu.host._internal_contracts import AttemptState, GlobalEventPosition
 from dayu.host._run_state_store import AttemptLeaseStore
+from dayu.host.contracts import (
+    TERMINAL_RUN_EVENT_TYPES,
+    RunEventCursor,
+    RunEventDraft,
+)
 
 _LOGGER: logging.Logger = logging.getLogger(__name__)
 
@@ -163,6 +173,7 @@ class AttemptSupervisor:
     lease_store: AttemptLeaseStore
     lease_config: AttemptLeaseConfig
     clock: UtcClock
+    event_store: DurableRunEventStore
     _sessions: dict[str, _LeaseSession] = field(
         default_factory=dict, init=False
     )
@@ -377,6 +388,100 @@ class AttemptSupervisor:
             state.value,
         )
         return True
+
+    async def append_terminal_and_close(
+        self,
+        *,
+        owner_context: AttemptOwnerContext,
+        draft: RunEventDraft,
+        failure_summary: str | None = None,
+    ) -> AttemptTerminalLink:
+        """同事务原子完成: terminal RunEvent append + attempt 终态 close。
+
+        本方法是 P8-S4 的核心入口, 在单一 ``BEGIN IMMEDIATE`` 事务内顺
+        序完成:
+
+        1. 校验 ``owner_context.run_id == draft.run_id`` 与 draft type
+           为 terminal RunEventType, 防止把非终态事件错误送入终态收口路径;
+        2. :meth:`AttemptLeaseStore.verify_owner` 在事务内确认当前 owner
+           仍然有效 (state=running、owner_token_hash + fencing_token 命中、
+           lease 未过期); 命中失败抛 :class:`AttemptFencingError`,
+           ``BEGIN IMMEDIATE`` 事务整体回滚, EventLog 不残留 stale terminal
+           RunEvent;
+        3. :meth:`DurableRunEventStore.append_with_position_in_transaction`
+           在同事务内 append terminal RunEvent, 取得全局位置;
+        4. :meth:`AttemptLeaseStore.close_terminal` 用 owner CAS 把
+           ``host_attempts`` 推到对应终态, 同时写入
+           ``terminal_event_position`` / ``finished_at`` /
+           ``failure_summary``。CAS 命中失败同样抛
+           :class:`AttemptFencingError` 触发回滚。
+
+        terminal Run state 与 RunResult snapshot 仍由 EventLog
+        ``_upsert_run_state`` / ``_write_terminal_result_snapshot`` 在同
+        事务内完成, supervisor 不重复 update。
+
+        :param owner_context: 当前 owner 句柄。
+        :param draft: 终态 RunEvent 草稿; 必须是 terminal type 且
+            ``run_id`` 与 owner_context 一致。
+        :param failure_summary: 失败摘要; 成功 / 取消 / 暂停诊断为 ``None``。
+        :returns: :class:`AttemptTerminalLink` 包含 attempt id、run id、
+            terminal state、cursor 与全局 position。
+        :raises ValueError: draft 与 owner_context 不一致或 draft 非
+            terminal type 时抛出。
+        :raises AttemptFencingError: 任一 owner CAS 命中失败时抛出, 整
+            个事务已回滚, EventLog 不残留 terminal RunEvent。
+        :raises sqlite3.DatabaseError: 非冲突 SQLite 错误透传。
+        """
+
+        if draft.run_id != owner_context.run_id:
+            raise ValueError(
+                "RunEventDraft.run_id does not match owner_context.run_id"
+            )
+        if draft.type not in TERMINAL_RUN_EVENT_TYPES:
+            raise ValueError(
+                "append_terminal_and_close requires terminal RunEventType"
+            )
+        terminal_state = attempt_state_from_terminal_event_type(draft.type)
+        async with self.storage.transaction() as tx:
+            self.lease_store.verify_owner(
+                tx=tx,
+                owner_context=owner_context,
+            )
+            appended = (
+                self.event_store.append_with_position_in_transaction(
+                    tx=tx,
+                    draft=draft,
+                )
+            )
+            self.lease_store.close_terminal(
+                tx=tx,
+                owner_context=owner_context,
+                state=terminal_state,
+                terminal_event_position=appended.event_position,
+                failure_summary=failure_summary,
+            )
+        _LOGGER.debug(
+            "host.attempt.terminal_close_applied attempt_id=%s "
+            "owner_id=%s owner_token=%s fencing_token=%s state=%s "
+            "event_position=%s sequence=%s",
+            owner_context.attempt_id,
+            owner_context.owner_id,
+            owner_context.owner_token.masked(),
+            owner_context.fencing_token.value,
+            terminal_state.value,
+            appended.event_position.value,
+            appended.event.cursor.sequence,
+        )
+        return AttemptTerminalLink(
+            attempt_id=owner_context.attempt_id,
+            run_id=owner_context.run_id,
+            terminal_state=terminal_state,
+            event=appended.event,
+            event_cursor=RunEventCursor(
+                sequence=appended.event.cursor.sequence
+            ),
+            event_position=appended.event_position,
+        )
 
     async def _acquire_in_transaction(
         self,

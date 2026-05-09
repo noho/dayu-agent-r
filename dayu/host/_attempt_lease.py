@@ -43,7 +43,7 @@ from dayu.host._internal_contracts import (
     FencingToken,
     GlobalEventPosition,
 )
-from dayu.host.contracts import RunEventCursor
+from dayu.host.contracts import RunEvent, RunEventCursor
 
 ATTEMPT_OWNER_TOKEN_BYTES: int = 32
 """Attempt owner secret token 字节数；用于 :func:`secrets.token_hex`。"""
@@ -313,9 +313,16 @@ class AttemptRecoveryDecision:
 class AttemptTerminalLink:
     """``append_terminal_and_close`` 的强类型返回。
 
+    本类型同时承载事务内 append 出的 terminal :class:`RunEvent` 实例,
+    供调用方在事务提交后无需再次访问 ``EventLog`` 即可拿到完整事件;
+    避免事务提交后再做一次 ``list_events`` 查询带来的额外 SQLite
+    round-trip 与 "append 后立即可查" 的隐含不变量假设。
+
     :param attempt_id: 关闭的 attempt id。
     :param run_id: Run id。
     :param terminal_state: terminal 状态。
+    :param event: 已落库的 terminal :class:`RunEvent`; 在原子 append +
+        close 事务内构造, 与 ``event_cursor`` / ``event_position`` 同源。
     :param event_cursor: terminal RunEvent 的 per-run cursor。
     :param event_position: terminal RunEvent 的全局 position。
     """
@@ -323,6 +330,7 @@ class AttemptTerminalLink:
     attempt_id: str
     run_id: str
     terminal_state: AttemptState
+    event: RunEvent
     event_cursor: RunEventCursor
     event_position: GlobalEventPosition
 

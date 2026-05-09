@@ -178,7 +178,24 @@ Host 当前 Run harness、RunEventStore、ToolRuntime、Conversation Memory / Ru
   `LocalRunHarness` 仅薄委托 supervisor，并在 `_finish_attempt_if_durable` 通过
   `close_attempt_with_diagnostic_state` 完成 owner-aware 收口；owner CAS 命中失败时
   diagnostic close 返回 `False` 且不覆盖未来状态；harness 在 owner-lost 后停止从 Engine
-  拉取 / append late event。
+  拉取 / append late event；`_run_to_store` 端到端 owner-lost 集成路径覆盖
+  `proxy stream -> owner lost -> _handle_owner_lost -> Host failure terminal append ->
+  EventLog 不含 stale Engine fact -> owner-aware diagnostic close`：fake proxy 在 owner
+  被外部 fence 后仍准备 late Engine event，harness 通过 `_RecordingDiagnosticSupervisor`
+  观察 supervisor owner-aware diagnostic close 路径被调用且返回 `False`（CAS miss 证明
+  非 legacy unconditional update），EventLog 出现 Host
+  `RUN_FAILED(error_code=attempt_lease_lost)`，late Engine event 不进入 EventLog，
+  `host_attempts.state` 仍是 `running`（owner-aware CAS 没覆盖未来状态）。
+- P8-S4 attempt fencing 原子 terminal close（`tests/host/test_phase8_attempt_fencing.py`）：
+  覆盖 `AttemptSupervisor.append_terminal_and_close` 单 `BEGIN IMMEDIATE` 事务内同时
+  完成 owner 校验、terminal RunEvent append 与 attempt 终态 close 的原子语义。正常
+  owner 路径断言 `host_attempts.terminal_event_position` 与 EventLog 终态 RunEvent
+  全局 position 一致、`host_runs` 同事务推进到终态并写出 `RunResult` 快照；owner 已被
+  替换 / fencing token 不一致 / lease 过期路径断言抛 typed `AttemptFencingError` 且整
+  事务回滚（EventLog 不残留 terminal RunEvent，`host_attempts.state` 不被旧 owner 覆盖
+  未来状态，错误文本不暴露 owner secret 明文）；draft 与 owner_context 不一致或非
+  terminal RunEventType 时抛 `ValueError` 且 EventLog 无写入。fake clock 替代真实
+  ``time.sleep`` 推进 lease 过期。
 - public boundary：锁定 `dayu.host.__all__`，允许 Run 级 `start_run`、`stream_run_events`、`get_run_result`，
   以及 P2 Run 级 `get_tool_fetch_more_handle`、`fetch_more_tool_result`，阻止 `EngineWorker`、`LocalProxy`、
   `ToolExecutor`、`InMemoryToolRuntime`、`ToolRuntimeToolExecutor`、`InMemoryConversationMemoryStore`、

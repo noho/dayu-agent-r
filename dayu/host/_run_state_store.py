@@ -591,6 +591,85 @@ class AttemptLeaseStore:
         )
         return cursor.rowcount == 1
 
+    def close_terminal(
+        self,
+        *,
+        tx: HostStorageTransaction,
+        owner_context: AttemptOwnerContext,
+        state: AttemptState,
+        terminal_event_position: GlobalEventPosition,
+        failure_summary: str | None,
+    ) -> None:
+        """在事务内 owner-aware 地把 attempt 收口到正常 terminal 状态。
+
+        与 :meth:`update_state_owner_aware` 的区别：本方法专用于 P8-S4
+        terminal append + close 同事务原子写入路径，CAS 条件包含完整
+        ``lease_expires_at > now``，``rowcount == 0`` 立即抛
+        :class:`AttemptFencingError` 让外层 ``BEGIN IMMEDIATE`` 事务整体
+        回滚——这是确保「fencing 失败时 EventLog 不残留 stale terminal
+        RunEvent」语义的关键。``terminal_event_position`` 必须由调用方
+        在同一事务内由刚 append 的 terminal RunEvent 提供。
+
+        :param tx: 当前事务。
+        :param owner_context: 当前 owner 句柄。
+        :param state: 终态枚举之一 (SUCCEEDED/FAILED/CANCELLED/SUSPENDED)。
+        :param terminal_event_position: 同事务内刚追加的 terminal RunEvent
+            全局位置。
+        :param failure_summary: 失败摘要；成功 / 取消 / 暂停可为 ``None``。
+        :returns: 无返回值。
+        :raises ValueError: ``state`` 不是合法 terminal 状态时抛出。
+        :raises AttemptFencingError: CAS miss 时抛出，由外层事务回滚。
+        :raises sqlite3.DatabaseError: 写入失败时抛出。
+        """
+
+        if state not in _ATTEMPT_TERMINAL_STATES:
+            raise ValueError(
+                f"close_terminal requires terminal AttemptState, got {state}"
+            )
+        now = self.clock.now()
+        finished_at_iso = now.isoformat()
+        cursor = tx.execute(
+            """
+            UPDATE host_attempts SET state = ?, finished_at = ?,
+                terminal_event_position = ?, failure_summary = ?
+            WHERE attempt_id = ?
+              AND state = ?
+              AND owner_token_hash = ?
+              AND fencing_token = ?
+              AND lease_expires_at > ?
+            """,
+            (
+                state.value,
+                finished_at_iso,
+                terminal_event_position.value,
+                failure_summary,
+                owner_context.attempt_id,
+                AttemptState.RUNNING.value,
+                owner_context.owner_token.digest(),
+                owner_context.fencing_token.value,
+                now.isoformat(),
+            ),
+        )
+        if cursor.rowcount == 1:
+            return
+        result = self._diagnose_fence(
+            tx=tx,
+            owner_context=owner_context,
+            now=now,
+        )
+        raise AttemptFencingError(
+            attempt_id=owner_context.attempt_id,
+            run_id=owner_context.run_id,
+            reason=(
+                result.reason
+                if result.reason is not None
+                else AttemptFencingReason.OWNER_MISSING
+            ),
+            current_state=result.current_state,
+            owner_id=result.current_owner_id,
+            fencing_token=result.current_fencing_token,
+        )
+
     def verify_owner(
         self,
         *,

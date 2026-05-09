@@ -331,10 +331,22 @@ supervisor 暴露 typed `AttemptOwnerLossReason`（`FENCED` / `STORAGE_ERROR`）
 `LocalRunHarness` 在等待 Engine event 时与该信号 race，一旦 owner 失活立即停止
 后续 EventLog append、调用 `AttemptSupervisor.close_attempt_with_diagnostic_state`
 做 owner_token + fencing_token CAS 收口，不再退回到 legacy 非 owner-aware update。
+P8-S4 已把 terminal RunEvent append、owner fencing 校验、attempt 终态收口与
+`host_attempts.terminal_event_position` 写入收敛到同一 `BEGIN IMMEDIATE` 事务内：
+`AttemptSupervisor.append_terminal_and_close` 串联 `verify_owner` →
+`DurableRunEventStore.append_with_position_in_transaction` →
+`AttemptLeaseStore.close_terminal`，正常 owner 路径在原子事务内写出 terminal RunEvent
+全局 position 与 attempt SUCCEEDED / FAILED / CANCELLED / SUSPENDED 终态字段，并复用
+EventLog 既有的 Run 终态状态推进与 `RunResult` 快照同事务语义；任何步骤的 owner /
+fencing token / lease 过期校验失败都会抛 typed `AttemptFencingError` 并整事务回滚，
+EventLog 不残留 stale terminal RunEvent，`host_attempts` 也不会被旧 owner 覆盖未来
+状态。`LocalRunHarness._run_to_store` 在 supervisor 注入且 active attempt 持有
+owner_context + lease_exit_stack 时通过 `_can_atomic_terminal_close` 路由到原子路径，
+完成后立即 `aclose` lease_exit_stack 退出 supervisor lease_context；非 supervisor 装配
+路径退化为既有的 `event_store.append` + `_finish_attempt_if_durable` 两步。
 public `StartRunRequest` / `start_run` 不暴露 lease TTL，owner secret token 明文不入库、
-不进入日志、不进入 EventLog payload。当前 terminal event append + attempt close 的同
-事务原子写入、ToolRuntime / EventLog 事务级 CAS append、recovery scan 与多进程稳态
-仍未落地，分别归 P8-S4 / P8-S5 / P8-S6 / P8-S7。
+不进入日志、不进入 EventLog payload。当前 ToolRuntime / EventLog 事务级 attempt-scoped
+CAS append、recovery scan 与多进程稳态仍未落地，分别归 P8-S5 / P8-S6 / P8-S7。
 
 Host 已落地主路径使用日志表达执行边界：`VERBOSE` 覆盖 `start_run` 接纳、background task、attempt、
 EngineWorker 调用、terminal append、context overflow / compact / retry、ToolRuntime 调用边界、

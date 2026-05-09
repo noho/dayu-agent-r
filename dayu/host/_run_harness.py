@@ -35,6 +35,9 @@ from dayu.engine import (
 from dayu.host._attempt_lease import (
     AttemptOwnerContext,
 )
+from dayu.host._attempt_state_mapping import (
+    attempt_state_from_terminal_event_type,
+)
 from dayu.host._attempt_supervisor import (
     AttemptOwnerLossReason,
     AttemptSupervisor,
@@ -82,6 +85,7 @@ from dayu.host._tool_runtime import (
 )
 from dayu.host._worker import EngineWorker
 from dayu.host.contracts import (
+    TERMINAL_RUN_EVENT_TYPES,
     ContextCompactFailureReason,
     HostContextAttemptRetryData,
     HostContextOverflowObservedData,
@@ -646,9 +650,27 @@ class LocalRunHarness:
                                 event=event,
                                 attempt_index=attempt_index,
                             )
-                        stored_event = await self.event_store.append(
-                            translate_engine_event(event)
+                        draft = translate_engine_event(event)
+                        atomic_attempt = (
+                            current_active_attempt
+                            if (
+                                draft.type in TERMINAL_RUN_EVENT_TYPES
+                                and current_active_attempt is not None
+                                and self._can_atomic_terminal_close(
+                                    current_active_attempt
+                                )
+                            )
+                            else None
                         )
+                        if atomic_attempt is not None:
+                            stored_event = (
+                                await self._append_terminal_and_close(
+                                    active_attempt=atomic_attempt,
+                                    draft=draft,
+                                )
+                            )
+                        else:
+                            stored_event = await self.event_store.append(draft)
                         if terminal_result_from_event(stored_event) is not None:
                             _LOGGER.log(
                                 VERBOSE_LOG_LEVEL,
@@ -664,10 +686,12 @@ class LocalRunHarness:
                                 stored_event.cursor.sequence,
                             )
                             terminal_seen = True
-                            await self._finish_attempt_if_durable(
-                                active_attempt=current_active_attempt,
-                                terminal_event=stored_event,
-                            )
+                            if atomic_attempt is None:
+                                # legacy / 非 supervisor 路径仍走旧 close。
+                                await self._finish_attempt_if_durable(
+                                    active_attempt=current_active_attempt,
+                                    terminal_event=stored_event,
+                                )
                             current_active_attempt = None
                             return
                     if overflow_trigger_seen:
@@ -1476,6 +1500,102 @@ class LocalRunHarness:
             lease_exit_stack=None,
         )
 
+    def _can_atomic_terminal_close(
+        self,
+        active_attempt: "_ActiveAttempt | None",
+    ) -> bool:
+        """判断是否走 P8-S4 supervisor 同事务原子 terminal append + close。
+
+        条件: 当前 attempt 由 supervisor 接管 (持有 owner_context 与
+        lease_exit_stack), 且 supervisor 已注入。否则回退到 P6 legacy
+        路径: 先 ``event_store.append()`` 再 ``_finish_attempt_if_durable``。
+
+        :param active_attempt: 当前 attempt 句柄;为 ``None`` 表示无
+            durable attempt。
+        :returns: 走原子路径返回 ``True``。
+        :raises Exception: 不主动抛出异常。
+        """
+
+        return (
+            active_attempt is not None
+            and active_attempt.owner_context is not None
+            and active_attempt.lease_exit_stack is not None
+            and self.attempt_supervisor is not None
+        )
+
+    async def _append_terminal_and_close(
+        self,
+        *,
+        active_attempt: "_ActiveAttempt",
+        draft: RunEventDraft,
+    ) -> RunEvent:
+        """走 P8-S4 supervisor API: 单事务 terminal append + attempt close。
+
+        通过 :meth:`AttemptSupervisor.append_terminal_and_close` 在同一
+        ``BEGIN IMMEDIATE`` 事务内完成 ``verify_owner`` ->
+        terminal RunEvent append -> attempt 终态 close (含
+        ``terminal_event_position`` 写入)。任意 owner CAS 命中失败抛
+        :class:`AttemptFencingError`, 整事务回滚, EventLog 不残留 stale
+        terminal RunEvent。
+
+        本方法在原子写入成功后立即关闭 ``lease_exit_stack``, 避免与
+        ``_finish_attempt_if_durable`` 二次 close 重复; supervisor 内部
+        ``_sessions`` 也在 lease_context 退出时被清理。
+
+        :param active_attempt: 当前 attempt 句柄, 必须持有 owner_context
+            与 lease_exit_stack。
+        :param draft: terminal RunEvent 草稿; type 必须是 terminal。
+        :returns: 已落库的 terminal :class:`RunEvent`。
+        :raises AttemptFencingError: owner CAS 命中失败时由 supervisor 抛
+            出, 整事务回滚。
+        :raises Exception: 其它写入失败透传。
+        """
+
+        supervisor = self.attempt_supervisor
+        owner_context = active_attempt.owner_context
+        lease_exit_stack = active_attempt.lease_exit_stack
+        if (
+            supervisor is None
+            or owner_context is None
+            or lease_exit_stack is None
+        ):
+            # _can_atomic_terminal_close 已经守住, 此分支只是 type narrowing
+            # 兜底。
+            raise RuntimeError(
+                "atomic terminal close requires supervisor + owner_context + "
+                "lease_exit_stack"
+            )
+        terminal_state = attempt_state_from_terminal_event_type(draft.type)
+        failure_summary = (
+            draft.type.value
+            if terminal_state in (
+                AttemptState.FAILED,
+                AttemptState.CANCELLED,
+                AttemptState.SUSPENDED,
+            )
+            else None
+        )
+        link = await supervisor.append_terminal_and_close(
+            owner_context=owner_context,
+            draft=draft,
+            failure_summary=failure_summary,
+        )
+        await lease_exit_stack.aclose()
+        _LOGGER.log(
+            VERBOSE_LOG_LEVEL,
+            "host.run.attempt_finished attempt_id=%s state=%s "
+            "terminal_event_position=%s",
+            active_attempt.attempt_id,
+            link.terminal_state.value,
+            link.event_position.value,
+        )
+        # supervisor 在同一 ``BEGIN IMMEDIATE`` 事务内已经 append 了
+        # terminal RunEvent, 并通过 ``AttemptTerminalLink.event`` 把构造
+        # 出的 :class:`RunEvent` 直接交给 caller; 这里直接复用, 不再做
+        # 事务提交后的 ``list_events`` round-trip, 也不依赖 "append 后立
+        # 即可查" 的隐含不变量。
+        return link.event
+
     async def _finish_attempt_if_durable(
         self,
         *,
@@ -1524,7 +1644,9 @@ class LocalRunHarness:
         resolved_state = state
         resolved_failure = failure_summary
         if terminal_event is not None:
-            resolved_state = _attempt_state_from_terminal(terminal_event)
+            resolved_state = attempt_state_from_terminal_event_type(
+                terminal_event.type
+            )
             if resolved_state in (
                 AttemptState.FAILED,
                 AttemptState.CANCELLED,
@@ -1987,37 +2109,6 @@ def _extract_accepted_start_input(*, request: StartRunRequest) -> _AcceptedStart
         current_user_text=content,
         caller_system_messages=tuple(caller_system_messages),
     )
-
-
-_ERROR_NON_TERMINAL_RUN_EVENT_FOR_ATTEMPT: str = (
-    "attempt state mapping requires a terminal RunEvent"
-)
-
-
-def _attempt_state_from_terminal(event: RunEvent) -> AttemptState:
-    """从 terminal RunEvent 推导 attempt 终态。
-
-    映射关系：``FINAL_ANSWER`` -> ``SUCCEEDED``、``RUN_FAILED`` -> ``FAILED``、
-    ``RUN_CANCELLED`` -> ``CANCELLED``、``RUN_SUSPENDED`` -> ``SUSPENDED``。
-    本 helper 假定调用方已经通过 ``terminal_result_from_event`` 验证了
-    传入事件确实是终态;若入参为非终态事件,直接抛出 ``ValueError``。
-
-    :param event: 已 append 的终态 RunEvent。
-    :returns: 对应 attempt 终态。
-    :raises ValueError: 入参事件不是终态类型时抛出。
-    """
-
-    match event.type:
-        case RunEventType.FINAL_ANSWER:
-            return AttemptState.SUCCEEDED
-        case RunEventType.RUN_FAILED:
-            return AttemptState.FAILED
-        case RunEventType.RUN_CANCELLED:
-            return AttemptState.CANCELLED
-        case RunEventType.RUN_SUSPENDED:
-            return AttemptState.SUSPENDED
-        case _:
-            raise ValueError(_ERROR_NON_TERMINAL_RUN_EVENT_FOR_ATTEMPT)
 
 
 def _is_terminal_engine_event(event: EngineEvent) -> bool:

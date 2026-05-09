@@ -236,6 +236,7 @@ def build_durable_harness(
         lease_store=attempt_lease_store,
         lease_config=config.attempt_lease_config,
         clock=actual_clock,
+        event_store=event_store,
     )
     actual_proxy: WorkerProxy = (
         proxy if proxy is not None

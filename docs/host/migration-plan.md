@@ -53,8 +53,10 @@
   `29dee8b host: make observer sinks async`，S2 code review 见
   `docs/host/phase8-s2-code-review.md`。P8-S3 AttemptSupervisor Lease Context 与 Renew
   Loop 已完成实施与修复复审，review / rereview 见 `docs/host/phase8-s3-code-review.md`、
-  `docs/host/phase8-s3-fix-rereview.md`，结论为有条件通过；下一入口是 P8-S4：
-  Terminal Append + Close 原子垂直片。
+  `docs/host/phase8-s3-fix-rereview.md`，结论为有条件通过。P8-S4 Terminal Append +
+  Close 原子垂直片已完成实施、code review、修复与复审，review / rereview 见
+  `docs/host/phase8-s4-code-review.md`、`docs/host/phase8-s4-fix-rereview.md`，结论通过；
+  下一入口是 P8-S5：Attempt-scoped Append 与 ToolRuntime Fencing。
 
 每个 Phase 进入实现前，必须另写可交接的 phase plan，细化到迁移 Agent 可以直接接手：
 目标、非目标、边界、文件级改动清单、契约变化、状态机、测试清单、验证命令、review gate、
@@ -458,15 +460,15 @@ P7 落地后，仍需后续阶段追踪的残余风险：
 P8 按 stage 实施；每个 stage 的残余风险必须在进入下一 stage 前归属到后续 stage、issue 或
 P16 收口项。
 
-- `deferred-with-owner: P8-S4`：P8-S3 复审 Low-3。owner-lost 路径目前覆盖了
-  `_next_engine_event_or_lose_owner` helper 级 race，证明 owner-lost 先到时不会继续拉取 / append
-  late Engine event；但尚缺 `_run_to_store` 端到端集成测试，覆盖 proxy stream -> owner lost ->
+- `completed: P8-S4`：P8-S3 复审 Low-3 已由
+  `test_run_to_store_owner_lost_drops_late_engine_event_and_writes_host_failure`
+  补齐 `_run_to_store` 端到端集成覆盖，验证 proxy stream -> owner lost ->
   `_handle_owner_lost` -> Host failure terminal append -> EventLog 不含 stale Engine fact ->
-  owner-aware diagnostic close 的完整路径。P8-S4 实施 terminal event append + attempt close
-  同事务原子写入时，必须把该端到端测试与 terminal position 测试一起补齐。
-- `deferred-with-owner: P8-S4`：terminal event append、owner fencing、attempt terminal close、
-  `terminal_event_position` 写入仍需同一个 `BEGIN IMMEDIATE` 事务固定；P8-S3 只做 owner-aware
-  diagnostic close，`terminal_event_position` 仍为 `NULL`。
+  owner-aware diagnostic close 路径。
+- `completed: P8-S4`：terminal event append、owner fencing、attempt terminal close、
+  `terminal_event_position` 写入已通过 `AttemptSupervisor.append_terminal_and_close(...)`
+  固定到同一个 `BEGIN IMMEDIATE` 事务；`terminal_event_position` 与 terminal RunEvent
+  global position 同源。
 - `deferred-with-owner: P8-S5`：Engine-sourced EventLog append、context facts 与 ToolRuntime
   Host-owned canonical facts 仍需统一走 attempt-scoped append port，在事务内执行
   `verify_owner` CAS；P8-S3 只提供运行时 owner-lost 停止信号，不替代 S5 的事务级 fencing。

@@ -68,8 +68,17 @@ _LOGGER: logging.Logger = logging.getLogger(__name__)
 
 
 @dataclass(frozen=True, slots=True)
-class _AppendedRunEvent:
-    """事务内 append 后的 RunEvent 与 internal global position。"""
+class AppendedRunEvent:
+    """事务内 append 后的 RunEvent 与 internal global position。
+
+    本类型只供 Host internal 同事务原子写入路径(P8-S4 terminal append +
+    attempt close)使用; 公开的 :meth:`DurableRunEventStore.append` /
+    :meth:`append_in_transaction` 不返回 ``GlobalEventPosition``,
+    避免全局位置语义经由 public 接口溢出到 ``RunEventCursor``。
+
+    :param event: 已落库的 :class:`RunEvent`。
+    :param event_position: 内部全局位置, 仅 Host internal 使用。
+    """
 
     event: RunEvent
     event_position: GlobalEventPosition
@@ -257,7 +266,7 @@ class DurableRunEventStore:
         *,
         tx: HostStorageTransaction,
         draft: RunEventDraft,
-    ) -> _AppendedRunEvent:
+    ) -> AppendedRunEvent:
         """事务内执行 append；调用方负责事务上下文。
 
         :param tx: 当前 :class:`HostStorageTransaction`。
@@ -333,7 +342,7 @@ class DurableRunEventStore:
         )
         if is_terminal:
             self._write_terminal_result_snapshot(tx=tx, event=event)
-        return _AppendedRunEvent(
+        return AppendedRunEvent(
             event=event,
             event_position=GlobalEventPosition(value=event_position),
         )
@@ -358,6 +367,31 @@ class DurableRunEventStore:
 
         appended = self._append_in_transaction(tx=tx, draft=draft)
         return appended.event
+
+    def append_with_position_in_transaction(
+        self,
+        *,
+        tx: HostStorageTransaction,
+        draft: RunEventDraft,
+    ) -> AppendedRunEvent:
+        """事务内追加 RunEvent 并返回 internal global position。
+
+        本方法仅供 Host internal 同事务原子写入路径(P8-S4 terminal
+        append + attempt close)使用; 与 :meth:`append_in_transaction`
+        的差别在于额外暴露 ``GlobalEventPosition``, 让 supervisor 在同
+        事务内把 ``host_attempts.terminal_event_position`` 与新写入
+        的 RunEvent 全局位置对齐。``GlobalEventPosition`` 不允许经由
+        public 接口外溢, 因此公开签名仅返回 :class:`AppendedRunEvent`
+        包装而非裸值。
+
+        :param tx: 当前 :class:`HostStorageTransaction`。
+        :param draft: RunEvent 草稿。
+        :returns: ``AppendedRunEvent`` 含已落库 RunEvent 与全局位置。
+        :raises ValueError: run 已终态、来源不一致或 engine event id 重复。
+        """
+
+        _validate_draft_provenance(draft)
+        return self._append_in_transaction(tx=tx, draft=draft)
 
     def _upsert_run_state(
         self,
@@ -814,6 +848,7 @@ def _append_log_level(event: RunEvent) -> int:
 
 
 __all__ = [
+    "AppendedRunEvent",
     "DurableRunEventStore",
     "ensure_host_schema",
 ]
