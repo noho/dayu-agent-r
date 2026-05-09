@@ -124,9 +124,10 @@ P6 已落地：
   Run 终态 `RunResult` 快照在 terminal RunEvent 入库的同一事务内由
   `DurableRunEventStore` 持久化，避免事件 / 快照分离失败。
   `LocalRunHarness` 在每个 attempt 起点写入 `CREATED → RUNNING`，终态写入
-  `SUCCEEDED / FAILED / CANCELLED / SUSPENDED`；context overflow compact retry
-  会把旧 attempt 标记为 `STALE_DIAGNOSTIC` 后开新 attempt。`attempt_id` 形如
-  `attempt-<run_id>-<index>-<short_uuid>`，owner lease / fencing 留给 P8。
+  `SUCCEEDED / FAILED / CANCELLED / SUSPENDED`；P8-S1 已在 internal
+  `AttemptState` / store 层扩展 `STALE / RECOVERING / LOST` 诊断态，并提供
+  owner lease 与全局单调 fencing token 的 CAS 基础。`attempt_id` 形如
+  `attempt-<run_id>-<index>-<short_uuid>`。
 - `ProjectionStore` + `ProjectionCoordinator` 驱动 at-least-once observer，记录
   per-observer checkpoint、`status`、`retry_count`、`lag_events`；checkpoint 不允许倒退，
   相同 position 重放幂等。`ProjectionCoordinator.drain()` 内置 `_drain_lock`
@@ -322,8 +323,9 @@ checkpoint、`status`、`retry_count`、`last_error_code`、`lag_events`；check
 loop / 线程，也不与 terminal 后的 `drain()` 重入冲突。`DurableRunEventStore` 写入
 RunEventData 时通过封闭 type↔data 映射的序列化注册表
 （`dayu.host._run_event_serializer`，`schema_version=1`）做 fail-fast 校验；schema 变化按
-全新起库处理，不维护旧库兼容。当前实现仍是单进程：未提供跨进程 lease / fencing 与多进程
-恢复。
+全新起库处理，不维护旧库兼容。P8-S1 已提供 internal attempt lease / fencing store 基础；
+当前 `LocalRunHarness` 主路径、supervisor、renew loop、recovery scan 与 public lifecycle
+governance 仍未接入。
 
 Host 已落地主路径使用日志表达执行边界：`VERBOSE` 覆盖 `start_run` 接纳、background task、attempt、
 EngineWorker 调用、terminal append、context overflow / compact / retry、ToolRuntime 调用边界、
@@ -435,4 +437,6 @@ RUNNING -> CANCELLED
 RUNNING -> SUSPENDED
 ```
 
-完整 `CREATED / QUEUED / WAITING / RECOVERING / CANCELLING / LOST` 治理状态尚未落地。
+`STALE / RECOVERING / LOST` 已作为 internal `AttemptState` / store 诊断态落地；完整
+`QUEUED / WAITING / CANCELLING` 主路径治理，以及 supervisor、renew loop、recovery scan
+和 public lifecycle governance 尚未接入。

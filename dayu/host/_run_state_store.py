@@ -1,10 +1,14 @@
-"""Host P6 Run / Attempt minimal state stores.
+"""Host P6/P8 Run / Attempt minimal state stores.
 
 本模块在 ``HostStorage`` 之上提供 Run / Attempt 最小持久状态的查询协议
 与实现。写入入口必须经由 :class:`HostStorageTransaction`，写入与
 EventLog append 共享同一事务。
 
-P6 不实现 admission、owner lease、fencing、orphan recovery。
+P6 不实现 admission、owner lease、fencing、orphan recovery；P8-S1 在
+``host_attempts`` 上扩展 owner / lease 字段并新增 :class:`AttemptLeaseStore`
+的 CAS acquire / renew / verify 基础，本 slice 不接入
+:class:`LocalRunHarness` 主执行路径，也不实现 recovery scan / terminal
+event position 原子 close。
 """
 
 from __future__ import annotations
@@ -16,6 +20,15 @@ from datetime import datetime, timezone
 
 from dayu.contracts import JsonValue
 from dayu.engine import FinishReason, RunResumeHint
+from dayu.host._attempt_lease import (
+    AttemptFencingError,
+    AttemptFencingReason,
+    AttemptLeaseDecision,
+    AttemptLeaseResult,
+    AttemptOwnerContext,
+    AttemptOwnerToken,
+    UtcClock,
+)
 from dayu.host._host_storage_transaction import (
     HostStorage,
     HostStorageTransaction,
@@ -24,6 +37,7 @@ from dayu.host._internal_contracts import (
     AttemptRecord,
     AttemptState,
     ExtendedRunState,
+    FencingToken,
     GlobalEventPosition,
     RunRecord,
 )
@@ -35,6 +49,44 @@ from dayu.host.contracts import (
     RunSucceededResult,
     RunSuspendedResult,
 )
+
+
+_ATTEMPT_TERMINAL_STATES: frozenset[AttemptState] = frozenset(
+    {
+        AttemptState.SUCCEEDED,
+        AttemptState.FAILED,
+        AttemptState.CANCELLED,
+        AttemptState.SUSPENDED,
+        AttemptState.LOST,
+    }
+)
+"""attempt 终态集合：已 lock 不再可执行；recovery 不复用同一 attempt。"""
+
+
+_ATTEMPT_FINISHED_STATES: frozenset[AttemptState] = frozenset(
+    {
+        AttemptState.SUCCEEDED,
+        AttemptState.FAILED,
+        AttemptState.CANCELLED,
+        AttemptState.SUSPENDED,
+        AttemptState.STALE,
+        AttemptState.RECOVERING,
+        AttemptState.LOST,
+    }
+)
+"""会写入 ``finished_at`` 的状态集合：含正常终态与 owner 收口诊断态。"""
+
+
+_ATTEMPT_SELECT_COLUMNS: str = (
+    "attempt_id, run_id, attempt_index, state, started_at, finished_at, "
+    "terminal_event_position, failure_summary, owner_id, owner_token_hash, "
+    "fencing_token, lease_expires_at, lease_renewed_at, "
+    "recovered_from_attempt_id, stale_marked_at"
+)
+
+
+_FENCING_TOKEN_RESOURCE_TYPE_ATTEMPT: str = "attempt"
+"""``host_fencing_tokens.resource_type`` 用于 attempt owner lease。"""
 
 
 @dataclass(slots=True)
@@ -157,8 +209,12 @@ class AttemptStateStore:
             """
             INSERT INTO host_attempts (
                 attempt_id, run_id, attempt_index, state, started_at,
-                finished_at, terminal_event_position, failure_summary
-            ) VALUES (?, ?, ?, ?, ?, NULL, NULL, NULL)
+                finished_at, terminal_event_position, failure_summary,
+                owner_id, owner_token_hash, fencing_token,
+                lease_expires_at, lease_renewed_at,
+                recovered_from_attempt_id, stale_marked_at
+            ) VALUES (?, ?, ?, ?, ?, NULL, NULL, NULL,
+                NULL, NULL, NULL, NULL, NULL, NULL, NULL)
             """,
             (
                 attempt_id,
@@ -177,6 +233,13 @@ class AttemptStateStore:
             finished_at=None,
             terminal_event_position=None,
             failure_summary=None,
+            owner_id=None,
+            owner_token_hash=None,
+            fencing_token=None,
+            lease_expires_at=None,
+            lease_renewed_at=None,
+            recovered_from_attempt_id=None,
+            stale_marked_at=None,
         )
 
     def update_state(
@@ -190,6 +253,11 @@ class AttemptStateStore:
     ) -> None:
         """在事务内推进 attempt 状态。
 
+        本方法是 P6/P7 主路径的非 owner-aware 通道；P8-S1 仅扩展状态枚
+        举到 ``STALE`` / ``RECOVERING`` / ``LOST``，但不在此方法上加
+        owner CAS。owner-aware CAS 推进由 :class:`AttemptLeaseStore` 承
+        载，并在后续 slice 接入 harness 主路径。
+
         :param tx: 当前事务。
         :param attempt_id: attempt id。
         :param state: 新状态。
@@ -200,15 +268,10 @@ class AttemptStateStore:
         :raises sqlite3.DatabaseError: 写入失败时抛出。
         """
 
-        is_terminal = state in {
-            AttemptState.SUCCEEDED,
-            AttemptState.FAILED,
-            AttemptState.CANCELLED,
-            AttemptState.SUSPENDED,
-            AttemptState.STALE_DIAGNOSTIC,
-        }
         finished_at_iso = (
-            datetime.now(tz=timezone.utc).isoformat() if is_terminal else None
+            datetime.now(tz=timezone.utc).isoformat()
+            if state in _ATTEMPT_FINISHED_STATES
+            else None
         )
         tx.execute(
             """
@@ -235,11 +298,8 @@ class AttemptStateStore:
         """
 
         rows = self.storage.execute_read(
-            """
-            SELECT attempt_id, run_id, attempt_index, state, started_at,
-                finished_at, terminal_event_position, failure_summary
-            FROM host_attempts WHERE attempt_id = ?
-            """,
+            f"SELECT {_ATTEMPT_SELECT_COLUMNS} FROM host_attempts "
+            "WHERE attempt_id = ?",
             (attempt_id,),
         )
         if not rows:
@@ -255,15 +315,475 @@ class AttemptStateStore:
         """
 
         rows = self.storage.execute_read(
-            """
-            SELECT attempt_id, run_id, attempt_index, state, started_at,
-                finished_at, terminal_event_position, failure_summary
-            FROM host_attempts WHERE run_id = ?
-            ORDER BY attempt_index ASC
-            """,
+            f"SELECT {_ATTEMPT_SELECT_COLUMNS} FROM host_attempts "
+            "WHERE run_id = ? ORDER BY attempt_index ASC",
             (run_id,),
         )
         return tuple(_row_to_attempt_record(row) for row in rows)
+
+
+@dataclass(slots=True)
+class AttemptLeaseStore:
+    """Attempt owner lease 的 CAS 写入入口。
+
+    本 store 不持有 :class:`AttemptLeaseConfig`，也不自行计算 TTL；调用
+    方（supervisor / 装配层）必须传入已经计算好的 ``lease_expires_at``
+    UTC 时刻。``clock`` 仅用于在 WHERE 子句里取 ``now`` 与 fencing 判断
+    时间，store 不在此处生成 lease 截止时刻。
+
+    fencing 真源是全局严格单调递增的 :class:`FencingToken`：每次
+    :meth:`acquire_new_attempt` 在同一 ``BEGIN IMMEDIATE`` 事务内先向
+    ``host_fencing_tokens`` 表插入一行获取新 token，再 INSERT
+    ``host_attempts`` 写入 owner 凭据；CAS / fencing 判断只用
+    ``fencing_token``，不再使用 per-attempt counter，不复用 owner secret。
+    允许 token gap（acquire 冲突回滚），禁止 token 倒退或复用。
+
+    SQL 关键 CAS 条件：
+
+    - acquire 新 attempt：在事务内 INSERT ``host_fencing_tokens`` -> 取新
+      ``FencingToken`` -> INSERT ``host_attempts`` ``state='running'``、
+      ``fencing_token=<new>``。``UNIQUE(run_id, attempt_index)`` 冲突 ->
+      ``BUSY``。
+    - renew：``UPDATE ... WHERE attempt_id=? AND state='running' AND
+      owner_token_hash=? AND fencing_token=? AND lease_expires_at > now``。
+      ``rowcount == 0`` 必须映射成 typed :class:`AttemptLeaseResult` 或
+      :class:`AttemptFencingError`，禁止抛裸 SQLite 错误。
+    - verify owner：与 renew 相同 WHERE，但不更新；命中失败抛
+      :class:`AttemptFencingError`。
+
+    所有时间使用 timezone-aware UTC，由 :class:`UtcClock` 注入；明文
+    owner token 不写入数据库，只写 :meth:`AttemptOwnerToken.digest`。
+
+    :param storage: 共享 :class:`HostStorage`。
+    :param clock: 可注入 UTC clock，用于 fencing 时间判断。
+    """
+
+    storage: HostStorage
+    clock: UtcClock
+
+    def acquire_new_attempt(
+        self,
+        *,
+        tx: HostStorageTransaction,
+        attempt_id: str,
+        run_id: str,
+        attempt_index: int,
+        recovered_from_attempt_id: str | None,
+        owner_id: str,
+        owner_token: AttemptOwnerToken,
+        lease_expires_at: datetime,
+    ) -> AttemptLeaseResult:
+        """在事务内创建并 acquire 新 attempt 的 owner lease。
+
+        在同一事务内先分配新的全局 :class:`FencingToken`，再 INSERT
+        ``host_attempts`` 写入 owner 凭据；``UNIQUE(run_id, attempt_index)``
+        冲突时返回 ``AttemptLeaseResult(decision=BUSY)``，调用方不得回退
+        到复用旧 attempt（recovery 必须使用新的 ``attempt_index`` /
+        ``attempt_id`` 并重新分配 fencing token）。
+
+        :param tx: 当前事务。
+        :param attempt_id: 新 attempt id。
+        :param run_id: Run id。
+        :param attempt_index: 新 attempt 序号；与已有 attempt 冲突时
+            BUSY。
+        :param recovered_from_attempt_id: 若是 recovery attempt，记录被恢
+            复的旧 attempt id；非 recovery 路径为 ``None``。
+        :param owner_id: 新 owner 诊断 id。
+        :param owner_token: 新 owner secret token；明文不入库。
+        :param lease_expires_at: 由调用方按 ``AttemptLeaseConfig`` 计算
+            的 lease 到期 UTC 时刻；必须 timezone-aware。
+        :returns: ``AttemptLeaseResult``。
+        :raises ValueError: ``lease_expires_at`` 非 timezone-aware 时抛出。
+        :raises sqlite3.DatabaseError: 非冲突 SQLite 错误时透传。
+        """
+
+        _require_aware(lease_expires_at, "lease_expires_at")
+        now = self.clock.now()
+        owner_hash = owner_token.digest()
+        fencing_token = self._allocate_fencing_token(
+            tx=tx,
+            resource_id=attempt_id,
+            owner_id=owner_id,
+            now=now,
+        )
+        try:
+            tx.execute(
+                """
+                INSERT INTO host_attempts (
+                    attempt_id, run_id, attempt_index, state, started_at,
+                    finished_at, terminal_event_position, failure_summary,
+                    owner_id, owner_token_hash, fencing_token,
+                    lease_expires_at, lease_renewed_at,
+                    recovered_from_attempt_id, stale_marked_at
+                ) VALUES (?, ?, ?, ?, ?, NULL, NULL, NULL,
+                    ?, ?, ?, ?, ?, ?, NULL)
+                """,
+                (
+                    attempt_id,
+                    run_id,
+                    attempt_index,
+                    AttemptState.RUNNING.value,
+                    now.isoformat(),
+                    owner_id,
+                    owner_hash,
+                    fencing_token.value,
+                    lease_expires_at.isoformat(),
+                    now.isoformat(),
+                    recovered_from_attempt_id,
+                ),
+            )
+        except sqlite3.IntegrityError:
+            # fencing token 已经分配给冲突的 acquire 失败路径；按设计
+            # 允许 token gap，不回收、不复用。
+            return self._build_busy_result(
+                tx=tx, run_id=run_id, attempt_index=attempt_index
+            )
+        return AttemptLeaseResult(
+            decision=AttemptLeaseDecision.ACQUIRED,
+            owner_context=AttemptOwnerContext(
+                attempt_id=attempt_id,
+                run_id=run_id,
+                attempt_index=attempt_index,
+                owner_id=owner_id,
+                owner_token=owner_token,
+                fencing_token=fencing_token,
+                lease_expires_at=lease_expires_at,
+            ),
+            current_state=AttemptState.RUNNING,
+            current_owner_id=owner_id,
+            lease_expires_at=lease_expires_at,
+            reason=None,
+            current_fencing_token=fencing_token,
+        )
+
+    def renew(
+        self,
+        *,
+        tx: HostStorageTransaction,
+        owner_context: AttemptOwnerContext,
+        lease_expires_at: datetime,
+    ) -> AttemptLeaseResult:
+        """在事务内 renew 当前 owner 的 lease。
+
+        CAS 条件：``state='running' AND owner_token_hash=? AND
+        fencing_token=? AND lease_expires_at > now``。``rowcount == 0``
+        时按当前行状态映射成 ``FENCED`` / ``TERMINAL`` 等 typed result；
+        ``fencing_token`` 在 renew 路径上不变（renew 只延长 lease，不切
+        owner，不分配新 token）。
+
+        :param tx: 当前事务。
+        :param owner_context: 当前 owner 句柄。
+        :param lease_expires_at: 新 lease 到期 UTC 时刻；必须 timezone-
+            aware 且严格大于当前 ``now``。
+        :returns: ``AttemptLeaseResult``；ACQUIRED 时复用同一 fencing
+            token 返回更新后的 ``owner_context``。
+        :raises ValueError: ``lease_expires_at`` 非 timezone-aware 时抛出。
+        """
+
+        _require_aware(lease_expires_at, "lease_expires_at")
+        now = self.clock.now()
+        cursor = tx.execute(
+            """
+            UPDATE host_attempts SET lease_expires_at = ?, lease_renewed_at = ?
+            WHERE attempt_id = ?
+              AND state = ?
+              AND owner_token_hash = ?
+              AND fencing_token = ?
+              AND lease_expires_at > ?
+            """,
+            (
+                lease_expires_at.isoformat(),
+                now.isoformat(),
+                owner_context.attempt_id,
+                AttemptState.RUNNING.value,
+                owner_context.owner_token.digest(),
+                owner_context.fencing_token.value,
+                now.isoformat(),
+            ),
+        )
+        if cursor.rowcount == 1:
+            return AttemptLeaseResult(
+                decision=AttemptLeaseDecision.ACQUIRED,
+                owner_context=AttemptOwnerContext(
+                    attempt_id=owner_context.attempt_id,
+                    run_id=owner_context.run_id,
+                    attempt_index=owner_context.attempt_index,
+                    owner_id=owner_context.owner_id,
+                    owner_token=owner_context.owner_token,
+                    fencing_token=owner_context.fencing_token,
+                    lease_expires_at=lease_expires_at,
+                ),
+                current_state=AttemptState.RUNNING,
+                current_owner_id=owner_context.owner_id,
+                lease_expires_at=lease_expires_at,
+                reason=None,
+                current_fencing_token=owner_context.fencing_token,
+            )
+        return self._diagnose_fence(
+            tx=tx,
+            owner_context=owner_context,
+            now=now,
+        )
+
+    def verify_owner(
+        self,
+        *,
+        tx: HostStorageTransaction,
+        owner_context: AttemptOwnerContext,
+    ) -> None:
+        """在事务内校验当前 owner 是否仍持有有效 lease。
+
+        与 :meth:`renew` 共享 WHERE 条件，但只读不更新。失败时根据当前
+        行状态抛 :class:`AttemptFencingError`，由调用方决定收口策略。
+
+        :param tx: 当前事务。
+        :param owner_context: 当前 owner 句柄。
+        :returns: 无返回值。
+        :raises AttemptFencingError: owner 失效 / 不匹配 / 已 terminal
+            等情形时抛出。
+        """
+
+        now = self.clock.now()
+        rows = tx.execute(
+            """
+            SELECT 1 FROM host_attempts
+            WHERE attempt_id = ?
+              AND state = ?
+              AND owner_token_hash = ?
+              AND fencing_token = ?
+              AND lease_expires_at > ?
+            """,
+            (
+                owner_context.attempt_id,
+                AttemptState.RUNNING.value,
+                owner_context.owner_token.digest(),
+                owner_context.fencing_token.value,
+                now.isoformat(),
+            ),
+        ).fetchall()
+        if rows:
+            return
+        result = self._diagnose_fence(
+            tx=tx,
+            owner_context=owner_context,
+            now=now,
+        )
+        raise AttemptFencingError(
+            attempt_id=owner_context.attempt_id,
+            run_id=owner_context.run_id,
+            reason=(
+                result.reason
+                if result.reason is not None
+                else AttemptFencingReason.OWNER_MISSING
+            ),
+            current_state=result.current_state,
+            owner_id=result.current_owner_id,
+            fencing_token=result.current_fencing_token,
+        )
+
+    def _allocate_fencing_token(
+        self,
+        *,
+        tx: HostStorageTransaction,
+        resource_id: str,
+        owner_id: str,
+        now: datetime,
+    ) -> FencingToken:
+        """在事务内向 ``host_fencing_tokens`` 分配下一个全局 fencing token。
+
+        ``fencing_token`` 列是 ``INTEGER PRIMARY KEY AUTOINCREMENT``，
+        SQLite 严格保证全局单调递增；事务回滚时已分配的 token 不被回
+        收，下一次 acquire 取得严格更大的值，符合"允许 gap，不允许倒
+        退或复用"的契约。
+
+        :param tx: 当前事务。
+        :param resource_id: 资源标识；attempt 资源使用 ``attempt_id``。
+        :param owner_id: owner 诊断 id。
+        :param now: 当前 UTC 时间，用于 ``issued_at``。
+        :returns: 新分配的 :class:`FencingToken`。
+        :raises sqlite3.DatabaseError: 写入失败时抛出。
+        """
+
+        cursor = tx.execute(
+            """
+            INSERT INTO host_fencing_tokens (
+                resource_type, resource_id, owner_id, issued_at
+            ) VALUES (?, ?, ?, ?)
+            """,
+            (
+                _FENCING_TOKEN_RESOURCE_TYPE_ATTEMPT,
+                resource_id,
+                owner_id,
+                now.isoformat(),
+            ),
+        )
+        return FencingToken(value=int(cursor.lastrowid or 0))
+
+    def _diagnose_fence(
+        self,
+        *,
+        tx: HostStorageTransaction,
+        owner_context: AttemptOwnerContext,
+        now: datetime,
+    ) -> AttemptLeaseResult:
+        """根据当前 row 状态把 CAS 失败映射为 typed 结果。
+
+        :param tx: 当前事务。
+        :param owner_context: owner 句柄。
+        :param now: fencing 判断使用的 UTC 当前时间。
+        :returns: ``AttemptLeaseResult``，永不返回 ``ACQUIRED``。
+        """
+
+        row = tx.execute(
+            "SELECT state, owner_id, owner_token_hash, fencing_token, "
+            "lease_expires_at FROM host_attempts WHERE attempt_id = ?",
+            (owner_context.attempt_id,),
+        ).fetchone()
+        if row is None:
+            return AttemptLeaseResult(
+                decision=AttemptLeaseDecision.FENCED,
+                owner_context=None,
+                current_state=None,
+                current_owner_id=None,
+                lease_expires_at=None,
+                reason=AttemptFencingReason.OWNER_MISSING,
+            )
+        state = AttemptState(row["state"])
+        current_owner_id = row["owner_id"]
+        current_hash = row["owner_token_hash"]
+        current_token_raw = row["fencing_token"]
+        current_token = (
+            None
+            if current_token_raw is None
+            else FencingToken(value=int(current_token_raw))
+        )
+        lease_expires_raw = row["lease_expires_at"]
+        lease_expires = (
+            None
+            if lease_expires_raw is None
+            else datetime.fromisoformat(lease_expires_raw)
+        )
+
+        if state in _ATTEMPT_TERMINAL_STATES:
+            return AttemptLeaseResult(
+                decision=AttemptLeaseDecision.TERMINAL,
+                owner_context=None,
+                current_state=state,
+                current_owner_id=current_owner_id,
+                lease_expires_at=lease_expires,
+                reason=AttemptFencingReason.ATTEMPT_TERMINAL,
+                current_fencing_token=current_token,
+            )
+        if state is not AttemptState.RUNNING:
+            return AttemptLeaseResult(
+                decision=AttemptLeaseDecision.FENCED,
+                owner_context=None,
+                current_state=state,
+                current_owner_id=current_owner_id,
+                lease_expires_at=lease_expires,
+                reason=AttemptFencingReason.ATTEMPT_NOT_RUNNING,
+                current_fencing_token=current_token,
+            )
+        expected_hash = owner_context.owner_token.digest()
+        if current_hash != expected_hash:
+            return AttemptLeaseResult(
+                decision=AttemptLeaseDecision.FENCED,
+                owner_context=None,
+                current_state=state,
+                current_owner_id=current_owner_id,
+                lease_expires_at=lease_expires,
+                reason=AttemptFencingReason.OWNER_MISMATCH,
+                current_fencing_token=current_token,
+            )
+        if (
+            current_token is None
+            or current_token.value != owner_context.fencing_token.value
+        ):
+            return AttemptLeaseResult(
+                decision=AttemptLeaseDecision.FENCED,
+                owner_context=None,
+                current_state=state,
+                current_owner_id=current_owner_id,
+                lease_expires_at=lease_expires,
+                reason=AttemptFencingReason.FENCING_TOKEN_MISMATCH,
+                current_fencing_token=current_token,
+            )
+        if lease_expires is None or lease_expires <= now:
+            return AttemptLeaseResult(
+                decision=AttemptLeaseDecision.FENCED,
+                owner_context=None,
+                current_state=state,
+                current_owner_id=current_owner_id,
+                lease_expires_at=lease_expires,
+                reason=AttemptFencingReason.LEASE_EXPIRED,
+                current_fencing_token=current_token,
+            )
+        # 所有显式条件均匹配但仍 rowcount==0；这意味着事务边界外发生了
+        # 与本 owner 不一致的写入，按 storage conflict 收口。
+        return AttemptLeaseResult(
+            decision=AttemptLeaseDecision.FENCED,
+            owner_context=None,
+            current_state=state,
+            current_owner_id=current_owner_id,
+            lease_expires_at=lease_expires,
+            reason=AttemptFencingReason.STORAGE_CONFLICT,
+            current_fencing_token=current_token,
+        )
+
+    def _build_busy_result(
+        self,
+        *,
+        tx: HostStorageTransaction,
+        run_id: str,
+        attempt_index: int,
+    ) -> AttemptLeaseResult:
+        """``UNIQUE(run_id, attempt_index)`` 冲突时构造 BUSY 结果。
+
+        :param tx: 当前事务。
+        :param run_id: Run id。
+        :param attempt_index: 冲突的 attempt index。
+        :returns: ``AttemptLeaseResult(decision=BUSY)``，附带库内当前
+            owner 摘要。
+        """
+
+        row = tx.execute(
+            "SELECT state, owner_id, lease_expires_at FROM host_attempts "
+            "WHERE run_id = ? AND attempt_index = ?",
+            (run_id, attempt_index),
+        ).fetchone()
+        if row is None:
+            return AttemptLeaseResult(
+                decision=AttemptLeaseDecision.BUSY,
+                owner_context=None,
+                current_state=None,
+                current_owner_id=None,
+                lease_expires_at=None,
+                reason=AttemptFencingReason.STORAGE_CONFLICT,
+            )
+        lease_raw = row["lease_expires_at"]
+        return AttemptLeaseResult(
+            decision=AttemptLeaseDecision.BUSY,
+            owner_context=None,
+            current_state=AttemptState(row["state"]),
+            current_owner_id=row["owner_id"],
+            lease_expires_at=(
+                None if lease_raw is None else datetime.fromisoformat(lease_raw)
+            ),
+            reason=None,
+        )
+
+
+def _require_aware(value: datetime, name: str) -> None:
+    """校验 datetime 必须 timezone-aware。
+
+    :param value: 待校验的 datetime。
+    :param name: 字段名，用于错误消息。
+    :returns: 无返回值。
+    :raises ValueError: 缺少 tzinfo 时抛出。
+    """
+
+    if value.tzinfo is None:
+        raise ValueError(f"{name} must be timezone-aware UTC datetime")
 
 
 def _row_to_run_record(row: sqlite3.Row) -> RunRecord:
@@ -318,6 +838,25 @@ def _row_to_attempt_record(row: sqlite3.Row) -> AttemptRecord:
             else GlobalEventPosition(value=int(row["terminal_event_position"]))  # type: ignore[index]
         ),
         failure_summary=row["failure_summary"],  # type: ignore[index]
+        owner_id=row["owner_id"],  # type: ignore[index]
+        owner_token_hash=row["owner_token_hash"],  # type: ignore[index]
+        fencing_token=(
+            None if row["fencing_token"] is None  # type: ignore[index]
+            else FencingToken(value=int(row["fencing_token"]))  # type: ignore[index]
+        ),
+        lease_expires_at=(
+            None if row["lease_expires_at"] is None  # type: ignore[index]
+            else datetime.fromisoformat(row["lease_expires_at"])  # type: ignore[index]
+        ),
+        lease_renewed_at=(
+            None if row["lease_renewed_at"] is None  # type: ignore[index]
+            else datetime.fromisoformat(row["lease_renewed_at"])  # type: ignore[index]
+        ),
+        recovered_from_attempt_id=row["recovered_from_attempt_id"],  # type: ignore[index]
+        stale_marked_at=(
+            None if row["stale_marked_at"] is None  # type: ignore[index]
+            else datetime.fromisoformat(row["stale_marked_at"])  # type: ignore[index]
+        ),
     )
 
 
@@ -459,6 +998,7 @@ def _must_bool(value: JsonValue | None) -> bool:
 
 
 __all__ = [
+    "AttemptLeaseStore",
     "AttemptStateStore",
     "RunStateStore",
 ]

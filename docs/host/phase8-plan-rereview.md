@@ -1,5 +1,8 @@
 # Host P8 Plan Re-review：Attempt Lease / Recovery / 多进程并发基础
 
+> 注意：本复审完成后，用户进一步确认 P8 必须实施全局单调 fencing token，并区分
+> owner secret 与 fencing token。因此本复审结论对全局 fencing token 契约未覆盖，需要追加复审。
+
 ## 结论：通过
 
 本次复审只做文档复审，不写生产代码。复审目标是确认用户最新决策写回后，`docs/host/phase8-plan.md` 是否仍然 handoff-ready / code-generation-ready。结论为通过：P8 plan 已把 recovery 主路径、async observer 协议、多平台 multiprocessing 测试 helper、慢盘 Docker stress 后移、ToolRuntime attempt-scoped fencing、terminal 原子事务和 slice 边界写成确定方案，没有留下阻断性开放问题。

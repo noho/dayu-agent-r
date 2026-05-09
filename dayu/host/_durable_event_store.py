@@ -114,6 +114,19 @@ _SCHEMA_STATEMENTS: tuple[str, ...] = (
     )
     """,
     """
+    CREATE TABLE IF NOT EXISTS host_fencing_tokens (
+        fencing_token INTEGER PRIMARY KEY AUTOINCREMENT,
+        resource_type TEXT NOT NULL,
+        resource_id TEXT NOT NULL,
+        owner_id TEXT NOT NULL,
+        issued_at TEXT NOT NULL
+    )
+    """,
+    """
+    CREATE INDEX IF NOT EXISTS idx_host_fencing_tokens_resource
+    ON host_fencing_tokens (resource_type, resource_id, fencing_token)
+    """,
+    """
     CREATE TABLE IF NOT EXISTS host_attempts (
         attempt_id TEXT PRIMARY KEY,
         run_id TEXT NOT NULL,
@@ -123,8 +136,27 @@ _SCHEMA_STATEMENTS: tuple[str, ...] = (
         finished_at TEXT,
         terminal_event_position INTEGER,
         failure_summary TEXT,
+        owner_id TEXT,
+        owner_token_hash TEXT,
+        fencing_token INTEGER,
+        lease_expires_at TEXT,
+        lease_renewed_at TEXT,
+        recovered_from_attempt_id TEXT,
+        stale_marked_at TEXT,
         UNIQUE (run_id, attempt_index)
     )
+    """,
+    """
+    CREATE INDEX IF NOT EXISTS idx_host_attempts_run_state
+    ON host_attempts (run_id, state)
+    """,
+    """
+    CREATE INDEX IF NOT EXISTS idx_host_attempts_lease
+    ON host_attempts (state, lease_expires_at)
+    """,
+    """
+    CREATE INDEX IF NOT EXISTS idx_host_attempts_recovered_from
+    ON host_attempts (recovered_from_attempt_id)
     """,
     """
     CREATE TABLE IF NOT EXISTS host_projection_checkpoints (

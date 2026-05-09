@@ -2,14 +2,14 @@
 
 ## 1. 目标与动机
 
-P8 目标是在 P6 durable EventLog / Run State / Projection 与 P7 tool trace projection 之上，落地 Attempt owner 真源、lease / fencing、stale / orphan recovery、`terminal_event_position` 原子关联，以及真实多进程并发验证。动机成立：Full-Governance Multi-Turn 不能只依赖 durable append；只要多个 Host 进程可能同时恢复、续跑或终结同一个 internal attempt，就必须有跨进程一致的 owner token 与 fencing，阻止旧 owner 迟到写入污染 EventLog、Run state、Attempt state、projection checkpoint 或 tool trace。
+P8 目标是在 P6 durable EventLog / Run State / Projection 与 P7 tool trace projection 之上，落地 Attempt owner 真源、lease / fencing、stale / orphan recovery、`terminal_event_position` 原子关联，以及真实多进程并发验证。动机成立：Full-Governance Multi-Turn 不能只依赖 durable append；只要多个 Host 进程可能同时恢复、续跑或终结同一个 internal attempt，就必须有跨进程一致的 owner secret 与全局单调 fencing token，阻止旧 owner 迟到写入污染 EventLog、Run state、Attempt state、projection checkpoint 或 tool trace。
 
 P8 是 P9 Session / Run lifecycle admission、跨进程 cancel、P11 replay、P12 outbox、P14 wait / resume 的必要基础。P9 可以用唯一约束 / 行锁解决 `client_request_id` 幂等与同 Session active Run admission，但 attempt 执行权、恢复权、迟到写入拒绝和 orphan 收口必须先在 P8 固定。
 
 本阶段必须产出：
 
 - Attempt owner lease：owner token、owner id、lease expiry、renew heartbeat、CAS acquire、CAS renew、terminal close。
-- Fencing：所有 attempt-scoped 写入必须携带当前 owner token；旧 owner、过期 owner、非 owner 的迟到写入返回 typed fencing refusal。
+- Fencing：所有 attempt-scoped 写入必须携带当前 owner secret 与全局单调 fencing token；旧 owner、过期 owner、非 owner 或旧 fencing token 的迟到写入返回 typed fencing refusal。
 - Recovery 主路径：P8 不 takeover 同一 attempt。过期 / orphan attempt 先通过 owner/fencing CAS 标记为 `STALE`、`RECOVERING` 或 `LOST` 诊断终态，再创建新的 recovery attempt，使用新的 `attempt_id` / `attempt_index`，并记录 `recovered_from_attempt_id`。
 - ToolRuntime facts fencing：`TOOL_RESULT_TRUNCATED`、`TOOL_CURSOR_ISSUED`、`TOOL_FETCH_MORE_REQUESTED`、`TOOL_FETCH_MORE_COMPLETED`、`TOOL_FETCH_MORE_FAILED`、`TOOL_CURSOR_EXPIRED`、`TOOL_CURSOR_DENIED` 都属于 attempt-scoped Host-owned canonical facts，必须走 owner fencing。
 - `terminal_event_position` 关联：terminal event append、owner fencing、attempt terminal close、`terminal_event_position` 写入必须在同一个 `BEGIN IMMEDIATE` 事务中完成。
@@ -47,7 +47,7 @@ P8 不实现以下能力：
 - `docs/host/migration-plan.md` §4.2 将真实多进程 stress、owner lease / fencing / orphan recovery、attempt `terminal_event_position` 写入都标为 `deferred-with-owner: P8`。
 - `docs/host/migration-plan.md` §4.3 将 partial tool calls 完整语义标为 `deferred-with-owner: P8`，并记录 `LocalRunHarness` 已接近 God Object 阈值，P8/P9 应继续拆分职责。
 - `docs/host/design.md` §3.1 要求 internal `Attempt` owner / lease / fencing、startup recovery 对 orphan / stale 状态调和都必须跨进程一致，不能依赖单进程内存锁。
-- `dayu/host/_durable_event_store.py` 已有 SQLite WAL、`BEGIN IMMEDIATE`、`UNIQUE(run_id, sequence)`、global `event_position`、terminal guard，说明 P6 durable facts 是可用基础；但 `host_attempts` schema 目前只有 `attempt_id/run_id/attempt_index/state/started_at/finished_at/terminal_event_position/failure_summary`，没有 owner token、lease expiry 或 fencing generation。
+- `dayu/host/_durable_event_store.py` 已有 SQLite WAL、`BEGIN IMMEDIATE`、`UNIQUE(run_id, sequence)`、global `event_position`、terminal guard，说明 P6 durable facts 是可用基础；但 `host_attempts` schema 目前只有 `attempt_id/run_id/attempt_index/state/started_at/finished_at/terminal_event_position/failure_summary`，没有 owner token、lease expiry 或全局单调 fencing token。
 - `dayu/host/_run_state_store.py` 的模块 docstring 明确 P6 不实现 admission、owner lease、fencing、orphan recovery；`AttemptStateStore.update_state` 目前只按 `attempt_id` 更新状态，没有 owner compare-and-set 条件。
 - `dayu/host/_run_harness.py` 的 `_finish_attempt_if_durable` 在收到 terminal event 时没有从 EventLog 取 global position，`terminal_position` 始终为 `None`，导致 `host_attempts.terminal_event_position` 继续空置；terminal EventLog append 与 attempt update 也是两个事务。
 - `dayu/host/_tool_runtime.py` 多个路径直接调用 `event_store.append(...)` 写入 tool runtime canonical facts，当前 `ToolExecutionContext` 不携带 Host owner context，旧 owner 可能绕过 attempt fencing 写入工具事实。
@@ -118,13 +118,18 @@ class AttemptOwnerToken:
 
 
 @dataclass(frozen=True, slots=True)
+class FencingToken:
+    value: int
+
+
+@dataclass(frozen=True, slots=True)
 class AttemptOwnerContext:
     attempt_id: str
     run_id: str
     attempt_index: int
     owner_id: str
     owner_token: AttemptOwnerToken
-    lease_generation: int
+    fencing_token: FencingToken
     lease_expires_at: datetime
 
 
@@ -149,7 +154,7 @@ class AttemptFencingReason(StrEnum):
     OWNER_MISSING = "owner_missing"
     OWNER_MISMATCH = "owner_mismatch"
     LEASE_EXPIRED = "lease_expired"
-    GENERATION_MISMATCH = "generation_mismatch"
+    FENCING_TOKEN_MISMATCH = "fencing_token_mismatch"
     ATTEMPT_NOT_RUNNING = "attempt_not_running"
     ATTEMPT_TERMINAL = "attempt_terminal"
     RUN_TERMINAL = "run_terminal"
@@ -163,7 +168,7 @@ class AttemptFencingError(Exception):
     reason: AttemptFencingReason
     current_state: AttemptState | None
     owner_id: str | None
-    lease_generation: int | None
+    fencing_token: FencingToken | None
 
 
 class AttemptRecoveryAction(StrEnum):
@@ -189,22 +194,42 @@ class AttemptTerminalLink:
     terminal_state: AttemptState
     event_cursor: RunEventCursor
     event_position: GlobalEventPosition
+
+
+@dataclass(frozen=True, slots=True)
+class AttemptLeaseConfig:
+    ttl: timedelta
+    renew_interval: timedelta
+    owner_id_prefix: str
 ```
 
-固定常量集中定义在 `_attempt_lease.py`：
+默认配置值集中定义在 `_attempt_lease.py`，但真实运行时必须通过 Host 装配层注入
+`AttemptLeaseConfig`，不能让 public `start_run` 调用方或业务调用方逐次传入 lease TTL：
 
 - `ATTEMPT_OWNER_TOKEN_BYTES: int = 32`
-- `ATTEMPT_LEASE_TTL_SECONDS: int = 30`
-- `ATTEMPT_LEASE_RENEW_INTERVAL_SECONDS: int = 10`
-- `ATTEMPT_OWNER_ID_PREFIX: str = "host"`
+- `DEFAULT_ATTEMPT_LEASE_CONFIG = AttemptLeaseConfig(ttl=timedelta(seconds=30), renew_interval=timedelta(seconds=10), owner_id_prefix="host")`
 
-所有时间使用 timezone-aware UTC `datetime`，由可注入 `UtcClock` 提供。测试不得依赖真实 sleep 判断 lease 过期。
+`AttemptSupervisor` 接收 `AttemptLeaseConfig` 与可注入 `UtcClock`。Store 层不自己决定 TTL；
+`AttemptLeaseStore` 只接收 supervisor 计算后的 `lease_expires_at` 或等价强类型值。所有时间使用
+timezone-aware UTC `datetime`，由可注入 `UtcClock` 提供。测试不得依赖真实 sleep 判断 lease 过期。
 
 ### 6.2 Schema
 
-P8 按全新 schema 起库处理，固定扩展 `host_attempts`，不新增 `host_attempt_leases` 备选表：
+P8 按全新 schema 起库处理，固定扩展 `host_attempts`，并新增全局单调 fencing token 分配表。
+不新增 `host_attempt_leases` 备选表：
 
 ```sql
+CREATE TABLE IF NOT EXISTS host_fencing_tokens (
+    fencing_token INTEGER PRIMARY KEY AUTOINCREMENT,
+    resource_type TEXT NOT NULL,
+    resource_id TEXT NOT NULL,
+    owner_id TEXT NOT NULL,
+    issued_at TEXT NOT NULL
+);
+
+CREATE INDEX IF NOT EXISTS idx_host_fencing_tokens_resource
+ON host_fencing_tokens (resource_type, resource_id, fencing_token);
+
 CREATE TABLE IF NOT EXISTS host_attempts (
     attempt_id TEXT PRIMARY KEY,
     run_id TEXT NOT NULL,
@@ -216,7 +241,7 @@ CREATE TABLE IF NOT EXISTS host_attempts (
     failure_summary TEXT,
     owner_id TEXT,
     owner_token_hash TEXT,
-    lease_generation INTEGER NOT NULL DEFAULT 0,
+    fencing_token INTEGER,
     lease_expires_at TEXT,
     lease_renewed_at TEXT,
     recovered_from_attempt_id TEXT,
@@ -236,9 +261,15 @@ ON host_attempts (recovered_from_attempt_id);
 
 字段语义：
 
+- `host_fencing_tokens.fencing_token` 是 Host durable 全局单调 fencing token。每次 acquire 新 owner
+  lease 都必须先在同一 storage transaction 中插入该表，取得新的 token，再写入对应资源行。
+- `resource_type/resource_id` 描述 token 所属资源。P8 首个消费者是
+  `resource_type='attempt'`、`resource_id=attempt_id`；后续 Session / Run / Outbox / Wait /
+  Remote / Observer claim owner 必须复用同一 fencing 原则。
 - `owner_token_hash` 存储 `AttemptOwnerToken.digest()`，永不存明文 token。
 - `owner_id` 是诊断摘要，例如 `host:<pid>:<boot_id_short>`，不得作为授权凭据。
-- `lease_generation` 每次 acquire 新执行权时单调递增；fencing 必须同时校验 token hash 与 generation。
+- `fencing_token` 存储当前 attempt owner 的全局单调 fencing token；fencing 必须同时校验
+  token hash 与 fencing token。
 - `lease_expires_at` 是当前 owner lease 到期 UTC ISO 字符串；terminal / stale / lost 状态可保留最后值用于诊断。
 - `lease_renewed_at` 是最近一次 acquire / renew UTC 时间。
 - `recovered_from_attempt_id` 只写在新 recovery attempt 上，指向来源 attempt。
@@ -279,7 +310,7 @@ STALE -> LOST
 语义：
 
 - `CREATED`：记录已创建但尚未持有有效 owner。P8 主路径应在同一事务内创建并 acquire 到 `RUNNING`，该状态主要服务可诊断中间态与测试。
-- `RUNNING`：当前 attempt 有有效 owner lease；只有匹配 token hash + generation 且 lease 未过期的 owner 可以写 attempt-scoped facts。
+- `RUNNING`：当前 attempt 有有效 owner lease；只有匹配 owner token hash + 全局单调 fencing token 且 lease 未过期的 owner 可以写 attempt-scoped facts。
 - `SUCCEEDED` / `FAILED` / `CANCELLED` / `SUSPENDED`：正常 terminal attempt，必须同事务写入 terminal EventLog position。
 - `STALE`：旧 owner lease 过期，结果未知，当前 attempt 已关闭执行权，不允许再写 attempt-scoped facts。
 - `RECOVERING`：旧 attempt 已被 recovery CAS 关闭，并且同一事务创建了新的 recovery attempt；旧 attempt 不再可执行。
@@ -311,7 +342,7 @@ class AttemptLeaseStore:
         recovered_from_attempt_id: str | None,
         owner_id: str,
         owner_token: AttemptOwnerToken,
-        ttl_seconds: int,
+        lease_expires_at: datetime,
     ) -> AttemptLeaseResult: ...
 
     def renew(
@@ -319,7 +350,7 @@ class AttemptLeaseStore:
         *,
         tx: HostStorageTransaction,
         owner_context: AttemptOwnerContext,
-        ttl_seconds: int,
+        lease_expires_at: datetime,
     ) -> AttemptLeaseResult: ...
 
     def verify_owner(
@@ -334,7 +365,7 @@ class AttemptLeaseStore:
         *,
         tx: HostStorageTransaction,
         attempt_id: str,
-        expected_generation: int,
+        expected_fencing_token: FencingToken,
         state: AttemptState,
         failure_summary: str,
     ) -> AttemptRecoveryDecision: ...
@@ -344,13 +375,13 @@ class AttemptLeaseStore:
         *,
         tx: HostStorageTransaction,
         source_attempt_id: str,
-        source_generation: int,
+        source_fencing_token: FencingToken,
         run_id: str,
         next_attempt_index: int,
         recovery_attempt_id: str,
         owner_id: str,
         owner_token: AttemptOwnerToken,
-        ttl_seconds: int,
+        lease_expires_at: datetime,
     ) -> AttemptLeaseResult: ...
 
 
@@ -359,6 +390,7 @@ class AttemptSupervisor:
     storage: HostStorage
     lease_store: AttemptLeaseStore
     event_store: DurableRunEventStore
+    lease_config: AttemptLeaseConfig
     clock: UtcClock
 
     async def lease_context(
@@ -390,11 +422,15 @@ class AttemptSupervisor:
 
 CAS 规则固定如下：
 
-- acquire 新 attempt：`INSERT host_attempts (...) VALUES (... attempt_id=?, state='running', owner_token_hash=?, lease_generation=1, ...)`；`UNIQUE(run_id, attempt_index)` 冲突转 `AttemptLeaseResult(decision=BUSY)`，不 fallback 到复用旧 attempt。
-- renew：`UPDATE host_attempts SET lease_expires_at=?, lease_renewed_at=? WHERE attempt_id=? AND state='running' AND owner_token_hash=? AND lease_generation=? AND lease_expires_at > now`；`rowcount == 0` 转 `AttemptLeaseResult(decision=FENCED, reason=OWNER_MISMATCH | LEASE_EXPIRED | GENERATION_MISMATCH | ATTEMPT_TERMINAL)`。
+- acquire 新 attempt：store 在同一 `BEGIN IMMEDIATE` 事务内先插入 `host_fencing_tokens`，取得新的全局
+  `fencing_token`，再 `INSERT host_attempts (...) VALUES (... attempt_id=?, state='running',
+  owner_token_hash=?, fencing_token=?, ...)`；`UNIQUE(run_id, attempt_index)` 冲突转
+  `AttemptLeaseResult(decision=BUSY)`，不 fallback 到复用旧 attempt。若后续 insert attempt 失败，
+  已分配的 fencing token 可以形成 gap；fencing token 只要求全局单调，不要求连续。
+- renew：`UPDATE host_attempts SET lease_expires_at=?, lease_renewed_at=? WHERE attempt_id=? AND state='running' AND owner_token_hash=? AND fencing_token=? AND lease_expires_at > now`；`rowcount == 0` 转 `AttemptLeaseResult(decision=FENCED, reason=OWNER_MISMATCH | LEASE_EXPIRED | FENCING_TOKEN_MISMATCH | ATTEMPT_TERMINAL)`。
 - verify owner：同 renew 的 `WHERE` 条件，但不更新字段；`rowcount == 0` 或查不到有效行必须抛 `AttemptFencingError`。
-- terminal close：同事务先 verify owner，再 append terminal event，再 `UPDATE host_attempts SET state=?, finished_at=?, terminal_event_position=?, failure_summary=? WHERE attempt_id=? AND state='running' AND owner_token_hash=? AND lease_generation=? AND lease_expires_at > now`；`rowcount == 0` 整个事务回滚并抛 `AttemptFencingError`。
-- mark recovering：`UPDATE host_attempts SET state='recovering', finished_at=?, stale_marked_at=?, failure_summary=? WHERE attempt_id=? AND state='running' AND lease_generation=? AND lease_expires_at <= now`；`rowcount == 1` 后在同一事务插入新 recovery attempt。`rowcount == 0` 转 `AttemptRecoveryDecision(action=NOOP_TERMINAL | MARK_LOST)`，由当前行状态决定。
+- terminal close：同事务先 verify owner，再 append terminal event，再 `UPDATE host_attempts SET state=?, finished_at=?, terminal_event_position=?, failure_summary=? WHERE attempt_id=? AND state='running' AND owner_token_hash=? AND fencing_token=? AND lease_expires_at > now`；`rowcount == 0` 整个事务回滚并抛 `AttemptFencingError`。
+- mark recovering：`UPDATE host_attempts SET state='recovering', finished_at=?, stale_marked_at=?, failure_summary=? WHERE attempt_id=? AND state='running' AND fencing_token=? AND lease_expires_at <= now`；`rowcount == 1` 后在同一事务分配新的全局 fencing token 并插入新 recovery attempt。`rowcount == 0` 转 `AttemptRecoveryDecision(action=NOOP_TERMINAL | MARK_LOST)`，由当前行状态决定。
 
 ## 7. Fenced EventLog Append 与 ToolRuntime 覆盖
 
@@ -508,13 +544,14 @@ acquire new attempt
 
 实现要求：
 
-- TTL 与 renew interval 只允许使用 `_attempt_lease.py` 中集中常量：`ATTEMPT_LEASE_TTL_SECONDS`、`ATTEMPT_LEASE_RENEW_INTERVAL_SECONDS`。
+- TTL 与 renew interval 由 Host durable harness / Host bootstrap 装配层通过 `AttemptLeaseConfig` 注入；
+  `_attempt_lease.py` 只提供默认配置值，业务调用方和 public `start_run` 不能逐次传 TTL。
 - `AttemptSupervisor.lease_context(...)` 是 async context manager。进入时 acquire 并启动 renew loop；退出时停止 renew loop。正常 terminal 由 `append_terminal_and_close` 完成；异常退出未 terminal 时按当前原因写 `FAILED` 或 `STALE` 诊断收口，但仍必须经过 owner fencing。
 - renew loop 使用可注入 `UtcClock` 计算 UTC；测试用 fake clock 驱动，不依赖真实 sleep。
-- renew `rowcount == 0`、发现 lease expired、owner mismatch 或 generation mismatch 时，返回 typed `AttemptLeaseResult(decision=FENCED, reason=...)`，supervisor 必须停止后续 append，通知 harness 取消 / 收口当前 Engine run，并让当前 attempt 进入 `STALE` 或 `LOST` 诊断语义。
+- renew `rowcount == 0`、发现 lease expired、owner mismatch 或 fencing token mismatch 时，返回 typed `AttemptLeaseResult(decision=FENCED, reason=...)`，supervisor 必须停止后续 append，通知 harness 取消 / 收口当前 Engine run，并让当前 attempt 进入 `STALE` 或 `LOST` 诊断语义。
 - storage error 不是 fencing。supervisor 应停止 renew loop、停止后续 append，并把 run/attempt 以 Host storage failure 路径收口；如果 storage 已不可写，至少记录安全日志并让后台 task 失败暴露。
 - close terminal / diagnostic close 后必须停止 renew loop；renew loop 不得在 terminal 后继续延长 lease。
-- owner token 明文只存在于 `AttemptOwnerContext`；异常、日志、result 只输出 `owner_id`、generation、masked token。
+- owner token 明文只存在于 `AttemptOwnerContext`；异常、日志、result 只输出 `owner_id`、fencing token、masked token。
 
 ## 10. Recovery 策略
 
@@ -524,7 +561,7 @@ Recovery scan 读取 `state IN ('running', 'created')` 且 `lease_expires_at <= 
 
 1. 如果 run 已 terminal：将 attempt 标记 `LOST` 或保持已有 terminal，返回 `NOOP_TERMINAL`，不创建 recovery attempt。
 2. 如果 attempt 仍是 `RUNNING` 且 lease 已过期：CAS 更新旧 attempt 为 `RECOVERING`，写 `finished_at`、`stale_marked_at`、`failure_summary='lease_expired_recovery_started'`。
-3. 同一事务计算 `next_attempt_index = MAX(attempt_index) + 1`，插入新的 recovery attempt，状态为 `RUNNING`，新 `attempt_id`、新 owner token、新 generation=1，并写 `recovered_from_attempt_id=source_attempt_id`。
+3. 同一事务计算 `next_attempt_index = MAX(attempt_index) + 1`，分配新的全局 fencing token，插入新的 recovery attempt，状态为 `RUNNING`，新 `attempt_id`、新 owner token、新 fencing token，并写 `recovered_from_attempt_id=source_attempt_id`。
 4. 如果 CAS 失败：根据当前行返回 `NOOP_TERMINAL` 或 `MARK_LOST`，不重试 takeover。
 
 `STALE` 是只标记不立即创建 recovery attempt 的显式诊断 API，供 smoke / 运维收口测试使用；默认 `recover_stale_attempts()` 使用 `RECOVERING + new attempt`。
@@ -647,7 +684,7 @@ P8 不增强 analyzer，也不补造 partial tool call 记录；只固定 owner 
   - `source .venv/bin/activate && pytest tests/host/test_phase8_attempt_lease_store.py`
   - `source .venv/bin/activate && pytest tests/host/test_phase6_run_state_store.py tests/host/test_phase6_durable_event_store.py`
   - `source .venv/bin/activate && python -m pyright`
-- 完成信号：acquire / renew / expiry / owner mismatch / generation mismatch / terminal row 的 typed result 测试通过；旧 P6 store 测试通过。
+- 完成信号：acquire / renew / expiry / owner mismatch / fencing token mismatch / terminal row 的 typed result 测试通过；全局 fencing token 单调递增且允许 gap；旧 P6 store 测试通过。
 - 停止条件：需要旧库兼容迁移；无法避免 `Any` / `object`；schema 需要新增 `host_attempt_leases` 表；rowcount=0 不能映射成 typed reason。
 - 上下文压力：中。
 
@@ -783,7 +820,7 @@ P8 不增强 analyzer，也不补造 partial tool call 记录；只固定 owner 
 
 - 使用临时目录文件 SQLite，不使用 `:memory:`，确保跨进程可见。
 - 构造 deterministic fake worker / proxy，不调用真实 provider。
-- 场景 1：owner A acquire + renew，输出 `owner_acquired=true owner=***abcd generation=1 renewed=true`。
+- 场景 1：owner A acquire + renew，输出 `owner_acquired=true owner=***abcd fencing_token=<int> renewed=true`。
 - 场景 2：owner B 在 lease 未过期时 acquire 被拒绝，输出 `busy=true`。
 - 场景 3：lease 过期后 recovery scan 标记 owner A attempt 为 `recovering`，创建 owner B recovery attempt，输出 `recovered_from=<attempt-a> recovery_attempt=<attempt-b>`。
 - 场景 4：owner A late append / ToolRuntime truncate fact 被 fenced，输出 `late_write=fenced reason=LEASE_EXPIRED`。
@@ -801,7 +838,8 @@ P8 不增强 analyzer，也不补造 partial tool call 记录；只固定 owner 
 单元 / 集成测试：
 
 - `tests/host/test_phase8_attempt_lease_store.py`
-  - acquire / renew / expiry / owner mismatch / generation mismatch / terminal refusal。
+  - acquire / renew / expiry / owner mismatch / fencing token mismatch / terminal refusal。
+  - 全局 fencing token 单调递增，失败事务可留下 gap，但不得倒退或复用。
   - owner token hash / masked logging。
   - CAS `rowcount == 0` 转 typed decision / error。
 - `tests/host/test_phase8_attempt_supervisor.py`
@@ -891,7 +929,8 @@ Code gate：
 
 可接受：
 
-- P8 首版使用固定较短 lease TTL 常量，但必须命名、有测试可注入 clock，不得魔法数字散落。
+- P8 首版可以使用 `_attempt_lease.py` 中的默认 `AttemptLeaseConfig`，但真实运行必须允许 Host 装配层覆盖；
+  不得把 TTL / renew interval 写成不可替换的模块常量，也不得让 public 调用方逐次传入。
 - recovery policy 先支持默认 `RECOVERING + new attempt`、显式 mark `STALE`、显式 mark `LOST` 的封闭分支，不要求完整 replay。
 - observer sink 协议在 P8 升级为 async；observer claim / lease 后移到 #28 或 P15。
 
@@ -912,7 +951,8 @@ Code gate：
 
 残余风险：
 
-- SQLite time / Python time 若混用，lease expiry 可能 flaky；P8 通过可注入 UTC clock 与集中常量降低风险。
+- SQLite time / Python time 若混用，lease expiry 可能 flaky；P8 通过可注入 UTC clock 与装配层
+  `AttemptLeaseConfig` 降低风险。
 - JSONL tool trace 是文件系统 sink，和 SQLite checkpoint 非原子；P8 不改变该 P7 trade-off，仍依赖 idempotency key 去重。
 - async observer 在同一 storage transaction 内 `await observer.process(...)` 会让 observer IO 时间计入
   projection transaction 持有时间；P8 接受该取舍以删除 `_run_async` bridge，并通过默认 deterministic

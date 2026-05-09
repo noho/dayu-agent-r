@@ -625,12 +625,12 @@ class LocalRunHarness:
                             return
                         next_request, compact_trace = next_request_with_trace
                         # 当前 attempt 因 context overflow 关闭,准备启动下一
-                        # attempt: 旧 attempt 状态推进为 STALE_DIAGNOSTIC,
+                        # attempt: 旧 attempt 状态推进为 STALE,
                         # 然后为新 attempt 创建持久记录。
                         await self._finish_attempt_if_durable(
                             attempt_id=current_attempt_id,
                             terminal_event=None,
-                            state=AttemptState.STALE_DIAGNOSTIC,
+                            state=AttemptState.STALE,
                             failure_summary="context_overflow_compacted",
                         )
                         attempt_request = next_request
@@ -674,7 +674,7 @@ class LocalRunHarness:
                     state=(
                         AttemptState.FAILED
                         if terminal_seen
-                        else AttemptState.STALE_DIAGNOSTIC
+                        else AttemptState.STALE
                     ),
                     failure_summary=(
                         "attempt_closed_by_terminal_event"
