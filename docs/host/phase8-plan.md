@@ -31,7 +31,7 @@ P8 是 P9 Session / Run lifecycle admission、跨进程 cancel、P11 replay、P1
 P8 不实现以下能力：
 
 - 不做 RemoteProxy / RemoteStub。
-- 不做完整 Session / Run lifecycle admission，不实现 `client_request_id` 幂等，不固定最终 Host public interface；这些属于 P9。
+- 不做完整 Session / Run lifecycle admission，不实现 `client_request_id` 幂等，不固定最终 Host public interface；这些属于 P9。P8-S8 落地的 durable conversation memory read model recovery 是 Host internal 治理能力，不等同于 P9 public memory edit / reset / forget API；S8 不固定 public memory API、不让 UI / Service 参与恢复、不迁移业务 memory。
 - 不做完整 ToolRegistry governance；权限、middleware、tool catalog 属于 P10。
 - 不做 Outbox / Wait / Suspend / Resume。
 - 不把 lane / runtime dependency 实现为 Host 私有业务层；P8 不实现 lane。
@@ -782,37 +782,125 @@ P8 不增强 analyzer，也不补造 partial tool call 记录；只固定 owner 
 - 停止条件：测试只能覆盖 `:memory:`；必须靠未命名 sleep 魔法数字才能稳定；多进程失败根因未定位；实现开始引入 observer claim；为了测试方便把 process launcher 提升为 Host 生产 API。
 - 上下文压力：中高。
 
-### P8-S8：手工 Smoke
+### P8-S8：Durable Conversation Memory Store / Read Model Rebuild
 
-- 目标：新增 `utils/smoke_host_p8_attempt_lease.py`，用摘要展示 owner acquire / renew / fence / recovery attempt / terminal_event_position / observer caught up。
-- 预期可见 / 契约结果：用户可运行 smoke 直接观察 P8 治理路径；慢硬盘 + Docker Linux 重压版 multiprocessing 由 issue #38 跟踪，可作为后续手工 stress，不进入 P8 默认 pytest；基础测试已在 S7 默认运行。
+- 目标：
+  - 在 P8-S7 多进程 owner / fencing / recovery 验证之上，补齐 durable conversation memory
+    read model recovery 能力，关闭“projection checkpoint 已 caught up，但进程重启后 in-memory
+    memory 丢失，`startup_reconcile()` 因 checkpoint 已推进而不再 replay 已处理 EventLog，
+    导致 session memory snapshot 永久丢失”这条数据丢失通道。
+  - `build_durable_harness` 默认装配路径不得再依赖 production
+    `InMemoryConversationMemoryStore`；durable harness 默认 memory read model 必须具备
+    durable recovery 语义。
+  - 落地 durable conversation memory read model 或 checkpoint-aware rebuild 机制（例如
+    durable memory projection store，或 startup-time 基于已处理 RunEvent 范围按
+    `session_id` 重建 in-memory snapshot），由本 slice 计划阶段在两条路径中固定一条；
+    无论选哪条，都必须保证 in-memory snapshot 丢失后 Host internal 路径能自行恢复，
+    不要求 UI / Service 调用方触发 reload。
+- 顺手必须删除：
+  - production `InMemoryConversationMemoryStore` 实现（`dayu/host/_conversation_memory.py`
+    中的 `InMemoryConversationMemoryStore` 类、模块 `__all__` 中对应导出、
+    `dayu.host` package 任何 re-export）。
+  - 依赖 production `InMemoryConversationMemoryStore` 的测试用例。若个别测试仍需
+    memory store fake，必须迁移为 `tests/host/` 私有 fake / test helper（例如
+    `tests/host/_memory_store_fake.py`）；禁止保留 production InMemory 实现来迁就旧测试。
+- 预期可见 / 契约结果：
+  - 文件 SQLite + 重新装配（同进程 rebuild 或新进程重启）场景下，EventLog 已包含
+    某 session 的 terminal run，`host_projection_checkpoints` 已 caught up，新 memory
+    read model 初始为空，仍能由 Host internal durable / rebuild 路径恢复出该 session
+    的 memory snapshot（recent_raw_turns / older_raw_turns / tool_facts /
+    evidence_anchors 等关键字段语义不丢）。
+  - `build_durable_harness` 默认 memory read model 在不传 `memory_store` 时具备 durable
+    recovery 语义；不再依赖 production `InMemoryConversationMemoryStore`。
+  - production `InMemoryConversationMemoryStore` 与对应测试已删除；保留下来的 memory
+    fake 仅存在于 `tests/host/` 私有 helper 中。
+  - `dayu/host/README.md` 明确写出 durable memory 当前事实，不再暗示 in-memory store 可
+    用于生产 durable path。
+- 文件 ownership：
+  - `dayu/host/_conversation_memory.py`：删除 production InMemory 实现、收敛 protocol
+    与 helper；保留 `ConversationMemoryStore` Protocol、snapshot dataclass、projection
+    helper、constants。
+  - 新增 durable memory read model 实现文件（命名由计划阶段固定，例如
+    `dayu/host/_conversation_memory_durable.py` 或在已有 projection 模块内扩展），
+    具体路径在本 slice 计划阶段写死。
+  - `dayu/host/_durable_harness.py`：`build_durable_harness` 默认装配 durable memory
+    read model；`memory_store` 参数仍允许覆盖，但默认不再实例化 production InMemory。
+  - `dayu/host/_memory_projection.py` 等 observer 文件：按 durable read model 决策同步。
+  - `tests/host/`：删除依赖 production InMemory 的测试用例，迁移必要 fake 到私有 helper，
+    新增 durable memory recovery 测试（覆盖 caught-up checkpoint + 空 memory + 重建场景）。
+  - `dayu/host/README.md`、必要时 `tests/README.md`：按文档触发规则同步当前事实。
+- 允许修改：
+  - 删除 production `InMemoryConversationMemoryStore`、对应 `__all__` 导出与 package
+    re-export。
+  - 新增 / 调整 durable memory read model 实现与装配。
+  - 新增 / 调整 durable memory recovery 测试与私有 fake helper。
+  - 同步 README 中与 memory store 当前事实不一致的部分。
+- 非目标：
+  - 不实现 P9 Session / Run admission、`client_request_id` 幂等或 active Run 仲裁。
+  - 不固定 public memory edit / reset / forget API；那是 issue #24 / 后续 phase 范围。
+  - 不迁移业务 memory（财报实体 / 跨 session / project / user memory）。
+  - 不让 UI / Service 参与 memory recovery；recovery 必须是 Host 内部治理能力。
+  - 不把 memory durable read model 升级成完整 long-term memory store。
+- 前置依赖：P8-S7。
+- 测试 / 验证命令：
+  - `source .venv/bin/activate && pytest tests/host/test_phase8_durable_memory_recovery.py`
+    （具体测试文件名由本 slice 计划阶段固定）
+  - `source .venv/bin/activate && pytest tests/host/test_phase6_durable_harness_integration.py tests/host/test_phase7_durable_harness_config.py`
+  - `source .venv/bin/activate && pytest tests/host/test_phase3_conversation_memory*.py tests/host/test_phase6_memory_projection*.py`
+    （按当前测试树实际命中文件调整；目标是覆盖原依赖 production InMemory 的测试已迁移
+    或删除）
+  - `source .venv/bin/activate && python -m pyright`
+- 完成信号：
+  - durable memory recovery 测试通过：file SQLite + caught-up checkpoint + 空 memory
+    场景下 Host internal 路径可恢复 session memory snapshot。
+  - `build_durable_harness` 默认路径不再实例化 production `InMemoryConversationMemoryStore`；
+    `grep -R "InMemoryConversationMemoryStore" dayu/ utils/` 仅在迁移说明 / 注释中出现，
+    不再存在 production 实现导出。
+  - `tests/host/` 中所有依赖 production InMemory 的旧测试已删除或迁移到私有 fake；
+    pyright 与受影响测试通过。
+  - `dayu/host/README.md` 已更新 durable memory 当前事实，删除 “in-memory store 可用于
+    durable path” 的措辞。
+- 停止条件：
+  - durable memory read model 设计需要修改 EventLog schema、projection checkpoint 语义
+    或引入 P9 lifecycle admission 才能成立。
+  - 必须保留 production `InMemoryConversationMemoryStore` 才能让旧测试通过（违反“顺手
+    必须删除”要求）。
+  - 需要让 UI / Service 调用方主动触发 memory reload。
+  - durable read model 需要把 owner token / scope token / 大块 prompt 写入 memory
+    storage 才能正确恢复。
+- 上下文压力：高。
+
+### P8-S9：手工 Smoke
+
+- 目标：新增 `utils/smoke_host_p8_attempt_lease.py`，用摘要展示 owner acquire / renew / fence / recovery attempt / terminal_event_position / observer caught up，并补充 durable memory recovery 摘要场景。
+- 预期可见 / 契约结果：用户可运行 smoke 直接观察 P8 治理路径；慢硬盘 + Docker Linux 重压版 multiprocessing 由 issue #38 跟踪，可作为后续手工 stress，不进入 P8 默认 pytest；基础测试已在 S7 默认运行；durable memory recovery 已在 S8 默认运行。
 - 文件 ownership：`utils/smoke_host_p8_attempt_lease.py`。
 - 允许修改：smoke only；必要时复用 P8 私有 multiprocessing platform helper 或添加测试 fixture 风格 fake proxy。
 - 非目标：不调用真实 provider；不输出完整 prompt、tool result、scope token、owner token。
-- 前置依赖：P8-S7。
+- 前置依赖：P8-S8。
 - 测试 / 验证命令：
   - `source .venv/bin/activate && python utils/smoke_host_p8_attempt_lease.py`
   - `source .venv/bin/activate && python -m pyright`
-- 完成信号：输出包含 acquire/renew/fenced/recovery_attempt/recovered_from/terminal_event_position/observer_caught_up 摘要，且 token masked。
+- 完成信号：输出包含 acquire/renew/fenced/recovery_attempt/recovered_from/terminal_event_position/observer_caught_up/memory_recovered 摘要，且 token masked。
 - 停止条件：smoke 需要真实 API key 或外部服务；输出泄露 token；只能证明 happy path。
 - 上下文压力：中。
 
-### P8-S9：文档同步与收口
+### P8-S10：文档同步与收口
 
 - 目标：按代码事实更新 `docs/host/design.md`、`dayu/host/README.md`、`tests/README.md` 与实施报告。
 - 预期可见 / 契约结果：文档只写 P8 已落地事实，不写 P9/P10 未来能力为当前事实。
 - 文件 ownership：`docs/host/design.md`、`dayu/host/README.md`、`tests/README.md`、必要 review 文档。
 - 允许修改：文档。
 - 非目标：不更新根 README，除非 smoke 使用方式成为项目级用户入口；不更新 `docs/code_review.md`，除非用户确认 P8 代码事实已落地。
-- 前置依赖：P8-S8。
+- 前置依赖：P8-S9。
 - 测试 / 验证命令：
   - `source .venv/bin/activate && python -m pyright`
   - 受影响 pytest 汇总命令见第 16 节。
-- 完成信号：README 触发判断记录完整；phase implementation report 填完；observer async / no claim 决策写入设计文档当前事实。
-- 停止条件：文档需要描述未落地 P9 lifecycle；术语新旧混用；把 observer claim 写成 P8 已落地事实，或把 observer async 升级写漏。
+- 完成信号：README 触发判断记录完整；phase implementation report 填完；observer async / no claim 决策写入设计文档当前事实；durable conversation memory recovery 当前事实写入 `dayu/host/README.md`，production `InMemoryConversationMemoryStore` 旧术语已从 README / design 全量清理。
+- 停止条件：文档需要描述未落地 P9 lifecycle；术语新旧混用；把 observer claim 写成 P8 已落地事实，或把 observer async 升级写漏；保留 production `InMemoryConversationMemoryStore` 描述为当前事实。
 - 上下文压力：低。
 
-并行规则：默认串行。只有 P8-S8 smoke 与 P8-S9 文档草稿可在 P8-S7 通过后并行起草；不得与 P8-S1 至 P8-S7 并行，因为它们共享 attempt / durable / ToolRuntime / observer 契约边界。
+并行规则：默认串行。只有 P8-S9 smoke 与 P8-S10 文档草稿可在 P8-S8 通过后并行起草；不得与 P8-S1 至 P8-S8 并行，因为它们共享 attempt / durable / ToolRuntime / observer / conversation memory read model 契约边界。
 
 ## 15. P8 手工 Smoke 设计
 
@@ -826,6 +914,7 @@ P8 不增强 analyzer，也不补造 partial tool call 记录；只固定 owner 
 - 场景 4：owner A late append / ToolRuntime truncate fact 被 fenced，输出 `late_write=fenced reason=LEASE_EXPIRED`。
 - 场景 5：owner B 写 terminal event 并 close attempt，输出 `terminal_event_position=<int> attempt_state=succeeded`。
 - 场景 6：模拟 terminal 后未 drain，重新装配后 `startup_reconcile` 追平 observer，输出 `observer_caught_up=true`。
+- 场景 7：terminal run 已落库且 projection checkpoint 已 caught up 后，丢弃 in-memory memory read model 并重新装配 durable harness，输出 `memory_recovered=true session=<masked>`，证明 durable memory recovery 路径生效，不依赖 production `InMemoryConversationMemoryStore`。
 
 输出约束：
 
@@ -864,6 +953,12 @@ P8 不增强 analyzer，也不补造 partial tool call 记录；只固定 owner 
   - terminal race。
   - stale recovery。
   - observer drain / recovery。
+- `tests/host/test_phase8_durable_memory_recovery.py`
+  - 文件 SQLite + caught-up checkpoint + 空 memory read model 重建：Host internal 路径
+    可恢复 session memory snapshot（recent / older raw turns、tool facts、evidence
+    anchors）。
+  - `build_durable_harness` 默认装配不再依赖 production `InMemoryConversationMemoryStore`。
+  - 旧依赖 production InMemory 的测试已删除或迁移到 `tests/host/` 私有 fake helper。
 
 回归测试：
 
@@ -887,7 +982,8 @@ pytest tests/host/test_phase8_attempt_lease_store.py \
   tests/host/test_phase8_attempt_fencing.py \
   tests/host/test_phase8_tool_runtime_fencing.py \
   tests/host/test_phase8_attempt_recovery.py \
-  tests/host/test_phase8_multiprocess_stress.py
+  tests/host/test_phase8_multiprocess_stress.py \
+  tests/host/test_phase8_durable_memory_recovery.py
 ```
 
 Smoke 与类型检查：
@@ -918,7 +1014,7 @@ Plan gate：
 
 Code gate：
 
-- Slice-level review：P8-S1 至 P8-S7 每个高风险 slice 后都应做局部 review / fix / rereview，再进入下一 slice。
+- Slice-level review：P8-S1 至 P8-S8 每个高风险 slice 后都应做局部 review / fix / rereview，再进入下一 slice。S8 durable memory recovery 必须额外做架构边界 review，确认未把 P9 lifecycle / public memory edit API 偷做进 S8。
 - Phase-level 常规 code review：所有 slice 完成后整体审查 bug、状态机、schema、测试、弱类型、兼容代码。
 - 并发专项 code review：必须审查真实多进程测试、terminal race、late write fencing、lease expiry clock、busy_timeout 行为。
 - 架构边界 code review：必须审查 `LocalRunHarness` 是否只薄委托，Engine 是否未引入 Host governance，`dayu.runtime` 是否未承载 Host 业务语义。

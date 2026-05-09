@@ -496,7 +496,18 @@ P16 收口项。
   scope 绑定到新 run 时 `_append_fetch_requested` 在 `_verify_run_id_matches` 早抛
   `AttemptFencingError(OWNER_MISMATCH)`，EventLog 不残留 fact，错误文本不含 owner secret。
 - `deferred-with-owner: P8-S7 / issue #38`：默认 deterministic multiprocessing 测试仍未落地；
-  慢硬盘 + Docker Linux stress 作为增强手工压力测试由 GitHub issue #38 跟踪。
+  慢硬盘 + Docker Linux stress 作为增强手工压力测试由 GitHub issue #38 跟踪。P8-S7 仅验证
+  multiprocessing owner / fencing / recovery 语义，不解决 durable conversation memory read
+  model rebuild；durable memory recovery 单独由 P8-S8 承接，不得在 S7 中偷做。
+- `deferred-with-owner: P8-S8`：durable conversation memory read model / checkpoint-aware
+  rebuild。当前 `build_durable_harness` 默认仍装配 production
+  `InMemoryConversationMemoryStore`；若 projection checkpoint 已 caught up 而进程重启后
+  in-memory memory 丢失，`startup_reconcile()` 因 checkpoint 已推进而不会 replay 已处理
+  EventLog，导致 session memory read model 永久丢失。P9 固定生产 public lifecycle 前必须
+  在 P8-S8 内落地 durable memory read model 或 checkpoint-aware rebuild 机制，并顺手删除
+  production `InMemoryConversationMemoryStore` 与依赖它的测试用例（必要 fake 迁移到
+  `tests/host/` 私有 helper）。S8 不实现 P9 admission，不固定 public memory API，不迁移
+  业务 memory，不让 UI / Service 参与恢复。
 - `deferred-with-owner: P8-S7`：`AttemptSupervisor.recover_stale_attempts` 自动 wire 进 Host
   bootstrap (`build_durable_harness` / Session 生命周期) 由 P8-S7 推进；当前为内部显式入口，
   允许测试与运营手动调用，不影响生产 Host 启动 (因为 P8-S6 之前也无自动 recovery)。
