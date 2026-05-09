@@ -47,6 +47,7 @@ from dayu.host._conversation_memory import (
     UserPreferenceProfileRef,
 )
 from dayu.host._run_harness import LocalRunHarness
+from tests.host._memory_store_fake import FakeInMemoryConversationMemoryStore
 from dayu.host._event_store import InMemoryRunEventStore, RunEventStore
 from dayu.host.contracts import (
     ContextCompactFailureReason,
@@ -756,6 +757,7 @@ def test_negative_context_compact_retry_limit_is_rejected() -> None:
         LocalRunHarness(
             proxy=proxy,
             context_compact_retry_limit=-1,
+            memory_store=FakeInMemoryConversationMemoryStore(),
         )
 
 
@@ -795,7 +797,9 @@ async def test_compaction_requested_then_final_answer_closes_sequence() -> None:
     """Engine 请求 compact 后意外成功时，Host 先追加 compact_failed 闭合事实。"""
 
     proxy = _CompactionRequestedThenFinalProxy()
-    harness = LocalRunHarness(proxy=proxy)
+    harness = LocalRunHarness(
+        proxy=proxy, memory_store=FakeInMemoryConversationMemoryStore()
+    )
 
     stream = await harness.start_run(_request())
     events = await _collect(stream.events)
@@ -1024,7 +1028,7 @@ async def test_start_run_rejects_non_current_user_shapes(
     """入口仍拒绝历史、tool/assistant、多个 user 与空 user。"""
 
     proxy = _OverflowThenSuccessProxy()
-    harness = LocalRunHarness(proxy=proxy)
+    harness = LocalRunHarness(proxy=proxy, memory_store=FakeInMemoryConversationMemoryStore())
 
     with pytest.raises(ValueError, match=expected_error):
         await harness.start_run(_request(messages=messages))

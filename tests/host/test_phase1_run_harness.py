@@ -54,6 +54,7 @@ from dayu.host._event_translation import terminal_result_from_event
 from dayu.host._proxy import LocalProxy
 from dayu.host._run_harness import LocalRunHarness
 from dayu.host._worker import EngineWorker
+from tests.host._memory_store_fake import FakeInMemoryConversationMemoryStore
 
 _BACKGROUND_START_SPIN_LIMIT: int = 20
 _BACKGROUND_START_SLEEP_SECONDS: float = 0.0
@@ -475,7 +476,8 @@ async def test_local_harness_supports_tool_call_fake_executor_smoke(
     monkeypatch.setattr(agent_module, "_build_runner", fake_build_runner)
     executor = _RecordingToolExecutor()
     harness = LocalRunHarness(
-        proxy=LocalProxy(worker=EngineWorker(tool_executor=executor))
+        proxy=LocalProxy(worker=EngineWorker(tool_executor=executor)),
+        memory_store=FakeInMemoryConversationMemoryStore(),
     )
 
     stream = await harness.start_run(

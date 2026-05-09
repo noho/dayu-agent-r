@@ -10,8 +10,30 @@ from __future__ import annotations
 import argparse
 import asyncio
 import logging
+import sys
 from dataclasses import dataclass
 from datetime import datetime
+from pathlib import Path
+
+_REPO_ROOT_PARENT_INDEX: int = 1
+
+
+def _ensure_repo_root_on_path() -> None:
+    """确保按文件路径运行脚本时也能导入仓库顶层包。
+
+    :returns: 无返回值。
+    :raises Exception: 不主动抛出异常。
+    """
+
+    if __package__ not in (None, ""):
+        return
+    repo_root = Path(__file__).resolve().parents[_REPO_ROOT_PARENT_INDEX]
+    repo_root_text = str(repo_root)
+    if repo_root_text not in sys.path:
+        sys.path.insert(0, repo_root_text)
+
+
+_ensure_repo_root_on_path()
 
 from dayu.contracts import JsonValue, ToolTruncateSpec
 from dayu.contracts.tool_call import (
@@ -31,6 +53,7 @@ from dayu.host._event_store import InMemoryRunEventStore
 from dayu.host._proxy import LocalProxy
 from dayu.host._run_harness import LocalRunHarness
 from dayu.host._tool_runtime import InMemoryToolRuntime, ToolRuntimeToolExecutor
+from utils._smoke_memory_store import SmokeInMemoryConversationMemoryStore
 from dayu.host._worker import EngineWorker
 from dayu.host.contracts import (
     ToolCursorIssuedData,
@@ -179,6 +202,7 @@ async def _main() -> None:
         proxy=LocalProxy(worker=EngineWorker(adapter)),
         event_store=event_store,
         tool_runtime=runtime,
+        memory_store=SmokeInMemoryConversationMemoryStore(),
     )
 
     outcome = await adapter.execute(_request())

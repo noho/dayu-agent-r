@@ -237,14 +237,23 @@ Host 当前 Run harness、RunEventStore、ToolRuntime、Conversation Memory / Ru
   进程 B `build_durable_harness` + `coordinator.startup_reconcile` 把 memory /
   timeline / audit checkpoint 推到 EventLog tail, 第二次 reconcile 幂等。
   场景 (4) **仅** 验证 EventLog / projection checkpoint / `startup_reconcile`
-  既有语义, 不声称 in-memory `ConversationMemoryStore` 具备生产级崩溃恢复;
-  durable memory store + checkpoint-aware rebuild 已划入 P8-S8 scope。
+  既有语义；durable memory store + checkpoint-aware rebuild 由 P8-S8
+  `tests/host/test_phase8_durable_memory_recovery.py` 单独覆盖。
   helper 强制 spawn-only / module-level worker / typed traceback 回传 / join
   超时强杀 (`terminate` -> `kill`), 不使用 `time.sleep` 控 race, 不使用
   ``:memory:``。
+- P8-S8 durable conversation memory recovery（`tests/host/test_phase8_durable_memory_recovery.py`）：
+  验证 (1) `build_durable_harness` 默认装配 `DurableConversationMemoryStore`；
+  (2) terminal run + drain 后重新装配仍可读出 memory snapshot；(3) checkpoint
+  尚未推进时崩溃 → `startup_reconcile` 重投 EventLog 重建 read model 并幂等；
+  (4) `apply_patch`（reset / SESSION clear / claim correction）持久化生效，
+  非 SESSION scope clear 抛 `ValueError`；(5) snapshot JSON encode/decode
+  roundtrip 无损；(6) 仓库内不再残留 production `InMemoryConversationMemoryStore`。
+  legacy 内存 fake 由 `tests/host/_memory_store_fake.py` 提供，仅供 tests / smoke
+  使用，生产代码不得依赖。
 - public boundary：锁定 `dayu.host.__all__`，允许 Run 级 `start_run`、`stream_run_events`、`get_run_result`，
   以及 P2 Run 级 `get_tool_fetch_more_handle`、`fetch_more_tool_result`，阻止 `EngineWorker`、`LocalProxy`、
-  `ToolExecutor`、`InMemoryToolRuntime`、`ToolRuntimeToolExecutor`、`InMemoryConversationMemoryStore`、
+  `ToolExecutor`、`InMemoryToolRuntime`、`ToolRuntimeToolExecutor`、`DurableConversationMemoryStore`、
   `DefaultRunInputBuilder`、`RunInputBuildTrace`、`run_agent_messages` 泄漏为包根 API。
 - import boundary：阻止 Host 导入 `dayu.fins`、`dayu.service`、`dayu.ui`。
 - weak typing guard：扫描 `dayu.host` 源码，阻止 `Any`、`object`、无类型签名与裸容器注解。

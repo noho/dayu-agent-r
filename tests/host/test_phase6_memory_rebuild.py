@@ -22,8 +22,8 @@ from dayu.engine import (
     RunFailedData,
     RunSuspendedData,
 )
-from dayu.host._conversation_memory import (
-    InMemoryConversationMemoryStore,
+from tests.host._memory_store_fake import (
+    FakeInMemoryConversationMemoryStore,
 )
 from dayu.host._memory_projection import MemoryProjectionObserver
 from dayu.host.contracts import (
@@ -151,7 +151,7 @@ def _suspended_event(*, run_id: str, sequence: int = 1) -> RunEvent:
 async def test_memory_rebuild_keeps_user_input_on_success() -> None:
     """成功终态：user input + assistant raw turn 都进入 memory。"""
 
-    memory = InMemoryConversationMemoryStore()
+    memory = FakeInMemoryConversationMemoryStore()
     observer = MemoryProjectionObserver(memory_store=memory)
     await observer.rebuild_from_events(
         events=(
@@ -170,7 +170,7 @@ async def test_memory_rebuild_keeps_user_input_on_success() -> None:
 async def test_memory_rebuild_engine_failure_writes_neutral_terminal() -> None:
     """Engine RUN_FAILED 必须写中性 terminal，user input 不丢。"""
 
-    memory = InMemoryConversationMemoryStore()
+    memory = FakeInMemoryConversationMemoryStore()
     observer = MemoryProjectionObserver(memory_store=memory)
     await observer.rebuild_from_events(
         events=(
@@ -192,7 +192,7 @@ async def test_memory_rebuild_engine_failure_writes_neutral_terminal() -> None:
 async def test_memory_rebuild_host_failure_writes_neutral_terminal() -> None:
     """Host-owned failure 也写中性 terminal summary。"""
 
-    memory = InMemoryConversationMemoryStore()
+    memory = FakeInMemoryConversationMemoryStore()
     observer = MemoryProjectionObserver(memory_store=memory)
     await observer.rebuild_from_events(
         events=(
@@ -208,7 +208,7 @@ async def test_memory_rebuild_host_failure_writes_neutral_terminal() -> None:
 async def test_memory_rebuild_cancelled_keeps_user_input_no_assistant() -> None:
     """cancelled 仅保留用户输入，不写 assistant terminal。"""
 
-    memory = InMemoryConversationMemoryStore()
+    memory = FakeInMemoryConversationMemoryStore()
     observer = MemoryProjectionObserver(memory_store=memory)
     await observer.rebuild_from_events(
         events=(
@@ -233,7 +233,7 @@ async def test_memory_rebuild_cancelled_keeps_user_input_no_assistant() -> None:
 async def test_memory_rebuild_suspended_keeps_user_input_no_assistant() -> None:
     """suspended 也只保留用户输入，不写 assistant terminal。"""
 
-    memory = InMemoryConversationMemoryStore()
+    memory = FakeInMemoryConversationMemoryStore()
     observer = MemoryProjectionObserver(memory_store=memory)
     await observer.rebuild_from_events(
         events=(

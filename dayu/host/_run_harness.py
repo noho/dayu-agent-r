@@ -48,7 +48,6 @@ from dayu.host._context_compaction import (
 )
 from dayu.host._conversation_memory import (
     ConversationMemoryStore,
-    InMemoryConversationMemoryStore,
     snapshot_with_transient_tool_facts,
 )
 from dayu.host._durable_event_store import DurableRunEventStore
@@ -373,6 +372,25 @@ class _AcceptedStartInput:
     caller_system_messages: tuple[SystemMessage, ...]
 
 
+def _require_memory_store() -> ConversationMemoryStore:
+    """legacy default factory: 拒绝默认装配 memory store。
+
+    P8-S8 起 production ``InMemoryConversationMemoryStore`` 已删除；调用
+    方必须显式传入 :class:`ConversationMemoryStore`。Durable harness 通过
+    :func:`build_durable_harness` 注入 :class:`DurableConversationMemoryStore`，
+    legacy 内存测试路径必须传入 ``tests/host/_memory_store_fake`` 中的
+    fake store。
+
+    :returns: 不返回；总是 raise。
+    :raises RuntimeError: 始终抛出，以提示调用方未注入 memory store。
+    """
+
+    raise RuntimeError(
+        "LocalRunHarness 必须显式传入 memory_store: "
+        "production InMemoryConversationMemoryStore 已在 P8-S8 删除"
+    )
+
+
 @dataclass(frozen=True, slots=True)
 class LocalRunHarness:
     """Host 内部本地 Run harness。
@@ -416,7 +434,7 @@ class LocalRunHarness:
     event_store: RunEventStore = field(default_factory=InMemoryRunEventStore)
     tool_runtime: InMemoryToolRuntime | None = None
     memory_store: ConversationMemoryStore = field(
-        default_factory=InMemoryConversationMemoryStore
+        default_factory=lambda: _require_memory_store()
     )
     run_input_builder: RunInputBuilder = field(
         default_factory=DefaultRunInputBuilder
@@ -2097,9 +2115,22 @@ def _log_background_task_failure(
 def _build_default_harness() -> LocalRunHarness:
     """构造默认 harness。
 
+    P8-S8 起默认 harness 也使用 :class:`DurableConversationMemoryStore`
+    （以 ``:memory:`` SQLite 为后端），不再依赖已删除的 production
+    ``InMemoryConversationMemoryStore``。non-durable EventLog / tool
+    runtime 仍走 P3 内存实现，以保持 legacy 顶层 ``start_run``
+    便利入口的行为。
+
     :returns: 默认本地 Run harness。
     :raises Exception: 不主动抛出异常。
     """
+
+    # 局部导入避免顶层模块循环依赖（durable harness 反向依赖
+    # ``_run_harness``）。
+    from dayu.host._conversation_memory_durable import (
+        open_durable_conversation_memory_store,
+    )
+    from dayu.host._host_storage_transaction import HostStorage
 
     executor: ToolExecutor = _NoopToolExecutor()
     event_store = InMemoryRunEventStore()
@@ -2107,10 +2138,13 @@ def _build_default_harness() -> LocalRunHarness:
         executor=executor,
         event_store=event_store,
     )
+    storage = HostStorage(database_path=":memory:")
+    memory_store = open_durable_conversation_memory_store(storage)
     return LocalRunHarness(
         proxy=LocalProxy(worker=EngineWorker(ToolRuntimeToolExecutor(runtime))),
         event_store=event_store,
         tool_runtime=runtime,
+        memory_store=memory_store,
     )
 
 

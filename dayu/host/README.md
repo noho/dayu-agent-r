@@ -55,7 +55,7 @@ compact retry，以及公共 tool declaration 契约：
   补读，不调用业务 executor，也不把它提升为完整 ToolRegistry / governance。
 - 补读失败结果中的 `denied` 只表示权限 / scope 拒绝；cursor 不存在、cursor 过期和 terminal Run 都不是权限拒绝。
 - terminal Run 后 `fetch_more_tool_result(...)` 返回 typed failure，不追加新 RunEvent。
-- Host 内部 `InMemoryConversationMemoryStore` 只从 canonical RunEvent 投影 session memory；preview、
+- Host 内部 `DurableConversationMemoryStore`（P8-S8 起为默认 read model）只从 canonical RunEvent 投影 session memory；preview、
   reasoning delta、content delta 与 content completed 不进入 memory pool 或 RunInputBuilder replay。
 - 当前 memory 结构预留 `ConversationPinnedState`、`TaskFrame`、`MemoryClaim`、`ClaimStatus`、
   `EvidenceAnchor`、`AssumptionRegister`、`UserPreferenceProfileRef`，但 Host 不解释财报业务语义。
@@ -202,7 +202,7 @@ P7 已落地：
   `fetch_more_tool_result`。
 
 `EngineWorker`、`LocalProxy`、`WorkerProxy`、`ToolExecutor`、`InMemoryToolRuntime`、
-`ToolRuntimeToolExecutor`、`InMemoryConversationMemoryStore`、`DefaultRunInputBuilder`、
+`ToolRuntimeToolExecutor`、`DurableConversationMemoryStore`、`DefaultRunInputBuilder`、
 `RunInputBuildTrace` 与 `run_agent_messages` 不属于 Host public API。
 
 ## 稳定边界
@@ -380,10 +380,10 @@ P8-S7 引入了真实多进程 + observer drain 验证测试套（`tests/host/te
 `build_durable_harness` + `coordinator.startup_reconcile` 在进程 A 落 terminal 但未 drain 后由
 进程 B 把 memory / timeline / audit checkpoint 追到 EventLog tail 且第二次 reconcile 幂等。
 该测试套 **不** 引入 multiprocessing launcher / process supervisor 生产代码，也不自动接入
-`build_durable_harness`；recovery scan 自动装配仍未落地。`startup_reconcile` 仅推进
-`host_projection_checkpoints` 既有语义，**不** 等于 in-memory `ConversationMemoryStore` 具备
-生产级崩溃恢复——durable `ConversationMemoryStore` 与 checkpoint-aware rebuild 仍是后续 slice
-（P8-S8）的工作。
+`build_durable_harness`；recovery scan 自动装配仍未落地。P8-S8 起 `build_durable_harness` 默认装配
+`DurableConversationMemoryStore`，memory 与 checkpoint 在同一 SQLite 事务原子推进，且
+`startup_reconcile` 在 checkpoint 已追平但 memory snapshot 丢失时也会重投全部 EventLog 把 memory
+重建到 tail。
 
 Host 已落地主路径使用日志表达执行边界：`VERBOSE` 覆盖 `start_run` 接纳、background task、attempt、
 EngineWorker 调用、terminal append、context overflow / compact / retry、ToolRuntime 调用边界、
@@ -397,10 +397,15 @@ Engine stream 无 terminal 等 contract / invariant 破坏。日志不得输出 
 `InMemoryRunEventStore` 在 DEBUG 下不逐条打印 preview delta append，也不打印 subscribe wait / batch 轮询；
 terminal append、subscribe start / complete 与 canonical append 边界仍可观察。
 
-当前 `InMemoryConversationMemoryStore` 也是 Host 内部临时实现。它以 `session_id` 隔离 memory，只投影
-已 append 的 canonical RunEvent；不同 session 不互相读取 memory。它不提供跨进程恢复、持久 projection、
-public memory 编辑或审计 UI。同一 store 实例通过 `asyncio.Lock` 序列化 snapshot 读写，只声明单进程
-内存态一致性，不声明多进程正确性。
+P8-S8 起默认装配的 `DurableConversationMemoryStore` 把 session memory snapshot 写入与 EventLog
+checkpoint 共用的 SQLite 事务，因此 ProjectionCoordinator 提交 batch 时 memory read model、timeline、
+audit、checkpoint 同生同灭；任何一方失败则整体回滚。它以 `session_id` 隔离 memory，只投影
+已 append 的 canonical RunEvent；不同 session 不互相读取 memory。`apply_patch`（reset / SESSION clear
+/ claim correction）也走同事务路径，跨进程恢复由 `startup_reconcile` 在启动时把 EventLog tail 重投到
+read model；非 SESSION scope clear 视为契约违约抛 `ValueError`。同一 store 实例通过 `asyncio.Lock`
+序列化 snapshot 读写以避免单进程内并发竞态，跨进程一致性靠 SQLite WAL + checkpoint 提交顺序。
+non-durable 顶层 `start_run` 便利入口仍接受调用方显式注入的 `ConversationMemoryStore`（例如
+tests-only `FakeInMemoryConversationMemoryStore`），但生产路径下不再有内存态 store 默认装配。
 
 如果 worker / proxy 异常导致 Host 无法获得 Engine terminal event，或 Engine stream 正常结束但没有产出
 terminal event，后台任务会 append 一个 Host-owned canonical `RUN_FAILED` 事件；该事件 `source=HOST`，

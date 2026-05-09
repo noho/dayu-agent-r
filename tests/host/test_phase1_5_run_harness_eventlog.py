@@ -37,6 +37,7 @@ from dayu.engine import (
 from dayu.host._event_store import InMemoryRunEventStore
 from dayu.host._event_translation import translate_engine_event
 from dayu.host._run_harness import LocalRunHarness
+from tests.host._memory_store_fake import FakeInMemoryConversationMemoryStore
 from dayu.host.contracts import (
     HostRunFailedData,
     RunEvent,
@@ -510,6 +511,7 @@ async def test_run_stream_reads_events_after_store_append() -> None:
             release_after_first_event=gate,
         ),
         event_store=store,
+        memory_store=FakeInMemoryConversationMemoryStore(),
     )
 
     stream = await harness.start_run(_request(run_id))
@@ -556,6 +558,7 @@ async def test_host_verbose_logs_main_path_without_payloads(
                 _engine_final(run_id=run_id, content=secret_final),
             ),
         ),
+        memory_store=FakeInMemoryConversationMemoryStore(),
     )
 
     with caplog.at_level(15, logger="dayu.host"):
@@ -599,6 +602,7 @@ async def test_result_snapshot_only_uses_appended_terminal_event() -> None:
             release_after_first_event=gate,
         ),
         event_store=store,
+        memory_store=FakeInMemoryConversationMemoryStore(),
     )
 
     stream = await harness.start_run(_request(run_id))
@@ -624,6 +628,7 @@ async def test_proxy_exception_appends_host_owned_failure_event() -> None:
     harness = LocalRunHarness(
         proxy=_FailingProxy(error=RuntimeError("boom")),
         event_store=store,
+        memory_store=FakeInMemoryConversationMemoryStore(),
     )
 
     stream = await harness.start_run(_request(run_id))
@@ -653,6 +658,7 @@ async def test_run_input_build_trace_cache_evicts_old_runs_fifo() -> None:
         proxy=_ScriptedProxy(events=()),
         event_store=store,
         run_input_trace_cache_limit=2,
+        memory_store=FakeInMemoryConversationMemoryStore(),
     )
 
     for run_id in ("trace-run-1", "trace-run-2", "trace-run-3"):
@@ -679,6 +685,7 @@ async def test_run_input_message_cache_uses_independent_smaller_limit() -> None:
         event_store=store,
         run_input_trace_cache_limit=4,
         run_input_message_cache_limit=2,
+        memory_store=FakeInMemoryConversationMemoryStore(),
     )
 
     for run_id in ("message-run-1", "message-run-2", "message-run-3"):
@@ -709,7 +716,7 @@ async def test_harness_stops_after_terminal_and_keeps_views_consistent() -> None
             _engine_content_delta(run_id=run_id),
         )
     )
-    harness = LocalRunHarness(proxy=proxy, event_store=store)
+    harness = LocalRunHarness(proxy=proxy, event_store=store, memory_store=FakeInMemoryConversationMemoryStore())
 
     stream = await harness.start_run(_request(run_id))
     events = await _collect(stream.events)
@@ -742,7 +749,7 @@ async def test_harness_ignores_second_terminal_after_first_terminal() -> None:
             _engine_final(run_id=run_id, content="second terminal"),
         )
     )
-    harness = LocalRunHarness(proxy=proxy, event_store=store)
+    harness = LocalRunHarness(proxy=proxy, event_store=store, memory_store=FakeInMemoryConversationMemoryStore())
 
     stream = await harness.start_run(_request(run_id))
     events = await _collect(stream.events)
@@ -779,6 +786,7 @@ async def test_terminal_result_error_does_not_append_host_failure() -> None:
             )
         ),
         event_store=store,
+        memory_store=FakeInMemoryConversationMemoryStore(),
     )
 
     with pytest.raises(TypeError, match="FinalAnswerData"):
@@ -821,6 +829,7 @@ async def test_stream_close_error_does_not_mask_terminal_contract_error(
             )
         ),
         event_store=store,
+        memory_store=FakeInMemoryConversationMemoryStore(),
     )
 
     caplog.set_level(logging.WARNING, logger="dayu.host._run_harness")
@@ -861,6 +870,7 @@ async def test_stream_close_error_does_not_change_worker_failure_fact(
             )
         ),
         event_store=store,
+        memory_store=FakeInMemoryConversationMemoryStore(),
     )
 
     caplog.set_level(logging.WARNING, logger="dayu.host._run_harness")
@@ -903,6 +913,7 @@ async def test_stream_close_error_after_success_does_not_append_host_failure(
             )
         ),
         event_store=store,
+        memory_store=FakeInMemoryConversationMemoryStore(),
     )
 
     caplog.set_level(logging.WARNING, logger="dayu.host._run_harness")
@@ -947,6 +958,7 @@ async def test_start_run_logs_background_contract_error(
             )
         ),
         event_store=store,
+        memory_store=FakeInMemoryConversationMemoryStore(),
     )
 
     caplog.set_level(logging.ERROR, logger="dayu.host._run_harness")

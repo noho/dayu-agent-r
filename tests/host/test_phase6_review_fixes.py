@@ -545,11 +545,14 @@ async def test_memory_observer_sink_failure_preserves_pending_for_replay() -> No
     from dayu.engine import FinalAnswerData, FinishReason
     from dayu.host._conversation_memory import (
         ConversationMemorySnapshot,
-        ConversationMemoryStore,
     )
     from dayu.host._event_observer import ProjectionEventEnvelope
+    from dayu.host._host_storage_transaction import HostStorageTransaction
     from dayu.host._internal_contracts import GlobalEventPosition
-    from dayu.host._memory_projection import MemoryProjectionObserver
+    from dayu.host._memory_projection import (
+        ConversationMemoryProjectionStore,
+        MemoryProjectionObserver,
+    )
     from dayu.host.contracts import (
         RunEvent,
         RunEventCursor,
@@ -574,13 +577,31 @@ async def test_memory_observer_sink_failure_preserves_pending_for_replay() -> No
         async def project_run_events(
             self, events: tuple[RunEvent, ...]
         ) -> None:
+            """非事务路径，本测试不使用。
+
+            :param events: 事件元组。
+            :returns: 无返回值。
+            :raises NotImplementedError: 始终。
+            """
+
+            del events
+            raise NotImplementedError
+
+        async def project_run_events_in_transaction(
+            self,
+            *,
+            tx: HostStorageTransaction,
+            events: tuple[RunEvent, ...],
+        ) -> None:
             """模拟 sink。
 
+            :param tx: 当前事务（不消费）。
             :param events: 事件元组。
             :returns: 无返回值。
             :raises RuntimeError: 在剩余失败计数 > 0 时抛出。
             """
 
+            del tx
             if self._remaining > 0:
                 self._remaining -= 1
                 raise RuntimeError("sink failure")
@@ -599,7 +620,7 @@ async def test_memory_observer_sink_failure_preserves_pending_for_replay() -> No
             del session_id
             raise NotImplementedError
 
-    flaky: ConversationMemoryStore = _FlakyMemoryStore(fail_times=1)  # type: ignore[assignment]
+    flaky: ConversationMemoryProjectionStore = _FlakyMemoryStore(fail_times=1)  # type: ignore[assignment]
     observer = MemoryProjectionObserver(memory_store=flaky)
 
     user_event = RunEvent(
@@ -670,14 +691,14 @@ async def test_memory_observer_sink_failure_preserves_pending_for_replay() -> No
 async def test_durable_bundle_startup_reconcile_catches_up_after_crash() -> None:
     """P1 修复：模拟崩溃后只剩 EventLog + RunResult，``startup_reconcile`` 追平 read model。"""
 
-    from dayu.host._conversation_memory import InMemoryConversationMemoryStore
+    from tests.host._memory_store_fake import FakeInMemoryConversationMemoryStore
     from dayu.host._durable_harness import (
         DurableHarnessConfig,
         build_durable_harness,
     )
     from dayu.host.contracts import UserInputAcceptedData, UserInputScope
 
-    memory = InMemoryConversationMemoryStore()
+    memory = FakeInMemoryConversationMemoryStore()
     bundle_a = build_durable_harness(
         config=DurableHarnessConfig(database_path=":memory:"),
         memory_store=memory,

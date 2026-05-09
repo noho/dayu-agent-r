@@ -111,8 +111,10 @@ from dayu.host._conversation_memory import (  # noqa: E402
     ConversationMemorySnapshot,
     ConversationMemoryStore,
     ConversationPinnedState,
-    InMemoryConversationMemoryStore,
     TaskFrame,
+)
+from utils._smoke_memory_store import (  # noqa: E402
+    SmokeInMemoryConversationMemoryStore,
 )
 from dayu.host._event_store import InMemoryRunEventStore  # noqa: E402
 from dayu.host._proxy import LocalProxy, WorkerProxy  # noqa: E402
@@ -459,8 +461,8 @@ class SeededMemoryStore:
 
     pinned_state: ConversationPinnedState
     task_frame: TaskFrame
-    delegate: InMemoryConversationMemoryStore = field(
-        default_factory=InMemoryConversationMemoryStore
+    delegate: SmokeInMemoryConversationMemoryStore = field(
+        default_factory=SmokeInMemoryConversationMemoryStore
     )
 
     async def project_run_events(self, events: tuple[RunEvent, ...]) -> None:

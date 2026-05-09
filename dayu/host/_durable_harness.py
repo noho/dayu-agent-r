@@ -36,9 +36,12 @@ from dayu.host._attempt_lease import (
 )
 from dayu.host._attempt_supervisor import AttemptSupervisor
 from dayu.host._audit_projection import AuditProjectionObserver
-from dayu.host._conversation_memory import (
-    ConversationMemoryStore,
-    InMemoryConversationMemoryStore,
+from dayu.host._conversation_memory_durable import (
+    open_durable_conversation_memory_store,
+)
+from dayu.host._memory_projection import (
+    ConversationMemoryProjectionStore,
+    MemoryProjectionObserver,
 )
 from dayu.host._durable_event_store import (
     DurableRunEventStore,
@@ -46,7 +49,6 @@ from dayu.host._durable_event_store import (
 )
 from dayu.host._event_observer import ObserverSink, ProjectionCoordinator
 from dayu.host._host_storage_transaction import HostStorage
-from dayu.host._memory_projection import MemoryProjectionObserver
 from dayu.host._projection_store import ProjectionStore
 from dayu.host._proxy import LocalProxy, WorkerProxy
 from dayu.host._run_harness import (
@@ -131,7 +133,7 @@ class DurableHarnessBundle:
     storage: HostStorage
     event_store: DurableRunEventStore
     coordinator: ProjectionCoordinator
-    memory_store: ConversationMemoryStore
+    memory_store: ConversationMemoryProjectionStore
     timeline_observer: TimelineProjectionObserver
     audit_observer: AuditProjectionObserver
     tool_trace_observer: ToolTraceObserver | None
@@ -163,7 +165,7 @@ def build_durable_harness(
     *,
     config: DurableHarnessConfig,
     executor: ToolExecutor | None = None,
-    memory_store: ConversationMemoryStore | None = None,
+    memory_store: ConversationMemoryProjectionStore | None = None,
     proxy: WorkerProxy | None = None,
     clock: UtcClock | None = None,
 ) -> DurableHarnessBundle:
@@ -171,8 +173,9 @@ def build_durable_harness(
 
     :param config: durable harness 装配配置。
     :param executor: 自定义 ToolExecutor；默认为 ``_NoopToolExecutor``。
-    :param memory_store: 自定义对话 memory store；默认为
-        :class:`InMemoryConversationMemoryStore`。
+    :param memory_store: 自定义对话 memory store；默认通过
+        :func:`open_durable_conversation_memory_store` 装配 durable read
+        model，确保进程重启后 memory snapshot 可恢复（P8-S8）。
     :param proxy: 自定义 WorkerProxy；默认装配本地 EngineWorker + LocalProxy。
         smoke / 测试可注入 stub proxy 跳过真实 Engine。
     :param clock: 可选 :class:`UtcClock`; 默认使用 :class:`_SystemUtcClock`,
@@ -185,9 +188,9 @@ def build_durable_harness(
     event_store = open_durable_event_store(storage)
     actual_clock: UtcClock = clock if clock is not None else _SystemUtcClock()
 
-    actual_memory: ConversationMemoryStore = (
+    actual_memory: ConversationMemoryProjectionStore = (
         memory_store if memory_store is not None
-        else InMemoryConversationMemoryStore()
+        else open_durable_conversation_memory_store(storage)
     )
     memory_observer = MemoryProjectionObserver(memory_store=actual_memory)
     timeline_observer = TimelineProjectionObserver()

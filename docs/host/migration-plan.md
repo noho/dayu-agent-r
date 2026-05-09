@@ -68,8 +68,16 @@
   四类默认可跑测试 (`tests/host/test_phase8_multiprocess_stress.py`) 在文件落库
   SQLite 上确认 EventLog append、terminal close race、stale recovery、observer
   startup_reconcile 在跨进程并发下的 P8 既有契约一致性；不引入生产代码、不自动
-  wire recovery scan。下一入口是 P8-S8: durable ConversationMemoryStore +
-  checkpoint-aware rebuild。
+  wire recovery scan。P8-S8 Durable Conversation Memory Store / Read Model Rebuild
+  已实施：production `InMemoryConversationMemoryStore` 删除；
+  `dayu/host/_conversation_memory_durable.py` 提供 SQLite durable read model
+  （单表 `host_conversation_memory_snapshots` 保存 JSON snapshot）
+  + 结构化 JSON snapshot encode/decode；
+  `MemoryProjectionObserver` 升级为同事务 observer，复用 ProjectionCoordinator
+  事务把 memory snapshot 推进与 checkpoint 推进绑定；`build_durable_harness` 默认装配
+  durable store；`startup_reconcile` 在 checkpoint 已追平但 memory 丢失时也会重投
+  EventLog 重建 read model 并保持幂等；`tests/host/_memory_store_fake.py` 承载
+  legacy 内存 fake 仅供 tests / smoke 使用。
 
 每个 Phase 进入实现前，必须另写可交接的 phase plan，细化到迁移 Agent 可以直接接手：
 目标、非目标、边界、文件级改动清单、契约变化、状态机、测试清单、验证命令、review gate、
@@ -517,14 +525,17 @@ P16 收口项。
   rebuild, 也 **不** 声称 in-memory `ConversationMemoryStore` 具备生产级崩溃恢复;
   observer drain 测试只在 `host_projection_checkpoints` 表层验证既有
   `startup_reconcile` 语义。durable memory recovery 划入 P8-S8。
-- `deferred-with-owner: P8-S8`：durable conversation memory read model / checkpoint-aware
-  rebuild。当前 `build_durable_harness` 默认仍装配 production
-  `InMemoryConversationMemoryStore`；若 projection checkpoint 已 caught up 而进程重启后
-  in-memory memory 丢失，`startup_reconcile()` 因 checkpoint 已推进而不会 replay 已处理
-  EventLog，导致 session memory read model 永久丢失。P9 固定生产 public lifecycle 前必须
-  在 P8-S8 内落地 durable memory read model 或 checkpoint-aware rebuild 机制，并顺手删除
-  production `InMemoryConversationMemoryStore` 与依赖它的测试用例（必要 fake 迁移到
-  `tests/host/` 私有 helper）。S8 不实现 P9 admission，不固定 public memory API，不迁移
+- `resolved: P8-S8`（durable conversation memory read model / checkpoint-aware
+  rebuild）：production `InMemoryConversationMemoryStore` 删除；
+  `DurableConversationMemoryStore`（SQLite read model + JSON snapshot encode/decode）
+  成为 `build_durable_harness` 默认装配；`MemoryProjectionObserver` 升级为同事务
+  observer，与 ProjectionCoordinator 共用事务把 memory 推进与 checkpoint 推进绑定；
+  `startup_reconcile` 在 checkpoint 已追平但 memory 丢失时也会重投 EventLog 重建
+  read model 并保持幂等；legacy 内存 fake 迁移到 `tests/host/_memory_store_fake.py`，
+  生产代码不再依赖；`tests/host/test_phase8_durable_memory_recovery.py` 覆盖
+  默认装配、reopen 持久化、crash 前未投影时的启动恢复、reset / SESSION clear /
+  claim correction 持久化、snapshot JSON roundtrip 与 production InMemory 残留扫描。
+  S8 不实现 P9 admission，不固定 public memory API，不迁移
   业务 memory，不让 UI / Service 参与恢复。
 - `deferred-with-owner: P9 / Session lifecycle`：`AttemptSupervisor.recover_stale_attempts`
   自动 wire 进 Host bootstrap (`build_durable_harness` / Session 生命周期) 仍未落地；

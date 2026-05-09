@@ -21,7 +21,6 @@ from dayu.engine import (
 from dayu.host._conversation_memory import (
     ClaimCorrectionPatch,
     ClaimStatus,
-    InMemoryConversationMemoryStore,
     MemoryClaim,
     MemoryIngestionPolicy,
     MemoryProducerKind,
@@ -34,6 +33,9 @@ from dayu.host._conversation_memory import (
 from dayu.host._event_store import InMemoryRunEventStore
 from dayu.host._event_translation import user_input_accepted_draft
 from dayu.host._run_input_builder import DefaultRunInputBuilder
+from tests.host._memory_store_fake import (
+    FakeInMemoryConversationMemoryStore,
+)
 from dayu.host.contracts import (
     HostRunFailedData,
     RunEvent,
@@ -251,7 +253,7 @@ async def test_projection_reads_user_input_from_canonical_eventlog() -> None:
     """用户输入、final answer 与 tool fact 从 EventLog 投影。"""
 
     event_store = InMemoryRunEventStore()
-    memory_store = InMemoryConversationMemoryStore()
+    memory_store = FakeInMemoryConversationMemoryStore()
     user_event = await event_store.append(
         user_input_accepted_draft(
             run_id="run-1",
@@ -300,7 +302,7 @@ async def test_host_failure_terminal_projects_neutral_summary() -> None:
     """Host-owned failure 终态以中性摘要进入下一轮 memory。"""
 
     event_store = InMemoryRunEventStore()
-    memory_store = InMemoryConversationMemoryStore()
+    memory_store = FakeInMemoryConversationMemoryStore()
     await event_store.append(
         user_input_accepted_draft(
             run_id="run-failed",
@@ -352,7 +354,7 @@ async def test_preview_and_reasoning_do_not_enter_memory_projection() -> None:
     """preview / reasoning / delta 不进入 memory pool。"""
 
     event_store = InMemoryRunEventStore()
-    memory_store = InMemoryConversationMemoryStore()
+    memory_store = FakeInMemoryConversationMemoryStore()
     await event_store.append(
         user_input_accepted_draft(
             run_id="run-preview",
@@ -390,7 +392,7 @@ async def test_assistant_final_answer_is_not_verified_claim() -> None:
     """assistant final answer 不自动升级为 verified claim。"""
 
     event_store = InMemoryRunEventStore()
-    memory_store = InMemoryConversationMemoryStore()
+    memory_store = FakeInMemoryConversationMemoryStore()
     await event_store.append(
         user_input_accepted_draft(
             run_id="run-final",
@@ -422,7 +424,7 @@ async def test_memory_items_carry_provenance_trust_and_scope() -> None:
     """memory item 必须携带 source / provenance / trust / scope 元数据。"""
 
     event_store = InMemoryRunEventStore()
-    memory_store = InMemoryConversationMemoryStore()
+    memory_store = FakeInMemoryConversationMemoryStore()
     await event_store.append(
         user_input_accepted_draft(
             run_id="run-meta",
@@ -468,7 +470,7 @@ async def test_user_input_scope_is_closed_enum_and_projection_fail_fast() -> Non
     """USER_INPUT_ACCEPTED scope 必须来自封闭枚举。"""
 
     event_store = InMemoryRunEventStore()
-    memory_store = InMemoryConversationMemoryStore()
+    memory_store = FakeInMemoryConversationMemoryStore()
     valid_event = await event_store.append(
         user_input_accepted_draft(
             run_id="run-scope",
@@ -506,7 +508,7 @@ async def test_user_input_scope_is_closed_enum_and_projection_fail_fast() -> Non
 async def test_scope_clear_patch_rejects_non_session_scope() -> None:
     """P3 只支持 SESSION scope clear，非 SESSION scope 必须 fail fast。"""
 
-    memory_store = InMemoryConversationMemoryStore()
+    memory_store = FakeInMemoryConversationMemoryStore()
 
     with pytest.raises(ValueError, match="scope_clear_only_supports_session"):
         await memory_store.apply_patch(
@@ -523,7 +525,7 @@ async def test_memory_reset_patch_clears_session_snapshot() -> None:
     """MemoryResetPatch 会清空指定 session 的 snapshot。"""
 
     event_store = InMemoryRunEventStore()
-    memory_store = InMemoryConversationMemoryStore()
+    memory_store = FakeInMemoryConversationMemoryStore()
     user_event = await event_store.append(
         user_input_accepted_draft(
             run_id="run-reset",
@@ -575,7 +577,7 @@ async def test_claim_correction_patch_appends_verified_claim() -> None:
     """ClaimCorrectionPatch 会追加用户确认 claim。"""
 
     event_store = InMemoryRunEventStore()
-    memory_store = InMemoryConversationMemoryStore()
+    memory_store = FakeInMemoryConversationMemoryStore()
     user_event = await event_store.append(
         user_input_accepted_draft(
             run_id="run-claim",
@@ -620,7 +622,7 @@ async def test_concurrent_projection_keeps_same_session_turns() -> None:
     """同 session 并发投影不会丢失简单 raw turn 更新。"""
 
     event_store = InMemoryRunEventStore()
-    memory_store = InMemoryConversationMemoryStore(recent_turn_limit=8)
+    memory_store = FakeInMemoryConversationMemoryStore(recent_turn_limit=8)
     await event_store.append(
         user_input_accepted_draft(
             run_id="run-concurrent-a",
@@ -671,7 +673,7 @@ async def test_different_sessions_do_not_share_memory() -> None:
     """不同 session 的 memory 不串读。"""
 
     event_store = InMemoryRunEventStore()
-    memory_store = InMemoryConversationMemoryStore()
+    memory_store = FakeInMemoryConversationMemoryStore()
     await event_store.append(
         user_input_accepted_draft(
             run_id="run-a",
