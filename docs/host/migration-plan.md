@@ -530,11 +530,18 @@ P16 收口项。
   `DurableConversationMemoryStore`（SQLite read model + JSON snapshot encode/decode）
   成为 `build_durable_harness` 默认装配；`MemoryProjectionObserver` 升级为同事务
   observer，与 ProjectionCoordinator 共用事务把 memory 推进与 checkpoint 推进绑定；
-  `startup_reconcile` 在 checkpoint 已追平但 memory 丢失时也会重投 EventLog 重建
-  read model 并保持幂等；legacy 内存 fake 迁移到 `tests/host/_memory_store_fake.py`，
-  生产代码不再依赖；`tests/host/test_phase8_durable_memory_recovery.py` 覆盖
-  默认装配、reopen 持久化、crash 前未投影时的启动恢复、reset / SESSION clear /
-  claim correction 持久化、snapshot JSON roundtrip 与 production InMemory 残留扫描。
+  `DurableHarnessBundle.startup_reconcile` 在 `ProjectionCoordinator.startup_reconcile`
+  之后追加 `DurableConversationMemoryStore.repair_missing_session_snapshots`，
+  当 checkpoint 已 `CAUGHT_UP`、EventLog 无新事件、但
+  `host_conversation_memory_snapshots` 中部分 session row 因运维误操作 / read
+  model 损坏而缺失时，从 EventLog 按 session 重投 canonical 事件重建快照；
+  `MemoryResetPatch` / `ScopeClearPatch(SESSION)` 写入的空 snapshot row 仍存在，不会
+  被 repair 误判成“缺失”而恢复旧内容；legacy 内存 fake 迁移到
+  `tests/host/_memory_store_fake.py`，生产代码不再依赖；
+  `tests/host/test_phase8_durable_memory_recovery.py` 覆盖默认装配、reopen 持久化、
+  crash 前未投影时的启动恢复、checkpoint 已 caught-up 时的 repair 重建、intentional
+  empty snapshot 不被 repair 误恢复、reset / SESSION clear / claim correction 持久化、
+  snapshot JSON roundtrip 与 production InMemory 残留扫描。
   S8 不实现 P9 admission，不固定 public memory API，不迁移
   业务 memory，不让 UI / Service 参与恢复。
 - `deferred-with-owner: P9 / Session lifecycle`：`AttemptSupervisor.recover_stale_attempts`

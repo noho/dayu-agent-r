@@ -407,6 +407,16 @@ read model；非 SESSION scope clear 视为契约违约抛 `ValueError`。同一
 non-durable 顶层 `start_run` 便利入口仍接受调用方显式注入的 `ConversationMemoryStore`（例如
 tests-only `FakeInMemoryConversationMemoryStore`），但生产路径下不再有内存态 store 默认装配。
 
+`DurableHarnessBundle.startup_reconcile()` 在 `ProjectionCoordinator.startup_reconcile()`
+之后会再调用 `DurableConversationMemoryStore.repair_missing_session_snapshots()`：
+当 projection checkpoint 已 `CAUGHT_UP`、EventLog 无新事件、但
+`host_conversation_memory_snapshots` 因运维误操作 / read model 损坏导致部分 session row
+丢失时，普通 drain 不会再驱动 observer 重投，repair 路径按 session 扫描 EventLog 中的
+canonical 事件、对“snapshot row 缺失且 EventLog 已含 terminal 事件”的 session 重建快照。
+`MemoryResetPatch` 与 `ScopeClearPatch(SESSION)` 走 UPSERT 写入空快照行，行依然存在，因此
+不会被 repair 误判成“缺失”而被旧 EventLog 内容覆盖。EventLog 仍是事实真源，memory snapshot
+只是 read model。
+
 如果 worker / proxy 异常导致 Host 无法获得 Engine terminal event，或 Engine stream 正常结束但没有产出
 terminal event，后台任务会 append 一个 Host-owned canonical `RUN_FAILED` 事件；该事件 `source=HOST`，
 `source_engine_event_id=None`。无终态正常结束的错误码为 `engine_stream_ended_without_terminal`。
@@ -488,6 +498,18 @@ python utils/smoke_engine_worker.py --case deepseek-v4-flash
 该脚本直接调用 Host 内部 `EngineWorker` wrapper，使用真实 provider 配置与 fake `add_numbers`
 ToolExecutor 验证 Host `StartRunRequest` 到 Engine 事件流的装配链路。脚本只用于人工验证，
 不代表 EngineWorker 是 Host public API。
+
+当前提供 Host P8 attempt lease / fencing / recovery 手工 smoke 脚本，用 file SQLite +
+fake clock + deterministic fake worker 覆盖 7 个场景：owner acquire + renew、busy、
+supervisor recovery scan、late write fenced、terminal close、observer reconcile 与
+durable memory recovery（checkpoint 已 CAUGHT_UP 且 snapshot row 缺失时由
+`startup_reconcile` 走 repair 路径从 EventLog 重建 session memory）。owner token 明文不出现
+在输出中，summary 输出 ≤20 行 `key=value` 格式：
+
+```bash
+python utils/smoke_host_p8_attempt_lease.py
+python utils/smoke_host_p8_attempt_lease.py --log-level DEBUG
+```
 
 ## 当前状态机
 

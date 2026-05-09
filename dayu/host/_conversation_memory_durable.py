@@ -55,11 +55,13 @@ from dayu.host._conversation_memory import (
     UserPreferenceProfileRef,
     _project_canonical_events,
 )
+from dayu.host._durable_event_store import DurableRunEventStore
 from dayu.host._host_storage_transaction import (
     HostStorage,
     HostStorageTransaction,
 )
 from dayu.host.contracts import (
+    TERMINAL_RUN_EVENT_TYPES,
     RunEvent,
     RunEventCursor,
     RunEventKind,
@@ -75,6 +77,8 @@ _ERROR_SCOPE_CLEAR_UNSUPPORTED_SCOPE: str = "scope_clear_only_supports_session"
 _ERROR_SNAPSHOT_DECODE: str = "host_conversation_memory_snapshot_decode_failed"
 _ERROR_SNAPSHOT_ENCODE: str = "host_conversation_memory_snapshot_encode_failed"
 _TABLE_NAME: str = "host_conversation_memory_snapshots"
+# repair 路径分页拉取 EventLog 的 batch 大小，避免单次 SELECT 全量加载。
+_REPAIR_FETCH_BATCH_LIMIT: int = 256
 
 _JsonObject: TypeAlias = Mapping[str, JsonValue]
 
@@ -221,6 +225,182 @@ class DurableConversationMemoryStore:
                             + (claim,),
                         )
                         self._write_snapshot(tx=tx, snapshot=updated)
+
+    async def repair_missing_session_snapshots(
+        self,
+        *,
+        event_store: DurableRunEventStore,
+    ) -> tuple[str, ...]:
+        """Host internal: 从 EventLog 重建“snapshot row 缺失”的 session memory。
+
+        关闭 P8-S8 gap：``ProjectionCoordinator`` 的 checkpoint 已 CAUGHT_UP
+        且 EventLog 无新事件时，普通 ``startup_reconcile()`` 不会再驱动
+        observer 重投；若 ``host_conversation_memory_snapshots`` 因运维误
+        操作或 read model 损坏而丢失某些 session row，旧 session memory 就
+        无法被自动恢复。本方法显式扫描 EventLog 与 snapshot 表，按 session
+        重投 canonical 事件以重建缺失 row。
+
+        关键边界（与 intentional empty snapshot 区分）：
+
+        - :class:`MemoryResetPatch` / :class:`ScopeClearPatch` (SESSION)
+          通过 ``apply_patch`` 写入空 snapshot row（UPSERT）。该 row 仍存
+          在，本方法 **不会** 把它当作“缺失”重建。
+        - 仅当 EventLog 有 canonical 事件、但 snapshot 表无对应 row 时，
+          才视为 read model 缺失并重建。
+
+        :param event_store: durable EventLog，作为事实真源。
+        :returns: 本次成功重建 snapshot 的 session_id 元组（按重建顺序）。
+        :raises sqlite3.DatabaseError: 读取或写入失败时抛出。
+        """
+
+        async with self._lock:
+            return await self._repair_missing_session_snapshots_locked(
+                event_store=event_store
+            )
+
+    async def _repair_missing_session_snapshots_locked(
+        self,
+        *,
+        event_store: DurableRunEventStore,
+    ) -> tuple[str, ...]:
+        """``_lock`` 持有下的 repair 实现。
+
+        :param event_store: durable EventLog。
+        :returns: 重建成功的 session_id 元组。
+        :raises sqlite3.DatabaseError: 读取或写入失败时抛出。
+        """
+
+        missing_session_ids = self._collect_missing_session_ids()
+        if not missing_session_ids:
+            return ()
+        repaired: list[str] = []
+        for session_id in missing_session_ids:
+            canonical_events = self._fetch_canonical_events_for_session(
+                event_store=event_store, session_id=session_id
+            )
+            if not canonical_events:
+                # EventLog 中确实没有 canonical 事件可用于重建；保持缺失
+                # 状态，留给上层 lifecycle 决定是否新建 session。
+                continue
+            if not self._has_terminal_event(canonical_events):
+                # 仅有 USER_INPUT_ACCEPTED 但无 terminal / canonical 工具
+                # 事实，意味着 session 还在进行中 / 没有完整事实；本 helper
+                # 不主动写入“半成品” snapshot，等待正常 projection 路径。
+                continue
+            async with self.storage.transaction() as tx:
+                # 二次确认 row 仍缺失：避免与并发 observer 投影竞争导致
+                # 覆盖刚写入的 snapshot。
+                if self._snapshot_row_exists_in_tx(
+                    tx=tx, session_id=session_id
+                ):
+                    continue
+                self._project_in_tx(tx=tx, events=canonical_events)
+            repaired.append(session_id)
+            _LOGGER.log(
+                VERBOSE_LOG_LEVEL,
+                "host.conversation_memory.durable_repaired session_id=%s "
+                "canonical_count=%s",
+                session_id,
+                len(canonical_events),
+            )
+        return tuple(repaired)
+
+    def _collect_missing_session_ids(self) -> tuple[str, ...]:
+        """扫描出 EventLog 中已有 canonical 事件、但 snapshot 表缺失的 session。
+
+        :returns: 缺失 snapshot row 的 session_id 元组（按 session_id 升序）。
+        :raises sqlite3.DatabaseError: 读取失败时抛出。
+        """
+
+        rows = self.storage.execute_read(
+            """
+            SELECT DISTINCT e.session_id AS session_id
+            FROM host_run_events AS e
+            LEFT JOIN host_conversation_memory_snapshots AS s
+                ON s.session_id = e.session_id
+            WHERE e.kind = ? AND s.session_id IS NULL
+            ORDER BY e.session_id ASC
+            """,
+            (RunEventKind.CANONICAL.value,),
+        )
+        return tuple(str(row["session_id"]) for row in rows)
+
+    def _fetch_canonical_events_for_session(
+        self,
+        *,
+        event_store: DurableRunEventStore,
+        session_id: str,
+    ) -> tuple[RunEvent, ...]:
+        """按 session 顺序读取 canonical RunEvent 用于重投。
+
+        通过 :meth:`DurableRunEventStore.fetch_events_by_position` 分页拉
+        取，避免单次 SELECT 加载超大 EventLog。
+
+        :param event_store: durable EventLog。
+        :param session_id: 会话 id。
+        :returns: 该 session 的全部 canonical RunEvent，按 global position
+            升序。
+        :raises sqlite3.DatabaseError: 读取失败时抛出。
+        """
+
+        collected: list[RunEvent] = []
+        after = None
+        while True:
+            batch = event_store.fetch_events_by_position(
+                after=after, limit=_REPAIR_FETCH_BATCH_LIMIT
+            )
+            if not batch:
+                break
+            for position, event in batch:
+                if (
+                    event.session_id == session_id
+                    and event.kind is RunEventKind.CANONICAL
+                ):
+                    collected.append(event)
+                after = position
+        return tuple(collected)
+
+    def _has_terminal_event(
+        self, events: tuple[RunEvent, ...]
+    ) -> bool:
+        """判断事件元组是否含 terminal 事件（session 已落定）。
+
+        当前实现把 ``TERMINAL_RUN_EVENT_TYPES`` 视为”session 已落定的完整
+        事实”信号；仅 ``USER_INPUT_ACCEPTED`` 单独存在视为”session 仍在
+        进行”，不重建 snapshot 以避免写入”半成品” read model。
+
+        :param events: canonical RunEvent 元组。
+        :returns: 含 terminal 事件时返回 ``True``。
+        :raises Exception: 不主动抛出异常。
+        """
+
+        for event in events:
+            if event.type in TERMINAL_RUN_EVENT_TYPES:
+                return True
+        return False
+
+    def _snapshot_row_exists_in_tx(
+        self,
+        *,
+        tx: HostStorageTransaction,
+        session_id: str,
+    ) -> bool:
+        """事务内判定 snapshot row 是否存在。
+
+        :param tx: 当前事务。
+        :param session_id: 会话 id。
+        :returns: row 存在返回 ``True``。
+        :raises sqlite3.DatabaseError: 读取失败时抛出。
+        """
+
+        cursor = tx.execute(
+            "SELECT 1 FROM host_conversation_memory_snapshots "
+            "WHERE session_id = ?",
+            (session_id,),
+        )
+        row = cursor.fetchone()
+        cursor.close()
+        return row is not None
 
     def _project_in_tx(
         self,

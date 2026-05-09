@@ -475,3 +475,151 @@ def test_replace_keeps_dataclass_immutability() -> None:
     updated = replace(snapshot, session_id="session-replaced")
     assert updated.session_id == "session-replaced"
     assert snapshot.session_id == "session-roundtrip"
+
+
+@pytest.mark.asyncio
+async def test_startup_reconcile_repairs_snapshot_when_checkpoint_caught_up_and_row_missing(
+    tmp_path: Path,
+) -> None:
+    """checkpoint 已 CAUGHT_UP + snapshot row 被外部删除 → repair 必须重建。
+
+    复现 P8-S8 gap：``ProjectionCoordinator`` 的 checkpoint 已推进至最新
+    EventLog position 后，普通 drain 不会再驱动 observer 重投。本测试构造
+    “checkpoint CAUGHT_UP，``host_conversation_memory_snapshots`` 行被
+    外部删除”的 read model 丢失场景，调用 :meth:`startup_reconcile` 必须
+    通过 durable memory repair 路径从 EventLog 重建缺失 snapshot。
+    """
+
+    db_path = tmp_path / "memory_repair.sqlite"
+    config = DurableHarnessConfig(database_path=str(db_path))
+    session_id = "session_repair"
+    run_id = "run_repair_1"
+    user_text = "请记录关键事实。"
+    final_text = "已记录关键事实。"
+
+    bundle_a = build_durable_harness(config=config)
+    try:
+        await bundle_a.event_store.append(
+            _user_input_draft(
+                run_id=run_id, session_id=session_id, content=user_text
+            )
+        )
+        await bundle_a.event_store.append(
+            _final_draft(
+                run_id=run_id, session_id=session_id, content=final_text
+            )
+        )
+        # 推进到 CAUGHT_UP，snapshot 此时已写入。
+        await bundle_a.coordinator.drain()
+        snapshot = await bundle_a.memory_store.get_snapshot(session_id)
+        assert any(
+            turn.user_text == user_text for turn in snapshot.recent_raw_turns
+        )
+
+        # 模拟 read model 丢失：直接删除 snapshot 行，但保留 EventLog 与
+        # observer checkpoint。
+        async with bundle_a.storage.transaction() as tx:
+            tx.execute(
+                "DELETE FROM host_conversation_memory_snapshots "
+                "WHERE session_id = ?",
+                (session_id,),
+            )
+        empty = await bundle_a.memory_store.get_snapshot(session_id)
+        assert empty.recent_raw_turns == ()
+    finally:
+        bundle_a.close()
+
+    # 重新装配并触发 startup_reconcile：checkpoint 已 CAUGHT_UP 不会再
+    # drain，但 repair 路径必须从 EventLog 重建缺失 snapshot。
+    bundle_b = build_durable_harness(config=config)
+    try:
+        await bundle_b.startup_reconcile()
+        recovered = await bundle_b.memory_store.get_snapshot(session_id)
+        assert any(
+            turn.user_text == user_text for turn in recovered.recent_raw_turns
+        )
+        assert any(
+            turn.assistant_final == final_text
+            for turn in recovered.recent_raw_turns
+        )
+
+        # 重复 reconcile 不破坏已恢复 snapshot。
+        await bundle_b.startup_reconcile()
+        again = await bundle_b.memory_store.get_snapshot(session_id)
+        assert again.recent_raw_turns == recovered.recent_raw_turns
+    finally:
+        bundle_b.close()
+
+
+@pytest.mark.asyncio
+async def test_startup_reconcile_does_not_overwrite_intentional_empty_snapshot(
+    tmp_path: Path,
+) -> None:
+    """``MemoryResetPatch`` / ``ScopeClearPatch(SESSION)`` 写入的空 snapshot
+    必须区别于“缺失 row”，repair 路径不得误恢复旧内容。"""
+
+    db_path = tmp_path / "memory_intentional_empty.sqlite"
+    config = DurableHarnessConfig(database_path=str(db_path))
+    session_id = "session_intentional_empty"
+    run_id = "run_intentional_1"
+    user_text = "需要被 reset 清掉的旧事实。"
+    final_text = "旧 final answer。"
+
+    bundle = build_durable_harness(config=config)
+    try:
+        await bundle.event_store.append(
+            _user_input_draft(
+                run_id=run_id, session_id=session_id, content=user_text
+            )
+        )
+        await bundle.event_store.append(
+            _final_draft(
+                run_id=run_id, session_id=session_id, content=final_text
+            )
+        )
+        await bundle.coordinator.drain()
+
+        # 走 MemoryResetPatch：snapshot 写入空内容，但 row 仍存在。
+        await bundle.memory_store.apply_patch(
+            MemoryResetPatch(
+                session_id=session_id,
+                scope=MemoryScope.SESSION,
+                reason="user_requested_reset",
+            )
+        )
+        empty = await bundle.memory_store.get_snapshot(session_id)
+        assert empty.recent_raw_turns == ()
+
+        # startup_reconcile 不得把 EventLog 的旧事实重新投回。
+        await bundle.startup_reconcile()
+        still_empty = await bundle.memory_store.get_snapshot(session_id)
+        assert still_empty.recent_raw_turns == ()
+
+        # ScopeClearPatch(SESSION) 同样不应被 repair 误恢复。
+        await bundle.event_store.append(
+            _user_input_draft(
+                run_id="run_intentional_2",
+                session_id=session_id,
+                content="再次写入然后被 clear。",
+            )
+        )
+        await bundle.event_store.append(
+            _final_draft(
+                run_id="run_intentional_2",
+                session_id=session_id,
+                content="再次的 final。",
+            )
+        )
+        await bundle.coordinator.drain()
+        await bundle.memory_store.apply_patch(
+            ScopeClearPatch(
+                session_id=session_id,
+                scope=MemoryScope.SESSION,
+                reason="user_requested_clear",
+            )
+        )
+        await bundle.startup_reconcile()
+        still_empty_2 = await bundle.memory_store.get_snapshot(session_id)
+        assert still_empty_2.recent_raw_turns == ()
+    finally:
+        bundle.close()

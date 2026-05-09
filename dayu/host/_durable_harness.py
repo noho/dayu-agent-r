@@ -37,6 +37,7 @@ from dayu.host._attempt_lease import (
 from dayu.host._attempt_supervisor import AttemptSupervisor
 from dayu.host._audit_projection import AuditProjectionObserver
 from dayu.host._conversation_memory_durable import (
+    DurableConversationMemoryStore,
     open_durable_conversation_memory_store,
 )
 from dayu.host._memory_projection import (
@@ -154,11 +155,25 @@ class DurableHarnessBundle:
         async 上下文内串行 drain 至 ``CAUGHT_UP``，不引入新 event loop /
         线程，也不与 terminal 后的 ``drain()`` 重入冲突。
 
+        在 coordinator drain 完成后，本方法继续触发 durable memory store
+        的 ``repair_missing_session_snapshots``：当 projection checkpoint
+        已 ``CAUGHT_UP`` 但 ``host_conversation_memory_snapshots`` 部分
+        session row 因运维误操作或 read model 损坏而缺失时，普通 drain 不
+        会再驱动 observer 重投，repair 路径从 EventLog 重建缺失 session
+        snapshot；intentional empty snapshot（``MemoryResetPatch`` /
+        ``ScopeClearPatch(SESSION)`` 写入的空 row）因 row 仍存在不会被误
+        恢复。当装配的 memory store 不是 :class:`DurableConversationMemoryStore`
+        时不触发 repair（自定义 store 的恢复语义由 store 自己负责）。
+
         :returns: 无返回值。
         :raises sqlite3.DatabaseError: 写入失败时抛出。
         """
 
         await self.coordinator.startup_reconcile()
+        if isinstance(self.memory_store, DurableConversationMemoryStore):
+            await self.memory_store.repair_missing_session_snapshots(
+                event_store=self.event_store
+            )
 
 
 def build_durable_harness(

@@ -910,11 +910,11 @@ P8 不增强 analyzer，也不补造 partial tool call 记录；只固定 owner 
 - 构造 deterministic fake worker / proxy，不调用真实 provider。
 - 场景 1：owner A acquire + renew，输出 `owner_acquired=true owner=***abcd fencing_token=<int> renewed=true`。
 - 场景 2：owner B 在 lease 未过期时 acquire 被拒绝，输出 `busy=true`。
-- 场景 3：lease 过期后 recovery scan 标记 owner A attempt 为 `recovering`，创建 owner B recovery attempt，输出 `recovered_from=<attempt-a> recovery_attempt=<attempt-b>`。
+- 场景 3：lease 过期后 `recover_stale_attempts` supervisor scan 标记 owner A attempt 为 `recovering`，创建 recovery attempt，输出 `recovered_from=<attempt-a> recovery_attempt=<attempt-b>`。
 - 场景 4：owner A late append / ToolRuntime truncate fact 被 fenced，输出 `late_write=fenced reason=LEASE_EXPIRED`。
-- 场景 5：owner B 写 terminal event 并 close attempt，输出 `terminal_event_position=<int> attempt_state=succeeded`。
+- 场景 5：新 owner 通过 `lease_context` acquire 新 attempt 并写 terminal event close，输出 `terminal_event_position=<int> attempt_state=failed`。
 - 场景 6：模拟 terminal 后未 drain，重新装配后 `startup_reconcile` 追平 observer，输出 `observer_caught_up=true`。
-- 场景 7：terminal run 已落库且 projection checkpoint 已 caught up 后，丢弃 in-memory memory read model 并重新装配 durable harness，输出 `memory_recovered=true session=<masked>`，证明 durable memory recovery 路径生效，不依赖 production `InMemoryConversationMemoryStore`。
+- 场景 7：验证 durable memory checkpoint-caught-up 后删除 memory snapshot，再次 `startup_reconcile` 通过 durable repair 路径从 EventLog 重建 session memory，输出 `checkpoint_caught_up=true snapshot_deleted=true memory_recovered=true recovery_mode=checkpoint_rebuild`。完整 memory recovery 语义同步由 `test_phase8_durable_memory_recovery.py` 覆盖。
 
 输出约束：
 
