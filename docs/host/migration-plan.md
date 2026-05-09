@@ -39,8 +39,7 @@
   OLD / NEW review、架构边界 review、review fix 与复审均已完成，复审见
   `docs/host/phase7-fix-rereview.md`，结论通过；ToolRuntime `iteration_id` root-cause
   follow-up review 见 `docs/reviews/code-review-20260508-001.md`，Finding 001 / 003 已修复并复审通过；
-  残余风险已拆分到 GitHub issues #29-#35。
-  当前进入 P7 实现提交与 PR 前收口阶段。
+  残余风险已拆分到 GitHub issues #29-#36。P7 PR #37 已创建，当前等待用户人工 PR review。
 
 每个 Phase 进入实现前，必须另写可交接的 phase plan，细化到迁移 Agent 可以直接接手：
 目标、非目标、边界、文件级改动清单、契约变化、状态机、测试清单、验证命令、review gate、
@@ -80,35 +79,56 @@ migration/host-p{phase}-{short-name}
 
 如果用户指定其它分支名，以用户指令为准。
 
+当前仓库远端名是 `github`，不是 `origin`。总控 Agent 执行 push / PR 前必须先用
+`git remote -v` 或等价命令确认远端名，禁止假设远端一定叫 `origin`。本仓库默认 push
+形态为 `git push -u github <branch>`。
+
 每个 Phase 的固定节奏：
 
 1. 从最新主线或用户指定基线开新分支。
-2. 派 Agent 写 phase handoff plan。
+2. 派 Agent 写 phase handoff plan。除纯文档 / 极小修复外，plan 必须拆成若干可独立交付的
+   implementation stage / slice。每个 slice 必须足够小，原则上一个实施 Agent pass 加一个
+   review pass 可以完成；若 slice 太大、无法干净 review，必须先拆分再实施。每个 slice 必须
+   写明：slice id、短标题、目标、预期用户可见或契约可见结果、文件 / 模块 ownership、
+   允许修改、明确非目标、前置依赖、测试 / 验证命令、完成信号、停止条件和预计上下文压力。
+   slices 必须按依赖和风险排序；优先使用每步后系统仍可工作的 vertical slice。只有文件
+   ownership 与契约边界完全不重叠时，才允许并行 slice。禁止只写一个覆盖整个 phase 的大实施任务。
 3. 派 review Agent 做 plan review；必要时派额外 review Agent 做 OLD / NEW 对比、最佳实践、
-   架构边界或并发专项 review。
+   架构边界或并发专项 review。plan review 必须检查 slice 是否过粗、ownership 是否清晰、
+   测试是否只堆到最后、顺序是否容易诱导实施 Agent 提前做未来 slice；不合格时必须要求修 plan。
 4. 总控 Agent 读取 plan review 结果并判断 finding 是否成立；成立时派 Agent 修 plan，修复 Agent 必须在对应
    review 文档的 finding 标题上标注修复状态。
 5. 派 review Agent 复审修复后的 plan；若仍不通过，重复步骤 4-5，直到 review Agent 明确通过。
 6. plan review 通过后，停下来等用户人工确认。
 7. 用户确认后，commit phase plan 与 review 文档。
-8. 总控 Agent 生成按通过 plan 实施代码的指导 prompt，交给用户手工派迁移 Agent 生成代码。
-9. 总控 Agent 生成 code review 指导 prompt，交给用户手工派 Agent 执行 code review；必要时额外生成 OLD / NEW
+8. 总控 Agent 按通过 plan 的 implementation stage / slice 逐个生成实施指导 prompt，交给用户
+   手工派迁移 Agent 生成代码。每个实施 Agent 只能执行当前 stage，不得提前实现后续 stage；
+   若实施中发现当前 stage 过大、上下文窗口不足或需要跨 stage 改契约，必须停止并回报总控拆分 /
+   修 plan，不得硬做。
+9. 每个 stage 完成后，迁移 Agent 必须报告改动文件、验证结果、未覆盖项和是否触碰后续 stage。
+   总控 Agent 判断是否进入下一 stage；对契约 / schema / state-machine / 并发 / durable storage /
+   public interface 等高风险 stage，必须先生成 stage-level code review prompt 并完成修复 / 复审后，
+   才能进入下一 stage。
+10. 所有 stage 完成后，总控 Agent 生成 phase-level code review 指导 prompt，交给用户手工派
+    Agent 执行整体 code review；必要时额外生成 OLD / NEW
    对比、架构边界、类型安全或并发专项 review prompt。
-10. 用户提交 code review 结果后，总控 Agent 判断 finding 是否成立；成立时生成代码修复 prompt，
+11. 用户提交 code review 结果后，总控 Agent 判断 finding 是否成立；成立时生成代码修复 prompt，
     交给用户手工派 Agent 修复代码。修复 Agent 必须在对应 code review 文档的 finding 标题上标注
     修复状态，总控 Agent 负责检查标注是否到位。
-11. 总控 Agent 生成复审 prompt，交给用户手工派 Agent 执行复审；若仍不通过，重复步骤 10-11，
+12. 总控 Agent 生成复审 prompt，交给用户手工派 Agent 执行复审；若仍不通过，重复步骤 11-12，
     直到用户复审通过。
-12. code review 通过后，停下来等用户人工 review。
-13. 用户确认后，commit 代码、测试和必要 README / docs 更新。
-14. 准备 PR 时，确认只包含本 Phase 范围内提交，push 并创建 ready PR；不创建 draft PR，
+13. code review 通过后，停下来等用户人工 review。
+14. 用户确认后，commit 代码、测试和必要 README / docs 更新。若 Phase 被拆成多个高风险
+    stage，总控可在用户确认后按 stage 分别 commit，或在 phase 收口时统一 commit；无论哪种方式，
+    每个 commit 都必须只包含已通过对应 review gate 的改动。
+15. 准备 PR 时，确认只包含本 Phase 范围内提交，push 并创建 ready PR；不创建 draft PR，
     除非用户明确要求。PR 创建后停下来等用户人工 PR review。
-15. 用户提交 PR review 结果后，总控 Agent 判断 finding 是否成立；成立时生成代码修复 prompt，
+16. 用户提交 PR review 结果后，总控 Agent 判断 finding 是否成立；成立时生成代码修复 prompt，
     交给用户手工派 Agent 修复代码。修复 Agent 必须在对应 PR review 文档的 finding 标题上标注
     修复状态，总控 Agent 负责检查标注是否到位。
-16. PR review 通过后，停下来等用户确认。若 review 由用户本人完成，则对应修复也必须由用户本人复核；
+17. PR review 通过后，停下来等用户确认。若 review 由用户本人完成，则对应修复也必须由用户本人复核；
     总控 Agent 与其它 review Agent 不得替代用户复核结论。
-17. squash merge PR 并删除远端分支默认由用户执行；只有用户明确指示总控 Agent 执行时，
+18. squash merge PR 并删除远端分支默认由用户执行；只有用户明确指示总控 Agent 执行时，
     总控 Agent 才能执行 squash merge / delete branch。用户手工 merge 后，总控只记录状态。
 
 禁止事项：
@@ -117,6 +137,10 @@ migration/host-p{phase}-{short-name}
 - 不用总控 Agent 自己的复核替代用户 review / 复审结论；总控只负责派 Agent 写 / 修 phase plan、
   生成代码实施 / 代码修复 / review prompt、判断 finding 是否成立和维护修复状态。
 - 不在 review finding 未标注修复状态的情况下声称 review 通过。
+- 不把大 Phase 一次性塞给单个实施 Agent；若计划中已有多个 stage，必须按 stage 逐段实施、
+  逐段验证。若实施 Agent 报告上下文窗口不足，总控必须拆分 stage 或修 plan。
+- 不让实施 Agent 在当前 slice 中提前实现未来 slice；除非已通过 plan 明确授权多个 disjoint
+  slice 并行，否则发现 drift 必须停止并回到总控。
 - 不把多个 Phase 的实现混进一个 PR，除非用户明确批准合并。
 - 不在用户确认前 commit / push / create PR / merge。
 - 不把迁移过程要求写进 `docs/code_review.md`；该文档只写日常 review 当前事实专项。
@@ -338,6 +362,10 @@ P7 落地后，仍需后续阶段追踪的残余风险：
 - `accepted: P7 scope`：JSONL 与 EventLog checkpoint 非原子。每行 trace 在 EventLog 已 commit
   之后由 observer 写入；进程在两步之间崩溃，replay 后会产生重复行。靠行内 sha256[:32]
   `idempotency_key` 让 analyzer 去重消化崩溃窗口；P7 不引入跨子系统二阶段提交。
+- `deferred-with-owner: issue #36`：Tool Trace JSONL 文件滚动边界。`_select_jsonl_file`
+  当前在 append 前按现有文件大小选择分片，crash replay / duplicate append 可能让接近阈值的
+  `tool_calls_*.jsonl` 分片超过目标大小。正确性由 analyzer `idempotency_key` 去重保证，
+  但长期文件管理可预测性与运维体验需要在 #36 跟踪治理。
 - `deferred-with-owner: P7-followup`：compact 重试路径合成 `RunInputContextSnapshotBuiltData`
   时的 `iteration_index` / `attempt_index` 取值需要与真实 Engine attempt 元信息对齐验证，
   避免 trace `iteration_context_snapshot` 字段在 compact retry 后语义偏移。
@@ -541,6 +569,10 @@ PR 创建后：
 每个 Phase 结束前，总控 Agent 必须确认：
 
 - Phase 目标已完成，非目标未被偷做。
+- phase plan 已按 implementation stage / slice 拆分；每个非平凡 slice 都有 slice id、短标题、
+  目标、预期可见结果、文件 / 模块 ownership、前置依赖、明确非目标、测试命令、完成信号和
+  停止条件。实际实施记录能对应到这些 slice，未把整个大 Phase 一次性交给单个实施 Agent，
+  也未在当前 slice 中偷做未来 slice。
 - P6 及以后每项新增治理能力都有对应 `utils/` 手工 smoke，且 smoke 输出足以观察新增治理能力的
   执行路径，不刷屏、不泄露 scope token、不打印大块 prompt / delta / tool result。
 - 没有旧接口兼容 wrapper / facade / re-export。

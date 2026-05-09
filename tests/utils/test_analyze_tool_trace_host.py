@@ -265,6 +265,40 @@ def test_analyzer_detects_truncation_without_fetch_more_followup(
     )
 
 
+def test_analyzer_tracks_fetch_more_by_tool_call_not_run(
+    tmp_path: Path,
+) -> None:
+    """同 run 其它 tool_call 的 fetch_more 不应掩盖当前 tool_call 的截断缺口。"""
+
+    truncated_without_fetch_more = _tool_call_record(
+        idempotency_key="trunc-a",
+        source_event_position=1,
+        tool_call_id="tc-a",
+        truncation_has_more=True,
+        truncation_scope_token="scope-A",
+        truncation_cursor="cur-A",
+    )
+    unrelated_fetch_more = _tool_call_record(
+        idempotency_key="fetch-b",
+        source_event_position=2,
+        tool_call_id="tc-b",
+        fetch_more_consumed_cursor="cur-B",
+    )
+    _write_jsonl(
+        trace_root=tmp_path,
+        session_id=_SESSION_ID,
+        records=[truncated_without_fetch_more, unrelated_fetch_more],
+    )
+    report = analyze_trace_root(trace_root=tmp_path)
+    assert report.truncation_without_fetch_more == (
+        TruncationGap(
+            run_id=_RUN_ID,
+            tool_call_id="tc-a",
+            scope_token="scope-A",
+        ),
+    )
+
+
 def test_analyzer_detects_wrong_scope_token_in_fetch_more(
     tmp_path: Path,
 ) -> None:

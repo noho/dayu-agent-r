@@ -400,14 +400,14 @@ def _detect_repeated_tool_calls(
 def _detect_truncation_gaps(
     entries: list[TraceLineEntry],
 ) -> tuple[TruncationGap, ...]:
-    """检测同 run 内 truncation 后没有 fetch_more 续读的 tool_call。
+    """检测同一工具调用 truncation 后没有 fetch_more 续读的 tool_call。
 
     :param entries: 去重后的 record 列表。
     :returns: TruncationGap 列表。
     :raises Exception: 不主动抛出异常。
     """
 
-    has_fetch_more_by_run: dict[str, bool] = {}
+    has_fetch_more_by_tool_call: dict[tuple[str, str], bool] = {}
     truncations: list[tuple[str, str, str]] = []
     for entry in entries:
         record = entry.record
@@ -415,21 +415,20 @@ def _detect_truncation_gaps(
         if trace_type != _TRACE_TYPE_TOOL_CALL:
             continue
         run_id = _read_str(record, "run_id")
+        tool_call_id = _read_str(record, "tool_call_id")
         truncation_has_more = _read_bool(record, "truncation_has_more")
         fetch_more_consumed = record.get("fetch_more_consumed_cursor")
+        tool_call_key = (run_id, tool_call_id)
         if isinstance(fetch_more_consumed, str) and fetch_more_consumed != "":
-            has_fetch_more_by_run[run_id] = True
-        elif run_id not in has_fetch_more_by_run:
-            has_fetch_more_by_run[run_id] = (
-                has_fetch_more_by_run.get(run_id, False)
-            )
+            has_fetch_more_by_tool_call[tool_call_key] = True
+        else:
+            has_fetch_more_by_tool_call.setdefault(tool_call_key, False)
         if truncation_has_more is True:
             scope_token = _read_str(record, "truncation_scope_token")
-            tool_call_id = _read_str(record, "tool_call_id")
             truncations.append((run_id, tool_call_id, scope_token))
     gaps: list[TruncationGap] = []
     for run_id, tool_call_id, scope_token in truncations:
-        if not has_fetch_more_by_run.get(run_id, False):
+        if not has_fetch_more_by_tool_call.get((run_id, tool_call_id), False):
             gaps.append(
                 TruncationGap(
                     run_id=run_id,
