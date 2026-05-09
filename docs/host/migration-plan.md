@@ -337,13 +337,14 @@ P6 code / architecture / concurrency review 修复后，若仍存在不阻断 P6
   对运维状态视图可能误读为“未启动”。不影响 projection 正确性。需要在 P15 Governance
   Hardening 阶段为 `ProjectionStore` 增加无 position 的 `set_status` 入口，或引入哨兵
   position 显式表达 "已追平且尚无事件"。
-- `deferred-with-owner: P8/#28/P15`：`ObserverSink.process` async 升级与 observer claim / lease。
-  P6 当前保留同步 observer 协议，并由 `MemoryProjectionObserver._run_async` 桥接 async
-  `ConversationMemoryStore` 接口；这保证 P6 diff 边界小，但每个 terminal projection 会引入
-  thread + event loop 桥接开销。P8 plan gate 已固定：P8 负责把 `ObserverSink.process` 升级为
-  async 协议并删除 `_run_async` bridge；P8 不实现 observer claim / lease，不升级 observer
-  ownership，只通过 deterministic multiprocessing observer drain 验证 attempt lease 不破坏现有
-  checkpoint 语义。后台 observer drain、observer claim / lease 归 #28 或 P15 单独设计。
+- `accepted: P8-S2 completed / deferred-with-owner: #28/P15`：`ObserverSink.process`
+  async 升级已在 P8-S2 完成，`MemoryProjectionObserver._run_async` bridge 已删除，observer
+  统一由 `ProjectionCoordinator` 在同一 storage transaction 内 `await observer.process(...)` 后推进
+  checkpoint。P8 仍不实现 observer claim / lease，不升级 observer ownership，只通过 deterministic
+  multiprocessing observer drain 验证 attempt lease 不破坏现有 checkpoint 语义。async observer 让
+  tool trace JSONL flush 等 sink IO 计入 terminal 后 projection transaction 持有时间；这是 P8 为删除
+  `_run_async` bridge 接受的取舍。后台 buffered drain、best-effort observer 从 terminal 主路径解耦、
+  observer claim / lease 与 projection hardening 归 issue #28 或 P15 单独设计。
 - `deferred-with-owner: P9`：`startup_reconcile` 进入 Host 启动流程。P6 只提供
   `DurableHarnessBundle.startup_reconcile()` 显式入口，用于在 terminal event 已持久化但 terminal 后
   `drain()` 尚未执行就崩溃的场景中追平 read model。由于 `build_durable_harness()` 是同步装配函数，
@@ -365,6 +366,11 @@ P6 code / architecture / concurrency review 修复后，若仍存在不阻断 P6
   no-full-governance smoke 与非 durable 过渡装配使用，不再代表生产事实层。P16 interface freeze /
   文档收口时必须决定：删除它、迁移到测试 helper / explicit local adapter，或用专项理由保留为
   非生产 adapter；不得继续作为 Host 生产默认装配或 public interface 暗含依赖。
+- `deferred-with-owner: P16`：observer direct-call 测试中的 fake transaction 类型收口。
+  P8-S2 将 `ObserverSink.process` 升级为 async 后，P7 tool trace projection 测试仍沿用
+  `cast(object, None)  # type: ignore[arg-type]` 作为不使用 `tx` 的 fake transaction。
+  这是 P7 既有测试约定，不阻塞 P8；P16 interface freeze 若要加强测试侧协议守护，应评估引入
+  typed fake transaction 或测试 helper，消除该类 `type: ignore`。
 
 ### 4.3 P7 残余风险追踪
 

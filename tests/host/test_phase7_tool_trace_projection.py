@@ -163,7 +163,8 @@ def _read_jsonl_lines(root: Path) -> list[dict[str, JsonValue]]:
     return out
 
 
-def test_tool_call_paired_emits_record(tmp_path: Path) -> None:
+@pytest.mark.asyncio
+async def test_tool_call_paired_emits_record(tmp_path: Path) -> None:
     """同 batch ``TOOL_CALL_REQUESTED`` + ``TOOL_RESULT_ACCEPTED`` 派发一行。"""
 
     sink = ToolTraceJsonlSink(root_path=tmp_path)
@@ -191,7 +192,7 @@ def test_tool_call_paired_emits_record(tmp_path: Path) -> None:
             outcome=_completed_outcome(),
         ),
     )
-    observer.process(tx=cast(object, None), batch=(requested, accepted))  # type: ignore[arg-type]
+    await observer.process(tx=cast(object, None), batch=(requested, accepted))  # type: ignore[arg-type]
     lines = _read_jsonl_lines(tmp_path)
     assert len(lines) == 1
     rec = lines[0]
@@ -200,7 +201,8 @@ def test_tool_call_paired_emits_record(tmp_path: Path) -> None:
     assert rec["outcome_kind"] == "completed"
 
 
-def test_tool_call_missing_accepted_raises(tmp_path: Path) -> None:
+@pytest.mark.asyncio
+async def test_tool_call_missing_accepted_raises(tmp_path: Path) -> None:
     """缺失 ``TOOL_RESULT_ACCEPTED`` 抛 ProjectionSchemaError。"""
 
     sink = ToolTraceJsonlSink(root_path=tmp_path)
@@ -218,10 +220,11 @@ def test_tool_call_missing_accepted_raises(tmp_path: Path) -> None:
         ),
     )
     with pytest.raises(ProjectionSchemaError):
-        observer.process(tx=cast(object, None), batch=(requested,))  # type: ignore[arg-type]
+        await observer.process(tx=cast(object, None), batch=(requested,))  # type: ignore[arg-type]
 
 
-def test_tool_call_failed_outcome_records_error(tmp_path: Path) -> None:
+@pytest.mark.asyncio
+async def test_tool_call_failed_outcome_records_error(tmp_path: Path) -> None:
     """failed outcome 写入 ``failure_error`` / ``failure_message``。"""
 
     sink = ToolTraceJsonlSink(root_path=tmp_path)
@@ -249,14 +252,15 @@ def test_tool_call_failed_outcome_records_error(tmp_path: Path) -> None:
             outcome=_failed_outcome(),
         ),
     )
-    observer.process(tx=cast(object, None), batch=(requested, accepted))  # type: ignore[arg-type]
+    await observer.process(tx=cast(object, None), batch=(requested, accepted))  # type: ignore[arg-type]
     lines = _read_jsonl_lines(tmp_path)
     assert lines[0]["outcome_kind"] == "failed"
     assert lines[0]["failure_error"] == "boom"
     assert lines[0]["failure_message"] == "bad"
 
 
-def test_iteration_usage_emits_record(tmp_path: Path) -> None:
+@pytest.mark.asyncio
+async def test_iteration_usage_emits_record(tmp_path: Path) -> None:
     """``RUNNER_USAGE_RECORDED`` 派发 ``iteration_usage``。"""
 
     sink = ToolTraceJsonlSink(root_path=tmp_path)
@@ -271,7 +275,7 @@ def test_iteration_usage_emits_record(tmp_path: Path) -> None:
             total_tokens=30,
         ),
     )
-    observer.process(tx=cast(object, None), batch=(env,))  # type: ignore[arg-type]
+    await observer.process(tx=cast(object, None), batch=(env,))  # type: ignore[arg-type]
     lines = _read_jsonl_lines(tmp_path)
     assert len(lines) == 1
     assert lines[0]["trace_type"] == "iteration_usage"
@@ -279,7 +283,8 @@ def test_iteration_usage_emits_record(tmp_path: Path) -> None:
     assert lines[0]["total_tokens"] == 30
 
 
-def test_final_answer_emits_record(tmp_path: Path) -> None:
+@pytest.mark.asyncio
+async def test_final_answer_emits_record(tmp_path: Path) -> None:
     """``FINAL_ANSWER`` 派发 ``final_response``，``iteration_id`` 为空。"""
 
     sink = ToolTraceJsonlSink(root_path=tmp_path)
@@ -294,7 +299,7 @@ def test_final_answer_emits_record(tmp_path: Path) -> None:
             finish_reason=FinishReason.STOP,
         ),
     )
-    observer.process(tx=cast(object, None), batch=(env,))  # type: ignore[arg-type]
+    await observer.process(tx=cast(object, None), batch=(env,))  # type: ignore[arg-type]
     lines = _read_jsonl_lines(tmp_path)
     assert lines[0]["trace_type"] == "final_response"
     assert lines[0]["iteration_id"] == ""
@@ -302,7 +307,8 @@ def test_final_answer_emits_record(tmp_path: Path) -> None:
     assert lines[0]["finish_reason"] == "stop"
 
 
-def test_provider_protocol_error_omitted_payload(tmp_path: Path) -> None:
+@pytest.mark.asyncio
+async def test_provider_protocol_error_omitted_payload(tmp_path: Path) -> None:
     """``raw_payload`` 为 ``None`` 时 fallback 到 omitted_no_payload。"""
 
     sink = ToolTraceJsonlSink(root_path=tmp_path)
@@ -318,14 +324,15 @@ def test_provider_protocol_error_omitted_payload(tmp_path: Path) -> None:
             raw_payload=None,
         ),
     )
-    observer.process(tx=cast(object, None), batch=(env,))  # type: ignore[arg-type]
+    await observer.process(tx=cast(object, None), batch=(env,))  # type: ignore[arg-type]
     lines = _read_jsonl_lines(tmp_path)
     raw = lines[0]["raw_payload_json"]
     assert isinstance(raw, str)
     assert json.loads(raw) == {"reason": "omitted_no_payload"}
 
 
-def test_provider_protocol_error_scrubs_secret(tmp_path: Path) -> None:
+@pytest.mark.asyncio
+async def test_provider_protocol_error_scrubs_secret(tmp_path: Path) -> None:
     """raw payload 中敏感字段被替换为 ``***``。"""
 
     sink = ToolTraceJsonlSink(root_path=tmp_path)
@@ -341,7 +348,7 @@ def test_provider_protocol_error_scrubs_secret(tmp_path: Path) -> None:
             raw_payload={"Authorization": "Bearer abc", "msg": "ok"},
         ),
     )
-    observer.process(tx=cast(object, None), batch=(env,))  # type: ignore[arg-type]
+    await observer.process(tx=cast(object, None), batch=(env,))  # type: ignore[arg-type]
     lines = _read_jsonl_lines(tmp_path)
     raw = lines[0]["raw_payload_json"]
     assert isinstance(raw, str)
@@ -392,7 +399,8 @@ def _snapshot_data() -> RunInputContextSnapshotBuiltData:
     )
 
 
-def test_context_snapshot_writes_blob_files_and_record(tmp_path: Path) -> None:
+@pytest.mark.asyncio
+async def test_context_snapshot_writes_blob_files_and_record(tmp_path: Path) -> None:
     """context snapshot 派发 2 个 raw_payloads 文件 + 1 行 JSONL。"""
 
     sink = ToolTraceJsonlSink(root_path=tmp_path)
@@ -402,7 +410,7 @@ def test_context_snapshot_writes_blob_files_and_record(tmp_path: Path) -> None:
         event_type=RunEventType.RUN_INPUT_CONTEXT_SNAPSHOT_BUILT,
         data=_snapshot_data(),
     )
-    observer.process(tx=cast(object, None), batch=(env,))  # type: ignore[arg-type]
+    await observer.process(tx=cast(object, None), batch=(env,))  # type: ignore[arg-type]
     raw_dir = tmp_path / "raw_payloads" / f"{_RUN_ID}_iter-1"
     assert (raw_dir / "blob_input.json").read_text(encoding="utf-8").startswith(
         "[{"
@@ -420,7 +428,8 @@ def test_context_snapshot_writes_blob_files_and_record(tmp_path: Path) -> None:
     )
 
 
-def test_idempotency_key_stable_across_redrain(tmp_path: Path) -> None:
+@pytest.mark.asyncio
+async def test_idempotency_key_stable_across_redrain(tmp_path: Path) -> None:
     """重复 process 同样 envelope 的 ``idempotency_key`` 一致。"""
 
     sink = ToolTraceJsonlSink(root_path=tmp_path)
@@ -435,8 +444,8 @@ def test_idempotency_key_stable_across_redrain(tmp_path: Path) -> None:
             total_tokens=3,
         ),
     )
-    observer.process(tx=cast(object, None), batch=(env,))  # type: ignore[arg-type]
-    observer.process(tx=cast(object, None), batch=(env,))  # type: ignore[arg-type]
+    await observer.process(tx=cast(object, None), batch=(env,))  # type: ignore[arg-type]
+    await observer.process(tx=cast(object, None), batch=(env,))  # type: ignore[arg-type]
     lines = _read_jsonl_lines(tmp_path)
     assert len(lines) == 2
     assert lines[0]["idempotency_key"] == lines[1]["idempotency_key"]
@@ -485,7 +494,8 @@ def _accepted_env(*, position: int = 2) -> ProjectionEventEnvelope:
     )
 
 
-def test_tool_call_with_truncated_pairs_into_record(tmp_path: Path) -> None:
+@pytest.mark.asyncio
+async def test_tool_call_with_truncated_pairs_into_record(tmp_path: Path) -> None:
     """``TOOL_CALL_REQUESTED + TOOL_RESULT_ACCEPTED + TOOL_RESULT_TRUNCATED``
     依赖共同 ``iteration_id`` 配对，写入截断维度字段。"""
 
@@ -513,7 +523,7 @@ def test_tool_call_with_truncated_pairs_into_record(tmp_path: Path) -> None:
             ),
         ),
     )
-    observer.process(
+    await observer.process(
         tx=cast(object, None),  # type: ignore[arg-type]
         batch=(_requested_env(), _accepted_env(), truncated),
     )
@@ -527,7 +537,8 @@ def test_tool_call_with_truncated_pairs_into_record(tmp_path: Path) -> None:
     assert rec["truncation_limit"] == 10
 
 
-def test_tool_call_with_fetch_more_completed_pairs(tmp_path: Path) -> None:
+@pytest.mark.asyncio
+async def test_tool_call_with_fetch_more_completed_pairs(tmp_path: Path) -> None:
     """``TOOL_FETCH_MORE_COMPLETED`` 同 batch 配对写 fetch_more 维度字段。"""
 
     sink = ToolTraceJsonlSink(root_path=tmp_path)
@@ -552,7 +563,7 @@ def test_tool_call_with_fetch_more_completed_pairs(tmp_path: Path) -> None:
             ),
         ),
     )
-    observer.process(
+    await observer.process(
         tx=cast(object, None),  # type: ignore[arg-type]
         batch=(_requested_env(), _accepted_env(), fetch_completed),
     )
@@ -565,7 +576,8 @@ def test_tool_call_with_fetch_more_completed_pairs(tmp_path: Path) -> None:
     assert rec["fetch_more_has_more"] is False
 
 
-def test_tool_call_with_cursor_denied_records_reason(tmp_path: Path) -> None:
+@pytest.mark.asyncio
+async def test_tool_call_with_cursor_denied_records_reason(tmp_path: Path) -> None:
     """``TOOL_CURSOR_DENIED`` 同 batch 配对写入 ``cursor_denial_reason``。"""
 
     sink = ToolTraceJsonlSink(root_path=tmp_path)
@@ -580,7 +592,7 @@ def test_tool_call_with_cursor_denied_records_reason(tmp_path: Path) -> None:
             reason="cursor_scope_mismatch",
         ),
     )
-    observer.process(
+    await observer.process(
         tx=cast(object, None),  # type: ignore[arg-type]
         batch=(_requested_env(), _accepted_env(), denied),
     )
@@ -588,7 +600,8 @@ def test_tool_call_with_cursor_denied_records_reason(tmp_path: Path) -> None:
     assert lines[0]["cursor_denial_reason"] == "cursor_scope_mismatch"
 
 
-def test_tool_call_with_cursor_expired_records_time(tmp_path: Path) -> None:
+@pytest.mark.asyncio
+async def test_tool_call_with_cursor_expired_records_time(tmp_path: Path) -> None:
     """``TOOL_CURSOR_EXPIRED`` 同 batch 配对写入 ``cursor_expired_at_monotonic``。"""
 
     sink = ToolTraceJsonlSink(root_path=tmp_path)
@@ -603,7 +616,7 @@ def test_tool_call_with_cursor_expired_records_time(tmp_path: Path) -> None:
             expired_at_monotonic=131.5,
         ),
     )
-    observer.process(
+    await observer.process(
         tx=cast(object, None),  # type: ignore[arg-type]
         batch=(_requested_env(), _accepted_env(), expired),
     )
@@ -611,7 +624,8 @@ def test_tool_call_with_cursor_expired_records_time(tmp_path: Path) -> None:
     assert lines[0]["cursor_expired_at_monotonic"] == 131.5
 
 
-def test_truncated_alone_without_request_raises(tmp_path: Path) -> None:
+@pytest.mark.asyncio
+async def test_truncated_alone_without_request_raises(tmp_path: Path) -> None:
     """单独出现 ``TOOL_RESULT_TRUNCATED`` 缺 requested/accepted 抛 schema error。"""
 
     sink = ToolTraceJsonlSink(root_path=tmp_path)
@@ -639,13 +653,14 @@ def test_truncated_alone_without_request_raises(tmp_path: Path) -> None:
         ),
     )
     with pytest.raises(ProjectionSchemaError):
-        observer.process(
+        await observer.process(
             tx=cast(object, None),  # type: ignore[arg-type]
             batch=(truncated,),
         )
 
 
-def test_truncate_then_fetch_more_real_sequence(tmp_path: Path) -> None:
+@pytest.mark.asyncio
+async def test_truncate_then_fetch_more_real_sequence(tmp_path: Path) -> None:
     """真实序列：requested + accepted + truncated + fetch_more_completed
     四事件同 batch，trace 同时记录截断与补读维度。"""
 
@@ -693,7 +708,7 @@ def test_truncate_then_fetch_more_real_sequence(tmp_path: Path) -> None:
             ),
         ),
     )
-    observer.process(
+    await observer.process(
         tx=cast(object, None),  # type: ignore[arg-type]
         batch=(_requested_env(), _accepted_env(), truncated, fetch_completed),
     )

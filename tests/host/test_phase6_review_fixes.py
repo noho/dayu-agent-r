@@ -365,7 +365,7 @@ class _RecordingObserver:
 
         return self._descriptor
 
-    def process(
+    async def process(
         self,
         *,
         tx: HostStorageTransaction,
@@ -648,13 +648,13 @@ async def test_memory_observer_sink_failure_preserves_pending_for_replay() -> No
         observer._pending_by_run["other_run"] = []  # noqa: SLF001
         with pytest.raises(RuntimeError, match="sink failure"):
             async with storage.transaction() as tx:
-                observer.process(tx=tx, batch=batch)
+                await observer.process(tx=tx, batch=batch)
         # 关键不变量：失败后 _pending_by_run 不能被破坏（之前累积的 run 仍在）。
         assert "other_run" in observer._pending_by_run  # noqa: SLF001
 
         # 第二次重放：sink 成功；coordinator 会用同一 batch 重放，整批应被完整投影。
         async with storage.transaction() as tx:
-            observer.process(tx=tx, batch=batch)
+            await observer.process(tx=tx, batch=batch)
         assert len(flaky.projected) == 1  # type: ignore[attr-defined]
         projected_events = flaky.projected[0]  # type: ignore[attr-defined]
         types = [e.type for e in projected_events]

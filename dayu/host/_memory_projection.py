@@ -10,17 +10,18 @@ memory projection 是 required projection：
 - 成功终态写 assistant final answer。
 - Engine ``RUN_FAILED`` 与 Host-owned failure 写中性 terminal summary。
 - cancelled / suspended 不写 assistant terminal summary，但保留用户输入。
+
+P8 起 ``ObserverSink.process`` 已升级为 async 协议，observer 直接
+``await`` :class:`ConversationMemoryStore`，不再需要 sync-async 桥接。
 """
 
 from __future__ import annotations
 
-from collections.abc import Awaitable
 from dataclasses import dataclass, field
 
 from dayu.host._conversation_memory import ConversationMemoryStore
 from dayu.host._event_observer import (
     ObserverDescriptor,
-    ObserverSink,
     ProjectionEventEnvelope,
 )
 from dayu.host._host_storage_transaction import HostStorageTransaction
@@ -62,7 +63,7 @@ class MemoryProjectionObserver:
             required=True,
         )
 
-    def process(
+    async def process(
         self,
         *,
         tx: HostStorageTransaction,
@@ -101,21 +102,18 @@ class MemoryProjectionObserver:
             staged.setdefault(event.run_id, []).append(event)
             if event.type in TERMINAL_RUN_EVENT_TYPES:
                 events = tuple(staged[event.run_id])
-                # 同步路径：memory store 是 asyncio 协程接口，但 observer
-                # 在事务内同步运行；采用 ``run_until_complete`` 兼容内存实
-                # 现的 Lock。
-                _run_async(
-                    self.memory_store.project_run_events(events)
-                )
+                # P8 起 observer 协议为 async，直接 await memory store；不再
+                # 需要 thread + 新 event loop 的 sync-async 桥接。
+                await self.memory_store.project_run_events(events)
                 terminal_run_ids.append(event.run_id)
         # sink 全部成功后才把 staged 状态写回真源，并清掉已 terminal 的
-        # run 条目；任何一次 ``_run_async`` 抛异常时控制流不会到达此处，
+        # run 条目；任何一次 ``await`` 抛异常时控制流不会到达此处，
         # ``_pending_by_run`` 维持调用前的累积视图。
         self._pending_by_run = staged
         for run_id in terminal_run_ids:
             self._pending_by_run.pop(run_id, None)
 
-    def rebuild_from_events(
+    async def rebuild_from_events(
         self,
         events: tuple[RunEvent, ...],
     ) -> None:
@@ -140,59 +138,7 @@ class MemoryProjectionObserver:
                 continue
             groups.setdefault(event.run_id, []).append(event)
         for run_events in groups.values():
-            _run_async(
-                self.memory_store.project_run_events(tuple(run_events))
-            )
-
-
-def _run_async(coro: Awaitable[None]) -> None:
-    """在同步上下文驱动一个协程到完成。
-
-    observer 在 ``ProjectionCoordinator`` 写事务的线程内被同步调用，但
-    memory store 协议是协程；本函数在没有 running loop 时用临时 loop
-    驱动，在已有 running loop 时把协程派发到一个独立线程内的新 loop
-    执行，避免阻塞外层 loop 也避免重入冲突。
-
-    :param coro: awaitable 对象。
-    :returns: 无返回值。
-    :raises Exception: 协程内部异常透传。
-    """
-
-    import asyncio
-    import threading
-
-    try:
-        running = asyncio.get_running_loop()
-    except RuntimeError:
-        running = None
-
-    async def _await_target() -> None:
-        await coro
-
-    if running is None:
-        loop = asyncio.new_event_loop()
-        try:
-            loop.run_until_complete(_await_target())
-        finally:
-            loop.close()
-        return
-
-    error_box: list[BaseException] = []
-
-    def _runner() -> None:
-        loop = asyncio.new_event_loop()
-        try:
-            loop.run_until_complete(_await_target())
-        except BaseException as exc:  # noqa: BLE001
-            error_box.append(exc)
-        finally:
-            loop.close()
-
-    thread = threading.Thread(target=_runner, name="memory-projection-runner")
-    thread.start()
-    thread.join()
-    if error_box:
-        raise error_box[0]
+            await self.memory_store.project_run_events(tuple(run_events))
 
 
 __all__ = [

@@ -107,7 +107,7 @@ class _RetryOnceObserver:
             required=False,
         )
 
-    def process(
+    async def process(
         self,
         *,
         tx: HostStorageTransaction,
@@ -162,7 +162,7 @@ class _BlockingObserver:
             required=True,
         )
 
-    def process(
+    async def process(
         self,
         *,
         tx: HostStorageTransaction,

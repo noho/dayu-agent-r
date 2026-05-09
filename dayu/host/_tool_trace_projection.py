@@ -138,7 +138,7 @@ class ToolTraceObserver(ObserverSink):
             required=False,
         )
 
-    def process(
+    async def process(
         self,
         *,
         tx: HostStorageTransaction,
@@ -146,8 +146,10 @@ class ToolTraceObserver(ObserverSink):
     ) -> None:
         """处理 EventLog batch。
 
-        ``tx`` 在 P7 trace observer 中不被使用，保留参数以满足
-        :class:`ObserverSink` 协议。
+        ``tx`` 在 P7/P8 trace observer 中不被使用，保留参数以满足
+        :class:`ObserverSink` 协议。协议为 async（P8 起 ObserverSink
+        协议升级为 async）；当前实现内部仍只做同步 JSONL / 文件写入，
+        不 ``await`` 任何下游，但保持 async 签名以匹配协议。
 
         :param tx: 当前事务（未使用）。
         :param batch: 事件 envelope 元组，按 position 升序。

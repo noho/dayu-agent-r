@@ -55,13 +55,17 @@ class TimelineProjectionObserver:
             required=False,
         )
 
-    def process(
+    async def process(
         self,
         *,
         tx: HostStorageTransaction,
         batch: tuple[ProjectionEventEnvelope, ...],
     ) -> None:
         """累计 canonical 事件到内存 timeline。
+
+        协议为 async（P8 起 :class:`ObserverSink` 协议升级为 async）。
+        timeline 写入仍是纯内存操作，不需要 await 任何下游；保持
+        async 签名以匹配协议。
 
         :param tx: 当前事务（timeline read model 不写 SQL，但保留接口）。
         :param batch: 事件 envelope 元组。

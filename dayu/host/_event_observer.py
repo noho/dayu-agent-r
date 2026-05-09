@@ -7,7 +7,9 @@ EngineEvent iterator；不实现完整 MQ / claim / lease。
 设计要点：
 
 - ``ObserverSink`` 协议：观察者负责 sink 写入，写入必须幂等。在同一 UoW
-  内 sink 写入与 checkpoint 前进必须一起提交。
+  内 sink 写入与 checkpoint 前进必须一起提交。``process`` 为 async 协议：
+  observer 内部允许 ``await`` 异步 store / sink，不再需要 sync-async
+  桥接。
 - ``ProjectionCoordinator``：组合一组 observer 与 :class:`ProjectionStore`，
   按 global event position 顺序拉取 batch，逐个调用 sink 处理。
 - 失败语义：sink 抛 ``RetryableProjectionError`` 时记录 ``RETRYABLE_FAILED``，
@@ -88,13 +90,18 @@ class ObserverSink(Protocol):
         """
         ...
 
-    def process(
+    async def process(
         self,
         *,
         tx: HostStorageTransaction,
         batch: tuple[ProjectionEventEnvelope, ...],
     ) -> None:
         """在事务内处理一批事件。
+
+        协议为 async：observer 与 projection checkpoint 推进必须在同一个
+        ``HostStorage.transaction()`` 内完成；async 协议消除 P6/P7 内
+        sync-async 桥接（例如 memory store 的 thread + new loop bridge），
+        允许 observer 直接 ``await`` 其下游异步 store / sink。
 
         :param tx: 当前 :class:`HostStorageTransaction`。
         :param batch: 事件 envelope 元组，按 position 升序。
@@ -253,7 +260,7 @@ class ProjectionCoordinator:
             last_position = envelopes[-1].position
             try:
                 async with self.storage.transaction() as tx:
-                    observer.process(tx=tx, batch=envelopes)
+                    await observer.process(tx=tx, batch=envelopes)
                     self.projection_store.advance_success(
                         tx=tx,
                         observer_id=desc.observer_id,

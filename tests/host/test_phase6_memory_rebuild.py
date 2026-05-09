@@ -11,7 +11,6 @@
 
 from __future__ import annotations
 
-import asyncio
 from datetime import datetime, timezone
 
 import pytest
@@ -154,7 +153,7 @@ async def test_memory_rebuild_keeps_user_input_on_success() -> None:
 
     memory = InMemoryConversationMemoryStore()
     observer = MemoryProjectionObserver(memory_store=memory)
-    await asyncio.to_thread(observer.rebuild_from_events,
+    await observer.rebuild_from_events(
         events=(
             _user_input_event(run_id="r1", content="问题1"),
             _final_event(run_id="r1", content="答案1"),
@@ -173,7 +172,7 @@ async def test_memory_rebuild_engine_failure_writes_neutral_terminal() -> None:
 
     memory = InMemoryConversationMemoryStore()
     observer = MemoryProjectionObserver(memory_store=memory)
-    await asyncio.to_thread(observer.rebuild_from_events,
+    await observer.rebuild_from_events(
         events=(
             _user_input_event(run_id="r1", content="问题"),
             _engine_failed_event(run_id="r1"),
@@ -195,7 +194,7 @@ async def test_memory_rebuild_host_failure_writes_neutral_terminal() -> None:
 
     memory = InMemoryConversationMemoryStore()
     observer = MemoryProjectionObserver(memory_store=memory)
-    await asyncio.to_thread(observer.rebuild_from_events,
+    await observer.rebuild_from_events(
         events=(
             _user_input_event(run_id="r1", content="hi"),
             _host_failed_event(run_id="r1"),
@@ -211,7 +210,7 @@ async def test_memory_rebuild_cancelled_keeps_user_input_no_assistant() -> None:
 
     memory = InMemoryConversationMemoryStore()
     observer = MemoryProjectionObserver(memory_store=memory)
-    await asyncio.to_thread(observer.rebuild_from_events,
+    await observer.rebuild_from_events(
         events=(
             _user_input_event(run_id="r1", content="cancel-me"),
             _cancelled_event(run_id="r1"),
@@ -236,7 +235,7 @@ async def test_memory_rebuild_suspended_keeps_user_input_no_assistant() -> None:
 
     memory = InMemoryConversationMemoryStore()
     observer = MemoryProjectionObserver(memory_store=memory)
-    await asyncio.to_thread(observer.rebuild_from_events,
+    await observer.rebuild_from_events(
         events=(
             _user_input_event(run_id="r1", content="pause"),
             _suspended_event(run_id="r1"),
