@@ -369,7 +369,21 @@ fencing token、独立 owner secret hash、`recovered_from_attempt_id` 反向链
 CAS rowcount=0 命中 `NOOP_TERMINAL` 安全分支不残留改写。recovery scan 不修改
 `host_projection_checkpoints`，不写诊断 RunEvent，所有决策以 typed `AttemptRecoveryDecision`
 返回。该入口当前只是内部入口，未自动 wire 进 `build_durable_harness` 或 Session 生命周期，
-自动装配时机由 P8-S7 决定。多进程稳态仍归 P8-S7。
+自动装配时机仍未在生产链路落地。
+
+P8-S7 引入了真实多进程 + observer drain 验证测试套（`tests/host/test_phase8_multiprocess_stress.py`
+与 `tests/host/_multiprocess_platform.py`），在文件落库 SQLite (WAL + ``BEGIN IMMEDIATE``) 上
+确认: 多进程并发 `DurableRunEventStore.append` 严格保留 per-run sequence + global
+`event_position` 单调唯一；多进程 terminal close 仅 owner secret 命中库内 hash 的胜出，另一方
+落 `AttemptFencingError(OWNER_MISMATCH)` 整事务回滚；跨进程 stale recovery 仍透传 typed
+`AttemptRecoveryDecision`、新 attempt 的 fencing token 严格更大、旧 owner late append 仍 fenced；
+`build_durable_harness` + `coordinator.startup_reconcile` 在进程 A 落 terminal 但未 drain 后由
+进程 B 把 memory / timeline / audit checkpoint 追到 EventLog tail 且第二次 reconcile 幂等。
+该测试套 **不** 引入 multiprocessing launcher / process supervisor 生产代码，也不自动接入
+`build_durable_harness`；recovery scan 自动装配仍未落地。`startup_reconcile` 仅推进
+`host_projection_checkpoints` 既有语义，**不** 等于 in-memory `ConversationMemoryStore` 具备
+生产级崩溃恢复——durable `ConversationMemoryStore` 与 checkpoint-aware rebuild 仍是后续 slice
+（P8-S8）的工作。
 
 Host 已落地主路径使用日志表达执行边界：`VERBOSE` 覆盖 `start_run` 接纳、background task、attempt、
 EngineWorker 调用、terminal append、context overflow / compact / retry、ToolRuntime 调用边界、

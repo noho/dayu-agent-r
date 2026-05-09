@@ -222,6 +222,26 @@ Host 当前 Run harness、RunEventStore、ToolRuntime、Conversation Memory / Ru
   `mark_recovering_and_create_attempt` 命中 `NOOP_TERMINAL` 安全分支，不创建恢复行也
   不覆盖旧行；recovery scan 不修改 `host_projection_checkpoints`、不写诊断 RunEvent。
   fake clock 替代真实 ``time.sleep`` 推进 lease 过期。
+- P8-S7 真实多进程 + observer drain 验证（`tests/host/test_phase8_multiprocess_stress.py`）：
+  通过 `tests/host/_multiprocess_platform.py` 提供的 spawn-only 多进程平台 helper
+  (`WorkerSpec` / `WorkerContext` / `run_workers` / `assert_clean_exit` / `make_barrier`)
+  在文件落库 SQLite (WAL + ``BEGIN IMMEDIATE``) 上覆盖四类场景: (1) N 个进程并发
+  `DurableRunEventStore.append` 严格保持 per-run sequence + global `event_position`
+  单调唯一; (2) 两个进程持不同 owner secret 同时 `append_terminal_and_close`,
+  仅命中库内 hash 的胜出, 另一方落 `AttemptFencingError(OWNER_MISMATCH)`,
+  EventLog 不残留 stale terminal; (3) 进程 A 拿 lease 后退出, 测试主进程把
+  `host_attempts.lease_expires_at` 改成过去时刻, 进程 B `recover_stale_attempts`
+  落地 typed `MARK_RECOVERING_AND_CREATE_ATTEMPT` (新 fencing token 严格更大、
+  `recovered_from_attempt_id` 链接旧 attempt、旧 owner late append fenced、不写
+  诊断 RunEvent); (4) 进程 A 写 user_input + delta + final_answer 但不 drain,
+  进程 B `build_durable_harness` + `coordinator.startup_reconcile` 把 memory /
+  timeline / audit checkpoint 推到 EventLog tail, 第二次 reconcile 幂等。
+  场景 (4) **仅** 验证 EventLog / projection checkpoint / `startup_reconcile`
+  既有语义, 不声称 in-memory `ConversationMemoryStore` 具备生产级崩溃恢复;
+  durable memory store + checkpoint-aware rebuild 已划入 P8-S8 scope。
+  helper 强制 spawn-only / module-level worker / typed traceback 回传 / join
+  超时强杀 (`terminate` -> `kill`), 不使用 `time.sleep` 控 race, 不使用
+  ``:memory:``。
 - public boundary：锁定 `dayu.host.__all__`，允许 Run 级 `start_run`、`stream_run_events`、`get_run_result`，
   以及 P2 Run 级 `get_tool_fetch_more_handle`、`fetch_more_tool_result`，阻止 `EngineWorker`、`LocalProxy`、
   `ToolExecutor`、`InMemoryToolRuntime`、`ToolRuntimeToolExecutor`、`InMemoryConversationMemoryStore`、

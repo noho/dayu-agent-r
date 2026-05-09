@@ -62,8 +62,14 @@
   P8-S6 Stale / Orphan Recovery 新 Attempt 主路径已完成内部显式入口实施：
   `AttemptSupervisor.recover_stale_attempts` 覆盖 `MARK_RECOVERING_AND_CREATE_ATTEMPT` /
   `MARK_LOST` (run terminal / orphan CREATED) / `NOOP_TERMINAL` 全部 typed 决策；
-  P8-S5 deferred 端到端 framework `fetch_more` fenced 测试同步补齐。下一入口是 P8-S7：
-  Multi-process 默认 deterministic 测试。
+  P8-S5 deferred 端到端 framework `fetch_more` fenced 测试同步补齐。
+  P8-S7 Deterministic Multiprocessing 与 Observer Drain 验证已完成实施：
+  spawn-only 多进程平台 helper (`tests/host/_multiprocess_platform.py`) +
+  四类默认可跑测试 (`tests/host/test_phase8_multiprocess_stress.py`) 在文件落库
+  SQLite 上确认 EventLog append、terminal close race、stale recovery、observer
+  startup_reconcile 在跨进程并发下的 P8 既有契约一致性；不引入生产代码、不自动
+  wire recovery scan。下一入口是 P8-S8: durable ConversationMemoryStore +
+  checkpoint-aware rebuild。
 
 每个 Phase 进入实现前，必须另写可交接的 phase plan，细化到迁移 Agent 可以直接接手：
 目标、非目标、边界、文件级改动清单、契约变化、状态机、测试清单、验证命令、review gate、
@@ -495,10 +501,22 @@ P16 收口项。
   写入 `TOOL_FETCH_MORE_REQUESTED` / `TOOL_FETCH_MORE_COMPLETED` facts；cursor 绑定到旧 run、owner
   scope 绑定到新 run 时 `_append_fetch_requested` 在 `_verify_run_id_matches` 早抛
   `AttemptFencingError(OWNER_MISMATCH)`，EventLog 不残留 fact，错误文本不含 owner secret。
-- `deferred-with-owner: P8-S7 / issue #38`：默认 deterministic multiprocessing 测试仍未落地；
-  慢硬盘 + Docker Linux stress 作为增强手工压力测试由 GitHub issue #38 跟踪。P8-S7 仅验证
-  multiprocessing owner / fencing / recovery 语义，不解决 durable conversation memory read
-  model rebuild；durable memory recovery 单独由 P8-S8 承接，不得在 S7 中偷做。
+- `completed: P8-S7`：默认 deterministic multiprocessing 测试已落地于
+  `tests/host/test_phase8_multiprocess_stress.py` + `tests/host/_multiprocess_platform.py`：
+  spawn-only context、module-level worker、文件落库 SQLite (WAL + ``BEGIN IMMEDIATE``)
+  覆盖 (1) 跨进程 EventLog append 严格保留 per-run sequence + global `event_position`
+  单调唯一; (2) terminal close race 仅 owner secret 命中库内 hash 的胜出, 另一方落
+  `AttemptFencingError(OWNER_MISMATCH)`、EventLog 不残留 stale terminal; (3) 跨进程
+  stale recovery 透传 typed `MARK_RECOVERING_AND_CREATE_ATTEMPT`、新 fencing token 严格
+  更大、`recovered_from_attempt_id` 链接、不写诊断 RunEvent、旧 owner late append 仍
+  fenced; (4) 进程 A 落 terminal 不 drain + 进程 B `coordinator.startup_reconcile`
+  追平 memory / timeline / audit checkpoint 至 EventLog tail 且第二次幂等。
+  本 slice 不引入 multiprocessing launcher / process supervisor 生产代码,
+  也不自动接入 `build_durable_harness`。慢硬盘 + Docker Linux stress 仍由 GitHub
+  issue #38 跟踪。本 slice 明确 **不** 解决 durable conversation memory read model
+  rebuild, 也 **不** 声称 in-memory `ConversationMemoryStore` 具备生产级崩溃恢复;
+  observer drain 测试只在 `host_projection_checkpoints` 表层验证既有
+  `startup_reconcile` 语义。durable memory recovery 划入 P8-S8。
 - `deferred-with-owner: P8-S8`：durable conversation memory read model / checkpoint-aware
   rebuild。当前 `build_durable_harness` 默认仍装配 production
   `InMemoryConversationMemoryStore`；若 projection checkpoint 已 caught up 而进程重启后
@@ -508,9 +526,10 @@ P16 收口项。
   production `InMemoryConversationMemoryStore` 与依赖它的测试用例（必要 fake 迁移到
   `tests/host/` 私有 helper）。S8 不实现 P9 admission，不固定 public memory API，不迁移
   业务 memory，不让 UI / Service 参与恢复。
-- `deferred-with-owner: P8-S7`：`AttemptSupervisor.recover_stale_attempts` 自动 wire 进 Host
-  bootstrap (`build_durable_harness` / Session 生命周期) 由 P8-S7 推进；当前为内部显式入口，
-  允许测试与运营手动调用，不影响生产 Host 启动 (因为 P8-S6 之前也无自动 recovery)。
+- `deferred-with-owner: P9 / Session lifecycle`：`AttemptSupervisor.recover_stale_attempts`
+  自动 wire 进 Host bootstrap (`build_durable_harness` / Session 生命周期) 仍未落地；
+  当前为内部显式入口，允许测试与运营手动调用，不影响生产 Host 启动 (因为既往 phase 之前
+  也无自动 recovery)。P8-S7 已验证多进程下 typed 决策语义, 但自动装配时机仍归后续 phase。
 - `deferred-with-owner: P16`：P8-S3 测试 fake 当前用 `cast(AttemptSupervisor, ...)` 桥接具体类；
   interface freeze 前应评估是否抽 `AttemptSupervisorPort` 这类 Host internal protocol，避免测试替身
   长期依赖具体实现。
