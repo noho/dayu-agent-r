@@ -359,7 +359,7 @@ async def _run_smoke(*, proxy: _FakeOverflowProxy) -> None:
     """
 
     memory_store: ConversationMemoryStore = _SmokeMemoryStore(_snapshot())
-    harness = LocalRunHarness(proxy=proxy, memory_store=memory_store)
+    harness = LocalRunHarness(is_durable=False, proxy=proxy, memory_store=memory_store)
     stream = await harness.start_run(_request())
     events: list[RunEvent] = []
     async for event in stream.events:

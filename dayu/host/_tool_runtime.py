@@ -30,7 +30,6 @@ from dayu.contracts import (
 )
 from dayu.contracts.tool_call import ToolExecutionRequest
 from dayu.contracts.tool_outcome import (
-    ToolAwaitingOutcome,
     ToolCompletedOutcome,
     ToolExecutionOutcome,
     ToolFailedOutcome,
@@ -166,6 +165,9 @@ class ToolRuntimeEventAppender(Protocol):
 @dataclass(frozen=True, slots=True)
 class PlainRunEventAppender:
     """非 fencing 的 ToolRuntime fact append 实现。
+
+    test-only fallback; never used in durable harness; durable path always
+    uses AttemptScopedRunEventAppender via AttemptSupervisor.scoped_appender.
 
     本实现仅在非 durable / 测试 / bootstrap-without-supervisor 路径下
     使用, 直接透传到 :class:`RunEventStore.append`, 不做 owner CAS,
@@ -332,10 +334,17 @@ class ToolRuntimeToolExecutor:
         return await self.runtime.execute_tool_call(request)
 
 
-@dataclass(slots=True)
+@dataclass(slots=True, kw_only=True)
 class InMemoryToolRuntime:
     """单进程内存态 ToolRuntime。
 
+    :param is_durable: P8-S1 装配显式声明位:``True`` 表示由
+        :func:`build_durable_harness` 装配的 production / durable runtime,
+        ``_resolve_appender`` 必须从 :class:`ToolRuntimeOwnerScope`
+        ContextVar 解析 owner-bound appender, 缺失时立即 ``RuntimeError``;
+        ``False`` 表示 test-only 装配,允许在 ContextVar 缺失时退化为
+        :class:`PlainRunEventAppender`。本字段是 keyword-only 必填参数,
+        所有 ``InMemoryToolRuntime(...)`` 构造点必须显式传值。
     :param executor: 底层业务 ToolExecutor。
     :param event_store: Host RunEventStore; 仅用作 ``list_events`` 终态
         cursor 检测以及无 owner scope 路径的回退 fact append。
@@ -346,6 +355,7 @@ class InMemoryToolRuntime:
     :param token_generator: cursor 原文生成器。
     """
 
+    is_durable: bool
     executor: ToolExecutor
     event_store: RunEventStore
     truncate_specs: Mapping[str, ToolTruncateSpec] = field(default_factory=dict)
@@ -364,18 +374,27 @@ class InMemoryToolRuntime:
     def _resolve_appender(self) -> ToolRuntimeEventAppender:
         """返回当前 attempt scope 内的 fact appender。
 
-        - 若 :class:`ToolRuntimeOwnerScope` 已安装 fencing-aware
-          appender, 直接返回该 appender, 后续 fact append 在同一
-          ``BEGIN IMMEDIATE`` 事务内做 ``verify_owner`` + EventLog
-          append, fenced owner 命中时抛 ``AttemptFencingError``;
-        - 否则退化为 :class:`PlainRunEventAppender`, 直接调用
-          底层 :class:`RunEventStore.append`, 不做 owner CAS。
+        - ``is_durable=True``: 必须从
+          :class:`ToolRuntimeOwnerScope` ContextVar 读到 owner-bound
+          fencing-aware appender, 缺失时立即 ``RuntimeError`` fail fast,
+          严格阻止 durable 路径退化为非 fenced append;
+        - ``is_durable=False`` (test-only): ContextVar 存在时返回安装的
+          appender, 缺失时退化为 :class:`PlainRunEventAppender`,
+          与 P6/P7 行为一致。
 
         :returns: 当前生效的 :class:`ToolRuntimeEventAppender`。
-        :raises Exception: 不主动抛出异常。
+        :raises RuntimeError: ``is_durable=True`` 且 ContextVar 中没有
+            owner scope 时抛出。
         """
 
         active = _ACTIVE_TOOL_RUNTIME_APPENDER.get()
+        if self.is_durable:
+            if active is None:
+                raise RuntimeError(
+                    "durable runtime requires ToolRuntimeOwnerScope for "
+                    "attempt-scoped append"
+                )
+            return active
         if active is not None:
             return active
         return PlainRunEventAppender(event_store=self.event_store)
@@ -1593,13 +1612,12 @@ def _tool_outcome_name(outcome: ToolExecutionOutcome) -> str:
     :raises Exception: 不主动抛出异常。
     """
 
+    # invariant 校验：ToolExecutionOutcome 为封闭联合，按构造类型枚举即可，无需 fallback。
     if isinstance(outcome, ToolCompletedOutcome):
         return "completed"
     if isinstance(outcome, ToolFailedOutcome):
         return "failed"
-    if isinstance(outcome, ToolAwaitingOutcome):
-        return "awaiting"
-    return "unknown"
+    return "awaiting"
 
 
 def _framework_fetch_more_failed(*, message: str) -> ToolFailedOutcome:

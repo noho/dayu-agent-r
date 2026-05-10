@@ -728,6 +728,7 @@ async def test_phase5_compact_retry_is_internal_attempt_and_preserves_facts(
 
     proxy = _OverflowThenSuccessProxy()
     compact_harness = LocalRunHarness(
+        is_durable=False,
         proxy=proxy,
         memory_store=memory_store,
     )

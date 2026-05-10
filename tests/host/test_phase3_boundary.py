@@ -296,7 +296,7 @@ async def test_append_user_input_failure_does_not_start_engine() -> None:
 
     store = _FailingAppendStore()
     proxy = _CountingProxy()
-    harness = LocalRunHarness(proxy=proxy, event_store=store, memory_store=FakeInMemoryConversationMemoryStore())
+    harness = LocalRunHarness(is_durable=False, proxy=proxy, event_store=store, memory_store=FakeInMemoryConversationMemoryStore())
 
     with pytest.raises(RuntimeError, match=_ERROR_APPEND_FAILED):
         await harness.start_run(_request())
@@ -355,6 +355,7 @@ async def test_invalid_ingress_transcript_does_not_start_engine_or_pollute_memor
     memory_store = FakeInMemoryConversationMemoryStore()
     proxy = _CountingProxy()
     harness = LocalRunHarness(
+        is_durable=False,
         proxy=proxy,
         event_store=event_store,
         memory_store=memory_store,
@@ -378,6 +379,7 @@ async def test_host_owned_worker_failure_projects_user_input_to_memory() -> None
     memory_store = FakeInMemoryConversationMemoryStore()
     proxy = _SynchronousFailingProxy()
     harness = LocalRunHarness(
+        is_durable=False,
         proxy=proxy,
         event_store=event_store,
         memory_store=memory_store,
@@ -405,6 +407,7 @@ async def test_engine_stream_without_terminal_fails_and_projects_memory(
     memory_store = FakeInMemoryConversationMemoryStore()
     proxy = _CountingProxy()
     harness = LocalRunHarness(
+        is_durable=False,
         proxy=proxy,
         event_store=event_store,
         memory_store=memory_store,

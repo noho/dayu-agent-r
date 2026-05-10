@@ -476,6 +476,7 @@ async def test_local_harness_supports_tool_call_fake_executor_smoke(
     monkeypatch.setattr(agent_module, "_build_runner", fake_build_runner)
     executor = _RecordingToolExecutor()
     harness = LocalRunHarness(
+        is_durable=False,
         proxy=LocalProxy(worker=EngineWorker(tool_executor=executor)),
         memory_store=FakeInMemoryConversationMemoryStore(),
     )

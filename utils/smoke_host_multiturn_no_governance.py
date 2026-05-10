@@ -739,6 +739,7 @@ def build_huge_echo_harness(
     event_store = InMemoryRunEventStore()
     business_executor = HUGE_ECHO_DEFINITION.executor
     runtime = InMemoryToolRuntime(
+        is_durable=False,
         executor=business_executor,
         event_store=event_store,
         truncate_specs=bundle.truncate_specs(),
@@ -752,6 +753,7 @@ def build_huge_echo_harness(
     if resolved_proxy is None:
         resolved_proxy = LocalProxy(worker=EngineWorker(gated_executor))
     return LocalRunHarness(
+        is_durable=False,
         proxy=resolved_proxy,
         event_store=event_store,
         tool_runtime=runtime,
@@ -959,7 +961,7 @@ async def run_compact_retry_case() -> bool:
     if not ok:
         return False
     proxy = _OverflowThenSuccessProxy()
-    compact_harness = LocalRunHarness(proxy=proxy, memory_store=memory_store)
+    compact_harness = LocalRunHarness(is_durable=False, proxy=proxy, memory_store=memory_store)
     request = build_start_request(
         session_id="phase5-session",
         run_id="phase5-compact-run",

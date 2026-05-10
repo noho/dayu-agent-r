@@ -695,7 +695,7 @@ async def test_overflow_compacts_and_retries_same_run_without_new_user_input() -
 
     proxy = _OverflowThenSuccessProxy()
     memory_store: ConversationMemoryStore = _SnapshotMemoryStore(_large_snapshot())
-    harness = LocalRunHarness(proxy=proxy, memory_store=memory_store)
+    harness = LocalRunHarness(is_durable=False, proxy=proxy, memory_store=memory_store)
 
     stream = await harness.start_run(_request())
     events = await _collect(stream.events)
@@ -725,6 +725,7 @@ async def test_overflow_retry_limit_fails_host_owned_terminal() -> None:
     proxy = _OverflowThenSuccessProxy()
     memory_store: ConversationMemoryStore = _SnapshotMemoryStore(_large_snapshot())
     harness = LocalRunHarness(
+        is_durable=False,
         proxy=proxy,
         memory_store=memory_store,
         context_compact_retry_limit=0,
@@ -755,6 +756,7 @@ def test_negative_context_compact_retry_limit_is_rejected() -> None:
         match="context_compact_retry_limit_must_be_non_negative",
     ):
         LocalRunHarness(
+            is_durable=False,
             proxy=proxy,
             context_compact_retry_limit=-1,
             memory_store=FakeInMemoryConversationMemoryStore(),
@@ -767,7 +769,7 @@ async def test_compaction_requested_then_stream_end_observes_overflow() -> None:
 
     proxy = _CompactionRequestedThenEndedProxy()
     memory_store: ConversationMemoryStore = _SnapshotMemoryStore(_large_snapshot())
-    harness = LocalRunHarness(proxy=proxy, memory_store=memory_store)
+    harness = LocalRunHarness(is_durable=False, proxy=proxy, memory_store=memory_store)
 
     stream = await harness.start_run(_request())
     events = await _collect(stream.events)
@@ -798,6 +800,7 @@ async def test_compaction_requested_then_final_answer_closes_sequence() -> None:
 
     proxy = _CompactionRequestedThenFinalProxy()
     harness = LocalRunHarness(
+        is_durable=False,
         proxy=proxy, memory_store=FakeInMemoryConversationMemoryStore()
     )
 
@@ -824,6 +827,7 @@ async def test_same_run_tool_facts_enter_compacted_attempt() -> None:
     proxy = _ToolFactThenOverflowProxy(event_store=event_store)
     memory_store: ConversationMemoryStore = _SnapshotMemoryStore(_large_snapshot())
     harness = LocalRunHarness(
+        is_durable=False,
         proxy=proxy,
         event_store=event_store,
         memory_store=memory_store,
@@ -852,6 +856,7 @@ async def test_missing_trace_cache_compact_failure_gets_host_terminal() -> None:
     proxy = _DelayedOverflowProxy(gate=gate)
     memory_store: ConversationMemoryStore = _SnapshotMemoryStore(_snapshot())
     harness = LocalRunHarness(
+        is_durable=False,
         proxy=proxy,
         memory_store=memory_store,
         run_input_trace_cache_limit=1,
@@ -885,7 +890,7 @@ async def test_internal_final_answer_echo_is_filtered_result() -> None:
         )
     )
     memory_store: ConversationMemoryStore = _SnapshotMemoryStore(_snapshot())
-    harness = LocalRunHarness(proxy=proxy, memory_store=memory_store)
+    harness = LocalRunHarness(is_durable=False, proxy=proxy, memory_store=memory_store)
 
     stream = await harness.start_run(_request())
     await _collect(stream.events)
@@ -906,7 +911,7 @@ async def test_natural_final_answer_with_tool_facts_words_is_not_filtered() -> N
         final_content="The tool facts discussed above support the conclusion."
     )
     memory_store: ConversationMemoryStore = _SnapshotMemoryStore(_snapshot())
-    harness = LocalRunHarness(proxy=proxy, memory_store=memory_store)
+    harness = LocalRunHarness(is_durable=False, proxy=proxy, memory_store=memory_store)
 
     stream = await harness.start_run(_request())
     await _collect(stream.events)
@@ -926,7 +931,7 @@ async def test_caller_system_prompts_precede_host_memory_and_user() -> None:
 
     proxy = _OverflowThenSuccessProxy()
     memory_store: ConversationMemoryStore = _SnapshotMemoryStore(_snapshot())
-    harness = LocalRunHarness(proxy=proxy, memory_store=memory_store)
+    harness = LocalRunHarness(is_durable=False, proxy=proxy, memory_store=memory_store)
     request = _request(
         messages=(
             SystemMessage(
@@ -1028,7 +1033,7 @@ async def test_start_run_rejects_non_current_user_shapes(
     """入口仍拒绝历史、tool/assistant、多个 user 与空 user。"""
 
     proxy = _OverflowThenSuccessProxy()
-    harness = LocalRunHarness(proxy=proxy, memory_store=FakeInMemoryConversationMemoryStore())
+    harness = LocalRunHarness(is_durable=False, proxy=proxy, memory_store=FakeInMemoryConversationMemoryStore())
 
     with pytest.raises(ValueError, match=expected_error):
         await harness.start_run(_request(messages=messages))

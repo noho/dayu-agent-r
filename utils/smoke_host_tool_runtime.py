@@ -193,12 +193,14 @@ async def _main() -> None:
 
     event_store = InMemoryRunEventStore()
     runtime = InMemoryToolRuntime(
+        is_durable=False,
         executor=_LargeListExecutor(),
         event_store=event_store,
         truncate_specs={"smoke_list": _spec()},
     )
     adapter = ToolRuntimeToolExecutor(runtime)
     harness = LocalRunHarness(
+        is_durable=False,
         proxy=LocalProxy(worker=EngineWorker(adapter)),
         event_store=event_store,
         tool_runtime=runtime,

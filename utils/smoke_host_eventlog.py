@@ -290,11 +290,13 @@ def _build_harness(
     store = InMemoryRunEventStore()
     if case_name == "success":
         return LocalRunHarness(
+            is_durable=False,
             proxy=_ScriptedProxy(events=_success_events(request)),
             event_store=store,
             memory_store=SmokeInMemoryConversationMemoryStore(),
         )
     return LocalRunHarness(
+        is_durable=False,
         proxy=_FailingProxy(),
         event_store=store,
         memory_store=SmokeInMemoryConversationMemoryStore(),

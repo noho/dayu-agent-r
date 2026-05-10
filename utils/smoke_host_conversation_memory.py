@@ -410,6 +410,7 @@ async def _run_conversation_case() -> None:
     memory_store = SmokeInMemoryConversationMemoryStore()
     proxy = _ScriptedProxy(include_tool_fact=True)
     harness = LocalRunHarness(
+        is_durable=False,
         proxy=proxy,
         event_store=event_store,
         memory_store=memory_store,
@@ -495,6 +496,7 @@ async def _run_missing_terminal_case() -> None:
     memory_store = SmokeInMemoryConversationMemoryStore()
     proxy = _MissingTerminalProxy()
     harness = LocalRunHarness(
+        is_durable=False,
         proxy=proxy,
         event_store=event_store,
         memory_store=memory_store,

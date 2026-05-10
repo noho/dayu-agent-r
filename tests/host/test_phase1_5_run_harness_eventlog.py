@@ -503,6 +503,7 @@ async def test_run_stream_reads_events_after_store_append() -> None:
     gate = _AsyncReleaseGate()
     store = _RecordingRunEventStore()
     harness = LocalRunHarness(
+        is_durable=False,
         proxy=_ScriptedProxy(
             events=(
                 _engine_content_delta(run_id=run_id),
@@ -552,6 +553,7 @@ async def test_host_verbose_logs_main_path_without_payloads(
         ),
     )
     harness = LocalRunHarness(
+        is_durable=False,
         proxy=_ScriptedProxy(
             events=(
                 _engine_content_delta(run_id=run_id),
@@ -594,6 +596,7 @@ async def test_result_snapshot_only_uses_appended_terminal_event() -> None:
     gate = _AsyncReleaseGate()
     store = InMemoryRunEventStore()
     harness = LocalRunHarness(
+        is_durable=False,
         proxy=_ScriptedProxy(
             events=(
                 _engine_content_delta(run_id=run_id),
@@ -626,6 +629,7 @@ async def test_proxy_exception_appends_host_owned_failure_event() -> None:
     run_id = "eventlog_host_failure"
     store = InMemoryRunEventStore()
     harness = LocalRunHarness(
+        is_durable=False,
         proxy=_FailingProxy(error=RuntimeError("boom")),
         event_store=store,
         memory_store=FakeInMemoryConversationMemoryStore(),
@@ -655,6 +659,7 @@ async def test_run_input_build_trace_cache_evicts_old_runs_fifo() -> None:
 
     store = InMemoryRunEventStore()
     harness = LocalRunHarness(
+        is_durable=False,
         proxy=_ScriptedProxy(events=()),
         event_store=store,
         run_input_trace_cache_limit=2,
@@ -681,6 +686,7 @@ async def test_run_input_message_cache_uses_independent_smaller_limit() -> None:
 
     store = InMemoryRunEventStore()
     harness = LocalRunHarness(
+        is_durable=False,
         proxy=_ScriptedProxy(events=()),
         event_store=store,
         run_input_trace_cache_limit=4,
@@ -716,7 +722,7 @@ async def test_harness_stops_after_terminal_and_keeps_views_consistent() -> None
             _engine_content_delta(run_id=run_id),
         )
     )
-    harness = LocalRunHarness(proxy=proxy, event_store=store, memory_store=FakeInMemoryConversationMemoryStore())
+    harness = LocalRunHarness(is_durable=False, proxy=proxy, event_store=store, memory_store=FakeInMemoryConversationMemoryStore())
 
     stream = await harness.start_run(_request(run_id))
     events = await _collect(stream.events)
@@ -749,7 +755,7 @@ async def test_harness_ignores_second_terminal_after_first_terminal() -> None:
             _engine_final(run_id=run_id, content="second terminal"),
         )
     )
-    harness = LocalRunHarness(proxy=proxy, event_store=store, memory_store=FakeInMemoryConversationMemoryStore())
+    harness = LocalRunHarness(is_durable=False, proxy=proxy, event_store=store, memory_store=FakeInMemoryConversationMemoryStore())
 
     stream = await harness.start_run(_request(run_id))
     events = await _collect(stream.events)
@@ -772,6 +778,7 @@ async def test_terminal_result_error_does_not_append_host_failure() -> None:
     run_id = "eventlog_mismatch_terminal"
     store = InMemoryRunEventStore()
     harness = LocalRunHarness(
+        is_durable=False,
         proxy=_ScriptedProxy(
             events=(
                 _engine_event(
@@ -812,6 +819,7 @@ async def test_stream_close_error_does_not_mask_terminal_contract_error(
     run_id = "eventlog_close_error_with_contract_error"
     store = InMemoryRunEventStore()
     harness = LocalRunHarness(
+        is_durable=False,
         proxy=_ClosingFailureProxy(
             engine_events=_ClosingFailureEngineEvents(
                 events=(
@@ -862,6 +870,7 @@ async def test_stream_close_error_does_not_change_worker_failure_fact(
     run_id = "eventlog_close_error_with_worker_error"
     store = InMemoryRunEventStore()
     harness = LocalRunHarness(
+        is_durable=False,
         proxy=_ClosingFailureProxy(
             engine_events=_ClosingFailureEngineEvents(
                 events=(),
@@ -906,6 +915,7 @@ async def test_stream_close_error_after_success_does_not_append_host_failure(
     run_id = "eventlog_close_error_after_success"
     store = InMemoryRunEventStore()
     harness = LocalRunHarness(
+        is_durable=False,
         proxy=_ClosingFailureProxy(
             engine_events=_ClosingFailureEngineEvents(
                 events=(_engine_final(run_id=run_id, content="done"),),
@@ -944,6 +954,7 @@ async def test_start_run_logs_background_contract_error(
     run_id = "eventlog_public_mismatch_terminal"
     store = InMemoryRunEventStore()
     harness = LocalRunHarness(
+        is_durable=False,
         proxy=_ScriptedProxy(
             events=(
                 _engine_event(

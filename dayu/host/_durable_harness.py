@@ -241,6 +241,7 @@ def build_durable_harness(
         executor if executor is not None else _NoopToolExecutor()
     )
     runtime = InMemoryToolRuntime(
+        is_durable=True,
         executor=actual_executor,
         event_store=event_store,
     )
@@ -262,12 +263,12 @@ def build_durable_harness(
     )
     tool_trace_enabled = tool_trace_observer is not None
     harness = LocalRunHarness(
+        is_durable=True,
         proxy=actual_proxy,
         event_store=event_store,
         tool_runtime=runtime,
         memory_store=actual_memory,
         coordinator=coordinator,
-        attempt_state_store=attempt_state_store,
         attempt_supervisor=attempt_supervisor,
         storage=storage,
         tool_trace_context_fact_enabled=tool_trace_enabled,

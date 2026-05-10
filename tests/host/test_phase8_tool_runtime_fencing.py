@@ -209,6 +209,7 @@ async def test_inmemory_tool_runtime_resolves_to_plain_outside_scope() -> None:
             return None
 
         runtime = InMemoryToolRuntime(
+            is_durable=False,
             executor=_noop_executor,  # type: ignore[arg-type]
             event_store=event_store,
         )
@@ -234,6 +235,7 @@ async def test_inmemory_tool_runtime_resolves_to_scoped_inside_scope() -> None:
             return None
 
         runtime = InMemoryToolRuntime(
+            is_durable=False,
             executor=_noop_executor,  # type: ignore[arg-type]
             event_store=supervisor.event_store,
         )
@@ -366,6 +368,7 @@ async def test_fetch_more_under_owner_scope_appends_facts_normally() -> None:
             return None
 
         runtime = InMemoryToolRuntime(
+            is_durable=False,
             executor=_noop_executor,  # type: ignore[arg-type]
             event_store=supervisor.event_store,
         )
@@ -434,6 +437,7 @@ async def test_fetch_more_run_id_mismatch_is_fenced_end_to_end() -> None:
             return None
 
         runtime = InMemoryToolRuntime(
+            is_durable=False,
             executor=_noop_executor,  # type: ignore[arg-type]
             event_store=supervisor.event_store,
         )
@@ -483,5 +487,60 @@ async def test_fetch_more_run_id_mismatch_is_fenced_end_to_end() -> None:
             run_id="r_other", after=None
         )
         assert events_other == ()
+    finally:
+        storage.close()
+
+
+@pytest.mark.asyncio
+async def test_durable_runtime_without_owner_scope_fails_fast() -> None:
+    """P8-S1: durable runtime 在 ContextVar 缺 owner scope 时立即 RuntimeError。
+
+    durable 装配 (``is_durable=True``) 显式禁止 ToolRuntime 退化为
+    :class:`PlainRunEventAppender`; 任何工具调用走到 ``_resolve_appender``
+    时缺失 :class:`ToolRuntimeOwnerScope` 必须立即 ``RuntimeError`` fail
+    fast, 杜绝 owner-less attempt-scoped fact append 的可能。
+    """
+
+    storage = _open_storage()
+    try:
+        await _seed_run(storage, run_id="r1")
+        event_store = DurableRunEventStore(storage=storage)
+
+        async def _noop_executor(*args: object, **kwargs: object) -> object:
+            del args, kwargs
+            return None
+
+        runtime = InMemoryToolRuntime(
+            is_durable=True,
+            executor=_noop_executor,  # type: ignore[arg-type]
+            event_store=event_store,
+        )
+        with pytest.raises(RuntimeError, match="ToolRuntimeOwnerScope"):
+            runtime._resolve_appender()  # noqa: SLF001
+
+        # execute_tool_call 路径下也必须 fail fast: 构造一个最小 cursor 让
+        # 流程进入 fact append, 没有 owner scope 时 _resolve_appender
+        # 立即抛 RuntimeError。
+        record = _build_cursor_record(
+            cursor_value="cursor-no-scope",
+            run_id="r1",
+            session_id="s",
+            tool_call_id="tc-no-scope",
+        )
+        runtime._records_by_cursor[record.cursor] = record  # noqa: SLF001
+        request = ToolFetchMoreRequest(
+            session_id="s",
+            run_id="r1",
+            iteration_id="iter-no-scope",
+            tool_call_id="tc-no-scope",
+            cursor=ToolRuntimeCursor(
+                value=record.cursor,
+                fingerprint=record.cursor_fingerprint,
+            ),
+            scope_token=record.scope_token,
+            limit=2,
+        )
+        with pytest.raises(RuntimeError, match="ToolRuntimeOwnerScope"):
+            await runtime.fetch_more(request)
     finally:
         storage.close()

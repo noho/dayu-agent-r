@@ -232,7 +232,7 @@ async def test_second_run_sees_first_run_final_answer_and_tool_summary() -> None
     """顺序第二轮通过真实 Builder 路径看到第一轮 memory。"""
 
     proxy = _RecordingProxy()
-    harness = LocalRunHarness(proxy=proxy, memory_store=FakeInMemoryConversationMemoryStore())
+    harness = LocalRunHarness(is_durable=False, proxy=proxy, memory_store=FakeInMemoryConversationMemoryStore())
 
     first_stream = await harness.start_run(
         _request(run_id="run-1", content="第一轮问题")

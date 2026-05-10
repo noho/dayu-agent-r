@@ -391,10 +391,17 @@ def _require_memory_store() -> ConversationMemoryStore:
     )
 
 
-@dataclass(frozen=True, slots=True)
+@dataclass(frozen=True, slots=True, kw_only=True)
 class LocalRunHarness:
     """Host 内部本地 Run harness。
 
+    :param is_durable: P8-S1 装配显式声明位:``True`` 表示 production /
+        durable 装配 (必须注入 :class:`AttemptSupervisor` +
+        :class:`DurableRunEventStore` + :class:`HostStorage`,
+        ``attempt_state_store`` 必须为 ``None``);``False`` 表示 test-only
+        non-durable 装配 (禁止注入 ``attempt_supervisor``)。本字段是
+        keyword-only 必填参数, 所有 ``LocalRunHarness(...)`` 构造点必须显
+        式传值,否则触发 ``TypeError``。
     :param proxy: Host 内部 worker proxy。
     :param event_store: Host 内部 RunEventStore。
     :param tool_runtime: Host 内部 ToolRuntime。
@@ -405,19 +412,17 @@ class LocalRunHarness:
         必须注入,terminal 后由 harness 调用 ``coordinator.drain()`` 推进
         observer checkpoint / required projection；为 ``None`` 时退化为
         legacy 内存路径,直接调用 ``memory_store.project_run_events``。
-    :param attempt_state_store: 可选 :class:`AttemptStateStore`；当 durable
-        EventLog + HostStorage 在场时由调用方注入,以便 harness 在每个
-        attempt 起止处持久化 attempt 最小状态。仅当未注入
-        ``attempt_supervisor`` 时使用; 注入 supervisor 后 attempt 创建/收
-        口由 supervisor 经 lease store 完成, 本字段仅作 P6 legacy 兼容入
-        口。
+    :param attempt_state_store: 可选 :class:`AttemptStateStore`；仅 P6
+        legacy 非 durable 兼容路径使用。durable (``is_durable=True``)
+        装配禁止注入本字段。
     :param attempt_supervisor: 可选 :class:`AttemptSupervisor`；P8-S3 起,
         durable 装配层通过装配 :class:`AttemptLeaseConfig` 注入 supervisor,
         harness 只在 attempt 边界薄委托 ``lease_context``, 自身不写 lease
         SQL、不计算 TTL、不实现 renew loop, 也不处理 fencing 逻辑。
+        ``is_durable=True`` 时必填; ``is_durable=False`` 时禁止注入。
     :param storage: 可选 :class:`HostStorage`；attempt_state_store 写入需要
-        共享事务,因此 harness 持有 storage handle 以开启短事务。仅 durable
-        路径需要注入。
+        共享事务,因此 harness 持有 storage handle 以开启短事务。
+        ``is_durable=True`` 时必填。
     :param tool_trace_context_fact_enabled: P7 开关，启用后 harness 在每个
         attempt 启动前同事务追加 ``RUN_INPUT_CONTEXT_SNAPSHOT_BUILT``
         canonical fact。仅 durable 路径生效（要求
@@ -430,6 +435,7 @@ class LocalRunHarness:
     :param run_input_message_cache_limit: RunInput 消息诊断缓存保留上限。
     """
 
+    is_durable: bool
     proxy: WorkerProxy
     event_store: RunEventStore = field(default_factory=InMemoryRunEventStore)
     tool_runtime: InMemoryToolRuntime | None = None
@@ -465,11 +471,13 @@ class LocalRunHarness:
     )
 
     def __post_init__(self) -> None:
-        """校验 harness 内部 compact retry 与调试缓存配置。
+        """校验 harness 内部 compact retry / 调试缓存配置 + durable invariant。
 
         :returns: 无返回值。
         :raises ValueError: compact retry 上限为负数，或调试缓存容量
             不是正数时抛出。
+        :raises RuntimeError: ``is_durable`` 与注入字段组合违反 P8-S1
+            装配契约时抛出。
         """
 
         if self.context_compact_retry_limit < 0:
@@ -478,6 +486,55 @@ class LocalRunHarness:
             raise ValueError(_ERROR_RUN_INPUT_TRACE_CACHE_LIMIT_INVALID)
         if self.run_input_message_cache_limit <= 0:
             raise ValueError(_ERROR_RUN_INPUT_MESSAGE_CACHE_LIMIT_INVALID)
+        if self.is_durable:
+            if self.attempt_supervisor is None:
+                raise RuntimeError(
+                    "durable harness invariant violated: "
+                    "attempt_supervisor is required when is_durable=True"
+                )
+            # invariant 校验:isinstance 用于装配契约校验,非类型分支判断;
+            # 与 CLAUDE.md 禁止 isinstance 当类型逃避不冲突。
+            if not isinstance(self.event_store, DurableRunEventStore):
+                raise RuntimeError(
+                    "durable harness invariant violated: "
+                    "event_store must be DurableRunEventStore when "
+                    f"is_durable=True (got {type(self.event_store).__name__})"
+                )
+            if self.attempt_state_store is not None:
+                raise RuntimeError(
+                    "durable harness invariant violated: "
+                    "attempt_state_store must be None when is_durable=True "
+                    "(P6 legacy store is forbidden in durable path)"
+                )
+            if self.storage is None:
+                raise RuntimeError(
+                    "durable harness invariant violated: "
+                    "storage is required when is_durable=True"
+                )
+            if self.tool_runtime is None:
+                raise RuntimeError(
+                    "durable harness invariant violated: "
+                    "tool_runtime is required when is_durable=True"
+                )
+            if not self.tool_runtime.is_durable:
+                raise RuntimeError(
+                    "durable harness invariant violated: "
+                    "tool_runtime.is_durable must be True when "
+                    "harness.is_durable=True"
+                )
+            return
+        if self.attempt_supervisor is not None:
+            raise RuntimeError(
+                "non-durable harness invariant violated: "
+                "attempt_supervisor must be None when is_durable=False "
+                "(test-only path forbids supervisor)"
+            )
+        if self.tool_runtime is not None and self.tool_runtime.is_durable:
+            raise RuntimeError(
+                "non-durable harness invariant violated: "
+                "tool_runtime.is_durable must be False when "
+                "harness.is_durable=False"
+            )
 
     def _resolve_attempt_appender(
         self,
@@ -485,21 +542,37 @@ class LocalRunHarness:
     ) -> ToolRuntimeEventAppender:
         """返回当前 attempt 的 fencing-aware fact appender。
 
-        - durable + supervisor 路径: 返回
-          :class:`AttemptScopedRunEventAppender`,
-          每条 fact append 在同 ``BEGIN IMMEDIATE`` 事务内做
-          ``verify_owner`` + EventLog append, fenced owner 命中时抛
-          :class:`AttemptFencingError`, EventLog 不残留;
-        - legacy / 无 supervisor 路径 (或 ``active_attempt is None``):
-          退化为 :class:`PlainRunEventAppender`, 直接透传
-          :class:`RunEventStore.append`, 与 P6/P7 行为一致。
+        - ``is_durable=True``: 必须能解析 :class:`AttemptOwnerContext`
+          (来自 ``active_attempt`` 或 ToolRuntime ContextVar);
+          解析失败立即 ``RuntimeError`` fail fast,
+          **永不**返回 :class:`PlainRunEventAppender`。
+        - ``is_durable=False`` (test-only): 沿用旧 fallback 语义,
+          返回 :class:`PlainRunEventAppender`, 直接透传
+          :class:`RunEventStore.append`。
 
         :param active_attempt: 当前 active attempt 句柄; 为 ``None`` 表
             示 run-level 或 lease-lost 之后的非 attempt-scoped 写入。
         :returns: 当前生效的 :class:`ToolRuntimeEventAppender`。
-        :raises Exception: 不主动抛出异常。
+        :raises RuntimeError: ``is_durable=True`` 且无法解析 owner_context
+            时抛出。
         """
 
+        if self.is_durable:
+            if (
+                self.attempt_supervisor is not None
+                and active_attempt is not None
+                and active_attempt.owner_context is not None
+            ):
+                return self.attempt_supervisor.scoped_appender(
+                    active_attempt.owner_context
+                )
+            active = active_tool_runtime_appender()
+            if active is not None:
+                return active
+            raise RuntimeError(
+                "durable harness requires AttemptOwnerContext for "
+                "attempt-scoped append"
+            )
         if (
             self.attempt_supervisor is not None
             and active_attempt is not None
@@ -2135,12 +2208,14 @@ def _build_default_harness() -> LocalRunHarness:
     executor: ToolExecutor = _NoopToolExecutor()
     event_store = InMemoryRunEventStore()
     runtime = InMemoryToolRuntime(
+        is_durable=False,
         executor=executor,
         event_store=event_store,
     )
     storage = HostStorage(database_path=":memory:")
     memory_store = open_durable_conversation_memory_store(storage)
     return LocalRunHarness(
+        is_durable=False,
         proxy=LocalProxy(worker=EngineWorker(ToolRuntimeToolExecutor(runtime))),
         event_store=event_store,
         tool_runtime=runtime,

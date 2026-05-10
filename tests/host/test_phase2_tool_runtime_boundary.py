@@ -124,6 +124,7 @@ def _runtime() -> tuple[InMemoryToolRuntime, InMemoryRunEventStore]:
 
     store = InMemoryRunEventStore()
     runtime = InMemoryToolRuntime(
+        is_durable=False,
         executor=_Executor(value=[1, 2, 3]),
         event_store=store,
         truncate_specs={

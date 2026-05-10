@@ -266,6 +266,7 @@ async def _runtime(
         specs["demo"] = spec
     return (
         InMemoryToolRuntime(
+            is_durable=False,
             executor=_Executor(value=value),
             event_store=store,
             truncate_specs=specs,
@@ -549,6 +550,7 @@ async def test_non_completed_outcome_passthrough_without_cursor() -> None:
     for outcome in (failed, awaiting):
         store = InMemoryRunEventStore()
         runtime = InMemoryToolRuntime(
+            is_durable=False,
             executor=_OutcomeExecutor(outcome=outcome),
             event_store=store,
             truncate_specs={"demo": _spec("text_chars", "max_chars", 1)},

@@ -474,6 +474,7 @@ async def test_local_run_harness_thin_delegates_to_supervisor() -> None:
             worker=EngineWorker(ToolRuntimeToolExecutor(runtime))
         )
         harness = LocalRunHarness(
+            is_durable=True,
             proxy=proxy,
             event_store=bundle.event_store,
             tool_runtime=runtime,
@@ -916,6 +917,7 @@ async def test_owner_lost_during_engine_wait_stops_late_event_append() -> None:
         runtime = bundle.harness.tool_runtime
         assert runtime is not None
         harness = LocalRunHarness(
+            is_durable=True,
             proxy=proxy,
             event_store=bundle.event_store,
             tool_runtime=runtime,
@@ -1204,12 +1206,12 @@ async def test_run_to_store_owner_lost_drops_late_engine_event_and_writes_host_f
         from dayu.host._proxy import WorkerProxy
 
         harness = LocalRunHarness(
+            is_durable=True,
             proxy=cast(WorkerProxy, proxy),
             event_store=bundle.event_store,
             tool_runtime=runtime,
             memory_store=bundle.memory_store,
             coordinator=bundle.coordinator,
-            attempt_state_store=bundle.attempt_state_store,
             attempt_supervisor=cast(AttemptSupervisor, recording),
             storage=bundle.storage,
         )

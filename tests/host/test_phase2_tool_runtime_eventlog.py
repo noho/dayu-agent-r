@@ -152,6 +152,7 @@ def _runtime() -> tuple[InMemoryToolRuntime, InMemoryRunEventStore]:
 
     store = InMemoryRunEventStore()
     runtime = InMemoryToolRuntime(
+        is_durable=False,
         executor=_Executor(value=[1, 2, 3, 4]),
         event_store=store,
         truncate_specs={"demo": _spec()},
@@ -314,6 +315,7 @@ async def test_handle_expired_appends_owner_cursor_expired_fact() -> None:
     clock = _Clock()
     store = InMemoryRunEventStore()
     runtime = InMemoryToolRuntime(
+        is_durable=False,
         executor=_Executor(value=[1, 2, 3, 4]),
         event_store=store,
         truncate_specs={"demo": _spec()},
