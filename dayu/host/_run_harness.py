@@ -876,6 +876,14 @@ class LocalRunHarness:
                             terminal_seen=terminal_seen,
                             active_attempt=current_active_attempt,
                         )
+                        if (
+                            terminal_seen
+                            and current_active_attempt is not None
+                            and self._can_atomic_terminal_close(
+                                current_active_attempt
+                            )
+                        ):
+                            current_active_attempt = None
                     except AttemptFencingError:
                         # scoped appender 在写 worker failure 时观察到
                         # owner 已 fenced; 立即收敛到 owner-lost 路径,
@@ -926,6 +934,14 @@ class LocalRunHarness:
                                             active_attempt=current_active_attempt,
                                         )
                                     )
+                                    if (
+                                        terminal_seen
+                                        and current_active_attempt is not None
+                                        and self._can_atomic_terminal_close(
+                                            current_active_attempt
+                                        )
+                                    ):
+                                        current_active_attempt = None
                                 except AttemptFencingError:
                                     # scoped appender 在写 worker failure
                                     # terminal 时观察到 owner 已 fenced,
@@ -1042,6 +1058,7 @@ class LocalRunHarness:
                                     request=attempt_request,
                                     current_user_event=current_user_event,
                                     attempt_index=attempt_index,
+                                    active_attempt=current_active_attempt,
                                 )
                             except Exception as exc:
                                 try:
@@ -1050,8 +1067,17 @@ class LocalRunHarness:
                                             request=attempt_request,
                                             attempt_index=attempt_index,
                                             error=exc,
+                                            active_attempt=current_active_attempt,
                                         )
                                     )
+                                    if (
+                                        terminal_seen
+                                        and current_active_attempt is not None
+                                        and self._can_atomic_terminal_close(
+                                            current_active_attempt
+                                        )
+                                    ):
+                                        current_active_attempt = None
                                 except AttemptFencingError:
                                     # compact 失败 host_failure 写入触发
                                     # owner CAS fence; 收敛 owner-lost,
@@ -1069,13 +1095,21 @@ class LocalRunHarness:
                                 return
                             if next_request_with_trace is None:
                                 terminal_seen = True
-                                await self._finish_attempt_if_durable(
-                                    active_attempt=current_active_attempt,
-                                    terminal_event=None,
-                                    state=AttemptState.FAILED,
-                                    failure_summary="context_compact_failed",
-                                )
-                                current_active_attempt = None
+                                if (
+                                    current_active_attempt is not None
+                                    and self._can_atomic_terminal_close(
+                                        current_active_attempt
+                                    )
+                                ):
+                                    current_active_attempt = None
+                                else:
+                                    await self._finish_attempt_if_durable(
+                                        active_attempt=current_active_attempt,
+                                        terminal_event=None,
+                                        state=AttemptState.FAILED,
+                                        failure_summary="context_compact_failed",
+                                    )
+                                    current_active_attempt = None
                                 return
                             next_request, compact_trace = next_request_with_trace
                             # F5 root cause: 必须 (1) 先 acquire 新 attempt,
@@ -1161,8 +1195,17 @@ class LocalRunHarness:
                                 request=attempt_request,
                                 event_count=event_count,
                                 terminal_seen=terminal_seen,
+                                active_attempt=current_active_attempt,
                             )
                         )
+                        if (
+                            terminal_seen
+                            and current_active_attempt is not None
+                            and self._can_atomic_terminal_close(
+                                current_active_attempt
+                            )
+                        ):
+                            current_active_attempt = None
                         return
                 finally:
                     await _close_engine_events_if_supported(
@@ -1402,12 +1445,15 @@ class LocalRunHarness:
         request: StartRunRequest,
         current_user_event: RunEvent,
         attempt_index: int,
+        active_attempt: "_ActiveAttempt | None",
     ) -> tuple[StartRunRequest, RunInputBuildTrace] | None:
         """执行 Host-owned compact 并返回下一次 attempt 请求与合成 trace。
 
         :param request: 当前 attempt 请求。
         :param current_user_event: 本 Run 原始用户输入事件。
         :param attempt_index: 当前 attempt 序号。
+        :param active_attempt: 当前 attempt 句柄；用于 durable terminal
+            failure 走 ``append_terminal_and_close`` 原子收口。
         :returns: 成功返回 ``(compact 后请求, 合成 RunInputBuildTrace)``；失败
             返回 ``None``。合成 trace 的 ``items`` 为空（compact 路径不再来自
             RunInputBuilder），``total_token_estimate`` 取
@@ -1437,14 +1483,15 @@ class LocalRunHarness:
                     data=failed_data,
                 )
             )
-            await self._scope_appender().append(
-                host_context_compact_failure_terminal_draft(
+            await self._append_terminal_draft_for_active_attempt(
+                active_attempt=active_attempt,
+                draft=host_context_compact_failure_terminal_draft(
                     run_id=request.run_id,
                     session_id=request.session_id,
                     occurred_at=datetime.now(tz=timezone.utc),
                     reason=failed_data.reason,
                     message=failed_data.message,
-                )
+                ),
             )
             return None
         snapshot = await self.memory_store.get_snapshot(request.session_id)
@@ -1478,14 +1525,15 @@ class LocalRunHarness:
                     data=failed_data,
                 )
             )
-            await self._scope_appender().append(
-                host_context_compact_failure_terminal_draft(
+            await self._append_terminal_draft_for_active_attempt(
+                active_attempt=active_attempt,
+                draft=host_context_compact_failure_terminal_draft(
                     run_id=request.run_id,
                     session_id=request.session_id,
                     occurred_at=datetime.now(tz=timezone.utc),
                     reason=failed_data.reason,
                     message=failed_data.message,
-                )
+                ),
             )
             return None
         decision = self.compact_coordinator.compact(
@@ -1525,14 +1573,15 @@ class LocalRunHarness:
                     data=failed_data,
                 )
             )
-            await self._scope_appender().append(
-                host_context_compact_failure_terminal_draft(
+            await self._append_terminal_draft_for_active_attempt(
+                active_attempt=active_attempt,
+                draft=host_context_compact_failure_terminal_draft(
                     run_id=request.run_id,
                     session_id=request.session_id,
                     occurred_at=datetime.now(tz=timezone.utc),
                     reason=failed_data.reason,
                     message=failed_data.message,
-                )
+                ),
             )
             return None
         completed_data = decision.completed_data
@@ -1659,18 +1708,48 @@ class LocalRunHarness:
         stored_event = await appender.append(draft)
         return terminal_result_from_event(stored_event) is not None
 
+    async def _append_terminal_draft_for_active_attempt(
+        self,
+        *,
+        active_attempt: "_ActiveAttempt | None",
+        draft: RunEventDraft,
+    ) -> RunEvent:
+        """按当前 attempt 能力追加 terminal draft。
+
+        durable supervisor 路径必须走 :meth:`_append_terminal_and_close`，
+        保证 owner verify、terminal RunEvent append 与 attempt close 在同
+        一事务内完成；非 supervisor 测试路径保留旧 appender 语义。
+
+        :param active_attempt: 当前 attempt 句柄。
+        :param draft: terminal RunEvent 草稿。
+        :returns: 已落库的 terminal RunEvent。
+        :raises Exception: append 或 close 失败时透传。
+        """
+
+        if active_attempt is not None and self._can_atomic_terminal_close(
+            active_attempt
+        ):
+            return await self._append_terminal_and_close(
+                active_attempt=active_attempt,
+                draft=draft,
+            )
+        return await self._scope_appender().append(draft)
+
     async def _append_compact_exception_failure(
         self,
         *,
         request: StartRunRequest,
         attempt_index: int,
         error: Exception,
+        active_attempt: "_ActiveAttempt | None",
     ) -> bool:
         """将 compact 分支异常收口为 Host-owned 失败终态。
 
         :param request: 当前 attempt 请求。
         :param attempt_index: 当前 attempt 序号。
         :param error: compact 分支抛出的异常。
+        :param active_attempt: 当前 attempt 句柄；用于 durable terminal
+            failure 走 ``append_terminal_and_close`` 原子收口。
         :returns: 已追加终态时返回 ``True``。
         :raises Exception: append 失败时透传。
         """
@@ -1698,8 +1777,9 @@ class LocalRunHarness:
                 data=failed_data,
             )
         )
-        stored_event = await self._scope_appender().append(
-            host_context_compact_failure_terminal_draft(
+        stored_event = await self._append_terminal_draft_for_active_attempt(
+            active_attempt=active_attempt,
+            draft=host_context_compact_failure_terminal_draft(
                 run_id=request.run_id,
                 session_id=request.session_id,
                 occurred_at=datetime.now(tz=timezone.utc),
@@ -1850,22 +1930,10 @@ class LocalRunHarness:
             occurred_at=datetime.now(tz=timezone.utc),
             error=error,
         )
-        if (
-            active_attempt is not None
-            and active_attempt.owner_context is not None
-            and self.attempt_supervisor is not None
-        ):
-            # durable 路径: AttemptScopedRunEventAppender 拒绝 terminal
-            # RunEventType, 必须走 append_terminal_and_close。
-            link = await self.attempt_supervisor.append_terminal_and_close(
-                owner_context=active_attempt.owner_context,
-                draft=draft,
-            )
-            stored_event = link.event
-        else:
-            stored_event = await self._resolve_attempt_appender(
-                active_attempt
-            ).append(draft)
+        stored_event = await self._append_terminal_draft_for_active_attempt(
+            active_attempt=active_attempt,
+            draft=draft,
+        )
         return terminal_result_from_event(stored_event) is not None
 
     async def _append_missing_terminal_failure_if_needed(
@@ -1874,6 +1942,7 @@ class LocalRunHarness:
         request: StartRunRequest,
         event_count: int,
         terminal_seen: bool,
+        active_attempt: "_ActiveAttempt | None",
     ) -> bool:
         """Engine stream 正常结束但无终态时追加 Host-owned failure。
 
@@ -1883,6 +1952,8 @@ class LocalRunHarness:
         :param request: start_run 请求。
         :param event_count: 已成功取得的 EngineEvent 数量。
         :param terminal_seen: 是否已经从已 append 事件推导出终态。
+        :param active_attempt: 当前 attempt 句柄；用于 durable terminal
+            failure 走 ``append_terminal_and_close`` 原子收口。
         :returns: 已存在或新追加终态时返回 ``True``。
         :raises Exception: append Host-owned failure 失败时透传。
         """
@@ -1896,8 +1967,9 @@ class LocalRunHarness:
             request.run_id,
             event_count,
         )
-        stored_event = await self._scope_appender().append(
-            host_failure_draft(
+        stored_event = await self._append_terminal_draft_for_active_attempt(
+            active_attempt=active_attempt,
+            draft=host_failure_draft(
                 run_id=request.run_id,
                 session_id=request.session_id,
                 occurred_at=datetime.now(tz=timezone.utc),

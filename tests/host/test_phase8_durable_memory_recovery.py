@@ -713,6 +713,77 @@ async def test_startup_reconcile_repairs_snapshot_when_checkpoint_caught_up_and_
 
 
 @pytest.mark.asyncio
+async def test_startup_reconcile_repairs_multi_run_session_by_run_batches(
+    tmp_path: Path,
+) -> None:
+    """多 run session 的 snapshot repair 必须逐 run 投影，保留所有 turn。
+
+    回归 P8 F13：repair 路径从 EventLog 按 session 拉取 canonical events，
+    但 memory 投影契约是“同一 run 的事件”。跨 run 批量传入会让 raw turn
+    投影只保留最后一个 run。
+    """
+
+    db_path = tmp_path / "memory_repair_multi_run.sqlite"
+    config = DurableHarnessConfig(database_path=str(db_path))
+    session_id = "session_repair_multi"
+    run_1 = "run_repair_multi_1"
+    run_2 = "run_repair_multi_2"
+
+    bundle_a = build_durable_harness(config=config)
+    try:
+        await bundle_a.event_store.append(
+            _user_input_draft(
+                run_id=run_1,
+                session_id=session_id,
+                content="第一轮用户问题",
+            )
+        )
+        await bundle_a.event_store.append(
+            _final_draft(
+                run_id=run_1,
+                session_id=session_id,
+                content="第一轮回答",
+            )
+        )
+        await bundle_a.event_store.append(
+            _user_input_draft(
+                run_id=run_2,
+                session_id=session_id,
+                content="第二轮用户问题",
+            )
+        )
+        await bundle_a.event_store.append(
+            _final_draft(
+                run_id=run_2,
+                session_id=session_id,
+                content="第二轮回答",
+            )
+        )
+        await bundle_a.coordinator.drain()
+        async with bundle_a.storage.transaction() as tx:
+            tx.execute(
+                "DELETE FROM host_conversation_memory_snapshots "
+                "WHERE session_id = ?",
+                (session_id,),
+            )
+    finally:
+        bundle_a.close()
+
+    bundle_b = build_durable_harness(config=config)
+    try:
+        await bundle_b.startup_reconcile()
+        recovered = await bundle_b.memory_store.get_snapshot(session_id)
+        recovered_turns = {
+            turn.user_text: turn.assistant_final
+            for turn in recovered.recent_raw_turns
+        }
+        assert recovered_turns["第一轮用户问题"] == "第一轮回答"
+        assert recovered_turns["第二轮用户问题"] == "第二轮回答"
+    finally:
+        bundle_b.close()
+
+
+@pytest.mark.asyncio
 async def test_startup_reconcile_does_not_overwrite_intentional_empty_snapshot(
     tmp_path: Path,
 ) -> None:

@@ -713,7 +713,7 @@ class AttemptLeaseStore:
 
         :param tx: 当前事务。
         :param owner_context: 当前 owner 句柄。
-        :param state: 终态枚举之一 (SUCCEEDED/FAILED/CANCELLED/SUSPENDED)。
+        :param state: 终态枚举之一 (SUCCEEDED/FAILED/CANCELLED/SUSPENDED/LOST)。
         :param terminal_event_position: 同事务内刚追加的 terminal RunEvent
             全局位置。
         :param failure_summary: 失败摘要；成功 / 取消 / 暂停可为 ``None``。
@@ -953,7 +953,7 @@ class AttemptLeaseStore:
         *,
         tx: HostStorageTransaction,
         source_attempt_id: str,
-        source_fencing_token: int | None,
+        source_fencing_token: FencingToken | None,
         target_state: AttemptState,
         reason: str,
     ) -> AttemptRecoveryDecision:
@@ -963,9 +963,11 @@ class AttemptLeaseStore:
         attempt, 用于 lease 过期 LOST、CREATED 孤儿 LOST、run 已 terminal
         收口、显式 STALE 诊断、CAS 失败兜底等场景。
 
-        CAS 条件: ``state IN ('running', 'created') AND fencing_token IS ?``
-        (与 ``source_fencing_token`` 严格相等; ``None`` 时匹配 ``CREATED``
-        孤儿行)。``rowcount == 0`` 表示当前行已被其他进程推进, 返回
+        CAS 条件: ``None`` token 只匹配孤儿行；非 ``None`` token 必须同时
+        命中 ``RUNNING``、同一 fencing token，且 ``lease_expires_at <= now``。
+        后者避免 recovery scan 读到过期候选后，合法 owner 已成功 renew
+        的竞态里仍把 active attempt 错误收口为 ``LOST``。``rowcount == 0``
+        表示当前行已被其他进程推进或 lease 已恢复有效，返回
         ``NOOP_TERMINAL``。
 
         :param tx: 当前事务。
@@ -1010,8 +1012,10 @@ class AttemptLeaseStore:
                 UPDATE host_attempts SET state = ?, finished_at = ?,
                     stale_marked_at = ?, failure_summary = ?
                 WHERE attempt_id = ?
-                  AND state IN (?, ?)
+                  AND state = ?
                   AND fencing_token = ?
+                  AND lease_expires_at IS NOT NULL
+                  AND lease_expires_at <= ?
                 """,
                 (
                     target_state.value,
@@ -1020,8 +1024,8 @@ class AttemptLeaseStore:
                     reason,
                     source_attempt_id,
                     AttemptState.RUNNING.value,
-                    AttemptState.CREATED.value,
-                    source_fencing_token,
+                    source_fencing_token.value,
+                    now.isoformat(),
                 ),
             )
         if cursor.rowcount != 1:
@@ -1155,7 +1159,10 @@ class AttemptLeaseStore:
                 current_fencing_token=current_token,
             )
         expected_hash = owner_context.owner_token.digest()
-        if not hmac.compare_digest(current_hash, expected_hash):
+        if not isinstance(current_hash, str) or not hmac.compare_digest(
+            current_hash,
+            expected_hash,
+        ):
             return AttemptLeaseResult(
                 decision=AttemptLeaseDecision.FENCED,
                 owner_context=None,
@@ -1217,7 +1224,8 @@ class AttemptLeaseStore:
         """
 
         row = tx.execute(
-            "SELECT state, owner_id, lease_expires_at FROM host_attempts "
+            "SELECT state, owner_id, fencing_token, lease_expires_at "
+            "FROM host_attempts "
             "WHERE run_id = ? AND attempt_index = ?",
             (run_id, attempt_index),
         ).fetchone()
@@ -1231,6 +1239,7 @@ class AttemptLeaseStore:
                 reason=AttemptFencingReason.STORAGE_CONFLICT,
             )
         lease_raw = row["lease_expires_at"]
+        fencing_token_raw = row["fencing_token"]
         return AttemptLeaseResult(
             decision=AttemptLeaseDecision.BUSY,
             owner_context=None,
@@ -1238,6 +1247,11 @@ class AttemptLeaseStore:
             current_owner_id=row["owner_id"],
             lease_expires_at=(
                 None if lease_raw is None else datetime.fromisoformat(lease_raw)
+            ),
+            current_fencing_token=(
+                None
+                if fencing_token_raw is None
+                else FencingToken(value=int(fencing_token_raw))
             ),
             reason=None,
         )

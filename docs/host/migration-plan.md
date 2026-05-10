@@ -26,7 +26,8 @@ Dayu 项目级约束、artifact 索引和仍需追踪的 residual risks；不复
 - 当前待处理 review findings：无 accepted findings 遗留。
   - 2044 review 6 findings 全部已修复。
   - 2051 review 5 findings + 3 test findings 全部已修复。
-  - T1 (`_renew_loop` 并发竞争测试) 未修 — 非 accepted finding，属 P9 test hardening。
+  - T1 (`_renew_loop` 并发竞争测试) 未修 — 非 accepted finding，属 P8.5
+    adversarial coverage。
 - 下一入口：P8 PR re-review / user confirmation / merge；P8 merge 后进入 P8.5
   ToolRuntime Event Model Correction。
 
@@ -69,7 +70,7 @@ Dayu 项目级约束、artifact 索引和仍需追踪的 residual risks；不复
 | P6 | Durable EventLog / Run State / Projection | merged PR #26 | SQLite WAL durable facts、Run state、projection checkpoint、observer 基础 | durable append / replay / checkpoint / projection smoke 通过 |
 | P7 | Tool Trace Projection / Sink | merged PR #37 | Host observer / sink 派生 tool trace | trace projection 从 canonical facts 幂等重建 |
 | P8 | Attempt Lease / Recovery / Multiprocessing | PR #40 open | owner token、fencing、attempt supervisor、diagnostic recovery、durable memory、multiprocessing stress | 迟到 owner 被 fenced；terminal close 原子；P8 smoke 通过 |
-| P8.5 | ToolRuntime Event Model Correction | planned | 纠正 framework `fetch_more` 被特化为专属 RunEventType 的事件模型；调查并修复由此暴露的 multi-fact partial risk | `fetch_more` 作为普通 Host built-in tool 建模；不再用具体工具名扩展 RunEventType；疑似 EventLog 多 fact 原子性问题有明确结论与 owner |
+| P8.5 | P8 Stabilization / ToolRuntime Event Model | planned | 在 P9 lifecycle 前收口 P8 稳定性尾巴：纠正 framework `fetch_more` 专属 RunEventType 事件模型，并补齐 durable memory / trace / capacity / adversarial coverage 稳定性问题 | `fetch_more` 作为普通 Host built-in tool 建模；不再用具体工具名扩展 RunEventType；P8 已落地 attempt lease / recovery / multiprocessing 在 P8.5 后稳定可用 |
 | P9 | Session / Run Lifecycle Governance / Public Interface | planned | admission、同 Session active Run、cancel 基础治理、Host public interface 固定 | lifecycle/admission/cancel smoke 通过，public exports 冻结 |
 | P10 | ToolRegistry Governance | planned | 通用工具注册、权限、middleware、registry audit | 通用工具可注册、授权、审计，Engine 只见 schema / executor |
 | P10.5 | Web Tools Migration Smoke | planned | 迁移代表性 web tool 验证真实工具链路 | 至少一个 web tool 通过 ToolRegistry / ToolRuntime / trace / memory smoke |
@@ -87,7 +88,7 @@ Dayu 项目级约束、artifact 索引和仍需追踪的 residual risks；不复
 
 | Phase | 关键输出 | 明确非目标 |
 | --- | --- | --- |
-| P8.5 | ToolRuntime event model root-cause plan、删除 `TOOL_FETCH_MORE_REQUESTED` / `TOOL_FETCH_MORE_COMPLETED` / `TOOL_FETCH_MORE_FAILED` 等具体工具名 RunEventType 的实施决策、`fetch_more` 作为普通 Host built-in tool 的通用 tool-call facts 建模、serializer / contracts / trace / memory / smoke / docs 同步、疑似 EventLog multi-fact 原子性问题的证据化裁决、`docs/host/phase8.5-plan.md` | 不恢复 legacy public fetch_more handle；不提前实现完整 P10 ToolRegistry；不把 ToolRuntime 业务语义放入 `dayu.runtime`；不把具体工具名继续编码成 RunEventType；不在缺少直接证据时断言 EventLog batch append 一定需要或一定不需要 |
+| P8.5 | ToolRuntime event model root-cause plan、删除 `TOOL_FETCH_MORE_REQUESTED` / `TOOL_FETCH_MORE_COMPLETED` / `TOOL_FETCH_MORE_FAILED` 等具体工具名 RunEventType 的实施决策、`fetch_more` 作为普通 Host built-in tool 的通用 tool-call facts 建模、serializer / contracts / trace / memory / smoke / docs 同步、疑似 EventLog multi-fact 原子性问题的证据化裁决、durable memory repair 容量与 damaged snapshot 策略、ToolTraceObserver async I/O 边界、RunInput snapshot payload size 策略、P8 adversarial coverage gaps、`docs/host/phase8.5-plan.md` | 不恢复 legacy public fetch_more handle；不提前实现完整 P10 ToolRegistry；不把 ToolRuntime 业务语义放入 `dayu.runtime`；不把具体工具名继续编码成 RunEventType；不在缺少直接证据时断言 EventLog batch append 一定需要或一定不需要；不做 P9 Session / Run lifecycle admission；不做 P16 public/internal bundle interface freeze |
 | P9 | SessionManager、RunManager、RunSupervisor、`client_request_id` 幂等、同 Session active Run 仲裁、`cancel_run`、生产级 admission policy、Host public interface 契约、OLD wechat / web / prompt / interactive 调用需求调研、`utils/smoke_host_p9_lifecycle.py` | 不做 issue #3 强制终止增强；不做 wait / suspend / resume；不做 Remote RPC；不迁移业务工具 |
 | P10 | ToolRegistry / tool catalog、display metadata、permission policy、middleware chain、framework tool registration、schema / binding 校验、registry audit facts、`utils/smoke_host_p10_tool_registry.py` | 不迁移 business fins / doc / web 工具；不让 Host / Engine 承载财报业务语义；不让 Engine 持有 registry |
 | P10.5 | 代表性 web tool `@tool` declaration、ToolRegistry 注册、permission / middleware / display metadata 对接、ToolRuntime truncate / fetch_more 适配、tool trace / memory facts smoke、`utils/smoke_host_p10_5_web_tools.py` | 不迁移 fins / doc 全量业务工具；不把 web 业务语义塞进 Host / Engine；不扩大 P10 ToolRegistry 契约；不实现 P11 validation replay |
@@ -137,24 +138,29 @@ P8 cleanup 后的 stale / orphan recovery 旧术语（`MARK_RECOVERING_AND_CREAT
 | `TOOL_FETCH_MORE_REQUESTED` / `TOOL_FETCH_MORE_COMPLETED` / `TOOL_FETCH_MORE_FAILED` 将具体 Host built-in tool 名编码进 RunEventType，未来每新增内置工具都可能诱导新增事件类型 | P8.5 | deferred-with-owner |
 | `TOOL_CURSOR_ISSUED` / `TOOL_CURSOR_EXPIRED` / `TOOL_CURSOR_DENIED` / `TOOL_RESULT_TRUNCATED` 属于通用 ToolRuntime 机制 fact 还是应并入通用 tool result fact，需基于 projection / trace / replay 直接证据裁决 | P8.5 | needs-more-evidence |
 | P8 PR review 2051-F1~F5 + T2~T4：session leak / verify_run_id / observer CAUGHT_UP / lastrowid / RECOVERING / coverage tests | PR #40 | fixed, validated |
-| P8 PR review 1948-F2：`_verify_run_id_matches()` 缺独立 RUN_ID_MISMATCH reason | P9 / P16 interface freeze | deferred-with-owner |
-| durable memory repair 按 session 扫描 EventLog 的容量风险 | P9 / capacity | deferred-with-owner |
+| P8 PR review 1948-F2：`_verify_run_id_matches()` 缺独立 RUN_ID_MISMATCH reason，run_id 不匹配的内部不变量违反不应与 owner token mismatch 共用 `OWNER_MISMATCH` | P8.5 | deferred-with-owner |
+| durable memory repair 按 session 扫描 EventLog 的容量风险 | P8.5 | deferred-with-owner |
+| durable memory snapshot row 存在但 payload 损坏时 repair 不可见，需定义自动修复 / 运维介入边界 | P8.5 | deferred-with-owner |
 | `recover_stale_attempts(run_id=None)` 全局扫描路径未单测 | PR #40 | fixed (T2 test added) |
-| `next_attempt_index` 未独立单测 | P9 / test hardening | deferred-with-owner |
+| `next_attempt_index` 未独立单测 | P8.5 | deferred-with-owner |
+| P8 PR review 2242/2247 coverage-only gaps：renew/terminal race、recovery CAS miss、owner-lost late event、terminal override、expired/denied fencing 等 adversarial tests | P8.5 | deferred-with-owner |
 | recovery scan 自动接入生产启动链路 | P9 / Session lifecycle | deferred-with-owner |
 | `startup_reconcile` 自动接入 Host 启动流程 | P9 / Session lifecycle | deferred-with-owner |
 | `HostStorage.close()` 对后台 task / `to_thread` commit 无生命周期保护 | P9 lifecycle | deferred-with-owner |
-| compact 成功但后续 durable append 失败时的诊断事件精度 | P15 governance hardening | deferred-with-owner |
+| compact 成功但后续 durable append 失败时的诊断事件精度 | P8.5 | deferred-with-owner |
 | observer 在空 EventLog 且 `last_success_position is None` 时无法明确转 `CAUGHT_UP` | PR #40 | fixed (zero-event observer advance) |
-| observer buffered drain / best-effort observer 解耦 / observer claim lease | GitHub issue #28 / P15 | deferred-with-owner |
+| observer buffered drain / best-effort observer 解耦 / observer claim lease；P8.5 需裁决哪些属于 P8 read model / trace 多进程稳定性前置，剩余治理项继续由 issue #28 / P15 承接 | P8.5 / GitHub issue #28 | deferred-with-owner |
 | 慢硬盘 + Docker Linux multiprocessing stress 稳定性 | GitHub issue #38 | tracked |
 | Tool Trace JSONL 文件滚动边界 | GitHub issue #36 | tracked |
-| compact retry 合成 `RunInputContextSnapshotBuiltData` 的 `iteration_index` / `attempt_index` 语义对齐 | P7 follow-up / P9 | deferred-with-owner |
-| SSE 中途失败导致 partial tool call 缺少完整 trace 语义 | P9 / P15 | deferred-with-owner |
-| `RUN_INPUT_CONTEXT_SNAPSHOT_BUILT` 内联 raw payload 造成 EventLog 热冷混合与体积增长 | P9 / capacity | deferred-with-owner |
+| `ToolTraceObserver.process` 在 async observer 协议内执行同步 JSONL / blob 文件 I/O，需评估 executor / outbox / backpressure 边界 | P8.5 | deferred-with-owner |
+| compact retry 合成 `RunInputContextSnapshotBuiltData` 的 `iteration_index` / `attempt_index` 语义对齐 | P8.5 | deferred-with-owner |
+| SSE 中途失败导致 partial tool call 缺少完整 trace 语义 | P8.5 | deferred-with-owner |
+| `RUN_INPUT_CONTEXT_SNAPSHOT_BUILT` 内联 raw payload 造成 EventLog 热冷混合与体积增长 | P8.5 | deferred-with-owner |
 | `LocalRunHarness` 职责继续膨胀，接近 God Object 阈值 | P9 / P16 architecture | deferred-with-owner |
+| `DurableHarnessBundle` 暴露 attempt supervisor / lease store 等 Host internal 治理对象，public/internal bundle 边界需在接口冻结前收口 | P16 interface freeze | deferred-with-owner |
 | schema bootstrap 半失败治理 / 严格事务化 DDL | P15 | deferred-with-owner |
-| observer claim / lease / hard-gate | P15 | deferred-with-owner |
+| observer claim / lease 中与 P8 durable memory / tool trace projection 多进程所有权相关的部分 | P8.5 | deferred-with-owner |
+| observer hard-gate / required projection enforcement / watchdog 级治理 | P15 | deferred-with-owner |
 | `InMemoryRunEventStore` 生产语义最终收口 | P16 interface freeze | deferred-with-owner |
 | observer direct-call 测试 fake transaction 类型收口 | P16 interface freeze | deferred-with-owner |
 | P8-S3 测试 fake 依赖具体 `AttemptSupervisor`，是否抽 `AttemptSupervisorPort` | P16 interface freeze | deferred-with-owner |

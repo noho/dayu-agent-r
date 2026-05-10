@@ -321,6 +321,11 @@ class DurableConversationMemoryStore:
                 # 事实，意味着 session 还在进行中 / 没有完整事实；本 helper
                 # 不主动写入“半成品” snapshot，等待正常 projection 路径。
                 continue
+            terminal_run_batches = (
+                self._group_terminal_canonical_events_by_run(canonical_events)
+            )
+            if not terminal_run_batches:
+                continue
             async with self.storage.transaction() as tx:
                 # 二次确认 row 仍缺失：避免与并发 observer 投影竞争导致
                 # 覆盖刚写入的 snapshot。
@@ -328,14 +333,16 @@ class DurableConversationMemoryStore:
                     tx=tx, session_id=session_id
                 ):
                     continue
-                self._project_in_tx(tx=tx, events=canonical_events)
+                for run_events in terminal_run_batches:
+                    self._project_in_tx(tx=tx, events=run_events)
             repaired.append(session_id)
             _LOGGER.log(
                 VERBOSE_LOG_LEVEL,
                 "host.conversation_memory.durable_repaired session_id=%s "
-                "canonical_count=%s",
+                "canonical_count=%s run_count=%s",
                 session_id,
                 len(canonical_events),
+                len(terminal_run_batches),
             )
         return tuple(repaired)
 
@@ -412,6 +419,36 @@ class DurableConversationMemoryStore:
             if event.type in TERMINAL_RUN_EVENT_TYPES:
                 return True
         return False
+
+    def _group_terminal_canonical_events_by_run(
+        self,
+        events: tuple[RunEvent, ...],
+    ) -> tuple[tuple[RunEvent, ...], ...]:
+        """把 session 级 canonical events 按 run_id 分成已终态批次。
+
+        repair 路径从 EventLog 按 session 拉取事实，但
+        ``_project_canonical_events`` / ``_project_raw_turn`` 的契约是“同
+        一 run 的事件”。这里显式按 run_id 分组，只把含 terminal event 的
+        run 批次交给投影，避免把跨 run 的 USER / FINAL 拼成单个 turn。
+
+        :param events: session 级 canonical RunEvent 元组。
+        :returns: 按首次出现顺序排列的 terminal run 事件批次。
+        :raises Exception: 不主动抛出异常。
+        """
+
+        grouped: dict[str, list[RunEvent]] = {}
+        for event in events:
+            if event.kind is not RunEventKind.CANONICAL:
+                continue
+            if event.run_id not in grouped:
+                grouped[event.run_id] = []
+            grouped[event.run_id].append(event)
+        batches: list[tuple[RunEvent, ...]] = []
+        for group in grouped.values():
+            batch = tuple(group)
+            if self._has_terminal_event(batch):
+                batches.append(batch)
+        return tuple(batches)
 
     def _snapshot_row_exists_in_tx(
         self,

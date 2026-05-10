@@ -28,6 +28,7 @@ from dayu.engine.contracts.engine_events import IterationStartedData
 from dayu.host._attempt_lease import (
     AttemptFencingError,
     AttemptFencingReason,
+    AttemptLeaseDecision,
     AttemptLeaseConfig,
     AttemptOwnerToken,
 )
@@ -566,6 +567,81 @@ async def test_scoped_appender_rejects_when_owner_fenced() -> None:
             assert events == ()
             # 错误文本不含 owner secret 明文
             assert owner_context.owner_token.value not in str(excinfo.value)
+    finally:
+        storage.close()
+
+
+@pytest.mark.asyncio
+async def test_verify_owner_with_null_owner_hash_returns_typed_fence() -> None:
+    """RUNNING 行 owner hash 为 NULL 时返回 typed OWNER_MISMATCH。
+
+    回归 P8 F8：``_diagnose_fence`` 不得把 ``None`` 传给
+    ``hmac.compare_digest`` 导致 ``TypeError``，而应按 owner 不匹配收口。
+    """
+
+    storage = _open_storage()
+    try:
+        await _seed_run(storage)
+        clock = _FakeClock()
+        supervisor = _build_supervisor(storage=storage, clock=clock)
+        async with supervisor.lease_context(
+            run_id="r1", attempt_index=0
+        ) as owner_context:
+            async with storage.transaction() as tx:
+                tx.execute(
+                    "UPDATE host_attempts SET owner_token_hash = NULL "
+                    "WHERE attempt_id = ?",
+                    (owner_context.attempt_id,),
+                )
+            with pytest.raises(AttemptFencingError) as excinfo:
+                async with storage.transaction() as tx:
+                    supervisor.lease_store.verify_owner(
+                        tx=tx,
+                        owner_context=owner_context,
+                    )
+            assert excinfo.value.reason is AttemptFencingReason.OWNER_MISMATCH
+    finally:
+        storage.close()
+
+
+@pytest.mark.asyncio
+async def test_busy_acquire_result_includes_current_fencing_token() -> None:
+    """attempt_index 冲突的 BUSY 结果必须携带当前 fencing token。
+
+    回归 P8 F22：BUSY 诊断缺少 ``current_fencing_token`` 会丢失并发冲突
+    的关键诊断字段。
+    """
+
+    storage = _open_storage()
+    try:
+        await _seed_run(storage)
+        clock = _FakeClock()
+        lease_store = AttemptLeaseStore(storage=storage, clock=clock)
+        owner_token = AttemptOwnerToken.new()
+        async with storage.transaction() as tx:
+            first = lease_store.acquire_new_attempt(
+                tx=tx,
+                attempt_id="attempt-busy-1",
+                run_id="r1",
+                attempt_index=0,
+                recovered_from_attempt_id=None,
+                owner_id="owner-1",
+                owner_token=owner_token,
+                lease_expires_at=clock.now() + timedelta(seconds=30),
+            )
+            assert first.owner_context is not None
+            busy = lease_store.acquire_new_attempt(
+                tx=tx,
+                attempt_id="attempt-busy-2",
+                run_id="r1",
+                attempt_index=0,
+                recovered_from_attempt_id=None,
+                owner_id="owner-2",
+                owner_token=AttemptOwnerToken.new(),
+                lease_expires_at=clock.now() + timedelta(seconds=30),
+            )
+        assert busy.decision is AttemptLeaseDecision.BUSY
+        assert busy.current_fencing_token == first.owner_context.fencing_token
     finally:
         storage.close()
 

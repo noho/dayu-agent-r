@@ -826,11 +826,7 @@ class AttemptSupervisor:
                 return self.lease_store.mark_stale_or_lost(
                     tx=tx,
                     source_attempt_id=candidate.attempt_id,
-                    source_fencing_token=(
-                        None
-                        if candidate.fencing_token is None
-                        else candidate.fencing_token.value
-                    ),
+                    source_fencing_token=candidate.fencing_token,
                     target_state=AttemptState.LOST,
                     reason=_RECOVERY_REASON_RUN_TERMINAL,
                 )
@@ -848,7 +844,7 @@ class AttemptSupervisor:
             return self.lease_store.mark_stale_or_lost(
                 tx=tx,
                 source_attempt_id=candidate.attempt_id,
-                source_fencing_token=candidate.fencing_token.value,
+                source_fencing_token=candidate.fencing_token,
                 target_state=AttemptState.LOST,
                 reason=_RECOVERY_REASON_LEASE_EXPIRED,
             )

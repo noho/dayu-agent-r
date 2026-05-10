@@ -459,7 +459,7 @@ class HostToolRuntime:
                     request.context.tool_call_id,
                 )
                 return outcome
-            cursor_creation = self._store_cursor(
+            cursor_creation = self._build_cursor(
                 request=request,
                 spec=spec,
                 truncated=truncated,
@@ -475,6 +475,7 @@ class HostToolRuntime:
                 request=request,
                 data=cursor_creation.issued_event,
             )
+            self._commit_cursor_creation(cursor_creation)
             completed = ToolCompletedOutcome(
                 result=ToolResultSuccess(
                     ok=True,
@@ -777,12 +778,11 @@ class HostToolRuntime:
             )
             now = self.clock()
             if record.expires_at_monotonic <= now:
-                self._remove_cursor(record.cursor)
                 await self._append_cursor_expired(
                     record=record,
                     iteration_id=request.iteration_id,
                 )
-                return await self._fetch_failure(
+                failed = await self._fetch_failure(
                     request=request,
                     record=record,
                     error_code=_ERROR_CURSOR_EXPIRED,
@@ -790,6 +790,8 @@ class HostToolRuntime:
                     denied=False,
                     expired=True,
                 )
+                self._remove_cursor(record.cursor)
+                return failed
             denied_reason = self._scope_denied_reason(
                 request=request,
                 record=record,
@@ -899,7 +901,7 @@ class HostToolRuntime:
         _ = request
         return None
 
-    def _store_cursor(
+    def _build_cursor(
         self,
         *,
         request: ToolExecutionRequest,
@@ -907,7 +909,12 @@ class HostToolRuntime:
         truncated: _TruncatedValue,
         parent_cursor_fingerprint: str | None,
     ) -> _CursorCreation:
-        """创建并保存 cursor。
+        """纯构建初始截断 cursor，不写入内存 maps。
+
+        调用方必须先成功写入 ``TOOL_RESULT_TRUNCATED`` 与
+        ``TOOL_CURSOR_ISSUED`` EventLog facts，再调用
+        :meth:`_commit_cursor_creation` 注册 cursor，避免 fencing race 下出
+        现无事实支撑的孤儿 cursor。
 
         :param request: 工具执行请求。
         :param spec: 截断声明。
@@ -926,7 +933,8 @@ class HostToolRuntime:
             spec=spec,
             timeout_seconds=request.context.timeout_seconds,
         )
-        return self._create_cursor(
+        self._cleanup_expired(self.clock())
+        return self._build_cursor_creation(
             session_id=request.context.session_id,
             run_id=request.context.run_id,
             iteration_id=request.context.iteration_id,
@@ -943,45 +951,6 @@ class HostToolRuntime:
             parent_cursor_fingerprint=parent_cursor_fingerprint,
             arguments=request.call.arguments,
             ttl_seconds=ttl_seconds,
-        )
-
-    def _store_cursor_from_record(
-        self,
-        *,
-        record: _CursorRecord,
-        offset: int,
-        parent_cursor_fingerprint: str,
-        iteration_id: str,
-    ) -> _CursorCreation:
-        """从旧 cursor 记录派生下一页 cursor 并立即注册。
-
-        :param record: 已消费 cursor 记录。
-        :param offset: 下一页起始 offset。
-        :param parent_cursor_fingerprint: 父 cursor 指纹。
-        :param iteration_id: 派生 cursor 所属 Engine iteration id；通常为
-            正在调用 framework ``fetch_more`` 的 iteration。
-        :returns: 新 cursor 创建结果。
-        :raises Exception: 不主动抛出异常。
-        """
-
-        return self._create_cursor(
-            session_id=record.session_id,
-            run_id=record.run_id,
-            iteration_id=iteration_id,
-            tool_call_id=record.tool_call_id,
-            tool_name=record.tool_name,
-            strategy=record.strategy,
-            unit=record.unit,
-            limit=record.limit,
-            total=record.total,
-            data=record.data,
-            offset=offset,
-            template=record.template,
-            field_path=record.field_path,
-            parent_cursor_fingerprint=parent_cursor_fingerprint,
-            arguments=None,
-            ttl_seconds=record.ttl_seconds,
-            scope_hash=record.scope_hash,
         )
 
     def _build_cursor_from_record(
@@ -1140,77 +1109,6 @@ class HostToolRuntime:
         self._cursor_by_fingerprint[
             creation.record.cursor_fingerprint
         ] = creation.record.cursor
-
-    def _create_cursor(
-        self,
-        *,
-        session_id: str,
-        run_id: str,
-        iteration_id: str,
-        tool_call_id: str,
-        tool_name: str,
-        strategy: str,
-        unit: str,
-        limit: int,
-        total: int,
-        data: _StoredData,
-        offset: int,
-        template: JsonValue | None,
-        field_path: tuple[str, ...] | None,
-        parent_cursor_fingerprint: str | None,
-        arguments: Mapping[str, JsonValue] | None,
-        ttl_seconds: int,
-        scope_hash: str | None = None,
-    ) -> _CursorCreation:
-        """构建 cursor 并立即注册到内存 maps（build + commit）。
-
-        供初始截断路径使用；``_fetch_more`` 的 next cursor 必须使用
-        :meth:`_build_cursor_creation` + :meth:`_commit_cursor_creation`
-        分步调用。
-
-        :param session_id: 会话 id。
-        :param run_id: Run id。
-        :param tool_call_id: 原始工具调用 id。
-        :param tool_name: 工具名。
-        :param strategy: 截断策略。
-        :param unit: 截断单位。
-        :param limit: 截断上限。
-        :param total: 原始总量估计。
-        :param data: 原始目标数据。
-        :param offset: 下一页起始 offset。
-        :param template: wrapper 模板。
-        :param field_path: wrapper 目标路径。
-        :param parent_cursor_fingerprint: 父 cursor 指纹。
-        :param arguments: 工具参数；派生 cursor 可为 ``None``。
-        :param ttl_seconds: TTL 秒数。
-        :param scope_hash: 已有 scope hash。
-        :returns: cursor 创建结果。
-        :raises Exception: 不主动抛出异常。
-        """
-
-        now = self.clock()
-        self._cleanup_expired(now)
-        creation = self._build_cursor_creation(
-            session_id=session_id,
-            run_id=run_id,
-            iteration_id=iteration_id,
-            tool_call_id=tool_call_id,
-            tool_name=tool_name,
-            strategy=strategy,
-            unit=unit,
-            limit=limit,
-            total=total,
-            data=data,
-            offset=offset,
-            template=template,
-            field_path=field_path,
-            parent_cursor_fingerprint=parent_cursor_fingerprint,
-            arguments=arguments,
-            ttl_seconds=ttl_seconds,
-            scope_hash=scope_hash,
-        )
-        self._commit_cursor_creation(creation)
-        return creation
 
     def _remove_cursor(self, cursor: str) -> None:
         """删除 cursor 记录。

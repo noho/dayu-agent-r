@@ -18,7 +18,7 @@
 
 from __future__ import annotations
 
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from datetime import datetime, timedelta, timezone
 
 import pytest
@@ -247,6 +247,45 @@ class _FencingOnIssuedAppender:
         if draft.type is RunEventType.TOOL_CURSOR_ISSUED:
             raise AttemptFencingError(
                 attempt_id="attempt-fenced-on-issued",
+                run_id=draft.run_id,
+                reason=AttemptFencingReason.OWNER_MISMATCH,
+                current_state=AttemptState.RUNNING,
+                owner_id="owner-other",
+                fencing_token=FencingToken(value=1),
+            )
+        return RunEvent(
+            cursor=RunEventCursor(sequence=0),
+            run_id=draft.run_id,
+            session_id=draft.session_id,
+            kind=draft.kind,
+            source=draft.source,
+            type=draft.type,
+            occurred_at=draft.occurred_at,
+            data=draft.data,
+            source_engine_event_id=draft.source_engine_event_id,
+        )
+
+
+class _FencingOnExpiredAppender:
+    """仅在 ``TOOL_CURSOR_EXPIRED`` 时抛 :class:`AttemptFencingError` 的 appender。"""
+
+    def __init__(self) -> None:
+        """初始化。"""
+
+        self.appended_types: list[RunEventType] = []
+
+    async def append(self, draft: RunEventDraft) -> RunEvent:
+        """按 draft type 决定通过或 fenced。
+
+        :param draft: 待写入的 RunEvent 草稿。
+        :returns: 非 EXPIRED 时返回 fake event。
+        :raises AttemptFencingError: ``TOOL_CURSOR_EXPIRED`` 时抛出。
+        """
+
+        self.appended_types.append(draft.type)
+        if draft.type is RunEventType.TOOL_CURSOR_EXPIRED:
+            raise AttemptFencingError(
+                attempt_id="attempt-fenced-on-expired",
                 run_id=draft.run_id,
                 reason=AttemptFencingReason.OWNER_MISMATCH,
                 current_state=AttemptState.RUNNING,
@@ -519,6 +558,8 @@ async def test_execute_tool_call_propagates_attempt_fencing_error_from_append_pa
             with pytest.raises(AttemptFencingError) as excinfo:
                 await runtime.execute_tool_call(_tool_request())
         assert excinfo.value.reason is AttemptFencingReason.OWNER_MISMATCH
+        assert runtime._records_by_cursor == {}  # noqa: SLF001
+        assert runtime._cursor_by_fingerprint == {}  # noqa: SLF001
     finally:
         storage.close()
 
@@ -956,6 +997,67 @@ async def test_fetch_more_issued_fencing_preserves_old_cursor() -> None:
         assert RunEventType.TOOL_CURSOR_ISSUED in fencing_appender.appended_types
         # 已知 partial fact: COMPLETED 已写入, ISSUED 未写入。
         # 这是 EventLog 多 fact append 非原子的固有限制。
+    finally:
+        storage.close()
+
+
+@pytest.mark.asyncio
+async def test_fetch_more_expired_fencing_preserves_old_cursor() -> None:
+    """``_append_cursor_expired`` 被 fenced 时必须先保留旧 cursor。
+
+    回归 P8 F17：过期路径要先成功写入 EventLog 事实，再删除内存 cursor；
+    若 EXPIRED fact append 被 owner fencing 拦截，旧 cursor 仍应留在 maps
+    中供后续 attempt 按真实事实重试或诊断。
+    """
+
+    storage = _open_storage()
+    try:
+        await _seed_run(storage, run_id="r1")
+        clock = _FakeClock()
+        supervisor = _build_supervisor(storage=storage, clock=clock)
+        fencing_appender = _FencingOnExpiredAppender()
+        runtime = HostToolRuntime(
+            is_durable=False,
+            executor=_NoopExecutor(),
+            event_store=supervisor.event_store,
+            clock=lambda: 2.0,
+        )
+        record = _build_cursor_record(
+            cursor_value="cursor-expired-fence",
+            run_id="r1",
+            session_id="s",
+            tool_call_id="tc-expired-fence",
+        )
+        expired_record = replace(record, expires_at_monotonic=1.0)
+        runtime._records_by_cursor[expired_record.cursor] = expired_record  # noqa: SLF001
+        runtime._cursor_by_fingerprint[expired_record.cursor_fingerprint] = expired_record.cursor  # noqa: SLF001
+
+        async with supervisor.lease_context(
+            run_id="r1", attempt_index=0
+        ) as owner_context:
+            del owner_context
+            async with ToolRuntimeOwnerScope(fencing_appender):
+                request = ToolFetchMoreRequest(
+                    session_id="s",
+                    run_id="r1",
+                    iteration_id="iter-expired-fence",
+                    tool_call_id="tc-expired-fence",
+                    cursor=ToolRuntimeCursor(
+                        value=expired_record.cursor,
+                        fingerprint=expired_record.cursor_fingerprint,
+                    ),
+                    scope_token=expired_record.scope_token,
+                    limit=4,
+                )
+                with pytest.raises(AttemptFencingError):
+                    await runtime._fetch_more(request)  # noqa: SLF001
+
+        assert expired_record.cursor in runtime._records_by_cursor  # noqa: SLF001
+        assert (
+            runtime._cursor_by_fingerprint.get(expired_record.cursor_fingerprint)  # noqa: SLF001
+            == expired_record.cursor
+        )
+        assert RunEventType.TOOL_CURSOR_EXPIRED in fencing_appender.appended_types
     finally:
         storage.close()
 

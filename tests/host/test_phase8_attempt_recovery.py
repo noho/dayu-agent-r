@@ -419,6 +419,67 @@ async def test_recover_returns_noop_when_cas_misses(
 
 
 @pytest.mark.asyncio
+async def test_recover_noop_when_candidate_lease_is_renewed_before_mark(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """scan 后、mark 前 lease 变为有效 -> ``NOOP_TERMINAL``，不误标 LOST。
+
+    回归 P8 F14：``mark_stale_or_lost`` 的非 orphan CAS 必须重新检查
+    ``lease_expires_at <= now``。否则 recovery scan 读到旧候选后，合法
+    owner 已把 lease 刷新到未来时，mark 阶段仍会仅凭 fencing token 命中
+    并错误收口 active attempt。
+    """
+
+    storage = _open_storage()
+    try:
+        await _seed_run(storage, run_id=_RUN_ID)
+        clock = _FakeClock()
+        supervisor = _build_supervisor(storage=storage, clock=clock)
+        async with supervisor.lease_context(
+            run_id=_RUN_ID, attempt_index=0
+        ) as owner:
+            attempt_id = owner.attempt_id
+        clock.advance(timedelta(seconds=120))
+
+        original_list = AttemptLeaseStore.list_recovery_candidates
+
+        def _patched_list(  # type: ignore[no-untyped-def]
+            self, *, tx, run_id, now
+        ):
+            candidates = original_list(self, tx=tx, run_id=run_id, now=now)
+            tx.execute(
+                "UPDATE host_attempts SET lease_expires_at = ?, "
+                "lease_renewed_at = ? WHERE attempt_id = ?",
+                (
+                    (now + timedelta(seconds=30)).isoformat(),
+                    now.isoformat(),
+                    attempt_id,
+                ),
+            )
+            return candidates
+
+        monkeypatch.setattr(
+            AttemptLeaseStore, "list_recovery_candidates", _patched_list
+        )
+
+        decisions = await supervisor.recover_stale_attempts(run_id=_RUN_ID)
+        assert len(decisions) == 1
+        assert decisions[0].action is AttemptRecoveryAction.NOOP_TERMINAL
+        assert decisions[0].reason == "cas_failed_noop"
+
+        async with storage.transaction() as tx:
+            row = tx.execute(
+                "SELECT state, lease_expires_at FROM host_attempts "
+                "WHERE attempt_id = ?",
+                (attempt_id,),
+            ).fetchone()
+        assert row["state"] == AttemptState.RUNNING.value
+        assert datetime.fromisoformat(row["lease_expires_at"]) > clock.now()
+    finally:
+        storage.close()
+
+
+@pytest.mark.asyncio
 async def test_recover_does_not_advance_projection_checkpoint() -> None:
     """recovery scan 必须不修改 ``host_projection_checkpoints``。"""
 
