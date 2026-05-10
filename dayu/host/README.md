@@ -5,9 +5,10 @@ Phase 流程、review 过程或 PR 流程。
 
 ## 当前状态
 
-`dayu.host` 当前落地 P5 no-full-governance 纵向 smoke 所需的最小 Run harness、内存态 RunEventStore、
-Host-owned ToolRuntime 截断 / 补读、Host 内部 Conversation Memory / RunInputBuilder、context overflow
-compact retry，以及公共 tool declaration 契约：
+`dayu.host` 当前落地最小 Run harness（含内存态与 P6 durable 两条路径）、Host-owned ToolRuntime
+截断 / 补读、Host 内部 Conversation Memory / RunInputBuilder、context overflow compact retry、
+公共 tool declaration 契约，以及 P8 attempt lease / fencing / recovery / terminal atomic close /
+attempt-scoped append / durable memory：
 
 - 包根暴露 Run 级契约与 `await start_run(request)`、`stream_run_events(run_id, after=cursor)`、
   `await get_run_result(run_id)`、`await get_tool_fetch_more_handle(request)`、
@@ -106,8 +107,7 @@ compact retry，以及公共 tool declaration 契约：
 
 - `client_request_id` 创建幂等。
 - Session governance 与同 Session active Run 仲裁。
-- workspace migration、多进程 lease / fencing 治理（已具备 SQLite WAL durable EventLog，
-  恢复仅覆盖单进程重启，不含跨进程仲裁）。
+- recovery scan 自动装配到生产启动链路（当前仅为内部显式入口，`build_durable_harness` 不自动调用）。
 - 完整 ToolRegistry、工具发现、权限治理、middleware、业务工具迁移。
 - 远程 / 多进程补读。
 - public memory edit / reset / forget API、跨 session / project / user memory。
@@ -176,6 +176,46 @@ P7 已落地：
   `LocalRunHarness`；``None`` / 空字符串等价于未配置 trace，coordinator
   observer 元组与 EventLog 都不会出现 trace fact 与 trace observer。
   P7 不在 SQLite 引入任何 ``host_tool_trace_*`` 表。
+
+P8 已落地：
+
+- attempt lease / fencing 核心（P8-S1 基础 + P8-S3 接入）：`AttemptSupervisor` 通过
+  `DurableHarnessConfig.attempt_lease_config` 装配到 `build_durable_harness`；每个 attempt 在
+  `LocalRunHarness.start_run` 时经 `AttemptSupervisor.lease_context()` 获取 owner secret token
+  （SHA-256 digest 入库，明文不入库、不进日志、不进 EventLog）与全局单调 fencing token；
+  `_renew_loop` 后台心跳在 `AttemptOwnerLossReason.FENCED / STORAGE_ERROR` 时通过
+  `wait_owner_lost()` 暴露 typed 信号，`LocalRunHarness` 用 `_next_engine_event_or_lose_owner()`
+  在 Engine event 与 owner-lost 之间 race，一旦 owner 失活即停止后续 EventLog append 并走
+  owner-aware diagnostic close。
+- terminal atomic close（P8-S4）：`AttemptSupervisor.append_terminal_and_close` 在单个
+  `BEGIN IMMEDIATE` 事务内串联 `verify_owner` → EventLog terminal RunEvent append →
+  `host_attempts.terminal_event_position` 写入 → attempt 终态 close；任何 owner / fencing
+  token / lease 过期校验失败抛 `AttemptFencingError` 并整事务回滚，EventLog 不残留 stale
+  terminal，`host_attempts` 不被旧 owner 覆盖未来状态。
+- attempt-scoped append（P8-S5）：`AttemptScopedRunEventAppender` 收敛所有当前 attempt
+  owner 的 canonical fact 写入（Engine 翻译事件、context overflow / compact、trace fact、
+  ToolRuntime fact）；`draft.run_id` 与 `owner_context.run_id` 不一致直接抛
+  `AttemptFencingError(reason=OWNER_MISMATCH)`。`ToolRuntimeOwnerScope`（ContextVar）
+  在 `LocalRunHarness._run_to_store` 每个 attempt 生命周期内把 scoped appender 注入
+  `InMemoryToolRuntime`，使框架 `fetch_more` 也按 originating attempt 落库。
+- stale / orphan recovery（P8-S6）：`AttemptSupervisor.recover_stale_attempts` 内部显式
+  入口扫描 `state IN ('running','created') AND lease_expires_at <= now`，逐候选用独立
+  `BEGIN IMMEDIATE` 事务 CAS 决策——旧 RUNNING 推 `RECOVERING` + INSERT 新 recovery
+  attempt（严格更大 fencing token、`recovered_from_attempt_id` 链接）；run terminal 推
+  `MARK_LOST` 不创建恢复 attempt；`CREATED` 孤儿推 `MARK_LOST`；fencing token 被改写时
+  命中 `NOOP_TERMINAL` 安全分支。该入口当前未自动 wire 进 `build_durable_harness` 或
+  Session 生命周期。
+- 多进程 stress 验证（P8-S7）：`tests/host/test_phase8_multiprocess_stress.py` 通过
+  spawn-only + file SQLite (WAL + `BEGIN IMMEDIATE`) 覆盖并发 append、terminal close
+  race、跨进程 stale recovery、observer drain 四场景。不引入 multiprocessing launcher
+  生产代码。
+- durable conversation memory（P8-S8）：`DurableConversationMemoryStore` 成为
+  `build_durable_harness` 默认 memory read model，与 EventLog checkpoint 同事务原子推进；
+  `startup_reconcile` 后追加 `repair_missing_session_snapshots()` 在 checkpoint 已 CAUGHT_UP
+  但 snapshot row 因运维误操作丢失时从 EventLog 重建。生产代码不再保留
+  `InMemoryConversationMemoryStore`。
+- attempt state 诊断态扩展：`AttemptState` / store 层新增 `STALE`、`RECOVERING`、`LOST`
+  三个诊断态（P8-S1），配合 fencing token CAS 基础。
 
 不得为旧 Host 接口创建兼容 wrapper、facade 或 re-export。
 
@@ -522,6 +562,8 @@ RUNNING -> CANCELLED
 RUNNING -> SUSPENDED
 ```
 
-`STALE / RECOVERING / LOST` 已作为 internal `AttemptState` / store 诊断态落地；完整
-`QUEUED / WAITING / CANCELLING` 主路径治理，以及 supervisor、renew loop、recovery scan
-和 public lifecycle governance 尚未接入。
+`STALE / RECOVERING / LOST` 已作为 internal `AttemptState` / store 诊断态落地（P8-S1）；
+`AttemptSupervisor` 的 lease acquire / renew heartbeat / owner-aware diagnostic close /
+recovery scan / terminal atomic close / attempt-scoped append 已落地（P8-S3 至 P8-S6）。
+完整 `QUEUED / WAITING / CANCELLING` 主路径治理、recovery scan 自动装配到生产启动链路、
+以及 public lifecycle governance 尚未接入。

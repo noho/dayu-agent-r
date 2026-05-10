@@ -78,6 +78,11 @@
   durable store；`startup_reconcile` 在 checkpoint 已追平但 memory 丢失时也会重投
   EventLog 重建 read model 并保持幂等；`tests/host/_memory_store_fake.py` 承载
   legacy 内存 fake 仅供 tests / smoke 使用。
+  P8-S9 smoke 验证已完成：`utils/smoke_host_p8_attempt_lease.py` 覆盖 7 个场景
+  （owner acquire+renew、busy、recovery scan、late write fenced、terminal close、
+  observer reconcile、durable memory recovery），最新提交为
+  `7140a1c host: repair p8 memory recovery smoke`。
+  P8-S10 文档同步与收口为当前 slice。
 
 每个 Phase 进入实现前，必须另写可交接的 phase plan，细化到迁移 Agent 可以直接接手：
 目标、非目标、边界、文件级改动清单、契约变化、状态机、测试清单、验证命令、review gate、
@@ -551,6 +556,15 @@ P16 收口项。
 - `deferred-with-owner: P16`：P8-S3 测试 fake 当前用 `cast(AttemptSupervisor, ...)` 桥接具体类；
   interface freeze 前应评估是否抽 `AttemptSupervisorPort` 这类 Host internal protocol，避免测试替身
   长期依赖具体实现。
+- `completed: P8-S9`：P8 smoke 验证已通过 `utils/smoke_host_p8_attempt_lease.py` 完成，
+  覆盖 owner acquire+renew、busy、recovery scan、late write fenced、terminal close、
+  observer reconcile、durable memory recovery 七个场景。smoke 为手工脚本，不在 pytest 默认集内。
+- `deferred-with-owner: P9 / capacity`：`repair_missing_session_snapshots` 按 session 扫描
+  EventLog 中 canonical 事件重建快照；当 session 数量增长后可能成为全表扫描。P9 或 capacity
+  阶段应评估是否需要索引优化或增量 repair 策略。
+- `deferred-with-owner: issue #38`：慢硬盘 + Docker Linux 下 multiprocessing stress 测试
+  的稳定性和超时边界。当前测试使用 spawn-only + file SQLite，不使用 `time.sleep` 控 race，
+  但慢磁盘环境下的 join 超时强杀行为仍需 #38 跟踪。
 
 P9 实施 `start_run` 幂等时，必须重新讨论并固定 `(session_id, client_request_id)` 如何幂等映射到
 同一个 `run_id`：包括 `run_id` 由 Host 生成还是由持久 Run 创建事实确定、重复请求返回同一
@@ -702,6 +716,19 @@ README 更新遵循 `AGENTS.md`：
 - 除 `tests/README.md` 外，其它 README 默认等迁移结束或对应代码事实落地后再改。
 - 命中 README 触发条件时，必须先判断是否属于该 README 的职责范围。
 - README 只写当前已落地事实，不写未来设计。
+- README 的目标读者是参与开发的人，而不是最终用户、迁移审计读者或源码逐行导读读者。
+  README 应优先写稳定开发认知：接口、架构、边界、执行路径、状态机、事件流、关键原理机制。
+  README 不写过细实现细节、类 / 函数流水账、近期更新流水账，也不把未来 Phase 的设计写成
+  当前事实。
+- `docs/host/design.md` 是 Host 接口与架构边界真源；它应在 README 的抽象层级之上补充少量
+  机制细节和设计取舍，例如关键事务边界、状态转换、恢复路径和不变量，但仍不得展开成源码说明书。
+  若 README 与 `design.md` 都需要更新，README 写开发者稳定口径，`design.md` 写稍细的设计口径，
+  两者必须同向且不能互相矛盾。
+- P8-S10 文档同步与收口必须按上述口径同时复核 Engine 与 Host 文档：`dayu/engine/README.md`
+  只写 Engine 当前接口、Runner / Agent 事件流、取消与诊断边界以及与 Host 的职责切分，不写 Host
+  attempt lease、EventLog、ToolRuntime、Conversation Memory 等治理实现细节；`dayu/host/README.md`
+  只写 Host 当前接口、架构边界、执行路径、状态机、事件流和关键治理机制，不写 P9 lifecycle /
+  admission / public memory API 为当前事实。
 
 `docs/code_review.md` 更新规则：
 

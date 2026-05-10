@@ -41,6 +41,11 @@ pytest tests/host/test_phase3_boundary.py -q
 pytest tests/contracts/test_tool_declaration.py -q
 pytest tests/host/test_phase5_multiturn_no_governance_smoke.py -q
 pytest tests/host/test_phase8_attempt_supervisor.py -q
+pytest tests/host/test_phase8_attempt_fencing.py -q
+pytest tests/host/test_phase8_tool_runtime_fencing.py -q
+pytest tests/host/test_phase8_attempt_recovery.py -q
+pytest tests/host/test_phase8_multiprocess_stress.py -q
+pytest tests/host/test_phase8_durable_memory_recovery.py -q
 pytest tests/engine/contracts -q
 pytest tests/engine/runners/openai/test_event_flow_ordering.py -q
 ```
@@ -251,6 +256,10 @@ Host 当前 Run harness、RunEventStore、ToolRuntime、Conversation Memory / Ru
   roundtrip 无损；(6) 仓库内不再残留 production `InMemoryConversationMemoryStore`。
   legacy 内存 fake 由 `tests/host/_memory_store_fake.py` 提供，仅供 tests / smoke
   使用，生产代码不得依赖。
+- P8 smoke（`utils/smoke_host_p8_attempt_lease.py`）是手工脚本，不在 pytest 默认集内；
+  7 个场景（owner acquire+renew、busy、recovery scan、late write fenced、terminal close、
+  observer reconcile、durable memory recovery）通过 fake clock + deterministic fake worker
+  覆盖。慢硬盘 + Docker Linux stress 测试由 GitHub issue #38 跟踪，不在当前测试集内。
 - public boundary：锁定 `dayu.host.__all__`，允许 Run 级 `start_run`、`stream_run_events`、`get_run_result`，
   以及 P2 Run 级 `get_tool_fetch_more_handle`、`fetch_more_tool_result`，阻止 `EngineWorker`、`LocalProxy`、
   `ToolExecutor`、`InMemoryToolRuntime`、`ToolRuntimeToolExecutor`、`DurableConversationMemoryStore`、

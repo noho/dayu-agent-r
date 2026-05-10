@@ -691,6 +691,19 @@ attempt，不创建新的用户输入事实，也不改变对外 `run_id`。
 - recovery scan 不推进 projection checkpoint，不消费 observer side channel；projection 仍基于
   durable EventLog 的 global position at-least-once 追平。
 
+### 8.4 P8 明确未做的事
+
+P8 落地了 attempt lease / fencing / recovery 的内部机制，但以下事项明确不在 P8 范围内：
+
+- recovery scan 未自动 wire 进 `build_durable_harness` 或 Session 生产启动链路；当前仅为
+  `AttemptSupervisor.recover_stale_attempts` 内部显式入口，调用方需自行决定扫描时机。
+- 未引入 multiprocessing launcher / process supervisor 生产代码；P8-S7 多进程 stress 测试
+  使用 spawn-only 平台 helper，不提供生产级进程管理。
+- 未实现 `QUEUED / WAITING / CANCELLING` 主路径治理；这些状态仍为预留。
+- 未实现 public lifecycle governance（如 run admission、session active run 仲裁）。
+- 未改变 Engine 协议；Engine 仍只看到普通 `RunInput`、`ToolExecutor` 和 `EngineEvent`。
+- 未引入 observer claim / lease；attempt ownership 与 observer ownership 是两个独立状态机。
+
 ## 9. EventLog 与 RunEvent
 
 EventLog 第一阶段就做。EventLog 是 Run 的 append-only 事实账本，不是 EventBus。
@@ -937,6 +950,11 @@ P7 落地后的硬事实：
 - provider secret scrub 仅作用于 `PROVIDER_PROTOCOL_ERROR.raw_payload`（`Authorization` /
   `api_key` / `cookie` / `x-api-key` / `openai-organization` / `anthropic-api-key` 等键替换为 `***`）；
   `scope_token` / `cursor` / prompt / tool result 仍按 OLD 热 / 冷分层保留进 trace，用于真实故障定位。
+
+P8-S2 把 `ObserverSink.process` 从同步升级为 async 调用协议：`ProjectionCoordinator.drain()`
+在同一 HostStorage 事务内 `await observer.process(tx, events)`，sink 写入与 checkpoint 推进
+同生同灭。这不引入 observer claim / lease；observer 仍从 durable EventLog 消费，不读取 attempt
+owner side channel。attempt ownership 与 observer ownership 是两个独立状态机。
 
 ### 9.5 Wait / Suspend 预留契约
 
@@ -1190,7 +1208,8 @@ evidence、timeline、tool cursor 或 compaction。
 - `LocalRunHarness.start_run` 会先 append `USER_INPUT_ACCEPTED`，append 失败时不启动 Engine。
 - Engine 实际消费的 `RunInput` 由 Host 内部 `DefaultRunInputBuilder` 从当前用户输入事件与
   `ConversationMemorySnapshot` 构造，不从 `StartRunRequest.input` 旁路回放用户输入。
-- Host 内部 `InMemoryConversationMemoryStore` 只从已 append canonical RunEvent 投影 session memory；
+- Host 内部 memory store（P3 为 `InMemoryConversationMemoryStore`，P8-S8 起替换为
+  `DurableConversationMemoryStore`）只从已 append canonical RunEvent 投影 session memory；
   preview / reasoning / delta / content completed 不进入 memory pool。
 - Engine terminal 或 Host-owned worker / proxy failure terminal 后，当前 run 的 canonical events 才会投影
   到 memory；失败轮次的用户输入事实和中性 terminal summary 都会进入下一轮 memory。
@@ -1254,8 +1273,11 @@ P3 后执行边界：
   tool trace 可持久重建 `iteration_context_snapshot`。该 fact 只服务 trace / audit / replay 诊断，
   不进入 ConversationMemory projection，不参与下一轮 RunInputBuilder 输入，也不影响 Engine 看到的
   `RunInput.messages`。
-- 当前 `InMemoryConversationMemoryStore` 是单进程、顺序多轮 smoke/test adapter；真实持久 projection、
-  observer checkpoint、多进程恢复与 cross-scope governance 留给后续 phase。
+- P8-S8 起 `build_durable_harness` 默认装配 `DurableConversationMemoryStore`，memory snapshot
+  与 EventLog checkpoint 同事务原子推进；生产代码不再保留 `InMemoryConversationMemoryStore`。
+  tests-only `FakeInMemoryConversationMemoryStore`（位于 `tests/host/_memory_store_fake.py`）
+  仅供测试 / smoke 使用。`startup_reconcile` 在 checkpoint 已 CAUGHT_UP 但 snapshot row
+  因运维误操作丢失时，走 `repair_missing_session_snapshots` 从 EventLog 重建。
 
 P4 当前执行边界 / 设计约束：
 
@@ -1804,7 +1826,8 @@ Conversation Memory / RunInputBuilder 的实现必须满足以下不变量：
 - Host 不 import `dayu.fins`，不理解财报业务规则。
 - Engine 不 import Host memory，不理解 claim、anchor、scope 或 compaction。
 - build trace 不进入模型上下文，不成为下一轮事实真源。
-- in-memory store 只服务最小单进程 smoke，不宣称持久化、多进程或生产正确性。
+- P8-S8 起 production path 使用 `DurableConversationMemoryStore`；tests-only
+  `FakeInMemoryConversationMemoryStore` 只服务最小单进程 smoke，不宣称持久化、多进程或生产正确性。
 
 ## 13. Reply Outbox
 
@@ -1878,7 +1901,8 @@ upsert ReplyOutbox by delivery_key
 以下内容不阻塞当前 Host 核心架构，但进入实现前需要单独设计：
 
 - Steer：active Run 上的追加输入，可后加。
-- Attempt lease / fencing 细节。
+- Attempt lease / fencing 细节（P8-S1 至 P8-S6 已落地 attempt-scoped lease、fencing、terminal atomic
+  close、recovery scan 与 attempt-scoped append；recovery scan 自动装配到生产启动链路仍未落地）。
 - 取消治理增强：watchdog、取消超时升级、强制终止和资源可观测收口，后移 GitHub issue #3。
 - RemoteProxy / RemoteStub wire protocol。
 - ToolRuntime 完整治理面。
