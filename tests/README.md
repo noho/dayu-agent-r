@@ -208,24 +208,21 @@ Host 当前 Run harness、RunEventStore、ToolRuntime、Conversation Memory / Ru
 - P8-S5 ToolRuntime owner fencing（`tests/host/test_phase8_tool_runtime_fencing.py`）：
   覆盖 `ToolRuntimeOwnerScope` ContextVar 安装 / 恢复（含异常路径）、
   `active_tool_runtime_appender` scope 外返回 `None`、`InMemoryToolRuntime._resolve_appender`
-  scope 内返回 `AttemptScopedRunEventAppender` / scope 外退化为 `PlainRunEventAppender`，
-  以及 ToolRuntime fact `run_id` mismatch 命中
+  在 durable 路径 scope 内返回 `AttemptScopedRunEventAppender`，scope 外 fail-fast，
+  非 durable 测试路径才允许 `PlainRunEventAppender`，以及 ToolRuntime fact `run_id` mismatch 命中
   `AttemptFencingError(reason=OWNER_MISMATCH)` 且 EventLog 不残留 fact、错误文本不
-  暴露 owner secret。同时覆盖 P8-S6 补齐的 framework `fetch_more` 端到端 fenced 断言：
-  合法 owner scope 下 `InMemoryToolRuntime.fetch_more` 写入
+  暴露 owner secret。同时覆盖 framework `fetch_more` 作为普通 tool call 的端到端 fenced 断言：
+  合法 owner scope 下 `execute_tool_call` 写入
   `TOOL_FETCH_MORE_REQUESTED` / `TOOL_FETCH_MORE_COMPLETED` facts；cursor 绑定旧 run、
   owner scope 绑定新 run 时端到端命中
   `AttemptFencingError(reason=OWNER_MISMATCH)` 且 EventLog 在两个 run 中均不残留
   fetch_more fact、错误文本不暴露 owner secret。
 - P8-S6 stale / orphan recovery 主路径（`tests/host/test_phase8_attempt_recovery.py`）：
   覆盖 `AttemptSupervisor.recover_stale_attempts` 全部 typed 决策——
-  `RUNNING` lease 过期推到 `MARK_RECOVERING_AND_CREATE_ATTEMPT`（旧 attempt CAS 推
-  `RECOVERING`、新 recovery attempt RUNNING + 严格更大 fencing token +
-  `recovered_from_attempt_id` 链接、旧 owner 再次 `verify_owner` 仍 fenced）；run terminal
-  推到 `MARK_LOST` 不创建恢复 attempt；`CREATED` 孤儿（无 owner / 无 fencing token）推
-  `MARK_LOST`；fencing token 在 scan 与短事务之间被改写时直接调用
-  `mark_recovering_and_create_attempt` 命中 `NOOP_TERMINAL` 安全分支，不创建恢复行也
-  不覆盖旧行；recovery scan 不修改 `host_projection_checkpoints`、不写诊断 RunEvent。
+  `RUNNING` lease 过期与 `CREATED` 孤儿均诊断收口为 `MARK_LOST`，不创建新的
+  RUNNING recovery attempt；run terminal 或 scan 与短事务之间 CAS miss 时返回
+  `NOOP_TERMINAL`，不覆盖旧行；recovery scan 不修改 `host_projection_checkpoints`、
+  不写诊断 RunEvent。
   fake clock 替代真实 ``time.sleep`` 推进 lease 过期。
 - P8-S7 真实多进程 + observer drain 验证（`tests/host/test_phase8_multiprocess_stress.py`）：
   通过 `tests/host/_multiprocess_platform.py` 提供的 spawn-only 多进程平台 helper
@@ -236,9 +233,8 @@ Host 当前 Run harness、RunEventStore、ToolRuntime、Conversation Memory / Ru
   仅命中库内 hash 的胜出, 另一方落 `AttemptFencingError(OWNER_MISMATCH)`,
   EventLog 不残留 stale terminal; (3) 进程 A 拿 lease 后退出, 测试主进程把
   `host_attempts.lease_expires_at` 改成过去时刻, 进程 B `recover_stale_attempts`
-  落地 typed `MARK_RECOVERING_AND_CREATE_ATTEMPT` (新 fencing token 严格更大、
-  `recovered_from_attempt_id` 链接旧 attempt、旧 owner late append fenced、不写
-  诊断 RunEvent); (4) 进程 A 写 user_input + delta + final_answer 但不 drain,
+  落地 typed `MARK_LOST` 诊断收口, 旧 owner late append fenced, 不创建新的
+  RUNNING recovery attempt, 不写诊断 RunEvent; (4) 进程 A 写 user_input + delta + final_answer 但不 drain,
   进程 B `build_durable_harness` + `coordinator.startup_reconcile` 把 memory /
   timeline / audit checkpoint 推到 EventLog tail, 第二次 reconcile 幂等。
   场景 (4) **仅** 验证 EventLog / projection checkpoint / `startup_reconcile`
