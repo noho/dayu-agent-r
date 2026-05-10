@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+from dataclasses import dataclass, field
 from datetime import datetime, timezone
 
 import pytest
@@ -14,6 +15,18 @@ from dayu.host._internal_contracts import (
     ExtendedRunState,
 )
 from dayu.host._run_state_store import AttemptStateStore, RunStateStore
+
+
+@dataclass(slots=True)
+class _FixedClock:
+    """单元测试用固定 UTC clock; 不暴露 advance, 仅提供稳定时间字段。"""
+
+    current: datetime = field(
+        default_factory=lambda: datetime(2026, 5, 9, 12, 0, 0, tzinfo=timezone.utc)
+    )
+
+    def now(self) -> datetime:
+        return self.current
 from dayu.host.contracts import (
     RunEventCursor,
     RunEventDraft,
@@ -102,7 +115,7 @@ async def test_attempt_state_create_and_update() -> None:
 
     storage = HostStorage(database_path=":memory:")
     open_durable_event_store(storage)
-    attempt_store = AttemptStateStore(storage=storage)
+    attempt_store = AttemptStateStore(storage=storage, clock=_FixedClock())
     async with storage.transaction() as tx:
         tx.execute(
             "INSERT INTO host_runs (run_id, session_id, state, created_at, "

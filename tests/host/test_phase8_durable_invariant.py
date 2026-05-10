@@ -170,7 +170,7 @@ def test_durable_rejects_legacy_attempt_state_store() -> None:
     storage = _open_durable_storage()
     try:
         supervisor = _build_supervisor(storage)
-        legacy_store = AttemptStateStore(storage=storage)
+        legacy_store = AttemptStateStore(storage=storage, clock=_FakeClock())
         with pytest.raises(RuntimeError, match="attempt_state_store"):
             LocalRunHarness(
                 is_durable=True,

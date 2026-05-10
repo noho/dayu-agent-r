@@ -216,7 +216,7 @@ def test_host_does_not_export_internal_tool_runtime_implementations() -> None:
 
     exported = frozenset(host.__all__)
     assert "ToolFetchMoreRequest" in exported
-    assert "ToolFetchMoreHandle" in exported
+    assert "ToolFetchMoreHandle" not in exported
     assert "InMemoryToolRuntime" not in exported
     assert "ToolRuntimeToolExecutor" not in exported
     assert "ToolExecutor" not in exported

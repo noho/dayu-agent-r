@@ -127,7 +127,7 @@ async def test_acquire_inserts_running_attempt_with_owner_lease() -> None:
     await _seed_run(storage)
     clock = _FakeClock()
     lease_store = AttemptLeaseStore(storage=storage, clock=clock)
-    state_store = AttemptStateStore(storage=storage)
+    state_store = AttemptStateStore(storage=storage, clock=clock)
     token = AttemptOwnerToken.new()
     expires = _expires_at(clock)
 
@@ -239,7 +239,7 @@ async def test_renew_extends_lease_without_changing_fencing_token() -> None:
     await _seed_run(storage)
     clock = _FakeClock()
     lease_store = AttemptLeaseStore(storage=storage, clock=clock)
-    state_store = AttemptStateStore(storage=storage)
+    state_store = AttemptStateStore(storage=storage, clock=clock)
     token = AttemptOwnerToken.new()
 
     async with storage.transaction() as tx:
@@ -411,7 +411,7 @@ async def test_renew_terminal_when_attempt_terminal_state() -> None:
     await _seed_run(storage)
     clock = _FakeClock()
     lease_store = AttemptLeaseStore(storage=storage, clock=clock)
-    state_store = AttemptStateStore(storage=storage)
+    state_store = AttemptStateStore(storage=storage, clock=clock)
     token = AttemptOwnerToken.new()
 
     async with storage.transaction() as tx:
@@ -544,7 +544,7 @@ async def test_acquire_records_recovered_from_attempt_id() -> None:
     await _seed_run(storage)
     clock = _FakeClock()
     lease_store = AttemptLeaseStore(storage=storage, clock=clock)
-    state_store = AttemptStateStore(storage=storage)
+    state_store = AttemptStateStore(storage=storage, clock=clock)
     token_a = AttemptOwnerToken.new()
     token_b = AttemptOwnerToken.new()
 
@@ -693,4 +693,94 @@ async def test_allocate_fencing_token_fail_fast_when_lastrowid_invalid() -> None
             now=clock.now(),
         )
     assert any("host_fencing_tokens" in sql for sql in stub.captured_sql)
+    storage.close()
+
+
+@pytest.mark.asyncio
+async def test_acquire_new_attempt_busy_when_attempt_index_unique_violation() -> None:
+    """F4: ``UNIQUE(run_id, attempt_index)`` 冲突仍映射为 BUSY。
+
+    第二次 acquire 复用同一 ``(run_id, attempt_index)``, store 应返回
+    ``decision=BUSY`` 而不是抛 IntegrityError; 业务级 BUSY 路径必须保留。
+    """
+
+    storage = _open_storage()
+    await _seed_run(storage)
+    clock = _FakeClock()
+    lease_store = AttemptLeaseStore(storage=storage, clock=clock)
+    token_a = AttemptOwnerToken.new()
+    token_b = AttemptOwnerToken.new()
+
+    async with storage.transaction() as tx:
+        first = lease_store.acquire_new_attempt(
+            tx=tx,
+            attempt_id="a1",
+            run_id="r1",
+            attempt_index=0,
+            recovered_from_attempt_id=None,
+            owner_id="host:1",
+            owner_token=token_a,
+            lease_expires_at=_expires_at(clock),
+        )
+    assert first.decision is AttemptLeaseDecision.ACQUIRED
+
+    async with storage.transaction() as tx:
+        second = lease_store.acquire_new_attempt(
+            tx=tx,
+            attempt_id="a2",
+            run_id="r1",
+            attempt_index=0,
+            recovered_from_attempt_id=None,
+            owner_id="host:2",
+            owner_token=token_b,
+            lease_expires_at=_expires_at(clock),
+        )
+    assert second.decision is AttemptLeaseDecision.BUSY
+    storage.close()
+
+
+@pytest.mark.asyncio
+async def test_acquire_new_attempt_propagates_other_integrity_errors() -> None:
+    """F4: 非 ``(run_id, attempt_index)`` 的 IntegrityError 不能伪装成 BUSY。
+
+    通过 PRIMARY KEY ``attempt_id`` 碰撞触发 IntegrityError: 第一次 acquire
+    成功写入 ``a1``, 第二次以新 ``attempt_index`` 但相同 ``attempt_id`` 再
+    次 acquire, 应直接透传 IntegrityError, 不被 ``_is_attempt_index_unique_violation``
+    误判为 BUSY。
+    """
+
+    import sqlite3 as _sqlite3
+
+    storage = _open_storage()
+    await _seed_run(storage)
+    clock = _FakeClock()
+    lease_store = AttemptLeaseStore(storage=storage, clock=clock)
+    token_a = AttemptOwnerToken.new()
+    token_b = AttemptOwnerToken.new()
+
+    async with storage.transaction() as tx:
+        first = lease_store.acquire_new_attempt(
+            tx=tx,
+            attempt_id="dup-pk",
+            run_id="r1",
+            attempt_index=0,
+            recovered_from_attempt_id=None,
+            owner_id="host:1",
+            owner_token=token_a,
+            lease_expires_at=_expires_at(clock),
+        )
+    assert first.decision is AttemptLeaseDecision.ACQUIRED
+
+    with pytest.raises(_sqlite3.IntegrityError):
+        async with storage.transaction() as tx:
+            lease_store.acquire_new_attempt(
+                tx=tx,
+                attempt_id="dup-pk",
+                run_id="r1",
+                attempt_index=1,
+                recovered_from_attempt_id=None,
+                owner_id="host:2",
+                owner_token=token_b,
+                lease_expires_at=_expires_at(clock),
+            )
     storage.close()

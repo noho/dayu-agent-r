@@ -3,7 +3,8 @@
 from __future__ import annotations
 
 import asyncio
-from collections.abc import AsyncIterator
+from collections.abc import AsyncGenerator, AsyncIterator
+from contextlib import asynccontextmanager
 from dataclasses import dataclass, field, replace
 from datetime import datetime, timezone
 
@@ -31,6 +32,12 @@ from dayu.engine import (
     ToolResultAcceptedData,
     UserMessage,
 )
+from dayu.host._attempt_lease import (
+    AttemptFencingError,
+    AttemptFencingReason,
+    AttemptOwnerContext,
+)
+from dayu.host._attempt_supervisor import AttemptSupervisor
 from dayu.host._conversation_memory import (
     AssumptionRegister,
     ConversationMemoryPatch,
@@ -46,14 +53,20 @@ from dayu.host._conversation_memory import (
     TaskFrame,
     UserPreferenceProfileRef,
 )
-from dayu.host._run_harness import LocalRunHarness
-from tests.host._memory_store_fake import FakeInMemoryConversationMemoryStore
+from dayu.host._durable_event_store import DurableRunEventStore
+from dayu.host._durable_harness import (
+    DurableHarnessConfig,
+    build_durable_harness,
+)
 from dayu.host._event_store import InMemoryRunEventStore, RunEventStore
+from dayu.host._internal_contracts import AttemptState
+from dayu.host._run_harness import LocalRunHarness
 from dayu.host.contracts import (
     ContextCompactFailureReason,
     HostContextCompactCompletedData,
     HostContextCompactFailedData,
     HostContextAttemptRetryData,
+    HostRunFailedData,
     RunEvent,
     RunEventCursor,
     RunEventDraft,
@@ -69,6 +82,7 @@ from dayu.host.contracts import (
     ToolResultTruncatedData,
     ToolValueSizeSummary,
 )
+from tests.host._memory_store_fake import FakeInMemoryConversationMemoryStore
 
 
 def _utc_now() -> datetime:
@@ -1037,3 +1051,163 @@ async def test_start_run_rejects_non_current_user_shapes(
 
     with pytest.raises(ValueError, match=expected_error):
         await harness.start_run(_request(messages=messages))
+
+
+@pytest.mark.asyncio
+async def test_durable_overflow_retry_acquire_failure_writes_owner_scoped_terminal(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """F5 root cause: durable 路径下 retry 新 attempt acquire 失败必须 owner-scoped terminal 收口。
+
+    构造 durable harness + ``AttemptSupervisor`` + 真实
+    ``DurableRunEventStore``, 触发一次 context overflow compact, 然后
+    monkeypatch 让第二次 ``AttemptSupervisor.lease_context`` (即新
+    attempt acquire) 抛 :class:`AttemptFencingError`, 验证:
+
+    1. EventLog 中存在 Host-owned ``RUN_FAILED`` terminal RunEvent
+       (``error_code=context_overflow_retry_acquire_failed``);
+    2. 旧 attempt 的 ``terminal_event_position`` 已被 supervisor 在同一
+       事务内写入(证明走 owner-scoped 原子终态路径,
+       :class:`AttemptSupervisor.append_terminal_and_close`), 不是裸
+       ``event_store.append`` (后者无法回填 ``terminal_event_position``);
+    3. 旧 attempt 不残留 ``STALE`` 收口, 而是终态 ``FAILED``;
+    4. 没有第二个 attempt 残留 (acquire 失败前 supervisor 没有写入新
+       ``host_attempts`` 行);
+    5. RunStream 订阅方收到该 terminal RunEvent 并自然结束;
+    6. ``get_run_result`` 返回 :class:`RunFailedResult`。
+    """
+
+    proxy = _OverflowThenSuccessProxy()
+    bundle = build_durable_harness(
+        config=DurableHarnessConfig(database_path=":memory:"),
+        proxy=proxy,
+    )
+    try:
+        original_lease_context = AttemptSupervisor.lease_context
+        call_count = {"n": 0}
+
+        @asynccontextmanager
+        async def _patched_lease_context(
+            self: AttemptSupervisor,
+            *,
+            run_id: str,
+            attempt_index: int,
+            recovered_from_attempt_id: str | None = None,
+        ) -> AsyncGenerator[AttemptOwnerContext, None]:
+            call_count["n"] += 1
+            if call_count["n"] >= 2:
+                raise AttemptFencingError(
+                    attempt_id=f"attempt-{run_id}-{attempt_index}",
+                    run_id=run_id,
+                    reason=AttemptFencingReason.STORAGE_CONFLICT,
+                    current_state=None,
+                    owner_id=None,
+                    fencing_token=None,
+                )
+            async with original_lease_context(
+                self,
+                run_id=run_id,
+                attempt_index=attempt_index,
+                recovered_from_attempt_id=recovered_from_attempt_id,
+            ) as owner_context:
+                yield owner_context
+
+        monkeypatch.setattr(
+            AttemptSupervisor,
+            "lease_context",
+            _patched_lease_context,
+        )
+
+        # 旁路验证: 监控 ``DurableRunEventStore.append`` 是否被裸调用
+        # 写入 terminal RunEvent。owner-scoped 路径下的 terminal append
+        # 经由 supervisor 在事务内写, **不**走该 public ``append`` 方法。
+        original_append = DurableRunEventStore.append
+        bare_terminal_append_calls: list[str] = []
+
+        async def _spy_append(
+            self: DurableRunEventStore,
+            draft: RunEventDraft,
+        ) -> RunEvent:
+            if draft.type is RunEventType.RUN_FAILED:
+                bare_terminal_append_calls.append(draft.run_id)
+            return await original_append(self, draft)
+
+        monkeypatch.setattr(
+            DurableRunEventStore,
+            "append",
+            _spy_append,
+        )
+
+        projected = asyncio.Event()
+        original_project_terminal_run = LocalRunHarness._project_terminal_run
+
+        async def _patched_project_terminal_run(
+            self: LocalRunHarness,
+            run_id: str,
+        ) -> None:
+            try:
+                await original_project_terminal_run(self, run_id)
+            finally:
+                projected.set()
+
+        monkeypatch.setattr(
+            LocalRunHarness,
+            "_project_terminal_run",
+            _patched_project_terminal_run,
+        )
+
+        request = _request()
+        stream = await bundle.harness.start_run(request)
+
+        events = await asyncio.wait_for(
+            _collect(stream.events), timeout=5.0
+        )
+        await asyncio.wait_for(projected.wait(), timeout=5.0)
+
+        # (1) RunStream 收到 terminal event。
+        terminal_events = [
+            event
+            for event in events
+            if event.type is RunEventType.RUN_FAILED
+            and isinstance(event.data, HostRunFailedData)
+            and event.data.error_code
+            == "context_overflow_retry_acquire_failed"
+        ]
+        assert len(terminal_events) == 1, (
+            f"expect single overflow-retry-acquire-failed terminal, "
+            f"got types={[e.type for e in events]}"
+        )
+
+        # (2) 旧 attempt 终态 FAILED 且 terminal_event_position 已被
+        # supervisor 在事务内写入 (owner-scoped 原子路径独有特征)。
+        attempts = bundle.attempt_state_store.list_for_run(request.run_id)
+        assert len(attempts) == 1, (
+            f"acquire 失败前 supervisor 不应写入第二个 host_attempts 行, "
+            f"实际 attempts={attempts}"
+        )
+        old_attempt = attempts[0]
+        assert old_attempt.state is AttemptState.FAILED
+        assert old_attempt.terminal_event_position is not None, (
+            "owner-scoped append_terminal_and_close 必须在同事务内回填 "
+            "terminal_event_position; None 说明走了裸 event_store.append"
+        )
+
+        # (3) DurableRunEventStore.append 未被用于写 terminal RunEvent
+        # (owner-scoped 路径不经过该 public 方法)。
+        assert bare_terminal_append_calls == [], (
+            f"terminal RunEvent 必须由 supervisor 在事务内 append, 不能"
+            f"经由裸 event_store.append; 命中: {bare_terminal_append_calls}"
+        )
+
+        # (4) get_run_result 推导出 RunFailedResult。
+        result = await bundle.harness.get_run_result(request.run_id)
+        assert isinstance(result, RunFailedResult)
+
+        # (5) compact 已成功完成 (CONTEXT_COMPACT_COMPLETED 已 append),
+        # 即异常发生在 compact 之后、retry 边界之内。
+        assert any(
+            isinstance(event.data, HostContextCompactCompletedData)
+            for event in events
+        )
+    finally:
+        bundle.close()

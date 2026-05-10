@@ -391,7 +391,15 @@ class DurableRunEventStore:
         """
 
         _validate_draft_provenance(draft)
-        return self._append_in_transaction(tx=tx, draft=draft)
+        appended = self._append_in_transaction(tx=tx, draft=draft)
+        # supervisor 在同事务内 append terminal RunEvent + close attempt,
+        # 之后不会再有任何 notify-hooked append 推进 ``_condition``;
+        # 必须在 commit 后唤醒订阅者, 否则 RunStream subscribe 永远 wait,
+        # 上层无法收到 terminal event。注: ``add_post_commit_hook`` 幂等地
+        # 追加 hook, 多次 register 也只会在 commit 后多触发一次 ``notify_all``,
+        # 不影响正确性。
+        tx.add_post_commit_hook(self._make_notify_hook())
+        return appended
 
     def _upsert_run_state(
         self,

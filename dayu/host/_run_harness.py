@@ -138,6 +138,9 @@ _ERROR_ENGINE_STREAM_ENDED_WITHOUT_TERMINAL: str = (
     "engine_stream_ended_without_terminal"
 )
 _ERROR_ATTEMPT_LEASE_LOST: str = "attempt_lease_lost"
+_ERROR_CONTEXT_OVERFLOW_RETRY_ACQUIRE_FAILED: str = (
+    "context_overflow_retry_acquire_failed"
+)
 _RUN_INPUT_TRACE_CACHE_LIMIT: int = 32
 _RUN_INPUT_MESSAGE_CACHE_LIMIT: int = 3
 _CONTEXT_COMPACT_RETRY_LIMIT: int = 1
@@ -930,9 +933,49 @@ class LocalRunHarness:
                                 current_active_attempt = None
                                 return
                             next_request, compact_trace = next_request_with_trace
-                            # 当前 attempt 因 context overflow 关闭,准备启动下一
-                            # attempt: 旧 attempt 状态推进为 STALE,
-                            # 然后为新 attempt 创建持久记录。
+                            # F5 root cause: 必须 (1) 先 acquire 新 attempt,
+                            # 成功后再把旧 attempt 收口到 STALE; (2) acquire
+                            # 失败时旧 attempt 仍持有有效 owner, 必须沿旧
+                            # owner-scoped 路径写入 Host-owned ``RUN_FAILED``
+                            # terminal RunEvent (走 :meth:`_append_terminal_and_close`
+                            # 同事务原子路径), 不能裸 ``event_store.append``,
+                            # 否则 RunStream 永远收不到 terminal, RunResult
+                            # 也无法推导, Run 残留无 terminal 的 STALE 收口。
+                            new_attempt_index = attempt_index + 1
+                            try:
+                                new_active_attempt = (
+                                    await self._begin_attempt_if_durable(
+                                        request=next_request,
+                                        attempt_index=new_attempt_index,
+                                    )
+                                )
+                            except Exception as acquire_exc:
+                                terminal_seen = (
+                                    await self._append_overflow_acquire_failure_terminal(
+                                        request=attempt_request,
+                                        active_attempt=current_active_attempt,
+                                        attempt_index=attempt_index,
+                                        new_attempt_index=new_attempt_index,
+                                        error=acquire_exc,
+                                    )
+                                )
+                                # _append_terminal_and_close 已经把旧
+                                # attempt 推进到终态并 close lease_exit_stack;
+                                # 把 current_active_attempt 置 None 防止
+                                # 上层 finally 二次 close。非 supervisor 路径
+                                # 下旧 attempt 由上层 finally 走
+                                # _finish_attempt_if_durable(state=FAILED)
+                                # 推进 host_attempts。
+                                if (
+                                    current_active_attempt is not None
+                                    and self._can_atomic_terminal_close(
+                                        current_active_attempt
+                                    )
+                                ):
+                                    current_active_attempt = None
+                                return
+                            # 新 attempt 成功 acquire 后再关闭旧 attempt; 此时
+                            # 切换 owner 视角不再可逆。
                             await self._finish_attempt_if_durable(
                                 active_attempt=current_active_attempt,
                                 terminal_event=None,
@@ -940,13 +983,8 @@ class LocalRunHarness:
                                 failure_summary="context_overflow_compacted",
                             )
                             attempt_request = next_request
-                            attempt_index += 1
-                            current_active_attempt = (
-                                await self._begin_attempt_if_durable(
-                                    request=attempt_request,
-                                    attempt_index=attempt_index,
-                                )
-                            )
+                            attempt_index = new_attempt_index
+                            current_active_attempt = new_active_attempt
                             await self._append_run_input_context_snapshot_fact(
                                 request=attempt_request,
                                 build_trace=compact_trace,
@@ -1384,6 +1422,77 @@ class LocalRunHarness:
             compacted_input=compacted_input,
             after_token_estimate=completed_data.after_token_estimate,
         )
+
+    async def _append_overflow_acquire_failure_terminal(
+        self,
+        *,
+        request: StartRunRequest,
+        active_attempt: "_ActiveAttempt | None",
+        attempt_index: int,
+        new_attempt_index: int,
+        error: Exception,
+    ) -> bool:
+        """context overflow retry 路径下, 新 attempt acquire 失败时的 terminal 收口。
+
+        语义: compact 已成功产出新 ``RunInputBuildTrace``, 但取得新
+        attempt owner CAS 失败 (:class:`AttemptFencingError` / SQLite
+        IntegrityError 等)。此时 *旧* attempt 的 owner 仍然有效, 必须沿
+        旧 attempt 的 owner-scoped 路径写入 Host-owned ``RUN_FAILED``
+        terminal RunEvent, 让 RunStream 正常收口、RunResult 可推导;
+        本方法**绝不**走裸 ``event_store.append``, 也不引入 unscoped
+        Host failure append。
+
+        - ``_can_atomic_terminal_close=True`` (durable + supervisor):
+          调用 :meth:`_append_terminal_and_close`, 在单一事务内完成
+          ``verify_owner`` + terminal RunEvent append + 旧 attempt 终态
+          ``close`` (含 ``terminal_event_position``); ``lease_exit_stack``
+          也会在事务成功后关闭, 上层 finally 不再重复 close。
+        - 非 supervisor 路径 (legacy + ``is_durable=False``): 通过
+          :meth:`_resolve_attempt_appender` 取出当前 attempt 的 fencing-
+          aware appender (legacy non-durable 退化为
+          :class:`PlainRunEventAppender`) 写入 terminal RunEvent, 再由
+          上层 finally 经 :meth:`_finish_attempt_if_durable` 推进
+          ``host_attempts`` 终态。
+
+        :param request: 旧 attempt 请求 (acquire 失败时新 attempt 已经无
+            owner, 必须用旧 attempt 的 session/run 标识)。
+        :param active_attempt: 旧 attempt 句柄, 必须仍持有有效 owner。
+        :param attempt_index: 旧 attempt 序号 (诊断字段)。
+        :param new_attempt_index: 计划中的新 attempt 序号 (诊断字段)。
+        :param error: acquire 失败的根因异常。
+        :returns: 已写入 terminal 时返回 ``True``。
+        :raises Exception: terminal 写入或 supervisor close 失败时透传。
+        """
+
+        _LOGGER.error(
+            "host.run.context_overflow_retry_acquire_failed "
+            "session_id=%s run_id=%s old_attempt_index=%s "
+            "new_attempt_index=%s exc_type=%s",
+            request.session_id,
+            request.run_id,
+            attempt_index,
+            new_attempt_index,
+            type(error).__name__,
+            exc_info=(type(error), error, error.__traceback__),
+        )
+        draft = host_failure_draft(
+            run_id=request.run_id,
+            session_id=request.session_id,
+            occurred_at=datetime.now(tz=timezone.utc),
+            error=RuntimeError(_ERROR_CONTEXT_OVERFLOW_RETRY_ACQUIRE_FAILED),
+            error_code=_ERROR_CONTEXT_OVERFLOW_RETRY_ACQUIRE_FAILED,
+        )
+        if active_attempt is not None and self._can_atomic_terminal_close(
+            active_attempt
+        ):
+            stored_event = await self._append_terminal_and_close(
+                active_attempt=active_attempt,
+                draft=draft,
+            )
+            return terminal_result_from_event(stored_event) is not None
+        appender = self._resolve_attempt_appender(active_attempt)
+        stored_event = await appender.append(draft)
+        return terminal_result_from_event(stored_event) is not None
 
     async def _append_compact_exception_failure(
         self,

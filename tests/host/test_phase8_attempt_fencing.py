@@ -194,7 +194,7 @@ async def test_append_terminal_and_close_writes_position_atomically() -> None:
         await _seed_run(storage)
         clock = _FakeClock()
         supervisor = _build_supervisor(storage=storage, clock=clock)
-        attempt_state_store = AttemptStateStore(storage=storage)
+        attempt_state_store = AttemptStateStore(storage=storage, clock=clock)
         run_state_store = RunStateStore(storage=storage)
         async with supervisor.lease_context(
             run_id="r1", attempt_index=0
@@ -268,7 +268,7 @@ async def test_append_terminal_and_close_rolls_back_when_owner_fenced() -> None:
         await _seed_run(storage)
         clock = _FakeClock()
         supervisor = _build_supervisor(storage=storage, clock=clock)
-        attempt_state_store = AttemptStateStore(storage=storage)
+        attempt_state_store = AttemptStateStore(storage=storage, clock=clock)
         async with supervisor.lease_context(
             run_id="r1", attempt_index=0
         ) as owner_context:
@@ -593,5 +593,195 @@ async def test_scoped_appender_appends_when_owner_active() -> None:
             )
             assert len(events) == 1
             assert events[0].source_engine_event_id == "engine_preview_ok"
+    finally:
+        storage.close()
+
+
+@pytest.mark.asyncio
+async def test_append_in_transaction_appends_within_outer_transaction() -> None:
+    """``append_in_transaction``: 外层事务内 owner 仍 active 时正常 append。
+
+    生产路径 ``LocalRunHarness._resolve_attempt_appender`` 在 harness 持
+    有外层事务时调用此方法, 测试必须证明 verify_owner +
+    append_with_position 在同事务内串联成功。
+    """
+
+    storage = _open_storage()
+    try:
+        await _seed_run(storage)
+        clock = _FakeClock()
+        supervisor = _build_supervisor(storage=storage, clock=clock)
+        async with supervisor.lease_context(
+            run_id="r1", attempt_index=0
+        ) as owner_context:
+            appender = supervisor.scoped_appender(owner_context)
+            async with storage.transaction() as tx:
+                event = appender.append_in_transaction(
+                    tx=tx,
+                    draft=_engine_event_draft(
+                        run_id="r1", engine_event_id="engine_in_tx_ok"
+                    ),
+                )
+            assert event.type == RunEventType.ITERATION_STARTED
+            events = await supervisor.event_store.list_events(
+                run_id="r1", after=None
+            )
+            assert len(events) == 1
+            assert events[0].source_engine_event_id == "engine_in_tx_ok"
+    finally:
+        storage.close()
+
+
+@pytest.mark.asyncio
+async def test_append_in_transaction_rolls_back_when_owner_fenced() -> None:
+    """``append_in_transaction``: owner 被外部替换后 verify_owner 必 CAS miss。
+
+    在外层事务前先把 owner_token_hash + fencing_token 改成不同值, 进入
+    外层事务后 ``append_in_transaction`` 调用 ``verify_owner`` 应抛
+    :class:`AttemptFencingError`, 整事务回滚: EventLog 不残留 RunEvent。
+    """
+
+    storage = _open_storage()
+    try:
+        await _seed_run(storage)
+        clock = _FakeClock()
+        supervisor = _build_supervisor(storage=storage, clock=clock)
+        async with supervisor.lease_context(
+            run_id="r1", attempt_index=0
+        ) as owner_context:
+            appender = supervisor.scoped_appender(owner_context)
+            other_owner_token = AttemptOwnerToken.new()
+            async with storage.transaction() as tx:
+                tx.execute(
+                    "UPDATE host_attempts SET owner_token_hash = ?, "
+                    "fencing_token = ? WHERE attempt_id = ?",
+                    (
+                        other_owner_token.digest(),
+                        owner_context.fencing_token.value + 7000,
+                        owner_context.attempt_id,
+                    ),
+                )
+            with pytest.raises(AttemptFencingError) as excinfo:
+                async with storage.transaction() as tx:
+                    appender.append_in_transaction(
+                        tx=tx,
+                        draft=_engine_event_draft(
+                            run_id="r1",
+                            engine_event_id="engine_in_tx_fenced",
+                        ),
+                    )
+            assert excinfo.value.reason in (
+                AttemptFencingReason.OWNER_MISMATCH,
+                AttemptFencingReason.FENCING_TOKEN_MISMATCH,
+            )
+            events = await supervisor.event_store.list_events(
+                run_id="r1", after=None
+            )
+            assert events == ()
+            assert owner_context.owner_token.value not in str(excinfo.value)
+    finally:
+        storage.close()
+
+
+@pytest.mark.asyncio
+async def test_append_in_transaction_rejects_run_id_mismatch() -> None:
+    """``append_in_transaction``: draft.run_id 与 owner 不一致抛 OWNER_MISMATCH。
+
+    与 ``append`` 路径保持一致的 typed reason, 不允许跨 run 借助同事务旁
+    路 fencing。
+    """
+
+    storage = _open_storage()
+    try:
+        await _seed_run(storage)
+        clock = _FakeClock()
+        supervisor = _build_supervisor(storage=storage, clock=clock)
+        async with supervisor.lease_context(
+            run_id="r1", attempt_index=0
+        ) as owner_context:
+            appender = supervisor.scoped_appender(owner_context)
+            mismatch = _engine_event_draft(
+                run_id="other_run",
+                engine_event_id="engine_in_tx_other_run",
+            )
+            with pytest.raises(AttemptFencingError) as excinfo:
+                async with storage.transaction() as tx:
+                    appender.append_in_transaction(tx=tx, draft=mismatch)
+            assert excinfo.value.reason == AttemptFencingReason.OWNER_MISMATCH
+            events = await supervisor.event_store.list_events(
+                run_id="r1", after=None
+            )
+            assert events == ()
+            other_events = await supervisor.event_store.list_events(
+                run_id="other_run", after=None
+            )
+            assert other_events == ()
+    finally:
+        storage.close()
+
+
+@pytest.mark.asyncio
+async def test_append_in_transaction_rejects_terminal_drafts() -> None:
+    """``append_in_transaction``: terminal RunEventType 必抛 ValueError。
+
+    terminal RunEvent 必须走 ``append_terminal_and_close``, 否则 attempt
+    close 与 terminal append 失去原子性。
+    """
+
+    storage = _open_storage()
+    try:
+        await _seed_run(storage)
+        clock = _FakeClock()
+        supervisor = _build_supervisor(storage=storage, clock=clock)
+        async with supervisor.lease_context(
+            run_id="r1", attempt_index=0
+        ) as owner_context:
+            appender = supervisor.scoped_appender(owner_context)
+            with pytest.raises(ValueError):
+                async with storage.transaction() as tx:
+                    appender.append_in_transaction(
+                        tx=tx,
+                        draft=_final_answer_draft(run_id="r1"),
+                    )
+            events = await supervisor.event_store.list_events(
+                run_id="r1", after=None
+            )
+            assert events == ()
+    finally:
+        storage.close()
+
+
+@pytest.mark.asyncio
+async def test_update_state_owner_aware_uses_injected_clock_for_finished_at() -> None:
+    """F2: ``update_state_owner_aware`` 写入 ``finished_at`` 必使用注入 clock。
+
+    fake clock 推到一个区分系统墙钟的固定时刻, owner-aware 诊断 close 后
+    断言 ``finished_at`` 与 ``clock.now()`` 完全一致, 不会落到真实墙钟。
+    """
+
+    storage = _open_storage()
+    try:
+        await _seed_run(storage)
+        clock = _FakeClock()
+        supervisor = _build_supervisor(storage=storage, clock=clock)
+        attempt_state_store = AttemptStateStore(storage=storage, clock=clock)
+        async with supervisor.lease_context(
+            run_id="r1", attempt_index=0
+        ) as owner_context:
+            clock.advance(timedelta(seconds=7))
+            target_finished_at = clock.now()
+            async with storage.transaction() as tx:
+                updated = supervisor.lease_store.update_state_owner_aware(
+                    tx=tx,
+                    owner_context=owner_context,
+                    state=AttemptState.STALE,
+                    failure_summary="diagnostic_close",
+                    terminal_event_position=None,
+                )
+            assert updated is True
+        attempt = attempt_state_store.get(owner_context.attempt_id)
+        assert attempt is not None
+        assert attempt.state is AttemptState.STALE
+        assert attempt.finished_at == target_finished_at
     finally:
         storage.close()

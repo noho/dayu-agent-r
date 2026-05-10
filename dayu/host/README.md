@@ -10,7 +10,7 @@ Phase 流程、review 过程或 PR 流程。
 公共 tool declaration 契约，以及 P8 attempt lease / fencing / recovery / terminal atomic close /
 attempt-scoped append / durable memory：
 
-- 包根只暴露 Run 级契约与 fetch_more 协议契约 (`ToolFetchMoreRequest` / `ToolFetchMoreHandle` 等)；
+- 包根只暴露 Run 级契约与 fetch_more 协议契约 (`ToolFetchMoreRequest` 等)；
   Run 生命周期与 fetch_more 操作必须经由 `LocalRunHarness` / `build_durable_harness()` 装配后的
   实例方法（`harness.start_run` / `harness.stream_run_events` / `harness.get_run_result`）调用，
   framework `fetch_more` 工具调用经 `ToolRuntimeToolExecutor -> InMemoryToolRuntime.execute_tool_call`。
@@ -232,10 +232,8 @@ P8 已落地：
 - ToolRuntime fact data：`ToolResultTruncatedData`、`ToolCursorIssuedData`、`ToolFetchMoreRequestedData`、
   `ToolFetchMoreCompletedData`、`ToolFetchMoreFailedData`、`ToolCursorExpiredData`、`ToolCursorDeniedData`、
   `ToolRuntimeEventData`、`ToolValueSizeSummary`。
-- Tool fetch_more 契约：`ToolRuntimeCursor`、`ToolFetchMoreHandleRequest`、`ToolFetchMoreHandle`、
-  `ToolFetchMoreHandleResult`、`ToolFetchMoreHandleSucceededResult`、`ToolFetchMoreHandleFailedResult`、
-  `ToolFetchMoreRequest`、`ToolFetchMoreResult`、`ToolFetchMoreSucceededResult`、
-  `ToolFetchMoreFailedResult`。
+- Tool fetch_more 契约：`ToolRuntimeCursor`、`ToolFetchMoreRequest`、`ToolFetchMoreResult`、
+  `ToolFetchMoreSucceededResult`、`ToolFetchMoreFailedResult`。
 - Run 终态结果类型：`RunResult`、`RunSucceededResult`、`RunFailedResult`、`RunCancelledResult`、`RunSuspendedResult`。
 - Host context compact 事实类型：`HostContextOverflowObservedData`、`HostContextCompactRequestedData`、
   `HostContextCompactCompletedData`、`HostContextCompactFailedData`、`HostContextAttemptRetryData`、

@@ -366,11 +366,11 @@ class DurableConversationMemoryStore:
     def _has_terminal_event(
         self, events: tuple[RunEvent, ...]
     ) -> bool:
-        """判断事件元组是否含 terminal 事件（session 已落定）。
+        """判断事件元组是否含 terminal 事件 (session 已落定)。
 
-        当前实现把 ``TERMINAL_RUN_EVENT_TYPES`` 视为”session 已落定的完整
-        事实”信号；仅 ``USER_INPUT_ACCEPTED`` 单独存在视为”session 仍在
-        进行”，不重建 snapshot 以避免写入”半成品” read model。
+        ``TERMINAL_RUN_EVENT_TYPES`` 是唯一证明 session 已落定的信号; 只
+        有命中 terminal 事件 repair 才会重建 snapshot, 否则视为 session
+        仍在进行, 不写入半成品 read model。
 
         :param events: canonical RunEvent 元组。
         :returns: 含 terminal 事件时返回 ``True``。

@@ -246,7 +246,7 @@ def build_durable_harness(
         event_store=event_store,
     )
     run_state_store = RunStateStore(storage=storage)
-    attempt_state_store = AttemptStateStore(storage=storage)
+    attempt_state_store = AttemptStateStore(storage=storage, clock=actual_clock)
     attempt_lease_store = AttemptLeaseStore(
         storage=storage, clock=actual_clock
     )

@@ -16,7 +16,7 @@ from __future__ import annotations
 import json
 import sqlite3
 from dataclasses import dataclass
-from datetime import datetime, timezone
+from datetime import datetime
 
 from dayu.contracts import JsonValue
 from dayu.engine import FinishReason, RunResumeHint
@@ -89,6 +89,39 @@ _ATTEMPT_SELECT_COLUMNS: str = (
 
 _FENCING_TOKEN_RESOURCE_TYPE_ATTEMPT: str = "attempt"
 """``host_fencing_tokens.resource_type`` 用于 attempt owner lease。"""
+
+
+_ATTEMPT_INDEX_UNIQUE_CONSTRAINT_MARKERS: tuple[str, ...] = (
+    "host_attempts.run_id, host_attempts.attempt_index",
+    "host_attempts.attempt_index, host_attempts.run_id",
+)
+"""SQLite ``UNIQUE(run_id, attempt_index)`` 冲突的命名 constraint marker。
+
+SQLite 在 ``IntegrityError`` 消息里携带涉及的 constraint 列名 (例如
+``UNIQUE constraint failed: host_attempts.run_id, host_attempts.attempt_index``);
+acquire 路径只接受 ``(run_id, attempt_index)`` 业务级冲突映射为 BUSY,
+其它 ``IntegrityError`` (PRIMARY KEY 碰撞 / 其它 schema 约束) 必须透
+传, 避免被伪装成 BUSY 后让上层走错收口路径。这里用集中的 marker 元组
+代替散落在业务逻辑里的字面量字符串, 便于审计与测试覆盖。"""
+
+
+def _is_attempt_index_unique_violation(exc: sqlite3.IntegrityError) -> bool:
+    """判断 ``IntegrityError`` 是否由 ``UNIQUE(run_id, attempt_index)`` 触发。
+
+    通过 SQLite 错误消息中的 constraint 列描述匹配。其它
+    ``IntegrityError`` (例如 PRIMARY KEY ``attempt_id`` 碰撞) 不属于业务
+    级 BUSY 语义, 必须透传给调用方。
+
+    :param exc: SQLite 抛出的 :class:`sqlite3.IntegrityError`。
+    :returns: 是 ``(run_id, attempt_index)`` UNIQUE 冲突时返回 ``True``。
+    :raises Exception: 不主动抛出异常。
+    """
+
+    message = str(exc)
+    return any(
+        marker in message
+        for marker in _ATTEMPT_INDEX_UNIQUE_CONSTRAINT_MARKERS
+    )
 
 
 _RECOVERY_REASON_LEASE_EXPIRED: str = "recovery_lease_expired"
@@ -216,10 +249,20 @@ class RunStateStore:
 class AttemptStateStore:
     """Attempt minimal state durable 查询/写入入口。
 
+    本 store 只承载 P6 legacy 非 owner-aware 路径 (``is_durable=False`` 或
+    显式的 P6 兼容测试场景), 不参与 P8 fencing CAS。但 ``started_at`` /
+    ``finished_at`` 时间戳必须与 fencing 路径共用同一注入时间源, 以保证
+    `_FakeClock` 之类的可注入 clock 在 legacy 测试场景下也能稳定断言时间
+    字段。clock 的注入是 strict requirement, 不允许通过 ``datetime.now``
+    退化成隐式系统墙钟。
+
     :param storage: 共享 :class:`HostStorage`。
+    :param clock: 注入的 UTC clock; 用于生成 ``started_at`` 与诊断/终态
+        ``finished_at``。
     """
 
     storage: HostStorage
+    clock: UtcClock
 
     def create(
         self,
@@ -239,7 +282,7 @@ class AttemptStateStore:
         :raises sqlite3.DatabaseError: 写入失败时抛出。
         """
 
-        now = datetime.now(tz=timezone.utc)
+        now = self.clock.now()
         tx.execute(
             """
             INSERT INTO host_attempts (
@@ -304,7 +347,7 @@ class AttemptStateStore:
         """
 
         finished_at_iso = (
-            datetime.now(tz=timezone.utc).isoformat()
+            self.clock.now().isoformat()
             if state in _ATTEMPT_FINISHED_STATES
             else None
         )
@@ -416,6 +459,11 @@ class AttemptLeaseStore:
         到复用旧 attempt（recovery 必须使用新的 ``attempt_index`` /
         ``attempt_id`` 并重新分配 fencing token）。
 
+        其它 :class:`sqlite3.IntegrityError` (例如 PRIMARY KEY
+        ``attempt_id`` 碰撞或将来新增的 schema 约束) 不属于 BUSY 业务语
+        义, 直接透传给调用方, 避免被伪装成 ``(run_id, attempt_index)``
+        冲突导致诊断 payload 描述到错误的 attempt 行。
+
         :param tx: 当前事务。
         :param attempt_id: 新 attempt id。
         :param run_id: Run id。
@@ -467,7 +515,12 @@ class AttemptLeaseStore:
                     recovered_from_attempt_id,
                 ),
             )
-        except sqlite3.IntegrityError:
+        except sqlite3.IntegrityError as exc:
+            if not _is_attempt_index_unique_violation(exc):
+                # 非预期 IntegrityError (例如 PRIMARY KEY ``attempt_id``
+                # 碰撞或新增 schema 约束) 不属于 BUSY 业务语义, 透传给
+                # 上层, 避免诊断 payload 描述错误的 attempt 行。
+                raise
             # fencing token 已经分配给冲突的 acquire 失败路径；按设计
             # 允许 token gap，不回收、不复用。
             return self._build_busy_result(
@@ -596,7 +649,7 @@ class AttemptLeaseStore:
         """
 
         finished_at_iso = (
-            datetime.now(tz=timezone.utc).isoformat()
+            self.clock.now().isoformat()
             if state in _ATTEMPT_FINISHED_STATES
             else None
         )
