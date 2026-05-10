@@ -82,7 +82,7 @@ from dayu.host._run_input_builder import (
 from dayu.host._run_input_context_fact import RunInputContextFactBuilder
 from dayu.host._run_state_store import AttemptStateStore
 from dayu.host._tool_runtime import (
-    InMemoryToolRuntime,
+    HostToolRuntime,
     PlainRunEventAppender,
     ToolRuntimeEventAppender,
     ToolRuntimeOwnerScope,
@@ -440,7 +440,7 @@ class LocalRunHarness:
     is_durable: bool
     proxy: WorkerProxy
     event_store: RunEventStore = field(default_factory=InMemoryRunEventStore)
-    tool_runtime: InMemoryToolRuntime | None = None
+    tool_runtime: HostToolRuntime | None = None
     memory_store: ConversationMemoryStore = field(
         default_factory=lambda: _require_memory_store()
     )
@@ -623,7 +623,7 @@ class LocalRunHarness:
         durable + supervisor 路径返回真正的
         :class:`ToolRuntimeOwnerScope`, 在 attempt 生命周期内把绑定
         owner 的 :class:`AttemptScopedRunEventAppender` 注入到
-        :class:`InMemoryToolRuntime` 的 active appender ContextVar,
+        :class:`HostToolRuntime` 的 active appender ContextVar,
         使 ToolRuntime canonical fact append (``TOOL_RESULT_TRUNCATED``
         / ``TOOL_CURSOR_*`` / ``TOOL_FETCH_MORE_*``) 与 Engine 翻译事件
         统一走 fencing-aware 同事务路径; legacy / 无 supervisor / 无
@@ -874,6 +874,7 @@ class LocalRunHarness:
                             error=exc,
                             event_count=event_count,
                             terminal_seen=terminal_seen,
+                            active_attempt=current_active_attempt,
                         )
                     except AttemptFencingError:
                         # scoped appender 在写 worker failure 时观察到
@@ -922,6 +923,7 @@ class LocalRunHarness:
                                             error=exc,
                                             event_count=event_count,
                                             terminal_seen=terminal_seen,
+                                            active_attempt=current_active_attempt,
                                         )
                                     )
                                 except AttemptFencingError:
@@ -1372,6 +1374,13 @@ class LocalRunHarness:
             # session 干净退出; CAS miss 不影响后续 cleanup 顺序。
             await active_attempt.lease_exit_stack.aclose()
             return False
+        except Exception:
+            # 非 AttemptFencingError 异常（如 sqlite3.DatabaseError）也
+            # 必须关闭 lease_exit_stack, 避免 renew loop 泄漏为孤儿 task。
+            # 不写 terminal event（异常路径无法保证原子性），直接 re-raise
+            # 让上层 finally 处理。
+            await active_attempt.lease_exit_stack.aclose()
+            raise
         # CAS hit: supervisor 已在同事务内推进 attempt 终态并写入
         # terminal_event_position; 这里关闭 lease_exit_stack 让 renew
         # loop / supervisor session 退出, 避免与上层 finally 块的
@@ -1807,6 +1816,7 @@ class LocalRunHarness:
         error: Exception,
         event_count: int,
         terminal_seen: bool,
+        active_attempt: _ActiveAttempt | None,
     ) -> bool:
         """按 worker / proxy 异常追加 Host-owned failure。
 
@@ -1817,6 +1827,9 @@ class LocalRunHarness:
         :param error: worker / proxy 抛出的异常。
         :param event_count: 已成功取得的 EngineEvent 数量。
         :param terminal_seen: 是否已经从已 append 事件推导出终态。
+        :param active_attempt: 当前 active attempt 句柄；传入后使用
+            ``_resolve_attempt_appender`` 解析 fencing-aware appender,
+            避免依赖 ToolRuntime ContextVar scope。
         :returns: 已存在或新追加终态时返回 ``True``。
         :raises Exception: append Host-owned failure 失败时透传。
         """
@@ -1831,14 +1844,28 @@ class LocalRunHarness:
         )
         if terminal_seen:
             return True
-        stored_event = await self._scope_appender().append(
-            host_failure_draft(
-                run_id=request.run_id,
-                session_id=request.session_id,
-                occurred_at=datetime.now(tz=timezone.utc),
-                error=error,
-            )
+        draft = host_failure_draft(
+            run_id=request.run_id,
+            session_id=request.session_id,
+            occurred_at=datetime.now(tz=timezone.utc),
+            error=error,
         )
+        if (
+            active_attempt is not None
+            and active_attempt.owner_context is not None
+            and self.attempt_supervisor is not None
+        ):
+            # durable 路径: AttemptScopedRunEventAppender 拒绝 terminal
+            # RunEventType, 必须走 append_terminal_and_close。
+            link = await self.attempt_supervisor.append_terminal_and_close(
+                owner_context=active_attempt.owner_context,
+                draft=draft,
+            )
+            stored_event = link.event
+        else:
+            stored_event = await self._resolve_attempt_appender(
+                active_attempt
+            ).append(draft)
         return terminal_result_from_event(stored_event) is not None
 
     async def _append_missing_terminal_failure_if_needed(
@@ -2183,19 +2210,30 @@ class LocalRunHarness:
             # 完成 CAS 写入, 否则 session 被移除后 verify_owner / 后续
             # owner-lost signal 都会立即视为已失活。terminal event
             # position 的同事务原子写入归 P8-S4。
-            await self.attempt_supervisor.close_attempt_with_diagnostic_state(
-                owner_context=active_attempt.owner_context,
-                state=resolved_state,
-                failure_summary=resolved_failure,
-                terminal_event_position=None,
+            cas_applied = (
+                await self.attempt_supervisor
+                .close_attempt_with_diagnostic_state(
+                    owner_context=active_attempt.owner_context,
+                    state=resolved_state,
+                    failure_summary=resolved_failure,
+                    terminal_event_position=None,
+                )
             )
             await active_attempt.lease_exit_stack.aclose()
-            _LOGGER.log(
-                VERBOSE_LOG_LEVEL,
-                "host.run.attempt_finished attempt_id=%s state=%s",
-                active_attempt.attempt_id,
-                resolved_state.value,
-            )
+            if cas_applied:
+                _LOGGER.log(
+                    VERBOSE_LOG_LEVEL,
+                    "host.run.attempt_finished attempt_id=%s state=%s",
+                    active_attempt.attempt_id,
+                    resolved_state.value,
+                )
+            else:
+                _LOGGER.warning(
+                    "host.run.attempt_finished_cas_miss attempt_id=%s "
+                    "state=%s",
+                    active_attempt.attempt_id,
+                    resolved_state.value,
+                )
             return
         if not self.is_durable:
             # 非 durable 路径下 attempt 概念不存在, noop。

@@ -40,6 +40,7 @@ from dayu.host._host_storage_transaction import HostStorage
 from dayu.host._internal_contracts import (
     AttemptState,
     ExtendedRunState,
+    GlobalEventPosition,
 )
 from dayu.host._run_state_store import (
     AttemptLeaseStore,
@@ -783,5 +784,64 @@ async def test_update_state_owner_aware_uses_injected_clock_for_finished_at() ->
         assert attempt is not None
         assert attempt.state is AttemptState.STALE
         assert attempt.finished_at == target_finished_at
+    finally:
+        storage.close()
+
+
+@pytest.mark.asyncio
+async def test_close_terminal_rejects_stale_state() -> None:
+    """``close_terminal`` 拒绝 ``AttemptState.STALE``，STALE 走 ``mark_stale_or_lost``。"""
+
+    storage = _open_storage()
+    try:
+        await _seed_run(storage)
+        clock = _FakeClock()
+        supervisor = _build_supervisor(storage=storage, clock=clock)
+        async with supervisor.lease_context(
+            run_id="r1", attempt_index=0
+        ) as owner_context:
+            async with storage.transaction() as tx:
+                with pytest.raises(ValueError, match="close_terminal requires"):
+                    supervisor.lease_store.close_terminal(
+                        tx=tx,
+                        owner_context=owner_context,
+                        state=AttemptState.STALE,
+                        terminal_event_position=GlobalEventPosition(value=1),
+                        failure_summary="should_fail",
+                    )
+    finally:
+        storage.close()
+
+
+@pytest.mark.asyncio
+async def test_append_terminal_and_close_respects_state_override() -> None:
+    """``terminal_state_override`` 覆盖默认按 draft type 推断的 attempt 终态。
+
+    T4: 传 ``terminal_state_override=AttemptState.FAILED`` 时, 即使 draft
+    type 为 ``FINAL_ANSWORD`` (默认推断 SUCCEEDED), attempt 终态也必须是
+    FAILED。
+    """
+
+    storage = _open_storage()
+    try:
+        await _seed_run(storage)
+        clock = _FakeClock()
+        supervisor = _build_supervisor(storage=storage, clock=clock)
+        attempt_state_store = AttemptStateStore(storage=storage, clock=clock)
+        async with supervisor.lease_context(
+            run_id="r1", attempt_index=0
+        ) as owner_context:
+            link = await supervisor.append_terminal_and_close(
+                owner_context=owner_context,
+                draft=_final_answer_draft(run_id="r1"),
+                failure_summary="override_test",
+                terminal_state_override=AttemptState.FAILED,
+            )
+        # override 生效: terminal_state 为 FAILED 而非 SUCCEEDED。
+        assert link.terminal_state is AttemptState.FAILED
+        attempt = attempt_state_store.get(owner_context.attempt_id)
+        assert attempt is not None
+        assert attempt.state is AttemptState.FAILED
+        assert attempt.failure_summary == "override_test"
     finally:
         storage.close()

@@ -54,7 +54,7 @@ from dayu.host.contracts import (
 )
 
 
-_ATTEMPT_TERMINAL_STATES: frozenset[AttemptState] = frozenset(
+_ATTEMPT_CAS_TERMINAL_STATES: frozenset[AttemptState] = frozenset(
     {
         AttemptState.SUCCEEDED,
         AttemptState.FAILED,
@@ -64,7 +64,19 @@ _ATTEMPT_TERMINAL_STATES: frozenset[AttemptState] = frozenset(
         AttemptState.LOST,
     }
 )
-"""attempt 终态集合：已 lock 不再可执行；recovery 不复用同一 attempt。"""
+"""fencing 诊断用终态集合：``_diagnose_fence`` 判断 attempt 是否已 terminal。"""
+
+
+_ATTEMPT_CLOSE_TERMINAL_VALID_STATES: frozenset[AttemptState] = frozenset(
+    {
+        AttemptState.SUCCEEDED,
+        AttemptState.FAILED,
+        AttemptState.CANCELLED,
+        AttemptState.SUSPENDED,
+        AttemptState.LOST,
+    }
+)
+"""``close_terminal`` 接受的终态集合：不含 ``STALE``（STALE 走 ``mark_stale_or_lost``）。"""
 
 
 _ATTEMPT_FINISHED_STATES: frozenset[AttemptState] = frozenset(
@@ -74,7 +86,6 @@ _ATTEMPT_FINISHED_STATES: frozenset[AttemptState] = frozenset(
         AttemptState.CANCELLED,
         AttemptState.SUSPENDED,
         AttemptState.STALE,
-        AttemptState.RECOVERING,
         AttemptState.LOST,
     }
 )
@@ -334,9 +345,9 @@ class AttemptStateStore:
         """在事务内推进 attempt 状态。
 
         本方法是 P6/P7 主路径的非 owner-aware 通道；P8-S1 仅扩展状态枚
-        举到 ``STALE`` / ``RECOVERING`` / ``LOST``，但不在此方法上加
-        owner CAS。owner-aware CAS 推进由 :class:`AttemptLeaseStore` 承
-        载，并在后续 slice 接入 harness 主路径。
+        举到 ``STALE`` / ``LOST``，但不在此方法上加 owner CAS。owner-
+        aware CAS 推进由 :class:`AttemptLeaseStore` 承载，并在后续 slice
+        接入 harness 主路径。
 
         :param tx: 当前事务。
         :param attempt_id: attempt id。
@@ -712,7 +723,7 @@ class AttemptLeaseStore:
         :raises sqlite3.DatabaseError: 写入失败时抛出。
         """
 
-        if state not in _ATTEMPT_TERMINAL_STATES:
+        if state not in _ATTEMPT_CLOSE_TERMINAL_VALID_STATES:
             raise ValueError(
                 f"close_terminal requires terminal AttemptState, got {state}"
             )
@@ -834,7 +845,7 @@ class AttemptLeaseStore:
           这类行也必须进入 recovery 收口为 LOST, 否则一直滞留 ``CREATED``
           污染状态机 (P8 D3 / 0830-F2)。
 
-        ``RECOVERING`` / 终态行不会出现在结果中, 避免重复处理。结果按
+        终态行不会出现在结果中, 避免重复处理。结果按
         ``started_at`` 升序返回, 让 recovery scan 顺序稳定可重放。
 
         本方法仅提供候选列表; 调用方需在每个候选的独立 ``BEGIN IMMEDIATE``
@@ -1123,7 +1134,7 @@ class AttemptLeaseStore:
             else datetime.fromisoformat(lease_expires_raw)
         )
 
-        if state in _ATTEMPT_TERMINAL_STATES:
+        if state in _ATTEMPT_CAS_TERMINAL_STATES:
             return AttemptLeaseResult(
                 decision=AttemptLeaseDecision.TERMINAL,
                 owner_context=None,

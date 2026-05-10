@@ -319,7 +319,13 @@ class DurableRunEventStore:
                 1 if is_terminal else 0,
             ),
         )
-        event_position = int(cursor.lastrowid or 0)
+        lastrowid = cursor.lastrowid
+        if lastrowid is None:
+            raise RuntimeError(
+                "host_run_events INSERT did not yield a lastrowid; "
+                f"run_id={draft.run_id!r} sequence={sequence}"
+            )
+        event_position = int(lastrowid)
 
         self._upsert_run_state(
             tx=tx,

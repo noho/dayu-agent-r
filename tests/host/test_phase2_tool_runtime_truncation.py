@@ -29,7 +29,7 @@ from dayu.host import (
     ToolResultTruncatedData,
 )
 from dayu.host._event_store import InMemoryRunEventStore
-from dayu.host._tool_runtime import InMemoryToolRuntime, _build_chunk
+from dayu.host._tool_runtime import HostToolRuntime, _build_chunk
 from dayu.host._tool_runtime import _CursorRecord
 
 
@@ -293,7 +293,7 @@ async def _runtime(
     spec: ToolTruncateSpec | None,
     clock: _Clock | None = None,
     tokens: _Tokens | None = None,
-) -> tuple[InMemoryToolRuntime, InMemoryRunEventStore]:
+) -> tuple[HostToolRuntime, InMemoryRunEventStore]:
     """构造测试 runtime。
 
     :param value: 工具返回值。
@@ -309,7 +309,7 @@ async def _runtime(
     if spec is not None:
         specs["demo"] = spec
     return (
-        InMemoryToolRuntime(
+        HostToolRuntime(
             is_durable=False,
             executor=_Executor(value=value),
             event_store=store,
@@ -575,7 +575,7 @@ async def test_non_completed_outcome_passthrough_without_cursor() -> None:
 
     for outcome in (failed, awaiting):
         store = InMemoryRunEventStore()
-        runtime = InMemoryToolRuntime(
+        runtime = HostToolRuntime(
             is_durable=False,
             executor=_OutcomeExecutor(outcome=outcome),
             event_store=store,
@@ -745,3 +745,23 @@ async def test_ttl_expired_and_opportunistic_cleanup() -> None:
     )
     assert isinstance(stale, ToolFailedOutcome)
     assert stale.result.error == "cursor_not_found"
+
+
+@pytest.mark.asyncio
+async def test_truncation_strategy_value_type_mismatch_returns_original() -> None:
+    """strategy 与 value 类型不匹配时静默跳过截断, 返回原始值。
+
+    T3: ``strategy="list_items"`` 但 value 为 str 时, ``_apply_truncation``
+    fallthrough 返回 ``None``, 不截断。
+    """
+
+    runtime, _store = await _runtime(
+        value="not-a-list",
+        spec=_spec("list_items", "max_items", 2),
+    )
+
+    outcome = await runtime.execute_tool_call(_request())
+    assert isinstance(outcome, ToolCompletedOutcome)
+    # 类型不匹配: 不截断, 返回原始值。
+    assert outcome.result.value == "not-a-list"
+    assert outcome.result.truncation is None

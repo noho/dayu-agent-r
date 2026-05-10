@@ -59,7 +59,7 @@ FORBIDDEN_EXPORTS: frozenset[str] = frozenset(
         "EngineWorker",
         "LocalProxy",
         "ToolExecutor",
-        "InMemoryToolRuntime",
+        "HostToolRuntime",
         "ToolRuntimeToolExecutor",
         "run_agent_messages",
         "fetch_more_tool_result",

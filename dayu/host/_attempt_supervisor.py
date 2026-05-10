@@ -412,7 +412,7 @@ class AttemptScopedRunEventAppender:
             attempt_id=self.owner_context.attempt_id,
             run_id=self.owner_context.run_id,
             reason=AttemptFencingReason.OWNER_MISMATCH,
-            current_state=AttemptState.RUNNING,
+            current_state=None,
             owner_id=self.owner_context.owner_id,
             fencing_token=self.owner_context.fencing_token,
         )
@@ -569,10 +569,16 @@ class AttemptSupervisor:
         )
         session = _LeaseSession(owner_context=owner_context)
         self._sessions[attempt_id] = session
-        renew_task = asyncio.create_task(
-            self._renew_loop(session=session),
-            name=f"attempt-renew:{attempt_id}",
-        )
+        try:
+            renew_task = asyncio.create_task(
+                self._renew_loop(session=session),
+                name=f"attempt-renew:{attempt_id}",
+            )
+        except Exception:
+            # create_task 失败（如事件循环已关闭）时清理 session 注册,
+            # 避免 _sessions 中残留无 renew task 的孤儿 session。
+            del self._sessions[attempt_id]
+            raise
         session.renew_task = renew_task
         _LOGGER.debug(
             "host.attempt.lease_acquired run_id=%s attempt_id=%s "

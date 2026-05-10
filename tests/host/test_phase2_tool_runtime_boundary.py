@@ -34,7 +34,7 @@ from dayu.host import (
     ToolResultTruncatedData,
 )
 from dayu.host._event_store import InMemoryRunEventStore
-from dayu.host._tool_runtime import InMemoryToolRuntime
+from dayu.host._tool_runtime import HostToolRuntime
 
 
 @dataclass(frozen=True, slots=True)
@@ -163,7 +163,7 @@ def _framework_request(
     )
 
 
-def _runtime() -> tuple[InMemoryToolRuntime, InMemoryRunEventStore]:
+def _runtime() -> tuple[HostToolRuntime, InMemoryRunEventStore]:
     """构造 runtime。
 
     :returns: runtime 与 store。
@@ -171,7 +171,7 @@ def _runtime() -> tuple[InMemoryToolRuntime, InMemoryRunEventStore]:
     """
 
     store = InMemoryRunEventStore()
-    runtime = InMemoryToolRuntime(
+    runtime = HostToolRuntime(
         is_durable=False,
         executor=_Executor(value=[1, 2, 3]),
         event_store=store,
@@ -218,10 +218,10 @@ def test_host_does_not_export_internal_tool_runtime_implementations() -> None:
     exported = frozenset(host.__all__)
     assert "ToolFetchMoreRequest" in exported
     assert "ToolFetchMoreHandle" not in exported
-    assert "InMemoryToolRuntime" not in exported
+    assert "HostToolRuntime" not in exported
     assert "ToolRuntimeToolExecutor" not in exported
     assert "ToolExecutor" not in exported
-    assert not hasattr(host, "InMemoryToolRuntime")
+    assert not hasattr(host, "HostToolRuntime")
     assert not hasattr(host, "ToolRuntimeToolExecutor")
 
 

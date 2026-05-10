@@ -4,7 +4,7 @@
 与 utils 下其它 provider smoke 一致的脚本内 ``ProviderCase``，固定运行
 ``mimo-v2.5-pro-plan``。该路径由模型通过 LLM tool calling 调用公共
 ``@tool`` 声明的 ``huge_echo``，并经
-``ToolExecutor.execute -> ToolRuntimeToolExecutor -> InMemoryToolRuntime``
+``ToolExecutor.execute -> ToolRuntimeToolExecutor -> HostToolRuntime``
 产生截断、cursor 与补读事实。缺少 API key 或 provider case 能力不满足时
 返回清晰失败，不能把 fake case 当作真实 provider 成功。
 """
@@ -118,7 +118,7 @@ from dayu.host._event_store import InMemoryRunEventStore  # noqa: E402
 from dayu.host._proxy import LocalProxy, WorkerProxy  # noqa: E402
 from dayu.host._run_harness import LocalRunHarness  # noqa: E402
 from dayu.host._tool_runtime import (  # noqa: E402
-    InMemoryToolRuntime,
+    HostToolRuntime,
     ToolRuntimeToolExecutor,
 )
 from dayu.host._worker import EngineWorker  # noqa: E402
@@ -736,7 +736,7 @@ def build_huge_echo_harness(
     bundle = huge_echo_bundle()
     event_store = InMemoryRunEventStore()
     business_executor = HUGE_ECHO_DEFINITION.executor
-    runtime = InMemoryToolRuntime(
+    runtime = HostToolRuntime(
         is_durable=False,
         executor=business_executor,
         event_store=event_store,

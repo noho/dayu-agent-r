@@ -127,7 +127,7 @@ Host 当前 Run harness、RunEventStore、ToolRuntime、Conversation Memory / Ru
   coordinator。
 - P5 no-full-governance smoke：覆盖公共 `huge_echo` 工具通过 `ToolDefinition` / `ToolBundle` 声明、
   fake provider 只模拟 LLM tool call output、真实 Engine Agent tool loop 调用 `ToolExecutor.execute`、
-  `ToolRuntimeToolExecutor -> InMemoryToolRuntime -> huge_echo executor` 产生 truncate / cursor facts、
+  `ToolRuntimeToolExecutor -> HostToolRuntime -> huge_echo executor` 产生 truncate / cursor facts、
   截断 ToolMessage 包含 LLM-readable `truncation.next_action="fetch_more"` 与 `fetch_more_args`、模型在同一 run
   内通过 Engine tool loop 发起 framework `fetch_more`、Host ToolRuntime 路由 framework 补读并在 terminal 前追加
   fetch_more facts、terminal 后 framework `fetch_more` 工具调用返回 typed failure 不追加 EventLog、
@@ -207,7 +207,7 @@ Host 当前 Run harness、RunEventStore、ToolRuntime、Conversation Memory / Ru
   ``time.sleep`` 推进 lease 过期。
 - P8-S5 ToolRuntime owner fencing（`tests/host/test_phase8_tool_runtime_fencing.py`）：
   覆盖 `ToolRuntimeOwnerScope` ContextVar 安装 / 恢复（含异常路径）、
-  `active_tool_runtime_appender` scope 外返回 `None`、`InMemoryToolRuntime._resolve_appender`
+  `active_tool_runtime_appender` scope 外返回 `None`、`HostToolRuntime._resolve_appender`
   在 durable 路径 scope 内返回 `AttemptScopedRunEventAppender`，scope 外 fail-fast，
   非 durable 测试路径才允许 `PlainRunEventAppender`，以及 ToolRuntime fact `run_id` mismatch 命中
   `AttemptFencingError(reason=OWNER_MISMATCH)` 且 EventLog 不残留 fact、错误文本不
@@ -262,7 +262,7 @@ Host 当前 Run harness、RunEventStore、ToolRuntime、Conversation Memory / Ru
   (`ToolRuntimeCursor` / `ToolFetchMoreRequest` / `ToolFetchMoreResult` 等)；Run 级 `start_run` / `stream_run_events` /
   `get_run_result` 与 framework `fetch_more` 路径必须经 `LocalRunHarness` 实例 / 普通 tool call
   访问，阻止 `EngineWorker`、`LocalProxy`、
-  `ToolExecutor`、`InMemoryToolRuntime`、`ToolRuntimeToolExecutor`、`DurableConversationMemoryStore`、
+  `ToolExecutor`、`HostToolRuntime`、`ToolRuntimeToolExecutor`、`DurableConversationMemoryStore`、
   `DefaultRunInputBuilder`、`RunInputBuildTrace`、`run_agent_messages` 泄漏为包根 API。
 - import boundary：阻止 Host 导入 `dayu.fins`、`dayu.service`、`dayu.ui`。
 - weak typing guard：扫描 `dayu.host` 源码，阻止 `Any`、`object`、无类型签名与裸容器注解。

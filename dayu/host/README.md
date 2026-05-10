@@ -13,7 +13,7 @@ attempt-scoped append / durable memory：
 - 包根只暴露 Run 级契约与 fetch_more 协议契约 (`ToolFetchMoreRequest` 等)；
   Run 生命周期与 fetch_more 操作必须经由 `LocalRunHarness` / `build_durable_harness()` 装配后的
   实例方法（`harness.start_run` / `harness.stream_run_events` / `harness.get_run_result`）调用，
-  framework `fetch_more` 工具调用经 `ToolRuntimeToolExecutor -> InMemoryToolRuntime.execute_tool_call`。
+  framework `fetch_more` 工具调用经 `ToolRuntimeToolExecutor -> HostToolRuntime.execute_tool_call`。
 - `harness.start_run` 是 async 入口，返回 `RunStream`，包含 `RunHandle` 与 `RunEvent` 异步流；被 await 时会立即启动
   内存后台任务。
 - Host 内部通过 `LocalProxy -> EngineWorker -> dayu.engine.run_agent_messages` 调用 Engine 函数式入口。
@@ -33,7 +33,7 @@ attempt-scoped append / durable memory：
   非法 scope 会在投影时失败。
 - 同一 run 的 terminal RunEvent 会封闭当前事件流；store 拒绝 terminal 后继续 append，harness 在首个
   terminal 后关闭 worker stream。
-- Host 内部 `InMemoryToolRuntime` 通过 `ToolRuntimeToolExecutor` 适配为 Engine 唯一可见的
+- Host 内部 `HostToolRuntime` 通过 `ToolRuntimeToolExecutor` 适配为 Engine 唯一可见的
   `ToolExecutor.execute`，Engine 不感知 cursor store、TTL、scope token 或补读实现。
 - P5 smoke/test 工具使用公共 `ToolDefinition` / `ToolBundle` 声明：工具现场通过
   `@tool(..., truncate=ToolTruncateSpec(...))` 同源声明 LLM-facing `ToolSchema`、Host ToolRuntime
@@ -52,9 +52,9 @@ attempt-scoped append / durable memory：
   截断凭证。
 - `scope_token` 不进入 RunEvent、memory projection 或日志；framework `fetch_more` 通过 LLM-facing tool
   message 中的 `truncation.fetch_more_args` 把 cursor / scope_token 透传给模型，模型按普通 tool call
-  回传，由 Host `ToolRuntimeToolExecutor -> InMemoryToolRuntime.execute_tool_call` 在 framework 路径下消费。
+  回传，由 Host `ToolRuntimeToolExecutor -> HostToolRuntime.execute_tool_call` 在 framework 路径下消费。
 - framework `fetch_more` 作为最小 LLM-facing schema 与业务工具 schema 一起传给 Engine / Runner；
-  `ToolRuntimeToolExecutor -> InMemoryToolRuntime.execute_tool_call` 会识别该工具名并路由到 Host ToolRuntime
+  `ToolRuntimeToolExecutor -> HostToolRuntime.execute_tool_call` 会识别该工具名并路由到 Host ToolRuntime
   补读，不调用业务 executor，也不把它提升为完整 ToolRegistry / governance。
 - 补读失败结果中的 `denied` 只表示权限 / scope 拒绝；cursor 不存在、cursor 过期和 terminal Run 都不是权限拒绝。
 - terminal Run 后 framework `fetch_more` 工具调用返回 typed failure，不追加新 RunEvent。
@@ -127,7 +127,7 @@ P6 已落地：
   `DurableRunEventStore` 持久化，避免事件 / 快照分离失败。
   `LocalRunHarness` 在每个 attempt 起点写入 `CREATED → RUNNING`，终态写入
   `SUCCEEDED / FAILED / CANCELLED / SUSPENDED`；P8-S1 已在 internal
-  `AttemptState` / store 层扩展 `STALE / RECOVERING / LOST` 诊断态，并提供
+  `AttemptState` / store 层扩展 `STALE / LOST` 诊断态，并提供
   owner lease 与全局单调 fencing token 的 CAS 基础。`attempt_id` 形如
   `attempt-<run_id>-<index>-<short_uuid>`。
 - `ProjectionStore` + `ProjectionCoordinator` 驱动 at-least-once observer，记录
@@ -199,14 +199,13 @@ P8 已落地：
   ToolRuntime fact）；`draft.run_id` 与 `owner_context.run_id` 不一致直接抛
   `AttemptFencingError(reason=OWNER_MISMATCH)`。`ToolRuntimeOwnerScope`（ContextVar）
   在 `LocalRunHarness._run_to_store` 每个 attempt 生命周期内把 scoped appender 注入
-  `InMemoryToolRuntime`，使框架 `fetch_more` 也按 originating attempt 落库。
+  `HostToolRuntime`，使框架 `fetch_more` 也按 originating attempt 落库。
 - stale / orphan recovery（P8-S6）：`AttemptSupervisor.recover_stale_attempts` 内部显式
   入口扫描 `state IN ('running','created') AND lease_expires_at <= now`，逐候选用独立
-  `BEGIN IMMEDIATE` 事务 CAS 决策——旧 RUNNING 推 `RECOVERING` + INSERT 新 recovery
-  attempt（严格更大 fencing token、`recovered_from_attempt_id` 链接）；run terminal 推
-  `MARK_LOST` 不创建恢复 attempt；`CREATED` 孤儿推 `MARK_LOST`；fencing token 被改写时
-  命中 `NOOP_TERMINAL` 安全分支。该入口当前未自动 wire 进 `build_durable_harness` 或
-  Session 生命周期。
+  `BEGIN IMMEDIATE` 事务 CAS 决策——旧 attempt 一律 `MARK_LOST` 诊断收口，不再创建
+  recovery attempt（P8 D2）；run terminal 推 `MARK_LOST`；`CREATED` 孤儿推 `MARK_LOST`；
+  fencing token 被改写时命中 `NOOP_TERMINAL` 安全分支。该入口当前未自动 wire 进
+  `build_durable_harness` 或 Session 生命周期。
 - 多进程 stress 验证（P8-S7）：`tests/host/test_phase8_multiprocess_stress.py` 通过
   spawn-only + file SQLite (WAL + `BEGIN IMMEDIATE`) 覆盖并发 append、terminal close
   race、跨进程 stale recovery、observer drain 四场景。不引入 multiprocessing launcher
@@ -216,8 +215,8 @@ P8 已落地：
   `startup_reconcile` 后追加 `repair_missing_session_snapshots()` 在 checkpoint 已 CAUGHT_UP
   但 snapshot row 因运维误操作丢失时从 EventLog 重建。生产代码不再保留
   `InMemoryConversationMemoryStore`。
-- attempt state 诊断态扩展：`AttemptState` / store 层新增 `STALE`、`RECOVERING`、`LOST`
-  三个诊断态（P8-S1），配合 fencing token CAS 基础。
+- attempt state 诊断态扩展：`AttemptState` / store 层新增 `STALE`、`LOST`
+  两个诊断态（P8-S1），配合 fencing token CAS 基础。
 
 不得为旧 Host 接口创建兼容 wrapper、facade 或 re-export。
 
@@ -242,9 +241,9 @@ P8 已落地：
   `HostContextCompactEventData`、`ContextCompactFailureReason`。
 - 最小入口：经 `LocalRunHarness` / `build_durable_harness()` 装配后调用实例方法
   `start_run` / `stream_run_events` / `get_run_result`；framework `fetch_more` 通过普通 tool call
-  路径走 `ToolRuntimeToolExecutor -> InMemoryToolRuntime.execute_tool_call`，不再有独立 public helper。
+  路径走 `ToolRuntimeToolExecutor -> HostToolRuntime.execute_tool_call`，不再有独立 public helper。
 
-`EngineWorker`、`LocalProxy`、`WorkerProxy`、`ToolExecutor`、`InMemoryToolRuntime`、
+`EngineWorker`、`LocalProxy`、`WorkerProxy`、`ToolExecutor`、`HostToolRuntime`、
 `ToolRuntimeToolExecutor`、`DurableConversationMemoryStore`、`DefaultRunInputBuilder`、
 `RunInputBuildTrace` 与 `run_agent_messages` 不属于 Host public API。
 
@@ -285,7 +284,7 @@ P5 sequential smoke 主路径：
 LocalRunHarness.start_run(run_index=1)
   -> Engine Agent tool loop emits huge_echo tool call
   -> ToolExecutor.execute
-  -> ToolRuntimeToolExecutor -> InMemoryToolRuntime -> huge_echo executor
+  -> ToolRuntimeToolExecutor -> HostToolRuntime -> huge_echo executor
   -> truncate / cursor facts
   -> Engine injects truncated tool result with fetch_more hint
   -> model emits framework fetch_more tool call
@@ -316,7 +315,7 @@ Engine / Runner
 Engine
   -> ToolExecutor.execute
   -> ToolRuntimeToolExecutor
-  -> InMemoryToolRuntime
+  -> HostToolRuntime
   -> business ToolExecutor
   -> truncate / cursor facts
   -> RunEventStore.append
@@ -330,8 +329,8 @@ Model
   -> Engine Agent tool loop
   -> ToolExecutor.execute
   -> ToolRuntimeToolExecutor
-  -> InMemoryToolRuntime.execute_tool_call
-  -> InMemoryToolRuntime.fetch_more
+  -> HostToolRuntime.execute_tool_call
+  -> HostToolRuntime.fetch_more
   -> RunEventStore.append(fetch_more facts for original business tool)
 ```
 
@@ -340,8 +339,8 @@ Host framework `fetch_more` 路径（与业务工具走同一 Engine 工具调�
 ```text
 Engine ToolExecutor.execute(ToolExecutionRequest{name=FRAMEWORK_FETCH_MORE_TOOL_NAME})
   -> ToolRuntimeToolExecutor
-  -> InMemoryToolRuntime.execute_tool_call
-  -> InMemoryToolRuntime._fetch_more (内部子例程)
+  -> HostToolRuntime.execute_tool_call
+  -> HostToolRuntime._fetch_more (内部子例程)
   -> RunEventStore.append
 ```
 
@@ -400,7 +399,7 @@ public `StartRunRequest` / `start_run` 不暴露 lease TTL，owner secret token 
 RunEvent。`AttemptSupervisor.scoped_appender(owner_context)` 是构造该 appender 的唯一
 公开入口；`LocalRunHarness._run_to_store` 在每个 attempt 生命周期内通过
 `ToolRuntimeOwnerScope`（基于 `contextvars.ContextVar`）把 scoped appender 注入到
-`InMemoryToolRuntime`，使框架级 `fetch_more` 也按 originating attempt 的 owner
+`HostToolRuntime`，使框架级 `fetch_more` 也按 originating attempt 的 owner
 落库，避免跨 attempt 写错 run。`ToolExecutionContext` 不变，不向 ToolExecutor 暴露
 任何 owner secret。P8 D2 后 stale / orphan recovery 入口
 `AttemptSupervisor.recover_stale_attempts(*, run_id=None)` 仅做诊断收口：候选扫描使用短读事务挑选
@@ -569,7 +568,7 @@ RUNNING -> CANCELLED
 RUNNING -> SUSPENDED
 ```
 
-`STALE / RECOVERING / LOST` 已作为 internal `AttemptState` / store 诊断态落地（P8-S1）；
+`STALE / LOST` 已作为 internal `AttemptState` / store 诊断态落地（P8-S1）；
 `AttemptSupervisor` 的 lease acquire / renew heartbeat / owner-aware diagnostic close /
 recovery scan / terminal atomic close / attempt-scoped append 已落地（P8-S3 至 P8-S6）。
 完整 `QUEUED / WAITING / CANCELLING` 主路径治理、recovery scan 自动装配到生产启动链路、

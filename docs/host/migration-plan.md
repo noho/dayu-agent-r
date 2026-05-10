@@ -17,24 +17,18 @@ Dayu 项目级约束、artifact 索引和仍需追踪的 residual risks；不复
 - 当前 phase：P8 Attempt Lease / Recovery / 多进程并发基础。
 - 当前分支：`migration/host-p8-attempt-lease-recovery`。
 - 当前 PR：#40 — `[codex] Host P8 durable attempt governance`。
-- 当前 gate：PR review fix loop。
-- 最新 accepted commit：`51dbf69 docs: simplify host migration plan control flow`。
+- 当前 gate：PR review fix loop (2044/2051 reviews complete)。
+- 最新 accepted commit：`277c62c host: fix pr40 parallel review findings`。
 - 最新 PR review artifact：
-  `docs/reviews/pr-40-review-20260510-1939.md`、
-  `docs/reviews/pr-40-review-20260510-1943.md`、
-  `docs/reviews/pr-40-review-20260510-1948.md`。
-- 当前待处理 review findings：
-  - accepted：1939-F1 ToolRuntime 必须透传 `AttemptFencingError`。
-  - accepted：1943-F1 durable memory observer terminal 投影必须从 EventLog 重读完整 run facts，不能依赖进程内 pending 跨 checkpoint / restart。
-  - accepted：1943-F2 删除旧 public `ToolFetchMoreHandle*` contracts。
-  - accepted：1948-F1 durable `_scope_appender()` 无 owner scope 必须 fail fast。
-  - accepted：1939-F3 `_handle_owner_lost` 普通异常路径必须清理 active attempt，避免 finally 重复 close。
-  - accepted：1939-F4 `AttemptState.STALE` fencing 诊断归类为 `ATTEMPT_TERMINAL`。
-  - accepted：1939-F5 durable memory snapshot `updated_at` 使用注入 clock。
-  - rejected-with-reason：1939-F2 recovery scan TOCTOU；CAS 已正确收敛，不修。
-  - deferred-with-owner：1948-F2 独立 `RUN_ID_MISMATCH` reason，owner 为 P9 / P16。
-  - deferred-with-owner：durable memory repair 全 EventLog 扫描性能，owner 为 P9 / capacity。
-- 下一入口：完成 PR review 1939 / 1943 / 1948 findings 的验证、re-review / user confirmation / accepted fix commit。
+  `docs/reviews/pr-40-review-20260510-2044.md`、
+  `docs/reviews/pr-40-review-20260510-2051.md`、
+  `docs/reviews/pr-40-final-review-fix-report-20260510.md`。
+- 当前待处理 review findings：无 accepted findings 遗留。
+  - 2044 review 6 findings 全部已修复。
+  - 2051 review 5 findings + 3 test findings 全部已修复。
+  - T1 (`_renew_loop` 并发竞争测试) 未修 — 非 accepted finding，属 P9 test hardening。
+- 下一入口：P8 PR re-review / user confirmation / merge；P8 merge 后进入 P8.5
+  ToolRuntime Event Model Correction。
 
 ## 2. Dayu Host Gateflow 扩展
 
@@ -75,6 +69,7 @@ Dayu 项目级约束、artifact 索引和仍需追踪的 residual risks；不复
 | P6 | Durable EventLog / Run State / Projection | merged PR #26 | SQLite WAL durable facts、Run state、projection checkpoint、observer 基础 | durable append / replay / checkpoint / projection smoke 通过 |
 | P7 | Tool Trace Projection / Sink | merged PR #37 | Host observer / sink 派生 tool trace | trace projection 从 canonical facts 幂等重建 |
 | P8 | Attempt Lease / Recovery / Multiprocessing | PR #40 open | owner token、fencing、attempt supervisor、diagnostic recovery、durable memory、multiprocessing stress | 迟到 owner 被 fenced；terminal close 原子；P8 smoke 通过 |
+| P8.5 | ToolRuntime Event Model Correction | planned | 纠正 framework `fetch_more` 被特化为专属 RunEventType 的事件模型；调查并修复由此暴露的 multi-fact partial risk | `fetch_more` 作为普通 Host built-in tool 建模；不再用具体工具名扩展 RunEventType；疑似 EventLog 多 fact 原子性问题有明确结论与 owner |
 | P9 | Session / Run Lifecycle Governance / Public Interface | planned | admission、同 Session active Run、cancel 基础治理、Host public interface 固定 | lifecycle/admission/cancel smoke 通过，public exports 冻结 |
 | P10 | ToolRegistry Governance | planned | 通用工具注册、权限、middleware、registry audit | 通用工具可注册、授权、审计，Engine 只见 schema / executor |
 | P10.5 | Web Tools Migration Smoke | planned | 迁移代表性 web tool 验证真实工具链路 | 至少一个 web tool 通过 ToolRegistry / ToolRuntime / trace / memory smoke |
@@ -87,11 +82,12 @@ Dayu 项目级约束、artifact 索引和仍需追踪的 residual risks；不复
 
 ### 4.1 未实施 Phase 边界索引
 
-以下表格保留 P9 及以后未实施 phase 的关键输出与明确非目标；完整实现细节仍必须在对应
+以下表格保留 P8.5 及以后未实施 phase 的关键输出与明确非目标；完整实现细节仍必须在对应
 `phase{N}-plan.md` 中重新写成 handoff-ready plan。
 
 | Phase | 关键输出 | 明确非目标 |
 | --- | --- | --- |
+| P8.5 | ToolRuntime event model root-cause plan、删除 `TOOL_FETCH_MORE_REQUESTED` / `TOOL_FETCH_MORE_COMPLETED` / `TOOL_FETCH_MORE_FAILED` 等具体工具名 RunEventType 的实施决策、`fetch_more` 作为普通 Host built-in tool 的通用 tool-call facts 建模、serializer / contracts / trace / memory / smoke / docs 同步、疑似 EventLog multi-fact 原子性问题的证据化裁决、`docs/host/phase8.5-plan.md` | 不恢复 legacy public fetch_more handle；不提前实现完整 P10 ToolRegistry；不把 ToolRuntime 业务语义放入 `dayu.runtime`；不把具体工具名继续编码成 RunEventType；不在缺少直接证据时断言 EventLog batch append 一定需要或一定不需要 |
 | P9 | SessionManager、RunManager、RunSupervisor、`client_request_id` 幂等、同 Session active Run 仲裁、`cancel_run`、生产级 admission policy、Host public interface 契约、OLD wechat / web / prompt / interactive 调用需求调研、`utils/smoke_host_p9_lifecycle.py` | 不做 issue #3 强制终止增强；不做 wait / suspend / resume；不做 Remote RPC；不迁移业务工具 |
 | P10 | ToolRegistry / tool catalog、display metadata、permission policy、middleware chain、framework tool registration、schema / binding 校验、registry audit facts、`utils/smoke_host_p10_tool_registry.py` | 不迁移 business fins / doc / web 工具；不让 Host / Engine 承载财报业务语义；不让 Engine 持有 registry |
 | P10.5 | 代表性 web tool `@tool` declaration、ToolRegistry 注册、permission / middleware / display metadata 对接、ToolRuntime truncate / fetch_more 适配、tool trace / memory facts smoke、`utils/smoke_host_p10_5_web_tools.py` | 不迁移 fins / doc 全量业务工具；不把 web 业务语义塞进 Host / Engine；不扩大 P10 ToolRegistry 契约；不实现 P11 validation replay |
@@ -107,6 +103,7 @@ Dayu 项目级约束、artifact 索引和仍需追踪的 residual risks；不复
 P8 当前在 PR #40 review/fix loop，已落地或正在收口的核心事实如下：
 
 - `AttemptLeaseStore` / `AttemptSupervisor` 提供 owner token、全局单调 fencing token、lease renew、owner CAS。
+- `_fetch_more` cursor 生命周期采用 pure build + deferred commit 模式：`_build_cursor_creation` 纯构建不写内存 maps，`_commit_cursor_creation` 在所有 EventLog append 成功后才写入。fencing 发生时内存 maps 无副作用。
 - terminal close 通过 `append_terminal_and_close` 在单个 `BEGIN IMMEDIATE` 事务内完成 owner verify、terminal RunEvent append、attempt close 和 `terminal_event_position` 写入。
 - recovery scan 在 P8 cleanup 后只做 diagnostic close：候选 attempt 进入 `MARK_LOST` / `NOOP_TERMINAL`，不再创建无人持有 owner secret 的 recovery attempt。
 - durable path 不允许 `PlainRunEventAppender` fallback；ToolRuntime facts 和 framework `fetch_more` 均必须在 owner scope 内写入。
@@ -114,28 +111,41 @@ P8 当前在 PR #40 review/fix loop，已落地或正在收口的核心事实如
 - production `InMemoryConversationMemoryStore` 已删除；durable harness 默认装配 `DurableConversationMemoryStore`，并支持 checkpoint caught-up 后 missing snapshot repair。
 - multiprocessing stress 覆盖 file SQLite append、terminal close、stale recovery、observer startup reconcile 既有语义；慢硬盘 / Docker Linux stress 仍由 issue #38 跟踪。
 
+P8 允许带着一个已登记的架构问题 close：当前 ToolRuntime 仍把 framework
+`fetch_more` 表达为 `TOOL_FETCH_MORE_REQUESTED` / `TOOL_FETCH_MORE_COMPLETED` /
+`TOOL_FETCH_MORE_FAILED` 等专属 RunEventType。该模型疑似错层：`fetch_more`
+应是普通 Host built-in tool，而不是需要扩展 RunEventType 的特殊事件族。P8
+只保证 owner / fencing / attempt governance 与已修复的 cursor map 副作用；事件模型
+root cause、serializer / projection 迁移、以及“EventLog multi-fact append 是否独立
+需要 batch 原子性”的最终判断统一进入 P8.5。
+
 P8 cleanup 后的 stale / orphan recovery 旧术语（`MARK_RECOVERING_AND_CREATE_ATTEMPT`、新 recovery attempt、`recovered_from_attempt_id` 自动写入等）均已废弃。若历史 phase plan / review artifact 仍保留这些词，只作为审计上下文；当前实现真源以代码、`dayu/host/README.md`、`docs/host/design.md` 和 PR #40 review artifacts 为准。
 
 ## 6. Residual Risk Registry
 
 | Risk | Owner / Destination | Status |
 | --- | --- | --- |
-| P8 PR review 1939-F1：ToolRuntime catch-all 吞 `AttemptFencingError` | PR #40 current fix loop | accepted，fixed and validated in working tree，待 re-review |
-| P8 PR review 1939-F3：`_handle_owner_lost` 普通异常后 active attempt 未清理 | PR #40 current fix loop | accepted，fixed and validated in working tree，待 re-review |
-| P8 PR review 1939-F4：STALE fencing 诊断未归类为 terminal | PR #40 current fix loop | accepted，fixed and validated in working tree，待 re-review |
-| P8 PR review 1939-F5：durable memory snapshot clock 未注入 | PR #40 current fix loop | accepted，fixed and validated in working tree，待 re-review |
-| P8 PR review 1943-F1：durable memory observer 非终态 checkpoint 后重启丢 pending facts | PR #40 current fix loop | accepted，fixed and validated in working tree，待 re-review |
-| P8 PR review 1943-F2：旧 public `ToolFetchMoreHandle*` contracts 仍导出 | PR #40 current fix loop | accepted，fixed and validated in working tree，待 re-review |
-| P8 PR review 1948-F1：durable `_scope_appender()` 无 owner scope 静默 fallback | PR #40 current fix loop | accepted，fixed and validated in working tree，待 re-review |
+| P8 PR review 1939-F1：ToolRuntime catch-all 吞 `AttemptFencingError` | PR #40 | fixed, validated |
+| P8 PR review 1939-F3：`_handle_owner_lost` 普通异常后 active attempt 未清理 | PR #40 | fixed, validated |
+| P8 PR review 1939-F4：STALE fencing 诊断未归类为 terminal | PR #40 | fixed, validated |
+| P8 PR review 1939-F5：durable memory snapshot clock 未注入 | PR #40 | fixed, validated |
+| P8 PR review 1943-F1：durable memory observer 非终态 checkpoint 后重启丢 pending facts | PR #40 | fixed, validated |
+| P8 PR review 1943-F2：旧 public `ToolFetchMoreHandle*` contracts 仍导出 | PR #40 | fixed, validated |
+| P8 PR review 1948-F1：durable `_scope_appender()` 无 owner scope 静默 fallback | PR #40 | fixed, validated |
+| P8 PR review 2044-F1~F6：scope 调用 / RECOVERING / lease_exit_stack / cursor mutation / terminal set / diagnostic log | PR #40 | fixed, validated |
+| P8 PR review 2044-F4 residual：`fetch_more` 当前用专属 RunEventType + 多 fact 表达，暴露 COMPLETED 成功 + ISSUED 失败的 partial fact 风险；root cause 疑似为 ToolRuntime event model 错层，EventLog batch 原子性是否仍是独立问题尚未定论 | P8.5 | deferred-with-owner |
+| `TOOL_FETCH_MORE_REQUESTED` / `TOOL_FETCH_MORE_COMPLETED` / `TOOL_FETCH_MORE_FAILED` 将具体 Host built-in tool 名编码进 RunEventType，未来每新增内置工具都可能诱导新增事件类型 | P8.5 | deferred-with-owner |
+| `TOOL_CURSOR_ISSUED` / `TOOL_CURSOR_EXPIRED` / `TOOL_CURSOR_DENIED` / `TOOL_RESULT_TRUNCATED` 属于通用 ToolRuntime 机制 fact 还是应并入通用 tool result fact，需基于 projection / trace / replay 直接证据裁决 | P8.5 | needs-more-evidence |
+| P8 PR review 2051-F1~F5 + T2~T4：session leak / verify_run_id / observer CAUGHT_UP / lastrowid / RECOVERING / coverage tests | PR #40 | fixed, validated |
 | P8 PR review 1948-F2：`_verify_run_id_matches()` 缺独立 RUN_ID_MISMATCH reason | P9 / P16 interface freeze | deferred-with-owner |
 | durable memory repair 按 session 扫描 EventLog 的容量风险 | P9 / capacity | deferred-with-owner |
-| `recover_stale_attempts(run_id=None)` 全局扫描路径未单测 | P9 / test hardening | deferred-with-owner |
+| `recover_stale_attempts(run_id=None)` 全局扫描路径未单测 | PR #40 | fixed (T2 test added) |
 | `next_attempt_index` 未独立单测 | P9 / test hardening | deferred-with-owner |
 | recovery scan 自动接入生产启动链路 | P9 / Session lifecycle | deferred-with-owner |
 | `startup_reconcile` 自动接入 Host 启动流程 | P9 / Session lifecycle | deferred-with-owner |
 | `HostStorage.close()` 对后台 task / `to_thread` commit 无生命周期保护 | P9 lifecycle | deferred-with-owner |
 | compact 成功但后续 durable append 失败时的诊断事件精度 | P15 governance hardening | deferred-with-owner |
-| observer 在空 EventLog 且 `last_success_position is None` 时无法明确转 `CAUGHT_UP` | P15 governance hardening | deferred-with-owner |
+| observer 在空 EventLog 且 `last_success_position is None` 时无法明确转 `CAUGHT_UP` | PR #40 | fixed (zero-event observer advance) |
 | observer buffered drain / best-effort observer 解耦 / observer claim lease | GitHub issue #28 / P15 | deferred-with-owner |
 | 慢硬盘 + Docker Linux multiprocessing stress 稳定性 | GitHub issue #38 | tracked |
 | Tool Trace JSONL 文件滚动边界 | GitHub issue #36 | tracked |

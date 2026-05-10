@@ -241,7 +241,7 @@ class ProjectionCoordinator:
                             position=checkpoint.last_success_position
                             or GlobalEventPosition(value=0),
                             status=ObserverStatus.CAUGHT_UP,
-                        ) if checkpoint.last_success_position is not None else None
+                        )
                 refreshed = self.projection_store.get(
                     observer_id=desc.observer_id,
                     projection_name=desc.projection_name,

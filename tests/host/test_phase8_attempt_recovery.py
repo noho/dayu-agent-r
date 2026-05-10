@@ -465,3 +465,85 @@ async def test_recover_does_not_advance_projection_checkpoint() -> None:
         assert after.retry_count == before.retry_count
     finally:
         storage.close()
+
+
+@pytest.mark.asyncio
+async def test_recover_stale_attempts_full_scan_run_id_none() -> None:
+    """``run_id=None`` 全库扫描: 跨多个 run 的过期 attempt 独立收口。
+
+    T2: 验证全库扫描路径的候选排序与跨 run 独立事务回滚行为。
+    """
+
+    storage = _open_storage()
+    try:
+        run_a, run_b, run_c = "r-full-a", "r-full-b", "r-full-c"
+        await _seed_run(storage, run_id=run_a)
+        await _seed_run(storage, run_id=run_b)
+        # run_c 为 terminal run。
+        await _seed_run(
+            storage, run_id=run_c, state=ExtendedRunState.SUCCEEDED
+        )
+        clock = _FakeClock()
+        supervisor = _build_supervisor(storage=storage, clock=clock)
+
+        # 为每个 run 创建一个 attempt。
+        async with supervisor.lease_context(
+            run_id=run_a, attempt_index=0
+        ) as ctx_a:
+            attempt_a = ctx_a.attempt_id
+        async with supervisor.lease_context(
+            run_id=run_b, attempt_index=0
+        ) as ctx_b:
+            attempt_b = ctx_b.attempt_id
+        async with supervisor.lease_context(
+            run_id=run_c, attempt_index=0
+        ) as ctx_c:
+            attempt_c = ctx_c.attempt_id
+
+        # 推进时间使所有 lease 过期。
+        clock.advance(timedelta(seconds=120))
+
+        # 全库扫描。
+        decisions = await supervisor.recover_stale_attempts(run_id=None)
+        assert len(decisions) == 3
+
+        decision_map = {d.source_attempt_id: d for d in decisions}
+
+        # run_a: lease 过期 -> MARK_LOST。
+        da = decision_map[attempt_a]
+        assert da.action is AttemptRecoveryAction.MARK_LOST
+        assert da.reason == "recovery_lease_expired"
+
+        # run_b: lease 过期 -> MARK_LOST。
+        db = decision_map[attempt_b]
+        assert db.action is AttemptRecoveryAction.MARK_LOST
+        assert db.reason == "recovery_lease_expired"
+
+        # run_c: run 已 terminal -> MARK_LOST。
+        dc = decision_map[attempt_c]
+        assert dc.action is AttemptRecoveryAction.MARK_LOST
+        assert dc.reason == "recovery_run_terminal"
+
+        # 每个 run 仍只有旧 attempt, 无 recovery attempt 行。
+        assert await _attempt_count(storage, run_id=run_a) == 1
+        assert await _attempt_count(storage, run_id=run_b) == 1
+        assert await _attempt_count(storage, run_id=run_c) == 1
+
+        # 所有 attempt 均为 LOST。
+        async with storage.transaction() as tx:
+            for attempt_id in (attempt_a, attempt_b, attempt_c):
+                row = tx.execute(
+                    "SELECT state FROM host_attempts WHERE attempt_id = ?",
+                    (attempt_id,),
+                ).fetchone()
+                assert row["state"] == AttemptState.LOST.value
+
+        # EventLog 无诊断 RunEvent。
+        for run_id in (run_a, run_b, run_c):
+            assert await _events_for(supervisor.event_store, run_id=run_id) == 0
+
+        # 二次扫描幂等: 所有 attempt 已 LOST, 候选集为空。
+        second = await supervisor.recover_stale_attempts(run_id=None)
+        assert len(second) == 0
+    finally:
+        storage.close()

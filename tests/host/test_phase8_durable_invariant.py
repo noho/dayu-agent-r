@@ -36,7 +36,7 @@ from dayu.host._host_storage_transaction import HostStorage
 from dayu.host._proxy import LocalProxy
 from dayu.host._run_harness import LocalRunHarness
 from dayu.host._run_state_store import AttemptLeaseStore, AttemptStateStore
-from dayu.host._tool_runtime import InMemoryToolRuntime
+from dayu.host._tool_runtime import HostToolRuntime
 from dayu.host._tool_runtime import PlainRunEventAppender
 from dayu.host._worker import EngineWorker
 from dayu.host._tool_runtime import ToolRuntimeToolExecutor
@@ -100,7 +100,7 @@ def _make_proxy() -> LocalProxy:
     :raises Exception: 不主动抛出异常。
     """
 
-    runtime = InMemoryToolRuntime(
+    runtime = HostToolRuntime(
         is_durable=False,
         executor=_NoopExec(),  # type: ignore[arg-type]
         event_store=InMemoryRunEventStore(),
@@ -108,29 +108,29 @@ def _make_proxy() -> LocalProxy:
     return LocalProxy(worker=EngineWorker(ToolRuntimeToolExecutor(runtime)))
 
 
-def _make_non_durable_runtime() -> InMemoryToolRuntime:
+def _make_non_durable_runtime() -> HostToolRuntime:
     """构造非 durable ToolRuntime,与 harness ``is_durable=False`` 同源。
 
-    :returns: ``is_durable=False`` 的 :class:`InMemoryToolRuntime`。
+    :returns: ``is_durable=False`` 的 :class:`HostToolRuntime`。
     :raises Exception: 不主动抛出异常。
     """
 
-    return InMemoryToolRuntime(
+    return HostToolRuntime(
         is_durable=False,
         executor=_NoopExec(),  # type: ignore[arg-type]
         event_store=InMemoryRunEventStore(),
     )
 
 
-def _make_durable_runtime(storage: HostStorage) -> InMemoryToolRuntime:
+def _make_durable_runtime(storage: HostStorage) -> HostToolRuntime:
     """构造 durable ToolRuntime,与 harness ``is_durable=True`` 同源。
 
     :param storage: 共享 storage(传给 :class:`DurableRunEventStore`)。
-    :returns: ``is_durable=True`` 的 :class:`InMemoryToolRuntime`。
+    :returns: ``is_durable=True`` 的 :class:`HostToolRuntime`。
     :raises Exception: 不主动抛出异常。
     """
 
-    return InMemoryToolRuntime(
+    return HostToolRuntime(
         is_durable=True,
         executor=_NoopExec(),  # type: ignore[arg-type]
         event_store=DurableRunEventStore(storage=storage),

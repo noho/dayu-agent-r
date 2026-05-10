@@ -27,6 +27,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import sqlite3
 from contextlib import asynccontextmanager
 from collections.abc import AsyncGenerator, AsyncIterator
 from dataclasses import dataclass, field
@@ -86,6 +87,7 @@ from dayu.host._internal_contracts import (
 )
 from dayu.host._run_state_store import AttemptLeaseStore
 from dayu.host._run_harness import _ActiveAttempt
+from dayu.host._tool_runtime import HostToolRuntime
 from dayu.host.contracts import (
     HostRunFailedData,
     RunEvent,
@@ -1760,5 +1762,299 @@ async def test_owner_lost_handler_non_fencing_error_clears_active_attempt(
                 current_user_event=current_user_event,
             )
         assert finish_calls == []
+    finally:
+        bundle.close()
+
+
+def _noop_tool_runtime(
+    event_store: DurableRunEventStore,
+) -> HostToolRuntime:
+    """构造一个 noop tool runtime 用于不需要工具执行的测试。
+
+    :param event_store: 事件 store。
+    :returns: tool runtime 实例。
+    :raises Exception: 不主动抛出异常。
+    """
+
+    from dayu.contracts.tool_call import ToolExecutionRequest
+    from dayu.contracts.tool_outcome import (
+        ToolCompletedOutcome,
+        ToolExecutionOutcome,
+    )
+    from dayu.contracts.tool_result import ToolResultSuccess
+
+    class _NoopExecutor:
+        async def execute(
+            self, request: ToolExecutionRequest
+        ) -> ToolExecutionOutcome:
+            del request
+            return ToolCompletedOutcome(
+                result=ToolResultSuccess(
+                    ok=True, value=None, truncation=None, meta=None
+                )
+            )
+
+    return HostToolRuntime(
+        is_durable=True,
+        executor=_NoopExecutor(),
+        event_store=event_store,
+    )
+
+
+@pytest.mark.asyncio
+async def test_handle_owner_lost_closes_stack_on_non_fencing_exception() -> None:
+    """``_handle_owner_lost`` 非 AttemptFencingError 异常时也关闭 lease_exit_stack。"""
+
+    from dayu.host._run_harness import LocalRunHarness
+    from dayu.host._proxy import WorkerProxy
+    from tests.host._memory_store_fake import (
+        FakeInMemoryConversationMemoryStore,
+    )
+
+    storage = _open_storage()
+    try:
+        await _seed_run(storage)
+        clock = _FakeClock()
+        supervisor = _build_supervisor(storage=storage, clock=clock)
+        event_store = _build_event_store(storage)
+
+        class _ExplodingSupervisor:
+            """append_terminal_and_close 抛非 fencing 异常。"""
+
+            def __init__(self, inner: AttemptSupervisor) -> None:
+                self._inner = inner
+
+            async def append_terminal_and_close(
+                self, **_kwargs: object
+            ) -> object:
+                raise sqlite3.DatabaseError("disk I/O error")
+
+            def scoped_appender(
+                self, owner_context: AttemptOwnerContext
+            ) -> AttemptScopedRunEventAppender:
+                return self._inner.scoped_appender(owner_context)
+
+            async def close_attempt_with_diagnostic_state(
+                self, **_kwargs: object
+            ) -> bool:
+                return True
+
+            async def wait_owner_lost(
+                self, _owner_context: AttemptOwnerContext
+            ) -> AttemptOwnerLossReason:
+                await asyncio.sleep(10)
+                return AttemptOwnerLossReason.FENCED  # pragma: no cover
+
+            def is_owner_active(
+                self, _owner_context: AttemptOwnerContext
+            ) -> bool:
+                return False
+
+        exploding = _ExplodingSupervisor(supervisor)
+        stack_closed = False
+
+        class _TrackingStack:
+            """记录 aclose 是否被调用。"""
+
+            def __init__(self) -> None:
+                pass
+
+            async def aclose(self) -> None:
+                nonlocal stack_closed
+                stack_closed = True
+
+        harness = LocalRunHarness(
+            is_durable=True,
+            proxy=cast(WorkerProxy, _NoopProxy()),
+            event_store=event_store,
+            tool_runtime=_noop_tool_runtime(event_store),
+            memory_store=FakeInMemoryConversationMemoryStore(),
+            coordinator=None,
+            attempt_supervisor=cast(AttemptSupervisor, exploding),
+            storage=storage,
+        )
+
+        # 构造一个带 owner_context 的 active attempt。
+        async with supervisor.lease_context(
+            run_id="r1", attempt_index=0
+        ) as owner_context:
+            tracking_stack = _TrackingStack()
+            active = _ActiveAttempt(
+                attempt_id=owner_context.attempt_id,
+                owner_context=owner_context,
+                lease_exit_stack=tracking_stack,  # type: ignore[arg-type]
+            )
+
+            request = StartRunRequest(
+                session_id="s1",
+                run_id="r1",
+                input=RunInput(
+                    messages=(
+                        UserMessage(
+                            role=AgentMessageRole.USER, content="hi"
+                        ),
+                    )
+                ),
+                options=RunOptions(
+                    runner_spec=RunnerSpec(
+                        provider="openai",
+                        model="m",
+                        endpoint="https://example.test/v1/chat/completions",
+                        api_key_ref="K",
+                        headers={},
+                        supports_tool_calling=True,
+                        supports_streaming=True,
+                        supports_stream_usage=False,
+                        default_timeout_seconds=30.0,
+                        max_retries=0,
+                        provider_request=None,
+                    ),
+                    runner_options=RunnerCallOptions(
+                        temperature=None,
+                        max_tokens=None,
+                        top_p=None,
+                        stream=True,
+                    ),
+                    agent_policy=AgentPolicy(
+                        max_iterations=3,
+                        continuation_max_attempts=1,
+                        allow_tool_calls=True,
+                    ),
+                    stream=False,
+                    disable_tools=True,
+                    tool_schemas=(),
+                ),
+            )
+
+            with pytest.raises(sqlite3.DatabaseError, match="disk I/O"):
+                await harness._handle_owner_lost(  # noqa: SLF001
+                    request=request,
+                    active_attempt=active,
+                    loss_reason=AttemptOwnerLossReason.STORAGE_ERROR,
+                    event_count=0,
+                    terminal_seen=False,
+                )
+            assert stack_closed, (
+                "非 fencing 异常时 lease_exit_stack 必须被关闭"
+            )
+    finally:
+        storage.close()
+
+
+class _NoopProxy:
+    """最小 proxy stub。"""
+
+    async def stream_engine_events(
+        self,
+        **_kwargs: object,
+    ) -> AsyncIterator[EngineEvent]:
+        yield  # type: ignore[misc]
+        return  # pragma: no cover
+
+
+@pytest.mark.asyncio
+async def test_lease_context_cleans_session_on_create_task_failure() -> None:
+    """``asyncio.create_task`` 失败时 ``_sessions`` 无残留。"""
+
+    storage = _open_storage()
+    try:
+        await _seed_run(storage)
+        clock = _FakeClock()
+        supervisor = _build_supervisor(storage=storage, clock=clock)
+        original_create_task = asyncio.create_task
+        call_count = 0
+
+        def _failing_create_task(*args: object, **kwargs: object) -> asyncio.Task[object]:
+            nonlocal call_count
+            call_count += 1
+            raise RuntimeError("event loop closed")
+
+        asyncio.create_task = _failing_create_task  # type: ignore[assignment]
+        try:
+            with pytest.raises(RuntimeError, match="event loop closed"):
+                async with supervisor.lease_context(
+                    run_id="r1", attempt_index=0
+                ):
+                    pass  # pragma: no cover
+            assert supervisor._sessions == {}
+        finally:
+            asyncio.create_task = original_create_task  # type: ignore[assignment]
+    finally:
+        storage.close()
+
+
+@pytest.mark.asyncio
+async def test_worker_exception_before_owner_scope_writes_terminal() -> None:
+    """``stream_engine_events`` 在 ``_attempt_owner_scope`` 前抛普通异常时,
+    durable path 写入 Host ``RUN_FAILED`` terminal, RunStream 不 hang。
+
+    修复 2044-F1: ``_append_worker_failure_if_needed`` 改用
+    ``_resolve_attempt_appender(active_attempt)`` 替代 ``_scope_appender()``,
+    确保在 owner scope 进入前也能正确写入 terminal event。
+    """
+
+    from dayu.host._durable_harness import (
+        DurableHarnessConfig,
+        build_durable_harness,
+    )
+    from dayu.host._proxy import WorkerProxy
+    from dayu.host._run_harness import LocalRunHarness
+
+    class _ExplodingProxy:
+        """``stream_engine_events`` 抛出非 fencing 异常。"""
+
+        def stream_engine_events(
+            self,
+            *,
+            request: StartRunRequest,
+            cancellation_token: CancellationToken,
+        ) -> AsyncIterator[EngineEvent]:
+            del request, cancellation_token
+            raise RuntimeError("engine assembly failed")
+
+    fast_renew = AttemptLeaseConfig(
+        ttl=timedelta(seconds=30),
+        renew_interval=timedelta(milliseconds=5),
+        owner_id_prefix="host-test",
+    )
+    bundle = build_durable_harness(
+        config=DurableHarnessConfig(
+            database_path=":memory:",
+            attempt_lease_config=fast_renew,
+        )
+    )
+    try:
+        # 构造使用 exploding proxy 的 harness。
+        harness = LocalRunHarness(
+            is_durable=True,
+            proxy=cast(WorkerProxy, _ExplodingProxy()),
+            event_store=bundle.event_store,
+            tool_runtime=bundle.harness.tool_runtime,
+            memory_store=bundle.memory_store,
+            coordinator=bundle.coordinator,
+            attempt_supervisor=bundle.attempt_supervisor,
+            storage=bundle.storage,
+        )
+
+        request = _minimal_start_request(session_id="s_f1", run_id="r_f1")
+        stream = await harness.start_run(request)
+
+        # 消费 RunStream 直到结束。
+        events: list[RunEvent] = []
+        async for event in stream.events:
+            events.append(event)
+
+        # 验证 terminal event 已写入。
+        terminal_events = [
+            e for e in events
+            if e.type in {RunEventType.RUN_FAILED, RunEventType.FINAL_ANSWER}
+        ]
+        assert len(terminal_events) >= 1, (
+            "worker 异常后必须写入 terminal RunEvent"
+        )
+
+        # 验证 RunResult 可推导。
+        result = bundle.run_state_store.get_terminal_result("r_f1")
+        assert result is not None, "RunResult 必须可推导"
     finally:
         bundle.close()

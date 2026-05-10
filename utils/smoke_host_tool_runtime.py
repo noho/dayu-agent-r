@@ -54,7 +54,7 @@ from dayu.contracts.tool_result import ToolResultSuccess
 from dayu.host._event_store import InMemoryRunEventStore
 from dayu.host._proxy import LocalProxy
 from dayu.host._run_harness import LocalRunHarness
-from dayu.host._tool_runtime import InMemoryToolRuntime, ToolRuntimeToolExecutor
+from dayu.host._tool_runtime import HostToolRuntime, ToolRuntimeToolExecutor
 from utils._smoke_memory_store import SmokeInMemoryConversationMemoryStore
 from dayu.host._worker import EngineWorker
 from dayu.host.contracts import (
@@ -194,7 +194,7 @@ async def _main() -> None:
     """
 
     event_store = InMemoryRunEventStore()
-    runtime = InMemoryToolRuntime(
+    runtime = HostToolRuntime(
         is_durable=False,
         executor=_LargeListExecutor(),
         event_store=event_store,
@@ -203,7 +203,7 @@ async def _main() -> None:
     adapter = ToolRuntimeToolExecutor(runtime)
     # harness 在 P8-S2 之前用于演示 LocalRunHarness 的公开 fetch_more 入口；
     # S2 之后 framework fetch_more 仅作普通 tool call 经
-    # ToolRuntimeToolExecutor -> InMemoryToolRuntime.execute_tool_call。
+    # ToolRuntimeToolExecutor -> HostToolRuntime.execute_tool_call。
     # 保留 harness 装配仅为验证 LocalRunHarness 仍能持有 tool_runtime。
     harness = LocalRunHarness(
         is_durable=False,

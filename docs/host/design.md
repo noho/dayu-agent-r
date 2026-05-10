@@ -588,7 +588,6 @@ FAILED
 CANCELLED
 SUSPENDED
 STALE
-RECOVERING
 LOST
 ```
 
@@ -601,9 +600,7 @@ RUNNING -> FAILED
 RUNNING -> CANCELLED
 RUNNING -> SUSPENDED
 RUNNING -> STALE
-RUNNING -> RECOVERING
 RUNNING -> LOST
-STALE -> RECOVERING
 STALE -> LOST
 ```
 
@@ -618,9 +615,6 @@ STALE -> LOST
 - `STALE`：旧 owner lease 过期, 结果未知, 当前 attempt 已关闭执行权; P8 D2 后 recovery
   scan 一律把过期 lease 收口为 `LOST`(诊断终态), `STALE` 仅作为运维 / smoke 显式诊断 API
   保留, 不在生产 recovery 主路径出现。
-- `RECOVERING`：仍保留为 attempt 状态码以兼容已有 EventLog / 旧库 recovery 链, 但 P8 D2 后
-  生产 recovery 主路径不再产生 `RECOVERING` 状态; 重试 / resume 必须由 Service 层显式发起新的
-  `StartRunRequest` (新 attempt_index)。
 - `LOST`：结果无法确认; Recovery 主路径默认终态; 不允许再写 attempt-scoped facts。
 
 `SUSPENDED` 是 issue #4 的预留状态：表示 Engine / ToolExecutor 协作产生等待事实后，
@@ -1102,7 +1096,7 @@ P2 后工具执行边界：
 Engine
   -> ToolExecutor.execute(request)
   -> Host-owned ToolRuntimeToolExecutor
-  -> InMemoryToolRuntime.execute_tool_call(request)
+  -> HostToolRuntime.execute_tool_call(request)
       -> underlying business ToolExecutor
       -> schema-driven truncate / cursor store
       -> RunEventStore.append(canonical tool runtime facts)
@@ -1115,7 +1109,7 @@ P2 后补读边界：
 UI / Service / test harness
   -> get_tool_fetch_more_handle(session / run / original tool_call / cursor fingerprint)
   -> fetch_more_tool_result(handle cursor + scope token + optional limit)
-  -> InMemoryToolRuntime.fetch_more(request)
+  -> HostToolRuntime.fetch_more(request)
   -> RunEventStore.append(canonical fetch_more facts)
   -> ToolFetchMoreResult
 ```
@@ -1152,7 +1146,7 @@ P5 后目标的 LLM-facing truncate / fetch_more 执行路径是：
 Model -> tool_call huge_echo(...)
   -> Engine treats it as ordinary LLM tool call
   -> ToolExecutor.execute
-  -> ToolRuntimeToolExecutor -> InMemoryToolRuntime
+  -> ToolRuntimeToolExecutor -> HostToolRuntime
   -> huge_echo returns a large result
   -> ToolRuntime applies ToolTruncateSpec
       -> supports text_chars / text_lines / list_items / binary_bytes
@@ -1326,7 +1320,7 @@ LocalRunHarness.start_run(turn 1)
   -> LocalProxy -> EngineWorker -> Engine Agent tool loop
   -> model tool_call huge_echo
   -> ToolExecutor.execute
-  -> ToolRuntimeToolExecutor -> InMemoryToolRuntime -> huge_echo executor
+  -> ToolRuntimeToolExecutor -> HostToolRuntime -> huge_echo executor
   -> ToolRuntime append truncate / cursor facts
   -> Engine injects truncated tool result with next_action=fetch_more hint
   -> model tool_call fetch_more

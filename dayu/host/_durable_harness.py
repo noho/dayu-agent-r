@@ -65,7 +65,7 @@ from dayu.host._run_state_store import (
 )
 from dayu.host._timeline_projection import TimelineProjectionObserver
 from dayu.host._tool_runtime import (
-    InMemoryToolRuntime,
+    HostToolRuntime,
     ToolRuntimeToolExecutor,
 )
 from dayu.host._tool_trace_jsonl_sink import ToolTraceJsonlSink
@@ -245,7 +245,7 @@ def build_durable_harness(
     actual_executor: ToolExecutor = (
         executor if executor is not None else _NoopToolExecutor()
     )
-    runtime = InMemoryToolRuntime(
+    runtime = HostToolRuntime(
         is_durable=True,
         executor=actual_executor,
         event_store=event_store,

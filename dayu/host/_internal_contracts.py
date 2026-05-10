@@ -63,14 +63,14 @@ class FencingToken:
 class AttemptState(StrEnum):
     """Host attempt 最小持久状态。
 
-    P8 在 P6 基础上把 ``STALE_DIAGNOSTIC`` 拆分为 ``STALE`` /
-    ``RECOVERING`` / ``LOST`` 三个 owner-aware 终止 / 中间态：
+    P8 在 P6 基础上把 ``STALE_DIAGNOSTIC`` 拆分为 ``STALE`` / ``LOST``
+    两个 owner-aware 诊断终态：
 
-    - ``STALE``：旧 owner lease 过期，attempt 已被关闭执行权但尚未创建
-      recovery attempt；结果未知。
-    - ``RECOVERING``：旧 attempt 已被 recovery CAS 关闭，并在同事务创
-      建了新的 recovery attempt。
+    - ``STALE``：旧 owner lease 过期，attempt 已被关闭执行权；结果未知。
     - ``LOST``：结果无法确认且 policy 不创建 recovery attempt。
+
+    P8 D2: recovery 仅做诊断收口, 不创建 recovery attempt; ``RECOVERING``
+    中间态已废弃, 不再有写入路径。
 
     合法迁移由 P8 supervisor / lease store 在 CAS 层强制；本枚举只承载
     持久状态字面量。
@@ -83,7 +83,6 @@ class AttemptState(StrEnum):
     CANCELLED = "cancelled"
     SUSPENDED = "suspended"
     STALE = "stale"
-    RECOVERING = "recovering"
     LOST = "lost"
 
 
@@ -147,8 +146,8 @@ class AttemptRecord:
     :param started_at: attempt 开始时间。
     :param finished_at: attempt 完成时间;未完成为 ``None``。
     :param terminal_event_position: terminal 事件全局位置；正常 terminal
-        attempt 必须非空；``STALE`` / ``RECOVERING`` / ``LOST`` 这类无
-        terminal RunEvent 的诊断终态可为空。
+        attempt 必须非空；``STALE`` / ``LOST`` 这类无 terminal RunEvent
+        的诊断终态可为空。
     :param failure_summary: 失败摘要；非失败 / 未失败为 ``None``。
     :param owner_id: 当前 owner 诊断 id；无 owner 为 ``None``。
     :param owner_token_hash: 当前 owner token 的 SHA-256 hex 摘要；无
@@ -161,8 +160,8 @@ class AttemptRecord:
         acquire 时为 ``None``。
     :param recovered_from_attempt_id: 仅在新 recovery attempt 上写入，
         指向被恢复的旧 attempt id。
-    :param stale_marked_at: 旧 attempt 被标记 ``STALE`` / ``RECOVERING`` /
-        ``LOST`` 时的 UTC 时刻；其它状态为 ``None``。
+    :param stale_marked_at: 旧 attempt 被标记 ``STALE`` / ``LOST`` 时的
+        UTC 时刻；其它状态为 ``None``。
     """
 
     attempt_id: str

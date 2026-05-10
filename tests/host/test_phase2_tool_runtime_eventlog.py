@@ -36,7 +36,7 @@ from dayu.host import (
 )
 from dayu.host.contracts import RunEventDraft
 from dayu.host._event_store import InMemoryRunEventStore
-from dayu.host._tool_runtime import InMemoryToolRuntime
+from dayu.host._tool_runtime import HostToolRuntime
 
 
 @dataclass(frozen=True, slots=True)
@@ -205,7 +205,7 @@ def _framework_request(
     )
 
 
-def _runtime() -> tuple[InMemoryToolRuntime, InMemoryRunEventStore]:
+def _runtime() -> tuple[HostToolRuntime, InMemoryRunEventStore]:
     """构造 runtime 与 event store。
 
     :returns: runtime 与 store。
@@ -213,7 +213,7 @@ def _runtime() -> tuple[InMemoryToolRuntime, InMemoryRunEventStore]:
     """
 
     store = InMemoryRunEventStore()
-    runtime = InMemoryToolRuntime(
+    runtime = HostToolRuntime(
         is_durable=False,
         executor=_Executor(value=[1, 2, 3, 4]),
         event_store=store,
@@ -344,7 +344,7 @@ async def test_expired_cursor_appends_owner_cursor_expired_fact() -> None:
 
     clock = _Clock()
     store = InMemoryRunEventStore()
-    runtime = InMemoryToolRuntime(
+    runtime = HostToolRuntime(
         is_durable=False,
         executor=_Executor(value=[1, 2, 3, 4]),
         event_store=store,

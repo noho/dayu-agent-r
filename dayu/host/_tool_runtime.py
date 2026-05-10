@@ -124,7 +124,7 @@ class ToolRuntimeEventAppender(Protocol):
 
     本 Protocol 是 ToolRuntime 写入 ``TOOL_RESULT_TRUNCATED`` /
     ``TOOL_CURSOR_*`` / ``TOOL_FETCH_MORE_*`` 等 Host-owned canonical
-    fact 的唯一入口; ``InMemoryToolRuntime`` 的 7 个 ``_append_*``
+    fact 的唯一入口; ``HostToolRuntime`` 的 7 个 ``_append_*``
     helper 不再直接调用 :class:`RunEventStore.append`, 全部通过当前
     active appender 落库。
 
@@ -314,7 +314,7 @@ class _CursorCreation:
 class ToolRuntimeToolExecutor:
     """将 Host ToolRuntime 适配为 Engine 可消费的 ToolExecutor。"""
 
-    runtime: "InMemoryToolRuntime"
+    runtime: "HostToolRuntime"
 
     async def execute(
         self,
@@ -332,8 +332,12 @@ class ToolRuntimeToolExecutor:
 
 
 @dataclass(slots=True, kw_only=True)
-class InMemoryToolRuntime:
-    """单进程内存态 ToolRuntime。
+class HostToolRuntime:
+    """Host-owned ToolRuntime。
+
+    durable 路径下 canonical facts 通过 owner-scoped appender 写 EventLog；
+    cursor registry（``_records_by_cursor`` / ``_cursor_by_fingerprint``）
+    是 transient coordination state，进程重启后丢失不等于 durable fact 丢失。
 
     :param is_durable: P8-S1 装配显式声明位:``True`` 表示由
         :func:`build_durable_harness` 装配的 production / durable runtime,
@@ -341,7 +345,7 @@ class InMemoryToolRuntime:
         ContextVar 解析 owner-bound appender, 缺失时立即 ``RuntimeError``;
         ``False`` 表示 test-only 装配,允许在 ContextVar 缺失时退化为
         :class:`PlainRunEventAppender`。本字段是 keyword-only 必填参数,
-        所有 ``InMemoryToolRuntime(...)`` 构造点必须显式传值。
+        所有 ``HostToolRuntime(...)`` 构造点必须显式传值。
     :param executor: 底层业务 ToolExecutor。
     :param event_store: Host RunEventStore; 仅用作 ``list_events`` 终态
         cursor 检测以及无 owner scope 路径的回退 fact append。
@@ -813,21 +817,24 @@ class InMemoryToolRuntime:
             )
             new_offset = record.offset + chunk_size
             has_more = new_offset < record.total
-            self._remove_cursor(record.cursor)
+            # 纯构建 next cursor：不写入内存 maps，不产生副作用。
             next_cursor: ToolRuntimeCursor | None = None
             next_issued_event: ToolCursorIssuedData | None = None
+            pending_cursor_creation: _CursorCreation | None = None
             if has_more:
-                cursor_creation = self._store_cursor_from_record(
+                pending_cursor_creation = self._build_cursor_from_record(
                     record=record,
                     offset=new_offset,
                     parent_cursor_fingerprint=record.cursor_fingerprint,
                     iteration_id=request.iteration_id,
                 )
                 next_cursor = ToolRuntimeCursor(
-                    value=cursor_creation.record.cursor,
-                    fingerprint=cursor_creation.record.cursor_fingerprint,
+                    value=pending_cursor_creation.record.cursor,
+                    fingerprint=pending_cursor_creation.record.cursor_fingerprint,
                 )
-                next_issued_event = cursor_creation.issued_event
+                next_issued_event = pending_cursor_creation.issued_event
+            # EventLog append：此时内存 maps 尚未变更，
+            # AttemptFencingError 直接透传即可，无需回滚。
             completed_event = await self._append_fetch_completed(
                 request=request,
                 record=record,
@@ -842,6 +849,10 @@ class InMemoryToolRuntime:
                     request=request,
                     data=next_issued_event,
                 )
+            # 所有 EventLog append 成功：现在安全地变更内存 maps。
+            self._remove_cursor(record.cursor)
+            if pending_cursor_creation is not None:
+                self._commit_cursor_creation(pending_cursor_creation)
             return ToolFetchMoreSucceededResult(
                 run_id=request.run_id,
                 session_id=request.session_id,
@@ -942,7 +953,7 @@ class InMemoryToolRuntime:
         parent_cursor_fingerprint: str,
         iteration_id: str,
     ) -> _CursorCreation:
-        """从旧 cursor 记录派生下一页 cursor。
+        """从旧 cursor 记录派生下一页 cursor 并立即注册。
 
         :param record: 已消费 cursor 记录。
         :param offset: 下一页起始 offset。
@@ -973,7 +984,45 @@ class InMemoryToolRuntime:
             scope_hash=record.scope_hash,
         )
 
-    def _create_cursor(
+    def _build_cursor_from_record(
+        self,
+        *,
+        record: _CursorRecord,
+        offset: int,
+        parent_cursor_fingerprint: str,
+        iteration_id: str,
+    ) -> _CursorCreation:
+        """从旧 cursor 记录纯构建下一页 cursor，不写入内存 maps。
+
+        :param record: 已消费 cursor 记录。
+        :param offset: 下一页起始 offset。
+        :param parent_cursor_fingerprint: 父 cursor 指纹。
+        :param iteration_id: 派生 cursor 所属 Engine iteration id。
+        :returns: cursor 创建结果（未注册到内存 maps）。
+        :raises Exception: 不主动抛出异常。
+        """
+
+        return self._build_cursor_creation(
+            session_id=record.session_id,
+            run_id=record.run_id,
+            iteration_id=iteration_id,
+            tool_call_id=record.tool_call_id,
+            tool_name=record.tool_name,
+            strategy=record.strategy,
+            unit=record.unit,
+            limit=record.limit,
+            total=record.total,
+            data=record.data,
+            offset=offset,
+            template=record.template,
+            field_path=record.field_path,
+            parent_cursor_fingerprint=parent_cursor_fingerprint,
+            arguments=None,
+            ttl_seconds=record.ttl_seconds,
+            scope_hash=record.scope_hash,
+        )
+
+    def _build_cursor_creation(
         self,
         *,
         session_id: str,
@@ -994,7 +1043,10 @@ class InMemoryToolRuntime:
         ttl_seconds: int,
         scope_hash: str | None = None,
     ) -> _CursorCreation:
-        """保存 cursor record 并返回签发事实材料。
+        """纯构建 cursor 创建结果，不写入内存 maps。
+
+        调用方拿到返回值后，必须显式调用 :meth:`_commit_cursor_creation`
+        才会注册到 ``_records_by_cursor`` / ``_cursor_by_fingerprint``。
 
         :param session_id: 会话 id。
         :param run_id: Run id。
@@ -1012,12 +1064,11 @@ class InMemoryToolRuntime:
         :param arguments: 工具参数；派生 cursor 可为 ``None``。
         :param ttl_seconds: TTL 秒数。
         :param scope_hash: 已有 scope hash。
-        :returns: cursor 创建结果。
+        :returns: cursor 创建结果（未注册到内存 maps）。
         :raises Exception: 不主动抛出异常。
         """
 
         now = self.clock()
-        self._cleanup_expired(now)
         cursor = self.token_generator()
         cursor_fingerprint = _fingerprint_text(cursor)
         resolved_scope_hash = scope_hash
@@ -1057,8 +1108,6 @@ class InMemoryToolRuntime:
             ttl_seconds=ttl_seconds,
             parent_cursor_fingerprint=parent_cursor_fingerprint,
         )
-        self._records_by_cursor[cursor] = record
-        self._cursor_by_fingerprint[cursor_fingerprint] = cursor
         return _CursorCreation(
             record=record,
             issued_event=ToolCursorIssuedData(
@@ -1076,6 +1125,92 @@ class InMemoryToolRuntime:
                 single_use=True,
             ),
         )
+
+    def _commit_cursor_creation(
+        self, creation: _CursorCreation
+    ) -> None:
+        """将构建好的 cursor 注册到内存 maps。
+
+        :param creation: :meth:`_build_cursor_creation` 返回值。
+        :returns: 无返回值。
+        :raises Exception: 不主动抛出异常。
+        """
+
+        self._records_by_cursor[creation.record.cursor] = creation.record
+        self._cursor_by_fingerprint[
+            creation.record.cursor_fingerprint
+        ] = creation.record.cursor
+
+    def _create_cursor(
+        self,
+        *,
+        session_id: str,
+        run_id: str,
+        iteration_id: str,
+        tool_call_id: str,
+        tool_name: str,
+        strategy: str,
+        unit: str,
+        limit: int,
+        total: int,
+        data: _StoredData,
+        offset: int,
+        template: JsonValue | None,
+        field_path: tuple[str, ...] | None,
+        parent_cursor_fingerprint: str | None,
+        arguments: Mapping[str, JsonValue] | None,
+        ttl_seconds: int,
+        scope_hash: str | None = None,
+    ) -> _CursorCreation:
+        """构建 cursor 并立即注册到内存 maps（build + commit）。
+
+        供初始截断路径使用；``_fetch_more`` 的 next cursor 必须使用
+        :meth:`_build_cursor_creation` + :meth:`_commit_cursor_creation`
+        分步调用。
+
+        :param session_id: 会话 id。
+        :param run_id: Run id。
+        :param tool_call_id: 原始工具调用 id。
+        :param tool_name: 工具名。
+        :param strategy: 截断策略。
+        :param unit: 截断单位。
+        :param limit: 截断上限。
+        :param total: 原始总量估计。
+        :param data: 原始目标数据。
+        :param offset: 下一页起始 offset。
+        :param template: wrapper 模板。
+        :param field_path: wrapper 目标路径。
+        :param parent_cursor_fingerprint: 父 cursor 指纹。
+        :param arguments: 工具参数；派生 cursor 可为 ``None``。
+        :param ttl_seconds: TTL 秒数。
+        :param scope_hash: 已有 scope hash。
+        :returns: cursor 创建结果。
+        :raises Exception: 不主动抛出异常。
+        """
+
+        now = self.clock()
+        self._cleanup_expired(now)
+        creation = self._build_cursor_creation(
+            session_id=session_id,
+            run_id=run_id,
+            iteration_id=iteration_id,
+            tool_call_id=tool_call_id,
+            tool_name=tool_name,
+            strategy=strategy,
+            unit=unit,
+            limit=limit,
+            total=total,
+            data=data,
+            offset=offset,
+            template=template,
+            field_path=field_path,
+            parent_cursor_fingerprint=parent_cursor_fingerprint,
+            arguments=arguments,
+            ttl_seconds=ttl_seconds,
+            scope_hash=scope_hash,
+        )
+        self._commit_cursor_creation(creation)
+        return creation
 
     def _remove_cursor(self, cursor: str) -> None:
         """删除 cursor 记录。
