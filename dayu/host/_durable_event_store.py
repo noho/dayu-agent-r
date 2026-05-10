@@ -68,8 +68,17 @@ _LOGGER: logging.Logger = logging.getLogger(__name__)
 
 
 @dataclass(frozen=True, slots=True)
-class _AppendedRunEvent:
-    """事务内 append 后的 RunEvent 与 internal global position。"""
+class AppendedRunEvent:
+    """事务内 append 后的 RunEvent 与 internal global position。
+
+    本类型只供 Host internal 同事务原子写入路径(P8-S4 terminal append +
+    attempt close)使用; 公开的 :meth:`DurableRunEventStore.append` /
+    :meth:`append_in_transaction` 不返回 ``GlobalEventPosition``,
+    避免全局位置语义经由 public 接口溢出到 ``RunEventCursor``。
+
+    :param event: 已落库的 :class:`RunEvent`。
+    :param event_position: 内部全局位置, 仅 Host internal 使用。
+    """
 
     event: RunEvent
     event_position: GlobalEventPosition
@@ -114,6 +123,19 @@ _SCHEMA_STATEMENTS: tuple[str, ...] = (
     )
     """,
     """
+    CREATE TABLE IF NOT EXISTS host_fencing_tokens (
+        fencing_token INTEGER PRIMARY KEY AUTOINCREMENT,
+        resource_type TEXT NOT NULL,
+        resource_id TEXT NOT NULL,
+        owner_id TEXT NOT NULL,
+        issued_at TEXT NOT NULL
+    )
+    """,
+    """
+    CREATE INDEX IF NOT EXISTS idx_host_fencing_tokens_resource
+    ON host_fencing_tokens (resource_type, resource_id, fencing_token)
+    """,
+    """
     CREATE TABLE IF NOT EXISTS host_attempts (
         attempt_id TEXT PRIMARY KEY,
         run_id TEXT NOT NULL,
@@ -123,8 +145,27 @@ _SCHEMA_STATEMENTS: tuple[str, ...] = (
         finished_at TEXT,
         terminal_event_position INTEGER,
         failure_summary TEXT,
+        owner_id TEXT,
+        owner_token_hash TEXT,
+        fencing_token INTEGER,
+        lease_expires_at TEXT,
+        lease_renewed_at TEXT,
+        recovered_from_attempt_id TEXT,
+        stale_marked_at TEXT,
         UNIQUE (run_id, attempt_index)
     )
+    """,
+    """
+    CREATE INDEX IF NOT EXISTS idx_host_attempts_run_state
+    ON host_attempts (run_id, state)
+    """,
+    """
+    CREATE INDEX IF NOT EXISTS idx_host_attempts_lease
+    ON host_attempts (state, lease_expires_at)
+    """,
+    """
+    CREATE INDEX IF NOT EXISTS idx_host_attempts_recovered_from
+    ON host_attempts (recovered_from_attempt_id)
     """,
     """
     CREATE TABLE IF NOT EXISTS host_projection_checkpoints (
@@ -225,7 +266,7 @@ class DurableRunEventStore:
         *,
         tx: HostStorageTransaction,
         draft: RunEventDraft,
-    ) -> _AppendedRunEvent:
+    ) -> AppendedRunEvent:
         """事务内执行 append；调用方负责事务上下文。
 
         :param tx: 当前 :class:`HostStorageTransaction`。
@@ -278,7 +319,13 @@ class DurableRunEventStore:
                 1 if is_terminal else 0,
             ),
         )
-        event_position = int(cursor.lastrowid or 0)
+        lastrowid = cursor.lastrowid
+        if lastrowid is None:
+            raise RuntimeError(
+                "host_run_events INSERT did not yield a lastrowid; "
+                f"run_id={draft.run_id!r} sequence={sequence}"
+            )
+        event_position = int(lastrowid)
 
         self._upsert_run_state(
             tx=tx,
@@ -301,7 +348,7 @@ class DurableRunEventStore:
         )
         if is_terminal:
             self._write_terminal_result_snapshot(tx=tx, event=event)
-        return _AppendedRunEvent(
+        return AppendedRunEvent(
             event=event,
             event_position=GlobalEventPosition(value=event_position),
         )
@@ -326,6 +373,39 @@ class DurableRunEventStore:
 
         appended = self._append_in_transaction(tx=tx, draft=draft)
         return appended.event
+
+    def append_with_position_in_transaction(
+        self,
+        *,
+        tx: HostStorageTransaction,
+        draft: RunEventDraft,
+    ) -> AppendedRunEvent:
+        """事务内追加 RunEvent 并返回 internal global position。
+
+        本方法仅供 Host internal 同事务原子写入路径(P8-S4 terminal
+        append + attempt close)使用; 与 :meth:`append_in_transaction`
+        的差别在于额外暴露 ``GlobalEventPosition``, 让 supervisor 在同
+        事务内把 ``host_attempts.terminal_event_position`` 与新写入
+        的 RunEvent 全局位置对齐。``GlobalEventPosition`` 不允许经由
+        public 接口外溢, 因此公开签名仅返回 :class:`AppendedRunEvent`
+        包装而非裸值。
+
+        :param tx: 当前 :class:`HostStorageTransaction`。
+        :param draft: RunEvent 草稿。
+        :returns: ``AppendedRunEvent`` 含已落库 RunEvent 与全局位置。
+        :raises ValueError: run 已终态、来源不一致或 engine event id 重复。
+        """
+
+        _validate_draft_provenance(draft)
+        appended = self._append_in_transaction(tx=tx, draft=draft)
+        # supervisor 在同事务内 append terminal RunEvent + close attempt,
+        # 之后不会再有任何 notify-hooked append 推进 ``_condition``;
+        # 必须在 commit 后唤醒订阅者, 否则 RunStream subscribe 永远 wait,
+        # 上层无法收到 terminal event。注: ``add_post_commit_hook`` 幂等地
+        # 追加 hook, 多次 register 也只会在 commit 后多触发一次 ``notify_all``,
+        # 不影响正确性。
+        tx.add_post_commit_hook(self._make_notify_hook())
+        return appended
 
     def _upsert_run_state(
         self,
@@ -616,6 +696,40 @@ class DurableRunEventStore:
             result.append((position, event))
         return tuple(result)
 
+    def fetch_canonical_events_for_run_in_transaction(
+        self,
+        *,
+        tx: HostStorageTransaction,
+        session_id: str,
+        run_id: str,
+    ) -> tuple[RunEvent, ...]:
+        """在调用方事务内按 run 读取全部 canonical RunEvent。
+
+        durable read model 在 terminal 投影时使用本 Host internal API 从
+        EventLog 真源重建同一 run 的完整 canonical facts，避免依赖进程内
+        pending 状态跨 checkpoint / restart 保存事实。
+
+        :param tx: 当前 Host storage 事务。
+        :param session_id: 会话 id，用于限定同一 session 边界。
+        :param run_id: Run id。
+        :returns: 该 run 的 canonical RunEvent 元组，按 global position 升序。
+        :raises sqlite3.DatabaseError: 读取失败时抛出。
+        """
+
+        cursor = tx.execute(
+            """
+            SELECT run_id, session_id, sequence, event_position, kind,
+                source, type, occurred_at, payload, source_engine_event_id
+            FROM host_run_events
+            WHERE session_id = ? AND run_id = ? AND kind = ?
+            ORDER BY event_position ASC
+            """,
+            (session_id, run_id, RunEventKind.CANONICAL.value),
+        )
+        rows = cursor.fetchall()
+        cursor.close()
+        return tuple(_row_to_run_event(row) for row in rows)
+
     def _make_notify_hook(self) -> "Callable[[], None]":
         """构造一个 commit 后通知订阅者的 hook。
 
@@ -782,6 +896,7 @@ def _append_log_level(event: RunEvent) -> int:
 
 
 __all__ = [
+    "AppendedRunEvent",
     "DurableRunEventStore",
     "ensure_host_schema",
 ]

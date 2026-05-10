@@ -4,7 +4,7 @@
 与 utils 下其它 provider smoke 一致的脚本内 ``ProviderCase``，固定运行
 ``mimo-v2.5-pro-plan``。该路径由模型通过 LLM tool calling 调用公共
 ``@tool`` 声明的 ``huge_echo``，并经
-``ToolExecutor.execute -> ToolRuntimeToolExecutor -> InMemoryToolRuntime``
+``ToolExecutor.execute -> ToolRuntimeToolExecutor -> HostToolRuntime``
 产生截断、cursor 与补读事实。缺少 API key 或 provider case 能力不满足时
 返回清晰失败，不能把 fake case 当作真实 provider 成功。
 """
@@ -101,8 +101,6 @@ from dayu.host import (  # noqa: E402
     RunSucceededResult,
     StartRunRequest,
     ToolFetchMoreFailedResult,
-    ToolFetchMoreHandleRequest,
-    ToolFetchMoreHandleSucceededResult,
     ToolFetchMoreRequest,
     ToolFetchMoreSucceededResult,
 )
@@ -111,14 +109,16 @@ from dayu.host._conversation_memory import (  # noqa: E402
     ConversationMemorySnapshot,
     ConversationMemoryStore,
     ConversationPinnedState,
-    InMemoryConversationMemoryStore,
     TaskFrame,
+)
+from utils._smoke_memory_store import (  # noqa: E402
+    SmokeInMemoryConversationMemoryStore,
 )
 from dayu.host._event_store import InMemoryRunEventStore  # noqa: E402
 from dayu.host._proxy import LocalProxy, WorkerProxy  # noqa: E402
 from dayu.host._run_harness import LocalRunHarness  # noqa: E402
 from dayu.host._tool_runtime import (  # noqa: E402
-    InMemoryToolRuntime,
+    HostToolRuntime,
     ToolRuntimeToolExecutor,
 )
 from dayu.host._worker import EngineWorker  # noqa: E402
@@ -459,8 +459,8 @@ class SeededMemoryStore:
 
     pinned_state: ConversationPinnedState
     task_frame: TaskFrame
-    delegate: InMemoryConversationMemoryStore = field(
-        default_factory=InMemoryConversationMemoryStore
+    delegate: SmokeInMemoryConversationMemoryStore = field(
+        default_factory=SmokeInMemoryConversationMemoryStore
     )
 
     async def project_run_events(self, events: tuple[RunEvent, ...]) -> None:
@@ -736,7 +736,8 @@ def build_huge_echo_harness(
     bundle = huge_echo_bundle()
     event_store = InMemoryRunEventStore()
     business_executor = HUGE_ECHO_DEFINITION.executor
-    runtime = InMemoryToolRuntime(
+    runtime = HostToolRuntime(
+        is_durable=False,
         executor=business_executor,
         event_store=event_store,
         truncate_specs=bundle.truncate_specs(),
@@ -750,6 +751,7 @@ def build_huge_echo_harness(
     if resolved_proxy is None:
         resolved_proxy = LocalProxy(worker=EngineWorker(gated_executor))
     return LocalRunHarness(
+        is_durable=False,
         proxy=resolved_proxy,
         event_store=event_store,
         tool_runtime=runtime,
@@ -957,7 +959,7 @@ async def run_compact_retry_case() -> bool:
     if not ok:
         return False
     proxy = _OverflowThenSuccessProxy()
-    compact_harness = LocalRunHarness(proxy=proxy, memory_store=memory_store)
+    compact_harness = LocalRunHarness(is_durable=False, proxy=proxy, memory_store=memory_store)
     request = build_start_request(
         session_id="phase5-session",
         run_id="phase5-compact-run",

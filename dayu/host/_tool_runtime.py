@@ -8,6 +8,7 @@ from __future__ import annotations
 
 import asyncio
 import base64
+import contextvars
 import copy
 import hashlib
 import hmac
@@ -15,7 +16,8 @@ import json
 import logging
 import secrets
 import time
-from collections.abc import Mapping
+from collections.abc import AsyncGenerator, Mapping
+from contextlib import asynccontextmanager
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from typing import Protocol, TypeAlias, cast
@@ -28,7 +30,6 @@ from dayu.contracts import (
 )
 from dayu.contracts.tool_call import ToolExecutionRequest
 from dayu.contracts.tool_outcome import (
-    ToolAwaitingOutcome,
     ToolCompletedOutcome,
     ToolExecutionOutcome,
     ToolFailedOutcome,
@@ -38,9 +39,11 @@ from dayu.contracts.tool_result import (
     ToolResultSuccess,
     ToolTruncationInfo,
 )
+from dayu.host._attempt_lease import AttemptFencingError
 from dayu.host._event_store import RunEventStore
 from dayu.host._event_translation import terminal_result_from_event
 from dayu.host.contracts import (
+    RunEvent,
     RunEventCursor,
     RunEventDraft,
     RunEventKind,
@@ -52,11 +55,6 @@ from dayu.host.contracts import (
     ToolFetchMoreCompletedData,
     ToolFetchMoreFailedData,
     ToolFetchMoreFailedResult,
-    ToolFetchMoreHandle,
-    ToolFetchMoreHandleFailedResult,
-    ToolFetchMoreHandleRequest,
-    ToolFetchMoreHandleResult,
-    ToolFetchMoreHandleSucceededResult,
     ToolFetchMoreRequest,
     ToolFetchMoreRequestedData,
     ToolFetchMoreResult,
@@ -121,6 +119,142 @@ class _TokenGenerator(Protocol):
         ...
 
 
+class ToolRuntimeEventAppender(Protocol):
+    """ToolRuntime canonical fact append port。
+
+    本 Protocol 是 ToolRuntime 写入 ``TOOL_RESULT_TRUNCATED`` /
+    ``TOOL_CURSOR_*`` / ``TOOL_FETCH_MORE_*`` 等 Host-owned canonical
+    fact 的唯一入口; ``HostToolRuntime`` 的 7 个 ``_append_*``
+    helper 不再直接调用 :class:`RunEventStore.append`, 全部通过当前
+    active appender 落库。
+
+    P8-S5 装配规则:
+
+    - durable 路径: 由 :class:`ToolRuntimeOwnerScope` 在每个 attempt
+      生命周期内安装绑定 owner 的
+      :class:`AttemptScopedRunEventAppender`, 每条 fact append 都在同
+      一 ``BEGIN IMMEDIATE`` 事务内完成 ``verify_owner`` + EventLog
+      append; stale owner / fenced owner 命中时抛
+      ``AttemptFencingError``, 不写诊断 RunEvent;
+    - 非 durable / 测试路径: 退化为 :class:`PlainRunEventAppender`,
+      仅做 ``RunEventStore.append`` 透传, 不引入 owner 校验;
+    - 不允许把 :class:`AttemptOwnerToken` / 任何 owner secret 暴露给
+      ToolExecutor 或工具实现, 也不通过 ``ToolExecutionContext`` 传递
+      owner 句柄。
+
+    Protocol 只承诺 ``await append(draft)`` 返回 :class:`RunEvent`;
+    fenced 失败由具体实现以 ``AttemptFencingError`` 透传给上层 harness,
+    Protocol 不暴露 fencing 状态。
+    """
+
+    async def append(self, draft: RunEventDraft) -> RunEvent:
+        """append 一条 ToolRuntime canonical RunEvent。
+
+        :param draft: RunEvent 草稿。
+        :returns: 已落库的 :class:`RunEvent`。
+        :raises Exception: 实现自身错误透传; durable 实现可能抛
+            ``AttemptFencingError`` / SQLite 错误。
+        """
+        ...
+
+
+@dataclass(frozen=True, slots=True)
+class PlainRunEventAppender:
+    """非 fencing 的 ToolRuntime fact append 实现。
+
+    test-only fallback; never used in durable harness; durable path always
+    uses AttemptScopedRunEventAppender via AttemptSupervisor.scoped_appender.
+
+    本实现仅在非 durable / 测试 / bootstrap-without-supervisor 路径下
+    使用, 直接透传到 :class:`RunEventStore.append`, 不做 owner CAS,
+    也不开 ``BEGIN IMMEDIATE`` 事务。durable 路径必须使用
+    :class:`AttemptScopedRunEventAppender`。
+
+    :param event_store: 底层 :class:`RunEventStore`。
+    """
+
+    event_store: RunEventStore
+
+    async def append(self, draft: RunEventDraft) -> RunEvent:
+        """直接通过 :class:`RunEventStore.append` 落库。
+
+        :param draft: RunEvent 草稿。
+        :returns: 已落库的 :class:`RunEvent`。
+        :raises Exception: 底层 EventStore 错误透传。
+        """
+
+        return await self.event_store.append(draft)
+
+
+_ACTIVE_TOOL_RUNTIME_APPENDER: contextvars.ContextVar[
+    ToolRuntimeEventAppender | None
+] = contextvars.ContextVar("dayu_host_tool_runtime_appender", default=None)
+"""ToolRuntime 当前 attempt 绑定的 fencing-aware appender。
+
+:class:`ToolRuntimeOwnerScope` 进入时把 owner 绑定的
+:class:`AttemptScopedRunEventAppender` 注入本 ContextVar; 退出时恢复
+旧值, 异常路径同样恢复。``ContextVar`` 保证并发 run / 嵌套 attempt
+不会互相污染, 也避免把 owner secret 通过 ``ToolExecutionContext``
+泄漏到工具实现。
+"""
+
+
+@asynccontextmanager
+async def ToolRuntimeOwnerScope(  # noqa: N802
+    appender: ToolRuntimeEventAppender,
+) -> AsyncGenerator[None, None]:
+    """以 ContextVar 形式安装 attempt-scoped fencing appender。
+
+    本 async context manager 在每个 attempt 生命周期 (``_run_to_store``)
+    外侧被 :mod:`dayu.host._durable_harness` / :mod:`dayu.host._run_harness`
+    包裹一次, 进入时把 ``appender`` (通常是
+    :class:`AttemptScopedRunEventAppender`) 注入
+    :data:`_ACTIVE_TOOL_RUNTIME_APPENDER`, 离开时无条件恢复旧值, 异常
+    也不例外。
+
+    并发约束:
+
+    - 不通过模块级 dict / 全局变量保存 appender, 避免跨 attempt /
+      跨进程 race;
+    - 使用 :class:`contextvars.ContextVar` 让每个 asyncio Task 持有独立
+      副本; ``run_in_executor`` 路径会自动复制, 不需要额外封装;
+    - framework ``fetch_more`` 嵌套调用本 scope 时, 内层 token 取代外
+      层, 退出后还原, 满足 "framework fetch_more 使用发起 fetch_more
+      的当前 attempt owner" 的语义。
+
+    本 scope 不持有 owner secret 明文; ``appender`` 只暴露
+    :meth:`ToolRuntimeEventAppender.append`, owner token 仅 owner 自己
+    持有, 不会通过 ToolRuntime 流向 ToolExecutor。
+
+    :param appender: 当前 attempt 的 fencing-aware appender。
+    :yields: 无 yield 值; 在 ``with`` 内部 ToolRuntime 的所有 fact
+        append 都会路由到 ``appender``。
+    :raises Exception: yield 内部异常透传; 退出时无条件恢复旧 token。
+    """
+
+    token = _ACTIVE_TOOL_RUNTIME_APPENDER.set(appender)
+    try:
+        yield
+    finally:
+        _ACTIVE_TOOL_RUNTIME_APPENDER.reset(token)
+
+
+def active_tool_runtime_appender() -> ToolRuntimeEventAppender | None:
+    """返回当前 :class:`ToolRuntimeOwnerScope` 安装的 appender。
+
+    供 :class:`LocalRunHarness` 内部 helper 在不显式持有
+    ``_ActiveAttempt`` 句柄时, 仍能命中当前 attempt scope 内的
+    fencing-aware appender; 没有 scope 时返回 ``None``, 调用方需自行
+    退化到 plain append 路径。
+
+    :returns: 当前生效的 :class:`ToolRuntimeEventAppender`; 无 scope 时
+        返回 ``None``。
+    :raises Exception: 不主动抛出异常。
+    """
+
+    return _ACTIVE_TOOL_RUNTIME_APPENDER.get()
+
+
 @dataclass(frozen=True, slots=True)
 class _TruncateTarget:
     """已解析的截断目标。"""
@@ -180,7 +314,7 @@ class _CursorCreation:
 class ToolRuntimeToolExecutor:
     """将 Host ToolRuntime 适配为 Engine 可消费的 ToolExecutor。"""
 
-    runtime: "InMemoryToolRuntime"
+    runtime: "HostToolRuntime"
 
     async def execute(
         self,
@@ -190,23 +324,39 @@ class ToolRuntimeToolExecutor:
 
         :param request: 工具执行请求。
         :returns: 工具执行 outcome。
-        :raises Exception: 不主动抛出异常，内部异常转为工具失败 outcome。
+        :raises AttemptFencingError: owner fencing 透传给 Host harness。
+        :raises Exception: ToolRuntime 普通异常由 runtime 转为工具失败 outcome。
         """
 
         return await self.runtime.execute_tool_call(request)
 
 
-@dataclass(slots=True)
-class InMemoryToolRuntime:
-    """单进程内存态 ToolRuntime。
+@dataclass(slots=True, kw_only=True)
+class HostToolRuntime:
+    """Host-owned ToolRuntime。
 
+    durable 路径下 canonical facts 通过 owner-scoped appender 写 EventLog；
+    cursor registry（``_records_by_cursor`` / ``_cursor_by_fingerprint``）
+    是 transient coordination state，进程重启后丢失不等于 durable fact 丢失。
+
+    :param is_durable: P8-S1 装配显式声明位:``True`` 表示由
+        :func:`build_durable_harness` 装配的 production / durable runtime,
+        ``_resolve_appender`` 必须从 :class:`ToolRuntimeOwnerScope`
+        ContextVar 解析 owner-bound appender, 缺失时立即 ``RuntimeError``;
+        ``False`` 表示 test-only 装配,允许在 ContextVar 缺失时退化为
+        :class:`PlainRunEventAppender`。本字段是 keyword-only 必填参数,
+        所有 ``HostToolRuntime(...)`` 构造点必须显式传值。
     :param executor: 底层业务 ToolExecutor。
-    :param event_store: Host RunEventStore。
+    :param event_store: Host RunEventStore; 仅用作 ``list_events`` 终态
+        cursor 检测以及无 owner scope 路径的回退 fact append。
+        canonical fact 写入由 :class:`ToolRuntimeEventAppender`
+        统一承担。
     :param truncate_specs: 按工具名注入的显式截断声明。
     :param clock: monotonic clock。
     :param token_generator: cursor 原文生成器。
     """
 
+    is_durable: bool
     executor: ToolExecutor
     event_store: RunEventStore
     truncate_specs: Mapping[str, ToolTruncateSpec] = field(default_factory=dict)
@@ -222,6 +372,34 @@ class InMemoryToolRuntime:
     )
     _fetch_lock: asyncio.Lock = field(default_factory=asyncio.Lock, init=False)
 
+    def _resolve_appender(self) -> ToolRuntimeEventAppender:
+        """返回当前 attempt scope 内的 fact appender。
+
+        - ``is_durable=True``: 必须从
+          :class:`ToolRuntimeOwnerScope` ContextVar 读到 owner-bound
+          fencing-aware appender, 缺失时立即 ``RuntimeError`` fail fast,
+          严格阻止 durable 路径退化为非 fenced append;
+        - ``is_durable=False`` (test-only): ContextVar 存在时返回安装的
+          appender, 缺失时退化为 :class:`PlainRunEventAppender`,
+          与 P6/P7 行为一致。
+
+        :returns: 当前生效的 :class:`ToolRuntimeEventAppender`。
+        :raises RuntimeError: ``is_durable=True`` 且 ContextVar 中没有
+            owner scope 时抛出。
+        """
+
+        active = _ACTIVE_TOOL_RUNTIME_APPENDER.get()
+        if self.is_durable:
+            if active is None:
+                raise RuntimeError(
+                    "durable runtime requires ToolRuntimeOwnerScope for "
+                    "attempt-scoped append"
+                )
+            return active
+        if active is not None:
+            return active
+        return PlainRunEventAppender(event_store=self.event_store)
+
     async def execute_tool_call(
         self,
         request: ToolExecutionRequest,
@@ -230,7 +408,8 @@ class InMemoryToolRuntime:
 
         :param request: 工具执行请求。
         :returns: 截断后的工具执行 outcome。
-        :raises Exception: 不主动抛出异常，ToolRuntime 自身异常转失败 outcome。
+        :raises AttemptFencingError: owner fencing 必须透传给 Host harness。
+        :raises Exception: ToolRuntime 自身普通异常转失败 outcome，不向外抛出。
         """
 
         is_framework_fetch_more = request.call.name == FRAMEWORK_FETCH_MORE_TOOL_NAME
@@ -280,7 +459,7 @@ class InMemoryToolRuntime:
                     request.context.tool_call_id,
                 )
                 return outcome
-            cursor_creation = self._store_cursor(
+            cursor_creation = self._build_cursor(
                 request=request,
                 spec=spec,
                 truncated=truncated,
@@ -296,6 +475,7 @@ class InMemoryToolRuntime:
                 request=request,
                 data=cursor_creation.issued_event,
             )
+            self._commit_cursor_creation(cursor_creation)
             completed = ToolCompletedOutcome(
                 result=ToolResultSuccess(
                     ok=True,
@@ -341,6 +521,8 @@ class InMemoryToolRuntime:
                 cursor_creation.record.ttl_seconds,
             )
             return completed
+        except AttemptFencingError:
+            raise
         except Exception as exc:
             _LOGGER.error(
                 "host.tool_runtime.tool_call_finished "
@@ -391,7 +573,7 @@ class InMemoryToolRuntime:
                 parsed.result.error,
             )
             return parsed
-        fetch_result = await self.fetch_more(parsed)
+        fetch_result = await self._fetch_more(parsed)
         if isinstance(fetch_result, ToolFetchMoreFailedResult):
             failed = ToolFailedOutcome(
                 result=ToolResultFailure(
@@ -534,88 +716,16 @@ class InMemoryToolRuntime:
             ),
         )
 
-    async def get_tool_fetch_more_handle(
-        self,
-        request: ToolFetchMoreHandleRequest,
-    ) -> ToolFetchMoreHandleResult:
-        """按非 EventLog 通道读取受控补读 handle。
-
-        :param request: handle 读取请求。
-        :returns: handle 读取结果。
-        :raises Exception: 不主动抛出异常。
-        """
-
-        record = self._record_by_fingerprint(request.cursor_fingerprint)
-        if record is None:
-            return _handle_failure(
-                request=request,
-                error_code=_ERROR_CURSOR_NOT_FOUND,
-                message="cursor not found",
-                denied=False,
-            )
-        terminal_cursor = await self._terminal_cursor(record.run_id)
-        if terminal_cursor is not None:
-            return _handle_failure(
-                request=request,
-                error_code=_ERROR_RUN_TERMINAL,
-                message="run is terminal",
-                denied=False,
-            )
-        denied_reason = _binding_denied_reason(
-            record=record,
-            session_id=request.session_id,
-            run_id=request.run_id,
-            tool_call_id=request.tool_call_id,
-        )
-        if denied_reason is not None:
-            await self._append_cursor_denied(
-                record=record,
-                reason=denied_reason,
-                iteration_id=request.iteration_id,
-            )
-            return _handle_failure(
-                request=request,
-                error_code=_ERROR_CURSOR_SCOPE_MISMATCH,
-                message=denied_reason,
-                denied=True,
-            )
-        now = self.clock()
-        if record.expires_at_monotonic <= now:
-            self._remove_cursor(record.cursor)
-            await self._append_cursor_expired(
-                record=record,
-                iteration_id=request.iteration_id,
-            )
-            return _handle_failure(
-                request=request,
-                error_code=_ERROR_CURSOR_EXPIRED,
-                message="cursor expired",
-                denied=False,
-            )
-        handle = ToolFetchMoreHandle(
-            session_id=record.session_id,
-            run_id=record.run_id,
-            tool_call_id=record.tool_call_id,
-            cursor=ToolRuntimeCursor(
-                value=record.cursor,
-                fingerprint=record.cursor_fingerprint,
-            ),
-            scope_token=record.scope_token,
-            expires_at_monotonic=record.expires_at_monotonic,
-        )
-        return ToolFetchMoreHandleSucceededResult(
-            run_id=record.run_id,
-            session_id=record.session_id,
-            tool_call_id=record.tool_call_id,
-            handle=handle,
-            expires_at_monotonic=record.expires_at_monotonic,
-        )
-
-    async def fetch_more(
+    async def _fetch_more(
         self,
         request: ToolFetchMoreRequest,
     ) -> ToolFetchMoreResult:
         """补读已截断工具结果。
+
+        本方法仅作为 :meth:`execute_tool_call` 内部子例程被
+        :meth:`_execute_framework_fetch_more` 调用；P8-S2 起不再作为公开
+        入口暴露，framework ``fetch_more`` 必须以普通 tool call 形态走
+        :class:`ToolRuntimeToolExecutor` -> :meth:`execute_tool_call`。
 
         :param request: 补读请求。
         :returns: 补读结果。
@@ -668,12 +778,11 @@ class InMemoryToolRuntime:
             )
             now = self.clock()
             if record.expires_at_monotonic <= now:
-                self._remove_cursor(record.cursor)
                 await self._append_cursor_expired(
                     record=record,
                     iteration_id=request.iteration_id,
                 )
-                return await self._fetch_failure(
+                failed = await self._fetch_failure(
                     request=request,
                     record=record,
                     error_code=_ERROR_CURSOR_EXPIRED,
@@ -681,6 +790,8 @@ class InMemoryToolRuntime:
                     denied=False,
                     expired=True,
                 )
+                self._remove_cursor(record.cursor)
+                return failed
             denied_reason = self._scope_denied_reason(
                 request=request,
                 record=record,
@@ -708,21 +819,24 @@ class InMemoryToolRuntime:
             )
             new_offset = record.offset + chunk_size
             has_more = new_offset < record.total
-            self._remove_cursor(record.cursor)
+            # 纯构建 next cursor：不写入内存 maps，不产生副作用。
             next_cursor: ToolRuntimeCursor | None = None
             next_issued_event: ToolCursorIssuedData | None = None
+            pending_cursor_creation: _CursorCreation | None = None
             if has_more:
-                cursor_creation = self._store_cursor_from_record(
+                pending_cursor_creation = self._build_cursor_from_record(
                     record=record,
                     offset=new_offset,
                     parent_cursor_fingerprint=record.cursor_fingerprint,
                     iteration_id=request.iteration_id,
                 )
                 next_cursor = ToolRuntimeCursor(
-                    value=cursor_creation.record.cursor,
-                    fingerprint=cursor_creation.record.cursor_fingerprint,
+                    value=pending_cursor_creation.record.cursor,
+                    fingerprint=pending_cursor_creation.record.cursor_fingerprint,
                 )
-                next_issued_event = cursor_creation.issued_event
+                next_issued_event = pending_cursor_creation.issued_event
+            # EventLog append：此时内存 maps 尚未变更，
+            # AttemptFencingError 直接透传即可，无需回滚。
             completed_event = await self._append_fetch_completed(
                 request=request,
                 record=record,
@@ -737,6 +851,10 @@ class InMemoryToolRuntime:
                     request=request,
                     data=next_issued_event,
                 )
+            # 所有 EventLog append 成功：现在安全地变更内存 maps。
+            self._remove_cursor(record.cursor)
+            if pending_cursor_creation is not None:
+                self._commit_cursor_creation(pending_cursor_creation)
             return ToolFetchMoreSucceededResult(
                 run_id=request.run_id,
                 session_id=request.session_id,
@@ -783,7 +901,7 @@ class InMemoryToolRuntime:
         _ = request
         return None
 
-    def _store_cursor(
+    def _build_cursor(
         self,
         *,
         request: ToolExecutionRequest,
@@ -791,7 +909,12 @@ class InMemoryToolRuntime:
         truncated: _TruncatedValue,
         parent_cursor_fingerprint: str | None,
     ) -> _CursorCreation:
-        """创建并保存 cursor。
+        """纯构建初始截断 cursor，不写入内存 maps。
+
+        调用方必须先成功写入 ``TOOL_RESULT_TRUNCATED`` 与
+        ``TOOL_CURSOR_ISSUED`` EventLog facts，再调用
+        :meth:`_commit_cursor_creation` 注册 cursor，避免 fencing race 下出
+        现无事实支撑的孤儿 cursor。
 
         :param request: 工具执行请求。
         :param spec: 截断声明。
@@ -810,7 +933,8 @@ class InMemoryToolRuntime:
             spec=spec,
             timeout_seconds=request.context.timeout_seconds,
         )
-        return self._create_cursor(
+        self._cleanup_expired(self.clock())
+        return self._build_cursor_creation(
             session_id=request.context.session_id,
             run_id=request.context.run_id,
             iteration_id=request.context.iteration_id,
@@ -829,7 +953,7 @@ class InMemoryToolRuntime:
             ttl_seconds=ttl_seconds,
         )
 
-    def _store_cursor_from_record(
+    def _build_cursor_from_record(
         self,
         *,
         record: _CursorRecord,
@@ -837,18 +961,17 @@ class InMemoryToolRuntime:
         parent_cursor_fingerprint: str,
         iteration_id: str,
     ) -> _CursorCreation:
-        """从旧 cursor 记录派生下一页 cursor。
+        """从旧 cursor 记录纯构建下一页 cursor，不写入内存 maps。
 
         :param record: 已消费 cursor 记录。
         :param offset: 下一页起始 offset。
         :param parent_cursor_fingerprint: 父 cursor 指纹。
-        :param iteration_id: 派生 cursor 所属 Engine iteration id；通常为
-            正在调用 framework ``fetch_more`` 的 iteration。
-        :returns: 新 cursor 创建结果。
+        :param iteration_id: 派生 cursor 所属 Engine iteration id。
+        :returns: cursor 创建结果（未注册到内存 maps）。
         :raises Exception: 不主动抛出异常。
         """
 
-        return self._create_cursor(
+        return self._build_cursor_creation(
             session_id=record.session_id,
             run_id=record.run_id,
             iteration_id=iteration_id,
@@ -868,7 +991,7 @@ class InMemoryToolRuntime:
             scope_hash=record.scope_hash,
         )
 
-    def _create_cursor(
+    def _build_cursor_creation(
         self,
         *,
         session_id: str,
@@ -889,7 +1012,10 @@ class InMemoryToolRuntime:
         ttl_seconds: int,
         scope_hash: str | None = None,
     ) -> _CursorCreation:
-        """保存 cursor record 并返回签发事实材料。
+        """纯构建 cursor 创建结果，不写入内存 maps。
+
+        调用方拿到返回值后，必须显式调用 :meth:`_commit_cursor_creation`
+        才会注册到 ``_records_by_cursor`` / ``_cursor_by_fingerprint``。
 
         :param session_id: 会话 id。
         :param run_id: Run id。
@@ -907,12 +1033,11 @@ class InMemoryToolRuntime:
         :param arguments: 工具参数；派生 cursor 可为 ``None``。
         :param ttl_seconds: TTL 秒数。
         :param scope_hash: 已有 scope hash。
-        :returns: cursor 创建结果。
+        :returns: cursor 创建结果（未注册到内存 maps）。
         :raises Exception: 不主动抛出异常。
         """
 
         now = self.clock()
-        self._cleanup_expired(now)
         cursor = self.token_generator()
         cursor_fingerprint = _fingerprint_text(cursor)
         resolved_scope_hash = scope_hash
@@ -952,8 +1077,6 @@ class InMemoryToolRuntime:
             ttl_seconds=ttl_seconds,
             parent_cursor_fingerprint=parent_cursor_fingerprint,
         )
-        self._records_by_cursor[cursor] = record
-        self._cursor_by_fingerprint[cursor_fingerprint] = cursor
         return _CursorCreation(
             record=record,
             issued_event=ToolCursorIssuedData(
@@ -972,20 +1095,20 @@ class InMemoryToolRuntime:
             ),
         )
 
-    def _record_by_fingerprint(
-        self, cursor_fingerprint: str
-    ) -> _CursorRecord | None:
-        """按 cursor 指纹读取记录。
+    def _commit_cursor_creation(
+        self, creation: _CursorCreation
+    ) -> None:
+        """将构建好的 cursor 注册到内存 maps。
 
-        :param cursor_fingerprint: cursor 指纹。
-        :returns: cursor 记录；不存在返回 ``None``。
+        :param creation: :meth:`_build_cursor_creation` 返回值。
+        :returns: 无返回值。
         :raises Exception: 不主动抛出异常。
         """
 
-        cursor = self._cursor_by_fingerprint.get(cursor_fingerprint)
-        if cursor is None:
-            return None
-        return self._records_by_cursor.get(cursor)
+        self._records_by_cursor[creation.record.cursor] = creation.record
+        self._cursor_by_fingerprint[
+            creation.record.cursor_fingerprint
+        ] = creation.record.cursor
 
     def _remove_cursor(self, cursor: str) -> None:
         """删除 cursor 记录。
@@ -1070,7 +1193,7 @@ class InMemoryToolRuntime:
         :raises Exception: append 失败时透传。
         """
 
-        event = await self.event_store.append(
+        event = await self._resolve_appender().append(
             RunEventDraft(
                 run_id=request.context.run_id,
                 session_id=request.context.session_id,
@@ -1115,7 +1238,7 @@ class InMemoryToolRuntime:
         :raises Exception: append 失败时透传。
         """
 
-        event = await self.event_store.append(
+        event = await self._resolve_appender().append(
             RunEventDraft(
                 run_id=request.context.run_id
                 if isinstance(request, ToolExecutionRequest)
@@ -1147,7 +1270,7 @@ class InMemoryToolRuntime:
         :raises Exception: append 失败时透传。
         """
 
-        event = await self.event_store.append(
+        event = await self._resolve_appender().append(
             RunEventDraft(
                 run_id=record.run_id,
                 session_id=record.session_id,
@@ -1190,7 +1313,7 @@ class InMemoryToolRuntime:
         :raises Exception: append 失败时透传。
         """
 
-        event = await self.event_store.append(
+        event = await self._resolve_appender().append(
             RunEventDraft(
                 run_id=record.run_id,
                 session_id=record.session_id,
@@ -1236,7 +1359,7 @@ class InMemoryToolRuntime:
         :raises Exception: append 失败时透传。
         """
 
-        event = await self.event_store.append(
+        event = await self._resolve_appender().append(
             RunEventDraft(
                 run_id=record.run_id,
                 session_id=record.session_id,
@@ -1271,7 +1394,7 @@ class InMemoryToolRuntime:
         :raises Exception: append 失败时透传。
         """
 
-        event = await self.event_store.append(
+        event = await self._resolve_appender().append(
             RunEventDraft(
                 run_id=record.run_id,
                 session_id=record.session_id,
@@ -1312,7 +1435,7 @@ class InMemoryToolRuntime:
         :raises Exception: append 失败时透传。
         """
 
-        event = await self.event_store.append(
+        event = await self._resolve_appender().append(
             RunEventDraft(
                 run_id=record.run_id,
                 session_id=record.session_id,
@@ -1341,33 +1464,6 @@ class InMemoryToolRuntime:
             denied=denied,
             event_cursor=event.cursor,
         )
-
-
-def _handle_failure(
-    *,
-    request: ToolFetchMoreHandleRequest,
-    error_code: str,
-    message: str,
-    denied: bool,
-) -> ToolFetchMoreHandleFailedResult:
-    """构造 handle 读取失败结果。
-
-    :param request: handle 读取请求。
-    :param error_code: 失败错误码。
-    :param message: 人类可读错误描述。
-    :param denied: 是否为权限拒绝。
-    :returns: handle 读取失败结果。
-    :raises Exception: 不主动抛出异常。
-    """
-
-    return ToolFetchMoreHandleFailedResult(
-        run_id=request.run_id,
-        session_id=request.session_id,
-        tool_call_id=request.tool_call_id,
-        error_code=error_code,
-        message=message,
-        denied=denied,
-    )
 
 
 def _fetch_failure_without_event(
@@ -1435,13 +1531,12 @@ def _tool_outcome_name(outcome: ToolExecutionOutcome) -> str:
     :raises Exception: 不主动抛出异常。
     """
 
+    # invariant 校验：ToolExecutionOutcome 为封闭联合，按构造类型枚举即可，无需 fallback。
     if isinstance(outcome, ToolCompletedOutcome):
         return "completed"
     if isinstance(outcome, ToolFailedOutcome):
         return "failed"
-    if isinstance(outcome, ToolAwaitingOutcome):
-        return "awaiting"
-    return "unknown"
+    return "awaiting"
 
 
 def _framework_fetch_more_failed(*, message: str) -> ToolFailedOutcome:

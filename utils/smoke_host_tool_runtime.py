@@ -10,27 +10,52 @@ from __future__ import annotations
 import argparse
 import asyncio
 import logging
+import sys
 from dataclasses import dataclass
 from datetime import datetime
+from pathlib import Path
 
-from dayu.contracts import JsonValue, ToolTruncateSpec
+_REPO_ROOT_PARENT_INDEX: int = 1
+
+
+def _ensure_repo_root_on_path() -> None:
+    """确保按文件路径运行脚本时也能导入仓库顶层包。
+
+    :returns: 无返回值。
+    :raises Exception: 不主动抛出异常。
+    """
+
+    if __package__ not in (None, ""):
+        return
+    repo_root = Path(__file__).resolve().parents[_REPO_ROOT_PARENT_INDEX]
+    repo_root_text = str(repo_root)
+    if repo_root_text not in sys.path:
+        sys.path.insert(0, repo_root_text)
+
+
+_ensure_repo_root_on_path()
+
+from dayu.contracts import (
+    FRAMEWORK_FETCH_MORE_TOOL_NAME,
+    JsonValue,
+    ToolTruncateSpec,
+)
 from dayu.contracts.tool_call import (
     ToolCallRequest,
     ToolExecutionContext,
     ToolExecutionRequest,
 )
-from dayu.contracts.tool_outcome import ToolCompletedOutcome, ToolExecutionOutcome
-from dayu.contracts.tool_result import ToolResultSuccess
-from dayu.host import (
-    ToolFetchMoreHandleRequest,
-    ToolFetchMoreHandleSucceededResult,
-    ToolFetchMoreRequest,
-    ToolFetchMoreSucceededResult,
+from dayu.contracts.tool_outcome import (
+    ToolCompletedOutcome,
+    ToolExecutionOutcome,
+    ToolFailedOutcome,
 )
+from dayu.contracts.tool_result import ToolResultSuccess
 from dayu.host._event_store import InMemoryRunEventStore
 from dayu.host._proxy import LocalProxy
 from dayu.host._run_harness import LocalRunHarness
-from dayu.host._tool_runtime import InMemoryToolRuntime, ToolRuntimeToolExecutor
+from dayu.host._tool_runtime import HostToolRuntime, ToolRuntimeToolExecutor
+from utils._smoke_memory_store import SmokeInMemoryConversationMemoryStore
 from dayu.host._worker import EngineWorker
 from dayu.host.contracts import (
     ToolCursorIssuedData,
@@ -169,17 +194,25 @@ async def _main() -> None:
     """
 
     event_store = InMemoryRunEventStore()
-    runtime = InMemoryToolRuntime(
+    runtime = HostToolRuntime(
+        is_durable=False,
         executor=_LargeListExecutor(),
         event_store=event_store,
         truncate_specs={"smoke_list": _spec()},
     )
     adapter = ToolRuntimeToolExecutor(runtime)
+    # harness 在 P8-S2 之前用于演示 LocalRunHarness 的公开 fetch_more 入口；
+    # S2 之后 framework fetch_more 仅作普通 tool call 经
+    # ToolRuntimeToolExecutor -> HostToolRuntime.execute_tool_call。
+    # 保留 harness 装配仅为验证 LocalRunHarness 仍能持有 tool_runtime。
     harness = LocalRunHarness(
+        is_durable=False,
         proxy=LocalProxy(worker=EngineWorker(adapter)),
         event_store=event_store,
         tool_runtime=runtime,
+        memory_store=SmokeInMemoryConversationMemoryStore(),
     )
+    assert harness.tool_runtime is runtime
 
     outcome = await adapter.execute(_request())
     if not isinstance(outcome, ToolCompletedOutcome):
@@ -219,63 +252,72 @@ async def _main() -> None:
     if not cursor_fingerprint:
         raise RuntimeError("cursor fingerprint was not issued")
 
-    handle_result = await harness.get_tool_fetch_more_handle(
-        ToolFetchMoreHandleRequest(
-            iteration_id="smoke_iter_1",
-            session_id=_SESSION_ID,
-            run_id=_RUN_ID,
-            tool_call_id=_TOOL_CALL_ID,
-            cursor_fingerprint=cursor_fingerprint,
-        )
-    )
-    if not isinstance(handle_result, ToolFetchMoreHandleSucceededResult):
-        raise RuntimeError(handle_result.error_code)
-    _LOGGER.info(
-        "handle acquired fingerprint=%s expires_at=%.3f",
-        handle_result.handle.cursor.fingerprint,
-        handle_result.expires_at_monotonic,
-    )
+    truncation = outcome.result.truncation
+    if truncation is None:
+        raise RuntimeError("truncation info missing")
 
-    fetch_result = await harness.fetch_more_tool_result(
-        ToolFetchMoreRequest(
-            iteration_id="smoke_iter_1",
-            session_id=_SESSION_ID,
-            run_id=_RUN_ID,
-            tool_call_id=_TOOL_CALL_ID,
-            cursor=handle_result.handle.cursor,
-            scope_token=handle_result.handle.scope_token,
-            limit=99,
+    fetch_outcome = await runtime.execute_tool_call(
+        ToolExecutionRequest(
+            call=ToolCallRequest(
+                tool_call_id="smoke_fetch_call_1",
+                name=FRAMEWORK_FETCH_MORE_TOOL_NAME,
+                arguments={
+                    "cursor": truncation.cursor,
+                    "scope_token": truncation.scope_token,
+                    "limit": 99,
+                },
+                index_in_iteration=0,
+                provider_state=None,
+            ),
+            context=ToolExecutionContext(
+                run_id=_RUN_ID,
+                session_id=_SESSION_ID,
+                iteration_id="smoke_iter_1",
+                tool_call_id="smoke_fetch_call_1",
+                index_in_iteration=0,
+                timeout_seconds=None,
+                cancellation_token=_Token(),
+                correlation_id="smoke-correlation",
+            ),
         )
     )
-    if not isinstance(fetch_result, ToolFetchMoreSucceededResult):
-        raise RuntimeError(fetch_result.error_code)
-    if not isinstance(fetch_result.value, list):
+    if not isinstance(fetch_outcome, ToolCompletedOutcome):
+        raise RuntimeError("framework fetch_more did not complete")
+    if not isinstance(fetch_outcome.result.value, list):
         raise RuntimeError("fetch_more value is not a list")
     _LOGGER.info(
-        "fetch_more completed items=%s has_more=%s event_cursor=%s",
-        len(fetch_result.value),
-        fetch_result.truncation is not None,
-        fetch_result.event_cursor.sequence,
+        "fetch_more completed items=%s has_more=%s",
+        len(fetch_outcome.result.value),
+        fetch_outcome.result.truncation is not None,
     )
 
-    reused = await harness.fetch_more_tool_result(
-        ToolFetchMoreRequest(
-            iteration_id="smoke_iter_1",
-            session_id=_SESSION_ID,
-            run_id=_RUN_ID,
-            tool_call_id=_TOOL_CALL_ID,
-            cursor=handle_result.handle.cursor,
-            scope_token=handle_result.handle.scope_token,
-            limit=None,
+    reused = await runtime.execute_tool_call(
+        ToolExecutionRequest(
+            call=ToolCallRequest(
+                tool_call_id="smoke_fetch_call_2",
+                name=FRAMEWORK_FETCH_MORE_TOOL_NAME,
+                arguments={
+                    "cursor": truncation.cursor,
+                    "scope_token": truncation.scope_token,
+                },
+                index_in_iteration=0,
+                provider_state=None,
+            ),
+            context=ToolExecutionContext(
+                run_id=_RUN_ID,
+                session_id=_SESSION_ID,
+                iteration_id="smoke_iter_1",
+                tool_call_id="smoke_fetch_call_2",
+                index_in_iteration=0,
+                timeout_seconds=None,
+                cancellation_token=_Token(),
+                correlation_id="smoke-correlation",
+            ),
         )
     )
-    if isinstance(reused, ToolFetchMoreSucceededResult):
+    if not isinstance(reused, ToolFailedOutcome):
         raise RuntimeError("single-use cursor unexpectedly succeeded")
-    _LOGGER.info(
-        "old cursor rejected error=%s event_cursor=%s",
-        reused.error_code,
-        reused.event_cursor.sequence if reused.event_cursor is not None else None,
-    )
+    _LOGGER.info("old cursor rejected error=%s", reused.result.error)
 
     for event in await event_store.list_events(_RUN_ID, after=None):
         data = event.data

@@ -245,9 +245,9 @@ async def test_durable_harness_start_run_drains_to_read_models() -> None:
 async def test_durable_harness_shares_memory_store_with_observer() -> None:
     """传入 memory_store 必须被 LocalRunHarness 与 MemoryProjectionObserver 共享。"""
 
-    from dayu.host._conversation_memory import InMemoryConversationMemoryStore
+    from tests.host._memory_store_fake import FakeInMemoryConversationMemoryStore
 
-    shared = InMemoryConversationMemoryStore()
+    shared = FakeInMemoryConversationMemoryStore()
     bundle = build_durable_harness(
         config=DurableHarnessConfig(database_path=":memory:"),
         memory_store=shared,

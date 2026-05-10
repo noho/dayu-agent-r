@@ -1,8 +1,14 @@
 """Host P6 memory projection observer。
 
-本模块把 P3-P5 已有的 ``InMemoryConversationMemoryStore.project_run_events``
-封装为基于 durable EventLog 的 observer，按 run_id 累积 canonical 事件，
-在 terminal 事件后整批投影到 :class:`ConversationMemoryStore`。
+本模块把 P3-P5 的 memory store 投影封装为基于 durable EventLog 的
+observer，按 run_id 累积 canonical 事件，在 terminal 事件后整批投影。
+
+P8-S8 起 observer 必须使用 transaction-aware 写入：投影写入与
+projection checkpoint 推进必须在同一 :class:`HostStorageTransaction`
+内提交，避免 “projection checkpoint 已 caught up，但 memory snapshot
+未持久化” 的恢复洞。:class:`ConversationMemoryProjectionStore` 协议
+继承 :class:`ConversationMemoryStore`，附加
+``project_run_events_in_transaction`` 接口；observer 只接受该协议。
 
 memory projection 是 required projection：
 
@@ -10,17 +16,24 @@ memory projection 是 required projection：
 - 成功终态写 assistant final answer。
 - Engine ``RUN_FAILED`` 与 Host-owned failure 写中性 terminal summary。
 - cancelled / suspended 不写 assistant terminal summary，但保留用户输入。
+
+P8 起 ``ObserverSink.process`` 已升级为 async 协议，observer 直接
+``await`` memory store，不再需要 sync-async 桥接。
+
+P8 PR #40 follow-up 起 durable 装配在 terminal run 投影时必须从
+EventLog 真源重读该 run 的完整 canonical 事件，再与 checkpoint advance
+处于同一 observer transaction 内提交；进程内 pending 仅作为非 durable /
+测试路径的短生命周期缓存，不承担跨 checkpoint / restart 的事实保存职责。
 """
 
 from __future__ import annotations
 
-from collections.abc import Awaitable
 from dataclasses import dataclass, field
+from typing import Protocol
 
 from dayu.host._conversation_memory import ConversationMemoryStore
 from dayu.host._event_observer import (
     ObserverDescriptor,
-    ObserverSink,
     ProjectionEventEnvelope,
 )
 from dayu.host._host_storage_transaction import HostStorageTransaction
@@ -35,14 +48,73 @@ _PROJECTION_NAME: str = "conversation_memory"
 _SCHEMA_VERSION: int = 1
 
 
+class ConversationMemoryProjectionStore(ConversationMemoryStore, Protocol):
+    """observer 路径专用 :class:`ConversationMemoryStore` 协议扩展。
+
+    在 :class:`ConversationMemoryStore` 之上附加事务感知投影接口。
+    observer 持有 :class:`HostStorageTransaction` 时调用
+    ``project_run_events_in_transaction``，确保 snapshot 写入与
+    projection checkpoint 推进在同一事务内提交。
+
+    :param tx: 当前事务。
+    :param events: 同一 run 的 RunEvent 元组。
+    :returns: 无返回值。
+    """
+
+    async def project_run_events_in_transaction(
+        self,
+        *,
+        tx: HostStorageTransaction,
+        events: tuple[RunEvent, ...],
+    ) -> None:
+        """事务内投影 RunEvent。
+
+        :param tx: 当前事务。
+        :param events: 同一 run 的 RunEvent 元组。
+        :returns: 无返回值。
+        :raises Exception: 投影失败时透传。
+        """
+        ...
+
+
+class CanonicalRunEventReader(Protocol):
+    """按 run 读取 canonical EventLog facts 的 Host internal 协议。
+
+    durable memory observer 使用该协议在 terminal 事件到达时从 EventLog
+    真源重建同一 run 的完整 canonical 事件，避免 checkpoint 已推进后进程
+    重启导致 ``_pending_by_run`` 丢失。
+    """
+
+    def fetch_canonical_events_for_run_in_transaction(
+        self,
+        *,
+        tx: HostStorageTransaction,
+        session_id: str,
+        run_id: str,
+    ) -> tuple[RunEvent, ...]:
+        """在当前 observer 事务内读取同一 run 的 canonical 事件。
+
+        :param tx: 当前 observer 事务。
+        :param session_id: 会话 id。
+        :param run_id: Run id。
+        :returns: RunEvent 元组，按 EventLog 全局位置升序。
+        :raises Exception: 读取失败时透传。
+        """
+        ...
+
+
 @dataclass(slots=True)
 class MemoryProjectionObserver:
     """memory read model observer。
 
-    :param memory_store: ConversationMemoryStore 实例。
+    :param memory_store: 实现 :class:`ConversationMemoryProjectionStore`
+        协议的 memory store。
+    :param event_reader: durable EventLog canonical fact reader；提供时
+        terminal 投影从 EventLog 重读完整 run facts，缺省仅用于旧单元测试。
     """
 
-    memory_store: ConversationMemoryStore
+    memory_store: ConversationMemoryProjectionStore
+    event_reader: CanonicalRunEventReader | None = None
     _pending_by_run: dict[str, list[RunEvent]] = field(
         default_factory=dict, init=False
     )
@@ -62,7 +134,7 @@ class MemoryProjectionObserver:
             required=True,
         )
 
-    def process(
+    async def process(
         self,
         *,
         tx: HostStorageTransaction,
@@ -70,10 +142,10 @@ class MemoryProjectionObserver:
     ) -> None:
         """累积 canonical 事件，遇到 terminal 时整批投影。
 
-        memory store 写入是内存态、幂等：``project_run_events`` 接收同一
-        run 的事件元组，``InMemoryConversationMemoryStore`` 内部会用
-        ``replace`` 模式合并。``tx`` 不参与 memory 写入但保留参数以保持协议
-        一致。
+        memory snapshot 写入与 ``ProjectionCoordinator`` checkpoint
+        advance 共享同一个 :class:`HostStorageTransaction`：
+        ``project_run_events_in_transaction`` 不再开新事务，写入失败时
+        observer transaction 整体回滚，checkpoint 不前进。
 
         :param tx: 当前事务。
         :param batch: 事件 envelope 元组。
@@ -81,14 +153,10 @@ class MemoryProjectionObserver:
         :raises Exception: 投影失败时透传。
         """
 
-        del tx
         # at-least-once 不变量：sink 失败时 ``_pending_by_run`` 不能被破坏。
         # 因此先把本批次新增事件累积到一个临时副本中，sink 全部成功后再
         # 整体提交回 ``_pending_by_run``，并在 terminal 事件成功投影后才
-        # 删除该 run 的累积条目。这样即使 ``project_run_events`` 抛异常被
-        # 上层标记为 ``RETRYABLE_FAILED`` / ``BLOCKED_FAILED``，下次 drain
-        # / 重放时 observer 仍能用同一批 envelope 重放并重新累积，用户
-        # 输入与 final 不会因 pop-before-sink 永久丢失。
+        # 删除该 run 的累积条目。
         staged: dict[str, list[RunEvent]] = {
             run_id: list(events)
             for run_id, events in self._pending_by_run.items()
@@ -100,22 +168,27 @@ class MemoryProjectionObserver:
                 continue
             staged.setdefault(event.run_id, []).append(event)
             if event.type in TERMINAL_RUN_EVENT_TYPES:
-                events = tuple(staged[event.run_id])
-                # 同步路径：memory store 是 asyncio 协程接口，但 observer
-                # 在事务内同步运行；采用 ``run_until_complete`` 兼容内存实
-                # 现的 Lock。
-                _run_async(
-                    self.memory_store.project_run_events(events)
+                if self.event_reader is None:
+                    events = tuple(staged[event.run_id])
+                else:
+                    events = (
+                        self.event_reader
+                        .fetch_canonical_events_for_run_in_transaction(
+                            tx=tx,
+                            session_id=event.session_id,
+                            run_id=event.run_id,
+                        )
+                    )
+                await self.memory_store.project_run_events_in_transaction(
+                    tx=tx, events=events
                 )
                 terminal_run_ids.append(event.run_id)
-        # sink 全部成功后才把 staged 状态写回真源，并清掉已 terminal 的
-        # run 条目；任何一次 ``_run_async`` 抛异常时控制流不会到达此处，
-        # ``_pending_by_run`` 维持调用前的累积视图。
+        # sink 全部成功后才把 staged 状态写回真源，并清掉已 terminal 的 run。
         self._pending_by_run = staged
         for run_id in terminal_run_ids:
             self._pending_by_run.pop(run_id, None)
 
-    def rebuild_from_events(
+    async def rebuild_from_events(
         self,
         events: tuple[RunEvent, ...],
     ) -> None:
@@ -124,10 +197,9 @@ class MemoryProjectionObserver:
         生产路径不调用本方法。生产 startup / 崩溃恢复路径由
         :meth:`ProjectionCoordinator.startup_reconcile` 经由 ``drain()``
         + observer ``process()`` 完成，复用同一份 at-least-once 累积逻辑。
-        本 helper 仅供 ``tests/host/test_phase6_memory_rebuild.py`` 直接以
-        canonical RunEvent 序列驱动 ``InMemoryConversationMemoryStore``，
-        作为 memory required projection 五条事实（成功 / engine failed /
-        host failed / cancelled / suspended）的最小行为契约。
+        本 helper 仅供 ``tests/host/test_phase6_memory_rebuild.py`` 类型
+        测试以 canonical RunEvent 序列直接驱动 memory store。它不持有
+        observer transaction，因此走非事务版本 ``project_run_events``。
 
         :param events: 全部 RunEvent。
         :returns: 无返回值。
@@ -140,61 +212,11 @@ class MemoryProjectionObserver:
                 continue
             groups.setdefault(event.run_id, []).append(event)
         for run_events in groups.values():
-            _run_async(
-                self.memory_store.project_run_events(tuple(run_events))
-            )
-
-
-def _run_async(coro: Awaitable[None]) -> None:
-    """在同步上下文驱动一个协程到完成。
-
-    observer 在 ``ProjectionCoordinator`` 写事务的线程内被同步调用，但
-    memory store 协议是协程；本函数在没有 running loop 时用临时 loop
-    驱动，在已有 running loop 时把协程派发到一个独立线程内的新 loop
-    执行，避免阻塞外层 loop 也避免重入冲突。
-
-    :param coro: awaitable 对象。
-    :returns: 无返回值。
-    :raises Exception: 协程内部异常透传。
-    """
-
-    import asyncio
-    import threading
-
-    try:
-        running = asyncio.get_running_loop()
-    except RuntimeError:
-        running = None
-
-    async def _await_target() -> None:
-        await coro
-
-    if running is None:
-        loop = asyncio.new_event_loop()
-        try:
-            loop.run_until_complete(_await_target())
-        finally:
-            loop.close()
-        return
-
-    error_box: list[BaseException] = []
-
-    def _runner() -> None:
-        loop = asyncio.new_event_loop()
-        try:
-            loop.run_until_complete(_await_target())
-        except BaseException as exc:  # noqa: BLE001
-            error_box.append(exc)
-        finally:
-            loop.close()
-
-    thread = threading.Thread(target=_runner, name="memory-projection-runner")
-    thread.start()
-    thread.join()
-    if error_box:
-        raise error_box[0]
+            await self.memory_store.project_run_events(tuple(run_events))
 
 
 __all__ = [
+    "CanonicalRunEventReader",
+    "ConversationMemoryProjectionStore",
     "MemoryProjectionObserver",
 ]

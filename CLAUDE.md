@@ -81,8 +81,8 @@
 - 各 README 固定职责：
   - 根目录 `README.md`：用户手册，只写安装、配置、跑通、常用工作流、CLI 命令、trace/render 入口、文档导航。
   - `dayu/README.md`：开发手册总览，只写整体架构、设计意图、稳定边界、扩展入口、代码阅读顺序。
-  - `dayu/engine/README.md`：Engine 开发手册，只写架构、公共契约、函数式入口、Runner/Agent 事件流、状态机、取消与诊断边界、扩展点；不写 Host ToolRegistry、trace store、transcript、conversation memory 等未归属 Engine 的能力。
-  - `dayu/host/README.md`：Host 开发手册，只写架构、接口、机制和当前已经落地的事实。
+  - `dayu/engine/README.md`：Engine 开发手册，只写接口、架构、边界、执行路径、状态机、事件流、关键机制、公共契约、扩展点。
+  - `dayu/host/README.md`：Host 开发手册，只写接口、架构、边界、执行路径、状态机、事件流、关键机制、公共契约、扩展点。
   - `dayu/fins/README.md`：Fins 开发手册，只写 capability 定位、两条执行路径、对外接口、内部分层与机制。
   - `dayu/config/README.md`：配置说明手册，只写默认配置、`workspace/config` 覆盖关系、常改项、最小示例、prompts 目录职责。
   - `tests/README.md`：测试手册，只写测试分层、运行方式、约定与维护规则。
@@ -98,7 +98,10 @@
 - 文档写作约束：
   - 优先写“当前怎么用 / 当前怎么工作”，不要写“未来可能会怎样”。
   - 示例必须使用当前真实命令、真实导入路径、真实参数名。
+  - 禁止罗列实现细节。
   - 高层文档使用抽象边界，不泄漏不必要的具体实现类名；包级文档可写当前默认实现，但要区分“当前实现”和“稳定契约”。
+  - `docs/host/design.md` 是 Host 接口与架构边界真源：在 Host README 的抽象层级之上补充少量机制细节、设计取舍、关键事务边界、状态转换、恢复路径和不变量，但不得展开成源码说明书。
+  - `docs/engine/design.md` 是 Engine 接口与架构边界真源：在 Engine README 的抽象层级之上补充少量机制细节、设计取舍、关键事务边界、状态转换、恢复路径和不变量，但不得展开成源码说明书。
   - 若概念已改名，必须全量清理旧名，禁止新旧术语并存。
 
 ## 目录约束

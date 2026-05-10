@@ -7,29 +7,34 @@ import json
 from dataclasses import dataclass
 from datetime import datetime
 from pathlib import Path
-from typing import cast
 
 import pytest
 
 import dayu.engine as engine
 import dayu.host as host
-from dayu.contracts import JsonValue, ToolTruncateSpec, ToolTruncationInfo
+import dayu.host.contracts as host_contracts
+from dayu.contracts import (
+    FRAMEWORK_FETCH_MORE_TOOL_NAME,
+    JsonValue,
+    ToolTruncateSpec,
+    ToolTruncationInfo,
+)
 from dayu.contracts.tool_call import (
     ToolCallRequest,
     ToolExecutionContext,
     ToolExecutionRequest,
 )
-from dayu.contracts.tool_outcome import ToolCompletedOutcome, ToolExecutionOutcome
+from dayu.contracts.tool_outcome import (
+    ToolCompletedOutcome,
+    ToolExecutionOutcome,
+    ToolFailedOutcome,
+)
 from dayu.contracts.tool_result import ToolResultSuccess
 from dayu.host import (
-    ToolFetchMoreHandleRequest,
-    ToolFetchMoreHandleSucceededResult,
-    ToolFetchMoreRequest,
-    ToolFetchMoreSucceededResult,
     ToolResultTruncatedData,
 )
 from dayu.host._event_store import InMemoryRunEventStore
-from dayu.host._tool_runtime import InMemoryToolRuntime
+from dayu.host._tool_runtime import HostToolRuntime
 
 
 @dataclass(frozen=True, slots=True)
@@ -115,7 +120,50 @@ def _request(
     )
 
 
-def _runtime() -> tuple[InMemoryToolRuntime, InMemoryRunEventStore]:
+def _framework_request(
+    *,
+    cursor_value: str,
+    scope_token: str,
+    run_id: str = "run_1",
+    session_id: str = "session_1",
+    tool_call_id: str = "fetch_call_1",
+) -> ToolExecutionRequest:
+    """构造 framework ``fetch_more`` 工具执行请求。
+
+    :param cursor_value: cursor 原文。
+    :param scope_token: scope token 明文。
+    :param run_id: Run id。
+    :param session_id: 会话 id。
+    :param tool_call_id: framework tool call id。
+    :returns: ToolExecutionRequest。
+    :raises Exception: 不主动抛出异常。
+    """
+
+    return ToolExecutionRequest(
+        call=ToolCallRequest(
+            tool_call_id=tool_call_id,
+            name=FRAMEWORK_FETCH_MORE_TOOL_NAME,
+            arguments={
+                "cursor": cursor_value,
+                "scope_token": scope_token,
+            },
+            index_in_iteration=0,
+            provider_state=None,
+        ),
+        context=ToolExecutionContext(
+            run_id=run_id,
+            session_id=session_id,
+            iteration_id="iter_1",
+            tool_call_id=tool_call_id,
+            index_in_iteration=0,
+            timeout_seconds=None,
+            cancellation_token=_Token(),
+            correlation_id=None,
+        ),
+    )
+
+
+def _runtime() -> tuple[HostToolRuntime, InMemoryRunEventStore]:
     """构造 runtime。
 
     :returns: runtime 与 store。
@@ -123,7 +171,8 @@ def _runtime() -> tuple[InMemoryToolRuntime, InMemoryRunEventStore]:
     """
 
     store = InMemoryRunEventStore()
-    runtime = InMemoryToolRuntime(
+    runtime = HostToolRuntime(
+        is_durable=False,
         executor=_Executor(value=[1, 2, 3]),
         event_store=store,
         truncate_specs={
@@ -163,19 +212,36 @@ def _imported_modules(root: Path) -> list[tuple[Path, str]]:
     return modules
 
 
-def test_host_exports_public_fetch_more_contracts_without_internal_runtime() -> None:
-    """Host 包根只导出 Run 级补读入口与契约类型。"""
+def test_host_does_not_export_internal_tool_runtime_implementations() -> None:
+    """Host 包根不得直接导出内部 ToolRuntime 实现。"""
 
     exported = frozenset(host.__all__)
-    assert "get_tool_fetch_more_handle" in exported
-    assert "fetch_more_tool_result" in exported
     assert "ToolFetchMoreRequest" in exported
-    assert "ToolFetchMoreHandle" in exported
-    assert "InMemoryToolRuntime" not in exported
+    assert "ToolFetchMoreHandle" not in exported
+    assert "HostToolRuntime" not in exported
     assert "ToolRuntimeToolExecutor" not in exported
     assert "ToolExecutor" not in exported
-    assert not hasattr(host, "InMemoryToolRuntime")
+    assert not hasattr(host, "HostToolRuntime")
     assert not hasattr(host, "ToolRuntimeToolExecutor")
+
+
+def test_legacy_fetch_more_handle_contracts_are_not_public() -> None:
+    """旧 public fetch_more handle 协议不得从包根或 contracts 导出。"""
+
+    forbidden = frozenset(
+        {
+            "ToolFetchMoreHandleRequest",
+            "ToolFetchMoreHandle",
+            "ToolFetchMoreHandleSucceededResult",
+            "ToolFetchMoreHandleFailedResult",
+            "ToolFetchMoreHandleResult",
+        }
+    )
+    assert forbidden.isdisjoint(frozenset(host.__all__))
+    assert forbidden.isdisjoint(frozenset(host_contracts.__all__))
+    for name in forbidden:
+        assert not hasattr(host, name)
+        assert not hasattr(host_contracts, name)
 
 
 def test_engine_does_not_import_host_or_tool_runtime() -> None:
@@ -193,83 +259,63 @@ def test_engine_does_not_import_host_or_tool_runtime() -> None:
 
 
 @pytest.mark.asyncio
-async def test_scope_token_delivered_only_by_handle_not_eventlog() -> None:
-    """scope token 不进入 EventLog，但可通过受控 handle 补读。"""
+async def test_scope_token_delivered_only_via_outcome_truncation_not_eventlog() -> None:
+    """scope token 不进入 EventLog，但通过 outcome.truncation 暴露给模型。"""
 
     runtime, store = _runtime()
-    await runtime.execute_tool_call(_request())
+    outcome = await runtime.execute_tool_call(_request())
+    assert isinstance(outcome, ToolCompletedOutcome)
+    truncation = outcome.result.truncation
+    assert truncation is not None
+    assert truncation.scope_token
+
     events = await store.list_events("run_1", after=None)
     serialized_events = repr(events)
     assert "scope_token" not in serialized_events
     assert "cursor-boundary" not in serialized_events
+    assert isinstance(events[0].data, ToolResultTruncatedData)
 
-    truncated = cast(ToolResultTruncatedData, events[0].data)
-    handle = await runtime.get_tool_fetch_more_handle(
-        ToolFetchMoreHandleRequest(
-            iteration_id="iter_1",
-            session_id="session_1",
-            run_id="run_1",
-            tool_call_id="tc_1",
-            cursor_fingerprint=truncated.cursor_fingerprint,
+    fetch_outcome = await runtime.execute_tool_call(
+        _framework_request(
+            cursor_value=truncation.cursor,
+            scope_token=truncation.scope_token,
         )
     )
-    assert isinstance(handle, ToolFetchMoreHandleSucceededResult)
-    assert handle.handle.scope_token
-
-    result = await runtime.fetch_more(
-        ToolFetchMoreRequest(
-            iteration_id="iter_1",
-            session_id="session_1",
-            run_id="run_1",
-            tool_call_id="tc_1",
-            cursor=handle.handle.cursor,
-            scope_token=handle.handle.scope_token,
-            limit=None,
-        )
-    )
-    assert isinstance(result, ToolFetchMoreSucceededResult)
-    assert result.value == [2]
+    assert isinstance(fetch_outcome, ToolCompletedOutcome)
+    assert fetch_outcome.result.value == [2]
 
 
 @pytest.mark.asyncio
-async def test_scope_binding_rejects_cross_session_run_or_tool_call() -> None:
-    """cursor 绑定 session / run / 原始 tool_call，不绑定 fetch_more 新调用。"""
+async def test_scope_binding_rejects_cross_session_or_run() -> None:
+    """cursor 绑定 session / run；framework fetch_more 跨边界返回失败。"""
 
     runtime, store = _runtime()
-    await runtime.execute_tool_call(_request())
-    truncated = cast(
-        ToolResultTruncatedData,
-        (await store.list_events("run_1", after=None))[0].data,
-    )
-    good = await runtime.get_tool_fetch_more_handle(
-        ToolFetchMoreHandleRequest(
-            iteration_id="iter_1",
-            session_id="session_1",
-            run_id="run_1",
-            tool_call_id="tc_1",
-            cursor_fingerprint=truncated.cursor_fingerprint,
-        )
-    )
-    assert isinstance(good, ToolFetchMoreHandleSucceededResult)
+    outcome = await runtime.execute_tool_call(_request())
+    assert isinstance(outcome, ToolCompletedOutcome)
+    truncation = outcome.result.truncation
+    assert truncation is not None
 
-    for session_id, run_id, tool_call_id in (
-        ("session_2", "run_1", "tc_1"),
-        ("session_1", "run_2", "tc_1"),
-        ("session_1", "run_1", "tc_2"),
+    for session_id, run_id in (
+        ("session_2", "run_1"),
+        ("session_1", "run_2"),
     ):
-        denied = await runtime.fetch_more(
-            ToolFetchMoreRequest(
-                iteration_id="iter_1",
+        denied = await runtime.execute_tool_call(
+            _framework_request(
+                cursor_value=truncation.cursor,
+                scope_token=truncation.scope_token,
                 session_id=session_id,
                 run_id=run_id,
-                tool_call_id=tool_call_id,
-                cursor=good.handle.cursor,
-                scope_token=good.handle.scope_token,
-                limit=None,
+                tool_call_id=f"fetch_call_{session_id}_{run_id}",
             )
         )
-        assert not isinstance(denied, ToolFetchMoreSucceededResult)
-        assert denied.error_code == "cursor_scope_mismatch"
+        assert isinstance(denied, ToolFailedOutcome)
+        assert denied.result.error == "cursor_scope_mismatch"
+    # cursor owner Run 仍只看到 owner 端的 denial 事实
+    owner_events = await store.list_events("run_1", after=None)
+    assert any(
+        event.type is host.RunEventType.TOOL_CURSOR_DENIED
+        for event in owner_events
+    )
 
 
 @pytest.mark.asyncio
@@ -277,36 +323,21 @@ async def test_cross_run_fetch_more_does_not_pollute_claimed_run() -> None:
     """跨 Run 补读拒绝事实只能归属 cursor owner Run。"""
 
     runtime, store = _runtime()
-    await runtime.execute_tool_call(_request())
-    truncated = cast(
-        ToolResultTruncatedData,
-        (await store.list_events("run_1", after=None))[0].data,
-    )
-    good = await runtime.get_tool_fetch_more_handle(
-        ToolFetchMoreHandleRequest(
-            iteration_id="iter_1",
-            session_id="session_1",
-            run_id="run_1",
-            tool_call_id="tc_1",
-            cursor_fingerprint=truncated.cursor_fingerprint,
-        )
-    )
-    assert isinstance(good, ToolFetchMoreHandleSucceededResult)
+    outcome = await runtime.execute_tool_call(_request())
+    assert isinstance(outcome, ToolCompletedOutcome)
+    truncation = outcome.result.truncation
+    assert truncation is not None
 
-    denied = await runtime.fetch_more(
-        ToolFetchMoreRequest(
-            iteration_id="iter_1",
-            session_id="session_1",
+    denied = await runtime.execute_tool_call(
+        _framework_request(
+            cursor_value=truncation.cursor,
+            scope_token=truncation.scope_token,
             run_id="run_2",
-            tool_call_id="tc_1",
-            cursor=good.handle.cursor,
-            scope_token=good.handle.scope_token,
-            limit=None,
         )
     )
 
-    assert not isinstance(denied, ToolFetchMoreSucceededResult)
-    assert denied.error_code == "cursor_scope_mismatch"
+    assert isinstance(denied, ToolFailedOutcome)
+    assert denied.result.error == "cursor_scope_mismatch"
     owner_events = await store.list_events("run_1", after=None)
     claimed_events = await store.list_events("run_2", after=None)
     assert claimed_events == ()

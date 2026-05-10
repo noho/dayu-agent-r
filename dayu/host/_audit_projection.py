@@ -81,13 +81,17 @@ class AuditProjectionObserver:
             required=False,
         )
 
-    def process(
+    async def process(
         self,
         *,
         tx: HostStorageTransaction,
         batch: tuple[ProjectionEventEnvelope, ...],
     ) -> None:
         """记录 canonical 事件审计条目。
+
+        协议为 async（P8 起 :class:`ObserverSink` 协议升级为 async）。
+        audit observer 仅在内存累积条目，不需要 await 任何下游；保持
+        async 签名以匹配协议。
 
         :param tx: 当前事务（audit read model 不写 SQL）。
         :param batch: 事件 envelope 元组。

@@ -41,12 +41,13 @@ from dayu.host import (
     RunEventSource,
     RunEventType,
     RunSucceededResult,
-    ToolFetchMoreFailedResult,
-    ToolFetchMoreHandleRequest,
-    ToolFetchMoreHandleSucceededResult,
-    ToolFetchMoreRequest,
-    ToolFetchMoreSucceededResult,
 )
+from dayu.contracts.tool_call import (
+    ToolCallRequest,
+    ToolExecutionContext,
+    ToolExecutionRequest,
+)
+from dayu.contracts.tool_outcome import ToolCompletedOutcome, ToolFailedOutcome
 from dayu.host.contracts import (
     HostContextCompactCompletedData,
     ToolCursorIssuedData,
@@ -83,6 +84,39 @@ _RUN_1: str = "phase5-test-run-1"
 _RUN_2: str = "phase5-test-run-2"
 _COMPACT_RUN: str = "phase5-test-compact"
 _T = TypeVar("_T")
+
+
+@dataclass(frozen=True, slots=True)
+class _NoopCancellationToken:
+    """phase5 测试用永不取消 cancellation token。"""
+
+    def is_cancelled(self) -> bool:
+        """返回是否已取消。
+
+        :returns: 始终为 ``False``。
+        :raises Exception: 不主动抛出异常。
+        """
+
+        return False
+
+    def cancel_reason(self) -> str | None:
+        """返回取消原因。
+
+        :returns: 始终为 ``None``。
+        :raises Exception: 不主动抛出异常。
+        """
+
+        return None
+
+    def requested_at(self) -> datetime | None:
+        """返回取消请求时间。
+
+        :returns: 始终为 ``None``。
+        :raises Exception: 不主动抛出异常。
+        """
+
+        return None
+
 _ROOT_LOGGER_NAME: Final[str] = ""
 _DAYU_LOGGER_NAME: Final[str] = "dayu"
 _ENGINE_AGENT_LOGGER_NAME: Final[str] = "dayu.engine.agent"
@@ -516,35 +550,44 @@ async def test_phase5_sequential_multiturn_stitches_eventlog_toolruntime_memory(
 
     stream = await harness.start_run(request)
     first_events = await _collect_until_fetch_more_completed(stream.events)
-    cursor = _last_data(first_events, ToolCursorIssuedData)
     truncated = _last_data(first_events, ToolResultTruncatedData)
     fetch_completed = _last_data(first_events, ToolFetchMoreCompletedData)
 
     assert fetch_completed.next_cursor_fingerprint is not None
-    next_handle = await harness.get_tool_fetch_more_handle(
-        ToolFetchMoreHandleRequest(
-            iteration_id="iter-0",
-            session_id=_SESSION_ID,
-            run_id=_RUN_1,
-            tool_call_id=cursor.tool_call_id,
-            cursor_fingerprint=fetch_completed.next_cursor_fingerprint,
-        )
-    )
-    assert isinstance(next_handle, ToolFetchMoreHandleSucceededResult)
+    runtime = harness.tool_runtime
+    assert runtime is not None
+    next_cursor_value = runtime._cursor_by_fingerprint[
+        fetch_completed.next_cursor_fingerprint
+    ]
+    next_record = runtime._records_by_cursor[next_cursor_value]
+    next_scope_token = next_record.scope_token
     probe.release()
     first_events = first_events + await _collect(stream.events)
     terminal = await _wait_succeeded(harness, _RUN_1)
     await _wait_memory_projected(harness, _SESSION_ID)
     event_count_before = len(await harness.event_store.list_events(_RUN_1, after=None))
-    post_terminal = await harness.fetch_more_tool_result(
-        ToolFetchMoreRequest(
-            iteration_id="iter-0",
-            session_id=_SESSION_ID,
-            run_id=_RUN_1,
-            tool_call_id=cursor.tool_call_id,
-            cursor=next_handle.handle.cursor,
-            scope_token=next_handle.handle.scope_token,
-            limit=None,
+    post_terminal = await runtime.execute_tool_call(
+        ToolExecutionRequest(
+            call=ToolCallRequest(
+                tool_call_id="post-terminal-fetch",
+                name=FRAMEWORK_FETCH_MORE_TOOL_NAME,
+                arguments={
+                    "cursor": next_cursor_value,
+                    "scope_token": next_scope_token,
+                },
+                index_in_iteration=0,
+                provider_state=None,
+            ),
+            context=ToolExecutionContext(
+                run_id=_RUN_1,
+                session_id=_SESSION_ID,
+                iteration_id="iter-post-terminal",
+                tool_call_id="post-terminal-fetch",
+                index_in_iteration=0,
+                timeout_seconds=None,
+                cancellation_token=_NoopCancellationToken(),
+                correlation_id=None,
+            ),
         )
     )
     event_count_after = len(await harness.event_store.list_events(_RUN_1, after=None))
@@ -595,10 +638,8 @@ async def test_phase5_sequential_multiturn_stitches_eventlog_toolruntime_memory(
     assert truncated.tool_name == "huge_echo"
     assert _last_data(first_events, ToolFetchMoreCompletedData).tool_name == "huge_echo"
     assert _event_cursor_for_data(first_events, fetch_completed) < terminal.terminal_event_cursor.sequence
-    assert isinstance(post_terminal, ToolFetchMoreFailedResult)
-    assert post_terminal.error_code == "run_terminal"
-    assert not post_terminal.denied
-    assert post_terminal.event_cursor is None
+    assert isinstance(post_terminal, ToolFailedOutcome)
+    assert post_terminal.result.error == "run_terminal"
     assert event_count_before == event_count_after
     assert _event_count(second_events, RunEventType.USER_INPUT_ACCEPTED) == 1
     assert "phase5-host-smoke" in second_input_text
@@ -728,6 +769,7 @@ async def test_phase5_compact_retry_is_internal_attempt_and_preserves_facts(
 
     proxy = _OverflowThenSuccessProxy()
     compact_harness = LocalRunHarness(
+        is_durable=False,
         proxy=proxy,
         memory_store=memory_store,
     )

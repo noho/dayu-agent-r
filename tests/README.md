@@ -40,6 +40,12 @@ pytest tests/host/test_phase3_multiturn_smoke.py -q
 pytest tests/host/test_phase3_boundary.py -q
 pytest tests/contracts/test_tool_declaration.py -q
 pytest tests/host/test_phase5_multiturn_no_governance_smoke.py -q
+pytest tests/host/test_phase8_attempt_supervisor.py -q
+pytest tests/host/test_phase8_attempt_fencing.py -q
+pytest tests/host/test_phase8_tool_runtime_fencing.py -q
+pytest tests/host/test_phase8_attempt_recovery.py -q
+pytest tests/host/test_phase8_multiprocess_stress.py -q
+pytest tests/host/test_phase8_durable_memory_recovery.py -q
 pytest tests/engine/contracts -q
 pytest tests/engine/runners/openai/test_event_flow_ordering.py -q
 ```
@@ -121,10 +127,10 @@ Host 当前 Run harness、RunEventStore、ToolRuntime、Conversation Memory / Ru
   coordinator。
 - P5 no-full-governance smoke：覆盖公共 `huge_echo` 工具通过 `ToolDefinition` / `ToolBundle` 声明、
   fake provider 只模拟 LLM tool call output、真实 Engine Agent tool loop 调用 `ToolExecutor.execute`、
-  `ToolRuntimeToolExecutor -> InMemoryToolRuntime -> huge_echo executor` 产生 truncate / cursor facts、
+  `ToolRuntimeToolExecutor -> HostToolRuntime -> huge_echo executor` 产生 truncate / cursor facts、
   截断 ToolMessage 包含 LLM-readable `truncation.next_action="fetch_more"` 与 `fetch_more_args`、模型在同一 run
   内通过 Engine tool loop 发起 framework `fetch_more`、Host ToolRuntime 路由 framework 补读并在 terminal 前追加
-  fetch_more facts、terminal 后 Host public `fetch_more_tool_result` typed failure 不追加 EventLog、
+  fetch_more facts、terminal 后 framework `fetch_more` 工具调用返回 typed failure 不追加 EventLog、
   后续 Run 的 RunInputBuilder 看到 previous run user / final / tool / fetch_more facts 与 source cursor、
   compact retry 不重复 `USER_INPUT_ACCEPTED`，真实 provider smoke 按 `utils/` smoke 既有范式写死
   `mimo-v2.5-pro-plan` `ProviderCase` 且不读取配置层级，并显式锁定
@@ -168,9 +174,95 @@ Host 当前 Run harness、RunEventStore、ToolRuntime、Conversation Memory / Ru
   fact、`ToolTraceJsonlSink` JSONL + raw payload blob 落盘、provider secret
   scrub、`ToolTraceObserver` 5 类 record 派发、``DurableHarnessConfig.tool_trace_path``
   装配开关与 ``tool_trace_v2_host`` schema 字面量边界。
-- public boundary：锁定 `dayu.host.__all__`，允许 Run 级 `start_run`、`stream_run_events`、`get_run_result`，
-  以及 P2 Run 级 `get_tool_fetch_more_handle`、`fetch_more_tool_result`，阻止 `EngineWorker`、`LocalProxy`、
-  `ToolExecutor`、`InMemoryToolRuntime`、`ToolRuntimeToolExecutor`、`InMemoryConversationMemoryStore`、
+- P8-S3 attempt supervisor（`tests/host/test_phase8_attempt_supervisor.py`）：覆盖
+  `AttemptSupervisor.lease_context` 正常 acquire / yield / 退出清理；renew loop 在 fake
+  clock 下 renew 成功保持 fencing token 不变、刷新 `lease_expires_at`；renew 命中
+  `FENCED` 后 session 失活并通过 `wait_owner_lost` 暴露 typed `FENCED`；renew 抛 storage
+  异常时映射为 typed `STORAGE_ERROR`，masked 日志覆盖且 owner secret 明文不泄漏；
+  `DurableHarnessConfig.attempt_lease_config` 装配入口可覆盖默认 TTL / interval / prefix；
+  `LocalRunHarness` 仅薄委托 supervisor，并在 `_finish_attempt_if_durable` 通过
+  `close_attempt_with_diagnostic_state` 完成 owner-aware 收口；owner CAS 命中失败时
+  diagnostic close 返回 `False` 且不覆盖未来状态；harness 在 owner-lost 后停止从 Engine
+  拉取 / append late event；`_run_to_store` 端到端 owner-lost 集成路径覆盖
+  `proxy stream -> owner lost -> _handle_owner_lost -> Host failure terminal append ->
+  EventLog 不含 stale Engine fact -> owner-aware diagnostic close`：fake proxy 在 owner
+  被外部 fence 后仍准备 late Engine event，harness 通过 `_RecordingDiagnosticSupervisor`
+  观察 supervisor owner-aware diagnostic close 路径被调用且返回 `False`（CAS miss 证明
+  非 legacy unconditional update），EventLog 出现 Host
+  `RUN_FAILED(error_code=attempt_lease_lost)`，late Engine event 不进入 EventLog，
+  `host_attempts.state` 仍是 `running`（owner-aware CAS 没覆盖未来状态）。
+- P8-S4 attempt fencing 原子 terminal close（`tests/host/test_phase8_attempt_fencing.py`）：
+  覆盖 `AttemptSupervisor.append_terminal_and_close` 单 `BEGIN IMMEDIATE` 事务内同时
+  完成 owner 校验、terminal RunEvent append 与 attempt 终态 close 的原子语义。正常
+  owner 路径断言 `host_attempts.terminal_event_position` 与 EventLog 终态 RunEvent
+  全局 position 一致、`host_runs` 同事务推进到终态并写出 `RunResult` 快照;owner 已被
+  替换 / fencing token 不一致 / lease 过期路径断言抛 typed `AttemptFencingError` 且整
+  事务回滚（EventLog 不残留 terminal RunEvent，`host_attempts.state` 不被旧 owner 覆盖
+  未来状态，错误文本不暴露 owner secret 明文）;非 terminal RunEventType 时抛 `ValueError`
+  且 EventLog 无写入；draft 与 owner_context 的 `run_id` 不一致时抛
+  `AttemptFencingError(reason=OWNER_MISMATCH)`，同时覆盖 P8-S5 引入的
+  `AttemptScopedRunEventAppender.append` 非 terminal 路径（terminal draft 抛 `ValueError`、
+  run_id mismatch 抛 OWNER_MISMATCH、stale owner / fenced fencing token 抛
+  AttemptFencingError、正常 owner 单事务 verify+append 落库）。fake clock 替代真实
+  ``time.sleep`` 推进 lease 过期。
+- P8-S5 ToolRuntime owner fencing（`tests/host/test_phase8_tool_runtime_fencing.py`）：
+  覆盖 `ToolRuntimeOwnerScope` ContextVar 安装 / 恢复（含异常路径）、
+  `active_tool_runtime_appender` scope 外返回 `None`、`HostToolRuntime._resolve_appender`
+  在 durable 路径 scope 内返回 `AttemptScopedRunEventAppender`，scope 外 fail-fast，
+  非 durable 测试路径才允许 `PlainRunEventAppender`，以及 ToolRuntime fact `run_id` mismatch 命中
+  `AttemptFencingError(reason=OWNER_MISMATCH)` 且 EventLog 不残留 fact、错误文本不
+  暴露 owner secret。同时覆盖 framework `fetch_more` 作为普通 tool call 的端到端 fenced 断言：
+  合法 owner scope 下 `execute_tool_call` 写入
+  `TOOL_FETCH_MORE_REQUESTED` / `TOOL_FETCH_MORE_COMPLETED` facts；cursor 绑定旧 run、
+  owner scope 绑定新 run 时端到端命中
+  `AttemptFencingError(reason=OWNER_MISMATCH)` 且 EventLog 在两个 run 中均不残留
+  fetch_more fact、错误文本不暴露 owner secret。
+- P8-S6 stale / orphan recovery 主路径（`tests/host/test_phase8_attempt_recovery.py`）：
+  覆盖 `AttemptSupervisor.recover_stale_attempts` 全部 typed 决策——
+  `RUNNING` lease 过期与 `CREATED` 孤儿均诊断收口为 `MARK_LOST`，不创建新的
+  RUNNING recovery attempt；run terminal 或 scan 与短事务之间 CAS miss 时返回
+  `NOOP_TERMINAL`，不覆盖旧行；recovery scan 不修改 `host_projection_checkpoints`、
+  不写诊断 RunEvent。
+  fake clock 替代真实 ``time.sleep`` 推进 lease 过期。
+- P8-S7 真实多进程 + observer drain 验证（`tests/host/test_phase8_multiprocess_stress.py`）：
+  通过 `tests/host/_multiprocess_platform.py` 提供的 spawn-only 多进程平台 helper
+  (`WorkerSpec` / `WorkerContext` / `run_workers` / `assert_clean_exit` / `make_barrier`)
+  在文件落库 SQLite (WAL + ``BEGIN IMMEDIATE``) 上覆盖四类场景: (1) N 个进程并发
+  `DurableRunEventStore.append` 严格保持 per-run sequence + global `event_position`
+  单调唯一; (2) 两个进程持不同 owner secret 同时 `append_terminal_and_close`,
+  仅命中库内 hash 的胜出, 另一方落 `AttemptFencingError(OWNER_MISMATCH)`,
+  EventLog 不残留 stale terminal; (3) 进程 A 拿 lease 后退出, 测试主进程把
+  `host_attempts.lease_expires_at` 改成过去时刻, 进程 B `recover_stale_attempts`
+  落地 typed `MARK_LOST` 诊断收口, 旧 owner late append fenced, 不创建新的
+  RUNNING recovery attempt, 不写诊断 RunEvent; (4) 进程 A 写 user_input + delta + final_answer 但不 drain,
+  进程 B `build_durable_harness` + `coordinator.startup_reconcile` 把 memory /
+  timeline / audit checkpoint 推到 EventLog tail, 第二次 reconcile 幂等。
+  场景 (4) **仅** 验证 EventLog / projection checkpoint / `startup_reconcile`
+  既有语义；durable memory store + checkpoint-aware rebuild 由 P8-S8
+  `tests/host/test_phase8_durable_memory_recovery.py` 单独覆盖。
+  helper 强制 spawn-only / module-level worker / typed traceback 回传 / join
+  超时强杀 (`terminate` -> `kill`), 不使用 `time.sleep` 控 race, 不使用
+  ``:memory:``。
+- P8-S8 durable conversation memory recovery（`tests/host/test_phase8_durable_memory_recovery.py`）：
+  验证 (1) `build_durable_harness` 默认装配 `DurableConversationMemoryStore`；
+  (2) terminal run + drain 后重新装配仍可读出 memory snapshot；(3) checkpoint
+  尚未推进时崩溃 → `startup_reconcile` 重投 EventLog 重建 read model 并幂等；
+  (4) 非终态事件已 checkpoint 后进程重启，terminal 投影仍从 EventLog 重读完整 run
+  facts；(5) 注入 clock 控制 snapshot `updated_at`；(6) `apply_patch`（reset /
+  SESSION clear / claim correction）持久化生效，非 SESSION scope clear 抛
+  `ValueError`；(7) snapshot JSON encode/decode roundtrip 无损；(8) 仓库内
+  不再残留 production `InMemoryConversationMemoryStore`。
+  legacy 内存 fake 由 `tests/host/_memory_store_fake.py` 提供，仅供 tests / smoke
+  使用，生产代码不得依赖。
+- P8 smoke（`utils/smoke_host_p8_attempt_lease.py`）是手工脚本，不在 pytest 默认集内；
+  7 个场景（owner acquire+renew、busy、recovery scan、late write fenced、terminal close、
+  observer reconcile、durable memory recovery）通过 fake clock + deterministic fake worker
+  覆盖。慢硬盘 + Docker Linux stress 测试由 GitHub issue #38 跟踪，不在当前测试集内。
+- public boundary：锁定 `dayu.host.__all__`，包根仅暴露当前 contracts 强类型契约
+  (`RunEvent` / `StartRunRequest` / `ToolRuntimeCursor` / `ToolFetchMoreRequest` 等)；Run 级 `start_run` / `stream_run_events` /
+  `get_run_result` 与 framework `fetch_more` 路径必须经 `LocalRunHarness` 实例 / 普通 tool call
+  访问，阻止 `EngineWorker`、`LocalProxy`、
+  `ToolExecutor`、`HostToolRuntime`、`ToolRuntimeToolExecutor`、`DurableConversationMemoryStore`、
   `DefaultRunInputBuilder`、`RunInputBuildTrace`、`run_agent_messages` 泄漏为包根 API。
 - import boundary：阻止 Host 导入 `dayu.fins`、`dayu.service`、`dayu.ui`。
 - weak typing guard：扫描 `dayu.host` 源码，阻止 `Any`、`object`、无类型签名与裸容器注解。

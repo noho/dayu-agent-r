@@ -58,6 +58,7 @@ from dayu.engine import (
 )
 from dayu.host._event_store import InMemoryRunEventStore
 from dayu.host._run_harness import LocalRunHarness
+from utils._smoke_memory_store import SmokeInMemoryConversationMemoryStore
 from dayu.host.contracts import (
     RunEvent,
     RunEventCursor,
@@ -289,10 +290,17 @@ def _build_harness(
     store = InMemoryRunEventStore()
     if case_name == "success":
         return LocalRunHarness(
+            is_durable=False,
             proxy=_ScriptedProxy(events=_success_events(request)),
             event_store=store,
+            memory_store=SmokeInMemoryConversationMemoryStore(),
         )
-    return LocalRunHarness(proxy=_FailingProxy(), event_store=store)
+    return LocalRunHarness(
+        is_durable=False,
+        proxy=_FailingProxy(),
+        event_store=store,
+        memory_store=SmokeInMemoryConversationMemoryStore(),
+    )
 
 
 async def run_smoke(args: SmokeArgs) -> int:

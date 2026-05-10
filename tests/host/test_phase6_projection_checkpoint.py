@@ -107,7 +107,7 @@ class _RetryOnceObserver:
             required=False,
         )
 
-    def process(
+    async def process(
         self,
         *,
         tx: HostStorageTransaction,
@@ -162,7 +162,7 @@ class _BlockingObserver:
             required=True,
         )
 
-    def process(
+    async def process(
         self,
         *,
         tx: HostStorageTransaction,
@@ -259,4 +259,30 @@ async def test_projection_lag_events_reflects_remaining_events() -> None:
     cp = proj.get(observer_id="x", projection_name="y", schema_version=1)
     assert cp is not None
     assert cp.lag_events == 2
+    storage.close()
+
+
+@pytest.mark.asyncio
+async def test_zero_event_observer_advances_to_caught_up() -> None:
+    """零 EventLog + checkpoint position None 时 observer 应推进到 CAUGHT_UP。"""
+
+    storage = HostStorage(database_path=":memory:")
+    store = open_durable_event_store(storage)
+    # 不写入任何事件，EventLog 为空。
+
+    observer = AuditProjectionObserver()
+    proj_store = ProjectionStore(storage=storage)
+    coord = ProjectionCoordinator(
+        storage=storage,
+        event_store=store,
+        projection_store=proj_store,
+        observers=(observer,),
+    )
+    snapshots = await coord.drain()
+    assert len(snapshots) == 1
+    cp = snapshots[0]
+    assert cp.status is ObserverStatus.CAUGHT_UP
+    # 零事件时 observer 从 None 推进到 position=0 (初始 caught-up 位置)。
+    assert cp.last_success_position is not None
+    assert cp.last_success_position.value == 0
     storage.close()

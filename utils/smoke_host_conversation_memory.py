@@ -2,7 +2,7 @@
 
 本脚本不访问真实 provider，只使用 fake ``WorkerProxy`` 产出少量
 ``EngineEvent``。Host 侧仍走真实 ``LocalRunHarness``、
-``InMemoryRunEventStore``、``InMemoryConversationMemoryStore`` 与默认
+``InMemoryRunEventStore``、``SmokeInMemoryConversationMemoryStore`` 与默认
 ``RunInputBuilder`` 路径，用于观察：
 
 - 首轮 ``USER_INPUT_ACCEPTED`` 是否先落 EventLog。
@@ -61,7 +61,7 @@ from dayu.engine import (
     ToolResultAcceptedData,
     UserMessage,
 )
-from dayu.host._conversation_memory import InMemoryConversationMemoryStore
+from utils._smoke_memory_store import SmokeInMemoryConversationMemoryStore
 from dayu.host._event_store import InMemoryRunEventStore
 from dayu.host._run_harness import LocalRunHarness
 from dayu.host._run_input_builder import (
@@ -407,9 +407,10 @@ async def _run_conversation_case() -> None:
     """
 
     event_store = InMemoryRunEventStore()
-    memory_store = InMemoryConversationMemoryStore()
+    memory_store = SmokeInMemoryConversationMemoryStore()
     proxy = _ScriptedProxy(include_tool_fact=True)
     harness = LocalRunHarness(
+        is_durable=False,
         proxy=proxy,
         event_store=event_store,
         memory_store=memory_store,
@@ -492,9 +493,10 @@ async def _run_missing_terminal_case() -> None:
     """
 
     event_store = InMemoryRunEventStore()
-    memory_store = InMemoryConversationMemoryStore()
+    memory_store = SmokeInMemoryConversationMemoryStore()
     proxy = _MissingTerminalProxy()
     harness = LocalRunHarness(
+        is_durable=False,
         proxy=proxy,
         event_store=event_store,
         memory_store=memory_store,

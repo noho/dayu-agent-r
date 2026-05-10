@@ -29,7 +29,7 @@ from dayu.engine import (
     ToolMessage,
     UserMessage,
 )
-from dayu.host._conversation_memory import InMemoryConversationMemoryStore
+from tests.host._memory_store_fake import FakeInMemoryConversationMemoryStore
 from dayu.host._event_store import InMemoryRunEventStore
 from dayu.host._event_translation import user_input_accepted_draft
 from dayu.host._run_harness import LocalRunHarness
@@ -296,7 +296,7 @@ async def test_append_user_input_failure_does_not_start_engine() -> None:
 
     store = _FailingAppendStore()
     proxy = _CountingProxy()
-    harness = LocalRunHarness(proxy=proxy, event_store=store)
+    harness = LocalRunHarness(is_durable=False, proxy=proxy, event_store=store, memory_store=FakeInMemoryConversationMemoryStore())
 
     with pytest.raises(RuntimeError, match=_ERROR_APPEND_FAILED):
         await harness.start_run(_request())
@@ -352,9 +352,10 @@ async def test_invalid_ingress_transcript_does_not_start_engine_or_pollute_memor
     """入口 input 不是单条非空 UserMessage 时 fail fast。"""
 
     event_store = InMemoryRunEventStore()
-    memory_store = InMemoryConversationMemoryStore()
+    memory_store = FakeInMemoryConversationMemoryStore()
     proxy = _CountingProxy()
     harness = LocalRunHarness(
+        is_durable=False,
         proxy=proxy,
         event_store=event_store,
         memory_store=memory_store,
@@ -375,9 +376,10 @@ async def test_host_owned_worker_failure_projects_user_input_to_memory() -> None
     """Host-owned failure 终态也会触发 memory projection。"""
 
     event_store = InMemoryRunEventStore()
-    memory_store = InMemoryConversationMemoryStore()
+    memory_store = FakeInMemoryConversationMemoryStore()
     proxy = _SynchronousFailingProxy()
     harness = LocalRunHarness(
+        is_durable=False,
         proxy=proxy,
         event_store=event_store,
         memory_store=memory_store,
@@ -402,9 +404,10 @@ async def test_engine_stream_without_terminal_fails_and_projects_memory(
 
     caplog.set_level(logging.CRITICAL, logger="dayu.host._run_harness")
     event_store = InMemoryRunEventStore()
-    memory_store = InMemoryConversationMemoryStore()
+    memory_store = FakeInMemoryConversationMemoryStore()
     proxy = _CountingProxy()
     harness = LocalRunHarness(
+        is_durable=False,
         proxy=proxy,
         event_store=event_store,
         memory_store=memory_store,
@@ -477,7 +480,7 @@ async def test_run_input_replay_excludes_display_reasoning() -> None:
     """RunInputBuilder replay 不包含 preview reasoning。"""
 
     event_store = InMemoryRunEventStore()
-    memory_store = InMemoryConversationMemoryStore()
+    memory_store = FakeInMemoryConversationMemoryStore()
     await event_store.append(
         user_input_accepted_draft(
             run_id="run-reasoning",

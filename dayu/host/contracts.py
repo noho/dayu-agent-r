@@ -832,97 +832,13 @@ class RunStream:
 class ToolRuntimeCursor:
     """Host ToolRuntime cursor 公共包装。
 
-    :param value: cursor 原文，仅通过受控 handle 交付。
+    :param value: cursor 原文，仅由 Host ToolRuntime 内部生成并经
+        framework ``fetch_more`` 普通 tool call 参数回传。
     :param fingerprint: cursor 指纹，可从 RunEvent 中观察。
     """
 
     value: str
     fingerprint: str
-
-
-@dataclass(frozen=True, slots=True)
-class ToolFetchMoreHandleRequest:
-    """读取工具补读 handle 的请求。
-
-    :param session_id: 会话 id。
-    :param run_id: Run id。
-    :param iteration_id: 当前调用方所在 Engine iteration id；用于 ToolRuntime
-        派生事件携带准确的 iteration 维度，避免 trace projection 失配。
-    :param tool_call_id: 原始工具调用 id。
-    :param cursor_fingerprint: RunEvent 中暴露的 cursor 指纹。
-    """
-
-    session_id: str
-    run_id: str
-    iteration_id: str
-    tool_call_id: str
-    cursor_fingerprint: str
-
-
-@dataclass(frozen=True, slots=True)
-class ToolFetchMoreHandle:
-    """工具补读受控 handle。
-
-    该结构不得写入 RunEvent、Engine projection 或日志。
-
-    :param session_id: 会话 id。
-    :param run_id: Run id。
-    :param tool_call_id: 原始工具调用 id。
-    :param cursor: ToolRuntime cursor。
-    :param scope_token: scope 校验 token。
-    :param expires_at_monotonic: 单进程 monotonic 过期时间。
-    """
-
-    session_id: str
-    run_id: str
-    tool_call_id: str
-    cursor: ToolRuntimeCursor
-    scope_token: str
-    expires_at_monotonic: float
-
-
-@dataclass(frozen=True, slots=True)
-class ToolFetchMoreHandleSucceededResult:
-    """工具补读 handle 读取成功结果。
-
-    :param run_id: Run id。
-    :param session_id: 会话 id。
-    :param tool_call_id: 原始工具调用 id。
-    :param handle: 受控补读 handle。
-    :param expires_at_monotonic: 单进程 monotonic 过期时间。
-    """
-
-    run_id: str
-    session_id: str
-    tool_call_id: str
-    handle: ToolFetchMoreHandle
-    expires_at_monotonic: float
-
-
-@dataclass(frozen=True, slots=True)
-class ToolFetchMoreHandleFailedResult:
-    """工具补读 handle 读取失败结果。
-
-    :param run_id: Run id。
-    :param session_id: 会话 id。
-    :param tool_call_id: 原始工具调用 id。
-    :param error_code: 失败错误码。
-    :param message: 人类可读错误描述。
-    :param denied: 是否为权限拒绝。
-    """
-
-    run_id: str
-    session_id: str
-    tool_call_id: str
-    error_code: str
-    message: str
-    denied: bool
-
-
-ToolFetchMoreHandleResult: TypeAlias = (
-    ToolFetchMoreHandleSucceededResult | ToolFetchMoreHandleFailedResult
-)
-"""工具补读 handle 读取结果封闭联合。"""
 
 
 @dataclass(frozen=True, slots=True)
@@ -935,7 +851,7 @@ class ToolFetchMoreRequest:
         派生事件携带准确的 iteration 维度。
     :param tool_call_id: 原始工具调用 id。
     :param cursor: ToolRuntime cursor。
-    :param scope_token: 受控 handle 中携带的 scope token。
+    :param scope_token: framework ``fetch_more`` 参数中携带的 scope token。
     :param limit: 可选读取上限。
     """
 
@@ -1014,11 +930,6 @@ __all__ = [
     "ToolFetchMoreCompletedData",
     "ToolFetchMoreFailedData",
     "ToolFetchMoreFailedResult",
-    "ToolFetchMoreHandle",
-    "ToolFetchMoreHandleFailedResult",
-    "ToolFetchMoreHandleRequest",
-    "ToolFetchMoreHandleResult",
-    "ToolFetchMoreHandleSucceededResult",
     "ToolFetchMoreRequest",
     "ToolFetchMoreResult",
     "ToolFetchMoreSucceededResult",

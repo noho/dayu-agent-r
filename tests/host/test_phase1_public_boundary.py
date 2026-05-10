@@ -2,8 +2,6 @@
 
 from __future__ import annotations
 
-import inspect
-
 import dayu.host as host
 
 EXPECTED_EXPORTS: frozenset[str] = frozenset(
@@ -26,6 +24,10 @@ EXPECTED_EXPORTS: frozenset[str] = frozenset(
         "RunFailedResult",
         "RunHandle",
         "RunInput",
+        "RunInputContextMeta",
+        "RunInputContextSnapshotBuiltData",
+        "RunInputMessageSummary",
+        "RunInputToolSchemaSummary",
         "RunOptions",
         "RunResult",
         "RunState",
@@ -39,11 +41,6 @@ EXPECTED_EXPORTS: frozenset[str] = frozenset(
         "ToolFetchMoreCompletedData",
         "ToolFetchMoreFailedData",
         "ToolFetchMoreFailedResult",
-        "ToolFetchMoreHandle",
-        "ToolFetchMoreHandleFailedResult",
-        "ToolFetchMoreHandleRequest",
-        "ToolFetchMoreHandleResult",
-        "ToolFetchMoreHandleSucceededResult",
         "ToolFetchMoreRequest",
         "ToolFetchMoreRequestedData",
         "ToolFetchMoreResult",
@@ -54,11 +51,6 @@ EXPECTED_EXPORTS: frozenset[str] = frozenset(
         "ToolValueSizeSummary",
         "UserInputAcceptedData",
         "UserInputScope",
-        "fetch_more_tool_result",
-        "get_run_result",
-        "get_tool_fetch_more_handle",
-        "start_run",
-        "stream_run_events",
     }
 )
 
@@ -67,9 +59,14 @@ FORBIDDEN_EXPORTS: frozenset[str] = frozenset(
         "EngineWorker",
         "LocalProxy",
         "ToolExecutor",
-        "InMemoryToolRuntime",
+        "HostToolRuntime",
         "ToolRuntimeToolExecutor",
         "run_agent_messages",
+        "fetch_more_tool_result",
+        "get_run_result",
+        "get_tool_fetch_more_handle",
+        "start_run",
+        "stream_run_events",
     }
 )
 
@@ -92,16 +89,3 @@ def test_internal_symbols_not_exported_or_attribute_accessible() -> None:
     )
     for name in FORBIDDEN_EXPORTS:
         assert not hasattr(host, name), f"{name} unexpectedly accessible"
-
-
-def test_public_start_run_is_async_entrypoint() -> None:
-    """public start_run 必须保持 async 入口语义。"""
-
-    assert inspect.iscoroutinefunction(host.start_run)
-
-
-def test_public_run_read_apis_have_expected_async_shape() -> None:
-    """Run 级读取入口保持当前 public API 形态。"""
-
-    assert not inspect.iscoroutinefunction(host.stream_run_events)
-    assert inspect.iscoroutinefunction(host.get_run_result)

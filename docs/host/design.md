@@ -81,6 +81,32 @@ lane 的最小正确性语义后续应在 `dayu.runtime` 设计中固定：
 - 公平性策略必须显式说明，例如 FIFO 或明确非 FIFO。
 - 多进程实现不得退化为进程内 `asyncio.Semaphore`。
 
+### 3.5 Fencing Token 语义
+
+多进程 owner / lease 设计必须区分两类 token：
+
+- `owner_token`：随机 secret，只用于证明调用方确实持有当前 owner capability；它不能作为 fencing
+  token 使用。
+- `fencing_token`：durable 全局单调递增 token，用于让共享资源拒绝旧 owner 的迟到请求。
+
+P8 起 Host 必须提供全局单调 fencing token 分配能力。每次获得某个共享资源的 owner lease 时，
+Host 都必须在 durable storage 中分配新的 `fencing_token`；后续写入、取消、resume、ack、delivery
+或 checkpoint advance 等操作必须携带该 token，并由资源侧比较 / 校验 token 是否仍是当前 token。
+
+该原则覆盖后续所有多进程共享资源：
+
+- attempt owner。
+- run lifecycle owner。
+- session active run admission。
+- wait record owner。
+- outbox delivery owner。
+- remote worker / remote attempt owner。
+- observer claim owner。
+
+实现不要求所有资源共用同一 row，但要求 token 值来自同一个 Host durable monotonic allocator，
+或具备等价的跨进程全局单调语义。禁止把随机 `owner_token`、scope token、cursor token 或
+进程内对象 id 当作 fencing token。
+
 ## 4. 候选架构
 
 当前 Host 候选分解：
@@ -500,7 +526,9 @@ CREATED / QUEUED / RUNNING / WAITING / RECOVERING / CANCELLING -> LOST
 取消治理增强跟踪在 GitHub issue #3，当前不进入 Host 主迁移第一阶段实现。Host 设计只预留必要空间：
 
 - `Run` 状态机包含 `CANCELLING` 与 `LOST`，支持取消请求、协作收口失败和结果不可判定的结构化表达。
-- `Attempt` 状态机包含 `CANCELLING`、`STALE` 与 `LOST`，支持后续 watchdog、超时升级和 owner 失活调和。
+- P8 后 `Attempt` 状态机不再单独建模 `CANCELLING` 中间态；取消意图先由 Run / WorkerProxy
+  控制通道表达，attempt 最终收敛到 `CANCELLED`、`FAILED`、`STALE` 或 `LOST`。后续 issue #3
+  若需要 attempt 级取消中间态，必须重新更新本节状态机。
 - `RunEvent` / EventLog 必须能记录取消请求、取消已下发、取消已收口、取消升级和 lost 等事实。
 - Engine 不主动轮询 Host；取消信号仍由 Host / WorkerProxy 映射到执行环境内 cancellation token。
 
@@ -550,42 +578,129 @@ Attempt 不作为普通调用方 public interface。
 
 ### 8.1 Attempt 状态机
 
-候选状态：
+P8 后 `Attempt` 状态机固定为：
 
 ```text
 CREATED
-LEASED
-STARTING
 RUNNING
-SUSPENDED
-CANCELLING
 SUCCEEDED
 FAILED
 CANCELLED
+SUSPENDED
 STALE
 LOST
 ```
 
-合法主路径：
+合法迁移：
 
 ```text
-CREATED -> LEASED -> STARTING -> RUNNING -> SUCCEEDED
-CREATED -> LEASED -> STARTING -> RUNNING -> FAILED
-CREATED -> LEASED -> STARTING -> RUNNING -> SUSPENDED
-CREATED -> LEASED -> STARTING -> RUNNING -> CANCELLING -> CANCELLED
-CREATED / LEASED / STARTING / RUNNING / SUSPENDED / CANCELLING -> STALE
-CREATED / LEASED / STARTING / RUNNING / SUSPENDED / CANCELLING -> LOST
+CREATED -> RUNNING
+RUNNING -> SUCCEEDED
+RUNNING -> FAILED
+RUNNING -> CANCELLED
+RUNNING -> SUSPENDED
+RUNNING -> STALE
+RUNNING -> LOST
+STALE -> LOST
 ```
 
-实现阶段必须细化：
+状态语义：
 
-- lease / fencing token。
-- 旧 owner 迟到写入的拒绝规则。
-- attempt event 与 run event 的映射。
-- stale attempt 是否必然触发 Run `RECOVERING`。
+- `CREATED`：attempt 记录已创建，但尚未持有有效 owner。P8 主路径应在同一事务中创建并 acquire 到
+  `RUNNING`；该状态主要服务诊断和测试。
+- `RUNNING`：当前 attempt 有有效 owner lease；只有匹配 owner token hash、全局单调
+  `fencing_token` 且 lease 未过期的 owner 可以写 attempt-scoped facts。
+- `SUCCEEDED` / `FAILED` / `CANCELLED` / `SUSPENDED`：正常 terminal attempt，必须同事务关联
+  terminal EventLog position。
+- `STALE`：旧 owner lease 过期, 结果未知, 当前 attempt 已关闭执行权; P8 D2 后 recovery
+  scan 一律把过期 lease 收口为 `LOST`(诊断终态), `STALE` 仅作为运维 / smoke 显式诊断 API
+  保留, 不在生产 recovery 主路径出现。
+- `LOST`：结果无法确认; Recovery 主路径默认终态; 不允许再写 attempt-scoped facts。
 
 `SUSPENDED` 是 issue #4 的预留状态：表示 Engine / ToolExecutor 协作产生等待事实后，
 当前 attempt 已停止继续执行，Run 进入 `WAITING`，后续由 Host wait record 完成、取消、超时或丢失治理。
+
+### 8.2 P8 Attempt Supervision 边界
+
+P8 新增 `AttemptSupervisor` 作为 Host 内部 owner 真源。它不是 public interface，也不改变 Engine
+协议；Engine 仍只看到普通 `RunInput`、`ToolExecutor` 和 `EngineEvent`。
+
+P8 后 Attempt 执行边界是：
+
+```text
+LocalRunHarness
+  -> AttemptSupervisor.lease_context(...)
+      -> AttemptLeaseStore acquire / renew / verify / close
+      -> AttemptOwnerContext 只在 Host internal 流动
+      -> global monotonic fencing_token identifies current owner epoch
+  -> WorkerProxy / EngineWorker.stream_engine_events(...)
+  -> EngineEvent / Host-owned facts
+  -> AttemptScopedRunEventAppender
+      -> verify current owner in the same HostStorage transaction
+      -> append durable RunEvent
+      -> allocate per-run cursor and global event position
+  -> terminal path
+      -> append terminal RunEvent
+      -> close attempt
+      -> write terminal_event_position
+      -> update Run terminal state / result snapshot
+      -> commit as one durable unit
+  -> ProjectionCoordinator drains EventLog
+```
+
+边界规则：
+
+- `AttemptSupervisor` 管理 owner token、owner id、lease expiry、renew heartbeat、fencing、
+  terminal close 和 stale / orphan recovery；`LocalRunHarness` 只做薄编排，不承载 lease SQL、
+  recovery scan、token 校验或 fencing error 策略。
+- owner token 明文只能存在于 Host internal `AttemptOwnerContext`；持久化只保存 token hash，
+  普通日志、RunEvent payload、ToolExecutionContext、public stream 和 README 示例都不能泄露明文 token。
+  fencing token 是全局单调整数，可用于 owner 新旧比较，但仍不应作为普通调用方 public API 暴露。
+- P8 D2 后 recovery 仅做诊断收口, 不 takeover、不在 recovery 路径创建新 attempt。旧 attempt
+  通过 CAS 标记为 `LOST` (lease 过期 / `CREATED` 孤儿 / run terminal); 重试 / resume 必须由
+  Service 层显式发起新的 `StartRunRequest` (新 attempt_index), 不由 recovery 隐式创建。
+- 旧 owner、过期 owner、非 owner 或旧 fencing token 的迟到写入必须返回 typed fencing refusal，并且不得写入
+  diagnostic RunEvent；非 owner 不应通过“我被拒绝了”这类 meta-fact 污染 canonical EventLog。
+- 所有 attempt-scoped append 都必须走 owner fencing，包括 Engine-sourced events、context compact
+  facts、`RUN_INPUT_CONTEXT_SNAPSHOT_BUILT` 和 ToolRuntime 产生的 truncate / cursor / fetch_more facts。
+- ToolRuntime 不获得 owner token，也不把 owner token 放入 `ToolExecutionContext`。Host 通过内部
+  `AttemptScopedRunEventAppender` / owner scope 为当前 attempt 注入可写 append port。
+- 正常 terminal attempt 必须在同一 `BEGIN IMMEDIATE` 或等价 durable unit 中完成 terminal event
+  append、owner verify、attempt close、`terminal_event_position` 写入、Run terminal state / result
+  snapshot 更新；禁止 append 后另起事务补 position，也禁止用 `MAX(event_position)` 猜 position。
+- Attempt ownership 与 observer ownership 是两个状态机。P8 可以把 `ObserverSink.process` 升级为
+  async 调用协议，但不因此引入 observer claim / lease；observer 仍从 durable EventLog 消费，
+  不读取 attempt owner side channel。
+
+### 8.3 Recovery 与 Run 的关系
+
+`Run` 是调用方看到的执行单位；`Attempt` 是 Host 内部执行尝试。recovery 创建新的 internal
+attempt，不创建新的用户输入事实，也不改变对外 `run_id`。
+
+规则：
+
+- 同一个 Run 下可以有多个 attempt；`attempt_index` 必须反映真实执行尝试次数。
+- 旧 attempt 进入 `LOST` (P8 D2 主路径) 或诊断态 `STALE` 后不再可执行; Service 层显式发起的
+  新 attempt 使用新的 `attempt_id` / `attempt_index`, 通过新一轮 owner / fencing token 启动,
+  不依赖 recovery 隐式创建。`recovered_from_attempt_id` 字段保留作为审计回填字段, 用于 P8 之前
+  的旧库或将来 Service 层显式重试时回写来源 attempt id, 不在 recovery scan 内自动写入。
+- 旧 attempt 没有 terminal RunEvent 时，`terminal_event_position` 可以为空；最终 Run 的
+  `terminal_event_cursor` / terminal result 必须来自真正写入 terminal RunEvent 的正常 terminal attempt。
+- recovery scan 不推进 projection checkpoint，不消费 observer side channel；projection 仍基于
+  durable EventLog 的 global position at-least-once 追平。
+
+### 8.4 P8 明确未做的事
+
+P8 落地了 attempt lease / fencing / recovery 的内部机制，但以下事项明确不在 P8 范围内：
+
+- recovery scan 未自动 wire 进 `build_durable_harness` 或 Session 生产启动链路；当前仅为
+  `AttemptSupervisor.recover_stale_attempts` 内部显式入口，调用方需自行决定扫描时机。
+- 未引入 multiprocessing launcher / process supervisor 生产代码；P8-S7 多进程 stress 测试
+  使用 spawn-only 平台 helper，不提供生产级进程管理。
+- 未实现 `QUEUED / WAITING / CANCELLING` 主路径治理；这些状态仍为预留。
+- 未实现 public lifecycle governance（如 run admission、session active run 仲裁）。
+- 未改变 Engine 协议；Engine 仍只看到普通 `RunInput`、`ToolExecutor` 和 `EngineEvent`。
+- 未引入 observer claim / lease；attempt ownership 与 observer ownership 是两个独立状态机。
 
 ## 9. EventLog 与 RunEvent
 
@@ -739,7 +854,7 @@ Projection / observer 的最小机制：
 - 每个 observer 有稳定 `observer_id`、消费 cursor / checkpoint 和 schema version。
 - observer 写入必须幂等；重复消费同一事件不能产生重复 trace、重复 audit 或重复投递。
 - projection 采用 at-least-once 语义，失败可重试，失败状态可观测。
-- 多进程下 observer claim / lease 必须带 owner token / fencing，避免多个进程同时写同一 sink。
+- 多进程下 observer claim / lease 必须同时具备 owner secret 与全局单调 fencing token，避免多个进程同时写同一 sink。
 - observer 可以按 visibility / audience 订阅不同事件层，例如 client、internal、audit、trace。
 - projection lag、失败次数、最后成功 cursor 应可查询，便于恢复与运维。
 
@@ -833,6 +948,11 @@ P7 落地后的硬事实：
 - provider secret scrub 仅作用于 `PROVIDER_PROTOCOL_ERROR.raw_payload`（`Authorization` /
   `api_key` / `cookie` / `x-api-key` / `openai-organization` / `anthropic-api-key` 等键替换为 `***`）；
   `scope_token` / `cursor` / prompt / tool result 仍按 OLD 热 / 冷分层保留进 trace，用于真实故障定位。
+
+P8-S2 把 `ObserverSink.process` 从同步升级为 async 调用协议：`ProjectionCoordinator.drain()`
+在同一 HostStorage 事务内 `await observer.process(tx, events)`，sink 写入与 checkpoint 推进
+同生同灭。这不引入 observer claim / lease；observer 仍从 durable EventLog 消费，不读取 attempt
+owner side channel。attempt ownership 与 observer ownership 是两个独立状态机。
 
 ### 9.5 Wait / Suspend 预留契约
 
@@ -928,7 +1048,7 @@ EngineWorker 第一版语义接口：
 class WorkerCancelRequest:
     run_id: str
     attempt_id: str
-    fencing_token: str
+    fencing_token: int
 
 class EngineWorker(Protocol):
     def run_agent_messages(
@@ -976,7 +1096,7 @@ P2 后工具执行边界：
 Engine
   -> ToolExecutor.execute(request)
   -> Host-owned ToolRuntimeToolExecutor
-  -> InMemoryToolRuntime.execute_tool_call(request)
+  -> HostToolRuntime.execute_tool_call(request)
       -> underlying business ToolExecutor
       -> schema-driven truncate / cursor store
       -> RunEventStore.append(canonical tool runtime facts)
@@ -989,7 +1109,7 @@ P2 后补读边界：
 UI / Service / test harness
   -> get_tool_fetch_more_handle(session / run / original tool_call / cursor fingerprint)
   -> fetch_more_tool_result(handle cursor + scope token + optional limit)
-  -> InMemoryToolRuntime.fetch_more(request)
+  -> HostToolRuntime.fetch_more(request)
   -> RunEventStore.append(canonical fetch_more facts)
   -> ToolFetchMoreResult
 ```
@@ -1026,7 +1146,7 @@ P5 后目标的 LLM-facing truncate / fetch_more 执行路径是：
 Model -> tool_call huge_echo(...)
   -> Engine treats it as ordinary LLM tool call
   -> ToolExecutor.execute
-  -> ToolRuntimeToolExecutor -> InMemoryToolRuntime
+  -> ToolRuntimeToolExecutor -> HostToolRuntime
   -> huge_echo returns a large result
   -> ToolRuntime applies ToolTruncateSpec
       -> supports text_chars / text_lines / list_items / binary_bytes
@@ -1086,7 +1206,8 @@ evidence、timeline、tool cursor 或 compaction。
 - `LocalRunHarness.start_run` 会先 append `USER_INPUT_ACCEPTED`，append 失败时不启动 Engine。
 - Engine 实际消费的 `RunInput` 由 Host 内部 `DefaultRunInputBuilder` 从当前用户输入事件与
   `ConversationMemorySnapshot` 构造，不从 `StartRunRequest.input` 旁路回放用户输入。
-- Host 内部 `InMemoryConversationMemoryStore` 只从已 append canonical RunEvent 投影 session memory；
+- Host 内部 memory store（P3 为 `InMemoryConversationMemoryStore`，P8-S8 起替换为
+  `DurableConversationMemoryStore`）只从已 append canonical RunEvent 投影 session memory；
   preview / reasoning / delta / content completed 不进入 memory pool。
 - Engine terminal 或 Host-owned worker / proxy failure terminal 后，当前 run 的 canonical events 才会投影
   到 memory；失败轮次的用户输入事实和中性 terminal summary 都会进入下一轮 memory。
@@ -1150,8 +1271,11 @@ P3 后执行边界：
   tool trace 可持久重建 `iteration_context_snapshot`。该 fact 只服务 trace / audit / replay 诊断，
   不进入 ConversationMemory projection，不参与下一轮 RunInputBuilder 输入，也不影响 Engine 看到的
   `RunInput.messages`。
-- 当前 `InMemoryConversationMemoryStore` 是单进程、顺序多轮 smoke/test adapter；真实持久 projection、
-  observer checkpoint、多进程恢复与 cross-scope governance 留给后续 phase。
+- P8-S8 起 `build_durable_harness` 默认装配 `DurableConversationMemoryStore`，memory snapshot
+  与 EventLog checkpoint 同事务原子推进；生产代码不再保留 `InMemoryConversationMemoryStore`。
+  tests-only `FakeInMemoryConversationMemoryStore`（位于 `tests/host/_memory_store_fake.py`）
+  仅供测试 / smoke 使用。`startup_reconcile` 在 checkpoint 已 CAUGHT_UP 但 snapshot row
+  因运维误操作丢失时，走 `repair_missing_session_snapshots` 从 EventLog 重建。
 
 P4 当前执行边界 / 设计约束：
 
@@ -1196,7 +1320,7 @@ LocalRunHarness.start_run(turn 1)
   -> LocalProxy -> EngineWorker -> Engine Agent tool loop
   -> model tool_call huge_echo
   -> ToolExecutor.execute
-  -> ToolRuntimeToolExecutor -> InMemoryToolRuntime -> huge_echo executor
+  -> ToolRuntimeToolExecutor -> HostToolRuntime -> huge_echo executor
   -> ToolRuntime append truncate / cursor facts
   -> Engine injects truncated tool result with next_action=fetch_more hint
   -> model tool_call fetch_more
@@ -1700,7 +1824,8 @@ Conversation Memory / RunInputBuilder 的实现必须满足以下不变量：
 - Host 不 import `dayu.fins`，不理解财报业务规则。
 - Engine 不 import Host memory，不理解 claim、anchor、scope 或 compaction。
 - build trace 不进入模型上下文，不成为下一轮事实真源。
-- in-memory store 只服务最小单进程 smoke，不宣称持久化、多进程或生产正确性。
+- P8-S8 起 production path 使用 `DurableConversationMemoryStore`；tests-only
+  `FakeInMemoryConversationMemoryStore` 只服务最小单进程 smoke，不宣称持久化、多进程或生产正确性。
 
 ## 13. Reply Outbox
 
@@ -1774,7 +1899,8 @@ upsert ReplyOutbox by delivery_key
 以下内容不阻塞当前 Host 核心架构，但进入实现前需要单独设计：
 
 - Steer：active Run 上的追加输入，可后加。
-- Attempt lease / fencing 细节。
+- Attempt lease / fencing 细节（P8-S1 至 P8-S6 已落地 attempt-scoped lease、fencing、terminal atomic
+  close、recovery scan 与 attempt-scoped append；recovery scan 自动装配到生产启动链路仍未落地）。
 - 取消治理增强：watchdog、取消超时升级、强制终止和资源可观测收口，后移 GitHub issue #3。
 - RemoteProxy / RemoteStub wire protocol。
 - ToolRuntime 完整治理面。

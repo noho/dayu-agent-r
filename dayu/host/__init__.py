@@ -1,18 +1,15 @@
 """Host 公共入口。
 
-P1.5 暴露最小 Run 级入口与事件事实读取接口。Host 内部的 ``EngineWorker``、
-``LocalProxy``、``WorkerProxy`` 与 ``ToolExecutor`` 代持不属于 public surface。
+P8 阶段包根只导出 ``dayu.host.contracts`` 中的强类型契约，避免把当前
+仍在迁移中的 harness / runtime 装配细节提前固定为 public API。
+
+durable harness 装配入口仍位于 ``dayu.host._durable_harness``；
+``LocalRunHarness`` 与 ``HostToolRuntime`` 仍是 Host 内部实现 / 子模块测试入口，
+不属于 ``dayu.host`` 包根导出面。P9/P16 前不得通过包根新增兼容 re-export。
 """
 
 from __future__ import annotations
 
-from dayu.host._run_harness import (
-    fetch_more_tool_result,
-    get_run_result,
-    get_tool_fetch_more_handle,
-    start_run,
-    stream_run_events,
-)
 from dayu.host.contracts import (
     ContextCompactFailureReason,
     HostContextAttemptRetryData,
@@ -32,6 +29,10 @@ from dayu.host.contracts import (
     RunFailedResult,
     RunHandle,
     RunInput,
+    RunInputContextMeta,
+    RunInputContextSnapshotBuiltData,
+    RunInputMessageSummary,
+    RunInputToolSchemaSummary,
     RunOptions,
     RunResult,
     RunState,
@@ -45,11 +46,6 @@ from dayu.host.contracts import (
     ToolFetchMoreCompletedData,
     ToolFetchMoreFailedData,
     ToolFetchMoreFailedResult,
-    ToolFetchMoreHandle,
-    ToolFetchMoreHandleFailedResult,
-    ToolFetchMoreHandleRequest,
-    ToolFetchMoreHandleResult,
-    ToolFetchMoreHandleSucceededResult,
     ToolFetchMoreRequest,
     ToolFetchMoreRequestedData,
     ToolFetchMoreResult,
@@ -81,6 +77,10 @@ __all__ = [
     "RunFailedResult",
     "RunHandle",
     "RunInput",
+    "RunInputContextMeta",
+    "RunInputContextSnapshotBuiltData",
+    "RunInputMessageSummary",
+    "RunInputToolSchemaSummary",
     "RunOptions",
     "RunResult",
     "RunState",
@@ -94,11 +94,6 @@ __all__ = [
     "ToolFetchMoreCompletedData",
     "ToolFetchMoreFailedData",
     "ToolFetchMoreFailedResult",
-    "ToolFetchMoreHandle",
-    "ToolFetchMoreHandleFailedResult",
-    "ToolFetchMoreHandleRequest",
-    "ToolFetchMoreHandleResult",
-    "ToolFetchMoreHandleSucceededResult",
     "ToolFetchMoreRequest",
     "ToolFetchMoreRequestedData",
     "ToolFetchMoreResult",
@@ -109,9 +104,4 @@ __all__ = [
     "ToolValueSizeSummary",
     "UserInputAcceptedData",
     "UserInputScope",
-    "fetch_more_tool_result",
-    "get_run_result",
-    "get_tool_fetch_more_handle",
-    "start_run",
-    "stream_run_events",
 ]
