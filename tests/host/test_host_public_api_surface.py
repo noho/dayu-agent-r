@@ -1,10 +1,12 @@
-"""Host P8-S2 公开 API surface 反向断言测试。
+"""Host P8 公开 API surface 正向 / 反向断言测试。
 
-S2 删除了 ``dayu.host`` 模块级 ``start_run`` / ``stream_run_events`` /
+P8 阶段 ``dayu.host`` 包根只导出 contracts 强类型契约，不把 durable
+harness / runtime 内部装配入口提前固定为 public API。S2 删除了
+``dayu.host`` 模块级 ``start_run`` / ``stream_run_events`` /
 ``get_run_result`` / ``get_tool_fetch_more_handle`` /
 ``fetch_more_tool_result`` 五个 helper, 以及对应的
 :class:`LocalRunHarness` / :class:`HostToolRuntime` 公开方法。本测试
-作为 surface 收紧的反向断言, 防止后续无意中再次暴露这些入口。
+同时锁定当前应导出的 contracts 符号与不应泄漏的 legacy / internal 符号。
 """
 
 from __future__ import annotations
@@ -14,22 +16,90 @@ from dayu.host._run_harness import LocalRunHarness
 from dayu.host._tool_runtime import HostToolRuntime
 
 
-def test_host_module_does_not_export_legacy_helpers() -> None:
-    """``dayu.host`` 包根不再导出 5 个 legacy helper。"""
+_EXPECTED_HOST_CONTRACT_EXPORTS: frozenset[str] = frozenset(
+    {
+        "ContextCompactFailureReason",
+        "HostContextAttemptRetryData",
+        "HostContextCompactCompletedData",
+        "HostContextCompactEventData",
+        "HostContextCompactFailedData",
+        "HostContextCompactRequestedData",
+        "HostContextOverflowObservedData",
+        "HostRunFailedData",
+        "RunCancelledResult",
+        "RunEvent",
+        "RunEventCursor",
+        "RunEventData",
+        "RunEventKind",
+        "RunEventSource",
+        "RunEventType",
+        "RunFailedResult",
+        "RunHandle",
+        "RunInput",
+        "RunInputContextMeta",
+        "RunInputContextSnapshotBuiltData",
+        "RunInputMessageSummary",
+        "RunInputToolSchemaSummary",
+        "RunOptions",
+        "RunResult",
+        "RunState",
+        "RunStream",
+        "RunSucceededResult",
+        "RunSuspendedResult",
+        "StartRunRequest",
+        "ToolCursorDeniedData",
+        "ToolCursorExpiredData",
+        "ToolCursorIssuedData",
+        "ToolFetchMoreCompletedData",
+        "ToolFetchMoreFailedData",
+        "ToolFetchMoreFailedResult",
+        "ToolFetchMoreRequest",
+        "ToolFetchMoreRequestedData",
+        "ToolFetchMoreResult",
+        "ToolFetchMoreSucceededResult",
+        "ToolResultTruncatedData",
+        "ToolRuntimeCursor",
+        "ToolRuntimeEventData",
+        "ToolValueSizeSummary",
+        "UserInputAcceptedData",
+        "UserInputScope",
+    }
+)
+"""当前 ``dayu.host`` 包根允许导出的 contracts 符号集合。"""
 
-    forbidden: frozenset[str] = frozenset(
-        {
-            "start_run",
-            "stream_run_events",
-            "get_run_result",
-            "get_tool_fetch_more_handle",
-            "fetch_more_tool_result",
-        }
-    )
+
+_FORBIDDEN_HOST_ROOT_EXPORTS: frozenset[str] = frozenset(
+    {
+        "start_run",
+        "stream_run_events",
+        "get_run_result",
+        "get_tool_fetch_more_handle",
+        "fetch_more_tool_result",
+        "LocalRunHarness",
+        "build_durable_harness",
+        "HostToolRuntime",
+    }
+)
+"""当前 ``dayu.host`` 包根禁止导出的 legacy / internal 符号集合。"""
+
+
+def test_host_module_exports_exact_contract_surface() -> None:
+    """``dayu.host.__all__`` 精确等于当前 contracts 导出集合。"""
+
     actual = frozenset(host.__all__)
-    leaked = actual & forbidden
+    assert actual == _EXPECTED_HOST_CONTRACT_EXPORTS
+    assert len(host.__all__) == len(_EXPECTED_HOST_CONTRACT_EXPORTS)
+    for name in _EXPECTED_HOST_CONTRACT_EXPORTS:
+        assert hasattr(host, name), f"{name} missing from dayu.host"
+
+
+def test_host_module_does_not_export_legacy_helpers() -> None:
+    """``dayu.host`` 包根不再导出 legacy helper 与 internal 装配入口。"""
+
+    actual = frozenset(host.__all__)
+    leaked = actual & _FORBIDDEN_HOST_ROOT_EXPORTS
     assert leaked == frozenset(), f"forbidden symbols leaked: {leaked}"
-    for name in forbidden:
+    for name in _FORBIDDEN_HOST_ROOT_EXPORTS:
         assert not hasattr(host, name), f"{name} unexpectedly accessible"
 
 

@@ -658,14 +658,16 @@ class AttemptLeaseStore:
             用方应传 ``None``, 终态原子写入归 P8-S4。
         :returns: CAS 命中并写入返回 ``True``; rowcount==0 时返回
             ``False`` (owner 已被替换 / 行已不在 RUNNING 状态)。
+        :raises ValueError: ``state`` 不是诊断态 / 终态时抛出。
         :raises sqlite3.DatabaseError: 写入失败时抛出。
         """
 
-        finished_at_iso = (
-            self.clock.now().isoformat()
-            if state in _ATTEMPT_FINISHED_STATES
-            else None
-        )
+        if state not in _ATTEMPT_FINISHED_STATES:
+            raise ValueError(
+                "update_state_owner_aware requires finished AttemptState, "
+                f"got {state}"
+            )
+        finished_at_iso = self.clock.now().isoformat()
         position_value = (
             None if terminal_event_position is None
             else terminal_event_position.value

@@ -26,8 +26,10 @@
 from __future__ import annotations
 
 import asyncio
+import gc
 import logging
 import sqlite3
+import warnings
 from contextlib import asynccontextmanager
 from collections.abc import AsyncGenerator, AsyncIterator
 from dataclasses import dataclass, field
@@ -1971,12 +1973,19 @@ async def test_lease_context_cleans_session_on_create_task_failure() -> None:
 
         asyncio.create_task = _failing_create_task  # type: ignore[assignment]
         try:
-            with pytest.raises(RuntimeError, match="event loop closed"):
-                async with supervisor.lease_context(
-                    run_id="r1", attempt_index=0
-                ):
-                    pass  # pragma: no cover
+            with warnings.catch_warnings(record=True) as captured_warnings:
+                warnings.simplefilter("always", RuntimeWarning)
+                with pytest.raises(RuntimeError, match="event loop closed"):
+                    async with supervisor.lease_context(
+                        run_id="r1", attempt_index=0
+                    ):
+                        pass  # pragma: no cover
+                gc.collect()
             assert supervisor._sessions == {}
+            assert not any(
+                "was never awaited" in str(warning.message)
+                for warning in captured_warnings
+            )
         finally:
             asyncio.create_task = original_create_task  # type: ignore[assignment]
     finally:

@@ -1,11 +1,11 @@
 """Host 公共入口。
 
-P8-S2 起公开接口仅暴露 contracts 与 :class:`LocalRunHarness`/
-:func:`build_durable_harness`（后者由 ``dayu.host._durable_harness``
-直接导出）；上层应通过 ``build_durable_harness().harness`` 装配 production /
-durable harness，再使用其实例方法（``start_run`` / ``stream_run_events`` /
-``get_run_result``）。``LocalRunHarness`` 自身仍是 Host 内部 kernel，但作为
-test-only 装配入口被显式暴露。
+P8 阶段包根只导出 ``dayu.host.contracts`` 中的强类型契约，避免把当前
+仍在迁移中的 harness / runtime 装配细节提前固定为 public API。
+
+durable harness 装配入口仍位于 ``dayu.host._durable_harness``；
+``LocalRunHarness`` 与 ``HostToolRuntime`` 仍是 Host 内部实现 / 子模块测试入口，
+不属于 ``dayu.host`` 包根导出面。P9/P16 前不得通过包根新增兼容 re-export。
 """
 
 from __future__ import annotations

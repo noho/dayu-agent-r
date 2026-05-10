@@ -34,6 +34,7 @@ from dayu.host._internal_contracts import (
     AttemptState,
     ExtendedRunState,
     FencingToken,
+    GlobalEventPosition,
 )
 from dayu.host._run_state_store import (
     AttemptLeaseStore,
@@ -275,6 +276,155 @@ async def test_renew_extends_lease_without_changing_fencing_token() -> None:
     assert record.lease_expires_at == new_expires
     assert record.lease_renewed_at == clock.now()
     assert record.fencing_token == original_token
+    storage.close()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "invalid_state",
+    (AttemptState.CREATED, AttemptState.RUNNING),
+)
+async def test_update_state_owner_aware_rejects_non_finished_states(
+    invalid_state: AttemptState,
+) -> None:
+    """owner-aware 状态推进拒绝非诊断态 / 终态，且不改写数据库。
+
+    :param invalid_state: 待验证的非法 target state。
+    :returns: 无返回值。
+    :raises AssertionError: 非法状态未抛错或数据库状态被改写时由 pytest 抛出。
+    """
+
+    storage = _open_storage()
+    await _seed_run(storage)
+    clock = _FakeClock()
+    lease_store = AttemptLeaseStore(storage=storage, clock=clock)
+    state_store = AttemptStateStore(storage=storage, clock=clock)
+
+    async with storage.transaction() as tx:
+        acquired = lease_store.acquire_new_attempt(
+            tx=tx,
+            attempt_id="a1",
+            run_id="r1",
+            attempt_index=0,
+            recovered_from_attempt_id=None,
+            owner_id="host:1",
+            owner_token=AttemptOwnerToken.new(),
+            lease_expires_at=_expires_at(clock),
+        )
+    assert acquired.owner_context is not None
+    before = state_store.get("a1")
+    assert before is not None
+    assert before.state is AttemptState.RUNNING
+
+    async with storage.transaction() as tx:
+        with pytest.raises(ValueError, match="finished AttemptState"):
+            lease_store.update_state_owner_aware(
+                tx=tx,
+                owner_context=acquired.owner_context,
+                state=invalid_state,
+                failure_summary="invalid-regression",
+                terminal_event_position=None,
+            )
+
+    after = state_store.get("a1")
+    assert after is not None
+    assert after.state is before.state
+    assert after.finished_at == before.finished_at
+    assert after.terminal_event_position == before.terminal_event_position
+    assert after.failure_summary == before.failure_summary
+    storage.close()
+
+
+@pytest.mark.asyncio
+async def test_update_state_owner_aware_allows_diagnostic_state() -> None:
+    """owner-aware 状态推进仍允许 STALE 诊断态。
+
+    :returns: 无返回值。
+    :raises AssertionError: 合法诊断态未写入或字段不符合预期时由 pytest 抛出。
+    """
+
+    storage = _open_storage()
+    await _seed_run(storage)
+    clock = _FakeClock()
+    lease_store = AttemptLeaseStore(storage=storage, clock=clock)
+    state_store = AttemptStateStore(storage=storage, clock=clock)
+
+    async with storage.transaction() as tx:
+        acquired = lease_store.acquire_new_attempt(
+            tx=tx,
+            attempt_id="a1",
+            run_id="r1",
+            attempt_index=0,
+            recovered_from_attempt_id=None,
+            owner_id="host:1",
+            owner_token=AttemptOwnerToken.new(),
+            lease_expires_at=_expires_at(clock),
+        )
+    assert acquired.owner_context is not None
+
+    async with storage.transaction() as tx:
+        updated = lease_store.update_state_owner_aware(
+            tx=tx,
+            owner_context=acquired.owner_context,
+            state=AttemptState.STALE,
+            failure_summary="lease_lost",
+            terminal_event_position=None,
+        )
+
+    record = state_store.get("a1")
+    assert updated is True
+    assert record is not None
+    assert record.state is AttemptState.STALE
+    assert record.finished_at == clock.now()
+    assert record.terminal_event_position is None
+    assert record.failure_summary == "lease_lost"
+    storage.close()
+
+
+@pytest.mark.asyncio
+async def test_update_state_owner_aware_allows_terminal_state() -> None:
+    """owner-aware 状态推进仍允许合法 terminal state。
+
+    :returns: 无返回值。
+    :raises AssertionError: 合法终态未写入或字段不符合预期时由 pytest 抛出。
+    """
+
+    storage = _open_storage()
+    await _seed_run(storage)
+    clock = _FakeClock()
+    lease_store = AttemptLeaseStore(storage=storage, clock=clock)
+    state_store = AttemptStateStore(storage=storage, clock=clock)
+    position = GlobalEventPosition(value=7)
+
+    async with storage.transaction() as tx:
+        acquired = lease_store.acquire_new_attempt(
+            tx=tx,
+            attempt_id="a1",
+            run_id="r1",
+            attempt_index=0,
+            recovered_from_attempt_id=None,
+            owner_id="host:1",
+            owner_token=AttemptOwnerToken.new(),
+            lease_expires_at=_expires_at(clock),
+        )
+    assert acquired.owner_context is not None
+
+    async with storage.transaction() as tx:
+        updated = lease_store.update_state_owner_aware(
+            tx=tx,
+            owner_context=acquired.owner_context,
+            state=AttemptState.SUCCEEDED,
+            failure_summary=None,
+            terminal_event_position=position,
+        )
+
+    record = state_store.get("a1")
+    assert updated is True
+    assert record is not None
+    assert record.state is AttemptState.SUCCEEDED
+    assert record.finished_at == clock.now()
+    assert record.terminal_event_position == position
+    assert record.failure_summary is None
     storage.close()
 
 

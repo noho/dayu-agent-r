@@ -258,8 +258,8 @@ Host 当前 Run harness、RunEventStore、ToolRuntime、Conversation Memory / Ru
   7 个场景（owner acquire+renew、busy、recovery scan、late write fenced、terminal close、
   observer reconcile、durable memory recovery）通过 fake clock + deterministic fake worker
   覆盖。慢硬盘 + Docker Linux stress 测试由 GitHub issue #38 跟踪，不在当前测试集内。
-- public boundary：锁定 `dayu.host.__all__`，包根仅暴露当前 fetch_more 协议契约
-  (`ToolRuntimeCursor` / `ToolFetchMoreRequest` / `ToolFetchMoreResult` 等)；Run 级 `start_run` / `stream_run_events` /
+- public boundary：锁定 `dayu.host.__all__`，包根仅暴露当前 contracts 强类型契约
+  (`RunEvent` / `StartRunRequest` / `ToolRuntimeCursor` / `ToolFetchMoreRequest` 等)；Run 级 `start_run` / `stream_run_events` /
   `get_run_result` 与 framework `fetch_more` 路径必须经 `LocalRunHarness` 实例 / 普通 tool call
   访问，阻止 `EngineWorker`、`LocalProxy`、
   `ToolExecutor`、`HostToolRuntime`、`ToolRuntimeToolExecutor`、`DurableConversationMemoryStore`、

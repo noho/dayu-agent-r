@@ -239,9 +239,11 @@ P8 已落地：
 - Host context compact 事实类型：`HostContextOverflowObservedData`、`HostContextCompactRequestedData`、
   `HostContextCompactCompletedData`、`HostContextCompactFailedData`、`HostContextAttemptRetryData`、
   `HostContextCompactEventData`、`ContextCompactFailureReason`。
-- 最小入口：经 `LocalRunHarness` / `build_durable_harness()` 装配后调用实例方法
-  `start_run` / `stream_run_events` / `get_run_result`；framework `fetch_more` 通过普通 tool call
-  路径走 `ToolRuntimeToolExecutor -> HostToolRuntime.execute_tool_call`，不再有独立 public helper。
+
+`LocalRunHarness` / `build_durable_harness()` 仍位于 Host internal/submodule 路径；当前使用方经这些
+装配入口取得 harness 后调用实例方法 `start_run` / `stream_run_events` / `get_run_result`。
+framework `fetch_more` 通过普通 tool call 路径走
+`ToolRuntimeToolExecutor -> HostToolRuntime.execute_tool_call`，不再有独立 public helper。
 
 `EngineWorker`、`LocalProxy`、`WorkerProxy`、`ToolExecutor`、`HostToolRuntime`、
 `ToolRuntimeToolExecutor`、`DurableConversationMemoryStore`、`DefaultRunInputBuilder`、

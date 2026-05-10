@@ -144,10 +144,11 @@ P8 cleanup 后的 stale / orphan recovery 旧术语（`MARK_RECOVERING_AND_CREAT
 | `recover_stale_attempts(run_id=None)` 全局扫描路径未单测 | PR #40 | fixed (T2 test added) |
 | `next_attempt_index` 未独立单测 | P8.5 | deferred-with-owner |
 | P8 PR review 2242/2247 coverage-only gaps：renew/terminal race、recovery CAS miss、owner-lost late event、terminal override、expired/denied fencing 等 adversarial tests | P8.5 | deferred-with-owner |
+| P8 PR review 0612/0613 low findings：`_renew_loop` STORAGE_ERROR 异常分类、BUSY reason 细化、`lease_context` 参数校验等 attempt lease 诊断 / 防御性边界 | P8.5 | deferred-with-owner |
 | recovery scan 自动接入生产启动链路 | P9 / Session lifecycle | deferred-with-owner |
 | `startup_reconcile` 自动接入 Host 启动流程 | P9 / Session lifecycle | deferred-with-owner |
 | `HostStorage.close()` 对后台 task / `to_thread` commit 无生命周期保护 | P9 lifecycle | deferred-with-owner |
-| compact 成功但后续 durable append 失败时的诊断事件精度 | P8.5 | deferred-with-owner |
+| compact 成功 / 失败路径中诊断 fact 与 terminal fact 分步 append 导致的诊断事件精度、孤立诊断 fact 与原子性取舍 | P8.5 | deferred-with-owner |
 | observer 在空 EventLog 且 `last_success_position is None` 时无法明确转 `CAUGHT_UP` | PR #40 | fixed (zero-event observer advance) |
 | observer buffered drain / best-effort observer 解耦 / observer claim lease；P8.5 需裁决哪些属于 P8 read model / trace 多进程稳定性前置，剩余治理项继续由 issue #28 / P15 承接 | P8.5 / GitHub issue #28 | deferred-with-owner |
 | 慢硬盘 + Docker Linux multiprocessing stress 稳定性 | GitHub issue #38 | tracked |
@@ -158,6 +159,7 @@ P8 cleanup 后的 stale / orphan recovery 旧术语（`MARK_RECOVERING_AND_CREAT
 | `RUN_INPUT_CONTEXT_SNAPSHOT_BUILT` 内联 raw payload 造成 EventLog 热冷混合与体积增长 | P8.5 | deferred-with-owner |
 | `LocalRunHarness` 职责继续膨胀，接近 God Object 阈值 | P9 / P16 architecture | deferred-with-owner |
 | `DurableHarnessBundle` 暴露 attempt supervisor / lease store 等 Host internal 治理对象，public/internal bundle 边界需在接口冻结前收口 | P16 interface freeze | deferred-with-owner |
+| `_LeaseSession.stopped_event` 死同步原语、`_tool_outcome_name` fallback、legacy `AttemptStateStore.update_state` CAS 保护、internal module `__all__` 清理等非阻塞内部清洁度问题 | P16 interface freeze | deferred-with-owner |
 | schema bootstrap 半失败治理 / 严格事务化 DDL | P15 | deferred-with-owner |
 | observer claim / lease 中与 P8 durable memory / tool trace projection 多进程所有权相关的部分 | P8.5 | deferred-with-owner |
 | observer hard-gate / required projection enforcement / watchdog 级治理 | P15 | deferred-with-owner |

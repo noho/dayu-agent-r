@@ -569,14 +569,16 @@ class AttemptSupervisor:
         )
         session = _LeaseSession(owner_context=owner_context)
         self._sessions[attempt_id] = session
+        renew_coro = self._renew_loop(session=session)
         try:
             renew_task = asyncio.create_task(
-                self._renew_loop(session=session),
+                renew_coro,
                 name=f"attempt-renew:{attempt_id}",
             )
         except Exception:
             # create_task 失败（如事件循环已关闭）时清理 session 注册,
-            # 避免 _sessions 中残留无 renew task 的孤儿 session。
+            # 并关闭尚未被 task 接管的 coroutine, 避免泄漏未 await 协程。
+            renew_coro.close()
             del self._sessions[attempt_id]
             raise
         session.renew_task = renew_task
