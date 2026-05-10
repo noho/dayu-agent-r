@@ -615,11 +615,13 @@ STALE -> LOST
   `fencing_token` 且 lease 未过期的 owner 可以写 attempt-scoped facts。
 - `SUCCEEDED` / `FAILED` / `CANCELLED` / `SUSPENDED`：正常 terminal attempt，必须同事务关联
   terminal EventLog position。
-- `STALE`：旧 owner lease 过期，结果未知，当前 attempt 已关闭执行权；后续可被 recovery CAS
-  标记为 `RECOVERING`，或在无法恢复时标记为 `LOST`。
-- `RECOVERING`：旧 attempt 已被 recovery CAS 关闭，并且同一事务创建了新的 recovery attempt；
-  旧 attempt 不再可执行。
-- `LOST`：结果无法确认且当前 policy 不创建 recovery attempt；不允许再写 attempt-scoped facts。
+- `STALE`：旧 owner lease 过期, 结果未知, 当前 attempt 已关闭执行权; P8 D2 后 recovery
+  scan 一律把过期 lease 收口为 `LOST`(诊断终态), `STALE` 仅作为运维 / smoke 显式诊断 API
+  保留, 不在生产 recovery 主路径出现。
+- `RECOVERING`：仍保留为 attempt 状态码以兼容已有 EventLog / 旧库 recovery 链, 但 P8 D2 后
+  生产 recovery 主路径不再产生 `RECOVERING` 状态; 重试 / resume 必须由 Service 层显式发起新的
+  `StartRunRequest` (新 attempt_index)。
+- `LOST`：结果无法确认; Recovery 主路径默认终态; 不允许再写 attempt-scoped facts。
 
 `SUSPENDED` 是 issue #4 的预留状态：表示 Engine / ToolExecutor 协作产生等待事实后，
 当前 attempt 已停止继续执行，Run 进入 `WAITING`，后续由 Host wait record 完成、取消、超时或丢失治理。
@@ -660,9 +662,9 @@ LocalRunHarness
 - owner token 明文只能存在于 Host internal `AttemptOwnerContext`；持久化只保存 token hash，
   普通日志、RunEvent payload、ToolExecutionContext、public stream 和 README 示例都不能泄露明文 token。
   fencing token 是全局单调整数，可用于 owner 新旧比较，但仍不应作为普通调用方 public API 暴露。
-- P8 recovery 不 takeover 同一 attempt。旧 attempt 先通过 CAS 标记为 `RECOVERING`、`STALE`
-  或 `LOST`，默认主路径是在同一事务中创建新的 recovery attempt，并写
-  `recovered_from_attempt_id`。
+- P8 D2 后 recovery 仅做诊断收口, 不 takeover、不在 recovery 路径创建新 attempt。旧 attempt
+  通过 CAS 标记为 `LOST` (lease 过期 / `CREATED` 孤儿 / run terminal); 重试 / resume 必须由
+  Service 层显式发起新的 `StartRunRequest` (新 attempt_index), 不由 recovery 隐式创建。
 - 旧 owner、过期 owner、非 owner 或旧 fencing token 的迟到写入必须返回 typed fencing refusal，并且不得写入
   diagnostic RunEvent；非 owner 不应通过“我被拒绝了”这类 meta-fact 污染 canonical EventLog。
 - 所有 attempt-scoped append 都必须走 owner fencing，包括 Engine-sourced events、context compact
@@ -684,8 +686,10 @@ attempt，不创建新的用户输入事实，也不改变对外 `run_id`。
 规则：
 
 - 同一个 Run 下可以有多个 attempt；`attempt_index` 必须反映真实执行尝试次数。
-- 旧 attempt 进入 `RECOVERING` / `STALE` / `LOST` 后不再可执行；新的 recovery attempt 使用新的
-  `attempt_id` / `attempt_index`，并通过 `recovered_from_attempt_id` 保持审计链。
+- 旧 attempt 进入 `LOST` (P8 D2 主路径) 或诊断态 `STALE` 后不再可执行; Service 层显式发起的
+  新 attempt 使用新的 `attempt_id` / `attempt_index`, 通过新一轮 owner / fencing token 启动,
+  不依赖 recovery 隐式创建。`recovered_from_attempt_id` 字段保留作为审计回填字段, 用于 P8 之前
+  的旧库或将来 Service 层显式重试时回写来源 attempt id, 不在 recovery scan 内自动写入。
 - 旧 attempt 没有 terminal RunEvent 时，`terminal_event_position` 可以为空；最终 Run 的
   `terminal_event_cursor` / terminal result 必须来自真正写入 terminal RunEvent 的正常 terminal attempt。
 - recovery scan 不推进 projection checkpoint，不消费 observer side channel；projection 仍基于

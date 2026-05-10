@@ -2,8 +2,8 @@
 
 本模块为上层（Service / smoke / 测试）提供以 :class:`DurableRunEventStore`
 为后端、并自动驱动 :class:`ProjectionCoordinator` 的 :class:`LocalRunHarness`
-装配函数。它不替换 :func:`_build_default_harness`，而是作为 durable
-存储路径的显式入口；调用方负责保留 :class:`HostStorage` 的 close 责任。
+装配函数。它作为 durable 装配的主入口；调用方负责保留
+:class:`HostStorage` 的 close 责任。
 
 约束：
 

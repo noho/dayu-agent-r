@@ -76,6 +76,9 @@ _LOGGER: logging.Logger = logging.getLogger(__name__)
 _ERROR_SCOPE_CLEAR_UNSUPPORTED_SCOPE: str = "scope_clear_only_supports_session"
 _ERROR_SNAPSHOT_DECODE: str = "host_conversation_memory_snapshot_decode_failed"
 _ERROR_SNAPSHOT_ENCODE: str = "host_conversation_memory_snapshot_encode_failed"
+_ERROR_SNAPSHOT_SCHEMA_VERSION: str = (
+    "host_conversation_memory_snapshot_schema_version_mismatch"
+)
 _TABLE_NAME: str = "host_conversation_memory_snapshots"
 # repair 路径分页拉取 EventLog 的 batch 大小，避免单次 SELECT 全量加载。
 _REPAIR_FETCH_BATCH_LIMIT: int = 256
@@ -591,7 +594,17 @@ def _encode_snapshot(snapshot: ConversationMemorySnapshot) -> _JsonObject:
 
 
 def _decode_snapshot(payload: _JsonObject) -> ConversationMemorySnapshot:
-    """把 JSON 对象解码为 ``ConversationMemorySnapshot``。"""
+    """把 JSON 对象解码为 ``ConversationMemorySnapshot``。
+
+    Snapshot 是 durable read model, 编码格式必须与 :data:`_SCHEMA_VERSION`
+    严格一致; 如果 payload 缺失 ``schema_version`` 或与当前版本不匹配,
+    必须立即抛 :class:`ValueError`, 禁止静默放过未知版本 (会污染
+    durable repair 路径 / observer 重建路径)。
+    """
+
+    raw_version = payload.get("schema_version")
+    if not isinstance(raw_version, int) or raw_version != _SCHEMA_VERSION:
+        raise ValueError(_ERROR_SNAPSHOT_SCHEMA_VERSION)
 
     return ConversationMemorySnapshot(
         session_id=_decode_str(payload, "session_id"),

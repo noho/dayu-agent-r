@@ -1,5 +1,20 @@
 # Host P8 Handoff Plan：Attempt Lease / Recovery / 多进程并发基础
 
+> **P8 D2 修订**: 本计划文档保留为 P8 实施期的历史 plan, 其中
+> `MARK_RECOVERING_AND_CREATE_ATTEMPT` / `mark_recovering_and_create_attempt` /
+> `recovery_attempt_id` / `recovery_attempt_index` / "在同一事务中创建新的 recovery
+> attempt" 等 recovery 主路径描述, 以及 `STALE` / `RECOVERING` 作为生产 recovery
+> 主态的相关段落, 均在 P8 D2 (`docs/host/phase8-cleanup-plan.md` D2) 后被废弃。
+> 当前真源:
+>
+> - Recovery scan 仅做诊断收口, 唯一动作是把过期 / 孤儿 attempt CAS 推到 `LOST`
+>   (reason `recovery_lease_expired` / `recovery_created_orphan` /
+>   `recovery_run_terminal`), 或 CAS miss 时返回 `NOOP_TERMINAL`;
+> - Recovery 不再创建新的 recovery attempt, 不再写 `recovered_from_attempt_id`,
+>   重试 / resume 必须由 Service 层显式发起新 `StartRunRequest`;
+> - 详见 `dayu/host/README.md` recovery 段、`docs/host/design.md` §8.2/§8.3 与
+>   `dayu/host/_attempt_supervisor.py` 主路径源代码。
+
 ## 1. 目标与动机
 
 P8 目标是在 P6 durable EventLog / Run State / Projection 与 P7 tool trace projection 之上，落地 Attempt owner 真源、lease / fencing、stale / orphan recovery、`terminal_event_position` 原子关联，以及真实多进程并发验证。动机成立：Full-Governance Multi-Turn 不能只依赖 durable append；只要多个 Host 进程可能同时恢复、续跑或终结同一个 internal attempt，就必须有跨进程一致的 owner secret 与全局单调 fencing token，阻止旧 owner 迟到写入污染 EventLog、Run state、Attempt state、projection checkpoint 或 tool trace。

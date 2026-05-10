@@ -26,10 +26,6 @@ from dayu.contracts.tool_outcome import (
 from dayu.contracts.tool_result import ToolResultFailure, ToolResultSuccess
 from dayu.host import (
     RunEventType,
-    ToolFetchMoreHandleRequest,
-    ToolFetchMoreHandleSucceededResult,
-    ToolFetchMoreRequest,
-    ToolFetchMoreSucceededResult,
     ToolResultTruncatedData,
 )
 from dayu.host._event_store import InMemoryRunEventStore
@@ -243,6 +239,54 @@ def _request(
     )
 
 
+def _framework_request(
+    *,
+    cursor_value: str,
+    scope_token: str,
+    run_id: str = "run_1",
+    session_id: str = "session_1",
+    tool_call_id: str = "fetch_call_1",
+    limit: int | None = None,
+) -> ToolExecutionRequest:
+    """构造 framework ``fetch_more`` 工具执行请求。
+
+    :param cursor_value: cursor 原文。
+    :param scope_token: scope token 明文。
+    :param run_id: Run id。
+    :param session_id: 会话 id。
+    :param tool_call_id: framework tool call id。
+    :param limit: 可选 limit。
+    :returns: ToolExecutionRequest。
+    :raises Exception: 不主动抛出异常。
+    """
+
+    arguments: dict[str, JsonValue] = {
+        "cursor": cursor_value,
+        "scope_token": scope_token,
+    }
+    if limit is not None:
+        arguments["limit"] = limit
+    return ToolExecutionRequest(
+        call=ToolCallRequest(
+            tool_call_id=tool_call_id,
+            name=FRAMEWORK_FETCH_MORE_TOOL_NAME,
+            arguments=arguments,
+            index_in_iteration=0,
+            provider_state=None,
+        ),
+        context=ToolExecutionContext(
+            run_id=run_id,
+            session_id=session_id,
+            iteration_id="iter_1",
+            tool_call_id=tool_call_id,
+            index_in_iteration=0,
+            timeout_seconds=None,
+            cancellation_token=_Token(),
+            correlation_id=None,
+        ),
+    )
+
+
 async def _runtime(
     *,
     value: JsonValue,
@@ -393,42 +437,24 @@ async def test_truncation_strategies(
 async def test_binary_bytes_fetch_more_returns_base64_json_string() -> None:
     """binary_bytes 补读结果保持 base64 JsonValue 字符串契约。"""
 
-    runtime, store = await _runtime(
+    runtime, _store = await _runtime(
         value=cast(JsonValue, b"abcdef"),
         spec=_spec("binary_bytes", "max_bytes", 2),
     )
     outcome = await runtime.execute_tool_call(_request())
     assert isinstance(outcome, ToolCompletedOutcome)
     assert outcome.result.value == "YWI="
-    truncated = cast(
-        ToolResultTruncatedData,
-        (await store.list_events("run_1", after=None))[0].data,
-    )
-    handle = await runtime.get_tool_fetch_more_handle(
-        ToolFetchMoreHandleRequest(
-            iteration_id="iter_1",
-            session_id="session_1",
-            run_id="run_1",
-            tool_call_id="tc_1",
-            cursor_fingerprint=truncated.cursor_fingerprint,
-        )
-    )
-    assert isinstance(handle, ToolFetchMoreHandleSucceededResult)
+    assert outcome.result.truncation is not None
 
-    result = await runtime.fetch_more(
-        ToolFetchMoreRequest(
-            iteration_id="iter_1",
-            session_id="session_1",
-            run_id="run_1",
-            tool_call_id="tc_1",
-            cursor=handle.handle.cursor,
-            scope_token=handle.handle.scope_token,
-            limit=None,
+    fetch_outcome = await runtime.execute_tool_call(
+        _framework_request(
+            cursor_value=outcome.result.truncation.cursor,
+            scope_token=outcome.result.truncation.scope_token,
         )
     )
 
-    assert isinstance(result, ToolFetchMoreSucceededResult)
-    assert result.value == "Y2Q="
+    assert isinstance(fetch_outcome, ToolCompletedOutcome)
+    assert fetch_outcome.result.value == "Y2Q="
 
 
 @pytest.mark.asyncio
@@ -566,136 +592,88 @@ async def test_non_completed_outcome_passthrough_without_cursor() -> None:
 async def test_fetch_more_single_use_limit_clamp_and_next_cursor() -> None:
     """成功补读后旧 cursor 失效，limit clamp，并在有剩余时签发新 cursor。"""
 
-    runtime, store = await _runtime(
+    runtime, _store = await _runtime(
         value=[1, 2, 3, 4, 5],
         spec=_spec("list_items", "max_items", 2),
     )
-    await runtime.execute_tool_call(_request())
-    truncated = cast(
-        ToolResultTruncatedData,
-        (await store.list_events("run_1", after=None))[0].data,
-    )
-    handle_result = await runtime.get_tool_fetch_more_handle(
-        ToolFetchMoreHandleRequest(
-            iteration_id="iter_1",
-            session_id="session_1",
-            run_id="run_1",
-            tool_call_id="tc_1",
-            cursor_fingerprint=truncated.cursor_fingerprint,
-        )
-    )
-    assert isinstance(handle_result, ToolFetchMoreHandleSucceededResult)
+    outcome = await runtime.execute_tool_call(_request())
+    assert isinstance(outcome, ToolCompletedOutcome)
+    truncation = outcome.result.truncation
+    assert truncation is not None
 
-    first = await runtime.fetch_more(
-        ToolFetchMoreRequest(
-            iteration_id="iter_1",
-            session_id="session_1",
-            run_id="run_1",
-            tool_call_id="tc_1",
-            cursor=handle_result.handle.cursor,
-            scope_token=handle_result.handle.scope_token,
+    first = await runtime.execute_tool_call(
+        _framework_request(
+            cursor_value=truncation.cursor,
+            scope_token=truncation.scope_token,
             limit=99,
         )
     )
-    assert isinstance(first, ToolFetchMoreSucceededResult)
-    assert first.value == [3, 4]
-    assert first.truncation is not None
+    assert isinstance(first, ToolCompletedOutcome)
+    assert first.result.value == [3, 4]
+    assert first.result.truncation is not None
 
-    reused = await runtime.fetch_more(
-        ToolFetchMoreRequest(
-            iteration_id="iter_1",
-            session_id="session_1",
-            run_id="run_1",
-            tool_call_id="tc_1",
-            cursor=handle_result.handle.cursor,
-            scope_token=handle_result.handle.scope_token,
-            limit=None,
+    reused = await runtime.execute_tool_call(
+        _framework_request(
+            cursor_value=truncation.cursor,
+            scope_token=truncation.scope_token,
+            tool_call_id="fetch_call_2",
         )
     )
-    assert not isinstance(reused, ToolFetchMoreSucceededResult)
-    assert reused.error_code == "cursor_not_found"
-    assert reused.denied is False
+    assert isinstance(reused, ToolFailedOutcome)
+    assert reused.result.error == "cursor_not_found"
 
-    next_handle = await runtime.get_tool_fetch_more_handle(
-        ToolFetchMoreHandleRequest(
-            iteration_id="iter_1",
-            session_id="session_1",
-            run_id="run_1",
-            tool_call_id="tc_1",
-            cursor_fingerprint=first.truncation.fingerprint,
+    second = await runtime.execute_tool_call(
+        _framework_request(
+            cursor_value=first.result.truncation.cursor,
+            scope_token=first.result.truncation.scope_token,
+            tool_call_id="fetch_call_3",
         )
     )
-    assert isinstance(next_handle, ToolFetchMoreHandleSucceededResult)
-    second = await runtime.fetch_more(
-        ToolFetchMoreRequest(
-            iteration_id="iter_1",
-            session_id="session_1",
-            run_id="run_1",
-            tool_call_id="tc_1",
-            cursor=next_handle.handle.cursor,
-            scope_token=next_handle.handle.scope_token,
-            limit=None,
-        )
-    )
-    assert isinstance(second, ToolFetchMoreSucceededResult)
-    assert second.value == [5]
-    assert second.truncation is None
+    assert isinstance(second, ToolCompletedOutcome)
+    assert second.result.value == [5]
+    assert second.result.truncation is None
 
 
 @pytest.mark.asyncio
 async def test_concurrent_fetch_more_same_cursor_is_single_use() -> None:
     """同一 cursor 并发补读时只有一个成功，另一个返回 cursor_not_found。"""
 
-    runtime, store = await _runtime(
+    runtime, _store = await _runtime(
         value=[1, 2, 3, 4],
         spec=_spec("list_items", "max_items", 2),
     )
-    await runtime.execute_tool_call(_request())
-    truncated = cast(
-        ToolResultTruncatedData,
-        (await store.list_events("run_1", after=None))[0].data,
+    outcome = await runtime.execute_tool_call(_request())
+    assert isinstance(outcome, ToolCompletedOutcome)
+    truncation = outcome.result.truncation
+    assert truncation is not None
+
+    request_a = _framework_request(
+        cursor_value=truncation.cursor,
+        scope_token=truncation.scope_token,
+        tool_call_id="fetch_call_a",
     )
-    handle = await runtime.get_tool_fetch_more_handle(
-        ToolFetchMoreHandleRequest(
-            iteration_id="iter_1",
-            session_id="session_1",
-            run_id="run_1",
-            tool_call_id="tc_1",
-            cursor_fingerprint=truncated.cursor_fingerprint,
-        )
-    )
-    assert isinstance(handle, ToolFetchMoreHandleSucceededResult)
-    request = ToolFetchMoreRequest(
-        iteration_id="iter_1",
-        session_id="session_1",
-        run_id="run_1",
-        tool_call_id="tc_1",
-        cursor=handle.handle.cursor,
-        scope_token=handle.handle.scope_token,
-        limit=None,
+    request_b = _framework_request(
+        cursor_value=truncation.cursor,
+        scope_token=truncation.scope_token,
+        tool_call_id="fetch_call_b",
     )
 
     first, second = await asyncio.gather(
-        runtime.fetch_more(request),
-        runtime.fetch_more(request),
+        runtime.execute_tool_call(request_a),
+        runtime.execute_tool_call(request_b),
     )
 
     results = (first, second)
     successes = [
-        result
-        for result in results
-        if isinstance(result, ToolFetchMoreSucceededResult)
+        result for result in results if isinstance(result, ToolCompletedOutcome)
     ]
     failures = [
-        result
-        for result in results
-        if not isinstance(result, ToolFetchMoreSucceededResult)
+        result for result in results if isinstance(result, ToolFailedOutcome)
     ]
     assert len(successes) == 1
-    assert successes[0].value == [3, 4]
+    assert successes[0].result.value == [3, 4]
     assert len(failures) == 1
-    assert failures[0].error_code == "cursor_not_found"
-    assert failures[0].denied is False
+    assert failures[0].result.error == "cursor_not_found"
 
 
 def test_build_chunk_strategy_data_type_mismatch_returns_empty_chunk() -> None:
@@ -735,53 +713,35 @@ async def test_ttl_expired_and_opportunistic_cleanup() -> None:
     """过期 cursor 被拒绝，后续创建 cursor 时清理无人访问的过期 payload。"""
 
     clock = _Clock()
-    runtime, store = await _runtime(
+    runtime, _store = await _runtime(
         value="abcdef",
         spec=_spec("text_chars", "max_chars", 2, ttl_seconds=5),
         clock=clock,
     )
-    await runtime.execute_tool_call(_request())
-    first = cast(
-        ToolResultTruncatedData,
-        (await store.list_events("run_1", after=None))[0].data,
-    )
-    handle = await runtime.get_tool_fetch_more_handle(
-        ToolFetchMoreHandleRequest(
-            iteration_id="iter_1",
-            session_id="session_1",
-            run_id="run_1",
-            tool_call_id="tc_1",
-            cursor_fingerprint=first.cursor_fingerprint,
-        )
-    )
-    assert isinstance(handle, ToolFetchMoreHandleSucceededResult)
+    outcome = await runtime.execute_tool_call(_request())
+    assert isinstance(outcome, ToolCompletedOutcome)
+    truncation = outcome.result.truncation
+    assert truncation is not None
     clock.now = 106.0
 
-    expired = await runtime.fetch_more(
-        ToolFetchMoreRequest(
-            iteration_id="iter_1",
-            session_id="session_1",
-            run_id="run_1",
-            tool_call_id="tc_1",
-            cursor=handle.handle.cursor,
-            scope_token=handle.handle.scope_token,
-            limit=None,
+    expired = await runtime.execute_tool_call(
+        _framework_request(
+            cursor_value=truncation.cursor,
+            scope_token=truncation.scope_token,
         )
     )
-    assert not isinstance(expired, ToolFetchMoreSucceededResult)
-    assert expired.error_code == "cursor_expired"
-    assert expired.denied is False
+    assert isinstance(expired, ToolFailedOutcome)
+    assert expired.result.error == "cursor_expired"
 
-    await runtime.execute_tool_call(_request(run_id="run_2", tool_call_id="tc_2"))
-    stale_handle = await runtime.get_tool_fetch_more_handle(
-        ToolFetchMoreHandleRequest(
-            iteration_id="iter_1",
-            session_id="session_1",
-            run_id="run_1",
-            tool_call_id="tc_1",
-            cursor_fingerprint=first.cursor_fingerprint,
+    await runtime.execute_tool_call(
+        _request(run_id="run_2", tool_call_id="tc_2")
+    )
+    stale = await runtime.execute_tool_call(
+        _framework_request(
+            cursor_value=truncation.cursor,
+            scope_token=truncation.scope_token,
+            tool_call_id="fetch_call_stale",
         )
     )
-    assert not isinstance(stale_handle, ToolFetchMoreHandleSucceededResult)
-    assert stale_handle.error_code == "cursor_not_found"
-    assert stale_handle.denied is False
+    assert isinstance(stale, ToolFailedOutcome)
+    assert stale.result.error == "cursor_not_found"

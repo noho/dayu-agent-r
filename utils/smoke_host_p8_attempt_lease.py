@@ -1,15 +1,18 @@
 """人工验证 Host P8 Attempt Lease / Fencing / Recovery 路径的 smoke 脚本。
 
 本脚本通过 7 个 offline deterministic 场景验证 P8 attempt 所有权、fencing、
-recovery、terminal close、observer reconciliation 与 durable memory recovery:
+recovery 诊断收口、terminal close、observer reconciliation 与 durable
+memory recovery:
 
 1. Owner A acquire + renew → owner acquired, fencing token 不变, lease 刷新。
 2. Owner B acquire 同 attempt_index → busy。
 3. 时钟推进至 lease 过期 → ``recover_stale_attempts`` supervisor scan
-   创建 recovery attempt, recovered_from 链接。
+   返回 ``MARK_LOST`` + ``recovery_lease_expired`` (P8 D2: 仅诊断收口,
+   不创建 recovery attempt)。
 4. Owner A late write → fenced, EventLog 不残留。
-5. 新 owner 通过 ``lease_context`` acquire 新 attempt → terminal close,
-   attempt_state=failed。
+5. Service 层显式发起新 attempt (index=1) → terminal close,
+   attempt_state=failed (P8 D2: retry 由 Service 层显式触发, 不由 recovery
+   隐式创建)。
 6. 关闭 harness 后重新打开 → startup_reconcile observer caught up。
 7. Durable memory: checkpoint caught-up 后删除 memory snapshot,
    startup_reconcile 通过 durable repair 从 EventLog 重建 snapshot
@@ -74,6 +77,7 @@ from dayu.host._durable_harness import (  # noqa: E402
 from dayu.host._event_translation import (  # noqa: E402
     user_input_accepted_draft,
 )
+from dayu.host._internal_contracts import AttemptState  # noqa: E402
 from dayu.host.contracts import (  # noqa: E402
     HostRunFailedData,
     RunEventDraft,
@@ -268,48 +272,48 @@ async def _run_smoke() -> None:
             print(f"[s2] busy={busy}")
 
             # === Scenario 3: Advance clock → supervisor recovery scan ===
-            # 推进时钟超过 lease TTL，使 attempt A lease 过期
+            # 推进时钟超过 lease TTL，使 attempt A lease 过期。
+            # P8 D2: recovery 仅诊断收口, 旧 attempt 标记 LOST,
+            # 不创建 recovery attempt。
             clock.advance(_LEASE_TTL_SECONDS + 5)
 
-            # 通过 supervisor.recover_stale_attempts 执行 recovery scan
-            # supervisor 内部扫描候选、CAS 标记 RECOVERING、创建 recovery attempt
             recovery_decisions = await bundle.attempt_supervisor.recover_stale_attempts(
                 run_id=_SMOKE_RUN_ID,
             )
-            assert len(recovery_decisions) > 0, (
-                "recover_stale_attempts 应至少返回 1 个决策"
+            assert len(recovery_decisions) == 1, (
+                f"recover_stale_attempts 应返回 1 个决策, 实际 {len(recovery_decisions)}"
             )
             decision = recovery_decisions[0]
-            assert decision.action is AttemptRecoveryAction.MARK_RECOVERING_AND_CREATE_ATTEMPT, (
-                f"期望 MARK_RECOVERING_AND_CREATE_ATTEMPT, 实际 {decision.action}"
+            assert decision.action is AttemptRecoveryAction.MARK_LOST, (
+                f"期望 MARK_LOST, 实际 {decision.action}"
             )
-            assert decision.recovery_attempt_id is not None
-            assert decision.recovery_attempt_index is not None
-            recovery_attempt_id = decision.recovery_attempt_id
-            recovery_attempt_index = decision.recovery_attempt_index
+            assert decision.reason == "recovery_lease_expired", (
+                f"期望 reason=recovery_lease_expired, 实际 {decision.reason}"
+            )
+            assert decision.source_attempt_id == a_attempt_id
 
-            # 验证旧 attempt 状态为 RECOVERING
             old_attempt = bundle.attempt_state_store.get(a_attempt_id)
             old_state = (
                 old_attempt.state.value
                 if old_attempt is not None
                 else "missing"
             )
+            assert old_state == AttemptState.LOST.value, (
+                f"期望旧 attempt LOST, 实际 {old_state}"
+            )
 
             print(
                 f"[s3] recovered_from={_mask_id(a_attempt_id)} "
-                f"recovery_attempt={_mask_id(recovery_attempt_id)} "
-                f"recovery_index={recovery_attempt_index} "
+                f"action={decision.action.value} "
+                f"reason={decision.reason} "
                 f"old_state={old_state}"
             )
 
             # === Scenario 4: Owner A late write → fenced ===
-            # Owner A 的 lease 已过期，scoped_appender.append 应抛
-            # AttemptFencingError
+            # Owner A 的 lease 已过期, 旧 attempt 已 LOST,
+            # scoped_appender.append 应抛 AttemptFencingError
             assert owner_a is not None
             old_appender = bundle.attempt_supervisor.scoped_appender(owner_a)
-            # 用非 terminal draft 测试 fenced（terminal draft 会先被
-            # ValueError 拦截，无法到达 fencing 路径）
             late_non_terminal = RunEventDraft(
                 run_id=_SMOKE_RUN_ID,
                 session_id=_SMOKE_SESSION_ID,
@@ -332,12 +336,10 @@ async def _run_smoke() -> None:
 
             print(f"[s4] late_write=fenced reason={fence_reason}")
 
-            # === Scenario 5: New owner terminal close via lease_context ===
-            # recovery attempt 的 owner_token 由 supervisor 内部持有,
-            # 无法从 AttemptRecoveryDecision 获取。改用 lease_context acquire
-            # 一个新 attempt (attempt_index = recovery_index + 1) 来验证
-            # append_terminal_and_close 路径。
-            terminal_attempt_index = recovery_attempt_index + 1
+            # === Scenario 5: Service 层显式发起新 attempt + terminal close ===
+            # P8 D2: recovery 不再隐式创建 recovery attempt; retry 由 Service
+            # 层显式触发新 ``StartRunRequest``。这里以 attempt_index=1 模拟
+            # Service 层显式重试, 并在新 attempt 上做 terminal close。
             terminal_draft = _terminal_failed_draft(
                 run_id=_SMOKE_RUN_ID,
                 session_id=_SMOKE_SESSION_ID,
@@ -345,7 +347,7 @@ async def _run_smoke() -> None:
             )
             async with bundle.attempt_supervisor.lease_context(
                 run_id=_SMOKE_RUN_ID,
-                attempt_index=terminal_attempt_index,
+                attempt_index=1,
             ) as terminal_ctx:
                 link = await bundle.attempt_supervisor.append_terminal_and_close(
                     owner_context=terminal_ctx,

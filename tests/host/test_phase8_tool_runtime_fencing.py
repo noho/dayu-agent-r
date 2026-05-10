@@ -398,7 +398,7 @@ async def test_fetch_more_under_owner_scope_appends_facts_normally() -> None:
                     scope_token=record.scope_token,
                     limit=2,
                 )
-                result = await runtime.fetch_more(request)
+                result = await runtime._fetch_more(request)  # noqa: SLF001
         # 期望: 至少出现 TOOL_FETCH_MORE_REQUESTED 与 TOOL_FETCH_MORE_COMPLETED;
         # 仍有剩余时还会出现 TOOL_CURSOR_ISSUED。
         events = await supervisor.event_store.list_events(
@@ -469,7 +469,7 @@ async def test_fetch_more_run_id_mismatch_is_fenced_end_to_end() -> None:
                     limit=2,
                 )
                 with pytest.raises(AttemptFencingError) as excinfo:
-                    await runtime.fetch_more(request)
+                    await runtime._fetch_more(request)  # noqa: SLF001
                 assert (
                     excinfo.value.reason
                     is AttemptFencingReason.OWNER_MISMATCH
@@ -541,6 +541,6 @@ async def test_durable_runtime_without_owner_scope_fails_fast() -> None:
             limit=2,
         )
         with pytest.raises(RuntimeError, match="ToolRuntimeOwnerScope"):
-            await runtime.fetch_more(request)
+            await runtime._fetch_more(request)  # noqa: SLF001
     finally:
         storage.close()

@@ -51,6 +51,7 @@ from dayu.host._attempt_lease import (
     AttemptLeaseResult,
     AttemptOwnerContext,
     AttemptOwnerToken,
+    AttemptTerminalLink,
     DEFAULT_ATTEMPT_LEASE_CONFIG,
 )
 from dayu.host._attempt_supervisor import (
@@ -79,6 +80,8 @@ from dayu.host._internal_contracts import (
 from dayu.host._run_state_store import AttemptLeaseStore
 from dayu.host.contracts import (
     HostRunFailedData,
+    RunEvent,
+    RunEventDraft,
     RunEventSource,
     RunEventType,
     StartRunRequest,
@@ -998,18 +1001,23 @@ async def test_owner_lost_during_engine_wait_stops_late_event_append() -> None:
 
 @dataclass(slots=True)
 class _RecordingDiagnosticSupervisor:
-    """包装真实 supervisor 并记录 diagnostic close 调用。
+    """包装真实 supervisor 并记录 diagnostic close 与 terminal close 调用。
 
     本 wrapper 不替换 lease_context / renew loop / wait_owner_lost 任何路径,
     仅透传到内部 supervisor; 唯一额外能力是把
-    ``close_attempt_with_diagnostic_state`` 的入参与返回值记录到列表, 使集成
-    测试可以在 ``_run_to_store`` 整链路上观察 owner-aware 收口确实经过 supervisor
-    路径(而不是 legacy 非 owner-aware update_state)。
+    ``close_attempt_with_diagnostic_state`` 与
+    ``append_terminal_and_close`` 的入参与返回值记录到列表, 使集成
+    测试可以在 ``_run_to_store`` 整链路上观察 owner-aware 收口确实经过
+    supervisor 路径(而不是 legacy 非 owner-aware update_state, 或裸
+    ``event_store.append``)。
     """
 
     inner: AttemptSupervisor
     diagnostic_close_calls: list[
         tuple[str, AttemptState, str | None, GlobalEventPosition | None, bool]
+    ] = field(default_factory=list)
+    terminal_close_calls: list[
+        tuple[str, RunEventType, str | None, AttemptFencingReason | None]
     ] = field(default_factory=list)
 
     @asynccontextmanager
@@ -1064,6 +1072,31 @@ class _RecordingDiagnosticSupervisor:
             )
         )
         return applied
+
+    async def append_terminal_and_close(
+        self,
+        *,
+        owner_context: AttemptOwnerContext,
+        draft: RunEventDraft,
+        failure_summary: str | None = None,
+        terminal_state_override: AttemptState | None = None,
+    ) -> AttemptTerminalLink:
+        try:
+            link = await self.inner.append_terminal_and_close(
+                owner_context=owner_context,
+                draft=draft,
+                failure_summary=failure_summary,
+                terminal_state_override=terminal_state_override,
+            )
+        except AttemptFencingError as exc:
+            self.terminal_close_calls.append(
+                (owner_context.attempt_id, draft.type, failure_summary, exc.reason)
+            )
+            raise
+        self.terminal_close_calls.append(
+            (owner_context.attempt_id, draft.type, failure_summary, None)
+        )
+        return link
 
 
 @dataclass(slots=True)
@@ -1134,37 +1167,25 @@ class _OwnerLostDuringRunToStoreProxy:
 
 
 @pytest.mark.asyncio
-async def test_run_to_store_owner_lost_drops_late_engine_event_and_writes_host_failure() -> (
-    None
-):
-    """``_run_to_store`` 端到端 owner-lost: late Engine event 不进 EventLog, Host 写诊断终态。
+async def test_run_to_store_owner_lost_atomic_terminal_close_cas_hit() -> None:
+    """``_run_to_store`` 端到端 owner-lost (Case A — CAS hit): atomic terminal close。
 
-    覆盖 P8-S3 Low-3 follow-up 完整路径, 不只测 ``_next_engine_event_or_lose_owner``:
+    P8-S3 Case A: owner 被诊断为 lost 但 DB 真源仍持有当前 owner_token /
+    fencing_token (例如 supervisor 内部 ``loss_reason`` 被 storage error 等
+    非 DB-CAS 原因置位)。``_handle_owner_lost`` 必须走
+    ``AttemptSupervisor.append_terminal_and_close`` 在单事务内完成:
 
-    1. ``build_durable_harness`` 装配真实 supervisor + DurableEventStore + 默认
-       observer; renew_interval 用极短值, 便于测试主线程外部 fence 后 supervisor
-       renew CAS 立即 miss。
-    2. 注入 fake proxy: 先 yield 一个 preview content_delta, 等待 ``loss_done``
-       后再 yield 一个 late event (模拟 worker 在 owner-lost 后仍在产出事件)。
-    3. 测试主线程等 preview event 已 append, 直接 UPDATE ``host_attempts.fencing_token``
-       (owner_token_hash 保留), 让 supervisor renew loop 在下一次 CAS 时命中
-       FENCED, ``wait_owner_lost`` 立即返回 typed ``FENCED``。
-    4. set ``loss_done`` 让 fake stream 准备 yield late event; harness 经
-       ``_handle_owner_lost`` 路径写入 ``RUN_FAILED(error_code=attempt_lease_lost)``,
-       关闭 stream, 不再 append late event。
-    5. 通过 ``_RecordingDiagnosticSupervisor`` 观察:
-       - diagnostic close 至少被调用一次, 入参 ``state == AttemptState.LOST``,
-         failure_summary 以 ``attempt_lease_lost:`` 开头;
-       - close 返回 ``False`` (owner CAS miss, 因为外部已经替换 fencing token),
-         证明走的是 owner-aware 路径而不是 legacy 非 owner-aware update。
-    6. EventLog 断言:
-       - 出现 Host RUN_FAILED 且 ``error_code == "attempt_lease_lost"``;
-       - 不出现 ``event_id == "engine_late_after_loss"`` 的 RunEvent
-         (late Engine event 没有进入 EventLog)。
-    7. ``host_attempts`` 行的 ``state`` 仍是 ``running`` (CAS miss 未覆盖未来
-       状态), 进一步证明诊断收口走 owner-aware CAS 而不是 unconditional 写。
-    8. 全程不依赖真实 ``time.sleep``; 仅在轮询等待异步事件时使用极短
-       ``asyncio.sleep`` 让出事件循环。
+    1. ``verify_owner`` CAS hit;
+    2. terminal ``RUN_FAILED(error_code=attempt_lease_lost)`` append;
+    3. ``host_attempts`` 终态 close + ``terminal_event_position`` 写入。
+
+    关键断言:
+
+    - EventLog 出现恰 1 条 Host RUN_FAILED, ``error_code == attempt_lease_lost``;
+    - ``host_attempts.state == LOST`` 且 ``terminal_event_position`` 非空,
+      ``failure_summary`` 以 ``attempt_lease_lost:`` 开头;
+    - RunStream 订阅方收到 terminal event 后 generator 自然结束;
+    - late Engine event 不进入 EventLog。
     """
 
     from dayu.engine import (
@@ -1180,8 +1201,7 @@ async def test_run_to_store_owner_lost_drops_late_engine_event_and_writes_host_f
         RunOptions,
     )
 
-    # renew_interval 设极短, 便于外部 fence 后 supervisor 立刻 CAS-miss; ttl
-    # 仍较长, 不靠 lease 自然过期。
+    # renew_interval 设极短, 让 renew loop 快速观察到 loss_reason 后退出。
     fast_renew = AttemptLeaseConfig(
         ttl=timedelta(seconds=30),
         renew_interval=timedelta(milliseconds=5),
@@ -1257,47 +1277,26 @@ async def test_run_to_store_owner_lost_drops_late_engine_event_and_writes_host_f
 
         run_stream = await harness.start_run(request)
 
-        # 等 fake proxy 已经 yield 第一个 preview event; 此时 attempt 已经
-        # 存在于 host_attempts, EventLog 已经 append 了 USER_INPUT_ACCEPTED +
-        # context snapshot + preview。
+        # 等 fake proxy 已经 yield preview event。
         await asyncio.wait_for(
             sync_state.first_event_yielded.wait(), timeout=2.0
         )
 
-        # 直接 UPDATE host_attempts.fencing_token 把当前 owner 替换成不同的
-        # fencing token (state 仍为 running, owner_token_hash 不动): supervisor
-        # renew loop 下一次 CAS 必然 miss -> 标记 FENCED -> wait_owner_lost
-        # 返回 FENCED -> harness 走 _handle_owner_lost 路径。
-        attempt_id = recording.inner._sessions[  # noqa: SLF001
-            next(iter(recording.inner._sessions))  # noqa: SLF001
-        ].owner_context.attempt_id
-        owner_context = recording.inner._sessions[attempt_id].owner_context  # noqa: SLF001
-        async with bundle.storage.transaction() as tx:
-            tx.execute(
-                "UPDATE host_attempts SET fencing_token = ? "
-                "WHERE attempt_id = ?",
-                (10_000_000, attempt_id),
-            )
+        # Case A 触发: 直接把 supervisor 内部 session 的 loss_reason 置为
+        # STORAGE_ERROR 并 set owner_lost_event, 不修改 DB; renew loop 在
+        # 下次 tick 看到 loss_reason 非空后退出, harness wait_owner_lost
+        # 立即返回 STORAGE_ERROR。DB owner_token / fencing_token 仍是真实
+        # 当前 owner -> ``append_terminal_and_close`` CAS 命中。
+        sessions = recording.inner._sessions  # noqa: SLF001
+        attempt_id = next(iter(sessions))
+        session = sessions[attempt_id]
+        owner_context = session.owner_context
+        session.loss_reason = AttemptOwnerLossReason.STORAGE_ERROR
+        session.owner_lost_event.set()
 
-        # 等到 supervisor 的 renew loop 真正完成一次 CAS 并把 owner 标记为
-        # 失活, 才让 fake stream 解除等待。这避免 late event 被 harness 在
-        # owner-lost 信号到达前抢先 anext 消费(导致 attempt_lease_lost 路径
-        # 被 engine_stream_ended_without_terminal 替换)。
-        loss_deadline = asyncio.get_running_loop().time() + 2.0
-        while asyncio.get_running_loop().time() < loss_deadline:
-            if not recording.inner.is_owner_active(owner_context):
-                break
-            await asyncio.sleep(0.005)
-        assert not recording.inner.is_owner_active(owner_context), (
-            "supervisor renew loop did not detect external fence"
-        )
-
-        # 让 fake stream 解除等待, 准备 yield late event; harness 此时已经
-        # 在 owner-lost 路径上, race 必然命中 owner-lost。
+        # 让 fake stream 解除等待, harness 在 owner-lost race 命中。
         sync_state.loss_done.set()
 
-        # 等 background _run_to_store task 跑完: 用 EventLog 出现 Host
-        # RUN_FAILED 作为完成信号, 不依赖真实 sleep。
         deadline = asyncio.get_running_loop().time() + 5.0
         host_failure_event = None
         late_event_in_log = False
@@ -1317,38 +1316,235 @@ async def test_run_to_store_owner_lost_drops_late_engine_event_and_writes_host_f
                 break
             await asyncio.sleep(0.01)
 
-        # 关键断言 1: Host RUN_FAILED(error_code=attempt_lease_lost) 已写入。
         assert host_failure_event is not None, (
-            "host owner-lost terminal RUN_FAILED was not appended"
+            "atomic terminal close should append HOST RUN_FAILED on CAS hit"
         )
         host_data = host_failure_event.data
         assert isinstance(host_data, HostRunFailedData)
         assert host_data.error_code == "attempt_lease_lost"
         assert host_data.recoverable is False
 
-        # 关键断言 2: late Engine event 没有进入 EventLog。
         assert late_event_in_log is False, (
             "late Engine event after owner-lost leaked into EventLog"
         )
 
-        # 关键断言 3: diagnostic close 通过 supervisor owner-aware 路径调用,
-        # 且 CAS miss 返回 False (因为外部已替换 fencing token)。
-        relevant_calls = [
+        # 走的是 ``append_terminal_and_close`` 而不是 legacy 裸 append +
+        # diagnostic close: terminal_close_calls 至少 1 次, fence_reason
+        # 为 None (CAS hit)。
+        relevant_terminal = [
+            call for call in recording.terminal_close_calls
+            if call[0] == attempt_id
+        ]
+        assert len(relevant_terminal) >= 1
+        _aid, draft_type, summary, fence_reason = relevant_terminal[-1]
+        assert draft_type is RunEventType.RUN_FAILED
+        assert summary is not None
+        assert summary.startswith("attempt_lease_lost:")
+        assert fence_reason is None, (
+            "Case A 期望 verify_owner CAS 命中, 不应出现 fence_reason"
+        )
+
+        # host_attempts 已被 supervisor 在同事务内推到 LOST, 并写入
+        # terminal_event_position。
+        async with bundle.storage.transaction() as tx:
+            row = tx.execute(
+                "SELECT state, failure_summary, terminal_event_position "
+                "FROM host_attempts WHERE attempt_id = ?",
+                (attempt_id,),
+            ).fetchone()
+        assert row is not None
+        assert row[0] == AttemptState.LOST.value
+        assert row[1] is not None and row[1].startswith("attempt_lease_lost:")
+        assert row[2] is not None
+
+        # 不应触发 diagnostic close (CAS hit 路径已经把 attempt 推到 LOST,
+        # 上层 finally 块的 _finish_attempt_if_durable 在 active_attempt
+        # 被置 None 后跳过)。
+        diagnostic_relevant = [
             call for call in recording.diagnostic_close_calls
             if call[0] == attempt_id
         ]
-        assert len(relevant_calls) >= 1
-        _aid, state, summary, _pos, applied = relevant_calls[-1]
-        assert state is AttemptState.LOST
-        assert summary is not None
-        assert summary.startswith("attempt_lease_lost:")
-        assert applied is False, (
-            "diagnostic close should CAS-miss after external fence; "
-            "non-owner-aware update would have returned True"
+        assert diagnostic_relevant == [], (
+            "Case A 不应回退到 diagnostic close; "
+            "append_terminal_and_close 已 atomic 推进终态"
         )
 
-        # 关键断言 4: host_attempts.state 仍是 running, owner-aware CAS 没有
-        # 把它覆盖为 LOST; 这进一步证明走的是 supervisor owner-aware 路径。
+        consumed_types: list[RunEventType] = []
+        async for evt in run_stream.events:
+            consumed_types.append(evt.type)
+        assert RunEventType.RUN_FAILED in consumed_types
+
+        # owner_context 在记录调用中保留, 用于诊断输出
+        assert owner_context.attempt_id == attempt_id
+    finally:
+        bundle.close()
+
+
+@pytest.mark.asyncio
+async def test_handle_owner_lost_cas_miss_no_stale_terminal() -> None:
+    """``_handle_owner_lost`` Case B — CAS miss: 不写任何终态 RunEvent。
+
+    P8-S3 Case B: 在旧 owner 的 owner-lost signal 触发前, 已有 recovery /
+    其它进程把 ``host_attempts`` 推到 LOST。``_handle_owner_lost`` 必须:
+
+    - 调 ``append_terminal_and_close`` 触发 ``AttemptFencingError``;
+    - **不**向 EventLog 追加任何 ``RUN_FAILED``;
+    - ``host_attempts.state`` 保持 recovery 推进后的值;
+    - typed log ``host.run.attempt_lease_lost_cas_miss`` 已记录;
+    - RunStream generator 自然 break, 不抛 user-visible 异常。
+    """
+
+    from dayu.engine import (
+        AgentMessageRole,
+        AgentPolicy,
+        RunnerCallOptions,
+        RunnerSpec,
+        UserMessage,
+    )
+    from dayu.host._run_harness import LocalRunHarness
+    from dayu.host.contracts import (
+        RunInput,
+        RunOptions,
+    )
+
+    fast_renew = AttemptLeaseConfig(
+        ttl=timedelta(seconds=30),
+        renew_interval=timedelta(milliseconds=5),
+        owner_id_prefix="host-test",
+    )
+    bundle = build_durable_harness(
+        config=DurableHarnessConfig(
+            database_path=":memory:",
+            attempt_lease_config=fast_renew,
+        )
+    )
+    try:
+        sync_state = _OwnerLostDuringRunToStoreState()
+        proxy = _OwnerLostDuringRunToStoreProxy(
+            state=sync_state, session_id="s_int", run_id="r_int"
+        )
+        recording = _RecordingDiagnosticSupervisor(
+            inner=bundle.attempt_supervisor
+        )
+        runtime = bundle.harness.tool_runtime
+        assert runtime is not None
+        from dayu.host._proxy import WorkerProxy
+
+        harness = LocalRunHarness(
+            is_durable=True,
+            proxy=cast(WorkerProxy, proxy),
+            event_store=bundle.event_store,
+            tool_runtime=runtime,
+            memory_store=bundle.memory_store,
+            coordinator=bundle.coordinator,
+            attempt_supervisor=cast(AttemptSupervisor, recording),
+            storage=bundle.storage,
+        )
+
+        request = StartRunRequest(
+            session_id="s_int",
+            run_id="r_int",
+            input=RunInput(
+                messages=(
+                    UserMessage(role=AgentMessageRole.USER, content="hi"),
+                )
+            ),
+            options=RunOptions(
+                runner_spec=RunnerSpec(
+                    provider="openai",
+                    model="m",
+                    endpoint="https://example.test/v1/chat/completions",
+                    api_key_ref="K",
+                    headers={},
+                    supports_tool_calling=True,
+                    supports_streaming=True,
+                    supports_stream_usage=False,
+                    default_timeout_seconds=30.0,
+                    max_retries=0,
+                    provider_request=None,
+                ),
+                runner_options=RunnerCallOptions(
+                    temperature=None,
+                    max_tokens=None,
+                    top_p=None,
+                    stream=True,
+                ),
+                agent_policy=AgentPolicy(
+                    max_iterations=3,
+                    continuation_max_attempts=1,
+                    allow_tool_calls=True,
+                ),
+                stream=False,
+                disable_tools=True,
+                tool_schemas=(),
+            ),
+        )
+
+        run_stream = await harness.start_run(request)
+        await asyncio.wait_for(
+            sync_state.first_event_yielded.wait(), timeout=2.0
+        )
+
+        # 模拟 recovery: 直接 UPDATE ``host_attempts`` 把 fencing_token
+        # 替换 (state 仍为 running, owner_token_hash 不动), 让 supervisor
+        # 后续 ``verify_owner`` CAS 必然 miss; 紧接着把 supervisor 内部
+        # session 的 ``loss_reason`` 置位, 触发 owner-lost signal。
+        sessions = recording.inner._sessions  # noqa: SLF001
+        attempt_id = next(iter(sessions))
+        session = sessions[attempt_id]
+        async with bundle.storage.transaction() as tx:
+            tx.execute(
+                "UPDATE host_attempts SET fencing_token = ? "
+                "WHERE attempt_id = ?",
+                (10_000_000, attempt_id),
+            )
+        session.loss_reason = AttemptOwnerLossReason.FENCED
+        session.fence_reason = AttemptFencingReason.FENCING_TOKEN_MISMATCH
+        session.owner_lost_event.set()
+
+        sync_state.loss_done.set()
+
+        # 等 background _run_to_store task 完成 (要么 CAS miss 后退出,
+        # 要么 supervisor 记录 terminal_close_calls)。
+        deadline = asyncio.get_running_loop().time() + 5.0
+        terminal_recorded = False
+        while asyncio.get_running_loop().time() < deadline:
+            relevant = [
+                c for c in recording.terminal_close_calls
+                if c[0] == attempt_id
+            ]
+            if relevant:
+                terminal_recorded = True
+                break
+            await asyncio.sleep(0.01)
+
+        assert terminal_recorded, (
+            "_handle_owner_lost should attempt append_terminal_and_close"
+        )
+        # CAS miss: terminal_close_calls 末尾 fence_reason 非空。
+        last_call = [
+            c for c in recording.terminal_close_calls if c[0] == attempt_id
+        ][-1]
+        assert last_call[3] is not None, (
+            "Case B 期望 verify_owner CAS miss, fence_reason 必须非空"
+        )
+
+        # 关键断言: EventLog 不出现 HOST RUN_FAILED。
+        events = await bundle.event_store.list_events(
+            run_id="r_int", after=None
+        )
+        host_failure_count = sum(
+            1
+            for evt in events
+            if evt.type is RunEventType.RUN_FAILED
+            and evt.source is RunEventSource.HOST
+        )
+        assert host_failure_count == 0, (
+            "CAS miss path must not append stale HOST RUN_FAILED"
+        )
+
+        # host_attempts.state 保持 recovery 推进后的值 (本测试只改 fencing_token,
+        # 没改 state, 因此仍是 RUNNING)。
         async with bundle.storage.transaction() as tx:
             row = tx.execute(
                 "SELECT state FROM host_attempts WHERE attempt_id = ?",
@@ -1357,11 +1553,10 @@ async def test_run_to_store_owner_lost_drops_late_engine_event_and_writes_host_f
         assert row is not None
         assert row[0] == AttemptState.RUNNING.value
 
-        # 消费 RunStream 直到结束, 避免遗留订阅资源。
-        consumed_types: list[RunEventType] = []
-        async for evt in run_stream.events:
-            consumed_types.append(evt.type)
-        # 订阅流以 Host RUN_FAILED 收口; 不应出现 late engine event。
-        assert RunEventType.RUN_FAILED in consumed_types
+        # CAS miss 路径不会写终态事件; 真正终态由 recovery 真源补齐。
+        # 本用例无 recovery 进程, 因此 RunStream 不会自然结束;
+        # 显式 aclose() generator, 验证不抛 user-visible 异常即可。
+        events_iter = cast(AsyncGenerator[RunEvent, None], run_stream.events)
+        await events_iter.aclose()
     finally:
         bundle.close()

@@ -91,10 +91,13 @@ _FENCING_TOKEN_RESOURCE_TYPE_ATTEMPT: str = "attempt"
 """``host_fencing_tokens.resource_type`` 用于 attempt owner lease。"""
 
 
-_RECOVERY_REASON_LEASE_EXPIRED: str = "lease_expired_recovery_started"
-"""recovery 默认原因: 旧 owner lease 过期, 已 CAS mark recovering + 新 attempt。"""
+_RECOVERY_REASON_LEASE_EXPIRED: str = "recovery_lease_expired"
+"""recovery 原因: 候选为 ``RUNNING`` 且 lease 已过期; 由 recovery 直接 LOST。"""
 
-_RECOVERY_REASON_RUN_TERMINAL: str = "run_terminal_lost"
+_RECOVERY_REASON_CREATED_ORPHAN: str = "recovery_created_orphan"
+"""recovery 原因: 候选为 ``CREATED`` 孤儿 (lease 字段为 ``NULL``); LOST 收口。"""
+
+_RECOVERY_REASON_RUN_TERMINAL: str = "recovery_run_terminal"
 """recovery 原因: run 已 terminal, 旧 attempt 标记为 LOST 不再创建 recovery。"""
 
 _RECOVERY_REASON_NOOP_TERMINAL: str = "attempt_already_terminal"
@@ -108,51 +111,6 @@ _RECOVERY_REASON_CAS_NOOP: str = "cas_failed_noop"
 
 _RECOVERY_REASON_MARK_STALE: str = "marked_stale"
 """recovery 原因: 显式 STALE 诊断, 不创建 recovery attempt。"""
-
-_RECOVERY_REASON_UNIQUE_INDEX_COLLISION: str = "unique_index_collision"
-"""recovery 原因: 新 recovery attempt INSERT 命中 ``UNIQUE(run_id, attempt_index)`` 冲突, 整事务已回滚。"""
-
-
-class AttemptIndexCollisionError(Exception):
-    """recovery 路径 INSERT 新 attempt 时命中 ``UNIQUE(run_id, attempt_index)`` 冲突。
-
-    本异常用于把 :meth:`AttemptLeaseStore.mark_recovering_and_create_attempt`
-    内部捕获的裸 :class:`sqlite3.IntegrityError` 转换为强类型信号, 让外层
-    ``async with HostStorage.transaction()`` 一并回滚旧 attempt 的
-    ``RECOVERING`` CAS, 避免 "旧 attempt 已变 RECOVERING、新 recovery
-    attempt 未落库" 的半提交状态。
-
-    supervisor 在事务外捕获本异常后, 必须返回 typed
-    :class:`AttemptRecoveryDecision(action=NOOP_TERMINAL,
-    reason="unique_index_collision", ...)`, 不允许把裸 ``IntegrityError``
-    泄漏给上层调用方。
-    """
-
-    def __init__(
-        self,
-        *,
-        run_id: str,
-        attempt_index: int,
-        source_attempt_id: str,
-    ) -> None:
-        """构造 typed 冲突异常。
-
-        :param run_id: Run id。
-        :param attempt_index: 触发冲突的 ``attempt_index``。
-        :param source_attempt_id: 被本轮 recovery 处理的旧 attempt id。
-        :returns: 无返回值。
-        :raises Exception: 不主动抛出异常。
-        """
-
-        super().__init__(
-            "recovery attempt INSERT collided on UNIQUE(run_id, "
-            f"attempt_index): run_id={run_id} attempt_index={attempt_index} "
-            f"source_attempt_id={source_attempt_id}"
-        )
-        self.run_id: str = run_id
-        self.attempt_index: int = attempt_index
-        self.source_attempt_id: str = source_attempt_id
-
 
 _RUN_TERMINAL_STATES: frozenset[str] = frozenset(
     {
@@ -810,17 +768,24 @@ class AttemptLeaseStore:
         run_id: str | None,
         now: datetime,
     ) -> tuple[AttemptRecord, ...]:
-        """列出 lease 已过期、需要 recovery 处理的候选 attempt。
+        """列出需要 recovery 处理的候选 attempt。
 
-        条件: ``state IN ('running', 'created') AND lease_expires_at <= now``。
-        ``CREATED`` 行通常对应 acquire 失败 / 异常未推进的孤儿; lease 字段为
-        ``NULL`` 时由 SQL 比较自然过滤掉, 不会被误判为候选。``RECOVERING``
-        / 终态行不会出现在结果中, 避免重复处理。结果按 ``started_at`` 升序
-        返回, 让 recovery scan 顺序稳定可重放。
+        覆盖两类候选:
+
+        - ``state = 'running' AND lease_expires_at IS NOT NULL AND
+          lease_expires_at <= now``: 旧 owner lease 过期, 需要 LOST 收口。
+        - ``state = 'created' AND lease_expires_at IS NULL``: acquire 失败
+          或装配异常留下的孤儿行, owner / fencing token 全为 ``NULL``;
+          这类行也必须进入 recovery 收口为 LOST, 否则一直滞留 ``CREATED``
+          污染状态机 (P8 D3 / 0830-F2)。
+
+        ``RECOVERING`` / 终态行不会出现在结果中, 避免重复处理。结果按
+        ``started_at`` 升序返回, 让 recovery scan 顺序稳定可重放。
 
         本方法仅提供候选列表; 调用方需在每个候选的独立 ``BEGIN IMMEDIATE``
-        短事务内分别调用 :meth:`mark_recovering_and_create_attempt` 或
-        :meth:`mark_stale_or_lost`, 不在本方法的事务内做后续 CAS。
+        短事务内调用 :meth:`mark_stale_or_lost` 收口, 不在本方法的事务内做
+        后续 CAS。P8 D2 收口语义: recovery 不再创建 recovery attempt; 旧
+        attempt 一律 LOST 或 STALE。
 
         :param tx: 当前事务。
         :param run_id: 限定 run id; ``None`` 表示扫描全库。
@@ -831,32 +796,37 @@ class AttemptLeaseStore:
         """
 
         _require_aware(now, "now")
+        # 两个 OR 子句严格对应 RUNNING-expired 与 CREATED-orphan 两类
+        # 候选, 用括号显式分组避免 SQLite 默认运算符优先级把 ``AND``
+        # 错配。
+        where_clause = (
+            "((state = ? AND lease_expires_at IS NOT NULL "
+            "AND lease_expires_at <= ?) "
+            "OR (state = ? AND lease_expires_at IS NULL))"
+        )
         params: tuple[object, ...]
         if run_id is None:
             sql = (
                 f"SELECT {_ATTEMPT_SELECT_COLUMNS} FROM host_attempts "
-                "WHERE state IN (?, ?) AND lease_expires_at IS NOT NULL "
-                "AND lease_expires_at <= ? "
+                f"WHERE {where_clause} "
                 "ORDER BY started_at ASC, attempt_id ASC"
             )
             params = (
                 AttemptState.RUNNING.value,
-                AttemptState.CREATED.value,
                 now.isoformat(),
+                AttemptState.CREATED.value,
             )
         else:
             sql = (
                 f"SELECT {_ATTEMPT_SELECT_COLUMNS} FROM host_attempts "
-                "WHERE run_id = ? AND state IN (?, ?) "
-                "AND lease_expires_at IS NOT NULL "
-                "AND lease_expires_at <= ? "
+                f"WHERE run_id = ? AND {where_clause} "
                 "ORDER BY started_at ASC, attempt_id ASC"
             )
             params = (
                 run_id,
                 AttemptState.RUNNING.value,
-                AttemptState.CREATED.value,
                 now.isoformat(),
+                AttemptState.CREATED.value,
             )
         rows = tx.execute(sql, params).fetchall()
         return tuple(_row_to_attempt_record(row) for row in rows)
@@ -912,144 +882,6 @@ class AttemptLeaseStore:
             return 0
         return int(row["max_idx"]) + 1
 
-    def mark_recovering_and_create_attempt(
-        self,
-        *,
-        tx: HostStorageTransaction,
-        source_attempt_id: str,
-        source_fencing_token: int,
-        run_id: str,
-        recovery_attempt_id: str,
-        recovery_attempt_index: int,
-        owner_id: str,
-        owner_token: AttemptOwnerToken,
-        lease_expires_at: datetime,
-    ) -> AttemptRecoveryDecision:
-        """在事务内 CAS 标记旧 attempt 为 ``RECOVERING`` 并插入新 recovery attempt。
-
-        SQL 顺序:
-
-        1. CAS ``UPDATE host_attempts SET state='recovering',
-           finished_at=?, stale_marked_at=?,
-           failure_summary='lease_expired_recovery_started'
-           WHERE attempt_id=? AND state='running' AND fencing_token=?
-           AND lease_expires_at IS NOT NULL AND lease_expires_at <= now``。
-           ``rowcount == 0`` 即表示当前行已被其他进程推进 (terminal /
-           recovering / 不同 fencing token), 本方法返回
-           ``AttemptRecoveryDecision(action=NOOP_TERMINAL)``, 不创建新 attempt。
-        2. 同事务内通过 :meth:`_allocate_fencing_token` 分配新的全局
-           fencing token, INSERT 新 ``host_attempts`` 行, ``state='running'``、
-           ``recovered_from_attempt_id=source_attempt_id``、owner / lease /
-           fencing token 全部为新分配值。``UNIQUE(run_id, attempt_index)``
-           冲突由调用方在外层 ``BEGIN IMMEDIATE`` 事务回滚, 不在本方法内
-           吞掉。
-
-        本方法不处理 ``CREATED`` 状态的旧 attempt; 如果调用方传入
-        ``CREATED`` 行的 ``source_fencing_token`` (通常为 ``None`` 对应的
-        store-side 缺失), CAS 因 ``state='running'`` 条件不命中, 返回
-        ``NOOP_TERMINAL`` 让上层走 :meth:`mark_stale_or_lost` 收口。
-
-        :param tx: 当前事务; 调用方负责 ``BEGIN IMMEDIATE``。
-        :param source_attempt_id: 旧 attempt id。
-        :param source_fencing_token: 旧 attempt 当前持有的 fencing token
-            (CAS 凭据)。
-        :param run_id: Run id。
-        :param recovery_attempt_id: 新 recovery attempt id。
-        :param recovery_attempt_index: 新 attempt 序号; 必须由
-            :meth:`next_attempt_index` 计算后传入, 与已有行 UNIQUE 冲突时
-            外层事务回滚。
-        :param owner_id: 新 owner 诊断 id。
-        :param owner_token: 新 owner secret token; 明文不入库。
-        :param lease_expires_at: 由调用方计算的新 attempt lease 到期时刻。
-        :returns: typed :class:`AttemptRecoveryDecision`, action 为
-            ``MARK_RECOVERING_AND_CREATE_ATTEMPT`` 或 ``NOOP_TERMINAL``。
-        :raises ValueError: ``lease_expires_at`` 非 timezone-aware 时抛出。
-        :raises sqlite3.DatabaseError: 写入失败时抛出。
-        """
-
-        _require_aware(lease_expires_at, "lease_expires_at")
-        now = self.clock.now()
-        cas_cursor = tx.execute(
-            """
-            UPDATE host_attempts SET state = ?, finished_at = ?,
-                stale_marked_at = ?, failure_summary = ?
-            WHERE attempt_id = ?
-              AND state = ?
-              AND fencing_token = ?
-              AND lease_expires_at IS NOT NULL
-              AND lease_expires_at <= ?
-            """,
-            (
-                AttemptState.RECOVERING.value,
-                now.isoformat(),
-                now.isoformat(),
-                _RECOVERY_REASON_LEASE_EXPIRED,
-                source_attempt_id,
-                AttemptState.RUNNING.value,
-                source_fencing_token,
-                now.isoformat(),
-            ),
-        )
-        if cas_cursor.rowcount != 1:
-            return AttemptRecoveryDecision(
-                action=AttemptRecoveryAction.NOOP_TERMINAL,
-                source_attempt_id=source_attempt_id,
-                recovery_attempt_id=None,
-                recovery_attempt_index=None,
-                reason=_RECOVERY_REASON_CAS_NOOP,
-            )
-        new_token = self._allocate_fencing_token(
-            tx=tx,
-            resource_id=recovery_attempt_id,
-            owner_id=owner_id,
-            now=now,
-        )
-        try:
-            tx.execute(
-                """
-                INSERT INTO host_attempts (
-                    attempt_id, run_id, attempt_index, state, started_at,
-                    finished_at, terminal_event_position, failure_summary,
-                    owner_id, owner_token_hash, fencing_token,
-                    lease_expires_at, lease_renewed_at,
-                    recovered_from_attempt_id, stale_marked_at
-                ) VALUES (?, ?, ?, ?, ?, NULL, NULL, NULL,
-                    ?, ?, ?, ?, ?, ?, NULL)
-                """,
-                (
-                    recovery_attempt_id,
-                    run_id,
-                    recovery_attempt_index,
-                    AttemptState.RUNNING.value,
-                    now.isoformat(),
-                    owner_id,
-                    owner_token.digest(),
-                    new_token.value,
-                    lease_expires_at.isoformat(),
-                    now.isoformat(),
-                    source_attempt_id,
-                ),
-            )
-        except sqlite3.IntegrityError as exc:
-            # ``UNIQUE(run_id, attempt_index)`` 冲突: 必然来自另一进程在
-            # ``next_attempt_index`` 与本 INSERT 之间已经完成同 index 的
-            # 写入。这里抛出 typed :class:`AttemptIndexCollisionError`,
-            # 由外层 ``async with HostStorage.transaction()`` 触发整事务
-            # 回滚, 旧 attempt 的 ``RECOVERING`` CAS 一并回滚, 不保留
-            # "旧 attempt RECOVERING 但无 recovery 行" 的半提交。
-            raise AttemptIndexCollisionError(
-                run_id=run_id,
-                attempt_index=recovery_attempt_index,
-                source_attempt_id=source_attempt_id,
-            ) from exc
-        return AttemptRecoveryDecision(
-            action=AttemptRecoveryAction.MARK_RECOVERING_AND_CREATE_ATTEMPT,
-            source_attempt_id=source_attempt_id,
-            recovery_attempt_id=recovery_attempt_id,
-            recovery_attempt_index=recovery_attempt_index,
-            reason=_RECOVERY_REASON_LEASE_EXPIRED,
-        )
-
     def mark_stale_or_lost(
         self,
         *,
@@ -1061,9 +893,9 @@ class AttemptLeaseStore:
     ) -> AttemptRecoveryDecision:
         """在事务内把旧 attempt 收口到 ``STALE`` / ``LOST`` 诊断态。
 
-        与 :meth:`mark_recovering_and_create_attempt` 不同, 本方法只更新旧
-        attempt, 不创建 recovery attempt; 用于 run 已 terminal、显式 stale
-        诊断、CAS 失败兜底等场景。
+        P8 D2: recovery 仅做诊断收口, 不创建新 attempt; 本方法只更新旧
+        attempt, 用于 lease 过期 LOST、CREATED 孤儿 LOST、run 已 terminal
+        收口、显式 STALE 诊断、CAS 失败兜底等场景。
 
         CAS 条件: ``state IN ('running', 'created') AND fencing_token IS ?``
         (与 ``source_fencing_token`` 严格相等; ``None`` 时匹配 ``CREATED``
@@ -1130,8 +962,6 @@ class AttemptLeaseStore:
             return AttemptRecoveryDecision(
                 action=AttemptRecoveryAction.NOOP_TERMINAL,
                 source_attempt_id=source_attempt_id,
-                recovery_attempt_id=None,
-                recovery_attempt_index=None,
                 reason=_RECOVERY_REASON_CAS_NOOP,
             )
         action = (
@@ -1142,8 +972,6 @@ class AttemptLeaseStore:
         return AttemptRecoveryDecision(
             action=action,
             source_attempt_id=source_attempt_id,
-            recovery_attempt_id=None,
-            recovery_attempt_index=None,
             reason=reason,
         )
 
@@ -1167,6 +995,9 @@ class AttemptLeaseStore:
         :param owner_id: owner 诊断 id。
         :param now: 当前 UTC 时间，用于 ``issued_at``。
         :returns: 新分配的 :class:`FencingToken`。
+        :raises RuntimeError: SQLite ``lastrowid`` 缺失或非正时, 表示
+            ``host_fencing_tokens`` 严格单调递增不变量被破坏, 立即
+            fail-fast。
         :raises sqlite3.DatabaseError: 写入失败时抛出。
         """
 
@@ -1183,7 +1014,14 @@ class AttemptLeaseStore:
                 now.isoformat(),
             ),
         )
-        return FencingToken(value=int(cursor.lastrowid or 0))
+        last_rowid = cursor.lastrowid
+        if last_rowid is None or last_rowid < 1:
+            raise RuntimeError(
+                "host_fencing_tokens INSERT did not yield a positive "
+                f"lastrowid (got {last_rowid!r}); fencing token monotonic "
+                f"invariant violated for resource_id={resource_id!r}"
+            )
+        return FencingToken(value=int(last_rowid))
 
     def _diagnose_fence(
         self,

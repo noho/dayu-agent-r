@@ -130,7 +130,7 @@ Host 当前 Run harness、RunEventStore、ToolRuntime、Conversation Memory / Ru
   `ToolRuntimeToolExecutor -> InMemoryToolRuntime -> huge_echo executor` 产生 truncate / cursor facts、
   截断 ToolMessage 包含 LLM-readable `truncation.next_action="fetch_more"` 与 `fetch_more_args`、模型在同一 run
   内通过 Engine tool loop 发起 framework `fetch_more`、Host ToolRuntime 路由 framework 补读并在 terminal 前追加
-  fetch_more facts、terminal 后 Host public `fetch_more_tool_result` typed failure 不追加 EventLog、
+  fetch_more facts、terminal 后 framework `fetch_more` 工具调用返回 typed failure 不追加 EventLog、
   后续 Run 的 RunInputBuilder 看到 previous run user / final / tool / fetch_more facts 与 source cursor、
   compact retry 不重复 `USER_INPUT_ACCEPTED`，真实 provider smoke 按 `utils/` smoke 既有范式写死
   `mimo-v2.5-pro-plan` `ProviderCase` 且不读取配置层级，并显式锁定
@@ -260,8 +260,10 @@ Host 当前 Run harness、RunEventStore、ToolRuntime、Conversation Memory / Ru
   7 个场景（owner acquire+renew、busy、recovery scan、late write fenced、terminal close、
   observer reconcile、durable memory recovery）通过 fake clock + deterministic fake worker
   覆盖。慢硬盘 + Docker Linux stress 测试由 GitHub issue #38 跟踪，不在当前测试集内。
-- public boundary：锁定 `dayu.host.__all__`，允许 Run 级 `start_run`、`stream_run_events`、`get_run_result`，
-  以及 P2 Run 级 `get_tool_fetch_more_handle`、`fetch_more_tool_result`，阻止 `EngineWorker`、`LocalProxy`、
+- public boundary：锁定 `dayu.host.__all__`，包根仅暴露 fetch_more 协议契约
+  (`ToolFetchMoreRequest` / `ToolFetchMoreHandle` 等)；Run 级 `start_run` / `stream_run_events` /
+  `get_run_result` 与 framework `fetch_more` 路径必须经 `LocalRunHarness` 实例 / 普通 tool call
+  访问，阻止 `EngineWorker`、`LocalProxy`、
   `ToolExecutor`、`InMemoryToolRuntime`、`ToolRuntimeToolExecutor`、`DurableConversationMemoryStore`、
   `DefaultRunInputBuilder`、`RunInputBuildTrace`、`run_agent_messages` 泄漏为包根 API。
 - import boundary：阻止 Host 导入 `dayu.fins`、`dayu.service`、`dayu.ui`。

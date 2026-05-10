@@ -281,11 +281,14 @@ class AttemptFencingError(Exception):
 
 
 class AttemptRecoveryAction(StrEnum):
-    """recovery scan 对单个 attempt 的离散收口动作。"""
+    """recovery scan 对单个 attempt 的离散收口动作。
+
+    P8 D2: recovery 仅做诊断收口, 不再创建新 attempt; 上游 retry / resume
+    必须由 Service 层显式发起新 ``StartRunRequest``。
+    """
 
     NOOP_TERMINAL = "noop_terminal"
     MARK_STALE = "mark_stale"
-    MARK_RECOVERING_AND_CREATE_ATTEMPT = "mark_recovering_and_create_attempt"
     MARK_LOST = "mark_lost"
 
 
@@ -293,19 +296,16 @@ class AttemptRecoveryAction(StrEnum):
 class AttemptRecoveryDecision:
     """recovery scan 对单个 attempt 收口后的 typed 决策。
 
+    P8 D2: recovery 仅做诊断收口, 决策不携带任何"新 attempt"字段。
+
     :param action: 离散动作。
     :param source_attempt_id: 被处理的旧 attempt id。
-    :param recovery_attempt_id: 新建 recovery attempt id；仅在
-        ``MARK_RECOVERING_AND_CREATE_ATTEMPT`` 时非空。
-    :param recovery_attempt_index: 新建 recovery attempt 的 index；仅在
-        ``MARK_RECOVERING_AND_CREATE_ATTEMPT`` 时非空。
-    :param reason: 摘要原因，例如 ``lease_expired_recovery_started``。
+    :param reason: 摘要原因，例如 ``recovery_lease_expired`` /
+        ``recovery_created_orphan`` / ``recovery_run_terminal``。
     """
 
     action: AttemptRecoveryAction
     source_attempt_id: str
-    recovery_attempt_id: str | None
-    recovery_attempt_index: int | None
     reason: str
 
 

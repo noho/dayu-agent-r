@@ -14,6 +14,7 @@
 
 from __future__ import annotations
 
+import json
 from collections.abc import Iterable
 from dataclasses import replace
 from datetime import datetime, timezone
@@ -424,6 +425,28 @@ def test_snapshot_json_encode_decode_roundtrip() -> None:
     text = _encode_snapshot_text(snapshot=snapshot)
     decoded = _decode_snapshot_text(payload_text=text)
     assert decoded == snapshot
+
+
+def test_decode_snapshot_rejects_missing_schema_version() -> None:
+    """payload 缺少 ``schema_version`` 时必须抛 ValueError。
+
+    Snapshot 是 durable read model, 跨版本 / 缺字段时静默放过会污染
+    durable repair 路径。本测试断言 fail-fast。
+    """
+
+    bad_payload = json.dumps({"session_id": "s1"})
+    with pytest.raises(ValueError, match="schema_version"):
+        _decode_snapshot_text(payload_text=bad_payload)
+
+
+def test_decode_snapshot_rejects_unknown_schema_version() -> None:
+    """payload ``schema_version`` 与当前不匹配时必须抛 ValueError。"""
+
+    bad_payload = json.dumps(
+        {"schema_version": 999, "session_id": "s1"}
+    )
+    with pytest.raises(ValueError, match="schema_version"):
+        _decode_snapshot_text(payload_text=bad_payload)
 
 
 def _iter_python_files(roots: Iterable[Path]) -> Iterable[Path]:

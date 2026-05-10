@@ -1,22 +1,24 @@
-"""Host P8-S6 Stale / Orphan Recovery 主路径测试。
+"""Host P8 Stale / Orphan Recovery 诊断收口测试 (P8 D2 后)。
 
-覆盖 :meth:`AttemptSupervisor.recover_stale_attempts` 的全部 typed 决策:
+P8 D2 后 recovery scan 仅做诊断收口, 不再创建 recovery attempt。
+``AttemptSupervisor.recover_stale_attempts`` 的全部 typed 决策:
 
-- ``MARK_RECOVERING_AND_CREATE_ATTEMPT``: ``RUNNING`` 旧 attempt lease 过
-  期, 旧 attempt 被 CAS 推到 ``RECOVERING`` 并写入 ``stale_marked_at`` /
-  ``failure_summary``; 同事务内 INSERT 新 attempt, 新 attempt 持有严格
-  更大的 fencing token、独立 owner secret hash, 并通过
-  ``recovered_from_attempt_id`` 链接回旧 attempt; 旧 owner 之后再试图
-  ``verify_owner`` 必然 fenced。
-- ``MARK_LOST`` (run terminal): run 已 terminal 时旧 attempt 被标记为
-  ``LOST``, 不创建 recovery attempt; ``host_attempts`` 不新增行。
-- ``MARK_LOST`` (orphan ``CREATED``): ``CREATED`` 孤儿行 (无 owner / 无
-  fencing token) 被标记为 ``LOST``, 不创建 recovery attempt。
-- ``NOOP_TERMINAL``: 候选行 fencing token 在 scan 与短事务之间被其它进
-  程改写时, CAS miss 应返回 NOOP, 不创建 recovery attempt, 不覆盖该行。
+- ``MARK_LOST`` (run terminal): run 已 terminal -> 旧 attempt 标记为
+  ``LOST``, reason = ``recovery_run_terminal``;
+- ``MARK_LOST`` (orphan ``CREATED``): ``CREATED`` 孤儿行 (lease 字段为
+  ``NULL`` 或 fencing_token 为 ``None``) -> ``MARK_LOST``, reason =
+  ``recovery_created_orphan``;
+- ``MARK_LOST`` (lease 过期): ``RUNNING`` lease 过期 -> ``MARK_LOST``,
+  reason = ``recovery_lease_expired``;
+- ``NOOP_TERMINAL``: CAS miss (其它进程已推进) -> store 层 typed
+  decision 原样透传, reason = ``cas_failed_noop``。
 
-附加断言: recovery scan 不修改 ``host_projection_checkpoints``, 不写
-EventLog 诊断 RunEvent (``list_events`` 仍为空)。
+附加断言:
+
+- recovery scan **不**修改 ``host_projection_checkpoints``;
+- recovery scan **不**写 EventLog 诊断 RunEvent;
+- recovery scan **不**新增 ``host_attempts`` 行 (无 recovery attempt);
+- 二次 scan 幂等: 旧 attempt 已 LOST, 二次扫描候选集为空。
 
 测试一律使用真实 ``AttemptSupervisor`` + 真实 storage + ``_FakeClock``,
 不 mock fencing 路径。
@@ -32,7 +34,6 @@ import pytest
 from dayu.host._attempt_lease import (
     AttemptFencingError,
     AttemptLeaseConfig,
-    AttemptOwnerToken,
     AttemptRecoveryAction,
 )
 from dayu.host._attempt_supervisor import AttemptSupervisor
@@ -44,7 +45,6 @@ from dayu.host._host_storage_transaction import HostStorage
 from dayu.host._internal_contracts import AttemptState, ExtendedRunState
 from dayu.host._projection_store import ProjectionStore
 from dayu.host._run_state_store import (
-    AttemptIndexCollisionError,
     AttemptLeaseStore,
 )
 
@@ -162,65 +162,72 @@ async def _events_for(
     return len(events)
 
 
+async def _attempt_count(
+    storage: HostStorage, *, run_id: str
+) -> int:
+    """统计 ``host_attempts`` 当前行数。
+
+    :param storage: 共享 storage。
+    :param run_id: Run id。
+    :returns: 行数。
+    :raises sqlite3.DatabaseError: 读取失败透传。
+    """
+
+    async with storage.transaction() as tx:
+        row = tx.execute(
+            "SELECT COUNT(*) AS n FROM host_attempts WHERE run_id = ?",
+            (run_id,),
+        ).fetchone()
+    return int(row["n"])
+
+
 @pytest.mark.asyncio
-async def test_recover_stale_running_attempt_creates_recovery_attempt() -> None:
-    """``RUNNING`` lease 过期 -> ``MARK_RECOVERING_AND_CREATE_ATTEMPT``。"""
+async def test_recover_running_lease_expired_marks_lost_no_new_attempt() -> None:
+    """``RUNNING`` lease 过期 -> ``MARK_LOST`` + ``recovery_lease_expired``。
+
+    P8 D2: recovery 不再创建 recovery attempt; 旧 attempt 直接 LOST,
+    ``host_attempts`` 不新增行。
+    """
 
     storage = _open_storage()
     try:
         await _seed_run(storage, run_id=_RUN_ID)
         clock = _FakeClock()
         supervisor = _build_supervisor(storage=storage, clock=clock)
-        # 进入 lease_context, acquire owner; 退出 ctx 不会自动收口 attempt,
-        # 旧行仍处于 RUNNING 状态, 但 lease 在 clock.advance 后过期。
         async with supervisor.lease_context(
             run_id=_RUN_ID, attempt_index=0
         ) as old_owner:
             old_attempt_id = old_owner.attempt_id
             old_token = old_owner.fencing_token.value
-        # 强制清空 supervisor sessions, 模拟进程崩溃后旧 owner 不可达。
-        # 推进时钟超过 lease TTL 让旧行 lease_expires_at <= now。
         clock.advance(timedelta(seconds=120))
 
         decisions = await supervisor.recover_stale_attempts(run_id=_RUN_ID)
         assert len(decisions) == 1
         decision = decisions[0]
-        assert (
-            decision.action
-            is AttemptRecoveryAction.MARK_RECOVERING_AND_CREATE_ATTEMPT
-        )
+        assert decision.action is AttemptRecoveryAction.MARK_LOST
         assert decision.source_attempt_id == old_attempt_id
-        assert decision.recovery_attempt_id is not None
-        assert decision.recovery_attempt_index == 1
+        assert decision.reason == "recovery_lease_expired"
 
-        # 验证旧 attempt 已被 CAS 推到 RECOVERING; 新 attempt RUNNING +
-        # recovered_from_attempt_id 链接 + 严格更大 fencing token。
-        # 通过 SQL 直接验证事实, 避免依赖未公开 helper。
+        # 关键断言: scan 后 host_attempts 不出现新行 (无 recovery attempt)。
+        assert await _attempt_count(storage, run_id=_RUN_ID) == 1
+
+        # 旧 attempt state == LOST; fencing_token 不被改写 (CAS 用 token 匹配)。
         async with storage.transaction() as tx:
-            rows = tx.execute(
-                "SELECT attempt_id, attempt_index, state, fencing_token, "
-                "recovered_from_attempt_id, stale_marked_at, "
-                "failure_summary FROM host_attempts WHERE run_id = ? "
-                "ORDER BY attempt_index ASC",
-                (_RUN_ID,),
-            ).fetchall()
-        assert len(rows) == 2
-        old_row, new_row = rows[0], rows[1]
-        assert old_row["attempt_id"] == old_attempt_id
-        assert old_row["state"] == AttemptState.RECOVERING.value
-        assert old_row["stale_marked_at"] is not None
-        assert old_row["failure_summary"] == "lease_expired_recovery_started"
-        assert new_row["attempt_id"] == decision.recovery_attempt_id
-        assert new_row["state"] == AttemptState.RUNNING.value
-        assert new_row["recovered_from_attempt_id"] == old_attempt_id
-        assert int(new_row["fencing_token"]) > old_token
+            row = tx.execute(
+                "SELECT state, fencing_token, failure_summary "
+                "FROM host_attempts WHERE attempt_id = ?",
+                (old_attempt_id,),
+            ).fetchone()
+        assert row["state"] == AttemptState.LOST.value
+        assert int(row["fencing_token"]) == old_token
+        assert row["failure_summary"] == "recovery_lease_expired"
 
         # recovery scan 不写诊断 RunEvent。
         assert await _events_for(
             supervisor.event_store, run_id=_RUN_ID
         ) == 0
 
-        # 旧 owner 再次 verify 必然 fenced (state 不再 running)。
+        # 旧 owner 再次 verify 必然 fenced。
         with pytest.raises(AttemptFencingError):
             async with storage.transaction() as tx:
                 supervisor.lease_store.verify_owner(
@@ -232,7 +239,7 @@ async def test_recover_stale_running_attempt_creates_recovery_attempt() -> None:
 
 @pytest.mark.asyncio
 async def test_recover_skips_when_run_is_terminal() -> None:
-    """run 已 terminal -> ``MARK_LOST``, 不创建 recovery attempt。"""
+    """run 已 terminal -> ``MARK_LOST`` + ``recovery_run_terminal``。"""
 
     storage = _open_storage()
     try:
@@ -244,7 +251,6 @@ async def test_recover_skips_when_run_is_terminal() -> None:
         ) as old_owner:
             old_attempt_id = old_owner.attempt_id
 
-        # 把 run 推到 terminal (例如 SUCCEEDED) 后再 scan。
         async with storage.transaction() as tx:
             tx.execute(
                 "UPDATE host_runs SET state = ? WHERE run_id = ?",
@@ -256,32 +262,32 @@ async def test_recover_skips_when_run_is_terminal() -> None:
         assert len(decisions) == 1
         assert decisions[0].action is AttemptRecoveryAction.MARK_LOST
         assert decisions[0].source_attempt_id == old_attempt_id
-        assert decisions[0].recovery_attempt_id is None
+        assert decisions[0].reason == "recovery_run_terminal"
 
+        # 仍只有旧 attempt, 无 recovery attempt 行。
+        assert await _attempt_count(storage, run_id=_RUN_ID) == 1
         async with storage.transaction() as tx:
-            rows = tx.execute(
-                "SELECT state FROM host_attempts WHERE run_id = ? "
-                "ORDER BY attempt_index ASC",
+            row = tx.execute(
+                "SELECT state FROM host_attempts WHERE run_id = ?",
                 (_RUN_ID,),
-            ).fetchall()
-        # 仅旧 attempt, 无 recovery attempt 行。
-        assert len(rows) == 1
-        assert rows[0]["state"] == AttemptState.LOST.value
+            ).fetchone()
+        assert row["state"] == AttemptState.LOST.value
     finally:
         storage.close()
 
 
 @pytest.mark.asyncio
 async def test_recover_marks_orphan_created_attempt_lost() -> None:
-    """``CREATED`` 孤儿行 -> ``MARK_LOST``, 不创建 recovery attempt。"""
+    """``CREATED`` 孤儿行 -> ``MARK_LOST`` + ``recovery_created_orphan``。
+
+    S6: ``state='created' AND lease_expires_at IS NULL`` 也必须进入候选集。
+    """
 
     storage = _open_storage()
     try:
         await _seed_run(storage, run_id=_RUN_ID)
         clock = _FakeClock()
-        # 直接构造一个 CREATED 行: 无 owner / 无 fencing token, 但带过期
-        # lease_expires_at 让它进入 candidate scan 集合。
-        expired = (clock.now() - timedelta(seconds=10)).isoformat()
+        # CREATED 孤儿行: owner / fencing_token / lease 字段全为 NULL。
         started = clock.now().isoformat()
         async with storage.transaction() as tx:
             tx.execute(
@@ -293,7 +299,7 @@ async def test_recover_marks_orphan_created_attempt_lost() -> None:
                     lease_expires_at, lease_renewed_at,
                     recovered_from_attempt_id, stale_marked_at
                 ) VALUES (?, ?, ?, ?, ?, NULL, NULL, NULL,
-                    NULL, NULL, NULL, ?, NULL, NULL, NULL)
+                    NULL, NULL, NULL, NULL, NULL, NULL, NULL)
                 """,
                 (
                     "attempt-orphan",
@@ -301,7 +307,6 @@ async def test_recover_marks_orphan_created_attempt_lost() -> None:
                     0,
                     AttemptState.CREATED.value,
                     started,
-                    expired,
                 ),
             )
         supervisor = _build_supervisor(storage=storage, clock=clock)
@@ -310,31 +315,22 @@ async def test_recover_marks_orphan_created_attempt_lost() -> None:
         assert len(decisions) == 1
         assert decisions[0].action is AttemptRecoveryAction.MARK_LOST
         assert decisions[0].source_attempt_id == "attempt-orphan"
-        assert decisions[0].recovery_attempt_id is None
+        assert decisions[0].reason == "recovery_created_orphan"
 
+        assert await _attempt_count(storage, run_id=_RUN_ID) == 1
         async with storage.transaction() as tx:
-            rows = tx.execute(
+            row = tx.execute(
                 "SELECT attempt_id, state FROM host_attempts WHERE run_id = ?",
                 (_RUN_ID,),
-            ).fetchall()
-        assert len(rows) == 1
-        assert rows[0]["state"] == AttemptState.LOST.value
+            ).fetchone()
+        assert row["state"] == AttemptState.LOST.value
     finally:
         storage.close()
 
 
 @pytest.mark.asyncio
-async def test_recover_returns_noop_when_cas_misses() -> None:
-    """fencing token 在 scan 与短事务之间改写 -> ``NOOP_TERMINAL``。
-
-    通过直接调用 store 层 CAS 入口模拟该 race: scan 拿到的候选携带 token
-    ``T``, 在本进程进入 recovery 短事务之前另一个进程已把该行 fencing_token
-    替换为 ``T'``, 因此 CAS ``state='running' AND fencing_token=T`` rowcount
-    为 0, store 返回 ``NOOP_TERMINAL`` (``cas_failed_noop`` reason)。
-
-    F1 review fix 断言: supervisor 必须保留 store 返回的 reason
-    ``cas_failed_noop``, 不允许被覆盖为 supervisor 自建的常量。
-    """
+async def test_recover_idempotent_second_scan_finds_no_candidates() -> None:
+    """recovery scan 幂等: 旧 attempt 已 LOST 后, 二次扫描候选集为空。"""
 
     storage = _open_storage()
     try:
@@ -343,70 +339,35 @@ async def test_recover_returns_noop_when_cas_misses() -> None:
         supervisor = _build_supervisor(storage=storage, clock=clock)
         async with supervisor.lease_context(
             run_id=_RUN_ID, attempt_index=0
-        ) as old_owner:
-            old_attempt_id = old_owner.attempt_id
-            stale_token = old_owner.fencing_token.value
+        ):
+            pass
         clock.advance(timedelta(seconds=120))
 
-        # 模拟另一个进程在 scan 之后, 本进程 CAS 之前覆盖了 fencing_token,
-        # 让 mark_recovering CAS rowcount=0 命中 NOOP_TERMINAL 分支。
-        async with storage.transaction() as tx:
-            tx.execute(
-                "UPDATE host_attempts SET fencing_token = ? "
-                "WHERE attempt_id = ?",
-                (stale_token + 999, old_attempt_id),
-            )
+        first = await supervisor.recover_stale_attempts(run_id=_RUN_ID)
+        assert len(first) == 1
+        assert first[0].action is AttemptRecoveryAction.MARK_LOST
 
-        # 直接调用 store CAS 入口, 用 scan 时已记录的 stale token 作为
-        # source_fencing_token; 这等价于 supervisor 在拿到候选后被另一个
-        # 进程抢先覆写。
-        async with storage.transaction() as tx:
-            decision = (
-                supervisor.lease_store.mark_recovering_and_create_attempt(
-                    tx=tx,
-                    source_attempt_id=old_attempt_id,
-                    source_fencing_token=stale_token,
-                    run_id=_RUN_ID,
-                    recovery_attempt_id="attempt-recovery-mismatch",
-                    recovery_attempt_index=1,
-                    owner_id="host-recovery-test",
-                    owner_token=AttemptOwnerToken.new(),
-                    lease_expires_at=clock.now() + timedelta(seconds=30),
-                )
-            )
-        assert decision.action is AttemptRecoveryAction.NOOP_TERMINAL
-        assert decision.source_attempt_id == old_attempt_id
-        assert decision.recovery_attempt_id is None
-        # F1: store 返回的 reason 必须是 ``cas_failed_noop`` 而不是被
-        # supervisor 替换为 ``attempt_already_terminal``。
-        assert decision.reason == "cas_failed_noop"
-        # CAS miss: 没有创建 recovery 行, 旧行也未被改 state。
-        async with storage.transaction() as tx:
-            rows = tx.execute(
-                "SELECT attempt_id, state FROM host_attempts WHERE run_id = ?",
-                (_RUN_ID,),
-            ).fetchall()
-        assert len(rows) == 1
-        assert rows[0]["state"] == AttemptState.RUNNING.value
+        # 二次扫描不应再返回候选, 也不应再次推进任何状态。
+        second = await supervisor.recover_stale_attempts(run_id=_RUN_ID)
+        assert second == ()
+        assert await _attempt_count(storage, run_id=_RUN_ID) == 1
+        assert await _events_for(
+            supervisor.event_store, run_id=_RUN_ID
+        ) == 0
     finally:
         storage.close()
 
 
 @pytest.mark.asyncio
-async def test_supervisor_preserves_store_reason_on_cas_noop(
+async def test_recover_returns_noop_when_cas_misses(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """F1: ``recover_stale_attempts`` 必须透传 store 层返回的 reason。
+    """fencing token 在 scan 与 CAS 之间被改写 -> ``NOOP_TERMINAL``。
 
-    构造 fencing token race 让 ``mark_recovering_and_create_attempt`` 返回
-    ``NOOP_TERMINAL(reason="cas_failed_noop")``, 之后 supervisor
-    ``recover_stale_attempts`` 必须把该 reason 原样带回, 不允许把它静默
-    替换为 supervisor 自建的 ``attempt_already_terminal``; 同时也不允许
-    替换为本 slice 新增的 ``unique_index_collision``。
-
-    用 monkeypatch 改写 ``list_recovery_candidates`` 行为以模拟"scan 时
-    候选携带 stale fencing token, 短事务内 CAS rowcount=0"的真实并发
-    race; 这是 store 层 typed decision 真正会被触发的路径。
+    通过 monkeypatch ``list_recovery_candidates`` 模拟"scan 拿到 stale
+    fencing token, 进入短事务前另一进程已抢先覆写 fencing_token"的
+    并发 race; supervisor 必须把 store 层 ``NOOP_TERMINAL(reason=
+    cas_failed_noop)`` 决策原样带回, 不允许覆写 reason。
     """
 
     storage = _open_storage()
@@ -421,16 +382,12 @@ async def test_supervisor_preserves_store_reason_on_cas_noop(
             stale_token = old_owner.fencing_token.value
         clock.advance(timedelta(seconds=120))
 
-        # 让 scan 看到的候选携带 stale_token; 然后在它真正进入短事务 CAS
-        # 之前, 由"另一个进程"改写 fencing_token 让 CAS rowcount=0。
         original_list = AttemptLeaseStore.list_recovery_candidates
 
         def _patched_list(  # type: ignore[no-untyped-def]
             self, *, tx, run_id, now
         ):
             candidates = original_list(self, tx=tx, run_id=run_id, now=now)
-            # scan 后立刻覆写 fencing_token, 模拟其它进程抢先一步; 候选
-            # 元组里仍然持有 stale_token, supervisor 后续 CAS 必然 miss。
             tx.execute(
                 "UPDATE host_attempts SET fencing_token = ? "
                 "WHERE attempt_id = ?",
@@ -447,182 +404,16 @@ async def test_supervisor_preserves_store_reason_on_cas_noop(
         decision = decisions[0]
         assert decision.action is AttemptRecoveryAction.NOOP_TERMINAL
         assert decision.source_attempt_id == old_attempt_id
-        assert decision.recovery_attempt_id is None
-        # F1 核心断言: store reason 必须被原样带回, 不能被 supervisor 覆盖。
         assert decision.reason == "cas_failed_noop"
-    finally:
-        storage.close()
 
-
-@pytest.mark.asyncio
-async def test_mark_recovering_unique_index_collision_rolls_back_atomically() -> (
-    None
-):
-    """F2 store 层断言: ``UNIQUE(run_id, attempt_index)`` 冲突应抛 typed 异常。
-
-    预置一个已经占用 ``attempt_index=1`` 的 attempt 行, 然后调用
-    ``mark_recovering_and_create_attempt`` 让它去插入 ``attempt_index=1``
-    的新 recovery attempt, 必须抛 :class:`AttemptIndexCollisionError`,
-    而不是裸 ``sqlite3.IntegrityError``; 旧 attempt 的 ``RECOVERING`` CAS
-    必须随外层事务回滚, 旧行仍处于 ``RUNNING``, 不留半状态。
-    """
-
-    storage = _open_storage()
-    try:
-        await _seed_run(storage, run_id=_RUN_ID)
-        clock = _FakeClock()
-        supervisor = _build_supervisor(storage=storage, clock=clock)
-        # 先 acquire 旧 attempt (attempt_index=0) 让它处于 RUNNING。
-        async with supervisor.lease_context(
-            run_id=_RUN_ID, attempt_index=0
-        ) as old_owner:
-            old_attempt_id = old_owner.attempt_id
-            stale_token = old_owner.fencing_token.value
-        # 预置一个 attempt_index=1 的"占位"行, 模拟另一进程已经成功完成
-        # recovery 的场景。
+        # CAS miss: 旧行 state 仍 RUNNING, 没有新 attempt 行。
+        assert await _attempt_count(storage, run_id=_RUN_ID) == 1
         async with storage.transaction() as tx:
-            now_iso = clock.now().isoformat()
-            tx.execute(
-                """
-                INSERT INTO host_attempts (
-                    attempt_id, run_id, attempt_index, state, started_at,
-                    finished_at, terminal_event_position, failure_summary,
-                    owner_id, owner_token_hash, fencing_token,
-                    lease_expires_at, lease_renewed_at,
-                    recovered_from_attempt_id, stale_marked_at
-                ) VALUES (?, ?, ?, ?, ?, NULL, NULL, NULL,
-                    NULL, NULL, NULL, NULL, NULL, NULL, NULL)
-                """,
-                (
-                    "attempt-other-recovery",
-                    _RUN_ID,
-                    1,
-                    AttemptState.RUNNING.value,
-                    now_iso,
-                ),
-            )
-        clock.advance(timedelta(seconds=120))
-
-        # 直接驱动 store 层接口: 让 lease 过期的旧 attempt 试图把新
-        # recovery attempt 也写到 attempt_index=1, 必须抛 typed 冲突。
-        with pytest.raises(AttemptIndexCollisionError) as excinfo:
-            async with storage.transaction() as tx:
-                supervisor.lease_store.mark_recovering_and_create_attempt(
-                    tx=tx,
-                    source_attempt_id=old_attempt_id,
-                    source_fencing_token=stale_token,
-                    run_id=_RUN_ID,
-                    recovery_attempt_id="attempt-recovery-collision",
-                    recovery_attempt_index=1,
-                    owner_id="host-recovery-test",
-                    owner_token=AttemptOwnerToken.new(),
-                    lease_expires_at=clock.now() + timedelta(seconds=30),
-                )
-        assert excinfo.value.run_id == _RUN_ID
-        assert excinfo.value.attempt_index == 1
-        assert excinfo.value.source_attempt_id == old_attempt_id
-
-        # 关键断言: 整事务已被回滚, 旧 attempt 仍 RUNNING, 没有进入
-        # RECOVERING 半状态; ``attempt_index=1`` 占位行未被改写; 也没有
-        # 多余的 recovery attempt 行被落库。
-        async with storage.transaction() as tx:
-            rows = tx.execute(
-                "SELECT attempt_id, attempt_index, state FROM host_attempts "
-                "WHERE run_id = ? ORDER BY attempt_index ASC",
-                (_RUN_ID,),
-            ).fetchall()
-        assert len(rows) == 2
-        assert rows[0]["attempt_id"] == old_attempt_id
-        assert rows[0]["state"] == AttemptState.RUNNING.value
-        assert rows[1]["attempt_id"] == "attempt-other-recovery"
-        assert rows[1]["state"] == AttemptState.RUNNING.value
-    finally:
-        storage.close()
-
-
-@pytest.mark.asyncio
-async def test_supervisor_unique_index_collision_returns_typed_noop(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    """F2 supervisor 层断言: 冲突收口为 typed ``NOOP_TERMINAL``, 不抛裸异常。
-
-    通过 monkeypatch ``next_attempt_index`` 强制返回已被占用的 index,
-    模拟两个并发进程在独立短事务中算出相同 ``attempt_index`` 的真实并发
-    race; supervisor 必须在事务外捕获 :class:`AttemptIndexCollisionError`,
-    返回 ``AttemptRecoveryDecision(action=NOOP_TERMINAL,
-    reason="unique_index_collision")``, 旧 attempt 不被改成 RECOVERING。
-    """
-
-    storage = _open_storage()
-    try:
-        await _seed_run(storage, run_id=_RUN_ID)
-        clock = _FakeClock()
-        supervisor = _build_supervisor(storage=storage, clock=clock)
-        async with supervisor.lease_context(
-            run_id=_RUN_ID, attempt_index=0
-        ) as old_owner:
-            old_attempt_id = old_owner.attempt_id
-
-        # 预置 attempt_index=1 占位行, 模拟其它进程已经 race 成功。
-        async with storage.transaction() as tx:
-            now_iso = clock.now().isoformat()
-            tx.execute(
-                """
-                INSERT INTO host_attempts (
-                    attempt_id, run_id, attempt_index, state, started_at,
-                    finished_at, terminal_event_position, failure_summary,
-                    owner_id, owner_token_hash, fencing_token,
-                    lease_expires_at, lease_renewed_at,
-                    recovered_from_attempt_id, stale_marked_at
-                ) VALUES (?, ?, ?, ?, ?, NULL, NULL, NULL,
-                    NULL, NULL, NULL, NULL, NULL, NULL, NULL)
-                """,
-                (
-                    "attempt-winner",
-                    _RUN_ID,
-                    1,
-                    AttemptState.SUCCEEDED.value,
-                    now_iso,
-                ),
-            )
-        clock.advance(timedelta(seconds=120))
-
-        # monkeypatch next_attempt_index: 在并发场景中, 本进程读到的
-        # MAX(attempt_index) 可能在 race 中过期; 这里强制让 supervisor
-        # 试图占用与"其它进程"相同的 attempt_index=1, 必然 UNIQUE 冲突。
-        def _force_collision_index(  # type: ignore[no-untyped-def]
-            *_args, **_kwargs
-        ) -> int:
-            return 1
-
-        monkeypatch.setattr(
-            AttemptLeaseStore,
-            "next_attempt_index",
-            _force_collision_index,
-        )
-
-        decisions = await supervisor.recover_stale_attempts(run_id=_RUN_ID)
-        assert len(decisions) == 1
-        decision = decisions[0]
-        assert decision.action is AttemptRecoveryAction.NOOP_TERMINAL
-        assert decision.source_attempt_id == old_attempt_id
-        assert decision.recovery_attempt_id is None
-        assert decision.recovery_attempt_index is None
-        assert decision.reason == "unique_index_collision"
-
-        # 原子性核心断言: 旧 attempt 没有被改成 RECOVERING; 占位行未被
-        # 触碰; 没有任何残留 recovery 行。
-        async with storage.transaction() as tx:
-            rows = tx.execute(
-                "SELECT attempt_id, attempt_index, state FROM host_attempts "
-                "WHERE run_id = ? ORDER BY attempt_index ASC",
-                (_RUN_ID,),
-            ).fetchall()
-        assert len(rows) == 2
-        assert rows[0]["attempt_id"] == old_attempt_id
-        assert rows[0]["state"] == AttemptState.RUNNING.value
-        assert rows[1]["attempt_id"] == "attempt-winner"
-        assert rows[1]["state"] == AttemptState.SUCCEEDED.value
+            row = tx.execute(
+                "SELECT state FROM host_attempts WHERE attempt_id = ?",
+                (old_attempt_id,),
+            ).fetchone()
+        assert row["state"] == AttemptState.RUNNING.value
     finally:
         storage.close()
 
@@ -637,7 +428,6 @@ async def test_recover_does_not_advance_projection_checkpoint() -> None:
         clock = _FakeClock()
         supervisor = _build_supervisor(storage=storage, clock=clock)
         projections = ProjectionStore(storage=storage)
-        # ensure 一个 checkpoint 行作为 baseline。
         async with storage.transaction() as tx:
             projections.ensure(
                 tx=tx,

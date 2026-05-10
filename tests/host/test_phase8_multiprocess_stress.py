@@ -12,9 +12,9 @@
    terminal。
 3. **跨进程 stale recovery**: 进程 A 拿到 lease 后退出 (不收口);
    测试主进程把 ``lease_expires_at`` 改成过去时刻; 进程 B 调
-   ``recover_stale_attempts`` 落地 typed
-   ``MARK_RECOVERING_AND_CREATE_ATTEMPT``; 旧 owner late append 必然
-   ``AttemptFencingError``; 不写诊断 RunEvent。
+   ``recover_stale_attempts`` 落地 typed ``MARK_LOST`` (P8 D2 诊断收口);
+   旧 attempt 状态变为 ``LOST``, 不创建 recovery attempt; 旧 owner late
+   append 必然 ``AttemptFencingError``; 不写诊断 RunEvent。
 4. **Observer drain / startup_reconcile**: 进程 A 写入 terminal facts
    但 **不** drain; 进程 B ``build_durable_harness`` +
    ``coordinator.startup_reconcile`` 把 memory / timeline / audit
@@ -683,10 +683,6 @@ def _worker_recover(
                     {
                         "action": decision.action.value,
                         "source_attempt_id": decision.source_attempt_id,
-                        "recovery_attempt_id": decision.recovery_attempt_id,
-                        "recovery_attempt_index": (
-                            decision.recovery_attempt_index
-                        ),
                         "reason": decision.reason,
                     }
                     for decision in decisions
@@ -777,16 +773,10 @@ def test_cross_process_stale_recovery_preserves_typed_decision(
     assert isinstance(decisions, list)
     assert len(decisions) == 1
     decision = decisions[0]
-    assert (
-        decision["action"]
-        == "mark_recovering_and_create_attempt"
-    )
+    # P8 D2: recovery 仅做诊断收口, 旧 attempt 直接 LOST, 不创建 recovery。
+    assert decision["action"] == "mark_lost"
     assert decision["source_attempt_id"] == old_attempt_id
-    new_attempt_id = decision["recovery_attempt_id"]
-    new_attempt_index = decision["recovery_attempt_index"]
-    assert isinstance(new_attempt_id, str)
-    assert new_attempt_index == old_attempt_index + 1
-    assert decision["reason"] == "lease_expired_recovery_started"
+    assert decision["reason"] == "recovery_lease_expired"
 
     storage = HostStorage(database_path=database_path)
     try:
@@ -796,14 +786,12 @@ def test_cross_process_stale_recovery_preserves_typed_decision(
             "ORDER BY attempt_index ASC",
             (_RUN_ID,),
         )
-        assert len(rows) == 2
-        old_row, new_row = rows[0], rows[1]
+        # 多进程 race 后只有旧 attempt 一行, 状态为 LOST; 没有新 RUNNING 行。
+        assert len(rows) == 1
+        old_row = rows[0]
         assert old_row["attempt_id"] == old_attempt_id
-        assert old_row["state"] == AttemptState.RECOVERING.value
-        assert new_row["attempt_id"] == new_attempt_id
-        assert new_row["state"] == AttemptState.RUNNING.value
-        assert new_row["recovered_from_attempt_id"] == old_attempt_id
-        assert int(new_row["fencing_token"]) > old_fencing_token
+        assert old_row["state"] == AttemptState.LOST.value
+        assert int(old_row["fencing_token"]) == old_fencing_token
 
         # recovery scan 不写 EventLog 诊断 RunEvent。
         event_rows = storage.execute_read(

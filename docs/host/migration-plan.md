@@ -1,5 +1,14 @@
 # Host 迁移总控计划
 
+> **P8 D2 修订**: 本文件中关于 P8 stale / orphan recovery 的描述
+> (`MARK_RECOVERING_AND_CREATE_ATTEMPT`, "新 recovery attempt", "新 fencing token
+> 严格更大", `recovered_from_attempt_id` 自动写入, 等) 在 P8 D2
+> (`docs/host/phase8-cleanup-plan.md` D2) 后被废弃。当前 recovery scan 仅做诊断
+> 收口: 把候选 attempt CAS 推到 `LOST` 或返回 `NOOP_TERMINAL`, 不创建新 attempt,
+> 不写 `recovered_from_attempt_id`; 重试 / resume 由 Service 层显式发起新
+> `StartRunRequest`。真源参见 `dayu/host/README.md` recovery 段与
+> `docs/host/design.md` §8.2/§8.3。
+
 ## 1. 计划状态
 
 本文档是 Host 迁移总控计划草稿，用于指导总控 Agent 分阶段派 Agent 编写 / 修复 phase plan，

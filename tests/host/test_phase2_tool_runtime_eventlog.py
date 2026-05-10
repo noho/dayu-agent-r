@@ -8,13 +8,21 @@ from typing import cast
 
 import pytest
 
-from dayu.contracts import JsonValue, ToolTruncateSpec
+from dayu.contracts import (
+    FRAMEWORK_FETCH_MORE_TOOL_NAME,
+    JsonValue,
+    ToolTruncateSpec,
+)
 from dayu.contracts.tool_call import (
     ToolCallRequest,
     ToolExecutionContext,
     ToolExecutionRequest,
 )
-from dayu.contracts.tool_outcome import ToolCompletedOutcome, ToolExecutionOutcome
+from dayu.contracts.tool_outcome import (
+    ToolCompletedOutcome,
+    ToolExecutionOutcome,
+    ToolFailedOutcome,
+)
 from dayu.contracts.tool_result import ToolResultSuccess
 from dayu.engine import FinalAnswerData, FinishReason
 from dayu.host import (
@@ -23,11 +31,7 @@ from dayu.host import (
     RunEventType,
     ToolFetchMoreCompletedData,
     ToolFetchMoreFailedData,
-    ToolFetchMoreHandleRequest,
-    ToolFetchMoreHandleSucceededResult,
-    ToolFetchMoreRequest,
     ToolFetchMoreRequestedData,
-    ToolFetchMoreSucceededResult,
     ToolResultTruncatedData,
 )
 from dayu.host.contracts import RunEventDraft
@@ -115,26 +119,84 @@ def _spec() -> ToolTruncateSpec:
     )
 
 
-def _request() -> ToolExecutionRequest:
+def _request(
+    *,
+    run_id: str = "run_1",
+    session_id: str = "session_1",
+    tool_call_id: str = "tc_1",
+    tool_name: str = "demo",
+) -> ToolExecutionRequest:
     """构造工具执行请求。
 
+    :param run_id: Run id。
+    :param session_id: 会话 id。
+    :param tool_call_id: 工具调用 id。
+    :param tool_name: 工具名。
     :returns: ToolExecutionRequest。
     :raises Exception: 不主动抛出异常。
     """
 
     return ToolExecutionRequest(
         call=ToolCallRequest(
-            tool_call_id="tc_1",
-            name="demo",
+            tool_call_id=tool_call_id,
+            name=tool_name,
             arguments={},
             index_in_iteration=0,
             provider_state=None,
         ),
         context=ToolExecutionContext(
-            run_id="run_1",
-            session_id="session_1",
+            run_id=run_id,
+            session_id=session_id,
             iteration_id="iter_1",
-            tool_call_id="tc_1",
+            tool_call_id=tool_call_id,
+            index_in_iteration=0,
+            timeout_seconds=None,
+            cancellation_token=_Token(),
+            correlation_id=None,
+        ),
+    )
+
+
+def _framework_request(
+    *,
+    cursor_value: str,
+    scope_token: str,
+    run_id: str = "run_1",
+    session_id: str = "session_1",
+    tool_call_id: str = "fetch_call_1",
+    limit: int | None = None,
+) -> ToolExecutionRequest:
+    """构造 framework ``fetch_more`` 工具执行请求。
+
+    :param cursor_value: cursor 原文。
+    :param scope_token: scope token 明文。
+    :param run_id: Run id。
+    :param session_id: 会话 id。
+    :param tool_call_id: framework tool call id。
+    :param limit: 可选 limit。
+    :returns: ToolExecutionRequest。
+    :raises Exception: 不主动抛出异常。
+    """
+
+    arguments: dict[str, JsonValue] = {
+        "cursor": cursor_value,
+        "scope_token": scope_token,
+    }
+    if limit is not None:
+        arguments["limit"] = limit
+    return ToolExecutionRequest(
+        call=ToolCallRequest(
+            tool_call_id=tool_call_id,
+            name=FRAMEWORK_FETCH_MORE_TOOL_NAME,
+            arguments=arguments,
+            index_in_iteration=0,
+            provider_state=None,
+        ),
+        context=ToolExecutionContext(
+            run_id=run_id,
+            session_id=session_id,
+            iteration_id="iter_1",
+            tool_call_id=tool_call_id,
             index_in_iteration=0,
             timeout_seconds=None,
             cancellation_token=_Token(),
@@ -186,36 +248,25 @@ async def test_eventlog_contains_neutral_truncation_facts_without_token() -> Non
 
 @pytest.mark.asyncio
 async def test_fetch_more_event_order_and_return_event_cursor() -> None:
-    """fetch_more 返回前按 requested -> completed 顺序写入事实。"""
+    """framework ``fetch_more`` 按 requested -> completed 顺序写入事实。"""
 
     runtime, store = _runtime()
-    await runtime.execute_tool_call(_request())
+    outcome = await runtime.execute_tool_call(_request())
+    assert isinstance(outcome, ToolCompletedOutcome)
+    truncation = outcome.result.truncation
+    assert truncation is not None
     first_event = (await store.list_events("run_1", after=None))[0]
     truncated = cast(ToolResultTruncatedData, first_event.data)
-    handle = await runtime.get_tool_fetch_more_handle(
-        ToolFetchMoreHandleRequest(
-            iteration_id="iter_1",
-            session_id="session_1",
-            run_id="run_1",
-            tool_call_id="tc_1",
-            cursor_fingerprint=truncated.cursor_fingerprint,
-        )
-    )
-    assert isinstance(handle, ToolFetchMoreHandleSucceededResult)
 
-    result = await runtime.fetch_more(
-        ToolFetchMoreRequest(
-            iteration_id="iter_1",
-            session_id="session_1",
-            run_id="run_1",
-            tool_call_id="tc_1",
-            cursor=handle.handle.cursor,
-            scope_token=handle.handle.scope_token,
+    fetch_outcome = await runtime.execute_tool_call(
+        _framework_request(
+            cursor_value=truncation.cursor,
+            scope_token=truncation.scope_token,
             limit=1,
         )
     )
 
-    assert isinstance(result, ToolFetchMoreSucceededResult)
+    assert isinstance(fetch_outcome, ToolCompletedOutcome)
     events = await store.list_events("run_1", after=None)
     assert [event.type for event in events] == [
         RunEventType.TOOL_RESULT_TRUNCATED,
@@ -224,7 +275,6 @@ async def test_fetch_more_event_order_and_return_event_cursor() -> None:
         RunEventType.TOOL_FETCH_MORE_COMPLETED,
         RunEventType.TOOL_CURSOR_ISSUED,
     ]
-    assert result.event_cursor == events[3].cursor
     requested = events[2].data
     completed = events[3].data
     assert isinstance(requested, ToolFetchMoreRequestedData)
@@ -238,35 +288,19 @@ async def test_denied_fetch_more_appends_denied_and_failed_facts() -> None:
     """scope token 错误时追加 denied 与 failed canonical facts。"""
 
     runtime, store = _runtime()
-    await runtime.execute_tool_call(_request())
-    truncated = cast(
-        ToolResultTruncatedData,
-        (await store.list_events("run_1", after=None))[0].data,
-    )
-    handle = await runtime.get_tool_fetch_more_handle(
-        ToolFetchMoreHandleRequest(
-            iteration_id="iter_1",
-            session_id="session_1",
-            run_id="run_1",
-            tool_call_id="tc_1",
-            cursor_fingerprint=truncated.cursor_fingerprint,
-        )
-    )
-    assert isinstance(handle, ToolFetchMoreHandleSucceededResult)
+    outcome = await runtime.execute_tool_call(_request())
+    assert isinstance(outcome, ToolCompletedOutcome)
+    truncation = outcome.result.truncation
+    assert truncation is not None
 
-    result = await runtime.fetch_more(
-        ToolFetchMoreRequest(
-            iteration_id="iter_1",
-            session_id="session_1",
-            run_id="run_1",
-            tool_call_id="tc_1",
-            cursor=handle.handle.cursor,
+    fetch_outcome = await runtime.execute_tool_call(
+        _framework_request(
+            cursor_value=truncation.cursor,
             scope_token="wrong-token",
-            limit=None,
         )
     )
 
-    assert not isinstance(result, ToolFetchMoreSucceededResult)
+    assert isinstance(fetch_outcome, ToolFailedOutcome)
     events = await store.list_events("run_1", after=None)
     assert [event.type for event in events[-3:]] == [
         RunEventType.TOOL_FETCH_MORE_REQUESTED,
@@ -276,41 +310,37 @@ async def test_denied_fetch_more_appends_denied_and_failed_facts() -> None:
     failed = events[-1].data
     assert isinstance(failed, ToolFetchMoreFailedData)
     assert failed.denied is True
-    assert result.event_cursor == events[-1].cursor
 
 
 @pytest.mark.asyncio
-async def test_handle_denied_appends_owner_cursor_denied_fact() -> None:
-    """handle 阶段绑定拒绝进入 cursor owner RunEvent。"""
+async def test_cross_run_fetch_more_appends_owner_cursor_denied_fact() -> None:
+    """跨 Run framework ``fetch_more`` 拒绝事实进入 cursor owner Run。"""
 
     runtime, store = _runtime()
-    await runtime.execute_tool_call(_request())
-    truncated = cast(
-        ToolResultTruncatedData,
-        (await store.list_events("run_1", after=None))[0].data,
-    )
+    outcome = await runtime.execute_tool_call(_request())
+    assert isinstance(outcome, ToolCompletedOutcome)
+    truncation = outcome.result.truncation
+    assert truncation is not None
 
-    denied = await runtime.get_tool_fetch_more_handle(
-        ToolFetchMoreHandleRequest(
-            iteration_id="iter_1",
-            session_id="session_1",
+    denied = await runtime.execute_tool_call(
+        _framework_request(
+            cursor_value=truncation.cursor,
+            scope_token=truncation.scope_token,
             run_id="run_2",
-            tool_call_id="tc_1",
-            cursor_fingerprint=truncated.cursor_fingerprint,
         )
     )
 
-    assert not isinstance(denied, ToolFetchMoreHandleSucceededResult)
-    assert denied.error_code == "cursor_scope_mismatch"
+    assert isinstance(denied, ToolFailedOutcome)
     owner_events = await store.list_events("run_1", after=None)
     claimed_events = await store.list_events("run_2", after=None)
     assert claimed_events == ()
-    assert owner_events[-1].type == RunEventType.TOOL_CURSOR_DENIED
+    assert owner_events[-1].type == RunEventType.TOOL_FETCH_MORE_FAILED
+    assert RunEventType.TOOL_CURSOR_DENIED in {event.type for event in owner_events}
 
 
 @pytest.mark.asyncio
-async def test_handle_expired_appends_owner_cursor_expired_fact() -> None:
-    """handle 阶段过期 cursor 进入 cursor owner RunEvent。"""
+async def test_expired_cursor_appends_owner_cursor_expired_fact() -> None:
+    """过期 cursor 经 framework ``fetch_more`` 进入 cursor owner RunEvent。"""
 
     clock = _Clock()
     store = InMemoryRunEventStore()
@@ -322,50 +352,35 @@ async def test_handle_expired_appends_owner_cursor_expired_fact() -> None:
         clock=clock,
         token_generator=lambda: "cursor-handle-expired",
     )
-    await runtime.execute_tool_call(_request())
-    truncated = cast(
-        ToolResultTruncatedData,
-        (await store.list_events("run_1", after=None))[0].data,
-    )
+    outcome = await runtime.execute_tool_call(_request())
+    assert isinstance(outcome, ToolCompletedOutcome)
+    truncation = outcome.result.truncation
+    assert truncation is not None
     clock.now = 131.0
 
-    expired = await runtime.get_tool_fetch_more_handle(
-        ToolFetchMoreHandleRequest(
-            iteration_id="iter_1",
-            session_id="session_1",
-            run_id="run_1",
-            tool_call_id="tc_1",
-            cursor_fingerprint=truncated.cursor_fingerprint,
+    expired = await runtime.execute_tool_call(
+        _framework_request(
+            cursor_value=truncation.cursor,
+            scope_token=truncation.scope_token,
         )
     )
 
-    assert not isinstance(expired, ToolFetchMoreHandleSucceededResult)
-    assert expired.error_code == "cursor_expired"
+    assert isinstance(expired, ToolFailedOutcome)
     events = await store.list_events("run_1", after=None)
-    assert events[-1].type == RunEventType.TOOL_CURSOR_EXPIRED
+    event_types = [event.type for event in events]
+    assert RunEventType.TOOL_CURSOR_EXPIRED in event_types
+    assert events[-1].type == RunEventType.TOOL_FETCH_MORE_FAILED
 
 
 @pytest.mark.asyncio
 async def test_terminal_run_fetch_more_returns_failure_without_new_event() -> None:
-    """terminal Run 后 fetch_more 返回 typed failure，不追加新 RunEvent。"""
+    """terminal Run 后 framework ``fetch_more`` 返回失败 outcome，不追加新 RunEvent。"""
 
     runtime, store = _runtime()
-    await runtime.execute_tool_call(_request())
-    truncated = cast(
-        ToolResultTruncatedData,
-        (await store.list_events("run_1", after=None))[0].data,
-    )
-    handle = await runtime.get_tool_fetch_more_handle(
-        ToolFetchMoreHandleRequest(
-            iteration_id="iter_1",
-            session_id="session_1",
-            run_id="run_1",
-            tool_call_id="tc_1",
-            cursor_fingerprint=truncated.cursor_fingerprint,
-        )
-    )
-    assert isinstance(handle, ToolFetchMoreHandleSucceededResult)
-    before_terminal = await store.list_events("run_1", after=None)
+    outcome = await runtime.execute_tool_call(_request())
+    assert isinstance(outcome, ToolCompletedOutcome)
+    truncation = outcome.result.truncation
+    assert truncation is not None
     await store.append(
         RunEventDraft(
             run_id="run_1",
@@ -383,68 +398,17 @@ async def test_terminal_run_fetch_more_returns_failure_without_new_event() -> No
             source_engine_event_id="engine-final",
         )
     )
-
-    result = await runtime.fetch_more(
-        ToolFetchMoreRequest(
-            iteration_id="iter_1",
-            session_id="session_1",
-            run_id="run_1",
-            tool_call_id="tc_1",
-            cursor=handle.handle.cursor,
-            scope_token=handle.handle.scope_token,
-            limit=None,
-        )
-    )
-
-    after = await store.list_events("run_1", after=None)
-    assert not isinstance(result, ToolFetchMoreSucceededResult)
-    assert result.error_code == "run_terminal"
-    assert result.denied is False
-    assert result.event_cursor is None
-    assert len(after) == len(before_terminal) + 1
-
-
-@pytest.mark.asyncio
-async def test_terminal_run_handle_failure_does_not_append_event() -> None:
-    """terminal Run 后 handle 读取失败不追加 cursor lifecycle 事实。"""
-
-    runtime, store = _runtime()
-    await runtime.execute_tool_call(_request())
-    truncated = cast(
-        ToolResultTruncatedData,
-        (await store.list_events("run_1", after=None))[0].data,
-    )
     before_terminal = await store.list_events("run_1", after=None)
-    await store.append(
-        RunEventDraft(
-            run_id="run_1",
-            session_id="session_1",
-            kind=RunEventKind.CANONICAL,
-            source=RunEventSource.ENGINE,
-            type=RunEventType.FINAL_ANSWER,
-            occurred_at=datetime.now(tz=timezone.utc),
-            data=FinalAnswerData(
-                content="done",
-                filtered=False,
-                degraded=False,
-                finish_reason=FinishReason.STOP,
-            ),
-            source_engine_event_id="engine-final",
-        )
-    )
 
-    result = await runtime.get_tool_fetch_more_handle(
-        ToolFetchMoreHandleRequest(
-            iteration_id="iter_1",
-            session_id="session_2",
-            run_id="run_1",
-            tool_call_id="tc_1",
-            cursor_fingerprint=truncated.cursor_fingerprint,
+    fetch_outcome = await runtime.execute_tool_call(
+        _framework_request(
+            cursor_value=truncation.cursor,
+            scope_token=truncation.scope_token,
         )
     )
 
     after = await store.list_events("run_1", after=None)
-    assert not isinstance(result, ToolFetchMoreHandleSucceededResult)
-    assert result.error_code == "run_terminal"
-    assert result.denied is False
-    assert len(after) == len(before_terminal) + 1
+    assert isinstance(fetch_outcome, ToolFailedOutcome)
+    assert fetch_outcome.result.error == "run_terminal"
+    # framework fetch_more 在 run terminal 时不追加新 RunEvent
+    assert len(after) == len(before_terminal)

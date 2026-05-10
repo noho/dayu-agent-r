@@ -54,11 +54,6 @@ from dayu.host.contracts import (
     ToolFetchMoreCompletedData,
     ToolFetchMoreFailedData,
     ToolFetchMoreFailedResult,
-    ToolFetchMoreHandle,
-    ToolFetchMoreHandleFailedResult,
-    ToolFetchMoreHandleRequest,
-    ToolFetchMoreHandleResult,
-    ToolFetchMoreHandleSucceededResult,
     ToolFetchMoreRequest,
     ToolFetchMoreRequestedData,
     ToolFetchMoreResult,
@@ -568,7 +563,7 @@ class InMemoryToolRuntime:
                 parsed.result.error,
             )
             return parsed
-        fetch_result = await self.fetch_more(parsed)
+        fetch_result = await self._fetch_more(parsed)
         if isinstance(fetch_result, ToolFetchMoreFailedResult):
             failed = ToolFailedOutcome(
                 result=ToolResultFailure(
@@ -711,88 +706,16 @@ class InMemoryToolRuntime:
             ),
         )
 
-    async def get_tool_fetch_more_handle(
-        self,
-        request: ToolFetchMoreHandleRequest,
-    ) -> ToolFetchMoreHandleResult:
-        """按非 EventLog 通道读取受控补读 handle。
-
-        :param request: handle 读取请求。
-        :returns: handle 读取结果。
-        :raises Exception: 不主动抛出异常。
-        """
-
-        record = self._record_by_fingerprint(request.cursor_fingerprint)
-        if record is None:
-            return _handle_failure(
-                request=request,
-                error_code=_ERROR_CURSOR_NOT_FOUND,
-                message="cursor not found",
-                denied=False,
-            )
-        terminal_cursor = await self._terminal_cursor(record.run_id)
-        if terminal_cursor is not None:
-            return _handle_failure(
-                request=request,
-                error_code=_ERROR_RUN_TERMINAL,
-                message="run is terminal",
-                denied=False,
-            )
-        denied_reason = _binding_denied_reason(
-            record=record,
-            session_id=request.session_id,
-            run_id=request.run_id,
-            tool_call_id=request.tool_call_id,
-        )
-        if denied_reason is not None:
-            await self._append_cursor_denied(
-                record=record,
-                reason=denied_reason,
-                iteration_id=request.iteration_id,
-            )
-            return _handle_failure(
-                request=request,
-                error_code=_ERROR_CURSOR_SCOPE_MISMATCH,
-                message=denied_reason,
-                denied=True,
-            )
-        now = self.clock()
-        if record.expires_at_monotonic <= now:
-            self._remove_cursor(record.cursor)
-            await self._append_cursor_expired(
-                record=record,
-                iteration_id=request.iteration_id,
-            )
-            return _handle_failure(
-                request=request,
-                error_code=_ERROR_CURSOR_EXPIRED,
-                message="cursor expired",
-                denied=False,
-            )
-        handle = ToolFetchMoreHandle(
-            session_id=record.session_id,
-            run_id=record.run_id,
-            tool_call_id=record.tool_call_id,
-            cursor=ToolRuntimeCursor(
-                value=record.cursor,
-                fingerprint=record.cursor_fingerprint,
-            ),
-            scope_token=record.scope_token,
-            expires_at_monotonic=record.expires_at_monotonic,
-        )
-        return ToolFetchMoreHandleSucceededResult(
-            run_id=record.run_id,
-            session_id=record.session_id,
-            tool_call_id=record.tool_call_id,
-            handle=handle,
-            expires_at_monotonic=record.expires_at_monotonic,
-        )
-
-    async def fetch_more(
+    async def _fetch_more(
         self,
         request: ToolFetchMoreRequest,
     ) -> ToolFetchMoreResult:
         """补读已截断工具结果。
+
+        本方法仅作为 :meth:`execute_tool_call` 内部子例程被
+        :meth:`_execute_framework_fetch_more` 调用；P8-S2 起不再作为公开
+        入口暴露，framework ``fetch_more`` 必须以普通 tool call 形态走
+        :class:`ToolRuntimeToolExecutor` -> :meth:`execute_tool_call`。
 
         :param request: 补读请求。
         :returns: 补读结果。
@@ -1149,21 +1072,6 @@ class InMemoryToolRuntime:
             ),
         )
 
-    def _record_by_fingerprint(
-        self, cursor_fingerprint: str
-    ) -> _CursorRecord | None:
-        """按 cursor 指纹读取记录。
-
-        :param cursor_fingerprint: cursor 指纹。
-        :returns: cursor 记录；不存在返回 ``None``。
-        :raises Exception: 不主动抛出异常。
-        """
-
-        cursor = self._cursor_by_fingerprint.get(cursor_fingerprint)
-        if cursor is None:
-            return None
-        return self._records_by_cursor.get(cursor)
-
     def _remove_cursor(self, cursor: str) -> None:
         """删除 cursor 记录。
 
@@ -1518,33 +1426,6 @@ class InMemoryToolRuntime:
             denied=denied,
             event_cursor=event.cursor,
         )
-
-
-def _handle_failure(
-    *,
-    request: ToolFetchMoreHandleRequest,
-    error_code: str,
-    message: str,
-    denied: bool,
-) -> ToolFetchMoreHandleFailedResult:
-    """构造 handle 读取失败结果。
-
-    :param request: handle 读取请求。
-    :param error_code: 失败错误码。
-    :param message: 人类可读错误描述。
-    :param denied: 是否为权限拒绝。
-    :returns: handle 读取失败结果。
-    :raises Exception: 不主动抛出异常。
-    """
-
-    return ToolFetchMoreHandleFailedResult(
-        run_id=request.run_id,
-        session_id=request.session_id,
-        tool_call_id=request.tool_call_id,
-        error_code=error_code,
-        message=message,
-        denied=denied,
-    )
 
 
 def _fetch_failure_without_event(

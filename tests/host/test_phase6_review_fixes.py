@@ -778,3 +778,41 @@ async def test_finish_attempt_if_durable_rejects_terminal_event_and_state_togeth
 
 
 __all__ = ["_drafts_for"]
+
+
+@pytest.mark.asyncio
+async def test_finish_attempt_if_durable_raises_when_supervisor_missing() -> None:
+    """``is_durable=True`` 但 supervisor / owner_context 缺失时必须 raise。
+
+    P8-S4 D5: legacy fallback (非 owner-aware update) 已删除; 进入此路径
+    说明 attempt 装配 invariant 被破坏, 应立即 fail-fast 暴露问题, 而不是
+    退化到不带 CAS 的 update 与 recovery 真源竞争。
+    """
+
+    from dayu.host._durable_harness import (
+        DurableHarnessConfig,
+        build_durable_harness,
+    )
+    from dayu.host._run_harness import _ActiveAttempt
+    from dayu.host._run_state_store import AttemptState
+
+    bundle = build_durable_harness(
+        config=DurableHarnessConfig(database_path=":memory:")
+    )
+    try:
+        harness = bundle.harness
+        assert harness.is_durable is True
+        active = _ActiveAttempt(
+            attempt_id="att_invariant",
+            owner_context=None,
+            lease_exit_stack=None,
+        )
+        with pytest.raises(RuntimeError, match="invariant violated"):
+            await harness._finish_attempt_if_durable(  # noqa: SLF001
+                active_attempt=active,
+                terminal_event=None,
+                state=AttemptState.FAILED,
+                failure_summary="test",
+            )
+    finally:
+        bundle.close()

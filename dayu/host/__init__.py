@@ -1,18 +1,15 @@
 """Host 公共入口。
 
-P1.5 暴露最小 Run 级入口与事件事实读取接口。Host 内部的 ``EngineWorker``、
-``LocalProxy``、``WorkerProxy`` 与 ``ToolExecutor`` 代持不属于 public surface。
+P8-S2 起公开接口仅暴露 contracts 与 :class:`LocalRunHarness`/
+:func:`build_durable_harness`（后者由 ``dayu.host._durable_harness``
+直接导出）；上层应通过 ``build_durable_harness().harness`` 装配 production /
+durable harness，再使用其实例方法（``start_run`` / ``stream_run_events`` /
+``get_run_result``）。``LocalRunHarness`` 自身仍是 Host 内部 kernel，但作为
+test-only 装配入口被显式暴露。
 """
 
 from __future__ import annotations
 
-from dayu.host._run_harness import (
-    fetch_more_tool_result,
-    get_run_result,
-    get_tool_fetch_more_handle,
-    start_run,
-    stream_run_events,
-)
 from dayu.host.contracts import (
     ContextCompactFailureReason,
     HostContextAttemptRetryData,
@@ -109,9 +106,4 @@ __all__ = [
     "ToolValueSizeSummary",
     "UserInputAcceptedData",
     "UserInputScope",
-    "fetch_more_tool_result",
-    "get_run_result",
-    "get_tool_fetch_more_handle",
-    "start_run",
-    "stream_run_events",
 ]

@@ -1,7 +1,10 @@
 """Host P4 最小 Run harness。
 
-本模块提供 public ``start_run`` 的内存态测试入口，以及内部
-``LocalRunHarness``。它不提供生产级 Session / Run governance。
+本模块定义 Host 内部 :class:`LocalRunHarness`，不再提供 package-level
+``start_run`` / ``stream_run_events`` / ``get_run_result`` 便利入口。上层
+（service / smoke / 测试）一律通过 :func:`build_durable_harness` 装配
+durable harness 后调用其实例方法；test-only 场景显式构造
+``LocalRunHarness(is_durable=False, ...)``。
 """
 
 from __future__ import annotations
@@ -9,7 +12,6 @@ from __future__ import annotations
 import asyncio
 import logging
 import uuid
-import weakref
 from collections import OrderedDict
 from collections.abc import AsyncGenerator, AsyncIterator
 from contextlib import AbstractAsyncContextManager, AsyncExitStack, asynccontextmanager
@@ -33,6 +35,7 @@ from dayu.engine import (
     UserMessage,
 )
 from dayu.host._attempt_lease import (
+    AttemptFencingError,
     AttemptOwnerContext,
 )
 from dayu.host._attempt_state_mapping import (
@@ -104,16 +107,11 @@ from dayu.host.contracts import (
     RunState,
     RunStream,
     StartRunRequest,
-    ToolFetchMoreHandleRequest,
-    ToolFetchMoreHandleResult,
-    ToolFetchMoreRequest,
-    ToolFetchMoreResult,
 )
 from dayu.runtime.log_levels import VERBOSE_LOG_LEVEL
 
 _INITIAL_CURSOR_SEQUENCE: int = -1
 _ERROR_TOOL_EXECUTOR_NOT_CONFIGURED: str = "tool_executor_not_configured"
-_ERROR_TOOL_RUNTIME_NOT_CONFIGURED: str = "tool_runtime_not_configured"
 _ERROR_CURRENT_USER_INPUT_REQUIRED: str = "current_user_input_required"
 _ERROR_CURRENT_USER_INPUT_SHAPE_EMPTY: str = (
     "start_run_input_requires_trailing_non_empty_user_message"
@@ -1086,27 +1084,36 @@ class LocalRunHarness:
         event_count: int,
         terminal_seen: bool,
     ) -> bool:
-        """attempt owner-lost 后停止 append 并 owner-aware 收口。
+        """attempt owner-lost 后通过原子接口收口或安全放弃。
 
         本 helper 是 P8-S3 owner-lost 路径的统一收口入口:
 
-        - 不再向 EventLog append 任何 attempt-scoped fact。
-        - 通过 ``terminal_seen`` 区分: 若此前已经写入终态, 不再追加 Host-
-          owned failure (避免覆盖 Engine 终态);
-          否则追加诊断 ``RUN_FAILED(error_code=attempt_lease_lost)``,
-          让上层订阅方与 Run 结果有确定终态可读。
-        - 通过 :meth:`_finish_attempt_if_durable` (在调用方 ``return`` 后
-          的 ``finally`` 块中) 走 supervisor owner-aware diagnostic
-          close 路径; 本 helper 自身不直接 update_state, 由后续
-          :meth:`_finish_attempt_if_durable` 的 active_attempt 路径完成。
+        - 若已经写入终态 (``terminal_seen``), 不再追加 Host-owned failure,
+          交给上层 finally 块的 :meth:`_finish_attempt_if_durable` 完成
+          attempt 状态推进;
+        - 否则通过 :meth:`AttemptSupervisor.append_terminal_and_close`
+          在单一 ``BEGIN IMMEDIATE`` 事务内尝试: ``verify_owner`` CAS +
+          terminal RunEvent append + ``host_attempts`` 终态 close。
+          - CAS hit: terminal ``RUN_FAILED(error_code=attempt_lease_lost)``
+            落库, 上层 ``_run_to_store`` 经由现有 ``terminal_seen`` 路径
+            自然退出, RunStream 订阅方收到 terminal event 后 generator
+            自然结束;
+          - CAS miss (``AttemptFencingError``): 整事务回滚, EventLog 不
+            残留 stale terminal RunEvent; 仅记 typed log 供诊断, 上层
+            generator 通过现有 ``_run_to_store`` cleanup 自然退出。
+
+        本 helper 不再执行裸 ``event_store.append``; legacy 非 supervisor
+        路径在 ``is_durable=False`` 装配下仅记诊断日志后返回, 不写终态。
 
         :param request: 当前 attempt 请求。
         :param active_attempt: 当前 active attempt 句柄, 仅用于诊断字段。
         :param loss_reason: typed owner-lost 原因。
         :param event_count: 已成功取得的 EngineEvent 数量。
         :param terminal_seen: 是否已经从已 append 事件推导出终态。
-        :returns: 已存在或新追加终态时返回 ``True``。
-        :raises Exception: append Host-owned failure 失败时透传。
+        :returns: 已存在或新写入终态时返回 ``True``; CAS miss 或非
+            durable 路径返回 ``False``。
+        :raises Exception: ``append_terminal_and_close`` 抛出非
+            :class:`AttemptFencingError` 异常时透传。
         """
 
         attempt_id = (
@@ -1121,25 +1128,70 @@ class LocalRunHarness:
             loss_reason.value,
             event_count,
         )
-        if active_attempt is not None:
-            await self._finish_attempt_if_durable(
-                active_attempt=active_attempt,
-                terminal_event=None,
-                state=AttemptState.LOST,
-                failure_summary=f"{_ERROR_ATTEMPT_LEASE_LOST}:{loss_reason.value}",
-            )
         if terminal_seen:
             return True
-        stored_event = await self.event_store.append(
-            host_failure_draft(
-                run_id=request.run_id,
-                session_id=request.session_id,
-                occurred_at=datetime.now(tz=timezone.utc),
-                error=RuntimeError(_ERROR_ATTEMPT_LEASE_LOST),
-                error_code=_ERROR_ATTEMPT_LEASE_LOST,
-            )
+        # 非 supervisor 路径: 仅在 ``is_durable=False`` test-only 装配下
+        # 命中; 此时无 owner CAS 真源, 不写任何终态, 由上层 generator
+        # cleanup 自然结束。
+        if (
+            self.attempt_supervisor is None
+            or active_attempt is None
+            or active_attempt.owner_context is None
+            or active_attempt.lease_exit_stack is None
+        ):
+            return False
+        supervisor = self.attempt_supervisor
+        owner_context = active_attempt.owner_context
+        failure_summary = (
+            f"{_ERROR_ATTEMPT_LEASE_LOST}:{loss_reason.value}"
         )
-        return terminal_result_from_event(stored_event) is not None
+        draft = host_failure_draft(
+            run_id=request.run_id,
+            session_id=request.session_id,
+            occurred_at=datetime.now(tz=timezone.utc),
+            error=RuntimeError(_ERROR_ATTEMPT_LEASE_LOST),
+            error_code=_ERROR_ATTEMPT_LEASE_LOST,
+        )
+        try:
+            link = await supervisor.append_terminal_and_close(
+                owner_context=owner_context,
+                draft=draft,
+                failure_summary=failure_summary,
+                terminal_state_override=AttemptState.LOST,
+            )
+        except AttemptFencingError as fence_exc:
+            # CAS miss: owner 已被 recovery / 其它进程替换或 attempt 已
+            # 推到终态。本路径**绝不**写 RunEvent: 任何额外 append 都会
+            # 与 recovery 真源竞争, 形成 stale terminal。
+            _LOGGER.warning(
+                "host.run.attempt_lease_lost_cas_miss session_id=%s "
+                "run_id=%s attempt_id=%s loss_reason=%s "
+                "fence_reason=%s event_count=%s",
+                request.session_id,
+                request.run_id,
+                attempt_id,
+                loss_reason.value,
+                fence_exc.reason.value,
+                event_count,
+            )
+            # 仍需关闭 lease_exit_stack 让 renew loop / supervisor
+            # session 干净退出; CAS miss 不影响后续 cleanup 顺序。
+            await active_attempt.lease_exit_stack.aclose()
+            return False
+        # CAS hit: supervisor 已在同事务内推进 attempt 终态并写入
+        # terminal_event_position; 这里关闭 lease_exit_stack 让 renew
+        # loop / supervisor session 退出, 避免与上层 finally 块的
+        # ``_finish_attempt_if_durable`` 二次 close 重复。
+        await active_attempt.lease_exit_stack.aclose()
+        _LOGGER.log(
+            VERBOSE_LOG_LEVEL,
+            "host.run.attempt_lease_lost_terminal_appended attempt_id=%s "
+            "state=%s terminal_event_position=%s",
+            link.attempt_id,
+            link.terminal_state.value,
+            link.event_position.value,
+        )
+        return True
 
     async def _compact_or_fail(
         self,
@@ -1805,21 +1857,22 @@ class LocalRunHarness:
     ) -> None:
         """durable 路径下推进 attempt 终态 / 诊断态。
 
-        supervisor 路径:
+        supervisor 路径(``is_durable=True`` 必经):
 
-        - 先尝试 owner-aware diagnostic close: 通过
-          :meth:`AttemptSupervisor.close_attempt_with_diagnostic_state`
-          在同事务内对 ``host_attempts`` 做 owner_token + fencing_token
-          CAS 更新; CAS 命中失败说明 owner 已被 recovery 替换, harness
-          直接放弃覆盖未来状态, 不再退化到 legacy 非 owner-aware update。
+        - 通过 :meth:`AttemptSupervisor.close_attempt_with_diagnostic_state`
+          在同事务内对 ``host_attempts`` 做 owner_token + fencing_token CAS
+          更新; CAS 命中失败说明 owner 已被 recovery 替换, harness 直接放弃
+          覆盖未来状态。
         - 然后才调用 :meth:`AsyncExitStack.aclose` 让
           :meth:`AttemptSupervisor.lease_context` 退出 (取消 renew loop /
           清理 supervisor 内部 session)。这样可以保证 CAS 在 supervisor
           仍持有 session 时执行, 避免 "先丢弃 session 再写库" 的窗口。
-        - terminal event position 的同事务原子写入归 P8-S4 实现, 本
-          slice 仍传 ``None``。
 
-        legacy 路径(无 supervisor): 与 P6 行为一致, 直接更新状态字段。
+        ``is_durable=False`` 路径下 attempt 概念不存在, 函数 noop。
+        ``is_durable=True`` 但 supervisor / owner_context / lease_exit_stack
+        缺失视为装配 invariant 被破坏, 直接 raise 而不是退化到非 owner-aware
+        update; 避免与 recovery 真源在 ``host_attempts`` 上竞争产生 stale
+        state(P8 D5)。
 
         :param active_attempt: 当前 active attempt 句柄；``None`` 表示无
             durable attempt 可推进, 直接返回。
@@ -1830,6 +1883,8 @@ class LocalRunHarness:
         :returns: 无返回值。
         :raises ValueError: 同时显式提供 ``terminal_event`` 与 ``state`` 时
             抛出；二者语义互斥，调用方必须明确意图，禁止隐式优先级。
+        :raises RuntimeError: ``is_durable=True`` 但 supervisor / owner_context
+            / lease_exit_stack 缺失。
         :raises Exception: 写入失败时透传。
         """
 
@@ -1877,22 +1932,16 @@ class LocalRunHarness:
                 resolved_state.value,
             )
             return
-        if self.attempt_state_store is None or self.storage is None:
+        if not self.is_durable:
+            # 非 durable 路径下 attempt 概念不存在, noop。
             return
-        terminal_position: GlobalEventPosition | None = None
-        async with self.storage.transaction() as tx:
-            self.attempt_state_store.update_state(
-                tx=tx,
-                attempt_id=active_attempt.attempt_id,
-                state=resolved_state,
-                terminal_event_position=terminal_position,
-                failure_summary=resolved_failure,
-            )
-        _LOGGER.log(
-            VERBOSE_LOG_LEVEL,
-            "host.run.attempt_finished attempt_id=%s state=%s",
-            active_attempt.attempt_id,
-            resolved_state.value,
+        # is_durable=True 必须始终携带 supervisor + owner_context;
+        # 进入此分支说明上游装配或 attempt 生命周期出错, 立即 fail-fast,
+        # 避免退化到非 owner-aware update 制造 stale state。
+        raise RuntimeError(
+            "_finish_attempt_if_durable invariant violated: "
+            "is_durable=True 但 attempt_supervisor / owner_context / "
+            f"lease_exit_stack 缺失 attempt_id={active_attempt.attempt_id}"
         )
 
     def _remember_run_input_build_trace(
@@ -2062,36 +2111,6 @@ class LocalRunHarness:
                 return result
         return None
 
-    async def get_tool_fetch_more_handle(
-        self,
-        request: ToolFetchMoreHandleRequest,
-    ) -> ToolFetchMoreHandleResult:
-        """读取工具补读受控 handle。
-
-        :param request: handle 读取请求。
-        :returns: handle 读取结果。
-        :raises RuntimeError: harness 未装配 ToolRuntime 时抛出。
-        """
-
-        if self.tool_runtime is None:
-            raise RuntimeError(_ERROR_TOOL_RUNTIME_NOT_CONFIGURED)
-        return await self.tool_runtime.get_tool_fetch_more_handle(request)
-
-    async def fetch_more_tool_result(
-        self,
-        request: ToolFetchMoreRequest,
-    ) -> ToolFetchMoreResult:
-        """补读已截断工具结果。
-
-        :param request: 补读请求。
-        :returns: 补读结果。
-        :raises RuntimeError: harness 未装配 ToolRuntime 时抛出。
-        """
-
-        if self.tool_runtime is None:
-            raise RuntimeError(_ERROR_TOOL_RUNTIME_NOT_CONFIGURED)
-        return await self.tool_runtime.fetch_more(request)
-
 
 def _remember_lru_run_cache_item(
     *,
@@ -2149,11 +2168,6 @@ async def _close_engine_events_if_supported(
             )
 
 
-_DEFAULT_HARNESS_BY_LOOP: weakref.WeakKeyDictionary[
-    asyncio.AbstractEventLoop, LocalRunHarness
-] = weakref.WeakKeyDictionary()
-
-
 def _log_background_task_failure(
     request: StartRunRequest,
     task: asyncio.Future[None],
@@ -2182,135 +2196,6 @@ def _log_background_task_failure(
         request.run_id,
         type(error).__name__,
         exc_info=(type(error), error, error.__traceback__),
-    )
-
-
-def _build_default_harness() -> LocalRunHarness:
-    """构造默认 harness。
-
-    P8-S8 起默认 harness 也使用 :class:`DurableConversationMemoryStore`
-    （以 ``:memory:`` SQLite 为后端），不再依赖已删除的 production
-    ``InMemoryConversationMemoryStore``。non-durable EventLog / tool
-    runtime 仍走 P3 内存实现，以保持 legacy 顶层 ``start_run``
-    便利入口的行为。
-
-    :returns: 默认本地 Run harness。
-    :raises Exception: 不主动抛出异常。
-    """
-
-    # 局部导入避免顶层模块循环依赖（durable harness 反向依赖
-    # ``_run_harness``）。
-    from dayu.host._conversation_memory_durable import (
-        open_durable_conversation_memory_store,
-    )
-    from dayu.host._host_storage_transaction import HostStorage
-
-    executor: ToolExecutor = _NoopToolExecutor()
-    event_store = InMemoryRunEventStore()
-    runtime = InMemoryToolRuntime(
-        is_durable=False,
-        executor=executor,
-        event_store=event_store,
-    )
-    storage = HostStorage(database_path=":memory:")
-    memory_store = open_durable_conversation_memory_store(storage)
-    return LocalRunHarness(
-        is_durable=False,
-        proxy=LocalProxy(worker=EngineWorker(ToolRuntimeToolExecutor(runtime))),
-        event_store=event_store,
-        tool_runtime=runtime,
-        memory_store=memory_store,
-    )
-
-
-def _default_harness_for_running_loop() -> LocalRunHarness:
-    """返回当前 event loop 绑定的默认 harness。
-
-    :returns: 当前 event loop 对应的默认 LocalRunHarness。
-    :raises RuntimeError: 当前线程没有运行中的 event loop 时抛出。
-    """
-
-    loop = asyncio.get_running_loop()
-    harness = _DEFAULT_HARNESS_BY_LOOP.get(loop)
-    if harness is None:
-        harness = _build_default_harness()
-        _DEFAULT_HARNESS_BY_LOOP[loop] = harness
-    return harness
-
-
-async def start_run(request: StartRunRequest) -> RunStream:
-    """启动 P1.5 最小 Run。
-
-    这是 public 测试入口，不暴露 EngineWorker 或 ToolExecutor。需要定制
-    ToolExecutor 的测试应使用内部 harness，而不是把 ToolExecutor 提升
-    为 Host public API。
-
-    :param request: start_run 请求。
-    :returns: RunStream，包含句柄与事件流。
-    :raises Exception: 构造后台任务失败时透传底层异常。
-    """
-
-    return await _default_harness_for_running_loop().start_run(request)
-
-
-def stream_run_events(
-    run_id: str,
-    after: RunEventCursor | None = None,
-) -> AsyncIterator[RunEvent]:
-    """订阅默认 harness 中某个 run 的 RunEvent 流。
-
-    :param run_id: Run id。
-    :param after: exclusive 起点 cursor；为 ``None`` 时从头订阅。
-    :returns: RunEvent 异步流。
-    :raises Exception: 不主动抛出异常。
-    """
-
-    return _default_harness_for_running_loop().stream_run_events(
-        run_id=run_id,
-        after=after,
-    )
-
-
-async def get_run_result(run_id: str) -> RunResult | None:
-    """查询默认 harness 中某个 run 的终态结果快照。
-
-    :param run_id: Run id。
-    :returns: 已终态时返回 RunResult，否则返回 ``None``。
-    :raises TypeError: 终态事件类型与 data 类型不一致时抛出。
-    """
-
-    return await _default_harness_for_running_loop().get_run_result(
-        run_id=run_id
-    )
-
-
-async def get_tool_fetch_more_handle(
-    request: ToolFetchMoreHandleRequest,
-) -> ToolFetchMoreHandleResult:
-    """读取默认 harness 中的工具补读受控 handle。
-
-    :param request: handle 读取请求。
-    :returns: handle 读取结果。
-    :raises RuntimeError: 默认 harness 未装配 ToolRuntime 时抛出。
-    """
-
-    return await _default_harness_for_running_loop().get_tool_fetch_more_handle(
-        request
-    )
-
-
-async def fetch_more_tool_result(
-    request: ToolFetchMoreRequest,
-) -> ToolFetchMoreResult:
-    """补读默认 harness 中的截断工具结果。
-
-    :param request: 补读请求。
-    :returns: 补读结果。
-    :raises RuntimeError: 默认 harness 未装配 ToolRuntime 时抛出。
-    """
-
-    return await _default_harness_for_running_loop().fetch_more_tool_result(
-        request
     )
 
 
@@ -2399,9 +2284,4 @@ def _is_context_compaction_required_terminal(event: EngineEvent) -> bool:
 
 __all__ = [
     "LocalRunHarness",
-    "fetch_more_tool_result",
-    "get_run_result",
-    "get_tool_fetch_more_handle",
-    "start_run",
-    "stream_run_events",
 ]

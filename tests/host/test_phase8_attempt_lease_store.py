@@ -648,3 +648,49 @@ def test_acquire_rejects_naive_lease_expires_at() -> None:
 
     asyncio.run(_go())
     storage.close()
+
+
+@pytest.mark.asyncio
+async def test_allocate_fencing_token_fail_fast_when_lastrowid_invalid() -> None:
+    """``host_fencing_tokens`` INSERT 未拿到正 ``lastrowid`` 时必须 fail-fast。
+
+    SQLite ``INTEGER PRIMARY KEY AUTOINCREMENT`` 在正常路径下保证严格单调
+    递增的 ``lastrowid``; 一旦缺失或非正, 表示 fencing 单调递增不变量被
+    破坏, 必须立即抛 :class:`RuntimeError`, 禁止退化为 ``FencingToken(0)``
+    / 静默继续这种"局部止血"。
+    """
+
+    storage = _open_storage()
+    await _seed_run(storage)
+    clock = _FakeClock()
+    lease_store = AttemptLeaseStore(storage=storage, clock=clock)
+
+    @dataclass(slots=True)
+    class _NullLastRowidCursor:
+        """``lastrowid`` 缺失的 cursor stub。"""
+
+        lastrowid: int | None = None
+
+    @dataclass(slots=True)
+    class _StubTx:
+        """只暴露 ``execute`` 的 tx stub, 始终返回 ``lastrowid=None``。"""
+
+        captured_sql: list[str] = field(default_factory=list)
+
+        def execute(
+            self, sql: str, params: object = ()
+        ) -> _NullLastRowidCursor:
+            del params
+            self.captured_sql.append(sql)
+            return _NullLastRowidCursor()
+
+    stub = _StubTx()
+    with pytest.raises(RuntimeError, match="fencing token monotonic"):
+        lease_store._allocate_fencing_token(  # type: ignore[arg-type]
+            tx=stub,  # type: ignore[arg-type]
+            resource_id="a-fail",
+            owner_id="host:1",
+            now=clock.now(),
+        )
+    assert any("host_fencing_tokens" in sql for sql in stub.captured_sql)
+    storage.close()
