@@ -229,6 +229,8 @@ P8 已落地：
 - Run 句柄与事件：`RunHandle`、`RunStream`、`RunEvent`、`RunEventCursor`、`RunEventType`、
   `RunEventKind`、`RunEventSource`、`RunEventData`、`RunState`。
 - Host-owned event data：`HostRunFailedData`、`UserInputAcceptedData`、`UserInputScope`。
+- Run input context fact data：`RunInputContextSnapshotBuiltData`、`RunInputContextMeta`、
+  `RunInputMessageSummary`、`RunInputToolSchemaSummary`。
 - ToolRuntime fact data：`ToolResultTruncatedData`、`ToolCursorIssuedData`、`ToolFetchMoreRequestedData`、
   `ToolFetchMoreCompletedData`、`ToolFetchMoreFailedData`、`ToolCursorExpiredData`、`ToolCursorDeniedData`、
   `ToolRuntimeEventData`、`ToolValueSizeSummary`。

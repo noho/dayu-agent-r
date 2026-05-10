@@ -111,6 +111,7 @@ from dayu.host.contracts import (
 from dayu.runtime.log_levels import VERBOSE_LOG_LEVEL
 
 _INITIAL_CURSOR_SEQUENCE: int = -1
+_TASK_AWARE_STREAM_DRAIN_SECONDS: float = 0.05
 _ERROR_TOOL_EXECUTOR_NOT_CONFIGURED: str = "tool_executor_not_configured"
 _ERROR_CURRENT_USER_INPUT_REQUIRED: str = "current_user_input_required"
 _ERROR_CURRENT_USER_INPUT_SHAPE_EMPTY: str = (
@@ -713,13 +714,82 @@ class LocalRunHarness:
             state=RunState.RUNNING,
             event_cursor=RunEventCursor(sequence=_INITIAL_CURSOR_SEQUENCE),
         )
+        subscription = self.event_store.subscribe(
+            run_id=engine_request.run_id,
+            after=handle.event_cursor,
+        )
         return RunStream(
             handle=handle,
-            events=self.event_store.subscribe(
-                run_id=engine_request.run_id,
-                after=handle.event_cursor,
+            events=self._task_aware_event_stream(
+                subscription=subscription,
+                background_task=task,
             ),
         )
+
+    async def _task_aware_event_stream(
+        self,
+        subscription: AsyncIterator[RunEvent],
+        background_task: asyncio.Task[None],
+    ) -> AsyncGenerator[RunEvent, None]:
+        """与 ``_run_to_store`` task 协同的事件流包装。
+
+        :param subscription: ``RunEventStore.subscribe`` 返回的原始事件流。
+        :param background_task: 后台 ``_run_to_store`` task。
+        :returns: 与原 subscription 行为一致, 但在出现以下情况时主动结束:
+            (1) subscription 自身因 EventLog terminal 自然结束;
+            (2) 后台 task 已完成且 subscription 无更多新事件 (例如
+            owner-lost CAS miss 路径不写 terminal RunEvent, 但 task 已退出,
+            避免上层 ``async for`` 永远阻塞在条件变量上)。
+        :raises Exception: subscription 自身抛出的异常透传。
+        """
+
+        sub_iter = subscription.__aiter__()
+        try:
+            while True:
+                next_task: asyncio.Task[RunEvent] = asyncio.ensure_future(
+                    sub_iter.__anext__()
+                )
+                try:
+                    done, _pending = await asyncio.wait(
+                        [next_task, background_task],
+                        return_when=asyncio.FIRST_COMPLETED,
+                    )
+                    if next_task in done:
+                        try:
+                            event = next_task.result()
+                        except StopAsyncIteration:
+                            return
+                        yield event
+                        continue
+                    # background_task 已完成而 subscription 仍 pending:
+                    # 给一个短窗口让 subscription 把已落库 event 拉出来,
+                    # 没拉到就结束, 避免在条件变量上永久挂起。
+                    drain_done, _drain_pending = await asyncio.wait(
+                        [next_task],
+                        timeout=_TASK_AWARE_STREAM_DRAIN_SECONDS,
+                    )
+                    if next_task in drain_done:
+                        try:
+                            event = next_task.result()
+                        except StopAsyncIteration:
+                            return
+                        yield event
+                        continue
+                    return
+                finally:
+                    if not next_task.done():
+                        next_task.cancel()
+                        try:
+                            await next_task
+                        except (StopAsyncIteration, asyncio.CancelledError):
+                            pass
+        finally:
+            aclose = getattr(sub_iter, "aclose", None)
+            if aclose is not None:
+                try:
+                    await aclose()
+                except Exception:  # pragma: no cover - defensive
+                    pass
 
     async def _run_to_store(
         self,
@@ -772,13 +842,40 @@ class LocalRunHarness:
                         request=attempt_request,
                         cancellation_token=token,
                     )
-                except Exception as exc:
-                    terminal_seen = await self._append_worker_failure_if_needed(
+                except AttemptFencingError:
+                    # owner CAS 在拿 engine iterator 期间已 fenced (例如
+                    # tool runtime 装配阶段触发 verify_owner)。统一收口
+                    # 到 _handle_owner_lost: CAS hit 走原子 terminal +
+                    # close, CAS miss 不写 stale RunEvent。
+                    terminal_seen = await self._handle_owner_lost(
                         request=attempt_request,
-                        error=exc,
+                        active_attempt=current_active_attempt,
+                        loss_reason=AttemptOwnerLossReason.FENCED,
                         event_count=event_count,
                         terminal_seen=terminal_seen,
                     )
+                    current_active_attempt = None
+                    return
+                except Exception as exc:
+                    try:
+                        terminal_seen = await self._append_worker_failure_if_needed(
+                            request=attempt_request,
+                            error=exc,
+                            event_count=event_count,
+                            terminal_seen=terminal_seen,
+                        )
+                    except AttemptFencingError:
+                        # scoped appender 在写 worker failure 时观察到
+                        # owner 已 fenced; 立即收敛到 owner-lost 路径,
+                        # 不再叠加 host_failure stale terminal。
+                        terminal_seen = await self._handle_owner_lost(
+                            request=attempt_request,
+                            active_attempt=current_active_attempt,
+                            loss_reason=AttemptOwnerLossReason.FENCED,
+                            event_count=event_count,
+                            terminal_seen=terminal_seen,
+                        )
+                        current_active_attempt = None
                     return
                 try:
                     async with self._attempt_owner_scope(current_active_attempt):
@@ -803,14 +900,28 @@ class LocalRunHarness:
                                 current_active_attempt = None
                                 return
                             except Exception as exc:
-                                terminal_seen = (
-                                    await self._append_worker_failure_if_needed(
+                                try:
+                                    terminal_seen = (
+                                        await self._append_worker_failure_if_needed(
+                                            request=attempt_request,
+                                            error=exc,
+                                            event_count=event_count,
+                                            terminal_seen=terminal_seen,
+                                        )
+                                    )
+                                except AttemptFencingError:
+                                    # scoped appender 在写 worker failure
+                                    # terminal 时观察到 owner 已 fenced,
+                                    # 必须收敛到 owner-lost 路径, 不能再
+                                    # 叠加 stale host_failure terminal。
+                                    terminal_seen = await self._handle_owner_lost(
                                         request=attempt_request,
-                                        error=exc,
+                                        active_attempt=current_active_attempt,
+                                        loss_reason=AttemptOwnerLossReason.FENCED,
                                         event_count=event_count,
                                         terminal_seen=terminal_seen,
                                     )
-                                )
+                                    current_active_attempt = None
                                 return
                             event_count += 1
                             if _is_context_compaction_requested(event):
@@ -914,13 +1025,26 @@ class LocalRunHarness:
                                     attempt_index=attempt_index,
                                 )
                             except Exception as exc:
-                                terminal_seen = (
-                                    await self._append_compact_exception_failure(
-                                        request=attempt_request,
-                                        attempt_index=attempt_index,
-                                        error=exc,
+                                try:
+                                    terminal_seen = (
+                                        await self._append_compact_exception_failure(
+                                            request=attempt_request,
+                                            attempt_index=attempt_index,
+                                            error=exc,
+                                        )
                                     )
-                                )
+                                except AttemptFencingError:
+                                    # compact 失败 host_failure 写入触发
+                                    # owner CAS fence; 收敛 owner-lost,
+                                    # 不写 stale terminal。
+                                    terminal_seen = await self._handle_owner_lost(
+                                        request=attempt_request,
+                                        active_attempt=current_active_attempt,
+                                        loss_reason=AttemptOwnerLossReason.FENCED,
+                                        event_count=event_count,
+                                        terminal_seen=terminal_seen,
+                                    )
+                                    current_active_attempt = None
                                 return
                             if next_request_with_trace is None:
                                 terminal_seen = True
@@ -950,15 +1074,26 @@ class LocalRunHarness:
                                     )
                                 )
                             except Exception as acquire_exc:
-                                terminal_seen = (
-                                    await self._append_overflow_acquire_failure_terminal(
+                                try:
+                                    terminal_seen = (
+                                        await self._append_overflow_acquire_failure_terminal(
+                                            request=attempt_request,
+                                            active_attempt=current_active_attempt,
+                                            attempt_index=attempt_index,
+                                            new_attempt_index=new_attempt_index,
+                                            error=acquire_exc,
+                                        )
+                                    )
+                                except AttemptFencingError:
+                                    terminal_seen = await self._handle_owner_lost(
                                         request=attempt_request,
                                         active_attempt=current_active_attempt,
-                                        attempt_index=attempt_index,
-                                        new_attempt_index=new_attempt_index,
-                                        error=acquire_exc,
+                                        loss_reason=AttemptOwnerLossReason.FENCED,
+                                        event_count=event_count,
+                                        terminal_seen=terminal_seen,
                                     )
-                                )
+                                    current_active_attempt = None
+                                    return
                                 # _append_terminal_and_close 已经把旧
                                 # attempt 推进到终态并 close lease_exit_stack;
                                 # 把 current_active_attempt 置 None 防止

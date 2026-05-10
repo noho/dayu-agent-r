@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import logging
 from collections.abc import AsyncGenerator, AsyncIterator
 from contextlib import asynccontextmanager
 from dataclasses import dataclass, field, replace
@@ -36,6 +37,7 @@ from dayu.host._attempt_lease import (
     AttemptFencingError,
     AttemptFencingReason,
     AttemptOwnerContext,
+    AttemptTerminalLink,
 )
 from dayu.host._attempt_supervisor import AttemptSupervisor
 from dayu.host._conversation_memory import (
@@ -1209,5 +1211,161 @@ async def test_durable_overflow_retry_acquire_failure_writes_owner_scoped_termin
             isinstance(event.data, HostContextCompactCompletedData)
             for event in events
         )
+    finally:
+        bundle.close()
+
+
+@pytest.mark.asyncio
+async def test_durable_overflow_acquire_failure_terminal_fencing_routes_owner_lost(
+    monkeypatch: pytest.MonkeyPatch,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """N1: retry acquire 失败后旧 owner terminal close 被 fence 时走 owner-lost。
+
+    :param monkeypatch: pytest monkeypatch fixture。
+    :param caplog: pytest 日志捕获 fixture。
+    :returns: 无返回值。
+    :raises AssertionError: 断言不满足时由 pytest 抛出。
+    """
+
+    proxy = _OverflowThenSuccessProxy()
+    bundle = build_durable_harness(
+        config=DurableHarnessConfig(database_path=":memory:"),
+        proxy=proxy,
+    )
+    try:
+        original_lease_context = AttemptSupervisor.lease_context
+        lease_context_call_count = 0
+
+        @asynccontextmanager
+        async def _patched_lease_context(
+            self: AttemptSupervisor,
+            *,
+            run_id: str,
+            attempt_index: int,
+            recovered_from_attempt_id: str | None = None,
+        ) -> AsyncGenerator[AttemptOwnerContext, None]:
+            """第一次 acquire 成功，第二次 acquire 模拟 fencing 失败。
+
+            :param self: 被 monkeypatch 的 supervisor。
+            :param run_id: Run id。
+            :param attempt_index: attempt 序号。
+            :param recovered_from_attempt_id: 恢复来源 attempt id。
+            :returns: 异步 owner context generator。
+            :raises AttemptFencingError: 第二次 acquire 时主动抛出。
+            """
+
+            nonlocal lease_context_call_count
+
+            lease_context_call_count += 1
+            if lease_context_call_count >= 2:
+                raise AttemptFencingError(
+                    attempt_id=f"attempt-{run_id}-{attempt_index}",
+                    run_id=run_id,
+                    reason=AttemptFencingReason.STORAGE_CONFLICT,
+                    current_state=None,
+                    owner_id=None,
+                    fencing_token=None,
+                )
+            async with original_lease_context(
+                self,
+                run_id=run_id,
+                attempt_index=attempt_index,
+                recovered_from_attempt_id=recovered_from_attempt_id,
+            ) as owner_context:
+                yield owner_context
+
+        terminal_close_attempts: list[str] = []
+
+        async def _patched_append_terminal_and_close(
+            self: AttemptSupervisor,
+            *,
+            owner_context: AttemptOwnerContext,
+            draft: RunEventDraft,
+            failure_summary: str | None = None,
+            terminal_state_override: AttemptState | None = None,
+        ) -> AttemptTerminalLink:
+            """模拟旧 owner terminal close 发生 CAS miss。
+
+            :param self: 被 monkeypatch 的 supervisor。
+            :param owner_context: 旧 attempt owner context。
+            :param draft: terminal RunEvent 草稿。
+            :param failure_summary: attempt failure summary。
+            :param terminal_state_override: terminal state 覆盖值。
+            :returns: 不返回；本 helper 总是抛出。
+            :raises AttemptFencingError: 始终模拟 fencing token 不匹配。
+            """
+
+            _ = (self, draft, failure_summary, terminal_state_override)
+            terminal_close_attempts.append(owner_context.attempt_id)
+            raise AttemptFencingError(
+                attempt_id=owner_context.attempt_id,
+                run_id=owner_context.run_id,
+                reason=AttemptFencingReason.FENCING_TOKEN_MISMATCH,
+                current_state=AttemptState.RUNNING,
+                owner_id=owner_context.owner_id,
+                fencing_token=owner_context.fencing_token,
+            )
+
+        monkeypatch.setattr(
+            AttemptSupervisor,
+            "lease_context",
+            _patched_lease_context,
+        )
+        monkeypatch.setattr(
+            AttemptSupervisor,
+            "append_terminal_and_close",
+            _patched_append_terminal_and_close,
+        )
+
+        original_append = DurableRunEventStore.append
+        bare_terminal_append_calls: list[str] = []
+
+        async def _spy_append(
+            self: DurableRunEventStore,
+            draft: RunEventDraft,
+        ) -> RunEvent:
+            """记录是否存在 public append 直写 terminal。
+
+            :param self: DurableRunEventStore 实例。
+            :param draft: RunEvent 草稿。
+            :returns: 落库后的 RunEvent。
+            :raises Exception: 透传原 append 异常。
+            """
+
+            if draft.type is RunEventType.RUN_FAILED:
+                bare_terminal_append_calls.append(draft.run_id)
+            return await original_append(self, draft)
+
+        monkeypatch.setattr(
+            DurableRunEventStore,
+            "append",
+            _spy_append,
+        )
+
+        request = _request()
+        with caplog.at_level(logging.ERROR, logger="dayu.host._run_harness"):
+            stream = await bundle.harness.start_run(request)
+            events = await asyncio.wait_for(
+                _collect(stream.events), timeout=5.0
+            )
+
+        assert lease_context_call_count == 2
+        assert len(terminal_close_attempts) == 2, (
+            "acquire-failure terminal close fencing 后必须再走 "
+            "_handle_owner_lost 的 append_terminal_and_close 尝试"
+        )
+        assert bare_terminal_append_calls == []
+        assert all(
+            not (
+                event.type is RunEventType.RUN_FAILED
+                and event.source is RunEventSource.HOST
+            )
+            for event in events
+        ), "CAS miss 路径不应写 stale HOST terminal RunEvent"
+        assert all(
+            "host.run.background_task_failed" not in record.getMessage()
+            for record in caplog.records
+        ), "AttemptFencingError 不应裸冒泡为 background task 失败"
     finally:
         bundle.close()

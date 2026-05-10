@@ -13,6 +13,7 @@ event position 原子 close。
 
 from __future__ import annotations
 
+import hmac
 import json
 import sqlite3
 from dataclasses import dataclass
@@ -1142,7 +1143,7 @@ class AttemptLeaseStore:
                 current_fencing_token=current_token,
             )
         expected_hash = owner_context.owner_token.digest()
-        if current_hash != expected_hash:
+        if not hmac.compare_digest(current_hash, expected_hash):
             return AttemptLeaseResult(
                 decision=AttemptLeaseDecision.FENCED,
                 owner_context=None,
