@@ -247,17 +247,19 @@ Host 当前 Run harness、RunEventStore、ToolRuntime、Conversation Memory / Ru
   验证 (1) `build_durable_harness` 默认装配 `DurableConversationMemoryStore`；
   (2) terminal run + drain 后重新装配仍可读出 memory snapshot；(3) checkpoint
   尚未推进时崩溃 → `startup_reconcile` 重投 EventLog 重建 read model 并幂等；
-  (4) `apply_patch`（reset / SESSION clear / claim correction）持久化生效，
-  非 SESSION scope clear 抛 `ValueError`；(5) snapshot JSON encode/decode
-  roundtrip 无损；(6) 仓库内不再残留 production `InMemoryConversationMemoryStore`。
+  (4) 非终态事件已 checkpoint 后进程重启，terminal 投影仍从 EventLog 重读完整 run
+  facts；(5) 注入 clock 控制 snapshot `updated_at`；(6) `apply_patch`（reset /
+  SESSION clear / claim correction）持久化生效，非 SESSION scope clear 抛
+  `ValueError`；(7) snapshot JSON encode/decode roundtrip 无损；(8) 仓库内
+  不再残留 production `InMemoryConversationMemoryStore`。
   legacy 内存 fake 由 `tests/host/_memory_store_fake.py` 提供，仅供 tests / smoke
   使用，生产代码不得依赖。
 - P8 smoke（`utils/smoke_host_p8_attempt_lease.py`）是手工脚本，不在 pytest 默认集内；
   7 个场景（owner acquire+renew、busy、recovery scan、late write fenced、terminal close、
   observer reconcile、durable memory recovery）通过 fake clock + deterministic fake worker
   覆盖。慢硬盘 + Docker Linux stress 测试由 GitHub issue #38 跟踪，不在当前测试集内。
-- public boundary：锁定 `dayu.host.__all__`，包根仅暴露 fetch_more 协议契约
-  (`ToolFetchMoreRequest` / `ToolFetchMoreHandle` 等)；Run 级 `start_run` / `stream_run_events` /
+- public boundary：锁定 `dayu.host.__all__`，包根仅暴露当前 fetch_more 协议契约
+  (`ToolRuntimeCursor` / `ToolFetchMoreRequest` / `ToolFetchMoreResult` 等)；Run 级 `start_run` / `stream_run_events` /
   `get_run_result` 与 framework `fetch_more` 路径必须经 `LocalRunHarness` 实例 / 普通 tool call
   访问，阻止 `EngineWorker`、`LocalProxy`、
   `ToolExecutor`、`InMemoryToolRuntime`、`ToolRuntimeToolExecutor`、`DurableConversationMemoryStore`、

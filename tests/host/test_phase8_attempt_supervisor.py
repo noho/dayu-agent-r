@@ -41,6 +41,13 @@ from dayu.engine.contracts.engine_events import (
     EngineEvent,
     EngineEventType,
 )
+from dayu.engine import (
+    AgentMessageRole,
+    AgentPolicy,
+    RunnerCallOptions,
+    RunnerSpec,
+    UserMessage,
+)
 from dayu.contracts import CancellationToken
 from dayu.host._attempt_lease import (
     ATTEMPT_OWNER_ID_PREFIX,
@@ -78,13 +85,19 @@ from dayu.host._internal_contracts import (
     GlobalEventPosition,
 )
 from dayu.host._run_state_store import AttemptLeaseStore
+from dayu.host._run_harness import _ActiveAttempt
 from dayu.host.contracts import (
     HostRunFailedData,
     RunEvent,
     RunEventDraft,
+    RunEventKind,
     RunEventSource,
     RunEventType,
+    RunInput,
+    RunOptions,
     StartRunRequest,
+    UserInputAcceptedData,
+    UserInputScope,
 )
 
 
@@ -103,6 +116,81 @@ class _FakeClock:
 
     def advance(self, delta: timedelta) -> None:
         self.current = self.current + delta
+
+
+class _FencingProxy:
+    """在获取 Engine iterator 时直接抛 fencing 的 fake proxy。"""
+
+    def stream_engine_events(
+        self,
+        *,
+        request: StartRunRequest,
+        cancellation_token: CancellationToken,
+    ) -> AsyncIterator[EngineEvent]:
+        """模拟 proxy 入口阶段被 owner fencing 拒绝。
+
+        :param request: start run 请求。
+        :param cancellation_token: 取消 token。
+        :returns: 永不返回异步迭代器。
+        :raises AttemptFencingError: 始终抛出 typed fencing 错误。
+        """
+
+        del cancellation_token
+        raise AttemptFencingError(
+            attempt_id="attempt-entry-fenced",
+            run_id=request.run_id,
+            reason=AttemptFencingReason.OWNER_MISMATCH,
+            current_state=AttemptState.RUNNING,
+            owner_id="owner-other",
+            fencing_token=FencingToken(value=1),
+        )
+
+
+def _minimal_start_request(*, session_id: str, run_id: str) -> StartRunRequest:
+    """构造最小 durable harness start request。
+
+    :param session_id: 会话 id。
+    :param run_id: Run id。
+    :returns: :class:`StartRunRequest`。
+    :raises Exception: 不主动抛出异常。
+    """
+
+    return StartRunRequest(
+        session_id=session_id,
+        run_id=run_id,
+        input=RunInput(
+            messages=(UserMessage(role=AgentMessageRole.USER, content="hi"),)
+        ),
+        options=RunOptions(
+            runner_spec=RunnerSpec(
+                provider="openai",
+                model="m",
+                endpoint="https://example.test/v1/chat/completions",
+                api_key_ref="K",
+                headers={},
+                supports_tool_calling=True,
+                supports_streaming=True,
+                supports_stream_usage=False,
+                default_timeout_seconds=30.0,
+                max_retries=0,
+                provider_request=None,
+            ),
+            runner_options=RunnerCallOptions(
+                temperature=None,
+                max_tokens=None,
+                top_p=None,
+                stream=True,
+            ),
+            agent_policy=AgentPolicy(
+                max_iterations=3,
+                continuation_max_attempts=1,
+                allow_tool_calls=True,
+            ),
+            stream=False,
+            disable_tools=True,
+            tool_schemas=(),
+        ),
+    )
 
 
 def _open_storage() -> HostStorage:
@@ -460,7 +548,7 @@ class _RecordingSupervisor:
 async def test_local_run_harness_thin_delegates_to_supervisor() -> None:
     """harness ``_begin_attempt_if_durable`` 仅薄委托 supervisor.lease_context。"""
 
-    from dayu.host._run_harness import LocalRunHarness, _ActiveAttempt
+    from dayu.host._run_harness import LocalRunHarness
     from dayu.host._proxy import LocalProxy
     from dayu.host._worker import EngineWorker
     from dayu.host._tool_runtime import ToolRuntimeToolExecutor
@@ -908,7 +996,7 @@ async def test_owner_lost_during_engine_wait_stops_late_event_append() -> None:
     断言: late event 不进入 EventLog (event_store.append 不再被调用)。
     """
 
-    from dayu.host._run_harness import LocalRunHarness
+    from dayu.host._run_harness import LocalRunHarness, _ActiveAttempt
 
     bundle = build_durable_harness(
         config=DurableHarnessConfig(database_path=":memory:")
@@ -1558,5 +1646,119 @@ async def test_handle_owner_lost_cas_miss_no_stale_terminal() -> None:
         # 显式 aclose() generator, 验证不抛 user-visible 异常即可。
         events_iter = cast(AsyncGenerator[RunEvent, None], run_stream.events)
         await events_iter.aclose()
+    finally:
+        bundle.close()
+
+
+@pytest.mark.asyncio
+async def test_owner_lost_handler_non_fencing_error_clears_active_attempt(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """owner-lost handler 抛普通异常时 finally 不得重复 close 同一 attempt。
+
+    :param monkeypatch: pytest monkeypatch fixture。
+    :returns: 无返回值。
+    :raises AssertionError: 发生重复 close 或未透传原异常时抛出。
+    """
+
+    from dayu.host._proxy import WorkerProxy
+    from dayu.host._run_harness import LocalRunHarness
+
+    bundle = build_durable_harness(
+        config=DurableHarnessConfig(database_path=":memory:")
+    )
+    finish_calls: list[str] = []
+
+    async def _raising_owner_lost(
+        self: LocalRunHarness,
+        *,
+        request: StartRunRequest,
+        active_attempt: _ActiveAttempt | None,
+        loss_reason: AttemptOwnerLossReason,
+        event_count: int,
+        terminal_seen: bool,
+    ) -> bool:
+        """替换 ``_handle_owner_lost``，模拟非 fencing cleanup 异常。
+
+        :param self: harness 实例。
+        :param request: 当前 run 请求。
+        :param active_attempt: 当前 attempt。
+        :param loss_reason: owner-lost 原因。
+        :param event_count: 已处理事件数。
+        :param terminal_seen: 是否已见 terminal。
+        :returns: 永不返回。
+        :raises RuntimeError: 始终抛出模拟异常。
+        """
+
+        del self, request, active_attempt, loss_reason, event_count
+        del terminal_seen
+        raise RuntimeError("owner-lost-cleanup-failed")
+
+    async def _recording_finish(
+        self: LocalRunHarness,
+        *,
+        active_attempt: _ActiveAttempt | None,
+        terminal_event: RunEvent | None,
+        state: AttemptState | None = None,
+        failure_summary: str | None = None,
+    ) -> None:
+        """记录是否发生 fallback attempt close。
+
+        :param self: harness 实例。
+        :param active_attempt: 当前 attempt。
+        :param terminal_event: terminal RunEvent。
+        :param state: 显式 attempt state。
+        :param failure_summary: 失败摘要。
+        :returns: 无返回值。
+        :raises Exception: 不主动抛出异常。
+        """
+
+        del self, terminal_event, state, failure_summary
+        if active_attempt is not None:
+            finish_calls.append("close")
+
+    monkeypatch.setattr(
+        LocalRunHarness, "_handle_owner_lost", _raising_owner_lost
+    )
+    monkeypatch.setattr(
+        LocalRunHarness, "_finish_attempt_if_durable", _recording_finish
+    )
+
+    try:
+        runtime = bundle.harness.tool_runtime
+        assert runtime is not None
+        harness = LocalRunHarness(
+            is_durable=True,
+            proxy=cast(WorkerProxy, _FencingProxy()),
+            event_store=bundle.event_store,
+            tool_runtime=runtime,
+            memory_store=bundle.memory_store,
+            coordinator=bundle.coordinator,
+            attempt_supervisor=bundle.attempt_supervisor,
+            storage=bundle.storage,
+        )
+        request = _minimal_start_request(session_id="s_clear", run_id="r_clear")
+        current_user_event = await bundle.event_store.append(
+            RunEventDraft(
+                run_id=request.run_id,
+                session_id=request.session_id,
+                kind=RunEventKind.CANONICAL,
+                source=RunEventSource.HOST,
+                type=RunEventType.USER_INPUT_ACCEPTED,
+                occurred_at=datetime.now(tz=timezone.utc),
+                data=UserInputAcceptedData(
+                    turn_id=request.run_id,
+                    content="hi",
+                    scope=UserInputScope.SESSION,
+                ),
+                source_engine_event_id=None,
+            )
+        )
+        with pytest.raises(RuntimeError, match="owner-lost-cleanup-failed"):
+            await harness._run_to_store(  # noqa: SLF001
+                request=request,
+                current_user_event=current_user_event,
+            )
+        assert finish_calls == []
     finally:
         bundle.close()

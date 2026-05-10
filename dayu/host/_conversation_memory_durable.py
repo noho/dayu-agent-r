@@ -30,7 +30,7 @@ import logging
 from collections.abc import Mapping
 from dataclasses import dataclass, field, replace
 from datetime import datetime, timezone
-from typing import TypeAlias
+from typing import Protocol, TypeAlias
 
 from dayu.contracts.json_value import JsonValue
 from dayu.host._conversation_memory import (
@@ -96,6 +96,35 @@ _SCHEMA_STATEMENTS: tuple[str, ...] = (
 )
 
 
+class UtcClock(Protocol):
+    """durable memory 使用的 UTC clock 协议。
+
+    该协议与 Host 其它 durable state store 的 clock 形状保持一致，使
+    snapshot ``updated_at`` 可在测试中确定性断言。
+    """
+
+    def now(self) -> datetime:
+        """返回当前 timezone-aware UTC 时间。
+
+        :returns: timezone-aware UTC datetime。
+        :raises Exception: 具体 clock 失败时透传。
+        """
+        ...
+
+
+class _SystemUtcClock:
+    """系统 UTC clock 默认实现。"""
+
+    def now(self) -> datetime:
+        """返回当前 timezone-aware UTC 时间。
+
+        :returns: timezone-aware UTC datetime。
+        :raises Exception: 不主动抛出异常。
+        """
+
+        return datetime.now(tz=timezone.utc)
+
+
 def ensure_durable_memory_schema(storage: HostStorage) -> None:
     """初始化 durable conversation memory snapshot schema。
 
@@ -113,10 +142,12 @@ class DurableConversationMemoryStore:
 
     :param storage: Host durable storage。
     :param recent_turn_limit: recent raw turn 保留数量，与 P3 内存态语义一致。
+    :param clock: Host internal UTC clock，用于 deterministic ``updated_at``。
     """
 
     storage: HostStorage
     recent_turn_limit: int = DEFAULT_RECENT_TURN_LIMIT
+    clock: UtcClock = field(default_factory=_SystemUtcClock)
     _lock: asyncio.Lock = field(default_factory=asyncio.Lock, init=False)
 
     async def project_run_events(self, events: tuple[RunEvent, ...]) -> None:
@@ -474,10 +505,16 @@ class DurableConversationMemoryStore:
         tx: HostStorageTransaction,
         snapshot: ConversationMemorySnapshot,
     ) -> None:
-        """事务内 upsert snapshot。"""
+        """事务内 upsert snapshot。
+
+        :param tx: 当前事务。
+        :param snapshot: 待写入的 snapshot。
+        :returns: 无返回值。
+        :raises sqlite3.DatabaseError: 写入失败时抛出。
+        """
 
         payload_text = _encode_snapshot_text(snapshot=snapshot)
-        updated_at = datetime.now(tz=timezone.utc).isoformat()
+        updated_at = self.clock.now().isoformat()
         tx.execute(
             "INSERT INTO host_conversation_memory_snapshots "
             "(session_id, snapshot_payload, updated_at) "
@@ -493,11 +530,13 @@ def open_durable_conversation_memory_store(
     storage: HostStorage,
     *,
     recent_turn_limit: int = DEFAULT_RECENT_TURN_LIMIT,
+    clock: UtcClock | None = None,
 ) -> DurableConversationMemoryStore:
     """打开并初始化 durable conversation memory store。
 
     :param storage: 已构造的 :class:`HostStorage`。
     :param recent_turn_limit: recent raw turn 保留数量。
+    :param clock: 可选 Host internal UTC clock；未传入时使用系统 UTC clock。
     :returns: 已初始化 schema 的 :class:`DurableConversationMemoryStore`。
     :raises sqlite3.DatabaseError: schema bootstrap 失败时抛出。
     """
@@ -507,6 +546,7 @@ def open_durable_conversation_memory_store(
     return DurableConversationMemoryStore(
         storage=storage,
         recent_turn_limit=recent_turn_limit,
+        clock=clock if clock is not None else _SystemUtcClock(),
     )
 
 
@@ -1000,6 +1040,7 @@ def _decode_str_tuple(payload: _JsonObject, key: str) -> tuple[str, ...]:
 __all__ = [
     "DEFAULT_RECENT_TURN_LIMIT",
     "DurableConversationMemoryStore",
+    "UtcClock",
     "ensure_durable_memory_schema",
     "open_durable_conversation_memory_store",
 ]

@@ -205,9 +205,14 @@ def build_durable_harness(
 
     actual_memory: ConversationMemoryProjectionStore = (
         memory_store if memory_store is not None
-        else open_durable_conversation_memory_store(storage)
+        else open_durable_conversation_memory_store(
+            storage, clock=actual_clock
+        )
     )
-    memory_observer = MemoryProjectionObserver(memory_store=actual_memory)
+    memory_observer = MemoryProjectionObserver(
+        memory_store=actual_memory,
+        event_reader=event_store,
+    )
     timeline_observer = TimelineProjectionObserver()
     audit_observer = AuditProjectionObserver()
 

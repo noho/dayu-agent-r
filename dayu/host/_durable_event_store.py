@@ -690,6 +690,40 @@ class DurableRunEventStore:
             result.append((position, event))
         return tuple(result)
 
+    def fetch_canonical_events_for_run_in_transaction(
+        self,
+        *,
+        tx: HostStorageTransaction,
+        session_id: str,
+        run_id: str,
+    ) -> tuple[RunEvent, ...]:
+        """在调用方事务内按 run 读取全部 canonical RunEvent。
+
+        durable read model 在 terminal 投影时使用本 Host internal API 从
+        EventLog 真源重建同一 run 的完整 canonical facts，避免依赖进程内
+        pending 状态跨 checkpoint / restart 保存事实。
+
+        :param tx: 当前 Host storage 事务。
+        :param session_id: 会话 id，用于限定同一 session 边界。
+        :param run_id: Run id。
+        :returns: 该 run 的 canonical RunEvent 元组，按 global position 升序。
+        :raises sqlite3.DatabaseError: 读取失败时抛出。
+        """
+
+        cursor = tx.execute(
+            """
+            SELECT run_id, session_id, sequence, event_position, kind,
+                source, type, occurred_at, payload, source_engine_event_id
+            FROM host_run_events
+            WHERE session_id = ? AND run_id = ? AND kind = ?
+            ORDER BY event_position ASC
+            """,
+            (session_id, run_id, RunEventKind.CANONICAL.value),
+        )
+        rows = cursor.fetchall()
+        cursor.close()
+        return tuple(_row_to_run_event(row) for row in rows)
+
     def _make_notify_hook(self) -> "Callable[[], None]":
         """构造一个 commit 后通知订阅者的 hook。
 

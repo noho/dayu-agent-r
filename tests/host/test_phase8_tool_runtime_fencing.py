@@ -23,6 +23,17 @@ from datetime import datetime, timedelta, timezone
 
 import pytest
 
+from dayu.contracts import JsonValue, ToolTruncateSpec
+from dayu.contracts.tool_call import (
+    ToolCallRequest,
+    ToolExecutionContext,
+    ToolExecutionRequest,
+)
+from dayu.contracts.tool_outcome import (
+    ToolCompletedOutcome,
+    ToolExecutionOutcome,
+)
+from dayu.contracts.tool_result import ToolResultSuccess
 from dayu.host._attempt_lease import (
     AttemptFencingError,
     AttemptFencingReason,
@@ -37,16 +48,22 @@ from dayu.host._durable_event_store import (
     open_durable_event_store,
 )
 from dayu.host._host_storage_transaction import HostStorage
-from dayu.host._internal_contracts import ExtendedRunState
+from dayu.host._internal_contracts import (
+    AttemptState,
+    ExtendedRunState,
+    FencingToken,
+)
 from dayu.host._run_state_store import AttemptLeaseStore
 from dayu.host._tool_runtime import (
     InMemoryToolRuntime,
     PlainRunEventAppender,
     ToolRuntimeOwnerScope,
+    ToolRuntimeEventAppender,
     active_tool_runtime_appender,
     _CursorRecord,
 )
 from dayu.host.contracts import (
+    RunEvent,
     RunEventDraft,
     RunEventKind,
     RunEventSource,
@@ -54,6 +71,112 @@ from dayu.host.contracts import (
     ToolFetchMoreRequest,
     ToolRuntimeCursor,
 )
+
+
+@dataclass(frozen=True, slots=True)
+class _Token:
+    """测试用永不取消 token。"""
+
+    def is_cancelled(self) -> bool:
+        """返回是否已经取消。
+
+        :returns: 始终为 ``False``。
+        :raises Exception: 不主动抛出异常。
+        """
+
+        return False
+
+    def cancel_reason(self) -> str | None:
+        """返回取消原因。
+
+        :returns: 始终为 ``None``。
+        :raises Exception: 不主动抛出异常。
+        """
+
+        return None
+
+    def requested_at(self) -> datetime | None:
+        """返回取消请求时间。
+
+        :returns: 始终为 ``None``。
+        :raises Exception: 不主动抛出异常。
+        """
+
+        return None
+
+
+@dataclass(slots=True)
+class _CompletedExecutor:
+    """返回固定工具结果的 fake executor。"""
+
+    value: JsonValue
+
+    async def execute(
+        self,
+        request: ToolExecutionRequest,
+    ) -> ToolExecutionOutcome:
+        """返回成功工具结果。
+
+        :param request: 工具执行请求。
+        :returns: 成功 outcome。
+        :raises Exception: 不主动抛出异常。
+        """
+
+        del request
+        return ToolCompletedOutcome(
+            result=ToolResultSuccess(
+                ok=True,
+                value=self.value,
+                truncation=None,
+                meta=None,
+            )
+        )
+
+
+class _NoopExecutor:
+    """返回空成功结果的 fake executor。"""
+
+    async def execute(
+        self,
+        request: ToolExecutionRequest,
+    ) -> ToolExecutionOutcome:
+        """返回空成功工具结果。
+
+        :param request: 工具执行请求。
+        :returns: 空成功 outcome。
+        :raises Exception: 不主动抛出异常。
+        """
+
+        del request
+        return ToolCompletedOutcome(
+            result=ToolResultSuccess(
+                ok=True,
+                value=None,
+                truncation=None,
+                meta=None,
+            )
+        )
+
+
+class _FencingAppender:
+    """始终抛 :class:`AttemptFencingError` 的 appender。"""
+
+    async def append(self, draft: RunEventDraft) -> RunEvent:
+        """模拟 owner CAS 在 ToolRuntime fact append path 被 fenced。
+
+        :param draft: 待写入的 RunEvent 草稿。
+        :returns: 永不返回。
+        :raises AttemptFencingError: 始终抛出 typed fencing 错误。
+        """
+
+        raise AttemptFencingError(
+            attempt_id="attempt-fenced",
+            run_id=draft.run_id,
+            reason=AttemptFencingReason.OWNER_MISMATCH,
+            current_state=AttemptState.RUNNING,
+            owner_id="owner-other",
+            fencing_token=FencingToken(value=1),
+        )
 
 
 @dataclass(slots=True)
@@ -156,6 +279,34 @@ def _tool_truncated_draft(*, run_id: str) -> RunEventDraft:
     )
 
 
+def _tool_request() -> ToolExecutionRequest:
+    """构造会触发截断 fact append 的工具执行请求。
+
+    :returns: :class:`ToolExecutionRequest`。
+    :raises Exception: 不主动抛出异常。
+    """
+
+    return ToolExecutionRequest(
+        call=ToolCallRequest(
+            tool_call_id="tc-fenced",
+            name="demo",
+            arguments={},
+            index_in_iteration=0,
+            provider_state=None,
+        ),
+        context=ToolExecutionContext(
+            run_id="r1",
+            session_id="s",
+            iteration_id="iter-1",
+            tool_call_id="tc-fenced",
+            index_in_iteration=0,
+            timeout_seconds=None,
+            cancellation_token=_Token(),
+            correlation_id=None,
+        ),
+    )
+
+
 @pytest.mark.asyncio
 async def test_active_appender_none_outside_scope() -> None:
     """没有 scope 时 ``active_tool_runtime_appender`` 必须返回 ``None``。
@@ -204,13 +355,9 @@ async def test_inmemory_tool_runtime_resolves_to_plain_outside_scope() -> None:
         del clock
         event_store = DurableRunEventStore(storage=storage)
 
-        async def _noop_executor(*args: object, **kwargs: object) -> object:
-            del args, kwargs
-            return None
-
         runtime = InMemoryToolRuntime(
             is_durable=False,
-            executor=_noop_executor,  # type: ignore[arg-type]
+            executor=_NoopExecutor(),
             event_store=event_store,
         )
         appender = runtime._resolve_appender()  # noqa: SLF001
@@ -230,13 +377,9 @@ async def test_inmemory_tool_runtime_resolves_to_scoped_inside_scope() -> None:
         clock = _FakeClock()
         supervisor = _build_supervisor(storage=storage, clock=clock)
 
-        async def _noop_executor(*args: object, **kwargs: object) -> object:
-            del args, kwargs
-            return None
-
         runtime = InMemoryToolRuntime(
             is_durable=False,
-            executor=_noop_executor,  # type: ignore[arg-type]
+            executor=_NoopExecutor(),
             event_store=supervisor.event_store,
         )
         async with supervisor.lease_context(
@@ -252,6 +395,43 @@ async def test_inmemory_tool_runtime_resolves_to_scoped_inside_scope() -> None:
                 runtime._resolve_appender(),  # noqa: SLF001
                 PlainRunEventAppender,
             )
+    finally:
+        storage.close()
+
+
+@pytest.mark.asyncio
+async def test_execute_tool_call_propagates_attempt_fencing_error_from_append_path() -> None:
+    """ToolRuntime append path 的 fencing 必须透传，不能转成普通工具失败。
+
+    回归 PR #40 1939-F1：``execute_tool_call`` 的 catch-all 曾把
+    ``AttemptFencingError`` 吞成 ``ToolFailedOutcome``，导致 Host harness
+    看不到 owner-lost 信号。本测试让截断成功后的 fact append 抛 fencing，
+    断言异常原样透传。
+    """
+
+    storage = _open_storage()
+    try:
+        runtime = InMemoryToolRuntime(
+            is_durable=False,
+            executor=_CompletedExecutor(value=[1, 2, 3]),
+            event_store=DurableRunEventStore(storage=storage),
+            truncate_specs={
+                "demo": ToolTruncateSpec(
+                    enabled=True,
+                    strategy="list_items",
+                    limits={"max_items": 1},
+                    target_field=None,
+                    field_path=None,
+                    ttl_seconds=30,
+                )
+            },
+            token_generator=lambda: "cursor-fenced",
+        )
+        appender: ToolRuntimeEventAppender = _FencingAppender()
+        async with ToolRuntimeOwnerScope(appender):
+            with pytest.raises(AttemptFencingError) as excinfo:
+                await runtime.execute_tool_call(_tool_request())
+        assert excinfo.value.reason is AttemptFencingReason.OWNER_MISMATCH
     finally:
         storage.close()
 
@@ -363,13 +543,9 @@ async def test_fetch_more_under_owner_scope_appends_facts_normally() -> None:
         clock = _FakeClock()
         supervisor = _build_supervisor(storage=storage, clock=clock)
 
-        async def _noop_executor(*args: object, **kwargs: object) -> object:
-            del args, kwargs
-            return None
-
         runtime = InMemoryToolRuntime(
             is_durable=False,
-            executor=_noop_executor,  # type: ignore[arg-type]
+            executor=_NoopExecutor(),
             event_store=supervisor.event_store,
         )
         # 构造一个 cursor 绑定到 run_id=r1, 与 owner scope 一致。
@@ -432,13 +608,9 @@ async def test_fetch_more_run_id_mismatch_is_fenced_end_to_end() -> None:
         clock = _FakeClock()
         supervisor = _build_supervisor(storage=storage, clock=clock)
 
-        async def _noop_executor(*args: object, **kwargs: object) -> object:
-            del args, kwargs
-            return None
-
         runtime = InMemoryToolRuntime(
             is_durable=False,
-            executor=_noop_executor,  # type: ignore[arg-type]
+            executor=_NoopExecutor(),
             event_store=supervisor.event_store,
         )
         # 旧 cursor 绑定到 r_other (上一个 attempt 留下的); request 也指向
@@ -506,13 +678,9 @@ async def test_durable_runtime_without_owner_scope_fails_fast() -> None:
         await _seed_run(storage, run_id="r1")
         event_store = DurableRunEventStore(storage=storage)
 
-        async def _noop_executor(*args: object, **kwargs: object) -> object:
-            del args, kwargs
-            return None
-
         runtime = InMemoryToolRuntime(
             is_durable=True,
-            executor=_noop_executor,  # type: ignore[arg-type]
+            executor=_NoopExecutor(),
             event_store=event_store,
         )
         with pytest.raises(RuntimeError, match="ToolRuntimeOwnerScope"):

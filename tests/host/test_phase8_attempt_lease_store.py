@@ -447,6 +447,50 @@ async def test_renew_terminal_when_attempt_terminal_state() -> None:
 
 
 @pytest.mark.asyncio
+async def test_renew_terminal_when_attempt_stale_state() -> None:
+    """旧 owner 在 STALE 诊断态 renew 必须 TERMINAL+ATTEMPT_TERMINAL。"""
+
+    storage = _open_storage()
+    await _seed_run(storage)
+    clock = _FakeClock()
+    lease_store = AttemptLeaseStore(storage=storage, clock=clock)
+    state_store = AttemptStateStore(storage=storage, clock=clock)
+    token = AttemptOwnerToken.new()
+
+    async with storage.transaction() as tx:
+        acquired = lease_store.acquire_new_attempt(
+            tx=tx,
+            attempt_id="a1",
+            run_id="r1",
+            attempt_index=0,
+            recovered_from_attempt_id=None,
+            owner_id="host:1",
+            owner_token=token,
+            lease_expires_at=_expires_at(clock),
+        )
+    assert acquired.owner_context is not None
+
+    async with storage.transaction() as tx:
+        state_store.update_state(
+            tx=tx,
+            attempt_id="a1",
+            state=AttemptState.STALE,
+            failure_summary="context_overflow_compacted",
+        )
+
+    async with storage.transaction() as tx:
+        result = lease_store.renew(
+            tx=tx,
+            owner_context=acquired.owner_context,
+            lease_expires_at=_expires_at(clock),
+        )
+    assert result.decision is AttemptLeaseDecision.TERMINAL
+    assert result.reason is AttemptFencingReason.ATTEMPT_TERMINAL
+    assert result.current_state is AttemptState.STALE
+    storage.close()
+
+
+@pytest.mark.asyncio
 async def test_verify_owner_passes_for_valid_lease() -> None:
     """合法 owner 通过 verify_owner，不抛异常。"""
 
@@ -533,6 +577,45 @@ async def test_verify_owner_raises_owner_missing_for_unknown_attempt() -> None:
         with pytest.raises(AttemptFencingError) as excinfo:
             lease_store.verify_owner(tx=tx, owner_context=ghost)
     assert excinfo.value.reason is AttemptFencingReason.OWNER_MISSING
+    storage.close()
+
+
+@pytest.mark.asyncio
+async def test_verify_owner_reports_stale_as_attempt_terminal() -> None:
+    """旧 owner 在 STALE 诊断态 verify_owner 必须抛 ATTEMPT_TERMINAL。"""
+
+    storage = _open_storage()
+    await _seed_run(storage)
+    clock = _FakeClock()
+    lease_store = AttemptLeaseStore(storage=storage, clock=clock)
+    state_store = AttemptStateStore(storage=storage, clock=clock)
+    token = AttemptOwnerToken.new()
+
+    async with storage.transaction() as tx:
+        acquired = lease_store.acquire_new_attempt(
+            tx=tx,
+            attempt_id="a1",
+            run_id="r1",
+            attempt_index=0,
+            recovered_from_attempt_id=None,
+            owner_id="host:1",
+            owner_token=token,
+            lease_expires_at=_expires_at(clock),
+        )
+    assert acquired.owner_context is not None
+    async with storage.transaction() as tx:
+        state_store.update_state(
+            tx=tx,
+            attempt_id="a1",
+            state=AttemptState.STALE,
+            failure_summary="context_overflow_compacted",
+        )
+
+    async with storage.transaction() as tx:
+        with pytest.raises(AttemptFencingError) as excinfo:
+            lease_store.verify_owner(tx=tx, owner_context=acquired.owner_context)
+    assert excinfo.value.reason is AttemptFencingReason.ATTEMPT_TERMINAL
+    assert excinfo.value.current_state is AttemptState.STALE
     storage.close()
 
 
@@ -678,7 +761,7 @@ async def test_allocate_fencing_token_fail_fast_when_lastrowid_invalid() -> None
         captured_sql: list[str] = field(default_factory=list)
 
         def execute(
-            self, sql: str, params: object = ()
+            self, sql: str, params: tuple[str, ...] = ()
         ) -> _NullLastRowidCursor:
             del params
             self.captured_sql.append(sql)

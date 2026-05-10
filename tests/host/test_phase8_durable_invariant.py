@@ -19,6 +19,12 @@ from datetime import datetime, timedelta, timezone
 
 import pytest
 
+from dayu.contracts.tool_call import ToolExecutionRequest
+from dayu.contracts.tool_outcome import (
+    ToolCompletedOutcome,
+    ToolExecutionOutcome,
+)
+from dayu.contracts.tool_result import ToolResultSuccess
 from dayu.host._attempt_lease import AttemptLeaseConfig
 from dayu.host._attempt_supervisor import AttemptSupervisor
 from dayu.host._durable_event_store import (
@@ -31,6 +37,7 @@ from dayu.host._proxy import LocalProxy
 from dayu.host._run_harness import LocalRunHarness
 from dayu.host._run_state_store import AttemptLeaseStore, AttemptStateStore
 from dayu.host._tool_runtime import InMemoryToolRuntime
+from dayu.host._tool_runtime import PlainRunEventAppender
 from dayu.host._worker import EngineWorker
 from dayu.host._tool_runtime import ToolRuntimeToolExecutor
 from tests.host._memory_store_fake import FakeInMemoryConversationMemoryStore
@@ -133,16 +140,25 @@ def _make_durable_runtime(storage: HostStorage) -> InMemoryToolRuntime:
 class _NoopExec:
     """no-op tool executor 占位。"""
 
-    async def execute(self, request: object) -> object:  # noqa: D401
-        """忽略 request, 返回 ``None``。
+    async def execute(
+        self, request: ToolExecutionRequest
+    ) -> ToolExecutionOutcome:
+        """忽略 request，返回空成功工具结果。
 
         :param request: 工具执行请求。
-        :returns: ``None``。
+        :returns: 空成功 outcome。
         :raises Exception: 不主动抛出异常。
         """
 
         del request
-        return None
+        return ToolCompletedOutcome(
+            result=ToolResultSuccess(
+                ok=True,
+                value=None,
+                truncation=None,
+                meta=None,
+            )
+        )
 
 
 def test_durable_requires_supervisor() -> None:
@@ -361,3 +377,40 @@ async def test_resolve_attempt_appender_durable_no_owner_raises() -> None:
             harness._resolve_attempt_appender(None)  # noqa: SLF001
     finally:
         storage.close()
+
+
+@pytest.mark.asyncio
+async def test_scope_appender_durable_without_owner_scope_raises() -> None:
+    """durable harness 无 owner scope 时 ``_scope_appender`` 必须 fail fast。"""
+
+    storage = _open_durable_storage()
+    try:
+        supervisor = _build_supervisor(storage)
+        harness = LocalRunHarness(
+            is_durable=True,
+            proxy=_make_proxy(),
+            event_store=DurableRunEventStore(storage=storage),
+            memory_store=FakeInMemoryConversationMemoryStore(),
+            attempt_supervisor=supervisor,
+            storage=storage,
+            tool_runtime=_make_durable_runtime(storage),
+        )
+        with pytest.raises(RuntimeError, match="ToolRuntimeOwnerScope"):
+            harness._scope_appender()  # noqa: SLF001
+    finally:
+        storage.close()
+
+
+@pytest.mark.asyncio
+async def test_scope_appender_non_durable_without_owner_scope_uses_plain_fallback() -> None:
+    """非 durable test-only 路径无 owner scope 时仍返回 plain appender。"""
+
+    harness = LocalRunHarness(
+        is_durable=False,
+        proxy=_make_proxy(),
+        memory_store=FakeInMemoryConversationMemoryStore(),
+        tool_runtime=_make_non_durable_runtime(),
+    )
+
+    appender = harness._scope_appender()  # noqa: SLF001
+    assert isinstance(appender, PlainRunEventAppender)

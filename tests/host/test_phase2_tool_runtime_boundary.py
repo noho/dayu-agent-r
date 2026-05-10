@@ -12,6 +12,7 @@ import pytest
 
 import dayu.engine as engine
 import dayu.host as host
+import dayu.host.contracts as host_contracts
 from dayu.contracts import (
     FRAMEWORK_FETCH_MORE_TOOL_NAME,
     JsonValue,
@@ -222,6 +223,25 @@ def test_host_does_not_export_internal_tool_runtime_implementations() -> None:
     assert "ToolExecutor" not in exported
     assert not hasattr(host, "InMemoryToolRuntime")
     assert not hasattr(host, "ToolRuntimeToolExecutor")
+
+
+def test_legacy_fetch_more_handle_contracts_are_not_public() -> None:
+    """旧 public fetch_more handle 协议不得从包根或 contracts 导出。"""
+
+    forbidden = frozenset(
+        {
+            "ToolFetchMoreHandleRequest",
+            "ToolFetchMoreHandle",
+            "ToolFetchMoreHandleSucceededResult",
+            "ToolFetchMoreHandleFailedResult",
+            "ToolFetchMoreHandleResult",
+        }
+    )
+    assert forbidden.isdisjoint(frozenset(host.__all__))
+    assert forbidden.isdisjoint(frozenset(host_contracts.__all__))
+    for name in forbidden:
+        assert not hasattr(host, name)
+        assert not hasattr(host_contracts, name)
 
 
 def test_engine_does_not_import_host_or_tool_runtime() -> None:

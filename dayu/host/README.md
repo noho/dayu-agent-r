@@ -444,8 +444,11 @@ terminal append、subscribe start / complete 与 canonical append 边界仍可�
 P8-S8 起默认装配的 `DurableConversationMemoryStore` 把 session memory snapshot 写入与 EventLog
 checkpoint 共用的 SQLite 事务，因此 ProjectionCoordinator 提交 batch 时 memory read model、timeline、
 audit、checkpoint 同生同灭；任何一方失败则整体回滚。它以 `session_id` 隔离 memory，只投影
-已 append 的 canonical RunEvent；不同 session 不互相读取 memory。`apply_patch`（reset / SESSION clear
-/ claim correction）也走同事务路径，跨进程恢复由 `startup_reconcile` 在启动时把 EventLog tail 重投到
+已 append 的 canonical RunEvent；不同 session 不互相读取 memory。memory observer 遇到 terminal
+事件时会在同一 observer transaction 内按 `session_id` + `run_id` 从 durable EventLog 重读该 run
+的完整 canonical facts，再写 snapshot 并推进 checkpoint；进程内 pending 只服务单进程短生命周期，
+不承担跨 checkpoint / restart 的事实保存职责。`apply_patch`（reset / SESSION clear
+/ claim correction）也走同事务路径，跨进程恢复由 `startup_reconcile` 在启动时把 EventLog tail 投到
 read model；非 SESSION scope clear 视为契约违约抛 `ValueError`。同一 store 实例通过 `asyncio.Lock`
 序列化 snapshot 读写以避免单进程内并发竞态，跨进程一致性靠 SQLite WAL + checkpoint 提交顺序。
 non-durable 顶层 `start_run` 便利入口仍接受调用方显式注入的 `ConversationMemoryStore`（例如

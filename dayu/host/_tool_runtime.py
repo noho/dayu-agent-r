@@ -39,6 +39,7 @@ from dayu.contracts.tool_result import (
     ToolResultSuccess,
     ToolTruncationInfo,
 )
+from dayu.host._attempt_lease import AttemptFencingError
 from dayu.host._event_store import RunEventStore
 from dayu.host._event_translation import terminal_result_from_event
 from dayu.host.contracts import (
@@ -323,7 +324,8 @@ class ToolRuntimeToolExecutor:
 
         :param request: 工具执行请求。
         :returns: 工具执行 outcome。
-        :raises Exception: 不主动抛出异常，内部异常转为工具失败 outcome。
+        :raises AttemptFencingError: owner fencing 透传给 Host harness。
+        :raises Exception: ToolRuntime 普通异常由 runtime 转为工具失败 outcome。
         """
 
         return await self.runtime.execute_tool_call(request)
@@ -402,7 +404,8 @@ class InMemoryToolRuntime:
 
         :param request: 工具执行请求。
         :returns: 截断后的工具执行 outcome。
-        :raises Exception: 不主动抛出异常，ToolRuntime 自身异常转失败 outcome。
+        :raises AttemptFencingError: owner fencing 必须透传给 Host harness。
+        :raises Exception: ToolRuntime 自身普通异常转失败 outcome，不向外抛出。
         """
 
         is_framework_fetch_more = request.call.name == FRAMEWORK_FETCH_MORE_TOOL_NAME
@@ -513,6 +516,8 @@ class InMemoryToolRuntime:
                 cursor_creation.record.ttl_seconds,
             )
             return completed
+        except AttemptFencingError:
+            raise
         except Exception as exc:
             _LOGGER.error(
                 "host.tool_runtime.tool_call_finished "

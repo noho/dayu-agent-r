@@ -16,7 +16,7 @@ from __future__ import annotations
 
 import json
 from collections.abc import Iterable
-from dataclasses import replace
+from dataclasses import dataclass, replace
 from datetime import datetime, timezone
 from pathlib import Path
 
@@ -62,6 +62,22 @@ from dayu.host.contracts import (
     UserInputAcceptedData,
     UserInputScope,
 )
+
+
+@dataclass(slots=True)
+class _FakeClock:
+    """durable memory 测试使用的可控 UTC clock。"""
+
+    current: datetime
+
+    def now(self) -> datetime:
+        """返回当前 fake UTC 时间。
+
+        :returns: timezone-aware UTC datetime。
+        :raises Exception: 不主动抛出异常。
+        """
+
+        return self.current
 
 
 def _utc() -> datetime:
@@ -124,6 +140,26 @@ def _final_draft(
         ),
         source_engine_event_id=f"engine_{run_id}_final",
     )
+
+
+def _snapshot_updated_at(storage: HostStorage, *, session_id: str) -> str:
+    """读取 durable memory snapshot 的 ``updated_at``。
+
+    :param storage: Host storage。
+    :param session_id: 会话 id。
+    :returns: ``updated_at`` ISO 文本。
+    :raises AssertionError: snapshot row 不存在或字段类型错误时抛出。
+    """
+
+    rows = storage.execute_read(
+        "SELECT updated_at FROM host_conversation_memory_snapshots "
+        "WHERE session_id = ?",
+        (session_id,),
+    )
+    assert rows
+    updated_at = rows[0]["updated_at"]
+    assert isinstance(updated_at, str)
+    return updated_at
 
 
 @pytest.mark.asyncio
@@ -232,6 +268,108 @@ async def test_startup_reconcile_recovers_snapshot_after_crash_before_projection
         await bundle.startup_reconcile()
         snapshot_again = await bundle.memory_store.get_snapshot(session_id)
         assert snapshot_again.recent_raw_turns == snapshot.recent_raw_turns
+    finally:
+        bundle.close()
+
+
+@pytest.mark.asyncio
+async def test_terminal_projection_rereads_run_events_after_pending_checkpoint_restart(
+    tmp_path: Path,
+) -> None:
+    """非终态 checkpoint 后重启，terminal 投影必须从 EventLog 重读完整 run。
+
+    回归 PR #40 1943-F1：``USER_INPUT_ACCEPTED`` 已被 memory observer
+    checkpoint 越过但尚未写 snapshot，进程重启后进程内 pending 丢失；
+    terminal 到达时 snapshot 仍必须包含 user input 和 final answer。
+    """
+
+    db_path = tmp_path / "memory_pending_restart.sqlite"
+    config = DurableHarnessConfig(database_path=str(db_path))
+    session_id = "session_pending_restart"
+    run_id = "run_pending_restart_1"
+    user_text = "请保留这条非终态事实。"
+    final_text = "已保留非终态事实。"
+
+    bundle_a = build_durable_harness(config=config)
+    try:
+        await bundle_a.event_store.append(
+            _user_input_draft(
+                run_id=run_id, session_id=session_id, content=user_text
+            )
+        )
+        await bundle_a.coordinator.drain()
+        snapshot = await bundle_a.memory_store.get_snapshot(session_id)
+        assert snapshot.recent_raw_turns == ()
+    finally:
+        bundle_a.close()
+
+    bundle_b = build_durable_harness(config=config)
+    try:
+        await bundle_b.event_store.append(
+            _final_draft(
+                run_id=run_id, session_id=session_id, content=final_text
+            )
+        )
+        await bundle_b.startup_reconcile()
+        recovered = await bundle_b.memory_store.get_snapshot(session_id)
+        assert any(
+            turn.user_text == user_text for turn in recovered.recent_raw_turns
+        )
+        assert any(
+            turn.assistant_final == final_text
+            for turn in recovered.recent_raw_turns
+        )
+        checkpoint = bundle_b.coordinator.projection_store.get(
+            observer_id="host_memory_projection",
+            projection_name="conversation_memory",
+            schema_version=1,
+        )
+        latest_position = bundle_b.event_store.latest_event_position()
+        assert checkpoint is not None
+        assert latest_position is not None
+        assert checkpoint.last_success_position == latest_position
+
+        assert isinstance(
+            bundle_b.memory_store, DurableConversationMemoryStore
+        )
+        repaired = await bundle_b.memory_store.repair_missing_session_snapshots(
+            event_store=bundle_b.event_store
+        )
+        assert repaired == ()
+    finally:
+        bundle_b.close()
+
+
+@pytest.mark.asyncio
+async def test_durable_memory_snapshot_updated_at_uses_injected_clock(
+    tmp_path: Path,
+) -> None:
+    """snapshot ``updated_at`` 必须使用注入 clock，便于确定性验证。"""
+
+    db_path = tmp_path / "memory_clock.sqlite"
+    config = DurableHarnessConfig(database_path=str(db_path))
+    session_id = "session_clock"
+    run_id = "run_clock_1"
+    clock = _FakeClock(
+        current=datetime(2026, 5, 10, 8, 30, 0, tzinfo=timezone.utc)
+    )
+
+    bundle = build_durable_harness(config=config, clock=clock)
+    try:
+        await bundle.event_store.append(
+            _user_input_draft(
+                run_id=run_id, session_id=session_id, content="hello"
+            )
+        )
+        await bundle.event_store.append(
+            _final_draft(
+                run_id=run_id, session_id=session_id, content="world"
+            )
+        )
+        await bundle.coordinator.drain()
+        assert _snapshot_updated_at(
+            bundle.storage, session_id=session_id
+        ) == clock.current.isoformat()
     finally:
         bundle.close()
 

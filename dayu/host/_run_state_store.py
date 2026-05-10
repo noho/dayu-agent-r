@@ -60,6 +60,7 @@ _ATTEMPT_TERMINAL_STATES: frozenset[AttemptState] = frozenset(
         AttemptState.FAILED,
         AttemptState.CANCELLED,
         AttemptState.SUSPENDED,
+        AttemptState.STALE,
         AttemptState.LOST,
     }
 )

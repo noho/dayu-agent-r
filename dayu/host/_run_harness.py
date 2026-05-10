@@ -595,14 +595,23 @@ class LocalRunHarness:
         也能命中 attempt-scoped append, 不必把 ``active_attempt`` 显式
         穿透到所有签名。
 
-        :returns: 当前生效的 :class:`ToolRuntimeEventAppender`; 没有
-            scope 时退化为 :class:`PlainRunEventAppender`。
-        :raises Exception: 不主动抛出异常。
+        durable 路径没有 active scope 时立即 fail fast，避免 Host-owned
+        ToolRuntime facts 绕过 owner CAS；非 durable test-only 路径仍可
+        退化为 :class:`PlainRunEventAppender`。
+
+        :returns: 当前生效的 :class:`ToolRuntimeEventAppender`。
+        :raises RuntimeError: ``is_durable=True`` 且没有 active owner scope
+            时抛出。
         """
 
         active = active_tool_runtime_appender()
         if active is not None:
             return active
+        if self.is_durable:
+            raise RuntimeError(
+                "durable harness requires ToolRuntimeOwnerScope for "
+                "scope appender"
+            )
         return PlainRunEventAppender(event_store=self.event_store)
 
     def _attempt_owner_scope(
@@ -847,14 +856,16 @@ class LocalRunHarness:
                     # tool runtime 装配阶段触发 verify_owner)。统一收口
                     # 到 _handle_owner_lost: CAS hit 走原子 terminal +
                     # close, CAS miss 不写 stale RunEvent。
-                    terminal_seen = await self._handle_owner_lost(
-                        request=attempt_request,
-                        active_attempt=current_active_attempt,
-                        loss_reason=AttemptOwnerLossReason.FENCED,
-                        event_count=event_count,
-                        terminal_seen=terminal_seen,
-                    )
-                    current_active_attempt = None
+                    try:
+                        terminal_seen = await self._handle_owner_lost(
+                            request=attempt_request,
+                            active_attempt=current_active_attempt,
+                            loss_reason=AttemptOwnerLossReason.FENCED,
+                            event_count=event_count,
+                            terminal_seen=terminal_seen,
+                        )
+                    finally:
+                        current_active_attempt = None
                     return
                 except Exception as exc:
                     try:
@@ -868,14 +879,16 @@ class LocalRunHarness:
                         # scoped appender 在写 worker failure 时观察到
                         # owner 已 fenced; 立即收敛到 owner-lost 路径,
                         # 不再叠加 host_failure stale terminal。
-                        terminal_seen = await self._handle_owner_lost(
-                            request=attempt_request,
-                            active_attempt=current_active_attempt,
-                            loss_reason=AttemptOwnerLossReason.FENCED,
-                            event_count=event_count,
-                            terminal_seen=terminal_seen,
-                        )
-                        current_active_attempt = None
+                        try:
+                            terminal_seen = await self._handle_owner_lost(
+                                request=attempt_request,
+                                active_attempt=current_active_attempt,
+                                loss_reason=AttemptOwnerLossReason.FENCED,
+                                event_count=event_count,
+                                terminal_seen=terminal_seen,
+                            )
+                        finally:
+                            current_active_attempt = None
                     return
                 try:
                     async with self._attempt_owner_scope(current_active_attempt):
@@ -888,16 +901,18 @@ class LocalRunHarness:
                             except StopAsyncIteration:
                                 break
                             except _OwnerLostDuringEngineWait as lost:
-                                terminal_seen = (
-                                    await self._handle_owner_lost(
-                                        request=attempt_request,
-                                        active_attempt=current_active_attempt,
-                                        loss_reason=lost.loss_reason,
-                                        event_count=event_count,
-                                        terminal_seen=terminal_seen,
+                                try:
+                                    terminal_seen = (
+                                        await self._handle_owner_lost(
+                                            request=attempt_request,
+                                            active_attempt=current_active_attempt,
+                                            loss_reason=lost.loss_reason,
+                                            event_count=event_count,
+                                            terminal_seen=terminal_seen,
+                                        )
                                     )
-                                )
-                                current_active_attempt = None
+                                finally:
+                                    current_active_attempt = None
                                 return
                             except Exception as exc:
                                 try:
@@ -914,14 +929,16 @@ class LocalRunHarness:
                                     # terminal 时观察到 owner 已 fenced,
                                     # 必须收敛到 owner-lost 路径, 不能再
                                     # 叠加 stale host_failure terminal。
-                                    terminal_seen = await self._handle_owner_lost(
-                                        request=attempt_request,
-                                        active_attempt=current_active_attempt,
-                                        loss_reason=AttemptOwnerLossReason.FENCED,
-                                        event_count=event_count,
-                                        terminal_seen=terminal_seen,
-                                    )
-                                    current_active_attempt = None
+                                    try:
+                                        terminal_seen = await self._handle_owner_lost(
+                                            request=attempt_request,
+                                            active_attempt=current_active_attempt,
+                                            loss_reason=AttemptOwnerLossReason.FENCED,
+                                            event_count=event_count,
+                                            terminal_seen=terminal_seen,
+                                        )
+                                    finally:
+                                        current_active_attempt = None
                                 return
                             event_count += 1
                             if _is_context_compaction_requested(event):
@@ -1037,14 +1054,16 @@ class LocalRunHarness:
                                     # compact 失败 host_failure 写入触发
                                     # owner CAS fence; 收敛 owner-lost,
                                     # 不写 stale terminal。
-                                    terminal_seen = await self._handle_owner_lost(
-                                        request=attempt_request,
-                                        active_attempt=current_active_attempt,
-                                        loss_reason=AttemptOwnerLossReason.FENCED,
-                                        event_count=event_count,
-                                        terminal_seen=terminal_seen,
-                                    )
-                                    current_active_attempt = None
+                                    try:
+                                        terminal_seen = await self._handle_owner_lost(
+                                            request=attempt_request,
+                                            active_attempt=current_active_attempt,
+                                            loss_reason=AttemptOwnerLossReason.FENCED,
+                                            event_count=event_count,
+                                            terminal_seen=terminal_seen,
+                                        )
+                                    finally:
+                                        current_active_attempt = None
                                 return
                             if next_request_with_trace is None:
                                 terminal_seen = True
@@ -1085,14 +1104,16 @@ class LocalRunHarness:
                                         )
                                     )
                                 except AttemptFencingError:
-                                    terminal_seen = await self._handle_owner_lost(
-                                        request=attempt_request,
-                                        active_attempt=current_active_attempt,
-                                        loss_reason=AttemptOwnerLossReason.FENCED,
-                                        event_count=event_count,
-                                        terminal_seen=terminal_seen,
-                                    )
-                                    current_active_attempt = None
+                                    try:
+                                        terminal_seen = await self._handle_owner_lost(
+                                            request=attempt_request,
+                                            active_attempt=current_active_attempt,
+                                            loss_reason=AttemptOwnerLossReason.FENCED,
+                                            event_count=event_count,
+                                            terminal_seen=terminal_seen,
+                                        )
+                                    finally:
+                                        current_active_attempt = None
                                     return
                                 # _append_terminal_and_close 已经把旧
                                 # attempt 推进到终态并 close lease_exit_stack;

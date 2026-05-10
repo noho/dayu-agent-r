@@ -18,14 +18,23 @@ Dayu 项目级约束、artifact 索引和仍需追踪的 residual risks；不复
 - 当前分支：`migration/host-p8-attempt-lease-recovery`。
 - 当前 PR：#40 — `[codex] Host P8 durable attempt governance`。
 - 当前 gate：PR review fix loop。
-- 最新 accepted commit：`756f150 gateflow: accept pr-40 review fixes`。
-- 最新 PR review artifact：`docs/reviews/pr-40-review-20260510-1808.md`。
+- 最新 accepted commit：`51dbf69 docs: simplify host migration plan control flow`。
+- 最新 PR review artifact：
+  `docs/reviews/pr-40-review-20260510-1939.md`、
+  `docs/reviews/pr-40-review-20260510-1943.md`、
+  `docs/reviews/pr-40-review-20260510-1948.md`。
 - 当前待处理 review findings：
-  - accepted：compact / worker 异常路径中的 `AttemptFencingError` 需统一 owner-lost 收口，且不能恢复裸 terminal append。
-  - accepted：owner token hash 比较改用 `hmac.compare_digest`。
-  - accepted：`RunInputContextSnapshotBuiltData` 等活跃 `RunEventData` 嵌套类型补齐包根导出。
+  - accepted：1939-F1 ToolRuntime 必须透传 `AttemptFencingError`。
+  - accepted：1943-F1 durable memory observer terminal 投影必须从 EventLog 重读完整 run facts，不能依赖进程内 pending 跨 checkpoint / restart。
+  - accepted：1943-F2 删除旧 public `ToolFetchMoreHandle*` contracts。
+  - accepted：1948-F1 durable `_scope_appender()` 无 owner scope 必须 fail fast。
+  - accepted：1939-F3 `_handle_owner_lost` 普通异常路径必须清理 active attempt，避免 finally 重复 close。
+  - accepted：1939-F4 `AttemptState.STALE` fencing 诊断归类为 `ATTEMPT_TERMINAL`。
+  - accepted：1939-F5 durable memory snapshot `updated_at` 使用注入 clock。
+  - rejected-with-reason：1939-F2 recovery scan TOCTOU；CAS 已正确收敛，不修。
+  - deferred-with-owner：1948-F2 独立 `RUN_ID_MISMATCH` reason，owner 为 P9 / P16。
   - deferred-with-owner：durable memory repair 全 EventLog 扫描性能，owner 为 P9 / capacity。
-- 下一入口：完成 PR review 1808 findings 的 fix / re-review / user confirmation / accepted fix commit。
+- 下一入口：完成 PR review 1939 / 1943 / 1948 findings 的验证、re-review / user confirmation / accepted fix commit。
 
 ## 2. Dayu Host Gateflow 扩展
 
@@ -111,9 +120,14 @@ P8 cleanup 后的 stale / orphan recovery 旧术语（`MARK_RECOVERING_AND_CREAT
 
 | Risk | Owner / Destination | Status |
 | --- | --- | --- |
-| P8 PR review 1808 F1/F2：compact / worker 异常路径 `AttemptFencingError` 可能导致 stream 无 terminal / hang | PR #40 current fix loop | accepted，待 fix / re-review |
-| P8 PR review 1808 F3：owner token hash 比较未使用 `hmac.compare_digest` | PR #40 current fix loop | accepted，待 fix / re-review |
-| P8 PR review 1808 F5：活跃 `RunEventData` 嵌套类型未从 `dayu.host` 包根导出 | PR #40 current fix loop | accepted，待 fix / re-review |
+| P8 PR review 1939-F1：ToolRuntime catch-all 吞 `AttemptFencingError` | PR #40 current fix loop | accepted，fixed and validated in working tree，待 re-review |
+| P8 PR review 1939-F3：`_handle_owner_lost` 普通异常后 active attempt 未清理 | PR #40 current fix loop | accepted，fixed and validated in working tree，待 re-review |
+| P8 PR review 1939-F4：STALE fencing 诊断未归类为 terminal | PR #40 current fix loop | accepted，fixed and validated in working tree，待 re-review |
+| P8 PR review 1939-F5：durable memory snapshot clock 未注入 | PR #40 current fix loop | accepted，fixed and validated in working tree，待 re-review |
+| P8 PR review 1943-F1：durable memory observer 非终态 checkpoint 后重启丢 pending facts | PR #40 current fix loop | accepted，fixed and validated in working tree，待 re-review |
+| P8 PR review 1943-F2：旧 public `ToolFetchMoreHandle*` contracts 仍导出 | PR #40 current fix loop | accepted，fixed and validated in working tree，待 re-review |
+| P8 PR review 1948-F1：durable `_scope_appender()` 无 owner scope 静默 fallback | PR #40 current fix loop | accepted，fixed and validated in working tree，待 re-review |
+| P8 PR review 1948-F2：`_verify_run_id_matches()` 缺独立 RUN_ID_MISMATCH reason | P9 / P16 interface freeze | deferred-with-owner |
 | durable memory repair 按 session 扫描 EventLog 的容量风险 | P9 / capacity | deferred-with-owner |
 | `recover_stale_attempts(run_id=None)` 全局扫描路径未单测 | P9 / test hardening | deferred-with-owner |
 | `next_attempt_index` 未独立单测 | P9 / test hardening | deferred-with-owner |

@@ -19,6 +19,11 @@ memory projection 是 required projection：
 
 P8 起 ``ObserverSink.process`` 已升级为 async 协议，observer 直接
 ``await`` memory store，不再需要 sync-async 桥接。
+
+P8 PR #40 follow-up 起 durable 装配在 terminal run 投影时必须从
+EventLog 真源重读该 run 的完整 canonical 事件，再与 checkpoint advance
+处于同一 observer transaction 内提交；进程内 pending 仅作为非 durable /
+测试路径的短生命周期缓存，不承担跨 checkpoint / restart 的事实保存职责。
 """
 
 from __future__ import annotations
@@ -72,15 +77,44 @@ class ConversationMemoryProjectionStore(ConversationMemoryStore, Protocol):
         ...
 
 
+class CanonicalRunEventReader(Protocol):
+    """按 run 读取 canonical EventLog facts 的 Host internal 协议。
+
+    durable memory observer 使用该协议在 terminal 事件到达时从 EventLog
+    真源重建同一 run 的完整 canonical 事件，避免 checkpoint 已推进后进程
+    重启导致 ``_pending_by_run`` 丢失。
+    """
+
+    def fetch_canonical_events_for_run_in_transaction(
+        self,
+        *,
+        tx: HostStorageTransaction,
+        session_id: str,
+        run_id: str,
+    ) -> tuple[RunEvent, ...]:
+        """在当前 observer 事务内读取同一 run 的 canonical 事件。
+
+        :param tx: 当前 observer 事务。
+        :param session_id: 会话 id。
+        :param run_id: Run id。
+        :returns: RunEvent 元组，按 EventLog 全局位置升序。
+        :raises Exception: 读取失败时透传。
+        """
+        ...
+
+
 @dataclass(slots=True)
 class MemoryProjectionObserver:
     """memory read model observer。
 
     :param memory_store: 实现 :class:`ConversationMemoryProjectionStore`
         协议的 memory store。
+    :param event_reader: durable EventLog canonical fact reader；提供时
+        terminal 投影从 EventLog 重读完整 run facts，缺省仅用于旧单元测试。
     """
 
     memory_store: ConversationMemoryProjectionStore
+    event_reader: CanonicalRunEventReader | None = None
     _pending_by_run: dict[str, list[RunEvent]] = field(
         default_factory=dict, init=False
     )
@@ -134,7 +168,17 @@ class MemoryProjectionObserver:
                 continue
             staged.setdefault(event.run_id, []).append(event)
             if event.type in TERMINAL_RUN_EVENT_TYPES:
-                events = tuple(staged[event.run_id])
+                if self.event_reader is None:
+                    events = tuple(staged[event.run_id])
+                else:
+                    events = (
+                        self.event_reader
+                        .fetch_canonical_events_for_run_in_transaction(
+                            tx=tx,
+                            session_id=event.session_id,
+                            run_id=event.run_id,
+                        )
+                    )
                 await self.memory_store.project_run_events_in_transaction(
                     tx=tx, events=events
                 )
@@ -172,6 +216,7 @@ class MemoryProjectionObserver:
 
 
 __all__ = [
+    "CanonicalRunEventReader",
     "ConversationMemoryProjectionStore",
     "MemoryProjectionObserver",
 ]
