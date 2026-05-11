@@ -150,15 +150,16 @@ P7 已落地：
 
 - EventLog 是 trace 唯一来源：``RUN_INPUT_CONTEXT_SNAPSHOT_BUILT`` canonical
   fact 在 RunInputBuilder 完成、Engine attempt 启动前由 `LocalRunHarness`
-  同事务追加，内联完整 ``raw_input_messages_json`` /
-  ``raw_tool_schemas_json`` 与 ``raw_*_blob_id``。compact 重试路径合成
-  trace 后追加；启用开关由 `tool_trace_context_fact_enabled` 控制，关闭
-  时行为与 P6 完全一致。
+  追加；完整 input / tool schema raw payload 先写入
+  `run_input_raw_payloads` side-store，并与 EventLog fact 处在同一个
+  `HostStorage.transaction()`。EventLog hot row 只保存摘要、blob id、
+  sha256 与 byte size。compact 重试路径合成 trace 后追加；启用开关由
+  `tool_trace_context_fact_enabled` 控制，关闭时行为与 P6 完全一致。
 - `RunInputContextFactBuilder`（位于 `dayu.host._run_input_context_fact`）
   把 `RunInput` / 当前 user 事件 / 工具 schemas 派生为强类型
   `RunInputContextSnapshotBuiltData`，包含 message / tool schema 摘要、
   ``content_hash``、``role_sequence``、``current_user_*`` 维度，
-  ``raw_*_blob_id`` 跨 replay 稳定（相同输入产出相同 id）。
+  raw payload 的 blob id / sha256 / byte size 跨 replay 稳定。
 - `ToolTraceObserver`（位于 `dayu.host._tool_trace_projection`）把 EventLog
   canonical 事实派发为 5 类 trace record：``tool_call``、
   ``iteration_context_snapshot``、``iteration_usage``、``final_response``、
@@ -170,15 +171,18 @@ P7 已落地：
   I/O 发生在 checkpoint transaction 外；I/O 成功但 checkpoint 失败时允许重放
   产生重复行，读侧按 ``idempotency_key`` 去重。
 - `ToolTraceJsonlSink` 落 ``<root>/sessions/<session_id>/tool_calls_*.jsonl``
-  并按 ~10MB 滚动；每行 ``flush + fsync``。
-  ``RUN_INPUT_CONTEXT_SNAPSHOT_BUILT`` 内联的 raw payload 写入
+  并按 ~10MB 滚动；每行 ``flush + fsync``。`ToolTraceObserver` 从
+  `run_input_raw_payloads` 读取并校验 hash / byte size / JSON / kind 后，
+  再把 raw payload 写入
   ``<root>/raw_payloads/<run_id>_<iteration_id>/<blob_id>.json``，先 tmp +
-  ``os.replace`` 原子落地。``PROVIDER_PROTOCOL_ERROR`` 的 ``raw_payload``
+  ``os.replace`` 原子落地；校验失败抛 `ProjectionSchemaError`，checkpoint
+  不推进。``PROVIDER_PROTOCOL_ERROR`` 的 ``raw_payload``
   在落盘前由 `_scrub_provider_secret` 替换 ``Authorization`` /
   ``api_key`` / ``cookie`` / ``x-api-key`` 等敏感键与字符串 header 为
   ``"***"``；缺失
-  payload 时 fallback 到 ``{"reason": "omitted_no_payload"}``。其它字段
-  （prompt、tool result、scope_token / cursor）按 OLD 热/冷分层保留。
+  payload 时 fallback 到 ``{"reason": "omitted_no_payload"}``；partial
+  tool call 诊断写入 bounded summary，不包含 raw arguments。其它字段
+  （prompt、tool result、scope_token / cursor）按普通 payload 保留。
 - 装配开关：`DurableHarnessConfig.tool_trace_path` 非空字符串时装配
   `ToolTraceObserver`（非 required projection）并把 fact 开关传给
   `LocalRunHarness`；``None`` / 空字符串等价于未配置 trace，coordinator

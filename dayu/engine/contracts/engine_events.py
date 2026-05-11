@@ -18,6 +18,7 @@ from typing import TypeAlias
 
 from dayu.engine.contracts.agent_run import ContextBudgetSnapshot, RunResumeHint
 from dayu.engine.contracts.finish_reason import FinishReason
+from dayu.engine.contracts.partial_tool_call import PartialToolCallSummary
 from dayu.contracts.json_value import JsonValue
 from dayu.contracts.tool_await import ToolAwaitSpec
 from dayu.contracts.tool_call import ToolCallProviderState
@@ -194,6 +195,8 @@ class ProviderProtocolErrorData:
     :param provider_request_id: provider 侧请求 id；为 ``None`` 表示
         未提供。
     :param raw_payload: provider 原始报错载荷；为 ``None`` 表示无。
+    :param partial_tool_calls: provider stream 失败前已解析但未完成的
+        tool call 有界摘要；不包含 raw argument payload。
     """
 
     iteration_id: str
@@ -201,6 +204,7 @@ class ProviderProtocolErrorData:
     message: str
     provider_request_id: str | None
     raw_payload: JsonValue | None
+    partial_tool_calls: tuple[PartialToolCallSummary, ...] = ()
 
 
 @dataclass(frozen=True, slots=True)
@@ -345,6 +349,7 @@ __all__ = [
     "ContextCompactionRequestedData",
     "RunnerUsageData",
     "ProviderProtocolErrorData",
+    "PartialToolCallSummary",
     "RunnerDoneEngineData",
     "FinalAnswerData",
     "RunSuspendedData",

@@ -54,6 +54,7 @@ from dayu.engine.contracts.messages import (
     ToolMessage,
     UserMessage,
 )
+from dayu.engine.contracts.partial_tool_call import PartialToolCallSummary
 from dayu.engine.contracts.runner import AsyncRunner
 from dayu.engine.contracts.runner_events import (
     RunnerContentCompletedData,
@@ -117,6 +118,7 @@ __all__ = [
     "MimoThinkingExtension",
     "OpenAIReasoningEffort",
     "OpenAIReasoningExtension",
+    "PartialToolCallSummary",
     "ProviderProtocolErrorData",
     "ProviderRequestExtension",
     "QwenThinkingExtension",

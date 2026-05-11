@@ -18,6 +18,7 @@
 from __future__ import annotations
 
 import json
+from dataclasses import replace
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Literal, cast
@@ -40,7 +41,17 @@ from dayu.engine import (
     ToolResultAcceptedData,
 )
 from dayu.host._event_observer import ProjectionEventEnvelope
+from dayu.host._host_storage_transaction import HostStorage
 from dayu.host._internal_contracts import GlobalEventPosition
+from dayu.host._run_input_raw_payload_store import (
+    RunInputRawPayloadKind,
+    RunInputRawPayloadReadError,
+    RunInputRawPayloadRefs,
+    RunInputRawPayloadWriteSet,
+    ensure_run_input_raw_payload_schema,
+    get_run_input_raw_payload,
+    put_run_input_raw_payloads,
+)
 from dayu.host._tool_trace_jsonl_sink import ToolTraceJsonlSink
 from dayu.host._tool_trace_projection import (
     ProjectionSchemaError,
@@ -422,7 +433,7 @@ async def test_provider_protocol_error_scrubs_secret(tmp_path: Path) -> None:
     assert parsed["msg"] == "ok"
 
 
-def _snapshot_data() -> RunInputContextSnapshotBuiltData:
+def _snapshot_data(*, refs: RunInputRawPayloadRefs) -> RunInputContextSnapshotBuiltData:
     """构造 RunInputContextSnapshotBuiltData。
 
     :returns: data。
@@ -455,10 +466,12 @@ def _snapshot_data() -> RunInputContextSnapshotBuiltData:
             memory_item_count=0,
             current_user_run_id=_RUN_ID,
         ),
-        raw_input_messages_json='[{"role":"user","content":"hi"}]',
-        raw_tool_schemas_json="[]",
-        raw_input_blob_id="blob_input",
-        raw_tool_schemas_blob_id="blob_tools",
+        raw_input_messages_blob_id=refs.input_messages.blob_id,
+        raw_input_messages_sha256=refs.input_messages.content_sha256,
+        raw_input_messages_byte_size=refs.input_messages.byte_size,
+        raw_tool_schemas_blob_id=refs.tool_schemas.blob_id,
+        raw_tool_schemas_sha256=refs.tool_schemas.content_sha256,
+        raw_tool_schemas_byte_size=refs.tool_schemas.byte_size,
     )
 
 
@@ -467,22 +480,295 @@ async def test_context_snapshot_writes_blob_files_and_record(tmp_path: Path) -> 
     """context snapshot 派发 2 个 raw_payloads 文件 + 1 行 JSONL。"""
 
     sink = ToolTraceJsonlSink(root_path=tmp_path)
-    observer = ToolTraceObserver(jsonl_sink=sink)
+    storage = HostStorage(database_path=":memory:")
+    storage.open()
+    ensure_run_input_raw_payload_schema(storage)
+    payloads = RunInputRawPayloadWriteSet(
+        input_messages_json='[{"role":"user","content":"hi"}]',
+        tool_schemas_json="[]",
+    )
+    async with storage.transaction() as tx:
+        refs = put_run_input_raw_payloads(
+            tx=tx,
+            session_id=_SESSION_ID,
+            run_id=_RUN_ID,
+            attempt_index=0,
+            iteration_index=0,
+            iteration_id="iter-1",
+            payloads=payloads,
+            created_at=datetime.now(tz=timezone.utc),
+        )
+    observer = ToolTraceObserver(jsonl_sink=sink, raw_payload_storage=storage)
     env = _envelope(
         position=7,
         event_type=RunEventType.RUN_INPUT_CONTEXT_SNAPSHOT_BUILT,
-        data=_snapshot_data(),
+        data=_snapshot_data(refs=refs),
     )
-    await observer.process(tx=cast(object, None), batch=(env,))  # type: ignore[arg-type]
-    raw_dir = tmp_path / "raw_payloads" / f"{_RUN_ID}_iter-1"
-    assert (raw_dir / "blob_input.json").read_text(encoding="utf-8").startswith("[{")
-    assert (raw_dir / "blob_tools.json").read_text(encoding="utf-8") == "[]"
-    lines = _read_jsonl_lines(tmp_path)
-    assert len(lines) == 1
-    rec = lines[0]
-    assert rec["trace_type"] == "iteration_context_snapshot"
-    assert rec["raw_input_blob_relative_path"] == (f"raw_payloads/{_RUN_ID}_iter-1/blob_input.json")
-    assert rec["raw_tool_schemas_blob_relative_path"] == (f"raw_payloads/{_RUN_ID}_iter-1/blob_tools.json")
+    try:
+        await observer.process(tx=cast(object, None), batch=(env,))  # type: ignore[arg-type]
+        raw_dir = tmp_path / "raw_payloads" / f"{_RUN_ID}_iter-1"
+        assert (
+            raw_dir / f"{refs.input_messages.blob_id}.json"
+        ).read_text(encoding="utf-8").startswith("[{")
+        assert (
+            raw_dir / f"{refs.tool_schemas.blob_id}.json"
+        ).read_text(encoding="utf-8") == "[]"
+        lines = _read_jsonl_lines(tmp_path)
+        assert len(lines) == 1
+        rec = lines[0]
+        assert rec["trace_type"] == "iteration_context_snapshot"
+        assert rec["raw_input_blob_relative_path"] == (
+            f"raw_payloads/{_RUN_ID}_iter-1/{refs.input_messages.blob_id}.json"
+        )
+        assert rec["raw_tool_schemas_blob_relative_path"] == (
+            f"raw_payloads/{_RUN_ID}_iter-1/{refs.tool_schemas.blob_id}.json"
+        )
+    finally:
+        storage.close()
+
+
+@pytest.mark.asyncio
+async def test_run_input_raw_payload_rollback_leaves_no_orphan_row() -> None:
+    """side-store 与外层 transaction 同生同灭，rollback 后不得残留孤儿行。"""
+
+    storage = HostStorage(database_path=":memory:")
+    storage.open()
+    ensure_run_input_raw_payload_schema(storage)
+    payloads = RunInputRawPayloadWriteSet(
+        input_messages_json="[]",
+        tool_schemas_json="[]",
+    )
+    try:
+        with pytest.raises(RuntimeError):
+            async with storage.transaction() as tx:
+                put_run_input_raw_payloads(
+                    tx=tx,
+                    session_id=_SESSION_ID,
+                    run_id=_RUN_ID,
+                    attempt_index=0,
+                    iteration_index=0,
+                    iteration_id="iter-rollback",
+                    payloads=payloads,
+                    created_at=datetime.now(tz=timezone.utc),
+                )
+                raise RuntimeError("force rollback")
+        rows = storage.execute_read(
+            "SELECT COUNT(*) AS count FROM run_input_raw_payloads"
+        )
+        assert int(rows[0]["count"]) == 0
+    finally:
+        storage.close()
+
+
+@pytest.mark.asyncio
+async def test_context_snapshot_missing_raw_payload_fails_before_jsonl(
+    tmp_path: Path,
+) -> None:
+    """missing side-store row 必须是 typed projection failure 且不写 trace 行。"""
+
+    storage = HostStorage(database_path=":memory:")
+    storage.open()
+    ensure_run_input_raw_payload_schema(storage)
+    payloads = RunInputRawPayloadWriteSet(
+        input_messages_json="[]",
+        tool_schemas_json="[]",
+    )
+    async with storage.transaction() as tx:
+        refs = put_run_input_raw_payloads(
+            tx=tx,
+            session_id=_SESSION_ID,
+            run_id=_RUN_ID,
+            attempt_index=0,
+            iteration_index=0,
+            iteration_id="iter-1",
+            payloads=payloads,
+            created_at=datetime.now(tz=timezone.utc),
+        )
+    data = replace(
+        _snapshot_data(refs=refs),
+        raw_input_messages_blob_id="missing-blob",
+    )
+    observer = ToolTraceObserver(
+        jsonl_sink=ToolTraceJsonlSink(root_path=tmp_path),
+        raw_payload_storage=storage,
+    )
+    try:
+        env = _envelope(
+            position=7,
+            event_type=RunEventType.RUN_INPUT_CONTEXT_SNAPSHOT_BUILT,
+            data=data,
+        )
+        with pytest.raises(ProjectionSchemaError, match="missing_row"):
+            await observer.process(tx=cast(object, None), batch=(env,))  # type: ignore[arg-type]
+        assert _read_jsonl_lines(tmp_path) == []
+    finally:
+        storage.close()
+
+
+@pytest.mark.asyncio
+async def test_context_snapshot_hash_mismatch_fails_before_jsonl(
+    tmp_path: Path,
+) -> None:
+    """hash mismatch 必须阻断 projection，避免 checkpoint 在坏读后推进。"""
+
+    storage = HostStorage(database_path=":memory:")
+    storage.open()
+    ensure_run_input_raw_payload_schema(storage)
+    payloads = RunInputRawPayloadWriteSet(
+        input_messages_json="[]",
+        tool_schemas_json="[]",
+    )
+    async with storage.transaction() as tx:
+        refs = put_run_input_raw_payloads(
+            tx=tx,
+            session_id=_SESSION_ID,
+            run_id=_RUN_ID,
+            attempt_index=0,
+            iteration_index=0,
+            iteration_id="iter-1",
+            payloads=payloads,
+            created_at=datetime.now(tz=timezone.utc),
+        )
+    data = replace(
+        _snapshot_data(refs=refs),
+        raw_input_messages_sha256="not-the-real-hash",
+    )
+    observer = ToolTraceObserver(
+        jsonl_sink=ToolTraceJsonlSink(root_path=tmp_path),
+        raw_payload_storage=storage,
+    )
+    try:
+        env = _envelope(
+            position=7,
+            event_type=RunEventType.RUN_INPUT_CONTEXT_SNAPSHOT_BUILT,
+            data=data,
+        )
+        with pytest.raises(ProjectionSchemaError, match="hash_mismatch"):
+            await observer.process(tx=cast(object, None), batch=(env,))  # type: ignore[arg-type]
+        assert _read_jsonl_lines(tmp_path) == []
+    finally:
+        storage.close()
+
+
+@pytest.mark.asyncio
+async def test_run_input_raw_payload_byte_size_mismatch_is_typed_failure() -> None:
+    """reader API 必须把 byte size mismatch 表达为 typed failure。"""
+
+    storage = HostStorage(database_path=":memory:")
+    storage.open()
+    ensure_run_input_raw_payload_schema(storage)
+    payloads = RunInputRawPayloadWriteSet(
+        input_messages_json="[]",
+        tool_schemas_json="[]",
+    )
+    try:
+        async with storage.transaction() as tx:
+            refs = put_run_input_raw_payloads(
+                tx=tx,
+                session_id=_SESSION_ID,
+                run_id=_RUN_ID,
+                attempt_index=0,
+                iteration_index=0,
+                iteration_id="iter-1",
+                payloads=payloads,
+                created_at=datetime.now(tz=timezone.utc),
+            )
+        wrong_ref = replace(
+            refs.input_messages,
+            byte_size=refs.input_messages.byte_size + 1,
+        )
+        with pytest.raises(
+            RunInputRawPayloadReadError,
+            match="byte_size_mismatch",
+        ):
+            get_run_input_raw_payload(
+                storage=storage,
+                ref=wrong_ref,
+                expected_kind=RunInputRawPayloadKind.INPUT_MESSAGES,
+            )
+    finally:
+        storage.close()
+
+
+@pytest.mark.asyncio
+async def test_context_snapshot_corrupt_json_fails_before_jsonl(
+    tmp_path: Path,
+) -> None:
+    """corrupt JSON 必须阻断 projection，禁止合成 fake raw payload。"""
+
+    storage = HostStorage(database_path=":memory:")
+    storage.open()
+    ensure_run_input_raw_payload_schema(storage)
+    payloads = RunInputRawPayloadWriteSet(
+        input_messages_json="[",
+        tool_schemas_json="[]",
+    )
+    async with storage.transaction() as tx:
+        refs = put_run_input_raw_payloads(
+            tx=tx,
+            session_id=_SESSION_ID,
+            run_id=_RUN_ID,
+            attempt_index=0,
+            iteration_index=0,
+            iteration_id="iter-1",
+            payloads=payloads,
+            created_at=datetime.now(tz=timezone.utc),
+        )
+    # side-store 允许持久保存原始 JSON 字符串；读取路径负责校验 JSON 合法性。
+    with pytest.raises(RunInputRawPayloadReadError):
+        get_run_input_raw_payload(
+            storage=storage,
+            ref=refs.input_messages,
+            expected_kind=RunInputRawPayloadKind.INPUT_MESSAGES,
+        )
+    observer = ToolTraceObserver(
+        jsonl_sink=ToolTraceJsonlSink(root_path=tmp_path),
+        raw_payload_storage=storage,
+    )
+    try:
+        env = _envelope(
+            position=7,
+            event_type=RunEventType.RUN_INPUT_CONTEXT_SNAPSHOT_BUILT,
+            data=_snapshot_data(refs=refs),
+        )
+        with pytest.raises(ProjectionSchemaError, match="invalid_json"):
+            await observer.process(tx=cast(object, None), batch=(env,))  # type: ignore[arg-type]
+        assert _read_jsonl_lines(tmp_path) == []
+    finally:
+        storage.close()
+
+
+@pytest.mark.asyncio
+async def test_run_input_raw_payload_kind_mismatch_is_typed_failure() -> None:
+    """reader API 必须把 kind mismatch 表达为 typed failure。"""
+
+    storage = HostStorage(database_path=":memory:")
+    storage.open()
+    ensure_run_input_raw_payload_schema(storage)
+    payloads = RunInputRawPayloadWriteSet(
+        input_messages_json="[]",
+        tool_schemas_json="[]",
+    )
+    try:
+        async with storage.transaction() as tx:
+            refs = put_run_input_raw_payloads(
+                tx=tx,
+                session_id=_SESSION_ID,
+                run_id=_RUN_ID,
+                attempt_index=0,
+                iteration_index=0,
+                iteration_id="iter-1",
+                payloads=payloads,
+                created_at=datetime.now(tz=timezone.utc),
+            )
+        with pytest.raises(RunInputRawPayloadReadError, match="kind_mismatch"):
+            get_run_input_raw_payload(
+                storage=storage,
+                ref=refs.input_messages,
+                expected_kind=RunInputRawPayloadKind.TOOL_SCHEMAS,
+            )
+    finally:
+        storage.close()
 
 
 @pytest.mark.asyncio

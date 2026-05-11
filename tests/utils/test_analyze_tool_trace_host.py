@@ -20,6 +20,7 @@ from utils.analyze_tool_trace_host import (
     FailurePattern,
     FetchMoreScopeIssue,
     PositionGap,
+    ProviderPartialToolCallDiagnostic,
     RepeatedToolCall,
     ToolStats,
     TraceAnalysisReport,
@@ -174,6 +175,7 @@ def _provider_protocol_error_record(
         "message": "429",
         "provider_request_id": "req-1",
         "raw_payload_json": "{}",
+        "partial_tool_calls_json": "[]",
     }
 
 
@@ -489,6 +491,48 @@ def test_analyzer_counts_provider_protocol_errors(tmp_path: Path) -> None:
     )
     report = analyze_trace_root(trace_root=tmp_path)
     assert report.provider_protocol_error_count == 2
+
+
+def test_analyzer_reports_provider_partial_tool_calls(tmp_path: Path) -> None:
+    """provider_protocol_error 输出 bounded partial tool call 摘要。"""
+
+    record = dict(
+        _provider_protocol_error_record(
+            idempotency_key="partial-1",
+            source_event_position=1,
+        )
+    )
+    record["error_code"] = "sse_invalid_json"
+    record["partial_tool_calls_json"] = json.dumps(
+        [
+            {
+                "tool_call_index": 0,
+                "tool_call_id": "call-1",
+                "name_fragment": "lookup",
+                "arguments_byte_size": 12,
+                "arguments_sha256": "abc123",
+            }
+        ],
+        ensure_ascii=False,
+    )
+    _write_jsonl(
+        trace_root=tmp_path,
+        session_id=_SESSION_ID,
+        records=[record],
+    )
+    report = analyze_trace_root(trace_root=tmp_path)
+    assert report.provider_partial_tool_calls == (
+        ProviderPartialToolCallDiagnostic(
+            run_id=_RUN_ID,
+            iteration_id="iter-1",
+            error_code="sse_invalid_json",
+            tool_call_index=0,
+            tool_call_id="call-1",
+            name_fragment="lookup",
+            arguments_byte_size=12,
+            arguments_sha256="abc123",
+        ),
+    )
 
 
 def test_analyzer_reports_final_response_presence(tmp_path: Path) -> None:

@@ -1,7 +1,8 @@
 """Host P7 ToolTraceJsonlSink。
 
-本模块把 EventLog canonical fact 派生的 trace record 实时写入 JSONL 文件，
-并把 ``RUN_INPUT_CONTEXT_SNAPSHOT_BUILT`` fact 内联的完整 raw payload 拆为
+本模块把 EventLog canonical fact 派生的 trace record 实时写入 JSONL
+文件，并把 projection 已从 Host raw payload side-store 读取和校验过的
+完整 raw payload 写为
 ``raw_payloads/<run_id>_<iteration_id>/<blob_id>.json`` 文件。每行写入后
 立即 ``flush + fsync``；raw payload 文件采用 ``os.replace`` 原子改名。
 
@@ -514,6 +515,8 @@ class ProviderProtocolErrorRecord:
     :param provider_request_id: provider 侧请求 id；缺失为 ``None``。
     :param raw_payload_json: scrub 后的 provider 原始报错 JSON 字符串；缺
         失时为 ``'{"reason":"omitted_no_payload"}'``。
+    :param partial_tool_calls_json: SSE 失败前 partial tool call 有界摘要
+        JSON 字符串；不包含 raw argument payload。
     """
 
     schema_version: str
@@ -528,6 +531,7 @@ class ProviderProtocolErrorRecord:
     message: str
     provider_request_id: str | None
     raw_payload_json: str
+    partial_tool_calls_json: str
 
     def to_json_record(self) -> Mapping[str, JsonValue]:
         """编码为 JSON record。
@@ -549,6 +553,7 @@ class ProviderProtocolErrorRecord:
             "message": self.message,
             "provider_request_id": self.provider_request_id,
             "raw_payload_json": self.raw_payload_json,
+            "partial_tool_calls_json": self.partial_tool_calls_json,
         }
 
 

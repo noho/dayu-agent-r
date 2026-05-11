@@ -224,7 +224,10 @@ def build_durable_harness(
         jsonl_sink = ToolTraceJsonlSink(
             root_path=Path(config.tool_trace_path)
         )
-        tool_trace_observer = ToolTraceObserver(jsonl_sink=jsonl_sink)
+        tool_trace_observer = ToolTraceObserver(
+            jsonl_sink=jsonl_sink,
+            raw_payload_storage=storage,
+        )
 
     observers: tuple[ObserverSink, ...]
     if tool_trace_observer is None:

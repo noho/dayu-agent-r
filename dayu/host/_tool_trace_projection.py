@@ -52,6 +52,13 @@ from dayu.host._credential_scrub import (
     scrub_tool_execution_outcome,
 )
 from dayu.host._host_storage_transaction import HostStorageTransaction
+from dayu.host._host_storage_transaction import HostStorage
+from dayu.host._run_input_raw_payload_store import (
+    RunInputRawPayloadKind,
+    RunInputRawPayloadReadError,
+    RunInputRawPayloadRef,
+    get_run_input_raw_payload,
+)
 from dayu.host._tool_trace_jsonl_sink import (
     FinalResponseRecord,
     IterationContextSnapshotRecord,
@@ -108,9 +115,12 @@ class ToolTraceObserver(ObserverSink, NonTransactionalObserverSink):
     """tool trace projection observer。
 
     :param jsonl_sink: 实际负责文件写入的 sink。
+    :param raw_payload_storage: RunInput raw payload side-store 读连接；为
+        ``None`` 时 snapshot fact 读取会失败。
     """
 
     jsonl_sink: ToolTraceJsonlSink
+    raw_payload_storage: HostStorage | None = None
     _schema_version_str: str = field(default=ToolTraceSchemaVersion.TOOL_TRACE_V2_HOST.value, init=False)
 
     @property
@@ -440,6 +450,20 @@ class ToolTraceObserver(ObserverSink, NonTransactionalObserverSink):
             message=data.message,
             provider_request_id=data.provider_request_id,
             raw_payload_json=raw_payload_json,
+            partial_tool_calls_json=json.dumps(
+                [
+                    {
+                        "tool_call_index": item.tool_call_index,
+                        "tool_call_id": item.tool_call_id,
+                        "name_fragment": item.name_fragment,
+                        "arguments_byte_size": item.arguments_byte_size,
+                        "arguments_sha256": item.arguments_sha256,
+                    }
+                    for item in data.partial_tool_calls
+                ],
+                ensure_ascii=False,
+                sort_keys=True,
+            ),
         )
         self.jsonl_sink.append_record_line(
             session_id=event.session_id,
@@ -466,19 +490,43 @@ class ToolTraceObserver(ObserverSink, NonTransactionalObserverSink):
             raise ProjectionSchemaError("RUN_INPUT_CONTEXT_SNAPSHOT_BUILT data type mismatch")
         if event.kind is not RunEventKind.CANONICAL or event.source is not RunEventSource.HOST:
             raise ProjectionSchemaError("RUN_INPUT_CONTEXT_SNAPSHOT_BUILT must be canonical host fact")
+        storage = self.raw_payload_storage
+        if storage is None:
+            raise ProjectionSchemaError("RUN_INPUT_CONTEXT_SNAPSHOT_BUILT raw payload storage missing")
+        try:
+            raw_input_payload = get_run_input_raw_payload(
+                storage=storage,
+                ref=RunInputRawPayloadRef(
+                    blob_id=data.raw_input_messages_blob_id,
+                    content_sha256=data.raw_input_messages_sha256,
+                    byte_size=data.raw_input_messages_byte_size,
+                ),
+                expected_kind=RunInputRawPayloadKind.INPUT_MESSAGES,
+            )
+            raw_tool_schemas_payload = get_run_input_raw_payload(
+                storage=storage,
+                ref=RunInputRawPayloadRef(
+                    blob_id=data.raw_tool_schemas_blob_id,
+                    content_sha256=data.raw_tool_schemas_sha256,
+                    byte_size=data.raw_tool_schemas_byte_size,
+                ),
+                expected_kind=RunInputRawPayloadKind.TOOL_SCHEMAS,
+            )
+        except RunInputRawPayloadReadError as exc:
+            raise ProjectionSchemaError(str(exc)) from exc
         self.jsonl_sink.write_raw_payload_blob(
             run_id=event.run_id,
             iteration_id=data.iteration_id,
-            blob_id=data.raw_input_blob_id,
-            payload_text=data.raw_input_messages_json,
+            blob_id=data.raw_input_messages_blob_id,
+            payload_text=raw_input_payload.payload_json,
         )
         self.jsonl_sink.write_raw_payload_blob(
             run_id=event.run_id,
             iteration_id=data.iteration_id,
             blob_id=data.raw_tool_schemas_blob_id,
-            payload_text=data.raw_tool_schemas_json,
+            payload_text=raw_tool_schemas_payload.payload_json,
         )
-        raw_input_relpath = f"{_RAW_PAYLOADS_DIR}/{event.run_id}_{data.iteration_id}/" f"{data.raw_input_blob_id}.json"
+        raw_input_relpath = f"{_RAW_PAYLOADS_DIR}/{event.run_id}_{data.iteration_id}/" f"{data.raw_input_messages_blob_id}.json"
         raw_tools_relpath = (
             f"{_RAW_PAYLOADS_DIR}/{event.run_id}_{data.iteration_id}/" f"{data.raw_tool_schemas_blob_id}.json"
         )

@@ -2,19 +2,15 @@
 
 本模块把 :class:`RunInputBuildResult` 与当前用户输入事件派生为
 :class:`RunInputContextSnapshotBuiltData`，作为 EventLog canonical fact
-追加。raw payload (model_input_messages / tool_schemas) 完整内联在
-``raw_input_messages_json`` / ``raw_tool_schemas_json``；observer 阶段
-负责把它们拆成 ``raw_payloads/`` 文件，hot 层只保留摘要。
+追加。raw payload (model_input_messages / tool_schemas) 不进入 EventLog
+hot row；builder 只派生 hot fact 与待写 side-store payload 材料。
 
 设计要点：
 
 - builder 是无状态 dataclass，不持有 LRU、事件流或 Engine 状态；
   调用方在每个 attempt 启动前显式构造材料后调用 ``build``。
-- 序列化字段（``*_json``）使用 ``json.dumps(..., sort_keys=True,
+- raw payload 字段（``*_json``）使用 ``json.dumps(..., sort_keys=True,
   ensure_ascii=False)``，保证 replay / 重启后 blob_id 稳定。
-- ``raw_input_blob_id`` / ``raw_tool_schemas_blob_id`` 由 ``run_id`` +
-  ``iteration_id`` + 角色派生，与 EventLog 行内容解耦，确保 observer
-  在 crash 重放后仍能写到同一文件名（``os.replace`` 原子覆盖）。
 """
 
 from __future__ import annotations
@@ -33,6 +29,10 @@ from dayu.engine import (
     UserMessage,
 )
 from dayu.host._run_input_builder import RunInputBuildTrace
+from dayu.host._run_input_raw_payload_store import (
+    RunInputRawPayloadWriteSet,
+    describe_run_input_raw_payloads,
+)
 from dayu.host._text import truncate_text
 from dayu.host._token_estimator import estimate_text_tokens
 from dayu.host.contracts import (
@@ -48,7 +48,6 @@ from dayu.host.contracts import (
     UserInputAcceptedData,
 )
 
-_BLOB_ID_HEX_PREFIX_LEN: int = 16
 _CONTENT_HASH_HEX_PREFIX_LEN: int = 32
 _DEFAULT_EXCERPT_CHAR_LIMIT: int = 256
 _SOURCE_KIND_CALLER_SYSTEM: str = "caller_system"
@@ -57,11 +56,22 @@ _SOURCE_KIND_CURRENT_USER: str = "current_user"
 _SOURCE_KIND_ASSISTANT: str = "assistant"
 _SOURCE_KIND_TOOL_RESULT: str = "tool_result"
 _SOURCE_KIND_UNKNOWN: str = "unknown"
-_BLOB_ROLE_INPUT: str = "input"
-_BLOB_ROLE_TOOLS: str = "tools"
 _ERROR_CURRENT_USER_EVENT_KIND: str = (
     "current_user_event must be canonical Host USER_INPUT_ACCEPTED"
 )
+
+
+@dataclass(frozen=True, slots=True)
+class RunInputContextFactBuildResult:
+    """RunInput context fact 构造结果。
+
+    :param data: 可追加到 EventLog 的 hot fact data。
+    :param raw_payloads: 必须与 EventLog append 同事务写入 side-store 的
+        raw payload JSON。
+    """
+
+    data: RunInputContextSnapshotBuiltData
+    raw_payloads: RunInputRawPayloadWriteSet
 
 
 @dataclass(frozen=True, slots=True)
@@ -83,8 +93,8 @@ class RunInputContextFactBuilder:
         attempt_index: int,
         iteration_index: int,
         iteration_id: str,
-    ) -> RunInputContextSnapshotBuiltData:
-        """派生 ``RunInputContextSnapshotBuiltData`` 事实。
+    ) -> RunInputContextFactBuildResult:
+        """派生 ``RunInputContextSnapshotBuiltData`` 与 raw payload 材料。
 
         :param run_input: 已交给 Engine 的 RunInput。
         :param build_trace: ``RunInputBuilder`` 产出的 trace。
@@ -94,7 +104,7 @@ class RunInputContextFactBuilder:
         :param attempt_index: Host attempt 序号。
         :param iteration_index: Engine iteration index。
         :param iteration_id: Engine iteration id。
-        :returns: ``RunInputContextSnapshotBuiltData``。
+        :returns: ``RunInputContextFactBuildResult``。
         :raises ValueError: ``current_user_event`` 不是 canonical Host
             ``USER_INPUT_ACCEPTED`` 时抛出。
         :raises TypeError: ``current_user_event.data`` 不是
@@ -118,6 +128,17 @@ class RunInputContextFactBuilder:
         raw_tool_schemas_json = json.dumps(
             schema_dicts, ensure_ascii=False, sort_keys=True
         )
+        raw_payloads = RunInputRawPayloadWriteSet(
+            input_messages_json=raw_input_messages_json,
+            tool_schemas_json=raw_tool_schemas_json,
+        )
+        raw_refs = describe_run_input_raw_payloads(
+            run_id=run_id,
+            attempt_index=attempt_index,
+            iteration_index=iteration_index,
+            iteration_id=iteration_id,
+            payloads=raw_payloads,
+        )
         total_char_size = sum(
             len(_message_text(message)) for message in run_input.messages
         )
@@ -131,17 +152,7 @@ class RunInputContextFactBuilder:
             memory_item_count=len(build_trace.items),
             current_user_run_id=run_id,
         )
-        raw_input_blob_id = _blob_id(
-            run_id=run_id,
-            iteration_id=iteration_id,
-            role=_BLOB_ROLE_INPUT,
-        )
-        raw_tool_schemas_blob_id = _blob_id(
-            run_id=run_id,
-            iteration_id=iteration_id,
-            role=_BLOB_ROLE_TOOLS,
-        )
-        return RunInputContextSnapshotBuiltData(
+        data = RunInputContextSnapshotBuiltData(
             iteration_id=iteration_id,
             iteration_index=iteration_index,
             attempt_index=attempt_index,
@@ -153,10 +164,16 @@ class RunInputContextFactBuilder:
             message_summaries=message_summaries,
             tool_schema_summaries=tool_schema_summaries,
             context_meta=context_meta,
-            raw_input_messages_json=raw_input_messages_json,
-            raw_tool_schemas_json=raw_tool_schemas_json,
-            raw_input_blob_id=raw_input_blob_id,
-            raw_tool_schemas_blob_id=raw_tool_schemas_blob_id,
+            raw_input_messages_blob_id=raw_refs.input_messages.blob_id,
+            raw_input_messages_sha256=raw_refs.input_messages.content_sha256,
+            raw_input_messages_byte_size=raw_refs.input_messages.byte_size,
+            raw_tool_schemas_blob_id=raw_refs.tool_schemas.blob_id,
+            raw_tool_schemas_sha256=raw_refs.tool_schemas.content_sha256,
+            raw_tool_schemas_byte_size=raw_refs.tool_schemas.byte_size,
+        )
+        return RunInputContextFactBuildResult(
+            data=data,
+            raw_payloads=raw_payloads,
         )
 
 
@@ -367,20 +384,4 @@ def _short_sha256(text: str) -> str:
     ]
 
 
-def _blob_id(*, run_id: str, iteration_id: str, role: str) -> str:
-    """计算 raw_payload blob id。
-
-    :param run_id: Run id。
-    :param iteration_id: 迭代 id。
-    :param role: 角色字面量（``input`` / ``tools``）。
-    :returns: blob id（hex 16 字符）。
-    :raises Exception: 不主动抛出异常。
-    """
-
-    payload = f"{run_id}|{iteration_id}|{role}"
-    return hashlib.sha256(payload.encode("utf-8")).hexdigest()[
-        :_BLOB_ID_HEX_PREFIX_LEN
-    ]
-
-
-__all__ = ["RunInputContextFactBuilder"]
+__all__ = ["RunInputContextFactBuilder", "RunInputContextFactBuildResult"]

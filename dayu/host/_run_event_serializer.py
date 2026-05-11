@@ -59,6 +59,7 @@ from dayu.engine.contracts.engine_events import (
     ToolCallRequestedData,
     ToolResultAcceptedData,
 )
+from dayu.engine.contracts.partial_tool_call import PartialToolCallSummary
 from dayu.engine.contracts.finish_reason import FinishReason
 from dayu.host._credential_scrub import (
     scrub_tool_arguments,
@@ -293,6 +294,10 @@ def _encode_fields(
             "message": data.message,
             "provider_request_id": data.provider_request_id,
             "raw_payload": data.raw_payload,
+            "partial_tool_calls": [
+                _encode_partial_tool_call_summary(item)
+                for item in data.partial_tool_calls
+            ],
         }
     if isinstance(data, RunnerDoneEngineData):
         return {
@@ -480,6 +485,9 @@ def _decode_fields(
             message=_get_str(fields, "message"),
             provider_request_id=_get_optional_str(fields, "provider_request_id"),
             raw_payload=fields.get("raw_payload"),
+            partial_tool_calls=_decode_partial_tool_call_summaries(
+                fields.get("partial_tool_calls")
+            ),
         )
     if event_type is RunEventType.RUNNER_DONE:
         return RunnerDoneEngineData(
@@ -630,6 +638,63 @@ def _decode_provider_state(value: JsonValue) -> ToolCallProviderState | None:
     if not isinstance(signature, str):
         raise ValueError(_ERROR_INVALID_PROVIDER_STATE)
     return GeminiToolCallState(thought_signature=signature)
+
+
+def _encode_partial_tool_call_summary(
+    summary: PartialToolCallSummary,
+) -> Mapping[str, JsonValue]:
+    """编码 partial tool call 有界摘要。
+
+    :param summary: partial tool call 摘要。
+    :returns: JSON 字段映射。
+    :raises Exception: 不主动抛出异常。
+    """
+
+    return {
+        "tool_call_index": summary.tool_call_index,
+        "tool_call_id": summary.tool_call_id,
+        "name_fragment": summary.name_fragment,
+        "arguments_byte_size": summary.arguments_byte_size,
+        "arguments_sha256": summary.arguments_sha256,
+    }
+
+
+def _decode_partial_tool_call_summaries(
+    value: JsonValue,
+) -> tuple[PartialToolCallSummary, ...]:
+    """解码 partial tool call 有界摘要列表。
+
+    :param value: JSON value。
+    :returns: 摘要元组。
+    :raises ValueError: 字段非法时抛出。
+    """
+
+    if value is None:
+        return ()
+    if not isinstance(value, list):
+        raise ValueError(_ERROR_INVALID_FIELDS)
+    return tuple(_decode_partial_tool_call_summary(item) for item in value)
+
+
+def _decode_partial_tool_call_summary(
+    value: JsonValue,
+) -> PartialToolCallSummary:
+    """解码单个 partial tool call 有界摘要。
+
+    :param value: JSON value。
+    :returns: 摘要对象。
+    :raises ValueError: 字段非法时抛出。
+    """
+
+    if not isinstance(value, dict):
+        raise ValueError(_ERROR_INVALID_FIELDS)
+    return PartialToolCallSummary(
+        tool_call_index=_get_int(value, "tool_call_index"),
+        tool_call_id=_get_optional_str(value, "tool_call_id"),
+        name_fragment=_get_optional_str(value, "name_fragment"),
+        arguments_byte_size=_get_int(value, "arguments_byte_size"),
+        arguments_sha256=_get_optional_str(value, "arguments_sha256"),
+    )
 
 
 def _encode_outcome(
@@ -1062,10 +1127,12 @@ def _encode_run_input_context_snapshot(
             for item in data.tool_schema_summaries
         ],
         "context_meta": _encode_run_input_context_meta(data.context_meta),
-        "raw_input_messages_json": data.raw_input_messages_json,
-        "raw_tool_schemas_json": data.raw_tool_schemas_json,
-        "raw_input_blob_id": data.raw_input_blob_id,
+        "raw_input_messages_blob_id": data.raw_input_messages_blob_id,
+        "raw_input_messages_sha256": data.raw_input_messages_sha256,
+        "raw_input_messages_byte_size": data.raw_input_messages_byte_size,
         "raw_tool_schemas_blob_id": data.raw_tool_schemas_blob_id,
+        "raw_tool_schemas_sha256": data.raw_tool_schemas_sha256,
+        "raw_tool_schemas_byte_size": data.raw_tool_schemas_byte_size,
     }
 
 
@@ -1101,10 +1168,20 @@ def _decode_run_input_context_snapshot(
             _decode_run_input_tool_schema_summary(item) for item in raw_schemas
         ),
         context_meta=_decode_run_input_context_meta(fields.get("context_meta")),
-        raw_input_messages_json=_get_str(fields, "raw_input_messages_json"),
-        raw_tool_schemas_json=_get_str(fields, "raw_tool_schemas_json"),
-        raw_input_blob_id=_get_str(fields, "raw_input_blob_id"),
+        raw_input_messages_blob_id=_get_str(
+            fields, "raw_input_messages_blob_id"
+        ),
+        raw_input_messages_sha256=_get_str(
+            fields, "raw_input_messages_sha256"
+        ),
+        raw_input_messages_byte_size=_get_int(
+            fields, "raw_input_messages_byte_size"
+        ),
         raw_tool_schemas_blob_id=_get_str(fields, "raw_tool_schemas_blob_id"),
+        raw_tool_schemas_sha256=_get_str(fields, "raw_tool_schemas_sha256"),
+        raw_tool_schemas_byte_size=_get_int(
+            fields, "raw_tool_schemas_byte_size"
+        ),
     )
 
 

@@ -71,10 +71,12 @@ def _sample_data() -> RunInputContextSnapshotBuiltData:
             memory_item_count=0,
             current_user_run_id="run-1",
         ),
-        raw_input_messages_json='[{"role":"user","content":"hello"}]',
-        raw_tool_schemas_json='[{"name":"calc"}]',
-        raw_input_blob_id="blob-input",
+        raw_input_messages_blob_id="blob-input",
+        raw_input_messages_sha256="sha-input",
+        raw_input_messages_byte_size=35,
         raw_tool_schemas_blob_id="blob-tools",
+        raw_tool_schemas_sha256="sha-tools",
+        raw_tool_schemas_byte_size=17,
     )
 
 
@@ -112,7 +114,7 @@ def test_run_input_context_snapshot_built_decode_rejects_invalid_fields() -> Non
     )
     payload = json.loads(raw)
     fields = dict(payload["fields"])
-    fields.pop("raw_input_messages_json")
+    fields.pop("raw_input_messages_blob_id")
     payload["fields"] = fields
     bad_raw = json.dumps(payload)
     with pytest.raises(ValueError):
@@ -136,10 +138,12 @@ def test_run_input_context_snapshot_built_optional_cursor_is_none() -> None:
         message_summaries=base.message_summaries,
         tool_schema_summaries=base.tool_schema_summaries,
         context_meta=base.context_meta,
-        raw_input_messages_json=base.raw_input_messages_json,
-        raw_tool_schemas_json=base.raw_tool_schemas_json,
-        raw_input_blob_id=base.raw_input_blob_id,
+        raw_input_messages_blob_id=base.raw_input_messages_blob_id,
+        raw_input_messages_sha256=base.raw_input_messages_sha256,
+        raw_input_messages_byte_size=base.raw_input_messages_byte_size,
         raw_tool_schemas_blob_id=base.raw_tool_schemas_blob_id,
+        raw_tool_schemas_sha256=base.raw_tool_schemas_sha256,
+        raw_tool_schemas_byte_size=base.raw_tool_schemas_byte_size,
     )
     raw = serialize_run_event_data(
         event_type=RunEventType.RUN_INPUT_CONTEXT_SNAPSHOT_BUILT,

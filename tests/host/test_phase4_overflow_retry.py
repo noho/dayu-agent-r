@@ -64,6 +64,7 @@ from dayu.host._event_store import InMemoryRunEventStore, RunEventStore
 from dayu.host._internal_contracts import AttemptState
 from dayu.host._run_harness import LocalRunHarness
 from dayu.host.contracts import (
+    TERMINAL_RUN_EVENT_TYPES,
     ContextCompactFailureReason,
     HostContextCompactCompletedData,
     HostContextCompactFailedData,
@@ -854,8 +855,8 @@ async def test_same_run_tool_facts_enter_compacted_attempt() -> None:
     )
     assert "tool_call_id=call-current" in compact_text
     assert "source_event_cursor=2" in compact_text
-    assert "cursor_fingerprint=fp-current" in compact_text
-    assert "has_more=True" in compact_text
+    assert "cursor_fingerprint=None" in compact_text
+    assert "has_more=None" in compact_text
 
 
 @pytest.mark.asyncio
@@ -1214,7 +1215,11 @@ async def test_durable_overflow_acquire_failure_terminal_fencing_routes_owner_lo
     monkeypatch: pytest.MonkeyPatch,
     caplog: pytest.LogCaptureFixture,
 ) -> None:
-    """N1: retry acquire 失败后旧 owner terminal close 被 fence 时走 owner-lost。
+    """N1: compact diagnostic 已成功，但旧 owner terminal close 被 fence。
+
+    该场景证明 compact success diagnostic 可先落库；随后 terminal close
+    CAS miss 时不得补写 stale Host terminal，Run 终态仍只能来自唯一
+    terminal truth。
 
     :param monkeypatch: pytest monkeypatch fixture。
     :param caplog: pytest 日志捕获 fixture。
@@ -1357,6 +1362,25 @@ async def test_durable_overflow_acquire_failure_terminal_fencing_routes_owner_lo
             )
             for event in events
         ), "CAS miss 路径不应写 stale HOST terminal RunEvent"
+        stored_events = await bundle.event_store.list_events(request.run_id, None)
+        assert any(
+            event.type is RunEventType.CONTEXT_COMPACT_COMPLETED
+            for event in stored_events
+        ), "compact success diagnostic 应已落库"
+        terminal_events = [
+            event for event in stored_events
+            if event.type in TERMINAL_RUN_EVENT_TYPES
+        ]
+        assert len(terminal_events) <= 1, (
+            "terminal close CAS miss 不得制造第二个 terminal truth"
+        )
+        assert all(
+            not (
+                event.type is RunEventType.RUN_FAILED
+                and event.source is RunEventSource.HOST
+            )
+            for event in terminal_events
+        ), "stale Host terminal 不得在 EventLog 中成为终态真源"
         assert all(
             "host.run.background_task_failed" not in record.getMessage()
             for record in caplog.records

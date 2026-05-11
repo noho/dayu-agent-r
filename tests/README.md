@@ -181,7 +181,8 @@ Host 当前 Run harness、RunEventStore、ToolRuntime、Conversation Memory / Ru
     RunResult 快照可读。
 - P7 tool trace projection（`tests/host/test_phase7_*.py`）：覆盖
   `RunInputContextFactBuilder` 派生 ``RUN_INPUT_CONTEXT_SNAPSHOT_BUILT`` canonical
-  fact、`ToolTraceJsonlSink` JSONL + raw payload blob 落盘、provider secret
+  fact、`run_input_raw_payloads` side-store 同事务写入与校验失败路径、
+  `ToolTraceJsonlSink` JSONL + raw payload blob 落盘、provider secret
   scrub、普通 tool payload 显式凭证 scrub 与 cursor / scope token 保留、
   `ToolTraceObserver` 5 类 record 派发、``DurableHarnessConfig.tool_trace_path``
   装配开关与 ``tool_trace_v2_host`` schema 字面量边界。
@@ -283,7 +284,8 @@ Host 当前 Run harness、RunEventStore、ToolRuntime、Conversation Memory / Ru
   OLD ``tool_trace_v2`` schema、检测重复 tool_call、truncation 后未续读
   ordinary fetch_more、fetch_more 引用未知 cursor / 错误 scope / 重复 cursor
   / failed outcome、忽略旧专属 fetch_more projection 字段、provider_protocol_error
-  计数、final_response 是否存在与同 run 内 ``source_event_position`` 单调性。
+  计数、bounded partial tool call 诊断、final_response 是否存在与同 run 内
+  ``source_event_position`` 单调性。
 
 ### `tests/engine/contracts/`
 

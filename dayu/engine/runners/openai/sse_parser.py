@@ -195,6 +195,7 @@ class SSEParser:
                 message="failed to decode SSE chunk as UTF-8",
                 provider_request_id=None,
                 raw_payload=raw_payload,
+                partial_tool_calls=self._aggregator.partial_summaries(),
             )
         )
         self._terminated = True
@@ -238,6 +239,7 @@ class SSEParser:
                     message=f"SSE data line is not valid JSON: {exc}",
                     provider_request_id=None,
                     raw_payload=None,
+                    partial_tool_calls=self._aggregator.partial_summaries(),
                 )
             )
             self._fatal_terminated = True
@@ -253,6 +255,7 @@ class SSEParser:
                     message="SSE data line is not a JSON object",
                     provider_request_id=None,
                     raw_payload=None,
+                    partial_tool_calls=self._aggregator.partial_summaries(),
                 )
             )
             self._fatal_terminated = True
@@ -429,7 +432,13 @@ class SSEParser:
                     message="usage fields are not all integers",
                     provider_request_id=None,
                     raw_payload=None,
+                    partial_tool_calls=self._aggregator.partial_summaries(),
                 )
+            )
+            self._fatal_terminated = True
+            self._terminated = True
+            yield _make_event(
+                RunnerDoneData(finish_reason=FinishReason.ERROR)
             )
             return
         normalized: _OpenAIUsage = {

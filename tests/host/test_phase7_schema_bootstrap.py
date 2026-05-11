@@ -3,8 +3,8 @@
 确认：
 
 - P7 不向 SQLite 引入 ``host_tool_trace_*`` 任何新表（trace 完全走文件系统）。
-- ``RUN_INPUT_CONTEXT_SNAPSHOT_BUILT`` fact 内联大体积 raw JSON 时仍可正常
-  通过 :meth:`DurableRunEventStore.append` round-trip。
+- ``RUN_INPUT_CONTEXT_SNAPSHOT_BUILT`` fact 只保存 raw payload 引用，不再
+  内联大体积 raw JSON。
 """
 
 from __future__ import annotations
@@ -47,14 +47,12 @@ def test_no_tool_trace_tables_added_to_sqlite_schema() -> None:
 
 
 @pytest.mark.asyncio
-async def test_run_event_data_column_accepts_inlined_raw_payload() -> None:
-    """``RUN_INPUT_CONTEXT_SNAPSHOT_BUILT`` 内联大 raw JSON 时 round-trip 不丢失。"""
+async def test_run_event_data_column_keeps_bounded_raw_payload_refs() -> None:
+    """``RUN_INPUT_CONTEXT_SNAPSHOT_BUILT`` round-trip 只保存 bounded refs。"""
 
     storage = HostStorage(database_path=":memory:")
     try:
         store = open_durable_event_store(storage)
-        big_input = "x" * (256 * 1024)
-        big_tools = "y" * (128 * 1024)
         data = RunInputContextSnapshotBuiltData(
             iteration_id="iter-1",
             iteration_index=0,
@@ -83,10 +81,12 @@ async def test_run_event_data_column_accepts_inlined_raw_payload() -> None:
                 memory_item_count=0,
                 current_user_run_id="r1",
             ),
-            raw_input_messages_json=big_input,
-            raw_tool_schemas_json=big_tools,
-            raw_input_blob_id="blob-input",
+            raw_input_messages_blob_id="blob-input",
+            raw_input_messages_sha256="sha-input",
+            raw_input_messages_byte_size=256 * 1024,
             raw_tool_schemas_blob_id="blob-tools",
+            raw_tool_schemas_sha256="sha-tools",
+            raw_tool_schemas_byte_size=128 * 1024,
         )
         draft = RunEventDraft(
             run_id="r1",
@@ -104,7 +104,9 @@ async def test_run_event_data_column_accepts_inlined_raw_payload() -> None:
         assert len(rows) == 1
         _, event = rows[0]
         assert isinstance(event.data, RunInputContextSnapshotBuiltData)
-        assert event.data.raw_input_messages_json == big_input
-        assert event.data.raw_tool_schemas_json == big_tools
+        assert event.data.raw_input_messages_blob_id == "blob-input"
+        assert event.data.raw_tool_schemas_blob_id == "blob-tools"
+        assert event.data.raw_input_messages_byte_size == 256 * 1024
+        assert event.data.raw_tool_schemas_byte_size == 128 * 1024
     finally:
         storage.close()

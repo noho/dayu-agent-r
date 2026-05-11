@@ -356,11 +356,9 @@ class RunInputContextSnapshotBuiltData:
     """RunInputBuilder 完成、Engine attempt 启动前的 Host-owned 事实。
 
     本 fact 在 Host RunInputBuilder 完成后、Engine attempt 启动前同事务追
-    加到 EventLog；崩溃 replay 时由 P7 ``ToolTraceObserver`` 派生为 OLD
-    `iteration_context_snapshot` 的等价 record。完整 model_input_messages
-    与 tool_schemas 的 raw JSON 内联在 ``raw_input_messages_json`` /
-    ``raw_tool_schemas_json`` 中（EventLog ``data`` TEXT 列无大小硬限制）；
-    observer 阶段把它们拆成 ``raw_payloads/`` 文件，hot 层只保留摘要。
+    加到 EventLog；完整 model_input_messages 与 tool_schemas 的 raw JSON
+    由 Host raw payload side-store 持久保存。EventLog hot fact 只保留
+    摘要、blob id、sha256 与 byte size。
 
     :param iteration_id: 当前 Engine iteration id。
     :param iteration_index: Engine iteration index（attempt 内自增）。
@@ -372,11 +370,12 @@ class RunInputContextSnapshotBuiltData:
     :param message_summaries: 每条 model_input message 的热层摘要。
     :param tool_schema_summaries: 暴露给 Engine 的工具 schema 摘要。
     :param context_meta: 整体上下文摘要。
-    :param raw_input_messages_json: 完整 model_input_messages 的 JSON 字符串。
-    :param raw_tool_schemas_json: 完整 tool_schemas 的 JSON 字符串。
-    :param raw_input_blob_id: observer 写 raw_input 文件时使用的稳定标识。
-    :param raw_tool_schemas_blob_id: observer 写 raw_tool_schemas 文件时使用的
-        稳定标识。
+    :param raw_input_messages_blob_id: ``input_messages`` raw payload blob id。
+    :param raw_input_messages_sha256: ``input_messages`` raw payload sha256。
+    :param raw_input_messages_byte_size: ``input_messages`` raw payload 字节数。
+    :param raw_tool_schemas_blob_id: ``tool_schemas`` raw payload blob id。
+    :param raw_tool_schemas_sha256: ``tool_schemas`` raw payload sha256。
+    :param raw_tool_schemas_byte_size: ``tool_schemas`` raw payload 字节数。
     """
 
     iteration_id: str
@@ -388,10 +387,12 @@ class RunInputContextSnapshotBuiltData:
     message_summaries: tuple[RunInputMessageSummary, ...]
     tool_schema_summaries: tuple[RunInputToolSchemaSummary, ...]
     context_meta: RunInputContextMeta
-    raw_input_messages_json: str
-    raw_tool_schemas_json: str
-    raw_input_blob_id: str
+    raw_input_messages_blob_id: str
+    raw_input_messages_sha256: str
+    raw_input_messages_byte_size: int
     raw_tool_schemas_blob_id: str
+    raw_tool_schemas_sha256: str
+    raw_tool_schemas_byte_size: int
 
 
 RunEventData: TypeAlias = (

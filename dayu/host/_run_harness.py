@@ -81,6 +81,7 @@ from dayu.host._run_input_builder import (
     RunInputBuilder,
 )
 from dayu.host._run_input_context_fact import RunInputContextFactBuilder
+from dayu.host._run_input_raw_payload_store import put_run_input_raw_payloads
 from dayu.host._run_state_store import AttemptStateStore
 from dayu.host._tool_runtime import (
     HostToolRuntime,
@@ -2297,7 +2298,7 @@ class LocalRunHarness:
             return
         if self.run_input_context_fact_builder is None:
             raise ValueError(_RUN_INPUT_CONTEXT_FACT_BUILDER_REQUIRED)
-        data = self.run_input_context_fact_builder.build(
+        built = self.run_input_context_fact_builder.build(
             run_input=request.input,
             build_trace=build_trace,
             current_user_event=current_user_event,
@@ -2306,13 +2307,15 @@ class LocalRunHarness:
             iteration_index=iteration_index,
             iteration_id=iteration_id,
         )
+        data = built.data
+        occurred_at = datetime.now(tz=timezone.utc)
         draft = RunEventDraft(
             run_id=request.run_id,
             session_id=request.session_id,
             kind=RunEventKind.CANONICAL,
             source=RunEventSource.HOST,
             type=RunEventType.RUN_INPUT_CONTEXT_SNAPSHOT_BUILT,
-            occurred_at=datetime.now(tz=timezone.utc),
+            occurred_at=occurred_at,
             data=data,
             source_engine_event_id=None,
         )
@@ -2326,6 +2329,16 @@ class LocalRunHarness:
             else None
         )
         async with self.storage.transaction() as tx:
+            put_run_input_raw_payloads(
+                tx=tx,
+                session_id=request.session_id,
+                run_id=request.run_id,
+                attempt_index=attempt_index,
+                iteration_index=iteration_index,
+                iteration_id=iteration_id,
+                payloads=built.raw_payloads,
+                created_at=occurred_at,
+            )
             if scoped is not None:
                 scoped.append_in_transaction(tx=tx, draft=draft)
             else:

@@ -1114,6 +1114,7 @@ class _AsyncAgent:
                     message=data.message,
                     provider_request_id=data.provider_request_id,
                     raw_payload=data.raw_payload,
+                    partial_tool_calls=data.partial_tool_calls,
                 ),
                 occurred_at=runner_event.occurred_at,
             )

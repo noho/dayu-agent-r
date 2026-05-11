@@ -258,6 +258,30 @@ class ContextPressureRun:
 
 
 @dataclass(frozen=True, slots=True)
+class ProviderPartialToolCallDiagnostic:
+    """provider_protocol_error 中的 partial tool call 诊断。
+
+    :param run_id: Run id。
+    :param iteration_id: iteration id。
+    :param error_code: provider protocol error code。
+    :param tool_call_index: provider tool call index。
+    :param tool_call_id: provider 已给出的 tool call id。
+    :param name_fragment: 已解析工具名片段。
+    :param arguments_byte_size: 已收到 arguments delta 字节数。
+    :param arguments_sha256: 已收到 arguments delta sha256。
+    """
+
+    run_id: str
+    iteration_id: str
+    error_code: str
+    tool_call_index: int
+    tool_call_id: str | None
+    name_fragment: str | None
+    arguments_byte_size: int
+    arguments_sha256: str | None
+
+
+@dataclass(frozen=True, slots=True)
 class TraceAnalysisReport:
     """trace 诊断结果汇总。
 
@@ -287,6 +311,7 @@ class TraceAnalysisReport:
     failure_patterns: tuple[FailurePattern, ...]
     detailed_failure_patterns: tuple[DetailedFailurePattern, ...]
     context_pressure_runs: tuple[ContextPressureRun, ...]
+    provider_partial_tool_calls: tuple[ProviderPartialToolCallDiagnostic, ...]
 
 
 @dataclass(frozen=True, slots=True)
@@ -391,6 +416,21 @@ def _read_int(record: JsonRecord, key: str) -> int | None:
     if isinstance(value, bool):
         return None
     if isinstance(value, int):
+        return value
+    return None
+
+
+def _read_optional_str(record: JsonRecord, key: str) -> str | None:
+    """读取可空 ``str`` 字段。
+
+    :param record: JSON 对象。
+    :param key: 字段名。
+    :returns: 字段字符串值；缺失、``null`` 或类型不匹配返回 ``None``。
+    :raises Exception: 不主动抛出异常。
+    """
+
+    value = record.get(key)
+    if isinstance(value, str):
         return value
     return None
 
@@ -995,6 +1035,49 @@ def _build_context_pressure_runs(
     return tuple(findings)
 
 
+def _build_provider_partial_tool_calls(
+    entries: list[TraceLineEntry],
+) -> tuple[ProviderPartialToolCallDiagnostic, ...]:
+    """从 provider_protocol_error record 提取 partial tool call 诊断。
+
+    :param entries: 去重后的 record 列表。
+    :returns: partial tool call 诊断元组。
+    :raises ValueError: ``partial_tool_calls_json`` 非合法 JSON 时抛出。
+    """
+
+    diagnostics: list[ProviderPartialToolCallDiagnostic] = []
+    for entry in entries:
+        record = entry.record
+        if _read_str(record, "trace_type") != _TRACE_TYPE_PROVIDER_PROTOCOL_ERROR:
+            continue
+        partials_raw = _read_str(record, "partial_tool_calls_json")
+        if partials_raw == "":
+            continue
+        parsed = json.loads(partials_raw)
+        if not isinstance(parsed, list):
+            raise ValueError("partial_tool_calls_json must decode to list")
+        for item in parsed:
+            if not isinstance(item, dict):
+                raise ValueError("partial tool call summary must be object")
+            diagnostics.append(
+                ProviderPartialToolCallDiagnostic(
+                    run_id=_read_str(record, "run_id"),
+                    iteration_id=_read_str(record, "iteration_id"),
+                    error_code=_read_str(record, "error_code"),
+                    tool_call_index=_read_int(item, "tool_call_index") or 0,
+                    tool_call_id=_read_optional_str(item, "tool_call_id"),
+                    name_fragment=_read_optional_str(item, "name_fragment"),
+                    arguments_byte_size=(
+                        _read_int(item, "arguments_byte_size") or 0
+                    ),
+                    arguments_sha256=_read_optional_str(
+                        item, "arguments_sha256"
+                    ),
+                )
+            )
+    return tuple(diagnostics)
+
+
 def analyze_trace_root(*, trace_root: Path) -> TraceAnalysisReport:
     """读取并分析 ``<trace_root>/sessions/**/tool_calls_*.jsonl``。
 
@@ -1050,6 +1133,9 @@ def analyze_trace_root(*, trace_root: Path) -> TraceAnalysisReport:
     failure_patterns = _build_failure_patterns(deduped_entries)
     detailed_failure_patterns = _build_detailed_failure_patterns(deduped_entries)
     context_pressure_runs = _build_context_pressure_runs(deduped_entries)
+    provider_partial_tool_calls = _build_provider_partial_tool_calls(
+        deduped_entries
+    )
     provider_error_count = counts_by_type.get(_TRACE_TYPE_PROVIDER_PROTOCOL_ERROR, 0)
     final_response_present = counts_by_type.get(_TRACE_TYPE_FINAL_RESPONSE, 0) > 0
     return TraceAnalysisReport(
@@ -1067,6 +1153,7 @@ def analyze_trace_root(*, trace_root: Path) -> TraceAnalysisReport:
         failure_patterns=failure_patterns,
         detailed_failure_patterns=detailed_failure_patterns,
         context_pressure_runs=context_pressure_runs,
+        provider_partial_tool_calls=provider_partial_tool_calls,
     )
 
 
@@ -1098,6 +1185,17 @@ def _format_report(report: TraceAnalysisReport) -> str:
         lines.append(
             f"  run={issue.run_id} tool_call={issue.tool_call_id} "
             f"cursor={issue.scope_token_or_cursor!r} reason={issue.reason}"
+        )
+    lines.append(
+        f"provider_partial_tool_calls: {len(report.provider_partial_tool_calls)}"
+    )
+    for partial in report.provider_partial_tool_calls:
+        lines.append(
+            f"  run={partial.run_id} iteration={partial.iteration_id} "
+            f"error={partial.error_code} index={partial.tool_call_index} "
+            f"id={partial.tool_call_id!r} name={partial.name_fragment!r} "
+            f"arg_bytes={partial.arguments_byte_size} "
+            f"arg_sha256={partial.arguments_sha256!r}"
         )
     lines.append(f"source_event_position_gaps: {len(report.source_event_position_gaps)}")
     for pos_gap in report.source_event_position_gaps:

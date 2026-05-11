@@ -1015,9 +1015,12 @@ bundle = build_durable_harness(
 - `tool_trace_path` 非空时装配 `ToolTraceObserver` + `ToolTraceJsonlSink`，
   trace 会以 JSONL 写入
   `<root>/sessions/<session_id>/tool_calls_NNNNNN.jsonl`（约 10MB 滚动），
-  `RUN_INPUT_CONTEXT_SNAPSHOT_BUILT` 内联的完整 input / tool schema raw
-  payload 拆为 `<root>/raw_payloads/<run_id>_<iteration_id>/<blob_id>.json`，
-  先写 tmp + `os.replace` 原子落地。
+  `RUN_INPUT_CONTEXT_SNAPSHOT_BUILT` 只在 EventLog hot row 保存 raw payload
+  的 blob id / sha256 / byte size；完整 input / tool schema raw payload 在
+  同一个 `HostStorage.transaction()` 写入 `run_input_raw_payloads`，trace
+  projection 读取并校验后再落
+  `<root>/raw_payloads/<run_id>_<iteration_id>/<blob_id>.json`，先写 tmp +
+  `os.replace` 原子落地。
 - schema 字面量为 `tool_trace_v2_host`，**与旧 `tool_trace_v2` 不兼容**，
   治理边界、字段集合、idempotency_key 计算方式都不同。
 - 行内 sha256[:32] `idempotency_key` 让重复 replay 的孤儿副本可以被 analyzer
@@ -1040,8 +1043,9 @@ python utils/analyze_tool_trace_host.py <trace_root>
 `utils/analyze_tool_trace_host.py` 仅识别 `tool_trace_v2_host` schema，
 遇到 OLD `tool_trace_v2` 文件直接抛 `ValueError`；它输出去重后的 record
 计数、重复 tool_call、truncation 后未续读 fetch_more、fetch_more 引用未知
-cursor、`provider_protocol_error` 数量、`final_response` 是否存在，以及同
-run 内 `source_event_position` 是否单调。
+cursor、`provider_protocol_error` 数量、provider partial tool call bounded
+summary、`final_response` 是否存在，以及同 run 内 `source_event_position`
+是否单调。
 
 > 5.0 与 5（`utils.analyze_tool_trace`）面向**两条不同的 trace 路径**：
 > 5 是 CLI 历史 OLD trace，沿用 `tool_trace_v2` schema 与既有 markdown

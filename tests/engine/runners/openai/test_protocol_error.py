@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import hashlib
 import json
 
 import pytest
@@ -15,11 +16,26 @@ from dayu.engine.contracts.runner_events import (
 from dayu.engine.runners.openai.non_stream_parser import (
     parse_non_stream_response,
 )
+from dayu.engine.runners.openai.tool_call_aggregator import (
+    PARTIAL_TOOL_CALL_NAME_FRAGMENT_MAX_CHARS,
+    PARTIAL_TOOL_CALL_SUMMARY_MAX_ITEMS,
+)
 
 from tests.engine.runners.openai._sse_helpers import (
     make_no_thought_hook,
     parse_sse,
 )
+
+
+def _sse_json_chunk(payload_json: str) -> bytes:
+    """把 JSON 字符串包装为单条 SSE data chunk。
+
+    :param payload_json: 已序列化的 JSON 字符串。
+    :returns: UTF-8 编码后的 SSE chunk。
+    :raises Exception: 不主动抛出异常。
+    """
+
+    return f"data: {payload_json}\n\n".encode("utf-8")
 
 
 @pytest.mark.asyncio
@@ -41,6 +57,150 @@ async def test_sse_invalid_json_emits_protocol_error() -> None:
     assert events[0].data.error_code == "sse_invalid_json"
     assert isinstance(events[1].data, RunnerDoneData)
     assert events[1].data.finish_reason is FinishReason.ERROR
+
+
+@pytest.mark.asyncio
+async def test_sse_invalid_json_reports_bounded_partial_tool_call() -> None:
+    """SSE 中途失败时协议错误携带 partial tool call 摘要且不含 raw arguments。"""
+
+    chunks = [
+        (
+            b'data: {"choices":[{"delta":{"tool_calls":'
+            b'[{"index":0,"id":"call-1","type":"function",'
+            b'"function":{"name":"lookup","arguments":"{\\"ticker\\":"}}]}}]}\n\n'
+        ),
+        b"data: not-a-json\n\n",
+    ]
+    events = await parse_sse(chunks)
+    assert isinstance(events[1].data, RunnerProtocolErrorData)
+    partials = events[1].data.partial_tool_calls
+    assert len(partials) == 1
+    assert partials[0].tool_call_index == 0
+    assert partials[0].tool_call_id == "call-1"
+    assert partials[0].name_fragment == "lookup"
+    assert partials[0].arguments_byte_size > 0
+    assert partials[0].arguments_sha256 is not None
+
+
+@pytest.mark.asyncio
+async def test_sse_partial_tool_call_summary_has_hard_bounds() -> None:
+    """partial tool call 摘要限制条数与工具名片段长度且不含 raw arguments。"""
+
+    long_name = "lookup_" + (
+        "x" * (PARTIAL_TOOL_CALL_NAME_FRAGMENT_MAX_CHARS + 50)
+    )
+    argument_fragment = '{"secret":"should-not-appear"'
+    tool_calls = [
+        {
+            "index": index,
+            "id": f"call-{index}",
+            "type": "function",
+            "function": {
+                "name": long_name,
+                "arguments": argument_fragment,
+            },
+        }
+        for index in range(PARTIAL_TOOL_CALL_SUMMARY_MAX_ITEMS + 7)
+    ]
+    payload_json = json.dumps(
+        {"choices": [{"delta": {"tool_calls": tool_calls}}]},
+        separators=(",", ":"),
+    )
+    events = await parse_sse(
+        [_sse_json_chunk(payload_json), b"data: nope\n\n"]
+    )
+
+    protocol_errors = [
+        e.data for e in events if isinstance(e.data, RunnerProtocolErrorData)
+    ]
+    assert len(protocol_errors) == 1
+    partials = protocol_errors[0].partial_tool_calls
+    assert len(partials) == PARTIAL_TOOL_CALL_SUMMARY_MAX_ITEMS
+    assert tuple(p.tool_call_index for p in partials) == tuple(
+        range(PARTIAL_TOOL_CALL_SUMMARY_MAX_ITEMS)
+    )
+    expected_sha256 = hashlib.sha256(
+        argument_fragment.encode("utf-8")
+    ).hexdigest()
+    for partial in partials:
+        name_fragment = partial.name_fragment
+        assert name_fragment is not None
+        assert name_fragment == long_name[
+            :PARTIAL_TOOL_CALL_NAME_FRAGMENT_MAX_CHARS
+        ]
+        assert len(name_fragment) <= PARTIAL_TOOL_CALL_NAME_FRAGMENT_MAX_CHARS
+        assert partial.arguments_byte_size == len(
+            argument_fragment.encode("utf-8")
+        )
+        assert partial.arguments_sha256 == expected_sha256
+    assert "should-not-appear" not in repr(partials)
+
+
+@pytest.mark.asyncio
+async def test_sse_usage_malformed_after_tool_delta_is_fatal() -> None:
+    """tool call delta 后 malformed usage 必须错误收口且不产出 completed。"""
+
+    tool_payload = json.dumps(
+        {
+            "choices": [
+                {
+                    "delta": {
+                        "tool_calls": [
+                            {
+                                "index": 0,
+                                "id": "call-1",
+                                "type": "function",
+                                "function": {
+                                    "name": "lookup",
+                                    "arguments": "{}",
+                                },
+                            }
+                        ]
+                    }
+                }
+            ]
+        },
+        separators=(",", ":"),
+    )
+    malformed_usage_payload = json.dumps(
+        {
+            "choices": [],
+            "usage": {
+                "prompt_tokens": "bad",
+                "completion_tokens": 1,
+                "total_tokens": 2,
+            },
+        },
+        separators=(",", ":"),
+    )
+    events = await parse_sse(
+        [
+            _sse_json_chunk(tool_payload),
+            _sse_json_chunk(malformed_usage_payload),
+            (
+                b'data: {"choices":[{"finish_reason":"tool_calls",'
+                b'"delta":{}}]}\n\n'
+            ),
+            b"data: [DONE]\n\n",
+        ]
+    )
+    types = [e.type for e in events]
+    assert types == [
+        RunnerEventType.RUNNER_TOOL_CALL_DELTA,
+        RunnerEventType.PROVIDER_PROTOCOL_ERROR,
+        RunnerEventType.RUNNER_DONE,
+    ]
+    protocol_error = events[1].data
+    assert isinstance(protocol_error, RunnerProtocolErrorData)
+    assert protocol_error.error_code == "usage_field_malformed"
+    assert len(protocol_error.partial_tool_calls) == 1
+    assert protocol_error.partial_tool_calls[0].tool_call_id == "call-1"
+    assert protocol_error.partial_tool_calls[0].name_fragment == "lookup"
+    done = events[2].data
+    assert isinstance(done, RunnerDoneData)
+    assert done.finish_reason is FinishReason.ERROR
+    assert RunnerEventType.RUNNER_TOOL_CALLS_COMPLETED not in types
+    assert RunnerEventType.RUNNER_CONTENT_COMPLETED not in types
 
 
 @pytest.mark.asyncio

@@ -40,6 +40,9 @@ from dayu.host._run_event_serializer import (
     deserialize_run_event_data,
     serialize_run_event_data,
 )
+from dayu.host._run_input_raw_payload_store import (
+    ensure_run_input_raw_payload_schema,
+)
 from dayu.host.contracts import (
     TERMINAL_RUN_EVENT_TYPES,
     RunEvent,
@@ -225,6 +228,7 @@ class DurableRunEventStore:
         """
 
         ensure_host_schema(self.storage)
+        ensure_run_input_raw_payload_schema(self.storage)
 
     async def append(self, draft: RunEventDraft) -> RunEvent:
         """在单一事务内 append RunEvent 草稿。
