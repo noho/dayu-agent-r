@@ -44,6 +44,7 @@ EXPECTED_EXPORTS: frozenset[str] = frozenset(
         "MimoThinkingExtension",
         "OpenAIReasoningEffort",
         "OpenAIReasoningExtension",
+        "PartialToolCallSummary",
         "ProviderProtocolErrorData",
         "ProviderRequestExtension",
         "QwenThinkingExtension",

@@ -23,14 +23,14 @@ pytest tests/contracts tests/engine -q
 运行类型检查：
 
 ```bash
-pyright
+python -m pyright dayu/ tests/ utils/
 ```
 
 也可以按目录或文件收窄测试范围：
 
 ```bash
-pytest tests/contracts -q
 pytest tests/host -q
+pytest tests/contracts -q
 pytest tests/host/test_phase2_tool_runtime_truncation.py -q
 pytest tests/host/test_phase2_tool_runtime_eventlog.py -q
 pytest tests/host/test_phase2_tool_runtime_boundary.py -q
@@ -81,7 +81,8 @@ Engine 契约、包根导出、事件契约与架构边界测试，覆盖 `dayu.
 - package exports：锁定 `dayu.engine.__all__`，阻止未承诺入口、实现类或取消异常出现在包根。
 - import boundary：阻止 Engine 反向依赖 Host、Service、UI、fins、工具执行实现、处理器或 trace 私有模块；OpenAI runner 子树内允许当前实现所需的 `aiohttp`。
 - weak typing guard：扫描 `dayu.engine` 源码，守住强类型签名、封闭联合与 metadata 类型边界。
-- 事件契约与消息契约：覆盖 EngineEvent、RunnerEvent、AgentMessage、metadata、终态事件集合等结构约束。
+- 事件契约与消息契约：覆盖 EngineEvent、RunnerEvent、AgentMessage、metadata、provider protocol error
+  `partial_tool_calls` 有界摘要、终态事件集合等结构约束。
 - Agent 状态机：覆盖无工具 final / failed / cancelled、普通 completed / failed tool calling、工具结果投影、max iteration force-answer、连续失败工具批次保护、awaiting 拒绝与取消优先级。
 - smoke 脚本轻量测试：覆盖 provider smoke 与 tool-call smoke 的参数解析、缺 key 跳过、安全输出和 fake 工具行为，不做真实联网。
 

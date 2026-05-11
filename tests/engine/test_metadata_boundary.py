@@ -14,6 +14,7 @@ from dayu.engine.contracts.engine_events import (
     ProviderProtocolErrorData,
     RunnerUsageData,
 )
+from dayu.engine.contracts.partial_tool_call import PartialToolCallSummary
 from dayu.engine.contracts.runner_events import (
     RunnerContentCompletedData,
     RunnerProtocolErrorData,
@@ -49,6 +50,7 @@ def test_provider_protocol_error_engine_data_has_explicit_fields() -> None:
         "iteration_id",
         "error_code",
         "message",
+        "partial_tool_calls",
         "provider_request_id",
         "raw_payload",
     } == fields
@@ -61,9 +63,29 @@ def test_provider_protocol_error_runner_data_has_explicit_fields() -> None:
     assert {
         "error_code",
         "message",
+        "partial_tool_calls",
         "provider_request_id",
         "raw_payload",
     } == fields
+
+
+def test_partial_tool_call_summary_excludes_raw_arguments() -> None:
+    """partial tool call 摘要必须只暴露有界诊断字段。
+
+    参数：无。
+    返回值：无。
+    异常：断言失败时由 pytest 抛出 ``AssertionError``。
+    """
+
+    fields = _field_names(PartialToolCallSummary)
+    assert {
+        "tool_call_index",
+        "tool_call_id",
+        "name_fragment",
+        "arguments_byte_size",
+        "arguments_sha256",
+    } == fields
+    assert "arguments" not in fields
 
 
 def test_runner_content_completed_data_has_finish_reason() -> None:

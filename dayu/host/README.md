@@ -513,9 +513,9 @@ python utils/smoke_host_p6_durable_eventlog.py
 python utils/smoke_host_p6_durable_eventlog.py --log-level DEBUG
 ```
 
-当前提供 Host ToolRuntime smoke 脚本，用于观察 P2 schema-driven truncate、cursor issued、
-受控 handle、fetch_more 与 single-use 失效。脚本日志只输出 cursor fingerprint、事件 cursor、chunk size 等
-中性摘要：
+当前提供 Host ToolRuntime smoke 脚本，用于观察 schema-driven truncate、Host 私有
+`RuntimeTruncateManager` 补读、framework `fetch_more` 普通工具调用与 single-use 失效。脚本日志只输出
+cursor fingerprint、事件 cursor、chunk size 等中性摘要，不输出 raw cursor 或 `scope_token`：
 
 ```bash
 python utils/smoke_host_tool_runtime.py --log-level DEBUG

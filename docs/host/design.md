@@ -904,11 +904,11 @@ RunInputBuilder 的决策。它必须在 RunInputBuilder 产物确定后、Engin
 tool trace 会重新退化为进程内缓存诊断，无法 crash replay。
 
 `RUN_INPUT_CONTEXT_SNAPSHOT_BUILT` 的 raw payload 与 EventLog fact 必须作为同一个 durable unit of
-work 提交。P7 落地的实现方式：fact `data` payload 直接内联完整 `raw_input_messages_json` 与
-`raw_tool_schemas_json`（SQLite TEXT 列无大小硬上限），事务边界收敛到单条 `append_in_transaction`
-原子写入；不再单独写"先 raw blob 再 append fact ref"两阶段。该方式天然消除"fact 已落库但 raw
-ref 缺失"窗口；trade-off 是 EventLog 行体积增大，已在 `docs/host/migration-plan.md` §4.3 登记为
-中期评估项（必要时再外迁到独立表 / 文件）。
+work 提交。P8.5 后当前实现不再把完整 `raw_input_messages_json` / `raw_tool_schemas_json` 内联进
+EventLog hot row；Host 在同一个 `HostStorage.transaction()` 内先写 `run_input_raw_payloads`
+side-store，再 append 只含 blob id、sha256、byte size 与 bounded summary 的 EventLog fact。
+trace projection / debug read path 读取 side-store 时必须校验 blob kind、hash、byte size 与 JSON；
+缺失、损坏或 hash mismatch 均返回 typed projection failure，checkpoint 不推进，禁止合成 fake raw payload。
 
 P7 trace payload 采用 OLD 的热 / 冷分层，而不是默认做业务内容过滤：
 
@@ -931,18 +931,17 @@ exporter / adapter 输入输出素材，但 Host 内部 read model 不伪装成�
 harness 在配置了 `ToolTraceStore` / trace storage path 时默认注册 `tool_trace_observer`；未配置 trace
 store 时不注册，避免无意义 observer 状态面。
 
-P7 落地后的硬事实：
+P7 / P8.5 落地后的硬事实：
 
 - JSONL 文件是 trace 的真源；P7 不在 SQLite 引入任何 `host_tool_trace_*` 表。`docs/host/phase7-plan.md`
   §9 原先建议的 `host_tool_trace_records` / `host_tool_trace_raw_payloads` 双表方案已被 JSONL 真源方案取代。
-- `RUN_INPUT_CONTEXT_SNAPSHOT_BUILT` 是 P6 EventLog 的事实补齐 patch，由 Host 同事务追加；
-  内联 `raw_input_messages_json` / `raw_tool_schemas_json` 与 `raw_*_blob_id`，让 trace observer
-  无需回查 EventLog 即可重建 raw payload。
-- `ToolTraceObserver` 是当前唯一 sink 同步阻塞 terminal drain 的 observer：sink 每行 `flush + fsync`、
-  raw payload `tmp + os.replace` 原子落地，但写入完全在文件系统，**不动 SQLite**，不阻塞 Engine 事件
-  产生；`tx` 参数仅为满足 `ObserverSink` 协议而保留。projection 采用 best-effort 语义：JSONL append
-  与 `ProjectionCoordinator` checkpoint 推进非原子，crash 窗口可能产生孤儿副本，依赖行内
-  `idempotency_key` 在 analyzer 阶段去重，至少一次 + 去重而非 exactly-once。
+- `RUN_INPUT_CONTEXT_SNAPSHOT_BUILT` 是 P6 EventLog 的事实补齐 patch，由 Host 与
+  `run_input_raw_payloads` side-store 在同一 storage transaction 内提交。EventLog fact 只保留 raw payload
+  refs / hashes / sizes 与 bounded summary；trace observer 回查 side-store 并校验后写出 raw payload 文件。
+- `ToolTraceObserver` 是 non-required `NonTransactionalObserverSink`：JSONL 每行 `flush + fsync`、
+  raw payload `tmp + os.replace` 原子落地，I/O 发生在 checkpoint transaction 外。sink 成功后才用短事务推进
+  checkpoint；I/O 成功但 checkpoint 前 crash 或 checkpoint 失败时允许 replay 产生重复 JSONL / blob 行，
+  依赖行内 `idempotency_key` 在 analyzer / reader 阶段去重，至少一次 + 去重而非 exactly-once。
 - 行内 `idempotency_key`（sha256[:32], 包含 `schema_version | trace_type | run_id | iteration_id |
   tool_call_id | source_event_position | record_role`）是 analyzer 去重崩溃 replay 副本的依据；
   `analyzer` 严格拒绝 OLD `tool_trace_v2` 文件，不做兼容读取。
