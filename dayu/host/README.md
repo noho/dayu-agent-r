@@ -52,11 +52,13 @@ attempt-scoped append / durable memory；P8.5-S1 起 ToolRuntime 的截断补读
 - LLM-facing 截断 tool result 会携带 `truncation.next_action="fetch_more"` 与
   `truncation.fetch_more_args={cursor, scope_token, limit?}`；这些 ordinary tool payload 可进入
   EventLog / trace。EventLog / trace 只 scrub `API_KEY`、`api_key`、`Authorization`、password、
-  client secret 等明确凭证字段；cursor、scope token、普通 `token`、工具参数与普通工具结果不是 scrub 触发条件。
+  client secret、`access_token`、`auth_token`、`secret_key`、`bearer_token` 等明确凭证字段；
+  cursor、scope token、普通 `token`、工具参数与普通工具结果不是 scrub 触发条件。
 - Conversation Memory / RunInput 是摄取策略边界：memory snapshot 与 RunInput rendered tool fact 不包含
   raw cursor、raw scope token 或可复用的 `truncation.fetch_more_args`，只保留不可复用摘要。
 - framework `fetch_more` schema 由 Host runtime assembly 自动投影到 Engine-visible schemas；调用方只传业务
-  schema，`RunOptions` public object 不被污染。Engine 只接收 `ToolSchema` 与 `ToolExecutor` adapter，
+  schema，任何调用方传入的同名 `fetch_more` schema 都会被拒绝，`RunOptions` public object 不被污染。
+  Engine 只接收 `ToolSchema` 与 `ToolExecutor` adapter，
   不接收 `ToolDefinition`、callable、manager、cursor store 或 truncation 状态机。
 - 补读失败结果中的 `denied` 只表示权限 / scope 拒绝；cursor 不存在、cursor 过期和 terminal Run 都不是权限拒绝。
 - terminal Run 后 framework `fetch_more` 工具调用返回普通 failed tool outcome，不追加专用 RunEvent。
@@ -160,22 +162,26 @@ P7 已落地：
   把 `RunInput` / 当前 user 事件 / 工具 schemas 派生为强类型
   `RunInputContextSnapshotBuiltData`，包含 message / tool schema 摘要、
   ``content_hash``、``role_sequence``、``current_user_*`` 维度，
-  raw payload 的 blob id / sha256 / byte size 跨 replay 稳定。
+  raw payload 的 blob id / sha256 / byte size 跨 replay 稳定；assistant tool call
+  arguments 写入 side-store 前复用显式凭证 scrub，不清洗 cursor、scope token 或普通 `token`。
 - `ToolTraceObserver`（位于 `dayu.host._tool_trace_projection`）把 EventLog
   canonical 事实派发为 5 类 trace record：``tool_call``、
   ``iteration_context_snapshot``、``iteration_usage``、``final_response``、
-  ``provider_protocol_error``；同 batch 内按 ``(iteration_id, tool_call_id)``
-  配对 ``TOOL_CALL_REQUESTED`` + ``TOOL_RESULT_ACCEPTED``，缺对抛
+  ``provider_protocol_error``；按 ``(iteration_id, tool_call_id)``
+  配对 ``TOOL_CALL_REQUESTED`` + ``TOOL_RESULT_ACCEPTED``；request/result 可以跨 checkpoint batch 配对，
+  batch limit 只影响吞吐，不改变配对语义。事件 data 类型不匹配时抛
   `ProjectionSchemaError` -> `BLOCKED_FAILED`。``record_role`` /
   ``source_event_position`` 进入 sha256[:32] ``idempotency_key`` 让
   analyzer 去重重放副本。该 observer 是非 required projection，JSONL / blob
   I/O 发生在 checkpoint transaction 外；I/O 成功但 checkpoint 失败时允许重放
   产生重复行，读侧按 ``idempotency_key`` 去重。
 - `ToolTraceJsonlSink` 落 ``<root>/sessions/<session_id>/tool_calls_*.jsonl``
-  并按 ~10MB 滚动；每行 ``flush + fsync``。`ToolTraceObserver` 从
+  并按 ~10MB 滚动；session/run/iteration/blob 逻辑 id 会先编码为安全路径片段并做 trace root
+  containment 检查。JSONL append 不是崩溃原子事务，读侧 analyzer 会跳过非法半行并依赖
+  ``idempotency_key`` 去重完整重放行。`ToolTraceObserver` 从
   `run_input_raw_payloads` 读取并校验 hash / byte size / JSON / kind 后，
   再把 raw payload 写入
-  ``<root>/raw_payloads/<run_id>_<iteration_id>/<blob_id>.json``，先 tmp +
+  ``<root>/raw_payloads/<encoded-run-id>_<encoded-iteration-id>/<encoded-blob-id>.json``，先 tmp +
   ``os.replace`` 原子落地；校验失败抛 `ProjectionSchemaError`，checkpoint
   不推进。``PROVIDER_PROTOCOL_ERROR`` 的 ``raw_payload``
   在落盘前由 `_scrub_provider_secret` 替换 ``Authorization`` /
@@ -211,7 +217,9 @@ P8 已落地：
   `AttemptFencingError(reason=RUN_ID_MISMATCH)`。`ToolRuntimeOwnerScope`（ContextVar）
   在 `LocalRunHarness._run_to_store` 每个 attempt 生命周期内把 scoped appender 注入
   `HostToolRuntime`，使 durable 工具执行入口在业务 executor、framework `fetch_more` 与截断 manager
-  mutation 前先验证 active owner；框架 `fetch_more` 也按 originating attempt 的普通工具事件路径约束落库。
+  mutation 前先验证 active owner；业务 executor 返回后、framework `fetch_more` await 后还会在 cursor
+  registry mutation 前二次校验 owner，避免旧 owner 消费旧 cursor 或签发 next cursor。框架 `fetch_more`
+  也按 originating attempt 的普通工具事件路径约束落库。
 - stale / orphan recovery（P8-S6）：`AttemptSupervisor.recover_stale_attempts` 内部显式
   入口扫描 `state IN ('running','created') AND lease_expires_at <= now`，逐候选用独立
   `BEGIN IMMEDIATE` 事务 CAS 决策——旧 attempt 一律 `MARK_LOST` 诊断收口，不再创建

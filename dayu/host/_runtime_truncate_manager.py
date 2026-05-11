@@ -104,6 +104,19 @@ class RuntimeTerminalChecker(Protocol):
         ...
 
 
+class RuntimeOwnerVerifier(Protocol):
+    """截断状态 mutation 前的 attempt owner 校验协议。"""
+
+    async def verify_active_owner(self, *, run_id: str) -> None:
+        """校验当前 owner 仍可写指定 run。
+
+        :param run_id: Run id。
+        :returns: 无返回值。
+        :raises Exception: owner 失效或底层校验失败时透传。
+        """
+        ...
+
+
 @dataclass(frozen=True, slots=True)
 class _TruncateTarget:
     """已解析的截断目标。
@@ -289,10 +302,14 @@ class RuntimeTruncateManager:
     async def fetch_more(
         self,
         request: ToolExecutionRequest,
+        *,
+        owner_verifier: RuntimeOwnerVerifier | None = None,
     ) -> ToolExecutionOutcome:
         """执行 Host 私有 ``fetch_more`` framework 工具。
 
         :param request: Engine 发起的普通工具执行请求。
+        :param owner_verifier: durable 路径在 cursor registry mutation 前
+            二次校验 attempt owner；非 durable 路径为 ``None``。
         :returns: 普通工具执行 outcome。
         :raises Exception: run 终态检查失败时透传。
         """
@@ -313,6 +330,10 @@ class RuntimeTruncateManager:
                     error_code=_ERROR_RUN_TERMINAL,
                     message="run is terminal",
                 )
+            if owner_verifier is not None:
+                await owner_verifier.verify_active_owner(
+                    run_id=parsed.request.context.run_id
+                )
             binding_reason = _binding_denied_reason(
                 record=record,
                 session_id=parsed.request.context.session_id,
@@ -325,6 +346,10 @@ class RuntimeTruncateManager:
                 )
             now = self.clock()
             if record.expires_at_monotonic <= now:
+                if owner_verifier is not None:
+                    await owner_verifier.verify_active_owner(
+                        run_id=parsed.request.context.run_id
+                    )
                 with self._state_lock:
                     self._remove_cursor(record.cursor)
                 return _failed_outcome(
@@ -367,6 +392,12 @@ class RuntimeTruncateManager:
                     has_more=True,
                     limit=next_record.limit,
                     ttl_seconds=next_record.ttl_seconds,
+                )
+            # mutation 紧邻第二次 owner 校验，避免旧 owner 在 await 之后
+            # 消费旧 cursor 或提交 next cursor。
+            if owner_verifier is not None:
+                await owner_verifier.verify_active_owner(
+                    run_id=parsed.request.context.run_id
                 )
             with self._state_lock:
                 if next_record is not None:
@@ -1032,7 +1063,11 @@ def _replace_path(
             chunk=chunk,
         )
         return copied
-    raise RuntimeError("truncate field_path does not match wrapper template")
+    field_path_text = ".".join(field_path)
+    raise RuntimeError(
+        "truncate field_path does not match wrapper template: "
+        f"field_path={field_path_text} key={key} type={type(child).__name__}"
+    )
 
 
 def _resolve_fetch_limit(requested: int | None, record_limit: int) -> int:

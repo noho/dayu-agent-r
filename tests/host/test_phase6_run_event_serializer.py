@@ -227,6 +227,69 @@ def test_deserialize_rejects_legacy_top_level_tool_result_truncation() -> None:
         )
 
 
+def test_deserialize_tool_result_success_requires_value_key() -> None:
+    """success result 缺少必填 value 字段必须 fail-fast。"""
+
+    raw = f"""
+    {{
+        "schema_version": {CURRENT_SCHEMA_VERSION},
+        "type_name": "{RunEventType.TOOL_RESULT_ACCEPTED.value}::ToolResultAcceptedData",
+        "fields": {{
+            "iteration_id": "iter-1",
+            "tool_call_id": "tc-1",
+            "name": "demo",
+            "index_in_iteration": 0,
+            "outcome": {{
+                "kind": "completed",
+                "result": {{
+                    "ok": true,
+                    "meta": null
+                }}
+            }}
+        }}
+    }}
+    """
+
+    with pytest.raises(ValueError, match="missing value"):
+        deserialize_run_event_data(
+            event_type=RunEventType.TOOL_RESULT_ACCEPTED,
+            raw=raw,
+        )
+
+
+def test_deserialize_tool_result_success_allows_explicit_null_value() -> None:
+    """success result 显式 ``value: null`` 是合法 JSON null。"""
+
+    raw = f"""
+    {{
+        "schema_version": {CURRENT_SCHEMA_VERSION},
+        "type_name": "{RunEventType.TOOL_RESULT_ACCEPTED.value}::ToolResultAcceptedData",
+        "fields": {{
+            "iteration_id": "iter-1",
+            "tool_call_id": "tc-1",
+            "name": "demo",
+            "index_in_iteration": 0,
+            "outcome": {{
+                "kind": "completed",
+                "result": {{
+                    "ok": true,
+                    "value": null,
+                    "meta": null
+                }}
+            }}
+        }}
+    }}
+    """
+
+    decoded = deserialize_run_event_data(
+        event_type=RunEventType.TOOL_RESULT_ACCEPTED,
+        raw=raw,
+    )
+    assert isinstance(decoded, ToolResultAcceptedData)
+    assert isinstance(decoded.outcome, ToolCompletedOutcome)
+    assert decoded.outcome.result.value is None
+
+
 def test_serialize_rejects_type_data_mismatch() -> None:
     """event_type 与 data 不匹配必须 fail-fast。"""
 

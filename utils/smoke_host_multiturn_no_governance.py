@@ -743,7 +743,7 @@ def build_huge_echo_harness(
         resolved_proxy = LocalProxy(
             worker=EngineWorker(
                 tool_executor=gated_executor,
-                schema_provider=runtime,
+                schema_provider=None,
             )
         )
     return LocalRunHarness(

@@ -42,9 +42,7 @@ def test_append_record_line_rolls_when_file_exceeds_threshold(
     """文件大小超过阈值后写入下一个分片。"""
 
     sink = ToolTraceJsonlSink(root_path=tmp_path)
-    target_dir = tmp_path / "sessions" / "s1"
-    target_dir.mkdir(parents=True, exist_ok=True)
-    first = target_dir / "tool_calls_000001.jsonl"
+    first = sink.append_record_line(session_id="s1", record={"seed": True})
     first.write_bytes(b"x" * (_LARGE_FILE_THRESHOLD + _DUMMY_LINE_BYTES))
     rolled_path = sink.append_record_line(session_id="s1", record={"k": "v"})
     assert rolled_path.name == "tool_calls_000002.jsonl"
@@ -64,6 +62,52 @@ def test_write_raw_payload_blob_atomic_replace(tmp_path: Path) -> None:
     assert final_path.read_text(encoding="utf-8") == '{"hello": "world"}'
     tmp_path_file = final_path.with_suffix(".json.tmp")
     assert not tmp_path_file.exists()
+
+
+def test_trace_paths_encode_logical_ids_inside_root(tmp_path: Path) -> None:
+    """session/run/iteration/blob 逻辑 id 不得影响 trace root 外路径。"""
+
+    sink = ToolTraceJsonlSink(root_path=tmp_path)
+    jsonl_path = sink.append_record_line(
+        session_id="../s/..\\evil",
+        record={"k": "v"},
+    )
+    blob_path = sink.write_raw_payload_blob(
+        run_id="../run/..\\evil",
+        iteration_id="",
+        blob_id="../blob/..\\evil",
+        payload_text="{}",
+    )
+
+    root = tmp_path.resolve()
+    assert jsonl_path.resolve().relative_to(root)
+    assert blob_path.resolve().relative_to(root)
+    assert ".." not in jsonl_path.relative_to(root).as_posix()
+    assert ".." not in blob_path.relative_to(root).as_posix()
+
+
+def test_trace_paths_hash_long_logical_ids_inside_root(tmp_path: Path) -> None:
+    """超长逻辑 id 使用稳定短 segment，避免单段文件名过长。"""
+
+    sink = ToolTraceJsonlSink(root_path=tmp_path)
+    long_id = "x" * 2048
+
+    jsonl_path = sink.append_record_line(
+        session_id=long_id,
+        record={"k": "v"},
+    )
+    blob_path = sink.write_raw_payload_blob(
+        run_id=long_id,
+        iteration_id=long_id,
+        blob_id=long_id,
+        payload_text="{}",
+    )
+
+    root = tmp_path.resolve()
+    assert jsonl_path.resolve().relative_to(root)
+    assert blob_path.resolve().relative_to(root)
+    assert all(len(part) <= 120 for part in jsonl_path.relative_to(root).parts)
+    assert all(len(part) <= 255 for part in blob_path.relative_to(root).parts)
 
 
 def test_scrub_provider_secret_replaces_known_keys() -> None:

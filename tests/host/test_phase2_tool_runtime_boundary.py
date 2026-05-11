@@ -268,6 +268,16 @@ def test_engine_does_not_import_host_or_tool_runtime() -> None:
     assert violations == []
 
 
+def test_caller_provided_fetch_more_schema_is_rejected_even_when_identical() -> None:
+    """调用方不得通过 RunOptions 手工注入 Host 私有 fetch_more schema。"""
+
+    runtime, _store = _runtime()
+    framework_schema = runtime._framework_tools.tool_schemas()[0]
+
+    with pytest.raises(ValueError, match="framework tool schema name conflict"):
+        runtime.engine_visible_tool_schemas((framework_schema,))
+
+
 @pytest.mark.asyncio
 async def test_scope_token_delivered_via_ordinary_payload_not_special_eventlog() -> None:
     """scope token 只经普通工具结果 payload 暴露给模型。"""

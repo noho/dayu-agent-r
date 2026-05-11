@@ -51,13 +51,19 @@ def inject_truncation_hint(
 
     :param value: 原始工具成功值。
     :param hint: Host 私有截断 hint。
-    :returns: 注入 ``truncation`` 后的 JSON 值；原值为 object 时顶层覆盖，
-        原值非 object 时包装为 ``{"content": value, "truncation": ...}``。
+    :returns: 注入 ``truncation`` 后的 JSON 值；原值为 object 且没有
+        ``truncation`` 字段时顶层追加；已有同名业务字段或原值非 object
+        时包装为 ``{"content": value, "truncation": ...}``。
     :raises Exception: 不主动抛出异常。
     """
 
     truncation = build_truncation_payload(hint)
     if isinstance(value, Mapping):
+        if TRUNCATION_FIELD in value:
+            return {
+                CONTENT_FIELD: dict(value),
+                TRUNCATION_FIELD: truncation,
+            }
         projected: dict[str, JsonValue] = dict(value)
         projected[TRUNCATION_FIELD] = truncation
         return projected

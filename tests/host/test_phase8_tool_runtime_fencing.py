@@ -202,6 +202,44 @@ class _FencingAppender:
         raise AssertionError("fenced generic tool call must not append")
 
 
+@dataclass(slots=True)
+class _SecondVerifyFencingAppender:
+    """第一次 owner 校验通过、第二次校验模拟 owner lost。"""
+
+    verify_calls: int = 0
+
+    async def verify_active_owner(self, *, run_id: str) -> None:
+        """第二次及后续校验抛 AttemptFencingError。
+
+        :param run_id: Run id。
+        :returns: 无返回值。
+        :raises AttemptFencingError: 第二次及后续调用时抛出。
+        """
+
+        self.verify_calls += 1
+        if self.verify_calls < 2:
+            return
+        raise AttemptFencingError(
+            attempt_id="attempt-fenced",
+            run_id=run_id,
+            reason=AttemptFencingReason.OWNER_MISMATCH,
+            current_state=AttemptState.RUNNING,
+            owner_id="other-owner",
+            fencing_token=FencingToken(value=9),
+        )
+
+    async def append(self, draft: RunEventDraft) -> RunEvent:
+        """本测试不应进入 append。
+
+        :param draft: RunEvent 草稿。
+        :returns: 永不返回。
+        :raises AssertionError: 始终抛出。
+        """
+
+        del draft
+        raise AssertionError("second verify fencing test must not append")
+
+
 def _spec() -> ToolTruncateSpec:
     """构造测试用截断声明。
 
@@ -328,6 +366,7 @@ async def test_durable_executor_with_scope_allows_business_truncation() -> None:
     assert executor.calls == 1
     assert isinstance(outcome, ToolCompletedOutcome)
     assert extract_truncation_hint(outcome.result.value) is not None
+    assert await store.list_events("run-1", after=None) == ()
 
 
 @pytest.mark.asyncio
@@ -356,6 +395,69 @@ async def test_durable_generic_tool_call_fencing_happens_before_business_call() 
     assert appender.verify_calls == 1
     assert appender.append_calls == 0
     assert await store.list_events("run-1", after=None) == ()
+
+
+@pytest.mark.asyncio
+async def test_durable_business_truncation_reverifies_owner_before_cursor_commit() -> None:
+    """业务 executor 返回后 owner 丢失时不签发截断 cursor。"""
+
+    store = InMemoryRunEventStore()
+    executor = _Executor(value=[1, 2, 3])
+    runtime = HostToolRuntime(
+        is_durable=True,
+        executor=executor,
+        event_store=store,
+        truncate_specs={"demo": _spec()},
+        token_generator=_Tokens(),
+        clock=lambda: 100.0,
+    )
+    tool_executor = ToolRuntimeToolExecutor(runtime=runtime)
+    appender = _SecondVerifyFencingAppender()
+
+    async with ToolRuntimeOwnerScope(appender):
+        with pytest.raises(AttemptFencingError):
+            await tool_executor.execute(_request())
+
+    assert executor.calls == 1
+    assert appender.verify_calls == 2
+    assert runtime._default_manager._records_by_cursor == {}
+
+
+@pytest.mark.asyncio
+async def test_durable_fetch_more_reverifies_owner_before_cursor_mutation() -> None:
+    """framework fetch_more 在 owner 丢失后不消费旧 cursor 或提交 next cursor。"""
+
+    store = InMemoryRunEventStore()
+    runtime = HostToolRuntime(
+        is_durable=True,
+        executor=_Executor(value=[1, 2, 3]),
+        event_store=store,
+        truncate_specs={"demo": _spec()},
+        token_generator=_Tokens(),
+        clock=lambda: 100.0,
+    )
+    tool_executor = ToolRuntimeToolExecutor(runtime=runtime)
+
+    async with ToolRuntimeOwnerScope(PlainRunEventAppender(event_store=store)):
+        first = await tool_executor.execute(_request())
+    assert isinstance(first, ToolCompletedOutcome)
+    truncation = _required_truncation(first.result.value)
+    fetch_request = _request(
+        tool_name=FRAMEWORK_FETCH_MORE_NAME,
+        arguments={
+            "cursor": truncation.cursor,
+            "scope_token": truncation.scope_token,
+        },
+        tool_call_id="read-1",
+    )
+    appender = _SecondVerifyFencingAppender()
+
+    async with ToolRuntimeOwnerScope(appender):
+        with pytest.raises(AttemptFencingError):
+            await tool_executor.execute(fetch_request)
+
+    assert appender.verify_calls == 2
+    assert tuple(runtime._default_manager._records_by_cursor) == (truncation.cursor,)
 
 
 @pytest.mark.asyncio

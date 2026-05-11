@@ -28,6 +28,7 @@ from dayu.engine import (
     ToolMessage,
     UserMessage,
 )
+from dayu.host._credential_scrub import scrub_tool_arguments
 from dayu.host._run_input_builder import RunInputBuildTrace
 from dayu.host._run_input_raw_payload_store import (
     RunInputRawPayloadWriteSet,
@@ -327,7 +328,7 @@ def _message_to_dict(message: AgentMessage) -> dict[str, JsonValue]:
                 {
                     "id": call.id,
                     "name": call.name,
-                    "arguments": dict(call.arguments),
+                    "arguments": dict(scrub_tool_arguments(call.arguments)),
                 }
             )
         return {

@@ -268,15 +268,6 @@ class HostToolRuntime:
         }
         conflict = user_names & framework_names
         if conflict:
-            framework_by_name = {
-                schema.function.name: schema for schema in framework_schemas
-            }
-            if all(
-                schema == framework_by_name.get(schema.function.name)
-                for schema in user_tool_schemas
-                if schema.function.name in conflict
-            ):
-                return user_tool_schemas
             names = ", ".join(sorted(conflict))
             raise ValueError(f"framework tool schema name conflict: {names}")
         return (*user_tool_schemas, *framework_schemas)
@@ -309,8 +300,9 @@ class HostToolRuntime:
         )
         try:
             if is_framework_tool:
-                outcome = await self._framework_tools.fetch_more_definition().executor.execute(
-                    request
+                outcome = await self._default_manager.fetch_more(
+                    request,
+                    owner_verifier=appender,
                 )
                 self._log_finished(
                     request=request,
@@ -328,6 +320,7 @@ class HostToolRuntime:
                     truncated=False,
                 )
                 return outcome
+            await appender.verify_active_owner(run_id=request.context.run_id)
             completed = self._default_manager.apply_truncation(
                 request=request,
                 outcome=outcome,

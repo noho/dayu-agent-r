@@ -120,7 +120,6 @@ class SSEParser:
         self._data_lines: list[str] = []
         self._terminated: bool = False
         self._tool_calls_seen: bool = False
-        self._fatal_terminated: bool = False
         self._utf8_decoder: codecs.IncrementalDecoder = (
             codecs.getincrementaldecoder("utf-8")(errors="strict")
         )
@@ -242,7 +241,6 @@ class SSEParser:
                     partial_tool_calls=self._aggregator.partial_summaries(),
                 )
             )
-            self._fatal_terminated = True
             self._terminated = True
             yield _make_event(
                 RunnerDoneData(finish_reason=FinishReason.ERROR)
@@ -258,7 +256,6 @@ class SSEParser:
                     partial_tool_calls=self._aggregator.partial_summaries(),
                 )
             )
-            self._fatal_terminated = True
             self._terminated = True
             yield _make_event(
                 RunnerDoneData(finish_reason=FinishReason.ERROR)
@@ -435,7 +432,6 @@ class SSEParser:
                     partial_tool_calls=self._aggregator.partial_summaries(),
                 )
             )
-            self._fatal_terminated = True
             self._terminated = True
             yield _make_event(
                 RunnerDoneData(finish_reason=FinishReason.ERROR)
@@ -477,7 +473,6 @@ class SSEParser:
             if result.fatal_errors:
                 for fatal in result.fatal_errors:
                     yield _make_event(fatal)
-                self._fatal_terminated = True
                 self._terminated = True
                 yield _make_event(
                     RunnerDoneData(finish_reason=FinishReason.ERROR)

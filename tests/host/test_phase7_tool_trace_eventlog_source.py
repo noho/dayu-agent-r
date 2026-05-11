@@ -237,8 +237,7 @@ async def test_eventlog_records_context_snapshot_when_trace_enabled(
         # drain 让 trace observer 把 fact 派发为 JSONL + blob。
         await bundle.coordinator.drain()
         trace_root = tmp_path / "trace"
-        session_dir = trace_root / "sessions" / _SESSION_ID
-        jsonl_files = list(session_dir.glob("tool_calls_*.jsonl"))
+        jsonl_files = list((trace_root / "sessions").glob("*/tool_calls_*.jsonl"))
         assert len(jsonl_files) >= 1
         all_lines: list[dict[str, object]] = []
         for fp in jsonl_files:

@@ -10,6 +10,9 @@
 - schema 字面量为 ``tool_trace_v2_host``，**不向后兼容 OLD ``tool_trace_v2``**。
 - 行内 ``idempotency_key`` 字段为 sha256 of source provenance；analyzer 用
   它去重崩溃 replay 产生的孤儿副本。
+- JSONL append 不是跨进程崩溃原子事务：进程可能在 write/flush/fsync
+  之间留下半行或无换行尾行。读侧必须跳过非法 JSON 行，并继续依赖
+  ``idempotency_key`` 去重已完整落盘的重放副本。
 - provider secret 只在 ``PROVIDER_PROTOCOL_ERROR`` 的 raw payload 上 scrub；
   scope_token / cursor / prompt / tool result 不做过滤（按 OLD 热/冷分层
   保留，用于真实故障定位）。
@@ -17,6 +20,7 @@
 
 from __future__ import annotations
 
+import base64
 import hashlib
 import json
 import os
@@ -32,6 +36,10 @@ from dayu.host._credential_scrub import scrub_explicit_credentials
 
 _TRACE_SCHEMA_VERSION_HOST: str = "tool_trace_v2_host"
 _FILE_BYTE_THRESHOLD: int = 10 * 1024 * 1024
+_ENCODED_SEGMENT_PREFIX: str = "b64_"
+_EMPTY_SEGMENT: str = "empty"
+_HASHED_SEGMENT_PREFIX: str = "sha256_"
+_MAX_PATH_SEGMENT_LENGTH: int = 120
 
 
 class ToolTraceSchemaVersion(StrEnum):
@@ -138,9 +146,12 @@ class ToolTraceJsonlSink:
         :raises OSError: 写入失败时抛出。
         """
 
-        target_dir = self.root_path / "sessions" / session_id
+        root_path = self.root_path.resolve()
+        target_dir = root_path / "sessions" / _safe_path_segment(session_id)
+        _assert_under_root(root_path=root_path, path=target_dir)
         target_dir.mkdir(parents=True, exist_ok=True)
         target_path = self._select_jsonl_file(target_dir=target_dir)
+        _assert_under_root(root_path=root_path, path=target_path)
         line = json.dumps(dict(record), ensure_ascii=False, sort_keys=True)
         with target_path.open("ab") as handle:
             handle.write(line.encode("utf-8"))
@@ -170,10 +181,17 @@ class ToolTraceJsonlSink:
         :raises OSError: 写入失败时抛出。
         """
 
-        target_dir = self.root_path / "raw_payloads" / f"{run_id}_{iteration_id}"
+        root_path = self.root_path.resolve()
+        target_dir = root_path / "raw_payloads" / (
+            f"{_safe_path_segment(run_id)}_{_safe_path_segment(iteration_id)}"
+        )
+        _assert_under_root(root_path=root_path, path=target_dir)
         target_dir.mkdir(parents=True, exist_ok=True)
-        final_path = target_dir / f"{blob_id}.json"
-        tmp_path = target_dir / f"{blob_id}.json.tmp"
+        blob_segment = _safe_path_segment(blob_id)
+        final_path = target_dir / f"{blob_segment}.json"
+        tmp_path = target_dir / f"{blob_segment}.json.tmp"
+        _assert_under_root(root_path=root_path, path=final_path)
+        _assert_under_root(root_path=root_path, path=tmp_path)
         with tmp_path.open("wb") as handle:
             handle.write(payload_text.encode("utf-8"))
             handle.flush()
@@ -211,6 +229,43 @@ def now_iso() -> str:
     """
 
     return datetime.now(timezone.utc).isoformat()
+
+
+def _safe_path_segment(value: str) -> str:
+    """把逻辑 id 编码为单个安全路径片段。
+
+    :param value: session/run/iteration/blob 等逻辑 id。
+    :returns: URL-safe 路径片段；空 id 使用固定片段，超长 id 使用稳定
+        sha256 片段，避免超过常见文件系统单段长度。
+    :raises Exception: 不主动抛出异常。
+    """
+
+    if value == "":
+        return _EMPTY_SEGMENT
+    encoded = base64.urlsafe_b64encode(value.encode("utf-8")).decode("ascii")
+    segment = f"{_ENCODED_SEGMENT_PREFIX}{encoded.rstrip('=')}"
+    if len(segment) <= _MAX_PATH_SEGMENT_LENGTH:
+        return segment
+    digest = hashlib.sha256(value.encode("utf-8")).hexdigest()
+    return f"{_HASHED_SEGMENT_PREFIX}{digest}"
+
+
+def _assert_under_root(*, root_path: Path, path: Path) -> None:
+    """断言目标路径仍位于 trace root 之下。
+
+    :param root_path: 已 resolve 的 trace root。
+    :param path: 待检查路径。
+    :returns: 无返回值。
+    :raises ValueError: 目标路径逃逸 trace root 时抛出。
+    """
+
+    resolved_path = path.resolve()
+    try:
+        resolved_path.relative_to(root_path)
+    except ValueError as exc:
+        raise ValueError(
+            f"trace sink path escapes trace root: path={resolved_path}"
+        ) from exc
 
 
 # ---------------------------------------------------------------------------

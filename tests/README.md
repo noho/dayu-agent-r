@@ -106,14 +106,14 @@ Host 当前 Run harness、RunEventStore、ToolRuntime、Conversation Memory / Ru
   Host 私有 `RuntimeTruncateManager` 持有，并把 LLM-facing hint 注入普通 `ToolResultSuccess.value`，
   不产生专用 truncation / cursor RunEvent 或 public truncation contract。
 - credential scrub：覆盖显式 API key、Authorization、x-api-key、cookie、client secret、private key、
-  password 等字段 / 字符串 header 清洗，并锁定 cursor、scope_token、普通 token、anthropic-version、
+  password、access_token、auth_token、secret_key、bearer_token 等字段 / 字符串 header 清洗，并锁定 cursor、scope_token、普通 token、anthropic-version、
   openai-organization 不被误清洗。
 - ToolRuntime eventlog：覆盖业务工具与 framework `fetch_more` 只通过普通 `TOOL_CALL_REQUESTED` /
   `TOOL_RESULT_ACCEPTED` 表达，terminal 后不追加专用事实；ordinary payload 可保留 cursor / scope token /
   truncation.fetch_more_args，显式 API key / credential scrub 仍成立。
 - ToolRuntime boundary：覆盖 Host 包根只导出 Run 级契约与通用 value summary，旧 public fetch_more /
   cursor contract 负向锁定不存在，Engine 不 import Host / ToolRuntime；调用方只传业务 schema，Host runtime
-  assembly 自动把私有 `fetch_more` schema 投影给 Engine，`RunOptions` 不被污染，Engine 不接收
+  assembly 自动把私有 `fetch_more` schema 投影给 Engine，调用方手工传入同名 schema 会被拒绝，`RunOptions` 不被污染，Engine 不接收
   `ToolDefinition`、callable 或 manager。
 - Conversation Memory projection：覆盖 `USER_INPUT_ACCEPTED`、canonical final answer、ToolRuntime / Engine tool fact
   从 EventLog 投影，preview / reasoning / delta 不进入 memory，assistant final answer 不自动成为 verified claim，
@@ -183,10 +183,10 @@ Host 当前 Run harness、RunEventStore、ToolRuntime、Conversation Memory / Ru
     RunResult 快照可读。
 - P7 tool trace projection（`tests/host/test_phase7_*.py`）：覆盖
   `RunInputContextFactBuilder` 派生 ``RUN_INPUT_CONTEXT_SNAPSHOT_BUILT`` canonical
-  fact、`run_input_raw_payloads` side-store 同事务写入与校验失败路径、
+  fact、assistant tool call arguments raw payload 显式凭证 scrub、`run_input_raw_payloads` side-store 同事务写入与校验失败路径、
   `ToolTraceJsonlSink` JSONL + raw payload blob 落盘、provider secret
-  scrub、普通 tool payload 显式凭证 scrub 与 cursor / scope token 保留、
-  `ToolTraceObserver` 5 类 record 派发、``DurableHarnessConfig.tool_trace_path``
+  scrub、逻辑 id 安全路径编码与 trace root containment、JSONL 半行 analyzer 防御、普通 tool payload 显式凭证 scrub 与 cursor / scope token 保留、
+  `ToolTraceObserver` 5 类 record 派发与 request/result 跨 batch 配对、``DurableHarnessConfig.tool_trace_path``
   装配开关与 ``tool_trace_v2_host`` schema 字面量边界。
 - P8-S3 attempt supervisor（`tests/host/test_phase8_attempt_supervisor.py`）：覆盖
   `AttemptSupervisor.lease_context` 正常 acquire / yield / 退出清理；renew loop 在 fake
@@ -227,7 +227,8 @@ Host 当前 Run harness、RunEventStore、ToolRuntime、Conversation Memory / Ru
   在 durable 路径 scope 外 fail-fast，非 durable 测试路径才允许 `PlainRunEventAppender`。同时通过
   `ToolRuntimeToolExecutor.execute` / `HostToolRuntime.execute_tool_call` 真实入口覆盖 durable owner
   scope guard：无 scope 时业务 executor 不被调用、framework `fetch_more` 不消费 cursor；合法 scope 下
-  业务截断与 framework 补读返回普通 outcome 且不追加专用 fetch_more fact。
+  业务截断与 framework 补读返回普通 outcome 且不追加专用 fetch_more fact；业务 executor 返回后或
+  framework `fetch_more` await 后 owner 丢失时，截断 manager 不签发 next cursor、不消费旧 cursor。
 - P8-S6 stale / orphan recovery 主路径（`tests/host/test_phase8_attempt_recovery.py`）：
   覆盖 `AttemptSupervisor.recover_stale_attempts` 全部 typed 决策——
   `RUNNING` lease 过期与 `CREATED` 孤儿均诊断收口为 `MARK_LOST`，不创建新的

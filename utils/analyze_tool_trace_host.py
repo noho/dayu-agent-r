@@ -1099,7 +1099,10 @@ def analyze_trace_root(*, trace_root: Path) -> TraceAnalysisReport:
                 if stripped == "":
                     continue
                 total_lines_read += 1
-                record_obj = json.loads(stripped)
+                try:
+                    record_obj = json.loads(stripped)
+                except json.JSONDecodeError:
+                    continue
                 if not isinstance(record_obj, dict):
                     raise ValueError(f"trace record at {file_path}:{line_number} is not a " f"JSON object")
                 record: Mapping[str, JsonValue] = record_obj
@@ -1276,6 +1279,7 @@ __all__ = [
     "FailurePattern",
     "FetchMoreScopeIssue",
     "PositionGap",
+    "ProviderPartialToolCallDiagnostic",
     "RepeatedToolCall",
     "ToolStats",
     "TraceAnalysisReport",

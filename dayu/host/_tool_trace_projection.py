@@ -7,8 +7,8 @@ checkpoint transaction。
 
 派发规则：
 
-- ``TOOL_CALL_REQUESTED`` + ``TOOL_RESULT_ACCEPTED``（同 batch 内按
-  ``(iteration_id, tool_call_id)`` 配对）-> 一条
+- ``TOOL_CALL_REQUESTED`` + ``TOOL_RESULT_ACCEPTED``（按
+  ``(iteration_id, tool_call_id)`` 跨 checkpoint batch 配对）-> 一条
   :class:`ToolCallRecord`。截断信息只来自普通 accepted outcome payload。
 - ``RUNNER_USAGE_RECORDED`` -> :class:`IterationUsageRecord`。
 - ``FINAL_ANSWER`` -> :class:`FinalResponseRecord`（``iteration_id`` 为
@@ -19,13 +19,14 @@ checkpoint transaction。
 - ``RUN_INPUT_CONTEXT_SNAPSHOT_BUILT`` -> 先写 raw_input / raw_tool_schemas
   两个 blob 文件，再写 :class:`IterationContextSnapshotRecord`。
 
-错误处理：``TOOL_CALL_REQUESTED`` 在同 batch 内未配对 ``TOOL_RESULT_ACCEPTED``
-时抛 :class:`ProjectionSchemaError`，由 :class:`ProjectionCoordinator`
-按 ``BLOCKED_FAILED`` 记录。
+错误处理：同一 tool_call 的 request/result 不依赖 checkpoint batch 边界；
+observer 会在内存中暂存未配对事件，直到对应事件到达后再发射 record。
 """
 
+import _thread
 import asyncio
 import json
+import threading
 from collections.abc import Mapping
 from dataclasses import dataclass, field
 
@@ -87,7 +88,6 @@ _RECORD_ROLE_PRIMARY: str = "primary"
 _OUTCOME_COMPLETED: str = "completed"
 _OUTCOME_FAILED: str = "failed"
 _OMITTED_PAYLOAD_JSON: str = '{"reason": "omitted_no_payload"}'
-_RAW_PAYLOADS_DIR: str = "raw_payloads"
 
 
 class ProjectionSchemaError(Exception):
@@ -123,6 +123,14 @@ class ToolTraceObserver(ObserverSink, NonTransactionalObserverSink):
     jsonl_sink: ToolTraceJsonlSink
     raw_payload_storage: HostStorage | None = None
     _schema_version_str: str = field(default=ToolTraceSchemaVersion.TOOL_TRACE_V2_HOST.value, init=False)
+    _pending_tool_call_groups: dict[tuple[str, str], _ToolCallGroup] = field(
+        default_factory=dict,
+        init=False,
+    )
+    _pending_lock: _thread.RLock = field(
+        default_factory=threading.RLock,
+        init=False,
+    )
 
     @property
     def descriptor(self) -> ObserverDescriptor:
@@ -155,7 +163,7 @@ class ToolTraceObserver(ObserverSink, NonTransactionalObserverSink):
         :param tx: 当前事务（未使用）。
         :param batch: 事件 envelope 元组，按 position 升序。
         :returns: 无返回值。
-        :raises ProjectionSchemaError: tool_call 未配对时抛出。
+        :raises ProjectionSchemaError: 事件 data 类型不匹配时抛出。
         :raises OSError: JSONL / blob 写入失败时透传。
         """
 
@@ -176,7 +184,7 @@ class ToolTraceObserver(ObserverSink, NonTransactionalObserverSink):
 
         :param batch: 事件 envelope 元组，按 position 升序。
         :returns: 无返回值。
-        :raises ProjectionSchemaError: tool_call 未配对时抛出。
+        :raises ProjectionSchemaError: 事件 data 类型不匹配时抛出。
         :raises OSError: JSONL / blob 写入失败时透传。
         """
 
@@ -191,60 +199,58 @@ class ToolTraceObserver(ObserverSink, NonTransactionalObserverSink):
 
         :param batch: 事件 envelope 元组，按 position 升序。
         :returns: 无返回值。
-        :raises ProjectionSchemaError: tool_call 未配对时抛出。
+        :raises ProjectionSchemaError: 事件 data 类型不匹配时抛出。
         :raises OSError: JSONL / blob 写入失败时透传。
         """
 
-        groups: dict[tuple[str, str], _ToolCallGroup] = {}
-        for envelope in batch:
-            event = envelope.event
-            event_type = event.type
-            if event_type is RunEventType.TOOL_CALL_REQUESTED:
-                self._collect_tool_call(envelope=envelope, groups=groups)
-                continue
-            if event_type is RunEventType.TOOL_RESULT_ACCEPTED:
-                self._collect_tool_call(envelope=envelope, groups=groups)
-                continue
-            if event_type is RunEventType.RUNNER_USAGE_RECORDED:
-                self._emit_iteration_usage(envelope=envelope)
-                continue
-            if event_type is RunEventType.FINAL_ANSWER:
-                self._emit_final_response(envelope=envelope)
-                continue
-            if event_type is RunEventType.PROVIDER_PROTOCOL_ERROR:
-                self._emit_provider_protocol_error(envelope=envelope)
-                continue
-            if event_type is RunEventType.RUN_INPUT_CONTEXT_SNAPSHOT_BUILT:
-                self._emit_iteration_context_snapshot(envelope=envelope)
-                continue
-
-        for key, group in groups.items():
-            self._emit_tool_call(key=key, group=group)
+        with self._pending_lock:
+            for envelope in batch:
+                event = envelope.event
+                event_type = event.type
+                if event_type is RunEventType.TOOL_CALL_REQUESTED:
+                    self._collect_tool_call(envelope=envelope)
+                    continue
+                if event_type is RunEventType.TOOL_RESULT_ACCEPTED:
+                    self._collect_tool_call(envelope=envelope)
+                    continue
+                if event_type is RunEventType.RUNNER_USAGE_RECORDED:
+                    self._emit_iteration_usage(envelope=envelope)
+                    continue
+                if event_type is RunEventType.FINAL_ANSWER:
+                    self._emit_final_response(envelope=envelope)
+                    continue
+                if event_type is RunEventType.PROVIDER_PROTOCOL_ERROR:
+                    self._emit_provider_protocol_error(envelope=envelope)
+                    continue
+                if event_type is RunEventType.RUN_INPUT_CONTEXT_SNAPSHOT_BUILT:
+                    self._emit_iteration_context_snapshot(envelope=envelope)
+                    continue
 
     def _collect_tool_call(
         self,
         *,
         envelope: ProjectionEventEnvelope,
-        groups: dict[tuple[str, str], _ToolCallGroup],
     ) -> None:
         """把单条 tool 维度事件归入对应 group。
 
         :param envelope: 事件 envelope。
-        :param groups: 当前 batch 累积的 group dict。
         :returns: 无返回值。
-        :raises Exception: 不主动抛出异常。
+        :raises ProjectionSchemaError: 事件 data 类型不匹配时抛出。
         """
 
         key = _tool_call_group_key(envelope=envelope)
-        group = groups.get(key)
+        group = self._pending_tool_call_groups.get(key)
         if group is None:
             group = _ToolCallGroup()
-            groups[key] = group
+            self._pending_tool_call_groups[key] = group
         event_type = envelope.event.type
         if event_type is RunEventType.TOOL_CALL_REQUESTED:
             group.requested = envelope
         elif event_type is RunEventType.TOOL_RESULT_ACCEPTED:
             group.accepted = envelope
+        if group.requested is not None and group.accepted is not None:
+            self._emit_tool_call(key=key, group=group)
+            self._pending_tool_call_groups.pop(key, None)
 
     def _emit_tool_call(
         self,
@@ -515,21 +521,22 @@ class ToolTraceObserver(ObserverSink, NonTransactionalObserverSink):
             )
         except RunInputRawPayloadReadError as exc:
             raise ProjectionSchemaError(str(exc)) from exc
-        self.jsonl_sink.write_raw_payload_blob(
+        raw_input_path = self.jsonl_sink.write_raw_payload_blob(
             run_id=event.run_id,
             iteration_id=data.iteration_id,
             blob_id=data.raw_input_messages_blob_id,
             payload_text=raw_input_payload.payload_json,
         )
-        self.jsonl_sink.write_raw_payload_blob(
+        raw_tool_schemas_path = self.jsonl_sink.write_raw_payload_blob(
             run_id=event.run_id,
             iteration_id=data.iteration_id,
             blob_id=data.raw_tool_schemas_blob_id,
             payload_text=raw_tool_schemas_payload.payload_json,
         )
-        raw_input_relpath = f"{_RAW_PAYLOADS_DIR}/{event.run_id}_{data.iteration_id}/" f"{data.raw_input_messages_blob_id}.json"
+        root_path = self.jsonl_sink.root_path.resolve()
+        raw_input_relpath = raw_input_path.resolve().relative_to(root_path).as_posix()
         raw_tools_relpath = (
-            f"{_RAW_PAYLOADS_DIR}/{event.run_id}_{data.iteration_id}/" f"{data.raw_tool_schemas_blob_id}.json"
+            raw_tool_schemas_path.resolve().relative_to(root_path).as_posix()
         )
         message_summaries_payload: list[JsonValue] = [
             {

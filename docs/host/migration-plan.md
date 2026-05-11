@@ -17,11 +17,11 @@ Dayu 项目级约束、artifact 索引和仍需追踪的 residual risks；不复
 - 当前 phase：P8.5 — P8 Stabilization / ToolRuntime Event Model。
 - 当前分支：`migration/host-p8-5-stabilization`。
 - P8 PR：#40 已 merge。
-- 当前 gate：P8.5 implementation slices complete；按用户指令停下汇报，不自动 push / PR / merge。
+- 当前 gate：PR #42 review fix pass；按用户指令不自动 commit / push / PR / merge / closeout。
 - 最新 plan artifact：`docs/host/phase8.5-plan.md`。
 - 最新 plan review artifact：`docs/host/phase8.5-plan-review.md`（fail，7 findings 全部 accepted）；
   `docs/host/phase8.5-plan-rereview.md` 已通过。
-- 当前待处理事项：无剩余 implementation slice；等待用户授权是否进入 P8.5 PR gate。
+- 当前待处理事项：PR #42 accepted review findings 修复与 re-review。
 - 下一入口：P8.5 PR gate / PR review gate；P8.5 PR closeout 后进入 P8.6 Recovery Model Re-challenge。
 
 ## 2. Dayu Host Gateflow 扩展
@@ -126,16 +126,20 @@ P8.5 当前 Slice 1 至 Slice 6 均已通过 implementation review loop，并已
   不再携带 top-level `truncation` 字段，LLM-facing truncation / `fetch_more_args` 只作为 Host 注入的普通
   `ToolResultSuccess.value` JSON payload 存在，Engine 只做普通 JSON tool result projection。
 - EventLog / trace 默认保留 ordinary tool args/result payload，只 scrub API key、Authorization、cookie、
-  client secret、private key、password 等明确凭证；cursor、`scope_token`、普通 `token`、tool args/results
+  client secret、private key、password、`access_token`、`auth_token`、`secret_key`、`bearer_token`
+  等明确凭证；cursor、`scope_token`、普通 `token`、tool args/results
   不是敏感字段 scrub 触发条件。
 - Conversation Memory / RunInput 是独立 ingestion policy：raw cursor、raw `scope_token` 和可复用的
   `truncation.fetch_more_args` 不进入长期 memory 或下一轮 RunInput。
 - corrupt memory snapshot row 不自动覆盖；P8.5 只提供 typed diagnostic + WARNING。其产生根因、quarantine、
   运维命令与长期自动覆盖策略由 GitHub issue #41 跟踪。
 - non-required trace JSONL/blob sink 采用事务外 at-least-once 写入；checkpoint 只在 sink success 后推进，重复
-  JSONL/blob 由 reader / analyzer 按 `idempotency_key` 去重。
+  JSONL/blob 由 reader / analyzer 按 `idempotency_key` 去重。trace 路径对逻辑 id 使用安全路径片段编码并做
+  trace root containment 检查；JSONL crash 半行由 analyzer 跳过。
 - `RUN_INPUT_CONTEXT_SNAPSHOT_BUILT` hot row 不再内联无界 raw payload；raw input messages / tool schemas 写入
   `run_input_raw_payloads` side-store，并与 EventLog fact append 在同一 Host storage transaction 内提交。
+  side-store 当前不做 retention 清理；长期增长策略由 GitHub issue #43 跟踪，PR #42 不加入 ad-hoc
+  DELETE / TTL。
 - P15 hard-gate / required projection enforcement / watchdog、P9 Session / Run lifecycle admission、P16
   public/internal bundle freeze 均不是 P8.5 已实现内容。
 - P8.6 将在 P8.5 PR closeout 后专门重审 recovery 概念：corrupt durable memory snapshot row、
@@ -184,6 +188,7 @@ P8 cleanup 后的 stale / orphan recovery 旧术语（`MARK_RECOVERING_AND_CREAT
 | SSE 中途失败导致 provider protocol error 缺少完整 trace 语义，主要验收入口是 `utils/analyze_tool_trace_host.py` 能显示 bounded partial tool-call summary | P8.5 Slice 4 | fixed, validated for provider protocol errors |
 | provider stream transport-layer read failure 仍走 HTTP error 语义，缺少 partial tool-call diagnostic 覆盖 | P16 interface freeze | deferred-with-owner; provider adapter coverage to be rechecked with Engine / Host contract freeze |
 | `RUN_INPUT_CONTEXT_SNAPSHOT_BUILT` 内联 raw payload 造成 EventLog 热冷混合与体积增长 | P8.5 Slice 4 | fixed, validated：raw payload moved to `run_input_raw_payloads` side-store |
+| `run_input_raw_payloads` side-store 长期 retention / 清理策略 | GitHub issue #43 | tracked；PR #42 不做 ad-hoc DELETE / TTL |
 | `LocalRunHarness` 职责继续膨胀，接近 God Object 阈值 | P9 / P16 architecture | deferred-with-owner |
 | `DurableHarnessBundle` 暴露 attempt supervisor / lease store 等 Host internal 治理对象，public/internal bundle 边界需在接口冻结前收口 | P16 interface freeze | deferred-with-owner |
 | `_LeaseSession.stopped_event` 死同步原语、`_tool_outcome_name` fallback、legacy `AttemptStateStore.update_state` CAS 保护、internal module `__all__` 清理等非阻塞内部清洁度问题 | P16 interface freeze | deferred-with-owner |

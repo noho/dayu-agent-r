@@ -273,7 +273,7 @@ def build_durable_harness(
         else LocalProxy(
             worker=EngineWorker(
                 tool_executor=ToolRuntimeToolExecutor(runtime),
-                schema_provider=runtime,
+                schema_provider=None,
             )
         )
     )

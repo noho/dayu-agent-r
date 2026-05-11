@@ -2,10 +2,10 @@
 
 覆盖：
 
-- ``TOOL_CALL_REQUESTED`` + ``TOOL_RESULT_ACCEPTED`` 同 batch 配对生成
+- ``TOOL_CALL_REQUESTED`` + ``TOOL_RESULT_ACCEPTED`` 跨 batch 配对生成
   ``tool_call`` record。
-- 仅 ``TOOL_CALL_REQUESTED`` 而无 ``TOOL_RESULT_ACCEPTED`` 抛
-  :class:`ProjectionSchemaError`。
+- 仅 ``TOOL_CALL_REQUESTED`` 而无 ``TOOL_RESULT_ACCEPTED`` 暂存 pending，
+  不阻塞 checkpoint batch。
 - ``RUNNER_USAGE_RECORDED`` 派发为 ``iteration_usage``。
 - ``FINAL_ANSWER`` 派发为 ``final_response``，``iteration_id`` 为空字符串。
 - ``PROVIDER_PROTOCOL_ERROR`` raw_payload 缺失时写入
@@ -155,11 +155,11 @@ def _read_jsonl_lines(root: Path) -> list[dict[str, JsonValue]]:
     :raises Exception: 不主动抛出异常。
     """
 
-    target_dir = root / "sessions" / _SESSION_ID
-    if not target_dir.exists():
-        return []
     out: list[dict[str, JsonValue]] = []
-    for path in sorted(target_dir.glob("tool_calls_*.jsonl")):
+    sessions_dir = root / "sessions"
+    if not sessions_dir.exists():
+        return out
+    for path in sorted(sessions_dir.glob("*/tool_calls_*.jsonl")):
         for line in path.read_text(encoding="utf-8").splitlines():
             if line:
                 out.append(json.loads(line))
@@ -275,8 +275,8 @@ async def test_tool_call_trace_scrubs_credentials_and_retains_capabilities(
 
 
 @pytest.mark.asyncio
-async def test_tool_call_missing_accepted_raises(tmp_path: Path) -> None:
-    """缺失 ``TOOL_RESULT_ACCEPTED`` 抛 ProjectionSchemaError。"""
+async def test_tool_call_missing_accepted_waits_for_later_batch(tmp_path: Path) -> None:
+    """缺失 ``TOOL_RESULT_ACCEPTED`` 时先暂存，后续 batch 到达再派发。"""
 
     sink = ToolTraceJsonlSink(root_path=tmp_path)
     observer = ToolTraceObserver(jsonl_sink=sink)
@@ -292,8 +292,41 @@ async def test_tool_call_missing_accepted_raises(tmp_path: Path) -> None:
             provider_state=None,
         ),
     )
-    with pytest.raises(ProjectionSchemaError):
-        await observer.process(tx=cast(object, None), batch=(requested,))  # type: ignore[arg-type]
+    await observer.process(tx=cast(object, None), batch=(requested,))  # type: ignore[arg-type]
+    assert _read_jsonl_lines(tmp_path) == []
+
+    accepted = _envelope(
+        position=3,
+        event_type=RunEventType.TOOL_RESULT_ACCEPTED,
+        data=ToolResultAcceptedData(
+            iteration_id="iter-1",
+            tool_call_id="call-1",
+            name="echo",
+            index_in_iteration=0,
+            outcome=_completed_outcome(),
+        ),
+    )
+    usage = _envelope(
+        position=2,
+        event_type=RunEventType.RUNNER_USAGE_RECORDED,
+        data=RunnerUsageData(
+            iteration_id="iter-1",
+            prompt_tokens=1,
+            completion_tokens=1,
+            total_tokens=2,
+        ),
+    )
+
+    await observer.process(tx=cast(object, None), batch=(usage,))  # type: ignore[arg-type]
+    assert [line["trace_type"] for line in _read_jsonl_lines(tmp_path)] == [
+        "iteration_usage"
+    ]
+    await observer.process(tx=cast(object, None), batch=(accepted,))  # type: ignore[arg-type]
+    lines = _read_jsonl_lines(tmp_path)
+    assert [line["trace_type"] for line in lines] == [
+        "iteration_usage",
+        "tool_call",
+    ]
 
 
 @pytest.mark.asyncio
@@ -503,23 +536,20 @@ async def test_context_snapshot_writes_blob_files_and_record(tmp_path: Path) -> 
     )
     try:
         await observer.process(tx=cast(object, None), batch=(env,))  # type: ignore[arg-type]
-        raw_dir = tmp_path / "raw_payloads" / f"{_RUN_ID}_iter-1"
-        assert (
-            raw_dir / f"{refs.input_messages.blob_id}.json"
-        ).read_text(encoding="utf-8").startswith("[{")
-        assert (
-            raw_dir / f"{refs.tool_schemas.blob_id}.json"
-        ).read_text(encoding="utf-8") == "[]"
+        raw_files = sorted((tmp_path / "raw_payloads").rglob("*.json"))
+        payloads_by_text = {path.read_text(encoding="utf-8") for path in raw_files}
+        assert '[{"role":"user","content":"hi"}]' in payloads_by_text
+        assert "[]" in payloads_by_text
         lines = _read_jsonl_lines(tmp_path)
         assert len(lines) == 1
         rec = lines[0]
         assert rec["trace_type"] == "iteration_context_snapshot"
-        assert rec["raw_input_blob_relative_path"] == (
-            f"raw_payloads/{_RUN_ID}_iter-1/{refs.input_messages.blob_id}.json"
-        )
-        assert rec["raw_tool_schemas_blob_relative_path"] == (
-            f"raw_payloads/{_RUN_ID}_iter-1/{refs.tool_schemas.blob_id}.json"
-        )
+        input_relpath = rec["raw_input_blob_relative_path"]
+        tools_relpath = rec["raw_tool_schemas_blob_relative_path"]
+        assert isinstance(input_relpath, str)
+        assert isinstance(tools_relpath, str)
+        assert (tmp_path / input_relpath).exists()
+        assert (tmp_path / tools_relpath).exists()
     finally:
         storage.close()
 

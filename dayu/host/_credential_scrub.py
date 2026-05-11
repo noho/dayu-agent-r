@@ -30,6 +30,14 @@ _EXPLICIT_CREDENTIAL_KEYS: frozenset[str] = frozenset(
         "cookie",
         "credential",
         "credentials",
+        "access_token",
+        "access-token",
+        "auth_token",
+        "auth-token",
+        "bearer_token",
+        "bearer-token",
+        "secret_key",
+        "secret-key",
         "password",
         "passwd",
         "client_secret",
@@ -40,7 +48,8 @@ _EXPLICIT_CREDENTIAL_KEYS: frozenset[str] = frozenset(
 )
 _TEXT_CREDENTIAL_ASSIGNMENT_PATTERN: re.Pattern[str] = re.compile(
     r"\b(api(?:[_-]|\s+)?key|anthropic-api-key|x-api-key|authorization|cookie|"
-    r"credentials?|password|passwd|client[_-]?secret|private[_-]?key)"
+    r"credentials?|access[_-]?token|auth[_-]?token|bearer[_-]?token|"
+    r"secret[_-]?key|password|passwd|client[_-]?secret|private[_-]?key)"
     r"\b(\s*[:=]\s*)([^\r\n,}&]+)",
     flags=re.IGNORECASE,
 )

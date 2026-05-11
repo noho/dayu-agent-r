@@ -13,6 +13,7 @@ from typing import TypeAlias
 
 import pytest
 
+import utils.analyze_tool_trace_host as analyzer
 from dayu.contracts import JsonValue
 from utils.analyze_tool_trace_host import (
     ContextPressureRun,
@@ -63,6 +64,20 @@ def _write_jsonl(
             handle.write(json.dumps(dict(record), ensure_ascii=False))
             handle.write("\n")
     return target_path
+
+
+def _append_raw_jsonl_line(*, path: Path, raw_line: str) -> None:
+    """向 JSONL 文件追加原始行。
+
+    :param path: JSONL 路径。
+    :param raw_line: 原始行文本。
+    :returns: 无返回值。
+    :raises Exception: 写入失败时透传。
+    """
+
+    with path.open("a", encoding="utf-8") as handle:
+        handle.write(raw_line)
+        handle.write("\n")
 
 
 def _tool_call_record(
@@ -834,3 +849,37 @@ def test_tool_stats_dataclass_is_exported() -> None:
     assert FailurePattern.__name__ == "FailurePattern"
     assert DetailedFailurePattern.__name__ == "DetailedFailurePattern"
     assert ContextPressureRun.__name__ == "ContextPressureRun"
+    assert ProviderPartialToolCallDiagnostic.__name__ == "ProviderPartialToolCallDiagnostic"
+    assert "ProviderPartialToolCallDiagnostic" in analyzer.__all__
+
+
+def test_analyzer_skips_malformed_jsonl_partial_line(tmp_path: Path) -> None:
+    """崩溃留下半行 JSONL 时 analyzer 跳过坏行继续读取完整行。"""
+
+    path = _write_jsonl(
+        trace_root=tmp_path,
+        session_id=_SESSION_ID,
+        records=[
+            _tool_call_record(
+                idempotency_key="ok-1",
+                source_event_position=1,
+            )
+        ],
+    )
+    _append_raw_jsonl_line(path=path, raw_line='{"schema_version": ')
+    _append_raw_jsonl_line(
+        path=path,
+        raw_line=json.dumps(
+            _tool_call_record(
+                idempotency_key="ok-2",
+                source_event_position=2,
+            )
+        ),
+    )
+
+    report = analyze_trace_root(trace_root=tmp_path)
+
+    assert report.total_lines_read == 3
+    assert report.deduped_record_count == 2
+    by_tool = {item.tool_name: item for item in report.tool_stats}
+    assert by_tool[_TOOL_NAME].call_count == 2

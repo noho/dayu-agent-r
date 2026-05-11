@@ -150,11 +150,12 @@ def _read_trace_jsonl_lines(*, root: Path, session_id: str) -> list[dict[str, Js
     :raises json.JSONDecodeError: JSONL 行不是合法 JSON 时抛出。
     """
 
-    session_dir = root / "sessions" / session_id
-    if not session_dir.exists():
+    _ = session_id
+    sessions_dir = root / "sessions"
+    if not sessions_dir.exists():
         return []
     records: list[dict[str, JsonValue]] = []
-    for path in sorted(session_dir.glob("tool_calls_*.jsonl")):
+    for path in sorted(sessions_dir.glob("*/tool_calls_*.jsonl")):
         for line in path.read_text(encoding="utf-8").splitlines():
             if line:
                 records.append(cast(dict[str, JsonValue], json.loads(line)))

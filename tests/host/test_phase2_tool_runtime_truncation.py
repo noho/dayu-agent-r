@@ -32,6 +32,7 @@ from dayu.host._tool_result_truncation import (
     extract_truncation_hint,
 )
 from dayu.host._tool_runtime import HostToolRuntime
+from dayu.host._runtime_truncate_manager import _replace_path
 
 
 @dataclass(frozen=True, slots=True)
@@ -548,6 +549,20 @@ async def test_field_path_mismatch_does_not_return_fake_truncated_wrapper() -> N
     assert await store.list_events("run_1", after=None) == ()
 
 
+def test_replace_path_error_includes_field_path_key_and_type() -> None:
+    """wrapper 中间路径类型不匹配时错误消息包含可诊断上下文。"""
+
+    with pytest.raises(
+        RuntimeError,
+        match=r"field_path=nested\.long key=nested type=str",
+    ):
+        _replace_path(
+            value={"nested": "not-object"},
+            field_path=("nested", "long"),
+            chunk="abc",
+        )
+
+
 @pytest.mark.asyncio
 async def test_field_path_has_priority_over_target_field() -> None:
     """field_path 与 target_field 同时存在时优先使用 field_path。"""
@@ -758,6 +773,43 @@ async def test_apply_truncation_and_fetch_more_share_state_lock() -> None:
     assert isinstance(fetched, ToolCompletedOutcome)
     assert isinstance(applied, ToolCompletedOutcome)
     _required_truncation(applied.result.value)
+
+
+@pytest.mark.asyncio
+async def test_concurrent_apply_truncation_for_multiple_tools_registers_independent_cursors() -> None:
+    """两个工具同时触发截断时各自签发独立 cursor。"""
+
+    runtime, _store = await _runtime(
+        value=[1, 2, 3, 4],
+        spec=_spec("list_items", "max_items", 2),
+    )
+    manager = runtime._default_manager
+    outcome_a = ToolCompletedOutcome(
+        result=ToolResultSuccess(ok=True, value=[1, 2, 3], meta=None)
+    )
+    outcome_b = ToolCompletedOutcome(
+        result=ToolResultSuccess(ok=True, value=["a", "b", "c"], meta=None)
+    )
+
+    applied_a, applied_b = await asyncio.gather(
+        asyncio.to_thread(
+            manager.apply_truncation,
+            request=_request(tool_call_id="tc-a", tool_name="tool_a"),
+            outcome=outcome_a,
+            spec=_spec("list_items", "max_items", 1),
+        ),
+        asyncio.to_thread(
+            manager.apply_truncation,
+            request=_request(tool_call_id="tc-b", tool_name="tool_b"),
+            outcome=outcome_b,
+            spec=_spec("list_items", "max_items", 1),
+        ),
+    )
+
+    hint_a = _required_truncation(applied_a.result.value)
+    hint_b = _required_truncation(applied_b.result.value)
+    assert hint_a.cursor != hint_b.cursor
+    assert set(manager._records_by_cursor) == {hint_a.cursor, hint_b.cursor}
 
 
 @pytest.mark.asyncio

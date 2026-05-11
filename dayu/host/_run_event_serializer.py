@@ -813,6 +813,8 @@ def _decode_result_success(value: JsonValue) -> ToolResultSuccess:
             f"{_ERROR_INVALID_OUTCOME_TYPE}: "
             f"legacy top-level {_RESULT_SUCCESS_TOP_LEVEL_TRUNCATION_KEY}"
         )
+    if "value" not in value:
+        raise ValueError(f"{_ERROR_INVALID_OUTCOME_TYPE}: missing value")
     meta_payload = value.get("meta")
     meta: ToolResultMeta | None = None
     if meta_payload is not None:
@@ -827,7 +829,7 @@ def _decode_result_success(value: JsonValue) -> ToolResultSuccess:
         )
     return ToolResultSuccess(
         ok=True,
-        value=value.get("value"),
+        value=value["value"],
         meta=meta,
     )
 
@@ -1280,19 +1282,6 @@ def _get_bool(fields: Mapping[str, JsonValue], key: str) -> bool:
     return value
 
 
-def _get_float(fields: Mapping[str, JsonValue], key: str) -> float:
-    """从字段中读取必填浮点。
-
-    :param fields: JSON 字段映射。
-    :param key: 键名。
-    :returns: 浮点值。
-    :raises ValueError: 字段缺失或类型不符时抛出。
-    """
-
-    value = fields.get(key)
-    if isinstance(value, bool) or not isinstance(value, (int, float)):
-        raise ValueError(f"{_ERROR_INVALID_FIELDS}: missing float {key}")
-    return float(value)
 
 
 def _get_mapping(

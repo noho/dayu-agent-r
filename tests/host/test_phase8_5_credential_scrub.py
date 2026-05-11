@@ -27,6 +27,10 @@ def test_scrub_explicit_credentials_recurses_nested_payload() -> None:
             {"client_secret": "client-secret"},
             {"private_key": "private-key"},
             {"password": "password"},
+            {"access_token": "access-token"},
+            {"auth_token": "auth-token"},
+            {"secret_key": "secret-key"},
+            {"bearer_token": "bearer-token"},
         ],
     }
     scrubbed = scrub_explicit_credentials(payload)
@@ -44,6 +48,10 @@ def test_scrub_explicit_credentials_recurses_nested_payload() -> None:
         {"client_secret": "***"},
         {"private_key": "***"},
         {"password": "***"},
+        {"access_token": "***"},
+        {"auth_token": "***"},
+        {"secret_key": "***"},
+        {"bearer_token": "***"},
     ]
 
 
@@ -68,6 +76,10 @@ def test_scrub_explicit_credentials_scrubs_header_text() -> None:
         "Authorization: Bearer sk-live\n"
         "x-api-key = sk-x\n"
         "API key: sk-api-space\n"
+        "access_token: access-secret\n"
+        "auth-token = auth-secret\n"
+        "secret_key: secret-key\n"
+        "bearer_token: bearer-secret\n"
         "cookie: sid=secret; theme=dark\n"
         "cursor: cursor-raw\n"
         "token: ordinary-token"
@@ -77,12 +89,20 @@ def test_scrub_explicit_credentials_scrubs_header_text() -> None:
     assert "Authorization: ***" in scrubbed
     assert "x-api-key = ***" in scrubbed
     assert "API key: ***" in scrubbed
+    assert "access_token: ***" in scrubbed
+    assert "auth-token = ***" in scrubbed
+    assert "secret_key: ***" in scrubbed
+    assert "bearer_token: ***" in scrubbed
     assert "cookie: ***" in scrubbed
     assert "cursor: cursor-raw" in scrubbed
     assert "token: ordinary-token" in scrubbed
     assert "sk-live" not in scrubbed
     assert "sk-x" not in scrubbed
     assert "sk-api-space" not in scrubbed
+    assert "access-secret" not in scrubbed
+    assert "auth-secret" not in scrubbed
+    assert "secret-key" not in scrubbed
+    assert "bearer-secret" not in scrubbed
     assert "sid=secret" not in scrubbed
 
 
