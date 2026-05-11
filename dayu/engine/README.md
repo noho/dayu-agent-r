@@ -6,11 +6,10 @@ Engine 位于整体链路最下游：
 UI -> Service -> Host -> Engine
 ```
 
-本文档记录 `dayu.engine` 当前代码已经暴露的开发接口、公共契约、架构、边界、执行路径、状态机、事件流、关键机制、扩展点。
-
 ## Agent更新约束【必须遵守】
 
-- 本文档不写过程状态，只保留稳定说明。
+- 本文档只写 `dayu.engine` 当前代码已经暴露的开发接口、公共契约、架构、边界、执行路径、状态机、事件流、关键机制、扩展点。
+- 本文档不写过程状态，不写未来计划，不写实现细节，只保留稳定说明。
 
 ## 设计目标
 
@@ -66,8 +65,8 @@ from dayu.engine.contracts import AgentRunRequest, RunnerSpec
 
 `AgentRunRequest` 是执行入口的唯一请求对象，字段包括：
 
-- `run_id`：本次 run 标识。
-- `session_id`：调用方传入的会话标识；Engine 只随事件透传，不拥有 session 生命周期。
+- `run_id`：调用方传入的本次 run 标识；Engine 只随事件与工具执行上下文透传，不拥有 run 生命周期。
+- `session_id`：调用方传入的 session 标识；Engine 只随事件与工具执行上下文透传，不拥有 session 生命周期。
 - `messages`：进入本次 run 的 `AgentMessage` 元组。
 - `disable_tools`：是否禁用工具调用。
 - `runner_spec`：Runner 规约。
