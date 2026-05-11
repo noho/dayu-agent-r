@@ -28,6 +28,7 @@ from dayu.engine.contracts.engine_events import IterationStartedData
 from dayu.host._attempt_lease import (
     AttemptFencingError,
     AttemptFencingReason,
+    AttemptLeaseBusyReason,
     AttemptLeaseDecision,
     AttemptLeaseConfig,
     AttemptOwnerToken,
@@ -405,7 +406,7 @@ async def test_append_terminal_and_close_validates_run_id_and_type() -> None:
                     draft=mismatched,
                     failure_summary=None,
                 )
-            assert exc_info.value.reason == AttemptFencingReason.OWNER_MISMATCH
+            assert exc_info.value.reason == AttemptFencingReason.RUN_ID_MISMATCH
             non_terminal = RunEventDraft(
                 run_id="r1",
                 session_id="s",
@@ -489,7 +490,7 @@ async def test_scoped_appender_blocks_terminal_drafts() -> None:
 
 @pytest.mark.asyncio
 async def test_scoped_appender_rejects_run_id_mismatch() -> None:
-    """draft.run_id 与 owner_context.run_id 不一致时抛 OWNER_MISMATCH 不写入。"""
+    """draft.run_id 与 owner_context.run_id 不一致时抛 RUN_ID_MISMATCH。"""
 
     storage = _open_storage()
     try:
@@ -505,7 +506,7 @@ async def test_scoped_appender_rejects_run_id_mismatch() -> None:
             )
             with pytest.raises(AttemptFencingError) as excinfo:
                 await appender.append(mismatch)
-            assert excinfo.value.reason == AttemptFencingReason.OWNER_MISMATCH
+            assert excinfo.value.reason == AttemptFencingReason.RUN_ID_MISMATCH
             assert excinfo.value.attempt_id == owner_context.attempt_id
             events = await supervisor.event_store.list_events(
                 run_id="r1", after=None
@@ -641,6 +642,8 @@ async def test_busy_acquire_result_includes_current_fencing_token() -> None:
                 lease_expires_at=clock.now() + timedelta(seconds=30),
             )
         assert busy.decision is AttemptLeaseDecision.BUSY
+        assert busy.reason is None
+        assert busy.busy_reason is AttemptLeaseBusyReason.ATTEMPT_INDEX_CONFLICT
         assert busy.current_fencing_token == first.owner_context.fencing_token
     finally:
         storage.close()
@@ -762,7 +765,7 @@ async def test_append_in_transaction_rolls_back_when_owner_fenced() -> None:
 
 @pytest.mark.asyncio
 async def test_append_in_transaction_rejects_run_id_mismatch() -> None:
-    """``append_in_transaction``: draft.run_id 与 owner 不一致抛 OWNER_MISMATCH。
+    """``append_in_transaction``: draft.run_id 与 owner 不一致抛 RUN_ID_MISMATCH。
 
     与 ``append`` 路径保持一致的 typed reason, 不允许跨 run 借助同事务旁
     路 fencing。
@@ -784,7 +787,7 @@ async def test_append_in_transaction_rejects_run_id_mismatch() -> None:
             with pytest.raises(AttemptFencingError) as excinfo:
                 async with storage.transaction() as tx:
                     appender.append_in_transaction(tx=tx, draft=mismatch)
-            assert excinfo.value.reason == AttemptFencingReason.OWNER_MISMATCH
+            assert excinfo.value.reason == AttemptFencingReason.RUN_ID_MISMATCH
             events = await supervisor.event_store.list_events(
                 run_id="r1", after=None
             )

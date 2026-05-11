@@ -96,6 +96,16 @@ _RECOVERY_REASON_CREATED_ORPHAN: str = "recovery_created_orphan"
 """recovery 原因: ``CREATED`` 孤儿行无 owner / 无 fencing token, 标记为 LOST。"""
 _RECOVERY_REASON_LEASE_EXPIRED: str = "recovery_lease_expired"
 """recovery 原因: ``RUNNING`` 候选 lease 过期, 直接收口为 LOST (P8 D2)。"""
+_ERROR_RUN_ID_REQUIRED: str = "run_id must be non-empty"
+"""lease_context 参数错误: ``run_id`` 不能为空。"""
+_ERROR_ATTEMPT_INDEX_NON_NEGATIVE: str = (
+    "attempt_index must be greater than or equal to 0"
+)
+"""lease_context 参数错误: ``attempt_index`` 不能为负数。"""
+_ERROR_RECOVERED_FROM_ATTEMPT_ID_REQUIRED: str = (
+    "recovered_from_attempt_id must be non-empty when provided"
+)
+"""lease_context 参数错误: recovery 来源 attempt id 不能是空串。"""
 
 
 class AttemptOwnerLossReason(StrEnum):
@@ -113,6 +123,30 @@ class AttemptOwnerLossReason(StrEnum):
 
     FENCED = "fenced"
     STORAGE_ERROR = "storage_error"
+
+
+def _validate_lease_context_args(
+    *,
+    run_id: str,
+    attempt_index: int,
+    recovered_from_attempt_id: str | None,
+) -> None:
+    """校验 ``lease_context`` 的业务标识参数。
+
+    :param run_id: Run id，必须是非空字符串。
+    :param attempt_index: 同一 run 内 attempt 序号，必须大于等于 0。
+    :param recovered_from_attempt_id: recovery 来源 attempt id；为 ``None``
+        表示非 recovery，提供时必须是非空字符串。
+    :returns: 无返回值。
+    :raises ValueError: 任一参数不满足边界约束时抛出。
+    """
+
+    if run_id == "":
+        raise ValueError(_ERROR_RUN_ID_REQUIRED)
+    if attempt_index < 0:
+        raise ValueError(_ERROR_ATTEMPT_INDEX_NON_NEGATIVE)
+    if recovered_from_attempt_id == "":
+        raise ValueError(_ERROR_RECOVERED_FROM_ATTEMPT_ID_REQUIRED)
 
 
 @dataclass(slots=True)
@@ -199,7 +233,7 @@ class AttemptScopedRunEventAppender:
       跨 run 复用;
     - 所有 append 在内部对 ``draft.run_id`` 与 ``owner_context.run_id``
       做严格相等校验, 不一致时抛
-      :class:`AttemptFencingError(reason=OWNER_MISMATCH)`, 防止 ToolRuntime
+      :class:`AttemptFencingError(reason=RUN_ID_MISMATCH)`, 防止 ToolRuntime
       在 attempt 边界 race 期间把旧 cursor 的 fact 写到错误 run。
 
     fencing 真源仍是 :meth:`AttemptLeaseStore.verify_owner` 的事务内 CAS,
@@ -246,7 +280,7 @@ class AttemptScopedRunEventAppender:
         步骤:
 
         1. 校验 ``draft.run_id == owner_context.run_id``, 不一致时抛
-           :class:`AttemptFencingError(reason=OWNER_MISMATCH)`;
+           :class:`AttemptFencingError(reason=RUN_ID_MISMATCH)`;
         2. 校验 ``draft.type`` 不属于 :data:`TERMINAL_RUN_EVENT_TYPES`,
            terminal RunEvent 必须走 :meth:`append_terminal_and_close`,
            否则 attempt close 与 terminal append 失去原子性;
@@ -406,7 +440,7 @@ class AttemptScopedRunEventAppender:
         的第一道防线: 旧 owner 不应该用绑定它的 appender 写入到其它 run
         的 EventLog, ToolRuntime 在 attempt 边界 race 期间也不应让旧
         cursor 写入新 run。命中失败映射为
-        :class:`AttemptFencingError(reason=OWNER_MISMATCH)`, 不写诊断
+        :class:`AttemptFencingError(reason=RUN_ID_MISMATCH)`, 不写诊断
         RunEvent, 由调用方按 typed refusal 收口。
 
         :param draft: 待校验的 RunEvent 草稿。
@@ -440,7 +474,7 @@ class AttemptScopedRunEventAppender:
         raise AttemptFencingError(
             attempt_id=self.owner_context.attempt_id,
             run_id=self.owner_context.run_id,
-            reason=AttemptFencingReason.OWNER_MISMATCH,
+            reason=AttemptFencingReason.RUN_ID_MISMATCH,
             current_state=None,
             owner_id=self.owner_context.owner_id,
             fencing_token=self.owner_context.fencing_token,
@@ -574,8 +608,15 @@ class AttemptSupervisor:
         :returns: 异步迭代器, 仅产出一个 :class:`AttemptOwnerContext`。
         :raises AttemptFencingError: acquire 命中 BUSY / TERMINAL /
             FENCED 等非 ACQUIRED 决策时抛出, 由调用方决定收口策略。
+        :raises ValueError: ``run_id`` 为空、``attempt_index`` 为负数或
+            ``recovered_from_attempt_id`` 为空串时抛出。
         """
 
+        _validate_lease_context_args(
+            run_id=run_id,
+            attempt_index=attempt_index,
+            recovered_from_attempt_id=recovered_from_attempt_id,
+        )
         owner_token = AttemptOwnerToken.new()
         owner_id = _default_owner_id(self.lease_config.owner_id_prefix)
         attempt_id = _default_attempt_id(

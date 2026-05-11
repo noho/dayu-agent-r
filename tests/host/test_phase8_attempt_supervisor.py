@@ -56,6 +56,7 @@ from dayu.host._attempt_lease import (
     ATTEMPT_OWNER_ID_PREFIX,
     AttemptFencingError,
     AttemptFencingReason,
+    AttemptLeaseBusyReason,
     AttemptLeaseConfig,
     AttemptLeaseDecision,
     AttemptLeaseResult,
@@ -690,7 +691,8 @@ class _BusyStore:
             current_state=AttemptState.RUNNING,
             current_owner_id="someone",
             lease_expires_at=self.clock.now(),
-            reason=AttemptFencingReason.ATTEMPT_NOT_RUNNING,
+            reason=None,
+            busy_reason=AttemptLeaseBusyReason.ATTEMPT_INDEX_CONFLICT,
             current_fencing_token=FencingToken(value=7),
         )
 
@@ -750,7 +752,55 @@ async def test_lease_context_propagates_acquire_fencing_error() -> None:
                 run_id="r1", attempt_index=0
             ):
                 pytest.fail("lease_context should not yield on BUSY")
-        assert excinfo.value.reason is AttemptFencingReason.ATTEMPT_NOT_RUNNING
+        assert excinfo.value.reason is AttemptFencingReason.STORAGE_CONFLICT
+    finally:
+        storage.close()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("run_id", "attempt_index", "recovered_from_attempt_id", "message"),
+    (
+        ("", 0, None, "run_id must be non-empty"),
+        ("r1", -1, None, "attempt_index must be greater than or equal to 0"),
+        (
+            "r1",
+            0,
+            "",
+            "recovered_from_attempt_id must be non-empty when provided",
+        ),
+    ),
+)
+async def test_lease_context_validates_identity_arguments(
+    run_id: str,
+    attempt_index: int,
+    recovered_from_attempt_id: str | None,
+    message: str,
+) -> None:
+    """lease_context 必须在 acquire 前拒绝非法业务标识参数。
+
+    :param run_id: 待验证的 Run id。
+    :param attempt_index: 待验证的 attempt 序号。
+    :param recovered_from_attempt_id: 待验证的 recovery 来源 attempt id。
+    :param message: 期望的错误消息片段。
+    :returns: 无返回值。
+    :raises AssertionError: 未抛出预期 ``ValueError`` 时由 pytest 抛出。
+    """
+
+    storage = _open_storage()
+    try:
+        await _seed_run(storage)
+        clock = _FakeClock()
+        supervisor = _build_supervisor(storage=storage, clock=clock)
+        with pytest.raises(ValueError, match=message):
+            async with supervisor.lease_context(
+                run_id=run_id,
+                attempt_index=attempt_index,
+                recovered_from_attempt_id=recovered_from_attempt_id,
+            ):
+                pytest.fail("lease_context should reject invalid arguments")
+        rows = storage.execute_read("SELECT attempt_id FROM host_attempts")
+        assert rows == []
     finally:
         storage.close()
 

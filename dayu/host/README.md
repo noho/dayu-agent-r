@@ -207,7 +207,7 @@ P8 已落地：
 - attempt-scoped append（P8-S5）：`AttemptScopedRunEventAppender` 收敛所有当前 attempt
   owner 的 canonical fact 写入（Engine 翻译事件、context overflow / compact、trace fact 与普通
   tool call/result fact）；`draft.run_id` 与 `owner_context.run_id` 不一致直接抛
-  `AttemptFencingError(reason=OWNER_MISMATCH)`。`ToolRuntimeOwnerScope`（ContextVar）
+  `AttemptFencingError(reason=RUN_ID_MISMATCH)`。`ToolRuntimeOwnerScope`（ContextVar）
   在 `LocalRunHarness._run_to_store` 每个 attempt 生命周期内把 scoped appender 注入
   `HostToolRuntime`，使 durable 工具执行入口在业务 executor、framework `fetch_more` 与截断 manager
   mutation 前先验证 active owner；框架 `fetch_more` 也按 originating attempt 的普通工具事件路径约束落库。
@@ -405,7 +405,7 @@ public `StartRunRequest` / `start_run` 不暴露 lease TTL，owner secret token 
 facts）都通过该 appender
 在同一 `BEGIN IMMEDIATE` 事务内执行 `verify_owner` + EventLog append；
 `draft.run_id` 与 `owner_context.run_id` 不一致直接抛 typed
-`AttemptFencingError(reason=OWNER_MISMATCH)`，stale owner / fencing token 不一致 / lease
+`AttemptFencingError(reason=RUN_ID_MISMATCH)`，stale owner / fencing token 不一致 / lease
 过期同样抛 `AttemptFencingError` 整事务回滚，EventLog 不残留 stale fact，也不写诊断
 RunEvent。`AttemptSupervisor.scoped_appender(owner_context)` 是构造该 appender 的唯一
 公开入口；`LocalRunHarness._run_to_store` 在每个 attempt 生命周期内通过
