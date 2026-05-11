@@ -10,11 +10,13 @@ from dayu.engine import (
     ContentDeltaData,
     FinalAnswerData,
     FinishReason,
+    ProviderProtocolErrorData,
     RunCancelledData,
     RunFailedData,
     ToolCallRequestedData,
     ToolResultAcceptedData,
 )
+from dayu.engine.contracts.partial_tool_call import PartialToolCallSummary
 from dayu.contracts.tool_outcome import ToolCompletedOutcome
 from dayu.contracts.tool_result import ToolResultSuccess
 from dayu.host._run_event_serializer import (
@@ -77,6 +79,110 @@ def test_run_failed_engine_vs_host_variants_distinguished() -> None:
     decoded_host = deserialize_run_event_data(event_type=RunEventType.RUN_FAILED, raw=raw_host)
     assert isinstance(decoded_host, HostRunFailedData)
     assert decoded_host == host
+
+
+def test_run_failed_message_scrubs_explicit_credentials() -> None:
+    """Engine RUN_FAILED message 写入 EventLog 前必须清洗显式凭证。"""
+
+    raw = serialize_run_event_data(
+        event_type=RunEventType.RUN_FAILED,
+        data=RunFailedData(
+            error_code="http_401",
+            message="provider rejected api_key=sk-secret",
+            recoverable=False,
+        ),
+    )
+    decoded = deserialize_run_event_data(
+        event_type=RunEventType.RUN_FAILED,
+        raw=raw,
+    )
+    assert isinstance(decoded, RunFailedData)
+    assert decoded.message == "provider rejected api_key=***"
+    assert "sk-secret" not in raw
+
+
+def test_provider_protocol_error_scrubs_message_and_raw_payload() -> None:
+    """PROVIDER_PROTOCOL_ERROR 的 message / raw_payload 都要清洗显式凭证。"""
+
+    raw = serialize_run_event_data(
+        event_type=RunEventType.PROVIDER_PROTOCOL_ERROR,
+        data=ProviderProtocolErrorData(
+            iteration_id="iter-1",
+            error_code="bad_sse",
+            message="Authorization: Bearer sk-secret",
+            provider_request_id="req-1",
+            raw_payload={
+                "api_key": "sk-payload",
+                "cursor": "ordinary-cursor",
+            },
+            partial_tool_calls=(
+                PartialToolCallSummary(
+                    tool_call_index=0,
+                    tool_call_id="call-1",
+                    name_fragment="lookup",
+                    arguments_byte_size=5,
+                    arguments_sha256="abc",
+                ),
+            ),
+        ),
+    )
+    decoded = deserialize_run_event_data(
+        event_type=RunEventType.PROVIDER_PROTOCOL_ERROR,
+        raw=raw,
+    )
+    assert isinstance(decoded, ProviderProtocolErrorData)
+    assert decoded.message == "Authorization: ***"
+    assert decoded.raw_payload == {
+        "api_key": "***",
+        "cursor": "ordinary-cursor",
+    }
+    assert decoded.partial_tool_calls[0].tool_call_id == "call-1"
+    assert "sk-secret" not in raw
+    assert "sk-payload" not in raw
+
+
+def test_provider_protocol_error_requires_partial_tool_calls_field() -> None:
+    """缺失 partial_tool_calls 字段必须 fail-fast；显式空列表才表示无 partial。"""
+
+    raw_missing = f"""
+    {{
+        "schema_version": {CURRENT_SCHEMA_VERSION},
+        "type_name": "{RunEventType.PROVIDER_PROTOCOL_ERROR.value}::ProviderProtocolErrorData",
+        "fields": {{
+            "iteration_id": "iter-1",
+            "error_code": "bad_sse",
+            "message": "m",
+            "provider_request_id": null,
+            "raw_payload": null
+        }}
+    }}
+    """
+    with pytest.raises(ValueError):
+        deserialize_run_event_data(
+            event_type=RunEventType.PROVIDER_PROTOCOL_ERROR,
+            raw=raw_missing,
+        )
+
+    raw_empty = f"""
+    {{
+        "schema_version": {CURRENT_SCHEMA_VERSION},
+        "type_name": "{RunEventType.PROVIDER_PROTOCOL_ERROR.value}::ProviderProtocolErrorData",
+        "fields": {{
+            "iteration_id": "iter-1",
+            "error_code": "bad_sse",
+            "message": "m",
+            "provider_request_id": null,
+            "raw_payload": null,
+            "partial_tool_calls": []
+        }}
+    }}
+    """
+    decoded = deserialize_run_event_data(
+        event_type=RunEventType.PROVIDER_PROTOCOL_ERROR,
+        raw=raw_empty,
+    )
+    assert isinstance(decoded, ProviderProtocolErrorData)
+    assert decoded.partial_tool_calls == ()
 
 
 def test_run_cancelled_round_trip_preserves_timestamps() -> None:

@@ -301,13 +301,6 @@ class ToolCallRecord:
     :param truncation_cursor: 截断 cursor 指纹；无截断为 ``None``。
     :param truncation_has_more: 截断 has_more；无截断为 ``None``。
     :param truncation_limit: 截断 limit；无截断为 ``None``。
-    :param fetch_more_consumed_cursor: 已消费 cursor 指纹；无补读为 ``None``。
-    :param fetch_more_next_cursor: 下一页 cursor 指纹；无补读为 ``None``。
-    :param fetch_more_chunk_size: 补读返回元素数量；无补读为 ``None``。
-    :param fetch_more_has_more: 补读 has_more；无补读为 ``None``。
-    :param cursor_denial_reason: cursor 拒绝原因；非拒绝为 ``None``。
-    :param cursor_expired_at_monotonic: cursor 过期单进程时间；非过期为
-        ``None``。
     """
 
     schema_version: str
@@ -330,12 +323,6 @@ class ToolCallRecord:
     truncation_cursor: str | None
     truncation_has_more: bool | None
     truncation_limit: int | None
-    fetch_more_consumed_cursor: str | None
-    fetch_more_next_cursor: str | None
-    fetch_more_chunk_size: int | None
-    fetch_more_has_more: bool | None
-    cursor_denial_reason: str | None
-    cursor_expired_at_monotonic: float | None
 
     def to_json_record(self) -> Mapping[str, JsonValue]:
         """编码为 JSON record。
@@ -365,12 +352,6 @@ class ToolCallRecord:
             "truncation_cursor": self.truncation_cursor,
             "truncation_has_more": self.truncation_has_more,
             "truncation_limit": self.truncation_limit,
-            "fetch_more_consumed_cursor": self.fetch_more_consumed_cursor,
-            "fetch_more_next_cursor": self.fetch_more_next_cursor,
-            "fetch_more_chunk_size": self.fetch_more_chunk_size,
-            "fetch_more_has_more": self.fetch_more_has_more,
-            "cursor_denial_reason": self.cursor_denial_reason,
-            "cursor_expired_at_monotonic": self.cursor_expired_at_monotonic,
         }
         return record
 

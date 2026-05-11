@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import ast
 import json
-from collections.abc import Mapping
+from collections.abc import AsyncIterator, Mapping
 from dataclasses import dataclass
 from datetime import datetime
 from pathlib import Path
@@ -15,8 +15,20 @@ import dayu.engine as engine
 import dayu.host as host
 import dayu.host.contracts as host_contracts
 from dayu.contracts import (
+    CancellationToken,
     JsonValue,
+    ToolFunctionSchema,
+    ToolParametersSchema,
+    ToolSchema,
     ToolTruncateSpec,
+)
+from dayu.engine import (
+    AgentMessageRole,
+    AgentPolicy,
+    EngineEvent,
+    RunnerCallOptions,
+    RunnerSpec,
+    UserMessage,
 )
 from dayu.contracts.tool_call import (
     ToolCallRequest,
@@ -32,7 +44,10 @@ from dayu.contracts.tool_result import ToolResultSuccess
 from dayu.host._event_store import InMemoryRunEventStore
 from dayu.host._framework_tools import FRAMEWORK_FETCH_MORE_NAME
 from dayu.host._tool_result_truncation import extract_truncation_hint
+from dayu.host._run_harness import LocalRunHarness
 from dayu.host._tool_runtime import HostToolRuntime
+from dayu.host.contracts import RunInput, RunOptions, StartRunRequest
+from tests.host._memory_store_fake import FakeInMemoryConversationMemoryStore
 
 
 def _content_value(value: JsonValue) -> JsonValue:
@@ -94,6 +109,49 @@ class _Executor:
         )
 
 
+@dataclass(frozen=True, slots=True)
+class _UnavailableProxy:
+    """不应被调用的 WorkerProxy。"""
+
+    def stream_engine_events(
+        self,
+        request: StartRunRequest,
+        cancellation_token: CancellationToken,
+    ) -> AsyncIterator[EngineEvent]:
+        """防止 schema preflight 测试误启动 Engine。
+
+        :param request: start_run 请求。
+        :param cancellation_token: 取消 token。
+        :returns: 不返回。
+        :raises AssertionError: 始终抛出。
+        """
+
+        _ = request
+        _ = cancellation_token
+        raise AssertionError("schema preflight should reject before proxy")
+
+
+@dataclass(frozen=True, slots=True)
+class _SchemaProvider:
+    """测试用 Engine schema provider。"""
+
+    schemas: tuple[ToolSchema, ...]
+
+    def engine_visible_tool_schemas(
+        self,
+        user_tool_schemas: tuple[ToolSchema, ...],
+    ) -> tuple[ToolSchema, ...]:
+        """返回预设 schema。
+
+        :param user_tool_schemas: 调用方 schema。
+        :returns: 预设 schema。
+        :raises Exception: 不主动抛出异常。
+        """
+
+        _ = user_tool_schemas
+        return self.schemas
+
+
 def _request(
     *,
     run_id: str = "run_1",
@@ -126,6 +184,80 @@ def _request(
             timeout_seconds=None,
             cancellation_token=_Token(),
             correlation_id=None,
+        ),
+    )
+
+
+def _tool_schema(name: str) -> ToolSchema:
+    """构造最小 ToolSchema。
+
+    :param name: 工具名。
+    :returns: ToolSchema。
+    :raises Exception: 不主动抛出异常。
+    """
+
+    return ToolSchema(
+        type="function",
+        function=ToolFunctionSchema(
+            name=name,
+            description=f"{name} tool",
+            parameters=ToolParametersSchema(
+                type="object",
+                properties={},
+                required=(),
+                additional_properties=False,
+            ),
+        ),
+    )
+
+
+def _start_request(
+    *,
+    tool_schemas: tuple[ToolSchema, ...],
+    run_id: str = "run-schema",
+) -> StartRunRequest:
+    """构造 start_run 请求。
+
+    :param tool_schemas: RunOptions 中的工具 schema。
+    :param run_id: Run id。
+    :returns: StartRunRequest。
+    :raises Exception: 不主动抛出异常。
+    """
+
+    return StartRunRequest(
+        session_id="session-schema",
+        run_id=run_id,
+        input=RunInput(
+            messages=(UserMessage(role=AgentMessageRole.USER, content="hi"),)
+        ),
+        options=RunOptions(
+            runner_spec=RunnerSpec(
+                provider="openai",
+                model="m",
+                endpoint="https://example.test/v1/chat/completions",
+                api_key_ref="K",
+                headers={},
+                supports_tool_calling=True,
+                supports_streaming=True,
+                supports_stream_usage=False,
+                default_timeout_seconds=30.0,
+                max_retries=0,
+                provider_request=None,
+            ),
+            runner_options=RunnerCallOptions(
+                temperature=None,
+                max_tokens=None,
+                top_p=None,
+                stream=True,
+            ),
+            agent_policy=AgentPolicy(
+                max_iterations=1,
+                continuation_max_attempts=0,
+                allow_tool_calls=True,
+            ),
+            stream=True,
+            disable_tools=False,
+            tool_schemas=tool_schemas,
         ),
     )
 
@@ -276,6 +408,59 @@ def test_caller_provided_fetch_more_schema_is_rejected_even_when_identical() -> 
 
     with pytest.raises(ValueError, match="framework tool schema name conflict"):
         runtime.engine_visible_tool_schemas((framework_schema,))
+
+
+def test_engine_visible_request_returns_original_without_provider() -> None:
+    """无 provider 时 ``_engine_visible_request`` 原样返回 request。"""
+
+    harness = LocalRunHarness(
+        is_durable=False,
+        proxy=_UnavailableProxy(),
+        event_store=InMemoryRunEventStore(),
+        memory_store=FakeInMemoryConversationMemoryStore(),
+    )
+    request = _start_request(tool_schemas=())
+
+    assert harness._engine_visible_request(request) is request
+
+
+def test_engine_visible_request_replaces_tool_schemas_from_provider() -> None:
+    """provider 返回增强 schema 时 ``_engine_visible_request`` 构造 request 副本。"""
+
+    schema = _tool_schema("demo")
+    enhanced = _tool_schema("fetch_more")
+    harness = LocalRunHarness(
+        is_durable=False,
+        proxy=_UnavailableProxy(),
+        event_store=InMemoryRunEventStore(),
+        memory_store=FakeInMemoryConversationMemoryStore(),
+        engine_tool_schema_provider=_SchemaProvider(schemas=(schema, enhanced)),
+    )
+    request = _start_request(tool_schemas=(schema,))
+
+    projected = harness._engine_visible_request(request)
+
+    assert projected is not request
+    assert projected.options.tool_schemas == (schema, enhanced)
+
+
+@pytest.mark.asyncio
+async def test_start_run_rejects_fetch_more_schema_before_user_input_event() -> None:
+    """start_run 在写 USER_INPUT_ACCEPTED 前预检 caller-provided fetch_more schema。"""
+
+    runtime, store = _runtime()
+    harness = LocalRunHarness(
+        is_durable=False,
+        proxy=_UnavailableProxy(),
+        event_store=store,
+        memory_store=FakeInMemoryConversationMemoryStore(),
+        engine_tool_schema_provider=runtime,
+    )
+    request = _start_request(tool_schemas=(_tool_schema(FRAMEWORK_FETCH_MORE_NAME),))
+
+    with pytest.raises(ValueError, match="framework tool schema name conflict"):
+        await harness.start_run(request)
+    assert await store.list_events("run-schema", after=None) == ()
 
 
 @pytest.mark.asyncio

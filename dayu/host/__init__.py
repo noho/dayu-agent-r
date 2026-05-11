@@ -40,7 +40,6 @@ from dayu.host.contracts import (
     RunSucceededResult,
     RunSuspendedResult,
     StartRunRequest,
-    ToolValueSizeSummary,
     UserInputAcceptedData,
     UserInputScope,
 )
@@ -75,7 +74,6 @@ __all__ = [
     "RunSucceededResult",
     "RunSuspendedResult",
     "StartRunRequest",
-    "ToolValueSizeSummary",
     "UserInputAcceptedData",
     "UserInputScope",
 ]

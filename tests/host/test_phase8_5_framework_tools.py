@@ -3,6 +3,9 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
+from typing import cast
+
+import pytest
 
 from dayu.contracts import ToolTruncateSpec
 from dayu.contracts.tool_call import ToolExecutionRequest
@@ -68,3 +71,14 @@ def test_framework_tool_set_projects_fetch_more_schema() -> None:
     assert len(schemas) == 1
     assert schemas[0].function.name == FRAMEWORK_FETCH_MORE_NAME
     assert runtime._framework_tools.fetch_more_definition().to_tool_schema() == schemas[0]
+
+
+@pytest.mark.asyncio
+async def test_framework_fetch_more_callable_fails_fast_when_not_intercepted() -> None:
+    """framework fetch_more schema callable 被直接执行时必须暴露装配错误。"""
+
+    runtime = _runtime()
+    definition = runtime._framework_tools.fetch_more_definition()
+
+    with pytest.raises(AssertionError, match="intercepted"):
+        await definition.callable(cast(ToolExecutionRequest, None))

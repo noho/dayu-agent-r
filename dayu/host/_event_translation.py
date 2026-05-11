@@ -8,6 +8,7 @@ from datetime import datetime
 from dayu.engine import (
     EngineEvent,
     FinalAnswerData,
+    ProviderProtocolErrorData,
     RunCancelledData,
     RunFailedData,
     RunSuspendedData,
@@ -15,6 +16,7 @@ from dayu.engine import (
     ToolResultAcceptedData,
 )
 from dayu.host._credential_scrub import (
+    _scrub_text_credential_assignments,
     scrub_tool_arguments,
     scrub_tool_execution_outcome,
 )
@@ -96,6 +98,16 @@ def translate_engine_event(event: EngineEvent) -> RunEventDraft:
         data = replace(
             data,
             outcome=scrub_tool_execution_outcome(data.outcome),
+        )
+    elif isinstance(data, ProviderProtocolErrorData):
+        data = replace(
+            data,
+            message=_scrub_text_credential_assignments(data.message),
+        )
+    elif isinstance(data, RunFailedData):
+        data = replace(
+            data,
+            message=_scrub_text_credential_assignments(data.message),
         )
     return RunEventDraft(
         run_id=event.run_id,

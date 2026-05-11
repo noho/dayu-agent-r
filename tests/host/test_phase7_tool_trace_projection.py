@@ -40,7 +40,8 @@ from dayu.engine import (
     ToolResultAcceptedData,
 )
 from dayu.host._event_observer import ProjectionEventEnvelope
-from dayu.host._host_storage_transaction import HostStorage
+from dayu.host._durable_event_store import open_durable_event_store
+from dayu.host._host_storage_transaction import HostStorage, HostStorageTransaction
 from dayu.host._internal_contracts import GlobalEventPosition
 from dayu.host._run_input_raw_payload_store import (
     RunInputRawPayloadKind,
@@ -60,6 +61,7 @@ from dayu.host.contracts import (
     RunEvent,
     RunEventCursor,
     RunEventData,
+    RunEventDraft,
     RunEventKind,
     RunEventSource,
     RunEventType,
@@ -68,6 +70,7 @@ from dayu.host.contracts import (
     RunInputMessageSummary,
     RunInputToolSchemaSummary,
 )
+from utils.analyze_tool_trace_host import analyze_trace_root
 
 _RUN_ID: str = "r1"
 _SESSION_ID: str = "s1"
@@ -272,6 +275,8 @@ async def test_tool_call_trace_scrubs_credentials_and_retains_capabilities(
     assert parsed_result["cursor"] == "cursor-result"
     assert parsed_result["scope_token"] == "scope-result"
     assert parsed_result["token"] == "ordinary-result-token"
+    assert "fetch_more_consumed_cursor" not in lines[0]
+    assert "cursor_denial_reason" not in lines[0]
 
 
 @pytest.mark.asyncio
@@ -327,6 +332,132 @@ async def test_tool_call_missing_accepted_waits_for_later_batch(tmp_path: Path) 
         "iteration_usage",
         "tool_call",
     ]
+    assert lines[1]["source_event_position"] == 3
+
+
+@pytest.mark.asyncio
+async def test_tool_call_delayed_pairing_keeps_analyzer_positions_monotonic(
+    tmp_path: Path,
+) -> None:
+    """跨 batch 延迟配对写出的 trace 不应触发 analyzer position gap。"""
+
+    sink = ToolTraceJsonlSink(root_path=tmp_path)
+    observer = ToolTraceObserver(jsonl_sink=sink)
+    requested = _envelope(
+        position=1,
+        event_type=RunEventType.TOOL_CALL_REQUESTED,
+        data=ToolCallRequestedData(
+            iteration_id="iter-1",
+            tool_call_id="call-1",
+            name="echo",
+            arguments={},
+            index_in_iteration=0,
+            provider_state=None,
+        ),
+    )
+    usage = _envelope(
+        position=2,
+        event_type=RunEventType.RUNNER_USAGE_RECORDED,
+        data=RunnerUsageData(
+            iteration_id="iter-1",
+            prompt_tokens=1,
+            completion_tokens=1,
+            total_tokens=2,
+        ),
+    )
+    accepted = _envelope(
+        position=3,
+        event_type=RunEventType.TOOL_RESULT_ACCEPTED,
+        data=ToolResultAcceptedData(
+            iteration_id="iter-1",
+            tool_call_id="call-1",
+            name="echo",
+            index_in_iteration=0,
+            outcome=_completed_outcome(),
+        ),
+    )
+
+    await observer.process(tx=cast(object, None), batch=(requested,))  # type: ignore[arg-type]
+    await observer.process(tx=cast(object, None), batch=(usage,))  # type: ignore[arg-type]
+    await observer.process(tx=cast(object, None), batch=(accepted,))  # type: ignore[arg-type]
+
+    records = _read_jsonl_lines(tmp_path)
+    assert [record["trace_type"] for record in records] == [
+        "iteration_usage",
+        "tool_call",
+    ]
+    assert [record["source_event_position"] for record in records] == [2, 3]
+    report = analyze_trace_root(trace_root=tmp_path)
+    assert report.source_event_position_gaps == ()
+
+
+@pytest.mark.asyncio
+async def test_tool_call_pairing_survives_checkpoint_restart(tmp_path: Path) -> None:
+    """request 已 checkpoint 后新 observer 处理 accepted 仍可从 EventLog 回查配对。"""
+
+    storage = HostStorage(database_path=":memory:")
+    storage.open()
+    store = open_durable_event_store(storage)
+    try:
+        requested_event = await store.append(
+            RunEventDraft(
+                run_id=_RUN_ID,
+                session_id=_SESSION_ID,
+                kind=RunEventKind.CANONICAL,
+                source=RunEventSource.HOST,
+                type=RunEventType.TOOL_CALL_REQUESTED,
+                occurred_at=_utc(),
+                data=ToolCallRequestedData(
+                    iteration_id="iter-1",
+                    tool_call_id="call-1",
+                    name="echo",
+                    arguments={},
+                    index_in_iteration=0,
+                    provider_state=None,
+                ),
+                source_engine_event_id=None,
+            )
+        )
+        accepted_event = await store.append(
+            RunEventDraft(
+                run_id=_RUN_ID,
+                session_id=_SESSION_ID,
+                kind=RunEventKind.CANONICAL,
+                source=RunEventSource.HOST,
+                type=RunEventType.TOOL_RESULT_ACCEPTED,
+                occurred_at=_utc(),
+                data=ToolResultAcceptedData(
+                    iteration_id="iter-1",
+                    tool_call_id="call-1",
+                    name="echo",
+                    index_in_iteration=0,
+                    outcome=_completed_outcome(),
+                ),
+                source_engine_event_id=None,
+            )
+        )
+        observer = ToolTraceObserver(
+            jsonl_sink=ToolTraceJsonlSink(root_path=tmp_path),
+            event_store=store,
+        )
+
+        await observer.process(
+            tx=cast(HostStorageTransaction, None),
+            batch=(
+                ProjectionEventEnvelope(
+                    position=GlobalEventPosition(value=2),
+                    event=accepted_event,
+                ),
+            ),
+        )  # type: ignore[arg-type]
+
+        lines = _read_jsonl_lines(tmp_path)
+        assert len(lines) == 1
+        assert lines[0]["trace_type"] == "tool_call"
+        assert lines[0]["tool_call_id"] == "call-1"
+        assert requested_event.cursor.sequence == 0
+    finally:
+        storage.close()
 
 
 @pytest.mark.asyncio
@@ -461,6 +592,29 @@ async def test_provider_protocol_error_scrubs_secret(tmp_path: Path) -> None:
     parsed = json.loads(raw)
     assert parsed["Authorization"] == "***"
     assert parsed["msg"] == "ok"
+    assert lines[0]["message"] == "x"
+
+
+@pytest.mark.asyncio
+async def test_provider_protocol_error_scrubs_message(tmp_path: Path) -> None:
+    """provider protocol error message 落 trace 前也要清洗显式凭证。"""
+
+    sink = ToolTraceJsonlSink(root_path=tmp_path)
+    observer = ToolTraceObserver(jsonl_sink=sink)
+    env = _envelope(
+        position=4,
+        event_type=RunEventType.PROVIDER_PROTOCOL_ERROR,
+        data=ProviderProtocolErrorData(
+            iteration_id="iter-1",
+            error_code="bad",
+            message="Invalid api_key=sk-secret",
+            provider_request_id=None,
+            raw_payload=None,
+        ),
+    )
+    await observer.process(tx=cast(object, None), batch=(env,))  # type: ignore[arg-type]
+    lines = _read_jsonl_lines(tmp_path)
+    assert lines[0]["message"] == "Invalid api_key=***"
 
 
 def _snapshot_data(*, refs: RunInputRawPayloadRefs) -> RunInputContextSnapshotBuiltData:

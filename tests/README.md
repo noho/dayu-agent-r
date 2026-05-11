@@ -82,7 +82,7 @@ Engine 契约、包根导出、事件契约与架构边界测试，覆盖 `dayu.
 - import boundary：阻止 Engine 反向依赖 Host、Service、UI、fins、工具执行实现、处理器或 trace 私有模块；OpenAI runner 子树内允许当前实现所需的 `aiohttp`。
 - weak typing guard：扫描 `dayu.engine` 源码，守住强类型签名、封闭联合与 metadata 类型边界。
 - 事件契约与消息契约：覆盖 EngineEvent、RunnerEvent、AgentMessage、metadata、provider protocol error
-  `partial_tool_calls` 有界摘要、终态事件集合等结构约束。
+  `partial_tool_calls` 有界摘要（含 provider-controlled tool_call_id 长度边界）、终态事件集合等结构约束。
 - Agent 状态机：覆盖无工具 final / failed / cancelled、普通 completed / failed tool calling、工具结果投影、max iteration force-answer、连续失败工具批次保护、awaiting 拒绝与取消优先级。
 - smoke 脚本轻量测试：覆盖 provider smoke 与 tool-call smoke 的参数解析、缺 key 跳过、安全输出和 fake 工具行为，不做真实联网。
 
@@ -184,9 +184,10 @@ Host 当前 Run harness、RunEventStore、ToolRuntime、Conversation Memory / Ru
 - P7 tool trace projection（`tests/host/test_phase7_*.py`）：覆盖
   `RunInputContextFactBuilder` 派生 ``RUN_INPUT_CONTEXT_SNAPSHOT_BUILT`` canonical
   fact、assistant tool call arguments raw payload 显式凭证 scrub、`run_input_raw_payloads` side-store 同事务写入与校验失败路径、
-  `ToolTraceJsonlSink` JSONL + raw payload blob 落盘、provider secret
+  `ToolTraceJsonlSink` JSONL + raw payload blob 落盘、provider message / raw payload secret
   scrub、逻辑 id 安全路径编码与 trace root containment、JSONL 半行 analyzer 防御、普通 tool payload 显式凭证 scrub 与 cursor / scope token 保留、
-  `ToolTraceObserver` 5 类 record 派发与 request/result 跨 batch 配对、``DurableHarnessConfig.tool_trace_path``
+  `ToolTraceObserver` 5 类 record 派发与 request/result 跨 batch / checkpoint restart 配对、
+  跨 batch 延迟配对经真实 JSONL 后由 analyzer 验证 ``source_event_position`` 无倒退、``DurableHarnessConfig.tool_trace_path``
   装配开关与 ``tool_trace_v2_host`` schema 字面量边界。
 - P8-S3 attempt supervisor（`tests/host/test_phase8_attempt_supervisor.py`）：覆盖
   `AttemptSupervisor.lease_context` 正常 acquire / yield / 退出清理；renew loop 在 fake
@@ -271,7 +272,7 @@ Host 当前 Run harness、RunEventStore、ToolRuntime、Conversation Memory / Ru
   observer reconcile、durable memory recovery）通过 fake clock + deterministic fake worker
   覆盖。慢硬盘 + Docker Linux stress 测试由 GitHub issue #38 跟踪，不在当前测试集内。
 - public boundary：锁定 `dayu.host.__all__`，包根仅暴露当前 contracts 强类型契约
-  (`RunEvent` / `StartRunRequest` / `RunInputContextSnapshotBuiltData` / `ToolValueSizeSummary` 等)，并负向锁定
+  (`RunEvent` / `StartRunRequest` / `RunInputContextSnapshotBuiltData` 等)，并负向锁定
   旧 cursor / fetch_more public contract 不存在；Run 级
   `start_run` / `stream_run_events` / `get_run_result` 与 framework `fetch_more` 路径必须经 `LocalRunHarness` 实例 / 普通 tool call
   访问，阻止 `EngineWorker`、`LocalProxy`、

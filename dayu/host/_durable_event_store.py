@@ -704,6 +704,43 @@ class DurableRunEventStore:
             result.append((position, event))
         return tuple(result)
 
+    def fetch_run_events_by_type_before_position(
+        self,
+        *,
+        run_id: str,
+        event_type: RunEventType,
+        before: GlobalEventPosition,
+    ) -> tuple[tuple[GlobalEventPosition, RunEvent], ...]:
+        """读取指定 run 在某个全局位置前的同类事件。
+
+        Tool trace projection 用它在进程重启后从 durable EventLog 回查已经
+        checkpoint 的 ``TOOL_CALL_REQUESTED``，避免 request/result 分属不
+        同 batch 时只依赖进程内 pending 状态。
+
+        :param run_id: Run id。
+        :param event_type: 需要读取的 RunEvent 类型。
+        :param before: exclusive 全局位置上界。
+        :returns: ``(position, event)`` 二元组元组，按 position 降序。
+        :raises sqlite3.DatabaseError: 读取失败时抛出。
+        """
+
+        rows = self.storage.execute_read(
+            """
+            SELECT run_id, session_id, sequence, event_position, kind,
+                source, type, occurred_at, payload, source_engine_event_id
+            FROM host_run_events
+            WHERE run_id = ? AND type = ? AND event_position < ?
+            ORDER BY event_position DESC
+            """,
+            (run_id, event_type.value, before.value),
+        )
+        result: list[tuple[GlobalEventPosition, RunEvent]] = []
+        for row in rows:
+            event = _row_to_run_event(row)
+            position = GlobalEventPosition(value=int(row["event_position"]))
+            result.append((position, event))
+        return tuple(result)
+
     def fetch_events_for_session_by_position(
         self,
         *,

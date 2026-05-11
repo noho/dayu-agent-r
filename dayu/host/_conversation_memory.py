@@ -642,7 +642,10 @@ def _tool_fact_truncation_fields(
     truncation = extract_truncation_hint(outcome.result.value)
     if truncation is None:
         return None, None
-    return _fingerprint_text(truncation.cursor), truncation.has_more
+    cursor_fingerprint = (
+        None if truncation.cursor is None else _fingerprint_text(truncation.cursor)
+    )
+    return cursor_fingerprint, truncation.has_more
 
 
 def _summarize_tool_result(data: ToolResultAcceptedData) -> str:
@@ -663,7 +666,7 @@ def _summarize_tool_result(data: ToolResultAcceptedData) -> str:
                     f"工具结果已接纳：value={value_text}; truncated=true; "
                     f"has_more={truncation.has_more}; limit={truncation.limit}; "
                     f"ttl_seconds={truncation.ttl_seconds}; "
-                    f"cursor_fingerprint={_fingerprint_text(truncation.cursor)}"
+                    f"cursor_fingerprint={_optional_fingerprint_text(truncation.cursor)}"
                 ),
                 limit=_TOOL_FACT_SUMMARY_LIMIT,
             )
@@ -698,7 +701,7 @@ def _memory_safe_tool_value(value: JsonValue) -> JsonValue:
     }
     safe_truncation: dict[str, JsonValue] = {
         "has_more": truncation.has_more,
-        "cursor_fingerprint": _fingerprint_text(truncation.cursor),
+        "cursor_fingerprint": _optional_fingerprint_text(truncation.cursor),
     }
     if truncation.limit is not None:
         safe_truncation["limit"] = truncation.limit
@@ -717,6 +720,19 @@ def _fingerprint_text(value: str) -> str:
     """
 
     return hashlib.sha256(value.encode("utf-8")).hexdigest()[:_CURSOR_FINGERPRINT_LENGTH]
+
+
+def _optional_fingerprint_text(value: str | None) -> str | None:
+    """生成可空短文本指纹。
+
+    :param value: 原始文本；为 ``None`` 表示没有 raw cursor。
+    :returns: 短指纹或 ``None``。
+    :raises Exception: 不主动抛出异常。
+    """
+
+    if value is None:
+        return None
+    return _fingerprint_text(value)
 
 
 def _evidence_anchor_from_fact(fact: ConversationToolFact) -> EvidenceAnchor:

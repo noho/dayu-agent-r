@@ -61,6 +61,8 @@ from dayu.engine.contracts.engine_events import (
 from dayu.engine.contracts.partial_tool_call import PartialToolCallSummary
 from dayu.engine.contracts.finish_reason import FinishReason
 from dayu.host._credential_scrub import (
+    _scrub_text_credential_assignments,
+    scrub_explicit_credentials,
     scrub_tool_arguments,
     scrub_tool_execution_outcome,
 )
@@ -291,9 +293,13 @@ def _encode_fields(
         return {
             "iteration_id": data.iteration_id,
             "error_code": data.error_code,
-            "message": data.message,
+            "message": _scrub_text_credential_assignments(data.message),
             "provider_request_id": data.provider_request_id,
-            "raw_payload": data.raw_payload,
+            "raw_payload": (
+                None
+                if data.raw_payload is None
+                else scrub_explicit_credentials(data.raw_payload)
+            ),
             "partial_tool_calls": [
                 _encode_partial_tool_call_summary(item)
                 for item in data.partial_tool_calls
@@ -328,7 +334,7 @@ def _encode_fields(
     if isinstance(data, RunFailedData):
         return {
             "error_code": data.error_code,
-            "message": data.message,
+            "message": _scrub_text_credential_assignments(data.message),
             "recoverable": data.recoverable,
         }
     if isinstance(data, HostRunFailedData):
@@ -479,6 +485,8 @@ def _decode_fields(
             total_tokens=_get_int(fields, "total_tokens"),
         )
     if event_type is RunEventType.PROVIDER_PROTOCOL_ERROR:
+        if "partial_tool_calls" not in fields:
+            raise ValueError(_ERROR_INVALID_FIELDS)
         return ProviderProtocolErrorData(
             iteration_id=_get_str(fields, "iteration_id"),
             error_code=_get_str(fields, "error_code"),
@@ -486,7 +494,7 @@ def _decode_fields(
             provider_request_id=_get_optional_str(fields, "provider_request_id"),
             raw_payload=fields.get("raw_payload"),
             partial_tool_calls=_decode_partial_tool_call_summaries(
-                fields.get("partial_tool_calls")
+                fields["partial_tool_calls"]
             ),
         )
     if event_type is RunEventType.RUNNER_DONE:
@@ -669,8 +677,6 @@ def _decode_partial_tool_call_summaries(
     :raises ValueError: 字段非法时抛出。
     """
 
-    if value is None:
-        return ()
     if not isinstance(value, list):
         raise ValueError(_ERROR_INVALID_FIELDS)
     return tuple(_decode_partial_tool_call_summary(item) for item in value)

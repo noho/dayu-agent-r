@@ -32,7 +32,10 @@ from dayu.host._tool_result_truncation import (
     extract_truncation_hint,
 )
 from dayu.host._tool_runtime import HostToolRuntime
-from dayu.host._runtime_truncate_manager import _replace_path
+from dayu.host._runtime_truncate_manager import (
+    _DEFAULT_CURSOR_TTL_SECONDS,
+    _replace_path,
+)
 
 
 @dataclass(frozen=True, slots=True)
@@ -435,6 +438,11 @@ async def test_tool_runtime_debug_logs_tool_call_boundary_without_secret() -> No
             _spec("binary_bytes", "max_bytes", 2),
             "YWI=",
         ),
+        (
+            cast(JsonValue, bytearray(b"abcd")),
+            _spec("binary_bytes", "max_bytes", 2),
+            "YWI=",
+        ),
     ],
 )
 async def test_truncation_strategies(
@@ -474,6 +482,26 @@ async def test_binary_bytes_fetch_more_returns_base64_json_string() -> None:
 
     assert isinstance(fetch_outcome, ToolCompletedOutcome)
     assert _content_value(fetch_outcome.result.value) == "Y2Q="
+
+
+@pytest.mark.asyncio
+async def test_infinite_timeout_uses_default_cursor_ttl() -> None:
+    """工具 timeout 为无穷大时 cursor TTL 回退默认值，不抛 OverflowError。"""
+
+    runtime, _store = await _runtime(
+        value="abcdef",
+        spec=_spec("text_chars", "max_chars", 3, ttl_seconds=None),
+    )
+    request = replace(
+        _request(),
+        context=replace(_request().context, timeout_seconds=float("inf")),
+    )
+
+    outcome = await runtime.execute_tool_call(request)
+
+    assert isinstance(outcome, ToolCompletedOutcome)
+    truncation = _required_truncation(outcome.result.value)
+    assert truncation.ttl_seconds == _DEFAULT_CURSOR_TTL_SECONDS
 
 
 @pytest.mark.asyncio

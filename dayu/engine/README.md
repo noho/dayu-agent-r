@@ -70,7 +70,7 @@ Runner 只产出 `RunnerEvent`。RunnerEvent 不包含 Host 治理字段，不�
 - `PROVIDER_PROTOCOL_ERROR` -> `PROVIDER_PROTOCOL_ERROR`
   - 若流式 provider failure 前已经解析到未完成 tool call delta，事件 data
     携带 bounded `partial_tool_calls` 摘要；该摘要不包含 raw arguments，
-    也不驱动工具执行。
+    provider-controlled `tool_call_id` 也会被长度边界约束，且不驱动工具执行。
 - `RUNNER_HTTP_ERROR(context_length_exceeded)` -> `CONTEXT_COMPACTION_REQUESTED`，随后由 recoverable
   `RUN_FAILED(context_compaction_required)` 收口；Host 决定是否 compact / retry
 - `RUNNER_DONE` -> `RUNNER_DONE`

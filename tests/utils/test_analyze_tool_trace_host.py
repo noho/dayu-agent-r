@@ -88,8 +88,6 @@ def _tool_call_record(
     truncation_has_more: bool | None = None,
     truncation_scope_token: str | None = None,
     truncation_cursor: str | None = None,
-    fetch_more_consumed_cursor: str | None = None,
-    fetch_more_next_cursor: str | None = None,
     tool_call_id: str = "tc-1",
     run_id: str = _RUN_ID,
     tool_name: str = _TOOL_NAME,
@@ -125,12 +123,6 @@ def _tool_call_record(
         "truncation_cursor": truncation_cursor,
         "truncation_has_more": truncation_has_more,
         "truncation_limit": None,
-        "fetch_more_consumed_cursor": fetch_more_consumed_cursor,
-        "fetch_more_next_cursor": fetch_more_next_cursor,
-        "fetch_more_chunk_size": None,
-        "fetch_more_has_more": None,
-        "cursor_denial_reason": None,
-        "cursor_expired_at_monotonic": None,
     }
     return record
 
@@ -316,16 +308,16 @@ def test_analyzer_ignores_legacy_fetch_more_projection_fields(
 ) -> None:
     """旧专属 fetch_more 字段不能替代 ordinary fetch_more tool call 事实。"""
 
-    truncated = _tool_call_record(
+    truncated = dict(_tool_call_record(
         idempotency_key="trunc-legacy",
         source_event_position=1,
         tool_call_id="tc-trunc",
         truncation_has_more=True,
         truncation_scope_token="scope-A",
         truncation_cursor="cur-A",
-        fetch_more_consumed_cursor="cur-A",
-        fetch_more_next_cursor="cur-B",
-    )
+    ))
+    truncated["fetch_more_consumed_cursor"] = "cur-A"
+    truncated["fetch_more_next_cursor"] = "cur-B"
     _write_jsonl(
         trace_root=tmp_path,
         session_id=_SESSION_ID,

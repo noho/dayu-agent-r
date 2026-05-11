@@ -47,7 +47,6 @@ _EXPECTED_HOST_CONTRACT_EXPORTS: frozenset[str] = frozenset(
         "RunSucceededResult",
         "RunSuspendedResult",
         "StartRunRequest",
-        "ToolValueSizeSummary",
         "UserInputAcceptedData",
         "UserInputScope",
     }

@@ -15,6 +15,7 @@ import copy
 import hashlib
 import hmac
 import json
+import math
 import secrets
 import threading
 import time
@@ -382,7 +383,6 @@ class RuntimeTruncateManager:
             next_record: _RuntimeCursorRecord | None = None
             if has_more:
                 next_record = self._build_cursor_from_record(
-                    request=parsed.request,
                     record=record,
                     offset=new_offset,
                 )
@@ -536,20 +536,17 @@ class RuntimeTruncateManager:
     def _build_cursor_from_record(
         self,
         *,
-        request: ToolExecutionRequest,
         record: _RuntimeCursorRecord,
         offset: int,
     ) -> _RuntimeCursorRecord:
         """从已消费记录构建下一页 cursor。
 
-        :param request: 当前 framework 工具执行请求。
         :param record: 已消费 cursor 记录。
         :param offset: 下一页起始 offset。
         :returns: 新 cursor 记录。
         :raises Exception: 不主动抛出异常。
         """
 
-        _ = request
         return self._build_cursor_record(
             session_id=record.session_id,
             run_id=record.run_id,
@@ -782,7 +779,7 @@ def _resolve_ttl_seconds(
 
     if spec.ttl_seconds is not None and spec.ttl_seconds > 0:
         return spec.ttl_seconds
-    if timeout_seconds is not None and timeout_seconds > 0:
+    if timeout_seconds is not None and math.isfinite(timeout_seconds) and timeout_seconds > 0:
         return max(1, int(timeout_seconds))
     return _DEFAULT_CURSOR_TTL_SECONDS
 

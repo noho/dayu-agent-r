@@ -169,9 +169,11 @@ P7 已落地：
   ``iteration_context_snapshot``、``iteration_usage``、``final_response``、
   ``provider_protocol_error``；按 ``(iteration_id, tool_call_id)``
   配对 ``TOOL_CALL_REQUESTED`` + ``TOOL_RESULT_ACCEPTED``；request/result 可以跨 checkpoint batch 配对，
-  batch limit 只影响吞吐，不改变配对语义。事件 data 类型不匹配时抛
-  `ProjectionSchemaError` -> `BLOCKED_FAILED`。``record_role`` /
-  ``source_event_position`` 进入 sha256[:32] ``idempotency_key`` 让
+  batch limit 只影响吞吐，不改变配对语义；如果进程在 request checkpoint 后重启，observer 会从 durable
+  EventLog 回查已落库 request 完成配对。事件 data 类型不匹配时抛
+  `ProjectionSchemaError` -> `BLOCKED_FAILED`。``tool_call`` record 在 accepted/result event
+  到达后才完成写出，因此其 ``source_event_position`` 使用 accepted/result event position，避免合法延迟配对在
+  JSONL 写出序中表现为 position 倒退。``record_role`` / ``source_event_position`` 进入 sha256[:32] ``idempotency_key`` 让
   analyzer 去重重放副本。该 observer 是非 required projection，JSONL / blob
   I/O 发生在 checkpoint transaction 外；I/O 成功但 checkpoint 失败时允许重放
   产生重复行，读侧按 ``idempotency_key`` 去重。
@@ -183,8 +185,8 @@ P7 已落地：
   再把 raw payload 写入
   ``<root>/raw_payloads/<encoded-run-id>_<encoded-iteration-id>/<encoded-blob-id>.json``，先 tmp +
   ``os.replace`` 原子落地；校验失败抛 `ProjectionSchemaError`，checkpoint
-  不推进。``PROVIDER_PROTOCOL_ERROR`` 的 ``raw_payload``
-  在落盘前由 `_scrub_provider_secret` 替换 ``Authorization`` /
+  不推进。``PROVIDER_PROTOCOL_ERROR`` 的 ``message`` 与 ``raw_payload``
+  在落盘前清洗显式凭证，其中 raw payload 由 `_scrub_provider_secret` 替换 ``Authorization`` /
   ``api_key`` / ``cookie`` / ``x-api-key`` 等敏感键与字符串 header 为
   ``"***"``；缺失
   payload 时 fallback 到 ``{"reason": "omitted_no_payload"}``；partial
@@ -251,7 +253,6 @@ P8 已落地：
 - Host-owned event data：`HostRunFailedData`、`UserInputAcceptedData`、`UserInputScope`。
 - Run input context fact data：`RunInputContextSnapshotBuiltData`、`RunInputContextMeta`、
   `RunInputMessageSummary`、`RunInputToolSchemaSummary`。
-- Tool value 摘要：`ToolValueSizeSummary`。
 - Run 终态结果类型：`RunResult`、`RunSucceededResult`、`RunFailedResult`、`RunCancelledResult`、`RunSuspendedResult`。
 - Host context compact 事实类型：`HostContextOverflowObservedData`、`HostContextCompactRequestedData`、
   `HostContextCompactCompletedData`、`HostContextCompactFailedData`、`HostContextAttemptRetryData`、

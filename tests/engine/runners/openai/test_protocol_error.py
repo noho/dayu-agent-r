@@ -13,6 +13,9 @@ from dayu.engine.contracts.runner_events import (
     RunnerEventType,
     RunnerProtocolErrorData,
 )
+from dayu.engine.contracts.partial_tool_call import (
+    PARTIAL_TOOL_CALL_ID_MAX_CHARS,
+)
 from dayu.engine.runners.openai.non_stream_parser import (
     parse_non_stream_response,
 )
@@ -80,6 +83,45 @@ async def test_sse_invalid_json_reports_bounded_partial_tool_call() -> None:
     assert partials[0].name_fragment == "lookup"
     assert partials[0].arguments_byte_size > 0
     assert partials[0].arguments_sha256 is not None
+
+
+@pytest.mark.asyncio
+async def test_sse_partial_tool_call_summary_bounds_tool_call_id() -> None:
+    """provider 控制的超长 tool_call_id 不得原样进入 partial 摘要。"""
+
+    long_id = "call-" + ("x" * (PARTIAL_TOOL_CALL_ID_MAX_CHARS + 100))
+    payload_json = json.dumps(
+        {
+            "choices": [
+                {
+                    "delta": {
+                        "tool_calls": [
+                            {
+                                "index": 0,
+                                "id": long_id,
+                                "type": "function",
+                                "function": {
+                                    "name": "lookup",
+                                    "arguments": '{"ticker":',
+                                },
+                            }
+                        ]
+                    }
+                }
+            ]
+        },
+        separators=(",", ":"),
+    )
+
+    events = await parse_sse([_sse_json_chunk(payload_json), b"data: nope\n\n"])
+
+    protocol_errors = [
+        e.data for e in events if isinstance(e.data, RunnerProtocolErrorData)
+    ]
+    assert len(protocol_errors) == 1
+    partial = protocol_errors[0].partial_tool_calls[0]
+    assert partial.tool_call_id == long_id[:PARTIAL_TOOL_CALL_ID_MAX_CHARS]
+    assert partial.tool_call_id != long_id
 
 
 @pytest.mark.asyncio

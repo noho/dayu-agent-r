@@ -613,6 +613,7 @@ class LocalRunHarness:
         """
 
         accepted_input = _extract_accepted_start_input(request=request)
+        self._engine_visible_request(request)
         current_user_event = await self.event_store.append(
             user_input_accepted_draft(
                 run_id=request.run_id,
@@ -789,17 +790,25 @@ class LocalRunHarness:
         attempt_index = 0
         event_count = 0
         terminal_seen = False
-        current_active_attempt: _ActiveAttempt | None = await self._begin_attempt_if_durable(
-            request=request,
-            attempt_index=attempt_index,
-        )
-        _LOGGER.log(
-            VERBOSE_LOG_LEVEL,
-            "host.run.background_start session_id=%s run_id=%s",
-            request.session_id,
-            request.run_id,
-        )
+        current_active_attempt: _ActiveAttempt | None = None
         try:
+            try:
+                current_active_attempt = await self._begin_attempt_if_durable(
+                    request=request,
+                    attempt_index=attempt_index,
+                )
+            except Exception as exc:
+                terminal_seen = await self._append_initial_admission_failure_terminal(
+                    request=request,
+                    error=exc,
+                )
+                return
+            _LOGGER.log(
+                VERBOSE_LOG_LEVEL,
+                "host.run.background_start session_id=%s run_id=%s",
+                request.session_id,
+                request.run_id,
+            )
             while True:
                 overflow_trigger_seen = False
                 overflow_observed_seen = False
@@ -1110,18 +1119,44 @@ class LocalRunHarness:
                             attempt_request = next_request
                             attempt_index = new_attempt_index
                             current_active_attempt = new_active_attempt
-                            await self._append_run_input_context_snapshot_fact(
-                                request=attempt_request,
-                                build_trace=compact_trace,
-                                current_user_event=current_user_event,
-                                attempt_index=attempt_index,
-                                iteration_index=0,
-                                iteration_id=_iteration_id_for_attempt(
-                                    run_id=attempt_request.run_id,
+                            try:
+                                await self._append_run_input_context_snapshot_fact(
+                                    request=attempt_request,
+                                    build_trace=compact_trace,
+                                    current_user_event=current_user_event,
                                     attempt_index=attempt_index,
-                                ),
-                                active_attempt=current_active_attempt,
-                            )
+                                    iteration_index=0,
+                                    iteration_id=_iteration_id_for_attempt(
+                                        run_id=attempt_request.run_id,
+                                        attempt_index=attempt_index,
+                                    ),
+                                    active_attempt=current_active_attempt,
+                                )
+                            except AttemptFencingError:
+                                try:
+                                    terminal_seen = await self._handle_owner_lost(
+                                        request=attempt_request,
+                                        active_attempt=current_active_attempt,
+                                        loss_reason=AttemptOwnerLossReason.FENCED,
+                                        event_count=event_count,
+                                        terminal_seen=terminal_seen,
+                                    )
+                                finally:
+                                    current_active_attempt = None
+                                return
+                            except Exception as snapshot_exc:
+                                terminal_seen = await self._append_run_input_context_snapshot_failure_terminal(
+                                    request=attempt_request,
+                                    active_attempt=current_active_attempt,
+                                    error=snapshot_exc,
+                                )
+                                if (
+                                    terminal_seen
+                                    and current_active_attempt is not None
+                                    and self._can_atomic_terminal_close(current_active_attempt)
+                                ):
+                                    current_active_attempt = None
+                                return
                             continue
                         terminal_seen = await self._append_missing_terminal_failure_if_needed(
                             request=attempt_request,
@@ -1541,6 +1576,77 @@ class LocalRunHarness:
             after_token_estimate=completed_data.after_token_estimate,
         )
 
+    async def _append_initial_admission_failure_terminal(
+        self,
+        *,
+        request: StartRunRequest,
+        error: Exception,
+    ) -> bool:
+        """初始 attempt admission 失败后追加 Host-owned 失败终态。
+
+        本路径发生在 ``USER_INPUT_ACCEPTED`` 已经落库、但首个 durable
+        attempt owner 尚未取得时。此时没有 active owner 可用于
+        attempt-scoped append；为了避免 run 停在“已接纳无终态”，Host 以
+        普通 EventLog terminal 事实收口。
+
+        :param request: start_run 请求。
+        :param error: admission 失败异常。
+        :returns: 已写入 terminal 时返回 ``True``。
+        :raises Exception: terminal append 失败时透传。
+        """
+
+        _LOGGER.error(
+            "host.run.initial_attempt_admission_failed session_id=%s run_id=%s exc_type=%s",
+            request.session_id,
+            request.run_id,
+            type(error).__name__,
+            exc_info=(type(error), error, error.__traceback__),
+        )
+        stored_event = await self.event_store.append(
+            host_failure_draft(
+                run_id=request.run_id,
+                session_id=request.session_id,
+                occurred_at=datetime.now(tz=timezone.utc),
+                error=error,
+            )
+        )
+        return terminal_result_from_event(stored_event) is not None
+
+    async def _append_run_input_context_snapshot_failure_terminal(
+        self,
+        *,
+        request: StartRunRequest,
+        active_attempt: "_ActiveAttempt | None",
+        error: Exception,
+    ) -> bool:
+        """compact retry snapshot fact 写入失败后追加 Host-owned 失败终态。
+
+        :param request: 当前 attempt 请求。
+        :param active_attempt: 已 acquire 的新 attempt；若具备 supervisor
+            owner，则 terminal append 与 attempt close 走原子路径。
+        :param error: snapshot fact 写入失败异常。
+        :returns: 已写入 terminal 时返回 ``True``。
+        :raises Exception: terminal append 失败时透传。
+        """
+
+        _LOGGER.error(
+            "host.run.context_snapshot_fact_failed session_id=%s run_id=%s exc_type=%s",
+            request.session_id,
+            request.run_id,
+            type(error).__name__,
+            exc_info=(type(error), error, error.__traceback__),
+        )
+        stored_event = await self._append_terminal_draft_for_active_attempt(
+            active_attempt=active_attempt,
+            draft=host_failure_draft(
+                run_id=request.run_id,
+                session_id=request.session_id,
+                occurred_at=datetime.now(tz=timezone.utc),
+                error=error,
+            ),
+        )
+        return terminal_result_from_event(stored_event) is not None
+
     async def _append_overflow_acquire_failure_terminal(
         self,
         *,
@@ -1714,7 +1820,7 @@ class LocalRunHarness:
             engine_error_code = data.error_code
             recoverable = data.recoverable
             reason = data.message
-        if isinstance(data, ContextCompactionRequestedData):
+        elif isinstance(data, ContextCompactionRequestedData):
             recoverable = True
             reason = data.reason
         _LOGGER.log(

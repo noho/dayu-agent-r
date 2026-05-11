@@ -748,6 +748,54 @@ async def test_scoped_appender_appends_when_owner_active() -> None:
 
 
 @pytest.mark.asyncio
+async def test_verify_active_owner_accepts_current_owner() -> None:
+    """``verify_active_owner`` 对当前 owner CAS 命中时不抛异常。"""
+
+    storage = _open_storage()
+    try:
+        await _seed_run(storage)
+        clock = _FakeClock()
+        supervisor = _build_supervisor(storage=storage, clock=clock)
+        async with supervisor.lease_context(
+            run_id="r1", attempt_index=0
+        ) as owner_context:
+            appender = supervisor.scoped_appender(owner_context)
+            await appender.verify_active_owner(run_id="r1")
+    finally:
+        storage.close()
+
+
+@pytest.mark.asyncio
+async def test_verify_active_owner_rejects_fenced_owner() -> None:
+    """``verify_active_owner`` 对 stale owner CAS miss 时抛 typed fencing error。"""
+
+    storage = _open_storage()
+    try:
+        await _seed_run(storage)
+        clock = _FakeClock()
+        supervisor = _build_supervisor(storage=storage, clock=clock)
+        async with supervisor.lease_context(
+            run_id="r1", attempt_index=0
+        ) as owner_context:
+            appender = supervisor.scoped_appender(owner_context)
+            other_owner_token = AttemptOwnerToken.new()
+            async with storage.transaction() as tx:
+                tx.execute(
+                    "UPDATE host_attempts SET owner_token_hash = ?, "
+                    "fencing_token = ? WHERE attempt_id = ?",
+                    (
+                        other_owner_token.digest(),
+                        owner_context.fencing_token.value + 9000,
+                        owner_context.attempt_id,
+                    ),
+                )
+            with pytest.raises(AttemptFencingError):
+                await appender.verify_active_owner(run_id="r1")
+    finally:
+        storage.close()
+
+
+@pytest.mark.asyncio
 async def test_append_in_transaction_appends_within_outer_transaction() -> None:
     """``append_in_transaction``: 外层事务内 owner 仍 active 时正常 append。
 

@@ -95,6 +95,7 @@ from dayu.host.contracts import (
     HostRunFailedData,
     RunEvent,
     RunEventDraft,
+    RunFailedResult,
     RunEventKind,
     RunEventSource,
     RunEventType,
@@ -780,6 +781,54 @@ async def test_lease_context_propagates_acquire_fencing_error() -> None:
         assert excinfo.value.reason is AttemptFencingReason.STORAGE_CONFLICT
     finally:
         storage.close()
+
+
+@pytest.mark.asyncio
+async def test_start_run_initial_attempt_busy_writes_terminal_failure() -> None:
+    """首个 attempt acquire BUSY 不得留下 USER_INPUT_ACCEPTED 无终态。"""
+
+    bundle = build_durable_harness(
+        config=DurableHarnessConfig(database_path=":memory:")
+    )
+    clock = _FakeClock()
+    supervisor = AttemptSupervisor(
+        storage=bundle.storage,
+        lease_store=cast(AttemptLeaseStore, _BusyStore(clock=clock)),
+        lease_config=AttemptLeaseConfig(
+            ttl=timedelta(seconds=30),
+            renew_interval=timedelta(milliseconds=10),
+            owner_id_prefix="host-test",
+        ),
+        clock=clock,
+        event_store=bundle.event_store,
+    )
+    from dayu.host._proxy import WorkerProxy
+    from dayu.host._run_harness import LocalRunHarness
+
+    harness = LocalRunHarness(
+        is_durable=True,
+        proxy=cast(WorkerProxy, _FencingProxy()),
+        event_store=bundle.event_store,
+        tool_runtime=bundle.harness.tool_runtime,
+        memory_store=bundle.memory_store,
+        coordinator=bundle.coordinator,
+        attempt_supervisor=supervisor,
+        storage=bundle.storage,
+    )
+    try:
+        stream = await harness.start_run(
+            _minimal_start_request(session_id="s-busy", run_id="r-busy")
+        )
+        events = [event async for event in stream.events]
+
+        assert [event.type for event in events] == [
+            RunEventType.USER_INPUT_ACCEPTED,
+            RunEventType.RUN_FAILED,
+        ]
+        result = bundle.run_state_store.get_terminal_result("r-busy")
+        assert isinstance(result, RunFailedResult)
+    finally:
+        bundle.close()
 
 
 @pytest.mark.asyncio

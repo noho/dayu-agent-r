@@ -282,22 +282,6 @@ HostContextCompactEventData: TypeAlias = (
 
 
 @dataclass(frozen=True, slots=True)
-class ToolValueSizeSummary:
-    """工具结果值大小摘要。
-
-    :param unit: 摘要单位。
-    :param size: 当前值大小。
-    :param total_estimate: 原始总量估计。
-    :param fingerprint: 当前值摘要指纹。
-    """
-
-    unit: str
-    size: int
-    total_estimate: int
-    fingerprint: str
-
-
-@dataclass(frozen=True, slots=True)
 class RunInputMessageSummary:
     """RunInput 单条消息的热层摘要。
 
@@ -649,7 +633,6 @@ __all__ = [
     "HostRunFailedData",
     "UserInputAcceptedData",
     "UserInputScope",
-    "ToolValueSizeSummary",
     "RunCancelledResult",
     "RunEventData",
     "RunEvent",

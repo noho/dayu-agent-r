@@ -9,7 +9,9 @@ checkpoint transaction。
 
 - ``TOOL_CALL_REQUESTED`` + ``TOOL_RESULT_ACCEPTED``（按
   ``(iteration_id, tool_call_id)`` 跨 checkpoint batch 配对）-> 一条
-  :class:`ToolCallRecord`。截断信息只来自普通 accepted outcome payload。
+  :class:`ToolCallRecord`；record 在 accepted 到达后才完成写出，因此
+  ``source_event_position`` 使用 accepted event position。截断信息只来自
+  普通 accepted outcome payload。
 - ``RUNNER_USAGE_RECORDED`` -> :class:`IterationUsageRecord`。
 - ``FINAL_ANSWER`` -> :class:`FinalResponseRecord`（``iteration_id`` 为
   空字符串，因为 ``FinalAnswerData`` 不携带 iteration 维度）。
@@ -48,7 +50,9 @@ from dayu.host._event_observer import (
     ObserverSink,
     ProjectionEventEnvelope,
 )
+from dayu.host._durable_event_store import DurableRunEventStore
 from dayu.host._credential_scrub import (
+    _scrub_text_credential_assignments,
     scrub_tool_arguments,
     scrub_tool_execution_outcome,
 )
@@ -118,10 +122,13 @@ class ToolTraceObserver(ObserverSink, NonTransactionalObserverSink):
     :param jsonl_sink: 实际负责文件写入的 sink。
     :param raw_payload_storage: RunInput raw payload side-store 读连接；为
         ``None`` 时 snapshot fact 读取会失败。
+    :param event_store: durable EventLog 读连接；用于进程重启后回查已
+        checkpoint 的 tool request 事件。
     """
 
     jsonl_sink: ToolTraceJsonlSink
     raw_payload_storage: HostStorage | None = None
+    event_store: DurableRunEventStore | None = None
     _schema_version_str: str = field(default=ToolTraceSchemaVersion.TOOL_TRACE_V2_HOST.value, init=False)
     _pending_tool_call_groups: dict[tuple[str, str], _ToolCallGroup] = field(
         default_factory=dict,
@@ -248,9 +255,40 @@ class ToolTraceObserver(ObserverSink, NonTransactionalObserverSink):
             group.requested = envelope
         elif event_type is RunEventType.TOOL_RESULT_ACCEPTED:
             group.accepted = envelope
+            if group.requested is None:
+                group.requested = self._load_requested_from_eventlog(accepted=envelope)
         if group.requested is not None and group.accepted is not None:
-            self._emit_tool_call(key=key, group=group)
             self._pending_tool_call_groups.pop(key, None)
+            self._emit_tool_call(key=key, group=group)
+
+    def _load_requested_from_eventlog(
+        self,
+        *,
+        accepted: ProjectionEventEnvelope,
+    ) -> ProjectionEventEnvelope | None:
+        """从 durable EventLog 回查 accepted 对应的 requested 事件。
+
+        :param accepted: 当前 ``TOOL_RESULT_ACCEPTED`` envelope。
+        :returns: 找到时返回 requested envelope；未配置 durable store 或未命中
+            时返回 ``None``。
+        :raises ProjectionSchemaError: accepted/requested data 类型不匹配。
+        :raises Exception: EventLog 读取失败时透传。
+        """
+
+        event_store = self.event_store
+        if event_store is None:
+            return None
+        accepted_key = _tool_call_group_key(envelope=accepted)
+        rows = event_store.fetch_run_events_by_type_before_position(
+            run_id=accepted.event.run_id,
+            event_type=RunEventType.TOOL_CALL_REQUESTED,
+            before=accepted.position,
+        )
+        for position, event in rows:
+            candidate = ProjectionEventEnvelope(position=position, event=event)
+            if _tool_call_group_key(envelope=candidate) == accepted_key:
+                return candidate
+        return None
 
     def _emit_tool_call(
         self,
@@ -289,7 +327,10 @@ class ToolTraceObserver(ObserverSink, NonTransactionalObserverSink):
             truncation_limit,
         ) = _summarize_truncation(outcome=scrubbed_outcome)
         iteration_id, tool_call_id = key
-        source_event_position = group.requested.position.value
+        # tool_call record 是 request/result 配对完成后的投影事实；
+        # request 可能早于 usage 在旧 batch 到达，使用 accepted position
+        # 才能表达该 JSONL record 的完成来源并保持写出序单调。
+        source_event_position = group.accepted.position.value
         idempotency_key = compute_idempotency_key(
             schema_version=self._schema_version_str,
             trace_type=ToolTraceRecordType.TOOL_CALL.value,
@@ -324,12 +365,6 @@ class ToolTraceObserver(ObserverSink, NonTransactionalObserverSink):
             truncation_cursor=truncation_cursor,
             truncation_has_more=truncation_has_more,
             truncation_limit=truncation_limit,
-            fetch_more_consumed_cursor=None,
-            fetch_more_next_cursor=None,
-            fetch_more_chunk_size=None,
-            fetch_more_has_more=None,
-            cursor_denial_reason=None,
-            cursor_expired_at_monotonic=None,
         )
         self.jsonl_sink.append_record_line(
             session_id=requested_event.session_id,
@@ -454,7 +489,7 @@ class ToolTraceObserver(ObserverSink, NonTransactionalObserverSink):
             source_event_position=envelope.position.value,
             iteration_id=data.iteration_id,
             error_code=data.error_code,
-            message=data.message,
+            message=_scrub_text_credential_assignments(data.message),
             provider_request_id=data.provider_request_id,
             raw_payload_json=raw_payload_json,
             partial_tool_calls_json=json.dumps(

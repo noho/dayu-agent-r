@@ -98,14 +98,16 @@ class FrameworkToolSet:
         async def _fetch_more(
             request: ToolExecutionRequest,
         ) -> ToolExecutionOutcome:
-            """执行 Host 私有 framework 补读工具。
+            """标记 Host 私有 framework 补读工具的 schema callable。
 
             :param request: Engine 发起的普通工具执行请求。
-            :returns: 普通工具执行 outcome。
-            :raises Exception: manager 内部终态检查失败时透传。
+            :returns: 不返回；真实执行路径由 ``HostToolRuntime`` 拦截。
+            :raises AssertionError: 该 callable 被直接执行时抛出。
             """
 
-            return await manager.fetch_more(request)
+            _ = manager
+            _ = request
+            raise AssertionError("framework fetch_more must be intercepted by HostToolRuntime")
 
         return _fetch_more
 

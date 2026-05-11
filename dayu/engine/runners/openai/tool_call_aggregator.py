@@ -27,7 +27,10 @@ from dayu.contracts.tool_call import (
     ToolCallProviderState,
     ToolCallRequest,
 )
-from dayu.engine.contracts.partial_tool_call import PartialToolCallSummary
+from dayu.engine.contracts.partial_tool_call import (
+    PARTIAL_TOOL_CALL_ID_MAX_CHARS,
+    PartialToolCallSummary,
+)
 from dayu.engine.contracts.runner_events import RunnerProtocolErrorData
 from dayu.engine.runners.openai._types import _OpenAIToolCallDelta
 
@@ -354,7 +357,7 @@ class ToolCallAggregator:
             summaries.append(
                 PartialToolCallSummary(
                     tool_call_index=index,
-                    tool_call_id=partial.tool_call_id,
+                    tool_call_id=_bounded_tool_call_id(partial.tool_call_id),
                     name_fragment=_bounded_name_fragment(partial.name),
                     arguments_byte_size=len(
                         partial.arguments_buffer.encode("utf-8")
@@ -400,6 +403,19 @@ class ToolCallAggregator:
             )
             return None
         return parsed
+
+
+def _bounded_tool_call_id(value: str | None) -> str | None:
+    """返回有界 provider tool call id 片段。
+
+    :param value: provider 已给出的 tool call id；未知为 ``None``。
+    :returns: 不超过 :data:`PARTIAL_TOOL_CALL_ID_MAX_CHARS` 的 id 片段。
+    :raises Exception: 不主动抛出异常。
+    """
+
+    if value is None:
+        return None
+    return value[:PARTIAL_TOOL_CALL_ID_MAX_CHARS]
 
 
 __all__ = [

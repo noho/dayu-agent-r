@@ -8,6 +8,7 @@ from __future__ import annotations
 
 import re
 from collections.abc import Mapping
+from typing import assert_never
 
 from dayu.contracts import JsonValue
 from dayu.contracts.tool_outcome import (
@@ -127,7 +128,7 @@ def scrub_tool_execution_outcome(
         )
     if isinstance(outcome, ToolAwaitingOutcome):
         return outcome
-    return outcome
+    assert_never(outcome)
 
 
 def _is_explicit_credential_key(key: str) -> bool:

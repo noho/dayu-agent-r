@@ -116,6 +116,8 @@ def extract_truncation_hint(value: JsonValue) -> ToolResultTruncationHint | None
     has_more = payload.get(TRUNCATION_HAS_MORE_FIELD)
     if not isinstance(has_more, bool):
         return None
+    if not has_more:
+        return None
     fetch_more_args = payload.get(TRUNCATION_FETCH_MORE_ARGS_FIELD)
     cursor: str = ""
     scope_token: str = ""
@@ -130,7 +132,7 @@ def extract_truncation_hint(value: JsonValue) -> ToolResultTruncationHint | None
             scope_token = scope_token_value
         if isinstance(limit_value, int) and not isinstance(limit_value, bool):
             limit = limit_value
-    if has_more and (cursor == "" or scope_token == ""):
+    if cursor == "" or scope_token == "":
         return None
     ttl_value = payload.get(TRUNCATION_TTL_SECONDS_FIELD)
     ttl_seconds: int | None = None

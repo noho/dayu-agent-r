@@ -35,7 +35,6 @@ EXPECTED_EXPORTS: frozenset[str] = frozenset(
         "RunSucceededResult",
         "RunSuspendedResult",
         "StartRunRequest",
-        "ToolValueSizeSummary",
         "UserInputAcceptedData",
         "UserInputScope",
     }
