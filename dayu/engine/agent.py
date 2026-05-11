@@ -544,7 +544,7 @@ class _AsyncAgent:
                         )
                     )
                     return
-                if self._is_cancelled():
+                if self._is_cancelled() and not state.done_seen:
                     yield await self._make_cancelled_terminal_with_close()
                     return
 
@@ -592,7 +592,7 @@ class _AsyncAgent:
                             continuation_active or bool(continuation_content_parts),
                             continuation_decision.degraded,
                         )
-                        yield await self._make_final_or_cancelled_after_close(
+                        yield await self._make_final_after_close(
                             continuation_decision
                         )
                         return
@@ -611,7 +611,7 @@ class _AsyncAgent:
                         continuation_attempts += 1
                         continuation_active = True
                         continue
-                    yield await self._make_final_or_cancelled_after_close(decision)
+                    yield await self._make_final_after_close(decision)
                     return
                 if isinstance(decision, RunFailedData):
                     yield await self._make_failed_or_cancelled_terminal_with_close(
@@ -934,6 +934,9 @@ class _AsyncAgent:
                 )
                 if engine_event is not None:
                     yield engine_event
+                if self._is_cancelled():
+                    yield await self._make_cancelled_terminal_with_close()
+                    return
             runner_call_completed_failure = self._log_runner_call_completed(
                 iteration_id=iteration_id,
                 iteration_index=iteration_index,
@@ -1369,9 +1372,6 @@ class _AsyncAgent:
                 return
             completed_outcome = outcome.value
 
-            if self._is_cancelled():
-                yield await self._make_cancelled_terminal_with_close()
-                return
             if isinstance(completed_outcome, ToolAwaitingOutcome):
                 yield self._make_event(
                     event_type=EngineEventType.TOOL_AWAITING,
@@ -1396,10 +1396,7 @@ class _AsyncAgent:
                     call.tool_call_id,
                     completed_outcome.await_spec.await_kind.value,
                 )
-                if self._is_cancelled():
-                    yield await self._make_cancelled_terminal_with_close()
-                    return
-                yield await self._make_suspended_or_cancelled_terminal_with_close(
+                yield await self._make_suspended_terminal_with_close(
                     completed_outcome
                 )
                 return
@@ -1621,7 +1618,7 @@ class _AsyncAgent:
                 )
             )
             return
-        if self._is_cancelled():
+        if self._is_cancelled() and not state.done_seen:
             yield await self._make_cancelled_terminal_with_close()
             return
         decision = self._classify_iteration(
@@ -1654,20 +1651,18 @@ class _AsyncAgent:
                 )
             )
             return
-        yield await self._make_final_or_cancelled_after_close(decision)
+        yield await self._make_final_after_close(decision)
 
-    async def _make_final_or_cancelled_after_close(
+    async def _make_final_after_close(
         self, decision: _FinalDecision
     ) -> EngineEvent:
-        """构造最终回答或取消终态。
+        """构造最终回答终态。
 
         :param decision: final answer 决策。
         :returns: terminal EngineEvent。
         :raises Exception: 不主动抛出异常。
         """
 
-        if self._is_cancelled():
-            return await self._make_cancelled_terminal_with_close()
         return self._make_terminal_final(
             FinalAnswerData(
                 content=decision.content,
@@ -1691,21 +1686,17 @@ class _AsyncAgent:
             return await self._make_cancelled_terminal_with_close()
         return self._make_terminal_failed(failure)
 
-    async def _make_suspended_or_cancelled_terminal_with_close(
+    async def _make_suspended_terminal_with_close(
         self, awaiting: ToolAwaitingOutcome
     ) -> EngineEvent:
-        """按取消优先级构造挂起终态。
+        """关闭 Runner 后构造挂起终态。
 
         :param awaiting: 工具等待 outcome。
-        :returns: ``RUN_CANCELLED`` 或 ``RUN_SUSPENDED`` terminal。
+        :returns: ``RUN_SUSPENDED`` terminal。
         :raises Exception: 不主动抛出异常；Runner close 异常会被吞掉并记日志。
         """
 
-        if self._is_cancelled():
-            return await self._make_cancelled_terminal_with_close()
         await self._close_runner_once()
-        if self._is_cancelled():
-            return await self._make_cancelled_terminal_with_close()
         return self._make_terminal_suspended(
             RunSuspendedData(
                 reason=RUN_SUSPENDED_REASON_TOOL_AWAITING,

@@ -59,6 +59,7 @@ from dayu.engine.contracts.runner_events import (
     RunnerEvent,
     RunnerEventData,
     RunnerEventType,
+    RunnerReasoningDeltaData,
     RunnerToolCallDeltaData,
     RunnerToolCallsCompletedData,
 )
@@ -1228,8 +1229,8 @@ async def test_tool_awaiting_suspends_run_without_next_tool_injection() -> None:
 
 
 @pytest.mark.asyncio
-async def test_awaiting_cancellation_priority_before_and_after_event() -> None:
-    """取消命中时必须优先 run_cancelled，不伪装成 suspended。"""
+async def test_awaiting_cancellation_before_and_after_outcome_boundary() -> None:
+    """取消在 awaiting outcome 前后命中时遵守提交边界。"""
 
     token_before = _Token()
     before_executor = _RecordingToolExecutor(
@@ -1262,16 +1263,16 @@ async def test_awaiting_cancellation_priority_before_and_after_event() -> None:
         if event.type is EngineEventType.TOOL_AWAITING:
             token_after.trigger("after_awaiting")
 
-    assert _terminal(after_events).type is EngineEventType.RUN_CANCELLED
+    assert _terminal(after_events).type is EngineEventType.RUN_SUSPENDED
     assert [
         event.type for event in after_events
         if event.type
-        in {EngineEventType.TOOL_AWAITING, EngineEventType.RUN_CANCELLED}
-    ] == [EngineEventType.TOOL_AWAITING, EngineEventType.RUN_CANCELLED]
+        in {EngineEventType.TOOL_AWAITING, EngineEventType.RUN_SUSPENDED}
+    ] == [EngineEventType.TOOL_AWAITING, EngineEventType.RUN_SUSPENDED]
     assert [
         event
         for event in after_events
-        if event.type is EngineEventType.RUN_SUSPENDED
+        if event.type is EngineEventType.RUN_CANCELLED
     ] == []
 
 
@@ -1703,23 +1704,62 @@ async def test_consecutive_failed_batches_force_answer_raise_and_reset() -> None
 
 
 @pytest.mark.asyncio
-async def test_cancellation_after_tool_outcome_wins_before_injection() -> None:
-    """工具 outcome 后若 token 取消，必须 run_cancelled 且不注入下一轮。"""
+async def test_late_cancellation_after_tool_outcome_preserves_accepted_facts() -> None:
+    """工具 outcome 后 late cancel 只阻止下一轮 Runner。"""
 
     token = _Token()
-    executor = _RecordingToolExecutor(
-        outcomes={"tc_1": _success(5)},
-        token_to_cancel=token,
-    )
-    runner = _ScriptedRunner(scripts=(_tool_script(_tool_call("tc_1")),))
-
-    events = await _collect(
-        _AsyncAgent(
-            request=_request(token=token, executor=executor),
-            runner=runner,
+    executor = _RecordingToolExecutor(outcomes={"tc_1": _success(5)})
+    runner = _ScriptedRunner(
+        scripts=(
+            (
+                _event(
+                    RunnerEventType.RUNNER_CONTENT_DELTA,
+                    RunnerContentDeltaData(delta="partial"),
+                ),
+                _event(
+                    RunnerEventType.RUNNER_REASONING_DELTA,
+                    RunnerReasoningDeltaData(delta="think"),
+                ),
+                _event(
+                    RunnerEventType.RUNNER_TOOL_CALLS_COMPLETED,
+                    RunnerToolCallsCompletedData(
+                        tool_calls=(_tool_call("tc_1"),)
+                    ),
+                ),
+                _event(
+                    RunnerEventType.RUNNER_DONE,
+                    RunnerDoneData(finish_reason=FinishReason.TOOL_CALLS),
+                ),
+            ),
+            _final_script("unused"),
         )
     )
 
+    agent = _AsyncAgent(
+        request=_request(token=token, executor=executor),
+        runner=runner,
+    )
+    events: list[EngineEvent] = []
+    async for event in agent.run_messages():
+        events.append(event)
+        if event.type is EngineEventType.TOOL_RESULT_ACCEPTED:
+            token.trigger("after_tool_result")
+
     assert _terminal(events).type is EngineEventType.RUN_CANCELLED
     assert runner.call_count == 1
-    assert EngineEventType.TOOL_RESULT_ACCEPTED not in {event.type for event in events}
+    assert [
+        event.type
+        for event in events
+        if event.type
+        in {
+            EngineEventType.CONTENT_DELTA,
+            EngineEventType.REASONING_DELTA,
+            EngineEventType.TOOL_RESULT_ACCEPTED,
+            EngineEventType.RUN_CANCELLED,
+        }
+    ] == [
+        EngineEventType.CONTENT_DELTA,
+        EngineEventType.REASONING_DELTA,
+        EngineEventType.TOOL_RESULT_ACCEPTED,
+        EngineEventType.RUN_CANCELLED,
+    ]
