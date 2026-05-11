@@ -50,6 +50,7 @@ from dayu.host._run_state_store import (
     RunStateStore,
 )
 from dayu.host.contracts import (
+    HostRunFailedData,
     RunEventDraft,
     RunEventKind,
     RunEventSource,
@@ -176,6 +177,31 @@ def _final_answer_draft(
     )
 
 
+def _host_failed_draft(*, run_id: str) -> RunEventDraft:
+    """构造 Host ``RUN_FAILED`` terminal 草稿。
+
+    :param run_id: Run id。
+    :returns: Host 失败 terminal RunEvent 草稿。
+    :raises Exception: 不主动抛出异常。
+    """
+
+    return RunEventDraft(
+        run_id=run_id,
+        session_id="s",
+        kind=RunEventKind.CANONICAL,
+        source=RunEventSource.HOST,
+        type=RunEventType.RUN_FAILED,
+        occurred_at=datetime.now(tz=timezone.utc),
+        data=HostRunFailedData(
+            error_code="attempt_lease_lost",
+            message="attempt lease lost",
+            recoverable=False,
+            exception_type="RuntimeError",
+        ),
+        source_engine_event_id=None,
+    )
+
+
 @pytest.mark.asyncio
 async def test_append_terminal_and_close_writes_position_atomically() -> None:
     """正常 owner: terminal append + close 同事务原子写入。
@@ -247,6 +273,50 @@ async def test_append_terminal_and_close_writes_position_atomically() -> None:
         )
         assert isinstance(run_record.result, RunSucceededResult)
         assert run_record.result.content == "ok"
+    finally:
+        storage.close()
+
+
+@pytest.mark.asyncio
+async def test_terminal_override_does_not_overwrite_existing_terminal_truth() -> None:
+    """已有 terminal truth 时, LOST override 不得覆盖 attempt / EventLog。"""
+
+    storage = _open_storage()
+    try:
+        await _seed_run(storage)
+        clock = _FakeClock()
+        supervisor = _build_supervisor(storage=storage, clock=clock)
+        attempt_state_store = AttemptStateStore(storage=storage, clock=clock)
+        async with supervisor.lease_context(
+            run_id="r1", attempt_index=0
+        ) as owner_context:
+            first_link = await supervisor.append_terminal_and_close(
+                owner_context=owner_context,
+                draft=_final_answer_draft(run_id="r1"),
+                failure_summary=None,
+            )
+            with pytest.raises(AttemptFencingError) as excinfo:
+                await supervisor.append_terminal_and_close(
+                    owner_context=owner_context,
+                    draft=_host_failed_draft(run_id="r1"),
+                    failure_summary="attempt_lease_lost:fenced",
+                    terminal_state_override=AttemptState.LOST,
+                )
+
+        assert excinfo.value.reason is AttemptFencingReason.ATTEMPT_TERMINAL
+        attempt = attempt_state_store.get(owner_context.attempt_id)
+        assert attempt is not None
+        assert attempt.state is AttemptState.SUCCEEDED
+        assert attempt.terminal_event_position is not None
+        assert (
+            attempt.terminal_event_position.value
+            == first_link.event_position.value
+        )
+        events = await supervisor.event_store.list_events(
+            run_id="r1", after=None
+        )
+        assert len(events) == 1
+        assert events[0].type is RunEventType.FINAL_ANSWER
     finally:
         storage.close()
 

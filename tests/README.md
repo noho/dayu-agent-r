@@ -191,6 +191,8 @@ Host 当前 Run harness、RunEventStore、ToolRuntime、Conversation Memory / Ru
   clock 下 renew 成功保持 fencing token 不变、刷新 `lease_expires_at`；renew 命中
   `FENCED` 后 session 失活并通过 `wait_owner_lost` 暴露 typed `FENCED`；renew 抛 storage
   异常时映射为 typed `STORAGE_ERROR`，masked 日志覆盖且 owner secret 明文不泄漏；
+  attempt terminal close 后 renew 命中 terminal fencing 时暴露 typed owner-lost signal，
+  并保证后台 renew task 不泄漏异常；
   `DurableHarnessConfig.attempt_lease_config` 装配入口可覆盖默认 TTL / interval / prefix；
   `LocalRunHarness` 仅薄委托 supervisor，并在 `_finish_attempt_if_durable` 通过
   `close_attempt_with_diagnostic_state` 完成 owner-aware 收口；owner CAS 命中失败时

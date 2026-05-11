@@ -1007,8 +1007,10 @@ class AttemptSupervisor:
 
         每轮先 sleep ``renew_interval``, 然后在事务内调用
         :meth:`AttemptLeaseStore.renew`。``ACQUIRED`` 替换 session 内的
-        owner_context(刷新 lease_expires_at); ``FENCED`` / ``TERMINAL``
-        / ``BUSY`` 通过 :meth:`_mark_owner_lost` 标记 session 失活并退出
+        owner_context(刷新 lease_expires_at); 若 renew 事务返回前已有并
+        发路径把 session 标记为 owner-lost, 则保留第一原因并退出, 不用
+        late renew 改写 session 视图。``FENCED`` / ``TERMINAL`` /
+        ``BUSY`` 通过 :meth:`_mark_owner_lost` 标记 session 失活并退出
         循环。renew 自身抛出非 ``CancelledError`` 异常时, 同样调用
         :meth:`_mark_owner_lost` 以独立的 ``STORAGE_ERROR`` loss reason
         收口, 不被伪装成 fencing。
@@ -1071,6 +1073,8 @@ class AttemptSupervisor:
                     result.decision is AttemptLeaseDecision.ACQUIRED
                     and result.owner_context is not None
                 ):
+                    if session.loss_reason is not None:
+                        return
                     session.owner_context = result.owner_context
                     _LOGGER.debug(
                         "host.attempt.lease_renewed attempt_id=%s "

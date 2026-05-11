@@ -20,7 +20,12 @@ from dayu.contracts.tool_outcome import (
 )
 from dayu.contracts.tool_result import ToolResultSuccess
 from dayu.host._event_store import InMemoryRunEventStore
+from dayu.host._attempt_lease import (
+    AttemptFencingError,
+    AttemptFencingReason,
+)
 from dayu.host._framework_tools import FRAMEWORK_FETCH_MORE_NAME
+from dayu.host._internal_contracts import AttemptState, FencingToken
 from dayu.host._tool_runtime import (
     HostToolRuntime,
     PlainRunEventAppender,
@@ -28,6 +33,7 @@ from dayu.host._tool_runtime import (
     ToolRuntimeOwnerScope,
     active_tool_runtime_appender,
 )
+from dayu.host.contracts import RunEvent, RunEventDraft
 
 
 @dataclass(frozen=True, slots=True)
@@ -110,6 +116,60 @@ class _Tokens:
 
         self.next_index += 1
         return f"cursor-{self.next_index}"
+
+
+@dataclass(slots=True)
+class _ManualClock:
+    """测试用 monotonic clock。"""
+
+    value: float = 100.0
+
+    def __call__(self) -> float:
+        """返回当前 monotonic 时间。
+
+        :returns: 当前测试时间。
+        :raises Exception: 不主动抛出异常。
+        """
+
+        return self.value
+
+
+@dataclass(slots=True)
+class _FencingAppender:
+    """在 owner 校验阶段抛 fencing 的 appender。"""
+
+    verify_calls: int = 0
+    append_calls: int = 0
+
+    async def verify_active_owner(self, *, run_id: str) -> None:
+        """模拟 generic tool call 进入业务执行前 owner 已失效。
+
+        :param run_id: Run id。
+        :returns: 无返回值。
+        :raises AttemptFencingError: 始终抛出 owner mismatch。
+        """
+
+        self.verify_calls += 1
+        raise AttemptFencingError(
+            attempt_id="attempt-fenced",
+            run_id=run_id,
+            reason=AttemptFencingReason.OWNER_MISMATCH,
+            current_state=AttemptState.RUNNING,
+            owner_id="other-owner",
+            fencing_token=FencingToken(value=9),
+        )
+
+    async def append(self, draft: RunEventDraft) -> RunEvent:
+        """记录 append 调用并拒绝写入。
+
+        :param draft: RunEvent 草稿。
+        :returns: 永不返回。
+        :raises AssertionError: 始终抛出，generic fencing 不应进入 append。
+        """
+
+        del draft
+        self.append_calls += 1
+        raise AssertionError("fenced generic tool call must not append")
 
 
 def _spec() -> ToolTruncateSpec:
@@ -241,6 +301,34 @@ async def test_durable_executor_with_scope_allows_business_truncation() -> None:
 
 
 @pytest.mark.asyncio
+async def test_durable_generic_tool_call_fencing_happens_before_business_call() -> None:
+    """generic tool call 被 owner fencing 拒绝时不调用业务工具、不写事实。"""
+
+    store = InMemoryRunEventStore()
+    executor = _Executor(value=[1, 2, 3])
+    runtime = HostToolRuntime(
+        is_durable=True,
+        executor=executor,
+        event_store=store,
+        truncate_specs={"demo": _spec()},
+        token_generator=_Tokens(),
+        clock=lambda: 100.0,
+    )
+    tool_executor = ToolRuntimeToolExecutor(runtime=runtime)
+    appender = _FencingAppender()
+
+    async with ToolRuntimeOwnerScope(appender):
+        with pytest.raises(AttemptFencingError) as excinfo:
+            await tool_executor.execute(_request())
+
+    assert excinfo.value.reason is AttemptFencingReason.OWNER_MISMATCH
+    assert executor.calls == 0
+    assert appender.verify_calls == 1
+    assert appender.append_calls == 0
+    assert await store.list_events("run-1", after=None) == ()
+
+
+@pytest.mark.asyncio
 async def test_durable_fetch_more_rejects_without_scope_before_cursor_consume() -> None:
     """durable ``fetch_more`` 无 owner scope 时拒绝且不消费已有 cursor。"""
 
@@ -344,4 +432,39 @@ async def test_wrong_scope_returns_plain_failed_outcome() -> None:
 
     assert isinstance(failed, ToolFailedOutcome)
     assert failed.result.error == "cursor_scope_mismatch"
+    assert await store.list_events("run-1", after=None) == ()
+
+
+@pytest.mark.asyncio
+async def test_expired_fetch_more_returns_plain_failed_outcome() -> None:
+    """cursor 过期时 ``fetch_more`` 返回普通 failed outcome，不写专属事实。"""
+
+    store = InMemoryRunEventStore()
+    clock = _ManualClock()
+    runtime = HostToolRuntime(
+        is_durable=False,
+        executor=_Executor(value=[1, 2, 3]),
+        event_store=store,
+        truncate_specs={"demo": _spec()},
+        token_generator=_Tokens(),
+        clock=clock,
+    )
+    outcome = await runtime.execute_tool_call(_request())
+    assert isinstance(outcome, ToolCompletedOutcome)
+    assert outcome.result.truncation is not None
+
+    clock.value = 200.0
+    failed = await runtime.execute_tool_call(
+        _request(
+            tool_name=FRAMEWORK_FETCH_MORE_NAME,
+            arguments={
+                "cursor": outcome.result.truncation.cursor,
+                "scope_token": outcome.result.truncation.scope_token,
+            },
+            tool_call_id="read-1",
+        )
+    )
+
+    assert isinstance(failed, ToolFailedOutcome)
+    assert failed.result.error == "cursor_expired"
     assert await store.list_events("run-1", after=None) == ()

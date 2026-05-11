@@ -31,7 +31,7 @@ import logging
 import sqlite3
 import warnings
 from contextlib import asynccontextmanager
-from collections.abc import AsyncGenerator, AsyncIterator
+from collections.abc import AsyncGenerator, AsyncIterator, Callable
 from dataclasses import dataclass, field
 from datetime import datetime, timedelta, timezone
 
@@ -237,6 +237,31 @@ def _build_supervisor(
         lease_config=actual_config,
         clock=clock,
         event_store=_build_event_store(storage),
+    )
+
+
+def _host_run_failed_draft(*, run_id: str) -> RunEventDraft:
+    """构造 Host ``RUN_FAILED`` terminal RunEvent 草稿。
+
+    :param run_id: Run id。
+    :returns: Host 失败 terminal RunEvent 草稿。
+    :raises Exception: 不主动抛出异常。
+    """
+
+    return RunEventDraft(
+        run_id=run_id,
+        session_id="s",
+        kind=RunEventKind.CANONICAL,
+        source=RunEventSource.HOST,
+        type=RunEventType.RUN_FAILED,
+        occurred_at=datetime.now(tz=timezone.utc),
+        data=HostRunFailedData(
+            error_code="attempt_lease_lost",
+            message="attempt lease lost",
+            recoverable=False,
+            exception_type="RuntimeError",
+        ),
+        source_engine_event_id=None,
     )
 
 
@@ -879,6 +904,142 @@ class _StorageErrorLeaseStore:
         )
 
 
+@dataclass(slots=True)
+class _LateSuccessLeaseStore:
+    """让 renew 在返回成功前触发并发 owner-lost 的 lease store stub。
+
+    :param inner: 真实 lease store，用于 acquire / verify / close。
+    :param before_success_return: renew 返回成功结果前执行的回调。
+    :param renew_called: renew 已被调用的同步信号。
+    """
+
+    inner: AttemptLeaseStore
+    before_success_return: Callable[[], None] | None = None
+    renew_called: asyncio.Event = field(default_factory=asyncio.Event)
+
+    def acquire_new_attempt(
+        self,
+        *,
+        tx: HostStorageTransaction,
+        attempt_id: str,
+        run_id: str,
+        attempt_index: int,
+        recovered_from_attempt_id: str | None,
+        owner_id: str,
+        owner_token: AttemptOwnerToken,
+        lease_expires_at: datetime,
+    ) -> AttemptLeaseResult:
+        return self.inner.acquire_new_attempt(
+            tx=tx,
+            attempt_id=attempt_id,
+            run_id=run_id,
+            attempt_index=attempt_index,
+            recovered_from_attempt_id=recovered_from_attempt_id,
+            owner_id=owner_id,
+            owner_token=owner_token,
+            lease_expires_at=lease_expires_at,
+        )
+
+    def renew(
+        self,
+        *,
+        tx: HostStorageTransaction,
+        owner_context: AttemptOwnerContext,
+        lease_expires_at: datetime,
+    ) -> AttemptLeaseResult:
+        result = self.inner.renew(
+            tx=tx,
+            owner_context=owner_context,
+            lease_expires_at=lease_expires_at,
+        )
+        self.renew_called.set()
+        if self.before_success_return is not None:
+            self.before_success_return()
+        return result
+
+    def verify_owner(
+        self,
+        *,
+        tx: HostStorageTransaction,
+        owner_context: AttemptOwnerContext,
+    ) -> None:
+        self.inner.verify_owner(tx=tx, owner_context=owner_context)
+
+    def update_state_owner_aware(
+        self,
+        *,
+        tx: HostStorageTransaction,
+        owner_context: AttemptOwnerContext,
+        state: AttemptState,
+        failure_summary: str | None,
+        terminal_event_position: GlobalEventPosition | None,
+    ) -> bool:
+        return self.inner.update_state_owner_aware(
+            tx=tx,
+            owner_context=owner_context,
+            state=state,
+            failure_summary=failure_summary,
+            terminal_event_position=terminal_event_position,
+        )
+
+
+@pytest.mark.asyncio
+async def test_renew_late_success_does_not_overwrite_owner_lost_reason() -> None:
+    """late successful renew 不得覆盖已置位的 owner-lost 第一原因。"""
+
+    storage = _open_storage()
+    try:
+        await _seed_run(storage)
+        clock = _FakeClock()
+        real_store = AttemptLeaseStore(storage=storage, clock=clock)
+        store = _LateSuccessLeaseStore(inner=real_store)
+        supervisor = AttemptSupervisor(
+            storage=storage,
+            lease_store=cast(AttemptLeaseStore, store),
+            lease_config=AttemptLeaseConfig(
+                ttl=timedelta(seconds=30),
+                renew_interval=timedelta(milliseconds=5),
+                owner_id_prefix="host-test",
+            ),
+            clock=clock,
+            event_store=_build_event_store(storage),
+        )
+        async with supervisor.lease_context(
+            run_id="r1", attempt_index=0
+        ) as owner_context:
+            session = supervisor._sessions[owner_context.attempt_id]  # noqa: SLF001
+            first_owner_context = session.owner_context
+
+            def _mark_storage_loss() -> None:
+                """模拟 renew 成功返回前已经由并发路径判定 owner-lost。
+
+                :returns: 无返回值。
+                :raises Exception: 不主动抛出异常。
+                """
+
+                supervisor._mark_owner_lost(  # noqa: SLF001
+                    session=session,
+                    loss_reason=AttemptOwnerLossReason.STORAGE_ERROR,
+                    fence_reason=None,
+                )
+
+            store.before_success_return = _mark_storage_loss
+            clock.advance(timedelta(seconds=1))
+
+            await asyncio.wait_for(store.renew_called.wait(), timeout=1.0)
+            await asyncio.wait_for(session.stopped_event.wait(), timeout=1.0)
+            loss_reason = await asyncio.wait_for(
+                supervisor.wait_owner_lost(owner_context),
+                timeout=1.0,
+            )
+
+            assert loss_reason is AttemptOwnerLossReason.STORAGE_ERROR
+            assert session.loss_reason is AttemptOwnerLossReason.STORAGE_ERROR
+            assert session.owner_context is first_owner_context
+    finally:
+        storage.close()
+
+
 @pytest.mark.asyncio
 async def test_renew_storage_error_marks_owner_lost_with_storage_reason(
     caplog: pytest.LogCaptureFixture,
@@ -919,12 +1080,66 @@ async def test_renew_storage_error_marks_owner_lost_with_storage_reason(
                     timeout=0.5,
                 )
                 assert loss_reason is AttemptOwnerLossReason.STORAGE_ERROR
+                session = supervisor._sessions[owner_context.attempt_id]  # noqa: SLF001
+                await asyncio.wait_for(session.stopped_event.wait(), timeout=0.5)
+                renew_task = session.renew_task
+                assert renew_task is not None
+                assert renew_task.done()
+                assert renew_task.exception() is None
         all_logs = "\n".join(record.getMessage() for record in caplog.records)
         # owner 明文不能进入日志; masked token 必须出现; storage error 标识必须出现。
         for plain in plaintext_seen:
             assert plain not in all_logs
         assert "***" in all_logs
         assert "host.attempt.lease_renew_storage_error" in all_logs
+    finally:
+        storage.close()
+
+
+@pytest.mark.asyncio
+async def test_renew_terminal_fence_after_terminal_close_marks_owner_lost() -> None:
+    """terminal close 竞争后 renew 收到 ATTEMPT_TERMINAL 并无异常退出。"""
+
+    storage = _open_storage()
+    try:
+        await _seed_run(storage)
+        clock = _FakeClock()
+        config = AttemptLeaseConfig(
+            ttl=timedelta(seconds=30),
+            renew_interval=timedelta(milliseconds=5),
+            owner_id_prefix="host-test",
+        )
+        supervisor = _build_supervisor(
+            storage=storage,
+            clock=clock,
+            config=config,
+        )
+        async with supervisor.lease_context(
+            run_id="r1", attempt_index=0
+        ) as owner_context:
+            session = supervisor._sessions[owner_context.attempt_id]  # noqa: SLF001
+            await supervisor.append_terminal_and_close(
+                owner_context=owner_context,
+                draft=_host_run_failed_draft(run_id=owner_context.run_id),
+                failure_summary="attempt lease lost",
+            )
+
+            await asyncio.wait_for(session.stopped_event.wait(), timeout=1.0)
+            loss_reason = await asyncio.wait_for(
+                supervisor.wait_owner_lost(owner_context),
+                timeout=1.0,
+            )
+            renew_task = session.renew_task
+
+            assert loss_reason is AttemptOwnerLossReason.FENCED
+            assert session.loss_reason is AttemptOwnerLossReason.FENCED
+            assert (
+                session.fence_reason
+                is AttemptFencingReason.ATTEMPT_TERMINAL
+            )
+            assert renew_task is not None
+            assert renew_task.done()
+            assert renew_task.exception() is None
     finally:
         storage.close()
 
