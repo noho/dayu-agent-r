@@ -38,6 +38,7 @@ from dayu.host._attempt_supervisor import AttemptSupervisor
 from dayu.host._audit_projection import AuditProjectionObserver
 from dayu.host._conversation_memory_durable import (
     DurableConversationMemoryStore,
+    MemoryRepairReport,
     open_durable_conversation_memory_store,
 )
 from dayu.host._memory_projection import (
@@ -145,7 +146,7 @@ class DurableHarnessBundle:
     attempt_lease_config: AttemptLeaseConfig
     close: Callable[[], None]
 
-    async def startup_reconcile(self) -> None:
+    async def startup_reconcile(self) -> MemoryRepairReport | None:
         """启动 / 重新装配后显式追平 read model。
 
         进程崩溃可能停在 terminal 事件已持久化、但 ``coordinator.drain``
@@ -165,15 +166,17 @@ class DurableHarnessBundle:
         恢复。当装配的 memory store 不是 :class:`DurableConversationMemoryStore`
         时不触发 repair（自定义 store 的恢复语义由 store 自己负责）。
 
-        :returns: 无返回值。
+        :returns: durable memory repair 报告；自定义 memory store 不支持该
+            repair 契约时返回 ``None``。
         :raises sqlite3.DatabaseError: 写入失败时抛出。
         """
 
         await self.coordinator.startup_reconcile()
         if isinstance(self.memory_store, DurableConversationMemoryStore):
-            await self.memory_store.repair_missing_session_snapshots(
+            return await self.memory_store.repair_missing_session_snapshots(
                 event_store=self.event_store
             )
+        return None
 
 
 def build_durable_harness(

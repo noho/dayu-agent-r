@@ -30,6 +30,7 @@ import logging
 from collections.abc import Mapping
 from dataclasses import dataclass, field, replace
 from datetime import datetime, timezone
+from enum import StrEnum
 from typing import Protocol, TypeAlias
 
 from dayu.contracts.json_value import JsonValue
@@ -82,6 +83,12 @@ _ERROR_SNAPSHOT_SCHEMA_VERSION: str = (
 _TABLE_NAME: str = "host_conversation_memory_snapshots"
 # repair 路径分页拉取 EventLog 的 batch 大小，避免单次 SELECT 全量加载。
 _REPAIR_FETCH_BATCH_LIMIT: int = 256
+# repair 路径分页扫描候选 session 的 batch 大小，避免一次性收集全库。
+_REPAIR_SESSION_SCAN_BATCH_LIMIT: int = 256
+_REPAIR_REASON_PAYLOAD_NOT_TEXT: str = "snapshot_payload_not_text"
+_REPAIR_REASON_PAYLOAD_SESSION_MISMATCH: str = "snapshot_session_id_mismatch"
+_REPAIR_REASON_PAYLOAD_SCHEMA_MISMATCH: str = "snapshot_schema_mismatch"
+_REPAIR_REASON_PAYLOAD_DECODE_FAILED: str = "snapshot_decode_failed"
 
 _JsonObject: TypeAlias = Mapping[str, JsonValue]
 
@@ -94,6 +101,51 @@ _SCHEMA_STATEMENTS: tuple[str, ...] = (
     )
     """,
 )
+
+
+class MemoryRepairDiagnosticKind(StrEnum):
+    """durable memory repair 诊断类型。"""
+
+    CORRUPT_SNAPSHOT = "corrupt_snapshot"
+
+
+@dataclass(frozen=True, slots=True)
+class MemoryRepairDiagnostic:
+    """durable memory repair 单条诊断。
+
+    :param kind: 诊断类型。
+    :param session_id: 触发诊断的 session id。
+    :param reason: 诊断原因，供日志与运维判断使用。
+    """
+
+    kind: MemoryRepairDiagnosticKind
+    session_id: str
+    reason: str
+
+
+@dataclass(frozen=True, slots=True)
+class MemoryRepairReport:
+    """durable memory repair 执行报告。
+
+    :param repaired_session_ids: 本次成功重建 snapshot 的 session id 元组。
+    :param diagnostics: 本次发现但未自动覆盖的诊断元组。
+    """
+
+    repaired_session_ids: tuple[str, ...]
+    diagnostics: tuple[MemoryRepairDiagnostic, ...]
+
+
+@dataclass(frozen=True, slots=True)
+class _SnapshotRowInspection:
+    """snapshot row 检查结果。
+
+    :param row_exists: snapshot row 是否存在。
+    :param diagnostic: row 存在但不可安全读取时的诊断；合法或缺失时为
+        ``None``。
+    """
+
+    row_exists: bool
+    diagnostic: MemoryRepairDiagnostic | None
 
 
 class UtcClock(Protocol):
@@ -264,8 +316,8 @@ class DurableConversationMemoryStore:
         self,
         *,
         event_store: DurableRunEventStore,
-    ) -> tuple[str, ...]:
-        """Host internal: 从 EventLog 重建“snapshot row 缺失”的 session memory。
+    ) -> MemoryRepairReport:
+        """Host internal: 从 EventLog 重建缺失 session memory 并报告坏行。
 
         关闭 P8-S8 gap：``ProjectionCoordinator`` 的 checkpoint 已 CAUGHT_UP
         且 EventLog 无新事件时，普通 ``startup_reconcile()`` 不会再驱动
@@ -281,9 +333,12 @@ class DurableConversationMemoryStore:
           在，本方法 **不会** 把它当作“缺失”重建。
         - 仅当 EventLog 有 canonical 事件、但 snapshot 表无对应 row 时，
           才视为 read model 缺失并重建。
+        - snapshot row 已存在但 payload 损坏、schema 不匹配或类型非法时，
+          不自动覆盖；返回 typed diagnostic 并记录 WARNING，是否删除坏行
+          后重建由运维 / issue #41 后续裁决。
 
         :param event_store: durable EventLog，作为事实真源。
-        :returns: 本次成功重建 snapshot 的 session_id 元组（按重建顺序）。
+        :returns: 本次 repair 报告。
         :raises sqlite3.DatabaseError: 读取或写入失败时抛出。
         """
 
@@ -296,75 +351,264 @@ class DurableConversationMemoryStore:
         self,
         *,
         event_store: DurableRunEventStore,
-    ) -> tuple[str, ...]:
+    ) -> MemoryRepairReport:
         """``_lock`` 持有下的 repair 实现。
 
         :param event_store: durable EventLog。
-        :returns: 重建成功的 session_id 元组。
+        :returns: 本次 repair 报告。
         :raises sqlite3.DatabaseError: 读取或写入失败时抛出。
         """
 
-        missing_session_ids = self._collect_missing_session_ids()
-        if not missing_session_ids:
-            return ()
         repaired: list[str] = []
-        for session_id in missing_session_ids:
-            canonical_events = self._fetch_canonical_events_for_session(
-                event_store=event_store, session_id=session_id
+        diagnostics: list[MemoryRepairDiagnostic] = []
+        after_snapshot_only_session_id: str | None = None
+        while True:
+            snapshot_only_session_ids = (
+                self._collect_snapshot_only_session_ids_after(
+                    after_session_id=after_snapshot_only_session_id
+                )
             )
-            if not canonical_events:
-                # EventLog 中确实没有 canonical 事件可用于重建；保持缺失
-                # 状态，留给上层 lifecycle 决定是否新建 session。
-                continue
-            if not self._has_terminal_event(canonical_events):
-                # 仅有 USER_INPUT_ACCEPTED 但无 terminal / canonical 工具
-                # 事实，意味着 session 还在进行中 / 没有完整事实；本 helper
-                # 不主动写入“半成品” snapshot，等待正常 projection 路径。
-                continue
-            terminal_run_batches = (
-                self._group_terminal_canonical_events_by_run(canonical_events)
+            if not snapshot_only_session_ids:
+                break
+            for session_id in snapshot_only_session_ids:
+                inspection = self._inspect_snapshot_row(
+                    session_id=session_id
+                )
+                if inspection.diagnostic is not None:
+                    diagnostics.append(inspection.diagnostic)
+                    _log_memory_repair_diagnostic(inspection.diagnostic)
+            after_snapshot_only_session_id = snapshot_only_session_ids[-1]
+
+        after_session_id: str | None = None
+        while True:
+            session_ids = self._collect_repair_candidate_session_ids_after(
+                after_session_id=after_session_id
             )
-            if not terminal_run_batches:
-                continue
-            async with self.storage.transaction() as tx:
-                # 二次确认 row 仍缺失：避免与并发 observer 投影竞争导致
-                # 覆盖刚写入的 snapshot。
-                if self._snapshot_row_exists_in_tx(
-                    tx=tx, session_id=session_id
-                ):
+            if not session_ids:
+                break
+            for session_id in session_ids:
+                inspection = self._inspect_snapshot_row(session_id=session_id)
+                if inspection.diagnostic is not None:
+                    diagnostics.append(inspection.diagnostic)
+                    _log_memory_repair_diagnostic(inspection.diagnostic)
                     continue
-                for run_events in terminal_run_batches:
-                    self._project_in_tx(tx=tx, events=run_events)
-            repaired.append(session_id)
-            _LOGGER.log(
-                VERBOSE_LOG_LEVEL,
-                "host.conversation_memory.durable_repaired session_id=%s "
-                "canonical_count=%s run_count=%s",
-                session_id,
-                len(canonical_events),
-                len(terminal_run_batches),
+                if inspection.row_exists:
+                    continue
+                if await self._repair_missing_snapshot_for_session(
+                    event_store=event_store,
+                    session_id=session_id,
+                ):
+                    repaired.append(session_id)
+            after_session_id = session_ids[-1]
+        return MemoryRepairReport(
+            repaired_session_ids=tuple(repaired),
+            diagnostics=tuple(diagnostics),
+        )
+
+    async def _repair_missing_snapshot_for_session(
+        self,
+        *,
+        event_store: DurableRunEventStore,
+        session_id: str,
+    ) -> bool:
+        """重建单个缺失 snapshot row。
+
+        :param event_store: durable EventLog。
+        :param session_id: 会话 id。
+        :returns: 成功写入 snapshot 时返回 ``True``。
+        :raises sqlite3.DatabaseError: 读取或写入失败时抛出。
+        """
+
+        canonical_events = self._fetch_canonical_events_for_session(
+            event_store=event_store, session_id=session_id
+        )
+        if not canonical_events:
+            # EventLog 中确实没有 canonical 事件可用于重建；保持缺失
+            # 状态，留给上层 lifecycle 决定是否新建 session。
+            return False
+        if not self._has_terminal_event(canonical_events):
+            # 仅有 USER_INPUT_ACCEPTED 但无 terminal / canonical 工具
+            # 事实，意味着 session 还在进行中 / 没有完整事实；本 helper
+            # 不主动写入“半成品” snapshot，等待正常 projection 路径。
+            return False
+        terminal_run_batches = (
+            self._group_terminal_canonical_events_by_run(canonical_events)
+        )
+        if not terminal_run_batches:
+            return False
+        async with self.storage.transaction() as tx:
+            # 二次确认 row 仍缺失：避免与并发 observer 投影竞争导致覆盖
+            # 刚写入的 snapshot。若并发方已写入 row，本次 repair 不接管。
+            if self._snapshot_row_exists_in_tx(
+                tx=tx, session_id=session_id
+            ):
+                return False
+            for run_events in terminal_run_batches:
+                self._project_in_tx(tx=tx, events=run_events)
+        _LOGGER.log(
+            VERBOSE_LOG_LEVEL,
+            "host.conversation_memory.durable_repaired session_id=%s "
+            "canonical_count=%s run_count=%s",
+            session_id,
+            len(canonical_events),
+            len(terminal_run_batches),
+        )
+        return True
+
+    def _collect_repair_candidate_session_ids_after(
+        self,
+        *,
+        after_session_id: str | None,
+    ) -> tuple[str, ...]:
+        """分页扫描 EventLog 中存在 canonical 事件的 session。
+
+        repair 需要同时处理“缺失 row”和“已有 row 但 payload 损坏”两类
+        情况，因此候选集来自 EventLog canonical session，再逐个检查
+        snapshot row 状态。扫描按 session id 分页，避免一次性把全库
+        session 收集到内存。
+
+        :param after_session_id: exclusive 起点 session id；``None`` 表示从头。
+        :returns: 候选 session id 元组。
+        :raises sqlite3.DatabaseError: 读取失败时抛出。
+        """
+
+        if after_session_id is None:
+            rows = self.storage.execute_read(
+                """
+                SELECT DISTINCT e.session_id AS session_id
+                FROM host_run_events AS e
+                WHERE e.kind = ?
+                ORDER BY e.session_id ASC
+                LIMIT ?
+                """,
+                (
+                    RunEventKind.CANONICAL.value,
+                    _REPAIR_SESSION_SCAN_BATCH_LIMIT,
+                ),
             )
-        return tuple(repaired)
+        else:
+            rows = self.storage.execute_read(
+                """
+                SELECT DISTINCT e.session_id AS session_id
+                FROM host_run_events AS e
+                WHERE e.kind = ? AND e.session_id > ?
+                ORDER BY e.session_id ASC
+                LIMIT ?
+                """,
+                (
+                    RunEventKind.CANONICAL.value,
+                    after_session_id,
+                    _REPAIR_SESSION_SCAN_BATCH_LIMIT,
+                ),
+            )
+        return tuple(str(row["session_id"]) for row in rows)
 
-    def _collect_missing_session_ids(self) -> tuple[str, ...]:
-        """扫描出 EventLog 中已有 canonical 事件、但 snapshot 表缺失的 session。
+    def _collect_snapshot_only_session_ids_after(
+        self,
+        *,
+        after_session_id: str | None,
+    ) -> tuple[str, ...]:
+        """分页扫描只有 snapshot row、没有 canonical EventLog 的 session。
 
-        :returns: 缺失 snapshot row 的 session_id 元组（按 session_id 升序）。
+        这类 session 不能参与缺失 row 重建，因为 EventLog 没有可作为真源
+        的 canonical facts；但其已有 snapshot row 仍可能损坏，repair
+        必须把坏行诊断出来并保持 no-overwrite 语义。扫描只返回一页
+        session id，避免一次性加载 snapshot 表。
+
+        :param after_session_id: exclusive 起点 session id；``None`` 表示从头。
+        :returns: snapshot-only session id 元组。
+        :raises sqlite3.DatabaseError: 读取失败时抛出。
+        """
+
+        if after_session_id is None:
+            rows = self.storage.execute_read(
+                """
+                SELECT s.session_id AS session_id
+                FROM host_conversation_memory_snapshots AS s
+                WHERE NOT EXISTS (
+                    SELECT 1
+                    FROM host_run_events AS e
+                    WHERE e.session_id = s.session_id AND e.kind = ?
+                )
+                ORDER BY s.session_id ASC
+                LIMIT ?
+                """,
+                (
+                    RunEventKind.CANONICAL.value,
+                    _REPAIR_SESSION_SCAN_BATCH_LIMIT,
+                ),
+            )
+        else:
+            rows = self.storage.execute_read(
+                """
+                SELECT s.session_id AS session_id
+                FROM host_conversation_memory_snapshots AS s
+                WHERE s.session_id > ?
+                  AND NOT EXISTS (
+                    SELECT 1
+                    FROM host_run_events AS e
+                    WHERE e.session_id = s.session_id AND e.kind = ?
+                  )
+                ORDER BY s.session_id ASC
+                LIMIT ?
+                """,
+                (
+                    after_session_id,
+                    RunEventKind.CANONICAL.value,
+                    _REPAIR_SESSION_SCAN_BATCH_LIMIT,
+                ),
+            )
+        return tuple(str(row["session_id"]) for row in rows)
+
+    def _inspect_snapshot_row(
+        self,
+        *,
+        session_id: str,
+    ) -> _SnapshotRowInspection:
+        """检查 snapshot row 是否缺失或损坏。
+
+        :param session_id: 会话 id。
+        :returns: snapshot row 检查结果。
         :raises sqlite3.DatabaseError: 读取失败时抛出。
         """
 
         rows = self.storage.execute_read(
-            """
-            SELECT DISTINCT e.session_id AS session_id
-            FROM host_run_events AS e
-            LEFT JOIN host_conversation_memory_snapshots AS s
-                ON s.session_id = e.session_id
-            WHERE e.kind = ? AND s.session_id IS NULL
-            ORDER BY e.session_id ASC
-            """,
-            (RunEventKind.CANONICAL.value,),
+            "SELECT snapshot_payload FROM "
+            "host_conversation_memory_snapshots WHERE session_id = ?",
+            (session_id,),
         )
-        return tuple(str(row["session_id"]) for row in rows)
+        if not rows:
+            return _SnapshotRowInspection(
+                row_exists=False, diagnostic=None
+            )
+        payload_text = rows[0]["snapshot_payload"]
+        if not isinstance(payload_text, str):
+            return _SnapshotRowInspection(
+                row_exists=True,
+                diagnostic=_build_corrupt_snapshot_diagnostic(
+                    session_id=session_id,
+                    reason=_REPAIR_REASON_PAYLOAD_NOT_TEXT,
+                ),
+            )
+        try:
+            snapshot = _decode_snapshot_text(payload_text=payload_text)
+        except ValueError as exc:
+            return _SnapshotRowInspection(
+                row_exists=True,
+                diagnostic=_build_corrupt_snapshot_diagnostic(
+                    session_id=session_id,
+                    reason=_repair_reason_from_snapshot_error(exc),
+                ),
+            )
+        if snapshot.session_id != session_id:
+            return _SnapshotRowInspection(
+                row_exists=True,
+                diagnostic=_build_corrupt_snapshot_diagnostic(
+                    session_id=session_id,
+                    reason=_REPAIR_REASON_PAYLOAD_SESSION_MISMATCH,
+                ),
+            )
+        return _SnapshotRowInspection(row_exists=True, diagnostic=None)
 
     def _fetch_canonical_events_for_session(
         self,
@@ -374,8 +618,9 @@ class DurableConversationMemoryStore:
     ) -> tuple[RunEvent, ...]:
         """按 session 顺序读取 canonical RunEvent 用于重投。
 
-        通过 :meth:`DurableRunEventStore.fetch_events_by_position` 分页拉
-        取，避免单次 SELECT 加载超大 EventLog。
+        通过 :meth:`DurableRunEventStore.fetch_events_for_session_by_position`
+        分页拉取，避免单次 SELECT 加载超大 EventLog 或全局扫描后在
+        Python 侧过滤 session。
 
         :param event_store: durable EventLog。
         :param session_id: 会话 id。
@@ -387,17 +632,16 @@ class DurableConversationMemoryStore:
         collected: list[RunEvent] = []
         after = None
         while True:
-            batch = event_store.fetch_events_by_position(
-                after=after, limit=_REPAIR_FETCH_BATCH_LIMIT
+            batch = event_store.fetch_events_for_session_by_position(
+                session_id=session_id,
+                kind=RunEventKind.CANONICAL,
+                after=after,
+                limit=_REPAIR_FETCH_BATCH_LIMIT,
             )
             if not batch:
                 break
             for position, event in batch:
-                if (
-                    event.session_id == session_id
-                    and event.kind is RunEventKind.CANONICAL
-                ):
-                    collected.append(event)
+                collected.append(event)
                 after = position
         return tuple(collected)
 
@@ -520,7 +764,14 @@ class DurableConversationMemoryStore:
         tx: HostStorageTransaction,
         session_id: str,
     ) -> ConversationMemorySnapshot:
-        """事务内读取 snapshot。"""
+        """事务内读取 snapshot。
+
+        :param tx: 当前事务。
+        :param session_id: 会话 id。
+        :returns: 已持久化 snapshot；row 缺失时返回空 snapshot。
+        :raises ValueError: 已落库 snapshot payload 解码失败时抛出。
+        :raises sqlite3.DatabaseError: 读取失败时抛出。
+        """
 
         cursor = tx.execute(
             "SELECT snapshot_payload FROM "
@@ -561,6 +812,58 @@ class DurableConversationMemoryStore:
             "updated_at = excluded.updated_at",
             (snapshot.session_id, payload_text, updated_at),
         )
+
+
+def _build_corrupt_snapshot_diagnostic(
+    *,
+    session_id: str,
+    reason: str,
+) -> MemoryRepairDiagnostic:
+    """构造 corrupt snapshot 诊断。
+
+    :param session_id: 会话 id。
+    :param reason: 诊断原因。
+    :returns: :class:`MemoryRepairDiagnostic`。
+    :raises Exception: 不主动抛出异常。
+    """
+
+    return MemoryRepairDiagnostic(
+        kind=MemoryRepairDiagnosticKind.CORRUPT_SNAPSHOT,
+        session_id=session_id,
+        reason=reason,
+    )
+
+
+def _repair_reason_from_snapshot_error(exc: ValueError) -> str:
+    """把 snapshot decode 错误映射为 repair 诊断原因。
+
+    :param exc: snapshot decode 抛出的 :class:`ValueError`。
+    :returns: repair 诊断原因。
+    :raises Exception: 不主动抛出异常。
+    """
+
+    if str(exc) == _ERROR_SNAPSHOT_SCHEMA_VERSION:
+        return _REPAIR_REASON_PAYLOAD_SCHEMA_MISMATCH
+    return _REPAIR_REASON_PAYLOAD_DECODE_FAILED
+
+
+def _log_memory_repair_diagnostic(
+    diagnostic: MemoryRepairDiagnostic,
+) -> None:
+    """记录 durable memory repair 诊断。
+
+    :param diagnostic: repair 诊断。
+    :returns: 无返回值。
+    :raises Exception: 不主动抛出异常。
+    """
+
+    _LOGGER.warning(
+        "host.conversation_memory.durable_repair_diagnostic kind=%s "
+        "session_id=%s reason=%s",
+        diagnostic.kind.value,
+        diagnostic.session_id,
+        diagnostic.reason,
+    )
 
 
 def open_durable_conversation_memory_store(

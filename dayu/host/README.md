@@ -216,8 +216,9 @@ P8 已落地：
 - durable conversation memory（P8-S8）：`DurableConversationMemoryStore` 成为
   `build_durable_harness` 默认 memory read model，与 EventLog checkpoint 同事务原子推进；
   `startup_reconcile` 后追加 `repair_missing_session_snapshots()` 在 checkpoint 已 CAUGHT_UP
-  但 snapshot row 因运维误操作丢失时从 EventLog 重建。生产代码不再保留
-  `InMemoryConversationMemoryStore`。
+  但 snapshot row 因运维误操作丢失时从 EventLog 重建；repair 返回
+  `MemoryRepairReport`，已有但无法解码的 snapshot row 只产出 typed diagnostic 并记录
+  WARNING，不会被自动覆盖。生产代码不再保留 `InMemoryConversationMemoryStore`。
 - attempt state 诊断态扩展：`AttemptState` / store 层新增 `STALE`、`LOST`
   两个诊断态（P8-S1），配合 fencing token CAS 基础。
 
@@ -465,7 +466,10 @@ tests-only `FakeInMemoryConversationMemoryStore`），但生产路径下不再�
 canonical 事件、对“snapshot row 缺失且 EventLog 已含 terminal 事件”的 session 重建快照。
 `MemoryResetPatch` 与 `ScopeClearPatch(SESSION)` 走 UPSERT 写入空快照行，行依然存在，因此
 不会被 repair 误判成“缺失”而被旧 EventLog 内容覆盖。EventLog 仍是事实真源，memory snapshot
-只是 read model。
+只是 read model。repair 返回 `MemoryRepairReport(repaired_session_ids, diagnostics)`；
+snapshot row 已存在但 payload 损坏、schema 不匹配或类型非法时，即使该 session 没有
+canonical EventLog，repair 也只返回 `CORRUPT_SNAPSHOT` 诊断并记录 WARNING，不覆盖该 row，
+同时继续处理其它 session。
 
 如果 worker / proxy 异常导致 Host 无法获得 Engine terminal event，或 Engine stream 正常结束但没有产出
 terminal event，后台任务会 append 一个 Host-owned canonical `RUN_FAILED` 事件；该事件 `source=HOST`，

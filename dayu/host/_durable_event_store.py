@@ -106,6 +106,10 @@ _SCHEMA_STATEMENTS: tuple[str, ...] = (
     ON host_run_events (run_id, sequence)
     """,
     """
+    CREATE INDEX IF NOT EXISTS idx_host_run_events_session_kind_position
+    ON host_run_events (session_id, kind, event_position)
+    """,
+    """
     CREATE UNIQUE INDEX IF NOT EXISTS idx_host_run_events_engine_id
     ON host_run_events (run_id, source_engine_event_id)
     WHERE source_engine_event_id IS NOT NULL
@@ -688,6 +692,49 @@ class DurableRunEventStore:
             LIMIT ?
             """,
             (threshold, limit),
+        )
+        result: list[tuple[GlobalEventPosition, RunEvent]] = []
+        for row in rows:
+            event = _row_to_run_event(row)
+            position = GlobalEventPosition(value=int(row["event_position"]))
+            result.append((position, event))
+        return tuple(result)
+
+    def fetch_events_for_session_by_position(
+        self,
+        *,
+        session_id: str,
+        kind: RunEventKind,
+        after: GlobalEventPosition | None,
+        limit: int,
+    ) -> tuple[tuple[GlobalEventPosition, RunEvent], ...]:
+        """按 session、kind 与全局 position 顺序读取一批事件。
+
+        durable memory repair 使用本 helper 从 EventLog 真源分页拉取单个
+        session 的 canonical facts，避免全局扫描后在 Python 侧过滤。
+
+        :param session_id: 会话 id。
+        :param kind: RunEvent kind 过滤条件。
+        :param after: exclusive 起点 position；``None`` 表示从头。
+        :param limit: 最大返回条数，必须为正。
+        :returns: ``(position, event)`` 二元组元组。
+        :raises ValueError: ``limit`` 非正时抛出。
+        :raises sqlite3.DatabaseError: 读取失败时抛出。
+        """
+
+        if limit <= 0:
+            raise ValueError("limit must be positive")
+        threshold = -1 if after is None else after.value
+        rows = self.storage.execute_read(
+            """
+            SELECT run_id, session_id, sequence, event_position, kind,
+                source, type, occurred_at, payload, source_engine_event_id
+            FROM host_run_events
+            WHERE session_id = ? AND kind = ? AND event_position > ?
+            ORDER BY event_position ASC
+            LIMIT ?
+            """,
+            (session_id, kind.value, threshold, limit),
         )
         result: list[tuple[GlobalEventPosition, RunEvent]] = []
         for row in rows:
