@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import json
 import logging
+import math
 from collections.abc import AsyncIterator, Mapping, Sequence
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
@@ -72,6 +73,18 @@ from dayu.contracts.tool_schema import (
     ToolSchema,
 )
 from tests.engine.runners.openai._sse_helpers import make_no_thought_hook
+
+_TOOL_EXECUTION_TIMEOUT_SECONDS: float = 5.0
+_MINIMAL_MAX_ITERATIONS: int = 1
+_NO_CONTINUATION_ATTEMPTS: int = 0
+_INVALID_CONTINUATION_ATTEMPTS: int = -1
+_INVALID_FAILED_BATCH_THRESHOLDS: tuple[int, ...] = (0, -1)
+_INVALID_TOOL_EXECUTION_TIMEOUTS: tuple[float, ...] = (
+    0.0,
+    -1.0,
+    math.nan,
+    math.inf,
+)
 
 
 def _utc_now() -> datetime:
@@ -547,6 +560,7 @@ def _request(
             max_iterations=max_iterations,
             continuation_max_attempts=continuation_max_attempts,
             allow_tool_calls=allow_tool_calls,
+            tool_execution_timeout_seconds=_TOOL_EXECUTION_TIMEOUT_SECONDS,
             fallback_mode=fallback_mode,
             fallback_prompt="请直接回答。",
             continuation_prompt=continuation_prompt,
@@ -640,9 +654,10 @@ def test_contract_fields_are_explicit() -> None:
     """Phase 3 contract 字段必须显式存在。"""
 
     policy = AgentPolicy(
-        max_iterations=1,
-        continuation_max_attempts=0,
+        max_iterations=_MINIMAL_MAX_ITERATIONS,
+        continuation_max_attempts=_NO_CONTINUATION_ATTEMPTS,
         allow_tool_calls=True,
+        tool_execution_timeout_seconds=_TOOL_EXECUTION_TIMEOUT_SECONDS,
     )
 
     assert policy.fallback_mode is AgentFallbackMode.FORCE_ANSWER
@@ -654,27 +669,38 @@ def test_contract_fields_are_explicit() -> None:
 def test_agent_policy_rejects_invalid_values() -> None:
     """AgentPolicy 非法策略值必须在 contract 构造期 fail fast。"""
 
-    for threshold in (0, -1):
+    for threshold in _INVALID_FAILED_BATCH_THRESHOLDS:
         with pytest.raises(ValueError):
             AgentPolicy(
-                max_iterations=1,
-                continuation_max_attempts=0,
+                max_iterations=_MINIMAL_MAX_ITERATIONS,
+                continuation_max_attempts=_NO_CONTINUATION_ATTEMPTS,
                 allow_tool_calls=True,
+                tool_execution_timeout_seconds=_TOOL_EXECUTION_TIMEOUT_SECONDS,
                 max_consecutive_failed_tool_batches=threshold,
             )
     with pytest.raises(ValueError):
         AgentPolicy(
-            max_iterations=1,
-            continuation_max_attempts=-1,
+            max_iterations=_MINIMAL_MAX_ITERATIONS,
+            continuation_max_attempts=_INVALID_CONTINUATION_ATTEMPTS,
             allow_tool_calls=True,
+            tool_execution_timeout_seconds=_TOOL_EXECUTION_TIMEOUT_SECONDS,
         )
     with pytest.raises(ValueError):
         AgentPolicy(
-            max_iterations=1,
-            continuation_max_attempts=0,
+            max_iterations=_MINIMAL_MAX_ITERATIONS,
+            continuation_max_attempts=_NO_CONTINUATION_ATTEMPTS,
             allow_tool_calls=True,
+            tool_execution_timeout_seconds=_TOOL_EXECUTION_TIMEOUT_SECONDS,
             continuation_prompt=" ",
         )
+    for timeout_seconds in _INVALID_TOOL_EXECUTION_TIMEOUTS:
+        with pytest.raises(ValueError):
+            AgentPolicy(
+                max_iterations=_MINIMAL_MAX_ITERATIONS,
+                continuation_max_attempts=_NO_CONTINUATION_ATTEMPTS,
+                allow_tool_calls=True,
+                tool_execution_timeout_seconds=timeout_seconds,
+            )
 
 
 def test_llm_projection_shapes() -> None:

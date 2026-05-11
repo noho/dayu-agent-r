@@ -15,18 +15,19 @@
   外层 ``Task.cancel()``，异常向上抛出，runtime helper 不吞，确保上层
   ``Task.cancel()`` 在调用栈任意位置仍生效。
 
-两个 helper 的 task ownership 不同：
+这些 helper 的 task ownership 不同：
 
-- :func:`await_or_cancel` **拥有** awaitable：内部 ``ensure_future`` 包成
-  target task；token 命中时**必须** ``target.cancel()`` 并 ``await`` 直至
-  done，**禁止**留下后台运行的 target task。awaitable 抛异常时同样保证
-  target task 已 done。
+- :func:`await_or_cancel` / :func:`await_or_cancel_or_timeout` **拥有**
+  awaitable：内部 ``ensure_future`` 包成 target task；token 或 timeout
+  命中时**必须** ``target.cancel()`` 并 ``await`` 直至 done，**禁止**
+  留下后台运行的 target task。awaitable 抛异常时同样保证 target task
+  已 done。
 - :func:`wait_for_or_cancel` **不拥有** ``pending`` task：调用方（Runner
   idle wait 中要跨循环复用 readany task）保留所有权，helper 仅 race，
   不取消 ``pending``；调用方按返回的 :data:`WaitOutcome` 自行决定下一步
   是否取消 ``pending``。
 
-两个 helper 在退出前都会清理自己创建的内部 watcher / poller task，覆盖
+这些 helper 在退出前都会清理自己创建的内部 watcher / poller task，覆盖
 所有路径（awaitable / pending 完成、token 命中、awaitable 抛异常、
 timeout、外层 cancel），不留泄漏。
 """
@@ -69,7 +70,7 @@ class WaitCancelled:
 
 @dataclass(frozen=True, slots=True)
 class WaitTimedOut:
-    """timeout 命中（仅 :func:`wait_for_or_cancel` 可能返回）。
+    """timeout 命中。
 
     :param elapsed_seconds: 自 helper 开始等待到 timeout 命中的秒数。
     """
@@ -187,6 +188,75 @@ async def wait_for_or_cancel(
             await _cancel_task_and_wait(cancel_watcher)
 
 
+async def await_or_cancel_or_timeout(
+    awaitable: Awaitable[T],
+    *,
+    token: CancellationToken,
+    timeout_seconds: float,
+    poll_interval_seconds: float = _DEFAULT_POLL_INTERVAL_SECONDS,
+) -> WaitCompleted[T] | WaitCancelled | WaitTimedOut:
+    """等待 ``awaitable``，并同时监听 token 取消与 timeout。
+
+    helper 拥有 awaitable 的所有权：
+
+    - 若 ``awaitable`` 先完成，返回 :class:`WaitCompleted`。
+    - 若 token 在 awaitable 完成前命中，取消并等待 target task 收口，
+      返回 :class:`WaitCancelled`。
+    - 若 timeout 在 awaitable 完成前命中，取消并等待 target task 收口，
+      返回 :class:`WaitTimedOut`。
+    - cancellation 与 timeout 竞争时 cancellation 优先。
+    - helper 自身被外层 ``Task.cancel()`` 取消时，取消并等待 target task
+      收口，然后重新抛出 ``asyncio.CancelledError``。
+
+    :param awaitable: 需要等待的 awaitable / coroutine。
+    :param token: 取消观察 token。
+    :param timeout_seconds: timeout 秒数。
+    :param poll_interval_seconds: 轮询 token 的间隔秒数。
+    :returns: :class:`WaitCompleted`、:class:`WaitCancelled` 或
+        :class:`WaitTimedOut`。
+
+    :raises Exception: 透传 ``awaitable`` 自身的异常。
+    :raises asyncio.CancelledError: helper 所在 task 被外层取消，或
+        ``awaitable`` 自身抛出 ``asyncio.CancelledError`` 时透传。
+    """
+
+    if token.is_cancelled():
+        if asyncio.iscoroutine(awaitable):
+            awaitable.close()
+            return WaitCancelled(reason=token.cancel_reason())
+        target_task: asyncio.Task[T] = asyncio.ensure_future(awaitable)
+        await _cancel_task_and_wait(target_task)
+        return WaitCancelled(reason=token.cancel_reason())
+
+    started_at = time.monotonic()
+    target_task: asyncio.Task[T] = asyncio.ensure_future(awaitable)
+    cancel_watcher: asyncio.Task[None] = asyncio.ensure_future(
+        _poll_cancellation(token, interval_seconds=poll_interval_seconds)
+    )
+    try:
+        done, _ = await asyncio.wait(
+            {target_task, cancel_watcher},
+            timeout=timeout_seconds,
+            return_when=asyncio.FIRST_COMPLETED,
+        )
+        if cancel_watcher in done and token.is_cancelled():
+            await _cancel_task_and_wait(target_task)
+            return WaitCancelled(reason=token.cancel_reason())
+        if target_task in done:
+            return WaitCompleted(value=await target_task)
+        if token.is_cancelled():
+            await _cancel_task_and_wait(target_task)
+            return WaitCancelled(reason=token.cancel_reason())
+        await _cancel_task_and_wait(target_task)
+        return WaitTimedOut(elapsed_seconds=time.monotonic() - started_at)
+    except asyncio.CancelledError:
+        await _cancel_task_and_wait(target_task)
+        raise
+    finally:
+        if not cancel_watcher.done():
+            await _cancel_task_and_wait(cancel_watcher)
+
+
 async def _poll_cancellation(
     token: CancellationToken, *, interval_seconds: float
 ) -> None:
@@ -229,5 +299,6 @@ __all__ = [
     "WaitTimedOut",
     "WaitOutcome",
     "await_or_cancel",
+    "await_or_cancel_or_timeout",
     "wait_for_or_cancel",
 ]

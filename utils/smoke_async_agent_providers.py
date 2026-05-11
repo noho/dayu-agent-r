@@ -41,8 +41,11 @@ from dayu.runtime.log import LogLevel, configure
 
 _PROMPT: str = "用一句话回答：2+2 等于几？"
 _DEFAULT_TIMEOUT_SECONDS: float = 60.0
+_TOOL_EXECUTION_TIMEOUT_SECONDS: float = 5.0
 _DEFAULT_MAX_RETRIES: int = 0
 _DEFAULT_MAX_TOKENS: int = 64
+_MAX_ITERATIONS_WITHOUT_TOOLS: int = 1
+_CONTINUATION_MAX_ATTEMPTS_WITHOUT_TOOLS: int = 0
 _RUN_ID_PREFIX: str = "smoke_async_agent"
 _SKIP_PREFIX: str = "SKIP"
 _CASE_PREFIX: str = "CASE"
@@ -279,9 +282,10 @@ def build_request(
             stream=stream,
         ),
         agent_policy=AgentPolicy(
-            max_iterations=1,
-            continuation_max_attempts=0,
+            max_iterations=_MAX_ITERATIONS_WITHOUT_TOOLS,
+            continuation_max_attempts=_CONTINUATION_MAX_ATTEMPTS_WITHOUT_TOOLS,
             allow_tool_calls=False,
+            tool_execution_timeout_seconds=_TOOL_EXECUTION_TIMEOUT_SECONDS,
         ),
         tool_schemas=(),
         tool_executor=_NoopToolExecutor(),

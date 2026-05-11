@@ -7,6 +7,7 @@
 
 from __future__ import annotations
 
+import math
 from dataclasses import dataclass
 from enum import StrEnum
 
@@ -43,6 +44,8 @@ class AgentPolicy:
     :param continuation_max_attempts: 同一迭代内 continuation 最大尝试
         次数。
     :param allow_tool_calls: 是否允许工具调用。
+    :param tool_execution_timeout_seconds: Engine 等待
+        ``ToolExecutor.execute`` 完成握手的超时秒数，必须为正数。
     :param fallback_mode: 普通工具轮次耗尽或连续失败工具批次达到阈值后的
         收口模式。
     :param fallback_prompt: force-answer 时追加给 Runner 的用户消息。
@@ -54,6 +57,7 @@ class AgentPolicy:
     max_iterations: int
     continuation_max_attempts: int
     allow_tool_calls: bool
+    tool_execution_timeout_seconds: float
     fallback_mode: AgentFallbackMode = AgentFallbackMode.FORCE_ANSWER
     fallback_prompt: str = _DEFAULT_FALLBACK_PROMPT
     continuation_prompt: str = _DEFAULT_CONTINUATION_PROMPT
@@ -64,10 +68,17 @@ class AgentPolicy:
     def __post_init__(self) -> None:
         """校验 Agent 策略边界。
 
-        :raises ValueError: continuation 次数小于 0、continuation prompt
-            为空或连续失败工具批次阈值小于 1 时抛出。
+        :raises ValueError: timeout 非正数、continuation 次数小于 0、
+            continuation prompt 为空或连续失败工具批次阈值小于 1 时抛出。
         """
 
+        if (
+            not math.isfinite(self.tool_execution_timeout_seconds)
+            or self.tool_execution_timeout_seconds <= 0
+        ):
+            raise ValueError(
+                "AgentPolicy.tool_execution_timeout_seconds must be finite and > 0"
+            )
         if self.continuation_max_attempts < 0:
             raise ValueError(
                 "AgentPolicy.continuation_max_attempts must be >= 0"

@@ -68,6 +68,9 @@ from dayu.contracts.tool_schema import (
     ToolSchema,
 )
 
+_TOOL_EXECUTION_TIMEOUT_SECONDS: float = 5.0
+_CONTINUATION_MAX_ATTEMPTS: int = 3
+
 
 def _utc_now() -> datetime:
     """返回测试用 UTC 当前时间。
@@ -288,8 +291,9 @@ def _request(
         ),
         agent_policy=AgentPolicy(
             max_iterations=max_iterations,
-            continuation_max_attempts=3,
+            continuation_max_attempts=_CONTINUATION_MAX_ATTEMPTS,
             allow_tool_calls=True,
+            tool_execution_timeout_seconds=_TOOL_EXECUTION_TIMEOUT_SECONDS,
         ),
         tool_schemas=tool_schemas,
         tool_executor=_NoopToolExecutor(),
