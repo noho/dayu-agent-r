@@ -22,7 +22,7 @@ Dayu 项目级约束、artifact 索引和仍需追踪的 residual risks；不复
 - 最新 plan review artifact：`docs/host/phase8.5-plan-review.md`（fail，7 findings 全部 accepted）；
   `docs/host/phase8.5-plan-rereview.md` 已通过。
 - 当前待处理事项：无剩余 implementation slice；等待用户授权是否进入 P8.5 PR gate。
-- 下一入口：P8.5 PR gate / PR review gate，或后续 P9 Session / Run Lifecycle Governance。
+- 下一入口：P8.5 PR gate / PR review gate；P8.5 PR closeout 后进入 P8.6 Recovery Model Re-challenge。
 
 ## 2. Dayu Host Gateflow 扩展
 
@@ -68,6 +68,7 @@ Dayu 项目级约束、artifact 索引和仍需追踪的 residual risks；不复
 | P7 | Tool Trace Projection / Sink | merged PR #37 | Host observer / sink 派生 tool trace | trace projection 从 canonical facts 幂等重建 |
 | P8 | Attempt Lease / Recovery / Multiprocessing | merged PR #40 | owner token、fencing、attempt supervisor、diagnostic recovery、durable memory、multiprocessing stress | 迟到 owner 被 fenced；terminal close 原子；P8 smoke 通过 |
 | P8.5 | P8 Stabilization / ToolRuntime Event Model | implementation complete | 在 P9 lifecycle 前收口 P8 稳定性尾巴：纠正 framework `fetch_more` / cursor / truncation 专属 RunEventType 事件模型，并补齐 durable memory / trace / capacity / adversarial coverage 稳定性问题 | EventLog 只记录普通 tool calling；`fetch_more` 作为 Host 私有 framework built-in tool 投影 schema；`RuntimeTruncateManager` 持有截断 / cursor 状态；P8 已落地 attempt lease / recovery / multiprocessing 在 P8.5 后稳定可用 |
+| P8.6 | Recovery Model Re-challenge | planned | 在 P9 lifecycle 前重新挑战 P8 的 recovery 概念边界：corrupt memory snapshot row、recovery scan、startup_reconcile 是否应作为正常恢复路径存在，还是暴露了 Attempt Lease / Recovery / Multiprocessing 设计不够闭合 | 形成 handoff-ready 调查 plan；明确哪些 recovery 是 self-healing system invariant，哪些属于 operator repair / quarantine / disaster recovery，哪些应回到 P9/P15/P16 |
 | P9 | Session / Run Lifecycle Governance / Public Interface | planned | admission、同 Session active Run、cancel 基础治理、Host public interface 固定 | lifecycle/admission/cancel smoke 通过，public exports 冻结 |
 | P10 | ToolRegistry Governance | planned | 通用工具注册、权限、middleware、registry audit | 通用工具可注册、授权、审计，Engine 只见 schema / executor |
 | P10.5 | Web Tools Migration Smoke | planned | 迁移代表性 web tool 验证真实工具链路 | 至少一个 web tool 通过 ToolRegistry / ToolRuntime / trace / memory smoke |
@@ -86,6 +87,7 @@ Dayu 项目级约束、artifact 索引和仍需追踪的 residual risks；不复
 | Phase | 关键输出 | 明确非目标 |
 | --- | --- | --- |
 | P8.5 | ToolRuntime event model root-cause plan、删除 `TOOL_FETCH_MORE_REQUESTED` / `TOOL_FETCH_MORE_COMPLETED` / `TOOL_FETCH_MORE_FAILED`、`TOOL_CURSOR_*`、`TOOL_RESULT_TRUNCATED` 等专属 RunEventType 的实施决策、EventLog 只记录普通 `TOOL_CALL_REQUESTED` / `TOOL_RESULT_ACCEPTED`、Host 私有 `fetch_more` framework tool schema 投影、`RuntimeTruncateManager` 截断 / cursor 状态边界、serializer / contracts / trace / memory / smoke / docs 同步、durable memory repair 容量与 damaged snapshot 策略、ToolTraceObserver async I/O 边界、RunInput snapshot side store 策略、P8 adversarial coverage gaps、`docs/host/phase8.5-plan.md` | 不恢复 legacy public fetch_more handle；不提前实现完整 P10 ToolRegistry；不把 ToolRuntime 业务语义放入 `dayu.runtime`；不把具体工具名、cursor 或 truncation 继续编码成 RunEventType；不在缺少直接证据时断言 EventLog batch append 一定需要或一定不需要；不做 P9 Session / Run lifecycle admission；不做 P16 public/internal bundle interface freeze |
+| P8.6 | Recovery Model Re-challenge plan、对 `corrupt durable memory snapshot row` / `recovery scan` / `startup_reconcile` 的同源调查、Attempt Lease / Recovery / Multiprocessing 自愈边界审计、与 ZooKeeper / Kafka / etcd 等成熟系统的 recovery / operator intervention 原则对照、operator repair / quarantine / auto-rebuild policy 候选、后续 phase owner 重新归档 | 不在 P8.6 plan 前改 recovery 代码；不把“能 repair”默认当成“应存在 recovery”；不把运维手工介入当作正常路径；不做 P9 Session lifecycle admission；不做 P15 hard-gate/watchdog；不做 P16 interface freeze |
 | P9 | SessionManager、RunManager、RunSupervisor、`client_request_id` 幂等、同 Session active Run 仲裁、`cancel_run`、生产级 admission policy、Host public interface 契约、OLD wechat / web / prompt / interactive 调用需求调研、`utils/smoke_host_p9_lifecycle.py` | 不做 issue #3 强制终止增强；不做 wait / suspend / resume；不做 Remote RPC；不迁移业务工具 |
 | P10 | ToolRegistry / tool catalog、display metadata、permission policy、middleware chain、framework tool registration、schema / binding 校验、registry audit facts、`utils/smoke_host_p10_tool_registry.py` | 不迁移 business fins / doc / web 工具；不让 Host / Engine 承载财报业务语义；不让 Engine 持有 registry |
 | P10.5 | 代表性 web tool `@tool` declaration、ToolRegistry 注册、permission / middleware / display metadata 对接、ToolRuntime truncate / fetch_more 适配、tool trace / memory facts smoke、`utils/smoke_host_p10_5_web_tools.py` | 不迁移 fins / doc 全量业务工具；不把 web 业务语义塞进 Host / Engine；不扩大 P10 ToolRegistry 契约；不实现 P11 validation replay |
@@ -136,6 +138,9 @@ P8.5 当前 Slice 1 至 Slice 6 均已通过 implementation review loop，并已
   `run_input_raw_payloads` side-store，并与 EventLog fact append 在同一 Host storage transaction 内提交。
 - P15 hard-gate / required projection enforcement / watchdog、P9 Session / Run lifecycle admission、P16
   public/internal bundle freeze 均不是 P8.5 已实现内容。
+- P8.6 将在 P8.5 PR closeout 后专门重审 recovery 概念：corrupt durable memory snapshot row、
+  recovery scan、startup_reconcile 不能分散作为孤立 residual 处理；需要从 Attempt Lease / Recovery /
+  Multiprocessing 的自愈不变量出发，挑战“实现良好的系统是否还应需要 recovery / 运维干预”。
 
 P8 cleanup 后的 stale / orphan recovery 旧术语（`MARK_RECOVERING_AND_CREATE_ATTEMPT`、新 recovery attempt、
 `recovered_from_attempt_id` 自动写入等）均已废弃。若历史 phase plan / review artifact 仍保留这些词，只作为
@@ -160,13 +165,13 @@ P8 cleanup 后的 stale / orphan recovery 旧术语（`MARK_RECOVERING_AND_CREAT
 | P8 PR review 1948-F2：`_verify_run_id_matches()` 缺独立 RUN_ID_MISMATCH reason，run_id 不匹配的内部不变量违反不应与 owner token mismatch 共用 `OWNER_MISMATCH` | P8.5 Slice 5a | fixed, validated |
 | durable memory repair 按 session 扫描 EventLog 的容量风险 | P8.5 Slice 2 | fixed, validated |
 | durable memory snapshot row 存在但 payload 损坏时 repair 不可见 | P8.5 Slice 2 | fixed, validated：typed diagnostic + WARNING，不自动覆盖 |
-| corrupt durable memory snapshot row 的产生根因、quarantine / 运维命令 / 长期自动覆盖策略 | GitHub issue #41 | tracked; not solved by P8.5 |
+| corrupt durable memory snapshot row 的产生根因、quarantine / 运维命令 / 长期自动覆盖策略 | P8.6 / GitHub issue #41 | tracked; not solved by P8.5 |
 | `recover_stale_attempts(run_id=None)` 全局扫描路径未单测 | PR #40 | fixed (T2 test added) |
 | `next_attempt_index` 未独立单测 | P8.5 Slice 5a | fixed, validated |
 | P8 PR review 2242/2247 coverage-only gaps：renew/terminal race、recovery CAS miss、owner-lost late event、terminal override、expired/denied fencing 等 adversarial tests | P8.5 Slice 5b | fixed, validated |
 | P8 PR review 0612/0613 low findings：`_renew_loop` STORAGE_ERROR 异常分类、BUSY reason 细化、`lease_context` 参数校验等 attempt lease 诊断 / 防御性边界 | P8.5 Slice 5a / Slice 5b | fixed, validated for approved scope |
-| recovery scan 自动接入生产启动链路 | P9 / Session lifecycle | deferred-with-owner |
-| `startup_reconcile` 自动接入 Host 启动流程 | P9 / Session lifecycle | deferred-with-owner |
+| recovery scan 是否应作为正常生产启动链路存在，还是暴露 Attempt Lease / Recovery 模型未闭合 | P8.6 | deferred-with-owner |
+| `startup_reconcile` 是否应作为正常启动恢复路径存在，还是应被更强 lifecycle / projection invariant 取代 | P8.6 | deferred-with-owner |
 | `HostStorage.close()` 对后台 task / `to_thread` commit 无生命周期保护 | P9 lifecycle | deferred-with-owner |
 | compact 成功 / 失败路径中诊断 fact 与 terminal fact 分步 append 导致的诊断事件精度、孤立诊断 fact 与原子性取舍 | P8.5 Slice 4 | fixed for approved compact / SSE partial semantics; broader lifecycle admission remains P9 |
 | observer 在空 EventLog 且 `last_success_position is None` 时无法明确转 `CAUGHT_UP` | PR #40 | fixed (zero-event observer advance) |
