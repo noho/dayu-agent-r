@@ -64,7 +64,7 @@ from dayu.engine.contracts import AgentRunRequest, RunnerSpec
 - `agent_policy`：Agent 策略。
 - `tool_schemas`：暴露给 LLM 的工具 schema 快照。
 - `tool_executor`：工具执行协议实现。
-- `cancellation_token`：取消观察 token；命中后 `run_agent_messages` 产出 `run_cancelled` 终态事件，`run_agent_and_wait` 返回 `EngineRunOutcomeCancelled`。
+- `cancellation_token`：取消观察 token；命中后阻止尚未开始的后续工作，并在取消赢得当前边界时以 `run_cancelled` / `EngineRunOutcomeCancelled` 收口。
 
 Engine 消费这些字段完成单次 run；不从配置文件、调用方状态或 UI 状态中补读隐式参数。
 
@@ -148,9 +148,11 @@ Engine 公共契约分为 Engine 专属契约与跨层共享契约。Engine 专�
 
 `tool_schemas` 与 `tool_executor` 是同一组工具能力在 Engine 边界上的两个投影。`tool_schemas` 是模型可见的工具 schema 快照，只进入 Runner 调用；`tool_executor` 是工具调用的统一执行入口，只通过 `ToolExecutor.execute(request)` 接收模型返回的工具名、参数和执行上下文。Engine 要求二者由调用方作为同源输入提供，但 Engine 不持有工具注册表，不从 executor 反查 schema，也不负责工具名路由、权限校验或运行时治理。
 
+`AgentPolicy.tool_execution_timeout_seconds` 是 Engine 等待 `ToolExecutor.execute` 返回 outcome 的握手超时预算，必须是有限正数。Engine 构造 `ToolExecutionContext` 时填入该值，并用同一预算等待工具执行协议返回。
+
 `ToolAwaitingOutcome` 是长时间运行工具的挂起契约。ToolExecutor 返回该 outcome 时，Engine 产出 `tool_awaiting` 和 `run_suspended`，事件 data 携带 `await_spec` 与 `snapshot`；`run_agent_and_wait` 返回 `EngineRunOutcomeSuspended`，同样携带这些机器可读恢复事实。
 
-`cancellation_token` 是 Engine 可观察的取消入口。Engine 在 run 开始、Runner 事件消费边界和工具执行等待边界观察该 token；取消命中后以 `run_cancelled` 事件和 `EngineRunOutcomeCancelled` 收口。取消不是普通失败、工具失败或最终回答，也不是公共异常类型。
+`cancellation_token` 是 Engine 可观察的取消入口。Engine 在 run 开始、Runner 事件消费边界、工具执行等待边界和下一轮工作开始前观察该 token；取消不是普通失败、工具失败或最终回答，也不是公共异常类型。已经被 Engine 接受的 RunnerEvent、工具 outcome、awaiting 事实和 final decision 不会被迟到取消改写。
 
 `AgentRunResult` 是 `run_agent_and_wait` 的终态返回联合，成员为 `EngineRunOutcomeFinalAnswer`、`EngineRunOutcomeFailed`、`EngineRunOutcomeCancelled`、`EngineRunOutcomeSuspended`。终态 outcome 只表达本次 run 的结果，不表达上层持久化状态。
 
@@ -204,12 +206,22 @@ run_agent_messages(request)
               -> provider_protocol_error
               -> context_compaction_requested
               -> iteration_completed
+              -> after each accepted RunnerEvent, observe cancellation_token
       -> if model requested tools
           -> emit EngineEvent.tool_call_requested
           -> ToolExecutor.execute(ToolExecutionRequest)
+              -> ToolExecutionContext.timeout_seconds = agent_policy.tool_execution_timeout_seconds
+              -> wait execute outcome with cancellation_token and handshake timeout
+          -> if cancellation_token wins before outcome
+              -> emit terminal EngineEvent.run_cancelled
+          -> if handshake timeout wins before outcome
+              -> cancel execute task
+              -> emit terminal EngineEvent.run_failed(tool_execution_timeout)
           -> if completed / failed outcome
               -> emit EngineEvent.tool_result_accepted
               -> inject ToolMessage into next iteration messages
+              -> if cancellation_token observed after injection
+                  -> emit terminal EngineEvent.run_cancelled
               -> if all outcomes failed enough times
                   -> fallback by agent_policy.fallback_mode
               -> if max_iterations budget remains
@@ -221,16 +233,15 @@ run_agent_messages(request)
               -> AsyncAgent emits EngineEvent.tool_awaiting
               -> close Runner
               -> AsyncAgent emits terminal EngineEvent.run_suspended
+              -> late cancellation does not replace run_suspended
       -> if fallback_mode is FORCE_ANSWER
+          -> observe cancellation_token before fallback Runner call
           -> append fallback_prompt to run-local messages
           -> AsyncRunner.call(messages, request.runner_options, tools=())
           -> emit EngineEvent.final_answer if content accepted
           -> emit EngineEvent.run_failed if force-answer is empty or still requests tools
       -> if fallback_mode is RAISE_ERROR
           -> emit EngineEvent.run_failed
-      -> if cancellation_token observed
-          -> emit EngineEvent.run_cancelled
-          -> close Runner
       -> if final content accepted
           -> emit EngineEvent.final_answer
           -> close Runner
@@ -336,13 +347,15 @@ Runner 的 `runner_done` 只表示本次 RunnerEvent 流结束；提升到 Engin
 
 ## 关键机制
 
-取消 token 是 Engine 的取消收口。Agent 在迭代前、Runner 事件消费后、工具执行前后观察 token；工具执行通过共享 runtime 的取消等待 helper 把 token 传入等待过程。公共结果以 `run_cancelled` 事件和 `EngineRunOutcomeCancelled` 表达。取消是当前 run 的终态；上层调用者要继续原目标时，需要用新的 `AgentRunRequest.messages` 显式提供已确认事实、用户意图或恢复输入。
+取消 token 是 Engine 的取消收口。Agent 在迭代前、Runner 事件消费后、工具执行等待边界和下一轮工作开始前观察 token；工具执行通过共享 runtime 的取消 / timeout 等待 helper 把 token 纳入等待过程。取消赢得当前边界时，公共结果以 `run_cancelled` 事件和 `EngineRunOutcomeCancelled` 表达。上层调用者要继续原目标时，需要用新的 `AgentRunRequest.messages` 显式提供已确认事实、用户意图或恢复输入。
 
-工具执行协议以 `ToolSchema` 快照和 `ToolExecutor.execute` 为边界。Engine 把 Runner 完成的工具调用投影为 `ToolExecutionRequest`，其中包含 run、session、iteration、tool call 与 correlation 信息；工具返回完成或失败 outcome 后，Engine 将结果投影为 LLM 可消费的 tool message。
+工具执行协议以 `ToolSchema` 快照和 `ToolExecutor.execute` 为边界。Engine 把 Runner 完成的工具调用投影为 `ToolExecutionRequest`，其中包含 run、session、iteration、tool call、correlation 信息、取消 token 与工具握手 timeout；工具返回完成或失败 outcome 后，Engine 先产出 `tool_result_accepted`，再将结果投影为 LLM 可消费的 tool message。若随后观察到取消，Engine 以 `run_cancelled` 收口，但不丢弃已接受的工具结果事实，也不进入下一轮 Runner。
+
+工具握手 timeout 是 Engine 对 `ToolExecutor.execute` 的等待预算，不是外部长事务 timeout。`AgentPolicy.tool_execution_timeout_seconds` 是该预算真源；timeout 先于 outcome 命中时，Engine 取消 execute task，并以不可恢复 `run_failed(tool_execution_timeout)` 收口。ToolExecutor / ToolRuntime 负责协作响应取消，并治理可能已经启动的线程、子进程、HTTP 请求或远端 job。
 
 挂起 / 恢复协议以 `ToolAwaitingOutcome` 为边界。工具开始外部长事务并建议挂起时，ToolExecutor 返回 `await_spec` 与 `snapshot`；Engine 先产出 `tool_awaiting`，再以 `run_suspended` 收口并关闭 Runner。Engine 不等待外部长事务完成，不持久化等待记录，也不恢复旧 Agent/Runner 实例；上层调用者保存 `await_spec` / `snapshot`，等工具终态确定后构造新的 `AgentRunRequest`，把工具终态结果或恢复输入显式交回 Engine。
 
-取消优先于挂起、最终回答和失败候选。Engine 已观察到 cancellation token 后，不再把同一次 run 收口为 `run_suspended` 或 `final_answer`。上层调用者把自己的取消命令映射成 run-local token，就能在外层强约束生命周期；把工具长事务映射成 `ToolAwaitingOutcome`，再用新 run 恢复，就能形成“宿主强约束下的 LLM in the loop”。
+Engine 的取消提交边界是“阻止未来工作，不覆盖已接受事实”。已经提升的 content / reasoning delta、已经接受的普通工具结果、已经返回的 awaiting outcome 和已经接受的 final decision 都会先按各自事实收口；取消只在尚未接受 outcome、下一轮 Runner、continuation 或 fallback 之前抢占。上层调用者把自己的取消命令映射成 run-local token，把长事务映射成 `ToolAwaitingOutcome`，再用新 run 恢复，就能形成“宿主强约束下的 LLM in the loop”。
 
 provider 协议错误与 HTTP / 网络错误分层处理。Runner 解析层错误产出 `provider_protocol_error`；HTTP、网络、超时和上下文超限产出 `runner_http_error`。其中上下文长度超限会被 Engine 提升为 `context_compaction_requested`，并以可恢复失败候选收口；是否压缩、如何恢复不属于 Engine。
 

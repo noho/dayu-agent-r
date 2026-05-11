@@ -158,7 +158,7 @@ OLD Engine 阅读范围：
 
 `dayu/engine/cancellation.py::await_or_cancel` 让业务 awaitable 与 cancellation waiter 竞争；取消先到时取消子任务并抛 `dayu.contracts.cancellation.CancelledError`。
 
-结论：取消真源应由 Host 持有，Engine、Runner、工具只观察。取消命中后不能继续产出 `final_answer`。
+结论：取消真源应由 Host 持有，Engine、Runner、工具只观察。取消命中后阻止未来工作，但不改写已经被 Engine 接受的 RunnerEvent、工具 outcome、awaiting 事实或 final decision。
 
 ### 2.7 ToolRegistry 与工具结果
 
@@ -339,7 +339,7 @@ Engine 位于 Host 下游，提供 Agent、Runner、tool calling 协议等运行
 - Runner 是 run-scoped，由 Agent 或函数式入口创建，并在 run 结束、取消、失败、挂起时关闭。
 - 新 run 的 Agent 自然拥有新的上下文预算、iteration 状态和 pending tool-call 状态；工具截断 cursor 属于 Host ToolRuntime。
 - Agent 只观察 Host 提供的取消令牌。
-- 在提交 `final_answer` 前必须再次检查取消。
+- final decision 进入提交边界前按 RunnerEvent 消费边界观察取消；final decision 已接受后，迟到取消不能把 `final_answer` 改写为 `run_cancelled`。
 
 并发约束：
 
@@ -352,7 +352,8 @@ Engine 位于 Host 下游，提供 Agent、Runner、tool calling 协议等运行
 - Agent 每轮 iteration 起点检查取消。
 - Runner 阻塞边界检查取消。
 - Host 侧 ToolExecutionContext 带 linked cancellation token。
-- 工具超时、取消、后台任务收口由 Host ToolRuntime 负责；Engine 只接收终态工具结果或等待事实。
+- Engine 负责 `ToolExecutor.execute` handshake 等待预算，并在 outcome 返回前超时时收口为不可恢复 `run_failed(tool_execution_timeout)`。
+- 外部长事务 timeout、取消传播、后台任务收口和 orphan control 由 Host / ToolRuntime / ToolExecutor 负责；Engine 只接收终态工具结果或等待事实。
 
 ## 7. Runner 接口文档
 
