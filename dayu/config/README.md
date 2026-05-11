@@ -1,7 +1,7 @@
 # Dayu 配置说明
 
 本手册只说明当前 `dayu/config/` 中已经存在的默认配置，以及它们与
-`workspace/config/` 的覆盖关系。Engine、Host、Fins 的内部机制不在这里展开。
+`workspace/config/` 的覆盖关系。Engine 与领域能力的内部机制不在这里展开。
 
 ## 配置层级
 
@@ -28,8 +28,7 @@ dayu/config/
 ```
 
 `llm_models.json` 定义默认模型入口和 provider 请求扩展；`run.json`
-定义运行时默认参数、工具限额、Host 存储与并发配置、trace 输出目录和
-conversation memory 参数。
+定义运行时默认参数与工具限额。
 
 ## llm_models.json
 
@@ -117,9 +116,6 @@ OpenAI-compatible runner 形态。
 | `doc_tool_limits` | 文档工具默认读取和列表限制 |
 | `fins_tool_limits` | 财报工具默认读取和列表限制 |
 | `web_tools_config` | Web 工具 provider、超时、抓取和浏览器配置 |
-| `host_config` | Host 存储路径、lane 并发、pending turn 和取消桥接参数 |
-| `tool_trace_config` | tool trace 输出配置 |
-| `conversation_memory` | 多轮会话记忆预算、压缩触发和 episode 限制 |
 
 这些配置属于默认值；具体项目应在 `workspace/config/run.json` 中覆盖。
 

@@ -2,7 +2,7 @@
 
 `大愚 Agent` 是每个投资者的助理分析师。  
 - `大愚 Agent` 是一个面向买方财报分析场景的 Agent 系统，但它不是简单的功能组合，`大愚 Agent` 让AI读财报的方式从丢给它整份财报“大海捞针”变成“按图索骥”，让数据有置信度，让投资结论、投资报告可审计、可追踪。  
-- `大愚 Agent` 还具备完整的“宿主强约束下的 LLM in the loop 的能力”，基础架构能力上已经对齐 OpenClaw ，后续会加上现在 OpenClaw 能做的事情。
+- `大愚 Agent` 的 Host 层正在重写中；当前主线保留 Engine、公共契约、运行时基础设施与配置真源。
 
 当前你可以用它完成四类工作：
 - 财报数据管线：美股 / A 股 / 港股财报下载，美股 / A 股 / 港股财报上传。
@@ -14,12 +14,9 @@
 - 最终使用者。
 
 如果你要参与开发，而不是只使用系统：
-- 总览开发手册：[dayu/README.md](dayu/README.md)
-- Host 手册：[dayu/host/README.md](dayu/host/README.md)
 - Engine 手册：[dayu/engine/README.md](dayu/engine/README.md)
-- Fins 手册：[dayu/fins/README.md](dayu/fins/README.md)
 - 配置手册：[dayu/config/README.md](dayu/config/README.md)
-- 贡献指南：[CONTRIBUTING.md](CONTRIBUTING.md)
+- Host 重写保留设计材料：[docs/host/design.md](docs/host/design.md)、[docs/host/interface-discussion-notes.md](docs/host/interface-discussion-notes.md)
 
 ## 0. 如果你想参与项目
 - 定性分析模板 读起来机械感还很强，还没写出差异化：
@@ -201,9 +198,8 @@ API Key 申请地址：
 - 默认推荐 Mimo Token Plan（mimo-v2.5-pro-plan），性价比最优。（注： MIMO_PLAN_API_KEY / MIMO_API_KEY 是两个不同的KEY，不能混用）。
 - 海外用户选Mimo Token Plan SG。
 - 如需接入 OpenRouter 等聚合服务，可在 `init` 中选择”自定义 OpenAI 兼容 API”，填写 `CUSTOM_OPENAI_API_KEY`、Base URL、模型 ID 与最大上下文 tokens。
-- 本地 Ollama 模型和自定义 OpenAI 兼容 API 在 `init` 时会根据最大上下文 tokens 自动配置 `conversation_memory`（>= 100 万 tokens 扩大工作记忆上限，< 100 万收紧情景记忆预算）；Ollama 的 `write_chapter` 并发 lane 默认设为 2。
+- 本地 Ollama 模型和自定义 OpenAI 兼容 API 在 `init` 时会写入对应模型配置；Ollama 的 `write_chapter` 并发 lane 默认设为 2。
 - `--reset` 确认后会删除 `workspace/.dayu/`、`workspace/config/`、`workspace/assets/`，再按首次初始化流程重建；它比 `--overwrite` 更彻底，会一并清空运行时状态。
-- 升级 dayu 后若运行命令时看到 `HostStore 检测到旧版 SQLite schema 与当前实现不兼容` 报错，按提示处理：优先删除报错信息里 `db_path` 指向的数据库文件后重启（仅丢失 host 运行状态，保留 conversation 历史与 `run.json`）；如果不方便定位也可以直接跑 `dayu-cli init --reset` 完整重建工作区。
 - 联网搜索默认可走 `auto`，若配置了 Tavily / Serper，会优先使用对应 provider。
 - 若运行环境需要访问 `localhost`、私网 IP 或内网域名，可在 `workspace/config/run.json` 的 `web_tools_config.allow_private_network_url` 中显式打开内网访问开关。
 - 修改默认模型请参考 [8. 模型配置](#model-config)。
@@ -217,7 +213,7 @@ workspace/
 ├── .dayu/            # 系统隐藏工作目录（batch 暂存、备份恢复等）
 ├── portfolio/        # 每个 ticker 的财报与材料
 ├── draft/            # write 输出目录
-└── output/           # tool trace 等辅助输出
+└── output/           # 运行输出和诊断辅助文件
 ```
 
 说明：`workspace/.dayu/` 由系统自动维护，当前会承载财报仓储的 batch 暂存与 crash recovery 备份；不需要手动创建或清理。如果运行有异常全部删除也没有影响。  
@@ -273,11 +269,6 @@ dayu-cli <subcommand> [参数]
 | `process` | 全量预处理（最终用户可无视） |
 | `process_filing` | 预处理单份 filing（最终用户可无视） |
 | `process_material` | 预处理单份 material（最终用户可无视） |
-| `conv` | 管理带 label 的可恢复 CLI 对话（最终用户可无视） |
-| `sessions` | 列出或关闭宿主会话（最终用户可无视） |
-| `runs` | 列出运行记录（最终用户可无视） |
-| `cancel` | 取消运行中的 run（最终用户可无视） |
-| `host` | 宿主维护（清理孤儿运行/查看状态，最终用户可无视） |
 > 注：预处理命令仅供开发使用，最终用户可忽略。
 
 共享参数：
@@ -297,14 +288,11 @@ dayu-cli <subcommand> [参数]
 | `--label` | `prompt` `interactive` | 把当前对话绑定到可恢复 label；`prompt` 会进入 labeled multi-turn，对应 scene 为 `prompt_mt` |
 | `--new-session` | `interactive` | 不续接上一次 interactive 多轮会话，改为从头开始一个新会话 |
 | `--web-provider` | `prompt` `interactive` `write` | 指定联网检索 provider，如 `auto`、`tavily`、`serper`、`duckduckgo` |
-| `--enable-tool-trace` | `prompt` `interactive` `write` | 开启工具调用追踪，覆盖 `run.json` 中的 trace 配置 |
-| `--tool-trace-dir` | `prompt` `interactive` `write` | 指定 trace 输出目录，覆盖 `run.json` 中的 trace 配置 |
 | `--thinking` / `--no-thinking` | `prompt` `interactive` | 控制是否在终端回显模型思考过程 |
 
 说明：
 - `--log-level`、`--debug`、`--verbose`、`--info`、`--quiet` 是同一组日志参数，使用其一即可。
 - `prompt`、`interactive`、`write` 还支持更多 Agent 运行参数，例如 `--tool-timeout-seconds`、`--max-iterations`、`--doc-limits-json`、`--fins-limits-json`；需要时可用 `dayu-cli <subcommand> --help` 查看完整列表。
-- 宿主管理命令同样支持 `--base` / `--config` / 日志参数；例如 `dayu-cli host --base ./workspace status`、`dayu-cli sessions --base ./workspace --source cli --scene interactive`、`dayu-cli conv --base ./workspace list`。
 - `interactive` 默认会续接本地绑定的同一个多轮会话；如果上一次回答还没完整回显到终端，重启 CLI 会先把那次回答补完，再进入新的输入循环。
 
 ### 2.2 Web 入口（Streamlit）
@@ -374,8 +362,6 @@ dayu-wechat <command> [参数]
 | `--max-consecutive-failed-tool-batches` | `run` `service install` | 覆盖连续失败工具批次上限 |
 | `--max-duplicate-tool-calls` | `run` `service install` | 覆盖重复工具调用连续上限 |
 | `--duplicate-tool-hint-prompt` | `run` `service install` | 覆盖重复工具调用提示词 |
-| `--enable-tool-trace` | `run` `service install` | 开启工具调用追踪 |
-| `--tool-trace-dir` | `run` `service install` | 指定 trace 输出目录 |
 | `--doc-limits-json` | `run` `service install` | 覆盖文档工具 limits |
 | `--fins-limits-json` | `run` `service install` | 覆盖财报工具 limits |
 | `--typing-interval-sec` | `run` `service install` | 控制 typing 提示发送间隔 |
@@ -572,8 +558,6 @@ dayu-cli interactive --temperature 0.2
 dayu-cli interactive --thinking
 dayu-cli interactive --label apple
 dayu-cli interactive --new-session
-dayu-cli sessions --source cli --scene interactive
-dayu-cli conv status --label apple
 dayu-cli interactive --verbose
 ```
 
@@ -586,8 +570,6 @@ dayu-cli interactive --verbose
 - 带 `--label` 的 CLI 启动时，会明确提示当前是“新创建标签”还是“恢复标签”；`prompt --label` 在回答末尾还会再次打印标签提示框，方便你后续继续复用同一个 label。
 - 同一个 label 在任意时刻只能被一个 CLI 进程占用：`interactive --label` 会在整个 REPL 生命周期内持有该 label，直到双 `Ctrl+D` 完整退出；`prompt --label` 会在本轮返回最终回答前持有该 label。若命中占用中的 label，CLI 会提示你等待当前对话结束后重试，或改用新的 `--label`。
 - 如果你在 workspace 本地覆写了 `prompt_mt` 或其他带 label 会命中的 scene manifest，必须保留 `conversation.enabled=true`；否则 CLI 会直接拒绝执行该 labeled conversation。
-- 如果某个 label 对应的底层 session 已经被 `dayu-cli sessions close` 关闭，下次再用同名 `--label` 时，CLI 会先提示“旧对话已关闭”，再按全新对话重新创建该 label；如果你是通过 `conv remove --label` 主动释放 label，则下次直接按普通新建处理，不额外提示。
-- 如果你想查看底层 Host session，可用 `dayu-cli sessions --source cli --scene interactive` 或 `dayu-cli sessions --source cli --scene prompt_mt`；如果你想查看或释放 label 到会话的映射，使用 `dayu-cli conv list`、`dayu-cli conv list --all`、`dayu-cli conv status --label <label>` 与 `dayu-cli conv remove --label <label>`。其中 `conv list` 默认只展示 active 的 labeled conversation，`conv list --all` 额外包含已关闭对话；若某个 label 的 registry record 已漂移到不存在的 Host session，CLI 会先自动清理再继续执行，不再展示 `missing`。`conv remove --label` 会先关闭底层 session（若仍存在），再释放该 label；之后同名 `--label` 会从全新对话开始。若你通过 `sessions close` 关闭了某个带 label 的底层 session，下次同名 `--label` 会在提示后创建新的会话，而不是恢复旧 transcript。若你需要诊断底层 `session_id`，请用 `conv status --label <label>` 或直接查看 `sessions`。
 - 默认不回显模型思考过程；如需在终端查看，显式传 `--thinking`。
 
 ### 3.5 微信对话 daemon：
@@ -600,8 +582,8 @@ dayu-cli interactive --verbose
 | 命令 | 关键参数 | 说明 |
 |------|------|------|
 | `login` | `--label` `--relogin` `--qrcode-timeout-sec` | 建立或刷新登录态 |
-| `run` | `--model-name` `--temperature` `--web-provider` `--debug-sse` `--fallback-mode` `--enable-tool-trace` | 在当前终端以前台方式运行 |
-| `service install` | `--label` `--model-name` `--temperature` `--web-provider` `--debug-sse` `--fallback-mode` `--enable-tool-trace` | 安装后台服务 |
+| `run` | `--model-name` `--temperature` `--web-provider` `--debug-sse` `--fallback-mode` | 在当前终端以前台方式运行 |
+| `service install` | `--label` `--model-name` `--temperature` `--web-provider` `--debug-sse` `--fallback-mode` | 安装后台服务 |
 | `service start` | `--label` | 启动后台服务 |
 | `service restart` | `--label` | 重启后台服务 |
 | `service stop` | `--label` | 停止后台服务 |
@@ -646,7 +628,6 @@ dayu-wechat run
 ```bash
 dayu-wechat login --relogin
 dayu-wechat run --model-name mimo-v2.5-pro-thinking --temperature 0.4
-dayu-wechat run --enable-tool-trace
 dayu-wechat service install
 dayu-wechat service start
 dayu-wechat service restart
@@ -707,8 +688,7 @@ dayu-cli write --ticker AAPL --infer
 dayu-cli write --ticker AAPL --summary
 dayu-cli write --ticker AAPL \
   --template ./workspace/assets/定性分析模板.md \
-  --output ./workspace/draft/AAPL \
-  --enable-tool-trace
+  --output ./workspace/draft/AAPL
 ```
 
 命令说明：
@@ -964,221 +944,16 @@ dayu-cli process --ticker AAPL --ci --document-id fil_001 --document-id fil_002
 - `dayu-cli write --summary --ticker AAPL` 的摘要输出
 - 需要排查问题时，再看对应的 `*_audit.json`
 
-## 5. tool trace 分析
+## 5. Engine provider smoke
 
-如果你在 `prompt` / `interactive` / `write` 时开启了 trace：
-
-```bash
-dayu-cli prompt \
-  "总结最新财报风险" \
-  --ticker AAPL \
-  --enable-tool-trace
-```
-
-trace 默认写入 `workspace/output/tool_call_traces`。分析命令：
-
-```bash
-python -m utils.analyze_tool_trace \
-  --input ./workspace/output/tool_call_traces \
-  --ticker AAPL \
-  --output ./workspace/trace_analysis_AAPL.md
-```
-
-这个脚本会输出：
-- 工具级诊断总表（成功率、截断率、载荷大小、错误分布）
-- 详细失败签名（例如 URL 拦截、HTTP 状态、超时等），而不只停留在粗粒度 `error_code`
-- 单独汇总 `sse_protocol_error`，直接展示 `partial_tool_name`、失败时的 `arguments` 前缀以及对应 `sse_error_*.json` 冷存路径
-- 围绕“降低模型认知负担”的信号分析
-- 截断续读、重复调用、上下文负担、失败与降级诊断
-- 各 run / turn 的工具调用链与 trace 完整性检查
-- 面向工具设计的优化建议
-
-### 5.0 Host P7 durable trace（NEW，schema `tool_trace_v2_host`）
-
-Host P6/P7 路径下的 durable EventLog 自带一条**新的** trace 落盘通道，
-用于人工排查 EventLog 与 LLM-facing 上下文的真实事实。装配入口：
-
-```python
-from dayu.host._durable_harness import (
-    DurableHarnessConfig,
-    build_durable_harness,
-)
-
-bundle = build_durable_harness(
-    config=DurableHarnessConfig(
-        database_path="workspace/host.sqlite",
-        tool_trace_path="workspace/output/host_tool_trace",
-    ),
-)
-```
-
-- `tool_trace_path` 非空时装配 `ToolTraceObserver` + `ToolTraceJsonlSink`，
-  trace 会以 JSONL 写入
-  `<root>/sessions/<session_id>/tool_calls_NNNNNN.jsonl`（约 10MB 滚动），
-  `RUN_INPUT_CONTEXT_SNAPSHOT_BUILT` 只在 EventLog hot row 保存 raw payload
-  的 blob id / sha256 / byte size；完整 input / tool schema raw payload 在
-  同一个 `HostStorage.transaction()` 写入 `run_input_raw_payloads`，trace
-  projection 读取并校验后再落
-  `<root>/raw_payloads/<run_id>_<iteration_id>/<blob_id>.json`，先写 tmp +
-  `os.replace` 原子落地。
-- schema 字面量为 `tool_trace_v2_host`，**与旧 `tool_trace_v2` 不兼容**，
-  治理边界、字段集合、idempotency_key 计算方式都不同。
-- 行内 sha256[:32] `idempotency_key` 让重复 replay 的孤儿副本可以被 analyzer
-  去重；P7 没有在 SQLite 引入 `host_tool_trace_*` 表。
-
-人工 smoke：
+当前 `utils/` 只保留 Engine provider smoke 脚本，用于人工验证 OpenAI-compatible provider 的基础 Agent 主链路。它不属于生产入口，也不读取 Host 配置。
 
 ```bash
 source .venv/bin/activate
-python utils/smoke_host_p7_tool_trace.py
-# 末尾会自动调 analyzer，并打印 tmp 目录路径供 inspect。
+python utils/smoke_async_agent_providers.py --case mimo-v2.5-pro-plan
 ```
 
-独立 analyzer：
-
-```bash
-python utils/analyze_tool_trace_host.py <trace_root>
-```
-
-`utils/analyze_tool_trace_host.py` 仅识别 `tool_trace_v2_host` schema，
-遇到 OLD `tool_trace_v2` 文件直接抛 `ValueError`；它输出去重后的 record
-计数、重复 tool_call、truncation 后未续读 fetch_more、fetch_more 引用未知
-cursor、`provider_protocol_error` 数量、provider partial tool call bounded
-summary、`final_response` 是否存在，以及同 run 内 `source_event_position`
-是否单调。
-
-> 5.0 与 5（`utils.analyze_tool_trace`）面向**两条不同的 trace 路径**：
-> 5 是 CLI 历史 OLD trace，沿用 `tool_trace_v2` schema 与既有 markdown
-> 报告；5.0 是 Host durable harness 的 NEW trace。两条路径不互通，分析
-> 工具不应混用。
-
-### 5.1 网页抓取诊断
-
-当你遇到“浏览器能打开，但 `fetch_web_page` / `requests` / Playwright 访问失败”的 URL 时，可以用下面的脚本把同源证据导出成 JSON：
-
-```bash
-python -m utils.diagnose_web_access \
-  --url "https://investor.pddholdings.com/news-releases/news-release-details/pdd-holdings-announces-fourth-quarter-2025-and-fiscal-year-2025" \
-  --output ./workspace/output/web_diagnostics/pdd-ir.json
-```
-
-如需用有界面 Chrome 观察实际打开过程：
-
-```bash
-python -m utils.diagnose_web_access \
-  --url "https://example.com" \
-  --headed \
-  --channel chrome
-```
-
-如需在人工完成验证后导出可复用的浏览器状态：
-
-```bash
-python -m utils.diagnose_web_access \
-  --url "https://www.reuters.com/..." \
-  --headed \
-  --channel chrome \
-  --manual-wait-seconds 30 \
-  --pause-before-snapshot \
-  --storage-state-out ./workspace/output/web_diagnostics/storage_states/www.reuters.com.json
-```
-
-仓库内也提供了更省事的包装脚本：
-
-```bash
-./utils/diag_web.sh "https://www.reuters.com/..."
-```
-
-它默认会用有界面 Chrome 打开页面，并等待 30 秒供你人工操作；30 秒到达后会自动继续采样页面状态并保存诊断结果。
-
-它也会按 host 自动读写 `workspace/output/web_diagnostics/storage_states/<host>.json`：
-- 第一次运行时，若状态文件不存在，只会导出新的 state，不会报错
-- 后续再运行同一 host 时，会自动把已有 state 喂回诊断脚本
-
-脚本会导出：
-- 浏览器主文档 request headers 与导航结果
-- 当前仓库 `fetch_web_page` 的调用结果，以及工具层 `extra.internal_diagnostics`
-- `requests` 将发送的 headers 与实际 GET 结果
-- Playwright 观察到的网络请求摘要
-- 浏览器页面的文本/HTML 前缀，便于判断 challenge/access gate
-
-若某些受保护站点只能靠人工浏览器通过验证，可把导出的 state 文件放进 `run.json.web_tools_config.playwright_storage_state_dir` 指向的目录；`fetch_web_page` 会按 host 自动复用对应的 `<host>.json`。
-
-### 5.2 批量诊断与 CI
-
-如果你的目标不是“修一个站点”，而是让 CI 持续产出一批可分析的 `web_diagnostics` 原始证据，再由后续分析去定位 `fetch_web_page` 的 root cause，推荐直接使用 `diagnose_web_access` 的批量模式：
-
-```bash
-python -m utils.diagnose_web_access \
-  --url-file ./utils/web_ci_urls.jsonl \
-  --run-label 20260406-sample \
-  --storage-state-dir ./workspace/output/web_diagnostics/storage_states
-```
-
-仓库里已经附带了一份 sample corpus：`./utils/web_ci_urls.jsonl`。它覆盖常见新闻网站、财经网站和政府/监管组织，并包含中国与海外站点，可直接作为第一轮诊断样本。
-
-如果你直接使用仓库内的包装脚本：
-
-```bash
-./utils/diag_web_batch.sh ./utils/web_ci_urls.jsonl
-```
-
-它默认也会开启有界面 Chrome，并为每条 URL 等待 30 秒供你人工操作；30 秒到达后会自动继续采样并保存诊断结果。
-
-它会对每个 URL 逐条导出同源诊断 JSON，单条诊断里默认包含三条访问路径：
-- 人工/自动浏览器侧的 Playwright 诊断
-- `requests` 侧的实际请求结果
-- 当前仓库 `fetch_web_page` 的调用结果
-
-如果你需要人工浏览器先完成验证，再采样页面状态并保存可复用 cookie / local storage，可在批量模式下继续加：
-
-```bash
-python -m utils.diagnose_web_access \
-  --url-file ./utils/web_ci_urls.jsonl \
-  --run-label 20260406-manual \
-  --headed \
-  --channel chrome \
-  --manual-wait-seconds 30 \
-  --pause-before-snapshot \
-  --storage-state-dir ./workspace/output/web_diagnostics/storage_states
-```
-
-只有显式传入 `--pause-before-snapshot` 时，脚本才会在等待结束后继续要求你按回车确认。
-
-默认每条 URL 都会在独立子进程里执行，并在执行前删除 `workspace/.dayu/session`，避免进程内 Session、warmup host 和 Playwright 单例污染下一条 URL。这样 CI 侧只需要稳定地产出 `web_diagnostics`，后续分析和优化可以基于这些原始结果继续进行。
-
-URL 文件支持两种格式：
-
-1. JSONL：适合带元数据的长期基准集
-
-```json
-{"url":"https://finance.yahoo.com/quote/AAPL/","label":"Yahoo Finance AAPL","region":"foreign","category":"quote"}
-{"url":"https://www.reuters.com/markets/companies/AAPL.OQ/","label":"Reuters AAPL","region":"foreign","category":"company-page"}
-{"url":"https://www.stcn.com/article/detail/1568835.html","label":"证券时报示例","region":"china","category":"news"}
-```
-
-2. TXT：每行一个 URL，适合快速试跑
-
-```text
-https://finance.yahoo.com/quote/AAPL/
-https://www.reuters.com/markets/companies/AAPL.OQ/
-```
-
-常用参数：
-- `--storage-state-dir`：按 host 自动读写 storage state 目录
-- `--headed`：启用有界面浏览器，便于人工观察和手工通过验证
-- `--manual-wait-seconds`：导航后先额外等待多少秒
-- `--pause-before-snapshot`：人工确认完成后，再按回车继续采样和保存 state
-- `--skip-playwright`：只跑 `requests` 与 `fetch_web_page`
-- `--skip-tool-fetch`：只收集浏览器与 `requests` 诊断，不调用 `fetch_web_page`
-
-输出目录默认写到 `workspace/output/web_diagnostics/<run_label>/`，其中包括：
-- `corpus.normalized.jsonl`：本轮归一化后的样本集
-- `diagnostics/`：每条 URL 的完整诊断 JSON
-- `results.jsonl`：从完整诊断提炼出的批量索引，便于后续程序分析
-- `summary.json` / `summary.md`：本轮批量诊断汇总
-
-如果你希望我直接参与 CI 优化流程，那么 CI 侧只需要跑完这一步并保留 `workspace/output/web_diagnostics/<run_label>/`，后续我就可以基于这批 `web_diagnostics` 结果做差异分析、找 root cause，并继续优化 `fetch_web_page`。
+缺少对应 API key 时，脚本会跳过该 provider case 并以 0 退出；轻量无网络测试位于 `tests/engine/test_smoke_async_agent_providers.py`。
 
 ## 6. 渲染输出
 
@@ -1213,13 +988,13 @@ dayu-render workspace/draft/AAPL/AAPL_qual_report.md report.html
 | 文件/目录 | 用途 |
 |-----------|------|
 | `workspace/config/llm_models.json` | 模型配置、API Key 占位符 |
-| `workspace/config/run.json` | Agent 行为、Host 配置、工具超时、trace、budget、limits；CLI / WeChat 的 chat 与 prompt 默认执行参数也在运行时由 Host 基于这里继续收敛 |
+| `workspace/config/run.json` | Agent 行为、工具超时、budget 与 limits |
 | `workspace/config/prompts/` | prompt 资产 |
 
 建议修改方式：
 - 想换模型：改 `llm_models.json`
-- 想新增自定义模型：先在 `workspace/config/llm_models.json` 里添加模型配置；再把该模型加入对应 scene manifest 的 `workspace/config/prompts/manifests/*.json -> model.allowed_names`，必要时改 `model.default_name`；如果该模型要长期参与 `interactive` 多轮会话，建议同时给该模型补 `runtime_hints.conversation_memory`
-- 想调 Agent 行为：改 `run.json`；其中 `conversation_memory` 控制 `interactive` 多轮会话的历史预算与压缩策略
+- 想新增自定义模型：先在 `workspace/config/llm_models.json` 里添加模型配置；再把该模型加入对应 scene manifest 的 `workspace/config/prompts/manifests/*.json -> model.allowed_names`，必要时改 `model.default_name`
+- 想调 Agent 行为：改 `run.json` 中的运行参数、工具超时与工具 limits
 - 想改系统提示词和任务提示词：改 `prompts/`
 
 配置说明请看：
@@ -1369,12 +1144,9 @@ dayu-render workspace/draft/AAPL/AAPL_qual_report.md report.html
 ## 9. 文档导航
 
 - 用户手册（当前文档）：[README.md](README.md)
-- 开发手册总览：[dayu/README.md](dayu/README.md)
-- Host 包开发手册：[dayu/host/README.md](dayu/host/README.md)
 - Engine 包开发手册：[dayu/engine/README.md](dayu/engine/README.md)
-- Fins 包开发手册：[dayu/fins/README.md](dayu/fins/README.md)
 - 配置说明手册：[dayu/config/README.md](dayu/config/README.md)
-- 贡献指南：[CONTRIBUTING.md](CONTRIBUTING.md)
+- Host 重写设计材料：[docs/host/design.md](docs/host/design.md)、[docs/host/interface-discussion-notes.md](docs/host/interface-discussion-notes.md)
 
 ## 10. 开源与许可证
 
