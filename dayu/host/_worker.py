@@ -9,9 +9,8 @@ import logging
 from collections.abc import AsyncIterator
 from dataclasses import dataclass
 
-from dayu.contracts import CancellationToken, ToolExecutor
+from dayu.contracts import CancellationToken, ToolExecutor, ToolSchema
 from dayu.engine import AgentRunRequest, EngineEvent, run_agent_messages
-from dayu.host._engine_tool_schema_provider import EngineToolSchemaProvider
 from dayu.host.contracts import StartRunRequest
 from dayu.runtime.log_levels import VERBOSE_LOG_LEVEL
 
@@ -23,31 +22,26 @@ class EngineWorker:
     """Host 内部 EngineWorker capability。
 
     :param tool_executor: Host 内部代持的工具执行器。
-    :param schema_provider: Host 内部 framework schema provider；只返回
-        Engine-visible ``ToolSchema``。
     """
 
     tool_executor: ToolExecutor
-    schema_provider: EngineToolSchemaProvider | None = None
 
     def run_agent_messages(
         self,
         request: StartRunRequest,
+        tool_schemas: tuple[ToolSchema, ...],
         cancellation_token: CancellationToken,
     ) -> AsyncIterator[EngineEvent]:
         """调用 Engine 函数式入口并返回 EngineEvent 流。
 
         :param request: Host P1 start_run 请求。
+        :param tool_schemas: Host 已显式确定的当前 Engine-visible 工具
+            schema 集合。
         :param cancellation_token: Host 注入的取消观察 token。
         :returns: EngineEvent 异步流。
         :raises Exception: 透传 Engine 运行异常。
         """
 
-        tool_schemas = request.options.tool_schemas
-        if self.schema_provider is not None:
-            tool_schemas = self.schema_provider.engine_visible_tool_schemas(
-                tool_schemas
-            )
         engine_request = AgentRunRequest(
             run_id=request.run_id,
             session_id=request.session_id,

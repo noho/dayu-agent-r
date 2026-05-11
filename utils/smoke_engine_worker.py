@@ -325,6 +325,7 @@ async def _capture_engine_worker_request(
     try:
         async for _event in worker.run_agent_messages(
             request=request,
+            tool_schemas=request.options.tool_schemas,
             cancellation_token=_SmokeCancellationToken(),
         ):
             pass
@@ -610,6 +611,7 @@ async def run_case(
     print(f"{_CASE_PREFIX} {case.name} worker=EngineWorker stream={stream}")
     async for event in worker.run_agent_messages(
         request=request,
+        tool_schemas=request.options.tool_schemas,
         cancellation_token=_SmokeCancellationToken(),
     ):
         summary = safe_event_summary(event)

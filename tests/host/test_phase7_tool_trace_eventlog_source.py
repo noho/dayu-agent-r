@@ -21,7 +21,7 @@ from pathlib import Path
 
 import pytest
 
-from dayu.contracts import CancellationToken
+from dayu.contracts import CancellationToken, ToolSchema
 from dayu.engine import (
     AgentMessageRole,
     AgentPolicy,
@@ -105,6 +105,7 @@ class _StubProxy:
     def stream_engine_events(
         self,
         request: StartRunRequest,
+        tool_schemas: tuple[ToolSchema, ...],
         cancellation_token: CancellationToken,
     ) -> AsyncIterator[EngineEvent]:
         """返回预定义事件流。

@@ -48,7 +48,7 @@ def _ensure_repo_root_on_path() -> None:
 
 _ensure_repo_root_on_path()
 
-from dayu.contracts import CancellationToken  # noqa: E402
+from dayu.contracts import CancellationToken, ToolSchema  # noqa: E402
 from dayu.engine import (  # noqa: E402
     AgentMessageRole,
     AgentPolicy,
@@ -172,6 +172,7 @@ class _StubProxy:
     def stream_engine_events(
         self,
         request: StartRunRequest,
+        tool_schemas: tuple[ToolSchema, ...],
         cancellation_token: CancellationToken,
     ) -> AsyncIterator[EngineEvent]:
         """返回预定义事件流。

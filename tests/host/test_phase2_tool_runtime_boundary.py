@@ -5,7 +5,7 @@ from __future__ import annotations
 import ast
 import json
 from collections.abc import AsyncIterator, Mapping
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from datetime import datetime
 from pathlib import Path
 
@@ -46,6 +46,8 @@ from dayu.host._framework_tools import FRAMEWORK_FETCH_MORE_NAME
 from dayu.host._tool_result_truncation import extract_truncation_hint
 from dayu.host._run_harness import LocalRunHarness
 from dayu.host._tool_runtime import HostToolRuntime
+from dayu.host._worker import EngineWorker
+import dayu.host._worker as worker_module
 from dayu.host.contracts import RunInput, RunOptions, StartRunRequest
 from tests.host._memory_store_fake import FakeInMemoryConversationMemoryStore
 
@@ -116,40 +118,61 @@ class _UnavailableProxy:
     def stream_engine_events(
         self,
         request: StartRunRequest,
+        tool_schemas: tuple[ToolSchema, ...],
         cancellation_token: CancellationToken,
     ) -> AsyncIterator[EngineEvent]:
         """防止 schema preflight 测试误启动 Engine。
 
         :param request: start_run 请求。
+        :param tool_schemas: Engine-visible schema；本测试不使用。
         :param cancellation_token: 取消 token。
         :returns: 不返回。
         :raises AssertionError: 始终抛出。
         """
 
         _ = request
+        _ = tool_schemas
         _ = cancellation_token
         raise AssertionError("schema preflight should reject before proxy")
 
 
-@dataclass(frozen=True, slots=True)
-class _SchemaProvider:
-    """测试用 Engine schema provider。"""
+@dataclass(slots=True)
+class _RecordingSchemaProxy:
+    """记录 Harness 传给 EngineWorker 边界的 schema。"""
 
-    schemas: tuple[ToolSchema, ...]
+    requests: list[StartRunRequest] = field(default_factory=list)
+    schemas_seen: list[tuple[ToolSchema, ...]] = field(default_factory=list)
 
-    def engine_visible_tool_schemas(
+    def stream_engine_events(
         self,
-        user_tool_schemas: tuple[ToolSchema, ...],
-    ) -> tuple[ToolSchema, ...]:
-        """返回预设 schema。
+        request: StartRunRequest,
+        tool_schemas: tuple[ToolSchema, ...],
+        cancellation_token: CancellationToken,
+    ) -> AsyncIterator[EngineEvent]:
+        """记录显式 schema 并返回空 Engine 事件流。
 
-        :param user_tool_schemas: 调用方 schema。
-        :returns: 预设 schema。
+        :param request: start_run 请求。
+        :param tool_schemas: Host 已确定的 Engine-visible schema。
+        :param cancellation_token: 取消 token。
+        :returns: 空 EngineEvent 异步流。
         :raises Exception: 不主动抛出异常。
         """
 
-        _ = user_tool_schemas
-        return self.schemas
+        _ = cancellation_token
+        self.requests.append(request)
+        self.schemas_seen.append(tool_schemas)
+        return self._empty()
+
+    async def _empty(self) -> AsyncIterator[EngineEvent]:
+        """返回空 EngineEvent 流，让 Host 以 missing terminal 收口。
+
+        :returns: 空 EngineEvent 异步流。
+        :raises Exception: 不主动抛出异常。
+        """
+
+        empty_events: tuple[EngineEvent, ...] = ()
+        for event in empty_events:
+            yield event
 
 
 def _request(
@@ -410,8 +433,8 @@ def test_caller_provided_fetch_more_schema_is_rejected_even_when_identical() -> 
         runtime.engine_visible_tool_schemas((framework_schema,))
 
 
-def test_engine_visible_request_returns_original_without_provider() -> None:
-    """无 provider 时 ``_engine_visible_request`` 原样返回 request。"""
+def test_resolve_engine_tool_schemas_returns_user_schemas_without_runtime() -> None:
+    """无 ToolRuntime 时 Harness 只传调用方业务 schema。"""
 
     harness = LocalRunHarness(
         is_durable=False,
@@ -421,27 +444,86 @@ def test_engine_visible_request_returns_original_without_provider() -> None:
     )
     request = _start_request(tool_schemas=())
 
-    assert harness._engine_visible_request(request) is request
+    assert harness._resolve_engine_tool_schemas(request.options.tool_schemas) == ()
 
 
-def test_engine_visible_request_replaces_tool_schemas_from_provider() -> None:
-    """provider 返回增强 schema 时 ``_engine_visible_request`` 构造 request 副本。"""
+@pytest.mark.asyncio
+async def test_harness_passes_explicit_schemas_without_mutating_request() -> None:
+    """Harness 只传显式 schema 参数，不把 framework schema 写回 request。"""
 
+    runtime, store = _runtime()
     schema = _tool_schema("demo")
-    enhanced = _tool_schema("fetch_more")
+    proxy = _RecordingSchemaProxy()
     harness = LocalRunHarness(
         is_durable=False,
-        proxy=_UnavailableProxy(),
-        event_store=InMemoryRunEventStore(),
+        proxy=proxy,
+        event_store=store,
+        tool_runtime=runtime,
         memory_store=FakeInMemoryConversationMemoryStore(),
-        engine_tool_schema_provider=_SchemaProvider(schemas=(schema, enhanced)),
     )
     request = _start_request(tool_schemas=(schema,))
 
-    projected = harness._engine_visible_request(request)
+    stream = await harness.start_run(request)
+    async for _event in stream.events:
+        pass
 
-    assert projected is not request
-    assert projected.options.tool_schemas == (schema, enhanced)
+    assert request.options.tool_schemas == (schema,)
+    assert len(proxy.requests) == 1
+    assert proxy.requests[0].options.tool_schemas == (schema,)
+    names = tuple(schema.function.name for schema in proxy.schemas_seen[0])
+    assert names == ("demo", FRAMEWORK_FETCH_MORE_NAME)
+
+
+@pytest.mark.asyncio
+async def test_engine_worker_uses_explicit_tool_schemas(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """EngineWorker 只使用显式 schema 参数装配 Engine request。"""
+
+    captured: list[engine.AgentRunRequest] = []
+
+    async def _empty_events() -> AsyncIterator[EngineEvent]:
+        """返回空 EngineEvent 流。
+
+        :returns: 空异步事件流。
+        :raises Exception: 不主动抛出异常。
+        """
+
+        empty_events: tuple[EngineEvent, ...] = ()
+        for event in empty_events:
+            yield event
+
+    def _capture_run_agent_messages(
+        request: engine.AgentRunRequest,
+    ) -> AsyncIterator[EngineEvent]:
+        """捕获 Engine request。
+
+        :param request: EngineWorker 装配出的 request。
+        :returns: 空 EngineEvent 流。
+        :raises Exception: 不主动抛出异常。
+        """
+
+        captured.append(request)
+        return _empty_events()
+
+    monkeypatch.setattr(
+        worker_module,
+        "run_agent_messages",
+        _capture_run_agent_messages,
+    )
+    caller_schema = _tool_schema("caller_tool")
+    explicit_schema = _tool_schema("explicit_tool")
+    worker = EngineWorker(tool_executor=_Executor(value={}))
+
+    async for _event in worker.run_agent_messages(
+        request=_start_request(tool_schemas=(caller_schema,)),
+        tool_schemas=(explicit_schema,),
+        cancellation_token=_Token(),
+    ):
+        pass
+
+    assert len(captured) == 1
+    assert captured[0].tool_schemas == (explicit_schema,)
 
 
 @pytest.mark.asyncio
@@ -453,8 +535,8 @@ async def test_start_run_rejects_fetch_more_schema_before_user_input_event() -> 
         is_durable=False,
         proxy=_UnavailableProxy(),
         event_store=store,
+        tool_runtime=runtime,
         memory_store=FakeInMemoryConversationMemoryStore(),
-        engine_tool_schema_provider=runtime,
     )
     request = _start_request(tool_schemas=(_tool_schema(FRAMEWORK_FETCH_MORE_NAME),))
 

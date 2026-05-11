@@ -1055,7 +1055,9 @@ class WorkerCancelRequest:
 class EngineWorker(Protocol):
     def run_agent_messages(
         self,
-        request: AgentRunRequest,
+        request: StartRunRequest,
+        tool_schemas: tuple[ToolSchema, ...],
+        cancellation_token: CancellationToken,
     ) -> AsyncIterator[EngineEvent]: ...
 
     async def cancel(self, request: WorkerCancelRequest) -> None: ...
@@ -1087,6 +1089,31 @@ ToolExecutor 由 EngineWorker 替 Host 在执行环境中代持，并提供给 E
 - Engine 只消费 `ToolExecutor` protocol。
 - Engine 不知道 ToolExecutor 是本地实现还是远程 worker 内实现。
 - Engine 不注册工具、不发现工具、不持有 ToolRegistry。
+
+EngineWorker 同时是 Host 把“当前对 Engine 生效的工具 schema”交给 Engine 的唯一适配边界。Host /
+ToolRuntime 可以在自身内部使用更强的工具声明对象、内部 schema 表达或 `ToolDefinition`，但进入 EngineWorker
+之后必须收敛为显式的 `tuple[ToolSchema, ...]`，再交给 Engine。这里不应使用 callback-style
+`schema_provider` 让 EngineWorker 在运行中回调 Runtime 重新计算 schema；当前生效 schema 应由 Host 装配 /
+Runtime 在进入 EngineWorker 前显式产出，避免 Harness 与 Worker 双重增强、重入调用或隐式副作用。
+
+LocalRunHarness 不负责把 framework tools 投影成 Engine-visible schema。Harness 的职责是 Run lifecycle、
+EventLog、attempt、memory、compact 与治理收口；它可以携带调用方原始业务 tool schema，但不应知道
+OpenAI / Anthropic / Gemini 等 provider schema 形状，也不应通过私有 helper 二次增强 request。若 Host 需要把
+`fetch_more` 等 framework tool 暴露给模型，ToolRuntime / 装配层先把它加入当前生效的 Dayu 抽象
+`ToolSchema` 集合，再由 EngineWorker 显式传给 Engine。
+
+Provider-specific schema 翻译不属于 Host。当前 OpenAI 路径中，Dayu 抽象 `ToolSchema` 到 OpenAI
+`tools` payload 的翻译位置仍是 Engine 的 OpenAI runner payload adapter
+（`dayu/engine/runners/openai/payload.py::_serialize_tool_schema`）。P8.5 不移动该边界；未来支持 Anthropic
+API 时，再在 Engine / Runner 的 provider adapter 层决定 Anthropic schema shape，而不是让 Host Harness
+感知 provider 细节。
+
+该边界的长期收益是把 Host 内部工具定义机制与 Engine/provider 协议解耦。`@tool` 只是当前用于声明
+schema、display metadata 与 callable 绑定的一种便利方式，不应成为 Host / Engine 边界契约。未来若需要把
+工具定义改成配置文件、数据库 catalog、remote tool manifest、代码生成 schema，或 P10 ToolRegistry 下的
+权限化工具描述，Host 只需要把这些内部表达投影为当前生效的 Dayu 抽象 `ToolSchema` 集合并交给 EngineWorker；
+Engine / Runner 仍只处理抽象 `ToolSchema` 到 provider-specific payload 的转换。这样既能轻易替换工具定义来源，
+也避免 `LocalRunHarness`、Engine 或 provider adapter 依赖 `@tool`、`ToolDefinition` 或 Runtime 私有类型。
 
 Host-owned ToolRuntime 代持底层业务 `ToolExecutor`，负责普通 tool dispatch、执行编排和
 `ToolExecutionOutcome` 返回。ToolRuntime 不直接实现截断状态机或 cursor store；这些能力属于 Host
@@ -1120,6 +1147,8 @@ fencing 与补读实现都属于 Host 私有实现，Engine 什么都看不到�
 Engine 边界必须保持：
 
 - Engine 只接收投影后的 `ToolSchema`，不接收 `ToolDefinition`。
+- EngineWorker 只接收 Host 已显式确定的当前生效 `ToolSchema` 集合，不在运行时通过 callback 回调 Runtime
+  重新增强 schema。
 - Engine 只发普通 `ToolExecutionRequest(name="fetch_more", arguments=...)`。
 - Engine 只接收普通 `ToolExecutionOutcome`。
 - Engine 不 import、不持有、不分支判断 `@tool`、`ToolDefinition`、callable、executor、framework built-in

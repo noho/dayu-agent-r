@@ -44,7 +44,7 @@ def _ensure_repo_root_on_path() -> None:
 
 _ensure_repo_root_on_path()
 
-from dayu.contracts import CancellationToken
+from dayu.contracts import CancellationToken, ToolSchema
 from dayu.engine import (
     AgentMessageRole,
     AgentPolicy,
@@ -105,6 +105,7 @@ class _ScriptedProxy:
     def stream_engine_events(
         self,
         request: StartRunRequest,
+        tool_schemas: tuple[ToolSchema, ...],
         cancellation_token: CancellationToken,
     ) -> AsyncIterator[EngineEvent]:
         """返回脚本化 EngineEvent 流。
@@ -136,6 +137,7 @@ class _FailingProxy:
     def stream_engine_events(
         self,
         request: StartRunRequest,
+        tool_schemas: tuple[ToolSchema, ...],
         cancellation_token: CancellationToken,
     ) -> AsyncIterator[EngineEvent]:
         """返回会在迭代时失败的 EngineEvent 流。

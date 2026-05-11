@@ -45,7 +45,7 @@ def _ensure_repo_root_on_path() -> None:
 
 _ensure_repo_root_on_path()
 
-from dayu.contracts import CancellationToken, JsonValue
+from dayu.contracts import CancellationToken, JsonValue, ToolSchema
 from dayu.contracts.tool_outcome import ToolCompletedOutcome
 from dayu.contracts.tool_result import ToolResultSuccess
 from dayu.engine import (
@@ -127,6 +127,7 @@ class _ScriptedProxy:
     def stream_engine_events(
         self,
         request: StartRunRequest,
+        tool_schemas: tuple[ToolSchema, ...],
         cancellation_token: CancellationToken,
     ) -> AsyncIterator[EngineEvent]:
         """返回脚本化 EngineEvent 流。
@@ -172,6 +173,7 @@ class _MissingTerminalProxy:
     def stream_engine_events(
         self,
         request: StartRunRequest,
+        tool_schemas: tuple[ToolSchema, ...],
         cancellation_token: CancellationToken,
     ) -> AsyncIterator[EngineEvent]:
         """返回无 terminal 的空 EngineEvent 流。

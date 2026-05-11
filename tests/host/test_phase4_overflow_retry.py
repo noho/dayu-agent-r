@@ -12,7 +12,7 @@ from pathlib import Path
 
 import pytest
 
-from dayu.contracts import CancellationToken
+from dayu.contracts import CancellationToken, ToolSchema
 from dayu.contracts.tool_outcome import ToolCompletedOutcome
 from dayu.contracts.tool_result import ToolResultSuccess
 from dayu.engine import (
@@ -146,6 +146,7 @@ class _OverflowThenSuccessProxy:
     def stream_engine_events(
         self,
         request: StartRunRequest,
+        tool_schemas: tuple[ToolSchema, ...],
         cancellation_token: CancellationToken,
     ) -> AsyncIterator[EngineEvent]:
         """返回脚本化 EngineEvent 流。
@@ -209,6 +210,7 @@ class _CompactionRequestedThenFinalProxy:
     def stream_engine_events(
         self,
         request: StartRunRequest,
+        tool_schemas: tuple[ToolSchema, ...],
         cancellation_token: CancellationToken,
     ) -> AsyncIterator[EngineEvent]:
         """返回异常闭合的 EngineEvent 流。
@@ -258,6 +260,7 @@ class _CompactionRequestedThenEndedProxy:
     def stream_engine_events(
         self,
         request: StartRunRequest,
+        tool_schemas: tuple[ToolSchema, ...],
         cancellation_token: CancellationToken,
     ) -> AsyncIterator[EngineEvent]:
         """返回缺少 terminal overflow 的 EngineEvent 流。
@@ -313,6 +316,7 @@ class _ToolFactThenOverflowProxy:
     def stream_engine_events(
         self,
         request: StartRunRequest,
+        tool_schemas: tuple[ToolSchema, ...],
         cancellation_token: CancellationToken,
     ) -> AsyncIterator[EngineEvent]:
         """返回带同 Run 工具事实的脚本化 EngineEvent 流。
@@ -412,6 +416,7 @@ class _DelayedOverflowProxy:
     def stream_engine_events(
         self,
         request: StartRunRequest,
+        tool_schemas: tuple[ToolSchema, ...],
         cancellation_token: CancellationToken,
     ) -> AsyncIterator[EngineEvent]:
         """按 run id 返回延迟 overflow 或直接成功。
@@ -1226,6 +1231,7 @@ async def test_durable_compact_retry_snapshot_failure_writes_terminal(
         self: LocalRunHarness,
         *,
         request: StartRunRequest,
+        tool_schemas: tuple[ToolSchema, ...],
         build_trace: RunInputBuildTrace,
         current_user_event: RunEvent,
         attempt_index: int,
@@ -1242,6 +1248,7 @@ async def test_durable_compact_retry_snapshot_failure_writes_terminal(
         await original(
             self,
             request=request,
+            tool_schemas=tool_schemas,
             build_trace=build_trace,
             current_user_event=current_user_event,
             attempt_index=attempt_index,

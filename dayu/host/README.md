@@ -56,10 +56,10 @@ attempt-scoped append / durable memory；P8.5-S1 起 ToolRuntime 的截断补读
   cursor、scope token、普通 `token`、工具参数与普通工具结果不是 scrub 触发条件。
 - Conversation Memory / RunInput 是摄取策略边界：memory snapshot 与 RunInput rendered tool fact 不包含
   raw cursor、raw scope token 或可复用的 `truncation.fetch_more_args`，只保留不可复用摘要。
-- framework `fetch_more` schema 由 Host runtime assembly 自动投影到 Engine-visible schemas；调用方只传业务
+- framework `fetch_more` schema 由 Host ToolRuntime 投影到当前 Engine-visible `ToolSchema` 集合；调用方只传业务
   schema，任何调用方传入的同名 `fetch_more` schema 都会被拒绝，`RunOptions` public object 不被污染。
-  Engine 只接收 `ToolSchema` 与 `ToolExecutor` adapter，
-  不接收 `ToolDefinition`、callable、manager、cursor store 或 truncation 状态机。
+  `WorkerProxy` / `EngineWorker` 接收显式 `tuple[ToolSchema, ...]` 与 `ToolExecutor` adapter，
+  不回调 Runtime 取 schema，也不接收 `ToolDefinition`、callable、manager、cursor store 或 truncation 状态机。
 - 补读失败结果中的 `denied` 只表示权限 / scope 拒绝；cursor 不存在、cursor 过期和 terminal Run 都不是权限拒绝。
 - terminal Run 后 framework `fetch_more` 工具调用返回普通 failed tool outcome，不追加专用 RunEvent。
 - Host 内部 `DurableConversationMemoryStore`（P8-S8 起为默认 read model）只从 canonical RunEvent 投影 session memory；preview、
@@ -365,8 +365,9 @@ Engine ToolExecutor.execute(ToolExecutionRequest{name=fetch_more})
   -> RuntimeTruncateManager.fetch_more
 ```
 
-`EngineWorker` 只负责把 Host `StartRunRequest` 装配为 Engine `AgentRunRequest` 并调用 Engine。它不注册工具、
-不发现工具、不直接做权限、不做审计；ToolRuntime adapter 是 Host 内部执行治理边界，不提升为 public API。
+`EngineWorker` 只负责把 Host `StartRunRequest` 与 Host 已显式确定的 `tuple[ToolSchema, ...]` 装配为 Engine
+`AgentRunRequest` 并调用 Engine。它不注册工具、不发现工具、不回调 Runtime 取 schema、不直接做权限、
+不做审计；ToolRuntime adapter 是 Host 内部执行治理边界，不提升为 public API。
 
 默认 `harness.start_run` 不暴露 ToolExecutor 配置入口。需要 fake ToolExecutor 的 Host 测试使用内部
 `LocalRunHarness` 装配，避免把 `ToolExecutor.execute` 提升为 Host public API。

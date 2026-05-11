@@ -113,8 +113,8 @@ Host 当前 Run harness、RunEventStore、ToolRuntime、Conversation Memory / Ru
   truncation.fetch_more_args，显式 API key / credential scrub 仍成立。
 - ToolRuntime boundary：覆盖 Host 包根只导出 Run 级契约与通用 value summary，旧 public fetch_more /
   cursor contract 负向锁定不存在，Engine 不 import Host / ToolRuntime；调用方只传业务 schema，Host runtime
-  assembly 自动把私有 `fetch_more` schema 投影给 Engine，调用方手工传入同名 schema 会被拒绝，`RunOptions` 不被污染，Engine 不接收
-  `ToolDefinition`、callable 或 manager。
+  投影当前 Engine-visible `ToolSchema` 集合并通过 `WorkerProxy` 显式传给 `EngineWorker`，调用方手工传入同名
+  schema 会被拒绝，`RunOptions` 不被污染，Engine 不接收 `ToolDefinition`、callable 或 manager。
 - Conversation Memory projection：覆盖 `USER_INPUT_ACCEPTED`、canonical final answer、ToolRuntime / Engine tool fact
   从 EventLog 投影，preview / reasoning / delta 不进入 memory，assistant final answer 不自动成为 verified claim，
   memory item 携带 provenance / trust / scope 元数据，`USER_INPUT_ACCEPTED` scope 使用封闭枚举并非法 fail fast，

@@ -9,7 +9,7 @@ from datetime import datetime, timezone
 
 import pytest
 
-from dayu.contracts import CancellationToken
+from dayu.contracts import CancellationToken, ToolSchema
 from dayu.contracts.tool_outcome import ToolCompletedOutcome
 from dayu.contracts.tool_result import ToolResultSuccess
 from dayu.engine import (
@@ -61,6 +61,7 @@ class _RecordingProxy:
     def stream_engine_events(
         self,
         request: StartRunRequest,
+        tool_schemas: tuple[ToolSchema, ...],
         cancellation_token: CancellationToken,
     ) -> AsyncIterator[EngineEvent]:
         """返回脚本化 EngineEvent 流。

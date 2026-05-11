@@ -15,7 +15,7 @@ from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from typing import Literal, cast
 
-from dayu.contracts import CancellationToken
+from dayu.contracts import CancellationToken, ToolSchema
 from dayu.engine import (
     AgentMessageRole,
     AgentPolicy,
@@ -147,6 +147,7 @@ class _FakeOverflowProxy:
     def stream_engine_events(
         self,
         request: StartRunRequest,
+        tool_schemas: tuple[ToolSchema, ...],
         cancellation_token: CancellationToken,
     ) -> AsyncIterator[EngineEvent]:
         """返回 fake EngineEvent 流。

@@ -208,12 +208,11 @@ async def _main() -> None:
     harness = LocalRunHarness(
         is_durable=False,
         proxy=LocalProxy(
-            worker=EngineWorker(tool_executor=adapter, schema_provider=runtime)
+            worker=EngineWorker(tool_executor=adapter)
         ),
         event_store=event_store,
         tool_runtime=runtime,
         memory_store=SmokeInMemoryConversationMemoryStore(),
-        engine_tool_schema_provider=runtime,
     )
     assert harness.tool_runtime is runtime
 

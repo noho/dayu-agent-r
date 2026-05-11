@@ -20,7 +20,7 @@ from datetime import datetime, timezone
 from functools import partial
 from typing import Protocol, TypeVar, runtime_checkable
 
-from dayu.contracts import ToolExecutor
+from dayu.contracts import ToolExecutor, ToolSchema
 from dayu.contracts.tool_call import ToolExecutionRequest
 from dayu.contracts.tool_outcome import ToolExecutionOutcome, ToolFailedOutcome
 from dayu.contracts.tool_result import ToolResultFailure
@@ -54,7 +54,6 @@ from dayu.host._conversation_memory import (
     snapshot_with_transient_tool_facts,
 )
 from dayu.host._durable_event_store import DurableRunEventStore
-from dayu.host._engine_tool_schema_provider import EngineToolSchemaProvider
 from dayu.host._event_observer import ProjectionCoordinator
 from dayu.host._event_store import InMemoryRunEventStore, RunEventStore
 from dayu.host._event_translation import (
@@ -429,7 +428,6 @@ class LocalRunHarness:
     storage: HostStorage | None = None
     tool_trace_context_fact_enabled: bool = False
     run_input_context_fact_builder: RunInputContextFactBuilder | None = None
-    engine_tool_schema_provider: EngineToolSchemaProvider | None = None
     context_compact_retry_limit: int = _CONTEXT_COMPACT_RETRY_LIMIT
     run_input_trace_cache_limit: int = _RUN_INPUT_TRACE_CACHE_LIMIT
     run_input_message_cache_limit: int = _RUN_INPUT_MESSAGE_CACHE_LIMIT
@@ -613,7 +611,9 @@ class LocalRunHarness:
         """
 
         accepted_input = _extract_accepted_start_input(request=request)
-        self._engine_visible_request(request)
+        engine_tool_schemas = self._resolve_engine_tool_schemas(
+            request.options.tool_schemas
+        )
         current_user_event = await self.event_store.append(
             user_input_accepted_draft(
                 run_id=request.run_id,
@@ -637,9 +637,10 @@ class LocalRunHarness:
             run_id=request.run_id,
             messages=build_result.run_input.messages,
         )
-        engine_request = self._engine_visible_request(replace(request, input=build_result.run_input))
+        engine_request = replace(request, input=build_result.run_input)
         await self._append_run_input_context_snapshot_fact(
             request=engine_request,
+            tool_schemas=engine_tool_schemas,
             build_trace=build_result.trace,
             current_user_event=current_user_event,
             attempt_index=0,
@@ -649,6 +650,7 @@ class LocalRunHarness:
         task = asyncio.create_task(
             self._run_to_store(
                 request=engine_request,
+                tool_schemas=engine_tool_schemas,
                 current_user_event=current_user_event,
             )
         )
@@ -682,30 +684,21 @@ class LocalRunHarness:
             ),
         )
 
-    def _engine_visible_request(
+    def _resolve_engine_tool_schemas(
         self,
-        request: StartRunRequest,
-    ) -> StartRunRequest:
-        """构造只供 Engine attempt 使用的 request 副本。
+        user_tool_schemas: tuple[ToolSchema, ...],
+    ) -> tuple[ToolSchema, ...]:
+        """解析当前 Engine-visible 工具 schema 集合。
 
-        :param request: 调用方原始 request 或内部 retry request。
-        :returns: tool schema 已增强的 request；无 provider 时原样返回。
+        :param user_tool_schemas: 调用方传入的业务工具 schema。
+        :returns: Host runtime 投影后的 Engine-visible schema；没有
+            ToolRuntime 时返回调用方 schema。
         :raises ValueError: framework schema 与业务 schema 冲突时抛出。
         """
 
-        provider = self.engine_tool_schema_provider
-        if provider is None:
-            return request
-        enhanced_schemas = provider.engine_visible_tool_schemas(request.options.tool_schemas)
-        if enhanced_schemas == request.options.tool_schemas:
-            return request
-        return replace(
-            request,
-            options=replace(
-                request.options,
-                tool_schemas=enhanced_schemas,
-            ),
-        )
+        if self.tool_runtime is None:
+            return user_tool_schemas
+        return self.tool_runtime.engine_visible_tool_schemas(user_tool_schemas)
 
     async def _task_aware_event_stream(
         self,
@@ -773,11 +766,13 @@ class LocalRunHarness:
     async def _run_to_store(
         self,
         request: StartRunRequest,
+        tool_schemas: tuple[ToolSchema, ...],
         current_user_event: RunEvent | None = None,
     ) -> None:
         """立即执行 Engine 事件流并写入 RunEventStore。
 
         :param request: start_run 请求。
+        :param tool_schemas: Host 已显式确定并传给 EngineWorker 的 schema。
         :param current_user_event: 本 Run 原始 USER_INPUT_ACCEPTED 事件；仅
             context compact retry 路径必需。
         :returns: 无返回值。
@@ -824,6 +819,7 @@ class LocalRunHarness:
                 try:
                     engine_events = self.proxy.stream_engine_events(
                         request=attempt_request,
+                        tool_schemas=tool_schemas,
                         cancellation_token=token,
                     )
                 except AttemptFencingError:
@@ -1122,6 +1118,7 @@ class LocalRunHarness:
                             try:
                                 await self._append_run_input_context_snapshot_fact(
                                     request=attempt_request,
+                                    tool_schemas=tool_schemas,
                                     build_trace=compact_trace,
                                     current_user_event=current_user_event,
                                     attempt_index=attempt_index,
@@ -2358,6 +2355,7 @@ class LocalRunHarness:
         self,
         *,
         request: StartRunRequest,
+        tool_schemas: tuple[ToolSchema, ...],
         build_trace: RunInputBuildTrace,
         current_user_event: RunEvent,
         attempt_index: int,
@@ -2377,9 +2375,9 @@ class LocalRunHarness:
         append; 其它路径退化为 :meth:`DurableRunEventStore.append_in_transaction`,
         与 P6 行为一致 (start_run 阶段尚未开 attempt, 不参与 fencing)。
 
-        :param request: 当前 attempt 的 engine-visible start 请求；其
-            ``input.messages`` 与 ``options.tool_schemas`` 均为实际交给
-            Engine 的消息序列和增强后 schema。
+        :param request: 当前 attempt 的 start 请求；其 ``input.messages``
+            是实际交给 Engine 的消息序列。
+        :param tool_schemas: 实际交给 Engine 的 schema 集合。
         :param build_trace: RunInputBuilder 产出的 trace；compact 路径下由
             调用方合成。
         :param current_user_event: 本 Run 原始用户输入事件。
@@ -2408,7 +2406,7 @@ class LocalRunHarness:
             run_input=request.input,
             build_trace=build_trace,
             current_user_event=current_user_event,
-            tool_schemas=request.options.tool_schemas,
+            tool_schemas=tool_schemas,
             attempt_index=attempt_index,
             iteration_index=iteration_index,
             iteration_id=iteration_id,

@@ -503,6 +503,7 @@ class _OverflowThenSuccessProxy:
     def stream_engine_events(
         self,
         request: StartRunRequest,
+        tool_schemas: tuple[ToolSchema, ...],
         cancellation_token: CancellationToken,
     ) -> AsyncIterator[EngineEvent]:
         """第一次 attempt 产出 overflow，第二次 attempt 产出 final。
@@ -743,7 +744,6 @@ def build_huge_echo_harness(
         resolved_proxy = LocalProxy(
             worker=EngineWorker(
                 tool_executor=gated_executor,
-                schema_provider=None,
             )
         )
     return LocalRunHarness(
@@ -752,7 +752,6 @@ def build_huge_echo_harness(
         event_store=event_store,
         tool_runtime=runtime,
         memory_store=memory_store or _seeded_memory_store(),
-        engine_tool_schema_provider=runtime,
     )
 
 

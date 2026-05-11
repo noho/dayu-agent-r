@@ -51,7 +51,7 @@ from dayu.engine import (
     RunnerSpec,
     UserMessage,
 )
-from dayu.contracts import CancellationToken
+from dayu.contracts import CancellationToken, ToolSchema
 from dayu.host._attempt_lease import (
     ATTEMPT_OWNER_ID_PREFIX,
     AttemptFencingError,
@@ -131,6 +131,7 @@ class _FencingProxy:
         self,
         *,
         request: StartRunRequest,
+        tool_schemas: tuple[ToolSchema, ...],
         cancellation_token: CancellationToken,
     ) -> AsyncIterator[EngineEvent]:
         """模拟 proxy 入口阶段被 owner fencing 拒绝。
@@ -1536,6 +1537,7 @@ class _OwnerLostDuringRunToStoreProxy:
     def stream_engine_events(
         self,
         request: StartRunRequest,
+        tool_schemas: tuple[ToolSchema, ...],
         cancellation_token: CancellationToken,
     ) -> AsyncIterator[EngineEvent]:
         del request, cancellation_token
@@ -2075,6 +2077,7 @@ async def test_owner_lost_handler_non_fencing_error_clears_active_attempt(
         with pytest.raises(RuntimeError, match="owner-lost-cleanup-failed"):
             await harness._run_to_store(  # noqa: SLF001
                 request=request,
+                tool_schemas=(),
                 current_user_event=current_user_event,
             )
         assert finish_calls == []
@@ -2330,6 +2333,7 @@ async def test_worker_exception_before_owner_scope_writes_terminal() -> None:
             self,
             *,
             request: StartRunRequest,
+            tool_schemas: tuple[ToolSchema, ...],
             cancellation_token: CancellationToken,
         ) -> AsyncIterator[EngineEvent]:
             del request, cancellation_token
