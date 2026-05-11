@@ -134,7 +134,9 @@ P6 已落地：
 - `ProjectionStore` + `ProjectionCoordinator` 驱动 at-least-once observer，记录
   per-observer checkpoint、`status`、`retry_count`、`lag_events`；checkpoint 不允许倒退，
   相同 position 重放幂等。`ProjectionCoordinator.drain()` 内置 `_drain_lock`
-  防止并发 drain 重入，sink + checkpoint 同事务保证 at-least-once。
+  防止并发 drain 重入。required / transactional observer 的 sink + checkpoint
+  仍在同一 SQLite 事务内提交；实现 `NonTransactionalObserverSink` 的非 required
+  observer 会先在事务外完成 sink I/O，再用短事务推进 checkpoint。
   `LocalRunHarness` 在 run 终态后调用 `coordinator.drain()` 推进所有 read model；
   无 coordinator 装配时退化为内存 fallback 仅用于 legacy `InMemoryRunEventStore` 测试路径。
 - 自带三个 observer：memory（required）、timeline（非 required）、audit（非 required）。
@@ -164,7 +166,9 @@ P7 已落地：
   配对 ``TOOL_CALL_REQUESTED`` + ``TOOL_RESULT_ACCEPTED``，缺对抛
   `ProjectionSchemaError` -> `BLOCKED_FAILED`。``record_role`` /
   ``source_event_position`` 进入 sha256[:32] ``idempotency_key`` 让
-  analyzer 去重重放副本。
+  analyzer 去重重放副本。该 observer 是非 required projection，JSONL / blob
+  I/O 发生在 checkpoint transaction 外；I/O 成功但 checkpoint 失败时允许重放
+  产生重复行，读侧按 ``idempotency_key`` 去重。
 - `ToolTraceJsonlSink` 落 ``<root>/sessions/<session_id>/tool_calls_*.jsonl``
   并按 ~10MB 滚动；每行 ``flush + fsync``。
   ``RUN_INPUT_CONTEXT_SNAPSHOT_BUILT`` 内联的 raw payload 写入

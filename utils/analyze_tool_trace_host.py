@@ -548,19 +548,6 @@ def _detect_truncation_gaps(
         if call.cursor == "":
             continue
         consumed_positions.setdefault((call.run_id, call.cursor), []).append(call.source_event_position)
-    # historical input handling: 旧字段若仍出现在 trace fixture 中，可以补充
-    # 作为事实源，但新格式不依赖这些字段。
-    for entry in entries:
-        record = entry.record
-        if _read_str(record, "trace_type") != _TRACE_TYPE_TOOL_CALL:
-            continue
-        legacy_cursor = record.get("fetch_more_consumed_cursor")
-        if not isinstance(legacy_cursor, str) or legacy_cursor == "":
-            continue
-        consumed_positions.setdefault(
-            (_read_str(record, "run_id"), legacy_cursor),
-            [],
-        ).append(_read_int(record, "source_event_position") or 0)
     gaps: list[TruncationGap] = []
     for truncation in truncations:
         positions = consumed_positions.get(
@@ -610,20 +597,6 @@ def _detect_fetch_more_unknown_cursor(
                 record,
                 "truncation_scope_token",
             )
-        next_cursor = record.get("fetch_more_next_cursor")
-        if isinstance(next_cursor, str) and next_cursor != "":
-            issued_scope_by_cursor.setdefault((run_id, next_cursor), "")
-        consumed_cursor = record.get("fetch_more_consumed_cursor")
-        if isinstance(consumed_cursor, str) and consumed_cursor != "":
-            if (run_id, consumed_cursor) not in issued_scope_by_cursor:
-                issues.append(
-                    FetchMoreScopeIssue(
-                        run_id=run_id,
-                        tool_call_id=_read_str(record, "tool_call_id"),
-                        scope_token_or_cursor=consumed_cursor,
-                        reason=_ISSUE_UNKNOWN_CONSUMED_CURSOR,
-                    )
-                )
         if _read_str(record, "tool_name") != _FETCH_MORE_TOOL_NAME:
             continue
         arguments = _read_arguments_json(record)

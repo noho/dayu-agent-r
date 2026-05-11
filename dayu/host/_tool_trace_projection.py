@@ -1,8 +1,9 @@
 """Host P7 ToolTraceObserver。
 
 把 EventLog canonical fact 派生为 trace record，实时写入
-:class:`ToolTraceJsonlSink`。``tx`` 不被使用（trace 完全走文件系统），
-保留参数以满足 :class:`ObserverSink` 协议。
+:class:`ToolTraceJsonlSink`。``tx`` 不被使用（trace 完全走文件系统）；
+coordinator 会优先通过非事务协议把 JSONL / blob I/O 移出 SQLite
+checkpoint transaction。
 
 派发规则：
 
@@ -23,8 +24,7 @@
 按 ``BLOCKED_FAILED`` 记录。
 """
 
-from __future__ import annotations
-
+import asyncio
 import json
 from collections.abc import Mapping
 from dataclasses import dataclass, field
@@ -42,6 +42,7 @@ from dayu.engine import (
     ToolResultAcceptedData,
 )
 from dayu.host._event_observer import (
+    NonTransactionalObserverSink,
     ObserverDescriptor,
     ObserverSink,
     ProjectionEventEnvelope,
@@ -103,7 +104,7 @@ class _ToolCallGroup:
 
 
 @dataclass(slots=True)
-class ToolTraceObserver(ObserverSink):
+class ToolTraceObserver(ObserverSink, NonTransactionalObserverSink):
     """tool trace projection observer。
 
     :param jsonl_sink: 实际负责文件写入的 sink。
@@ -136,9 +137,9 @@ class ToolTraceObserver(ObserverSink):
         """处理 EventLog batch。
 
         ``tx`` 在 P7/P8 trace observer 中不被使用，保留参数以满足
-        :class:`ObserverSink` 协议。协议为 async（P8 起 ObserverSink
-        协议升级为 async）；当前实现内部仍只做同步 JSONL / 文件写入，
-        不 ``await`` 任何下游，但保持 async 签名以匹配协议。
+        :class:`ObserverSink` 协议。coordinator 正常会调用
+        :meth:`process_non_transactional`，让 JSONL / blob I/O 发生在
+        checkpoint transaction 外；本方法用于直接测试或旧调用点。
 
         :param tx: 当前事务（未使用）。
         :param batch: 事件 envelope 元组，按 position 升序。
@@ -148,6 +149,41 @@ class ToolTraceObserver(ObserverSink):
         """
 
         _ = tx
+        await self.process_non_transactional(batch=batch)
+
+    async def process_non_transactional(
+        self,
+        *,
+        batch: tuple[ProjectionEventEnvelope, ...],
+    ) -> None:
+        """在 checkpoint transaction 外处理 EventLog batch。
+
+        同步 JSONL / blob 写入通过 ``asyncio.to_thread`` 放入线程执行，
+        避免阻塞 event loop。写入成功后由 coordinator 另启短事务推进
+        checkpoint；若 checkpoint 推进失败，后续重放会产生相同
+        ``idempotency_key`` 的重复行，由 reader / analyzer 去重。
+
+        :param batch: 事件 envelope 元组，按 position 升序。
+        :returns: 无返回值。
+        :raises ProjectionSchemaError: tool_call 未配对时抛出。
+        :raises OSError: JSONL / blob 写入失败时透传。
+        """
+
+        await asyncio.to_thread(self._process_sync, batch=batch)
+
+    def _process_sync(
+        self,
+        *,
+        batch: tuple[ProjectionEventEnvelope, ...],
+    ) -> None:
+        """同步处理 EventLog batch 并写入 JSONL / blob sink。
+
+        :param batch: 事件 envelope 元组，按 position 升序。
+        :returns: 无返回值。
+        :raises ProjectionSchemaError: tool_call 未配对时抛出。
+        :raises OSError: JSONL / blob 写入失败时透传。
+        """
+
         groups: dict[tuple[str, str], _ToolCallGroup] = {}
         for envelope in batch:
             event = envelope.event

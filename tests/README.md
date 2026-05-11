@@ -163,7 +163,8 @@ Host 当前 Run harness、RunEventStore、ToolRuntime、Conversation Memory / Ru
   - `projection_checkpoint`：observer drain 后 checkpoint 推进到最新 position，
     `RetryableProjectionError` 标 RETRYABLE_FAILED 不前进 success position，普通异常进入
     BLOCKED_FAILED 并记录错误码，`ProjectionStore.advance_success` 拒绝倒退，`lag_events`
-    等于 MAX(position) - last_success_position。
+    等于 MAX(position) - last_success_position；非 required 非事务 observer 的 sink
+    I/O 失败不阻塞 required observer，sink 成功但 checkpoint 失败时允许后续重放。
   - `memory_rebuild`：required memory projection 满足 USER_INPUT_ACCEPTED 永不丢失、成功终态
     写 assistant final、Engine `RUN_FAILED` 与 Host-owned `RUN_FAILED` 写中性 terminal summary、
     cancelled / suspended 仅保留用户输入。
@@ -280,8 +281,9 @@ Host 当前 Run harness、RunEventStore、ToolRuntime、Conversation Memory / Ru
 - `test_analyze_tool_trace_host.py`：验证 P7 trace analyzer
   (`utils/analyze_tool_trace_host.py`) 按 ``idempotency_key`` 去重、严格拒绝
   OLD ``tool_trace_v2`` schema、检测重复 tool_call、truncation 后未续读
-  fetch_more、fetch_more 引用未知 cursor、provider_protocol_error 计数、
-  final_response 是否存在与同 run 内 ``source_event_position`` 单调性。
+  ordinary fetch_more、fetch_more 引用未知 cursor / 错误 scope / 重复 cursor
+  / failed outcome、忽略旧专属 fetch_more projection 字段、provider_protocol_error
+  计数、final_response 是否存在与同 run 内 ``source_event_position`` 单调性。
 
 ### `tests/engine/contracts/`
 

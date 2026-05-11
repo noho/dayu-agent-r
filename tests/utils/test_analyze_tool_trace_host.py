@@ -294,6 +294,37 @@ def test_analyzer_accepts_ordinary_fetch_more_followup(
     assert report.fetch_more_with_unknown_scope_token == ()
 
 
+def test_analyzer_ignores_legacy_fetch_more_projection_fields(
+    tmp_path: Path,
+) -> None:
+    """旧专属 fetch_more 字段不能替代 ordinary fetch_more tool call 事实。"""
+
+    truncated = _tool_call_record(
+        idempotency_key="trunc-legacy",
+        source_event_position=1,
+        tool_call_id="tc-trunc",
+        truncation_has_more=True,
+        truncation_scope_token="scope-A",
+        truncation_cursor="cur-A",
+        fetch_more_consumed_cursor="cur-A",
+        fetch_more_next_cursor="cur-B",
+    )
+    _write_jsonl(
+        trace_root=tmp_path,
+        session_id=_SESSION_ID,
+        records=[truncated],
+    )
+    report = analyze_trace_root(trace_root=tmp_path)
+    assert report.truncation_without_fetch_more == (
+        TruncationGap(
+            run_id=_RUN_ID,
+            tool_call_id="tc-trunc",
+            scope_token="scope-A",
+        ),
+    )
+    assert report.fetch_more_with_unknown_scope_token == ()
+
+
 def test_analyzer_tracks_fetch_more_by_tool_call_not_run(
     tmp_path: Path,
 ) -> None:
