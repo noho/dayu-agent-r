@@ -90,6 +90,7 @@ _INVALID_TOOL_EXECUTION_TIMEOUTS: tuple[float, ...] = (
     math.nan,
     math.inf,
 )
+_OVERSIZED_RESUME_TOKEN_LENGTH: int = 2049
 
 
 def _utc_now() -> datetime:
@@ -319,6 +320,7 @@ class _RecordingToolExecutor:
     outcomes: Mapping[str, ToolExecutionOutcome]
     token_to_cancel: _Token | None = None
     raise_for_call_id: str | None = None
+    raise_cancelled_for_call_id: str | None = None
     requests: list[ToolExecutionRequest] = field(default_factory=list)
 
     async def execute(self, request: ToolExecutionRequest) -> ToolExecutionOutcome:
@@ -327,11 +329,15 @@ class _RecordingToolExecutor:
         :param request: 工具执行请求。
         :returns: 预设工具 outcome。
         :raises RuntimeError: 配置 ``raise_for_call_id`` 时抛出。
+        :raises asyncio.CancelledError: 配置 ``raise_cancelled_for_call_id``
+            时抛出。
         """
 
         self.requests.append(request)
         if self.raise_for_call_id == request.call.tool_call_id:
             raise RuntimeError("tool exploded")
+        if self.raise_cancelled_for_call_id == request.call.tool_call_id:
+            raise asyncio.CancelledError()
         if self.token_to_cancel is not None:
             self.token_to_cancel.trigger()
         return self.outcomes[request.call.tool_call_id]
@@ -735,6 +741,24 @@ def test_agent_policy_rejects_invalid_values() -> None:
                 allow_tool_calls=True,
                 tool_execution_timeout_seconds=timeout_seconds,
             )
+
+
+def test_tool_await_spec_rejects_invalid_resume_token() -> None:
+    """ToolAwaitSpec 的 resume token 必须有基础边界校验。"""
+
+    for resume_token in ("", " "):
+        with pytest.raises(ValueError):
+            ToolAwaitSpec(
+                await_kind=ToolAwaitKind.EXTERNAL_JOB,
+                deadline=None,
+                resume_token=resume_token,
+            )
+    with pytest.raises(ValueError):
+        ToolAwaitSpec(
+            await_kind=ToolAwaitKind.EXTERNAL_JOB,
+            deadline=None,
+            resume_token="x" * _OVERSIZED_RESUME_TOKEN_LENGTH,
+        )
 
 
 def test_llm_projection_shapes() -> None:
@@ -1182,10 +1206,12 @@ async def test_tool_awaiting_suspends_run_without_next_tool_injection() -> None:
         captured_at=_utc_now(),
     )
     awaiting = _awaiting(resume_token="resume-1", snapshot=snapshot)
-    awaiting_executor = _RecordingToolExecutor(outcomes={"tc_1": awaiting})
+    awaiting_executor = _RecordingToolExecutor(
+        outcomes={"tc_1": awaiting, "tc_2": _success(2)}
+    )
     runner = _ScriptedRunner(
         scripts=(
-            _tool_script(_tool_call("tc_1")),
+            _tool_script(_tool_call("tc_1"), _tool_call("tc_2", index=1)),
             _final_script("should-not-run"),
         )
     )
@@ -1223,6 +1249,7 @@ async def test_tool_awaiting_suspends_run_without_next_tool_injection() -> None:
     assert suspended.await_spec is awaiting.await_spec
     assert suspended.snapshot is snapshot
     assert len(awaiting_executor.requests) == 1
+    assert awaiting_executor.requests[0].call.tool_call_id == "tc_1"
     assert runner.call_count == 1
     assert runner.close_count == 1
     assert len(runner.messages_seen) == 1
@@ -1310,6 +1337,26 @@ async def test_duplicate_and_executor_exception_paths() -> None:
     tool_message = runner.messages_seen[1][-1]
     assert isinstance(tool_message, ToolMessage)
     assert json.loads(tool_message.content)["error"] == "tool_executor_exception"
+
+    cancelled_executor = _RecordingToolExecutor(
+        outcomes={"tc_1": _success(1)},
+        raise_cancelled_for_call_id="tc_1",
+    )
+    cancelled_runner = _ScriptedRunner(
+        scripts=(_tool_script(_tool_call("tc_1")), _final_script("recovered"))
+    )
+    cancelled_events = await _collect(
+        _AsyncAgent(
+            request=_request(executor=cancelled_executor),
+            runner=cancelled_runner,
+        )
+    )
+    assert _terminal(cancelled_events).type is EngineEventType.FINAL_ANSWER
+    cancelled_tool_message = cancelled_runner.messages_seen[1][-1]
+    assert isinstance(cancelled_tool_message, ToolMessage)
+    assert json.loads(cancelled_tool_message.content)["error"] == (
+        "tool_executor_exception"
+    )
 
 
 @pytest.mark.asyncio

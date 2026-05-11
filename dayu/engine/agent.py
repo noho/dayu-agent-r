@@ -544,6 +544,8 @@ class _AsyncAgent:
                         )
                     )
                     return
+                # commit boundary：Runner 未完成时取消可抢占；Runner done 后
+                # 已接受的 final/tool/failure 候选不能被迟到取消改写。
                 if self._is_cancelled() and not state.done_seen:
                     yield await self._make_cancelled_terminal_with_close()
                     return
@@ -1362,13 +1364,7 @@ class _AsyncAgent:
                 yield await self._make_cancelled_terminal_with_close()
                 return
             if isinstance(outcome, WaitTimedOut):
-                yield self._make_terminal_failed(
-                    RunFailedData(
-                        error_code=_ERROR_TOOL_EXECUTION_TIMEOUT,
-                        message=_TOOL_EXECUTION_TIMEOUT_MESSAGE,
-                        recoverable=False,
-                    )
-                )
+                yield await self._make_tool_timeout_terminal_with_close()
                 return
             completed_outcome = outcome.value
 
@@ -1459,7 +1455,7 @@ class _AsyncAgent:
 
         try:
             return await await_or_cancel_or_timeout(
-                self._request.tool_executor.execute(tool_request),
+                self._call_tool_executor(tool_request),
                 token=self._request.cancellation_token,
                 timeout_seconds=(
                     self._request.agent_policy.tool_execution_timeout_seconds
@@ -1477,6 +1473,31 @@ class _AsyncAgent:
                         hint=None,
                         meta=None,
                     )
+                )
+            )
+
+    async def _call_tool_executor(
+        self, tool_request: ToolExecutionRequest
+    ) -> ToolExecutionOutcome:
+        """调用 ToolExecutor，并把 executor 内部取消异常归一为工具失败。
+
+        :param tool_request: 工具执行请求。
+        :returns: 工具执行 outcome。
+        :raises asyncio.CancelledError: run-local cancellation 已命中时透传。
+        """
+
+        try:
+            return await self._request.tool_executor.execute(tool_request)
+        except asyncio.CancelledError:
+            if self._request.cancellation_token.is_cancelled():
+                raise
+            return ToolFailedOutcome(
+                result=ToolResultFailure(
+                    ok=False,
+                    error=_ERROR_TOOL_EXECUTOR_EXCEPTION,
+                    message=asyncio.CancelledError.__name__,
+                    hint=None,
+                    meta=None,
                 )
             )
 
@@ -1618,6 +1639,8 @@ class _AsyncAgent:
                 )
             )
             return
+        # commit boundary：force-answer Runner 已 done 后，final / failure
+        # 候选先提交；取消只阻止下一轮尚未开始的工作。
         if self._is_cancelled() and not state.done_seen:
             yield await self._make_cancelled_terminal_with_close()
             return
@@ -1663,6 +1686,7 @@ class _AsyncAgent:
         :raises Exception: 不主动抛出异常。
         """
 
+        # final decision 已进入 terminal commit boundary，迟到取消不覆盖。
         return self._make_terminal_final(
             FinalAnswerData(
                 content=decision.content,
@@ -1686,16 +1710,37 @@ class _AsyncAgent:
             return await self._make_cancelled_terminal_with_close()
         return self._make_terminal_failed(failure)
 
+    async def _make_tool_timeout_terminal_with_close(self) -> EngineEvent:
+        """关闭 Runner 后提交工具握手超时失败终态。
+
+        :returns: ``RUN_FAILED(tool_execution_timeout)`` terminal。
+        :raises Exception: 不主动抛出异常；Runner close 异常会被吞掉并记日志。
+        """
+
+        await self._close_runner_once()
+        return self._make_terminal_failed(
+            RunFailedData(
+                error_code=_ERROR_TOOL_EXECUTION_TIMEOUT,
+                message=_TOOL_EXECUTION_TIMEOUT_MESSAGE,
+                recoverable=False,
+            )
+        )
+
     async def _make_suspended_terminal_with_close(
         self, awaiting: ToolAwaitingOutcome
     ) -> EngineEvent:
         """关闭 Runner 后构造挂起终态。
+
+        ToolAwaitingOutcome 已经返回时，``await_spec`` / ``snapshot`` 是
+        已接受的恢复事实；迟到取消不覆盖 ``RUN_SUSPENDED``。取消若要抢占
+        挂起，只能在工具 outcome 返回前由等待 helper 返回 ``WaitCancelled``。
 
         :param awaiting: 工具等待 outcome。
         :returns: ``RUN_SUSPENDED`` terminal。
         :raises Exception: 不主动抛出异常；Runner close 异常会被吞掉并记日志。
         """
 
+        # awaiting outcome 已携带恢复事实；迟到取消不覆盖 run_suspended。
         await self._close_runner_once()
         return self._make_terminal_suspended(
             RunSuspendedData(

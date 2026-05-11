@@ -110,6 +110,9 @@ async def await_or_cancel(
     if token.is_cancelled():
         if asyncio.iscoroutine(awaitable):
             awaitable.close()
+            return WaitCancelled(reason=token.cancel_reason())
+        target_task: asyncio.Task[T] = asyncio.ensure_future(awaitable)
+        await _cancel_task_and_wait(target_task)
         return WaitCancelled(reason=token.cancel_reason())
 
     target_task: asyncio.Task[T] = asyncio.ensure_future(awaitable)

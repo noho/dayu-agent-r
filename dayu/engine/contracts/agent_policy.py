@@ -45,7 +45,7 @@ class AgentPolicy:
         次数。
     :param allow_tool_calls: 是否允许工具调用。
     :param tool_execution_timeout_seconds: Engine 等待
-        ``ToolExecutor.execute`` 完成握手的超时秒数，必须为正数。
+        ``ToolExecutor.execute`` 完成握手的超时秒数真源，必须为有限正数。
     :param fallback_mode: 普通工具轮次耗尽或连续失败工具批次达到阈值后的
         收口模式。
     :param fallback_prompt: force-answer 时追加给 Runner 的用户消息。

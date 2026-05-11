@@ -128,6 +128,33 @@ async def test_await_or_cancel_short_circuits_when_already_cancelled() -> None:
 
 
 @pytest.mark.asyncio
+async def test_await_or_cancel_closes_task_when_already_cancelled() -> None:
+    """入口已取消且传入 task 时，helper 必须取消并等待 target 收口。"""
+
+    token = _FakeToken()
+    target_done = asyncio.Event()
+
+    async def _target() -> None:
+        try:
+            await asyncio.sleep(_SLOW_OPERATION_SECONDS)
+        finally:
+            target_done.set()
+
+    task = asyncio.ensure_future(_target())
+    await asyncio.sleep(0)
+    token.cancel(reason=_CANCEL_REASON)
+
+    outcome = await await_or_cancel(
+        task, token=token, poll_interval_seconds=_FAST_POLL
+    )
+    assert isinstance(outcome, WaitCancelled)
+    assert outcome.reason == _CANCEL_REASON
+    assert task.done()
+    assert task.cancelled()
+    assert target_done.is_set()
+
+
+@pytest.mark.asyncio
 async def test_await_or_cancel_owns_target_and_cancels_on_token_hit() -> None:
     """token 命中时 helper 必须取消并等待 target task done，不留后台任务。"""
 
