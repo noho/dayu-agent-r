@@ -5,7 +5,7 @@
 - ``append_record_line`` 每行追加并 fsync。
 - 文件大小达到 ~10MB 触发滚动。
 - ``write_raw_payload_blob`` 通过 tmp + ``os.replace`` 原子改名。
-- ``_scrub_provider_secret`` 替换敏感键。
+- ``_scrub_provider_secret`` 替换敏感键与字符串 header。
 - ``compute_idempotency_key`` 输入相同则结果相同，关键字段任一变化结果变化。
 """
 
@@ -72,6 +72,11 @@ def test_scrub_provider_secret_replaces_known_keys() -> None:
     payload = {
         "Authorization": "Bearer xxx",
         "api_key": "sk-yyy",
+        "openai-organization": "org-public-id",
+        "anthropic-version": "2023-06-01",
+        "client_secret": "client-secret",
+        "private_key": "private-key",
+        "password": "password",
         "headers": {
             "x-api-key": "secret",
             "x-other": "ok",
@@ -82,6 +87,11 @@ def test_scrub_provider_secret_replaces_known_keys() -> None:
     assert isinstance(scrubbed, dict)
     assert scrubbed["Authorization"] == "***"
     assert scrubbed["api_key"] == "***"
+    assert scrubbed["openai-organization"] == "org-public-id"
+    assert scrubbed["anthropic-version"] == "2023-06-01"
+    assert scrubbed["client_secret"] == "***"
+    assert scrubbed["private_key"] == "***"
+    assert scrubbed["password"] == "***"
     headers = scrubbed["headers"]
     assert isinstance(headers, dict)
     assert headers["x-api-key"] == "***"
@@ -92,6 +102,75 @@ def test_scrub_provider_secret_replaces_known_keys() -> None:
     assert isinstance(first, dict)
     assert first["Cookie"] == "***"
     assert first["content"] == "hi"
+
+
+def test_scrub_provider_secret_scrubs_header_text_and_keeps_runtime_fields() -> None:
+    """provider raw payload 中的字符串 header 清洗，运行期能力字段保留。"""
+
+    payload = {
+        "message": (
+            "Authorization: Bearer sk-live\n"
+            "x-api-key: sk-x\n"
+            "cookie: sid=secret\n"
+            "API key = sk-api\n"
+            "client_secret=sk-client\n"
+            "private_key: sk-private\n"
+            "password: sk-password\n"
+            "cursor: cursor-raw\n"
+            "scope_token: scope-raw\n"
+            "token: ordinary-token\n"
+            "anthropic-version: 2023-06-01\n"
+            "openai-organization: org-public-id"
+        ),
+        "cursor": "cursor-raw",
+        "scope_token": "scope-raw",
+        "token": "ordinary-token",
+        "anthropic-version": "2023-06-01",
+        "openai-organization": "org-public-id",
+        "nested": [
+            {
+                "debug": (
+                    "Authorization=Bearer nested-secret, "
+                    "token=ordinary-token"
+                )
+            }
+        ],
+    }
+    scrubbed = _scrub_provider_secret(payload)
+    assert isinstance(scrubbed, dict)
+    assert scrubbed["cursor"] == "cursor-raw"
+    assert scrubbed["scope_token"] == "scope-raw"
+    assert scrubbed["token"] == "ordinary-token"
+    assert scrubbed["anthropic-version"] == "2023-06-01"
+    assert scrubbed["openai-organization"] == "org-public-id"
+    message = scrubbed["message"]
+    assert isinstance(message, str)
+    assert "Authorization: ***" in message
+    assert "x-api-key: ***" in message
+    assert "cookie: ***" in message
+    assert "API key = ***" in message
+    assert "client_secret=***" in message
+    assert "private_key: ***" in message
+    assert "password: ***" in message
+    assert "cursor: cursor-raw" in message
+    assert "scope_token: scope-raw" in message
+    assert "token: ordinary-token" in message
+    assert "anthropic-version: 2023-06-01" in message
+    assert "openai-organization: org-public-id" in message
+    assert "sk-live" not in message
+    assert "sk-x" not in message
+    assert "sid=secret" not in message
+    assert "sk-api" not in message
+    assert "sk-client" not in message
+    assert "sk-private" not in message
+    assert "sk-password" not in message
+    nested = scrubbed["nested"]
+    assert isinstance(nested, list)
+    first = nested[0]
+    assert isinstance(first, dict)
+    debug = first["debug"]
+    assert isinstance(debug, str)
+    assert debug == "Authorization=***, token=ordinary-token"
 
 
 def test_compute_idempotency_key_is_deterministic() -> None:

@@ -11,6 +11,7 @@ from dataclasses import dataclass
 
 from dayu.contracts import CancellationToken, ToolExecutor
 from dayu.engine import AgentRunRequest, EngineEvent, run_agent_messages
+from dayu.host._engine_tool_schema_provider import EngineToolSchemaProvider
 from dayu.host.contracts import StartRunRequest
 from dayu.runtime.log_levels import VERBOSE_LOG_LEVEL
 
@@ -22,9 +23,12 @@ class EngineWorker:
     """Host 内部 EngineWorker capability。
 
     :param tool_executor: Host 内部代持的工具执行器。
+    :param schema_provider: Host 内部 framework schema provider；只返回
+        Engine-visible ``ToolSchema``。
     """
 
     tool_executor: ToolExecutor
+    schema_provider: EngineToolSchemaProvider | None = None
 
     def run_agent_messages(
         self,
@@ -39,6 +43,11 @@ class EngineWorker:
         :raises Exception: 透传 Engine 运行异常。
         """
 
+        tool_schemas = request.options.tool_schemas
+        if self.schema_provider is not None:
+            tool_schemas = self.schema_provider.engine_visible_tool_schemas(
+                tool_schemas
+            )
         engine_request = AgentRunRequest(
             run_id=request.run_id,
             session_id=request.session_id,
@@ -48,7 +57,7 @@ class EngineWorker:
             runner_spec=request.options.runner_spec,
             runner_options=request.options.runner_options,
             agent_policy=request.options.agent_policy,
-            tool_schemas=request.options.tool_schemas,
+            tool_schemas=tool_schemas,
             tool_executor=self.tool_executor,
             cancellation_token=cancellation_token,
         )

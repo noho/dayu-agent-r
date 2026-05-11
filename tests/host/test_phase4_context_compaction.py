@@ -115,7 +115,7 @@ def _snapshot() -> ConversationMemorySnapshot:
         fact_id="tool_fact:run-old:5",
         tool_name="fins.lookup",
         tool_call_id="call-1",
-        event_type=RunEventType.TOOL_RESULT_TRUNCATED,
+        event_type=RunEventType.TOOL_RESULT_ACCEPTED,
         summary="收入同比增长 12%，来源为 2024 年年报。",
         cursor_fingerprint="fp-safe",
         has_more=True,

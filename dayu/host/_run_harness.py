@@ -54,6 +54,7 @@ from dayu.host._conversation_memory import (
     snapshot_with_transient_tool_facts,
 )
 from dayu.host._durable_event_store import DurableRunEventStore
+from dayu.host._engine_tool_schema_provider import EngineToolSchemaProvider
 from dayu.host._event_observer import ProjectionCoordinator
 from dayu.host._event_store import InMemoryRunEventStore, RunEventStore
 from dayu.host._event_translation import (
@@ -114,42 +115,24 @@ _INITIAL_CURSOR_SEQUENCE: int = -1
 _TASK_AWARE_STREAM_DRAIN_SECONDS: float = 0.05
 _ERROR_TOOL_EXECUTOR_NOT_CONFIGURED: str = "tool_executor_not_configured"
 _ERROR_CURRENT_USER_INPUT_REQUIRED: str = "current_user_input_required"
-_ERROR_CURRENT_USER_INPUT_SHAPE_EMPTY: str = (
-    "start_run_input_requires_trailing_non_empty_user_message"
-)
-_ERROR_CURRENT_USER_INPUT_SHAPE_TRAILING_USER: str = (
-    "start_run_input_must_end_with_single_current_user_message"
-)
-_ERROR_CURRENT_USER_INPUT_SHAPE_MULTIPLE_USER: str = (
-    "start_run_input_allows_only_one_trailing_current_user_message"
-)
+_ERROR_CURRENT_USER_INPUT_SHAPE_EMPTY: str = "start_run_input_requires_trailing_non_empty_user_message"
+_ERROR_CURRENT_USER_INPUT_SHAPE_TRAILING_USER: str = "start_run_input_must_end_with_single_current_user_message"
+_ERROR_CURRENT_USER_INPUT_SHAPE_MULTIPLE_USER: str = "start_run_input_allows_only_one_trailing_current_user_message"
 _ERROR_CURRENT_USER_INPUT_SHAPE_UNSUPPORTED_HISTORY: str = (
     "start_run_input_allows_only_leading_system_messages_before_current_user"
 )
-_ERROR_RUN_INPUT_TRACE_CACHE_LIMIT_INVALID: str = (
-    "run_input_trace_cache_limit_must_be_positive"
-)
-_ERROR_RUN_INPUT_MESSAGE_CACHE_LIMIT_INVALID: str = (
-    "run_input_message_cache_limit_must_be_positive"
-)
-_ERROR_CONTEXT_COMPACT_RETRY_LIMIT_INVALID: str = (
-    "context_compact_retry_limit_must_be_non_negative"
-)
-_ERROR_ENGINE_STREAM_ENDED_WITHOUT_TERMINAL: str = (
-    "engine_stream_ended_without_terminal"
-)
+_ERROR_RUN_INPUT_TRACE_CACHE_LIMIT_INVALID: str = "run_input_trace_cache_limit_must_be_positive"
+_ERROR_RUN_INPUT_MESSAGE_CACHE_LIMIT_INVALID: str = "run_input_message_cache_limit_must_be_positive"
+_ERROR_CONTEXT_COMPACT_RETRY_LIMIT_INVALID: str = "context_compact_retry_limit_must_be_non_negative"
+_ERROR_ENGINE_STREAM_ENDED_WITHOUT_TERMINAL: str = "engine_stream_ended_without_terminal"
 _ERROR_ATTEMPT_LEASE_LOST: str = "attempt_lease_lost"
-_ERROR_CONTEXT_OVERFLOW_RETRY_ACQUIRE_FAILED: str = (
-    "context_overflow_retry_acquire_failed"
-)
+_ERROR_CONTEXT_OVERFLOW_RETRY_ACQUIRE_FAILED: str = "context_overflow_retry_acquire_failed"
 _RUN_INPUT_TRACE_CACHE_LIMIT: int = 32
 _RUN_INPUT_MESSAGE_CACHE_LIMIT: int = 3
 _CONTEXT_COMPACT_RETRY_LIMIT: int = 1
 _ERROR_CONTEXT_COMPACTION_REQUIRED: str = "context_compaction_required"
 _COMPACT_TRACE_MISSING_MESSAGE: str = "run input build trace is missing"
-_UNEXPECTED_COMPACTION_TERMINAL_MESSAGE: str = (
-    "engine produced terminal event after context compaction request"
-)
+_UNEXPECTED_COMPACTION_TERMINAL_MESSAGE: str = "engine produced terminal event after context compaction request"
 _LOGGER: logging.Logger = logging.getLogger(__name__)
 _RunCacheValue = TypeVar("_RunCacheValue")
 
@@ -180,8 +163,7 @@ class _OwnerLostDuringEngineWait(Exception):
 
 
 _RUN_INPUT_CONTEXT_FACT_BUILDER_REQUIRED: str = (
-    "run_input_context_fact_builder must be provided when "
-    "tool_trace_context_fact_enabled is True"
+    "run_input_context_fact_builder must be provided when " "tool_trace_context_fact_enabled is True"
 )
 
 
@@ -239,10 +221,7 @@ def _synthesize_compact_trace(
     :raises Exception: 不主动抛出异常。
     """
 
-    total_char_size = sum(
-        len(_message_text_for_trace(message))
-        for message in compacted_input.messages
-    )
+    total_char_size = sum(len(_message_text_for_trace(message)) for message in compacted_input.messages)
     return RunInputBuildTrace(
         session_id=request.session_id,
         run_id=request.run_id,
@@ -388,8 +367,7 @@ def _require_memory_store() -> ConversationMemoryStore:
     """
 
     raise RuntimeError(
-        "LocalRunHarness 必须显式传入 memory_store: "
-        "production InMemoryConversationMemoryStore 已在 P8-S8 删除"
+        "LocalRunHarness 必须显式传入 memory_store: " "production InMemoryConversationMemoryStore 已在 P8-S8 删除"
     )
 
 
@@ -441,33 +419,24 @@ class LocalRunHarness:
     proxy: WorkerProxy
     event_store: RunEventStore = field(default_factory=InMemoryRunEventStore)
     tool_runtime: HostToolRuntime | None = None
-    memory_store: ConversationMemoryStore = field(
-        default_factory=lambda: _require_memory_store()
-    )
-    run_input_builder: RunInputBuilder = field(
-        default_factory=DefaultRunInputBuilder
-    )
-    compact_coordinator: ContextCompactCoordinator = field(
-        default_factory=ContextCompactCoordinator
-    )
+    memory_store: ConversationMemoryStore = field(default_factory=lambda: _require_memory_store())
+    run_input_builder: RunInputBuilder = field(default_factory=DefaultRunInputBuilder)
+    compact_coordinator: ContextCompactCoordinator = field(default_factory=ContextCompactCoordinator)
     coordinator: ProjectionCoordinator | None = None
     attempt_state_store: AttemptStateStore | None = None
     attempt_supervisor: AttemptSupervisor | None = None
     storage: HostStorage | None = None
     tool_trace_context_fact_enabled: bool = False
     run_input_context_fact_builder: RunInputContextFactBuilder | None = None
+    engine_tool_schema_provider: EngineToolSchemaProvider | None = None
     context_compact_retry_limit: int = _CONTEXT_COMPACT_RETRY_LIMIT
     run_input_trace_cache_limit: int = _RUN_INPUT_TRACE_CACHE_LIMIT
     run_input_message_cache_limit: int = _RUN_INPUT_MESSAGE_CACHE_LIMIT
-    last_run_input_build_trace_by_run: OrderedDict[
-        str, RunInputBuildTrace
-    ] = field(
+    last_run_input_build_trace_by_run: OrderedDict[str, RunInputBuildTrace] = field(
         default_factory=OrderedDict,
         init=False,
     )
-    last_run_input_messages_by_run: OrderedDict[
-        str, tuple[AgentMessage, ...]
-    ] = field(
+    last_run_input_messages_by_run: OrderedDict[str, tuple[AgentMessage, ...]] = field(
         default_factory=OrderedDict,
         init=False,
     )
@@ -491,8 +460,7 @@ class LocalRunHarness:
         if self.is_durable:
             if self.attempt_supervisor is None:
                 raise RuntimeError(
-                    "durable harness invariant violated: "
-                    "attempt_supervisor is required when is_durable=True"
+                    "durable harness invariant violated: " "attempt_supervisor is required when is_durable=True"
                 )
             # invariant 校验:isinstance 用于装配契约校验,非类型分支判断;
             # 与 CLAUDE.md 禁止 isinstance 当类型逃避不冲突。
@@ -509,14 +477,10 @@ class LocalRunHarness:
                     "(P6 legacy store is forbidden in durable path)"
                 )
             if self.storage is None:
-                raise RuntimeError(
-                    "durable harness invariant violated: "
-                    "storage is required when is_durable=True"
-                )
+                raise RuntimeError("durable harness invariant violated: " "storage is required when is_durable=True")
             if self.tool_runtime is None:
                 raise RuntimeError(
-                    "durable harness invariant violated: "
-                    "tool_runtime is required when is_durable=True"
+                    "durable harness invariant violated: " "tool_runtime is required when is_durable=True"
                 )
             if not self.tool_runtime.is_durable:
                 raise RuntimeError(
@@ -565,24 +529,17 @@ class LocalRunHarness:
                 and active_attempt is not None
                 and active_attempt.owner_context is not None
             ):
-                return self.attempt_supervisor.scoped_appender(
-                    active_attempt.owner_context
-                )
+                return self.attempt_supervisor.scoped_appender(active_attempt.owner_context)
             active = active_tool_runtime_appender()
             if active is not None:
                 return active
-            raise RuntimeError(
-                "durable harness requires AttemptOwnerContext for "
-                "attempt-scoped append"
-            )
+            raise RuntimeError("durable harness requires AttemptOwnerContext for " "attempt-scoped append")
         if (
             self.attempt_supervisor is not None
             and active_attempt is not None
             and active_attempt.owner_context is not None
         ):
-            return self.attempt_supervisor.scoped_appender(
-                active_attempt.owner_context
-            )
+            return self.attempt_supervisor.scoped_appender(active_attempt.owner_context)
         return PlainRunEventAppender(event_store=self.event_store)
 
     def _scope_appender(self) -> ToolRuntimeEventAppender:
@@ -608,10 +565,7 @@ class LocalRunHarness:
         if active is not None:
             return active
         if self.is_durable:
-            raise RuntimeError(
-                "durable harness requires ToolRuntimeOwnerScope for "
-                "scope appender"
-            )
+            raise RuntimeError("durable harness requires ToolRuntimeOwnerScope for " "scope appender")
         return PlainRunEventAppender(event_store=self.event_store)
 
     def _attempt_owner_scope(
@@ -624,9 +578,8 @@ class LocalRunHarness:
         :class:`ToolRuntimeOwnerScope`, 在 attempt 生命周期内把绑定
         owner 的 :class:`AttemptScopedRunEventAppender` 注入到
         :class:`HostToolRuntime` 的 active appender ContextVar,
-        使 ToolRuntime canonical fact append (``TOOL_RESULT_TRUNCATED``
-        / ``TOOL_CURSOR_*`` / ``TOOL_FETCH_MORE_*``) 与 Engine 翻译事件
-        统一走 fencing-aware 同事务路径; legacy / 无 supervisor / 无
+        使 ToolRuntime 需要 append Host-owned canonical fact 时与 Engine
+        翻译事件统一走 fencing-aware 同事务路径; legacy / 无 supervisor / 无
         ``owner_context`` 路径返回 :func:`_null_attempt_owner_scope`,
         退化为 P6/P7 行为, 不修改 ToolRuntime active appender。
 
@@ -640,11 +593,7 @@ class LocalRunHarness:
             and active_attempt is not None
             and active_attempt.owner_context is not None
         ):
-            return ToolRuntimeOwnerScope(
-                self.attempt_supervisor.scoped_appender(
-                    active_attempt.owner_context
-                )
-            )
+            return ToolRuntimeOwnerScope(self.attempt_supervisor.scoped_appender(active_attempt.owner_context))
         return _null_attempt_owner_scope()
 
     async def start_run(self, request: StartRunRequest) -> RunStream:
@@ -686,16 +635,14 @@ class LocalRunHarness:
             run_id=request.run_id,
             messages=build_result.run_input.messages,
         )
-        engine_request = replace(request, input=build_result.run_input)
+        engine_request = self._engine_visible_request(replace(request, input=build_result.run_input))
         await self._append_run_input_context_snapshot_fact(
             request=engine_request,
             build_trace=build_result.trace,
             current_user_event=current_user_event,
             attempt_index=0,
             iteration_index=0,
-            iteration_id=_iteration_id_for_attempt(
-                run_id=engine_request.run_id, attempt_index=0
-            ),
+            iteration_id=_iteration_id_for_attempt(run_id=engine_request.run_id, attempt_index=0),
         )
         task = asyncio.create_task(
             self._run_to_store(
@@ -703,9 +650,7 @@ class LocalRunHarness:
                 current_user_event=current_user_event,
             )
         )
-        task.add_done_callback(
-            partial(_log_background_task_failure, engine_request)
-        )
+        task.add_done_callback(partial(_log_background_task_failure, engine_request))
         _LOGGER.log(
             VERBOSE_LOG_LEVEL,
             "host.run.start_accepted session_id=%s run_id=%s "
@@ -735,6 +680,31 @@ class LocalRunHarness:
             ),
         )
 
+    def _engine_visible_request(
+        self,
+        request: StartRunRequest,
+    ) -> StartRunRequest:
+        """构造只供 Engine attempt 使用的 request 副本。
+
+        :param request: 调用方原始 request 或内部 retry request。
+        :returns: tool schema 已增强的 request；无 provider 时原样返回。
+        :raises ValueError: framework schema 与业务 schema 冲突时抛出。
+        """
+
+        provider = self.engine_tool_schema_provider
+        if provider is None:
+            return request
+        enhanced_schemas = provider.engine_visible_tool_schemas(request.options.tool_schemas)
+        if enhanced_schemas == request.options.tool_schemas:
+            return request
+        return replace(
+            request,
+            options=replace(
+                request.options,
+                tool_schemas=enhanced_schemas,
+            ),
+        )
+
     async def _task_aware_event_stream(
         self,
         subscription: AsyncIterator[RunEvent],
@@ -755,9 +725,7 @@ class LocalRunHarness:
         sub_iter = subscription.__aiter__()
         try:
             while True:
-                next_task: asyncio.Task[RunEvent] = asyncio.ensure_future(
-                    sub_iter.__anext__()
-                )
+                next_task: asyncio.Task[RunEvent] = asyncio.ensure_future(sub_iter.__anext__())
                 try:
                     done, _pending = await asyncio.wait(
                         [next_task, background_task],
@@ -820,11 +788,9 @@ class LocalRunHarness:
         attempt_index = 0
         event_count = 0
         terminal_seen = False
-        current_active_attempt: _ActiveAttempt | None = (
-            await self._begin_attempt_if_durable(
-                request=request,
-                attempt_index=attempt_index,
-            )
+        current_active_attempt: _ActiveAttempt | None = await self._begin_attempt_if_durable(
+            request=request,
+            attempt_index=attempt_index,
         )
         _LOGGER.log(
             VERBOSE_LOG_LEVEL,
@@ -839,8 +805,7 @@ class LocalRunHarness:
                 overflow_trigger_event: EngineEvent | None = None
                 _LOGGER.log(
                     VERBOSE_LOG_LEVEL,
-                    "host.run.attempt_start session_id=%s run_id=%s "
-                    "attempt_index=%s message_count=%s",
+                    "host.run.attempt_start session_id=%s run_id=%s " "attempt_index=%s message_count=%s",
                     attempt_request.session_id,
                     attempt_request.run_id,
                     attempt_index,
@@ -879,9 +844,7 @@ class LocalRunHarness:
                         if (
                             terminal_seen
                             and current_active_attempt is not None
-                            and self._can_atomic_terminal_close(
-                                current_active_attempt
-                            )
+                            and self._can_atomic_terminal_close(current_active_attempt)
                         ):
                             current_active_attempt = None
                     except AttemptFencingError:
@@ -911,35 +874,29 @@ class LocalRunHarness:
                                 break
                             except _OwnerLostDuringEngineWait as lost:
                                 try:
-                                    terminal_seen = (
-                                        await self._handle_owner_lost(
-                                            request=attempt_request,
-                                            active_attempt=current_active_attempt,
-                                            loss_reason=lost.loss_reason,
-                                            event_count=event_count,
-                                            terminal_seen=terminal_seen,
-                                        )
+                                    terminal_seen = await self._handle_owner_lost(
+                                        request=attempt_request,
+                                        active_attempt=current_active_attempt,
+                                        loss_reason=lost.loss_reason,
+                                        event_count=event_count,
+                                        terminal_seen=terminal_seen,
                                     )
                                 finally:
                                     current_active_attempt = None
                                 return
                             except Exception as exc:
                                 try:
-                                    terminal_seen = (
-                                        await self._append_worker_failure_if_needed(
-                                            request=attempt_request,
-                                            error=exc,
-                                            event_count=event_count,
-                                            terminal_seen=terminal_seen,
-                                            active_attempt=current_active_attempt,
-                                        )
+                                    terminal_seen = await self._append_worker_failure_if_needed(
+                                        request=attempt_request,
+                                        error=exc,
+                                        event_count=event_count,
+                                        terminal_seen=terminal_seen,
+                                        active_attempt=current_active_attempt,
                                     )
                                     if (
                                         terminal_seen
                                         and current_active_attempt is not None
-                                        and self._can_atomic_terminal_close(
-                                            current_active_attempt
-                                        )
+                                        and self._can_atomic_terminal_close(current_active_attempt)
                                     ):
                                         current_active_attempt = None
                                 except AttemptFencingError:
@@ -972,9 +929,9 @@ class LocalRunHarness:
                                     attempt_index,
                                     event.type.value,
                                 )
-                                await self._resolve_attempt_appender(
-                                    current_active_attempt
-                                ).append(translate_engine_event(event))
+                                await self._resolve_attempt_appender(current_active_attempt).append(
+                                    translate_engine_event(event)
+                                )
                                 continue
                             if _is_context_compaction_required_terminal(event):
                                 overflow_trigger_seen = True
@@ -985,9 +942,7 @@ class LocalRunHarness:
                                 )
                                 overflow_observed_seen = True
                                 break
-                            if overflow_trigger_seen and _is_terminal_engine_event(
-                                event
-                            ):
+                            if overflow_trigger_seen and _is_terminal_engine_event(event):
                                 await self._append_unexpected_compaction_terminal_closure(
                                     request=attempt_request,
                                     event=event,
@@ -999,23 +954,19 @@ class LocalRunHarness:
                                 if (
                                     draft.type in TERMINAL_RUN_EVENT_TYPES
                                     and current_active_attempt is not None
-                                    and self._can_atomic_terminal_close(
-                                        current_active_attempt
-                                    )
+                                    and self._can_atomic_terminal_close(current_active_attempt)
                                 )
                                 else None
                             )
                             if atomic_attempt is not None:
-                                stored_event = (
-                                    await self._append_terminal_and_close(
-                                        active_attempt=atomic_attempt,
-                                        draft=draft,
-                                    )
+                                stored_event = await self._append_terminal_and_close(
+                                    active_attempt=atomic_attempt,
+                                    draft=draft,
                                 )
                             else:
-                                stored_event = await self._resolve_attempt_appender(
-                                    current_active_attempt
-                                ).append(draft)
+                                stored_event = await self._resolve_attempt_appender(current_active_attempt).append(
+                                    draft
+                                )
                             if terminal_result_from_event(stored_event) is not None:
                                 _LOGGER.log(
                                     VERBOSE_LOG_LEVEL,
@@ -1040,19 +991,14 @@ class LocalRunHarness:
                                 current_active_attempt = None
                                 return
                         if overflow_trigger_seen:
-                            if (
-                                not overflow_observed_seen
-                                and overflow_trigger_event is not None
-                            ):
+                            if not overflow_observed_seen and overflow_trigger_event is not None:
                                 await self._append_overflow_observed(
                                     request=attempt_request,
                                     event=overflow_trigger_event,
                                     attempt_index=attempt_index,
                                 )
                             if current_user_event is None:
-                                raise RuntimeError(
-                                    "context compact requires current_user_event"
-                                )
+                                raise RuntimeError("context compact requires current_user_event")
                             try:
                                 next_request_with_trace = await self._compact_or_fail(
                                     request=attempt_request,
@@ -1062,20 +1008,16 @@ class LocalRunHarness:
                                 )
                             except Exception as exc:
                                 try:
-                                    terminal_seen = (
-                                        await self._append_compact_exception_failure(
-                                            request=attempt_request,
-                                            attempt_index=attempt_index,
-                                            error=exc,
-                                            active_attempt=current_active_attempt,
-                                        )
+                                    terminal_seen = await self._append_compact_exception_failure(
+                                        request=attempt_request,
+                                        attempt_index=attempt_index,
+                                        error=exc,
+                                        active_attempt=current_active_attempt,
                                     )
                                     if (
                                         terminal_seen
                                         and current_active_attempt is not None
-                                        and self._can_atomic_terminal_close(
-                                            current_active_attempt
-                                        )
+                                        and self._can_atomic_terminal_close(current_active_attempt)
                                     ):
                                         current_active_attempt = None
                                 except AttemptFencingError:
@@ -1095,11 +1037,8 @@ class LocalRunHarness:
                                 return
                             if next_request_with_trace is None:
                                 terminal_seen = True
-                                if (
-                                    current_active_attempt is not None
-                                    and self._can_atomic_terminal_close(
-                                        current_active_attempt
-                                    )
+                                if current_active_attempt is not None and self._can_atomic_terminal_close(
+                                    current_active_attempt
                                 ):
                                     current_active_attempt = None
                                 else:
@@ -1122,22 +1061,18 @@ class LocalRunHarness:
                             # 也无法推导, Run 残留无 terminal 的 STALE 收口。
                             new_attempt_index = attempt_index + 1
                             try:
-                                new_active_attempt = (
-                                    await self._begin_attempt_if_durable(
-                                        request=next_request,
-                                        attempt_index=new_attempt_index,
-                                    )
+                                new_active_attempt = await self._begin_attempt_if_durable(
+                                    request=next_request,
+                                    attempt_index=new_attempt_index,
                                 )
                             except Exception as acquire_exc:
                                 try:
-                                    terminal_seen = (
-                                        await self._append_overflow_acquire_failure_terminal(
-                                            request=attempt_request,
-                                            active_attempt=current_active_attempt,
-                                            attempt_index=attempt_index,
-                                            new_attempt_index=new_attempt_index,
-                                            error=acquire_exc,
-                                        )
+                                    terminal_seen = await self._append_overflow_acquire_failure_terminal(
+                                        request=attempt_request,
+                                        active_attempt=current_active_attempt,
+                                        attempt_index=attempt_index,
+                                        new_attempt_index=new_attempt_index,
+                                        error=acquire_exc,
                                     )
                                 except AttemptFencingError:
                                     try:
@@ -1158,11 +1093,8 @@ class LocalRunHarness:
                                 # 下旧 attempt 由上层 finally 走
                                 # _finish_attempt_if_durable(state=FAILED)
                                 # 推进 host_attempts。
-                                if (
-                                    current_active_attempt is not None
-                                    and self._can_atomic_terminal_close(
-                                        current_active_attempt
-                                    )
+                                if current_active_attempt is not None and self._can_atomic_terminal_close(
+                                    current_active_attempt
                                 ):
                                     current_active_attempt = None
                                 return
@@ -1190,20 +1122,16 @@ class LocalRunHarness:
                                 active_attempt=current_active_attempt,
                             )
                             continue
-                        terminal_seen = (
-                            await self._append_missing_terminal_failure_if_needed(
-                                request=attempt_request,
-                                event_count=event_count,
-                                terminal_seen=terminal_seen,
-                                active_attempt=current_active_attempt,
-                            )
+                        terminal_seen = await self._append_missing_terminal_failure_if_needed(
+                            request=attempt_request,
+                            event_count=event_count,
+                            terminal_seen=terminal_seen,
+                            active_attempt=current_active_attempt,
                         )
                         if (
                             terminal_seen
                             and current_active_attempt is not None
-                            and self._can_atomic_terminal_close(
-                                current_active_attempt
-                            )
+                            and self._can_atomic_terminal_close(current_active_attempt)
                         ):
                             current_active_attempt = None
                         return
@@ -1217,23 +1145,16 @@ class LocalRunHarness:
                 await self._finish_attempt_if_durable(
                     active_attempt=current_active_attempt,
                     terminal_event=None,
-                    state=(
-                        AttemptState.FAILED
-                        if terminal_seen
-                        else AttemptState.STALE
-                    ),
+                    state=(AttemptState.FAILED if terminal_seen else AttemptState.STALE),
                     failure_summary=(
-                        "attempt_closed_by_terminal_event"
-                        if terminal_seen
-                        else "run_terminated_without_terminal_event"
+                        "attempt_closed_by_terminal_event" if terminal_seen else "run_terminated_without_terminal_event"
                     ),
                 )
                 current_active_attempt = None
             if terminal_seen:
                 await self._project_terminal_run(request.run_id)
             _LOGGER.info(
-                "host.run.background_finished session_id=%s run_id=%s "
-                "event_count=%s terminal_seen=%s",
+                "host.run.background_finished session_id=%s run_id=%s " "event_count=%s terminal_seen=%s",
                 request.session_id,
                 request.run_id,
                 event_count,
@@ -1269,27 +1190,17 @@ class LocalRunHarness:
         :raises Exception: 透传 Engine iterator 自身异常。
         """
 
-        if (
-            self.attempt_supervisor is None
-            or active_attempt is None
-            or active_attempt.owner_context is None
-        ):
+        if self.attempt_supervisor is None or active_attempt is None or active_attempt.owner_context is None:
             return await anext(engine_events)
         owner_context = active_attempt.owner_context
         # 进入 race 前先做无锁快照检查: 已失活直接抛, 不再尝试拉取
         # Engine event。
         if not self.attempt_supervisor.is_owner_active(owner_context):
-            loss_reason = await self.attempt_supervisor.wait_owner_lost(
-                owner_context
-            )
+            loss_reason = await self.attempt_supervisor.wait_owner_lost(owner_context)
             raise _OwnerLostDuringEngineWait(loss_reason=loss_reason)
-        next_event_task: asyncio.Task[EngineEvent] = asyncio.ensure_future(
-            anext(engine_events)
-        )
-        owner_lost_task: asyncio.Task[AttemptOwnerLossReason] = (
-            asyncio.ensure_future(
-                self.attempt_supervisor.wait_owner_lost(owner_context)
-            )
+        next_event_task: asyncio.Task[EngineEvent] = asyncio.ensure_future(anext(engine_events))
+        owner_lost_task: asyncio.Task[AttemptOwnerLossReason] = asyncio.ensure_future(
+            self.attempt_supervisor.wait_owner_lost(owner_context)
         )
         try:
             done, _ = await asyncio.wait(
@@ -1355,12 +1266,9 @@ class LocalRunHarness:
             :class:`AttemptFencingError` 异常时透传。
         """
 
-        attempt_id = (
-            "<none>" if active_attempt is None else active_attempt.attempt_id
-        )
+        attempt_id = "<none>" if active_attempt is None else active_attempt.attempt_id
         _LOGGER.error(
-            "host.run.attempt_lease_lost session_id=%s run_id=%s "
-            "attempt_id=%s loss_reason=%s event_count=%s",
+            "host.run.attempt_lease_lost session_id=%s run_id=%s " "attempt_id=%s loss_reason=%s event_count=%s",
             request.session_id,
             request.run_id,
             attempt_id,
@@ -1381,9 +1289,7 @@ class LocalRunHarness:
             return False
         supervisor = self.attempt_supervisor
         owner_context = active_attempt.owner_context
-        failure_summary = (
-            f"{_ERROR_ATTEMPT_LEASE_LOST}:{loss_reason.value}"
-        )
+        failure_summary = f"{_ERROR_ATTEMPT_LEASE_LOST}:{loss_reason.value}"
         draft = host_failure_draft(
             run_id=request.run_id,
             session_id=request.session_id,
@@ -1431,8 +1337,7 @@ class LocalRunHarness:
         await active_attempt.lease_exit_stack.aclose()
         _LOGGER.log(
             VERBOSE_LOG_LEVEL,
-            "host.run.attempt_lease_lost_terminal_appended attempt_id=%s "
-            "state=%s terminal_event_position=%s",
+            "host.run.attempt_lease_lost_terminal_appended attempt_id=%s " "state=%s terminal_event_position=%s",
             link.attempt_id,
             link.terminal_state.value,
             link.event_position.value,
@@ -1505,8 +1410,7 @@ class LocalRunHarness:
         )
         if request.run_id not in self.last_run_input_build_trace_by_run:
             _LOGGER.error(
-                "host.run.context_compact_trace_missing session_id=%s "
-                "run_id=%s attempt_index=%s",
+                "host.run.context_compact_trace_missing session_id=%s " "run_id=%s attempt_index=%s",
                 request.session_id,
                 request.run_id,
                 attempt_index,
@@ -1611,8 +1515,7 @@ class LocalRunHarness:
         next_attempt_index = attempt_index + 1
         _LOGGER.log(
             VERBOSE_LOG_LEVEL,
-            "host.run.attempt_retrying session_id=%s run_id=%s "
-            "from_attempt_index=%s next_attempt_index=%s",
+            "host.run.attempt_retrying session_id=%s run_id=%s " "from_attempt_index=%s next_attempt_index=%s",
             request.session_id,
             request.run_id,
             attempt_index,
@@ -1696,9 +1599,7 @@ class LocalRunHarness:
             error=RuntimeError(_ERROR_CONTEXT_OVERFLOW_RETRY_ACQUIRE_FAILED),
             error_code=_ERROR_CONTEXT_OVERFLOW_RETRY_ACQUIRE_FAILED,
         )
-        if active_attempt is not None and self._can_atomic_terminal_close(
-            active_attempt
-        ):
+        if active_attempt is not None and self._can_atomic_terminal_close(active_attempt):
             stored_event = await self._append_terminal_and_close(
                 active_attempt=active_attempt,
                 draft=draft,
@@ -1726,9 +1627,7 @@ class LocalRunHarness:
         :raises Exception: append 或 close 失败时透传。
         """
 
-        if active_attempt is not None and self._can_atomic_terminal_close(
-            active_attempt
-        ):
+        if active_attempt is not None and self._can_atomic_terminal_close(active_attempt):
             return await self._append_terminal_and_close(
                 active_attempt=active_attempt,
                 draft=draft,
@@ -1755,8 +1654,7 @@ class LocalRunHarness:
         """
 
         _LOGGER.error(
-            "host.run.context_compact_failed session_id=%s run_id=%s "
-            "attempt_index=%s exc_type=%s",
+            "host.run.context_compact_failed session_id=%s run_id=%s " "attempt_index=%s exc_type=%s",
             request.session_id,
             request.run_id,
             attempt_index,
@@ -1785,7 +1683,7 @@ class LocalRunHarness:
                 occurred_at=datetime.now(tz=timezone.utc),
                 reason=failed_data.reason,
                 message=failed_data.message,
-            )
+            ),
         )
         return terminal_result_from_event(stored_event) is not None
 
@@ -1915,8 +1813,7 @@ class LocalRunHarness:
         """
 
         _LOGGER.error(
-            "host.run.background_failed session_id=%s run_id=%s "
-            "event_count=%s exc_type=%s",
+            "host.run.background_failed session_id=%s run_id=%s " "event_count=%s exc_type=%s",
             request.session_id,
             request.run_id,
             event_count,
@@ -1961,8 +1858,7 @@ class LocalRunHarness:
         if terminal_seen:
             return True
         _LOGGER.critical(
-            "host.run.engine_stream_ended_without_terminal "
-            "session_id=%s run_id=%s event_count=%s",
+            "host.run.engine_stream_ended_without_terminal " "session_id=%s run_id=%s event_count=%s",
             request.session_id,
             request.run_id,
             event_count,
@@ -1975,7 +1871,7 @@ class LocalRunHarness:
                 occurred_at=datetime.now(tz=timezone.utc),
                 error=RuntimeError(_ERROR_ENGINE_STREAM_ENDED_WITHOUT_TERMINAL),
                 error_code=_ERROR_ENGINE_STREAM_ENDED_WITHOUT_TERMINAL,
-            )
+            ),
         )
         return terminal_result_from_event(stored_event) is not None
 
@@ -2086,9 +1982,7 @@ class LocalRunHarness:
             )
         if self.attempt_state_store is None or self.storage is None:
             return None
-        attempt_id = (
-            f"attempt-{request.run_id}-{attempt_index}-{uuid.uuid4().hex[:8]}"
-        )
+        attempt_id = f"attempt-{request.run_id}-{attempt_index}-{uuid.uuid4().hex[:8]}"
         async with self.storage.transaction() as tx:
             self.attempt_state_store.create(
                 tx=tx,
@@ -2103,8 +1997,7 @@ class LocalRunHarness:
             )
         _LOGGER.log(
             VERBOSE_LOG_LEVEL,
-            "host.run.attempt_created run_id=%s attempt_id=%s "
-            "attempt_index=%s",
+            "host.run.attempt_created run_id=%s attempt_id=%s " "attempt_index=%s",
             request.run_id,
             attempt_id,
             attempt_index,
@@ -2169,21 +2062,15 @@ class LocalRunHarness:
         supervisor = self.attempt_supervisor
         owner_context = active_attempt.owner_context
         lease_exit_stack = active_attempt.lease_exit_stack
-        if (
-            supervisor is None
-            or owner_context is None
-            or lease_exit_stack is None
-        ):
+        if supervisor is None or owner_context is None or lease_exit_stack is None:
             # _can_atomic_terminal_close 已经守住, 此分支只是 type narrowing
             # 兜底。
-            raise RuntimeError(
-                "atomic terminal close requires supervisor + owner_context + "
-                "lease_exit_stack"
-            )
+            raise RuntimeError("atomic terminal close requires supervisor + owner_context + " "lease_exit_stack")
         terminal_state = attempt_state_from_terminal_event_type(draft.type)
         failure_summary = (
             draft.type.value
-            if terminal_state in (
+            if terminal_state
+            in (
                 AttemptState.FAILED,
                 AttemptState.CANCELLED,
                 AttemptState.SUSPENDED,
@@ -2198,8 +2085,7 @@ class LocalRunHarness:
         await lease_exit_stack.aclose()
         _LOGGER.log(
             VERBOSE_LOG_LEVEL,
-            "host.run.attempt_finished attempt_id=%s state=%s "
-            "terminal_event_position=%s",
+            "host.run.attempt_finished attempt_id=%s state=%s " "terminal_event_position=%s",
             active_attempt.attempt_id,
             link.terminal_state.value,
             link.event_position.value,
@@ -2254,22 +2140,23 @@ class LocalRunHarness:
 
         if terminal_event is not None and state is not None:
             raise ValueError(
-                "_finish_attempt_if_durable 不允许同时传入 terminal_event "
-                "与 state；二者互斥，调用方需明确终态来源。"
+                "_finish_attempt_if_durable 不允许同时传入 terminal_event " "与 state；二者互斥，调用方需明确终态来源。"
             )
         if active_attempt is None:
             return
         resolved_state = state
         resolved_failure = failure_summary
         if terminal_event is not None:
-            resolved_state = attempt_state_from_terminal_event_type(
-                terminal_event.type
-            )
-            if resolved_state in (
-                AttemptState.FAILED,
-                AttemptState.CANCELLED,
-                AttemptState.SUSPENDED,
-            ) and resolved_failure is None:
+            resolved_state = attempt_state_from_terminal_event_type(terminal_event.type)
+            if (
+                resolved_state
+                in (
+                    AttemptState.FAILED,
+                    AttemptState.CANCELLED,
+                    AttemptState.SUSPENDED,
+                )
+                and resolved_failure is None
+            ):
                 resolved_failure = terminal_event.type.value
         if resolved_state is None:
             resolved_state = AttemptState.FAILED
@@ -2282,14 +2169,11 @@ class LocalRunHarness:
             # 完成 CAS 写入, 否则 session 被移除后 verify_owner / 后续
             # owner-lost signal 都会立即视为已失活。terminal event
             # position 的同事务原子写入归 P8-S4。
-            cas_applied = (
-                await self.attempt_supervisor
-                .close_attempt_with_diagnostic_state(
-                    owner_context=active_attempt.owner_context,
-                    state=resolved_state,
-                    failure_summary=resolved_failure,
-                    terminal_event_position=None,
-                )
+            cas_applied = await self.attempt_supervisor.close_attempt_with_diagnostic_state(
+                owner_context=active_attempt.owner_context,
+                state=resolved_state,
+                failure_summary=resolved_failure,
+                terminal_event_position=None,
             )
             await active_attempt.lease_exit_stack.aclose()
             if cas_applied:
@@ -2301,8 +2185,7 @@ class LocalRunHarness:
                 )
             else:
                 _LOGGER.warning(
-                    "host.run.attempt_finished_cas_miss attempt_id=%s "
-                    "state=%s",
+                    "host.run.attempt_finished_cas_miss attempt_id=%s " "state=%s",
                     active_attempt.attempt_id,
                     resolved_state.value,
                 )
@@ -2387,8 +2270,9 @@ class LocalRunHarness:
         append; 其它路径退化为 :meth:`DurableRunEventStore.append_in_transaction`,
         与 P6 行为一致 (start_run 阶段尚未开 attempt, 不参与 fencing)。
 
-        :param request: 当前 attempt 的 start 请求；其 ``input.messages`` 为
-            实际交给 Engine 的消息序列。
+        :param request: 当前 attempt 的 engine-visible start 请求；其
+            ``input.messages`` 与 ``options.tool_schemas`` 均为实际交给
+            Engine 的消息序列和增强后 schema。
         :param build_trace: RunInputBuilder 产出的 trace；compact 路径下由
             调用方合成。
         :param current_user_event: 本 Run 原始用户输入事件。
@@ -2448,8 +2332,7 @@ class LocalRunHarness:
                 self.event_store.append_in_transaction(tx=tx, draft=draft)
         _LOGGER.log(
             VERBOSE_LOG_LEVEL,
-            "host.run.run_input_context_snapshot_built run_id=%s "
-            "attempt_index=%s iteration_id=%s message_count=%s",
+            "host.run.run_input_context_snapshot_built run_id=%s " "attempt_index=%s iteration_id=%s message_count=%s",
             request.run_id,
             attempt_index,
             iteration_id,
@@ -2534,8 +2417,7 @@ async def _close_engine_events_if_supported(
             await engine_events.aclose()
         except Exception as exc:
             _LOGGER.warning(
-                "host.run.stream_close_failed session_id=%s run_id=%s "
-                "exc_type=%s",
+                "host.run.stream_close_failed session_id=%s run_id=%s " "exc_type=%s",
                 request.session_id,
                 request.run_id,
                 type(exc).__name__,
@@ -2565,8 +2447,7 @@ def _log_background_task_failure(
     if error is None:
         return
     _LOGGER.error(
-        "host.run.background_task_failed session_id=%s run_id=%s "
-        "exc_type=%s",
+        "host.run.background_task_failed session_id=%s run_id=%s " "exc_type=%s",
         request.session_id,
         request.run_id,
         type(error).__name__,

@@ -99,18 +99,25 @@ Host 当前 Run harness、RunEventStore、ToolRuntime、Conversation Memory / Ru
   会落 Host-owned canonical failure 事件，并验证 RunInput trace 调试缓存与更小的消息诊断缓存分别按容量淘汰。
 - tool-call smoke：通过内部 `LocalRunHarness` 注入 fake ToolExecutor，覆盖 Runner tool call -> Engine 工具闭环 -> Host RunEvent stream。
 - ToolRuntime truncation：覆盖 text chars、text lines、list items、binary bytes、no-spec no-truncate、
-  explicit target only、field_path 优先级、路径不匹配不截断、execute-time cursor facts、非成功 outcome 不创建
-  cursor、single-use、并发 single-use、TTL expired、opportunistic cleanup、limit clamp 与策略 / data 类型不匹配。
-- ToolRuntime eventlog：覆盖截断 / cursor issued / fetch_more requested / completed / failed / denied / expired
-  均通过 canonical RunEvent 表达，handle 阶段 denied / expired 写入可信 owner run，terminal 后不追加事实，
-  非权限失败不标记 denied，且 EventLog 不保存明文 scope token 或完整大结果。
-- ToolRuntime boundary：覆盖 Host 包根只导出 Run 级补读入口与契约类型，Engine 不 import Host / ToolRuntime，
-  Host public scope token 只能通过受控 handle 交付，跨 run 补读不污染请求伪造的 run，Engine LLM-facing
-  projection 会为截断结果生成 `fetch_more_args`。
+  explicit target only、field_path 优先级、路径不匹配不截断、非成功 outcome 不创建 cursor、single-use、
+  并发 single-use、TTL expired、opportunistic cleanup、limit clamp、未知 strategy fail closed、
+  apply / fetch_more 共享状态锁与策略 / data 类型不匹配；截断状态由
+  Host 私有 `RuntimeTruncateManager` 持有，不产生专用 truncation / cursor RunEvent。
+- credential scrub：覆盖显式 API key、Authorization、x-api-key、cookie、client secret、private key、
+  password 等字段 / 字符串 header 清洗，并锁定 cursor、scope_token、普通 token、anthropic-version、
+  openai-organization 不被误清洗。
+- ToolRuntime eventlog：覆盖业务工具与 framework `fetch_more` 只通过普通 `TOOL_CALL_REQUESTED` /
+  `TOOL_RESULT_ACCEPTED` 表达，terminal 后不追加专用事实；ordinary payload 可保留 cursor / scope token /
+  truncation.fetch_more_args，显式 API key / credential scrub 仍成立。
+- ToolRuntime boundary：覆盖 Host 包根只导出 Run 级契约与通用 value summary，旧 public fetch_more /
+  cursor contract 负向锁定不存在，Engine 不 import Host / ToolRuntime；调用方只传业务 schema，Host runtime
+  assembly 自动把私有 `fetch_more` schema 投影给 Engine，`RunOptions` 不被污染，Engine 不接收
+  `ToolDefinition`、callable 或 manager。
 - Conversation Memory projection：覆盖 `USER_INPUT_ACCEPTED`、canonical final answer、ToolRuntime / Engine tool fact
   从 EventLog 投影，preview / reasoning / delta 不进入 memory，assistant final answer 不自动成为 verified claim，
   memory item 携带 provenance / trust / scope 元数据，`USER_INPUT_ACCEPTED` scope 使用封闭枚举并非法 fail fast，
-  非 SESSION scope clear patch fail fast，不同 session 不串 memory。
+  非 SESSION scope clear patch fail fast，不同 session 不串 memory；truncation 结构化字段只保存安全 cursor
+  fingerprint 与 has_more，不保存 raw cursor / scope_token。
 - RunInputBuilder：覆盖 memory block 顺序、tool facts / evidence anchors 与 assistant history 分离、
   tool facts 独立 section、source event cursor 输出、recent raw turns 单 section header、pinned state 预算外全量注入、
   older pool 新到旧消费预算后按时间顺序渲染、internal-only `RunInputBuildTrace`、预算裁剪原因、
@@ -127,11 +134,12 @@ Host 当前 Run harness、RunEventStore、ToolRuntime、Conversation Memory / Ru
   coordinator。
 - P5 no-full-governance smoke：覆盖公共 `huge_echo` 工具通过 `ToolDefinition` / `ToolBundle` 声明、
   fake provider 只模拟 LLM tool call output、真实 Engine Agent tool loop 调用 `ToolExecutor.execute`、
-  `ToolRuntimeToolExecutor -> HostToolRuntime -> huge_echo executor` 产生 truncate / cursor facts、
+  `ToolRuntimeToolExecutor -> HostToolRuntime -> huge_echo executor` 返回普通截断 tool outcome、
   截断 ToolMessage 包含 LLM-readable `truncation.next_action="fetch_more"` 与 `fetch_more_args`、模型在同一 run
-  内通过 Engine tool loop 发起 framework `fetch_more`、Host ToolRuntime 路由 framework 补读并在 terminal 前追加
-  fetch_more facts、terminal 后 framework `fetch_more` 工具调用返回 typed failure 不追加 EventLog、
-  后续 Run 的 RunInputBuilder 看到 previous run user / final / tool / fetch_more facts 与 source cursor、
+  内通过 Engine tool loop 发起 framework `fetch_more`、Host ToolRuntime 路由 framework 补读并返回普通 tool outcome、
+  terminal 后 framework `fetch_more` 工具调用返回普通 failed outcome 不追加专用 EventLog、
+  后续 Run 的 RunInputBuilder 看到 previous run user / final / ordinary tool facts 与 source cursor，
+  但不包含 raw cursor / raw scope token / 可复用 `fetch_more_args`、
   compact retry 不重复 `USER_INPUT_ACCEPTED`，真实 provider smoke 按 `utils/` smoke 既有范式写死
   `mimo-v2.5-pro-plan` `ProviderCase` 且不读取配置层级，并显式锁定
   `MimoThinkingExtension(enabled=True)` 属于 hardcoded ProviderCase，`--thinking` 只在 real-provider 路径回显
@@ -148,7 +156,8 @@ Host 当前 Run harness、RunEventStore、ToolRuntime、Conversation Memory / Ru
     分页消费，engine 来源缺 `source_engine_event_id` 时拒绝，`latest_event_position` 跟踪最大值。
   - `run_event_serializer`：常见 RunEventData round trip，`RUN_FAILED` 在 Engine `RunFailedData`
     与 Host `HostRunFailedData` 之间靠 `exception_type` 区分，type↔data 不匹配 fail-fast，
-    `schema_version` 不匹配 fail-fast，`type_name` 与 `event_type` 不匹配 fail-fast。
+    `schema_version` 不匹配 fail-fast，`type_name` 与 `event_type` 不匹配 fail-fast，并覆盖普通
+    tool payload 中显式凭证 scrub 与 cursor / scope token 保留。
   - `run_state_store`：FINAL_ANSWER append 后 run state 自动转 SUCCEEDED 并记录 terminal cursor，
     terminal `RunResult` JSON encode/decode round trip，attempt 创建 + 状态推进 + 终态字段写入。
   - `projection_checkpoint`：observer drain 后 checkpoint 推进到最新 position，
@@ -172,7 +181,8 @@ Host 当前 Run harness、RunEventStore、ToolRuntime、Conversation Memory / Ru
 - P7 tool trace projection（`tests/host/test_phase7_*.py`）：覆盖
   `RunInputContextFactBuilder` 派生 ``RUN_INPUT_CONTEXT_SNAPSHOT_BUILT`` canonical
   fact、`ToolTraceJsonlSink` JSONL + raw payload blob 落盘、provider secret
-  scrub、`ToolTraceObserver` 5 类 record 派发、``DurableHarnessConfig.tool_trace_path``
+  scrub、普通 tool payload 显式凭证 scrub 与 cursor / scope token 保留、
+  `ToolTraceObserver` 5 类 record 派发、``DurableHarnessConfig.tool_trace_path``
   装配开关与 ``tool_trace_v2_host`` schema 字面量边界。
 - P8-S3 attempt supervisor（`tests/host/test_phase8_attempt_supervisor.py`）：覆盖
   `AttemptSupervisor.lease_context` 正常 acquire / yield / 退出清理；renew loop 在 fake
@@ -208,15 +218,10 @@ Host 当前 Run harness、RunEventStore、ToolRuntime、Conversation Memory / Ru
 - P8-S5 ToolRuntime owner fencing（`tests/host/test_phase8_tool_runtime_fencing.py`）：
   覆盖 `ToolRuntimeOwnerScope` ContextVar 安装 / 恢复（含异常路径）、
   `active_tool_runtime_appender` scope 外返回 `None`、`HostToolRuntime._resolve_appender`
-  在 durable 路径 scope 内返回 `AttemptScopedRunEventAppender`，scope 外 fail-fast，
-  非 durable 测试路径才允许 `PlainRunEventAppender`，以及 ToolRuntime fact `run_id` mismatch 命中
-  `AttemptFencingError(reason=OWNER_MISMATCH)` 且 EventLog 不残留 fact、错误文本不
-  暴露 owner secret。同时覆盖 framework `fetch_more` 作为普通 tool call 的端到端 fenced 断言：
-  合法 owner scope 下 `execute_tool_call` 写入
-  `TOOL_FETCH_MORE_REQUESTED` / `TOOL_FETCH_MORE_COMPLETED` facts；cursor 绑定旧 run、
-  owner scope 绑定新 run 时端到端命中
-  `AttemptFencingError(reason=OWNER_MISMATCH)` 且 EventLog 在两个 run 中均不残留
-  fetch_more fact、错误文本不暴露 owner secret。
+  在 durable 路径 scope 外 fail-fast，非 durable 测试路径才允许 `PlainRunEventAppender`。同时通过
+  `ToolRuntimeToolExecutor.execute` / `HostToolRuntime.execute_tool_call` 真实入口覆盖 durable owner
+  scope guard：无 scope 时业务 executor 不被调用、framework `fetch_more` 不消费 cursor；合法 scope 下
+  业务截断与 framework 补读返回普通 outcome 且不追加专用 fetch_more fact。
 - P8-S6 stale / orphan recovery 主路径（`tests/host/test_phase8_attempt_recovery.py`）：
   覆盖 `AttemptSupervisor.recover_stale_attempts` 全部 typed 决策——
   `RUNNING` lease 过期与 `CREATED` 孤儿均诊断收口为 `MARK_LOST`，不创建新的
@@ -259,8 +264,9 @@ Host 当前 Run harness、RunEventStore、ToolRuntime、Conversation Memory / Ru
   observer reconcile、durable memory recovery）通过 fake clock + deterministic fake worker
   覆盖。慢硬盘 + Docker Linux stress 测试由 GitHub issue #38 跟踪，不在当前测试集内。
 - public boundary：锁定 `dayu.host.__all__`，包根仅暴露当前 contracts 强类型契约
-  (`RunEvent` / `StartRunRequest` / `ToolRuntimeCursor` / `ToolFetchMoreRequest` 等)；Run 级 `start_run` / `stream_run_events` /
-  `get_run_result` 与 framework `fetch_more` 路径必须经 `LocalRunHarness` 实例 / 普通 tool call
+  (`RunEvent` / `StartRunRequest` / `RunInputContextSnapshotBuiltData` / `ToolValueSizeSummary` 等)，并负向锁定
+  旧 cursor / fetch_more public contract 不存在；Run 级
+  `start_run` / `stream_run_events` / `get_run_result` 与 framework `fetch_more` 路径必须经 `LocalRunHarness` 实例 / 普通 tool call
   访问，阻止 `EngineWorker`、`LocalProxy`、
   `ToolExecutor`、`HostToolRuntime`、`ToolRuntimeToolExecutor`、`DurableConversationMemoryStore`、
   `DefaultRunInputBuilder`、`RunInputBuildTrace`、`run_agent_messages` 泄漏为包根 API。

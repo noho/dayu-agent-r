@@ -947,7 +947,7 @@ P7 落地后的硬事实：
   tool_call_id | source_event_position | record_role`）是 analyzer 去重崩溃 replay 副本的依据；
   `analyzer` 严格拒绝 OLD `tool_trace_v2` 文件，不做兼容读取。
 - provider secret scrub 仅作用于 `PROVIDER_PROTOCOL_ERROR.raw_payload`（`Authorization` /
-  `api_key` / `cookie` / `x-api-key` / `openai-organization` / `anthropic-api-key` 等键替换为 `***`）；
+  `api_key` / `cookie` / `x-api-key` / `anthropic-api-key` 等明确凭证键替换为 `***`）；
   `scope_token` / `cursor` / prompt / tool result 仍按 OLD 热 / 冷分层保留进 trace，用于真实故障定位。
 
 P8-S2 曾把 `ObserverSink.process` 从同步升级为 async 调用协议：`ProjectionCoordinator.drain()`

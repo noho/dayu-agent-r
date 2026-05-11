@@ -27,8 +27,12 @@ from dayu.contracts.json_value import JsonValue
 class ToolTruncationInfo:
     """工具级截断元信息（中性事实）。
 
-    :param cursor: 截断补读 cursor 原文；只允许短期进入 LLM-facing tool
-        result projection，不得写入 Host RunEvent / memory / 日志。
+    ``ToolTruncationInfo`` 是普通 LLM-facing 工具结果载荷的一部分。
+    Host EventLog / trace 可按普通工具结果保留该载荷；Conversation
+    Memory 与下一轮 RunInput 只摄取不可复用摘要，不持久复用 cursor、
+    ``scope_token`` 或完整 ``fetch_more_args``。
+
+    :param cursor: 截断补读 cursor 原文；只用于短期 LLM roundtrip。
     :param scope_token: 截断 scope 唯一 token。
     :param scope_hash: 截断 scope 内容 hash。
     :param has_more: 是否还有未取回数据。

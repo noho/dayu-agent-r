@@ -21,8 +21,6 @@
 - :func:`tool` / :class:`ToolDisplayInfo` / :class:`ToolDefinition` /
   :class:`ToolBundle` 最小工具声明契约；definition / bundle 只能投影为
   ``ToolSchema`` 后进入 Engine。
-- :func:`framework_fetch_more_tool_schema` /
-  :data:`FRAMEWORK_FETCH_MORE_TOOL_NAME` 最小 framework 补读工具 schema。
 
 本包内部模块允许相互 import；**禁止** import :mod:`dayu.engine` 或上层
 任何包。
@@ -46,13 +44,11 @@ from dayu.contracts.tool_call import (
 )
 from dayu.contracts.tool_executor import ToolExecutor
 from dayu.contracts.tool_declaration import (
-    FRAMEWORK_FETCH_MORE_TOOL_NAME,
     FunctionToolExecutor,
     ToolBundle,
     ToolDefinition,
     ToolDisplayInfo,
     ToolFunctionCallable,
-    framework_fetch_more_tool_schema,
     tool,
 )
 from dayu.contracts.tool_outcome import (
@@ -78,7 +74,6 @@ from dayu.contracts.tool_schema import (
 
 __all__ = [
     "CancellationToken",
-    "FRAMEWORK_FETCH_MORE_TOOL_NAME",
     "GeminiToolCallState",
     "JsonValue",
     "ToolAwaitKind",
@@ -108,6 +103,5 @@ __all__ = [
     "ToolTruncateSpec",
     "ToolTruncationInfo",
     "ToolTruncationStrategy",
-    "framework_fetch_more_tool_schema",
     "tool",
 ]

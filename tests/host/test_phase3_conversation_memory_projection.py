@@ -3,13 +3,14 @@
 from __future__ import annotations
 
 import asyncio
+import hashlib
 from datetime import datetime, timezone
 from typing import cast
 
 import pytest
 
 from dayu.contracts.tool_outcome import ToolCompletedOutcome
-from dayu.contracts.tool_result import ToolResultSuccess
+from dayu.contracts.tool_result import ToolResultSuccess, ToolTruncationInfo
 from dayu.engine import (
     ContentDeltaData,
     FinalAnswerData,
@@ -288,13 +289,60 @@ async def test_projection_reads_user_input_from_canonical_eventlog() -> None:
     assert snapshot.recent_raw_turns[0].user_text == "请分析收入"
     assert snapshot.recent_raw_turns[0].assistant_final == "收入增长。"
     assert snapshot.recent_raw_turns[0].user_provenance.source_run_id == "run-1"
-    assert (
-        snapshot.recent_raw_turns[0].user_provenance.source_event_cursor
-        == user_event.cursor
-    )
+    assert snapshot.recent_raw_turns[0].user_provenance.source_event_cursor == user_event.cursor
     assert snapshot.tool_facts[0].tool_name == "financial_fact_lookup"
     assert snapshot.tool_facts[0].provenance.source_event_cursor == tool_event.cursor
     assert snapshot.evidence_anchors[0].tool_call_id == "tool-call-1"
+
+
+@pytest.mark.asyncio
+async def test_tool_fact_structured_truncation_fields_are_safe() -> None:
+    """tool fact 结构化字段从 truncation 派生，但不保存 raw cursor。"""
+
+    event_store = InMemoryRunEventStore()
+    memory_store = FakeInMemoryConversationMemoryStore()
+    await event_store.append(
+        RunEventDraft(
+            run_id="run-truncated",
+            session_id="session-truncated",
+            kind=RunEventKind.CANONICAL,
+            source=RunEventSource.ENGINE,
+            type=RunEventType.TOOL_RESULT_ACCEPTED,
+            occurred_at=_utc_now(),
+            data=ToolResultAcceptedData(
+                iteration_id="iter",
+                tool_call_id="tool-call-truncated",
+                name="large_tool",
+                index_in_iteration=0,
+                outcome=ToolCompletedOutcome(
+                    result=ToolResultSuccess(
+                        ok=True,
+                        value={"items": [1, 2]},
+                        truncation=ToolTruncationInfo(
+                            cursor="raw-cursor-secret",
+                            scope_token="raw-scope-token",
+                            scope_hash="scope-hash-safe",
+                            has_more=True,
+                            limit=2,
+                            ttl_seconds=60,
+                        ),
+                        meta=None,
+                    )
+                ),
+            ),
+            source_engine_event_id="run-truncated:tool",
+        )
+    )
+
+    await memory_store.project_run_events(await event_store.list_events("run-truncated", after=None))
+    snapshot = await memory_store.get_snapshot("session-truncated")
+    fact = snapshot.tool_facts[0]
+
+    assert fact.cursor_fingerprint == hashlib.sha256(b"raw-cursor-secret").hexdigest()[:16]
+    assert fact.has_more is True
+    assert "raw-cursor-secret" not in fact.summary
+    assert "raw-scope-token" not in fact.summary
+    assert snapshot.evidence_anchors[0].fingerprint == fact.cursor_fingerprint
 
 
 @pytest.mark.asyncio
@@ -318,9 +366,7 @@ async def test_host_failure_terminal_projects_neutral_summary() -> None:
         run_id="run-failed",
     )
 
-    await memory_store.project_run_events(
-        await event_store.list_events("run-failed", after=None)
-    )
+    await memory_store.project_run_events(await event_store.list_events("run-failed", after=None))
     snapshot = await memory_store.get_snapshot("session-failed")
     current_event = await event_store.append(
         user_input_accepted_draft(
@@ -376,9 +422,7 @@ async def test_preview_and_reasoning_do_not_enter_memory_projection() -> None:
         content="最终回答",
     )
 
-    await memory_store.project_run_events(
-        await event_store.list_events("run-preview", after=None)
-    )
+    await memory_store.project_run_events(await event_store.list_events("run-preview", after=None))
     snapshot = await memory_store.get_snapshot("session-preview")
 
     rendered_turn = snapshot.recent_raw_turns[0].user_text
@@ -409,9 +453,7 @@ async def test_assistant_final_answer_is_not_verified_claim() -> None:
         content="这是助手结论，不是 verified fact。",
     )
 
-    await memory_store.project_run_events(
-        await event_store.list_events("run-final", after=None)
-    )
+    await memory_store.project_run_events(await event_store.list_events("run-final", after=None))
     snapshot = await memory_store.get_snapshot("session-final")
 
     assert snapshot.recent_raw_turns[0].assistant_final is not None
@@ -446,9 +488,7 @@ async def test_memory_items_carry_provenance_trust_and_scope() -> None:
         content="助手回答",
     )
 
-    await memory_store.project_run_events(
-        await event_store.list_events("run-meta", after=None)
-    )
+    await memory_store.project_run_events(await event_store.list_events("run-meta", after=None))
     snapshot = await memory_store.get_snapshot("session-meta")
     user_provenance = snapshot.recent_raw_turns[0].user_provenance
     tool_provenance = snapshot.tool_facts[0].provenance
@@ -456,10 +496,7 @@ async def test_memory_items_carry_provenance_trust_and_scope() -> None:
     assert user_provenance.source_run_id == "run-meta"
     assert user_provenance.scope is MemoryScope.SESSION
     assert user_provenance.producer_kind is MemoryProducerKind.HOST_USER_INPUT
-    assert (
-        user_provenance.ingestion_policy
-        is MemoryIngestionPolicy.PRIMARY_SESSION_CANONICAL
-    )
+    assert user_provenance.ingestion_policy is MemoryIngestionPolicy.PRIMARY_SESSION_CANONICAL
     assert tool_provenance.scope is MemoryScope.SESSION
     assert tool_provenance.producer_kind is MemoryProducerKind.ENGINE_TOOL_FACT
     assert tool_provenance.source_event_cursor.sequence > 0
@@ -541,9 +578,7 @@ async def test_memory_reset_patch_clears_session_snapshot() -> None:
         run_id="run-reset",
         content="重置前回答",
     )
-    await memory_store.project_run_events(
-        await event_store.list_events("run-reset", after=None)
-    )
+    await memory_store.project_run_events(await event_store.list_events("run-reset", after=None))
     await memory_store.apply_patch(
         ClaimCorrectionPatch(
             session_id="session-reset",
@@ -689,9 +724,7 @@ async def test_different_sessions_do_not_share_memory() -> None:
         run_id="run-a",
         content="A 的回答",
     )
-    await memory_store.project_run_events(
-        await event_store.list_events("run-a", after=None)
-    )
+    await memory_store.project_run_events(await event_store.list_events("run-a", after=None))
 
     snapshot_a = await memory_store.get_snapshot("session-a")
     snapshot_b = await memory_store.get_snapshot("session-b")

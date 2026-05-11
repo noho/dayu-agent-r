@@ -14,7 +14,6 @@ import dayu.engine as engine
 import dayu.host as host
 import dayu.host.contracts as host_contracts
 from dayu.contracts import (
-    FRAMEWORK_FETCH_MORE_TOOL_NAME,
     JsonValue,
     ToolTruncateSpec,
     ToolTruncationInfo,
@@ -30,10 +29,8 @@ from dayu.contracts.tool_outcome import (
     ToolFailedOutcome,
 )
 from dayu.contracts.tool_result import ToolResultSuccess
-from dayu.host import (
-    ToolResultTruncatedData,
-)
 from dayu.host._event_store import InMemoryRunEventStore
+from dayu.host._framework_tools import FRAMEWORK_FETCH_MORE_NAME
 from dayu.host._tool_runtime import HostToolRuntime
 
 
@@ -142,7 +139,7 @@ def _framework_request(
     return ToolExecutionRequest(
         call=ToolCallRequest(
             tool_call_id=tool_call_id,
-            name=FRAMEWORK_FETCH_MORE_TOOL_NAME,
+            name=FRAMEWORK_FETCH_MORE_NAME,
             arguments={
                 "cursor": cursor_value,
                 "scope_token": scope_token,
@@ -216,7 +213,7 @@ def test_host_does_not_export_internal_tool_runtime_implementations() -> None:
     """Host 包根不得直接导出内部 ToolRuntime 实现。"""
 
     exported = frozenset(host.__all__)
-    assert "ToolFetchMoreRequest" in exported
+    assert "ToolFetchMoreRequest" not in exported
     assert "ToolFetchMoreHandle" not in exported
     assert "HostToolRuntime" not in exported
     assert "ToolRuntimeToolExecutor" not in exported
@@ -259,8 +256,8 @@ def test_engine_does_not_import_host_or_tool_runtime() -> None:
 
 
 @pytest.mark.asyncio
-async def test_scope_token_delivered_only_via_outcome_truncation_not_eventlog() -> None:
-    """scope token 不进入 EventLog，但通过 outcome.truncation 暴露给模型。"""
+async def test_scope_token_delivered_via_outcome_truncation_not_special_eventlog() -> None:
+    """scope token 只经普通 outcome.truncation 暴露给模型。"""
 
     runtime, store = _runtime()
     outcome = await runtime.execute_tool_call(_request())
@@ -270,10 +267,7 @@ async def test_scope_token_delivered_only_via_outcome_truncation_not_eventlog() 
     assert truncation.scope_token
 
     events = await store.list_events("run_1", after=None)
-    serialized_events = repr(events)
-    assert "scope_token" not in serialized_events
-    assert "cursor-boundary" not in serialized_events
-    assert isinstance(events[0].data, ToolResultTruncatedData)
+    assert events == ()
 
     fetch_outcome = await runtime.execute_tool_call(
         _framework_request(
@@ -310,12 +304,8 @@ async def test_scope_binding_rejects_cross_session_or_run() -> None:
         )
         assert isinstance(denied, ToolFailedOutcome)
         assert denied.result.error == "cursor_scope_mismatch"
-    # cursor owner Run 仍只看到 owner 端的 denial 事实
     owner_events = await store.list_events("run_1", after=None)
-    assert any(
-        event.type is host.RunEventType.TOOL_CURSOR_DENIED
-        for event in owner_events
-    )
+    assert owner_events == ()
 
 
 @pytest.mark.asyncio
@@ -340,11 +330,8 @@ async def test_cross_run_fetch_more_does_not_pollute_claimed_run() -> None:
     assert denied.result.error == "cursor_scope_mismatch"
     owner_events = await store.list_events("run_1", after=None)
     claimed_events = await store.list_events("run_2", after=None)
+    assert owner_events == ()
     assert claimed_events == ()
-    assert [event.type for event in owner_events[-2:]] == [
-        host.RunEventType.TOOL_CURSOR_DENIED,
-        host.RunEventType.TOOL_FETCH_MORE_FAILED,
-    ]
 
 
 def test_engine_tool_projection_includes_llm_fetch_more_hint() -> None:

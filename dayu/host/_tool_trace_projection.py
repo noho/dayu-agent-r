@@ -7,8 +7,8 @@
 派发规则：
 
 - ``TOOL_CALL_REQUESTED`` + ``TOOL_RESULT_ACCEPTED``（同 batch 内按
-  ``(iteration_id, tool_call_id)`` 配对） + 同组内的 truncation /
-  fetch_more / cursor 维度副事件 -> 一条 :class:`ToolCallRecord`。
+  ``(iteration_id, tool_call_id)`` 配对）-> 一条
+  :class:`ToolCallRecord`。截断信息只来自普通 accepted outcome payload。
 - ``RUNNER_USAGE_RECORDED`` -> :class:`IterationUsageRecord`。
 - ``FINAL_ANSWER`` -> :class:`FinalResponseRecord`（``iteration_id`` 为
   空字符串，因为 ``FinalAnswerData`` 不携带 iteration 维度）。
@@ -46,6 +46,10 @@ from dayu.host._event_observer import (
     ObserverSink,
     ProjectionEventEnvelope,
 )
+from dayu.host._credential_scrub import (
+    scrub_tool_arguments,
+    scrub_tool_execution_outcome,
+)
 from dayu.host._host_storage_transaction import HostStorageTransaction
 from dayu.host._tool_trace_jsonl_sink import (
     FinalResponseRecord,
@@ -65,10 +69,6 @@ from dayu.host.contracts import (
     RunEventSource,
     RunEventType,
     RunInputContextSnapshotBuiltData,
-    ToolCursorDeniedData,
-    ToolCursorExpiredData,
-    ToolFetchMoreCompletedData,
-    ToolResultTruncatedData,
 )
 
 _OBSERVER_ID: str = "tool_trace"
@@ -96,19 +96,10 @@ class _ToolCallGroup:
 
     :param requested: ``TOOL_CALL_REQUESTED`` envelope；缺失为 ``None``。
     :param accepted: ``TOOL_RESULT_ACCEPTED`` envelope；缺失为 ``None``。
-    :param truncated: ``TOOL_RESULT_TRUNCATED`` envelope；缺失为 ``None``。
-    :param fetch_more_completed: ``TOOL_FETCH_MORE_COMPLETED`` envelope；
-        缺失为 ``None``。
-    :param cursor_denied: ``TOOL_CURSOR_DENIED`` envelope；缺失为 ``None``。
-    :param cursor_expired: ``TOOL_CURSOR_EXPIRED`` envelope；缺失为 ``None``。
     """
 
     requested: ProjectionEventEnvelope | None = None
     accepted: ProjectionEventEnvelope | None = None
-    truncated: ProjectionEventEnvelope | None = None
-    fetch_more_completed: ProjectionEventEnvelope | None = None
-    cursor_denied: ProjectionEventEnvelope | None = None
-    cursor_expired: ProjectionEventEnvelope | None = None
 
 
 @dataclass(slots=True)
@@ -119,9 +110,7 @@ class ToolTraceObserver(ObserverSink):
     """
 
     jsonl_sink: ToolTraceJsonlSink
-    _schema_version_str: str = field(
-        default=ToolTraceSchemaVersion.TOOL_TRACE_V2_HOST.value, init=False
-    )
+    _schema_version_str: str = field(default=ToolTraceSchemaVersion.TOOL_TRACE_V2_HOST.value, init=False)
 
     @property
     def descriptor(self) -> ObserverDescriptor:
@@ -169,18 +158,6 @@ class ToolTraceObserver(ObserverSink):
             if event_type is RunEventType.TOOL_RESULT_ACCEPTED:
                 self._collect_tool_call(envelope=envelope, groups=groups)
                 continue
-            if event_type is RunEventType.TOOL_RESULT_TRUNCATED:
-                self._collect_tool_call(envelope=envelope, groups=groups)
-                continue
-            if event_type is RunEventType.TOOL_FETCH_MORE_COMPLETED:
-                self._collect_tool_call(envelope=envelope, groups=groups)
-                continue
-            if event_type is RunEventType.TOOL_CURSOR_DENIED:
-                self._collect_tool_call(envelope=envelope, groups=groups)
-                continue
-            if event_type is RunEventType.TOOL_CURSOR_EXPIRED:
-                self._collect_tool_call(envelope=envelope, groups=groups)
-                continue
             if event_type is RunEventType.RUNNER_USAGE_RECORDED:
                 self._emit_iteration_usage(envelope=envelope)
                 continue
@@ -221,14 +198,6 @@ class ToolTraceObserver(ObserverSink):
             group.requested = envelope
         elif event_type is RunEventType.TOOL_RESULT_ACCEPTED:
             group.accepted = envelope
-        elif event_type is RunEventType.TOOL_RESULT_TRUNCATED:
-            group.truncated = envelope
-        elif event_type is RunEventType.TOOL_FETCH_MORE_COMPLETED:
-            group.fetch_more_completed = envelope
-        elif event_type is RunEventType.TOOL_CURSOR_DENIED:
-            group.cursor_denied = envelope
-        elif event_type is RunEventType.TOOL_CURSOR_EXPIRED:
-            group.cursor_expired = envelope
 
     def _emit_tool_call(
         self,
@@ -246,41 +215,26 @@ class ToolTraceObserver(ObserverSink):
         """
 
         if group.requested is None or group.accepted is None:
-            raise ProjectionSchemaError(
-                f"tool_call group missing requested/accepted pair: key={key}"
-            )
+            raise ProjectionSchemaError(f"tool_call group missing requested/accepted pair: key={key}")
         requested_event = group.requested.event
         requested_data = requested_event.data
         if not isinstance(requested_data, ToolCallRequestedData):
-            raise ProjectionSchemaError(
-                "TOOL_CALL_REQUESTED data type mismatch"
-            )
+            raise ProjectionSchemaError("TOOL_CALL_REQUESTED data type mismatch")
         accepted_data = group.accepted.event.data
         if not isinstance(accepted_data, ToolResultAcceptedData):
-            raise ProjectionSchemaError(
-                "TOOL_RESULT_ACCEPTED data type mismatch"
-            )
-        outcome_kind, result_value_json, failure_error, failure_message = (
-            _summarize_outcome(outcome=accepted_data.outcome)
-        )
+            raise ProjectionSchemaError("TOOL_RESULT_ACCEPTED data type mismatch")
+        # trace projection 可被测试、repair 或 backfill 直接喂入未清洗数据；
+        # 这里复用 EventLog 同一个幂等 helper 做防御性清洗，避免分叉规则。
+        scrubbed_outcome = scrub_tool_execution_outcome(accepted_data.outcome)
+        if not isinstance(scrubbed_outcome, (ToolCompletedOutcome, ToolFailedOutcome)):
+            raise ProjectionSchemaError("TOOL_RESULT_ACCEPTED outcome type mismatch")
+        outcome_kind, result_value_json, failure_error, failure_message = _summarize_outcome(outcome=scrubbed_outcome)
         (
             truncation_scope_token,
             truncation_cursor,
             truncation_has_more,
             truncation_limit,
-        ) = _summarize_truncation(envelope=group.truncated)
-        (
-            fetch_more_consumed_cursor,
-            fetch_more_next_cursor,
-            fetch_more_chunk_size,
-            fetch_more_has_more,
-        ) = _summarize_fetch_more(envelope=group.fetch_more_completed)
-        cursor_denial_reason = _summarize_cursor_denied(
-            envelope=group.cursor_denied
-        )
-        cursor_expired_at = _summarize_cursor_expired(
-            envelope=group.cursor_expired
-        )
+        ) = _summarize_truncation(outcome=scrubbed_outcome)
         iteration_id, tool_call_id = key
         source_event_position = group.requested.position.value
         idempotency_key = compute_idempotency_key(
@@ -305,7 +259,7 @@ class ToolTraceObserver(ObserverSink):
             tool_name=requested_data.name,
             index_in_iteration=requested_data.index_in_iteration,
             arguments_json=json.dumps(
-                dict(requested_data.arguments),
+                dict(scrub_tool_arguments(requested_data.arguments)),
                 ensure_ascii=False,
                 sort_keys=True,
             ),
@@ -317,21 +271,19 @@ class ToolTraceObserver(ObserverSink):
             truncation_cursor=truncation_cursor,
             truncation_has_more=truncation_has_more,
             truncation_limit=truncation_limit,
-            fetch_more_consumed_cursor=fetch_more_consumed_cursor,
-            fetch_more_next_cursor=fetch_more_next_cursor,
-            fetch_more_chunk_size=fetch_more_chunk_size,
-            fetch_more_has_more=fetch_more_has_more,
-            cursor_denial_reason=cursor_denial_reason,
-            cursor_expired_at_monotonic=cursor_expired_at,
+            fetch_more_consumed_cursor=None,
+            fetch_more_next_cursor=None,
+            fetch_more_chunk_size=None,
+            fetch_more_has_more=None,
+            cursor_denial_reason=None,
+            cursor_expired_at_monotonic=None,
         )
         self.jsonl_sink.append_record_line(
             session_id=requested_event.session_id,
             record=record.to_json_record(),
         )
 
-    def _emit_iteration_usage(
-        self, *, envelope: ProjectionEventEnvelope
-    ) -> None:
+    def _emit_iteration_usage(self, *, envelope: ProjectionEventEnvelope) -> None:
         """发射 iteration_usage record。
 
         :param envelope: ``RUNNER_USAGE_RECORDED`` envelope。
@@ -343,9 +295,7 @@ class ToolTraceObserver(ObserverSink):
         event = envelope.event
         data = event.data
         if not isinstance(data, RunnerUsageData):
-            raise ProjectionSchemaError(
-                "RUNNER_USAGE_RECORDED data type mismatch"
-            )
+            raise ProjectionSchemaError("RUNNER_USAGE_RECORDED data type mismatch")
         idempotency_key = compute_idempotency_key(
             schema_version=self._schema_version_str,
             trace_type=ToolTraceRecordType.ITERATION_USAGE.value,
@@ -373,9 +323,7 @@ class ToolTraceObserver(ObserverSink):
             record=record.to_json_record(),
         )
 
-    def _emit_final_response(
-        self, *, envelope: ProjectionEventEnvelope
-    ) -> None:
+    def _emit_final_response(self, *, envelope: ProjectionEventEnvelope) -> None:
         """发射 final_response record。
 
         :param envelope: ``FINAL_ANSWER`` envelope。
@@ -416,9 +364,7 @@ class ToolTraceObserver(ObserverSink):
             record=record.to_json_record(),
         )
 
-    def _emit_provider_protocol_error(
-        self, *, envelope: ProjectionEventEnvelope
-    ) -> None:
+    def _emit_provider_protocol_error(self, *, envelope: ProjectionEventEnvelope) -> None:
         """发射 provider_protocol_error record。
 
         :param envelope: ``PROVIDER_PROTOCOL_ERROR`` envelope。
@@ -430,16 +376,12 @@ class ToolTraceObserver(ObserverSink):
         event = envelope.event
         data = event.data
         if not isinstance(data, ProviderProtocolErrorData):
-            raise ProjectionSchemaError(
-                "PROVIDER_PROTOCOL_ERROR data type mismatch"
-            )
+            raise ProjectionSchemaError("PROVIDER_PROTOCOL_ERROR data type mismatch")
         if data.raw_payload is None:
             raw_payload_json = _OMITTED_PAYLOAD_JSON
         else:
             scrubbed: JsonValue = _scrub_provider_secret(data.raw_payload)
-            raw_payload_json = json.dumps(
-                scrubbed, ensure_ascii=False, sort_keys=True
-            )
+            raw_payload_json = json.dumps(scrubbed, ensure_ascii=False, sort_keys=True)
         idempotency_key = compute_idempotency_key(
             schema_version=self._schema_version_str,
             trace_type=ToolTraceRecordType.PROVIDER_PROTOCOL_ERROR.value,
@@ -468,9 +410,7 @@ class ToolTraceObserver(ObserverSink):
             record=record.to_json_record(),
         )
 
-    def _emit_iteration_context_snapshot(
-        self, *, envelope: ProjectionEventEnvelope
-    ) -> None:
+    def _emit_iteration_context_snapshot(self, *, envelope: ProjectionEventEnvelope) -> None:
         """发射 iteration_context_snapshot record，并落 raw payload 文件。
 
         实现：先 ``write_raw_payload_blob`` 写两份 raw payload（input /
@@ -487,16 +427,9 @@ class ToolTraceObserver(ObserverSink):
         event = envelope.event
         data = event.data
         if not isinstance(data, RunInputContextSnapshotBuiltData):
-            raise ProjectionSchemaError(
-                "RUN_INPUT_CONTEXT_SNAPSHOT_BUILT data type mismatch"
-            )
-        if (
-            event.kind is not RunEventKind.CANONICAL
-            or event.source is not RunEventSource.HOST
-        ):
-            raise ProjectionSchemaError(
-                "RUN_INPUT_CONTEXT_SNAPSHOT_BUILT must be canonical host fact"
-            )
+            raise ProjectionSchemaError("RUN_INPUT_CONTEXT_SNAPSHOT_BUILT data type mismatch")
+        if event.kind is not RunEventKind.CANONICAL or event.source is not RunEventSource.HOST:
+            raise ProjectionSchemaError("RUN_INPUT_CONTEXT_SNAPSHOT_BUILT must be canonical host fact")
         self.jsonl_sink.write_raw_payload_blob(
             run_id=event.run_id,
             iteration_id=data.iteration_id,
@@ -509,13 +442,9 @@ class ToolTraceObserver(ObserverSink):
             blob_id=data.raw_tool_schemas_blob_id,
             payload_text=data.raw_tool_schemas_json,
         )
-        raw_input_relpath = (
-            f"{_RAW_PAYLOADS_DIR}/{event.run_id}_{data.iteration_id}/"
-            f"{data.raw_input_blob_id}.json"
-        )
+        raw_input_relpath = f"{_RAW_PAYLOADS_DIR}/{event.run_id}_{data.iteration_id}/" f"{data.raw_input_blob_id}.json"
         raw_tools_relpath = (
-            f"{_RAW_PAYLOADS_DIR}/{event.run_id}_{data.iteration_id}/"
-            f"{data.raw_tool_schemas_blob_id}.json"
+            f"{_RAW_PAYLOADS_DIR}/{event.run_id}_{data.iteration_id}/" f"{data.raw_tool_schemas_blob_id}.json"
         )
         message_summaries_payload: list[JsonValue] = [
             {
@@ -590,9 +519,7 @@ class ToolTraceObserver(ObserverSink):
         )
 
 
-def _tool_call_group_key(
-    *, envelope: ProjectionEventEnvelope
-) -> tuple[str, str]:
+def _tool_call_group_key(*, envelope: ProjectionEventEnvelope) -> tuple[str, str]:
     """从 envelope 提取 ``(iteration_id, tool_call_id)`` 用作 group key。
 
     :param envelope: 工具维度事件 envelope。
@@ -606,18 +533,7 @@ def _tool_call_group_key(
         return (data.iteration_id, data.tool_call_id)
     if isinstance(data, ToolResultAcceptedData):
         return (data.iteration_id, data.tool_call_id)
-    if isinstance(data, ToolResultTruncatedData):
-        return (data.iteration_id, data.tool_call_id)
-    if isinstance(data, ToolFetchMoreCompletedData):
-        return (data.iteration_id, data.tool_call_id)
-    if isinstance(data, ToolCursorDeniedData):
-        return (data.iteration_id, data.tool_call_id)
-    if isinstance(data, ToolCursorExpiredData):
-        return (data.iteration_id, data.tool_call_id)
-    raise ProjectionSchemaError(
-        f"unexpected tool-dimension event data type: "
-        f"{type(data).__name__}"
-    )
+    raise ProjectionSchemaError(f"unexpected tool-dimension event data type: " f"{type(data).__name__}")
 
 
 def _summarize_outcome(
@@ -631,9 +547,7 @@ def _summarize_outcome(
     """
 
     if isinstance(outcome, ToolCompletedOutcome):
-        result_value_json = json.dumps(
-            outcome.result.value, ensure_ascii=False, sort_keys=True
-        )
+        result_value_json = json.dumps(outcome.result.value, ensure_ascii=False, sort_keys=True)
         return (_OUTCOME_COMPLETED, result_value_json, None, None)
     return (
         _OUTCOME_FAILED,
@@ -644,87 +558,27 @@ def _summarize_outcome(
 
 
 def _summarize_truncation(
-    *, envelope: ProjectionEventEnvelope | None
+    *, outcome: ToolCompletedOutcome | ToolFailedOutcome
 ) -> tuple[str | None, str | None, bool | None, int | None]:
     """提取 truncation 维度字段。
 
-    :param envelope: ``TOOL_RESULT_TRUNCATED`` envelope；可为 ``None``。
+    :param outcome: accepted tool outcome。
     :returns: ``(scope_token, cursor, has_more, limit)``；无 truncation 时
         全部为 ``None``。
     :raises Exception: 不主动抛出异常。
     """
 
-    if envelope is None:
+    if not isinstance(outcome, ToolCompletedOutcome):
         return (None, None, None, None)
-    data = envelope.event.data
-    if not isinstance(data, ToolResultTruncatedData):
-        return (None, None, None, None)
-    return (
-        data.strategy,
-        data.cursor_fingerprint,
-        data.has_more,
-        data.limit,
-    )
-
-
-def _summarize_fetch_more(
-    *, envelope: ProjectionEventEnvelope | None
-) -> tuple[str | None, str | None, int | None, bool | None]:
-    """提取 fetch_more 维度字段。
-
-    :param envelope: ``TOOL_FETCH_MORE_COMPLETED`` envelope；可为 ``None``。
-    :returns: ``(consumed_cursor, next_cursor, chunk_size, has_more)``；
-        无 fetch_more 时全部为 ``None``。
-    :raises Exception: 不主动抛出异常。
-    """
-
-    if envelope is None:
-        return (None, None, None, None)
-    data = envelope.event.data
-    if not isinstance(data, ToolFetchMoreCompletedData):
+    truncation = outcome.result.truncation
+    if truncation is None:
         return (None, None, None, None)
     return (
-        data.consumed_cursor_fingerprint,
-        data.next_cursor_fingerprint,
-        data.chunk_size,
-        data.has_more,
+        truncation.scope_token,
+        truncation.cursor,
+        truncation.has_more,
+        truncation.limit,
     )
-
-
-def _summarize_cursor_denied(
-    *, envelope: ProjectionEventEnvelope | None
-) -> str | None:
-    """提取 cursor 拒绝原因。
-
-    :param envelope: ``TOOL_CURSOR_DENIED`` envelope；可为 ``None``。
-    :returns: 拒绝原因；无拒绝为 ``None``。
-    :raises Exception: 不主动抛出异常。
-    """
-
-    if envelope is None:
-        return None
-    data = envelope.event.data
-    if not isinstance(data, ToolCursorDeniedData):
-        return None
-    return data.reason
-
-
-def _summarize_cursor_expired(
-    *, envelope: ProjectionEventEnvelope | None
-) -> float | None:
-    """提取 cursor 过期 monotonic 时间。
-
-    :param envelope: ``TOOL_CURSOR_EXPIRED`` envelope；可为 ``None``。
-    :returns: 过期单进程时间；无过期为 ``None``。
-    :raises Exception: 不主动抛出异常。
-    """
-
-    if envelope is None:
-        return None
-    data = envelope.event.data
-    if not isinstance(data, ToolCursorExpiredData):
-        return None
-    return data.expired_at_monotonic
 
 
 __all__ = ["ProjectionSchemaError", "ToolTraceObserver"]

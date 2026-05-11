@@ -3,7 +3,6 @@
 from __future__ import annotations
 
 from dayu.contracts import (
-    FRAMEWORK_FETCH_MORE_TOOL_NAME,
     FunctionToolExecutor,
     ToolBundle,
     ToolCompletedOutcome,
@@ -15,7 +14,6 @@ from dayu.contracts import (
     ToolResultSuccess,
     ToolSchema,
     ToolTruncateSpec,
-    framework_fetch_more_tool_schema,
     tool,
 )
 from dayu.contracts.tool_outcome import ToolExecutionOutcome
@@ -107,23 +105,6 @@ def test_tool_declaration_keeps_schema_runtime_and_display_metadata_separate() -
     assert not hasattr(projected, "display_name")
     assert not hasattr(projected, "tags")
     assert "fetch_more" not in projected.function.parameters.properties
-
-
-def test_framework_fetch_more_schema_is_llm_facing_only() -> None:
-    """framework ``fetch_more`` schema 不携带 runtime metadata。"""
-
-    schema = framework_fetch_more_tool_schema()
-
-    assert schema.function.name == FRAMEWORK_FETCH_MORE_TOOL_NAME
-    assert schema.function.parameters.required == ("cursor", "scope_token")
-    assert set(schema.function.parameters.properties) == {
-        "cursor",
-        "scope_token",
-        "limit",
-    }
-    assert not hasattr(schema, "truncate")
-    assert not hasattr(schema, "display")
-    assert not hasattr(schema, "tags")
 
 
 def test_tool_definition_rejects_name_schema_mismatch() -> None:

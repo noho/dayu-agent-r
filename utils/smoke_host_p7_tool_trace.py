@@ -12,10 +12,10 @@
   验证 raw_payload 中的 provider secret 被 scrub 为 ``"***"``。
 - ``FINAL_ANSWER`` -> ``final_response`` record。
 
-注意：``TOOL_RESULT_TRUNCATED`` 与 ``TOOL_FETCH_MORE_*`` 是 Host
-ToolRuntime 在内部追加的 canonical fact，不能由 stub proxy 直接注入
-EngineEvent，因此本 smoke 不覆盖 truncation / fetch_more 路径；这条路
-径要等真实 ToolRuntime smoke 或专属 truncation smoke。
+注意：P8.5-S1 后 truncation / fetch_more 不再使用专用 canonical fact；
+stub proxy 只能注入 EngineEvent，因此本 smoke 不覆盖真实 ToolRuntime 的
+ordinary truncation payload 与 framework ``fetch_more`` 普通工具调用路径；
+这条路径由 ToolRuntime smoke 或专属 truncation smoke 覆盖。
 
 trace 根目录使用 ``tempfile.mkdtemp(prefix="dayu_p7_smoke_")`` 创建，
 **脚本结束后不删除**，便于人工 inspect。脚本末尾会自动调用

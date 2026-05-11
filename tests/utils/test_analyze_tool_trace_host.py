@@ -182,9 +182,7 @@ def test_analyzer_dedupes_orphan_lines_by_idempotency_key(
 ) -> None:
     """同 idempotency_key 多行只保留首条。"""
 
-    record = _tool_call_record(
-        idempotency_key="dup-key", source_event_position=1
-    )
+    record = _tool_call_record(idempotency_key="dup-key", source_event_position=1)
     _write_jsonl(
         trace_root=tmp_path,
         session_id=_SESSION_ID,
@@ -233,9 +231,7 @@ def test_analyzer_detects_repeated_tool_calls(tmp_path: Path) -> None:
         records=records,
     )
     report = analyze_trace_root(trace_root=tmp_path)
-    assert report.repeated_tool_calls == (
-        RepeatedToolCall(tool_name=_TOOL_NAME, run_id=_RUN_ID, count=2),
-    )
+    assert report.repeated_tool_calls == (RepeatedToolCall(tool_name=_TOOL_NAME, run_id=_RUN_ID, count=2),)
 
 
 def test_analyzer_detects_truncation_without_fetch_more_followup(
@@ -265,10 +261,43 @@ def test_analyzer_detects_truncation_without_fetch_more_followup(
     )
 
 
+def test_analyzer_accepts_ordinary_fetch_more_followup(
+    tmp_path: Path,
+) -> None:
+    """ordinary fetch_more arguments_json 消费 cursor 后不再报警。"""
+
+    truncated = _tool_call_record(
+        idempotency_key="trunc-a",
+        source_event_position=1,
+        tool_call_id="tc-a",
+        truncation_has_more=True,
+        truncation_scope_token="scope-A",
+        truncation_cursor="cur-A",
+    )
+    fetch_more = _tool_call_record(
+        idempotency_key="fetch-a",
+        source_event_position=2,
+        tool_call_id="tc-fetch-a",
+        tool_name="fetch_more",
+        arguments_json=json.dumps(
+            {"cursor": "cur-A", "scope_token": "scope-A"},
+            ensure_ascii=False,
+        ),
+    )
+    _write_jsonl(
+        trace_root=tmp_path,
+        session_id=_SESSION_ID,
+        records=[truncated, fetch_more],
+    )
+    report = analyze_trace_root(trace_root=tmp_path)
+    assert report.truncation_without_fetch_more == ()
+    assert report.fetch_more_with_unknown_scope_token == ()
+
+
 def test_analyzer_tracks_fetch_more_by_tool_call_not_run(
     tmp_path: Path,
 ) -> None:
-    """同 run 其它 tool_call 的 fetch_more 不应掩盖当前 tool_call 的截断缺口。"""
+    """同 run 其它 cursor 的 ordinary fetch_more 不应掩盖当前截断缺口。"""
 
     truncated_without_fetch_more = _tool_call_record(
         idempotency_key="trunc-a",
@@ -281,8 +310,12 @@ def test_analyzer_tracks_fetch_more_by_tool_call_not_run(
     unrelated_fetch_more = _tool_call_record(
         idempotency_key="fetch-b",
         source_event_position=2,
-        tool_call_id="tc-b",
-        fetch_more_consumed_cursor="cur-B",
+        tool_call_id="tc-fetch-b",
+        tool_name="fetch_more",
+        arguments_json=json.dumps(
+            {"cursor": "cur-B", "scope_token": "scope-B"},
+            ensure_ascii=False,
+        ),
     )
     _write_jsonl(
         trace_root=tmp_path,
@@ -302,24 +335,110 @@ def test_analyzer_tracks_fetch_more_by_tool_call_not_run(
 def test_analyzer_detects_wrong_scope_token_in_fetch_more(
     tmp_path: Path,
 ) -> None:
-    """fetch_more_consumed_cursor 引用从未出现过的 cursor 时报警。"""
+    """ordinary fetch_more scope_token 与已签发 cursor 不一致时报警。"""
 
-    record = _tool_call_record(
-        idempotency_key="fm-1",
+    truncated = _tool_call_record(
+        idempotency_key="trunc-1",
         source_event_position=1,
-        fetch_more_consumed_cursor="unknown-cursor",
+        truncation_has_more=True,
+        truncation_scope_token="scope-good",
+        truncation_cursor="cur-good",
+    )
+    fetch_more = _tool_call_record(
+        idempotency_key="fm-1",
+        source_event_position=2,
+        tool_call_id="tc-fetch-1",
+        tool_name="fetch_more",
+        arguments_json=json.dumps(
+            {"cursor": "cur-good", "scope_token": "scope-bad"},
+            ensure_ascii=False,
+        ),
     )
     _write_jsonl(
         trace_root=tmp_path,
         session_id=_SESSION_ID,
-        records=[record],
+        records=[truncated, fetch_more],
     )
     report = analyze_trace_root(trace_root=tmp_path)
     assert report.fetch_more_with_unknown_scope_token == (
         FetchMoreScopeIssue(
             run_id=_RUN_ID,
-            tool_call_id="tc-1",
-            scope_token_or_cursor="unknown-cursor",
+            tool_call_id="tc-fetch-1",
+            scope_token_or_cursor="scope-bad",
+            reason="wrong_scope_token",
+        ),
+    )
+
+
+def test_analyzer_detects_ordinary_fetch_more_unknown_duplicate_and_failed(
+    tmp_path: Path,
+) -> None:
+    """ordinary fetch_more 覆盖 unknown cursor、重复 cursor 与 failed outcome。"""
+
+    issued = _tool_call_record(
+        idempotency_key="trunc-1",
+        source_event_position=1,
+        truncation_has_more=True,
+        truncation_scope_token="scope-A",
+        truncation_cursor="cur-A",
+    )
+    first_fetch = _tool_call_record(
+        idempotency_key="fetch-1",
+        source_event_position=2,
+        tool_call_id="tc-fetch-1",
+        tool_name="fetch_more",
+        arguments_json=json.dumps(
+            {"cursor": "cur-A", "scope_token": "scope-A"},
+            ensure_ascii=False,
+        ),
+    )
+    duplicate_fetch = _tool_call_record(
+        idempotency_key="fetch-2",
+        source_event_position=3,
+        tool_call_id="tc-fetch-2",
+        tool_name="fetch_more",
+        arguments_json=json.dumps(
+            {"cursor": "cur-A", "scope_token": "scope-A"},
+            ensure_ascii=False,
+        ),
+        outcome_kind="failed",
+        result_value_json=None,
+        failure_error="cursor_not_found",
+        failure_message="cursor not found",
+    )
+    unknown_fetch = _tool_call_record(
+        idempotency_key="fetch-3",
+        source_event_position=4,
+        tool_call_id="tc-fetch-3",
+        tool_name="fetch_more",
+        arguments_json=json.dumps(
+            {"cursor": "cur-missing", "scope_token": "scope-missing"},
+            ensure_ascii=False,
+        ),
+    )
+    _write_jsonl(
+        trace_root=tmp_path,
+        session_id=_SESSION_ID,
+        records=[issued, first_fetch, duplicate_fetch, unknown_fetch],
+    )
+    report = analyze_trace_root(trace_root=tmp_path)
+    assert report.fetch_more_with_unknown_scope_token == (
+        FetchMoreScopeIssue(
+            run_id=_RUN_ID,
+            tool_call_id="tc-fetch-2",
+            scope_token_or_cursor="cur-A",
+            reason="duplicate_consumed_cursor",
+        ),
+        FetchMoreScopeIssue(
+            run_id=_RUN_ID,
+            tool_call_id="tc-fetch-2",
+            scope_token_or_cursor="cur-A",
+            reason="fetch_more_failed:cursor_not_found",
+        ),
+        FetchMoreScopeIssue(
+            run_id=_RUN_ID,
+            tool_call_id="tc-fetch-3",
+            scope_token_or_cursor="cur-missing",
             reason="unknown_consumed_cursor",
         ),
     )
@@ -329,12 +448,8 @@ def test_analyzer_counts_provider_protocol_errors(tmp_path: Path) -> None:
     """provider_protocol_error 数量统计。"""
 
     records = [
-        _provider_protocol_error_record(
-            idempotency_key="ppe-1", source_event_position=1
-        ),
-        _provider_protocol_error_record(
-            idempotency_key="ppe-2", source_event_position=2
-        ),
+        _provider_protocol_error_record(idempotency_key="ppe-1", source_event_position=1),
+        _provider_protocol_error_record(idempotency_key="ppe-2", source_event_position=2),
     ]
     _write_jsonl(
         trace_root=tmp_path,
@@ -350,9 +465,7 @@ def test_analyzer_reports_final_response_presence(tmp_path: Path) -> None:
 
     # 缺失。
     empty_root = tmp_path / "absent"
-    record_only_tool_call = _tool_call_record(
-        idempotency_key="t-1", source_event_position=1
-    )
+    record_only_tool_call = _tool_call_record(idempotency_key="t-1", source_event_position=1)
     _write_jsonl(
         trace_root=empty_root,
         session_id=_SESSION_ID,
@@ -363,9 +476,7 @@ def test_analyzer_reports_final_response_presence(tmp_path: Path) -> None:
 
     # 存在。
     present_root = tmp_path / "present"
-    final_record = _final_response_record(
-        idempotency_key="f-1", source_event_position=2
-    )
+    final_record = _final_response_record(idempotency_key="f-1", source_event_position=2)
     _write_jsonl(
         trace_root=present_root,
         session_id=_SESSION_ID,
@@ -549,24 +660,27 @@ def test_analyzer_aggregates_failure_patterns(tmp_path: Path) -> None:
         records=records,
     )
     report = analyze_trace_root(trace_root=tmp_path)
-    assert FailurePattern(
-        tool_name="fetch_web_page",
-        error_code="EXECUTION_ERROR",
-        count=2,
-    ) in report.failure_patterns
-    assert FailurePattern(
-        tool_name="fetch_web_page",
-        error_code="permission_denied",
-        count=1,
-    ) in report.failure_patterns
+    assert (
+        FailurePattern(
+            tool_name="fetch_web_page",
+            error_code="EXECUTION_ERROR",
+            count=2,
+        )
+        in report.failure_patterns
+    )
+    assert (
+        FailurePattern(
+            tool_name="fetch_web_page",
+            error_code="permission_denied",
+            count=1,
+        )
+        in report.failure_patterns
+    )
     # 详细签名：HTTP_404 与 URL_BLOCKED 至少各一个。
     signatures = {item.error_signature for item in report.detailed_failure_patterns}
     assert "HTTP_404" in signatures
     assert "URL_BLOCKED" in signatures
-    assert all(
-        isinstance(item, DetailedFailurePattern)
-        for item in report.detailed_failure_patterns
-    )
+    assert all(isinstance(item, DetailedFailurePattern) for item in report.detailed_failure_patterns)
 
 
 def test_analyzer_detects_context_pressure_runs(tmp_path: Path) -> None:

@@ -12,7 +12,6 @@ import dayu.contracts as contracts
 EXPECTED_EXPORTS: frozenset[str] = frozenset(
     {
         "CancellationToken",
-        "FRAMEWORK_FETCH_MORE_TOOL_NAME",
         "GeminiToolCallState",
         "JsonValue",
         "ToolAwaitKind",
@@ -42,7 +41,6 @@ EXPECTED_EXPORTS: frozenset[str] = frozenset(
         "ToolTruncationInfo",
         "ToolTruncationStrategy",
         "FunctionToolExecutor",
-        "framework_fetch_more_tool_schema",
         "tool",
     }
 )

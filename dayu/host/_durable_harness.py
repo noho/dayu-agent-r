@@ -264,7 +264,12 @@ def build_durable_harness(
     )
     actual_proxy: WorkerProxy = (
         proxy if proxy is not None
-        else LocalProxy(worker=EngineWorker(ToolRuntimeToolExecutor(runtime)))
+        else LocalProxy(
+            worker=EngineWorker(
+                tool_executor=ToolRuntimeToolExecutor(runtime),
+                schema_provider=runtime,
+            )
+        )
     )
     tool_trace_enabled = tool_trace_observer is not None
     harness = LocalRunHarness(
@@ -280,6 +285,7 @@ def build_durable_harness(
         run_input_context_fact_builder=(
             RunInputContextFactBuilder() if tool_trace_enabled else None
         ),
+        engine_tool_schema_provider=runtime,
     )
 
     return DurableHarnessBundle(

@@ -27,23 +27,10 @@ from pathlib import Path
 from typing import TypeAlias
 
 from dayu.contracts import JsonValue
-
+from dayu.host._credential_scrub import scrub_explicit_credentials
 
 _TRACE_SCHEMA_VERSION_HOST: str = "tool_trace_v2_host"
 _FILE_BYTE_THRESHOLD: int = 10 * 1024 * 1024
-_PROVIDER_SECRET_KEYS: frozenset[str] = frozenset(
-    {
-        "authorization",
-        "api_key",
-        "api-key",
-        "x-api-key",
-        "cookie",
-        "set-cookie",
-        "openai-organization",
-        "x-goog-api-key",
-        "anthropic-api-key",
-    }
-)
 
 
 class ToolTraceSchemaVersion(StrEnum):
@@ -101,27 +88,14 @@ def compute_idempotency_key(
 
 
 def _scrub_provider_secret(payload: JsonValue) -> JsonValue:
-    """递归剔除 provider raw payload 中的 secret 字段。
+    """递归剔除 provider raw payload 中的显式凭证。
 
     :param payload: 任意 JSON value。
     :returns: scrub 后的 JSON value（保持原结构，只替换敏感值为 ``"***"``）。
     :raises Exception: 不主动抛出异常。
     """
 
-    if isinstance(payload, dict):
-        scrubbed: dict[str, JsonValue] = {}
-        for key, value in payload.items():
-            if not isinstance(key, str):
-                scrubbed[str(key)] = _scrub_provider_secret(value)
-                continue
-            if key.lower() in _PROVIDER_SECRET_KEYS:
-                scrubbed[key] = "***"
-            else:
-                scrubbed[key] = _scrub_provider_secret(value)
-        return scrubbed
-    if isinstance(payload, list):
-        return [_scrub_provider_secret(item) for item in payload]
-    return payload
+    return scrub_explicit_credentials(payload)
 
 
 JsonRecord: TypeAlias = Mapping[str, JsonValue]
@@ -195,9 +169,7 @@ class ToolTraceJsonlSink:
         :raises OSError: 写入失败时抛出。
         """
 
-        target_dir = (
-            self.root_path / "raw_payloads" / f"{run_id}_{iteration_id}"
-        )
+        target_dir = self.root_path / "raw_payloads" / f"{run_id}_{iteration_id}"
         target_dir.mkdir(parents=True, exist_ok=True)
         final_path = target_dir / f"{blob_id}.json"
         tmp_path = target_dir / f"{blob_id}.json.tmp"
@@ -414,12 +386,8 @@ class IterationContextSnapshotRecord:
             "message_summaries_json": self.message_summaries_json,
             "tool_schema_summaries_json": self.tool_schema_summaries_json,
             "context_meta_json": self.context_meta_json,
-            "raw_input_blob_relative_path": (
-                self.raw_input_blob_relative_path
-            ),
-            "raw_tool_schemas_blob_relative_path": (
-                self.raw_tool_schemas_blob_relative_path
-            ),
+            "raw_input_blob_relative_path": (self.raw_input_blob_relative_path),
+            "raw_tool_schemas_blob_relative_path": (self.raw_tool_schemas_blob_relative_path),
         }
 
 

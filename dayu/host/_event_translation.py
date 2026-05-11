@@ -5,9 +5,6 @@ from __future__ import annotations
 from dataclasses import replace
 from datetime import datetime
 
-from dayu.contracts import FRAMEWORK_FETCH_MORE_TOOL_NAME
-from dayu.contracts.tool_outcome import ToolCompletedOutcome
-from dayu.contracts.tool_result import ToolResultSuccess
 from dayu.engine import (
     EngineEvent,
     FinalAnswerData,
@@ -16,6 +13,10 @@ from dayu.engine import (
     RunSuspendedData,
     ToolCallRequestedData,
     ToolResultAcceptedData,
+)
+from dayu.host._credential_scrub import (
+    scrub_tool_arguments,
+    scrub_tool_execution_outcome,
 )
 from dayu.host.contracts import (
     ContextCompactFailureReason,
@@ -39,25 +40,14 @@ from dayu.host.contracts import (
     UserInputAcceptedData,
 )
 
-_ERROR_FINAL_ANSWER_DATA_TYPE: str = (
-    "FINAL_ANSWER event data must be FinalAnswerData"
-)
+_ERROR_FINAL_ANSWER_DATA_TYPE: str = "FINAL_ANSWER event data must be FinalAnswerData"
 _ERROR_RUN_FAILED_DATA_TYPE: str = "RUN_FAILED event data must be RunFailedData"
-_ERROR_HOST_RUN_FAILED_DATA_TYPE: str = (
-    "RUN_FAILED host event data must be HostRunFailedData"
-)
-_ERROR_RUN_CANCELLED_DATA_TYPE: str = (
-    "RUN_CANCELLED event data must be RunCancelledData"
-)
-_ERROR_RUN_SUSPENDED_DATA_TYPE: str = (
-    "RUN_SUSPENDED event data must be RunSuspendedData"
-)
+_ERROR_HOST_RUN_FAILED_DATA_TYPE: str = "RUN_FAILED host event data must be HostRunFailedData"
+_ERROR_RUN_CANCELLED_DATA_TYPE: str = "RUN_CANCELLED event data must be RunCancelledData"
+_ERROR_RUN_SUSPENDED_DATA_TYPE: str = "RUN_SUSPENDED event data must be RunSuspendedData"
 _HOST_WORKER_FAILURE_ERROR_CODE: str = "host_worker_failed"
 _HOST_CONTEXT_COMPACT_FAILED_ERROR_CODE: str = "host_context_compact_failed"
-_FILTERED_INTERNAL_ECHO_CONTENT: str = (
-    "回答包含内部治理上下文，Host 已过滤该结果。请重试或缩小问题范围。"
-)
-_FRAMEWORK_FETCH_MORE_LIMIT_ARG: str = "limit"
+_FILTERED_INTERNAL_ECHO_CONTENT: str = "回答包含内部治理上下文，Host 已过滤该结果。请重试或缩小问题范围。"
 _INTERNAL_ECHO_MARKERS: tuple[str, ...] = (
     "## host memory",
     "## host compact memory",
@@ -74,7 +64,6 @@ _INTERNAL_ECHO_MARKERS: tuple[str, ...] = (
     "toolcompletedoutcome(",
     "toolresultsuccess(",
     "toolresultfailure(",
-    "toolresulttruncateddata(",
     "runevent(",
 )
 _PREVIEW_ENGINE_EVENT_TYPES: frozenset[RunEventType] = frozenset(
@@ -98,10 +87,16 @@ def translate_engine_event(event: EngineEvent) -> RunEventDraft:
     data = event.data
     if isinstance(data, FinalAnswerData):
         data = _filter_internal_echo_final_answer(data)
-    if isinstance(data, ToolCallRequestedData):
-        data = _redact_framework_fetch_more_arguments(data)
-    if isinstance(data, ToolResultAcceptedData):
-        data = _redact_tool_result_truncation(data)
+    elif isinstance(data, ToolCallRequestedData):
+        data = replace(
+            data,
+            arguments=scrub_tool_arguments(data.arguments),
+        )
+    elif isinstance(data, ToolResultAcceptedData):
+        data = replace(
+            data,
+            outcome=scrub_tool_execution_outcome(data.outcome),
+        )
     return RunEventDraft(
         run_id=event.run_id,
         session_id=event.session_id,
@@ -111,61 +106,6 @@ def translate_engine_event(event: EngineEvent) -> RunEventDraft:
         occurred_at=event.occurred_at,
         data=data,
         source_engine_event_id=event.event_id,
-    )
-
-
-def _redact_framework_fetch_more_arguments(
-    data: ToolCallRequestedData,
-) -> ToolCallRequestedData:
-    """移除 framework ``fetch_more`` 参数中的敏感 cursor / token。
-
-    Engine 仍把模型发出的普通 JSON 交给 ToolExecutor；Host 在写入
-    RunEvent 前只保留非敏感 ``limit`` 观察值，避免 cursor 原文与
-    ``scope_token`` 进入 EventLog、memory 或 smoke 输出。
-
-    :param data: Engine 工具调用请求 data。
-    :returns: 可写入 RunEvent 的 data。
-    :raises Exception: 不主动抛出异常。
-    """
-
-    if data.name != FRAMEWORK_FETCH_MORE_TOOL_NAME:
-        return data
-    limit = data.arguments.get(_FRAMEWORK_FETCH_MORE_LIMIT_ARG)
-    if isinstance(limit, int) and not isinstance(limit, bool):
-        return replace(
-            data,
-            arguments={_FRAMEWORK_FETCH_MORE_LIMIT_ARG: limit},
-        )
-    return replace(data, arguments={})
-
-
-def _redact_tool_result_truncation(
-    data: ToolResultAcceptedData,
-) -> ToolResultAcceptedData:
-    """移除 Engine accepted outcome 中仅供 LLM roundtrip 使用的截断凭证。
-
-    Host ToolRuntime 已通过独立 canonical facts 记录截断、cursor 指纹与
-    fetch_more 完成情况；accepted outcome 不应再携带 cursor 原文或
-    ``scope_token``。
-
-    :param data: Engine 工具结果接受 data。
-    :returns: 可写入 RunEvent 的 data。
-    :raises Exception: 不主动抛出异常。
-    """
-
-    outcome = data.outcome
-    if not isinstance(outcome, ToolCompletedOutcome):
-        return data
-    result = outcome.result
-    if not isinstance(result, ToolResultSuccess):
-        return data
-    if result.truncation is None:
-        return data
-    return replace(
-        data,
-        outcome=ToolCompletedOutcome(
-            result=replace(result, truncation=None),
-        ),
     )
 
 

@@ -8,12 +8,14 @@ Phase 流程、review 过程或 PR 流程。
 `dayu.host` 当前落地最小 Run harness（含内存态与 P6 durable 两条路径）、Host-owned ToolRuntime
 截断 / 补读、Host 内部 Conversation Memory / RunInputBuilder、context overflow compact retry、
 公共 tool declaration 契约，以及 P8 attempt lease / fencing / recovery / terminal atomic close /
-attempt-scoped append / durable memory：
+attempt-scoped append / durable memory；P8.5-S1 起 ToolRuntime 的截断补读状态机迁移为 Host 私有
+`RuntimeTruncateManager`，EventLog 只记录普通工具请求 / 结果事实：
 
-- 包根只暴露 Run 级契约与 fetch_more 协议契约 (`ToolFetchMoreRequest` 等)；
-  Run 生命周期与 fetch_more 操作必须经由 `LocalRunHarness` / `build_durable_harness()` 装配后的
-  实例方法（`harness.start_run` / `harness.stream_run_events` / `harness.get_run_result`）调用，
-  framework `fetch_more` 工具调用经 `ToolRuntimeToolExecutor -> HostToolRuntime.execute_tool_call`。
+- 包根只暴露 Run 级契约、RunInput context fact 与通用 tool value summary；framework `fetch_more`
+  是 Host 私有工具，不作为 public contract / helper 暴露。Run 生命周期必须经由
+  `LocalRunHarness` / `build_durable_harness()` 装配后的实例方法（`harness.start_run` /
+  `harness.stream_run_events` / `harness.get_run_result`）调用，framework `fetch_more` 工具调用经
+  `ToolRuntimeToolExecutor -> HostToolRuntime.execute_tool_call` 的普通 tool call 路径进入 Host。
 - `harness.start_run` 是 async 入口，返回 `RunStream`，包含 `RunHandle` 与 `RunEvent` 异步流；被 await 时会立即启动
   内存后台任务。
 - Host 内部通过 `LocalProxy -> EngineWorker -> dayu.engine.run_agent_messages` 调用 Engine 函数式入口。
@@ -43,21 +45,20 @@ attempt-scoped append / durable memory：
 - ToolRuntime 只按工具显式 `ToolTruncateSpec` 截断；无 spec、未启用、未知策略或非法 limit 不截断。
 - `binary_bytes` 截断与补读在 Host public `JsonValue` 结果中返回 base64 ASCII 字符串；`unit="bytes"` 与
   `value_summary` 表示原始字节大小，不使用 OLD LLM projection 的 `content_base64` 包装结构。
-- 截断与补读事实写入 canonical RunEvent：`tool_result_truncated`、`tool_cursor_issued`、
-  `tool_fetch_more_requested`、`tool_fetch_more_completed`、`tool_fetch_more_failed`、
-  `tool_cursor_expired`、`tool_cursor_denied`。
+- 截断与补读不再写入专用 RunEvent。业务工具调用只写普通 `TOOL_CALL_REQUESTED` /
+  `TOOL_RESULT_ACCEPTED`；framework `fetch_more` 也只是普通工具名，成功 / 失败都通过普通
+  `ToolCompletedOutcome` / `ToolFailedOutcome` 返回。
 - LLM-facing 截断 tool result 会携带 `truncation.next_action="fetch_more"` 与
-  `truncation.fetch_more_args={cursor, scope_token, limit?}`；Host 在写入 RunEvent 前会移除 framework
-  `fetch_more` 调用参数中的 cursor 原文 / `scope_token`，并移除 accepted outcome 中仅供 LLM roundtrip 使用的
-  截断凭证。
-- `scope_token` 不进入 RunEvent、memory projection 或日志；framework `fetch_more` 通过 LLM-facing tool
-  message 中的 `truncation.fetch_more_args` 把 cursor / scope_token 透传给模型，模型按普通 tool call
-  回传，由 Host `ToolRuntimeToolExecutor -> HostToolRuntime.execute_tool_call` 在 framework 路径下消费。
-- framework `fetch_more` 作为最小 LLM-facing schema 与业务工具 schema 一起传给 Engine / Runner；
-  `ToolRuntimeToolExecutor -> HostToolRuntime.execute_tool_call` 会识别该工具名并路由到 Host ToolRuntime
-  补读，不调用业务 executor，也不把它提升为完整 ToolRegistry / governance。
+  `truncation.fetch_more_args={cursor, scope_token, limit?}`；这些 ordinary tool payload 可进入
+  EventLog / trace。EventLog / trace 只 scrub `API_KEY`、`api_key`、`Authorization`、password、
+  client secret 等明确凭证字段；cursor、scope token、普通 `token`、工具参数与普通工具结果不是 scrub 触发条件。
+- Conversation Memory / RunInput 是摄取策略边界：memory snapshot 与 RunInput rendered tool fact 不包含
+  raw cursor、raw scope token 或可复用的 `truncation.fetch_more_args`，只保留不可复用摘要。
+- framework `fetch_more` schema 由 Host runtime assembly 自动投影到 Engine-visible schemas；调用方只传业务
+  schema，`RunOptions` public object 不被污染。Engine 只接收 `ToolSchema` 与 `ToolExecutor` adapter，
+  不接收 `ToolDefinition`、callable、manager、cursor store 或 truncation 状态机。
 - 补读失败结果中的 `denied` 只表示权限 / scope 拒绝；cursor 不存在、cursor 过期和 terminal Run 都不是权限拒绝。
-- terminal Run 后 framework `fetch_more` 工具调用返回 typed failure，不追加新 RunEvent。
+- terminal Run 后 framework `fetch_more` 工具调用返回普通 failed tool outcome，不追加专用 RunEvent。
 - Host 内部 `DurableConversationMemoryStore`（P8-S8 起为默认 read model）只从 canonical RunEvent 投影 session memory；preview、
   reasoning delta、content delta 与 content completed 不进入 memory pool 或 RunInputBuilder replay。
 - 当前 memory 结构预留 `ConversationPinnedState`、`TaskFrame`、`MemoryClaim`、`ClaimStatus`、
@@ -170,7 +171,8 @@ P7 已落地：
   ``<root>/raw_payloads/<run_id>_<iteration_id>/<blob_id>.json``，先 tmp +
   ``os.replace`` 原子落地。``PROVIDER_PROTOCOL_ERROR`` 的 ``raw_payload``
   在落盘前由 `_scrub_provider_secret` 替换 ``Authorization`` /
-  ``api_key`` / ``cookie`` / ``x-api-key`` 等敏感键为 ``"***"``；缺失
+  ``api_key`` / ``cookie`` / ``x-api-key`` 等敏感键与字符串 header 为
+  ``"***"``；缺失
   payload 时 fallback 到 ``{"reason": "omitted_no_payload"}``。其它字段
   （prompt、tool result、scope_token / cursor）按 OLD 热/冷分层保留。
 - 装配开关：`DurableHarnessConfig.tool_trace_path` 非空字符串时装配
@@ -195,11 +197,12 @@ P8 已落地：
   token / lease 过期校验失败抛 `AttemptFencingError` 并整事务回滚，EventLog 不残留 stale
   terminal，`host_attempts` 不被旧 owner 覆盖未来状态。
 - attempt-scoped append（P8-S5）：`AttemptScopedRunEventAppender` 收敛所有当前 attempt
-  owner 的 canonical fact 写入（Engine 翻译事件、context overflow / compact、trace fact、
-  ToolRuntime fact）；`draft.run_id` 与 `owner_context.run_id` 不一致直接抛
+  owner 的 canonical fact 写入（Engine 翻译事件、context overflow / compact、trace fact 与普通
+  tool call/result fact）；`draft.run_id` 与 `owner_context.run_id` 不一致直接抛
   `AttemptFencingError(reason=OWNER_MISMATCH)`。`ToolRuntimeOwnerScope`（ContextVar）
   在 `LocalRunHarness._run_to_store` 每个 attempt 生命周期内把 scoped appender 注入
-  `HostToolRuntime`，使框架 `fetch_more` 也按 originating attempt 落库。
+  `HostToolRuntime`，使 durable 工具执行入口在业务 executor、framework `fetch_more` 与截断 manager
+  mutation 前先验证 active owner；框架 `fetch_more` 也按 originating attempt 的普通工具事件路径约束落库。
 - stale / orphan recovery（P8-S6）：`AttemptSupervisor.recover_stale_attempts` 内部显式
   入口扫描 `state IN ('running','created') AND lease_expires_at <= now`，逐候选用独立
   `BEGIN IMMEDIATE` 事务 CAS 决策——旧 attempt 一律 `MARK_LOST` 诊断收口，不再创建
@@ -230,11 +233,7 @@ P8 已落地：
 - Host-owned event data：`HostRunFailedData`、`UserInputAcceptedData`、`UserInputScope`。
 - Run input context fact data：`RunInputContextSnapshotBuiltData`、`RunInputContextMeta`、
   `RunInputMessageSummary`、`RunInputToolSchemaSummary`。
-- ToolRuntime fact data：`ToolResultTruncatedData`、`ToolCursorIssuedData`、`ToolFetchMoreRequestedData`、
-  `ToolFetchMoreCompletedData`、`ToolFetchMoreFailedData`、`ToolCursorExpiredData`、`ToolCursorDeniedData`、
-  `ToolRuntimeEventData`、`ToolValueSizeSummary`。
-- Tool fetch_more 契约：`ToolRuntimeCursor`、`ToolFetchMoreRequest`、`ToolFetchMoreResult`、
-  `ToolFetchMoreSucceededResult`、`ToolFetchMoreFailedResult`。
+- Tool value 摘要：`ToolValueSizeSummary`。
 - Run 终态结果类型：`RunResult`、`RunSucceededResult`、`RunFailedResult`、`RunCancelledResult`、`RunSuspendedResult`。
 - Host context compact 事实类型：`HostContextOverflowObservedData`、`HostContextCompactRequestedData`、
   `HostContextCompactCompletedData`、`HostContextCompactFailedData`、`HostContextAttemptRetryData`、
@@ -287,14 +286,14 @@ LocalRunHarness.start_run(run_index=1)
   -> Engine Agent tool loop emits huge_echo tool call
   -> ToolExecutor.execute
   -> ToolRuntimeToolExecutor -> HostToolRuntime -> huge_echo executor
-  -> truncate / cursor facts
+  -> ordinary TOOL_CALL_REQUESTED / TOOL_RESULT_ACCEPTED facts
   -> Engine injects truncated tool result with fetch_more hint
   -> model emits framework fetch_more tool call
-  -> ToolRuntime routes framework fetch_more and appends fetch_more facts
+  -> ToolRuntime routes framework fetch_more and returns ordinary tool outcome
   -> final terminal
   -> memory projection
 LocalRunHarness.start_run(run_index=2 after terminal)
-  -> RunInputBuilder sees previous user / final / tool / fetch_more facts
+  -> RunInputBuilder sees previous user / final / ordinary tool facts
 ```
 
 context overflow compact retry 路径：
@@ -319,8 +318,8 @@ Engine
   -> ToolRuntimeToolExecutor
   -> HostToolRuntime
   -> business ToolExecutor
-  -> truncate / cursor facts
-  -> RunEventStore.append
+  -> optional RuntimeTruncateManager truncation
+  -> ordinary tool outcome
 ```
 
 framework 补读路径：
@@ -332,18 +331,19 @@ Model
   -> ToolExecutor.execute
   -> ToolRuntimeToolExecutor
   -> HostToolRuntime.execute_tool_call
-  -> HostToolRuntime.fetch_more
-  -> RunEventStore.append(fetch_more facts for original business tool)
+  -> private framework fetch_more callable
+  -> RuntimeTruncateManager.fetch_more
+  -> ordinary tool outcome
 ```
 
 Host framework `fetch_more` 路径（与业务工具走同一 Engine 工具调用路径）：
 
 ```text
-Engine ToolExecutor.execute(ToolExecutionRequest{name=FRAMEWORK_FETCH_MORE_TOOL_NAME})
+Engine ToolExecutor.execute(ToolExecutionRequest{name=fetch_more})
   -> ToolRuntimeToolExecutor
   -> HostToolRuntime.execute_tool_call
-  -> HostToolRuntime._fetch_more (内部子例程)
-  -> RunEventStore.append
+  -> private framework fetch_more callable
+  -> RuntimeTruncateManager.fetch_more
 ```
 
 `EngineWorker` 只负责把 Host `StartRunRequest` 装配为 Engine `AgentRunRequest` 并调用 Engine。它不注册工具、
@@ -392,8 +392,8 @@ public `StartRunRequest` / `start_run` 不暴露 lease TTL，owner secret token 
 不进入日志、不进入 EventLog payload。P8-S5 进一步把 attempt-scoped append 收敛到
 `AttemptScopedRunEventAppender`：所有由当前 attempt owner 写入的 canonical fact
 （Engine-sourced 翻译事件、`CONTEXT_OVERFLOW_OBSERVED` / `CONTEXT_COMPACT_*` /
-`CONTEXT_ATTEMPT_RETRYING`、`RUN_INPUT_CONTEXT_SNAPSHOT_BUILT`、ToolRuntime
-`TOOL_RESULT_TRUNCATED` / `TOOL_CURSOR_*` / `TOOL_FETCH_MORE_*`）都通过该 appender
+`CONTEXT_ATTEMPT_RETRYING`、`RUN_INPUT_CONTEXT_SNAPSHOT_BUILT` 与 ordinary tool runtime
+facts）都通过该 appender
 在同一 `BEGIN IMMEDIATE` 事务内执行 `verify_owner` + EventLog append；
 `draft.run_id` 与 `owner_context.run_id` 不一致直接抛 typed
 `AttemptFencingError(reason=OWNER_MISMATCH)`，stale owner / fencing token 不一致 / lease
@@ -401,8 +401,10 @@ public `StartRunRequest` / `start_run` 不暴露 lease TTL，owner secret token 
 RunEvent。`AttemptSupervisor.scoped_appender(owner_context)` 是构造该 appender 的唯一
 公开入口；`LocalRunHarness._run_to_store` 在每个 attempt 生命周期内通过
 `ToolRuntimeOwnerScope`（基于 `contextvars.ContextVar`）把 scoped appender 注入到
-`HostToolRuntime`，使框架级 `fetch_more` 也按 originating attempt 的 owner
-落库，避免跨 attempt 写错 run。`ToolExecutionContext` 不变，不向 ToolExecutor 暴露
+`HostToolRuntime`，使 durable `HostToolRuntime.execute_tool_call()` 在进入业务 executor、framework
+`fetch_more` 或截断 manager mutation 前先执行 active owner verification；框架级 `fetch_more`
+也按普通工具调用路径接受 originating attempt 的 owner 约束，避免跨 attempt 写错 run 或消费旧 cursor。
+`ToolExecutionContext` 不变，不向 ToolExecutor 暴露
 任何 owner secret。P8 D2 后 stale / orphan recovery 入口
 `AttemptSupervisor.recover_stale_attempts(*, run_id=None)` 仅做诊断收口：候选扫描使用短读事务挑选
 `state IN ('running','created') AND (lease_expires_at <= now OR lease_expires_at IS NULL)` 的 attempt，

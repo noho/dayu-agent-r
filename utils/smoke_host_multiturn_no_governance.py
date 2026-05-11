@@ -46,7 +46,6 @@ _ensure_repo_root_on_path()
 
 from dayu.contracts import (  # noqa: E402
     CancellationToken,
-    FRAMEWORK_FETCH_MORE_TOOL_NAME,
     JsonValue,
     ToolBundle,
     ToolCallRequest,
@@ -58,7 +57,6 @@ from dayu.contracts import (  # noqa: E402
     ToolResultSuccess,
     ToolSchema,
     ToolTruncateSpec,
-    framework_fetch_more_tool_schema,
     tool,
 )
 import dayu.engine.agent as agent_module  # noqa: E402
@@ -91,6 +89,7 @@ from dayu.engine import (  # noqa: E402
     RunnerToolCallsCompletedData,
     SystemMessage,
     ToolMessage,
+    ToolResultAcceptedData,
     UserMessage,
 )
 from dayu.host import (  # noqa: E402
@@ -100,9 +99,6 @@ from dayu.host import (  # noqa: E402
     RunOptions,
     RunSucceededResult,
     StartRunRequest,
-    ToolFetchMoreFailedResult,
-    ToolFetchMoreRequest,
-    ToolFetchMoreSucceededResult,
 )
 from dayu.host._conversation_memory import (  # noqa: E402
     ConversationMemoryPatch,
@@ -115,6 +111,7 @@ from utils._smoke_memory_store import (  # noqa: E402
     SmokeInMemoryConversationMemoryStore,
 )
 from dayu.host._event_store import InMemoryRunEventStore  # noqa: E402
+from dayu.host._framework_tools import FRAMEWORK_FETCH_MORE_NAME  # noqa: E402
 from dayu.host._proxy import LocalProxy, WorkerProxy  # noqa: E402
 from dayu.host._run_harness import LocalRunHarness  # noqa: E402
 from dayu.host._tool_runtime import (  # noqa: E402
@@ -125,9 +122,6 @@ from dayu.host._worker import EngineWorker  # noqa: E402
 from dayu.host.contracts import (  # noqa: E402
     HostContextCompactCompletedData,
     HostContextOverflowObservedData,
-    ToolCursorIssuedData,
-    ToolFetchMoreCompletedData,
-    ToolResultTruncatedData,
 )
 from dayu.runtime.log import LogLevel, configure  # noqa: E402
 
@@ -706,16 +700,13 @@ def huge_echo_bundle() -> ToolBundle:
 
 
 def phase5_tool_schemas() -> tuple[ToolSchema, ...]:
-    """返回 P5 主路径暴露给模型的业务工具与 framework 工具 schema。
+    """返回 P5 主路径调用方传入的业务工具 schema。
 
-    :returns: ``huge_echo`` 与 framework ``fetch_more`` schema。
+    :returns: ``huge_echo`` 业务工具 schema。
     :raises Exception: 不主动抛出异常。
     """
 
-    return (
-        *huge_echo_bundle().to_tool_schemas(),
-        framework_fetch_more_tool_schema(),
-    )
+    return huge_echo_bundle().to_tool_schemas()
 
 
 def build_huge_echo_harness(
@@ -749,13 +740,19 @@ def build_huge_echo_harness(
     )
     resolved_proxy = proxy
     if resolved_proxy is None:
-        resolved_proxy = LocalProxy(worker=EngineWorker(gated_executor))
+        resolved_proxy = LocalProxy(
+            worker=EngineWorker(
+                tool_executor=gated_executor,
+                schema_provider=runtime,
+            )
+        )
     return LocalRunHarness(
         is_durable=False,
         proxy=resolved_proxy,
         event_store=event_store,
         tool_runtime=runtime,
         memory_store=memory_store or _seeded_memory_store(),
+        engine_tool_schema_provider=runtime,
     )
 
 
@@ -1071,15 +1068,18 @@ async def _run_tool_multiturn_case(
         )
         probe.release()
         return False
-    cursor_event = _last_data(first_events, ToolCursorIssuedData)
-    truncated = _last_data(first_events, ToolResultTruncatedData)
-    if cursor_event is None or truncated is None:
+    first_tool_result = _last_tool_result(
+        first_events, tool_name=HUGE_ECHO_DEFINITION.name
+    )
+    if first_tool_result is None:
         print(
             f"{_SMOKE_PREFIX} case={case_name} failed "
             f"reason=model_did_not_call_huge_echo"
         )
         return False
-    fetch_completed = _last_data(first_events, ToolFetchMoreCompletedData)
+    fetch_completed = _last_tool_result(
+        first_events, tool_name=FRAMEWORK_FETCH_MORE_NAME
+    )
     if fetch_completed is None:
         print(
             f"{_SMOKE_PREFIX} case={case_name} failed "
@@ -1138,13 +1138,13 @@ async def _run_tool_multiturn_case(
     )
     print(
         f"{_SMOKE_PREFIX} case={case_name} run_index=1 tool_truncated "
-        f"event_cursor={_event_cursor_for_data(first_events, truncated)} "
-        f"cursor_issued={cursor_event.cursor_fingerprint}"
+        f"event_cursor={_event_cursor_for_data(first_events, first_tool_result)} "
+        f"has_more={_tool_result_has_more(first_tool_result)}"
     )
     fetch_event_cursor = _event_cursor_for_data(first_events, fetch_completed)
     print(
         f"{_SMOKE_PREFIX} case={case_name} fetch_more pre_terminal "
-        f"completed has_more={fetch_completed.has_more} "
+        f"completed has_more={_tool_result_has_more(fetch_completed)} "
         f"event_cursor={fetch_event_cursor} "
         f"before_terminal={fetch_event_cursor is not None and fetch_event_cursor < terminal_cursor}"
     )
@@ -1167,7 +1167,7 @@ async def _run_tool_multiturn_case(
         and probe.execute_called
         and probe.runtime_completed
         and HUGE_ECHO_DEFINITION.name in probe.tool_names
-        and FRAMEWORK_FETCH_MORE_TOOL_NAME in probe.tool_names
+        and FRAMEWORK_FETCH_MORE_NAME in probe.tool_names
         and fetch_completed is not None
         and fetch_event_cursor is not None
         and fetch_event_cursor < terminal_cursor
@@ -1300,7 +1300,7 @@ def _fake_fetch_more_tool_call(
 
     return ToolCallRequest(
         tool_call_id=_FETCH_MORE_TOOL_CALL_ID,
-        name=FRAMEWORK_FETCH_MORE_TOOL_NAME,
+        name=FRAMEWORK_FETCH_MORE_NAME,
         arguments=arguments,
         index_in_iteration=0,
         provider_state=None,
@@ -1347,10 +1347,10 @@ def _fetch_more_script_from_hint(
     """
 
     tool_names = {schema.function.name for schema in tools}
-    assert FRAMEWORK_FETCH_MORE_TOOL_NAME in tool_names
+    assert FRAMEWORK_FETCH_MORE_NAME in tool_names
     payload = _latest_tool_message_payload(messages)
     truncation = _json_object_field(payload, "truncation")
-    assert truncation.get("next_action") == FRAMEWORK_FETCH_MORE_TOOL_NAME
+    assert truncation.get("next_action") == FRAMEWORK_FETCH_MORE_NAME
     fetch_more_args = _json_object_field(truncation, "fetch_more_args")
     assert isinstance(fetch_more_args.get("cursor"), str)
     assert isinstance(fetch_more_args.get("scope_token"), str)
@@ -1447,11 +1447,11 @@ async def _collect_until_cursor_issued(
     async for event in events:
         collected.append(event)
         _observe_real_provider_run_event(output, event)
-        if isinstance(event.data, ToolCursorIssuedData):
+        if _is_tool_result_for(event=event, tool_name=FRAMEWORK_FETCH_MORE_NAME):
             return tuple(collected)
         if _is_terminal(event):
-            raise RuntimeError("terminal before cursor issued")
-    raise RuntimeError("stream ended before cursor issued")
+            raise RuntimeError("terminal before fetch_more completed")
+    raise RuntimeError("stream ended before fetch_more completed")
 
 
 async def _collect_events(
@@ -1609,11 +1609,61 @@ def _first_data(
     return None
 
 
+def _is_tool_result_for(*, event: RunEvent, tool_name: str) -> bool:
+    """判断事件是否为指定工具的普通 accepted 结果。
+
+    :param event: RunEvent。
+    :param tool_name: 工具名。
+    :returns: 匹配时返回 ``True``。
+    :raises Exception: 不主动抛出异常。
+    """
+
+    data = event.data
+    return isinstance(data, ToolResultAcceptedData) and data.name == tool_name
+
+
+def _last_tool_result(
+    events: Sequence[RunEvent],
+    *,
+    tool_name: str,
+) -> ToolResultAcceptedData | None:
+    """按工具名返回最后一个普通 accepted 结果。
+
+    :param events: 事件序列。
+    :param tool_name: 工具名。
+    :returns: 匹配 data 或 ``None``。
+    :raises Exception: 不主动抛出异常。
+    """
+
+    for event in reversed(events):
+        data = event.data
+        if isinstance(data, ToolResultAcceptedData) and data.name == tool_name:
+            return data
+    return None
+
+
+def _tool_result_has_more(data: ToolResultAcceptedData) -> bool | None:
+    """读取普通工具结果中的截断 has_more 摘要。
+
+    :param data: 工具结果 data。
+    :returns: ``has_more`` 或 ``None``。
+    :raises Exception: 不主动抛出异常。
+    """
+
+    outcome = data.outcome
+    if not isinstance(outcome, ToolCompletedOutcome):
+        return None
+    truncation = outcome.result.truncation
+    if truncation is None:
+        return None
+    return truncation.has_more
+
+
 def _event_cursor_for_data(
     events: Sequence[RunEvent],
-    data: ToolResultTruncatedData | ToolFetchMoreCompletedData,
+    data: ToolResultAcceptedData,
 ) -> int | None:
-    """返回指定工具事实 data 对应事件 cursor。
+    """返回指定工具结果 data 对应事件 cursor。
 
     :param events: 事件序列。
     :param data: 工具事实 data。

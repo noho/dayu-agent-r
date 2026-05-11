@@ -320,7 +320,7 @@ P8.5 完成后必须同时满足：
 ### Tests / docs / smokes
 
 - `tests/contracts/test_tool_declaration.py`
-- `tests/contracts/test_tool_result.py` 或现有 tool result contract tests
+- `tests/contracts/test_tool_result_envelope.py` 或现有 tool result contract tests
 - `tests/contracts/test_package_exports.py`
 - `tests/host/test_phase1_public_boundary.py`
 - `tests/host/test_host_public_api_surface.py`
@@ -446,7 +446,7 @@ contracts，抽出 `RuntimeTruncateManager`，将 `fetch_more` 改为 Host 私�
 ```bash
 source .venv/bin/activate
 python -m pyright dayu/host/ dayu/contracts/ tests/host/ tests/contracts/
-pytest tests/contracts/test_tool_declaration.py tests/contracts/test_tool_result.py tests/contracts/test_package_exports.py -q
+pytest tests/contracts/test_tool_declaration.py tests/contracts/test_tool_result_envelope.py tests/contracts/test_package_exports.py -q
 pytest tests/host/test_phase1_public_boundary.py tests/host/test_host_public_api_surface.py -q
 pytest tests/host/test_phase2_tool_runtime_boundary.py tests/host/test_phase2_tool_runtime_truncation.py tests/host/test_phase2_tool_runtime_eventlog.py -q
 pytest tests/host/test_phase3_conversation_memory_projection.py tests/host/test_phase5_multiturn_no_governance_smoke.py tests/host/test_phase8_tool_runtime_fencing.py -q

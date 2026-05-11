@@ -81,8 +81,6 @@ from dayu.host.contracts import (
     RunOptions,
     RunSucceededResult,
     StartRunRequest,
-    ToolResultTruncatedData,
-    ToolValueSizeSummary,
 )
 from tests.host._memory_store_fake import FakeInMemoryConversationMemoryStore
 
@@ -640,7 +638,7 @@ def _tool_truncated_draft(
     run_id: str,
     session_id: str,
 ) -> RunEventDraft:
-    """构造测试用 Host 工具截断事实。
+    """构造测试用普通工具结果事实。
 
     :param run_id: Run id。
     :param session_id: Session id。
@@ -652,28 +650,24 @@ def _tool_truncated_draft(
         run_id=run_id,
         session_id=session_id,
         kind=RunEventKind.CANONICAL,
-        source=RunEventSource.HOST,
-        type=RunEventType.TOOL_RESULT_TRUNCATED,
+        source=RunEventSource.ENGINE,
+        type=RunEventType.TOOL_RESULT_ACCEPTED,
         occurred_at=_utc_now(),
-        data=ToolResultTruncatedData(
+        data=ToolResultAcceptedData(
             iteration_id="iter-0",
-            tool_name="fins.lookup",
             tool_call_id="call-current",
-            strategy="preview_with_cursor",
-            limit=1024,
-            unit="chars",
-            total_estimate=4096,
-            cursor_fingerprint="fp-current",
-            ttl_seconds=600,
-            has_more=True,
-            value_summary=ToolValueSizeSummary(
-                unit="chars",
-                size=1024,
-                total_estimate=4096,
-                fingerprint="value-fp-current",
+            name="fins.lookup",
+            index_in_iteration=0,
+            outcome=ToolCompletedOutcome(
+                result=ToolResultSuccess(
+                    ok=True,
+                    value={"summary": "收入同比增长 12%"},
+                    truncation=None,
+                    meta=None,
+                )
             ),
         ),
-        source_engine_event_id=None,
+        source_engine_event_id="engine-tool-current",
     )
 
 

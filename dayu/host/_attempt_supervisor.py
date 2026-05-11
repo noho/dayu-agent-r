@@ -185,9 +185,8 @@ class AttemptScopedRunEventAppender:
 
     本类型是 P8-S5 attempt-scoped append 的强类型入口: 所有由当前
     attempt owner 写入的 canonical fact (Engine-sourced event、context
-    overflow / compact facts、``RUN_INPUT_CONTEXT_SNAPSHOT_BUILT``、
-    ToolRuntime ``TOOL_RESULT_TRUNCATED`` / ``TOOL_CURSOR_*`` /
-    ``TOOL_FETCH_MORE_*``) 都通过本类型在同一个 ``BEGIN IMMEDIATE``
+    overflow / compact facts、``RUN_INPUT_CONTEXT_SNAPSHOT_BUILT`` 与
+    其它 Host-owned canonical fact）都通过本类型在同一个 ``BEGIN IMMEDIATE``
     事务内执行 :meth:`AttemptLeaseStore.verify_owner` + EventLog append,
     任意 owner CAS 命中失败抛 :class:`AttemptFencingError` 整事务回滚,
     EventLog 不残留 stale fact。
@@ -220,6 +219,26 @@ class AttemptScopedRunEventAppender:
     event_store: DurableRunEventStore
     lease_store: AttemptLeaseStore
     owner_context: AttemptOwnerContext
+
+    async def verify_active_owner(self, *, run_id: str) -> None:
+        """验证当前 owner 仍可执行指定 run 的 ToolRuntime mutation。
+
+        ToolRuntime 在进入业务 executor、framework ``fetch_more`` 或截断
+        manager mutation 前调用本方法。它不写 RunEvent，只在独立短事务内
+        执行 owner CAS，确保 stale owner 无法消费或签发 cursor。
+
+        :param run_id: 即将执行工具调用所属 Run id。
+        :returns: 无返回值。
+        :raises AttemptFencingError: ``run_id`` 不匹配或 owner CAS 失败。
+        :raises sqlite3.DatabaseError: 非冲突 SQLite 错误透传。
+        """
+
+        self._verify_run_id_value(run_id=run_id)
+        async with self.storage.transaction() as tx:
+            self.lease_store.verify_owner(
+                tx=tx,
+                owner_context=self.owner_context,
+            )
 
     async def append(self, draft: RunEventDraft) -> RunEvent:
         """在 ``BEGIN IMMEDIATE`` 事务内 append 非 terminal RunEvent。
@@ -395,7 +414,17 @@ class AttemptScopedRunEventAppender:
         :raises AttemptFencingError: ``run_id`` 不匹配时抛出。
         """
 
-        if draft.run_id == self.owner_context.run_id:
+        self._verify_run_id_value(run_id=draft.run_id)
+
+    def _verify_run_id_value(self, *, run_id: str) -> None:
+        """校验 run_id 与 owner_context.run_id 严格相等。
+
+        :param run_id: 待校验 Run id。
+        :returns: 无返回值。
+        :raises AttemptFencingError: ``run_id`` 不匹配时抛出。
+        """
+
+        if run_id == self.owner_context.run_id:
             return
         _LOGGER.warning(
             "host.attempt.scoped_append_run_id_mismatch "
@@ -403,7 +432,7 @@ class AttemptScopedRunEventAppender:
             "owner_id=%s owner_token=%s fencing_token=%s",
             self.owner_context.attempt_id,
             self.owner_context.run_id,
-            draft.run_id,
+            run_id,
             self.owner_context.owner_id,
             self.owner_context.owner_token.masked(),
             self.owner_context.fencing_token.value,
