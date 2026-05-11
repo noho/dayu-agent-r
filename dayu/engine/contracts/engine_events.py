@@ -20,12 +20,15 @@ from dayu.engine.contracts.agent_run import ContextBudgetSnapshot, RunResumeHint
 from dayu.engine.contracts.finish_reason import FinishReason
 from dayu.engine.contracts.partial_tool_call import PartialToolCallSummary
 from dayu.contracts.json_value import JsonValue
-from dayu.contracts.tool_await import ToolAwaitSpec
+from dayu.contracts.tool_await import ToolAwaitSnapshot, ToolAwaitSpec
 from dayu.contracts.tool_call import ToolCallProviderState
 from dayu.contracts.tool_outcome import (
     ToolCompletedOutcome,
     ToolFailedOutcome,
 )
+
+RUN_SUSPENDED_REASON_TOOL_AWAITING: str = "tool_awaiting"
+"""工具进入长事务等待导致 run 挂起的中性原因码。"""
 
 
 class EngineEventType(StrEnum):
@@ -148,11 +151,13 @@ class ToolAwaitingData:
     :param iteration_id: 当前迭代 id。
     :param tool_call_id: 工具调用 id。
     :param await_spec: 等待规约。
+    :param snapshot: 等待时点快照；无快照时为 ``None``。
     """
 
     iteration_id: str
     tool_call_id: str
     await_spec: ToolAwaitSpec
+    snapshot: ToolAwaitSnapshot | None
 
 
 @dataclass(frozen=True, slots=True)
@@ -241,10 +246,14 @@ class RunSuspendedData:
 
     :param reason: 挂起原因（中性字符串）。
     :param resume_hint: 可选的恢复提示；无为 ``None``。
+    :param await_spec: 工具等待规约。
+    :param snapshot: 等待时点快照；无快照时为 ``None``。
     """
 
     reason: str
     resume_hint: RunResumeHint | None
+    await_spec: ToolAwaitSpec
+    snapshot: ToolAwaitSnapshot | None
 
 
 @dataclass(frozen=True, slots=True)
@@ -331,6 +340,7 @@ TERMINAL_ENGINE_EVENT_TYPES: frozenset[EngineEventType] = frozenset(
 
 
 __all__ = [
+    "RUN_SUSPENDED_REASON_TOOL_AWAITING",
     "EngineEventType",
     "IterationStartedData",
     "ContentDeltaData",

@@ -1133,6 +1133,13 @@ Engine
   -> Engine receives ToolExecutionOutcome
 ```
 
+ToolExecutor handshake timeout / orphan control 备忘：
+
+- `ToolExecutor.execute` 是 Engine 与 ToolRuntime 之间的 bounded execution handshake。短工具应在该握手内返回普通 `completed` / `failed` outcome；长工具一旦启动外部长事务并需要上层接管，必须在该握手内返回 `ToolAwaitingOutcome(await_spec, snapshot)`。
+- Engine 可以在 handshake timeout 后停止等待并以 `run_failed(tool_execution_timeout)` 收口，但这只表示 Engine 不再等待 `execute()`；它不证明工具线程、子进程、HTTP 请求或远端 job 已停止。
+- ToolRuntime / ToolExecutor 必须承担 timeout 后的资源收口与 orphan control：观察 cancellation / timeout，尽力停止本地工作；如果外部 job 可能已启动但未返回 `ToolAwaitingOutcome`，必须通过幂等 job id、cleanup hook、reconcile 或 orphan scanner 自行治理。
+- Engine 不持有 `await_spec` / `snapshot` 时，不能恢复、监控或取消可能已启动的外部长事务；因此 Host 不应把“可能启动了 job，但没有 await_spec”的半提交状态留给 Engine 处理。
+
 `RuntimeTruncateManager` 是 ToolRuntime 内部组合的 Host 私有组件。它按显式 `ToolTruncateSpec` 决定是否
 截断普通 tool result，维护 run-scoped、single-use、TTL-bound cursor store，并生成返回给 LLM 的
 `truncation.fetch_more_args`。它不进入 Engine、`dayu.host.__all__`、`dayu.host.contracts` 或

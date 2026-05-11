@@ -24,6 +24,7 @@ from dayu.engine.contracts.agent_run import (
     RunResumeHint,
 )
 from dayu.engine.contracts.engine_events import (
+    RUN_SUSPENDED_REASON_TOOL_AWAITING,
     TERMINAL_ENGINE_EVENT_TYPES,
     ContentCompleteData,
     ContentDeltaData,
@@ -124,6 +125,7 @@ __all__ = [
     "ProviderRequestExtension",
     "QwenThinkingExtension",
     "ReasoningDeltaData",
+    "RUN_SUSPENDED_REASON_TOOL_AWAITING",
     "RunCancelledData",
     "RunFailedData",
     "RunResumeHint",

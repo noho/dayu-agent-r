@@ -148,6 +148,8 @@ Engine 公共契约分为 Engine 专属契约与跨层共享契约。Engine 专�
 
 `tool_schemas` 与 `tool_executor` 是同一组工具能力在 Engine 边界上的两个投影。`tool_schemas` 是模型可见的工具 schema 快照，只进入 Runner 调用；`tool_executor` 是工具调用的统一执行入口，只通过 `ToolExecutor.execute(request)` 接收模型返回的工具名、参数和执行上下文。Engine 要求二者由调用方作为同源输入提供，但 Engine 不持有工具注册表，不从 executor 反查 schema，也不负责工具名路由、权限校验或运行时治理。
 
+`ToolAwaitingOutcome` 是长时间运行工具的挂起契约。ToolExecutor 返回该 outcome 时，Engine 产出 `tool_awaiting` 和 `run_suspended`，事件 data 携带 `await_spec` 与 `snapshot`；`run_agent_and_wait` 返回 `EngineRunOutcomeSuspended`，同样携带这些机器可读恢复事实。
+
 `cancellation_token` 是 Engine 可观察的取消入口。Engine 在 run 开始、Runner 事件消费边界和工具执行等待边界观察该 token；取消命中后以 `run_cancelled` 事件和 `EngineRunOutcomeCancelled` 收口。取消不是普通失败、工具失败或最终回答，也不是公共异常类型。
 
 `AgentRunResult` 是 `run_agent_and_wait` 的终态返回联合，成员为 `EngineRunOutcomeFinalAnswer`、`EngineRunOutcomeFailed`、`EngineRunOutcomeCancelled`、`EngineRunOutcomeSuspended`。终态 outcome 只表达本次 run 的结果，不表达上层持久化状态。
@@ -190,7 +192,9 @@ run_agent_messages(request)
   -> create run-scoped Agent from request + Runner
   -> Agent.run_messages
       -> observe cancellation_token before work
-      -> append iteration_started
+      -> validate agent_policy.max_iterations >= 1
+      -> emit EngineEvent.iteration_started
+      -> run ordinary iterations within agent_policy.max_iterations
       -> compute effective tools from disable_tools / AgentPolicy / Runner capability
       -> AsyncRunner.call(messages, request.runner_options, effective_tools)
           -> RunnerEvent stream
@@ -201,19 +205,37 @@ run_agent_messages(request)
               -> context_compaction_requested
               -> iteration_completed
       -> if model requested tools
-          -> append tool_call_requested
+          -> emit EngineEvent.tool_call_requested
           -> ToolExecutor.execute(ToolExecutionRequest)
-          -> append tool_result_accepted for completed / failed outcome
-          -> inject ToolMessage into next iteration messages
-          -> continue next iteration
+          -> if completed / failed outcome
+              -> emit EngineEvent.tool_result_accepted
+              -> inject ToolMessage into next iteration messages
+              -> if all outcomes failed enough times
+                  -> fallback by agent_policy.fallback_mode
+              -> if max_iterations budget remains
+                  -> continue next ordinary iteration
+              -> if max_iterations exhausted
+                  -> fallback by agent_policy.fallback_mode
+          -> if awaiting outcome
+              -> ToolExecutor returned ToolAwaitingOutcome(await_spec, snapshot)
+              -> AsyncAgent emits EngineEvent.tool_awaiting
+              -> close Runner
+              -> AsyncAgent emits terminal EngineEvent.run_suspended
+      -> if fallback_mode is FORCE_ANSWER
+          -> append fallback_prompt to run-local messages
+          -> AsyncRunner.call(messages, request.runner_options, tools=())
+          -> emit EngineEvent.final_answer if content accepted
+          -> emit EngineEvent.run_failed if force-answer is empty or still requests tools
+      -> if fallback_mode is RAISE_ERROR
+          -> emit EngineEvent.run_failed
       -> if cancellation_token observed
-          -> append run_cancelled
+          -> emit EngineEvent.run_cancelled
           -> close Runner
       -> if final content accepted
-          -> append final_answer
+          -> emit EngineEvent.final_answer
           -> close Runner
       -> if failure selected
-          -> append run_failed
+          -> emit EngineEvent.run_failed
           -> close Runner
   -> EngineEvent async stream
 ```
@@ -225,7 +247,7 @@ run_agent_and_wait(request)
   -> map final_answer -> EngineRunOutcomeFinalAnswer
   -> map run_failed -> EngineRunOutcomeFailed
   -> map run_cancelled -> EngineRunOutcomeCancelled
-  -> map unexpected run_suspended -> EngineRunOutcomeFailed
+  -> map run_suspended -> EngineRunOutcomeSuspended
   -> if stream ends without terminal -> EngineRunOutcomeFailed
 ```
 
@@ -254,8 +276,13 @@ ITERATING -> FINAL_ANSWERED
 ITERATING -> FAILED
 ITERATING -> CANCELLED
 EXECUTING_TOOL -> ITERATING
+EXECUTING_TOOL -> FORCE_ANSWER
+EXECUTING_TOOL -> SUSPENDED
 EXECUTING_TOOL -> FAILED
 EXECUTING_TOOL -> CANCELLED
+FORCE_ANSWER -> FINAL_ANSWERED
+FORCE_ANSWER -> FAILED
+FORCE_ANSWER -> CANCELLED
 ```
 
 状态语义：
@@ -263,13 +290,13 @@ EXECUTING_TOOL -> CANCELLED
 - `CREATED`：`run_agent_messages(request)` 已接收请求，但尚未开始普通 LLM iteration；如果取消 token 已命中或策略参数非法，可直接进入 terminal。
 - `ITERATING`：Engine 已产出 `iteration_started`，正在消费一次 `AsyncRunner.call(...)` 的 `RunnerEvent` 流；`iteration_completed` 只表示本轮 RunnerEvent 流结束，不是 run 终态。
 - `EXECUTING_TOOL`：本轮 Runner 已完成工具调用请求，Engine 产出 `tool_call_requested`，并通过 `ToolExecutor.execute(ToolExecutionRequest)` 等待工具 outcome。
+- `FORCE_ANSWER`：普通工具 iteration 预算耗尽，或连续全失败工具批次达到阈值后，Engine 按 `AgentPolicy.fallback_mode=FORCE_ANSWER` 追加 `fallback_prompt`，禁用工具再调用一次 Runner；空回答或再次请求工具会收口为 `run_failed`。
 - `FINAL_ANSWERED`：Engine 已产出 `final_answer`，对应 `EngineRunOutcomeFinalAnswer`。
-- `FAILED`：Engine 已产出 `run_failed`，对应 `EngineRunOutcomeFailed`；provider protocol error、context overflow 后的 recoverable failure、`ToolAwaitingOutcome` 当前 fail-closed、重复工具调用 id、Runner 异常结束等都收口到该状态。
+- `FAILED`：Engine 已产出 `run_failed`，对应 `EngineRunOutcomeFailed`；provider protocol error、context overflow 后的 recoverable failure、重复工具调用 id、Runner 异常结束等都收口到该状态。
+- `SUSPENDED`：Engine 已产出 `run_suspended`，对应 `EngineRunOutcomeSuspended`；当前来源是 ToolExecutor 返回 `ToolAwaitingOutcome`。
 - `CANCELLED`：Engine 已观察到 `cancellation_token` 命中并产出 `run_cancelled`，对应 `EngineRunOutcomeCancelled`。
 
-`run_suspended` / `EngineRunOutcomeSuspended` 保留为公共契约终态；当前 Agent run loop 不生产该事件。`run_agent_and_wait` 遇到意外 `run_suspended` 时防御性返回 `EngineRunOutcomeFailed`。
-
-Terminal 事件集合由 `TERMINAL_ENGINE_EVENT_TYPES` 定义。进入 `FINAL_ANSWERED`、`FAILED` 或 `CANCELLED` 后，本次 run 不再继续产出普通事件。
+Terminal 事件集合由 `TERMINAL_ENGINE_EVENT_TYPES` 定义。进入 `FINAL_ANSWERED`、`FAILED`、`SUSPENDED` 或 `CANCELLED` 后，本次 run 不再继续产出普通事件。
 
 ## 事件流
 
@@ -309,9 +336,13 @@ Runner 的 `runner_done` 只表示本次 RunnerEvent 流结束；提升到 Engin
 
 ## 关键机制
 
-取消 token 是 Engine 的取消收口。Agent 在迭代前、Runner 事件消费后、工具执行前后观察 token；工具执行通过共享 runtime 的取消等待 helper 把 token 传入等待过程。公共结果以 `run_cancelled` 事件和 `EngineRunOutcomeCancelled` 表达。
+取消 token 是 Engine 的取消收口。Agent 在迭代前、Runner 事件消费后、工具执行前后观察 token；工具执行通过共享 runtime 的取消等待 helper 把 token 传入等待过程。公共结果以 `run_cancelled` 事件和 `EngineRunOutcomeCancelled` 表达。取消是当前 run 的终态；上层调用者要继续原目标时，需要用新的 `AgentRunRequest.messages` 显式提供已确认事实、用户意图或恢复输入。
 
 工具执行协议以 `ToolSchema` 快照和 `ToolExecutor.execute` 为边界。Engine 把 Runner 完成的工具调用投影为 `ToolExecutionRequest`，其中包含 run、session、iteration、tool call 与 correlation 信息；工具返回完成或失败 outcome 后，Engine 将结果投影为 LLM 可消费的 tool message。
+
+挂起 / 恢复协议以 `ToolAwaitingOutcome` 为边界。工具开始外部长事务并建议挂起时，ToolExecutor 返回 `await_spec` 与 `snapshot`；Engine 先产出 `tool_awaiting`，再以 `run_suspended` 收口并关闭 Runner。Engine 不等待外部长事务完成，不持久化等待记录，也不恢复旧 Agent/Runner 实例；上层调用者保存 `await_spec` / `snapshot`，等工具终态确定后构造新的 `AgentRunRequest`，把工具终态结果或恢复输入显式交回 Engine。
+
+取消优先于挂起、最终回答和失败候选。Engine 已观察到 cancellation token 后，不再把同一次 run 收口为 `run_suspended` 或 `final_answer`。上层调用者把自己的取消命令映射成 run-local token，就能在外层强约束生命周期；把工具长事务映射成 `ToolAwaitingOutcome`，再用新 run 恢复，就能形成“宿主强约束下的 LLM in the loop”。
 
 provider 协议错误与 HTTP / 网络错误分层处理。Runner 解析层错误产出 `provider_protocol_error`；HTTP、网络、超时和上下文超限产出 `runner_http_error`。其中上下文长度超限会被 Engine 提升为 `context_compaction_requested`，并以可恢复失败候选收口；是否压缩、如何恢复不属于 Engine。
 

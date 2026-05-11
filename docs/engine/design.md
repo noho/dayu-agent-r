@@ -290,12 +290,12 @@ Engine 位于 Host 下游，提供 Agent、Runner、tool calling 协议等运行
 
 1. Engine 将 `tool_schemas` 传给 Runner，Runner 只把 schema 发送给模型。
 2. 模型返回 tool call 后，Runner 归一为 `ToolCallRequest` 事件，Agent 负责补齐 `run_id`、`iteration_id`、`tool_call_id`、参数 JSON 与调用序号。
-3. Agent 调用 EngineWorker 替 Host 代持并提供的 `ToolExecutor.execute(request)`。这是 Engine 唯一“调用工具”的方式；实际注册、校验、执行、权限、超时、审计、取消和长事务治理都在 Host / EngineWorker 执行环境内完成。
+3. Agent 调用 EngineWorker 替 Host 代持并提供的 `ToolExecutor.execute(request)`。这是 Engine 唯一“调用工具”的方式；实际注册、校验、执行、权限、审计、取消和长事务治理都在 Host / EngineWorker 执行环境内完成。
 4. ToolExecutor 返回 `ToolExecutionOutcome`：
-   - `completed`：包含 `ToolResultEnvelope`，Agent 产出 `tool_result_accepted` 事件，并把 LLM-facing tool message 注入下一轮 Runner 调用。
-   - `failed`：包含失败 `ToolResultEnvelope`，Agent 按普通工具失败结果注入上下文，让模型决定恢复或给出失败说明。
-   - `awaiting`：包含 `ToolAwaitSpec` 与当前 job snapshot，Agent 产出 `tool_awaiting` / `run_suspended` 事件后停止本次 run；Host 记录 wait record，监控终态，并在终态后用新的 run-scoped Engine 调用恢复原始目标。
-5. Host 恢复时，不要求复用旧 Agent/Runner；Host 只需把终态工具结果作为权威消息或恢复输入放回新的 `AgentRunRequest`。
+   - `completed`：包含 `ToolResultEnvelope`，Agent 先产出 `tool_result_accepted` 事件，并把 LLM-facing tool message 注入 run-local accepted context；若随后观察到取消，只阻止下一轮 Runner，不吞掉已接受工具事实。
+   - `failed`：包含失败 `ToolResultEnvelope`，Agent 同样先产出 `tool_result_accepted` 并注入失败 tool message；若未取消，让模型决定恢复或给出失败说明。
+   - `awaiting`：包含 `ToolAwaitSpec` 与当前 job snapshot，Agent 产出 `tool_awaiting` / `run_suspended` 事件后停止本次 run；上层调用者接管外部长事务，监控终态，并在终态后用新的 run-scoped Engine 调用恢复原始目标。
+5. 上层调用者恢复时，不要求复用旧 Agent/Runner；只需把终态工具结果作为权威消息或恢复输入放回新的 `AgentRunRequest`。
 
 扩展 outcome 预留：
 
@@ -310,8 +310,8 @@ Engine 位于 Host 下游，提供 Agent、Runner、tool calling 协议等运行
 - `iteration_started` 表示 Engine 新一轮 agent iteration 开始。
 - `tool_call_requested` 表示模型请求调用工具，是观测事件；Engine 随后通过 EngineWorker 替 Host 代持并提供的 `ToolExecutor.execute(request)` 调用工具，Host 不因该事件另行触发第二套工具执行路径。
 - `tool_result_accepted` 表示 EngineWorker 替 Host 代持的 ToolExecutor 已返回结果，Engine 已接收并进入后续上下文注入。
-- `tool_awaiting` 表示工具返回长事务等待事实；Host 挂起 run、监控 job，并在终态后恢复 Agent。
-- `run_suspended` 表示 Engine 已因 Host 托管等待停止本次 run，后续恢复由 Host 重新发起。
+- `tool_awaiting` 表示工具返回长事务等待事实，事件必须携带 `await_spec` 与 snapshot；上层调用者据此接管外部长事务。
+- `run_suspended` 表示 Engine 已因工具等待停止本次 run，后续恢复由上层调用者用新的 `AgentRunRequest` 重新发起。
 - `iteration_completed` 表示本轮 Engine iteration 的模型调用边界完成，只是 EngineEvent 的观测事实，不是 run 终态。
 - `final_answer` 表示 Agent 对外最终回答完成。
 - `run_failed` 表示运行失败终态。
@@ -497,13 +497,13 @@ EngineEvent data 类型草案：
 | `content_completed` | `ContentCompleteData` | `iteration_id`, `content`, `reasoning_content`, `finish_reason` |
 | `tool_call_requested` | `ToolCallRequestedData` | `iteration_id`, `tool_call_id`, `name`, `arguments`, `index_in_iteration`, `provider_state` |
 | `tool_result_accepted` | `ToolResultAcceptedData` | `iteration_id`, `tool_call_id`, `name`, `index_in_iteration`, `outcome` |
-| `tool_awaiting` | `ToolAwaitingData` | `iteration_id`, `tool_call_id`, `await_spec` |
+| `tool_awaiting` | `ToolAwaitingData` | `iteration_id`, `tool_call_id`, `await_spec`, `snapshot` |
 | `context_compaction_requested` | `ContextCompactionRequestedData` | `iteration_id`, `budget_state`, `reason`；当前在 provider context overflow 时产出，随后以 recoverable `run_failed(context_compaction_required)` 收口 |
 | `usage_reported` | `UsageReportedData` | `iteration_id`, `prompt_tokens`, `completion_tokens`, `total_tokens` |
 | `provider_protocol_error` | `ProviderProtocolErrorData` | `iteration_id`, `error_code`, `message`, `provider_request_id`, `raw_payload` |
 | `iteration_completed` | `IterationCompletedData` | `iteration_id`, `finish_reason` |
 | `final_answer` | `FinalAnswerData` | `content`, `filtered`, `degraded`, `finish_reason` |
-| `run_suspended` | `RunSuspendedData` | `reason`, `resume_hint` |
+| `run_suspended` | `RunSuspendedData` | `reason`, `resume_hint`, `await_spec`, `snapshot` |
 | `run_cancelled` | `RunCancelledData` | `reason`, `requested_at`, `accepted_at`, `finished_at` |
 | `run_failed` | `RunFailedData` | `error_code`, `message`, `recoverable` |
 
@@ -514,6 +514,34 @@ EngineEvent data 类型草案：
 - `reasoning_content` 是否需要随 assistant tool_calls 写回也属于 provider-specific roundtrip 语义。Phase 3 可以先按 OLD 已证明可行的行为无条件写回本轮 `reasoning_content`，作为普通工具闭环的过渡实现；但这不应成为 NEW 跨 provider 稳定规则。有些 provider 可能要求写回，有些 provider 可能不要求写回，也可能存在写回后被 provider 拒绝的情况。Phase 3 后需要用专门 patch 把无脑写回改为 provider-specific 非无脑写回，并评估是否把部分 provider 的 reasoning roundtrip 纳入 `provider_state`。
 - `index_in_iteration` 是本轮 tool call 排序事实，`tool_call_requested` 与 `tool_result_accepted` 都必须显式携带，observer 不应依赖回查前序事件才能重建结果顺序。
 - `tool_call_requested` 只是观测事件，不触发第二套执行路径；工具执行只能由 Agent 状态机继续调用 EngineWorker 替 Host 代持的 `ToolExecutor`。
+
+Observable fact / cancellation 稳定规则：
+
+- 取消不是“随时覆盖一切”。Engine 已经收到的可观察事实必须先 emit / accept，迟到取消只阻止未来工作。
+- RunnerEvent stream 中已经收到的 content delta、reasoning delta、usage、provider protocol error 等事实，必须先提升为 EngineEvent 或更新 accepted run-local state；随后再观察 `cancellation_token`。
+- ToolExecutor 已经返回的 completed / failed outcome，必须先产出 `tool_result_accepted` 并注入 ToolMessage；随后再观察 `cancellation_token`。若已取消，本次 run 收口为 `run_cancelled`，但不丢失该工具结果事实，也不进入下一轮 Runner。
+- ToolExecutor 已经返回的 awaiting outcome，必须先产出 `tool_awaiting` 并收口为 `run_suspended`；迟到取消不能吞掉 `await_spec` / `snapshot`。
+- Engine 已经接受 final candidate 后，`final_answer` 是终态 commit boundary；迟到取消不能把它改写为 `run_cancelled`。
+
+ToolExecutor.execute bounded handshake 稳定规则：
+
+- `ToolExecutor.execute` 是 Engine 与工具执行环境之间的 bounded execution handshake。Engine 等待 handshake outcome，但不托管长事务生命周期。
+- 短工具必须在 handshake 内返回 `ToolCompletedOutcome` 或 `ToolFailedOutcome`。
+- 长工具一旦启动外部长事务并需要上层接管，必须在 handshake 内返回 `ToolAwaitingOutcome(await_spec, snapshot)`。
+- `AgentPolicy.tool_execution_timeout_seconds` 是 ToolExecutor handshake timeout 真源，必须为正数。Engine 构造 `ToolExecutionContext` 时填入该值，并在等待 `ToolExecutor.execute` 时主动执行同一 timeout。
+- handshake timeout before outcome 时，Engine 取消 execute await task，并以不可恢复 `run_failed(tool_execution_timeout)` 收口。该 timeout 只表示 Engine 不再等待 `execute()`，不证明工具线程、子进程、HTTP 请求或远端 job 已停止。
+- 外部长事务 timeout、job reconcile、cleanup 和 orphan control 属于上层调用者 / ToolRuntime / ToolExecutor 治理；Engine 没有 `await_spec` / `snapshot` 时不能恢复、监控或取消可能已启动的外部长事务。
+
+Suspend / Resume 稳定规则：
+
+- Suspend 的唯一当前来源是 `ToolExecutor.execute(request)` 返回 `ToolAwaitingOutcome(await_spec, snapshot)`。
+- Engine 接收 `ToolAwaitingOutcome` 后，先产出 `tool_awaiting`，再产出终态 `run_suspended`，并关闭本次 run 相关 Runner 资源。
+- `tool_awaiting` 是工具等待事实，携带 `iteration_id`、`tool_call_id`、`await_spec` 与 `snapshot`。
+- `run_suspended` 是 run 终态，携带 `reason`、`resume_hint`、`await_spec` 与 `snapshot`；当前 `reason` 固定表达工具等待。
+- Engine 不等待外部长事务完成，不轮询 job，不持久化 wait record，不保留可恢复的 in-memory Agent/Runner。
+- Resume 不是恢复同一个 Engine 实例；上层调用者在外部长事务结束后，构造新的 `AgentRunRequest.messages`，把工具终态结果或恢复输入作为显式上下文交给新的 run。
+- `run_agent_messages` 调用者应消费 `tool_awaiting` / `run_suspended` 事件并保存恢复所需事实；`run_agent_and_wait` 调用者只能得到结构化 suspended outcome。
+- 取消要抢在 suspend 前，只能在 `ToolAwaitingOutcome` 返回前生效；`ToolAwaitingOutcome` 已返回后，awaiting / suspended 事实优先于迟到取消。
 
 RunnerEvent 稳定规则：
 
@@ -553,18 +581,21 @@ Cancellation 稳定规则：
 - Engine 接受取消事实后必须返回结构化终态：`run_cancelled` 事件或 `EngineRunOutcomeCancelled`。
 - `EngineRunOutcomeCancelled` 至少包含 `session_id`、`run_id`、`reason`、`requested_at`、`accepted_at`、`finished_at`。
 - transport error、连接断开、RPC timeout 不是业务取消真源，只能作为 Host 治理输入，由 Host 判定是否转成取消、失败或 lost。
-- 取消优先于最终回答；Engine 收到取消后不得继续产出 `final_answer`。
+- 取消在入口、RunnerEvent 处理后、ToolExecutor handshake 边界、fallback Runner 调用前等可中断边界生效。
+- 取消只阻止未来工作，不吞掉已经收到并接受的 RunnerEvent、普通工具结果、awaiting 事实或 final answer。
+- 进入 force-answer Runner 调用前必须观察取消；force-answer 已经得到可接受 final content 后，按 final answer commit boundary 收口。
 - Engine 必须停止本次 run 相关的 Runner 请求、SSE 读取和事件产出，并完成资源收口。
 - Host ToolRuntime 负责工具子任务取消和后台 job 治理，Engine 只接收取消事实或终态结果。
+- Cancel / Resume 不是 Engine 内部状态恢复。取消是当前 run 的终态；上层调用者若要继续原目标，必须构造新的 `AgentRunRequest.messages`，把已确认事实、取消后的用户意图或恢复输入显式交给新的 run。
+- Engine 层不区分两套 resume 机制。`run_suspended` 和 `run_cancelled` 都是上一 run 的 terminal reason；恢复动作都由上层调用者构造新的 `AgentRunRequest(messages=...)` 完成。
 - watchdog、取消超时升级、强制终止、lost 判定等取消治理增强不进入第一阶段迁移细节，由 [issue #3](https://github.com/noho/dayu-agent-r/issues/3) 跟踪。
 
 Context budget / compaction 后续协作规则：
 
-- context overflow / `context_compaction_requested` 不进入本轮 Engine 迁移实现范围。
+- provider context overflow 当前会产出 `context_compaction_requested`，随后以 recoverable `run_failed(context_compaction_required)` 收口。
 - `ContextBudgetState`、projected context tokens、trigger ratio、soft / hard limit 和工具结果 capping 只作为后续 Host 上下文治理与 Engine 协作设计素材；当前 Engine 不生产这些状态。
-- 当前 Engine 不做 Engine 内 compact / retry，不做 projected tokens 早停，不把 provider context overflow 改写成 `context_compaction_required` recoverable failure。
-- Host 未来基于 conversation_memory / transcript / tool facts 压缩后，可重新构造 `AgentRunRequest.messages` 并发起新的 run；是否需要 `context_compaction_requested`、recoverable terminal 和对应数据结构，留给后续 Host 实施时的独立 issue 决定。
-- wait / resume / monitor 的 terminal 与恢复语义留给 issue #4 后续设计。
+- 当前 Engine 不做 Engine 内 compact / retry，不做 projected tokens 早停；是否压缩、如何重构消息和如何恢复由上层调用者决定。
+- Host 未来基于 conversation_memory / transcript / tool facts 压缩后，可重新构造 `AgentRunRequest.messages` 并发起新的 run。
 - Engine 不理解业务语义，也不应让 Host 内核理解业务语义；若压缩需要业务知识，应由对应 capability 提供摘要/恢复输入。
 - OLD `_compact_messages` 只作为 context overflow 历史行为证据和后续 Host 设计参考；当前 Engine 阶段不得把它作为稳定 compact / retry 能力迁入。
 
@@ -750,8 +781,8 @@ Engine 包根导出建议：
 - `ToolExecutionRequest`：Agent 调用 ToolExecutor 时补齐运行上下文后的请求。
 - `ToolExecutionOutcome`：ToolExecutor 返回给 Engine 的结果联合类型。
 - `ToolResultEnvelope`：普通完成/失败工具结果。
-- `ToolAwaitSpec`：Host 托管长事务等待、终态唤醒和 resume 的机器可读契约。
-- `ToolAwaitSnapshot`：Host 返回给 Engine 的等待态快照，只表达可恢复等待所需的中性治理事实，不表达 web/doc/fins 业务状态。
+- `ToolAwaitSpec`：上层调用者托管长事务等待、终态唤醒和 resume 的机器可读契约。
+- `ToolAwaitSnapshot`：ToolExecutor 返回给 Engine 的等待态快照，只表达可恢复等待所需的中性治理事实，不表达 web/doc/fins 业务状态。
 
 稳定流程：
 
@@ -761,7 +792,7 @@ Engine 包根导出建议：
 4. Runner 产出模型 tool call，Agent 转成 `ToolExecutionRequest`。
 5. Agent 调用 `tool_executor.execute(request)`。
 6. ToolExecutor 返回普通结果时，Agent 注入下一轮 tool message。
-7. ToolExecutor 返回 `ToolAwaitSpec` 时，Agent 产出 suspended 事件并结束本次 run；Host 终态后重新调用函数式入口恢复。
+7. ToolExecutor 返回 `ToolAwaitingOutcome(await_spec, snapshot)` 时，Agent 产出 `tool_awaiting` 与 `run_suspended` 并结束本次 run；上层调用者在外部长事务终态后重新调用函数式入口恢复。
 
 第一阶段 Outcome 联合类型建议：
 
@@ -775,7 +806,7 @@ Engine 包根导出建议：
 
 - `ToolExecutionOutcome` 必须是封闭可辨识联合类型，不能用 `status: str` 加任意 payload 逃避类型设计。
 - 第一阶段除 `awaiting` 外不定义其它非终态 outcome；后续治理分支必须经 #4 子 issue 单独确认。
-- Host 恢复 run 时必须提供结构化恢复输入，不依赖旧 Agent/Runner 实例仍然存活。
+- 上层调用者恢复 run 时必须提供结构化恢复输入，不依赖旧 Agent/Runner 实例仍然存活。
 
 ### 14.5 AsyncAgent
 
@@ -888,9 +919,9 @@ Engine 迁移顺序：
 5. 实现函数式入口骨架 `run_agent_messages` / `run_agent_and_wait`，入口内部创建 run-scoped Agent 与 Runner，并只向 Host 暴露 `EngineEvent`。
 6. 实现 Agent 最小 loop：无工具场景下完成 iteration 调度、RunnerEvent 提升、usage 记录、final_answer、失败终态和资源收口。
 7. 实现 completed / failed tool loop：Engine 接收 `tool_schemas` 与 `ToolExecutor` protocol，发出 `ToolExecutionRequest`，接收 `completed` / `failed` outcome，注入下一轮 tool message；不实现 ToolRegistry / ToolRuntime。
-8. awaiting / suspended 主链路已取消当前 Engine 独立实施，转入 issue #4 后续拆子 issue；当前迁移不实现 `tool_awaiting` / `run_suspended` / resume。
+8. 实现 awaiting / suspended 主链路：`ToolAwaitingOutcome` 产出 `tool_awaiting` 与 `run_suspended`，并以结构化 suspended outcome 收口；resume 由上层调用者用新的 `AgentRunRequest` 显式恢复。
 9. 实现取消观察主链路：`AgentRunRequest.cancellation_token` 是 Engine 可见取消入口；Engine 观察取消并产出 `run_cancelled` / `EngineRunOutcomeCancelled`。`CancelRun(session_id, run_id, reason, requested_at)` 只作为 Host API / 进程适配层命令，不进入 Engine 公共 contract。
-10. context overflow / `context_compaction_requested` 后移：当前 Engine 迁移只保留事件契约/概念草案，不实现生产路径、recoverable terminal、Engine 内 compact / retry、conversation memory 或语义压缩；后续 Host 上下文治理实施时再完善 Engine 协作事件。
+10. context overflow 只实现 Engine 事件与 recoverable failure 收口：provider context overflow 产出 `context_compaction_requested`，随后以 `run_failed(context_compaction_required)` 收口；Engine 不实现 Engine 内 compact / retry、conversation memory 或语义压缩。
 11. 清理 processors/tools/web/doc/fins 与 Engine core 的导入关系；`Source`、`DocumentProcessor`、`ProcessorRegistry` 对 Engine / Host 不可见，Engine 只保留协议与事件边界。
 12. 根据实际落地同步 `dayu/engine/README.md`；涉及 Host、fins、capability 的 README 留给对应迁移阶段更新。
 
@@ -900,14 +931,14 @@ Host 接口要求：
 - Host 消费 `AsyncIterator[EngineEvent]`，并自行决定 transcript 持久化、tool trace observer、审计、指标、UI 转发。
 - Host 是 ToolRuntime / ToolRegistry 与工具治理真源；ToolExecutor 由 EngineWorker 替 Host 代持并提供，可以在本地 worker 或远程 worker 内执行；Engine 只依赖协议。
 - Host 外层取消命令映射为 run-local cancellation token；Engine 不持有跨 run cancel registry。
-- Host 未来负责 conversation memory、语义压缩、context overflow 后的消息重构与重新发起 run；如需要 `context_compaction_requested`，由后续 Host 实施时的独立 issue 完善 Engine。
-- Host 未来负责 `await_spec` 的 wait record、monitor、resume；当前 Engine 迁移不产出 awaiting/suspended 事实，相关能力由 issue #4 后续设计。
+- Host 未来负责 conversation memory、语义压缩、context overflow 后的消息重构与重新发起 run；Engine 只提供 `context_compaction_requested` 与 recoverable failure 事实。
+- Host 负责 `await_spec` 的 wait record、monitor、resume；Engine 只产出 awaiting/suspended 事实，不持久化等待记录，也不恢复旧 Agent/Runner 实例。
 - Host 负责 web/doc/fins toolset/capability 装配；财报文档读取仍只能通过 `dayu.fins.storage`。
 
 测试策略：
 
 - 测试代码按 NEW Engine contracts 重写；OLD tests 不迁移为兼容测试，只作为行为证据、场景样本和回归用例来源。
-- 每个迁移切片先建立接口测试，再迁实现；接口测试必须覆盖 Host -> Engine 公共入口、输入类型、输出事件、取消、tool calling 等当前稳定契约。context budget / compaction request 不作为本轮稳定实现契约。
+- 每个迁移切片先建立接口测试，再迁实现；接口测试必须覆盖 Host -> Engine 公共入口、输入类型、输出事件、取消、tool calling 等当前稳定契约。provider context overflow 的 `context_compaction_requested` 与 recoverable failure 是当前 Engine 事实；Host 语义压缩和恢复不属于 Engine 测试范围。
 - 必须建立架构测试，防止边界回退：
   - 若约定 Engine 包根只导出 `run_agent_messages`、`run_agent_and_wait` 和 contract 类型，则导出更多实现类、兼容 wrapper、旧 re-export 时测试必须失败。
   - Engine 不得导入 Host 具体实现、Host ToolRegistry、web/doc/fins tools、`dayu.fins.storage` 具体实现。

@@ -39,6 +39,7 @@ from dayu.contracts import (
     ToolSchema,
 )
 from dayu.engine.contracts import (
+    RUN_SUSPENDED_REASON_TOOL_AWAITING,
     TERMINAL_ENGINE_EVENT_TYPES,
     AgentFallbackMode,
     AgentMessage,
@@ -147,6 +148,7 @@ __all__ = [
     "ProviderRequestExtension",
     "QwenThinkingExtension",
     "ReasoningDeltaData",
+    "RUN_SUSPENDED_REASON_TOOL_AWAITING",
     "RunCancelledData",
     "RunFailedData",
     "RunResumeHint",

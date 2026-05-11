@@ -20,12 +20,14 @@ from dayu.engine.contracts.agent_run import (
     EngineRunOutcomeCancelled,
     EngineRunOutcomeFailed,
     EngineRunOutcomeFinalAnswer,
+    EngineRunOutcomeSuspended,
 )
 from dayu.engine.contracts.engine_events import (
     ContextCompactionRequestedData,
     EngineEvent,
     EngineEventType,
     FinalAnswerData,
+    RUN_SUSPENDED_REASON_TOOL_AWAITING,
     RunCancelledData,
     RunFailedData,
     RunSuspendedData,
@@ -54,6 +56,11 @@ from dayu.engine.contracts.runner_events import (
     RunnerUsageRecordedData,
 )
 from dayu.engine.contracts.runner_spec import RunnerCallOptions, RunnerSpec
+from dayu.contracts.tool_await import (
+    ToolAwaitKind,
+    ToolAwaitSnapshot,
+    ToolAwaitSpec,
+)
 from dayu.contracts.tool_call import ToolCallRequest
 from dayu.contracts.tool_schema import (
     ToolFunctionSchema,
@@ -985,15 +992,25 @@ async def test_run_agent_and_wait_maps_final_failed_cancelled(
 
 
 @pytest.mark.asyncio
-async def test_run_agent_and_wait_rejects_unexpected_suspended(
+async def test_run_agent_and_wait_maps_suspended(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """RUN_SUSPENDED 不是 Phase 2 可用能力，wait 入口防御性失败。"""
+    """run_agent_and_wait 必须把 RUN_SUSPENDED 映射为 suspended outcome。"""
+
+    await_spec = ToolAwaitSpec(
+        await_kind=ToolAwaitKind.EXTERNAL_JOB,
+        deadline=None,
+        resume_token="resume",
+    )
+    snapshot = ToolAwaitSnapshot(
+        snapshot_id="snapshot",
+        captured_at=_utc_now(),
+    )
 
     async def fake_messages(
         request: AgentRunRequest,
     ) -> AsyncIterator[EngineEvent]:
-        """产出意外 suspended terminal。
+        """产出 suspended terminal。
 
         :param request: Agent run 请求。
         :returns: EngineEvent 异步流。
@@ -1005,15 +1022,23 @@ async def test_run_agent_and_wait_rejects_unexpected_suspended(
             session_id=request.session_id,
             run_id=request.run_id,
             type=EngineEventType.RUN_SUSPENDED,
-            data=RunSuspendedData(reason="awaiting", resume_hint=None),
+            data=RunSuspendedData(
+                reason=RUN_SUSPENDED_REASON_TOOL_AWAITING,
+                resume_hint=None,
+                await_spec=await_spec,
+                snapshot=snapshot,
+            ),
             metadata=None,
         )
 
     monkeypatch.setattr(agent_module, "run_agent_messages", fake_messages)
     result = await agent_module.run_agent_and_wait(_request())
 
-    assert isinstance(result, EngineRunOutcomeFailed)
-    assert result.error_code == "unexpected_suspended_in_phase3"
+    assert isinstance(result, EngineRunOutcomeSuspended)
+    assert result.reason == RUN_SUSPENDED_REASON_TOOL_AWAITING
+    assert result.resume_hint is None
+    assert result.await_spec is await_spec
+    assert result.snapshot is snapshot
 
 
 def _terminal_count(events: Sequence[EngineEvent]) -> int:

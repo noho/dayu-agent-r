@@ -47,6 +47,7 @@ from dayu.engine.contracts.agent_run import (
     EngineRunOutcomeCancelled,
     EngineRunOutcomeFailed,
     EngineRunOutcomeFinalAnswer,
+    EngineRunOutcomeSuspended,
 )
 from dayu.engine.contracts.engine_events import (
     ContextCompactionRequestedData,
@@ -59,9 +60,12 @@ from dayu.engine.contracts.engine_events import (
     IterationCompletedData,
     IterationStartedData,
     ProviderProtocolErrorData,
+    RUN_SUSPENDED_REASON_TOOL_AWAITING,
     ReasoningDeltaData,
     RunCancelledData,
     RunFailedData,
+    RunSuspendedData,
+    ToolAwaitingData,
     ToolCallRequestedData,
     ToolResultAcceptedData,
     UsageReportedData,
@@ -108,12 +112,10 @@ _ERROR_RUNNER_ERROR_DONE_WITHOUT_DETAIL: str = (
 _ERROR_CONTEXT_COMPACTION_REQUIRED: str = "context_compaction_required"
 _ERROR_TOOL_CALL_NOT_ENABLED: str = "tool_call_not_enabled"
 _ERROR_MISSING_TERMINAL: str = "missing_terminal"
-_ERROR_UNEXPECTED_SUSPENDED: str = "unexpected_suspended_in_phase3"
 _ERROR_RUNNER_TOOL_CALLS_MISSING: str = "runner_tool_calls_missing"
 _ERROR_RUNNER_TOOL_CALLS_FINISH_REASON_MISMATCH: str = (
     "runner_tool_calls_finish_reason_mismatch"
 )
-_ERROR_TOOL_AWAITING_NOT_SUPPORTED: str = "tool_awaiting_not_supported_in_phase3"
 _ERROR_DUPLICATE_TOOL_CALL_ID: str = "duplicate_tool_call_id"
 _ERROR_TOOL_EXECUTOR_EXCEPTION: str = "tool_executor_exception"
 _ERROR_FORCE_ANSWER_EMPTY: str = "force_answer_empty"
@@ -1353,10 +1355,34 @@ class _AsyncAgent:
                 yield await self._make_cancelled_terminal_with_close()
                 return
             if isinstance(completed_outcome, ToolAwaitingOutcome):
-                self._last_tool_batch_result = RunFailedData(
-                    error_code=_ERROR_TOOL_AWAITING_NOT_SUPPORTED,
-                    message="ToolAwaitingOutcome is not supported in phase3",
-                    recoverable=False,
+                yield self._make_event(
+                    event_type=EngineEventType.TOOL_AWAITING,
+                    data=ToolAwaitingData(
+                        iteration_id=decision.iteration_id,
+                        tool_call_id=call.tool_call_id,
+                        await_spec=completed_outcome.await_spec,
+                        snapshot=completed_outcome.snapshot,
+                    ),
+                    occurred_at=_utc_now(),
+                )
+                _LOGGER.log(
+                    VERBOSE_LOG_LEVEL,
+                    "engine.agent.tool_awaiting session_id=%s run_id=%s "
+                    "iteration_id=%s iteration_index=%s tool_name=%s "
+                    "tool_call_id=%s await_kind=%s",
+                    self._request.session_id,
+                    self._request.run_id,
+                    decision.iteration_id,
+                    decision.iteration_index,
+                    call.name,
+                    call.tool_call_id,
+                    completed_outcome.await_spec.await_kind.value,
+                )
+                if self._is_cancelled():
+                    yield await self._make_cancelled_terminal_with_close()
+                    return
+                yield await self._make_suspended_or_cancelled_terminal_with_close(
+                    completed_outcome
                 )
                 return
             if isinstance(completed_outcome, ToolCompletedOutcome) or isinstance(
@@ -1643,6 +1669,30 @@ class _AsyncAgent:
             return await self._make_cancelled_terminal_with_close()
         return self._make_terminal_failed(failure)
 
+    async def _make_suspended_or_cancelled_terminal_with_close(
+        self, awaiting: ToolAwaitingOutcome
+    ) -> EngineEvent:
+        """按取消优先级构造挂起终态。
+
+        :param awaiting: 工具等待 outcome。
+        :returns: ``RUN_CANCELLED`` 或 ``RUN_SUSPENDED`` terminal。
+        :raises Exception: 不主动抛出异常；Runner close 异常会被吞掉并记日志。
+        """
+
+        if self._is_cancelled():
+            return await self._make_cancelled_terminal_with_close()
+        await self._close_runner_once()
+        if self._is_cancelled():
+            return await self._make_cancelled_terminal_with_close()
+        return self._make_terminal_suspended(
+            RunSuspendedData(
+                reason=RUN_SUSPENDED_REASON_TOOL_AWAITING,
+                resume_hint=None,
+                await_spec=awaiting.await_spec,
+                snapshot=awaiting.snapshot,
+            )
+        )
+
     async def _make_cancelled_terminal_with_close(self) -> EngineEvent:
         """关闭 Runner 后构造取消终态。
 
@@ -1694,6 +1744,19 @@ class _AsyncAgent:
             data=data,
         )
 
+    def _make_terminal_suspended(self, data: RunSuspendedData) -> EngineEvent:
+        """构造唯一 suspended 终态。
+
+        :param data: run suspended data。
+        :returns: terminal EngineEvent。
+        :raises RuntimeError: terminal 已产出时抛出。
+        """
+
+        return self._make_terminal_event(
+            event_type=EngineEventType.RUN_SUSPENDED,
+            data=data,
+        )
+
     def _make_terminal_cancelled(self, data: RunCancelledData) -> EngineEvent:
         """构造唯一 cancelled 终态。
 
@@ -1711,7 +1774,12 @@ class _AsyncAgent:
         self,
         *,
         event_type: EngineEventType,
-        data: FinalAnswerData | RunFailedData | RunCancelledData,
+        data: (
+            FinalAnswerData
+            | RunFailedData
+            | RunSuspendedData
+            | RunCancelledData
+        ),
     ) -> EngineEvent:
         """构造 terminal EngineEvent 并锁定终态。
 
@@ -2062,11 +2130,22 @@ async def run_agent_and_wait(request: AgentRunRequest) -> AgentRunResult:
             accepted_at=data.accepted_at,
             finished_at=data.finished_at,
         )
+    if terminal.type is EngineEventType.RUN_SUSPENDED and isinstance(
+        data, RunSuspendedData
+    ):
+        return EngineRunOutcomeSuspended(
+            session_id=terminal.session_id,
+            run_id=terminal.run_id,
+            reason=data.reason,
+            resume_hint=data.resume_hint,
+            await_spec=data.await_spec,
+            snapshot=data.snapshot,
+        )
     return EngineRunOutcomeFailed(
         session_id=request.session_id,
         run_id=request.run_id,
-        error_code=_ERROR_UNEXPECTED_SUSPENDED,
-        message="run_suspended is not supported by phase3 agent run loop",
+        error_code=_ERROR_MISSING_TERMINAL,
+        message=_MISSING_TERMINAL_MESSAGE,
         recoverable=False,
     )
 

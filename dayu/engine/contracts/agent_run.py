@@ -22,6 +22,7 @@ from dayu.contracts.cancellation import CancellationToken
 from dayu.engine.contracts.finish_reason import FinishReason
 from dayu.engine.contracts.messages import AgentMessage
 from dayu.engine.contracts.runner_spec import RunnerCallOptions, RunnerSpec
+from dayu.contracts.tool_await import ToolAwaitSnapshot, ToolAwaitSpec
 from dayu.contracts.tool_executor import ToolExecutor
 from dayu.contracts.tool_schema import ToolSchema
 
@@ -151,12 +152,16 @@ class EngineRunOutcomeSuspended:
     :param run_id: 运行 id。
     :param reason: 挂起原因。
     :param resume_hint: 可选恢复提示。
+    :param await_spec: 工具等待规约。
+    :param snapshot: 工具等待时点快照；无快照时为 ``None``。
     """
 
     session_id: str
     run_id: str
     reason: str
     resume_hint: RunResumeHint | None
+    await_spec: ToolAwaitSpec
+    snapshot: ToolAwaitSnapshot | None
 
 
 AgentRunResult: TypeAlias = (

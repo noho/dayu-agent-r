@@ -125,3 +125,23 @@ def test_engine_event_required_fields_have_no_default() -> None:
         assert f.default_factory is dataclasses.MISSING, (
             f"field {f.name} has default_factory"
         )
+
+
+def test_tool_awaiting_and_suspended_data_fields_are_locked() -> None:
+    """等待与挂起 data 必须携带恢复所需机器可读事实。"""
+
+    awaiting_fields = {f.name for f in dataclasses.fields(ToolAwaitingData)}
+    suspended_fields = {f.name for f in dataclasses.fields(RunSuspendedData)}
+
+    assert awaiting_fields == {
+        "iteration_id",
+        "tool_call_id",
+        "await_spec",
+        "snapshot",
+    }
+    assert suspended_fields == {
+        "reason",
+        "resume_hint",
+        "await_spec",
+        "snapshot",
+    }

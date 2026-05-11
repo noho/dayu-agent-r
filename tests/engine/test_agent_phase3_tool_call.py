@@ -34,7 +34,10 @@ from dayu.engine.contracts.engine_events import (
     EngineEvent,
     EngineEventType,
     FinalAnswerData,
+    RUN_SUSPENDED_REASON_TOOL_AWAITING,
     RunFailedData,
+    RunSuspendedData,
+    ToolAwaitingData,
     ToolCallRequestedData,
     ToolResultAcceptedData,
 )
@@ -58,7 +61,11 @@ from dayu.engine.contracts.runner_events import (
 )
 from dayu.engine.contracts.runner_spec import RunnerCallOptions, RunnerSpec
 from dayu.engine.runners.openai.non_stream_parser import parse_non_stream_response
-from dayu.contracts.tool_await import ToolAwaitKind, ToolAwaitSpec
+from dayu.contracts.tool_await import (
+    ToolAwaitKind,
+    ToolAwaitSnapshot,
+    ToolAwaitSpec,
+)
 from dayu.contracts.tool_schema import (
     ToolFunctionSchema,
     ToolParametersSchema,
@@ -462,6 +469,29 @@ def _failed(hint: str | None = None) -> ToolFailedOutcome:
     )
 
 
+def _awaiting(
+    *,
+    resume_token: str = "resume",
+    snapshot: ToolAwaitSnapshot | None = None,
+) -> ToolAwaitingOutcome:
+    """构造等待 outcome。
+
+    :param resume_token: 恢复 token。
+    :param snapshot: 可选等待快照。
+    :returns: ToolAwaitingOutcome。
+    :raises Exception: 不主动抛出异常。
+    """
+
+    return ToolAwaitingOutcome(
+        await_spec=ToolAwaitSpec(
+            await_kind=ToolAwaitKind.EXTERNAL_JOB,
+            deadline=None,
+            resume_token=resume_token,
+        ),
+        snapshot=snapshot,
+    )
+
+
 def _request(
     *,
     token: _Token | None = None,
@@ -577,6 +607,19 @@ def _failed_data(events: Sequence[EngineEvent]) -> RunFailedData:
 
     data = _terminal(events).data
     assert isinstance(data, RunFailedData)
+    return data
+
+
+def _suspended_data(events: Sequence[EngineEvent]) -> RunSuspendedData:
+    """返回 terminal run_suspended data。
+
+    :param events: EngineEvent 序列。
+    :returns: RunSuspendedData。
+    :raises AssertionError: terminal 不是 run_suspended 时抛出。
+    """
+
+    data = _terminal(events).data
+    assert isinstance(data, RunSuspendedData)
     return data
 
 
@@ -1067,30 +1110,111 @@ async def test_verbose_logs_engine_main_path_without_tool_payloads(
 
 
 @pytest.mark.asyncio
-async def test_awaiting_duplicate_and_executor_exception_paths() -> None:
-    """awaiting、duplicate、executor exception 均有明确 Phase 3 收口。"""
+async def test_tool_awaiting_suspends_run_without_next_tool_injection() -> None:
+    """awaiting outcome 必须产出 tool_awaiting 与 run_suspended。"""
 
-    awaiting_executor = _RecordingToolExecutor(
-        outcomes={
-            "tc_1": ToolAwaitingOutcome(
-                await_spec=ToolAwaitSpec(
-                    await_kind=ToolAwaitKind.EXTERNAL_JOB,
-                    deadline=None,
-                    resume_token="resume",
-                ),
-                snapshot=None,
-            )
-        }
+    snapshot = ToolAwaitSnapshot(
+        snapshot_id="snapshot-1",
+        captured_at=_utc_now(),
     )
+    awaiting = _awaiting(resume_token="resume-1", snapshot=snapshot)
+    awaiting_executor = _RecordingToolExecutor(outcomes={"tc_1": awaiting})
+    runner = _ScriptedRunner(
+        scripts=(
+            _tool_script(_tool_call("tc_1")),
+            _final_script("should-not-run"),
+        )
+    )
+
     awaiting_events = await _collect(
         _AsyncAgent(
             request=_request(executor=awaiting_executor),
+            runner=runner,
+        )
+    )
+
+    terminal = _terminal(awaiting_events)
+    awaiting_events_only = [
+        event
+        for event in awaiting_events
+        if event.type is EngineEventType.TOOL_AWAITING
+    ]
+    accepted_events = [
+        event
+        for event in awaiting_events
+        if event.type is EngineEventType.TOOL_RESULT_ACCEPTED
+    ]
+    assert terminal.type is EngineEventType.RUN_SUSPENDED
+    assert len(awaiting_events_only) == 1
+    assert accepted_events == []
+    assert isinstance(awaiting_events_only[0].data, ToolAwaitingData)
+    assert awaiting_events_only[0].data.iteration_id == "run_phase3_iteration_1"
+    assert awaiting_events_only[0].data.tool_call_id == "tc_1"
+    assert awaiting_events_only[0].data.await_spec is awaiting.await_spec
+    assert awaiting_events_only[0].data.snapshot is snapshot
+
+    suspended = _suspended_data(awaiting_events)
+    assert suspended.reason == RUN_SUSPENDED_REASON_TOOL_AWAITING
+    assert suspended.resume_hint is None
+    assert suspended.await_spec is awaiting.await_spec
+    assert suspended.snapshot is snapshot
+    assert len(awaiting_executor.requests) == 1
+    assert runner.call_count == 1
+    assert runner.close_count == 1
+    assert len(runner.messages_seen) == 1
+
+
+@pytest.mark.asyncio
+async def test_awaiting_cancellation_priority_before_and_after_event() -> None:
+    """取消命中时必须优先 run_cancelled，不伪装成 suspended。"""
+
+    token_before = _Token()
+    before_executor = _RecordingToolExecutor(
+        outcomes={"tc_1": _awaiting()},
+        token_to_cancel=token_before,
+    )
+    before_events = await _collect(
+        _AsyncAgent(
+            request=_request(token=token_before, executor=before_executor),
             runner=_ScriptedRunner(scripts=(_tool_script(_tool_call("tc_1")),)),
         )
     )
-    assert _failed_data(awaiting_events).error_code == (
-        "tool_awaiting_not_supported_in_phase3"
+
+    assert _terminal(before_events).type is EngineEventType.RUN_CANCELLED
+    assert [
+        event
+        for event in before_events
+        if event.type is EngineEventType.TOOL_AWAITING
+    ] == []
+
+    token_after = _Token()
+    after_executor = _RecordingToolExecutor(outcomes={"tc_1": _awaiting()})
+    after_agent = _AsyncAgent(
+        request=_request(token=token_after, executor=after_executor),
+        runner=_ScriptedRunner(scripts=(_tool_script(_tool_call("tc_1")),)),
     )
+    after_events: list[EngineEvent] = []
+    async for event in after_agent.run_messages():
+        after_events.append(event)
+        if event.type is EngineEventType.TOOL_AWAITING:
+            token_after.trigger("after_awaiting")
+
+    assert _terminal(after_events).type is EngineEventType.RUN_CANCELLED
+    assert [
+        event.type for event in after_events
+        if event.type
+        in {EngineEventType.TOOL_AWAITING, EngineEventType.RUN_CANCELLED}
+    ] == [EngineEventType.TOOL_AWAITING, EngineEventType.RUN_CANCELLED]
+    assert [
+        event
+        for event in after_events
+        if event.type is EngineEventType.RUN_SUSPENDED
+    ] == []
+
+
+@pytest.mark.asyncio
+async def test_duplicate_and_executor_exception_paths() -> None:
+    """duplicate、executor exception 均有明确收口。"""
 
     duplicate_executor = _RecordingToolExecutor(
         outcomes={"tc_1": _success(1)}
