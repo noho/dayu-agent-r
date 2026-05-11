@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+from collections.abc import Mapping
 from dataclasses import dataclass
 from datetime import datetime, timezone
 import pytest
@@ -30,7 +31,21 @@ from dayu.host import (
 from dayu.host.contracts import RunEventDraft
 from dayu.host._event_store import InMemoryRunEventStore
 from dayu.host._framework_tools import FRAMEWORK_FETCH_MORE_NAME
+from dayu.host._tool_result_truncation import extract_truncation_hint
 from dayu.host._tool_runtime import HostToolRuntime
+
+
+def _content_value(value: JsonValue) -> JsonValue:
+    """读取非 object 工具值被截断后的 ``content`` 包装。
+
+    :param value: 工具成功结果值。
+    :returns: ``content`` 字段或原值。
+    :raises Exception: 不主动抛出异常。
+    """
+
+    if isinstance(value, Mapping) and "content" in value:
+        return value["content"]
+    return value
 
 
 @dataclass(frozen=True, slots=True)
@@ -74,7 +89,6 @@ class _Executor:
             result=ToolResultSuccess(
                 ok=True,
                 value=self.value,
-                truncation=None,
                 meta=None,
             )
         )
@@ -225,8 +239,9 @@ async def test_runtime_truncation_does_not_append_special_eventlog_facts() -> No
 
     outcome = await runtime.execute_tool_call(_request())
     assert isinstance(outcome, ToolCompletedOutcome)
-    assert outcome.result.truncation is not None
-    assert outcome.result.truncation.cursor == "cursor-eventlog"
+    truncation = extract_truncation_hint(outcome.result.value)
+    assert truncation is not None
+    assert truncation.cursor == "cursor-eventlog"
 
     events = await store.list_events("run_1", after=None)
     assert events == ()
@@ -239,7 +254,7 @@ async def test_fetch_more_returns_ordinary_completed_outcome_without_special_fac
     runtime, store = _runtime()
     outcome = await runtime.execute_tool_call(_request())
     assert isinstance(outcome, ToolCompletedOutcome)
-    truncation = outcome.result.truncation
+    truncation = extract_truncation_hint(outcome.result.value)
     assert truncation is not None
 
     fetch_outcome = await runtime.execute_tool_call(
@@ -251,8 +266,8 @@ async def test_fetch_more_returns_ordinary_completed_outcome_without_special_fac
     )
 
     assert isinstance(fetch_outcome, ToolCompletedOutcome)
-    assert fetch_outcome.result.value == [3]
-    assert fetch_outcome.result.truncation is not None
+    assert _content_value(fetch_outcome.result.value) == [3]
+    assert extract_truncation_hint(fetch_outcome.result.value) is not None
     events = await store.list_events("run_1", after=None)
     assert events == ()
 
@@ -264,7 +279,7 @@ async def test_denied_fetch_more_returns_failed_outcome_without_special_facts() 
     runtime, store = _runtime()
     outcome = await runtime.execute_tool_call(_request())
     assert isinstance(outcome, ToolCompletedOutcome)
-    truncation = outcome.result.truncation
+    truncation = extract_truncation_hint(outcome.result.value)
     assert truncation is not None
 
     fetch_outcome = await runtime.execute_tool_call(
@@ -286,7 +301,7 @@ async def test_cross_run_fetch_more_returns_failure_without_polluting_claimed_ru
     runtime, store = _runtime()
     outcome = await runtime.execute_tool_call(_request())
     assert isinstance(outcome, ToolCompletedOutcome)
-    truncation = outcome.result.truncation
+    truncation = extract_truncation_hint(outcome.result.value)
     assert truncation is not None
 
     denied = await runtime.execute_tool_call(
@@ -320,7 +335,7 @@ async def test_expired_cursor_returns_failure_without_special_fact() -> None:
     )
     outcome = await runtime.execute_tool_call(_request())
     assert isinstance(outcome, ToolCompletedOutcome)
-    truncation = outcome.result.truncation
+    truncation = extract_truncation_hint(outcome.result.value)
     assert truncation is not None
     clock.now = 131.0
 
@@ -343,7 +358,7 @@ async def test_terminal_run_fetch_more_returns_failure_without_new_event() -> No
     runtime, store = _runtime()
     outcome = await runtime.execute_tool_call(_request())
     assert isinstance(outcome, ToolCompletedOutcome)
-    truncation = outcome.result.truncation
+    truncation = extract_truncation_hint(outcome.result.value)
     assert truncation is not None
     await store.append(
         RunEventDraft(

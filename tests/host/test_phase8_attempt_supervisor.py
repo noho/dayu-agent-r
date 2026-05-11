@@ -2057,7 +2057,7 @@ def _noop_tool_runtime(
             del request
             return ToolCompletedOutcome(
                 result=ToolResultSuccess(
-                    ok=True, value=None, truncation=None, meta=None
+                    ok=True, value=None, meta=None
                 )
             )
 

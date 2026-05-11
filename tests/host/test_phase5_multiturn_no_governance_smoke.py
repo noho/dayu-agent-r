@@ -52,6 +52,7 @@ from dayu.contracts.tool_outcome import ToolCompletedOutcome, ToolFailedOutcome
 from dayu.host.contracts import HostContextCompactCompletedData
 from dayu.host._framework_tools import FRAMEWORK_FETCH_MORE_NAME
 from dayu.host._run_harness import LocalRunHarness
+from dayu.host._tool_result_truncation import extract_truncation_hint
 from dayu.runtime.log_levels import VERBOSE_LOG_LEVEL
 from utils.smoke_host_multiturn_no_governance import (
     HUGE_ECHO_DEFINITION,
@@ -545,9 +546,12 @@ async def test_phase5_sequential_multiturn_stitches_eventlog_toolruntime_memory(
         first_events, tool_name=FRAMEWORK_FETCH_MORE_NAME
     )
     assert isinstance(fetch_completed.outcome, ToolCompletedOutcome)
-    assert fetch_completed.outcome.result.truncation is not None
-    next_cursor_value = fetch_completed.outcome.result.truncation.cursor
-    next_scope_token = fetch_completed.outcome.result.truncation.scope_token
+    next_truncation = extract_truncation_hint(
+        fetch_completed.outcome.result.value
+    )
+    assert next_truncation is not None
+    next_cursor_value = next_truncation.cursor
+    next_scope_token = next_truncation.scope_token
     runtime = harness.tool_runtime
     assert runtime is not None
     terminal = await _wait_succeeded(harness, _RUN_1)

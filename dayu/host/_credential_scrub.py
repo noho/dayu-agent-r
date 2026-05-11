@@ -102,7 +102,6 @@ def scrub_tool_execution_outcome(
             result=ToolResultSuccess(
                 ok=True,
                 value=scrub_explicit_credentials(result.value),
-                truncation=result.truncation,
                 meta=result.meta,
             )
         )

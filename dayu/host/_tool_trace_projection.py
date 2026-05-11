@@ -72,6 +72,7 @@ from dayu.host._tool_trace_jsonl_sink import (
     compute_idempotency_key,
     now_iso,
 )
+from dayu.host._tool_result_truncation import extract_truncation_hint
 from dayu.host.contracts import (
     RunEventKind,
     RunEventSource,
@@ -654,7 +655,7 @@ def _summarize_truncation(
 
     if not isinstance(outcome, ToolCompletedOutcome):
         return (None, None, None, None)
-    truncation = outcome.result.truncation
+    truncation = extract_truncation_hint(outcome.result.value)
     if truncation is None:
         return (None, None, None, None)
     return (

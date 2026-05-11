@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import ast
 import json
+from collections.abc import Mapping
 from dataclasses import dataclass
 from datetime import datetime
 from pathlib import Path
@@ -16,7 +17,6 @@ import dayu.host.contracts as host_contracts
 from dayu.contracts import (
     JsonValue,
     ToolTruncateSpec,
-    ToolTruncationInfo,
 )
 from dayu.contracts.tool_call import (
     ToolCallRequest,
@@ -31,7 +31,21 @@ from dayu.contracts.tool_outcome import (
 from dayu.contracts.tool_result import ToolResultSuccess
 from dayu.host._event_store import InMemoryRunEventStore
 from dayu.host._framework_tools import FRAMEWORK_FETCH_MORE_NAME
+from dayu.host._tool_result_truncation import extract_truncation_hint
 from dayu.host._tool_runtime import HostToolRuntime
+
+
+def _content_value(value: JsonValue) -> JsonValue:
+    """读取非 object 工具值被截断后的 ``content`` 包装。
+
+    :param value: 工具成功结果值。
+    :returns: ``content`` 字段或原值。
+    :raises Exception: 不主动抛出异常。
+    """
+
+    if isinstance(value, Mapping) and "content" in value:
+        return value["content"]
+    return value
 
 
 @dataclass(frozen=True, slots=True)
@@ -75,7 +89,6 @@ class _Executor:
             result=ToolResultSuccess(
                 ok=True,
                 value=self.value,
-                truncation=None,
                 meta=None,
             )
         )
@@ -256,13 +269,13 @@ def test_engine_does_not_import_host_or_tool_runtime() -> None:
 
 
 @pytest.mark.asyncio
-async def test_scope_token_delivered_via_outcome_truncation_not_special_eventlog() -> None:
-    """scope token 只经普通 outcome.truncation 暴露给模型。"""
+async def test_scope_token_delivered_via_ordinary_payload_not_special_eventlog() -> None:
+    """scope token 只经普通工具结果 payload 暴露给模型。"""
 
     runtime, store = _runtime()
     outcome = await runtime.execute_tool_call(_request())
     assert isinstance(outcome, ToolCompletedOutcome)
-    truncation = outcome.result.truncation
+    truncation = extract_truncation_hint(outcome.result.value)
     assert truncation is not None
     assert truncation.scope_token
 
@@ -276,7 +289,7 @@ async def test_scope_token_delivered_via_outcome_truncation_not_special_eventlog
         )
     )
     assert isinstance(fetch_outcome, ToolCompletedOutcome)
-    assert fetch_outcome.result.value == [2]
+    assert _content_value(fetch_outcome.result.value) == [2]
 
 
 @pytest.mark.asyncio
@@ -286,7 +299,7 @@ async def test_scope_binding_rejects_cross_session_or_run() -> None:
     runtime, store = _runtime()
     outcome = await runtime.execute_tool_call(_request())
     assert isinstance(outcome, ToolCompletedOutcome)
-    truncation = outcome.result.truncation
+    truncation = extract_truncation_hint(outcome.result.value)
     assert truncation is not None
 
     for session_id, run_id in (
@@ -315,7 +328,7 @@ async def test_cross_run_fetch_more_does_not_pollute_claimed_run() -> None:
     runtime, store = _runtime()
     outcome = await runtime.execute_tool_call(_request())
     assert isinstance(outcome, ToolCompletedOutcome)
-    truncation = outcome.result.truncation
+    truncation = extract_truncation_hint(outcome.result.value)
     assert truncation is not None
 
     denied = await runtime.execute_tool_call(
@@ -343,15 +356,18 @@ def test_engine_tool_projection_includes_llm_fetch_more_hint() -> None:
         ToolCompletedOutcome(
             result=ToolResultSuccess(
                 ok=True,
-                value={"preview": "abc"},
-                truncation=ToolTruncationInfo(
-                    cursor="cursor-value",
-                    scope_token="secret-token",
-                    scope_hash="secret-hash",
-                    has_more=True,
-                    limit=None,
-                    ttl_seconds=30,
-                ),
+                value={
+                    "preview": "abc",
+                    "truncation": {
+                        "fetch_more_args": {
+                            "cursor": "cursor-value",
+                            "scope_token": "secret-token",
+                        },
+                        "has_more": True,
+                        "next_action": "fetch_more",
+                        "ttl_seconds": 30,
+                    },
+                },
                 meta=None,
             )
         )

@@ -11,8 +11,7 @@
 - :class:`ToolCallRequest` / :class:`ToolExecutionContext` /
   :class:`ToolExecutionRequest`。
 - :class:`ToolResultSuccess` / :class:`ToolResultFailure` /
-  :data:`ToolResultEnvelope` / :class:`ToolTruncationInfo` /
-  :class:`ToolResultMeta`。
+  :data:`ToolResultEnvelope` / :class:`ToolResultMeta`。
 - :class:`ToolAwaitKind` / :class:`ToolAwaitSpec` /
   :class:`ToolAwaitSnapshot`。
 - :class:`ToolCompletedOutcome` / :class:`ToolFailedOutcome` /
@@ -62,7 +61,6 @@ from dayu.contracts.tool_result import (
     ToolResultFailure,
     ToolResultMeta,
     ToolResultSuccess,
-    ToolTruncationInfo,
 )
 from dayu.contracts.tool_schema import (
     ToolFunctionSchema,
@@ -101,7 +99,6 @@ __all__ = [
     "ToolResultSuccess",
     "ToolSchema",
     "ToolTruncateSpec",
-    "ToolTruncationInfo",
     "ToolTruncationStrategy",
     "tool",
 ]

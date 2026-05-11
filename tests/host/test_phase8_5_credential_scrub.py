@@ -107,7 +107,6 @@ def test_scrub_tool_execution_outcome_scrubs_success_and_failure_text() -> None:
             result=ToolResultSuccess(
                 ok=True,
                 value={"password": "pw", "scope_token": "scope"},
-                truncation=None,
                 meta=None,
             )
         )

@@ -38,7 +38,6 @@ EXPECTED_EXPORTS: frozenset[str] = frozenset(
         "ToolResultSuccess",
         "ToolSchema",
         "ToolTruncateSpec",
-        "ToolTruncationInfo",
         "ToolTruncationStrategy",
         "FunctionToolExecutor",
         "tool",
@@ -46,7 +45,9 @@ EXPECTED_EXPORTS: frozenset[str] = frozenset(
 )
 
 
-FORBIDDEN_EXPORTS: frozenset[str] = frozenset({"CancelledError"})
+FORBIDDEN_EXPORTS: frozenset[str] = frozenset(
+    {"CancelledError", "ToolTruncationInfo"}
+)
 
 
 def test_contracts_all_matches_expected_set() -> None:

@@ -103,7 +103,8 @@ Host 当前 Run harness、RunEventStore、ToolRuntime、Conversation Memory / Ru
   explicit target only、field_path 优先级、路径不匹配不截断、非成功 outcome 不创建 cursor、single-use、
   并发 single-use、TTL expired、opportunistic cleanup、limit clamp、未知 strategy fail closed、
   apply / fetch_more 共享状态锁与策略 / data 类型不匹配；截断状态由
-  Host 私有 `RuntimeTruncateManager` 持有，不产生专用 truncation / cursor RunEvent。
+  Host 私有 `RuntimeTruncateManager` 持有，并把 LLM-facing hint 注入普通 `ToolResultSuccess.value`，
+  不产生专用 truncation / cursor RunEvent 或 public truncation contract。
 - credential scrub：覆盖显式 API key、Authorization、x-api-key、cookie、client secret、private key、
   password 等字段 / 字符串 header 清洗，并锁定 cursor、scope_token、普通 token、anthropic-version、
   openai-organization 不被误清洗。
@@ -118,7 +119,7 @@ Host 当前 Run harness、RunEventStore、ToolRuntime、Conversation Memory / Ru
   从 EventLog 投影，preview / reasoning / delta 不进入 memory，assistant final answer 不自动成为 verified claim，
   memory item 携带 provenance / trust / scope 元数据，`USER_INPUT_ACCEPTED` scope 使用封闭枚举并非法 fail fast，
   非 SESSION scope clear patch fail fast，不同 session 不串 memory；truncation 结构化字段只保存安全 cursor
-  fingerprint 与 has_more，不保存 raw cursor / scope_token。
+  fingerprint 与 has_more，summary 不保存 raw cursor / scope_token / 可复用 `fetch_more_args`。
 - RunInputBuilder：覆盖 memory block 顺序、tool facts / evidence anchors 与 assistant history 分离、
   tool facts 独立 section、source event cursor 输出、recent raw turns 单 section header、pinned state 预算外全量注入、
   older pool 新到旧消费预算后按时间顺序渲染、internal-only `RunInputBuildTrace`、预算裁剪原因、
@@ -136,7 +137,7 @@ Host 当前 Run harness、RunEventStore、ToolRuntime、Conversation Memory / Ru
 - P5 no-full-governance smoke：覆盖公共 `huge_echo` 工具通过 `ToolDefinition` / `ToolBundle` 声明、
   fake provider 只模拟 LLM tool call output、真实 Engine Agent tool loop 调用 `ToolExecutor.execute`、
   `ToolRuntimeToolExecutor -> HostToolRuntime -> huge_echo executor` 返回普通截断 tool outcome、
-  截断 ToolMessage 包含 LLM-readable `truncation.next_action="fetch_more"` 与 `fetch_more_args`、模型在同一 run
+  Host 注入的普通 ToolMessage value 包含 LLM-readable `truncation.next_action="fetch_more"` 与 `fetch_more_args`、模型在同一 run
   内通过 Engine tool loop 发起 framework `fetch_more`、Host ToolRuntime 路由 framework 补读并返回普通 tool outcome、
   terminal 后 framework `fetch_more` 工具调用返回普通 failed outcome 不追加专用 EventLog、
   后续 Run 的 RunInputBuilder 看到 previous run user / final / ordinary tool facts 与 source cursor，

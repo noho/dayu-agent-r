@@ -97,7 +97,6 @@ EXPECTED_EXPORTS: frozenset[str] = frozenset(
         "ToolResultMeta",
         "ToolResultSuccess",
         "ToolSchema",
-        "ToolTruncationInfo",
         "UserMessage",
     }
 )
@@ -114,6 +113,7 @@ FORBIDDEN_EXPORTS: frozenset[str] = frozenset(
         "ToolTraceRecorder",
         "JsonlToolTraceStore",
         "CancelledError",
+        "ToolTruncationInfo",
     }
 )
 

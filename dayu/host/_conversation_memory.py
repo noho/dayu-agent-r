@@ -9,11 +9,13 @@ from __future__ import annotations
 
 import logging
 import hashlib
+from collections.abc import Mapping
 from dataclasses import dataclass, replace
 from datetime import datetime
 from enum import StrEnum
 from typing import Protocol, TypeAlias
 
+from dayu.contracts import JsonValue
 from dayu.contracts.tool_outcome import (
     ToolCompletedOutcome,
     ToolFailedOutcome,
@@ -21,6 +23,10 @@ from dayu.contracts.tool_outcome import (
 from dayu.engine import FinalAnswerData, ToolResultAcceptedData
 from dayu.engine.contracts.engine_events import RunFailedData
 from dayu.host._text import truncate_text
+from dayu.host._tool_result_truncation import (
+    TRUNCATION_FIELD,
+    extract_truncation_hint,
+)
 from dayu.host.contracts import (
     HostRunFailedData,
     RunEvent,
@@ -633,7 +639,7 @@ def _tool_fact_truncation_fields(
     outcome = data.outcome
     if not isinstance(outcome, ToolCompletedOutcome):
         return None, None
-    truncation = outcome.result.truncation
+    truncation = extract_truncation_hint(outcome.result.value)
     if truncation is None:
         return None, None
     return _fingerprint_text(truncation.cursor), truncation.has_more
@@ -649,15 +655,15 @@ def _summarize_tool_result(data: ToolResultAcceptedData) -> str:
 
     outcome = data.outcome
     if isinstance(outcome, ToolCompletedOutcome):
-        value_text = repr(outcome.result.value)
-        truncation = outcome.result.truncation
+        value_text = repr(_memory_safe_tool_value(outcome.result.value))
+        truncation = extract_truncation_hint(outcome.result.value)
         if truncation is not None:
             return truncate_text(
                 text=(
                     f"工具结果已接纳：value={value_text}; truncated=true; "
                     f"has_more={truncation.has_more}; limit={truncation.limit}; "
                     f"ttl_seconds={truncation.ttl_seconds}; "
-                    f"scope_hash={truncation.scope_hash}"
+                    f"cursor_fingerprint={_fingerprint_text(truncation.cursor)}"
                 ),
                 limit=_TOOL_FACT_SUMMARY_LIMIT,
             )
@@ -671,6 +677,35 @@ def _summarize_tool_result(data: ToolResultAcceptedData) -> str:
             limit=_TOOL_FACT_SUMMARY_LIMIT,
         )
     return "工具结果已接纳"
+
+
+def _memory_safe_tool_value(value: JsonValue) -> JsonValue:
+    """移除普通工具结果中可复用的补读凭证。
+
+    :param value: 工具成功结果值。
+    :returns: 可进入 memory 摘要的安全值，保留 ``has_more`` 与 cursor
+        指纹，不保留 raw cursor、raw scope token 或 ``fetch_more_args``。
+    :raises Exception: 不主动抛出异常。
+    """
+
+    truncation = extract_truncation_hint(value)
+    if truncation is None:
+        return value
+    if not isinstance(value, Mapping):
+        return value
+    safe_value: dict[str, JsonValue] = {
+        key: item for key, item in value.items() if key != TRUNCATION_FIELD
+    }
+    safe_truncation: dict[str, JsonValue] = {
+        "has_more": truncation.has_more,
+        "cursor_fingerprint": _fingerprint_text(truncation.cursor),
+    }
+    if truncation.limit is not None:
+        safe_truncation["limit"] = truncation.limit
+    if truncation.ttl_seconds is not None:
+        safe_truncation["ttl_seconds"] = truncation.ttl_seconds
+    safe_value[TRUNCATION_FIELD] = safe_truncation
+    return safe_value
 
 
 def _fingerprint_text(value: str) -> str:

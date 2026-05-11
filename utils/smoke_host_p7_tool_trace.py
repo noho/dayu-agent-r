@@ -62,7 +62,6 @@ from dayu.contracts import (  # noqa: E402
     CancellationToken,
     ToolCompletedOutcome,
     ToolResultSuccess,
-    ToolTruncationInfo,
 )
 from dayu.engine import (  # noqa: E402
     AgentMessageRole,
@@ -278,15 +277,19 @@ def _build_engine_events() -> tuple[EngineEvent, ...]:
             outcome=ToolCompletedOutcome(
                 result=ToolResultSuccess(
                     ok=True,
-                    value={"summary": "large doc..."},
-                    truncation=ToolTruncationInfo(
-                        cursor="cur-A",
-                        scope_token="st-1",
-                        scope_hash="sh-1",
-                        has_more=True,
-                        limit=10,
-                        ttl_seconds=60,
-                    ),
+                    value={
+                        "summary": "large doc...",
+                        "truncation": {
+                            "fetch_more_args": {
+                                "cursor": "cur-A",
+                                "limit": 10,
+                                "scope_token": "st-1",
+                            },
+                            "has_more": True,
+                            "next_action": "fetch_more",
+                            "ttl_seconds": 60,
+                        },
+                    },
                     meta=None,
                 )
             ),

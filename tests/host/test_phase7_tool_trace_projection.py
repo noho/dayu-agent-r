@@ -30,7 +30,6 @@ from dayu.contracts.tool_outcome import ToolCompletedOutcome, ToolFailedOutcome
 from dayu.contracts.tool_result import (
     ToolResultFailure,
     ToolResultSuccess,
-    ToolTruncationInfo,
 )
 from dayu.engine import (
     FinalAnswerData,
@@ -125,7 +124,6 @@ def _completed_outcome() -> ToolCompletedOutcome:
         result=ToolResultSuccess(
             ok=cast(Literal[True], True),
             value={"v": 1},
-            truncation=None,
             meta=None,
         )
     )
@@ -250,7 +248,6 @@ async def test_tool_call_trace_scrubs_credentials_and_retains_capabilities(
                         "scope_token": "scope-result",
                         "token": "ordinary-result-token",
                     },
-                    truncation=None,
                     meta=None,
                 )
             ),
@@ -854,15 +851,19 @@ async def test_tool_call_truncation_payload_pairs_into_record(tmp_path: Path) ->
             outcome=ToolCompletedOutcome(
                 result=ToolResultSuccess(
                     ok=True,
-                    value={"preview": "abc"},
-                    truncation=ToolTruncationInfo(
-                        cursor="cursor-abc",
-                        scope_token="scope-token",
-                        scope_hash="scope-hash",
-                        has_more=True,
-                        limit=10,
-                        ttl_seconds=60,
-                    ),
+                    value={
+                        "preview": "abc",
+                        "truncation": {
+                            "fetch_more_args": {
+                                "cursor": "cursor-abc",
+                                "limit": 10,
+                                "scope_token": "scope-token",
+                            },
+                            "has_more": True,
+                            "next_action": "fetch_more",
+                            "ttl_seconds": 60,
+                        },
+                    },
                     meta=None,
                 )
             ),

@@ -39,7 +39,6 @@ from dayu.contracts.tool_result import (
     ToolResultFailure,
     ToolResultMeta,
     ToolResultSuccess,
-    ToolTruncationInfo,
 )
 from dayu.engine.contracts.agent_run import ContextBudgetSnapshot, RunResumeHint
 from dayu.engine.contracts.engine_events import (
@@ -96,6 +95,7 @@ _ERROR_INVALID_USER_INPUT_SCOPE: str = "invalid_user_input_scope"
 _ERROR_INVALID_FAILURE_REASON: str = "invalid_context_compact_failure_reason"
 _ERROR_INVALID_OUTCOME_TYPE: str = "invalid_tool_outcome_type"
 _ERROR_INVALID_PROVIDER_STATE: str = "invalid_tool_call_provider_state"
+_RESULT_SUCCESS_TOP_LEVEL_TRUNCATION_KEY: str = "truncation"
 
 
 _PayloadFields: TypeAlias = Mapping[str, JsonValue]
@@ -782,23 +782,10 @@ def _encode_result_success(result: ToolResultSuccess) -> Mapping[str, JsonValue]
     :raises Exception: 不主动抛出异常。
     """
 
-    truncation = result.truncation
     meta = result.meta
     return {
         "ok": True,
         "value": result.value,
-        "truncation": (
-            None
-            if truncation is None
-            else {
-                "cursor": truncation.cursor,
-                "scope_token": truncation.scope_token,
-                "scope_hash": truncation.scope_hash,
-                "has_more": truncation.has_more,
-                "limit": truncation.limit,
-                "ttl_seconds": truncation.ttl_seconds,
-            }
-        ),
         "meta": (
             None
             if meta is None
@@ -821,18 +808,10 @@ def _decode_result_success(value: JsonValue) -> ToolResultSuccess:
 
     if not isinstance(value, dict):
         raise ValueError(_ERROR_INVALID_OUTCOME_TYPE)
-    truncation_payload = value.get("truncation")
-    truncation: ToolTruncationInfo | None = None
-    if truncation_payload is not None:
-        if not isinstance(truncation_payload, dict):
-            raise ValueError(_ERROR_INVALID_OUTCOME_TYPE)
-        truncation = ToolTruncationInfo(
-            cursor=_get_str(truncation_payload, "cursor"),
-            scope_token=_get_str(truncation_payload, "scope_token"),
-            scope_hash=_get_str(truncation_payload, "scope_hash"),
-            has_more=_get_bool(truncation_payload, "has_more"),
-            limit=_get_optional_int(truncation_payload, "limit"),
-            ttl_seconds=_get_optional_int(truncation_payload, "ttl_seconds"),
+    if _RESULT_SUCCESS_TOP_LEVEL_TRUNCATION_KEY in value:
+        raise ValueError(
+            f"{_ERROR_INVALID_OUTCOME_TYPE}: "
+            f"legacy top-level {_RESULT_SUCCESS_TOP_LEVEL_TRUNCATION_KEY}"
         )
     meta_payload = value.get("meta")
     meta: ToolResultMeta | None = None
@@ -849,7 +828,6 @@ def _decode_result_success(value: JsonValue) -> ToolResultSuccess:
     return ToolResultSuccess(
         ok=True,
         value=value.get("value"),
-        truncation=truncation,
         meta=meta,
     )
 

@@ -11,6 +11,7 @@ import argparse
 import asyncio
 import logging
 import sys
+from collections.abc import Mapping
 from dataclasses import dataclass
 from datetime import datetime
 from pathlib import Path
@@ -51,6 +52,7 @@ from dayu.host._event_store import InMemoryRunEventStore
 from dayu.host._framework_tools import FRAMEWORK_FETCH_MORE_NAME
 from dayu.host._proxy import LocalProxy
 from dayu.host._run_harness import LocalRunHarness
+from dayu.host._tool_result_truncation import extract_truncation_hint
 from dayu.host._tool_runtime import HostToolRuntime, ToolRuntimeToolExecutor
 from utils._smoke_memory_store import SmokeInMemoryConversationMemoryStore
 from dayu.host._worker import EngineWorker
@@ -59,6 +61,19 @@ _LOGGER: logging.Logger = logging.getLogger("smoke.host.tool_runtime")
 _RUN_ID: str = "smoke_run_tool_runtime"
 _SESSION_ID: str = "smoke_session"
 _TOOL_CALL_ID: str = "smoke_tc_1"
+
+
+def _content_value(value: JsonValue) -> JsonValue:
+    """读取非 object 工具值被截断后的 ``content`` 包装。
+
+    :param value: 工具成功结果值。
+    :returns: ``content`` 字段或原值。
+    :raises Exception: 不主动抛出异常。
+    """
+
+    if isinstance(value, Mapping) and "content" in value:
+        return value["content"]
+    return value
 
 
 @dataclass(frozen=True, slots=True)
@@ -113,7 +128,6 @@ class _LargeListExecutor:
             result=ToolResultSuccess(
                 ok=True,
                 value=values,
-                truncation=None,
                 meta=None,
             )
         )
@@ -207,18 +221,19 @@ async def _main() -> None:
     if not isinstance(outcome, ToolCompletedOutcome):
         raise RuntimeError("tool execution did not complete")
     value = outcome.result.value
-    if not isinstance(value, list):
+    content = _content_value(value)
+    if not isinstance(content, list):
         raise RuntimeError("truncated value is not a list")
     _LOGGER.info(
-        "execute completed truncated_items=%s has_truncation=%s",
-        len(value),
-        outcome.result.truncation is not None,
+        "execute completed truncated_items=%s truncation_present %s",
+        len(content),
+        extract_truncation_hint(outcome.result.value) is not None,
     )
 
     if await event_store.list_events(_RUN_ID, after=None) != ():
         raise RuntimeError("ToolRuntime appended unexpected special events")
 
-    truncation = outcome.result.truncation
+    truncation = extract_truncation_hint(outcome.result.value)
     if truncation is None:
         raise RuntimeError("truncation info missing")
 
@@ -249,12 +264,13 @@ async def _main() -> None:
     )
     if not isinstance(fetch_outcome, ToolCompletedOutcome):
         raise RuntimeError("framework fetch_more did not complete")
-    if not isinstance(fetch_outcome.result.value, list):
+    fetch_content = _content_value(fetch_outcome.result.value)
+    if not isinstance(fetch_content, list):
         raise RuntimeError("fetch_more value is not a list")
     _LOGGER.info(
         "fetch_more completed items=%s has_more=%s",
-        len(fetch_outcome.result.value),
-        fetch_outcome.result.truncation is not None,
+        len(fetch_content),
+        extract_truncation_hint(fetch_outcome.result.value) is not None,
     )
 
     reused = await runtime.execute_tool_call(

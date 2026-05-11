@@ -43,7 +43,8 @@ attempt-scoped append / durable memory；P8.5-S1 起 ToolRuntime 的截断补读
   只接收 `tuple[ToolSchema, ...]`，不会接收 definition / bundle、truncate spec、display metadata、
   tags、callable 或 executor binding。
 - ToolRuntime 只按工具显式 `ToolTruncateSpec` 截断；无 spec、未启用、未知策略或非法 limit 不截断。
-- `binary_bytes` 截断与补读在 Host public `JsonValue` 结果中返回 base64 ASCII 字符串；`unit="bytes"` 与
+- `binary_bytes` 截断与补读的实际 chunk 使用 base64 ASCII 字符串；若仍有更多数据，Host 会按普通
+  tool result JSON 语义包装为 `{"content": <chunk>, "truncation": ...}`。`unit="bytes"` 与
   `value_summary` 表示原始字节大小，不使用 OLD LLM projection 的 `content_base64` 包装结构。
 - 截断与补读不再写入专用 RunEvent。业务工具调用只写普通 `TOOL_CALL_REQUESTED` /
   `TOOL_RESULT_ACCEPTED`；framework `fetch_more` 也只是普通工具名，成功 / 失败都通过普通
@@ -296,7 +297,7 @@ LocalRunHarness.start_run(run_index=1)
   -> ToolExecutor.execute
   -> ToolRuntimeToolExecutor -> HostToolRuntime -> huge_echo executor
   -> ordinary TOOL_CALL_REQUESTED / TOOL_RESULT_ACCEPTED facts
-  -> Engine injects truncated tool result with fetch_more hint
+  -> Host-injected ordinary tool result carries fetch_more hint
   -> model emits framework fetch_more tool call
   -> ToolRuntime routes framework fetch_more and returns ordinary tool outcome
   -> final terminal

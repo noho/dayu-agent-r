@@ -1078,7 +1078,6 @@ def test_engine_event_kind_classification_matrix() -> None:
                     result=ToolResultSuccess(
                         ok=True,
                         value={"ok": True},
-                        truncation=None,
                         meta=None,
                     )
                 ),

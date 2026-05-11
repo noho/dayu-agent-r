@@ -1218,9 +1218,8 @@ Model -> tool_call huge_echo(...)
       -> supports text_chars / text_lines / list_items / binary_bytes
       -> supports target_field / field_path where declared
       -> stores run-scoped single-use cursor + scope token
-      -> returns a truncated ordinary tool result
-  -> Engine injects truncated tool result back to the model
-      -> includes LLM-readable truncation hint
+      -> returns an ordinary tool result value with LLM-readable truncation hint
+  -> Engine projects ordinary JSON tool result back to the model
       -> truncation.next_action = "fetch_more"
       -> truncation.fetch_more_args = {cursor, scope_token, limit?}
 Model -> tool_call fetch_more(cursor, scope_token, limit?)
@@ -1385,8 +1384,8 @@ LocalRunHarness.start_run(turn 1)
   -> model tool_call huge_echo
   -> ToolExecutor.execute
   -> ToolRuntimeToolExecutor -> HostToolRuntime -> huge_echo executor
-  -> RuntimeTruncateManager returns truncated ordinary tool result
-  -> Engine injects truncated tool result with next_action=fetch_more hint
+  -> RuntimeTruncateManager returns ordinary tool result value with next_action=fetch_more hint
+  -> Engine projects ordinary JSON tool result
   -> model tool_call fetch_more
   -> ToolRuntime routes to Host private framework fetch_more tool
       -> fetch_more callable consumes cursor through closure-injected RuntimeTruncateManager Protocol

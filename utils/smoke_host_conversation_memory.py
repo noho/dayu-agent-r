@@ -344,7 +344,6 @@ def _tool_result_event(request: StartRunRequest) -> EngineEvent:
                 result=ToolResultSuccess(
                     ok=True,
                     value=value,
-                    truncation=None,
                     meta=None,
                 )
             ),

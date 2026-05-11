@@ -10,7 +10,7 @@ from typing import cast
 import pytest
 
 from dayu.contracts.tool_outcome import ToolCompletedOutcome
-from dayu.contracts.tool_result import ToolResultSuccess, ToolTruncationInfo
+from dayu.contracts.tool_result import ToolResultSuccess
 from dayu.engine import (
     ContentDeltaData,
     FinalAnswerData,
@@ -164,7 +164,6 @@ async def _append_tool_result(
                     result=ToolResultSuccess(
                         ok=True,
                         value={"revenue": 100},
-                        truncation=None,
                         meta=None,
                     )
                 ),
@@ -317,15 +316,19 @@ async def test_tool_fact_structured_truncation_fields_are_safe() -> None:
                 outcome=ToolCompletedOutcome(
                     result=ToolResultSuccess(
                         ok=True,
-                        value={"items": [1, 2]},
-                        truncation=ToolTruncationInfo(
-                            cursor="raw-cursor-secret",
-                            scope_token="raw-scope-token",
-                            scope_hash="scope-hash-safe",
-                            has_more=True,
-                            limit=2,
-                            ttl_seconds=60,
-                        ),
+                        value={
+                            "items": [1, 2],
+                            "truncation": {
+                                "fetch_more_args": {
+                                    "cursor": "raw-cursor-secret",
+                                    "limit": 2,
+                                    "scope_token": "raw-scope-token",
+                                },
+                                "has_more": True,
+                                "next_action": "fetch_more",
+                                "ttl_seconds": 60,
+                            },
+                        },
                         meta=None,
                     )
                 ),

@@ -114,6 +114,7 @@ from dayu.host._event_store import InMemoryRunEventStore  # noqa: E402
 from dayu.host._framework_tools import FRAMEWORK_FETCH_MORE_NAME  # noqa: E402
 from dayu.host._proxy import LocalProxy, WorkerProxy  # noqa: E402
 from dayu.host._run_harness import LocalRunHarness  # noqa: E402
+from dayu.host._tool_result_truncation import extract_truncation_hint  # noqa: E402
 from dayu.host._tool_runtime import (  # noqa: E402
     HostToolRuntime,
     ToolRuntimeToolExecutor,
@@ -656,7 +657,6 @@ async def _huge_echo_execute(
         result=ToolResultSuccess(
             ok=True,
             value="\n".join(lines),
-            truncation=None,
             meta=None,
         )
     )
@@ -1653,7 +1653,7 @@ def _tool_result_has_more(data: ToolResultAcceptedData) -> bool | None:
     outcome = data.outcome
     if not isinstance(outcome, ToolCompletedOutcome):
         return None
-    truncation = outcome.result.truncation
+    truncation = extract_truncation_hint(outcome.result.value)
     if truncation is None:
         return None
     return truncation.has_more

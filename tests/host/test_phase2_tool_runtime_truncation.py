@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
+from collections.abc import Mapping
 from dataclasses import dataclass, replace
 from datetime import datetime
 from typing import cast
@@ -26,6 +27,10 @@ from dayu.contracts.tool_outcome import (
 from dayu.contracts.tool_result import ToolResultFailure, ToolResultSuccess
 from dayu.host._event_store import InMemoryRunEventStore
 from dayu.host._framework_tools import FRAMEWORK_FETCH_MORE_NAME
+from dayu.host._tool_result_truncation import (
+    ToolResultTruncationHint,
+    extract_truncation_hint,
+)
 from dayu.host._tool_runtime import HostToolRuntime
 
 
@@ -82,7 +87,6 @@ class _Executor:
             result=ToolResultSuccess(
                 ok=True,
                 value=self.value,
-                truncation=None,
                 meta=None,
             )
         )
@@ -164,6 +168,32 @@ class _ListLogHandler(logging.Handler):
         """
 
         self.messages.append(self.format(record))
+
+
+def _required_truncation(value: JsonValue) -> ToolResultTruncationHint:
+    """提取测试期望存在的截断 hint。
+
+    :param value: 工具成功结果值。
+    :returns: 截断 hint。
+    :raises AssertionError: 截断 hint 不存在时抛出。
+    """
+
+    truncation = extract_truncation_hint(value)
+    assert truncation is not None
+    return truncation
+
+
+def _content_value(value: JsonValue) -> JsonValue:
+    """读取非 object 工具值被截断后的 ``content`` 包装。
+
+    :param value: 工具成功结果值。
+    :returns: ``content`` 字段或原值。
+    :raises Exception: 不主动抛出异常。
+    """
+
+    if isinstance(value, Mapping) and "content" in value:
+        return value["content"]
+    return value
 
 
 def _spec(
@@ -328,11 +358,11 @@ async def test_truncates_text_chars_and_issues_execute_time_cursor() -> None:
 
     outcome = await runtime.execute_tool_call(_request())
     assert isinstance(outcome, ToolCompletedOutcome)
-    assert outcome.result.value == "abc"
-    assert outcome.result.truncation is not None
-    assert outcome.result.truncation.cursor
-    assert outcome.result.truncation.scope_token
-    assert outcome.result.truncation.limit == 3
+    assert _content_value(outcome.result.value) == "abc"
+    truncation = _required_truncation(outcome.result.value)
+    assert truncation.cursor
+    assert truncation.scope_token
+    assert truncation.limit == 3
 
     assert await store.list_events("run_1", after=None) == ()
 
@@ -357,7 +387,7 @@ async def test_tool_runtime_debug_logs_tool_call_boundary_without_secret() -> No
     try:
         outcome = await runtime.execute_tool_call(_request())
         assert isinstance(outcome, ToolCompletedOutcome)
-        truncation = outcome.result.truncation
+        truncation = extract_truncation_hint(outcome.result.value)
         assert truncation is not None
         fetch_request_base = _request(
             tool_call_id="fetch_call_1",
@@ -418,7 +448,7 @@ async def test_truncation_strategies(
     outcome = await runtime.execute_tool_call(_request())
 
     assert isinstance(outcome, ToolCompletedOutcome)
-    assert outcome.result.value == expected
+    assert _content_value(outcome.result.value) == expected
 
 
 @pytest.mark.asyncio
@@ -431,18 +461,18 @@ async def test_binary_bytes_fetch_more_returns_base64_json_string() -> None:
     )
     outcome = await runtime.execute_tool_call(_request())
     assert isinstance(outcome, ToolCompletedOutcome)
-    assert outcome.result.value == "YWI="
-    assert outcome.result.truncation is not None
+    assert _content_value(outcome.result.value) == "YWI="
+    truncation = _required_truncation(outcome.result.value)
 
     fetch_outcome = await runtime.execute_tool_call(
         _framework_request(
-            cursor_value=outcome.result.truncation.cursor,
-            scope_token=outcome.result.truncation.scope_token,
+            cursor_value=truncation.cursor,
+            scope_token=truncation.scope_token,
         )
     )
 
     assert isinstance(fetch_outcome, ToolCompletedOutcome)
-    assert fetch_outcome.result.value == "Y2Q="
+    assert _content_value(fetch_outcome.result.value) == "Y2Q="
 
 
 @pytest.mark.asyncio
@@ -490,7 +520,10 @@ async def test_wrapper_requires_explicit_target() -> None:
     )
     outcome_with_target = await runtime_with_target.execute_tool_call(_request())
     assert isinstance(outcome_with_target, ToolCompletedOutcome)
-    assert outcome_with_target.result.value == {"short": "x", "long": "abc"}
+    assert isinstance(outcome_with_target.result.value, Mapping)
+    assert outcome_with_target.result.value["short"] == "x"
+    assert outcome_with_target.result.value["long"] == "abc"
+    _required_truncation(outcome_with_target.result.value)
 
 
 @pytest.mark.asyncio
@@ -534,7 +567,10 @@ async def test_field_path_has_priority_over_target_field() -> None:
     outcome = await runtime.execute_tool_call(_request())
 
     assert isinstance(outcome, ToolCompletedOutcome)
-    assert outcome.result.value == {"long": "abcdef", "nested": {"long": "uvw"}}
+    assert isinstance(outcome.result.value, Mapping)
+    assert outcome.result.value["long"] == "abcdef"
+    assert outcome.result.value["nested"] == {"long": "uvw"}
+    _required_truncation(outcome.result.value)
 
 
 @pytest.mark.asyncio
@@ -584,7 +620,7 @@ async def test_fetch_more_single_use_limit_clamp_and_next_cursor() -> None:
     )
     outcome = await runtime.execute_tool_call(_request())
     assert isinstance(outcome, ToolCompletedOutcome)
-    truncation = outcome.result.truncation
+    truncation = extract_truncation_hint(outcome.result.value)
     assert truncation is not None
 
     first = await runtime.execute_tool_call(
@@ -595,8 +631,8 @@ async def test_fetch_more_single_use_limit_clamp_and_next_cursor() -> None:
         )
     )
     assert isinstance(first, ToolCompletedOutcome)
-    assert first.result.value == [3, 4]
-    assert first.result.truncation is not None
+    assert _content_value(first.result.value) == [3, 4]
+    first_truncation = _required_truncation(first.result.value)
 
     reused = await runtime.execute_tool_call(
         _framework_request(
@@ -610,14 +646,14 @@ async def test_fetch_more_single_use_limit_clamp_and_next_cursor() -> None:
 
     second = await runtime.execute_tool_call(
         _framework_request(
-            cursor_value=first.result.truncation.cursor,
-            scope_token=first.result.truncation.scope_token,
+            cursor_value=first_truncation.cursor,
+            scope_token=first_truncation.scope_token,
             tool_call_id="fetch_call_3",
         )
     )
     assert isinstance(second, ToolCompletedOutcome)
-    assert second.result.value == [5]
-    assert second.result.truncation is None
+    assert _content_value(second.result.value) == [5]
+    assert extract_truncation_hint(second.result.value) is None
 
 
 @pytest.mark.asyncio
@@ -695,7 +731,7 @@ async def test_apply_truncation_and_fetch_more_share_state_lock() -> None:
     )
     outcome = await runtime.execute_tool_call(_request())
     assert isinstance(outcome, ToolCompletedOutcome)
-    truncation = outcome.result.truncation
+    truncation = extract_truncation_hint(outcome.result.value)
     assert truncation is not None
 
     fetched, applied = await asyncio.gather(
@@ -712,7 +748,6 @@ async def test_apply_truncation_and_fetch_more_share_state_lock() -> None:
                 result=ToolResultSuccess(
                     ok=True,
                     value=[10, 20, 30, 40],
-                    truncation=None,
                     meta=None,
                 )
             ),
@@ -722,7 +757,7 @@ async def test_apply_truncation_and_fetch_more_share_state_lock() -> None:
 
     assert isinstance(fetched, ToolCompletedOutcome)
     assert isinstance(applied, ToolCompletedOutcome)
-    assert applied.result.truncation is not None
+    _required_truncation(applied.result.value)
 
 
 @pytest.mark.asyncio
@@ -735,7 +770,7 @@ async def test_concurrent_fetch_more_same_cursor_is_single_use() -> None:
     )
     outcome = await runtime.execute_tool_call(_request())
     assert isinstance(outcome, ToolCompletedOutcome)
-    truncation = outcome.result.truncation
+    truncation = extract_truncation_hint(outcome.result.value)
     assert truncation is not None
 
     request_a = _framework_request(
@@ -758,7 +793,7 @@ async def test_concurrent_fetch_more_same_cursor_is_single_use() -> None:
     successes = [result for result in results if isinstance(result, ToolCompletedOutcome)]
     failures = [result for result in results if isinstance(result, ToolFailedOutcome)]
     assert len(successes) == 1
-    assert successes[0].result.value == [3, 4]
+    assert _content_value(successes[0].result.value) == [3, 4]
     assert len(failures) == 1
     assert failures[0].result.error == "cursor_not_found"
 
@@ -775,7 +810,7 @@ async def test_ttl_expired_and_opportunistic_cleanup() -> None:
     )
     outcome = await runtime.execute_tool_call(_request())
     assert isinstance(outcome, ToolCompletedOutcome)
-    truncation = outcome.result.truncation
+    truncation = extract_truncation_hint(outcome.result.value)
     assert truncation is not None
     clock.now = 106.0
 
@@ -817,4 +852,4 @@ async def test_truncation_strategy_value_type_mismatch_returns_original() -> Non
     assert isinstance(outcome, ToolCompletedOutcome)
     # 类型不匹配: 不截断, 返回原始值。
     assert outcome.result.value == "not-a-list"
-    assert outcome.result.truncation is None
+    assert extract_truncation_hint(outcome.result.value) is None

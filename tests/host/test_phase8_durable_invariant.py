@@ -155,7 +155,6 @@ class _NoopExec:
             result=ToolResultSuccess(
                 ok=True,
                 value=None,
-                truncation=None,
                 meta=None,
             )
         )

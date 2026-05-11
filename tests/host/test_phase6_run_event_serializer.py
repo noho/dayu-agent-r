@@ -16,7 +16,7 @@ from dayu.engine import (
     ToolResultAcceptedData,
 )
 from dayu.contracts.tool_outcome import ToolCompletedOutcome
-from dayu.contracts.tool_result import ToolResultSuccess, ToolTruncationInfo
+from dayu.contracts.tool_result import ToolResultSuccess
 from dayu.host._run_event_serializer import (
     CURRENT_SCHEMA_VERSION,
     deserialize_run_event_data,
@@ -150,15 +150,17 @@ def test_tool_payload_serializer_scrubs_credentials_and_retains_capabilities() -
                     "cursor": "cursor-result",
                     "scope_token": "scope-result",
                     "token": "ordinary-result-token",
+                    "truncation": {
+                        "fetch_more_args": {
+                            "cursor": "cursor-truncation",
+                            "limit": 10,
+                            "scope_token": "scope-truncation",
+                        },
+                        "has_more": True,
+                        "next_action": "fetch_more",
+                        "ttl_seconds": 60,
+                    },
                 },
-                truncation=ToolTruncationInfo(
-                    cursor="cursor-truncation",
-                    scope_token="scope-truncation",
-                    scope_hash="scope-hash",
-                    has_more=True,
-                    limit=10,
-                    ttl_seconds=60,
-                ),
                 meta=None,
             )
         ),
@@ -180,9 +182,49 @@ def test_tool_payload_serializer_scrubs_credentials_and_retains_capabilities() -
     assert value["cursor"] == "cursor-result"
     assert value["scope_token"] == "scope-result"
     assert value["token"] == "ordinary-result-token"
-    assert decoded_accepted.outcome.result.truncation is not None
-    assert decoded_accepted.outcome.result.truncation.cursor == "cursor-truncation"
-    assert decoded_accepted.outcome.result.truncation.scope_token == "scope-truncation"
+    truncation = value["truncation"]
+    assert isinstance(truncation, dict)
+    fetch_more_args = truncation["fetch_more_args"]
+    assert isinstance(fetch_more_args, dict)
+    assert fetch_more_args["cursor"] == "cursor-truncation"
+    assert fetch_more_args["scope_token"] == "scope-truncation"
+
+
+def test_deserialize_rejects_legacy_top_level_tool_result_truncation() -> None:
+    """旧 success result 顶层 truncation schema 必须 fail-fast。"""
+
+    raw = f"""
+    {{
+        "schema_version": {CURRENT_SCHEMA_VERSION},
+        "type_name": "{RunEventType.TOOL_RESULT_ACCEPTED.value}::ToolResultAcceptedData",
+        "fields": {{
+            "iteration_id": "iter-1",
+            "tool_call_id": "tc-1",
+            "name": "demo",
+            "index_in_iteration": 0,
+            "outcome": {{
+                "kind": "completed",
+                "result": {{
+                    "ok": true,
+                    "value": {{"content": "short"}},
+                    "truncation": {{
+                        "cursor": "legacy-cursor",
+                        "scope_token": "legacy-scope",
+                        "scope_hash": "legacy-scope-hash",
+                        "has_more": true
+                    }},
+                    "meta": null
+                }}
+            }}
+        }}
+    }}
+    """
+
+    with pytest.raises(ValueError, match="legacy top-level truncation"):
+        deserialize_run_event_data(
+            event_type=RunEventType.TOOL_RESULT_ACCEPTED,
+            raw=raw,
+        )
 
 
 def test_serialize_rejects_type_data_mismatch() -> None:

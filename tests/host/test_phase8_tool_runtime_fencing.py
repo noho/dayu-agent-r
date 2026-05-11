@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+from collections.abc import Mapping
 from dataclasses import dataclass
 from datetime import datetime
 
@@ -26,6 +27,10 @@ from dayu.host._attempt_lease import (
 )
 from dayu.host._framework_tools import FRAMEWORK_FETCH_MORE_NAME
 from dayu.host._internal_contracts import AttemptState, FencingToken
+from dayu.host._tool_result_truncation import (
+    ToolResultTruncationHint,
+    extract_truncation_hint,
+)
 from dayu.host._tool_runtime import (
     HostToolRuntime,
     PlainRunEventAppender,
@@ -34,6 +39,32 @@ from dayu.host._tool_runtime import (
     active_tool_runtime_appender,
 )
 from dayu.host.contracts import RunEvent, RunEventDraft
+
+
+def _required_truncation(value: JsonValue) -> ToolResultTruncationHint:
+    """提取测试期望存在的截断 hint。
+
+    :param value: 工具成功结果值。
+    :returns: 截断 hint。
+    :raises AssertionError: 截断 hint 不存在时抛出。
+    """
+
+    truncation = extract_truncation_hint(value)
+    assert truncation is not None
+    return truncation
+
+
+def _content_value(value: JsonValue) -> JsonValue:
+    """读取非 object 工具值被截断后的 ``content`` 包装。
+
+    :param value: 工具成功结果值。
+    :returns: ``content`` 字段或原值。
+    :raises Exception: 不主动抛出异常。
+    """
+
+    if isinstance(value, Mapping) and "content" in value:
+        return value["content"]
+    return value
 
 
 @dataclass(frozen=True, slots=True)
@@ -95,7 +126,6 @@ class _Executor:
             result=ToolResultSuccess(
                 ok=True,
                 value=self.value,
-                truncation=None,
                 meta=None,
             )
         )
@@ -297,7 +327,7 @@ async def test_durable_executor_with_scope_allows_business_truncation() -> None:
 
     assert executor.calls == 1
     assert isinstance(outcome, ToolCompletedOutcome)
-    assert outcome.result.truncation is not None
+    assert extract_truncation_hint(outcome.result.value) is not None
 
 
 @pytest.mark.asyncio
@@ -347,12 +377,12 @@ async def test_durable_fetch_more_rejects_without_scope_before_cursor_consume() 
         first = await tool_executor.execute(_request())
 
     assert isinstance(first, ToolCompletedOutcome)
-    assert first.result.truncation is not None
+    truncation = _required_truncation(first.result.value)
     fetch_request = _request(
         tool_name=FRAMEWORK_FETCH_MORE_NAME,
         arguments={
-            "cursor": first.result.truncation.cursor,
-            "scope_token": first.result.truncation.scope_token,
+            "cursor": truncation.cursor,
+            "scope_token": truncation.scope_token,
         },
         tool_call_id="read-1",
     )
@@ -364,7 +394,7 @@ async def test_durable_fetch_more_rejects_without_scope_before_cursor_consume() 
         read = await tool_executor.execute(fetch_request)
 
     assert isinstance(read, ToolCompletedOutcome)
-    assert read.result.value == [2]
+    assert _content_value(read.result.value) == [2]
 
 
 @pytest.mark.asyncio
@@ -383,22 +413,22 @@ async def test_truncation_and_fetch_more_do_not_append_special_facts() -> None:
 
     outcome = await runtime.execute_tool_call(_request())
     assert isinstance(outcome, ToolCompletedOutcome)
-    assert outcome.result.value == [1]
-    assert outcome.result.truncation is not None
+    assert _content_value(outcome.result.value) == [1]
+    truncation = _required_truncation(outcome.result.value)
 
     read = await runtime.execute_tool_call(
         _request(
             tool_name=FRAMEWORK_FETCH_MORE_NAME,
             arguments={
-                "cursor": outcome.result.truncation.cursor,
-                "scope_token": outcome.result.truncation.scope_token,
+                "cursor": truncation.cursor,
+                "scope_token": truncation.scope_token,
             },
             tool_call_id="read-1",
         )
     )
 
     assert isinstance(read, ToolCompletedOutcome)
-    assert read.result.value == [2]
+    assert _content_value(read.result.value) == [2]
     assert await store.list_events("run-1", after=None) == ()
 
 
@@ -417,13 +447,13 @@ async def test_wrong_scope_returns_plain_failed_outcome() -> None:
     )
     outcome = await runtime.execute_tool_call(_request())
     assert isinstance(outcome, ToolCompletedOutcome)
-    assert outcome.result.truncation is not None
+    truncation = _required_truncation(outcome.result.value)
 
     failed = await runtime.execute_tool_call(
         _request(
             tool_name=FRAMEWORK_FETCH_MORE_NAME,
             arguments={
-                "cursor": outcome.result.truncation.cursor,
+                "cursor": truncation.cursor,
                 "scope_token": "wrong",
             },
             tool_call_id="read-1",
@@ -451,15 +481,15 @@ async def test_expired_fetch_more_returns_plain_failed_outcome() -> None:
     )
     outcome = await runtime.execute_tool_call(_request())
     assert isinstance(outcome, ToolCompletedOutcome)
-    assert outcome.result.truncation is not None
+    truncation = _required_truncation(outcome.result.value)
 
     clock.value = 200.0
     failed = await runtime.execute_tool_call(
         _request(
             tool_name=FRAMEWORK_FETCH_MORE_NAME,
             arguments={
-                "cursor": outcome.result.truncation.cursor,
-                "scope_token": outcome.result.truncation.scope_token,
+                "cursor": truncation.cursor,
+                "scope_token": truncation.scope_token,
             },
             tool_call_id="read-1",
         )

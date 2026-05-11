@@ -113,7 +113,6 @@ def _tool_event(request: StartRunRequest) -> EngineEvent:
                 result=ToolResultSuccess(
                     ok=True,
                     value={"revenue": 100},
-                    truncation=None,
                     meta=None,
                 )
             ),

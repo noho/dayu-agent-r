@@ -33,7 +33,6 @@ async def _echo_tool(
         result=ToolResultSuccess(
             ok=True,
             value={"name": request.call.name},
-            truncation=None,
             meta=None,
         )
     )

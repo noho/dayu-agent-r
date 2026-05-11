@@ -120,6 +120,9 @@ P8.5 当前 Slice 1 至 Slice 6 均已通过 implementation review loop，并已
   对 Engine 只是普通 tool schema / tool request / tool outcome。
 - `RuntimeTruncateManager` 持有 Host 私有截断状态机和 cursor store；Runtime 只组合 manager，在普通 tool result
   返回前做可选截断，并通过闭包把补读能力传给私有 `fetch_more` callable。
+- P8.5 follow-up fixed residual：`ToolTruncationInfo` public contract leakage 已移除；`ToolResultSuccess`
+  不再携带 top-level `truncation` 字段，LLM-facing truncation / `fetch_more_args` 只作为 Host 注入的普通
+  `ToolResultSuccess.value` JSON payload 存在，Engine 只做普通 JSON tool result projection。
 - EventLog / trace 默认保留 ordinary tool args/result payload，只 scrub API key、Authorization、cookie、
   client secret、private key、password 等明确凭证；cursor、`scope_token`、普通 `token`、tool args/results
   不是敏感字段 scrub 触发条件。

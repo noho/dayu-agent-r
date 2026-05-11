@@ -133,7 +133,6 @@ def _tool_call_accepted_draft(*, run_id: str, tool_call_id: str) -> RunEventDraf
                 result=ToolResultSuccess(
                     ok=cast(Literal[True], True),
                     value={"answer": "ok"},
-                    truncation=None,
                     meta=None,
                 )
             ),

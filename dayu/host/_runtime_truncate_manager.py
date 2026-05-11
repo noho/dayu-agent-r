@@ -32,7 +32,10 @@ from dayu.contracts.tool_outcome import (
 from dayu.contracts.tool_result import (
     ToolResultFailure,
     ToolResultSuccess,
-    ToolTruncationInfo,
+)
+from dayu.host._tool_result_truncation import (
+    ToolResultTruncationHint,
+    inject_truncation_hint,
 )
 
 _DEFAULT_CURSOR_TTL_SECONDS: int = 300
@@ -269,14 +272,15 @@ class RuntimeTruncateManager:
         return ToolCompletedOutcome(
             result=ToolResultSuccess(
                 ok=True,
-                value=truncated.value,
-                truncation=ToolTruncationInfo(
-                    cursor=record.cursor,
-                    scope_token=record.scope_token,
-                    scope_hash=record.scope_hash,
-                    has_more=True,
-                    limit=record.limit,
-                    ttl_seconds=record.ttl_seconds,
+                value=inject_truncation_hint(
+                    value=truncated.value,
+                    hint=ToolResultTruncationHint(
+                        cursor=record.cursor,
+                        scope_token=record.scope_token,
+                        has_more=True,
+                        limit=record.limit,
+                        ttl_seconds=record.ttl_seconds,
+                    ),
                 ),
                 meta=outcome.result.meta,
             )
@@ -349,7 +353,7 @@ class RuntimeTruncateManager:
             )
             new_offset = record.offset + chunk.size
             has_more = new_offset < record.total
-            next_truncation: ToolTruncationInfo | None = None
+            next_hint: ToolResultTruncationHint | None = None
             next_record: _RuntimeCursorRecord | None = None
             if has_more:
                 next_record = self._build_cursor_from_record(
@@ -357,10 +361,9 @@ class RuntimeTruncateManager:
                     record=record,
                     offset=new_offset,
                 )
-                next_truncation = ToolTruncationInfo(
+                next_hint = ToolResultTruncationHint(
                     cursor=next_record.cursor,
                     scope_token=next_record.scope_token,
-                    scope_hash=next_record.scope_hash,
                     has_more=True,
                     limit=next_record.limit,
                     ttl_seconds=next_record.ttl_seconds,
@@ -372,8 +375,14 @@ class RuntimeTruncateManager:
             return ToolCompletedOutcome(
                 result=ToolResultSuccess(
                     ok=True,
-                    value=output_value,
-                    truncation=next_truncation,
+                    value=(
+                        output_value
+                        if next_hint is None
+                        else inject_truncation_hint(
+                            value=output_value,
+                            hint=next_hint,
+                        )
+                    ),
                     meta=None,
                 )
             )

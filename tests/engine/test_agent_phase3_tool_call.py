@@ -26,7 +26,6 @@ from dayu.contracts.tool_outcome import (
 from dayu.contracts.tool_result import (
     ToolResultFailure,
     ToolResultSuccess,
-    ToolTruncationInfo,
 )
 from dayu.engine.agent import _AsyncAgent, _project_tool_outcome_for_llm
 from dayu.engine.contracts.agent_policy import AgentFallbackMode, AgentPolicy
@@ -439,7 +438,6 @@ def _success(value: JsonValue) -> ToolCompletedOutcome:
         result=ToolResultSuccess(
             ok=True,
             value=value,
-            truncation=None,
             meta=None,
         )
     )
@@ -638,7 +636,7 @@ def test_agent_policy_rejects_invalid_values() -> None:
 
 
 def test_llm_projection_shapes() -> None:
-    """工具结果注入 LLM 前必须使用专用 projection。"""
+    """工具结果注入 LLM 前必须保持普通 JSON projection。"""
 
     success_object = _project_tool_outcome_for_llm(_success({"sum": 5}))
     success_scalar = _project_tool_outcome_for_llm(_success("ok"))
@@ -648,15 +646,18 @@ def test_llm_projection_shapes() -> None:
         ToolCompletedOutcome(
             result=ToolResultSuccess(
                 ok=True,
-                value={},
-                truncation=ToolTruncationInfo(
-                    cursor="cursor-value",
-                    scope_token="secret_token",
-                    scope_hash="secret_hash",
-                    has_more=True,
-                    limit=30,
-                    ttl_seconds=60,
-                ),
+                value={
+                    "truncation": {
+                        "fetch_more_args": {
+                            "cursor": "cursor-value",
+                            "limit": 30,
+                            "scope_token": "secret_token",
+                        },
+                        "has_more": True,
+                        "next_action": "fetch_more",
+                        "ttl_seconds": 60,
+                    }
+                },
                 meta=None,
             )
         )
@@ -688,7 +689,7 @@ def test_llm_projection_shapes() -> None:
 
 
 def test_llm_truncation_projection_without_more_hides_fetch_hint() -> None:
-    """has_more=False 时 LLM projection 不暴露续读动作、TTL 与内部 scope。
+    """普通 value 中 has_more=False 时 Engine 只做 JSON 透传。
 
     :returns: 无返回值。
     :raises AssertionError: projection 结构不符合预期时抛出。
@@ -698,15 +699,7 @@ def test_llm_truncation_projection_without_more_hides_fetch_hint() -> None:
         ToolCompletedOutcome(
             result=ToolResultSuccess(
                 ok=True,
-                value={},
-                truncation=ToolTruncationInfo(
-                    cursor="cursor-value",
-                    scope_token="secret_token",
-                    scope_hash="secret_hash",
-                    has_more=False,
-                    limit=None,
-                    ttl_seconds=60,
-                ),
+                value={"truncation": {"has_more": False}},
                 meta=None,
             )
         )

@@ -364,7 +364,6 @@ class _ToolFactThenOverflowProxy:
                     result=ToolResultSuccess(
                         ok=True,
                         value={"revenue_growth": "12%"},
-                        truncation=None,
                         meta=None,
                     )
                 ),
@@ -663,7 +662,6 @@ def _tool_truncated_draft(
                 result=ToolResultSuccess(
                     ok=True,
                     value={"summary": "收入同比增长 12%"},
-                    truncation=None,
                     meta=None,
                 )
             ),

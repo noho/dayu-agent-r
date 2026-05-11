@@ -55,7 +55,6 @@ def _make_completed() -> ToolCompletedOutcome:
         result=ToolResultSuccess(
             ok=True,
             value=None,
-            truncation=None,
             meta=None,
         )
     )

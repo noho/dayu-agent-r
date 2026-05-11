@@ -16,8 +16,8 @@ Engine 当前负责：
 - 提供函数式入口：`run_agent_messages(request)` 与 `run_agent_and_wait(request)`。
 - 在私有 run-scoped Agent 中消费 Runner 事件流，并提升为带 `session_id`、`run_id`、`sequence`、`event_id` 的 `EngineEvent`。
 - 执行普通 completed / failed tool calling 闭环：Runner tool call -> `ToolExecutionRequest` -> `ToolExecutor.execute` -> tool message 注入下一轮 Runner。
-- 若 ToolExecutor 返回的成功结果携带截断信息，Agent 会把它投影为 LLM-facing
-  `truncation.next_action="fetch_more"` 与 `truncation.fetch_more_args`；Engine 不持有 cursor store，也不解释
+- ToolExecutor 成功结果只按普通 JSON value 投影；若 Host 已在 ordinary payload 中注入
+  `truncation.next_action="fetch_more"` 与 `truncation.fetch_more_args`，Engine 只透传该 JSON，不持有 cursor store，也不解释
   `scope_token`。
 - 在 `finish_reason=length` 时执行 final-answer text continuation；continuation 轮固定 `tools=()`，只续写被截断的最终回答文本。
 - 收口三类终态：`final_answer`、`run_failed`、`run_cancelled`。
@@ -138,10 +138,8 @@ ToolExecutor 由 EngineWorker 替 Host 在选定执行环境中代持，并通�
 - 成功且 value 是 JSON object 时展开 value，不包内部 `ok/value` 信封。
 - 成功且 value 不是 JSON object 时包成 `{"content": ...}`。
 - 失败时投影 `error` / `message`，仅在 hint 非空时投影 `hint`。
-- 截断成功结果会投影 `truncation.has_more`；当 `has_more=True` 时投影
-  `truncation.next_action="fetch_more"` 与 `truncation.fetch_more_args={cursor, scope_token, limit?}`，
-  让模型可在下一轮发起 framework `fetch_more`。`scope_hash` 不投影给 LLM；当 `has_more=False` 时不投影
-  `next_action`、`fetch_more_args` 或 `ttl_seconds`。
+- Engine 不识别 Host 私有截断类型，也不根据 truncation 字段分支；LLM-facing truncation hint 是普通
+  tool result JSON，由 Host 注入到 `ToolResultSuccess.value`。
 
 当最后一轮普通工具调用执行完后，默认 `AgentFallbackMode.FORCE_ANSWER` 会追加 `AgentPolicy.fallback_prompt` 作为 `UserMessage`，以 `tools=()` 再调用 Runner，并产出 `final_answer(degraded=True)`。`AgentFallbackMode.RAISE_ERROR` 才直接 `run_failed("max_iterations_exceeded")`。连续全失败工具批次达到 `AgentPolicy.max_consecutive_failed_tool_batches` 时使用同一 fallback mode 收口。
 

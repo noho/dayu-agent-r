@@ -37,7 +37,6 @@ from dayu.contracts import (
     ToolResultMeta,
     ToolResultSuccess,
     ToolSchema,
-    ToolTruncationInfo,
 )
 from dayu.engine.contracts import (
     TERMINAL_ENGINE_EVENT_TYPES,
@@ -195,6 +194,5 @@ __all__ = [
     "ToolResultMeta",
     "ToolResultSuccess",
     "ToolSchema",
-    "ToolTruncationInfo",
     "UserMessage",
 ]
