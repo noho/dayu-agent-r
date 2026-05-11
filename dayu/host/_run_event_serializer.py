@@ -39,7 +39,6 @@ from dayu.contracts.tool_result import (
     ToolResultFailure,
     ToolResultMeta,
     ToolResultSuccess,
-    ToolTruncationInfo,
 )
 from dayu.engine.contracts.agent_run import ContextBudgetSnapshot, RunResumeHint
 from dayu.engine.contracts.engine_events import (
@@ -59,7 +58,14 @@ from dayu.engine.contracts.engine_events import (
     ToolCallRequestedData,
     ToolResultAcceptedData,
 )
+from dayu.engine.contracts.partial_tool_call import PartialToolCallSummary
 from dayu.engine.contracts.finish_reason import FinishReason
+from dayu.host._credential_scrub import (
+    _scrub_text_credential_assignments,
+    scrub_explicit_credentials,
+    scrub_tool_arguments,
+    scrub_tool_execution_outcome,
+)
 from dayu.host.contracts import (
     ContextCompactFailureReason,
     HostContextAttemptRetryData,
@@ -74,14 +80,6 @@ from dayu.host.contracts import (
     RunInputContextSnapshotBuiltData,
     RunInputMessageSummary,
     RunInputToolSchemaSummary,
-    ToolCursorDeniedData,
-    ToolCursorExpiredData,
-    ToolCursorIssuedData,
-    ToolFetchMoreCompletedData,
-    ToolFetchMoreFailedData,
-    ToolFetchMoreRequestedData,
-    ToolResultTruncatedData,
-    ToolValueSizeSummary,
     UserInputAcceptedData,
     UserInputScope,
 )
@@ -99,6 +97,7 @@ _ERROR_INVALID_USER_INPUT_SCOPE: str = "invalid_user_input_scope"
 _ERROR_INVALID_FAILURE_REASON: str = "invalid_context_compact_failure_reason"
 _ERROR_INVALID_OUTCOME_TYPE: str = "invalid_tool_outcome_type"
 _ERROR_INVALID_PROVIDER_STATE: str = "invalid_tool_call_provider_state"
+_RESULT_SUCCESS_TOP_LEVEL_TRUNCATION_KEY: str = "truncation"
 
 
 _PayloadFields: TypeAlias = Mapping[str, JsonValue]
@@ -257,7 +256,7 @@ def _encode_fields(
             "iteration_id": data.iteration_id,
             "tool_call_id": data.tool_call_id,
             "name": data.name,
-            "arguments": dict(data.arguments),
+            "arguments": dict(scrub_tool_arguments(data.arguments)),
             "index_in_iteration": data.index_in_iteration,
             "provider_state": _encode_provider_state(data.provider_state),
         }
@@ -267,7 +266,9 @@ def _encode_fields(
             "tool_call_id": data.tool_call_id,
             "name": data.name,
             "index_in_iteration": data.index_in_iteration,
-            "outcome": _encode_outcome(data.outcome),
+            "outcome": _encode_outcome(
+                scrub_tool_execution_outcome(data.outcome)
+            ),
         }
     if isinstance(data, ToolAwaitingData):
         return {
@@ -292,9 +293,17 @@ def _encode_fields(
         return {
             "iteration_id": data.iteration_id,
             "error_code": data.error_code,
-            "message": data.message,
+            "message": _scrub_text_credential_assignments(data.message),
             "provider_request_id": data.provider_request_id,
-            "raw_payload": data.raw_payload,
+            "raw_payload": (
+                None
+                if data.raw_payload is None
+                else scrub_explicit_credentials(data.raw_payload)
+            ),
+            "partial_tool_calls": [
+                _encode_partial_tool_call_summary(item)
+                for item in data.partial_tool_calls
+            ],
         }
     if isinstance(data, RunnerDoneEngineData):
         return {
@@ -325,7 +334,7 @@ def _encode_fields(
     if isinstance(data, RunFailedData):
         return {
             "error_code": data.error_code,
-            "message": data.message,
+            "message": _scrub_text_credential_assignments(data.message),
             "recoverable": data.recoverable,
         }
     if isinstance(data, HostRunFailedData):
@@ -392,78 +401,6 @@ def _encode_fields(
             "from_attempt_index": data.from_attempt_index,
             "next_attempt_index": data.next_attempt_index,
             "policy_id": data.policy_id,
-            "reason": data.reason,
-        }
-    if isinstance(data, ToolResultTruncatedData):
-        return {
-            "iteration_id": data.iteration_id,
-            "tool_name": data.tool_name,
-            "tool_call_id": data.tool_call_id,
-            "strategy": data.strategy,
-            "limit": data.limit,
-            "unit": data.unit,
-            "total_estimate": data.total_estimate,
-            "cursor_fingerprint": data.cursor_fingerprint,
-            "ttl_seconds": data.ttl_seconds,
-            "has_more": data.has_more,
-            "value_summary": _encode_value_summary(data.value_summary),
-        }
-    if isinstance(data, ToolCursorIssuedData):
-        return {
-            "iteration_id": data.iteration_id,
-            "tool_name": data.tool_name,
-            "tool_call_id": data.tool_call_id,
-            "cursor_fingerprint": data.cursor_fingerprint,
-            "scope_hash": data.scope_hash,
-            "parent_cursor_fingerprint": data.parent_cursor_fingerprint,
-            "offset": data.offset,
-            "limit": data.limit,
-            "total_estimate": data.total_estimate,
-            "ttl_seconds": data.ttl_seconds,
-            "expires_at_monotonic": data.expires_at_monotonic,
-            "single_use": data.single_use,
-        }
-    if isinstance(data, ToolFetchMoreRequestedData):
-        return {
-            "iteration_id": data.iteration_id,
-            "tool_call_id": data.tool_call_id,
-            "cursor_fingerprint": data.cursor_fingerprint,
-            "requested_limit": data.requested_limit,
-        }
-    if isinstance(data, ToolFetchMoreCompletedData):
-        return {
-            "iteration_id": data.iteration_id,
-            "tool_name": data.tool_name,
-            "tool_call_id": data.tool_call_id,
-            "consumed_cursor_fingerprint": data.consumed_cursor_fingerprint,
-            "next_cursor_fingerprint": data.next_cursor_fingerprint,
-            "limit": data.limit,
-            "chunk_size": data.chunk_size,
-            "has_more": data.has_more,
-            "value_summary": _encode_value_summary(data.value_summary),
-        }
-    if isinstance(data, ToolFetchMoreFailedData):
-        return {
-            "iteration_id": data.iteration_id,
-            "tool_call_id": data.tool_call_id,
-            "cursor_fingerprint": data.cursor_fingerprint,
-            "error_code": data.error_code,
-            "message": data.message,
-            "denied": data.denied,
-            "expired": data.expired,
-        }
-    if isinstance(data, ToolCursorExpiredData):
-        return {
-            "iteration_id": data.iteration_id,
-            "tool_call_id": data.tool_call_id,
-            "cursor_fingerprint": data.cursor_fingerprint,
-            "expired_at_monotonic": data.expired_at_monotonic,
-        }
-    if isinstance(data, ToolCursorDeniedData):
-        return {
-            "iteration_id": data.iteration_id,
-            "tool_call_id": data.tool_call_id,
-            "cursor_fingerprint": data.cursor_fingerprint,
             "reason": data.reason,
         }
     if isinstance(data, RunInputContextSnapshotBuiltData):
@@ -548,12 +485,17 @@ def _decode_fields(
             total_tokens=_get_int(fields, "total_tokens"),
         )
     if event_type is RunEventType.PROVIDER_PROTOCOL_ERROR:
+        if "partial_tool_calls" not in fields:
+            raise ValueError(_ERROR_INVALID_FIELDS)
         return ProviderProtocolErrorData(
             iteration_id=_get_str(fields, "iteration_id"),
             error_code=_get_str(fields, "error_code"),
             message=_get_str(fields, "message"),
             provider_request_id=_get_optional_str(fields, "provider_request_id"),
             raw_payload=fields.get("raw_payload"),
+            partial_tool_calls=_decode_partial_tool_call_summaries(
+                fields["partial_tool_calls"]
+            ),
         )
     if event_type is RunEventType.RUNNER_DONE:
         return RunnerDoneEngineData(
@@ -665,84 +607,6 @@ def _decode_fields(
             policy_id=_get_str(fields, "policy_id"),
             reason=_get_str(fields, "reason"),
         )
-    if event_type is RunEventType.TOOL_RESULT_TRUNCATED:
-        return ToolResultTruncatedData(
-            iteration_id=_get_str(fields, "iteration_id"),
-            tool_name=_get_str(fields, "tool_name"),
-            tool_call_id=_get_str(fields, "tool_call_id"),
-            strategy=_get_str(fields, "strategy"),
-            limit=_get_int(fields, "limit"),
-            unit=_get_str(fields, "unit"),
-            total_estimate=_get_int(fields, "total_estimate"),
-            cursor_fingerprint=_get_str(fields, "cursor_fingerprint"),
-            ttl_seconds=_get_int(fields, "ttl_seconds"),
-            has_more=_get_bool(fields, "has_more"),
-            value_summary=_decode_value_summary(fields.get("value_summary")),
-        )
-    if event_type is RunEventType.TOOL_CURSOR_ISSUED:
-        return ToolCursorIssuedData(
-            iteration_id=_get_str(fields, "iteration_id"),
-            tool_name=_get_str(fields, "tool_name"),
-            tool_call_id=_get_str(fields, "tool_call_id"),
-            cursor_fingerprint=_get_str(fields, "cursor_fingerprint"),
-            scope_hash=_get_str(fields, "scope_hash"),
-            parent_cursor_fingerprint=_get_optional_str(
-                fields, "parent_cursor_fingerprint"
-            ),
-            offset=_get_int(fields, "offset"),
-            limit=_get_int(fields, "limit"),
-            total_estimate=_get_int(fields, "total_estimate"),
-            ttl_seconds=_get_int(fields, "ttl_seconds"),
-            expires_at_monotonic=_get_float(fields, "expires_at_monotonic"),
-            single_use=_get_bool(fields, "single_use"),
-        )
-    if event_type is RunEventType.TOOL_FETCH_MORE_REQUESTED:
-        return ToolFetchMoreRequestedData(
-            iteration_id=_get_str(fields, "iteration_id"),
-            tool_call_id=_get_str(fields, "tool_call_id"),
-            cursor_fingerprint=_get_str(fields, "cursor_fingerprint"),
-            requested_limit=_get_optional_int(fields, "requested_limit"),
-        )
-    if event_type is RunEventType.TOOL_FETCH_MORE_COMPLETED:
-        return ToolFetchMoreCompletedData(
-            iteration_id=_get_str(fields, "iteration_id"),
-            tool_name=_get_str(fields, "tool_name"),
-            tool_call_id=_get_str(fields, "tool_call_id"),
-            consumed_cursor_fingerprint=_get_str(
-                fields, "consumed_cursor_fingerprint"
-            ),
-            next_cursor_fingerprint=_get_optional_str(
-                fields, "next_cursor_fingerprint"
-            ),
-            limit=_get_int(fields, "limit"),
-            chunk_size=_get_int(fields, "chunk_size"),
-            has_more=_get_bool(fields, "has_more"),
-            value_summary=_decode_value_summary(fields.get("value_summary")),
-        )
-    if event_type is RunEventType.TOOL_FETCH_MORE_FAILED:
-        return ToolFetchMoreFailedData(
-            iteration_id=_get_str(fields, "iteration_id"),
-            tool_call_id=_get_str(fields, "tool_call_id"),
-            cursor_fingerprint=_get_str(fields, "cursor_fingerprint"),
-            error_code=_get_str(fields, "error_code"),
-            message=_get_str(fields, "message"),
-            denied=_get_bool(fields, "denied"),
-            expired=_get_bool(fields, "expired"),
-        )
-    if event_type is RunEventType.TOOL_CURSOR_EXPIRED:
-        return ToolCursorExpiredData(
-            iteration_id=_get_str(fields, "iteration_id"),
-            tool_call_id=_get_str(fields, "tool_call_id"),
-            cursor_fingerprint=_get_str(fields, "cursor_fingerprint"),
-            expired_at_monotonic=_get_float(fields, "expired_at_monotonic"),
-        )
-    if event_type is RunEventType.TOOL_CURSOR_DENIED:
-        return ToolCursorDeniedData(
-            iteration_id=_get_str(fields, "iteration_id"),
-            tool_call_id=_get_str(fields, "tool_call_id"),
-            cursor_fingerprint=_get_str(fields, "cursor_fingerprint"),
-            reason=_get_str(fields, "reason"),
-        )
     if event_type is RunEventType.RUN_INPUT_CONTEXT_SNAPSHOT_BUILT:
         return _decode_run_input_context_snapshot(fields)
     raise ValueError(f"{_ERROR_UNKNOWN_TYPE}: {event_type.value}")
@@ -782,6 +646,61 @@ def _decode_provider_state(value: JsonValue) -> ToolCallProviderState | None:
     if not isinstance(signature, str):
         raise ValueError(_ERROR_INVALID_PROVIDER_STATE)
     return GeminiToolCallState(thought_signature=signature)
+
+
+def _encode_partial_tool_call_summary(
+    summary: PartialToolCallSummary,
+) -> Mapping[str, JsonValue]:
+    """编码 partial tool call 有界摘要。
+
+    :param summary: partial tool call 摘要。
+    :returns: JSON 字段映射。
+    :raises Exception: 不主动抛出异常。
+    """
+
+    return {
+        "tool_call_index": summary.tool_call_index,
+        "tool_call_id": summary.tool_call_id,
+        "name_fragment": summary.name_fragment,
+        "arguments_byte_size": summary.arguments_byte_size,
+        "arguments_sha256": summary.arguments_sha256,
+    }
+
+
+def _decode_partial_tool_call_summaries(
+    value: JsonValue,
+) -> tuple[PartialToolCallSummary, ...]:
+    """解码 partial tool call 有界摘要列表。
+
+    :param value: JSON value。
+    :returns: 摘要元组。
+    :raises ValueError: 字段非法时抛出。
+    """
+
+    if not isinstance(value, list):
+        raise ValueError(_ERROR_INVALID_FIELDS)
+    return tuple(_decode_partial_tool_call_summary(item) for item in value)
+
+
+def _decode_partial_tool_call_summary(
+    value: JsonValue,
+) -> PartialToolCallSummary:
+    """解码单个 partial tool call 有界摘要。
+
+    :param value: JSON value。
+    :returns: 摘要对象。
+    :raises ValueError: 字段非法时抛出。
+    """
+
+    if not isinstance(value, dict):
+        raise ValueError(_ERROR_INVALID_FIELDS)
+    return PartialToolCallSummary(
+        tool_call_index=_get_int(value, "tool_call_index"),
+        tool_call_id=_get_optional_str(value, "tool_call_id"),
+        name_fragment=_get_optional_str(value, "name_fragment"),
+        arguments_byte_size=_get_int(value, "arguments_byte_size"),
+        arguments_sha256=_get_optional_str(value, "arguments_sha256"),
+    )
 
 
 def _encode_outcome(
@@ -869,23 +788,10 @@ def _encode_result_success(result: ToolResultSuccess) -> Mapping[str, JsonValue]
     :raises Exception: 不主动抛出异常。
     """
 
-    truncation = result.truncation
     meta = result.meta
     return {
         "ok": True,
         "value": result.value,
-        "truncation": (
-            None
-            if truncation is None
-            else {
-                "cursor": truncation.cursor,
-                "scope_token": truncation.scope_token,
-                "scope_hash": truncation.scope_hash,
-                "has_more": truncation.has_more,
-                "limit": truncation.limit,
-                "ttl_seconds": truncation.ttl_seconds,
-            }
-        ),
         "meta": (
             None
             if meta is None
@@ -908,19 +814,13 @@ def _decode_result_success(value: JsonValue) -> ToolResultSuccess:
 
     if not isinstance(value, dict):
         raise ValueError(_ERROR_INVALID_OUTCOME_TYPE)
-    truncation_payload = value.get("truncation")
-    truncation: ToolTruncationInfo | None = None
-    if truncation_payload is not None:
-        if not isinstance(truncation_payload, dict):
-            raise ValueError(_ERROR_INVALID_OUTCOME_TYPE)
-        truncation = ToolTruncationInfo(
-            cursor=_get_str(truncation_payload, "cursor"),
-            scope_token=_get_str(truncation_payload, "scope_token"),
-            scope_hash=_get_str(truncation_payload, "scope_hash"),
-            has_more=_get_bool(truncation_payload, "has_more"),
-            limit=_get_optional_int(truncation_payload, "limit"),
-            ttl_seconds=_get_optional_int(truncation_payload, "ttl_seconds"),
+    if _RESULT_SUCCESS_TOP_LEVEL_TRUNCATION_KEY in value:
+        raise ValueError(
+            f"{_ERROR_INVALID_OUTCOME_TYPE}: "
+            f"legacy top-level {_RESULT_SUCCESS_TOP_LEVEL_TRUNCATION_KEY}"
         )
+    if "value" not in value:
+        raise ValueError(f"{_ERROR_INVALID_OUTCOME_TYPE}: missing value")
     meta_payload = value.get("meta")
     meta: ToolResultMeta | None = None
     if meta_payload is not None:
@@ -935,8 +835,7 @@ def _decode_result_success(value: JsonValue) -> ToolResultSuccess:
         )
     return ToolResultSuccess(
         ok=True,
-        value=value.get("value"),
-        truncation=truncation,
+        value=value["value"],
         meta=meta,
     )
 
@@ -1068,42 +967,6 @@ def _decode_budget(value: JsonValue) -> ContextBudgetSnapshot:
         prompt_tokens=_get_int(value, "prompt_tokens"),
         completion_tokens=_get_int(value, "completion_tokens"),
         total_tokens=_get_int(value, "total_tokens"),
-    )
-
-
-def _encode_value_summary(
-    summary: ToolValueSizeSummary,
-) -> Mapping[str, JsonValue]:
-    """编码 ToolValueSizeSummary。
-
-    :param summary: 工具结果大小摘要。
-    :returns: JSON 表达。
-    :raises Exception: 不主动抛出异常。
-    """
-
-    return {
-        "unit": summary.unit,
-        "size": summary.size,
-        "total_estimate": summary.total_estimate,
-        "fingerprint": summary.fingerprint,
-    }
-
-
-def _decode_value_summary(value: JsonValue) -> ToolValueSizeSummary:
-    """解码 ToolValueSizeSummary。
-
-    :param value: JSON 表达。
-    :returns: ToolValueSizeSummary。
-    :raises ValueError: 字段非法时抛出。
-    """
-
-    if not isinstance(value, dict):
-        raise ValueError(_ERROR_INVALID_FIELDS)
-    return ToolValueSizeSummary(
-        unit=_get_str(value, "unit"),
-        size=_get_int(value, "size"),
-        total_estimate=_get_int(value, "total_estimate"),
-        fingerprint=_get_str(value, "fingerprint"),
     )
 
 
@@ -1250,10 +1113,12 @@ def _encode_run_input_context_snapshot(
             for item in data.tool_schema_summaries
         ],
         "context_meta": _encode_run_input_context_meta(data.context_meta),
-        "raw_input_messages_json": data.raw_input_messages_json,
-        "raw_tool_schemas_json": data.raw_tool_schemas_json,
-        "raw_input_blob_id": data.raw_input_blob_id,
+        "raw_input_messages_blob_id": data.raw_input_messages_blob_id,
+        "raw_input_messages_sha256": data.raw_input_messages_sha256,
+        "raw_input_messages_byte_size": data.raw_input_messages_byte_size,
         "raw_tool_schemas_blob_id": data.raw_tool_schemas_blob_id,
+        "raw_tool_schemas_sha256": data.raw_tool_schemas_sha256,
+        "raw_tool_schemas_byte_size": data.raw_tool_schemas_byte_size,
     }
 
 
@@ -1289,10 +1154,20 @@ def _decode_run_input_context_snapshot(
             _decode_run_input_tool_schema_summary(item) for item in raw_schemas
         ),
         context_meta=_decode_run_input_context_meta(fields.get("context_meta")),
-        raw_input_messages_json=_get_str(fields, "raw_input_messages_json"),
-        raw_tool_schemas_json=_get_str(fields, "raw_tool_schemas_json"),
-        raw_input_blob_id=_get_str(fields, "raw_input_blob_id"),
+        raw_input_messages_blob_id=_get_str(
+            fields, "raw_input_messages_blob_id"
+        ),
+        raw_input_messages_sha256=_get_str(
+            fields, "raw_input_messages_sha256"
+        ),
+        raw_input_messages_byte_size=_get_int(
+            fields, "raw_input_messages_byte_size"
+        ),
         raw_tool_schemas_blob_id=_get_str(fields, "raw_tool_schemas_blob_id"),
+        raw_tool_schemas_sha256=_get_str(fields, "raw_tool_schemas_sha256"),
+        raw_tool_schemas_byte_size=_get_int(
+            fields, "raw_tool_schemas_byte_size"
+        ),
     )
 
 
@@ -1413,19 +1288,6 @@ def _get_bool(fields: Mapping[str, JsonValue], key: str) -> bool:
     return value
 
 
-def _get_float(fields: Mapping[str, JsonValue], key: str) -> float:
-    """从字段中读取必填浮点。
-
-    :param fields: JSON 字段映射。
-    :param key: 键名。
-    :returns: 浮点值。
-    :raises ValueError: 字段缺失或类型不符时抛出。
-    """
-
-    value = fields.get(key)
-    if isinstance(value, bool) or not isinstance(value, (int, float)):
-        raise ValueError(f"{_ERROR_INVALID_FIELDS}: missing float {key}")
-    return float(value)
 
 
 def _get_mapping(
@@ -1471,13 +1333,6 @@ _DATA_CLASS_BY_TYPE: Mapping[RunEventType, type] = {
     RunEventType.CONTEXT_COMPACT_COMPLETED: HostContextCompactCompletedData,
     RunEventType.CONTEXT_COMPACT_FAILED: HostContextCompactFailedData,
     RunEventType.CONTEXT_ATTEMPT_RETRYING: HostContextAttemptRetryData,
-    RunEventType.TOOL_RESULT_TRUNCATED: ToolResultTruncatedData,
-    RunEventType.TOOL_CURSOR_ISSUED: ToolCursorIssuedData,
-    RunEventType.TOOL_FETCH_MORE_REQUESTED: ToolFetchMoreRequestedData,
-    RunEventType.TOOL_FETCH_MORE_COMPLETED: ToolFetchMoreCompletedData,
-    RunEventType.TOOL_FETCH_MORE_FAILED: ToolFetchMoreFailedData,
-    RunEventType.TOOL_CURSOR_EXPIRED: ToolCursorExpiredData,
-    RunEventType.TOOL_CURSOR_DENIED: ToolCursorDeniedData,
     RunEventType.RUN_INPUT_CONTEXT_SNAPSHOT_BUILT: (
         RunInputContextSnapshotBuiltData
     ),

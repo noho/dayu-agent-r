@@ -205,7 +205,6 @@ class AddNumbersToolExecutor:
             result=ToolResultSuccess(
                 ok=True,
                 value=result_value,
-                truncation=None,
                 meta=None,
             )
         )

@@ -26,9 +26,6 @@ from dayu.contracts.tool_schema import (
     ToolTruncateSpec,
 )
 
-FRAMEWORK_FETCH_MORE_TOOL_NAME: str = "fetch_more"
-"""框架级补读工具名。"""
-
 ToolFunctionCallable = Callable[
     [ToolExecutionRequest], Awaitable[ToolExecutionOutcome]
 ]
@@ -158,59 +155,6 @@ class ToolBundle:
         }
 
 
-def framework_fetch_more_tool_schema() -> ToolSchema:
-    """返回框架级 ``fetch_more`` 的 LLM-facing schema。
-
-    该 schema 只让模型在看到截断结果里的
-    ``truncation.next_action="fetch_more"`` 后发起普通 tool call；它不携带
-    ``ToolTruncateSpec``、展示 metadata、tags 或执行绑定，也不代表完整
-    ToolRegistry / governance。
-
-    :returns: ``fetch_more`` 工具 schema。
-    :raises Exception: 不主动抛出异常。
-    """
-
-    return ToolSchema(
-        type="function",
-        function=ToolFunctionSchema(
-            name=FRAMEWORK_FETCH_MORE_TOOL_NAME,
-            description=(
-                "继续读取上一条已截断的工具结果。只有当最新工具结果里的 "
-                'truncation.next_action="fetch_more" 时才调用；直接使用同一条 '
-                "truncation.fetch_more_args，不要复用更早返回里的旧 cursor。"
-            ),
-            parameters=ToolParametersSchema(
-                type="object",
-                properties={
-                    "cursor": {
-                        "type": "string",
-                        "description": (
-                            "单次有效的补读游标，直接使用最新工具结果里的 "
-                            "truncation.fetch_more_args.cursor。"
-                        ),
-                    },
-                    "scope_token": {
-                        "type": "string",
-                        "description": (
-                            "范围校验令牌，直接使用同一条工具结果里的 "
-                            "truncation.fetch_more_args.scope_token。"
-                        ),
-                    },
-                    "limit": {
-                        "type": "integer",
-                        "minimum": 1,
-                        "description": (
-                            "可选的单次读取上限；如果 hint 未提供则不要自行编造。"
-                        ),
-                    },
-                },
-                required=("cursor", "scope_token"),
-                additional_properties=False,
-            ),
-        ),
-    )
-
-
 def tool(
     *,
     name: str,
@@ -267,12 +211,10 @@ def tool(
 
 
 __all__ = [
-    "FRAMEWORK_FETCH_MORE_TOOL_NAME",
     "FunctionToolExecutor",
     "ToolBundle",
     "ToolDefinition",
     "ToolDisplayInfo",
     "ToolFunctionCallable",
-    "framework_fetch_more_tool_schema",
     "tool",
 ]

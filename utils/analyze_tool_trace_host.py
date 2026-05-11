@@ -4,8 +4,9 @@
 ``tool_trace_v2_host``），按 ``idempotency_key`` 去重并执行结构性诊断：
 
 - 重复 tool_call（同 ``run_id`` + ``tool_name`` + ``arguments_json`` 多次出现）。
-- ``truncation_has_more=True`` 之后同 run 没有 fetch_more 续读。
-- ``fetch_more_consumed_cursor`` 引用了在该 run 之前未出现过的 cursor。
+- ``truncation_has_more=True`` 之后同 run 没有 ordinary ``fetch_more`` 续读。
+- ordinary ``tool_name=="fetch_more"`` 的 ``arguments_json`` 引用了未知 cursor、
+  错误 scope、重复 cursor 或返回 failed outcome。
 - ``provider_protocol_error`` 计数。
 - ``final_response`` 是否存在。
 - 同 ``run_id`` 内 ``source_event_position`` 是否单调不下降。
@@ -42,7 +43,7 @@ import sys
 from collections.abc import Mapping
 from dataclasses import dataclass
 from pathlib import Path
-from typing import TypeAlias
+from typing import TypeAlias, cast
 
 _REPO_ROOT_PARENT_INDEX: int = 1
 
@@ -70,6 +71,14 @@ _TRACE_SCHEMA_VERSION_HOST: str = "tool_trace_v2_host"
 _TRACE_TYPE_TOOL_CALL: str = "tool_call"
 _TRACE_TYPE_FINAL_RESPONSE: str = "final_response"
 _TRACE_TYPE_PROVIDER_PROTOCOL_ERROR: str = "provider_protocol_error"
+_FETCH_MORE_TOOL_NAME: str = "fetch_more"
+_FETCH_MORE_CURSOR_ARG: str = "cursor"
+_FETCH_MORE_SCOPE_TOKEN_ARG: str = "scope_token"
+_OUTCOME_FAILED: str = "failed"
+_ISSUE_UNKNOWN_CONSUMED_CURSOR: str = "unknown_consumed_cursor"
+_ISSUE_WRONG_SCOPE_TOKEN: str = "wrong_scope_token"
+_ISSUE_DUPLICATE_CONSUMED_CURSOR: str = "duplicate_consumed_cursor"
+_ISSUE_FETCH_MORE_FAILED_PREFIX: str = "fetch_more_failed"
 
 
 JsonRecord: TypeAlias = Mapping[str, JsonValue]
@@ -249,6 +258,30 @@ class ContextPressureRun:
 
 
 @dataclass(frozen=True, slots=True)
+class ProviderPartialToolCallDiagnostic:
+    """provider_protocol_error 中的 partial tool call 诊断。
+
+    :param run_id: Run id。
+    :param iteration_id: iteration id。
+    :param error_code: provider protocol error code。
+    :param tool_call_index: provider tool call index。
+    :param tool_call_id: provider 已给出的 tool call id。
+    :param name_fragment: 已解析工具名片段。
+    :param arguments_byte_size: 已收到 arguments delta 字节数。
+    :param arguments_sha256: 已收到 arguments delta sha256。
+    """
+
+    run_id: str
+    iteration_id: str
+    error_code: str
+    tool_call_index: int
+    tool_call_id: str | None
+    name_fragment: str | None
+    arguments_byte_size: int
+    arguments_sha256: str | None
+
+
+@dataclass(frozen=True, slots=True)
 class TraceAnalysisReport:
     """trace 诊断结果汇总。
 
@@ -278,6 +311,47 @@ class TraceAnalysisReport:
     failure_patterns: tuple[FailurePattern, ...]
     detailed_failure_patterns: tuple[DetailedFailurePattern, ...]
     context_pressure_runs: tuple[ContextPressureRun, ...]
+    provider_partial_tool_calls: tuple[ProviderPartialToolCallDiagnostic, ...]
+
+
+@dataclass(frozen=True, slots=True)
+class _TruncationCursor:
+    """普通工具结果中签发的截断 cursor 摘要。
+
+    :param run_id: Run id。
+    :param tool_call_id: 签发 cursor 的工具调用 id。
+    :param cursor: raw cursor。
+    :param scope_token: raw scope token。
+    :param source_event_position: 来源事件 position。
+    """
+
+    run_id: str
+    tool_call_id: str
+    cursor: str
+    scope_token: str
+    source_event_position: int
+
+
+@dataclass(frozen=True, slots=True)
+class _FetchMoreCall:
+    """ordinary ``fetch_more`` 工具调用摘要。
+
+    :param run_id: Run id。
+    :param tool_call_id: fetch_more 工具调用 id。
+    :param cursor: arguments_json.cursor。
+    :param scope_token: arguments_json.scope_token。
+    :param source_event_position: 来源事件 position。
+    :param outcome_kind: 工具调用 outcome kind。
+    :param failure_error: 失败错误码；成功时为空字符串。
+    """
+
+    run_id: str
+    tool_call_id: str
+    cursor: str
+    scope_token: str
+    source_event_position: int
+    outcome_kind: str
+    failure_error: str
 
 
 def _iter_jsonl_files(*, trace_root: Path) -> list[Path]:
@@ -304,9 +378,7 @@ def _validate_schema_version(*, value: JsonValue, file_path: Path) -> None:
     """
 
     if not isinstance(value, str):
-        raise ValueError(
-            f"trace record missing string schema_version in {file_path}"
-        )
+        raise ValueError(f"trace record missing string schema_version in {file_path}")
     if value == _TRACE_SCHEMA_VERSION_HOST:
         return
     raise ValueError(
@@ -348,6 +420,21 @@ def _read_int(record: JsonRecord, key: str) -> int | None:
     return None
 
 
+def _read_optional_str(record: JsonRecord, key: str) -> str | None:
+    """读取可空 ``str`` 字段。
+
+    :param record: JSON 对象。
+    :param key: 字段名。
+    :returns: 字段字符串值；缺失、``null`` 或类型不匹配返回 ``None``。
+    :raises Exception: 不主动抛出异常。
+    """
+
+    value = record.get(key)
+    if isinstance(value, str):
+        return value
+    return None
+
+
 def _read_bool(record: JsonRecord, key: str) -> bool | None:
     """读取 ``bool`` 字段。
 
@@ -361,6 +448,93 @@ def _read_bool(record: JsonRecord, key: str) -> bool | None:
     if isinstance(value, bool):
         return value
     return None
+
+
+def _read_arguments_json(record: JsonRecord) -> Mapping[str, JsonValue]:
+    """解析 tool_call record 的 ``arguments_json``。
+
+    :param record: trace JSON 对象。
+    :returns: 参数 JSON 对象；缺失、非法或非对象时返回空映射。
+    :raises Exception: 不主动抛出异常。
+    """
+
+    raw = _read_str(record, "arguments_json")
+    if raw == "":
+        return {}
+    try:
+        decoded = json.loads(raw)
+    except json.JSONDecodeError:
+        return {}
+    if not isinstance(decoded, dict):
+        return {}
+    return cast(Mapping[str, JsonValue], decoded)
+
+
+def _collect_truncation_cursors(
+    entries: list[TraceLineEntry],
+) -> tuple[_TruncationCursor, ...]:
+    """收集 ordinary tool result 中的截断 cursor。
+
+    :param entries: 去重后的 record 列表。
+    :returns: 截断 cursor 摘要元组。
+    :raises Exception: 不主动抛出异常。
+    """
+
+    cursors: list[_TruncationCursor] = []
+    for entry in entries:
+        record = entry.record
+        if _read_str(record, "trace_type") != _TRACE_TYPE_TOOL_CALL:
+            continue
+        if _read_bool(record, "truncation_has_more") is not True:
+            continue
+        cursor = _read_str(record, "truncation_cursor")
+        scope_token = _read_str(record, "truncation_scope_token")
+        cursors.append(
+            _TruncationCursor(
+                run_id=_read_str(record, "run_id"),
+                tool_call_id=_read_str(record, "tool_call_id"),
+                cursor=cursor,
+                scope_token=scope_token,
+                source_event_position=(_read_int(record, "source_event_position") or 0),
+            )
+        )
+    return tuple(cursors)
+
+
+def _collect_fetch_more_calls(
+    entries: list[TraceLineEntry],
+) -> tuple[_FetchMoreCall, ...]:
+    """收集 ordinary ``fetch_more`` 工具调用。
+
+    :param entries: 去重后的 record 列表。
+    :returns: fetch_more 调用摘要元组。
+    :raises Exception: 不主动抛出异常。
+    """
+
+    calls: list[_FetchMoreCall] = []
+    for entry in entries:
+        record = entry.record
+        if _read_str(record, "trace_type") != _TRACE_TYPE_TOOL_CALL:
+            continue
+        if _read_str(record, "tool_name") != _FETCH_MORE_TOOL_NAME:
+            continue
+        arguments = _read_arguments_json(record)
+        cursor_value = arguments.get(_FETCH_MORE_CURSOR_ARG)
+        scope_token_value = arguments.get(_FETCH_MORE_SCOPE_TOKEN_ARG)
+        cursor = cursor_value if isinstance(cursor_value, str) else ""
+        scope_token = scope_token_value if isinstance(scope_token_value, str) else ""
+        calls.append(
+            _FetchMoreCall(
+                run_id=_read_str(record, "run_id"),
+                tool_call_id=_read_str(record, "tool_call_id"),
+                cursor=cursor,
+                scope_token=scope_token,
+                source_event_position=(_read_int(record, "source_event_position") or 0),
+                outcome_kind=_read_str(record, "outcome_kind"),
+                failure_error=_read_str(record, "failure_error"),
+            )
+        )
+    return tuple(calls)
 
 
 def _detect_repeated_tool_calls(
@@ -400,40 +574,33 @@ def _detect_repeated_tool_calls(
 def _detect_truncation_gaps(
     entries: list[TraceLineEntry],
 ) -> tuple[TruncationGap, ...]:
-    """检测同一工具调用 truncation 后没有 fetch_more 续读的 tool_call。
+    """检测 truncation 后没有 ordinary ``fetch_more`` 续读的 tool_call。
 
     :param entries: 去重后的 record 列表。
     :returns: TruncationGap 列表。
     :raises Exception: 不主动抛出异常。
     """
 
-    has_fetch_more_by_tool_call: dict[tuple[str, str], bool] = {}
-    truncations: list[tuple[str, str, str]] = []
-    for entry in entries:
-        record = entry.record
-        trace_type = _read_str(record, "trace_type")
-        if trace_type != _TRACE_TYPE_TOOL_CALL:
+    truncations = _collect_truncation_cursors(entries)
+    fetch_more_calls = _collect_fetch_more_calls(entries)
+    consumed_positions: dict[tuple[str, str], list[int]] = {}
+    for call in fetch_more_calls:
+        if call.cursor == "":
             continue
-        run_id = _read_str(record, "run_id")
-        tool_call_id = _read_str(record, "tool_call_id")
-        truncation_has_more = _read_bool(record, "truncation_has_more")
-        fetch_more_consumed = record.get("fetch_more_consumed_cursor")
-        tool_call_key = (run_id, tool_call_id)
-        if isinstance(fetch_more_consumed, str) and fetch_more_consumed != "":
-            has_fetch_more_by_tool_call[tool_call_key] = True
-        else:
-            has_fetch_more_by_tool_call.setdefault(tool_call_key, False)
-        if truncation_has_more is True:
-            scope_token = _read_str(record, "truncation_scope_token")
-            truncations.append((run_id, tool_call_id, scope_token))
+        consumed_positions.setdefault((call.run_id, call.cursor), []).append(call.source_event_position)
     gaps: list[TruncationGap] = []
-    for run_id, tool_call_id, scope_token in truncations:
-        if not has_fetch_more_by_tool_call.get((run_id, tool_call_id), False):
+    for truncation in truncations:
+        positions = consumed_positions.get(
+            (truncation.run_id, truncation.cursor),
+            [],
+        )
+        has_followup = any(position > truncation.source_event_position for position in positions)
+        if not has_followup:
             gaps.append(
                 TruncationGap(
-                    run_id=run_id,
-                    tool_call_id=tool_call_id,
-                    scope_token=scope_token,
+                    run_id=truncation.run_id,
+                    tool_call_id=truncation.tool_call_id,
+                    scope_token=truncation.scope_token,
                 )
             )
     return tuple(gaps)
@@ -442,7 +609,7 @@ def _detect_truncation_gaps(
 def _detect_fetch_more_unknown_cursor(
     entries: list[TraceLineEntry],
 ) -> tuple[FetchMoreScopeIssue, ...]:
-    """检测 fetch_more 引用了未在该 run 之前出现过的 cursor。
+    """检测 ordinary ``fetch_more`` 的 cursor / scope / failed outcome 问题。
 
     :param entries: 去重后的 record 列表（按 source_event_position 排序）。
     :returns: FetchMoreScopeIssue 列表。
@@ -456,32 +623,68 @@ def _detect_fetch_more_unknown_cursor(
             _read_int(item.record, "source_event_position") or 0,
         ),
     )
-    seen_cursors_by_run: dict[str, set[str]] = {}
+    issued_scope_by_cursor: dict[tuple[str, str], str] = {}
+    consumed_cursors_by_run: dict[str, set[str]] = {}
     issues: list[FetchMoreScopeIssue] = []
     for entry in sorted_entries:
         record = entry.record
         if _read_str(record, "trace_type") != _TRACE_TYPE_TOOL_CALL:
             continue
         run_id = _read_str(record, "run_id")
-        cursor_set = seen_cursors_by_run.setdefault(run_id, set())
         truncation_cursor = record.get("truncation_cursor")
         if isinstance(truncation_cursor, str) and truncation_cursor != "":
-            cursor_set.add(truncation_cursor)
-        next_cursor = record.get("fetch_more_next_cursor")
-        if isinstance(next_cursor, str) and next_cursor != "":
-            cursor_set.add(next_cursor)
-        consumed_cursor = record.get("fetch_more_consumed_cursor")
-        if isinstance(consumed_cursor, str) and consumed_cursor != "":
-            if consumed_cursor not in cursor_set:
-                issues.append(
-                    FetchMoreScopeIssue(
-                        run_id=run_id,
-                        tool_call_id=_read_str(record, "tool_call_id"),
-                        scope_token_or_cursor=consumed_cursor,
-                        reason="unknown_consumed_cursor",
-                    )
+            issued_scope_by_cursor[(run_id, truncation_cursor)] = _read_str(
+                record,
+                "truncation_scope_token",
+            )
+        if _read_str(record, "tool_name") != _FETCH_MORE_TOOL_NAME:
+            continue
+        arguments = _read_arguments_json(record)
+        cursor_value = arguments.get(_FETCH_MORE_CURSOR_ARG)
+        scope_token_value = arguments.get(_FETCH_MORE_SCOPE_TOKEN_ARG)
+        cursor = cursor_value if isinstance(cursor_value, str) else ""
+        scope_token = scope_token_value if isinstance(scope_token_value, str) else ""
+        consumed_set = consumed_cursors_by_run.setdefault(run_id, set())
+        if cursor in consumed_set:
+            issues.append(
+                FetchMoreScopeIssue(
+                    run_id=run_id,
+                    tool_call_id=_read_str(record, "tool_call_id"),
+                    scope_token_or_cursor=cursor,
+                    reason=_ISSUE_DUPLICATE_CONSUMED_CURSOR,
                 )
-            cursor_set.add(consumed_cursor)
+            )
+        if cursor != "":
+            consumed_set.add(cursor)
+        expected_scope = issued_scope_by_cursor.get((run_id, cursor))
+        if expected_scope is None:
+            issues.append(
+                FetchMoreScopeIssue(
+                    run_id=run_id,
+                    tool_call_id=_read_str(record, "tool_call_id"),
+                    scope_token_or_cursor=cursor,
+                    reason=_ISSUE_UNKNOWN_CONSUMED_CURSOR,
+                )
+            )
+        elif expected_scope != "" and scope_token != expected_scope:
+            issues.append(
+                FetchMoreScopeIssue(
+                    run_id=run_id,
+                    tool_call_id=_read_str(record, "tool_call_id"),
+                    scope_token_or_cursor=scope_token,
+                    reason=_ISSUE_WRONG_SCOPE_TOKEN,
+                )
+            )
+        if _read_str(record, "outcome_kind") == _OUTCOME_FAILED:
+            failure_error = _read_str(record, "failure_error") or _UNKNOWN_ERROR_CODE
+            issues.append(
+                FetchMoreScopeIssue(
+                    run_id=run_id,
+                    tool_call_id=_read_str(record, "tool_call_id"),
+                    scope_token_or_cursor=cursor,
+                    reason=f"{_ISSUE_FETCH_MORE_FAILED_PREFIX}:{failure_error}",
+                )
+            )
     return tuple(issues)
 
 
@@ -583,9 +786,7 @@ def _safe_ratio(numerator: int, denominator: int) -> float:
     return numerator / denominator
 
 
-def _classify_error_signature(
-    *, error_code: str, message: str
-) -> str:
+def _classify_error_signature(*, error_code: str, message: str) -> str:
     """把粗粒度 ``failure_error`` + ``failure_message`` 映射成签名。
 
     NEW record 不携带 raw_result 冷存，无法读取 OLD ``error.detail`` /
@@ -662,16 +863,10 @@ def _summarize_tool_stats(
                 success_count += 1
                 result_value_json = record.get("result_value_json")
                 if isinstance(result_value_json, str):
-                    result_byte_sizes.append(
-                        len(result_value_json.encode("utf-8"))
-                    )
+                    result_byte_sizes.append(len(result_value_json.encode("utf-8")))
             else:
-                error_code = (
-                    _read_str(record, "failure_error") or _UNKNOWN_ERROR_CODE
-                )
-                error_counter[error_code] = (
-                    error_counter.get(error_code, 0) + 1
-                )
+                error_code = _read_str(record, "failure_error") or _UNKNOWN_ERROR_CODE
+                error_counter[error_code] = error_counter.get(error_code, 0) + 1
             if _read_bool(record, "truncation_has_more") is True:
                 truncation_count += 1
         top_errors = tuple(
@@ -689,9 +884,7 @@ def _summarize_tool_stats(
                 truncation_count=truncation_count,
                 truncation_rate=_safe_ratio(truncation_count, call_count),
                 median_result_bytes=_median_int(result_byte_sizes),
-                p90_result_bytes=_percentile_int(
-                    result_byte_sizes, _LARGE_PAYLOAD_PERCENTILE
-                ),
+                p90_result_bytes=_percentile_int(result_byte_sizes, _LARGE_PAYLOAD_PERCENTILE),
                 top_error_codes=top_errors,
             )
         )
@@ -718,18 +911,14 @@ def _build_failure_patterns(
         if _read_str(record, "outcome_kind") == "completed":
             continue
         tool_name = _read_str(record, "tool_name")
-        error_code = (
-            _read_str(record, "failure_error") or _UNKNOWN_ERROR_CODE
-        )
+        error_code = _read_str(record, "failure_error") or _UNKNOWN_ERROR_CODE
         key = (tool_name, error_code)
         counter[key] = counter.get(key, 0) + 1
     patterns = [
         FailurePattern(tool_name=tool_name, error_code=error_code, count=count)
         for (tool_name, error_code), count in counter.items()
     ]
-    patterns.sort(
-        key=lambda item: (-item.count, item.tool_name, item.error_code)
-    )
+    patterns.sort(key=lambda item: (-item.count, item.tool_name, item.error_code))
     return tuple(patterns)
 
 
@@ -751,13 +940,9 @@ def _build_detailed_failure_patterns(
         if _read_str(record, "outcome_kind") == "completed":
             continue
         tool_name = _read_str(record, "tool_name")
-        error_code = (
-            _read_str(record, "failure_error") or _UNKNOWN_ERROR_CODE
-        )
+        error_code = _read_str(record, "failure_error") or _UNKNOWN_ERROR_CODE
         message = _read_str(record, "failure_message")
-        signature = _classify_error_signature(
-            error_code=error_code, message=message
-        )
+        signature = _classify_error_signature(error_code=error_code, message=message)
         key = (tool_name, signature, error_code)
         counter[key] = counter.get(key, 0) + 1
     patterns = [
@@ -817,9 +1002,7 @@ def _build_context_pressure_runs(
         if trace_type == _TRACE_TYPE_TOOL_CALL:
             by_run_tool_calls[run_id] = by_run_tool_calls.get(run_id, 0) + 1
         elif trace_type == _TRACE_TYPE_PROVIDER_PROTOCOL_ERROR:
-            by_run_provider_errors[run_id] = (
-                by_run_provider_errors.get(run_id, 0) + 1
-            )
+            by_run_provider_errors[run_id] = by_run_provider_errors.get(run_id, 0) + 1
         elif trace_type == _TRACE_TYPE_FINAL_RESPONSE:
             degraded = _read_bool(record, "degraded") or False
             filtered = _read_bool(record, "filtered") or False
@@ -852,6 +1035,49 @@ def _build_context_pressure_runs(
     return tuple(findings)
 
 
+def _build_provider_partial_tool_calls(
+    entries: list[TraceLineEntry],
+) -> tuple[ProviderPartialToolCallDiagnostic, ...]:
+    """从 provider_protocol_error record 提取 partial tool call 诊断。
+
+    :param entries: 去重后的 record 列表。
+    :returns: partial tool call 诊断元组。
+    :raises ValueError: ``partial_tool_calls_json`` 非合法 JSON 时抛出。
+    """
+
+    diagnostics: list[ProviderPartialToolCallDiagnostic] = []
+    for entry in entries:
+        record = entry.record
+        if _read_str(record, "trace_type") != _TRACE_TYPE_PROVIDER_PROTOCOL_ERROR:
+            continue
+        partials_raw = _read_str(record, "partial_tool_calls_json")
+        if partials_raw == "":
+            continue
+        parsed = json.loads(partials_raw)
+        if not isinstance(parsed, list):
+            raise ValueError("partial_tool_calls_json must decode to list")
+        for item in parsed:
+            if not isinstance(item, dict):
+                raise ValueError("partial tool call summary must be object")
+            diagnostics.append(
+                ProviderPartialToolCallDiagnostic(
+                    run_id=_read_str(record, "run_id"),
+                    iteration_id=_read_str(record, "iteration_id"),
+                    error_code=_read_str(record, "error_code"),
+                    tool_call_index=_read_int(item, "tool_call_index") or 0,
+                    tool_call_id=_read_optional_str(item, "tool_call_id"),
+                    name_fragment=_read_optional_str(item, "name_fragment"),
+                    arguments_byte_size=(
+                        _read_int(item, "arguments_byte_size") or 0
+                    ),
+                    arguments_sha256=_read_optional_str(
+                        item, "arguments_sha256"
+                    ),
+                )
+            )
+    return tuple(diagnostics)
+
+
 def analyze_trace_root(*, trace_root: Path) -> TraceAnalysisReport:
     """读取并分析 ``<trace_root>/sessions/**/tool_calls_*.jsonl``。
 
@@ -873,12 +1099,12 @@ def analyze_trace_root(*, trace_root: Path) -> TraceAnalysisReport:
                 if stripped == "":
                     continue
                 total_lines_read += 1
-                record_obj = json.loads(stripped)
+                try:
+                    record_obj = json.loads(stripped)
+                except json.JSONDecodeError:
+                    continue
                 if not isinstance(record_obj, dict):
-                    raise ValueError(
-                        f"trace record at {file_path}:{line_number} is not a "
-                        f"JSON object"
-                    )
+                    raise ValueError(f"trace record at {file_path}:{line_number} is not a " f"JSON object")
                 record: Mapping[str, JsonValue] = record_obj
                 _validate_schema_version(
                     value=record.get("schema_version", ""),
@@ -908,16 +1134,13 @@ def analyze_trace_root(*, trace_root: Path) -> TraceAnalysisReport:
     position_gaps = _detect_position_gaps(deduped_entries)
     tool_stats = _summarize_tool_stats(deduped_entries)
     failure_patterns = _build_failure_patterns(deduped_entries)
-    detailed_failure_patterns = _build_detailed_failure_patterns(
+    detailed_failure_patterns = _build_detailed_failure_patterns(deduped_entries)
+    context_pressure_runs = _build_context_pressure_runs(deduped_entries)
+    provider_partial_tool_calls = _build_provider_partial_tool_calls(
         deduped_entries
     )
-    context_pressure_runs = _build_context_pressure_runs(deduped_entries)
-    provider_error_count = counts_by_type.get(
-        _TRACE_TYPE_PROVIDER_PROTOCOL_ERROR, 0
-    )
-    final_response_present = (
-        counts_by_type.get(_TRACE_TYPE_FINAL_RESPONSE, 0) > 0
-    )
+    provider_error_count = counts_by_type.get(_TRACE_TYPE_PROVIDER_PROTOCOL_ERROR, 0)
+    final_response_present = counts_by_type.get(_TRACE_TYPE_FINAL_RESPONSE, 0) > 0
     return TraceAnalysisReport(
         total_lines_read=total_lines_read,
         deduped_record_count=len(deduped_entries),
@@ -933,6 +1156,7 @@ def analyze_trace_root(*, trace_root: Path) -> TraceAnalysisReport:
         failure_patterns=failure_patterns,
         detailed_failure_patterns=detailed_failure_patterns,
         context_pressure_runs=context_pressure_runs,
+        provider_partial_tool_calls=provider_partial_tool_calls,
     )
 
 
@@ -947,56 +1171,41 @@ def _format_report(report: TraceAnalysisReport) -> str:
     lines: list[str] = []
     lines.append(f"total_lines_read={report.total_lines_read}")
     lines.append(f"deduped_record_count={report.deduped_record_count}")
-    lines.append(
-        "duplicate_idempotency_keys="
-        f"{len(report.duplicate_idempotency_keys)}"
-    )
-    lines.append(
-        f"provider_protocol_error_count={report.provider_protocol_error_count}"
-    )
+    lines.append("duplicate_idempotency_keys=" f"{len(report.duplicate_idempotency_keys)}")
+    lines.append(f"provider_protocol_error_count={report.provider_protocol_error_count}")
     lines.append(f"final_response_present={report.final_response_present}")
     lines.append("record_counts_by_type:")
     for trace_type, count in sorted(report.record_counts_by_type.items()):
         lines.append(f"  {trace_type}: {count}")
-    lines.append(
-        f"repeated_tool_calls: {len(report.repeated_tool_calls)}"
-    )
+    lines.append(f"repeated_tool_calls: {len(report.repeated_tool_calls)}")
     for repeat in report.repeated_tool_calls:
-        lines.append(
-            f"  run={repeat.run_id} tool={repeat.tool_name} "
-            f"count={repeat.count}"
-        )
-    lines.append(
-        "truncation_without_fetch_more: "
-        f"{len(report.truncation_without_fetch_more)}"
-    )
+        lines.append(f"  run={repeat.run_id} tool={repeat.tool_name} " f"count={repeat.count}")
+    lines.append("truncation_without_fetch_more: " f"{len(report.truncation_without_fetch_more)}")
     for gap in report.truncation_without_fetch_more:
-        lines.append(
-            f"  run={gap.run_id} tool_call={gap.tool_call_id} "
-            f"scope_token={gap.scope_token!r}"
-        )
-    lines.append(
-        "fetch_more_with_unknown_scope_token: "
-        f"{len(report.fetch_more_with_unknown_scope_token)}"
-    )
+        lines.append(f"  run={gap.run_id} tool_call={gap.tool_call_id} " f"scope_token={gap.scope_token!r}")
+    lines.append("fetch_more_with_unknown_scope_token: " f"{len(report.fetch_more_with_unknown_scope_token)}")
     for issue in report.fetch_more_with_unknown_scope_token:
         lines.append(
             f"  run={issue.run_id} tool_call={issue.tool_call_id} "
             f"cursor={issue.scope_token_or_cursor!r} reason={issue.reason}"
         )
     lines.append(
-        f"source_event_position_gaps: {len(report.source_event_position_gaps)}"
+        f"provider_partial_tool_calls: {len(report.provider_partial_tool_calls)}"
     )
-    for pos_gap in report.source_event_position_gaps:
+    for partial in report.provider_partial_tool_calls:
         lines.append(
-            f"  run={pos_gap.run_id} prev={pos_gap.prev_position} "
-            f"next={pos_gap.next_position}"
+            f"  run={partial.run_id} iteration={partial.iteration_id} "
+            f"error={partial.error_code} index={partial.tool_call_index} "
+            f"id={partial.tool_call_id!r} name={partial.name_fragment!r} "
+            f"arg_bytes={partial.arguments_byte_size} "
+            f"arg_sha256={partial.arguments_sha256!r}"
         )
+    lines.append(f"source_event_position_gaps: {len(report.source_event_position_gaps)}")
+    for pos_gap in report.source_event_position_gaps:
+        lines.append(f"  run={pos_gap.run_id} prev={pos_gap.prev_position} " f"next={pos_gap.next_position}")
     lines.append(f"tool_stats: {len(report.tool_stats)}")
     for stat in report.tool_stats:
-        top_errors_text = ", ".join(
-            f"{code}:{count}" for code, count in stat.top_error_codes
-        )
+        top_errors_text = ", ".join(f"{code}:{count}" for code, count in stat.top_error_codes)
         lines.append(
             f"  tool={stat.tool_name} call_count={stat.call_count} "
             f"success_rate={stat.success_rate:.2f} "
@@ -1007,13 +1216,8 @@ def _format_report(report: TraceAnalysisReport) -> str:
         )
     lines.append(f"failure_patterns: {len(report.failure_patterns)}")
     for pattern in report.failure_patterns:
-        lines.append(
-            f"  tool={pattern.tool_name} error={pattern.error_code} "
-            f"count={pattern.count}"
-        )
-    lines.append(
-        f"detailed_failure_patterns: {len(report.detailed_failure_patterns)}"
-    )
+        lines.append(f"  tool={pattern.tool_name} error={pattern.error_code} " f"count={pattern.count}")
+    lines.append(f"detailed_failure_patterns: {len(report.detailed_failure_patterns)}")
     for detailed in report.detailed_failure_patterns:
         lines.append(
             f"  tool={detailed.tool_name} "
@@ -1040,9 +1244,7 @@ def _parse_cli_args(argv: list[str]) -> Path:
     :raises SystemExit: 参数缺失时由 argparse 抛出。
     """
 
-    parser = argparse.ArgumentParser(
-        description="Analyze Host P7 tool trace JSONL output."
-    )
+    parser = argparse.ArgumentParser(description="Analyze Host P7 tool trace JSONL output.")
     parser.add_argument(
         "trace_root",
         type=Path,
@@ -1077,6 +1279,7 @@ __all__ = [
     "FailurePattern",
     "FetchMoreScopeIssue",
     "PositionGap",
+    "ProviderPartialToolCallDiagnostic",
     "RepeatedToolCall",
     "ToolStats",
     "TraceAnalysisReport",

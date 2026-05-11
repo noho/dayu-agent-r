@@ -2,14 +2,12 @@
 
 from __future__ import annotations
 
+from collections.abc import Mapping
 from dataclasses import dataclass
 from datetime import datetime, timezone
-from typing import cast
-
 import pytest
 
 from dayu.contracts import (
-    FRAMEWORK_FETCH_MORE_TOOL_NAME,
     JsonValue,
     ToolTruncateSpec,
 )
@@ -29,14 +27,25 @@ from dayu.host import (
     RunEventKind,
     RunEventSource,
     RunEventType,
-    ToolFetchMoreCompletedData,
-    ToolFetchMoreFailedData,
-    ToolFetchMoreRequestedData,
-    ToolResultTruncatedData,
 )
 from dayu.host.contracts import RunEventDraft
 from dayu.host._event_store import InMemoryRunEventStore
+from dayu.host._framework_tools import FRAMEWORK_FETCH_MORE_NAME
+from dayu.host._tool_result_truncation import extract_truncation_hint
 from dayu.host._tool_runtime import HostToolRuntime
+
+
+def _content_value(value: JsonValue) -> JsonValue:
+    """读取非 object 工具值被截断后的 ``content`` 包装。
+
+    :param value: 工具成功结果值。
+    :returns: ``content`` 字段或原值。
+    :raises Exception: 不主动抛出异常。
+    """
+
+    if isinstance(value, Mapping) and "content" in value:
+        return value["content"]
+    return value
 
 
 @dataclass(frozen=True, slots=True)
@@ -80,7 +89,6 @@ class _Executor:
             result=ToolResultSuccess(
                 ok=True,
                 value=self.value,
-                truncation=None,
                 meta=None,
             )
         )
@@ -187,7 +195,7 @@ def _framework_request(
     return ToolExecutionRequest(
         call=ToolCallRequest(
             tool_call_id=tool_call_id,
-            name=FRAMEWORK_FETCH_MORE_TOOL_NAME,
+            name=FRAMEWORK_FETCH_MORE_NAME,
             arguments=arguments,
             index_in_iteration=0,
             provider_state=None,
@@ -224,39 +232,30 @@ def _runtime() -> tuple[HostToolRuntime, InMemoryRunEventStore]:
 
 
 @pytest.mark.asyncio
-async def test_eventlog_contains_neutral_truncation_facts_without_token() -> None:
-    """RunEvent 只保存中性摘要，不保存 token 明文或大结果。"""
+async def test_runtime_truncation_does_not_append_special_eventlog_facts() -> None:
+    """截断只改写普通工具 outcome，不追加 Host 专属工具事实。"""
 
     runtime, store = _runtime()
 
-    await runtime.execute_tool_call(_request())
+    outcome = await runtime.execute_tool_call(_request())
+    assert isinstance(outcome, ToolCompletedOutcome)
+    truncation = extract_truncation_hint(outcome.result.value)
+    assert truncation is not None
+    assert truncation.cursor == "cursor-eventlog"
 
     events = await store.list_events("run_1", after=None)
-    serialized = repr(events)
-    assert "cursor-eventlog" not in serialized
-    assert "scope_token" not in serialized
-    assert "1, 2, 3, 4" not in serialized
-    assert [event.kind for event in events] == [
-        RunEventKind.CANONICAL,
-        RunEventKind.CANONICAL,
-    ]
-    assert [event.source for event in events] == [
-        RunEventSource.HOST,
-        RunEventSource.HOST,
-    ]
+    assert events == ()
 
 
 @pytest.mark.asyncio
-async def test_fetch_more_event_order_and_return_event_cursor() -> None:
-    """framework ``fetch_more`` 按 requested -> completed 顺序写入事实。"""
+async def test_fetch_more_returns_ordinary_completed_outcome_without_special_facts() -> None:
+    """framework ``fetch_more`` 返回普通 completed outcome，不追加专属事实。"""
 
     runtime, store = _runtime()
     outcome = await runtime.execute_tool_call(_request())
     assert isinstance(outcome, ToolCompletedOutcome)
-    truncation = outcome.result.truncation
+    truncation = extract_truncation_hint(outcome.result.value)
     assert truncation is not None
-    first_event = (await store.list_events("run_1", after=None))[0]
-    truncated = cast(ToolResultTruncatedData, first_event.data)
 
     fetch_outcome = await runtime.execute_tool_call(
         _framework_request(
@@ -267,30 +266,20 @@ async def test_fetch_more_event_order_and_return_event_cursor() -> None:
     )
 
     assert isinstance(fetch_outcome, ToolCompletedOutcome)
+    assert _content_value(fetch_outcome.result.value) == [3]
+    assert extract_truncation_hint(fetch_outcome.result.value) is not None
     events = await store.list_events("run_1", after=None)
-    assert [event.type for event in events] == [
-        RunEventType.TOOL_RESULT_TRUNCATED,
-        RunEventType.TOOL_CURSOR_ISSUED,
-        RunEventType.TOOL_FETCH_MORE_REQUESTED,
-        RunEventType.TOOL_FETCH_MORE_COMPLETED,
-        RunEventType.TOOL_CURSOR_ISSUED,
-    ]
-    requested = events[2].data
-    completed = events[3].data
-    assert isinstance(requested, ToolFetchMoreRequestedData)
-    assert isinstance(completed, ToolFetchMoreCompletedData)
-    assert requested.cursor_fingerprint == truncated.cursor_fingerprint
-    assert completed.next_cursor_fingerprint is not None
+    assert events == ()
 
 
 @pytest.mark.asyncio
-async def test_denied_fetch_more_appends_denied_and_failed_facts() -> None:
-    """scope token 错误时追加 denied 与 failed canonical facts。"""
+async def test_denied_fetch_more_returns_failed_outcome_without_special_facts() -> None:
+    """scope token 错误时返回普通 failed outcome，不追加专属事实。"""
 
     runtime, store = _runtime()
     outcome = await runtime.execute_tool_call(_request())
     assert isinstance(outcome, ToolCompletedOutcome)
-    truncation = outcome.result.truncation
+    truncation = extract_truncation_hint(outcome.result.value)
     assert truncation is not None
 
     fetch_outcome = await runtime.execute_tool_call(
@@ -302,24 +291,17 @@ async def test_denied_fetch_more_appends_denied_and_failed_facts() -> None:
 
     assert isinstance(fetch_outcome, ToolFailedOutcome)
     events = await store.list_events("run_1", after=None)
-    assert [event.type for event in events[-3:]] == [
-        RunEventType.TOOL_FETCH_MORE_REQUESTED,
-        RunEventType.TOOL_CURSOR_DENIED,
-        RunEventType.TOOL_FETCH_MORE_FAILED,
-    ]
-    failed = events[-1].data
-    assert isinstance(failed, ToolFetchMoreFailedData)
-    assert failed.denied is True
+    assert events == ()
 
 
 @pytest.mark.asyncio
-async def test_cross_run_fetch_more_appends_owner_cursor_denied_fact() -> None:
-    """跨 Run framework ``fetch_more`` 拒绝事实进入 cursor owner Run。"""
+async def test_cross_run_fetch_more_returns_failure_without_polluting_claimed_run() -> None:
+    """跨 Run framework ``fetch_more`` 返回失败且不写伪造事实。"""
 
     runtime, store = _runtime()
     outcome = await runtime.execute_tool_call(_request())
     assert isinstance(outcome, ToolCompletedOutcome)
-    truncation = outcome.result.truncation
+    truncation = extract_truncation_hint(outcome.result.value)
     assert truncation is not None
 
     denied = await runtime.execute_tool_call(
@@ -333,14 +315,13 @@ async def test_cross_run_fetch_more_appends_owner_cursor_denied_fact() -> None:
     assert isinstance(denied, ToolFailedOutcome)
     owner_events = await store.list_events("run_1", after=None)
     claimed_events = await store.list_events("run_2", after=None)
+    assert owner_events == ()
     assert claimed_events == ()
-    assert owner_events[-1].type == RunEventType.TOOL_FETCH_MORE_FAILED
-    assert RunEventType.TOOL_CURSOR_DENIED in {event.type for event in owner_events}
 
 
 @pytest.mark.asyncio
-async def test_expired_cursor_appends_owner_cursor_expired_fact() -> None:
-    """过期 cursor 经 framework ``fetch_more`` 进入 cursor owner RunEvent。"""
+async def test_expired_cursor_returns_failure_without_special_fact() -> None:
+    """过期 cursor 经 framework ``fetch_more`` 返回普通失败 outcome。"""
 
     clock = _Clock()
     store = InMemoryRunEventStore()
@@ -354,7 +335,7 @@ async def test_expired_cursor_appends_owner_cursor_expired_fact() -> None:
     )
     outcome = await runtime.execute_tool_call(_request())
     assert isinstance(outcome, ToolCompletedOutcome)
-    truncation = outcome.result.truncation
+    truncation = extract_truncation_hint(outcome.result.value)
     assert truncation is not None
     clock.now = 131.0
 
@@ -367,9 +348,7 @@ async def test_expired_cursor_appends_owner_cursor_expired_fact() -> None:
 
     assert isinstance(expired, ToolFailedOutcome)
     events = await store.list_events("run_1", after=None)
-    event_types = [event.type for event in events]
-    assert RunEventType.TOOL_CURSOR_EXPIRED in event_types
-    assert events[-1].type == RunEventType.TOOL_FETCH_MORE_FAILED
+    assert events == ()
 
 
 @pytest.mark.asyncio
@@ -379,7 +358,7 @@ async def test_terminal_run_fetch_more_returns_failure_without_new_event() -> No
     runtime, store = _runtime()
     outcome = await runtime.execute_tool_call(_request())
     assert isinstance(outcome, ToolCompletedOutcome)
-    truncation = outcome.result.truncation
+    truncation = extract_truncation_hint(outcome.result.value)
     assert truncation is not None
     await store.append(
         RunEventDraft(

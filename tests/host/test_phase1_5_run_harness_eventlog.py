@@ -11,7 +11,7 @@ from datetime import datetime, timezone
 import pytest
 from _pytest.logging import LogCaptureFixture
 
-from dayu.contracts import CancellationToken
+from dayu.contracts import CancellationToken, ToolSchema
 from dayu.contracts.tool_outcome import ToolCompletedOutcome
 from dayu.contracts.tool_result import ToolResultSuccess
 from dayu.engine import (
@@ -104,6 +104,7 @@ class _ScriptedProxy:
     def stream_engine_events(
         self,
         request: StartRunRequest,
+        tool_schemas: tuple[ToolSchema, ...],
         cancellation_token: CancellationToken,
     ) -> AsyncIterator[EngineEvent]:
         """返回脚本化 EngineEvent 流。
@@ -139,6 +140,7 @@ class _FailingProxy:
     def stream_engine_events(
         self,
         request: StartRunRequest,
+        tool_schemas: tuple[ToolSchema, ...],
         cancellation_token: CancellationToken,
     ) -> AsyncIterator[EngineEvent]:
         """返回会失败的 EngineEvent 流。
@@ -217,6 +219,7 @@ class _ClosingFailureProxy:
     def stream_engine_events(
         self,
         request: StartRunRequest,
+        tool_schemas: tuple[ToolSchema, ...],
         cancellation_token: CancellationToken,
     ) -> AsyncIterator[EngineEvent]:
         """返回配置好的 EngineEvent 流。
@@ -797,7 +800,10 @@ async def test_terminal_result_error_does_not_append_host_failure() -> None:
     )
 
     with pytest.raises(TypeError, match="FinalAnswerData"):
-        await harness._run_to_store(_request(run_id))
+        await harness._run_to_store(
+            _request(run_id),
+            tool_schemas=(),
+        )
 
     events = await store.list_events(run_id=run_id, after=None)
     assert len(events) == 1
@@ -843,7 +849,10 @@ async def test_stream_close_error_does_not_mask_terminal_contract_error(
     caplog.set_level(logging.WARNING, logger="dayu.host._run_harness")
 
     with pytest.raises(TypeError, match="FinalAnswerData"):
-        await harness._run_to_store(_request(run_id))
+        await harness._run_to_store(
+            _request(run_id),
+            tool_schemas=(),
+        )
 
     events = await store.list_events(run_id=run_id, after=None)
     close_logs = [
@@ -884,7 +893,10 @@ async def test_stream_close_error_does_not_change_worker_failure_fact(
 
     caplog.set_level(logging.WARNING, logger="dayu.host._run_harness")
 
-    await harness._run_to_store(_request(run_id))
+    await harness._run_to_store(
+        _request(run_id),
+        tool_schemas=(),
+    )
 
     events = await store.list_events(run_id=run_id, after=None)
     close_logs = [
@@ -928,7 +940,10 @@ async def test_stream_close_error_after_success_does_not_append_host_failure(
 
     caplog.set_level(logging.WARNING, logger="dayu.host._run_harness")
 
-    await harness._run_to_store(_request(run_id))
+    await harness._run_to_store(
+        _request(run_id),
+        tool_schemas=(),
+    )
 
     events = await store.list_events(run_id=run_id, after=None)
     result = await harness.get_run_result(run_id)
@@ -1078,7 +1093,6 @@ def test_engine_event_kind_classification_matrix() -> None:
                     result=ToolResultSuccess(
                         ok=True,
                         value={"ok": True},
-                        truncation=None,
                         meta=None,
                     )
                 ),

@@ -186,7 +186,6 @@ class _RecordingToolExecutor:
             result=ToolResultSuccess(
                 ok=True,
                 value={"sum": 5},
-                truncation=None,
                 meta=None,
             )
         )

@@ -34,6 +34,7 @@ import pytest
 from dayu.host._attempt_lease import (
     AttemptFencingError,
     AttemptLeaseConfig,
+    AttemptOwnerToken,
     AttemptRecoveryAction,
 )
 from dayu.host._attempt_supervisor import AttemptSupervisor
@@ -384,14 +385,22 @@ async def test_recover_returns_noop_when_cas_misses(
 
         original_list = AttemptLeaseStore.list_recovery_candidates
 
+        replacement_owner = AttemptOwnerToken.new()
+
         def _patched_list(  # type: ignore[no-untyped-def]
             self, *, tx, run_id, now
         ):
             candidates = original_list(self, tx=tx, run_id=run_id, now=now)
             tx.execute(
-                "UPDATE host_attempts SET fencing_token = ? "
+                "UPDATE host_attempts SET owner_id = ?, "
+                "owner_token_hash = ?, fencing_token = ? "
                 "WHERE attempt_id = ?",
-                (stale_token + 999, old_attempt_id),
+                (
+                    "replacement-owner",
+                    replacement_owner.digest(),
+                    stale_token + 999,
+                    old_attempt_id,
+                ),
             )
             return candidates
 
@@ -410,10 +419,14 @@ async def test_recover_returns_noop_when_cas_misses(
         assert await _attempt_count(storage, run_id=_RUN_ID) == 1
         async with storage.transaction() as tx:
             row = tx.execute(
-                "SELECT state FROM host_attempts WHERE attempt_id = ?",
+                "SELECT state, owner_id, owner_token_hash, fencing_token "
+                "FROM host_attempts WHERE attempt_id = ?",
                 (old_attempt_id,),
             ).fetchone()
         assert row["state"] == AttemptState.RUNNING.value
+        assert row["owner_id"] == "replacement-owner"
+        assert row["owner_token_hash"] == replacement_owner.digest()
+        assert int(row["fencing_token"]) == stale_token + 999
     finally:
         storage.close()
 

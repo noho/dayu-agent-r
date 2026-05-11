@@ -24,6 +24,7 @@ from dayu.engine import FinishReason, RunResumeHint
 from dayu.host._attempt_lease import (
     AttemptFencingError,
     AttemptFencingReason,
+    AttemptLeaseBusyReason,
     AttemptLeaseDecision,
     AttemptLeaseResult,
     AttemptOwnerContext,
@@ -1238,7 +1239,8 @@ class AttemptLeaseStore:
                 current_state=None,
                 current_owner_id=None,
                 lease_expires_at=None,
-                reason=AttemptFencingReason.STORAGE_CONFLICT,
+                reason=None,
+                busy_reason=AttemptLeaseBusyReason.ATTEMPT_INDEX_CONFLICT,
             )
         lease_raw = row["lease_expires_at"]
         fencing_token_raw = row["fencing_token"]
@@ -1256,6 +1258,7 @@ class AttemptLeaseStore:
                 else FencingToken(value=int(fencing_token_raw))
             ),
             reason=None,
+            busy_reason=AttemptLeaseBusyReason.ATTEMPT_INDEX_CONFLICT,
         )
 
 

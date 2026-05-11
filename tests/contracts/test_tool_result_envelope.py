@@ -18,7 +18,7 @@ from dayu.contracts.tool_result import (
 def test_success_envelope_has_ok_true_and_value() -> None:
     """:class:`ToolResultSuccess` 应固定 ``ok=True`` 并承载 ``value``。"""
 
-    s = ToolResultSuccess(ok=True, value={"a": 1}, truncation=None, meta=None)
+    s = ToolResultSuccess(ok=True, value={"a": 1}, meta=None)
     assert s.ok is True
     assert isinstance(s, ToolResultSuccess)
     assert not isinstance(s, ToolResultFailure)
@@ -42,7 +42,7 @@ def test_envelope_field_sets_do_not_contain_await_spec() -> None:
     success_fields = {f.name for f in dataclasses.fields(ToolResultSuccess)}
     failure_fields = {f.name for f in dataclasses.fields(ToolResultFailure)}
     forbidden = {"await_spec", "await", "awaiting"}
-    assert success_fields == {"ok", "value", "truncation", "meta"}
+    assert success_fields == {"ok", "value", "meta"}
     assert failure_fields == {"ok", "error", "message", "hint", "meta"}
     assert success_fields.isdisjoint(forbidden)
     assert failure_fields.isdisjoint(forbidden)

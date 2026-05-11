@@ -120,7 +120,6 @@ class SSEParser:
         self._data_lines: list[str] = []
         self._terminated: bool = False
         self._tool_calls_seen: bool = False
-        self._fatal_terminated: bool = False
         self._utf8_decoder: codecs.IncrementalDecoder = (
             codecs.getincrementaldecoder("utf-8")(errors="strict")
         )
@@ -195,6 +194,7 @@ class SSEParser:
                 message="failed to decode SSE chunk as UTF-8",
                 provider_request_id=None,
                 raw_payload=raw_payload,
+                partial_tool_calls=self._aggregator.partial_summaries(),
             )
         )
         self._terminated = True
@@ -238,9 +238,9 @@ class SSEParser:
                     message=f"SSE data line is not valid JSON: {exc}",
                     provider_request_id=None,
                     raw_payload=None,
+                    partial_tool_calls=self._aggregator.partial_summaries(),
                 )
             )
-            self._fatal_terminated = True
             self._terminated = True
             yield _make_event(
                 RunnerDoneData(finish_reason=FinishReason.ERROR)
@@ -253,9 +253,9 @@ class SSEParser:
                     message="SSE data line is not a JSON object",
                     provider_request_id=None,
                     raw_payload=None,
+                    partial_tool_calls=self._aggregator.partial_summaries(),
                 )
             )
-            self._fatal_terminated = True
             self._terminated = True
             yield _make_event(
                 RunnerDoneData(finish_reason=FinishReason.ERROR)
@@ -429,7 +429,12 @@ class SSEParser:
                     message="usage fields are not all integers",
                     provider_request_id=None,
                     raw_payload=None,
+                    partial_tool_calls=self._aggregator.partial_summaries(),
                 )
+            )
+            self._terminated = True
+            yield _make_event(
+                RunnerDoneData(finish_reason=FinishReason.ERROR)
             )
             return
         normalized: _OpenAIUsage = {
@@ -468,7 +473,6 @@ class SSEParser:
             if result.fatal_errors:
                 for fatal in result.fatal_errors:
                     yield _make_event(fatal)
-                self._fatal_terminated = True
                 self._terminated = True
                 yield _make_event(
                     RunnerDoneData(finish_reason=FinishReason.ERROR)

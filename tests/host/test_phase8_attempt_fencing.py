@@ -28,6 +28,7 @@ from dayu.engine.contracts.engine_events import IterationStartedData
 from dayu.host._attempt_lease import (
     AttemptFencingError,
     AttemptFencingReason,
+    AttemptLeaseBusyReason,
     AttemptLeaseDecision,
     AttemptLeaseConfig,
     AttemptOwnerToken,
@@ -49,6 +50,7 @@ from dayu.host._run_state_store import (
     RunStateStore,
 )
 from dayu.host.contracts import (
+    HostRunFailedData,
     RunEventDraft,
     RunEventKind,
     RunEventSource,
@@ -175,6 +177,31 @@ def _final_answer_draft(
     )
 
 
+def _host_failed_draft(*, run_id: str) -> RunEventDraft:
+    """构造 Host ``RUN_FAILED`` terminal 草稿。
+
+    :param run_id: Run id。
+    :returns: Host 失败 terminal RunEvent 草稿。
+    :raises Exception: 不主动抛出异常。
+    """
+
+    return RunEventDraft(
+        run_id=run_id,
+        session_id="s",
+        kind=RunEventKind.CANONICAL,
+        source=RunEventSource.HOST,
+        type=RunEventType.RUN_FAILED,
+        occurred_at=datetime.now(tz=timezone.utc),
+        data=HostRunFailedData(
+            error_code="attempt_lease_lost",
+            message="attempt lease lost",
+            recoverable=False,
+            exception_type="RuntimeError",
+        ),
+        source_engine_event_id=None,
+    )
+
+
 @pytest.mark.asyncio
 async def test_append_terminal_and_close_writes_position_atomically() -> None:
     """正常 owner: terminal append + close 同事务原子写入。
@@ -246,6 +273,50 @@ async def test_append_terminal_and_close_writes_position_atomically() -> None:
         )
         assert isinstance(run_record.result, RunSucceededResult)
         assert run_record.result.content == "ok"
+    finally:
+        storage.close()
+
+
+@pytest.mark.asyncio
+async def test_terminal_override_does_not_overwrite_existing_terminal_truth() -> None:
+    """已有 terminal truth 时, LOST override 不得覆盖 attempt / EventLog。"""
+
+    storage = _open_storage()
+    try:
+        await _seed_run(storage)
+        clock = _FakeClock()
+        supervisor = _build_supervisor(storage=storage, clock=clock)
+        attempt_state_store = AttemptStateStore(storage=storage, clock=clock)
+        async with supervisor.lease_context(
+            run_id="r1", attempt_index=0
+        ) as owner_context:
+            first_link = await supervisor.append_terminal_and_close(
+                owner_context=owner_context,
+                draft=_final_answer_draft(run_id="r1"),
+                failure_summary=None,
+            )
+            with pytest.raises(AttemptFencingError) as excinfo:
+                await supervisor.append_terminal_and_close(
+                    owner_context=owner_context,
+                    draft=_host_failed_draft(run_id="r1"),
+                    failure_summary="attempt_lease_lost:fenced",
+                    terminal_state_override=AttemptState.LOST,
+                )
+
+        assert excinfo.value.reason is AttemptFencingReason.ATTEMPT_TERMINAL
+        attempt = attempt_state_store.get(owner_context.attempt_id)
+        assert attempt is not None
+        assert attempt.state is AttemptState.SUCCEEDED
+        assert attempt.terminal_event_position is not None
+        assert (
+            attempt.terminal_event_position.value
+            == first_link.event_position.value
+        )
+        events = await supervisor.event_store.list_events(
+            run_id="r1", after=None
+        )
+        assert len(events) == 1
+        assert events[0].type is RunEventType.FINAL_ANSWER
     finally:
         storage.close()
 
@@ -405,7 +476,7 @@ async def test_append_terminal_and_close_validates_run_id_and_type() -> None:
                     draft=mismatched,
                     failure_summary=None,
                 )
-            assert exc_info.value.reason == AttemptFencingReason.OWNER_MISMATCH
+            assert exc_info.value.reason == AttemptFencingReason.RUN_ID_MISMATCH
             non_terminal = RunEventDraft(
                 run_id="r1",
                 session_id="s",
@@ -489,7 +560,7 @@ async def test_scoped_appender_blocks_terminal_drafts() -> None:
 
 @pytest.mark.asyncio
 async def test_scoped_appender_rejects_run_id_mismatch() -> None:
-    """draft.run_id 与 owner_context.run_id 不一致时抛 OWNER_MISMATCH 不写入。"""
+    """draft.run_id 与 owner_context.run_id 不一致时抛 RUN_ID_MISMATCH。"""
 
     storage = _open_storage()
     try:
@@ -505,7 +576,7 @@ async def test_scoped_appender_rejects_run_id_mismatch() -> None:
             )
             with pytest.raises(AttemptFencingError) as excinfo:
                 await appender.append(mismatch)
-            assert excinfo.value.reason == AttemptFencingReason.OWNER_MISMATCH
+            assert excinfo.value.reason == AttemptFencingReason.RUN_ID_MISMATCH
             assert excinfo.value.attempt_id == owner_context.attempt_id
             events = await supervisor.event_store.list_events(
                 run_id="r1", after=None
@@ -641,6 +712,8 @@ async def test_busy_acquire_result_includes_current_fencing_token() -> None:
                 lease_expires_at=clock.now() + timedelta(seconds=30),
             )
         assert busy.decision is AttemptLeaseDecision.BUSY
+        assert busy.reason is None
+        assert busy.busy_reason is AttemptLeaseBusyReason.ATTEMPT_INDEX_CONFLICT
         assert busy.current_fencing_token == first.owner_context.fencing_token
     finally:
         storage.close()
@@ -670,6 +743,54 @@ async def test_scoped_appender_appends_when_owner_active() -> None:
             )
             assert len(events) == 1
             assert events[0].source_engine_event_id == "engine_preview_ok"
+    finally:
+        storage.close()
+
+
+@pytest.mark.asyncio
+async def test_verify_active_owner_accepts_current_owner() -> None:
+    """``verify_active_owner`` 对当前 owner CAS 命中时不抛异常。"""
+
+    storage = _open_storage()
+    try:
+        await _seed_run(storage)
+        clock = _FakeClock()
+        supervisor = _build_supervisor(storage=storage, clock=clock)
+        async with supervisor.lease_context(
+            run_id="r1", attempt_index=0
+        ) as owner_context:
+            appender = supervisor.scoped_appender(owner_context)
+            await appender.verify_active_owner(run_id="r1")
+    finally:
+        storage.close()
+
+
+@pytest.mark.asyncio
+async def test_verify_active_owner_rejects_fenced_owner() -> None:
+    """``verify_active_owner`` 对 stale owner CAS miss 时抛 typed fencing error。"""
+
+    storage = _open_storage()
+    try:
+        await _seed_run(storage)
+        clock = _FakeClock()
+        supervisor = _build_supervisor(storage=storage, clock=clock)
+        async with supervisor.lease_context(
+            run_id="r1", attempt_index=0
+        ) as owner_context:
+            appender = supervisor.scoped_appender(owner_context)
+            other_owner_token = AttemptOwnerToken.new()
+            async with storage.transaction() as tx:
+                tx.execute(
+                    "UPDATE host_attempts SET owner_token_hash = ?, "
+                    "fencing_token = ? WHERE attempt_id = ?",
+                    (
+                        other_owner_token.digest(),
+                        owner_context.fencing_token.value + 9000,
+                        owner_context.attempt_id,
+                    ),
+                )
+            with pytest.raises(AttemptFencingError):
+                await appender.verify_active_owner(run_id="r1")
     finally:
         storage.close()
 
@@ -762,7 +883,7 @@ async def test_append_in_transaction_rolls_back_when_owner_fenced() -> None:
 
 @pytest.mark.asyncio
 async def test_append_in_transaction_rejects_run_id_mismatch() -> None:
-    """``append_in_transaction``: draft.run_id 与 owner 不一致抛 OWNER_MISMATCH。
+    """``append_in_transaction``: draft.run_id 与 owner 不一致抛 RUN_ID_MISMATCH。
 
     与 ``append`` 路径保持一致的 typed reason, 不允许跨 run 借助同事务旁
     路 fencing。
@@ -784,7 +905,7 @@ async def test_append_in_transaction_rejects_run_id_mismatch() -> None:
             with pytest.raises(AttemptFencingError) as excinfo:
                 async with storage.transaction() as tx:
                     appender.append_in_transaction(tx=tx, draft=mismatch)
-            assert excinfo.value.reason == AttemptFencingReason.OWNER_MISMATCH
+            assert excinfo.value.reason == AttemptFencingReason.RUN_ID_MISMATCH
             events = await supervisor.event_store.list_events(
                 run_id="r1", after=None
             )

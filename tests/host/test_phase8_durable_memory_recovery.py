@@ -15,6 +15,7 @@
 from __future__ import annotations
 
 import json
+import logging
 from collections.abc import Iterable
 from dataclasses import dataclass, replace
 from datetime import datetime, timezone
@@ -43,6 +44,7 @@ from dayu.host._conversation_memory import (
 )
 from dayu.host._conversation_memory_durable import (
     DurableConversationMemoryStore,
+    MemoryRepairDiagnosticKind,
     _decode_snapshot_text,
     _encode_snapshot_text,
     open_durable_conversation_memory_store,
@@ -160,6 +162,49 @@ def _snapshot_updated_at(storage: HostStorage, *, session_id: str) -> str:
     updated_at = rows[0]["updated_at"]
     assert isinstance(updated_at, str)
     return updated_at
+
+
+def _snapshot_payload(storage: HostStorage, *, session_id: str) -> str:
+    """读取 durable memory snapshot 的 raw payload。
+
+    :param storage: Host storage。
+    :param session_id: 会话 id。
+    :returns: snapshot payload 文本。
+    :raises AssertionError: snapshot row 不存在或字段类型错误时抛出。
+    """
+
+    rows = storage.execute_read(
+        "SELECT snapshot_payload FROM host_conversation_memory_snapshots "
+        "WHERE session_id = ?",
+        (session_id,),
+    )
+    assert rows
+    payload_text = rows[0]["snapshot_payload"]
+    assert isinstance(payload_text, str)
+    return payload_text
+
+
+async def _overwrite_snapshot_payload(
+    storage: HostStorage,
+    *,
+    session_id: str,
+    payload_text: str,
+) -> None:
+    """测试辅助：直接覆盖 durable snapshot payload。
+
+    :param storage: Host storage。
+    :param session_id: 会话 id。
+    :param payload_text: 要写入的 snapshot payload 文本。
+    :returns: 无返回值。
+    :raises sqlite3.DatabaseError: 写入失败时抛出。
+    """
+
+    async with storage.transaction() as tx:
+        tx.execute(
+            "UPDATE host_conversation_memory_snapshots "
+            "SET snapshot_payload = ? WHERE session_id = ?",
+            (payload_text, session_id),
+        )
 
 
 @pytest.mark.asyncio
@@ -335,7 +380,8 @@ async def test_terminal_projection_rereads_run_events_after_pending_checkpoint_r
         repaired = await bundle_b.memory_store.repair_missing_session_snapshots(
             event_store=bundle_b.event_store
         )
-        assert repaired == ()
+        assert repaired.repaired_session_ids == ()
+        assert repaired.diagnostics == ()
     finally:
         bundle_b.close()
 
@@ -710,6 +756,202 @@ async def test_startup_reconcile_repairs_snapshot_when_checkpoint_caught_up_and_
         assert again.recent_raw_turns == recovered.recent_raw_turns
     finally:
         bundle_b.close()
+
+
+@pytest.mark.asyncio
+async def test_repair_reports_corrupt_snapshot_and_repairs_other_missing_session(
+    tmp_path: Path,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """坏 snapshot row 不得被覆盖，repair 必须继续恢复其它缺失 session。"""
+
+    db_path = tmp_path / "memory_repair_corrupt.sqlite"
+    config = DurableHarnessConfig(database_path=str(db_path))
+    corrupt_session_id = "session_repair_corrupt"
+    missing_session_id = "session_repair_missing_after_corrupt"
+
+    bundle = build_durable_harness(config=config)
+    try:
+        await bundle.event_store.append(
+            _user_input_draft(
+                run_id="run_corrupt_1",
+                session_id=corrupt_session_id,
+                content="会留下损坏 snapshot 的事实。",
+            )
+        )
+        await bundle.event_store.append(
+            _final_draft(
+                run_id="run_corrupt_1",
+                session_id=corrupt_session_id,
+                content="corrupt final",
+            )
+        )
+        await bundle.event_store.append(
+            _user_input_draft(
+                run_id="run_missing_after_corrupt_1",
+                session_id=missing_session_id,
+                content="需要继续恢复的事实。",
+            )
+        )
+        await bundle.event_store.append(
+            _final_draft(
+                run_id="run_missing_after_corrupt_1",
+                session_id=missing_session_id,
+                content="missing final",
+            )
+        )
+        await bundle.coordinator.drain()
+
+        corrupt_payload = "{bad-json"
+        await _overwrite_snapshot_payload(
+            bundle.storage,
+            session_id=corrupt_session_id,
+            payload_text=corrupt_payload,
+        )
+        async with bundle.storage.transaction() as tx:
+            tx.execute(
+                "DELETE FROM host_conversation_memory_snapshots "
+                "WHERE session_id = ?",
+                (missing_session_id,),
+            )
+
+        caplog.set_level(
+            logging.WARNING,
+            logger="dayu.host._conversation_memory_durable",
+        )
+        assert isinstance(bundle.memory_store, DurableConversationMemoryStore)
+        report = await bundle.memory_store.repair_missing_session_snapshots(
+            event_store=bundle.event_store
+        )
+
+        assert report.repaired_session_ids == (missing_session_id,)
+        assert len(report.diagnostics) == 1
+        diagnostic = report.diagnostics[0]
+        assert diagnostic.kind is MemoryRepairDiagnosticKind.CORRUPT_SNAPSHOT
+        assert diagnostic.session_id == corrupt_session_id
+        assert "durable_repair_diagnostic" in caplog.text
+        assert _snapshot_payload(
+            bundle.storage, session_id=corrupt_session_id
+        ) == corrupt_payload
+        with pytest.raises(ValueError):
+            await bundle.memory_store.get_snapshot(corrupt_session_id)
+
+        recovered = await bundle.memory_store.get_snapshot(missing_session_id)
+        assert any(
+            turn.user_text == "需要继续恢复的事实。"
+            for turn in recovered.recent_raw_turns
+        )
+    finally:
+        bundle.close()
+
+
+@pytest.mark.asyncio
+async def test_repair_reports_schema_mismatch_without_overwrite(
+    tmp_path: Path,
+) -> None:
+    """schema mismatch snapshot row 必须只返回 diagnostic，不自动覆盖。"""
+
+    db_path = tmp_path / "memory_repair_schema_mismatch.sqlite"
+    config = DurableHarnessConfig(database_path=str(db_path))
+    session_id = "session_schema_mismatch"
+    run_id = "run_schema_mismatch_1"
+
+    bundle = build_durable_harness(config=config)
+    try:
+        await bundle.event_store.append(
+            _user_input_draft(
+                run_id=run_id,
+                session_id=session_id,
+                content="schema mismatch should not be overwritten",
+            )
+        )
+        await bundle.event_store.append(
+            _final_draft(
+                run_id=run_id,
+                session_id=session_id,
+                content="schema mismatch final",
+            )
+        )
+        await bundle.coordinator.drain()
+
+        bad_payload = json.dumps(
+            {"schema_version": 999, "session_id": session_id}
+        )
+        await _overwrite_snapshot_payload(
+            bundle.storage,
+            session_id=session_id,
+            payload_text=bad_payload,
+        )
+
+        report = await bundle.startup_reconcile()
+
+        assert report is not None
+        assert report.repaired_session_ids == ()
+        assert len(report.diagnostics) == 1
+        diagnostic = report.diagnostics[0]
+        assert diagnostic.kind is MemoryRepairDiagnosticKind.CORRUPT_SNAPSHOT
+        assert diagnostic.session_id == session_id
+        assert _snapshot_payload(
+            bundle.storage, session_id=session_id
+        ) == bad_payload
+    finally:
+        bundle.close()
+
+
+@pytest.mark.asyncio
+async def test_repair_reports_snapshot_only_corrupt_row_without_overwrite(
+    tmp_path: Path,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """无 canonical EventLog 的坏 snapshot row 也必须诊断且不覆盖。"""
+
+    db_path = tmp_path / "memory_snapshot_only_corrupt.sqlite"
+    config = DurableHarnessConfig(database_path=str(db_path))
+    session_id = "session_snapshot_only_corrupt"
+
+    bundle = build_durable_harness(config=config)
+    try:
+        await bundle.memory_store.apply_patch(
+            MemoryResetPatch(
+                session_id=session_id,
+                scope=MemoryScope.SESSION,
+                reason="test_snapshot_only_reset",
+            )
+        )
+        valid_empty_payload = _snapshot_payload(
+            bundle.storage, session_id=session_id
+        )
+        assert _decode_snapshot_text(
+            payload_text=valid_empty_payload
+        ).recent_raw_turns == ()
+
+        corrupt_payload = "{bad-json"
+        await _overwrite_snapshot_payload(
+            bundle.storage,
+            session_id=session_id,
+            payload_text=corrupt_payload,
+        )
+
+        caplog.set_level(
+            logging.WARNING,
+            logger="dayu.host._conversation_memory_durable",
+        )
+        report = await bundle.startup_reconcile()
+
+        assert report is not None
+        assert report.repaired_session_ids == ()
+        assert len(report.diagnostics) == 1
+        diagnostic = report.diagnostics[0]
+        assert diagnostic.kind is MemoryRepairDiagnosticKind.CORRUPT_SNAPSHOT
+        assert diagnostic.session_id == session_id
+        assert "durable_repair_diagnostic" in caplog.text
+        assert _snapshot_payload(
+            bundle.storage, session_id=session_id
+        ) == corrupt_payload
+        with pytest.raises(ValueError):
+            await bundle.memory_store.get_snapshot(session_id)
+    finally:
+        bundle.close()
 
 
 @pytest.mark.asyncio

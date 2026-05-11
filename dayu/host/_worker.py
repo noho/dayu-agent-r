@@ -9,7 +9,7 @@ import logging
 from collections.abc import AsyncIterator
 from dataclasses import dataclass
 
-from dayu.contracts import CancellationToken, ToolExecutor
+from dayu.contracts import CancellationToken, ToolExecutor, ToolSchema
 from dayu.engine import AgentRunRequest, EngineEvent, run_agent_messages
 from dayu.host.contracts import StartRunRequest
 from dayu.runtime.log_levels import VERBOSE_LOG_LEVEL
@@ -29,11 +29,14 @@ class EngineWorker:
     def run_agent_messages(
         self,
         request: StartRunRequest,
+        tool_schemas: tuple[ToolSchema, ...],
         cancellation_token: CancellationToken,
     ) -> AsyncIterator[EngineEvent]:
         """调用 Engine 函数式入口并返回 EngineEvent 流。
 
         :param request: Host P1 start_run 请求。
+        :param tool_schemas: Host 已显式确定的当前 Engine-visible 工具
+            schema 集合。
         :param cancellation_token: Host 注入的取消观察 token。
         :returns: EngineEvent 异步流。
         :raises Exception: 透传 Engine 运行异常。
@@ -48,7 +51,7 @@ class EngineWorker:
             runner_spec=request.options.runner_spec,
             runner_options=request.options.runner_options,
             agent_policy=request.options.agent_policy,
-            tool_schemas=request.options.tool_schemas,
+            tool_schemas=tool_schemas,
             tool_executor=self.tool_executor,
             cancellation_token=cancellation_token,
         )

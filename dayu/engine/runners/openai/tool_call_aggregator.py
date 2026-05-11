@@ -16,6 +16,7 @@ OLD 已验证的兼容点（见 phase1-plan.md §5.3）：
 
 from __future__ import annotations
 
+import hashlib
 import json
 from collections.abc import Mapping
 from dataclasses import dataclass, field
@@ -26,6 +27,10 @@ from dayu.contracts.tool_call import (
     ToolCallProviderState,
     ToolCallRequest,
 )
+from dayu.engine.contracts.partial_tool_call import (
+    PARTIAL_TOOL_CALL_ID_MAX_CHARS,
+    PartialToolCallSummary,
+)
 from dayu.engine.contracts.runner_events import RunnerProtocolErrorData
 from dayu.engine.runners.openai._types import _OpenAIToolCallDelta
 
@@ -35,6 +40,21 @@ _GEMINI_THOUGHT_KEY: str = "thought"
 _KNOWN_GEMINI_KEYS: frozenset[str] = frozenset(
     {_GEMINI_THOUGHT_SIGNATURE_KEY, _GEMINI_THOUGHT_KEY}
 )
+PARTIAL_TOOL_CALL_SUMMARY_MAX_ITEMS: int = 16
+PARTIAL_TOOL_CALL_NAME_FRAGMENT_MAX_CHARS: int = 128
+
+
+def _bounded_name_fragment(name: str) -> str | None:
+    """生成用于协议错误诊断的工具名片段。
+
+    :param name: 已累积的工具名。
+    :returns: 空名称返回 ``None``；非空名称返回按字符数截断后的片段。
+    :raises Exception: 不主动抛出异常。
+    """
+
+    if not name:
+        return None
+    return name[:PARTIAL_TOOL_CALL_NAME_FRAGMENT_MAX_CHARS]
 
 
 @dataclass(slots=True)
@@ -177,6 +197,7 @@ class ToolCallAggregator:
                     message="tool call delta missing both index and id",
                     provider_request_id=None,
                     raw_payload=None,
+                    partial_tool_calls=self.partial_summaries(),
                 )
             )
             return None
@@ -227,6 +248,7 @@ class ToolCallAggregator:
                         ),
                         provider_request_id=None,
                         raw_payload=None,
+                        partial_tool_calls=self.partial_summaries(),
                     )
                 )
                 continue
@@ -241,6 +263,7 @@ class ToolCallAggregator:
                             ),
                             provider_request_id=None,
                             raw_payload=None,
+                            partial_tool_calls=self.partial_summaries(),
                         )
                     )
             signature = inner.get(_GEMINI_THOUGHT_SIGNATURE_KEY)
@@ -273,6 +296,7 @@ class ToolCallAggregator:
                         message="tool call missing id at finalize",
                         provider_request_id=None,
                         raw_payload=None,
+                        partial_tool_calls=self.partial_summaries(),
                     )
                 )
                 continue
@@ -285,6 +309,7 @@ class ToolCallAggregator:
                         ),
                         provider_request_id=None,
                         raw_payload=None,
+                        partial_tool_calls=self.partial_summaries(),
                     )
                 )
                 continue
@@ -310,6 +335,38 @@ class ToolCallAggregator:
             warnings=tuple(self._warnings),
         )
 
+    def partial_summaries(self) -> tuple[PartialToolCallSummary, ...]:
+        """生成当前 partial tool call 有界摘要。
+
+        :returns: 按 provider index 排序的 partial summary 元组。
+        :raises Exception: 不主动抛出异常。
+        """
+
+        summaries: list[PartialToolCallSummary] = []
+        for index in sorted(self._partials_by_index.keys())[
+            :PARTIAL_TOOL_CALL_SUMMARY_MAX_ITEMS
+        ]:
+            partial = self._partials_by_index[index]
+            arguments_sha256 = (
+                None
+                if partial.arguments_buffer == ""
+                else hashlib.sha256(
+                    partial.arguments_buffer.encode("utf-8")
+                ).hexdigest()
+            )
+            summaries.append(
+                PartialToolCallSummary(
+                    tool_call_index=index,
+                    tool_call_id=_bounded_tool_call_id(partial.tool_call_id),
+                    name_fragment=_bounded_name_fragment(partial.name),
+                    arguments_byte_size=len(
+                        partial.arguments_buffer.encode("utf-8")
+                    ),
+                    arguments_sha256=arguments_sha256,
+                )
+            )
+        return tuple(summaries)
+
     def _parse_arguments(
         self, buffer: str, *, tool_call_id: str
     ) -> Mapping[str, JsonValue] | None:
@@ -328,6 +385,7 @@ class ToolCallAggregator:
                     ),
                     provider_request_id=None,
                     raw_payload=None,
+                    partial_tool_calls=self.partial_summaries(),
                 )
             )
             return None
@@ -340,10 +398,29 @@ class ToolCallAggregator:
                     ),
                     provider_request_id=None,
                     raw_payload=None,
+                    partial_tool_calls=self.partial_summaries(),
                 )
             )
             return None
         return parsed
 
 
-__all__ = ["ToolCallAggregator", "ToolCallAggregateResult"]
+def _bounded_tool_call_id(value: str | None) -> str | None:
+    """返回有界 provider tool call id 片段。
+
+    :param value: provider 已给出的 tool call id；未知为 ``None``。
+    :returns: 不超过 :data:`PARTIAL_TOOL_CALL_ID_MAX_CHARS` 的 id 片段。
+    :raises Exception: 不主动抛出异常。
+    """
+
+    if value is None:
+        return None
+    return value[:PARTIAL_TOOL_CALL_ID_MAX_CHARS]
+
+
+__all__ = [
+    "PARTIAL_TOOL_CALL_NAME_FRAGMENT_MAX_CHARS",
+    "PARTIAL_TOOL_CALL_SUMMARY_MAX_ITEMS",
+    "ToolCallAggregator",
+    "ToolCallAggregateResult",
+]

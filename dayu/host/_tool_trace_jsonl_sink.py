@@ -1,7 +1,8 @@
 """Host P7 ToolTraceJsonlSink。
 
-本模块把 EventLog canonical fact 派生的 trace record 实时写入 JSONL 文件，
-并把 ``RUN_INPUT_CONTEXT_SNAPSHOT_BUILT`` fact 内联的完整 raw payload 拆为
+本模块把 EventLog canonical fact 派生的 trace record 实时写入 JSONL
+文件，并把 projection 已从 Host raw payload side-store 读取和校验过的
+完整 raw payload 写为
 ``raw_payloads/<run_id>_<iteration_id>/<blob_id>.json`` 文件。每行写入后
 立即 ``flush + fsync``；raw payload 文件采用 ``os.replace`` 原子改名。
 
@@ -9,6 +10,9 @@
 - schema 字面量为 ``tool_trace_v2_host``，**不向后兼容 OLD ``tool_trace_v2``**。
 - 行内 ``idempotency_key`` 字段为 sha256 of source provenance；analyzer 用
   它去重崩溃 replay 产生的孤儿副本。
+- JSONL append 不是跨进程崩溃原子事务：进程可能在 write/flush/fsync
+  之间留下半行或无换行尾行。读侧必须跳过非法 JSON 行，并继续依赖
+  ``idempotency_key`` 去重已完整落盘的重放副本。
 - provider secret 只在 ``PROVIDER_PROTOCOL_ERROR`` 的 raw payload 上 scrub；
   scope_token / cursor / prompt / tool result 不做过滤（按 OLD 热/冷分层
   保留，用于真实故障定位）。
@@ -16,6 +20,7 @@
 
 from __future__ import annotations
 
+import base64
 import hashlib
 import json
 import os
@@ -27,23 +32,14 @@ from pathlib import Path
 from typing import TypeAlias
 
 from dayu.contracts import JsonValue
-
+from dayu.host._credential_scrub import scrub_explicit_credentials
 
 _TRACE_SCHEMA_VERSION_HOST: str = "tool_trace_v2_host"
 _FILE_BYTE_THRESHOLD: int = 10 * 1024 * 1024
-_PROVIDER_SECRET_KEYS: frozenset[str] = frozenset(
-    {
-        "authorization",
-        "api_key",
-        "api-key",
-        "x-api-key",
-        "cookie",
-        "set-cookie",
-        "openai-organization",
-        "x-goog-api-key",
-        "anthropic-api-key",
-    }
-)
+_ENCODED_SEGMENT_PREFIX: str = "b64_"
+_EMPTY_SEGMENT: str = "empty"
+_HASHED_SEGMENT_PREFIX: str = "sha256_"
+_MAX_PATH_SEGMENT_LENGTH: int = 120
 
 
 class ToolTraceSchemaVersion(StrEnum):
@@ -101,27 +97,14 @@ def compute_idempotency_key(
 
 
 def _scrub_provider_secret(payload: JsonValue) -> JsonValue:
-    """递归剔除 provider raw payload 中的 secret 字段。
+    """递归剔除 provider raw payload 中的显式凭证。
 
     :param payload: 任意 JSON value。
     :returns: scrub 后的 JSON value（保持原结构，只替换敏感值为 ``"***"``）。
     :raises Exception: 不主动抛出异常。
     """
 
-    if isinstance(payload, dict):
-        scrubbed: dict[str, JsonValue] = {}
-        for key, value in payload.items():
-            if not isinstance(key, str):
-                scrubbed[str(key)] = _scrub_provider_secret(value)
-                continue
-            if key.lower() in _PROVIDER_SECRET_KEYS:
-                scrubbed[key] = "***"
-            else:
-                scrubbed[key] = _scrub_provider_secret(value)
-        return scrubbed
-    if isinstance(payload, list):
-        return [_scrub_provider_secret(item) for item in payload]
-    return payload
+    return scrub_explicit_credentials(payload)
 
 
 JsonRecord: TypeAlias = Mapping[str, JsonValue]
@@ -163,9 +146,12 @@ class ToolTraceJsonlSink:
         :raises OSError: 写入失败时抛出。
         """
 
-        target_dir = self.root_path / "sessions" / session_id
+        root_path = self.root_path.resolve()
+        target_dir = root_path / "sessions" / _safe_path_segment(session_id)
+        _assert_under_root(root_path=root_path, path=target_dir)
         target_dir.mkdir(parents=True, exist_ok=True)
         target_path = self._select_jsonl_file(target_dir=target_dir)
+        _assert_under_root(root_path=root_path, path=target_path)
         line = json.dumps(dict(record), ensure_ascii=False, sort_keys=True)
         with target_path.open("ab") as handle:
             handle.write(line.encode("utf-8"))
@@ -195,12 +181,17 @@ class ToolTraceJsonlSink:
         :raises OSError: 写入失败时抛出。
         """
 
-        target_dir = (
-            self.root_path / "raw_payloads" / f"{run_id}_{iteration_id}"
+        root_path = self.root_path.resolve()
+        target_dir = root_path / "raw_payloads" / (
+            f"{_safe_path_segment(run_id)}_{_safe_path_segment(iteration_id)}"
         )
+        _assert_under_root(root_path=root_path, path=target_dir)
         target_dir.mkdir(parents=True, exist_ok=True)
-        final_path = target_dir / f"{blob_id}.json"
-        tmp_path = target_dir / f"{blob_id}.json.tmp"
+        blob_segment = _safe_path_segment(blob_id)
+        final_path = target_dir / f"{blob_segment}.json"
+        tmp_path = target_dir / f"{blob_segment}.json.tmp"
+        _assert_under_root(root_path=root_path, path=final_path)
+        _assert_under_root(root_path=root_path, path=tmp_path)
         with tmp_path.open("wb") as handle:
             handle.write(payload_text.encode("utf-8"))
             handle.flush()
@@ -240,6 +231,43 @@ def now_iso() -> str:
     return datetime.now(timezone.utc).isoformat()
 
 
+def _safe_path_segment(value: str) -> str:
+    """把逻辑 id 编码为单个安全路径片段。
+
+    :param value: session/run/iteration/blob 等逻辑 id。
+    :returns: URL-safe 路径片段；空 id 使用固定片段，超长 id 使用稳定
+        sha256 片段，避免超过常见文件系统单段长度。
+    :raises Exception: 不主动抛出异常。
+    """
+
+    if value == "":
+        return _EMPTY_SEGMENT
+    encoded = base64.urlsafe_b64encode(value.encode("utf-8")).decode("ascii")
+    segment = f"{_ENCODED_SEGMENT_PREFIX}{encoded.rstrip('=')}"
+    if len(segment) <= _MAX_PATH_SEGMENT_LENGTH:
+        return segment
+    digest = hashlib.sha256(value.encode("utf-8")).hexdigest()
+    return f"{_HASHED_SEGMENT_PREFIX}{digest}"
+
+
+def _assert_under_root(*, root_path: Path, path: Path) -> None:
+    """断言目标路径仍位于 trace root 之下。
+
+    :param root_path: 已 resolve 的 trace root。
+    :param path: 待检查路径。
+    :returns: 无返回值。
+    :raises ValueError: 目标路径逃逸 trace root 时抛出。
+    """
+
+    resolved_path = path.resolve()
+    try:
+        resolved_path.relative_to(root_path)
+    except ValueError as exc:
+        raise ValueError(
+            f"trace sink path escapes trace root: path={resolved_path}"
+        ) from exc
+
+
 # ---------------------------------------------------------------------------
 # 5 个强类型 trace record dataclass。
 # 每个 record 自带 ``to_json_record`` 方法，把强类型字段映射为
@@ -273,13 +301,6 @@ class ToolCallRecord:
     :param truncation_cursor: 截断 cursor 指纹；无截断为 ``None``。
     :param truncation_has_more: 截断 has_more；无截断为 ``None``。
     :param truncation_limit: 截断 limit；无截断为 ``None``。
-    :param fetch_more_consumed_cursor: 已消费 cursor 指纹；无补读为 ``None``。
-    :param fetch_more_next_cursor: 下一页 cursor 指纹；无补读为 ``None``。
-    :param fetch_more_chunk_size: 补读返回元素数量；无补读为 ``None``。
-    :param fetch_more_has_more: 补读 has_more；无补读为 ``None``。
-    :param cursor_denial_reason: cursor 拒绝原因；非拒绝为 ``None``。
-    :param cursor_expired_at_monotonic: cursor 过期单进程时间；非过期为
-        ``None``。
     """
 
     schema_version: str
@@ -302,12 +323,6 @@ class ToolCallRecord:
     truncation_cursor: str | None
     truncation_has_more: bool | None
     truncation_limit: int | None
-    fetch_more_consumed_cursor: str | None
-    fetch_more_next_cursor: str | None
-    fetch_more_chunk_size: int | None
-    fetch_more_has_more: bool | None
-    cursor_denial_reason: str | None
-    cursor_expired_at_monotonic: float | None
 
     def to_json_record(self) -> Mapping[str, JsonValue]:
         """编码为 JSON record。
@@ -337,12 +352,6 @@ class ToolCallRecord:
             "truncation_cursor": self.truncation_cursor,
             "truncation_has_more": self.truncation_has_more,
             "truncation_limit": self.truncation_limit,
-            "fetch_more_consumed_cursor": self.fetch_more_consumed_cursor,
-            "fetch_more_next_cursor": self.fetch_more_next_cursor,
-            "fetch_more_chunk_size": self.fetch_more_chunk_size,
-            "fetch_more_has_more": self.fetch_more_has_more,
-            "cursor_denial_reason": self.cursor_denial_reason,
-            "cursor_expired_at_monotonic": self.cursor_expired_at_monotonic,
         }
         return record
 
@@ -414,12 +423,8 @@ class IterationContextSnapshotRecord:
             "message_summaries_json": self.message_summaries_json,
             "tool_schema_summaries_json": self.tool_schema_summaries_json,
             "context_meta_json": self.context_meta_json,
-            "raw_input_blob_relative_path": (
-                self.raw_input_blob_relative_path
-            ),
-            "raw_tool_schemas_blob_relative_path": (
-                self.raw_tool_schemas_blob_relative_path
-            ),
+            "raw_input_blob_relative_path": (self.raw_input_blob_relative_path),
+            "raw_tool_schemas_blob_relative_path": (self.raw_tool_schemas_blob_relative_path),
         }
 
 
@@ -546,6 +551,8 @@ class ProviderProtocolErrorRecord:
     :param provider_request_id: provider 侧请求 id；缺失为 ``None``。
     :param raw_payload_json: scrub 后的 provider 原始报错 JSON 字符串；缺
         失时为 ``'{"reason":"omitted_no_payload"}'``。
+    :param partial_tool_calls_json: SSE 失败前 partial tool call 有界摘要
+        JSON 字符串；不包含 raw argument payload。
     """
 
     schema_version: str
@@ -560,6 +567,7 @@ class ProviderProtocolErrorRecord:
     message: str
     provider_request_id: str | None
     raw_payload_json: str
+    partial_tool_calls_json: str
 
     def to_json_record(self) -> Mapping[str, JsonValue]:
         """编码为 JSON record。
@@ -581,6 +589,7 @@ class ProviderProtocolErrorRecord:
             "message": self.message,
             "provider_request_id": self.provider_request_id,
             "raw_payload_json": self.raw_payload_json,
+            "partial_tool_calls_json": self.partial_tool_calls_json,
         }
 
 

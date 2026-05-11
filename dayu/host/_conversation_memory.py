@@ -8,11 +8,14 @@
 from __future__ import annotations
 
 import logging
+import hashlib
+from collections.abc import Mapping
 from dataclasses import dataclass, replace
 from datetime import datetime
 from enum import StrEnum
 from typing import Protocol, TypeAlias
 
+from dayu.contracts import JsonValue
 from dayu.contracts.tool_outcome import (
     ToolCompletedOutcome,
     ToolFailedOutcome,
@@ -20,19 +23,16 @@ from dayu.contracts.tool_outcome import (
 from dayu.engine import FinalAnswerData, ToolResultAcceptedData
 from dayu.engine.contracts.engine_events import RunFailedData
 from dayu.host._text import truncate_text
+from dayu.host._tool_result_truncation import (
+    TRUNCATION_FIELD,
+    extract_truncation_hint,
+)
 from dayu.host.contracts import (
     HostRunFailedData,
     RunEvent,
     RunEventCursor,
     RunEventKind,
     RunEventType,
-    ToolCursorDeniedData,
-    ToolCursorExpiredData,
-    ToolCursorIssuedData,
-    ToolFetchMoreCompletedData,
-    ToolFetchMoreFailedData,
-    ToolFetchMoreRequestedData,
-    ToolResultTruncatedData,
     UserInputAcceptedData,
     UserInputScope,
 )
@@ -42,6 +42,7 @@ _USER_TEXT_SUMMARY_LIMIT: int = 240
 _ASSISTANT_TEXT_SUMMARY_LIMIT: int = 240
 _TERMINAL_TEXT_SUMMARY_LIMIT: int = 240
 _TOOL_FACT_SUMMARY_LIMIT: int = 360
+_CURSOR_FINGERPRINT_LENGTH: int = 16
 _LOGGER: logging.Logger = logging.getLogger(__name__)
 
 
@@ -346,9 +347,7 @@ class ScopeClearPatch:
     reason: str
 
 
-ConversationMemoryPatch: TypeAlias = (
-    MemoryResetPatch | ClaimCorrectionPatch | ScopeClearPatch
-)
+ConversationMemoryPatch: TypeAlias = MemoryResetPatch | ClaimCorrectionPatch | ScopeClearPatch
 """Conversation memory internal patch 封闭联合。"""
 
 
@@ -436,9 +435,7 @@ def _project_canonical_events(
         recent_raw_turns=recent_turns,
         older_raw_turns=older_turns,
         tool_facts=_merge_tool_facts(snapshot.tool_facts, tool_facts),
-        evidence_anchors=_merge_evidence_anchors(
-            snapshot.evidence_anchors, evidence_anchors
-        ),
+        evidence_anchors=_merge_evidence_anchors(snapshot.evidence_anchors, evidence_anchors),
     )
 
 
@@ -460,9 +457,7 @@ def snapshot_with_transient_tool_facts(
     :raises Exception: 不主动抛出异常。
     """
 
-    canonical_events = tuple(
-        event for event in events if event.kind is RunEventKind.CANONICAL
-    )
+    canonical_events = tuple(event for event in events if event.kind is RunEventKind.CANONICAL)
     tool_facts = _project_tool_facts(canonical_events)
     if not tool_facts:
         return snapshot
@@ -490,29 +485,15 @@ def _project_raw_turn(events: tuple[RunEvent, ...]) -> ConversationRawTurn | Non
     host_failure_event: RunEvent | None = None
     engine_failure_event: RunEvent | None = None
     for event in events:
-        if (
-            event.type is RunEventType.USER_INPUT_ACCEPTED
-            and isinstance(event.data, UserInputAcceptedData)
-        ):
+        if event.type is RunEventType.USER_INPUT_ACCEPTED and isinstance(event.data, UserInputAcceptedData):
             user_event = event
-        elif (
-            event.type is RunEventType.FINAL_ANSWER
-            and isinstance(event.data, FinalAnswerData)
-        ):
+        elif event.type is RunEventType.FINAL_ANSWER and isinstance(event.data, FinalAnswerData):
             final_event = event
-        elif (
-            event.type is RunEventType.RUN_FAILED
-            and isinstance(event.data, HostRunFailedData)
-        ):
+        elif event.type is RunEventType.RUN_FAILED and isinstance(event.data, HostRunFailedData):
             host_failure_event = event
-        elif (
-            event.type is RunEventType.RUN_FAILED
-            and isinstance(event.data, RunFailedData)
-        ):
+        elif event.type is RunEventType.RUN_FAILED and isinstance(event.data, RunFailedData):
             engine_failure_event = event
-    if user_event is None or not isinstance(
-        user_event.data, UserInputAcceptedData
-    ):
+    if user_event is None or not isinstance(user_event.data, UserInputAcceptedData):
         return None
     user_scope = scope_from_user_input_event(user_event)
     assistant_text: str | None = None
@@ -527,9 +508,7 @@ def _project_raw_turn(events: tuple[RunEvent, ...]) -> ConversationRawTurn | Non
             ingestion_policy=MemoryIngestionPolicy.PRIMARY_SESSION_CANONICAL,
             trust_level=MemoryTrustLevel.ASSISTANT_CONCLUSION,
         )
-    elif host_failure_event is not None and isinstance(
-        host_failure_event.data, HostRunFailedData
-    ):
+    elif host_failure_event is not None and isinstance(host_failure_event.data, HostRunFailedData):
         terminal_summary = _summarize_host_failure(host_failure_event.data)
         terminal_provenance = _provenance(
             event=host_failure_event,
@@ -537,9 +516,7 @@ def _project_raw_turn(events: tuple[RunEvent, ...]) -> ConversationRawTurn | Non
             ingestion_policy=MemoryIngestionPolicy.PRIMARY_SESSION_CANONICAL,
             trust_level=MemoryTrustLevel.HOST_OBSERVED,
         )
-    elif engine_failure_event is not None and isinstance(
-        engine_failure_event.data, RunFailedData
-    ):
+    elif engine_failure_event is not None and isinstance(engine_failure_event.data, RunFailedData):
         terminal_summary = _summarize_engine_failure(engine_failure_event.data)
         terminal_provenance = _provenance(
             event=engine_failure_event,
@@ -597,9 +574,7 @@ def _summarize_engine_failure(data: RunFailedData) -> str:
 
     return truncate_text(
         text=(
-            f"run_failed: error_code={data.error_code}; "
-            f"recoverable={data.recoverable}; "
-            f"message={data.message}"
+            f"run_failed: error_code={data.error_code}; " f"recoverable={data.recoverable}; " f"message={data.message}"
         ),
         limit=_TERMINAL_TEXT_SUMMARY_LIMIT,
     )
@@ -630,148 +605,47 @@ def _tool_fact_from_event(event: RunEvent) -> ConversationToolFact | None:
     """
 
     data = event.data
-    producer_kind = MemoryProducerKind.HOST_TOOL_RUNTIME
     if isinstance(data, ToolResultAcceptedData):
-        producer_kind = MemoryProducerKind.ENGINE_TOOL_FACT
+        cursor_fingerprint, has_more = _tool_fact_truncation_fields(data)
         return ConversationToolFact(
             fact_id=_item_id("tool_fact", event),
             tool_name=data.name,
             tool_call_id=data.tool_call_id,
             event_type=event.type,
             summary=_summarize_tool_result(data),
-            cursor_fingerprint=None,
-            has_more=None,
+            cursor_fingerprint=cursor_fingerprint,
+            has_more=has_more,
             provenance=_provenance(
                 event=event,
-                producer_kind=producer_kind,
-                ingestion_policy=MemoryIngestionPolicy.TOOL_FACT_CANONICAL,
-                trust_level=MemoryTrustLevel.TOOL_OBSERVED,
-            ),
-        )
-    if isinstance(data, ToolResultTruncatedData):
-        return ConversationToolFact(
-            fact_id=_item_id("tool_fact", event),
-            tool_name=data.tool_name,
-            tool_call_id=data.tool_call_id,
-            event_type=event.type,
-            summary=(
-                f"工具结果已截断：strategy={data.strategy}; "
-                f"unit={data.unit}; size={data.value_summary.size}; "
-                f"total_estimate={data.total_estimate}; has_more={data.has_more}"
-            ),
-            cursor_fingerprint=data.cursor_fingerprint,
-            has_more=data.has_more,
-            provenance=_provenance(
-                event=event,
-                producer_kind=producer_kind,
-                ingestion_policy=MemoryIngestionPolicy.TOOL_FACT_CANONICAL,
-                trust_level=MemoryTrustLevel.TOOL_OBSERVED,
-            ),
-        )
-    if isinstance(data, ToolCursorIssuedData):
-        return ConversationToolFact(
-            fact_id=_item_id("tool_fact", event),
-            tool_name=data.tool_name,
-            tool_call_id=data.tool_call_id,
-            event_type=event.type,
-            summary=(
-                f"工具补读 cursor 已签发：offset={data.offset}; "
-                f"limit={data.limit}; total_estimate={data.total_estimate}"
-            ),
-            cursor_fingerprint=data.cursor_fingerprint,
-            has_more=None,
-            provenance=_provenance(
-                event=event,
-                producer_kind=producer_kind,
-                ingestion_policy=MemoryIngestionPolicy.TOOL_FACT_CANONICAL,
-                trust_level=MemoryTrustLevel.TOOL_OBSERVED,
-            ),
-        )
-    if isinstance(data, ToolFetchMoreRequestedData):
-        return ConversationToolFact(
-            fact_id=_item_id("tool_fact", event),
-            tool_name="unknown",
-            tool_call_id=data.tool_call_id,
-            event_type=event.type,
-            summary=f"工具补读已请求：requested_limit={data.requested_limit}",
-            cursor_fingerprint=data.cursor_fingerprint,
-            has_more=None,
-            provenance=_provenance(
-                event=event,
-                producer_kind=producer_kind,
-                ingestion_policy=MemoryIngestionPolicy.TOOL_FACT_CANONICAL,
-                trust_level=MemoryTrustLevel.TOOL_OBSERVED,
-            ),
-        )
-    if isinstance(data, ToolFetchMoreCompletedData):
-        return ConversationToolFact(
-            fact_id=_item_id("tool_fact", event),
-            tool_name=data.tool_name,
-            tool_call_id=data.tool_call_id,
-            event_type=event.type,
-            summary=(
-                f"工具补读完成：chunk_size={data.chunk_size}; "
-                f"limit={data.limit}; has_more={data.has_more}; "
-                f"value_size={data.value_summary.size}"
-            ),
-            cursor_fingerprint=data.consumed_cursor_fingerprint,
-            has_more=data.has_more,
-            provenance=_provenance(
-                event=event,
-                producer_kind=producer_kind,
-                ingestion_policy=MemoryIngestionPolicy.TOOL_FACT_CANONICAL,
-                trust_level=MemoryTrustLevel.TOOL_OBSERVED,
-            ),
-        )
-    if isinstance(data, ToolFetchMoreFailedData):
-        return ConversationToolFact(
-            fact_id=_item_id("tool_fact", event),
-            tool_name="unknown",
-            tool_call_id=data.tool_call_id,
-            event_type=event.type,
-            summary=f"工具补读失败：error_code={data.error_code}; denied={data.denied}",
-            cursor_fingerprint=data.cursor_fingerprint,
-            has_more=None,
-            provenance=_provenance(
-                event=event,
-                producer_kind=producer_kind,
-                ingestion_policy=MemoryIngestionPolicy.TOOL_FACT_CANONICAL,
-                trust_level=MemoryTrustLevel.TOOL_OBSERVED,
-            ),
-        )
-    if isinstance(data, ToolCursorExpiredData):
-        return ConversationToolFact(
-            fact_id=_item_id("tool_fact", event),
-            tool_name="unknown",
-            tool_call_id=data.tool_call_id,
-            event_type=event.type,
-            summary="工具补读 cursor 已过期",
-            cursor_fingerprint=data.cursor_fingerprint,
-            has_more=None,
-            provenance=_provenance(
-                event=event,
-                producer_kind=producer_kind,
-                ingestion_policy=MemoryIngestionPolicy.TOOL_FACT_CANONICAL,
-                trust_level=MemoryTrustLevel.TOOL_OBSERVED,
-            ),
-        )
-    if isinstance(data, ToolCursorDeniedData):
-        return ConversationToolFact(
-            fact_id=_item_id("tool_fact", event),
-            tool_name="unknown",
-            tool_call_id=data.tool_call_id,
-            event_type=event.type,
-            summary=f"工具补读 cursor 被拒绝：reason={data.reason}",
-            cursor_fingerprint=data.cursor_fingerprint,
-            has_more=None,
-            provenance=_provenance(
-                event=event,
-                producer_kind=producer_kind,
+                producer_kind=MemoryProducerKind.ENGINE_TOOL_FACT,
                 ingestion_policy=MemoryIngestionPolicy.TOOL_FACT_CANONICAL,
                 trust_level=MemoryTrustLevel.TOOL_OBSERVED,
             ),
         )
     return None
+
+
+def _tool_fact_truncation_fields(
+    data: ToolResultAcceptedData,
+) -> tuple[str | None, bool | None]:
+    """从普通工具结果中提取安全截断结构化字段。
+
+    :param data: Engine 工具结果事件 data。
+    :returns: ``(cursor_fingerprint, has_more)``；没有截断信息时均为
+        ``None``。
+    :raises Exception: 不主动抛出异常。
+    """
+
+    outcome = data.outcome
+    if not isinstance(outcome, ToolCompletedOutcome):
+        return None, None
+    truncation = extract_truncation_hint(outcome.result.value)
+    if truncation is None:
+        return None, None
+    cursor_fingerprint = (
+        None if truncation.cursor is None else _fingerprint_text(truncation.cursor)
+    )
+    return cursor_fingerprint, truncation.has_more
 
 
 def _summarize_tool_result(data: ToolResultAcceptedData) -> str:
@@ -784,20 +658,81 @@ def _summarize_tool_result(data: ToolResultAcceptedData) -> str:
 
     outcome = data.outcome
     if isinstance(outcome, ToolCompletedOutcome):
-        value_text = repr(outcome.result.value)
+        value_text = repr(_memory_safe_tool_value(outcome.result.value))
+        truncation = extract_truncation_hint(outcome.result.value)
+        if truncation is not None:
+            return truncate_text(
+                text=(
+                    f"工具结果已接纳：value={value_text}; truncated=true; "
+                    f"has_more={truncation.has_more}; limit={truncation.limit}; "
+                    f"ttl_seconds={truncation.ttl_seconds}; "
+                    f"cursor_fingerprint={_optional_fingerprint_text(truncation.cursor)}"
+                ),
+                limit=_TOOL_FACT_SUMMARY_LIMIT,
+            )
         return truncate_text(
             text=f"工具结果已接纳：value={value_text}",
             limit=_TOOL_FACT_SUMMARY_LIMIT,
         )
     if isinstance(outcome, ToolFailedOutcome):
         return truncate_text(
-            text=(
-                f"工具结果失败：error={outcome.result.error}; "
-                f"message={outcome.result.message}"
-            ),
+            text=(f"工具结果失败：error={outcome.result.error}; " f"message={outcome.result.message}"),
             limit=_TOOL_FACT_SUMMARY_LIMIT,
         )
     return "工具结果已接纳"
+
+
+def _memory_safe_tool_value(value: JsonValue) -> JsonValue:
+    """移除普通工具结果中可复用的补读凭证。
+
+    :param value: 工具成功结果值。
+    :returns: 可进入 memory 摘要的安全值，保留 ``has_more`` 与 cursor
+        指纹，不保留 raw cursor、raw scope token 或 ``fetch_more_args``。
+    :raises Exception: 不主动抛出异常。
+    """
+
+    truncation = extract_truncation_hint(value)
+    if truncation is None:
+        return value
+    if not isinstance(value, Mapping):
+        return value
+    safe_value: dict[str, JsonValue] = {
+        key: item for key, item in value.items() if key != TRUNCATION_FIELD
+    }
+    safe_truncation: dict[str, JsonValue] = {
+        "has_more": truncation.has_more,
+        "cursor_fingerprint": _optional_fingerprint_text(truncation.cursor),
+    }
+    if truncation.limit is not None:
+        safe_truncation["limit"] = truncation.limit
+    if truncation.ttl_seconds is not None:
+        safe_truncation["ttl_seconds"] = truncation.ttl_seconds
+    safe_value[TRUNCATION_FIELD] = safe_truncation
+    return safe_value
+
+
+def _fingerprint_text(value: str) -> str:
+    """生成短文本指纹，避免把 raw cursor 写入 memory。
+
+    :param value: 原始文本。
+    :returns: SHA-256 短指纹。
+    :raises Exception: 不主动抛出异常。
+    """
+
+    return hashlib.sha256(value.encode("utf-8")).hexdigest()[:_CURSOR_FINGERPRINT_LENGTH]
+
+
+def _optional_fingerprint_text(value: str | None) -> str | None:
+    """生成可空短文本指纹。
+
+    :param value: 原始文本；为 ``None`` 表示没有 raw cursor。
+    :returns: 短指纹或 ``None``。
+    :raises Exception: 不主动抛出异常。
+    """
+
+    if value is None:
+        return None
+    return _fingerprint_text(value)
 
 
 def _evidence_anchor_from_fact(fact: ConversationToolFact) -> EvidenceAnchor:

@@ -23,6 +23,7 @@ from dayu.host._attempt_lease import (
     DEFAULT_ATTEMPT_LEASE_CONFIG,
     AttemptFencingError,
     AttemptFencingReason,
+    AttemptLeaseBusyReason,
     AttemptLeaseConfig,
     AttemptLeaseDecision,
     AttemptOwnerContext,
@@ -209,6 +210,8 @@ async def test_acquire_returns_busy_on_attempt_index_conflict() -> None:
             lease_expires_at=expires,
         )
     assert second.decision is AttemptLeaseDecision.BUSY
+    assert second.reason is None
+    assert second.busy_reason is AttemptLeaseBusyReason.ATTEMPT_INDEX_CONFLICT
     assert second.current_state is AttemptState.RUNNING
     assert second.current_owner_id == "host:1"
 
@@ -229,6 +232,130 @@ async def test_acquire_returns_busy_on_attempt_index_conflict() -> None:
     assert third.decision is AttemptLeaseDecision.ACQUIRED
     assert third.owner_context is not None
     assert third.owner_context.fencing_token.value > first_token.value
+    storage.close()
+
+
+@pytest.mark.asyncio
+async def test_next_attempt_index_returns_zero_without_attempts() -> None:
+    """没有 attempt 时, 下一个 attempt_index 必须从 0 开始。"""
+
+    storage = _open_storage()
+    await _seed_run(storage)
+    clock = _FakeClock()
+    lease_store = AttemptLeaseStore(storage=storage, clock=clock)
+
+    async with storage.transaction() as tx:
+        next_index = lease_store.next_attempt_index(tx=tx, run_id="r1")
+
+    assert next_index == 0
+    storage.close()
+
+
+@pytest.mark.asyncio
+async def test_next_attempt_index_advances_after_active_attempt() -> None:
+    """已有 RUNNING attempt 时, 下一个 index 等于最大 index 加 1。"""
+
+    storage = _open_storage()
+    await _seed_run(storage)
+    clock = _FakeClock()
+    lease_store = AttemptLeaseStore(storage=storage, clock=clock)
+
+    async with storage.transaction() as tx:
+        lease_store.acquire_new_attempt(
+            tx=tx,
+            attempt_id="a1",
+            run_id="r1",
+            attempt_index=0,
+            recovered_from_attempt_id=None,
+            owner_id="host:1",
+            owner_token=AttemptOwnerToken.new(),
+            lease_expires_at=_expires_at(clock),
+        )
+        next_index = lease_store.next_attempt_index(tx=tx, run_id="r1")
+
+    assert next_index == 1
+    storage.close()
+
+
+@pytest.mark.asyncio
+async def test_next_attempt_index_advances_after_terminal_attempt() -> None:
+    """已有 terminal attempt 时, 下一个 index 仍基于历史最大值递增。"""
+
+    storage = _open_storage()
+    await _seed_run(storage)
+    clock = _FakeClock()
+    lease_store = AttemptLeaseStore(storage=storage, clock=clock)
+    state_store = AttemptStateStore(storage=storage, clock=clock)
+
+    async with storage.transaction() as tx:
+        lease_store.acquire_new_attempt(
+            tx=tx,
+            attempt_id="a1",
+            run_id="r1",
+            attempt_index=0,
+            recovered_from_attempt_id=None,
+            owner_id="host:1",
+            owner_token=AttemptOwnerToken.new(),
+            lease_expires_at=_expires_at(clock),
+        )
+        state_store.update_state(
+            tx=tx,
+            attempt_id="a1",
+            state=AttemptState.SUCCEEDED,
+        )
+        next_index = lease_store.next_attempt_index(tx=tx, run_id="r1")
+
+    assert next_index == 1
+    storage.close()
+
+
+@pytest.mark.asyncio
+async def test_next_attempt_index_skips_gaps_and_conflicts() -> None:
+    """存在 index gap 或冲突历史时, 下一个 index 必须取最大值加 1。"""
+
+    storage = _open_storage()
+    await _seed_run(storage)
+    clock = _FakeClock()
+    lease_store = AttemptLeaseStore(storage=storage, clock=clock)
+
+    async with storage.transaction() as tx:
+        first = lease_store.acquire_new_attempt(
+            tx=tx,
+            attempt_id="a1",
+            run_id="r1",
+            attempt_index=0,
+            recovered_from_attempt_id=None,
+            owner_id="host:1",
+            owner_token=AttemptOwnerToken.new(),
+            lease_expires_at=_expires_at(clock),
+        )
+        conflict = lease_store.acquire_new_attempt(
+            tx=tx,
+            attempt_id="a-conflict",
+            run_id="r1",
+            attempt_index=0,
+            recovered_from_attempt_id=None,
+            owner_id="host:conflict",
+            owner_token=AttemptOwnerToken.new(),
+            lease_expires_at=_expires_at(clock),
+        )
+        second = lease_store.acquire_new_attempt(
+            tx=tx,
+            attempt_id="a3",
+            run_id="r1",
+            attempt_index=2,
+            recovered_from_attempt_id=None,
+            owner_id="host:3",
+            owner_token=AttemptOwnerToken.new(),
+            lease_expires_at=_expires_at(clock),
+        )
+        next_index = lease_store.next_attempt_index(tx=tx, run_id="r1")
+
+    assert first.decision is AttemptLeaseDecision.ACQUIRED
+    assert conflict.decision is AttemptLeaseDecision.BUSY
+    assert conflict.busy_reason is AttemptLeaseBusyReason.ATTEMPT_INDEX_CONFLICT
+    assert second.decision is AttemptLeaseDecision.ACQUIRED
+    assert next_index == 3
     storage.close()
 
 
@@ -935,6 +1062,7 @@ async def test_acquire_new_attempt_busy_when_attempt_index_unique_violation() ->
 
     第二次 acquire 复用同一 ``(run_id, attempt_index)``, store 应返回
     ``decision=BUSY`` 而不是抛 IntegrityError; 业务级 BUSY 路径必须保留。
+    BUSY 诊断必须使用独立 ``busy_reason``，不得复用 fencing reason。
     """
 
     storage = _open_storage()
@@ -969,6 +1097,8 @@ async def test_acquire_new_attempt_busy_when_attempt_index_unique_violation() ->
             lease_expires_at=_expires_at(clock),
         )
     assert second.decision is AttemptLeaseDecision.BUSY
+    assert second.reason is None
+    assert second.busy_reason is AttemptLeaseBusyReason.ATTEMPT_INDEX_CONFLICT
     storage.close()
 
 

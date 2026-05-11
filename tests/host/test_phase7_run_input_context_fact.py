@@ -3,8 +3,8 @@
 覆盖：
 
 - builder 输出 ``RunInputContextSnapshotBuiltData`` 字段一致。
-- ``raw_input_blob_id`` / ``raw_tool_schemas_blob_id`` 跨 replay 稳定。
-- ``raw_input_messages_json`` / ``raw_tool_schemas_json`` 排序后稳定。
+- raw payload blob id / sha256 / byte size 跨 replay 稳定。
+- raw payload JSON 由 build result 单独返回，不进入 EventLog fact data。
 - 当前用户事件类型不匹配时抛异常。
 """
 
@@ -22,6 +22,8 @@ from dayu.contracts.tool_schema import (
 )
 from dayu.engine import (
     AgentMessageRole,
+    AssistantMessage,
+    AssistantToolCall,
     SystemMessage,
     UserMessage,
 )
@@ -122,7 +124,7 @@ def test_builder_outputs_consistent_summary() -> None:
     """builder 把 RunInput / event 派生为 snapshot data。"""
 
     builder = RunInputContextFactBuilder()
-    data = builder.build(
+    built = builder.build(
         run_input=_run_input(),
         build_trace=_trace(),
         current_user_event=_user_event(),
@@ -131,6 +133,7 @@ def test_builder_outputs_consistent_summary() -> None:
         iteration_index=0,
         iteration_id="r1-attempt-00",
     )
+    data = built.data
     assert data.iteration_id == "r1-attempt-00"
     assert data.attempt_index == 0
     assert data.iteration_index == 0
@@ -145,10 +148,73 @@ def test_builder_outputs_consistent_summary() -> None:
     assert data.context_meta.message_count == 2
     assert data.context_meta.role_sequence == ("system", "user")
     assert data.context_meta.current_user_run_id == "r1"
-    # raw_input_messages_json 应可解析为 list。
-    parsed = json.loads(data.raw_input_messages_json)
+    # raw payload 不进入 EventLog data，但 build result 必须保留可写入
+    # side-store 的 JSON。
+    parsed = json.loads(built.raw_payloads.input_messages_json)
     assert isinstance(parsed, list)
     assert len(parsed) == 2
+    assert data.raw_input_messages_byte_size == len(
+        built.raw_payloads.input_messages_json.encode("utf-8")
+    )
+
+
+def test_raw_input_messages_scrub_assistant_tool_call_credentials() -> None:
+    """RunInput raw payload 中 assistant tool call 参数清洗显式凭证。"""
+
+    run_input = RunInput(
+        messages=(
+            AssistantMessage(
+                role=AgentMessageRole.ASSISTANT,
+                content=None,
+                reasoning_content=None,
+                tool_calls=(
+                    AssistantToolCall(
+                        id="tc-1",
+                        name="secret_tool",
+                        arguments={
+                            "api_key": "sk-api",
+                            "password": "pw",
+                            "client_secret": "client-secret",
+                            "Authorization": "Bearer secret",
+                            "access_token": "access-secret",
+                            "cursor": "cursor-public",
+                            "scope_token": "scope-public",
+                            "token": "ordinary-token",
+                        },
+                        provider_state=None,
+                    ),
+                ),
+            ),
+        )
+    )
+    built = RunInputContextFactBuilder().build(
+        run_input=run_input,
+        build_trace=_trace(),
+        current_user_event=_user_event(),
+        tool_schemas=(),
+        attempt_index=0,
+        iteration_index=0,
+        iteration_id="r1-attempt-00",
+    )
+
+    raw = json.loads(built.raw_payloads.input_messages_json)
+    assert isinstance(raw, list)
+    first = raw[0]
+    assert isinstance(first, dict)
+    tool_calls = first["tool_calls"]
+    assert isinstance(tool_calls, list)
+    call = tool_calls[0]
+    assert isinstance(call, dict)
+    arguments = call["arguments"]
+    assert isinstance(arguments, dict)
+    assert arguments["api_key"] == "***"
+    assert arguments["password"] == "***"
+    assert arguments["client_secret"] == "***"
+    assert arguments["Authorization"] == "***"
+    assert arguments["access_token"] == "***"
+    assert arguments["cursor"] == "cursor-public"
+    assert arguments["scope_token"] == "scope-public"
+    assert arguments["token"] == "ordinary-token"
 
 
 def test_builder_blob_id_stable_across_calls() -> None:
@@ -173,9 +239,11 @@ def test_builder_blob_id_stable_across_calls() -> None:
         iteration_index=0,
         iteration_id="r1-attempt-00",
     )
-    assert a.raw_input_blob_id == b.raw_input_blob_id
-    assert a.raw_tool_schemas_blob_id == b.raw_tool_schemas_blob_id
-    assert a.raw_input_blob_id != a.raw_tool_schemas_blob_id
+    assert a.data.raw_input_messages_blob_id == b.data.raw_input_messages_blob_id
+    assert a.data.raw_tool_schemas_blob_id == b.data.raw_tool_schemas_blob_id
+    assert a.data.raw_input_messages_blob_id != a.data.raw_tool_schemas_blob_id
+    assert a.data.raw_input_messages_sha256 == b.data.raw_input_messages_sha256
+    assert a.raw_payloads.input_messages_json == b.raw_payloads.input_messages_json
 
 
 def test_builder_rejects_non_user_input_event() -> None:

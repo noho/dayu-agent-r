@@ -9,7 +9,7 @@ from collections.abc import AsyncIterator
 from dataclasses import dataclass
 from typing import Protocol
 
-from dayu.contracts import CancellationToken
+from dayu.contracts import CancellationToken, ToolSchema
 from dayu.engine import EngineEvent
 from dayu.host._worker import EngineWorker
 from dayu.host.contracts import StartRunRequest
@@ -21,11 +21,14 @@ class WorkerProxy(Protocol):
     def stream_engine_events(
         self,
         request: StartRunRequest,
+        tool_schemas: tuple[ToolSchema, ...],
         cancellation_token: CancellationToken,
     ) -> AsyncIterator[EngineEvent]:
         """返回 EngineEvent 异步流。
 
         :param request: Host P1 start_run 请求。
+        :param tool_schemas: Host 已显式确定的当前 Engine-visible 工具
+            schema 集合。
         :param cancellation_token: 取消观察 token。
         :returns: EngineEvent 异步流。
         :raises Exception: 透传 worker 运行异常。
@@ -45,11 +48,14 @@ class LocalProxy:
     def stream_engine_events(
         self,
         request: StartRunRequest,
+        tool_schemas: tuple[ToolSchema, ...],
         cancellation_token: CancellationToken,
     ) -> AsyncIterator[EngineEvent]:
         """代理到本地 EngineWorker。
 
         :param request: Host P1 start_run 请求。
+        :param tool_schemas: Host 已显式确定的当前 Engine-visible 工具
+            schema 集合。
         :param cancellation_token: 取消观察 token。
         :returns: EngineEvent 异步流。
         :raises Exception: 透传 EngineWorker 运行异常。
@@ -57,6 +63,7 @@ class LocalProxy:
 
         return self.worker.run_agent_messages(
             request=request,
+            tool_schemas=tool_schemas,
             cancellation_token=cancellation_token,
         )
 

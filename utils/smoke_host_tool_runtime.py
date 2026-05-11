@@ -1,8 +1,8 @@
 """Host P2 ToolRuntime smoke。
 
-该脚本在单进程内演示 schema-driven truncate、canonical RunEvent 事实、
-非 EventLog handle 补读与 single-use 失效。日志只输出中性摘要，不输出
-scope token 明文或完整大结果。
+该脚本在单进程内演示 schema-driven truncate、普通 framework
+``fetch_more`` tool call 与 single-use 失效。ToolRuntime 不追加截断或
+cursor 专属 RunEvent。
 """
 
 from __future__ import annotations
@@ -11,6 +11,7 @@ import argparse
 import asyncio
 import logging
 import sys
+from collections.abc import Mapping
 from dataclasses import dataclass
 from datetime import datetime
 from pathlib import Path
@@ -35,11 +36,7 @@ def _ensure_repo_root_on_path() -> None:
 
 _ensure_repo_root_on_path()
 
-from dayu.contracts import (
-    FRAMEWORK_FETCH_MORE_TOOL_NAME,
-    JsonValue,
-    ToolTruncateSpec,
-)
+from dayu.contracts import JsonValue, ToolTruncateSpec
 from dayu.contracts.tool_call import (
     ToolCallRequest,
     ToolExecutionContext,
@@ -52,23 +49,31 @@ from dayu.contracts.tool_outcome import (
 )
 from dayu.contracts.tool_result import ToolResultSuccess
 from dayu.host._event_store import InMemoryRunEventStore
+from dayu.host._framework_tools import FRAMEWORK_FETCH_MORE_NAME
 from dayu.host._proxy import LocalProxy
 from dayu.host._run_harness import LocalRunHarness
+from dayu.host._tool_result_truncation import extract_truncation_hint
 from dayu.host._tool_runtime import HostToolRuntime, ToolRuntimeToolExecutor
 from utils._smoke_memory_store import SmokeInMemoryConversationMemoryStore
 from dayu.host._worker import EngineWorker
-from dayu.host.contracts import (
-    ToolCursorIssuedData,
-    ToolFetchMoreCompletedData,
-    ToolFetchMoreFailedData,
-    ToolFetchMoreRequestedData,
-    ToolResultTruncatedData,
-)
 
 _LOGGER: logging.Logger = logging.getLogger("smoke.host.tool_runtime")
 _RUN_ID: str = "smoke_run_tool_runtime"
 _SESSION_ID: str = "smoke_session"
 _TOOL_CALL_ID: str = "smoke_tc_1"
+
+
+def _content_value(value: JsonValue) -> JsonValue:
+    """读取非 object 工具值被截断后的 ``content`` 包装。
+
+    :param value: 工具成功结果值。
+    :returns: ``content`` 字段或原值。
+    :raises Exception: 不主动抛出异常。
+    """
+
+    if isinstance(value, Mapping) and "content" in value:
+        return value["content"]
+    return value
 
 
 @dataclass(frozen=True, slots=True)
@@ -123,7 +128,6 @@ class _LargeListExecutor:
             result=ToolResultSuccess(
                 ok=True,
                 value=values,
-                truncation=None,
                 meta=None,
             )
         )
@@ -201,13 +205,11 @@ async def _main() -> None:
         truncate_specs={"smoke_list": _spec()},
     )
     adapter = ToolRuntimeToolExecutor(runtime)
-    # harness 在 P8-S2 之前用于演示 LocalRunHarness 的公开 fetch_more 入口；
-    # S2 之后 framework fetch_more 仅作普通 tool call 经
-    # ToolRuntimeToolExecutor -> HostToolRuntime.execute_tool_call。
-    # 保留 harness 装配仅为验证 LocalRunHarness 仍能持有 tool_runtime。
     harness = LocalRunHarness(
         is_durable=False,
-        proxy=LocalProxy(worker=EngineWorker(adapter)),
+        proxy=LocalProxy(
+            worker=EngineWorker(tool_executor=adapter)
+        ),
         event_store=event_store,
         tool_runtime=runtime,
         memory_store=SmokeInMemoryConversationMemoryStore(),
@@ -218,41 +220,19 @@ async def _main() -> None:
     if not isinstance(outcome, ToolCompletedOutcome):
         raise RuntimeError("tool execution did not complete")
     value = outcome.result.value
-    if not isinstance(value, list):
+    content = _content_value(value)
+    if not isinstance(content, list):
         raise RuntimeError("truncated value is not a list")
     _LOGGER.info(
-        "execute completed truncated_items=%s has_truncation=%s",
-        len(value),
-        outcome.result.truncation is not None,
+        "execute completed truncated_items=%s truncation_present %s",
+        len(content),
+        extract_truncation_hint(outcome.result.value) is not None,
     )
 
-    events = await event_store.list_events(_RUN_ID, after=None)
-    cursor_fingerprint = ""
-    for event in events:
-        data = event.data
-        if isinstance(data, ToolResultTruncatedData):
-            cursor_fingerprint = data.cursor_fingerprint
-            _LOGGER.info(
-                "event cursor=%s type=%s fingerprint=%s size=%s total=%s",
-                event.cursor.sequence,
-                event.type.value,
-                data.cursor_fingerprint,
-                data.value_summary.size,
-                data.total_estimate,
-            )
-        elif isinstance(data, ToolCursorIssuedData):
-            _LOGGER.info(
-                "event cursor=%s type=%s fingerprint=%s parent=%s offset=%s",
-                event.cursor.sequence,
-                event.type.value,
-                data.cursor_fingerprint,
-                data.parent_cursor_fingerprint,
-                data.offset,
-            )
-    if not cursor_fingerprint:
-        raise RuntimeError("cursor fingerprint was not issued")
+    if await event_store.list_events(_RUN_ID, after=None) != ():
+        raise RuntimeError("ToolRuntime appended unexpected special events")
 
-    truncation = outcome.result.truncation
+    truncation = extract_truncation_hint(outcome.result.value)
     if truncation is None:
         raise RuntimeError("truncation info missing")
 
@@ -260,7 +240,7 @@ async def _main() -> None:
         ToolExecutionRequest(
             call=ToolCallRequest(
                 tool_call_id="smoke_fetch_call_1",
-                name=FRAMEWORK_FETCH_MORE_TOOL_NAME,
+                name=FRAMEWORK_FETCH_MORE_NAME,
                 arguments={
                     "cursor": truncation.cursor,
                     "scope_token": truncation.scope_token,
@@ -283,19 +263,20 @@ async def _main() -> None:
     )
     if not isinstance(fetch_outcome, ToolCompletedOutcome):
         raise RuntimeError("framework fetch_more did not complete")
-    if not isinstance(fetch_outcome.result.value, list):
+    fetch_content = _content_value(fetch_outcome.result.value)
+    if not isinstance(fetch_content, list):
         raise RuntimeError("fetch_more value is not a list")
     _LOGGER.info(
         "fetch_more completed items=%s has_more=%s",
-        len(fetch_outcome.result.value),
-        fetch_outcome.result.truncation is not None,
+        len(fetch_content),
+        extract_truncation_hint(fetch_outcome.result.value) is not None,
     )
 
     reused = await runtime.execute_tool_call(
         ToolExecutionRequest(
             call=ToolCallRequest(
                 tool_call_id="smoke_fetch_call_2",
-                name=FRAMEWORK_FETCH_MORE_TOOL_NAME,
+                name=FRAMEWORK_FETCH_MORE_NAME,
                 arguments={
                     "cursor": truncation.cursor,
                     "scope_token": truncation.scope_token,
@@ -319,33 +300,8 @@ async def _main() -> None:
         raise RuntimeError("single-use cursor unexpectedly succeeded")
     _LOGGER.info("old cursor rejected error=%s", reused.result.error)
 
-    for event in await event_store.list_events(_RUN_ID, after=None):
-        data = event.data
-        if isinstance(data, ToolFetchMoreRequestedData):
-            _LOGGER.debug(
-                "event cursor=%s type=%s fingerprint=%s requested_limit=%s",
-                event.cursor.sequence,
-                event.type.value,
-                data.cursor_fingerprint,
-                data.requested_limit,
-            )
-        elif isinstance(data, ToolFetchMoreCompletedData):
-            _LOGGER.debug(
-                "event cursor=%s type=%s consumed=%s next=%s chunk_size=%s",
-                event.cursor.sequence,
-                event.type.value,
-                data.consumed_cursor_fingerprint,
-                data.next_cursor_fingerprint,
-                data.chunk_size,
-            )
-        elif isinstance(data, ToolFetchMoreFailedData):
-            _LOGGER.debug(
-                "event cursor=%s type=%s fingerprint=%s error=%s",
-                event.cursor.sequence,
-                event.type.value,
-                data.cursor_fingerprint,
-                data.error_code,
-            )
+    if await event_store.list_events(_RUN_ID, after=None) != ():
+        raise RuntimeError("fetch_more appended unexpected special events")
 
 
 def main() -> None:

@@ -96,6 +96,16 @@ _RECOVERY_REASON_CREATED_ORPHAN: str = "recovery_created_orphan"
 """recovery 原因: ``CREATED`` 孤儿行无 owner / 无 fencing token, 标记为 LOST。"""
 _RECOVERY_REASON_LEASE_EXPIRED: str = "recovery_lease_expired"
 """recovery 原因: ``RUNNING`` 候选 lease 过期, 直接收口为 LOST (P8 D2)。"""
+_ERROR_RUN_ID_REQUIRED: str = "run_id must be non-empty"
+"""lease_context 参数错误: ``run_id`` 不能为空。"""
+_ERROR_ATTEMPT_INDEX_NON_NEGATIVE: str = (
+    "attempt_index must be greater than or equal to 0"
+)
+"""lease_context 参数错误: ``attempt_index`` 不能为负数。"""
+_ERROR_RECOVERED_FROM_ATTEMPT_ID_REQUIRED: str = (
+    "recovered_from_attempt_id must be non-empty when provided"
+)
+"""lease_context 参数错误: recovery 来源 attempt id 不能是空串。"""
 
 
 class AttemptOwnerLossReason(StrEnum):
@@ -113,6 +123,30 @@ class AttemptOwnerLossReason(StrEnum):
 
     FENCED = "fenced"
     STORAGE_ERROR = "storage_error"
+
+
+def _validate_lease_context_args(
+    *,
+    run_id: str,
+    attempt_index: int,
+    recovered_from_attempt_id: str | None,
+) -> None:
+    """校验 ``lease_context`` 的业务标识参数。
+
+    :param run_id: Run id，必须是非空字符串。
+    :param attempt_index: 同一 run 内 attempt 序号，必须大于等于 0。
+    :param recovered_from_attempt_id: recovery 来源 attempt id；为 ``None``
+        表示非 recovery，提供时必须是非空字符串。
+    :returns: 无返回值。
+    :raises ValueError: 任一参数不满足边界约束时抛出。
+    """
+
+    if run_id == "":
+        raise ValueError(_ERROR_RUN_ID_REQUIRED)
+    if attempt_index < 0:
+        raise ValueError(_ERROR_ATTEMPT_INDEX_NON_NEGATIVE)
+    if recovered_from_attempt_id == "":
+        raise ValueError(_ERROR_RECOVERED_FROM_ATTEMPT_ID_REQUIRED)
 
 
 @dataclass(slots=True)
@@ -185,9 +219,8 @@ class AttemptScopedRunEventAppender:
 
     本类型是 P8-S5 attempt-scoped append 的强类型入口: 所有由当前
     attempt owner 写入的 canonical fact (Engine-sourced event、context
-    overflow / compact facts、``RUN_INPUT_CONTEXT_SNAPSHOT_BUILT``、
-    ToolRuntime ``TOOL_RESULT_TRUNCATED`` / ``TOOL_CURSOR_*`` /
-    ``TOOL_FETCH_MORE_*``) 都通过本类型在同一个 ``BEGIN IMMEDIATE``
+    overflow / compact facts、``RUN_INPUT_CONTEXT_SNAPSHOT_BUILT`` 与
+    其它 Host-owned canonical fact）都通过本类型在同一个 ``BEGIN IMMEDIATE``
     事务内执行 :meth:`AttemptLeaseStore.verify_owner` + EventLog append,
     任意 owner CAS 命中失败抛 :class:`AttemptFencingError` 整事务回滚,
     EventLog 不残留 stale fact。
@@ -200,7 +233,7 @@ class AttemptScopedRunEventAppender:
       跨 run 复用;
     - 所有 append 在内部对 ``draft.run_id`` 与 ``owner_context.run_id``
       做严格相等校验, 不一致时抛
-      :class:`AttemptFencingError(reason=OWNER_MISMATCH)`, 防止 ToolRuntime
+      :class:`AttemptFencingError(reason=RUN_ID_MISMATCH)`, 防止 ToolRuntime
       在 attempt 边界 race 期间把旧 cursor 的 fact 写到错误 run。
 
     fencing 真源仍是 :meth:`AttemptLeaseStore.verify_owner` 的事务内 CAS,
@@ -221,13 +254,33 @@ class AttemptScopedRunEventAppender:
     lease_store: AttemptLeaseStore
     owner_context: AttemptOwnerContext
 
+    async def verify_active_owner(self, *, run_id: str) -> None:
+        """验证当前 owner 仍可执行指定 run 的 ToolRuntime mutation。
+
+        ToolRuntime 在进入业务 executor、framework ``fetch_more`` 或截断
+        manager mutation 前调用本方法。它不写 RunEvent，只在独立短事务内
+        执行 owner CAS，确保 stale owner 无法消费或签发 cursor。
+
+        :param run_id: 即将执行工具调用所属 Run id。
+        :returns: 无返回值。
+        :raises AttemptFencingError: ``run_id`` 不匹配或 owner CAS 失败。
+        :raises sqlite3.DatabaseError: 非冲突 SQLite 错误透传。
+        """
+
+        self._verify_run_id_value(run_id=run_id)
+        async with self.storage.transaction() as tx:
+            self.lease_store.verify_owner(
+                tx=tx,
+                owner_context=self.owner_context,
+            )
+
     async def append(self, draft: RunEventDraft) -> RunEvent:
         """在 ``BEGIN IMMEDIATE`` 事务内 append 非 terminal RunEvent。
 
         步骤:
 
         1. 校验 ``draft.run_id == owner_context.run_id``, 不一致时抛
-           :class:`AttemptFencingError(reason=OWNER_MISMATCH)`;
+           :class:`AttemptFencingError(reason=RUN_ID_MISMATCH)`;
         2. 校验 ``draft.type`` 不属于 :data:`TERMINAL_RUN_EVENT_TYPES`,
            terminal RunEvent 必须走 :meth:`append_terminal_and_close`,
            否则 attempt close 与 terminal append 失去原子性;
@@ -387,7 +440,7 @@ class AttemptScopedRunEventAppender:
         的第一道防线: 旧 owner 不应该用绑定它的 appender 写入到其它 run
         的 EventLog, ToolRuntime 在 attempt 边界 race 期间也不应让旧
         cursor 写入新 run。命中失败映射为
-        :class:`AttemptFencingError(reason=OWNER_MISMATCH)`, 不写诊断
+        :class:`AttemptFencingError(reason=RUN_ID_MISMATCH)`, 不写诊断
         RunEvent, 由调用方按 typed refusal 收口。
 
         :param draft: 待校验的 RunEvent 草稿。
@@ -395,7 +448,17 @@ class AttemptScopedRunEventAppender:
         :raises AttemptFencingError: ``run_id`` 不匹配时抛出。
         """
 
-        if draft.run_id == self.owner_context.run_id:
+        self._verify_run_id_value(run_id=draft.run_id)
+
+    def _verify_run_id_value(self, *, run_id: str) -> None:
+        """校验 run_id 与 owner_context.run_id 严格相等。
+
+        :param run_id: 待校验 Run id。
+        :returns: 无返回值。
+        :raises AttemptFencingError: ``run_id`` 不匹配时抛出。
+        """
+
+        if run_id == self.owner_context.run_id:
             return
         _LOGGER.warning(
             "host.attempt.scoped_append_run_id_mismatch "
@@ -403,7 +466,7 @@ class AttemptScopedRunEventAppender:
             "owner_id=%s owner_token=%s fencing_token=%s",
             self.owner_context.attempt_id,
             self.owner_context.run_id,
-            draft.run_id,
+            run_id,
             self.owner_context.owner_id,
             self.owner_context.owner_token.masked(),
             self.owner_context.fencing_token.value,
@@ -411,7 +474,7 @@ class AttemptScopedRunEventAppender:
         raise AttemptFencingError(
             attempt_id=self.owner_context.attempt_id,
             run_id=self.owner_context.run_id,
-            reason=AttemptFencingReason.OWNER_MISMATCH,
+            reason=AttemptFencingReason.RUN_ID_MISMATCH,
             current_state=None,
             owner_id=self.owner_context.owner_id,
             fencing_token=self.owner_context.fencing_token,
@@ -545,8 +608,15 @@ class AttemptSupervisor:
         :returns: 异步迭代器, 仅产出一个 :class:`AttemptOwnerContext`。
         :raises AttemptFencingError: acquire 命中 BUSY / TERMINAL /
             FENCED 等非 ACQUIRED 决策时抛出, 由调用方决定收口策略。
+        :raises ValueError: ``run_id`` 为空、``attempt_index`` 为负数或
+            ``recovered_from_attempt_id`` 为空串时抛出。
         """
 
+        _validate_lease_context_args(
+            run_id=run_id,
+            attempt_index=attempt_index,
+            recovered_from_attempt_id=recovered_from_attempt_id,
+        )
         owner_token = AttemptOwnerToken.new()
         owner_id = _default_owner_id(self.lease_config.owner_id_prefix)
         attempt_id = _default_attempt_id(
@@ -937,8 +1007,10 @@ class AttemptSupervisor:
 
         每轮先 sleep ``renew_interval``, 然后在事务内调用
         :meth:`AttemptLeaseStore.renew`。``ACQUIRED`` 替换 session 内的
-        owner_context(刷新 lease_expires_at); ``FENCED`` / ``TERMINAL``
-        / ``BUSY`` 通过 :meth:`_mark_owner_lost` 标记 session 失活并退出
+        owner_context(刷新 lease_expires_at); 若 renew 事务返回前已有并
+        发路径把 session 标记为 owner-lost, 则保留第一原因并退出, 不用
+        late renew 改写 session 视图。``FENCED`` / ``TERMINAL`` /
+        ``BUSY`` 通过 :meth:`_mark_owner_lost` 标记 session 失活并退出
         循环。renew 自身抛出非 ``CancelledError`` 异常时, 同样调用
         :meth:`_mark_owner_lost` 以独立的 ``STORAGE_ERROR`` loss reason
         收口, 不被伪装成 fencing。
@@ -1001,6 +1073,8 @@ class AttemptSupervisor:
                     result.decision is AttemptLeaseDecision.ACQUIRED
                     and result.owner_context is not None
                 ):
+                    if session.loss_reason is not None:
+                        return
                     session.owner_context = result.owner_context
                     _LOGGER.debug(
                         "host.attempt.lease_renewed attempt_id=%s "

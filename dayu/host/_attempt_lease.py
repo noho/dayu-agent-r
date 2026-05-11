@@ -202,12 +202,19 @@ class AttemptFencingReason(StrEnum):
 
     OWNER_MISSING = "owner_missing"
     OWNER_MISMATCH = "owner_mismatch"
+    RUN_ID_MISMATCH = "run_id_mismatch"
     LEASE_EXPIRED = "lease_expired"
     FENCING_TOKEN_MISMATCH = "fencing_token_mismatch"
     ATTEMPT_NOT_RUNNING = "attempt_not_running"
     ATTEMPT_TERMINAL = "attempt_terminal"
     RUN_TERMINAL = "run_terminal"
     STORAGE_CONFLICT = "storage_conflict"
+
+
+class AttemptLeaseBusyReason(StrEnum):
+    """acquire 返回 ``BUSY`` 的业务级冲突原因。"""
+
+    ATTEMPT_INDEX_CONFLICT = "attempt_index_conflict"
 
 
 @dataclass(frozen=True, slots=True)
@@ -219,7 +226,10 @@ class AttemptLeaseResult:
     :param current_state: 库内当前 attempt 状态；当无对应行时可为 ``None``。
     :param current_owner_id: 库内当前 owner id；无 owner 时为 ``None``。
     :param lease_expires_at: 库内当前 lease 到期；无 lease 时为 ``None``。
-    :param reason: 失败 / fenced 的细分原因；``ACQUIRED`` 时为 ``None``。
+    :param reason: fencing / terminal 失败的细分原因；``ACQUIRED`` 与
+        ``BUSY`` 时为 ``None``。
+    :param busy_reason: ``BUSY`` 的业务级冲突原因；非 ``BUSY`` 时为
+        ``None``。
     :param current_fencing_token: 库内当前 owner 持有的 fencing token；
         无 owner / 无对应行时为 ``None``。仅作诊断用，CAS 真源仍是
         ``owner_context.fencing_token``。
@@ -231,6 +241,7 @@ class AttemptLeaseResult:
     current_owner_id: str | None
     lease_expires_at: datetime | None
     reason: AttemptFencingReason | None
+    busy_reason: AttemptLeaseBusyReason | None = None
     current_fencing_token: FencingToken | None = None
 
 
@@ -358,6 +369,7 @@ __all__ = [
     "DEFAULT_ATTEMPT_LEASE_CONFIG",
     "AttemptFencingError",
     "AttemptFencingReason",
+    "AttemptLeaseBusyReason",
     "AttemptLeaseConfig",
     "AttemptLeaseDecision",
     "AttemptLeaseResult",

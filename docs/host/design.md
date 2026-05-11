@@ -662,7 +662,8 @@ LocalRunHarness
 - 旧 owner、过期 owner、非 owner 或旧 fencing token 的迟到写入必须返回 typed fencing refusal，并且不得写入
   diagnostic RunEvent；非 owner 不应通过“我被拒绝了”这类 meta-fact 污染 canonical EventLog。
 - 所有 attempt-scoped append 都必须走 owner fencing，包括 Engine-sourced events、context compact
-  facts、`RUN_INPUT_CONTEXT_SNAPSHOT_BUILT` 和 ToolRuntime 产生的 truncate / cursor / fetch_more facts。
+  facts、`RUN_INPUT_CONTEXT_SNAPSHOT_BUILT` 和 ToolRuntime / Engine tool loop 产生的普通 tool calling
+  facts。P8.5 后不再把 truncate / cursor / `fetch_more` 表达为专属 RunEvent fact。
 - ToolRuntime 不获得 owner token，也不把 owner token 放入 `ToolExecutionContext`。Host 通过内部
   `AttemptScopedRunEventAppender` / owner scope 为当前 attempt 注入可写 append port。
 - 正常 terminal attempt 必须在同一 `BEGIN IMMEDIATE` 或等价 durable unit 中完成 terminal event
@@ -903,11 +904,11 @@ RunInputBuilder 的决策。它必须在 RunInputBuilder 产物确定后、Engin
 tool trace 会重新退化为进程内缓存诊断，无法 crash replay。
 
 `RUN_INPUT_CONTEXT_SNAPSHOT_BUILT` 的 raw payload 与 EventLog fact 必须作为同一个 durable unit of
-work 提交。P7 落地的实现方式：fact `data` payload 直接内联完整 `raw_input_messages_json` 与
-`raw_tool_schemas_json`（SQLite TEXT 列无大小硬上限），事务边界收敛到单条 `append_in_transaction`
-原子写入；不再单独写"先 raw blob 再 append fact ref"两阶段。该方式天然消除"fact 已落库但 raw
-ref 缺失"窗口；trade-off 是 EventLog 行体积增大，已在 `docs/host/migration-plan.md` §4.3 登记为
-中期评估项（必要时再外迁到独立表 / 文件）。
+work 提交。P8.5 后当前实现不再把完整 `raw_input_messages_json` / `raw_tool_schemas_json` 内联进
+EventLog hot row；Host 在同一个 `HostStorage.transaction()` 内先写 `run_input_raw_payloads`
+side-store，再 append 只含 blob id、sha256、byte size 与 bounded summary 的 EventLog fact。
+trace projection / debug read path 读取 side-store 时必须校验 blob kind、hash、byte size 与 JSON；
+缺失、损坏或 hash mismatch 均返回 typed projection failure，checkpoint 不推进，禁止合成 fake raw payload。
 
 P7 trace payload 采用 OLD 的热 / 冷分层，而不是默认做业务内容过滤：
 
@@ -930,29 +931,30 @@ exporter / adapter 输入输出素材，但 Host 内部 read model 不伪装成�
 harness 在配置了 `ToolTraceStore` / trace storage path 时默认注册 `tool_trace_observer`；未配置 trace
 store 时不注册，避免无意义 observer 状态面。
 
-P7 落地后的硬事实：
+P7 / P8.5 落地后的硬事实：
 
 - JSONL 文件是 trace 的真源；P7 不在 SQLite 引入任何 `host_tool_trace_*` 表。`docs/host/phase7-plan.md`
   §9 原先建议的 `host_tool_trace_records` / `host_tool_trace_raw_payloads` 双表方案已被 JSONL 真源方案取代。
-- `RUN_INPUT_CONTEXT_SNAPSHOT_BUILT` 是 P6 EventLog 的事实补齐 patch，由 Host 同事务追加；
-  内联 `raw_input_messages_json` / `raw_tool_schemas_json` 与 `raw_*_blob_id`，让 trace observer
-  无需回查 EventLog 即可重建 raw payload。
-- `ToolTraceObserver` 是当前唯一 sink 同步阻塞 terminal drain 的 observer：sink 每行 `flush + fsync`、
-  raw payload `tmp + os.replace` 原子落地，但写入完全在文件系统，**不动 SQLite**，不阻塞 Engine 事件
-  产生；`tx` 参数仅为满足 `ObserverSink` 协议而保留。projection 采用 best-effort 语义：JSONL append
-  与 `ProjectionCoordinator` checkpoint 推进非原子，crash 窗口可能产生孤儿副本，依赖行内
-  `idempotency_key` 在 analyzer 阶段去重，至少一次 + 去重而非 exactly-once。
+- `RUN_INPUT_CONTEXT_SNAPSHOT_BUILT` 是 P6 EventLog 的事实补齐 patch，由 Host 与
+  `run_input_raw_payloads` side-store 在同一 storage transaction 内提交。EventLog fact 只保留 raw payload
+  refs / hashes / sizes 与 bounded summary；trace observer 回查 side-store 并校验后写出 raw payload 文件。
+- `ToolTraceObserver` 是 non-required `NonTransactionalObserverSink`：JSONL 每行 `flush + fsync`、
+  raw payload `tmp + os.replace` 原子落地，I/O 发生在 checkpoint transaction 外。sink 成功后才用短事务推进
+  checkpoint；I/O 成功但 checkpoint 前 crash 或 checkpoint 失败时允许 replay 产生重复 JSONL / blob 行，
+  依赖行内 `idempotency_key` 在 analyzer / reader 阶段去重，至少一次 + 去重而非 exactly-once。
 - 行内 `idempotency_key`（sha256[:32], 包含 `schema_version | trace_type | run_id | iteration_id |
   tool_call_id | source_event_position | record_role`）是 analyzer 去重崩溃 replay 副本的依据；
   `analyzer` 严格拒绝 OLD `tool_trace_v2` 文件，不做兼容读取。
 - provider secret scrub 仅作用于 `PROVIDER_PROTOCOL_ERROR.raw_payload`（`Authorization` /
-  `api_key` / `cookie` / `x-api-key` / `openai-organization` / `anthropic-api-key` 等键替换为 `***`）；
+  `api_key` / `cookie` / `x-api-key` / `anthropic-api-key` 等明确凭证键替换为 `***`）；
   `scope_token` / `cursor` / prompt / tool result 仍按 OLD 热 / 冷分层保留进 trace，用于真实故障定位。
 
-P8-S2 把 `ObserverSink.process` 从同步升级为 async 调用协议：`ProjectionCoordinator.drain()`
-在同一 HostStorage 事务内 `await observer.process(tx, events)`，sink 写入与 checkpoint 推进
-同生同灭。这不引入 observer claim / lease；observer 仍从 durable EventLog 消费，不读取 attempt
-owner side channel。attempt ownership 与 observer ownership 是两个独立状态机。
+P8-S2 曾把 `ObserverSink.process` 从同步升级为 async 调用协议：`ProjectionCoordinator.drain()`
+在同一 HostStorage 事务内 `await observer.process(tx, events)`。该描述只记录 P8 前置实现事实；
+P8.5 起，non-required trace JSONL/blob sink 采用事务外 at-least-once 写入，checkpoint 仅在 sink
+success 后短事务推进，checkpoint 前 crash 允许 replay duplicate 并依赖 `idempotency_key` 去重。
+这不引入 observer claim / lease；observer 仍从 durable EventLog 消费，不读取 attempt owner side
+channel。attempt ownership 与 observer ownership 是两个独立状态机。
 
 ### 9.5 Wait / Suspend 预留契约
 
@@ -1053,7 +1055,9 @@ class WorkerCancelRequest:
 class EngineWorker(Protocol):
     def run_agent_messages(
         self,
-        request: AgentRunRequest,
+        request: StartRunRequest,
+        tool_schemas: tuple[ToolSchema, ...],
+        cancellation_token: CancellationToken,
     ) -> AsyncIterator[EngineEvent]: ...
 
     async def cancel(self, request: WorkerCancelRequest) -> None: ...
@@ -1086,11 +1090,37 @@ ToolExecutor 由 EngineWorker 替 Host 在执行环境中代持，并提供给 E
 - Engine 不知道 ToolExecutor 是本地实现还是远程 worker 内实现。
 - Engine 不注册工具、不发现工具、不持有 ToolRegistry。
 
-当前 P2 已落地最小 Host-owned ToolRuntime：它代持底层业务 `ToolExecutor`，在普通工具成功返回路径上按显式
-`ToolTruncateSpec` 执行截断，生成 run-scoped、single-use、TTL-bound cursor，并把截断 / 补读治理事实写入
-canonical `RunEvent`。
+EngineWorker 同时是 Host 把“当前对 Engine 生效的工具 schema”交给 Engine 的唯一适配边界。Host /
+ToolRuntime 可以在自身内部使用更强的工具声明对象、内部 schema 表达或 `ToolDefinition`，但进入 EngineWorker
+之后必须收敛为显式的 `tuple[ToolSchema, ...]`，再交给 Engine。这里不应使用 callback-style
+`schema_provider` 让 EngineWorker 在运行中回调 Runtime 重新计算 schema；当前生效 schema 应由 Host 装配 /
+Runtime 在进入 EngineWorker 前显式产出，避免 Harness 与 Worker 双重增强、重入调用或隐式副作用。
 
-P2 后工具执行边界：
+LocalRunHarness 不负责把 framework tools 投影成 Engine-visible schema。Harness 的职责是 Run lifecycle、
+EventLog、attempt、memory、compact 与治理收口；它可以携带调用方原始业务 tool schema，但不应知道
+OpenAI / Anthropic / Gemini 等 provider schema 形状，也不应通过私有 helper 二次增强 request。若 Host 需要把
+`fetch_more` 等 framework tool 暴露给模型，ToolRuntime / 装配层先把它加入当前生效的 Dayu 抽象
+`ToolSchema` 集合，再由 EngineWorker 显式传给 Engine。
+
+Provider-specific schema 翻译不属于 Host。当前 OpenAI 路径中，Dayu 抽象 `ToolSchema` 到 OpenAI
+`tools` payload 的翻译位置仍是 Engine 的 OpenAI runner payload adapter
+（`dayu/engine/runners/openai/payload.py::_serialize_tool_schema`）。P8.5 不移动该边界；未来支持 Anthropic
+API 时，再在 Engine / Runner 的 provider adapter 层决定 Anthropic schema shape，而不是让 Host Harness
+感知 provider 细节。
+
+该边界的长期收益是把 Host 内部工具定义机制与 Engine/provider 协议解耦。`@tool` 只是当前用于声明
+schema、display metadata 与 callable 绑定的一种便利方式，不应成为 Host / Engine 边界契约。未来若需要把
+工具定义改成配置文件、数据库 catalog、remote tool manifest、代码生成 schema，或 P10 ToolRegistry 下的
+权限化工具描述，Host 只需要把这些内部表达投影为当前生效的 Dayu 抽象 `ToolSchema` 集合并交给 EngineWorker；
+Engine / Runner 仍只处理抽象 `ToolSchema` 到 provider-specific payload 的转换。这样既能轻易替换工具定义来源，
+也避免 `LocalRunHarness`、Engine 或 provider adapter 依赖 `@tool`、`ToolDefinition` 或 Runtime 私有类型。
+
+Host-owned ToolRuntime 代持底层业务 `ToolExecutor`，负责普通 tool dispatch、执行编排和
+`ToolExecutionOutcome` 返回。ToolRuntime 不直接实现截断状态机或 cursor store；这些能力属于 Host
+私有截断组件，本文暂称 `RuntimeTruncateManager`。ToolRuntime 不注册业务工具、不发现业务工具、不拥有业务
+权限模型；业务工具仍由调用方提供的 `ToolExecutor` 执行。
+
+工具执行边界：
 
 ```text
 Engine
@@ -1098,35 +1128,99 @@ Engine
   -> Host-owned ToolRuntimeToolExecutor
   -> HostToolRuntime.execute_tool_call(request)
       -> underlying business ToolExecutor
-      -> schema-driven truncate / cursor store
-      -> RunEventStore.append(canonical tool runtime facts)
+      -> RuntimeTruncateManager applies schema-driven truncate when needed
+      -> ordinary ToolExecutionOutcome
   -> Engine receives ToolExecutionOutcome
 ```
 
-P2 后补读边界：
+`RuntimeTruncateManager` 是 ToolRuntime 内部组合的 Host 私有组件。它按显式 `ToolTruncateSpec` 决定是否
+截断普通 tool result，维护 run-scoped、single-use、TTL-bound cursor store，并生成返回给 LLM 的
+`truncation.fetch_more_args`。它不进入 Engine、`dayu.host.__all__`、`dayu.host.contracts` 或
+`dayu.runtime`。
+
+### 11.1 Host framework built-in tool 边界
+
+`fetch_more` 是 Host 私有 framework built-in tool。它对模型表现为普通 tool schema，对 Engine 表现为普通
+`ToolExecutionRequest` / `ToolExecutionOutcome`，但它的 declaration、callable、executor、cursor store、
+fencing 与补读实现都属于 Host 私有实现，Engine 什么都看不到。
+
+Engine 边界必须保持：
+
+- Engine 只接收投影后的 `ToolSchema`，不接收 `ToolDefinition`。
+- EngineWorker 只接收 Host 已显式确定的当前生效 `ToolSchema` 集合，不在运行时通过 callback 回调 Runtime
+  重新增强 schema。
+- Engine 只发普通 `ToolExecutionRequest(name="fetch_more", arguments=...)`。
+- Engine 只接收普通 `ToolExecutionOutcome`。
+- Engine 不 import、不持有、不分支判断 `@tool`、`ToolDefinition`、callable、executor、framework built-in
+  dispatch、cursor store、fencing 或 Host runtime 私有类型。
+
+Host framework tool declaration 边界：
+
+- Host 可以在私有 runtime 装配层使用公共 `@tool(...)` 声明能力，为 `fetch_more` 构造私有
+  `ToolDefinition`。
+- `@tool` 只用于让 schema、参数约束、展示 metadata 与执行 callable 同源声明；对 Engine / Runner 只能投影
+  `definition.to_tool_schema()`。
+- `fetch_more` 的 `ToolDefinition` 不进入 `dayu.host.__all__`、`dayu.host.contracts`、`StartRunRequest`、
+  `RunOptions` 或 Engine public contract。
+- Host 不为 `fetch_more` 保留 public handle、public request/result dataclass 或 legacy compatibility
+  wrapper。
+
+Runtime / tool 执行边界：
+
+- Runtime 只在构造 Host 私有 `fetch_more` tool definition 时，通过闭包传入 `RuntimeTruncateManager`
+  的最小补读 Protocol。
+- 传入闭包的 Protocol 只暴露 `fetch_more` 执行所需能力，例如 cursor lookup / consume / issue、
+  scope / binding / TTL 校验、limit resolution 与 chunk building；不暴露 Runtime 本体、EventLog、
+  harness 或 Engine。
+- 闭包注入完成后，`fetch_more` callable 自己执行补读 tool calling 逻辑，并直接返回
+  `ToolCompletedOutcome` 或 `ToolFailedOutcome`。
+- Runtime 不再构造或消费 `ToolFetchMoreRequest` / `ToolFetchMoreSucceededResult` /
+  `ToolFetchMoreFailedResult` / `ToolFetchMoreResult` 等具体工具名契约。
+- Runtime 不根据 `fetch_more` 私有返回类型分支；它只按普通 tool name dispatch 到 Host 私有 framework
+  tool executor，并返回普通 `ToolExecutionOutcome`。
+- Runtime 不拥有 cursor / truncation 的内部状态机；它只组合 `RuntimeTruncateManager`，并在普通 tool
+  result 返回前调用 manager 做可选截断。
+- `RuntimeTruncateManager` 不把 cursor、truncation 或 `fetch_more` 提升成 EventLog 特殊事实、public
+  contract 或 projection 分支类型名。
+
+`fetch_more` 补读边界：
 
 ```text
-UI / Service / test harness
-  -> get_tool_fetch_more_handle(session / run / original tool_call / cursor fingerprint)
-  -> fetch_more_tool_result(handle cursor + scope token + optional limit)
-  -> HostToolRuntime.fetch_more(request)
-  -> RunEventStore.append(canonical fetch_more facts)
-  -> ToolFetchMoreResult
+Model -> tool_call fetch_more(cursor, scope_token, limit?)
+  -> Engine treats it as ordinary LLM tool call
+  -> ToolExecutor.execute(ToolExecutionRequest{name="fetch_more"})
+  -> ToolRuntimeToolExecutor -> HostToolRuntime
+  -> Host private framework tool dispatch
+  -> fetch_more callable uses closure-injected RuntimeTruncateManager Protocol
+      -> validates cursor binding / scope / TTL
+      -> consumes old cursor and optionally issues next cursor
+  -> returns ordinary ToolExecutionOutcome
+  -> Engine injects ordinary tool result back to the model
 ```
 
-P2 Host public handle 的边界是：`scope_token` 只通过调用方持有的非 EventLog 受控 handle 短期交付，
-不写入 memory、普通日志或 smoke 大块输出，也不进入 RunInputBuilder。P2/P5 最小运行事实可以只在
-RunEvent 中保存 cursor fingerprint、scope hash、limit、unit、size summary、lineage 等中性摘要，不保存完整
-大结果。P7 tool trace 落地后，`scope_token` / raw cursor 作为 `fetch_more` 诊断字段进入 trace 冷层或
-tool call raw payload；这属于 debug / trace read model，不是 memory 或模型上下文真源。terminal RunEvent
-后的 `fetch_more` 返回 typed failure，且不追加新 RunEvent，以保持 terminal guard。
-
-P5 LLM-facing truncated tool result 的边界是：截断后的普通 tool result 可以短期携带
+LLM-facing truncated tool result 的边界是：截断后的普通 tool result 可以短期携带
 `truncation.fetch_more_args.scope_token` 给模型，只用于同一 run 内由模型发起的 framework `fetch_more`
 tool call。该 token 仍不得写入 memory projection、普通日志或文档 / smoke 大块输出。P7 起，trace 冷层
 必须能够保留该 token 与 cursor，用来诊断模型是否重复 `fetch_more`、传错 `scope_token` 或传错 cursor。
 Engine 仍不拥有、不解释 `scope_token`；它只把 token 当作普通 tool result JSON 注入给模型，再把模型发起的
 普通 tool args 回传给 Host。
+
+EventLog / RunEvent 边界：
+
+- EventLog 只看到一次次普通 tool calling：`TOOL_CALL_REQUESTED` 与 `TOOL_RESULT_ACCEPTED`。
+- truncate 只是 Runtime 改写某个普通 tool 返回给 LLM 的数据；对 EventLog 来说，它仍是该 tool 的普通
+  accepted result。
+- `fetch_more` 只是普通 tool name，对 EventLog 来说，它仍是一次普通 tool request / result。
+- cursor 是 truncate / fetch_more 的内部实现细节，只能作为普通 tool call 参数或普通 tool result payload
+  的一部分短期进入 LLM roundtrip；Dayu 是本地 Agent，EventLog 只做窄 credential scrub：除
+  `API_KEY` / 明确凭证外，不因字段名是 cursor、`scope_token`、tool args 或 tool result 而删除或遮蔽。
+- 如果 EventLog 需要保留截断观察信息，应优先扩展通用 tool result 的摘要或 credential-scrubbed payload，
+  不新增 `TOOL_RESULT_TRUNCATED` / `TOOL_CURSOR_ISSUED` / `TOOL_CURSOR_EXPIRED` /
+  `TOOL_CURSOR_DENIED` 等 cursor / truncation 专属 RunEventType。
+- Host 不追加 `TOOL_FETCH_MORE_REQUESTED` / `TOOL_FETCH_MORE_COMPLETED` /
+  `TOOL_FETCH_MORE_FAILED` 等具体工具名 RunEventType。
+- terminal RunEvent 后的 `fetch_more` 返回普通 failed `ToolExecutionOutcome`，且不追加新 RunEvent，以保持
+  terminal guard。
 
 ToolRuntime 仍必须保持：
 
@@ -1137,8 +1231,9 @@ ToolRuntime 仍必须保持：
 - `ToolTruncateSpec` 必须继续支持 OLD 已覆盖的多种截断策略，例如 `text_chars`、`text_lines`、
   `list_items`、`binary_bytes`，并支持 `target_field` / `field_path` 等定位方式；P5 不能把实现收窄成
   只服务 `huge_echo` 的单一文本截断。
-- P2 最小实现只提供 Host public `fetch_more` 路径；P5 修订目标是在不引入完整 ToolRegistry / 权限治理的前提下，
-  恢复 OLD 的 LLM-facing framework `fetch_more` 行为，让模型在同一个 run 内自行通过 tool calling 补读。
+- `fetch_more` 只作为 Host 私有 framework built-in tool 暴露给模型 schema，不恢复 legacy public
+  `fetch_more` handle。
+- 不在 P8.5 提前引入完整 P10 ToolRegistry；Host 私有 framework tool dispatch 只覆盖 Host built-in tool。
 
 P5 后目标的 LLM-facing truncate / fetch_more 执行路径是：
 
@@ -1148,36 +1243,33 @@ Model -> tool_call huge_echo(...)
   -> ToolExecutor.execute
   -> ToolRuntimeToolExecutor -> HostToolRuntime
   -> huge_echo returns a large result
-  -> ToolRuntime applies ToolTruncateSpec
+  -> RuntimeTruncateManager applies ToolTruncateSpec
       -> supports text_chars / text_lines / list_items / binary_bytes
       -> supports target_field / field_path where declared
       -> stores run-scoped single-use cursor + scope token
-      -> appends canonical truncated / cursor-issued facts
-  -> Engine injects truncated tool result back to the model
-      -> includes LLM-readable truncation hint
+      -> returns an ordinary tool result value with LLM-readable truncation hint
+  -> Engine projects ordinary JSON tool result back to the model
       -> truncation.next_action = "fetch_more"
       -> truncation.fetch_more_args = {cursor, scope_token, limit?}
 Model -> tool_call fetch_more(cursor, scope_token, limit?)
   -> Engine still treats it as ordinary LLM tool call
-  -> Host ToolExecutor / ToolRuntime routes framework fetch_more
-      instead of business executor
-  -> ToolRuntime consumes cursor, appends fetch_more requested / completed facts
+  -> Host ToolRuntime routes to private framework tool executor
+  -> fetch_more callable consumes cursor through closure-injected RuntimeTruncateManager Protocol
   -> returns next chunk and, if needed, next cursor hint
 Model -> repeats fetch_more if needed, then emits final answer
 ```
 
 因此 `fetch_more` 本身应作为 framework tool 暴露给 LLM，但它不是业务工具，不进入完整业务 ToolRegistry
-治理目标。Engine 只看到普通 tool call 与普通 tool result；cursor 存储、scope 校验、single-use、TTL、
-lineage 与审计事实仍由 Host ToolRuntime 拥有。
+治理目标。Engine 只看到 ordinary tool schema、ordinary tool call 与 ordinary tool result；cursor 存储、
+scope 校验、single-use、TTL 与 lineage 由 Host 私有 `RuntimeTruncateManager` 拥有。
 
-ToolRuntime 最小生命周期事实当前已经覆盖截断与补读子集，完整权限模型仍未展开：
+ToolRuntime 最小生命周期事实应保持在普通 tool calling 维度，完整权限模型仍未展开：
 
 - tool call proposed。
 - approved / denied / deferred。
 - started。
 - completed。
 - failed。
-- truncated / cursor issued / fetch_more requested / completed / failed / cursor expired / cursor denied。
 - cancelled / timeout。
 
 这些事实可以投影为客户端可见 tool summary、内部 audit event 或 trace event。Host 只治理运行边界、
@@ -1264,7 +1356,7 @@ P3 后执行边界：
 - `ConversationMemoryStore` 只消费同一 run 已落库的 canonical `RunEvent`，不消费 preview、reasoning、
   display timeline 或 debug trace。
 - `RunInputBuilder` 只读 `ConversationMemorySnapshot` 与当前 `USER_INPUT_ACCEPTED` 事件；不读取
-  ToolRuntime cursor store，不持有 `ToolFetchMoreHandle`，不消费 `scope_token`。
+  `RuntimeTruncateManager` cursor store，不持有 legacy public `fetch_more` handle，不消费 `scope_token`。
 - `RunInputBuildTrace` 只用于 Host 内部诊断与测试；它不写入 EventLog，不进入模型上下文，也不作为下一轮
   memory 真源。
 - P7 起，Host 在 RunInputBuilder 完成后追加 `RUN_INPUT_CONTEXT_SNAPSHOT_BUILT` diagnostic fact，使
@@ -1321,11 +1413,11 @@ LocalRunHarness.start_run(turn 1)
   -> model tool_call huge_echo
   -> ToolExecutor.execute
   -> ToolRuntimeToolExecutor -> HostToolRuntime -> huge_echo executor
-  -> ToolRuntime append truncate / cursor facts
-  -> Engine injects truncated tool result with next_action=fetch_more hint
+  -> RuntimeTruncateManager returns ordinary tool result value with next_action=fetch_more hint
+  -> Engine projects ordinary JSON tool result
   -> model tool_call fetch_more
-  -> ToolRuntime routes framework fetch_more
-      -> append fetch_more requested / completed before terminal
+  -> ToolRuntime routes to Host private framework fetch_more tool
+      -> fetch_more callable consumes cursor through closure-injected RuntimeTruncateManager Protocol
       -> return next chunk / next cursor hint if needed
   -> Engine final terminal
   -> ConversationMemoryStore.project_run_events
@@ -1671,8 +1763,9 @@ content delta、content completed 不进入 memory pool 或 RunInput replay；de
 
 ### 12.6 RunInputBuilder 输入顺序
 
-RunInputBuilder 的输出是 Engine 已经理解的 `RunInput.messages`。它不能读取 ToolRuntime cursor store，
-不能持有 `ToolFetchMoreHandle`，不能消费 `scope_token`、cursor 原文、完整大工具结果或 reasoning。
+RunInputBuilder 的输出是 Engine 已经理解的 `RunInput.messages`。它不能读取 `RuntimeTruncateManager`
+cursor store，不能持有 legacy public `fetch_more` handle，不能消费 `scope_token`、cursor 原文、
+完整大工具结果或 reasoning。
 
 当前 P3 运行态输入顺序：
 

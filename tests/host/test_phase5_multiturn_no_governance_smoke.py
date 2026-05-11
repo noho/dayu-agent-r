@@ -14,7 +14,7 @@ import pytest
 from typing import Final, TypeVar
 
 import dayu.engine.agent as agent_module
-from dayu.contracts import FRAMEWORK_FETCH_MORE_TOOL_NAME, ToolSchema
+from dayu.contracts import ToolSchema
 from dayu.engine import (
     AgentMessage,
     AgentMessageRole,
@@ -33,6 +33,7 @@ from dayu.engine import (
     SystemMessage,
     ToolCallRequestedData,
     ToolMessage,
+    ToolResultAcceptedData,
 )
 from dayu.host import (
     RunEvent,
@@ -48,13 +49,10 @@ from dayu.contracts.tool_call import (
     ToolExecutionRequest,
 )
 from dayu.contracts.tool_outcome import ToolCompletedOutcome, ToolFailedOutcome
-from dayu.host.contracts import (
-    HostContextCompactCompletedData,
-    ToolCursorIssuedData,
-    ToolFetchMoreCompletedData,
-    ToolResultTruncatedData,
-)
+from dayu.host.contracts import HostContextCompactCompletedData
+from dayu.host._framework_tools import FRAMEWORK_FETCH_MORE_NAME
 from dayu.host._run_harness import LocalRunHarness
+from dayu.host._tool_result_truncation import extract_truncation_hint
 from dayu.runtime.log_levels import VERBOSE_LOG_LEVEL
 from utils.smoke_host_multiturn_no_governance import (
     HUGE_ECHO_DEFINITION,
@@ -368,34 +366,10 @@ async def _streaming_reasoning_then_final_events(
     )
 
 
-async def _collect_until_cursor(
-    events: AsyncIterator[RunEvent],
-) -> tuple[RunEvent, ...]:
-    """收集到 cursor issued 为止。
-
-    :param events: RunEvent 流。
-    :returns: 已收集事件。
-    :raises AssertionError: 提前终态或流结束时抛出。
-    """
-
-    collected: list[RunEvent] = []
-    async for event in events:
-        collected.append(event)
-        if isinstance(event.data, ToolCursorIssuedData):
-            return tuple(collected)
-        assert event.type not in {
-            RunEventType.FINAL_ANSWER,
-            RunEventType.RUN_FAILED,
-            RunEventType.RUN_CANCELLED,
-            RunEventType.RUN_SUSPENDED,
-        }
-    raise AssertionError("cursor was not issued")
-
-
 async def _collect_until_fetch_more_completed(
     events: AsyncIterator[RunEvent],
 ) -> tuple[RunEvent, ...]:
-    """收集到 framework ``fetch_more`` 完成事实为止。
+    """收集到 framework ``fetch_more`` 普通 accepted 结果为止。
 
     :param events: RunEvent 流。
     :returns: 已收集事件。
@@ -405,7 +379,7 @@ async def _collect_until_fetch_more_completed(
     collected: list[RunEvent] = []
     async for event in events:
         collected.append(event)
-        if isinstance(event.data, ToolFetchMoreCompletedData):
+        if _is_tool_result_for(event=event, tool_name=FRAMEWORK_FETCH_MORE_NAME):
             return tuple(collected)
         assert event.type not in {
             RunEventType.FINAL_ANSWER,
@@ -416,19 +390,37 @@ async def _collect_until_fetch_more_completed(
     raise AssertionError("fetch_more was not completed")
 
 
-def _last_data(events: tuple[RunEvent, ...], data_type: type[_T]) -> _T:
-    """读取最后一个指定类型 data。
+def _is_tool_result_for(*, event: RunEvent, tool_name: str) -> bool:
+    """判断事件是否为指定工具的普通 accepted 结果。
+
+    :param event: RunEvent。
+    :param tool_name: 工具名。
+    :returns: 匹配时返回 ``True``。
+    :raises Exception: 不主动抛出异常。
+    """
+
+    data = event.data
+    return isinstance(data, ToolResultAcceptedData) and data.name == tool_name
+
+
+def _last_tool_result(
+    events: tuple[RunEvent, ...],
+    *,
+    tool_name: str,
+) -> ToolResultAcceptedData:
+    """读取最后一个指定工具的普通 accepted 结果。
 
     :param events: RunEvent 元组。
-    :param data_type: data 类型。
-    :returns: data。
+    :param tool_name: 工具名。
+    :returns: 工具结果 data。
     :raises AssertionError: 未找到时抛出。
     """
 
     for event in reversed(events):
-        if isinstance(event.data, data_type):
-            return event.data
-    raise AssertionError(f"missing data: {data_type.__name__}")
+        data = event.data
+        if isinstance(data, ToolResultAcceptedData) and data.name == tool_name:
+            return data
+    raise AssertionError(f"missing tool result: {tool_name}")
 
 
 def _event_count(events: tuple[RunEvent, ...], event_type: RunEventType) -> int:
@@ -445,7 +437,7 @@ def _event_count(events: tuple[RunEvent, ...], event_type: RunEventType) -> int:
 
 def _event_cursor_for_data(
     events: tuple[RunEvent, ...],
-    data: ToolFetchMoreCompletedData,
+    data: ToolResultAcceptedData,
 ) -> int:
     """读取指定 data 对应事件 cursor。
 
@@ -533,8 +525,8 @@ async def test_phase5_sequential_multiturn_stitches_eventlog_toolruntime_memory(
 
     monkeypatch.setattr(agent_module, "_build_runner", _fake_build_runner)
     probe = ToolExecutionProbe(
-        gate_after_runtime=True,
-        gate_tool_name=FRAMEWORK_FETCH_MORE_TOOL_NAME,
+        gate_after_runtime=False,
+        gate_tool_name=FRAMEWORK_FETCH_MORE_NAME,
     )
     memory_store = _seeded_memory_store()
     harness = build_huge_echo_harness(probe=probe, memory_store=memory_store)
@@ -549,20 +541,19 @@ async def test_phase5_sequential_multiturn_stitches_eventlog_toolruntime_memory(
     )
 
     stream = await harness.start_run(request)
-    first_events = await _collect_until_fetch_more_completed(stream.events)
-    truncated = _last_data(first_events, ToolResultTruncatedData)
-    fetch_completed = _last_data(first_events, ToolFetchMoreCompletedData)
-
-    assert fetch_completed.next_cursor_fingerprint is not None
+    first_events = await _collect(stream.events)
+    fetch_completed = _last_tool_result(
+        first_events, tool_name=FRAMEWORK_FETCH_MORE_NAME
+    )
+    assert isinstance(fetch_completed.outcome, ToolCompletedOutcome)
+    next_truncation = extract_truncation_hint(
+        fetch_completed.outcome.result.value
+    )
+    assert next_truncation is not None
+    next_cursor_value = next_truncation.cursor
+    next_scope_token = next_truncation.scope_token
     runtime = harness.tool_runtime
     assert runtime is not None
-    next_cursor_value = runtime._cursor_by_fingerprint[
-        fetch_completed.next_cursor_fingerprint
-    ]
-    next_record = runtime._records_by_cursor[next_cursor_value]
-    next_scope_token = next_record.scope_token
-    probe.release()
-    first_events = first_events + await _collect(stream.events)
     terminal = await _wait_succeeded(harness, _RUN_1)
     await _wait_memory_projected(harness, _SESSION_ID)
     event_count_before = len(await harness.event_store.list_events(_RUN_1, after=None))
@@ -570,7 +561,7 @@ async def test_phase5_sequential_multiturn_stitches_eventlog_toolruntime_memory(
         ToolExecutionRequest(
             call=ToolCallRequest(
                 tool_call_id="post-terminal-fetch",
-                name=FRAMEWORK_FETCH_MORE_TOOL_NAME,
+                name=FRAMEWORK_FETCH_MORE_NAME,
                 arguments={
                     "cursor": next_cursor_value,
                     "scope_token": next_scope_token,
@@ -610,8 +601,8 @@ async def test_phase5_sequential_multiturn_stitches_eventlog_toolruntime_memory(
     first_schema_names = {
         schema.function.name for schema in runner.requests[0].tool_schemas
     }
-    assert runner.requests[0].tool_schemas == schemas
-    assert first_schema_names == {"huge_echo", FRAMEWORK_FETCH_MORE_TOOL_NAME}
+    assert request.options.tool_schemas == schemas
+    assert first_schema_names == {"huge_echo", FRAMEWORK_FETCH_MORE_NAME}
     assert all(isinstance(schema, ToolSchema) for schema in runner.requests[0].tool_schemas)
     second_iteration_tool_message = _latest_tool_message_content(
         runner.messages_seen[1]
@@ -620,23 +611,21 @@ async def test_phase5_sequential_multiturn_stitches_eventlog_toolruntime_memory(
     assert second_payload["truncation"]["next_action"] == "fetch_more"
     assert "cursor" in second_payload["truncation"]["fetch_more_args"]
     assert "scope_token" in second_payload["truncation"]["fetch_more_args"]
-    assert "scope_token" not in repr(first_events)
+    assert "scope_token" in repr(first_events)
     fetch_more_requested = [
         event
         for event in first_events
         if event.type is RunEventType.TOOL_CALL_REQUESTED
         and isinstance(event.data, ToolCallRequestedData)
-        and event.data.name == FRAMEWORK_FETCH_MORE_TOOL_NAME
+        and event.data.name == FRAMEWORK_FETCH_MORE_NAME
     ]
     assert fetch_more_requested
-    assert "scope_token" not in repr(fetch_more_requested)
+    assert "scope_token" in repr(fetch_more_requested)
     assert RunEventType.TOOL_CALL_REQUESTED in {event.type for event in first_events}
     assert _event_count(first_events, RunEventType.USER_INPUT_ACCEPTED) == 1
     assert probe.execute_called
     assert probe.runtime_completed
-    assert probe.tool_names == ["huge_echo", FRAMEWORK_FETCH_MORE_TOOL_NAME]
-    assert truncated.tool_name == "huge_echo"
-    assert _last_data(first_events, ToolFetchMoreCompletedData).tool_name == "huge_echo"
+    assert probe.tool_names == ["huge_echo", FRAMEWORK_FETCH_MORE_NAME]
     assert _event_cursor_for_data(first_events, fetch_completed) < terminal.terminal_event_cursor.sequence
     assert isinstance(post_terminal, ToolFailedOutcome)
     assert post_terminal.result.error == "run_terminal"
@@ -646,6 +635,8 @@ async def test_phase5_sequential_multiturn_stitches_eventlog_toolruntime_memory(
     assert "final mentions huge_echo" in second_input_text
     assert "tool_name=huge_echo" in second_input_text
     assert "source_event_cursor=" in second_input_text
+    assert "scope_token" not in second_input_text
+    assert "fetch_more_args" not in second_input_text
     assert "phase5 pinned goal" in second_input_text
     assert "phase5-topic" in second_input_text
 
@@ -763,7 +754,7 @@ async def test_phase5_compact_retry_is_internal_attempt_and_preserves_facts(
         )
     )
     first_events = await _collect(first.events)
-    assert _last_data(first_events, ToolFetchMoreCompletedData).tool_name == "huge_echo"
+    assert _last_tool_result(first_events, tool_name=FRAMEWORK_FETCH_MORE_NAME).name == FRAMEWORK_FETCH_MORE_NAME
     await _wait_succeeded(harness, _RUN_1)
     await _wait_memory_projected(harness, _SESSION_ID)
 
@@ -794,7 +785,11 @@ async def test_phase5_compact_retry_is_internal_attempt_and_preserves_facts(
 
     assert _event_count(compact_events, RunEventType.USER_INPUT_ACCEPTED) == 1
     assert len(proxy.requests) == 2
-    assert _last_data(compact_events, HostContextCompactCompletedData).reduced
+    assert any(
+        isinstance(event.data, HostContextCompactCompletedData)
+        and event.data.reduced
+        for event in compact_events
+    )
     assert "caller system prompt" in retry_text
     assert "当前用户问题触发 compact" in retry_text
     assert "phase5 pinned goal" in retry_text

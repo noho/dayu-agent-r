@@ -37,7 +37,6 @@ from dayu.contracts import (
     ToolResultMeta,
     ToolResultSuccess,
     ToolSchema,
-    ToolTruncationInfo,
 )
 from dayu.engine.contracts import (
     TERMINAL_ENGINE_EVENT_TYPES,
@@ -72,6 +71,7 @@ from dayu.engine.contracts import (
     OpenAIReasoningEffort,
     MimoThinkingExtension,
     OpenAIReasoningExtension,
+    PartialToolCallSummary,
     ProviderProtocolErrorData,
     ProviderRequestExtension,
     QwenThinkingExtension,
@@ -141,6 +141,7 @@ __all__ = [
     "MimoThinkingExtension",
     "OpenAIReasoningEffort",
     "OpenAIReasoningExtension",
+    "PartialToolCallSummary",
     "ProviderProtocolErrorData",
     "ProviderRequestExtension",
     "QwenThinkingExtension",
@@ -193,6 +194,5 @@ __all__ = [
     "ToolResultMeta",
     "ToolResultSuccess",
     "ToolSchema",
-    "ToolTruncationInfo",
     "UserMessage",
 ]

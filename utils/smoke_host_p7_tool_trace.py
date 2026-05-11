@@ -12,10 +12,10 @@
   验证 raw_payload 中的 provider secret 被 scrub 为 ``"***"``。
 - ``FINAL_ANSWER`` -> ``final_response`` record。
 
-注意：``TOOL_RESULT_TRUNCATED`` 与 ``TOOL_FETCH_MORE_*`` 是 Host
-ToolRuntime 在内部追加的 canonical fact，不能由 stub proxy 直接注入
-EngineEvent，因此本 smoke 不覆盖 truncation / fetch_more 路径；这条路
-径要等真实 ToolRuntime smoke 或专属 truncation smoke。
+注意：P8.5-S1 后 truncation / fetch_more 不再使用专用 canonical fact；
+stub proxy 只能注入 EngineEvent，因此本 smoke 不覆盖真实 ToolRuntime 的
+ordinary truncation payload 与 framework ``fetch_more`` 普通工具调用路径；
+这条路径由 ToolRuntime smoke 或专属 truncation smoke 覆盖。
 
 trace 根目录使用 ``tempfile.mkdtemp(prefix="dayu_p7_smoke_")`` 创建，
 **脚本结束后不删除**，便于人工 inspect。脚本末尾会自动调用
@@ -60,9 +60,9 @@ _ensure_repo_root_on_path()
 
 from dayu.contracts import (  # noqa: E402
     CancellationToken,
+    ToolSchema,
     ToolCompletedOutcome,
     ToolResultSuccess,
-    ToolTruncationInfo,
 )
 from dayu.engine import (  # noqa: E402
     AgentMessageRole,
@@ -199,6 +199,7 @@ class _StubProxy:
     def stream_engine_events(
         self,
         request: StartRunRequest,
+        tool_schemas: tuple[ToolSchema, ...],
         cancellation_token: CancellationToken,
     ) -> AsyncIterator[EngineEvent]:
         """返回预定义事件流。
@@ -278,15 +279,19 @@ def _build_engine_events() -> tuple[EngineEvent, ...]:
             outcome=ToolCompletedOutcome(
                 result=ToolResultSuccess(
                     ok=True,
-                    value={"summary": "large doc..."},
-                    truncation=ToolTruncationInfo(
-                        cursor="cur-A",
-                        scope_token="st-1",
-                        scope_hash="sh-1",
-                        has_more=True,
-                        limit=10,
-                        ttl_seconds=60,
-                    ),
+                    value={
+                        "summary": "large doc...",
+                        "truncation": {
+                            "fetch_more_args": {
+                                "cursor": "cur-A",
+                                "limit": 10,
+                                "scope_token": "st-1",
+                            },
+                            "has_more": True,
+                            "next_action": "fetch_more",
+                            "ttl_seconds": 60,
+                        },
+                    },
                     meta=None,
                 )
             ),

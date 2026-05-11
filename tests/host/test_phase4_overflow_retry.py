@@ -8,10 +8,11 @@ from collections.abc import AsyncGenerator, AsyncIterator
 from contextlib import asynccontextmanager
 from dataclasses import dataclass, field, replace
 from datetime import datetime, timezone
+from pathlib import Path
 
 import pytest
 
-from dayu.contracts import CancellationToken
+from dayu.contracts import CancellationToken, ToolSchema
 from dayu.contracts.tool_outcome import ToolCompletedOutcome
 from dayu.contracts.tool_result import ToolResultSuccess
 from dayu.engine import (
@@ -62,8 +63,10 @@ from dayu.host._durable_harness import (
 )
 from dayu.host._event_store import InMemoryRunEventStore, RunEventStore
 from dayu.host._internal_contracts import AttemptState
-from dayu.host._run_harness import LocalRunHarness
+from dayu.host._run_harness import LocalRunHarness, _ActiveAttempt
+from dayu.host._run_input_builder import RunInputBuildTrace
 from dayu.host.contracts import (
+    TERMINAL_RUN_EVENT_TYPES,
     ContextCompactFailureReason,
     HostContextCompactCompletedData,
     HostContextCompactFailedData,
@@ -81,8 +84,6 @@ from dayu.host.contracts import (
     RunOptions,
     RunSucceededResult,
     StartRunRequest,
-    ToolResultTruncatedData,
-    ToolValueSizeSummary,
 )
 from tests.host._memory_store_fake import FakeInMemoryConversationMemoryStore
 
@@ -145,6 +146,7 @@ class _OverflowThenSuccessProxy:
     def stream_engine_events(
         self,
         request: StartRunRequest,
+        tool_schemas: tuple[ToolSchema, ...],
         cancellation_token: CancellationToken,
     ) -> AsyncIterator[EngineEvent]:
         """返回脚本化 EngineEvent 流。
@@ -208,6 +210,7 @@ class _CompactionRequestedThenFinalProxy:
     def stream_engine_events(
         self,
         request: StartRunRequest,
+        tool_schemas: tuple[ToolSchema, ...],
         cancellation_token: CancellationToken,
     ) -> AsyncIterator[EngineEvent]:
         """返回异常闭合的 EngineEvent 流。
@@ -257,6 +260,7 @@ class _CompactionRequestedThenEndedProxy:
     def stream_engine_events(
         self,
         request: StartRunRequest,
+        tool_schemas: tuple[ToolSchema, ...],
         cancellation_token: CancellationToken,
     ) -> AsyncIterator[EngineEvent]:
         """返回缺少 terminal overflow 的 EngineEvent 流。
@@ -312,6 +316,7 @@ class _ToolFactThenOverflowProxy:
     def stream_engine_events(
         self,
         request: StartRunRequest,
+        tool_schemas: tuple[ToolSchema, ...],
         cancellation_token: CancellationToken,
     ) -> AsyncIterator[EngineEvent]:
         """返回带同 Run 工具事实的脚本化 EngineEvent 流。
@@ -365,7 +370,6 @@ class _ToolFactThenOverflowProxy:
                     result=ToolResultSuccess(
                         ok=True,
                         value={"revenue_growth": "12%"},
-                        truncation=None,
                         meta=None,
                     )
                 ),
@@ -412,6 +416,7 @@ class _DelayedOverflowProxy:
     def stream_engine_events(
         self,
         request: StartRunRequest,
+        tool_schemas: tuple[ToolSchema, ...],
         cancellation_token: CancellationToken,
     ) -> AsyncIterator[EngineEvent]:
         """按 run id 返回延迟 overflow 或直接成功。
@@ -640,7 +645,7 @@ def _tool_truncated_draft(
     run_id: str,
     session_id: str,
 ) -> RunEventDraft:
-    """构造测试用 Host 工具截断事实。
+    """构造测试用普通工具结果事实。
 
     :param run_id: Run id。
     :param session_id: Session id。
@@ -652,28 +657,23 @@ def _tool_truncated_draft(
         run_id=run_id,
         session_id=session_id,
         kind=RunEventKind.CANONICAL,
-        source=RunEventSource.HOST,
-        type=RunEventType.TOOL_RESULT_TRUNCATED,
+        source=RunEventSource.ENGINE,
+        type=RunEventType.TOOL_RESULT_ACCEPTED,
         occurred_at=_utc_now(),
-        data=ToolResultTruncatedData(
+        data=ToolResultAcceptedData(
             iteration_id="iter-0",
-            tool_name="fins.lookup",
             tool_call_id="call-current",
-            strategy="preview_with_cursor",
-            limit=1024,
-            unit="chars",
-            total_estimate=4096,
-            cursor_fingerprint="fp-current",
-            ttl_seconds=600,
-            has_more=True,
-            value_summary=ToolValueSizeSummary(
-                unit="chars",
-                size=1024,
-                total_estimate=4096,
-                fingerprint="value-fp-current",
+            name="fins.lookup",
+            index_in_iteration=0,
+            outcome=ToolCompletedOutcome(
+                result=ToolResultSuccess(
+                    ok=True,
+                    value={"summary": "收入同比增长 12%"},
+                    meta=None,
+                )
             ),
         ),
-        source_engine_event_id=None,
+        source_engine_event_id="engine-tool-current",
     )
 
 
@@ -860,8 +860,8 @@ async def test_same_run_tool_facts_enter_compacted_attempt() -> None:
     )
     assert "tool_call_id=call-current" in compact_text
     assert "source_event_cursor=2" in compact_text
-    assert "cursor_fingerprint=fp-current" in compact_text
-    assert "has_more=True" in compact_text
+    assert "cursor_fingerprint=None" in compact_text
+    assert "has_more=None" in compact_text
 
 
 @pytest.mark.asyncio
@@ -1216,11 +1216,101 @@ async def test_durable_overflow_retry_acquire_failure_writes_owner_scoped_termin
 
 
 @pytest.mark.asyncio
+async def test_durable_compact_retry_snapshot_failure_writes_terminal(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """compact retry 新 attempt 的 snapshot fact 失败必须写入 terminal。"""
+
+    original = LocalRunHarness._append_run_input_context_snapshot_fact
+    original_project_terminal_run = LocalRunHarness._project_terminal_run
+    call_count = 0
+    projected = asyncio.Event()
+
+    async def _fail_second_snapshot_append(
+        self: LocalRunHarness,
+        *,
+        request: StartRunRequest,
+        tool_schemas: tuple[ToolSchema, ...],
+        build_trace: RunInputBuildTrace,
+        current_user_event: RunEvent,
+        attempt_index: int,
+        iteration_index: int,
+        iteration_id: str,
+        active_attempt: _ActiveAttempt | None = None,
+    ) -> None:
+        """第二次 snapshot fact append 模拟 side-store 写入失败。"""
+
+        nonlocal call_count
+        call_count += 1
+        if call_count == 2:
+            raise RuntimeError("snapshot side-store failed")
+        await original(
+            self,
+            request=request,
+            tool_schemas=tool_schemas,
+            build_trace=build_trace,
+            current_user_event=current_user_event,
+            attempt_index=attempt_index,
+            iteration_index=iteration_index,
+            iteration_id=iteration_id,
+            active_attempt=active_attempt,
+        )
+
+    monkeypatch.setattr(
+        LocalRunHarness,
+        "_append_run_input_context_snapshot_fact",
+        _fail_second_snapshot_append,
+    )
+
+    async def _patched_project_terminal_run(
+        self: LocalRunHarness,
+        run_id: str,
+    ) -> None:
+        """记录 terminal projection 已完成或已退出。"""
+
+        try:
+            await original_project_terminal_run(self, run_id)
+        finally:
+            projected.set()
+
+    monkeypatch.setattr(
+        LocalRunHarness,
+        "_project_terminal_run",
+        _patched_project_terminal_run,
+    )
+    bundle = build_durable_harness(
+        config=DurableHarnessConfig(
+            database_path=str(tmp_path / "host.sqlite"),
+            tool_trace_path=str(tmp_path / "trace"),
+        ),
+        proxy=_OverflowThenSuccessProxy(),
+    )
+    try:
+        request = _request()
+        stream = await bundle.harness.start_run(request)
+        events = await asyncio.wait_for(_collect(stream.events), timeout=5.0)
+        await asyncio.wait_for(projected.wait(), timeout=5.0)
+        terminal = events[-1]
+
+        assert terminal.type is RunEventType.RUN_FAILED
+        result = await bundle.harness.get_run_result(request.run_id)
+        assert isinstance(result, RunFailedResult)
+        assert "snapshot side-store failed" in result.message
+    finally:
+        bundle.close()
+
+
+@pytest.mark.asyncio
 async def test_durable_overflow_acquire_failure_terminal_fencing_routes_owner_lost(
     monkeypatch: pytest.MonkeyPatch,
     caplog: pytest.LogCaptureFixture,
 ) -> None:
-    """N1: retry acquire 失败后旧 owner terminal close 被 fence 时走 owner-lost。
+    """N1: compact diagnostic 已成功，但旧 owner terminal close 被 fence。
+
+    该场景证明 compact success diagnostic 可先落库；随后 terminal close
+    CAS miss 时不得补写 stale Host terminal，Run 终态仍只能来自唯一
+    terminal truth。
 
     :param monkeypatch: pytest monkeypatch fixture。
     :param caplog: pytest 日志捕获 fixture。
@@ -1363,6 +1453,25 @@ async def test_durable_overflow_acquire_failure_terminal_fencing_routes_owner_lo
             )
             for event in events
         ), "CAS miss 路径不应写 stale HOST terminal RunEvent"
+        stored_events = await bundle.event_store.list_events(request.run_id, None)
+        assert any(
+            event.type is RunEventType.CONTEXT_COMPACT_COMPLETED
+            for event in stored_events
+        ), "compact success diagnostic 应已落库"
+        terminal_events = [
+            event for event in stored_events
+            if event.type in TERMINAL_RUN_EVENT_TYPES
+        ]
+        assert len(terminal_events) <= 1, (
+            "terminal close CAS miss 不得制造第二个 terminal truth"
+        )
+        assert all(
+            not (
+                event.type is RunEventType.RUN_FAILED
+                and event.source is RunEventSource.HOST
+            )
+            for event in terminal_events
+        ), "stale Host terminal 不得在 EventLog 中成为终态真源"
         assert all(
             "host.run.background_task_failed" not in record.getMessage()
             for record in caplog.records

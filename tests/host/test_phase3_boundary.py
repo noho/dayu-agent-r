@@ -14,7 +14,7 @@ from _pytest.logging import LogCaptureFixture
 
 import dayu.engine as engine
 import dayu.host as host
-from dayu.contracts import CancellationToken
+from dayu.contracts import CancellationToken, ToolSchema
 from dayu.engine import (
     AgentMessage,
     AgentPolicy,
@@ -130,6 +130,7 @@ class _CountingProxy:
     def stream_engine_events(
         self,
         request: StartRunRequest,
+        tool_schemas: tuple[ToolSchema, ...],
         cancellation_token: CancellationToken,
     ) -> AsyncIterator[EngineEvent]:
         """记录调用并返回空事件流。
@@ -164,6 +165,7 @@ class _SynchronousFailingProxy:
     def stream_engine_events(
         self,
         request: StartRunRequest,
+        tool_schemas: tuple[ToolSchema, ...],
         cancellation_token: CancellationToken,
     ) -> AsyncIterator[EngineEvent]:
         """模拟 proxy / worker 启动失败。
