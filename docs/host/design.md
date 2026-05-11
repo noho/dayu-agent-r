@@ -662,7 +662,8 @@ LocalRunHarness
 - 旧 owner、过期 owner、非 owner 或旧 fencing token 的迟到写入必须返回 typed fencing refusal，并且不得写入
   diagnostic RunEvent；非 owner 不应通过“我被拒绝了”这类 meta-fact 污染 canonical EventLog。
 - 所有 attempt-scoped append 都必须走 owner fencing，包括 Engine-sourced events、context compact
-  facts、`RUN_INPUT_CONTEXT_SNAPSHOT_BUILT` 和 ToolRuntime 产生的 truncate / cursor / fetch_more facts。
+  facts、`RUN_INPUT_CONTEXT_SNAPSHOT_BUILT` 和 ToolRuntime / Engine tool loop 产生的普通 tool calling
+  facts。P8.5 后不再把 truncate / cursor / `fetch_more` 表达为专属 RunEvent fact。
 - ToolRuntime 不获得 owner token，也不把 owner token 放入 `ToolExecutionContext`。Host 通过内部
   `AttemptScopedRunEventAppender` / owner scope 为当前 attempt 注入可写 append port。
 - 正常 terminal attempt 必须在同一 `BEGIN IMMEDIATE` 或等价 durable unit 中完成 terminal event
@@ -949,10 +950,12 @@ P7 落地后的硬事实：
   `api_key` / `cookie` / `x-api-key` / `openai-organization` / `anthropic-api-key` 等键替换为 `***`）；
   `scope_token` / `cursor` / prompt / tool result 仍按 OLD 热 / 冷分层保留进 trace，用于真实故障定位。
 
-P8-S2 把 `ObserverSink.process` 从同步升级为 async 调用协议：`ProjectionCoordinator.drain()`
-在同一 HostStorage 事务内 `await observer.process(tx, events)`，sink 写入与 checkpoint 推进
-同生同灭。这不引入 observer claim / lease；observer 仍从 durable EventLog 消费，不读取 attempt
-owner side channel。attempt ownership 与 observer ownership 是两个独立状态机。
+P8-S2 曾把 `ObserverSink.process` 从同步升级为 async 调用协议：`ProjectionCoordinator.drain()`
+在同一 HostStorage 事务内 `await observer.process(tx, events)`。该描述只记录 P8 前置实现事实；
+P8.5 起，non-required trace JSONL/blob sink 采用事务外 at-least-once 写入，checkpoint 仅在 sink
+success 后短事务推进，checkpoint 前 crash 允许 replay duplicate 并依赖 `idempotency_key` 去重。
+这不引入 observer claim / lease；observer 仍从 durable EventLog 消费，不读取 attempt owner side
+channel。attempt ownership 与 observer ownership 是两个独立状态机。
 
 ### 9.5 Wait / Suspend 预留契约
 
@@ -1181,8 +1184,9 @@ EventLog / RunEvent 边界：
   accepted result。
 - `fetch_more` 只是普通 tool name，对 EventLog 来说，它仍是一次普通 tool request / result。
 - cursor 是 truncate / fetch_more 的内部实现细节，只能作为普通 tool call 参数或普通 tool result payload
-  的一部分短期进入 LLM roundtrip；EventLog 写入时可以按敏感字段策略 redaction。
-- 如果 EventLog 需要保留截断观察信息，应优先扩展通用 tool result 的安全摘要或 redaction 后 payload，
+  的一部分短期进入 LLM roundtrip；Dayu 是本地 Agent，EventLog 只做窄 credential scrub：除
+  `API_KEY` / 明确凭证外，不因字段名是 cursor、`scope_token`、tool args 或 tool result 而删除或遮蔽。
+- 如果 EventLog 需要保留截断观察信息，应优先扩展通用 tool result 的摘要或 credential-scrubbed payload，
   不新增 `TOOL_RESULT_TRUNCATED` / `TOOL_CURSOR_ISSUED` / `TOOL_CURSOR_EXPIRED` /
   `TOOL_CURSOR_DENIED` 等 cursor / truncation 专属 RunEventType。
 - Host 不追加 `TOOL_FETCH_MORE_REQUESTED` / `TOOL_FETCH_MORE_COMPLETED` /

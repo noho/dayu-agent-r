@@ -1,5 +1,14 @@
 # P8.5 Plan Amendment Re-Review Artifact
 
+> **Superseded / historical artifact.** This re-review belonged to accepted plan
+> commit `1aad621762765d27c5cd161836f062b1ed906995`. The controller later declared
+> P8.5 Slice 1 implementation failed, reverted the slice outputs, and reset P8.5
+> back to plan gate. Current planning truth is `docs/host/phase8.5-plan.md`,
+> `docs/host/phase8.5-plan-review.md`,
+> `docs/host/phase8.5-plan-fix-report.md`,
+> `docs/host/phase8.5-plan-rereview.md`, and the later manual-review amendment
+> artifacts. Keep this file only as audit history.
+
 - **re-review gate name**: plan amendment re-review
 - **reviewed target**: `docs/host/phase8.5-plan.md` (post-amendment)
 - **amendment report**: `docs/host/phase8.5-plan-amendment-report.md`

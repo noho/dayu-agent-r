@@ -1,94 +1,151 @@
 # P8.5 Plan Re-Review Artifact
 
-- **re-review gate name**: plan re-review
-- **reviewed target**: `docs/host/phase8.5-plan.md` (post-fix)
+- **review gate name**: plan re-review
+- **reviewed target**: `docs/host/phase8.5-plan.md`
 - **source review artifact**: `docs/host/phase8.5-plan-review.md`
 - **source fix artifact**: `docs/host/phase8.5-plan-fix-report.md`
-- **re-reviewer**: plan re-review agent (Claude)
-- **re-review date**: 2026-05-11
-- **re-reviewer conclusion**: **pass**
+- **related source-of-truth docs**: `docs/host/design.md`, `docs/host/migration-plan.md`
+- **work-unit name**: P8.5 - P8 Stabilization / ToolRuntime Event Model
 - **artifact path**: `docs/host/phase8.5-plan-rereview.md`
+- **reviewer conclusion**: **pass**
+
+## Scope
+
+本轮只 re-review P8.5 re-plan review F01-F07 的修复状态，以及 controller payload policy
+correction 是否一致写入 plan / design / migration 文档。不修改 plan、生产代码、测试代码，不进入
+implementation、commit、PR 或 closeout。
+
+## Summary
+
+- F01-F07 均已修复到 handoff-ready 水平。
+- 未发现 blocker 或 high-risk plan gap。
+- Blocking open questions: none.
+- Findings: 0.
 
 ## Per-Finding Verification
 
-### F01 — test file paths
+### F01 - framework `fetch_more` schema 自动投影路径不够 handoff-ready
 
-- **原始问题**: plan 引用不存在的 `tests/host/test_run_event_serializer.py`，projection 测试路径模糊。
-- **修复承诺**: 改为 `tests/host/test_phase6_run_event_serializer.py`，补充 `tests/host/test_phase7_contract_serializer.py`，明确 projection 测试为 `test_phase3_conversation_memory_projection.py`、`test_phase7_tool_trace_projection.py`、`test_phase7_tool_trace_eventlog_source.py`、`test_phase7_tool_trace_jsonl_sink.py` 等。
-- **验证**: plan §5 Affected Files 已更新为 `tests/host/test_phase6_run_event_serializer.py` 和 `tests/host/test_phase7_contract_serializer.py`。Slice 2/3/6 validation commands 使用具体文件路径。与 `Glob("tests/host/test_*serializer*.py")` 和 `Glob("tests/host/test_phase7_*.py")` 返回结果一致。
-- **判定**: **fixed**
+- **原始问题**: plan 未裁决 Host 私有 `fetch_more` schema 如何自动投影到 Engine-visible schemas，也未写清
+  owner、call path、`RunOptions` mutation 边界和 RunInput context fact 应记录哪组 schemas。
+- **修复证据**:
+  - `docs/host/phase8.5-plan.md:122-136` 明确 schema 投影 owner 是 Host runtime assembly，不是
+    Engine 或调用方；推荐 Host-private provider；在构造 `AgentRunRequest` 前生成 enhanced schemas；
+    `StartRunRequest.options.tool_schemas` / `RunOptions` 不做 in-place mutation；`RUN_INPUT_CONTEXT_SNAPSHOT_BUILT`
+    记录 Engine 实际收到的 enhanced schemas。
+  - `docs/host/phase8.5-plan.md:391-399` 在 Slice 1 implementation instructions 中给出 provider /
+    `_run_harness.py` / `_worker.py` / durable assembly 的 call path 和测试目标。
+  - `docs/host/phase8.5-plan.md:263-266` 将 schema provider、`_worker.py`、`_run_harness.py`、
+    `_durable_harness.py` 纳入 affected files。
+- **re-review 判断**: fixed。该项已足够交给 implementation agent，不需要其重新决定 owner 或 public
+  mutation 策略。
 
-### F02 — RunInput raw payload side store ownership
+### F02 - memory / RunInput capability boundary 未定义
 
-- **原始问题**: side store writer / reader / transaction ownership 未定义。
-- **修复承诺**: 明确 writer 是 `LocalRunHarness._append_run_input_context_snapshot_fact` 所在 Host durable append 边界；`RunInputContextFactBuilder` 只构造 material / summary；side store write 与 EventLog append 共用同一个 `HostStorage.transaction()`；reader 是 `ToolTraceObserver` / trace projection。
-- **验证**: plan §2.4 point 3 和 §7 已更新。明确 `RunInputContextFactBuilder` 产出 material，side store write 在 `LocalRunHarness._run_to_store` attempt 生命周期事务内完成，与 EventLog fact 共用 `HostStorage.transaction()`。stop condition：无法同事务时停下回报。
-- **判定**: **fixed**
+- **原始问题**: EventLog / trace 保留 cursor、`scope_token` 后，plan 未写清 Conversation Memory /
+  RunInput 如何避免跨 run 复用短期 capability。
+- **修复证据**:
+  - `docs/host/phase8.5-plan.md:138-148` 明确 EventLog / trace ordinary payload 默认保留，但
+    Conversation Memory / RunInput 是独立 ingestion policy；raw cursor、raw `scope_token`、
+    `truncation.fetch_more_args` 只可生成不可复用摘要，不进入长期 memory 或下一轮 RunInput。
+  - `docs/host/phase8.5-plan.md:406-417` 要求 `_conversation_memory.py` 摘要化短期 capability，并测试
+    EventLog / trace 可见 raw payload，但 memory snapshot / RunInput rendered tool facts 不包含 raw
+    cursor / raw `scope_token`。
+  - `docs/host/migration-plan.md:46-49` 将同一长期口径写入 migration registry。
+- **re-review 判断**: fixed。plan 已区分 credential scrub 与 memory ingestion policy，不再把
+  local-agent payload retention 误扩展为长期 capability retention。
 
-### F03 — SSE partial tool-call diagnostic layer boundary
+### F03 - `ToolTruncationInfo` shared contract impact 未纳入
 
-- **原始问题**: diagnostic fact 是 Engine-owned 还是 Host-owned 未裁决。
-- **修复承诺**: 明确为 Engine-owned diagnostic data、Host-owned persistence；通过扩展现有 provider/protocol failure data 的 bounded `partial_tool_calls` summary，由 Host `_event_translation.py` 透传为现有 `PROVIDER_PROTOCOL_ERROR` RunEvent data；禁止新增具体工具名或 provider-specific RunEventType。
-- **验证**: plan Slice 6 已重写。diagnostic 定义为 Engine `RunnerHTTPErrorData` 或 `RunnerProtocolFailureData` 扩展 bounded `partial_tool_calls` summary 字段，Host `_event_translation.py` 翻译为 `PROVIDER_PROTOCOL_ERROR` RunEvent。不新增 RunEventType。Engine public contract 扩展范围受限。
-- **判定**: **fixed**
+- **原始问题**: 新 payload policy 改变了 shared tool result contract 语义，但 plan 漏列
+  `dayu/contracts/tool_result.py` 和 contract-level tests。
+- **修复证据**:
+  - `docs/host/phase8.5-plan.md:268-270`、`:307-309` 将 shared contract 文件和 contract tests 纳入
+    affected files。
+  - `docs/host/phase8.5-plan.md:331-337` 明确 `ToolTruncationInfo` 是 ordinary LLM-facing tool result
+    payload，可进入 EventLog / trace，但不得进入 memory、下一轮 RunInput、普通日志或 README 大块输出。
+  - `docs/host/phase8.5-plan.md:401-402` 要求 Slice 1 更新 `ToolTruncationInfo` 文档并加 contract-level
+    test。
+- **re-review 判断**: fixed。shared contract 与测试影响已纳入 plan。
 
-### F04 — durable memory repair fetch helper
+### F04 - RunInput raw payload side store schema / API / transaction ownership 未定义
 
-- **原始问题**: `_fetch_canonical_events_for_session()` 仍是全库扫描 + client-side 过滤，plan 未指定 helper SQL shape。
-- **修复承诺**: 新增 `DurableRunEventStore.fetch_events_by_session(...)` 或等价强类型 helper；SQL shape 固定为 `WHERE session_id = ? AND kind = ? AND event_position > ? ORDER BY event_position ASC LIMIT ?`；索引 `(session_id, kind, event_position)`。
-- **验证**: plan Slice 3 已明确 helper 方法签名、SQL shape 和索引定义。与 `_conversation_memory_durable.py:369-402` 当前全库扫描实现形成直接对照。
-- **判定**: **fixed**
+- **原始问题**: raw payload side store 的表、字段、key、索引、writer/reader API、transaction ownership 和
+  missing/corrupt 行语义留给 implementation agent 设计。
+- **修复证据**:
+  - `docs/host/phase8.5-plan.md:180-198` 固定 `run_input_raw_payloads` schema、allowed
+    `payload_kind`、unique key、索引、writer owner、reader owner、同事务要求和 typed projection failure。
+  - `docs/host/phase8.5-plan.md:342-348` 在 schema/index impact 中重复固定 schema。
+  - `docs/host/phase8.5-plan.md:596-617` 在 Slice 4 写清 side-store API 形状、reader 校验、
+    `RunInputContextSnapshotBuiltData` 删除 inline raw 字段并保存 blob id / hash / byte size。
+  - `docs/host/phase8.5-plan.md:637-641` 要求验证 rollback 无 orphan row、blob hash/size 校验、
+    missing/hash mismatch/corrupt JSON 导致 typed projection failure 且 checkpoint 不推进。
+- **re-review 判断**: fixed。schema/API/事务边界已经足够具体；实现若无法同事务提交有 stop condition。
 
-### F05 — Slice 7 粒度和 BUSY reason
+### F05 - design / migration 旧事实冲突
 
-- **原始问题**: Slice 7 过粗（6 个子任务），BUSY reason 缺少具体枚举值，是 open design choice。
-- **修复承诺**: 拆为 Slice 7a（attempt lease contract hardening）和 Slice 7b（attempt adversarial coverage）；新增 `AttemptLeaseBusyReason.ATTEMPT_INDEX_CONFLICT = "attempt_index_conflict"`，在 `AttemptLeaseResult.busy_reason` 独立字段表达，禁止复用 fencing reason。
-- **验证**: plan §8 已拆为 Slice 7a 和 Slice 7b。7a 覆盖 `AttemptFencingReason.RUN_ID_MISMATCH`、`AttemptLeaseBusyReason.ATTEMPT_INDEX_CONFLICT`、`lease_context` 参数校验。7b 覆盖 adversarial tests。枚举值名和字段位置明确。
-- **判定**: **fixed**
+- **原始问题**: `design.md` 仍残留旧专属 fact / observer 同事务口径，可能和 re-plan 的 current design 冲突。
+- **修复证据**:
+  - `docs/host/phase8.5-plan.md:11-13` 明确 `docs/host/design.md` §11 与本 plan supersede 旧 P2/P7/P8
+    wording。
+  - `docs/host/design.md:1092-1113` 将 cursor store 归属收敛到 Host 私有 `RuntimeTruncateManager`。
+  - `docs/host/design.md:1121-1156` 明确 Engine 不看 `ToolDefinition` / callable / manager，Runtime
+    通过闭包注入 manager Protocol，Runtime 不构造或消费 `ToolFetchMore*`。
+  - `docs/host/design.md:1180-1195` 明确 EventLog 只看到普通 tool calling，不新增 cursor /
+    truncation / `fetch_more` 专属 RunEventType。
+  - `docs/host/migration-plan.md:71`、`:89` 已把 P8.5 phase 边界更新为 generic tool calling /
+    Host-private `fetch_more` / `RuntimeTruncateManager` 口径。
+- **re-review 判断**: fixed。旧事实已通过 priority statement 和 design current section 收敛；Slice 6 仍保留
+  docs closeout，但不阻塞 implementation handoff。
 
-### F06 — append_many stop condition
+### F06 - trace observer at-least-once / checkpoint / duplicate idempotency semantics 不明确
 
-- **原始问题**: "不先做 append_many" stop condition 缺少可验证基线，无法注入 cursor fact 失败场景。
-- **修复承诺**: 删除模糊 stop condition，改为明确测试要求：注入 mechanism fact append failure，断言 `HostToolRuntime.execute_tool_call()` 不返回 successful `ToolCompletedOutcome`；当前预期不需要 `append_many`，若测试反证则 stop and report。
-- **验证**: plan Slice 2 implementation prompt point 7 已重写。明确注入方法：在 `_append_fetch_completed` 或等价路径的 cursor fact append 阶段注入 `sqlite3.DatabaseError`，断言 `_fetch_more` 抛出异常。与 `_tool_runtime.py:840` 代码事实一致（cursor append 在返回前执行）。
-- **判定**: **fixed**
+- **原始问题**: plan 只说把 I/O 移出 transaction，未裁决 checkpoint crash window、重复 JSONL 行、
+  failure status 和 required/non-required observer 分离语义。
+- **修复证据**:
+  - `docs/host/phase8.5-plan.md:167-173` 明确 non-required trace JSONL/blob sink 是 at-least-once；
+    sink success 后 checkpoint 前 crash 或 checkpoint failure 允许 replay duplicate；reader/analyzer
+    按 `idempotency_key` 去重；sink failure 不推进 checkpoint；checkpoint failure 不得报告 success；
+    non-required trace failure 不阻塞 required memory observer。
+  - `docs/host/phase8.5-plan.md:537-547` 在 Slice 3 implementation instructions 中重复这些状态机规则。
+  - `docs/host/phase8.5-plan.md:558-562` 写入 expected assertions。
+- **re-review 判断**: fixed。at-least-once 与 checkpoint 语义已可测试、可 review。
 
-### F07 — corrupt snapshot diagnostic
+### F07 - grep guard 未区分 production/current docs 与 historical docs
 
-- **原始问题**: corrupt snapshot 处理未收敛：抛异常 vs log vs fail fast 未定义，可能中断 startup_reconcile。
-- **修复承诺**: 收敛为 typed diagnostic `MemoryRepairDiagnostic(kind=CORRUPT_SNAPSHOT, session_id=..., reason=...)`；WARNING 日志、不自动 delete / overwrite、不阻断其它 missing-row repair；report / diagnostics 对调用方可见。
-- **验证**: plan Slice 3 已更新。定义 `MemoryRepairDiagnostic(kind=CORRUPT_SNAPSHOT, ...)` typed diagnostic，要求 WARNING 日志、不自动 delete/overwrite、不阻断其它 session repair。与 `_conversation_memory_durable.py:517-537` 当前抛异常行为形成对照。
-- **判定**: **fixed**
+- **原始问题**: grep guard 可能被 migration/review 历史上下文命中，导致 implementation agent 为了零命中删除审计上下文。
+- **修复证据**:
+  - `docs/host/phase8.5-plan.md:418-419` 对 Slice 1 生产代码 guard 写明生产代码不得命中，negative
+    forbidden-name tests 可命中但必须注释。
+  - `docs/host/phase8.5-plan.md:782-791` 在 Slice 6 validation 中拆分 production/current-doc guard
+    与 historical-doc audit guard，明确 migration plan、旧 review artifacts、本 plan 可作为历史 /
+    residual context 命中旧名字。
+- **re-review 判断**: fixed。guard 的 expected-result 语义清楚。
 
-### F08 — 旧 TOOL_FETCH_MORE_* 数据迁移
+## Payload Policy Consistency
 
-- **原始问题**: "全新 schema 起库" 但未显式声明旧数据丢弃和不写兼容 reader。
-- **修复承诺**: 显式声明 P8.5 按全新起库处理，旧 `TOOL_FETCH_MORE_*` EventLog 行、旧 inline raw payload 行和 P8 测试库数据丢弃；不写兼容 reader、decoder 或 migration。
-- **验证**: plan §1 Goal / Success Signal 和 §6 Contract impact 已显式声明。与 `contracts.py:73-75`、`_run_event_serializer.py:1476-1478` 中待删除的条目对应。
-- **判定**: **fixed**
+- `docs/host/phase8.5-plan.md:31-33`、`:68-69`、`:88-89`、`:351-354` 均写明 EventLog / trace
+  ordinary payload 默认保留，只 scrub `API_KEY` / explicit credentials，不因 cursor、`scope_token`、
+  tool args/result 字段名 redaction。
+- `docs/host/design.md:1173-1188` 写明 `scope_token` / cursor 可短期进入 LLM roundtrip 与 EventLog /
+  trace 诊断，但不得进入 memory projection、普通日志或文档 / smoke 大块输出。
+- `docs/host/migration-plan.md:46-49` 已把该政策写入长期 migration registry。
 
-## Fix-Introduced Risk Assessment
+re-review 判断：policy 一致。唯一保留的是 plan §11 的 non-blocking watch item：implementation agent 不得把
+普通业务字段、cursor、`scope_token`、tool args/result 扩大解释为 credentials。该 watch item 不阻塞 plan
+handoff。
 
-fix agent 声明未引入新风险或新 open question。逐项验证：
+## Open Questions And Residual Risk
 
-- **新 blocker**: 无。所有 fix 都是对 plan artifact 的澄清和细化，未改变核心架构裁决方向。
-- **新 open question**: 无。原有 3 个 open questions（SSE partial diagnostic 边界、BUSY reason 枚举、append_many stop condition）已在 fix 中收敛为明确实现选择。
-- **fix 引入的副作用**: 无。fix 仅修改 plan 文档，未修改生产代码或测试代码。
-
-## Residual Risk
-
-| Risk | Owner | Status |
-| --- | --- | --- |
-| observer claim lease / outbox / hard-gate | P15 / issue #28 | Explicitly not P8.5 |
-| `InMemoryRunEventStore` 生产语义收口 | P16 interface freeze | Deferred |
-| schema bootstrap 半失败治理 | P15 | Deferred |
-| `LocalRunHarness` God Object 膨胀 | P9 / P16 | Deferred |
-| `DurableHarnessBundle` public/internal 边界 | P16 | Deferred |
-| P15 required projection enforcement | P15 | Deferred |
-| `HostStorage.close()` 后台 task 生命周期 | P9 lifecycle | Deferred |
+- Blocking open questions: none.
+- Non-blocking watch item: credential scrub 只能窄定义为 `API_KEY` / explicit credentials；如果发现新的明确
+  credential 字段，implementation slice report 必须列直接证据并补测试。
+- Deferred-by-plan risks remain assigned to later slices / phases in `docs/host/phase8.5-plan.md:850-869`，
+  including P15 observer hard-gate / watchdog and P16 public/internal interface freeze。
 
 ## Conclusion
 
-全部 8 个 accepted findings（F01–F08）均已按 fix report 承诺修复，plan artifact 中对应内容与 fix 描述一致。fix 未引入新 blocker、新 open question 或新风险。原有 3 个 open questions 已在 fix 中收敛为明确实现选择，不再 blocking implementation handoff。
+F01-F07 均已修复。未发现 blocker、高风险 plan gap 或未收敛的 blocking open question。
 
-**re-review 结论：pass**。plan 可进入 implementation handoff。
+**re-review 结论：pass**。plan 可进入 user confirmation gate；按 Gateflow，仍需用户确认后才能创建新的
+accepted plan commit 并进入 implementation。

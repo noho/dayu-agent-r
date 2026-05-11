@@ -1,847 +1,937 @@
 # Host P8.5 Handoff Plan：P8 Stabilization / ToolRuntime Event Model
 
-## 0. 计划边界
+## 0. Gate / Reset State
 
 - 当前 gate：`plan`。
 - Work unit：P8.5 — P8 Stabilization / ToolRuntime Event Model。
-- 当前分支必须保持为 `migration/host-p8-5-stabilization`，远端名为 `github`。
-- 本计划只授权后续 implementation agent 修改代码、测试和相关 README；当前 planning agent 只维护本文件。
-- 本计划不是 Gateflow controller 输出，不启动 `$gateflow` / `/gateflow`，不重排 gate，不 commit，不 push，不开 PR。
+- 当前分支：`migration/host-p8-5-stabilization`。
+- 当前 baseline：`f81197e docs: clarify host tool runtime boundaries`。
+- 旧 accepted plan 与旧 Slice 1 implementation 已由 controller 判定失败；本文件完整 supersede 旧
+  `docs/host/phase8.5-plan.md` 裁决。
+- 设计优先级：`docs/host/design.md` §11 与本 plan 是 P8.5 当前实现真源；若旧 P2/P7/P8 文字仍把
+  truncate / cursor / `fetch_more` 描述为专属 RunEvent fact、专属 projection 分支或 EventLog
+  credential-scrub 对象，一律视为历史 current-code evidence，已被 §11 与本 plan supersede。
+- planning agent 只维护本文件；不改生产代码、不改测试代码、不 commit、不 push、不进入 implementation。
+- 后续 worker prompt 必须使用 Gateflow-governed handoff 口径：worker 不是 controller，不得启动
+  `$gateflow` / `/gateflow`，不得重排 gate。
 
 ## 1. Goal / Motivation / Success Signal
 
 ### Goal
 
-P8.5 在 P9 Session / Run Lifecycle Governance / Public Interface 之前，收口 P8 已落地的 Attempt Lease / Recovery / Multiprocessing、durable memory、trace 与 ToolRuntime 的稳定性尾巴。核心目标是把 `fetch_more` 从具体工具名 RunEventType 中移出，恢复为普通 Host built-in tool，并让 ToolRuntime cursor / truncation / denial 等事实停留在通用运行时机制层。
+P8.5 在 P9 Session / Run Lifecycle Governance / Public Interface 前，收口 P8 已落地的 attempt
+lease / recovery / multiprocessing、durable memory、tool trace 与 ToolRuntime 稳定性尾巴。
+
+核心目标升级为：把 ToolRuntime / EventLog 修正为 **generic tool-calling-only EventLog**，并把
+truncate / cursor / `fetch_more` 收回 Host 私有 tool runtime 组件边界：
+
+- EventLog 只记录普通 tool calling：`TOOL_CALL_REQUESTED` / `TOOL_RESULT_ACCEPTED`。
+- `truncate` 只是 Host 私有 `RuntimeTruncateManager` 改写普通 tool result 返回给 LLM 的数据。
+- `fetch_more` 只是普通 tool name；它是 Host 私有 framework built-in tool，但 Engine 什么都看不到。
+- cursor 是 truncate / `fetch_more` 的内部实现细节，只能作为普通 tool call 参数或普通 tool result
+  payload 短期参与 LLM roundtrip。Dayu 是本地 Agent，EventLog / trace 只做窄 credential scrub；除
+  `API_KEY` / 明确凭证外，不因字段名是 cursor、`scope_token`、tool args 或 tool result 而删除或遮蔽。
 
 ### Motivation
 
-动机成立，且不是表面修复问题。当前代码把 `fetch_more` 这个具体 framework tool name 编码进 `RunEventType`、serializer、memory projection 和 trace projection：
+动机成立，而且旧 Slice 1 的失败不是单纯“删错 export”，而是 root cause 判断不够彻底。当前代码仍把
+truncate / cursor / `fetch_more` 提升成 EventLog 特殊事实、public Host contract、serializer 分支、
+memory projection 分支和 trace projection 分支。这与新版 `docs/host/design.md` 的边界冲突：
 
-- `dayu/host/contracts.py:73-75` 定义 `TOOL_FETCH_MORE_REQUESTED` / `TOOL_FETCH_MORE_COMPLETED` / `TOOL_FETCH_MORE_FAILED`。
-- `dayu/host/_run_event_serializer.py:668-747` 和 `dayu/host/_run_event_serializer.py:1449-1485` 为这些具体事件维护封闭反序列化映射。
-- `dayu/host/_tool_runtime.py:1279-1444` 在 `_append_fetch_requested()`、`_append_fetch_completed()`、`_fetch_failure()` 中追加具体 `fetch_more` RunEvent。
-- `dayu/host/_conversation_memory.py:690-741` 和 `dayu/host/_tool_trace_projection.py:166-183` 消费 `ToolFetchMore*Data`，其中 memory projection 还用 `"unknown"` 填补 tool_name。
-
-这与 Host 设计边界冲突：`docs/host/design.md:49-55` 要求 Host/Engine 不懂业务语义，ToolRuntime 治理不应和具体工具权限/业务权限混在一起；`docs/host/design.md:1077-1188` 将 `fetch_more` 定位为 LLM-facing framework tool，不是业务工具，也不进入完整 ToolRegistry。
+- `docs/host/design.md:1089-1103`：ToolRuntime 负责普通 tool dispatch；截断状态机和 cursor store
+  属于 Host 私有 `RuntimeTruncateManager`。
+- `docs/host/design.md:1114-1124`：`fetch_more` 对 Engine 只表现为普通
+  `ToolExecutionRequest` / `ToolExecutionOutcome`，Engine 不知道 definition / callable / dispatch /
+  cursor store。
+- `docs/host/design.md:1137-1153`：Runtime 只通过闭包把最小补读 Protocol 传给 `fetch_more`
+  callable；Runtime 不构造或消费 `ToolFetchMore*`，也不拥有 cursor / truncation 状态机。
+- `docs/host/design.md:1177-1189`：EventLog 只看到普通 tool calling；不新增
+  `TOOL_RESULT_TRUNCATED` / `TOOL_CURSOR_*` / `TOOL_FETCH_MORE_*`。
 
 ### Success Signal
 
 P8.5 完成后必须同时满足：
 
-- `RunEventType` 中不再存在任何具体工具名事件，尤其不再存在 `TOOL_FETCH_MORE_REQUESTED` / `TOOL_FETCH_MORE_COMPLETED` / `TOOL_FETCH_MORE_FAILED`。
-- `fetch_more` 的 request / result 真源是已有通用 tool-call facts：`TOOL_CALL_REQUESTED` 与 `TOOL_RESULT_ACCEPTED`；Host 不再追加专属 `fetch_more` lifecycle fact。
-- `TOOL_RESULT_TRUNCATED` / `TOOL_CURSOR_ISSUED` / `TOOL_CURSOR_EXPIRED` / `TOOL_CURSOR_DENIED` 被明确裁决为通用 ToolRuntime mechanism facts，不并入通用 tool result fact。
-- serializer、memory projection、tool trace projection、trace JSONL、测试和 README 均不再依赖 `ToolFetchMore*Data`。
-- durable memory startup repair 不再对大库做每个缺失 session 一次全 EventLog 扫描；snapshot row 存在但 payload 损坏时有明确诊断和运维边界。
-- ToolTraceObserver 的同步 JSONL / blob I/O 不再在 SQLite observer transaction 内长时间执行；但不引入 P15 required projection enforcement / watchdog / observer claim lease。
-- compact / RunInput / trace 的事实语义明确：compact 诊断 fact 与 terminal fact 的非原子取舍有测试覆盖；compact retry 的 `attempt_index` / `iteration_index` 语义固定；RunInput raw payload 不再无界内联进 EventLog 热路径。
-- P8 attempt lease / recovery adversarial gaps 有独立测试或明确代码修复，且不把 Host治理语义放入 `dayu.runtime`。
-- P8.5 按全新起库处理；旧 `TOOL_FETCH_MORE_*` EventLog 行和测试库数据丢弃，不写兼容 reader、decoder 或 migration。
+- `RunEventType` 不再包含 `TOOL_RESULT_TRUNCATED`、`TOOL_CURSOR_ISSUED`、
+  `TOOL_CURSOR_EXPIRED`、`TOOL_CURSOR_DENIED`、`TOOL_FETCH_MORE_REQUESTED`、
+  `TOOL_FETCH_MORE_COMPLETED`、`TOOL_FETCH_MORE_FAILED`。
+- `dayu.host` public surface 不再导出 `ToolResultTruncatedData`、`ToolCursor*Data`、
+  `ToolFetchMore*Data`、`ToolRuntimeCursor`、`ToolFetchMoreRequest` 或 `ToolFetchMoreResult`。
+- `fetch_more` schema 与 callable 由 Host 私有 `@tool(...)` `ToolDefinition` 同源声明；Engine 只收到
+  `definition.to_tool_schema()`。
+- `HostToolRuntime` 只做普通 dispatch、组合 `RuntimeTruncateManager`、在普通 tool result 返回前做可选截断；
+  它不根据 `fetch_more` 私有返回类型分支。
+- `RuntimeTruncateManager` 拥有截断状态机与 cursor store，并通过最小 Protocol 闭包供 `fetch_more`
+  callable 补读。
+- serializer、conversation memory、tool trace projection 和 README/tests 不再依赖 cursor / truncation /
+  `fetch_more` 专属 RunEvent。
+- EventLog / trace 中普通 tool call arguments 与 ordinary tool result payload 默认保留；只 scrub
+  `API_KEY` / explicit credentials。cursor、`scope_token`、tool data 本身不是 credential scrub 触发条件。
+- durable memory repair、trace observer I/O、RunInput raw payload、compact / SSE partial semantics、
+  attempt lease hardening 均有切片覆盖、review gate 和验证命令。
+- P8.5 按全新起库处理；旧 `TOOL_*TRUNCATED/CURSOR/FETCH_MORE*` EventLog 行丢弃，不写兼容 reader、
+  decoder 或 migration。
 
 ## 2. Authoritative Decisions
 
-本节是 P8.5 的关键契约裁决。implementation agent 不得自行改选。
+### 2.1 ToolRuntime / EventLog
 
-### 2.1 ToolRuntime Event Model
+1. EventLog 只记录普通 tool calling：
+   - 保留 `TOOL_CALL_REQUESTED`。
+   - 保留 `TOOL_RESULT_ACCEPTED`。
+   - 删除 cursor / truncation / `fetch_more` 专属 RunEventType 与 data class。
 
-1. 删除具体工具名 RunEventType：
-   - 删除 `TOOL_FETCH_MORE_REQUESTED`。
-   - 删除 `TOOL_FETCH_MORE_COMPLETED`。
-   - 删除 `TOOL_FETCH_MORE_FAILED`。
-   - 删除对应 `ToolFetchMoreRequestedData` / `ToolFetchMoreCompletedData` / `ToolFetchMoreFailedData` 及 serializer 分支。
-   - 不提供兼容 re-export、兼容 wrapper、兼容 decoder 分支。
+2. `truncate` 不再是 RunEvent fact：
+   - `RuntimeTruncateManager` 在 `ToolCompletedOutcome` 返回给 Engine 前改写普通 tool result。
+   - 截断后的 LLM-facing tool result 可以携带 `truncation.next_action="fetch_more"` 与
+     `truncation.fetch_more_args`。
+   - EventLog 中的 `TOOL_RESULT_ACCEPTED` 保存普通 tool result payload。除 `API_KEY` / explicit
+     credentials 外，不因 payload 含 cursor、`scope_token` 或 tool data 而删除或遮蔽字段。
 
-2. `fetch_more` 作为普通 Host built-in tool 建模：
-   - `FRAMEWORK_FETCH_MORE_TOOL_NAME = "fetch_more"` 继续只存在于 tool declaration / HostToolRuntime routing / tests 中。
-   - `TOOL_CALL_REQUESTED` 表示 LLM 请求调用 `fetch_more`。
-   - `TOOL_RESULT_ACCEPTED` 表示 `fetch_more` 返回成功或失败结果。
-   - `_event_translation.py` 中对 `fetch_more` arguments 的 redaction 可以保留，因为它处理的是通用 tool-call fact 的敏感字段，不是具体 RunEventType。
+3. `fetch_more` 是 Host 私有 framework built-in tool：
+   - Host 私有层使用 `@tool(...)` 构造 `ToolDefinition`，schema 与 callable 同源。
+   - Host 只把 `definition.to_tool_schema()` 放入 Engine / Runner 可见 tool schema。
+   - Engine 不 import、不接收、不保存、不分支判断 `ToolDefinition`、callable、executor、framework dispatch、
+     manager 或 Host 私有 cursor 类型。
+   - Runtime 只按普通 tool name dispatch 到 framework executor；执行细节由 `fetch_more` callable 使用闭包
+     注入的 manager Protocol 完成。
 
-3. ToolRuntime mechanism facts 保留为通用机制事实：
-   - `TOOL_RESULT_TRUNCATED` 保留。它描述 Host 对任意 tool result 的截断机制，不是某个工具调用的业务结果。
-   - `TOOL_CURSOR_ISSUED` 保留。它描述 Host 为任意 tool result 或 cursor continuation 签发 cursor。
-   - `TOOL_CURSOR_EXPIRED` 保留。它描述 Host 拒绝使用过期 cursor。
-   - `TOOL_CURSOR_DENIED` 保留。它描述 Host 因 scope / binding / fencing 拒绝 cursor。
+4. `RuntimeTruncateManager` 是 Host 私有组件：
+   - 负责 `ToolTruncateSpec` 驱动的截断、single-use cursor store、TTL、scope / binding 校验、chunk building。
+   - 不进入 `dayu.runtime`。
+   - 不进入 Engine。
+   - 不进入 `dayu.host.__all__` 或 public Host contracts。
+   - 暴露给 `fetch_more` callable 的只是一组最小补读 Protocol 能力，不暴露 Runtime 本体、EventLog、harness
+     或 Engine。
 
-4. 上述 cursor facts 必须区分两个 tool-call id：
-   - `owner_tool_call_id`：被截断的原始业务 tool call id。
-   - `emitting_tool_call_id`：触发本次机制事实的当前 tool call id。首次截断时与 `owner_tool_call_id` 相同；`fetch_more` 派生新 cursor、expired、denied 时为 `fetch_more` 的 tool call id。
-   - 如现有字段名需要迁移，使用无兼容的新 schema 名称；不要保留旧字段别名。
+5. 不做 EventLog batch append：
+   - 旧 partial 风险来自专属 multi-fact 模型；删除专属 facts 后该风险消失。
+   - 截断 cursor 注册必须和 tool outcome 构造保持一致：如果 manager 无法安全创建/登记 cursor，则返回普通
+     failed outcome 或不截断，不能产生需要 EventLog 额外 fact 才能解释的状态。
+   - P8.5 不实现 `append_many`，除非实现中发现新的、非 cursor 专属 facts 的直接证据；发现后必须 stop and
+     report。
 
-5. 不把 mechanism facts 并入 `TOOL_RESULT_ACCEPTED`：
-   - 直接原因：`TOOL_RESULT_ACCEPTED` 是 Engine / Host tool loop 接受结果的通用事实；cursor 签发、过期、拒绝、截断是 Host ToolRuntime 资源治理事实。
-   - 并入会让 Engine tool result 协议承载 Host cursor lifecycle，反向泄漏 Host 实现细节。
-   - P8.5 只修正具体工具名错层，不提前做 P10 ToolRegistry 或 P16 public/internal bundle freeze。
+6. `dayu.contracts` 边界：
+   - `ToolTruncateSpec`、`@tool`、`ToolDefinition`、`ToolBundle` 仍是公共工具声明契约。
+   - `fetch_more` 作为 Host framework built-in，不应继续以 public schema helper 形态要求调用方手工加入
+     `RunOptions.tool_schemas`。
+   - `framework_fetch_more_tool_schema()` / `FRAMEWORK_FETCH_MORE_TOOL_NAME` 若仍留在 `dayu.contracts`，
+     只能作为实现期短暂停留的旧事实；P8.5 最终状态应把 `fetch_more` 名称与 schema source 收回 Host 私有层。
+     若实现发现移除这两个 public exports 会破坏 P8.5 以外的大范围 public contract，必须 stop and report。
 
-6. EventLog multi-fact partial risk 的裁决：
-   - 删除 `TOOL_FETCH_MORE_COMPLETED` 后，原 P8 residual 中“`TOOL_FETCH_MORE_COMPLETED` 成功但 `TOOL_CURSOR_ISSUED` 失败”的具体 partial 风险消失。
-   - P8.5 不预设 `append_many` 必须实现。当前预期是：ToolRuntime 在返回给 Engine 前先 append required mechanism facts，因此 mechanism fact append failure 不应产生 successful `ToolCompletedOutcome`。
-   - implementation 必须注入 mechanism fact append failure，断言 `HostToolRuntime.execute_tool_call()` 不返回 successful `ToolCompletedOutcome`。
-   - 若测试证明 append failure 后仍返回 success，implementation 必须 stop and report；否则禁止实现 `append_many`。
-   - compact diagnostic / terminal 的多 fact 风险是独立问题，在 Slice 4 处理，不得混同为 ToolRuntime event model root cause。
+7. Host 私有 framework schema 投影 owner：
+   - schema 投影 owner 是 Host runtime assembly，不是 Engine，也不是普通调用方。
+   - P8.5 推荐新增 Host-private schema provider / protocol，例如 `EngineToolSchemaProvider` 或等价命名：
+     `engine_visible_tool_schemas(user_tool_schemas: tuple[ToolSchema, ...]) -> tuple[ToolSchema, ...]`。
+   - `HostToolRuntime` 通过 Host 私有 `@tool(...)` framework definition 提供 `fetch_more` schema projection；
+     provider 只返回 `definition.to_tool_schema()`，不泄漏 `ToolDefinition`、callable、executor 或 manager。
+   - `EngineWorker` 或 Host harness 内部必须在构造 `AgentRunRequest` 前调用 provider，生成真正传给 Engine 的
+     enhanced tool schemas。调用方仍只传业务 schemas；不得要求调用方 import
+     `framework_fetch_more_tool_schema()`。
+   - `StartRunRequest.options.tool_schemas` 和 `RunOptions` public object 不做 in-place mutation；Host 可以在内部
+     创建 engine-visible request/options copy。
+   - `RUN_INPUT_CONTEXT_SNAPSHOT_BUILT` 必须记录真正传给 Engine 的 enhanced tool schemas，而不是调用方原始
+     schemas。
+   - 如果实现需要改 Engine public contract 或让 Engine 接收 `ToolDefinition` / callable / manager，必须 stop and
+     report。
 
-7. 类似 `fetch_more` 的特化全面检查：
-   - P8.5 必须新增或更新测试，保证 `RunEventType` enum name/value、serializer data-class mapping、memory projection 和 trace projection 不含具体 framework tool name。
-   - `FRAMEWORK_FETCH_MORE_TOOL_NAME` 在 tool declaration、schema、HostToolRuntime routing 中允许存在；它不得出现在 `RunEventType` 名称、event data class 名称或 projection 分支类型名中。
+8. Memory / RunInput capability ingestion policy：
+   - EventLog / trace ordinary tool payload 默认保留；cursor、`scope_token`、tool args/result 不因字段名被
+     credential scrub。
+   - Conversation Memory / RunInput 是 ingestion policy，不是 EventLog credential scrub。短期 runtime capability
+     不进入长期 memory 或下一轮 RunInput。
+   - memory projection 对 ordinary `TOOL_RESULT_ACCEPTED` 中的 `truncation.fetch_more_args`、raw cursor、
+     raw `scope_token` 只生成安全摘要，例如 `truncated=true`、`has_more=true`、`fetch_more_available=true`、
+     size / strategy / fingerprint；不得输出原文 cursor 或 scope token。
+   - RunInputBuilder rendered tool facts 不包含 raw cursor、raw `scope_token` 或可复用的
+     `truncation.fetch_more_args`。
+   - 这不是字段级 credential scrub，而是短期 capability 不跨 run 持久复用的 ingestion rule。
 
 ### 2.2 Durable Memory Repair
 
-1. 自动修复边界：
-   - snapshot row 缺失，且 EventLog 中存在该 session 的 canonical terminal run facts：允许 startup repair 自动重建。
-   - snapshot row 存在但 payload JSON 损坏、schema version 不匹配或字段类型非法：startup repair 不得自动覆盖。必须捕获为强类型 diagnostic，例如 `MemoryRepairDiagnostic(kind=CORRUPT_SNAPSHOT, session_id=..., reason=...)`，让运维介入。
+- missing snapshot row 自动修复仍是 P8.5 范围。
+- corrupt snapshot row 不自动覆盖；返回 typed diagnostic 并记录 WARNING，运维决定是否删除损坏 row 后让 repair
+  重建。
+- corrupt snapshot row 的根因研究与“为什么会产生需要运维介入的损坏 row”不在本轮直接裁决；已由
+  GitHub issue #41 跟踪。P8.5 只固定保守行为：不静默覆盖、不合成假 snapshot、输出 typed diagnostic +
+  WARNING，并保留后续 issue 的 evidence。
+- repair 不得按 session 重复全 EventLog 扫描；新增按 session / kind / event_position 分页读取的 durable helper
+  和必要索引。
 
-2. 运维介入边界：
-   - corrupt snapshot row 的默认处理是 typed diagnostic + WARNING 级日志，不 silent ignore，不自动 delete / overwrite。
-   - corrupt snapshot diagnostic 不得阻断其它 missing-row repair。
-   - `repair_missing_session_snapshots()` 必须返回或暴露包含 repaired session 与 diagnostics 的强类型 report；`startup_reconcile()` 调用方必须能读取 diagnostics。若现有返回值需要调整，使用新强类型返回值，不用 extra payload。
-   - 运维修复动作在 P8.5 仅定义为“备份后删除损坏 snapshot row，再由 startup repair 走缺失 row 自动重建”或后续专门 maintenance command。P8.5 不引入用户级 CLI。
+### 2.3 Tool Trace / Observer
 
-3. 容量风险修复：
-   - 当前 repair 不能继续按缺失 session 数量重复全 EventLog 扫描。
-   - P8.5 必须在 `DurableRunEventStore` 新增 `fetch_events_by_session(...)` 或等价强类型 helper，并配套索引。
-   - helper 的 SQL shape 必须是：`WHERE session_id = ? AND kind = ? AND event_position > ? ORDER BY event_position ASC LIMIT ?`。
-   - repair missing session list 必须分页或有内部 batch limit，避免一次性收集全库 session id。
+- 删除 cursor / truncation 专属 facts 后，ToolTraceProjection 只从普通
+  `TOOL_CALL_REQUESTED` / `TOOL_RESULT_ACCEPTED` 产出 tool call record。
+- `fetch_more` 在 trace 中只是 `tool_name="fetch_more"` 的普通 tool call。
+- 截断观察信息若需要保留，只能来自普通 accepted result payload 或其安全摘要，例如 `truncated=true`、
+  strategy、chunk size、has_more、cursor / `scope_token`；不得依赖专属 RunEventType。
+- Trace 默认保留 ordinary tool call args / result payload；只 scrub API key / explicit credentials，不因字段名
+  是 cursor 或 `scope_token` 做遮蔽。
+- `ToolTraceObserver` 的 JSONL/blob I/O 不应发生在 SQLite checkpoint transaction 内。
+- 非 required trace JSONL/blob sink 采用 at-least-once 语义：JSONL/blob 写入成功但 checkpoint 前 crash 或
+  checkpoint 失败时，重放可能产生重复行；reader / analyzer 必须按 `idempotency_key` 去重。
+- checkpoint 只能在 sink success 后推进；sink failure 记录 non-required observer failure 且不推进 checkpoint；
+  checkpoint failure 不得被报告为 success，下一轮允许 replay。
+- required observer 与 non-required observer 的失败边界必须保持分离：non-required trace I/O failure 不阻塞
+  required memory observer 追平。
+- `utils/analyze_tool_trace_host.py` 必须随 trace schema 调整同步更新。删除专属 facts 后，truncate /
+  `fetch_more` 的错误诊断仍是核心验收信号：analyzer 应能从 ordinary tool payload / trace record 中识别
+  truncation 未续读、`fetch_more` unknown cursor / wrong scope、重复 `fetch_more`、失败 outcome 与
+  provider partial 诊断。
+- P8.5 不做 P15 hard-gate / required projection enforcement / watchdog / observer claim lease / durable observer
+  outbox。
 
-### 2.3 Tool Trace / Observer / Projection
+### 2.4 Compact / RunInput / SSE Partial
 
-1. `ToolTraceObserver.process` 的同步 I/O 边界：
-   - 当前 async observer 协议内执行同步 JSONL / blob I/O 是 P8.5 范围内要修正的稳定性问题。
-   - P8.5 必须让 non-required tool trace observer 的文件 I/O 不再发生在 SQLite observer checkpoint transaction 内。
+- compact diagnostic 与 terminal fact 的分步 append 是独立风险，不与 ToolRuntime event model 混同。
+- `RUN_INPUT_CONTEXT_SNAPSHOT_BUILT` 不再无界内联 raw messages / tool schemas 到 EventLog hot row；P8.5 引入
+  Host durable raw payload side store。
+- raw payload side store schema 在本 plan 固定，不留给 implementation agent 自行设计：
+  - 表名：`run_input_raw_payloads`。
+  - columns：`blob_id TEXT PRIMARY KEY`、`session_id TEXT NOT NULL`、`run_id TEXT NOT NULL`、
+    `attempt_index INTEGER NOT NULL`、`iteration_index INTEGER NOT NULL`、`iteration_id TEXT NOT NULL`、
+    `payload_kind TEXT NOT NULL`、`content_sha256 TEXT NOT NULL`、`byte_size INTEGER NOT NULL`、
+    `payload_json TEXT NOT NULL`、`created_at TEXT NOT NULL`。
+  - `payload_kind` allowed values：`input_messages`、`tool_schemas`。
+  - UNIQUE `(run_id, attempt_index, iteration_index, payload_kind)`。
+  - Index：`(session_id, run_id)`；若 implementation 证据显示 trace/debug reader 需要按 iteration 查找，可加
+    `(run_id, iteration_id)`。
+  - `RunInputContextSnapshotBuiltData` 删除 inline raw json 字段，改为保存两个 payload 的 blob id、hash 与
+    byte size。
+  - writer owner：Host durable run input context fact append boundary；side store rows 与 EventLog fact append
+    必须在同一个 `HostStorage.transaction()` 内提交。
+  - reader owner：Tool trace projection / debug reader。
+  - missing / corrupt / hash mismatch side-store row：required read path 返回 typed projection failure，例如
+    `ProjectionSchemaError` 或等价类型，checkpoint 不推进；禁止合成 fake raw payload。
+- SSE partial tool-call diagnostic 属于 Engine-owned diagnostic data、Host-owned persistence；不新增具体工具名
+  或 provider-specific RunEventType。
+- SSE partial tool-call diagnostic 的主要验收入口是 `utils/analyze_tool_trace_host.py`：当 SSE 中途失败且存在
+  已解析但未完成的 tool call delta 时，trace/analyzer 必须能显示 bounded partial tool-call summary，帮助定位
+  provider stream failure 前模型正在构造的工具调用；该 summary 不驱动 tool execution，不进入 memory。
 
-2. P8.5 与 P15 的边界：
-   - P8.5 做：non-required ToolTraceObserver best-effort decoupling 的最小边界调整；trace I/O 失败不得阻塞 run terminal；checkpoint 与 JSONL/blob 的非原子关系继续用 idempotency key 和 replay 去重承担。
-   - P8.5 不做：required projection enforcement、hard-gate、watchdog、durable observer outbox、全局 buffered drain、observer claim lease。
-   - observer claim lease 归 P15 / issue #28。P8.5 不引入 observer owner secret、fencing token 或多进程 observer claim 表。
+### 2.5 Attempt Lease / Recovery
 
-3. Projection model：
-   - Tool trace projection 必须从通用 `TOOL_CALL_REQUESTED` / `TOOL_RESULT_ACCEPTED` 表达 `fetch_more` 的 request/result。
-   - Cursor / truncation facts 作为 annotations 加入 trace record，不再从 `ToolFetchMoreCompletedData` 汇总。
-   - Projection 对 partial / missing pair 必须给出稳定 best-effort 记录或明确 skip reason，不得因一个普通 partial trace 破坏 required memory projection。
-
-### 2.4 Compact / RunInput / Trace Semantic Cleanup
-
-1. compact diagnostic fact 与 terminal fact：
-   - `CONTEXT_COMPACT_FAILED` 后追加 terminal failure 是两步事实；P8.5 不先假设必须 batch append。
-   - implementation 必须补测试覆盖 diagnostic fact 成功但 terminal close 被 fencing / CAS miss 拒绝的路径，并证明 owner / recovery 仍给出唯一 terminal truth。
-   - success path 的 `CONTEXT_COMPACT_COMPLETED` 与 `CONTEXT_ATTEMPT_RETRYING` 也必须覆盖孤立 fact 风险；若无直接破坏 terminal truth 的证据，保持现有分步 append 但补充注释和测试。
-
-2. compact retry 的 `RunInputContextSnapshotBuiltData` 语义：
-   - `attempt_index` 表示 Host attempt index；compact retry 后递增。
-   - `iteration_index` 表示当前 Host attempt 内的 Engine iteration index；每个新 attempt 的首轮 Engine 输入仍为 `0`。
-   - `iteration_id` 继续由 `run_id + attempt_index` 派生；不得把 compact retry 伪装成同一 attempt 内连续 iteration。
-
-3. RunInput raw payload 热冷分离：
-   - `RUN_INPUT_CONTEXT_SNAPSHOT_BUILT` 不得继续无界内联完整 raw messages / tool schemas 到 EventLog hot row。
-   - P8.5 引入 Host-owned durable raw payload side store，EventLog fact 仅保留 summary、content hash、byte size 和 blob id。
-   - writer 是 `LocalRunHarness._append_run_input_context_snapshot_fact` 所在 Host durable append 边界；`RunInputContextFactBuilder` 只构造 raw payload material 与 summary，不持有 storage、不写库。
-   - side store write 与 `RUN_INPUT_CONTEXT_SNAPSHOT_BUILT` EventLog append 必须使用同一个 `HostStorage.transaction()`；如果无法同事务实现，implementation 必须 stop and report。
-   - reader 是 `ToolTraceObserver` / trace projection：通过 blob id 从 Host durable side store 读取 raw payload，再写 JSONL/blob。
-   - 该 side store 不是 tool trace JSONL，也不是 P15 projection；它属于 Host durable state。
-   - 因本项目按新 schema 起库处理，P8.5 不写旧 EventLog raw inline payload 兼容 reader。
-
-4. SSE partial tool call trace：
-   - P8.5 不做完整 P15 trace hard gate，但必须让中途失败的 partial tool call 不再表现为“无语义缺口”。
-   - SSE partial diagnostic 是 Engine-owned diagnostic data，Host-owned persistence。
-   - 不新增具体工具名 RunEventType，不新增 provider-specific RunEventType。
-   - 方案固定为：扩展 Engine 现有 provider/protocol failure 事件的数据，加入 bounded `partial_tool_calls` summary；Host `_event_translation.py` 只透传为现有 `PROVIDER_PROTOCOL_ERROR` RunEvent data；`ToolTraceObserver` 从该 data 派生 trace diagnostic。
-   - partial summary 只能含 bounded count / id / name fragment / argument size / hash / finish reason，不含 raw argument payload，不进入 memory，不驱动 tool execution。
-
-### 2.5 Attempt Lease / Recovery Hardening
-
-1. `_verify_run_id_matches()` 必须使用独立 reason：
-   - 新增 `AttemptFencingReason.RUN_ID_MISMATCH` 或等价强类型枚举值。
-   - 不再把 draft.run_id mismatch 归类为 `OWNER_MISMATCH`。
-
-2. `next_attempt_index` 必须有独立测试：
-   - 覆盖无 attempt、已有 active attempt、已有 terminal attempt、gap / conflict 情况。
-   - 测试直接面向 run state store，不通过 harness 间接覆盖。
-
-3. `_renew_loop` 并发竞争测试：
-   - 覆盖 renew 与 terminal close race。
-   - 覆盖 owner-lost 已标记后 late renew / late event 不覆盖第一原因。
-   - 覆盖 storage exception 分类为 `STORAGE_ERROR`，且不泄漏 background task exception。
-
-4. recovery / fencing coverage：
-   - recovery CAS miss 不得关闭新 owner。
-   - owner-lost late event 不得追加 attempt-scoped event。
-   - terminal override 不得覆盖既有 terminal。
-   - expired / denied cursor facts 必须走 attempt-scoped appender fencing。
-
-5. 诊断 / 防御边界：
-   - `BUSY` reason 要细化到可诊断 attempt-index conflict，不能只给调用者一个空 reason。
-   - BUSY reason 不复用 fencing reason；新增 `AttemptLeaseBusyReason.ATTEMPT_INDEX_CONFLICT = "attempt_index_conflict"`，并在 `AttemptLeaseResult` 中以独立字段表达，例如 `busy_reason`。
-   - `lease_context` 参数必须校验：`run_id` 非空，`attempt_index >= 0`，`recovered_from_attempt_id` 非空时不得为空字符串。
-   - 这些契约属于 `dayu.host`，不得迁入 `dayu.runtime`。
+- `_verify_run_id_matches()` 使用独立 `RUN_ID_MISMATCH` reason。
+- `next_attempt_index`、renew / terminal race、recovery CAS miss、owner-lost late event、terminal override、
+  owner-lost classification、BUSY reason、`lease_context` 参数校验均进入 P8.5。
+- attempt lease 语义不进入 `dayu.runtime`。
 
 ## 3. Direct Code Evidence
 
-| Area | Direct evidence | Why it matters |
+| Area | Direct evidence | Conflict / implication |
 | --- | --- | --- |
-| RunEventType concrete fetch_more | `dayu/host/contracts.py:71-78` | `TOOL_FETCH_MORE_*` 与 cursor/truncation facts 同列为 public RunEventType，说明具体工具名进入 EventLog contract。 |
-| FetchMore data classes | `dayu/host/contracts.py:393-440` | `ToolFetchMoreCompletedData` / `ToolFetchMoreFailedData` 直接绑定具体工具名。 |
-| ToolRuntime data union | `dayu/host/contracts.py:478-486` | `ToolRuntimeEventData` union 收纳 `ToolFetchMore*Data`，使 projection / serializer 被具体工具污染。 |
-| Serializer closed mapping | `dayu/host/_run_event_serializer.py:668-747`、`dayu/host/_run_event_serializer.py:1449-1485` | decoder 和 data class mapping 都要同步删除 fetch_more-specific data。 |
-| fetch_more ordinary tool route | `dayu/host/_tool_runtime.py:403-429`、`dayu/host/_tool_runtime.py:548-576` | `execute_tool_call()` 通过普通 tool call name 路由到 framework `fetch_more`，说明可用通用 tool-call facts 建模。 |
-| fetch_more multi-fact append | `dayu/host/_tool_runtime.py:719-865` | `_fetch_more()` 当前追加 requested / completed / cursor facts；成功返回前 deferred commit 的顺序是判断是否需要 batch append 的直接依据。 |
-| append helpers | `dayu/host/_tool_runtime.py:1188-1459` | 当前每类 ToolRuntime fact 各自 append，具体 `TOOL_FETCH_MORE_*` 在这里产生。 |
-| Engine already records generic fetch_more call | `dayu/host/_event_translation.py:117-139` | translation 已对 `fetch_more` 的 `TOOL_CALL_REQUESTED` 做 redaction，说明通用 tool call fact 已存在。 |
-| framework tool schema | `dayu/contracts/tool_declaration.py:29`、`dayu/contracts/tool_declaration.py:161-196` | `fetch_more` 是 LLM-facing tool schema，不是 RunEventType。 |
-| no legacy public handle | `tests/host/test_host_public_api_surface.py:106-118` | 当前测试锁定 public surface 不暴露旧 `fetch_more` handle；P8.5 不恢复。 |
-| memory projection polluted | `dayu/host/_conversation_memory.py:690-741` | memory projection 为 `ToolFetchMore*Data` 造 memory fact 且 tool_name 用 `"unknown"`，说明错层影响 durable memory。 |
-| trace projection polluted | `dayu/host/_tool_trace_projection.py:93-112`、`dayu/host/_tool_trace_projection.py:166-183`、`dayu/host/_tool_trace_projection.py:670-691` | trace group 和 summary 只理解 `ToolFetchMoreCompletedData`，失败/partial 语义不完整。 |
-| async observer sync I/O | `dayu/host/_tool_trace_projection.py:141-159` | `process` 是 async 协议，但 docstring 明确内部仍做同步 JSONL / 文件写入。 |
-| sync JSONL / blob writes | `dayu/host/_tool_trace_jsonl_sink.py:149-209` | 每行 `flush+fsync`，raw blob `os.replace`，属于阻塞文件 I/O。 |
-| observer transaction boundary | `dayu/host/_event_observer.py:216-271` | observer process 在 storage transaction 内执行后推进 checkpoint；非 required trace I/O 会拉长 SQLite transaction。 |
-| durable repair startup | `dayu/host/_durable_harness.py:148-176` | startup reconcile 会自动调用 memory repair。 |
-| durable repair missing row only | `dayu/host/_conversation_memory_durable.py:263-288` | docstring 明确只修 snapshot row 缺失，不修 row 存在但 payload 损坏。 |
-| repair full scan risk | `dayu/host/_conversation_memory_durable.py:349-402` | 缺失 session 收集和 per-session event fetch 依赖全 EventLog 扫描，容量风险直接存在。 |
-| corrupt snapshot invisible to repair | `dayu/host/_conversation_memory_durable.py:517-537`、`dayu/host/_conversation_memory_durable.py:628-684` | row 存在但 decode / schema error 会抛错；missing-row repair 看不到该类损坏。 |
-| existing repair tests | `tests/host/test_phase8_durable_memory_recovery.py:642-855` | 当前覆盖 row 删除 repair 和 intentional empty snapshot；未覆盖 corrupt row startup 边界。 |
-| compact failure split append | `dayu/host/_run_harness.py:1450-1638` | compact failed / terminal failed、completed / retrying 都是分步 append，需测试孤立 fact 取舍。 |
-| RunInput context fact append | `dayu/host/_run_harness.py:2367-2455` | `RUN_INPUT_CONTEXT_SNAPSHOT_BUILT` 按 attempt / iteration append，语义要固定。 |
-| RunInput raw inline | `dayu/host/_run_input_context_fact.py:76-160`、`dayu/host/contracts.py:545-585` | raw messages / tool schemas 内联进 EventLog data TEXT，造成热冷混合和体积增长。 |
-| SSE partial gap | `dayu/engine/runners/openai/sse_parser.py:284-329`、`dayu/engine/runners/openai/sse_parser.py:448-500`、`dayu/engine/runners/openai/runner.py:420-545` | parser 会先见到 tool call delta；byte stream 中途失败时 runner 产生 HTTP/protocol failure，但没有完整 tool-call completed 语义。 |
-| run id mismatch reason | `dayu/host/_attempt_supervisor.py:383-418` | `_verify_run_id_matches()` 当前把 run_id mismatch 归入 `OWNER_MISMATCH`。 |
-| next attempt index | `dayu/host/_run_state_store.py:928-951` | `next_attempt_index()` 是独立 store 能力，需要独立测试而不是只走 harness。 |
-| renew loop | `dayu/host/_attempt_supervisor.py:935-1041` | `_renew_loop` 的 storage error、fenced、owner-lost race 都在这里发生。 |
-| lease context validation gap | `dayu/host/_attempt_supervisor.py:511-600` | `lease_context` 当前入口缺少显式参数校验。 |
+| Event enum still specialized | `dayu/host/contracts.py:71-77` | `TOOL_RESULT_TRUNCATED`、`TOOL_CURSOR_*`、`TOOL_FETCH_MORE_*` 仍是 public RunEventType。 |
+| Public data classes still specialized | `dayu/host/contracts.py:309-462` | ToolRuntime facts 与 fetch_more lifecycle 被建成 public Host data class。 |
+| Public fetch_more contract remains | `dayu/host/contracts.py:845-911`、`dayu/host/__init__.py:43-101` | `ToolRuntimeCursor` / `ToolFetchMore*` 仍被当作 Host public contract。 |
+| Serializer closed mapping | `dayu/host/_run_event_serializer.py:397-462`、`:668-740`、`:1474-1480` | encoder / decoder / type map 都依赖专属 facts，必须删除而非兼容。 |
+| Runtime owns cursor store | `dayu/host/_tool_runtime.py:362-369`、`:904-1114` | `HostToolRuntime` 直接维护 cursor maps，和 design 中 `RuntimeTruncateManager` ownership 冲突。 |
+| Runtime branches on fetch_more result | `dayu/host/_tool_runtime.py:548-664`、`:667-865` | Runtime 构造/消费 `ToolFetchMoreRequest/Result`，与闭包注入后 tool 自执行边界冲突。 |
+| Runtime appends special facts | `dayu/host/_tool_runtime.py:1188-1459` | 截断、cursor、fetch_more 都由 Runtime 追加 Host-owned RunEvent。 |
+| Engine schema path uses caller schemas | `dayu/host/_worker.py:42-52`、`dayu/host/_run_harness.py:2416-2422` | 当前 Engine request 与 RunInput context fact 直接使用 `request.options.tool_schemas`，缺 Host 私有 framework schema 投影层。 |
+| Current credential scrub is too broad | `dayu/host/_event_translation.py:101-154` | 当前会移除 `fetch_more` cursor / `scope_token` 和 truncation roundtrip fields；新 durable rule 要求 ordinary tool payload 默认保留，只 scrub API key / explicit credentials。 |
+| Trace projection specialized | `dayu/host/_tool_trace_projection.py:141-198`、`:220-231` | projection 按 cursor/fetch_more 专属 event 分支聚合。 |
+| Trace sync I/O in async observer | `dayu/host/_tool_trace_projection.py:141-159`、`dayu/host/_tool_trace_jsonl_sink.py:149-209` | async observer 内执行 `flush/fsync/os.replace`。 |
+| Trace analyzer expects old truncation/fetch_more fields | `utils/analyze_tool_trace_host.py:1-35`、`:460-490`、`:907-985`、`tests/utils/test_analyze_tool_trace_host.py:241-293` | analyzer 的 truncation / fetch_more diagnostics 是用户调试入口，必须随 generic tool payload trace 更新，而不是丢失错误诊断能力。 |
+| Observer transaction wraps process | `dayu/host/_event_observer.py:261-271` | observer `process` 在 SQLite transaction 内执行，然后推进 checkpoint。 |
+| Memory projection specialized | `dayu/host/_conversation_memory.py:651-758` | memory projection 把 cursor / fetch_more 专属 facts 投成 memory tool facts。 |
+| README locks old public facts | `dayu/host/README.md:13`、`:233-237`、`:396` | README 仍说包根暴露 fetch_more contracts 和 ToolRuntime fact data。 |
+| Tests lock old model | `tests/host/test_phase2_tool_runtime_eventlog.py:250-372`、`tests/host/test_phase8_tool_runtime_fencing.py:659-1147` | 测试仍期待专属 facts 和私有 `_fetch_more` 调用。 |
+| Public contracts expose schema helper | `dayu/contracts/tool_declaration.py:161-207`、`dayu/contracts/__init__.py:49-111` | `fetch_more` schema helper 仍是 contracts public export，和 Host 私有 framework tool definition 存在张力。 |
+| Smoke manually injects fetch_more schema | `utils/smoke_host_multiturn_no_governance.py:708-718` | 当前调用方手工把 `fetch_more` schema 加给 Engine；新 design 应由 Host 投影私有 definition schema。 |
+| Durable repair missing-row only | `dayu/host/_conversation_memory_durable.py:263-288` | repair docstring 只覆盖缺 row，不覆盖 corrupt row diagnostic。 |
+| Durable repair full-scan shape | `dayu/host/_conversation_memory_durable.py:349-402` | repair 存在容量风险，需要按 session / event_position 的 SQL helper。 |
+| Raw RunInput inline | `dayu/host/contracts.py:545-582`、`dayu/host/_run_input_context_fact.py:115-157` | raw messages / schemas 直接进入 EventLog data。 |
+| Shared truncation contract still old | `dayu/contracts/tool_result.py:27-45` | `ToolTruncationInfo` docstring 仍禁止 cursor 写入 Host RunEvent / memory / 日志，需要改成 EventLog/trace ordinary payload + memory ingestion policy。 |
+| Compact split append | `dayu/host/_run_harness.py:1450-1638` | compact diagnostic、completed、retry、terminal 是分步 append。 |
+| SSE partial gap | `dayu/engine/runners/openai/sse_parser.py:284-329`、`:448-500`、`dayu/engine/runners/openai/runner.py:420-545` | parser 可见 tool call delta，但 protocol failure 缺 bounded partial tool-call summary。 |
+| RUN_ID_MISMATCH absent | `dayu/host/_attempt_supervisor.py:383-418` | run_id mismatch 被归为 `OWNER_MISMATCH`。 |
+| lease_context validation gap | `dayu/host/_attempt_supervisor.py:511-600` | `run_id`、`attempt_index`、`recovered_from_attempt_id` 缺显式参数校验。 |
+| next_attempt_index needs direct tests | `dayu/host/_run_state_store.py:928-951` | 独立 store 能力当前主要由 harness 间接覆盖。 |
 
 ## 4. Non-goals
 
 - 不恢复 legacy public `fetch_more` handle。
+- 不把 `ToolFetchMore*` 或 cursor/truncation 专属 contract 改名后继续公开。
 - 不提前实现完整 P10 ToolRegistry。
-- 不把 ToolRuntime 业务语义放入 `dayu.runtime`。
-- 不把具体工具名继续编码成 `RunEventType`。
-- 不在缺少直接证据时断言 EventLog batch append 一定需要或一定不需要。
+- 不把 Host tool runtime 语义放入 `dayu.runtime`。
+- 不把具体工具名、cursor、truncation 继续编码成 `RunEventType`。
+- 不为旧 schema / 旧 EventLog payload 写兼容 reader、decoder 或 migration。
 - 不做 P9 Session / Run lifecycle admission。
+- 不做 P15 hard-gate / required projection enforcement / watchdog / observer claim lease。
 - 不做 P16 public/internal bundle interface freeze。
-- 不做 P15 hard-gate / required projection enforcement / watchdog。
-- 不引入 observer claim lease、observer owner secret、observer fencing token。
-- 不为旧 schema / 旧 EventLog payload 写兼容 reader。
-- 不把 durable memory corrupt snapshot 自动覆盖为“修复成功”。
+- 不引入用户级 memory repair CLI。
 
 ## 5. Affected Files / Modules
 
-### Host contracts / serializer
+### ToolRuntime / contracts / serializer
 
 - `dayu/host/contracts.py`
 - `dayu/host/__init__.py`
 - `dayu/host/_run_event_serializer.py`
-- `tests/host/test_phase6_run_event_serializer.py`
-- `tests/host/test_phase7_contract_serializer.py`
-- `tests/host/test_host_public_api_surface.py`
-
-### ToolRuntime / projections
-
 - `dayu/host/_tool_runtime.py`
+- 新增 `dayu/host/_runtime_truncate_manager.py` 或等价 Host 私有模块
+- 新增 `dayu/host/_framework_tools.py` 或等价 Host 私有模块
+- 新增 Host 私有 schema provider module / protocol，例如 `dayu/host/_engine_tool_schema_provider.py` 或等价位置
+- `dayu/host/_worker.py`
+- `dayu/host/_run_harness.py`
+- `dayu/host/_durable_harness.py`
 - `dayu/host/_event_translation.py`
+- `dayu/contracts/tool_declaration.py`
+- `dayu/contracts/tool_result.py`
+- `dayu/contracts/__init__.py`
+
+### Projections / trace / memory
+
 - `dayu/host/_conversation_memory.py`
 - `dayu/host/_tool_trace_projection.py`
 - `dayu/host/_tool_trace_jsonl_sink.py`
 - `dayu/host/_event_observer.py`
-- `tests/host/test_phase5_multiturn_no_governance_smoke.py`
-- `tests/host/test_phase8_tool_runtime_fencing.py`
-- `tests/host/test_phase2_tool_runtime_eventlog.py`
-- `tests/host/test_phase2_tool_runtime_truncation.py`
-- `tests/host/test_phase2_tool_runtime_boundary.py`
-- `tests/host/test_phase3_conversation_memory_projection.py`
-- `tests/host/test_phase7_tool_trace_projection.py`
-- `tests/host/test_phase7_tool_trace_eventlog_source.py`
-- `tests/host/test_phase7_tool_trace_jsonl_sink.py`
+- `utils/analyze_tool_trace_host.py`
+- `tests/utils/test_analyze_tool_trace_host.py`
 
-### Durable memory / storage schema
+### Durable memory / storage / RunInput
 
 - `dayu/host/_conversation_memory_durable.py`
-- `dayu/host/_durable_harness.py`
 - `dayu/host/_durable_event_store.py`
-- storage schema module located by `rg "host_run_events|host_conversation_memory_snapshots" dayu/host`
-- `tests/host/test_phase8_durable_memory_recovery.py`
-
-### Compact / RunInput / trace payload
-
-- `dayu/host/_run_harness.py`
+- `dayu/host/_host_storage.py` / schema bootstrap owner located by implementation
+- `dayu/host/_durable_harness.py`
 - `dayu/host/_run_input_context_fact.py`
-- Host durable storage schema / transaction module
-- RunInput context fact tests
-- compact retry / failure tests
+- `dayu/host/_run_harness.py`
+- 新增 Host raw payload side-store module if needed
 
-### Engine SSE partial diagnostic
+### Engine partial diagnostics
 
+- `dayu/engine/contracts/runner_events.py`
+- `dayu/engine/contracts/engine_events.py`
 - `dayu/engine/runners/openai/sse_parser.py`
 - `dayu/engine/runners/openai/runner.py`
 - `dayu/engine/agent.py`
-- `tests/engine/contracts/test_runner_events.py`
-- `tests/engine/runners/openai/test_sse_tool_call_stream.py`
-- `tests/engine/runners/openai/test_stream_idle.py`
-- `tests/engine/runners/openai/test_protocol_error.py`
-- `tests/engine/runners/openai/test_http_error_event.py`
-- `tests/host/test_phase7_tool_trace_projection.py`
-- `tests/host/test_phase7_tool_trace_eventlog_source.py`
+- `dayu/host/_event_translation.py`
+- `utils/analyze_tool_trace_host.py`
+- `tests/utils/test_analyze_tool_trace_host.py`
 
 ### Attempt lease / recovery
 
-- `dayu/host/_attempt_lease.py`
 - `dayu/host/_attempt_supervisor.py`
+- `dayu/host/_attempt_lease_store.py`
 - `dayu/host/_run_state_store.py`
-- `tests/host/test_phase8_attempt_supervisor.py`
-- `tests/host/test_phase8_attempt_fencing.py`
-- `tests/host/test_phase8_attempt_recovery.py`
-- `tests/host/test_phase8_multiprocess_stress.py`
+- existing P8 test files under `tests/host/test_phase8_*.py`
 
-### Docs
+### Tests / docs / smokes
 
+- `tests/contracts/test_tool_declaration.py`
+- `tests/contracts/test_tool_result.py` 或现有 tool result contract tests
+- `tests/contracts/test_package_exports.py`
+- `tests/host/test_phase1_public_boundary.py`
+- `tests/host/test_host_public_api_surface.py`
+- `tests/host/test_phase2_tool_runtime_boundary.py`
+- `tests/host/test_phase2_tool_runtime_truncation.py`
+- `tests/host/test_phase2_tool_runtime_eventlog.py`
+- `tests/host/test_phase3_conversation_memory_projection.py`
+- `tests/host/test_phase5_multiturn_no_governance_smoke.py`
+- `tests/host/test_phase6_run_event_serializer.py`
+- `tests/host/test_phase7_tool_trace_projection.py`
+- `tests/host/test_phase7_contract_serializer.py`
+- `tests/host/test_phase7_run_input_context_fact.py`
+- `tests/host/test_phase8_tool_runtime_fencing.py`
+- `tests/host/test_phase8_durable_memory_recovery.py`
+- `tests/utils/test_analyze_tool_trace_host.py`
+- `utils/smoke_host_multiturn_no_governance.py`
+- `utils/smoke_host_tool_runtime.py`
+- `utils/analyze_tool_trace_host.py`
 - `dayu/host/README.md`
 - `tests/README.md`
-- `docs/host/migration-plan.md`
-- `docs/host/design.md` only if implementation changes stable Host design boundary, not for mere code detail。
-
-## 6. Contract / Serializer / RunEventType / Projection / Test Impact
-
-### Contract impact
-
-- Remove `RunEventType.TOOL_FETCH_MORE_REQUESTED` / `TOOL_FETCH_MORE_COMPLETED` / `TOOL_FETCH_MORE_FAILED`。
-- Remove `ToolFetchMoreRequestedData` / `ToolFetchMoreCompletedData` / `ToolFetchMoreFailedData`。
-- Remove these types from `RunEventData` / `ToolRuntimeEventData` unions and package root exports。
-- Keep `FRAMEWORK_FETCH_MORE_TOOL_NAME` and `framework_fetch_more_tool_schema()` in `dayu.contracts.tool_declaration`。
-- Keep or reshape internal `ToolFetchMoreRequest` / `ToolFetchMoreResult` only if `_tool_runtime.py` still needs typed helper data；do not export them from `dayu.host.__all__` unless a direct public contract test justifies it。
-- Reshape cursor data classes to include `owner_tool_call_id` and `emitting_tool_call_id`。
-- SSE partial diagnostic uses Engine-owned diagnostic data and Host-owned persistence：extend existing Engine provider/protocol failure event data with bounded `partial_tool_calls` summary, then have Host `_event_translation.py` pass it through existing `PROVIDER_PROTOCOL_ERROR` RunEvent data. Do not add a new concrete-tool or provider-specific RunEventType.
-
-### Serializer impact
-
-- Delete decoder branches for removed fetch_more-specific event types。
-- Delete mapping entries in `_DATA_CLASS_BY_TYPE`。
-- Add serializer coverage for reshaped cursor facts and RunInput raw payload side-store references。
-- Add negative tests ensuring `TOOL_FETCH_MORE_*` strings are absent from serialized event type values and enum names。
-
-### Projection impact
-
-- Memory projection must stop manufacturing memory facts from `ToolFetchMoreRequestedData` / `CompletedData` / `FailedData`。
-- Memory projection may summarize `fetch_more` through generic `TOOL_CALL_REQUESTED` / `TOOL_RESULT_ACCEPTED` only when that is already part of normal tool-call conversation memory policy；cursor facts remain Host diagnostic mechanism facts。
-- Tool trace projection must group by generic tool call id and annotate truncation / cursor facts via `owner_tool_call_id` and `emitting_tool_call_id`。
-- Tool trace must represent `fetch_more` success and failure using generic tool result outcome, not `ToolFetchMoreCompletedData`。
-- Required memory projection must remain isolated from non-required trace observer failures。
-
-### Test impact
-
-- Existing tests expecting `TOOL_FETCH_MORE_*` must be rewritten to assert generic tool-call facts plus mechanism facts。
-- Public API surface tests must lock that legacy public `fetch_more` handle is still absent。
-- Add guard tests for no concrete framework tool name in `RunEventType` / serializer mapping / projection type branches。
-- Add durable repair capacity and corrupt-row tests。
-- Add ToolTraceObserver transaction-boundary / best-effort failure tests。
-- Add compact split append race tests。
-- Add RunInput payload side-store tests。
-- Add SSE partial tool-call diagnostic tests。
-- Add attempt hardening adversarial tests.
-
-## 7. Schema / Index Impact
-
-P8.5 has schema impact. Because project policy says schema 变更按全新 schema 起库处理，本计划禁止旧库兼容读取。旧 `TOOL_FETCH_MORE_*` EventLog 行、旧 inline raw payload 行和 P8 测试库数据全部按 development branch schema 修正丢弃，不写兼容 reader、decoder 或 migration。
-
-### Required schema/index changes
-
-1. Durable memory repair index：
-   - Add index supporting `session_id + canonical kind + event_position` lookup on `host_run_events`。
-   - Required shape：`CREATE INDEX ... ON host_run_events(session_id, kind, event_position)`。
-   - Add `DurableRunEventStore.fetch_events_by_session(...)` or an equivalent strongly typed helper whose SQL uses `WHERE session_id = ? AND kind = ? AND event_position > ? ORDER BY event_position ASC LIMIT ?`。
-   - If existing schema has different column names, implementation must use actual schema names and keep the same access pattern.
-
-2. RunInput raw payload side store：
-   - Add Host-owned durable table for RunInput context raw payload blobs.
-   - Required columns：`run_id`、`attempt_index`、`iteration_id`、`blob_role`、`blob_id`、`content_hash`、`byte_size`、`payload_json`、created ordering column。
-   - Required uniqueness：`blob_id` unique；`run_id + attempt_index + iteration_id + blob_role` unique。
-   - EventLog fact stores only `blob_id` / `content_hash` / `byte_size` and summary fields.
-   - Writer：`LocalRunHarness._append_run_input_context_snapshot_fact` in the Host durable append boundary.
-   - Builder：`RunInputContextFactBuilder` only returns raw payload material / summary and never receives storage.
-   - Transaction：side-store write and `RUN_INPUT_CONTEXT_SNAPSHOT_BUILT` EventLog append must share the same `HostStorage.transaction()`。
-   - Reader：`ToolTraceObserver` / trace projection reads payload by blob id from the Host durable side store before writing JSONL/blob.
-
-### No schema changes for P8.5
-
-- No observer claim lease table。
-- No required projection policy table。
-- No P9 run lifecycle admission table。
-- No P10 ToolRegistry table。
-- No public/internal bundle interface freeze table。
-
-## 8. Implementation Slices
-
-### Slice 1 — ToolRuntime generic fetch_more event model
-
-**Purpose**
-
-一次性完成 `fetch_more` event model 的纵向 contract migration。该 slice 同时删除具体工具名 RunEvent contract、迁移 HostToolRuntime runtime 行为、同步 serializer / projections / tests，保证 slice 完成后系统可运行、pyright 和 affected tests 可通过。禁止把 contract removal 拆成会制造不可运行中间态的临时兼容层。
-
-**Implementation prompt**
-
-```text
-你是 Dayu Host P8.5 implementation agent。只实现 Slice 1：ToolRuntime generic fetch_more event model。
-
-必须先读取 AGENTS.md、CLAUDE.md、docs/host/phase8.5-plan.md，并遵守中文 docstring、严格类型、分层约束。
-
-这是一个完整 contract migration slice。完成后必须让 pyright 与 affected tests 可通过；不允许临时 compatibility reader、wrapper、re-export、bridge event 或“先删 contract、后续 slice 再修 runtime/projection”的中间态。
-
-目标：
-1. 从 dayu/host/contracts.py 删除 RunEventType.TOOL_FETCH_MORE_REQUESTED / TOOL_FETCH_MORE_COMPLETED / TOOL_FETCH_MORE_FAILED。
-2. 删除 ToolFetchMoreRequestedData / ToolFetchMoreCompletedData / ToolFetchMoreFailedData，以及它们在 RunEventData / ToolRuntimeEventData union 中的成员。
-3. 从 dayu/host/_run_event_serializer.py 删除这些 data 的 decoder、encoder mapping 和 _DATA_CLASS_BY_TYPE 条目。
-4. 从 dayu/host/__init__.py 删除这些 event data 的 public export；不要添加兼容 re-export。
-5. 保留 dayu.contracts.tool_declaration.FRAMEWORK_FETCH_MORE_TOOL_NAME 和 framework_fetch_more_tool_schema()。
-6. 保留或调整内部 ToolFetchMoreRequest / ToolFetchMoreResult 的使用，但不得恢复 legacy public fetch_more handle。
-7. 修改 dayu/host/_tool_runtime.py，删除 _append_fetch_requested、_append_fetch_completed、_fetch_failure 对专属 RunEventType 的依赖；HostToolRuntime 不再追加 fetch_more-specific RunEvent。
-8. HostToolRuntime 仍通过 execute_tool_call() 接收普通 tool call；当 request.call.name == FRAMEWORK_FETCH_MORE_TOOL_NAME 时执行 framework fetch_more。
-9. fetch_more request/result 的持久化真源必须是 Engine/Host tool loop 已有的 generic TOOL_CALL_REQUESTED 和 TOOL_RESULT_ACCEPTED。
-10. cursor / truncation facts 保留为 generic ToolRuntime mechanism facts：TOOL_RESULT_TRUNCATED、TOOL_CURSOR_ISSUED、TOOL_CURSOR_EXPIRED、TOOL_CURSOR_DENIED。
-11. reshape TOOL_CURSOR_ISSUED / TOOL_CURSOR_EXPIRED / TOOL_CURSOR_DENIED data，使其同时包含 owner_tool_call_id 与 emitting_tool_call_id。首次截断两者相同；fetch_more 派生/拒绝/过期时 emitting_tool_call_id 是 fetch_more call id。
-12. TOOL_RESULT_TRUNCATED 保持通用 mechanism fact；如字段名需要同步，使用无兼容新字段。
-13. 修复 dayu/host/_conversation_memory.py：不得再引用 ToolFetchMore*Data；不得再用 tool_name="unknown" 表示 fetch_more 专属 memory fact。
-14. 修复 dayu/host/_tool_trace_projection.py：fetch_more trace 用 generic tool-call request/result 生成；cursor / truncation annotations 来自 generic mechanism facts。
-15. 更新 tests/host/test_phase6_run_event_serializer.py、tests/host/test_phase7_contract_serializer.py 和 tests/host/test_host_public_api_surface.py：RunEventType enum name/value 和 serializer mapping 中不得包含 TOOL_FETCH_MORE 或 tool_fetch_more。
-16. 更新 ToolRuntime / memory projection / tool trace projection / P5 smoke / P8 fencing 相关测试：fetch_more 成功、失败、expired、denied、next cursor 四类路径都用 generic tool-call facts + generic mechanism facts 断言。
-17. 增加回归测试：注入 mechanism fact append failure，断言 HostToolRuntime.execute_tool_call() 不返回 successful ToolCompletedOutcome。当前预期是 ToolRuntime 在返回给 Engine 前先 append required mechanism facts，因此不需要 append_many。
-18. 若测试证明 append failure 后仍返回 success，立即 stop and report；否则禁止实现 append_many。
-19. 增加 guard test：RunEventType / serializer / projections 不包含具体 framework tool name 分支。
-20. P8.5 按全新起库处理；旧 TOOL_FETCH_MORE_* EventLog 行和旧测试库数据丢弃，不写兼容 reader、decoder 或 migration。
-
-禁止：
-- 不实现 append_many，除非第 18 条 stop condition 被直接测试证据触发并由 controller 重新裁决。
-- 不提前实现 P10 ToolRegistry。
-- 不恢复 legacy fetch_more public handle。
-- 不把 ToolRuntime 语义放入 dayu.runtime。
-- 不新增 compatibility reader / wrapper / re-export。
-
-完成后必须运行受影响 tests、grep guards 和 pyright，报告命令与结果。
-```
-
-**Acceptance**
-
-- `rg "TOOL_FETCH_MORE|ToolFetchMore(Requested|Completed|Failed)" dayu/host tests/host` 只允许出现在迁移计划文档或负向测试字符串中。
-- Serializer tests 证明新 contract 可 round-trip。
-- `fetch_more` 成功、失败、expired、denied、next cursor 四类路径都有 generic tool-call facts 和 mechanism facts 测试。
-- Trace JSONL 中 `fetch_more` 是普通 tool call record；cursor annotations 来自 mechanism facts。
-- Memory projection 不再生成 tool_name `"unknown"` 的 fetch_more 专属 memory fact。
-- mechanism fact append failure 注入后，`HostToolRuntime.execute_tool_call()` 不返回 successful `ToolCompletedOutcome`。
-
-### Slice 2 — Durable memory repair stabilization
-
-**Purpose**
-
-修复 startup repair 的容量风险，并定义 corrupt snapshot row 的自动修复 / 运维介入边界。
-
-**Implementation prompt**
-
-```text
-你是 Dayu Host P8.5 implementation agent。只实现 Slice 2：Durable memory repair stabilization。
-
-目标：
-1. 定位 host_run_events schema 真源，新增支持按 session_id + kind + event_position 查询 canonical events 的索引，索引 shape 必须是 (session_id, kind, event_position)。
-2. 在 DurableRunEventStore 新增 fetch_events_by_session(...) 或等价强类型 helper，SQL shape 必须是 WHERE session_id = ? AND kind = ? AND event_position > ? ORDER BY event_position ASC LIMIT ?。
-3. 用该 helper 替换 _fetch_canonical_events_for_session() 对全 EventLog 的 per-session 扫描。
-4. _collect_missing_session_ids() 必须分页或使用 batch limit；不得一次性收集全库 session id。
-5. startup repair 继续只自动修复 snapshot row 缺失。
-6. snapshot row 存在但 payload JSON 损坏、schema version 不匹配或字段类型非法时，不得自动 overwrite。必须捕获为强类型 diagnostic，例如 MemoryRepairDiagnostic(kind=CORRUPT_SNAPSHOT, session_id=..., reason=...)。
-7. repair_missing_session_snapshots() 必须返回或暴露包含 repaired session 与 diagnostics 的强类型 report；startup_reconcile() 调用方必须能读取 diagnostics。corrupt diagnostic 记录 WARNING 级日志，且不得阻断其它 missing-row repair。
-8. 测试覆盖：
-   - missing row 自动 repair。
-   - 多 session repair 不做 per-session 全库扫描；可通过 fake store 调用计数或 SQL helper 单测证明。
-   - corrupt payload row 在 startup_reconcile 中被诊断出来且不会被自动覆盖。
-   - corrupt payload row 不阻断其它 missing-row repair。
-   - intentional empty snapshot row 不被误判为缺失或 corrupt。
-
-禁止：
-- 不新增用户级 CLI。
-- 不为旧 schema 写兼容读取。
-- 不 silent delete / overwrite corrupt snapshot。
-
-完成后运行 durable memory 相关 tests 和 pyright，报告命令与结果。
-```
-
-**Acceptance**
-
-- repair 对缺失 row 是自动恢复。
-- corrupt row 是 repair required，不是假成功。
-- 大库扫描路径被索引化 / session-filter helper 替代。
-
-### Slice 3 — Tool trace observer I/O boundary
-
-**Purpose**
-
-把 non-required tool trace 的同步文件 I/O 从 observer checkpoint SQLite transaction 中移出，限定 P8.5 与 P15 边界。
-
-**Implementation prompt**
-
-```text
-你是 Dayu Host P8.5 implementation agent。只实现 Slice 3：Tool trace observer I/O boundary。
-
-目标：
-1. 阅读 dayu/host/_event_observer.py、_tool_trace_projection.py、_tool_trace_jsonl_sink.py，确认 ProjectionCoordinator 当前在 storage transaction 内 await observer.process()。
-2. 修改 observer drain 边界：required observer 保持事务语义；non-required ToolTraceObserver 的 JSONL / blob I/O 不得在 SQLite transaction 内执行。
-3. 如需使用 executor，只允许最小使用 asyncio.to_thread 或等价标准库方式隔离阻塞文件 I/O；不得引入 durable outbox、claim lease、watchdog、required projection enforcement。
-4. checkpoint 与 JSONL/blob 仍允许非原子，但必须依赖 existing idempotency_key / replay 去重；在 docstring 中说明该取舍。
-5. ToolTraceObserver I/O 失败必须让 observer checkpoint 标记为 best-effort failure 或保留可重试状态；不得阻塞 run terminal，也不得影响 required memory projection。
-6. 测试覆盖：
-   - trace sink fsync/write failure 不影响 run terminal。
-   - required observer 仍在事务内推进 checkpoint。
-   - non-required trace observer 不在同一个 SQLite transaction 内执行阻塞 sink 调用，可用 fake storage transaction marker 验证。
-
-禁止：
-- 不实现 P15 observer claim lease。
-- 不实现 required projection hard gate。
-- 不实现 watchdog 或全局 buffered drain。
-
-完成后运行 observer / trace projection 相关 tests 和 pyright，报告命令与结果。
-```
-
-**Acceptance**
-
-- ToolTraceObserver 仍是 best-effort observer。
-- 文件 I/O 与 SQLite checkpoint transaction 的边界清晰。
-- P15 residual 明确保留为 observer claim / outbox / hard-gate，而不是被 P8.5 半实现。
-
-### Slice 4 — Compact / RunInput payload / semantic cleanup
-
-**Purpose**
-
-固定 compact retry 语义，处理 RunInput raw payload 热冷混合，并测试 compact split append 的原子性取舍。
-
-**Implementation prompt**
-
-```text
-你是 Dayu Host P8.5 implementation agent。只实现 Slice 4：Compact / RunInput payload / semantic cleanup。
-
-目标：
-1. 修改 RunInputContextSnapshotBuiltData：EventLog fact 不再内联完整 raw messages / raw tool schemas；只保留 summary、blob id、content hash、byte size 等热字段。
-2. 新增 Host-owned durable RunInput raw payload side store。writer 必须是 LocalRunHarness._append_run_input_context_snapshot_fact 所在 Host durable append 边界。
-3. RunInputContextFactBuilder 只构造 raw payload material / summary，不持有 storage、不写库；fact 只携带 blob id / content hash / byte size / summary。
-4. side store write 与 RUN_INPUT_CONTEXT_SNAPSHOT_BUILT EventLog append 必须使用同一个 HostStorage.transaction()；如果无法同事务实现，立即 stop and report。
-5. reader 必须是 ToolTraceObserver / trace projection：通过 blob id 从 Host durable side store 读取 raw payload，再写 JSONL/blob。
-6. 固定 compact retry 语义：
-   - attempt_index 是 Host attempt index，compact retry 后递增。
-   - iteration_index 是当前 attempt 内 Engine iteration index，新 attempt 首轮为 0。
-   - iteration_id 继续由 run_id + attempt_index 派生。
-7. 为 compact failure/success split append 增加 adversarial tests：
-   - CONTEXT_COMPACT_FAILED 已 append 但 terminal close 被 fencing/CAS miss 拒绝。
-   - CONTEXT_COMPACT_COMPLETED 已 append 但 CONTEXT_ATTEMPT_RETRYING append 失败。
-   - recovery 后仍只有唯一 terminal truth。
-8. 如果测试证明 split append 会产生错误 terminal truth，停下回报，需要重新裁决最小事务边界；否则保持分步 append 并补充中文 docstring / 注释说明取舍。
-
-禁止：
-- 不写旧 inline raw payload 兼容 reader。
-- 不把 raw payload 放进 tool trace JSONL 作为唯一真源。
-- 不提前做 P9 Session lifecycle。
-
-完成后运行 compact / RunInput / serializer / storage 相关 tests 和 pyright，报告命令与结果。
-```
-
-**Acceptance**
-
-- EventLog 中 `RUN_INPUT_CONTEXT_SNAPSHOT_BUILT` row 不含完整 raw messages / raw tool schemas。
-- raw payload side store 可按 blob id 读取并校验 hash / byte size。
-- compact retry attempt / iteration 语义有测试锁定。
-
-### Slice 5 — SSE partial tool-call trace diagnostic
-
-**Purpose**
-
-让 provider stream 中途失败后的 partial tool-call 具备可追踪诊断语义，但不驱动 tool execution，不进入 memory。
-
-**Implementation prompt**
-
-```text
-你是 Dayu Host P8.5 implementation agent。只实现 Slice 5：SSE partial tool-call trace diagnostic。
-
-目标：
-1. 阅读 dayu/engine/runners/openai/sse_parser.py、runner.py、dayu/engine/agent.py，定位 tool call delta 已出现但 RunnerToolCallsCompletedData 尚未产生时的失败路径。
-2. diagnostic ownership 固定为 Engine-owned diagnostic data + Host-owned persistence。
-3. 扩展 Engine 现有 provider/protocol failure 事件的数据，加入 bounded partial_tool_calls summary；不要新增具体工具名 RunEventType，不要新增 provider-specific RunEventType。
-4. partial summary 只能含 bounded count / id / name fragment / argument size / hash / finish reason；不得含 raw argument payload。
-5. Host _event_translation.py 只透传为现有 PROVIDER_PROTOCOL_ERROR RunEvent data；ToolTraceObserver 从该 data 派生 trace diagnostic，使 trace 中明确显示“partial tool call observed then stream failed”。
-6. 测试覆盖：
-   - SSE 在 tool_call_delta 后网络读失败。
-   - SSE 在 partial arguments 后 provider protocol error。
-   - 没有 completed tool call 时不会生成 TOOL_CALL_REQUESTED。
-   - trace 有 partial diagnostic，memory 无 partial tool call。
-
-禁止：
-- 不实现 P15 hard-gate。
-- 不把 partial delta 当成可执行 tool call。
-- 不把 provider-specific raw payload 无界写入 EventLog。
-- 不新增具体工具名或 provider-specific RunEventType。
-
-完成后运行 engine openai runner/parser tests、host translation/trace tests 和 pyright，报告命令与结果。
-```
-
-**Acceptance**
-
-- partial tool-call failure 不再是 trace 语义空洞。
-- diagnostic 是通用、typed、bounded 的 trace/debug fact。
-
-### Slice 6a — Attempt lease contract hardening
-
-**Purpose**
-
-收口 attempt lease 的小型契约修正：run_id mismatch reason、BUSY reason 与入口参数校验。
-
-**Implementation prompt**
-
-```text
-你是 Dayu Host P8.5 implementation agent。只实现 Slice 6a：Attempt lease contract hardening。
-
-目标：
-1. 在 dayu/host/_attempt_lease.py 新增独立 RUN_ID_MISMATCH reason；修改 _verify_run_id_matches()，不再用 OWNER_MISMATCH 表达 draft.run_id mismatch。
-2. BUSY reason 不复用 fencing reason；新增 AttemptLeaseBusyReason.ATTEMPT_INDEX_CONFLICT = "attempt_index_conflict"，并在 AttemptLeaseResult 中以独立字段表达，例如 busy_reason。
-3. acquire_new_attempt / lease_context 的 attempt-index conflict 路径必须填充 busy_reason。
-4. 为 lease_context 增加参数校验：run_id 非空，attempt_index >= 0，recovered_from_attempt_id 非空时不得为空字符串。
-5. 更新 contract / acquire_new_attempt / lease_context 相关测试，断言 RUN_ID_MISMATCH、busy_reason、参数校验错误。
-
-禁止：
-- 不把 BUSY reason 塞进 AttemptFencingReason。
-- 不把 attempt lease contracts 移到 dayu.runtime。
-- 不做 P9 run lifecycle admission。
-- 不改 recovery / renew_loop adversarial coverage；这些属于 Slice 6b。
-
-完成后运行 phase8 attempt lease / supervisor / fencing 相关 tests 和 pyright，报告命令与结果。
-```
-
-**Acceptance**
-
-- run_id mismatch 有独立 reason。
-- BUSY attempt-index conflict 通过 AttemptLeaseBusyReason.ATTEMPT_INDEX_CONFLICT 表达。
-- lease_context 参数校验有确定性测试。
-
-### Slice 6b — Attempt adversarial coverage
-
-**Purpose**
-
-补齐 P8 attempt lease / recovery 的 adversarial tests，不混入新的 lease contract 设计。
-
-**Implementation prompt**
-
-```text
-你是 Dayu Host P8.5 implementation agent。只实现 Slice 6b：Attempt adversarial coverage。
-
-前置：Slice 6a 已完成。
-
-目标：
-1. 为 _run_state_store.next_attempt_index() 增加独立 tests：无 attempt、active attempt、terminal attempt、gap/conflict。
-2. 为 _renew_loop 增加并发竞争 tests：
-   - renew 与 terminal close race。
-   - owner-lost 后 late renew / late event 不覆盖第一原因。
-   - storage exception 分类 STORAGE_ERROR，不泄漏 background task exception。
-3. 补齐 recovery CAS miss、owner-lost late event、terminal override、expired/denied cursor fencing 的直接测试。
-
-禁止：
-- 不把 attempt lease contracts 移到 dayu.runtime。
-- 不做 P9 run lifecycle admission。
-- 不用 sleep-heavy flaky stress test 替代确定性 race test；优先 fake clock / fake store / barrier。
-- 不再修改 BUSY reason 或 RUN_ID_MISMATCH contract；若 Slice 6a contract 不足，stop and report。
-
-完成后运行 phase8 attempt / fencing / recovery / tool runtime fencing tests 和 pyright，报告命令与结果。
-```
-
-**Acceptance**
-
-- 关键 race 和 fencing gap 有确定性测试。
-- attempt-scoped ToolRuntime cursor facts 均受 owner fencing 保护。
-
-### Slice 7 — Docs, migration notes, final validation
-
-**Purpose**
-
-同步 P8.5 后的稳定契约，避免 README 残留旧术语和旧事件模型。
-
-**Implementation prompt**
-
-```text
-你是 Dayu Host P8.5 implementation agent。只实现 Slice 7：Docs, migration notes, final validation。
-
-前置：Slice 1-6b 已完成。
-
-目标：
-1. 更新 dayu/host/README.md：
-   - 删除 TOOL_FETCH_MORE_REQUESTED / COMPLETED / FAILED。
-   - 说明 fetch_more 是普通 Host built-in tool，request/result 由通用 tool-call facts 表达。
-   - 说明 cursor/truncation facts 是通用 ToolRuntime mechanism facts。
-   - 说明 durable memory repair 的自动/运维边界。
-   - 说明 ToolTraceObserver best-effort I/O 边界。
-2. 更新 tests/README.md：
-   - 只在测试分层或运行方式变化时更新；不要罗列实现细节。
-3. 更新 docs/host/migration-plan.md：
-   - 将 P8.5 状态、residual risk owner 变化和 non-goals 同步为当前事实。
-   - 明确 P8.5 按全新 schema 起库处理，旧 TOOL_FETCH_MORE_* EventLog 行和测试库数据丢弃，不写兼容 reader / decoder / migration。
-4. 仅当 Host 设计稳定边界发生变化时，更新 docs/host/design.md；不要把源码说明书搬进 design。
-5. 运行完整受影响测试、pyright 和 grep guard。
-
-禁止：
-- 不维护时间敏感“近期更新”。
-- 不写未来设计。
-- 不新增旧术语兼容说明。
-
-完成后输出 implementation completion report，格式见本计划末尾。
-```
-
-**Acceptance**
-
-- README 不再宣称 `tool_fetch_more_requested/completed/failed` 是 canonical facts。
-- migration-plan residual risk registry 中 P8.5 项被关闭或转交明确 owner。
-
-## 9. Review Gates
-
-Implementation 完成后必须经过以下 review gates：
-
-1. Contract gate：
-   - `RunEventType` 没有具体工具名。
-   - serializer 没有 `ToolFetchMore*Data` 映射。
-   - package root 没有兼容 re-export。
-   - 该 gate 与 ToolRuntime / Projection gate 同属 Slice 1，必须在同一 slice review 中一起验证，不允许只删除 contract 后留下 runtime/projection 断裂。
-
-2. ToolRuntime gate：
-   - `fetch_more` request/result 只通过 generic tool-call facts 表示。
-   - cursor / truncation mechanism facts 有 `owner_tool_call_id` 与 `emitting_tool_call_id`。
-   - 没有无证据引入 `append_many`。
-
-3. Projection gate：
-   - memory projection 不使用 `"unknown"` 伪 tool_name 表示 fetch_more。
-   - trace projection 成功、失败、expired、denied、partial 都有稳定语义。
-   - non-required trace observer failure 不影响 required memory projection。
-
-4. Durable memory gate：
-   - missing row 自动 repair。
-   - corrupt row 不自动 overwrite，诊断明确。
-   - repair 不再 per missing session 全库扫描。
-
-5. Compact / RunInput gate：
-   - EventLog hot fact 不内联 raw payload。
-   - compact retry attempt / iteration 语义测试固定。
-   - split append failure / fencing 测试证明 terminal truth 唯一。
-
-6. Attempt gate：
-   - `RUN_ID_MISMATCH` 独立 reason。
-   - BUSY attempt-index conflict 通过 `AttemptLeaseBusyReason.ATTEMPT_INDEX_CONFLICT` / `AttemptLeaseResult.busy_reason` 表达，不复用 fencing reason。
-   - renew/terminal/recovery/cursor fencing adversarial tests 覆盖。
-   - lease_context 参数校验覆盖。
-
-7. Docs gate：
-   - `dayu/host/README.md` 与代码事实一致。
-   - `tests/README.md` 只在职责范围内更新。
-   - `docs/host/migration-plan.md` residual owner 更新。
-
-## 10. Validation Commands
-
-所有命令都必须先激活虚拟环境：
+- root `README.md` only if user-facing smoke/tool schema instructions change.
+
+## 6. Contract / Serializer / Projection / Schema Impact
+
+- Public Host contract impact：删除 ToolRuntime cursor/truncation/fetch_more event data 与 fetch_more request/result
+  contracts from Host public surface。
+- Public shared contract impact：`ToolTruncateSpec` 和 `@tool` 保留；`ToolTruncationInfo` 是 ordinary
+  LLM-facing tool result payload 的一部分，可进入 EventLog / trace；不得进入 Conversation Memory、下一轮
+  RunInput、普通日志或 README 大块输出。`framework_fetch_more_tool_schema()` /
+  `FRAMEWORK_FETCH_MORE_TOOL_NAME` 最终应不再作为 caller-facing public helper 使用。实现若无法安全移除，必须
+  stop and report。
+- Serializer impact：删除 cursor/truncation/fetch_more 专属 encode/decode 分支和 closed mapping；不兼容旧 rows。
+- EventLog schema/index impact：
+  - Slice 1 不需要新增 EventLog table；是 event type/data 收缩。
+  - Slice 2 需要新增或确认 `host_run_events(session_id, kind, event_position)` 方向的索引 / helper。
+  - Slice 4 新增 Host durable raw payload side store：
+    `run_input_raw_payloads(blob_id TEXT PRIMARY KEY, session_id TEXT NOT NULL, run_id TEXT NOT NULL,
+    attempt_index INTEGER NOT NULL, iteration_index INTEGER NOT NULL, iteration_id TEXT NOT NULL,
+    payload_kind TEXT NOT NULL, content_sha256 TEXT NOT NULL, byte_size INTEGER NOT NULL,
+    payload_json TEXT NOT NULL, created_at TEXT NOT NULL)`；`payload_kind IN ('input_messages','tool_schemas')`；
+    UNIQUE `(run_id, attempt_index, iteration_index, payload_kind)`；Index `(session_id, run_id)`，可选
+    `(run_id, iteration_id)`；不支持旧 inline payload compatibility。
+- Projection impact：memory / trace 不再消费 cursor/truncation/fetch_more 专属 facts；trace I/O 与 checkpoint
+  transaction 解耦。
+- Payload policy impact：EventLog / trace 普通 tool payload 默认保留；serializer 与 projection 测试必须断言
+  cursor / `scope_token` 可作为 ordinary tool args/result payload 存在，且 API key / explicit credentials
+  仍被 scrub。不要把 cursor / `scope_token` 描述为敏感字段；它们只受 memory / RunInput
+  ingestion policy 限制。
+- Test impact：大量旧 P2/P5/P7/P8 测试需要跟随边界迁移，禁止为旧测试堆兼容代码。
+
+## 7. Implementation Slices
+
+### Slice 1 — Generic Tool-Calling EventLog + RuntimeTruncateManager
+
+**Objective**
+
+一次性完成 ToolRuntime event model root cause 修复：删除 cursor/truncation/`fetch_more` 专属 RunEvent 与 public
+contracts，抽出 `RuntimeTruncateManager`，将 `fetch_more` 改为 Host 私有 `@tool` framework tool。
+
+**Allowed files/modules**
+
+`dayu/host/contracts.py`、`dayu/host/__init__.py`、`dayu/host/_run_event_serializer.py`、
+`dayu/host/_tool_runtime.py`、Host 私有新增模块、`dayu/host/_worker.py`、`dayu/host/_run_harness.py`、
+`dayu/host/_durable_harness.py`、`dayu/host/_conversation_memory.py`、`dayu/host/_event_translation.py`、
+`dayu/contracts/tool_declaration.py`、`dayu/contracts/tool_result.py`、`dayu/contracts/__init__.py`、
+相关 tests / utils smoke / README。
+
+**Implementation instructions**
+
+- 删除 `RunEventType.TOOL_RESULT_TRUNCATED`、`TOOL_CURSOR_ISSUED`、`TOOL_CURSOR_EXPIRED`、
+  `TOOL_CURSOR_DENIED`、`TOOL_FETCH_MORE_REQUESTED`、`TOOL_FETCH_MORE_COMPLETED`、
+  `TOOL_FETCH_MORE_FAILED`。
+- 删除对应 Host data class、`ToolRuntimeEventData` union、Host package exports、serializer mapping。
+- 删除 `ToolRuntimeCursor`、`ToolFetchMoreRequest`、`ToolFetchMoreSucceededResult`、
+  `ToolFetchMoreFailedResult`、`ToolFetchMoreResult`；如内部仍需要 cursor handle，用 Host 私有 manager 类型。
+- 新增 Host 私有 `RuntimeTruncateManager`，迁移 cursor maps、TTL、scope / binding 校验、limit clamp、
+  chunk building、single-use consume / next cursor issue。
+- `HostToolRuntime.execute_tool_call()` 对业务 tool：
+  1. 调用底层 business executor。
+  2. 对 successful `ToolCompletedOutcome` 调用 manager 可选截断。
+  3. 返回普通 `ToolExecutionOutcome`。
+  4. 不追加截断 / cursor RunEvent。
+- 在 Host 私有层用 `@tool(...)` 构造 `fetch_more` `ToolDefinition`；callable 通过闭包拿到 manager 最小补读
+  Protocol，自己执行补读并返回普通 `ToolCompletedOutcome` / `ToolFailedOutcome`。
+- 新增 Host 私有 schema provider / protocol，例如 `EngineToolSchemaProvider`：
+  - `HostToolRuntime` 或 Host runtime assembly 拥有 provider。
+  - provider 从私有 framework `ToolDefinition` 投影 `definition.to_tool_schema()`。
+  - `_run_harness.py` / `_worker.py` / durable assembly 在构造 `AgentRunRequest` 前把调用方业务 schemas 与
+    framework schemas 合成为 engine-visible schemas。
+  - 不修改 `StartRunRequest.options.tool_schemas` / `RunOptions` public object；必要时创建内部 enhanced request
+    或 options copy。
+  - `RUN_INPUT_CONTEXT_SNAPSHOT_BUILT` 使用 enhanced tool schemas，保证 trace 记录的是 Engine 实际看到的 schema。
+  - Engine 不接收 `ToolDefinition`、callable、executor 或 manager。
+- 调用方不应再手工 import public `framework_fetch_more_tool_schema()`；旧 smoke 需要改为只传业务 schemas。
+- `ToolTruncationInfo` 文档改为 ordinary LLM-facing tool result payload：可进入 EventLog / trace；不得进入
+  memory / 下一轮 RunInput / 普通日志 / README 大块输出。
+- `_event_translation.py` 的 scrub 规则改为 credential-only：普通 `fetch_more` arguments 中 raw cursor /
+  `scope_token` 可进入 EventLog，accepted result 中 cursor / `scope_token` 也可作为普通 payload 保留；
+  只有 `API_KEY` / explicit credentials 被 scrub。
+- `_conversation_memory.py` 的普通 tool result ingestion 必须摘要化短期 capability：raw cursor、
+  raw `scope_token`、`truncation.fetch_more_args` 不进入 Conversation Memory tool fact 文本或下一轮 RunInput；
+  允许保留 `truncated=true`、strategy、size、has_more、cursor fingerprint 等不可复用摘要。
+- 更新 tests：public surface 负向锁定 `ToolFetchMore*`、`ToolCursor*Data`、`ToolResultTruncatedData`、
+  `TOOL_CURSOR_*`、`TOOL_RESULT_TRUNCATED` 不存在；P2/P5/P8 测试改为断言普通 tool call/request/result。
+- 更新 tests：新增 ordinary payload retention 断言，覆盖 `fetch_more` tool call args 中 cursor /
+  `scope_token`、truncated ordinary tool result 中 `truncation.fetch_more_args` 可以进入 EventLog / trace；同时保留
+  API key / explicit credential scrub 断言。
+- 更新 tests：调用方只传业务 `ToolSchema` 时，Engine request 仍包含 `fetch_more` schema；`RunOptions.tool_schemas`
+  不被污染；Engine 不接收 `ToolDefinition` / callable / manager；RunInput context fact 记录 enhanced schemas。
+- 更新 tests：EventLog / trace 可见 cursor / `scope_token` ordinary payload；memory snapshot / RunInput rendered
+  tool facts 不包含 raw cursor / raw `scope_token`。
+- grep guard（production/current-doc）：`rg "TOOL_FETCH_MORE|TOOL_CURSOR_|TOOL_RESULT_TRUNCATED|ToolFetchMore|ToolCursor.*Data|ToolResultTruncatedData" dayu tests dayu/host/README.md tests/README.md`
+  生产代码不得命中；负向 forbidden-name 测试常量允许命中但必须注释为 forbidden names。
+
+**Non-goals**
+
+- 不引入 P10 ToolRegistry。
+- 不实现 EventLog `append_many`。
+- 不把 manager 放入 `dayu.runtime`。
+
+**Validation**
 
 ```bash
 source .venv/bin/activate
+python -m pyright dayu/host/ dayu/contracts/ tests/host/ tests/contracts/
+pytest tests/contracts/test_tool_declaration.py tests/contracts/test_tool_result.py tests/contracts/test_package_exports.py -q
+pytest tests/host/test_phase1_public_boundary.py tests/host/test_host_public_api_surface.py -q
+pytest tests/host/test_phase2_tool_runtime_boundary.py tests/host/test_phase2_tool_runtime_truncation.py tests/host/test_phase2_tool_runtime_eventlog.py -q
+pytest tests/host/test_phase3_conversation_memory_projection.py tests/host/test_phase5_multiturn_no_governance_smoke.py tests/host/test_phase8_tool_runtime_fencing.py -q
 ```
 
-Recommended targeted validation：
+**Completion signal**
 
-Slice 1 必须把 contract、serializer、ToolRuntime、memory projection、tool trace projection 与 public surface 相关测试作为同一组运行，不能只运行 contract tests：
+No dedicated cursor/truncation/fetch_more RunEvent remains; `fetch_more` works through ordinary tool call path and Host-private
+framework tool callable.
 
-```bash
-pytest tests/host/test_host_public_api_surface.py
-pytest tests/host/test_phase6_run_event_serializer.py tests/host/test_phase7_contract_serializer.py
-pytest tests/host/test_phase2_tool_runtime_eventlog.py tests/host/test_phase2_tool_runtime_truncation.py tests/host/test_phase2_tool_runtime_boundary.py
-pytest tests/host/test_phase3_conversation_memory_projection.py
-pytest tests/host/test_phase7_tool_trace_projection.py tests/host/test_phase7_tool_trace_eventlog_source.py tests/host/test_phase7_tool_trace_jsonl_sink.py
-pytest tests/host/test_phase5_multiturn_no_governance_smoke.py tests/host/test_phase8_tool_runtime_fencing.py
-pytest tests/host/test_phase8_durable_memory_recovery.py
-pytest tests/host/test_phase8_attempt_lease_store.py tests/host/test_phase8_attempt_supervisor.py tests/host/test_phase8_attempt_fencing.py tests/host/test_phase8_attempt_recovery.py
-pytest tests/host/test_phase8_multiprocess_stress.py
-pytest tests/engine/contracts/test_runner_events.py
-pytest tests/engine/runners/openai/test_sse_tool_call_stream.py tests/engine/runners/openai/test_stream_idle.py tests/engine/runners/openai/test_protocol_error.py tests/engine/runners/openai/test_http_error_event.py
-pytest tests/engine
-pyright
-```
+**Stop conditions**
 
-Required grep guards：
+- Need to expose `ToolDefinition` / manager / cursor type to Engine, `StartRunRequest`, `RunOptions`, or Host public API.
+- Need complete P10 ToolRegistry to finish.
+- Need compatibility reader for old cursor/fetch_more EventLog rows.
 
-```bash
-rg "TOOL_FETCH_MORE|tool_fetch_more|ToolFetchMore(Requested|Completed|Failed)" dayu tests
-rg "RunEventType\\..*FETCH_MORE" dayu tests
-rg "unknown" dayu/host/_conversation_memory.py dayu/host/_tool_trace_projection.py
-```
-
-Expected grep result：
-
-- 第一条只允许命中文档、负向测试字符串或仍被批准保留的 internal request/result helper；不得命中 `RunEventType`、serializer mapping、projection implementation。
-- 第二条不得命中生产代码。
-- 第三条不得命中用于填补 fetch_more tool_name 的实现分支。
-
-## 11. Residual Risk Owner Changes
-
-| Risk | Before P8.5 | P8.5 target owner/status |
-| --- | --- | --- |
-| fetch_more concrete RunEventType | P8 residual, Host ToolRuntime event model | Closed by Slice 1；owner Host ToolRuntime contract。 |
-| fetch_more multi-fact partial completed/issued | P8 residual, suspected EventLog batch issue | Reclassified：after model fix, require direct regression evidence before batch append；owner Host ToolRuntime tests。 |
-| cursor/truncation fact placement | Open model question | Decided：generic ToolRuntime mechanism facts；owner Host contracts/projection。 |
-| durable repair full scan | P8 residual | Closed or reduced by session-filter index/helper；owner durable memory store。 |
-| corrupt snapshot row invisible to repair | P8 residual | Reclassified as typed `MemoryRepairDiagnostic(kind=CORRUPT_SNAPSHOT, ...)` + WARNING log；owner durable memory startup reconcile。 |
-| ToolTraceObserver sync I/O in async protocol | P8 residual / P15 candidate | P8.5 handles non-required trace I/O transaction boundary；durable outbox/claim lease remains P15。 |
-| observer claim lease | P15 / issue #28 | Explicitly not P8.5。 |
-| compact split diagnostic/terminal append | P8.5 semantic cleanup | Covered by adversarial tests；batch append only if direct evidence。 |
-| RunInput raw payload hot row growth | P7 tradeoff / P8.5 cleanup | Closed by raw payload side store written from `LocalRunHarness._append_run_input_context_snapshot_fact` in the same `HostStorage.transaction()`；owner Host durable storage。 |
-| SSE partial tool call trace gap | Engine runner / Host trace | Reduced by Engine-owned `partial_tool_calls` summary on existing provider/protocol failure data + Host-owned `PROVIDER_PROTOCOL_ERROR` persistence；owner Engine runner + Host trace translation。 |
-| attempt lease contract gaps | P8 residual | Closed by Slice 6a；owner Host attempt lease/supervisor。 |
-| attempt lease adversarial gaps | P8 residual | Closed by Slice 6b tests；owner Host attempt supervisor/store。 |
-| old `TOOL_FETCH_MORE_*` EventLog rows | P8 development branch data | Explicitly discarded under fresh schema；no compatibility reader / decoder / migration。 |
-
-## 12. Docs Update Decision
-
-P8.5 implementation must update docs because code changes hit documented Host contracts and tests:
-
-- `dayu/host/README.md`：必须更新。P8.5 修改 Host ToolRuntime facts、durable memory repair、ToolTraceObserver boundary、attempt lease diagnostics。
-- `tests/README.md`：仅当新增测试分层、命令或维护约定变化时更新；不要机械罗列文件。
-- `docs/host/migration-plan.md`：必须更新 P8.5 状态与 residual risk owner。
-- `docs/host/design.md`：只有当 implementation 改变设计级稳定边界时更新；若只是实现现有 P8.5 裁决，不展开源码细节。
-- 根目录 `README.md`：默认不更新，除非新增或改变用户可见 CLI / 配置 / trace render 入口。
-
-## 13. Stop Conditions
-
-implementation agent 遇到以下任一情况必须停止并回报，不得自行选择关键契约：
-
-- mechanism fact append failure 注入后，`HostToolRuntime.execute_tool_call()` 仍返回 successful `ToolCompletedOutcome`。
-- Durable memory corrupt snapshot 自动覆盖与 typed diagnostic / WARNING log / non-blocking repair report 之间出现不可兼容需求。
-- RunInput raw payload side store 无法与 `RUN_INPUT_CONTEXT_SNAPSHOT_BUILT` EventLog append 共用同一个 `HostStorage.transaction()`。
-- SSE partial diagnostic 需要把 partial delta 当成可执行 `TOOL_CALL_REQUESTED` 才能实现。
-- Non-required ToolTraceObserver decoupling 需要引入 P15 claim lease / watchdog / required projection policy。
-- Attempt lease hardening 需要把 Host owner / fencing contracts 移入 `dayu.runtime`。
-- BUSY attempt-index conflict 只能通过复用 `AttemptFencingReason` 才能表达，无法使用独立 `AttemptLeaseBusyReason` / `busy_reason`。
-- pyright 需要通过 `Any`、`object`、无类型签名或忽略注释才能通过。
-- 受影响测试必须靠兼容旧 schema / 旧 event type 才能通过。
-
-## 14. Implementation Completion Report Format
-
-Implementation agent 完成后必须按以下格式报告：
+**Implementation prompt**
 
 ```text
-P8.5 implementation report
+这是 Gateflow-governed implementation handoff，但你不是 Gateflow controller。不要启动 $gateflow / /gateflow；
+不要重新写 plan、不要做 plan review、不要 commit/PR/closeout。current gate: implementation。
 
-Changed:
-- <按 slice 列出生产代码变更>
+Assigned slice: P8.5 Slice 1 — Generic Tool-Calling EventLog + RuntimeTruncateManager。
+Approved plan path: docs/host/phase8.5-plan.md。
 
-Contracts:
-- <RunEventType / serializer / data class / projection contract 变化>
+严格按 Slice 1 scope 实施。核心边界：EventLog 只记录 TOOL_CALL_REQUESTED / TOOL_RESULT_ACCEPTED；
+truncate/cursor/fetch_more 都是 Host 私有 RuntimeTruncateManager / framework tool 实现细节；Engine 什么都看不到。
+Host runtime assembly 必须自动把私有 fetch_more schema 投影到 Engine-visible schemas，调用方只传业务 schema，
+且 RunOptions public object 不被污染。EventLog / trace 保留普通 payload；memory / RunInput 不保留 raw
+cursor、raw scope_token 或可复用 fetch_more_args。
 
-Schema/index:
-- <新增或修改的 table/index，或说明无>
-
-Tests:
-- <新增/更新测试文件>
-
-Validation:
-- source .venv/bin/activate
-- <pytest command>: <pass/fail>
-- pyright: <pass/fail>
-- grep guards: <pass/fail>
-
-Docs:
-- <更新的 README / design / migration docs>
-
-Residual risks:
-- <仍保留的 P15/P9/P16 风险及 owner>
-
-Stop conditions hit:
-- <none 或具体项>
+完成后写 durable implementation artifact:
+docs/host/phase8.5-s1-implementation-report.md
+报告 changed files、plan items implemented、validation results、docs decision、residual risks、stop condition status。
 ```
+
+### Slice 2 — Durable Memory Repair Stabilization
+
+**Objective**
+
+修复 durable memory repair 的容量风险与 corrupt snapshot row 策略边界。
+
+**Allowed files/modules**
+
+`dayu/host/_conversation_memory_durable.py`、`dayu/host/_durable_event_store.py`、schema bootstrap owner、
+`dayu/host/_durable_harness.py`、`tests/host/test_phase8_durable_memory_recovery.py`、README。
+
+**Implementation instructions**
+
+- 新增强类型 repair report，例如 `MemoryRepairReport(repaired_session_ids, diagnostics)`。
+- 新增 typed diagnostic，例如 `MemoryRepairDiagnostic(kind=CORRUPT_SNAPSHOT, session_id, reason)`。
+- `repair_missing_session_snapshots()` 返回 report；`startup_reconcile()` 暴露或记录 diagnostics。
+- snapshot row 缺失且 EventLog 有 terminal canonical facts：自动重建。
+- snapshot row 存在但 payload corrupt / schema mismatch / type invalid：不覆盖，返回 typed diagnostic，记录 WARNING，
+  继续其它 session repair；运维是否删除损坏 row 后让 repair 重建由人工决定。
+- corrupt snapshot row 的产生原因、是否应该存在运维手工介入、是否需要 quarantine / operator command /
+  自动覆盖策略，均不在 P8.5 Slice 2 直接研究或裁决；由 GitHub issue #41 跟踪。implementation 若发现直接
+  代码证据说明 corrupt row 可由当前写路径正常产生，必须 stop and report。
+- 新增 durable event helper，SQL shape 必须是
+  `WHERE session_id = ? AND kind = ? AND event_position > ? ORDER BY event_position ASC LIMIT ?`。
+- 新增或确认索引支持上述 helper。
+- missing session scan 分页或 batch limit，避免一次性收集全库。
+
+**Validation**
+
+```bash
+source .venv/bin/activate
+python -m pyright dayu/host/ tests/host/
+pytest tests/host/test_phase8_durable_memory_recovery.py -q
+pytest tests/host/test_phase8_multiprocess_stress.py -q
+```
+
+**Stop conditions**
+
+- Need user-facing repair CLI.
+- Need old database migration / compatibility reader.
+
+**Implementation prompt**
+
+```text
+这是 Gateflow-governed implementation handoff，但你不是 Gateflow controller。不要启动 $gateflow / /gateflow；
+不要进入其它 slice、不要 commit/PR。current gate: implementation。
+
+Assigned slice: P8.5 Slice 2 — Durable Memory Repair Stabilization。
+只修改 durable memory repair、EventLog helper/index、相关 tests/README。不要修改 ToolRuntime event model。
+
+完成后写 docs/host/phase8.5-s2-implementation-report.md。
+```
+
+### Slice 3 — Tool Trace / Observer Projection Stability
+
+**Objective**
+
+让 trace projection 适配 generic tool-calling-only EventLog，并把非 required ToolTraceObserver 文件 I/O 移出 SQLite
+checkpoint transaction。
+
+**Allowed files/modules**
+
+`dayu/host/_tool_trace_projection.py`、`dayu/host/_tool_trace_jsonl_sink.py`、`dayu/host/_event_observer.py`、
+`utils/analyze_tool_trace_host.py`、`tests/host/test_phase7_tool_trace_projection.py`、
+`tests/host/test_phase7_tool_trace_jsonl_sink.py`、`tests/utils/test_analyze_tool_trace_host.py`、README。
+
+**Implementation instructions**
+
+- trace tool_call record 只从 `TOOL_CALL_REQUESTED` + `TOOL_RESULT_ACCEPTED` 配对产生。
+- `fetch_more` 是普通 `tool_name`，不得有特殊 trace branch。
+- 截断信息只从 ordinary accepted result payload / summary 派生；没有 payload / summary 时 trace 不得反推
+  cursor store。
+- 删除 `ToolFetchMoreCompletedData` / cursor fact summarizer。
+- 更新 `utils/analyze_tool_trace_host.py` 以适配新的 generic tool-call trace schema：
+  - truncate / `fetch_more` 诊断不得依赖 `TOOL_RESULT_TRUNCATED`、`TOOL_CURSOR_*` 或旧专属字段。
+  - analyzer 必须继续报告 truncation 后未续读、`fetch_more` unknown cursor / wrong scope、重复
+    `fetch_more`、tool failure patterns 与 provider protocol failure。
+  - analyzer 去重仍以 `idempotency_key` 为真源，适配 non-required trace at-least-once replay。
+  - `tests/utils/test_analyze_tool_trace_host.py` 必须随 schema 更新，覆盖新的 ordinary payload 输入。
+- 为非 required observer 增加非事务处理路径，例如 protocol `NonTransactionalObserverSink`：
+  - required observer 仍在 transaction 内 `process(tx,batch)`。
+  - non-required trace observer 先在 transaction 外执行 JSONL/blob I/O；成功后用短 transaction 推进 checkpoint。
+  - I/O 失败时记录 non-required observer failure，不推进 checkpoint，不阻塞 memory required projection。
+  - JSONL/blob sink 是 at-least-once；I/O 成功但 checkpoint 前 crash 或 checkpoint 失败时，下一次 drain 允许
+    replay 并产生重复 JSONL/blob record，reader/analyzer 必须按 `idempotency_key` 去重。
+  - checkpoint 只能在 sink success 后推进；checkpoint 推进失败必须记录为 checkpoint failure / blocked or
+    retryable failure，不得标记 success。
+  - required observer failure 与 non-required observer failure 分开记录；non-required trace failure 不得把 required
+    memory observer 状态拖成 failed。
+- `ToolTraceObserver` 可用 `asyncio.to_thread` 包裹同步 JSONL/blob 写入，避免阻塞 event loop；不做 durable outbox。
+
+**Validation**
+
+```bash
+source .venv/bin/activate
+python -m pyright dayu/host/ tests/host/
+pytest tests/host/test_phase7_tool_trace_projection.py tests/host/test_phase7_tool_trace_jsonl_sink.py -q
+pytest tests/host/test_phase6_projection_checkpoint.py tests/host/test_phase8_multiprocess_stress.py -q
+pytest tests/utils/test_analyze_tool_trace_host.py -q
+```
+
+Expected assertions include：
+
+- I/O success + checkpoint failure 后 replay 会产生相同 `idempotency_key` 的重复 row，analyzer / reader 去重后只保留一条逻辑记录。
+- I/O failure 不推进 trace checkpoint，记录 failure，且不阻塞 required memory observer 成功推进。
+- checkpoint failure 不得被报告为 success。
+- analyzer 在新 trace schema 下仍能输出 truncation / `fetch_more` 错误诊断，且重复 row 被
+  `idempotency_key` 去重。
+
+**Stop conditions**
+
+- Need observer claim lease / watchdog / hard-gate.
+- Need durable observer outbox.
+
+**Implementation prompt**
+
+```text
+这是 Gateflow-governed implementation handoff，但你不是 Gateflow controller。不要启动 $gateflow / /gateflow；
+不要进入其它 slice、不要 commit/PR。current gate: implementation。
+
+Assigned slice: P8.5 Slice 3 — Tool Trace / Observer Projection Stability。
+只处理 trace projection generic tool-call 模型与 non-required observer I/O transaction 边界。
+
+完成后写 docs/host/phase8.5-s3-implementation-report.md。
+```
+
+### Slice 4 — Compact / RunInput / SSE Partial Semantic Cleanup
+
+**Objective**
+
+收口 compact 分步事实、RunInput raw payload 热冷分离、compact retry iteration/attempt 语义，以及 SSE partial
+tool-call diagnostic。
+
+**Allowed files/modules**
+
+`dayu/host/contracts.py`、`dayu/host/_run_event_serializer.py`、`dayu/host/_run_input_context_fact.py`、
+`dayu/host/_run_harness.py`、Host raw payload side-store module/schema、`dayu/host/_tool_trace_projection.py`、
+`dayu/engine/contracts/*`、`dayu/engine/runners/openai/*`、`dayu/engine/agent.py`、
+`utils/analyze_tool_trace_host.py`、相关 tests / README。
+
+**Implementation instructions**
+
+- `RUN_INPUT_CONTEXT_SNAPSHOT_BUILT` data 移除无界 raw inline payload；保留 summary、hash、byte size、blob id。
+- 新增 Host durable raw payload side store，schema 固定为：
+  - table：`run_input_raw_payloads`。
+  - columns：`blob_id TEXT PRIMARY KEY`、`session_id TEXT NOT NULL`、`run_id TEXT NOT NULL`、
+    `attempt_index INTEGER NOT NULL`、`iteration_index INTEGER NOT NULL`、`iteration_id TEXT NOT NULL`、
+    `payload_kind TEXT NOT NULL`、`content_sha256 TEXT NOT NULL`、`byte_size INTEGER NOT NULL`、
+    `payload_json TEXT NOT NULL`、`created_at TEXT NOT NULL`。
+  - `payload_kind` allowed values：`input_messages`、`tool_schemas`。
+  - UNIQUE `(run_id, attempt_index, iteration_index, payload_kind)`。
+  - Index `(session_id, run_id)`；可选 Index `(run_id, iteration_id)` 仅在 reader 直接需要时增加。
+- 新增 side-store API 或等价 repository：
+  - writer：`put_run_input_raw_payloads(tx, session_id, run_id, attempt_index, iteration_index, iteration_id, payloads)`
+    或等价强类型 API，在同一 transaction 内写入两类 payload 并返回 blob id / hash / byte size。
+  - reader：`get_run_input_raw_payload(tx_or_conn, blob_id)` 或按 snapshot fact 引用批量读取，校验
+    `content_sha256` 与 `byte_size`。
+  - missing row、hash mismatch、invalid JSON、kind mismatch 必须抛 typed projection failure，例如
+    `ProjectionSchemaError`；required read path checkpoint 不推进；不得合成 fake raw payload。
+- writer 是 Host durable run input context fact append boundary；reader 是 trace projection / debug reader。
+- side store write 与 EventLog append 必须处于同一个 `HostStorage.transaction()`；做不到则 stop and report。
+- `RunInputContextSnapshotBuiltData` 删除 inline `raw_input_messages_json` / `raw_tool_schemas_json`，保留：
+  `raw_input_messages_blob_id`、`raw_input_messages_sha256`、`raw_input_messages_byte_size`、
+  `raw_tool_schemas_blob_id`、`raw_tool_schemas_sha256`、`raw_tool_schemas_byte_size`。
+- compact retry 语义固定：
+  - `attempt_index` 是 Host attempt index，retry 后递增。
+  - `iteration_index` 是当前 attempt 内 Engine iteration，retry attempt 首轮为 `0`。
+  - `iteration_id` 由 `run_id + attempt_index` 派生。
+- 补测试覆盖 compact diagnostic success 但 terminal close CAS/fencing miss 的路径，证明唯一 terminal truth 不破坏。
+- 扩展 Engine provider/protocol failure data，加入 bounded `partial_tool_calls` summary；Host 继续用
+  `PROVIDER_PROTOCOL_ERROR` RunEvent，trace projection 派生 diagnostic。
+- partial summary 不含 raw argument payload，不进入 memory，不驱动 tool execution。
+- 更新 `utils/analyze_tool_trace_host.py`：`provider_protocol_error` 报告中必须展示 bounded
+  `partial_tool_calls` summary，使 SSE 中途失败时能看到模型已开始构造但未完成的 tool call；该诊断是
+  SSE partial feature 的主要人工观察入口。
+
+**Validation**
+
+```bash
+source .venv/bin/activate
+python -m pyright dayu/engine/ dayu/host/ tests/engine/ tests/host/
+pytest tests/host/test_phase4_overflow_retry.py tests/host/test_phase7_run_input_context_fact.py tests/host/test_phase7_contract_serializer.py -q
+pytest tests/host/test_phase7_tool_trace_projection.py -q
+pytest tests/engine/runners/openai/test_protocol_error.py tests/engine/runners/openai/test_event_flow_ordering.py -q
+pytest tests/utils/test_analyze_tool_trace_host.py -q
+```
+
+Expected assertions include：
+
+- transaction rollback 后没有 orphan side-store row。
+- EventLog fact 引用的 blob id 可读，hash / byte size 校验通过。
+- missing side-store row、hash mismatch 或 corrupt JSON 导致 typed projection failure，checkpoint 不推进。
+- SSE partial tool-call diagnostic 能在 `utils/analyze_tool_trace_host.py` 输出中看见 bounded partial
+  tool-call summary。
+
+**Stop conditions**
+
+- Need provider-specific RunEventType.
+- Need raw payload compatibility reader for old EventLog rows.
+- Cannot make raw side store and EventLog append atomic in P8.5 scope.
+
+**Implementation prompt**
+
+```text
+这是 Gateflow-governed implementation handoff，但你不是 Gateflow controller。不要启动 $gateflow / /gateflow；
+不要进入其它 slice、不要 commit/PR。current gate: implementation。
+
+Assigned slice: P8.5 Slice 4 — Compact / RunInput / SSE Partial Semantic Cleanup。
+只处理 compact、RunInput raw side store、SSE partial diagnostic 与相关 trace/readme/tests。
+
+完成后写 docs/host/phase8.5-s4-implementation-report.md。
+```
+
+### Slice 5a — Attempt Lease Diagnostic Corrections
+
+**Objective**
+
+修复 attempt lease 诊断与防御性边界：独立 `RUN_ID_MISMATCH`、BUSY reason、`lease_context` 参数校验、
+`next_attempt_index` 独立测试。
+
+**Allowed files/modules**
+
+`dayu/host/_attempt_supervisor.py`、`dayu/host/_attempt_lease_store.py`、`dayu/host/_run_state_store.py`、
+P8 attempt tests、README。
+
+**Implementation instructions**
+
+- 新增 `AttemptFencingReason.RUN_ID_MISMATCH`；`_verify_run_id_matches()` 使用该 reason。
+- BUSY reason 不复用 fencing reason；新增 `AttemptLeaseBusyReason.ATTEMPT_INDEX_CONFLICT` 或等价强类型枚举。
+- `AttemptLeaseResult` 以独立字段表达 busy reason。
+- `lease_context` 显式校验 `run_id` 非空、`attempt_index >= 0`、`recovered_from_attempt_id` 非空时不能是空串。
+- 为 `RunStateStore.next_attempt_index()` 补独立测试：无 attempt、active、terminal、gap/conflict。
+
+**Validation**
+
+```bash
+source .venv/bin/activate
+python -m pyright dayu/host/ tests/host/
+pytest tests/host/test_phase8_attempt_supervisor.py tests/host/test_phase8_attempt_fencing.py tests/host/test_phase8_attempt_recovery.py -q
+```
+
+**Stop conditions**
+
+- Need change public Host API.
+- Need move attempt semantics into `dayu.runtime`。
+
+**Implementation prompt**
+
+```text
+这是 Gateflow-governed implementation handoff，但你不是 Gateflow controller。不要启动 $gateflow / /gateflow；
+不要进入其它 slice、不要 commit/PR。current gate: implementation。
+
+Assigned slice: P8.5 Slice 5a — Attempt Lease Diagnostic Corrections。
+只处理 attempt lease 诊断、防御校验和 next_attempt_index 独立测试。
+
+完成后写 docs/host/phase8.5-s5a-implementation-report.md。
+```
+
+### Slice 5b — Attempt Lease / Recovery Adversarial Hardening
+
+**Objective**
+
+补齐 P8 adversarial coverage：renew/terminal race、recovery CAS miss、owner-lost late event、terminal override、
+expired/denied fencing 等。
+
+**Allowed files/modules**
+
+`dayu/host/_attempt_supervisor.py`、`dayu/host/_attempt_lease_store.py`、`dayu/host/_run_harness.py`、
+P8 tests、README。
+
+**Implementation instructions**
+
+- 覆盖 `_renew_loop` 并发竞争：renew 与 terminal close race、owner-lost 第一原因不被 late renew 覆盖、
+  storage exception 分类为 `STORAGE_ERROR` 且不泄漏 background task exception。
+- recovery CAS miss 不得关闭新 owner。
+- owner-lost late event 不得追加 attempt-scoped EventLog。
+- terminal override 不得覆盖既有 terminal。
+- Slice 1 后不再存在 cursor facts；expired/denied fencing 改为 `fetch_more` 普通 failed outcome 与
+  attempt-scoped generic tool call path的 fencing 覆盖。
+
+**Validation**
+
+```bash
+source .venv/bin/activate
+python -m pyright dayu/host/ tests/host/
+pytest tests/host/test_phase8_attempt_supervisor.py tests/host/test_phase8_attempt_fencing.py tests/host/test_phase8_attempt_recovery.py tests/host/test_phase8_tool_runtime_fencing.py -q
+pytest tests/host/test_phase8_multiprocess_stress.py -q
+```
+
+**Stop conditions**
+
+- Need production process supervisor.
+- Need P9 lifecycle admission.
+
+**Implementation prompt**
+
+```text
+这是 Gateflow-governed implementation handoff，但你不是 Gateflow controller。不要启动 $gateflow / /gateflow；
+不要进入其它 slice、不要 commit/PR。current gate: implementation。
+
+Assigned slice: P8.5 Slice 5b — Attempt Lease / Recovery Adversarial Hardening。
+只处理 approved adversarial coverage 和直接必要的 root-cause fixes。
+
+完成后写 docs/host/phase8.5-s5b-implementation-report.md。
+```
+
+### Slice 6 — Documentation / Migration Registry Closeout
+
+**Objective**
+
+把 P8.5 后的真实代码事实同步到 docs / README / migration residual registry，准备 controller 进入 PR gate。
+
+**Allowed files/modules**
+
+`docs/host/migration-plan.md`、`docs/host/design.md`（仅修正与实现事实冲突的少量文字）、
+`dayu/host/README.md`、`tests/README.md`、root `README.md` if triggered。
+
+**Implementation instructions**
+
+- Host README 删除旧 public `ToolFetchMore*`、ToolRuntime fact data、cursor fact EventLog 描述。
+- Tests README 更新 P8.5 后测试分层与命令。
+- migration-plan residual risk registry 更新：哪些 fixed、哪些 deferred to P9/P15/P16/issue。
+- `docs/host/design.md` 只保留 current design；旧 P7/P8 段落若仍提到 cursor / truncation /
+  `fetch_more` 专属 facts 或 observer sink 与 checkpoint 同事务，必须改成 historical pre-P8.5 wording 或明确
+  superseded by §11，不得作为 normative current fact 留存。
+- 不把 future design 写成已落地事实。
+
+**Validation**
+
+```bash
+source .venv/bin/activate
+python -m pyright dayu/ tests/ utils/
+pytest tests/host -q
+pytest tests/contracts tests/engine -q
+rg "TOOL_FETCH_MORE|TOOL_CURSOR_|TOOL_RESULT_TRUNCATED|ToolFetchMore|ToolCursor.*Data|ToolResultTruncatedData" dayu tests dayu/host/README.md tests/README.md
+rg "TOOL_FETCH_MORE|TOOL_CURSOR_|TOOL_RESULT_TRUNCATED|ToolFetchMore|ToolCursor.*Data|ToolResultTruncatedData" docs/host/migration-plan.md docs/host/phase8.5-plan.md
+```
+
+Expected grep semantics：
+
+- production/current-doc guard：`dayu`、`tests`、`dayu/host/README.md`、`tests/README.md` 不应存在当前用法；
+  仅允许 negative forbidden-name tests 命中，且测试注释必须说明这些名字被禁止。
+- historical-doc audit guard：`docs/host/migration-plan.md`、旧 review artifacts 和本 plan 可作为历史 /
+  residual context 命中旧名字；不得为了零命中删除审计上下文。
+
+**Stop conditions**
+
+- Any docs claim cannot be supported by code/tests.
+
+**Implementation prompt**
+
+```text
+这是 Gateflow-governed implementation handoff，但你不是 Gateflow controller。不要启动 $gateflow / /gateflow；
+不要进入 commit/PR。current gate: implementation。
+
+Assigned slice: P8.5 Slice 6 — Documentation / Migration Registry Closeout。
+只同步 P8.5 已完成代码事实与 residual risk owner。
+
+完成后写 docs/host/phase8.5-s6-implementation-report.md。
+```
+
+## 8. Review Gates
+
+### Plan review
+
+- 必须 adversarial review 本 plan 是否真正遵守 `docs/host/design.md` §11；§11 与本 plan supersede 旧 P2/P7/P8
+  历史 wording。
+- 必须挑战 Slice 1 是否过大；若 reviewer 认为过大，必须提出不会诱导临时兼容层的替代切片。
+- 必须检查 public contract removal 是否写清楚，尤其 `dayu.contracts.framework_fetch_more_tool_schema` /
+  `FRAMEWORK_FETCH_MORE_TOOL_NAME` 的最终归属。
+- 必须检查所有 blocking open questions 是否已收敛。
+- Artifact：`docs/host/phase8.5-plan-review.md`。
+
+### Plan fix / re-review
+
+- Fix artifact：`docs/host/phase8.5-plan-fix-report.md`。
+- Re-review artifact：`docs/host/phase8.5-plan-rereview.md`。
+- re-review pass 后必须等 user confirmation；确认后 controller 才能创建新的 accepted plan commit。
+
+### Code review per slice
+
+- 每个 slice implementation artifact 落盘后才能进入 code review。
+- Code review 只 review assigned slice diff，不重审未开始 slice。
+- accepted findings 必须 fix + re-review；code re-review pass 后等 user confirmation 才能 accepted slice commit。
+
+## 9. Validation Matrix
+
+全 P8.5 closeout 前至少运行：
+
+```bash
+source .venv/bin/activate
+python -m pyright dayu/ tests/ utils/
+pytest tests/contracts tests/engine -q
+pytest tests/host -q
+pytest tests/host/test_phase8_multiprocess_stress.py -q
+python utils/smoke_host_tool_runtime.py
+python utils/smoke_host_multiturn_no_governance.py --fake-provider
+git diff --check
+```
+
+如真实 provider smoke 需要外部 key，不作为必跑项；若运行则记录环境与结果。
+
+## 10. Residual Risk Owner Changes
+
+| Residual risk | New owner / destination |
+| --- | --- |
+| ToolRuntime event model root cause | P8.5 Slice 1 |
+| `TOOL_FETCH_MORE_*` concrete tool RunEventType | P8.5 Slice 1 |
+| `TOOL_RESULT_TRUNCATED` / `TOOL_CURSOR_*` as EventLog facts | P8.5 Slice 1 |
+| EventLog multi-fact partial risk from old fetch_more completed + cursor issued | Closed by Slice 1 if no dedicated facts remain; `append_many` remains non-goal unless new evidence |
+| Durable memory repair capacity / corrupt row immediate behavior | P8.5 Slice 2：capacity helper + typed diagnostic + WARNING; no automatic overwrite |
+| Corrupt durable memory snapshot row root-cause / long-term repair policy | GitHub issue #41 |
+| ToolTraceObserver sync I/O inside transaction | P8.5 Slice 3 |
+| `analyze_tool_trace_host.py` generic trace diagnostics for truncation / fetch_more | P8.5 Slice 3 |
+| Observer claim lease / hard-gate / watchdog | P15 / issue #28 |
+| Compact diagnostic / terminal split append | P8.5 Slice 4 |
+| RunInput raw payload hot/cold mixing | P8.5 Slice 4 |
+| SSE partial tool-call semantic gap / analyzer visibility | P8.5 Slice 4 |
+| `_verify_run_id_matches()` reason | P8.5 Slice 5a |
+| `next_attempt_index` independent tests | P8.5 Slice 5a |
+| `_renew_loop` race / storage error / owner-lost coverage | P8.5 Slice 5b |
+| recovery CAS miss / owner-lost late event / terminal override | P8.5 Slice 5b |
+| P9 lifecycle admission / recovery auto wire | P9 |
+| P16 public/internal bundle freeze | P16 |
+
+## 11. Open Questions
+
+No blocking open question for plan handoff.
+
+Non-blocking watch item：API key / explicit credentials 的识别边界必须保持窄定义。implementation agent 不得
+把普通业务字段、cursor、`scope_token`、tool args 或 tool result 扩大解释为 credentials；若发现具体 provider
+payload 内存在新的明确凭证字段，应在 slice report 中列证据并收敛到 credential scrub 测试。
+
+## 12. Implementation Completion Report Format
+
+每个 slice implementation report 必须包含：
+
+- work gate name：`implementation`。
+- work-unit name and assigned slice id。
+- approved plan path。
+- assigned scope / explicit non-goals / allowed files。
+- changed files。
+- plan items implemented。
+- plan items not implemented and reason。
+- validation commands and results。
+- documentation update decision and result。
+- plan gaps or controller questions。
+- residual risks and uncovered areas, classified as current-slice fix / later slice / later phase / existing issue /
+  new issue or user decision。
+- completion signal。
+- stop condition status。
+- artifact path。
