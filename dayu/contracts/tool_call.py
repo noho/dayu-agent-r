@@ -80,8 +80,8 @@ class ToolExecutionContext:
     :param iteration_id: 当前 LLM 迭代 id。
     :param tool_call_id: 当前工具调用 id。
     :param index_in_iteration: 当前工具调用在迭代内的序号。
-    :param timeout_seconds: 工具级超时秒数；``None`` 表示由 Host 兜底
-        策略决定。
+    :param timeout_seconds: Engine 等待 ``ToolExecutor.execute`` 返回
+        outcome 的握手超时秒数；``None`` 表示调用方未提供该预算。
     :param cancellation_token: 取消观察 token。
     :param correlation_id: 中性跨组件关联标识；不得用作 trace recorder
         私有入口。

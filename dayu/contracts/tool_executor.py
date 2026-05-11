@@ -29,10 +29,15 @@ class ToolExecutor(Protocol):
             :class:`ToolExecutionContext`）。
         :returns: 工具执行 outcome 封闭联合的某个具体成员。
 
-        实现必须协作式观察 ``request.context.cancellation_token``；取消的
-        **公共终态**由 Agent / Engine 入口收口为
-        :class:`RunCancelledData` / :class:`EngineRunOutcomeCancelled`，
-        不在本协议公共 ``:raises:`` 中暴露任何取消异常。
+        实现必须协作式观察 ``request.context.cancellation_token``，并允许
+        承载本次调用的 ``asyncio.Task`` 被取消；取消的**公共终态**由
+        Agent / Engine 入口收口为 ``run_cancelled``，不在本协议公共
+        ``:raises:`` 中暴露任何取消异常。
+
+        ``request.context.timeout_seconds`` 表示 Engine 等待本次工具握手
+        返回 outcome 的超时预算。若实现无法在该预算内返回 completed /
+        failed / awaiting outcome，被取消后的下游长事务清理属于
+        ToolExecutor / ToolRuntime 职责。
         """
         ...
 

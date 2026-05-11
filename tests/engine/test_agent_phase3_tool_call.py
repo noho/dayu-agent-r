@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import asyncio
 import json
 import logging
 import math
@@ -13,6 +14,7 @@ import pytest
 from _pytest.logging import LogCaptureFixture
 
 from dayu.contracts.json_value import JsonValue
+from dayu.contracts.tool_executor import ToolExecutor
 from dayu.contracts.tool_call import (
     GeminiToolCallState,
     ToolCallRequest,
@@ -75,6 +77,8 @@ from dayu.contracts.tool_schema import (
 from tests.engine.runners.openai._sse_helpers import make_no_thought_hook
 
 _TOOL_EXECUTION_TIMEOUT_SECONDS: float = 5.0
+_FAST_TOOL_EXECUTION_TIMEOUT_SECONDS: float = 0.01
+_SLOW_TOOL_EXECUTION_SECONDS: float = 5.0
 _MINIMAL_MAX_ITERATIONS: int = 1
 _NO_CONTINUATION_ATTEMPTS: int = 0
 _INVALID_CONTINUATION_ATTEMPTS: int = -1
@@ -332,6 +336,33 @@ class _RecordingToolExecutor:
         return self.outcomes[request.call.tool_call_id]
 
 
+@dataclass(slots=True)
+class _HangingToolExecutor:
+    """持续挂起直到被取消的 fake ToolExecutor。"""
+
+    requests: list[ToolExecutionRequest] = field(default_factory=list)
+    token_to_cancel_on_cancel: _Token | None = None
+    cancelled: bool = False
+
+    async def execute(self, request: ToolExecutionRequest) -> ToolExecutionOutcome:
+        """记录请求并模拟不返回 outcome 的工具握手。
+
+        :param request: 工具执行请求。
+        :returns: 理论上不会返回；若未被取消则返回成功 outcome。
+        :raises asyncio.CancelledError: task 被 Engine 取消时透传。
+        """
+
+        self.requests.append(request)
+        try:
+            await asyncio.sleep(_SLOW_TOOL_EXECUTION_SECONDS)
+        except asyncio.CancelledError:
+            self.cancelled = True
+            if self.token_to_cancel_on_cancel is not None:
+                self.token_to_cancel_on_cancel.trigger()
+            raise
+        return _success(0)
+
+
 def _event(event_type: RunnerEventType, data: RunnerEventData) -> RunnerEvent:
     """构造 RunnerEvent。
 
@@ -508,7 +539,7 @@ def _awaiting(
 def _request(
     *,
     token: _Token | None = None,
-    executor: _RecordingToolExecutor | None = None,
+    executor: ToolExecutor | None = None,
     max_iterations: int = 2,
     fallback_mode: AgentFallbackMode = AgentFallbackMode.FORCE_ANSWER,
     disable_tools: bool = False,
@@ -516,6 +547,7 @@ def _request(
     max_failed_batches: int = 2,
     continuation_max_attempts: int = 3,
     continuation_prompt: str = "请继续。",
+    tool_execution_timeout_seconds: float = _TOOL_EXECUTION_TIMEOUT_SECONDS,
 ) -> AgentRunRequest:
     """构造 AgentRunRequest。
 
@@ -528,6 +560,7 @@ def _request(
     :param max_failed_batches: 连续失败工具批次阈值。
     :param continuation_max_attempts: continuation 最大尝试次数。
     :param continuation_prompt: continuation 追加用户消息。
+    :param tool_execution_timeout_seconds: 工具握手超时秒数。
     :returns: AgentRunRequest。
     :raises Exception: 不主动抛出异常。
     """
@@ -560,7 +593,7 @@ def _request(
             max_iterations=max_iterations,
             continuation_max_attempts=continuation_max_attempts,
             allow_tool_calls=allow_tool_calls,
-            tool_execution_timeout_seconds=_TOOL_EXECUTION_TIMEOUT_SECONDS,
+            tool_execution_timeout_seconds=tool_execution_timeout_seconds,
             fallback_mode=fallback_mode,
             fallback_prompt="请直接回答。",
             continuation_prompt=continuation_prompt,
@@ -800,6 +833,10 @@ async def test_completed_tool_call_injects_messages_and_reaches_final() -> None:
     assert executor.requests[0].context.run_id == "run_phase3"
     assert executor.requests[0].context.iteration_id == "run_phase3_iteration_1"
     assert executor.requests[0].context.index_in_iteration == 0
+    assert (
+        executor.requests[0].context.timeout_seconds
+        == _TOOL_EXECUTION_TIMEOUT_SECONDS
+    )
     assert executor.requests[0].context.correlation_id == (
         "run_phase3:run_phase3_iteration_1:tc_1"
     )
@@ -1272,6 +1309,67 @@ async def test_duplicate_and_executor_exception_paths() -> None:
     tool_message = runner.messages_seen[1][-1]
     assert isinstance(tool_message, ToolMessage)
     assert json.loads(tool_message.content)["error"] == "tool_executor_exception"
+
+
+@pytest.mark.asyncio
+async def test_tool_execution_timeout_fails_run_without_tool_result() -> None:
+    """工具握手超时时收口为不可恢复 run_failed。"""
+
+    executor = _HangingToolExecutor()
+    runner = _ScriptedRunner(
+        scripts=(_tool_script(_tool_call("tc_1")), _final_script("unused"))
+    )
+
+    events = await _collect(
+        _AsyncAgent(
+            request=_request(
+                executor=executor,
+                tool_execution_timeout_seconds=_FAST_TOOL_EXECUTION_TIMEOUT_SECONDS,
+            ),
+            runner=runner,
+        )
+    )
+
+    failed = _failed_data(events)
+    assert failed.error_code == "tool_execution_timeout"
+    assert failed.recoverable is False
+    assert executor.cancelled is True
+    assert len(executor.requests) == 1
+    assert (
+        executor.requests[0].context.timeout_seconds
+        == _FAST_TOOL_EXECUTION_TIMEOUT_SECONDS
+    )
+    assert runner.call_count == 1
+    assert EngineEventType.TOOL_RESULT_ACCEPTED not in {
+        event.type for event in events
+    }
+
+
+@pytest.mark.asyncio
+async def test_tool_execution_timeout_wins_over_cleanup_cancel() -> None:
+    """工具握手超时已判定后，清理阶段 late cancel 不覆盖 run_failed。"""
+
+    token = _Token()
+    executor = _HangingToolExecutor(token_to_cancel_on_cancel=token)
+    runner = _ScriptedRunner(scripts=(_tool_script(_tool_call("tc_1")),))
+
+    events = await _collect(
+        _AsyncAgent(
+            request=_request(
+                token=token,
+                executor=executor,
+                tool_execution_timeout_seconds=_FAST_TOOL_EXECUTION_TIMEOUT_SECONDS,
+            ),
+            runner=runner,
+        )
+    )
+
+    failed = _failed_data(events)
+    assert failed.error_code == "tool_execution_timeout"
+    assert failed.recoverable is False
+    assert executor.cancelled is True
+    assert token.is_cancelled()
+    assert _terminal(events).type is EngineEventType.RUN_FAILED
 
 
 @pytest.mark.asyncio

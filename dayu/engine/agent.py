@@ -95,7 +95,12 @@ from dayu.engine.contracts.runner_events import (
     RunnerUsageRecordedData,
 )
 from dayu.engine.runners.openai.runner import AsyncOpenAIRunner
-from dayu.runtime.cancellation import WaitCancelled, WaitCompleted, await_or_cancel
+from dayu.runtime.cancellation import (
+    WaitCancelled,
+    WaitCompleted,
+    WaitTimedOut,
+    await_or_cancel_or_timeout,
+)
 from dayu.runtime.log_levels import VERBOSE_LOG_LEVEL
 
 _LOGGER: logging.Logger = logging.getLogger(__name__)
@@ -118,6 +123,7 @@ _ERROR_RUNNER_TOOL_CALLS_FINISH_REASON_MISMATCH: str = (
 )
 _ERROR_DUPLICATE_TOOL_CALL_ID: str = "duplicate_tool_call_id"
 _ERROR_TOOL_EXECUTOR_EXCEPTION: str = "tool_executor_exception"
+_ERROR_TOOL_EXECUTION_TIMEOUT: str = "tool_execution_timeout"
 _ERROR_FORCE_ANSWER_EMPTY: str = "force_answer_empty"
 _ERROR_CONSECUTIVE_FAILED_TOOL_BATCHES: str = (
     "consecutive_failed_tool_batches"
@@ -138,6 +144,7 @@ _MAX_ITERATIONS_EXCEEDED_MESSAGE: str = (
 _TOOL_CALL_NOT_ENABLED_MESSAGE: str = (
     "runner produced tool calls while tools were disabled or unavailable"
 )
+_TOOL_EXECUTION_TIMEOUT_MESSAGE: str = "tool execution handshake timed out"
 _MISSING_TERMINAL_MESSAGE: str = "agent event stream ended without terminal"
 _FORCE_ANSWER_EMPTY_MESSAGE: str = (
     "force-answer runner did not produce final content"
@@ -1336,7 +1343,9 @@ class _AsyncAgent:
                     iteration_id=decision.iteration_id,
                     tool_call_id=call.tool_call_id,
                     index_in_iteration=call.index_in_iteration,
-                    timeout_seconds=None,
+                    timeout_seconds=(
+                        self._request.agent_policy.tool_execution_timeout_seconds
+                    ),
                     cancellation_token=self._request.cancellation_token,
                     correlation_id=self._correlation_id(
                         iteration_id=decision.iteration_id,
@@ -1348,6 +1357,15 @@ class _AsyncAgent:
             outcome = await self._execute_one_tool(tool_request)
             if isinstance(outcome, WaitCancelled):
                 yield await self._make_cancelled_terminal_with_close()
+                return
+            if isinstance(outcome, WaitTimedOut):
+                yield self._make_terminal_failed(
+                    RunFailedData(
+                        error_code=_ERROR_TOOL_EXECUTION_TIMEOUT,
+                        message=_TOOL_EXECUTION_TIMEOUT_MESSAGE,
+                        recoverable=False,
+                    )
+                )
                 return
             completed_outcome = outcome.value
 
@@ -1433,18 +1451,22 @@ class _AsyncAgent:
 
     async def _execute_one_tool(
         self, tool_request: ToolExecutionRequest
-    ) -> WaitCompleted[ToolExecutionOutcome] | WaitCancelled:
-        """执行单个工具调用并处理取消与普通异常。
+    ) -> WaitCompleted[ToolExecutionOutcome] | WaitCancelled | WaitTimedOut:
+        """执行单个工具调用并处理取消、握手超时与普通异常。
 
         :param tool_request: 工具执行请求。
-        :returns: ``WaitCompleted`` 包裹的 outcome，或 ``WaitCancelled``。
+        :returns: ``WaitCompleted`` 包裹的 outcome、``WaitCancelled`` 或
+            ``WaitTimedOut``。
         :raises asyncio.CancelledError: 外层 task 被取消时透传。
         """
 
         try:
-            return await await_or_cancel(
+            return await await_or_cancel_or_timeout(
                 self._request.tool_executor.execute(tool_request),
                 token=self._request.cancellation_token,
+                timeout_seconds=(
+                    self._request.agent_policy.tool_execution_timeout_seconds
+                ),
             )
         except asyncio.CancelledError:
             raise
