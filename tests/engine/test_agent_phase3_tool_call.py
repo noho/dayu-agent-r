@@ -493,7 +493,6 @@ def _request(
         run_id="run_phase3",
         session_id="session_phase3",
         messages=(UserMessage(role=AgentMessageRole.USER, content="calculate"),),
-        stream=True,
         disable_tools=disable_tools,
         runner_spec=RunnerSpec(
             provider="openai",

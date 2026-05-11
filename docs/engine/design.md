@@ -111,7 +111,7 @@ OLD Engine 阅读范围：
 - 工具事件：`tool_call_start`、`tool_call_delta`、`tool_call_dispatched`、`tool_call_result`、`tool_calls_batch_ready`、`tool_calls_batch_done`
 - 控制事件：`iteration_start`、`metadata`、`warning`、`error`、`done`、`final_answer`
 
-结论：`done` 表示单次 Runner 回合结束；`final_answer` 是 Agent 对外最终回答真源，只能由 Agent 产出。OLD `StreamEvent(data: Any, metadata: dict[str, Any])` 不能原样作为 NEW 稳定接口迁移。NEW Host 可见边界统一命名为 `EngineEvent`；Runner 内部可以使用 `RunnerEvent` 归一 provider 流，Agent 再补齐 session/run/sequence/terminal 语义并提升为 `EngineEvent`。
+结论：`done` 表示单次 Runner 回合结束；`final_answer` 是 Agent 对外最终回答真源，只能由 Agent 产出。OLD `StreamEvent(data: Any, metadata: dict[str, Any])` 不能原样作为 NEW 稳定接口迁移。NEW Host 可见边界统一命名为 `EngineEvent`；Runner 内部可以使用 `RunnerEvent` 归一 provider 流，Agent 再补齐 session/run/terminal 语义并提升为 `EngineEvent`。
 
 ### 2.4 AsyncAgent
 
@@ -126,7 +126,7 @@ OLD Engine 阅读范围：
 - `trace_identity`
 - `cancellation_token`
 
-`AsyncAgent.run_messages` 接收 `messages/session_id/run_id/disable_tools/stream`，并在运行中原地追加消息历史。
+`AsyncAgent.run_messages` 接收 `messages/session_id/run_id/disable_tools`，并在运行中原地追加消息历史。
 
 `_acquire_run_slot` 明确同一 `AsyncAgent` 实例不支持并发运行。
 
@@ -312,7 +312,7 @@ Engine 位于 Host 下游，提供 Agent、Runner、tool calling 协议等运行
 - `tool_result_accepted` 表示 EngineWorker 替 Host 代持的 ToolExecutor 已返回结果，Engine 已接收并进入后续上下文注入。
 - `tool_awaiting` 表示工具返回长事务等待事实；Host 挂起 run、监控 job，并在终态后恢复 Agent。
 - `run_suspended` 表示 Engine 已因 Host 托管等待停止本次 run，后续恢复由 Host 重新发起。
-- `runner_done` 表示 Runner 单回合完成，只是 EngineEvent 的观测事实，不是 run 终态。
+- `iteration_completed` 表示本轮 Engine iteration 的模型调用边界完成，只是 EngineEvent 的观测事实，不是 run 终态。
 - `final_answer` 表示 Agent 对外最终回答完成。
 - `run_failed` 表示运行失败终态。
 - `run_cancelled` 表示 Host 取消请求已被 Engine 接受并收口为取消终态。取消不是普通 `error`，也不能伪装成工具失败或最终回答。
@@ -454,7 +454,7 @@ class ToolExecutor(Protocol):
 - `index_in_iteration`
 - `timeout_seconds`
 - `cancellation_token`
-- `correlation_id`：可选中性关联 ID；不是 ToolTraceRecorder 依赖。Host ToolRuntime 默认应使用 `session_id`、`run_id`、`iteration_id`、`tool_call_id` 与 EngineEvent sequence 建立关联。
+- `correlation_id`：可选中性关联 ID；不是 ToolTraceRecorder 依赖。Engine 不用它承载 trace、持久化游标或幂等键。
 
 工具结果契约：
 
@@ -478,13 +478,13 @@ Host ToolRegistry / ToolRuntime 职责：
 
 EngineEvent 稳定规则：
 
-- `EngineEvent` 是 Engine -> Host 的唯一观测边界；Host 侧 tool trace、审计、指标、告警、调试采样都订阅同一事件流。
-- 事件必须包含 `event_id`、`sequence`、`occurred_at`、`session_id`、`run_id`、`type`、强类型 `data`。
+- `EngineEvent` 是 Engine 对外事件边界。
+- 事件必须包含 `occurred_at`、`session_id`、`run_id`、`type`、强类型 `data`。
 - iteration 相关事件必须包含 `iteration_id`；tool 相关事件必须包含 `tool_call_id`。
 - terminal event 必须明确：`final_answer`、`run_cancelled`、`run_failed`、`run_suspended`。
-- Runner usage、SSE protocol error、provider request id、raw payload 等可观测事实必须作为强类型事件 data 暴露给 Host。
+- Usage、SSE protocol error、provider request id、raw payload 等可观测事实必须作为强类型事件 data 暴露。
 - `metadata` 只能承载非契约的 debug tag、采样标记或 observer hint；禁止用 `data: Any`、开放 `metadata` 或 typed metadata 承载显式契约语义。若实现保留 metadata，其值类型必须是严格 JSON value union。
-- 事件顺序必须可恢复：同一 run 内 `sequence` 单调递增；Host observer 可依赖 `event_id` 做幂等写入。
+- 事件顺序由 EngineEvent 异步流产出顺序定义；EngineEvent 不提供事件 id、事件序号、持久化游标或幂等写入键。
 - `final_answer` 的 `filtered` 是受过滤完成态的稳定真源。
 
 EngineEvent data 类型草案：
@@ -492,17 +492,17 @@ EngineEvent data 类型草案：
 | Event type | Data 类型 | 必要字段 |
 | --- | --- | --- |
 | `iteration_started` | `IterationStartedData` | `iteration_id`, `iteration_index`, `message_count` |
-| `runner_content_delta` | `ContentDeltaData` | `iteration_id`, `delta` |
-| `runner_reasoning_delta` | `ReasoningDeltaData` | `iteration_id`, `delta` |
-| `runner_content_completed` | `ContentCompleteData` | `iteration_id`, `content`, `reasoning_content`, `finish_reason` |
+| `content_delta` | `ContentDeltaData` | `iteration_id`, `delta` |
+| `reasoning_delta` | `ReasoningDeltaData` | `iteration_id`, `delta` |
+| `content_completed` | `ContentCompleteData` | `iteration_id`, `content`, `reasoning_content`, `finish_reason` |
 | `tool_call_requested` | `ToolCallRequestedData` | `iteration_id`, `tool_call_id`, `name`, `arguments`, `index_in_iteration`, `provider_state` |
 | `tool_result_accepted` | `ToolResultAcceptedData` | `iteration_id`, `tool_call_id`, `name`, `index_in_iteration`, `outcome` |
 | `tool_awaiting` | `ToolAwaitingData` | `iteration_id`, `tool_call_id`, `await_spec` |
-| `context_compaction_requested` | `ContextCompactionRequestedData` | `iteration_id`, `budget_state`, `reason`；后续 Host 上下文治理协作事件草案，当前 Engine 迁移不生产 |
-| `runner_usage_recorded` | `RunnerUsageData` | `iteration_id`, `prompt_tokens`, `completion_tokens`, `total_tokens` |
+| `context_compaction_requested` | `ContextCompactionRequestedData` | `iteration_id`, `budget_state`, `reason`；当前在 provider context overflow 时产出，随后以 recoverable `run_failed(context_compaction_required)` 收口 |
+| `usage_reported` | `UsageReportedData` | `iteration_id`, `prompt_tokens`, `completion_tokens`, `total_tokens` |
 | `provider_protocol_error` | `ProviderProtocolErrorData` | `iteration_id`, `error_code`, `message`, `provider_request_id`, `raw_payload` |
-| `runner_done` | `RunnerDoneData` | `iteration_id`, `finish_reason` |
-| `final_answer` | `FinalAnswerData` | `content`, `filtered`, `finish_reason` |
+| `iteration_completed` | `IterationCompletedData` | `iteration_id`, `finish_reason` |
+| `final_answer` | `FinalAnswerData` | `content`, `filtered`, `degraded`, `finish_reason` |
 | `run_suspended` | `RunSuspendedData` | `reason`, `resume_hint` |
 | `run_cancelled` | `RunCancelledData` | `reason`, `requested_at`, `accepted_at`, `finished_at` |
 | `run_failed` | `RunFailedData` | `error_code`, `message`, `recoverable` |
@@ -518,7 +518,7 @@ EngineEvent data 类型草案：
 RunnerEvent 稳定规则：
 
 - Runner 内部可产出 `RunnerEvent`，用于表达 provider 归一后的 content delta、reasoning delta、tool call delta、usage、runner_done、SSE protocol error 等事实。
-- `RunnerEvent` 不跨 Host 边界；Agent 必须把 RunnerEvent 提升为 EngineEvent，补齐 `session_id`、`run_id`、`iteration_id`、`event_id`、`sequence` 和 terminal 语义。
+- `RunnerEvent` 不跨 Host 边界；Agent 必须把 RunnerEvent 提升为 EngineEvent，补齐 `session_id`、`run_id`、`iteration_id` 和 terminal 语义。
 - Runner 不产出 `final_answer`、`run_cancelled`、`run_failed`、`run_suspended` 等 Host 可见终态事件。
 
 RunnerEvent data 类型草案：
@@ -532,6 +532,7 @@ RunnerEvent data 类型草案：
 | `runner_content_completed` | `RunnerContentCompletedData` | `content`, `reasoning_content`, `finish_reason` |
 | `runner_usage_recorded` | `RunnerUsageRecordedData` | `prompt_tokens`, `completion_tokens`, `total_tokens` |
 | `provider_protocol_error` | `RunnerProtocolErrorData` | `error_code`, `message`, `provider_request_id`, `raw_payload` |
+| `runner_http_error` | `RunnerHTTPErrorData` | `error_code`, `http_status`, `message`, `provider_request_id`, `raw_payload`, `attempt`, `retried` |
 | `runner_done` | `RunnerDoneData` | `finish_reason` |
 
 Host 事件订阅与 Trace 稳定规则：
@@ -667,7 +668,6 @@ Fins tools：
 - `run_id: str`
 - `session_id: str`
 - `messages: list[AgentMessage]`
-- `stream: bool`
 - `disable_tools: bool`
 - `runner_spec: RunnerSpec`
 - `runner_options: RunnerCallOptions`
@@ -916,7 +916,7 @@ Host 接口要求：
   - Engine 不得保留 `Runner.call(**extra_payloads)`、OLD `StreamEvent(data: Any, metadata: dict)` 等弱类型边界。
 - pyright 每步必须无新增或扩散错误。
 - ToolResult、ToolAwaitSpec、EngineEvent、RunnerEvent、ToolExecutionContext、Runner cancellation、Agent loop 状态机必须有专门测试。
-- EngineEvent 必须覆盖强类型 data、sequence 单调性、event_id 幂等、terminal event 唯一性、raw payload 事件载荷语义。
+- EngineEvent 必须覆盖强类型 data、事件类型顺序、terminal event 唯一性、raw payload 事件载荷语义。
 - ToolExecutionOutcome 联合类型需要穷尽匹配测试，确保新增 outcome 不会被吞成普通失败或弱类型 payload。
 - Runner 测试必须证明 Runner 只产出 tool call 事件，不执行工具。
 - Engine 边界测试必须证明 Engine 不导入 Host ToolRegistry、web/doc/fins tools 或 `dayu.fins.storage` 具体实现。

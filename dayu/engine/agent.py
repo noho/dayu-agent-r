@@ -56,15 +56,15 @@ from dayu.engine.contracts.engine_events import (
     EngineEventData,
     EngineEventType,
     FinalAnswerData,
+    IterationCompletedData,
     IterationStartedData,
     ProviderProtocolErrorData,
     ReasoningDeltaData,
     RunCancelledData,
     RunFailedData,
-    RunnerDoneEngineData,
-    RunnerUsageData,
     ToolCallRequestedData,
     ToolResultAcceptedData,
+    UsageReportedData,
 )
 from dayu.engine.contracts.finish_reason import FinishReason
 from dayu.engine.contracts.messages import (
@@ -437,7 +437,6 @@ class _AsyncAgent:
         self._runner: AsyncRunner = runner
         self._active_run_id: str | None = None
         self._run_guard_lock: threading.Lock = threading.Lock()
-        self._next_sequence: int = 0
         self._terminal_seen: bool = False
         self._closed: bool = False
         self._last_iteration_state: _IterationState | None = None
@@ -991,7 +990,7 @@ class _AsyncAgent:
         if isinstance(data, RunnerContentDeltaData):
             state.content_chunks.append(data.delta)
             return self._make_event(
-                event_type=EngineEventType.RUNNER_CONTENT_DELTA,
+                event_type=EngineEventType.CONTENT_DELTA,
                 data=ContentDeltaData(
                     iteration_id=iteration_id, delta=data.delta
                 ),
@@ -1000,7 +999,7 @@ class _AsyncAgent:
         if isinstance(data, RunnerReasoningDeltaData):
             state.reasoning_chunks.append(data.delta)
             return self._make_event(
-                event_type=EngineEventType.RUNNER_REASONING_DELTA,
+                event_type=EngineEventType.REASONING_DELTA,
                 data=ReasoningDeltaData(
                     iteration_id=iteration_id, delta=data.delta
                 ),
@@ -1023,7 +1022,7 @@ class _AsyncAgent:
                 data.reasoning_content is not None,
             )
             return self._make_event(
-                event_type=EngineEventType.RUNNER_CONTENT_COMPLETED,
+                event_type=EngineEventType.CONTENT_COMPLETED,
                 data=ContentCompleteData(
                     iteration_id=iteration_id,
                     content=data.content,
@@ -1046,8 +1045,8 @@ class _AsyncAgent:
                 data.total_tokens,
             )
             return self._make_event(
-                event_type=EngineEventType.RUNNER_USAGE_RECORDED,
-                data=RunnerUsageData(
+                event_type=EngineEventType.USAGE_REPORTED,
+                data=UsageReportedData(
                     iteration_id=iteration_id,
                     prompt_tokens=data.prompt_tokens,
                     completion_tokens=data.completion_tokens,
@@ -1134,8 +1133,8 @@ class _AsyncAgent:
                 data.finish_reason.value,
             )
             return self._make_event(
-                event_type=EngineEventType.RUNNER_DONE,
-                data=RunnerDoneEngineData(
+                event_type=EngineEventType.ITERATION_COMPLETED,
+                data=IterationCompletedData(
                     iteration_id=iteration_id,
                     finish_reason=data.finish_reason,
                 ),
@@ -1752,7 +1751,7 @@ class _AsyncAgent:
         data: EngineEventData,
         occurred_at: datetime,
     ) -> EngineEvent:
-        """构造普通 EngineEvent 并推进 sequence。
+        """构造普通 EngineEvent。
 
         :param event_type: Engine 事件类型。
         :param data: Engine 事件 data。
@@ -1761,11 +1760,7 @@ class _AsyncAgent:
         :raises Exception: 不主动抛出异常。
         """
 
-        sequence = self._next_sequence
-        self._next_sequence += 1
         return EngineEvent(
-            event_id=f"{self._request.run_id}:{sequence}",
-            sequence=sequence,
             occurred_at=occurred_at,
             session_id=self._request.session_id,
             run_id=self._request.run_id,

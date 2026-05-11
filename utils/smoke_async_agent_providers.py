@@ -270,7 +270,6 @@ def build_request(
         messages=(
             UserMessage(role=AgentMessageRole.USER, content=_PROMPT),
         ),
-        stream=stream,
         disable_tools=True,
         runner_spec=spec,
         runner_options=RunnerCallOptions(
@@ -331,17 +330,17 @@ def safe_event_summary(event: EngineEvent) -> str:
     """
 
     data = event.data
-    if event.type is EngineEventType.RUNNER_CONTENT_DELTA:
-        return f"{_EVENT_PREFIX} {event.type.value} sequence={event.sequence}"
+    if event.type is EngineEventType.CONTENT_DELTA:
+        return f"{_EVENT_PREFIX} {event.type.value}"
     if event.type is EngineEventType.FINAL_ANSWER and isinstance(
         data, FinalAnswerData
     ):
         return (
-            f"{_EVENT_PREFIX} {event.type.value} sequence={event.sequence} "
+            f"{_EVENT_PREFIX} {event.type.value} "
             f"content_len={len(data.content)} filtered={data.filtered} "
             f"content={data.content!r}"
         )
-    return f"{_EVENT_PREFIX} {event.type.value} sequence={event.sequence}"
+    return f"{_EVENT_PREFIX} {event.type.value}"
 
 
 async def run_case(

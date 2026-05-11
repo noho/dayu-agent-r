@@ -1,11 +1,11 @@
 """Engine 事件契约。
 
-:class:`EngineEvent` 是 Engine 对 Host / Service 暴露的**唯一**事件流。
+:class:`EngineEvent` 是 Engine 对调用方暴露的事件流。
 Agent 在内部把 :class:`RunnerEvent` 提升为 :class:`EngineEvent`，并补齐
-``session_id`` / ``run_id`` / ``sequence`` / ``event_id`` 等治理性字段。
+``session_id`` / ``run_id`` 等调用方关联字段。
 
 本模块同时提供 :data:`TERMINAL_ENGINE_EVENT_TYPES` 常量集合，列出会
-导致 Engine run 终止的事件类型，供 Host 治理层使用。
+导致 Engine run 终止的事件类型，供调用方识别终态。
 """
 
 from __future__ import annotations
@@ -32,16 +32,16 @@ class EngineEventType(StrEnum):
     """Engine 事件类型枚举。"""
 
     ITERATION_STARTED = "iteration_started"
-    RUNNER_CONTENT_DELTA = "runner_content_delta"
-    RUNNER_REASONING_DELTA = "runner_reasoning_delta"
-    RUNNER_CONTENT_COMPLETED = "runner_content_completed"
+    CONTENT_DELTA = "content_delta"
+    REASONING_DELTA = "reasoning_delta"
+    CONTENT_COMPLETED = "content_completed"
     TOOL_CALL_REQUESTED = "tool_call_requested"
     TOOL_RESULT_ACCEPTED = "tool_result_accepted"
     TOOL_AWAITING = "tool_awaiting"
     CONTEXT_COMPACTION_REQUESTED = "context_compaction_requested"
-    RUNNER_USAGE_RECORDED = "runner_usage_recorded"
+    USAGE_REPORTED = "usage_reported"
     PROVIDER_PROTOCOL_ERROR = "provider_protocol_error"
-    RUNNER_DONE = "runner_done"
+    ITERATION_COMPLETED = "iteration_completed"
     FINAL_ANSWER = "final_answer"
     RUN_SUSPENDED = "run_suspended"
     RUN_CANCELLED = "run_cancelled"
@@ -170,8 +170,8 @@ class ContextCompactionRequestedData:
 
 
 @dataclass(frozen=True, slots=True)
-class RunnerUsageData:
-    """Runner 用量提升事件 data。
+class UsageReportedData:
+    """用量上报事件 data。
 
     :param iteration_id: 当前迭代 id。
     :param prompt_tokens: 提示 token 数。
@@ -208,11 +208,8 @@ class ProviderProtocolErrorData:
 
 
 @dataclass(frozen=True, slots=True)
-class RunnerDoneEngineData:
-    """Runner 事件流结束在 Engine 侧的提升 data。
-
-    与 :class:`dayu.engine.contracts.runner_events.RunnerDoneData` 是
-    **不同**的 dataclass，命名上故意区分以避免包根白名单冲突。
+class IterationCompletedData:
+    """单次 Engine 迭代完成事件 data。
 
     :param iteration_id: 当前迭代 id。
     :param finish_reason: 完成原因。
@@ -289,9 +286,9 @@ EngineEventData: TypeAlias = (
     | ToolResultAcceptedData
     | ToolAwaitingData
     | ContextCompactionRequestedData
-    | RunnerUsageData
+    | UsageReportedData
     | ProviderProtocolErrorData
-    | RunnerDoneEngineData
+    | IterationCompletedData
     | FinalAnswerData
     | RunSuspendedData
     | RunCancelledData
@@ -304,8 +301,6 @@ EngineEventData: TypeAlias = (
 class EngineEvent:
     """Engine 公共事件。
 
-    :param event_id: 事件唯一 id（由 Agent 生成）。
-    :param sequence: 事件序号（在同一 run 内单调递增）。
     :param occurred_at: 事件发生时间。
     :param session_id: 会话 id。
     :param run_id: 运行 id。
@@ -316,8 +311,6 @@ class EngineEvent:
         无元数据。
     """
 
-    event_id: str
-    sequence: int
     occurred_at: datetime
     session_id: str
     run_id: str
@@ -347,10 +340,10 @@ __all__ = [
     "ToolResultAcceptedData",
     "ToolAwaitingData",
     "ContextCompactionRequestedData",
-    "RunnerUsageData",
+    "UsageReportedData",
     "ProviderProtocolErrorData",
     "PartialToolCallSummary",
-    "RunnerDoneEngineData",
+    "IterationCompletedData",
     "FinalAnswerData",
     "RunSuspendedData",
     "RunCancelledData",

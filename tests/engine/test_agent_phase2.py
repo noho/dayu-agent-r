@@ -259,7 +259,6 @@ def _request(
         messages=(
             UserMessage(role=AgentMessageRole.USER, content="hello"),
         ),
-        stream=True,
         disable_tools=True,
         runner_spec=RunnerSpec(
             provider="openai",
@@ -371,21 +370,21 @@ async def test_success_run_lifts_runner_events_and_agent_final() -> None:
     )
     events = await _collect(_AsyncAgent(request=_request(), runner=runner))
 
-    assert [event.sequence for event in events] == list(range(len(events)))
-    assert len({event.event_id for event in events}) == len(events)
     assert [event.type for event in events] == [
         EngineEventType.ITERATION_STARTED,
-        EngineEventType.RUNNER_CONTENT_DELTA,
-        EngineEventType.RUNNER_REASONING_DELTA,
-        EngineEventType.RUNNER_USAGE_RECORDED,
-        EngineEventType.RUNNER_CONTENT_COMPLETED,
-        EngineEventType.RUNNER_DONE,
+        EngineEventType.CONTENT_DELTA,
+        EngineEventType.REASONING_DELTA,
+        EngineEventType.USAGE_REPORTED,
+        EngineEventType.CONTENT_COMPLETED,
+        EngineEventType.ITERATION_COMPLETED,
         EngineEventType.FINAL_ANSWER,
     ]
     final = _final_event(events)
     assert isinstance(final.data, FinalAnswerData)
     assert final.data.content == "你好"
     assert final.data.degraded is False
+    assert {event.session_id for event in events} == {"session_phase2"}
+    assert {event.run_id for event in events} == {"run_phase2"}
     assert runner.close_count == 1
     _assert_single_terminal_at_end(events)
 
@@ -457,7 +456,7 @@ async def test_protocol_error_and_error_done_maps_to_run_failed() -> None:
     )
     events = await _collect(_AsyncAgent(request=_request(), runner=runner))
 
-    assert events[-2].type is EngineEventType.RUNNER_DONE
+    assert events[-2].type is EngineEventType.ITERATION_COMPLETED
     terminal = _final_event(events)
     assert terminal.type is EngineEventType.RUN_FAILED
     assert isinstance(terminal.data, RunFailedData)
@@ -467,7 +466,7 @@ async def test_protocol_error_and_error_done_maps_to_run_failed() -> None:
 
 @pytest.mark.asyncio
 async def test_http_error_maps_to_run_failed_without_extra_engine_event() -> None:
-    """HTTP error 记录失败候选，经 runner_done 收口 run_failed。"""
+    """HTTP error 记录失败候选，经迭代完成事件收口 run_failed。"""
 
     runner = _ScriptedRunner(
         events=(
@@ -493,7 +492,7 @@ async def test_http_error_maps_to_run_failed_without_extra_engine_event() -> Non
 
     assert [event.type for event in events] == [
         EngineEventType.ITERATION_STARTED,
-        EngineEventType.RUNNER_DONE,
+        EngineEventType.ITERATION_COMPLETED,
         EngineEventType.RUN_FAILED,
     ]
     assert isinstance(events[-1].data, RunFailedData)
@@ -529,7 +528,7 @@ async def test_context_overflow_http_error_maps_to_compaction_required_fact() ->
     assert [event.type for event in events] == [
         EngineEventType.ITERATION_STARTED,
         EngineEventType.CONTEXT_COMPACTION_REQUESTED,
-        EngineEventType.RUNNER_DONE,
+        EngineEventType.ITERATION_COMPLETED,
         EngineEventType.RUN_FAILED,
     ]
     compact_event = events[1]
@@ -877,7 +876,7 @@ async def test_private_agent_concurrent_run_fail_fast() -> None:
         """
 
         async for event in agent.run_messages():
-            if event.type is EngineEventType.RUNNER_CONTENT_DELTA:
+            if event.type is EngineEventType.CONTENT_DELTA:
                 first_event_seen.set()
 
     task = asyncio.create_task(consume_first_run())
@@ -917,7 +916,7 @@ async def test_outer_asyncio_cancelled_error_propagates_and_closes() -> None:
         """
 
         async for event in agent.run_messages():
-            if event.type is EngineEventType.RUNNER_CONTENT_DELTA:
+            if event.type is EngineEventType.CONTENT_DELTA:
                 first_event_seen.set()
 
     task = asyncio.create_task(consume_until_cancelled())
@@ -1002,8 +1001,6 @@ async def test_run_agent_and_wait_rejects_unexpected_suspended(
         """
 
         yield EngineEvent(
-            event_id="run_phase2:0",
-            sequence=0,
             occurred_at=_utc_now(),
             session_id=request.session_id,
             run_id=request.run_id,

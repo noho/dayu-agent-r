@@ -81,8 +81,8 @@
 - 各 README 固定职责：
   - 根目录 `README.md`：用户手册，只写安装、配置、跑通、常用工作流、CLI 命令、trace/render 入口、文档导航。
   - `dayu/README.md`：开发手册总览，只写整体架构、设计意图、稳定边界、扩展入口、代码阅读顺序。
-  - `dayu/engine/README.md`：Engine 开发手册，只写接口、架构、边界、执行路径、状态机、事件流、关键机制、公共契约、扩展点。
-  - `dayu/host/README.md`：Host 开发手册，只写接口、架构、边界、执行路径、状态机、事件流、关键机制、公共契约、扩展点。
+  - `dayu/engine/README.md`：Engine 开发手册，只写接口、公共契约、架构、边界、执行路径、状态机、事件流、关键机制、扩展点。
+  - `dayu/host/README.md`：Host 开发手册，只写接口、公共契约、架构、边界、执行路径、状态机、事件流、关键机制、扩展点。
   - `dayu/fins/README.md`：Fins 开发手册，只写 capability 定位、两条执行路径、对外接口、内部分层与机制。
   - `dayu/config/README.md`：配置说明手册，只写默认配置、`workspace/config` 覆盖关系、常改项、最小示例、prompts 目录职责。
   - `tests/README.md`：测试手册，只写测试分层、运行方式、约定与维护规则。

@@ -2,7 +2,7 @@
 
 - 验证 :class:`RunnerEventType` 枚举值与 RunnerEvent data dataclass 一一对应。
 - 验证 :class:`RunnerEvent` 字段集合精确符合契约（不含 ``session_id`` /
-  ``run_id`` / ``sequence`` / ``event_id``）。
+  ``run_id``）。
 """
 
 from __future__ import annotations
@@ -53,11 +53,11 @@ def test_runner_event_data_dataclasses_distinct() -> None:
 def test_runner_event_field_set() -> None:
     """:class:`RunnerEvent` 字段集合必须精确等于契约。
 
-    并且**不**包含 ``session_id`` / ``run_id`` / ``sequence`` / ``event_id``——
-    这些字段必须由 Agent 在提升为 :class:`EngineEvent` 时补齐。
+    并且**不**包含 ``session_id`` / ``run_id``，这些字段必须由 Agent 在
+    提升为 :class:`EngineEvent` 时补齐。
     """
 
     fields = {f.name for f in dataclasses.fields(RunnerEvent)}
     assert fields == {"type", "data", "occurred_at"}
-    forbidden = {"session_id", "run_id", "sequence", "event_id"}
+    forbidden = {"session_id", "run_id"}
     assert fields.isdisjoint(forbidden)

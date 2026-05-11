@@ -3,8 +3,7 @@
 :class:`RunnerEvent` 是 :class:`AsyncRunner.call` 产出的最小事件单元。
 Runner 只承担「LLM 协议归一」职责：把 OpenAI / Anthropic / Gemini /
 Qwen 等具体协议归一为本事件流，**不**执行工具、**不**拆分迭代、**不**
-为事件补 ``session_id`` / ``run_id`` / ``sequence`` / ``event_id``——这些
-由 Agent 在 :class:`EngineEvent` 提升时补齐。
+为事件补 ``session_id`` / ``run_id`` 等调用方关联字段。
 """
 
 from __future__ import annotations
@@ -225,8 +224,8 @@ class RunnerEvent:
     :param data: 事件 data 联合的某个具体成员。
     :param occurred_at: 事件发生时间。
 
-    本事件**不**含 ``session_id`` / ``run_id`` / ``sequence`` / ``event_id``。
-    Agent 在 :class:`EngineEvent` 提升阶段补齐这些字段。
+    本事件**不**含 ``session_id`` / ``run_id``，Agent 在
+    :class:`EngineEvent` 提升阶段补齐这些字段。
     """
 
     type: RunnerEventType

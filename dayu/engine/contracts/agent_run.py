@@ -62,7 +62,6 @@ class AgentRunRequest:
     :param run_id: 运行 id。
     :param session_id: 会话 id。
     :param messages: 进入本次 run 的消息元组。
-    :param stream: 是否启用流式提升。
     :param disable_tools: 是否禁用工具调用。
     :param runner_spec: Runner 规约。
     :param runner_options: Runner 调用参数。
@@ -77,7 +76,6 @@ class AgentRunRequest:
     run_id: str
     session_id: str
     messages: tuple[AgentMessage, ...]
-    stream: bool
     disable_tools: bool
     runner_spec: RunnerSpec
     runner_options: RunnerCallOptions

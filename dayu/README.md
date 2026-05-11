@@ -4,6 +4,10 @@
 
 本文档不写过程状态，只保留稳定说明。
 
+## 设计目标
+
+- 宿主强约束下的 LLM in the loop。
+
 ## 整体架构
 
 Dayu 的整体架构是：
@@ -71,7 +75,6 @@ Dayu 的日志用于诊断系统执行过程，不承担 UI 输出职责。面�
 
 - `run_id`：一次 Engine run 标识。
 - `iteration_id` / `iteration_index`：Engine 内一次模型调用与后续决策循环。
-- `event_id` / `sequence`：EngineEvent 或 RunnerEvent 的事件标识与顺序。
 - `provider` / `request_id`：Runner / provider 传输诊断标识。
 
 ## Contract Ownership

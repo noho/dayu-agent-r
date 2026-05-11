@@ -67,8 +67,6 @@ def test_build_request_uses_env_key_without_printing_it() -> None:
         timeout_seconds=30.0,
     )
     event = EngineEvent(
-        event_id="run:0",
-        sequence=0,
         occurred_at=datetime.now(tz=timezone.utc),
         session_id=request.session_id,
         run_id=request.run_id,
