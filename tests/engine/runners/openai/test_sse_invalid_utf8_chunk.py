@@ -29,7 +29,7 @@ async def test_invalid_utf8_emits_protocol_error_then_done_error() -> None:
         b'data: {"choices":[{"finish_reason":"stop","delta":{}}]}\n\n',
         b"data: [DONE]\n\n",
     ]
-    events = await parse_sse(chunks)
+    events = await parse_sse(chunks, provider_request_id="req_utf8")
     types = [e.type for e in events]
     assert types == [
         RunnerEventType.PROVIDER_PROTOCOL_ERROR,
@@ -38,6 +38,8 @@ async def test_invalid_utf8_emits_protocol_error_then_done_error() -> None:
     err = events[0].data
     assert isinstance(err, RunnerProtocolErrorData)
     assert err.error_code == "invalid_utf8"
+    assert err.provider_request_id == "req_utf8"
     done = events[1].data
     assert isinstance(done, RunnerDoneData)
     assert done.finish_reason is FinishReason.ERROR
+    assert done.provider_request_id == "req_utf8"

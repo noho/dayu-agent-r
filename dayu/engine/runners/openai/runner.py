@@ -22,13 +22,15 @@ import asyncio
 import json
 import logging
 import time
-from collections.abc import AsyncIterator, Awaitable, Sequence
+from collections.abc import AsyncIterator, Awaitable, Iterable, Sequence
+from dataclasses import dataclass
 from datetime import datetime, timezone
 from typing import TypeVar
 
 import aiohttp
 
 from dayu.contracts.cancellation import CancellationToken
+from dayu.contracts.json_value import JsonValue
 from dayu.contracts.tool_schema import ToolSchema
 from dayu.engine.contracts.finish_reason import FinishReason
 from dayu.engine.contracts.messages import AgentMessage
@@ -72,8 +74,56 @@ from dayu.runtime.cancellation import (
 _LOGGER: logging.Logger = logging.getLogger(__name__)
 
 _SSE_CONTENT_TYPE_FRAGMENT: str = "text/event-stream"
+_JSON_CONTENT_TYPE_FRAGMENT: str = "json"
+_PROVIDER_REQUEST_ID_HEADER_NAMES: tuple[str, ...] = ("x-request-id",)
 
 _AwaitableResult = TypeVar("_AwaitableResult")
+
+
+@dataclass(frozen=True, slots=True)
+class _HTTPErrorBody:
+    """HTTP 错误响应体读取结果。
+
+    :param message_text: 尽力读取到的人类可读 body 文本。
+    :param raw_payload: 当 body 是 JSON object 时保留的原始载荷。
+    """
+
+    message_text: str
+    raw_payload: JsonValue | None
+
+
+def _extract_provider_request_id(headers: Iterable[tuple[str, str]]) -> str | None:
+    """从 provider response headers 提取 request id。
+
+    :param headers: response header 键值序列。
+    :returns: ``x-request-id`` 去除首尾空白后的值；缺失或空白时返回
+        ``None``。
+    :raises Exception: 不主动抛出异常。
+    """
+
+    wanted = frozenset(_PROVIDER_REQUEST_ID_HEADER_NAMES)
+    for name, value in headers:
+        if name.lower() in wanted:
+            stripped = value.strip()
+            if stripped:
+                return stripped
+    return None
+
+
+def _is_sse_response(*, content_type: str, stream: bool) -> bool:
+    """判断 HTTP 200 response 是否应按 SSE 解析。
+
+    :param content_type: 小写后的 ``Content-Type``。
+    :param stream: 本次 effective options 是否请求流式。
+    :returns: 应按 SSE parser 尝试时返回 ``True``。
+    :raises Exception: 不主动抛出异常。
+    """
+
+    if not stream:
+        return False
+    if _SSE_CONTENT_TYPE_FRAGMENT in content_type:
+        return True
+    return _JSON_CONTENT_TYPE_FRAGMENT not in content_type
 
 
 async def await_or_cancel(
@@ -112,6 +162,8 @@ class _AttemptFailedRetriable(Exception):
     :param error_code: 中性错误码。
     :param http_status: HTTP 状态码；网络层错误为 ``None``。
     :param message_text: 人类可读消息。
+    :param provider_request_id: provider response request id。
+    :param raw_payload: provider JSON object 错误载荷。
     :param retry_after_seconds: 解析后的 ``Retry-After`` 秒数。
     """
 
@@ -121,12 +173,16 @@ class _AttemptFailedRetriable(Exception):
         error_code: RunnerHTTPErrorCode,
         http_status: int | None,
         message_text: str,
+        provider_request_id: str | None,
+        raw_payload: JsonValue | None,
         retry_after_seconds: float | None,
     ) -> None:
         super().__init__(message_text)
         self.error_code: RunnerHTTPErrorCode = error_code
         self.http_status: int | None = http_status
         self.message_text: str = message_text
+        self.provider_request_id: str | None = provider_request_id
+        self.raw_payload: JsonValue | None = raw_payload
         self.retry_after_seconds: float | None = retry_after_seconds
 
 
@@ -139,11 +195,15 @@ class _AttemptFailedTerminal(Exception):
         error_code: RunnerHTTPErrorCode,
         http_status: int | None,
         message_text: str,
+        provider_request_id: str | None,
+        raw_payload: JsonValue | None,
     ) -> None:
         super().__init__(message_text)
         self.error_code: RunnerHTTPErrorCode = error_code
         self.http_status: int | None = http_status
         self.message_text: str = message_text
+        self.provider_request_id: str | None = provider_request_id
+        self.raw_payload: JsonValue | None = raw_payload
 
 
 class AsyncOpenAIRunner:
@@ -207,8 +267,12 @@ class AsyncOpenAIRunner:
     ) -> AsyncIterator[RunnerEvent]:
         """``call`` 的真实异步生成器实现。"""
 
+        effective_options = self._effective_options(options)
         payload = build_request_payload(
-            messages=messages, options=options, tools=tools, spec=self._spec
+            messages=messages,
+            options=effective_options,
+            tools=tools,
+            spec=self._spec,
         )
         attempt = 0
         try:
@@ -220,29 +284,38 @@ class AsyncOpenAIRunner:
                     self._spec.provider,
                     self._spec.model,
                     attempt,
-                    options.stream,
+                    effective_options.stream,
                 )
                 try:
-                    async for event in self._do_attempt(payload, options):
+                    async for event in self._do_attempt(
+                        payload, effective_options
+                    ):
                         yield event
                     return
                 except _AttemptFailedTerminal as failure:
                     _LOGGER.warning(
                         "runner.attempt.terminal provider=%s model=%s "
-                        "attempt=%d error_code=%s http_status=%s",
+                        "attempt=%d error_code=%s http_status=%s "
+                        "provider_request_id=%s",
                         self._spec.provider,
                         self._spec.model,
                         attempt,
                         failure.error_code.value,
                         failure.http_status,
+                        failure.provider_request_id,
                     )
                     yield self._make_http_error_event(
                         error_code=failure.error_code,
                         http_status=failure.http_status,
                         message_text=failure.message_text,
+                        provider_request_id=failure.provider_request_id,
+                        raw_payload=failure.raw_payload,
                         attempt=attempt,
                     )
-                    yield self._make_done_event(FinishReason.ERROR)
+                    yield self._make_done_event(
+                        FinishReason.ERROR,
+                        provider_request_id=failure.provider_request_id,
+                    )
                     return
                 except _AttemptFailedRetriable as failure:
                     decision = compute_retry_decision(
@@ -254,20 +327,27 @@ class AsyncOpenAIRunner:
                     if not decision.should_retry:
                         _LOGGER.warning(
                             "runner.attempt.exhausted provider=%s model=%s "
-                            "attempt=%d error_code=%s http_status=%s",
+                            "attempt=%d error_code=%s http_status=%s "
+                            "provider_request_id=%s",
                             self._spec.provider,
                             self._spec.model,
                             attempt,
                             failure.error_code.value,
                             failure.http_status,
+                            failure.provider_request_id,
                         )
                         yield self._make_http_error_event(
                             error_code=failure.error_code,
                             http_status=failure.http_status,
                             message_text=failure.message_text,
+                            provider_request_id=failure.provider_request_id,
+                            raw_payload=failure.raw_payload,
                             attempt=attempt,
                         )
-                        yield self._make_done_event(FinishReason.ERROR)
+                        yield self._make_done_event(
+                            FinishReason.ERROR,
+                            provider_request_id=failure.provider_request_id,
+                        )
                         return
                     _LOGGER.info(
                         "runner.attempt.retry provider=%s model=%s "
@@ -291,6 +371,24 @@ class AsyncOpenAIRunner:
                 attempt,
             )
             return
+
+    def _effective_options(self, options: RunnerCallOptions) -> RunnerCallOptions:
+        """根据 Runner capability 计算本次实际调用选项。
+
+        :param options: 调用方传入的 Runner 调用选项。
+        :returns: 若当前 Runner 不支持流式且调用方请求流式，则返回
+            ``stream=False`` 的新选项；否则返回原选项。
+        :raises Exception: 不主动抛出异常。
+        """
+
+        if not options.stream or self._spec.supports_streaming:
+            return options
+        return RunnerCallOptions(
+            temperature=options.temperature,
+            max_tokens=options.max_tokens,
+            top_p=options.top_p,
+            stream=False,
+        )
 
     async def _do_attempt(
         self,
@@ -334,43 +432,56 @@ class AsyncOpenAIRunner:
                 error_code=classify_exception(exc),
                 http_status=None,
                 message_text=str(exc) or type(exc).__name__,
+                provider_request_id=None,
+                raw_payload=None,
                 retry_after_seconds=None,
             ) from exc
         try:
+            provider_request_id = _extract_provider_request_id(
+                response.headers.items()
+            )
             _LOGGER.debug(
-                "runner.http.response status=%d content_type=%s",
+                "runner.http.response status=%d content_type=%s "
+                "provider_request_id=%s",
                 response.status,
                 response.headers.get("Content-Type") or "",
+                provider_request_id,
             )
             if response.status != 200:
                 error_code = classify_http_status(response.status)
                 retry_after = parse_retry_after(
                     response.headers.get("Retry-After")
                 )
-                body_preview = await self._safe_read_text(response)
+                error_body = await self._safe_read_error_body(response)
                 if detect_context_overflow(
                     http_status=response.status,
-                    response_text=body_preview,
+                    response_text=error_body.message_text,
                 ):
                     raise _AttemptFailedTerminal(
                         error_code=RunnerHTTPErrorCode.CONTEXT_LENGTH_EXCEEDED,
                         http_status=response.status,
-                        message_text=body_preview
+                        message_text=error_body.message_text
                         or f"HTTP {response.status}",
+                        provider_request_id=provider_request_id,
+                        raw_payload=error_body.raw_payload,
                     )
                 if is_retriable(error_code):
                     raise _AttemptFailedRetriable(
                         error_code=error_code,
                         http_status=response.status,
-                        message_text=body_preview
+                        message_text=error_body.message_text
                         or f"HTTP {response.status}",
+                        provider_request_id=provider_request_id,
+                        raw_payload=error_body.raw_payload,
                         retry_after_seconds=retry_after,
                     )
                 raise _AttemptFailedTerminal(
                     error_code=error_code,
                     http_status=response.status,
-                    message_text=body_preview
+                    message_text=error_body.message_text
                     or f"HTTP {response.status}",
+                    provider_request_id=provider_request_id,
+                    raw_payload=error_body.raw_payload,
                 )
             content_type = (
                 response.headers.get("Content-Type") or ""
@@ -378,23 +489,35 @@ class AsyncOpenAIRunner:
             hook = detect_reasoning_protocol_hook(
                 self._spec.provider_request
             )
-            if options.stream and _SSE_CONTENT_TYPE_FRAGMENT in content_type:
-                parser = SSEParser(hook=hook)
+            if _is_sse_response(
+                content_type=content_type, stream=options.stream
+            ):
+                parser = SSEParser(
+                    hook=hook, provider_request_id=provider_request_id
+                )
                 async for event in parser.parse(
-                    self._iter_response_bytes(response)
+                    self._iter_response_bytes(
+                        response,
+                        provider_request_id=provider_request_id,
+                    )
                 ):
                     yield event
             else:
                 body = await await_or_cancel(
                     response.read(), token=self._token
                 )
-                for event in parse_non_stream_response(body, hook=hook):
+                for event in parse_non_stream_response(
+                    body, hook=hook, provider_request_id=provider_request_id
+                ):
                     yield event
         finally:
             response.release()
 
     async def _iter_response_bytes(
-        self, response: aiohttp.ClientResponse
+        self,
+        response: aiohttp.ClientResponse,
+        *,
+        provider_request_id: str | None,
     ) -> AsyncIterator[bytes]:
         """把响应 body 包装为带取消观察的字节迭代器。
 
@@ -403,6 +526,7 @@ class AsyncOpenAIRunner:
         :meth:`_iter_response_bytes_with_idle`。
 
         :param response: aiohttp 响应。
+        :param provider_request_id: 当前 response header 提供的 request id。
         :returns: 字节迭代器。
 
         :raises _AttemptFailedRetriable: 网络读取失败时。
@@ -410,18 +534,26 @@ class AsyncOpenAIRunner:
         """
 
         if self._spec.stream_idle_timeout_seconds is None:
-            async for chunk in self._iter_response_bytes_no_idle(response):
+            async for chunk in self._iter_response_bytes_no_idle(
+                response, provider_request_id=provider_request_id
+            ):
                 yield chunk
             return
-        async for chunk in self._iter_response_bytes_with_idle(response):
+        async for chunk in self._iter_response_bytes_with_idle(
+            response, provider_request_id=provider_request_id
+        ):
             yield chunk
 
     async def _iter_response_bytes_no_idle(
-        self, response: aiohttp.ClientResponse
+        self,
+        response: aiohttp.ClientResponse,
+        *,
+        provider_request_id: str | None,
     ) -> AsyncIterator[bytes]:
         """无空闲检测的字节迭代器。
 
         :param response: aiohttp 响应。
+        :param provider_request_id: 当前 response header 提供的 request id。
         :returns: 字节迭代器。
 
         :raises _AttemptFailedRetriable: 网络读取失败时。
@@ -438,6 +570,8 @@ class AsyncOpenAIRunner:
                     error_code=classify_exception(exc),
                     http_status=None,
                     message_text=str(exc) or type(exc).__name__,
+                    provider_request_id=provider_request_id,
+                    raw_payload=None,
                     retry_after_seconds=None,
                 ) from exc
             if not chunk:
@@ -445,7 +579,10 @@ class AsyncOpenAIRunner:
             yield chunk
 
     async def _iter_response_bytes_with_idle(
-        self, response: aiohttp.ClientResponse
+        self,
+        response: aiohttp.ClientResponse,
+        *,
+        provider_request_id: str | None,
     ) -> AsyncIterator[bytes]:
         """带空闲心跳 / timeout 的字节迭代器。
 
@@ -462,6 +599,7 @@ class AsyncOpenAIRunner:
         - cancellation：透传 :class:`_RunnerInterrupted`。
 
         :param response: aiohttp 响应。
+        :param provider_request_id: 当前 response header 提供的 request id。
         :returns: 字节迭代器。
 
         :raises _AttemptFailedRetriable: 网络读取失败 / idle timeout。
@@ -499,6 +637,8 @@ class AsyncOpenAIRunner:
                                     "stream idle timeout: no bytes "
                                     f"received in {timeout_seconds:.3f}s"
                                 ),
+                                provider_request_id=provider_request_id,
+                                raw_payload=None,
                                 retry_after_seconds=None,
                             )
                         if (
@@ -538,6 +678,8 @@ class AsyncOpenAIRunner:
                         error_code=classify_exception(exc),
                         http_status=None,
                         message_text=str(exc) or type(exc).__name__,
+                        provider_request_id=provider_request_id,
+                        raw_payload=None,
                         retry_after_seconds=None,
                     ) from exc
             finally:
@@ -564,17 +706,32 @@ class AsyncOpenAIRunner:
         except (asyncio.CancelledError, Exception):  # noqa: BLE001
             pass
 
-    async def _safe_read_text(
+    async def _safe_read_error_body(
         self, response: aiohttp.ClientResponse
-    ) -> str:
-        """尽力读取错误响应的文本，失败时返回空串。"""
+    ) -> _HTTPErrorBody:
+        """尽力读取错误响应 body，并保留 JSON object 载荷。
+
+        :param response: HTTP 错误响应。
+        :returns: body 文本与可选 JSON object 载荷。
+        :raises Exception: 不主动抛出异常。
+        """
 
         try:
-            return await await_or_cancel(
+            message_text = await await_or_cancel(
                 response.text(), token=self._token
             )
         except (aiohttp.ClientError, asyncio.TimeoutError, UnicodeDecodeError):
-            return ""
+            return _HTTPErrorBody(message_text="", raw_payload=None)
+        try:
+            decoded: JsonValue = json.loads(message_text)
+        except json.JSONDecodeError:
+            return _HTTPErrorBody(message_text=message_text, raw_payload=None)
+        if isinstance(decoded, dict):
+            return _HTTPErrorBody(
+                message_text=message_text,
+                raw_payload=decoded,
+            )
+        return _HTTPErrorBody(message_text=message_text, raw_payload=None)
 
     def _make_http_error_event(
         self,
@@ -582,6 +739,8 @@ class AsyncOpenAIRunner:
         error_code: RunnerHTTPErrorCode,
         http_status: int | None,
         message_text: str,
+        provider_request_id: str | None,
+        raw_payload: JsonValue | None,
         attempt: int,
     ) -> RunnerEvent:
         """构造 HTTP 错误事件。"""
@@ -590,8 +749,8 @@ class AsyncOpenAIRunner:
             error_code=error_code,
             http_status=http_status,
             message=message_text,
-            provider_request_id=None,
-            raw_payload=None,
+            provider_request_id=provider_request_id,
+            raw_payload=raw_payload,
             attempt=attempt,
             retried=attempt > 1,
         )
@@ -601,12 +760,27 @@ class AsyncOpenAIRunner:
             occurred_at=datetime.now(tz=timezone.utc),
         )
 
-    def _make_done_event(self, finish_reason: FinishReason) -> RunnerEvent:
-        """构造 Done 事件。"""
+    def _make_done_event(
+        self,
+        finish_reason: FinishReason,
+        *,
+        provider_request_id: str | None,
+    ) -> RunnerEvent:
+        """构造 Done 事件。
+
+        :param finish_reason: 完成原因。
+        :param provider_request_id: 本次 Runner 调用最终采用的 provider
+            response request id。
+        :returns: Runner done event。
+        :raises Exception: 不主动抛出异常。
+        """
 
         return RunnerEvent(
             type=RunnerEventType.RUNNER_DONE,
-            data=RunnerDoneData(finish_reason=finish_reason),
+            data=RunnerDoneData(
+                finish_reason=finish_reason,
+                provider_request_id=provider_request_id,
+            ),
             occurred_at=datetime.now(tz=timezone.utc),
         )
 

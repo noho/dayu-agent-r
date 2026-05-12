@@ -77,6 +77,13 @@ def test_runner_http_error_data_construction() -> None:
     assert data.http_status == 429
 
 
+def test_runner_done_data_field_set() -> None:
+    """RunnerDoneData 必须携带 provider request id 字段。"""
+
+    fields = {f.name for f in dataclasses.fields(RunnerDoneData)}
+    assert fields == {"finish_reason", "provider_request_id"}
+
+
 def test_runner_event_type_includes_runner_http_error() -> None:
     """枚举包含 ``RUNNER_HTTP_ERROR`` 成员。"""
 
@@ -144,5 +151,9 @@ def test_runner_event_with_http_error_data_construction() -> None:
 def test_runner_done_finish_reason_error_is_legal() -> None:
     """HTTP 错误最终以 ``RunnerDoneData(FinishReason.ERROR)`` 收口。"""
 
-    done = RunnerDoneData(finish_reason=FinishReason.ERROR)
+    done = RunnerDoneData(
+        finish_reason=FinishReason.ERROR,
+        provider_request_id="req-final",
+    )
     assert done.finish_reason is FinishReason.ERROR
+    assert done.provider_request_id == "req-final"

@@ -16,8 +16,12 @@ from dataclasses import dataclass
 from datetime import datetime
 from typing import Literal
 
-from dayu.contracts.tool_call import ToolExecutionRequest
-from dayu.contracts.tool_outcome import ToolExecutionOutcome, ToolFailedOutcome
+from dayu.contracts.tool_call import BatchToolExecutionRequest
+from dayu.contracts.tool_outcome import (
+    BatchToolExecutionOutcome,
+    BatchToolExecutionRecord,
+    ToolFailedOutcome,
+)
 from dayu.contracts.tool_result import ToolResultFailure
 from dayu.engine import (
     AgentMessageRole,
@@ -41,8 +45,11 @@ from dayu.runtime.log import LogLevel, configure
 
 _PROMPT: str = "用一句话回答：2+2 等于几？"
 _DEFAULT_TIMEOUT_SECONDS: float = 60.0
+_TOOL_EXECUTION_TIMEOUT_SECONDS: float = 5.0
 _DEFAULT_MAX_RETRIES: int = 0
 _DEFAULT_MAX_TOKENS: int = 64
+_MAX_ITERATIONS_WITHOUT_TOOLS: int = 1
+_CONTINUATION_MAX_ATTEMPTS_WITHOUT_TOOLS: int = 0
 _RUN_ID_PREFIX: str = "smoke_async_agent"
 _SKIP_PREFIX: str = "SKIP"
 _CASE_PREFIX: str = "CASE"
@@ -112,24 +119,31 @@ class _NoopToolExecutor:
     """
 
     async def execute(
-        self, request: ToolExecutionRequest
-    ) -> ToolExecutionOutcome:
-        """返回工具误调用失败 outcome。
+        self, request: BatchToolExecutionRequest
+    ) -> BatchToolExecutionOutcome:
+        """返回工具误调用失败 outcome 批次。
 
-        :param request: 工具执行请求。
-        :returns: 失败 outcome。
+        :param request: 批式工具执行请求。
+        :returns: 与输入 ``calls`` 一一对应的失败 outcome 批次。
         :raises Exception: 不主动抛出异常。
         """
 
-        return ToolFailedOutcome(
-            result=ToolResultFailure(
-                ok=False,
-                error="tool_executor_not_expected_in_phase2_smoke",
-                message=f"unexpected tool execution: {request.call.name}",
-                hint=None,
-                meta=None,
+        records = tuple(
+            BatchToolExecutionRecord(
+                tool_call_id=call.tool_call_id,
+                outcome=ToolFailedOutcome(
+                    result=ToolResultFailure(
+                        ok=False,
+                        error="tool_executor_not_expected_in_phase2_smoke",
+                        message=f"unexpected tool execution: {call.name}",
+                        hint=None,
+                        meta=None,
+                    )
+                ),
             )
+            for call in request.calls
         )
+        return BatchToolExecutionOutcome(records=records)
 
 
 CASES: tuple[ProviderCase, ...] = (
@@ -270,7 +284,6 @@ def build_request(
         messages=(
             UserMessage(role=AgentMessageRole.USER, content=_PROMPT),
         ),
-        stream=stream,
         disable_tools=True,
         runner_spec=spec,
         runner_options=RunnerCallOptions(
@@ -280,9 +293,10 @@ def build_request(
             stream=stream,
         ),
         agent_policy=AgentPolicy(
-            max_iterations=1,
-            continuation_max_attempts=0,
+            max_iterations=_MAX_ITERATIONS_WITHOUT_TOOLS,
+            continuation_max_attempts=_CONTINUATION_MAX_ATTEMPTS_WITHOUT_TOOLS,
             allow_tool_calls=False,
+            tool_execution_timeout_seconds=_TOOL_EXECUTION_TIMEOUT_SECONDS,
         ),
         tool_schemas=(),
         tool_executor=_NoopToolExecutor(),
@@ -331,17 +345,17 @@ def safe_event_summary(event: EngineEvent) -> str:
     """
 
     data = event.data
-    if event.type is EngineEventType.RUNNER_CONTENT_DELTA:
-        return f"{_EVENT_PREFIX} {event.type.value} sequence={event.sequence}"
+    if event.type is EngineEventType.CONTENT_DELTA:
+        return f"{_EVENT_PREFIX} {event.type.value}"
     if event.type is EngineEventType.FINAL_ANSWER and isinstance(
         data, FinalAnswerData
     ):
         return (
-            f"{_EVENT_PREFIX} {event.type.value} sequence={event.sequence} "
+            f"{_EVENT_PREFIX} {event.type.value} "
             f"content_len={len(data.content)} filtered={data.filtered} "
             f"content={data.content!r}"
         )
-    return f"{_EVENT_PREFIX} {event.type.value} sequence={event.sequence}"
+    return f"{_EVENT_PREFIX} {event.type.value}"
 
 
 async def run_case(

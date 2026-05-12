@@ -24,6 +24,7 @@ from dayu.engine.contracts.agent_run import (
     RunResumeHint,
 )
 from dayu.engine.contracts.engine_events import (
+    RUN_SUSPENDED_REASON_TOOL_AWAITING,
     TERMINAL_ENGINE_EVENT_TYPES,
     ContentCompleteData,
     ContentDeltaData,
@@ -32,17 +33,21 @@ from dayu.engine.contracts.engine_events import (
     EngineEventData,
     EngineEventType,
     FinalAnswerData,
+    IterationCompletedData,
     IterationStartedData,
     ProviderProtocolErrorData,
     ReasoningDeltaData,
     RunCancelledData,
     RunFailedData,
     RunSuspendedData,
-    RunnerDoneEngineData,
-    RunnerUsageData,
     ToolAwaitingData,
+    ToolCallBatchItemData,
+    ToolCallDeltaData,
     ToolCallRequestedData,
+    ToolCallsBatchDoneData,
+    ToolCallsBatchReadyData,
     ToolResultAcceptedData,
+    UsageReportedData,
 )
 from dayu.engine.contracts.finish_reason import FinishReason
 from dayu.engine.contracts.messages import (
@@ -56,6 +61,11 @@ from dayu.engine.contracts.messages import (
 )
 from dayu.engine.contracts.partial_tool_call import PartialToolCallSummary
 from dayu.engine.contracts.runner import AsyncRunner
+from dayu.engine.contracts.tool_records import (
+    AcceptedToolExecutionRecord,
+    AssistantToolCallBatchSnapshot,
+    AwaitingToolExecutionRecord,
+)
 from dayu.engine.contracts.runner_events import (
     RunnerContentCompletedData,
     RunnerContentDeltaData,
@@ -87,6 +97,7 @@ from dayu.engine.contracts.runner_spec import (
 )
 
 __all__ = [
+    "AcceptedToolExecutionRecord",
     "AgentMessage",
     "AgentMessageRole",
     "AgentFallbackMode",
@@ -96,7 +107,9 @@ __all__ = [
     "AnthropicThinkingExtension",
     "AssistantMessage",
     "AssistantToolCall",
+    "AssistantToolCallBatchSnapshot",
     "AsyncRunner",
+    "AwaitingToolExecutionRecord",
     "ContentCompleteData",
     "ContentDeltaData",
     "ContextBudgetSnapshot",
@@ -114,6 +127,7 @@ __all__ = [
     "FinishReason",
     "GeminiThinkingLevel",
     "GeminiThinkingExtension",
+    "IterationCompletedData",
     "IterationStartedData",
     "MimoThinkingExtension",
     "OpenAIReasoningEffort",
@@ -123,6 +137,7 @@ __all__ = [
     "ProviderRequestExtension",
     "QwenThinkingExtension",
     "ReasoningDeltaData",
+    "RUN_SUSPENDED_REASON_TOOL_AWAITING",
     "RunCancelledData",
     "RunFailedData",
     "RunResumeHint",
@@ -131,7 +146,6 @@ __all__ = [
     "RunnerContentCompletedData",
     "RunnerContentDeltaData",
     "RunnerDoneData",
-    "RunnerDoneEngineData",
     "RunnerEvent",
     "RunnerEventData",
     "RunnerEventType",
@@ -142,13 +156,17 @@ __all__ = [
     "RunnerSpec",
     "RunnerToolCallDeltaData",
     "RunnerToolCallsCompletedData",
-    "RunnerUsageData",
     "RunnerUsageRecordedData",
     "SystemMessage",
     "TERMINAL_ENGINE_EVENT_TYPES",
     "ToolAwaitingData",
+    "ToolCallBatchItemData",
+    "ToolCallDeltaData",
     "ToolCallRequestedData",
+    "ToolCallsBatchDoneData",
+    "ToolCallsBatchReadyData",
     "ToolMessage",
     "ToolResultAcceptedData",
+    "UsageReportedData",
     "UserMessage",
 ]

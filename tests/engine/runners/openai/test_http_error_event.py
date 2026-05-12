@@ -14,6 +14,7 @@ from __future__ import annotations
 
 import asyncio
 from collections.abc import Sequence
+import json
 
 import aiohttp
 import pytest
@@ -97,6 +98,27 @@ def _http_response(status: int, body: bytes = b"err") -> FakeResponseSpec:
     )
 
 
+def _http_response_with_headers(
+    status: int,
+    *,
+    headers: dict[str, str],
+    body: bytes,
+) -> FakeResponseSpec:
+    """构造带自定义响应头的 HTTP 错误响应。
+
+    :param status: HTTP 状态码。
+    :param headers: 响应头。
+    :param body: 响应体。
+    :returns: fake response spec。
+    """
+
+    return FakeResponseSpec(
+        status=status,
+        headers=headers,
+        body_chunks=[body],
+    )
+
+
 def _check_http_error_then_done(
     events: Sequence[RunnerEvent],
     *,
@@ -165,6 +187,98 @@ async def test_http_500_retry_exhausted_server_error(
         expected_attempt=2,
         expected_retried=True,
     )
+    await runner.close()
+
+
+@pytest.mark.asyncio
+async def test_retry_exhausted_keeps_final_attempt_provider_request_id(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """重试耗尽时 HTTP error 与 done 携带最终失败 attempt 的 request id。"""
+
+    _patch_no_sleep(monkeypatch)
+    runner = _make_runner(max_retries=1)
+    session = FakeSession()
+    session.enqueue_response(
+        _http_response_with_headers(
+            500,
+            headers={"X-Request-Id": " req_first "},
+            body=b'{"error":{"message":"first"}}',
+        )
+    )
+    session.enqueue_response(
+        _http_response_with_headers(
+            503,
+            headers={"x-request-id": "req_final"},
+            body=b'{"error":{"message":"final"}}',
+        )
+    )
+    _install_session(runner, session)
+
+    events = await _run(runner)
+
+    assert isinstance(events[-2].data, RunnerHTTPErrorData)
+    assert events[-2].data.provider_request_id == "req_final"
+    assert events[-2].data.raw_payload == {
+        "error": {"message": "final"}
+    }
+    assert isinstance(events[-1].data, RunnerDoneData)
+    assert events[-1].data.provider_request_id == "req_final"
+    await runner.close()
+
+
+@pytest.mark.asyncio
+async def test_http_json_object_error_body_preserved_as_raw_payload() -> None:
+    """HTTP JSON object 错误体必须进入 raw_payload，request id 仅来自 header。"""
+
+    runner = _make_runner(max_retries=0)
+    session = FakeSession()
+    payload = {
+        "error": {
+            "message": "bad",
+            "request_id": "payload-id-ignored",
+        }
+    }
+    session.enqueue_response(
+        _http_response_with_headers(
+            400,
+            headers={"x-ReQuEsT-id": " req_header "},
+            body=json.dumps(payload).encode("utf-8"),
+        )
+    )
+    _install_session(runner, session)
+
+    events = await _run(runner)
+
+    assert isinstance(events[-2].data, RunnerHTTPErrorData)
+    assert events[-2].data.provider_request_id == "req_header"
+    assert events[-2].data.raw_payload == payload
+    assert isinstance(events[-1].data, RunnerDoneData)
+    assert events[-1].data.provider_request_id == "req_header"
+    await runner.close()
+
+
+@pytest.mark.asyncio
+async def test_http_non_json_error_body_keeps_raw_payload_none() -> None:
+    """非 JSON 错误体只作为 message，不写 raw_payload。"""
+
+    runner = _make_runner(max_retries=0)
+    session = FakeSession()
+    session.enqueue_response(
+        _http_response_with_headers(
+            400,
+            headers={"x-request-id": "req_text"},
+            body=b"plain bad",
+        )
+    )
+    _install_session(runner, session)
+
+    events = await _run(runner)
+
+    assert isinstance(events[-2].data, RunnerHTTPErrorData)
+    assert events[-2].data.message == "plain bad"
+    assert events[-2].data.provider_request_id == "req_text"
+    assert events[-2].data.raw_payload is None
     await runner.close()
 
 

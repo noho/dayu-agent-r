@@ -76,13 +76,17 @@ def _make_event(data: RunnerEventData) -> RunnerEvent:
 
 
 def parse_non_stream_response(
-    payload: bytes, *, hook: _ReasoningProtocolHook
+    payload: bytes,
+    *,
+    hook: _ReasoningProtocolHook,
+    provider_request_id: str | None,
 ) -> Iterator[RunnerEvent]:
     """解析非流式 JSON 响应字节串。
 
     :param payload: 完整响应字节串。
     :param hook: provider 私有 reasoning 协议钩子；用于决定是否需要
         从 ``content`` 中剥离 ``<thought>`` 标签到 ``reasoning_content``。
+    :param provider_request_id: 当前 response header 提供的 request id。
     :returns: :class:`RunnerEvent` 同步迭代器（由 Runner 包装为
         异步流）。
     """
@@ -98,11 +102,16 @@ def parse_non_stream_response(
             RunnerProtocolErrorData(
                 error_code="invalid_utf8",
                 message=f"non-stream response not utf-8: {exc}",
-                provider_request_id=None,
+                provider_request_id=provider_request_id,
                 raw_payload=None,
             )
         )
-        yield _make_event(RunnerDoneData(finish_reason=FinishReason.ERROR))
+        yield _make_event(
+            RunnerDoneData(
+                finish_reason=FinishReason.ERROR,
+                provider_request_id=provider_request_id,
+            )
+        )
         return
     try:
         parsed = json.loads(text)
@@ -116,11 +125,16 @@ def parse_non_stream_response(
             RunnerProtocolErrorData(
                 error_code="non_stream_invalid_json",
                 message=f"non-stream response is not valid JSON: {exc}",
-                provider_request_id=None,
+                provider_request_id=provider_request_id,
                 raw_payload=None,
             )
         )
-        yield _make_event(RunnerDoneData(finish_reason=FinishReason.ERROR))
+        yield _make_event(
+            RunnerDoneData(
+                finish_reason=FinishReason.ERROR,
+                provider_request_id=provider_request_id,
+            )
+        )
         return
     if not isinstance(parsed, dict):
         _LOGGER.warning(
@@ -130,13 +144,20 @@ def parse_non_stream_response(
             RunnerProtocolErrorData(
                 error_code="non_stream_payload_not_object",
                 message="non-stream response top-level is not a JSON object",
-                provider_request_id=None,
+                provider_request_id=provider_request_id,
                 raw_payload=None,
             )
         )
-        yield _make_event(RunnerDoneData(finish_reason=FinishReason.ERROR))
+        yield _make_event(
+            RunnerDoneData(
+                finish_reason=FinishReason.ERROR,
+                provider_request_id=provider_request_id,
+            )
+        )
         return
-    yield from _emit_from_dict(parsed, hook=hook)
+    yield from _emit_from_dict(
+        parsed, hook=hook, provider_request_id=provider_request_id
+    )
 
 
 def _split_thought(
@@ -158,7 +179,10 @@ def _split_thought(
 
 
 def _emit_from_dict(
-    parsed: dict[str, JsonValue], *, hook: _ReasoningProtocolHook
+    parsed: dict[str, JsonValue],
+    *,
+    hook: _ReasoningProtocolHook,
+    provider_request_id: str | None,
 ) -> Iterator[RunnerEvent]:
     """从顶层 JSON 对象产出事件序列。"""
 
@@ -168,11 +192,16 @@ def _emit_from_dict(
             RunnerProtocolErrorData(
                 error_code="non_stream_missing_choices",
                 message="non-stream response missing choices",
-                provider_request_id=None,
+                provider_request_id=provider_request_id,
                 raw_payload=None,
             )
         )
-        yield _make_event(RunnerDoneData(finish_reason=FinishReason.ERROR))
+        yield _make_event(
+            RunnerDoneData(
+                finish_reason=FinishReason.ERROR,
+                provider_request_id=provider_request_id,
+            )
+        )
         return
     choice = choices[0]
     if not isinstance(choice, dict):
@@ -180,11 +209,16 @@ def _emit_from_dict(
             RunnerProtocolErrorData(
                 error_code="non_stream_choice_not_object",
                 message="non-stream choice is not a JSON object",
-                provider_request_id=None,
+                provider_request_id=provider_request_id,
                 raw_payload=None,
             )
         )
-        yield _make_event(RunnerDoneData(finish_reason=FinishReason.ERROR))
+        yield _make_event(
+            RunnerDoneData(
+                finish_reason=FinishReason.ERROR,
+                provider_request_id=provider_request_id,
+            )
+        )
         return
     finish_reason = _resolve_finish_reason(choice)
     message = choice.get("message")
@@ -210,14 +244,19 @@ def _emit_from_dict(
                 reasoning = inside + (reasoning or "")
         raw_tool_calls = message.get("tool_calls")
         if isinstance(raw_tool_calls, list) and raw_tool_calls:
-            tool_calls_request = _build_tool_calls(raw_tool_calls)
+            tool_calls_request = _build_tool_calls(
+                raw_tool_calls, provider_request_id=provider_request_id
+            )
             for warning in tool_calls_request.warnings:
                 yield _make_event(warning)
             if tool_calls_request.fatal_errors:
                 for fatal in tool_calls_request.fatal_errors:
                     yield _make_event(fatal)
                 yield _make_event(
-                    RunnerDoneData(finish_reason=FinishReason.ERROR)
+                    RunnerDoneData(
+                        finish_reason=FinishReason.ERROR,
+                        provider_request_id=provider_request_id,
+                    )
                 )
                 return
             yield _make_event(
@@ -253,7 +292,12 @@ def _emit_from_dict(
                     total_tokens=total_tokens,
                 )
             )
-    yield _make_event(RunnerDoneData(finish_reason=finish_reason))
+    yield _make_event(
+        RunnerDoneData(
+            finish_reason=finish_reason,
+            provider_request_id=provider_request_id,
+        )
+    )
 
 
 def _resolve_finish_reason(choice: dict[str, JsonValue]) -> FinishReason:
@@ -278,6 +322,8 @@ class _NonStreamToolCallsResult:
 
 def _build_tool_calls(
     raw_tool_calls: list[JsonValue],
+    *,
+    provider_request_id: str | None,
 ) -> _NonStreamToolCallsResult:
     """非流式 tool_calls 转 :class:`ToolCallRequest` 元组。
 
@@ -291,12 +337,14 @@ def _build_tool_calls(
     fatal 错误。
     """
 
-    aggregator = ToolCallAggregator()
+    aggregator = ToolCallAggregator(provider_request_id=provider_request_id)
     fatal_errors: list[RunnerProtocolErrorData] = []
     for index, raw in enumerate(raw_tool_calls):
         if not isinstance(raw, dict):
             continue
-        delta, pre_error = _coerce_final_tool_call(raw, index=index)
+        delta, pre_error = _coerce_final_tool_call(
+            raw, index=index, provider_request_id=provider_request_id
+        )
         if pre_error is not None:
             fatal_errors.append(pre_error)
             continue
@@ -313,7 +361,10 @@ def _build_tool_calls(
 
 
 def _coerce_final_tool_call(
-    raw: dict[str, JsonValue], *, index: int
+    raw: dict[str, JsonValue],
+    *,
+    index: int,
+    provider_request_id: str | None,
 ) -> tuple[_OpenAIToolCallDelta, RunnerProtocolErrorData | None]:
     """把非流式 tool call dict 转成可被聚合器消费的 delta 形态。
 
@@ -359,7 +410,7 @@ def _coerce_final_tool_call(
                     f"tool call {tool_id_for_msg} arguments is neither a "
                     "JSON string nor a JSON object"
                 ),
-                provider_request_id=None,
+                provider_request_id=provider_request_id,
                 raw_payload=None,
             )
         if func_payload:

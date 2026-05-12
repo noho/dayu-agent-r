@@ -12,7 +12,7 @@ import dataclasses
 
 from dayu.engine.contracts.engine_events import (
     ProviderProtocolErrorData,
-    RunnerUsageData,
+    UsageReportedData,
 )
 from dayu.engine.contracts.partial_tool_call import PartialToolCallSummary
 from dayu.engine.contracts.runner_events import (
@@ -28,10 +28,10 @@ def _field_names(cls: type) -> set[str]:
     return {f.name for f in dataclasses.fields(cls)}
 
 
-def test_runner_usage_data_uses_split_token_fields() -> None:
-    """Engine 侧用量提升事件必须使用拆分字段，不允许整 dict。"""
+def test_usage_reported_data_uses_split_token_fields() -> None:
+    """Engine 侧用量上报事件必须使用拆分字段，不允许整 dict。"""
 
-    fields = _field_names(RunnerUsageData)
+    fields = _field_names(UsageReportedData)
     assert {"prompt_tokens", "completion_tokens", "total_tokens"}.issubset(fields)
 
 

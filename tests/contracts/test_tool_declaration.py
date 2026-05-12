@@ -2,38 +2,51 @@
 
 from __future__ import annotations
 
+from datetime import datetime, timezone
+
 from dayu.contracts import (
-    FunctionToolExecutor,
+    BatchToolExecutionContext,
     ToolBundle,
+    ToolCallRequest,
+    ToolCallable,
     ToolCompletedOutcome,
-    ToolExecutionRequest,
     ToolDefinition,
     ToolDisplayInfo,
+    ToolExecutionOutcome,
     ToolFunctionSchema,
     ToolParametersSchema,
+    ToolResultMeta,
     ToolResultSuccess,
     ToolSchema,
     ToolTruncateSpec,
     tool,
 )
-from dayu.contracts.tool_outcome import ToolExecutionOutcome
 
 
 async def _echo_tool(
-    request: ToolExecutionRequest,
+    call: ToolCallRequest,
+    context: BatchToolExecutionContext,
 ) -> ToolExecutionOutcome:
-    """测试工具函数。
+    """测试用单工具调用实现。
 
-    :param request: 工具执行请求。
-    :returns: 成功 outcome。
+    :param call: 单次工具调用请求。
+    :param context: 批式握手共享的运行期上下文。
+    :returns: 直接成功的 outcome。
     :raises Exception: 不主动抛出异常。
     """
 
+    del call
+    del context
+    now = datetime.now(tz=timezone.utc)
     return ToolCompletedOutcome(
         result=ToolResultSuccess(
             ok=True,
-            value={"name": request.call.name},
-            meta=None,
+            value={"echo": "ok"},
+            meta=ToolResultMeta(
+                tool_name="echo",
+                started_at=now,
+                finished_at=now,
+            ),
         )
     )
 
@@ -89,6 +102,8 @@ def test_tool_declaration_keeps_schema_runtime_and_display_metadata_separate() -
 
     assert definition.name == "huge_echo"
     assert definition.callable is _echo_tool
+    assert isinstance(definition.callable, ToolCallable)
+    assert not hasattr(definition, "executor")
     assert definition.truncate == _truncate_spec()
     assert definition.display == ToolDisplayInfo(name="Huge Echo")
     assert not hasattr(definition, "display_name")
@@ -99,6 +114,7 @@ def test_tool_declaration_keeps_schema_runtime_and_display_metadata_separate() -
     assert projected.function.name == "huge_echo"
     assert projected.function.description == "return a large echo"
     assert projected.function.parameters == _parameters()
+    assert not hasattr(projected, "callable")
     assert not hasattr(projected, "truncate")
     assert not hasattr(projected, "display")
     assert not hasattr(projected, "display_name")
@@ -121,9 +137,8 @@ def test_tool_definition_rejects_name_schema_mismatch() -> None:
     try:
         ToolDefinition(
             name="runtime_name",
-            callable=_echo_tool,
-            executor=FunctionToolExecutor(_echo_tool),
             schema=schema,
+            callable=_echo_tool,
             truncate=_truncate_spec(),
             display=None,
             tags=(),

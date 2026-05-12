@@ -89,8 +89,8 @@ async def test_stream_and_non_stream_thought_strip_terminal_parity() -> None:
         }
     ).encode("utf-8")
     non_stream_events = list(
-        parse_non_stream_response(
-            non_stream_payload, hook=make_thought_hook()
+        (parse_non_stream_response(
+            non_stream_payload, hook=make_thought_hook(), provider_request_id=None)
         )
     )
     ns_completed, ns_done = _extract_completed_and_done(non_stream_events)

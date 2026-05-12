@@ -40,7 +40,7 @@ def test_non_stream_content_completed_and_usage_and_done() -> None:
             },
         }
     ).encode("utf-8")
-    events = list(parse_non_stream_response(payload, hook=make_no_thought_hook()))
+    events = list((parse_non_stream_response(payload, hook=make_no_thought_hook(), provider_request_id=None)))
     types = [e.type for e in events]
     assert types == [
         RunnerEventType.RUNNER_CONTENT_COMPLETED,
@@ -89,7 +89,7 @@ def test_non_stream_tool_calls_emitted() -> None:
             ]
         }
     ).encode("utf-8")
-    events = list(parse_non_stream_response(payload, hook=make_no_thought_hook()))
+    events = list((parse_non_stream_response(payload, hook=make_no_thought_hook(), provider_request_id=None)))
     completed = [
         e for e in events
         if e.type is RunnerEventType.RUNNER_TOOL_CALLS_COMPLETED

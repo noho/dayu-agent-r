@@ -27,15 +27,20 @@ async def parse_sse(
     chunks: Sequence[bytes],
     *,
     hook: _ReasoningProtocolHook | None = None,
+    provider_request_id: str | None = None,
 ) -> list[RunnerEvent]:
     """运行 SSE parser 并收集所有事件。
 
     :param chunks: 输入字节切片序列。
     :param hook: reasoning 协议钩子；为 ``None`` 默认无标签。
+    :param provider_request_id: 测试注入的 provider request id。
     :returns: 事件列表。
     """
 
-    parser = SSEParser(hook=hook or make_no_thought_hook())
+    parser = SSEParser(
+        hook=hook or make_no_thought_hook(),
+        provider_request_id=provider_request_id,
+    )
     events: list[RunnerEvent] = []
     async for event in parser.parse(AsyncByteIter(list(chunks))):
         events.append(event)

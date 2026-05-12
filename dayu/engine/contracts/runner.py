@@ -34,11 +34,12 @@ class AsyncRunner(Protocol):
         :param tools: 本次调用暴露给 LLM 的工具 schema 序列。
         :returns: :class:`RunnerEvent` 异步迭代器。
 
-        实现必须协作式观察 ``ToolExecutionContext`` / Agent 注入的
-        :class:`CancellationToken`；取消的**公共终态**由 Agent / Engine
-        入口收口为 :class:`RunCancelledData` /
-        :class:`EngineRunOutcomeCancelled`，不在本协议公共 ``:raises:``
-        中暴露任何取消异常。
+        实现必须协作式观察由 Engine / Runner 调用边界注入的
+        :class:`CancellationToken`（run/request 粒度，归 Agent 请求所有）；
+        取消的**公共终态**由 Agent / Engine 入口收口为
+        :class:`RunCancelledData` / :class:`EngineRunOutcomeCancelled`，
+        不在本协议公共 ``:raises:`` 中暴露任何取消异常。Runner 不观察
+        工具执行上下文，也不参与工具批式握手。
         """
         ...
 

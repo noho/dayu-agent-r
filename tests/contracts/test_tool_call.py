@@ -12,12 +12,48 @@
 from __future__ import annotations
 
 import dataclasses
+from datetime import datetime
+from typing import Final
+
+import pytest
 
 from dayu.contracts.tool_call import (
+    BatchToolExecutionContext,
+    BatchToolExecutionRequest,
     GeminiToolCallState,
     ToolCallProviderState,
     ToolCallRequest,
 )
+
+
+class _StaticCancellationToken:
+    """轻量 :class:`CancellationToken` 实现，仅供契约测试。"""
+
+    def __init__(self) -> None:
+        """初始化为未取消状态。"""
+
+        self._cancelled: bool = False
+
+    def is_cancelled(self) -> bool:
+        """返回是否已取消。"""
+
+        return self._cancelled
+
+    def cancel_reason(self) -> str | None:
+        """返回取消原因。"""
+
+        return None
+
+    def requested_at(self) -> datetime | None:
+        """返回取消请求时间。"""
+
+        return None
+
+
+_VALID_RUN_ID: Final[str] = "run-1"
+_VALID_SESSION_ID: Final[str] = "session-1"
+_VALID_ITERATION_ID: Final[str] = "iter-1"
+_VALID_CORRELATION_ID: Final[str] = "run-1:iter-1:tool_batch"
 
 
 def _describe_provider_state(state: ToolCallProviderState | None) -> str:
@@ -102,3 +138,69 @@ def test_provider_state_union_currently_only_gemini() -> None:
 
     state: ToolCallProviderState = GeminiToolCallState(thought_signature="s")
     assert isinstance(state, GeminiToolCallState)
+
+
+def _make_valid_context(
+    *, timeout_seconds: float | None = 5.0
+) -> BatchToolExecutionContext:
+    """构造合法的 :class:`BatchToolExecutionContext`。
+
+    :param timeout_seconds: 透传给 context 的超时秒数。
+    :returns: 合法 context 实例。
+    """
+
+    return BatchToolExecutionContext(
+        run_id=_VALID_RUN_ID,
+        session_id=_VALID_SESSION_ID,
+        iteration_id=_VALID_ITERATION_ID,
+        timeout_seconds=timeout_seconds,
+        cancellation_token=_StaticCancellationToken(),
+        correlation_id=_VALID_CORRELATION_ID,
+    )
+
+
+def test_batch_tool_execution_context_accepts_none_or_finite_positive() -> None:
+    """``timeout_seconds`` 为 ``None`` 或有限正数时构造合法。"""
+
+    none_ctx = _make_valid_context(timeout_seconds=None)
+    assert none_ctx.timeout_seconds is None
+
+    positive_ctx = _make_valid_context(timeout_seconds=1.5)
+    assert positive_ctx.timeout_seconds == 1.5
+
+
+def test_batch_tool_execution_context_rejects_non_positive_and_non_finite() -> None:
+    """``timeout_seconds`` 不为 ``None`` 且非有限正数时必须在构造期被拒。"""
+
+    import math
+
+    for invalid_timeout in (0.0, -1.0, -0.0001, math.inf, math.nan):
+        with pytest.raises(ValueError):
+            _make_valid_context(timeout_seconds=invalid_timeout)
+
+
+def test_batch_tool_execution_request_rejects_empty_calls() -> None:
+    """``calls`` 为空必须在构造期被拒。"""
+
+    with pytest.raises(ValueError):
+        BatchToolExecutionRequest(
+            calls=(),
+            context=_make_valid_context(),
+        )
+
+
+def test_batch_tool_execution_request_accepts_non_empty_calls() -> None:
+    """``calls`` 非空时构造合法。"""
+
+    call = ToolCallRequest(
+        tool_call_id="id-1",
+        name="get_value",
+        arguments={"k": "v"},
+        index_in_iteration=0,
+        provider_state=None,
+    )
+    request = BatchToolExecutionRequest(
+        calls=(call,),
+        context=_make_valid_context(),
+    )
+    assert request.calls == (call,)

@@ -1,7 +1,7 @@
 """包根导出白名单测试。
 
-断言 :data:`dayu.engine.__all__` 与 Phase 2 锁定白名单严格相等，并
-明确只导出真实函数式入口，不导出实现类。
+断言 :data:`dayu.engine.__all__` 与当前 Engine 公共表面严格相等，并
+明确只导出真实函数式入口与契约类型，不导出实现类。
 """
 
 from __future__ import annotations
@@ -39,6 +39,7 @@ EXPECTED_EXPORTS: frozenset[str] = frozenset(
         "GeminiThinkingLevel",
         "GeminiThinkingExtension",
         "GeminiToolCallState",
+        "IterationCompletedData",
         "IterationStartedData",
         "JsonValue",
         "MimoThinkingExtension",
@@ -49,6 +50,7 @@ EXPECTED_EXPORTS: frozenset[str] = frozenset(
         "ProviderRequestExtension",
         "QwenThinkingExtension",
         "ReasoningDeltaData",
+        "RUN_SUSPENDED_REASON_TOOL_AWAITING",
         "RunCancelledData",
         "RunFailedData",
         "RunResumeHint",
@@ -59,7 +61,6 @@ EXPECTED_EXPORTS: frozenset[str] = frozenset(
         "RunnerContentCompletedData",
         "RunnerContentDeltaData",
         "RunnerDoneData",
-        "RunnerDoneEngineData",
         "RunnerEvent",
         "RunnerEventData",
         "RunnerEventType",
@@ -70,7 +71,6 @@ EXPECTED_EXPORTS: frozenset[str] = frozenset(
         "RunnerSpec",
         "RunnerToolCallDeltaData",
         "RunnerToolCallsCompletedData",
-        "RunnerUsageData",
         "RunnerUsageRecordedData",
         "SystemMessage",
         "TERMINAL_ENGINE_EVENT_TYPES",
@@ -79,19 +79,30 @@ EXPECTED_EXPORTS: frozenset[str] = frozenset(
         "ToolAwaitSpec",
         "ToolAwaitingData",
         "ToolAwaitingOutcome",
+        "ToolCallBatchItemData",
+        "ToolCallDeltaData",
         "ToolCallProviderState",
         "ToolCallRequest",
         "ToolCallRequestedData",
+        "ToolCallsBatchDoneData",
+        "ToolCallsBatchReadyData",
+        "ToolCancelledOutcome",
         "ToolCompletedOutcome",
-        "ToolExecutionContext",
+        "AcceptedToolExecutionRecord",
+        "AssistantToolCallBatchSnapshot",
+        "AwaitingToolExecutionRecord",
+        "BatchToolExecutionContext",
+        "BatchToolExecutionOutcome",
+        "BatchToolExecutionRecord",
+        "BatchToolExecutionRequest",
         "ToolExecutionOutcome",
-        "ToolExecutionRequest",
         "ToolExecutor",
         "ToolFailedOutcome",
         "ToolFunctionSchema",
         "ToolMessage",
         "ToolParametersSchema",
         "ToolResultAcceptedData",
+        "UsageReportedData",
         "ToolResultEnvelope",
         "ToolResultFailure",
         "ToolResultMeta",
@@ -119,7 +130,7 @@ FORBIDDEN_EXPORTS: frozenset[str] = frozenset(
 
 
 def test_engine_all_matches_expected_set() -> None:
-    """``dayu.engine.__all__`` 必须与 Phase 2 锁定白名单严格相等。"""
+    """``dayu.engine.__all__`` 必须与当前公共表面严格相等。"""
 
     actual = frozenset(engine.__all__)
     assert actual == EXPECTED_EXPORTS, (

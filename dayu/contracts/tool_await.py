@@ -13,6 +13,9 @@ from __future__ import annotations
 from dataclasses import dataclass
 from datetime import datetime
 from enum import StrEnum
+from typing import Final
+
+_MAX_RESUME_TOKEN_LENGTH: Final[int] = 2048
 
 
 class ToolAwaitKind(StrEnum):
@@ -34,17 +37,33 @@ class ToolAwaitSpec:
 
     :param await_kind: 等待类型；Phase 0 仅 :attr:`ToolAwaitKind.EXTERNAL_JOB`。
     :param deadline: 截止时间；``None`` 表示由 Host 兜底策略决定。
-    :param resume_token: 恢复时所需的中性 token；语义由 Host 拥有。
+    :param resume_token: 恢复时所需的 Host-owned opaque reference。Engine
+        只透传该值，不解析、不签发、不把它视为授权凭据或可执行 payload。
     """
 
     await_kind: ToolAwaitKind
     deadline: datetime | None
     resume_token: str
 
+    def __post_init__(self) -> None:
+        """校验等待恢复 token 的基础边界。
+
+        :raises ValueError: ``resume_token`` 为空或超过长度上限时抛出。
+        """
+
+        if self.resume_token.strip() == "":
+            raise ValueError("ToolAwaitSpec.resume_token must not be empty")
+        if len(self.resume_token) > _MAX_RESUME_TOKEN_LENGTH:
+            raise ValueError("ToolAwaitSpec.resume_token is too long")
+
 
 @dataclass(frozen=True, slots=True)
 class ToolAwaitSnapshot:
-    """工具等待时点快照。
+    """工具等待时点快照引用。
+
+    快照内容由 Host / ToolRuntime 持有；Engine 只透传 opaque
+    ``snapshot_id`` 与采集时间，不提供快照检索机制，也不在本类型中承载
+    业务状态或任意属性袋。
 
     :param snapshot_id: 快照唯一 id。
     :param captured_at: 快照采集时间。

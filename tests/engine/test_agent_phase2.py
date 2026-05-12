@@ -10,8 +10,12 @@ from datetime import datetime, timezone
 import pytest
 
 import dayu.engine.agent as agent_module
-from dayu.contracts.tool_call import ToolExecutionRequest
-from dayu.contracts.tool_outcome import ToolExecutionOutcome, ToolFailedOutcome
+from dayu.contracts.tool_call import BatchToolExecutionRequest
+from dayu.contracts.tool_outcome import (
+    BatchToolExecutionOutcome,
+    BatchToolExecutionRecord,
+    ToolFailedOutcome,
+)
 from dayu.contracts.tool_result import ToolResultFailure
 from dayu.engine.agent import _AsyncAgent
 from dayu.engine.contracts.agent_policy import AgentPolicy
@@ -20,16 +24,20 @@ from dayu.engine.contracts.agent_run import (
     EngineRunOutcomeCancelled,
     EngineRunOutcomeFailed,
     EngineRunOutcomeFinalAnswer,
+    EngineRunOutcomeSuspended,
 )
 from dayu.engine.contracts.engine_events import (
     ContextCompactionRequestedData,
     EngineEvent,
     EngineEventType,
     FinalAnswerData,
+    IterationCompletedData,
+    RUN_SUSPENDED_REASON_TOOL_AWAITING,
     RunCancelledData,
     RunFailedData,
     RunSuspendedData,
     TERMINAL_ENGINE_EVENT_TYPES,
+    ToolCallDeltaData,
 )
 from dayu.engine.contracts.finish_reason import FinishReason
 from dayu.engine.contracts.messages import (
@@ -54,12 +62,24 @@ from dayu.engine.contracts.runner_events import (
     RunnerUsageRecordedData,
 )
 from dayu.engine.contracts.runner_spec import RunnerCallOptions, RunnerSpec
+from dayu.contracts.tool_await import (
+    ToolAwaitKind,
+    ToolAwaitSnapshot,
+    ToolAwaitSpec,
+)
 from dayu.contracts.tool_call import ToolCallRequest
+from dayu.engine.contracts.tool_records import (
+    AssistantToolCallBatchSnapshot,
+    AwaitingToolExecutionRecord,
+)
 from dayu.contracts.tool_schema import (
     ToolFunctionSchema,
     ToolParametersSchema,
     ToolSchema,
 )
+
+_TOOL_EXECUTION_TIMEOUT_SECONDS: float = 5.0
+_CONTINUATION_MAX_ATTEMPTS: int = 3
 
 
 def _utc_now() -> datetime:
@@ -124,24 +144,31 @@ class _NoopToolExecutor:
     """测试用 no-op ToolExecutor。"""
 
     async def execute(
-        self, request: ToolExecutionRequest
-    ) -> ToolExecutionOutcome:
+        self, request: BatchToolExecutionRequest
+    ) -> BatchToolExecutionOutcome:
         """返回失败 outcome，防止 Phase 2 误执行工具。
 
-        :param request: 工具执行请求。
-        :returns: 失败 outcome。
+        :param request: 批式工具执行请求。
+        :returns: 与输入 ``calls`` 一一对应的失败 outcome 批次。
         :raises Exception: 不主动抛出异常。
         """
 
-        return ToolFailedOutcome(
-            result=ToolResultFailure(
-                ok=False,
-                error="unexpected_tool_execution",
-                message=request.call.name,
-                hint=None,
-                meta=None,
+        records = tuple(
+            BatchToolExecutionRecord(
+                tool_call_id=call.tool_call_id,
+                outcome=ToolFailedOutcome(
+                    result=ToolResultFailure(
+                        ok=False,
+                        error="unexpected_tool_execution",
+                        message=call.name,
+                        hint=None,
+                        meta=None,
+                    )
+                ),
             )
+            for call in request.calls
         )
+        return BatchToolExecutionOutcome(records=records)
 
 
 @dataclass(slots=True)
@@ -259,7 +286,6 @@ def _request(
         messages=(
             UserMessage(role=AgentMessageRole.USER, content="hello"),
         ),
-        stream=True,
         disable_tools=True,
         runner_spec=RunnerSpec(
             provider="openai",
@@ -282,8 +308,9 @@ def _request(
         ),
         agent_policy=AgentPolicy(
             max_iterations=max_iterations,
-            continuation_max_attempts=3,
+            continuation_max_attempts=_CONTINUATION_MAX_ATTEMPTS,
             allow_tool_calls=True,
+            tool_execution_timeout_seconds=_TOOL_EXECUTION_TIMEOUT_SECONDS,
         ),
         tool_schemas=tool_schemas,
         tool_executor=_NoopToolExecutor(),
@@ -365,27 +392,27 @@ async def test_success_run_lifts_runner_events_and_agent_final() -> None:
             ),
             _event(
                 RunnerEventType.RUNNER_DONE,
-                RunnerDoneData(finish_reason=FinishReason.STOP),
+                RunnerDoneData(finish_reason=FinishReason.STOP, provider_request_id=None),
             ),
         )
     )
     events = await _collect(_AsyncAgent(request=_request(), runner=runner))
 
-    assert [event.sequence for event in events] == list(range(len(events)))
-    assert len({event.event_id for event in events}) == len(events)
     assert [event.type for event in events] == [
         EngineEventType.ITERATION_STARTED,
-        EngineEventType.RUNNER_CONTENT_DELTA,
-        EngineEventType.RUNNER_REASONING_DELTA,
-        EngineEventType.RUNNER_USAGE_RECORDED,
-        EngineEventType.RUNNER_CONTENT_COMPLETED,
-        EngineEventType.RUNNER_DONE,
+        EngineEventType.CONTENT_DELTA,
+        EngineEventType.REASONING_DELTA,
+        EngineEventType.USAGE_REPORTED,
+        EngineEventType.CONTENT_COMPLETED,
+        EngineEventType.ITERATION_COMPLETED,
         EngineEventType.FINAL_ANSWER,
     ]
     final = _final_event(events)
     assert isinstance(final.data, FinalAnswerData)
     assert final.data.content == "你好"
     assert final.data.degraded is False
+    assert {event.session_id for event in events} == {"session_phase2"}
+    assert {event.run_id for event in events} == {"run_phase2"}
     assert runner.close_count == 1
     _assert_single_terminal_at_end(events)
 
@@ -419,7 +446,7 @@ async def test_phase2_passes_empty_tools_even_when_request_has_schema() -> None:
             ),
             _event(
                 RunnerEventType.RUNNER_DONE,
-                RunnerDoneData(finish_reason=FinishReason.STOP),
+                RunnerDoneData(finish_reason=FinishReason.STOP, provider_request_id=None),
             ),
         )
     )
@@ -451,23 +478,29 @@ async def test_protocol_error_and_error_done_maps_to_run_failed() -> None:
             ),
             _event(
                 RunnerEventType.RUNNER_DONE,
-                RunnerDoneData(finish_reason=FinishReason.ERROR),
+                RunnerDoneData(
+                    finish_reason=FinishReason.ERROR,
+                    provider_request_id="req_1",
+                ),
             ),
         )
     )
     events = await _collect(_AsyncAgent(request=_request(), runner=runner))
 
-    assert events[-2].type is EngineEventType.RUNNER_DONE
+    assert events[-2].type is EngineEventType.ITERATION_COMPLETED
     terminal = _final_event(events)
     assert terminal.type is EngineEventType.RUN_FAILED
     assert isinstance(terminal.data, RunFailedData)
     assert terminal.data.error_code == "bad_sse"
+    assert isinstance(events[-2].data, IterationCompletedData)
+    assert events[-2].data.provider_request_id == "req_1"
+    assert terminal.data.provider_request_id == "req_1"
     _assert_single_terminal_at_end(events)
 
 
 @pytest.mark.asyncio
 async def test_http_error_maps_to_run_failed_without_extra_engine_event() -> None:
-    """HTTP error 记录失败候选，经 runner_done 收口 run_failed。"""
+    """HTTP error 记录失败候选，经迭代完成事件收口 run_failed。"""
 
     runner = _ScriptedRunner(
         events=(
@@ -477,7 +510,7 @@ async def test_http_error_maps_to_run_failed_without_extra_engine_event() -> Non
                     error_code=RunnerHTTPErrorCode.RATE_LIMIT_EXCEEDED,
                     http_status=429,
                     message="rate limited",
-                    provider_request_id=None,
+                    provider_request_id="req_http",
                     raw_payload=None,
                     attempt=1,
                     retried=False,
@@ -485,7 +518,10 @@ async def test_http_error_maps_to_run_failed_without_extra_engine_event() -> Non
             ),
             _event(
                 RunnerEventType.RUNNER_DONE,
-                RunnerDoneData(finish_reason=FinishReason.ERROR),
+                RunnerDoneData(
+                    finish_reason=FinishReason.ERROR,
+                    provider_request_id="req_http",
+                ),
             ),
         )
     )
@@ -493,11 +529,14 @@ async def test_http_error_maps_to_run_failed_without_extra_engine_event() -> Non
 
     assert [event.type for event in events] == [
         EngineEventType.ITERATION_STARTED,
-        EngineEventType.RUNNER_DONE,
+        EngineEventType.ITERATION_COMPLETED,
         EngineEventType.RUN_FAILED,
     ]
     assert isinstance(events[-1].data, RunFailedData)
     assert events[-1].data.error_code == "rate_limit_exceeded"
+    assert isinstance(events[-2].data, IterationCompletedData)
+    assert events[-2].data.provider_request_id == "req_http"
+    assert events[-1].data.provider_request_id == "req_http"
 
 
 @pytest.mark.asyncio
@@ -512,7 +551,7 @@ async def test_context_overflow_http_error_maps_to_compaction_required_fact() ->
                     error_code=RunnerHTTPErrorCode.CONTEXT_LENGTH_EXCEEDED,
                     http_status=400,
                     message="maximum context length is 128000 tokens",
-                    provider_request_id=None,
+                    provider_request_id="req_context",
                     raw_payload=None,
                     attempt=1,
                     retried=False,
@@ -520,7 +559,10 @@ async def test_context_overflow_http_error_maps_to_compaction_required_fact() ->
             ),
             _event(
                 RunnerEventType.RUNNER_DONE,
-                RunnerDoneData(finish_reason=FinishReason.ERROR),
+                RunnerDoneData(
+                    finish_reason=FinishReason.ERROR,
+                    provider_request_id="req_context",
+                ),
             ),
         )
     )
@@ -529,14 +571,18 @@ async def test_context_overflow_http_error_maps_to_compaction_required_fact() ->
     assert [event.type for event in events] == [
         EngineEventType.ITERATION_STARTED,
         EngineEventType.CONTEXT_COMPACTION_REQUESTED,
-        EngineEventType.RUNNER_DONE,
+        EngineEventType.ITERATION_COMPLETED,
         EngineEventType.RUN_FAILED,
     ]
     compact_event = events[1]
     assert isinstance(compact_event.data, ContextCompactionRequestedData)
+    assert compact_event.data.provider_request_id == "req_context"
+    assert isinstance(events[-2].data, IterationCompletedData)
+    assert events[-2].data.provider_request_id == "req_context"
     terminal = events[-1]
     assert isinstance(terminal.data, RunFailedData)
     assert terminal.data.error_code == "context_compaction_required"
+    assert terminal.data.provider_request_id == "req_context"
     assert terminal.data.recoverable
 
 
@@ -548,7 +594,7 @@ async def test_bare_error_done_maps_to_specific_run_failed() -> None:
         events=(
             _event(
                 RunnerEventType.RUNNER_DONE,
-                RunnerDoneData(finish_reason=FinishReason.ERROR),
+                RunnerDoneData(finish_reason=FinishReason.ERROR, provider_request_id=None),
             ),
         )
     )
@@ -558,6 +604,7 @@ async def test_bare_error_done_maps_to_specific_run_failed() -> None:
     assert terminal.type is EngineEventType.RUN_FAILED
     assert isinstance(terminal.data, RunFailedData)
     assert terminal.data.error_code == "runner_error_done_without_detail"
+    assert terminal.data.provider_request_id is None
 
 
 @pytest.mark.asyncio
@@ -634,7 +681,7 @@ async def test_cancel_before_final_answer_wins_over_final() -> None:
             ),
             _event(
                 RunnerEventType.RUNNER_DONE,
-                RunnerDoneData(finish_reason=FinishReason.STOP),
+                RunnerDoneData(finish_reason=FinishReason.STOP, provider_request_id=None),
             ),
         ),
         token_to_cancel_after_event_index=0,
@@ -666,7 +713,7 @@ async def test_provider_error_and_cancel_same_run_cancel_wins() -> None:
             ),
             _event(
                 RunnerEventType.RUNNER_DONE,
-                RunnerDoneData(finish_reason=FinishReason.ERROR),
+                RunnerDoneData(finish_reason=FinishReason.ERROR, provider_request_id=None),
             ),
         ),
         token_to_cancel_after_event_index=0,
@@ -700,7 +747,7 @@ async def test_http_error_and_cancel_same_run_cancel_wins() -> None:
             ),
             _event(
                 RunnerEventType.RUNNER_DONE,
-                RunnerDoneData(finish_reason=FinishReason.ERROR),
+                RunnerDoneData(finish_reason=FinishReason.ERROR, provider_request_id=None),
             ),
         ),
         token_to_cancel_after_event_index=0,
@@ -729,7 +776,7 @@ async def test_close_error_does_not_override_terminal() -> None:
             ),
             _event(
                 RunnerEventType.RUNNER_DONE,
-                RunnerDoneData(finish_reason=FinishReason.STOP),
+                RunnerDoneData(finish_reason=FinishReason.STOP, provider_request_id=None),
             ),
         ),
         raise_on_close=True,
@@ -743,7 +790,7 @@ async def test_close_error_does_not_override_terminal() -> None:
 
 @pytest.mark.asyncio
 async def test_tool_call_delta_and_completed_fail_closed() -> None:
-    """Phase 2 收到工具调用事件会 fail closed，不产出 ToolCallRequested。"""
+    """工具观测事件可见，但缺 Done 时仍 fail closed。"""
 
     completed_runner = _ScriptedRunner(
         events=(
@@ -785,6 +832,29 @@ async def test_tool_call_delta_and_completed_fail_closed() -> None:
         assert EngineEventType.TOOL_CALL_REQUESTED not in {
             event.type for event in events
         }
+    assert completed_runner.call_count == 1
+    completed_events = await _collect(
+        _AsyncAgent(request=_request(), runner=completed_runner)
+    )
+    ready_events = [
+        event
+        for event in completed_events
+        if event.type is EngineEventType.TOOL_CALLS_BATCH_READY
+    ]
+    # fail-closed 路径下 executor 未被调用，TOOL_CALLS_BATCH_READY 不应出现。
+    assert ready_events == []
+
+    delta_events = await _collect(
+        _AsyncAgent(request=_request(), runner=delta_runner)
+    )
+    tool_delta_events = [
+        event
+        for event in delta_events
+        if event.type is EngineEventType.TOOL_CALL_DELTA
+    ]
+    assert len(tool_delta_events) == 1
+    assert isinstance(tool_delta_events[0].data, ToolCallDeltaData)
+    assert tool_delta_events[0].data.arguments_delta == "{}"
 
 
 @pytest.mark.asyncio
@@ -804,7 +874,7 @@ async def test_length_and_content_filter_final_boundaries() -> None:
                 ),
                 _event(
                     RunnerEventType.RUNNER_DONE,
-                    RunnerDoneData(finish_reason=finish_reason),
+                    RunnerDoneData(finish_reason=finish_reason, provider_request_id=None),
                 ),
             )
         )
@@ -821,7 +891,7 @@ async def test_length_and_content_filter_final_boundaries() -> None:
 
 @pytest.mark.asyncio
 async def test_abnormal_stop_and_max_iterations_fail() -> None:
-    """无 done 异常结束与 max_iterations<1 都收口 run_failed。"""
+    """无 done 异常结束触发 run_failed；``max_iterations<1`` 在 contract 构造期被拒。"""
 
     abnormal = await _collect(
         _AsyncAgent(
@@ -841,12 +911,21 @@ async def test_abnormal_stop_and_max_iterations_fail() -> None:
 
     exceeded = await _collect(
         _AsyncAgent(
-            request=_request(max_iterations=0),
+            request=_request(),
             runner=_ScriptedRunner(events=()),
         )
     )
     assert isinstance(exceeded[-1].data, RunFailedData)
-    assert exceeded[-1].data.error_code == "max_iterations_exceeded"
+
+    # AgentPolicy 在构造期直接拒绝 ``max_iterations < 1``，
+    # 防止非法策略对象在系统中传递。
+    with pytest.raises(ValueError):
+        AgentPolicy(
+            max_iterations=0,
+            continuation_max_attempts=0,
+            allow_tool_calls=False,
+            tool_execution_timeout_seconds=1.0,
+        )
 
 
 @pytest.mark.asyncio
@@ -861,7 +940,7 @@ async def test_private_agent_concurrent_run_fail_fast() -> None:
             ),
             _event(
                 RunnerEventType.RUNNER_DONE,
-                RunnerDoneData(finish_reason=FinishReason.STOP),
+                RunnerDoneData(finish_reason=FinishReason.STOP, provider_request_id=None),
             ),
         ),
         block_after_first_event=True,
@@ -877,7 +956,7 @@ async def test_private_agent_concurrent_run_fail_fast() -> None:
         """
 
         async for event in agent.run_messages():
-            if event.type is EngineEventType.RUNNER_CONTENT_DELTA:
+            if event.type is EngineEventType.CONTENT_DELTA:
                 first_event_seen.set()
 
     task = asyncio.create_task(consume_first_run())
@@ -901,7 +980,7 @@ async def test_outer_asyncio_cancelled_error_propagates_and_closes() -> None:
             ),
             _event(
                 RunnerEventType.RUNNER_DONE,
-                RunnerDoneData(finish_reason=FinishReason.STOP),
+                RunnerDoneData(finish_reason=FinishReason.STOP, provider_request_id=None),
             ),
         ),
         block_after_first_event=True,
@@ -917,7 +996,7 @@ async def test_outer_asyncio_cancelled_error_propagates_and_closes() -> None:
         """
 
         async for event in agent.run_messages():
-            if event.type is EngineEventType.RUNNER_CONTENT_DELTA:
+            if event.type is EngineEventType.CONTENT_DELTA:
                 first_event_seen.set()
 
     task = asyncio.create_task(consume_until_cancelled())
@@ -949,7 +1028,7 @@ async def test_run_agent_and_wait_maps_final_failed_cancelled(
                 ),
                 _event(
                     RunnerEventType.RUNNER_DONE,
-                    RunnerDoneData(finish_reason=FinishReason.STOP),
+                    RunnerDoneData(finish_reason=FinishReason.STOP, provider_request_id=None),
                 ),
             )
         ),
@@ -957,7 +1036,7 @@ async def test_run_agent_and_wait_maps_final_failed_cancelled(
             events=(
                 _event(
                     RunnerEventType.RUNNER_DONE,
-                    RunnerDoneData(finish_reason=FinishReason.ERROR),
+                    RunnerDoneData(finish_reason=FinishReason.ERROR, provider_request_id=None),
                 ),
             )
         ),
@@ -986,15 +1065,18 @@ async def test_run_agent_and_wait_maps_final_failed_cancelled(
 
 
 @pytest.mark.asyncio
-async def test_run_agent_and_wait_rejects_unexpected_suspended(
+async def test_run_agent_and_wait_preserves_provider_request_id(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """RUN_SUSPENDED 不是 Phase 2 可用能力，wait 入口防御性失败。"""
+    """``RUN_FAILED`` 携带 provider_request_id 时，必须透传到 ``EngineRunOutcomeFailed``。"""
+
+    request = _request()
+    expected_provider_request_id = "req_provider_xyz"
 
     async def fake_messages(
         request: AgentRunRequest,
     ) -> AsyncIterator[EngineEvent]:
-        """产出意外 suspended terminal。
+        """产出携带 provider_request_id 的 ``RUN_FAILED`` 终态。
 
         :param request: Agent run 请求。
         :returns: EngineEvent 异步流。
@@ -1002,21 +1084,97 @@ async def test_run_agent_and_wait_rejects_unexpected_suspended(
         """
 
         yield EngineEvent(
-            event_id="run_phase2:0",
-            sequence=0,
+            occurred_at=_utc_now(),
+            session_id=request.session_id,
+            run_id=request.run_id,
+            type=EngineEventType.RUN_FAILED,
+            data=RunFailedData(
+                error_code="provider_http_error",
+                message="provider failed",
+                provider_request_id=expected_provider_request_id,
+                recoverable=False,
+            ),
+            metadata=None,
+        )
+
+    monkeypatch.setattr(agent_module, "run_agent_messages", fake_messages)
+    result = await agent_module.run_agent_and_wait(request)
+
+    assert isinstance(result, EngineRunOutcomeFailed)
+    assert result.provider_request_id == expected_provider_request_id
+    assert result.error_code == "provider_http_error"
+
+
+@pytest.mark.asyncio
+async def test_run_agent_and_wait_maps_suspended(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """run_agent_and_wait 必须把 RUN_SUSPENDED 映射为 suspended outcome。"""
+
+    await_spec = ToolAwaitSpec(
+        await_kind=ToolAwaitKind.EXTERNAL_JOB,
+        deadline=None,
+        resume_token="resume",
+    )
+    snapshot = ToolAwaitSnapshot(
+        snapshot_id="snapshot",
+        captured_at=_utc_now(),
+    )
+    tool_call = ToolCallRequest(
+        tool_call_id="tc_1",
+        name="add_numbers",
+        arguments={},
+        index_in_iteration=0,
+        provider_state=None,
+    )
+    batch_snapshot = AssistantToolCallBatchSnapshot(
+        iteration_id="run_phase2_iteration_1",
+        tool_calls=(tool_call,),
+        content=None,
+        reasoning_content=None,
+        provider_request_id=None,
+    )
+
+    async def fake_messages(
+        request: AgentRunRequest,
+    ) -> AsyncIterator[EngineEvent]:
+        """产出 suspended terminal。
+
+        :param request: Agent run 请求。
+        :returns: EngineEvent 异步流。
+        :raises Exception: 不主动抛出异常。
+        """
+
+        yield EngineEvent(
             occurred_at=_utc_now(),
             session_id=request.session_id,
             run_id=request.run_id,
             type=EngineEventType.RUN_SUSPENDED,
-            data=RunSuspendedData(reason="awaiting", resume_hint=None),
+            data=RunSuspendedData(
+                reason=RUN_SUSPENDED_REASON_TOOL_AWAITING,
+                resume_hint=None,
+                accepted_records=(),
+                awaiting_records=(
+                    AwaitingToolExecutionRecord(
+                        batch_snapshot=batch_snapshot,
+                        call=tool_call,
+                        await_spec=await_spec,
+                        snapshot=snapshot,
+                    ),
+                ),
+            ),
             metadata=None,
         )
 
     monkeypatch.setattr(agent_module, "run_agent_messages", fake_messages)
     result = await agent_module.run_agent_and_wait(_request())
 
-    assert isinstance(result, EngineRunOutcomeFailed)
-    assert result.error_code == "unexpected_suspended_in_phase3"
+    assert isinstance(result, EngineRunOutcomeSuspended)
+    assert result.reason == RUN_SUSPENDED_REASON_TOOL_AWAITING
+    assert result.resume_hint is None
+    assert len(result.awaiting_records) == 1
+    assert result.awaiting_records[0].await_spec is await_spec
+    assert result.awaiting_records[0].snapshot is snapshot
 
 
 def _terminal_count(events: Sequence[EngineEvent]) -> int:

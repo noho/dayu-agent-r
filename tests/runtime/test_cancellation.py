@@ -1,8 +1,9 @@
 """``dayu.runtime.cancellation`` helper 测试。
 
-覆盖 :func:`await_or_cancel` / :func:`wait_for_or_cancel` 的所有分支：
-正常完成、token 命中、timeout、cancellation 与 timeout 同时命中（cancel
-优先）、外层 ``Task.cancel()`` 透传、target task ownership 语义。
+覆盖 :func:`await_or_cancel`、:func:`wait_for_or_cancel` 与
+:func:`await_or_cancel_or_timeout` 的关键分支：正常完成、token 命中、
+timeout、cancellation 与 timeout 同时命中（cancel 优先）、外层
+``Task.cancel()`` 透传、target task ownership 语义。
 """
 
 from __future__ import annotations
@@ -17,6 +18,7 @@ from dayu.runtime.cancellation import (
     WaitCompleted,
     WaitTimedOut,
     await_or_cancel,
+    await_or_cancel_or_timeout,
     wait_for_or_cancel,
 )
 
@@ -54,7 +56,12 @@ class _FakeToken:
         return self._requested_at
 
 
-_FAST_POLL = 0.005
+_FAST_POLL: float = 0.005
+_FAST_TIMEOUT_SECONDS: float = _FAST_POLL * 4
+_SLOW_OPERATION_SECONDS: float = 5.0
+_EXPECTED_INT_VALUE: int = 42
+_EXPECTED_TEXT_VALUE: str = "value"
+_CANCEL_REASON: str = "user-stop"
 
 
 @pytest.mark.asyncio
@@ -63,14 +70,14 @@ async def test_await_or_cancel_returns_completed_on_success() -> None:
 
     async def _ok() -> int:
         await asyncio.sleep(0)
-        return 42
+        return _EXPECTED_INT_VALUE
 
     token = _FakeToken()
     outcome = await await_or_cancel(
         _ok(), token=token, poll_interval_seconds=_FAST_POLL
     )
     assert isinstance(outcome, WaitCompleted)
-    assert outcome.value == 42
+    assert outcome.value == _EXPECTED_INT_VALUE
 
 
 @pytest.mark.asyncio
@@ -80,12 +87,12 @@ async def test_await_or_cancel_returns_cancelled_when_token_hits() -> None:
     token = _FakeToken()
 
     async def _slow() -> int:
-        await asyncio.sleep(5)
+        await asyncio.sleep(_SLOW_OPERATION_SECONDS)
         return 0
 
     async def _trigger() -> None:
         await asyncio.sleep(_FAST_POLL * 2)
-        token.cancel(reason="user-stop")
+        token.cancel(reason=_CANCEL_REASON)
 
     trigger_task = asyncio.ensure_future(_trigger())
     try:
@@ -95,7 +102,7 @@ async def test_await_or_cancel_returns_cancelled_when_token_hits() -> None:
     finally:
         await trigger_task
     assert isinstance(outcome, WaitCancelled)
-    assert outcome.reason == "user-stop"
+    assert outcome.reason == _CANCEL_REASON
 
 
 @pytest.mark.asyncio
@@ -121,6 +128,33 @@ async def test_await_or_cancel_short_circuits_when_already_cancelled() -> None:
 
 
 @pytest.mark.asyncio
+async def test_await_or_cancel_closes_task_when_already_cancelled() -> None:
+    """入口已取消且传入 task 时，helper 必须取消并等待 target 收口。"""
+
+    token = _FakeToken()
+    target_done = asyncio.Event()
+
+    async def _target() -> None:
+        try:
+            await asyncio.sleep(_SLOW_OPERATION_SECONDS)
+        finally:
+            target_done.set()
+
+    task = asyncio.ensure_future(_target())
+    await asyncio.sleep(0)
+    token.cancel(reason=_CANCEL_REASON)
+
+    outcome = await await_or_cancel(
+        task, token=token, poll_interval_seconds=_FAST_POLL
+    )
+    assert isinstance(outcome, WaitCancelled)
+    assert outcome.reason == _CANCEL_REASON
+    assert task.done()
+    assert task.cancelled()
+    assert target_done.is_set()
+
+
+@pytest.mark.asyncio
 async def test_await_or_cancel_owns_target_and_cancels_on_token_hit() -> None:
     """token 命中时 helper 必须取消并等待 target task done，不留后台任务。"""
 
@@ -131,7 +165,7 @@ async def test_await_or_cancel_owns_target_and_cancels_on_token_hit() -> None:
     async def _target() -> None:
         nonlocal target_was_cancelled
         try:
-            await asyncio.sleep(5)
+            await asyncio.sleep(_SLOW_OPERATION_SECONDS)
         except asyncio.CancelledError:
             target_was_cancelled = True
             raise
@@ -179,7 +213,7 @@ async def test_await_or_cancel_propagates_outer_cancel() -> None:
     token = _FakeToken()
 
     async def _slow() -> None:
-        await asyncio.sleep(5)
+        await asyncio.sleep(_SLOW_OPERATION_SECONDS)
 
     async def _outer() -> None:
         await await_or_cancel(
@@ -194,23 +228,56 @@ async def test_await_or_cancel_propagates_outer_cancel() -> None:
 
 
 @pytest.mark.asyncio
+async def test_await_or_cancel_outer_cancel_closes_target() -> None:
+    """外层取消时 helper 必须取消并等待 target task 收口，不留孤儿协程。"""
+
+    token = _FakeToken()
+    target_done = asyncio.Event()
+    target_received_cancel = False
+
+    async def _slow() -> None:
+        nonlocal target_received_cancel
+        try:
+            await asyncio.sleep(_SLOW_OPERATION_SECONDS)
+        except asyncio.CancelledError:
+            target_received_cancel = True
+            raise
+        finally:
+            target_done.set()
+
+    async def _outer() -> None:
+        await await_or_cancel(
+            _slow(), token=token, poll_interval_seconds=_FAST_POLL
+        )
+
+    outer = asyncio.ensure_future(_outer())
+    await asyncio.sleep(_FAST_POLL * 2)
+    outer.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await outer
+    # 外层取消透传后，target task 必须已经被 helper 取消并收口。
+    assert target_done.is_set()
+    assert target_received_cancel is True
+
+
+@pytest.mark.asyncio
 async def test_wait_for_or_cancel_returns_completed_on_pending_done() -> None:
     """pending 完成时返回 :class:`WaitCompleted` 并保留调用方所有权。"""
 
     async def _ok() -> str:
         await asyncio.sleep(0)
-        return "value"
+        return _EXPECTED_TEXT_VALUE
 
     pending = asyncio.ensure_future(_ok())
     token = _FakeToken()
     outcome = await wait_for_or_cancel(
         pending,
         token=token,
-        timeout_seconds=1.0,
+        timeout_seconds=_SLOW_OPERATION_SECONDS,
         poll_interval_seconds=_FAST_POLL,
     )
     assert isinstance(outcome, WaitCompleted)
-    assert outcome.value == "value"
+    assert outcome.value == _EXPECTED_TEXT_VALUE
     assert pending.done()
 
 
@@ -219,7 +286,7 @@ async def test_wait_for_or_cancel_returns_timed_out() -> None:
     """timeout 命中时返回 :class:`WaitTimedOut`，pending 不被取消。"""
 
     async def _slow() -> None:
-        await asyncio.sleep(5)
+        await asyncio.sleep(_SLOW_OPERATION_SECONDS)
 
     pending = asyncio.ensure_future(_slow())
     token = _FakeToken()
@@ -227,7 +294,7 @@ async def test_wait_for_or_cancel_returns_timed_out() -> None:
         outcome = await wait_for_or_cancel(
             pending,
             token=token,
-            timeout_seconds=_FAST_POLL * 4,
+            timeout_seconds=_FAST_TIMEOUT_SECONDS,
             poll_interval_seconds=_FAST_POLL,
         )
         assert isinstance(outcome, WaitTimedOut)
@@ -267,7 +334,7 @@ async def test_wait_for_or_cancel_token_priority_over_timeout() -> None:
     """token 与 timeout 同时命中时优先返回 :class:`WaitCancelled`。"""
 
     async def _slow() -> None:
-        await asyncio.sleep(5)
+        await asyncio.sleep(_SLOW_OPERATION_SECONDS)
 
     pending = asyncio.ensure_future(_slow())
     token = _FakeToken()
@@ -296,7 +363,7 @@ async def test_wait_for_or_cancel_does_not_cancel_pending_on_token_hit() -> None
     """token 命中时 helper 不主动取消 pending，由调用方自行决定。"""
 
     async def _slow() -> None:
-        await asyncio.sleep(5)
+        await asyncio.sleep(_SLOW_OPERATION_SECONDS)
 
     pending = asyncio.ensure_future(_slow())
     token = _FakeToken()
@@ -330,7 +397,7 @@ async def test_wait_for_or_cancel_propagates_outer_cancel() -> None:
     """外层 ``Task.cancel()`` 必须透传到等待协程。"""
 
     async def _slow() -> None:
-        await asyncio.sleep(5)
+        await asyncio.sleep(_SLOW_OPERATION_SECONDS)
 
     pending = asyncio.ensure_future(_slow())
     token = _FakeToken()
@@ -353,3 +420,220 @@ async def test_wait_for_or_cancel_propagates_outer_cancel() -> None:
         await pending
     except asyncio.CancelledError:
         pass
+
+
+@pytest.mark.asyncio
+async def test_await_or_cancel_or_timeout_returns_completed() -> None:
+    """awaitable 正常完成时返回 :class:`WaitCompleted`。"""
+
+    async def _ok() -> str:
+        await asyncio.sleep(0)
+        return _EXPECTED_TEXT_VALUE
+
+    token = _FakeToken()
+    outcome = await await_or_cancel_or_timeout(
+        _ok(),
+        token=token,
+        timeout_seconds=_SLOW_OPERATION_SECONDS,
+        poll_interval_seconds=_FAST_POLL,
+    )
+    assert isinstance(outcome, WaitCompleted)
+    assert outcome.value == _EXPECTED_TEXT_VALUE
+
+
+@pytest.mark.asyncio
+async def test_await_or_cancel_or_timeout_returns_cancelled() -> None:
+    """token 命中时取消 target task 并返回 :class:`WaitCancelled`。"""
+
+    token = _FakeToken()
+
+    async def _slow() -> None:
+        await asyncio.sleep(_SLOW_OPERATION_SECONDS)
+
+    async def _trigger() -> None:
+        await asyncio.sleep(_FAST_POLL * 2)
+        token.cancel(reason=_CANCEL_REASON)
+
+    trigger_task = asyncio.ensure_future(_trigger())
+    try:
+        outcome = await await_or_cancel_or_timeout(
+            _slow(),
+            token=token,
+            timeout_seconds=_SLOW_OPERATION_SECONDS,
+            poll_interval_seconds=_FAST_POLL,
+        )
+    finally:
+        await trigger_task
+    assert isinstance(outcome, WaitCancelled)
+    assert outcome.reason == _CANCEL_REASON
+
+
+@pytest.mark.asyncio
+async def test_await_or_cancel_or_timeout_returns_timed_out() -> None:
+    """timeout 命中时取消 target task 并返回 :class:`WaitTimedOut`。"""
+
+    token = _FakeToken()
+    target_done = asyncio.Event()
+
+    async def _slow() -> None:
+        try:
+            await asyncio.sleep(_SLOW_OPERATION_SECONDS)
+        finally:
+            target_done.set()
+
+    outcome = await await_or_cancel_or_timeout(
+        _slow(),
+        token=token,
+        timeout_seconds=_FAST_TIMEOUT_SECONDS,
+        poll_interval_seconds=_FAST_POLL,
+    )
+    assert isinstance(outcome, WaitTimedOut)
+    assert outcome.elapsed_seconds >= 0
+    assert target_done.is_set()
+
+
+@pytest.mark.asyncio
+async def test_await_or_cancel_or_timeout_cancel_priority_over_timeout() -> None:
+    """cancellation 与 timeout 同时命中时返回 :class:`WaitCancelled`。"""
+
+    token = _FakeToken()
+    token.cancel(reason="prio")
+
+    async def _slow() -> None:
+        await asyncio.sleep(_SLOW_OPERATION_SECONDS)
+
+    outcome = await await_or_cancel_or_timeout(
+        _slow(),
+        token=token,
+        timeout_seconds=0.0,
+        poll_interval_seconds=_FAST_POLL,
+    )
+    assert isinstance(outcome, WaitCancelled)
+    assert outcome.reason == "prio"
+
+
+@pytest.mark.asyncio
+async def test_await_or_cancel_or_timeout_short_circuits_when_cancelled() -> None:
+    """入口已取消时不启动 target awaitable。"""
+
+    token = _FakeToken()
+    token.cancel(reason=_CANCEL_REASON)
+    started = False
+
+    async def _target() -> None:
+        nonlocal started
+        started = True
+
+    outcome = await await_or_cancel_or_timeout(
+        _target(),
+        token=token,
+        timeout_seconds=_SLOW_OPERATION_SECONDS,
+        poll_interval_seconds=_FAST_POLL,
+    )
+    assert isinstance(outcome, WaitCancelled)
+    assert outcome.reason == _CANCEL_REASON
+    assert started is False
+
+
+@pytest.mark.asyncio
+async def test_await_or_cancel_or_timeout_closes_task_when_cancelled() -> None:
+    """入口已取消且传入 task 时，helper 仍取消并等待 target 收口。"""
+
+    token = _FakeToken()
+    target_done = asyncio.Event()
+
+    async def _target() -> None:
+        try:
+            await asyncio.sleep(_SLOW_OPERATION_SECONDS)
+        finally:
+            target_done.set()
+
+    task = asyncio.ensure_future(_target())
+    await asyncio.sleep(0)
+    token.cancel(reason=_CANCEL_REASON)
+
+    outcome = await await_or_cancel_or_timeout(
+        task,
+        token=token,
+        timeout_seconds=_SLOW_OPERATION_SECONDS,
+        poll_interval_seconds=_FAST_POLL,
+    )
+    assert isinstance(outcome, WaitCancelled)
+    assert outcome.reason == _CANCEL_REASON
+    assert task.done()
+    assert task.cancelled()
+    assert target_done.is_set()
+
+
+@pytest.mark.asyncio
+async def test_await_or_cancel_or_timeout_propagates_awaitable_exception() -> None:
+    """awaitable 自身异常应原样透传。"""
+
+    class _Boom(RuntimeError):
+        pass
+
+    async def _raises() -> None:
+        raise _Boom("kaboom")
+
+    token = _FakeToken()
+    with pytest.raises(_Boom, match="kaboom"):
+        await await_or_cancel_or_timeout(
+            _raises(),
+            token=token,
+            timeout_seconds=_SLOW_OPERATION_SECONDS,
+            poll_interval_seconds=_FAST_POLL,
+        )
+
+
+@pytest.mark.asyncio
+async def test_await_or_cancel_or_timeout_outer_cancel_closes_target() -> None:
+    """外层取消时 helper 必须取消 target task 并透传 ``CancelledError``。"""
+
+    token = _FakeToken()
+    target_done = asyncio.Event()
+
+    async def _slow() -> None:
+        try:
+            await asyncio.sleep(_SLOW_OPERATION_SECONDS)
+        finally:
+            target_done.set()
+
+    async def _outer() -> None:
+        await await_or_cancel_or_timeout(
+            _slow(),
+            token=token,
+            timeout_seconds=_SLOW_OPERATION_SECONDS,
+            poll_interval_seconds=_FAST_POLL,
+        )
+
+    outer = asyncio.ensure_future(_outer())
+    await asyncio.sleep(_FAST_POLL * 2)
+    outer.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await outer
+    assert target_done.is_set()
+
+
+@pytest.mark.asyncio
+async def test_await_or_cancel_or_timeout_target_receives_cancelled_error() -> None:
+    """timeout 路径必须让 target 收到 ``asyncio.CancelledError``。"""
+
+    token = _FakeToken()
+    target_received_cancel = False
+
+    async def _slow() -> None:
+        nonlocal target_received_cancel
+        try:
+            await asyncio.sleep(_SLOW_OPERATION_SECONDS)
+        except asyncio.CancelledError:
+            target_received_cancel = True
+            raise
+
+    outcome = await await_or_cancel_or_timeout(
+        _slow(),
+        token=token,
+        timeout_seconds=_FAST_TIMEOUT_SECONDS,
+        poll_interval_seconds=_FAST_POLL,
+    )
+    assert isinstance(outcome, WaitTimedOut)
+    assert target_received_cancel is True
