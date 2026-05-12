@@ -195,6 +195,13 @@ class ToolCallsBatchDoneData:
 
     cancelled 不再被计入 failed。
 
+    本事件仅在本批不含 :class:`~dayu.contracts.tool_outcome.ToolAwaitingOutcome`
+    时产出。当批次内出现 awaiting outcome 时，Engine 先逐个产出 accepted
+    工具的 ``tool_result_accepted``，再为 awaiting 工具产出 ``tool_awaiting``，
+    随后直接以 ``run_suspended`` 收口，**不**产出 ``tool_calls_batch_done``。
+    调用方依赖批处理完整性信号时，必须同时识别 ``tool_awaiting`` +
+    ``run_suspended`` 的 awaiting 路径。
+
     :param iteration_id: 当前迭代 id。
     :param tool_call_ids: 本批已接受 completed / failed / cancelled
         outcome 的工具 id，按输入顺序排列。

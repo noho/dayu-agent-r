@@ -68,10 +68,13 @@ class AgentPolicy:
     def __post_init__(self) -> None:
         """校验 Agent 策略边界。
 
-        :raises ValueError: timeout 非正数、continuation 次数小于 0、
-            continuation prompt 为空或连续失败工具批次阈值小于 1 时抛出。
+        :raises ValueError: ``max_iterations`` 小于 1、timeout 非正数、
+            continuation 次数小于 0、continuation prompt 为空、
+            fallback prompt 为空或连续失败工具批次阈值小于 1 时抛出。
         """
 
+        if self.max_iterations < 1:
+            raise ValueError("AgentPolicy.max_iterations must be >= 1")
         if (
             not math.isfinite(self.tool_execution_timeout_seconds)
             or self.tool_execution_timeout_seconds <= 0
@@ -85,6 +88,8 @@ class AgentPolicy:
             )
         if self.continuation_prompt.strip() == "":
             raise ValueError("AgentPolicy.continuation_prompt must not be empty")
+        if self.fallback_prompt.strip() == "":
+            raise ValueError("AgentPolicy.fallback_prompt must not be empty")
         if self.max_consecutive_failed_tool_batches < 1:
             raise ValueError(
                 "AgentPolicy.max_consecutive_failed_tool_batches must be >= 1"

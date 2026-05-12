@@ -782,6 +782,25 @@ def test_agent_policy_rejects_invalid_values() -> None:
                 allow_tool_calls=True,
                 tool_execution_timeout_seconds=timeout_seconds,
             )
+    # max_iterations < 1 必须在构造期被拒。
+    for invalid_max_iterations in (0, -1):
+        with pytest.raises(ValueError):
+            AgentPolicy(
+                max_iterations=invalid_max_iterations,
+                continuation_max_attempts=_NO_CONTINUATION_ATTEMPTS,
+                allow_tool_calls=True,
+                tool_execution_timeout_seconds=_TOOL_EXECUTION_TIMEOUT_SECONDS,
+            )
+    # fallback_prompt 为空 / 纯空白必须在构造期被拒。
+    for invalid_fallback_prompt in ("", "   ", "\n\t"):
+        with pytest.raises(ValueError):
+            AgentPolicy(
+                max_iterations=_MINIMAL_MAX_ITERATIONS,
+                continuation_max_attempts=_NO_CONTINUATION_ATTEMPTS,
+                allow_tool_calls=True,
+                tool_execution_timeout_seconds=_TOOL_EXECUTION_TIMEOUT_SECONDS,
+                fallback_prompt=invalid_fallback_prompt,
+            )
 
 
 def test_tool_await_spec_rejects_invalid_resume_token() -> None:

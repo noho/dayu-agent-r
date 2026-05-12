@@ -98,6 +98,9 @@ async def await_or_cancel(
       ``asyncio.CancelledError``），再返回 :class:`WaitCancelled`，
       **禁止**留下后台运行的 target task。
     - awaitable 抛异常时透传，target task 已 done。
+    - helper 自身被外层 ``Task.cancel()`` 取消时，先取消并等待
+      target task 收口，避免后台孤儿协程泄漏，再重新抛出
+      ``asyncio.CancelledError``。
 
     :param awaitable: 需要等待的 awaitable / coroutine。
     :param token: 取消观察 token。
@@ -105,6 +108,8 @@ async def await_or_cancel(
     :returns: :class:`WaitCompleted` 或 :class:`WaitCancelled`。
 
     :raises Exception: 透传 ``awaitable`` 自身的异常。
+    :raises asyncio.CancelledError: helper 所在 task 被外层取消时透传，
+        target task 已被取消并收口。
     """
 
     if token.is_cancelled():
@@ -129,6 +134,11 @@ async def await_or_cancel(
             return WaitCancelled(reason=token.cancel_reason())
         # target_task 完成（或异常）；watcher 还在跑则清理。
         return WaitCompleted(value=await target_task)
+    except asyncio.CancelledError:
+        # helper 自身被外层 ``Task.cancel()`` 取消：取消并等待 target task
+        # 收口，避免后台孤儿协程泄漏，然后重新抛出 ``CancelledError``。
+        await _cancel_task_and_wait(target_task)
+        raise
     finally:
         if not cancel_watcher.done():
             await _cancel_task_and_wait(cancel_watcher)

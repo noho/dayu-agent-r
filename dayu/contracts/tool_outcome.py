@@ -86,17 +86,16 @@ class ToolAwaitingOutcome:
 class ToolCancelledOutcome:
     """工具级取消终态。
 
-    区别于 run 级取消：run 级取消是 Host / 上层主动撤回整个运行，由
-    Engine 终态 ``RunCancelledData`` 表达；工具级取消是单次工具执行
-    在工具自身边界内被取消（如工具内部超时、Host 工具治理决策放弃单
-    个工具），不连带影响其它工具调用与整个 run。
+    区别于 run 级取消：run 级取消由调用方主动撤回整个运行；工具级取消
+    是单次工具调用在工具自身边界内被取消（如工具内部超时、上层治理决策
+    放弃单个工具），不连带影响其它工具调用与整个 run。
 
-    取消事实不是失败：``_consecutive_failed_tool_batches`` 计数器不
-    将本终态计入失败。
+    语义上取消不等同于失败：取消终态不计入连续失败工具批次计数，由消费侧
+    自行解释。本契约层不感知任何 Engine 内部计数器或字段名。
 
     :param reason: 取消原因机器码，必须取自
         :data:`ALLOWED_TOOL_CANCELLED_REASONS`。
-    :param message: 面向 LLM 的人类可读说明。
+    :param message: 面向 LLM 的人类可读说明；不允许空字符串或纯空白。
     :param hint: 可选恢复提示，注入 LLM 时合并到投影体里。
     :param meta: 中性元信息（如 tool_name / started_at / finished_at），
         与其它 outcome 保持一致；无元信息时为 ``None``。
@@ -112,7 +111,8 @@ class ToolCancelledOutcome:
 
         :returns: 无返回值。
         :raises ValueError: ``reason`` 不在
-            :data:`ALLOWED_TOOL_CANCELLED_REASONS` 内或 ``message`` 为空时抛出。
+            :data:`ALLOWED_TOOL_CANCELLED_REASONS` 内或 ``message``
+            为空 / 纯空白时抛出。
         """
 
         if self.reason not in ALLOWED_TOOL_CANCELLED_REASONS:
@@ -120,7 +120,7 @@ class ToolCancelledOutcome:
                 "ToolCancelledOutcome.reason must be one of"
                 f" {sorted(ALLOWED_TOOL_CANCELLED_REASONS)}, got {self.reason!r}"
             )
-        if not self.message:
+        if self.message.strip() == "":
             raise ValueError("ToolCancelledOutcome.message must be non-empty")
 
 

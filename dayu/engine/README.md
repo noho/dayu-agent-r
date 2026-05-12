@@ -383,6 +383,8 @@ Runner 的 `runner_done` 只表示本次 RunnerEvent 流结束；提升到 Engin
 
 工具观测事件分三层：`tool_call_delta` 直接提升 Runner 的流式工具增量；`tool_calls_batch_ready` 表示 Agent 已接受 Runner 完成的本批工具调用，顺序与 Runner 完成顺序一致；`tool_calls_batch_done` 表示本批工具的 completed / failed outcome 已全部被 Engine 接受。`tool_call_requested` 仍表示 Agent 即将执行单个工具。`tool_calls_batch_done` 不是终态，不属于 `TERMINAL_ENGINE_EVENT_TYPES`。
 
+当本批工具包含 `ToolAwaitingOutcome` 时，Engine 先逐个产出 accepted 工具的 `tool_result_accepted`，再为每个 awaiting 工具产出 `tool_awaiting`，随后直接以 `run_suspended` 收口；**不**产出 `tool_calls_batch_done`。换言之，`tool_calls_batch_done` 仅在本批不含 awaiting 时产出，作为 "本批 accepted outcome 已全部接受、可进入下一轮 Runner" 的信号；调用方依赖批处理完整性时必须同时识别 `tool_awaiting` + `run_suspended` 的 awaiting 路径。
+
 HTTP 200 response 在 effective stream 为 `True` 且 `Content-Type` 为 `text/event-stream` 或不含 JSON 时按 SSE 解析；`Content-Type` 含 JSON 或 effective stream 为 `False` 时按非流式 JSON 解析。
 
 ## 关键机制

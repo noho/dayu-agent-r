@@ -2451,6 +2451,7 @@ async def run_agent_and_wait(request: AgentRunRequest) -> AgentRunResult:
             run_id=request.run_id,
             error_code=_ERROR_MISSING_TERMINAL,
             message=_MISSING_TERMINAL_MESSAGE,
+            provider_request_id=None,
             recoverable=False,
         )
 
@@ -2474,6 +2475,7 @@ async def run_agent_and_wait(request: AgentRunRequest) -> AgentRunResult:
             run_id=terminal.run_id,
             error_code=data.error_code,
             message=data.message,
+            provider_request_id=data.provider_request_id,
             recoverable=data.recoverable,
         )
     if terminal.type is EngineEventType.RUN_CANCELLED and isinstance(
@@ -2503,6 +2505,7 @@ async def run_agent_and_wait(request: AgentRunRequest) -> AgentRunResult:
         run_id=request.run_id,
         error_code=_ERROR_MISSING_TERMINAL,
         message=_MISSING_TERMINAL_MESSAGE,
+        provider_request_id=None,
         recoverable=False,
     )
 

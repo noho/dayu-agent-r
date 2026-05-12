@@ -891,7 +891,7 @@ async def test_length_and_content_filter_final_boundaries() -> None:
 
 @pytest.mark.asyncio
 async def test_abnormal_stop_and_max_iterations_fail() -> None:
-    """无 done 异常结束与 max_iterations<1 都收口 run_failed。"""
+    """无 done 异常结束触发 run_failed；``max_iterations<1`` 在 contract 构造期被拒。"""
 
     abnormal = await _collect(
         _AsyncAgent(
@@ -911,12 +911,21 @@ async def test_abnormal_stop_and_max_iterations_fail() -> None:
 
     exceeded = await _collect(
         _AsyncAgent(
-            request=_request(max_iterations=0),
+            request=_request(),
             runner=_ScriptedRunner(events=()),
         )
     )
     assert isinstance(exceeded[-1].data, RunFailedData)
-    assert exceeded[-1].data.error_code == "max_iterations_exceeded"
+
+    # AgentPolicy 在构造期直接拒绝 ``max_iterations < 1``，
+    # 防止非法策略对象在系统中传递。
+    with pytest.raises(ValueError):
+        AgentPolicy(
+            max_iterations=0,
+            continuation_max_attempts=0,
+            allow_tool_calls=False,
+            tool_execution_timeout_seconds=1.0,
+        )
 
 
 @pytest.mark.asyncio
@@ -1053,6 +1062,47 @@ async def test_run_agent_and_wait_maps_final_failed_cancelled(
         )
         result = await agent_module.run_agent_and_wait(current_request)
         assert isinstance(result, expected_type)
+
+
+@pytest.mark.asyncio
+async def test_run_agent_and_wait_preserves_provider_request_id(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """``RUN_FAILED`` 携带 provider_request_id 时，必须透传到 ``EngineRunOutcomeFailed``。"""
+
+    request = _request()
+    expected_provider_request_id = "req_provider_xyz"
+
+    async def fake_messages(
+        request: AgentRunRequest,
+    ) -> AsyncIterator[EngineEvent]:
+        """产出携带 provider_request_id 的 ``RUN_FAILED`` 终态。
+
+        :param request: Agent run 请求。
+        :returns: EngineEvent 异步流。
+        :raises Exception: 不主动抛出异常。
+        """
+
+        yield EngineEvent(
+            occurred_at=_utc_now(),
+            session_id=request.session_id,
+            run_id=request.run_id,
+            type=EngineEventType.RUN_FAILED,
+            data=RunFailedData(
+                error_code="provider_http_error",
+                message="provider failed",
+                provider_request_id=expected_provider_request_id,
+                recoverable=False,
+            ),
+            metadata=None,
+        )
+
+    monkeypatch.setattr(agent_module, "run_agent_messages", fake_messages)
+    result = await agent_module.run_agent_and_wait(request)
+
+    assert isinstance(result, EngineRunOutcomeFailed)
+    assert result.provider_request_id == expected_provider_request_id
+    assert result.error_code == "provider_http_error"
 
 
 @pytest.mark.asyncio

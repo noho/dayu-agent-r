@@ -169,3 +169,19 @@ def test_cancelled_rejects_empty_message() -> None:
             hint=None,
             meta=None,
         )
+
+
+def test_cancelled_rejects_whitespace_message() -> None:
+    """``message`` 为纯空白必须在构造期抛出 :class:`ValueError`。
+
+    取消语义需要可解释 message；纯空白与空字符串等价无效。
+    """
+
+    for invalid_message in ("   ", "\t", "\n", "  \t  \n"):
+        with pytest.raises(ValueError):
+            ToolCancelledOutcome(
+                reason=TOOL_CANCELLED_REASON_APPROVAL_DENIED,
+                message=invalid_message,
+                hint=None,
+                meta=None,
+            )

@@ -19,6 +19,7 @@
 
 from __future__ import annotations
 
+import math
 from collections.abc import Mapping
 from dataclasses import dataclass
 from typing import TypeAlias
@@ -101,18 +102,45 @@ class BatchToolExecutionContext:
     cancellation_token: CancellationToken
     correlation_id: str | None
 
+    def __post_init__(self) -> None:
+        """校验批级运行期上下文。
+
+        :returns: 无返回值。
+        :raises ValueError: ``timeout_seconds`` 不为 ``None`` 且不是有限正数时抛出。
+        """
+
+        if self.timeout_seconds is not None and (
+            not math.isfinite(self.timeout_seconds) or self.timeout_seconds <= 0
+        ):
+            raise ValueError(
+                "BatchToolExecutionContext.timeout_seconds must be None or"
+                " a finite positive number"
+            )
+
 
 @dataclass(frozen=True, slots=True)
 class BatchToolExecutionRequest:
     """批式工具执行入参。
 
     :param calls: 本次批内所有工具调用，按 LLM 输出顺序排列；元组语义
-        意味着不可变快照。
+        意味着不可变快照。非空：批式执行至少包含一次调用。
     :param context: 共享的批级执行上下文。
     """
 
     calls: tuple[ToolCallRequest, ...]
     context: BatchToolExecutionContext
+
+    def __post_init__(self) -> None:
+        """校验批式入参最小完整性。
+
+        :returns: 无返回值。
+        :raises ValueError: ``calls`` 为空时抛出。
+        """
+
+        if not self.calls:
+            raise ValueError(
+                "BatchToolExecutionRequest.calls must be non-empty"
+            )
 
 
 __all__ = [

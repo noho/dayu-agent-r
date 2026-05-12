@@ -117,6 +117,9 @@ class EngineRunOutcomeFailed:
     :param run_id: 运行 id。
     :param error_code: 中性错误码。
     :param message: 人类可读错误描述。
+    :param provider_request_id: 若失败直接源自 provider response 或
+        provider protocol，则为对应 request id；非 provider 失败为
+        ``None``。
     :param recoverable: 是否可恢复。
     """
 
@@ -124,6 +127,7 @@ class EngineRunOutcomeFailed:
     run_id: str
     error_code: str
     message: str
+    provider_request_id: str | None
     recoverable: bool
 
 

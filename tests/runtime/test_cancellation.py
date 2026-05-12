@@ -228,6 +228,39 @@ async def test_await_or_cancel_propagates_outer_cancel() -> None:
 
 
 @pytest.mark.asyncio
+async def test_await_or_cancel_outer_cancel_closes_target() -> None:
+    """外层取消时 helper 必须取消并等待 target task 收口，不留孤儿协程。"""
+
+    token = _FakeToken()
+    target_done = asyncio.Event()
+    target_received_cancel = False
+
+    async def _slow() -> None:
+        nonlocal target_received_cancel
+        try:
+            await asyncio.sleep(_SLOW_OPERATION_SECONDS)
+        except asyncio.CancelledError:
+            target_received_cancel = True
+            raise
+        finally:
+            target_done.set()
+
+    async def _outer() -> None:
+        await await_or_cancel(
+            _slow(), token=token, poll_interval_seconds=_FAST_POLL
+        )
+
+    outer = asyncio.ensure_future(_outer())
+    await asyncio.sleep(_FAST_POLL * 2)
+    outer.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await outer
+    # 外层取消透传后，target task 必须已经被 helper 取消并收口。
+    assert target_done.is_set()
+    assert target_received_cancel is True
+
+
+@pytest.mark.asyncio
 async def test_wait_for_or_cancel_returns_completed_on_pending_done() -> None:
     """pending 完成时返回 :class:`WaitCompleted` 并保留调用方所有权。"""
 
