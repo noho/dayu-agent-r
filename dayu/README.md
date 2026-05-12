@@ -9,7 +9,10 @@
 
 ## 设计目标
 
-- 宿主强约束下的 LLM in the loop。
+- 生产级买方财报分析 Agent
+- 范式是“宿主强约束下的 LLM in the loop”
+- 支持单机多客户端 / 多进程
+- 支持本地 Engine 和远程 Engine 并列执行
 
 ## 整体架构
 
@@ -23,7 +26,7 @@ UI -> Service -> Host -> Engine
 
 - `UI` 负责用户交互入口，只处理展示、输入收集与命令触发。
 - `Service` 负责业务请求受理与场景装配，把用户意图转成可执行请求。
-- `Host` 负责 Agent 运行宿主边界，拥有 session / run 生命周期、取消、治理、工具运行时与恢复策略。
+- `Host` 负责 Agent 运行宿主边界，拥有 session / run / attempt 生命周期、admission、取消、恢复、EventLog、工具运行时、memory / context governance 与 projection。
 - `Engine` 负责执行已准备好的模型交互、Runner / Agent 状态机与强类型事件流。
 
 依赖只能沿 `UI -> Service -> Host -> Engine` 向下发生；下层不得反向依赖上层。Engine 不理解 UI、Service 或 Host 的治理细节；Host 不承载财报业务语义；Service 不绕过 Host 直接控制 Engine。
@@ -34,20 +37,85 @@ UI -> Service -> Host -> Engine
 
 ## 术语约定
 
-以下术语用于描述 Agent 执行链路。包级 README 和设计文档应优先使用这些词，避免同一概念多名并存。
+以下术语用于描述 Agent 执行链路。本节是后续 Host / Engine / Service 相关 phase discussion、phase plan、
+implementation、review、fix 与 re-review 的项目级术语真源。包级 README 和设计文档必须使用这些词；
+不得在计划或实现中自行重解释同一术语。若术语缺失、冲突或不足以指导实施，应先讨论并更新本节及对应设计文档。
 
-- `session`：一条可持续的会话上下文。它属于 Host / 上层语义，Engine 不持有 session 生命周期。
-- `run`：一次 Agent 执行请求。一个 session 可以包含多次 run；Engine 只处理单次 run 的执行语义。
-- `attempt`：Host 为完成一次 run 发起的内部尝试。attempt 可用于 retry、恢复或治理，不进入 Engine 执行状态机。
+- `Session` / `session`：一条可持续的会话上下文。它属于 Host / 上层语义，Engine 不持有 session 生命周期。Session 状态只表达 `OPEN` / `CLOSED`。
+- `session slot`：外部入口复用当前 Session 的槽位，由 `(scope, slot_key)` 标识。WeChat 稳定身份、CLI `--label`、GUI 当前会话都可以映射到 slot。
+- `ensure_session`：Host 公共接口，表示“返回这个 slot 当前 Session，不存在则创建并绑定”。它按 `(scope, slot_key)` 幂等，不需要 `client_request_id`。
+- `create_session`：Host 公共接口，表示“明确创建一个新 Session”。它按 `client_request_id` 幂等；可选把新 Session 绑定到某个 session slot。
+- `Run` / `run`：用户可见的一次 Agent 目标 / 问题 / follow-up，属于一个 Session。一个 Session 可以包含多个 Run；Engine 只处理单次 `AgentRunRequest` 的执行语义。
+- `Attempt` / `attempt`：Host 为完成某个 Run 派发给本地或远程 EngineWorker 的一次执行。retry、resume、steer、replay 都创建新 Attempt，不复用旧 Agent / Runner / EngineWorker。
+- `Run status`：Host 管理的 Run 生命周期状态。当前设计集合为 `QUEUED`、`RUNNING`、`WAITING`、`CANCELLING`、`RECOVERING`、`SUCCEEDED`、`FAILED`、`CANCELLED`、`LOST`；其中 `SUCCEEDED`、`FAILED`、`CANCELLED`、`LOST` 是终态。
+- `Attempt status`：Host 管理的一次执行尝试状态。当前设计集合为 `RUNNING`、`SUCCEEDED`、`FAILED`、`CANCELLED`、`SUSPENDED`、`STEERED`、`LOST`；Attempt 终态不等于 Run 必然终态。
+- `active Run`：同一 Session 内当前占用执行槽位的 Run。Host 设计语义是同一 Session 同时最多一个 active Run。
+- `durable queue`：Host 已接受但尚未启动的 queued Run 集合。queued Run 必须持久化，不是内存队列项。
+- `promotion`：把一个已持久化的 `QUEUED` Run 提升为 `RUNNING` 并创建 Attempt。promotion 只在同一 Session 没有 active Run 时发生；active Run 存在时仍可接受 queue 或 steer，但不能启动另一个 queued Run。
+- `admission`：Host 对同一 Session 的并发入口治理。它决定新输入是直接启动、排队、拒绝、attach active，还是 steer 当前 Run。
+- `queue`：active Run 存在时，把新用户输入接受为后续 queued Run。
+- `steer`：active Run 存在时，把用户输入作用于当前 Run，并通过新 Attempt 继续；它不创建并列 Run。
 - `iteration`：Engine 内一次模型调用与后续决策循环。一次 run 可以包含多次 iteration，例如普通 tool loop 或 final-answer continuation。
+- `final_answer`：Engine terminal event，表示 assistant role 产出的最终回答。它不是 user role message 的返回值，也不是自动验证事实。
+- `assistant conclusion`：Memory 语境中对 `final_answer` 的保守称呼，表示助手结论。它可以作为 raw turn 的 assistant 输出参与追问连续性，但绝不能自动升级为 verified fact。
+- `verified fact`：Host / memory 中可作为事实使用的稳定信息。Host 只接受工具事实；用户输入、assistant final answer、summary、projection 都不能自动升级为 verified fact。
+- `EventLog`：Host 持有的 append-only 事件事实源。Run / Attempt 状态、RunResult、Session timeline、trace、audit、outbox 等能力只能从 EventLog 或同一持久化事务内的事实派生，不反向成为恢复输入真源。
+- `canonical event`：可恢复、可审计、可投影的 Host 事实事件。Host resume 构造新的 `AgentRunRequest.messages` 时，应以 canonical EventLog facts 为真源。
+- `USER_INPUT_ACCEPTED`：Host canonical event，表示某次用户输入已经被 durable accepted，并绑定到具体 Session / Run。它通常包含输入正文或 ref / digest、`session_id`、`run_id`、`client_request_id`、actor、source 和 accepted time；它不是 UI 临时文本，也不是仅一段裸 prompt。
+- `EngineEvent stream`：EngineWorker 执行 Engine 时产出的事件流。它是 Host ingest 的输入来源之一，不是 Host 事实真源。
+- `RunnerEvent stream`：Runner 到 Agent 的 provider 协议归一事件流，只在 Engine 内部消费，不直接暴露给 Engine 调用方，也不是 Host 事实真源。
+- `SSE stream` / `provider streaming`：Runner 与 provider 之间的传输能力，由 Runner 规约和单次 Runner 调用参数控制。它不是 `EngineEvent stream`，也不是 `Host event stream`。
+- `Host event stream`：Host 对 UI / CLI / Web / GUI 暴露的订阅与补读事件流。它来自 EventLog `event_sequence` cursor，不触发执行。
+- `preview event`：面向流式展示的临时事件。preview event 可以改善 UI 体验，但不能作为恢复、投递或 RunResult 的唯一事实来源。
+- `preview delta`：模型 content / reasoning / tool-call 的增量片段，只服务 UI 流式体验，默认不是 canonical fact。
+- `stream fanout`：把已提交 Host events 分发给多个 UI 客户端的 projection / sink。慢客户端必须用 `event_sequence` cursor 补读，不能反压 EventLog append。
+- `event_sequence`：Host durable store 分配的全局单调事件序列，是 Host event stream cursor、projection checkpoint、outbox、audit replay 和 recovery scan 的主 cursor。远端 ordering hint 不能替代 Host 分配的 `event_sequence`。
+- `execution_id`：Host 为一次 attempt 分配的执行 epoch，用于校验 Proxy / Stub / EngineWorker 回传事件是否属于当前 active attempt。它用于拒绝迟到事件污染 EventLog，不代表远端执行环境拥有 Host 治理状态。
+- `RunSnapshot` / `SessionSnapshot`：Host read model 快照。它们用于读取当前状态和游标，不是事实真源。
+- `RunResult`：Run 终态结果投影，不是事实真源；事实真源仍是 EventLog 与同事务状态索引。
+- `Session timeline`：面向 UI / read model 的会话展示视图，不是 RunInputBuilder 的事实真源。
+- `Observer` / `Sink` / `Projection`：消费已提交 EventLog 的派生机制。audit、usage、tool trace、stream fanout、memory snapshot、outbox 都属于 projection / sink；sink 失败不能回滚 EventLog。
+- `tool trace hot data`：tool trace 的热数据层，使用结构化 JSON projection 保存近期可查询、可展示、可关联的工具调用摘要、策略决策、证据锚点和错误 / 截断 / 等待信息。
+- `tool trace cold data`：tool trace 的冷数据层，使用 append-only JSONL 保存归档、批处理、离线审计所需的长诊断明细。JSON / JSONL 都是 EventLog 派生 projection，不是恢复、resume、memory 或 Run 状态迁移真源。
+- `Outbox`：Run terminal 后向 UI、Web、WeChat、CLI 等外部入口投递 final answer 的隔离通道。投递失败不能回滚 Run terminal，也不参与 resume / memory 事实重建。
+- `WorkerProxy`：Host 到执行环境的适配边界。LocalProxy 与 RemoteProxy 只负责传输、启动、取消控制和事件回传，不拥有 Session / Run / Attempt / EventLog 真源。
+- `EngineWorker`：承载一次 Engine 执行的执行环境能力。EngineWorker 可以位于本机或远端；无论位置如何，它只执行并回传事件 / 结果，不 append EventLog、不关闭 attempt、不更新 Run 状态。
+- `RemoteStub`：远端执行环境中的代理端点，负责把 RemoteProxy 的请求转为 EngineWorker 执行并回传事件 / 结果。RemoteStub 不拥有 Host 治理状态。
+- `ToolRuntime`：Host-owned 工具治理模块，作为 `ToolExecutor` 提供给 EngineWorker / Engine。它负责工具注册装配、policy、awaiting、truncation / fetch_more、语义级重复调用治理、tool trace 所需诊断和工具级幂等。
+- `ToolExecutor`：Engine 可见的工具执行协议。Engine 只调用 `ToolExecutor.execute(...)`；Host / ToolRuntime 负责把工具注册、权限、截断、等待、幂等、审计和重复调用治理包装成该协议。
+- `semantic duplicate tool governance` / `语义级重复工具调用治理`：Host / ToolRuntime 对语义级重复工具调用的治理。Engine 只处理结构性工具调用协议，不理解工具语义、业务幂等性、历史证据质量或重复读取是否有意义。
+- `TruncationManager`：ToolRuntime 内的工具结果截断治理能力，按工具声明的 `ToolTruncateSpec` 工作，并负责生成可恢复的 truncation cursor descriptor 与 scope binding。Engine 不读取 `ToolTruncateSpec`，也不理解截断策略。
+- `truncation cursor`：被截断工具结果的续读句柄，标识从哪个结果、哪个位置继续读。进入 messages 或 EventLog 后，必须可由 Host-governed durable descriptor、artifact ref 或等价 snapshot 恢复；不能只存在于远端进程内存。
+- `scope_token`：`fetch_more` 使用的 opaque capability / scope binding，用来证明某次续读只允许访问对应工具结果的后续内容。它可以是持久化映射或可验证 token，但不能变成远端 ToolRuntime 的治理状态。
+- `fetch_more`：Host / ToolRuntime 内置 framework tool，用普通 `@tool` 方式暴露和执行，用于通过 `cursor` 与 `scope_token` 读取被截断结果的后续内容。它不能有 Host / Engine 特化分支。
+- `ToolAwaitingOutcome` / `wait record`：长事务或外部等待进入 Host 的边界。Engine 只产出 awaiting / suspended 事实；Host 持久化 wait record，并通过统一 `resolve_wait` pipeline 创建新 Attempt 继续。
+- `resolve_wait`：Host 内部 / adapter API。poll、callback、manual 等等待结果来源都必须走同一个 resolution pipeline，不能各自改 Run 状态。
+- `retry`：confirmed failure / recoverable failure 后的新 Attempt。retry 不复用旧 EngineWorker / Agent / Runner。
+- `replay`：final answer 脏数据、schema invalid、输出 policy 失败或用户要求重答时的新 Attempt。replay 默认复用已接受工具事实，不重新执行昂贵工具。
+- `RunInputBuilder`：Host 内部组件，负责从当前 `USER_INPUT_ACCEPTED` canonical fact、当前 Run 语义 facts、连续性所需历史 canonical EventLog facts、memory snapshot、Service 场景参数、tool schemas snapshot 和 policy config 构造新的 `AgentRunRequest.messages`。它不能从 UI 临时文本、request 临时字段或 Session timeline 旁路读取当前 prompt。
+- `Conversation Memory`：Host read model / projection，服务多轮追问连续性。它消费 canonical facts，可重建、可修复，不是事实真源。
+- `Context Governance`：Host 对上下文预算、compaction、pinned state、tool facts、open questions、assumptions 和 trace / audit 的治理。Engine 可以 emit `context_compaction_requested`，但不做 Host-side compact retry；Host 必须 append compact events、执行 compact、重建 messages 并用新 Attempt 继续。
+- `compact events`：Host canonical event family，用于记录 context compaction 触发、成功或失败。当前设计包含 `CONTEXT_COMPACTION_REQUESTED`、`CONTEXT_COMPACTED`、`CONTEXT_COMPACTION_FAILED`；它们解释为什么后续 Attempt 的 messages 被压缩或重建。
+- `evidence anchor` / `provenance`：财报分析证据链的中立引用。长期归因必须能追到工具事实和 evidence anchor；summary 只能导航，不能替代证据。
+- `lane`：层中立 named semaphore，用于跨协程 / 跨进程的具名容量治理。lane 属于 `dayu.runtime`，不绑定 Host、Run、Tool 或财报业务语义。
+- `filelock`：`dayu.runtime` 对 `from filelock import FileLock` 的统一封装，用于多进程访问普通文件时的互斥保护。业务层、Host、Service、Fins 等不应各自直接封装或手写文件锁。
 
 `turn` 不用于描述 Engine / Runner 执行路径；如需表达用户视角的多轮对话，应在 UI / Service / Host 语义内明确其与 `session`、`run` 的关系。
+
+`resume` 不表示恢复旧 Agent / Runner / EngineWorker 实例。`run_suspended` 或 `run_cancelled` 后若要继续原目标，Host 必须基于 canonical EventLog facts 构造新的 `AgentRunRequest.messages`，并用新的 attempt 重新进入 Engine。
 
 ## Runtime
 
 `dayu.runtime` 是层中立运行期基础设施包，不属于 `UI / Service / Host / Engine` 任一业务层。
 
 公共运行时能力应优先沉淀在 `dayu.runtime`，但不得把业务语义、Host 治理状态或 Engine 协议状态机放入 runtime。
+
+`dayu.runtime` 当前稳定承载以下层中立能力：
+
+- 日志装配与日志 level。
+- 取消等待 / race helper。
+- `lane`：named semaphore。它只表达具名容量控制，可被 Host、Service、Fins 或其它层复用；它不能表达 Session / Run / Attempt owner，也不能替代 Host admission、SQLite transaction 或 CAS 状态迁移。
+- `filelock`：对第三方 `FileLock` 的统一 wrapper，只用于普通文件访问互斥。`dayu.runtime` 不能依赖 `dayu.engine` / `dayu.host` / `dayu.service` / `dayu.ui` / `dayu.fins` 等项目内上层 package；统一封装纯 infra 第三方依赖不违反这一边界。业务层不得散落 `from filelock import FileLock`，也不得用 file lock 兜底数据库事务、EventLog 顺序或 Host 状态机。
 
 ## 日志与可观测性
 
@@ -62,7 +130,7 @@ Dayu 的日志用于诊断系统执行过程，不承担 UI 输出职责。面�
 | `INFO` | 汇报重要信息。用于进程启动、smoke 摘要、run finished 摘要等调用方或运维人员需要知道的非异常信息。生产默认 `INFO` 应保持克制。 |
 | `WARN` | 汇报可恢复异常。用于 provider 临时失败后 retry、可降级协议差异等需要关注但本次执行仍可继续的情况。 |
 | `ERROR` | 汇报本次操作失败。用于 Engine run failed、provider 协议错误导致执行失败等。 |
-| `CRITICAL` | 汇报系统 invariant / contract 被破坏。用于按设计绝不应发生的断言级事件，例如 Engine stream 结束但没有 terminal event。 |
+| `CRITICAL` | 汇报系统 invariant / contract 被破坏。用于按设计绝不应发生的断言级事件，例如 EngineEvent stream 结束但没有 terminal event。 |
 
 `dayu.runtime.log_levels` 是层中立日志 level 数值真源，统一定义 Dayu 使用的标准级别整数常量与 `VERBOSE=15` 数值；该模块无装配副作用，不注册 stdlib level name、不安装 handler、不读取配置。
 
