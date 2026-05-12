@@ -11,9 +11,17 @@ import dayu.contracts as contracts
 
 EXPECTED_EXPORTS: frozenset[str] = frozenset(
     {
+        "ALLOWED_TOOL_CANCELLED_REASONS",
+        "BatchToolExecutionContext",
+        "BatchToolExecutionOutcome",
+        "BatchToolExecutionRecord",
+        "BatchToolExecutionRequest",
         "CancellationToken",
         "GeminiToolCallState",
         "JsonValue",
+        "TOOL_CANCELLED_REASON_APPROVAL_DENIED",
+        "TOOL_CANCELLED_REASON_HOST_CANCELLED",
+        "TOOL_CANCELLED_REASON_TIMEOUT",
         "ToolAwaitKind",
         "ToolAwaitSnapshot",
         "ToolAwaitSpec",
@@ -21,15 +29,14 @@ EXPECTED_EXPORTS: frozenset[str] = frozenset(
         "ToolBundle",
         "ToolCallProviderState",
         "ToolCallRequest",
+        "ToolCallable",
+        "ToolCancelledOutcome",
         "ToolCompletedOutcome",
         "ToolDefinition",
         "ToolDisplayInfo",
-        "ToolExecutionContext",
         "ToolExecutionOutcome",
-        "ToolExecutionRequest",
         "ToolExecutor",
         "ToolFailedOutcome",
-        "ToolFunctionCallable",
         "ToolFunctionSchema",
         "ToolParametersSchema",
         "ToolResultEnvelope",
@@ -39,7 +46,6 @@ EXPECTED_EXPORTS: frozenset[str] = frozenset(
         "ToolSchema",
         "ToolTruncateSpec",
         "ToolTruncationStrategy",
-        "FunctionToolExecutor",
         "tool",
     }
 )

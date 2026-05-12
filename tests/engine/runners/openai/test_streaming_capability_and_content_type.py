@@ -8,8 +8,12 @@ from collections.abc import Sequence
 
 import pytest
 
-from dayu.contracts.tool_call import ToolExecutionRequest
-from dayu.contracts.tool_outcome import ToolExecutionOutcome, ToolFailedOutcome
+from dayu.contracts.tool_call import BatchToolExecutionRequest
+from dayu.contracts.tool_outcome import (
+    BatchToolExecutionOutcome,
+    BatchToolExecutionRecord,
+    ToolFailedOutcome,
+)
 from dayu.contracts.tool_result import ToolResultFailure
 from dayu.engine.agent import _AsyncAgent
 from dayu.engine.contracts.agent_policy import AgentPolicy
@@ -47,24 +51,31 @@ class _NoopToolExecutor:
     """Agent 集成测试用 no-op ToolExecutor。"""
 
     async def execute(
-        self, request: ToolExecutionRequest
-    ) -> ToolExecutionOutcome:
-        """返回失败 outcome，防止无工具路径误执行工具。
+        self, request: BatchToolExecutionRequest
+    ) -> BatchToolExecutionOutcome:
+        """返回失败 outcome 批次，防止无工具路径误执行工具。
 
-        :param request: 工具执行请求。
-        :returns: 失败 outcome。
+        :param request: 批式工具执行请求。
+        :returns: 与输入 ``calls`` 一一对应的失败 outcome 批次。
         :raises Exception: 不主动抛出异常。
         """
 
-        return ToolFailedOutcome(
-            result=ToolResultFailure(
-                ok=False,
-                error="unexpected_tool_execution",
-                message=request.call.name,
-                hint=None,
-                meta=None,
+        records = tuple(
+            BatchToolExecutionRecord(
+                tool_call_id=call.tool_call_id,
+                outcome=ToolFailedOutcome(
+                    result=ToolResultFailure(
+                        ok=False,
+                        error="unexpected_tool_execution",
+                        message=call.name,
+                        hint=None,
+                        meta=None,
+                    )
+                ),
             )
+            for call in request.calls
         )
+        return BatchToolExecutionOutcome(records=records)
 
 
 def _install_session(

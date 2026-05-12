@@ -19,13 +19,12 @@ from typing import TypeAlias
 from dayu.engine.contracts.agent_run import ContextBudgetSnapshot, RunResumeHint
 from dayu.engine.contracts.finish_reason import FinishReason
 from dayu.engine.contracts.partial_tool_call import PartialToolCallSummary
-from dayu.contracts.json_value import JsonValue
-from dayu.contracts.tool_await import ToolAwaitSnapshot, ToolAwaitSpec
-from dayu.contracts.tool_call import ToolCallProviderState
-from dayu.contracts.tool_outcome import (
-    ToolCompletedOutcome,
-    ToolFailedOutcome,
+from dayu.engine.contracts.tool_records import (
+    AcceptedToolExecutionRecord,
+    AwaitingToolExecutionRecord,
 )
+from dayu.contracts.json_value import JsonValue
+from dayu.contracts.tool_call import ToolCallProviderState
 
 RUN_SUSPENDED_REASON_TOOL_AWAITING: str = "tool_awaiting"
 """工具进入长事务等待导致 run 挂起的中性原因码。"""
@@ -179,34 +178,59 @@ class ToolResultAcceptedData:
     """工具结果被 Engine 接受事件 data。
 
     :param iteration_id: 当前迭代 id。
-    :param tool_call_id: 工具调用 id。
-    :param name: 工具名称。
-    :param index_in_iteration: 工具调用在迭代内的序号。
-    :param outcome: 终态 outcome（仅 completed / failed；awaiting 走
-        :class:`ToolAwaitingData`）。
+    :param record: accepted 终态记录（completed / failed / cancelled）。
     """
 
     iteration_id: str
-    tool_call_id: str
-    name: str
-    index_in_iteration: int
-    outcome: ToolCompletedOutcome | ToolFailedOutcome
+    record: AcceptedToolExecutionRecord
 
 
 @dataclass(frozen=True, slots=True)
 class ToolCallsBatchDoneData:
     """工具调用批次完成事件 data。
 
+    与本批输入工具调用计数严格守恒：
+
+    ``completed_count + failed_count + cancelled_count == len(tool_call_ids)``。
+
+    cancelled 不再被计入 failed。
+
     :param iteration_id: 当前迭代 id。
-    :param tool_call_ids: 本批已接受 completed / failed outcome 的工具 id。
+    :param tool_call_ids: 本批已接受 completed / failed / cancelled
+        outcome 的工具 id，按输入顺序排列。
     :param completed_count: completed outcome 数量。
-    :param failed_count: failed outcome 数量。
+    :param failed_count: failed outcome 数量（不含 cancelled）。
+    :param cancelled_count: cancelled outcome 数量。
     """
 
     iteration_id: str
     tool_call_ids: tuple[str, ...]
     completed_count: int
     failed_count: int
+    cancelled_count: int
+
+    def __post_init__(self) -> None:
+        """校验三类计数与 ``tool_call_ids`` 守恒。
+
+        :returns: 无返回值。
+        :raises ValueError: 计数之和不等于 ids 数量或任一计数为负时抛出。
+        """
+
+        if (
+            self.completed_count < 0
+            or self.failed_count < 0
+            or self.cancelled_count < 0
+        ):
+            raise ValueError(
+                "ToolCallsBatchDoneData counts must be non-negative"
+            )
+        total = self.completed_count + self.failed_count + self.cancelled_count
+        if total != len(self.tool_call_ids):
+            raise ValueError(
+                "ToolCallsBatchDoneData counts must sum to len(tool_call_ids):"
+                f" got completed={self.completed_count} failed={self.failed_count}"
+                f" cancelled={self.cancelled_count} ids={len(self.tool_call_ids)}"
+            )
 
 
 @dataclass(frozen=True, slots=True)
@@ -214,15 +238,11 @@ class ToolAwaitingData:
     """工具进入长事务等待事件 data。
 
     :param iteration_id: 当前迭代 id。
-    :param tool_call_id: 工具调用 id。
-    :param await_spec: 等待规约。
-    :param snapshot: 等待时点快照；无快照时为 ``None``。
+    :param record: awaiting 终态记录。
     """
 
     iteration_id: str
-    tool_call_id: str
-    await_spec: ToolAwaitSpec
-    snapshot: ToolAwaitSnapshot | None
+    record: AwaitingToolExecutionRecord
 
 
 @dataclass(frozen=True, slots=True)
@@ -317,14 +337,28 @@ class RunSuspendedData:
 
     :param reason: 挂起原因（中性字符串）。
     :param resume_hint: 可选的恢复提示；无为 ``None``。
-    :param await_spec: 工具等待规约。
-    :param snapshot: 等待时点快照；无快照时为 ``None``。
+    :param accepted_records: 本批已 accepted 的工具记录元组（按输入
+        顺序），与 awaiting_records 共同重建 LLM context 已知事实。
+    :param awaiting_records: 本批进入长事务等待的工具记录元组（按输入
+        顺序）；至少含一个，否则不应进入 SUSPENDED。
     """
 
     reason: str
     resume_hint: RunResumeHint | None
-    await_spec: ToolAwaitSpec
-    snapshot: ToolAwaitSnapshot | None
+    accepted_records: tuple[AcceptedToolExecutionRecord, ...]
+    awaiting_records: tuple[AwaitingToolExecutionRecord, ...]
+
+    def __post_init__(self) -> None:
+        """校验 awaiting_records 非空。
+
+        :returns: 无返回值。
+        :raises ValueError: ``awaiting_records`` 为空时抛出。
+        """
+
+        if not self.awaiting_records:
+            raise ValueError(
+                "RunSuspendedData.awaiting_records must be non-empty"
+            )
 
 
 @dataclass(frozen=True, slots=True)

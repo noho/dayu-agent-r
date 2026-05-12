@@ -16,8 +16,12 @@ from dataclasses import dataclass
 from datetime import datetime
 from typing import Literal
 
-from dayu.contracts.tool_call import ToolExecutionRequest
-from dayu.contracts.tool_outcome import ToolExecutionOutcome, ToolFailedOutcome
+from dayu.contracts.tool_call import BatchToolExecutionRequest
+from dayu.contracts.tool_outcome import (
+    BatchToolExecutionOutcome,
+    BatchToolExecutionRecord,
+    ToolFailedOutcome,
+)
 from dayu.contracts.tool_result import ToolResultFailure
 from dayu.engine import (
     AgentMessageRole,
@@ -115,24 +119,31 @@ class _NoopToolExecutor:
     """
 
     async def execute(
-        self, request: ToolExecutionRequest
-    ) -> ToolExecutionOutcome:
-        """返回工具误调用失败 outcome。
+        self, request: BatchToolExecutionRequest
+    ) -> BatchToolExecutionOutcome:
+        """返回工具误调用失败 outcome 批次。
 
-        :param request: 工具执行请求。
-        :returns: 失败 outcome。
+        :param request: 批式工具执行请求。
+        :returns: 与输入 ``calls`` 一一对应的失败 outcome 批次。
         :raises Exception: 不主动抛出异常。
         """
 
-        return ToolFailedOutcome(
-            result=ToolResultFailure(
-                ok=False,
-                error="tool_executor_not_expected_in_phase2_smoke",
-                message=f"unexpected tool execution: {request.call.name}",
-                hint=None,
-                meta=None,
+        records = tuple(
+            BatchToolExecutionRecord(
+                tool_call_id=call.tool_call_id,
+                outcome=ToolFailedOutcome(
+                    result=ToolResultFailure(
+                        ok=False,
+                        error="tool_executor_not_expected_in_phase2_smoke",
+                        message=f"unexpected tool execution: {call.name}",
+                        hint=None,
+                        meta=None,
+                    )
+                ),
             )
+            for call in request.calls
         )
+        return BatchToolExecutionOutcome(records=records)
 
 
 CASES: tuple[ProviderCase, ...] = (

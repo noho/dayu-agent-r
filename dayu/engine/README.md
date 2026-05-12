@@ -141,7 +141,9 @@ Engine 消费的消息类型来自 `AgentMessage` 封闭联合，当前包括：
 - `AssistantMessage`
 - `ToolMessage`
 
-工具执行通过 `ToolExecutor.execute(request)` 完成。Engine 只依赖 `ToolExecutor` 协议、`ToolSchema` 快照、`ToolExecutionRequest` 与 `ToolExecutionOutcome`；工具发现、权限、审计、路由和持久化不属于 Engine 接口。
+工具执行通过 `ToolExecutor.execute(request)` 完成。Engine 只依赖 `ToolExecutor` 协议、`ToolSchema` 快照、`BatchToolExecutionRequest`、`BatchToolExecutionOutcome` 与 `ToolExecutionOutcome`；工具发现、权限、审计、路由和持久化不属于 Engine 接口。
+
+工具声明与工具执行治理的整体边界见 [dayu/README.md 的“工具定义与执行边界”](../README.md#工具定义与执行边界)。`@tool(...)`、`ToolDefinition` 与 `ToolCallable` 属于 Host / ToolRuntime 装配输入；Engine 不消费这些对象，只接收调用方传入的 `tool_schemas` 与 `tool_executor`。
 
 ### 非接口
 
@@ -172,10 +174,11 @@ Engine 公共契约分为 Engine 专属契约与跨层共享契约。Engine 专�
 - `EngineEventData`：Engine 事件 data 封闭联合。每个 `EngineEventType` 对应一个明确 data dataclass。
 - `AgentRunResult`：`run_agent_and_wait` 的终态返回联合。成员包括 `EngineRunOutcomeFinalAnswer`、`EngineRunOutcomeFailed`、`EngineRunOutcomeCancelled`、`EngineRunOutcomeSuspended`。
 - `tool_schemas`：本次 run 暴露给模型的工具 schema 快照。形状是 `tuple[ToolSchema, ...]`。
-- `tool_executor`：工具执行协议 handle。形状是 `ToolExecutor.execute(ToolExecutionRequest) -> ToolExecutionOutcome`。
-- `ToolExecutionRequest`：单次工具执行请求。形状包含 `call: ToolCallRequest` 与 `context: ToolExecutionContext`。
-- `ToolExecutionContext`：工具执行上下文。形状包含 `run_id`、`session_id`、`iteration_id`、`tool_call_id`、`index_in_iteration`、`timeout_seconds`、`cancellation_token`、`correlation_id`。
-- `ToolExecutionOutcome`：工具执行结果封闭联合。成员包括 `ToolCompletedOutcome`、`ToolFailedOutcome`、`ToolAwaitingOutcome`。
+- `tool_executor`：工具执行协议 handle。形状是 `ToolExecutor.execute(BatchToolExecutionRequest) -> BatchToolExecutionOutcome`。
+- `BatchToolExecutionRequest`：批式工具执行请求。形状包含 `calls: tuple[ToolCallRequest, ...]` 与 `context: BatchToolExecutionContext`。
+- `BatchToolExecutionContext`：批式工具执行上下文。形状包含 `run_id`、`session_id`、`iteration_id`、`timeout_seconds`、`cancellation_token`、`correlation_id`。
+- `ToolExecutionOutcome`：单工具执行结果封闭联合。成员包括 `ToolCompletedOutcome`、`ToolFailedOutcome`、`ToolAwaitingOutcome`、`ToolCancelledOutcome`。
+- `BatchToolExecutionOutcome`：批式工具执行结果。形状包含 `records: tuple[BatchToolExecutionRecord, ...]`，每个 record 与输入 tool call id 严格对应。
 - `ToolAwaitingOutcome`：长事务等待结果。形状包含 `await_spec: ToolAwaitSpec` 与 `snapshot: ToolAwaitSnapshot | None`。
 - `cancellation_token`：Engine 可观察的取消入口。形状是 `CancellationToken`，包含 `is_cancelled()`、`cancel_reason()`、`requested_at()`。
 - `RunnerHTTPErrorCode`：Runner HTTP / 网络 / 超时错误枚举。成员包括 `rate_limit_exceeded`、`server_error`、`client_error`、`network_error`、`timeout`、`context_length_exceeded`、`unknown_http_status`。
@@ -231,8 +234,8 @@ run_agent_messages(request)
               -> observe cancellation_token before future work
       -> if model requested tools
           -> emit EngineEvent.tool_call_requested
-          -> ToolExecutor.execute(ToolExecutionRequest)
-              -> ToolExecutionContext.timeout_seconds = agent_policy.tool_execution_timeout_seconds
+          -> ToolExecutor.execute(BatchToolExecutionRequest)
+              -> BatchToolExecutionContext.timeout_seconds = agent_policy.tool_execution_timeout_seconds
               -> wait execute outcome with cancellation_token and handshake timeout
           -> if cancellation_token wins before outcome
               -> emit terminal EngineEvent.run_cancelled
@@ -253,7 +256,7 @@ run_agent_messages(request)
               -> if max_iterations exhausted
                   -> fallback by agent_policy.fallback_mode
           -> if awaiting outcome
-              -> ToolExecutor returned ToolAwaitingOutcome(await_spec, snapshot)
+              -> ToolExecutor returned batch outcome containing ToolAwaitingOutcome
               -> emit EngineEvent.tool_awaiting
               -> close Runner
               -> emit terminal EngineEvent.run_suspended
@@ -330,7 +333,7 @@ FORCE_ANSWER -> CANCELLED
 
 - `CREATED`：`run_agent_messages(request)` 已接收请求，但尚未开始普通 LLM iteration；如果取消 token 已命中或策略参数非法，可直接进入 terminal。
 - `ITERATING`：Engine 已产出 `iteration_started`，正在消费一次 `AsyncRunner.call(...)` 的 `RunnerEvent` 流；普通迭代与 `finish_reason=length` continuation 都复用该状态，`iteration_completed` 只表示本轮 RunnerEvent 流结束，不是 run 终态。
-- `EXECUTING_TOOL`：本轮 Runner 已完成工具调用请求，Engine 产出 `tool_call_requested`，并通过 `ToolExecutor.execute(ToolExecutionRequest)` 等待工具 outcome。
+- `EXECUTING_TOOL`：本轮 Runner 已完成工具调用请求，Engine 产出 `tool_call_requested`，并通过 `ToolExecutor.execute(BatchToolExecutionRequest)` 等待工具 batch outcome。
 - `FORCE_ANSWER`：普通工具 iteration 预算耗尽，或连续全失败工具批次达到阈值后，Engine 按 `AgentPolicy.fallback_mode=FORCE_ANSWER` 追加 `fallback_prompt`，禁用工具再调用一次 Runner；空回答或再次请求工具会收口为 `run_failed`。
 - `FINAL_ANSWERED`：Engine 已产出 `final_answer`，对应 `EngineRunOutcomeFinalAnswer`。
 - `FAILED`：Engine 已产出 `run_failed`，对应 `EngineRunOutcomeFailed`；provider protocol error、context overflow 后的 recoverable failure、重复工具调用 id、Runner 异常结束等都收口到该状态。
@@ -386,9 +389,11 @@ HTTP 200 response 在 effective stream 为 `True` 且 `Content-Type` 为 `text/e
 
 取消 token 是 Engine 的取消收口。Agent 在迭代前、Runner 事件消费后、工具执行等待边界、工具结果注入后和下一轮工作开始前观察 token；工具执行通过 `dayu.runtime.cancellation.await_or_cancel_or_timeout` 把 token 与握手 timeout 纳入同一个 race。取消赢得当前边界时，公共结果以 `run_cancelled` 事件和 `EngineRunOutcomeCancelled` 表达。上层调用者要继续原目标时，需要用新的 `AgentRunRequest.messages` 显式提供已确认事实、用户意图或恢复输入。
 
-工具执行协议以 `ToolSchema` 快照和 `ToolExecutor.execute` 为边界。Engine 把 Runner 完成的工具调用投影为 `ToolExecutionRequest`，其中包含 run、session、iteration、tool call、correlation 信息、取消 token 与工具握手 timeout；工具返回完成或失败 outcome 后，Engine 先产出 `tool_result_accepted`，再将结果投影为 LLM 可消费的 tool message。若随后观察到取消，Engine 以 `run_cancelled` 收口，但不丢弃已接受的工具结果事实，也不进入下一轮 Runner。
+工具执行协议以 `ToolSchema` 快照和 `ToolExecutor.execute` 为边界。Engine 把 Runner 完成的工具调用批次投影为 `BatchToolExecutionRequest`，其中包含本批 `ToolCallRequest`、run、session、iteration、批级 correlation 信息、取消 token 与工具握手 timeout；工具返回 completed / failed / cancelled outcome 后，Engine 先产出 `tool_result_accepted`，再将结果投影为 LLM 可消费的 tool message。若随后观察到取消，Engine 以 `run_cancelled` 收口，但不丢弃已接受的工具结果事实，也不进入下一轮 Runner。
 
-工具握手 timeout 是 Engine 对 `ToolExecutor.execute` 的等待预算，不是外部长事务 timeout。`AgentPolicy.tool_execution_timeout_seconds` 是该预算真源；Engine 同时把它投影到 `ToolExecutionContext.timeout_seconds`，供 ToolExecutor 所在的工具执行环境协作设置内部等待边界。timeout 先于 outcome 命中时，runtime helper 取消 execute task，Engine 以不可恢复 `run_failed(tool_execution_timeout)` 收口。ToolExecutor 及其背后的工具执行环境负责协作响应取消，并治理可能已经启动的线程、子进程、HTTP 请求或远端 job。
+工具握手 timeout 是 Engine 对 `ToolExecutor.execute` 的等待预算，不是外部长事务 timeout。`AgentPolicy.tool_execution_timeout_seconds` 是该预算真源；Engine 同时把它投影到 `BatchToolExecutionContext.timeout_seconds`，供 ToolExecutor 所在的工具执行环境协作设置内部等待边界。timeout 先于 outcome 命中时，runtime helper 取消 execute task，Engine 以不可恢复 `run_failed(tool_execution_timeout)` 收口。ToolExecutor 及其背后的工具执行环境负责协作响应取消，并治理可能已经启动的线程、子进程、HTTP 请求或远端 job。
+
+`@tool(...)` 与 `ToolDefinition` 用于 Host / ToolRuntime 侧的工具声明和装配，不是 Engine 工具执行入口。Host / ToolRuntime 可以用 `@tool(...)` 获取 schema、truncate、display、tags 与单工具 `ToolCallable`，再用自身权限、审批、限流、并发、timeout、审计、awaiting 和 cleanup 策略包装出 batch `ToolExecutor`。Engine 不提供默认 `FunctionToolExecutor`，也不规定 batch 内部执行策略。
 
 挂起 / 恢复协议以 `ToolAwaitingOutcome` 为边界。工具开始外部长事务并建议挂起时，ToolExecutor 返回 `await_spec` 与 `snapshot`；Engine 先产出 `tool_awaiting`，再以 `run_suspended` 收口并关闭 Runner。Engine 不等待外部长事务完成，不持久化等待记录，也不恢复旧 Agent/Runner 实例；上层调用者保存 `await_spec` / `snapshot`，等工具终态确定后构造新的 `AgentRunRequest`，把工具终态结果或恢复输入显式交回 Engine。
 
@@ -408,4 +413,4 @@ Runner close 是 run-scoped 收尾机制。`run_agent_messages` 在生成器结�
 
 扩展 provider 请求参数时，优先进入 `RunnerSpec.provider_request` 的 provider extension；单次采样、输出长度、top-p 和流式开关进入 `RunnerCallOptions`。
 
-扩展工具能力时，通过 `ToolSchema` 暴露给 Runner，通过 `ToolExecutor` 输入与 `ToolExecutionOutcome` 返回结果表达。Engine 不新增工具注册表，也不把工具部署位置写进 Engine 契约。
+扩展工具能力时，在 Host / ToolRuntime 侧使用 `@tool(...)` 或等价机制声明工具定义，将 `ToolSchema` 暴露给 Runner，并将受治理后的 `ToolExecutor` 提供给 Engine。Engine 不新增工具注册表，也不把工具部署位置、工具定义对象或 batch 内部执行策略写进 Engine 契约。

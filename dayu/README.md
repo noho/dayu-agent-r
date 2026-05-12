@@ -93,3 +93,16 @@ Dayu 的日志用于诊断系统执行过程，不承担 UI 输出职责。面�
 - 财报领域语义归领域能力边界；公共契约不直接表达财报存储、解析或指标规则。
 
 因此，`dayu.contracts` 只能放跨层都需要理解的协作对象，例如工具调用请求、工具执行结果、取消观察 token 等。若一个类型只有某一层理解，或者携带该层私有状态，它应留在该层内部；如果多层都需要读写它，应优先重新审视边界，而不是把它提前公共化。
+
+## 工具定义与执行边界
+
+工具能力分为声明、治理和执行三个边界。
+
+- `@tool(...)` 是工具声明入口，用于在工具现场同源声明 `ToolSchema`、截断声明、展示 metadata、标签和单工具 callable。
+- `ToolDefinition` 是 Host / ToolRuntime 的装配输入，包含 schema、truncate、display、tags 与 `ToolCallable`；它不进入 Engine request，也不作为 Engine 稳定接口。
+- `ToolCallable` 是单工具调用协议，形状是 `async (call: ToolCallRequest, context: BatchToolExecutionContext) -> ToolExecutionOutcome`。工具函数可以通过闭包捕获 Web client、仓储、manager 等 Host 私有依赖。
+- `ToolExecutor` 是 Host / ToolRuntime 治理后的 batch 执行入口，形状是 `execute(BatchToolExecutionRequest) -> BatchToolExecutionOutcome`。Engine 只调用这个入口，不调用单工具 callable。
+
+Host / ToolRuntime 持有 `ToolDefinition`，把其中的 `ToolSchema` 投影给 Engine，并把 `ToolCallable` 包装进受治理的 `ToolExecutor`。权限、审批、限流、并发、内部 timeout、审计、长事务 awaiting、orphan cleanup 和工具级取消都属于 Host / ToolRuntime；`dayu.contracts` 不提供默认执行器，也不定义 batch 内部执行策略。
+
+Engine 只接收 `tool_schemas` 和 `tool_executor`。Engine 不导入、不持有、不分支判断 `@tool`、`ToolDefinition`、`ToolCallable`、具体工具实现或工具运行时治理对象。

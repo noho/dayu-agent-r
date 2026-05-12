@@ -654,7 +654,7 @@ LocalRunHarness
   terminal close 和 stale / orphan recovery；`LocalRunHarness` 只做薄编排，不承载 lease SQL、
   recovery scan、token 校验或 fencing error 策略。
 - owner token 明文只能存在于 Host internal `AttemptOwnerContext`；持久化只保存 token hash，
-  普通日志、RunEvent payload、ToolExecutionContext、public stream 和 README 示例都不能泄露明文 token。
+  普通日志、RunEvent payload、BatchToolExecutionContext、public stream 和 README 示例都不能泄露明文 token。
   fencing token 是全局单调整数，可用于 owner 新旧比较，但仍不应作为普通调用方 public API 暴露。
 - P8 D2 后 recovery 仅做诊断收口, 不 takeover、不在 recovery 路径创建新 attempt。旧 attempt
   通过 CAS 标记为 `LOST` (lease 过期 / `CREATED` 孤儿 / run terminal); 重试 / resume 必须由
@@ -664,7 +664,7 @@ LocalRunHarness
 - 所有 attempt-scoped append 都必须走 owner fencing，包括 Engine-sourced events、context compact
   facts、`RUN_INPUT_CONTEXT_SNAPSHOT_BUILT` 和 ToolRuntime / Engine tool loop 产生的普通 tool calling
   facts。P8.5 后不再把 truncate / cursor / `fetch_more` 表达为专属 RunEvent fact。
-- ToolRuntime 不获得 owner token，也不把 owner token 放入 `ToolExecutionContext`。Host 通过内部
+- ToolRuntime 不获得 owner token，也不把 owner token 放入 `BatchToolExecutionContext`。Host 通过内部
   `AttemptScopedRunEventAppender` / owner scope 为当前 attempt 注入可写 append port。
 - 正常 terminal attempt 必须在同一 `BEGIN IMMEDIATE` 或等价 durable unit 中完成 terminal event
   append、owner verify、attempt close、`terminal_event_position` 写入、Run terminal state / result
@@ -1148,7 +1148,7 @@ ToolExecutor handshake timeout / orphan control 备忘：
 ### 11.1 Host framework built-in tool 边界
 
 `fetch_more` 是 Host 私有 framework built-in tool。它对模型表现为普通 tool schema，对 Engine 表现为普通
-`ToolExecutionRequest` / `ToolExecutionOutcome`，但它的 declaration、callable、executor、cursor store、
+`ToolCallRequest` / `ToolExecutionOutcome`，但它的 declaration、callable、executor、cursor store、
 fencing 与补读实现都属于 Host 私有实现，Engine 什么都看不到。
 
 Engine 边界必须保持：
@@ -1156,7 +1156,7 @@ Engine 边界必须保持：
 - Engine 只接收投影后的 `ToolSchema`，不接收 `ToolDefinition`。
 - EngineWorker 只接收 Host 已显式确定的当前生效 `ToolSchema` 集合，不在运行时通过 callback 回调 Runtime
   重新增强 schema。
-- Engine 只发普通 `ToolExecutionRequest(name="fetch_more", arguments=...)`。
+- Engine 只发普通 `ToolCallRequest(name="fetch_more", arguments=...)`。
 - Engine 只接收普通 `ToolExecutionOutcome`。
 - Engine 不 import、不持有、不分支判断 `@tool`、`ToolDefinition`、callable、executor、framework built-in
   dispatch、cursor store、fencing 或 Host runtime 私有类型。
@@ -1195,7 +1195,7 @@ Runtime / tool 执行边界：
 ```text
 Model -> tool_call fetch_more(cursor, scope_token, limit?)
   -> Engine treats it as ordinary LLM tool call
-  -> ToolExecutor.execute(ToolExecutionRequest{name="fetch_more"})
+  -> ToolExecutor.execute(BatchToolExecutionRequest{calls=[ToolCallRequest{name="fetch_more"}], context=...})
   -> ToolRuntimeToolExecutor -> HostToolRuntime
   -> Host private framework tool dispatch
   -> fetch_more callable uses closure-injected RuntimeTruncateManager Protocol

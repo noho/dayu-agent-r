@@ -24,12 +24,15 @@ from typing import TypeAlias, assert_never
 
 from dayu.contracts.json_value import JsonValue
 from dayu.contracts.tool_call import (
+    BatchToolExecutionContext,
+    BatchToolExecutionRequest,
     ToolCallRequest,
-    ToolExecutionContext,
-    ToolExecutionRequest,
 )
 from dayu.contracts.tool_outcome import (
+    BatchToolExecutionOutcome,
+    BatchToolExecutionRecord,
     ToolAwaitingOutcome,
+    ToolCancelledOutcome,
     ToolCompletedOutcome,
     ToolExecutionOutcome,
     ToolFailedOutcome,
@@ -48,6 +51,11 @@ from dayu.engine.contracts.agent_run import (
     EngineRunOutcomeFailed,
     EngineRunOutcomeFinalAnswer,
     EngineRunOutcomeSuspended,
+)
+from dayu.engine.contracts.tool_records import (
+    AcceptedToolExecutionRecord,
+    AssistantToolCallBatchSnapshot,
+    AwaitingToolExecutionRecord,
 )
 from dayu.engine.contracts.engine_events import (
     ContextCompactionRequestedData,
@@ -129,6 +137,7 @@ _ERROR_RUNNER_TOOL_CALLS_FINISH_REASON_MISMATCH: str = (
 _ERROR_DUPLICATE_TOOL_CALL_ID: str = "duplicate_tool_call_id"
 _ERROR_TOOL_EXECUTOR_EXCEPTION: str = "tool_executor_exception"
 _ERROR_TOOL_EXECUTION_TIMEOUT: str = "tool_execution_timeout"
+_ERROR_TOOL_BATCH_OUTCOME_MISMATCH: str = "tool_batch_outcome_mismatch"
 _ERROR_FORCE_ANSWER_EMPTY: str = "force_answer_empty"
 _ERROR_CONSECUTIVE_FAILED_TOOL_BATCHES: str = (
     "consecutive_failed_tool_batches"
@@ -150,6 +159,9 @@ _TOOL_CALL_NOT_ENABLED_MESSAGE: str = (
     "runner produced tool calls while tools were disabled or unavailable"
 )
 _TOOL_EXECUTION_TIMEOUT_MESSAGE: str = "tool execution handshake timed out"
+_TOOL_BATCH_OUTCOME_MISMATCH_MESSAGE: str = (
+    "tool executor returned records that do not match input tool_call_ids"
+)
 _MISSING_TERMINAL_MESSAGE: str = "agent event stream ended without terminal"
 _FORCE_ANSWER_EMPTY_MESSAGE: str = (
     "force-answer runner did not produce final content"
@@ -296,12 +308,32 @@ def _project_tool_failure_for_llm(
     return projected
 
 
-def _project_tool_outcome_for_llm(
-    outcome: ToolCompletedOutcome | ToolFailedOutcome,
-) -> str:
-    """把工具 outcome 投影为 LLM-facing JSON 字符串。
+def _project_tool_cancelled_for_llm(
+    outcome: ToolCancelledOutcome,
+) -> dict[str, _PlainJsonValue]:
+    """将工具级取消 outcome 投影为 LLM-facing JSON object。
 
-    :param outcome: completed / failed 工具 outcome。
+    :param outcome: 工具级取消 outcome。
+    :returns: 可注入 ``ToolMessage.content`` 的 JSON object。
+    :raises Exception: 不主动抛出异常。
+    """
+
+    projected: dict[str, _PlainJsonValue] = {
+        "cancelled": True,
+        "reason": outcome.reason,
+        "message": outcome.message,
+    }
+    if outcome.hint is not None:
+        projected["hint"] = outcome.hint
+    return projected
+
+
+def _project_tool_outcome_for_llm(
+    outcome: ToolCompletedOutcome | ToolFailedOutcome | ToolCancelledOutcome,
+) -> str:
+    """把已接受工具 outcome 投影为 LLM-facing JSON 字符串。
+
+    :param outcome: completed / failed / cancelled 三种已接受 outcome。
     :returns: JSON 字符串；内容始终非空，保证 tool message 配对完整。
     :raises TypeError: JSON 序列化失败时抛出。
     """
@@ -310,6 +342,8 @@ def _project_tool_outcome_for_llm(
         projected = _project_tool_success_for_llm(outcome.result)
     elif isinstance(outcome, ToolFailedOutcome):
         projected = _project_tool_failure_for_llm(outcome.result)
+    elif isinstance(outcome, ToolCancelledOutcome):
+        projected = _project_tool_cancelled_for_llm(outcome)
     else:
         assert_never(outcome)
     return json.dumps(projected, ensure_ascii=False, sort_keys=True)
@@ -351,6 +385,7 @@ class _ToolCallsDecision:
     iteration_index: int
     content: str | None
     reasoning_content: str | None
+    provider_request_id: str | None
     tool_calls: tuple[ToolCallRequest, ...]
 
 
@@ -359,19 +394,31 @@ _IterationDecision: TypeAlias = _FinalDecision | _ToolCallsDecision | RunFailedD
 
 @dataclass(frozen=True, slots=True)
 class _ToolOutcomeRecord:
-    """单个工具调用执行后的 accepted outcome 记录。"""
+    """单个工具调用执行后的 accepted outcome 记录。
+
+    accepted 含 completed / failed / cancelled 三种已进入 LLM context 的
+    终态；awaiting 不属于 accepted，由 :class:`_ToolAwaitingRecord` 承载。
+    """
 
     call: ToolCallRequest
-    outcome: ToolCompletedOutcome | ToolFailedOutcome
+    outcome: ToolCompletedOutcome | ToolFailedOutcome | ToolCancelledOutcome
+
+
+@dataclass(frozen=True, slots=True)
+class _ToolAwaitingRecord:
+    """单个工具调用进入长事务等待的记录。"""
+
+    call: ToolCallRequest
+    outcome: ToolAwaitingOutcome
 
 
 def _tool_outcome_name(
-    outcome: ToolCompletedOutcome | ToolFailedOutcome,
+    outcome: ToolCompletedOutcome | ToolFailedOutcome | ToolCancelledOutcome,
 ) -> str:
     """返回工具 outcome 的日志安全分类名。
 
     :param outcome: 已接受的工具 outcome。
-    :returns: ``completed`` 或 ``failed``。
+    :returns: ``completed`` / ``failed`` / ``cancelled``。
     :raises Exception: 不主动抛出异常。
     """
 
@@ -379,6 +426,8 @@ def _tool_outcome_name(
         return "completed"
     if isinstance(outcome, ToolFailedOutcome):
         return "failed"
+    if isinstance(outcome, ToolCancelledOutcome):
+        return "cancelled"
     assert_never(outcome)
 
 
@@ -400,13 +449,27 @@ def _count_failed_tool_records(records: Sequence[_ToolOutcomeRecord]) -> int:
     """统计 failed 工具 outcome 数量。
 
     :param records: 工具 outcome 记录序列。
-    :returns: failed 数量。
+    :returns: failed 数量（不含 cancelled）。
     :raises Exception: 不主动抛出异常。
     """
 
     return sum(
         1 for record in records
         if isinstance(record.outcome, ToolFailedOutcome)
+    )
+
+
+def _count_cancelled_tool_records(records: Sequence[_ToolOutcomeRecord]) -> int:
+    """统计 cancelled 工具 outcome 数量。
+
+    :param records: 工具 outcome 记录序列。
+    :returns: cancelled 数量。
+    :raises Exception: 不主动抛出异常。
+    """
+
+    return sum(
+        1 for record in records
+        if isinstance(record.outcome, ToolCancelledOutcome)
     )
 
 
@@ -431,6 +494,55 @@ class _ToolBatchCompleted:
 
 
 _ToolBatchResult: TypeAlias = _ToolBatchCompleted | RunFailedData
+
+
+def _failed_record_from_exception(
+    *, call: ToolCallRequest, exc: BaseException
+) -> "BatchToolExecutionRecord":
+    """把 executor 抛出的普通异常归一为整批失败的单条记录。
+
+    :param call: 输入工具调用。
+    :param exc: executor 抛出的异常。
+    :returns: 与 ``call.tool_call_id`` 对齐的 failed 记录。
+    :raises Exception: 不主动抛出异常。
+    """
+
+    return BatchToolExecutionRecord(
+        tool_call_id=call.tool_call_id,
+        outcome=ToolFailedOutcome(
+            result=ToolResultFailure(
+                ok=False,
+                error=_ERROR_TOOL_EXECUTOR_EXCEPTION,
+                message=type(exc).__name__,
+                hint=None,
+                meta=None,
+            )
+        ),
+    )
+
+
+def _failed_record_from_cancelled(
+    *, call: ToolCallRequest
+) -> "BatchToolExecutionRecord":
+    """把 executor 抛出的非 run-level 取消异常归一为整批失败的单条记录。
+
+    :param call: 输入工具调用。
+    :returns: 与 ``call.tool_call_id`` 对齐的 failed 记录。
+    :raises Exception: 不主动抛出异常。
+    """
+
+    return BatchToolExecutionRecord(
+        tool_call_id=call.tool_call_id,
+        outcome=ToolFailedOutcome(
+            result=ToolResultFailure(
+                ok=False,
+                error=_ERROR_TOOL_EXECUTOR_EXCEPTION,
+                message=asyncio.CancelledError.__name__,
+                hint=None,
+                meta=None,
+            )
+        ),
+    )
 
 
 class _AsyncAgent:
@@ -1213,22 +1325,7 @@ class _AsyncAgent:
                 data.content is not None,
                 data.reasoning_content is not None,
             )
-            return self._make_event(
-                event_type=EngineEventType.TOOL_CALLS_BATCH_READY,
-                data=ToolCallsBatchReadyData(
-                    iteration_id=iteration_id,
-                    tool_calls=tuple(
-                        ToolCallBatchItemData(
-                            tool_call_id=call.tool_call_id,
-                            name=call.name,
-                            index_in_iteration=call.index_in_iteration,
-                            provider_state=call.provider_state,
-                        )
-                        for call in data.tool_calls
-                    ),
-                ),
-                occurred_at=runner_event.occurred_at,
-            )
+            return None
         state.failure_candidate = RunFailedData(
             error_code=_ERROR_RUNNER_EXCEPTION,
             message="runner event data did not match supported union",
@@ -1315,6 +1412,7 @@ class _AsyncAgent:
                 iteration_index=iteration_index,
                 content=content,
                 reasoning_content=reasoning,
+                provider_request_id=state.provider_request_id,
                 tool_calls=tuple(
                     sorted(
                         state.tool_calls,
@@ -1345,7 +1443,11 @@ class _AsyncAgent:
     async def _execute_tool_batch(
         self, decision: _ToolCallsDecision
     ) -> AsyncIterator[EngineEvent]:
-        """串行执行一批工具调用并产出工具事件。
+        """以单次批式握手执行一批工具调用并产出工具事件。
+
+        Engine 对一轮 LLM 工具调用对应的工具批，只调用 ``ToolExecutor.execute``
+        恰好一次；批内的工具并发、限流、审批、tool-level 取消等治理责任
+        全部归属 Host / ToolRuntime，不在 Engine。
 
         :param decision: 工具调用决策。
         :returns: EngineEvent 异步流。
@@ -1353,12 +1455,13 @@ class _AsyncAgent:
         """
 
         self._last_tool_batch_result = None
-        records: list[_ToolOutcomeRecord] = []
+
+        seen_in_batch: set[str] = set()
         for call in decision.tool_calls:
-            if self._is_cancelled():
-                yield await self._make_cancelled_terminal_with_close()
-                return
-            if call.tool_call_id in self._executed_tool_call_ids:
+            if (
+                call.tool_call_id in self._executed_tool_call_ids
+                or call.tool_call_id in seen_in_batch
+            ):
                 self._last_tool_batch_result = RunFailedData(
                     error_code=_ERROR_DUPLICATE_TOOL_CALL_ID,
                     message="duplicate tool_call_id in run",
@@ -1366,7 +1469,31 @@ class _AsyncAgent:
                     recoverable=False,
                 )
                 return
+            seen_in_batch.add(call.tool_call_id)
+        for call in decision.tool_calls:
+            self._executed_tool_call_ids.add(call.tool_call_id)
 
+        if self._is_cancelled():
+            yield await self._make_cancelled_terminal_with_close()
+            return
+
+        yield self._make_event(
+            event_type=EngineEventType.TOOL_CALLS_BATCH_READY,
+            data=ToolCallsBatchReadyData(
+                iteration_id=decision.iteration_id,
+                tool_calls=tuple(
+                    ToolCallBatchItemData(
+                        tool_call_id=call.tool_call_id,
+                        name=call.name,
+                        index_in_iteration=call.index_in_iteration,
+                        provider_state=call.provider_state,
+                    )
+                    for call in decision.tool_calls
+                ),
+            ),
+            occurred_at=_utc_now(),
+        )
+        for call in decision.tool_calls:
             yield self._make_event(
                 event_type=EngineEventType.TOOL_CALL_REQUESTED,
                 data=ToolCallRequestedData(
@@ -1393,43 +1520,106 @@ class _AsyncAgent:
                 call.index_in_iteration,
             )
 
-            self._executed_tool_call_ids.add(call.tool_call_id)
-            tool_request = ToolExecutionRequest(
-                call=call,
-                context=ToolExecutionContext(
-                    run_id=self._request.run_id,
-                    session_id=self._request.session_id,
+        batch_request = BatchToolExecutionRequest(
+            calls=decision.tool_calls,
+            context=BatchToolExecutionContext(
+                run_id=self._request.run_id,
+                session_id=self._request.session_id,
+                iteration_id=decision.iteration_id,
+                timeout_seconds=(
+                    self._request.agent_policy.tool_execution_timeout_seconds
+                ),
+                cancellation_token=self._request.cancellation_token,
+                correlation_id=self._batch_correlation_id(
                     iteration_id=decision.iteration_id,
-                    tool_call_id=call.tool_call_id,
-                    index_in_iteration=call.index_in_iteration,
-                    timeout_seconds=(
-                        self._request.agent_policy.tool_execution_timeout_seconds
-                    ),
-                    cancellation_token=self._request.cancellation_token,
-                    correlation_id=self._correlation_id(
-                        iteration_id=decision.iteration_id,
-                        tool_call_id=call.tool_call_id,
+                ),
+            ),
+        )
+
+        batch_outcome = await self._execute_batch(batch_request)
+        if isinstance(batch_outcome, WaitCancelled):
+            yield await self._make_cancelled_terminal_with_close()
+            return
+        if isinstance(batch_outcome, WaitTimedOut):
+            yield await self._make_tool_timeout_terminal_with_close()
+            return
+
+        bijection_failure = self._validate_batch_bijection(
+            calls=decision.tool_calls, outcome=batch_outcome.value
+        )
+        if bijection_failure is not None:
+            self._last_tool_batch_result = bijection_failure
+            return
+
+        outcome_by_id: dict[str, ToolExecutionOutcome] = {
+            record.tool_call_id: record.outcome
+            for record in batch_outcome.value.records
+        }
+        batch_snapshot = AssistantToolCallBatchSnapshot(
+            iteration_id=decision.iteration_id,
+            tool_calls=decision.tool_calls,
+            content=decision.content,
+            reasoning_content=decision.reasoning_content,
+            provider_request_id=decision.provider_request_id,
+        )
+        accepted_records: list[_ToolOutcomeRecord] = []
+        awaiting_records: list[_ToolAwaitingRecord] = []
+        for call in decision.tool_calls:
+            outcome = outcome_by_id[call.tool_call_id]
+            if isinstance(outcome, ToolAwaitingOutcome):
+                awaiting_records.append(
+                    _ToolAwaitingRecord(call=call, outcome=outcome)
+                )
+                continue
+            if (
+                isinstance(outcome, ToolCompletedOutcome)
+                or isinstance(outcome, ToolFailedOutcome)
+                or isinstance(outcome, ToolCancelledOutcome)
+            ):
+                accepted_records.append(
+                    _ToolOutcomeRecord(call=call, outcome=outcome)
+                )
+                continue
+            assert_never(outcome)
+
+        for record in accepted_records:
+            yield self._make_event(
+                event_type=EngineEventType.TOOL_RESULT_ACCEPTED,
+                data=ToolResultAcceptedData(
+                    iteration_id=decision.iteration_id,
+                    record=AcceptedToolExecutionRecord(
+                        batch_snapshot=batch_snapshot,
+                        call=record.call,
+                        outcome=record.outcome,
                     ),
                 ),
+                occurred_at=_utc_now(),
+            )
+            _LOGGER.debug(
+                "engine.agent.tool_result_accepted session_id=%s "
+                "run_id=%s iteration_id=%s iteration_index=%s "
+                "tool_name=%s tool_call_id=%s outcome=%s",
+                self._request.session_id,
+                self._request.run_id,
+                decision.iteration_id,
+                decision.iteration_index,
+                record.call.name,
+                record.call.tool_call_id,
+                _tool_outcome_name(record.outcome),
             )
 
-            outcome = await self._execute_one_tool(tool_request)
-            if isinstance(outcome, WaitCancelled):
-                yield await self._make_cancelled_terminal_with_close()
-                return
-            if isinstance(outcome, WaitTimedOut):
-                yield await self._make_tool_timeout_terminal_with_close()
-                return
-            completed_outcome = outcome.value
-
-            if isinstance(completed_outcome, ToolAwaitingOutcome):
+        if awaiting_records:
+            for awaiting in awaiting_records:
                 yield self._make_event(
                     event_type=EngineEventType.TOOL_AWAITING,
                     data=ToolAwaitingData(
                         iteration_id=decision.iteration_id,
-                        tool_call_id=call.tool_call_id,
-                        await_spec=completed_outcome.await_spec,
-                        snapshot=completed_outcome.snapshot,
+                        record=AwaitingToolExecutionRecord(
+                            batch_snapshot=batch_snapshot,
+                            call=awaiting.call,
+                            await_spec=awaiting.outcome.await_spec,
+                            snapshot=awaiting.outcome.snapshot,
+                        ),
                     ),
                     occurred_at=_utc_now(),
                 )
@@ -1442,91 +1632,102 @@ class _AsyncAgent:
                     self._request.run_id,
                     decision.iteration_id,
                     decision.iteration_index,
-                    call.name,
-                    call.tool_call_id,
-                    completed_outcome.await_spec.await_kind.value,
+                    awaiting.call.name,
+                    awaiting.call.tool_call_id,
+                    awaiting.outcome.await_spec.await_kind.value,
                 )
-                yield await self._make_suspended_terminal_with_close(
-                    completed_outcome
-                )
-                return
-            if isinstance(completed_outcome, ToolCompletedOutcome) or isinstance(
-                completed_outcome, ToolFailedOutcome
-            ):
-                yield self._make_event(
-                    event_type=EngineEventType.TOOL_RESULT_ACCEPTED,
-                    data=ToolResultAcceptedData(
-                        iteration_id=decision.iteration_id,
-                        tool_call_id=call.tool_call_id,
-                        name=call.name,
-                        index_in_iteration=call.index_in_iteration,
-                        outcome=completed_outcome,
-                    ),
-                    occurred_at=_utc_now(),
-                )
-                records.append(
-                    _ToolOutcomeRecord(call=call, outcome=completed_outcome)
-                )
-                _LOGGER.debug(
-                    "engine.agent.tool_result_accepted session_id=%s "
-                    "run_id=%s iteration_id=%s iteration_index=%s "
-                    "tool_name=%s tool_call_id=%s outcome=%s",
-                    self._request.session_id,
-                    self._request.run_id,
-                    decision.iteration_id,
-                    decision.iteration_index,
-                    call.name,
-                    call.tool_call_id,
-                    _tool_outcome_name(completed_outcome),
-                )
-            else:
-                assert_never(completed_outcome)
+            yield await self._make_suspended_terminal_with_close(
+                batch_snapshot=batch_snapshot,
+                accepted_records=tuple(accepted_records),
+                awaiting_records=tuple(awaiting_records),
+            )
+            return
+
         if self._is_cancelled():
             yield await self._make_cancelled_terminal_with_close()
             return
-        self._last_tool_batch_result = _ToolBatchCompleted(records=tuple(records))
-        completed_count = _count_completed_tool_records(records)
-        failed_count = _count_failed_tool_records(records)
+
+        records_tuple = tuple(accepted_records)
+        self._last_tool_batch_result = _ToolBatchCompleted(records=records_tuple)
+        completed_count = _count_completed_tool_records(records_tuple)
+        failed_count = _count_failed_tool_records(records_tuple)
+        cancelled_count = _count_cancelled_tool_records(records_tuple)
         _LOGGER.log(
             VERBOSE_LOG_LEVEL,
             "engine.agent.tool_batch_completed session_id=%s run_id=%s "
             "iteration_id=%s iteration_index=%s tool_call_count=%s "
-            "completed_count=%s failed_count=%s",
+            "completed_count=%s failed_count=%s cancelled_count=%s",
             self._request.session_id,
             self._request.run_id,
             decision.iteration_id,
             decision.iteration_index,
-            len(records),
+            len(records_tuple),
             completed_count,
             failed_count,
+            cancelled_count,
         )
         yield self._make_event(
             event_type=EngineEventType.TOOL_CALLS_BATCH_DONE,
             data=ToolCallsBatchDoneData(
                 iteration_id=decision.iteration_id,
                 tool_call_ids=tuple(
-                    record.call.tool_call_id for record in records
+                    record.call.tool_call_id for record in records_tuple
                 ),
                 completed_count=completed_count,
                 failed_count=failed_count,
+                cancelled_count=cancelled_count,
             ),
             occurred_at=_utc_now(),
         )
 
-    async def _execute_one_tool(
-        self, tool_request: ToolExecutionRequest
-    ) -> WaitCompleted[ToolExecutionOutcome] | WaitCancelled | WaitTimedOut:
-        """执行单个工具调用并处理取消、握手超时与普通异常。
+    def _validate_batch_bijection(
+        self,
+        *,
+        calls: tuple[ToolCallRequest, ...],
+        outcome: BatchToolExecutionOutcome,
+    ) -> RunFailedData | None:
+        """校验批式 outcome 与输入 calls 的双射关系。
 
-        :param tool_request: 工具执行请求。
-        :returns: ``WaitCompleted`` 包裹的 outcome、``WaitCancelled`` 或
-            ``WaitTimedOut``。
+        :param calls: 输入工具调用元组。
+        :param outcome: ToolExecutor 返回的批式 outcome。
+        :returns: 违反双射时返回 ``RUN_FAILED`` data，否则返回 ``None``。
+        :raises Exception: 不主动抛出异常。
+        """
+
+        input_ids = {call.tool_call_id for call in calls}
+        record_ids: list[str] = [record.tool_call_id for record in outcome.records]
+        if len(record_ids) != len(set(record_ids)):
+            return RunFailedData(
+                error_code=_ERROR_TOOL_BATCH_OUTCOME_MISMATCH,
+                message=_TOOL_BATCH_OUTCOME_MISMATCH_MESSAGE,
+                provider_request_id=None,
+                recoverable=False,
+            )
+        if set(record_ids) != input_ids:
+            return RunFailedData(
+                error_code=_ERROR_TOOL_BATCH_OUTCOME_MISMATCH,
+                message=_TOOL_BATCH_OUTCOME_MISMATCH_MESSAGE,
+                provider_request_id=None,
+                recoverable=False,
+            )
+        return None
+
+    async def _execute_batch(
+        self, request: BatchToolExecutionRequest
+    ) -> (
+        WaitCompleted[BatchToolExecutionOutcome] | WaitCancelled | WaitTimedOut
+    ):
+        """执行批式工具握手并处理取消、握手超时与普通异常。
+
+        :param request: 批式工具执行请求。
+        :returns: ``WaitCompleted`` 包裹的批式 outcome、``WaitCancelled``
+            或 ``WaitTimedOut``。
         :raises asyncio.CancelledError: 外层 task 被取消时透传。
         """
 
         try:
             return await await_or_cancel_or_timeout(
-                self._call_tool_executor(tool_request),
+                self._call_tool_executor(request),
                 token=self._request.cancellation_token,
                 timeout_seconds=(
                     self._request.agent_policy.tool_execution_timeout_seconds
@@ -1535,47 +1736,37 @@ class _AsyncAgent:
         except asyncio.CancelledError:
             raise
         except Exception as exc:
-            return WaitCompleted(
-                value=ToolFailedOutcome(
-                    result=ToolResultFailure(
-                        ok=False,
-                        error=_ERROR_TOOL_EXECUTOR_EXCEPTION,
-                        message=type(exc).__name__,
-                        hint=None,
-                        meta=None,
-                    )
-                )
+            records = tuple(
+                _failed_record_from_exception(call=call, exc=exc)
+                for call in request.calls
             )
+            return WaitCompleted(value=BatchToolExecutionOutcome(records=records))
 
     async def _call_tool_executor(
-        self, tool_request: ToolExecutionRequest
-    ) -> ToolExecutionOutcome:
-        """调用 ToolExecutor，并把 executor 内部取消异常归一为工具失败。
+        self, request: BatchToolExecutionRequest
+    ) -> BatchToolExecutionOutcome:
+        """调用 ToolExecutor 批式握手，并把 executor 内部取消异常归一为整批失败。
 
         Engine 将 ``CancelledError`` 加上已取消 token 归因为 run-level
         cancellation；若 executor 自行抛出 ``CancelledError`` 且 token
-        同时被取消，也会按 run cancellation 处理。这是当前握手边界的
-        有意归因取舍，避免引入复杂的取消来源身份追踪。
+        同时被取消，也会按 run cancellation 处理。这是当前批式握手边界
+        的有意归因取舍，避免引入复杂的取消来源身份追踪。
 
-        :param tool_request: 工具执行请求。
-        :returns: 工具执行 outcome。
+        :param request: 批式工具执行请求。
+        :returns: 批式工具执行 outcome。
         :raises asyncio.CancelledError: run-local cancellation 已命中时透传。
         """
 
         try:
-            return await self._request.tool_executor.execute(tool_request)
+            return await self._request.tool_executor.execute(request)
         except asyncio.CancelledError:
             if self._request.cancellation_token.is_cancelled():
                 raise
-            return ToolFailedOutcome(
-                result=ToolResultFailure(
-                    ok=False,
-                    error=_ERROR_TOOL_EXECUTOR_EXCEPTION,
-                    message=asyncio.CancelledError.__name__,
-                    hint=None,
-                    meta=None,
-                )
+            records = tuple(
+                _failed_record_from_cancelled(call=call)
+                for call in request.calls
             )
+            return BatchToolExecutionOutcome(records=records)
 
     def _inject_tool_messages(
         self,
@@ -1808,27 +1999,50 @@ class _AsyncAgent:
         )
 
     async def _make_suspended_terminal_with_close(
-        self, awaiting: ToolAwaitingOutcome
+        self,
+        *,
+        batch_snapshot: AssistantToolCallBatchSnapshot,
+        accepted_records: tuple[_ToolOutcomeRecord, ...],
+        awaiting_records: tuple[_ToolAwaitingRecord, ...],
     ) -> EngineEvent:
         """关闭 Runner 后构造挂起终态。
 
-        ToolAwaitingOutcome 已经返回时，``await_spec`` / ``snapshot`` 是
-        已接受的恢复事实；迟到取消不覆盖 ``RUN_SUSPENDED``。取消若要抢占
-        挂起，只能在工具 outcome 返回前由等待 helper 返回 ``WaitCancelled``。
+        awaiting 已返回时，已接受的工具记录与本批 awaiting 记录是已知
+        恢复事实；迟到取消不覆盖 ``RUN_SUSPENDED``。取消若要抢占挂起，
+        只能在批式 outcome 返回前由等待 helper 返回 ``WaitCancelled``。
 
-        :param awaiting: 工具等待 outcome。
+        :param batch_snapshot: 本批 LLM tool_calls snapshot。
+        :param accepted_records: 本批 accepted 工具记录（按输入顺序）。
+        :param awaiting_records: 本批 awaiting 工具记录（按输入顺序）；
+            至少含一个。
         :returns: ``RUN_SUSPENDED`` terminal。
         :raises Exception: 不主动抛出异常；Runner close 异常会被吞掉并记日志。
         """
 
-        # awaiting outcome 已携带恢复事实；迟到取消不覆盖 run_suspended。
         await self._close_runner_once()
+        accepted_data = tuple(
+            AcceptedToolExecutionRecord(
+                batch_snapshot=batch_snapshot,
+                call=record.call,
+                outcome=record.outcome,
+            )
+            for record in accepted_records
+        )
+        awaiting_data = tuple(
+            AwaitingToolExecutionRecord(
+                batch_snapshot=batch_snapshot,
+                call=record.call,
+                await_spec=record.outcome.await_spec,
+                snapshot=record.outcome.snapshot,
+            )
+            for record in awaiting_records
+        )
         return self._make_terminal_suspended(
             RunSuspendedData(
                 reason=RUN_SUSPENDED_REASON_TOOL_AWAITING,
                 resume_hint=None,
-                await_spec=awaiting.await_spec,
-                snapshot=awaiting.snapshot,
+                accepted_records=accepted_data,
+                awaiting_records=awaiting_data,
             )
         )
 
@@ -1989,16 +2203,16 @@ class _AsyncAgent:
             f"{iteration_index + _FIRST_ITERATION_ORDINAL}"
         )
 
-    def _correlation_id(self, *, iteration_id: str, tool_call_id: str) -> str:
-        """构造工具执行中性关联 id。
+    def _batch_correlation_id(self, *, iteration_id: str) -> str:
+        """构造批级中性关联 id。
 
         :param iteration_id: 当前迭代 id。
-        :param tool_call_id: 工具调用 id。
-        :returns: 中性 correlation id。
+        :returns: 形如 ``f"{run_id}:{iteration_id}:tool_batch"`` 的批级
+            关联标识。
         :raises Exception: 不主动抛出异常。
         """
 
-        return f"{self._request.run_id}:{iteration_id}:{tool_call_id}"
+        return f"{self._request.run_id}:{iteration_id}:tool_batch"
 
     def _effective_tools(self) -> Sequence[ToolSchema]:
         """返回本轮暴露给 Runner 的工具 schema。
@@ -2018,12 +2232,20 @@ class _AsyncAgent:
     def _all_records_failed(self, records: tuple[_ToolOutcomeRecord, ...]) -> bool:
         """判断工具批次是否全失败。
 
+        cancelled outcome 不计为失败（plan §5.3）：批内只要存在
+        completed 或 cancelled，就视为本批没有全失败。空 records 也
+        不视为全失败。
+
         :param records: 本批工具 outcome 记录。
-        :returns: 全部为 failed outcome 时返回 ``True``。
+        :returns: ``records`` 非空且全部为 failed outcome 时返回 ``True``。
         :raises Exception: 不主动抛出异常。
         """
 
-        return all(isinstance(record.outcome, ToolFailedOutcome) for record in records)
+        if not records:
+            return False
+        return all(
+            isinstance(record.outcome, ToolFailedOutcome) for record in records
+        )
 
     def _is_terminal(self, event: EngineEvent) -> bool:
         """判断事件是否为 terminal。
@@ -2273,8 +2495,8 @@ async def run_agent_and_wait(request: AgentRunRequest) -> AgentRunResult:
             run_id=terminal.run_id,
             reason=data.reason,
             resume_hint=data.resume_hint,
-            await_spec=data.await_spec,
-            snapshot=data.snapshot,
+            accepted_records=data.accepted_records,
+            awaiting_records=data.awaiting_records,
         )
     return EngineRunOutcomeFailed(
         session_id=request.session_id,

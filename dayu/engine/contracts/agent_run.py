@@ -22,7 +22,10 @@ from dayu.contracts.cancellation import CancellationToken
 from dayu.engine.contracts.finish_reason import FinishReason
 from dayu.engine.contracts.messages import AgentMessage
 from dayu.engine.contracts.runner_spec import RunnerCallOptions, RunnerSpec
-from dayu.contracts.tool_await import ToolAwaitSnapshot, ToolAwaitSpec
+from dayu.engine.contracts.tool_records import (
+    AcceptedToolExecutionRecord,
+    AwaitingToolExecutionRecord,
+)
 from dayu.contracts.tool_executor import ToolExecutor
 from dayu.contracts.tool_schema import ToolSchema
 
@@ -152,16 +155,30 @@ class EngineRunOutcomeSuspended:
     :param run_id: 运行 id。
     :param reason: 挂起原因。
     :param resume_hint: 可选恢复提示。
-    :param await_spec: 工具等待规约。
-    :param snapshot: 工具等待时点快照；无快照时为 ``None``。
+    :param accepted_records: 本批已 accepted 的工具记录元组（按输入顺序）；
+        与 ``awaiting_records`` 共同重建 LLM context 已知事实。
+    :param awaiting_records: 本批进入长事务等待的工具记录元组（按输入
+        顺序）；至少含一个，否则不应进入 SUSPENDED。
     """
 
     session_id: str
     run_id: str
     reason: str
     resume_hint: RunResumeHint | None
-    await_spec: ToolAwaitSpec
-    snapshot: ToolAwaitSnapshot | None
+    accepted_records: tuple[AcceptedToolExecutionRecord, ...]
+    awaiting_records: tuple[AwaitingToolExecutionRecord, ...]
+
+    def __post_init__(self) -> None:
+        """校验 ``awaiting_records`` 非空。
+
+        :returns: 无返回值。
+        :raises ValueError: ``awaiting_records`` 为空时抛出。
+        """
+
+        if not self.awaiting_records:
+            raise ValueError(
+                "EngineRunOutcomeSuspended.awaiting_records must be non-empty"
+            )
 
 
 AgentRunResult: TypeAlias = (

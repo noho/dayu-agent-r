@@ -1,6 +1,6 @@
 """``ToolExecutionOutcome`` 穷尽匹配测试。
 
-提供一个最小 ``match`` helper 覆盖三分支并以 :func:`typing.assert_never`
+提供一个最小 ``match`` helper 覆盖四分支并以 :func:`typing.assert_never`
 收口；新增子类型时 pyright 会在编译期报错。本文件同时确保 helper 在
 运行期对每个分支都返回正确判别。
 """
@@ -10,13 +10,17 @@ from __future__ import annotations
 from datetime import datetime
 from typing import assert_never
 
+import pytest
+
 from dayu.contracts.tool_await import (
     ToolAwaitKind,
     ToolAwaitSnapshot,
     ToolAwaitSpec,
 )
 from dayu.contracts.tool_outcome import (
+    TOOL_CANCELLED_REASON_APPROVAL_DENIED,
     ToolAwaitingOutcome,
+    ToolCancelledOutcome,
     ToolCompletedOutcome,
     ToolExecutionOutcome,
     ToolFailedOutcome,
@@ -28,7 +32,7 @@ from dayu.contracts.tool_result import (
 
 
 def _classify(outcome: ToolExecutionOutcome) -> str:
-    """对 :data:`ToolExecutionOutcome` 三分支做穷尽匹配。
+    """对 :data:`ToolExecutionOutcome` 四分支做穷尽匹配。
 
     :param outcome: 工具执行 outcome 联合。
     :returns: 分支判别字符串。
@@ -41,6 +45,8 @@ def _classify(outcome: ToolExecutionOutcome) -> str:
             return "failed"
         case ToolAwaitingOutcome():
             return "awaiting"
+        case ToolCancelledOutcome():
+            return "cancelled"
         case _:  # pragma: no cover - guarded by pyright
             assert_never(outcome)
 
@@ -96,6 +102,20 @@ def _make_awaiting() -> ToolAwaitingOutcome:
     )
 
 
+def _make_cancelled() -> ToolCancelledOutcome:
+    """构造一个最小的 cancelled outcome。
+
+    :returns: 最小可构造的 :class:`ToolCancelledOutcome`。
+    """
+
+    return ToolCancelledOutcome(
+        reason=TOOL_CANCELLED_REASON_APPROVAL_DENIED,
+        message="approval denied",
+        hint=None,
+        meta=None,
+    )
+
+
 def test_classify_completed() -> None:
     """completed 分支应返回 ``"completed"``。"""
 
@@ -112,3 +132,40 @@ def test_classify_awaiting() -> None:
     """awaiting 分支应返回 ``"awaiting"``。"""
 
     assert _classify(_make_awaiting()) == "awaiting"
+
+
+def test_classify_cancelled() -> None:
+    """cancelled 分支应返回 ``"cancelled"``。"""
+
+    assert _classify(_make_cancelled()) == "cancelled"
+
+
+def test_cancelled_rejects_invalid_reason() -> None:
+    """非白名单 ``reason`` 必须在构造期抛出 :class:`ValueError`。
+
+    校验 :class:`ToolCancelledOutcome.__post_init__` 防御受限 reason 集合，
+    避免 Host 误传任意 reason 字面量绕过取消语义。
+    """
+
+    with pytest.raises(ValueError):
+        ToolCancelledOutcome(
+            reason="not_a_real_reason",
+            message="x",
+            hint=None,
+            meta=None,
+        )
+
+
+def test_cancelled_rejects_empty_message() -> None:
+    """``message`` 为空必须在构造期抛出 :class:`ValueError`。
+
+    取消语义必须携带可解释的人类可读 message；空 message 视为无效输入。
+    """
+
+    with pytest.raises(ValueError):
+        ToolCancelledOutcome(
+            reason=TOOL_CANCELLED_REASON_APPROVAL_DENIED,
+            message="",
+            hint=None,
+            meta=None,
+        )

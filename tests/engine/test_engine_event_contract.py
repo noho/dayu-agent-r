@@ -145,15 +145,13 @@ def test_tool_awaiting_and_suspended_data_fields_are_locked() -> None:
 
     assert awaiting_fields == {
         "iteration_id",
-        "tool_call_id",
-        "await_spec",
-        "snapshot",
+        "record",
     }
     assert suspended_fields == {
         "reason",
         "resume_hint",
-        "await_spec",
-        "snapshot",
+        "accepted_records",
+        "awaiting_records",
     }
 
 
@@ -206,4 +204,5 @@ def test_tool_observation_data_fields_are_locked() -> None:
         "tool_call_ids",
         "completed_count",
         "failed_count",
+        "cancelled_count",
     }

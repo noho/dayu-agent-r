@@ -10,7 +10,7 @@ Engine 当前负责：
 
 - 运行单次 Agent 推理循环，包括 iteration、RunnerEvent 消费、工具结果回填、最终回答、降级收口、续写与终态提交。
 - 通过 `AsyncRunner` 调用模型 provider，并把 provider 协议归一为 `RunnerEvent`。
-- 通过 `ToolExecutor.execute(ToolExecutionRequest)` 与工具执行环境完成 bounded handshake。
+- 通过 `ToolExecutor.execute(BatchToolExecutionRequest)` 与工具执行环境完成 bounded handshake。
 - 将 Runner 和工具执行事实提升为强类型 `EngineEvent`。
 - 观察 `CancellationToken`，在可中断边界收口为结构化取消终态。
 - 在 provider 上下文超限时产出 `context_compaction_requested`，随后以可恢复 `run_failed(context_compaction_required)` 结束本次 run。
@@ -87,7 +87,7 @@ Engine 不读取配置文件，也不从 `ToolExecutor` 查询 schema。`tool_sc
 - `continuation_prompt` 是 length 续写时追加给 Runner 的用户消息，不能为空。
 - `max_consecutive_failed_tool_batches` 控制连续全失败工具批次阈值，必须至少为 1。
 
-`ToolExecutionContext.timeout_seconds` 不是独立真源。Agent 构造工具执行上下文时，把 `AgentPolicy.tool_execution_timeout_seconds` 投影到 `ToolExecutionContext.timeout_seconds`，供工具执行环境协作使用；Engine 同时用同一个策略值包裹 `ToolExecutor.execute` handshake。
+`BatchToolExecutionContext.timeout_seconds` 不是独立真源。Agent 构造工具执行上下文时，把 `AgentPolicy.tool_execution_timeout_seconds` 投影到 `BatchToolExecutionContext.timeout_seconds`，供工具执行环境协作使用；Engine 同时用同一个策略值包裹 `ToolExecutor.execute` handshake。
 
 ## 6. Agent 推理循环
 
@@ -99,9 +99,9 @@ Engine 不读取配置文件，也不从 `ToolExecutor` 查询 schema。`tool_sc
 4. 将内容、推理、usage、provider 协议错误、上下文超限与 iteration 完成事实提升为 `EngineEvent`。
 5. 根据 Runner 消费状态分类为最终回答、工具调用或失败。
 6. 若得到最终回答，产出 `final_answer`。
-7. 若得到工具调用，按 `index_in_iteration` 排序并串行执行工具 handshake。
-8. 对 completed / failed 工具 outcome 产出 `tool_result_accepted`，注入 assistant tool calls 与 tool messages，进入下一轮 Runner。
-9. 对 awaiting 工具 outcome 产出 `tool_awaiting` 和 `run_suspended`，结束本次 run。
+7. 若得到工具调用，按 `index_in_iteration` 排序并构造一个 batch 工具 handshake。
+8. 对 completed / failed / cancelled 工具 outcome 产出 `tool_result_accepted`，无 awaiting 时注入 assistant tool calls 与 tool messages，进入下一轮 Runner。
+9. 对包含 awaiting 的 batch 产出 `tool_awaiting` 和 `run_suspended`，结束本次 run。
 10. 若普通工具轮次耗尽或连续失败工具批次达到阈值，按 `fallback_mode` 收口。
 
 Runner 异常会转为 `run_failed(runner_exception)`。Runner 流结束但没有 `runner_done` 会转为 `run_failed(runner_abnormal_stop)`。同一 run 内重复 `tool_call_id` 会转为 `run_failed(duplicate_tool_call_id)`。
@@ -219,14 +219,14 @@ Engine 只通过 `ToolExecutor` 协议调用工具：
 class ToolExecutor(Protocol):
     async def execute(
         self,
-        request: ToolExecutionRequest,
-    ) -> ToolExecutionOutcome: ...
+        request: BatchToolExecutionRequest,
+    ) -> BatchToolExecutionOutcome: ...
 ```
 
-`ToolExecutionRequest` 包含：
+`BatchToolExecutionRequest` 包含：
 
-- `call: ToolCallRequest`
-- `context: ToolExecutionContext`
+- `calls: tuple[ToolCallRequest, ...]`
+- `context: BatchToolExecutionContext`
 
 `ToolCallRequest` 包含：
 
@@ -236,18 +236,28 @@ class ToolExecutor(Protocol):
 - `index_in_iteration`
 - `provider_state`
 
-`ToolExecutionContext` 包含：
+`BatchToolExecutionContext` 包含：
 
 - `run_id`
 - `session_id`
 - `iteration_id`
-- `tool_call_id`
-- `index_in_iteration`
 - `timeout_seconds`
 - `cancellation_token`
 - `correlation_id`
 
-`correlation_id` 是中性跨组件关联 id，不承载 trace recorder 私有语义，不作为幂等键、游标或授权凭据。
+批内单次工具调用身份由 `ToolCallRequest.tool_call_id` 和 `ToolCallRequest.index_in_iteration` 承载。`correlation_id` 是批级中性跨组件关联 id，不承载 trace recorder 私有语义，不作为幂等键、游标或授权凭据。
+
+`BatchToolExecutionOutcome` 包含 `records: tuple[BatchToolExecutionRecord, ...]`。每个 record 包含 `tool_call_id` 与 `outcome`，必须与输入 `calls` 严格双射。Engine 按输入 call 顺序处理返回记录，不把 executor 返回顺序作为公共事件顺序真源。
+
+### ToolDefinition 与 ToolCallable
+
+工具声明与工具执行治理不属于 Engine。
+
+`@tool(...)`、`ToolDefinition`、`ToolCallable` 的整体边界见 [dayu/README.md 的“工具定义与执行边界”](../../dayu/README.md#工具定义与执行边界)。Engine 不消费 `ToolDefinition`，不调用 `ToolCallable`，也不从工具定义对象读取 schema 或治理策略。
+
+Host / ToolRuntime 可以用 `@tool(...)` 在工具现场同源声明 `ToolSchema`、截断声明、展示 metadata、标签和单工具 callable。`ToolCallable` 是单工具调用协议；Host / ToolRuntime 持有它，并在自身治理边界内把一组工具定义包装为 `ToolExecutor`。batch 内串行、并发、权限、审批、限流、内部 timeout、审计、长事务 awaiting、orphan cleanup 和工具级取消都属于 Host / ToolRuntime。
+
+`dayu.contracts` 不提供 `FunctionToolExecutor` 或其它默认执行器。公共契约只定义 `ToolCallable`、`ToolDefinition`、`ToolExecutor` 与 batch request/outcome 形状，不定义 batch 内部执行策略。
 
 ### ToolExecutionOutcome
 
@@ -256,8 +266,9 @@ class ToolExecutor(Protocol):
 - `ToolCompletedOutcome(result: ToolResultSuccess)`
 - `ToolFailedOutcome(result: ToolResultFailure)`
 - `ToolAwaitingOutcome(await_spec: ToolAwaitSpec, snapshot: ToolAwaitSnapshot | None)`
+- `ToolCancelledOutcome(reason, message, hint, meta)`
 
-completed / failed outcome 会进入 `tool_result_accepted`，并被投影为 LLM-facing tool message。awaiting outcome 不进入普通工具结果信封，而是触发挂起流程。
+completed / failed / cancelled outcome 会进入 `tool_result_accepted`。无 awaiting 的 batch 会被投影为 LLM-facing tool messages。awaiting outcome 不进入普通工具结果信封，而是触发挂起流程。
 
 工具结果信封只表达 completed / failed：
 
@@ -277,7 +288,7 @@ completed / failed outcome 会进入 `tool_result_accepted`，并被投影为 LL
 当前 timeout 规则：
 
 - `AgentPolicy.tool_execution_timeout_seconds` 是唯一真源。
-- Agent 构造 `ToolExecutionContext.timeout_seconds` 时投影该值。
+- Agent 构造 `BatchToolExecutionContext.timeout_seconds` 时投影该值。
 - Agent 调用 `await_or_cancel_or_timeout` 包裹 `ToolExecutor.execute`，使用同一个 timeout。
 - 若 execute 在 timeout 前返回 completed / failed / awaiting outcome，Agent 按 outcome 提交后续事件。
 - 若 execute 抛出普通异常，Agent 将其归一为 `ToolFailedOutcome(error="tool_executor_exception")`，随后按普通 failed outcome 产出 `tool_result_accepted` 并注入 tool message。
@@ -289,16 +300,16 @@ completed / failed outcome 会进入 `tool_result_accepted`，并被投影为 LL
 
 ## 12. Suspend 与 Resume
 
-当前 run suspension 的唯一来源是 `ToolExecutor.execute` 返回 `ToolAwaitingOutcome`。
+当前 run suspension 的唯一来源是 `ToolExecutor.execute` 返回的 batch outcome 中包含至少一个 `ToolAwaitingOutcome`。
 
-收到 `ToolAwaitingOutcome` 后，Agent 按固定顺序处理：
+收到包含 `ToolAwaitingOutcome` 的 batch outcome 后，Agent 按固定顺序处理：
 
-1. 产出 `tool_awaiting`，携带 `iteration_id`、`tool_call_id`、`await_spec` 与 `snapshot`。
+1. 对每个 awaiting record 产出 `tool_awaiting`，携带对应 call、`await_spec` 与 `snapshot`。
 2. 关闭本次 Runner。
-3. 产出 terminal `run_suspended`，`reason` 为 `tool_awaiting`，并携带同一个 `await_spec` 与 `snapshot`。
+3. 产出 terminal `run_suspended`，`reason` 为 `tool_awaiting`，并携带同一批次已接受的普通工具事实与 awaiting 事实。
 4. 结束本次 run。
 
-Engine 不等待外部长事务完成，不轮询 job，不持久化 wait record，不保留可恢复的 in-memory Agent 或 Runner。恢复不是恢复旧 Engine 实例；调用方在外部长事务结束后构造新的 `AgentRunRequest`，把工具终态结果或恢复输入显式放入新 run 的 `messages`。
+Engine 不等待外部长事务完成，不轮询 job，不持久化 wait record，不保留可恢复的 in-memory Agent 或 Runner。恢复不是恢复旧 Engine 实例；调用方在外部长事务结束后构造新的 `AgentRunRequest`，把同一 assistant tool-call 批次、已接受工具事实、工具终态结果或恢复输入显式放入新 run 的 `messages`。
 
 `run_agent_messages` 调用方需要消费并保存 `tool_awaiting` / `run_suspended` 中的恢复事实。`run_agent_and_wait` 调用方通过 `EngineRunOutcomeSuspended` 获取同一组结构化事实。
 

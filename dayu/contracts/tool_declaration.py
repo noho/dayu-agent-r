@@ -1,23 +1,30 @@
 """工具声明契约。
 
-本模块提供最小 OLD-like ``@tool`` 声明能力，用于把 LLM-facing
-``ToolSchema``、Host ToolRuntime 截断声明、执行绑定与展示 metadata 放在
-同一个工具现场声明。它不是 ToolRegistry，不负责权限治理、生命周期治理、
-工具发现、middleware 或业务工具迁移。
+本模块提供最小工具 *声明* 能力：把 LLM-facing ``ToolSchema``、Host
+ToolRuntime 截断声明、展示 metadata 与 *单工具* :class:`ToolCallable`
+放在同一个工具现场声明。
 
-``ToolDefinition`` / ``ToolBundle`` 是装配输入；Engine / Runner 只能接收
-由 ``to_tool_schema()`` 或 ``to_tool_schemas()`` 投影得到的
-``ToolSchema``，不得消费 definition / bundle 本体、截断声明、展示 metadata
-或 callable / executor binding。
+``ToolDefinition`` / ``ToolBundle`` 是 Host / ToolRuntime 装配输入；
+Engine / Runner 只能接收由 ``to_tool_schema()`` 或
+``to_tool_schemas()`` 投影得到的 ``ToolSchema``，不得消费 definition /
+bundle 本体、截断声明、展示 metadata 或 ``ToolCallable``。
+
+`ToolCallable` 只是 *单* 工具调用协议；它不参与批级握手 / 治理。把一组
+``ToolDefinition.callable`` 包装为受治理的批式 :class:`ToolExecutor` 是
+Host / ToolRuntime 的职责，公共契约层不提供默认执行器或 callable
+适配器。
 """
 
 from __future__ import annotations
 
-from collections.abc import Awaitable, Callable, Mapping, Sequence
+from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
+from typing import Protocol, runtime_checkable
 
-from dayu.contracts.tool_call import ToolExecutionRequest
-from dayu.contracts.tool_executor import ToolExecutor
+from dayu.contracts.tool_call import (
+    BatchToolExecutionContext,
+    ToolCallRequest,
+)
 from dayu.contracts.tool_outcome import ToolExecutionOutcome
 from dayu.contracts.tool_schema import (
     ToolFunctionSchema,
@@ -26,35 +33,34 @@ from dayu.contracts.tool_schema import (
     ToolTruncateSpec,
 )
 
-ToolFunctionCallable = Callable[
-    [ToolExecutionRequest], Awaitable[ToolExecutionOutcome]
-]
-"""工具函数 callable 类型。
 
-P5 仅承诺 async callable 绑定，避免在公共契约层引入同步函数调度策略。
-"""
+@runtime_checkable
+class ToolCallable(Protocol):
+    """单工具调用协议。
 
+    `ToolCallable` 是工具函数在 *单次* 调用粒度的强类型形状，被 Host /
+    ToolRuntime 在批式 :class:`ToolExecutor` 内部组合调用。它本身不参与
+    批级握手或治理。
 
-@dataclass(frozen=True, slots=True)
-class FunctionToolExecutor:
-    """把工具函数适配为 ``ToolExecutor``。
-
-    :param function: 工具执行函数。
+    实现必须为 ``async`` 函数；不允许同步实现，避免 Host 治理路径上意外
+    阻塞事件循环。
     """
 
-    function: ToolFunctionCallable
-
-    async def execute(
-        self, request: ToolExecutionRequest
+    async def __call__(
+        self,
+        call: ToolCallRequest,
+        context: BatchToolExecutionContext,
     ) -> ToolExecutionOutcome:
-        """执行绑定的工具函数。
+        """执行单次工具调用。
 
-        :param request: 工具执行请求。
-        :returns: 工具执行 outcome。
-        :raises Exception: 底层工具函数异常会透传给调用方。
+        :param call: 单次工具调用请求。
+        :param context: 批式握手共享的运行期上下文。
+        :returns: 工具执行结果。
+        :raises Exception: 实现可透传业务异常；Host / ToolRuntime 负责
+            把异常归一化为 :class:`ToolFailedOutcome`。
         """
 
-        return await self.function(request)
+        ...
 
 
 @dataclass(frozen=True, slots=True)
@@ -69,21 +75,23 @@ class ToolDisplayInfo:
 
 @dataclass(frozen=True, slots=True)
 class ToolDefinition:
-    """单个工具的强类型声明结果。
+    """单个工具的强类型 *声明* 结果。
+
+    本对象承载工具元数据与 *单工具* :class:`ToolCallable`，但不持有任何
+    批式 executor。把 ``callable`` 组合为受治理的批式
+    :class:`ToolExecutor` 是 Host / ToolRuntime 的职责。
 
     :param name: 工具名。
-    :param callable: 工具函数绑定。
-    :param executor: ``ToolExecutor`` 绑定。
     :param schema: LLM-facing 工具 schema。
+    :param callable: 单工具调用协议。
     :param truncate: Host ToolRuntime 截断声明；为 ``None`` 表示不截断。
     :param display: 展示 metadata；不进入 LLM schema。
     :param tags: 展示或装配标签；不进入 LLM schema。
     """
 
     name: str
-    callable: ToolFunctionCallable
-    executor: ToolExecutor
     schema: ToolSchema
+    callable: ToolCallable
     truncate: ToolTruncateSpec | None
     display: ToolDisplayInfo | None
     tags: tuple[str, ...]
@@ -155,6 +163,54 @@ class ToolBundle:
         }
 
 
+@dataclass(frozen=True, slots=True)
+class _ToolDecorator:
+    """``@tool(...)`` 装饰器实现。
+
+    本对象只在装饰器内部使用；保存声明现场的元数据，在被调用时把传入
+    的 :class:`ToolCallable` 包装成 :class:`ToolDefinition` 返回。
+
+    :param name: 工具名。
+    :param description: LLM-facing 工具描述。
+    :param parameters: LLM-facing 参数 schema。
+    :param truncate: Host ToolRuntime 截断声明。
+    :param display: 展示 metadata；为 ``None`` 表示不声明展示名。
+    :param tags: 展示或装配标签元组。
+    """
+
+    name: str
+    description: str
+    parameters: ToolParametersSchema
+    truncate: ToolTruncateSpec | None
+    display: ToolDisplayInfo | None
+    tags: tuple[str, ...]
+
+    def __call__(self, callable_: ToolCallable) -> ToolDefinition:
+        """把被装饰的 :class:`ToolCallable` 凝聚为工具定义。
+
+        :param callable_: 被装饰的单工具调用协议实现。
+        :returns: 工具定义；``callable`` 字段直接保留传入引用。
+        :raises Exception: 不主动抛出异常。
+        """
+
+        schema = ToolSchema(
+            type="function",
+            function=ToolFunctionSchema(
+                name=self.name,
+                description=self.description,
+                parameters=self.parameters,
+            ),
+        )
+        return ToolDefinition(
+            name=self.name,
+            schema=schema,
+            callable=callable_,
+            truncate=self.truncate,
+            display=self.display,
+            tags=self.tags,
+        )
+
+
 def tool(
     *,
     name: str,
@@ -163,8 +219,14 @@ def tool(
     truncate: ToolTruncateSpec | None = None,
     display_name: str | None = None,
     tags: Sequence[str] = (),
-) -> Callable[[ToolFunctionCallable], ToolDefinition]:
-    """声明一个工具并返回 ``ToolDefinition``。
+) -> _ToolDecorator:
+    """声明一个工具并返回装饰器。
+
+    本装饰器用于在工具函数现场同源声明 :class:`ToolSchema`、Host
+    ToolRuntime 截断声明、展示 metadata、标签与 *单工具*
+    :class:`ToolCallable`，凝聚为 :class:`ToolDefinition`。它 *不* 把被
+    装饰对象绑定为任何批式 executor —— 批式 executor 装配由 Host /
+    ToolRuntime 负责。
 
     :param name: LLM-facing 工具名。
     :param description: LLM-facing 工具描述。
@@ -173,48 +235,29 @@ def tool(
     :param display_name: 展示友好名称；内部会转换为 ``ToolDisplayInfo``，
         且不进入 schema。
     :param tags: 展示或装配标签；不进入 schema。
-    :returns: 接收工具函数并产出 ``ToolDefinition`` 的 decorator。
+    :returns: 接收单工具 :class:`ToolCallable` 并产出
+        :class:`ToolDefinition` 的装饰器。
     :raises Exception: 不主动抛出异常。
     """
 
-    def _decorate(function: ToolFunctionCallable) -> ToolDefinition:
-        """把工具函数封装成工具定义。
-
-        :param function: 工具执行函数。
-        :returns: 工具定义。
-        :raises Exception: 不主动抛出异常。
-        """
-
-        schema = ToolSchema(
-            type="function",
-            function=ToolFunctionSchema(
-                name=name,
-                description=description,
-                parameters=parameters,
-            ),
-        )
-        return ToolDefinition(
-            name=name,
-            callable=function,
-            executor=FunctionToolExecutor(function),
-            schema=schema,
-            truncate=truncate,
-            display=(
-                ToolDisplayInfo(name=display_name)
-                if display_name is not None
-                else None
-            ),
-            tags=tuple(tags),
-        )
-
-    return _decorate
+    return _ToolDecorator(
+        name=name,
+        description=description,
+        parameters=parameters,
+        truncate=truncate,
+        display=(
+            ToolDisplayInfo(name=display_name)
+            if display_name is not None
+            else None
+        ),
+        tags=tuple(tags),
+    )
 
 
 __all__ = [
-    "FunctionToolExecutor",
     "ToolBundle",
+    "ToolCallable",
     "ToolDefinition",
     "ToolDisplayInfo",
-    "ToolFunctionCallable",
     "tool",
 ]

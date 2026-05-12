@@ -61,6 +61,11 @@ from dayu.engine.contracts.messages import (
 )
 from dayu.engine.contracts.partial_tool_call import PartialToolCallSummary
 from dayu.engine.contracts.runner import AsyncRunner
+from dayu.engine.contracts.tool_records import (
+    AcceptedToolExecutionRecord,
+    AssistantToolCallBatchSnapshot,
+    AwaitingToolExecutionRecord,
+)
 from dayu.engine.contracts.runner_events import (
     RunnerContentCompletedData,
     RunnerContentDeltaData,
@@ -92,6 +97,7 @@ from dayu.engine.contracts.runner_spec import (
 )
 
 __all__ = [
+    "AcceptedToolExecutionRecord",
     "AgentMessage",
     "AgentMessageRole",
     "AgentFallbackMode",
@@ -101,7 +107,9 @@ __all__ = [
     "AnthropicThinkingExtension",
     "AssistantMessage",
     "AssistantToolCall",
+    "AssistantToolCallBatchSnapshot",
     "AsyncRunner",
+    "AwaitingToolExecutionRecord",
     "ContentCompleteData",
     "ContentDeltaData",
     "ContextBudgetSnapshot",

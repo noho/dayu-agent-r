@@ -10,8 +10,12 @@ from datetime import datetime, timezone
 import pytest
 
 import dayu.engine.agent as agent_module
-from dayu.contracts.tool_call import ToolExecutionRequest
-from dayu.contracts.tool_outcome import ToolExecutionOutcome, ToolFailedOutcome
+from dayu.contracts.tool_call import BatchToolExecutionRequest
+from dayu.contracts.tool_outcome import (
+    BatchToolExecutionOutcome,
+    BatchToolExecutionRecord,
+    ToolFailedOutcome,
+)
 from dayu.contracts.tool_result import ToolResultFailure
 from dayu.engine.agent import _AsyncAgent
 from dayu.engine.contracts.agent_policy import AgentPolicy
@@ -34,7 +38,6 @@ from dayu.engine.contracts.engine_events import (
     RunSuspendedData,
     TERMINAL_ENGINE_EVENT_TYPES,
     ToolCallDeltaData,
-    ToolCallsBatchReadyData,
 )
 from dayu.engine.contracts.finish_reason import FinishReason
 from dayu.engine.contracts.messages import (
@@ -65,6 +68,10 @@ from dayu.contracts.tool_await import (
     ToolAwaitSpec,
 )
 from dayu.contracts.tool_call import ToolCallRequest
+from dayu.engine.contracts.tool_records import (
+    AssistantToolCallBatchSnapshot,
+    AwaitingToolExecutionRecord,
+)
 from dayu.contracts.tool_schema import (
     ToolFunctionSchema,
     ToolParametersSchema,
@@ -137,24 +144,31 @@ class _NoopToolExecutor:
     """测试用 no-op ToolExecutor。"""
 
     async def execute(
-        self, request: ToolExecutionRequest
-    ) -> ToolExecutionOutcome:
+        self, request: BatchToolExecutionRequest
+    ) -> BatchToolExecutionOutcome:
         """返回失败 outcome，防止 Phase 2 误执行工具。
 
-        :param request: 工具执行请求。
-        :returns: 失败 outcome。
+        :param request: 批式工具执行请求。
+        :returns: 与输入 ``calls`` 一一对应的失败 outcome 批次。
         :raises Exception: 不主动抛出异常。
         """
 
-        return ToolFailedOutcome(
-            result=ToolResultFailure(
-                ok=False,
-                error="unexpected_tool_execution",
-                message=request.call.name,
-                hint=None,
-                meta=None,
+        records = tuple(
+            BatchToolExecutionRecord(
+                tool_call_id=call.tool_call_id,
+                outcome=ToolFailedOutcome(
+                    result=ToolResultFailure(
+                        ok=False,
+                        error="unexpected_tool_execution",
+                        message=call.name,
+                        hint=None,
+                        meta=None,
+                    )
+                ),
             )
+            for call in request.calls
         )
+        return BatchToolExecutionOutcome(records=records)
 
 
 @dataclass(slots=True)
@@ -827,9 +841,8 @@ async def test_tool_call_delta_and_completed_fail_closed() -> None:
         for event in completed_events
         if event.type is EngineEventType.TOOL_CALLS_BATCH_READY
     ]
-    assert len(ready_events) == 1
-    assert isinstance(ready_events[0].data, ToolCallsBatchReadyData)
-    assert ready_events[0].data.tool_calls[0].tool_call_id == "tc_1"
+    # fail-closed 路径下 executor 未被调用，TOOL_CALLS_BATCH_READY 不应出现。
+    assert ready_events == []
 
     delta_events = await _collect(
         _AsyncAgent(request=_request(), runner=delta_runner)
@@ -1057,6 +1070,20 @@ async def test_run_agent_and_wait_maps_suspended(
         snapshot_id="snapshot",
         captured_at=_utc_now(),
     )
+    tool_call = ToolCallRequest(
+        tool_call_id="tc_1",
+        name="add_numbers",
+        arguments={},
+        index_in_iteration=0,
+        provider_state=None,
+    )
+    batch_snapshot = AssistantToolCallBatchSnapshot(
+        iteration_id="run_phase2_iteration_1",
+        tool_calls=(tool_call,),
+        content=None,
+        reasoning_content=None,
+        provider_request_id=None,
+    )
 
     async def fake_messages(
         request: AgentRunRequest,
@@ -1076,8 +1103,15 @@ async def test_run_agent_and_wait_maps_suspended(
             data=RunSuspendedData(
                 reason=RUN_SUSPENDED_REASON_TOOL_AWAITING,
                 resume_hint=None,
-                await_spec=await_spec,
-                snapshot=snapshot,
+                accepted_records=(),
+                awaiting_records=(
+                    AwaitingToolExecutionRecord(
+                        batch_snapshot=batch_snapshot,
+                        call=tool_call,
+                        await_spec=await_spec,
+                        snapshot=snapshot,
+                    ),
+                ),
             ),
             metadata=None,
         )
@@ -1088,8 +1122,9 @@ async def test_run_agent_and_wait_maps_suspended(
     assert isinstance(result, EngineRunOutcomeSuspended)
     assert result.reason == RUN_SUSPENDED_REASON_TOOL_AWAITING
     assert result.resume_hint is None
-    assert result.await_spec is await_spec
-    assert result.snapshot is snapshot
+    assert len(result.awaiting_records) == 1
+    assert result.awaiting_records[0].await_spec is await_spec
+    assert result.awaiting_records[0].snapshot is snapshot
 
 
 def _terminal_count(events: Sequence[EngineEvent]) -> int:

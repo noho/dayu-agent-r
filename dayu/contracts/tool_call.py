@@ -1,19 +1,20 @@
-"""工具调用请求与执行上下文契约。
+"""工具调用请求与批式执行上下文契约。
 
 本模块定义工具调用闭环中的强类型输入：
 
 - :class:`ToolCallRequest`：单次工具调用请求载荷（含
   :data:`ToolCallProviderState` provider 续航状态）。
-- :class:`ToolExecutionContext`：执行该调用所需的运行期上下文（运行 id /
-  会话 id / 迭代 id / 取消 token / 中性 correlation_id）。
-- :class:`ToolExecutionRequest`：将二者打包，作为 :meth:`ToolExecutor.execute`
-  的唯一入参。
+- :class:`BatchToolExecutionContext`：批式握手共享的运行期上下文
+  （run/session/iteration id、超时预算、取消 token、批级 correlation_id）。
+- :class:`BatchToolExecutionRequest`：把 ``calls`` 与共享 context 打包，
+  作为 :meth:`ToolExecutor.execute` 的唯一入参。
 - :class:`GeminiToolCallState` 与 :data:`ToolCallProviderState`：承载 provider
   私有的 tool call 续航状态（如 Gemini ``thought_signature``）；以**封闭联合**
   形式暴露，禁止使用 ``dict[str, Any]`` 或 metadata 万能袋承载。
 
-``correlation_id`` 仅用于跨 Host observer / ToolRuntime 的中性关联，**不**
-是 ToolTraceRecorder 私有入口；Engine 不会基于它做任何治理决策。
+批式 ``correlation_id`` 形如 ``f"{run_id}:{iteration_id}:tool_batch"``，
+仅用于跨 Host observer / ToolRuntime 的中性关联；Engine 不会基于它做
+任何治理决策。批内单次工具调用的关联信息由 ``tool_call_id`` 提供。
 """
 
 from __future__ import annotations
@@ -72,48 +73,52 @@ class ToolCallRequest:
 
 
 @dataclass(frozen=True, slots=True)
-class ToolExecutionContext:
-    """工具执行运行期上下文。
+class BatchToolExecutionContext:
+    """批式工具执行共享运行期上下文。
+
+    本上下文在一次 ``ToolExecutor.execute`` 握手内对所有 ``calls`` 共享：
+
+    - 不再包含 ``tool_call_id`` / ``index_in_iteration`` 等单次字段；
+      批内每个工具调用自身的 id / index 由 :class:`ToolCallRequest` 承载。
+    - ``correlation_id`` 是批级中性关联标识，约定形如
+      ``f"{run_id}:{iteration_id}:tool_batch"``；不得用作 trace recorder
+      私有入口。
 
     :param run_id: Agent run 唯一 id。
     :param session_id: 会话 id。
     :param iteration_id: 当前 LLM 迭代 id。
-    :param tool_call_id: 当前工具调用 id。
-    :param index_in_iteration: 当前工具调用在迭代内的序号。
-    :param timeout_seconds: Engine 从 AgentPolicy 真源投影到本次工具调用的
-        握手超时预算，供 ToolExecutor / ToolRuntime 协作设置内部超时；
-        ``None`` 表示调用方未提供该预算。
+    :param timeout_seconds: Engine 从 AgentPolicy 真源投影到本次批
+        握手的整体超时预算，供 ToolExecutor / ToolRuntime 协作设置内部
+        超时；``None`` 表示调用方未提供该预算。
     :param cancellation_token: 取消观察 token。
-    :param correlation_id: 中性跨组件关联标识；不得用作 trace recorder
-        私有入口。
+    :param correlation_id: 批级中性跨组件关联标识。
     """
 
     run_id: str
     session_id: str
     iteration_id: str
-    tool_call_id: str
-    index_in_iteration: int
     timeout_seconds: float | None
     cancellation_token: CancellationToken
     correlation_id: str | None
 
 
 @dataclass(frozen=True, slots=True)
-class ToolExecutionRequest:
-    """工具执行入参的封装。
+class BatchToolExecutionRequest:
+    """批式工具执行入参。
 
-    :param call: 工具调用请求。
-    :param context: 工具执行运行期上下文。
+    :param calls: 本次批内所有工具调用，按 LLM 输出顺序排列；元组语义
+        意味着不可变快照。
+    :param context: 共享的批级执行上下文。
     """
 
-    call: ToolCallRequest
-    context: ToolExecutionContext
+    calls: tuple[ToolCallRequest, ...]
+    context: BatchToolExecutionContext
 
 
 __all__ = [
+    "BatchToolExecutionContext",
+    "BatchToolExecutionRequest",
     "GeminiToolCallState",
     "ToolCallProviderState",
     "ToolCallRequest",
-    "ToolExecutionContext",
-    "ToolExecutionRequest",
 ]
