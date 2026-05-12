@@ -97,8 +97,11 @@ Engine 消费这些字段完成单次 run；不从配置文件、调用方状态
 - `content_delta`
 - `reasoning_delta`
 - `content_completed`
+- `tool_call_delta`
+- `tool_calls_batch_ready`
 - `tool_call_requested`
 - `tool_result_accepted`
+- `tool_calls_batch_done`
 - `tool_awaiting`
 - `context_compaction_requested`
 - `usage_reported`
@@ -127,7 +130,7 @@ Engine 消费这些字段完成单次 run；不从配置文件、调用方状态
 
 `RunnerSpec.provider_request` 是 `ProviderRequestExtension | None`，当前封闭联合成员包括 `OpenAIReasoningExtension`、`AnthropicThinkingExtension`、`DeepSeekThinkingExtension`、`MimoThinkingExtension`、`GeminiThinkingExtension`、`QwenThinkingExtension`。显式调用参数只进入 `RunnerCallOptions`，不放进 provider 扩展。
 
-`RunnerSpec.supports_stream_usage` 只门控 OpenAI-compatible Runner 是否在流式请求中写入 `stream_options.include_usage=True`；为 `False` 时不写该字段。`stream_idle_timeout_seconds` 与 `stream_idle_heartbeat_seconds` 是 SSE 字节空闲检测配置：heartbeat 只能在 timeout 已启用时设置，二者必须为正数，且 heartbeat 不能大于 timeout。
+OpenAI-compatible Runner 会在内部执行 streaming capability：当 `RunnerCallOptions.stream=True` 但 `RunnerSpec.supports_streaming=False` 时，本次请求降级为 `stream=False`，且不写 `stream_options`。`RunnerSpec.supports_stream_usage` 只门控流式请求中是否写入 `stream_options.include_usage=True`；为 `False` 时不写该字段。`stream_idle_timeout_seconds` 与 `stream_idle_heartbeat_seconds` 是 SSE 字节空闲检测配置：heartbeat 只能在 timeout 已启用时设置，二者必须为正数，且 heartbeat 不能大于 timeout。
 
 ### 消息与工具接口
 
@@ -156,27 +159,27 @@ Engine 消费的消息类型来自 `AgentMessage` 封闭联合，当前包括：
 
 ## 公共契约
 
-Engine 公共契约分为 Engine 专属契约与跨层共享契约。Engine 专属契约位于 `dayu.engine.contracts`；工具、JSON 值、取消 token 等共享契约位于 `dayu.contracts`，由 Engine 在请求、事件和工具执行协议中消费。
+Engine 公共契约分为 Engine 专属契约与跨层共享契约。Engine 专属契约位于 `dayu.engine.contracts`；工具、JSON 值、取消 token 等共享契约位于 `dayu.contracts`。
 
-`AgentRunRequest` 归属 Engine 执行入口，是单次 run 的完整输入快照。它包含调用方标识、消息快照、工具开关、Runner 规约、Runner 调用参数、Agent 策略、工具 schema 快照、工具执行协议实现和取消观察 token。Engine 不从隐式全局状态补读请求参数；Runner 是否流式输出只由 `RunnerCallOptions.stream` 表达。
-
-`tool_schemas` 与 `tool_executor` 是同一组工具能力在 Engine 边界上的两个投影。`tool_schemas` 是模型可见的工具 schema 快照，只进入 Runner 调用；`tool_executor` 是工具调用的统一执行入口，只通过 `ToolExecutor.execute(request)` 接收模型返回的工具名、参数和执行上下文。Engine 要求二者由调用方作为同源输入提供，但 Engine 不持有工具注册表，不从 executor 反查 schema，也不负责工具名路由、权限校验或运行时治理。
-
-`AgentPolicy.tool_execution_timeout_seconds` 是 Engine 等待 `ToolExecutor.execute` 返回 outcome 的握手超时预算真源，必须是有限正数。Engine 构造 `ToolExecutionContext` 时把该值投影为本次工具调用的 `timeout_seconds`，并用同一预算等待工具执行协议返回；`ToolExecutionContext.timeout_seconds` 不是第二真源。
-
-`ToolAwaitingOutcome` 是长时间运行工具的挂起契约。ToolExecutor 返回该 outcome 时，Engine 产出 `tool_awaiting` 和 `run_suspended`，事件 data 携带 `await_spec` 与 `snapshot`；`run_agent_and_wait` 返回 `EngineRunOutcomeSuspended`，同样携带这些机器可读恢复事实。
-
-`cancellation_token` 是 Engine 可观察的取消入口。Engine 在 run 开始、Runner 事件消费边界、工具执行等待边界、工具结果注入后和下一轮工作开始前观察该 token；取消不是普通失败、工具失败或最终回答，也不是公共异常类型。已经被 Engine 产出的 RunnerEvent 提升事件、已经接受的工具 outcome、awaiting 事实和 final decision 不会被迟到取消撤回或改写；取消只决定后续是否继续进入工具、下一轮 Runner、continuation 或 fallback。
-
-`AgentRunResult` 是 `run_agent_and_wait` 的终态返回联合，成员为 `EngineRunOutcomeFinalAnswer`、`EngineRunOutcomeFailed`、`EngineRunOutcomeCancelled`、`EngineRunOutcomeSuspended`。终态 outcome 只表达本次 run 的结果，不表达上层持久化状态。
-
-`EngineEvent` 与 `EngineEventData` 是调用方可观察事件契约。`EngineEventData` 是封闭联合，每个 `EngineEventType` 对应一个明确 data 类型；扩展事件时必须同步扩展事件枚举、data 联合和提升逻辑。
-
-`RunnerEvent` 是 Runner 到 Agent 的内部归一事件契约。RunnerEvent 层保留 `runner_*` 命名，包括 `runner_content_delta`、`runner_reasoning_delta`、`runner_tool_call_delta`、`runner_tool_calls_completed`、`runner_content_completed`、`runner_usage_recorded`、`runner_http_error`、`runner_done`；`provider_protocol_error` 作为 provider 协议错误事件在 RunnerEvent 与 EngineEvent 中同名表达。
-
-`RunnerHTTPErrorCode` 是 `runner_http_error` 的中性错误枚举，当前成员包括 `rate_limit_exceeded`、`server_error`、`client_error`、`network_error`、`timeout`、`context_length_exceeded`、`unknown_http_status`。其中 `context_length_exceeded` 会在 Agent 提升阶段转为 `context_compaction_requested` 与可恢复 `run_failed(context_compaction_required)`。
-
-`AsyncRunner` 归属 Engine Runner 抽象，只负责把 provider 调用归一为 `RunnerEvent` 异步流，并提供能力查询与关闭入口。`ToolExecutor` 归属共享工具执行协议，Engine 只通过 `ToolExecutor.execute(request)` 调用它；工具注册、权限、路由、审计和运行环境不属于 Engine 契约。
+- `AgentRunRequest`：单次 run 的输入快照。形状包含 `run_id`、`session_id`、`messages`、`disable_tools`、`runner_spec`、`runner_options`、`agent_policy`、`tool_schemas`、`tool_executor`、`cancellation_token`。
+- `AgentPolicy`：Agent loop 策略。形状包含 iteration 预算、续写预算、工具开关、工具握手 timeout、fallback 模式、fallback prompt、continuation prompt 与连续失败工具批次阈值。
+- `RunnerSpec`：Runner 规约。形状包含 provider、model、endpoint、api key 引用、headers、tool calling / streaming 能力、stream usage 能力、默认 timeout、重试次数、provider 请求扩展、SSE idle timeout 与 heartbeat。
+- `RunnerCallOptions`：单次 Runner 调用参数。形状包含 `temperature`、`max_tokens`、`top_p`、`stream`。
+- `ProviderRequestExtension`：provider 私有请求扩展的封闭联合。当前成员包括 `OpenAIReasoningExtension`、`AnthropicThinkingExtension`、`DeepSeekThinkingExtension`、`MimoThinkingExtension`、`GeminiThinkingExtension`、`QwenThinkingExtension`。
+- `AsyncRunner`：Engine 调用 LLM provider 的协议。形状包含 `call(messages, options, tools)`、`is_supports_tool_calling()`、`close()`。
+- `RunnerEvent`：Runner 到 Agent 的协议归一事件。形状包含 `type`、`data`、`occurred_at`；不包含 `session_id` 或 `run_id`。
+- `EngineEvent`：Engine 对调用方暴露的事件。形状包含 `occurred_at`、`session_id`、`run_id`、`type`、`data`、`metadata`。
+- `EngineEventData`：Engine 事件 data 封闭联合。每个 `EngineEventType` 对应一个明确 data dataclass。
+- `AgentRunResult`：`run_agent_and_wait` 的终态返回联合。成员包括 `EngineRunOutcomeFinalAnswer`、`EngineRunOutcomeFailed`、`EngineRunOutcomeCancelled`、`EngineRunOutcomeSuspended`。
+- `tool_schemas`：本次 run 暴露给模型的工具 schema 快照。形状是 `tuple[ToolSchema, ...]`。
+- `tool_executor`：工具执行协议 handle。形状是 `ToolExecutor.execute(ToolExecutionRequest) -> ToolExecutionOutcome`。
+- `ToolExecutionRequest`：单次工具执行请求。形状包含 `call: ToolCallRequest` 与 `context: ToolExecutionContext`。
+- `ToolExecutionContext`：工具执行上下文。形状包含 `run_id`、`session_id`、`iteration_id`、`tool_call_id`、`index_in_iteration`、`timeout_seconds`、`cancellation_token`、`correlation_id`。
+- `ToolExecutionOutcome`：工具执行结果封闭联合。成员包括 `ToolCompletedOutcome`、`ToolFailedOutcome`、`ToolAwaitingOutcome`。
+- `ToolAwaitingOutcome`：长事务等待结果。形状包含 `await_spec: ToolAwaitSpec` 与 `snapshot: ToolAwaitSnapshot | None`。
+- `cancellation_token`：Engine 可观察的取消入口。形状是 `CancellationToken`，包含 `is_cancelled()`、`cancel_reason()`、`requested_at()`。
+- `RunnerHTTPErrorCode`：Runner HTTP / 网络 / 超时错误枚举。成员包括 `rate_limit_exceeded`、`server_error`、`client_error`、`network_error`、`timeout`、`context_length_exceeded`、`unknown_http_status`。
+- `provider_request_id`：provider response 关联标识。形状是 `str | None`，出现在 `RunnerHTTPErrorData`、`RunnerProtocolErrorData`、`RunnerDoneData`、`IterationCompletedData`、`ProviderProtocolErrorData`、`ContextCompactionRequestedData` 与 `RunFailedData`。
 
 ## 架构
 
@@ -217,7 +220,9 @@ run_agent_messages(request)
       -> AsyncRunner.call(messages, request.runner_options, effective_tools)
           -> RunnerEvent stream
               -> content_delta / reasoning_delta
+              -> tool_call_delta
               -> content_completed
+              -> tool_calls_batch_ready
               -> usage_reported
               -> provider_protocol_error
               -> context_compaction_requested
@@ -236,6 +241,8 @@ run_agent_messages(request)
               -> emit terminal EngineEvent.run_failed(tool_execution_timeout)
           -> if completed / failed outcome
               -> emit EngineEvent.tool_result_accepted
+              -> after every completed / failed outcome in the batch is accepted
+                  -> emit EngineEvent.tool_calls_batch_done
               -> inject ToolMessage into run-local next-iteration messages
               -> if cancellation_token observed after accepted outcome
                   -> emit terminal EngineEvent.run_cancelled
@@ -340,8 +347,11 @@ Terminal 事件集合由 `TERMINAL_ENGINE_EVENT_TYPES` 定义。进入 `FINAL_AN
 - `content_delta`
 - `reasoning_delta`
 - `content_completed`
+- `tool_call_delta`
+- `tool_calls_batch_ready`
 - `tool_call_requested`
 - `tool_result_accepted`
+- `tool_calls_batch_done`
 - `tool_awaiting`
 - `context_compaction_requested`
 - `usage_reported`
@@ -367,6 +377,10 @@ RunnerEvent 层当前事件名如下：
 - `runner_done`
 
 Runner 的 `runner_done` 只表示本次 RunnerEvent 流结束；提升到 EngineEvent 后对应 `iteration_completed`，仍不等于 run 终态。
+
+工具观测事件分三层：`tool_call_delta` 直接提升 Runner 的流式工具增量；`tool_calls_batch_ready` 表示 Agent 已接受 Runner 完成的本批工具调用，顺序与 Runner 完成顺序一致；`tool_calls_batch_done` 表示本批工具的 completed / failed outcome 已全部被 Engine 接受。`tool_call_requested` 仍表示 Agent 即将执行单个工具。`tool_calls_batch_done` 不是终态，不属于 `TERMINAL_ENGINE_EVENT_TYPES`。
+
+HTTP 200 response 在 effective stream 为 `True` 且 `Content-Type` 为 `text/event-stream` 或不含 JSON 时按 SSE 解析；`Content-Type` 含 JSON 或 effective stream 为 `False` 时按非流式 JSON 解析。
 
 ## 关键机制
 

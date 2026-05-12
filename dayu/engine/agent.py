@@ -65,8 +65,13 @@ from dayu.engine.contracts.engine_events import (
     RunCancelledData,
     RunFailedData,
     RunSuspendedData,
+    TERMINAL_ENGINE_EVENT_TYPES,
     ToolAwaitingData,
+    ToolCallBatchItemData,
+    ToolCallDeltaData,
     ToolCallRequestedData,
+    ToolCallsBatchDoneData,
+    ToolCallsBatchReadyData,
     ToolResultAcceptedData,
     UsageReportedData,
 )
@@ -320,6 +325,7 @@ class _IterationState:
     completed_reasoning_content: str | None
     finish_reason: FinishReason | None
     failure_candidate: RunFailedData | None
+    provider_request_id: str | None
     done_seen: bool
     tool_call_signal_seen: bool
     tool_calls: tuple[ToolCallRequest, ...] | None
@@ -483,6 +489,7 @@ class _AsyncAgent:
                     RunFailedData(
                         error_code=_ERROR_MAX_ITERATIONS_EXCEEDED,
                         message=_MAX_ITERATIONS_EXCEEDED_MESSAGE,
+                        provider_request_id=None,
                         recoverable=False,
                     )
                 )
@@ -540,6 +547,7 @@ class _AsyncAgent:
                         RunFailedData(
                             error_code=_ERROR_MISSING_TERMINAL,
                             message=_MISSING_TERMINAL_MESSAGE,
+                            provider_request_id=None,
                             recoverable=False,
                         )
                     )
@@ -613,8 +621,7 @@ class _AsyncAgent:
                         continuation_attempts += 1
                         continuation_active = True
                         continue
-                    yield await self._make_final_after_close(decision)
-                    return
+                    assert_never(continuation_decision)
                 if isinstance(decision, RunFailedData):
                     yield await self._make_failed_or_cancelled_terminal_with_close(
                         decision
@@ -652,6 +659,7 @@ class _AsyncAgent:
                         RunFailedData(
                             error_code=_ERROR_MISSING_TERMINAL,
                             message="tool batch ended without result",
+                            provider_request_id=None,
                             recoverable=False,
                         )
                     )
@@ -836,6 +844,7 @@ class _AsyncAgent:
             return RunFailedData(
                 error_code=_ERROR_CONTINUATION_TOOL_CALL_NOT_ALLOWED,
                 message=_CONTINUATION_TOOL_CALL_NOT_ALLOWED_MESSAGE,
+                provider_request_id=state.provider_request_id,
                 recoverable=False,
             )
         return None
@@ -892,6 +901,7 @@ class _AsyncAgent:
             completed_reasoning_content=None,
             finish_reason=None,
             failure_candidate=None,
+            provider_request_id=None,
             done_seen=False,
             tool_call_signal_seen=False,
             tool_calls=None,
@@ -974,6 +984,7 @@ class _AsyncAgent:
                     RunFailedData(
                         error_code=_ERROR_MISSING_TERMINAL,
                         message=_MISSING_TERMINAL_MESSAGE,
+                        provider_request_id=None,
                         recoverable=False,
                     )
                 )
@@ -981,6 +992,7 @@ class _AsyncAgent:
             state.failure_candidate = RunFailedData(
                 error_code=_ERROR_RUNNER_EXCEPTION,
                 message=_exception_diagnostic_message(exc),
+                provider_request_id=None,
                 recoverable=False,
             )
 
@@ -991,8 +1003,8 @@ class _AsyncAgent:
 
         :param runner_event: Runner 产出的事件。
         :param iteration_id: 当前迭代 id。
-        :returns: 需要向 Host 暴露的 EngineEvent；HTTP error 与 tool call
-            delta 仅记录状态，返回 ``None``。
+        :returns: 需要向 Host 暴露的 EngineEvent；HTTP error 仅记录失败
+            候选，返回 ``None``。
         :raises RuntimeError: 内部迭代状态缺失时抛出。
         """
 
@@ -1083,6 +1095,7 @@ class _AsyncAgent:
             state.failure_candidate = RunFailedData(
                 error_code=data.error_code,
                 message=data.message,
+                provider_request_id=data.provider_request_id,
                 recoverable=False,
             )
             return self._make_event(
@@ -1101,18 +1114,20 @@ class _AsyncAgent:
             _LOGGER.debug(
                 "engine.agent.runner_event_classified session_id=%s "
                 "run_id=%s iteration_id=%s event_type=%s error_code=%s "
-                "http_status=%s",
+                "http_status=%s provider_request_id=%s",
                 self._request.session_id,
                 self._request.run_id,
                 iteration_id,
                 runner_event.type.value,
                 data.error_code.value,
                 data.http_status,
+                data.provider_request_id,
             )
             if data.error_code is RunnerHTTPErrorCode.CONTEXT_LENGTH_EXCEEDED:
                 state.failure_candidate = RunFailedData(
                     error_code=_ERROR_CONTEXT_COMPACTION_REQUIRED,
                     message=_CONTEXT_COMPACTION_REQUIRED_MESSAGE,
+                    provider_request_id=data.provider_request_id,
                     recoverable=True,
                 )
                 return self._make_event(
@@ -1125,32 +1140,38 @@ class _AsyncAgent:
                             total_tokens=0,
                         ),
                         reason=_ERROR_CONTEXT_COMPACTION_REQUIRED,
+                        provider_request_id=data.provider_request_id,
                     ),
                     occurred_at=runner_event.occurred_at,
                 )
             state.failure_candidate = RunFailedData(
                 error_code=data.error_code.value,
                 message=data.message,
+                provider_request_id=data.provider_request_id,
                 recoverable=False,
             )
             return None
         if isinstance(data, RunnerDoneData):
             state.done_seen = True
             state.finish_reason = data.finish_reason
+            state.provider_request_id = data.provider_request_id
             _LOGGER.debug(
                 "engine.agent.runner_event_classified session_id=%s "
-                "run_id=%s iteration_id=%s event_type=%s finish_reason=%s",
+                "run_id=%s iteration_id=%s event_type=%s finish_reason=%s "
+                "provider_request_id=%s",
                 self._request.session_id,
                 self._request.run_id,
                 iteration_id,
                 runner_event.type.value,
                 data.finish_reason.value,
+                data.provider_request_id,
             )
             return self._make_event(
                 event_type=EngineEventType.ITERATION_COMPLETED,
                 data=IterationCompletedData(
                     iteration_id=iteration_id,
                     finish_reason=data.finish_reason,
+                    provider_request_id=data.provider_request_id,
                 ),
                 occurred_at=runner_event.occurred_at,
             )
@@ -1164,7 +1185,17 @@ class _AsyncAgent:
                 iteration_id,
                 runner_event.type.value,
             )
-            return None
+            return self._make_event(
+                event_type=EngineEventType.TOOL_CALL_DELTA,
+                data=ToolCallDeltaData(
+                    iteration_id=iteration_id,
+                    tool_call_index=data.tool_call_index,
+                    tool_call_id=data.tool_call_id,
+                    name_delta=data.name_delta,
+                    arguments_delta=data.arguments_delta,
+                ),
+                occurred_at=runner_event.occurred_at,
+            )
         if isinstance(data, RunnerToolCallsCompletedData):
             state.tool_call_signal_seen = True
             state.tool_calls = data.tool_calls
@@ -1182,10 +1213,26 @@ class _AsyncAgent:
                 data.content is not None,
                 data.reasoning_content is not None,
             )
-            return None
+            return self._make_event(
+                event_type=EngineEventType.TOOL_CALLS_BATCH_READY,
+                data=ToolCallsBatchReadyData(
+                    iteration_id=iteration_id,
+                    tool_calls=tuple(
+                        ToolCallBatchItemData(
+                            tool_call_id=call.tool_call_id,
+                            name=call.name,
+                            index_in_iteration=call.index_in_iteration,
+                            provider_state=call.provider_state,
+                        )
+                        for call in data.tool_calls
+                    ),
+                ),
+                occurred_at=runner_event.occurred_at,
+            )
         state.failure_candidate = RunFailedData(
             error_code=_ERROR_RUNNER_EXCEPTION,
             message="runner event data did not match supported union",
+            provider_request_id=None,
             recoverable=False,
         )
         return None
@@ -1216,6 +1263,7 @@ class _AsyncAgent:
             return RunFailedData(
                 error_code=_ERROR_RUNNER_ABNORMAL_STOP,
                 message=_RUNNER_ABNORMAL_STOP_MESSAGE,
+                provider_request_id=None,
                 recoverable=False,
             )
 
@@ -1224,6 +1272,7 @@ class _AsyncAgent:
             return state.failure_candidate or RunFailedData(
                 error_code=_ERROR_RUNNER_ERROR_DONE_WITHOUT_DETAIL,
                 message=_RUNNER_ERROR_WITHOUT_DETAIL_MESSAGE,
+                provider_request_id=state.provider_request_id,
                 recoverable=False,
             )
 
@@ -1232,18 +1281,21 @@ class _AsyncAgent:
                 return RunFailedData(
                     error_code=_ERROR_RUNNER_TOOL_CALLS_FINISH_REASON_MISMATCH,
                     message="runner completed tool calls with non-tool finish reason",
+                    provider_request_id=state.provider_request_id,
                     recoverable=False,
                 )
             if not tool_calls_enabled:
                 return RunFailedData(
                     error_code=_ERROR_TOOL_CALL_NOT_ENABLED,
                     message=_TOOL_CALL_NOT_ENABLED_MESSAGE,
+                    provider_request_id=state.provider_request_id,
                     recoverable=False,
                 )
             if len(state.tool_calls) == 0:
                 return RunFailedData(
                     error_code=_ERROR_RUNNER_TOOL_CALLS_MISSING,
                     message="runner done with empty tool calls",
+                    provider_request_id=state.provider_request_id,
                     recoverable=False,
                 )
             content = state.tool_calls_content
@@ -1275,6 +1327,7 @@ class _AsyncAgent:
             return RunFailedData(
                 error_code=_ERROR_RUNNER_TOOL_CALLS_MISSING,
                 message="runner requested tool calls without completed tool call data",
+                provider_request_id=state.provider_request_id,
                 recoverable=False,
             )
 
@@ -1309,6 +1362,7 @@ class _AsyncAgent:
                 self._last_tool_batch_result = RunFailedData(
                     error_code=_ERROR_DUPLICATE_TOOL_CALL_ID,
                     message="duplicate tool_call_id in run",
+                    provider_request_id=None,
                     recoverable=False,
                 )
                 return
@@ -1427,7 +1481,12 @@ class _AsyncAgent:
                 )
             else:
                 assert_never(completed_outcome)
+        if self._is_cancelled():
+            yield await self._make_cancelled_terminal_with_close()
+            return
         self._last_tool_batch_result = _ToolBatchCompleted(records=tuple(records))
+        completed_count = _count_completed_tool_records(records)
+        failed_count = _count_failed_tool_records(records)
         _LOGGER.log(
             VERBOSE_LOG_LEVEL,
             "engine.agent.tool_batch_completed session_id=%s run_id=%s "
@@ -1438,8 +1497,20 @@ class _AsyncAgent:
             decision.iteration_id,
             decision.iteration_index,
             len(records),
-            _count_completed_tool_records(records),
-            _count_failed_tool_records(records),
+            completed_count,
+            failed_count,
+        )
+        yield self._make_event(
+            event_type=EngineEventType.TOOL_CALLS_BATCH_DONE,
+            data=ToolCallsBatchDoneData(
+                iteration_id=decision.iteration_id,
+                tool_call_ids=tuple(
+                    record.call.tool_call_id for record in records
+                ),
+                completed_count=completed_count,
+                failed_count=failed_count,
+            ),
+            occurred_at=_utc_now(),
         )
 
     async def _execute_one_tool(
@@ -1480,6 +1551,11 @@ class _AsyncAgent:
         self, tool_request: ToolExecutionRequest
     ) -> ToolExecutionOutcome:
         """调用 ToolExecutor，并把 executor 内部取消异常归一为工具失败。
+
+        Engine 将 ``CancelledError`` 加上已取消 token 归因为 run-level
+        cancellation；若 executor 自行抛出 ``CancelledError`` 且 token
+        同时被取消，也会按 run cancellation 处理。这是当前握手边界的
+        有意归因取舍，避免引入复杂的取消来源身份追踪。
 
         :param tool_request: 工具执行请求。
         :returns: 工具执行 outcome。
@@ -1574,6 +1650,7 @@ class _AsyncAgent:
                 RunFailedData(
                     error_code=error_code,
                     message=_fallback_error_message(error_code),
+                    provider_request_id=None,
                     recoverable=False,
                 )
             )
@@ -1635,6 +1712,7 @@ class _AsyncAgent:
                 RunFailedData(
                     error_code=_ERROR_MISSING_TERMINAL,
                     message=_MISSING_TERMINAL_MESSAGE,
+                    provider_request_id=None,
                     recoverable=False,
                 )
             )
@@ -1656,6 +1734,7 @@ class _AsyncAgent:
                 RunFailedData(
                     error_code=_ERROR_TOOL_CALL_NOT_ENABLED,
                     message=_TOOL_CALL_NOT_ENABLED_MESSAGE,
+                    provider_request_id=state.provider_request_id,
                     recoverable=False,
                 )
             )
@@ -1670,6 +1749,7 @@ class _AsyncAgent:
                 RunFailedData(
                     error_code=_ERROR_FORCE_ANSWER_EMPTY,
                     message=_FORCE_ANSWER_EMPTY_MESSAGE,
+                    provider_request_id=None,
                     recoverable=False,
                 )
             )
@@ -1722,6 +1802,7 @@ class _AsyncAgent:
             RunFailedData(
                 error_code=_ERROR_TOOL_EXECUTION_TIMEOUT,
                 message=_TOOL_EXECUTION_TIMEOUT_MESSAGE,
+                provider_request_id=None,
                 recoverable=False,
             )
         )
@@ -1952,12 +2033,7 @@ class _AsyncAgent:
         :raises Exception: 不主动抛出异常。
         """
 
-        return event.type in {
-            EngineEventType.FINAL_ANSWER,
-            EngineEventType.RUN_FAILED,
-            EngineEventType.RUN_CANCELLED,
-            EngineEventType.RUN_SUSPENDED,
-        }
+        return event.type in TERMINAL_ENGINE_EVENT_TYPES
 
     def _is_cancelled(self) -> bool:
         """返回 Host cancellation token 是否已取消。
@@ -2072,6 +2148,7 @@ class _AsyncAgent:
             return RunFailedData(
                 error_code=_ERROR_MISSING_TERMINAL,
                 message=_MISSING_TERMINAL_MESSAGE,
+                provider_request_id=None,
                 recoverable=False,
             )
         finish_reason = (

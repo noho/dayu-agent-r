@@ -24,7 +24,11 @@ from dayu.engine.contracts.engine_events import (
     RunFailedData,
     RunSuspendedData,
     ToolAwaitingData,
+    ToolCallBatchItemData,
+    ToolCallDeltaData,
     ToolCallRequestedData,
+    ToolCallsBatchDoneData,
+    ToolCallsBatchReadyData,
     ToolResultAcceptedData,
     UsageReportedData,
 )
@@ -34,8 +38,11 @@ EVENT_TYPE_TO_DATA: dict[EngineEventType, type] = {
     EngineEventType.CONTENT_DELTA: ContentDeltaData,
     EngineEventType.REASONING_DELTA: ReasoningDeltaData,
     EngineEventType.CONTENT_COMPLETED: ContentCompleteData,
+    EngineEventType.TOOL_CALL_DELTA: ToolCallDeltaData,
+    EngineEventType.TOOL_CALLS_BATCH_READY: ToolCallsBatchReadyData,
     EngineEventType.TOOL_CALL_REQUESTED: ToolCallRequestedData,
     EngineEventType.TOOL_RESULT_ACCEPTED: ToolResultAcceptedData,
+    EngineEventType.TOOL_CALLS_BATCH_DONE: ToolCallsBatchDoneData,
     EngineEventType.TOOL_AWAITING: ToolAwaitingData,
     EngineEventType.CONTEXT_COMPACTION_REQUESTED: ContextCompactionRequestedData,
     EngineEventType.USAGE_REPORTED: UsageReportedData,
@@ -62,8 +69,11 @@ def test_event_type_wire_values_are_locked() -> None:
         "content_delta",
         "reasoning_delta",
         "content_completed",
+        "tool_call_delta",
+        "tool_calls_batch_ready",
         "tool_call_requested",
         "tool_result_accepted",
+        "tool_calls_batch_done",
         "tool_awaiting",
         "context_compaction_requested",
         "usage_reported",
@@ -144,4 +154,56 @@ def test_tool_awaiting_and_suspended_data_fields_are_locked() -> None:
         "resume_hint",
         "await_spec",
         "snapshot",
+    }
+
+
+def test_provider_request_id_fields_are_locked() -> None:
+    """provider request id 字段必须是显式契约字段。"""
+
+    assert {f.name for f in dataclasses.fields(IterationCompletedData)} == {
+        "iteration_id",
+        "finish_reason",
+        "provider_request_id",
+    }
+    assert {f.name for f in dataclasses.fields(RunFailedData)} == {
+        "error_code",
+        "message",
+        "provider_request_id",
+        "recoverable",
+    }
+    assert {
+        f.name for f in dataclasses.fields(ContextCompactionRequestedData)
+    } == {
+        "iteration_id",
+        "budget_state",
+        "reason",
+        "provider_request_id",
+    }
+
+
+def test_tool_observation_data_fields_are_locked() -> None:
+    """工具观测事件 data 字段必须保持强类型结构。"""
+
+    assert {f.name for f in dataclasses.fields(ToolCallDeltaData)} == {
+        "iteration_id",
+        "tool_call_index",
+        "tool_call_id",
+        "name_delta",
+        "arguments_delta",
+    }
+    assert {f.name for f in dataclasses.fields(ToolCallBatchItemData)} == {
+        "tool_call_id",
+        "name",
+        "index_in_iteration",
+        "provider_state",
+    }
+    assert {f.name for f in dataclasses.fields(ToolCallsBatchReadyData)} == {
+        "iteration_id",
+        "tool_calls",
+    }
+    assert {f.name for f in dataclasses.fields(ToolCallsBatchDoneData)} == {
+        "iteration_id",
+        "tool_call_ids",
+        "completed_count",
+        "failed_count",
     }

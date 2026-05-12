@@ -27,11 +27,14 @@ from dayu.engine.contracts.engine_events import (
     EngineEvent,
     EngineEventType,
     FinalAnswerData,
+    IterationCompletedData,
     RUN_SUSPENDED_REASON_TOOL_AWAITING,
     RunCancelledData,
     RunFailedData,
     RunSuspendedData,
     TERMINAL_ENGINE_EVENT_TYPES,
+    ToolCallDeltaData,
+    ToolCallsBatchReadyData,
 )
 from dayu.engine.contracts.finish_reason import FinishReason
 from dayu.engine.contracts.messages import (
@@ -375,7 +378,7 @@ async def test_success_run_lifts_runner_events_and_agent_final() -> None:
             ),
             _event(
                 RunnerEventType.RUNNER_DONE,
-                RunnerDoneData(finish_reason=FinishReason.STOP),
+                RunnerDoneData(finish_reason=FinishReason.STOP, provider_request_id=None),
             ),
         )
     )
@@ -429,7 +432,7 @@ async def test_phase2_passes_empty_tools_even_when_request_has_schema() -> None:
             ),
             _event(
                 RunnerEventType.RUNNER_DONE,
-                RunnerDoneData(finish_reason=FinishReason.STOP),
+                RunnerDoneData(finish_reason=FinishReason.STOP, provider_request_id=None),
             ),
         )
     )
@@ -461,7 +464,10 @@ async def test_protocol_error_and_error_done_maps_to_run_failed() -> None:
             ),
             _event(
                 RunnerEventType.RUNNER_DONE,
-                RunnerDoneData(finish_reason=FinishReason.ERROR),
+                RunnerDoneData(
+                    finish_reason=FinishReason.ERROR,
+                    provider_request_id="req_1",
+                ),
             ),
         )
     )
@@ -472,6 +478,9 @@ async def test_protocol_error_and_error_done_maps_to_run_failed() -> None:
     assert terminal.type is EngineEventType.RUN_FAILED
     assert isinstance(terminal.data, RunFailedData)
     assert terminal.data.error_code == "bad_sse"
+    assert isinstance(events[-2].data, IterationCompletedData)
+    assert events[-2].data.provider_request_id == "req_1"
+    assert terminal.data.provider_request_id == "req_1"
     _assert_single_terminal_at_end(events)
 
 
@@ -487,7 +496,7 @@ async def test_http_error_maps_to_run_failed_without_extra_engine_event() -> Non
                     error_code=RunnerHTTPErrorCode.RATE_LIMIT_EXCEEDED,
                     http_status=429,
                     message="rate limited",
-                    provider_request_id=None,
+                    provider_request_id="req_http",
                     raw_payload=None,
                     attempt=1,
                     retried=False,
@@ -495,7 +504,10 @@ async def test_http_error_maps_to_run_failed_without_extra_engine_event() -> Non
             ),
             _event(
                 RunnerEventType.RUNNER_DONE,
-                RunnerDoneData(finish_reason=FinishReason.ERROR),
+                RunnerDoneData(
+                    finish_reason=FinishReason.ERROR,
+                    provider_request_id="req_http",
+                ),
             ),
         )
     )
@@ -508,6 +520,9 @@ async def test_http_error_maps_to_run_failed_without_extra_engine_event() -> Non
     ]
     assert isinstance(events[-1].data, RunFailedData)
     assert events[-1].data.error_code == "rate_limit_exceeded"
+    assert isinstance(events[-2].data, IterationCompletedData)
+    assert events[-2].data.provider_request_id == "req_http"
+    assert events[-1].data.provider_request_id == "req_http"
 
 
 @pytest.mark.asyncio
@@ -522,7 +537,7 @@ async def test_context_overflow_http_error_maps_to_compaction_required_fact() ->
                     error_code=RunnerHTTPErrorCode.CONTEXT_LENGTH_EXCEEDED,
                     http_status=400,
                     message="maximum context length is 128000 tokens",
-                    provider_request_id=None,
+                    provider_request_id="req_context",
                     raw_payload=None,
                     attempt=1,
                     retried=False,
@@ -530,7 +545,10 @@ async def test_context_overflow_http_error_maps_to_compaction_required_fact() ->
             ),
             _event(
                 RunnerEventType.RUNNER_DONE,
-                RunnerDoneData(finish_reason=FinishReason.ERROR),
+                RunnerDoneData(
+                    finish_reason=FinishReason.ERROR,
+                    provider_request_id="req_context",
+                ),
             ),
         )
     )
@@ -544,9 +562,13 @@ async def test_context_overflow_http_error_maps_to_compaction_required_fact() ->
     ]
     compact_event = events[1]
     assert isinstance(compact_event.data, ContextCompactionRequestedData)
+    assert compact_event.data.provider_request_id == "req_context"
+    assert isinstance(events[-2].data, IterationCompletedData)
+    assert events[-2].data.provider_request_id == "req_context"
     terminal = events[-1]
     assert isinstance(terminal.data, RunFailedData)
     assert terminal.data.error_code == "context_compaction_required"
+    assert terminal.data.provider_request_id == "req_context"
     assert terminal.data.recoverable
 
 
@@ -558,7 +580,7 @@ async def test_bare_error_done_maps_to_specific_run_failed() -> None:
         events=(
             _event(
                 RunnerEventType.RUNNER_DONE,
-                RunnerDoneData(finish_reason=FinishReason.ERROR),
+                RunnerDoneData(finish_reason=FinishReason.ERROR, provider_request_id=None),
             ),
         )
     )
@@ -568,6 +590,7 @@ async def test_bare_error_done_maps_to_specific_run_failed() -> None:
     assert terminal.type is EngineEventType.RUN_FAILED
     assert isinstance(terminal.data, RunFailedData)
     assert terminal.data.error_code == "runner_error_done_without_detail"
+    assert terminal.data.provider_request_id is None
 
 
 @pytest.mark.asyncio
@@ -644,7 +667,7 @@ async def test_cancel_before_final_answer_wins_over_final() -> None:
             ),
             _event(
                 RunnerEventType.RUNNER_DONE,
-                RunnerDoneData(finish_reason=FinishReason.STOP),
+                RunnerDoneData(finish_reason=FinishReason.STOP, provider_request_id=None),
             ),
         ),
         token_to_cancel_after_event_index=0,
@@ -676,7 +699,7 @@ async def test_provider_error_and_cancel_same_run_cancel_wins() -> None:
             ),
             _event(
                 RunnerEventType.RUNNER_DONE,
-                RunnerDoneData(finish_reason=FinishReason.ERROR),
+                RunnerDoneData(finish_reason=FinishReason.ERROR, provider_request_id=None),
             ),
         ),
         token_to_cancel_after_event_index=0,
@@ -710,7 +733,7 @@ async def test_http_error_and_cancel_same_run_cancel_wins() -> None:
             ),
             _event(
                 RunnerEventType.RUNNER_DONE,
-                RunnerDoneData(finish_reason=FinishReason.ERROR),
+                RunnerDoneData(finish_reason=FinishReason.ERROR, provider_request_id=None),
             ),
         ),
         token_to_cancel_after_event_index=0,
@@ -739,7 +762,7 @@ async def test_close_error_does_not_override_terminal() -> None:
             ),
             _event(
                 RunnerEventType.RUNNER_DONE,
-                RunnerDoneData(finish_reason=FinishReason.STOP),
+                RunnerDoneData(finish_reason=FinishReason.STOP, provider_request_id=None),
             ),
         ),
         raise_on_close=True,
@@ -753,7 +776,7 @@ async def test_close_error_does_not_override_terminal() -> None:
 
 @pytest.mark.asyncio
 async def test_tool_call_delta_and_completed_fail_closed() -> None:
-    """Phase 2 收到工具调用事件会 fail closed，不产出 ToolCallRequested。"""
+    """工具观测事件可见，但缺 Done 时仍 fail closed。"""
 
     completed_runner = _ScriptedRunner(
         events=(
@@ -795,6 +818,30 @@ async def test_tool_call_delta_and_completed_fail_closed() -> None:
         assert EngineEventType.TOOL_CALL_REQUESTED not in {
             event.type for event in events
         }
+    assert completed_runner.call_count == 1
+    completed_events = await _collect(
+        _AsyncAgent(request=_request(), runner=completed_runner)
+    )
+    ready_events = [
+        event
+        for event in completed_events
+        if event.type is EngineEventType.TOOL_CALLS_BATCH_READY
+    ]
+    assert len(ready_events) == 1
+    assert isinstance(ready_events[0].data, ToolCallsBatchReadyData)
+    assert ready_events[0].data.tool_calls[0].tool_call_id == "tc_1"
+
+    delta_events = await _collect(
+        _AsyncAgent(request=_request(), runner=delta_runner)
+    )
+    tool_delta_events = [
+        event
+        for event in delta_events
+        if event.type is EngineEventType.TOOL_CALL_DELTA
+    ]
+    assert len(tool_delta_events) == 1
+    assert isinstance(tool_delta_events[0].data, ToolCallDeltaData)
+    assert tool_delta_events[0].data.arguments_delta == "{}"
 
 
 @pytest.mark.asyncio
@@ -814,7 +861,7 @@ async def test_length_and_content_filter_final_boundaries() -> None:
                 ),
                 _event(
                     RunnerEventType.RUNNER_DONE,
-                    RunnerDoneData(finish_reason=finish_reason),
+                    RunnerDoneData(finish_reason=finish_reason, provider_request_id=None),
                 ),
             )
         )
@@ -871,7 +918,7 @@ async def test_private_agent_concurrent_run_fail_fast() -> None:
             ),
             _event(
                 RunnerEventType.RUNNER_DONE,
-                RunnerDoneData(finish_reason=FinishReason.STOP),
+                RunnerDoneData(finish_reason=FinishReason.STOP, provider_request_id=None),
             ),
         ),
         block_after_first_event=True,
@@ -911,7 +958,7 @@ async def test_outer_asyncio_cancelled_error_propagates_and_closes() -> None:
             ),
             _event(
                 RunnerEventType.RUNNER_DONE,
-                RunnerDoneData(finish_reason=FinishReason.STOP),
+                RunnerDoneData(finish_reason=FinishReason.STOP, provider_request_id=None),
             ),
         ),
         block_after_first_event=True,
@@ -959,7 +1006,7 @@ async def test_run_agent_and_wait_maps_final_failed_cancelled(
                 ),
                 _event(
                     RunnerEventType.RUNNER_DONE,
-                    RunnerDoneData(finish_reason=FinishReason.STOP),
+                    RunnerDoneData(finish_reason=FinishReason.STOP, provider_request_id=None),
                 ),
             )
         ),
@@ -967,7 +1014,7 @@ async def test_run_agent_and_wait_maps_final_failed_cancelled(
             events=(
                 _event(
                     RunnerEventType.RUNNER_DONE,
-                    RunnerDoneData(finish_reason=FinishReason.ERROR),
+                    RunnerDoneData(finish_reason=FinishReason.ERROR, provider_request_id=None),
                 ),
             )
         ),

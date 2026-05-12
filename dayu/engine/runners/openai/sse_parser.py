@@ -107,11 +107,20 @@ class SSEParser:
     """SSE 流解析器。
 
     :param hook: provider 私有 reasoning 协议钩子。
+    :param provider_request_id: 当前 response header 提供的 request id。
     """
 
-    def __init__(self, *, hook: _ReasoningProtocolHook) -> None:
+    def __init__(
+        self,
+        *,
+        hook: _ReasoningProtocolHook,
+        provider_request_id: str | None,
+    ) -> None:
         self._extractor = StreamingXMLTagExtractor(tag_name=hook.tag_name)
-        self._aggregator = ToolCallAggregator()
+        self._provider_request_id: str | None = provider_request_id
+        self._aggregator = ToolCallAggregator(
+            provider_request_id=provider_request_id
+        )
         self._content_buffer: list[str] = []
         self._reasoning_buffer: list[str] = []
         self._finish_reason: FinishReason | None = None
@@ -192,13 +201,18 @@ class SSEParser:
             RunnerProtocolErrorData(
                 error_code="invalid_utf8",
                 message="failed to decode SSE chunk as UTF-8",
-                provider_request_id=None,
+                provider_request_id=self._provider_request_id,
                 raw_payload=raw_payload,
                 partial_tool_calls=self._aggregator.partial_summaries(),
             )
         )
         self._terminated = True
-        yield _make_event(RunnerDoneData(finish_reason=FinishReason.ERROR))
+        yield _make_event(
+            RunnerDoneData(
+                finish_reason=FinishReason.ERROR,
+                provider_request_id=self._provider_request_id,
+            )
+        )
 
     async def _consume_line(self, line: str) -> AsyncIterator[RunnerEvent]:
         """处理一条 SSE 行。"""
@@ -236,14 +250,17 @@ class SSEParser:
                 RunnerProtocolErrorData(
                     error_code="sse_invalid_json",
                     message=f"SSE data line is not valid JSON: {exc}",
-                    provider_request_id=None,
+                    provider_request_id=self._provider_request_id,
                     raw_payload=None,
                     partial_tool_calls=self._aggregator.partial_summaries(),
                 )
             )
             self._terminated = True
             yield _make_event(
-                RunnerDoneData(finish_reason=FinishReason.ERROR)
+                RunnerDoneData(
+                    finish_reason=FinishReason.ERROR,
+                    provider_request_id=self._provider_request_id,
+                )
             )
             return
         if not isinstance(parsed, dict):
@@ -251,14 +268,17 @@ class SSEParser:
                 RunnerProtocolErrorData(
                     error_code="sse_payload_not_object",
                     message="SSE data line is not a JSON object",
-                    provider_request_id=None,
+                    provider_request_id=self._provider_request_id,
                     raw_payload=None,
                     partial_tool_calls=self._aggregator.partial_summaries(),
                 )
             )
             self._terminated = True
             yield _make_event(
-                RunnerDoneData(finish_reason=FinishReason.ERROR)
+                RunnerDoneData(
+                    finish_reason=FinishReason.ERROR,
+                    provider_request_id=self._provider_request_id,
+                )
             )
             return
         async for event in self._handle_chunk_object(parsed):
@@ -427,14 +447,17 @@ class SSEParser:
                 RunnerProtocolErrorData(
                     error_code="usage_field_malformed",
                     message="usage fields are not all integers",
-                    provider_request_id=None,
+                    provider_request_id=self._provider_request_id,
                     raw_payload=None,
                     partial_tool_calls=self._aggregator.partial_summaries(),
                 )
             )
             self._terminated = True
             yield _make_event(
-                RunnerDoneData(finish_reason=FinishReason.ERROR)
+                RunnerDoneData(
+                    finish_reason=FinishReason.ERROR,
+                    provider_request_id=self._provider_request_id,
+                )
             )
             return
         normalized: _OpenAIUsage = {
@@ -475,7 +498,10 @@ class SSEParser:
                     yield _make_event(fatal)
                 self._terminated = True
                 yield _make_event(
-                    RunnerDoneData(finish_reason=FinishReason.ERROR)
+                    RunnerDoneData(
+                        finish_reason=FinishReason.ERROR,
+                        provider_request_id=self._provider_request_id,
+                    )
                 )
                 return
             yield _make_event(
@@ -501,7 +527,12 @@ class SSEParser:
             else FinishReason.STOP
         )
         self._terminated = True
-        yield _make_event(RunnerDoneData(finish_reason=finish))
+        yield _make_event(
+            RunnerDoneData(
+                finish_reason=finish,
+                provider_request_id=self._provider_request_id,
+            )
+        )
 
 
 __all__ = ["SSEParser"]

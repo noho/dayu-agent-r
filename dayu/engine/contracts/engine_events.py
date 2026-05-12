@@ -38,8 +38,11 @@ class EngineEventType(StrEnum):
     CONTENT_DELTA = "content_delta"
     REASONING_DELTA = "reasoning_delta"
     CONTENT_COMPLETED = "content_completed"
+    TOOL_CALL_DELTA = "tool_call_delta"
+    TOOL_CALLS_BATCH_READY = "tool_calls_batch_ready"
     TOOL_CALL_REQUESTED = "tool_call_requested"
     TOOL_RESULT_ACCEPTED = "tool_result_accepted"
+    TOOL_CALLS_BATCH_DONE = "tool_calls_batch_done"
     TOOL_AWAITING = "tool_awaiting"
     CONTEXT_COMPACTION_REQUESTED = "context_compaction_requested"
     USAGE_REPORTED = "usage_reported"
@@ -126,6 +129,52 @@ class ToolCallRequestedData:
 
 
 @dataclass(frozen=True, slots=True)
+class ToolCallDeltaData:
+    """工具调用增量观测事件 data。
+
+    :param iteration_id: 当前迭代 id。
+    :param tool_call_index: 工具调用在本轮中的序号。
+    :param tool_call_id: 工具调用 id；流式协议中可能在中后期才确定。
+    :param name_delta: 工具名称增量；可能为 ``None``。
+    :param arguments_delta: 工具参数增量字符串；可能为 ``None``。
+    """
+
+    iteration_id: str
+    tool_call_index: int
+    tool_call_id: str | None
+    name_delta: str | None
+    arguments_delta: str | None
+
+
+@dataclass(frozen=True, slots=True)
+class ToolCallBatchItemData:
+    """工具调用批次成员 data。
+
+    :param tool_call_id: 工具调用 id。
+    :param name: 工具名称。
+    :param index_in_iteration: 工具调用在迭代内的序号。
+    :param provider_state: provider 私有续航状态。
+    """
+
+    tool_call_id: str
+    name: str
+    index_in_iteration: int
+    provider_state: ToolCallProviderState | None
+
+
+@dataclass(frozen=True, slots=True)
+class ToolCallsBatchReadyData:
+    """工具调用批次可执行事件 data。
+
+    :param iteration_id: 当前迭代 id。
+    :param tool_calls: 本批工具调用，顺序与 Runner 完成顺序一致。
+    """
+
+    iteration_id: str
+    tool_calls: tuple[ToolCallBatchItemData, ...]
+
+
+@dataclass(frozen=True, slots=True)
 class ToolResultAcceptedData:
     """工具结果被 Engine 接受事件 data。
 
@@ -142,6 +191,22 @@ class ToolResultAcceptedData:
     name: str
     index_in_iteration: int
     outcome: ToolCompletedOutcome | ToolFailedOutcome
+
+
+@dataclass(frozen=True, slots=True)
+class ToolCallsBatchDoneData:
+    """工具调用批次完成事件 data。
+
+    :param iteration_id: 当前迭代 id。
+    :param tool_call_ids: 本批已接受 completed / failed outcome 的工具 id。
+    :param completed_count: completed outcome 数量。
+    :param failed_count: failed outcome 数量。
+    """
+
+    iteration_id: str
+    tool_call_ids: tuple[str, ...]
+    completed_count: int
+    failed_count: int
 
 
 @dataclass(frozen=True, slots=True)
@@ -167,11 +232,14 @@ class ContextCompactionRequestedData:
     :param iteration_id: 当前迭代 id。
     :param budget_state: 触发压缩时的预算快照。
     :param reason: 压缩触发原因（中性字符串）。
+    :param provider_request_id: 触发压缩请求的 provider response request
+        id；非 provider response 触发时为 ``None``。
     """
 
     iteration_id: str
     budget_state: ContextBudgetSnapshot
     reason: str
+    provider_request_id: str | None
 
 
 @dataclass(frozen=True, slots=True)
@@ -218,10 +286,13 @@ class IterationCompletedData:
 
     :param iteration_id: 当前迭代 id。
     :param finish_reason: 完成原因。
+    :param provider_request_id: 本轮 Runner 调用最终采用的 provider
+        response request id；未收到 provider response 时为 ``None``。
     """
 
     iteration_id: str
     finish_reason: FinishReason
+    provider_request_id: str | None
 
 
 @dataclass(frozen=True, slots=True)
@@ -278,11 +349,15 @@ class RunFailedData:
 
     :param error_code: 中性错误码。
     :param message: 人类可读错误描述。
+    :param provider_request_id: 若失败直接源自 provider response 或
+        provider protocol，则为对应 request id；非 provider 失败为
+        ``None``。
     :param recoverable: 是否可恢复。
     """
 
     error_code: str
     message: str
+    provider_request_id: str | None
     recoverable: bool
 
 
@@ -291,8 +366,11 @@ EngineEventData: TypeAlias = (
     | ContentDeltaData
     | ReasoningDeltaData
     | ContentCompleteData
+    | ToolCallDeltaData
+    | ToolCallsBatchReadyData
     | ToolCallRequestedData
     | ToolResultAcceptedData
+    | ToolCallsBatchDoneData
     | ToolAwaitingData
     | ContextCompactionRequestedData
     | UsageReportedData
@@ -346,8 +424,12 @@ __all__ = [
     "ContentDeltaData",
     "ReasoningDeltaData",
     "ContentCompleteData",
+    "ToolCallDeltaData",
+    "ToolCallBatchItemData",
+    "ToolCallsBatchReadyData",
     "ToolCallRequestedData",
     "ToolResultAcceptedData",
+    "ToolCallsBatchDoneData",
     "ToolAwaitingData",
     "ContextCompactionRequestedData",
     "UsageReportedData",

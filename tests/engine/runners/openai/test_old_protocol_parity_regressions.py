@@ -73,7 +73,7 @@ def test_non_stream_tool_call_dict_arguments_preserved() -> None:
         }
     ).encode("utf-8")
     events = list(
-        parse_non_stream_response(payload, hook=make_no_thought_hook())
+        (parse_non_stream_response(payload, hook=make_no_thought_hook(), provider_request_id=None))
     )
     completed = next(
         e.data
@@ -115,7 +115,7 @@ def test_non_stream_tool_call_list_arguments_protocol_error() -> None:
         }
     ).encode("utf-8")
     events = list(
-        parse_non_stream_response(payload, hook=make_no_thought_hook())
+        (parse_non_stream_response(payload, hook=make_no_thought_hook(), provider_request_id=None))
     )
     types = [e.type for e in events]
     assert RunnerEventType.PROVIDER_PROTOCOL_ERROR in types
@@ -159,7 +159,7 @@ def test_non_stream_tool_call_invalid_string_json_protocol_error() -> None:
         }
     ).encode("utf-8")
     events = list(
-        parse_non_stream_response(payload, hook=make_no_thought_hook())
+        (parse_non_stream_response(payload, hook=make_no_thought_hook(), provider_request_id=None))
     )
     error_codes = [
         e.data.error_code
@@ -263,8 +263,8 @@ async def test_stream_non_stream_native_reasoning_with_thought_parity() -> None:
         }
     ).encode("utf-8")
     non_stream_events = list(
-        parse_non_stream_response(
-            non_stream_payload, hook=make_thought_hook()
+        (parse_non_stream_response(
+            non_stream_payload, hook=make_thought_hook(), provider_request_id=None)
         )
     )
 

@@ -106,7 +106,14 @@ class ToolCallAggregator:
       键）。调用方按顺序发出，**不**影响成功收口。
     """
 
-    def __init__(self) -> None:
+    def __init__(self, *, provider_request_id: str | None) -> None:
+        """初始化聚合器。
+
+        :param provider_request_id: 当前 response header 提供的 request id。
+        :raises Exception: 不主动抛出异常。
+        """
+
+        self._provider_request_id: str | None = provider_request_id
         self._partials_by_index: dict[int, _PartialToolCall] = {}
         self._index_by_id: dict[str, int] = {}
         # 合成 index 与真实 index 共用一个稠密命名空间，从 0 开始。
@@ -195,7 +202,7 @@ class ToolCallAggregator:
                 RunnerProtocolErrorData(
                     error_code="tool_call_missing_index_and_id",
                     message="tool call delta missing both index and id",
-                    provider_request_id=None,
+                    provider_request_id=self._provider_request_id,
                     raw_payload=None,
                     partial_tool_calls=self.partial_summaries(),
                 )
@@ -246,7 +253,7 @@ class ToolCallAggregator:
                             f"unknown provider namespace in tool call "
                             f"extra_content: {namespace}"
                         ),
-                        provider_request_id=None,
+                        provider_request_id=self._provider_request_id,
                         raw_payload=None,
                         partial_tool_calls=self.partial_summaries(),
                     )
@@ -261,7 +268,7 @@ class ToolCallAggregator:
                                 f"unknown google.* key in tool call "
                                 f"extra_content: {key}"
                             ),
-                            provider_request_id=None,
+                            provider_request_id=self._provider_request_id,
                             raw_payload=None,
                             partial_tool_calls=self.partial_summaries(),
                         )
@@ -294,7 +301,7 @@ class ToolCallAggregator:
                     RunnerProtocolErrorData(
                         error_code="tool_call_missing_id",
                         message="tool call missing id at finalize",
-                        provider_request_id=None,
+                        provider_request_id=self._provider_request_id,
                         raw_payload=None,
                         partial_tool_calls=self.partial_summaries(),
                     )
@@ -307,7 +314,7 @@ class ToolCallAggregator:
                         message=(
                             f"tool call {partial.tool_call_id} missing name"
                         ),
-                        provider_request_id=None,
+                        provider_request_id=self._provider_request_id,
                         raw_payload=None,
                         partial_tool_calls=self.partial_summaries(),
                     )
@@ -383,7 +390,7 @@ class ToolCallAggregator:
                     message=(
                         f"tool call {tool_call_id} arguments invalid: {exc}"
                     ),
-                    provider_request_id=None,
+                    provider_request_id=self._provider_request_id,
                     raw_payload=None,
                     partial_tool_calls=self.partial_summaries(),
                 )
@@ -396,7 +403,7 @@ class ToolCallAggregator:
                     message=(
                         f"tool call {tool_call_id} arguments is not an object"
                     ),
-                    provider_request_id=None,
+                    provider_request_id=self._provider_request_id,
                     raw_payload=None,
                     partial_tool_calls=self.partial_summaries(),
                 )

@@ -37,7 +37,7 @@ def test_non_stream_strips_leading_thought_into_reasoning() -> None:
         }
     ).encode("utf-8")
     events = list(
-        parse_non_stream_response(payload, hook=make_thought_hook())
+        (parse_non_stream_response(payload, hook=make_thought_hook(), provider_request_id=None))
     )
     completed_events = [
         e for e in events
@@ -74,7 +74,7 @@ def test_non_stream_thought_preserves_existing_reasoning_content() -> None:
         }
     ).encode("utf-8")
     events = list(
-        parse_non_stream_response(payload, hook=make_thought_hook())
+        (parse_non_stream_response(payload, hook=make_thought_hook(), provider_request_id=None))
     )
     completed = next(
         e.data for e in events

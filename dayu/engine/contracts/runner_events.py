@@ -197,9 +197,12 @@ class RunnerDoneData:
     """Runner 事件流结束事件 data。
 
     :param finish_reason: 完成原因。
+    :param provider_request_id: 本次 Runner 调用最终采用的 provider
+        response request id；网络层在收到 response 前失败时为 ``None``。
     """
 
     finish_reason: FinishReason
+    provider_request_id: str | None
 
 
 RunnerEventData: TypeAlias = (

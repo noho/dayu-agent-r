@@ -50,7 +50,7 @@ async def test_sse_invalid_json_emits_protocol_error() -> None:
         b'data: {"choices":[{"finish_reason":"stop","delta":{}}]}\n\n',
         b"data: [DONE]\n\n",
     ]
-    events = await parse_sse(chunks)
+    events = await parse_sse(chunks, provider_request_id="req_sse")
     types = [e.type for e in events]
     assert types == [
         RunnerEventType.PROVIDER_PROTOCOL_ERROR,
@@ -58,8 +58,10 @@ async def test_sse_invalid_json_emits_protocol_error() -> None:
     ]
     assert isinstance(events[0].data, RunnerProtocolErrorData)
     assert events[0].data.error_code == "sse_invalid_json"
+    assert events[0].data.provider_request_id == "req_sse"
     assert isinstance(events[1].data, RunnerDoneData)
     assert events[1].data.finish_reason is FinishReason.ERROR
+    assert events[1].data.provider_request_id == "req_sse"
 
 
 @pytest.mark.asyncio
@@ -308,7 +310,13 @@ def test_non_stream_invalid_json_error_then_done() -> None:
     """非流式响应非 JSON → ``non_stream_invalid_json`` + Done(ERROR)。"""
 
     events = list(
-        parse_non_stream_response(b"not-json", hook=make_no_thought_hook())
+        (
+            parse_non_stream_response(
+                b"not-json",
+                hook=make_no_thought_hook(),
+                provider_request_id="req_json",
+            )
+        )
     )
     types = [e.type for e in events]
     assert types == [
@@ -317,8 +325,10 @@ def test_non_stream_invalid_json_error_then_done() -> None:
     ]
     assert isinstance(events[0].data, RunnerProtocolErrorData)
     assert events[0].data.error_code == "non_stream_invalid_json"
+    assert events[0].data.provider_request_id == "req_json"
     assert isinstance(events[1].data, RunnerDoneData)
     assert events[1].data.finish_reason is FinishReason.ERROR
+    assert events[1].data.provider_request_id == "req_json"
 
 
 def test_non_stream_payload_not_object_error() -> None:
@@ -326,7 +336,7 @@ def test_non_stream_payload_not_object_error() -> None:
 
     payload = json.dumps([1, 2, 3]).encode("utf-8")
     events = list(
-        parse_non_stream_response(payload, hook=make_no_thought_hook())
+        (parse_non_stream_response(payload, hook=make_no_thought_hook(), provider_request_id=None))
     )
     assert events[0].type is RunnerEventType.PROVIDER_PROTOCOL_ERROR
     assert isinstance(events[0].data, RunnerProtocolErrorData)
@@ -338,7 +348,7 @@ def test_non_stream_missing_choices_error() -> None:
 
     payload = json.dumps({}).encode("utf-8")
     events = list(
-        parse_non_stream_response(payload, hook=make_no_thought_hook())
+        (parse_non_stream_response(payload, hook=make_no_thought_hook(), provider_request_id=None))
     )
     assert events[0].type is RunnerEventType.PROVIDER_PROTOCOL_ERROR
     assert isinstance(events[0].data, RunnerProtocolErrorData)
