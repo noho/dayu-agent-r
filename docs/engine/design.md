@@ -40,7 +40,7 @@ Engine 公共入口由 `dayu.engine.agent` 提供，并通过 `dayu.engine.__ini
 - `EngineRunOutcomeCancelled`
 - `EngineRunOutcomeSuspended`
 
-`_AsyncAgent` 与 `AsyncOpenAIRunner` 是当前实现类，不是调用方主依赖面。调用方依赖函数式入口与 contracts。
+包根 `dayu.engine` 同时导出 Engine 专属契约和调用 Engine 必需的跨层共享契约，例如工具 schema、工具执行协议、工具 outcome、JSON 值与取消 token。`_AsyncAgent` 与 `AsyncOpenAIRunner` 是当前实现类，不属于包根稳定导出；调用方依赖函数式入口与 contracts。
 
 ## 3. Run-Scoped 生命周期
 
@@ -171,6 +171,10 @@ Runner 不负责：
 - provider 请求扩展。
 - SSE stream idle timeout 与 heartbeat。
 
+`supports_stream_usage` 是 stream usage 请求字段的能力门控。仅当 `RunnerCallOptions.stream=True` 且 `RunnerSpec.supports_stream_usage=True` 时，OpenAI-compatible Runner 才写入 `stream_options.include_usage=True`；不支持时不写该 provider 字段。
+
+`stream_idle_timeout_seconds` 与 `stream_idle_heartbeat_seconds` 是 Runner 规约的一部分。`stream_idle_timeout_seconds=None` 表示不启用 SSE byte chunk 空闲检测；启用时必须为正数。`stream_idle_heartbeat_seconds` 只有在 idle timeout 启用时才允许设置，也必须为正数，且不得大于 `stream_idle_timeout_seconds`。
+
 provider 请求扩展是封闭联合：
 
 - `OpenAIReasoningExtension`
@@ -191,7 +195,7 @@ provider 请求扩展是封闭联合：
 
 ## 9. RunnerEvent
 
-`RunnerEvent` 是 Runner 内部事件边界，不跨 Engine 外部调用边界。Agent 必须将其提升为 `EngineEvent`。
+`RunnerEvent` 是 Runner 到 Agent 的协议归一事件契约。它通过 Engine contracts 导出，供 Runner 实现和契约测试使用，但不会作为 `run_agent_messages` 的对外事件流直接产出；Agent 必须将 Runner 事实提升为 `EngineEvent`。
 
 | Runner event | Data 类型 | Agent 处理 |
 | --- | --- | --- |
@@ -205,7 +209,7 @@ provider 请求扩展是封闭联合：
 | `runner_http_error` | `RunnerHTTPErrorData` | 上下文超限时产出 `context_compaction_requested`，其它 HTTP 错误设置失败候选 |
 | `runner_done` | `RunnerDoneData` | 标记 Runner 完成，产出 `iteration_completed` |
 
-`RunnerEvent` 不含 `session_id` 或 `run_id`。这些字段在 `EngineEvent` 提升阶段补齐。
+`RunnerEvent` 不含 `session_id` 或 `run_id`。这些字段在 `EngineEvent` 提升阶段补齐。调用方消费 Agent run 时只观察 `EngineEvent`；只有实现或测试 Runner 协议时才直接处理 `RunnerEvent`。
 
 ## 10. 工具调用协议
 
@@ -276,6 +280,8 @@ completed / failed outcome 会进入 `tool_result_accepted`，并被投影为 LL
 - Agent 构造 `ToolExecutionContext.timeout_seconds` 时投影该值。
 - Agent 调用 `await_or_cancel_or_timeout` 包裹 `ToolExecutor.execute`，使用同一个 timeout。
 - 若 execute 在 timeout 前返回 completed / failed / awaiting outcome，Agent 按 outcome 提交后续事件。
+- 若 execute 抛出普通异常，Agent 将其归一为 `ToolFailedOutcome(error="tool_executor_exception")`，随后按普通 failed outcome 产出 `tool_result_accepted` 并注入 tool message。
+- 若 execute 抛出 `asyncio.CancelledError` 且本次 run 的 `cancellation_token` 已取消，Agent 以 `run_cancelled` 收口；若 token 未取消，则该异常同样归一为 `ToolFailedOutcome(error="tool_executor_exception")`。
 - 若 timeout 先到，runtime helper 会取消 execute await task，并等待该 task 收口。
 - Engine 以不可恢复 `run_failed(tool_execution_timeout)` 收口。
 
@@ -398,4 +404,4 @@ Terminal event 类型固定为：
 - `ToolParametersSchema.required` 是必填字段名元组。
 - `ToolParametersSchema.additional_properties` 为 `bool | None`。
 
-`ToolTruncateSpec` 存在于公共契约中，但工具结果截断由 Engine 外部工具执行环境解释和执行。Engine 不创建截断 cursor，不执行 `fetch_more`，不保存跨 run 工具状态。
+`ToolTruncateSpec` 与 `ToolTruncationStrategy` 存在于 `dayu.contracts` 公共契约中，不属于 Engine 包根导出的稳定调用面。工具结果截断由 Engine 外部工具执行环境解释和执行；Engine 不创建截断 cursor，不执行 `fetch_more`，不保存跨 run 工具状态。

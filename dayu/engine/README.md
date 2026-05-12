@@ -125,6 +125,10 @@ Engine 消费这些字段完成单次 run；不从配置文件、调用方状态
 
 `RunnerCallOptions` 描述单次调用参数，字段包括 `temperature`、`max_tokens`、`top_p`、`stream`。
 
+`RunnerSpec.provider_request` 是 `ProviderRequestExtension | None`，当前封闭联合成员包括 `OpenAIReasoningExtension`、`AnthropicThinkingExtension`、`DeepSeekThinkingExtension`、`MimoThinkingExtension`、`GeminiThinkingExtension`、`QwenThinkingExtension`。显式调用参数只进入 `RunnerCallOptions`，不放进 provider 扩展。
+
+`RunnerSpec.supports_stream_usage` 只门控 OpenAI-compatible Runner 是否在流式请求中写入 `stream_options.include_usage=True`；为 `False` 时不写该字段。`stream_idle_timeout_seconds` 与 `stream_idle_heartbeat_seconds` 是 SSE 字节空闲检测配置：heartbeat 只能在 timeout 已启用时设置，二者必须为正数，且 heartbeat 不能大于 timeout。
+
 ### 消息与工具接口
 
 Engine 消费的消息类型来自 `AgentMessage` 封闭联合，当前包括：
@@ -169,6 +173,8 @@ Engine 公共契约分为 Engine 专属契约与跨层共享契约。Engine 专�
 `EngineEvent` 与 `EngineEventData` 是调用方可观察事件契约。`EngineEventData` 是封闭联合，每个 `EngineEventType` 对应一个明确 data 类型；扩展事件时必须同步扩展事件枚举、data 联合和提升逻辑。
 
 `RunnerEvent` 是 Runner 到 Agent 的内部归一事件契约。RunnerEvent 层保留 `runner_*` 命名，包括 `runner_content_delta`、`runner_reasoning_delta`、`runner_tool_call_delta`、`runner_tool_calls_completed`、`runner_content_completed`、`runner_usage_recorded`、`runner_http_error`、`runner_done`；`provider_protocol_error` 作为 provider 协议错误事件在 RunnerEvent 与 EngineEvent 中同名表达。
+
+`RunnerHTTPErrorCode` 是 `runner_http_error` 的中性错误枚举，当前成员包括 `rate_limit_exceeded`、`server_error`、`client_error`、`network_error`、`timeout`、`context_length_exceeded`、`unknown_http_status`。其中 `context_length_exceeded` 会在 Agent 提升阶段转为 `context_compaction_requested` 与可恢复 `run_failed(context_compaction_required)`。
 
 `AsyncRunner` 归属 Engine Runner 抽象，只负责把 provider 调用归一为 `RunnerEvent` 异步流，并提供能力查询与关闭入口。`ToolExecutor` 归属共享工具执行协议，Engine 只通过 `ToolExecutor.execute(request)` 调用它；工具注册、权限、路由、审计和运行环境不属于 Engine 契约。
 
@@ -241,9 +247,9 @@ run_agent_messages(request)
                   -> fallback by agent_policy.fallback_mode
           -> if awaiting outcome
               -> ToolExecutor returned ToolAwaitingOutcome(await_spec, snapshot)
-              -> AsyncAgent emits EngineEvent.tool_awaiting
+              -> emit EngineEvent.tool_awaiting
               -> close Runner
-              -> AsyncAgent emits terminal EngineEvent.run_suspended
+              -> emit terminal EngineEvent.run_suspended
               -> late cancellation does not replace run_suspended
       -> if finish_reason is length
           -> append continuation_prompt while continuation and iteration budgets remain
