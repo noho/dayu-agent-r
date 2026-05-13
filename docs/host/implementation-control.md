@@ -1274,18 +1274,6 @@ Phase 按依赖关系推进：先实现被其它阶段依赖的公共契约、ru
 - Phase 1 implementation 必须说明 runtime lane DB 的默认路径注入和 workspace cleanup 责任；若默认路径仍不足以由设计真源决定，implementation agent 必须停下交给 controller，不得自行选择。
 - Phase 11. Host Lifecycle / Recovery / Multi-process Hardening 可基于 Phase 1 lane DB 行为补充压力测试和长期残留 DB cleanup 策略，但不得把 lane token 升级为 Host truth。
 
-#### Phase 1 Runtime FileLock 风险追踪
-
-结论：
-
-- Phase 1 runtime filelock 是普通文件访问的同步互斥 wrapper，不是 Host durable truth、lease / fencing、EventLog ordering、admission 或 recovery proof。
-- 第三方 `filelock.FileLock` 在部分平台 release 时可能 unlink lock marker；Phase 1 wrapper 会尽力恢复 marker，但 marker 文件存在性不能作为治理真源或恢复证据。
-- Phase 1 不承诺 reentrant lock 语义；调用方不得依赖同一 `RuntimeFileLock` 实例重复 acquire 的第三方细节。
-
-追踪项：
-
-- 若后续调用方需要严格 marker invariant、非重入状态机或 async file lock，必须作为独立 API 决策与测试进入后续 work unit，不得在 Host durable store、EventLog 或 command path 中隐式依赖 filelock 行为。
-
 #### Remote 物理执行 exactly-once 非目标
 
 结论：
