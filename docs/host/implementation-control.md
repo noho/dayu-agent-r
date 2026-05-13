@@ -1274,6 +1274,18 @@ Phase 按依赖关系推进：先实现被其它阶段依赖的公共契约、ru
 - Phase 1 implementation 必须说明 runtime lane DB 的默认路径注入和 workspace cleanup 责任；若默认路径仍不足以由设计真源决定，implementation agent 必须停下交给 controller，不得自行选择。
 - Phase 11. Host Lifecycle / Recovery / Multi-process Hardening 可基于 Phase 1 lane DB 行为补充压力测试和长期残留 DB cleanup 策略，但不得把 lane token 升级为 Host truth。
 
+#### Phase 1 Runtime FileLock 风险追踪
+
+结论：
+
+- Phase 1 runtime filelock 是普通文件访问的同步互斥 wrapper，不是 Host durable truth、lease / fencing、EventLog ordering、admission 或 recovery proof。
+- 第三方 `filelock.FileLock` 在部分平台 release 时可能 unlink lock marker；Phase 1 wrapper 会尽力恢复 marker，但 marker 文件存在性不能作为治理真源或恢复证据。
+- Phase 1 不承诺 reentrant lock 语义；调用方不得依赖同一 `RuntimeFileLock` 实例重复 acquire 的第三方细节。
+
+追踪项：
+
+- 若后续调用方需要严格 marker invariant、非重入状态机或 async file lock，必须作为独立 API 决策与测试进入后续 work unit，不得在 Host durable store、EventLog 或 command path 中隐式依赖 filelock 行为。
+
 #### Remote 物理执行 exactly-once 非目标
 
 结论：
@@ -1341,6 +1353,6 @@ Phase 按依赖关系推进：先实现被其它阶段依赖的公共契约、ru
 
 P0：Engine Context Compaction Event 语义前置已完成 implementation 与 review loop；P0-S1 accepted slice commit 为 `ad6d116`，P0-S2 accepted slice commit 为 `6f6e716`。P0 后续状态进入 push / PR 路径，不再是当前 Host phase design gate。
 
-当前工作为 Phase 1：公共契约与 runtime 基础设施。Phase 1 design refinement 已写入 `docs/reviews/gateflow-phase-design-host-p1-codex-20260513.md`，controller-accepted design fix 已写入 `docs/reviews/gateflow-phase-design-fix-host-p1-codex-20260513.md`。用户反馈后的 design fixes 已写入 `docs/reviews/gateflow-phase-design-user-feedback-fix-host-p1-codex-20260513.md` 与 `docs/reviews/gateflow-phase-design-user-feedback-fix2-host-p1-codex-20260513.md`。AgentMiMo 与 AgentDS 的 phase design re-review 均确认 accepted findings 已修复且 new blocker 为 0；round2 re-review 进一步确认 lane 已改为 cross-process runtime capacity guard，Phase Map 已重排为 P12 ToolsDiscovery / ScenePrepare、P13 Audit / Tool Trace / Outbox、P14 RemoteProxy、P15 Retention / Purge。Phase 1 plan 已写入 `docs/host/phase1-public-contract-runtime-plan.md`；plan review、controller adjudication、plan fix 与 plan re-review artifacts 已写入 `docs/reviews/`。AgentMiMo 与 AgentDS 的 plan re-review 均确认 finding 数量为 0、blocking finding 数量为 0。用户已确认 Phase 1 plan；accepted plan commit 为 `34b1b41`。Phase 1 Slice 1 accepted slice commit 为 `66d8dc3`，Slice 2 accepted slice commit 为 `27e0d8b`。当前 gate 为 Phase 1 Slice 3 implementation：`dayu.runtime.filelock` sync wrapper。
+当前工作为 Phase 1：公共契约与 runtime 基础设施。Phase 1 design refinement 已写入 `docs/reviews/gateflow-phase-design-host-p1-codex-20260513.md`，controller-accepted design fix 已写入 `docs/reviews/gateflow-phase-design-fix-host-p1-codex-20260513.md`。用户反馈后的 design fixes 已写入 `docs/reviews/gateflow-phase-design-user-feedback-fix-host-p1-codex-20260513.md` 与 `docs/reviews/gateflow-phase-design-user-feedback-fix2-host-p1-codex-20260513.md`。AgentMiMo 与 AgentDS 的 phase design re-review 均确认 accepted findings 已修复且 new blocker 为 0；round2 re-review 进一步确认 lane 已改为 cross-process runtime capacity guard，Phase Map 已重排为 P12 ToolsDiscovery / ScenePrepare、P13 Audit / Tool Trace / Outbox、P14 RemoteProxy、P15 Retention / Purge。Phase 1 plan 已写入 `docs/host/phase1-public-contract-runtime-plan.md`；plan review、controller adjudication、plan fix 与 plan re-review artifacts 已写入 `docs/reviews/`。AgentMiMo 与 AgentDS 的 plan re-review 均确认 finding 数量为 0、blocking finding 数量为 0。用户已确认 Phase 1 plan；accepted plan commit 为 `34b1b41`。Phase 1 Slice 1 accepted slice commit 为 `66d8dc3`，Slice 2 accepted slice commit 为 `27e0d8b`，Slice 3 accepted slice commit 为 `e23e3e4`。用户已更新工作范式：从 Slice 3 起仅使用 AgentMiMo 做 review / re-review，slice 通过 review loop 后自动提交，完成所有 slices 后再停。当前 gate 为 Phase 1 Slice 4 implementation：`HostToolingOptions` / `ToolBundle` construction input validation and docs/tests sync。
 
 Phase 1 plan gate 通过证据：`docs/host/design.md`、`docs/host/implementation-control.md` 与 `dayu/README.md` 对 Host public typing、`ToolBundle` construction input、cross-process `dayu.runtime.lane`、`dayu.runtime.filelock`、ToolsDiscovery / ScenePrepare 的 Phase 12 destination 保持一致；AgentMiMo 与 AgentDS 的 Phase 1 design review accepted findings 已有 fix artifact 与 re-review artifact 记录；用户已确认进入 phase plan；`docs/host/phase1-public-contract-runtime-plan.md` 已生成；AgentMiMo 与 AgentDS 已完成 plan review、fix 后 re-review 并确认无剩余 finding。
