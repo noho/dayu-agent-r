@@ -110,6 +110,18 @@ CLOSED
 
 `close_session` 是归档 / 关闭语义，不删除 EventLog，不清空 memory，不重写历史。
 
+`close_session` 只关闭 Session 的新输入入口，不取消、不终止、不删除已有 Run。`CLOSED` Session 的语义：
+
+- `start_run`、`submit_followup(queue)`、`submit_followup(steer)` 返回 `invalid_state`。
+- `ensure_session(scope, slot_key)` 可以返回当前 slot Session，snapshot 标记为 `CLOSED`。
+- `create_session` 仍允许创建新 Session；UI / Service 若要继续聊天，应显式调用 `create_session(bind_slot=true, scope, slot_key)` 创建并重绑定新 Session。
+- `get_session`、`get_run`、`stream_run_events` 仍允许读取。
+- `cancel_run` 仍允许取消已有 Run。
+- `resolve_wait` 仍允许让已有 `WAITING` Run 继续收口。
+- `retry_run` / `replay_run` 默认拒绝在 closed Session 内创建关联新 Run，除非显式 policy 把新 Run 创建到其它 Session。
+
+已有 active Run 继续按 Host 状态机治理到终态；`WAITING` Run 保持 `WAITING`，后续 `resolve_wait` / resume 仍可继续；close 前已 durable accepted 的 `QUEUED` Run 继续保留，并可在 active slot 释放后 promotion。close 不等于 cancel；若调用方希望停止已有工作，必须显式调用 `cancel_run`。
+
 `clear_session` 不进入第一版普通公共接口。需要清理、遗忘或重置时，必须分别设计 close / new session / memory forget / purge 等有明确审计语义的接口。
 
 ## 5. Session Slot
@@ -176,7 +188,7 @@ LOST
 状态语义：
 
 - `QUEUED`：Run 已被 Host durable accepted，但尚未创建 active Attempt。
-- `RUNNING`：Run 当前有 active Attempt 正在执行。
+- `RUNNING`：Run 已占用 Session active slot，并已有 active Attempt lifecycle；active Attempt 可以处于 `STARTING` 或 `RUNNING`。
 - `WAITING`：当前 Attempt 已因外部等待条件收口为 `SUSPENDED`，Run 等待 Host 后续 resume。
 - `CANCELLING`：Host 已接受取消请求，正在等待 active Attempt 收口或超时升级。
 - `RECOVERING`：Host 已确认旧 Attempt 丢失，但用户请求和必要 canonical facts 仍可恢复；Host 正在或等待创建新 Attempt 继续同一 Run。
@@ -187,7 +199,7 @@ LOST
 
 `LOST` 不是 `FAILED`。`FAILED` 表示已确认失败；`LOST` 表示治理无法恢复或无法确认，不能伪装成普通失败。
 
-Host crash 导致旧 Attempt 丢失时，若用户输入和必要 canonical facts 已持久化，Run 优先进入 `RECOVERING`，而不是直接终态 `LOST`。
+允许且预期存在 `Run.status=RUNNING` 与 `Attempt.status=STARTING` 的组合。Host crash 导致旧 Attempt 丢失时，若用户输入和必要 canonical facts 已持久化，Run 优先进入 `RECOVERING`，而不是直接终态 `LOST`。
 
 ## 7. Attempt 生命周期
 
@@ -269,6 +281,9 @@ RECOVERING
 - `create_session` 由 `client_request_id` 幂等映射到一次明确的新建 Session 动作；绑定 slot 时，同一 `client_request_id` 重试不能重复创建或重复重绑定。
 - `start_run` 由 `(session_id, client_request_id)` 幂等映射到同一个 Run。
 - queued follow-up / queued run 也必须按 `(session_id, client_request_id)` 幂等。
+- `cancel_run` 由 `(run_id, client_request_id)` 幂等映射到同一个 cancel 操作。
+- `retry_run` / `replay_run` 由 `(source_run_id, client_request_id)` 幂等映射到同一个关联新 Run。
+- `resolve_wait` 由 `(wait_id, idempotency_key)` 幂等映射到同一个 wait resolution。
 
 多进程持久化方向：
 
@@ -308,24 +323,25 @@ Host 不允许先 dispatch EngineWorker 再补写用户输入事实。
 
 | 操作 / 来源 | 前置状态 | 目标状态 | 必须追加的 canonical facts | Attempt 动作 |
 | --- | --- | --- | --- | --- |
-| `start_run` 且无 active Run | Session `OPEN` | Run `RUNNING` | `USER_INPUT_ACCEPTED`、`RUN_ACCEPTED`、`RUN_STARTED`、`ATTEMPT_STARTED` | 创建新 Attempt 并 dispatch |
+| `start_run` 且无 active Run | Session `OPEN` | Run `RUNNING` / Attempt `STARTING` | `USER_INPUT_ACCEPTED`、`RUN_ACCEPTED`、`RUN_STARTED`、`ATTEMPT_STARTED` | 创建新 Attempt；commit 后 dispatch |
 | `start_run` 且有 active Run，policy=`queue` | Session `OPEN` | Run `QUEUED` | `USER_INPUT_ACCEPTED`、`RUN_ACCEPTED`、`RUN_QUEUED` | 不创建 Attempt |
-| queue promotion | Run `QUEUED` 且 Session 无 active Run | Run `RUNNING` | `RUN_STARTED`、`ATTEMPT_STARTED` | 创建新 Attempt 并 dispatch |
+| queue promotion | Run `QUEUED` 且 Session 无 active Run | Run `RUNNING` / Attempt `STARTING` | `RUN_STARTED`、`ATTEMPT_STARTED` | 创建新 Attempt；commit 后 dispatch |
 | Engine final answer | Run `RUNNING` / Attempt `RUNNING` | Run `SUCCEEDED` / Attempt `SUCCEEDED` | `RUN_SUCCEEDED`、`ATTEMPT_SUCCEEDED` | 关闭当前 Attempt |
 | Engine failure | Run `RUNNING` / Attempt `RUNNING` | Run `FAILED` / Attempt `FAILED`，或按 policy 进入 retry | `RUN_FAILED`、`ATTEMPT_FAILED` | 关闭当前 Attempt |
 | Engine suspended | Run `RUNNING` / Attempt `RUNNING` | Run `WAITING` / Attempt `SUSPENDED` | `TOOL_AWAITING`、`RUN_WAITING`、`ATTEMPT_SUSPENDED` | 关闭当前 Attempt，持久化 wait record |
 | `resolve_wait` | Run `WAITING` | Run `RUNNING` | `RESUME_REQUESTED`、tool terminal/result fact、`RUN_STARTED`、`ATTEMPT_STARTED` | 创建新 Attempt 并 dispatch |
-| `submit_followup(steer)` | target Run 是当前 active Run，且状态为 `RUNNING` 或 `WAITING` | 同一 Run `RUNNING` | `STEER_REQUESTED`、旧 Attempt terminal when `RUNNING`、`ATTEMPT_STARTED` | 运行中 Attempt 收口为 `STEERED`，或在 `STEER_REQUESTED` payload 中绑定并停用 active wait record；创建新 Attempt |
+| `submit_followup(steer)` on running | target Run 是当前 active Run，且状态为 `RUNNING` | 同一 Run `RUNNING` / new Attempt `STARTING` | `STEER_REQUESTED`、`ATTEMPT_STEERED`、`ATTEMPT_STARTED` | 运行中 Attempt 收口为 `STEERED`；创建新 Attempt；commit 后 dispatch |
+| `submit_followup(steer)` on waiting | target Run 是当前 active Run，且状态为 `WAITING` | 同一 Run `RUNNING` / new Attempt `STARTING` | `STEER_REQUESTED`、wait record cancelled with reason `steered`、`RUN_STARTED`、`ATTEMPT_STARTED` | 旧 Attempt 保持 `SUSPENDED`；创建新 Attempt；commit 后 dispatch |
 | `cancel_run` on queued | Run `QUEUED` | Run `CANCELLED` | `CANCEL_REQUESTED`、`RUN_CANCELLED` | 无 |
 | `cancel_run` on waiting | Run `WAITING` | Run `CANCELLED` | `CANCEL_REQUESTED`、wait record cancelled fact、`RUN_CANCELLED` | 旧 Attempt 保持 `SUSPENDED`；不传播 cancel |
-| `cancel_run` on active running | Run `RUNNING` / `CANCELLING` / `RECOVERING` | Run `CANCELLING`，后续 `CANCELLED` / `WAITING` / `RECOVERING` / `LOST` | `CANCEL_REQUESTED`，后续 terminal fact | 向当前 Attempt 传播 cancel |
+| `cancel_run` on active running / starting | Run `RUNNING` / `CANCELLING` / `RECOVERING` | Run `CANCELLING`，后续 `CANCELLED` / `WAITING` / `RECOVERING` / `LOST` | `CANCEL_REQUESTED`、`RUN_CANCELLING`，后续 terminal fact | commit 后向当前 Attempt 传播 cancel |
 | `retry(run)` | Run `FAILED` 或 recoverable failure | 关联的新 Run `QUEUED` 或 `RUNNING` | `RETRY_REQUESTED`、新 Run 的 `RUN_ACCEPTED`，按 admission 追加 `RUN_QUEUED` 或 `RUN_STARTED` / `ATTEMPT_STARTED` | 原 Run 终态不改；新 Run 创建自己的 Attempt |
 | `replay(run)` | Run `SUCCEEDED`，且 final answer 格式 / schema / 结构需修复 | 关联的新 Run `QUEUED` 或 `RUNNING` | `REPLAY_REQUESTED`、新 Run 的 `RUN_ACCEPTED`，按 admission 追加 `RUN_QUEUED` 或 `RUN_STARTED` / `ATTEMPT_STARTED` | 原 Run 终态不改；新 Run 默认复用已接受工具事实 |
 | recovery scan | Run `RUNNING` / `CANCELLING` 且 active Attempt 不可确认 | Run `RECOVERING` 或 `LOST` | `ATTEMPT_LOST`、`RUN_RECOVERING` 或 `RUN_LOST` | 不 takeover；可恢复时再创建新 Attempt |
 
 `RECOVERING` 的退出必须收敛：
 
-- `RECOVERING -> RUNNING`：Host 成功基于 canonical facts 创建并派发新 Attempt。
+- `RECOVERING -> RUNNING`：Host 成功基于 canonical facts 创建新 Attempt，记录 dispatch intent，并让 Attempt 进入 `STARTING`。
 - `RECOVERING -> CANCELLED`：用户在恢复期间取消，且没有新 Attempt 已提交 terminal。
 - `RECOVERING -> FAILED`：可恢复路径中的新 Attempt 已确认不可恢复失败，或恢复动作本身确认失败且 policy 选择失败收口。
 - `RECOVERING -> LOST`：无法重建 messages、必要 payload / anchor 缺失、重复恢复超过 policy 上限，或 policy 明确放弃恢复。
@@ -337,6 +353,24 @@ Attempt startup 边界：
 - `ATTEMPT_STARTED` 表示 Host 已在 durable store 中创建 `STARTING` Attempt，并记录 dispatch intent / dispatch record。
 - worker 明确接受 dispatch 后，Host append `ATTEMPT_RUNNING`，Attempt 才进入 `RUNNING`。
 - dispatch rejected、startup timeout、dispatch failure、cancel during `STARTING` 都必须关闭 Attempt，并追加明确 Attempt terminal fact。Run 随 Host policy 进入 `FAILED`、`RECOVERING` 或 `LOST`；实现不得把“Host 准备派发”和“worker 已开始执行”混为同一状态。
+- `Run RUNNING` 表达 Host 治理生命周期；Attempt `RUNNING` 表达执行环境生命周期。`Run RUNNING + Attempt STARTING` 是合法组合，表示该用户目标已进入 Host 治理执行态，但执行环境尚未确认接住。
+
+标准启动路径：
+
+```text
+start_run admitted
+  -> append USER_INPUT_ACCEPTED
+  -> append RUN_ACCEPTED
+  -> append RUN_STARTED
+  -> create Attempt(status=STARTING)
+  -> append ATTEMPT_STARTED
+  -> Run.status = RUNNING
+  -> commit
+  -> WorkerProxy dispatch
+  -> worker accepted
+  -> append ATTEMPT_RUNNING
+  -> Attempt.status = RUNNING
+```
 
 cancel / resolve / promotion 竞态规则：
 
@@ -356,6 +390,7 @@ Host durable store 是本地治理真源。第一版使用 SQLite 承载以下 d
 - durable queue。
 - wait record。
 - attempt dispatch record。
+- host instance liveness record。
 - durable payload table / descriptor table。
 - projection checkpoint。
 - optional outbox marker。
@@ -402,7 +437,7 @@ command path handle 只服务同步治理命令，例如 `start_run`、`submit_f
 background runtime supervisor 只服务已提交事实的追平、投影和投递。它可以持有：
 
 - Observer / Sink runner。
-- Outbox dispatcher。
+- Outbox projection runner。
 - stream fanout。
 - projection workers。
 - wait poller。
@@ -421,7 +456,7 @@ Host mutating command
   -> supervisor catches up Sink / Outbox / projection by event_sequence checkpoint
 ```
 
-command path 不直接运行慢 projection、outbox delivery、tool trace 写文件或 memory projection。background runtime 不 append canonical facts，不更新 Run / Attempt governance state，也不决定 mutating command 是否成功。
+command path 不直接运行慢 projection、outbox projection、tool trace 写文件或 memory projection。background runtime 不 append canonical facts，不更新 Run / Attempt governance state，也不决定 mutating command 是否成功。
 
 运行参数约束：
 
@@ -487,7 +522,7 @@ resolve_wait(host, wait_id, request) -> RunSnapshot
 
 外部语义采用函数式操作。`retry_run(host, run_id, request)` 与 `replay_run(host, run_id, request)` 的语义分别是 `retry(run)` / `replay(run)`：输入是源 Run，输出是关联的新 RunSnapshot；它们不是在原 Run 上调用 `Run.retry` / `Run.replay` 来重开终态。
 
-所有会 append EventLog `canonical_fact` 或影响 outbox / audit 的 mutating request 都必须携带结构化 `HostCallContext` 或等价 request envelope。Host 不负责认证，但必须记录上层已经解析的 actor / principal、source / client、request id、client operation id、delivery target hint 与权限声明。required fields 不能塞进无结构 metadata。
+所有会 append EventLog `canonical_fact` 或影响 audit 的 mutating request 都必须携带结构化 `HostCallContext` 或等价 request envelope。Host 不负责认证，但必须记录上层已经解析的 actor / principal、source / client、request id 与权限声明。required fields 不能塞进无结构 metadata。
 
 本节 request 片段只列操作专属字段；mutating request envelope 必须统一包含 `HostCallContext`。
 
@@ -497,12 +532,12 @@ resolve_wait(host, wait_id, request) -> RunSnapshot
 actor / principal       -> 谁代表本次操作负责
 source / client         -> 操作来自哪个入口或客户端
 request_id              -> 上层调用链路追踪 id
-client_request_id       -> 客户端操作幂等 id
-delivery_target_hint?   -> terminal answer 的默认投递目标提示
 authorization_claims?   -> 上层已验证的权限声明
 ```
 
-Host 不从 `Session slot` 反推 actor，也不从 metadata 猜 delivery target。匿名、系统动作和后台 policy 动作必须使用显式 actor 值，例如 system actor / service actor。下方 request 片段中出现的 `client_request_id` 与 `HostCallContext.client_request_id` 是同一个操作幂等字段，不是两份独立 id。
+`HostCallContext` 描述这次调用 Host 的来路和责任信息，回答“谁、从哪里、以什么权限发起”。它不描述“要做什么”，不携带 delivery target，也不是统一幂等键。具体 request 描述业务意图、状态机前置条件，并定义自己的幂等字段或幂等范围。
+
+Host 不从 `Session slot` 反推 actor，也不从 metadata 猜 actor、权限或 channel 投递目标。匿名、系统动作和后台 policy 动作必须使用显式 actor 值，例如 system actor / service actor。
 
 mutating API 的通用路径：
 
@@ -516,11 +551,12 @@ validate HostCallContext
   -> dispatch side effects only after commit
 ```
 
-事务提交前不得启动 EngineWorker、写 outbox delivery、调用外部 job 或通知远端执行。提交后的 side effect 必须能从 EventLog / dispatch record / outbox checkpoint 恢复或重试。
+事务提交前不得启动 EngineWorker、写 outbox item、调用外部 job 或通知远端执行。提交后的 side effect 必须能从 EventLog / dispatch record / outbox checkpoint 恢复或重试。
 
 Idempotency semantic contract：
 
 - 每个 mutating operation 的幂等范围必须显式定义，例如 `(session_id, client_request_id)`、`(run_id, client_request_id)` 或 `(scope, slot_key)`。
+- `HostCallContext` 不定义幂等范围；operation request owns idempotency key。
 - 幂等记录绑定 operation name、scope / target object、semantic input digest、result object id 和 accepted event refs。
 - 同一幂等键 + 同一 semantic input digest 重试时，Host 返回既有 snapshot，不重复 append canonical facts，不重复 dispatch。
 - 同一幂等键 + 不同 semantic input digest 必须返回 `idempotency_conflict`，不得静默复用旧对象，也不得创建第二个对象。
@@ -553,7 +589,6 @@ client_request_id
 input
 execution_target
 queue_policy
-delivery_target?
 ```
 
 `CancelRunRequest`：
@@ -561,7 +596,14 @@ delivery_target?
 ```text
 client_request_id
 reason
-mode: graceful
+mode: graceful   # first version only
+```
+
+`CloseSessionRequest`：
+
+```text
+client_request_id
+reason
 ```
 
 `SubmitFollowupRequest`：
@@ -572,7 +614,6 @@ client_request_id
 input
 behavior: queue | steer
 target_run_id?        # required when behavior=steer
-delivery_target?
 ```
 
 `RetryRunRequest`：
@@ -580,7 +621,6 @@ delivery_target?
 ```text
 client_request_id
 reason
-policy_overrides?
 ```
 
 `ReplayRunRequest`：
@@ -589,7 +629,6 @@ policy_overrides?
 client_request_id
 reason
 repair_instruction?
-reuse_policy
 ```
 
 `ResolveWaitRequest`：
@@ -606,11 +645,14 @@ Run 接口语义：
 - `start_run`：接受新的用户目标，按 `(session_id, client_request_id)` 幂等创建或返回同一个 Run；根据 admission 决定立即 `RUNNING`、进入 `QUEUED`、拒绝或 attach active。
 - `get_run`：读取 RunSnapshot；不触发执行、不触发 queue promotion、不改变 Run / Attempt 状态。
 - `stream_run_events`：从全局 `event_sequence` cursor 补读目标 Run 的事件；断线重连只依赖 cursor，不依赖内存订阅是否仍存在。
+- `close_session`：关闭 Session 新输入入口，按 `(session_id, client_request_id)` 幂等；不取消、不终止、不删除已有 Run。
 - `cancel_run`：接受取消请求，按 `(run_id, client_request_id)` 幂等；queued Run 直接 `CANCELLED`，active Run 进入 `CANCELLING` 并向当前 Attempt 传播 cancel。
 - `submit_followup`：接受运行中或会话级后续输入；`behavior=queue` 创建后续 queued Run，`behavior=steer` 必须命中 `target_run_id` 所指的当前 active Run 并切换 Attempt。
 - `retry_run`：函数式 `retry(run)`；在 confirmed failure / recoverable failure 后创建关联的新 Run。原 Run 保持终态不可变；新 Run 可以按 retry policy 复用旧 Run 已接受工具事实，并创建自己的 Attempt。
-- `replay_run`：函数式 `replay(run)`；只用于 final answer 格式、schema、结构或输出 envelope 失败时创建关联的新 Run。原 `SUCCEEDED` Run 不重开；新 Run 默认复用旧 Run 已接受工具事实，不重新执行昂贵工具。事实内容脏、幻觉、业务归因错误、证据不足或证据冲突不属于 replay 场景。
+- `replay_run`：函数式 `replay(run)`；只用于 final answer 格式、schema、结构或输出 envelope 失败时创建关联的新 Run。原 `SUCCEEDED` Run 不重开；新 Run 默认复用旧 Run 已接受工具事实，并以 no-tool messages 调用做结构修复。事实内容脏、幻觉、业务归因错误、证据不足或证据冲突不属于 replay 场景。
 - `resolve_wait`：wait adapter / manual admin 的统一入口；关闭 wait record，append tool terminal/result fact，并创建新 Attempt resume。
+
+第一版公共 API 不暴露开放式 policy knobs。Host policy 可以有默认值，但 request 不能携带无结构 `policy_overrides`。`CancelRunRequest.mode` 第一版唯一值为 `graceful`；不支持 `force` / `immediate`。`retry_run` 是否复用 accepted tool facts、重试次数和退避由 Host retry policy 决定。`replay_run` 固定复用源 Run accepted tool facts / evidence anchors，固定 no tools，固定只做结构修复。
 
 Run 读取与结果边界：
 
@@ -629,8 +671,8 @@ Run 读取与结果边界：
 
 Snapshot 最小语义：
 
-- `SessionSnapshot`：`session_id`、status、slot、active run、queued runs、timeline cursor。
-- `RunSnapshot`：`run_id`、`session_id`、status、current attempt、terminal result summary、event_sequence cursor、outbox status summary。
+- `SessionSnapshot`：`session_id`、status、slot、active run、queued runs、timeline cursor。timeline cursor 使用全局 `event_sequence` cursor；session-local cursor 只能作为 read model 优化，不能替代全局 cursor。
+- `RunSnapshot`：`run_id`、`session_id`、status、current attempt、terminal result summary、event_sequence cursor、source_run_id?、source_run_relation?、outbox summary。
 - `FollowupSnapshot`：accepted input ref、behavior、target run / queued run、current cursor。
 - `HostEventStream`：Host event stream 的返回对象，按全局 `event_sequence` 递增返回，携带 next `event_sequence` cursor。
 
@@ -692,13 +734,18 @@ user submits follow-up with behavior=steer
 user submits follow-up with behavior=steer
   -> Host validates target_run_id is the current WAITING active Run
   -> Host appends STEER_REQUESTED
-  -> Host marks active wait record abandoned for resume purposes in the same transaction
+  -> Host marks active wait record cancelled(reason=steered) in the same transaction
+  -> Host appends RUN_STARTED
   -> late wait result can only enter diagnostic / tool trace
   -> old Attempt remains SUSPENDED
-  -> Host creates new Attempt for the same Run
+  -> Host creates new Attempt(status=STARTING) for the same Run
+  -> Host appends ATTEMPT_STARTED
   -> Host rebuilds messages from EventLog canonical facts + steer input
-  -> Host dispatches through LocalProxy / RemoteProxy
+  -> commit
+  -> Host dispatches through LocalProxy / RemoteProxy after commit
 ```
+
+`WAITING` steer 不新增 wait record 状态。旧 Attempt 保持 `SUSPENDED`，不改写为 `STEERED`，因为它已经因 awaiting 正常 suspended。
 
 steerable Run 状态只有 `RUNNING` 与 `WAITING`。`CANCELLING`、`RECOVERING` 和所有 terminal 状态都不可 steer。
 
@@ -730,7 +777,7 @@ EventLog 不变量：
 - Projection / audit / memory / timeline / usage / tool trace 不得 append 或 update EventLog。
 - preview / reasoning / display-only event 可以用于 Host event stream，但不能成为 memory / audit / resume 真源。
 - 每条 event 必须显式标注 `event_class`；缺省不得被解释为 canonical fact。
-- 只有 `canonical_fact` 可以驱动 Run / Attempt 状态迁移、recovery、resume、memory verified inputs、audit 责任主链和 outbox delivery intent。
+- 只有 `canonical_fact` 可以驱动 Run / Attempt 状态迁移、recovery、resume、memory verified inputs、audit 责任主链和 outbox terminal delivery intent。
 - `preview` 可以按 `event_sequence` 补读以恢复 UI 体验，但 preview 丢失、压缩或清理不得影响 Run terminal、messages rebuild 或 memory。
 - `diagnostic` 可以用于排错和 trace，但不得让 late remote event、protocol error 或 projection failure 变成业务事实。
 - `projection_signal` 只能由 Host ingest / Host policy 写入，用于 usage、tool trace 或其它 projection 输入；Sink 不得把自己的输出再写回 EventLog 形成反馈环。
@@ -862,12 +909,12 @@ canonical event contract 必须转成 typed dataclass / enum / validation tests�
 | `SESSION_CREATED` / `SESSION_CLOSED` | `session_id` | slot / actor / reason | 更新 Session status | memory 不消费 | audit yes / timeline emit |
 | `USER_INPUT_ACCEPTED` | `session_id`、`run_id`、`client_request_id` | user input ref / digest / display text | 创建或关联 Run 输入 | resume yes / memory raw turn | audit yes / Host event stream emit |
 | `RUN_ACCEPTED` / `RUN_QUEUED` / `RUN_STARTED` | `session_id`、`run_id` | queue policy / execution target | 更新 Run status / queue index | resume yes | audit yes / Host event stream emit |
-| `RUN_WAITING` / `RUN_RECOVERING` | `session_id`、`run_id` | wait_id 或 recovery reason | 更新 Run status | resume yes | audit yes / Host event stream emit |
+| `RUN_WAITING` / `RUN_CANCELLING` / `RUN_RECOVERING` | `session_id`、`run_id` | wait_id / cancel reason / recovery reason | 更新 Run status | resume yes when semantically needed | audit yes / Host event stream emit |
 | `RUN_SUCCEEDED` / `RUN_FAILED` / `RUN_CANCELLED` / `RUN_LOST` | `session_id`、`run_id`、terminal attempt refs | terminal summary / error / reason / result ref | 更新 Run terminal status | resume 只消费有语义必要的终态；memory 消费 assistant conclusion 和工具事实 | audit yes / Host event stream emit / success 触发 outbox |
 | `ATTEMPT_STARTED` | `session_id`、`run_id`、`attempt_id`、`execution_id` | worker target / dispatch record ref | 创建 Attempt row，status=`STARTING` | resume 不消费，除非用于诊断 | audit yes / Host event stream optional |
 | `ATTEMPT_RUNNING` | `session_id`、`run_id`、`attempt_id`、`execution_id` | worker accepted / dispatch accepted info | Attempt status=`RUNNING` | resume 不消费，除非用于诊断 | audit yes / Host event stream optional |
 | `ATTEMPT_SUCCEEDED` / `ATTEMPT_FAILED` / `ATTEMPT_CANCELLED` / `ATTEMPT_SUSPENDED` / `ATTEMPT_STEERED` / `ATTEMPT_LOST` | `session_id`、`run_id`、`attempt_id`、`execution_id` | terminal reason / error / wait_id | 关闭 Attempt | resume 按需消费 suspended / lost reason | audit yes / Host event stream emit |
-| `FOLLOWUP_QUEUED` / `STEER_REQUESTED` / `CANCEL_REQUESTED` / `RESUME_REQUESTED` / `RETRY_REQUESTED` / `REPLAY_REQUESTED` | `session_id`、`run_id`、`client_request_id` | control input / reason / policy / source_run_id when retry or replay | 触发对应状态机；retry / replay 创建关联新 Run，不重开源 Run | 改变模型语义时进入 messages | audit yes / Host event stream emit |
+| `FOLLOWUP_QUEUED` / `STEER_REQUESTED` / `CANCEL_REQUESTED` / `RESUME_REQUESTED` / `RETRY_REQUESTED` / `REPLAY_REQUESTED` | `session_id`、`run_id`、operation idempotency key | control input / reason / policy / source_run_id when retry or replay | 触发对应状态机；retry / replay 创建关联新 Run，不重开源 Run | 改变模型语义时进入 messages | audit yes / Host event stream emit |
 | `TOOL_CALL_REQUESTED` | `session_id`、`run_id`、`attempt_id`、`execution_id` | tool_call_id / tool name / normalized args digest | 记录工具调用 intent | accepted into model history 时 resume 消费 | audit 是 / tool trace 是 |
 | `TOOL_CALL_GOVERNED` | `session_id`、`run_id`、`attempt_id`、`execution_id` | policy decision / duplicate key / action | 不直接改 Run；可触发 guidance / hard stop | action 影响模型继续时进入 messages | audit 是 / tool trace 是 |
 | `TOOL_RESULT_ACCEPTED` / `TOOL_TERMINAL_RESULT` | `session_id`、`run_id`、`attempt_id`、`execution_id` | result ref / digest / evidence anchors / status | 记录工具事实 | resume 是 / memory 工具事实 | audit 是 / tool trace 是 |
@@ -944,6 +991,7 @@ Sink semantic contract：
 
 - Sink 的输入是 committed EventLog event，不是事务中的临时状态。
 - Sink 必须按 `event_sequence` checkpoint 追平，并按 canonical `event_id` 幂等消费。
+- Sink 必须是幂等消费者；重复消费同一 canonical `event_id` 不得产生重复副作用或违反投递语义。
 - Sink 必须声明消费哪些 `event_class` / `event_type`；默认只消费 `canonical_fact`。
 - 每个 Sink 必须有自己的 typed consumer contract，明确输入 event 类型、payload view、checkpoint、幂等键、失败处理和输出 projection；不得让所有 Sink 共享一个无结构 Event payload。
 - Sink 可以维护自己的 projection 表、work queue 或冷数据文件，但不能写 Host governance truth。
@@ -957,7 +1005,7 @@ Sink semantic contract：
 - tool trace projection。
 - stream fanout。
 - memory projection。
-- outbox delivery。
+- outbox projection。
 
 ### 13.1 Tool Trace Hot / Cold Storage
 
@@ -1035,27 +1083,28 @@ get_session(session_id)
 
 Outbox：
 
-- Run terminal fact 提交后，final answer 已成为 Host 真源中的结果；投递给 UI、Web、WeChat、CLI 或其它入口属于 outbox delivery。
+- Run terminal fact 提交后，final answer 已成为 Host 真源中的结果。
+- 在线 / 已 attach 客户端的阅读路径是 Host event stream、Session timeline、RunSnapshot 或 read model；断线后通过 cursor 或 snapshot 补读。
+- Outbox 不是客户端阅读 final answer 的通用接口，也不是 UI read model。
+- Outbox 是离线 / 外部投递路径的 durable terminal delivery queue，表达 terminal result 可投递 / 可通知的 durable item。
+- Outbox 解决的问题是：离线客户端或外部渠道不需要回放中间过程，也不能丢 final answer / terminal notification。
+- Outbox 不包含完整 run timeline，不补 preview / progress / reasoning / streaming content。
+- Host 不负责 deliver to UI，不判断哪些客户端应该收到，不记录 GUI / CLI / WeChat / Web 的 channel 投递成功状态。
+- Session 不持有唯一 default delivery target；HostCallContext 不包含 delivery target / delivery hint。
+- 具体投递目标、投递成功状态、channel retry、WeChat / Web / notification binding 属于 Service / UI / channel adapter。
 - 投递失败不能回滚 Run terminal。
-- delivery target 必须是 typed stable target，优先级为 request 显式字段、`HostCallContext` typed field、Session binding default。
-- Host 必须在 Run accepted command transaction 中冻结 resolved delivery target。冻结位置可以是 `RUN_ACCEPTED` canonical payload，也可以是与 `RUN_ACCEPTED` 同事务更新的 Run durable state；OutboxSink 只能读取该冻结目标，不重新解析 metadata。
-- resume、wait resolution、recovery、retry Attempt 和 terminal 收口都不得重新解析同一个 Run 的 delivery target。
-- 没有冻结 delivery target 时，OutboxSink 不创建 delivery record；Run terminal 不受影响。
-- terminal transaction 不同步写 outbox 表；把 Run 终态提交和投递 work queue 生成强绑定违反 Observer / Sink 边界。
-- OutboxSink 按 `event_sequence` checkpoint 扫描 terminal EventLog facts，并 upsert outbox delivery record。outbox 表是 projection / work queue，可由 EventLog 重建。
+- terminal transaction 不同步写 outbox 表；把 Run 终态提交和 outbox work queue 生成强绑定违反 Observer / Sink 边界。
+- OutboxSink 按 `event_sequence` checkpoint 扫描 terminal EventLog facts，并 upsert outbox item。outbox 表是 projection / work queue，可由 EventLog 重建。
 - optional outbox marker / notification 只是 wakeup；它丢失不得影响最终投递意图的派生。
-- Outbox 必须具备幂等投递键、投递状态、重试次数、last error 和 delivery target。
+- Outbox 必须具备幂等 item key、terminal event ref、result ref / digest、session_id、run_id、event_sequence 和 projection state。channel delivery state 不属于 Host truth。
 - Outbox 不参与 resume、memory 事实重建或 Run 状态迁移。
 
-delivery target freeze 路径：
+阅读路径：
 
 ```text
-start_run / submit_followup accepted
-  -> Host resolves delivery target from explicit request / HostCallContext / Session binding
-  -> append USER_INPUT_ACCEPTED
-  -> append RUN_ACCEPTED(payload includes delivery_target_ref or delivery_context_ref)
-  -> optionally update Run durable row with resolved delivery target in same transaction
-  -> commit
+Host EventLog
+  -> Host event stream / Session timeline / RunSnapshot
+      -> UI read path: GUI / Web / CLI / attached clients read here
 ```
 
 OutboxSink 路径：
@@ -1063,14 +1112,13 @@ OutboxSink 路径：
 ```text
 OutboxSink checkpoint at event_sequence N
   -> scan terminal EventLog facts after N
-  -> read frozen delivery target from RUN_ACCEPTED / Run durable state
-  -> derive delivery intent
-  -> upsert outbox delivery record by idempotency key
+  -> derive terminal delivery intent / notification item
+  -> upsert outbox item by idempotency key
   -> advance checkpoint after projection commit
-  -> OutboxDispatcher delivers and updates outbox-local state
+  -> Service / channel adapter consumes outbox item and owns channel delivery
 ```
 
-delivery idempotency key 必须由 terminal event identity、delivery target 和 channel 派生。重复扫描同一 terminal event 不得创建重复投递任务。
+outbox item idempotency key 必须由 terminal event identity 派生。重复扫描同一 terminal event 不得创建重复 outbox item。
 
 OutboxSink 只读 EventLog / Run durable truth，并写 outbox projection / work queue。它不能 append EventLog、不能更新 Run / Attempt，也不能改变 terminal 结果。
 
@@ -1147,6 +1195,14 @@ attempt snapshot 至少包含：
 
 RemoteProxy、RemoteStub 与 EngineWorker 可以缓存 attempt snapshot 服务本次执行，但该 snapshot 不是远端治理状态；Host durable store 才是治理真源。
 
+Tool fact accept ack 语义：
+
+- ToolRuntime 向 Host submit tool fact candidate 必须携带稳定 accept idempotency key。
+- accept idempotency key 必须能由 attempt identity、tool call identity、tool fact kind、result digest / awaiting digest 等确定性输入派生。
+- Host 已 durable accepted 但 ack 在本地回调或远程传输中丢失时，ToolRuntime 必须重试 accept；Host 通过 accept idempotency key 返回既有 accepted ack，不追加第二份 canonical fact。
+- ack rejected 表示 Host 明确拒绝该 candidate；ack timeout 只表示 ToolRuntime 未确认 Host 是否 accepted，不能直接把 tool result 返回给 Engine。
+- ToolRuntime 在 ack timeout 后不得让 LLM 消费未确认结果；它必须重试 accept，或按 Host policy 进入 governed tool error / awaiting / Attempt failed / recoverable。
+
 ## 17. ToolRuntime
 
 ToolRuntime 是 Host-owned tool governance module。它可以随 EngineWorker 部署在本地或远端执行环境，但治理配置和真源来自 Host attempt snapshot。
@@ -1207,6 +1263,7 @@ tool fact candidate 必须包含足以治理和追溯的信息：
 - 截断发生时的 truncation descriptor / `scope_token` descriptor。
 - 外部副作用或付费工具适用的 idempotency key。
 - policy decision 与 diagnostic refs。
+- accept idempotency key。
 
 ToolRuntime 负责：
 
@@ -1379,9 +1436,11 @@ resume policy 覆盖 internal / manual、poll、callback 三类入口。所有�
 - 如果 job 状态无法确认，应进入 structured failed / lost。
 - Engine 不读取 wait record，也不恢复旧 Agent / Runner。
 - Host recovery scan 遇到 `WAITING` Run 时不得创建新 Attempt；它只能恢复 wait record 的 adapter 状态。
+- wait record 的 `resume_policy` / `await_spec` / `external_job_id` 必须包含足以在 Host restart 后恢复 adapter observation 的 durable refs。adapter registry / lookup 由 Host composition root 提供 typed adapter binding；wait record 只保存 adapter key / policy ref / external job refs，不保存进程内 adapter 对象。
 - `poll` adapter 从 wait record 读取 `external_job_id` / `await_spec` 后继续轮询，并在完成时调用同一个 `resolve_wait`。
 - `callback` 入口必须验证认证、重放防护和 idempotency key，然后调用同一个 `resolve_wait`。
 - `manual` resolve 只能由受控入口触发，并必须写 audit projection。
+- wait poller 是 background runtime 中的 trigger / adapter。它观察 wait record 与外部 job，但只能通过 `resolve_wait` command path 提交结果；不得持有 EventLog appender，不得直接更新 Run / Attempt / wait record terminal state。
 - wait record resolution 与 `RESUME_REQUESTED`、tool terminal/result fact、new Attempt 创建必须在同一事务或等价原子流程中收口。
 - `resolve_wait` 幂等范围是 `(wait_id, idempotency_key)`。
 - 同一幂等键 + 同一 outcome 重试时，Host 返回既有 accepted resolution result，不追加第二份 canonical fact。
@@ -1436,9 +1495,10 @@ Replay：
 - Replay 不重开原 `SUCCEEDED` Run；旧 final answer 保留为历史 assistant conclusion / rejected candidate，不是 verified fact。
 - Replay 创建关联的新 Run，新 Run 再创建自己的 Attempt 和 `execution_id`。
 - Replay 通过 EventLog 重建 messages，复用源 Run accepted tool facts / tool messages / evidence anchors。
-- Replay 默认不重新执行已接受工具。
+- Replay 是 no-tool `AgentRunRequest.messages` 结构修复调用，不重新执行工具，不新增工具事实。
 - 源 Run 的 final answer 不作为普通 assistant conclusion 注入新 Run；它只能作为 `rejected_candidate` / repair context 与 validation errors / repair instruction 一起进入 messages。
 - replay messages 必须约束模型只做结构修复，不引入新事实，不调用工具，不改变 evidence anchors。
+- 如果 replay 执行期间模型仍发起 tool call，Host / ToolRuntime 必须按 replay policy 拒绝；默认治理动作是 hard stop 或 governed tool error，并记录 diagnostic / tool trace。不得把该 tool call 当作普通工具执行。
 - Replay append `REPLAY_REQUESTED`，并在新 Run 上记录 `source_run_id` / `replay_of_run_id` 或等价关联。
 - Session timeline 可以把 replay Run 标成“对某次回答的重放 / 修正”，并用 read model 指向最新 replay result；EventLog 保留完整 replay 链。
 
@@ -1452,8 +1512,9 @@ Replay：
 client requests cancel
   -> Host appends CANCEL_REQUESTED
   -> if Run is QUEUED: Run -> CANCELLED
-  -> if Run has active Attempt: Run -> CANCELLING
-  -> Host sends cancel through LocalProxy / RemoteProxy
+  -> if Run has active Attempt: Host appends RUN_CANCELLING and Run -> CANCELLING
+  -> commit
+  -> Host sends cancel through LocalProxy / RemoteProxy after commit
   -> EngineWorker maps cancel to run-local cancellation token
   -> Engine emits run_cancelled when cancellation wins execution boundary
   -> Host validates attempt_id + execution_id
@@ -1464,6 +1525,7 @@ client requests cancel
 
 - `QUEUED` 且尚未创建 Attempt 的 Run 被取消时，直接进入 `CANCELLED`，不创建 Attempt。
 - `WAITING` Run 被取消时，Host 直接收口为 `CANCELLED`：append `CANCEL_REQUESTED`，标记 active wait record cancelled，append `RUN_CANCELLED`；外部 job 的实际取消属于 adapter best-effort 能力，不作为第一版保证。
+- `RUNNING` / Attempt `STARTING` / 其它需要等待 Attempt 收口的 active cancel 场景，必须 append `CANCEL_REQUESTED` + `RUN_CANCELLING`。`CANCEL_REQUESTED` 表达取消意图，`RUN_CANCELLING` 表达 Run 状态迁移。
 - terminal fact 已提交后，cancel 不能改写 terminal。
 - cancel 只阻止未来工作，不覆盖已接受事实。
 - 已接受 tool result、awaiting outcome、final decision、canonical facts 继续保留。
@@ -1472,6 +1534,7 @@ client requests cancel
 - 如果外部 job 在 Run 已 `CANCELLED` 后回调或被 poll 到结果，Host 必须拒绝其结果作为 `canonical_fact` 进入 EventLog，只能记录 diagnostic / tool trace。
 - cancel 控制消息最小携带 `run_id`、`attempt_id`、`execution_id`。
 - 未引入 watchdog 强化治理前，cancel 请求发出后如果 active Attempt 超时仍无法确认，旧 Attempt 进入 `LOST`；若 Run 可基于 durable facts 继续，Run 进入 `RECOVERING`，否则进入 `LOST`。
+- 同一 `(run_id, client_request_id)` cancel 重试必须返回既有结果，不重复 append `RUN_CANCELLING`。Run 已是 `CANCELLING` 时，新的不同 cancel 请求不能重复制造状态迁移；可按 policy 返回当前状态或记录 diagnostic。
 - 强制终止执行环境、后台 job reconcile、细粒度资源收口失败事实属于 cancel governance 扩展能力，不影响基础 Host 状态收口。
 
 Host ingest 顺序是分布式竞态排序真源。不得用物理时间重写该规则。
@@ -1595,6 +1658,7 @@ Conversation Memory
 - preview / reasoning / display-only facts 不进入 memory。
 - memory snapshot 是 read model，可重建、可修复，不是事实真源。
 - memory snapshot 与 projection checkpoint 必须同事务提交，或使用等价的 atomic commit marker；checkpoint 不得先于 snapshot 落库。
+- 如果 memory projection 不与 EventLog 位于同一 SQLite transaction，atomic commit marker 的最小语义是：snapshot content / artifact 必须先 durable 并可按 digest 校验，随后才能提交覆盖该 snapshot 的 checkpoint；checkpoint 提交失败时，projection 必须能从旧 checkpoint 继续重放；checkpoint 已提交但 snapshot 缺失或 digest mismatch 时，该 snapshot 不得被 RunInputBuilder 消费，必须从 EventLog 重建或进入结构化 recovery。
 - RunInputBuilder 消费 memory snapshot 时必须记录 snapshot cursor；后续 replay / audit 能解释当时看到的是哪一版 memory。
 - RunInputBuilder 消费 memory snapshot 前必须校验 snapshot cursor 覆盖本次构造 messages 所需的 EventLog cursor。若 snapshot 缺失或滞后，Host 必须从 EventLog canonical facts 重建所需 stable layer，或进入结构化 context governance / recovery；projection lag 不能改变同一 EventLog + policy 下的 messages。
 
@@ -1653,6 +1717,7 @@ compact 不变量：
 - compacted snapshot / summary 是 read model 或 input artifact；是否进入 memory projection 必须由 memory policy 决定。
 - RunInputBuilder 必须从 `USER_INPUT_ACCEPTED`、canonical facts、memory snapshot 和 compacted artifacts 重建完整 messages；不能复用失败 Attempt 的 provider request payload。
 - 新 Attempt 必须有新的 `attempt_id` / `execution_id`；旧 Attempt 不 takeover、不 resume。
+- compact 必须有 policy 上限。compaction 后仍超过 budget threshold 时，Host 必须按 policy 降级输入层或 append `CONTEXT_COMPACTION_FAILED` 并让 Run 进入 `FAILED` / `RECOVERING` / `LOST`；不得无限 compact retry。
 - tool trace / audit 必须能解释哪些内容被保留、压缩、丢弃，以及为什么这样做。
 
 参数默认值由 memory / context policy provider 定义。设计固定治理范围，policy 固定优先级和默认值。
@@ -1680,7 +1745,7 @@ Host 启动时必须执行 recovery scan：
 
 - `QUEUED` Run 保持 `QUEUED`，等待调度。
 - `WAITING` Run 保持 `WAITING`，等待 wait record resolution。
-- `RUNNING` / `CANCELLING` Run 的 active Attempt 若没有可确认的本进程 dispatch record 与可用执行通道，旧 Attempt 进入 `LOST`。
+- `RUNNING` / `CANCELLING` Run 的 active Attempt 只有在具备 positive orphan proof 时，才能进入 `LOST`。
 - 若 Run 的用户输入和必要 canonical facts durable accepted，Run 进入 `RECOVERING`。
 - 若必要 facts 缺失或 policy 放弃恢复，Run 进入 `LOST`。
 
@@ -1703,8 +1768,28 @@ Host startup
 - `QUEUED`：不触发 Engine dispatch；只等待 admission promotion。
 - `WAITING`：不创建 Attempt；只恢复 wait adapter observation。
 - `RUNNING` / `CANCELLING` 且存在当前 Host 可确认控制的 dispatch record：继续观察，不接管。
-- `RUNNING` / `CANCELLING` 且不存在当前 Host 可确认控制的 dispatch record：旧 Attempt -> `LOST`；Run 按 policy 与事实完整性进入 `RECOVERING` 或 `LOST`。
+- `RUNNING` / `CANCELLING` 且属于其它存活 Host instance：跳过 recovery，不 append `ATTEMPT_LOST`，不创建新 Attempt。
+- `RUNNING` / `CANCELLING` 且具备 positive orphan proof：通过 CAS 将旧 Attempt -> `LOST`；Run 按 policy 与事实完整性进入 `RECOVERING` 或 `LOST`。
+- `RUNNING` / `CANCELLING` 且只能判断 owner heartbeat stale，但无法证明 owner 进程已死：记录 suspect / diagnostic，跳过 recovery。
 - `RECOVERING`：继续按 recovery policy 创建新 Attempt，或因超过上限进入 `LOST`。
+
+多进程 recovery 不得把“当前进程不可确认控制”当作 orphan proof。一个 Host 进程无法控制另一个 Host 进程持有的 LocalProxy / RemoteProxy channel，并不表示该 Attempt 已丢失。
+
+positive orphan proof 第一版来自本机 Host 进程存活证据，而不是远端 lease。推荐最小机制：
+
+```text
+dispatch_record.owner_host_instance_id
+  -> host_instance durable row:
+       host_instance_id
+       pid
+       process_start_token / boot_id / create_time
+       heartbeat_at
+       status
+```
+
+orphan 判定必须同时证明 owner Host instance 已不可能继续治理该 Attempt，例如 pid 已不存在，或 pid 已复用但 process_start_token 不匹配，并且 heartbeat 已过期。`heartbeat_at` 单独不构成 orphan proof；进程卡顿、调试暂停或长时间阻塞不能导致其它 Host 进程误杀 active Attempt。`pid` 单独也不构成 orphan proof；pid 可能复用，必须配合 process_start_token / boot id / create time 等启动指纹。
+
+只有 positive orphan proof 成立后，才能 CAS `ATTEMPT_LOST` -> `RUN_RECOVERING` -> new Attempt。该机制不是重 lease / fencing：它不授予远端执行 ownership，不允许旧 Attempt takeover，只用于证明原 Host owner 是否已经不可能继续治理该 Attempt。
 
 ### 26.1 已接受 Prompt 的恢复语义
 
@@ -1722,19 +1807,20 @@ Host startup
 
 ```text
 USER_INPUT_ACCEPTED durable accepted
-  -> old RUNNING / CANCELLING Attempt marked LOST
+  -> old RUNNING / CANCELLING Attempt marked LOST only after positive orphan proof
   -> Run enters RECOVERING when recovery policy allows
   -> RunInputBuilder rebuilds complete AgentRunRequest.messages from EventLog
   -> Host creates new Attempt + new execution_id
   -> Host dispatches Engine again
   -> final_answer is accepted into EventLog / RunResult
-  -> Outbox delivers answer to UI / client
+  -> final answer is visible through Host event stream / read model
+  -> Outbox terminal delivery item can be derived for offline / external delivery
 ```
 
 不变量：
 
 - 用户 prompt 只有在 `USER_INPUT_ACCEPTED` 已提交后才具备恢复语义；若崩溃发生在 durable append 之前，Host 没有事实真源，不能凭空恢复这次输入。
-- Recovery 不恢复旧 Engine / Agent / Runner / provider request，也不接管旧远端 worker；旧 Attempt 只能进入 `LOST`。
+- Recovery 不恢复旧 Engine / Agent / Runner / provider request，也不接管旧远端 worker；旧 Attempt 只有在 positive orphan proof 成立后才能进入 `LOST`。
 - 新执行必须基于 EventLog canonical facts 重建完整 messages，并创建新 Attempt / 新 `execution_id`。
 - 用户不需要感知 Run / Attempt 细节；用户可见语义是“已提交 prompt 不丢，之后仍能收到 answer”。
 - 如果 recovery policy 放弃恢复、必要 facts 缺失、重复恢复超过限制或后续新 Attempt 失败，Run 应进入结构化 `FAILED` / `LOST`，不能伪造成功 answer。
@@ -1742,7 +1828,7 @@ USER_INPUT_ACCEPTED durable accepted
 attempt dispatch record 最小语义：
 
 ```text
-host_instance_id
+owner_host_instance_id
 run_id
 attempt_id
 execution_id
@@ -1752,9 +1838,9 @@ last_event_at?
 connection_state?
 ```
 
-dispatch record 不是 lease，也不是 fencing token。它只帮助 Host 判断“旧 Attempt 是否仍能被当前进程确认控制”。一旦无法确认，治理选择是标记旧 Attempt `LOST` 并基于 EventLog 创建新 Attempt，而不是接管旧执行。
+dispatch record 不是 lease，也不是 fencing token。它帮助 Host 识别本次 Attempt 的 owner Host instance、执行通道和诊断状态。当前进程不能确认控制该 dispatch record 时，只能说明当前进程不能接管；不能单独证明旧 Attempt 已丢失。
 
-`host_instance_id` 是 Host 进程启动时生成的本进程实例标识，只用于辅助判断 dispatch record 是否仍可由当前 Host 进程确认控制。它不是 lease、不是 fencing token、不是远端 owner。相同 `host_instance_id` 本身也不能授权 takeover；Host 仍必须能确认执行通道可用，否则旧 Attempt 进入 `LOST`。
+`host_instance_id` 是 Host 进程启动时生成的本进程实例标识，用于 host instance liveness record 与 dispatch record 关联。它不是 lease、不是 fencing token、不是远端 owner。相同 `host_instance_id` 本身也不能授权 takeover；positive orphan proof 只能证明原 owner 已不可能继续治理，不能允许接管旧 Attempt。
 
 Host graceful shutdown：
 
