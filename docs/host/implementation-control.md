@@ -81,6 +81,16 @@ phase discussion 至少需要确认：
 
 如果 discussion 发现 `docs/host/design.md` 对应章节不足以支撑直接写 plan，应先更新 `docs/host/design.md`，再进入该 phase 的 plan。
 
+## 仓库发布约定
+
+Host 设计与实施相关分支的 GitHub remote 名称为 `github`。提交后推送当前分支时使用：
+
+```bash
+git push -u github <branch>
+```
+
+不得假设 remote 名称为 `origin`。
+
 ## Slice 切分原则
 
 每个 phase 内的 implementation slices 在该 phase discussion / phase plan 阶段再具体确定；总控阶段不预先替各 phase 固定 slice。
