@@ -68,6 +68,9 @@ draft design checkpoint
 
 phase plan 不得从旧设计稿、旧代码路径或非真源文档推导架构边界。
 
+phase plan 文档必须放在 `docs/host/` 下；plan review、plan fix、plan re-review、implementation、code review、
+fix、code re-review 和总控裁决 artifact 放在 `docs/reviews/` 下。
+
 每个 phase 的第一步必须是和用户讨论并细化 `docs/host/design.md` 中的对应章节。该讨论属于 `$gateflow` 的 feature
 discussion / requirement clarification 阶段，必须在进入 plan gate 前完成。
 
