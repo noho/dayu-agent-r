@@ -45,7 +45,7 @@ implementation、review、fix 与 re-review 的项目级术语真源。包级 RE
 - `session slot`：外部入口复用当前 Session 的槽位，由 `(scope, slot_key)` 标识。WeChat 稳定身份、CLI `--label`、GUI 当前会话都可以映射到 slot。
 - `ensure_session`：Host 公共接口，表示“返回这个 slot 当前 Session，不存在则创建并绑定”。它按 `(scope, slot_key)` 幂等，不需要 `client_request_id`。
 - `create_session`：Host 公共接口，表示“明确创建一个新 Session”。它按 `client_request_id` 幂等；可选把新 Session 绑定到某个 session slot。
-- `purge_session`：Host 公共接口，表示“彻底清理一个已关闭且全部 Run 已终态的 Session 的 Host 本地数据”。它是 destructive purge，不是 close、cancel、archive、memory forget 或 UI hide；purge 后不再支持恢复、resume、retry、replay、timeline 补读或 final answer 找回。
+- `purge_session`：Host 公共接口，表示“彻底清理一个已关闭且全部 Run 已终态的 Session 的 Host 本地数据”。它是 destructive purge，不是 close、cancel、archive、memory forget 或 UI hide；purge 后不再支持恢复、resume、retry、replay、timeline 补读或 final answer 找回。purge 不删除已写入的 append-only audit JSONL；必须保留 purge tombstone，并让 audit 查询能识别源 EventLog facts 已被 purge。
 - `start_run`：Host 公共接口，表示显式创建一个新的独立 Run 目标。它不是聊天界面每次发送普通 prompt 的默认入口。
 - `submit_followup`：Host 公共接口，表示向同一 Session 提交一条会话延续输入。聊天界面的普通 prompt 入口应统一使用 `submit_followup`；`behavior=queue` 由 Host admission 在事务内决定排队或直接启动，`behavior=steer` 必须携带 `target_run_id` / expected active Run precondition。
 - `cancel_run`：Host 公共接口，表示取消指定 Run。它按 `(run_id, client_request_id)` 幂等；terminal 已提交时不能改写 terminal。
@@ -53,7 +53,7 @@ implementation、review、fix 与 re-review 的项目级术语真源。包级 RE
 - `Run` / `run`：用户可见的一次 Agent 目标 / 问题 / follow-up，属于一个 Session。一个 Session 可以包含多个 Run；Engine 只处理单次 `AgentRunRequest` 的执行语义。
 - `Attempt` / `attempt`：Host 为完成某个 Run 派发给本地或远程 EngineWorker 的一次执行。resume、steer、recovery 等同一 Run 内继续执行路径会创建新 Attempt；retry / replay 创建关联的新 Run，新 Run 再创建自己的 Attempt。任何路径都不复用旧 Agent / Runner / EngineWorker。
 - `retry_run` / `retry(run)`：公开 Host control API，由调用方主动发起，用于重新尝试完成一个失败或 policy 判定可重试的源 Run。Retry 创建关联的新 Run，不重开源 Run；新 Run 可以按 retry policy 使用工具，也可以复用源 Run 已 accepted 的工具事实。Retry 修的是执行失败或可恢复失败。
-- `replay_run` / `replay(run)`：公开 Host control API，由调用方主动发起，用于在源 Run 已 `SUCCEEDED` 但 final answer 格式、schema、结构或输出 envelope 脏时，基于源 Run 已 accepted 的事实创建关联新 Run 做 no-tool 结构修复。Replay 不重新查证、不重新执行工具、不修正事实内容；幻觉、事实错误、证据不足、归因错误不属于 replay 场景。Replay 修的是输出结构失败。
+- `replay_run` / `replay(run)`：公开 Host control API，由调用方主动发起，用于在源 Run 已 `SUCCEEDED` 但 final answer 格式、schema、结构或输出 envelope 脏时，基于源 Run 已 accepted 的事实创建关联新 Run 做 no-tool 结构修复。Replay 不重新查证、不重新执行工具、不修正事实内容；幻觉、事实错误、证据不足、归因错误不属于 replay 场景。Replay 修的是输出结构失败。主防线是 RunInputBuilder 不向 replay Attempt 暴露 tool schemas；ToolRuntime 拒绝 replay 中的 tool call 只是 defense-in-depth。
 - `Run status`：Host 管理的 Run 生命周期状态。当前设计集合为 `QUEUED`、`RUNNING`、`WAITING`、`CANCELLING`、`RECOVERING`、`SUCCEEDED`、`FAILED`、`CANCELLED`、`LOST`；其中 `SUCCEEDED`、`FAILED`、`CANCELLED`、`LOST` 是终态。`RUNNING` 表示 Run 已占用 Session active slot，并已有 active Attempt lifecycle，不要求 worker 已 accepted。
 - `Attempt status`：Host 管理的一次执行尝试状态。当前设计集合为 `STARTING`、`RUNNING`、`SUCCEEDED`、`FAILED`、`CANCELLED`、`SUSPENDED`、`STEERED`、`LOST`；Attempt 终态不等于 Run 必然终态。`STARTING` 表示 Host 已 durable 创建 dispatch intent，`RUNNING` 表示 worker 已接受执行。
 - `active Run`：同一 Session 内当前占用执行槽位的 Run。Host 设计语义是同一 Session 同时最多一个 active Run。
@@ -99,7 +99,7 @@ implementation、review、fix 与 re-review 的项目级术语真源。包级 RE
 - `WorkerProxy`：Host 到执行环境的适配边界。LocalProxy 与 RemoteProxy 只负责传输、启动、取消控制和事件回传，不拥有 Session / Run / Attempt / EventLog 真源。
 - `EngineWorker`：承载一次 Engine 执行的执行环境能力。EngineWorker 可以位于本机或远端；无论位置如何，它只执行并回传事件 / 结果，不 append EventLog、不关闭 attempt、不更新 Run 状态。
 - `RemoteStub`：远端执行环境中的代理端点，负责把 RemoteProxy 的请求转为 EngineWorker 执行并回传事件 / 结果。RemoteStub 不拥有 Host 治理状态。
-- `ToolBundle`：`dayu.contracts` 中已定义的工具声明集合，包含 `ToolDefinition` 元组，校验工具名唯一，并可投影为 Engine 可见的 `ToolSchema` 列表或 ToolRuntime 使用的 truncate specs。Host 的工具输入是外部传入的业务 `ToolBundle`；Host 不负责工具发现、模块扫描或注册生命周期。
+- `ToolBundle`：`dayu.contracts` 中已定义的工具声明集合，包含 `ToolDefinition` 元组，校验工具名唯一，并可投影为 Engine 可见的 `ToolSchema` 列表或 ToolRuntime 使用的 truncate specs。Host 的工具输入是外部传入的业务 `ToolBundle`；Host 不负责工具发现、模块扫描或注册生命周期。业务 `ToolBundle` 是 Host construction / composition root 的显式输入，不是普通 UI / Service per-run request payload。
 - `effective ToolBundle`：ToolRuntime factory 基于业务 `ToolBundle` 和启用的 framework tools 生成的 attempt-local runtime bundle。`fetch_more` 由 ToolRuntime factory 在启用 TruncationManager 时注入 effective ToolBundle，不要求外部业务 ToolBundle 提供。
 - `ToolRuntime`：Host-owned 工具治理模块，作为 `ToolExecutor` 提供给 EngineWorker / Engine。它消费 Host 传入的业务 `ToolBundle`，生成 attempt-local effective `ToolBundle`，负责 policy、awaiting、truncation / fetch_more、语义级重复调用治理、通过 `ToolTraceDiagnosticEmitter` 发出工具诊断，以及工具级幂等。ToolRuntime Host accept path 是工具事实 canonical 写入所有者；ToolRuntime 必须通过 Host accept barrier 让工具事实先被 Host durable accepted，收到 accepted ack 后才能把结果返回给 Engine。EngineEvent ingest 不能为同一工具 outcome 再写第二条工具 canonical fact。
 - `ToolTraceDiagnosticEmitter`：ToolRuntime 内部 typed interface，用于提交结构化工具诊断记录 / refs，供 tool trace projection 生成 hot JSON 与 cold JSONL。它不是 EventLog appender，不拥有 canonical fact，不写 audit，不直接写 trace 文件，也不更新 Run / Attempt 状态。
@@ -109,8 +109,8 @@ implementation、review、fix 与 re-review 的项目级术语真源。包级 RE
 - `truncation cursor`：被截断工具结果的续读句柄，标识从哪个结果、哪个位置继续读。进入 messages 或 EventLog 后，必须可由 Host-governed durable descriptor、artifact ref 或等价 snapshot 恢复；不能只存在于远端进程内存。
 - `scope_token`：`fetch_more` 使用的 opaque capability / scope binding，用来证明某次续读只允许访问对应工具结果的后续内容。它可以是持久化映射或可验证 token，但不能变成远端 ToolRuntime 的治理状态。
 - `fetch_more`：Host / ToolRuntime 内置 framework tool，用普通 `@tool` 方式暴露和执行，用于通过 `cursor` 与 `scope_token` 读取被截断结果的后续内容。它不能有 Host / Engine 特化分支。
-- `ToolAwaitingOutcome` / `wait record`：长事务或外部等待进入 Host 的边界。ToolRuntime 通过 Host accept path 提交 awaiting candidate；Host durable accepted 后持久化 wait record。Engine 只消费已 accepted 的 awaiting / suspended 语义 refs，并不拥有 wait record；Host 通过统一 `resolve_wait` pipeline 创建新 Attempt 继续。
-- `resolve_wait`：Host 内部 / adapter API。poll、callback、manual 等等待结果来源都必须走同一个 resolution pipeline，不能各自改 Run 状态。
+- `ToolAwaitingOutcome` / `wait record`：长事务或外部等待进入 Host 的边界。ToolRuntime 通过 Host accept path 提交 awaiting candidate；Host durable accepted 后同事务追加 `TOOL_AWAITING`、`RUN_WAITING`、`ATTEMPT_SUSPENDED`，持久化 wait record，并让 Run 进入 `WAITING`、Attempt 进入 `SUSPENDED`。Engine 只消费已 accepted 的 awaiting / suspended 语义 refs；Engine `tool_awaiting` / `run_suspended` 只能作为 preview / diagnostic / idempotent confirmation，不拥有 wait record 或 WAITING 状态迁移。Host 通过统一 `resolve_wait` pipeline 创建新 Attempt 继续。
+- `resolve_wait`：Host 的等待结果接收与治理入口，用于把 poll / callback / manual 带回来的长事务结果原子纳入 EventLog，并在通过校验后继续原 Run。它不是等待机制本身，不负责死等外部任务；结果未到时不应阻塞等待，应返回结构化错误或拒绝。它是短事务 command，最多只因 SQLite transaction / CAS / busy timeout 做短等待和重试。poll、callback、manual 等等待结果来源都必须走同一个 resolution pipeline，不能各自改 Run 状态。
 - `retry(run)`：调用方主动发起的函数式 Host 操作，用于 confirmed failure / recoverable failure。它不重开原终态 Run，而是创建一个关联的新 Run；新 Run 可以按 policy 复用旧 Run 已接受工具事实，并创建自己的 Attempt。
 - `replay(run)`：调用方主动发起的函数式 Host 操作，用于 final answer 的格式、schema、结构、输出 envelope 或引用格式违反输出 policy。它不重开原 `SUCCEEDED` Run；它创建一个关联的新 Run，默认复用旧 Run 已接受工具事实。replay 是 no-tool 结构修复调用，不重新执行工具，不新增工具事实。事实内容脏、幻觉、业务归因错误、证据不足或证据冲突不属于 replay 场景。
 - `RunInputBuilder`：Host 内部组件，负责从当前 `USER_INPUT_ACCEPTED` canonical fact、当前 Run 语义 facts、连续性所需历史 canonical EventLog facts、memory snapshot、Service 场景参数、tool schemas snapshot 和 policy config 构造新的 `AgentRunRequest.messages`。它不能从 UI 临时文本、request 临时字段或 Session timeline 旁路读取当前 prompt。

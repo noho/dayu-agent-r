@@ -136,7 +136,7 @@ CLOSED
 - `resolve_wait` 仍允许让已有 `WAITING` Run 继续收口。
 - `retry_run` / `replay_run` 默认拒绝在 closed Session 内创建关联新 Run，除非显式 policy 把新 Run 创建到其它 Session。
 
-已有 active Run 继续按 Host 状态机治理到终态；`WAITING` Run 保持 `WAITING`，后续 `resolve_wait` / resume 仍可继续；close 前已 durable accepted 的 `QUEUED` Run 继续保留，并可在 active slot 释放后 promotion。close 不等于 cancel；若调用方希望停止已有工作，必须显式调用 `cancel_run`。
+已有 active Run 继续按 Host 状态机治理到终态；close 前已 durable accepted 的非终态 Run 继续按原状态机完成。`QUEUED` Run 可在 active slot 释放后 promotion；`WAITING` Run 可在 `resolve_wait` 后 resume；`RECOVERING` Run 可继续 recovery dispatch；`RUNNING` / `CANCELLING` Run 继续收口到 terminal。close 不等于 cancel；若调用方希望停止已有工作，必须显式调用 `cancel_run` 或 `cancel_session_runs`。
 
 `clear_session` 不进入第一版普通公共接口。需要清理、遗忘或重置时，必须分别设计 close / new session / memory forget / purge 等有明确审计语义的接口。
 
@@ -154,7 +154,9 @@ CLOSED
 
 `purge_session` 删除范围包括该 Session 独占的 Host 本地数据：Session / slot binding、Run、Attempt、该 Session 的 EventLog rows、payload descriptors / local payloads、memory snapshot、projection rows、outbox items、tool trace hot data。共享 cold artifact 只有在没有其它 durable ref 引用时才允许被清理。
 
-`purge_session` 是第一版对 EventLog append-only retention 的唯一 destructive exception。它只能在严格前置条件成立后删除该 Session 的可恢复事实，并必须保留最小 purge tombstone / audit record。tombstone 至少包含 `session_id`、purge `client_request_id`、semantic request digest、actor / source / request refs、reason、purge timestamp、precondition digest、deleted counts / digest 和 tombstone id。purge tombstone 不是可恢复 Session fact，不参与 resume、retry、replay、memory 或 RunInputBuilder；它可以位于 purged Session EventLog 之外。
+`purge_session` 是第一版对 EventLog append-only retention 的唯一 destructive exception。它只能在严格前置条件成立后删除该 Session 的可恢复事实，并必须保留最小 purge tombstone / audit record。tombstone 至少包含 `session_id`、purge `client_request_id`、semantic request digest、actor / source / request refs、reason、purge timestamp、precondition digest、deleted counts / digest 和 tombstone id。purge tombstone 不是可恢复 Session fact，不参与 resume、retry、replay、memory 或 RunInputBuilder；它不能位于被 purge 的 Session EventLog 中，必须存入 Host durable store 中可按 `session_id` 查询的 tombstone table 或等价持久区域。
+
+`purge_session` 不删除已经写入的 append-only audit JSONL 记录。purge 必须写入 purge tombstone audit record；既有 audit JSONL 行可以保留对已删除 EventLog rows 的 refs，audit 查询 / analyze 工具必须能识别 purge tombstone，并报告源 EventLog facts 已被 purge。
 
 purge 后该 Session 不再支持 `get_session`、`get_run`、`stream_run_events`、`retry_run`、`replay_run` 或 final answer 恢复。读取接口应返回 `not_found` / `gone` 或 tombstone snapshot；具体错误形状属于 Public API phase。
 
@@ -365,19 +367,23 @@ Host 不允许先 dispatch EngineWorker 再补写用户输入事实。
 | queue promotion | Run `QUEUED` 且 Session 无 active Run | Run `RUNNING` / Attempt `STARTING` | `RUN_STARTED(start_reason=queue_promotion)`、`ATTEMPT_STARTED` | 创建新 Attempt；commit 后 dispatch |
 | Engine final answer | Run `RUNNING` / Attempt `RUNNING` | Run `SUCCEEDED` / Attempt `SUCCEEDED` | `RUN_SUCCEEDED`、`ATTEMPT_SUCCEEDED` | 关闭当前 Attempt |
 | Engine failure | Run `RUNNING` / Attempt `RUNNING` | Run `FAILED` / Attempt `FAILED`，或按 policy 进入 retry | `RUN_FAILED`、`ATTEMPT_FAILED` | 关闭当前 Attempt |
-| Engine suspended | Run `RUNNING` / Attempt `RUNNING` | Run `WAITING` / Attempt `SUSPENDED` | `TOOL_AWAITING`、`RUN_WAITING`、`ATTEMPT_SUSPENDED` | 关闭当前 Attempt，持久化 wait record |
+| context compaction proactive | Run accepted before Attempt creation / dispatch | Run `RUNNING` / Attempt `STARTING` after compact | `CONTEXT_COMPACTION_REQUESTED(trigger_source=proactive)`、`CONTEXT_COMPACTED`，随后 `RUN_STARTED`、`ATTEMPT_STARTED` | pre-dispatch input governance；不进入 `RECOVERING` |
+| context compaction reactive | Run `RUNNING` / Attempt `RUNNING` | Run `RECOVERING`，随后新 Attempt `STARTING` | `CONTEXT_COMPACTION_REQUESTED(trigger_source=reactive)`、current Attempt terminal by policy、`RUN_RECOVERING`、`CONTEXT_COMPACTED`、`RUN_STARTED(start_reason=recovery)`、`ATTEMPT_STARTED` | 关闭当前 Attempt；compact 后创建新 Attempt |
+| Tool awaiting accepted | Run `RUNNING` / Attempt `RUNNING` | Run `WAITING` / Attempt `SUSPENDED` | `TOOL_AWAITING`、`RUN_WAITING`、`ATTEMPT_SUSPENDED` | ToolRuntime Host accept transaction 关闭当前 Attempt，持久化 wait record |
 | `resolve_wait` | Run `WAITING` | Run `RUNNING` | `RESUME_REQUESTED`、tool terminal/result fact、`RUN_STARTED(start_reason=resume)`、`ATTEMPT_STARTED` | 创建新 Attempt 并 dispatch |
 | `submit_followup(steer)` on running | target Run 是当前 active Run，且状态为 `RUNNING` | 同一 Run `RUNNING` / new Attempt `STARTING` | `STEER_REQUESTED`、`ATTEMPT_STEERED`、`RUN_STARTED(start_reason=steer)`、`ATTEMPT_STARTED` | 运行中 Attempt 收口为 `STEERED`；创建新 Attempt；commit 后 dispatch |
 | `submit_followup(steer)` on waiting | target Run 是当前 active Run，且状态为 `WAITING` | 同一 Run `RUNNING` / new Attempt `STARTING` | `STEER_REQUESTED`、wait record cancelled with reason `steered`、`RUN_STARTED(start_reason=steer)`、`ATTEMPT_STARTED` | 旧 Attempt 保持 `SUSPENDED`；创建新 Attempt；commit 后 dispatch |
 | `cancel_run` on queued | Run `QUEUED` | Run `CANCELLED` | `CANCEL_REQUESTED`、`RUN_CANCELLED` | 无 |
 | `cancel_run` on waiting | Run `WAITING` | Run `CANCELLED` | `CANCEL_REQUESTED`、wait record cancelled fact、`RUN_CANCELLED` | 旧 Attempt 保持 `SUSPENDED`；不传播 cancel |
-| `cancel_run` on active running / starting | Run `RUNNING` / `CANCELLING` / `RECOVERING` | Run `CANCELLING`，后续 `CANCELLED` / `WAITING` / `RECOVERING` / `LOST` | `CANCEL_REQUESTED`、`RUN_CANCELLING`，后续 terminal fact | commit 后向当前 Attempt 传播 cancel |
+| `cancel_run` on recovering before dispatch | Run `RECOVERING` 且无新 Attempt dispatch committed | Run `CANCELLED` | `CANCEL_REQUESTED`、`RUN_CANCELLED` | 不创建新 Attempt；不进入 `CANCELLING` |
+| `cancel_run` on pre-dispatch starting | Run `RUNNING` / Attempt `STARTING` 且 dispatch record `pending` / `waiting_for_lane` | Run `CANCELLED` / Attempt `CANCELLED` | `CANCEL_REQUESTED`、`ATTEMPT_CANCELLED`、`RUN_CANCELLED` | 标记 dispatch record cancelled；cancel lane wait；不通知 WorkerProxy |
+| `cancel_run` on dispatching / active running | Run `RUNNING` / `CANCELLING` 且 dispatch record `dispatching` 或 Attempt `RUNNING` | Run `CANCELLING`，后续 `CANCELLED` / `WAITING` / `LOST` | `CANCEL_REQUESTED`、`RUN_CANCELLING`，后续 terminal fact | commit 后向当前 Attempt / WorkerProxy 传播 cancel |
 | `retry(run)` | Run `FAILED` 或 recoverable failure | 关联的新 Run `QUEUED` 或 `RUNNING` | `RETRY_REQUESTED`、新 Run 的 `RUN_ACCEPTED`，按 admission 追加 `RUN_QUEUED` 或 `RUN_STARTED(start_reason=initial)` / `ATTEMPT_STARTED` | 原 Run 终态不改；新 Run 创建自己的 Attempt |
 | `replay(run)` | Run `SUCCEEDED`，且 final answer 格式 / schema / 结构需修复 | 关联的新 Run `QUEUED` 或 `RUNNING` | `REPLAY_REQUESTED`、新 Run 的 `RUN_ACCEPTED`，按 admission 追加 `RUN_QUEUED` 或 `RUN_STARTED(start_reason=initial)` / `ATTEMPT_STARTED` | 原 Run 终态不改；新 Run 默认复用已接受工具事实 |
 | recovery scan | Run `RUNNING` / `CANCELLING` 且 active Attempt 不可确认 | Run `RECOVERING` 或 `LOST` | `ATTEMPT_LOST`、`RUN_RECOVERING` 或 `RUN_LOST` | 不 takeover |
 | recovery dispatch | Run `RECOVERING` 且可重建 messages | Run `RUNNING` / Attempt `STARTING` | `RUN_STARTED(start_reason=recovery)`、`ATTEMPT_STARTED` | 创建新 Attempt；commit 后 dispatch |
 
-`RUN_STARTED` 表示 Run 进入 active Attempt lifecycle。它必须携带 `start_reason`，第一版枚举为 `initial`、`queue_promotion`、`resume`、`steer`、`recovery`。不得用新增的 `RUN_RESUMED` / `RUN_RECOVERED` event 表达同一治理事实。
+`RUN_STARTED` 表示 Run 进入 active Attempt lifecycle。它必须携带 `start_reason`，第一版枚举为 `initial`、`queue_promotion`、`resume`、`steer`、`recovery`。`start_reason=recovery` 覆盖 crash recovery 和 reactive context compaction recovery；具体原因通过关联的 `ATTEMPT_LOST`、`CONTEXT_COMPACTION_REQUESTED` 或 policy refs 区分。不得用新增的 `RUN_RESUMED` / `RUN_RECOVERED` event 表达同一治理事实。
 
 `RECOVERING` 的退出必须收敛：
 
@@ -419,6 +425,7 @@ cancel / resolve / promotion 竞态规则：
 - cancel-first 场景下，迟到 `TOOL_AWAITING` / `run_suspended` 只能进入 diagnostic / tool trace 或被拒绝为 canonical fact；Host 不创建 active wait record，并将 Attempt / Run 按取消路径收口到 `CANCELLED`。
 - `cancel_run` 与 `resolve_wait` 并发时，先提交事务者赢。cancel 先到则迟到 `resolve_wait` 不得写入 canonical tool result；resolve 先到则 cancel 按最新 Run 状态继续处理。
 - `cancel_run` 与 queue promotion 并发时，CAS first-committer-wins，输方必须重新读取 Run 状态并按最新状态处理。
+- durable accepted 的 `CANCEL_REQUESTED` 在 terminal fact 之前胜出时，后续 recovery 不得继续用户目标。已取消的 lost Attempt 应按 policy 收口到 `CANCELLED` 或 `LOST`，不得创建新的正常执行 Attempt。
 
 ## 10. Durable Store
 
@@ -505,6 +512,7 @@ command path 不直接运行慢 projection、outbox projection、tool trace 写�
 - Host 运行参数可以有默认值，但默认值只能在 Host composition root 构造时应用。
 - 所有影响持久化、执行、恢复、投影、工具治理或外部通信的运行参数，都必须有显式接口可由调用方传入；不得只能通过模块级全局变量、隐式单例、环境变量或硬编码路径取得。
 - EventLog / durable store 所在数据库、payload / artifact 目录、projection / outbox 存储位置、worker target、policy provider、clock、id generator、truncation / context budget policy 都属于可注入运行参数。
+- 外部业务 `ToolBundle` 是 Host construction / composition root 的显式输入参数。Host handle 必须记录 tool bundle digest、schema digest 和 source refs，用于 Attempt snapshot、audit 和 diagnostic 解释。
 - Host 公共操作函数不接收零散全局配置；它们接收已构造好的 Host handle。Host handle 的构造函数或工厂函数必须暴露 typed options / request，用于传入上述运行参数。
 - 默认参数必须能被显式传入值完全覆盖；覆盖后的值必须进入 Host snapshot / diagnostic / audit 所需的可解释 refs，便于排查不同入口或进程使用的运行配置。
 
@@ -726,7 +734,7 @@ Run 接口语义：
 - `submit_followup`：接受同一 Session 的会话延续输入。聊天界面的普通 prompt 入口应统一使用该接口，不应由调用方先读 active Run 再在 `start_run` / `submit_followup` 之间选择。`behavior=queue` 由 Host admission 在同一事务内决定排队或直接启动；`behavior=steer` 必须命中 `target_run_id` 所指的当前 active Run 并切换 Attempt。
 - `retry_run`：公开 Host control API，由调用方主动发起；函数式语义为 `retry(run)`。它在 confirmed failure / recoverable failure 后创建关联的新 Run。原 Run 保持终态不可变；新 Run 可以按 retry policy 复用旧 Run 已接受工具事实，并创建自己的 Attempt。
 - `replay_run`：公开 Host control API，由调用方主动发起；函数式语义为 `replay(run)`。它只用于 final answer 格式、schema、结构或输出 envelope 失败时创建关联的新 Run。原 `SUCCEEDED` Run 不重开；新 Run 默认复用旧 Run 已接受工具事实，并以 no-tool messages 调用做结构修复。事实内容脏、幻觉、业务归因错误、证据不足或证据冲突不属于 replay 场景。
-- `resolve_wait`：wait adapter / manual admin 的统一入口；关闭 wait record，append tool terminal/result fact，并创建新 Attempt resume。
+- `resolve_wait`：等待结果接收与治理入口；接收 poll / callback / manual 已取得的结果，关闭 wait record，append tool terminal/result fact，并创建新 Attempt resume。它不负责等待外部长事务完成。
 
 第一版公共 API 不暴露开放式 policy knobs。Host policy 可以有默认值，但 request 不能携带无结构 `policy_overrides`。`CancelRunRequest.mode` 第一版唯一值为 `graceful`；不支持 `force` / `immediate`。`retry_run` 是否复用 accepted tool facts、重试次数和退避由 Host retry policy 决定。`replay_run` 固定复用源 Run accepted tool facts / evidence anchors，固定 no tools，固定只做结构修复。
 
@@ -1013,9 +1021,9 @@ canonical event contract 必须转成 typed dataclass / enum / validation tests�
 | `TOOL_CALL_REQUESTED` | `session_id`、`run_id`、`attempt_id`、`execution_id` | tool_call_id / tool name / normalized args digest | 记录工具调用 intent | accepted into model history 时 resume 消费 | audit 是 / tool trace 是 |
 | `TOOL_CALL_GOVERNED` | `session_id`、`run_id`、`attempt_id`、`execution_id` | policy decision / duplicate key / action | 不直接改 Run；可触发 guidance / hard stop | action 影响模型继续时进入 messages | audit 是 / tool trace 是 |
 | `TOOL_RESULT_ACCEPTED` / `TOOL_TERMINAL_RESULT` | `session_id`、`run_id`、`attempt_id`、`execution_id` | result ref / digest / evidence anchors / status | 记录工具事实 | resume 是 / memory 工具事实 | audit 是 / tool trace 是 |
-| `TOOL_AWAITING` | `session_id`、`run_id`、`attempt_id`、`execution_id` | wait_id / await_spec / external_job_id | 创建 wait record；Run -> `WAITING` | resume 是 | audit 是 / tool trace 是 |
+| `TOOL_AWAITING` | `session_id`、`run_id`、`attempt_id`、`execution_id` | wait_id / await_spec / external_job_id | 与 `RUN_WAITING`、`ATTEMPT_SUSPENDED` 同事务创建 wait record；Run -> `WAITING`；Attempt -> `SUSPENDED` | resume 是 | audit 是 / tool trace 是 |
 | `GUIDANCE_INSERTED` | `session_id`、`run_id` | guidance text / source policy / reason | 不直接改 terminal；影响下一 Attempt messages | 插入 messages 时 resume 消费 | audit yes / Host event stream emit |
-| `CONTEXT_COMPACTION_REQUESTED` | `session_id`、`run_id`、`attempt_id?`、`execution_id?` | trigger source / budget reason / provider error refs / snapshot refs | 触发 context governance；reactive path 可关闭当前 Attempt 并让 Run -> `RECOVERING` | resume 是；memory projection 按需消费 | audit yes / trace 是 |
+| `CONTEXT_COMPACTION_REQUESTED` | `session_id`、`run_id`；`trigger_source=reactive` 时必须有 `attempt_id`、`execution_id`；`trigger_source=proactive` 时可以没有 | trigger source / budget reason / provider error refs / snapshot refs | 触发 context governance；proactive path 是 pre-dispatch input governance；reactive path 可关闭当前 Attempt 并让 Run -> `RECOVERING` | resume 是；memory projection 按需消费 | audit yes / trace 是 |
 | `CONTEXT_COMPACTED` / `CONTEXT_COMPACTION_FAILED` | `session_id`、`run_id` | compact snapshot refs / preserved fact refs / dropped reason / quality check / failure reason | compacted 后允许创建新 Attempt；failed 后按 policy 失败或保持 recoverable | resume 是；memory projection 消费 compacted snapshot | audit yes / trace 是 |
 | `PROVIDER_PROTOCOL_ERROR` | `session_id`、`run_id`、`attempt_id`、`execution_id` | provider / error code / request ref | Attempt failure or retry input | retry 需要时 resume 消费 | audit yes / Host event stream emit |
 
@@ -1049,15 +1057,15 @@ tool_call_delta                -> preview
 tool_calls_batch_ready         -> preview or diagnostic
 tool_call_requested            -> TOOL_CALL_REQUESTED
 ToolRuntime policy decision     -> TOOL_CALL_GOVERNED when decision affects execution / guidance / audit / duplicate handling
-tool_result_accepted           -> preview / diagnostic / no-op with accepted refs; not canonical owner
+tool_result_accepted           -> preview / diagnostic / idempotent confirmation with accepted refs; not canonical owner
 tool_calls_batch_done          -> preview or diagnostic
-tool_awaiting                  -> preview / diagnostic / no-op with accepted refs; not canonical owner
-context_compaction_requested   -> CONTEXT_COMPACTION_REQUESTED
+tool_awaiting                  -> preview / diagnostic / idempotent confirmation with accepted refs; not canonical owner
+context_compaction_requested   -> CONTEXT_COMPACTION_REQUESTED(trigger_source=reactive); must include attempt_id + execution_id
 usage_reported                 -> usage projection input; canonical only if needed for audit policy
 provider_protocol_error        -> PROVIDER_PROTOCOL_ERROR
 iteration_completed            -> preview or diagnostic
 final_answer                   -> RUN_SUCCEEDED + ATTEMPT_SUCCEEDED
-run_suspended                  -> RUN_WAITING + ATTEMPT_SUSPENDED
+run_suspended                  -> preview / diagnostic / idempotent confirmation with accepted refs; not canonical owner
 run_cancelled                  -> RUN_CANCELLED + ATTEMPT_CANCELLED
 run_failed                     -> ATTEMPT_FAILED + (RUN_FAILED or RUN_RECOVERING by Host policy); context_compaction_required 在可恢复时进入 RUN_RECOVERING + new Attempt
 ```
@@ -1185,6 +1193,8 @@ Audit 重点记录治理动作和责任链：
 - payload ref / digest
 
 `LogAuditSink` 不写大 payload，不复制 tool trace 冷数据。工具执行细节、证据锚点、截断、等待、provider request id 等深诊断信息属于 tool trace；audit 只记录可关联 ref / digest。audit 与 tool trace 必须都能通过 operation context 回答“这是什么业务的什么操作产生的记录”。
+
+`purge_session` 不删除已经写入的 append-only audit JSONL 记录。purge 必须产生 purge tombstone audit record；既有 audit 行可以保留对已 purge EventLog rows 的 refs。audit 查询 / analyze 工具必须能识别 purge tombstone，并提示对应 Session 的源 EventLog facts 已被 purge。
 
 audit projection 可以为了查询重组，但不能反向成为恢复、resume 或 memory 真源。
 
@@ -1356,6 +1366,18 @@ EngineEvent stream EOF / error / transport close / worker crash
 
 该规则不是 lease / fencing 系统，也不保证 exactly-once 远程物理执行。它只是 Host 对自己执行流异常终止的本地治理；旧远端 worker 后续迟到事件仍按 `execution_id` 拒绝进入 canonical facts。
 
+dispatch record 已进入 `dispatching` 后，如果 WorkerProxy 调用失败、worker reject 或 startup timeout：
+
+```text
+dispatch record = dispatching
+  -> release lane token
+  -> append dispatch diagnostic
+  -> Attempt -> FAILED or LOST by failure type
+  -> Run -> FAILED / RECOVERING / LOST by Host policy and recoverability
+```
+
+Host recovery scan 遇到 `dispatch record = dispatching` 且 Attempt 仍为 `STARTING` 时，必须具备 positive orphan proof 才能把该 Attempt 标为 `LOST`。随后 Run 按 recovery policy 进入 `RECOVERING` 或 `LOST`。`dispatching` / `dispatcher_instance_id` 不授权 takeover，也不允许旧 Attempt 继续拥有 Host 状态。
+
 attempt snapshot 至少包含：
 
 - `session_id`、`run_id`、`attempt_id`、`execution_id`。
@@ -1389,7 +1411,9 @@ Host 的工具输入是公共契约 `ToolBundle`：
 tool declaration / external tool registration module
   -> ToolDefinition
   -> ToolBundle
-  -> Host receives ToolBundle as explicit parameter
+  -> create_host(..., tool_bundle=business_tool_bundle, ...)
+  -> Host receives business ToolBundle as explicit construction parameter
+  -> Host stores tool_bundle_digest / schema_digest / source refs in runtime snapshot
   -> Host creates attempt-local tool snapshot refs / digest
   -> ToolRuntime factory receives business ToolBundle
   -> ToolRuntime factory injects enabled framework tools
@@ -1412,6 +1436,10 @@ Host 对传入的业务 `ToolBundle` 只做治理所需的防御性校验和派�
 attempt-local snapshot 必须冻结本次 Attempt 使用的业务 `ToolBundle` 派生 refs。工具目录变化不能静默影响已创建 Attempt。
 
 `fetch_more` 不由外部业务 `ToolBundle` 提供。ToolRuntime factory 根据是否启用 TruncationManager 注入 framework tool，生成 attempt-local effective `ToolBundle`。RunInputBuilder 向 Engine 提供的 `tool_schemas` 和 ToolRuntime 执行使用的 callable binding 必须来自同一个 effective `ToolBundle`。`fetch_more` 仍走普通 tool dispatch / policy / accept barrier，不允许 Host 或 Engine 为它写特化分支。
+
+Start / follow-up request 默认不携带 raw `ToolBundle`，因为 `ToolBundle` 包含 callable binding，不是普通 UI / Service request payload。Host construction / composition root 是业务 `ToolBundle` 的默认输入边界。若未来支持多 scene tool profile，Service 可以通过 typed `tool_profile_ref` 或独立 Host handle 选择工具集合；该扩展必须冻结到 Attempt snapshot，不能塞进无结构 metadata。
+
+Retry / resume 默认复用源 Run / Attempt 已接受的 tool snapshot refs；policy 若要为关联新 Run 选择新的 tool snapshot，必须显式记录 source relation、new snapshot refs 与 policy decision。Replay 即使存在 effective `ToolBundle`，也不向模型暴露 tool schemas。
 
 ### 18.2 ToolRuntime Boundary
 
@@ -1590,14 +1618,21 @@ Host / ToolRuntime registers built-in @tool("fetch_more", ...)
 ```text
 ToolExecutor returns ToolAwaitingOutcome(await_spec, snapshot)
   -> ToolRuntime submits awaiting candidate to Host accept path
+  -> Host transaction validates attempt identity and current dispatch state
   -> Host appends TOOL_AWAITING
+  -> Host appends RUN_WAITING
+  -> Host appends ATTEMPT_SUSPENDED
+  -> Host creates active wait record
+  -> Host updates Run.status = WAITING
+  -> Host closes Attempt.status = SUSPENDED
   -> Host returns accepted ack / event refs
   -> Engine may emit tool_awaiting with accepted refs for diagnostic / preview
-  -> Engine emits run_suspended
-  -> Host closes Attempt as SUSPENDED
-  -> Host marks Run WAITING
-  -> Host persists wait record
+  -> Engine may emit run_suspended with accepted refs for diagnostic / preview
 ```
+
+ToolRuntime Host accept path 是 awaiting canonical owner。Engine `tool_awaiting` / `run_suspended` 不能创建 wait record，不能把 Run 推入 `WAITING`，不能关闭 Attempt，也不能追加第二份 awaiting canonical facts。它们只能携带 accepted refs，作为 preview、diagnostic 或 idempotent confirmation。
+
+如果 accepted ack 丢失，ToolRuntime 必须用同一个 accept idempotency key 重试，Host 返回既有 accepted refs。即使 Engine 后续 `tool_awaiting` / `run_suspended` 事件丢失，Host durable state 也已经完整；迟到 EngineEvent 只能 diagnostic / idempotent confirmation。
 
 wait record 最小语义：
 
@@ -1630,17 +1665,21 @@ Resume 策略分层：
 wait signal source
   -> poll | callback | manual
   -> common Host resolve_wait pipeline
+  -> append RESUME_REQUESTED
   -> append tool terminal/result fact
+  -> append RUN_STARTED(start_reason=resume)
   -> create new Attempt
   -> rebuild messages
   -> resume Run
 ```
 
-`poll`、`callback`、`manual` 只是等待结果进入 Host 的 adapter。稳定核心是 Host 内部统一的：
+`poll`、`callback`、`manual` 只是发现等待结果已经到达的 adapter。稳定核心是 Host 内部统一的等待结果接收与治理入口：
 
 ```text
 resolve_wait(wait_id, outcome, source, idempotency_key)
 ```
+
+`resolve_wait` 不等待外部长事务完成，也不死等业务结果。结果未到时，poll adapter / callback endpoint / manual operator 不应调用它，或调用后得到结构化拒绝，例如 `outcome_not_ready`、`invalid_state`、`wait_not_found`。`resolve_wait` 本身是短事务 command，最多只因 SQLite transaction、CAS 或 busy timeout 做短等待和重试。
 
 resume policy 覆盖 internal / manual、poll、callback 三类入口。所有入口都必须走同一个 `resolve_wait` pipeline，不能各自更新 Run / Attempt / EventLog。
 
@@ -1649,7 +1688,7 @@ resume policy 覆盖 internal / manual、poll、callback 三类入口。所有�
 - 如果工具启动外部 job，必须返回稳定 `external_job_id` 或等价 ref。
 - 外部副作用必须先有工具级 idempotency key，再启动外部 job。
 - wait record 是 Host durable 状态，不是 remote worker 状态。
-- job 完成后，Host append `RESUME_REQUESTED`、tool terminal / result canonical fact、`RUN_STARTED(start_reason=resume)`，再创建新 Attempt resume。
+- job 完成后，`resolve_wait` append `RESUME_REQUESTED`、tool terminal / result canonical fact、`RUN_STARTED(start_reason=resume)`、new Attempt row、`ATTEMPT_STARTED` 与 dispatch record，再 resume。
 - 如果 job 状态无法确认，应进入 structured failed / lost。
 - Engine 不读取 wait record，也不恢复旧 Agent / Runner。
 - Host recovery scan 遇到 `WAITING` Run 时不得创建新 Attempt；它只能恢复 wait record 的 adapter 状态。
@@ -1658,9 +1697,10 @@ resume policy 覆盖 internal / manual、poll、callback 三类入口。所有�
 - `callback` 入口必须验证认证、重放防护和 idempotency key，然后调用同一个 `resolve_wait`。
 - `manual` resolve 只能由受控入口触发，并必须写 audit projection。
 - wait poller 是 background runtime 中的 trigger / adapter。它观察 wait record 与外部 job，但只能通过 `resolve_wait` command path 提交结果；不得持有 EventLog appender，不得直接更新 Run / Attempt / wait record terminal state。
-- wait record resolution 与 `RESUME_REQUESTED`、tool terminal/result fact、`RUN_STARTED(start_reason=resume)`、new Attempt 创建必须在同一事务或等价原子流程中收口。
+- wait record resolution 与 `RESUME_REQUESTED`、tool terminal/result fact、`RUN_STARTED(start_reason=resume)`、new Attempt row、`ATTEMPT_STARTED`、dispatch record 创建必须在同一事务或等价原子流程中收口。
 - `resolve_wait` 幂等范围是 `(wait_id, idempotency_key)`。
-- 同一幂等键 + 同一 outcome 重试时，Host 返回既有 accepted resolution result，不追加第二份 canonical fact。
+- `resolve_wait` 幂等判断只基于 committed durable state；如果事务未 commit，重试应重新执行完整 resolution chain。
+- 同一幂等键 + 同一 outcome 重试时，Host 返回既有 RunSnapshot / Attempt refs，不追加第二份 canonical fact，不创建第二个 Attempt。
 - 同一幂等键 + 不同 outcome 必须返回 `idempotency_conflict`。
 - 已 `resolved` 的 wait record 只允许幂等重放既有结果，不允许第二次 resolution。
 - 非 `waiting` 状态的 wait record 不得被新的 resolution 改写；`cancelled` / `lost` 的迟到结果只能进入 diagnostic / tool trace。
@@ -1671,16 +1711,20 @@ resume policy 覆盖 internal / manual、poll、callback 三类入口。所有�
 
 `suspend`、`resume`、`retry`、`replay` 是不同语义。
 
-Suspend：
+Suspend / Awaiting：
 
 ```text
-EngineWorker / Engine emits suspended fact
+ToolRuntime receives ToolAwaitingOutcome
+  -> ToolRuntime submits awaiting candidate to Host accept path
   -> Host validates attempt_id + execution_id
   -> Host appends TOOL_AWAITING / RUN_WAITING / ATTEMPT_SUSPENDED
   -> Host closes current Attempt as SUSPENDED
   -> Host updates Run to WAITING
   -> Host persists wait record
+  -> Engine may emit tool_awaiting / run_suspended with accepted refs as diagnostic confirmation
 ```
+
+Engine `tool_awaiting` / `run_suspended` 不拥有 Host waiting 状态迁移；它们不能创建 wait record、不能关闭 Attempt、不能更新 Run。
 
 Resume：
 
@@ -1715,7 +1759,7 @@ Replay：
 - Replay 不重开原 `SUCCEEDED` Run；旧 final answer 保留为历史 assistant conclusion / rejected candidate，不是 verified fact。
 - Replay 创建关联的新 Run，新 Run 再创建自己的 Attempt 和 `execution_id`。
 - Replay 通过 EventLog 重建 messages，复用源 Run accepted tool facts / tool messages / evidence anchors。
-- Replay 是 no-tool `AgentRunRequest.messages` 结构修复调用，不重新执行工具，不新增工具事实。
+- Replay 是 no-tool `AgentRunRequest.messages` 结构修复调用，不重新执行工具，不新增工具事实。主防线在 RunInputBuilder：replay Attempt 构造 `AgentRunRequest` 时不暴露 tool schemas，模型不应获得可调用工具。ToolRuntime 的 replay policy 拒绝只是 defense-in-depth。
 - 源 Run 的 final answer 不作为普通 assistant conclusion 注入新 Run；它只能作为 `rejected_candidate` / repair context 与 validation errors / repair instruction 一起进入 messages。
 - replay messages 必须约束模型只做结构修复，不引入新事实，不调用工具，不改变 evidence anchors。
 - 如果 replay 执行期间模型仍发起 tool call，Host / ToolRuntime 必须按 replay policy 拒绝；默认治理动作是 hard stop 或 governed tool error，并记录 diagnostic / tool trace。不得把该 tool call 当作普通工具执行。
@@ -1744,9 +1788,11 @@ Retry / Replay 默认前置条件：
 client requests cancel
   -> Host appends CANCEL_REQUESTED
   -> if Run is QUEUED: Run -> CANCELLED
-  -> if Run has active Attempt: Host appends RUN_CANCELLING and Run -> CANCELLING
+  -> if Run is RECOVERING before new dispatch: Run -> CANCELLED
+  -> if Attempt STARTING and dispatch record pending / waiting_for_lane: Attempt -> CANCELLED and Run -> CANCELLED
+  -> if dispatching or active Attempt running: Host appends RUN_CANCELLING and Run -> CANCELLING
   -> commit
-  -> Host sends cancel through LocalProxy / RemoteProxy after commit
+  -> Host sends cancel through LocalProxy / RemoteProxy after commit only when dispatching / active worker exists
   -> EngineWorker maps cancel to run-local cancellation token
   -> Engine emits run_cancelled when cancellation wins execution boundary
   -> Host validates attempt_id + execution_id
@@ -1757,14 +1803,16 @@ client requests cancel
 
 - `QUEUED` 且尚未创建 Attempt 的 Run 被取消时，直接进入 `CANCELLED`，不创建 Attempt。
 - `WAITING` Run 被取消时，Host 直接收口为 `CANCELLED`：append `CANCEL_REQUESTED`，标记 active wait record cancelled，append `RUN_CANCELLED`；外部 job 的实际取消属于 adapter best-effort 能力，不作为第一版保证。
-- `RUNNING` / Attempt `STARTING` / 其它需要等待 Attempt 收口的 active cancel 场景，必须 append `CANCEL_REQUESTED` + `RUN_CANCELLING`。`CANCEL_REQUESTED` 表达取消意图，`RUN_CANCELLING` 表达 Run 状态迁移。
+- `RECOVERING` 且新 Attempt 尚未 dispatch committed 时直接进入 `CANCELLED`；不创建新 Attempt，不进入 `CANCELLING`。
+- Attempt `STARTING` 且 dispatch record 仍为 `pending` / `waiting_for_lane` 时直接收口：append `CANCEL_REQUESTED`、`ATTEMPT_CANCELLED`、`RUN_CANCELLED`，标记 dispatch record cancelled，cancel lane wait / wake dispatch scheduler，释放 active slot 并触发 queue promotion check；不通知 EngineWorker。
+- dispatch record 已进入 `dispatching` 或 Attempt 已 `RUNNING` 时，必须 append `CANCEL_REQUESTED` + `RUN_CANCELLING` 并向 WorkerProxy 传播 cancel。`CANCEL_REQUESTED` 表达取消意图，`RUN_CANCELLING` 表达 Run 状态迁移。
 - terminal fact 已提交后，cancel 不能改写 terminal。
 - cancel 只阻止未来工作，不覆盖已接受事实。
 - 已接受 tool result、awaiting outcome、final decision、canonical facts 继续保留。
 - cancel 与 suspend 同时发生时，由 Host ingest 事务提交顺序决定。suspend / awaiting 已 canonical accepted 后，late cancel 不覆盖它，后续走 `WAITING -> CANCELLED`；cancel 已提交后，late suspend / awaiting candidate 不得把 Run 推入 `WAITING`，只能进入 diagnostic / tool trace 或被拒绝为 canonical fact。
 - 如果外部 job 在 Run 已 `CANCELLED` 后回调或被 poll 到结果，Host 必须拒绝其结果作为 `canonical_fact` 进入 EventLog，只能记录 diagnostic / tool trace。
 - cancel 控制消息最小携带 `run_id`、`attempt_id`、`execution_id`。
-- 未引入 watchdog 强化治理前，cancel 请求发出后如果 active Attempt 超时仍无法确认，旧 Attempt 进入 `LOST`；若 Run 可基于 durable facts 继续，Run 进入 `RECOVERING`，否则进入 `LOST`。
+- 未引入 watchdog 强化治理前，cancel 请求发出后如果 active Attempt 超时仍无法确认，旧 Attempt 进入 `LOST`；若 `CANCEL_REQUESTED` 已 durable accepted 且 terminal fact 未抢先提交，Host 不得继续用户目标，Run 应按 policy 收口到 `CANCELLED` 或 `LOST`，不得创建新的正常执行 Attempt。
 - 同一 `(run_id, client_request_id)` cancel 重试必须返回既有结果，不重复 append `RUN_CANCELLING`。Run 已是 `CANCELLING` 时，新的不同 cancel 请求不能重复制造状态迁移；可按 policy 返回当前状态或记录 diagnostic。
 - 强制终止执行环境、后台 job reconcile、细粒度资源收口失败事实属于 cancel governance 扩展能力，不影响基础 Host 状态收口。
 
@@ -1910,7 +1958,14 @@ Conversation Memory
 - 第一版 memory snapshot 与 projection checkpoint 使用同一 SQLite durable store transaction 提交；checkpoint 不得先于 snapshot 落库。
 - 跨存储 atomic commit marker 不进入第一版默认实现，只作为后续 memory storage split 能力。
 - RunInputBuilder 消费 memory snapshot 时必须记录 snapshot cursor；后续 replay / audit 能解释当时看到的是哪一版 memory。
-- RunInputBuilder 消费 memory snapshot 前必须校验 snapshot cursor 覆盖本次构造 messages 所需的 EventLog cursor。若 snapshot 缺失或滞后，Host 必须从 EventLog canonical facts 重建所需 stable layer，或进入结构化 context governance / recovery；projection lag 不能改变同一 EventLog + policy 下的 messages。
+- RunInputBuilder 消费 memory snapshot 前必须校验 snapshot cursor 覆盖本次构造 messages 所需的 EventLog cursor。projection lag 不能改变同一 EventLog + policy 下的 messages。
+
+memory snapshot 缺失或滞后的处理：
+
+- snapshot cursor 滞后但 EventLog delta 在 policy 阈值内时，RunInputBuilder 可以从 EventLog canonical facts 重建所需 stable layer，并记录 diagnostic / trace。
+- snapshot 缺失、损坏或 lag 超过 policy 阈值时，Host 进入结构化 context governance / projection repair path；这不是 Run crash recovery。
+- memory projection lag 不得触发 Run 状态迁移，不得把 Run 推入 `RECOVERING`。
+- 重建后的 snapshot checkpoint 不得先于 durable snapshot content 落库。
 
 ## 25. Context Governance
 
@@ -1940,19 +1995,31 @@ context compaction 有两类触发来源：
 - proactive trigger：Host / RunInputBuilder 在 dispatch Attempt 前根据 provider-aware budget、tool facts、memory snapshot、当前用户输入和场景参数判断下一次 provider call 可能超过 policy 阈值。
 - reactive trigger：Engine 在 Runner 报告 context length exceeded 后 emit `context_compaction_requested` EngineEvent，并以 recoverable `run_failed(context_compaction_required)` 收口本次 Engine run。
 
-无论触发来源如何，compact 都是 Host governance，不是 Engine retry：
+compact 是 Host governance，不是 Engine retry。proactive 与 reactive 使用不同状态路径：
 
 ```text
-trigger: Host budget threshold or EngineEvent.context_compaction_requested
-  -> append CONTEXT_COMPACTION_REQUESTED
-  -> close current Attempt if reactive trigger
-  -> Run -> RECOVERING when policy allows recovery
+proactive trigger before dispatch
+  -> append CONTEXT_COMPACTION_REQUESTED(trigger_source=proactive)
   -> Host ContextGovernance compacts inputs / memory / evidence summaries
   -> append CONTEXT_COMPACTED or CONTEXT_COMPACTION_FAILED
   -> RunInputBuilder rebuilds complete AgentRunRequest.messages
+  -> append RUN_STARTED / ATTEMPT_STARTED
+  -> dispatch Engine
+
+reactive trigger from EngineEvent.context_compaction_requested
+  -> validate attempt_id + execution_id
+  -> append CONTEXT_COMPACTION_REQUESTED(trigger_source=reactive)
+  -> close current Attempt according to policy
+  -> Run -> RECOVERING when policy allows recovery
+  -> Host ContextGovernance compacts inputs / memory / evidence summaries
+  -> append CONTEXT_COMPACTED or CONTEXT_COMPACTION_FAILED
+  -> append RUN_STARTED(start_reason=recovery)
   -> create new Attempt with new execution_id
+  -> append ATTEMPT_STARTED
   -> dispatch Engine again
 ```
+
+proactive path 是 pre-dispatch input governance，不表示旧 Attempt orphan，也不要求 Run 进入 `RECOVERING`。reactive path 才复用 `RECOVERING` 与 `RUN_STARTED(start_reason=recovery)`。
 
 reactive path 约束：
 
