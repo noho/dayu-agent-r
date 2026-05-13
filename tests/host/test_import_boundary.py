@@ -3,9 +3,23 @@
 from __future__ import annotations
 
 import ast
+from dataclasses import fields
 from pathlib import Path
 
 import dayu.host as host
+from dayu.host.api import (
+    CancelRunRequest,
+    CancelSessionRunsRequest,
+    CloseSessionRequest,
+    CreateSessionRequest,
+    EnsureSessionRequest,
+    PurgeSessionRequest,
+    ReplayRunRequest,
+    ResolveWaitRequest,
+    RetryRunRequest,
+    StartRunRequest,
+    SubmitFollowupRequest,
+)
 
 HOST_FORBIDDEN_PREFIXES: tuple[str, ...] = (
     "dayu.engine",
@@ -79,3 +93,25 @@ def test_host_does_not_import_upper_or_business_layers() -> None:
             if _matches_prefix(module, HOST_FORBIDDEN_PREFIXES):
                 violations.append((str(file_path), module))
     assert not violations, f"host forbidden imports: {violations}"
+
+
+def test_host_request_dataclasses_do_not_carry_tool_bundle() -> None:
+    """per-run / command request 不得携带 business ``ToolBundle`` 字段。"""
+
+    request_fields = (
+        *fields(EnsureSessionRequest),
+        *fields(CreateSessionRequest),
+        *fields(CloseSessionRequest),
+        *fields(PurgeSessionRequest),
+        *fields(StartRunRequest),
+        *fields(CancelRunRequest),
+        *fields(CancelSessionRunsRequest),
+        *fields(SubmitFollowupRequest),
+        *fields(RetryRunRequest),
+        *fields(ReplayRunRequest),
+        *fields(ResolveWaitRequest),
+    )
+
+    assert "business_tool_bundle" not in {
+        request_field.name for request_field in request_fields
+    }

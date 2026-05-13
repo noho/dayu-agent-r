@@ -1,9 +1,9 @@
 """Host 公共命名空间。
 
-本包当前只导出 Phase 1 Slice 1 承诺的公共类型契约：request、
-snapshot、status、error、context 与 stream cursor。Host command path、
-durable store、EventLog、dispatch、tool runtime 与 policy provider 均不在
-当前包根导出范围内。
+本包当前导出 Phase 1 承诺的公共类型契约：request、snapshot、status、
+error、context、stream cursor，以及 Host construction 的业务工具输入
+边界。Host command path、durable store、EventLog、dispatch、
+ToolRuntime factory 与 policy provider 均不在当前包根导出范围内。
 """
 
 from __future__ import annotations
@@ -46,6 +46,14 @@ from dayu.host.api import (
     TerminalResultSummary,
     WaitResolutionSource,
 )
+from dayu.host.tooling import (
+    FrameworkToolName,
+    FrameworkToolPolicyView,
+    HostToolingOptions,
+    ToolBundleSourceKind,
+    ToolBundleSourceRef,
+    default_framework_tool_policy_view,
+)
 
 __all__ = [
     "AttemptStatus",
@@ -58,6 +66,8 @@ __all__ = [
     "EnsureSessionRequest",
     "FollowupBehavior",
     "FollowupSnapshot",
+    "FrameworkToolName",
+    "FrameworkToolPolicyView",
     "HostApiError",
     "HostApiErrorCode",
     "HostCallContext",
@@ -67,6 +77,7 @@ __all__ = [
     "HostInput",
     "HostMetadataEntry",
     "HostStreamCursor",
+    "HostToolingOptions",
     "OperationContext",
     "OutboxSummary",
     "PurgeSessionRequest",
@@ -83,5 +94,8 @@ __all__ = [
     "StartRunRequest",
     "SubmitFollowupRequest",
     "TerminalResultSummary",
+    "ToolBundleSourceKind",
+    "ToolBundleSourceRef",
     "WaitResolutionSource",
+    "default_framework_tool_policy_view",
 ]

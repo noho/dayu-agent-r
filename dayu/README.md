@@ -33,7 +33,7 @@ UI -> Service -> Host -> Engine
 
 `dayu.contracts` 承载跨层共享协作契约。契约层不得依赖具体业务层或执行层实现。
 
-`dayu.host` 承载 Host 公共 API 类型契约。当前已导出 request、snapshot、status、error、context 与 stream cursor 类型，供 UI / Service 按依赖方向向下引用；Host durable store、EventLog、dispatch、command path、ToolRuntime 与 policy provider 不属于当前公共命名空间。
+`dayu.host` 承载 Host 公共 API 类型契约。当前已导出 request、snapshot、status、error、context、stream cursor 类型，以及 Host construction 的 `HostToolingOptions` 工具输入边界，供 UI / Service 按依赖方向向下引用；Host durable store、EventLog、dispatch、command path、ToolRuntime 与 policy provider 不属于当前公共命名空间。
 
 财报领域能力属于独立领域边界；财报文档存取必须通过 `dayu.fins.storage` 下的仓储协议与仓储实现完成，不应泄漏到 Engine 或 Host 内部。
 
@@ -101,7 +101,8 @@ implementation、review、fix 与 re-review 的项目级术语真源。包级 RE
 - `WorkerProxy`：Host 到执行环境的适配边界。LocalProxy 与 RemoteProxy 只负责传输、启动、取消控制和事件回传，不拥有 Session / Run / Attempt / EventLog 真源。
 - `EngineWorker`：承载一次 Engine 执行的执行环境能力。EngineWorker 可以位于本机或远端；无论位置如何，它只执行并回传事件 / 结果，不 append EventLog、不关闭 attempt、不更新 Run 状态。
 - `RemoteStub`：远端执行环境中的代理端点，负责把 RemoteProxy 的请求转为 EngineWorker 执行并回传事件 / 结果。RemoteStub 不拥有 Host 治理状态。
-- `ToolBundle`：`dayu.contracts` 中已定义的工具声明集合，包含 `ToolDefinition` 元组，校验工具名唯一，并可投影为 Engine 可见的 `ToolSchema` 列表或 ToolRuntime 使用的 truncate specs。Host 的工具输入是外部传入的业务 `ToolBundle`；Host 不负责工具发现、模块扫描或注册生命周期。业务 `ToolBundle` 是 Host construction / composition root 的显式输入，不是普通 UI / Service per-run request payload。
+- `ToolBundle`：`dayu.contracts` 中已定义的工具声明集合，包含 `ToolDefinition` 元组，校验工具名唯一，并可投影为 Engine 可见的 `ToolSchema` 列表或 ToolRuntime 使用的 truncate specs。Host 的工具输入是外部传入的业务 `ToolBundle`；Host 不负责工具发现、模块扫描或注册生命周期。业务 `ToolBundle` 通过 `HostToolingOptions` 作为 Host construction / composition root 的显式输入，不是普通 UI / Service per-run request payload。
+- `HostToolingOptions`：`dayu.host.tooling` 中已实现的 Host construction typed options，包含业务 `ToolBundle`、非空来源 refs 与 framework tool policy view。它会拒绝业务工具占用 Host / ToolRuntime 预留的 framework tool 名称，例如 `fetch_more`；它不计算 durable tool snapshot，不注入 framework tool，也不解析 ToolRuntime policy。
 - `effective ToolBundle`：ToolRuntime factory 基于业务 `ToolBundle` 和启用的 framework tools 生成的 attempt-local runtime bundle。`fetch_more` 由 ToolRuntime factory 在启用 TruncationManager 时注入 effective ToolBundle，不要求外部业务 ToolBundle 提供。
 - `ToolRuntime`：Host-owned 工具治理模块，作为 `ToolExecutor` 提供给 EngineWorker / Engine。它消费 Host 传入的业务 `ToolBundle`，生成 attempt-local effective `ToolBundle`，负责 policy、awaiting、truncation / fetch_more、语义级重复调用治理、通过 `ToolTraceDiagnosticEmitter` 发出工具诊断，以及工具级幂等。ToolRuntime Host accept path 是工具事实 canonical 写入所有者；ToolRuntime 必须通过 Host accept barrier 让工具事实先被 Host durable accepted，收到 accepted ack 后才能把结果返回给 Engine。EngineEvent ingest 不能为同一工具 outcome 再写第二条工具 canonical fact。
 - `ToolTraceDiagnosticEmitter`：ToolRuntime 内部 typed interface，用于提交结构化工具诊断记录 / refs，供 tool trace projection 生成 hot JSON 与 cold JSONL。它不是 EventLog appender，不拥有 canonical fact，不写 audit，不直接写 trace 文件，也不更新 Run / Attempt 状态。
@@ -202,7 +203,7 @@ Dayu 的日志用于诊断系统执行过程，不承担 UI 输出职责。面�
 
 - `@tool(...)` 是工具声明入口，用于在工具现场同源声明 `ToolSchema`、截断声明、展示 metadata、标签和单工具 callable。
 - `ToolDefinition` 是 Host / ToolRuntime 的装配输入，包含 schema、truncate、display、tags 与 `ToolCallable`；它不进入 Engine request，也不作为 Engine 稳定接口。
-- 外部工具注册组件是工具发现 / 注册边界，产出业务 `ToolBundle`。Host 包不得 import 具体业务工具模块；新增工具应通过外部注册组件 / 配置 / Service composition 接入。
+- 外部工具注册组件是工具发现 / 注册边界，产出业务 `ToolBundle` 并通过 `HostToolingOptions` 传给 Host construction。Host 包不得 import 具体业务工具模块；新增工具应通过外部注册组件 / 配置 / Service composition 接入。
 - `fetch_more` 不由外部业务 `ToolBundle` 提供；ToolRuntime factory 根据 TruncationManager 注入 framework tool，生成 attempt-local effective `ToolBundle`。RunInputBuilder 投影给 Engine 的 `tool_schemas` 必须来自 effective ToolBundle。
 - `ToolCallable` 是单工具调用协议，形状是 `async (call: ToolCallRequest, context: BatchToolExecutionContext) -> ToolExecutionOutcome`。工具函数可以通过闭包捕获 Web client、仓储、manager 等 Host 私有依赖。
 - `ToolExecutor` 是 Host / ToolRuntime 治理后的 batch 执行入口，形状是 `execute(BatchToolExecutionRequest) -> BatchToolExecutionOutcome`。Engine 只调用这个入口，不调用单工具 callable。
