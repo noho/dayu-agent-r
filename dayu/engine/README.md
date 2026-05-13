@@ -409,7 +409,7 @@ HTTP 200 response 在 effective stream 为 `True` 且 `Content-Type` 为 `text/e
 
 Engine 的取消提交边界是“阻止未来工作，不覆盖已接受事实”。已经提升的 RunnerEvent 事实、已经接受的普通工具结果、已经返回的 awaiting outcome 和已经接受的 final decision 都会按各自事实保留；取消只在尚未接受 outcome、下一轮 Runner、continuation 或 fallback 之前抢占后续工作。上层调用者把自己的取消命令映射成 run-local token，把长事务映射成 `ToolAwaitingOutcome`，再用新 run 恢复，就能形成“宿主强约束下的 LLM in the loop”。
 
-provider 协议错误与 HTTP / 网络错误分层处理。Runner 解析层错误产出 `provider_protocol_error`；HTTP、网络、超时和上下文超限产出 `runner_http_error`。其中上下文长度超限会被 Engine 提升为 `context_compaction_requested`，并以可恢复失败候选收口；是否压缩、如何恢复不属于 Engine。
+provider 协议错误与 HTTP / 网络错误分层处理。Runner 解析层错误产出 `provider_protocol_error`；HTTP、网络、超时和上下文超限产出 `runner_http_error`。其中上下文长度超限会被 Engine 提升为 `context_compaction_requested`，该事件在 provider overflow 路径中的 `budget_state` 为 `None`，并以可恢复失败候选收口；是否压缩、如何恢复、如何记录 Host budget 不属于 Engine。Engine 不做 proactive threshold compaction、compact / retry、provider-aware tokenizer 或 Host budget policy。
 
 Runner close 是 run-scoped 收尾机制。`run_agent_messages` 在生成器结束或关闭时会触发 `EngineEvent stream` 关闭；Agent 也在终态路径和最终清理中幂等关闭 Runner。Runner close 失败只记录诊断，不改写已经确定的公共终态。
 

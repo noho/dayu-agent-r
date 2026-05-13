@@ -19,6 +19,7 @@ Engine 当前不负责：
 
 - 会话、用户意图、配置解析、prompt 渲染、权限、审计、持久化、trace 存储或观察者管线。
 - 工具注册、工具发现、工具参数校验、工具权限、工具内部超时、后台任务治理、长事务监控或恢复调度。
+- Host 上下文预算治理、proactive threshold compaction、context compact / retry、provider-aware tokenizer 或 budget policy。
 - 财报业务语义、ticker 归一、文档选择、章节规则、XBRL 处理或财报文档仓储访问。
 - 通过上层包反向依赖 UI、Service、Host、Fins 或具体工具实现。
 
@@ -407,16 +408,21 @@ Terminal event 类型固定为：
 
 ## 15. Context Compaction
 
-当前 Engine 不做上下文压缩，也不在 run 内 compact / retry。
+当前 Engine 不做上下文压缩，不在 run 内 compact / retry，不计算 Host
+budget，也不做 proactive threshold compaction、provider-aware tokenizer
+或 Host budget policy。
 
 当 Runner 报告 `RunnerHTTPErrorCode.CONTEXT_LENGTH_EXCEEDED` 时，Agent：
 
 1. 产出 `context_compaction_requested`。
-2. 使用 `ContextBudgetSnapshot(prompt_tokens=0, completion_tokens=0, total_tokens=0)` 作为占位快照。
+2. 将 `ContextCompactionRequestedData.budget_state` 设为 `None`，表示
+   provider overflow 边界没有可靠预算快照。
 3. 设置失败候选 `context_compaction_required`。
 4. 在 Runner done 后以 `run_failed(recoverable=True)` 收口。
 
-是否压缩、如何压缩、如何重新构造消息和是否再次发起 run，属于调用方在 Engine 之外的职责。Engine 只表达 provider context overflow 这一可恢复事实。
+是否压缩、如何压缩、如何重新构造消息、如何记录 before / after
+budget，以及是否再次发起 run，属于调用方在 Engine 之外的职责。
+Engine 只表达 provider context overflow 这一可恢复事实。
 
 ## 16. Tool Schema
 
