@@ -139,7 +139,7 @@ phase discussion 至少需要确认：
 追踪项：
 
 - Engine cleanup 完成后，更新 `dayu/engine/README.md`、`docs/engine/design.md`、`dayu/README.md` 中的相关术语与边界。
-- Host `design.md` 后续写回时应明确：proactive threshold compaction 属于 Host Context Governance；Engine provider overflow event 只是 reactive fallback。
+- Host `design.md` 必须明确：proactive threshold compaction 属于 Host Context Governance；Engine provider overflow event 只是 reactive fallback。
 - Host 测试设计必须覆盖：Engine overflow event 中预算 unknown 时，Host 仍使用自身 budget estimator 进行 compact 诊断与恢复决策。
 
 #### External Job Cancel Adapter 能力追踪
@@ -172,10 +172,87 @@ phase discussion 至少需要确认：
 - 后续若 Host / Service 为 OpenAI-compatible request 注入 `X-Client-Request-Id`，tool trace 也必须记录对应 client-side request id，并与 `provider_request_id`、`run_id`、`attempt_id`、`execution_id`、`event_sequence` 一起可查询。
 - 对 timeout / network error 且 `provider_request_id=None` 的场景，analyze 工具应提示优先查看 client-side request id / `X-Client-Request-Id`、网络错误类型、attempt 次数和 retry history。
 
+#### SQLite 多进程写入正确性验证
+
+结论：
+
+- 第一版继续使用 SQLite durable store 作为单机多进程 Host 真源。
+- 不提前引入服务化数据库、消息队列、分库或重型写入架构。
+- 正确性依赖 WAL、明确 busy timeout、短事务、显式重试、唯一约束和 CAS-style state transition。
+- 该项重点是验证写竞争不会破坏状态机和 EventLog 真源；性能容量只有在压测或生产观察证明明显后才升级为容量治理问题。
+
+追踪项：
+
+- Host Storage / Durable Store phase 必须明确 SQLite 连接配置、WAL、busy timeout、transaction 边界、retry 策略和错误分类。
+- 多进程测试必须覆盖同 Session 并发 `start_run`、重复 `client_request_id`、active slot admission、queue promotion、cancel / terminal race、EventLog `event_sequence` 单调性。
+- phase plan 不得把 SQLite 写竞争作为引入服务化 DB 或消息队列的默认理由。
+
+#### Remote 物理执行 exactly-once 非目标
+
+结论：
+
+- 第一版不保证 exactly-once 远程物理执行。
+- Host 只保证 canonical EventLog、Run / Attempt 状态和 Tool fact accept 的治理正确性。
+- 远端 worker 在 Host 崩溃、断连或超时后可能继续执行旧 attempt；Host 必须通过 `execution_id` 和 active Attempt 校验拒绝迟到 terminal / tool fact。
+- 外部副作用必须依赖工具级 idempotency key、tool policy、adapter best-effort cancel 和诊断追踪降低风险；不能依赖 Host lease / fencing 兜底。
+
+追踪项：
+
+- RemoteProxy / RemoteStub phase 必须测试旧 `execution_id` 的迟到 Engine event、迟到 tool result、迟到 terminal 只能进入 diagnostic / trace，不能污染 canonical EventLog。
+- 具有外部副作用的工具必须在 ToolRuntime / Tool Schema phase 明确 idempotency key、side-effect policy 和可取消能力。
+- Remote phase 不得引入远端 takeover attempt、远端 append EventLog 或远端更新 Run 状态。
+
+#### Session Purge / Archive 追踪
+
+结论：
+
+- 第一版提供 `purge_session`，用于清理已关闭且所有 Run 已终态的 Session 的 Host 本地数据。
+- `purge_session` 是 destructive purge，不是 close、cancel、archive、memory forget 或 UI hide。
+- `purge_session` 必须保留最小 purge tombstone / audit record；purge 后不再支持恢复、resume、retry、replay、timeline 补读或 final answer 找回。
+- `archive_session` 不进入第一版。archive 的语义是把冷 Session 移到 archive storage，保留可审计、可查询、可按需恢复的只读档案；archive 不删除事实。
+
+追踪项：
+
+- Public API / Storage phase 必须细化 `purge_session` 的 request、幂等、前置条件、删除范围、tombstone 存储位置和错误形状。
+- Storage phase 必须定义共享 cold artifact 的引用计数或 ref 检查，防止 purge 删除仍被其它 Session 引用的 artifact。
+- 后续单独追踪 `archive_session` 的需求和边界；不得用 `purge_session` 模拟 archive。
+
+#### Host 跨层测试策略追踪
+
+结论：
+
+- Host 测试不能只依赖端到端路径。
+- 每个 phase 的 handoff implementation-ready plan 必须包含与该 phase 边界匹配的验证策略。
+- 跨层集成测试用于验证路径组合，不替代状态机、事务、adapter、projection、recovery 的分层测试。
+
+追踪项：
+
+- State machine phase 必须提供 Run / Attempt / Session 状态迁移单元测试。
+- Storage phase 必须提供 SQLite transaction、CAS、唯一约束、多进程竞争和 crash recovery 测试。
+- Proxy / Remote phase 必须提供 WorkerProxy fake integration、迟到事件、断连、重发和 accept ack 测试。
+- ToolRuntime phase 必须提供 tool fact accept barrier、truncate / fetch_more、重复工具调用治理和 side-effect policy 测试。
+- Projection / Sink phase 必须提供 EventLog replay、checkpoint、Outbox、audit、usage、tool trace 的幂等追平测试。
+- Recovery phase 必须提供 Host restart、positive orphan proof、LOST / RECOVERABLE_LOST、prompt 已 accepted 但 answer 未返回的恢复测试。
+
+#### UI / Service Outbox 去重边界追踪
+
+结论：
+
+- 在线 / 已 attach 客户端通过 Host event stream、Session timeline、RunSnapshot 或 read model 读取 final answer。
+- Outbox 只提供离线 / 外部渠道的 terminal 增量，不提供完整聊天记录或中间过程回放。
+- 在线阅读路径和 Outbox 离线投递路径必须共享同一个 terminal identity。
+- per-client 的 seen cursor、delivery ledger、read ack 和 channel 投递状态属于 UI / Service / channel adapter，不属于 Host truth。
+
+追踪项：
+
+- Projection / Sink phase 必须保证 outbox item 携带稳定 `terminal_event_id`、`event_sequence`、`run_id`、`result_digest` 和幂等 item key。
+- Service / UI phase 必须定义 `last_seen_terminal_event_sequence` 或 `seen_terminal_event_ids` 的持久化位置和更新时机。
+- Service / UI phase 必须覆盖：客户端在线已展示 final answer 后离线重连，从 Outbox 读取增量时不会重复显示同一 terminal answer。
+- UI 显示聊天记录必须按 terminal identity upsert / dedupe，不得按 final answer 文本内容去重。
+
 ## 当前状态
 
-当前阶段为 draft design v2 完成。Host 代码实施尚未开始；`docs/host/design.md` 已是 Host 架构真源，
+当前阶段为 draft design v2 设计收口。Host 代码实施尚未开始；`docs/host/design.md` 已是 Host 架构真源，
 `dayu/README.md` 是项目级术语真源，本文档负责后续 phase 编排、进入 / 退出条件、交付物、风险和未覆盖项追踪。
 
-下一步必须先对 draft design v2 做一轮 review。若 review 通过且无阻断项，后续即可进入 phase 编排。进入任何
-phase plan 前，仍必须先和用户讨论并细化对应 `docs/host/design.md` 章节。
+进入 phase 编排前，需要完成针对 `docs/host/design.md` 的最终一致性检查。进入任何 phase plan 前，仍必须先和用户讨论并细化对应 `docs/host/design.md` 章节。

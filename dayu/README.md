@@ -45,6 +45,7 @@ implementation、review、fix 与 re-review 的项目级术语真源。包级 RE
 - `session slot`：外部入口复用当前 Session 的槽位，由 `(scope, slot_key)` 标识。WeChat 稳定身份、CLI `--label`、GUI 当前会话都可以映射到 slot。
 - `ensure_session`：Host 公共接口，表示“返回这个 slot 当前 Session，不存在则创建并绑定”。它按 `(scope, slot_key)` 幂等，不需要 `client_request_id`。
 - `create_session`：Host 公共接口，表示“明确创建一个新 Session”。它按 `client_request_id` 幂等；可选把新 Session 绑定到某个 session slot。
+- `purge_session`：Host 公共接口，表示“彻底清理一个已关闭且全部 Run 已终态的 Session 的 Host 本地数据”。它是 destructive purge，不是 close、cancel、archive、memory forget 或 UI hide；purge 后不再支持恢复、resume、retry、replay、timeline 补读或 final answer 找回。
 - `Run` / `run`：用户可见的一次 Agent 目标 / 问题 / follow-up，属于一个 Session。一个 Session 可以包含多个 Run；Engine 只处理单次 `AgentRunRequest` 的执行语义。
 - `Attempt` / `attempt`：Host 为完成某个 Run 派发给本地或远程 EngineWorker 的一次执行。resume、steer、recovery 等同一 Run 内继续执行路径会创建新 Attempt；retry / replay 创建关联的新 Run，新 Run 再创建自己的 Attempt。任何路径都不复用旧 Agent / Runner / EngineWorker。
 - `Run status`：Host 管理的 Run 生命周期状态。当前设计集合为 `QUEUED`、`RUNNING`、`WAITING`、`CANCELLING`、`RECOVERING`、`SUCCEEDED`、`FAILED`、`CANCELLED`、`LOST`；其中 `SUCCEEDED`、`FAILED`、`CANCELLED`、`LOST` 是终态。`RUNNING` 表示 Run 已占用 Session active slot，并已有 active Attempt lifecycle，不要求 worker 已 accepted。
@@ -83,7 +84,7 @@ implementation、review、fix 与 re-review 的项目级术语真源。包级 RE
 - `Observer` / `Sink` / `Projection`：消费已提交 EventLog 的派生机制。audit、usage、tool trace、stream fanout、memory snapshot、outbox 都属于 projection / sink；sink 失败不能回滚 EventLog。
 - `tool trace hot data`：tool trace 的热数据层，使用结构化 JSON projection 保存近期可查询、可展示、可关联的工具调用摘要、策略决策、证据锚点和错误 / 截断 / 等待信息。
 - `tool trace cold data`：tool trace 的冷数据层，使用 append-only JSONL 保存归档、批处理、离线审计所需的长诊断明细。JSON / JSONL 都是 EventLog 派生 projection，不是恢复、resume、memory 或 Run 状态迁移真源。
-- `Outbox`：离线 / 外部投递路径的 durable terminal delivery queue。它让离线客户端或外部渠道不必回放中间过程，也能拿到 final answer / terminal notification。Outbox 只表达 terminal delivery intent，不是完整 run timeline、不是 UI read model，也不决定 final answer 是否存在；投递失败不能回滚 Run terminal，也不参与 resume / memory 事实重建。在线 / 已 attach 客户端的阅读路径是 Host event stream、Session timeline、RunSnapshot 或 read model，不是 Outbox。
+- `Outbox`：离线 / 外部投递路径的 durable terminal delivery queue。它让离线客户端或外部渠道不必回放中间过程，也能拿到 final answer / terminal notification。Outbox 只表达 terminal delivery intent，不是完整 run timeline、不是 UI read model，也不决定 final answer 是否存在；投递失败不能回滚 Run terminal，也不参与 resume / memory 事实重建。在线 / 已 attach 客户端的阅读路径是 Host event stream、Session timeline、RunSnapshot 或 read model，不是 Outbox。在线阅读路径和 Outbox 离线投递路径必须共享同一个 terminal identity；UI / Service 用 `terminal_event_id` / `event_sequence` / `run_id` 去重，并维护自己的 seen cursor 或 delivery ledger。
 - `command path`：Host 同步治理命令路径，例如 `start_run`、`submit_followup`、`cancel_run`、`resolve_wait`、`retry_run`、`replay_run`。它负责校验、事务、EventLog append、状态索引更新、commit 和 after-commit wakeup，是写 Host truth 的路径。
 - `background runtime`：Host 已提交事实的追平和投影运行时，例如 Observer / Sink、audit、usage、tool trace、memory projection、outbox projection、stream fanout、wait poller。它按 `event_sequence` checkpoint 消费 EventLog，不 append canonical facts，不更新 Run / Attempt governance state。
 - `WorkerProxy`：Host 到执行环境的适配边界。LocalProxy 与 RemoteProxy 只负责传输、启动、取消控制和事件回传，不拥有 Session / Run / Attempt / EventLog 真源。

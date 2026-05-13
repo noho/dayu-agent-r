@@ -456,6 +456,82 @@ Host EventLog
 - 裁决：接受，P2。
 - 要点：补齐 `CancelPolicyView`、`SinkOutboxPolicyView` 或在 phase design 中明确合并视图。
 
+## Residual Risks Tracking
+
+### RR-1. SQLite 多进程写入竞争的实际表现
+
+- 来源：AgentDS residual risk。
+- 裁决：接受为低风险 validation item，不阻塞 design v2。
+- 归属：Host Storage / Durable Store phase。
+- 跟踪口径：
+  - 当前架构依赖 SQLite WAL、busy timeout、显式重试、唯一约束和 CAS-style state transition 支撑单机多进程。
+  - 作为买方财报分析 Agent，一次 Run 主要由 LLM 调用、工具读取、财报解析和外部 I/O 主导；SQLite 写入多为短事务。
+  - 同一 Session 又受 admission 限制为最多一个 active Run，多客户端 attach 更多是读 / stream / 补读，不是持续高频写。
+  - 因此不预设 SQLite 会成为核心瓶颈，不提前引入服务化 DB、消息队列、分库或重型写入架构。
+  - Host storage phase 必须定义合理 busy timeout、短事务边界、显式重试、CAS 失败返回语义，并用多进程并发测试验证 correctness。
+  - RR-1 的重点是防止 SQLite 写竞争破坏正确性；性能瓶颈只有在压测或生产观察证明明显后才升级为容量治理问题。
+  - 后续统一写入 `docs/host/implementation-control.md` 追踪区。
+
+### RR-2. Remote worker 孤儿执行
+
+- 来源：AgentDS residual risk。
+- 裁决：接受为已知 tradeoff，不阻塞 design v2。
+- 归属：RemoteProxy / ToolRuntime / External Side Effect phase。
+- 跟踪口径：
+  - 第一版不保证 exactly-once 远程物理执行。
+  - Host crash 或断连后，旧远端 worker 可能继续运行；Host 通过 `execution_id` 拒绝迟到事件污染 canonical EventLog。
+  - 外部副作用不能依赖 Host attempt ownership 兜底，必须依赖工具级 idempotency key / tool policy / best-effort cancel。
+  - Remote phase 测试必须覆盖：Host 已放弃旧 execution_id 后，远端迟到 tool result / terminal event 只能进入 diagnostic / trace，不能进入 canonical facts。
+  - 该结论后续统一写入 `docs/host/implementation-control.md` 追踪区，作为 Remote phase 的明确 non-goal / validation item。
+
+### RR-3. EventLog 无限增长的存储压力
+
+- 来源：AgentDS residual risk。
+- 裁决：接受为第一版需要提供 session-level destructive cleanup 的容量治理需求，不阻塞 design v2。
+- 归属：EventLog Storage / Retention / Archive phase。
+- 跟踪口径：
+  - EventLog 是 append-only truth，canonical facts 不能因普通清理而丢失。
+  - preview / diagnostic / projection_signal 可按 retention policy 降级、压缩或清理，但不得影响 recovery、resume、memory、audit 主链。
+  - 第一版加入 `purge_session`，用于彻底清理一个已经结束、不会再恢复的 Session 的 Host 数据，释放本地空间。
+  - `purge_session` 是 destructive purge API，不是 close、cancel、archive、memory forget 或 UI hide。
+  - `purge_session` 前置条件：
+
+```text
+Session must be CLOSED
+No active Run
+No QUEUED Run
+No WAITING / RECOVERING / CANCELLING Run
+All Runs terminal
+```
+
+  - 不满足前置条件时返回 `invalid_state`。
+  - `purge_session` 删除范围包括 Session / slot binding、Run、Attempt、该 Session 的 EventLog rows、payload descriptors / local payloads、memory snapshot、projection rows、outbox items、tool trace hot data 等由该 Session 独占的 Host 数据。
+  - `purge_session` 必须保留 minimal tombstone / audit record：
+
+```text
+SESSION_PURGED
+session_id
+actor
+reason
+purged_at
+counts / digest
+```
+
+  - purge 后不能 resume / retry / replay / 读取原 timeline / 恢复原 final answer；`get_session` / `get_run` 返回 `not_found` 或 purged tombstone snapshot，具体读语义在 phase design 定。
+  - `archive_session` 作为 tracking item，不进第一版实现。archive 语义是把冷 Session 从 hot SQLite / hot projections 移到 archive storage，保留可审计 / 可查询 / 可按需恢复的只读档案；archive 不等于 purge，不删除事实。
+  - 后续统一把 `archive_session` 写入 `docs/host/implementation-control.md` 追踪区。
+
+### RR-4. 跨层测试复杂性
+
+- 来源：AgentDS residual risk。
+- 裁决：接受为测试策略风险，不阻塞 design v2。
+- 归属：每个 phase plan 的 validation section，以及最终 integration phase。
+- 跟踪口径：
+  - Host 关键路径跨 durable transaction、dispatch、EngineEvent ingest、ToolRuntime accept barrier、projection / outbox 和 recovery。
+  - phase plan 必须明确 fake / mock 边界，避免只靠端到端测试覆盖所有状态机。
+  - 必须分层测试：state transition unit tests、SQLite transaction tests、multi-process tests、WorkerProxy fake integration、recovery crash simulation、projection replay tests。
+  - integration phase 必须覆盖 crash、timeout、late event、idempotent retry、remote stale execution、cancel / suspend / terminal races。
+
 ## Rejected / Already Covered
 
 ### R1. 整体架构需要重做

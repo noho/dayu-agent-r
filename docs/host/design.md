@@ -124,6 +124,24 @@ CLOSED
 
 `clear_session` 不进入第一版普通公共接口。需要清理、遗忘或重置时，必须分别设计 close / new session / memory forget / purge 等有明确审计语义的接口。
 
+`purge_session` 是第一版 destructive purge API，用于彻底清理一个已经结束且不再需要恢复的 Session 的 Host 本地数据。它不是 close、cancel、archive、memory forget 或 UI hide。
+
+`purge_session` 前置条件：
+
+- Session 必须已经 `CLOSED`。
+- Session 不得有 active Run。
+- Session 不得有 `QUEUED` Run。
+- Session 不得有 `WAITING` / `RECOVERING` / `CANCELLING` Run。
+- Session 下所有 Run 必须已经进入终态。
+
+不满足前置条件时，Host 必须返回 `invalid_state`，不得部分删除。
+
+`purge_session` 删除范围包括该 Session 独占的 Host 本地数据：Session / slot binding、Run、Attempt、该 Session 的 EventLog rows、payload descriptors / local payloads、memory snapshot、projection rows、outbox items、tool trace hot data。共享 cold artifact 只有在没有其它 durable ref 引用时才允许被清理。
+
+`purge_session` 必须保留最小 purge tombstone / audit record，用于说明该 `session_id` 已被 purge、由谁发起、何时发起、原因、删除计数或 digest。purge tombstone 不是可恢复 Session fact，不参与 resume、retry、replay、memory 或 RunInputBuilder；它可以位于 purged Session EventLog 之外。
+
+purge 后该 Session 不再支持 `get_session`、`get_run`、`stream_run_events`、`retry_run`、`replay_run` 或 final answer 恢复。读取接口应返回 `not_found` / `gone` 或 tombstone snapshot；具体错误形状属于 Public API phase。
+
 ## 5. Session Slot
 
 Session slot 用于让外部入口回到同一个当前 Session。取得当前会话与显式新建会话是两个不同意图，Host 公共接口必须拆成 `ensure_session` 与 `create_session`。
@@ -509,6 +527,7 @@ ensure_session(host, request) -> SessionSnapshot
 create_session(host, request) -> SessionSnapshot
 get_session(host, session_id) -> SessionSnapshot
 close_session(host, session_id, request) -> SessionSnapshot
+purge_session(host, session_id, request) -> PurgeSessionResult
 
 start_run(host, request) -> RunSnapshot
 get_run(host, run_id) -> RunSnapshot
@@ -606,6 +625,13 @@ client_request_id
 reason
 ```
 
+`PurgeSessionRequest`：
+
+```text
+client_request_id
+reason
+```
+
 `SubmitFollowupRequest`：
 
 ```text
@@ -646,6 +672,7 @@ Run 接口语义：
 - `get_run`：读取 RunSnapshot；不触发执行、不触发 queue promotion、不改变 Run / Attempt 状态。
 - `stream_run_events`：从全局 `event_sequence` cursor 补读目标 Run 的事件；断线重连只依赖 cursor，不依赖内存订阅是否仍存在。
 - `close_session`：关闭 Session 新输入入口，按 `(session_id, client_request_id)` 幂等；不取消、不终止、不删除已有 Run。
+- `purge_session`：清理已关闭且全部 Run 终态的 Session，按 `(session_id, client_request_id)` 幂等；删除可恢复事实与 projection，只保留最小 purge tombstone / audit record。
 - `cancel_run`：接受取消请求，按 `(run_id, client_request_id)` 幂等；queued Run 直接 `CANCELLED`，active Run 进入 `CANCELLING` 并向当前 Attempt 传播 cancel。
 - `submit_followup`：接受运行中或会话级后续输入；`behavior=queue` 创建后续 queued Run，`behavior=steer` 必须命中 `target_run_id` 所指的当前 active Run 并切换 Attempt。
 - `retry_run`：函数式 `retry(run)`；在 confirmed failure / recoverable failure 后创建关联的新 Run。原 Run 保持终态不可变；新 Run 可以按 retry policy 复用旧 Run 已接受工具事实，并创建自己的 Attempt。
@@ -662,7 +689,7 @@ Run 读取与结果边界：
 
 接口分层：
 
-- `ensure_session`、`create_session`、`get_session`、`close_session`、`start_run`、`get_run`、`stream_run_events`、`cancel_run`、`submit_followup` 是多入口稳定公共能力。
+- `ensure_session`、`create_session`、`get_session`、`close_session`、`purge_session`、`start_run`、`get_run`、`stream_run_events`、`cancel_run`、`submit_followup` 是多入口稳定公共能力。
 - `ensure_session` 表示“给我这个 slot 的当前会话，必要时创建并绑定”。
 - `create_session` 表示“明确分配一个新 Session”，可选绑定 slot。
 - `retry_run`、`replay_run` 是 Host control API；UI / Service 可以暴露，但必须保留 `retry(run)` / `replay(run)` 的函数式语义、Host 幂等与状态机。
@@ -674,6 +701,7 @@ Snapshot 最小语义：
 - `SessionSnapshot`：`session_id`、status、slot、active run、queued runs、timeline cursor。timeline cursor 使用全局 `event_sequence` cursor；session-local cursor 只能作为 read model 优化，不能替代全局 cursor。
 - `RunSnapshot`：`run_id`、`session_id`、status、current attempt、terminal result summary、event_sequence cursor、source_run_id?、source_run_relation?、outbox summary。
 - `FollowupSnapshot`：accepted input ref、behavior、target run / queued run、current cursor。
+- `PurgeSessionResult`：`session_id`、purged marker、purge tombstone ref、deleted counts / digest。
 - `HostEventStream`：Host event stream 的返回对象，按全局 `event_sequence` 递增返回，携带 next `event_sequence` cursor。
 
 公共错误分类至少包括：
@@ -1089,6 +1117,8 @@ Outbox：
 - Outbox 是离线 / 外部投递路径的 durable terminal delivery queue，表达 terminal result 可投递 / 可通知的 durable item。
 - Outbox 解决的问题是：离线客户端或外部渠道不需要回放中间过程，也不能丢 final answer / terminal notification。
 - Outbox 不包含完整 run timeline，不补 preview / progress / reasoning / streaming content。
+- 在线阅读路径和 Outbox 离线投递路径必须指向同一个 terminal identity。UI / Service 应使用 `terminal_event_id` / `event_sequence` / `run_id` 去重，不得用 final answer 文本内容去重。
+- UI 本地聊天记录应保存已展示 terminal answer 的 cursor，例如 `last_seen_terminal_event_sequence` 或 `seen_terminal_event_ids`。客户端重连时，Service / channel adapter 按该 cursor 从 Outbox 读取 terminal 增量；已展示过的 terminal item 不得作为新消息重复投递。
 - Host 不负责 deliver to UI，不判断哪些客户端应该收到，不记录 GUI / CLI / WeChat / Web 的 channel 投递成功状态。
 - Session 不持有唯一 default delivery target；HostCallContext 不包含 delivery target / delivery hint。
 - 具体投递目标、投递成功状态、channel retry、WeChat / Web / notification binding 属于 Service / UI / channel adapter。
@@ -1105,6 +1135,7 @@ Outbox：
 Host EventLog
   -> Host event stream / Session timeline / RunSnapshot
       -> UI read path: GUI / Web / CLI / attached clients read here
+      -> UI stores seen terminal cursor / terminal ids in local or Service state
 ```
 
 OutboxSink 路径：
@@ -1119,6 +1150,17 @@ OutboxSink checkpoint at event_sequence N
 ```
 
 outbox item idempotency key 必须由 terminal event identity 派生。重复扫描同一 terminal event 不得创建重复 outbox item。
+
+离线补投推荐语义：
+
+```text
+UI restores local chat history
+  -> reads last_seen_terminal_event_sequence or seen terminal_event_ids
+  -> Service / channel adapter queries Outbox terminal items after cursor
+  -> returns only unseen final answer / terminal notification items
+  -> UI upserts by terminal_event_id / run_id before display
+  -> UI / Service advances seen cursor after display or delivery ack
+```
 
 OutboxSink 只读 EventLog / Run durable truth，并写 outbox projection / work queue。它不能 append EventLog、不能更新 Run / Attempt，也不能改变 terminal 结果。
 
