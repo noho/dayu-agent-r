@@ -230,7 +230,7 @@ phase discussion 至少需要确认：
 - State machine phase 必须提供 Run / Attempt / Session 状态迁移单元测试。
 - Storage phase 必须提供 SQLite transaction、CAS、唯一约束、多进程竞争和 crash recovery 测试。
 - Proxy / Remote phase 必须提供 WorkerProxy fake integration、迟到事件、断连、重发和 accept ack 测试。
-- ToolRuntime phase 必须提供 tool fact accept barrier、truncate / fetch_more、重复工具调用治理和 side-effect policy 测试。
+- ToolRuntime phase 必须提供外部业务 `ToolBundle` 输入、attempt-local effective `ToolBundle`、`fetch_more` 注入、tool fact accept barrier、truncate / fetch_more、重复工具调用治理和 side-effect policy 测试。
 - Projection / Sink phase 必须提供 EventLog replay、checkpoint、Outbox、audit、usage、tool trace 的幂等追平测试。
 - Recovery phase 必须提供 Host restart、positive orphan proof、LOST / RECOVERABLE_LOST、prompt 已 accepted 但 answer 未返回的恢复测试。
 
