@@ -117,6 +117,31 @@ phase discussion 至少需要确认：
 
 ### 追踪区
 
+#### Engine Context Compaction Event 语义前置
+
+背景决议：
+
+- 当前 Engine 只在 provider 返回 `context_length_exceeded` 后 emit `context_compaction_requested`；这属于 reactive fallback，不是生产级 proactive context governance。
+- 当前 `ContextCompactionRequestedData.budget_state` 在该路径中填 `ContextBudgetSnapshot(0, 0, 0)`，只是占位诊断载体，不代表真实 prompt / completion / total token budget。
+- Host 生产级治理应由 Context Governance 基于 provider-aware budget policy 主动判断 soft / hard threshold；provider overflow 只能作为最后防线。
+- 如果不先澄清 Engine event contract，后续 Host implementation agent 可能误把 `0/0/0` 当真实预算，或误以为 Engine 已负责 context budget threshold。
+
+前置实施步骤：
+
+- 在进入 Host Context Governance / compact phase plan 前，必须先开一个 Engine contract cleanup work unit，且因涉及 Engine 代码，必须先停下来向用户确认。
+- 该 Engine work unit 的目标不是把 budget governance 放进 Engine，而是把 Engine 事件语义改到不会误导 Host：
+  - 明确 `context_compaction_requested` 的来源是 provider overflow reactive fallback。
+  - 将 `budget_state` 改成 optional / unknown 语义，或引入明确的 unknown marker；不得继续让 `0/0/0` 看起来像真实 token snapshot。
+  - 保留 `usage_reported`、`iteration_completed`、provider request id 和 overflow reason，供 Host Context Governance 诊断与追踪。
+  - README / docs/engine/design.md 必须同步说明：Engine 不做 proactive threshold compaction，不做 compact / retry，不计算 Host budget；Host 必须用自己的 estimator / tokenizer / policy 记录 before / after budget。
+- Host Context Governance phase 的 plan 必须显式依赖这个 Engine cleanup 完成，或在 plan 中写明临时兼容假设并禁止消费 `0/0/0` 作为真实预算。
+
+追踪项：
+
+- Engine cleanup 完成后，更新 `dayu/engine/README.md`、`docs/engine/design.md`、`dayu/README.md` 中的相关术语与边界。
+- Host `design.md` 后续写回时应明确：proactive threshold compaction 属于 Host Context Governance；Engine provider overflow event 只是 reactive fallback。
+- Host 测试设计必须覆盖：Engine overflow event 中预算 unknown 时，Host 仍使用自身 budget estimator 进行 compact 诊断与恢复决策。
+
 #### External Job Cancel Adapter 能力追踪
 
 背景决议：
@@ -149,12 +174,8 @@ phase discussion 至少需要确认：
 
 ## 当前状态
 
-当前阶段处于 draft design checkpoint。Host 代码实施尚未开始；`design.md` 已是 Host 架构真源，`dayu/README.md`
-是术语真源，本文档负责后续 phase 编排、进入 / 退出条件、交付物、风险和未覆盖项追踪。
+当前阶段为 draft design v2 完成。Host 代码实施尚未开始；`docs/host/design.md` 已是 Host 架构真源，
+`dayu/README.md` 是项目级术语真源，本文档负责后续 phase 编排、进入 / 退出条件、交付物、风险和未覆盖项追踪。
 
-draft2 design review 已完成，Controller 裁决记录在
-`docs/reviews/host-design-review-draft2-controller-adjudication-20260512.md`。需要用户拍板的 open decisions
-已确认，design-fix pass 已写回 `docs/host/design.md`。
-
-下一步可以进入 phase 编排或选择第一个 phase。进入任何 phase plan 前，仍必须先和用户讨论并细化对应
-`design.md` 章节。
+下一步必须先对 draft design v2 做一轮 review。若 review 通过且无阻断项，后续即可进入 phase 编排。进入任何
+phase plan 前，仍必须先和用户讨论并细化对应 `docs/host/design.md` 章节。

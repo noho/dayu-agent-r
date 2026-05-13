@@ -48,7 +48,7 @@ implementation、review、fix 与 re-review 的项目级术语真源。包级 RE
 - `Run` / `run`：用户可见的一次 Agent 目标 / 问题 / follow-up，属于一个 Session。一个 Session 可以包含多个 Run；Engine 只处理单次 `AgentRunRequest` 的执行语义。
 - `Attempt` / `attempt`：Host 为完成某个 Run 派发给本地或远程 EngineWorker 的一次执行。resume、steer、recovery 等同一 Run 内继续执行路径会创建新 Attempt；retry / replay 创建关联的新 Run，新 Run 再创建自己的 Attempt。任何路径都不复用旧 Agent / Runner / EngineWorker。
 - `Run status`：Host 管理的 Run 生命周期状态。当前设计集合为 `QUEUED`、`RUNNING`、`WAITING`、`CANCELLING`、`RECOVERING`、`SUCCEEDED`、`FAILED`、`CANCELLED`、`LOST`；其中 `SUCCEEDED`、`FAILED`、`CANCELLED`、`LOST` 是终态。
-- `Attempt status`：Host 管理的一次执行尝试状态。当前设计集合为 `RUNNING`、`SUCCEEDED`、`FAILED`、`CANCELLED`、`SUSPENDED`、`STEERED`、`LOST`；Attempt 终态不等于 Run 必然终态。
+- `Attempt status`：Host 管理的一次执行尝试状态。当前设计集合为 `STARTING`、`RUNNING`、`SUCCEEDED`、`FAILED`、`CANCELLED`、`SUSPENDED`、`STEERED`、`LOST`；Attempt 终态不等于 Run 必然终态。`STARTING` 表示 Host 已 durable 创建 dispatch intent，`RUNNING` 表示 worker 已接受执行。
 - `active Run`：同一 Session 内当前占用执行槽位的 Run。Host 设计语义是同一 Session 同时最多一个 active Run。
 - `durable queue`：Host 已接受但尚未启动的 queued Run 集合。queued Run 必须持久化，不是内存队列项。
 - `promotion`：把一个已持久化的 `QUEUED` Run 提升为 `RUNNING` 并创建 Attempt。promotion 只在同一 Session 没有 active Run 时发生；active Run 存在时仍可接受 queue 或 steer，但不能启动另一个 queued Run。
@@ -60,7 +60,7 @@ implementation、review、fix 与 re-review 的项目级术语真源。包级 RE
 - `assistant conclusion`：Memory 语境中对 `final_answer` 的保守称呼，表示助手结论。它可以作为 raw turn 的 assistant 输出参与追问连续性，但绝不能自动升级为 verified fact。
 - `verified fact`：Host / memory 中可作为事实使用的稳定信息。Host 只接受工具事实；用户输入、assistant final answer、summary、projection 都不能自动升级为 verified fact。
 - `EventLog`：Host 持有的 append-only 事件事实源。Run / Attempt 状态、RunResult、Session timeline、trace、audit、outbox 等能力只能从 EventLog 或同一持久化事务内的事实派生，不反向成为恢复输入真源。
-- `canonical event`：可恢复、可审计、可投影的 Host 事实事件。Host resume 构造新的 `AgentRunRequest.messages` 时，应以 canonical EventLog facts 为真源。
+- `canonical event`：EventLog 中 `event_class=canonical_fact` 的事实事件，可恢复、可审计、可投影。Host resume 构造新的 `AgentRunRequest.messages` 时，应以 canonical EventLog facts 为真源。
 - `USER_INPUT_ACCEPTED`：Host canonical event，表示某次用户输入已经被 durable accepted，并绑定到具体 Session / Run。它通常包含输入正文或 ref / digest、`session_id`、`run_id`、`client_request_id`、actor、source 和 accepted time；它不是 UI 临时文本，也不是仅一段裸 prompt。
 - `client operation id` / `client_request_id`：客户端或上层入口为一次 Host API 调用提供的幂等身份，用于断线重发、超时重试或重复提交时返回同一个操作结果。它标识的是“客户端操作”，不是 Host EventLog 事件，也不是远端 EngineWorker 事件。
 - `remote event identity`：Proxy / Stub / EngineWorker 回传的来源事件身份，用于 Host 识别远端重放、重复回传或乱序诊断。它可以参与 canonical event identity 的派生，但不能替代 Host 分配的 canonical event identity 或 `event_sequence`。
@@ -80,11 +80,13 @@ implementation、review、fix 与 re-review 的项目级术语真源。包级 RE
 - `Observer` / `Sink` / `Projection`：消费已提交 EventLog 的派生机制。audit、usage、tool trace、stream fanout、memory snapshot、outbox 都属于 projection / sink；sink 失败不能回滚 EventLog。
 - `tool trace hot data`：tool trace 的热数据层，使用结构化 JSON projection 保存近期可查询、可展示、可关联的工具调用摘要、策略决策、证据锚点和错误 / 截断 / 等待信息。
 - `tool trace cold data`：tool trace 的冷数据层，使用 append-only JSONL 保存归档、批处理、离线审计所需的长诊断明细。JSON / JSONL 都是 EventLog 派生 projection，不是恢复、resume、memory 或 Run 状态迁移真源。
-- `Outbox`：Run terminal 后向 UI、Web、WeChat、CLI 等外部入口投递 final answer 的隔离通道。投递失败不能回滚 Run terminal，也不参与 resume / memory 事实重建。
+- `Outbox`：Run terminal 后向 UI、Web、WeChat、CLI 等外部入口投递 final answer 的隔离通道。投递失败不能回滚 Run terminal，也不参与 resume / memory 事实重建。delivery target 在 Run accepted 时冻结到 `RUN_ACCEPTED` payload 或同事务 Run durable state，OutboxSink 只能读取冻结目标。
+- `command path`：Host 同步治理命令路径，例如 `start_run`、`submit_followup`、`cancel_run`、`resolve_wait`、`retry_run`、`replay_run`。它负责校验、事务、EventLog append、状态索引更新、commit 和 after-commit wakeup，是写 Host truth 的路径。
+- `background runtime`：Host 已提交事实的追平、投影和投递运行时，例如 Observer / Sink、audit、usage、tool trace、memory projection、outbox dispatcher、stream fanout、wait poller。它按 `event_sequence` checkpoint 消费 EventLog，不 append canonical facts，不更新 Run / Attempt governance state。
 - `WorkerProxy`：Host 到执行环境的适配边界。LocalProxy 与 RemoteProxy 只负责传输、启动、取消控制和事件回传，不拥有 Session / Run / Attempt / EventLog 真源。
 - `EngineWorker`：承载一次 Engine 执行的执行环境能力。EngineWorker 可以位于本机或远端；无论位置如何，它只执行并回传事件 / 结果，不 append EventLog、不关闭 attempt、不更新 Run 状态。
 - `RemoteStub`：远端执行环境中的代理端点，负责把 RemoteProxy 的请求转为 EngineWorker 执行并回传事件 / 结果。RemoteStub 不拥有 Host 治理状态。
-- `ToolRuntime`：Host-owned 工具治理模块，作为 `ToolExecutor` 提供给 EngineWorker / Engine。它负责工具注册装配、policy、awaiting、truncation / fetch_more、语义级重复调用治理、tool trace 所需诊断和工具级幂等。
+- `ToolRuntime`：Host-owned 工具治理模块，作为 `ToolExecutor` 提供给 EngineWorker / Engine。它负责工具注册装配、policy、awaiting、truncation / fetch_more、语义级重复调用治理、tool trace 所需诊断和工具级幂等。ToolRuntime 必须通过 Host accept barrier 让工具事实先被 Host durable accepted，收到 accepted ack 后才能把结果返回给 Engine。
 - `ToolExecutor`：Engine 可见的工具执行协议。Engine 只调用 `ToolExecutor.execute(...)`；Host / ToolRuntime 负责把工具注册、权限、截断、等待、幂等、审计和重复调用治理包装成该协议。
 - `semantic duplicate tool governance` / `语义级重复工具调用治理`：Host / ToolRuntime 对同一个 Run 内模型复读导致的重复工具调用治理，目标是减少无意义 token 和工具执行浪费。它使用 run-local in-memory duplicate index；不治理跨 Run / 跨 Session 历史相似证据，也不把同一轮正常工具调用视为需要治理的问题。Engine 只处理结构性工具调用协议，不理解工具语义、业务幂等性、历史证据质量或重复读取是否有意义。
 - `TruncationManager`：ToolRuntime 内的工具结果截断治理能力，按工具声明的 `ToolTruncateSpec` 工作，并负责生成可恢复的 truncation cursor descriptor 与 scope binding。Engine 不读取 `ToolTruncateSpec`，也不理解截断策略。
@@ -94,10 +96,10 @@ implementation、review、fix 与 re-review 的项目级术语真源。包级 RE
 - `ToolAwaitingOutcome` / `wait record`：长事务或外部等待进入 Host 的边界。Engine 只产出 awaiting / suspended 事实；Host 持久化 wait record，并通过统一 `resolve_wait` pipeline 创建新 Attempt 继续。
 - `resolve_wait`：Host 内部 / adapter API。poll、callback、manual 等等待结果来源都必须走同一个 resolution pipeline，不能各自改 Run 状态。
 - `retry(run)`：confirmed failure / recoverable failure 后的函数式 Host 操作。它不重开原终态 Run，而是创建一个关联的新 Run；新 Run 可以按 policy 复用旧 Run 已接受工具事实，并创建自己的 Attempt。
-- `replay(run)`：final answer 脏数据、schema invalid、输出 policy 失败或用户要求重答时的函数式 Host 操作。它不重开原 `SUCCEEDED` Run，也不是 `Run.replay` / `Run.relay` 对象方法；它创建一个关联的新 Run，默认复用旧 Run 已接受工具事实，不重新执行昂贵工具。
+- `replay(run)`：final answer 的格式、schema、结构、输出 envelope 或引用格式违反输出 policy 时的函数式 Host 操作。它不重开原 `SUCCEEDED` Run；它创建一个关联的新 Run，默认复用旧 Run 已接受工具事实，不重新执行昂贵工具。事实内容脏、幻觉、业务归因错误、证据不足或证据冲突不属于 replay 场景。
 - `RunInputBuilder`：Host 内部组件，负责从当前 `USER_INPUT_ACCEPTED` canonical fact、当前 Run 语义 facts、连续性所需历史 canonical EventLog facts、memory snapshot、Service 场景参数、tool schemas snapshot 和 policy config 构造新的 `AgentRunRequest.messages`。它不能从 UI 临时文本、request 临时字段或 Session timeline 旁路读取当前 prompt。
 - `Conversation Memory`：Host read model / projection，服务多轮追问连续性。它消费 canonical facts，可重建、可修复，不是事实真源。
-- `Context Governance`：Host 对上下文预算、compaction、pinned state、tool facts、open questions、assumptions 和 trace / audit 的治理。Engine 可以 emit `context_compaction_requested`，但不做 Host-side compact retry；Host 必须 append compact events、执行 compact、重建 messages 并用新 Attempt 继续。
+- `Context Governance`：Host 对上下文预算、compaction、pinned state、tool facts、open questions、assumptions 和 compact 事件的治理 orchestrator。Host 应在 dispatch 前根据 provider-aware budget 主动触发 compact；Engine emit `context_compaction_requested` 是 provider context overflow 后的 reactive fallback。Context Governance 不直接写 memory、audit、trace 或 outbox projection；这些 projection 只消费已提交 EventLog。
 - `compact events`：Host canonical event family，用于记录 context compaction 触发、成功或失败。当前设计包含 `CONTEXT_COMPACTION_REQUESTED`、`CONTEXT_COMPACTED`、`CONTEXT_COMPACTION_FAILED`；它们解释为什么后续 Attempt 的 messages 被压缩或重建。
 - `evidence anchor` / `provenance`：财报分析证据链的中立引用。长期归因必须能追到工具事实和 evidence anchor；summary 只能导航，不能替代证据。
 - `lane`：层中立 named semaphore，用于跨协程 / 跨进程的具名容量治理。lane 属于 `dayu.runtime`，不绑定 Host、Run、Tool 或财报业务语义。
