@@ -464,6 +464,8 @@ durable store 语义分区：
 
 governance truth 只能由 Host transaction 写入。derived state index 可以从 governance truth 重建；diagnostic / trace 不能参与状态恢复判定。
 
+Durable table ownership 跟随语义 owner，而不是跟随实现先后顺序。SQLite / transaction runner / EventLog / payload descriptor / idempotency / host instance liveness 是 durable foundation；Session / Run / Attempt / active index / queue index 属于状态机与 admission；wait record 属于 Tool Awaiting；projection checkpoint、audit、tool trace、outbox、memory snapshot、context artifacts、purge tombstone 等表属于各自 projection 或治理模块。实现不得创建无语义 owner 的空表，也不得让 projection 表成为 governance truth。
+
 ### 10.1 Host Handle / Composition Root
 
 Host 公共函数接收的 `host` 是 composition root / handle，不是业务 God object。它只负责持有模块化依赖和事务入口，不把各子系统状态混成一个可变大包。
@@ -1101,6 +1103,7 @@ Sink semantic contract：
 - Sink 可以维护自己的 projection 表、work queue 或冷数据文件，但不能写 Host governance truth。
 - Sink lag 只影响派生视图新鲜度，不影响 Run admission、cancel、resume、terminal 收口。
 - Sink 失败只能更新 sink-local retry / error state，不能回滚 EventLog，也不能改变 Run / Attempt 状态。
+- Audit、usage、tool trace、stream fanout、memory、outbox 等 sink 只依赖 committed EventLog 与各自 typed consumer contract；它们消费 recovery 相关 event 时不读取 Recovery 内部状态。Recovery 产生的 `ATTEMPT_LOST`、`RUN_RECOVERING`、`RUN_STARTED(start_reason=recovery)` 等只是普通 committed events，sink 不得对 Recovery 内部状态形成反向依赖。
 
 第一批 sink：
 
@@ -2069,6 +2072,8 @@ Host 启动时必须执行 recovery scan：
 - 若必要 facts 缺失或 policy 放弃恢复，Run 进入 `LOST`。
 
 Recovery scan 不得让旧 Attempt takeover。恢复必须创建新 Attempt。
+
+Recovery 的输入只能是 Host durable truth：Run / Attempt indexes、EventLog canonical facts、dispatch record、wait record、payload descriptors 和 host instance liveness record。Projection checkpoint、Session timeline、RunResult、audit、tool trace、outbox、memory snapshot lag 或其它 read model 不能作为 recovery scan 的前置条件或事实依据；这些 projection 只能在 recovery 提交 canonical facts 后按 `event_sequence` 追平。
 
 Recovery scan semantic path：
 

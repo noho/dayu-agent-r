@@ -15,7 +15,7 @@ Host 设计与实施必须始终服务于以下目标：
 - 支持单机多客户端 / 多进程。
 - 支持本地 Engine 和远程 Engine 并列执行。
 
-任何 phase plan、implementation slice、review finding 裁决和 scope 调整，都必须显式对齐这些目标。若某项设计或实现选择削弱这些目标，应停下来修正 `design.md` 后再继续。
+任何 phase plan、implementation slice、review finding 裁决和 scope 调整，都必须显式对齐这些目标。若某项设计或实现选择削弱这些目标，应停下来修正 `docs/host/design.md` 后再继续。
 
 ## 真源层级
 
@@ -26,11 +26,11 @@ dayu/README.md
   -> 项目级术语真源
   -> 约束跨层、跨 phase 的稳定术语含义
 
-design.md
+docs/host/design.md
   -> Host 架构真源
   -> 定义架构边界、状态机、公共接口、EventLog、恢复、并发、远程执行和关键治理路径
 
-implementation-control.md
+docs/host/implementation-control.md
   -> 实施编排文档
   -> 只记录 phases、依赖、进入 / 退出条件、交付物和验证要求
 ```
@@ -41,7 +41,7 @@ implementation-control.md
 `scope_token` 等术语。若发现术语缺失、冲突或不足以指导实施，应先和用户讨论，并同步更新 `dayu/README.md`
 及对应设计文档，再继续推进。
 
-本文档不得引入新的架构边界、状态机、公共接口或事件语义。若实施编排过程中发现需要新的架构决策，应先和用户讨论并同步到 `design.md`，再更新本文档的 phase 编排。
+本文档不得引入新的架构边界、状态机、公共接口或事件语义。若实施编排过程中发现需要新的架构决策，应先和用户讨论并同步到 `docs/host/design.md`，再更新本文档的 phase 编排。
 
 ## 工作流
 
@@ -51,8 +51,8 @@ Host 实施采用以下工作流：
 draft design checkpoint
   -> update implementation-control.md phases
   -> select one phase
-  -> discuss and refine the corresponding design.md section with the user
-  -> update design.md if the phase discussion changes architecture
+  -> discuss and refine the corresponding docs/host/design.md section with the user
+  -> update docs/host/design.md if the phase discussion changes architecture
   -> generate handoff implementation-ready plan for that phase
   -> review plan
   -> user confirmation
@@ -63,23 +63,23 @@ draft design checkpoint
 
 每个 phase 单独生成 handoff implementation-ready plan。phase plan 必须基于：
 
-- `design.md`
+- `docs/host/design.md`
 - 本文档中对应 phase 的范围、依赖和退出条件
 
 phase plan 不得从旧设计稿、旧代码路径或非真源文档推导架构边界。
 
-每个 phase 的第一步必须是和用户讨论并细化 `design.md` 中的对应章节。该讨论属于 `$gateflow` 的 feature
+每个 phase 的第一步必须是和用户讨论并细化 `docs/host/design.md` 中的对应章节。该讨论属于 `$gateflow` 的 feature
 discussion / requirement clarification 阶段，必须在进入 plan gate 前完成。
 
 phase discussion 至少需要确认：
 
 - phase 目标与 success signal；
 - 本 phase 是否服务于总控设计目标；
-- 对应 `design.md` 章节是否足够具体；
+- 对应 `docs/host/design.md` 章节是否足够具体；
 - 本 phase 的 scope boundary、non-goals 与 stop conditions；
 - 是否存在会阻塞 handoff implementation-ready plan 的架构、状态机、公共接口、schema、持久化或测试问题。
 
-如果 discussion 发现 `design.md` 对应章节不足以支撑直接写 plan，应先更新 `design.md`，再进入该 phase 的 plan。
+如果 discussion 发现 `docs/host/design.md` 对应章节不足以支撑直接写 plan，应先更新 `docs/host/design.md`，再进入该 phase 的 plan。
 
 ## Slice 切分原则
 
@@ -153,12 +153,12 @@ Phase Map 中每个 phase 必须使用统一条目格式。模板如下：
 字段含义：
 
 - 目标：该 phase 完成后系统新增或稳定下来的能力。
-- 对应设计章节：phase plan 的架构依据，只能引用 `design.md` 和本文档，不得引用旧讨论稿。
+- 对应设计章节：phase plan 的架构依据，只能引用 `docs/host/design.md` 和本文档，不得引用旧讨论稿。
 - 前置条件：必须已经完成的 phase、前置修正或外部确认。
 - 进入条件：开始该 phase discussion / plan 前必须满足的状态，例如设计章节已细化、无 blocking open question。
 - 范围：允许修改和禁止修改的模块 / 文件 / 层级；用于防止 scope creep。
 - 不做：明确排除的能力、兼容性、性能优化、远程能力或后续 phase 内容。
-- 关键设计问题：phase 第一步必须和用户讨论确认的问题；若结果改变架构，先写回 `design.md`。
+- 关键设计问题：phase 第一步必须和用户讨论确认的问题；若结果改变架构，先写回 `docs/host/design.md`。
 - 交付物：该 phase 需要产出的设计细化、plan、代码、测试和文档。
 - 建议 slice 切分：总控给初始建议，最终 slices 在 phase discussion / phase plan 中确定。
 - 验证要求：该 phase 必须通过的测试、pyright、文档同步和必要的手工验证。
@@ -207,14 +207,17 @@ Phase Map 中每个 phase 必须使用统一条目格式。模板如下：
 
 ## Phase Map
 
-Phase 按依赖关系推进：先实现被其它阶段依赖的公共契约、runtime 基础能力、durable store、EventLog 与状态机，再连接执行路径、工具治理、projection core、memory、context governance、recovery 与 remote。Audit、Tool Trace、Outbox 是独立 projection sinks，后置到核心治理路径稳定之后实现。每个 phase 开始时仍必须先和用户讨论并细化对应 `design.md` 章节，再生成 handoff implementation-ready plan。
+Phase 按依赖关系推进：先实现被其它阶段依赖的公共契约、runtime 基础能力、durable store、EventLog 与状态机，再连接执行路径、工具治理、projection core、memory、context governance、recovery 与 remote。Audit、Tool Trace、Outbox 是独立 projection sinks，后置到核心治理路径稳定之后实现。Phase 0 是 Engine cleanup 前置 work unit，只阻塞 Phase 10 Context Governance，不阻塞 Phase 1-9。每个 phase 开始时仍必须先和用户讨论并细化对应 `docs/host/design.md` 章节，再生成 handoff implementation-ready plan。
 
 ### Phase 0. Engine Context Compaction Event 语义前置
 
 目标：
 - 清理 Engine context overflow / compaction event 语义，避免 Host implementation agent 把 Engine reactive fallback 误解为 proactive context governance。
+- 本 phase 只阻塞 Phase 10 Context Governance / Compaction；不阻塞 Phase 1-9 的 Host foundational work。
 
 对应设计章节：
+- `dayu/engine/README.md`
+- `docs/engine/design.md`
 - `docs/host/design.md` §25 Context Governance
 - `docs/host/design.md` §25.1 Compact Event 响应路径
 - `docs/host/implementation-control.md` 追踪区 `Engine Context Compaction Event 语义前置`
@@ -260,7 +263,7 @@ Phase 按依赖关系推进：先实现被其它阶段依赖的公共契约、ru
 
 后续依赖：
 - 后续 phase 可依赖的稳定契约：Engine 只发出 reactive overflow signal，不做 Host proactive compaction。
-- 需要追踪到后续 phase 的事项：Host Context Governance phase 必须使用 Host estimator / policy 自主判断 budget。
+- 需要追踪到后续 phase 的事项：Phase 10. Context Governance / Compaction 必须使用 Host estimator / policy 自主判断 budget。
 
 ### Phase 1. 公共契约与 runtime 基础设施
 
@@ -276,7 +279,6 @@ Phase 按依赖关系推进：先实现被其它阶段依赖的公共契约、ru
 
 前置条件：
 - `dayu/README.md` 术语真源已覆盖本 phase 引入的命名。
-- Phase 0 已完成；如果用户明确决定 Phase 0 只阻塞 Context Governance，则必须在本 phase plan 中写明该例外与后续回补点。
 
 进入条件：
 - 确认哪些类型属于 `dayu.contracts`，哪些类型留在 `dayu.host` 内部。
@@ -294,6 +296,7 @@ Phase 按依赖关系推进：先实现被其它阶段依赖的公共契约、ru
 - 必须确认 Host API 类型放置位置与 import 边界。
 - 必须确认 `ToolBundle` 作为 Host construction input 的 typed options 形状。
 - 若 runtime helper 需要第三方依赖，必须确认它仍满足 `dayu.runtime` 层中立约束。
+- 必须按 slice 分别确认 public typing、runtime infra、ToolsDiscovery、ScenePrepare；任何一类出现重大架构分歧时，应拆出独立 phase。
 
 交付物：
 - phase design refinement
@@ -318,7 +321,7 @@ Phase 按依赖关系推进：先实现被其它阶段依赖的公共契约、ru
 
 后续依赖：
 - 后续 phase 可依赖的稳定契约：Host public typing、runtime helper、ToolBundle construction input。
-- 需要追踪到后续 phase 的事项：具体 Host store / command path 不在本 phase 落地。
+- 需要追踪到后续 phase 的事项：具体 Host store / command path 不在本 phase 落地；RunInputBuilder typed input provider protocols 在 Phase 5 建立，不在本 phase 落地，Phase 5 必须保持与本 phase 公共类型风格和 import boundary 一致。
 
 ### Phase 2. Durable Store / EventLog / Payload Foundation
 
@@ -335,10 +338,10 @@ Phase 按依赖关系推进：先实现被其它阶段依赖的公共契约、ru
 - Phase 1 公共类型与 runtime helper 已完成。
 
 进入条件：
-- 确认第一版 SQLite schema、transaction runner、WAL / busy timeout / retry policy、payload threshold 与 artifact 目录注入方式。
+- 确认第一版 SQLite schema convention、transaction runner、WAL / busy timeout、retry policy、payload threshold 与 artifact 目录注入方式；确认形式为用户确认，或 `docs/host/design.md` 对应章节已细化到可直接生成 schema / typed contract / test matrix。
 
 范围：
-- 允许修改：Host store schema、transaction API、EventLog appender / reader、payload table / descriptor、idempotency table、host instance liveness record。
+- 允许修改：SQLite connection / transaction runner / WAL / busy timeout、schema bootstrap convention、EventLog table 与 appender / reader、payload table / descriptor table、idempotency table、host instance liveness foundation。
 - 禁止修改：WorkerProxy、ToolRuntime、Projection、Memory、Remote transport。
 
 不做：
@@ -358,7 +361,7 @@ Phase 按依赖关系推进：先实现被其它阶段依赖的公共契约、ru
 - docs update
 
 建议 slice 切分：
-- Slice 1: SQLite schema / migration-free fresh DB bootstrap / transaction runner。
+- Slice 1: SQLite schema convention / migration-free fresh DB bootstrap / transaction runner。
 - Slice 2: EventLog append / read / event_sequence / idempotency primitive。
 - Slice 3: payload descriptor / host instance liveness / diagnostics foundation。
 
@@ -369,11 +372,11 @@ Phase 按依赖关系推进：先实现被其它阶段依赖的公共契约、ru
 - docs: Host README 或开发说明按触发规则同步。
 
 退出条件：
-- 后续 phase 能在一个事务内 append canonical facts、更新 state indexes，并可用 EventLog cursor 补读。
+- 后续 phase 能在一个事务内 append canonical facts、更新 state indexes，并可用 EventLog cursor 补读；后续 phase 增加的 tables 必须遵守本 phase 的 schema convention、transaction discipline 与全新 schema 起库约束。
 
 后续依赖：
-- 后续 phase 可依赖的稳定契约：SQLite durable truth、EventLog append / read、payload descriptor、host instance liveness。
-- 需要追踪到后续 phase 的事项：projection 与 recovery 只消费本 phase 提供的 durable primitives。
+- 后续 phase 可依赖的稳定契约：SQLite durable truth、schema convention、EventLog append / read、payload descriptor、idempotency primitive、host instance liveness。
+- 需要追踪到后续 phase 的事项：Session / Run / Attempt tables 由 Phase 3 拥有，wait record table 由 Phase 7 拥有，projection / memory / context / audit / trace / outbox / purge tombstone tables 由各自 phase 拥有；projection 与 recovery 只消费本 phase 提供的 durable primitives。
 
 ### Phase 3. Session / Run / Attempt 状态机与 Admission
 
@@ -392,10 +395,10 @@ Phase 按依赖关系推进：先实现被其它阶段依赖的公共契约、ru
 - Phase 2 durable store 与 EventLog foundation 已完成。
 
 进入条件：
-- 确认状态迁移表是否足够直接生成 typed transition service 与测试矩阵。
+- 确认状态迁移表是否足够直接生成 typed transition service 与测试矩阵；确认形式为用户确认，或 `docs/host/design.md` 对应章节已细化到可直接生成 typed transition contract / test matrix。
 
 范围：
-- 允许修改：Session / Run / Attempt tables、active index、queue index、transition service、admission service、promotion service。
+- 允许修改：Session / Session slot tables、Run / Attempt tables、active index、queue index、transition service、admission service、promotion service。
 - 禁止修改：Engine dispatch、ToolRuntime、Projection、Remote transport。
 
 不做：
@@ -487,8 +490,8 @@ Phase 按依赖关系推进：先实现被其它阶段依赖的公共契约、ru
 - 多入口可以通过稳定函数式 API 操作 Host durable state；尚未支持真实 Engine execution 的接口必须以明确状态或受控 fake dispatch 测试。
 
 后续依赖：
-- 后续 phase 可依赖的稳定契约：public command path、Host handle、typed options、snapshot shape、API idempotency。
-- 需要追踪到后续 phase 的事项：执行、projection、memory、remote 后续接入不得绕过 public command path。
+- 后续 phase 可依赖的稳定契约：public command path、Host handle、typed options、snapshot shape、API idempotency、read API shape（`get_run` / `get_session` / `stream_run_events` 的 snapshot 与 cursor contract）。
+- 需要追踪到后续 phase 的事项：执行、projection、memory、remote 后续接入不得绕过 public command path；Phase 8 依赖本 phase 的 read API shape 与 snapshot / stream cursor contract；`resolve_wait` public signature / request envelope 在本 phase 稳定，等待结果治理语义在 Phase 7 落地；`purge_session` public signature / `PurgeSessionResult` / idempotency contract 在本 phase 稳定，destructive cleanup 在 Phase 14 落地。
 
 ### Phase 5. RunInputBuilder 与本地执行 Dispatch
 
@@ -565,7 +568,7 @@ Phase 按依赖关系推进：先实现被其它阶段依赖的公共契约、ru
 - Phase 2 payload descriptor 与 EventLog append primitive 已完成。
 
 进入条件：
-- 确认 ToolRuntime ports、accept idempotency key、effective ToolBundle 与 truncation descriptor 的最小 typed contract。
+- 确认 ToolRuntime ports、accept idempotency key、effective ToolBundle 与 truncation descriptor 的最小 typed contract；确认形式为用户确认，或 `docs/host/design.md` 对应章节已细化到可直接生成 typed contract / test matrix。
 
 范围：
 - 允许修改：ToolRuntime factory、ToolExecutor wrapper、ToolBundle snapshot、tool fact accept path、TruncationManager、fetch_more framework tool、duplicate index、tool trace diagnostic emitter interface。
@@ -622,10 +625,10 @@ Phase 按依赖关系推进：先实现被其它阶段依赖的公共契约、ru
 - Phase 5 dispatch / resume attempt creation path 已完成。
 
 进入条件：
-- 确认第一版实现 internal / manual resolve + poll adapter，callback 只预留 adapter contract。
+- 确认第一版实现 internal / manual resolve + poll adapter，callback 只预留 adapter contract；必须复核 Phase 4 已冻结的 `resolve_wait` public signature / request envelope，如需变更，先回到 Public API contract 讨论。
 
 范围：
-- 允许修改：wait record store、ToolAwaitingOutcome accept path、resolve_wait command、wait poller background adapter、WAITING cancel / steer / resume。
+- 允许修改：wait record table / store、wait adapter durable refs、ToolAwaitingOutcome accept path、resolve_wait command、wait poller background adapter、WAITING cancel / steer / resume。
 - 禁止修改：外部系统专属 callback 服务、复杂 job reconcile、强制外部 job cancel。
 
 不做：
@@ -791,6 +794,7 @@ Phase 按依赖关系推进：先实现被其它阶段依赖的公共契约、ru
 - Phase 0 Engine context compaction event cleanup 已完成，或本 phase plan 明确临时兼容假设且禁止消费 `0/0/0` 作为真实预算。
 - Phase 9 memory projection 已完成。
 - Phase 5 dispatch / reactive failure closeout 已完成。
+- Phase 6 ToolRuntime / tool fact accept barrier / truncation descriptors 已完成。
 
 进入条件：
 - 确认 conservative estimator、provider-aware configured limits、safety margin 与 compact policy 的第一版默认值。
@@ -849,7 +853,7 @@ Phase 按依赖关系推进：先实现被其它阶段依赖的公共契约、ru
 前置条件：
 - Phase 5 dispatch record / LocalProxy 已完成。
 - Phase 2 host instance liveness foundation 已完成。
-- Phase 8 projection checkpoint 已完成。
+- Phase 3 state transition / admission 已完成。
 
 进入条件：
 - 确认 positive orphan proof 的本机 pid / process_start_token / heartbeat 判定实现策略。
@@ -883,7 +887,7 @@ Phase 按依赖关系推进：先实现被其它阶段依赖的公共契约、ru
 
 验证要求：
 - unit tests: orphan proof classifier、state classification。
-- integration tests: crash after USER_INPUT_ACCEPTED before final answer, restart produces answer; live second process not harmed。
+- integration tests: crash after USER_INPUT_ACCEPTED before final answer, restart produces answer; live second process not harmed; projection runner stopped or lagging 时仍能仅凭 EventLog / state indexes 完成 recovery。
 - pyright: recovery modules 通过。
 - docs: Host README recovery 语义同步。
 
@@ -908,7 +912,6 @@ Phase 按依赖关系推进：先实现被其它阶段依赖的公共契约、ru
 前置条件：
 - Phase 8 Projection Core / Host Event Stream / Minimal Read Model 已完成。
 - Phase 6 ToolRuntime diagnostic refs 已完成。
-- Phase 11 recovery 已完成。
 
 进入条件：
 - 确认 Audit、Tool Trace、Outbox 只是 projection / sink，不参与 Host command path 成功条件，不反向成为恢复、resume、memory 或 Run 状态迁移真源。
@@ -1028,6 +1031,8 @@ Phase 按依赖关系推进：先实现被其它阶段依赖的公共契约、ru
 
 进入条件：
 - 确认第一版 release / PR 前必须关闭的 residual risk 与可接受 non-goals。
+- 先区分 release-blocking 与 follow-up items；如 projection rebuild tooling、stress / smoke tests 或 docs closeout scope 过大，必须拆出独立 phase 或后续 work unit。
+- 必须复核 Phase 4 已冻结的 `purge_session` public signature / `PurgeSessionResult` / idempotency contract；如需变更，先回到 Public API contract 讨论。
 
 范围：
 - 允许修改：`purge_session` command implementation、purge delete ranges、shared artifact ref check、projection rebuild tooling、audit tombstone query support、stress / smoke tests、README sync。
@@ -1041,6 +1046,7 @@ Phase 按依赖关系推进：先实现被其它阶段依赖的公共契约、ru
 关键设计问题：
 - 必须确认 purge 对 EventLog / payload / projection / outbox / tool trace hot data / audit JSONL 的最终清理矩阵。
 - 必须确认第一版 residual risks 的接受、后续 issue 或当前修复归属。
+- 必须确认 purge / tombstone / projection rebuild slices 是否可以在 Remote smoke 之前独立完成；remote smoke / release closeout slice 依赖 Phase 13。
 
 交付物：
 - phase design refinement
@@ -1058,6 +1064,7 @@ Phase 按依赖关系推进：先实现被其它阶段依赖的公共契约、ru
 验证要求：
 - unit tests: purge precondition and tombstone behavior。
 - integration tests: purge after terminal runs, projection rebuild, audit JSONL retention。
+- integration tests: crash after `USER_INPUT_ACCEPTED` + old attempt events, recovery scan creates new attempt, new attempt reaches terminal, projection rebuild from EventLog verifies old attempt facts、new attempt facts、terminal result、outbox / audit / trace projections as applicable。
 - pyright: full project or affected packages。
 - docs: all triggered README updates complete。
 
@@ -1074,7 +1081,7 @@ Phase 按依赖关系推进：先实现被其它阶段依赖的公共契约、ru
 
 追踪规则：
 
-- `blocking` open question 必须在对应 phase 的 plan review 通过前解决，并写回 `design.md` 或 phase plan。
+- `blocking` open question 必须在对应 phase 的 plan review 通过前解决，并写回 `docs/host/design.md` 或 phase plan。
 - `non-blocking` open question 必须写明 working assumption、风险、触发回看条件和归属 phase。
 - implementation 中发现的新 open question，如果会影响设计边界或用户可见行为，必须停下交给用户讨论。
 - residual risk 和 uncovered area 必须分类为：当前 phase 修复、后续 phase 覆盖、后续 work unit、用户明确接受、或需要新跟踪项。
@@ -1099,14 +1106,14 @@ Phase 按依赖关系推进：先实现被其它阶段依赖的公共契约、ru
   - 将 `budget_state` 改成 optional / unknown 语义，或引入明确的 unknown marker；不得继续让 `0/0/0` 看起来像真实 token snapshot。
   - 保留 `usage_reported`、`iteration_completed`、provider request id 和 overflow reason，供 Host Context Governance 诊断与追踪。
   - README / docs/engine/design.md 必须同步说明：Engine 不做 proactive threshold compaction，不做 compact / retry，不计算 Host budget；Host 必须用自己的 estimator / tokenizer / policy 记录 before / after budget。
-- Host Context Governance phase 的 plan 必须显式依赖这个 Engine cleanup 完成，或在 plan 中写明临时兼容假设并禁止消费 `0/0/0` 作为真实预算。
+- Phase 10. Context Governance / Compaction 的 plan 必须显式依赖这个 Engine cleanup 完成，或在 plan 中写明临时兼容假设并禁止消费 `0/0/0` 作为真实预算。
 
 追踪项：
 
 - Engine cleanup 完成后，更新 `dayu/engine/README.md`、`docs/engine/design.md`、`dayu/README.md` 中的相关术语与边界。
-- Host `design.md` 已明确：proactive threshold compaction 属于 Host Context Governance；Engine provider overflow event
-  只是 reactive fallback。后续 Host Context Governance phase 只能按该语义实施。
-- Host 测试设计必须覆盖：Engine overflow event 中预算 unknown 时，Host 仍使用自身 budget estimator 进行 compact 诊断与恢复决策。
+- `docs/host/design.md` 已明确：proactive threshold compaction 属于 Host Context Governance；Engine provider overflow event
+  只是 reactive fallback。Phase 10. Context Governance / Compaction 只能按该语义实施。
+- Phase 10. Context Governance / Compaction 的测试设计必须覆盖：Engine overflow event 中预算 unknown 时，Host 仍使用自身 budget estimator 进行 compact 诊断与恢复决策。
 
 #### External Job Cancel Adapter 能力追踪
 
@@ -1117,10 +1124,10 @@ Phase 按依赖关系推进：先实现被其它阶段依赖的公共契约、ru
 
 追踪项：
 
-- Tool Awaiting / Wait Adapter phase 必须定义 wait record 被 Host 标记 cancelled 后，adapter 如何观察该状态。
+- Phase 7. Tool Awaiting / resolve_wait / Wait Adapter 必须定义 wait record 被 Host 标记 cancelled 后，adapter 如何观察该状态。
 - 后续 adapter 可以按能力实现外部 job cancel / revoke / abandon，但必须明确这是 best-effort，不得影响 Host EventLog 和 Run 终态的正确性。
 - 如果外部 job 在 Host 已取消 Run 后仍回调或被 poll 到结果，Host 必须拒绝其结果进入 canonical EventLog，只能记录 diagnostic / tool trace。
-- 对具有外部副作用、付费调用或长耗时资源占用的工具，后续工具 schema / policy phase 必须明确是否提供 job id、cancel handle、idempotency key 和资源清理策略。
+- Phase 6. ToolRuntime / Truncation / fetch_more / Duplicate Governance 必须明确具有外部副作用、付费调用或长耗时资源占用的工具是否提供 job id、cancel handle、idempotency key 和资源清理策略。
 - 第一版测试至少覆盖：`WAITING -> CANCELLED` 后迟到 `resolve_wait` / callback 不污染 canonical EventLog。
 
 #### Tool Trace / Provider Request 排错追踪
@@ -1133,9 +1140,9 @@ Phase 按依赖关系推进：先实现被其它阶段依赖的公共契约、ru
 
 追踪项：
 
-- 不修改 `design.md`；这不是 Host 架构边界新决策，而是 tool trace / analyze 工具排障能力需求。
-- 后续实现 tool trace 与 `utils/analyze_tool_trace.py` 时，必须把 `provider_request_id` 纳入热 JSON projection 与冷 JSONL，便于按 OpenAI `x-request-id` 排查 provider 错误、超时、协议错误和重试耗尽。
-- 后续若 Host / Service 为 OpenAI-compatible request 注入 `X-Client-Request-Id`，tool trace 也必须记录对应 client-side request id，并与 `provider_request_id`、`run_id`、`attempt_id`、`execution_id`、`event_sequence` 一起可查询。
+- 不修改 `docs/host/design.md`；这不是 Host 架构边界新决策，而是 tool trace / analyze 工具排障能力需求。
+- Phase 12. Audit / Tool Trace / Outbox Projections 实现 tool trace 与后续 `utils/analyze_tool_trace.py` 时，必须把 `provider_request_id` 纳入热 JSON projection 与冷 JSONL，便于按 OpenAI `x-request-id` 排查 provider 错误、超时、协议错误和重试耗尽。
+- 后续 Host 外部 Service / provider adapter work unit 若为 OpenAI-compatible request 注入 `X-Client-Request-Id`，Phase 12 tool trace 也必须记录对应 client-side request id，并与 `provider_request_id`、`run_id`、`attempt_id`、`execution_id`、`event_sequence` 一起可查询。
 - 对 timeout / network error 且 `provider_request_id=None` 的场景，analyze 工具应提示优先查看 client-side request id / `X-Client-Request-Id`、网络错误类型、attempt 次数和 retry history。
 
 #### SQLite 多进程写入正确性验证
@@ -1149,8 +1156,8 @@ Phase 按依赖关系推进：先实现被其它阶段依赖的公共契约、ru
 
 追踪项：
 
-- Host Storage / Durable Store phase 必须明确 SQLite 连接配置、WAL、busy timeout、transaction 边界、retry 策略和错误分类。
-- 多进程测试必须覆盖同 Session 并发 `start_run`、重复 `client_request_id`、active slot admission、queue promotion、cancel / terminal race、EventLog `event_sequence` 单调性。
+- Phase 2. Durable Store / EventLog / Payload Foundation 必须明确 SQLite 连接配置、WAL、busy timeout、transaction 边界、retry 策略和错误分类。
+- Phase 3. Session / Run / Attempt 状态机与 Admission 的多进程测试必须覆盖同 Session 并发 `start_run`、重复 `client_request_id`、active slot admission、queue promotion、cancel / terminal race、EventLog `event_sequence` 单调性。
 - phase plan 不得把 SQLite 写竞争作为引入服务化 DB 或消息队列的默认理由。
 
 #### Remote 物理执行 exactly-once 非目标
@@ -1164,9 +1171,9 @@ Phase 按依赖关系推进：先实现被其它阶段依赖的公共契约、ru
 
 追踪项：
 
-- RemoteProxy / RemoteStub phase 必须测试旧 `execution_id` 的迟到 Engine event、迟到 tool result、迟到 terminal 只能进入 diagnostic / trace，不能污染 canonical EventLog。
-- 具有外部副作用的工具必须在 ToolRuntime / Tool Schema phase 明确 idempotency key、side-effect policy 和可取消能力。
-- Remote phase 不得引入远端 takeover attempt、远端 append EventLog 或远端更新 Run 状态。
+- Phase 13. RemoteProxy / RemoteStub 必须测试旧 `execution_id` 的迟到 Engine event、迟到 tool result、迟到 terminal 只能进入 diagnostic / trace，不能污染 canonical EventLog。
+- Phase 6. ToolRuntime / Truncation / fetch_more / Duplicate Governance 必须明确具有外部副作用的工具的 idempotency key、side-effect policy 和可取消能力。
+- Phase 13. RemoteProxy / RemoteStub 不得引入远端 takeover attempt、远端 append EventLog 或远端更新 Run 状态。
 
 #### Session Purge / Archive 追踪
 
@@ -1179,8 +1186,8 @@ Phase 按依赖关系推进：先实现被其它阶段依赖的公共契约、ru
 
 追踪项：
 
-- Public API / Storage phase 必须细化 `purge_session` 的 request、幂等、前置条件、删除范围、tombstone 存储位置和错误形状。
-- Storage phase 必须定义共享 cold artifact 的引用计数或 ref 检查，防止 purge 删除仍被其它 Session 引用的 artifact。
+- Phase 4. Host Public API Command Path 必须稳定 `purge_session` 的 request、幂等、错误形状和 `PurgeSessionResult` 公共契约；Phase 14. Retention / Purge / Production Hardening 必须细化删除范围、tombstone 存储位置和 destructive cleanup 语义。
+- Phase 14. Retention / Purge / Production Hardening 必须定义共享 cold artifact 的引用计数或 ref 检查，防止 purge 删除仍被其它 Session 引用的 artifact。
 - 后续单独追踪 `archive_session` 的需求和边界；不得用 `purge_session` 模拟 archive。
 
 #### Host 跨层测试策略追踪
@@ -1193,12 +1200,12 @@ Phase 按依赖关系推进：先实现被其它阶段依赖的公共契约、ru
 
 追踪项：
 
-- State machine phase 必须提供 Run / Attempt / Session 状态迁移单元测试。
-- Storage phase 必须提供 SQLite transaction、CAS、唯一约束、多进程竞争和 crash recovery 测试。
-- Proxy / Remote phase 必须提供 WorkerProxy fake integration、迟到事件、断连、重发和 accept ack 测试。
-- ToolRuntime phase 必须提供外部业务 `ToolBundle` 输入、attempt-local effective `ToolBundle`、`fetch_more` 注入、tool fact accept barrier、truncate / fetch_more、重复工具调用治理和 side-effect policy 测试。
-- Projection / Sink phase 必须提供 EventLog replay、checkpoint、Outbox、audit、usage、tool trace 的幂等追平测试。
-- Recovery phase 必须提供 Host restart、positive orphan proof、LOST / RECOVERABLE_LOST、prompt 已 accepted 但 answer 未返回的恢复测试。
+- Phase 3. Session / Run / Attempt 状态机与 Admission 必须提供 Run / Attempt / Session 状态迁移单元测试。
+- Phase 2. Durable Store / EventLog / Payload Foundation 必须提供 SQLite transaction、CAS、唯一约束、多进程竞争和 crash recovery foundation 测试。
+- Phase 5. RunInputBuilder 与本地执行 Dispatch 必须提供 WorkerProxy fake integration；Phase 13. RemoteProxy / RemoteStub 必须提供迟到事件、断连、重发和 accept ack 测试。
+- Phase 6. ToolRuntime / Truncation / fetch_more / Duplicate Governance 必须提供外部业务 `ToolBundle` 输入、attempt-local effective `ToolBundle`、`fetch_more` 注入、tool fact accept barrier、truncate / fetch_more、重复工具调用治理和 side-effect policy 测试。
+- Phase 8. Projection Core / Host Event Stream / Minimal Read Model 必须提供 EventLog replay、checkpoint、Host event stream、minimal read model 的幂等追平测试；Phase 12. Audit / Tool Trace / Outbox Projections 必须提供 Outbox、audit、usage、tool trace 的幂等追平测试。
+- Phase 11. Host Lifecycle / Recovery / Multi-process Hardening 必须提供 Host restart、positive orphan proof、LOST / RECOVERABLE_LOST、prompt 已 accepted 但 answer 未返回的恢复测试。
 
 #### UI / Service Outbox 去重边界追踪
 
@@ -1211,14 +1218,14 @@ Phase 按依赖关系推进：先实现被其它阶段依赖的公共契约、ru
 
 追踪项：
 
-- Projection / Sink phase 必须保证 outbox item 携带稳定 `terminal_event_id`、`event_sequence`、`run_id`、`result_digest` 和幂等 item key。
-- Service / UI phase 必须定义 `last_seen_terminal_event_sequence` 或 `seen_terminal_event_ids` 的持久化位置和更新时机。
-- Service / UI phase 必须覆盖：客户端在线已展示 final answer 后离线重连，从 Outbox 读取增量时不会重复显示同一 terminal answer。
-- UI 显示聊天记录必须按 terminal identity upsert / dedupe，不得按 final answer 文本内容去重。
+- Phase 12. Audit / Tool Trace / Outbox Projections 必须保证 outbox item 携带稳定 `terminal_event_id`、`event_sequence`、`run_id`、`result_digest` 和幂等 item key。
+- Host 外部 Service / UI 后续 work unit 必须定义 `last_seen_terminal_event_sequence` 或 `seen_terminal_event_ids` 的持久化位置和更新时机。
+- Host 外部 Service / UI 后续 work unit 必须覆盖：客户端在线已展示 final answer 后离线重连，从 Outbox 读取增量时不会重复显示同一 terminal answer。
+- Host 外部 UI 显示聊天记录必须按 terminal identity upsert / dedupe，不得按 final answer 文本内容去重。
 
 ## 当前状态
 
-当前阶段为 phase map draft。Host 代码实施尚未开始；`docs/host/design.md` 已是 Host 架构真源，
-`dayu/README.md` 是项目级术语真源，本文档已按依赖关系给出 Host 实施 phases、进入 / 退出条件、交付物、风险和未覆盖项追踪。
+当前阶段为待实施 P0：Engine Context Compaction Event 语义前置。Host 代码实施尚未开始；`docs/host/design.md` 已是 Host 架构真源，
+`dayu/README.md` 是项目级术语真源，本文档已按依赖关系给出 Host 实施 phases、进入 / 退出条件、交付物、风险和未覆盖项追踪，并已写回 phase map review 的总控裁决结论。
 
-进入任何 phase plan 前，仍必须先和用户讨论并细化对应 `docs/host/design.md` 章节；若 phase discussion 改变架构边界，必须先写回 `docs/host/design.md`，再生成 handoff implementation-ready plan。
+进入 Phase 0 plan 前，必须先和用户确认是否允许修改 Engine 代码，并讨论 / 细化 Engine context overflow event contract。进入任何 phase plan 前，仍必须先和用户讨论并细化对应 `docs/host/design.md` 章节；若 phase discussion 改变架构边界，必须先写回 `docs/host/design.md`，再生成 handoff implementation-ready plan。
