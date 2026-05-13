@@ -32,6 +32,7 @@ python -m pyright dayu/ tests/ utils/
 pytest tests/contracts -q
 pytest tests/host -q
 pytest tests/runtime -q
+pytest tests/runtime/test_filelock.py tests/runtime/test_import_boundary.py -q
 pytest tests/runtime/test_lane.py tests/runtime/test_lane_multiprocess.py -q
 pytest tests/engine -q
 pytest tests/engine/contracts -q
@@ -51,6 +52,7 @@ pytest tests/engine/test_smoke_async_agent_providers.py -q
   heartbeat / release、timeout、协作式 cancellation、`Task.cancel()` 透传、controller close、跨进程 capacity invariant、
   release 后其它进程 acquire，以及 crash 后 TTL stale cleanup eventual acquire；测试不断言 FIFO、公平性或 Host
   dispatch 集成。
+- filelock：覆盖同步 file lock wrapper 的 parent directory 创建策略、禁用创建时的结构化错误、context manager 正常与异常路径 release、release 幂等、non-blocking timeout 包装，以及第三方 `filelock` import 只能出现在 `dayu.runtime.filelock` 的边界。
 - logging：验证 `dayu.runtime.log` 的 logger 装配、CLI 风格级别解析、`VERBOSE` / `CRITICAL` 级别契约，并验证 `dayu.runtime.log_levels` 只提供公共日志级别常量、不注册 stdlib logging level。
 
 ### `tests/contracts/`

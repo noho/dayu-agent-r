@@ -94,6 +94,13 @@ def test_runtime_import_boundary_scan_covers_lane_module() -> None:
     assert "lane.py" in scanned_names
 
 
+def test_runtime_import_boundary_scan_covers_filelock_module() -> None:
+    """runtime import 边界扫描必须覆盖新增 ``filelock.py``。"""
+
+    scanned_names = {file_path.name for file_path in _iter_python_files()}
+    assert "filelock.py" in scanned_names
+
+
 def test_runtime_does_not_import_phase0_forbidden_modules() -> None:
     """Phase 0 暂时禁止的运行期模块不得被 ``dayu.runtime`` 导入。"""
 
@@ -105,3 +112,19 @@ def test_runtime_does_not_import_phase0_forbidden_modules() -> None:
             if _matches_prefix(module, PHASE0_FORBIDDEN_PREFIXES):
                 violations.append((str(file_path), module))
     assert not violations, f"Phase 0 forbidden imports: {violations}"
+
+
+def test_third_party_filelock_import_is_confined_to_runtime_filelock() -> None:
+    """第三方 ``filelock`` 只能由 ``dayu.runtime.filelock`` 直接导入。"""
+
+    dayu_root = _runtime_root().parent
+    allowed_file = _runtime_root() / "filelock.py"
+    violations: list[tuple[str, str]] = []
+    for file_path in sorted(dayu_root.rglob("*.py")):
+        if "__pycache__" in file_path.parts or file_path == allowed_file:
+            continue
+        for module in _imported_module_names(file_path.read_text(encoding="utf-8")):
+            if _matches_prefix(module, ("filelock",)):
+                violations.append((str(file_path), module))
+
+    assert not violations, f"third-party filelock imports outside wrapper: {violations}"
