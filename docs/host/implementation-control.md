@@ -1237,7 +1237,7 @@ Phase 按依赖关系推进：先实现被其它阶段依赖的公共契约、ru
 当前阶段为 P0：Engine Context Compaction Event 语义前置。Host 代码实施尚未开始；`docs/host/design.md` 已是 Host 架构真源，
 `dayu/README.md` 是项目级术语真源。用户已确认 P0 直接进入 plan gate，并允许本 work unit 修改 Engine contract / docs / tests。
 
-当前 gate 为等待用户确认 P0-S2。P0 plan 已写入 `docs/host/phase0-engine-context-compaction-plan.md`；AgentMiMo 与 AgentDS 已完成并行 plan review，
+当前 gate 为 PR。P0 plan 已写入 `docs/host/phase0-engine-context-compaction-plan.md`；AgentMiMo 与 AgentDS 已完成并行 plan review，
 review artifacts 分别为 `docs/reviews/gateflow-plan-review-host-p0-engine-context-compaction-mimo-20260513.md` 和
 `docs/reviews/gateflow-plan-review-host-p0-engine-context-compaction-ds-20260513.md`。总控裁决已写入
 `docs/reviews/gateflow-plan-review-host-p0-engine-context-compaction-controller-adjudication-20260513.md`，plan fix artifact 已写入
@@ -1258,5 +1258,5 @@ P0 plan re-review 已通过，用户已确认进入 implementation；accepted pl
 `docs/reviews/gateflow-implementation-host-p0-s2-docs-context-compaction-20260513.md`。P0-S2 code review artifacts 已写入
 `docs/reviews/gateflow-code-review-host-p0-s2-docs-context-compaction-mimo-20260513.md` 和
 `docs/reviews/gateflow-code-review-host-p0-s2-docs-context-compaction-ds-20260513.md`，code review 总控裁决已写入
-`docs/reviews/gateflow-code-review-host-p0-s2-docs-context-compaction-controller-adjudication-20260513.md`。P0-S2 code review 已通过，进入 accepted slice commit 前必须等待用户确认。P0 plan fix 已补充：明确 Runner HTTP overflow event-path 测试、P0-S1 pyright completion signal、
+`docs/reviews/gateflow-code-review-host-p0-s2-docs-context-compaction-controller-adjudication-20260513.md`。P0-S2 accepted slice commit 为 `6f6e716`。P0 两个 implementation slices 均已完成并通过 review loop，当前按用户确认进入 push / PR。P0 plan fix 已补充：明确 Runner HTTP overflow event-path 测试、P0-S1 pyright completion signal、
 Phase 5 与 Phase 10 对 `budget_state=None` 的责任切分、多行 sentinel 搜索防线、`None` 与真实 `ContextBudgetSnapshot` 两条合法 contract 测试、`runner_events.py` docstring 目检，以及 `dayu/README.md` 术语精化边界。
