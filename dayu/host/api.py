@@ -1,0 +1,1218 @@
+"""Host 公共 API 类型契约。
+
+本模块只定义 Host 后续阶段可依赖的公共 request、snapshot、status、
+error 与 context 类型。它不实现 command path、durable store、EventLog、
+dispatch、policy provider 或 Engine 调用路径。
+"""
+
+from __future__ import annotations
+
+from dataclasses import dataclass
+from enum import StrEnum
+from typing import Protocol
+
+from dayu.contracts.json_value import JsonValue
+
+
+def _require_non_empty(value: str, *, field_name: str) -> None:
+    """校验必填字符串字段非空。
+
+    :param value: 待校验的字符串值。
+    :param field_name: 错误消息中使用的字段名。
+    :returns: 无返回值。
+    :raises ValueError: 字符串为空或仅包含空白字符时抛出。
+    """
+
+    if value.strip() == "":
+        raise ValueError(f"{field_name} must be non-empty")
+
+
+def _require_optional_non_empty(
+    value: str | None, *, field_name: str
+) -> None:
+    """校验可选字符串字段在存在时非空。
+
+    :param value: 待校验的可选字符串值。
+    :param field_name: 错误消息中使用的字段名。
+    :returns: 无返回值。
+    :raises ValueError: 字符串存在但为空或仅包含空白字符时抛出。
+    """
+
+    if value is not None:
+        _require_non_empty(value, field_name=field_name)
+
+
+def _require_non_negative(value: int, *, field_name: str) -> None:
+    """校验整数游标或序列号不为负数。
+
+    :param value: 待校验的整数值。
+    :param field_name: 错误消息中使用的字段名。
+    :returns: 无返回值。
+    :raises ValueError: ``value`` 小于零时抛出。
+    """
+
+    if value < 0:
+        raise ValueError(f"{field_name} must be non-negative")
+
+
+def _require_metadata_entries(
+    entries: tuple["HostMetadataEntry", ...], *, field_name: str
+) -> None:
+    """校验 metadata 元组中的 key 非空。
+
+    :param entries: Host metadata 条目元组。
+    :param field_name: 错误消息中使用的字段名。
+    :returns: 无返回值。
+    :raises ValueError: 任一 metadata key 为空时抛出。
+    """
+
+    for entry in entries:
+        _require_non_empty(entry.key, field_name=f"{field_name}.key")
+
+
+def _require_graceful_cancel(mode: "CancelMode", *, field_name: str) -> None:
+    """校验取消模式仍处于第一版允许集合。
+
+    :param mode: 请求传入的取消模式。
+    :param field_name: 错误消息中使用的字段名。
+    :returns: 无返回值。
+    :raises ValueError: 取消模式不是 :attr:`CancelMode.GRACEFUL` 时抛出。
+    """
+
+    if mode != CancelMode.GRACEFUL:
+        raise ValueError(f"{field_name} must be graceful")
+
+
+class SessionStatus(StrEnum):
+    """Session 生命周期状态。
+
+    成员：
+
+    - ``OPEN``：Session 可继续接收新 Run 或 follow-up。
+    - ``CLOSED``：Session 已关闭，不再接收新 Run。
+    """
+
+    OPEN = "open"
+    CLOSED = "closed"
+
+
+class RunStatus(StrEnum):
+    """Run 生命周期状态。
+
+    成员覆盖 Host 对用户可见目标的排队、执行、等待、取消、恢复与终态。
+    ``SUCCEEDED``、``FAILED``、``CANCELLED``、``LOST`` 是终态。
+    """
+
+    QUEUED = "queued"
+    RUNNING = "running"
+    WAITING = "waiting"
+    CANCELLING = "cancelling"
+    RECOVERING = "recovering"
+    SUCCEEDED = "succeeded"
+    FAILED = "failed"
+    CANCELLED = "cancelled"
+    LOST = "lost"
+
+
+class AttemptStatus(StrEnum):
+    """Attempt 生命周期状态。
+
+    成员描述 Host 派发给本地或远端 EngineWorker 的一次执行尝试状态。
+    Attempt 终态不自动等同于 Run 终态。
+    """
+
+    STARTING = "starting"
+    RUNNING = "running"
+    SUCCEEDED = "succeeded"
+    FAILED = "failed"
+    CANCELLED = "cancelled"
+    SUSPENDED = "suspended"
+    STEERED = "steered"
+    LOST = "lost"
+
+
+class FollowupBehavior(StrEnum):
+    """follow-up admission 行为。
+
+    - ``QUEUE``：作为同一 Session 后续输入排队或启动新 Run。
+    - ``STEER``：作用于指定 active Run，并通过新 Attempt 继续。
+    """
+
+    QUEUE = "queue"
+    STEER = "steer"
+
+
+class CancelMode(StrEnum):
+    """取消模式枚举。
+
+    Phase 1 只定义优雅取消；不承诺 force 或 immediate 语义。
+    """
+
+    GRACEFUL = "graceful"
+
+
+class WaitResolutionSource(StrEnum):
+    """等待结果来源枚举。
+
+    成员表示 ``resolve_wait`` 接收结果的外部来源，不表示长阻塞等待机制。
+    """
+
+    POLL = "poll"
+    CALLBACK = "callback"
+    MANUAL = "manual"
+
+
+class SourceRunRelation(StrEnum):
+    """当前 Run 与源 Run 的关系。
+
+    - ``RETRY``：重试源 Run 的失败或可恢复失败。
+    - ``REPLAY``：复用源 Run 事实做 no-tool 结构修复。
+    """
+
+    RETRY = "retry"
+    REPLAY = "replay"
+
+
+class HostApiErrorCode(StrEnum):
+    """Host API 结构化错误码。
+
+    Phase 1 只定义错误码集合，不实现 command path 抛错路径。
+    """
+
+    NOT_FOUND = "not_found"
+    INVALID_STATE = "invalid_state"
+    CONFLICT = "conflict"
+    IDEMPOTENCY_CONFLICT = "idempotency_conflict"
+    PERMISSION_DENIED = "permission_denied"
+    INTERNAL_ERROR = "internal_error"
+
+
+@dataclass(frozen=True, slots=True)
+class OperationContext:
+    """Host 调用的业务 / 操作上下文。
+
+    字段语义：
+
+    - ``operation_name``：操作名称，用于审计、trace 与诊断。
+    - ``operation_kind``：操作类别，例如交互、批处理或后台任务。
+    - ``business_domain``：业务域名称。
+    - ``business_object_type``：业务对象类型；无绑定对象时为 ``None``。
+    - ``business_object_id``：业务对象 id；无绑定对象时为 ``None``。
+    - ``scenario``：场景名称；无场景时为 ``None``。
+    - ``correlation_id``：跨系统关联 id；无关联时为 ``None``。
+    """
+
+    operation_name: str
+    operation_kind: str
+    business_domain: str
+    business_object_type: str | None
+    business_object_id: str | None
+    scenario: str | None
+    correlation_id: str | None
+
+    def __post_init__(self) -> None:
+        """校验操作上下文字段的基础完整性。
+
+        :returns: 无返回值。
+        :raises ValueError: 必填字符串为空，或可选 id 字段存在但为空时抛出。
+        """
+
+        _require_non_empty(
+            self.operation_name, field_name="OperationContext.operation_name"
+        )
+        _require_non_empty(
+            self.operation_kind, field_name="OperationContext.operation_kind"
+        )
+        _require_non_empty(
+            self.business_domain, field_name="OperationContext.business_domain"
+        )
+        _require_optional_non_empty(
+            self.business_object_id,
+            field_name="OperationContext.business_object_id",
+        )
+        _require_optional_non_empty(
+            self.correlation_id, field_name="OperationContext.correlation_id"
+        )
+
+
+@dataclass(frozen=True, slots=True)
+class AuthorizationClaim:
+    """调用方授权声明。
+
+    字段语义：
+
+    - ``name``：声明名称。
+    - ``value``：声明值。
+    """
+
+    name: str
+    value: str
+
+    def __post_init__(self) -> None:
+        """校验授权声明非空。
+
+        :returns: 无返回值。
+        :raises ValueError: ``name`` 或 ``value`` 为空时抛出。
+        """
+
+        _require_non_empty(self.name, field_name="AuthorizationClaim.name")
+        _require_non_empty(self.value, field_name="AuthorizationClaim.value")
+
+
+@dataclass(frozen=True, slots=True)
+class HostCallContext:
+    """Host API 调用上下文。
+
+    字段语义：
+
+    - ``actor``：发起调用的主体。
+    - ``source``：调用来源，例如 CLI、Service 或 UI adapter。
+    - ``request_id``：本次调用的追踪 id，不是统一幂等键。
+    - ``authorization_claims``：调用方授权声明集合。
+    - ``operation_context``：业务 / 操作上下文。
+    """
+
+    actor: str
+    source: str
+    request_id: str
+    authorization_claims: tuple[AuthorizationClaim, ...]
+    operation_context: OperationContext
+
+    def __post_init__(self) -> None:
+        """校验调用上下文基础字段非空。
+
+        :returns: 无返回值。
+        :raises ValueError: ``actor``、``source`` 或 ``request_id`` 为空时抛出。
+        """
+
+        _require_non_empty(self.actor, field_name="HostCallContext.actor")
+        _require_non_empty(self.source, field_name="HostCallContext.source")
+        _require_non_empty(
+            self.request_id, field_name="HostCallContext.request_id"
+        )
+
+
+@dataclass(frozen=True, slots=True)
+class HostMetadataEntry:
+    """Host 中性附加说明条目。
+
+    字段语义：
+
+    - ``key``：metadata key，仅用于非状态机、非幂等、非恢复、非审计主链说明。
+    - ``value``：严格 JSON 值；显式 request 字段禁止塞入 metadata。
+    """
+
+    key: str
+    value: JsonValue
+
+    def __post_init__(self) -> None:
+        """校验 metadata key 非空。
+
+        :returns: 无返回值。
+        :raises ValueError: ``key`` 为空或仅包含空白字符时抛出。
+        """
+
+        _require_non_empty(self.key, field_name="HostMetadataEntry.key")
+
+
+@dataclass(frozen=True, slots=True)
+class HostInput:
+    """Host 输入 envelope。
+
+    字段语义：
+
+    - ``display_text``：面向会话的输入展示文本。
+    - ``payload_ref``：大 payload 的外部引用；Phase 1 不实现 payload store。
+    - ``payload_digest``：外部 payload 的摘要；无 payload 时为 ``None``。
+    """
+
+    display_text: str
+    payload_ref: str | None
+    payload_digest: str | None
+
+    def __post_init__(self) -> None:
+        """校验输入 envelope 的可选引用字段。
+
+        :returns: 无返回值。
+        :raises ValueError: 可选引用或摘要存在但为空时抛出。
+        """
+
+        _require_optional_non_empty(
+            self.payload_ref, field_name="HostInput.payload_ref"
+        )
+        _require_optional_non_empty(
+            self.payload_digest, field_name="HostInput.payload_digest"
+        )
+
+
+@dataclass(frozen=True, slots=True)
+class SessionSlotRef:
+    """Session slot 引用。
+
+    字段语义：
+
+    - ``scope``：slot 命名空间。
+    - ``slot_key``：slot 在 scope 内的稳定键。
+    """
+
+    scope: str
+    slot_key: str
+
+    def __post_init__(self) -> None:
+        """校验 slot 引用字段非空。
+
+        :returns: 无返回值。
+        :raises ValueError: ``scope`` 或 ``slot_key`` 为空时抛出。
+        """
+
+        _require_non_empty(self.scope, field_name="SessionSlotRef.scope")
+        _require_non_empty(self.slot_key, field_name="SessionSlotRef.slot_key")
+
+
+@dataclass(frozen=True, slots=True)
+class HostStreamCursor:
+    """Host event stream 游标。
+
+    字段语义：
+
+    - ``event_sequence``：Host durable store 分配的全局单调事件序列。
+    """
+
+    event_sequence: int
+
+    def __post_init__(self) -> None:
+        """校验事件序列号非负。
+
+        :returns: 无返回值。
+        :raises ValueError: ``event_sequence`` 为负数时抛出。
+        """
+
+        _require_non_negative(
+            self.event_sequence, field_name="HostStreamCursor.event_sequence"
+        )
+
+
+class HostCommandFacet(Protocol):
+    """未来函数式 Host command API 的 opaque command handle 协议。
+
+    该协议只暴露稳定 handle id，不持有 store、policy、tool runtime 或其它
+    Host 具体实现细节，避免退化为 god bag。
+    """
+
+    @property
+    def host_handle_id(self) -> str:
+        """返回 Host command handle 的稳定诊断 id。
+
+        :returns: command handle id。
+        :raises RuntimeError: 具体实现可在自身不可用时抛出运行时错误。
+        """
+
+        ...
+
+
+@dataclass(frozen=True, slots=True)
+class EnsureSessionRequest:
+    """确保 Session 存在并绑定到 slot 的请求。
+
+    字段语义：
+
+    - ``scope``：slot 命名空间。
+    - ``slot_key``：slot 稳定键。
+    - ``metadata``：中性附加说明，不承载显式请求字段。
+    """
+
+    scope: str
+    slot_key: str
+    metadata: tuple[HostMetadataEntry, ...]
+
+    def __post_init__(self) -> None:
+        """校验 ensure session 请求字段。
+
+        :returns: 无返回值。
+        :raises ValueError: slot 字段或 metadata key 为空时抛出。
+        """
+
+        _require_non_empty(self.scope, field_name="EnsureSessionRequest.scope")
+        _require_non_empty(
+            self.slot_key, field_name="EnsureSessionRequest.slot_key"
+        )
+        _require_metadata_entries(
+            self.metadata, field_name="EnsureSessionRequest.metadata"
+        )
+
+
+@dataclass(frozen=True, slots=True)
+class CreateSessionRequest:
+    """显式创建 Session 的请求。
+
+    字段语义：
+
+    - ``context``：调用上下文。
+    - ``client_request_id``：客户端操作幂等 id。
+    - ``bind_slot``：是否把新 Session 绑定到 slot。
+    - ``scope``：绑定 slot 时的命名空间；不绑定时可为 ``None``。
+    - ``slot_key``：绑定 slot 时的稳定键；不绑定时可为 ``None``。
+    - ``metadata``：中性附加说明，不承载显式请求字段。
+    """
+
+    context: HostCallContext
+    client_request_id: str
+    bind_slot: bool
+    scope: str | None
+    slot_key: str | None
+    metadata: tuple[HostMetadataEntry, ...]
+
+    def __post_init__(self) -> None:
+        """校验 create session 请求字段与 slot 绑定前置条件。
+
+        :returns: 无返回值。
+        :raises ValueError: 幂等 id 为空、metadata key 为空，或绑定 slot
+            时缺少 ``scope`` / ``slot_key`` 时抛出。
+        """
+
+        _require_non_empty(
+            self.client_request_id,
+            field_name="CreateSessionRequest.client_request_id",
+        )
+        if self.bind_slot:
+            _require_optional_non_empty(
+                self.scope, field_name="CreateSessionRequest.scope"
+            )
+            _require_optional_non_empty(
+                self.slot_key, field_name="CreateSessionRequest.slot_key"
+            )
+            if self.scope is None or self.slot_key is None:
+                raise ValueError(
+                    "CreateSessionRequest scope and slot_key are required"
+                )
+        else:
+            _require_optional_non_empty(
+                self.scope, field_name="CreateSessionRequest.scope"
+            )
+            _require_optional_non_empty(
+                self.slot_key, field_name="CreateSessionRequest.slot_key"
+            )
+        _require_metadata_entries(
+            self.metadata, field_name="CreateSessionRequest.metadata"
+        )
+
+
+@dataclass(frozen=True, slots=True)
+class CloseSessionRequest:
+    """关闭 Session 的请求。
+
+    字段语义：
+
+    - ``context``：调用上下文。
+    - ``client_request_id``：客户端操作幂等 id。
+    - ``reason``：关闭原因机器码或短说明。
+    """
+
+    context: HostCallContext
+    client_request_id: str
+    reason: str
+
+    def __post_init__(self) -> None:
+        """校验 close session 请求字段。
+
+        :returns: 无返回值。
+        :raises ValueError: 幂等 id 或 reason 为空时抛出。
+        """
+
+        _require_non_empty(
+            self.client_request_id,
+            field_name="CloseSessionRequest.client_request_id",
+        )
+        _require_non_empty(
+            self.reason, field_name="CloseSessionRequest.reason"
+        )
+
+
+@dataclass(frozen=True, slots=True)
+class PurgeSessionRequest:
+    """清理已关闭 Session 本地可恢复事实的请求。
+
+    字段语义：
+
+    - ``context``：调用上下文。
+    - ``client_request_id``：客户端操作幂等 id。
+    - ``reason``：清理原因机器码或短说明。
+    """
+
+    context: HostCallContext
+    client_request_id: str
+    reason: str
+
+    def __post_init__(self) -> None:
+        """校验 purge session 请求字段。
+
+        :returns: 无返回值。
+        :raises ValueError: 幂等 id 或 reason 为空时抛出。
+        """
+
+        _require_non_empty(
+            self.client_request_id,
+            field_name="PurgeSessionRequest.client_request_id",
+        )
+        _require_non_empty(
+            self.reason, field_name="PurgeSessionRequest.reason"
+        )
+
+
+@dataclass(frozen=True, slots=True)
+class StartRunRequest:
+    """显式启动独立 Run 的请求。
+
+    字段语义：
+
+    - ``context``：调用上下文。
+    - ``session_id``：目标 Session id。
+    - ``client_request_id``：客户端操作幂等 id。
+    - ``input``：Host 输入 envelope。
+    - ``execution_target``：执行目标标识。
+    - ``queue_policy``：排队策略标识。
+    """
+
+    context: HostCallContext
+    session_id: str
+    client_request_id: str
+    input: HostInput
+    execution_target: str
+    queue_policy: str
+
+    def __post_init__(self) -> None:
+        """校验 start run 请求字段。
+
+        :returns: 无返回值。
+        :raises ValueError: id 或必填字符串为空时抛出。
+        """
+
+        _require_non_empty(
+            self.session_id, field_name="StartRunRequest.session_id"
+        )
+        _require_non_empty(
+            self.client_request_id,
+            field_name="StartRunRequest.client_request_id",
+        )
+        _require_non_empty(
+            self.execution_target,
+            field_name="StartRunRequest.execution_target",
+        )
+        _require_non_empty(
+            self.queue_policy, field_name="StartRunRequest.queue_policy"
+        )
+
+
+@dataclass(frozen=True, slots=True)
+class CancelRunRequest:
+    """取消单个 Run 的请求。
+
+    字段语义：
+
+    - ``context``：调用上下文。
+    - ``client_request_id``：客户端操作幂等 id。
+    - ``reason``：取消原因机器码或短说明。
+    - ``mode``：取消模式；Phase 1 只允许 graceful。
+    """
+
+    context: HostCallContext
+    client_request_id: str
+    reason: str
+    mode: CancelMode
+
+    def __post_init__(self) -> None:
+        """校验 cancel run 请求字段。
+
+        :returns: 无返回值。
+        :raises ValueError: 幂等 id、reason 为空或取消模式非法时抛出。
+        """
+
+        _require_non_empty(
+            self.client_request_id,
+            field_name="CancelRunRequest.client_request_id",
+        )
+        _require_non_empty(self.reason, field_name="CancelRunRequest.reason")
+        _require_graceful_cancel(self.mode, field_name="CancelRunRequest.mode")
+
+
+@dataclass(frozen=True, slots=True)
+class CancelSessionRunsRequest:
+    """取消 Session 下全部未终态 Run 的请求。
+
+    字段语义：
+
+    - ``context``：调用上下文。
+    - ``client_request_id``：客户端操作幂等 id。
+    - ``reason``：取消原因机器码或短说明。
+    - ``mode``：取消模式；Phase 1 只允许 graceful。
+    """
+
+    context: HostCallContext
+    client_request_id: str
+    reason: str
+    mode: CancelMode
+
+    def __post_init__(self) -> None:
+        """校验 cancel session runs 请求字段。
+
+        :returns: 无返回值。
+        :raises ValueError: 幂等 id、reason 为空或取消模式非法时抛出。
+        """
+
+        _require_non_empty(
+            self.client_request_id,
+            field_name="CancelSessionRunsRequest.client_request_id",
+        )
+        _require_non_empty(
+            self.reason, field_name="CancelSessionRunsRequest.reason"
+        )
+        _require_graceful_cancel(
+            self.mode, field_name="CancelSessionRunsRequest.mode"
+        )
+
+
+@dataclass(frozen=True, slots=True)
+class SubmitFollowupRequest:
+    """向同一 Session 提交后续输入的请求。
+
+    字段语义：
+
+    - ``context``：调用上下文。
+    - ``session_id``：目标 Session id。
+    - ``client_request_id``：客户端操作幂等 id。
+    - ``input``：Host 输入 envelope。
+    - ``behavior``：queue 或 steer 行为。
+    - ``target_run_id``：steer 目标 Run id；queue 时必须为 ``None``。
+    """
+
+    context: HostCallContext
+    session_id: str
+    client_request_id: str
+    input: HostInput
+    behavior: FollowupBehavior
+    target_run_id: str | None
+
+    def __post_init__(self) -> None:
+        """校验 follow-up 请求字段与 target_run_id 前置条件。
+
+        :returns: 无返回值。
+        :raises ValueError: id 为空、steer 缺目标、queue 携带目标时抛出。
+        """
+
+        _require_non_empty(
+            self.session_id, field_name="SubmitFollowupRequest.session_id"
+        )
+        _require_non_empty(
+            self.client_request_id,
+            field_name="SubmitFollowupRequest.client_request_id",
+        )
+        _require_optional_non_empty(
+            self.target_run_id,
+            field_name="SubmitFollowupRequest.target_run_id",
+        )
+        if (
+            self.behavior == FollowupBehavior.STEER
+            and self.target_run_id is None
+        ):
+            raise ValueError(
+                "SubmitFollowupRequest.target_run_id is required for steer"
+            )
+        if (
+            self.behavior == FollowupBehavior.QUEUE
+            and self.target_run_id is not None
+        ):
+            raise ValueError(
+                "SubmitFollowupRequest.target_run_id must be None for queue"
+            )
+
+
+@dataclass(frozen=True, slots=True)
+class RetryRunRequest:
+    """重试源 Run 的请求。
+
+    字段语义：
+
+    - ``context``：调用上下文。
+    - ``client_request_id``：客户端操作幂等 id。
+    - ``reason``：重试原因机器码或短说明。
+    """
+
+    context: HostCallContext
+    client_request_id: str
+    reason: str
+
+    def __post_init__(self) -> None:
+        """校验 retry run 请求字段。
+
+        :returns: 无返回值。
+        :raises ValueError: 幂等 id 或 reason 为空时抛出。
+        """
+
+        _require_non_empty(
+            self.client_request_id,
+            field_name="RetryRunRequest.client_request_id",
+        )
+        _require_non_empty(self.reason, field_name="RetryRunRequest.reason")
+
+
+@dataclass(frozen=True, slots=True)
+class ReplayRunRequest:
+    """对源 Run 做 no-tool 结构修复的请求。
+
+    字段语义：
+
+    - ``context``：调用上下文。
+    - ``client_request_id``：客户端操作幂等 id。
+    - ``reason``：replay 原因机器码或短说明。
+    - ``repair_instruction``：结构修复指令。
+    """
+
+    context: HostCallContext
+    client_request_id: str
+    reason: str
+    repair_instruction: str
+
+    def __post_init__(self) -> None:
+        """校验 replay run 请求字段。
+
+        :returns: 无返回值。
+        :raises ValueError: 幂等 id、reason 或修复指令为空时抛出。
+        """
+
+        _require_non_empty(
+            self.client_request_id,
+            field_name="ReplayRunRequest.client_request_id",
+        )
+        _require_non_empty(self.reason, field_name="ReplayRunRequest.reason")
+        _require_non_empty(
+            self.repair_instruction,
+            field_name="ReplayRunRequest.repair_instruction",
+        )
+
+
+@dataclass(frozen=True, slots=True)
+class ResolveWaitRequest:
+    """接收外部等待结果并交给 Host 治理的请求。
+
+    字段语义：
+
+    - ``context``：调用上下文。
+    - ``idempotency_key``：等待结果接收幂等键。
+    - ``outcome_ref``：等待结果引用。
+    - ``source``：等待结果来源。
+    - ``observed_at``：结果观测时间字符串。
+    """
+
+    context: HostCallContext
+    idempotency_key: str
+    outcome_ref: str
+    source: WaitResolutionSource
+    observed_at: str
+
+    def __post_init__(self) -> None:
+        """校验 resolve wait 请求字段。
+
+        :returns: 无返回值。
+        :raises ValueError: 幂等键、结果引用或观测时间为空时抛出。
+        """
+
+        _require_non_empty(
+            self.idempotency_key,
+            field_name="ResolveWaitRequest.idempotency_key",
+        )
+        _require_non_empty(
+            self.outcome_ref, field_name="ResolveWaitRequest.outcome_ref"
+        )
+        _require_non_empty(
+            self.observed_at, field_name="ResolveWaitRequest.observed_at"
+        )
+
+
+@dataclass(frozen=True, slots=True)
+class TerminalResultSummary:
+    """Run 终态结果摘要。
+
+    字段语义：
+
+    - ``status``：Run 终态状态。
+    - ``summary_ref``：终态摘要引用；无摘要时为 ``None``。
+    - ``summary_digest``：终态摘要内容摘要；无摘要时为 ``None``。
+    """
+
+    status: RunStatus
+    summary_ref: str | None
+    summary_digest: str | None
+
+    def __post_init__(self) -> None:
+        """校验终态结果摘要引用字段。
+
+        :returns: 无返回值。
+        :raises ValueError: 可选引用或摘要存在但为空时抛出。
+        """
+
+        _require_optional_non_empty(
+            self.summary_ref, field_name="TerminalResultSummary.summary_ref"
+        )
+        _require_optional_non_empty(
+            self.summary_digest,
+            field_name="TerminalResultSummary.summary_digest",
+        )
+
+
+@dataclass(frozen=True, slots=True)
+class OutboxSummary:
+    """终态 outbox 投递摘要。
+
+    字段语义：
+
+    - ``terminal_event_id``：终态事件 id。
+    - ``event_sequence``：终态事件序列号。
+    - ``delivery_state``：投递状态标识。
+    """
+
+    terminal_event_id: str
+    event_sequence: int
+    delivery_state: str
+
+    def __post_init__(self) -> None:
+        """校验 outbox 摘要字段。
+
+        :returns: 无返回值。
+        :raises ValueError: 事件 id、投递状态为空或序列号为负时抛出。
+        """
+
+        _require_non_empty(
+            self.terminal_event_id, field_name="OutboxSummary.terminal_event_id"
+        )
+        _require_non_negative(
+            self.event_sequence, field_name="OutboxSummary.event_sequence"
+        )
+        _require_non_empty(
+            self.delivery_state, field_name="OutboxSummary.delivery_state"
+        )
+
+
+@dataclass(frozen=True, slots=True)
+class SessionSnapshot:
+    """Session read model 快照。
+
+    字段语义：
+
+    - ``session_id``：Session id。
+    - ``status``：Session 当前状态。
+    - ``slot``：绑定 slot；未绑定时为 ``None``。
+    - ``active_run_id``：当前 active Run id；无 active Run 时为 ``None``。
+    - ``queued_run_ids``：已持久化但未启动的 queued Run id。
+    - ``timeline_cursor``：Session timeline 当前游标。
+    """
+
+    session_id: str
+    status: SessionStatus
+    slot: SessionSlotRef | None
+    active_run_id: str | None
+    queued_run_ids: tuple[str, ...]
+    timeline_cursor: HostStreamCursor
+
+    def __post_init__(self) -> None:
+        """校验 Session 快照 id 字段。
+
+        :returns: 无返回值。
+        :raises ValueError: Session id、active run id 或 queued run id 为空时抛出。
+        """
+
+        _require_non_empty(
+            self.session_id, field_name="SessionSnapshot.session_id"
+        )
+        _require_optional_non_empty(
+            self.active_run_id, field_name="SessionSnapshot.active_run_id"
+        )
+        for run_id in self.queued_run_ids:
+            _require_non_empty(
+                run_id, field_name="SessionSnapshot.queued_run_ids"
+            )
+
+
+@dataclass(frozen=True, slots=True)
+class RunSnapshot:
+    """Run read model 快照。
+
+    字段语义：
+
+    - ``run_id``：Run id。
+    - ``session_id``：所属 Session id。
+    - ``status``：Run 当前状态。
+    - ``current_attempt_id``：当前 Attempt id；无当前 Attempt 时为 ``None``。
+    - ``terminal_result_summary``：终态结果摘要；非终态或无摘要时为 ``None``。
+    - ``event_cursor``：Run 当前事件游标。
+    - ``source_run_id``：retry / replay 源 Run id；无源 Run 时为 ``None``。
+    - ``source_run_relation``：与源 Run 的关系；无源 Run 时为 ``None``。
+    - ``outbox_summary``：终态 outbox 摘要；无投递摘要时为 ``None``。
+    """
+
+    run_id: str
+    session_id: str
+    status: RunStatus
+    current_attempt_id: str | None
+    terminal_result_summary: TerminalResultSummary | None
+    event_cursor: HostStreamCursor
+    source_run_id: str | None
+    source_run_relation: SourceRunRelation | None
+    outbox_summary: OutboxSummary | None
+
+    def __post_init__(self) -> None:
+        """校验 Run 快照 id 字段。
+
+        :returns: 无返回值。
+        :raises ValueError: id 字段为空，或 source relation 与 source id 不一致时抛出。
+        """
+
+        _require_non_empty(self.run_id, field_name="RunSnapshot.run_id")
+        _require_non_empty(
+            self.session_id, field_name="RunSnapshot.session_id"
+        )
+        _require_optional_non_empty(
+            self.current_attempt_id,
+            field_name="RunSnapshot.current_attempt_id",
+        )
+        _require_optional_non_empty(
+            self.source_run_id, field_name="RunSnapshot.source_run_id"
+        )
+        if self.source_run_id is None and self.source_run_relation is not None:
+            raise ValueError(
+                "RunSnapshot.source_run_relation requires source_run_id"
+            )
+        if self.source_run_id is not None and self.source_run_relation is None:
+            raise ValueError(
+                "RunSnapshot.source_run_id requires source_run_relation"
+            )
+
+
+@dataclass(frozen=True, slots=True)
+class FollowupSnapshot:
+    """follow-up 接受结果快照。
+
+    字段语义：
+
+    - ``accepted_input_ref``：已接受输入的引用。
+    - ``behavior``：Host 采用的 follow-up 行为。
+    - ``target_run_id``：steer 目标 Run id；queue 时为 ``None``。
+    - ``queued_run_id``：queue 产生的 Run id；steer 时为 ``None``。
+    - ``current_cursor``：接受后的当前事件游标。
+    """
+
+    accepted_input_ref: str
+    behavior: FollowupBehavior
+    target_run_id: str | None
+    queued_run_id: str | None
+    current_cursor: HostStreamCursor
+
+    def __post_init__(self) -> None:
+        """校验 follow-up 快照字段与行为一致性。
+
+        :returns: 无返回值。
+        :raises ValueError: 引用 / id 为空或 queue / steer 字段组合非法时抛出。
+        """
+
+        _require_non_empty(
+            self.accepted_input_ref,
+            field_name="FollowupSnapshot.accepted_input_ref",
+        )
+        _require_optional_non_empty(
+            self.target_run_id, field_name="FollowupSnapshot.target_run_id"
+        )
+        _require_optional_non_empty(
+            self.queued_run_id, field_name="FollowupSnapshot.queued_run_id"
+        )
+        if self.behavior == FollowupBehavior.STEER:
+            if self.target_run_id is None:
+                raise ValueError(
+                    "FollowupSnapshot.target_run_id is required for steer"
+                )
+            if self.queued_run_id is not None:
+                raise ValueError(
+                    "FollowupSnapshot.queued_run_id must be None for steer"
+                )
+        if self.behavior == FollowupBehavior.QUEUE:
+            if self.target_run_id is not None:
+                raise ValueError(
+                    "FollowupSnapshot.target_run_id must be None for queue"
+                )
+            if self.queued_run_id is None:
+                raise ValueError(
+                    "FollowupSnapshot.queued_run_id is required for queue"
+                )
+
+
+@dataclass(frozen=True, slots=True)
+class PurgeSessionResult:
+    """Session 清理结果。
+
+    字段语义：
+
+    - ``session_id``：被清理的 Session id。
+    - ``purged``：是否完成清理。
+    - ``purge_tombstone_ref``：清理 tombstone 引用；未清理时为 ``None``。
+    - ``deleted_counts_digest``：删除计数摘要；未清理时为 ``None``。
+    """
+
+    session_id: str
+    purged: bool
+    purge_tombstone_ref: str | None
+    deleted_counts_digest: str | None
+
+    def __post_init__(self) -> None:
+        """校验清理结果字段。
+
+        :returns: 无返回值。
+        :raises ValueError: Session id 为空，或可选引用存在但为空时抛出。
+        """
+
+        _require_non_empty(
+            self.session_id, field_name="PurgeSessionResult.session_id"
+        )
+        _require_optional_non_empty(
+            self.purge_tombstone_ref,
+            field_name="PurgeSessionResult.purge_tombstone_ref",
+        )
+        _require_optional_non_empty(
+            self.deleted_counts_digest,
+            field_name="PurgeSessionResult.deleted_counts_digest",
+        )
+
+
+@dataclass(frozen=True, slots=True)
+class HostEventView:
+    """Host event stream 的事件视图。
+
+    字段语义：
+
+    - ``event_sequence``：全局单调事件序列。
+    - ``event_id``：canonical event id。
+    - ``event_type``：事件类型标识。
+    - ``session_id``：关联 Session id。
+    - ``run_id``：关联 Run id；事件不绑定 Run 时为 ``None``。
+    - ``payload_ref``：事件 payload 引用；无 payload 时为 ``None``。
+    - ``payload_digest``：事件 payload 摘要；无 payload 时为 ``None``。
+    """
+
+    event_sequence: int
+    event_id: str
+    event_type: str
+    session_id: str
+    run_id: str | None
+    payload_ref: str | None
+    payload_digest: str | None
+
+    def __post_init__(self) -> None:
+        """校验 Host event view 字段。
+
+        :returns: 无返回值。
+        :raises ValueError: 序列号为负、id 为空或可选引用存在但为空时抛出。
+        """
+
+        _require_non_negative(
+            self.event_sequence, field_name="HostEventView.event_sequence"
+        )
+        _require_non_empty(self.event_id, field_name="HostEventView.event_id")
+        _require_non_empty(
+            self.event_type, field_name="HostEventView.event_type"
+        )
+        _require_non_empty(
+            self.session_id, field_name="HostEventView.session_id"
+        )
+        _require_optional_non_empty(
+            self.run_id, field_name="HostEventView.run_id"
+        )
+        _require_optional_non_empty(
+            self.payload_ref, field_name="HostEventView.payload_ref"
+        )
+        _require_optional_non_empty(
+            self.payload_digest, field_name="HostEventView.payload_digest"
+        )
+
+
+@dataclass(frozen=True, slots=True)
+class HostEventStream:
+    """Host event stream 补读结果。
+
+    字段语义：
+
+    - ``events``：按 ``event_sequence`` 排列的事件视图。
+    - ``next_cursor``：下一次补读使用的游标。
+    """
+
+    events: tuple[HostEventView, ...]
+    next_cursor: HostStreamCursor
+
+
+class HostApiError(Exception):
+    """Host API 结构化异常。
+
+    字段语义：
+
+    - ``code``：结构化错误码。
+    - ``message``：人类可读错误描述。
+    - ``retryable``：调用方是否可以重试同一操作。
+    """
+
+    code: HostApiErrorCode
+    message: str
+    retryable: bool
+
+    def __init__(
+        self, *, code: HostApiErrorCode, message: str, retryable: bool
+    ) -> None:
+        """构造 Host API 异常。
+
+        :param code: 结构化错误码。
+        :param message: 人类可读错误描述。
+        :param retryable: 调用方是否可以重试同一操作。
+        :returns: 无返回值。
+        :raises ValueError: ``message`` 为空或仅包含空白字符时抛出。
+        """
+
+        _require_non_empty(message, field_name="HostApiError.message")
+        self.code = code
+        self.message = message
+        self.retryable = retryable
+        super().__init__(message)
+
+
+__all__ = [
+    "AttemptStatus",
+    "AuthorizationClaim",
+    "CancelMode",
+    "CancelRunRequest",
+    "CancelSessionRunsRequest",
+    "CloseSessionRequest",
+    "CreateSessionRequest",
+    "EnsureSessionRequest",
+    "FollowupBehavior",
+    "FollowupSnapshot",
+    "HostApiError",
+    "HostApiErrorCode",
+    "HostCallContext",
+    "HostCommandFacet",
+    "HostEventStream",
+    "HostEventView",
+    "HostInput",
+    "HostMetadataEntry",
+    "HostStreamCursor",
+    "OperationContext",
+    "OutboxSummary",
+    "PurgeSessionRequest",
+    "PurgeSessionResult",
+    "ReplayRunRequest",
+    "ResolveWaitRequest",
+    "RetryRunRequest",
+    "RunSnapshot",
+    "RunStatus",
+    "SessionSlotRef",
+    "SessionSnapshot",
+    "SessionStatus",
+    "SourceRunRelation",
+    "StartRunRequest",
+    "SubmitFollowupRequest",
+    "TerminalResultSummary",
+    "WaitResolutionSource",
+]

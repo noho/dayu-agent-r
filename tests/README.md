@@ -14,10 +14,10 @@ source .venv/bin/activate
 
 ## 常用命令
 
-运行当前契约、Runtime 与 Engine 测试：
+运行当前契约、Host、Runtime 与 Engine 测试：
 
 ```bash
-pytest tests/contracts tests/runtime tests/engine -q
+pytest tests/contracts tests/host tests/runtime tests/engine -q
 ```
 
 运行类型检查：
@@ -30,6 +30,7 @@ python -m pyright dayu/ tests/ utils/
 
 ```bash
 pytest tests/contracts -q
+pytest tests/host -q
 pytest tests/runtime -q
 pytest tests/engine -q
 pytest tests/engine/contracts -q
@@ -56,6 +57,15 @@ pytest tests/engine/test_smoke_async_agent_providers.py -q
 - weak typing guard：通过 AST 扫描阻止 `Any`、`object`、无类型签名与裸容器注解进入公共契约源码。
 - ToolExecutionOutcome / ToolResult / ToolCall 等契约测试：覆盖工具调用 provider state、工具结果信封、工具执行 outcome 封闭联合与穷尽匹配。
 - tool declaration：覆盖最小 `@tool(..., truncate=ToolTruncateSpec(...))` 声明能力，确认 `ToolDefinition` / `ToolBundle` 只投影 `ToolSchema` 给 Engine。
+
+### `tests/host/`
+
+Host 公共 API 类型测试，覆盖 `dayu.host` 的稳定边界：
+
+- package exports：锁定 `dayu.host.__all__` 与 `dayu.host.api.__all__` 白名单，阻止未承诺类型泄漏到包根。
+- public contracts：验证 status / error 枚举字符串值、frozen slots dataclass、结构化 `HostApiError` 与 request validation failure paths。
+- import boundary：阻止 Host 公共类型层导入 Engine、Fins、Service 或 UI。
+- weak typing guard：通过 AST 扫描阻止 `Any`、`object`、无类型签名与裸容器注解进入 Host 公共类型源码。
 
 ### `tests/engine/`
 
@@ -93,6 +103,7 @@ OpenAI-compatible Runner 的 provider 协议测试，覆盖从 payload 构建、
 ## 维护约定
 
 - 新增公共契约必须补 package export、import boundary、weak typing guard 相关测试。
+- 新增 Host 公共类型必须同步更新 `tests/host/test_package_exports.py`，并为新增 request / snapshot 校验补充 public contracts 测试。
 - 新增 Runner 行为必须优先补协议事件流测试，确保下游 Engine loop 能无歧义消费。
 - 状态机测试必须覆盖输入事实、状态分支、事件顺序、终态收口。
 - 架构边界测试必须阻止反向依赖，尤其是下层导入上层实现或私有治理概念。
