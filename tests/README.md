@@ -32,6 +32,7 @@ python -m pyright dayu/ tests/ utils/
 pytest tests/contracts -q
 pytest tests/host -q
 pytest tests/runtime -q
+pytest tests/runtime/test_lane.py tests/runtime/test_lane_multiprocess.py -q
 pytest tests/engine -q
 pytest tests/engine/contracts -q
 pytest tests/engine/runners/openai/test_event_flow_ordering.py -q
@@ -46,6 +47,10 @@ pytest tests/engine/test_smoke_async_agent_providers.py -q
 
 - import boundary：阻止 runtime 反向依赖 Engine、Service、UI、fins 或引入运行期 HTTP 客户端。
 - cancellation：覆盖取消等待 helper 的完成、取消与异常传播语义。
+- lane：覆盖 cross-process named semaphore / capacity guard 的配置校验、独立 SQLite runtime lane DB schema、acquire /
+  heartbeat / release、timeout、协作式 cancellation、`Task.cancel()` 透传、controller close、跨进程 capacity invariant、
+  release 后其它进程 acquire，以及 crash 后 TTL stale cleanup eventual acquire；测试不断言 FIFO、公平性或 Host
+  dispatch 集成。
 - logging：验证 `dayu.runtime.log` 的 logger 装配、CLI 风格级别解析、`VERBOSE` / `CRITICAL` 级别契约，并验证 `dayu.runtime.log_levels` 只提供公共日志级别常量、不注册 stdlib logging level。
 
 ### `tests/contracts/`
