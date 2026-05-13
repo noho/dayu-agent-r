@@ -13,7 +13,7 @@ UI -> Service -> Host -> Engine
 
 ## 设计目标
 
-- 为宿主强约束下的 LLM in the loop 提供单次 run 的执行状态机、Runner 协议归一、工具调用闭环与强类型事件流。
+- 为宿主强约束下的 LLM in the loop 提供单次 run 的执行状态机、Runner 协议归一、工具调用闭环与强类型 `EngineEvent stream`。
 - Agent 与 Runner 都是 run-scoped 一次性对象：一次 `AgentRunRequest` 对应一次 Agent / Runner 生命周期；run 结束、失败、取消或挂起后，Engine 不复用旧实例。
 
 ## 接口
@@ -45,7 +45,7 @@ from dayu.engine.contracts import AgentRunRequest, RunnerSpec
 
 ### 执行入口
 
-`run_agent_messages(request)` 运行一次 Agent，并返回 `EngineEvent` 异步流。
+`run_agent_messages(request)` 运行一次 Agent，并返回 `EngineEvent stream`。这里的 stream 是本次 Engine run 的异步生成器，不是 Host event stream，也不携带 Host `event_sequence` cursor。
 
 - 参数类型是 `AgentRunRequest`。
 - 返回值是异步生成器。
@@ -54,7 +54,7 @@ from dayu.engine.contracts import AgentRunRequest, RunnerSpec
 - `run_suspended` 或 `run_cancelled` 之后若要继续原目标，调用方需要构造新的 `AgentRunRequest`，把恢复输入、工具终态结果或用户意图显式放回 `messages`。
 - Runner 构造失败时异常继续透传。
 
-`run_agent_and_wait(request)` 运行一次 Agent，并完整消费 `run_agent_messages(request)` 直到终态。
+`run_agent_and_wait(request)` 运行一次 Agent，并完整消费 `run_agent_messages(request)` 的 `EngineEvent stream` 直到终态。
 
 - 参数类型是 `AgentRunRequest`。
 - 返回值类型是 `AgentRunResult`。
@@ -80,7 +80,7 @@ Engine 消费这些字段完成单次 run；不从配置文件、调用方状态
 
 ### 事件接口
 
-`EngineEvent` 是 Engine 对调用方暴露的事件对象，字段包括：
+`EngineEvent` 是 Engine 对调用方暴露的事件对象，组成 `EngineEvent stream`。字段包括：
 
 - `occurred_at`
 - `session_id`
@@ -89,7 +89,7 @@ Engine 消费这些字段完成单次 run；不从配置文件、调用方状态
 - `data`
 - `metadata`
 
-事件顺序由异步流产出顺序定义。`metadata` 只能承载中性 observer / debug hint，不承载契约事实。
+事件顺序由异步流产出顺序定义。EngineEvent 不提供事件序号、持久化 cursor、幂等键或 Host `event_sequence`；这些属于 Engine 外部调用方，尤其是 Host EventLog / Host event stream。`metadata` 只能承载中性 observer / debug hint，不承载契约事实。
 
 `EngineEventType` 当前包括：
 
@@ -196,7 +196,7 @@ RunnerEvent 与 EngineEvent 是两层事件。RunnerEvent 不含 `session_id` / 
 
 ## 边界
 
-Engine 位于 `UI -> Service -> Host -> Engine` 链路最下游，只负责执行单次 Agent run 所需的协议归一、工具调用编排、事件流和终态结果。
+Engine 位于 `UI -> Service -> Host -> Engine` 链路最下游，只负责执行单次 Agent run 所需的协议归一、工具调用编排、`EngineEvent stream` 和终态结果。
 
 Engine 不负责：
 
@@ -207,6 +207,14 @@ Engine 不负责：
 - UI / Service / Host 的状态机、恢复策略或展示策略。
 
 Engine 可以透传 `session_id`、`run_id`、provider request id、工具调用 id 等契约字段，但不规定这些标识的生成、持久化或去重方式。
+
+Stream 术语边界：
+
+- `EngineEvent stream`：`run_agent_messages(request)` 产出的本次 run 异步事件流。它是调用方 ingest 的输入来源，不是 durable truth。
+- `RunnerEvent stream`：Runner 到 Agent 的 provider 协议归一事件流，只在 Engine 内部消费，不直接暴露给 Engine 调用方。
+- `SSE stream` / provider streaming：Runner 与 provider 之间的传输能力，由 `RunnerCallOptions.stream`、`RunnerSpec.supports_streaming`、`supports_stream_usage` 和 SSE idle 配置控制。
+- `Host event stream`：Host 从 EventLog `event_sequence` cursor 派生的订阅 / 补读流，不属于 Engine 能力面。
+- `content_delta`、`reasoning_delta`、`tool_call_delta` 是 EngineEvent / RunnerEvent 的增量事件；是否进入 Host preview、canonical EventLog、memory 或 audit，由 Host ingest 与治理策略决定。
 
 ## 执行路径
 
@@ -279,7 +287,7 @@ run_agent_messages(request)
       -> if failure selected
           -> emit EngineEvent.run_failed
           -> close Runner
-  -> EngineEvent async stream
+  -> EngineEvent stream
 ```
 
 ```text
@@ -290,7 +298,7 @@ run_agent_and_wait(request)
   -> map run_failed -> EngineRunOutcomeFailed
   -> map run_cancelled -> EngineRunOutcomeCancelled
   -> map run_suspended -> EngineRunOutcomeSuspended
-  -> if stream ends without terminal -> EngineRunOutcomeFailed
+  -> if EngineEvent stream ends without terminal -> EngineRunOutcomeFailed
 ```
 
 ## 状态机
@@ -342,7 +350,7 @@ FORCE_ANSWER -> CANCELLED
 
 Terminal 事件集合由 `TERMINAL_ENGINE_EVENT_TYPES` 定义。进入 `FINAL_ANSWERED`、`FAILED`、`SUSPENDED` 或 `CANCELLED` 后，本次 run 不再继续产出普通事件。
 
-## 事件流
+## EngineEvent Stream
 
 `EngineEventType` 当前公共事件名如下：
 
@@ -365,7 +373,7 @@ Terminal 事件集合由 `TERMINAL_ENGINE_EVENT_TYPES` 定义。进入 `FINAL_AN
 - `run_cancelled`
 - `run_failed`
 
-事件顺序由异步流实际产出顺序定义。EngineEvent 不提供单独的事件序号字段、持久化游标或幂等键。
+事件顺序由异步流实际产出顺序定义。EngineEvent 不提供单独的事件序号字段、持久化游标、幂等键或 Host `event_sequence`。调用方如果需要恢复、补读、多客户端 fanout、audit 或 memory，必须在 Engine 外部把 EngineEvent ingest 成自己的 durable facts。
 
 RunnerEvent 层当前事件名如下：
 
@@ -395,7 +403,7 @@ HTTP 200 response 在 effective stream 为 `True` 且 `Content-Type` 为 `text/e
 
 工具握手 timeout 是 Engine 对 `ToolExecutor.execute` 的等待预算，不是外部长事务 timeout。`AgentPolicy.tool_execution_timeout_seconds` 是该预算真源；Engine 同时把它投影到 `BatchToolExecutionContext.timeout_seconds`，供 ToolExecutor 所在的工具执行环境协作设置内部等待边界。timeout 先于 outcome 命中时，runtime helper 取消 execute task，Engine 以不可恢复 `run_failed(tool_execution_timeout)` 收口。ToolExecutor 及其背后的工具执行环境负责协作响应取消，并治理可能已经启动的线程、子进程、HTTP 请求或远端 job。
 
-`@tool(...)` 与 `ToolDefinition` 用于 Host / ToolRuntime 侧的工具声明和装配，不是 Engine 工具执行入口。Host / ToolRuntime 可以用 `@tool(...)` 获取 schema、truncate、display、tags 与单工具 `ToolCallable`，再用自身权限、审批、限流、并发、timeout、审计、awaiting 和 cleanup 策略包装出 batch `ToolExecutor`。Engine 不提供默认 `FunctionToolExecutor`，也不规定 batch 内部执行策略。
+`@tool(...)` 与 `ToolDefinition` 用于 Host / ToolRuntime 侧的工具声明和装配，不是 Engine 工具执行入口。Host / ToolRuntime 可以用 `@tool(...)` 获取 schema、truncate、display、tags 与单工具 `ToolCallable`，再用自身权限、审批、限流、并发、timeout、审计、awaiting、truncation cursor / scope_token 和 cleanup 策略包装出 batch `ToolExecutor`。Engine 不提供默认 `FunctionToolExecutor`，也不规定 batch 内部执行策略。
 
 挂起 / 恢复协议以 `ToolAwaitingOutcome` 为边界。工具开始外部长事务并建议挂起时，ToolExecutor 返回 `await_spec` 与 `snapshot`；Engine 先产出 `tool_awaiting`，再以 `run_suspended` 收口并关闭 Runner。Engine 不等待外部长事务完成，不持久化等待记录，也不恢复旧 Agent/Runner 实例；上层调用者保存 `await_spec` / `snapshot`，等工具终态确定后构造新的 `AgentRunRequest`，把工具终态结果或恢复输入显式交回 Engine。
 
@@ -403,7 +411,7 @@ Engine 的取消提交边界是“阻止未来工作，不覆盖已接受事实�
 
 provider 协议错误与 HTTP / 网络错误分层处理。Runner 解析层错误产出 `provider_protocol_error`；HTTP、网络、超时和上下文超限产出 `runner_http_error`。其中上下文长度超限会被 Engine 提升为 `context_compaction_requested`，并以可恢复失败候选收口；是否压缩、如何恢复不属于 Engine。
 
-Runner close 是 run-scoped 收尾机制。`run_agent_messages` 在生成器结束或关闭时会触发内部事件流关闭；Agent 也在终态路径和最终清理中幂等关闭 Runner。Runner close 失败只记录诊断，不改写已经确定的公共终态。
+Runner close 是 run-scoped 收尾机制。`run_agent_messages` 在生成器结束或关闭时会触发 `EngineEvent stream` 关闭；Agent 也在终态路径和最终清理中幂等关闭 Runner。Runner close 失败只记录诊断，不改写已经确定的公共终态。
 
 `metadata` 是 EngineEvent 的中性 observer / debug hint 边界。契约事实必须进入强类型 data 字段，不得放进 metadata 让调用方解析。
 

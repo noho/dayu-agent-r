@@ -1,10 +1,10 @@
 # Engine 设计说明
 
-本文档描述当前代码中的 Engine 设计事实。Engine 提供一次性 Agent run 的函数式入口、Runner 协议归一、工具调用闭环、事件流与终态 outcome。Engine 不保存跨 run 状态，不拥有工具注册表，不读取配置文件，不理解财报业务语义，也不直接访问财报文档存储。
+本文档描述当前代码中的 Engine 设计事实。Engine 提供一次性 Agent run 的函数式入口、Runner 协议归一、工具调用闭环、`EngineEvent stream` 与终态 outcome。Engine 不保存跨 run 状态，不拥有工具注册表，不读取配置文件，不理解财报业务语义，也不直接访问财报文档存储。
 
 ## 1. 边界与职责
 
-Engine 位于调用方下游，只暴露运行一次 Agent 所需的输入、输出与中性协议。调用方负责构造完整的 `AgentRunRequest`，Engine 只消费请求中的事实并产出 `EngineEvent` 流或聚合后的 `AgentRunResult`。
+Engine 位于调用方下游，只暴露运行一次 Agent 所需的输入、输出与中性协议。调用方负责构造完整的 `AgentRunRequest`，Engine 只消费请求中的事实并产出 `EngineEvent stream` 或聚合后的 `AgentRunResult`。
 
 Engine 当前负责：
 
@@ -24,6 +24,18 @@ Engine 当前不负责：
 
 财报文档存取不属于 Engine 能力面。涉及财报文档的工具必须在 Engine 外部执行环境内遵守 `dayu.fins.storage` 仓储约束；Engine 只看见工具 schema、工具调用请求和工具 outcome。
 
+### 1.1 Stream 术语边界
+
+本文档不得把不同层的流式概念混称为 “stream”。固定术语如下：
+
+- `EngineEvent stream`：`run_agent_messages(request)` 产出的本次 run 异步事件流。它是调用方 ingest 的输入来源，不是 durable truth。
+- `RunnerEvent stream`：Runner 到 Agent 的 provider 协议归一事件流，只在 Engine 内部消费，不直接暴露给 Engine 调用方。
+- `SSE stream` / provider streaming：Runner 与 provider 之间的传输能力，由 `RunnerCallOptions.stream`、`RunnerSpec.supports_streaming`、`supports_stream_usage` 和 SSE idle 配置控制。
+- `Host event stream`：Host 从 EventLog `event_sequence` cursor 派生的订阅 / 补读流，不属于 Engine 能力面。
+- `content_delta`、`reasoning_delta`、`tool_call_delta` 是 EngineEvent / RunnerEvent 的增量事件；是否进入 Host preview、canonical EventLog、memory 或 audit，由 Host ingest 与治理策略决定。
+
+EngineEvent 不提供事件序号、持久化 cursor、幂等键或 Host `event_sequence`。这些属于调用方，尤其是 Host EventLog / Host event stream。
+
 ## 2. 公共入口
 
 Engine 公共入口由 `dayu.engine.agent` 提供，并通过 `dayu.engine.__init__` 导出：
@@ -31,9 +43,9 @@ Engine 公共入口由 `dayu.engine.agent` 提供，并通过 `dayu.engine.__ini
 - `run_agent_messages(request: AgentRunRequest) -> AsyncGenerator[EngineEvent, None]`
 - `run_agent_and_wait(request: AgentRunRequest) -> AgentRunResult`
 
-`run_agent_messages` 是流式入口。它为本次 request 构造新的 Runner 与私有 `_AsyncAgent`，然后产出 `EngineEvent`。调用方必须完整消费生成器；若提前停止消费，必须显式 `aclose()`，以触发 Runner 关闭和 run-scoped 资源收尾。
+`run_agent_messages` 是 `EngineEvent stream` 入口。它为本次 request 构造新的 Runner 与私有 `_AsyncAgent`，然后产出 `EngineEvent`。调用方必须完整消费生成器；若提前停止消费，必须显式 `aclose()`，以触发 Runner 关闭和 run-scoped 资源收尾。
 
-`run_agent_and_wait` 是聚合入口。它完整消费 `run_agent_messages` 的事件流，并把 terminal event 转换为 `AgentRunResult` 的四种封闭终态之一：
+`run_agent_and_wait` 是聚合入口。它完整消费 `run_agent_messages` 的 `EngineEvent stream`，并把 terminal event 转换为 `AgentRunResult` 的四种封闭终态之一：
 
 - `EngineRunOutcomeFinalAnswer`
 - `EngineRunOutcomeFailed`
@@ -49,7 +61,7 @@ Engine 当前采用 run-scoped 一次性 Agent / Runner 模型：
 - 每次 `run_agent_messages(request)` 都创建新的 `_AsyncAgent`。
 - 每次 run 都通过 `_build_runner(request)` 创建新的 `AsyncOpenAIRunner`。
 - `_AsyncAgent` 实例只服务一个 run，并用实例级运行槽防止并发复用。
-- Runner 的 HTTP session、SSE stream 与 provider 请求资源属于本次 run。
+- Runner 的 HTTP session、provider-side SSE stream 与 provider 请求资源属于本次 run。
 - run 正常结束、失败、取消、挂起或生成器关闭时，Agent 都会幂等调用 `runner.close()`。
 - 本次 run 内的消息列表、iteration 状态、已执行 tool call id、连续失败工具批次计数和续写状态都只存在于该 Agent 实例内。
 
@@ -195,7 +207,7 @@ provider 请求扩展是封闭联合：
 
 ## 9. RunnerEvent
 
-`RunnerEvent` 是 Runner 到 Agent 的协议归一事件契约。它通过 Engine contracts 导出，供 Runner 实现和契约测试使用，但不会作为 `run_agent_messages` 的对外事件流直接产出；Agent 必须将 Runner 事实提升为 `EngineEvent`。
+`RunnerEvent` 是 Runner 到 Agent 的协议归一事件契约。它通过 Engine contracts 导出，供 Runner 实现和契约测试使用，但不会作为 `run_agent_messages` 的对外 `EngineEvent stream` 直接产出；Agent 必须将 Runner 事实提升为 `EngineEvent`。
 
 | Runner event | Data 类型 | Agent 处理 |
 | --- | --- | --- |
@@ -345,9 +357,9 @@ Engine 只观察 token，不持有取消治理真源。取消公共终态通过 
 
 取消是当前 run 的 terminal reason。取消后若调用方要继续原目标，必须构造新的 `AgentRunRequest`。
 
-## 14. EngineEvent
+## 14. EngineEvent Stream
 
-`EngineEvent` 是 Engine 对调用方暴露的事件边界：
+`EngineEvent` 是 Engine 对调用方暴露的事件边界，组成 `EngineEvent stream`：
 
 ```python
 @dataclass(frozen=True, slots=True)
@@ -391,6 +403,8 @@ Terminal event 类型固定为：
 
 `tool_call_requested` 是观测事件，不是外部二次执行命令。工具执行由 Agent 状态机在事件之后继续调用 `ToolExecutor.execute` 完成。
 
+`EngineEvent stream` 的顺序只由本次异步生成器产出顺序定义。Engine 不提供持久化 cursor、Host `event_sequence`、重放语义、多客户端 fanout 或 EventLog append；调用方若需要恢复、补读、audit、usage、tool trace 或 memory，必须在 Engine 外部把 EngineEvent ingest 成自己的 durable facts。
+
 ## 15. Context Compaction
 
 当前 Engine 不做上下文压缩，也不在 run 内 compact / retry。
@@ -415,4 +429,4 @@ Terminal event 类型固定为：
 - `ToolParametersSchema.required` 是必填字段名元组。
 - `ToolParametersSchema.additional_properties` 为 `bool | None`。
 
-`ToolTruncateSpec` 与 `ToolTruncationStrategy` 存在于 `dayu.contracts` 公共契约中，不属于 Engine 包根导出的稳定调用面。工具结果截断由 Engine 外部工具执行环境解释和执行；Engine 不创建截断 cursor，不执行 `fetch_more`，不保存跨 run 工具状态。
+`ToolTruncateSpec` 与 `ToolTruncationStrategy` 存在于 `dayu.contracts` 公共契约中，不属于 Engine 包根导出的稳定调用面。工具结果截断由 Engine 外部工具执行环境解释和执行；Engine 不创建 truncation cursor，不生成或校验 `scope_token`，不执行 `fetch_more`，不保存跨 run 工具状态。
