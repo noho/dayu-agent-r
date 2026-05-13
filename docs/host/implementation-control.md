@@ -15,31 +15,25 @@ Host 设计与实施必须始终服务于以下目标：
 - 支持单机多客户端 / 多进程。
 - 支持本地 Engine 和远程 Engine 并列执行。
 
-任何 phase plan、implementation slice、review finding 裁决和 scope 调整，都必须显式对齐这些目标。若某项设计或实现选择削弱这些目标，应停下来回到 `discussion-note.md` 与 `design.md` 修正设计后再继续。
+任何 phase plan、implementation slice、review finding 裁决和 scope 调整，都必须显式对齐这些目标。若某项设计或实现选择削弱这些目标，应停下来修正 `design.md` 后再继续。
 
 ## 真源层级
 
 Host 后续计划与实施遵循以下真源层级：
 
 ```text
-discussion-note.md
-  -> 讨论决议与设计来源
-  -> 记录为什么这样设计
+dayu/README.md
+  -> 项目级术语真源
+  -> 约束跨层、跨 phase 的稳定术语含义
 
 design.md
-  -> 规范化后的 Host 架构真源
-  -> 后续 handoff implementation-ready plan 的主真源
+  -> Host 架构真源
+  -> 定义架构边界、状态机、公共接口、EventLog、恢复、并发、远程执行和关键治理路径
 
 implementation-control.md
   -> 实施编排文档
   -> 只记录 phases、依赖、进入 / 退出条件、交付物和验证要求
 ```
-
-`discussion-note.md` 与 `design.md` 都是生成 phase plan 的输入真源；如果两者出现表达差异，以 `design.md`
-的规范化表述为准。
-
-如果发现 `design.md` 漏掉或误写了 `discussion-note.md` 中已经确认的设计决议，应先修正 `design.md`，再生成或继续
-phase plan。
 
 术语真源是 `dayu/README.md` 的术语表。phase discussion、phase plan、implementation、review、fix 与 re-review
 必须使用该术语表中的定义；不得由 planning / implementation agent 自行重解释 `Session`、`Run`、`Attempt`、
@@ -47,19 +41,18 @@ phase plan。
 `scope_token` 等术语。若发现术语缺失、冲突或不足以指导实施，应先和用户讨论，并同步更新 `dayu/README.md`
 及对应设计文档，再继续推进。
 
-本文档不得引入新的架构边界、状态机、公共接口或事件语义。若实施编排过程中发现需要新的架构决策，应先回到
-`discussion-note.md` 讨论并同步到 `design.md`，再更新本文档的 phase 编排。
+本文档不得引入新的架构边界、状态机、公共接口或事件语义。若实施编排过程中发现需要新的架构决策，应先和用户讨论并同步到 `design.md`，再更新本文档的 phase 编排。
 
 ## 工作流
 
 Host 实施采用以下工作流：
 
 ```text
-discussion-note.md
-  -> generate / update design.md
+draft design checkpoint
   -> update implementation-control.md phases
   -> select one phase
   -> discuss and refine the corresponding design.md section with the user
+  -> update design.md if the phase discussion changes architecture
   -> generate handoff implementation-ready plan for that phase
   -> review plan
   -> user confirmation
@@ -70,7 +63,6 @@ discussion-note.md
 
 每个 phase 单独生成 handoff implementation-ready plan。phase plan 必须基于：
 
-- `discussion-note.md`
 - `design.md`
 - 本文档中对应 phase 的范围、依赖和退出条件
 
@@ -93,8 +85,19 @@ phase discussion 至少需要确认：
 
 - Host 后续每个复杂 work unit、phase plan、public contract change、schema / storage change、state-machine change
   和 architecture-sensitive task 都必须遵循 `$gateflow` 工作流。
+- `docs/host/design.md` 只写终态架构语义，不写 review 过程、用户确认过程、历史讨论、迁移痕迹、上一版对比或临时 open question。流程约束、裁决记录和追踪项分别写入本文档或 `docs/reviews/`。
 - phase plan、implementation 或 fix 过程中如果需要修改 Engine 代码，必须立即停下来向用户确认。未经用户明确确认，
   不得把 Engine 代码修改夹带进 Host phase。
+- phase plan、implementation 或 fix 不得让 Engine 理解 Host 状态、memory、guidance、steer、fetch_more 或 tool governance。
+- phase plan、implementation 或 fix 不得把 projection / timeline / audit / trace / outbox 当事实真源。
+- phase plan、implementation 或 fix 不得把旧 Attempt resume / takeover 作为实现方案。
+- phase plan、implementation 或 fix 不得让 RemoteStub / EngineWorker append EventLog、关闭 Attempt、更新 Run。
+- phase plan、implementation 或 fix 不得引入重 lease / fencing 系统替代 admission + SQLite transaction + CAS。
+- phase plan、implementation 或 fix 不得让远端 sequence、内存 notification 或 projection checkpoint 替代 Host 分配的全局 `event_sequence`。
+- phase plan、implementation 或 fix 不得把 assistant final answer 自动升级为 verified fact。
+- phase plan、implementation 或 fix 不得让 `fetch_more` 走 Host / Engine 特化分支。
+- phase plan、implementation 或 fix 不得把语义级重复工具调用治理放进 Engine；它属于 Host / ToolRuntime。
+- phase plan、implementation 或 fix 不得让 sink 失败影响 EventLog append 或 Run terminal。
 - phase 讨论、plan、implementation、review、fix 或 re-review 过程中出现 material open question 时，必须停下来和用户讨论；
   不得让 planning / implementation agent 自行选择会影响架构、公共接口、状态机、schema、持久化、并发、恢复、测试期望或用户可见行为的方案。
 - 每个 phase 产生的潜在影响、未覆盖项、deferred risk、后续 phase 依赖和明确不做项，必须回写到本文档的追踪区；
@@ -114,6 +117,21 @@ phase discussion 至少需要确认：
 
 ### 追踪区
 
+#### External Job Cancel Adapter 能力追踪
+
+背景决议：
+
+- `WAITING` Run 被 `cancel_run` 命中时，Host 第一版负责 durable 状态收口：append `CANCEL_REQUESTED`，标记 active wait record 为 cancelled，append `RUN_CANCELLED`，并释放 Session active slot。
+- 外部 job 的实际取消属于对应 wait adapter / tool adapter 的 best-effort 能力，不作为 Host 第一版保证。
+
+追踪项：
+
+- Tool Awaiting / Wait Adapter phase 必须定义 wait record 被 Host 标记 cancelled 后，adapter 如何观察该状态。
+- 后续 adapter 可以按能力实现外部 job cancel / revoke / abandon，但必须明确这是 best-effort，不得影响 Host EventLog 和 Run 终态的正确性。
+- 如果外部 job 在 Host 已取消 Run 后仍回调或被 poll 到结果，Host 必须拒绝其结果进入 canonical EventLog，只能记录 diagnostic / tool trace。
+- 对具有外部副作用、付费调用或长耗时资源占用的工具，后续工具 schema / policy phase 必须明确是否提供 job id、cancel handle、idempotency key 和资源清理策略。
+- 第一版测试至少覆盖：`WAITING -> CANCELLED` 后迟到 `resolve_wait` / callback 不污染 canonical EventLog。
+
 #### Tool Trace / Provider Request 排错追踪
 
 背景核实：
@@ -131,6 +149,12 @@ phase discussion 至少需要确认：
 
 ## 当前状态
 
-当前阶段仍未进入 Host 代码实施。`discussion-note.md` 已沉淀为讨论记录，`design.md` 是 Host 架构真源；
-下一步应基于 `design.md` 与本文档生成 phase 编排或选择第一个 phase，先讨论细化对应设计章节，再进入
-handoff implementation-ready plan。
+当前阶段处于 draft design checkpoint。Host 代码实施尚未开始；`design.md` 已是 Host 架构真源，`dayu/README.md`
+是术语真源，本文档负责后续 phase 编排、进入 / 退出条件、交付物、风险和未覆盖项追踪。
+
+draft2 design review 已完成，Controller 裁决记录在
+`docs/reviews/host-design-review-draft2-controller-adjudication-20260512.md`。需要用户拍板的 open decisions
+已确认，design-fix pass 已写回 `docs/host/design.md`。
+
+下一步可以进入 phase 编排或选择第一个 phase。进入任何 phase plan 前，仍必须先和用户讨论并细化对应
+`design.md` 章节。

@@ -46,7 +46,7 @@ implementation、review、fix 与 re-review 的项目级术语真源。包级 RE
 - `ensure_session`：Host 公共接口，表示“返回这个 slot 当前 Session，不存在则创建并绑定”。它按 `(scope, slot_key)` 幂等，不需要 `client_request_id`。
 - `create_session`：Host 公共接口，表示“明确创建一个新 Session”。它按 `client_request_id` 幂等；可选把新 Session 绑定到某个 session slot。
 - `Run` / `run`：用户可见的一次 Agent 目标 / 问题 / follow-up，属于一个 Session。一个 Session 可以包含多个 Run；Engine 只处理单次 `AgentRunRequest` 的执行语义。
-- `Attempt` / `attempt`：Host 为完成某个 Run 派发给本地或远程 EngineWorker 的一次执行。retry、resume、steer、replay 都创建新 Attempt，不复用旧 Agent / Runner / EngineWorker。
+- `Attempt` / `attempt`：Host 为完成某个 Run 派发给本地或远程 EngineWorker 的一次执行。resume、steer、recovery 等同一 Run 内继续执行路径会创建新 Attempt；retry / replay 创建关联的新 Run，新 Run 再创建自己的 Attempt。任何路径都不复用旧 Agent / Runner / EngineWorker。
 - `Run status`：Host 管理的 Run 生命周期状态。当前设计集合为 `QUEUED`、`RUNNING`、`WAITING`、`CANCELLING`、`RECOVERING`、`SUCCEEDED`、`FAILED`、`CANCELLED`、`LOST`；其中 `SUCCEEDED`、`FAILED`、`CANCELLED`、`LOST` 是终态。
 - `Attempt status`：Host 管理的一次执行尝试状态。当前设计集合为 `RUNNING`、`SUCCEEDED`、`FAILED`、`CANCELLED`、`SUSPENDED`、`STEERED`、`LOST`；Attempt 终态不等于 Run 必然终态。
 - `active Run`：同一 Session 内当前占用执行槽位的 Run。Host 设计语义是同一 Session 同时最多一个 active Run。
@@ -62,6 +62,9 @@ implementation、review、fix 与 re-review 的项目级术语真源。包级 RE
 - `EventLog`：Host 持有的 append-only 事件事实源。Run / Attempt 状态、RunResult、Session timeline、trace、audit、outbox 等能力只能从 EventLog 或同一持久化事务内的事实派生，不反向成为恢复输入真源。
 - `canonical event`：可恢复、可审计、可投影的 Host 事实事件。Host resume 构造新的 `AgentRunRequest.messages` 时，应以 canonical EventLog facts 为真源。
 - `USER_INPUT_ACCEPTED`：Host canonical event，表示某次用户输入已经被 durable accepted，并绑定到具体 Session / Run。它通常包含输入正文或 ref / digest、`session_id`、`run_id`、`client_request_id`、actor、source 和 accepted time；它不是 UI 临时文本，也不是仅一段裸 prompt。
+- `client operation id` / `client_request_id`：客户端或上层入口为一次 Host API 调用提供的幂等身份，用于断线重发、超时重试或重复提交时返回同一个操作结果。它标识的是“客户端操作”，不是 Host EventLog 事件，也不是远端 EngineWorker 事件。
+- `remote event identity`：Proxy / Stub / EngineWorker 回传的来源事件身份，用于 Host 识别远端重放、重复回传或乱序诊断。它可以参与 canonical event identity 的派生，但不能替代 Host 分配的 canonical event identity 或 `event_sequence`。
+- `canonical event identity` / `event_id`：Host EventLog 中单条 canonical fact 的幂等身份。一个远端事件如果映射为多个 canonical events，每个 canonical event 都必须有独立、稳定、可去重的 identity，例如由 `execution_id`、remote event identity、canonical event type 和 sub-index 派生。Host-generated state transition event 也必须有明确的幂等来源，不能混用 `client_request_id` 或 remote event identity。
 - `EngineEvent stream`：EngineWorker 执行 Engine 时产出的事件流。它是 Host ingest 的输入来源之一，不是 Host 事实真源。
 - `RunnerEvent stream`：Runner 到 Agent 的 provider 协议归一事件流，只在 Engine 内部消费，不直接暴露给 Engine 调用方，也不是 Host 事实真源。
 - `SSE stream` / `provider streaming`：Runner 与 provider 之间的传输能力，由 Runner 规约和单次 Runner 调用参数控制。它不是 `EngineEvent stream`，也不是 `Host event stream`。
@@ -83,15 +86,15 @@ implementation、review、fix 与 re-review 的项目级术语真源。包级 RE
 - `RemoteStub`：远端执行环境中的代理端点，负责把 RemoteProxy 的请求转为 EngineWorker 执行并回传事件 / 结果。RemoteStub 不拥有 Host 治理状态。
 - `ToolRuntime`：Host-owned 工具治理模块，作为 `ToolExecutor` 提供给 EngineWorker / Engine。它负责工具注册装配、policy、awaiting、truncation / fetch_more、语义级重复调用治理、tool trace 所需诊断和工具级幂等。
 - `ToolExecutor`：Engine 可见的工具执行协议。Engine 只调用 `ToolExecutor.execute(...)`；Host / ToolRuntime 负责把工具注册、权限、截断、等待、幂等、审计和重复调用治理包装成该协议。
-- `semantic duplicate tool governance` / `语义级重复工具调用治理`：Host / ToolRuntime 对语义级重复工具调用的治理。Engine 只处理结构性工具调用协议，不理解工具语义、业务幂等性、历史证据质量或重复读取是否有意义。
+- `semantic duplicate tool governance` / `语义级重复工具调用治理`：Host / ToolRuntime 对同一个 Run 内模型复读导致的重复工具调用治理，目标是减少无意义 token 和工具执行浪费。它使用 run-local in-memory duplicate index；不治理跨 Run / 跨 Session 历史相似证据，也不把同一轮正常工具调用视为需要治理的问题。Engine 只处理结构性工具调用协议，不理解工具语义、业务幂等性、历史证据质量或重复读取是否有意义。
 - `TruncationManager`：ToolRuntime 内的工具结果截断治理能力，按工具声明的 `ToolTruncateSpec` 工作，并负责生成可恢复的 truncation cursor descriptor 与 scope binding。Engine 不读取 `ToolTruncateSpec`，也不理解截断策略。
 - `truncation cursor`：被截断工具结果的续读句柄，标识从哪个结果、哪个位置继续读。进入 messages 或 EventLog 后，必须可由 Host-governed durable descriptor、artifact ref 或等价 snapshot 恢复；不能只存在于远端进程内存。
 - `scope_token`：`fetch_more` 使用的 opaque capability / scope binding，用来证明某次续读只允许访问对应工具结果的后续内容。它可以是持久化映射或可验证 token，但不能变成远端 ToolRuntime 的治理状态。
 - `fetch_more`：Host / ToolRuntime 内置 framework tool，用普通 `@tool` 方式暴露和执行，用于通过 `cursor` 与 `scope_token` 读取被截断结果的后续内容。它不能有 Host / Engine 特化分支。
 - `ToolAwaitingOutcome` / `wait record`：长事务或外部等待进入 Host 的边界。Engine 只产出 awaiting / suspended 事实；Host 持久化 wait record，并通过统一 `resolve_wait` pipeline 创建新 Attempt 继续。
 - `resolve_wait`：Host 内部 / adapter API。poll、callback、manual 等等待结果来源都必须走同一个 resolution pipeline，不能各自改 Run 状态。
-- `retry`：confirmed failure / recoverable failure 后的新 Attempt。retry 不复用旧 EngineWorker / Agent / Runner。
-- `replay`：final answer 脏数据、schema invalid、输出 policy 失败或用户要求重答时的新 Attempt。replay 默认复用已接受工具事实，不重新执行昂贵工具。
+- `retry(run)`：confirmed failure / recoverable failure 后的函数式 Host 操作。它不重开原终态 Run，而是创建一个关联的新 Run；新 Run 可以按 policy 复用旧 Run 已接受工具事实，并创建自己的 Attempt。
+- `replay(run)`：final answer 脏数据、schema invalid、输出 policy 失败或用户要求重答时的函数式 Host 操作。它不重开原 `SUCCEEDED` Run，也不是 `Run.replay` / `Run.relay` 对象方法；它创建一个关联的新 Run，默认复用旧 Run 已接受工具事实，不重新执行昂贵工具。
 - `RunInputBuilder`：Host 内部组件，负责从当前 `USER_INPUT_ACCEPTED` canonical fact、当前 Run 语义 facts、连续性所需历史 canonical EventLog facts、memory snapshot、Service 场景参数、tool schemas snapshot 和 policy config 构造新的 `AgentRunRequest.messages`。它不能从 UI 临时文本、request 临时字段或 Session timeline 旁路读取当前 prompt。
 - `Conversation Memory`：Host read model / projection，服务多轮追问连续性。它消费 canonical facts，可重建、可修复，不是事实真源。
 - `Context Governance`：Host 对上下文预算、compaction、pinned state、tool facts、open questions、assumptions 和 trace / audit 的治理。Engine 可以 emit `context_compaction_requested`，但不做 Host-side compact retry；Host 必须 append compact events、执行 compact、重建 messages 并用新 Attempt 继续。
