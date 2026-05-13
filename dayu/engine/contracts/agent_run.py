@@ -34,10 +34,10 @@ from dayu.contracts.tool_schema import ToolSchema
 class ContextBudgetSnapshot:
     """上下文预算快照。
 
-    Phase 0 仅承载 token 数三元组，**不**含计算逻辑、不消费阈值。
-    当 provider HTTP context overflow 在无 usage 数据的边界被识别时，
-    Engine 会填入 ``0/0/0`` 作为占位快照；Host compact 诊断使用 Host
-    自己的 estimator 记录 before / after，不依赖该占位值。
+    本类型仅承载真实、可解释的 token 数三元组，**不**含计算逻辑、
+    不消费阈值，也不承载 unknown marker。预算未知时，使用方必须在
+    持有本类型的字段上显式表达缺失语义。数值为零仍表示真实快照，
+    不得被解释为预算未知。
 
     :param prompt_tokens: 提示 token 数。
     :param completion_tokens: 完成 token 数。

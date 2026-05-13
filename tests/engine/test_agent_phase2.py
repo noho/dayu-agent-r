@@ -576,6 +576,7 @@ async def test_context_overflow_http_error_maps_to_compaction_required_fact() ->
     ]
     compact_event = events[1]
     assert isinstance(compact_event.data, ContextCompactionRequestedData)
+    assert compact_event.data.budget_state is None
     assert compact_event.data.provider_request_id == "req_context"
     assert isinstance(events[-2].data, IterationCompletedData)
     assert events[-2].data.provider_request_id == "req_context"

@@ -259,6 +259,41 @@ async def test_http_json_object_error_body_preserved_as_raw_payload() -> None:
 
 
 @pytest.mark.asyncio
+async def test_http_context_overflow_maps_to_context_length_exceeded() -> None:
+    """HTTP context overflow 必须进入专用错误码并保留 request id。"""
+
+    runner = _make_runner(max_retries=3)
+    session = FakeSession()
+    session.enqueue_response(
+        _http_response_with_headers(
+            400,
+            headers={"x-request-id": "req_context"},
+            body=(
+                b'{"error":{"code":"context_length_exceeded",'
+                b'"message":"maximum context length is 128000 tokens"}}'
+            ),
+        )
+    )
+    _install_session(runner, session)
+
+    events = await _run(runner)
+
+    _check_http_error_then_done(
+        events,
+        expected_code=RunnerHTTPErrorCode.CONTEXT_LENGTH_EXCEEDED,
+        expected_status=400,
+        expected_attempt=1,
+        expected_retried=False,
+    )
+    assert isinstance(events[-2].data, RunnerHTTPErrorData)
+    assert events[-2].data.provider_request_id == "req_context"
+    assert isinstance(events[-1].data, RunnerDoneData)
+    assert events[-1].data.finish_reason is FinishReason.ERROR
+    assert events[-1].data.provider_request_id == "req_context"
+    await runner.close()
+
+
+@pytest.mark.asyncio
 async def test_http_non_json_error_body_keeps_raw_payload_none() -> None:
     """非 JSON 错误体只作为 message，不写 raw_payload。"""
 

@@ -257,14 +257,15 @@ class ContextCompactionRequestedData:
     """上下文压缩请求事件 data。
 
     :param iteration_id: 当前迭代 id。
-    :param budget_state: 触发压缩时的预算快照。
+    :param budget_state: 触发压缩时的真实预算快照；当 provider
+        overflow 边界未上报可靠预算时为 ``None``，表示预算未知。
     :param reason: 压缩触发原因（中性字符串）。
     :param provider_request_id: 触发压缩请求的 provider response request
         id；非 provider response 触发时为 ``None``。
     """
 
     iteration_id: str
-    budget_state: ContextBudgetSnapshot
+    budget_state: ContextBudgetSnapshot | None
     reason: str
     provider_request_id: str | None
 

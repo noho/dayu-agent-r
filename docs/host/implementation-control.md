@@ -68,6 +68,9 @@ draft design checkpoint
 
 phase plan 不得从旧设计稿、旧代码路径或非真源文档推导架构边界。
 
+phase plan 文档必须放在 `docs/host/` 下；plan review、plan fix、plan re-review、implementation、code review、
+fix、code re-review 和总控裁决 artifact 放在 `docs/reviews/` 下。
+
 每个 phase 的第一步必须是和用户讨论并细化 `docs/host/design.md` 中的对应章节。该讨论属于 `$gateflow` 的 feature
 discussion / requirement clarification 阶段，必须在进入 plan gate 前完成。
 
@@ -269,7 +272,7 @@ Phase 按依赖关系推进：先实现被其它阶段依赖的公共契约、ru
 - docs: Engine README 与 design docs 同步。
 
 退出条件：
-- Engine overflow event 明确表达 reactive fallback 与 unknown budget，Host 后续 phase 不会把 `0/0/0` 当真实预算。
+- Engine overflow event 明确表达 reactive fallback 与 unknown budget，provider overflow path 使用 `budget_state=None`。
 
 后续依赖：
 - 后续 phase 可依赖的稳定契约：Engine 只发出 reactive overflow signal，不做 Host proactive compaction。
@@ -801,7 +804,7 @@ Phase 按依赖关系推进：先实现被其它阶段依赖的公共契约、ru
 - `docs/host/design.md` §23 RunInputBuilder
 
 前置条件：
-- Phase 0 Engine context compaction event cleanup 已完成，或本 phase plan 明确临时兼容假设且禁止消费 `0/0/0` 作为真实预算。
+- Phase 0 Engine context compaction event cleanup 已完成；Phase 10 不消费 Engine overflow event 作为真实 Host budget，必须使用 Host estimator / policy。
 - Phase 9 memory projection 已完成。
 - Phase 5 dispatch / reactive failure closeout 已完成。
 - Phase 6 ToolRuntime / tool fact accept barrier / truncation descriptors 已完成。
@@ -1103,26 +1106,25 @@ Phase 按依赖关系推进：先实现被其它阶段依赖的公共契约、ru
 
 背景决议：
 
-- 当前 Engine 只在 provider 返回 `context_length_exceeded` 后 emit `context_compaction_requested`；这属于 reactive fallback，不是生产级 proactive context governance。
-- 当前 `ContextCompactionRequestedData.budget_state` 在该路径中填 `ContextBudgetSnapshot(0, 0, 0)`，只是占位诊断载体，不代表真实 prompt / completion / total token budget。
+- Engine 只在 provider 返回 `context_length_exceeded` 后 emit `context_compaction_requested`；这属于 reactive fallback，不是生产级 proactive context governance。
+- P0-S1 已将 `ContextCompactionRequestedData.budget_state` 改为 `ContextBudgetSnapshot | None`；provider overflow path 使用 `None` 表示预算未知 / 未上报，不再使用零值快照作为 unknown sentinel。
+- `ContextBudgetSnapshot` 仍只表示真实、可解释的 token snapshot；数值为零仍是普通真实快照，不得被解释为 unknown。
 - Host 生产级治理应由 Context Governance 基于 provider-aware budget policy 主动判断 soft / hard threshold；provider overflow 只能作为最后防线。
-- 如果不先澄清 Engine event contract，后续 Host implementation agent 可能误把 `0/0/0` 当真实预算，或误以为 Engine 已负责 context budget threshold。
 
 前置实施步骤：
 
-- 在进入 Host Context Governance / compact phase plan 前，必须先开一个 Engine contract cleanup work unit，且因涉及 Engine 代码，必须先停下来向用户确认。
-- 该 Engine work unit 的目标不是把 budget governance 放进 Engine，而是把 Engine 事件语义改到不会误导 Host：
-  - 明确 `context_compaction_requested` 的来源是 provider overflow reactive fallback。
-  - 将 `budget_state` 改成 optional / unknown 语义，或引入明确的 unknown marker；不得继续让 `0/0/0` 看起来像真实 token snapshot。
-  - 保留 `usage_reported`、`iteration_completed`、provider request id 和 overflow reason，供 Host Context Governance 诊断与追踪。
-  - README / docs/engine/design.md 必须同步说明：Engine 不做 proactive threshold compaction，不做 compact / retry，不计算 Host budget；Host 必须用自己的 estimator / tokenizer / policy 记录 before / after budget。
-- Phase 10. Context Governance / Compaction 的 plan 必须显式依赖这个 Engine cleanup 完成，或在 plan 中写明临时兼容假设并禁止消费 `0/0/0` 作为真实预算。
+- P0-S1 Engine contract cleanup 已完成并提交为 `ad6d116`。
+- P0-S2 同步 Engine README、Engine design docs、项目级术语和本追踪区，使后续 Host implementation agent 不会把 Engine reactive fallback 误解为 proactive context governance。
+- P0 不把 budget governance 放进 Engine；Engine 不做 proactive threshold compaction，不做 compact / retry，不计算 Host budget，不提供 provider-aware tokenizer 或 Host budget policy。
+- P0 保留 `usage_reported`、`iteration_completed`、provider request id 和 overflow reason，供 Host Context Governance 诊断与追踪。
 
 追踪项：
 
-- Engine cleanup 完成后，更新 `dayu/engine/README.md`、`docs/engine/design.md`、`dayu/README.md` 中的相关术语与边界。
+- P0-S2 已同步 `dayu/engine/README.md`、`docs/engine/design.md`、`dayu/README.md` 中的相关术语与边界。
 - `docs/host/design.md` 已明确：proactive threshold compaction 属于 Host Context Governance；Engine provider overflow event
   只是 reactive fallback。Phase 10. Context Governance / Compaction 只能按该语义实施。
+- Phase 5 owns EngineEvent ingest validation：必须接受 `budget_state=None` 的 Engine event shape，不把 `None` 当作协议错误，不要求 Engine 提供 Host budget ref。
+- Phase 10 owns Context Governance semantic interpretation：当 Engine overflow budget unknown 时，必须使用 Host estimator / policy 生成 before / after budget refs，并决策 compact / recovery。
 - Phase 10. Context Governance / Compaction 的测试设计必须覆盖：Engine overflow event 中预算 unknown 时，Host 仍使用自身 budget estimator 进行 compact 诊断与恢复决策。
 
 #### External Job Cancel Adapter 能力追踪
@@ -1235,7 +1237,29 @@ Phase 按依赖关系推进：先实现被其它阶段依赖的公共契约、ru
 
 ## 当前状态
 
-当前阶段为待实施 P0：Engine Context Compaction Event 语义前置。Host 代码实施尚未开始；`docs/host/design.md` 已是 Host 架构真源，
-`dayu/README.md` 是项目级术语真源，本文档已按依赖关系给出 Host 实施 phases、进入 / 退出条件、交付物、风险和未覆盖项追踪，并已写回 phase map review 的总控裁决结论。
+当前阶段为 P0：Engine Context Compaction Event 语义前置。Host 代码实施尚未开始；`docs/host/design.md` 已是 Host 架构真源，
+`dayu/README.md` 是项目级术语真源。用户已确认 P0 直接进入 plan gate，并允许本 work unit 修改 Engine contract / docs / tests。
 
-进入 Phase 0 plan 前，必须先和用户确认是否允许修改 Engine 代码，并讨论 / 细化 Engine context overflow event contract。进入任何 phase plan 前，仍必须先和用户讨论并细化对应 `docs/host/design.md` 章节；若 phase discussion 改变架构边界，必须先写回 `docs/host/design.md`，再生成 handoff implementation-ready plan。
+当前 gate 为 PR。P0 plan 已写入 `docs/host/phase0-engine-context-compaction-plan.md`；AgentMiMo 与 AgentDS 已完成并行 plan review，
+review artifacts 分别为 `docs/reviews/gateflow-plan-review-host-p0-engine-context-compaction-mimo-20260513.md` 和
+`docs/reviews/gateflow-plan-review-host-p0-engine-context-compaction-ds-20260513.md`。总控裁决已写入
+`docs/reviews/gateflow-plan-review-host-p0-engine-context-compaction-controller-adjudication-20260513.md`，plan fix artifact 已写入
+`docs/reviews/gateflow-plan-fix-host-p0-engine-context-compaction-20260513.md`。plan re-review artifacts 已写入
+`docs/reviews/gateflow-plan-re-review-host-p0-engine-context-compaction-mimo-20260513.md` 和
+`docs/reviews/gateflow-plan-re-review-host-p0-engine-context-compaction-ds-20260513.md`，re-review 总控裁决已写入
+`docs/reviews/gateflow-plan-re-review-host-p0-engine-context-compaction-controller-adjudication-20260513.md`。
+
+P0 plan re-review 已通过，用户已确认进入 implementation；accepted plan commit 为 `866f6f5`。P0-S1 implementation artifact 已写入
+`docs/reviews/gateflow-implementation-host-p0-s1-engine-context-compaction-20260513.md`。P0-S1 code review artifacts 已写入
+`docs/reviews/gateflow-code-review-host-p0-s1-engine-context-compaction-mimo-20260513.md` 和
+`docs/reviews/gateflow-code-review-host-p0-s1-engine-context-compaction-ds-20260513.md`；code review 总控裁决已写入
+`docs/reviews/gateflow-code-review-host-p0-s1-engine-context-compaction-controller-adjudication-20260513.md`，C1 fix artifact 已写入
+`docs/reviews/gateflow-fix-host-p0-s1-engine-context-compaction-20260513.md`。P0-S1 code re-review artifacts 已写入
+`docs/reviews/gateflow-code-re-review-host-p0-s1-engine-context-compaction-mimo-20260513.md` 和
+`docs/reviews/gateflow-code-re-review-host-p0-s1-engine-context-compaction-ds-20260513.md`，code re-review 总控裁决已写入
+`docs/reviews/gateflow-code-re-review-host-p0-s1-engine-context-compaction-controller-adjudication-20260513.md`。P0-S1 accepted slice commit 为 `ad6d116`。P0-S2 implementation artifact 已写入
+`docs/reviews/gateflow-implementation-host-p0-s2-docs-context-compaction-20260513.md`。P0-S2 code review artifacts 已写入
+`docs/reviews/gateflow-code-review-host-p0-s2-docs-context-compaction-mimo-20260513.md` 和
+`docs/reviews/gateflow-code-review-host-p0-s2-docs-context-compaction-ds-20260513.md`，code review 总控裁决已写入
+`docs/reviews/gateflow-code-review-host-p0-s2-docs-context-compaction-controller-adjudication-20260513.md`。P0-S2 accepted slice commit 为 `6f6e716`。P0 两个 implementation slices 均已完成并通过 review loop，当前按用户确认进入 push / PR。P0 plan fix 已补充：明确 Runner HTTP overflow event-path 测试、P0-S1 pyright completion signal、
+Phase 5 与 Phase 10 对 `budget_state=None` 的责任切分、多行 sentinel 搜索防线、`None` 与真实 `ContextBudgetSnapshot` 两条合法 contract 测试、`runner_events.py` docstring 目检，以及 `dayu/README.md` 术语精化边界。
