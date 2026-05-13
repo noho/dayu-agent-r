@@ -179,6 +179,40 @@ def test_provider_request_id_fields_are_locked() -> None:
     }
 
 
+def test_context_compaction_budget_state_accepts_unknown_and_snapshot() -> None:
+    """上下文压缩预算字段同时支持未知与真实快照。"""
+
+    fields = {
+        f.name: f for f in dataclasses.fields(ContextCompactionRequestedData)
+    }
+    assert fields["budget_state"].default is dataclasses.MISSING
+    assert fields["budget_state"].default_factory is dataclasses.MISSING
+
+    unknown_budget = ContextCompactionRequestedData(
+        iteration_id="iter_unknown",
+        budget_state=None,
+        reason="context_compaction_required",
+        provider_request_id="req_unknown",
+    )
+    real_budget = ContextCompactionRequestedData(
+        iteration_id="iter_real",
+        budget_state=engine.ContextBudgetSnapshot(
+            prompt_tokens=1000,
+            completion_tokens=500,
+            total_tokens=1500,
+        ),
+        reason="context_compaction_required",
+        provider_request_id="req_real",
+    )
+
+    assert unknown_budget.budget_state is None
+    assert real_budget.budget_state == engine.ContextBudgetSnapshot(
+        prompt_tokens=1000,
+        completion_tokens=500,
+        total_tokens=1500,
+    )
+
+
 def test_tool_observation_data_fields_are_locked() -> None:
     """工具观测事件 data 字段必须保持强类型结构。"""
 

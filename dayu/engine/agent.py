@@ -46,7 +46,6 @@ from dayu.engine.contracts.agent_policy import AgentFallbackMode
 from dayu.engine.contracts.agent_run import (
     AgentRunRequest,
     AgentRunResult,
-    ContextBudgetSnapshot,
     EngineRunOutcomeCancelled,
     EngineRunOutcomeFailed,
     EngineRunOutcomeFinalAnswer,
@@ -1246,11 +1245,7 @@ class _AsyncAgent:
                     event_type=EngineEventType.CONTEXT_COMPACTION_REQUESTED,
                     data=ContextCompactionRequestedData(
                         iteration_id=iteration_id,
-                        budget_state=ContextBudgetSnapshot(
-                            prompt_tokens=0,
-                            completion_tokens=0,
-                            total_tokens=0,
-                        ),
+                        budget_state=None,
                         reason=_ERROR_CONTEXT_COMPACTION_REQUIRED,
                         provider_request_id=data.provider_request_id,
                     ),
