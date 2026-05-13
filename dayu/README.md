@@ -118,10 +118,10 @@ implementation、review、fix 与 re-review 的项目级术语真源。包级 RE
 - `Context Governance`：Host 对上下文预算、compaction、pinned state、tool facts、open questions、assumptions 和 compact 事件的治理 orchestrator。Host 应在 dispatch 前根据 provider-aware budget 主动触发 compact；Engine emit `context_compaction_requested` 是 provider context overflow 后的 reactive fallback，且 provider overflow 路径不携带真实 Host budget，Host Context Governance 使用自身 estimator / policy 记录预算并做 compact 决策。Context Governance 不直接写 memory、audit、trace 或 outbox projection；这些 projection 只消费已提交 EventLog。
 - `compact events`：Host canonical event family，用于记录 context compaction 触发、成功或失败。当前设计包含 `CONTEXT_COMPACTION_REQUESTED`、`CONTEXT_COMPACTED`、`CONTEXT_COMPACTION_FAILED`；它们解释为什么后续 Attempt 的 messages 被压缩或重建。
 - `evidence anchor` / `provenance`：财报分析证据链的中立引用。长期归因必须能追到工具事实和 evidence anchor；summary 只能导航，不能替代证据。
-- `lane`：层中立 named semaphore，用于跨协程 / 跨进程的具名容量治理。lane 属于 `dayu.runtime`，不绑定 Host、Run、Tool 或财报业务语义。lane acquire 是可取消的耗时操作；调用方 / supervisor 退出时必须同时触发 Host cancel 与 lane cancel。
-- `filelock`：`dayu.runtime` 对 `from filelock import FileLock` 的统一封装，用于多进程访问普通文件时的互斥保护。业务层、Host、Service、Fins 等不应各自直接封装或手写文件锁。
-- `ToolsDiscovery`：暂定名，独立于 Host 的工具发现 / 注册组件，收集工具声明、provider 或配置绑定，生成业务 `ToolBundle` 并显式传给 Host。若放入 `dayu.runtime`，它只能依赖标准库和 `dayu.contracts`，不得 import 具体业务工具包。
-- `ScenePrepare`：独立于 Host 的场景准备组件，根据 scene manifest 组装 system prompt 与场景约束，产出 typed scene inputs。若放入 `dayu.runtime`，它只能是通用 manifest assembly helper；具体财报 scene manifest、业务 prompt 文案和场景策略属于 Service / 业务配置。
+- `lane`：Host 设计要求沉淀到 `dayu.runtime` 的层中立 cross-process named semaphore / capacity guard，用于单机多客户端 / 多进程下的具名容量治理。它不绑定 Host、Run、Tool 或财报业务语义，不表达 Host truth、lease / fencing、Attempt owner、EventLog ordering 或 recovery proof。lane acquire 是可取消的耗时操作；调用方 / supervisor 退出时必须同时触发 Host cancel 与 lane cancel。
+- `filelock`：Host 设计要求沉淀到 `dayu.runtime` 的 `from filelock import FileLock` 同步统一封装，用于多进程访问普通文件时的互斥保护。业务层、Host、Service、Fins 等不应各自直接封装或手写文件锁。
+- `ToolsDiscovery`：暂定名，独立于 Host 的工具发现 / 注册组件，收集工具声明、provider 或配置绑定，生成业务 `ToolBundle` 并显式传给 Host。若后续放入 `dayu.runtime`，它只能依赖标准库和 `dayu.contracts`，不得 import 具体业务工具包。
+- `ScenePrepare`：独立于 Host 的场景准备组件，根据 scene manifest 组装 system prompt 与场景约束，产出 typed scene inputs。若后续放入 `dayu.runtime`，它只能是通用 manifest assembly helper；具体财报 scene manifest、业务 prompt 文案和场景策略属于 Service / 业务配置。
 
 `turn` 不用于描述 Engine / Runner 执行路径；如需表达用户视角的多轮对话，应在 UI / Service / Host 语义内明确其与 `session`、`run` 的关系。
 
@@ -133,14 +133,17 @@ implementation、review、fix 与 re-review 的项目级术语真源。包级 RE
 
 公共运行时能力应优先沉淀在 `dayu.runtime`，但不得把业务语义、Host 治理状态或 Engine 协议状态机放入 runtime。
 
-`dayu.runtime` 当前稳定承载以下层中立能力：
+`dayu.runtime` 当前已有以下层中立能力：
 
 - 日志装配与日志 level。
 - 取消等待 / race helper。
-- `lane`：named semaphore。它只表达具名容量控制，可被 Host、Service、Fins 或其它层复用；它不能表达 Session / Run / Attempt owner，也不能替代 Host admission、SQLite transaction 或 CAS 状态迁移。acquire 成功只表示拿到资源容量；使用方仍必须在执行副作用前 recheck 自己的 durable / semantic precondition，并在 cancel、失败或退出时释放或取消 lane。
-- `filelock`：对第三方 `FileLock` 的统一 wrapper，只用于普通文件访问互斥。`dayu.runtime` 不能依赖 `dayu.engine` / `dayu.host` / `dayu.service` / `dayu.ui` / `dayu.fins` 等项目内上层 package；统一封装纯 infra 第三方依赖不违反这一边界。业务层不得散落 `from filelock import FileLock`，也不得用 file lock 兜底数据库事务、EventLog 顺序或 Host 状态机。
-- `ToolsDiscovery`：工具发现 / 注册的层中立装配 helper。它可以接收外部传入的 provider / 配置绑定并产出 `ToolBundle`，但不能持有 Host 状态，不能 import 具体业务工具包，也不能决定 Run / Attempt 生命周期。
-- `ScenePrepare`：scene manifest 的层中立组装 helper。它可以把 manifest 与模板输入组装为 typed scene inputs，但不能内置财报业务规则、不能 import Service / Fins / Host，也不能绕过 Service 把场景 prompt 写入 Host 状态机。
+
+Host 设计要求以下层中立能力沉淀到 `dayu.runtime` 或保持为 runtime 边界约束：
+
+- `lane`：cross-process named semaphore / capacity guard。它只表达单机多进程的具名资源容量控制，可被 Host、Service、Fins 或其它层复用；它不能表达 Session / Run / Attempt owner，也不能替代 Host admission、SQLite transaction、CAS 状态迁移、lease / fencing、Attempt takeover、EventLog ordering 或 recovery proof。acquire 成功只表示拿到 runtime capacity claim；使用方仍必须在执行副作用前 recheck 自己的 durable / semantic precondition，并在 cancel、失败或退出时释放或取消 lane。
+- `filelock`：对第三方 `FileLock` 的同步 wrapper，只用于普通文件访问互斥。`dayu.runtime` 不能依赖 `dayu.engine` / `dayu.host` / `dayu.service` / `dayu.ui` / `dayu.fins` 等项目内上层 package；统一封装纯 infra 第三方依赖不违反这一边界。业务层不得散落 `from filelock import FileLock`，也不得用 file lock 兜底数据库事务、EventLog 顺序或 Host 状态机。
+- `ToolsDiscovery`：工具发现 / 注册的层中立装配边界。它可以接收外部传入的 provider / 配置绑定并产出 `ToolBundle`，但不能持有 Host 状态，不能 import 具体业务工具包，也不能决定 Run / Attempt 生命周期。具体 adapter、provider 注册生命周期和业务工具扫描不属于 Host Phase 1。
+- `ScenePrepare`：scene manifest 的层中立组装边界。它可以把 manifest 与模板输入组装为 typed scene inputs，但不能内置财报业务规则、不能 import Service / Fins / Host，也不能绕过 Service 把场景 prompt 写入 Host 状态机。具体 manifest schema、财报 prompt 文案和业务场景策略不属于 Host Phase 1。
 
 ## 日志与可观测性
 
