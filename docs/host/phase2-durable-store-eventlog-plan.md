@@ -215,7 +215,7 @@ idempotency_records
 ```
 
 ```text
-sqlite_payloads
+host_sqlite_payloads
   payload_id TEXT PRIMARY KEY
   payload_format TEXT NOT NULL CHECK payload_format in ('canonical_json', 'bytes')
   payload_json TEXT NULL
@@ -241,7 +241,7 @@ payload_descriptors
   artifact_relative_path TEXT NULL
   metadata_json TEXT NOT NULL
   created_at TEXT NOT NULL
-  FOREIGN KEY(sqlite_payload_id) REFERENCES sqlite_payloads(payload_id)
+  FOREIGN KEY(sqlite_payload_id) REFERENCES host_sqlite_payloads(payload_id)
 ```
 
 约束：
@@ -652,7 +652,7 @@ Tests:
   - mismatched `user_version` raises `HostSchemaMismatchError`.
   - connection has `foreign_keys=ON` and WAL enabled.
   - a second independent connection to the same DB returns `wal` from `PRAGMA journal_mode`, proving WAL mode is persisted rather than only assumed on the original connection.
-  - schema contains explicit PK / unique constraints for `event_id`, idempotency scope key, payload refs and host instance id.
+  - schema contains explicit PK / unique constraints for `event_id`, idempotency scope key, payload refs, `host_sqlite_payloads.payload_id` and host instance id.
   - no Session / Run / Attempt / wait / projection / outbox / memory / purge tables are created.
 - `tests/host/test_durable_transaction.py`
   - successful transaction commits rows and then runs after-commit callback.
