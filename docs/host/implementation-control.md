@@ -1431,7 +1431,7 @@ Phase 按依赖关系推进：先实现被其它阶段依赖的公共契约、ru
 
 P0：Engine Context Compaction Event 语义前置已完成 implementation 与 review loop；P0-S1 accepted slice commit 为 `ad6d116`，P0-S2 accepted slice commit 为 `6f6e716`。P0 后续状态进入 push / PR 路径，不再是当前 Host phase design gate。
 
-当前工作入口为 Phase 4：Host Public API Command Path implementation。Phase 3 已通过 PR 50
+Phase 4：Host Public API Command Path implementation 已完成。Phase 3 已通过 PR 50
 `Host Phase 3 admission state machine` merge 到 `main`，merge commit 为
 `d9c2ca9dd0d9b88b99dae96d972457a493f98f60`，merged at `2026-05-14T08:35:49Z`。
 Phase 4 design readiness artifact 为 `docs/reviews/gateflow-phase-design-host-p4-codex-20260514.md`，controller
@@ -1508,12 +1508,23 @@ re-review adjudication artifact 为
 `python -m pyright dayu/host tests/host` 0 errors，`git diff --check` passed。Phase 4 accepted deepreview commit 为
 `f8e7538`。Phase 4 状态为 completed；ready-to-create-PR 已执行，PR 51
 `https://github.com/noho/dayu-agent-r/pull/51` 已创建，title 为 `Host Phase 4 public API command path`，
-base 为 `main`，head 为 `docs/host-phase4-control-state`，GitHub 当前状态为 open / non-draft / mergeable，
-checks 当前未上报。PR readiness：所有 Phase 4 plan slice、code review、fix、re-review、aggregate deepreview、
+base 为 `main`，head 为 `docs/host-phase4-control-state`，并已 merge 到 `main`，merge commit 为
+`d9feaaf09b22bf099eb76b5d04f7c0438f67faf8`。PR readiness：所有 Phase 4 plan slice、code review、fix、re-review、aggregate deepreview、
 aggregate fix、aggregate re-review 与 accepted local commit 均已完成并记录 artifact / commit hash；工作区检查为 clean；
 剩余风险均已有后续 owner。后续 Phase 5 / 7 / 11 必须继续补齐
 dispatching / active worker、`WAITING`、`RECOVERING` 的 per-run 与 session-scope cancel，不得把 Phase 4 queued /
 pre-dispatch `STARTING` 子集写成最终语义。
+
+当前工作入口为 PR 51 merge 后的 full repository deep review 后续处理。三份全仓深度 review artifacts 为
+`docs/reviews/repo-review-20260514-1936.md`、`docs/reviews/repo-review-20260514-1937.md` 与
+`docs/reviews/repo-review-20260514-1942.md`；controller 裁决 artifact 为
+`docs/reviews/repo-review-controller-adjudication-20260514.md`，accepted adjudication commit 为 `6c28369`。用户已明确裁决：
+`llm_models.json` 相关 finding 不是 bug；`run.json` 相关 finding 也不是 bug，因为当前尚未计划实现配置文件加载。
+A1 Engine OpenAI runner cancellation / response cleanup race 已完成 implementation、review、accepted MiMo low finding fix、
+re-review 与 controller adjudication；accepted fix commit 为 `b997112`。A1 验证：`pytest tests/engine/runners/openai/test_response_cleanup_race.py tests/engine/runners/openai/test_cancellation_boundaries.py -q`
+6 passed，`pytest tests/engine/runners/openai -q` 184 passed，
+`python -m pyright dayu/engine/runners/openai tests/engine/runners/openai` 0 errors，`git diff --check` passed。
+下一 full repository review work unit 按 controller 裁决顺序进入 A4 Engine parser/provider robustness，除非后续总控裁决记录重排理由。
 
 历史状态：Phase 1 公共契约与 runtime 基础设施已完成并 merge；Phase 2 Durable Store / EventLog / Payload Foundation 已完成 plan、3 个 implementation slices、aggregate deepreview、aggregate fix、aggregate re-review 与 accepted deepreview commit，本 phase 状态为 completed。Phase 1 design refinement 已写入 `docs/reviews/gateflow-phase-design-host-p1-codex-20260513.md`，controller-accepted design fix 已写入 `docs/reviews/gateflow-phase-design-fix-host-p1-codex-20260513.md`。用户反馈后的 design fixes 已写入 `docs/reviews/gateflow-phase-design-user-feedback-fix-host-p1-codex-20260513.md` 与 `docs/reviews/gateflow-phase-design-user-feedback-fix2-host-p1-codex-20260513.md`。AgentMiMo 与 AgentDS 的 phase design re-review 均确认 accepted findings 已修复且 new blocker 为 0；round2 re-review 进一步确认 lane 已改为 cross-process runtime capacity guard，Phase Map 已重排为 P12 ToolsDiscovery / ScenePrepare、P13 Audit / Tool Trace / Outbox、P14 RemoteProxy、P15 Retention / Purge。Phase 1 plan 已写入 `docs/host/phase1-public-contract-runtime-plan.md`；plan review、controller adjudication、plan fix 与 plan re-review artifacts 已写入 `docs/reviews/`。AgentMiMo 与 AgentDS 的 plan re-review 均确认 finding 数量为 0、blocking finding 数量为 0。用户已确认 Phase 1 plan；accepted plan commit 为 `34b1b41`。Phase 1 Slice 1 accepted slice commit 为 `66d8dc3`，Slice 2 accepted slice commit 为 `27e0d8b`，Slice 3 accepted slice commit 为 `e23e3e4`，Slice 4 accepted slice commit 为 `0393a22`。
 
