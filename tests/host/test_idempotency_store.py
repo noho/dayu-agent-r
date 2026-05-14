@@ -292,6 +292,57 @@ def test_idempotency_rejects_whitespace_only_text_fields(
             store.transaction_runner.run_write(whitespace_result)
 
 
+def test_idempotency_rejects_one_sided_created_event_ref(
+    tmp_path: Path,
+) -> None:
+    """created_event_id 与 created_event_sequence 必须成对出现。"""
+
+    digest = sha256_digest_json({"command": "start"})
+    with open_host_durable_store(_options(tmp_path)) as store:
+
+        def only_event_id(transaction: HostTransaction) -> None:
+            """只提供 created_event_id。
+
+            :param transaction: Host transaction。
+            :returns: ``None``。
+            """
+
+            record_idempotent_result(
+                transaction,
+                _scope(),
+                digest,
+                _result_ref(
+                    created_event_id="event-1",
+                    created_event_sequence=None,
+                ),
+            )
+
+        def only_event_sequence(transaction: HostTransaction) -> None:
+            """只提供 created_event_sequence。
+
+            :param transaction: Host transaction。
+            :returns: ``None``。
+            """
+
+            record_idempotent_result(
+                transaction,
+                _scope(),
+                digest,
+                _result_ref(
+                    created_event_id=None,
+                    created_event_sequence=1,
+                ),
+            )
+
+        for operation in (only_event_id, only_event_sequence):
+            with pytest.raises(HostDurableError) as error_info:
+                store.transaction_runner.run_write(operation)
+            assert str(error_info.value) == (
+                "created_event_id and created_event_sequence "
+                "must be both set or both unset"
+            )
+
+
 def test_idempotency_conflict_is_not_retried_by_transaction_runner(
     tmp_path: Path,
 ) -> None:
@@ -383,7 +434,7 @@ def test_idempotency_record_missing_event_fk_raises_structured_error(
                 digest,
                 _result_ref(
                     created_event_id="missing-event",
-                    created_event_sequence=None,
+                    created_event_sequence=1,
                 ),
             )
 

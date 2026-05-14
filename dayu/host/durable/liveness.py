@@ -382,10 +382,15 @@ def _require_same_identity(
     :raises HostInstanceIdentityConflictError: durable row 身份与当前身份不一致时抛出。
     """
 
+    boot_id_conflicts = (
+        row.boot_id is not None
+        and identity.boot_id is not None
+        and row.boot_id != identity.boot_id
+    )
     if (
         row.pid != identity.pid
         or row.process_start_token != identity.process_start_token
-        or row.boot_id != identity.boot_id
+        or boot_id_conflicts
     ):
         raise HostInstanceIdentityConflictError(
             "Host instance id already exists with different identity"
@@ -418,5 +423,4 @@ def _host_instance_row_from_host_row(row: HostRow) -> HostInstanceRow:
         heartbeat_at=_require_text(row.get("heartbeat_at"), field_name="heartbeat_at"),
         status=status,
     )
-
 

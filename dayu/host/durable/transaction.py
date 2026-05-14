@@ -26,6 +26,7 @@ from dayu.host.durable.options import HostSQLiteStoragePolicy
 _SQLITE_CONSTRAINT_UNIQUE = sqlite3.SQLITE_CONSTRAINT_UNIQUE
 _SQLITE_CONSTRAINT_PRIMARYKEY = sqlite3.SQLITE_CONSTRAINT_PRIMARYKEY
 _SQLITE_CONSTRAINT_FOREIGNKEY = sqlite3.SQLITE_CONSTRAINT_FOREIGNKEY
+_SQLITE_CONSTRAINT_CHECK = sqlite3.SQLITE_CONSTRAINT_CHECK
 _SQLITE_MILLISECONDS_PER_SECOND = 1000
 
 T = TypeVar("T")
@@ -211,7 +212,7 @@ class HostTransactionRunner:
         attempt = 0
         max_attempts = self._sqlite_policy.write_busy_retry_count + 1
         delay_seconds = self._sqlite_policy.write_retry_initial_delay_seconds
-        while attempt < max_attempts:
+        while True:
             attempt += 1
             try:
                 self._connection.execute("BEGIN IMMEDIATE")
@@ -242,10 +243,6 @@ class HostTransactionRunner:
                 raise
             _run_after_commit(after_commit)
             return result
-        raise HostTransactionRetryExhaustedError(
-            "Host durable write transaction busy retry exhausted",
-            attempts=attempt,
-        )
 
 
 def configure_connection_pragmas(
@@ -310,6 +307,8 @@ def _classify_sqlite_error(error: sqlite3.Error) -> HostDurableError:
         return HostUniqueConstraintError("Host durable unique constraint failed")
     if code == _SQLITE_CONSTRAINT_FOREIGNKEY:
         return HostForeignKeyError("Host durable foreign key constraint failed")
+    if code == _SQLITE_CONSTRAINT_CHECK:
+        return HostDurableError("Host durable CHECK constraint failed")
     return HostDurableError("Host durable SQLite transaction failed")
 
 

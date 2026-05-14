@@ -53,11 +53,13 @@ def _identity(
     *,
     host_instance_id: str = "host-instance-1",
     process_start_token: str = "token-1",
+    boot_id: str | None = "boot-1",
 ) -> HostInstanceIdentity:
     """构造测试用 Host instance identity。
 
     :param host_instance_id: Host instance id。
     :param process_start_token: 进程启动指纹。
+    :param boot_id: 可选 boot id。
     :returns: Host instance identity。
     """
 
@@ -65,7 +67,7 @@ def _identity(
         host_instance_id=host_instance_id,
         pid=os.getpid(),
         process_start_token=process_start_token,
-        boot_id="boot-1",
+        boot_id=boot_id,
     )
 
 
@@ -248,6 +250,67 @@ def test_heartbeat_wrong_token_raises_identity_conflict(
             )
         after = store.transaction_runner.run_write(read_heartbeat)
         assert after == before
+
+
+def test_liveness_identity_tolerates_missing_boot_id_on_either_side(
+    tmp_path: Path,
+) -> None:
+    """boot_id 任一侧缺失时不拒绝同 pid 与 token 的当前进程。"""
+
+    none_boot_identity = _identity(boot_id=None)
+    value_boot_identity = _identity(boot_id="boot-1")
+    second_value_identity = _identity(
+        host_instance_id="host-instance-2",
+        process_start_token="token-2",
+        boot_id="boot-2",
+    )
+    second_none_identity = _identity(
+        host_instance_id="host-instance-2",
+        process_start_token="token-2",
+        boot_id=None,
+    )
+    with open_host_durable_store(_options(tmp_path)) as store:
+        store.transaction_runner.run_write(
+            lambda transaction: register_current_instance(
+                transaction, none_boot_identity
+            )
+        )
+        none_to_value = store.transaction_runner.run_write(
+            lambda transaction: heartbeat_current_instance(
+                transaction, value_boot_identity
+            )
+        )
+        store.transaction_runner.run_write(
+            lambda transaction: register_current_instance(
+                transaction, second_value_identity
+            )
+        )
+        value_to_none = store.transaction_runner.run_write(
+            lambda transaction: heartbeat_current_instance(
+                transaction, second_none_identity
+            )
+        )
+        assert none_to_value.host_instance_id == "host-instance-1"
+        assert value_to_none.host_instance_id == "host-instance-2"
+
+
+def test_liveness_identity_rejects_different_non_empty_boot_id(
+    tmp_path: Path,
+) -> None:
+    """两侧 boot_id 都存在且不同时仍判定身份冲突。"""
+
+    identity = _identity(boot_id="boot-1")
+    wrong_boot_identity = _identity(boot_id="boot-2")
+    with open_host_durable_store(_options(tmp_path)) as store:
+        store.transaction_runner.run_write(
+            lambda transaction: register_current_instance(transaction, identity)
+        )
+        with pytest.raises(HostInstanceIdentityConflictError):
+            store.transaction_runner.run_write(
+                lambda transaction: heartbeat_current_instance(
+                    transaction, wrong_boot_identity
+                )
+            )
 
 
 def test_mark_stopping_and_stopped_are_best_effort_when_absent(

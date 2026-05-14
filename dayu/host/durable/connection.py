@@ -151,7 +151,7 @@ def open_host_durable_store(
         bootstrap_host_durable_store(connection)
         validate_host_schema_version(connection)
     except (sqlite3.Error, HostDurableError) as exc:
-        connection.close()
+        _close_connection_best_effort(connection)
         if isinstance(exc, HostDurableError):
             raise
         raise HostDurableError("Host durable SQLite bootstrap failed") from exc
@@ -175,7 +175,7 @@ def _open_configured_connection(
         configure_connection_pragmas(connection, options.sqlite_policy)
         validate_host_schema_version(connection)
     except (sqlite3.Error, HostDurableError) as exc:
-        connection.close()
+        _close_connection_best_effort(connection)
         if isinstance(exc, HostDurableError):
             raise
         raise HostDurableError("Host durable SQLite connection setup failed") from exc
@@ -198,6 +198,19 @@ def _open_raw_connection(options: HostDurableStoreOptions) -> sqlite3.Connection
         )
     except sqlite3.Error as exc:
         raise HostDurableError("Host durable SQLite connection failed") from exc
+
+
+def _close_connection_best_effort(connection: sqlite3.Connection) -> None:
+    """尽力关闭初始化失败后的 SQLite connection。
+
+    :param connection: 初始化过程中需要清理的 SQLite connection。
+    :returns: ``None``。
+    """
+
+    try:
+        connection.close()
+    except sqlite3.Error:
+        return
 
 
 def _prepare_database_parent(db_path: Path, create_parent_dirs: bool) -> None:

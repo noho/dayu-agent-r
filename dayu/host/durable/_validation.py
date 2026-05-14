@@ -17,9 +17,11 @@ def require_non_empty_text(value: str, *, field_name: str) -> None:
     :param value: 待校验文本。
     :param field_name: 错误消息中的字段名。
     :returns: ``None``。
-    :raises HostDurableError: 文本为空时抛出。
+    :raises HostDurableError: 值不是文本或文本为空时抛出。
     """
 
+    if not isinstance(value, str):
+        raise HostDurableError(f"{field_name} must be non-empty")
     if value == "" or value.isspace():
         raise HostDurableError(f"{field_name} must be non-empty")
 

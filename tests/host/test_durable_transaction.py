@@ -328,6 +328,43 @@ def test_unique_and_foreign_key_errors_are_not_retried(tmp_path: Path) -> None:
         assert foreign_key_calls == ["called"]
 
 
+def test_check_constraint_error_is_classified_explicitly(tmp_path: Path) -> None:
+    """CHECK constraint failure 会保留明确诊断消息。"""
+
+    options = _options(tmp_path, retry_count=5)
+    with open_host_durable_store(options) as store:
+        setup_connection = store.connect()
+        try:
+            setup_connection.execute(
+                "CREATE TABLE statuses ("
+                "id TEXT PRIMARY KEY, "
+                "status TEXT NOT NULL CHECK(status IN ('running'))"
+                ")"
+            )
+            setup_connection.commit()
+        finally:
+            setup_connection.close()
+        calls: list[str] = []
+
+        def invalid_status(transaction: HostTransaction) -> None:
+            """触发 CHECK constraint。
+
+            :param transaction: Host transaction。
+            :returns: ``None``。
+            """
+
+            calls.append("called")
+            transaction.execute(
+                "INSERT INTO statuses (id, status) VALUES (?, ?)",
+                ("s1", "stopped"),
+            )
+
+        with pytest.raises(HostDurableError) as error_info:
+            store.transaction_runner.run_write(invalid_status)
+        assert str(error_info.value) == "Host durable CHECK constraint failed"
+        assert calls == ["called"]
+
+
 def test_schema_and_domain_errors_are_not_retried(tmp_path: Path) -> None:
     """schema / domain 结构化错误不被当成 busy / locked retry。"""
 

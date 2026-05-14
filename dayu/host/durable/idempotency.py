@@ -246,6 +246,13 @@ def _validate_result_ref(result: IdempotencyResultRef) -> None:
     _require_optional_non_empty_text(
         result.created_event_id, field_name="created_event_id"
     )
+    if (result.created_event_id is None) != (
+        result.created_event_sequence is None
+    ):
+        raise HostDurableError(
+            "created_event_id and created_event_sequence "
+            "must be both set or both unset"
+        )
     if result.created_event_sequence is not None and result.created_event_sequence <= 0:
         raise HostDurableError(
             "created_event_sequence must be positive when provided"

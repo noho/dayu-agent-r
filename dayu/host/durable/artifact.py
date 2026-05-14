@@ -93,7 +93,6 @@ class LocalArtifactStore:
             temp_digest = _read_file_digest(temp_path)
             if temp_digest != actual_digest:
                 raise HostDigestMismatchError("Artifact temp digest mismatch")
-            _ensure_parent_dir_contained(self._artifact_root, relative_path)
             final_path.parent.mkdir(parents=True, exist_ok=True)
             _ensure_contained(self._artifact_root, final_path.parent)
             os.replace(temp_path, final_path)
@@ -388,4 +387,3 @@ def _prepare_artifact_root(root: Path, *, create: bool) -> None:
         root.mkdir(parents=True, exist_ok=True)
     except OSError as exc:
         raise HostArtifactWriteError("Artifact root create failed") from exc
-
