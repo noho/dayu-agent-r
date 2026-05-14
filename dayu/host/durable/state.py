@@ -13,7 +13,10 @@ from typing import TypeVar
 
 from dayu.host.api import (
     AttemptStatus,
+    HostStreamCursor,
     RunStatus,
+    SessionSlotRef,
+    SessionSnapshot,
     SessionStatus,
     SourceRunRelation,
 )
@@ -25,7 +28,13 @@ from dayu.host.durable._validation import (
     require_text as _require_text,
 )
 from dayu.host.durable.errors import HostDurableError
+from dayu.host.durable.schema import (
+    TABLE_HOST_RUNS,
+    TABLE_HOST_SESSION_SLOTS,
+    TABLE_HOST_SESSIONS,
+)
 from dayu.host.durable.transaction import HostRow
+from dayu.host.durable.transaction import HostTransaction
 
 _StatusT = TypeVar("_StatusT", bound=StrEnum)
 
@@ -507,6 +516,306 @@ def dispatch_record_row_from_host_row(row: HostRow) -> DispatchRecordRow:
     )
 
 
+def read_session_by_id(
+    transaction: HostTransaction, session_id: str
+) -> SessionRow | None:
+    """按 Session id 读取 Session row。
+
+    :param transaction: 调用方提供的 Host transaction。
+    :param session_id: Session id。
+    :returns: 找到时返回 ``SessionRow``，否则返回 ``None``。
+    :raises HostDurableError: ``session_id`` 为空或 row 字段无效时抛出。
+    :raises sqlite3.Error: SQLite 查询失败时由 transaction runner 结构化转换。
+    """
+
+    _require_non_empty_text(session_id, field_name="session_id")
+    row = transaction.fetchone(
+        f"""
+        SELECT
+          session_id,
+          status,
+          metadata_json,
+          created_event_id,
+          created_event_sequence,
+          closed_event_id,
+          closed_event_sequence,
+          created_at,
+          closed_at
+        FROM {TABLE_HOST_SESSIONS}
+        WHERE session_id = ?
+        """,
+        (session_id,),
+    )
+    if row is None:
+        return None
+    return session_row_from_host_row(row)
+
+
+def read_session_slot(
+    transaction: HostTransaction, scope: str, slot_key: str
+) -> SessionSlotRow | None:
+    """按 ``(scope, slot_key)`` 读取 Session slot row。
+
+    :param transaction: 调用方提供的 Host transaction。
+    :param scope: slot 命名空间。
+    :param slot_key: slot 稳定键。
+    :returns: 找到时返回 ``SessionSlotRow``，否则返回 ``None``。
+    :raises HostDurableError: ``scope`` 或 ``slot_key`` 为空时抛出。
+    :raises sqlite3.Error: SQLite 查询失败时由 transaction runner 结构化转换。
+    """
+
+    _require_non_empty_text(scope, field_name="scope")
+    _require_non_empty_text(slot_key, field_name="slot_key")
+    row = transaction.fetchone(
+        f"""
+        SELECT
+          scope,
+          slot_key,
+          session_id,
+          bound_event_id,
+          bound_event_sequence,
+          metadata_json,
+          updated_at
+        FROM {TABLE_HOST_SESSION_SLOTS}
+        WHERE scope = ? AND slot_key = ?
+        """,
+        (scope, slot_key),
+    )
+    if row is None:
+        return None
+    return session_slot_row_from_host_row(row)
+
+
+def read_session_slot_by_session_id(
+    transaction: HostTransaction, session_id: str
+) -> SessionSlotRow | None:
+    """读取当前绑定到指定 Session 的 slot row。
+
+    :param transaction: 调用方提供的 Host transaction。
+    :param session_id: Session id。
+    :returns: 找到时返回 ``SessionSlotRow``，否则返回 ``None``。
+    :raises HostDurableError: ``session_id`` 为空或 row 字段无效时抛出。
+    :raises sqlite3.Error: SQLite 查询失败时由 transaction runner 结构化转换。
+    """
+
+    _require_non_empty_text(session_id, field_name="session_id")
+    row = transaction.fetchone(
+        f"""
+        SELECT
+          scope,
+          slot_key,
+          session_id,
+          bound_event_id,
+          bound_event_sequence,
+          metadata_json,
+          updated_at
+        FROM {TABLE_HOST_SESSION_SLOTS}
+        WHERE session_id = ?
+        ORDER BY updated_at DESC, scope ASC, slot_key ASC
+        LIMIT 1
+        """,
+        (session_id,),
+    )
+    if row is None:
+        return None
+    return session_slot_row_from_host_row(row)
+
+
+def insert_session(
+    transaction: HostTransaction, session: SessionRow
+) -> None:
+    """插入 Session row。
+
+    :param transaction: 调用方提供的 Host transaction。
+    :param session: 待插入的 Session row。
+    :returns: ``None``。
+    :raises HostDurableError: row 字段无效时抛出。
+    :raises sqlite3.Error: SQLite 写入失败时由 transaction runner 结构化转换。
+    """
+
+    _validate_session_for_insert(session)
+    transaction.execute(
+        f"""
+        INSERT INTO {TABLE_HOST_SESSIONS} (
+          session_id,
+          status,
+          metadata_json,
+          created_event_id,
+          created_event_sequence,
+          closed_event_id,
+          closed_event_sequence,
+          created_at,
+          closed_at
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+        """,
+        (
+            session.session_id,
+            serialize_session_status(session.status),
+            session.metadata_json,
+            session.created_event_id,
+            session.created_event_sequence,
+            session.closed_event_id,
+            session.closed_event_sequence,
+            session.created_at,
+            session.closed_at,
+        ),
+    )
+
+
+def insert_session_slot(
+    transaction: HostTransaction, slot: SessionSlotRow
+) -> None:
+    """插入 Session slot row。
+
+    :param transaction: 调用方提供的 Host transaction。
+    :param slot: 待插入的 slot row。
+    :returns: ``None``。
+    :raises HostDurableError: row 字段无效时抛出。
+    :raises sqlite3.Error: SQLite 写入失败时由 transaction runner 结构化转换。
+    """
+
+    _validate_session_slot(slot)
+    transaction.execute(
+        f"""
+        INSERT INTO {TABLE_HOST_SESSION_SLOTS} (
+          scope,
+          slot_key,
+          session_id,
+          bound_event_id,
+          bound_event_sequence,
+          metadata_json,
+          updated_at
+        ) VALUES (?, ?, ?, ?, ?, ?, ?)
+        """,
+        (
+            slot.scope,
+            slot.slot_key,
+            slot.session_id,
+            slot.bound_event_id,
+            slot.bound_event_sequence,
+            slot.metadata_json,
+            slot.updated_at,
+        ),
+    )
+
+
+def upsert_session_slot(
+    transaction: HostTransaction, slot: SessionSlotRow
+) -> None:
+    """插入或重绑定 Session slot row。
+
+    :param transaction: 调用方提供的 Host transaction。
+    :param slot: 新的 slot binding row。
+    :returns: ``None``。
+    :raises HostDurableError: row 字段无效时抛出。
+    :raises sqlite3.Error: SQLite 写入失败时由 transaction runner 结构化转换。
+    """
+
+    _validate_session_slot(slot)
+    transaction.execute(
+        f"""
+        INSERT INTO {TABLE_HOST_SESSION_SLOTS} (
+          scope,
+          slot_key,
+          session_id,
+          bound_event_id,
+          bound_event_sequence,
+          metadata_json,
+          updated_at
+        ) VALUES (?, ?, ?, ?, ?, ?, ?)
+        ON CONFLICT(scope, slot_key) DO UPDATE SET
+          session_id = excluded.session_id,
+          bound_event_id = excluded.bound_event_id,
+          bound_event_sequence = excluded.bound_event_sequence,
+          metadata_json = excluded.metadata_json,
+          updated_at = excluded.updated_at
+        """,
+        (
+            slot.scope,
+            slot.slot_key,
+            slot.session_id,
+            slot.bound_event_id,
+            slot.bound_event_sequence,
+            slot.metadata_json,
+            slot.updated_at,
+        ),
+    )
+
+
+def close_open_session_row(
+    transaction: HostTransaction,
+    *,
+    session_id: str,
+    closed_event_id: str,
+    closed_event_sequence: int,
+    closed_at: str,
+) -> bool:
+    """CAS 关闭 open Session row。
+
+    :param transaction: 调用方提供的 Host transaction。
+    :param session_id: 目标 Session id。
+    :param closed_event_id: ``SESSION_CLOSED`` 事件 id。
+    :param closed_event_sequence: ``SESSION_CLOSED`` 全局事件序号。
+    :param closed_at: 固定 UTC timestamp 文本。
+    :returns: 更新到一行时返回 ``True``，CAS loser 或非 open 状态返回 ``False``。
+    :raises HostDurableError: 输入字段无效时抛出。
+    :raises sqlite3.Error: SQLite 写入失败时由 transaction runner 结构化转换。
+    """
+
+    _require_non_empty_text(session_id, field_name="session_id")
+    _require_non_empty_text(closed_event_id, field_name="closed_event_id")
+    if closed_event_sequence <= 0:
+        raise HostDurableError("closed_event_sequence must be positive")
+    _require_non_empty_text(closed_at, field_name="closed_at")
+    result = transaction.execute(
+        f"""
+        UPDATE {TABLE_HOST_SESSIONS}
+        SET
+          status = ?,
+          closed_event_id = ?,
+          closed_event_sequence = ?,
+          closed_at = ?
+        WHERE session_id = ? AND status = ?
+        """,
+        (
+            serialize_session_status(SessionStatus.CLOSED),
+            closed_event_id,
+            closed_event_sequence,
+            closed_at,
+            session_id,
+            serialize_session_status(SessionStatus.OPEN),
+        ),
+    )
+    return result.rowcount == 1
+
+
+def session_snapshot_from_rows(
+    transaction: HostTransaction,
+    session: SessionRow,
+    slot: SessionSlotRow | None,
+) -> SessionSnapshot:
+    """由 durable row 转换为公共 SessionSnapshot。
+
+    :param transaction: 调用方提供的 Host transaction，用于读取 Run 索引摘要。
+    :param session: Session row。
+    :param slot: 当前绑定 slot；未绑定时为 ``None``。
+    :returns: 公共 ``SessionSnapshot``。
+    :raises HostDurableError: row 字段无效时抛出。
+    :raises sqlite3.Error: SQLite 查询失败时由 transaction runner 结构化转换。
+    """
+
+    return SessionSnapshot(
+        session_id=session.session_id,
+        status=session.status,
+        slot=_slot_ref_from_row(slot),
+        active_run_id=_read_active_run_id(transaction, session.session_id),
+        queued_run_ids=_read_queued_run_ids(transaction, session.session_id),
+        timeline_cursor=HostStreamCursor(
+            event_sequence=_session_timeline_cursor(session)
+        ),
+    )
+
+
 def _serialize_str_enum(value: StrEnum, *, enum_name: str) -> str:
     """序列化 StrEnum。
 
@@ -539,6 +848,128 @@ def _deserialize_str_enum(
         return enum_type(value)
     except ValueError as exc:
         raise HostDurableError(f"{enum_name} is invalid") from exc
+
+
+def _validate_session_for_insert(session: SessionRow) -> None:
+    """校验待插入 Session row。
+
+    :param session: 待校验 Session row。
+    :returns: ``None``。
+    :raises HostDurableError: 任一字段不满足 open Session 插入约束时抛出。
+    """
+
+    _require_non_empty_text(session.session_id, field_name="session_id")
+    if session.status != SessionStatus.OPEN:
+        raise HostDurableError("insert_session only accepts open Session row")
+    _require_non_empty_text(session.metadata_json, field_name="metadata_json")
+    _require_non_empty_text(session.created_event_id, field_name="created_event_id")
+    if session.created_event_sequence <= 0:
+        raise HostDurableError("created_event_sequence must be positive")
+    if session.closed_event_id is not None:
+        raise HostDurableError("open Session closed_event_id must be unset")
+    if session.closed_event_sequence is not None:
+        raise HostDurableError("open Session closed_event_sequence must be unset")
+    _require_non_empty_text(session.created_at, field_name="created_at")
+    if session.closed_at is not None:
+        raise HostDurableError("open Session closed_at must be unset")
+
+
+def _validate_session_slot(slot: SessionSlotRow) -> None:
+    """校验 Session slot row。
+
+    :param slot: 待校验 slot row。
+    :returns: ``None``。
+    :raises HostDurableError: 任一必填字段为空或事件序号无效时抛出。
+    """
+
+    _require_non_empty_text(slot.scope, field_name="scope")
+    _require_non_empty_text(slot.slot_key, field_name="slot_key")
+    _require_non_empty_text(slot.session_id, field_name="session_id")
+    _require_non_empty_text(slot.bound_event_id, field_name="bound_event_id")
+    if slot.bound_event_sequence <= 0:
+        raise HostDurableError("bound_event_sequence must be positive")
+    _require_non_empty_text(slot.metadata_json, field_name="metadata_json")
+    _require_non_empty_text(slot.updated_at, field_name="updated_at")
+
+
+def _slot_ref_from_row(slot: SessionSlotRow | None) -> SessionSlotRef | None:
+    """把 slot row 转换为公共 slot 引用。
+
+    :param slot: slot row 或 ``None``。
+    :returns: ``SessionSlotRef`` 或 ``None``。
+    """
+
+    if slot is None:
+        return None
+    return SessionSlotRef(scope=slot.scope, slot_key=slot.slot_key)
+
+
+def _session_timeline_cursor(session: SessionRow) -> int:
+    """读取 Session 自身 lifecycle 的最新事件游标。
+
+    :param session: Session row。
+    :returns: ``closed_event_sequence`` 或 ``created_event_sequence``。
+    """
+
+    if session.closed_event_sequence is not None:
+        return session.closed_event_sequence
+    return session.created_event_sequence
+
+
+def _read_active_run_id(
+    transaction: HostTransaction, session_id: str
+) -> str | None:
+    """读取 Session 当前 active Run id。
+
+    :param transaction: 调用方提供的 Host transaction。
+    :param session_id: Session id。
+    :returns: active Run id；不存在时为 ``None``。
+    :raises HostDurableError: row 字段无效时抛出。
+    """
+
+    row = transaction.fetchone(
+        f"""
+        SELECT run_id
+        FROM {TABLE_HOST_RUNS}
+        WHERE session_id = ?
+          AND status IN (?, ?, ?, ?)
+        ORDER BY accepted_event_sequence ASC, run_id ASC
+        LIMIT 1
+        """,
+        (
+            session_id,
+            serialize_run_status(RunStatus.RUNNING),
+            serialize_run_status(RunStatus.WAITING),
+            serialize_run_status(RunStatus.CANCELLING),
+            serialize_run_status(RunStatus.RECOVERING),
+        ),
+    )
+    if row is None:
+        return None
+    return _require_text(row.get("run_id"), field_name="run_id")
+
+
+def _read_queued_run_ids(
+    transaction: HostTransaction, session_id: str
+) -> tuple[str, ...]:
+    """读取 Session queued Run id 列表。
+
+    :param transaction: 调用方提供的 Host transaction。
+    :param session_id: Session id。
+    :returns: 按 accepted event sequence 排序的 Run id 元组。
+    :raises HostDurableError: row 字段无效时抛出。
+    """
+
+    rows = transaction.fetchall(
+        f"""
+        SELECT run_id
+        FROM {TABLE_HOST_RUNS}
+        WHERE session_id = ? AND status = ?
+        ORDER BY accepted_event_sequence ASC, run_id ASC
+        """,
+        (session_id, serialize_run_status(RunStatus.QUEUED)),
+    )
+    return tuple(_require_text(row.get("run_id"), field_name="run_id") for row in rows)
 
 
 def _optional_source_run_relation(value: str | None) -> SourceRunRelation | None:
