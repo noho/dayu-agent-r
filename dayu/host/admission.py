@@ -49,6 +49,7 @@ from dayu.host.durable.idempotency import (
     IdempotencyScope,
     IdempotencyStore,
 )
+from dayu.host.durable.schema import TABLE_EVENT_LOG
 from dayu.host.durable.run_transition import (
     CancelPredispatchStartingInput,
     CancelQueuedRunInput,
@@ -1656,7 +1657,7 @@ def _require_event_sequence(
     """
 
     row = transaction.fetchone(
-        "SELECT event_sequence FROM event_log WHERE event_id = ?",
+        f"SELECT event_sequence FROM {TABLE_EVENT_LOG} WHERE event_id = ?",
         (event_id,),
     )
     if row is None:

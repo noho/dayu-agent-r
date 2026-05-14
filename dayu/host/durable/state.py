@@ -1480,6 +1480,9 @@ def terminal_run_row(
 ) -> RunMutationResult:
     """CAS 将 active Run 推进到具体终态。
 
+    ``WAITING`` 源状态是为后续 phase 的 wait resolve 路径预留；Phase 3
+    调用方通过前置检查保证只会传入 ``RUNNING`` Run。
+
     :param transaction: 调用方提供的 Host transaction。
     :param run_id: 目标 Run id。
     :param current_attempt_id: 期望的 current Attempt id。
