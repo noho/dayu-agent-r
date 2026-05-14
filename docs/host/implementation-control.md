@@ -1578,8 +1578,18 @@ Controller re-review adjudication artifact 为
 `pytest tests/host/test_state_schema.py tests/host/test_run_attempt_transitions.py tests/host/test_weak_typing_guard.py -q`
 34 passed，`python -m pyright dayu/host tests/host` 0 errors，`git diff --check` passed。P5-S1 accepted slice commit 为
 `8ad5f10`。P5-S1 residual risk：`ATTEMPT_RUNNING` payload 的 `local_worker_id`、`worker_accepted_at`、`lane_name`
-与 `lane_claim_id` 由 P5-S3 LocalProxy / scheduler 接入时补齐。当前 gate 为 P5-S2 RunInputBuilder And No-tool
-Provider Boundary implementation。
+与 `lane_claim_id` 由 P5-S3 LocalProxy / scheduler 接入时补齐。
+P5-S2 RunInputBuilder And No-tool Provider Boundary 已完成 implementation 与 code review。Implementation artifact 为
+`docs/reviews/gateflow-implementation-host-p5-s2-runinputbuilder-no-tool-provider-20260514.md`；code review artifacts 为
+`docs/reviews/gateflow-code-review-host-p5-s2-runinputbuilder-no-tool-provider-mimo-20260514.md` 与
+`docs/reviews/gateflow-code-review-host-p5-s2-runinputbuilder-no-tool-provider-ds-20260514.md`。两份 review 均无
+blocking finding；Controller adjudication artifact 为
+`docs/reviews/gateflow-code-review-host-p5-s2-runinputbuilder-no-tool-provider-controller-adjudication-20260514.md`。P5-S2 validation：
+`pytest tests/host/test_run_input_builder.py tests/host/test_package_exports.py tests/host/test_weak_typing_guard.py -q`
+11 passed，`python -m pyright dayu/host tests/host` 0 errors，`git diff --check` passed。P5-S2 accepted slice commit 为
+`411e01e`。P5-S2 residual risks：artifact-backed current prompt loading 未实现，当前 builder 要求 durable `display_text`；
+Memory / compact / ToolRuntime real providers 分别由 Phase 9 / 10 / 6 接入；LocalProxy / scheduler 创建真实
+`AttemptDispatchSnapshot` 属于 P5-S3。当前 gate 为 P5-S3 Dispatch Scheduler, Lane And LocalProxy implementation。
 
 历史状态：Phase 1 公共契约与 runtime 基础设施已完成并 merge；Phase 2 Durable Store / EventLog / Payload Foundation 已完成 plan、3 个 implementation slices、aggregate deepreview、aggregate fix、aggregate re-review 与 accepted deepreview commit，本 phase 状态为 completed。Phase 1 design refinement 已写入 `docs/reviews/gateflow-phase-design-host-p1-codex-20260513.md`，controller-accepted design fix 已写入 `docs/reviews/gateflow-phase-design-fix-host-p1-codex-20260513.md`。用户反馈后的 design fixes 已写入 `docs/reviews/gateflow-phase-design-user-feedback-fix-host-p1-codex-20260513.md` 与 `docs/reviews/gateflow-phase-design-user-feedback-fix2-host-p1-codex-20260513.md`。AgentMiMo 与 AgentDS 的 phase design re-review 均确认 accepted findings 已修复且 new blocker 为 0；round2 re-review 进一步确认 lane 已改为 cross-process runtime capacity guard，Phase Map 已重排为 P12 ToolsDiscovery / ScenePrepare、P13 Audit / Tool Trace / Outbox、P14 RemoteProxy、P15 Retention / Purge。Phase 1 plan 已写入 `docs/host/phase1-public-contract-runtime-plan.md`；plan review、controller adjudication、plan fix 与 plan re-review artifacts 已写入 `docs/reviews/`。AgentMiMo 与 AgentDS 的 plan re-review 均确认 finding 数量为 0、blocking finding 数量为 0。用户已确认 Phase 1 plan；accepted plan commit 为 `34b1b41`。Phase 1 Slice 1 accepted slice commit 为 `66d8dc3`，Slice 2 accepted slice commit 为 `27e0d8b`，Slice 3 accepted slice commit 为 `e23e3e4`，Slice 4 accepted slice commit 为 `0393a22`。
 
