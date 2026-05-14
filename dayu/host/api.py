@@ -12,6 +12,7 @@ from dataclasses import dataclass
 from enum import StrEnum
 from typing import Protocol, TypeAlias
 
+from dayu.contracts.cancellation import CancellationToken
 from dayu.contracts.json_value import JsonValue
 
 
@@ -250,6 +251,54 @@ class SourceRunRelation(StrEnum):
 
     RETRY = "retry"
     REPLAY = "replay"
+
+
+@dataclass(frozen=True, slots=True)
+class AttemptDispatchSnapshot:
+    """一次 Attempt dispatch 的强类型输入快照。
+
+    本快照只承载 durable identity refs、dispatch refs、policy snapshot ref
+    与取消观察 token。Runner 规约、Runner 调用参数、AgentPolicy、工具
+    schema 与 ToolExecutor 必须由 RunInputBuilder 的 typed providers 在
+    build 时注入，不能重复塞入本快照。
+
+    :param session_id: Attempt 所属 Session id。
+    :param run_id: Attempt 所属 Run id。
+    :param attempt_id: Attempt id。
+    :param execution_id: Attempt execution id。
+    :param dispatch_record_id: Attempt dispatch record id。
+    :param execution_target: 已解析执行目标。
+    :param policy_snapshot_ref: Host policy snapshot ref。
+    :param cancellation_token: Host 注入的取消观察 token。
+    """
+
+    session_id: str
+    run_id: str
+    attempt_id: str
+    execution_id: str
+    dispatch_record_id: str
+    execution_target: str
+    policy_snapshot_ref: str
+    cancellation_token: CancellationToken
+
+    def __post_init__(self) -> None:
+        """校验快照必填文本字段。
+
+        :returns: ``None``。
+        :raises ValueError: 任一必填文本为空时抛出。
+        """
+
+        _require_non_empty(self.session_id, field_name="session_id")
+        _require_non_empty(self.run_id, field_name="run_id")
+        _require_non_empty(self.attempt_id, field_name="attempt_id")
+        _require_non_empty(self.execution_id, field_name="execution_id")
+        _require_non_empty(
+            self.dispatch_record_id, field_name="dispatch_record_id"
+        )
+        _require_non_empty(self.execution_target, field_name="execution_target")
+        _require_non_empty(
+            self.policy_snapshot_ref, field_name="policy_snapshot_ref"
+        )
 
 
 class HostApiErrorCode(StrEnum):
@@ -1409,6 +1458,7 @@ class HostApiError(Exception):
 
 
 __all__ = [
+    "AttemptDispatchSnapshot",
     "AttemptStatus",
     "AuthorizationClaim",
     "CancelMode",

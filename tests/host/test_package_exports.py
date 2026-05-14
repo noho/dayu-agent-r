@@ -8,6 +8,7 @@ import dayu.host.api as api
 
 EXPECTED_API_EXPORTS: frozenset[str] = frozenset(
     {
+        "AttemptDispatchSnapshot",
         "AttemptStatus",
         "AuthorizationClaim",
         "CancelMode",
