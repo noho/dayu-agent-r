@@ -22,7 +22,13 @@ import asyncio
 import json
 import logging
 import time
-from collections.abc import AsyncIterator, Awaitable, Iterable, Sequence
+from collections.abc import (
+    AsyncIterator,
+    Awaitable,
+    Coroutine,
+    Iterable,
+    Sequence,
+)
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from typing import TypeVar
@@ -424,8 +430,8 @@ class AsyncOpenAIRunner:
             response_ctx = session.post(
                 self._spec.endpoint, data=body_bytes, headers=headers
             )
-            response = await await_or_cancel(
-                response_ctx.__aenter__(), token=self._token
+            response = await self._enter_response_context_or_cancel(
+                response_ctx.__aenter__()
             )
         except (aiohttp.ClientError, asyncio.TimeoutError) as exc:
             raise _AttemptFailedRetriable(
@@ -512,6 +518,58 @@ class AsyncOpenAIRunner:
                     yield event
         finally:
             response.release()
+
+    async def _enter_response_context_or_cancel(
+        self,
+        response_enter: Coroutine[None, None, aiohttp.ClientResponse],
+    ) -> aiohttp.ClientResponse:
+        """进入 aiohttp response context，并在取消竞态中守住 response 释放。
+
+        :param response_enter: ``response_ctx.__aenter__()`` 返回的协程。
+        :returns: 已取得的 :class:`aiohttp.ClientResponse`。
+        :raises _RunnerInterrupted: cancellation token 在 response 可交给正文
+            处理前命中时抛出。
+        :raises Exception: 透传 ``__aenter__`` 自身异常。
+        """
+
+        response_task = asyncio.create_task(response_enter)
+        try:
+            outcome = await _runtime_wait_for_or_cancel(
+                response_task,
+                token=self._token,
+                timeout_seconds=None,
+            )
+        except asyncio.CancelledError:
+            await self._release_response_task_if_acquired(response_task)
+            raise
+        if isinstance(outcome, WaitCompleted):
+            return outcome.value
+        assert isinstance(outcome, WaitCancelled)
+        await self._release_response_task_if_acquired(response_task)
+        raise _RunnerInterrupted(
+            outcome.reason or "cancelled during response acquisition"
+        )
+
+    async def _release_response_task_if_acquired(
+        self, response_task: asyncio.Task[aiohttp.ClientResponse]
+    ) -> None:
+        """取消 response enter task，并释放已经取得的 response。
+
+        :param response_task: 正在进入 aiohttp response context 的 task。
+        :returns: 无返回值。
+        :raises Exception: 不主动抛出异常；进入阶段自身异常与 task 取消都
+            作为取消清理路径吞掉。
+        """
+
+        if not response_task.done():
+            response_task.cancel()
+        try:
+            response = await response_task
+        except asyncio.CancelledError:
+            return
+        except Exception:
+            return
+        response.release()
 
     async def _iter_response_bytes(
         self,
