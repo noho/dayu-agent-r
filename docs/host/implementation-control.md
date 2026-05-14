@@ -1479,7 +1479,7 @@ read/event stream 能力。AgentMiMo 与 AgentDS 的 code review artifacts 分�
 均为 accepted / no blocking finding。P4-S3 validation：`pytest tests/host/test_public_run_api.py tests/host/test_public_cancel_session_runs.py tests/host/test_admission_queue.py tests/host/test_admission_multiprocess.py -q`
 37 passed，`python -m pyright dayu/host tests/host` 0 errors，`git diff --check` passed；reviewer 额外验证
 `pytest tests/host/test_package_exports.py -q` 5 passed 与 `pytest tests/host -q` 191 passed。当前 gate 为 P4-S3 accepted
-slice commit；commit 后进入 P4-S4 Read APIs, Event Stream And Deferred Facade Behavior implementation。P4-S3 留下
+slice commit；P4-S3 accepted slice commit 为 `af61fe9`。commit 后进入 P4-S4 Read APIs, Event Stream And Deferred Facade Behavior implementation。P4-S3 留下
 明确后续 owner：public `submit_followup(queue)` 的默认 execution target 必须由后续 policy provider / execution
 target resolution owner 替换；完整 session-scope cancel 必须继续由 Phase 5 / 7 / 11 分别补齐 dispatching /
 active worker、`WAITING`、`RECOVERING`，不得把 Phase 4 queued / pre-dispatch `STARTING` 子集写成最终语义。
