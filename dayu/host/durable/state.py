@@ -14,6 +14,7 @@ from typing import TypeVar
 from dayu.host.api import (
     AttemptStatus,
     HostStreamCursor,
+    RunSnapshot,
     RunStatus,
     SessionSlotRef,
     SessionSnapshot,
@@ -820,6 +821,61 @@ def read_earliest_queued_run(
     if row is None:
         return None
     return run_row_from_host_row(row)
+
+
+def read_non_terminal_runs_for_session(
+    transaction: HostTransaction, session_id: str
+) -> tuple[RunRow, ...]:
+    """读取指定 Session 下所有非终态 Run。
+
+    :param transaction: 调用方提供的 Host transaction。
+    :param session_id: Session id。
+    :returns: 按 accepted event sequence 升序排列的非终态 Run row 元组。
+    :raises HostDurableError: ``session_id`` 为空或 row 字段无效时抛出。
+    :raises sqlite3.Error: SQLite 查询失败时由 transaction runner 结构化转换。
+    """
+
+    _require_non_empty_text(session_id, field_name="session_id")
+    rows = transaction.fetchall(
+        f"""
+        SELECT
+          run_id,
+          session_id,
+          status,
+          client_request_id,
+          input_event_id,
+          input_event_sequence,
+          accepted_event_id,
+          accepted_event_sequence,
+          queued_event_id,
+          queued_event_sequence,
+          started_event_id,
+          started_event_sequence,
+          terminal_event_id,
+          terminal_event_sequence,
+          current_attempt_id,
+          source_run_id,
+          source_run_relation,
+          execution_target,
+          queue_policy,
+          created_at,
+          updated_at,
+          terminal_at
+        FROM {TABLE_HOST_RUNS}
+        WHERE session_id = ?
+          AND status IN (?, ?, ?, ?, ?)
+        ORDER BY accepted_event_sequence ASC, run_id ASC
+        """,
+        (
+            session_id,
+            serialize_run_status(RunStatus.QUEUED),
+            serialize_run_status(RunStatus.RUNNING),
+            serialize_run_status(RunStatus.WAITING),
+            serialize_run_status(RunStatus.CANCELLING),
+            serialize_run_status(RunStatus.RECOVERING),
+        ),
+    )
+    return tuple(run_row_from_host_row(row) for row in rows)
 
 
 def read_attempt_by_id(
@@ -1755,6 +1811,27 @@ def session_snapshot_from_rows(
     )
 
 
+def run_snapshot_from_row(run: RunRow) -> RunSnapshot:
+    """由 durable Run row 构造公共 RunSnapshot。
+
+    :param run: durable Run row。
+    :returns: 公共 Run snapshot。
+    :raises ValueError: Run row 字段无法满足公共 snapshot 约束时抛出。
+    """
+
+    return RunSnapshot(
+        run_id=run.run_id,
+        session_id=run.session_id,
+        status=run.status,
+        current_attempt_id=run.current_attempt_id,
+        terminal_result_summary=None,
+        event_cursor=HostStreamCursor(event_sequence=_run_event_cursor(run)),
+        source_run_id=run.source_run_id,
+        source_run_relation=run.source_run_relation,
+        outbox_summary=None,
+    )
+
+
 def _serialize_str_enum(value: StrEnum, *, enum_name: str) -> str:
     """序列化 StrEnum。
 
@@ -2266,6 +2343,23 @@ def _session_timeline_cursor(session: SessionRow) -> int:
     if session.closed_event_sequence is not None:
         return session.closed_event_sequence
     return session.created_event_sequence
+
+
+def _run_event_cursor(run: RunRow) -> int:
+    """计算 Run snapshot 的当前事件游标。
+
+    :param run: durable Run row。
+    :returns: Run 已知事件引用中的最大全局 event sequence。
+    """
+
+    event_sequences = (
+        run.input_event_sequence,
+        run.accepted_event_sequence,
+        run.queued_event_sequence,
+        run.started_event_sequence,
+        run.terminal_event_sequence,
+    )
+    return max(sequence for sequence in event_sequences if sequence is not None)
 
 
 def _read_active_run_id(

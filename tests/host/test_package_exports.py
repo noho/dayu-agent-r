@@ -66,11 +66,15 @@ EXPECTED_TOOLING_EXPORTS: frozenset[str] = frozenset(
 EXPECTED_COMMAND_EXPORTS: frozenset[str] = frozenset(
     {
         "HostCommandHandle",
+        "cancel_run",
+        "cancel_session_runs",
         "close_session",
         "create_host_command_handle",
         "create_session",
         "ensure_session",
         "get_session",
+        "start_run",
+        "submit_followup",
     }
 )
 

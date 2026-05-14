@@ -1,7 +1,7 @@
 """Host 公共命名空间。
 
 本包当前导出公共类型契约、Host construction 的业务工具输入边界，以及
-Phase 4 已实现的 Session public command facade。durable store、EventLog、
+Phase 4 已实现的 Session / Run public command facade。durable store、EventLog、
 dispatch、ToolRuntime factory 与 policy provider 均不在当前包根导出范围内。
 """
 
@@ -52,10 +52,14 @@ from dayu.host.api import (
 )
 from dayu.host.command import (
     HostCommandHandle,
+    cancel_run,
+    cancel_session_runs,
     close_session,
     create_host_command_handle,
     create_session,
     ensure_session,
+    start_run,
+    submit_followup,
 )
 from dayu.host.read_api import get_session
 from dayu.host.tooling import (
@@ -115,10 +119,14 @@ __all__ = [
     "ToolBundleSourceKind",
     "ToolBundleSourceRef",
     "WaitResolutionSource",
+    "cancel_run",
+    "cancel_session_runs",
     "close_session",
     "create_host_command_handle",
     "create_session",
     "default_framework_tool_policy_view",
     "ensure_session",
     "get_session",
+    "start_run",
+    "submit_followup",
 ]
