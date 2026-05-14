@@ -621,6 +621,21 @@ async def test_runner_exception_maps_to_run_failed_and_closes() -> None:
     assert runner.close_count == 1
 
 
+def test_exception_diagnostic_message_marks_truncation() -> None:
+    """异常诊断消息被截断时必须显式携带截断标记。"""
+
+    message = agent_module._exception_diagnostic_message(
+        RuntimeError("x" * 500)
+    )
+
+    assert message.startswith("RuntimeError: ")
+    assert message.endswith("... [truncated]")
+    assert (
+        len(message.removeprefix("RuntimeError: "))
+        == agent_module._EXCEPTION_MESSAGE_MAX_LENGTH
+    )
+
+
 @pytest.mark.asyncio
 async def test_cancelled_before_run_closes_then_emits_cancelled() -> None:
     """入口已取消时不调用 Runner，但先 close 再产出 run_cancelled。"""

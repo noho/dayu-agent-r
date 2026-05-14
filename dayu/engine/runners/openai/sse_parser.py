@@ -68,7 +68,12 @@ _FINISH_REASON_MAP: dict[str, FinishReason] = {
 
 
 def _make_event(data: RunnerEventData) -> RunnerEvent:
-    """把事件 data 包装为 :class:`RunnerEvent`。"""
+    """把事件 data 包装为 :class:`RunnerEvent`。
+
+    :param data: Runner 事件载荷。
+    :returns: 带当前 UTC 时间戳的 :class:`RunnerEvent`。
+    :raises AssertionError: 当 ``data`` 不是 SSE parser 支持的事件载荷时抛出。
+    """
 
     occurred_at = datetime.now(tz=timezone.utc)
     type_ = _event_type_for(data)
@@ -76,7 +81,12 @@ def _make_event(data: RunnerEventData) -> RunnerEvent:
 
 
 def _event_type_for(data: RunnerEventData) -> RunnerEventType:
-    """根据 data 类型返回对应的 :class:`RunnerEventType`。"""
+    """根据 data 类型返回对应的 :class:`RunnerEventType`。
+
+    :param data: Runner 事件载荷。
+    :returns: 对应的 :class:`RunnerEventType`。
+    :raises AssertionError: 当 ``data`` 不属于 SSE parser 可产出的载荷类型时抛出。
+    """
 
     match data:
         case RunnerContentDeltaData():
@@ -287,13 +297,24 @@ class SSEParser:
     async def _handle_chunk_object(
         self, parsed: dict[str, JsonValue]
     ) -> AsyncIterator[RunnerEvent]:
-        """处理单个解析后的 SSE chunk JSON 对象。"""
+        """处理单个解析后的 SSE chunk JSON 对象。
+
+        :param parsed: 已解析的 SSE JSON object。
+        :returns: 归一化后的 Runner 事件异步迭代器。
+        :raises Exception: 不主动抛出异常。
+        """
 
         choices = parsed.get("choices")
         usage = parsed.get("usage")
         if isinstance(choices, list) and choices:
-            for choice in choices:
+            for index, choice in enumerate(choices):
                 if not isinstance(choice, dict):
+                    _LOGGER.warning(
+                        "sse.protocol_diagnostic "
+                        "code=sse_choice_not_object index=%d type=%s",
+                        index,
+                        type(choice).__name__,
+                    )
                     continue
                 async for event in self._handle_choice(choice):
                     yield event

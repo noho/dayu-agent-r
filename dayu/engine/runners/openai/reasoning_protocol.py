@@ -19,6 +19,8 @@ MiMo / Qwen）的推理链统一走 OpenAI 协议原生
 
 from __future__ import annotations
 
+from typing import assert_never
+
 from dayu.engine.contracts.runner_spec import (
     AnthropicThinkingExtension,
     DeepSeekThinkingExtension,
@@ -41,6 +43,7 @@ def detect_reasoning_protocol_hook(
     :param provider_request: ``RunnerSpec.provider_request``；为
         ``None`` 表示无 provider 私有扩展。
     :returns: :class:`_ReasoningProtocolHook` 钩子。
+    :raises AssertionError: 当封闭联合出现未处理 provider 扩展成员时抛出。
 
     - :class:`GeminiThinkingExtension(include_thoughts=True)` →
       ``tag_name="thought"``。
@@ -62,6 +65,8 @@ def detect_reasoning_protocol_hook(
             | QwenThinkingExtension()
         ):
             return _ReasoningProtocolHook(tag_name=None)
+        case _:
+            assert_never(provider_request)
 
 
 __all__ = ["detect_reasoning_protocol_hook"]

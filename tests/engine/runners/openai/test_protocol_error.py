@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import logging
 
 import pytest
 
@@ -245,6 +246,38 @@ async def test_sse_usage_malformed_after_tool_delta_is_fatal() -> None:
     assert done.finish_reason is FinishReason.ERROR
     assert RunnerEventType.RUNNER_TOOL_CALLS_COMPLETED not in types
     assert RunnerEventType.RUNNER_CONTENT_COMPLETED not in types
+
+
+@pytest.mark.asyncio
+async def test_sse_non_object_choice_logs_diagnostic(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """SSE ``choices`` 内非 object 成员只记录诊断，不改变协议行为。"""
+
+    caplog.set_level(
+        logging.WARNING, logger="dayu.engine.runners.openai.sse_parser"
+    )
+    payload_json = json.dumps(
+        {"choices": ["bad-choice", {"delta": {"content": "ok"}}]},
+        separators=(",", ":"),
+    )
+
+    events = await parse_sse(
+        [
+            _sse_json_chunk(payload_json),
+            b'data: {"choices":[{"finish_reason":"stop","delta":{}}]}\n\n',
+            b"data: [DONE]\n\n",
+        ]
+    )
+
+    assert any(
+        "code=sse_choice_not_object" in record.getMessage()
+        for record in caplog.records
+    )
+    assert any(
+        event.type is RunnerEventType.RUNNER_CONTENT_COMPLETED
+        for event in events
+    )
 
 
 @pytest.mark.asyncio

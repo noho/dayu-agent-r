@@ -68,6 +68,15 @@ def test_classify_exception_client_error() -> None:
     )
 
 
+def test_classify_exception_client_payload_error_is_network_error() -> None:
+    """``aiohttp.ClientPayloadError`` 属于读取失败，不应归为超时。"""
+
+    assert (
+        classify_exception(aiohttp.ClientPayloadError("broken payload"))
+        is RunnerHTTPErrorCode.NETWORK_ERROR
+    )
+
+
 def test_classify_exception_rejects_unrelated() -> None:
     """非传输层异常应抛出 :class:`TypeError`。"""
 

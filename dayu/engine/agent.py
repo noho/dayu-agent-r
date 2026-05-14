@@ -176,6 +176,7 @@ _CONTINUATION_TOOL_CALL_NOT_ALLOWED_MESSAGE: str = (
 )
 _EXCEPTION_MESSAGE_REDACTED: str = "exception message redacted"
 _EXCEPTION_MESSAGE_MAX_LENGTH: int = 240
+_EXCEPTION_MESSAGE_TRUNCATED_SUFFIX: str = "... [truncated]"
 _SENSITIVE_EXCEPTION_MARKERS: tuple[str, ...] = (
     "api_key",
     "apikey",
@@ -217,7 +218,14 @@ def _exception_diagnostic_message(exc: Exception) -> str:
     if any(marker in lowered_message for marker in _SENSITIVE_EXCEPTION_MARKERS):
         return f"{exc_type}: {_EXCEPTION_MESSAGE_REDACTED}"
     if len(raw_message) > _EXCEPTION_MESSAGE_MAX_LENGTH:
-        raw_message = raw_message[:_EXCEPTION_MESSAGE_MAX_LENGTH]
+        max_body_length = (
+            _EXCEPTION_MESSAGE_MAX_LENGTH
+            - len(_EXCEPTION_MESSAGE_TRUNCATED_SUFFIX)
+        )
+        raw_message = (
+            raw_message[:max_body_length]
+            + _EXCEPTION_MESSAGE_TRUNCATED_SUFFIX
+        )
     return f"{exc_type}: {raw_message}"
 
 
@@ -2427,12 +2435,7 @@ async def run_agent_and_wait(request: AgentRunRequest) -> AgentRunResult:
 
     terminal: EngineEvent | None = None
     async for event in run_agent_messages(request):
-        if event.type in {
-            EngineEventType.FINAL_ANSWER,
-            EngineEventType.RUN_FAILED,
-            EngineEventType.RUN_CANCELLED,
-            EngineEventType.RUN_SUSPENDED,
-        }:
+        if event.type in TERMINAL_ENGINE_EVENT_TYPES:
             terminal = event
 
     if terminal is None:
