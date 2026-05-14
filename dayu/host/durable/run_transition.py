@@ -38,13 +38,16 @@ from dayu.host.durable.state import (
     RunStartReason,
     StateMutationStatus,
     WorkerKind,
-    cancel_pending_dispatch_record_row,
+    cancel_starting_dispatch_record_row,
     cancel_queued_run_row,
     cancel_running_run_row,
     cancel_starting_attempt_row,
     insert_attempt,
     insert_dispatch_record,
     insert_run,
+    mark_attempt_running_row,
+    mark_dispatch_worker_accepted_row,
+    mark_run_cancelling_row,
     promote_queued_run_row,
     read_active_run_for_session,
     read_attempt_by_id,
@@ -60,7 +63,9 @@ _EVENT_TYPE_RUN_ACCEPTED = "RUN_ACCEPTED"
 _EVENT_TYPE_RUN_QUEUED = "RUN_QUEUED"
 _EVENT_TYPE_RUN_STARTED = "RUN_STARTED"
 _EVENT_TYPE_ATTEMPT_STARTED = "ATTEMPT_STARTED"
+_EVENT_TYPE_ATTEMPT_RUNNING = "ATTEMPT_RUNNING"
 _EVENT_TYPE_CANCEL_REQUESTED = "CANCEL_REQUESTED"
+_EVENT_TYPE_RUN_CANCELLING = "RUN_CANCELLING"
 _EVENT_TYPE_ATTEMPT_CANCELLED = "ATTEMPT_CANCELLED"
 _EVENT_TYPE_RUN_CANCELLED = "RUN_CANCELLED"
 _EVENT_TYPE_ATTEMPT_SUCCEEDED = "ATTEMPT_SUCCEEDED"
@@ -232,6 +237,28 @@ class TerminalCloseoutInput:
 
 
 @dataclass(frozen=True, slots=True)
+class AcceptWorkerRunningInput:
+    """WorkerProxy accepted 后推进 Attempt RUNNING 的输入。
+
+    :param run_id: 目标 Run id。
+    :param attempt_id: 目标 Attempt id。
+    :param attempt_running_event_id: 调用方生成的 ``ATTEMPT_RUNNING`` event id。
+    :param occurred_at: canonical fact 的发生时间。
+    :param actor: 事件 actor。
+    :param source: 事件 source。
+    :param worker_accept_reason: worker accept 诊断原因。
+    """
+
+    run_id: str
+    attempt_id: str
+    attempt_running_event_id: str
+    occurred_at: datetime
+    actor: str
+    source: str
+    worker_accept_reason: str
+
+
+@dataclass(frozen=True, slots=True)
 class CancelQueuedRunInput:
     """取消 queued Run 的输入。
 
@@ -283,6 +310,36 @@ class CancelPredispatchStartingInput:
     cancel_request_event_id: str
     attempt_cancelled_event_id: str
     run_cancelled_event_id: str
+    occurred_at: datetime
+    actor: str
+    source: str
+    client_request_id: str
+    idempotency_key: str
+    reason: str
+    mode: CancelMode
+    call_context_digest: str
+
+
+@dataclass(frozen=True, slots=True)
+class CancelActiveAttemptInput:
+    """请求取消 active RUNNING Attempt 的输入。
+
+    :param run_id: 目标 Run id。
+    :param cancel_request_event_id: 调用方生成的 ``CANCEL_REQUESTED`` event id。
+    :param run_cancelling_event_id: 调用方生成的 ``RUN_CANCELLING`` event id。
+    :param occurred_at: canonical facts 的发生时间。
+    :param actor: 事件 actor。
+    :param source: 事件 source。
+    :param client_request_id: 客户端幂等请求 id。
+    :param idempotency_key: 幂等 key。
+    :param reason: cancel reason。
+    :param mode: cancel mode。
+    :param call_context_digest: 调用上下文 digest。
+    """
+
+    run_id: str
+    cancel_request_event_id: str
+    run_cancelling_event_id: str
     occurred_at: datetime
     actor: str
     source: str
@@ -613,6 +670,75 @@ def terminal_closeout_in_transaction(
     )
 
 
+def accept_worker_running_in_transaction(
+    transaction: HostTransaction,
+    event_log_store: EventLogStore,
+    request: AcceptWorkerRunningInput,
+) -> RunTransitionResult:
+    """WorkerProxy accepted 后追加 ``ATTEMPT_RUNNING`` 并推进 Attempt。
+
+    :param transaction: 调用方提供的 Host transaction。
+    :param event_log_store: EventLog append primitive。
+    :param request: worker accepted 输入。
+    :returns: transition 结果，前置状态不满足时返回 not_found/invalid_state。
+    :raises HostDurableError: 输入字段或 SQLite 写入无效时由底层抛出。
+    """
+
+    _validate_accept_worker_running_input(request)
+    run = read_run_by_id(transaction, request.run_id)
+    attempt = read_attempt_by_id(transaction, request.attempt_id)
+    dispatch_record = read_dispatch_record_by_attempt_id(
+        transaction, request.attempt_id
+    )
+    invalid = _invalid_accept_worker_precondition(
+        run=run,
+        attempt=attempt,
+        dispatch_record=dispatch_record,
+        attempt_id=request.attempt_id,
+    )
+    if invalid is not None:
+        return invalid
+    if run is None or attempt is None or dispatch_record is None:
+        raise HostDurableError("worker accept precondition narrowing failed")
+
+    attempt_running_event = event_log_store.append_event(
+        transaction,
+        _attempt_running_event_request(
+            request=request,
+            run=run,
+            attempt=attempt,
+            dispatch_record=dispatch_record,
+        ),
+    ).row
+    accepted_at = format_utc_timestamp(request.occurred_at)
+    attempt_result = mark_attempt_running_row(
+        transaction,
+        attempt_id=attempt.attempt_id,
+        updated_at=accepted_at,
+    )
+    attempt_result = _require_attempt_mutation_updated(
+        attempt_result,
+        mutation_name="mark Attempt running",
+    )
+    dispatch_result = mark_dispatch_worker_accepted_row(
+        transaction,
+        attempt_id=attempt.attempt_id,
+        worker_accept_event_id=attempt_running_event.event_id,
+        worker_accept_event_sequence=attempt_running_event.event_sequence,
+        worker_accepted_at=accepted_at,
+    )
+    dispatch_result = _require_dispatch_record_mutation_updated(
+        dispatch_result,
+        mutation_name="record dispatch worker accept refs",
+    )
+    return RunTransitionResult(
+        status=attempt_result.status,
+        run=read_run_by_id(transaction, run.run_id),
+        attempt=attempt_result.row,
+        dispatch_record=dispatch_result.row,
+    )
+
+
 def cancel_queued_in_transaction(
     transaction: HostTransaction,
     event_log_store: EventLogStore,
@@ -713,7 +839,7 @@ def cancel_predispatch_starting_in_transaction(
         attempt is None
         or attempt.status != AttemptStatus.STARTING
         or dispatch_record is None
-        or dispatch_record.status != DispatchRecordStatus.PENDING
+        or not _dispatch_record_is_direct_cancelable(dispatch_record)
     ):
         return RunTransitionResult(
             status=StateMutationStatus.INVALID_STATE,
@@ -746,7 +872,7 @@ def cancel_predispatch_starting_in_transaction(
         ),
     ).row
     terminal_at = format_utc_timestamp(request.occurred_at)
-    dispatch_result = cancel_pending_dispatch_record_row(
+    dispatch_result = cancel_starting_dispatch_record_row(
         transaction,
         attempt_id=attempt.attempt_id,
         cancelled_event_id=attempt_cancelled_event.event_id,
@@ -755,7 +881,7 @@ def cancel_predispatch_starting_in_transaction(
     )
     dispatch_result = _require_dispatch_record_mutation_updated(
         dispatch_result,
-        mutation_name="cancel pending dispatch record",
+        mutation_name="cancel starting dispatch record",
     )
     attempt_result = cancel_starting_attempt_row(
         transaction,
@@ -785,6 +911,85 @@ def cancel_predispatch_starting_in_transaction(
         run=run_result.row,
         attempt=attempt_result.row,
         dispatch_record=dispatch_result.row,
+    )
+
+
+def request_active_attempt_cancel_in_transaction(
+    transaction: HostTransaction,
+    event_log_store: EventLogStore,
+    request: CancelActiveAttemptInput,
+) -> RunTransitionResult:
+    """请求取消 active RUNNING Attempt，并只首次写 ``RUN_CANCELLING``。
+
+    :param transaction: 调用方提供的 Host transaction。
+    :param event_log_store: EventLog append primitive。
+    :param request: active cancel 输入。
+    :returns: transition 结果；已处于 cancelling 时返回当前状态且不追加事件。
+    :raises HostDurableError: 输入字段或 SQLite 写入无效时由底层抛出。
+    """
+
+    _validate_cancel_active_input(request)
+    run = read_run_by_id(transaction, request.run_id)
+    if run is None:
+        return RunTransitionResult(
+            status=StateMutationStatus.NOT_FOUND,
+            run=None,
+            attempt=None,
+            dispatch_record=None,
+        )
+    if run.status == RunStatus.CANCELLING and run.current_attempt_id is not None:
+        attempt = read_attempt_by_id(transaction, run.current_attempt_id)
+        return RunTransitionResult(
+            status=StateMutationStatus.UPDATED,
+            run=run,
+            attempt=attempt,
+            dispatch_record=_read_dispatch_for_attempt(transaction, attempt),
+        )
+    if run.status != RunStatus.RUNNING or run.current_attempt_id is None:
+        return RunTransitionResult(
+            status=StateMutationStatus.INVALID_STATE,
+            run=run,
+            attempt=None,
+            dispatch_record=None,
+        )
+    attempt = read_attempt_by_id(transaction, run.current_attempt_id)
+    if attempt is None or attempt.status != AttemptStatus.RUNNING:
+        return RunTransitionResult(
+            status=StateMutationStatus.INVALID_STATE,
+            run=run,
+            attempt=attempt,
+            dispatch_record=_read_dispatch_for_attempt(transaction, attempt),
+        )
+
+    cancel_request_event = event_log_store.append_event(
+        transaction, _cancel_requested_event_request(request, run)
+    ).row
+    event_log_store.append_event(
+        transaction,
+        _run_cancelling_event_request(
+            request=request,
+            run=run,
+            attempt=attempt,
+            cancel_request_event_id=cancel_request_event.event_id,
+        ),
+    )
+    run_result = mark_run_cancelling_row(
+        transaction,
+        run_id=run.run_id,
+        current_attempt_id=attempt.attempt_id,
+        updated_at=format_utc_timestamp(request.occurred_at),
+    )
+    run_result = _require_run_mutation_updated(
+        run_result,
+        mutation_name="mark Run cancelling",
+    )
+    return RunTransitionResult(
+        status=run_result.status,
+        run=run_result.row,
+        attempt=read_attempt_by_id(transaction, attempt.attempt_id),
+        dispatch_record=read_dispatch_record_by_attempt_id(
+            transaction, attempt.attempt_id
+        ),
     )
 
 
@@ -1097,8 +1302,54 @@ def _promotion_attempt_started_event_request(
     )
 
 
+def _attempt_running_event_request(
+    *,
+    request: AcceptWorkerRunningInput,
+    run: RunRow,
+    attempt: AttemptRow,
+    dispatch_record: DispatchRecordRow,
+) -> EventLogAppendRequest:
+    """构造 ``ATTEMPT_RUNNING`` EventLog append request。
+
+    :param request: worker accepted 输入。
+    :param run: 目标 Run row。
+    :param attempt: 目标 Attempt row。
+    :param dispatch_record: 目标 dispatch record row。
+    :returns: EventLog append request。
+    """
+
+    return EventLogAppendRequest(
+        event_id=request.attempt_running_event_id,
+        event_class=EventClass.CANONICAL_FACT,
+        session_id=run.session_id,
+        run_id=run.run_id,
+        attempt_id=attempt.attempt_id,
+        execution_id=attempt.execution_id,
+        event_type=_EVENT_TYPE_ATTEMPT_RUNNING,
+        occurred_at=request.occurred_at,
+        actor=request.actor,
+        source=request.source,
+        client_request_id=None,
+        idempotency_key=None,
+        policy_decision=None,
+        reason={"reason": request.worker_accept_reason},
+        payload_json={
+            "attempt_id": attempt.attempt_id,
+            "execution_id": attempt.execution_id,
+            "dispatch_record_id": dispatch_record.dispatch_record_id,
+            "worker_kind": dispatch_record.worker_kind.value,
+            "execution_target": dispatch_record.execution_target,
+            "reason": request.worker_accept_reason,
+        },
+        payload_ref=None,
+        payload_digest=None,
+    )
+
+
 def _cancel_requested_event_request(
-    request: CancelQueuedRunInput | CancelPredispatchStartingInput,
+    request: CancelQueuedRunInput
+    | CancelPredispatchStartingInput
+    | CancelActiveAttemptInput,
     run: RunRow,
 ) -> EventLogAppendRequest:
     """构造 ``CANCEL_REQUESTED`` EventLog append request。
@@ -1130,6 +1381,50 @@ def _cancel_requested_event_request(
             "mode": request.mode.value,
             "target_status_at_accept": run.status.value,
             "call_context_digest": request.call_context_digest,
+        },
+        payload_ref=None,
+        payload_digest=None,
+    )
+
+
+def _run_cancelling_event_request(
+    *,
+    request: CancelActiveAttemptInput,
+    run: RunRow,
+    attempt: AttemptRow,
+    cancel_request_event_id: str,
+) -> EventLogAppendRequest:
+    """构造 ``RUN_CANCELLING`` EventLog append request。
+
+    :param request: active cancel 输入。
+    :param run: 被取消的 Run row。
+    :param attempt: 被取消的 active Attempt row。
+    :param cancel_request_event_id: CANCEL_REQUESTED event id。
+    :returns: EventLog append request。
+    """
+
+    return EventLogAppendRequest(
+        event_id=request.run_cancelling_event_id,
+        event_class=EventClass.CANONICAL_FACT,
+        session_id=run.session_id,
+        run_id=run.run_id,
+        attempt_id=attempt.attempt_id,
+        execution_id=attempt.execution_id,
+        event_type=_EVENT_TYPE_RUN_CANCELLING,
+        occurred_at=request.occurred_at,
+        actor=request.actor,
+        source=request.source,
+        client_request_id=request.client_request_id,
+        idempotency_key=request.idempotency_key,
+        policy_decision=None,
+        reason={"reason": request.reason, "mode": request.mode.value},
+        payload_json={
+            "run_id": run.run_id,
+            "attempt_id": attempt.attempt_id,
+            "execution_id": attempt.execution_id,
+            "reason": request.reason,
+            "mode": request.mode.value,
+            "cancel_request_event_id": cancel_request_event_id,
         },
         payload_ref=None,
         payload_digest=None,
@@ -1361,6 +1656,15 @@ def _pending_dispatch_record_row(
         owner_host_instance_id=request.owner_host_instance_id,
         created_event_id=created_event_id,
         created_event_sequence=created_event_sequence,
+        waiting_for_lane_at=None,
+        lane_name=None,
+        lane_claim_id=None,
+        lane_owner_id=None,
+        lane_acquired_at=None,
+        dispatching_at=None,
+        worker_accepted_at=None,
+        worker_accept_event_id=None,
+        worker_accept_event_sequence=None,
         cancelled_event_id=None,
         cancelled_event_sequence=None,
         created_at=created_at,
@@ -1433,6 +1737,15 @@ def _promotion_dispatch_record_row(
         owner_host_instance_id=request.owner_host_instance_id,
         created_event_id=created_event_id,
         created_event_sequence=created_event_sequence,
+        waiting_for_lane_at=None,
+        lane_name=None,
+        lane_claim_id=None,
+        lane_owner_id=None,
+        lane_acquired_at=None,
+        dispatching_at=None,
+        worker_accepted_at=None,
+        worker_accept_event_id=None,
+        worker_accept_event_sequence=None,
         cancelled_event_id=None,
         cancelled_event_sequence=None,
         created_at=created_at,
@@ -1479,6 +1792,97 @@ def _invalid_terminal_precondition(
             dispatch_record=None,
         )
     return None
+
+
+def _invalid_accept_worker_precondition(
+    *,
+    run: RunRow | None,
+    attempt: AttemptRow | None,
+    dispatch_record: DispatchRecordRow | None,
+    attempt_id: str,
+) -> RunTransitionResult | None:
+    """检查 worker accept 前置状态。
+
+    :param run: 目标 Run row。
+    :param attempt: 目标 Attempt row。
+    :param dispatch_record: 目标 dispatch record row。
+    :param attempt_id: 请求中的 Attempt id。
+    :returns: 前置失败时返回 transition 结果，否则返回 ``None``。
+    """
+
+    if run is None:
+        return RunTransitionResult(
+            status=StateMutationStatus.NOT_FOUND,
+            run=None,
+            attempt=attempt,
+            dispatch_record=dispatch_record,
+        )
+    if attempt is None:
+        return RunTransitionResult(
+            status=StateMutationStatus.NOT_FOUND,
+            run=run,
+            attempt=None,
+            dispatch_record=dispatch_record,
+        )
+    if dispatch_record is None:
+        return RunTransitionResult(
+            status=StateMutationStatus.NOT_FOUND,
+            run=run,
+            attempt=attempt,
+            dispatch_record=None,
+        )
+    if (
+        run.status != RunStatus.RUNNING
+        or run.current_attempt_id != attempt_id
+        or attempt.run_id != run.run_id
+        or attempt.status != AttemptStatus.STARTING
+        or dispatch_record.status != DispatchRecordStatus.DISPATCHING
+        or dispatch_record.worker_accept_event_id is not None
+    ):
+        return RunTransitionResult(
+            status=StateMutationStatus.INVALID_STATE,
+            run=run,
+            attempt=attempt,
+            dispatch_record=dispatch_record,
+        )
+    return None
+
+
+def _dispatch_record_is_direct_cancelable(
+    dispatch_record: DispatchRecordRow,
+) -> bool:
+    """判断 dispatch record 是否仍处于 worker accept 前 direct cancel 窗口。
+
+    :param dispatch_record: dispatch record row。
+    :returns: 可 direct cancel 时返回 ``True``。
+    """
+
+    if dispatch_record.status in (
+        DispatchRecordStatus.PENDING,
+        DispatchRecordStatus.WAITING_FOR_LANE,
+    ):
+        return True
+    return (
+        dispatch_record.status == DispatchRecordStatus.DISPATCHING
+        and dispatch_record.worker_accepted_at is None
+        and dispatch_record.worker_accept_event_id is None
+        and dispatch_record.worker_accept_event_sequence is None
+    )
+
+
+def _read_dispatch_for_attempt(
+    transaction: HostTransaction, attempt: AttemptRow | None
+) -> DispatchRecordRow | None:
+    """按 Attempt row 读取 dispatch record。
+
+    :param transaction: 调用方提供的 Host transaction。
+    :param attempt: Attempt row；缺失时返回 ``None``。
+    :returns: dispatch record row 或 ``None``。
+    """
+
+    if attempt is None:
+        return None
+    return read_dispatch_record_by_attempt_id(transaction, attempt.attempt_id)
 
 
 def _attempt_terminal_event_type(status: AttemptStatus) -> str:
@@ -1695,6 +2099,30 @@ def _validate_terminal_input(request: TerminalCloseoutInput) -> None:
     )
 
 
+def _validate_accept_worker_running_input(
+    request: AcceptWorkerRunningInput,
+) -> None:
+    """校验 worker accepted 输入。
+
+    :param request: worker accepted 输入。
+    :returns: ``None``。
+    :raises HostDurableError: 任一字段无效时抛出。
+    """
+
+    _require_non_empty_text(request.run_id, field_name="run_id")
+    _require_non_empty_text(request.attempt_id, field_name="attempt_id")
+    _require_non_empty_text(
+        request.attempt_running_event_id,
+        field_name="attempt_running_event_id",
+    )
+    _require_non_empty_text(request.actor, field_name="actor")
+    _require_non_empty_text(request.source, field_name="source")
+    _require_non_empty_text(
+        request.worker_accept_reason,
+        field_name="worker_accept_reason",
+    )
+
+
 def _validate_cancel_queued_input(request: CancelQueuedRunInput) -> None:
     """校验 cancel queued 输入。
 
@@ -1742,6 +2170,28 @@ def _validate_cancel_predispatch_input(
     _require_non_empty_text(
         request.attempt_cancelled_event_id,
         field_name="attempt_cancelled_event_id",
+    )
+
+
+def _validate_cancel_active_input(request: CancelActiveAttemptInput) -> None:
+    """校验 active cancel 输入。
+
+    :param request: active cancel 输入。
+    :returns: ``None``。
+    :raises HostDurableError: 任一字段无效时抛出。
+    """
+
+    _validate_common_cancel_input(
+        run_id=request.run_id,
+        cancel_request_event_id=request.cancel_request_event_id,
+        run_cancelled_event_id=request.run_cancelling_event_id,
+        actor=request.actor,
+        source=request.source,
+        client_request_id=request.client_request_id,
+        idempotency_key=request.idempotency_key,
+        reason=request.reason,
+        mode=request.mode,
+        call_context_digest=request.call_context_digest,
     )
 
 

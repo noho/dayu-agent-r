@@ -35,17 +35,21 @@ from dayu.host.durable.options import (
 )
 from dayu.host.durable.errors import HostDurableError
 from dayu.host.durable.run_transition import (
+    AcceptWorkerRunningInput,
+    CancelActiveAttemptInput,
     CancelPredispatchStartingInput,
     CancelQueuedRunInput,
     CreateQueuedRunInput,
     CreateRunningRunInput,
     PromoteQueuedRunInput,
     TerminalCloseoutInput,
+    accept_worker_running_in_transaction,
     cancel_predispatch_starting_in_transaction,
     cancel_queued_in_transaction,
     create_queued_run_in_transaction,
     create_running_run_with_starting_attempt_in_transaction,
     promote_queued_run_in_transaction,
+    request_active_attempt_cancel_in_transaction,
     terminal_closeout_in_transaction,
 )
 from dayu.host.durable.session_lifecycle import ensure_session
@@ -55,6 +59,10 @@ from dayu.host.durable.state import (
     RunStartReason,
     StateMutationStatus,
     WorkerKind,
+    mark_attempt_running_row,
+    mark_dispatch_worker_accepted_row,
+    mark_dispatch_waiting_for_lane_row,
+    mark_dispatching_after_lane_row,
     read_attempt_by_id,
     read_dispatch_record_by_attempt_id,
     read_run_by_id,
@@ -757,6 +765,299 @@ def test_cancel_predispatch_starting_updates_dispatch_attempt_and_run(
         )
 
 
+def test_dispatch_record_waiting_dispatching_and_worker_accept_refs(
+    tmp_path: Path,
+) -> None:
+    """dispatch record 按 waiting -> dispatching -> accepted refs 推进。"""
+
+    with open_host_durable_store(_options(tmp_path)) as store:
+        seeded = _seed_running_run(store, tmp_path)
+
+        def operation(transaction: HostTransaction) -> tuple[str, str, bool]:
+            """推进 dispatch record 并执行 worker accept。
+
+            :param transaction: Host transaction。
+            :returns: Attempt 状态、dispatch 状态与 worker accept refs 是否存在。
+            """
+
+            _ensure_host_instance_tx(transaction)
+            waiting = mark_dispatch_waiting_for_lane_row(
+                transaction,
+                attempt_id=seeded.attempt_id,
+                owner_host_instance_id="host-instance-1",
+                lane_name="llm",
+                waiting_for_lane_at="2026-05-14T01:02:04Z",
+            )
+            assert waiting.status == StateMutationStatus.UPDATED
+            dispatching = mark_dispatching_after_lane_row(
+                transaction,
+                attempt_id=seeded.attempt_id,
+                owner_host_instance_id="host-instance-1",
+                lane_name="llm",
+                lane_claim_id="lane-claim-1",
+                lane_owner_id="lane-owner-1",
+                lane_acquired_at="2026-05-14T01:02:05Z",
+                dispatching_at="2026-05-14T01:02:06Z",
+            )
+            assert dispatching.status == StateMutationStatus.UPDATED
+            accepted = accept_worker_running_in_transaction(
+                transaction,
+                EventLogStore(),
+                AcceptWorkerRunningInput(
+                    run_id=seeded.run_id,
+                    attempt_id=seeded.attempt_id,
+                    attempt_running_event_id="event-attempt-running",
+                    occurred_at=_NOW,
+                    actor="analyst",
+                    source="pytest",
+                    worker_accept_reason="worker_accepted",
+                ),
+            )
+            assert accepted.attempt is not None
+            assert accepted.dispatch_record is not None
+            dispatch_record = accepted.dispatch_record
+            return (
+                accepted.attempt.status.value,
+                dispatch_record.status.value,
+                dispatch_record.worker_accept_event_id is not None
+                and dispatch_record.worker_accept_event_sequence is not None
+                and dispatch_record.worker_accepted_at is not None,
+            )
+
+        assert store.transaction_runner.run_write(operation) == (
+            AttemptStatus.RUNNING.value,
+            DispatchRecordStatus.DISPATCHING.value,
+            True,
+        )
+
+
+def test_dispatching_requires_waiting_for_lane_source(tmp_path: Path) -> None:
+    """pending dispatch record 不能跳过 waiting_for_lane 直接进入 dispatching。"""
+
+    with open_host_durable_store(_options(tmp_path)) as store:
+        seeded = _seed_running_run(store, tmp_path)
+
+        def operation(transaction: HostTransaction) -> tuple[str, str]:
+            """对 pending dispatch record 直接执行 dispatching mutation。
+
+            :param transaction: Host transaction。
+            :returns: mutation 状态与最新 dispatch record 状态。
+            """
+
+            result = mark_dispatching_after_lane_row(
+                transaction,
+                attempt_id=seeded.attempt_id,
+                owner_host_instance_id="host-instance-1",
+                lane_name="llm",
+                lane_claim_id="lane-claim-1",
+                lane_owner_id="lane-owner-1",
+                lane_acquired_at="2026-05-14T01:02:05Z",
+                dispatching_at="2026-05-14T01:02:06Z",
+            )
+            assert result.row is not None
+            return result.status.value, result.row.status.value
+
+        assert store.transaction_runner.run_write(operation) == (
+            StateMutationStatus.INVALID_STATE.value,
+            DispatchRecordStatus.PENDING.value,
+        )
+
+
+@pytest.mark.parametrize(
+    "source_status",
+    (
+        DispatchRecordStatus.PENDING,
+        DispatchRecordStatus.WAITING_FOR_LANE,
+        DispatchRecordStatus.DISPATCHING,
+    ),
+)
+def test_cancel_predispatch_starting_supports_all_pre_accept_dispatch_statuses(
+    tmp_path: Path, source_status: DispatchRecordStatus
+) -> None:
+    """pending / waiting_for_lane / pre-accept dispatching 都可 direct cancel。"""
+
+    with open_host_durable_store(_options(tmp_path)) as store:
+        seeded = _seed_running_run(store, tmp_path)
+
+        def cancel(transaction: HostTransaction) -> tuple[str, str, str]:
+            """按参数构造 dispatch source 状态并执行 direct cancel。
+
+            :param transaction: Host transaction。
+            :returns: Run、Attempt、dispatch 状态。
+            """
+
+            if source_status == DispatchRecordStatus.WAITING_FOR_LANE:
+                _mark_waiting_tx(transaction, seeded.attempt_id)
+            elif source_status == DispatchRecordStatus.DISPATCHING:
+                _mark_dispatching_tx(transaction, seeded.attempt_id)
+            result = cancel_predispatch_starting_in_transaction(
+                transaction,
+                EventLogStore(),
+                _cancel_predispatch_input(
+                    run_id=seeded.run_id,
+                    event_suffix=source_status.value,
+                ),
+            )
+            assert result.run is not None
+            assert result.attempt is not None
+            assert result.dispatch_record is not None
+            return (
+                result.run.status.value,
+                result.attempt.status.value,
+                result.dispatch_record.status.value,
+            )
+
+        assert store.transaction_runner.run_write(cancel) == (
+            RunStatus.CANCELLED.value,
+            AttemptStatus.CANCELLED.value,
+            DispatchRecordStatus.CANCELLED.value,
+        )
+
+
+def test_cancel_predispatch_rejects_dispatching_after_worker_accept_refs(
+    tmp_path: Path,
+) -> None:
+    """dispatching 已有 worker accepted refs 时不能走 pre-worker direct cancel。"""
+
+    with open_host_durable_store(_options(tmp_path)) as store:
+        seeded = _seed_running_run(store, tmp_path)
+
+        def cancel(transaction: HostTransaction) -> tuple[str, str, str]:
+            """写入 worker accept refs 后尝试 direct cancel。
+
+            :param transaction: Host transaction。
+            :returns: transition 状态、Attempt 状态与 dispatch 状态。
+            """
+
+            _mark_dispatching_tx(transaction, seeded.attempt_id)
+            event = EventLogStore().append_event(
+                transaction,
+                _test_event(
+                    event_id="event-worker-accepted",
+                    session_id=seeded.session_id,
+                    run_id=seeded.run_id,
+                    event_type="ATTEMPT_RUNNING",
+                    payload={"attempt_id": seeded.attempt_id},
+                ),
+            ).row
+            accepted = mark_dispatch_worker_accepted_row(
+                transaction,
+                attempt_id=seeded.attempt_id,
+                worker_accept_event_id=event.event_id,
+                worker_accept_event_sequence=event.event_sequence,
+                worker_accepted_at="2026-05-14T01:02:07Z",
+            )
+            assert accepted.status == StateMutationStatus.UPDATED
+            result = cancel_predispatch_starting_in_transaction(
+                transaction,
+                EventLogStore(),
+                _cancel_predispatch_input(
+                    run_id=seeded.run_id,
+                    event_suffix="accepted",
+                ),
+            )
+            assert result.attempt is not None
+            assert result.dispatch_record is not None
+            return (
+                result.status.value,
+                result.attempt.status.value,
+                result.dispatch_record.status.value,
+            )
+
+        assert store.transaction_runner.run_write(cancel) == (
+            StateMutationStatus.INVALID_STATE.value,
+            AttemptStatus.STARTING.value,
+            DispatchRecordStatus.DISPATCHING.value,
+        )
+
+
+def test_mark_attempt_running_only_allows_starting_source(
+    tmp_path: Path,
+) -> None:
+    """ATTEMPT_RUNNING CAS 只允许 STARTING -> RUNNING。"""
+
+    with open_host_durable_store(_options(tmp_path)) as store:
+        seeded = _seed_running_run(store, tmp_path)
+
+        def operation(transaction: HostTransaction) -> tuple[str, str, str]:
+            """执行两次 Attempt RUNNING CAS。
+
+            :param transaction: Host transaction。
+            :returns: 两次 mutation 状态与最终 Attempt 状态。
+            """
+
+            first = mark_attempt_running_row(
+                transaction,
+                attempt_id=seeded.attempt_id,
+                updated_at="2026-05-14T01:02:08Z",
+            )
+            second = mark_attempt_running_row(
+                transaction,
+                attempt_id=seeded.attempt_id,
+                updated_at="2026-05-14T01:02:09Z",
+            )
+            latest = read_attempt_by_id(transaction, seeded.attempt_id)
+            assert latest is not None
+            return first.status.value, second.status.value, latest.status.value
+
+        assert store.transaction_runner.run_write(operation) == (
+            StateMutationStatus.UPDATED.value,
+            StateMutationStatus.INVALID_STATE.value,
+            AttemptStatus.RUNNING.value,
+        )
+
+
+def test_active_cancel_appends_run_cancelling_once(tmp_path: Path) -> None:
+    """active cancel 重复调用不重复追加 RUN_CANCELLING。"""
+
+    with open_host_durable_store(_options(tmp_path)) as store:
+        seeded = _seed_running_run(store, tmp_path)
+
+        def operation(transaction: HostTransaction) -> tuple[str, int]:
+            """先接受 worker，再执行两次 active cancel。
+
+            :param transaction: Host transaction。
+            :returns: Run 状态与 RUN_CANCELLING 事件数。
+            """
+
+            _mark_dispatching_tx(transaction, seeded.attempt_id)
+            accepted = accept_worker_running_in_transaction(
+                transaction,
+                EventLogStore(),
+                AcceptWorkerRunningInput(
+                    run_id=seeded.run_id,
+                    attempt_id=seeded.attempt_id,
+                    attempt_running_event_id="event-active-attempt-running",
+                    occurred_at=_NOW,
+                    actor="analyst",
+                    source="pytest",
+                    worker_accept_reason="worker_accepted",
+                ),
+            )
+            assert accepted.status == StateMutationStatus.UPDATED
+            first = request_active_attempt_cancel_in_transaction(
+                transaction,
+                EventLogStore(),
+                _cancel_active_input(run_id=seeded.run_id, event_suffix="first"),
+            )
+            second = request_active_attempt_cancel_in_transaction(
+                transaction,
+                EventLogStore(),
+                _cancel_active_input(run_id=seeded.run_id, event_suffix="second"),
+            )
+            assert first.run is not None
+            assert second.run is not None
+            return (
+                second.run.status.value,
+                _count_events(transaction, _EVENT_TYPE_RUN_CANCELLING),
+            )
+
+        assert store.transaction_runner.run_write(operation) == (
+            RunStatus.CANCELLING.value,
+            1,
+        )
+
+
 def test_cancel_queued_terminal_run_returns_invalid_state(
     tmp_path: Path,
 ) -> None:
@@ -1094,6 +1395,129 @@ def _promote_input(*, session_id: str) -> PromoteQueuedRunInput:
     )
 
 
+def _cancel_predispatch_input(
+    *, run_id: str, event_suffix: str
+) -> CancelPredispatchStartingInput:
+    """构造 pre-dispatch cancel 输入。
+
+    :param run_id: Run id。
+    :param event_suffix: event id 后缀。
+    :returns: CancelPredispatchStartingInput。
+    """
+
+    return CancelPredispatchStartingInput(
+        run_id=run_id,
+        cancel_request_event_id=f"event-cancel-requested-{event_suffix}",
+        attempt_cancelled_event_id=f"event-attempt-cancelled-{event_suffix}",
+        run_cancelled_event_id=f"event-run-cancelled-{event_suffix}",
+        occurred_at=_NOW,
+        actor="analyst",
+        source="pytest",
+        client_request_id=f"cancel-{event_suffix}",
+        idempotency_key=f"cancel-{event_suffix}",
+        reason="user_cancel",
+        mode=CancelMode.GRACEFUL,
+        call_context_digest=_CALL_CONTEXT_DIGEST,
+    )
+
+
+def _cancel_active_input(
+    *, run_id: str, event_suffix: str
+) -> CancelActiveAttemptInput:
+    """构造 active cancel 输入。
+
+    :param run_id: Run id。
+    :param event_suffix: event id 后缀。
+    :returns: CancelActiveAttemptInput。
+    """
+
+    return CancelActiveAttemptInput(
+        run_id=run_id,
+        cancel_request_event_id=f"event-active-cancel-requested-{event_suffix}",
+        run_cancelling_event_id=f"event-run-cancelling-{event_suffix}",
+        occurred_at=_NOW,
+        actor="analyst",
+        source="pytest",
+        client_request_id=f"active-cancel-{event_suffix}",
+        idempotency_key=f"active-cancel-{event_suffix}",
+        reason="user_cancel",
+        mode=CancelMode.GRACEFUL,
+        call_context_digest=_CALL_CONTEXT_DIGEST,
+    )
+
+
+def _mark_waiting_tx(transaction: HostTransaction, attempt_id: str) -> None:
+    """将测试 dispatch record 推进到 waiting_for_lane。
+
+    :param transaction: Host transaction。
+    :param attempt_id: Attempt id。
+    :returns: ``None``。
+    """
+
+    _ensure_host_instance_tx(transaction)
+    result = mark_dispatch_waiting_for_lane_row(
+        transaction,
+        attempt_id=attempt_id,
+        owner_host_instance_id="host-instance-1",
+        lane_name="llm",
+        waiting_for_lane_at="2026-05-14T01:02:04Z",
+    )
+    assert result.status == StateMutationStatus.UPDATED
+
+
+def _mark_dispatching_tx(transaction: HostTransaction, attempt_id: str) -> None:
+    """将测试 dispatch record 推进到 pre-accept dispatching。
+
+    :param transaction: Host transaction。
+    :param attempt_id: Attempt id。
+    :returns: ``None``。
+    """
+
+    _mark_waiting_tx(transaction, attempt_id)
+    result = mark_dispatching_after_lane_row(
+        transaction,
+        attempt_id=attempt_id,
+        owner_host_instance_id="host-instance-1",
+        lane_name="llm",
+        lane_claim_id="lane-claim-1",
+        lane_owner_id="lane-owner-1",
+        lane_acquired_at="2026-05-14T01:02:05Z",
+        dispatching_at="2026-05-14T01:02:06Z",
+    )
+    assert result.status == StateMutationStatus.UPDATED
+
+
+def _ensure_host_instance_tx(transaction: HostTransaction) -> None:
+    """写入测试用 Host instance row。
+
+    :param transaction: Host transaction。
+    :returns: ``None``。
+    """
+
+    transaction.execute(
+        """
+        INSERT OR IGNORE INTO host_instances (
+          host_instance_id,
+          pid,
+          process_start_token,
+          boot_id,
+          created_at,
+          heartbeat_at,
+          status
+        ) VALUES (?, ?, ?, ?, ?, ?, ?)
+        """,
+        (
+            "host-instance-1",
+            1,
+            "process-start-token",
+            None,
+            "2026-05-14T01:02:03Z",
+            "2026-05-14T01:02:03Z",
+            "running",
+        ),
+    )
+
+
 def _event_types(transaction: HostTransaction) -> tuple[str, ...]:
     """读取全部 EventLog event type。
 
@@ -1187,3 +1611,4 @@ _EVENT_TYPE_RUN_STARTED = "RUN_STARTED"
 _EVENT_TYPE_ATTEMPT_STARTED = "ATTEMPT_STARTED"
 _EVENT_TYPE_ATTEMPT_SUCCEEDED = "ATTEMPT_SUCCEEDED"
 _EVENT_TYPE_RUN_SUCCEEDED = "RUN_SUCCEEDED"
+_EVENT_TYPE_RUN_CANCELLING = "RUN_CANCELLING"

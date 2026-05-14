@@ -11,7 +11,7 @@ import sqlite3
 
 from dayu.host.durable.errors import HostSchemaMismatchError
 
-HOST_SCHEMA_VERSION = 2
+HOST_SCHEMA_VERSION = 3
 """当前 Host durable SQLite schema version。"""
 
 TABLE_EVENT_LOG = "event_log"
@@ -345,12 +345,23 @@ CREATE TABLE IF NOT EXISTS {TABLE_HOST_ATTEMPT_DISPATCH_RECORDS} (
   run_id TEXT NOT NULL,
   attempt_id TEXT NOT NULL UNIQUE,
   execution_id TEXT NOT NULL UNIQUE,
-  status TEXT NOT NULL CHECK (status IN ('pending', 'cancelled')),
+  status TEXT NOT NULL CHECK (
+    status IN ('pending', 'waiting_for_lane', 'dispatching', 'cancelled')
+  ),
   worker_kind TEXT NOT NULL CHECK (worker_kind IN ('local', 'remote')),
   execution_target TEXT NOT NULL,
   owner_host_instance_id TEXT NULL,
   created_event_id TEXT NOT NULL,
   created_event_sequence INTEGER NOT NULL,
+  waiting_for_lane_at TEXT NULL,
+  lane_name TEXT NULL,
+  lane_claim_id TEXT NULL,
+  lane_owner_id TEXT NULL,
+  lane_acquired_at TEXT NULL,
+  dispatching_at TEXT NULL,
+  worker_accepted_at TEXT NULL,
+  worker_accept_event_id TEXT NULL,
+  worker_accept_event_sequence INTEGER NULL,
   cancelled_event_id TEXT NULL,
   cancelled_event_sequence INTEGER NULL,
   created_at TEXT NOT NULL,
@@ -362,18 +373,68 @@ CREATE TABLE IF NOT EXISTS {TABLE_HOST_ATTEMPT_DISPATCH_RECORDS} (
   FOREIGN KEY(owner_host_instance_id) REFERENCES {TABLE_HOST_INSTANCES}(host_instance_id),
   FOREIGN KEY(created_event_id) REFERENCES {TABLE_EVENT_LOG}(event_id),
   FOREIGN KEY(created_event_sequence) REFERENCES {TABLE_EVENT_LOG}(event_sequence),
+  FOREIGN KEY(worker_accept_event_id) REFERENCES {TABLE_EVENT_LOG}(event_id),
+  FOREIGN KEY(worker_accept_event_sequence) REFERENCES {TABLE_EVENT_LOG}(event_sequence),
   FOREIGN KEY(cancelled_event_id) REFERENCES {TABLE_EVENT_LOG}(event_id),
   FOREIGN KEY(cancelled_event_sequence) REFERENCES {TABLE_EVENT_LOG}(event_sequence),
   CHECK (
     (status = 'pending'
+      AND waiting_for_lane_at IS NULL
+      AND lane_name IS NULL
+      AND lane_claim_id IS NULL
+      AND lane_owner_id IS NULL
+      AND lane_acquired_at IS NULL
+      AND dispatching_at IS NULL
+      AND worker_accepted_at IS NULL
+      AND worker_accept_event_id IS NULL
+      AND worker_accept_event_sequence IS NULL
       AND cancelled_event_id IS NULL
       AND cancelled_event_sequence IS NULL
       AND cancelled_at IS NULL)
     OR
+    (status = 'waiting_for_lane'
+      AND waiting_for_lane_at IS NOT NULL
+      AND lane_name IS NOT NULL
+      AND owner_host_instance_id IS NOT NULL
+      AND lane_claim_id IS NULL
+      AND lane_owner_id IS NULL
+      AND lane_acquired_at IS NULL
+      AND dispatching_at IS NULL
+      AND worker_accepted_at IS NULL
+      AND worker_accept_event_id IS NULL
+      AND worker_accept_event_sequence IS NULL
+      AND cancelled_event_id IS NULL
+      AND cancelled_event_sequence IS NULL
+      AND cancelled_at IS NULL)
+    OR
+    (status = 'dispatching'
+      AND waiting_for_lane_at IS NOT NULL
+      AND lane_name IS NOT NULL
+      AND owner_host_instance_id IS NOT NULL
+      AND lane_claim_id IS NOT NULL
+      AND lane_owner_id IS NOT NULL
+      AND lane_acquired_at IS NOT NULL
+      AND dispatching_at IS NOT NULL
+      AND cancelled_event_id IS NULL
+      AND cancelled_event_sequence IS NULL
+      AND cancelled_at IS NULL
+      AND (
+        (worker_accepted_at IS NULL
+          AND worker_accept_event_id IS NULL
+          AND worker_accept_event_sequence IS NULL)
+        OR
+        (worker_accepted_at IS NOT NULL
+          AND worker_accept_event_id IS NOT NULL
+          AND worker_accept_event_sequence IS NOT NULL)
+      ))
+    OR
     (status = 'cancelled'
       AND cancelled_event_id IS NOT NULL
       AND cancelled_event_sequence IS NOT NULL
-      AND cancelled_at IS NOT NULL)
+      AND cancelled_at IS NOT NULL
+      AND worker_accepted_at IS NULL
+      AND worker_accept_event_id IS NULL
+      AND worker_accept_event_sequence IS NULL)
   )
 )
 """
@@ -430,7 +491,7 @@ def bootstrap_host_durable_store(connection: sqlite3.Connection) -> None:
     """初始化 fresh Host durable SQLite schema 并校验版本。
 
     ``user_version`` 为 ``0`` 的 DB 被视为 fresh DB；函数会创建 foundation
-    与 Phase 3 state tables 并设置 ``PRAGMA user_version = 2``。``user_version`` 为当前版本
+    与 Phase 3 state tables 并设置当前 ``PRAGMA user_version``。``user_version`` 为当前版本
     时函数幂等执行 DDL。其它版本一律结构化失败，不做兼容读取或迁移。
 
     :param connection: 已完成 PRAGMA setup 的 SQLite connection。

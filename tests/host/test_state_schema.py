@@ -297,19 +297,19 @@ def test_multiple_queued_runs_for_one_session_succeed(tmp_path: Path) -> None:
         assert store.transaction_runner.run_write(operation) == 2
 
 
-def test_dispatch_record_status_check_only_allows_pending_cancelled(
+def test_dispatch_record_status_check_allows_phase5_statuses(
     tmp_path: Path,
 ) -> None:
-    """dispatch record status check 只允许 pending 和 cancelled。"""
+    """dispatch record status check 接受 Phase 5 四种状态。"""
 
     options = _options(tmp_path)
     with open_host_durable_store(options) as store:
 
-        def allowed_statuses(transaction: HostTransaction) -> int:
-            """写入 pending 与 cancelled dispatch record。
+        def allowed_statuses(transaction: HostTransaction) -> tuple[int, tuple[str, ...]]:
+            """写入四种合法 dispatch record。
 
             :param transaction: Host transaction。
-            :returns: dispatch record 总数。
+            :returns: dispatch record 总数与状态序列。
             """
 
             _insert_session_tx(transaction, session_id="session-1")
@@ -346,11 +346,47 @@ def test_dispatch_record_status_check_only_allows_pending_cancelled(
                 attempt_id="attempt-cancelled",
                 execution_id="execution-cancelled",
             )
+            _insert_attempt_tx(
+                transaction,
+                attempt_id="attempt-waiting",
+                run_id="run-1",
+                execution_id="execution-waiting",
+            )
+            _insert_waiting_dispatch_record_tx(
+                transaction,
+                dispatch_record_id="dispatch-waiting",
+                run_id="run-1",
+                attempt_id="attempt-waiting",
+                execution_id="execution-waiting",
+            )
+            _insert_attempt_tx(
+                transaction,
+                attempt_id="attempt-dispatching",
+                run_id="run-1",
+                execution_id="execution-dispatching",
+            )
+            _insert_dispatching_dispatch_record_tx(
+                transaction,
+                dispatch_record_id="dispatch-dispatching",
+                run_id="run-1",
+                attempt_id="attempt-dispatching",
+                execution_id="execution-dispatching",
+            )
             row = transaction.fetchone(
                 f"SELECT COUNT(*) AS count FROM {TABLE_HOST_ATTEMPT_DISPATCH_RECORDS}"
             )
             assert row is not None
-            return _required_row_int(row, column="count")
+            rows = transaction.fetchall(
+                f"""
+                SELECT status
+                FROM {TABLE_HOST_ATTEMPT_DISPATCH_RECORDS}
+                ORDER BY status ASC
+                """
+            )
+            return (
+                _required_row_int(row, column="count"),
+                tuple(_required_row_text(status_row, column="status") for status_row in rows),
+            )
 
         def operation(transaction: HostTransaction) -> None:
             """尝试写入非法 dispatch status。
@@ -394,24 +430,42 @@ def test_dispatch_record_status_check_only_allows_pending_cancelled(
                   owner_host_instance_id,
                   created_event_id,
                   created_event_sequence,
+                  waiting_for_lane_at,
+                  lane_name,
+                  lane_claim_id,
+                  lane_owner_id,
+                  lane_acquired_at,
+                  dispatching_at,
+                  worker_accepted_at,
+                  worker_accept_event_id,
+                  worker_accept_event_sequence,
                   cancelled_event_id,
                   cancelled_event_sequence,
                   created_at,
                   updated_at,
                   cancelled_at
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 """,
                 (
                     "dispatch-1",
                     "run-invalid",
                     "attempt-invalid",
                     "execution-invalid",
-                    "dispatching",
+                    "accepted",
                     serialize_worker_kind(WorkerKind.LOCAL),
                     "local-default",
                     None,
                     "event-dispatch-created",
                     created_sequence,
+                    None,
+                    None,
+                    None,
+                    None,
+                    None,
+                    None,
+                    None,
+                    None,
+                    None,
                     None,
                     None,
                     _TIMESTAMP,
@@ -420,7 +474,10 @@ def test_dispatch_record_status_check_only_allows_pending_cancelled(
                 ),
             )
 
-        assert store.transaction_runner.run_write(allowed_statuses) == 2
+        assert store.transaction_runner.run_write(allowed_statuses) == (
+            4,
+            ("cancelled", "dispatching", "pending", "waiting_for_lane"),
+        )
         with pytest.raises(HostDurableError) as error_info:
             store.transaction_runner.run_write(operation)
         assert str(error_info.value) == "Host durable CHECK constraint failed"
@@ -505,13 +562,56 @@ def test_state_row_codecs_round_trip_from_host_rows(tmp_path: Path) -> None:
         )
 
 
+def test_dispatch_record_nullability_rules_reject_invalid_shapes(
+    tmp_path: Path,
+) -> None:
+    """dispatch record fresh schema 拒绝不符合状态 nullability 的字段组合。"""
+
+    options = _options(tmp_path)
+    with open_host_durable_store(options) as store:
+
+        def operation(transaction: HostTransaction) -> None:
+            """尝试写入缺少 owner 的 waiting_for_lane dispatch。
+
+            :param transaction: Host transaction。
+            :returns: ``None``。
+            """
+
+            _insert_session_tx(transaction, session_id="session-1")
+            _insert_run_tx(
+                transaction,
+                run_id="run-1",
+                session_id="session-1",
+                status=RunStatus.RUNNING,
+                client_request_id="request-1",
+            )
+            _insert_attempt_tx(
+                transaction,
+                attempt_id="attempt-invalid-waiting",
+                run_id="run-1",
+                execution_id="execution-invalid-waiting",
+            )
+            _insert_waiting_dispatch_record_tx(
+                transaction,
+                dispatch_record_id="dispatch-invalid-waiting",
+                run_id="run-1",
+                attempt_id="attempt-invalid-waiting",
+                execution_id="execution-invalid-waiting",
+                owner_host_instance_id=None,
+            )
+
+        with pytest.raises(HostDurableError) as error_info:
+            store.transaction_runner.run_write(operation)
+        assert str(error_info.value) == "Host durable CHECK constraint failed"
+
+
 def test_status_deserializers_reject_unknown_values() -> None:
     """状态反序列化 helper 对未知值结构化失败。"""
 
     with pytest.raises(HostDurableError):
         deserialize_run_status("active")
     with pytest.raises(HostDurableError):
-        deserialize_dispatch_record_status("dispatching")
+        deserialize_dispatch_record_status("accepted")
     with pytest.raises(HostDurableError):
         deserialize_worker_kind("thread")
 
@@ -597,6 +697,20 @@ def _required_row_int(row: HostRow, *, column: str) -> int:
 
     value = row.get(column)
     assert isinstance(value, int)
+    return value
+
+
+def _required_row_text(row: HostRow, *, column: str) -> str:
+    """从 HostRow 中读取必填字符串列。
+
+    :param row: Host transaction 查询返回的 row。
+    :param column: 目标列名。
+    :returns: 字符串列值。
+    :raises AssertionError: 列值不是字符串时抛出。
+    """
+
+    value = row.get(column)
+    assert isinstance(value, str)
     return value
 
 
@@ -845,12 +959,21 @@ def _insert_dispatch_record_tx(
           owner_host_instance_id,
           created_event_id,
           created_event_sequence,
+          waiting_for_lane_at,
+          lane_name,
+          lane_claim_id,
+          lane_owner_id,
+          lane_acquired_at,
+          dispatching_at,
+          worker_accepted_at,
+          worker_accept_event_id,
+          worker_accept_event_sequence,
           cancelled_event_id,
           cancelled_event_sequence,
           created_at,
           updated_at,
           cancelled_at
-        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
         """,
         (
             dispatch_record_id,
@@ -863,6 +986,15 @@ def _insert_dispatch_record_tx(
             None,
             created_event_id,
             created_sequence,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
             None,
             None,
             _TIMESTAMP,
@@ -921,12 +1053,21 @@ def _insert_cancelled_dispatch_record_tx(
           owner_host_instance_id,
           created_event_id,
           created_event_sequence,
+          waiting_for_lane_at,
+          lane_name,
+          lane_claim_id,
+          lane_owner_id,
+          lane_acquired_at,
+          dispatching_at,
+          worker_accepted_at,
+          worker_accept_event_id,
+          worker_accept_event_sequence,
           cancelled_event_id,
           cancelled_event_sequence,
           created_at,
           updated_at,
           cancelled_at
-        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
         """,
         (
             dispatch_record_id,
@@ -939,10 +1080,252 @@ def _insert_cancelled_dispatch_record_tx(
             None,
             created_event_id,
             created_sequence,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
             cancelled_event_id,
             cancelled_sequence,
             _TIMESTAMP,
             _TIMESTAMP,
             _TIMESTAMP,
+        ),
+    )
+
+
+def _insert_waiting_dispatch_record_tx(
+    transaction: HostTransaction,
+    *,
+    dispatch_record_id: str,
+    run_id: str,
+    attempt_id: str,
+    execution_id: str,
+    owner_host_instance_id: str | None = "host-instance-1",
+) -> None:
+    """插入测试用 waiting_for_lane dispatch record。
+
+    :param transaction: Host transaction。
+    :param dispatch_record_id: dispatch record id。
+    :param run_id: Run id。
+    :param attempt_id: Attempt id。
+    :param execution_id: execution id。
+    :param owner_host_instance_id: owner Host instance id。
+    :returns: ``None``。
+    """
+
+    _ensure_host_instance_tx(transaction, host_instance_id="host-instance-1")
+    _insert_dispatch_record_with_diagnostics_tx(
+        transaction,
+        dispatch_record_id=dispatch_record_id,
+        run_id=run_id,
+        attempt_id=attempt_id,
+        execution_id=execution_id,
+        status=DispatchRecordStatus.WAITING_FOR_LANE,
+        owner_host_instance_id=owner_host_instance_id,
+        waiting_for_lane_at=_TIMESTAMP,
+        lane_name="llm",
+        lane_claim_id=None,
+        lane_owner_id=None,
+        lane_acquired_at=None,
+        dispatching_at=None,
+        worker_accepted_at=None,
+        worker_accept_event_id=None,
+        worker_accept_event_sequence=None,
+        cancelled_event_id=None,
+        cancelled_event_sequence=None,
+        cancelled_at=None,
+    )
+
+
+def _insert_dispatching_dispatch_record_tx(
+    transaction: HostTransaction,
+    *,
+    dispatch_record_id: str,
+    run_id: str,
+    attempt_id: str,
+    execution_id: str,
+) -> None:
+    """插入测试用 pre-accept dispatching dispatch record。
+
+    :param transaction: Host transaction。
+    :param dispatch_record_id: dispatch record id。
+    :param run_id: Run id。
+    :param attempt_id: Attempt id。
+    :param execution_id: execution id。
+    :returns: ``None``。
+    """
+
+    _ensure_host_instance_tx(transaction, host_instance_id="host-instance-1")
+    _insert_dispatch_record_with_diagnostics_tx(
+        transaction,
+        dispatch_record_id=dispatch_record_id,
+        run_id=run_id,
+        attempt_id=attempt_id,
+        execution_id=execution_id,
+        status=DispatchRecordStatus.DISPATCHING,
+        owner_host_instance_id="host-instance-1",
+        waiting_for_lane_at=_TIMESTAMP,
+        lane_name="llm",
+        lane_claim_id="lane-claim-1",
+        lane_owner_id="lane-owner-1",
+        lane_acquired_at=_TIMESTAMP,
+        dispatching_at=_TIMESTAMP,
+        worker_accepted_at=None,
+        worker_accept_event_id=None,
+        worker_accept_event_sequence=None,
+        cancelled_event_id=None,
+        cancelled_event_sequence=None,
+        cancelled_at=None,
+    )
+
+
+def _insert_dispatch_record_with_diagnostics_tx(
+    transaction: HostTransaction,
+    *,
+    dispatch_record_id: str,
+    run_id: str,
+    attempt_id: str,
+    execution_id: str,
+    status: DispatchRecordStatus,
+    owner_host_instance_id: str | None,
+    waiting_for_lane_at: str | None,
+    lane_name: str | None,
+    lane_claim_id: str | None,
+    lane_owner_id: str | None,
+    lane_acquired_at: str | None,
+    dispatching_at: str | None,
+    worker_accepted_at: str | None,
+    worker_accept_event_id: str | None,
+    worker_accept_event_sequence: int | None,
+    cancelled_event_id: str | None,
+    cancelled_event_sequence: int | None,
+    cancelled_at: str | None,
+) -> None:
+    """插入带 Phase 5 诊断字段的 dispatch record。
+
+    :param transaction: Host transaction。
+    :param dispatch_record_id: dispatch record id。
+    :param run_id: Run id。
+    :param attempt_id: Attempt id。
+    :param execution_id: execution id。
+    :param status: dispatch record 状态。
+    :param owner_host_instance_id: owner Host instance id。
+    :param waiting_for_lane_at: lane 等待时间。
+    :param lane_name: lane 名称。
+    :param lane_claim_id: lane claim id。
+    :param lane_owner_id: lane owner id。
+    :param lane_acquired_at: lane 获取时间。
+    :param dispatching_at: dispatching 时间。
+    :param worker_accepted_at: worker accept 时间。
+    :param worker_accept_event_id: ``ATTEMPT_RUNNING`` event id。
+    :param worker_accept_event_sequence: ``ATTEMPT_RUNNING`` event sequence。
+    :param cancelled_event_id: cancel event id。
+    :param cancelled_event_sequence: cancel event sequence。
+    :param cancelled_at: cancel 时间。
+    :returns: ``None``。
+    """
+
+    created_event_id = f"event-dispatch-created-{dispatch_record_id}"
+    created_sequence = _insert_event_tx(
+        transaction,
+        event_id=created_event_id,
+        session_id="session-1",
+        run_id=run_id,
+        attempt_id=attempt_id,
+        execution_id=execution_id,
+    )
+    transaction.execute(
+        f"""
+        INSERT INTO {TABLE_HOST_ATTEMPT_DISPATCH_RECORDS} (
+          dispatch_record_id,
+          run_id,
+          attempt_id,
+          execution_id,
+          status,
+          worker_kind,
+          execution_target,
+          owner_host_instance_id,
+          created_event_id,
+          created_event_sequence,
+          waiting_for_lane_at,
+          lane_name,
+          lane_claim_id,
+          lane_owner_id,
+          lane_acquired_at,
+          dispatching_at,
+          worker_accepted_at,
+          worker_accept_event_id,
+          worker_accept_event_sequence,
+          cancelled_event_id,
+          cancelled_event_sequence,
+          created_at,
+          updated_at,
+          cancelled_at
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        """,
+        (
+            dispatch_record_id,
+            run_id,
+            attempt_id,
+            execution_id,
+            serialize_dispatch_record_status(status),
+            serialize_worker_kind(WorkerKind.LOCAL),
+            "local-default",
+            owner_host_instance_id,
+            created_event_id,
+            created_sequence,
+            waiting_for_lane_at,
+            lane_name,
+            lane_claim_id,
+            lane_owner_id,
+            lane_acquired_at,
+            dispatching_at,
+            worker_accepted_at,
+            worker_accept_event_id,
+            worker_accept_event_sequence,
+            cancelled_event_id,
+            cancelled_event_sequence,
+            _TIMESTAMP,
+            _TIMESTAMP,
+            cancelled_at,
+        ),
+    )
+
+
+def _ensure_host_instance_tx(
+    transaction: HostTransaction, *, host_instance_id: str
+) -> None:
+    """写入测试用 Host instance row。
+
+    :param transaction: Host transaction。
+    :param host_instance_id: Host instance id。
+    :returns: ``None``。
+    """
+
+    transaction.execute(
+        """
+        INSERT OR IGNORE INTO host_instances (
+          host_instance_id,
+          pid,
+          process_start_token,
+          boot_id,
+          created_at,
+          heartbeat_at,
+          status
+        ) VALUES (?, ?, ?, ?, ?, ?, ?)
+        """,
+        (
+            host_instance_id,
+            1,
+            "process-start-token",
+            None,
+            _TIMESTAMP,
+            _TIMESTAMP,
+            "running",
         ),
     )

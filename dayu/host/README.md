@@ -88,10 +88,10 @@ Phase 4 public `submit_followup(queue)` 暂使用 Host facade 内部默认 execu
 - Payload descriptor primitive：支持 `sqlite_payload` 与 `artifact_ref` 两类 descriptor；SQLite payload row 与 descriptor 可在同一 transaction 内写入，EventLog 可引用既有 descriptor 与 digest。
 - Local artifact helper：在显式注入的 artifact root 下写入 `.tmp` 临时文件，完成 flush / fsync、digest 校验与 atomic rename 后返回最终 `LocalArtifactRef`；SQLite rollback 后已发布但未引用的文件只属于 cleanup / diagnostics orphan，不是 accepted fact。
 - Host instance liveness primitive：支持当前 instance register、heartbeat、mark stopping / stopped 与 read row；该 row 只表达本机 Host instance 生命周期诊断。
-- Phase 3 state schema / row codec：创建 Session、slot、Run、Attempt 与 attempt dispatch record durable tables；typed row codec 与低层 helper 负责状态枚举、SQLite row 转换、Session snapshot 读取和事务内 CAS mutation。
-- Phase 3 internal lifecycle / transition primitives：在调用方提供的 `HostTransaction` 内实现 Session / slot lifecycle，以及 Run / Attempt / pending dispatch record 的低层 transition helper；EventLog fact 与 state row mutation 必须处于同一 SQLite write transaction。
+- Phase 3 / 5 state schema / row codec：创建 Session、slot、Run、Attempt 与 attempt dispatch record durable tables；dispatch record 当前覆盖 `pending`、`waiting_for_lane`、`dispatching`、`cancelled` 四种状态，typed row codec 与低层 helper 负责状态枚举、SQLite row 转换、Session snapshot 读取和事务内 CAS mutation。
+- Phase 3 / 5 internal lifecycle / transition primitives：在调用方提供的 `HostTransaction` 内实现 Session / slot lifecycle，以及 Run / Attempt / dispatch record 的低层 transition helper；当前 durable primitive 覆盖 pre-dispatch cancel、`pending -> waiting_for_lane -> dispatching` 诊断推进、worker accepted refs、Attempt `STARTING -> RUNNING` 和 active Run `RUNNING -> CANCELLING`。EventLog fact 与 state row mutation 必须处于同一 SQLite write transaction。
 
-durable foundation 当前不实现 policy provider set、queue scanning / after-commit wakeup、scheduler、lane acquire、WorkerProxy / LocalProxy / RemoteProxy、Engine dispatch、EngineEvent ingest、recovery classifier、lease / fencing / takeover、artifact cleanup scheduler、projection、audit、outbox 或 ToolRuntime。
+durable foundation 当前不实现 policy provider set、queue scanning / after-commit wakeup、dispatch scheduler、真实 lane acquire、WorkerProxy / LocalProxy / RemoteProxy、Engine dispatch、EngineEvent ingest、active cancel propagation、recovery classifier、lease / fencing / takeover、artifact cleanup scheduler、projection、audit、outbox 或 ToolRuntime。
 
 ## Internal Admission
 
@@ -158,4 +158,4 @@ python -m pyright dayu/host tests/host
 
 测试覆盖包根导出白名单、枚举字符串值、请求校验失败路径、Host tooling options 校验、Host import 边界、弱类型守卫、Host command handle factory / close lifecycle、Session public facade 幂等、冲突、读取与关闭语义，以及 Run public facade 的 start / follow-up queue / steer unsupported / get_run / EventLog stream / cancel / session-scope cancel 子集 / deferred unsupported 函数。
 
-durable foundation 与 internal admission 测试覆盖 SQLite schema bootstrap / transaction runner、EventLog append / read / idempotency、payload descriptor、local artifact helper、host instance liveness、EventLog 多进程 sequence smoke、Session lifecycle、Run / Attempt transition primitive、start / follow-up admission、queue policy、idempotency、FIFO promotion、queued / pre-dispatch cancel、terminal closeout、admission 多进程 durable invariant，以及 Host 包根不导出 durable 内部模块。
+durable foundation 与 internal admission 测试覆盖 SQLite schema bootstrap / transaction runner、EventLog append / read / idempotency、payload descriptor、local artifact helper、host instance liveness、EventLog 多进程 sequence smoke、Session lifecycle、Run / Attempt transition primitive、dispatch record 四状态 schema、waiting / dispatching / worker accept refs、active cancel durable primitive、start / follow-up admission、queue policy、idempotency、FIFO promotion、queued / pre-dispatch cancel、terminal closeout、admission 多进程 durable invariant，以及 Host 包根不导出 durable 内部模块。
