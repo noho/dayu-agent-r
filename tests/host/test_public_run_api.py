@@ -20,12 +20,22 @@ from dayu.host import (
     HostCommandHandleOptions,
     HostInput,
     OperationContext,
+    PurgeSessionRequest,
+    ReplayRunRequest,
+    ResolveWaitRequest,
+    RetryRunRequest,
     RunStatus,
     StartRunRequest,
     SubmitFollowupRequest,
+    WaitResolutionSource,
     cancel_run,
     create_host_command_handle,
     ensure_session,
+    get_run,
+    purge_session,
+    replay_run,
+    resolve_wait,
+    retry_run,
     start_run,
     submit_followup,
 )
@@ -197,6 +207,48 @@ def _event_count(db_path: Path) -> int:
     return int(row[0])
 
 
+def _idempotency_count(db_path: Path) -> int:
+    """统计 idempotency record 数。
+
+    :param db_path: SQLite DB 路径。
+    :returns: idempotency record 数。
+    """
+
+    with sqlite3.connect(db_path) as connection:
+        row = connection.execute(
+            "SELECT COUNT(*) FROM idempotency_records"
+        ).fetchone()
+    assert row is not None
+    return int(row[0])
+
+
+def _known_run_event_cursor(db_path: Path, run_id: str) -> int:
+    """按 Run row 已知事件序列计算 public event cursor。
+
+    :param db_path: SQLite DB 路径。
+    :param run_id: Run id。
+    :returns: Run row 上 input/accepted/queued/started/terminal 的最大非空序列。
+    """
+
+    with sqlite3.connect(db_path) as connection:
+        row = connection.execute(
+            """
+            SELECT
+              input_event_sequence,
+              accepted_event_sequence,
+              queued_event_sequence,
+              started_event_sequence,
+              terminal_event_sequence
+            FROM host_runs
+            WHERE run_id = ?
+            """,
+            (run_id,),
+        ).fetchone()
+    assert row is not None
+    sequences = tuple(int(value) for value in row if value is not None)
+    return max(sequences)
+
+
 def _run_status(db_path: Path, run_id: str) -> RunStatus:
     """从 durable Run table 读取当前 Run 状态。
 
@@ -238,6 +290,67 @@ def test_start_run_direct_running_and_attach_active(tmp_path: Path) -> None:
         assert attached.run_id == running.run_id
         assert attached.status == RunStatus.RUNNING
         assert _event_count(options.db_path) == before_attach
+    finally:
+        host.close()
+
+
+def test_get_run_missing_returns_not_found(tmp_path: Path) -> None:
+    """get_run 读取不存在 Run 时返回 NOT_FOUND。"""
+
+    host = _open_handle(tmp_path)
+    try:
+        with pytest.raises(HostApiError) as exc_info:
+            get_run(host, "missing-run")
+
+        assert exc_info.value.code == HostApiErrorCode.NOT_FOUND
+        assert exc_info.value.retryable is False
+    finally:
+        host.close()
+
+
+def test_get_run_returns_durable_status_attempt_and_cursor(
+    tmp_path: Path,
+) -> None:
+    """get_run 返回 queued、running、cancelled Run 的 durable truth。"""
+
+    options = _options(tmp_path)
+    host = create_host_command_handle(options)
+    try:
+        session_id = _session_id(host)
+        running = start_run(host, _start_request(session_id, "start-running"))
+        queued = start_run(
+            host,
+            _start_request(session_id, "start-queued", queue_policy="queue"),
+        )
+        queued_read = get_run(host, queued.run_id)
+        queued_cursor_before_cancel = _known_run_event_cursor(
+            options.db_path, queued.run_id
+        )
+        cancelled = cancel_run(
+            host, queued.run_id, _cancel_request("cancel-queued")
+        )
+
+        running_read = get_run(host, running.run_id)
+        cancelled_read = get_run(host, cancelled.run_id)
+
+        assert running_read.status == RunStatus.RUNNING
+        assert running_read.current_attempt_id == running.current_attempt_id
+        assert running_read.event_cursor.event_sequence == _known_run_event_cursor(
+            options.db_path, running.run_id
+        )
+        assert queued_read.status == RunStatus.QUEUED
+        assert queued_read.current_attempt_id is None
+        assert queued_read.event_cursor.event_sequence == queued_cursor_before_cancel
+        assert cancelled_read.status == RunStatus.CANCELLED
+        assert cancelled_read.current_attempt_id is None
+        assert cancelled_read.terminal_result_summary is not None
+        assert cancelled_read.terminal_result_summary.status == RunStatus.CANCELLED
+        assert cancelled_read.terminal_result_summary.summary_ref is None
+        assert cancelled_read.terminal_result_summary.summary_digest is None
+        assert (
+            cancelled_read.event_cursor.event_sequence
+            == _known_run_event_cursor(options.db_path, cancelled.run_id)
+        )
     finally:
         host.close()
 
@@ -426,3 +539,70 @@ def test_public_cancel_and_promotion_race_preserves_run_invariants(
     assert statuses == (RunStatus.CANCELLED, RunStatus.CANCELLED)
     assert latest_active_status == RunStatus.CANCELLED
     assert latest_queued_status == RunStatus.CANCELLED
+
+
+def test_deferred_public_functions_are_stable_unsupported_without_writes(
+    tmp_path: Path,
+) -> None:
+    """retry/replay/resolve_wait/purge_session 返回 unsupported 且不写事实。"""
+
+    options = _options(tmp_path)
+    host = create_host_command_handle(options)
+    try:
+        session_id = _session_id(host)
+        run = start_run(host, _start_request(session_id, "start-1"))
+        before_events = _event_count(options.db_path)
+        before_idempotency = _idempotency_count(options.db_path)
+
+        with pytest.raises(HostApiError) as retry_exc:
+            retry_run(
+                host,
+                run.run_id,
+                RetryRunRequest(
+                    context=_context(),
+                    client_request_id="retry-1",
+                    reason="retry_test",
+                ),
+            )
+        with pytest.raises(HostApiError) as replay_exc:
+            replay_run(
+                host,
+                run.run_id,
+                ReplayRunRequest(
+                    context=_context(),
+                    client_request_id="replay-1",
+                    reason="replay_test",
+                    repair_instruction="repair structure",
+                ),
+            )
+        with pytest.raises(HostApiError) as resolve_exc:
+            resolve_wait(
+                host,
+                "wait-1",
+                ResolveWaitRequest(
+                    context=_context(),
+                    idempotency_key="resolve-1",
+                    outcome_ref="outcome-1",
+                    source=WaitResolutionSource.MANUAL,
+                    observed_at="2026-05-14T00:00:00.000000Z",
+                ),
+            )
+        with pytest.raises(HostApiError) as purge_exc:
+            purge_session(
+                host,
+                session_id,
+                PurgeSessionRequest(
+                    context=_context(),
+                    client_request_id="purge-1",
+                    reason="purge_test",
+                ),
+            )
+
+        for exc_info in (retry_exc, replay_exc, resolve_exc, purge_exc):
+            assert exc_info.value.code == HostApiErrorCode.UNSUPPORTED_OPERATION
+            assert exc_info.value.retryable is False
+            assert exc_info.value.detail is None
+        assert _event_count(options.db_path) == before_events
+        assert _idempotency_count(options.db_path) == before_idempotency
+    finally:
+        host.close()

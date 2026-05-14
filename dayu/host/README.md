@@ -14,13 +14,14 @@
 - command handle：`HostCommandHandle`、`create_host_command_handle`、`HostCommandFacet`；public handle 只暴露稳定 `host_handle_id` 与幂等 `close()`，不暴露 durable store、transaction runner、store connection 或 admission service。
 - command handle options：`HostCommandHandleOptions`，显式描述 Host command handle 的 durable DB、artifact root、SQLite timeout / retry 与 payload inline threshold 构造选项。
 - Session facade：`ensure_session`、`create_session`、`get_session`、`close_session`，均返回 `SessionSnapshot`。
-- Run command facade：`start_run`、`submit_followup`、`cancel_run`、`cancel_session_runs`；当前只覆盖 Phase 1-3 admission 可闭环路径。
+- Run facade：`start_run`、`submit_followup`、`get_run`、`stream_run_events`、`cancel_run`、`cancel_session_runs`；当前 command 路径只覆盖 Phase 1-3 admission 可闭环路径，读取路径只使用 durable Run / EventLog truth。
+- deferred facade：`retry_run`、`replay_run`、`resolve_wait`、`purge_session` 当前是 stable unsupported public functions，固定返回 `UNSUPPORTED_OPERATION`，不追加 EventLog，也不写 idempotency record。
 - requests：`EnsureSessionRequest`、`CreateSessionRequest`、`CloseSessionRequest`、`PurgeSessionRequest`、`StartRunRequest`、`CancelRunRequest`、`CancelSessionRunsRequest`、`SubmitFollowupRequest`、`RetryRunRequest`、`ReplayRunRequest`、`ResolveWaitRequest`。
 - snapshots / stream：`TerminalResultSummary`、`OutboxSummary`、`SessionSnapshot`、`RunSnapshot`、`FollowupSnapshot`、`PurgeSessionResult`、`HostEventView`、`HostEventStream`。
 - error：`HostApiError`、`HostApiErrorDetail`、`SteerConflictDetail`。
 - tooling construction options：`ToolBundleSourceKind`、`FrameworkToolName`、`ToolBundleSourceRef`、`FrameworkToolPolicyView`、`HostToolingOptions`、`default_framework_tool_policy_view`。
 
-`dayu.host.api.__all__` 仍只包含 request、snapshot、status、error、context 与 stream cursor 类型。Session read facade 位于 `dayu.host.read_api`，Session / Run command facade 位于 `dayu.host.command`，并由包根导出，但不进入 `dayu.host.api`。Host construction tooling 类型位于 `dayu.host.tooling`，由包根导出，但不进入 `dayu.host.api`。
+`dayu.host.api.__all__` 仍只包含 request、snapshot、status、error、context 与 stream cursor 类型。Session / Run read facade 位于 `dayu.host.read_api`，Session / Run command facade 与 deferred facade 位于 `dayu.host.command`，并由包根导出，但不进入 `dayu.host.api`。Host construction tooling 类型位于 `dayu.host.tooling`，由包根导出，但不进入 `dayu.host.api`。
 
 ## Public Session Command Path
 
@@ -42,12 +43,25 @@ public semantic digest 在 facade 边界只使用显式请求字段与 `HostCall
 
 - `start_run(host, request)`：复用 internal admission，支持无 active Run 时 direct `RUNNING`、有 active Run 时按 `queue_policy` 执行 `queue` / `reject` / `attach_active`。`attach_active` 只记录幂等结果并返回当前 active `RunSnapshot`，不追加 canonical attach fact。
 - `submit_followup(host, session_id, request)`：要求路径参数 `session_id` 等于 `request.session_id`。`behavior=queue` 复用 internal `submit_followup_queue`，active 存在时返回 `accepted_run_status=QUEUED`，无 active 时返回 `accepted_run_status=RUNNING`；`behavior=steer` 返回 `UNSUPPORTED_OPERATION` 且不追加 EventLog。
+- `get_run(host, run_id)`：通过只读 transaction 读取 durable Run row，缺失时返回 `NOT_FOUND`。`current_attempt_id` 来自 Run row；`event_cursor` 是 Run row 中 input、accepted、queued、started、terminal event sequence 的最大非空值。非终态 Run 的 `terminal_result_summary` 为 `None`；终态 Run 当前返回 status-only `TerminalResultSummary(status=..., summary_ref=None, summary_digest=None)`，因为 Phase 4 尚未引入 typed terminal payload decoder，不从 untyped EventLog payload 字符串临时解析 summary refs。`outbox_summary` 在 Phase 4 始终为 `None`。
+- `stream_run_events(host, run_id, cursor, limit=None)`：先校验目标 Run 存在，再按全局 EventLog `event_sequence > cursor.event_sequence` 扫描。`limit=None` 使用 `HOST_EVENT_STREAM_DEFAULT_LIMIT`，`limit <= 0` 或超过 `HOST_EVENT_STREAM_MAX_LIMIT` 返回 `INVALID_STATE`。`limit` 是全局 EventLog row 扫描窗口，也是返回事件上限；扫描后只返回 `row.run_id == run_id` 的 `HostEventView`。`next_cursor` 是本次扫描到的最大全局 `event_sequence`；没有扫描到 row 时等于输入 cursor。扫描窗口内只有无关 Run 事件时，返回空 `events` 但仍推进 `next_cursor`。
 - `cancel_run(host, run_id, request)`：复用 internal cancel，支持 queued Run cancel 与 pre-dispatch `RUNNING` / Attempt `STARTING` / dispatch `PENDING` cancel；dispatching / active worker、`WAITING`、`RECOVERING` 等后续 owner 能力映射为 `UNSUPPORTED_OPERATION`。
 - `cancel_session_runs(host, session_id, request)`：Phase 4 只在一个 write transaction 内批量取消同 Session 下 queued Run 与 pre-dispatch `STARTING` Run。若存在 dispatching / active worker、`WAITING`、`RECOVERING` 或其它 unsupported non-terminal Run，会在追加任何 cancel fact 前返回 `UNSUPPORTED_OPERATION`；该路径不触发 queue promotion。
+
+`stream_run_events` 只暴露 `event_sequence`、`event_id`、`event_type`、`session_id`、`run_id`、`payload_ref` 与 `payload_digest`，不暴露 policy decision JSON、reason JSON 或 inline payload JSON。该 API 不读取 projection checkpoint、memory state、outbox state、in-memory subscription position、session-local cursor 或 client sequence。
 
 `cancel_session_runs` 的幂等 scope 是 `(operation=cancel_session_runs, scope_id=session_id, idempotency_key=request.client_request_id)`。semantic digest 只包含 session id、请求上下文 digest、reason 与 mode，不包含当前 Run 列表；同 key 重放返回当前 `SessionSnapshot`，不会取消首次操作后新接受的 Run。没有 supported non-terminal Run 时只记录 session-scope 幂等结果，不追加 cancel fact。
 
 Phase 4 public `submit_followup(queue)` 暂使用 Host facade 内部默认 execution target 作为 policy resolution output；完整 policy provider / execution target resolution 装配不在当前实现范围。
+
+当前 stable unsupported public facade：
+
+- `retry_run(host, run_id, request)`
+- `replay_run(host, run_id, request)`
+- `resolve_wait(host, wait_id, request)`
+- `purge_session(host, session_id, request)`
+
+这些函数保留稳定签名，但 Phase 4 固定返回 `HostApiError(code=UNSUPPORTED_OPERATION, retryable=False, detail=None)`，不读取或写入 EventLog、idempotency record、purge tombstone、wait record 或 retry / replay Run。
 
 ## Host Tooling Options
 
@@ -127,7 +141,7 @@ Host 若在后续实现中复用 `dayu.runtime.filelock`，只能把它用于普
 
 当前未实现：
 
-- Run read public facade、EventLog stream public facade、policy provider set、dispatch scheduler、WorkerProxy / LocalProxy / RemoteProxy、dispatching / active worker cancel propagation、wait cancellation、recovery classifier、lease / fencing / takeover。
+- policy provider set、dispatch scheduler、WorkerProxy / LocalProxy / RemoteProxy、dispatching / active worker cancel propagation、wait cancellation、recovery classifier、lease / fencing / takeover。
 - artifact cleanup scheduler 与 diagnostics table。
 - ToolRuntime construction、ToolRuntime policy resolution、framework tool injection。
 - ToolsDiscovery / ScenePrepare provider contract、tool profile registry、Attempt tool snapshot durability。
@@ -142,6 +156,6 @@ pytest tests/host -q
 python -m pyright dayu/host tests/host
 ```
 
-测试覆盖包根导出白名单、枚举字符串值、请求校验失败路径、Host tooling options 校验、Host import 边界、弱类型守卫、Host command handle factory / close lifecycle、Session public facade 幂等、冲突、读取与关闭语义，以及 Run public facade 的 start / follow-up queue / steer unsupported / cancel / session-scope cancel 子集。
+测试覆盖包根导出白名单、枚举字符串值、请求校验失败路径、Host tooling options 校验、Host import 边界、弱类型守卫、Host command handle factory / close lifecycle、Session public facade 幂等、冲突、读取与关闭语义，以及 Run public facade 的 start / follow-up queue / steer unsupported / get_run / EventLog stream / cancel / session-scope cancel 子集 / deferred unsupported 函数。
 
 durable foundation 与 internal admission 测试覆盖 SQLite schema bootstrap / transaction runner、EventLog append / read / idempotency、payload descriptor、local artifact helper、host instance liveness、EventLog 多进程 sequence smoke、Session lifecycle、Run / Attempt transition primitive、start / follow-up admission、queue policy、idempotency、FIFO promotion、queued / pre-dispatch cancel、terminal closeout、admission 多进程 durable invariant，以及 Host 包根不导出 durable 内部模块。

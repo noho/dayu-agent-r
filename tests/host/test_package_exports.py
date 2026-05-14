@@ -72,8 +72,14 @@ EXPECTED_COMMAND_EXPORTS: frozenset[str] = frozenset(
         "create_host_command_handle",
         "create_session",
         "ensure_session",
+        "get_run",
         "get_session",
+        "purge_session",
+        "replay_run",
+        "resolve_wait",
+        "retry_run",
         "start_run",
+        "stream_run_events",
         "submit_followup",
     }
 )

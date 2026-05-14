@@ -9,6 +9,7 @@ supervisor，不实现 Engine dispatch、EventLog stream 或 purge。
 from __future__ import annotations
 
 from dataclasses import dataclass
+from typing import NoReturn
 from uuid import uuid4
 
 from dayu.contracts.json_value import JsonValue
@@ -33,6 +34,11 @@ from dayu.host.api import (
     HostCommandHandleOptions,
     HostInput,
     OperationContext,
+    PurgeSessionRequest,
+    PurgeSessionResult,
+    ReplayRunRequest,
+    ResolveWaitRequest,
+    RetryRunRequest,
     RunSnapshot,
     RunStatus,
     SessionSnapshot,
@@ -406,6 +412,76 @@ def cancel_session_runs(
     return result.snapshot
 
 
+def retry_run(
+    host: HostCommandHandle, run_id: str, request: RetryRunRequest
+) -> RunSnapshot:
+    """稳定拒绝 Phase 4 尚未实现的 retry Run。
+
+    本函数不打开 transaction、不追加 EventLog、不写 idempotency record。
+
+    :param host: Host command handle；Phase 4 deferred 路径不读取该 handle。
+    :param run_id: 源 Run id。
+    :param request: retry run 请求。
+    :returns: 当前阶段不会返回。
+    :raises HostApiError: 始终以 ``UNSUPPORTED_OPERATION`` 抛出。
+    """
+
+    _raise_unsupported_operation("retry_run")
+
+
+def replay_run(
+    host: HostCommandHandle, run_id: str, request: ReplayRunRequest
+) -> RunSnapshot:
+    """稳定拒绝 Phase 4 尚未实现的 replay Run。
+
+    本函数不打开 transaction、不追加 EventLog、不写 idempotency record。
+
+    :param host: Host command handle；Phase 4 deferred 路径不读取该 handle。
+    :param run_id: 源 Run id。
+    :param request: replay run 请求。
+    :returns: 当前阶段不会返回。
+    :raises HostApiError: 始终以 ``UNSUPPORTED_OPERATION`` 抛出。
+    """
+
+    _raise_unsupported_operation("replay_run")
+
+
+def resolve_wait(
+    host: HostCommandHandle, wait_id: str, request: ResolveWaitRequest
+) -> RunSnapshot:
+    """稳定拒绝 Phase 4 尚未实现的 wait result accept。
+
+    本函数不打开 transaction、不追加 EventLog、不写 idempotency record。
+
+    :param host: Host command handle；Phase 4 deferred 路径不读取该 handle。
+    :param wait_id: 待接收结果的 wait id。
+    :param request: resolve wait 请求。
+    :returns: 当前阶段不会返回。
+    :raises HostApiError: 始终以 ``UNSUPPORTED_OPERATION`` 抛出。
+    """
+
+    _raise_unsupported_operation("resolve_wait")
+
+
+def purge_session(
+    host: HostCommandHandle,
+    session_id: str,
+    request: PurgeSessionRequest,
+) -> PurgeSessionResult:
+    """稳定拒绝 Phase 4 尚未实现的 Session purge。
+
+    本函数不打开 transaction、不追加 EventLog、不写 idempotency record。
+
+    :param host: Host command handle；Phase 4 deferred 路径不读取该 handle。
+    :param session_id: 目标 Session id。
+    :param request: purge session 请求。
+    :returns: 当前阶段不会返回。
+    :raises HostApiError: 始终以 ``UNSUPPORTED_OPERATION`` 抛出。
+    """
+
+    _raise_unsupported_operation("purge_session")
+
+
 def _durable_options_from_public_options(
     options: HostCommandHandleOptions,
 ) -> HostDurableStoreOptions:
@@ -438,6 +514,23 @@ def _durable_options_from_public_options(
                 options.sqlite_write_retry_max_delay_seconds
             ),
         ),
+    )
+
+
+def _raise_unsupported_operation(operation_name: str) -> NoReturn:
+    """抛出 stable unsupported public facade 错误。
+
+    :param operation_name: public operation 名称。
+    :returns: 当前函数不会返回。
+    :raises HostApiError: 始终以 ``UNSUPPORTED_OPERATION`` 抛出，且
+        ``retryable=False``、``detail=None``。
+    """
+
+    raise HostApiError(
+        code=HostApiErrorCode.UNSUPPORTED_OPERATION,
+        message=f"{operation_name} is deferred beyond Phase 4",
+        retryable=False,
+        detail=None,
     )
 
 
@@ -765,6 +858,10 @@ __all__ = [
     "create_host_command_handle",
     "create_session",
     "ensure_session",
+    "purge_session",
+    "replay_run",
+    "resolve_wait",
+    "retry_run",
     "start_run",
     "submit_followup",
 ]
