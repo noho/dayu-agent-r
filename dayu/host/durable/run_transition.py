@@ -1467,10 +1467,10 @@ def _invalid_terminal_precondition(
             dispatch_record=None,
         )
     if (
-        run.status not in (RunStatus.RUNNING, RunStatus.WAITING)
+        run.status != RunStatus.RUNNING
         or run.current_attempt_id != attempt_id
         or attempt.run_id != run.run_id
-        or attempt.status not in (AttemptStatus.STARTING, AttemptStatus.RUNNING)
+        or attempt.status != AttemptStatus.STARTING
     ):
         return RunTransitionResult(
             status=StateMutationStatus.INVALID_STATE,

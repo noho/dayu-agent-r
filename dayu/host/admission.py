@@ -1,7 +1,8 @@
 """Host 内部 admission 与 queue promotion 服务。
 
-本模块实现 Phase 3 P3-S4 的内部 command 编排：``start_run``、
-``submit_followup(queue)`` 和单次 FIFO queue promotion。它只依赖 Host durable
+本模块实现 Phase 3 P3-S5 的内部 command 编排：``start_run``、
+``submit_followup(queue)``、``cancel_run``、terminal closeout 和单次 FIFO
+queue promotion。它只依赖 Host durable
 foundation、Session/Run/Attempt state helper 与调用方提供的 transaction
 runner；不实现 public facade、scheduler、lane、WorkerProxy、Engine dispatch、
 steer、retry、replay、wait 或 recovery。
@@ -17,7 +18,9 @@ from uuid import uuid4
 
 from dayu.contracts.json_value import JsonValue
 from dayu.host.api import (
+    AttemptStatus,
     AuthorizationClaim,
+    CancelRunRequest,
     FollowupBehavior,
     HostApiError,
     HostApiErrorCode,
@@ -47,13 +50,20 @@ from dayu.host.durable.idempotency import (
     IdempotencyStore,
 )
 from dayu.host.durable.run_transition import (
+    CancelPredispatchStartingInput,
+    CancelQueuedRunInput,
     CreateQueuedRunInput,
     CreateRunningRunInput,
     PromoteQueuedRunInput,
     PromotionSkipReason,
+    RunTransitionResult as DurableRunTransitionResult,
+    TerminalCloseoutInput,
+    cancel_predispatch_starting_in_transaction,
+    cancel_queued_in_transaction,
     create_queued_run_in_transaction,
     create_running_run_with_starting_attempt_in_transaction,
     promote_queued_run_in_transaction,
+    terminal_closeout_in_transaction,
 )
 from dayu.host.durable.state import (
     AttemptRow,
@@ -81,8 +91,10 @@ _EXECUTION_ID_PREFIX = "execution"
 _DISPATCH_RECORD_ID_PREFIX = "dispatch"
 _OPERATION_START_RUN = "start_run"
 _OPERATION_SUBMIT_FOLLOWUP_QUEUE = "submit_followup_queue"
+_OPERATION_CANCEL_RUN = "cancel_run"
 _IDEMPOTENCY_RESULT_KIND_RUN = "run"
 _QUEUE_REASON_ACTIVE_RUN_EXISTS = "active_run_exists"
+_TERMINAL_CLOSEOUT_REASON = "phase3_internal_closeout"
 
 
 class AdmissionPolicy(StrEnum):
@@ -224,6 +236,62 @@ class PromotionResult:
     skip_reason: PromotionSkipReason | None
 
 
+@dataclass(frozen=True, slots=True)
+class CloseoutAttemptTerminalInput:
+    """admission 层 internal terminal closeout 输入。
+
+    :param run_id: 目标 Run id。
+    :param attempt_id: 目标 Attempt id，必须是 Run 当前 Attempt。
+    :param attempt_terminal_status: Attempt 具体终态，只支持 succeeded/failed/lost。
+    :param run_terminal_status: Run 具体终态，只支持 succeeded/failed/lost。
+    :param terminal_summary_ref: terminal summary 引用；无摘要时为 ``None``。
+    :param terminal_summary_digest: terminal summary digest；无摘要时为 ``None``。
+    """
+
+    run_id: str
+    attempt_id: str
+    attempt_terminal_status: AttemptStatus
+    run_terminal_status: RunStatus
+    terminal_summary_ref: str | None
+    terminal_summary_digest: str | None
+
+
+@dataclass(frozen=True, slots=True)
+class CancelRunResult:
+    """admission 层 cancel_run 结果。
+
+    :param run: cancel 后或幂等重放读取到的 Run。
+    :param attempt: Run 当前 Attempt；queued cancel 时为 ``None``。
+    :param dispatch_record: 当前 Attempt 对应 dispatch record；无 Attempt 时为 ``None``。
+    :param promotion: active slot 被释放后触发的 promotion 结果；未释放时为 ``None``。
+    :param idempotent_replay: 是否命中既有 cancel 幂等记录。
+    :param released_active_slot: 本次 cancel 是否释放 active slot。
+    """
+
+    run: RunRow
+    attempt: AttemptRow | None
+    dispatch_record: DispatchRecordRow | None
+    promotion: PromotionResult | None
+    idempotent_replay: bool
+    released_active_slot: bool
+
+
+@dataclass(frozen=True, slots=True)
+class TerminalCloseoutResult:
+    """admission 层 terminal closeout 结果。
+
+    :param run: terminal closeout 后的 Run。
+    :param attempt: terminal closeout 后的 Attempt。
+    :param dispatch_record: Attempt 对应 dispatch record；缺失时为 ``None``。
+    :param promotion: active slot 释放后触发的 promotion 结果。
+    """
+
+    run: RunRow
+    attempt: AttemptRow
+    dispatch_record: DispatchRecordRow | None
+    promotion: PromotionResult
+
+
 class NoopAdmissionWakeupPort:
     """默认 no-op wakeup port。
 
@@ -359,6 +427,86 @@ class HostAdmissionService:
         )
         _wake_dispatch_if_needed(self.wakeup_port, result.pending_dispatch)
         return result
+
+    def cancel_run(
+        self,
+        run_id: str,
+        request: CancelRunRequest,
+        *,
+        caller_semantic_digest: str,
+    ) -> CancelRunResult:
+        """接受单 Run cancel 请求。
+
+        :param run_id: 被取消的 Run id。
+        :param request: cancel run 请求。
+        :param caller_semantic_digest: 调用方语义输入摘要。
+        :returns: cancel 结果；pre-dispatch active cancel 会包含 promotion 结果。
+        :raises ValueError: run id 或 digest 非法时抛出。
+        :raises HostApiError: Run 缺失、幂等冲突或 Phase 3 不支持状态时抛出。
+        :raises HostDurableError: durable 写入失败时由底层抛出。
+        """
+
+        _require_non_empty_text(run_id, field_name="run_id")
+        _require_sha256_digest(
+            caller_semantic_digest, field_name="caller_semantic_digest"
+        )
+        result = self.transaction_runner.run_write(
+            _CancelRunOperation(
+                run_id=run_id,
+                request=request,
+                caller_semantic_digest=caller_semantic_digest,
+                event_log_store=self.event_log_store,
+                idempotency_store=self.idempotency_store,
+                clock=self.clock,
+                id_factory=self.id_factory,
+            )
+        )
+        if result.released_active_slot:
+            promotion = _promote_after_release(
+                service=self,
+                session_id=result.run.session_id,
+            )
+            return CancelRunResult(
+                run=result.run,
+                attempt=result.attempt,
+                dispatch_record=result.dispatch_record,
+                promotion=promotion,
+                idempotent_replay=result.idempotent_replay,
+                released_active_slot=True,
+            )
+        return result
+
+    def closeout_attempt_terminal(
+        self, closeout_input: CloseoutAttemptTerminalInput
+    ) -> TerminalCloseoutResult:
+        """关闭 active Attempt / Run 到 succeeded、failed 或 lost 终态。
+
+        :param closeout_input: internal terminal closeout 输入。
+        :returns: terminal closeout 结果，包含 commit 后 promotion 结果。
+        :raises ValueError: 输入为空、终态不匹配或使用 cancellation terminal 时抛出。
+        :raises HostApiError: Run/Attempt 缺失或 Phase 3 不支持状态时抛出。
+        :raises HostDurableError: durable 写入失败时由底层抛出。
+        """
+
+        _validate_closeout_attempt_terminal_input(closeout_input)
+        result = self.transaction_runner.run_write(
+            _CloseoutAttemptTerminalOperation(
+                closeout_input=closeout_input,
+                event_log_store=self.event_log_store,
+                clock=self.clock,
+                id_factory=self.id_factory,
+            )
+        )
+        promotion = _promote_after_release(
+            service=self,
+            session_id=result.run.session_id,
+        )
+        return TerminalCloseoutResult(
+            run=result.run,
+            attempt=result.attempt,
+            dispatch_record=result.dispatch_record,
+            promotion=promotion,
+        )
 
     def promote_next_queued_run(self, session_id: str) -> PromotionResult:
         """按 FIFO promotion 一个 queued Run。
@@ -659,6 +807,245 @@ class _PromoteNextQueuedRunOperation:
             pending_dispatch=pending_dispatch,
             skipped=False,
             skip_reason=None,
+        )
+
+
+@dataclass(frozen=True, slots=True)
+class _CancelRunOperation:
+    """cancel_run transaction body。"""
+
+    run_id: str
+    request: CancelRunRequest
+    caller_semantic_digest: str
+    event_log_store: EventLogStore
+    idempotency_store: IdempotencyStore
+    clock: AdmissionClock
+    id_factory: AdmissionIdFactory
+
+    def __call__(self, transaction: HostTransaction) -> CancelRunResult:
+        """执行 cancel_run transaction。
+
+        :param transaction: 当前 Host transaction。
+        :returns: cancel 结果；本 transaction 不执行 promotion。
+        :raises HostApiError: Run 缺失、幂等冲突或状态不支持时抛出。
+        """
+
+        semantic_digest = _cancel_run_semantic_digest(
+            self.request, caller_semantic_digest=self.caller_semantic_digest
+        )
+        scope = _idempotency_scope(
+            operation=_OPERATION_CANCEL_RUN,
+            scope_id=self.run_id,
+            idempotency_key=self.request.client_request_id,
+        )
+        existing = self.idempotency_store.read_idempotency_record(transaction, scope)
+        if existing is not None:
+            _raise_if_digest_conflict(existing, semantic_digest)
+            return _idempotent_cancel_result(transaction, existing)
+
+        run = read_run_by_id(transaction, self.run_id)
+        if run is None:
+            raise HostApiError(
+                code=HostApiErrorCode.NOT_FOUND,
+                message="Run not found",
+                retryable=False,
+            )
+        if run.status == RunStatus.QUEUED:
+            return self._cancel_queued(
+                transaction=transaction,
+                semantic_digest=semantic_digest,
+                scope=scope,
+            )
+        if run.status == RunStatus.RUNNING:
+            return self._cancel_predispatch_starting(
+                transaction=transaction,
+                semantic_digest=semantic_digest,
+                scope=scope,
+            )
+        raise HostApiError(
+            code=HostApiErrorCode.INVALID_STATE,
+            message="Run status is not cancellable in Phase 3 admission",
+            retryable=False,
+        )
+
+    def _cancel_queued(
+        self,
+        *,
+        transaction: HostTransaction,
+        semantic_digest: str,
+        scope: IdempotencyScope,
+    ) -> CancelRunResult:
+        """取消 queued Run 并记录幂等结果。
+
+        :param transaction: 当前 Host transaction。
+        :param semantic_digest: cancel semantic digest。
+        :param scope: 幂等 scope。
+        :returns: cancel 结果。
+        :raises HostApiError: 状态变化竞争导致不满足 queued 前置条件时抛出。
+        """
+
+        now = self.clock.now()
+        cancel_request_event_id = self.id_factory.new_id(_EVENT_ID_PREFIX)
+        transition_result = cancel_queued_in_transaction(
+            transaction,
+            self.event_log_store,
+            CancelQueuedRunInput(
+                run_id=self.run_id,
+                cancel_request_event_id=cancel_request_event_id,
+                run_cancelled_event_id=self.id_factory.new_id(_EVENT_ID_PREFIX),
+                occurred_at=now,
+                actor=self.request.context.actor,
+                source=self.request.context.source,
+                client_request_id=self.request.client_request_id,
+                idempotency_key=self.request.client_request_id,
+                reason=self.request.reason,
+                mode=self.request.mode,
+                call_context_digest=_call_context_digest(self.request.context),
+            ),
+        )
+        _raise_for_cancel_transition_status(transition_result)
+        run = _require_transition_run(transition_result.run)
+        cancel_request_sequence = _require_event_sequence(
+            transaction, cancel_request_event_id
+        )
+        self.idempotency_store.record_idempotent_result(
+            transaction,
+            scope,
+            semantic_digest,
+            IdempotencyResultRef(
+                result_kind=_IDEMPOTENCY_RESULT_KIND_RUN,
+                result_ref=run.run_id,
+                created_event_id=cancel_request_event_id,
+                created_event_sequence=cancel_request_sequence,
+            ),
+        )
+        return CancelRunResult(
+            run=run,
+            attempt=None,
+            dispatch_record=None,
+            promotion=None,
+            idempotent_replay=False,
+            released_active_slot=False,
+        )
+
+    def _cancel_predispatch_starting(
+        self,
+        *,
+        transaction: HostTransaction,
+        semantic_digest: str,
+        scope: IdempotencyScope,
+    ) -> CancelRunResult:
+        """取消 pre-dispatch STARTING Attempt 并记录幂等结果。
+
+        :param transaction: 当前 Host transaction。
+        :param semantic_digest: cancel semantic digest。
+        :param scope: 幂等 scope。
+        :returns: cancel 结果。
+        :raises HostApiError: 状态不是 Phase 3 pre-dispatch cancel 时抛出。
+        """
+
+        now = self.clock.now()
+        cancel_request_event_id = self.id_factory.new_id(_EVENT_ID_PREFIX)
+        transition_result = cancel_predispatch_starting_in_transaction(
+            transaction,
+            self.event_log_store,
+            CancelPredispatchStartingInput(
+                run_id=self.run_id,
+                cancel_request_event_id=cancel_request_event_id,
+                attempt_cancelled_event_id=self.id_factory.new_id(_EVENT_ID_PREFIX),
+                run_cancelled_event_id=self.id_factory.new_id(_EVENT_ID_PREFIX),
+                occurred_at=now,
+                actor=self.request.context.actor,
+                source=self.request.context.source,
+                client_request_id=self.request.client_request_id,
+                idempotency_key=self.request.client_request_id,
+                reason=self.request.reason,
+                mode=self.request.mode,
+                call_context_digest=_call_context_digest(self.request.context),
+            ),
+        )
+        _raise_for_cancel_transition_status(transition_result)
+        run = _require_transition_run(transition_result.run)
+        cancel_request_sequence = _require_event_sequence(
+            transaction, cancel_request_event_id
+        )
+        self.idempotency_store.record_idempotent_result(
+            transaction,
+            scope,
+            semantic_digest,
+            IdempotencyResultRef(
+                result_kind=_IDEMPOTENCY_RESULT_KIND_RUN,
+                result_ref=run.run_id,
+                created_event_id=cancel_request_event_id,
+                created_event_sequence=cancel_request_sequence,
+            ),
+        )
+        return CancelRunResult(
+            run=run,
+            attempt=transition_result.attempt,
+            dispatch_record=transition_result.dispatch_record,
+            promotion=None,
+            idempotent_replay=False,
+            released_active_slot=True,
+        )
+
+
+@dataclass(frozen=True, slots=True)
+class _TerminalCloseoutTransactionResult:
+    """terminal closeout transaction 内部结果。"""
+
+    run: RunRow
+    attempt: AttemptRow
+    dispatch_record: DispatchRecordRow | None
+
+
+@dataclass(frozen=True, slots=True)
+class _CloseoutAttemptTerminalOperation:
+    """closeout_attempt_terminal transaction body。"""
+
+    closeout_input: CloseoutAttemptTerminalInput
+    event_log_store: EventLogStore
+    clock: AdmissionClock
+    id_factory: AdmissionIdFactory
+
+    def __call__(self, transaction: HostTransaction) -> _TerminalCloseoutTransactionResult:
+        """执行 terminal closeout transaction。
+
+        :param transaction: 当前 Host transaction。
+        :returns: transaction 内部 closeout 结果；promotion 由 commit 后外层执行。
+        :raises HostApiError: Run/Attempt 缺失或状态不支持时抛出。
+        """
+
+        transition_result = terminal_closeout_in_transaction(
+            transaction,
+            self.event_log_store,
+            TerminalCloseoutInput(
+                run_id=self.closeout_input.run_id,
+                attempt_id=self.closeout_input.attempt_id,
+                attempt_terminal_event_id=self.id_factory.new_id(_EVENT_ID_PREFIX),
+                run_terminal_event_id=self.id_factory.new_id(_EVENT_ID_PREFIX),
+                attempt_terminal_status=self.closeout_input.attempt_terminal_status,
+                run_terminal_status=self.closeout_input.run_terminal_status,
+                occurred_at=self.clock.now(),
+                actor=_INTERNAL_ACTOR,
+                source=_EVENT_SOURCE,
+                reason=_TERMINAL_CLOSEOUT_REASON,
+                terminal_summary_ref=self.closeout_input.terminal_summary_ref,
+                terminal_summary_digest=self.closeout_input.terminal_summary_digest,
+            ),
+        )
+        _raise_for_terminal_transition_status(transition_result)
+        run = _require_transition_run(transition_result.run)
+        if transition_result.attempt is None:
+            raise HostApiError(
+                code=HostApiErrorCode.INTERNAL_ERROR,
+                message="Terminal closeout returned no Attempt",
+                retryable=False,
+            )
+        return _TerminalCloseoutTransactionResult(
+            run=run,
+            attempt=transition_result.attempt,
+            dispatch_record=transition_result.dispatch_record,
         )
 
 
@@ -1091,6 +1478,40 @@ def _idempotent_run_result(
     )
 
 
+def _idempotent_cancel_result(
+    transaction: HostTransaction, record: IdempotencyRecord
+) -> CancelRunResult:
+    """从幂等记录恢复 cancel_run 结果。
+
+    :param transaction: 当前 Host transaction。
+    :param record: 已持久化 cancel 幂等记录。
+    :returns: cancel 结果；幂等重放不再次触发 promotion。
+    :raises HostApiError: 结果类型错误或 Run 缺失时抛出。
+    """
+
+    if record.result_kind != _IDEMPOTENCY_RESULT_KIND_RUN:
+        raise HostApiError(
+            code=HostApiErrorCode.INTERNAL_ERROR,
+            message="Cancel idempotency record result kind is not run",
+            retryable=False,
+        )
+    run = read_run_by_id(transaction, record.result_ref)
+    if run is None:
+        raise HostApiError(
+            code=HostApiErrorCode.INTERNAL_ERROR,
+            message="Cancel idempotency record points to missing Run",
+            retryable=False,
+        )
+    return CancelRunResult(
+        run=run,
+        attempt=_read_current_attempt(transaction, run),
+        dispatch_record=_read_current_dispatch_record(transaction, run),
+        promotion=None,
+        idempotent_replay=True,
+        released_active_slot=False,
+    )
+
+
 def _read_current_attempt(
     transaction: HostTransaction, run: RunRow
 ) -> AttemptRow | None:
@@ -1173,6 +1594,20 @@ def _wake_dispatch_if_needed(
         wakeup_port.wake_dispatch(pending_dispatch)
 
 
+def _promote_after_release(
+    *, service: HostAdmissionService, session_id: str
+) -> PromotionResult:
+    """active slot 释放后在新事务中触发一次 queue promotion。
+
+    :param service: admission service。
+    :param session_id: 释放 active slot 的 Session id。
+    :returns: promotion 结果。
+    """
+
+    service.wakeup_port.wake_queue_promotion(session_id)
+    return service.promote_next_queued_run(session_id)
+
+
 def _require_transition_run(run: RunRow | None) -> RunRow:
     """断言 transition 返回 Run row。
 
@@ -1207,6 +1642,87 @@ def _require_transition_dispatch_record(
             retryable=False,
         )
     return dispatch_record
+
+
+def _require_event_sequence(
+    transaction: HostTransaction, event_id: str
+) -> int:
+    """按 event id 读取已追加 EventLog sequence。
+
+    :param transaction: 当前 Host transaction。
+    :param event_id: EventLog event id。
+    :returns: event sequence。
+    :raises HostApiError: event id 缺失或 sequence 类型异常时抛出。
+    """
+
+    row = transaction.fetchone(
+        "SELECT event_sequence FROM event_log WHERE event_id = ?",
+        (event_id,),
+    )
+    if row is None:
+        raise HostApiError(
+            code=HostApiErrorCode.INTERNAL_ERROR,
+            message="EventLog row is missing after append",
+            retryable=False,
+        )
+    value = row.get("event_sequence")
+    if not isinstance(value, int):
+        raise HostApiError(
+            code=HostApiErrorCode.INTERNAL_ERROR,
+            message="EventLog sequence is invalid",
+            retryable=False,
+        )
+    return value
+
+
+def _raise_for_cancel_transition_status(
+    result: DurableRunTransitionResult,
+) -> None:
+    """把 cancel transition status 映射为 API 错误。
+
+    :param result: cancel transition 结果。
+    :returns: ``None``。
+    :raises HostApiError: status 为 not_found/invalid_state/cas_lost 时抛出。
+    """
+
+    if result.status == StateMutationStatus.UPDATED:
+        return
+    if result.status == StateMutationStatus.NOT_FOUND:
+        raise HostApiError(
+            code=HostApiErrorCode.NOT_FOUND,
+            message="Run not found",
+            retryable=False,
+        )
+    raise HostApiError(
+        code=HostApiErrorCode.INVALID_STATE,
+        message="Run state is not cancellable in Phase 3 admission",
+        retryable=False,
+    )
+
+
+def _raise_for_terminal_transition_status(
+    result: DurableRunTransitionResult,
+) -> None:
+    """把 terminal transition status 映射为 API 错误。
+
+    :param result: terminal transition 结果。
+    :returns: ``None``。
+    :raises HostApiError: status 为 not_found/invalid_state/cas_lost 时抛出。
+    """
+
+    if result.status == StateMutationStatus.UPDATED:
+        return
+    if result.status == StateMutationStatus.NOT_FOUND:
+        raise HostApiError(
+            code=HostApiErrorCode.NOT_FOUND,
+            message="Run or Attempt not found",
+            retryable=False,
+        )
+    raise HostApiError(
+        code=HostApiErrorCode.INVALID_STATE,
+        message="Run or Attempt state is not terminal-closeout eligible in Phase 3",
+        retryable=False,
+    )
 
 
 def _promotion_skip_reason(skip_reason: str | None) -> PromotionSkipReason | None:
@@ -1270,6 +1786,64 @@ def _followup_queue_semantic_digest(
             "call_context_digest": _call_context_digest(request.context),
         }
     )
+
+
+def _cancel_run_semantic_digest(
+    request: CancelRunRequest, *, caller_semantic_digest: str
+) -> str:
+    """计算 cancel_run semantic digest。
+
+    :param request: cancel run 请求。
+    :param caller_semantic_digest: 调用方语义输入摘要。
+    :returns: ``sha256:<hex>`` digest。
+    """
+
+    return sha256_digest_json(
+        {
+            "operation": _OPERATION_CANCEL_RUN,
+            "reason": request.reason,
+            "mode": request.mode.value,
+            "caller_semantic_digest": caller_semantic_digest,
+            "call_context_digest": _call_context_digest(request.context),
+        }
+    )
+
+
+def _validate_closeout_attempt_terminal_input(
+    closeout_input: CloseoutAttemptTerminalInput,
+) -> None:
+    """校验 admission terminal closeout 输入。
+
+    :param closeout_input: 待校验 closeout 输入。
+    :returns: ``None``。
+    :raises ValueError: 字段为空、终态不是 Phase 3 支持集合或 Run/Attempt 不匹配时抛出。
+    """
+
+    _require_non_empty_text(closeout_input.run_id, field_name="run_id")
+    _require_non_empty_text(closeout_input.attempt_id, field_name="attempt_id")
+    allowed_pairs = (
+        (AttemptStatus.SUCCEEDED, RunStatus.SUCCEEDED),
+        (AttemptStatus.FAILED, RunStatus.FAILED),
+        (AttemptStatus.LOST, RunStatus.LOST),
+    )
+    pair = (
+        closeout_input.attempt_terminal_status,
+        closeout_input.run_terminal_status,
+    )
+    if pair not in allowed_pairs:
+        raise ValueError(
+            "terminal closeout supports only succeeded, failed or lost matched statuses"
+        )
+    if closeout_input.terminal_summary_digest is not None:
+        _require_sha256_digest(
+            closeout_input.terminal_summary_digest,
+            field_name="terminal_summary_digest",
+        )
+    if (
+        closeout_input.terminal_summary_ref is not None
+        and closeout_input.terminal_summary_ref.strip() == ""
+    ):
+        raise ValueError("terminal_summary_ref must be non-empty")
 
 
 def _input_digest(input_value: HostInput) -> str:

@@ -77,7 +77,7 @@ Host 公共 API 类型、construction tooling options 与内部 durable foundati
 - package exports：锁定 `dayu.host.__all__` 与 `dayu.host.api.__all__` 白名单，确认 tooling 类型可从包根导入但不进入 `dayu.host.api`。
 - public contracts：验证 status / error 枚举字符串值、frozen slots dataclass、结构化 `HostApiError` 与 request validation failure paths。
 - tooling options：验证 `ToolBundleSourceKind` / `FrameworkToolName` 为 `StrEnum`、默认 reserved framework tool policy、source refs 非空、业务 `ToolBundle` 不得占用 `fetch_more` 等 reserved framework tool name，以及 default policy view 不共享可变状态。
-- durable foundation / internal admission：覆盖 SQLite fresh bootstrap、schema version / table constraint、transaction runner commit / rollback / after-commit / busy retry、EventLog append / read / duplicate / conflict、idempotency record / conflict、payload descriptor、local artifact helper、host instance liveness、多进程 EventLog `event_sequence` 唯一递增 smoke、Session lifecycle、Run / Attempt transition primitive、start / follow-up admission、queue policy、idempotency 与 FIFO promotion。
+- durable foundation / internal admission：覆盖 SQLite fresh bootstrap、schema version / table constraint、transaction runner commit / rollback / after-commit / busy retry、EventLog append / read / duplicate / conflict、idempotency record / conflict、payload descriptor、local artifact helper、host instance liveness、多进程 EventLog `event_sequence` 唯一递增 smoke、Session lifecycle、Run / Attempt transition primitive、start / follow-up admission、queue policy、idempotency、FIFO promotion、queued / pre-dispatch cancel 与 terminal closeout。
 - import boundary：阻止 Host 公共类型层导入 Engine、Fins、Service 或 UI，并确认 business `ToolBundle` 不进入 per-run request dataclass 字段。
 - weak typing guard：通过 AST 扫描阻止 `Any`、`object`、无类型签名与裸容器注解进入 Host 公共类型源码。
 

@@ -13,14 +13,18 @@ from dayu.host.admission import (
     AdmissionClock,
     AdmissionIdFactory,
     AdmissionWakeupPort,
+    CloseoutAttemptTerminalInput,
     HostAdmissionService,
     PendingDispatchRecord,
     SubmitFollowupQueueAdmissionInput,
     create_host_admission_service,
 )
+from dayu.host import admission as admission_module
 from dayu.host.api import (
     AttemptStatus,
     AuthorizationClaim,
+    CancelMode,
+    CancelRunRequest,
     CloseSessionRequest,
     EnsureSessionRequest,
     FollowupBehavior,
@@ -46,10 +50,15 @@ from dayu.host.durable.run_transition import (
     TerminalCloseoutInput,
     terminal_closeout_in_transaction,
 )
+from dayu.host.durable.errors import HostDurableError
 from dayu.host.durable.session_lifecycle import close_session, ensure_session
 from dayu.host.durable.state import (
+    AttemptRow,
+    DispatchRecordRow,
     DispatchRecordStatus,
     RunRow,
+    read_attempt_by_id,
+    read_dispatch_record_by_attempt_id,
     read_run_by_id,
 )
 from dayu.host.durable.transaction import HostRow, HostTransaction, HostTransactionRunner
@@ -562,6 +571,332 @@ def test_promotion_skips_with_active_then_promotes_earliest_queued_run(
         assert len(spy.dispatches) == 2
 
 
+def test_cancel_queued_run_is_idempotent_and_creates_no_attempt(
+    tmp_path: Path,
+) -> None:
+    """queued cancel 写 cancel facts，不创建 Attempt，重复请求不追加事件。"""
+
+    with open_host_durable_store(_options(tmp_path)) as store:
+        session_id = _ensure_session_id(store.transaction_runner)
+        service = _service(store.transaction_runner)
+        service.start_run(
+            _start_request(session_id=session_id, client_request_id="start-active"),
+            caller_semantic_digest=_CALLER_DIGEST,
+        )
+        queued = service.submit_followup_queue(
+            SubmitFollowupQueueAdmissionInput(
+                request=_followup_request(
+                    session_id=session_id,
+                    client_request_id="follow-cancel-queued",
+                ),
+                resolved_execution_target="queued-target",
+            ),
+            caller_semantic_digest=_CALLER_DIGEST,
+        )
+        before_retry = 0
+
+        first = service.cancel_run(
+            queued.run.run_id,
+            _cancel_request("cancel-queued"),
+            caller_semantic_digest=_CALLER_DIGEST,
+        )
+        before_retry = _event_count(store.transaction_runner)
+        second = service.cancel_run(
+            queued.run.run_id,
+            _cancel_request("cancel-queued"),
+            caller_semantic_digest=_CALLER_DIGEST,
+        )
+        record = _idempotency_record(
+            store.transaction_runner,
+            scope_kind="cancel_run",
+            scope_id=queued.run.run_id,
+            key="cancel-queued",
+        )
+
+        assert first.run.status == RunStatus.CANCELLED
+        assert first.attempt is None
+        assert first.dispatch_record is None
+        assert first.promotion is None
+        assert second.idempotent_replay is True
+        assert second.run.run_id == queued.run.run_id
+        assert _event_count(store.transaction_runner) == before_retry
+        assert _count_rows(store.transaction_runner, "host_attempts") == 1
+        assert _event_types_for_run(store.transaction_runner, queued.run.run_id) == (
+            "USER_INPUT_ACCEPTED",
+            "RUN_ACCEPTED",
+            "RUN_QUEUED",
+            "CANCEL_REQUESTED",
+            "RUN_CANCELLED",
+        )
+        assert _text(record, "created_event_id") is not None
+
+
+def test_cancel_predispatch_starting_promotes_exactly_one_queued_run(
+    tmp_path: Path,
+) -> None:
+    """active pre-dispatch cancel 取消 dispatch/Attempt/Run 后新事务 promotion 一条队列。"""
+
+    with open_host_durable_store(_options(tmp_path)) as store:
+        session_id = _ensure_session_id(store.transaction_runner)
+        spy = _WakeupSpy()
+        service = _service(store.transaction_runner, spy=spy)
+        active = service.start_run(
+            _start_request(session_id=session_id, client_request_id="start-active"),
+            caller_semantic_digest=_CALLER_DIGEST,
+        )
+        first_queued = service.submit_followup_queue(
+            SubmitFollowupQueueAdmissionInput(
+                request=_followup_request(
+                    session_id=session_id,
+                    client_request_id="follow-first",
+                    display_text="first queued",
+                ),
+                resolved_execution_target="first-target",
+            ),
+            caller_semantic_digest=_CALLER_DIGEST,
+        )
+        second_queued = service.submit_followup_queue(
+            SubmitFollowupQueueAdmissionInput(
+                request=_followup_request(
+                    session_id=session_id,
+                    client_request_id="follow-second",
+                    display_text="second queued",
+                ),
+                resolved_execution_target="second-target",
+            ),
+            caller_semantic_digest=_CALLER_DIGEST,
+        )
+        assert active.attempt is not None
+        assert active.dispatch_record is not None
+
+        result = service.cancel_run(
+            active.run.run_id,
+            _cancel_request("cancel-active"),
+            caller_semantic_digest=_CALLER_DIGEST,
+        )
+        active_attempt = _read_attempt(
+            store.transaction_runner, active.attempt.attempt_id
+        )
+        active_dispatch = _read_dispatch_record(
+            store.transaction_runner,
+            active.dispatch_record.attempt_id,
+        )
+
+        assert result.run.status == RunStatus.CANCELLED
+        assert result.attempt is not None
+        assert result.attempt.status == AttemptStatus.CANCELLED
+        assert result.dispatch_record is not None
+        assert result.dispatch_record.status == DispatchRecordStatus.CANCELLED
+        assert active_attempt.status == AttemptStatus.CANCELLED
+        assert active_dispatch.status == DispatchRecordStatus.CANCELLED
+        assert result.promotion is not None
+        assert result.promotion.promoted_run is not None
+        assert result.promotion.promoted_run.run_id == first_queued.run.run_id
+        assert _read_run(store.transaction_runner, second_queued.run.run_id).status == (
+            RunStatus.QUEUED
+        )
+        assert spy.promotions == [session_id]
+        assert len(spy.dispatches) == 2
+
+
+def test_terminal_closeout_promotes_exactly_one_queued_run_after_commit(
+    tmp_path: Path,
+) -> None:
+    """terminal closeout 释放 active slot 后在新事务中 promotion 一条 queued Run。"""
+
+    with open_host_durable_store(_options(tmp_path)) as store:
+        session_id = _ensure_session_id(store.transaction_runner)
+        spy = _WakeupSpy()
+        service = _service(store.transaction_runner, spy=spy)
+        active = service.start_run(
+            _start_request(session_id=session_id, client_request_id="start-active"),
+            caller_semantic_digest=_CALLER_DIGEST,
+        )
+        assert active.attempt is not None
+        first_queued = service.submit_followup_queue(
+            SubmitFollowupQueueAdmissionInput(
+                request=_followup_request(
+                    session_id=session_id,
+                    client_request_id="follow-terminal-first",
+                ),
+                resolved_execution_target="first-target",
+            ),
+            caller_semantic_digest=_CALLER_DIGEST,
+        )
+        second_queued = service.submit_followup_queue(
+            SubmitFollowupQueueAdmissionInput(
+                request=_followup_request(
+                    session_id=session_id,
+                    client_request_id="follow-terminal-second",
+                ),
+                resolved_execution_target="second-target",
+            ),
+            caller_semantic_digest=_CALLER_DIGEST,
+        )
+
+        result = service.closeout_attempt_terminal(
+            CloseoutAttemptTerminalInput(
+                run_id=active.run.run_id,
+                attempt_id=active.attempt.attempt_id,
+                attempt_terminal_status=AttemptStatus.SUCCEEDED,
+                run_terminal_status=RunStatus.SUCCEEDED,
+                terminal_summary_ref=None,
+                terminal_summary_digest=None,
+            )
+        )
+
+        assert result.run.status == RunStatus.SUCCEEDED
+        assert result.attempt.status == AttemptStatus.SUCCEEDED
+        assert result.promotion.promoted_run is not None
+        assert result.promotion.promoted_run.run_id == first_queued.run.run_id
+        assert _read_run(store.transaction_runner, second_queued.run.run_id).status == (
+            RunStatus.QUEUED
+        )
+        assert spy.promotions == [session_id]
+        assert len(spy.dispatches) == 2
+
+
+def test_cancel_terminal_run_returns_invalid_state_without_new_facts(
+    tmp_path: Path,
+) -> None:
+    """terminal Run 的后续 cancel 不能重写 terminal fact。"""
+
+    with open_host_durable_store(_options(tmp_path)) as store:
+        session_id = _ensure_session_id(store.transaction_runner)
+        service = _service(store.transaction_runner)
+        active = service.start_run(
+            _start_request(session_id=session_id, client_request_id="start-active"),
+            caller_semantic_digest=_CALLER_DIGEST,
+        )
+        assert active.attempt is not None
+        service.closeout_attempt_terminal(
+            CloseoutAttemptTerminalInput(
+                run_id=active.run.run_id,
+                attempt_id=active.attempt.attempt_id,
+                attempt_terminal_status=AttemptStatus.SUCCEEDED,
+                run_terminal_status=RunStatus.SUCCEEDED,
+                terminal_summary_ref=None,
+                terminal_summary_digest=None,
+            )
+        )
+        before = _event_count(store.transaction_runner)
+
+        with pytest.raises(HostApiError) as exc_info:
+            service.cancel_run(
+                active.run.run_id,
+                _cancel_request("cancel-terminal"),
+                caller_semantic_digest=_CALLER_DIGEST,
+            )
+
+        assert exc_info.value.code == HostApiErrorCode.INVALID_STATE
+        assert _event_count(store.transaction_runner) == before
+        assert _read_run(store.transaction_runner, active.run.run_id).status == (
+            RunStatus.SUCCEEDED
+        )
+
+
+def test_cancel_attempt_running_is_phase3_invalid_state_without_side_effects(
+    tmp_path: Path,
+) -> None:
+    """Attempt RUNNING cancel 属于后续 worker cancel propagation，Phase 3 返回 invalid_state。"""
+
+    with open_host_durable_store(_options(tmp_path)) as store:
+        session_id = _ensure_session_id(store.transaction_runner)
+        service = _service(store.transaction_runner)
+        active = service.start_run(
+            _start_request(session_id=session_id, client_request_id="start-active"),
+            caller_semantic_digest=_CALLER_DIGEST,
+        )
+        assert active.attempt is not None
+        _force_attempt_status(
+            store.transaction_runner,
+            attempt_id=active.attempt.attempt_id,
+            status=AttemptStatus.RUNNING,
+        )
+        before = _event_count(store.transaction_runner)
+
+        with pytest.raises(HostApiError) as exc_info:
+            service.cancel_run(
+                active.run.run_id,
+                _cancel_request("cancel-running-attempt"),
+                caller_semantic_digest=_CALLER_DIGEST,
+            )
+
+        assert exc_info.value.code == HostApiErrorCode.INVALID_STATE
+        assert _event_count(store.transaction_runner) == before
+        assert _read_run(store.transaction_runner, active.run.run_id).status == (
+            RunStatus.RUNNING
+        )
+
+
+def test_rollback_before_cancel_commit_does_not_wake_or_promote(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """cancel transaction rollback 时不执行 wakeup，也不在新事务 promotion。"""
+
+    with open_host_durable_store(_options(tmp_path)) as store:
+        session_id = _ensure_session_id(store.transaction_runner)
+        spy = _WakeupSpy()
+        service = _service(store.transaction_runner, spy=spy)
+        active = service.start_run(
+            _start_request(session_id=session_id, client_request_id="start-active"),
+            caller_semantic_digest=_CALLER_DIGEST,
+        )
+        queued = service.submit_followup_queue(
+            SubmitFollowupQueueAdmissionInput(
+                request=_followup_request(
+                    session_id=session_id,
+                    client_request_id="follow-rollback",
+                ),
+                resolved_execution_target="queued-target",
+            ),
+            caller_semantic_digest=_CALLER_DIGEST,
+        )
+        original_cancel = admission_module.cancel_predispatch_starting_in_transaction
+
+        def fail_after_transition(
+            transaction: HostTransaction,
+            event_log_store: EventLogStore,
+            request: admission_module.CancelPredispatchStartingInput,
+        ) -> admission_module.DurableRunTransitionResult:
+            """执行真实 cancel 后抛错，模拟 commit 前失败。
+
+            :param transaction: Host transaction。
+            :param event_log_store: EventLog store。
+            :param request: cancel pre-dispatch 输入。
+            :returns: 不返回，签名保持与被替换函数一致。
+            :raises HostDurableError: 总是抛出以触发 rollback。
+            """
+
+            original_cancel(transaction, event_log_store, request)
+            raise HostDurableError("forced rollback")
+
+        monkeypatch.setattr(
+            admission_module,
+            "cancel_predispatch_starting_in_transaction",
+            fail_after_transition,
+        )
+
+        with pytest.raises(HostDurableError):
+            service.cancel_run(
+                active.run.run_id,
+                _cancel_request("cancel-rollback"),
+                caller_semantic_digest=_CALLER_DIGEST,
+            )
+
+        assert spy.promotions == []
+        assert len(spy.dispatches) == 1
+        assert _read_run(store.transaction_runner, active.run.run_id).status == (
+            RunStatus.RUNNING
+        )
+        assert _read_run(store.transaction_runner, queued.run.run_id).status == (
+            RunStatus.QUEUED
+        )
+        assert "CANCEL_REQUESTED" not in _event_types_for_run(
+            store.transaction_runner, active.run.run_id
+        )
+
+
 def test_concurrent_promotion_attempts_promote_at_most_one_run(
     tmp_path: Path,
 ) -> None:
@@ -748,6 +1083,21 @@ def _close_request(client_request_id: str) -> CloseSessionRequest:
     )
 
 
+def _cancel_request(client_request_id: str) -> CancelRunRequest:
+    """构造 cancel run 请求。
+
+    :param client_request_id: 幂等请求 id。
+    :returns: CancelRunRequest。
+    """
+
+    return CancelRunRequest(
+        context=_context(),
+        client_request_id=client_request_id,
+        reason="user_cancel",
+        mode=CancelMode.GRACEFUL,
+    )
+
+
 def _closeout_active(
     transaction_runner: HostTransactionRunner, run_id: str
 ) -> None:
@@ -785,6 +1135,83 @@ def _closeout_active(
                 terminal_summary_ref=None,
                 terminal_summary_digest=None,
             ),
+        )
+
+    transaction_runner.run_write(operation)
+
+
+def _read_attempt(
+    transaction_runner: HostTransactionRunner, attempt_id: str
+) -> AttemptRow:
+    """读取 Attempt row。
+
+    :param transaction_runner: Host transaction runner。
+    :param attempt_id: Attempt id。
+    :returns: Attempt row。
+    """
+
+    def operation(transaction: HostTransaction) -> AttemptRow:
+        """读取 Attempt row。
+
+        :param transaction: Host transaction。
+        :returns: Attempt row。
+        """
+
+        attempt = read_attempt_by_id(transaction, attempt_id)
+        assert attempt is not None
+        return attempt
+
+    return transaction_runner.run_write(operation)
+
+
+def _read_dispatch_record(
+    transaction_runner: HostTransactionRunner, attempt_id: str
+) -> DispatchRecordRow:
+    """读取 Attempt dispatch record。
+
+    :param transaction_runner: Host transaction runner。
+    :param attempt_id: Attempt id。
+    :returns: DispatchRecordRow。
+    """
+
+    def operation(transaction: HostTransaction) -> DispatchRecordRow:
+        """读取 dispatch record。
+
+        :param transaction: Host transaction。
+        :returns: dispatch record。
+        """
+
+        dispatch_record = read_dispatch_record_by_attempt_id(transaction, attempt_id)
+        assert dispatch_record is not None
+        return dispatch_record
+
+    return transaction_runner.run_write(operation)
+
+
+def _force_attempt_status(
+    transaction_runner: HostTransactionRunner,
+    *,
+    attempt_id: str,
+    status: AttemptStatus,
+) -> None:
+    """测试内强制修改 Attempt 状态以构造 Phase 3 unsupported state。
+
+    :param transaction_runner: Host transaction runner。
+    :param attempt_id: Attempt id。
+    :param status: 目标 Attempt 状态。
+    :returns: ``None``。
+    """
+
+    def operation(transaction: HostTransaction) -> None:
+        """写入 Attempt 状态。
+
+        :param transaction: Host transaction。
+        :returns: ``None``。
+        """
+
+        transaction.execute(
+            "UPDATE host_attempts SET status = ? WHERE attempt_id = ?",
+            (status.value, attempt_id),
         )
 
     transaction_runner.run_write(operation)

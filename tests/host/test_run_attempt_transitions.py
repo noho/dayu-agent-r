@@ -388,6 +388,133 @@ def test_terminal_closeout_appends_concrete_terminal_events(
         assert "RUN_TERMINAL" not in event_types
 
 
+@pytest.mark.parametrize(
+    ("attempt_status", "run_status", "attempt_event_type", "run_event_type"),
+    (
+        (
+            AttemptStatus.FAILED,
+            RunStatus.FAILED,
+            "ATTEMPT_FAILED",
+            "RUN_FAILED",
+        ),
+        (
+            AttemptStatus.LOST,
+            RunStatus.LOST,
+            "ATTEMPT_LOST",
+            "RUN_LOST",
+        ),
+    ),
+)
+def test_terminal_closeout_supports_failure_and_lost_facts(
+    tmp_path: Path,
+    attempt_status: AttemptStatus,
+    run_status: RunStatus,
+    attempt_event_type: str,
+    run_event_type: str,
+) -> None:
+    """terminal helper 支持 failed/lost 具体 terminal facts。"""
+
+    with open_host_durable_store(_options(tmp_path)) as store:
+        seeded = _seed_running_run(store, tmp_path)
+
+        def closeout(transaction: HostTransaction) -> tuple[str, str, tuple[str, ...]]:
+            """按参数执行 terminal closeout。
+
+            :param transaction: Host transaction。
+            :returns: Run 状态、Attempt 状态与事件类型序列。
+            """
+
+            result = terminal_closeout_in_transaction(
+                transaction,
+                EventLogStore(),
+                TerminalCloseoutInput(
+                    run_id=seeded.run_id,
+                    attempt_id=seeded.attempt_id,
+                    attempt_terminal_event_id=f"event-attempt-{attempt_status.value}",
+                    run_terminal_event_id=f"event-run-{run_status.value}",
+                    attempt_terminal_status=attempt_status,
+                    run_terminal_status=run_status,
+                    occurred_at=_NOW,
+                    actor="analyst",
+                    source="pytest",
+                    reason="phase3_internal_closeout",
+                    terminal_summary_ref=None,
+                    terminal_summary_digest=None,
+                ),
+            )
+            assert result.run is not None
+            assert result.attempt is not None
+            return (
+                result.run.status.value,
+                result.attempt.status.value,
+                _event_types(transaction),
+            )
+
+        run_value, attempt_value, event_types = store.transaction_runner.run_write(
+            closeout
+        )
+        assert run_value == run_status.value
+        assert attempt_value == attempt_status.value
+        assert attempt_event_type in event_types
+        assert run_event_type in event_types
+
+
+def test_terminal_closeout_rejects_attempt_running_in_phase3(
+    tmp_path: Path,
+) -> None:
+    """Attempt RUNNING terminal closeout 在 Phase 3 返回 invalid_state。"""
+
+    with open_host_durable_store(_options(tmp_path)) as store:
+        seeded = _seed_running_run(store, tmp_path)
+
+        def force_running(transaction: HostTransaction) -> None:
+            """强制 Attempt 进入 RUNNING 构造后续 phase 才支持的状态。
+
+            :param transaction: Host transaction。
+            :returns: ``None``。
+            """
+
+            transaction.execute(
+                "UPDATE host_attempts SET status = ? WHERE attempt_id = ?",
+                (AttemptStatus.RUNNING.value, seeded.attempt_id),
+            )
+
+        store.transaction_runner.run_write(force_running)
+
+        def closeout(transaction: HostTransaction) -> tuple[str, str]:
+            """尝试关闭 Attempt RUNNING。
+
+            :param transaction: Host transaction。
+            :returns: transition status 与 Attempt 当前状态。
+            """
+
+            result = terminal_closeout_in_transaction(
+                transaction,
+                EventLogStore(),
+                TerminalCloseoutInput(
+                    run_id=seeded.run_id,
+                    attempt_id=seeded.attempt_id,
+                    attempt_terminal_event_id="event-attempt-running-terminal",
+                    run_terminal_event_id="event-run-running-terminal",
+                    attempt_terminal_status=AttemptStatus.SUCCEEDED,
+                    run_terminal_status=RunStatus.SUCCEEDED,
+                    occurred_at=_NOW,
+                    actor="analyst",
+                    source="pytest",
+                    reason="phase3_internal_closeout",
+                    terminal_summary_ref=None,
+                    terminal_summary_digest=None,
+                ),
+            )
+            assert result.attempt is not None
+            return result.status.value, result.attempt.status.value
+
+        assert store.transaction_runner.run_write(closeout) == (
+            StateMutationStatus.INVALID_STATE.value,
+            AttemptStatus.RUNNING.value,
+        )
+
+
 def test_promote_cas_loser_keeps_queued_state(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
