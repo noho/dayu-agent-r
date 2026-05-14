@@ -64,12 +64,191 @@ Host 内部模块边界：
 
 当前 Host 设计需要记录的 runtime / external assembly 基础组件：
 
-- `lane`：层中立 named semaphore，用于业务并发、LLM 并发或其它非真源资源容量治理。lane 只表达具名容量，不表达 Session / Run / Attempt owner，不替代 Host admission、SQLite transaction、CAS 状态迁移或 EventLog ordering。LLM lane acquire 是可取消的耗时操作；调用方 / supervisor 退出时必须同时触发 Host cancel 与 lane cancel，避免等待 acquire 或已持有容量的 dispatch guard 悬挂。Host 如何使用 lane 控制 LLM 并发的细节属于后续 phase design。
-- `filelock`：`dayu.runtime.filelock` 对 `from filelock import FileLock` 的统一封装，用于多进程访问普通文件时的互斥保护。filelock 不能表达 Host durable truth、EventLog ordering、Run / Attempt owner，也不能兜底数据库事务。
+- `lane`：层中立 cross-process named semaphore / capacity guard，用于单机多客户端 / 多进程下的业务并发、LLM 并发或其它非真源资源容量治理。lane 只表达资源容量，不表达 Session / Run / Attempt owner，不替代 Host admission、SQLite transaction、CAS 状态迁移、EventLog ordering、fencing token、Attempt takeover 或 recovery proof。LLM lane acquire 是可取消的耗时操作；调用方 / supervisor 退出时必须同时触发 Host cancel 与 lane cancel，避免等待 acquire 或已持有容量的 dispatch guard 悬挂。Host 如何使用 lane 控制 LLM 并发的细节属于后续 phase design。
+- `filelock`：`dayu.runtime.filelock` 对 `from filelock import FileLock` 的同步统一封装，用于多进程访问普通文件时的互斥保护。filelock 不能表达 Host durable truth、EventLog ordering、Run / Attempt owner，也不能兜底数据库事务。
 - `ToolsDiscovery`：暂定名，独立于 Host 的工具发现 / 注册组件。它收集工具声明、provider 或配置绑定，生成业务 `ToolBundle` 并作为显式参数传给 Host。Host 不做工具发现、模块扫描或注册生命周期管理。若放入 `dayu.runtime`，它只能依赖 `dayu.contracts` 与标准库，不得 import 具体业务工具包；具体 provider 由外部装配传入。
 - `ScenePrepare`：独立于 Host 的场景准备组件。它根据 scene manifest 组装 system prompt 与场景约束，产出可由 Service / Host request envelope 显式传入的 typed scene inputs。Host 不从 scene manifest 自行拼业务 prompt，也不把场景规则写进 Host 状态机。若放入 `dayu.runtime`，它只能是通用 manifest assembly helper；具体财报 scene manifest、业务 prompt 文案和场景策略属于 Service / 业务配置，不属于 runtime。
 
 这些组件服务 Host 装配，但不提升为 Host 治理真源。Host 真源仍是 Session / Run / Attempt / EventLog 与同事务状态索引。
+
+Phase 1 的 runtime 实施范围只包括 `lane` 与 `filelock` 的层中立基础能力，以及 Host construction input 中对外部 `ToolBundle` 的 typed 边界。`ToolsDiscovery` / `ScenePrepare` 在 Phase 1 只固定 import boundary 与责任边界，不落地具体 adapter、manifest schema、业务工具扫描、财报 prompt 组装或 provider 注册生命周期；这些能力若需要代码实现，必须作为独立后续 phase 进入 design refinement。
+
+### 3.1 `dayu.runtime.lane`
+
+`dayu.runtime.lane` 第一版是层中立、cross-process 的 async named semaphore / capacity guard primitive。它用于单机多客户端 / 多进程下对 LLM provider 调用、外部 API 调用、CPU / IO worker 等非真源资源做容量保护。它提供同一机器、同一 runtime lane coordinator 下的跨进程容量计数；跨进程 Host admission、Run / Attempt owner、EventLog ordering、SQLite CAS、fencing token、Attempt takeover 和 positive orphan proof 仍属于 Host durable store / Host 状态机 / recovery phase。
+
+第一版 coordinator 使用独立 runtime SQLite 文件实现，原因是：
+
+- 单机多进程容量计数需要原子 compare-and-claim；普通内存 semaphore 不满足项目目标。
+- SQLite 是 Python 3.11 标准库能力，可用短事务表达跨进程 claim / release，不引入业务层依赖。
+- 该 SQLite 文件是 `dayu.runtime.lane` 的资源容量协调器，不是 Host durable store；不得复用 Host EventLog / state index 数据库，也不得被 Host recovery 当作 truth。
+- `dayu.runtime.filelock` 可作为普通文件互斥 wrapper，但不能提供 capacity claim 的可查询状态、TTL cleanup 和原子计数，因此不作为 lane 第一版 coordinator。
+
+第一版 public API shape：
+
+```text
+@dataclass(frozen=True, slots=True)
+LaneConfig
+  name: str
+  capacity: int
+  default_timeout_seconds?: float
+  claim_ttl_seconds: float
+  heartbeat_interval_seconds: float
+
+@dataclass(frozen=True, slots=True)
+LaneOwner
+  owner_id: str
+  pid: int
+  process_start_token?: str
+
+@dataclass(frozen=True, slots=True)
+SQLiteLaneCoordinatorConfig
+  db_path: Path
+  create_parent_dirs: bool = true
+  busy_timeout_seconds: float
+  poll_interval_seconds: float
+
+@dataclass(slots=True)
+LaneClaimToken
+  name: str
+  claim_id: str
+  owner: LaneOwner
+  expires_at: datetime
+  refresh() -> Awaitable[None]
+  release() -> Awaitable[None]
+  released: bool
+
+@dataclass(frozen=True, slots=True)
+LaneAcquired
+  token: LaneClaimToken
+
+@dataclass(frozen=True, slots=True)
+LaneAcquireCancelled
+  reason?: str
+
+@dataclass(frozen=True, slots=True)
+LaneAcquireTimedOut
+  elapsed_seconds: float
+
+LaneAcquireOutcome = LaneAcquired | LaneAcquireCancelled | LaneAcquireTimedOut
+
+LaneController
+  open(configs: Sequence[LaneConfig], *, coordinator: SQLiteLaneCoordinatorConfig, owner?: LaneOwner) -> LaneController
+  acquire(name: str, *, token?: CancellationToken, timeout_seconds?: float) -> Awaitable[LaneAcquireOutcome]
+  close(reason?: str) -> Awaitable[None]
+```
+
+`LaneConfig.name` 必须非空，`capacity` 必须为正整数。`claim_ttl_seconds` 必须大于 `heartbeat_interval_seconds`，且二者都必须为正数。重复 lane name、未知 lane name、非正 capacity、非法 TTL / heartbeat 属于配置错误，必须在 controller construction 或 acquire 前以结构化 runtime error 暴露。Phase 1 不要求全局 registry；调用方显式持有 `LaneController`，避免模块级隐式单例。
+
+Coordinator / store / lock 选择和注入方式：
+
+- `LaneController.open(...)` 必须显式接收 `SQLiteLaneCoordinatorConfig`；调用方传入独立 runtime lane DB 路径，例如 workspace runtime 目录下的 `runtime_lanes.sqlite3`。
+- `db_path` 不得默认为 Host durable store 路径，不得从 Host package 读取配置，也不得通过模块级全局 singleton 隐式创建。
+- coordinator schema 只允许保存 lane capacity coordination 所需的 rows，例如 lane name、claim id、owner id、pid、process start token、created_at、heartbeat_at、expires_at。不得保存 Session / Run / Attempt / EventLog / Tool / 财报业务字段。
+- SQLite transaction 只保护 runtime capacity claim 的原子计数和 release；它不是 Host transaction、不能兜底 Host state machine，也不能被任何层解释为 resource fencing。
+- `busy_timeout_seconds` 只限制 runtime coordinator SQLite busy 等待；Host command path SQLite busy policy 属于 Host durable store，不由 runtime lane 决定。
+
+Acquire / release 生命周期：
+
+- `acquire()` 成功时，coordinator 在短事务内先清理同一 lane 中 `expires_at <= now` 的 stale claims，再在 active claim 数量小于 capacity 时插入一条新 claim，返回 `LaneAcquired(token=LaneClaimToken(...))`。
+- `claim_id` 必须是不可猜测的随机 id；`owner` 默认由 runtime 根据当前进程生成，也允许上层显式传入稳定 owner id。owner identity 只用于 runtime cleanup / diagnostics，不是 Host owner。
+- 只有持有 `LaneClaimToken` 才表示当前 owner 占用了一个 lane 容量。token id 只标识 runtime capacity claim，不得传入 Host EventLog 作为 canonical identity。
+- `LaneClaimToken.release()` 必须异步、幂等，并在短事务内按 `(lane_name, claim_id, owner_id)` 删除 claim；重复 release 不得影响其它 owner 的 claim。
+- token 持有期间必须定期 heartbeat / refresh，延长 `expires_at`。第一版可以由 `LaneController` 为本进程持有的 tokens 启动 heartbeat task，也可以由 token context helper 驱动；无论实现方式，heartbeat failure 必须让 token 进入不可继续使用的 released / lost 状态，并触发调用方可观测错误或取消。
+- 调用方必须用 `try/finally` 或 runtime 提供的 async context helper 持有 token，确保工作完成、失败、取消或 shutdown 时释放容量。
+- 第一版以 token 模型为必须实现的 public primitive；可额外提供 async context manager helper，但它只能包裹同一 token acquire / release 语义，不能引入第二套生命周期。
+
+Cancellation / shutdown：
+
+- 等待 acquire 必须可取消：外层 `asyncio.Task.cancel()` 必须透传 `asyncio.CancelledError`，不得吞掉取消；如果传入 `CancellationToken` 且 token 在等待期间命中，返回 `LaneAcquireCancelled(reason=...)`，不得创建 claim。
+- `timeout_seconds=None` 表示不设置 acquire timeout；`timeout_seconds=0` 表示 non-blocking acquire；正数表示最多等待对应秒数。timeout 命中返回 `LaneAcquireTimedOut`，不得占用容量。
+- cancellation 与 timeout 同时命中时 cancellation 优先，返回 `LaneAcquireCancelled`。
+- 等待 acquire 的轮询必须通过 SQLite 短事务重试；不得在一个长事务里等待容量释放。
+- `LaneController.close(reason=...)` 用于 supervisor shutdown：它停止接受新 acquire，唤醒仍在等待的 acquire 返回 `LaneAcquireCancelled`，并尝试 release 当前 controller 持有且尚未 release 的 tokens。owner task 仍必须在 `finally` / context manager 中 release；close 的 best-effort release 不能替代 owner task cleanup。
+- runtime primitive 不追踪 Host Run / Attempt，因此不能根据 Host cancel 自动释放 token。Host dispatch usage 必须在后续 phase 通过 owner task cancellation 和 durable recheck 组合完成。
+
+Stale owner / timeout handling：
+
+- 如果进程崩溃或 owner task 未能 release，claim 最多占用到 `expires_at`；后续 acquire 会在事务内清理 expired claims。
+- stale cleanup 只释放 runtime capacity，不能证明 Host Attempt orphan，不能驱动 Host recovery，不能写 EventLog。
+- heartbeat / TTL 不是 lease / fencing。即使某个 expired claim 被清理，也不授权旧 worker takeover，也不证明旧 side effect 已停止。
+- clock 使用 runtime injected / stdlib monotonic-to-wall strategy 必须保证同一 process 内 TTL 计算一致；跨进程 clock skew 只能影响 resource capacity availability，不能影响 Host truth。
+
+Fairness / ordering / non-goals：
+
+- 第一版不承诺 FIFO、公平性、优先级、权重、队列可观测性或跨 lane ordering；测试不得断言 acquire 顺序。
+- 第一版不实现分布式跨机器 rate limit、provider quota accounting、resource cost weighting、fencing token、Attempt takeover、Host recovery proof 或 capacity ownership diagnostics beyond runtime claims。
+- lane token 不是 Host truth、不是 lease、不是 fencing token、不是 Attempt owner、不是 dispatch record 状态。
+- acquire 成功只表示当前 owner 在 runtime coordinator 中拿到资源容量；执行任何副作用前，Host 后续 dispatch phase 仍必须在短事务内 recheck durable precondition。
+
+Multi-process tests:
+
+- 两个及以上独立 Python 进程使用同一个 lane DB 和同一 lane name 时，总并发 successful claims 不得超过 capacity。
+- 一个进程持有 claim 时，另一个进程 `timeout_seconds=0` acquire 同 lane 且 capacity 已满必须返回 timed out。
+- 持有 claim 的进程正常 release 后，另一个进程可以 acquire。
+- 持有 claim 的进程崩溃或不 heartbeat 后，另一个进程在 TTL 过期并清理 stale claim 后可以 acquire。
+- 多进程竞争不能依赖 acquire ordering；测试只断言 capacity invariant 和 eventual acquire / timeout。
+
+Import boundary：`dayu.runtime.lane` 只能依赖标准库（包括 `sqlite3`）、`dayu.contracts.cancellation.CancellationToken` 和同包层中立 helper；不得 import `dayu.engine` / `dayu.host` / `dayu.service` / `dayu.ui` / `dayu.fins`，不得持有财报、Host、Engine 或具体 provider 语义。
+
+Phase 1 只实现该 runtime primitive 及其单元测试，不实现 Host dispatch 对 lane 的使用，不实现 LLM provider policy，不修改 Host durable state machine。
+
+### 3.2 `dayu.runtime.filelock`
+
+`dayu.runtime.filelock` 第一版是对第三方 `filelock.FileLock` 的同步 wrapper，用于普通文件访问互斥，例如单进程 / 多进程对 JSONL、临时 artifact 或其它普通文件的短临界区保护。它不能用于 SQLite transaction、EventLog ordering、Host durable truth、Run / Attempt owner、lease / fencing 或 recovery 判断。
+
+第一版 public API shape：
+
+```text
+@dataclass(frozen=True, slots=True)
+RuntimeFileLockOptions
+  lock_path: Path
+  timeout_seconds?: float
+  create_parent_dirs: bool = true
+
+@dataclass(slots=True)
+RuntimeFileLockToken
+  lock_path: Path
+  release() -> None
+  released: bool
+
+RuntimeFileLock
+  acquire(timeout_seconds?: float) -> RuntimeFileLockToken
+  __enter__() -> RuntimeFileLockToken
+  __exit__(exc_type, exc, tb) -> None
+
+file_lock(lock_path: str | Path, *, timeout_seconds?: float, create_parent_dirs: bool = true) -> RuntimeFileLock
+```
+
+Sync / async 边界：
+
+- Phase 1 只提供同步 wrapper。它不提供 async file lock context manager，也不在线程池中替调用方隐藏阻塞 acquire。
+- async 调用方如需使用 file lock，必须在自己的边界显式决定是否放入 executor，或保证临界区足够短且不会阻塞事件循环关键路径。
+
+Path handling / directory creation：
+
+- `lock_path` 是显式 lock file 路径，不从业务文件路径隐式派生，避免调用方误判保护范围。
+- wrapper 必须把 `str | Path` 归一化为 `Path`，并在 `create_parent_dirs=True` 时创建 lock file 的 parent directory。
+- `create_parent_dirs=False` 且 parent directory 不存在时，必须返回 / 抛出结构化 runtime file lock error，不得静默退化。
+
+Timeout / error semantics：
+
+- `timeout_seconds=None` 表示等待第三方 `FileLock` 默认的无限等待语义；`timeout_seconds=0` 表示 non-blocking acquire；正数表示最多等待对应秒数。
+- 第三方 `filelock.Timeout` 必须被包装为 runtime 自己的 timeout error，避免上层散落直接依赖第三方异常类型。
+- lock acquire 失败、路径非法、parent directory 创建失败等必须归一为 runtime file lock error；不得吞异常后让调用方误以为已进入临界区。
+
+Stale lock / reentrancy / release：
+
+- 第一版不实现 stale lock 探测、锁文件删除、owner pid 解析、跨进程 owner takeover 或强制 break lock。发现疑似 stale lock 时只能 timeout / error，由调用方或运维路径处理。
+- lock marker 文件只属于第三方文件锁实现细节和普通文件互斥可见痕迹，不是 Host 治理真源。Host 不得用 marker 文件存在性判断 Run / Attempt owner、worker liveness、lease / fencing、EventLog ordering、recovery 或 takeover 条件；这些事实只能来自 Host durable store、EventLog、状态索引和事务。
+- wrapper 不承诺 reentrant lock 语义是设计意图，不是待补能力。调用方不得依赖同一线程 / 同一进程 / 同一 `RuntimeFileLock` 实例重复 acquire 的成功、失败、计数或 token 复用行为；测试不应断言第三方库的 reentrant 细节。
+- `RuntimeFileLockToken.release()` 必须幂等；重复 release 不得抛出误导性错误，也不得释放其它 token。
+- context manager 退出必须 release；异常路径也必须 release。
+
+第三方依赖边界：
+
+- 只有 `dayu.runtime.filelock` 可以直接 import `from filelock import FileLock` 及其 timeout 类型。业务层、Host、Service、Fins、工具模块不得各自直接封装或散落 import 第三方 `filelock`。
+- 该 wrapper 是纯 infra dependency adapter，不表达 Host durable truth，也不替代数据库事务、CAS、EventLog sequence 或 projection checkpoint。
 
 ## 4. 核心对象
 
@@ -518,6 +697,43 @@ command path 不直接运行慢 projection、outbox projection、tool trace 写�
 - Host 公共操作函数不接收零散全局配置；它们接收已构造好的 Host handle。Host handle 的构造函数或工厂函数必须暴露 typed options / request，用于传入上述运行参数。
 - 默认参数必须能被显式传入值完全覆盖；覆盖后的值必须进入 Host snapshot / diagnostic / audit 所需的可解释 refs，便于排查不同入口或进程使用的运行配置。
 
+Phase 1 必须稳定 ToolBundle construction input 的最小 typed shape，但不实现 Host command path、durable store、ToolRuntime policy resolution 或 framework tool 注入逻辑。最小 Python 3.11 类型形状为：
+
+```text
+class ToolBundleSourceKind(StrEnum):
+    EXPLICIT_PROVIDER = "explicit_provider"
+    CONFIG_BINDING = "config_binding"
+    PACKAGE_ENTRYPOINT = "package_entrypoint"
+    SERVICE_COMPOSITION = "service_composition"
+
+class FrameworkToolName(StrEnum):
+    FETCH_MORE = "fetch_more"
+
+@dataclass(frozen=True, slots=True)
+HostToolingOptions
+  business_tool_bundle: ToolBundle
+  source_refs: tuple[ToolBundleSourceRef, ...]
+  framework_tool_policy: FrameworkToolPolicyView
+
+@dataclass(frozen=True, slots=True)
+ToolBundleSourceRef
+  source_kind: ToolBundleSourceKind
+  source_id: str
+  version_ref?: str
+  content_digest?: str
+
+@dataclass(frozen=True, slots=True)
+FrameworkToolPolicyView
+  reserved_framework_tool_names: frozenset[FrameworkToolName]
+  enabled_framework_tools: frozenset[FrameworkToolName]
+```
+
+`HostToolingOptions` 属于 Host construction options 的一部分，只能在 composition root / host factory 接收。`business_tool_bundle` 不得出现在 `StartRunRequest`、`SubmitFollowupRequest`、retry / replay / resume request 或无结构 metadata 中。`ToolBundleSourceRef` 只记录可解释来源、版本与 digest；它不携带 callable，不反向指向具体业务工具模块，也不要求 Host 能重新执行 discovery。
+
+`ToolBundleSourceKind` 必须使用 Python 3.11 `enum.StrEnum`，不得实现为普通 `str` 常量或 `typing.Literal`，以保证 source refs 具备稳定字符串序列化和受限取值。`FrameworkToolName` 同样必须使用 Python 3.11 `enum.StrEnum`，不得实现为普通 `str` 常量或 `typing.Literal`；当前 framework tool 名称集合至少包含 `fetch_more`。`FrameworkToolPolicyView.reserved_framework_tool_names` 用于禁止业务 `ToolBundle` 占用 Host framework tool 名称，即使某个 framework tool 当前未启用也可以被保留。`FrameworkToolPolicyView.enabled_framework_tools` 只表达 construction-time policy view，表示本 Host handle 允许后续 ToolRuntime factory 注入的 framework tool 名称集合；它不得在 Phase 1 触发 ToolRuntime 注入、tool governance policy resolution 或 per-run policy override。
+
+Phase 1 的默认 reserved framework tool names 至少包含 `FrameworkToolName.FETCH_MORE`。enabled framework tools 必须显式来自 Host construction options 或其默认值；默认值不表达完整工具治理策略。`FrameworkToolPolicyView` 是独立的 construction-time framework-tool policy view，不是完整 `ToolGovernancePolicyView`。后续 ToolRuntime / Tool Governance phase 可以消费它，或将其并入更完整的 `ToolGovernancePolicyView`，但 Phase 1 不实现完整工具治理策略。
+
 `HostPolicyProviderSet` 是一组 typed policy providers，不是插件市场、全局 registry、service locator 或 god bag。它只承载 Host 运行时需要读取的治理策略：
 
 - admission policy。
@@ -553,6 +769,13 @@ HostPolicyProviderSet at composition root
 ## 11. Host 公共接口
 
 Host 公共接口采用函数式风格，但不得依赖全局隐式单例。公共函数接收明确的 Host handle / context 与 request，返回稳定 snapshot 或 Host event stream。
+
+类型归属规则：
+
+- `dayu.contracts` 只承载 Host 与 Engine / ToolRuntime 边界都必须理解的层间协作契约，例如现有 `ToolBundle`、`ToolDefinition`、`ToolSchema`、`ToolExecutor`、批式工具调用 / outcome、取消观察 token 与严格 JSON 值。
+- Host 公共 API 类型放在 `dayu.host` 的公共命名空间，而不是放进 `dayu.contracts`。这些类型包括 Host handle / command facet、`HostCallContext`、`OperationContext`、各 mutating request、`SessionSnapshot`、`RunSnapshot`、`FollowupSnapshot`、`PurgeSessionResult`、`HostEventStream`、Session / Run / Attempt status enum、Host API error code 与 stream cursor 类型。Service / UI 可以按向下依赖关系 import `dayu.host` 公共类型；Engine 不得 import 这些类型。
+- Host 内部类型留在 `dayu.host` 内部模块，不从公共命名空间导出。这些类型包括 durable EventLog row、状态索引 row、dispatch record、idempotency record、transaction object、policy provider set、ToolRuntime snapshot、accept barrier 内部 candidate、projection checkpoint row、recovery scan record 与 background supervisor 私有状态。
+- 如果某个类型同时被多层读写，必须先审视边界是否过宽；不能因为多个调用方想复用 dataclass 就把 Host 私有治理状态提前提升到 `dayu.contracts`。
 
 第一版最小接口集合：
 
@@ -1427,6 +1650,8 @@ tool declaration / external tool registration module
 `ToolBundle` 是 `dayu.contracts` 已定义的工具声明集合，包含 `ToolDefinition` 元组，校验工具名唯一，并可投影为 Engine 可见的 `ToolSchema` 列表或 ToolRuntime 使用的 truncate specs。Host 只接收 `ToolBundle`，不参与工具发现、模块扫描或注册生命周期。
 
 外部工具注册组件负责收集业务工具并生成业务 `ToolBundle`。它可以使用显式 provider 列表、配置绑定、包入口或 Service 装配；这些只是 discovery adapter，不改变 Host 语义契约。新增业务工具应通过新增工具包 / provider / 配置装配完成，不要求修改 Host 源码。
+
+Host construction input 只能接收 `HostToolingOptions` 这样的 typed options：业务 `ToolBundle`、工具来源 refs、framework tool policy view 与后续治理所需的可解释 digest/ref。Host 不接收 discovery adapter 本体，不调用 provider 列表，不扫描业务包，也不把 per-run `tool_profile_ref` 作为 Phase 1 能力。未来若支持多个 scene tool profile，必须先定义 profile registry / ref 的 typed contract，并保证 profile 选择冻结到 Attempt snapshot；在此之前，Phase 1 只支持单个 construction-time business `ToolBundle`。
 
 Host 对传入的业务 `ToolBundle` 只做治理所需的防御性校验和派生 metadata：
 

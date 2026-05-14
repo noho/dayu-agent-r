@@ -53,6 +53,7 @@ dependencies = [
     "pandas>=2.1.4,<4.0.0",
     "lxml>=5.2.2",
     "click>=8.1.0",
+    "filelock>=3.18.0",
     "trafilatura>=1.12.0",
     "readability-lxml>=0.8.1",
     "markdownify>=0.13.1",

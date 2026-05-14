@@ -33,6 +33,8 @@ UI -> Service -> Host -> Engine
 
 `dayu.contracts` 承载跨层共享协作契约。契约层不得依赖具体业务层或执行层实现。
 
+`dayu.host` 承载 Host 公共 API 类型契约。当前已导出 request、snapshot、status、error、context、stream cursor 类型，以及 Host construction 的 `HostToolingOptions` 工具输入边界，供 UI / Service 按依赖方向向下引用；Host durable store、EventLog、dispatch、command path、ToolRuntime 与 policy provider 不属于当前公共命名空间。
+
 财报领域能力属于独立领域边界；财报文档存取必须通过 `dayu.fins.storage` 下的仓储协议与仓储实现完成，不应泄漏到 Engine 或 Host 内部。
 
 ## 术语约定
@@ -99,7 +101,8 @@ implementation、review、fix 与 re-review 的项目级术语真源。包级 RE
 - `WorkerProxy`：Host 到执行环境的适配边界。LocalProxy 与 RemoteProxy 只负责传输、启动、取消控制和事件回传，不拥有 Session / Run / Attempt / EventLog 真源。
 - `EngineWorker`：承载一次 Engine 执行的执行环境能力。EngineWorker 可以位于本机或远端；无论位置如何，它只执行并回传事件 / 结果，不 append EventLog、不关闭 attempt、不更新 Run 状态。
 - `RemoteStub`：远端执行环境中的代理端点，负责把 RemoteProxy 的请求转为 EngineWorker 执行并回传事件 / 结果。RemoteStub 不拥有 Host 治理状态。
-- `ToolBundle`：`dayu.contracts` 中已定义的工具声明集合，包含 `ToolDefinition` 元组，校验工具名唯一，并可投影为 Engine 可见的 `ToolSchema` 列表或 ToolRuntime 使用的 truncate specs。Host 的工具输入是外部传入的业务 `ToolBundle`；Host 不负责工具发现、模块扫描或注册生命周期。业务 `ToolBundle` 是 Host construction / composition root 的显式输入，不是普通 UI / Service per-run request payload。
+- `ToolBundle`：`dayu.contracts` 中已定义的工具声明集合，包含 `ToolDefinition` 元组，校验工具名唯一，并可投影为 Engine 可见的 `ToolSchema` 列表或 ToolRuntime 使用的 truncate specs。Host 的工具输入是外部传入的业务 `ToolBundle`；Host 不负责工具发现、模块扫描或注册生命周期。业务 `ToolBundle` 通过 `HostToolingOptions` 作为 Host construction / composition root 的显式输入，不是普通 UI / Service per-run request payload。
+- `HostToolingOptions`：`dayu.host.tooling` 中已实现的 Host construction typed options，包含业务 `ToolBundle`、非空来源 refs 与 framework tool policy view。它会拒绝业务工具占用 Host / ToolRuntime 预留的 framework tool 名称，例如 `fetch_more`；它不计算 durable tool snapshot，不注入 framework tool，也不解析 ToolRuntime policy。
 - `effective ToolBundle`：ToolRuntime factory 基于业务 `ToolBundle` 和启用的 framework tools 生成的 attempt-local runtime bundle。`fetch_more` 由 ToolRuntime factory 在启用 TruncationManager 时注入 effective ToolBundle，不要求外部业务 ToolBundle 提供。
 - `ToolRuntime`：Host-owned 工具治理模块，作为 `ToolExecutor` 提供给 EngineWorker / Engine。它消费 Host 传入的业务 `ToolBundle`，生成 attempt-local effective `ToolBundle`，负责 policy、awaiting、truncation / fetch_more、语义级重复调用治理、通过 `ToolTraceDiagnosticEmitter` 发出工具诊断，以及工具级幂等。ToolRuntime Host accept path 是工具事实 canonical 写入所有者；ToolRuntime 必须通过 Host accept barrier 让工具事实先被 Host durable accepted，收到 accepted ack 后才能把结果返回给 Engine。EngineEvent ingest 不能为同一工具 outcome 再写第二条工具 canonical fact。
 - `ToolTraceDiagnosticEmitter`：ToolRuntime 内部 typed interface，用于提交结构化工具诊断记录 / refs，供 tool trace projection 生成 hot JSON 与 cold JSONL。它不是 EventLog appender，不拥有 canonical fact，不写 audit，不直接写 trace 文件，也不更新 Run / Attempt 状态。
@@ -118,10 +121,10 @@ implementation、review、fix 与 re-review 的项目级术语真源。包级 RE
 - `Context Governance`：Host 对上下文预算、compaction、pinned state、tool facts、open questions、assumptions 和 compact 事件的治理 orchestrator。Host 应在 dispatch 前根据 provider-aware budget 主动触发 compact；Engine emit `context_compaction_requested` 是 provider context overflow 后的 reactive fallback，且 provider overflow 路径不携带真实 Host budget，Host Context Governance 使用自身 estimator / policy 记录预算并做 compact 决策。Context Governance 不直接写 memory、audit、trace 或 outbox projection；这些 projection 只消费已提交 EventLog。
 - `compact events`：Host canonical event family，用于记录 context compaction 触发、成功或失败。当前设计包含 `CONTEXT_COMPACTION_REQUESTED`、`CONTEXT_COMPACTED`、`CONTEXT_COMPACTION_FAILED`；它们解释为什么后续 Attempt 的 messages 被压缩或重建。
 - `evidence anchor` / `provenance`：财报分析证据链的中立引用。长期归因必须能追到工具事实和 evidence anchor；summary 只能导航，不能替代证据。
-- `lane`：层中立 named semaphore，用于跨协程 / 跨进程的具名容量治理。lane 属于 `dayu.runtime`，不绑定 Host、Run、Tool 或财报业务语义。lane acquire 是可取消的耗时操作；调用方 / supervisor 退出时必须同时触发 Host cancel 与 lane cancel。
-- `filelock`：`dayu.runtime` 对 `from filelock import FileLock` 的统一封装，用于多进程访问普通文件时的互斥保护。业务层、Host、Service、Fins 等不应各自直接封装或手写文件锁。
-- `ToolsDiscovery`：暂定名，独立于 Host 的工具发现 / 注册组件，收集工具声明、provider 或配置绑定，生成业务 `ToolBundle` 并显式传给 Host。若放入 `dayu.runtime`，它只能依赖标准库和 `dayu.contracts`，不得 import 具体业务工具包。
-- `ScenePrepare`：独立于 Host 的场景准备组件，根据 scene manifest 组装 system prompt 与场景约束，产出 typed scene inputs。若放入 `dayu.runtime`，它只能是通用 manifest assembly helper；具体财报 scene manifest、业务 prompt 文案和场景策略属于 Service / 业务配置。
+- `lane`：Host 设计要求沉淀到 `dayu.runtime` 的层中立 cross-process named semaphore / capacity guard，用于单机多客户端 / 多进程下的具名容量治理。它不绑定 Host、Run、Tool 或财报业务语义，不表达 Host truth、lease / fencing、Attempt owner、EventLog ordering 或 recovery proof。lane acquire 是可取消的耗时操作；调用方 / supervisor 退出时必须同时触发 Host cancel 与 lane cancel。
+- `filelock`：`dayu.runtime.filelock` 提供对第三方 `FileLock` 的同步统一封装，用于多进程访问普通文件时的互斥保护。业务层、Host、Service、Fins 等不应各自直接封装或手写文件锁。
+- `ToolsDiscovery`：暂定名，独立于 Host 的工具发现 / 注册组件，收集工具声明、provider 或配置绑定，生成业务 `ToolBundle` 并显式传给 Host。若后续放入 `dayu.runtime`，它只能依赖标准库和 `dayu.contracts`，不得 import 具体业务工具包。
+- `ScenePrepare`：独立于 Host 的场景准备组件，根据 scene manifest 组装 system prompt 与场景约束，产出 typed scene inputs。若后续放入 `dayu.runtime`，它只能是通用 manifest assembly helper；具体财报 scene manifest、业务 prompt 文案和场景策略属于 Service / 业务配置。
 
 `turn` 不用于描述 Engine / Runner 执行路径；如需表达用户视角的多轮对话，应在 UI / Service / Host 语义内明确其与 `session`、`run` 的关系。
 
@@ -133,14 +136,24 @@ implementation、review、fix 与 re-review 的项目级术语真源。包级 RE
 
 公共运行时能力应优先沉淀在 `dayu.runtime`，但不得把业务语义、Host 治理状态或 Engine 协议状态机放入 runtime。
 
-`dayu.runtime` 当前稳定承载以下层中立能力：
+`dayu.runtime` 当前已有以下层中立能力：
 
 - 日志装配与日志 level。
 - 取消等待 / race helper。
-- `lane`：named semaphore。它只表达具名容量控制，可被 Host、Service、Fins 或其它层复用；它不能表达 Session / Run / Attempt owner，也不能替代 Host admission、SQLite transaction 或 CAS 状态迁移。acquire 成功只表示拿到资源容量；使用方仍必须在执行副作用前 recheck 自己的 durable / semantic precondition，并在 cancel、失败或退出时释放或取消 lane。
-- `filelock`：对第三方 `FileLock` 的统一 wrapper，只用于普通文件访问互斥。`dayu.runtime` 不能依赖 `dayu.engine` / `dayu.host` / `dayu.service` / `dayu.ui` / `dayu.fins` 等项目内上层 package；统一封装纯 infra 第三方依赖不违反这一边界。业务层不得散落 `from filelock import FileLock`，也不得用 file lock 兜底数据库事务、EventLog 顺序或 Host 状态机。
-- `ToolsDiscovery`：工具发现 / 注册的层中立装配 helper。它可以接收外部传入的 provider / 配置绑定并产出 `ToolBundle`，但不能持有 Host 状态，不能 import 具体业务工具包，也不能决定 Run / Attempt 生命周期。
-- `ScenePrepare`：scene manifest 的层中立组装 helper。它可以把 manifest 与模板输入组装为 typed scene inputs，但不能内置财报业务规则、不能 import Service / Fins / Host，也不能绕过 Service 把场景 prompt 写入 Host 状态机。
+- `lane`：cross-process named semaphore / capacity guard。调用方显式传入独立 SQLite runtime lane DB 路径，并通过
+  `LaneController` 获取、刷新和释放具名容量 claim；等待 acquire 支持 timeout、协作式 cancellation 与
+  `Task.cancel()` 透传，controller close 会取消 pending acquire 并尽力释放当前 tokens。lane 只表达 runtime capacity
+  claim，不保存 Session / Run / Attempt / EventLog / Tool / Fins 字段，也不承诺 FIFO、公平性、lease / fencing、
+  Attempt owner、Host admission 或 recovery proof。
+- `filelock`：对第三方 `FileLock` 的同步 wrapper，只用于普通文件访问互斥。调用方传入显式 lock file 路径，可选择创建
+  parent directory，并通过 wrapper 自有 timeout / runtime error 语义处理 acquire / release 失败；它不提供 async wrapper、
+  stale takeover、强制 break lock 或锁文件删除。业务层不得散落 `from filelock import FileLock`，也不得用 file lock 兜底
+  数据库事务、EventLog 顺序或 Host 状态机。
+
+Host 设计要求以下层中立能力沉淀到 `dayu.runtime` 或保持为 runtime 边界约束：
+
+- `ToolsDiscovery`：工具发现 / 注册的层中立装配边界。它可以接收外部传入的 provider / 配置绑定并产出 `ToolBundle`，但不能持有 Host 状态，不能 import 具体业务工具包，也不能决定 Run / Attempt 生命周期。具体 adapter、provider 注册生命周期和业务工具扫描不属于 Host Phase 1。
+- `ScenePrepare`：scene manifest 的层中立组装边界。它可以把 manifest 与模板输入组装为 typed scene inputs，但不能内置财报业务规则、不能 import Service / Fins / Host，也不能绕过 Service 把场景 prompt 写入 Host 状态机。具体 manifest schema、财报 prompt 文案和业务场景策略不属于 Host Phase 1。
 
 ## 日志与可观测性
 
@@ -193,7 +206,7 @@ Dayu 的日志用于诊断系统执行过程，不承担 UI 输出职责。面�
 
 - `@tool(...)` 是工具声明入口，用于在工具现场同源声明 `ToolSchema`、截断声明、展示 metadata、标签和单工具 callable。
 - `ToolDefinition` 是 Host / ToolRuntime 的装配输入，包含 schema、truncate、display、tags 与 `ToolCallable`；它不进入 Engine request，也不作为 Engine 稳定接口。
-- 外部工具注册组件是工具发现 / 注册边界，产出业务 `ToolBundle`。Host 包不得 import 具体业务工具模块；新增工具应通过外部注册组件 / 配置 / Service composition 接入。
+- 外部工具注册组件是工具发现 / 注册边界，产出业务 `ToolBundle` 并通过 `HostToolingOptions` 传给 Host construction。Host 包不得 import 具体业务工具模块；新增工具应通过外部注册组件 / 配置 / Service composition 接入。
 - `fetch_more` 不由外部业务 `ToolBundle` 提供；ToolRuntime factory 根据 TruncationManager 注入 framework tool，生成 attempt-local effective `ToolBundle`。RunInputBuilder 投影给 Engine 的 `tool_schemas` 必须来自 effective ToolBundle。
 - `ToolCallable` 是单工具调用协议，形状是 `async (call: ToolCallRequest, context: BatchToolExecutionContext) -> ToolExecutionOutcome`。工具函数可以通过闭包捕获 Web client、仓储、manager 等 Host 私有依赖。
 - `ToolExecutor` 是 Host / ToolRuntime 治理后的 batch 执行入口，形状是 `execute(BatchToolExecutionRequest) -> BatchToolExecutionOutcome`。Engine 只调用这个入口，不调用单工具 callable。

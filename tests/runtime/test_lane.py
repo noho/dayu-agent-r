@@ -1,0 +1,603 @@
+"""``dayu.runtime.lane`` 单进程行为测试。
+
+覆盖配置校验、独立 SQLite runtime lane DB 初始化、claim / heartbeat /
+release 生命周期、timeout、协作式 cancellation、外层 task cancellation 和
+controller close 语义。
+"""
+
+from __future__ import annotations
+
+import asyncio
+import sqlite3
+from datetime import UTC, datetime
+from pathlib import Path
+
+import pytest
+
+from dayu.runtime.lane import (
+    LaneAcquireCancelled,
+    LaneAcquired,
+    LaneClaimToken,
+    LaneAcquireTimedOut,
+    LaneConfig,
+    LaneController,
+    LaneOwner,
+    RuntimeLaneClaimLostError,
+    RuntimeLaneClosedError,
+    RuntimeLaneConfigError,
+    RuntimeLaneError,
+    SQLiteLaneCoordinatorConfig,
+)
+
+_LANE_NAME = "llm"
+_SECOND_LANE_NAME = "tool"
+_CLAIMS_TABLE = "runtime_lane_claims"
+_FAST_TTL_SECONDS = 0.5
+_FAST_HEARTBEAT_SECONDS = 0.05
+_FAST_POLL_SECONDS = 0.01
+_SHORT_TIMEOUT_SECONDS = 0.04
+_SLOW_OPERATION_SECONDS = 5.0
+_CANCEL_REASON = "user-stop"
+
+
+class _FakeCancellationToken:
+    """测试用协作式取消 token。"""
+
+    def __init__(self) -> None:
+        """初始化为未取消状态。"""
+
+        self._cancelled = False
+        self._reason: str | None = None
+        self._requested_at: datetime | None = None
+
+    def cancel(self, *, reason: str | None = _CANCEL_REASON) -> None:
+        """触发取消。
+
+        :param reason: 取消原因。
+        :returns: ``None``。
+        """
+
+        self._cancelled = True
+        self._reason = reason
+        self._requested_at = datetime.now(UTC)
+
+    def is_cancelled(self) -> bool:
+        """返回是否已取消。
+
+        :returns: 已取消返回 ``True``。
+        """
+
+        return self._cancelled
+
+    def cancel_reason(self) -> str | None:
+        """返回取消原因。
+
+        :returns: 取消原因；未取消返回 ``None``。
+        """
+
+        return self._reason
+
+    def requested_at(self) -> datetime | None:
+        """返回取消请求时间。
+
+        :returns: 取消请求时间；未取消返回 ``None``。
+        """
+
+        return self._requested_at
+
+
+def _coordinator(db_path: Path) -> SQLiteLaneCoordinatorConfig:
+    """构造测试用 SQLite coordinator 配置。
+
+    :param db_path: runtime lane DB 路径。
+    :returns: SQLite coordinator 配置。
+    """
+
+    return SQLiteLaneCoordinatorConfig(
+        db_path=db_path,
+        busy_timeout_seconds=1.0,
+        poll_interval_seconds=_FAST_POLL_SECONDS,
+    )
+
+
+def _lane_config(
+    *,
+    name: str = _LANE_NAME,
+    capacity: int = 1,
+    default_timeout_seconds: float | None = None,
+) -> LaneConfig:
+    """构造测试用 lane 配置。
+
+    :param name: lane 名称。
+    :param capacity: lane 容量。
+    :param default_timeout_seconds: 默认 acquire timeout。
+    :returns: lane 配置。
+    """
+
+    return LaneConfig(
+        name=name,
+        capacity=capacity,
+        default_timeout_seconds=default_timeout_seconds,
+        claim_ttl_seconds=_FAST_TTL_SECONDS,
+        heartbeat_interval_seconds=_FAST_HEARTBEAT_SECONDS,
+    )
+
+
+def _claim_count(db_path: Path, lane_name: str = _LANE_NAME) -> int:
+    """读取指定 lane 当前 claim row 数。
+
+    :param db_path: runtime lane DB 路径。
+    :param lane_name: lane 名称。
+    :returns: claim row 数。
+    """
+
+    connection = sqlite3.connect(db_path)
+    try:
+        row = connection.execute(
+            f"SELECT COUNT(*) FROM {_CLAIMS_TABLE} WHERE lane_name = ?",
+            (lane_name,),
+        ).fetchone()
+        assert row is not None
+        return int(row[0])
+    finally:
+        connection.close()
+
+
+def _delete_claim(db_path: Path, claim_id: str) -> None:
+    """直接删除测试 claim row，用于模拟 claim 丢失。
+
+    :param db_path: runtime lane DB 路径。
+    :param claim_id: claim id。
+    :returns: ``None``。
+    """
+
+    connection = sqlite3.connect(db_path)
+    try:
+        connection.execute(
+            f"DELETE FROM {_CLAIMS_TABLE} WHERE claim_id = ?",
+            (claim_id,),
+        )
+        connection.commit()
+    finally:
+        connection.close()
+
+
+def _table_columns(db_path: Path) -> set[str]:
+    """读取 claim table 字段集合。
+
+    :param db_path: runtime lane DB 路径。
+    :returns: 字段名集合。
+    """
+
+    connection = sqlite3.connect(db_path)
+    try:
+        rows = connection.execute(f"PRAGMA table_info({_CLAIMS_TABLE})").fetchall()
+        return {str(row[1]) for row in rows}
+    finally:
+        connection.close()
+
+
+@pytest.mark.asyncio
+async def test_config_validation_and_unknown_lane(tmp_path: Path) -> None:
+    """配置错误与未知 lane 必须抛结构化 runtime config error。"""
+
+    db_path = tmp_path / "runtime_lanes.sqlite3"
+    with pytest.raises(RuntimeLaneConfigError):
+        LaneConfig(name=" ", capacity=1)
+    with pytest.raises(RuntimeLaneConfigError):
+        LaneConfig(name=_LANE_NAME, capacity=0)
+    with pytest.raises(RuntimeLaneConfigError):
+        LaneConfig(
+            name=_LANE_NAME,
+            capacity=1,
+            claim_ttl_seconds=0.1,
+            heartbeat_interval_seconds=0.1,
+        )
+    with pytest.raises(RuntimeLaneConfigError):
+        await LaneController.open(
+            [_lane_config(), _lane_config()],
+            coordinator=_coordinator(db_path),
+        )
+
+    controller = await LaneController.open(
+        [_lane_config()],
+        coordinator=_coordinator(db_path),
+    )
+    with pytest.raises(RuntimeLaneConfigError):
+        await controller.acquire(_SECOND_LANE_NAME, timeout_seconds=0)
+
+
+def test_lane_owner_rejects_empty_owner_id_and_invalid_pid() -> None:
+    """LaneOwner 必须拒绝空 owner_id 与非法 pid。"""
+
+    with pytest.raises(RuntimeLaneConfigError, match="owner_id"):
+        LaneOwner(owner_id=" ", pid=1)
+    with pytest.raises(RuntimeLaneConfigError, match="pid"):
+        LaneOwner(owner_id="owner-1", pid=0)
+
+
+@pytest.mark.asyncio
+async def test_acquire_rejects_negative_timeout(tmp_path: Path) -> None:
+    """LaneController.acquire 必须拒绝负数 timeout_seconds。"""
+
+    db_path = tmp_path / "runtime_lanes.sqlite3"
+    controller = await LaneController.open(
+        [_lane_config()],
+        coordinator=_coordinator(db_path),
+    )
+
+    with pytest.raises(RuntimeLaneConfigError, match="timeout"):
+        await controller.acquire(_LANE_NAME, timeout_seconds=-1)
+    await controller.close(reason="test-done")
+
+
+@pytest.mark.asyncio
+async def test_close_is_idempotent_when_called_twice(tmp_path: Path) -> None:
+    """LaneController.close 连续调用两次必须保持幂等。"""
+
+    db_path = tmp_path / "runtime_lanes.sqlite3"
+    controller = await LaneController.open(
+        [_lane_config()],
+        coordinator=_coordinator(db_path),
+    )
+
+    await controller.close(reason="first-close")
+    await controller.close(reason="second-close")
+
+
+@pytest.mark.asyncio
+async def test_parent_directory_creation_policy(tmp_path: Path) -> None:
+    """create_parent_dirs=False 且 parent 缺失时必须抛配置错误。"""
+
+    missing_parent = tmp_path / "missing" / "runtime_lanes.sqlite3"
+    with pytest.raises(RuntimeLaneConfigError):
+        await LaneController.open(
+            [_lane_config()],
+            coordinator=SQLiteLaneCoordinatorConfig(
+                db_path=missing_parent,
+                create_parent_dirs=False,
+            ),
+        )
+
+    created_parent_db = tmp_path / "created" / "runtime_lanes.sqlite3"
+    await LaneController.open(
+        [_lane_config()],
+        coordinator=SQLiteLaneCoordinatorConfig(db_path=created_parent_db),
+    )
+    assert created_parent_db.exists()
+
+
+@pytest.mark.asyncio
+async def test_database_init_sets_wal_and_schema_has_no_host_or_fins_fields(
+    tmp_path: Path,
+) -> None:
+    """DB 初始化必须使用独立 runtime schema，且不包含 Host / Fins 字段。"""
+
+    db_path = tmp_path / "runtime_lanes.sqlite3"
+    await LaneController.open([_lane_config()], coordinator=_coordinator(db_path))
+
+    connection = sqlite3.connect(db_path)
+    try:
+        journal_mode = str(connection.execute("PRAGMA journal_mode").fetchone()[0])
+    finally:
+        connection.close()
+
+    assert journal_mode.lower() == "wal"
+    columns = _table_columns(db_path)
+    assert {
+        "lane_name",
+        "claim_id",
+        "owner_id",
+        "owner_pid",
+        "owner_process_start_token",
+        "created_at",
+        "heartbeat_at",
+        "expires_at",
+    } <= columns
+    forbidden_columns = {
+        "session_id",
+        "run_id",
+        "attempt_id",
+        "event_sequence",
+        "event_id",
+        "tool_name",
+        "fins_document_id",
+    }
+    assert columns.isdisjoint(forbidden_columns)
+
+
+@pytest.mark.asyncio
+async def test_acquire_refresh_and_release(tmp_path: Path) -> None:
+    """成功 acquire 后可以 refresh，并可通过 release 释放容量。"""
+
+    db_path = tmp_path / "runtime_lanes.sqlite3"
+    controller = await LaneController.open(
+        [_lane_config()], coordinator=_coordinator(db_path)
+    )
+
+    outcome = await controller.acquire(_LANE_NAME, timeout_seconds=0)
+    assert isinstance(outcome, LaneAcquired)
+    token = outcome.token
+    assert _claim_count(db_path) == 1
+
+    old_expires_at = token.expires_at
+    await asyncio.sleep(_FAST_POLL_SECONDS)
+    await token.refresh()
+    assert token.expires_at > old_expires_at
+
+    await token.release()
+    assert token.released is True
+    assert _claim_count(db_path) == 0
+    await controller.close(reason="test-done")
+
+
+@pytest.mark.asyncio
+async def test_duplicate_release_is_idempotent_and_isolated(
+    tmp_path: Path,
+) -> None:
+    """重复 release 不影响其它 claim。"""
+
+    db_path = tmp_path / "runtime_lanes.sqlite3"
+    controller = await LaneController.open(
+        [_lane_config(capacity=2)],
+        coordinator=_coordinator(db_path),
+    )
+    first = await controller.acquire(_LANE_NAME, timeout_seconds=0)
+    second = await controller.acquire(_LANE_NAME, timeout_seconds=0)
+    assert isinstance(first, LaneAcquired)
+    assert isinstance(second, LaneAcquired)
+
+    await first.token.release()
+    await first.token.release()
+    assert _claim_count(db_path) == 1
+
+    await second.token.refresh()
+    assert second.token.released is False
+    await second.token.release()
+    assert _claim_count(db_path) == 0
+    await controller.close()
+
+
+@pytest.mark.asyncio
+async def test_nonblocking_and_positive_timeout_do_not_occupy_capacity(
+    tmp_path: Path,
+) -> None:
+    """capacity 满时 non-blocking 与正 timeout 都返回 timed out 且不占容量。"""
+
+    db_path = tmp_path / "runtime_lanes.sqlite3"
+    controller = await LaneController.open(
+        [_lane_config(default_timeout_seconds=_SHORT_TIMEOUT_SECONDS)],
+        coordinator=_coordinator(db_path),
+    )
+    held = await controller.acquire(_LANE_NAME, timeout_seconds=0)
+    assert isinstance(held, LaneAcquired)
+
+    nonblocking = await controller.acquire(_LANE_NAME, timeout_seconds=0)
+    assert isinstance(nonblocking, LaneAcquireTimedOut)
+    positive = await controller.acquire(_LANE_NAME)
+    assert isinstance(positive, LaneAcquireTimedOut)
+    assert _claim_count(db_path) == 1
+
+    await held.token.release()
+    after_release = await controller.acquire(_LANE_NAME, timeout_seconds=0)
+    assert isinstance(after_release, LaneAcquired)
+    await after_release.token.release()
+    await controller.close()
+
+
+@pytest.mark.asyncio
+async def test_cancellation_token_cancels_waiting_acquire(tmp_path: Path) -> None:
+    """等待 acquire 时 cancellation token 命中应返回 cancelled。"""
+
+    db_path = tmp_path / "runtime_lanes.sqlite3"
+    controller = await LaneController.open(
+        [_lane_config()], coordinator=_coordinator(db_path)
+    )
+    held = await controller.acquire(_LANE_NAME, timeout_seconds=0)
+    assert isinstance(held, LaneAcquired)
+    cancel_token = _FakeCancellationToken()
+
+    async def _cancel_soon() -> None:
+        """稍后触发测试取消。
+
+        :returns: ``None``。
+        """
+
+        await asyncio.sleep(_FAST_POLL_SECONDS * 2)
+        cancel_token.cancel(reason=_CANCEL_REASON)
+
+    trigger = asyncio.create_task(_cancel_soon())
+    outcome = await controller.acquire(
+        _LANE_NAME,
+        token=cancel_token,
+        timeout_seconds=_SLOW_OPERATION_SECONDS,
+    )
+    await trigger
+    assert isinstance(outcome, LaneAcquireCancelled)
+    assert outcome.reason == _CANCEL_REASON
+    assert _claim_count(db_path) == 1
+    await held.token.release()
+    await controller.close()
+
+
+@pytest.mark.asyncio
+async def test_task_cancel_propagates_without_extra_claim(
+    tmp_path: Path,
+) -> None:
+    """外层 ``Task.cancel`` 必须透传，且不得泄漏额外 claim。"""
+
+    db_path = tmp_path / "runtime_lanes.sqlite3"
+    controller = await LaneController.open(
+        [_lane_config()], coordinator=_coordinator(db_path)
+    )
+    held = await controller.acquire(_LANE_NAME, timeout_seconds=0)
+    assert isinstance(held, LaneAcquired)
+
+    task = asyncio.create_task(
+        controller.acquire(_LANE_NAME, timeout_seconds=_SLOW_OPERATION_SECONDS)
+    )
+    await asyncio.sleep(_FAST_POLL_SECONDS * 2)
+    task.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await task
+    assert _claim_count(db_path) == 1
+
+    await held.token.release()
+    await controller.close()
+
+
+@pytest.mark.asyncio
+async def test_close_cancels_pending_and_releases_held_tokens(
+    tmp_path: Path,
+) -> None:
+    """close 会取消 pending acquire、释放 held token，并拒绝新 acquire。"""
+
+    db_path = tmp_path / "runtime_lanes.sqlite3"
+    controller = await LaneController.open(
+        [_lane_config()], coordinator=_coordinator(db_path)
+    )
+    held = await controller.acquire(_LANE_NAME, timeout_seconds=0)
+    assert isinstance(held, LaneAcquired)
+
+    pending = asyncio.create_task(
+        controller.acquire(_LANE_NAME, timeout_seconds=_SLOW_OPERATION_SECONDS)
+    )
+    await asyncio.sleep(_FAST_POLL_SECONDS * 2)
+    await controller.close(reason="shutdown")
+    pending_outcome = await pending
+
+    assert isinstance(pending_outcome, LaneAcquireCancelled)
+    assert pending_outcome.reason == "shutdown"
+    assert _claim_count(db_path) == 0
+    with pytest.raises(RuntimeLaneClosedError):
+        await controller.acquire(_LANE_NAME, timeout_seconds=0)
+
+
+@pytest.mark.asyncio
+async def test_refresh_reports_lost_claim_and_release_stays_idempotent(
+    tmp_path: Path,
+) -> None:
+    """claim row 丢失时 refresh 抛 lost，release 仍保持幂等。"""
+
+    db_path = tmp_path / "runtime_lanes.sqlite3"
+    controller = await LaneController.open(
+        [_lane_config()], coordinator=_coordinator(db_path)
+    )
+    outcome = await controller.acquire(_LANE_NAME, timeout_seconds=0)
+    assert isinstance(outcome, LaneAcquired)
+
+    _delete_claim(db_path, outcome.token.claim_id)
+    with pytest.raises(RuntimeLaneClaimLostError):
+        await outcome.token.refresh()
+    await outcome.token.release()
+    assert _claim_count(db_path) == 0
+    await controller.close()
+
+
+@pytest.mark.asyncio
+async def test_heartbeat_runtime_error_stops_new_acquire(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """heartbeat 遇到 RuntimeLaneError 后停止新 acquire 并暴露结构化错误。"""
+
+    db_path = tmp_path / "runtime_lanes.sqlite3"
+    controller = await LaneController.open(
+        [_lane_config()],
+        coordinator=_coordinator(db_path),
+    )
+    held = await controller.acquire(_LANE_NAME, timeout_seconds=0)
+    assert isinstance(held, LaneAcquired)
+
+    def _raise_heartbeat_error(_token: LaneClaimToken) -> datetime:
+        """模拟 heartbeat 中的不可恢复 SQLite runtime 错误。
+
+        :param _token: 待刷新的 token，本测试不使用。
+        :returns: 不返回；始终抛出结构化 runtime lane 错误。
+        :raises RuntimeLaneError: 始终抛出。
+        """
+
+        raise RuntimeLaneError("heartbeat failed")
+
+    monkeypatch.setattr(
+        controller,
+        "_refresh_token_sync",
+        _raise_heartbeat_error,
+    )
+
+    observed_error: RuntimeLaneError | None = None
+    for _ in range(20):
+        await asyncio.sleep(_FAST_HEARTBEAT_SECONDS)
+        try:
+            await controller.acquire(_LANE_NAME, timeout_seconds=0)
+        except RuntimeLaneError as exc:
+            observed_error = exc
+            break
+    assert observed_error is not None
+    assert str(observed_error) == "heartbeat failed"
+
+    await controller.close(reason="cleanup")
+    assert _claim_count(db_path) == 0
+
+
+@pytest.mark.asyncio
+async def test_heartbeat_lost_claim_does_not_close_controller(
+    tmp_path: Path,
+) -> None:
+    """单个 token lost 只标记该 token，不关闭 controller 或影响其它 token。"""
+
+    db_path = tmp_path / "runtime_lanes.sqlite3"
+    controller = await LaneController.open(
+        [_lane_config(capacity=2)],
+        coordinator=_coordinator(db_path),
+    )
+    first = await controller.acquire(_LANE_NAME, timeout_seconds=0)
+    second = await controller.acquire(_LANE_NAME, timeout_seconds=0)
+    assert isinstance(first, LaneAcquired)
+    assert isinstance(second, LaneAcquired)
+
+    _delete_claim(db_path, first.token.claim_id)
+    for _ in range(20):
+        if first.token.released:
+            break
+        await asyncio.sleep(_FAST_HEARTBEAT_SECONDS)
+
+    assert first.token.released is True
+    assert second.token.released is False
+    await second.token.refresh()
+
+    await second.token.release()
+    after_lost = await controller.acquire(_LANE_NAME, timeout_seconds=0)
+    assert isinstance(after_lost, LaneAcquired)
+    await after_lost.token.release()
+    assert _claim_count(db_path) == 0
+    await controller.close()
+
+
+@pytest.mark.asyncio
+async def test_concurrent_acquire_keeps_capacity_invariant(
+    tmp_path: Path,
+) -> None:
+    """并发 acquire 不应突破 capacity invariant。"""
+
+    db_path = tmp_path / "runtime_lanes.sqlite3"
+    capacity = 2
+    controller = await LaneController.open(
+        [_lane_config(capacity=capacity)],
+        coordinator=_coordinator(db_path),
+    )
+    outcomes = await asyncio.gather(
+        *[
+            controller.acquire(_LANE_NAME, timeout_seconds=0)
+            for _ in range(capacity * 3)
+        ]
+    )
+    acquired = [item for item in outcomes if isinstance(item, LaneAcquired)]
+    timed_out = [item for item in outcomes if isinstance(item, LaneAcquireTimedOut)]
+
+    assert len(acquired) == capacity
+    assert len(timed_out) == capacity * 2
+    assert _claim_count(db_path) == capacity
+    for outcome in acquired:
+        await outcome.token.release()
+    await controller.close()

@@ -281,7 +281,7 @@ Phase 按依赖关系推进：先实现被其它阶段依赖的公共契约、ru
 ### Phase 1. 公共契约与 runtime 基础设施
 
 目标：
-- 建立 Host 后续实现依赖的稳定类型、公共 request / snapshot / enum、`dayu.runtime` 基础能力与工具 / 场景装配边界。
+- 建立 Host 后续实现依赖的稳定类型、公共 request / snapshot / enum、`dayu.runtime` 基础能力与外部工具 / 场景装配边界。
 
 对应设计章节：
 - `docs/host/design.md` §3 dayu.runtime
@@ -295,21 +295,27 @@ Phase 按依赖关系推进：先实现被其它阶段依赖的公共契约、ru
 
 进入条件：
 - 确认哪些类型属于 `dayu.contracts`，哪些类型留在 `dayu.host` 内部。
+- 确认 Host 公共 API 类型放在 `dayu.host` 公共命名空间，`dayu.contracts` 只保留 Host / Engine / ToolRuntime 共同理解的层间协作契约。
+- 确认 ToolsDiscovery / ScenePrepare 在本 phase 只固定边界并后置具体实现，不作为 Phase 1 implementation slice。
+- 确认 `docs/host/design.md` §3.1 / §3.2 已细化 `dayu.runtime.lane` 与 `dayu.runtime.filelock` 的 public API shape、生命周期、错误语义、non-goals、import boundary 和测试点。
 
 范围：
-- 允许修改：公共契约、Host request / snapshot / error typing、`dayu.runtime.lane`、`dayu.runtime.filelock`、ToolsDiscovery / ScenePrepare 的层中立装配接口。
+- 允许修改：公共契约、Host request / snapshot / error typing、Host construction typed options 中的 `ToolBundle` 输入边界、`dayu.runtime.lane`、`dayu.runtime.filelock`、ToolsDiscovery / ScenePrepare 的层中立责任边界说明。
 - 禁止修改：Host durable state machine、Engine 执行路径、业务财报工具实现。
 
 不做：
-- 不实现 SQLite store。
+- 不实现 Host SQLite durable store / EventLog store；`dayu.runtime.lane` 的独立 SQLite lane DB 只用于 runtime capacity coordination。
 - 不实现 Host command path。
 - 不实现业务工具扫描或财报场景 prompt。
+- 不实现 ToolsDiscovery / ScenePrepare 具体 adapter、manifest schema、provider 注册生命周期或业务装配代码。
 
 关键设计问题：
 - 必须确认 Host API 类型放置位置与 import 边界。
 - 必须确认 `ToolBundle` 作为 Host construction input 的 typed options 形状。
-- 若 runtime helper 需要第三方依赖，必须确认它仍满足 `dayu.runtime` 层中立约束。
-- 必须按 slice 分别确认 public typing、runtime infra、ToolsDiscovery、ScenePrepare；任何一类出现重大架构分歧时，应拆出独立 phase。
+- 必须确认 `dayu.runtime.lane` 第一版是 cross-process named semaphore / capacity guard primitive，使用独立 runtime SQLite lane coordinator 表达跨进程 capacity claim；采用 claim token acquire / release / heartbeat 生命周期；等待 acquire 可取消，持有 claim token 时由 owner task 在 cancel / shutdown 的 `finally` 或 context helper 中 release；不承诺 FIFO、公平性、分布式跨机器容量、lease / fencing、Attempt owner、Attempt takeover 或 recovery proof。
+- 必须确认 `dayu.runtime.filelock` 第一版只提供同步 wrapper；第三方 `filelock.FileLock` 只能由 `dayu.runtime.filelock` 直接导入；timeout、路径、parent directory、release、stale lock、reentrancy 和错误语义必须按 `docs/host/design.md` §3.2 实施。
+- 若 runtime helper 需要第三方依赖，必须确认它仍满足 `dayu.runtime` 层中立约束；`filelock` 依赖只能封装在 `dayu.runtime.filelock`。
+- 必须按 slice 分别确认 public typing、runtime infra、ToolBundle construction input。ToolsDiscovery / ScenePrepare 只作为后续 Phase 12 的 boundary constraint；Phase 1 不实现它们，Phase 12 必须补齐 typed manifest / provider contract。
 
 交付物：
 - phase design refinement
@@ -320,21 +326,35 @@ Phase 按依赖关系推进：先实现被其它阶段依赖的公共契约、ru
 
 建议 slice 切分：
 - Slice 1: Host API request / snapshot / error / status 类型。
-- Slice 2: `dayu.runtime.lane` 与 `dayu.runtime.filelock`。
-- Slice 3: ToolsDiscovery / ScenePrepare 层中立装配接口。
+- Slice 2A: `dayu.runtime.lane` cross-process named semaphore / capacity guard primitive、`LaneConfig`、`SQLiteLaneCoordinatorConfig`、`LaneOwner`、`LaneController`、`LaneClaimToken`、acquire outcome、claim TTL / heartbeat、stale claim cleanup、cancel / timeout / close 语义、multi-process capacity tests 与 import boundary tests。
+- Slice 2B: `dayu.runtime.filelock` sync wrapper、`RuntimeFileLockOptions`、`RuntimeFileLock`、`RuntimeFileLockToken`、timeout / parent directory / release / third-party error wrapping 语义与 import boundary tests。
+- Slice 3: Host construction `ToolBundle` typed options、tool bundle source refs、framework tool reserved-name policy view。
+- Deferred Slice: ToolsDiscovery / ScenePrepare 具体 typed interface 与 adapter 实现；不进入 Phase 1 implementation-ready plan。用户指定 deferred destination 为 P12；Phase Map 已重排为 Phase 12 ToolsDiscovery / ScenePrepare，原 Audit / Tool Trace / Outbox Projections 后移到 Phase 13。
 
 验证要求：
 - unit tests: contract validation、runtime lane / filelock behavior。
-- integration tests: 无。
+- lane unit tests 必须覆盖：重复 lane name / 非正 capacity / 非法 TTL 配置错误、未知 lane acquire 错误、独立 runtime SQLite lane DB 初始化、成功 acquire / heartbeat / release、重复 release 不影响其它 claim、`timeout_seconds=0` non-blocking acquire、正 timeout 返回 timed out、等待 acquire 被 `CancellationToken` 取消返回 cancelled、外层 `asyncio.Task.cancel()` 透传、`LaneController.close()` 取消 pending acquire 并 best-effort release 当前 controller tokens、不承诺 acquire ordering。
+- lane multi-process tests 必须覆盖：多个独立 Python 进程共享同一 lane DB 时 successful claims 总数不超过 capacity；capacity 满时另一个进程 non-blocking acquire timed out；正常 release 后其它进程可 acquire；持有 claim 的进程崩溃或停止 heartbeat 后，TTL 过期并清理 stale claim 后其它进程可 acquire。
+- filelock unit tests 必须覆盖：parent directory creation、`create_parent_dirs=False` 缺 parent 时错误、context manager release、重复 release 幂等、timeout / non-blocking acquire 错误包装、第三方 `filelock` import 不散落到 Host / Service / Fins / Engine、wrapper 不用于 SQLite / EventLog truth 的文档边界。
+- integration tests: runtime lane multi-process capacity / stale claim cleanup；Host integration tests 无。
 - pyright: 相关包无新增错误。
 - docs: `dayu/README.md` 与受影响包 README 同步。
 
 退出条件：
-- 后续 phase 可以只依赖 typed contract，不需要自行发明 request、snapshot、status、runtime helper 或工具装配入口。
+- typed contracts 存在且从 `dayu.host` 公共命名空间可导入：Host handle / command facet type、`HostCallContext`、`OperationContext`、Host request 类型、`SessionSnapshot`、`RunSnapshot`、`FollowupSnapshot`、`PurgeSessionResult`、`HostEventStream`、Session / Run / Attempt status enum、Host API error code、stream cursor 类型。
+- Host construction typed contracts 存在且从 `dayu.host` 公共命名空间可导入：`HostToolingOptions`、`ToolBundleSourceRef`、`ToolBundleSourceKind`、`FrameworkToolName`、`FrameworkToolPolicyView`。`ToolBundleSourceKind` 与 `FrameworkToolName` 必须使用 Python 3.11 `enum.StrEnum`，不得使用普通 `str` 常量或 `typing.Literal`。
+- `FrameworkToolPolicyView` 是 frozen dataclass 风格类型，至少包含 `reserved_framework_tool_names: frozenset[FrameworkToolName]` 与 `enabled_framework_tools: frozenset[FrameworkToolName]`；Phase 1 只定义 construction-time framework-tool policy view，不实现 ToolRuntime 注入或完整 `ToolGovernancePolicyView`。
+- `dayu.runtime.lane` 存在并实现 `LaneConfig`、`SQLiteLaneCoordinatorConfig`、`LaneOwner`、`LaneController`、`LaneClaimToken`、`LaneAcquireOutcome`；满足 cross-process runtime capacity claim、独立 runtime SQLite lane DB、可取消 acquire、timeout、close pending acquire、claim TTL / heartbeat、stale claim cleanup、幂等 release、无 FIFO / fairness guarantee、无 Host truth / lease / fencing / Attempt owner / Attempt takeover / recovery proof 语义。
+- `dayu.runtime.filelock` 存在并实现同步 `file_lock(...)` wrapper、`RuntimeFileLockOptions`、`RuntimeFileLock`、`RuntimeFileLockToken`；满足 parent directory、timeout、第三方 timeout error wrapping、幂等 release、无 stale lock takeover、无 reentrancy guarantee、无 SQLite / EventLog / Host truth 语义。
+- `dayu.runtime.lane` 与 `dayu.runtime.filelock` 满足层中立 import boundary；`dayu.runtime` 不 import `dayu.engine` / `dayu.host` / `dayu.service` / `dayu.ui` / `dayu.fins`。
+- unit tests 覆盖 Host public contract validation、`ToolBundle` construction input validation、reserved framework tool name 冲突、`dayu.runtime.lane` 设计要求、`dayu.runtime.filelock` 设计要求；multi-process tests 覆盖 runtime lane DB capacity invariant 与 stale claim cleanup。
+- pyright 在相关包上通过，且不新增、不扩散类型错误。
+- docs 按 README 触发规则同步：`dayu/README.md`、受影响包 README、`tests/README.md` 只在职责范围内更新。
+- 明确 non-goals 仍未实现且测试不期待这些能力：Host SQLite durable store / EventLog store、Host command path、Engine 执行路径、ToolRuntime policy resolution / framework tool 注入、ToolsDiscovery / ScenePrepare 具体 adapter、manifest schema、业务工具扫描、财报场景 prompt。
 
 后续依赖：
 - 后续 phase 可依赖的稳定契约：Host public typing、runtime helper、ToolBundle construction input。
-- 需要追踪到后续 phase 的事项：具体 Host store / command path 不在本 phase 落地；RunInputBuilder typed input provider protocols 在 Phase 5 建立，不在本 phase 落地，Phase 5 必须保持与本 phase 公共类型风格和 import boundary 一致。
+- 需要追踪到后续 phase 的事项：具体 Host store / command path 不在本 phase 落地；RunInputBuilder typed input provider protocols 在 Phase 5 建立，不在本 phase 落地，Phase 5 必须保持与本 phase 公共类型风格和 import boundary 一致；ToolsDiscovery / ScenePrepare 具体 adapter 与 manifest / provider typed contract 按用户要求 deferred destination 标记为 Phase 12，不能夹带进 Phase 1。
 
 ### Phase 2. Durable Store / EventLog / Payload Foundation
 
@@ -474,7 +494,7 @@ Phase 按依赖关系推进：先实现被其它阶段依赖的公共契约、ru
 - 不实现 UI / Service channel delivery。
 - 不实现 wait adapter。
 - 不实现 `resolve_wait` 的等待结果治理语义；该能力在 Phase 7 落地。
-- 不实现 `purge_session` 的 destructive cleanup；该能力在 Phase 14 落地。
+- 不实现 `purge_session` 的 destructive cleanup；该能力在 Phase 15 落地。
 
 关键设计问题：
 - 必须确认 `submit_followup(queue)` 如何在事务内吸收 active Run 竞态。
@@ -504,7 +524,7 @@ Phase 按依赖关系推进：先实现被其它阶段依赖的公共契约、ru
 
 后续依赖：
 - 后续 phase 可依赖的稳定契约：public command path、Host handle、typed options、snapshot shape、API idempotency、read API shape（`get_run` / `get_session` / `stream_run_events` 的 snapshot 与 cursor contract）。
-- 需要追踪到后续 phase 的事项：执行、projection、memory、remote 后续接入不得绕过 public command path；Phase 8 依赖本 phase 的 read API shape 与 snapshot / stream cursor contract；`resolve_wait` public signature / request envelope 在本 phase 稳定，等待结果治理语义在 Phase 7 落地；`purge_session` public signature / `PurgeSessionResult` / idempotency contract 在本 phase 稳定，destructive cleanup 在 Phase 14 落地。
+- 需要追踪到后续 phase 的事项：执行、projection、memory、remote 后续接入不得绕过 public command path；Phase 8 依赖本 phase 的 read API shape 与 snapshot / stream cursor contract；`resolve_wait` public signature / request envelope 在本 phase 稳定，等待结果治理语义在 Phase 7 落地；`purge_session` public signature / `PurgeSessionResult` / idempotency contract 在本 phase 稳定，destructive cleanup 在 Phase 15 落地。
 
 ### Phase 5. RunInputBuilder 与本地执行 Dispatch
 
@@ -911,7 +931,73 @@ Phase 按依赖关系推进：先实现被其它阶段依赖的公共契约、ru
 - 后续 phase 可依赖的稳定契约：startup recovery、positive orphan proof、RECOVERING dispatch。
 - 需要追踪到后续 phase 的事项：远端 orphan execution 仍按 RemoteProxy phase 和 exactly-once 非目标治理。
 
-### Phase 12. Audit / Tool Trace / Outbox Projections
+### Phase 12. ToolsDiscovery / ScenePrepare
+
+目标：
+- 实现独立于 Host 的工具发现 / 注册与场景准备 runtime assembly 边界，让业务工具集合与 scene inputs 能在 Host construction / Service request envelope 前被 typed 组装，不让 Host import 具体业务工具、扫描业务包或拼接财报场景 prompt。
+
+对应设计章节：
+- `docs/host/design.md` §3 dayu.runtime
+- `docs/host/design.md` §10.1 Host Handle / Composition Root
+- `docs/host/design.md` §11 Host 公共接口
+- `docs/host/design.md` §18.1 ToolBundle Input / Runtime Tool View
+- `dayu/README.md` 术语约定与 Runtime
+
+前置条件：
+- Phase 1 Host public typing、`HostToolingOptions`、`ToolBundleSourceRef`、`ToolBundleSourceKind` 与 `FrameworkToolPolicyView` 已完成。
+- Phase 4 Host public API command path 已完成。
+- Phase 6 ToolRuntime / ToolBundle snapshot / framework tool policy 已完成。
+
+进入条件：
+- 确认 ToolsDiscovery / ScenePrepare 仍是 Host 外部装配能力，不拥有 Session / Run / Attempt / EventLog truth。
+- 确认具体财报业务工具 provider、财报 prompt 文案、财报 scene manifest 内容属于 Service / Fins / 配置边界，不写入 `dayu.runtime`。
+- 确认是否需要把 ToolsDiscovery / ScenePrepare 放入 `dayu.runtime`；若放入，只能依赖标准库与 `dayu.contracts`，不得 import `dayu.host` / `dayu.engine` / `dayu.service` / `dayu.ui` / `dayu.fins` 或具体业务工具包。
+
+范围：
+- 允许修改：ToolsDiscovery typed provider protocol、tool provider aggregation、`ToolBundle` validation / source refs assembly、ScenePrepare typed manifest assembly helper、scene input typed output、import boundary tests、相关 README。
+- 禁止修改：Host durable state machine、Host command path、Engine execution path、ToolRuntime accept barrier、具体业务财报工具实现、财报仓储实现。
+
+不做：
+- 不实现 Audit / Tool Trace / Outbox projection；该能力在 Phase 13。
+- 不实现业务财报工具扫描硬编码清单。
+- 不把财报 prompt 文案、业务 scene manifest 内容或 Fins storage 访问逻辑放入 `dayu.runtime`。
+- 不让 per-run request 携带 raw `ToolBundle` 或 callable binding。
+
+关键设计问题：
+- 必须确认 ToolsDiscovery provider protocol 的最小 typed shape：provider identity、version / digest source refs、`ToolDefinition` collection output、duplicate name handling、reserved framework tool name conflict handling。
+- 必须确认 ScenePrepare 的 typed scene input output shape，以及它如何进入 Service / Host request envelope 而不变成 Host 状态机语义。
+- 必须确认 ToolsDiscovery / ScenePrepare 的 import boundary tests，防止 runtime import 具体业务工具、Fins、Host、Engine、Service 或 UI。
+- 必须确认 source refs / digest 与 Phase 1 `HostToolingOptions`、Attempt snapshot refs 和 audit / diagnostic refs 的衔接方式。
+
+交付物：
+- phase design refinement
+- handoff implementation-ready plan
+- implementation slices
+- tests
+- docs update
+
+建议 slice 切分：
+- Slice 1: ToolsDiscovery provider protocol and ToolBundle aggregation。
+- Slice 2: ToolBundle source refs / digest assembly and reserved framework tool name validation。
+- Slice 3: ScenePrepare typed manifest assembly helper and scene input output。
+- Slice 4: import boundary tests and README sync。
+
+验证要求：
+- unit tests: provider aggregation、duplicate tool names、reserved framework tool conflicts、source refs / digest stability、scene manifest assembly、invalid manifest errors。
+- import boundary tests: runtime assembly modules 不 import `dayu.host` / `dayu.engine` / `dayu.service` / `dayu.ui` / `dayu.fins` 或具体业务工具包。
+- integration tests: 可使用 fake providers / fake scene manifests；不依赖真实财报工具扫描或财报 prompt 文案。
+- pyright: runtime assembly / affected contracts 通过。
+- docs: `dayu/README.md` 与受影响包 README 按职责同步。
+
+退出条件：
+- 外部装配方可以通过 typed provider / manifest assembly 得到业务 `ToolBundle`、`ToolBundleSourceRef` 与 typed scene inputs，并把它们交给 Host construction / request envelope，而无需 Host import 业务工具或拼 scene prompt。
+- Runtime assembly 边界不持有 Host truth，不参与 Run / Attempt lifecycle，不决定 EventLog / ToolRuntime accept barrier。
+
+后续依赖：
+- 后续 phase 可依赖的稳定契约：business `ToolBundle` discovery boundary、scene input assembly boundary、source refs / digest assembly。
+- 需要追踪到后续 phase 的事项：具体财报工具 provider、财报 scene manifest 内容、财报 prompt 文案仍属于 Service / Fins / 配置 work unit，不属于 runtime assembly phase。
+
+### Phase 13. Audit / Tool Trace / Outbox Projections
 
 目标：
 - 在已稳定的 EventLog consumer framework 上实现 LogAuditSink、tool trace hot / cold storage 与 Outbox terminal delivery queue projection。
@@ -969,7 +1055,7 @@ Phase 按依赖关系推进：先实现被其它阶段依赖的公共契约、ru
 - 后续 phase 可依赖的稳定契约：audit JSONL、tool trace hot / cold、outbox terminal delivery queue。
 - 需要追踪到后续 phase 的事项：Service / UI channel delivery、外部 audit 系统和长期归档策略不属于本 phase。
 
-### Phase 13. RemoteProxy / RemoteStub
+### Phase 14. RemoteProxy / RemoteStub
 
 目标：
 - 在 LocalProxy 语义基准上实现 RemoteProxy / RemoteStub transport substitution，保持 Host 治理真源、execution_id late event rejection 与 tool fact accept ack。
@@ -1027,7 +1113,7 @@ Phase 按依赖关系推进：先实现被其它阶段依赖的公共契约、ru
 - 后续 phase 可依赖的稳定契约：Remote transport substitution、tool accept ack over remote、late event diagnostic。
 - 需要追踪到后续 phase 的事项：远程 wire protocol 细节可以独立演进，但不能改变 semantic contract。
 
-### Phase 14. Retention / Purge / Production Hardening
+### Phase 15. Retention / Purge / Production Hardening
 
 目标：
 - 收口第一版生产化要求：`purge_session` destructive cleanup、audit tombstone、projection rebuild 验证、性能 / 并发 smoke、docs 与 residual risk 归档。
@@ -1040,7 +1126,7 @@ Phase 按依赖关系推进：先实现被其它阶段依赖的公共契约、ru
 - `docs/host/design.md` §28 第一版 Non-goals
 
 前置条件：
-- Phase 8 projection core、Phase 11 recovery、Phase 12 Audit / Tool Trace / Outbox、Phase 13 remote 已完成。
+- Phase 8 projection core、Phase 11 recovery、Phase 13 Audit / Tool Trace / Outbox、Phase 14 remote 已完成。
 
 进入条件：
 - 确认第一版 release / PR 前必须关闭的 residual risk 与可接受 non-goals。
@@ -1059,7 +1145,7 @@ Phase 按依赖关系推进：先实现被其它阶段依赖的公共契约、ru
 关键设计问题：
 - 必须确认 purge 对 EventLog / payload / projection / outbox / tool trace hot data / audit JSONL 的最终清理矩阵。
 - 必须确认第一版 residual risks 的接受、后续 issue 或当前修复归属。
-- 必须确认 purge / tombstone / projection rebuild slices 是否可以在 Remote smoke 之前独立完成；remote smoke / release closeout slice 依赖 Phase 13。
+- 必须确认 purge / tombstone / projection rebuild slices 是否可以在 Remote smoke 之前独立完成；remote smoke / release closeout slice 依赖 Phase 14。
 
 交付物：
 - phase design refinement
@@ -1153,8 +1239,8 @@ Phase 按依赖关系推进：先实现被其它阶段依赖的公共契约、ru
 追踪项：
 
 - 不修改 `docs/host/design.md`；这不是 Host 架构边界新决策，而是 tool trace / analyze 工具排障能力需求。
-- Phase 12. Audit / Tool Trace / Outbox Projections 实现 tool trace 与后续 `utils/analyze_tool_trace.py` 时，必须把 `provider_request_id` 纳入热 JSON projection 与冷 JSONL，便于按 OpenAI `x-request-id` 排查 provider 错误、超时、协议错误和重试耗尽。
-- 后续 Host 外部 Service / provider adapter work unit 若为 OpenAI-compatible request 注入 `X-Client-Request-Id`，Phase 12 tool trace 也必须记录对应 client-side request id，并与 `provider_request_id`、`run_id`、`attempt_id`、`execution_id`、`event_sequence` 一起可查询。
+- Phase 13. Audit / Tool Trace / Outbox Projections 实现 tool trace 与后续 `utils/analyze_tool_trace.py` 时，必须把 `provider_request_id` 纳入热 JSON projection 与冷 JSONL，便于按 OpenAI `x-request-id` 排查 provider 错误、超时、协议错误和重试耗尽。
+- 后续 Host 外部 Service / provider adapter work unit 若为 OpenAI-compatible request 注入 `X-Client-Request-Id`，Phase 13 tool trace 也必须记录对应 client-side request id，并与 `provider_request_id`、`run_id`、`attempt_id`、`execution_id`、`event_sequence` 一起可查询。
 - 对 timeout / network error 且 `provider_request_id=None` 的场景，analyze 工具应提示优先查看 client-side request id / `X-Client-Request-Id`、网络错误类型、attempt 次数和 retry history。
 
 #### SQLite 多进程写入正确性验证
@@ -1172,6 +1258,22 @@ Phase 按依赖关系推进：先实现被其它阶段依赖的公共契约、ru
 - Phase 3. Session / Run / Attempt 状态机与 Admission 的多进程测试必须覆盖同 Session 并发 `start_run`、重复 `client_request_id`、active slot admission、queue promotion、cancel / terminal race、EventLog `event_sequence` 单调性。
 - phase plan 不得把 SQLite 写竞争作为引入服务化 DB 或消息队列的默认理由。
 
+#### Phase 1 Runtime Lane 风险追踪
+
+结论：
+
+- Phase 1 runtime lane 是 cross-process runtime capacity coordinator，不是 Host durable truth、lease / fencing、Attempt owner、EventLog ordering、admission 或 recovery proof。
+- Phase 1 plan review loop 已确认 runtime lane 使用独立 SQLite runtime lane DB，且 successful acquire 的 stale cleanup、active count 与 insert 必须在同一个 SQLite transaction 内完成。
+- runtime lane 的 residual risks 属于 Phase 1 implementation validation 与 Phase 11 multi-process hardening 观察项，不阻塞 Phase 1 plan 进入用户确认。
+
+追踪项：
+
+- Phase 1 implementation 必须明确 runtime lane SQLite busy timeout 默认值、错误包装和测试断言；不得把 busy timeout 失败解释为 Host admission 或 recovery failure。
+- Phase 1 implementation 必须测试 heartbeat 只能刷新当前 token owner 的 active claim，release 幂等且不释放其它 claim。
+- Phase 1 implementation 必须按 TTL eventual consistency 处理 stale claim cleanup；测试只能断言 TTL 过期后可清理并重新 acquire，不得假设跨进程时钟完全同步或严格公平。
+- Phase 1 implementation 必须说明 runtime lane DB 的默认路径注入和 workspace cleanup 责任；若默认路径仍不足以由设计真源决定，implementation agent 必须停下交给 controller，不得自行选择。
+- Phase 11. Host Lifecycle / Recovery / Multi-process Hardening 可基于 Phase 1 lane DB 行为补充压力测试和长期残留 DB cleanup 策略，但不得把 lane token 升级为 Host truth。
+
 #### Remote 物理执行 exactly-once 非目标
 
 结论：
@@ -1183,9 +1285,9 @@ Phase 按依赖关系推进：先实现被其它阶段依赖的公共契约、ru
 
 追踪项：
 
-- Phase 13. RemoteProxy / RemoteStub 必须测试旧 `execution_id` 的迟到 Engine event、迟到 tool result、迟到 terminal 只能进入 diagnostic / trace，不能污染 canonical EventLog。
+- Phase 14. RemoteProxy / RemoteStub 必须测试旧 `execution_id` 的迟到 Engine event、迟到 tool result、迟到 terminal 只能进入 diagnostic / trace，不能污染 canonical EventLog。
 - Phase 6. ToolRuntime / Truncation / fetch_more / Duplicate Governance 必须明确具有外部副作用的工具的 idempotency key、side-effect policy 和可取消能力。
-- Phase 13. RemoteProxy / RemoteStub 不得引入远端 takeover attempt、远端 append EventLog 或远端更新 Run 状态。
+- Phase 14. RemoteProxy / RemoteStub 不得引入远端 takeover attempt、远端 append EventLog 或远端更新 Run 状态。
 
 #### Session Purge / Archive 追踪
 
@@ -1198,8 +1300,8 @@ Phase 按依赖关系推进：先实现被其它阶段依赖的公共契约、ru
 
 追踪项：
 
-- Phase 4. Host Public API Command Path 必须稳定 `purge_session` 的 request、幂等、错误形状和 `PurgeSessionResult` 公共契约；Phase 14. Retention / Purge / Production Hardening 必须细化删除范围、tombstone 存储位置和 destructive cleanup 语义。
-- Phase 14. Retention / Purge / Production Hardening 必须定义共享 cold artifact 的引用计数或 ref 检查，防止 purge 删除仍被其它 Session 引用的 artifact。
+- Phase 4. Host Public API Command Path 必须稳定 `purge_session` 的 request、幂等、错误形状和 `PurgeSessionResult` 公共契约；Phase 15. Retention / Purge / Production Hardening 必须细化删除范围、tombstone 存储位置和 destructive cleanup 语义。
+- Phase 15. Retention / Purge / Production Hardening 必须定义共享 cold artifact 的引用计数或 ref 检查，防止 purge 删除仍被其它 Session 引用的 artifact。
 - 后续单独追踪 `archive_session` 的需求和边界；不得用 `purge_session` 模拟 archive。
 
 #### Host 跨层测试策略追踪
@@ -1214,9 +1316,9 @@ Phase 按依赖关系推进：先实现被其它阶段依赖的公共契约、ru
 
 - Phase 3. Session / Run / Attempt 状态机与 Admission 必须提供 Run / Attempt / Session 状态迁移单元测试。
 - Phase 2. Durable Store / EventLog / Payload Foundation 必须提供 SQLite transaction、CAS、唯一约束、多进程竞争和 crash recovery foundation 测试。
-- Phase 5. RunInputBuilder 与本地执行 Dispatch 必须提供 WorkerProxy fake integration；Phase 13. RemoteProxy / RemoteStub 必须提供迟到事件、断连、重发和 accept ack 测试。
+- Phase 5. RunInputBuilder 与本地执行 Dispatch 必须提供 WorkerProxy fake integration；Phase 14. RemoteProxy / RemoteStub 必须提供迟到事件、断连、重发和 accept ack 测试。
 - Phase 6. ToolRuntime / Truncation / fetch_more / Duplicate Governance 必须提供外部业务 `ToolBundle` 输入、attempt-local effective `ToolBundle`、`fetch_more` 注入、tool fact accept barrier、truncate / fetch_more、重复工具调用治理和 side-effect policy 测试。
-- Phase 8. Projection Core / Host Event Stream / Minimal Read Model 必须提供 EventLog replay、checkpoint、Host event stream、minimal read model 的幂等追平测试；Phase 12. Audit / Tool Trace / Outbox Projections 必须提供 Outbox、audit、usage、tool trace 的幂等追平测试。
+- Phase 8. Projection Core / Host Event Stream / Minimal Read Model 必须提供 EventLog replay、checkpoint、Host event stream、minimal read model 的幂等追平测试；Phase 13. Audit / Tool Trace / Outbox Projections 必须提供 Outbox、audit、usage、tool trace 的幂等追平测试。
 - Phase 11. Host Lifecycle / Recovery / Multi-process Hardening 必须提供 Host restart、positive orphan proof、LOST / RECOVERABLE_LOST、prompt 已 accepted 但 answer 未返回的恢复测试。
 
 #### UI / Service Outbox 去重边界追踪
@@ -1230,36 +1332,20 @@ Phase 按依赖关系推进：先实现被其它阶段依赖的公共契约、ru
 
 追踪项：
 
-- Phase 12. Audit / Tool Trace / Outbox Projections 必须保证 outbox item 携带稳定 `terminal_event_id`、`event_sequence`、`run_id`、`result_digest` 和幂等 item key。
+- Phase 13. Audit / Tool Trace / Outbox Projections 必须保证 outbox item 携带稳定 `terminal_event_id`、`event_sequence`、`run_id`、`result_digest` 和幂等 item key。
 - Host 外部 Service / UI 后续 work unit 必须定义 `last_seen_terminal_event_sequence` 或 `seen_terminal_event_ids` 的持久化位置和更新时机。
 - Host 外部 Service / UI 后续 work unit 必须覆盖：客户端在线已展示 final answer 后离线重连，从 Outbox 读取增量时不会重复显示同一 terminal answer。
 - Host 外部 UI 显示聊天记录必须按 terminal identity upsert / dedupe，不得按 final answer 文本内容去重。
 
 ## 当前状态
 
-当前阶段为 P0：Engine Context Compaction Event 语义前置。Host 代码实施尚未开始；`docs/host/design.md` 已是 Host 架构真源，
-`dayu/README.md` 是项目级术语真源。用户已确认 P0 直接进入 plan gate，并允许本 work unit 修改 Engine contract / docs / tests。
+P0：Engine Context Compaction Event 语义前置已完成 implementation 与 review loop；P0-S1 accepted slice commit 为 `ad6d116`，P0-S2 accepted slice commit 为 `6f6e716`。P0 后续状态进入 push / PR 路径，不再是当前 Host phase design gate。
 
-当前 gate 为 PR。P0 plan 已写入 `docs/host/phase0-engine-context-compaction-plan.md`；AgentMiMo 与 AgentDS 已完成并行 plan review，
-review artifacts 分别为 `docs/reviews/gateflow-plan-review-host-p0-engine-context-compaction-mimo-20260513.md` 和
-`docs/reviews/gateflow-plan-review-host-p0-engine-context-compaction-ds-20260513.md`。总控裁决已写入
-`docs/reviews/gateflow-plan-review-host-p0-engine-context-compaction-controller-adjudication-20260513.md`，plan fix artifact 已写入
-`docs/reviews/gateflow-plan-fix-host-p0-engine-context-compaction-20260513.md`。plan re-review artifacts 已写入
-`docs/reviews/gateflow-plan-re-review-host-p0-engine-context-compaction-mimo-20260513.md` 和
-`docs/reviews/gateflow-plan-re-review-host-p0-engine-context-compaction-ds-20260513.md`，re-review 总控裁决已写入
-`docs/reviews/gateflow-plan-re-review-host-p0-engine-context-compaction-controller-adjudication-20260513.md`。
+当前工作为 Phase 1：公共契约与 runtime 基础设施。Phase 1 design refinement 已写入 `docs/reviews/gateflow-phase-design-host-p1-codex-20260513.md`，controller-accepted design fix 已写入 `docs/reviews/gateflow-phase-design-fix-host-p1-codex-20260513.md`。用户反馈后的 design fixes 已写入 `docs/reviews/gateflow-phase-design-user-feedback-fix-host-p1-codex-20260513.md` 与 `docs/reviews/gateflow-phase-design-user-feedback-fix2-host-p1-codex-20260513.md`。AgentMiMo 与 AgentDS 的 phase design re-review 均确认 accepted findings 已修复且 new blocker 为 0；round2 re-review 进一步确认 lane 已改为 cross-process runtime capacity guard，Phase Map 已重排为 P12 ToolsDiscovery / ScenePrepare、P13 Audit / Tool Trace / Outbox、P14 RemoteProxy、P15 Retention / Purge。Phase 1 plan 已写入 `docs/host/phase1-public-contract-runtime-plan.md`；plan review、controller adjudication、plan fix 与 plan re-review artifacts 已写入 `docs/reviews/`。AgentMiMo 与 AgentDS 的 plan re-review 均确认 finding 数量为 0、blocking finding 数量为 0。用户已确认 Phase 1 plan；accepted plan commit 为 `34b1b41`。Phase 1 Slice 1 accepted slice commit 为 `66d8dc3`，Slice 2 accepted slice commit 为 `27e0d8b`，Slice 3 accepted slice commit 为 `e23e3e4`，Slice 4 accepted slice commit 为 `0393a22`。用户已更新工作范式：从 Slice 3 起仅使用 AgentMiMo 做 review / re-review，slice 通过 review loop 后自动提交，完成所有 slices 后再停。当前 gate 为 Phase 1 implementation complete checkpoint：四个 slices 已实施、review 并提交，等待用户确认下一步。
 
-P0 plan re-review 已通过，用户已确认进入 implementation；accepted plan commit 为 `866f6f5`。P0-S1 implementation artifact 已写入
-`docs/reviews/gateflow-implementation-host-p0-s1-engine-context-compaction-20260513.md`。P0-S1 code review artifacts 已写入
-`docs/reviews/gateflow-code-review-host-p0-s1-engine-context-compaction-mimo-20260513.md` 和
-`docs/reviews/gateflow-code-review-host-p0-s1-engine-context-compaction-ds-20260513.md`；code review 总控裁决已写入
-`docs/reviews/gateflow-code-review-host-p0-s1-engine-context-compaction-controller-adjudication-20260513.md`，C1 fix artifact 已写入
-`docs/reviews/gateflow-fix-host-p0-s1-engine-context-compaction-20260513.md`。P0-S1 code re-review artifacts 已写入
-`docs/reviews/gateflow-code-re-review-host-p0-s1-engine-context-compaction-mimo-20260513.md` 和
-`docs/reviews/gateflow-code-re-review-host-p0-s1-engine-context-compaction-ds-20260513.md`，code re-review 总控裁决已写入
-`docs/reviews/gateflow-code-re-review-host-p0-s1-engine-context-compaction-controller-adjudication-20260513.md`。P0-S1 accepted slice commit 为 `ad6d116`。P0-S2 implementation artifact 已写入
-`docs/reviews/gateflow-implementation-host-p0-s2-docs-context-compaction-20260513.md`。P0-S2 code review artifacts 已写入
-`docs/reviews/gateflow-code-review-host-p0-s2-docs-context-compaction-mimo-20260513.md` 和
-`docs/reviews/gateflow-code-review-host-p0-s2-docs-context-compaction-ds-20260513.md`，code review 总控裁决已写入
-`docs/reviews/gateflow-code-review-host-p0-s2-docs-context-compaction-controller-adjudication-20260513.md`。P0-S2 accepted slice commit 为 `6f6e716`。P0 两个 implementation slices 均已完成并通过 review loop，当前按用户确认进入 push / PR。P0 plan fix 已补充：明确 Runner HTTP overflow event-path 测试、P0-S1 pyright completion signal、
-Phase 5 与 Phase 10 对 `budget_state=None` 的责任切分、多行 sentinel 搜索防线、`None` 与真实 `ContextBudgetSnapshot` 两条合法 contract 测试、`runner_events.py` docstring 目检，以及 `dayu/README.md` 术语精化边界。
+Phase 1 implementation 收口验证：
+
+- `source .venv/bin/activate && pytest tests/host tests/runtime -q`：102 passed。
+- `source .venv/bin/activate && python -m pyright dayu/ tests/ utils/`：0 errors。
+
+Phase 1 plan gate 通过证据：`docs/host/design.md`、`docs/host/implementation-control.md` 与 `dayu/README.md` 对 Host public typing、`ToolBundle` construction input、cross-process `dayu.runtime.lane`、`dayu.runtime.filelock`、ToolsDiscovery / ScenePrepare 的 Phase 12 destination 保持一致；AgentMiMo 与 AgentDS 的 Phase 1 design review accepted findings 已有 fix artifact 与 re-review artifact 记录；用户已确认进入 phase plan；`docs/host/phase1-public-contract-runtime-plan.md` 已生成；AgentMiMo 与 AgentDS 已完成 plan review、fix 后 re-review 并确认无剩余 finding。

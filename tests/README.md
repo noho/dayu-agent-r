@@ -14,10 +14,10 @@ source .venv/bin/activate
 
 ## 常用命令
 
-运行当前契约、Runtime 与 Engine 测试：
+运行当前契约、Host、Runtime 与 Engine 测试：
 
 ```bash
-pytest tests/contracts tests/runtime tests/engine -q
+pytest tests/contracts tests/host tests/runtime tests/engine -q
 ```
 
 运行类型检查：
@@ -30,7 +30,11 @@ python -m pyright dayu/ tests/ utils/
 
 ```bash
 pytest tests/contracts -q
+pytest tests/host -q
+pytest tests/host/test_tooling_options.py tests/host/test_package_exports.py tests/host/test_import_boundary.py -q
 pytest tests/runtime -q
+pytest tests/runtime/test_filelock.py tests/runtime/test_import_boundary.py -q
+pytest tests/runtime/test_lane.py tests/runtime/test_lane_multiprocess.py -q
 pytest tests/engine -q
 pytest tests/engine/contracts -q
 pytest tests/engine/runners/openai/test_event_flow_ordering.py -q
@@ -45,6 +49,11 @@ pytest tests/engine/test_smoke_async_agent_providers.py -q
 
 - import boundary：阻止 runtime 反向依赖 Engine、Service、UI、fins 或引入运行期 HTTP 客户端。
 - cancellation：覆盖取消等待 helper 的完成、取消与异常传播语义。
+- lane：覆盖 cross-process named semaphore / capacity guard 的配置校验、独立 SQLite runtime lane DB schema、acquire /
+  heartbeat / release、timeout、协作式 cancellation、`Task.cancel()` 透传、controller close、跨进程 capacity invariant、
+  release 后其它进程 acquire，以及 crash 后 TTL stale cleanup eventual acquire；测试不断言 FIFO、公平性或 Host
+  dispatch 集成。
+- filelock：覆盖同步 file lock wrapper 的 parent directory 创建策略、禁用创建时的结构化错误、context manager 正常与异常路径 release、release 幂等、non-blocking timeout 包装，以及第三方 `filelock` import 只能出现在 `dayu.runtime.filelock` 的边界。
 - logging：验证 `dayu.runtime.log` 的 logger 装配、CLI 风格级别解析、`VERBOSE` / `CRITICAL` 级别契约，并验证 `dayu.runtime.log_levels` 只提供公共日志级别常量、不注册 stdlib logging level。
 
 ### `tests/contracts/`
@@ -56,6 +65,16 @@ pytest tests/engine/test_smoke_async_agent_providers.py -q
 - weak typing guard：通过 AST 扫描阻止 `Any`、`object`、无类型签名与裸容器注解进入公共契约源码。
 - ToolExecutionOutcome / ToolResult / ToolCall 等契约测试：覆盖工具调用 provider state、工具结果信封、工具执行 outcome 封闭联合与穷尽匹配。
 - tool declaration：覆盖最小 `@tool(..., truncate=ToolTruncateSpec(...))` 声明能力，确认 `ToolDefinition` / `ToolBundle` 只投影 `ToolSchema` 给 Engine。
+
+### `tests/host/`
+
+Host 公共 API 类型与 construction tooling options 测试，覆盖 `dayu.host` 的稳定边界：
+
+- package exports：锁定 `dayu.host.__all__` 与 `dayu.host.api.__all__` 白名单，确认 tooling 类型可从包根导入但不进入 `dayu.host.api`。
+- public contracts：验证 status / error 枚举字符串值、frozen slots dataclass、结构化 `HostApiError` 与 request validation failure paths。
+- tooling options：验证 `ToolBundleSourceKind` / `FrameworkToolName` 为 `StrEnum`、默认 reserved framework tool policy、source refs 非空、业务 `ToolBundle` 不得占用 `fetch_more` 等 reserved framework tool name，以及 default policy view 不共享可变状态。
+- import boundary：阻止 Host 公共类型层导入 Engine、Fins、Service 或 UI，并确认 business `ToolBundle` 不进入 per-run request dataclass 字段。
+- weak typing guard：通过 AST 扫描阻止 `Any`、`object`、无类型签名与裸容器注解进入 Host 公共类型源码。
 
 ### `tests/engine/`
 
@@ -93,6 +112,7 @@ OpenAI-compatible Runner 的 provider 协议测试，覆盖从 payload 构建、
 ## 维护约定
 
 - 新增公共契约必须补 package export、import boundary、weak typing guard 相关测试。
+- 新增 Host 公共类型必须同步更新 `tests/host/test_package_exports.py`，并为新增 request / snapshot 或 construction options 校验补充对应测试。
 - 新增 Runner 行为必须优先补协议事件流测试，确保下游 Engine loop 能无歧义消费。
 - 状态机测试必须覆盖输入事实、状态分支、事件顺序、终态收口。
 - 架构边界测试必须阻止反向依赖，尤其是下层导入上层实现或私有治理概念。
