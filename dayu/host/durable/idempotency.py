@@ -10,10 +10,18 @@ from __future__ import annotations
 from dataclasses import dataclass
 from datetime import UTC, datetime
 
-from dayu.host.durable.codec import format_utc_timestamp, is_sha256_digest
+from dayu.host.durable._validation import (
+    optional_int as _optional_int,
+    optional_text as _optional_text,
+    require_non_empty_text as _require_non_empty_text,
+    require_optional_non_empty_text as _require_optional_non_empty_text,
+    require_sha256_digest as _validate_digest,
+    require_text as _require_text,
+)
+from dayu.host.durable.codec import format_utc_timestamp
 from dayu.host.durable.errors import HostDurableError, HostIdempotencyConflictError
 from dayu.host.durable.schema import TABLE_IDEMPOTENCY_RECORDS
-from dayu.host.durable.transaction import HostRow, HostTransaction, SQLiteScalar
+from dayu.host.durable.transaction import HostRow, HostTransaction
 
 
 @dataclass(frozen=True, slots=True)
@@ -244,19 +252,6 @@ def _validate_result_ref(result: IdempotencyResultRef) -> None:
         )
 
 
-def _validate_digest(value: str, *, field_name: str) -> None:
-    """校验 digest 字符串格式。
-
-    :param value: 待校验 digest。
-    :param field_name: 错误消息中的字段名。
-    :returns: ``None``。
-    :raises HostDurableError: digest 格式无效时抛出。
-    """
-
-    if not is_sha256_digest(value):
-        raise HostDurableError(f"{field_name} must be sha256 digest")
-
-
 def _idempotency_record_from_host_row(row: HostRow) -> IdempotencyRecord:
     """把通用 HostRow 转换为 IdempotencyRecord。
 
@@ -284,75 +279,3 @@ def _idempotency_record_from_host_row(row: HostRow) -> IdempotencyRecord:
         ),
         created_at=_require_text(row.get("created_at"), field_name="created_at"),
     )
-
-
-def _require_non_empty_text(value: str, *, field_name: str) -> None:
-    """校验必填文本非空。
-
-    :param value: 待校验文本。
-    :param field_name: 错误消息中的字段名。
-    :returns: ``None``。
-    :raises HostDurableError: 文本为空时抛出。
-    """
-
-    if value == "" or value.isspace():
-        raise HostDurableError(f"{field_name} must be non-empty")
-
-
-def _require_optional_non_empty_text(
-    value: str | None, *, field_name: str
-) -> None:
-    """校验 optional 文本如果存在则非空。
-
-    :param value: 待校验文本。
-    :param field_name: 错误消息中的字段名。
-    :returns: ``None``。
-    :raises HostDurableError: 文本为空字符串或纯空白字符串时抛出。
-    """
-
-    if value is not None and (value == "" or value.isspace()):
-        raise HostDurableError(f"{field_name} must be non-empty when provided")
-
-
-def _require_text(value: SQLiteScalar, *, field_name: str) -> str:
-    """把 SQLite scalar 校验并转换为必填文本。
-
-    :param value: SQLite scalar 值。
-    :param field_name: 错误消息中的字段名。
-    :returns: 文本值。
-    :raises HostDurableError: 值不是文本时抛出。
-    """
-
-    if isinstance(value, str):
-        return value
-    raise HostDurableError(f"{field_name} must be stored as text")
-
-
-def _optional_text(value: SQLiteScalar, *, field_name: str) -> str | None:
-    """把 SQLite scalar 校验并转换为 optional 文本。
-
-    :param value: SQLite scalar 值。
-    :param field_name: 错误消息中的字段名。
-    :returns: 文本值或 ``None``。
-    :raises HostDurableError: 值不是文本且不是 ``None`` 时抛出。
-    """
-
-    if value is None:
-        return None
-    return _require_text(value, field_name=field_name)
-
-
-def _optional_int(value: SQLiteScalar, *, field_name: str) -> int | None:
-    """把 SQLite scalar 校验并转换为 optional 整数。
-
-    :param value: SQLite scalar 值。
-    :param field_name: 错误消息中的字段名。
-    :returns: 整数值或 ``None``。
-    :raises HostDurableError: 值不是整数且不是 ``None`` 时抛出。
-    """
-
-    if value is None:
-        return None
-    if isinstance(value, int):
-        return value
-    raise HostDurableError(f"{field_name} must be stored as integer")

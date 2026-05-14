@@ -14,6 +14,14 @@ from datetime import UTC, datetime
 from enum import StrEnum
 
 from dayu.contracts.json_value import JsonValue
+from dayu.host.durable._validation import (
+    optional_text as _optional_text,
+    require_int as _require_int,
+    require_non_empty_text as _require_non_empty_text,
+    require_optional_non_empty_text as _require_optional_non_empty_text,
+    require_text as _require_text,
+)
+from dayu.host.durable.artifact import LocalArtifactRef, validate_artifact_ref
 from dayu.host.durable.codec import (
     canonical_json_dumps,
     format_utc_timestamp,
@@ -25,8 +33,9 @@ from dayu.host.durable.errors import (
     HostEventIdentityConflictError,
     HostPayloadReferenceError,
 )
+from dayu.host.durable.payload import PayloadKind, read_payload_descriptor
 from dayu.host.durable.schema import TABLE_EVENT_LOG
-from dayu.host.durable.transaction import HostRow, HostTransaction, SQLiteScalar
+from dayu.host.durable.transaction import HostRow, HostTransaction
 
 _MIN_READ_LIMIT = 1
 _MIN_EVENT_CURSOR = 0
@@ -211,6 +220,9 @@ def append_event(
     """
 
     _validate_append_request(request)
+    _validate_existing_payload_descriptor(
+        transaction, request.payload_ref, request.payload_digest
+    )
     try:
         encoded = _encode_append_request(request)
     except (TypeError, ValueError) as exc:
@@ -492,6 +504,51 @@ def _validate_payload_reference(
         raise HostPayloadReferenceError("EventLog payload_digest is invalid")
 
 
+def _validate_existing_payload_descriptor(
+    transaction: HostTransaction,
+    payload_ref: str | None,
+    payload_digest: str | None,
+) -> None:
+    """校验已存在 payload descriptor 与 EventLog 引用一致。
+
+    缺失 descriptor 仍交给 SQLite foreign key 约束分类为
+    :class:`HostForeignKeyError`，以保持 durable schema 作为缺失引用真源。
+
+    :param transaction: 调用方提供的 Host durable transaction。
+    :param payload_ref: payload descriptor 引用。
+    :param payload_digest: EventLog 记录的 payload digest。
+    :returns: ``None``。
+    :raises HostPayloadReferenceError: 已存在 descriptor digest 不一致或 artifact ref 无效时抛出。
+    """
+
+    if payload_ref is None:
+        return
+    descriptor = read_payload_descriptor(transaction, payload_ref)
+    if descriptor is None:
+        return
+    if descriptor.payload_digest != payload_digest:
+        raise HostPayloadReferenceError(
+            "EventLog payload_digest does not match descriptor"
+        )
+    if descriptor.payload_kind is not PayloadKind.ARTIFACT_REF:
+        return
+    artifact_relative_path = descriptor.artifact_relative_path
+    if artifact_relative_path is None:
+        raise HostPayloadReferenceError("EventLog artifact descriptor is incomplete")
+    try:
+        validate_artifact_ref(
+            LocalArtifactRef(
+                artifact_relative_path=artifact_relative_path,
+                artifact_digest=descriptor.payload_digest,
+                artifact_size_bytes=descriptor.payload_size_bytes,
+            )
+        )
+    except HostDurableError as exc:
+        raise HostPayloadReferenceError(
+            "EventLog artifact descriptor is not a published final artifact"
+        ) from exc
+
+
 def _event_log_row_from_host_row(row: HostRow) -> EventLogRow:
     """把通用 HostRow 转换为 EventLogRow。
 
@@ -539,73 +596,3 @@ def _event_log_row_from_host_row(row: HostRow) -> EventLogRow:
         ),
         appended_at=_require_text(row.get("appended_at"), field_name="appended_at"),
     )
-
-
-def _require_non_empty_text(value: str, *, field_name: str) -> None:
-    """校验必填文本非空。
-
-    :param value: 待校验文本。
-    :param field_name: 错误消息中的字段名。
-    :returns: ``None``。
-    :raises HostDurableError: 文本为空时抛出。
-    """
-
-    if value == "" or value.isspace():
-        raise HostDurableError(f"{field_name} must be non-empty")
-
-
-def _require_optional_non_empty_text(
-    value: str | None, *, field_name: str
-) -> None:
-    """校验 optional 文本如果存在则非空。
-
-    :param value: 待校验文本。
-    :param field_name: 错误消息中的字段名。
-    :returns: ``None``。
-    :raises HostDurableError: 文本为空字符串或纯空白字符串时抛出。
-    """
-
-    if value is not None and (value == "" or value.isspace()):
-        raise HostDurableError(f"{field_name} must be non-empty when provided")
-
-
-def _require_text(value: SQLiteScalar, *, field_name: str) -> str:
-    """把 SQLite scalar 校验并转换为必填文本。
-
-    :param value: SQLite scalar 值。
-    :param field_name: 错误消息中的字段名。
-    :returns: 文本值。
-    :raises HostDurableError: 值不是文本时抛出。
-    """
-
-    if isinstance(value, str):
-        return value
-    raise HostDurableError(f"{field_name} must be stored as text")
-
-
-def _optional_text(value: SQLiteScalar, *, field_name: str) -> str | None:
-    """把 SQLite scalar 校验并转换为 optional 文本。
-
-    :param value: SQLite scalar 值。
-    :param field_name: 错误消息中的字段名。
-    :returns: 文本值或 ``None``。
-    :raises HostDurableError: 值不是文本且不是 ``None`` 时抛出。
-    """
-
-    if value is None:
-        return None
-    return _require_text(value, field_name=field_name)
-
-
-def _require_int(value: SQLiteScalar, *, field_name: str) -> int:
-    """把 SQLite scalar 校验并转换为整数。
-
-    :param value: SQLite scalar 值。
-    :param field_name: 错误消息中的字段名。
-    :returns: 整数值。
-    :raises HostDurableError: 值不是整数时抛出。
-    """
-
-    if isinstance(value, int):
-        return value
-    raise HostDurableError(f"{field_name} must be stored as integer")
