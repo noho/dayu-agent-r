@@ -48,6 +48,20 @@
 
 durable foundation 当前不实现 public Host command facade、admission orchestration、policy provider set、queue scanning / after-commit wakeup、scheduler、lane acquire、WorkerProxy / LocalProxy / RemoteProxy、Engine dispatch、EngineEvent ingest、recovery classifier、lease / fencing / takeover、artifact cleanup scheduler、projection、audit、outbox 或 ToolRuntime。
 
+## Internal Admission
+
+`dayu.host.admission` 是 Host 内部 command 编排模块，不从 `dayu.host` 包根导出，也不是 public facade。
+
+当前已实现：
+
+- `start_run`：在 open Session 上根据 `queue_policy` 执行 direct start、queue、reject 或 attach active；创建 running Run 时只写 pending dispatch record，不启动真实 dispatch。
+- `submit_followup_queue`：接收调用方显式提供的 `resolved_execution_target`，在 active Run 存在时创建 queued Run，在无 active Run 时直接创建 running Run、STARTING Attempt 与 pending dispatch record。
+- `promote_next_queued_run`：按 queued Run 的 accepted `event_sequence` FIFO promotion 一个 Run；active Run 存在时返回 skipped。
+- operation idempotency：start / follow-up 使用显式 operation scope，同 key 同 digest 返回既有 Run，不同 digest 返回结构化 conflict；follow-up queue digest 不包含 `resolved_execution_target`。
+- no-op / 测试 wakeup port：只暴露 pending dispatch 和 queue promotion wakeup 端口，不执行 Engine、WorkerProxy、scheduler 或 lane acquire。
+
+internal admission 当前不实现 public Host command facade、policy provider integration、terminal / cancel 后自动 promotion trigger、真实 dispatch、EngineEvent ingest、steer、retry / replay、wait、recovery 或 session-scope cancel facade。
+
 ## 校验边界
 
 所有公共 dataclass 均使用 `frozen=True, slots=True`。枚举使用 `enum.StrEnum`，字符串值为稳定的 snake_case 值。
@@ -75,7 +89,7 @@ Host 若在后续实现中复用 `dayu.runtime.filelock`，只能把它用于普
 当前未实现：
 
 - Host command function。
-- admission service、policy provider set、queue scanning / after-commit wakeup、dispatch scheduler、WorkerProxy / LocalProxy / RemoteProxy、recovery classifier、lease / fencing / takeover。
+- public Host command facade、policy provider set、terminal / cancel 后自动 promotion trigger、dispatch scheduler、WorkerProxy / LocalProxy / RemoteProxy、recovery classifier、lease / fencing / takeover。
 - artifact cleanup scheduler 与 diagnostics table。
 - ToolRuntime construction、ToolRuntime policy resolution、framework tool injection。
 - ToolsDiscovery / ScenePrepare provider contract、tool profile registry、Attempt tool snapshot durability。
@@ -92,4 +106,4 @@ python -m pyright dayu/host tests/host
 
 测试覆盖包根导出白名单、枚举字符串值、请求校验失败路径、Host tooling options 校验、Host import 边界与弱类型守卫。
 
-durable foundation 测试覆盖 SQLite schema bootstrap / transaction runner、EventLog append / read / idempotency、payload descriptor、local artifact helper、host instance liveness、EventLog 多进程 sequence smoke、Session lifecycle、Run / Attempt transition primitive，以及 Host 包根不导出 durable 内部模块。
+durable foundation 与 internal admission 测试覆盖 SQLite schema bootstrap / transaction runner、EventLog append / read / idempotency、payload descriptor、local artifact helper、host instance liveness、EventLog 多进程 sequence smoke、Session lifecycle、Run / Attempt transition primitive、start / follow-up admission、queue policy、idempotency、FIFO promotion，以及 Host 包根不导出 durable 内部模块。

@@ -1,0 +1,1350 @@
+"""Host 内部 admission 与 queue promotion 服务。
+
+本模块实现 Phase 3 P3-S4 的内部 command 编排：``start_run``、
+``submit_followup(queue)`` 和单次 FIFO queue promotion。它只依赖 Host durable
+foundation、Session/Run/Attempt state helper 与调用方提供的 transaction
+runner；不实现 public facade、scheduler、lane、WorkerProxy、Engine dispatch、
+steer、retry、replay、wait 或 recovery。
+"""
+
+from __future__ import annotations
+
+from dataclasses import dataclass
+from datetime import UTC, datetime
+from enum import StrEnum
+from typing import Protocol
+from uuid import uuid4
+
+from dayu.contracts.json_value import JsonValue
+from dayu.host.api import (
+    AuthorizationClaim,
+    FollowupBehavior,
+    HostApiError,
+    HostApiErrorCode,
+    HostCallContext,
+    HostInput,
+    OperationContext,
+    RunStatus,
+    SessionStatus,
+    StartRunRequest,
+    SubmitFollowupRequest,
+)
+from dayu.host.durable._validation import (
+    require_non_empty_text as _require_non_empty_text,
+    require_sha256_digest as _require_sha256_digest,
+)
+from dayu.host.durable.codec import sha256_digest_json
+from dayu.host.durable.event_log import (
+    EventClass,
+    EventLogAppendRequest,
+    EventLogRow,
+    EventLogStore,
+)
+from dayu.host.durable.idempotency import (
+    IdempotencyRecord,
+    IdempotencyResultRef,
+    IdempotencyScope,
+    IdempotencyStore,
+)
+from dayu.host.durable.run_transition import (
+    CreateQueuedRunInput,
+    CreateRunningRunInput,
+    PromoteQueuedRunInput,
+    PromotionSkipReason,
+    create_queued_run_in_transaction,
+    create_running_run_with_starting_attempt_in_transaction,
+    promote_queued_run_in_transaction,
+)
+from dayu.host.durable.state import (
+    AttemptRow,
+    DispatchRecordRow,
+    RunRow,
+    RunStartReason,
+    SessionRow,
+    StateMutationStatus,
+    WorkerKind,
+    read_active_run_for_session,
+    read_attempt_by_id,
+    read_dispatch_record_by_attempt_id,
+    read_run_by_id,
+    read_session_by_id,
+)
+from dayu.host.durable.transaction import HostTransaction, HostTransactionRunner
+
+_EVENT_TYPE_USER_INPUT_ACCEPTED = "USER_INPUT_ACCEPTED"
+_EVENT_SOURCE = "host.admission"
+_INTERNAL_ACTOR = "host"
+_EVENT_ID_PREFIX = "event"
+_RUN_ID_PREFIX = "run"
+_ATTEMPT_ID_PREFIX = "attempt"
+_EXECUTION_ID_PREFIX = "execution"
+_DISPATCH_RECORD_ID_PREFIX = "dispatch"
+_OPERATION_START_RUN = "start_run"
+_OPERATION_SUBMIT_FOLLOWUP_QUEUE = "submit_followup_queue"
+_IDEMPOTENCY_RESULT_KIND_RUN = "run"
+_QUEUE_REASON_ACTIVE_RUN_EXISTS = "active_run_exists"
+
+
+class AdmissionPolicy(StrEnum):
+    """start_run admission policy 文本常量。"""
+
+    QUEUE = "queue"
+    REJECT = "reject"
+    ATTACH_ACTIVE = "attach_active"
+
+
+class AdmissionClock(Protocol):
+    """admission 服务使用的时钟端口。"""
+
+    def now(self) -> datetime:
+        """返回当前时间。
+
+        :returns: timezone-aware ``datetime``。
+        :raises RuntimeError: 具体实现可在时钟不可用时抛出。
+        """
+
+        ...
+
+
+class AdmissionIdFactory(Protocol):
+    """admission 服务使用的 id 生成端口。"""
+
+    def new_id(self, prefix: str) -> str:
+        """生成带指定前缀的稳定文本 id。
+
+        :param prefix: id 前缀。
+        :returns: 新生成的非空 id。
+        :raises RuntimeError: 具体实现可在熵源不可用时抛出。
+        """
+
+        ...
+
+
+class AdmissionWakeupPort(Protocol):
+    """admission commit 后的轻量 wakeup 端口。
+
+    Phase 3 只允许 no-op 或测试 spy，不在此端口内启动 Engine、scheduler、
+    lane acquire 或 WorkerProxy。
+    """
+
+    def wake_dispatch(self, record: "PendingDispatchRecord") -> None:
+        """唤醒后续 dispatch 检查。
+
+        :param record: 已持久化的 pending dispatch 摘要。
+        :returns: ``None``。
+        :raises RuntimeError: 具体测试或上层实现可抛出自身错误。
+        """
+
+        ...
+
+    def wake_queue_promotion(self, session_id: str) -> None:
+        """唤醒同 Session queue promotion 检查。
+
+        :param session_id: 目标 Session id。
+        :returns: ``None``。
+        :raises RuntimeError: 具体测试或上层实现可抛出自身错误。
+        """
+
+        ...
+
+
+@dataclass(frozen=True, slots=True)
+class SubmitFollowupQueueAdmissionInput:
+    """follow-up queue admission 的内部输入。
+
+    :param request: 公共 follow-up request，必须为 ``behavior=queue``。
+    :param resolved_execution_target: 调用方已归一化的执行目标，必须非空。
+    """
+
+    request: SubmitFollowupRequest
+    resolved_execution_target: str
+
+
+@dataclass(frozen=True, slots=True)
+class PendingDispatchRecord:
+    """commit 后 dispatch wakeup 使用的 pending dispatch 摘要。
+
+    :param dispatch_record_id: dispatch record id。
+    :param run_id: 所属 Run id。
+    :param attempt_id: 所属 Attempt id。
+    :param execution_id: execution id。
+    :param execution_target: 已持久化执行目标。
+    :param worker_kind: worker 类型。
+    """
+
+    dispatch_record_id: str
+    run_id: str
+    attempt_id: str
+    execution_id: str
+    execution_target: str
+    worker_kind: WorkerKind
+
+
+@dataclass(frozen=True, slots=True)
+class RunAdmissionResult:
+    """start/follow-up admission 结果。
+
+    :param run: 命令返回的 Run row。
+    :param attempt: 本次或幂等首次创建的 current Attempt；无 Attempt 时为 ``None``。
+    :param dispatch_record: 本次或幂等首次创建的 dispatch record；无 dispatch 时为 ``None``。
+    :param pending_dispatch: commit 后需要唤醒 dispatch 检查的摘要。
+    :param created: 本次调用是否新建 Run。
+    :param queued: 返回的 Run 是否处于 queued 状态。
+    :param attached_active: 是否通过 ``attach_active`` 返回既有 active Run。
+    :param idempotent_replay: 是否命中既有幂等记录。
+    """
+
+    run: RunRow
+    attempt: AttemptRow | None
+    dispatch_record: DispatchRecordRow | None
+    pending_dispatch: PendingDispatchRecord | None
+    created: bool
+    queued: bool
+    attached_active: bool
+    idempotent_replay: bool
+
+
+@dataclass(frozen=True, slots=True)
+class PromotionResult:
+    """admission 层 queue promotion 结果。
+
+    :param promoted_run: 被 promotion 的 Run；未 promotion 时为 ``None``。
+    :param attempt: 新建 Attempt；未 promotion 时为 ``None``。
+    :param dispatch_record: 新建 dispatch record；未 promotion 时为 ``None``。
+    :param pending_dispatch: commit 后需要唤醒 dispatch 检查的摘要。
+    :param skipped: 本次是否跳过 promotion。
+    :param skip_reason: 跳过原因；成功 promotion 时为 ``None``。
+    """
+
+    promoted_run: RunRow | None
+    attempt: AttemptRow | None
+    dispatch_record: DispatchRecordRow | None
+    pending_dispatch: PendingDispatchRecord | None
+    skipped: bool
+    skip_reason: PromotionSkipReason | None
+
+
+class NoopAdmissionWakeupPort:
+    """默认 no-op wakeup port。
+
+    该实现只满足 admission 服务依赖注入，不启动任何后台任务或外部副作用。
+    """
+
+    def wake_dispatch(self, record: PendingDispatchRecord) -> None:
+        """忽略 dispatch wakeup。
+
+        :param record: 已持久化的 pending dispatch 摘要。
+        :returns: ``None``。
+        """
+
+        del record
+
+    def wake_queue_promotion(self, session_id: str) -> None:
+        """忽略 queue promotion wakeup。
+
+        :param session_id: 目标 Session id。
+        :returns: ``None``。
+        """
+
+        del session_id
+
+
+class UtcAdmissionClock:
+    """使用系统 UTC 时间的 admission clock。"""
+
+    def now(self) -> datetime:
+        """返回当前 UTC 时间。
+
+        :returns: timezone-aware UTC ``datetime``。
+        """
+
+        return datetime.now(UTC)
+
+
+class UuidAdmissionIdFactory:
+    """使用 UUID4 生成 admission id 的默认工厂。"""
+
+    def new_id(self, prefix: str) -> str:
+        """生成 ``prefix-uuid`` 格式 id。
+
+        :param prefix: id 前缀。
+        :returns: 新生成的文本 id。
+        :raises ValueError: ``prefix`` 为空时抛出。
+        """
+
+        if prefix.strip() == "":
+            raise ValueError("prefix must be non-empty")
+        return f"{prefix}-{uuid4().hex}"
+
+
+@dataclass(frozen=True, slots=True)
+class HostAdmissionService:
+    """Host 内部 admission 服务。
+
+    :param transaction_runner: Host durable write transaction runner。
+    :param event_log_store: EventLog primitive。
+    :param idempotency_store: idempotency primitive。
+    :param clock: admission 事件时间来源。
+    :param id_factory: admission id 生成端口。
+    :param wakeup_port: commit 后 no-op/测试 wakeup 端口。
+    """
+
+    transaction_runner: HostTransactionRunner
+    event_log_store: EventLogStore
+    idempotency_store: IdempotencyStore
+    clock: AdmissionClock
+    id_factory: AdmissionIdFactory
+    wakeup_port: AdmissionWakeupPort
+
+    def start_run(
+        self, request: StartRunRequest, *, caller_semantic_digest: str
+    ) -> RunAdmissionResult:
+        """接受显式 start_run 请求。
+
+        :param request: start_run 请求。
+        :param caller_semantic_digest: 调用方语义输入摘要。
+        :returns: Run admission 结果。
+        :raises ValueError: queue policy 未知或 digest 非法时抛出。
+        :raises HostApiError: Session 缺失、closed、active reject 或幂等冲突时抛出。
+        :raises HostDurableError: durable 写入失败时由底层抛出。
+        """
+
+        policy = _parse_admission_policy(request.queue_policy)
+        _require_sha256_digest(
+            caller_semantic_digest, field_name="caller_semantic_digest"
+        )
+        result = self.transaction_runner.run_write(
+            _StartRunOperation(
+                request=request,
+                policy=policy,
+                caller_semantic_digest=caller_semantic_digest,
+                event_log_store=self.event_log_store,
+                idempotency_store=self.idempotency_store,
+                clock=self.clock,
+                id_factory=self.id_factory,
+            )
+        )
+        _wake_dispatch_if_needed(self.wakeup_port, result.pending_dispatch)
+        return result
+
+    def submit_followup_queue(
+        self,
+        admission_input: SubmitFollowupQueueAdmissionInput,
+        *,
+        caller_semantic_digest: str,
+    ) -> RunAdmissionResult:
+        """接受 ``submit_followup(queue)`` 请求。
+
+        :param admission_input: follow-up queue admission 输入。
+        :param caller_semantic_digest: 调用方语义输入摘要。
+        :returns: Run admission 结果。
+        :raises ValueError: behavior 非 queue、resolved target 为空或 digest 非法时抛出。
+        :raises HostApiError: Session 缺失、closed 或幂等冲突时抛出。
+        :raises HostDurableError: durable 写入失败时由底层抛出。
+        """
+
+        _validate_followup_queue_input(admission_input)
+        _require_sha256_digest(
+            caller_semantic_digest, field_name="caller_semantic_digest"
+        )
+        result = self.transaction_runner.run_write(
+            _SubmitFollowupQueueOperation(
+                admission_input=admission_input,
+                caller_semantic_digest=caller_semantic_digest,
+                event_log_store=self.event_log_store,
+                idempotency_store=self.idempotency_store,
+                clock=self.clock,
+                id_factory=self.id_factory,
+            )
+        )
+        _wake_dispatch_if_needed(self.wakeup_port, result.pending_dispatch)
+        return result
+
+    def promote_next_queued_run(self, session_id: str) -> PromotionResult:
+        """按 FIFO promotion 一个 queued Run。
+
+        :param session_id: 目标 Session id。
+        :returns: promotion 结果；active 存在或无 queued 时返回 skipped。
+        :raises HostApiError: Session 缺失时抛出。
+        :raises HostDurableError: durable 写入失败时由底层抛出。
+        """
+
+        _require_non_empty_text(session_id, field_name="session_id")
+        result = self.transaction_runner.run_write(
+            _PromoteNextQueuedRunOperation(
+                session_id=session_id,
+                event_log_store=self.event_log_store,
+                clock=self.clock,
+                id_factory=self.id_factory,
+            )
+        )
+        _wake_dispatch_if_needed(self.wakeup_port, result.pending_dispatch)
+        return result
+
+
+def create_host_admission_service(
+    transaction_runner: HostTransactionRunner,
+    *,
+    event_log_store: EventLogStore | None = None,
+    idempotency_store: IdempotencyStore | None = None,
+    clock: AdmissionClock | None = None,
+    id_factory: AdmissionIdFactory | None = None,
+    wakeup_port: AdmissionWakeupPort | None = None,
+) -> HostAdmissionService:
+    """创建默认依赖装配的内部 admission service。
+
+    :param transaction_runner: Host durable write transaction runner。
+    :param event_log_store: 可选 EventLog primitive。
+    :param idempotency_store: 可选 idempotency primitive。
+    :param clock: 可选 clock 端口。
+    :param id_factory: 可选 id factory 端口。
+    :param wakeup_port: 可选 wakeup 端口。
+    :returns: Host admission service。
+    """
+
+    return HostAdmissionService(
+        transaction_runner=transaction_runner,
+        event_log_store=event_log_store if event_log_store is not None else EventLogStore(),
+        idempotency_store=(
+            idempotency_store if idempotency_store is not None else IdempotencyStore()
+        ),
+        clock=clock if clock is not None else UtcAdmissionClock(),
+        id_factory=id_factory if id_factory is not None else UuidAdmissionIdFactory(),
+        wakeup_port=wakeup_port if wakeup_port is not None else NoopAdmissionWakeupPort(),
+    )
+
+
+@dataclass(frozen=True, slots=True)
+class _StartRunOperation:
+    """start_run transaction body。"""
+
+    request: StartRunRequest
+    policy: AdmissionPolicy
+    caller_semantic_digest: str
+    event_log_store: EventLogStore
+    idempotency_store: IdempotencyStore
+    clock: AdmissionClock
+    id_factory: AdmissionIdFactory
+
+    def __call__(self, transaction: HostTransaction) -> RunAdmissionResult:
+        """执行 start_run admission transaction。
+
+        :param transaction: 当前 Host transaction。
+        :returns: Run admission 结果。
+        :raises HostApiError: durable precondition 或幂等冲突失败时抛出。
+        """
+
+        semantic_digest = _start_run_semantic_digest(
+            self.request, caller_semantic_digest=self.caller_semantic_digest
+        )
+        scope = _idempotency_scope(
+            operation=_OPERATION_START_RUN,
+            scope_id=self.request.session_id,
+            idempotency_key=self.request.client_request_id,
+        )
+        existing = self.idempotency_store.read_idempotency_record(transaction, scope)
+        if existing is not None:
+            _raise_if_digest_conflict(existing, semantic_digest)
+            return _idempotent_run_result(transaction, existing)
+
+        _require_open_session(transaction, self.request.session_id)
+        active = read_active_run_for_session(transaction, self.request.session_id)
+        if active is not None:
+            return self._handle_active_run(
+                transaction=transaction,
+                semantic_digest=semantic_digest,
+                scope=scope,
+                active=active,
+            )
+        return _create_running_admission_result(
+            transaction=transaction,
+            event_log_store=self.event_log_store,
+            idempotency_store=self.idempotency_store,
+            clock=self.clock,
+            id_factory=self.id_factory,
+            request=_CreateAdmissionRequest.from_start_request(self.request),
+            semantic_digest=semantic_digest,
+            scope=scope,
+            queue_policy=self.policy.value,
+            start_reason=RunStartReason.INITIAL,
+        )
+
+    def _handle_active_run(
+        self,
+        *,
+        transaction: HostTransaction,
+        semantic_digest: str,
+        scope: IdempotencyScope,
+        active: RunRow,
+    ) -> RunAdmissionResult:
+        """处理 start_run 遇到 active Run 的 policy 分支。
+
+        :param transaction: 当前 Host transaction。
+        :param semantic_digest: 本次操作 semantic digest。
+        :param scope: 幂等 scope。
+        :param active: 当前 active Run。
+        :returns: admission 结果。
+        :raises HostApiError: reject policy 命中 active Run 时抛出 conflict。
+        """
+
+        if self.policy == AdmissionPolicy.REJECT:
+            raise HostApiError(
+                code=HostApiErrorCode.CONFLICT,
+                message="Session already has an active Run",
+                retryable=False,
+            )
+        if self.policy == AdmissionPolicy.ATTACH_ACTIVE:
+            self.idempotency_store.record_idempotent_result(
+                transaction,
+                scope,
+                semantic_digest,
+                IdempotencyResultRef(
+                    result_kind=_IDEMPOTENCY_RESULT_KIND_RUN,
+                    result_ref=active.run_id,
+                    created_event_id=None,
+                    created_event_sequence=None,
+                ),
+            )
+            return RunAdmissionResult(
+                run=active,
+                attempt=_read_current_attempt(transaction, active),
+                dispatch_record=_read_current_dispatch_record(transaction, active),
+                pending_dispatch=None,
+                created=False,
+                queued=False,
+                attached_active=True,
+                idempotent_replay=False,
+            )
+        return _create_queued_admission_result(
+            transaction=transaction,
+            event_log_store=self.event_log_store,
+            idempotency_store=self.idempotency_store,
+            clock=self.clock,
+            id_factory=self.id_factory,
+            request=_CreateAdmissionRequest.from_start_request(self.request),
+            semantic_digest=semantic_digest,
+            scope=scope,
+            queue_policy=self.policy.value,
+            active_run_id=active.run_id,
+        )
+
+
+@dataclass(frozen=True, slots=True)
+class _SubmitFollowupQueueOperation:
+    """submit_followup(queue) transaction body。"""
+
+    admission_input: SubmitFollowupQueueAdmissionInput
+    caller_semantic_digest: str
+    event_log_store: EventLogStore
+    idempotency_store: IdempotencyStore
+    clock: AdmissionClock
+    id_factory: AdmissionIdFactory
+
+    def __call__(self, transaction: HostTransaction) -> RunAdmissionResult:
+        """执行 follow-up queue admission transaction。
+
+        :param transaction: 当前 Host transaction。
+        :returns: Run admission 结果。
+        :raises HostApiError: durable precondition 或幂等冲突失败时抛出。
+        """
+
+        request = self.admission_input.request
+        semantic_digest = _followup_queue_semantic_digest(
+            request, caller_semantic_digest=self.caller_semantic_digest
+        )
+        scope = _idempotency_scope(
+            operation=_OPERATION_SUBMIT_FOLLOWUP_QUEUE,
+            scope_id=request.session_id,
+            idempotency_key=request.client_request_id,
+        )
+        existing = self.idempotency_store.read_idempotency_record(transaction, scope)
+        if existing is not None:
+            _raise_if_digest_conflict(existing, semantic_digest)
+            return _idempotent_run_result(transaction, existing)
+
+        _require_open_session(transaction, request.session_id)
+        active = read_active_run_for_session(transaction, request.session_id)
+        create_request = _CreateAdmissionRequest.from_followup_queue_input(
+            self.admission_input
+        )
+        if active is not None:
+            return _create_queued_admission_result(
+                transaction=transaction,
+                event_log_store=self.event_log_store,
+                idempotency_store=self.idempotency_store,
+                clock=self.clock,
+                id_factory=self.id_factory,
+                request=create_request,
+                semantic_digest=semantic_digest,
+                scope=scope,
+                queue_policy=AdmissionPolicy.QUEUE.value,
+                active_run_id=active.run_id,
+            )
+        return _create_running_admission_result(
+            transaction=transaction,
+            event_log_store=self.event_log_store,
+            idempotency_store=self.idempotency_store,
+            clock=self.clock,
+            id_factory=self.id_factory,
+            request=create_request,
+            semantic_digest=semantic_digest,
+            scope=scope,
+            queue_policy=AdmissionPolicy.QUEUE.value,
+            start_reason=RunStartReason.INITIAL,
+        )
+
+
+@dataclass(frozen=True, slots=True)
+class _PromoteNextQueuedRunOperation:
+    """promote_next_queued_run transaction body。"""
+
+    session_id: str
+    event_log_store: EventLogStore
+    clock: AdmissionClock
+    id_factory: AdmissionIdFactory
+
+    def __call__(self, transaction: HostTransaction) -> PromotionResult:
+        """执行一次 FIFO queue promotion。
+
+        :param transaction: 当前 Host transaction。
+        :returns: promotion 结果。
+        :raises HostApiError: Session 缺失时抛出。
+        """
+
+        _require_existing_session(transaction, self.session_id)
+        now = self.clock.now()
+        transition_result = promote_queued_run_in_transaction(
+            transaction,
+            self.event_log_store,
+            PromoteQueuedRunInput(
+                session_id=self.session_id,
+                run_started_event_id=self.id_factory.new_id(_EVENT_ID_PREFIX),
+                attempt_started_event_id=self.id_factory.new_id(_EVENT_ID_PREFIX),
+                attempt_id=self.id_factory.new_id(_ATTEMPT_ID_PREFIX),
+                execution_id=self.id_factory.new_id(_EXECUTION_ID_PREFIX),
+                dispatch_record_id=self.id_factory.new_id(_DISPATCH_RECORD_ID_PREFIX),
+                occurred_at=now,
+                actor=_INTERNAL_ACTOR,
+                source=_EVENT_SOURCE,
+                worker_kind=WorkerKind.LOCAL,
+                owner_host_instance_id=None,
+            ),
+        )
+        if transition_result.status != StateMutationStatus.UPDATED:
+            return PromotionResult(
+                promoted_run=None,
+                attempt=None,
+                dispatch_record=None,
+                pending_dispatch=None,
+                skipped=True,
+                skip_reason=_promotion_skip_reason(transition_result.skip_reason),
+            )
+        if (
+            transition_result.promoted_run is None
+            or transition_result.attempt is None
+            or transition_result.dispatch_record is None
+        ):
+            raise HostApiError(
+                code=HostApiErrorCode.INTERNAL_ERROR,
+                message="Promotion result is incomplete",
+                retryable=False,
+            )
+        pending_dispatch = _pending_dispatch_from_row(
+            transition_result.dispatch_record
+        )
+        return PromotionResult(
+            promoted_run=transition_result.promoted_run,
+            attempt=transition_result.attempt,
+            dispatch_record=transition_result.dispatch_record,
+            pending_dispatch=pending_dispatch,
+            skipped=False,
+            skip_reason=None,
+        )
+
+
+@dataclass(frozen=True, slots=True)
+class _CreateAdmissionRequest:
+    """创建 Run admission state 所需的归一化输入。"""
+
+    session_id: str
+    client_request_id: str
+    input: HostInput
+    execution_target: str
+    actor: str
+    source: str
+    call_context_digest: str
+    operation_kind: str
+
+    @classmethod
+    def from_start_request(cls, request: StartRunRequest) -> "_CreateAdmissionRequest":
+        """从 start_run request 构造归一化创建输入。
+
+        :param request: start_run request。
+        :returns: 归一化创建输入。
+        """
+
+        return cls(
+            session_id=request.session_id,
+            client_request_id=request.client_request_id,
+            input=request.input,
+            execution_target=request.execution_target,
+            actor=request.context.actor,
+            source=request.context.source,
+            call_context_digest=_call_context_digest(request.context),
+            operation_kind=_OPERATION_START_RUN,
+        )
+
+    @classmethod
+    def from_followup_queue_input(
+        cls, admission_input: SubmitFollowupQueueAdmissionInput
+    ) -> "_CreateAdmissionRequest":
+        """从 follow-up queue input 构造归一化创建输入。
+
+        :param admission_input: follow-up queue admission 输入。
+        :returns: 归一化创建输入。
+        """
+
+        request = admission_input.request
+        return cls(
+            session_id=request.session_id,
+            client_request_id=request.client_request_id,
+            input=request.input,
+            execution_target=admission_input.resolved_execution_target,
+            actor=request.context.actor,
+            source=request.context.source,
+            call_context_digest=_call_context_digest(request.context),
+            operation_kind=_OPERATION_SUBMIT_FOLLOWUP_QUEUE,
+        )
+
+
+def _create_running_admission_result(
+    *,
+    transaction: HostTransaction,
+    event_log_store: EventLogStore,
+    idempotency_store: IdempotencyStore,
+    clock: AdmissionClock,
+    id_factory: AdmissionIdFactory,
+    request: _CreateAdmissionRequest,
+    semantic_digest: str,
+    scope: IdempotencyScope,
+    queue_policy: str,
+    start_reason: RunStartReason,
+) -> RunAdmissionResult:
+    """创建 running Run、STARTING Attempt 和 pending dispatch。
+
+    :param transaction: 当前 Host transaction。
+    :param event_log_store: EventLog primitive。
+    :param idempotency_store: idempotency primitive。
+    :param clock: admission clock。
+    :param id_factory: admission id factory。
+    :param request: 归一化创建输入。
+    :param semantic_digest: semantic input digest。
+    :param scope: 幂等 scope。
+    :param queue_policy: 持久化 queue policy。
+    :param start_reason: Run start reason。
+    :returns: admission 结果。
+    """
+
+    now = clock.now()
+    run_id = id_factory.new_id(_RUN_ID_PREFIX)
+    input_event = _append_user_input_event(
+        transaction=transaction,
+        event_log_store=event_log_store,
+        request=request,
+        run_id=run_id,
+        event_id=id_factory.new_id(_EVENT_ID_PREFIX),
+        occurred_at=now,
+    )
+    transition_result = create_running_run_with_starting_attempt_in_transaction(
+        transaction,
+        event_log_store,
+        CreateRunningRunInput(
+            session_id=request.session_id,
+            run_id=run_id,
+            client_request_id=request.client_request_id,
+            input_event_id=input_event.event_id,
+            input_event_sequence=input_event.event_sequence,
+            run_accepted_event_id=id_factory.new_id(_EVENT_ID_PREFIX),
+            run_started_event_id=id_factory.new_id(_EVENT_ID_PREFIX),
+            attempt_started_event_id=id_factory.new_id(_EVENT_ID_PREFIX),
+            attempt_id=id_factory.new_id(_ATTEMPT_ID_PREFIX),
+            execution_id=id_factory.new_id(_EXECUTION_ID_PREFIX),
+            dispatch_record_id=id_factory.new_id(_DISPATCH_RECORD_ID_PREFIX),
+            occurred_at=now,
+            actor=request.actor,
+            source=request.source,
+            idempotency_key=request.client_request_id,
+            execution_target=request.execution_target,
+            queue_policy=queue_policy,
+            start_reason=start_reason,
+            worker_kind=WorkerKind.LOCAL,
+            owner_host_instance_id=None,
+            call_context_digest=request.call_context_digest,
+        ),
+    )
+    run = _require_transition_run(transition_result.run)
+    dispatch_record = _require_transition_dispatch_record(
+        transition_result.dispatch_record
+    )
+    idempotency_store.record_idempotent_result(
+        transaction,
+        scope,
+        semantic_digest,
+        IdempotencyResultRef(
+            result_kind=_IDEMPOTENCY_RESULT_KIND_RUN,
+            result_ref=run.run_id,
+            created_event_id=input_event.event_id,
+            created_event_sequence=input_event.event_sequence,
+        ),
+    )
+    return RunAdmissionResult(
+        run=run,
+        attempt=transition_result.attempt,
+        dispatch_record=dispatch_record,
+        pending_dispatch=_pending_dispatch_from_row(dispatch_record),
+        created=True,
+        queued=False,
+        attached_active=False,
+        idempotent_replay=False,
+    )
+
+
+def _create_queued_admission_result(
+    *,
+    transaction: HostTransaction,
+    event_log_store: EventLogStore,
+    idempotency_store: IdempotencyStore,
+    clock: AdmissionClock,
+    id_factory: AdmissionIdFactory,
+    request: _CreateAdmissionRequest,
+    semantic_digest: str,
+    scope: IdempotencyScope,
+    queue_policy: str,
+    active_run_id: str,
+) -> RunAdmissionResult:
+    """创建 queued Run admission 结果。
+
+    :param transaction: 当前 Host transaction。
+    :param event_log_store: EventLog primitive。
+    :param idempotency_store: idempotency primitive。
+    :param clock: admission clock。
+    :param id_factory: admission id factory。
+    :param request: 归一化创建输入。
+    :param semantic_digest: semantic input digest。
+    :param scope: 幂等 scope。
+    :param queue_policy: 持久化 queue policy。
+    :param active_run_id: admission 时存在的 active Run id。
+    :returns: admission 结果。
+    """
+
+    now = clock.now()
+    run_id = id_factory.new_id(_RUN_ID_PREFIX)
+    input_event = _append_user_input_event(
+        transaction=transaction,
+        event_log_store=event_log_store,
+        request=request,
+        run_id=run_id,
+        event_id=id_factory.new_id(_EVENT_ID_PREFIX),
+        occurred_at=now,
+    )
+    transition_result = create_queued_run_in_transaction(
+        transaction,
+        event_log_store,
+        CreateQueuedRunInput(
+            session_id=request.session_id,
+            run_id=run_id,
+            client_request_id=request.client_request_id,
+            input_event_id=input_event.event_id,
+            input_event_sequence=input_event.event_sequence,
+            run_accepted_event_id=id_factory.new_id(_EVENT_ID_PREFIX),
+            run_queued_event_id=id_factory.new_id(_EVENT_ID_PREFIX),
+            occurred_at=now,
+            actor=request.actor,
+            source=request.source,
+            idempotency_key=request.client_request_id,
+            execution_target=request.execution_target,
+            queue_policy=queue_policy,
+            queue_reason=_QUEUE_REASON_ACTIVE_RUN_EXISTS,
+            active_run_id=active_run_id,
+            call_context_digest=request.call_context_digest,
+        ),
+    )
+    run = _require_transition_run(transition_result.run)
+    idempotency_store.record_idempotent_result(
+        transaction,
+        scope,
+        semantic_digest,
+        IdempotencyResultRef(
+            result_kind=_IDEMPOTENCY_RESULT_KIND_RUN,
+            result_ref=run.run_id,
+            created_event_id=input_event.event_id,
+            created_event_sequence=input_event.event_sequence,
+        ),
+    )
+    return RunAdmissionResult(
+        run=run,
+        attempt=None,
+        dispatch_record=None,
+        pending_dispatch=None,
+        created=True,
+        queued=True,
+        attached_active=False,
+        idempotent_replay=False,
+    )
+
+
+def _append_user_input_event(
+    *,
+    transaction: HostTransaction,
+    event_log_store: EventLogStore,
+    request: _CreateAdmissionRequest,
+    run_id: str,
+    event_id: str,
+    occurred_at: datetime,
+) -> EventLogRow:
+    """追加 ``USER_INPUT_ACCEPTED`` canonical fact。
+
+    :param transaction: 当前 Host transaction。
+    :param event_log_store: EventLog primitive。
+    :param request: 归一化创建输入。
+    :param run_id: 本次 admission 生成的 Run id。
+    :param event_id: 本次 input event id。
+    :param occurred_at: 事件发生时间。
+    :returns: 已持久化 EventLog row。
+    """
+
+    return event_log_store.append_event(
+        transaction,
+        EventLogAppendRequest(
+            event_id=event_id,
+            event_class=EventClass.CANONICAL_FACT,
+            session_id=request.session_id,
+            run_id=run_id,
+            attempt_id=None,
+            execution_id=None,
+            event_type=_EVENT_TYPE_USER_INPUT_ACCEPTED,
+            occurred_at=occurred_at,
+            actor=request.actor,
+            source=request.source,
+            client_request_id=request.client_request_id,
+            idempotency_key=request.client_request_id,
+            policy_decision=None,
+            reason=None,
+            payload_json={
+                "input_ref": request.input.payload_ref,
+                "input_digest": _input_digest(request.input),
+                "display_text": request.input.display_text,
+                "payload_ref": request.input.payload_ref,
+                "payload_digest": request.input.payload_digest,
+                "operation_kind": request.operation_kind,
+                "call_context_digest": request.call_context_digest,
+            },
+            payload_ref=None,
+            payload_digest=None,
+        ),
+    ).row
+
+
+def _parse_admission_policy(queue_policy: str) -> AdmissionPolicy:
+    """解析 start_run queue policy。
+
+    :param queue_policy: 请求中的 queue policy 文本。
+    :returns: admission policy enum。
+    :raises ValueError: policy 不是 Phase 3 允许值时抛出。
+    """
+
+    try:
+        return AdmissionPolicy(queue_policy)
+    except ValueError as exc:
+        raise ValueError("queue_policy must be queue, reject or attach_active") from exc
+
+
+def _validate_followup_queue_input(
+    admission_input: SubmitFollowupQueueAdmissionInput,
+) -> None:
+    """校验 follow-up queue admission 输入。
+
+    :param admission_input: 待校验 admission 输入。
+    :returns: ``None``。
+    :raises ValueError: behavior 非 queue 或 resolved target 为空时抛出。
+    """
+
+    if admission_input.request.behavior != FollowupBehavior.QUEUE:
+        raise ValueError("SubmitFollowupRequest.behavior must be queue")
+    if admission_input.resolved_execution_target.strip() == "":
+        raise ValueError("resolved_execution_target must be non-empty")
+
+
+def _require_open_session(
+    transaction: HostTransaction, session_id: str
+) -> None:
+    """读取并校验 Session 为 open。
+
+    :param transaction: 当前 Host transaction。
+    :param session_id: Session id。
+    :returns: ``None``。
+    :raises HostApiError: Session 缺失或非 open 时抛出。
+    """
+
+    session = _require_existing_session(transaction, session_id)
+    if session.status != SessionStatus.OPEN:
+        raise HostApiError(
+            code=HostApiErrorCode.INVALID_STATE,
+            message="Session is not open",
+            retryable=False,
+        )
+
+
+def _require_existing_session(
+    transaction: HostTransaction, session_id: str
+) -> SessionRow:
+    """读取存在的 Session row。
+
+    :param transaction: 当前 Host transaction。
+    :param session_id: Session id。
+    :returns: Session row。
+    :raises HostApiError: Session 缺失时抛出。
+    """
+
+    session = read_session_by_id(transaction, session_id)
+    if session is None:
+        raise HostApiError(
+            code=HostApiErrorCode.NOT_FOUND,
+            message="Session not found",
+            retryable=False,
+        )
+    return session
+
+
+def _idempotency_scope(
+    *, operation: str, scope_id: str, idempotency_key: str
+) -> IdempotencyScope:
+    """构造 admission 幂等 scope。
+
+    :param operation: 操作名。
+    :param scope_id: scope id。
+    :param idempotency_key: 幂等 key。
+    :returns: idempotency scope。
+    """
+
+    return IdempotencyScope(
+        scope_kind=operation,
+        scope_id=scope_id,
+        idempotency_key=idempotency_key,
+    )
+
+
+def _raise_if_digest_conflict(
+    record: IdempotencyRecord, semantic_digest: str
+) -> None:
+    """校验既有幂等记录 digest 是否一致。
+
+    :param record: 既有幂等记录。
+    :param semantic_digest: 本次 semantic digest。
+    :returns: ``None``。
+    :raises HostApiError: digest 不一致时抛出 idempotency conflict。
+    """
+
+    if record.semantic_input_digest != semantic_digest:
+        raise HostApiError(
+            code=HostApiErrorCode.IDEMPOTENCY_CONFLICT,
+            message="Idempotency key already exists with different semantic digest",
+            retryable=False,
+        )
+
+
+def _idempotent_run_result(
+    transaction: HostTransaction, record: IdempotencyRecord
+) -> RunAdmissionResult:
+    """从幂等记录恢复 Run admission 结果。
+
+    :param transaction: 当前 Host transaction。
+    :param record: 已持久化幂等记录。
+    :returns: admission 结果。
+    :raises HostApiError: 结果类型错误或 Run 缺失时抛出。
+    """
+
+    if record.result_kind != _IDEMPOTENCY_RESULT_KIND_RUN:
+        raise HostApiError(
+            code=HostApiErrorCode.INTERNAL_ERROR,
+            message="Idempotency record result kind is not run",
+            retryable=False,
+        )
+    run = read_run_by_id(transaction, record.result_ref)
+    if run is None:
+        raise HostApiError(
+            code=HostApiErrorCode.INTERNAL_ERROR,
+            message="Idempotency record points to missing Run",
+            retryable=False,
+        )
+    attempt = _read_current_attempt(transaction, run)
+    dispatch_record = _read_current_dispatch_record(transaction, run)
+    return RunAdmissionResult(
+        run=run,
+        attempt=attempt,
+        dispatch_record=dispatch_record,
+        pending_dispatch=None,
+        created=False,
+        queued=run.status == RunStatus.QUEUED,
+        attached_active=record.created_event_id is None,
+        idempotent_replay=True,
+    )
+
+
+def _read_current_attempt(
+    transaction: HostTransaction, run: RunRow
+) -> AttemptRow | None:
+    """读取 Run 当前 Attempt。
+
+    :param transaction: 当前 Host transaction。
+    :param run: Run row。
+    :returns: 有 current Attempt 时返回 Attempt row，否则返回 ``None``。
+    :raises HostApiError: current_attempt_id 指向缺失 row 时抛出。
+    """
+
+    if run.current_attempt_id is None:
+        return None
+    attempt = read_attempt_by_id(transaction, run.current_attempt_id)
+    if attempt is None:
+        raise HostApiError(
+            code=HostApiErrorCode.INTERNAL_ERROR,
+            message="Run current Attempt is missing",
+            retryable=False,
+        )
+    return attempt
+
+
+def _read_current_dispatch_record(
+    transaction: HostTransaction, run: RunRow
+) -> DispatchRecordRow | None:
+    """读取 Run 当前 Attempt 对应的 dispatch record。
+
+    :param transaction: 当前 Host transaction。
+    :param run: Run row。
+    :returns: 有 current Attempt 时返回 dispatch row，否则返回 ``None``。
+    :raises HostApiError: current Attempt 缺 dispatch record 时抛出。
+    """
+
+    if run.current_attempt_id is None:
+        return None
+    dispatch_record = read_dispatch_record_by_attempt_id(
+        transaction, run.current_attempt_id
+    )
+    if dispatch_record is None:
+        raise HostApiError(
+            code=HostApiErrorCode.INTERNAL_ERROR,
+            message="Run current dispatch record is missing",
+            retryable=False,
+        )
+    return dispatch_record
+
+
+def _pending_dispatch_from_row(
+    dispatch_record: DispatchRecordRow,
+) -> PendingDispatchRecord:
+    """把 durable dispatch row 转为 wakeup 摘要。
+
+    :param dispatch_record: durable dispatch record row。
+    :returns: pending dispatch 摘要。
+    """
+
+    return PendingDispatchRecord(
+        dispatch_record_id=dispatch_record.dispatch_record_id,
+        run_id=dispatch_record.run_id,
+        attempt_id=dispatch_record.attempt_id,
+        execution_id=dispatch_record.execution_id,
+        execution_target=dispatch_record.execution_target,
+        worker_kind=dispatch_record.worker_kind,
+    )
+
+
+def _wake_dispatch_if_needed(
+    wakeup_port: AdmissionWakeupPort,
+    pending_dispatch: PendingDispatchRecord | None,
+) -> None:
+    """在 commit 后按需调用 dispatch wakeup。
+
+    :param wakeup_port: wakeup 端口。
+    :param pending_dispatch: pending dispatch 摘要。
+    :returns: ``None``。
+    """
+
+    if pending_dispatch is not None:
+        wakeup_port.wake_dispatch(pending_dispatch)
+
+
+def _require_transition_run(run: RunRow | None) -> RunRow:
+    """断言 transition 返回 Run row。
+
+    :param run: transition 返回的 Run row。
+    :returns: 非空 Run row。
+    :raises HostApiError: Run 缺失时抛出。
+    """
+
+    if run is None:
+        raise HostApiError(
+            code=HostApiErrorCode.INTERNAL_ERROR,
+            message="Run transition returned no Run",
+            retryable=False,
+        )
+    return run
+
+
+def _require_transition_dispatch_record(
+    dispatch_record: DispatchRecordRow | None,
+) -> DispatchRecordRow:
+    """断言 transition 返回 dispatch record。
+
+    :param dispatch_record: transition 返回的 dispatch record。
+    :returns: 非空 dispatch record。
+    :raises HostApiError: dispatch record 缺失时抛出。
+    """
+
+    if dispatch_record is None:
+        raise HostApiError(
+            code=HostApiErrorCode.INTERNAL_ERROR,
+            message="Run transition returned no dispatch record",
+            retryable=False,
+        )
+    return dispatch_record
+
+
+def _promotion_skip_reason(skip_reason: str | None) -> PromotionSkipReason | None:
+    """把低层 skip reason 文本转为 admission enum。
+
+    :param skip_reason: 低层 skip reason 文本。
+    :returns: 对应 enum；无 skip reason 时返回 ``None``。
+    :raises HostApiError: 低层返回未知 skip reason 时抛出。
+    """
+
+    if skip_reason is None:
+        return None
+    try:
+        return PromotionSkipReason(skip_reason)
+    except ValueError as exc:
+        raise HostApiError(
+            code=HostApiErrorCode.INTERNAL_ERROR,
+            message="Promotion returned unknown skip reason",
+            retryable=False,
+        ) from exc
+
+
+def _start_run_semantic_digest(
+    request: StartRunRequest, *, caller_semantic_digest: str
+) -> str:
+    """计算 start_run semantic digest。
+
+    :param request: start_run request。
+    :param caller_semantic_digest: 调用方语义输入摘要。
+    :returns: ``sha256:<hex>`` digest。
+    """
+
+    return sha256_digest_json(
+        {
+            "operation": _OPERATION_START_RUN,
+            "input_digest": _input_digest(request.input),
+            "execution_target": request.execution_target,
+            "queue_policy": request.queue_policy,
+            "caller_semantic_digest": caller_semantic_digest,
+            "call_context_digest": _call_context_digest(request.context),
+        }
+    )
+
+
+def _followup_queue_semantic_digest(
+    request: SubmitFollowupRequest, *, caller_semantic_digest: str
+) -> str:
+    """计算 submit_followup_queue semantic digest。
+
+    :param request: follow-up request。
+    :param caller_semantic_digest: 调用方语义输入摘要。
+    :returns: ``sha256:<hex>`` digest。
+    """
+
+    return sha256_digest_json(
+        {
+            "operation": _OPERATION_SUBMIT_FOLLOWUP_QUEUE,
+            "input_digest": _input_digest(request.input),
+            "behavior": FollowupBehavior.QUEUE.value,
+            "caller_semantic_digest": caller_semantic_digest,
+            "call_context_digest": _call_context_digest(request.context),
+        }
+    )
+
+
+def _input_digest(input_value: HostInput) -> str:
+    """计算 HostInput envelope digest。
+
+    :param input_value: Host 输入 envelope。
+    :returns: ``sha256:<hex>`` digest。
+    """
+
+    return sha256_digest_json(
+        {
+            "display_text": input_value.display_text,
+            "payload_ref": input_value.payload_ref,
+            "payload_digest": input_value.payload_digest,
+        }
+    )
+
+
+def _call_context_digest(context: HostCallContext) -> str:
+    """计算调用上下文 digest，排除 tracing request_id。
+
+    :param context: Host call context。
+    :returns: ``sha256:<hex>`` digest。
+    """
+
+    return sha256_digest_json(_call_context_json_value(context))
+
+
+def _call_context_json_value(context: HostCallContext) -> JsonValue:
+    """把调用上下文转为 JSON 值。
+
+    :param context: Host call context。
+    :returns: JSON 对象值。
+    """
+
+    return {
+        "actor": context.actor,
+        "source": context.source,
+        "authorization_claims": _authorization_claims_json_value(
+            context.authorization_claims
+        ),
+        "operation_context": _operation_context_json_value(
+            context.operation_context
+        ),
+    }
+
+
+def _authorization_claims_json_value(
+    claims: tuple[AuthorizationClaim, ...]
+) -> JsonValue:
+    """把授权声明转为 JSON 值。
+
+    :param claims: 授权声明元组。
+    :returns: JSON 数组值。
+    """
+
+    values: list[JsonValue] = []
+    for claim in claims:
+        values.append({"name": claim.name, "value": claim.value})
+    return values
+
+
+def _operation_context_json_value(context: OperationContext) -> JsonValue:
+    """把操作上下文转为 JSON 值。
+
+    :param context: 操作上下文。
+    :returns: JSON 对象值。
+    """
+
+    return {
+        "operation_name": context.operation_name,
+        "operation_kind": context.operation_kind,
+        "business_domain": context.business_domain,
+        "business_object_type": context.business_object_type,
+        "business_object_id": context.business_object_id,
+        "scenario": context.scenario,
+        "correlation_id": context.correlation_id,
+    }
