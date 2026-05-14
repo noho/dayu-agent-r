@@ -1431,9 +1431,9 @@ Phase 按依赖关系推进：先实现被其它阶段依赖的公共契约、ru
 
 P0：Engine Context Compaction Event 语义前置已完成 implementation 与 review loop；P0-S1 accepted slice commit 为 `ad6d116`，P0-S2 accepted slice commit 为 `6f6e716`。P0 后续状态进入 push / PR 路径，不再是当前 Host phase design gate。
 
-当前工作入口为 Phase 4：Host Public API Command Path design discussion / design refinement。Phase 3 已通过 PR 50
+当前工作入口为 Phase 4：Host Public API Command Path implementation。Phase 3 已通过 PR 50
 `Host Phase 3 admission state machine` merge 到 `main`，merge commit 为
-`d9c2ca9dd0d9b88b99dae96d972457a493f98f60`，merged at `2026-05-14T08:35:49Z`。Phase 4 尚未进入 plan gate。
+`d9c2ca9dd0d9b88b99dae96d972457a493f98f60`，merged at `2026-05-14T08:35:49Z`。
 Phase 4 design readiness artifact 为 `docs/reviews/gateflow-phase-design-host-p4-codex-20260514.md`，controller
 adjudication artifact 为 `docs/reviews/gateflow-phase-design-host-p4-controller-adjudication-20260514.md`。用户已确认：
 新增 `HostApiErrorCode.UNSUPPORTED_OPERATION`，用于表达 public envelope 已冻结但完整语义由后续 phase 落地；
@@ -1447,10 +1447,16 @@ accepted / no blocking finding。Phase 4 plan 已写入 `docs/host/phase4-public
 artifacts 为 `docs/reviews/gateflow-plan-review-host-p4-public-api-command-path-mimo-20260514.md` 与
 `docs/reviews/gateflow-plan-review-host-p4-public-api-command-path-ds-20260514.md`；controller plan review
 adjudication artifact 为 `docs/reviews/gateflow-plan-review-host-p4-public-api-command-path-controller-adjudication-20260514.md`。
-两份 plan review 均为 accepted / no blocking finding；当前 gate 为 accepted plan commit。commit 后进入 Phase 4
-implementation gate，下一 slice 为 P4-S1 Public Types, Error Detail, Handle Options And Constants。
-Phase 4 accepted plan commit 为 `e004031`。当前 gate 为 Phase 4 implementation，下一步进入 P4-S1 Public Types,
-Error Detail, Handle Options And Constants。
+两份 plan review 均为 accepted / no blocking finding。Phase 4 accepted plan commit 为 `e004031`。
+P4-S1 Public Types, Error Detail, Handle Options And Constants implementation artifact 为
+`docs/reviews/gateflow-implementation-host-p4-s1-public-types-20260514.md`。AgentMiMo 与 AgentDS 的 code review
+artifacts 分别为 `docs/reviews/gateflow-code-review-host-p4-s1-public-types-mimo-20260514.md` 与
+`docs/reviews/gateflow-code-review-host-p4-s1-public-types-ds-20260514.md`；controller adjudication artifact 为
+`docs/reviews/gateflow-code-review-host-p4-s1-public-types-controller-adjudication-20260514.md`。两份 code review
+均为 accepted / no blocking finding，controller 裁决 P4-S1 可进入 accepted slice commit。P4-S1 validation：
+`pytest tests/host/test_public_contracts.py tests/host/test_package_exports.py -q` 30 passed，
+`python -m pyright dayu/host tests/host` 0 errors，`git diff --check` passed。当前 gate 为 P4-S1 accepted slice
+commit；commit 后进入 P4-S2 Session Public APIs And Snapshots implementation。
 
 历史状态：Phase 1 公共契约与 runtime 基础设施已完成并 merge；Phase 2 Durable Store / EventLog / Payload Foundation 已完成 plan、3 个 implementation slices、aggregate deepreview、aggregate fix、aggregate re-review 与 accepted deepreview commit，本 phase 状态为 completed。Phase 1 design refinement 已写入 `docs/reviews/gateflow-phase-design-host-p1-codex-20260513.md`，controller-accepted design fix 已写入 `docs/reviews/gateflow-phase-design-fix-host-p1-codex-20260513.md`。用户反馈后的 design fixes 已写入 `docs/reviews/gateflow-phase-design-user-feedback-fix-host-p1-codex-20260513.md` 与 `docs/reviews/gateflow-phase-design-user-feedback-fix2-host-p1-codex-20260513.md`。AgentMiMo 与 AgentDS 的 phase design re-review 均确认 accepted findings 已修复且 new blocker 为 0；round2 re-review 进一步确认 lane 已改为 cross-process runtime capacity guard，Phase Map 已重排为 P12 ToolsDiscovery / ScenePrepare、P13 Audit / Tool Trace / Outbox、P14 RemoteProxy、P15 Retention / Purge。Phase 1 plan 已写入 `docs/host/phase1-public-contract-runtime-plan.md`；plan review、controller adjudication、plan fix 与 plan re-review artifacts 已写入 `docs/reviews/`。AgentMiMo 与 AgentDS 的 plan re-review 均确认 finding 数量为 0、blocking finding 数量为 0。用户已确认 Phase 1 plan；accepted plan commit 为 `34b1b41`。Phase 1 Slice 1 accepted slice commit 为 `66d8dc3`，Slice 2 accepted slice commit 为 `27e0d8b`，Slice 3 accepted slice commit 为 `e23e3e4`，Slice 4 accepted slice commit 为 `0393a22`。
 

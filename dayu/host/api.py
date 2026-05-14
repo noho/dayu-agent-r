@@ -7,11 +7,16 @@ dispatch、policy provider 或 Engine 调用路径。
 
 from __future__ import annotations
 
+import pathlib
 from dataclasses import dataclass
 from enum import StrEnum
-from typing import Protocol
+from typing import Protocol, TypeAlias
 
 from dayu.contracts.json_value import JsonValue
+
+
+HOST_EVENT_STREAM_DEFAULT_LIMIT = 100
+HOST_EVENT_STREAM_MAX_LIMIT = 1000
 
 
 def _require_non_empty(value: str, *, field_name: str) -> None:
@@ -53,6 +58,80 @@ def _require_non_negative(value: int, *, field_name: str) -> None:
 
     if value < 0:
         raise ValueError(f"{field_name} must be non-negative")
+
+
+def _require_non_negative_int(value: int, *, field_name: str) -> None:
+    """校验整数配置值不为负数且不是布尔值。
+
+    :param value: 待校验的整数值。
+    :param field_name: 错误消息中使用的字段名。
+    :returns: 无返回值。
+    :raises TypeError: ``value`` 不是严格整数时抛出。
+    :raises ValueError: ``value`` 小于零时抛出。
+    """
+
+    if isinstance(value, bool) or not isinstance(value, int):
+        raise TypeError(f"{field_name} must be int")
+    if value < 0:
+        raise ValueError(f"{field_name} must be non-negative")
+
+
+def _require_positive_int(value: int, *, field_name: str) -> None:
+    """校验整数配置值大于零。
+
+    :param value: 待校验的整数值。
+    :param field_name: 错误消息中使用的字段名。
+    :returns: 无返回值。
+    :raises TypeError: ``value`` 不是严格整数时抛出。
+    :raises ValueError: ``value`` 小于或等于零时抛出。
+    """
+
+    if isinstance(value, bool) or not isinstance(value, int):
+        raise TypeError(f"{field_name} must be int")
+    if value <= 0:
+        raise ValueError(f"{field_name} must be positive")
+
+
+def _require_positive_float(value: float, *, field_name: str) -> None:
+    """校验浮点配置值大于零。
+
+    :param value: 待校验的浮点值。
+    :param field_name: 错误消息中使用的字段名。
+    :returns: 无返回值。
+    :raises TypeError: ``value`` 不是严格数值时抛出。
+    :raises ValueError: ``value`` 小于或等于零时抛出。
+    """
+
+    if isinstance(value, bool) or not isinstance(value, int | float):
+        raise TypeError(f"{field_name} must be float")
+    if value <= 0:
+        raise ValueError(f"{field_name} must be positive")
+
+
+def _require_path(value: pathlib.Path, *, field_name: str) -> None:
+    """校验路径配置字段使用 ``pathlib.Path`` 实例。
+
+    :param value: 待校验的路径值。
+    :param field_name: 错误消息中使用的字段名。
+    :returns: 无返回值。
+    :raises TypeError: ``value`` 不是 ``pathlib.Path`` 实例时抛出。
+    """
+
+    if not isinstance(value, pathlib.Path):
+        raise TypeError(f"{field_name} must be pathlib.Path")
+
+
+def _require_bool(value: bool, *, field_name: str) -> None:
+    """校验布尔配置字段使用 ``bool`` 值。
+
+    :param value: 待校验的布尔值。
+    :param field_name: 错误消息中使用的字段名。
+    :returns: 无返回值。
+    :raises TypeError: ``value`` 不是 ``bool`` 时抛出。
+    """
+
+    if not isinstance(value, bool):
+        raise TypeError(f"{field_name} must be bool")
 
 
 def _require_metadata_entries(
@@ -176,7 +255,7 @@ class SourceRunRelation(StrEnum):
 class HostApiErrorCode(StrEnum):
     """Host API 结构化错误码。
 
-    Phase 1 只定义错误码集合，不实现 command path 抛错路径。
+    当前只冻结公共错误码集合，不实现 command path 抛错路径。
     """
 
     NOT_FOUND = "not_found"
@@ -184,7 +263,44 @@ class HostApiErrorCode(StrEnum):
     CONFLICT = "conflict"
     IDEMPOTENCY_CONFLICT = "idempotency_conflict"
     PERMISSION_DENIED = "permission_denied"
+    UNSUPPORTED_OPERATION = "unsupported_operation"
     INTERNAL_ERROR = "internal_error"
+
+
+@dataclass(frozen=True, slots=True)
+class SteerConflictDetail:
+    """steer 前置条件冲突的结构化错误详情。
+
+    字段语义：
+
+    - ``target_run_id``：调用方请求 steer 的目标 Run id。
+    - ``target_run_status``：目标 Run 当前状态；目标不存在或无法读取时为 ``None``。
+    - ``current_active_run_id``：Session 当前 active Run id；无 active Run 时为 ``None``。
+    - ``current_active_run_status``：当前 active Run 状态；无 active Run 时为 ``None``。
+    """
+
+    target_run_id: str
+    target_run_status: RunStatus | None
+    current_active_run_id: str | None
+    current_active_run_status: RunStatus | None
+
+    def __post_init__(self) -> None:
+        """校验 steer 冲突详情中的 Run id 字段。
+
+        :returns: 无返回值。
+        :raises ValueError: ``target_run_id`` 为空，或可选 active Run id 存在但为空时抛出。
+        """
+
+        _require_non_empty(
+            self.target_run_id, field_name="SteerConflictDetail.target_run_id"
+        )
+        _require_optional_non_empty(
+            self.current_active_run_id,
+            field_name="SteerConflictDetail.current_active_run_id",
+        )
+
+
+HostApiErrorDetail: TypeAlias = SteerConflictDetail
 
 
 @dataclass(frozen=True, slots=True)
@@ -408,6 +524,99 @@ class HostCommandFacet(Protocol):
         """
 
         ...
+
+
+@dataclass(frozen=True, slots=True)
+class HostCommandHandleOptions:
+    """Host command handle 的公共构造选项。
+
+    字段语义：
+
+    - ``host_handle_id``：可选稳定诊断 id；不传时由后续 factory 决定。
+    - ``db_path``：Host durable SQLite 数据库路径。
+    - ``artifact_root``：Host 本地 artifact 根目录。
+    - ``create_parent_dirs``：factory 打开存储前是否创建父目录。
+    - ``sqlite_busy_timeout_seconds``：SQLite busy timeout 秒数。
+    - ``sqlite_write_busy_retry_count``：写事务 busy 重试次数。
+    - ``sqlite_write_retry_initial_delay_seconds``：首次写重试等待秒数。
+    - ``sqlite_write_retry_backoff_multiplier``：写重试退避倍率。
+    - ``sqlite_write_retry_max_delay_seconds``：写重试最大等待秒数。
+    - ``payload_inline_threshold_bytes``：payload 内联存储阈值字节数。
+    """
+
+    host_handle_id: str | None
+    db_path: pathlib.Path
+    artifact_root: pathlib.Path
+    create_parent_dirs: bool
+    sqlite_busy_timeout_seconds: float
+    sqlite_write_busy_retry_count: int
+    sqlite_write_retry_initial_delay_seconds: float
+    sqlite_write_retry_backoff_multiplier: float
+    sqlite_write_retry_max_delay_seconds: float
+    payload_inline_threshold_bytes: int
+
+    def __post_init__(self) -> None:
+        """校验 Host command handle 构造选项。
+
+        :returns: 无返回值。
+        :raises ValueError: 可选 handle id 为空、数值配置不满足正数或非负约束时抛出。
+        :raises TypeError: 路径字段不是 ``pathlib.Path`` 或布尔字段不是 ``bool`` 时抛出。
+        """
+
+        _require_optional_non_empty(
+            self.host_handle_id,
+            field_name="HostCommandHandleOptions.host_handle_id",
+        )
+        _require_path(
+            self.db_path, field_name="HostCommandHandleOptions.db_path"
+        )
+        _require_path(
+            self.artifact_root,
+            field_name="HostCommandHandleOptions.artifact_root",
+        )
+        _require_bool(
+            self.create_parent_dirs,
+            field_name="HostCommandHandleOptions.create_parent_dirs",
+        )
+        _require_positive_float(
+            self.sqlite_busy_timeout_seconds,
+            field_name=(
+                "HostCommandHandleOptions.sqlite_busy_timeout_seconds"
+            ),
+        )
+        _require_non_negative_int(
+            self.sqlite_write_busy_retry_count,
+            field_name=(
+                "HostCommandHandleOptions.sqlite_write_busy_retry_count"
+            ),
+        )
+        _require_positive_float(
+            self.sqlite_write_retry_initial_delay_seconds,
+            field_name=(
+                "HostCommandHandleOptions."
+                "sqlite_write_retry_initial_delay_seconds"
+            ),
+        )
+        _require_positive_float(
+            self.sqlite_write_retry_backoff_multiplier,
+            field_name=(
+                "HostCommandHandleOptions."
+                "sqlite_write_retry_backoff_multiplier"
+            ),
+        )
+        _require_positive_float(
+            self.sqlite_write_retry_max_delay_seconds,
+            field_name=(
+                "HostCommandHandleOptions."
+                "sqlite_write_retry_max_delay_seconds"
+            ),
+        )
+        _require_positive_int(
+            self.payload_inline_threshold_bytes,
+            field_name=(
+                "HostCommandHandleOptions.payload_inline_threshold_bytes"
+            ),
+        )
 
 
 @dataclass(frozen=True, slots=True)
@@ -995,27 +1204,35 @@ class FollowupSnapshot:
 
     - ``accepted_input_ref``：已接受输入的引用。
     - ``behavior``：Host 采用的 follow-up 行为。
-    - ``target_run_id``：steer 目标 Run id；queue 时为 ``None``。
-    - ``queued_run_id``：queue 产生的 Run id；steer 时为 ``None``。
+    - ``accepted_run_id``：本次 follow-up 接受后关联的 Run id。
+    - ``accepted_run_status``：本次 follow-up 接受后关联 Run 的当前状态。
     - ``current_cursor``：接受后的当前事件游标。
+    - ``queued_run_id``：真实处于 queued 状态的 accepted Run id；其它情况为 ``None``。
+    - ``target_run_id``：steer 目标 Run id；queue 时为 ``None``。
     """
 
     accepted_input_ref: str
     behavior: FollowupBehavior
-    target_run_id: str | None
-    queued_run_id: str | None
+    accepted_run_id: str
+    accepted_run_status: RunStatus
     current_cursor: HostStreamCursor
+    queued_run_id: str | None
+    target_run_id: str | None
 
     def __post_init__(self) -> None:
         """校验 follow-up 快照字段与行为一致性。
 
         :returns: 无返回值。
-        :raises ValueError: 引用 / id 为空或 queue / steer 字段组合非法时抛出。
+        :raises ValueError: 引用 / id 为空，或 queue / steer 字段组合非法时抛出。
         """
 
         _require_non_empty(
             self.accepted_input_ref,
             field_name="FollowupSnapshot.accepted_input_ref",
+        )
+        _require_non_empty(
+            self.accepted_run_id,
+            field_name="FollowupSnapshot.accepted_run_id",
         )
         _require_optional_non_empty(
             self.target_run_id, field_name="FollowupSnapshot.target_run_id"
@@ -1023,23 +1240,27 @@ class FollowupSnapshot:
         _require_optional_non_empty(
             self.queued_run_id, field_name="FollowupSnapshot.queued_run_id"
         )
-        if self.behavior == FollowupBehavior.STEER:
-            if self.target_run_id is None:
-                raise ValueError(
-                    "FollowupSnapshot.target_run_id is required for steer"
-                )
-            if self.queued_run_id is not None:
-                raise ValueError(
-                    "FollowupSnapshot.queued_run_id must be None for steer"
-                )
         if self.behavior == FollowupBehavior.QUEUE:
             if self.target_run_id is not None:
                 raise ValueError(
                     "FollowupSnapshot.target_run_id must be None for queue"
                 )
-            if self.queued_run_id is None:
+            if self.accepted_run_status == RunStatus.QUEUED:
+                if self.queued_run_id != self.accepted_run_id:
+                    raise ValueError(
+                        "FollowupSnapshot.queued_run_id must equal "
+                        "accepted_run_id for queued queue result"
+                    )
+            elif self.accepted_run_status == RunStatus.RUNNING:
+                if self.queued_run_id is not None:
+                    raise ValueError(
+                        "FollowupSnapshot.queued_run_id must be None "
+                        "for running queue result"
+                    )
+            else:
                 raise ValueError(
-                    "FollowupSnapshot.queued_run_id is required for queue"
+                    "FollowupSnapshot.accepted_run_status must be queued "
+                    "or running for queue"
                 )
 
 
@@ -1153,20 +1374,28 @@ class HostApiError(Exception):
     - ``code``：结构化错误码。
     - ``message``：人类可读错误描述。
     - ``retryable``：调用方是否可以重试同一操作。
+    - ``detail``：受限 typed 错误详情；无详情时为 ``None``。
     """
 
     code: HostApiErrorCode
     message: str
     retryable: bool
+    detail: HostApiErrorDetail | None
 
     def __init__(
-        self, *, code: HostApiErrorCode, message: str, retryable: bool
+        self,
+        *,
+        code: HostApiErrorCode,
+        message: str,
+        retryable: bool,
+        detail: HostApiErrorDetail | None = None,
     ) -> None:
         """构造 Host API 异常。
 
         :param code: 结构化错误码。
         :param message: 人类可读错误描述。
         :param retryable: 调用方是否可以重试同一操作。
+        :param detail: 受限 typed 错误详情；无详情时为 ``None``。
         :returns: 无返回值。
         :raises ValueError: ``message`` 为空或仅包含空白字符时抛出。
         """
@@ -1175,6 +1404,7 @@ class HostApiError(Exception):
         self.code = code
         self.message = message
         self.retryable = retryable
+        self.detail = detail
         super().__init__(message)
 
 
@@ -1189,10 +1419,14 @@ __all__ = [
     "EnsureSessionRequest",
     "FollowupBehavior",
     "FollowupSnapshot",
+    "HOST_EVENT_STREAM_DEFAULT_LIMIT",
+    "HOST_EVENT_STREAM_MAX_LIMIT",
     "HostApiError",
     "HostApiErrorCode",
+    "HostApiErrorDetail",
     "HostCallContext",
     "HostCommandFacet",
+    "HostCommandHandleOptions",
     "HostEventStream",
     "HostEventView",
     "HostInput",
@@ -1212,6 +1446,7 @@ __all__ = [
     "SessionStatus",
     "SourceRunRelation",
     "StartRunRequest",
+    "SteerConflictDetail",
     "SubmitFollowupRequest",
     "TerminalResultSummary",
     "WaitResolutionSource",
