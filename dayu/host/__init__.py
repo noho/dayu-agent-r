@@ -1,9 +1,8 @@
 """Host 公共命名空间。
 
-本包当前导出 Phase 1 承诺的公共类型契约：request、snapshot、status、
-error、context、stream cursor，以及 Host construction 的业务工具输入
-边界。Host command path、durable store、EventLog、dispatch、
-ToolRuntime factory 与 policy provider 均不在当前包根导出范围内。
+本包当前导出公共类型契约、Host construction 的业务工具输入边界，以及
+Phase 4 已实现的 Session / Run public facade。durable store、EventLog store、
+dispatch、ToolRuntime factory 与 policy provider 均不在当前包根导出范围内。
 """
 
 from __future__ import annotations
@@ -19,10 +18,14 @@ from dayu.host.api import (
     EnsureSessionRequest,
     FollowupBehavior,
     FollowupSnapshot,
+    HOST_EVENT_STREAM_DEFAULT_LIMIT,
+    HOST_EVENT_STREAM_MAX_LIMIT,
     HostApiError,
     HostApiErrorCode,
+    HostApiErrorDetail,
     HostCallContext,
     HostCommandFacet,
+    HostCommandHandleOptions,
     HostEventStream,
     HostEventView,
     HostInput,
@@ -42,10 +45,27 @@ from dayu.host.api import (
     SessionStatus,
     SourceRunRelation,
     StartRunRequest,
+    SteerConflictDetail,
     SubmitFollowupRequest,
     TerminalResultSummary,
     WaitResolutionSource,
 )
+from dayu.host.command import (
+    HostCommandHandle,
+    cancel_run,
+    cancel_session_runs,
+    close_session,
+    create_host_command_handle,
+    create_session,
+    ensure_session,
+    purge_session,
+    replay_run,
+    resolve_wait,
+    retry_run,
+    start_run,
+    submit_followup,
+)
+from dayu.host.read_api import get_run, get_session, stream_run_events
 from dayu.host.tooling import (
     FrameworkToolName,
     FrameworkToolPolicyView,
@@ -68,10 +88,15 @@ __all__ = [
     "FollowupSnapshot",
     "FrameworkToolName",
     "FrameworkToolPolicyView",
+    "HOST_EVENT_STREAM_DEFAULT_LIMIT",
+    "HOST_EVENT_STREAM_MAX_LIMIT",
     "HostApiError",
     "HostApiErrorCode",
+    "HostApiErrorDetail",
     "HostCallContext",
+    "HostCommandHandle",
     "HostCommandFacet",
+    "HostCommandHandleOptions",
     "HostEventStream",
     "HostEventView",
     "HostInput",
@@ -92,10 +117,26 @@ __all__ = [
     "SessionStatus",
     "SourceRunRelation",
     "StartRunRequest",
+    "SteerConflictDetail",
     "SubmitFollowupRequest",
     "TerminalResultSummary",
     "ToolBundleSourceKind",
     "ToolBundleSourceRef",
     "WaitResolutionSource",
+    "cancel_run",
+    "cancel_session_runs",
+    "close_session",
+    "create_host_command_handle",
+    "create_session",
     "default_framework_tool_policy_view",
+    "ensure_session",
+    "get_run",
+    "get_session",
+    "purge_session",
+    "replay_run",
+    "resolve_wait",
+    "retry_run",
+    "start_run",
+    "stream_run_events",
+    "submit_followup",
 ]

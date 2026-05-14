@@ -66,6 +66,25 @@ class HostTransactionOperation(Protocol[T_co]):
         ...
 
 
+class HostReadTransactionOperation(Protocol[T_co]):
+    """Host durable read transaction body 协议。
+
+    :param transaction: 当前 read transaction wrapper。
+    :returns: operation 自定义返回值。
+    :raises Exception: operation 失败时由 runner rollback 并透传或结构化转换。
+    """
+
+    def __call__(self, transaction: "HostTransaction") -> T_co:
+        """执行 read transaction body。
+
+        :param transaction: 当前 read transaction wrapper。
+        :returns: operation 自定义返回值。
+        :raises Exception: operation 失败时由 runner rollback 并透传或结构化转换。
+        """
+
+        ...
+
+
 @dataclass(frozen=True, slots=True)
 class HostRow:
     """Host durable SQLite row 的强类型只读视图。
@@ -243,6 +262,30 @@ class HostTransactionRunner:
                 raise
             _run_after_commit(after_commit)
             return result
+
+    def run_read(self, operation: HostReadTransactionOperation[T]) -> T:
+        """在普通 read transaction 内运行 operation。
+
+        :param operation: transaction body。
+        :returns: ``operation`` 的返回值。
+        :raises HostDurableError: SQLite read transaction 失败时抛出结构化错误。
+        :raises Exception: operation 抛出的非 durable 错误会在 rollback 后透传。
+        """
+
+        try:
+            self._connection.execute("BEGIN")
+            result = operation(HostTransaction(self._connection))
+            self._connection.execute("COMMIT")
+        except sqlite3.Error as exc:
+            _rollback(self._connection)
+            raise _classify_sqlite_error(exc) from exc
+        except HostDurableError:
+            _rollback(self._connection)
+            raise
+        except Exception:
+            _rollback(self._connection)
+            raise
+        return result
 
 
 def configure_connection_pragmas(

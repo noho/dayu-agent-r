@@ -487,7 +487,7 @@ RECOVERING
 
 - `queue`：`submit_followup(queue)` 在同一个 Host admission transaction 内检查 active Run；有 active Run 时输入进入 durable queue，成为后续 Run；无 active Run 时直接创建并启动新 Run。
 - `reject`：当前 Session 有 active Run 时，拒绝创建新 Run，并返回 active run conflict。
-- `attach_active`：当前 Session 有 active Run 时，返回 active Run，不触发新执行。
+- `attach_active`：当前 Session 有 active Run 时，返回当前 active `RunSnapshot`，不触发新执行，不新增 canonical EventLog fact。第一版只通过幂等记录、diagnostic refs 或后续 audit/read-model projection 解释 attach request；如果后续需要把 attach 作为可查询业务事实，必须先补充新的 canonical event shape，不能由 public facade 临时发明事件。
 - `steer`：必须命中 active Run precondition；它在同一 Run 内切换 Attempt，不创建新 Run。
 
 幂等不变量：
@@ -834,7 +834,7 @@ purge_session(host, session_id, request) -> PurgeSessionResult
 
 start_run(host, request) -> RunSnapshot
 get_run(host, run_id) -> RunSnapshot
-stream_run_events(host, run_id, cursor) -> HostEventStream
+stream_run_events(host, run_id, cursor, limit?) -> HostEventStream
 cancel_run(host, run_id, request) -> RunSnapshot
 cancel_session_runs(host, session_id, request) -> SessionSnapshot
 submit_followup(host, session_id, request) -> FollowupSnapshot
@@ -844,6 +844,29 @@ resolve_wait(host, wait_id, request) -> RunSnapshot
 ```
 
 外部语义采用函数式操作。`retry_run(host, run_id, request)` 与 `replay_run(host, run_id, request)` 的语义分别是 `retry(run)` / `replay(run)`：输入是源 Run，输出是关联的新 RunSnapshot；它们不是在原 Run 上调用 `Run.retry` / `Run.replay` 来重开终态。
+
+Phase 4 public function behavior matrix：
+
+| 函数 / 路径 | Phase 4 行为 | 后续 owner / 说明 |
+| --- | --- | --- |
+| `ensure_session` | 完整实现 | 只依赖 Phase 1-3 durable store、slot binding 与 session lifecycle。 |
+| `create_session` | 完整实现 | 只依赖 Phase 1-3 durable store、slot binding 与 session lifecycle。 |
+| `get_session` | 完整实现 | 从 durable truth / minimal read path 构造 snapshot，不触发 projection worker。 |
+| `close_session` | 完整实现 | 关闭新输入入口；不 cancel、不 purge。 |
+| `start_run` | 完整实现 Phase 1-3 可闭环 admission | 支持 `queue` / `reject` / `attach_active` 的当前 durable 语义；`attach_active` 返回 active `RunSnapshot`，不新增 canonical fact。 |
+| `submit_followup(queue)` | 完整实现 | 在同一 admission transaction 内吸收 active Run 竞态；结果用 `accepted_run_id` + `accepted_run_status` 表达。 |
+| `get_run` | 完整实现 | 从 durable Run / Attempt truth 构造 snapshot。 |
+| `stream_run_events` | 完整实现 EventLog-backed read path | 全局 EventLog cursor 是唯一 cursor truth；Phase 4 不引入 projection truth。 |
+| `cancel_run` queued / pre-dispatch `STARTING` | 完整实现 | 覆盖 Phase 1-3 已有可闭环路径：`QUEUED` 与 dispatch record 尚未进入 dispatching 的 Attempt `STARTING`。 |
+| `cancel_session_runs` queued / pre-dispatch `STARTING` | 子集实现并追踪后续完善 | Phase 4 只批量覆盖上述 `cancel_run` 可闭环子集；dispatching / active worker、`WAITING`、`RECOVERING` cancel deferred。 |
+| `submit_followup(steer)` | stable unsupported / deferred | Phase 4 只冻结 envelope、validation、error/detail contract；public facade 返回 `unsupported_operation`。完整 Attempt switching 由后续 steer / dispatch / wait owner 落地。 |
+| `retry_run` | stable unsupported / deferred | Phase 4 冻结 request / idempotency / error envelope；执行语义由后续 retry owner 落地。 |
+| `replay_run` | stable unsupported / deferred | Phase 4 冻结 request / idempotency / error envelope；执行语义由后续 replay owner 落地。 |
+| `resolve_wait` | stable unsupported / deferred | Phase 7 owns wait record、tool result accept 与 resume Attempt。 |
+| `purge_session` | stable unsupported / deferred | Phase 15 owns destructive cleanup 与 purge tombstone persistence。 |
+| active dispatch cancel | stable unsupported / deferred | Phase 5 owns dispatching / active WorkerProxy cancel propagation。 |
+| wait cancel | stable unsupported / deferred | Phase 7 owns `WAITING` closeout 与 external job best-effort cancel / abandon。 |
+| recovery cancel | stable unsupported / deferred | Phase 11 owns `RECOVERING` dispatch / recovery scan cancellation。 |
 
 所有会 append EventLog `canonical_fact` 或影响 audit 的 mutating request 都必须携带结构化 `HostCallContext` 或等价 request envelope。Host 不负责认证，但必须记录上层已经解析的 actor / principal、source / client、request id、权限声明和 operation context。required fields 不能塞进无结构 metadata。
 
@@ -1000,9 +1023,9 @@ Run 接口语义：
 - `stream_run_events`：从全局 `event_sequence` cursor 补读目标 Run 的事件；断线重连只依赖 cursor，不依赖内存订阅是否仍存在。
 - `close_session`：关闭 Session 新输入入口，按 `(session_id, client_request_id)` 幂等；不取消、不终止、不删除已有 Run。
 - `purge_session`：清理已关闭且全部 Run 终态的 Session，按 `(session_id, client_request_id)` 幂等；删除可恢复事实与 projection，只保留最小 purge tombstone / audit record。
-- `cancel_run`：接受取消请求，按 `(run_id, client_request_id)` 幂等；queued Run 直接 `CANCELLED`，active Run 进入 `CANCELLING` 并向当前 Attempt 传播 cancel。
-- `cancel_session_runs`：接受 session-scope cancel 请求，按 `(session_id, client_request_id)` 幂等；取消该 Session 下所有未终态 Run，不影响其它 Session。
-- `submit_followup`：接受同一 Session 的会话延续输入。聊天界面的普通 prompt 入口应统一使用该接口，不应由调用方先读 active Run 再在 `start_run` / `submit_followup` 之间选择。`behavior=queue` 由 Host admission 在同一事务内决定排队或直接启动；`behavior=steer` 必须命中 `target_run_id` 所指的当前 active Run 并切换 Attempt。
+- `cancel_run`：接受取消请求，按 `(run_id, client_request_id)` 幂等；queued Run 直接 `CANCELLED`，pre-dispatch `STARTING` Run 可直接 `CANCELLED`。dispatching / active worker cancel 进入 `CANCELLING` 并向当前 Attempt 传播 cancel 的完整能力由 Phase 5 落地；`WAITING` 与 `RECOVERING` cancel 分别由 Phase 7 / Phase 11 落地。
+- `cancel_session_runs`：接受 session-scope cancel 请求，按 `(session_id, client_request_id)` 幂等；取消该 Session 下所有未终态 Run，不影响其它 Session。Phase 4 只实现 queued / pre-dispatch `STARTING` 子集，完整 dispatching / active worker、`WAITING`、`RECOVERING` cancel 必须由 Phase 5 / 7 / 11 补齐。
+- `submit_followup`：接受同一 Session 的会话延续输入。聊天界面的普通 prompt 入口应统一使用该接口，不应由调用方先读 active Run 再在 `start_run` / `submit_followup` 之间选择。`behavior=queue` 由 Host admission 在同一事务内决定排队或直接启动；`behavior=steer` 必须命中 `target_run_id` 所指的当前 active Run 并切换 Attempt。Phase 4 只冻结 steer envelope、validation 与 error/detail contract，public facade 对 steer 返回 `unsupported_operation`；完整 Attempt switching 后续落地。
 - `retry_run`：公开 Host control API，由调用方主动发起；函数式语义为 `retry(run)`。它在 confirmed failure / recoverable failure 后创建关联的新 Run。原 Run 保持终态不可变；新 Run 可以按 retry policy 复用旧 Run 已接受工具事实，并创建自己的 Attempt。
 - `replay_run`：公开 Host control API，由调用方主动发起；函数式语义为 `replay(run)`。它只用于 final answer 格式、schema、结构或输出 envelope 失败时创建关联的新 Run。原 `SUCCEEDED` Run 不重开；新 Run 默认复用旧 Run 已接受工具事实，并以 no-tool messages 调用做结构修复。事实内容脏、幻觉、业务归因错误、证据不足或证据冲突不属于 replay 场景。
 - `resolve_wait`：等待结果接收与治理入口；接收 poll / callback / manual 已取得的结果，关闭 wait record，append tool terminal/result fact，并创建新 Attempt resume。它不负责等待外部长事务完成。
@@ -1029,7 +1052,7 @@ Snapshot 最小语义：
 
 - `SessionSnapshot`：`session_id`、status、slot、active run、queued runs、timeline cursor。timeline cursor 使用全局 `event_sequence` cursor；session-local cursor 只能作为 read model 优化，不能替代全局 cursor。
 - `RunSnapshot`：`run_id`、`session_id`、status、current attempt、terminal result summary、event_sequence cursor、source_run_id?、source_run_relation?、outbox summary。
-- `FollowupSnapshot`：accepted input ref、behavior、target run / queued run、current cursor。
+- `FollowupSnapshot`：accepted input ref、behavior、`accepted_run_id`、`accepted_run_status`、current cursor。`accepted_run_status` 使用公共 `RunStatus`，queue 分支可为 `QUEUED` 或 `RUNNING`，用于表达无 active Run 时直接启动的新 Run。`queued_run_id?` 若保留，只能作为派生可选字段表达真正处于 `QUEUED` 的 Run，不能作为 queue 分支唯一结果字段；steer 分支可携带 `target_run_id?`，但 Phase 4 steer 返回 `unsupported_operation`，不会产生 accepted steer snapshot。
 - `PurgeSessionResult`：`session_id`、purged marker、purge tombstone ref、deleted counts / digest。
 - `HostEventStream`：Host event stream 的返回对象，按全局 `event_sequence` 递增返回，携带 next `event_sequence` cursor。
 
@@ -1040,6 +1063,7 @@ Snapshot 最小语义：
 - `conflict`
 - `idempotency_conflict`
 - `permission_denied`
+- `unsupported_operation`
 - `internal_error`
 
 错误分类语义：
@@ -1048,8 +1072,29 @@ Snapshot 最小语义：
 - `idempotency_conflict`：同一幂等键已绑定到不同语义输入或不同目标对象。
 - `invalid_state`：目标对象存在，但该状态下不允许此操作。
 - `permission_denied`：上层传入的 authorization claims 不满足 Host policy。
+- `unsupported_operation`：public request / response envelope 已冻结，但完整语义由后续 phase 落地；它不表达目标对象状态错误，也不能伪装成 `invalid_state`。
 
-`stream_run_events` 从 EventLog `event_sequence` cursor 补读，不触发新执行。
+`HostApiError` 必须是受限 typed contract：`code`、`message`、`retryable` 与 `detail?`。`detail` 只能是 Host 公共 API 中显式定义的 detail union 成员，禁止无结构 `extra` / `payload` / `metadata` god bag。第一版至少包含：
+
+```text
+SteerConflictDetail:
+  target_run_id
+  target_run_status?
+  current_active_run_id?
+  current_active_run_status?
+```
+
+`SteerConflictDetail` 只携带足以解释 steer precondition 失败的 Run id 与状态摘要，不嵌入完整 `RunSnapshot`，不暴露 Host durable row。后续新增错误 detail 时必须新增具体 typed detail，不得把显式参数塞进无结构 payload。
+
+`stream_run_events` 从 EventLog `event_sequence` cursor 补读，不触发新执行。Phase 4 cursor contract：
+
+- 全局 EventLog `event_sequence` 是唯一 cursor truth；projection checkpoint、session-local cursor、client sequence 或内存订阅位置都不能替代它。
+- public signature 包含可选 `limit`；未传时使用 Host public read 默认 limit，超过 Host public read 最大 limit 时返回 `invalid_state` 或等价 validation error，不静默无上限扫描。默认值和最大值必须以公共常量暴露，不能在实现中散落魔法数字。
+- `stream_run_events(host, run_id, cursor, limit?)` 只返回与目标 `run_id` 相关的 HostEventView；需要 session timeline 时走 `get_session` snapshot 或后续 read-model API，不把 session projection 当作本接口真源。
+- filtering 发生在 EventLog read path 上，`next_cursor` 以本次已经扫描过的最大全局 `event_sequence` 为准；即使过滤后结果为空，只要扫描推进，`next_cursor` 也必须前进，避免重连时重复扫描同一窗口。
+- 如果没有扫描到任何大于 cursor 的 EventLog row，返回空 events，`next_cursor` 等于输入 cursor。
+- `HostEventView` 是 EventLog row 的公共视图映射：携带 `event_id`、`event_sequence`、event type / class、`run_id`、`session_id?`、payload ref / digest 与必要的 public summary；不得暴露 durable row 私有列，也不得从 projection 派生新的事实。
+- Phase 4 不引入 projection truth；Phase 8 可以基于同一 cursor contract 建 projection / read model，但不能改变本接口的 truth 来源。
 
 ## 12. Follow-up 与 Steer
 
@@ -1063,9 +1108,12 @@ Snapshot 最小语义：
 - 当前 Session 有 active Run 时，follow-up 输入排队为后续 Run 的输入，不打断当前 active Run。
 - 当前 Session 没有 active Run 时，follow-up 创建并启动新 Run；execution target 通过 Host policy 归一化并持久化。
 - 排队输入使用 `(session_id, client_request_id)` 幂等。
+- queue follow-up 的 public result 必须使用 `accepted_run_id` + `accepted_run_status` 表达被接受的新 Run。active Run 存在时通常返回 `accepted_run_status=QUEUED`；无 active Run 时返回 `accepted_run_status=RUNNING` 或当前 admission 真实状态。`queued_run_id` 不能承载 running Run id。
 - `submit_followup(queue)` 的 `invalid_state` / `conflict` 不应表示 active Run 竞态；它应表示 Session closed、幂等冲突、权限不满足、输入不合法等真实错误。
 
 `steer` 语义：
+
+Phase 4 只冻结 `submit_followup(steer)` 的 public envelope、request validation、错误码与 typed detail contract，不实现 Attempt switching。Phase 4 public facade 在 steer 路径返回 `unsupported_operation`，`retryable=false`；完整 `RUNNING` / `WAITING` steer 语义由后续 steer / dispatch / wait owner 落地。以下完整语义是后续 owner 的目标设计，不是 Phase 4 implementation scope。
 
 - steer 是对当前 active Run 的控制输入，不创建并列新 Run。
 - steer request 必须携带 `target_run_id` 或等价 expected active Run precondition。
@@ -1188,7 +1236,7 @@ event_log
 - client operation id、remote event identity、canonical event identity 必须分层。`client_request_id` 标识客户端 API 操作幂等；remote event identity 标识 Proxy / Stub / EngineWorker 回传来源事件；canonical `event_id` 标识 Host EventLog 中单条 canonical fact。
 - 一个 remote event 如果映射为多个 canonical events，每个 canonical event 都必须有独立、稳定、可去重的 identity，例如由 `execution_id`、remote event identity、canonical event type 与 sub-index 派生。Host-generated state transition event 也必须有明确幂等来源，不能混用 `client_request_id` 或 remote event identity。
 - `run_sequence` / `session_sequence` 可作为 read model 优化，但不得替代全局 `event_sequence`。
-- `stream_run_events(run_id, cursor)` 使用全局 `event_sequence` cursor 过滤目标 run，保证断线重连稳定补读。
+- `stream_run_events(run_id, cursor, limit?)` 使用全局 `event_sequence` cursor 过滤目标 run，保证断线重连稳定补读。空结果也必须返回稳定 `next_cursor`：扫描窗口有推进时使用本次扫描过的最大全局 sequence，没有新 row 时保持输入 cursor。Phase 4 不引入 projection cursor truth。
 - 远端事件携带的 sequence 只用于 remote-side ordering / diagnostics；是否作为 `canonical_fact` 进入 EventLog 由 Host 决定，并由 Host 重新分配 `event_sequence`。
 
 idempotency record primitive：
@@ -1493,7 +1541,7 @@ EventLog 是真源；Run result、Session timeline、Host event stream、audit�
 get_run(run_id)
   -> RunSnapshot(status, terminal summary, active attempt, cursors)
 
-stream_run_events(run_id, cursor)
+stream_run_events(run_id, cursor, limit?)
   -> ordered Host event stream from EventLog event_sequence cursor
 
 get_session(session_id)
@@ -2105,6 +2153,8 @@ client requests cancel
 
 `cancel_session_runs(host, session_id, request)` 是 session-scope cancel command，用于客户端退出、supervisor shutdown 或用户明确停止该 Session 下全部未完成工作。它不是 `close_session`，不关闭新输入入口；不是 `purge_session`，不删除事实；也不表达“客户端拥有的所有 Session”。
 
+Phase 4 只实现 `cancel_session_runs` 的 Phase 1-3 可闭环子集：`QUEUED` Run 与 pre-dispatch Attempt `STARTING`。dispatch record 已进入 `dispatching`、Attempt 已 `RUNNING`、`WAITING`、`RECOVERING`、active worker propagation、wait record cancel 与 recovery dispatch cancel 都是 stable deferred 行为；Phase 5 / Phase 7 / Phase 11 必须分别补齐，不能把 Phase 4 子集解释为最终语义。
+
 `cancel_session_runs` 语义：
 
 - 作用范围是指定 `session_id` 下所有 non-terminal Run。
@@ -2113,8 +2163,9 @@ client requests cancel
 - 幂等范围是 `(session_id, client_request_id)`。
 - queued Run 直接 `CANCELLED`，不创建 Attempt。
 - Attempt `STARTING` 且尚未 dispatch / 正在 waiting-for-lane 时直接取消，不通知 EngineWorker。
-- 已 dispatch / active running Attempt 走普通 `cancel_run` 传播到 WorkerProxy。
-- `WAITING` Run 取消 wait record；外部 job 物理取消由 adapter best-effort。
+- 已 dispatch / active running Attempt 走普通 `cancel_run` 传播到 WorkerProxy；Phase 5 owns 该路径。
+- `WAITING` Run 取消 wait record；外部 job 物理取消由 adapter best-effort；Phase 7 owns 该路径。
+- `RECOVERING` Run 的取消由 Phase 11 recovery owner 接入。
 - terminal 已抢先提交时 terminal 优先，`cancel_session_runs` 返回当前终态，不改写 terminal。
 - 返回 `SessionSnapshot`，包含 cancel 后的 session / run summary。
 
