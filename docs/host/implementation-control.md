@@ -1338,9 +1338,9 @@ Phase 按依赖关系推进：先实现被其它阶段依赖的公共契约、ru
 
 追踪项：
 
-- Phase 2 Slice 3 必须覆盖合法非空 `payload_ref` 的 EventLog append 路径，因为 Slice 2 只能测试缺失 FK 错误路径。
-- Phase 2 后续 slices 如新增第三个 durable validation consumer，可重新评估是否抽取共享 private validation helper；当前 Slice 2 保持模块内私有 helper，避免引入无实际收益的胶水 seam。
-- `created_event_sequence <= 0` 的防御性校验当前无直接负例测试；该项不阻塞 Slice 2，若后续 idempotency API 扩展或覆盖率下降，再就近补充测试。
+- Phase 2 Slice 3 已覆盖合法非空 `payload_ref` 的 EventLog append 路径；该项已关闭。
+- 第三个 durable validation consumer 已触发共享 private validation helper 抽取；该项已关闭，后续如再出现重复校验逻辑，归属对应新增 consumer 所在 phase 就近处理。
+- `created_event_sequence <= 0` 的防御性校验当前无直接负例测试；该项不阻塞 Phase 2，owner 为首个扩展 idempotency public consumer 的 phase，当前预计是 Phase 4 Host Public API Command Path。若 Phase 4 未扩展该路径，则继续转交给后续首次扩展 idempotency API 的 phase。
 
 #### Phase 2 Aggregate Deepreview 追踪
 
@@ -1352,11 +1352,11 @@ Phase 按依赖关系推进：先实现被其它阶段依赖的公共契约、ru
 
 追踪项：
 
-- 后续 recovery / lifecycle phases 不得把 Phase 2 `host_instances` liveness row 解释为 lease、fencing、owner、takeover 或 positive orphan proof。
-- `heartbeat_current_instance` / repeated `register_current_instance` 当前可把同一当前 instance row 从 `stopping` 刷回 `running`；该行为在 Phase 2 无恢复消费者，后续若引入严格 lifecycle 解释必须重新评估。
-- `SQLitePayloadWriteRequest.payload_json=None` 在 `canonical_json` 格式下表示合法 JSON `null`；后续 command/path 若需要禁止隐式 null，应在更上层构造边界显式收紧。
-- Artifact orphan cleanup 仍归属后续 cleanup / diagnostics work unit；Phase 2 只保证 rollback 后 orphan 文件不是 accepted fact。
-- Artifact directory fsync failure 当前仍作为结构化 durable write error 暴露，不为平台兼容而吞掉；这是 aggregate adjudication 明确拒绝的修复方向。
+- Phase 11 Host Lifecycle / Recovery / Multi-process Hardening 不得把 Phase 2 `host_instances` liveness row 解释为 lease、fencing、owner、takeover 或 positive orphan proof；Phase 11 只能在 dispatch record、pid / process_start_token / boot id 与 heartbeat 等 durable facts 共同满足 positive orphan proof 后推进 recovery。
+- `heartbeat_current_instance` / repeated `register_current_instance` 当前可把同一当前 instance row 从 `stopping` 刷回 `running`；owner 为 Phase 11 Host Lifecycle / Recovery / Multi-process Hardening。Phase 11 若引入严格 lifecycle 解释，必须先决定是否收紧该 transition，并补充状态回退测试。
+- `SQLitePayloadWriteRequest.payload_json=None` 在 `canonical_json` 格式下表示合法 JSON `null`；owner 为 Phase 4 Host Public API Command Path 与 Phase 6 ToolRuntime / Truncation / fetch_more / Duplicate Governance。若 public command path 或 tool accept path 不允许隐式 null，必须在对应构造边界显式收紧，而不是修改 Phase 2 durable primitive。
+- Artifact orphan cleanup owner 为 Phase 15 Retention / Purge / Production Hardening。Phase 2 只保证 rollback 后 orphan 文件不是 accepted fact；Phase 15 必须决定 orphan cleanup 是 manual diagnostic、startup diagnostic 还是 background cleanup，并补测试 / 文档。
+- Artifact directory fsync failure 当前仍作为结构化 durable write error 暴露，不为平台兼容而吞掉；这是 aggregate adjudication 明确拒绝的修复方向，不安排为后续实现项。若 Phase 15 production hardening 后续要改变平台兼容策略，必须重新做 design discussion。
 
 #### UI / Service Outbox 去重边界追踪
 
