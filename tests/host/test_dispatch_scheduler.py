@@ -1,0 +1,692 @@
+"""Host Phase 5 dispatch scheduler 测试。"""
+
+from __future__ import annotations
+
+import asyncio
+import json
+from collections.abc import AsyncIterator
+from dataclasses import dataclass
+from datetime import UTC, datetime
+from pathlib import Path
+
+import pytest
+
+from dayu.engine.contracts.agent_policy import AgentPolicy
+from dayu.engine.contracts.agent_run import AgentRunRequest
+from dayu.engine.contracts.engine_events import EngineEvent
+from dayu.engine.contracts.runner_spec import RunnerCallOptions, RunnerSpec
+from dayu.host.admission import PendingDispatchRecord
+from dayu.host.api import (
+    AttemptDispatchSnapshot,
+    AttemptStatus,
+    CancelMode,
+    EnsureSessionRequest,
+    HostLocalExecutionOptions,
+    LocalEngineWorker,
+    LocalWorkerHandle,
+    RunStatus,
+)
+from dayu.host.dispatch import HostDispatchScheduler
+from dayu.host.durable.codec import sha256_digest_json
+from dayu.host.durable.connection import HostDurableStore, open_host_durable_store
+from dayu.host.durable.event_log import (
+    EventClass,
+    EventLogAppendRequest,
+    EventLogRow,
+    EventLogStore,
+)
+from dayu.host.durable.options import (
+    HostDurableStoreOptions,
+    HostSQLiteStoragePolicy,
+    PayloadStoragePolicy,
+)
+from dayu.host.durable.run_transition import (
+    CancelPredispatchStartingInput,
+    CreateRunningRunInput,
+    cancel_predispatch_starting_in_transaction,
+    create_running_run_with_starting_attempt_in_transaction,
+)
+from dayu.host.durable.session_lifecycle import ensure_session
+from dayu.host.durable.state import (
+    AttemptRow,
+    DispatchRecordRow,
+    DispatchRecordStatus,
+    RunRow,
+    RunStartReason,
+    WorkerKind,
+    mark_dispatch_waiting_for_lane_row,
+    mark_dispatching_after_lane_row,
+    read_attempt_by_id,
+    read_dispatch_record_by_attempt_id,
+    read_run_by_id,
+)
+from dayu.host.durable.transaction import HostTransaction, HostTransactionRunner
+from dayu.runtime.lane import (
+    LaneAcquired,
+    LaneConfig,
+    LaneController,
+    SQLiteLaneCoordinatorConfig,
+)
+
+_NOW = datetime(2026, 5, 15, 1, 2, 3, tzinfo=UTC)
+_CALL_CONTEXT_DIGEST = sha256_digest_json({"context": "dispatch-test"})
+_LANE_NAME = "llm"
+
+
+@dataclass(frozen=True, slots=True)
+class _SeededRun:
+    """测试中创建的 running Run。"""
+
+    session_id: str
+    run_id: str
+    attempt_id: str
+    execution_id: str
+    dispatch_record_id: str
+
+
+class _FakeHandle:
+    """测试用 worker handle。"""
+
+    def __init__(self, local_worker_id: str = "local-worker-test") -> None:
+        """初始化 fake handle。
+
+        :param local_worker_id: 本地 worker id。
+        :returns: ``None``。
+        """
+
+        self._local_worker_id = local_worker_id
+        self.closed = False
+
+    @property
+    def local_worker_id(self) -> str:
+        """返回本地 worker id。
+
+        :returns: 本地 worker id。
+        """
+
+        return self._local_worker_id
+
+    async def events(self) -> AsyncIterator[EngineEvent]:
+        """返回空事件流。
+
+        :returns: 空异步迭代器。
+        """
+
+        if False:
+            yield _unreachable_engine_event()
+
+    def cancel(self, reason: str) -> None:
+        """记录取消请求。
+
+        :param reason: 取消原因。
+        :returns: ``None``。
+        """
+
+        del reason
+
+    async def close(self) -> None:
+        """关闭 fake handle。
+
+        :returns: ``None``。
+        """
+
+        self.closed = True
+
+
+class _AcceptingWorker:
+    """测试用立即 accept worker。"""
+
+    def __init__(self, factory: "_FakeWorkerFactory") -> None:
+        """初始化 worker。
+
+        :param factory: 所属 factory。
+        :returns: ``None``。
+        """
+
+        self._factory = factory
+
+    async def accept(
+        self, snapshot: AttemptDispatchSnapshot, request: AgentRunRequest
+    ) -> LocalWorkerHandle:
+        """接受 worker 请求。
+
+        :param snapshot: dispatch snapshot。
+        :param request: Engine request。
+        :returns: fake handle。
+        """
+
+        self._factory.accepted_snapshots.append(snapshot)
+        self._factory.accepted_requests.append(request)
+        return _FakeHandle()
+
+
+class _SlowWorker:
+    """测试用超时 worker。"""
+
+    async def accept(
+        self, snapshot: AttemptDispatchSnapshot, request: AgentRunRequest
+    ) -> LocalWorkerHandle:
+        """阻塞直到 scheduler startup timeout。
+
+        :param snapshot: dispatch snapshot。
+        :param request: Engine request。
+        :returns: 不会返回的 fake handle。
+        """
+
+        del snapshot, request
+        await asyncio.sleep(1.0)
+        return _FakeHandle()
+
+
+class _FakeWorkerFactory:
+    """测试用 worker factory。"""
+
+    def __init__(self, *, slow: bool = False) -> None:
+        """初始化 factory。
+
+        :param slow: 是否返回超时 worker。
+        :returns: ``None``。
+        """
+
+        self.created = 0
+        self.accepted_snapshots: list[AttemptDispatchSnapshot] = []
+        self.accepted_requests: list[AgentRunRequest] = []
+        self._slow = slow
+
+    def create_worker(self, snapshot: AttemptDispatchSnapshot) -> LocalEngineWorker:
+        """创建 fake worker。
+
+        :param snapshot: dispatch snapshot。
+        :returns: fake worker。
+        """
+
+        del snapshot
+        self.created += 1
+        if self._slow:
+            return _SlowWorker()
+        return _AcceptingWorker(self)
+
+
+@pytest.mark.asyncio
+async def test_pending_waiting_dispatching_worker_accept_marks_running(
+    tmp_path: Path,
+) -> None:
+    """pending dispatch 可推进到 worker accepted，Attempt 进入 RUNNING。"""
+
+    factory = _FakeWorkerFactory()
+    with open_host_durable_store(_options(tmp_path)) as store:
+        seeded = _seed_current_run(store)
+        scheduler = await _open_scheduler(tmp_path, store, factory)
+        try:
+            scheduler.wake_dispatch(_pending_dispatch(seeded))
+            result = await scheduler.drain_once()
+
+            run, attempt, dispatch_record = _read_rows(
+                store.transaction_runner, seeded
+            )
+            event = _read_event_by_type(
+                store.transaction_runner, "ATTEMPT_RUNNING"
+            )
+            assert result.processed == 1
+            assert result.dispatched == 1
+            assert run.status == RunStatus.RUNNING
+            assert attempt.status == AttemptStatus.RUNNING
+            assert dispatch_record.status == DispatchRecordStatus.DISPATCHING
+            assert dispatch_record.worker_accept_event_id == event.event_id
+            payload = json.loads(event.payload_json)
+            assert payload["local_worker_id"] == "local-worker-test"
+            assert payload["worker_accepted_at"] == dispatch_record.worker_accepted_at
+            assert payload["lane_name"] == _LANE_NAME
+            assert payload["lane_claim_id"] == dispatch_record.lane_claim_id
+            assert (
+                factory.accepted_snapshots[0].dispatch_record_id
+                == seeded.dispatch_record_id
+            )
+            assert factory.accepted_requests[0].disable_tools is True
+        finally:
+            await scheduler.close()
+
+
+@pytest.mark.asyncio
+async def test_cancelled_dispatch_is_skipped_before_worker_call(
+    tmp_path: Path,
+) -> None:
+    """worker accept 前被 direct cancel 的 dispatch 不会调用 worker。"""
+
+    factory = _FakeWorkerFactory()
+    with open_host_durable_store(_options(tmp_path)) as store:
+        seeded = _seed_current_run(store)
+        scheduler = await _open_scheduler(tmp_path, store, factory)
+        try:
+            _mark_dispatching_and_cancel(store.transaction_runner, seeded)
+            scheduler.wake_dispatch(_pending_dispatch(seeded))
+            result = await scheduler.drain_once()
+            assert result.processed == 1
+            assert result.skipped == 1
+            assert factory.created == 0
+        finally:
+            await scheduler.close()
+
+
+@pytest.mark.asyncio
+async def test_worker_startup_timeout_closes_starting_attempt_failed(
+    tmp_path: Path,
+) -> None:
+    """worker accept timeout 会把 STARTING Attempt 和 Run 关闭为 FAILED。"""
+
+    factory = _FakeWorkerFactory(slow=True)
+    with open_host_durable_store(_options(tmp_path)) as store:
+        seeded = _seed_current_run(store)
+        scheduler = await _open_scheduler(
+            tmp_path,
+            store,
+            factory,
+            worker_startup_timeout_seconds=0.001,
+        )
+        try:
+            scheduler.wake_dispatch(_pending_dispatch(seeded))
+            result = await scheduler.drain_once()
+
+            run, attempt, _dispatch_record = _read_rows(
+                store.transaction_runner, seeded
+            )
+            event = _read_event_by_type(store.transaction_runner, "RUN_FAILED")
+            assert result.timed_out == 1
+            assert run.status == RunStatus.FAILED
+            assert attempt.status == AttemptStatus.FAILED
+            assert json.loads(_require_text(event.reason_json))["reason"] == (
+                "worker_startup_timeout"
+            )
+        finally:
+            await scheduler.close()
+
+
+@pytest.mark.asyncio
+async def test_lane_acquire_timeout_closes_starting_attempt_failed(
+    tmp_path: Path,
+) -> None:
+    """lane acquire timeout 会把 worker accept 前 Attempt 与 Run 关闭为 FAILED。"""
+
+    factory = _FakeWorkerFactory()
+    lane_db_path = tmp_path / "lane.sqlite3"
+    lane_holder = await LaneController.open(
+        [
+            LaneConfig(
+                name=_LANE_NAME,
+                capacity=1,
+                default_timeout_seconds=0.001,
+                claim_ttl_seconds=1.0,
+                heartbeat_interval_seconds=0.1,
+            )
+        ],
+        coordinator=SQLiteLaneCoordinatorConfig(db_path=lane_db_path),
+    )
+    claim = await lane_holder.acquire(_LANE_NAME, timeout_seconds=0)
+    assert isinstance(claim, LaneAcquired)
+    with open_host_durable_store(_options(tmp_path)) as store:
+        seeded = _seed_current_run(store)
+        scheduler = await _open_scheduler(
+            tmp_path,
+            store,
+            factory,
+            lane_db_path=lane_db_path,
+            lane_default_timeout_seconds=0.001,
+        )
+        try:
+            scheduler.wake_dispatch(_pending_dispatch(seeded))
+            result = await scheduler.drain_once()
+
+            run, attempt, _dispatch_record = _read_rows(
+                store.transaction_runner, seeded
+            )
+            event = _read_event_by_type(store.transaction_runner, "RUN_FAILED")
+            assert result.timed_out == 1
+            assert result.dispatched == 0
+            assert factory.created == 0
+            assert run.status == RunStatus.FAILED
+            assert attempt.status == AttemptStatus.FAILED
+            assert json.loads(_require_text(event.reason_json))["reason"] == (
+                "worker_startup_timeout"
+            )
+        finally:
+            await scheduler.close()
+            await claim.token.release()
+            await lane_holder.close()
+
+
+def _options(tmp_path: Path) -> HostDurableStoreOptions:
+    """构造 Host durable store options。
+
+    :param tmp_path: pytest 临时目录。
+    :returns: durable store options。
+    """
+
+    return HostDurableStoreOptions(
+        db_path=tmp_path / "host.sqlite3",
+        payload_policy=PayloadStoragePolicy(artifact_root=tmp_path / "artifacts"),
+        sqlite_policy=HostSQLiteStoragePolicy(
+            busy_timeout_seconds=0.25,
+            write_busy_retry_count=3,
+            write_retry_initial_delay_seconds=0.001,
+            write_retry_backoff_multiplier=1.2,
+            write_retry_max_delay_seconds=0.01,
+        ),
+    )
+
+
+async def _open_scheduler(
+    tmp_path: Path,
+    store: HostDurableStore,
+    factory: _FakeWorkerFactory,
+    *,
+    worker_startup_timeout_seconds: float = 1.0,
+    lane_db_path: Path | None = None,
+    lane_default_timeout_seconds: float = 0.01,
+) -> HostDispatchScheduler:
+    """打开测试 scheduler。
+
+    :param tmp_path: pytest 临时目录。
+    :param store: durable store。
+    :param factory: fake worker factory。
+    :param worker_startup_timeout_seconds: worker startup timeout。
+    :param lane_db_path: runtime lane DB 路径。
+    :param lane_default_timeout_seconds: lane acquire 默认 timeout。
+    :returns: scheduler。
+    """
+
+    return await HostDispatchScheduler.open(
+        transaction_runner=store.transaction_runner,
+        local_execution=HostLocalExecutionOptions(
+            lane_db_path=lane_db_path if lane_db_path is not None else tmp_path / "lane.sqlite3",
+            lane_name=_LANE_NAME,
+            lane_capacity=1,
+            lane_default_timeout_seconds=lane_default_timeout_seconds,
+            lane_claim_ttl_seconds=1.0,
+            lane_heartbeat_interval_seconds=0.1,
+            worker_startup_timeout_seconds=worker_startup_timeout_seconds,
+            dispatch_poll_interval_seconds=0.01,
+            runner_spec=_runner_spec(),
+            runner_options=RunnerCallOptions(
+                temperature=None, max_tokens=None, top_p=None, stream=False
+            ),
+            agent_policy=AgentPolicy(
+                max_iterations=1,
+                continuation_max_attempts=0,
+                allow_tool_calls=False,
+                tool_execution_timeout_seconds=1.0,
+            ),
+            worker_factory=factory,
+        ),
+        host_handle_id="host-test",
+    )
+
+
+def _runner_spec() -> RunnerSpec:
+    """构造测试 RunnerSpec。
+
+    :returns: RunnerSpec。
+    """
+
+    return RunnerSpec(
+        provider="test",
+        model="test-model",
+        endpoint="https://example.invalid",
+        api_key_ref="secret:test",
+        headers={},
+        supports_tool_calling=False,
+        supports_streaming=False,
+        supports_stream_usage=False,
+        default_timeout_seconds=1.0,
+        max_retries=0,
+        provider_request=None,
+    )
+
+
+def _seed_current_run(store: HostDurableStore) -> _SeededRun:
+    """创建 running Run、STARTING Attempt 和 pending dispatch。
+
+    :param store: durable store。
+    :returns: seeded run 摘要。
+    """
+
+    session_id = _ensure_session_id(store.transaction_runner)
+    seeded = _SeededRun(
+        session_id=session_id,
+        run_id="run-dispatch",
+        attempt_id="attempt-dispatch",
+        execution_id="execution-dispatch",
+        dispatch_record_id="dispatch-dispatch",
+    )
+    _append_user_input(
+        store.transaction_runner,
+        session_id=session_id,
+        run_id=seeded.run_id,
+        event_id="event-input-dispatch",
+    )
+
+    def _operation(transaction: HostTransaction) -> None:
+        create_running_run_with_starting_attempt_in_transaction(
+            transaction,
+            EventLogStore(),
+            CreateRunningRunInput(
+                session_id=session_id,
+                run_id=seeded.run_id,
+                client_request_id="client-dispatch",
+                input_event_id="event-input-dispatch",
+                input_event_sequence=2,
+                run_accepted_event_id="event-run-accepted-dispatch",
+                run_started_event_id="event-run-started-dispatch",
+                attempt_started_event_id="event-attempt-started-dispatch",
+                attempt_id=seeded.attempt_id,
+                execution_id=seeded.execution_id,
+                dispatch_record_id=seeded.dispatch_record_id,
+                occurred_at=_NOW,
+                actor="tester",
+                source="pytest",
+                idempotency_key="idem-dispatch",
+                execution_target="target-dispatch",
+                queue_policy="queue",
+                start_reason=RunStartReason.INITIAL,
+                worker_kind=WorkerKind.LOCAL,
+                owner_host_instance_id=None,
+                call_context_digest=_CALL_CONTEXT_DIGEST,
+            ),
+        )
+
+    store.transaction_runner.run_write(_operation)
+    return seeded
+
+
+def _ensure_session_id(transaction_runner: HostTransactionRunner) -> str:
+    """确保测试 Session 存在。
+
+    :param transaction_runner: transaction runner。
+    :returns: session id。
+    """
+
+    return ensure_session(
+        transaction_runner,
+        EnsureSessionRequest(scope="workspace", slot_key="slot", metadata=()),
+    ).snapshot.session_id
+
+
+def _append_user_input(
+    transaction_runner: HostTransactionRunner,
+    *,
+    session_id: str,
+    run_id: str,
+    event_id: str,
+) -> None:
+    """追加 USER_INPUT_ACCEPTED。
+
+    :param transaction_runner: transaction runner。
+    :param session_id: Session id。
+    :param run_id: Run id。
+    :param event_id: event id。
+    :returns: ``None``。
+    """
+
+    def _operation(transaction: HostTransaction) -> None:
+        EventLogStore().append_event(
+            transaction,
+            EventLogAppendRequest(
+                event_id=event_id,
+                event_class=EventClass.CANONICAL_FACT,
+                session_id=session_id,
+                run_id=run_id,
+                attempt_id=None,
+                execution_id=None,
+                event_type="USER_INPUT_ACCEPTED",
+                occurred_at=_NOW,
+                actor="tester",
+                source="pytest",
+                client_request_id="client-dispatch",
+                idempotency_key="idem-input",
+                policy_decision=None,
+                reason=None,
+                payload_json={
+                    "display_text": "dispatch prompt",
+                    "operation_kind": "unit_test",
+                    "execution_target": "target-dispatch",
+                },
+                payload_ref=None,
+                payload_digest=None,
+            ),
+        )
+
+    transaction_runner.run_write(_operation)
+
+
+def _pending_dispatch(seeded: _SeededRun) -> PendingDispatchRecord:
+    """构造 pending dispatch wakeup 摘要。
+
+    :param seeded: seeded run。
+    :returns: pending dispatch record。
+    """
+
+    return PendingDispatchRecord(
+        dispatch_record_id=seeded.dispatch_record_id,
+        run_id=seeded.run_id,
+        attempt_id=seeded.attempt_id,
+        execution_id=seeded.execution_id,
+        execution_target="target-dispatch",
+        worker_kind=WorkerKind.LOCAL,
+    )
+
+
+def _read_rows(
+    transaction_runner: HostTransactionRunner, seeded: _SeededRun
+) -> tuple[RunRow, AttemptRow, DispatchRecordRow]:
+    """读取 Run、Attempt 与 dispatch row。
+
+    :param transaction_runner: transaction runner。
+    :param seeded: seeded run。
+    :returns: 三个 durable row。
+    """
+
+    def _operation(
+        transaction: HostTransaction,
+    ) -> tuple[RunRow, AttemptRow, DispatchRecordRow]:
+        run = read_run_by_id(transaction, seeded.run_id)
+        attempt = read_attempt_by_id(transaction, seeded.attempt_id)
+        dispatch_record = read_dispatch_record_by_attempt_id(
+            transaction, seeded.attempt_id
+        )
+        assert run is not None
+        assert attempt is not None
+        assert dispatch_record is not None
+        return run, attempt, dispatch_record
+
+    return transaction_runner.run_read(_operation)
+
+
+def _read_event_by_type(
+    transaction_runner: HostTransactionRunner, event_type: str
+) -> EventLogRow:
+    """按事件类型读取单条事件。
+
+    :param transaction_runner: transaction runner。
+    :param event_type: 事件类型。
+    :returns: event row。
+    """
+
+    def _operation(transaction: HostTransaction) -> EventLogRow:
+        rows = EventLogStore().read_events_after(transaction, 0, limit=100)
+        for row in rows:
+            if row.event_type == event_type:
+                return row
+        raise AssertionError(f"missing event type {event_type}")
+
+    return transaction_runner.run_read(_operation)
+
+
+def _mark_dispatching_and_cancel(
+    transaction_runner: HostTransactionRunner, seeded: _SeededRun
+) -> None:
+    """把 dispatch 推进到 pre-accept dispatching 后 direct cancel。
+
+    :param transaction_runner: transaction runner。
+    :param seeded: seeded run。
+    :returns: ``None``。
+    """
+
+    def _operation(transaction: HostTransaction) -> None:
+        mark_dispatch_waiting_for_lane_row(
+            transaction,
+            attempt_id=seeded.attempt_id,
+            owner_host_instance_id="host-test",
+            lane_name=_LANE_NAME,
+            waiting_for_lane_at="2026-05-15T01:02:03.000000Z",
+        )
+        mark_dispatching_after_lane_row(
+            transaction,
+            attempt_id=seeded.attempt_id,
+            owner_host_instance_id="host-test",
+            lane_name=_LANE_NAME,
+            lane_claim_id="claim-before-cancel",
+            lane_owner_id="owner-before-cancel",
+            lane_acquired_at="2026-05-15T01:02:03.000000Z",
+            dispatching_at="2026-05-15T01:02:03.000000Z",
+        )
+        cancel_predispatch_starting_in_transaction(
+            transaction,
+            EventLogStore(),
+            CancelPredispatchStartingInput(
+                run_id=seeded.run_id,
+                cancel_request_event_id="event-cancel-requested",
+                attempt_cancelled_event_id="event-attempt-cancelled",
+                run_cancelled_event_id="event-run-cancelled",
+                occurred_at=_NOW,
+                actor="tester",
+                source="pytest",
+                client_request_id="client-cancel",
+                idempotency_key="idem-cancel",
+                reason="user_stop",
+                mode=CancelMode.GRACEFUL,
+                call_context_digest=_CALL_CONTEXT_DIGEST,
+            ),
+        )
+
+    transaction_runner.run_write(_operation)
+
+
+def _unreachable_engine_event() -> EngineEvent:
+    """构造不可达 EngineEvent 占位。
+
+    :returns: 当前函数不会被执行。
+    :raises AssertionError: 若测试错误执行到该分支则抛出。
+    """
+
+    raise AssertionError("unreachable")
+
+
+def _require_text(value: str | None) -> str:
+    """断言可选文本非空。
+
+    :param value: 可选文本。
+    :returns: 非空文本。
+    :raises AssertionError: 文本缺失时抛出。
+    """
+
+    assert value is not None
+    return value

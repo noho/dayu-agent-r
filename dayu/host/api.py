@@ -8,12 +8,17 @@ dispatch、policy provider 或 Engine 调用路径。
 from __future__ import annotations
 
 import pathlib
+from collections.abc import AsyncIterator
 from dataclasses import dataclass
 from enum import StrEnum
 from typing import Protocol, TypeAlias
 
 from dayu.contracts.cancellation import CancellationToken
 from dayu.contracts.json_value import JsonValue
+from dayu.engine.contracts.agent_policy import AgentPolicy
+from dayu.engine.contracts.agent_run import AgentRunRequest
+from dayu.engine.contracts.engine_events import EngineEvent
+from dayu.engine.contracts.runner_spec import RunnerCallOptions, RunnerSpec
 
 
 HOST_EVENT_STREAM_DEFAULT_LIMIT = 100
@@ -298,6 +303,169 @@ class AttemptDispatchSnapshot:
         _require_non_empty(self.execution_target, field_name="execution_target")
         _require_non_empty(
             self.policy_snapshot_ref, field_name="policy_snapshot_ref"
+        )
+
+
+class LocalWorkerHandle(Protocol):
+    """本地 Engine worker accept 后的运行期 handle 协议。"""
+
+    @property
+    def local_worker_id(self) -> str:
+        """返回本地 worker 诊断 id。
+
+        :returns: 本地 worker id。
+        :raises RuntimeError: 具体实现不可用时可抛出运行时错误。
+        """
+
+        ...
+
+    def events(self) -> AsyncIterator[EngineEvent]:
+        """返回本次 Engine run 的事件流。
+
+        :returns: EngineEvent 异步迭代器。
+        :raises RuntimeError: 具体 worker 事件流不可用时可抛出运行时错误。
+        """
+
+        ...
+
+    async def close(self) -> None:
+        """关闭 worker handle。
+
+        :returns: ``None``。
+        :raises RuntimeError: 具体实现关闭失败时可抛出运行时错误。
+        """
+
+        ...
+
+    def cancel(self, reason: str) -> None:
+        """向 worker 发起 best-effort 取消。
+
+        :param reason: 取消原因。
+        :returns: ``None``。
+        :raises RuntimeError: 具体实现取消失败时可抛出运行时错误。
+        """
+
+        ...
+
+
+class LocalEngineWorker(Protocol):
+    """本地 Engine worker accept 协议。"""
+
+    async def accept(
+        self,
+        snapshot: AttemptDispatchSnapshot,
+        request: AgentRunRequest,
+    ) -> LocalWorkerHandle:
+        """接受一次本地 Engine run。
+
+        :param snapshot: durable dispatch 快照。
+        :param request: RunInputBuilder 构造的 Engine 请求。
+        :returns: worker handle。
+        :raises RuntimeError: worker 无法接受本次运行时可抛出运行时错误。
+        """
+
+        ...
+
+
+class LocalEngineWorkerFactory(Protocol):
+    """本地 Engine worker factory 协议。"""
+
+    def create_worker(self, snapshot: AttemptDispatchSnapshot) -> LocalEngineWorker:
+        """创建处理指定 dispatch snapshot 的 worker。
+
+        :param snapshot: durable dispatch 快照。
+        :returns: 本地 Engine worker。
+        :raises RuntimeError: worker 无法创建时可抛出运行时错误。
+        """
+
+        ...
+
+
+@dataclass(frozen=True, slots=True)
+class HostLocalExecutionOptions:
+    """Host 本地执行调度配置。
+
+    :param lane_db_path: runtime lane SQLite 数据库路径。
+    :param lane_name: 本地执行 lane 名称。
+    :param lane_capacity: 本地执行 lane 容量。
+    :param lane_default_timeout_seconds: lane acquire 默认 timeout；``None`` 表示无限等待。
+    :param lane_claim_ttl_seconds: lane claim TTL 秒数。
+    :param lane_heartbeat_interval_seconds: lane heartbeat 秒数。
+    :param worker_startup_timeout_seconds: worker accept timeout 秒数。
+    :param dispatch_poll_interval_seconds: dispatch 后台循环空闲轮询秒数。
+    :param runner_spec: Engine Runner 规约。
+    :param runner_options: Engine Runner 调用参数。
+    :param agent_policy: Engine Agent policy。
+    :param worker_factory: 本地 worker factory。
+    """
+
+    lane_db_path: pathlib.Path
+    lane_name: str
+    lane_capacity: int
+    lane_default_timeout_seconds: float | None
+    lane_claim_ttl_seconds: float
+    lane_heartbeat_interval_seconds: float
+    worker_startup_timeout_seconds: float
+    dispatch_poll_interval_seconds: float
+    runner_spec: RunnerSpec
+    runner_options: RunnerCallOptions
+    agent_policy: AgentPolicy
+    worker_factory: LocalEngineWorkerFactory
+
+    def __post_init__(self) -> None:
+        """校验本地执行配置。
+
+        :returns: ``None``。
+        :raises TypeError: 路径或整数配置类型非法时抛出。
+        :raises ValueError: 文本为空、容量非法或 timeout 非法时抛出。
+        """
+
+        _require_path(
+            self.lane_db_path,
+            field_name="HostLocalExecutionOptions.lane_db_path",
+        )
+        _require_non_empty(
+            self.lane_name, field_name="HostLocalExecutionOptions.lane_name"
+        )
+        _require_positive_int(
+            self.lane_capacity,
+            field_name="HostLocalExecutionOptions.lane_capacity",
+        )
+        if self.lane_default_timeout_seconds is not None:
+            if (
+                isinstance(self.lane_default_timeout_seconds, bool)
+                or not isinstance(self.lane_default_timeout_seconds, int | float)
+            ):
+                raise TypeError(
+                    "HostLocalExecutionOptions.lane_default_timeout_seconds "
+                    "must be float"
+                )
+            if self.lane_default_timeout_seconds < 0:
+                raise ValueError(
+                    "HostLocalExecutionOptions.lane_default_timeout_seconds "
+                    "must be non-negative"
+                )
+        _require_positive_float(
+            self.lane_claim_ttl_seconds,
+            field_name="HostLocalExecutionOptions.lane_claim_ttl_seconds",
+        )
+        _require_positive_float(
+            self.lane_heartbeat_interval_seconds,
+            field_name=(
+                "HostLocalExecutionOptions.lane_heartbeat_interval_seconds"
+            ),
+        )
+        _require_positive_float(
+            self.worker_startup_timeout_seconds,
+            field_name=(
+                "HostLocalExecutionOptions.worker_startup_timeout_seconds"
+            ),
+        )
+        _require_positive_float(
+            self.dispatch_poll_interval_seconds,
+            field_name=(
+                "HostLocalExecutionOptions.dispatch_poll_interval_seconds"
+            ),
         )
 
 
@@ -591,6 +759,7 @@ class HostCommandHandleOptions:
     - ``sqlite_write_retry_backoff_multiplier``：写重试退避倍率。
     - ``sqlite_write_retry_max_delay_seconds``：写重试最大等待秒数。
     - ``payload_inline_threshold_bytes``：payload 内联存储阈值字节数。
+    - ``local_execution``：本地执行配置；``None`` 保持 no-op dispatch wakeup。
     """
 
     host_handle_id: str | None
@@ -603,6 +772,7 @@ class HostCommandHandleOptions:
     sqlite_write_retry_backoff_multiplier: float
     sqlite_write_retry_max_delay_seconds: float
     payload_inline_threshold_bytes: int
+    local_execution: HostLocalExecutionOptions | None = None
 
     def __post_init__(self) -> None:
         """校验 Host command handle 构造选项。
@@ -1477,11 +1647,15 @@ __all__ = [
     "HostCallContext",
     "HostCommandFacet",
     "HostCommandHandleOptions",
+    "HostLocalExecutionOptions",
     "HostEventStream",
     "HostEventView",
     "HostInput",
     "HostMetadataEntry",
     "HostStreamCursor",
+    "LocalEngineWorker",
+    "LocalEngineWorkerFactory",
+    "LocalWorkerHandle",
     "OperationContext",
     "OutboxSummary",
     "PurgeSessionRequest",

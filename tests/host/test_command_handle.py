@@ -34,7 +34,6 @@ from dayu.host import (
 )
 
 _FORBIDDEN_IMPORT_PREFIXES: tuple[str, ...] = (
-    "dayu.engine",
     "dayu.fins",
     "dayu.service",
     "dayu.ui",

@@ -4,7 +4,7 @@
 
 ## 当前公共命名空间
 
-`dayu.host` 当前提供 Host 公共 API 的类型契约、Session / Run public command facade 和 Host construction 的业务工具输入边界，供 UI / Service 按 `UI -> Service -> Host -> Engine` 的依赖方向向下引用。
+`dayu.host` 当前提供 Host 公共 API 的类型契约、Session / Run public command facade、Host construction 的业务工具输入边界、本地执行配置契约、dispatch scheduler 与 LocalProxy 基线能力，供 UI / Service 按 `UI -> Service -> Host -> Engine` 的依赖方向向下引用。
 
 当前包根导出包含以下类型：
 
@@ -12,7 +12,8 @@
 - status / enum：`SessionStatus`、`RunStatus`、`AttemptStatus`、`FollowupBehavior`、`CancelMode`、`WaitResolutionSource`、`SourceRunRelation`、`HostApiErrorCode`。
 - context / input：`OperationContext`、`AuthorizationClaim`、`HostCallContext`、`HostMetadataEntry`、`HostInput`、`SessionSlotRef`、`HostStreamCursor`。
 - command handle：`HostCommandHandle`、`create_host_command_handle`、`HostCommandFacet`；public handle 只暴露稳定 `host_handle_id` 与幂等 `close()`，不暴露 durable store、transaction runner、store connection 或 admission service。
-- command handle options：`HostCommandHandleOptions`，显式描述 Host command handle 的 durable DB、artifact root、SQLite timeout / retry 与 payload inline threshold 构造选项。
+- command handle options：`HostCommandHandleOptions`，显式描述 Host command handle 的 durable DB、artifact root、SQLite timeout / retry、payload inline threshold 与可选本地执行构造选项。
+- local execution options：`HostLocalExecutionOptions`、`LocalWorkerHandle`、`LocalEngineWorker`、`LocalEngineWorkerFactory`，描述 Host 本地 dispatch scheduler 接入 runtime lane、Runner 配置、Agent policy 与 LocalProxy worker factory 的 typed 边界。
 - Session facade：`ensure_session`、`create_session`、`get_session`、`close_session`，均返回 `SessionSnapshot`。
 - Run facade：`start_run`、`submit_followup`、`get_run`、`stream_run_events`、`cancel_run`、`cancel_session_runs`；当前 command 路径只覆盖 Phase 1-3 admission 可闭环路径，读取路径只使用 durable Run / EventLog truth。
 - deferred facade：`retry_run`、`replay_run`、`resolve_wait`、`purge_session` 当前是 stable unsupported public functions，固定返回 `UNSUPPORTED_OPERATION`，不追加 EventLog，也不写 idempotency record。
@@ -21,7 +22,7 @@
 - error：`HostApiError`、`HostApiErrorDetail`、`SteerConflictDetail`。
 - tooling construction options：`ToolBundleSourceKind`、`FrameworkToolName`、`ToolBundleSourceRef`、`FrameworkToolPolicyView`、`HostToolingOptions`、`default_framework_tool_policy_view`。
 
-`dayu.host.api.__all__` 仍只包含 request、snapshot、status、error、context 与 stream cursor 类型。Session / Run read facade 位于 `dayu.host.read_api`，Session / Run command facade 与 deferred facade 位于 `dayu.host.command`，并由包根导出，但不进入 `dayu.host.api`。Host construction tooling 类型位于 `dayu.host.tooling`，由包根导出，但不进入 `dayu.host.api`。
+`dayu.host.api.__all__` 包含 request、snapshot、status、error、context、stream cursor 与本地执行配置契约类型。Session / Run read facade 位于 `dayu.host.read_api`，Session / Run command facade 与 deferred facade 位于 `dayu.host.command`，并由包根导出，但不进入 `dayu.host.api`。Host construction tooling 类型位于 `dayu.host.tooling`，由包根导出，但不进入 `dayu.host.api`。
 
 ## Public Session Command Path
 
@@ -91,8 +92,9 @@ Phase 4 public `submit_followup(queue)` 暂使用 Host facade 内部默认 execu
 - Phase 3 / 5 state schema / row codec：创建 Session、slot、Run、Attempt 与 attempt dispatch record durable tables；dispatch record 当前覆盖 `pending`、`waiting_for_lane`、`dispatching`、`cancelled` 四种状态，typed row codec 与低层 helper 负责状态枚举、SQLite row 转换、Session snapshot 读取和事务内 CAS mutation。
 - Phase 3 / 5 internal lifecycle / transition primitives：在调用方提供的 `HostTransaction` 内实现 Session / slot lifecycle，以及 Run / Attempt / dispatch record 的低层 transition helper；当前 durable primitive 覆盖 pre-dispatch cancel、`pending -> waiting_for_lane -> dispatching` 诊断推进、worker accepted refs、Attempt `STARTING -> RUNNING` 和 active Run `RUNNING -> CANCELLING`。EventLog fact 与 state row mutation 必须处于同一 SQLite write transaction。
 - Phase 5 RunInputBuilder no-tool boundary：通过 typed providers 从 durable Run / Attempt / dispatch record 与 canonical EventLog facts 构造 deterministic `AgentRunRequest`；当前用户 prompt 只来自 durable `USER_INPUT_ACCEPTED`，continuity 只读 canonical facts 并按 `event_sequence` 排序。Phase 5 no-op memory / compact / tool schema providers 不创建 durable rows，输出 request 固定 `disable_tools=True`、`tool_schemas=()`、`AgentPolicy.allow_tool_calls=False`。
+- Phase 5 dispatch scheduler / LocalProxy baseline：`HostDispatchScheduler` 接收 pending dispatch wakeup，将 dispatch record 从 `pending` 推进到 `waiting_for_lane`，通过独立 runtime lane DB acquire capacity，再经 durable recheck 推进到 `dispatching`；worker accept 后追加 `ATTEMPT_RUNNING`、推进 Attempt `STARTING -> RUNNING`，并记录 worker accept refs。Default LocalProxy worker 调用 Engine public `run_agent_messages(request)` 并暴露 EngineEvent stream，但当前不 ingest EngineEvent。
 
-durable foundation 当前不实现 policy provider set、queue scanning / after-commit wakeup、dispatch scheduler、真实 lane acquire、WorkerProxy / LocalProxy / RemoteProxy、Engine dispatch、EngineEvent ingest、active cancel propagation、recovery classifier、lease / fencing / takeover、artifact cleanup scheduler、projection、audit、outbox 或 ToolRuntime。
+durable foundation 当前不实现 policy provider set、queue scanning / after-commit wakeup、RemoteProxy、EngineEvent ingest、active cancel propagation、recovery classifier、lease / fencing / takeover、artifact cleanup scheduler、projection、audit、outbox 或 ToolRuntime。
 
 ## Internal Admission
 
@@ -134,7 +136,7 @@ internal admission 当前的 session-scope cancel 只服务 Phase 4 public facad
 
 ## 架构边界
 
-`dayu.host` 不导入 `dayu.engine`、`dayu.fins`、`dayu.service` 或 `dayu.ui`。Host 公共类型不放入 `dayu.contracts`；`dayu.contracts` 只承载 Host 与 Engine / ToolRuntime 等共同理解的协作契约。
+`dayu.host` 可以在 LocalProxy 边界沿 `UI -> Service -> Host -> Engine` 方向调用 Engine public entry；Engine 不导入 Host。`dayu.host` 不导入 `dayu.fins`、`dayu.service` 或 `dayu.ui`。Host 公共类型不放入 `dayu.contracts`；`dayu.contracts` 只承载 Host 与 Engine / ToolRuntime 等共同理解的协作契约。
 
 业务工具发现、provider / 配置绑定、包入口扫描和 Service composition 发生在 Host 外部。Host 只接收外部已经形成的业务 `ToolBundle`，不扫描业务工具包，也不导入具体财报工具模块。`business_tool_bundle` 不进入 `StartRunRequest`、`SubmitFollowupRequest`、retry / replay / resolve wait 等 per-run request。
 
@@ -142,11 +144,11 @@ Host 若在后续实现中复用 `dayu.runtime.filelock`，只能把它用于普
 
 当前未实现：
 
-- policy provider set、dispatch scheduler、WorkerProxy / LocalProxy / RemoteProxy、dispatching / active worker cancel propagation、wait cancellation、recovery classifier、lease / fencing / takeover。
+- policy provider set、RemoteProxy、EngineEvent ingest、dispatching / active worker cancel propagation、wait cancellation、recovery classifier、lease / fencing / takeover。
 - artifact cleanup scheduler 与 diagnostics table。
 - ToolRuntime construction、ToolRuntime policy resolution、framework tool injection。
 - ToolsDiscovery / ScenePrepare provider contract、tool profile registry、Attempt tool snapshot durability。
-- Engine 调用路径、Fins 业务语义、Service / UI 装配逻辑。
+- command-handle 本地 scheduler lifecycle wiring、Fins 业务语义、Service / UI 装配逻辑。
 
 ## 测试
 
@@ -159,4 +161,4 @@ python -m pyright dayu/host tests/host
 
 测试覆盖包根导出白名单、枚举字符串值、请求校验失败路径、Host tooling options 校验、Host import 边界、弱类型守卫、Host command handle factory / close lifecycle、Session public facade 幂等、冲突、读取与关闭语义，以及 Run public facade 的 start / follow-up queue / steer unsupported / get_run / EventLog stream / cancel / session-scope cancel 子集 / deferred unsupported 函数。
 
-durable foundation、RunInputBuilder 与 internal admission 测试覆盖 SQLite schema bootstrap / transaction runner、EventLog append / read / idempotency、payload descriptor、local artifact helper、host instance liveness、EventLog 多进程 sequence smoke、Session lifecycle、Run / Attempt transition primitive、dispatch record 四状态 schema、waiting / dispatching / worker accept refs、active cancel durable primitive、RunInputBuilder durable prompt / canonical continuity / no-tool request、start / follow-up admission、queue policy、idempotency、FIFO promotion、queued / pre-dispatch cancel、terminal closeout、admission 多进程 durable invariant，以及 Host 包根不导出 durable 内部模块。
+durable foundation、RunInputBuilder、dispatch scheduler / LocalProxy 与 internal admission 测试覆盖 SQLite schema bootstrap / transaction runner、EventLog append / read / idempotency、payload descriptor、local artifact helper、host instance liveness、EventLog 多进程 sequence smoke、Session lifecycle、Run / Attempt transition primitive、dispatch record 四状态 schema、waiting / dispatching / worker accept refs、active cancel durable primitive、RunInputBuilder durable prompt / canonical continuity / no-tool request、scheduler pending / waiting / dispatching / worker accept、pre-accept cancel race、lane acquire timeout、worker startup timeout、LocalProxy Engine entry boundary、start / follow-up admission、queue policy、idempotency、FIFO promotion、queued / pre-dispatch cancel、terminal closeout、admission 多进程 durable invariant，以及 Host 包根不导出 durable 内部模块。

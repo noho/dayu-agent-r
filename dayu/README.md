@@ -33,7 +33,7 @@ UI -> Service -> Host -> Engine
 
 `dayu.contracts` 承载跨层共享协作契约。契约层不得依赖具体业务层或执行层实现。
 
-`dayu.host` 承载 Host 公共 API 类型契约。当前已导出 request、snapshot、status、error、context、stream cursor 类型，以及 Host construction 的 `HostToolingOptions` 工具输入边界，供 UI / Service 按依赖方向向下引用；Host durable store、EventLog、dispatch、command path、ToolRuntime 与 policy provider 不属于当前公共命名空间。
+`dayu.host` 承载 Host 公共 API 类型契约与 command facade。当前已导出 request、snapshot、status、error、context、stream cursor 类型，Host construction 的 `HostToolingOptions` 工具输入边界，以及 `HostLocalExecutionOptions` / local worker protocols 本地执行配置边界，供 UI / Service 按依赖方向向下引用；Host durable store、EventLog 内部实现、dispatch scheduler 实现、ToolRuntime 与 policy provider 不属于当前公共命名空间。
 
 财报领域能力属于独立领域边界；财报文档存取必须通过 `dayu.fins.storage` 下的仓储协议与仓储实现完成，不应泄漏到 Engine 或 Host 内部。
 
