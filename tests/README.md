@@ -36,6 +36,7 @@ pytest tests/host/test_durable_schema.py tests/host/test_durable_transaction.py 
 pytest tests/host/test_payload_store.py tests/host/test_artifact_store.py tests/host/test_host_instance_liveness.py -q
 pytest tests/host/test_session_lifecycle.py tests/host/test_run_attempt_transitions.py -q
 pytest tests/host/test_admission_queue.py tests/host/test_run_attempt_transitions.py -q
+pytest tests/host/test_command_handle.py tests/host/test_public_session_api.py tests/host/test_session_lifecycle.py -q
 pytest tests/host/test_admission_multiprocess.py tests/host -q
 pytest tests/runtime -q
 pytest tests/runtime/test_filelock.py tests/runtime/test_import_boundary.py -q
@@ -73,10 +74,11 @@ pytest tests/engine/test_smoke_async_agent_providers.py -q
 
 ### `tests/host/`
 
-Host 公共 API 类型、construction tooling options 与内部 durable foundation 测试，覆盖 `dayu.host` 的稳定边界：
+Host 公共 API 类型、Session public command facade、construction tooling options 与内部 durable foundation 测试，覆盖 `dayu.host` 的稳定边界：
 
-- package exports：锁定 `dayu.host.__all__` 与 `dayu.host.api.__all__` 白名单，确认 tooling 类型可从包根导入但不进入 `dayu.host.api`。
+- package exports：锁定 `dayu.host.__all__` 与 `dayu.host.api.__all__` 白名单，确认 command facade / tooling 类型可从包根导入但不进入 `dayu.host.api`。
 - public contracts：验证 status / error 枚举字符串值、frozen slots dataclass、结构化 `HostApiError` 与 request validation failure paths。
+- command handle / public session API：覆盖 Host command handle factory fresh DB、稳定 public handle id、内部依赖不暴露、close 幂等、关闭后 facade 稳定失败，以及 `ensure_session` / `create_session` / `get_session` / `close_session` 的 snapshot、幂等、冲突、NOT_FOUND 与保留 durable truth 语义。
 - tooling options：验证 `ToolBundleSourceKind` / `FrameworkToolName` 为 `StrEnum`、默认 reserved framework tool policy、source refs 非空、业务 `ToolBundle` 不得占用 `fetch_more` 等 reserved framework tool name，以及 default policy view 不共享可变状态。
 - durable foundation / internal admission：覆盖 SQLite fresh bootstrap、schema version / table constraint、transaction runner commit / rollback / after-commit / busy retry、EventLog append / read / duplicate / conflict、idempotency record / conflict、payload descriptor、local artifact helper、host instance liveness、多进程 EventLog `event_sequence` 唯一递增 smoke、Session lifecycle、Run / Attempt transition primitive、start / follow-up admission、queue policy、idempotency、FIFO promotion、queued / pre-dispatch cancel、terminal closeout，以及 admission 多进程 durable invariant，包括同 slot ensure、同 Session active Run 唯一性、跨进程幂等、FIFO promotion、queued cancel / promotion 竞争和 EventLog sequence 全局顺序。
 - import boundary：阻止 Host 公共类型层导入 Engine、Fins、Service 或 UI，并确认 business `ToolBundle` 不进入 per-run request dataclass 字段。

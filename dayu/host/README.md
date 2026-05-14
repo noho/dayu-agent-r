@@ -4,21 +4,36 @@
 
 ## 当前公共命名空间
 
-`dayu.host` 当前提供 Host 公共 API 的类型契约和 Host construction 的业务工具输入边界，供 UI / Service 按 `UI -> Service -> Host -> Engine` 的依赖方向向下引用。
+`dayu.host` 当前提供 Host 公共 API 的类型契约、Session public command facade 和 Host construction 的业务工具输入边界，供 UI / Service 按 `UI -> Service -> Host -> Engine` 的依赖方向向下引用。
 
 当前包根导出包含以下类型：
 
 - constants：`HOST_EVENT_STREAM_DEFAULT_LIMIT`、`HOST_EVENT_STREAM_MAX_LIMIT`。
 - status / enum：`SessionStatus`、`RunStatus`、`AttemptStatus`、`FollowupBehavior`、`CancelMode`、`WaitResolutionSource`、`SourceRunRelation`、`HostApiErrorCode`。
 - context / input：`OperationContext`、`AuthorizationClaim`、`HostCallContext`、`HostMetadataEntry`、`HostInput`、`SessionSlotRef`、`HostStreamCursor`。
-- command handle 协议：`HostCommandFacet`，只暴露 `host_handle_id`。
+- command handle：`HostCommandHandle`、`create_host_command_handle`、`HostCommandFacet`；public handle 只暴露稳定 `host_handle_id` 与幂等 `close()`，不暴露 durable store、transaction runner、store connection 或 admission service。
 - command handle options：`HostCommandHandleOptions`，显式描述 Host command handle 的 durable DB、artifact root、SQLite timeout / retry 与 payload inline threshold 构造选项。
+- Session facade：`ensure_session`、`create_session`、`get_session`、`close_session`，均返回 `SessionSnapshot`。
 - requests：`EnsureSessionRequest`、`CreateSessionRequest`、`CloseSessionRequest`、`PurgeSessionRequest`、`StartRunRequest`、`CancelRunRequest`、`CancelSessionRunsRequest`、`SubmitFollowupRequest`、`RetryRunRequest`、`ReplayRunRequest`、`ResolveWaitRequest`。
 - snapshots / stream：`TerminalResultSummary`、`OutboxSummary`、`SessionSnapshot`、`RunSnapshot`、`FollowupSnapshot`、`PurgeSessionResult`、`HostEventView`、`HostEventStream`。
 - error：`HostApiError`、`HostApiErrorDetail`、`SteerConflictDetail`。
 - tooling construction options：`ToolBundleSourceKind`、`FrameworkToolName`、`ToolBundleSourceRef`、`FrameworkToolPolicyView`、`HostToolingOptions`、`default_framework_tool_policy_view`。
 
-`dayu.host.api.__all__` 仍只包含 request、snapshot、status、error、context 与 stream cursor 类型。Host construction tooling 类型位于 `dayu.host.tooling`，由包根导出，但不进入 `dayu.host.api`。
+`dayu.host.api.__all__` 仍只包含 request、snapshot、status、error、context 与 stream cursor 类型。Session facade 位于 `dayu.host.command` / `dayu.host.read_api` 并由包根导出，但不进入 `dayu.host.api`。Host construction tooling 类型位于 `dayu.host.tooling`，由包根导出，但不进入 `dayu.host.api`。
+
+## Public Session Command Path
+
+`create_host_command_handle(options)` 会根据 `HostCommandHandleOptions` 打开 fresh/bootstrap 后的 Host durable SQLite store，并装配内部 no-op admission service 依赖。该 handle 是 public facade 的 opaque command handle；关闭 handle 后再次调用 public facade 会返回 `HostApiError(code=INVALID_STATE, retryable=False)`。
+
+当前已实现的 Session public facade：
+
+- `ensure_session(host, request)`：按 `(scope, slot_key)` 原子创建或复用当前 slot Session，返回 durable truth 生成的 `SessionSnapshot`。
+- `create_session(host, request)`：按 `client_request_id` 幂等创建显式新 Session，可选择重绑定 slot；同 key 同 semantic digest 返回同一 Session，同 key 不同 digest 返回 `IDEMPOTENCY_CONFLICT`。
+- `get_session(host, session_id)`：通过只读 transaction 读取 Session row、当前 active Run id 与 queued Run id 列表；缺失时返回 `NOT_FOUND`。
+- `close_session(host, session_id, request)`：只把 open Session 推进到 closed，保留 Session、EventLog、Run facts 与 slot binding；同一幂等 key 重放返回同一个 closed snapshot。
+
+public semantic digest 在 facade 边界只使用显式请求字段与 `HostCallContext` 的语义 digest，不包含 runtime-only object、内部依赖或 metadata bag。
+当前 `create_session` public facade 不持久化 `request.metadata`；metadata 持久化语义尚未成为 public contract。`ensure_session` 仍按 durable lifecycle 保存首次创建时的 metadata 摘要。
 
 ## Host Tooling Options
 
@@ -48,7 +63,7 @@
 - Phase 3 state schema / row codec：创建 Session、slot、Run、Attempt 与 attempt dispatch record durable tables；typed row codec 与低层 helper 负责状态枚举、SQLite row 转换、Session snapshot 读取和事务内 CAS mutation。
 - Phase 3 internal lifecycle / transition primitives：在调用方提供的 `HostTransaction` 内实现 Session / slot lifecycle，以及 Run / Attempt / pending dispatch record 的低层 transition helper；EventLog fact 与 state row mutation 必须处于同一 SQLite write transaction。
 
-durable foundation 当前不实现 public Host command facade、admission orchestration、policy provider set、queue scanning / after-commit wakeup、scheduler、lane acquire、WorkerProxy / LocalProxy / RemoteProxy、Engine dispatch、EngineEvent ingest、recovery classifier、lease / fencing / takeover、artifact cleanup scheduler、projection、audit、outbox 或 ToolRuntime。
+durable foundation 当前不实现 policy provider set、queue scanning / after-commit wakeup、scheduler、lane acquire、WorkerProxy / LocalProxy / RemoteProxy、Engine dispatch、EngineEvent ingest、recovery classifier、lease / fencing / takeover、artifact cleanup scheduler、projection、audit、outbox 或 ToolRuntime。
 
 ## Internal Admission
 
@@ -66,7 +81,7 @@ durable foundation 当前不实现 public Host command facade、admission orches
 - post-commit wakeup 边界：active slot 释放后的 durable promotion 先于 queue promotion wakeup；promotion 已提交后的 dispatch / queue wakeup `RuntimeError` 只按 best-effort 处理，不回滚或掩盖 durable promotion 结果。
 - 多进程 durable invariant：当前测试覆盖同 slot ensure 只绑定一个 Session、同 Session admission 最多一个 active Run、跨进程 follow-up 幂等重放 / 冲突、queued Run 按 accepted `event_sequence` FIFO promotion、queued cancel 与 promotion 的 first-committer-wins，以及 EventLog `event_sequence` 全局唯一递增。
 
-internal admission 当前不实现 public Host command facade、policy provider integration、真实 dispatch、dispatching / active worker cancel propagation、EngineEvent ingest、steer、retry / replay、wait cancellation、recovery cancellation 或 session-scope cancel facade。
+internal admission 当前不实现 policy provider integration、真实 dispatch、dispatching / active worker cancel propagation、EngineEvent ingest、steer、retry / replay、wait cancellation、recovery cancellation 或 session-scope cancel facade。
 
 ## 校验边界
 
@@ -97,8 +112,7 @@ Host 若在后续实现中复用 `dayu.runtime.filelock`，只能把它用于普
 
 当前未实现：
 
-- Host command function。
-- public Host command facade、policy provider set、dispatch scheduler、WorkerProxy / LocalProxy / RemoteProxy、dispatching / active worker cancel propagation、wait cancellation、recovery classifier、lease / fencing / takeover。
+- Run public command facade、EventLog stream public facade、policy provider set、dispatch scheduler、WorkerProxy / LocalProxy / RemoteProxy、dispatching / active worker cancel propagation、wait cancellation、recovery classifier、lease / fencing / takeover。
 - artifact cleanup scheduler 与 diagnostics table。
 - ToolRuntime construction、ToolRuntime policy resolution、framework tool injection。
 - ToolsDiscovery / ScenePrepare provider contract、tool profile registry、Attempt tool snapshot durability。
@@ -113,6 +127,6 @@ pytest tests/host -q
 python -m pyright dayu/host tests/host
 ```
 
-测试覆盖包根导出白名单、枚举字符串值、请求校验失败路径、Host tooling options 校验、Host import 边界与弱类型守卫。
+测试覆盖包根导出白名单、枚举字符串值、请求校验失败路径、Host tooling options 校验、Host import 边界、弱类型守卫、Host command handle factory / close lifecycle，以及 Session public facade 幂等、冲突、读取与关闭语义。
 
 durable foundation 与 internal admission 测试覆盖 SQLite schema bootstrap / transaction runner、EventLog append / read / idempotency、payload descriptor、local artifact helper、host instance liveness、EventLog 多进程 sequence smoke、Session lifecycle、Run / Attempt transition primitive、start / follow-up admission、queue policy、idempotency、FIFO promotion、queued / pre-dispatch cancel、terminal closeout、admission 多进程 durable invariant，以及 Host 包根不导出 durable 内部模块。

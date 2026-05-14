@@ -63,13 +63,24 @@ EXPECTED_TOOLING_EXPORTS: frozenset[str] = frozenset(
     }
 )
 
+EXPECTED_COMMAND_EXPORTS: frozenset[str] = frozenset(
+    {
+        "HostCommandHandle",
+        "close_session",
+        "create_host_command_handle",
+        "create_session",
+        "ensure_session",
+        "get_session",
+    }
+)
+
 EXPECTED_HOST_EXPORTS: frozenset[str] = (
-    EXPECTED_API_EXPORTS | EXPECTED_TOOLING_EXPORTS
+    EXPECTED_API_EXPORTS | EXPECTED_TOOLING_EXPORTS | EXPECTED_COMMAND_EXPORTS
 )
 
 
 def test_host_all_matches_phase1_public_contracts() -> None:
-    """``dayu.host.__all__`` 只包含 Phase 1 承诺的公共类型。"""
+    """``dayu.host.__all__`` 匹配当前 public contract。"""
 
     actual = frozenset(host.__all__)
     assert actual == EXPECTED_HOST_EXPORTS, (
@@ -94,5 +105,13 @@ def test_tooling_symbols_are_exported_from_package_root() -> None:
     """tooling 类型从包根导出，但不进入 ``dayu.host.api``。"""
 
     for name in EXPECTED_TOOLING_EXPORTS:
+        assert name in vars(host)
+        assert name not in vars(api)
+
+
+def test_command_symbols_are_exported_from_package_root_only() -> None:
+    """command facade 从包根导出，但不进入 ``dayu.host.api``。"""
+
+    for name in EXPECTED_COMMAND_EXPORTS:
         assert name in vars(host)
         assert name not in vars(api)
