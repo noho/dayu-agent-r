@@ -25,10 +25,13 @@ from dayu.host.durable._validation import (
     optional_text as _optional_text,
     require_int as _require_int,
     require_non_empty_text as _require_non_empty_text,
+    require_optional_non_empty_text as _require_optional_non_empty_text,
     require_text as _require_text,
 )
 from dayu.host.durable.errors import HostDurableError
 from dayu.host.durable.schema import (
+    TABLE_HOST_ATTEMPT_DISPATCH_RECORDS,
+    TABLE_HOST_ATTEMPTS,
     TABLE_HOST_RUNS,
     TABLE_HOST_SESSION_SLOTS,
     TABLE_HOST_SESSIONS,
@@ -62,6 +65,15 @@ class RunStartReason(StrEnum):
 
     INITIAL = "initial"
     QUEUE_PROMOTION = "queue_promotion"
+
+
+class StateMutationStatus(StrEnum):
+    """低层 CAS mutation 结果状态。"""
+
+    UPDATED = "updated"
+    CAS_LOST = "cas_lost"
+    NOT_FOUND = "not_found"
+    INVALID_STATE = "invalid_state"
 
 
 @dataclass(frozen=True, slots=True)
@@ -173,6 +185,42 @@ class DispatchRecordRow:
     created_at: str
     updated_at: str
     cancelled_at: str | None
+
+
+@dataclass(frozen=True, slots=True)
+class RunMutationResult:
+    """Run CAS mutation 结果。
+
+    :param status: mutation 结果分类。
+    :param row: mutation 后读取到的最新 Run row；缺失时为 ``None``。
+    """
+
+    status: StateMutationStatus
+    row: RunRow | None
+
+
+@dataclass(frozen=True, slots=True)
+class AttemptMutationResult:
+    """Attempt CAS mutation 结果。
+
+    :param status: mutation 结果分类。
+    :param row: mutation 后读取到的最新 Attempt row；缺失时为 ``None``。
+    """
+
+    status: StateMutationStatus
+    row: AttemptRow | None
+
+
+@dataclass(frozen=True, slots=True)
+class DispatchRecordMutationResult:
+    """dispatch record CAS mutation 结果。
+
+    :param status: mutation 结果分类。
+    :param row: mutation 后读取到的最新 dispatch record row；缺失时为 ``None``。
+    """
+
+    status: StateMutationStatus
+    row: DispatchRecordRow | None
 
 
 def serialize_session_status(status: SessionStatus) -> str:
@@ -621,6 +669,280 @@ def read_session_slot_by_session_id(
     return session_slot_row_from_host_row(row)
 
 
+def read_run_by_id(transaction: HostTransaction, run_id: str) -> RunRow | None:
+    """按 Run id 读取 Run row。
+
+    :param transaction: 调用方提供的 Host transaction。
+    :param run_id: Run id。
+    :returns: 找到时返回 ``RunRow``，否则返回 ``None``。
+    :raises HostDurableError: ``run_id`` 为空或 row 字段无效时抛出。
+    :raises sqlite3.Error: SQLite 查询失败时由 transaction runner 结构化转换。
+    """
+
+    _require_non_empty_text(run_id, field_name="run_id")
+    row = transaction.fetchone(
+        f"""
+        SELECT
+          run_id,
+          session_id,
+          status,
+          client_request_id,
+          input_event_id,
+          input_event_sequence,
+          accepted_event_id,
+          accepted_event_sequence,
+          queued_event_id,
+          queued_event_sequence,
+          started_event_id,
+          started_event_sequence,
+          terminal_event_id,
+          terminal_event_sequence,
+          current_attempt_id,
+          source_run_id,
+          source_run_relation,
+          execution_target,
+          queue_policy,
+          created_at,
+          updated_at,
+          terminal_at
+        FROM {TABLE_HOST_RUNS}
+        WHERE run_id = ?
+        """,
+        (run_id,),
+    )
+    if row is None:
+        return None
+    return run_row_from_host_row(row)
+
+
+def read_active_run_for_session(
+    transaction: HostTransaction, session_id: str
+) -> RunRow | None:
+    """读取 Session 当前 active Run。
+
+    :param transaction: 调用方提供的 Host transaction。
+    :param session_id: Session id。
+    :returns: 有 active Run 时返回 ``RunRow``，否则返回 ``None``。
+    :raises HostDurableError: ``session_id`` 为空或 row 字段无效时抛出。
+    :raises sqlite3.Error: SQLite 查询失败时由 transaction runner 结构化转换。
+    """
+
+    _require_non_empty_text(session_id, field_name="session_id")
+    row = transaction.fetchone(
+        f"""
+        SELECT
+          run_id,
+          session_id,
+          status,
+          client_request_id,
+          input_event_id,
+          input_event_sequence,
+          accepted_event_id,
+          accepted_event_sequence,
+          queued_event_id,
+          queued_event_sequence,
+          started_event_id,
+          started_event_sequence,
+          terminal_event_id,
+          terminal_event_sequence,
+          current_attempt_id,
+          source_run_id,
+          source_run_relation,
+          execution_target,
+          queue_policy,
+          created_at,
+          updated_at,
+          terminal_at
+        FROM {TABLE_HOST_RUNS}
+        WHERE session_id = ?
+          AND status IN (?, ?, ?, ?)
+        ORDER BY accepted_event_sequence ASC, run_id ASC
+        LIMIT 1
+        """,
+        (
+            session_id,
+            serialize_run_status(RunStatus.RUNNING),
+            serialize_run_status(RunStatus.WAITING),
+            serialize_run_status(RunStatus.CANCELLING),
+            serialize_run_status(RunStatus.RECOVERING),
+        ),
+    )
+    if row is None:
+        return None
+    return run_row_from_host_row(row)
+
+
+def read_earliest_queued_run(
+    transaction: HostTransaction, session_id: str
+) -> RunRow | None:
+    """读取 Session 下最早 accepted 的 queued Run。
+
+    :param transaction: 调用方提供的 Host transaction。
+    :param session_id: Session id。
+    :returns: 有 queued Run 时返回最早 row，否则返回 ``None``。
+    :raises HostDurableError: ``session_id`` 为空或 row 字段无效时抛出。
+    :raises sqlite3.Error: SQLite 查询失败时由 transaction runner 结构化转换。
+    """
+
+    _require_non_empty_text(session_id, field_name="session_id")
+    row = transaction.fetchone(
+        f"""
+        SELECT
+          run_id,
+          session_id,
+          status,
+          client_request_id,
+          input_event_id,
+          input_event_sequence,
+          accepted_event_id,
+          accepted_event_sequence,
+          queued_event_id,
+          queued_event_sequence,
+          started_event_id,
+          started_event_sequence,
+          terminal_event_id,
+          terminal_event_sequence,
+          current_attempt_id,
+          source_run_id,
+          source_run_relation,
+          execution_target,
+          queue_policy,
+          created_at,
+          updated_at,
+          terminal_at
+        FROM {TABLE_HOST_RUNS}
+        WHERE session_id = ? AND status = ?
+        ORDER BY accepted_event_sequence ASC, run_id ASC
+        LIMIT 1
+        """,
+        (session_id, serialize_run_status(RunStatus.QUEUED)),
+    )
+    if row is None:
+        return None
+    return run_row_from_host_row(row)
+
+
+def read_attempt_by_id(
+    transaction: HostTransaction, attempt_id: str
+) -> AttemptRow | None:
+    """按 Attempt id 读取 Attempt row。
+
+    :param transaction: 调用方提供的 Host transaction。
+    :param attempt_id: Attempt id。
+    :returns: 找到时返回 ``AttemptRow``，否则返回 ``None``。
+    :raises HostDurableError: ``attempt_id`` 为空或 row 字段无效时抛出。
+    :raises sqlite3.Error: SQLite 查询失败时由 transaction runner 结构化转换。
+    """
+
+    _require_non_empty_text(attempt_id, field_name="attempt_id")
+    row = transaction.fetchone(
+        f"""
+        SELECT
+          attempt_id,
+          run_id,
+          execution_id,
+          status,
+          started_event_id,
+          started_event_sequence,
+          terminal_event_id,
+          terminal_event_sequence,
+          created_at,
+          updated_at,
+          terminal_at
+        FROM {TABLE_HOST_ATTEMPTS}
+        WHERE attempt_id = ?
+        """,
+        (attempt_id,),
+    )
+    if row is None:
+        return None
+    return attempt_row_from_host_row(row)
+
+
+def read_dispatch_record_by_attempt_id(
+    transaction: HostTransaction, attempt_id: str
+) -> DispatchRecordRow | None:
+    """按 Attempt id 读取 dispatch record row。
+
+    :param transaction: 调用方提供的 Host transaction。
+    :param attempt_id: Attempt id。
+    :returns: 找到时返回 ``DispatchRecordRow``，否则返回 ``None``。
+    :raises HostDurableError: ``attempt_id`` 为空或 row 字段无效时抛出。
+    :raises sqlite3.Error: SQLite 查询失败时由 transaction runner 结构化转换。
+    """
+
+    _require_non_empty_text(attempt_id, field_name="attempt_id")
+    row = transaction.fetchone(
+        f"""
+        SELECT
+          dispatch_record_id,
+          run_id,
+          attempt_id,
+          execution_id,
+          status,
+          worker_kind,
+          execution_target,
+          owner_host_instance_id,
+          created_event_id,
+          created_event_sequence,
+          cancelled_event_id,
+          cancelled_event_sequence,
+          created_at,
+          updated_at,
+          cancelled_at
+        FROM {TABLE_HOST_ATTEMPT_DISPATCH_RECORDS}
+        WHERE attempt_id = ?
+        """,
+        (attempt_id,),
+    )
+    if row is None:
+        return None
+    return dispatch_record_row_from_host_row(row)
+
+
+def read_dispatch_record_by_id(
+    transaction: HostTransaction, dispatch_record_id: str
+) -> DispatchRecordRow | None:
+    """按 dispatch record id 读取 dispatch record row。
+
+    :param transaction: 调用方提供的 Host transaction。
+    :param dispatch_record_id: dispatch record id。
+    :returns: 找到时返回 ``DispatchRecordRow``，否则返回 ``None``。
+    :raises HostDurableError: ``dispatch_record_id`` 为空或 row 字段无效时抛出。
+    :raises sqlite3.Error: SQLite 查询失败时由 transaction runner 结构化转换。
+    """
+
+    _require_non_empty_text(
+        dispatch_record_id, field_name="dispatch_record_id"
+    )
+    row = transaction.fetchone(
+        f"""
+        SELECT
+          dispatch_record_id,
+          run_id,
+          attempt_id,
+          execution_id,
+          status,
+          worker_kind,
+          execution_target,
+          owner_host_instance_id,
+          created_event_id,
+          created_event_sequence,
+          cancelled_event_id,
+          cancelled_event_sequence,
+          created_at,
+          updated_at,
+          cancelled_at
+        FROM {TABLE_HOST_ATTEMPT_DISPATCH_RECORDS}
+        WHERE dispatch_record_id = ?
+        """,
+        (dispatch_record_id,),
+    )
+    if row is None:
+        return None
+    return dispatch_record_row_from_host_row(row)
+
+
 def insert_session(
     transaction: HostTransaction, session: SessionRow
 ) -> None:
@@ -789,6 +1111,620 @@ def close_open_session_row(
     return result.rowcount == 1
 
 
+def insert_run(transaction: HostTransaction, run: RunRow) -> None:
+    """插入 Run row。
+
+    :param transaction: 调用方提供的 Host transaction。
+    :param run: 待插入的 Run row。
+    :returns: ``None``。
+    :raises HostDurableError: row 字段无效时抛出。
+    :raises sqlite3.Error: SQLite 写入失败时由 transaction runner 结构化转换。
+    """
+
+    _validate_run_for_insert(run)
+    transaction.execute(
+        f"""
+        INSERT INTO {TABLE_HOST_RUNS} (
+          run_id,
+          session_id,
+          status,
+          client_request_id,
+          input_event_id,
+          input_event_sequence,
+          accepted_event_id,
+          accepted_event_sequence,
+          queued_event_id,
+          queued_event_sequence,
+          started_event_id,
+          started_event_sequence,
+          terminal_event_id,
+          terminal_event_sequence,
+          current_attempt_id,
+          source_run_id,
+          source_run_relation,
+          execution_target,
+          queue_policy,
+          created_at,
+          updated_at,
+          terminal_at
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        """,
+        (
+            run.run_id,
+            run.session_id,
+            serialize_run_status(run.status),
+            run.client_request_id,
+            run.input_event_id,
+            run.input_event_sequence,
+            run.accepted_event_id,
+            run.accepted_event_sequence,
+            run.queued_event_id,
+            run.queued_event_sequence,
+            run.started_event_id,
+            run.started_event_sequence,
+            run.terminal_event_id,
+            run.terminal_event_sequence,
+            run.current_attempt_id,
+            run.source_run_id,
+            _optional_source_run_relation_text(run.source_run_relation),
+            run.execution_target,
+            run.queue_policy,
+            run.created_at,
+            run.updated_at,
+            run.terminal_at,
+        ),
+    )
+
+
+def insert_attempt(transaction: HostTransaction, attempt: AttemptRow) -> None:
+    """插入 Attempt row。
+
+    :param transaction: 调用方提供的 Host transaction。
+    :param attempt: 待插入的 Attempt row。
+    :returns: ``None``。
+    :raises HostDurableError: row 字段无效时抛出。
+    :raises sqlite3.Error: SQLite 写入失败时由 transaction runner 结构化转换。
+    """
+
+    _validate_attempt_for_insert(attempt)
+    transaction.execute(
+        f"""
+        INSERT INTO {TABLE_HOST_ATTEMPTS} (
+          attempt_id,
+          run_id,
+          execution_id,
+          status,
+          started_event_id,
+          started_event_sequence,
+          terminal_event_id,
+          terminal_event_sequence,
+          created_at,
+          updated_at,
+          terminal_at
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        """,
+        (
+            attempt.attempt_id,
+            attempt.run_id,
+            attempt.execution_id,
+            serialize_attempt_status(attempt.status),
+            attempt.started_event_id,
+            attempt.started_event_sequence,
+            attempt.terminal_event_id,
+            attempt.terminal_event_sequence,
+            attempt.created_at,
+            attempt.updated_at,
+            attempt.terminal_at,
+        ),
+    )
+
+
+def insert_dispatch_record(
+    transaction: HostTransaction, dispatch_record: DispatchRecordRow
+) -> None:
+    """插入 Attempt dispatch record row。
+
+    :param transaction: 调用方提供的 Host transaction。
+    :param dispatch_record: 待插入的 dispatch record row。
+    :returns: ``None``。
+    :raises HostDurableError: row 字段无效时抛出。
+    :raises sqlite3.Error: SQLite 写入失败时由 transaction runner 结构化转换。
+    """
+
+    _validate_dispatch_record_for_insert(dispatch_record)
+    transaction.execute(
+        f"""
+        INSERT INTO {TABLE_HOST_ATTEMPT_DISPATCH_RECORDS} (
+          dispatch_record_id,
+          run_id,
+          attempt_id,
+          execution_id,
+          status,
+          worker_kind,
+          execution_target,
+          owner_host_instance_id,
+          created_event_id,
+          created_event_sequence,
+          cancelled_event_id,
+          cancelled_event_sequence,
+          created_at,
+          updated_at,
+          cancelled_at
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        """,
+        (
+            dispatch_record.dispatch_record_id,
+            dispatch_record.run_id,
+            dispatch_record.attempt_id,
+            dispatch_record.execution_id,
+            serialize_dispatch_record_status(dispatch_record.status),
+            serialize_worker_kind(dispatch_record.worker_kind),
+            dispatch_record.execution_target,
+            dispatch_record.owner_host_instance_id,
+            dispatch_record.created_event_id,
+            dispatch_record.created_event_sequence,
+            dispatch_record.cancelled_event_id,
+            dispatch_record.cancelled_event_sequence,
+            dispatch_record.created_at,
+            dispatch_record.updated_at,
+            dispatch_record.cancelled_at,
+        ),
+    )
+
+
+def promote_queued_run_row(
+    transaction: HostTransaction,
+    *,
+    session_id: str,
+    run_id: str,
+    started_event_id: str,
+    started_event_sequence: int,
+    current_attempt_id: str,
+    updated_at: str,
+) -> RunMutationResult:
+    """CAS 推进 queued Run 到 running。
+
+    :param transaction: 调用方提供的 Host transaction。
+    :param session_id: Run 所属 Session id。
+    :param run_id: 目标 Run id。
+    :param started_event_id: ``RUN_STARTED`` 事件 id。
+    :param started_event_sequence: ``RUN_STARTED`` 全局事件序号。
+    :param current_attempt_id: 新建 current Attempt id。
+    :param updated_at: 固定 UTC timestamp 文本。
+    :returns: Run mutation 结果，区分 updated/cas_lost/not_found/invalid_state。
+    :raises HostDurableError: 输入字段无效时抛出。
+    :raises sqlite3.Error: SQLite 写入失败时由 transaction runner 结构化转换。
+    """
+
+    _validate_run_start_update(
+        session_id=session_id,
+        run_id=run_id,
+        started_event_id=started_event_id,
+        started_event_sequence=started_event_sequence,
+        current_attempt_id=current_attempt_id,
+        updated_at=updated_at,
+    )
+    result = transaction.execute(
+        f"""
+        UPDATE {TABLE_HOST_RUNS}
+        SET
+          status = ?,
+          started_event_id = ?,
+          started_event_sequence = ?,
+          current_attempt_id = ?,
+          updated_at = ?
+        WHERE run_id = ?
+          AND session_id = ?
+          AND status = ?
+          AND NOT EXISTS (
+            SELECT 1
+            FROM {TABLE_HOST_RUNS} active_run
+            WHERE active_run.session_id = ?
+              AND active_run.run_id <> ?
+              AND active_run.status IN (?, ?, ?, ?)
+          )
+        """,
+        (
+            serialize_run_status(RunStatus.RUNNING),
+            started_event_id,
+            started_event_sequence,
+            current_attempt_id,
+            updated_at,
+            run_id,
+            session_id,
+            serialize_run_status(RunStatus.QUEUED),
+            session_id,
+            run_id,
+            serialize_run_status(RunStatus.RUNNING),
+            serialize_run_status(RunStatus.WAITING),
+            serialize_run_status(RunStatus.CANCELLING),
+            serialize_run_status(RunStatus.RECOVERING),
+        ),
+    )
+    return _run_mutation_result(
+        transaction,
+        run_id=run_id,
+        rowcount=result.rowcount,
+        expected_status=RunStatus.QUEUED,
+        cas_lost_when_expected=True,
+    )
+
+
+def cancel_queued_run_row(
+    transaction: HostTransaction,
+    *,
+    run_id: str,
+    terminal_event_id: str,
+    terminal_event_sequence: int,
+    terminal_at: str,
+) -> RunMutationResult:
+    """CAS 取消 queued Run。
+
+    :param transaction: 调用方提供的 Host transaction。
+    :param run_id: 目标 Run id。
+    :param terminal_event_id: ``RUN_CANCELLED`` 事件 id。
+    :param terminal_event_sequence: ``RUN_CANCELLED`` 全局事件序号。
+    :param terminal_at: 固定 UTC terminal timestamp 文本。
+    :returns: Run mutation 结果，区分 updated/cas_lost/not_found/invalid_state。
+    :raises HostDurableError: 输入字段无效时抛出。
+    :raises sqlite3.Error: SQLite 写入失败时由 transaction runner 结构化转换。
+    """
+
+    _validate_run_terminal_update(
+        run_id=run_id,
+        terminal_event_id=terminal_event_id,
+        terminal_event_sequence=terminal_event_sequence,
+        terminal_at=terminal_at,
+    )
+    result = transaction.execute(
+        f"""
+        UPDATE {TABLE_HOST_RUNS}
+        SET
+          status = ?,
+          terminal_event_id = ?,
+          terminal_event_sequence = ?,
+          updated_at = ?,
+          terminal_at = ?
+        WHERE run_id = ? AND status = ?
+        """,
+        (
+            serialize_run_status(RunStatus.CANCELLED),
+            terminal_event_id,
+            terminal_event_sequence,
+            terminal_at,
+            terminal_at,
+            run_id,
+            serialize_run_status(RunStatus.QUEUED),
+        ),
+    )
+    return _run_mutation_result(
+        transaction,
+        run_id=run_id,
+        rowcount=result.rowcount,
+        expected_status=RunStatus.QUEUED,
+        cas_lost_when_expected=False,
+    )
+
+
+def cancel_running_run_row(
+    transaction: HostTransaction,
+    *,
+    run_id: str,
+    current_attempt_id: str,
+    terminal_event_id: str,
+    terminal_event_sequence: int,
+    terminal_at: str,
+) -> RunMutationResult:
+    """CAS 取消 pre-dispatch running Run。
+
+    :param transaction: 调用方提供的 Host transaction。
+    :param run_id: 目标 Run id。
+    :param current_attempt_id: 期望的 current Attempt id。
+    :param terminal_event_id: ``RUN_CANCELLED`` 事件 id。
+    :param terminal_event_sequence: ``RUN_CANCELLED`` 全局事件序号。
+    :param terminal_at: 固定 UTC terminal timestamp 文本。
+    :returns: Run mutation 结果，区分 updated/cas_lost/not_found/invalid_state。
+    :raises HostDurableError: 输入字段无效时抛出。
+    :raises sqlite3.Error: SQLite 写入失败时由 transaction runner 结构化转换。
+    """
+
+    _validate_run_terminal_update(
+        run_id=run_id,
+        terminal_event_id=terminal_event_id,
+        terminal_event_sequence=terminal_event_sequence,
+        terminal_at=terminal_at,
+    )
+    _require_non_empty_text(current_attempt_id, field_name="current_attempt_id")
+    result = transaction.execute(
+        f"""
+        UPDATE {TABLE_HOST_RUNS}
+        SET
+          status = ?,
+          terminal_event_id = ?,
+          terminal_event_sequence = ?,
+          updated_at = ?,
+          terminal_at = ?
+        WHERE run_id = ?
+          AND status = ?
+          AND current_attempt_id = ?
+        """,
+        (
+            serialize_run_status(RunStatus.CANCELLED),
+            terminal_event_id,
+            terminal_event_sequence,
+            terminal_at,
+            terminal_at,
+            run_id,
+            serialize_run_status(RunStatus.RUNNING),
+            current_attempt_id,
+        ),
+    )
+    return _run_mutation_result(
+        transaction,
+        run_id=run_id,
+        rowcount=result.rowcount,
+        expected_status=RunStatus.RUNNING,
+        cas_lost_when_expected=True,
+    )
+
+
+def terminal_run_row(
+    transaction: HostTransaction,
+    *,
+    run_id: str,
+    current_attempt_id: str,
+    terminal_status: RunStatus,
+    terminal_event_id: str,
+    terminal_event_sequence: int,
+    terminal_at: str,
+) -> RunMutationResult:
+    """CAS 将 active Run 推进到具体终态。
+
+    :param transaction: 调用方提供的 Host transaction。
+    :param run_id: 目标 Run id。
+    :param current_attempt_id: 期望的 current Attempt id。
+    :param terminal_status: 目标 Run 终态，只允许 succeeded/failed/lost。
+    :param terminal_event_id: 具体 Run terminal event id。
+    :param terminal_event_sequence: 具体 Run terminal event 全局序号。
+    :param terminal_at: 固定 UTC terminal timestamp 文本。
+    :returns: Run mutation 结果，区分 updated/cas_lost/not_found/invalid_state。
+    :raises HostDurableError: 输入字段或 terminal status 无效时抛出。
+    :raises sqlite3.Error: SQLite 写入失败时由 transaction runner 结构化转换。
+    """
+
+    if terminal_status not in (
+        RunStatus.SUCCEEDED,
+        RunStatus.FAILED,
+        RunStatus.LOST,
+    ):
+        raise HostDurableError("terminal Run status is invalid")
+    _validate_run_terminal_update(
+        run_id=run_id,
+        terminal_event_id=terminal_event_id,
+        terminal_event_sequence=terminal_event_sequence,
+        terminal_at=terminal_at,
+    )
+    _require_non_empty_text(current_attempt_id, field_name="current_attempt_id")
+    result = transaction.execute(
+        f"""
+        UPDATE {TABLE_HOST_RUNS}
+        SET
+          status = ?,
+          terminal_event_id = ?,
+          terminal_event_sequence = ?,
+          updated_at = ?,
+          terminal_at = ?
+        WHERE run_id = ?
+          AND status IN (?, ?)
+          AND current_attempt_id = ?
+        """,
+        (
+            serialize_run_status(terminal_status),
+            terminal_event_id,
+            terminal_event_sequence,
+            terminal_at,
+            terminal_at,
+            run_id,
+            serialize_run_status(RunStatus.RUNNING),
+            serialize_run_status(RunStatus.WAITING),
+            current_attempt_id,
+        ),
+    )
+    return _run_mutation_result_for_active(
+        transaction,
+        run_id=run_id,
+        rowcount=result.rowcount,
+    )
+
+
+def terminal_attempt_row(
+    transaction: HostTransaction,
+    *,
+    attempt_id: str,
+    terminal_status: AttemptStatus,
+    terminal_event_id: str,
+    terminal_event_sequence: int,
+    terminal_at: str,
+) -> AttemptMutationResult:
+    """CAS 将 Attempt 推进到具体终态。
+
+    :param transaction: 调用方提供的 Host transaction。
+    :param attempt_id: 目标 Attempt id。
+    :param terminal_status: 目标 Attempt 终态，只允许 succeeded/failed/lost。
+    :param terminal_event_id: 具体 Attempt terminal event id。
+    :param terminal_event_sequence: 具体 Attempt terminal event 全局序号。
+    :param terminal_at: 固定 UTC terminal timestamp 文本。
+    :returns: Attempt mutation 结果，区分 updated/cas_lost/not_found/invalid_state。
+    :raises HostDurableError: 输入字段或 terminal status 无效时抛出。
+    :raises sqlite3.Error: SQLite 写入失败时由 transaction runner 结构化转换。
+    """
+
+    if terminal_status not in (
+        AttemptStatus.SUCCEEDED,
+        AttemptStatus.FAILED,
+        AttemptStatus.LOST,
+    ):
+        raise HostDurableError("terminal Attempt status is invalid")
+    _validate_attempt_terminal_update(
+        attempt_id=attempt_id,
+        terminal_event_id=terminal_event_id,
+        terminal_event_sequence=terminal_event_sequence,
+        terminal_at=terminal_at,
+    )
+    result = transaction.execute(
+        f"""
+        UPDATE {TABLE_HOST_ATTEMPTS}
+        SET
+          status = ?,
+          terminal_event_id = ?,
+          terminal_event_sequence = ?,
+          updated_at = ?,
+          terminal_at = ?
+        WHERE attempt_id = ?
+          AND status IN (?, ?)
+        """,
+        (
+            serialize_attempt_status(terminal_status),
+            terminal_event_id,
+            terminal_event_sequence,
+            terminal_at,
+            terminal_at,
+            attempt_id,
+            serialize_attempt_status(AttemptStatus.STARTING),
+            serialize_attempt_status(AttemptStatus.RUNNING),
+        ),
+    )
+    return _attempt_mutation_result_for_active(
+        transaction,
+        attempt_id=attempt_id,
+        rowcount=result.rowcount,
+    )
+
+
+def cancel_starting_attempt_row(
+    transaction: HostTransaction,
+    *,
+    attempt_id: str,
+    terminal_event_id: str,
+    terminal_event_sequence: int,
+    terminal_at: str,
+) -> AttemptMutationResult:
+    """CAS 取消 STARTING Attempt。
+
+    :param transaction: 调用方提供的 Host transaction。
+    :param attempt_id: 目标 Attempt id。
+    :param terminal_event_id: ``ATTEMPT_CANCELLED`` 事件 id。
+    :param terminal_event_sequence: ``ATTEMPT_CANCELLED`` 全局事件序号。
+    :param terminal_at: 固定 UTC terminal timestamp 文本。
+    :returns: Attempt mutation 结果，区分 updated/cas_lost/not_found/invalid_state。
+    :raises HostDurableError: 输入字段无效时抛出。
+    :raises sqlite3.Error: SQLite 写入失败时由 transaction runner 结构化转换。
+    """
+
+    _validate_attempt_terminal_update(
+        attempt_id=attempt_id,
+        terminal_event_id=terminal_event_id,
+        terminal_event_sequence=terminal_event_sequence,
+        terminal_at=terminal_at,
+    )
+    result = transaction.execute(
+        f"""
+        UPDATE {TABLE_HOST_ATTEMPTS}
+        SET
+          status = ?,
+          terminal_event_id = ?,
+          terminal_event_sequence = ?,
+          updated_at = ?,
+          terminal_at = ?
+        WHERE attempt_id = ? AND status = ?
+        """,
+        (
+            serialize_attempt_status(AttemptStatus.CANCELLED),
+            terminal_event_id,
+            terminal_event_sequence,
+            terminal_at,
+            terminal_at,
+            attempt_id,
+            serialize_attempt_status(AttemptStatus.STARTING),
+        ),
+    )
+    return _attempt_mutation_result(
+        transaction,
+        attempt_id=attempt_id,
+        rowcount=result.rowcount,
+        expected_status=AttemptStatus.STARTING,
+        cas_lost_when_expected=False,
+    )
+
+
+def cancel_pending_dispatch_record_row(
+    transaction: HostTransaction,
+    *,
+    attempt_id: str,
+    cancelled_event_id: str,
+    cancelled_event_sequence: int,
+    cancelled_at: str,
+) -> DispatchRecordMutationResult:
+    """CAS 取消 pending dispatch record。
+
+    :param transaction: 调用方提供的 Host transaction。
+    :param attempt_id: 目标 Attempt id。
+    :param cancelled_event_id: ``ATTEMPT_CANCELLED`` 事件 id。
+    :param cancelled_event_sequence: ``ATTEMPT_CANCELLED`` 全局事件序号。
+    :param cancelled_at: 固定 UTC cancel timestamp 文本。
+    :returns: dispatch record mutation 结果，区分 updated/cas_lost/not_found/invalid_state。
+    :raises HostDurableError: 输入字段无效时抛出。
+    :raises sqlite3.Error: SQLite 写入失败时由 transaction runner 结构化转换。
+    """
+
+    _require_non_empty_text(attempt_id, field_name="attempt_id")
+    _require_non_empty_text(cancelled_event_id, field_name="cancelled_event_id")
+    if cancelled_event_sequence <= 0:
+        raise HostDurableError("cancelled_event_sequence must be positive")
+    _require_non_empty_text(cancelled_at, field_name="cancelled_at")
+    result = transaction.execute(
+        f"""
+        UPDATE {TABLE_HOST_ATTEMPT_DISPATCH_RECORDS}
+        SET
+          status = ?,
+          cancelled_event_id = ?,
+          cancelled_event_sequence = ?,
+          updated_at = ?,
+          cancelled_at = ?
+        WHERE attempt_id = ? AND status = ?
+        """,
+        (
+            serialize_dispatch_record_status(DispatchRecordStatus.CANCELLED),
+            cancelled_event_id,
+            cancelled_event_sequence,
+            cancelled_at,
+            cancelled_at,
+            attempt_id,
+            serialize_dispatch_record_status(DispatchRecordStatus.PENDING),
+        ),
+    )
+    if result.rowcount == 1:
+        return DispatchRecordMutationResult(
+            status=StateMutationStatus.UPDATED,
+            row=read_dispatch_record_by_attempt_id(transaction, attempt_id),
+        )
+    latest = read_dispatch_record_by_attempt_id(transaction, attempt_id)
+    if latest is None:
+        return DispatchRecordMutationResult(
+            status=StateMutationStatus.NOT_FOUND,
+            row=None,
+        )
+    if latest.status == DispatchRecordStatus.PENDING:
+        return DispatchRecordMutationResult(
+            status=StateMutationStatus.CAS_LOST,
+            row=latest,
+        )
+    return DispatchRecordMutationResult(
+        status=StateMutationStatus.INVALID_STATE,
+        row=latest,
+    )
+
+
 def session_snapshot_from_rows(
     transaction: HostTransaction,
     session: SessionRow,
@@ -890,6 +1826,419 @@ def _validate_session_slot(slot: SessionSlotRow) -> None:
         raise HostDurableError("bound_event_sequence must be positive")
     _require_non_empty_text(slot.metadata_json, field_name="metadata_json")
     _require_non_empty_text(slot.updated_at, field_name="updated_at")
+
+
+def _validate_run_for_insert(run: RunRow) -> None:
+    """校验待插入 Run row。
+
+    :param run: 待校验 Run row。
+    :returns: ``None``。
+    :raises HostDurableError: 任一字段违反 Phase 3 Run row 约束时抛出。
+    """
+
+    _require_non_empty_text(run.run_id, field_name="run_id")
+    _require_non_empty_text(run.session_id, field_name="session_id")
+    if not isinstance(run.status, RunStatus):
+        raise HostDurableError("Run status is invalid")
+    _require_non_empty_text(run.client_request_id, field_name="client_request_id")
+    _require_non_empty_text(run.input_event_id, field_name="input_event_id")
+    _require_positive_sequence(run.input_event_sequence, "input_event_sequence")
+    _require_non_empty_text(run.accepted_event_id, field_name="accepted_event_id")
+    _require_positive_sequence(
+        run.accepted_event_sequence, "accepted_event_sequence"
+    )
+    _require_optional_non_empty_text(
+        run.queued_event_id, field_name="queued_event_id"
+    )
+    _require_optional_positive_sequence(
+        run.queued_event_sequence, "queued_event_sequence"
+    )
+    _require_optional_non_empty_text(
+        run.started_event_id, field_name="started_event_id"
+    )
+    _require_optional_positive_sequence(
+        run.started_event_sequence, "started_event_sequence"
+    )
+    _require_optional_non_empty_text(
+        run.terminal_event_id, field_name="terminal_event_id"
+    )
+    _require_optional_positive_sequence(
+        run.terminal_event_sequence, "terminal_event_sequence"
+    )
+    _require_optional_non_empty_text(
+        run.current_attempt_id, field_name="current_attempt_id"
+    )
+    _require_optional_non_empty_text(run.source_run_id, field_name="source_run_id")
+    _require_non_empty_text(run.execution_target, field_name="execution_target")
+    _require_non_empty_text(run.queue_policy, field_name="queue_policy")
+    _require_non_empty_text(run.created_at, field_name="created_at")
+    _require_non_empty_text(run.updated_at, field_name="updated_at")
+    _require_optional_non_empty_text(run.terminal_at, field_name="terminal_at")
+    if run.status == RunStatus.QUEUED:
+        if run.queued_event_id is None or run.queued_event_sequence is None:
+            raise HostDurableError("queued Run requires queue event refs")
+        if run.current_attempt_id is not None:
+            raise HostDurableError("queued Run current_attempt_id must be unset")
+    if _is_terminal_run_status(run.status):
+        if (
+            run.terminal_event_id is None
+            or run.terminal_event_sequence is None
+            or run.terminal_at is None
+        ):
+            raise HostDurableError("terminal Run requires terminal refs")
+    elif (
+        run.terminal_event_id is not None
+        or run.terminal_event_sequence is not None
+        or run.terminal_at is not None
+    ):
+        raise HostDurableError("non-terminal Run terminal refs must be unset")
+    if (run.source_run_id is None) != (run.source_run_relation is None):
+        raise HostDurableError("Run source relation fields must be paired")
+
+
+def _validate_attempt_for_insert(attempt: AttemptRow) -> None:
+    """校验待插入 Attempt row。
+
+    :param attempt: 待校验 Attempt row。
+    :returns: ``None``。
+    :raises HostDurableError: 任一字段违反 Phase 3 Attempt row 约束时抛出。
+    """
+
+    _require_non_empty_text(attempt.attempt_id, field_name="attempt_id")
+    _require_non_empty_text(attempt.run_id, field_name="run_id")
+    _require_non_empty_text(attempt.execution_id, field_name="execution_id")
+    if attempt.status != AttemptStatus.STARTING:
+        raise HostDurableError("insert_attempt only accepts STARTING Attempt")
+    _require_non_empty_text(
+        attempt.started_event_id, field_name="started_event_id"
+    )
+    _require_positive_sequence(
+        attempt.started_event_sequence, "started_event_sequence"
+    )
+    if attempt.terminal_event_id is not None:
+        raise HostDurableError("STARTING Attempt terminal_event_id must be unset")
+    if attempt.terminal_event_sequence is not None:
+        raise HostDurableError(
+            "STARTING Attempt terminal_event_sequence must be unset"
+        )
+    _require_non_empty_text(attempt.created_at, field_name="created_at")
+    _require_non_empty_text(attempt.updated_at, field_name="updated_at")
+    if attempt.terminal_at is not None:
+        raise HostDurableError("STARTING Attempt terminal_at must be unset")
+
+
+def _validate_dispatch_record_for_insert(
+    dispatch_record: DispatchRecordRow,
+) -> None:
+    """校验待插入 dispatch record row。
+
+    :param dispatch_record: 待校验 dispatch record row。
+    :returns: ``None``。
+    :raises HostDurableError: 任一字段违反 Phase 3 dispatch row 约束时抛出。
+    """
+
+    _require_non_empty_text(
+        dispatch_record.dispatch_record_id, field_name="dispatch_record_id"
+    )
+    _require_non_empty_text(dispatch_record.run_id, field_name="run_id")
+    _require_non_empty_text(dispatch_record.attempt_id, field_name="attempt_id")
+    _require_non_empty_text(dispatch_record.execution_id, field_name="execution_id")
+    if not isinstance(dispatch_record.status, DispatchRecordStatus):
+        raise HostDurableError("dispatch record status is invalid")
+    if not isinstance(dispatch_record.worker_kind, WorkerKind):
+        raise HostDurableError("worker kind is invalid")
+    _require_non_empty_text(
+        dispatch_record.execution_target, field_name="execution_target"
+    )
+    _require_optional_non_empty_text(
+        dispatch_record.owner_host_instance_id,
+        field_name="owner_host_instance_id",
+    )
+    _require_non_empty_text(
+        dispatch_record.created_event_id, field_name="created_event_id"
+    )
+    _require_positive_sequence(
+        dispatch_record.created_event_sequence, "created_event_sequence"
+    )
+    _require_optional_non_empty_text(
+        dispatch_record.cancelled_event_id, field_name="cancelled_event_id"
+    )
+    _require_optional_positive_sequence(
+        dispatch_record.cancelled_event_sequence, "cancelled_event_sequence"
+    )
+    _require_non_empty_text(dispatch_record.created_at, field_name="created_at")
+    _require_non_empty_text(dispatch_record.updated_at, field_name="updated_at")
+    _require_optional_non_empty_text(
+        dispatch_record.cancelled_at, field_name="cancelled_at"
+    )
+    if dispatch_record.status == DispatchRecordStatus.PENDING:
+        if dispatch_record.cancelled_event_id is not None:
+            raise HostDurableError("pending dispatch cancelled_event_id must be unset")
+        if dispatch_record.cancelled_event_sequence is not None:
+            raise HostDurableError(
+                "pending dispatch cancelled_event_sequence must be unset"
+            )
+        if dispatch_record.cancelled_at is not None:
+            raise HostDurableError("pending dispatch cancelled_at must be unset")
+    elif (
+        dispatch_record.cancelled_event_id is None
+        or dispatch_record.cancelled_event_sequence is None
+        or dispatch_record.cancelled_at is None
+    ):
+        raise HostDurableError("cancelled dispatch requires cancel refs")
+
+
+def _validate_run_start_update(
+    *,
+    session_id: str,
+    run_id: str,
+    started_event_id: str,
+    started_event_sequence: int,
+    current_attempt_id: str,
+    updated_at: str,
+) -> None:
+    """校验 Run start update 输入。
+
+    :param session_id: Session id。
+    :param run_id: Run id。
+    :param started_event_id: RUN_STARTED event id。
+    :param started_event_sequence: RUN_STARTED event sequence。
+    :param current_attempt_id: current Attempt id。
+    :param updated_at: 更新时间。
+    :returns: ``None``。
+    :raises HostDurableError: 任一字段无效时抛出。
+    """
+
+    _require_non_empty_text(session_id, field_name="session_id")
+    _require_non_empty_text(run_id, field_name="run_id")
+    _require_non_empty_text(started_event_id, field_name="started_event_id")
+    _require_positive_sequence(started_event_sequence, "started_event_sequence")
+    _require_non_empty_text(current_attempt_id, field_name="current_attempt_id")
+    _require_non_empty_text(updated_at, field_name="updated_at")
+
+
+def _validate_run_terminal_update(
+    *,
+    run_id: str,
+    terminal_event_id: str,
+    terminal_event_sequence: int,
+    terminal_at: str,
+) -> None:
+    """校验 Run terminal update 输入。
+
+    :param run_id: Run id。
+    :param terminal_event_id: terminal event id。
+    :param terminal_event_sequence: terminal event sequence。
+    :param terminal_at: terminal timestamp。
+    :returns: ``None``。
+    :raises HostDurableError: 任一字段无效时抛出。
+    """
+
+    _require_non_empty_text(run_id, field_name="run_id")
+    _require_non_empty_text(terminal_event_id, field_name="terminal_event_id")
+    _require_positive_sequence(
+        terminal_event_sequence, "terminal_event_sequence"
+    )
+    _require_non_empty_text(terminal_at, field_name="terminal_at")
+
+
+def _validate_attempt_terminal_update(
+    *,
+    attempt_id: str,
+    terminal_event_id: str,
+    terminal_event_sequence: int,
+    terminal_at: str,
+) -> None:
+    """校验 Attempt terminal update 输入。
+
+    :param attempt_id: Attempt id。
+    :param terminal_event_id: terminal event id。
+    :param terminal_event_sequence: terminal event sequence。
+    :param terminal_at: terminal timestamp。
+    :returns: ``None``。
+    :raises HostDurableError: 任一字段无效时抛出。
+    """
+
+    _require_non_empty_text(attempt_id, field_name="attempt_id")
+    _require_non_empty_text(terminal_event_id, field_name="terminal_event_id")
+    _require_positive_sequence(
+        terminal_event_sequence, "terminal_event_sequence"
+    )
+    _require_non_empty_text(terminal_at, field_name="terminal_at")
+
+
+def _run_mutation_result(
+    transaction: HostTransaction,
+    *,
+    run_id: str,
+    rowcount: int,
+    expected_status: RunStatus,
+    cas_lost_when_expected: bool,
+) -> RunMutationResult:
+    """构造 Run mutation 结果。
+
+    :param transaction: 调用方提供的 Host transaction。
+    :param run_id: Run id。
+    :param rowcount: UPDATE rowcount。
+    :param expected_status: CAS 期望源状态。
+    :param cas_lost_when_expected: 仍处于期望源状态时是否归为 CAS lost。
+    :returns: Run mutation 结果。
+    """
+
+    latest = read_run_by_id(transaction, run_id)
+    if rowcount == 1:
+        return RunMutationResult(status=StateMutationStatus.UPDATED, row=latest)
+    if latest is None:
+        return RunMutationResult(status=StateMutationStatus.NOT_FOUND, row=None)
+    if latest.status == expected_status and cas_lost_when_expected:
+        return RunMutationResult(status=StateMutationStatus.CAS_LOST, row=latest)
+    return RunMutationResult(status=StateMutationStatus.INVALID_STATE, row=latest)
+
+
+def _run_mutation_result_for_active(
+    transaction: HostTransaction, *, run_id: str, rowcount: int
+) -> RunMutationResult:
+    """构造 active Run terminal mutation 结果。
+
+    :param transaction: 调用方提供的 Host transaction。
+    :param run_id: Run id。
+    :param rowcount: UPDATE rowcount。
+    :returns: Run mutation 结果。
+    """
+
+    latest = read_run_by_id(transaction, run_id)
+    if rowcount == 1:
+        return RunMutationResult(status=StateMutationStatus.UPDATED, row=latest)
+    if latest is None:
+        return RunMutationResult(status=StateMutationStatus.NOT_FOUND, row=None)
+    if latest.status in (RunStatus.RUNNING, RunStatus.WAITING):
+        return RunMutationResult(status=StateMutationStatus.CAS_LOST, row=latest)
+    return RunMutationResult(status=StateMutationStatus.INVALID_STATE, row=latest)
+
+
+def _attempt_mutation_result(
+    transaction: HostTransaction,
+    *,
+    attempt_id: str,
+    rowcount: int,
+    expected_status: AttemptStatus,
+    cas_lost_when_expected: bool,
+) -> AttemptMutationResult:
+    """构造 Attempt mutation 结果。
+
+    :param transaction: 调用方提供的 Host transaction。
+    :param attempt_id: Attempt id。
+    :param rowcount: UPDATE rowcount。
+    :param expected_status: CAS 期望源状态。
+    :param cas_lost_when_expected: 仍处于期望源状态时是否归为 CAS lost。
+    :returns: Attempt mutation 结果。
+    """
+
+    latest = read_attempt_by_id(transaction, attempt_id)
+    if rowcount == 1:
+        return AttemptMutationResult(
+            status=StateMutationStatus.UPDATED, row=latest
+        )
+    if latest is None:
+        return AttemptMutationResult(
+            status=StateMutationStatus.NOT_FOUND, row=None
+        )
+    if latest.status == expected_status and cas_lost_when_expected:
+        return AttemptMutationResult(
+            status=StateMutationStatus.CAS_LOST, row=latest
+        )
+    return AttemptMutationResult(
+        status=StateMutationStatus.INVALID_STATE, row=latest
+    )
+
+
+def _attempt_mutation_result_for_active(
+    transaction: HostTransaction, *, attempt_id: str, rowcount: int
+) -> AttemptMutationResult:
+    """构造 active Attempt terminal mutation 结果。
+
+    :param transaction: 调用方提供的 Host transaction。
+    :param attempt_id: Attempt id。
+    :param rowcount: UPDATE rowcount。
+    :returns: Attempt mutation 结果。
+    """
+
+    latest = read_attempt_by_id(transaction, attempt_id)
+    if rowcount == 1:
+        return AttemptMutationResult(
+            status=StateMutationStatus.UPDATED, row=latest
+        )
+    if latest is None:
+        return AttemptMutationResult(
+            status=StateMutationStatus.NOT_FOUND, row=None
+        )
+    if latest.status in (AttemptStatus.STARTING, AttemptStatus.RUNNING):
+        return AttemptMutationResult(
+            status=StateMutationStatus.CAS_LOST, row=latest
+        )
+    return AttemptMutationResult(
+        status=StateMutationStatus.INVALID_STATE, row=latest
+    )
+
+
+def _optional_source_run_relation_text(
+    relation: SourceRunRelation | None,
+) -> str | None:
+    """序列化 optional SourceRunRelation。
+
+    :param relation: source relation 或 ``None``。
+    :returns: SQLite 文本值或 ``None``。
+    :raises HostDurableError: relation 类型非法时抛出。
+    """
+
+    if relation is None:
+        return None
+    if not isinstance(relation, SourceRunRelation):
+        raise HostDurableError("SourceRunRelation is invalid")
+    return relation.value
+
+
+def _require_positive_sequence(value: int, field_name: str) -> None:
+    """校验事件序号为正整数。
+
+    :param value: 事件序号。
+    :param field_name: 字段名。
+    :returns: ``None``。
+    :raises HostDurableError: 序号小于等于零时抛出。
+    """
+
+    if value <= 0:
+        raise HostDurableError(f"{field_name} must be positive")
+
+
+def _require_optional_positive_sequence(
+    value: int | None, field_name: str
+) -> None:
+    """校验 optional 事件序号。
+
+    :param value: 事件序号或 ``None``。
+    :param field_name: 字段名。
+    :returns: ``None``。
+    :raises HostDurableError: 序号存在且小于等于零时抛出。
+    """
+
+    if value is not None:
+        _require_positive_sequence(value, field_name)
+
+
+def _is_terminal_run_status(status: RunStatus) -> bool:
+    """判断 Run 状态是否为终态。
+
+    :param status: Run 状态。
+    :returns: 是终态时返回 ``True``。
+    """
+
+    return status in (
+        RunStatus.SUCCEEDED,
+        RunStatus.FAILED,
+        RunStatus.CANCELLED,
+        RunStatus.LOST,
+    )
 
 
 def _slot_ref_from_row(slot: SessionSlotRow | None) -> SessionSlotRef | None:

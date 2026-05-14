@@ -43,9 +43,10 @@
 - Payload descriptor primitive：支持 `sqlite_payload` 与 `artifact_ref` 两类 descriptor；SQLite payload row 与 descriptor 可在同一 transaction 内写入，EventLog 可引用既有 descriptor 与 digest。
 - Local artifact helper：在显式注入的 artifact root 下写入 `.tmp` 临时文件，完成 flush / fsync、digest 校验与 atomic rename 后返回最终 `LocalArtifactRef`；SQLite rollback 后已发布但未引用的文件只属于 cleanup / diagnostics orphan，不是 accepted fact。
 - Host instance liveness primitive：支持当前 instance register、heartbeat、mark stopping / stopped 与 read row；该 row 只表达本机 Host instance 生命周期诊断。
-- Phase 3 state schema / row codec：创建 Session、slot、Run、Attempt 与 attempt dispatch record durable tables；typed row codec 只负责状态枚举与 SQLite row 转换。
+- Phase 3 state schema / row codec：创建 Session、slot、Run、Attempt 与 attempt dispatch record durable tables；typed row codec 与低层 helper 负责状态枚举、SQLite row 转换、Session snapshot 读取和事务内 CAS mutation。
+- Phase 3 internal lifecycle / transition primitives：在调用方提供的 `HostTransaction` 内实现 Session / slot lifecycle，以及 Run / Attempt / pending dispatch record 的低层 transition helper；EventLog fact 与 state row mutation 必须处于同一 SQLite write transaction。
 
-durable foundation 当前不实现 Host command function、Session / Run / Attempt lifecycle command、admission、promotion、cancel、recovery classifier、lease / fencing / takeover、artifact cleanup scheduler、projection、audit、outbox、ToolRuntime 或 Engine dispatch。
+durable foundation 当前不实现 public Host command facade、admission orchestration、policy provider set、queue scanning / after-commit wakeup、scheduler、lane acquire、WorkerProxy / LocalProxy / RemoteProxy、Engine dispatch、EngineEvent ingest、recovery classifier、lease / fencing / takeover、artifact cleanup scheduler、projection、audit、outbox 或 ToolRuntime。
 
 ## 校验边界
 
@@ -74,7 +75,7 @@ Host 若在后续实现中复用 `dayu.runtime.filelock`，只能把它用于普
 当前未实现：
 
 - Host command function。
-- Session / Run / Attempt 状态机、dispatch record、policy provider set、recovery classifier、lease / fencing / takeover。
+- admission service、policy provider set、queue scanning / after-commit wakeup、dispatch scheduler、WorkerProxy / LocalProxy / RemoteProxy、recovery classifier、lease / fencing / takeover。
 - artifact cleanup scheduler 与 diagnostics table。
 - ToolRuntime construction、ToolRuntime policy resolution、framework tool injection。
 - ToolsDiscovery / ScenePrepare provider contract、tool profile registry、Attempt tool snapshot durability。
@@ -91,4 +92,4 @@ python -m pyright dayu/host tests/host
 
 测试覆盖包根导出白名单、枚举字符串值、请求校验失败路径、Host tooling options 校验、Host import 边界与弱类型守卫。
 
-durable foundation 测试覆盖 SQLite schema bootstrap / transaction runner、EventLog append / read / idempotency、payload descriptor、local artifact helper、host instance liveness、EventLog 多进程 sequence smoke，以及 Host 包根不导出 durable 内部模块。
+durable foundation 测试覆盖 SQLite schema bootstrap / transaction runner、EventLog append / read / idempotency、payload descriptor、local artifact helper、host instance liveness、EventLog 多进程 sequence smoke、Session lifecycle、Run / Attempt transition primitive，以及 Host 包根不导出 durable 内部模块。
