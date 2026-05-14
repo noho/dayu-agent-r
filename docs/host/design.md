@@ -645,6 +645,25 @@ governance truth 只能由 Host transaction 写入。derived state index 可以�
 
 Durable table ownership 跟随语义 owner，而不是跟随实现先后顺序。SQLite / transaction runner / EventLog / payload descriptor / idempotency / host instance liveness 是 durable foundation；Session / Run / Attempt / active index / queue index 属于状态机与 admission；wait record 属于 Tool Awaiting；projection checkpoint、audit、tool trace、outbox、memory snapshot、context artifacts、purge tombstone 等表属于各自 projection 或治理模块。实现不得创建无语义 owner 的空表，也不得让 projection 表成为 governance truth。
 
+SQLite schema convention：
+
+- 第一版 Host durable store 使用单个 SQLite 数据库文件作为 Host 本地治理真源。`dayu.runtime.lane` 的 runtime lane DB 仍是独立 runtime coordinator，不得复用 Host durable store。
+- 第一版按全新 schema 起库处理。bootstrap 只负责 fresh DB schema creation 与幂等校验，不提供旧库兼容读取、兼容迁移或旧 schema fallback。
+- bootstrap 必须设置并校验 `PRAGMA user_version`，用于标识当前 Host durable schema version。schema version 不匹配时必须结构化失败，不得静默按旧 schema 运行。
+- durable ids 使用 TEXT 存储稳定业务标识，例如 `session_id`、`run_id`、`attempt_id`、`execution_id`、`event_id`、`host_instance_id`。`event_sequence` 是 EventLog 的全局 INTEGER cursor，不替代这些业务 id。
+- durable timestamp 使用 UTC ISO-8601 TEXT 存储，必须规范化为 UTC、固定微秒精度并使用 `Z` 后缀。schema、reader 和 tests 不得混用本地时区、naive datetime、Unix timestamp integer 或多种 timestamp 表达。
+- JSON payload、policy decision、reason、actor、source、diagnostic refs 等结构化字段以确定性 canonical JSON TEXT 存储；digest 计算必须基于同一 canonicalization，不能依赖 Python dict 插入顺序或数据库返回顺序。
+- 外键约束必须开启。能够由 schema 表达的唯一性必须用显式 unique index 或 primary key 表达；不能只依赖 application-side check。
+- 每个 foundation table 必须有明确语义 owner。不得为了后续 phase 预创建空的 Session / Run / Attempt / wait / projection / outbox / memory / purge tables。
+
+SQLite transaction runner：
+
+- Host mutating command 使用短 write transaction。write transaction 必须显式进入 `BEGIN IMMEDIATE`，避免在写入中途才升级锁导致不确定失败。
+- Host durable connection 必须启用 WAL、`foreign_keys=ON` 和明确 busy timeout；这些属于 Host storage policy，不复用 runtime lane 的 SQLite 配置。
+- retry policy 只包裹短事务级 SQLite busy / locked 类失败，并必须有有限重试次数和退避。唯一约束冲突、外键错误、schema mismatch、payload digest mismatch、idempotency conflict、CAS precondition failed 不得按 busy retry 处理。
+- transaction runner 必须保证 commit 成功前不会触发 after-commit wakeup。after-commit callbacks 只在 SQLite commit 成功后执行；rollback、异常或 retry 中间失败不得唤醒 projection / sink / dispatcher。
+- 长耗时工作、Engine dispatch、artifact 大文件写入、projection、audit、tool trace、memory projection 不得在 Host SQLite write transaction 内执行。事务内只做状态校验、EventLog append、foundation row 写入、必要 state index 更新和可证明短小的 payload row 写入。
+
 ### 10.1 Host Handle / Composition Root
 
 Host 公共函数接收的 `host` 是 composition root / handle，不是业务 God object。它只负责持有模块化依赖和事务入口，不把各子系统状态混成一个可变大包。
@@ -1136,13 +1155,21 @@ event_log
 
 排序与幂等：
 
-- `event_sequence` 是 SQLite 分配的全局单调序列，是所有 Host event stream cursor、projection checkpoint、outbox dispatch、audit replay 和 recovery scan 的主 cursor。
-- `event_id` 是 Host ledger event identity；`canonical_fact` 的 `event_id` 同时是 canonical event identity。重复 ingest 同一 canonical `event_id` 必须返回已接受结果，不得 append 第二条 canonical event。
+- `event_sequence` 是 SQLite 分配的全局单调 INTEGER 序列，是所有 Host event stream cursor、projection checkpoint、outbox dispatch、audit replay 和 recovery scan 的主 cursor。它只能由 Host durable store 在 append transaction 中分配；远端 sequence、client request order、projection checkpoint 或内存 counter 都不能替代它。
+- `event_id` 是 Host ledger event identity，使用 TEXT 存储并全局唯一。所有 `event_class` 都必须有 ledger identity；`canonical_fact` 的 `event_id` 同时是 canonical event identity。重复 ingest 同一 canonical `event_id` 必须返回已接受结果，不得 append 第二条 canonical event。
+- EventLog schema 必须显式约束 `event_id` 全局唯一、`event_sequence` 全局单调唯一、`event_class` 必填、`event_type` 必填。`payload_json` 为 canonical JSON TEXT；大 payload 只通过 `payload_ref` / descriptor 与 `payload_digest` 引用。
 - client operation id、remote event identity、canonical event identity 必须分层。`client_request_id` 标识客户端 API 操作幂等；remote event identity 标识 Proxy / Stub / EngineWorker 回传来源事件；canonical `event_id` 标识 Host EventLog 中单条 canonical fact。
 - 一个 remote event 如果映射为多个 canonical events，每个 canonical event 都必须有独立、稳定、可去重的 identity，例如由 `execution_id`、remote event identity、canonical event type 与 sub-index 派生。Host-generated state transition event 也必须有明确幂等来源，不能混用 `client_request_id` 或 remote event identity。
 - `run_sequence` / `session_sequence` 可作为 read model 优化，但不得替代全局 `event_sequence`。
 - `stream_run_events(run_id, cursor)` 使用全局 `event_sequence` cursor 过滤目标 run，保证断线重连稳定补读。
 - 远端事件携带的 sequence 只用于 remote-side ordering / diagnostics；是否作为 `canonical_fact` 进入 EventLog 由 Host 决定，并由 Host 重新分配 `event_sequence`。
+
+idempotency record primitive：
+
+- Host durable store 提供通用幂等记录 primitive，但具体 operation 的幂等范围由对应 request / accept path 定义，不由 `HostCallContext` 统一定义。
+- 幂等记录以 `(scope_kind, scope_id, idempotency_key)` 唯一绑定一次语义输入。`scope_kind` 表达 operation 类别或 accept path 类别；`scope_id` 表达 session / run / wait / attempt / tool call 等作用域；`idempotency_key` 是调用方或 accept path 提供或确定性派生的 key。
+- 每条幂等记录必须保存 `semantic_input_digest`、`result_kind`、`result_ref`，并在适用时保存 `created_event_id` / `created_event_sequence`。重复请求命中同一 scope + key 且 semantic digest 相同，必须返回既有 accepted result ref；同一 scope + key 但 semantic digest 不同，必须返回 `idempotency_conflict`。
+- 幂等冲突是业务前置条件失败，不属于 SQLite busy / locked retry；不得通过重试、覆盖或追加第二个对象消解。
 
 Event ingest semantic contract：
 
@@ -1170,7 +1197,12 @@ canonical ingest 必须满足：
 
 - EventLog row 不应内嵌大 payload；canonical event 必须记录 payload ref / descriptor 与 digest，或其它可校验 ref。
 - 第一版使用 SQLite payload table 作为默认 durable payload store；小型 / 中型可恢复 payload 与引用它的 EventLog append 在同一 SQLite transaction 内提交。
+- Phase 2 payload foundation 支持两类最小 descriptor：`sqlite_payload` 与本地 `artifact_ref`。`sqlite_payload` 指向 SQLite payload table 中的 canonical JSON / bytes payload；`artifact_ref` 指向 Host composition root 注入的本地 artifact root 下的 durable artifact。
+- Host composition root 必须显式注入 `payload_inline_threshold_bytes` 与 artifact root。默认值只能在 construction root 应用，不能通过模块级全局变量、隐式环境变量或硬编码路径取得。
+- 小于等于 `payload_inline_threshold_bytes` 的可恢复 payload 可以作为 `sqlite_payload` 写入 SQLite payload table，并与引用它的 EventLog append 在同一 SQLite transaction 内提交。
 - 超过 Host policy 阈值的大工具结果、财报 chunk、binary、长网页正文、provider raw response、完整 prompt / messages、trace 明细必须外移到 artifact / blob / tool trace / 领域仓储，并在 artifact durable 且 digest verified 后才 append EventLog `canonical_fact`。
+- 本地 `artifact_ref` 的最小写入顺序是：先写入 artifact root 下的临时文件，完成 flush / fsync 或等价 durable 写入，计算并校验 digest，再通过 atomic rename 发布到最终相对路径，最后在 SQLite transaction 中写 payload descriptor 与 EventLog row。EventLog 不得引用未 durable、未 digest verified 或位于 artifact root 外的临时路径。
+- SQLite transaction 无法原子覆盖外部文件系统写入；因此 artifact 发布必须先于 EventLog canonical append。若 SQLite transaction 后续失败，已发布但未被 descriptor 引用的 artifact 只能作为后续 cleanup / diagnostics 处理，不能被当作 accepted fact。
 - `payload_digest`、normalized args digest、result digest 和 evidence digest 必须基于确定性序列化 / canonicalization 计算；同一语义 payload 不能因 JSON key 顺序或无关默认值产生不同 digest。
 - 会参与 resume、memory、audit、`fetch_more`、replay 的 payload / ref / descriptor 缺失或 digest 不匹配时，Host 不能把该 fact 当作 accepted fact 使用。
 - preview / diagnostic / display-only payload 可以降级丢失；其缺失只能影响展示、深度审计或 trace 细节，不能伪装成恢复必要事实。
@@ -2344,6 +2376,14 @@ dispatch_record.owner_host_instance_id
 orphan 判定必须同时证明 owner Host instance 已不可能继续治理该 Attempt，例如 pid 已不存在，或 pid 已复用但 process_start_token 不匹配，并且 heartbeat 已过期。`heartbeat_at` 单独不构成 orphan proof；进程卡顿、调试暂停或长时间阻塞不能导致其它 Host 进程误杀 active Attempt。`pid` 单独也不构成 orphan proof；pid 可能复用，必须配合 process_start_token / boot id / create time 等启动指纹。
 
 只有 positive orphan proof 成立后，才能 CAS `ATTEMPT_LOST` -> `RUN_RECOVERING` -> new Attempt。该机制不是重 lease / fencing：它不授予远端执行 ownership，不允许旧 Attempt takeover，只用于证明原 Host owner 是否已经不可能继续治理该 Attempt。
+
+Host instance liveness foundation 的最小边界：
+
+- host instance liveness record 是 durable foundation primitive，不是 lease、fencing token、Attempt owner 或 takeover grant。
+- Phase 2 只需要提供 register current instance、heartbeat current instance、mark stopping / stopped best-effort、read instance row 的持久化 primitive。
+- host instance row 最小字段包括 `host_instance_id`、`pid`、`process_start_token`、`boot_id?`、`created_at`、`heartbeat_at`、`status`。`status` 只表达本机 Host instance 的生命周期诊断，例如 `running`、`stopping`、`stopped`、`crashed_suspected`；不得被解释为远端执行 ownership。
+- heartbeat 只能刷新当前 Host instance 自己的 row；不得刷新其它 instance，也不得因 heartbeat stale 自动标记其它 instance 的 Attempt 为 `LOST`。
+- positive orphan proof classifier、dispatch record join、Attempt `LOST` CAS、Run `RECOVERING`、新 Attempt 创建属于后续 recovery / state machine phase。Phase 2 不实现 orphan classifier，不引入 lease / fencing，不允许旧 Attempt takeover。
 
 ### 27.1 已接受 Prompt 的恢复语义
 

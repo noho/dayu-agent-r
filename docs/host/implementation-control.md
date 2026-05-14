@@ -386,6 +386,13 @@ Phase 按依赖关系推进：先实现被其它阶段依赖的公共契约、ru
 - 必须确认 EventLog row、canonical event identity、event_sequence、payload descriptor 的 typed contract。
 - 必须确认 SQLite 多进程写入配置和测试策略。
 
+已确认的 Phase 2 durable foundation 决策：
+- SQLite schema convention：第一版使用单个 Host SQLite durable DB；fresh bootstrap 创建 schema 并设置 / 校验 `PRAGMA user_version`；durable ids 使用 TEXT；durable timestamp 使用 UTC ISO-8601 TEXT，固定微秒精度并使用 `Z` 后缀；结构化 JSON 使用 canonical JSON TEXT；唯一性用显式 unique index / primary key 表达；启用 foreign keys；不做旧库兼容读取、兼容迁移或旧 schema fallback。
+- Transaction runner：Host write transaction 是短事务，使用 `BEGIN IMMEDIATE`；连接启用 WAL、明确 busy timeout 与 `foreign_keys=ON`；只对 SQLite busy / locked 类短事务失败做有限 retry；唯一约束冲突、外键错误、schema mismatch、digest mismatch、idempotency conflict、CAS precondition failed 不 retry；after-commit wakeup 只在 commit 成功后触发。
+- EventLog / idempotency：`event_sequence` 是 Host durable store 分配的全局 INTEGER cursor；`event_id` 是 TEXT ledger identity 并全局唯一，所有 event class 都必须有 ledger identity；idempotency primitive 以 `(scope_kind, scope_id, idempotency_key)` 唯一绑定 `semantic_input_digest` 与 result ref，同 key 不同 digest 返回 `idempotency_conflict`。
+- Payload foundation：Phase 2 只支持 `sqlite_payload` 与本地 `artifact_ref` 最小 descriptor；Host composition root 注入 `payload_inline_threshold_bytes` 与 artifact root；大 payload 必须先 durable 写入 artifact root、digest verify、atomic rename，再在 SQLite transaction 中写 descriptor 与 EventLog。
+- Host instance liveness：Phase 2 只实现 register current instance、heartbeat current instance、mark stopping / stopped best-effort、read instance row；不实现 positive orphan proof classifier，不读取 dispatch record，不引入 lease / fencing / Attempt takeover。
+
 交付物：
 - phase design refinement
 - handoff implementation-ready plan
@@ -1254,7 +1261,7 @@ Phase 按依赖关系推进：先实现被其它阶段依赖的公共契约、ru
 
 追踪项：
 
-- Phase 2. Durable Store / EventLog / Payload Foundation 必须明确 SQLite 连接配置、WAL、busy timeout、transaction 边界、retry 策略和错误分类。
+- Phase 2. Durable Store / EventLog / Payload Foundation 已确认 SQLite 连接配置、WAL、busy timeout、transaction 边界、retry 策略和错误分类的设计边界；handoff-ready plan 必须把这些决策转成 typed API、schema、错误类型和测试断言。
 - Phase 3. Session / Run / Attempt 状态机与 Admission 的多进程测试必须覆盖同 Session 并发 `start_run`、重复 `client_request_id`、active slot admission、queue promotion、cancel / terminal race、EventLog `event_sequence` 单调性。
 - phase plan 不得把 SQLite 写竞争作为引入服务化 DB 或消息队列的默认理由。
 
@@ -1349,3 +1356,5 @@ Phase 1 implementation 收口验证：
 - `source .venv/bin/activate && python -m pyright dayu/ tests/ utils/`：0 errors。
 
 Phase 1 plan gate 通过证据：`docs/host/design.md`、`docs/host/implementation-control.md` 与 `dayu/README.md` 对 Host public typing、`ToolBundle` construction input、cross-process `dayu.runtime.lane`、`dayu.runtime.filelock`、ToolsDiscovery / ScenePrepare 的 Phase 12 destination 保持一致；AgentMiMo 与 AgentDS 的 Phase 1 design review accepted findings 已有 fix artifact 与 re-review artifact 记录；用户已确认进入 phase plan；`docs/host/phase1-public-contract-runtime-plan.md` 已生成；AgentMiMo 与 AgentDS 已完成 plan review、fix 后 re-review 并确认无剩余 finding。
+
+Phase 2 design refinement 状态：`docs/reviews/gateflow-phase-design-host-p2-codex-20260514.md` 提出的 5 个 blocking questions 已按 controller-accepted A 决策写回设计真源与本文档，fix artifact 为 `docs/reviews/gateflow-phase-design-fix-host-p2-codex-20260514.md`。AgentMiMo 与 AgentDS 的 design fix re-review artifacts 分别为 `docs/reviews/gateflow-phase-design-re-review-host-p2-mimo-20260514.md` 与 `docs/reviews/gateflow-phase-design-re-review-host-p2-ds-20260514.md`；controller adjudication artifact 为 `docs/reviews/gateflow-phase-design-re-review-host-p2-controller-adjudication-20260514.md`。Phase 2 plan 已写入 `docs/host/phase2-durable-store-eventlog-plan.md`；plan review artifacts 为 `docs/reviews/gateflow-plan-review-host-p2-durable-store-eventlog-mimo-20260514.md` 与 `docs/reviews/gateflow-plan-review-host-p2-durable-store-eventlog-ds-20260514.md`，controller adjudication artifact 为 `docs/reviews/gateflow-plan-review-host-p2-durable-store-eventlog-controller-adjudication-20260514.md`，plan fix artifact 为 `docs/reviews/gateflow-plan-fix-host-p2-durable-store-eventlog-codex-20260514.md`。AgentMiMo 与 AgentDS 的 plan re-review artifacts 分别为 `docs/reviews/gateflow-plan-re-review-host-p2-durable-store-eventlog-mimo-20260514.md` 与 `docs/reviews/gateflow-plan-re-review-host-p2-durable-store-eventlog-ds-20260514.md`；controller adjudication artifact 为 `docs/reviews/gateflow-plan-re-review-host-p2-durable-store-eventlog-controller-adjudication-20260514.md`。Phase 2 accepted plan commit 已创建；具体 hash 由当前 git commit 记录。当前 gate 为 Phase 2 Slice 1 implementation。
