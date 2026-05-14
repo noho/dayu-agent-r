@@ -11,13 +11,13 @@
 
 ## Summary
 
-Controller accepts two blocking / merge-gating issues and one low-risk maintainability fix:
+Controller accepts two blocking / merge-gating issues and one low-risk maintainability fix. The decision basis is `docs/host/design.md` and the design goals in `docs/host/implementation-control.md`; phase plan and tests are only corroborating implementation evidence.
 
 - `PR50-C-001`: accepted. Post-commit wakeup must be best-effort and must not prevent queue promotion after an active slot is released.
 - `PR50-C-002`: accepted. `git diff --check main...HEAD` must pass; current PR diff contains trailing whitespace in a review artifact.
 - `PR50-C-003`: accepted. `_require_event_sequence` should use the existing `EventLogStore` read API instead of direct SQL against `event_log`.
 
-The remaining findings are rejected or deferred because they conflict with the approved Phase 3 plan, describe future phase behavior, or request broad hardening tests beyond the PR merge gate. The updated DS finding that asks to include `resolved_execution_target` in follow-up idempotency digest is explicitly rejected because Phase 3 plan and tests deliberately require the opposite behavior.
+The remaining findings are rejected or deferred because they conflict with `docs/host/design.md`, describe future phase behavior, or request broad hardening beyond the PR merge gate. The updated DS finding that asks to include `resolved_execution_target` in follow-up idempotency digest is explicitly rejected because `docs/host/design.md` defines `SubmitFollowupRequest` without an execution target, while `StartRunRequest` explicitly owns `execution_target`; including caller-resolved target in follow-up idempotency would leak an internal routing decision into the operation semantic digest.
 
 ## Accepted Findings
 
@@ -67,23 +67,30 @@ The remaining findings are rejected or deferred because they conflict with the a
 
 - **source finding**: updated `pr-50-review-20260514-1555.md` finding 1
 - **decision**: rejected.
-- **reason**: The finding contradicts the approved Phase 3 plan. The plan explicitly requires follow-up queue idempotency digest to exclude `resolved_execution_target`; same-key same-digest retries must return the first persisted Run even if a later caller supplies a different resolved target. The field is a caller-resolved execution decision, not part of the semantic idempotency key for `submit_followup_queue`.
-- **direct plan evidence**:
+- **reason**: The finding would make `submit_followup(queue)` treat an internal resolved execution target as caller operation semantics. That conflicts with `docs/host/design.md`, where `SubmitFollowupRequest` contains `session_id`、`client_request_id`、`input`、`behavior`、`target_run_id?` and no execution target, while `StartRunRequest` explicitly contains `execution_target`. The design intent is that normal chat follow-up goes through Host admission, not caller pre-routing. Including `resolved_execution_target` in the digest would over-couple public idempotency to an internal normalization result and could create spurious conflicts across clients or retries.
+- **design-goal check**:
+  - `LLM in the loop`: Host keeps admission and target resolution under governance instead of letting caller target variation redefine the user operation.
+  - single-machine multi-client / multiprocess: same `(session_id, client_request_id)` follow-up retry remains stable even if a later caller has a different resolved target view.
+  - no overdesign: no new public semantic parameter is introduced for follow-up target routing in Phase 3.
+- **corroborating implementation evidence**:
   - `docs/host/phase3-session-run-attempt-admission-plan.md` states that follow-up queue digest excludes `resolved_execution_target`.
-  - The same plan requires repeated same-key / same-digest follow-up retries with a different later resolved target to return the first Run and not mutate `host_runs.execution_target`.
-  - `tests/host/test_admission_queue.py::test_followup_idempotency_excludes_later_resolved_execution_target` already locks this behavior.
+  - `tests/host/test_admission_queue.py::test_followup_idempotency_excludes_later_resolved_execution_target` locks this behavior.
 - **owner**: none for PR 50. If Phase 4 public command path wants a different target-resolution contract, it must reopen design discussion before changing this behavior.
 
 ### ATTACH_ACTIVE does not append an EventLog fact
 
 - **source finding**: updated `pr-50-review-20260514-1555.md` finding 3
-- **decision**: rejected.
-- **reason**: The approved Phase 3 plan explicitly states that `queue_policy=attach_active` with an active Run appends no EventLog row, creates an idempotency record with a null event ref, and returns the active Run. Adding a new canonical event would be a state/event contract change and would exceed PR review fix scope.
-- **direct plan evidence**:
+- **decision**: rejected as PR-fix scope; accepted as Phase 4 design clarification tracking.
+- **reason**: `docs/host/design.md` says `attach_active` returns the active Run and does not trigger new execution. It does not define a dedicated `USER_INPUT_ATTACHED` event or specify that the attached request input becomes model input for the active Run. Adding a new canonical EventLog fact in PR review would be a state/event contract change that risks polluting RunInputBuilder input semantics and memory/audit projections. That would be overdesign for Phase 3 and would weaken the stable "no new execution" meaning of `attach_active`.
+- **design nuance**: `docs/host/design.md` also says EventLog is the fact truth and lists `USER_INPUT_ACCEPTED` as "创建或关联 Run 输入". That wording can be read broadly. Because the design does not freeze an attach-active canonical event shape, the correct controller action is not to invent one during PR fix, but to track a Phase 4 public API / read-model clarification.
+- **design-goal check**:
+  - `LLM in the loop`: no new user input is injected into an already running Attempt without a defined steer/follow-up governance path.
+  - remote/local parity: avoiding an implicit attach event prevents later LocalProxy / RemoteProxy ingest from needing to special-case an unowned event.
+  - no overdesign: no new event type or projection semantics are introduced before the public command path phase.
+- **corroborating implementation evidence**:
   - `docs/host/phase3-session-run-attempt-admission-plan.md` defines attach-active result refs with null event ref.
-  - The plan pseudocode says attach-active records the idempotency result and skips the final `USER_INPUT_ACCEPTED` event step because no new Run or canonical fact is created.
   - `tests/host/test_admission_queue.py::test_reject_and_attach_active_have_expected_event_and_idempotency_effects` asserts the no-EventLog side effect behavior.
-- **owner**: none for PR 50. Phase 4 may revisit public audit wording only through design discussion.
+- **owner**: Phase 4 Host Public API Command Path owner must clarify whether `attach_active` needs public audit/read-model representation and, if yes, update `docs/host/design.md` before implementation.
 
 ### Broad failure-path test coverage list
 
@@ -100,7 +107,7 @@ The remaining findings are rejected or deferred because they conflict with the a
   - `pr-50-review-20260514-1555.md` finding 4
   - `pr-50-review-20260514-1604.md` finding 7
 - **decision**: rejected for Phase 3, deferred to Phase 5 EngineEvent ingest owner.
-- **reason**: The approved Phase 3 plan explicitly states that `internal_terminal_closeout` is not a public command and tests may call it without idempotency. If a later production owner needs idempotent terminal ingest, that owner must define the operation idempotency contract.
+- **reason**: `docs/host/design.md` defines idempotent event ingest for EngineEvent / ToolRuntime accept paths, but Phase 3 only exposes an internal terminal closeout helper to validate state-index convergence before EngineEvent ingest exists. Making it production-idempotent now would pre-decide the later EngineEvent identity contract and overdesign Phase 3.
 - **owner**: Phase 5 RunInputBuilder 与本地执行 Dispatch / EngineEvent ingest owner.
 
 ### Cancel CAS status code inconsistency

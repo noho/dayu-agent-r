@@ -1299,6 +1299,7 @@ Phase 按依赖关系推进：先实现被其它阶段依赖的公共契约、ru
 - Phase 4 public API owner 必须把 internal admission service 接入 public Host command facade；P3-S4 不导出 public facade。
 - P3-S6 owner 已补充低层 durable 多进程 cancel / promotion race；P3-S5 已覆盖单进程 rollback 不触发 wakeup / promotion。
 - Phase 4 public API owner 必须在 public command facade wiring 后补充 API 级 queued cancel / promotion race 覆盖；P3-S6 只验证内部 durable first-committer-wins，不覆盖 public facade 入口。
+- Phase 4 public API owner 必须澄清 `attach_active` 的 public audit / read-model 表达：若需要把 attach-active request 作为可查询事实呈现，必须先更新 `docs/host/design.md` 明确 canonical event shape，不能在 Phase 3 PR fix 中临时发明 EventLog 事件。
 - Phase 5 / later dispatch owner 必须补充 dispatch 非 pending、dispatching / active worker cancel propagation、wait cancellation 与 recovery cancellation；P3-S5 只覆盖 queued cancel 与 pre-dispatch STARTING cancel。
 - Phase 5. RunInputBuilder 与本地执行 Dispatch owns scheduler、lane acquire、dispatch record `dispatching`、WorkerProxy / LocalProxy、Engine dispatch、`ATTEMPT_RUNNING` 与 EngineEvent ingest startup 边界。
 - Phase 5 scheduler / wakeup owner 必须定义 after-commit promotion 独立事务失败后的重试或扫描路径；Phase 3 只保证失败不会回滚已提交的 terminal / cancel 主事务，queued Run 可留待后续 wakeup。
