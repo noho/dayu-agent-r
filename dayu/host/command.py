@@ -354,6 +354,10 @@ def cancel_run(
 ) -> RunSnapshot:
     """取消单个 Run，并返回最新 Run snapshot。
 
+    Phase 4 只覆盖 queued 与 pre-dispatch ``STARTING``；dispatching /
+    active worker 取消由 Phase 5 负责，``WAITING`` 取消由 Phase 7 负责，
+    ``RECOVERING`` 取消由 Phase 11 负责。
+
     :param host: Host command handle。
     :param run_id: 目标 Run id。
     :param request: cancel run 请求。

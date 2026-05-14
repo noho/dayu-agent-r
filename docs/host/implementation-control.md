@@ -1494,7 +1494,21 @@ limit 测试鲁棒性 finding。Fix 已完成并通过 re-review；AgentMiMo 与
 artifact 为 `docs/reviews/gateflow-code-re-review-host-p4-s4-read-stream-deferred-controller-adjudication-20260514.md`。
 两份 re-review 均确认 fixed / no blocking finding。P4-S4 validation：`pytest tests/host/test_public_event_stream.py tests/host/test_public_run_api.py tests/host -q`
 201 passed，`python -m pyright dayu/host tests/host` 0 errors，`git diff --check` passed。P4-S4 accepted slice commit 为
-`34b1207`。Phase 4 implementation slices 全部完成，当前 gate 为 Phase 4 aggregate deepreview。
+`34b1207`。Phase 4 aggregate deepreview artifacts 为
+`docs/reviews/gateflow-aggregate-deepreview-host-p4-public-api-command-path-mimo-20260514.md` 与
+`docs/reviews/gateflow-aggregate-deepreview-host-p4-public-api-command-path-ds-20260514.md`；两份 review 均无
+blocking finding。MiMo F-1 已通过
+`docs/reviews/gateflow-aggregate-fix-host-p4-public-api-command-path-20260514.md` 修复，明确补强 `cancel_run` 对
+Phase 5 / 7 / 11 deferred cancel owner 的提醒；aggregate re-review artifacts 为
+`docs/reviews/gateflow-aggregate-re-review-host-p4-public-api-command-path-mimo-20260514.md` 与
+`docs/reviews/gateflow-aggregate-re-review-host-p4-public-api-command-path-ds-20260514.md`；controller aggregate
+re-review adjudication artifact 为
+`docs/reviews/gateflow-aggregate-re-review-host-p4-public-api-command-path-controller-adjudication-20260514.md`。
+两份 re-review 均确认 fixed / no blocking finding。Aggregate fix validation：`pytest tests/host -q` 201 passed，
+`python -m pyright dayu/host tests/host` 0 errors，`git diff --check` passed。当前 gate 为 Phase 4 accepted deepreview
+commit；accepted deepreview commit 后进入 ready-to-create-PR 路径。后续 Phase 5 / 7 / 11 必须继续补齐
+dispatching / active worker、`WAITING`、`RECOVERING` 的 per-run 与 session-scope cancel，不得把 Phase 4 queued /
+pre-dispatch `STARTING` 子集写成最终语义。
 
 历史状态：Phase 1 公共契约与 runtime 基础设施已完成并 merge；Phase 2 Durable Store / EventLog / Payload Foundation 已完成 plan、3 个 implementation slices、aggregate deepreview、aggregate fix、aggregate re-review 与 accepted deepreview commit，本 phase 状态为 completed。Phase 1 design refinement 已写入 `docs/reviews/gateflow-phase-design-host-p1-codex-20260513.md`，controller-accepted design fix 已写入 `docs/reviews/gateflow-phase-design-fix-host-p1-codex-20260513.md`。用户反馈后的 design fixes 已写入 `docs/reviews/gateflow-phase-design-user-feedback-fix-host-p1-codex-20260513.md` 与 `docs/reviews/gateflow-phase-design-user-feedback-fix2-host-p1-codex-20260513.md`。AgentMiMo 与 AgentDS 的 phase design re-review 均确认 accepted findings 已修复且 new blocker 为 0；round2 re-review 进一步确认 lane 已改为 cross-process runtime capacity guard，Phase Map 已重排为 P12 ToolsDiscovery / ScenePrepare、P13 Audit / Tool Trace / Outbox、P14 RemoteProxy、P15 Retention / Purge。Phase 1 plan 已写入 `docs/host/phase1-public-contract-runtime-plan.md`；plan review、controller adjudication、plan fix 与 plan re-review artifacts 已写入 `docs/reviews/`。AgentMiMo 与 AgentDS 的 plan re-review 均确认 finding 数量为 0、blocking finding 数量为 0。用户已确认 Phase 1 plan；accepted plan commit 为 `34b1b41`。Phase 1 Slice 1 accepted slice commit 为 `66d8dc3`，Slice 2 accepted slice commit 为 `27e0d8b`，Slice 3 accepted slice commit 为 `e23e3e4`，Slice 4 accepted slice commit 为 `0393a22`。
 
