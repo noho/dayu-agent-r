@@ -430,25 +430,32 @@ Phase 按依赖关系推进：先实现被其它阶段依赖的公共契约、ru
 - `docs/host/design.md` §8 Attempt 生命周期
 - `docs/host/design.md` §9 Admission 与多进程并发
 - `docs/host/design.md` §9.1 状态迁移契约
+- `docs/host/design.md` §10 Durable Store
 
 前置条件：
 - Phase 2 durable store 与 EventLog foundation 已完成。
 
 进入条件：
-- 确认状态迁移表是否足够直接生成 typed transition service 与测试矩阵；确认形式为用户确认，或 `docs/host/design.md` 对应章节已细化到可直接生成 typed transition contract / test matrix。
+- Phase 3 design refinement 的 BQ1 / BQ2 / BQ3 已由 controller 裁决并经用户确认。
+- `docs/host/design.md` 已写回 Phase 3 owned transition subset 与 durable state / index contract。
+- 当前状态仍是 design fix / write-back；完成 design re-review 且无 blocking question 后，才允许进入 plan gate。
 
 范围：
-- 允许修改：Session / Session slot tables、Run / Attempt tables、active index、queue index、transition service、admission service、promotion service。
-- 禁止修改：Engine dispatch、ToolRuntime、Projection、Remote transport。
+- 允许修改：Session / Session slot tables、Run / Attempt tables、minimal dispatch record row、active index、queue index、transition service、admission service、promotion service。
+- 禁止修改：Engine dispatch、ToolRuntime、Projection、Remote transport、dispatch scheduler、lane acquire、WorkerProxy、LocalProxy、RemoteProxy。
 
 不做：
 - 不启动 Engine。
 - 不实现 public API 全量 facade。
 - 不实现 recovery scan。
+- 不实现 EngineEvent ingest、Tool awaiting、`resolve_wait`、steer、retry / replay、context compaction。
+- 不把 dispatch record 推进到 `dispatching`，不 append `ATTEMPT_RUNNING`。
 
 关键设计问题：
-- 必须确认每个 transition 的前置状态、终态、canonical events 与同事务索引更新。
-- 必须确认 queued Run 不占 active slot、promotion 触发点与多进程 CAS 语义。
+- 已确认 Phase 3 创建 minimal dispatch intent / dispatch record row，但只写 `pending` / `cancelled`；scheduler、lane acquire、WorkerProxy、LocalProxy、RemoteProxy、Engine dispatch 与 `ATTEMPT_RUNNING` 属于 Phase 5 或后续。
+- 已确认 Phase 3 必须补齐 durable state / index / CAS / idempotency contract；active Run invariant 第一版优先采用 SQLite partial unique index on active Run statuses。
+- 已确认 Phase 3 只覆盖 Session lifecycle、start / follow-up admission、queue promotion、cancel queued、cancel pre-dispatch starting、internal terminal closeout helper、terminal / cancel 后 promotion trigger；跨 phase matrix 行只作为 future-owner references。
+- 若 plan agent 发现 operation idempotency scope / digest / result ref、CAS preconditions 或 dispatch record row contract 仍不足以直接实现，必须停下交给 controller，不得自行选择。
 
 交付物：
 - phase design refinement
@@ -465,15 +472,17 @@ Phase 按依赖关系推进：先实现被其它阶段依赖的公共契约、ru
 验证要求：
 - unit tests: state transition matrix。
 - integration tests: 同 Session 并发 start / follow-up / queue promotion。
+- multi-process tests: 同 slot 并发 `ensure_session` 返回同一 Session 且不产生调用方可见孤儿 Session；同 Session 并发 start / follow-up 至多一个 active Run；重复 `(session_id, client_request_id)` 返回同一 Run，digest 不同则结构化冲突；active Run 存在时 follow-up queue 生成按 accepted `event_sequence` FIFO 的 durable queued Run；terminal / cancel 释放 active slot 后只 promotion 一个 queued Run；cancel queued 与 promotion 遵循 first-committer-wins；cancel pre-dispatch starting 将 dispatch record 标记为 `cancelled` 且不 dispatch；EventLog `event_sequence` 跨进程全局单调。
 - pyright: Host state 模块通过。
 - docs: Host README 按触发规则同步。
 
 退出条件：
-- Host 可以在不启动 Engine 的情况下正确接受、排队、启动、取消和终态收口 Run / Attempt state indexes。
+- Host 可以在不启动 Engine 的情况下正确接受、排队、启动、取消 queued / pre-dispatch starting，并通过内部 terminal closeout helper 收口 Run / Attempt state indexes 与触发 promotion。
+- Phase 3 implementation artifact 必须明确未实现 Engine dispatch、WorkerProxy、LocalProxy、RemoteProxy、EngineEvent ingest、Tool awaiting、recovery，并把它们转交给对应后续 phase。
 
 后续依赖：
-- 后续 phase 可依赖的稳定契约：active Run admission、durable queue、promotion、CAS transition service。
-- 需要追踪到后续 phase 的事项：dispatch、worker event ingest、recovery 会复用本 phase 状态机。
+- 后续 phase 可依赖的稳定契约：Session / slot lifecycle、active Run admission、durable queue、promotion、CAS transition service、Attempt STARTING + dispatch record pending startup truth。
+- 需要追踪到后续 phase 的事项：Phase 5 owns scheduler、lane acquire、WorkerProxy / LocalProxy、Engine dispatch、dispatch record `dispatching` 与 `ATTEMPT_RUNNING`；Phase 11 owns recovery scan、positive orphan proof、RECOVERING dispatch；其它 cross-phase matrix rows 由对应 phase owner 接入。
 
 ### Phase 4. Host Public API Command Path
 
@@ -1265,6 +1274,24 @@ Phase 按依赖关系推进：先实现被其它阶段依赖的公共契约、ru
 - Phase 3. Session / Run / Attempt 状态机与 Admission 的多进程测试必须覆盖同 Session 并发 `start_run`、重复 `client_request_id`、active slot admission、queue promotion、cancel / terminal race、EventLog `event_sequence` 单调性。
 - phase plan 不得把 SQLite 写竞争作为引入服务化 DB 或消息队列的默认理由。
 
+#### Phase 3 Dispatch Intent / State Index 决策追踪
+
+背景决议：
+
+- Phase 3 design refinement review 提出的 BQ1 / BQ2 / BQ3 已由 controller 裁决为 accepted，并经用户确认进入 design fix / write-back。
+- Phase 3 创建 minimal dispatch intent / dispatch record row，作为 `ATTEMPT_STARTED` startup truth 的一部分；Phase 3 只写 `pending` 与 `cancelled`。
+- active Run invariant 第一版优先采用 SQLite partial unique index on active Run statuses，让 active truth 跟随 `runs.status`。
+- queue FIFO truth 是 queued Run 的 accepted `event_sequence`，不是内存队列或 after-commit wakeup 顺序。
+- operation idempotency 的 scope、digest、result refs 必须在 Phase 3 plan / implementation 前按 operation 固定。
+
+追踪项：
+
+- Phase 3 plan gate 前必须完成 design fix re-review；若 re-review 发现 dispatch record、active index、CAS loser 语义或 idempotency operation contract 仍不足以直接生成实现，继续停留在 design refinement，不得进入 plan gate。
+- Phase 3 implementation 不得实现 scheduler、lane acquire、WorkerProxy、LocalProxy、RemoteProxy、Engine dispatch、dispatch record `dispatching` 或 `ATTEMPT_RUNNING`。
+- Phase 5. RunInputBuilder 与本地执行 Dispatch owns scheduler、lane acquire、dispatch record `dispatching`、WorkerProxy / LocalProxy、Engine dispatch、`ATTEMPT_RUNNING` 与 EngineEvent ingest startup 边界。
+- Phase 11. Host Lifecycle / Recovery / Multi-process Hardening owns dispatch record recovery join、positive orphan proof、RECOVERING dispatch、startup recovery scan 与多进程 hardening。
+- Tool awaiting / `resolve_wait` owner 为 Phase 7；steer、retry / replay、context compaction 分别由其对应 phase plan 接入，不得由 Phase 3 提前实现。
+
 #### Phase 1 Runtime Lane 风险追踪
 
 结论：
@@ -1388,3 +1415,7 @@ Phase 1 implementation 收口验证：
 Phase 1 plan gate 通过证据：`docs/host/design.md`、`docs/host/implementation-control.md` 与 `dayu/README.md` 对 Host public typing、`ToolBundle` construction input、cross-process `dayu.runtime.lane`、`dayu.runtime.filelock`、ToolsDiscovery / ScenePrepare 的 Phase 12 destination 保持一致；AgentMiMo 与 AgentDS 的 Phase 1 design review accepted findings 已有 fix artifact 与 re-review artifact 记录；用户已确认进入 phase plan；`docs/host/phase1-public-contract-runtime-plan.md` 已生成；AgentMiMo 与 AgentDS 已完成 plan review、fix 后 re-review 并确认无剩余 finding。
 
 Phase 2 design refinement 状态：`docs/reviews/gateflow-phase-design-host-p2-codex-20260514.md` 提出的 5 个 blocking questions 已按 controller-accepted A 决策写回设计真源与本文档，fix artifact 为 `docs/reviews/gateflow-phase-design-fix-host-p2-codex-20260514.md`。AgentMiMo 与 AgentDS 的 design fix re-review artifacts 分别为 `docs/reviews/gateflow-phase-design-re-review-host-p2-mimo-20260514.md` 与 `docs/reviews/gateflow-phase-design-re-review-host-p2-ds-20260514.md`；controller adjudication artifact 为 `docs/reviews/gateflow-phase-design-re-review-host-p2-controller-adjudication-20260514.md`。Phase 2 plan 已写入 `docs/host/phase2-durable-store-eventlog-plan.md`；plan review artifacts 为 `docs/reviews/gateflow-plan-review-host-p2-durable-store-eventlog-mimo-20260514.md` 与 `docs/reviews/gateflow-plan-review-host-p2-durable-store-eventlog-ds-20260514.md`，controller adjudication artifact 为 `docs/reviews/gateflow-plan-review-host-p2-durable-store-eventlog-controller-adjudication-20260514.md`，plan fix artifact 为 `docs/reviews/gateflow-plan-fix-host-p2-durable-store-eventlog-codex-20260514.md`。AgentMiMo 与 AgentDS 的 plan re-review artifacts 分别为 `docs/reviews/gateflow-plan-re-review-host-p2-durable-store-eventlog-mimo-20260514.md` 与 `docs/reviews/gateflow-plan-re-review-host-p2-durable-store-eventlog-ds-20260514.md`；controller adjudication artifact 为 `docs/reviews/gateflow-plan-re-review-host-p2-durable-store-eventlog-controller-adjudication-20260514.md`。Phase 2 accepted plan commit 为 `83c6ad6`。Slice 1 implementation artifact 为 `docs/reviews/gateflow-implementation-host-p2-s1-durable-schema-transaction-20260514.md`，controller implementation decision artifact 为 `docs/reviews/gateflow-implementation-decision-host-p2-s1-sqlite-payload-table-name-20260514.md`。AgentMiMo 与 AgentDS 的 Slice 1 code review artifacts 分别为 `docs/reviews/gateflow-code-review-host-p2-s1-durable-schema-transaction-mimo-20260514.md` 与 `docs/reviews/gateflow-code-review-host-p2-s1-durable-schema-transaction-ds-20260514.md`；controller adjudication artifact 为 `docs/reviews/gateflow-code-review-host-p2-s1-durable-schema-transaction-controller-adjudication-20260514.md`。Slice 1 validation：durable schema / transaction tests 15 passed，Host export / import boundary / weak typing guard tests 7 passed，`python -m pyright dayu/host tests/host` 0 errors；accepted Slice 1 commit 为 `be5dbdc`。Slice 2 implementation artifact 为 `docs/reviews/gateflow-implementation-host-p2-s2-eventlog-idempotency-20260514.md`；code review artifacts 为 `docs/reviews/gateflow-code-review-host-p2-s2-eventlog-idempotency-mimo-20260514.md` 与 `docs/reviews/gateflow-code-review-host-p2-s2-eventlog-idempotency-ds-20260514.md`；controller adjudication artifact 为 `docs/reviews/gateflow-code-review-host-p2-s2-eventlog-idempotency-controller-adjudication-20260514.md`；fix artifact 为 `docs/reviews/gateflow-fix-host-p2-s2-eventlog-idempotency-20260514.md`；code re-review artifacts 为 `docs/reviews/gateflow-code-re-review-host-p2-s2-eventlog-idempotency-mimo-20260514.md` 与 `docs/reviews/gateflow-code-re-review-host-p2-s2-eventlog-idempotency-ds-20260514.md`；controller re-review adjudication artifact 为 `docs/reviews/gateflow-code-re-review-host-p2-s2-eventlog-idempotency-controller-adjudication-20260514.md`。Slice 2 validation：EventLog / Idempotency tests 19 passed，多进程 EventLog smoke 1 passed，durable schema / transaction tests 15 passed，Host export / import boundary / weak typing guard tests 7 passed，`python -m pyright dayu/host tests/host` 0 errors。Phase 2 accepted Slice 2 commit 已创建；具体 hash 由当前 git commit 记录。Slice 3 implementation artifact 为 `docs/reviews/gateflow-implementation-host-p2-s3-payload-artifact-liveness-20260514.md`；code review artifacts 为 `docs/reviews/gateflow-code-review-host-p2-s3-payload-artifact-liveness-mimo-20260514.md` 与 `docs/reviews/gateflow-code-review-host-p2-s3-payload-artifact-liveness-ds-20260514.md`；controller adjudication artifact 为 `docs/reviews/gateflow-code-review-host-p2-s3-payload-artifact-liveness-controller-adjudication-20260514.md`；fix artifact 为 `docs/reviews/gateflow-fix-host-p2-s3-payload-artifact-liveness-20260514.md`；code re-review artifacts 为 `docs/reviews/gateflow-code-re-review-host-p2-s3-payload-artifact-liveness-mimo-20260514.md` 与 `docs/reviews/gateflow-code-re-review-host-p2-s3-payload-artifact-liveness-ds-20260514.md`；controller re-review adjudication artifact 为 `docs/reviews/gateflow-code-re-review-host-p2-s3-payload-artifact-liveness-controller-adjudication-20260514.md`。Slice 3 validation：payload / artifact / liveness tests 27 passed，EventLog / idempotency / multiprocess tests 20 passed，Host tests 94 passed，`python -m pyright dayu/host tests/host` 0 errors。Phase 2 accepted Slice 3 commit 已创建；具体 hash 由当前 git commit 记录。Aggregate deepreview artifacts 为 `docs/reviews/gateflow-aggregate-deepreview-host-p2-durable-store-eventlog-mimo-20260514.md` 与 `docs/reviews/gateflow-aggregate-deepreview-host-p2-durable-store-eventlog-ds-20260514.md`；controller aggregate adjudication artifact 为 `docs/reviews/gateflow-aggregate-deepreview-host-p2-durable-store-eventlog-controller-adjudication-20260514.md`；aggregate fix artifact 为 `docs/reviews/gateflow-aggregate-fix-host-p2-durable-store-eventlog-20260514.md`；aggregate re-review artifacts 为 `docs/reviews/gateflow-aggregate-re-review-host-p2-durable-store-eventlog-mimo-20260514.md` 与 `docs/reviews/gateflow-aggregate-re-review-host-p2-durable-store-eventlog-ds-20260514.md`；controller aggregate re-review adjudication artifact 为 `docs/reviews/gateflow-aggregate-re-review-host-p2-durable-store-eventlog-controller-adjudication-20260514.md`。Aggregate fix validation：Host tests 101 passed，runtime import/lane/filelock tests 29 passed，`python -m pyright dayu/host tests/host` 0 errors，`python -m pyright dayu/ tests/ utils/` 0 errors。Phase 2 accepted deepreview commit 已创建；具体 hash 由当前 git commit 记录。Phase 2 状态为 completed，后续工作入口为 Phase 3 design discussion / plan gate。
+
+Phase 3 design refinement 状态：`docs/reviews/gateflow-phase-design-host-p3-codex-20260514.md` 提出的 BQ1 / BQ2 / BQ3 已由 controller 在 `docs/reviews/gateflow-phase-design-host-p3-controller-adjudication-20260514.md` 中裁决为 accepted，并已获得用户确认。Design fix artifact 为 `docs/reviews/gateflow-phase-design-fix-host-p3-codex-20260514.md`。AgentMiMo design fix re-review artifact 为 `docs/reviews/gateflow-phase-design-re-review-host-p3-mimo-20260514.md`；其提出的 F1 已通过 `docs/reviews/gateflow-phase-design-additional-fix-host-p3-f1-codex-20260514.md` 修复，并由 `docs/reviews/gateflow-phase-design-additional-re-review-host-p3-f1-mimo-20260514.md` 确认 fixed。Controller design re-review adjudication artifact 为 `docs/reviews/gateflow-phase-design-re-review-host-p3-controller-adjudication-20260514.md`。
+
+Phase 3 plan gate 状态：Phase 3 plan 已写入 `docs/host/phase3-session-run-attempt-admission-plan.md`。AgentMiMo plan review artifact 为 `docs/reviews/gateflow-plan-review-host-p3-session-run-attempt-admission-mimo-20260514.md`，controller adjudication artifact 为 `docs/reviews/gateflow-plan-review-host-p3-session-run-attempt-admission-controller-adjudication-20260514.md`。Plan fix artifact 为 `docs/reviews/gateflow-plan-fix-host-p3-session-run-attempt-admission-codex-20260514.md`。AgentMiMo plan re-review artifact 为 `docs/reviews/gateflow-plan-re-review-host-p3-session-run-attempt-admission-mimo-20260514.md`；controller re-review adjudication artifact 为 `docs/reviews/gateflow-plan-re-review-host-p3-session-run-attempt-admission-controller-adjudication-20260514.md`。F1 / F2 / F3 均已确认 fixed，blocking finding 为 0。当前 gate 为 accepted plan commit；commit 后进入 Phase 3 implementation gate。
