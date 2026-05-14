@@ -20,6 +20,7 @@ from dayu.host.api import (
     SessionSnapshot,
     SessionStatus,
     SourceRunRelation,
+    TerminalResultSummary,
 )
 from dayu.host.durable._validation import (
     optional_int as _optional_int,
@@ -41,6 +42,9 @@ from dayu.host.durable.transaction import HostRow
 from dayu.host.durable.transaction import HostTransaction
 
 _StatusT = TypeVar("_StatusT", bound=StrEnum)
+_TERMINAL_RUN_STATUSES = frozenset(
+    (RunStatus.SUCCEEDED, RunStatus.FAILED, RunStatus.CANCELLED, RunStatus.LOST)
+)
 
 
 class DispatchRecordStatus(StrEnum):
@@ -1814,6 +1818,10 @@ def session_snapshot_from_rows(
 def run_snapshot_from_row(run: RunRow) -> RunSnapshot:
     """由 durable Run row 构造公共 RunSnapshot。
 
+    Phase 4 尚无 typed terminal payload decoder；终态 Run 只能稳定返回
+    status-only ``TerminalResultSummary``，不从 EventLog payload 字符串中做
+    ad hoc JSON 解析。
+
     :param run: durable Run row。
     :returns: 公共 Run snapshot。
     :raises ValueError: Run row 字段无法满足公共 snapshot 约束时抛出。
@@ -1824,11 +1832,32 @@ def run_snapshot_from_row(run: RunRow) -> RunSnapshot:
         session_id=run.session_id,
         status=run.status,
         current_attempt_id=run.current_attempt_id,
-        terminal_result_summary=None,
+        terminal_result_summary=_terminal_result_summary_from_status(
+            run.status
+        ),
         event_cursor=HostStreamCursor(event_sequence=_run_event_cursor(run)),
         source_run_id=run.source_run_id,
         source_run_relation=run.source_run_relation,
         outbox_summary=None,
+    )
+
+
+def _terminal_result_summary_from_status(
+    status: RunStatus,
+) -> TerminalResultSummary | None:
+    """按 Run 状态生成 public 终态摘要。
+
+    :param status: durable Run 状态。
+    :returns: 终态返回 status-only 摘要；非终态返回 ``None``。
+    :raises ValueError: status-only 终态摘要无法满足公共类型约束时抛出。
+    """
+
+    if status not in _TERMINAL_RUN_STATUSES:
+        return None
+    return TerminalResultSummary(
+        status=status,
+        summary_ref=None,
+        summary_digest=None,
     )
 
 

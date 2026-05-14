@@ -18,14 +18,11 @@ from dayu.host.api import (
     HostEventView,
     HostStreamCursor,
     RunSnapshot,
-    RunStatus,
     SessionSnapshot,
-    TerminalResultSummary,
 )
 from dayu.host.command import HostCommandHandle
 from dayu.host.durable.event_log import EventLogRow, read_events_after
 from dayu.host.durable.state import (
-    RunRow,
     read_run_by_id,
     read_session_by_id,
     read_session_slot_by_session_id,
@@ -33,10 +30,6 @@ from dayu.host.durable.state import (
     session_snapshot_from_rows,
 )
 from dayu.host.durable.transaction import HostTransaction
-
-_TERMINAL_RUN_STATUSES = frozenset(
-    (RunStatus.SUCCEEDED, RunStatus.FAILED, RunStatus.CANCELLED, RunStatus.LOST)
-)
 
 
 def get_session(host: HostCommandHandle, session_id: str) -> SessionSnapshot:
@@ -141,7 +134,7 @@ class _GetRunOperation:
                 message="Run not found",
                 retryable=False,
             )
-        return _run_snapshot_from_public_read_row(run)
+        return run_snapshot_from_row(run)
 
 
 @dataclass(frozen=True, slots=True)
@@ -204,38 +197,6 @@ def _resolve_stream_limit(limit: int | None) -> int:
             retryable=False,
         )
     return resolved
-
-
-def _run_snapshot_from_public_read_row(run: RunRow) -> RunSnapshot:
-    """把 Run row 转成 public read snapshot。
-
-    Phase 4 尚无 typed terminal payload decoder；终态 Run 只能稳定返回
-    status-only ``TerminalResultSummary``，不从 EventLog payload 字符串中做
-    ad hoc JSON 解析。
-
-    :param run: durable Run row。
-    :returns: public Run snapshot。
-    :raises ValueError: row 字段无法满足 public snapshot 约束时抛出。
-    """
-
-    base = run_snapshot_from_row(run)
-    if run.status not in _TERMINAL_RUN_STATUSES:
-        return base
-    return RunSnapshot(
-        run_id=base.run_id,
-        session_id=base.session_id,
-        status=base.status,
-        current_attempt_id=base.current_attempt_id,
-        terminal_result_summary=TerminalResultSummary(
-            status=run.status,
-            summary_ref=None,
-            summary_digest=None,
-        ),
-        event_cursor=base.event_cursor,
-        source_run_id=base.source_run_id,
-        source_run_relation=base.source_run_relation,
-        outbox_summary=None,
-    )
 
 
 def _event_view_from_row(row: EventLogRow) -> HostEventView:

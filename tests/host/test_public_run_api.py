@@ -341,9 +341,17 @@ def test_get_run_returns_durable_status_attempt_and_cursor(
         assert queued_read.status == RunStatus.QUEUED
         assert queued_read.current_attempt_id is None
         assert queued_read.event_cursor.event_sequence == queued_cursor_before_cancel
+        assert cancelled.terminal_result_summary is not None
+        assert cancelled.terminal_result_summary.status == RunStatus.CANCELLED
+        assert cancelled.terminal_result_summary.summary_ref is None
+        assert cancelled.terminal_result_summary.summary_digest is None
         assert cancelled_read.status == RunStatus.CANCELLED
         assert cancelled_read.current_attempt_id is None
         assert cancelled_read.terminal_result_summary is not None
+        assert (
+            cancelled_read.terminal_result_summary
+            == cancelled.terminal_result_summary
+        )
         assert cancelled_read.terminal_result_summary.status == RunStatus.CANCELLED
         assert cancelled_read.terminal_result_summary.summary_ref is None
         assert cancelled_read.terminal_result_summary.summary_digest is None
@@ -368,12 +376,18 @@ def test_start_run_idempotent_replay_returns_latest_snapshot_without_events(
         first = start_run(host, request)
         cancelled = cancel_run(host, first.run_id, _cancel_request("cancel-1"))
         before_replay = _event_count(options.db_path)
+        before_idempotency = _idempotency_count(options.db_path)
         replay = start_run(host, request)
 
         assert cancelled.status == RunStatus.CANCELLED
+        assert cancelled.terminal_result_summary is not None
+        assert cancelled.terminal_result_summary.status == RunStatus.CANCELLED
         assert replay.run_id == first.run_id
         assert replay.status == RunStatus.CANCELLED
+        assert replay.terminal_result_summary is not None
+        assert replay.terminal_result_summary == cancelled.terminal_result_summary
         assert _event_count(options.db_path) == before_replay
+        assert _idempotency_count(options.db_path) == before_idempotency
     finally:
         host.close()
 
