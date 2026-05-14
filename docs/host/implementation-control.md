@@ -1505,8 +1505,8 @@ Phase 5 / 7 / 11 deferred cancel owner 的提醒；aggregate re-review artifacts
 re-review adjudication artifact 为
 `docs/reviews/gateflow-aggregate-re-review-host-p4-public-api-command-path-controller-adjudication-20260514.md`。
 两份 re-review 均确认 fixed / no blocking finding。Aggregate fix validation：`pytest tests/host -q` 201 passed，
-`python -m pyright dayu/host tests/host` 0 errors，`git diff --check` passed。当前 gate 为 Phase 4 accepted deepreview
-commit；accepted deepreview commit 后进入 ready-to-create-PR 路径。后续 Phase 5 / 7 / 11 必须继续补齐
+`python -m pyright dayu/host tests/host` 0 errors，`git diff --check` passed。Phase 4 accepted deepreview commit 为
+`f8e7538`。当前 gate 为 ready-to-create-PR。后续 Phase 5 / 7 / 11 必须继续补齐
 dispatching / active worker、`WAITING`、`RECOVERING` 的 per-run 与 session-scope cancel，不得把 Phase 4 queued /
 pre-dispatch `STARTING` 子集写成最终语义。
 
