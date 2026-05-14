@@ -32,6 +32,7 @@ python -m pyright dayu/ tests/ utils/
 pytest tests/contracts -q
 pytest tests/host -q
 pytest tests/host/test_tooling_options.py tests/host/test_package_exports.py tests/host/test_import_boundary.py -q
+pytest tests/host/test_durable_schema.py tests/host/test_durable_transaction.py tests/host/test_event_log_store.py tests/host/test_event_log_multiprocess.py tests/host/test_idempotency_store.py -q
 pytest tests/runtime -q
 pytest tests/runtime/test_filelock.py tests/runtime/test_import_boundary.py -q
 pytest tests/runtime/test_lane.py tests/runtime/test_lane_multiprocess.py -q
@@ -68,11 +69,12 @@ pytest tests/engine/test_smoke_async_agent_providers.py -q
 
 ### `tests/host/`
 
-Host 公共 API 类型与 construction tooling options 测试，覆盖 `dayu.host` 的稳定边界：
+Host 公共 API 类型、construction tooling options 与内部 durable foundation 测试，覆盖 `dayu.host` 的稳定边界：
 
 - package exports：锁定 `dayu.host.__all__` 与 `dayu.host.api.__all__` 白名单，确认 tooling 类型可从包根导入但不进入 `dayu.host.api`。
 - public contracts：验证 status / error 枚举字符串值、frozen slots dataclass、结构化 `HostApiError` 与 request validation failure paths。
 - tooling options：验证 `ToolBundleSourceKind` / `FrameworkToolName` 为 `StrEnum`、默认 reserved framework tool policy、source refs 非空、业务 `ToolBundle` 不得占用 `fetch_more` 等 reserved framework tool name，以及 default policy view 不共享可变状态。
+- durable foundation：覆盖 SQLite fresh bootstrap、schema version / table constraint、transaction runner commit / rollback / after-commit / busy retry、EventLog append / read / duplicate / conflict、idempotency record / conflict，以及多进程 EventLog `event_sequence` 唯一递增 smoke。
 - import boundary：阻止 Host 公共类型层导入 Engine、Fins、Service 或 UI，并确认 business `ToolBundle` 不进入 per-run request dataclass 字段。
 - weak typing guard：通过 AST 扫描阻止 `Any`、`object`、无类型签名与裸容器注解进入 Host 公共类型源码。
 

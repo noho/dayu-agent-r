@@ -30,6 +30,19 @@
 
 默认 `FrameworkToolPolicyView` 预留 `FrameworkToolName.FETCH_MORE`，但默认不启用任何 framework tool。`HostToolingOptions` 会拒绝业务 `ToolBundle` 中与预留 framework tool 名称冲突的工具，例如 `fetch_more`。
 
+## Durable Foundation
+
+`dayu.host.durable` 是 Host 内部 durable foundation 子包，不从 `dayu.host` 包根导出，也不进入 `dayu.host.api`。
+
+当前已实现：
+
+- SQLite fresh bootstrap、schema version 校验、WAL / foreign key / busy timeout 配置与 transaction runner。
+- canonical JSON、UTC timestamp 与 sha256 digest helper。
+- EventLog append / read primitive：在调用方提供的 `HostTransaction` 内追加事件、分配全局 `event_sequence`、处理同体 `event_id` 幂等重复与异体冲突，并按 cursor 补读。
+- Idempotency primitive：以 `(scope_kind, scope_id, idempotency_key)` 绑定 `semantic_input_digest` 与显式 result ref，同 key 不同 digest 返回结构化冲突。
+
+durable foundation 当前不实现 Host command function、Session / Run / Attempt 状态机、payload descriptor 写入、artifact 写入、host instance liveness 操作、projection、audit、outbox、ToolRuntime 或 Engine dispatch。
+
 ## 校验边界
 
 所有公共 dataclass 均使用 `frozen=True, slots=True`。枚举使用 `enum.StrEnum`，字符串值为稳定的 snake_case 值。
@@ -57,7 +70,8 @@ Host 若在后续实现中复用 `dayu.runtime.filelock`，只能把它用于普
 当前未实现：
 
 - Host command function。
-- durable store、EventLog row、dispatch record、policy provider set。
+- Session / Run / Attempt 状态机、dispatch record、policy provider set。
+- payload descriptor 写入、artifact 写入、host instance liveness 操作。
 - ToolRuntime construction、ToolRuntime policy resolution、framework tool injection。
 - ToolsDiscovery / ScenePrepare provider contract、tool profile registry、Attempt tool snapshot durability。
 - Engine 调用路径、Fins 业务语义、Service / UI 装配逻辑。
@@ -72,3 +86,5 @@ python -m pyright dayu/host tests/host
 ```
 
 测试覆盖包根导出白名单、枚举字符串值、请求校验失败路径、Host tooling options 校验、Host import 边界与弱类型守卫。
+
+durable foundation 测试覆盖 SQLite schema bootstrap / transaction runner、EventLog append / read / idempotency、EventLog 多进程 sequence smoke，以及 Host 包根不导出 durable 内部模块。

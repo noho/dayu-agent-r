@@ -19,6 +19,7 @@ _UTC_TIMESTAMP_FORMAT = "%Y-%m-%dT%H:%M:%S.%fZ"
 _UTC_TIMESTAMP_PATTERN = re.compile(
     r"^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}\.\d{6}Z$"
 )
+_SHA256_DIGEST_PATTERN = re.compile(r"^sha256:[0-9a-f]{64}$")
 
 
 def canonical_json_dumps(value: JsonValue) -> str:
@@ -87,3 +88,13 @@ def sha256_digest_json(value: JsonValue) -> str:
     """
 
     return sha256_digest_bytes(canonical_json_dumps(value).encode("utf-8"))
+
+
+def is_sha256_digest(value: str) -> bool:
+    """判断字符串是否为 Host durable 标准 sha256 digest。
+
+    :param value: 待检查字符串。
+    :returns: 符合 ``sha256:<64 lowercase hex>`` 格式时返回 ``True``。
+    """
+
+    return _SHA256_DIGEST_PATTERN.fullmatch(value) is not None
