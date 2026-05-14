@@ -248,6 +248,92 @@ def test_invalid_cursor_validation_failure_path() -> None:
         HostStreamCursor(event_sequence=-1)
 
 
+def test_run_snapshot_rejects_relation_without_source_run_id() -> None:
+    """RunSnapshot.source_run_relation 不能脱离 source_run_id 单独存在。"""
+
+    with pytest.raises(ValueError, match="source_run_relation"):
+        RunSnapshot(
+            run_id="run-1",
+            session_id="session-1",
+            status=RunStatus.QUEUED,
+            current_attempt_id=None,
+            terminal_result_summary=None,
+            event_cursor=HostStreamCursor(event_sequence=0),
+            source_run_id=None,
+            source_run_relation=SourceRunRelation.RETRY,
+            outbox_summary=None,
+        )
+
+
+def test_run_snapshot_rejects_source_run_id_without_relation() -> None:
+    """RunSnapshot.source_run_id 必须同时声明 source_run_relation。"""
+
+    with pytest.raises(ValueError, match="source_run_id"):
+        RunSnapshot(
+            run_id="run-1",
+            session_id="session-1",
+            status=RunStatus.QUEUED,
+            current_attempt_id=None,
+            terminal_result_summary=None,
+            event_cursor=HostStreamCursor(event_sequence=0),
+            source_run_id="source-run-1",
+            source_run_relation=None,
+            outbox_summary=None,
+        )
+
+
+def test_followup_snapshot_steer_requires_target_run_id() -> None:
+    """steer follow-up snapshot 必须携带 target_run_id。"""
+
+    with pytest.raises(ValueError, match="target_run_id"):
+        FollowupSnapshot(
+            accepted_input_ref="input-1",
+            behavior=FollowupBehavior.STEER,
+            target_run_id=None,
+            queued_run_id=None,
+            current_cursor=HostStreamCursor(event_sequence=0),
+        )
+
+
+def test_followup_snapshot_steer_rejects_queued_run_id() -> None:
+    """steer follow-up snapshot 不得携带 queued_run_id。"""
+
+    with pytest.raises(ValueError, match="queued_run_id"):
+        FollowupSnapshot(
+            accepted_input_ref="input-1",
+            behavior=FollowupBehavior.STEER,
+            target_run_id="run-1",
+            queued_run_id="queued-run-1",
+            current_cursor=HostStreamCursor(event_sequence=0),
+        )
+
+
+def test_followup_snapshot_queue_rejects_target_run_id() -> None:
+    """queue follow-up snapshot 不得携带 target_run_id。"""
+
+    with pytest.raises(ValueError, match="target_run_id"):
+        FollowupSnapshot(
+            accepted_input_ref="input-1",
+            behavior=FollowupBehavior.QUEUE,
+            target_run_id="run-1",
+            queued_run_id="queued-run-1",
+            current_cursor=HostStreamCursor(event_sequence=0),
+        )
+
+
+def test_followup_snapshot_queue_requires_queued_run_id() -> None:
+    """queue follow-up snapshot 必须携带 queued_run_id。"""
+
+    with pytest.raises(ValueError, match="queued_run_id"):
+        FollowupSnapshot(
+            accepted_input_ref="input-1",
+            behavior=FollowupBehavior.QUEUE,
+            target_run_id=None,
+            queued_run_id=None,
+            current_cursor=HostStreamCursor(event_sequence=0),
+        )
+
+
 def test_steer_requires_target_run_id() -> None:
     """steer follow-up 必须携带 target_run_id。"""
 

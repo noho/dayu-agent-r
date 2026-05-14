@@ -145,10 +145,13 @@ implementation、review、fix 与 re-review 的项目级术语真源。包级 RE
   `Task.cancel()` 透传，controller close 会取消 pending acquire 并尽力释放当前 tokens。lane 只表达 runtime capacity
   claim，不保存 Session / Run / Attempt / EventLog / Tool / Fins 字段，也不承诺 FIFO、公平性、lease / fencing、
   Attempt owner、Host admission 或 recovery proof。
+- `filelock`：对第三方 `FileLock` 的同步 wrapper，只用于普通文件访问互斥。调用方传入显式 lock file 路径，可选择创建
+  parent directory，并通过 wrapper 自有 timeout / runtime error 语义处理 acquire / release 失败；它不提供 async wrapper、
+  stale takeover、强制 break lock 或锁文件删除。业务层不得散落 `from filelock import FileLock`，也不得用 file lock 兜底
+  数据库事务、EventLog 顺序或 Host 状态机。
 
 Host 设计要求以下层中立能力沉淀到 `dayu.runtime` 或保持为 runtime 边界约束：
 
-- `filelock`：对第三方 `FileLock` 的同步 wrapper，只用于普通文件访问互斥。调用方传入显式 lock file 路径，可选择创建 parent directory，并通过 wrapper 自有 timeout / runtime error 语义处理 acquire 失败；它不提供 async wrapper、stale takeover、强制 break lock 或锁文件删除。`dayu.runtime` 不能依赖 `dayu.engine` / `dayu.host` / `dayu.service` / `dayu.ui` / `dayu.fins` 等项目内上层 package；统一封装纯 infra 第三方依赖不违反这一边界。业务层不得散落 `from filelock import FileLock`，也不得用 file lock 兜底数据库事务、EventLog 顺序或 Host 状态机。
 - `ToolsDiscovery`：工具发现 / 注册的层中立装配边界。它可以接收外部传入的 provider / 配置绑定并产出 `ToolBundle`，但不能持有 Host 状态，不能 import 具体业务工具包，也不能决定 Run / Attempt 生命周期。具体 adapter、provider 注册生命周期和业务工具扫描不属于 Host Phase 1。
 - `ScenePrepare`：scene manifest 的层中立组装边界。它可以把 manifest 与模板输入组装为 typed scene inputs，但不能内置财报业务规则、不能 import Service / Fins / Host，也不能绕过 Service 把场景 prompt 写入 Host 状态机。具体 manifest schema、财报 prompt 文案和业务场景策略不属于 Host Phase 1。
 

@@ -21,6 +21,7 @@ from dayu.runtime.lane import (
     LaneAcquireTimedOut,
     LaneConfig,
     LaneController,
+    LaneOwner,
     RuntimeLaneClaimLostError,
     RuntimeLaneClosedError,
     RuntimeLaneConfigError,
@@ -204,6 +205,44 @@ async def test_config_validation_and_unknown_lane(tmp_path: Path) -> None:
     )
     with pytest.raises(RuntimeLaneConfigError):
         await controller.acquire(_SECOND_LANE_NAME, timeout_seconds=0)
+
+
+def test_lane_owner_rejects_empty_owner_id_and_invalid_pid() -> None:
+    """LaneOwner 必须拒绝空 owner_id 与非法 pid。"""
+
+    with pytest.raises(RuntimeLaneConfigError, match="owner_id"):
+        LaneOwner(owner_id=" ", pid=1)
+    with pytest.raises(RuntimeLaneConfigError, match="pid"):
+        LaneOwner(owner_id="owner-1", pid=0)
+
+
+@pytest.mark.asyncio
+async def test_acquire_rejects_negative_timeout(tmp_path: Path) -> None:
+    """LaneController.acquire 必须拒绝负数 timeout_seconds。"""
+
+    db_path = tmp_path / "runtime_lanes.sqlite3"
+    controller = await LaneController.open(
+        [_lane_config()],
+        coordinator=_coordinator(db_path),
+    )
+
+    with pytest.raises(RuntimeLaneConfigError, match="timeout"):
+        await controller.acquire(_LANE_NAME, timeout_seconds=-1)
+    await controller.close(reason="test-done")
+
+
+@pytest.mark.asyncio
+async def test_close_is_idempotent_when_called_twice(tmp_path: Path) -> None:
+    """LaneController.close 连续调用两次必须保持幂等。"""
+
+    db_path = tmp_path / "runtime_lanes.sqlite3"
+    controller = await LaneController.open(
+        [_lane_config()],
+        coordinator=_coordinator(db_path),
+    )
+
+    await controller.close(reason="first-close")
+    await controller.close(reason="second-close")
 
 
 @pytest.mark.asyncio

@@ -8,9 +8,12 @@ break lock / async wrapper 的公共边界。
 from __future__ import annotations
 
 from pathlib import Path
+from typing import cast
 
 import pytest
+from filelock import FileLock
 
+import dayu.runtime.filelock as filelock_module
 from dayu.runtime.filelock import (
     RuntimeFileLock,
     RuntimeFileLockError,
@@ -21,6 +24,34 @@ from dayu.runtime.filelock import (
 )
 
 _LOCK_FILE_NAME = "artifact.jsonl.lock"
+
+
+class _CountingThirdPartyLock:
+    """测试用第三方 lock 替身。"""
+
+    def __init__(self) -> None:
+        """初始化 release 调用计数。"""
+
+        self.release_calls = 0
+
+    def release(self) -> None:
+        """记录底层 release 调用。
+
+        :returns: ``None``。
+        """
+
+        self.release_calls += 1
+
+
+def _raise_marker_restore_error(_lock_path: Path) -> None:
+    """模拟 marker 恢复失败。
+
+    :param _lock_path: lock file 路径，本测试不使用。
+    :returns: 不返回；始终抛出 ``OSError``。
+    :raises OSError: 始终抛出，用于模拟 touch 失败。
+    """
+
+    raise OSError("marker restore failed")
 
 
 def _lock_path(tmp_path: Path) -> Path:
@@ -94,6 +125,33 @@ def test_release_is_idempotent(tmp_path: Path) -> None:
 
     assert token.released
     assert lock_path.exists()
+
+
+def test_release_marks_released_after_underlying_release_before_marker_failure(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """底层 release 成功后 marker 恢复失败不得向调用方抛错。"""
+
+    lock_path = _lock_path(tmp_path)
+    third_party_lock = _CountingThirdPartyLock()
+
+    monkeypatch.setattr(
+        filelock_module,
+        "_ensure_lock_file_marker_exists",
+        _raise_marker_restore_error,
+    )
+    token = RuntimeFileLockToken(
+        lock_path=lock_path,
+        third_party_lock=cast(FileLock, third_party_lock),
+    )
+
+    token.release()
+
+    assert token.released is True
+    assert third_party_lock.release_calls == 1
+    token.release()
+    assert third_party_lock.release_calls == 1
 
 
 def test_non_blocking_timeout_is_wrapped(tmp_path: Path) -> None:

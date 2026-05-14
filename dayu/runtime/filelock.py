@@ -98,10 +98,14 @@ class RuntimeFileLockToken:
 
         try:
             self._third_party_lock.release()
-            _ensure_lock_file_marker_exists(self.lock_path)
         except Exception as exc:
             raise RuntimeFileLockError("释放 runtime file lock 失败") from exc
         self.released = True
+
+        try:
+            _ensure_lock_file_marker_exists(self.lock_path)
+        except Exception:
+            pass
 
 
 class RuntimeFileLock:
