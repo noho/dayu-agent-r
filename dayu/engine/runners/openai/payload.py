@@ -24,7 +24,10 @@
 
 from __future__ import annotations
 
+import json
 from collections.abc import Mapping, Sequence
+from typing import assert_never
+
 from dayu.contracts.json_value import JsonValue
 from dayu.contracts.tool_call import GeminiToolCallState, ToolCallProviderState
 from dayu.contracts.tool_schema import ToolSchema
@@ -68,9 +71,8 @@ def _serialize_arguments(arguments: Mapping[str, JsonValue]) -> str:
 
     :param arguments: 工具调用参数。
     :returns: JSON 字符串。
+    :raises TypeError: 当 ``arguments`` 违反 JSON 值契约、无法序列化时抛出。
     """
-
-    import json
 
     return json.dumps(dict(arguments), ensure_ascii=False)
 
@@ -83,6 +85,7 @@ def _serialize_provider_state(
     :param provider_state: 强类型 provider 续航状态；为 ``None`` 表示
         不写 ``extra_content``。
     :returns: ``{"google": {"thought_signature": ...}}`` 或 ``None``。
+    :raises AssertionError: 当封闭联合出现未处理成员时抛出。
     """
 
     if provider_state is None:
@@ -91,6 +94,7 @@ def _serialize_provider_state(
         case GeminiToolCallState(thought_signature=signature):
             inner: Mapping[str, JsonValue] = {"thought_signature": signature}
             return {"google": inner}
+    assert_never(provider_state)
 
 
 def _serialize_assistant_tool_call(
@@ -122,6 +126,7 @@ def _serialize_message(message: AgentMessage) -> _OpenAIChatMessage:
 
     :param message: 任一具体消息。
     :returns: outbound 序列化形态。
+    :raises AssertionError: 当封闭联合出现未处理消息成员时抛出。
     """
 
     match message:
@@ -155,6 +160,7 @@ def _serialize_message(message: AgentMessage) -> _OpenAIChatMessage:
                 "tool_call_id": tool_call_id,
                 "content": content,
             }
+    assert_never(message)
 
 
 def _serialize_tool_schema(schema: ToolSchema) -> _OpenAIToolSchema:
@@ -194,6 +200,7 @@ def _apply_provider_request(
     :param payload: 待写入的请求 payload。
     :param provider_request: provider 请求扩展或 ``None``。
     :returns: 无返回值；原地修改 ``payload``。
+    :raises AssertionError: 当封闭联合出现未处理 provider 扩展成员时抛出。
     """
 
     if provider_request is None:
@@ -243,6 +250,8 @@ def _apply_provider_request(
             payload["enable_thinking"] = enable_thinking
             if thinking_budget is not None:
                 payload["thinking_budget"] = thinking_budget
+        case _:
+            assert_never(provider_request)
 
 
 def _top_level_thinking_enabled(enabled: bool) -> _OpenAIThinkingTopLevel:
@@ -260,6 +269,7 @@ def _reasoning_effort_value(effort: OpenAIReasoningEffort) -> str:
 
     :param effort: 推理强度枚举。
     :returns: 字符串字面量。
+    :raises AssertionError: 当枚举出现未处理成员时抛出。
     """
 
     match effort:
@@ -275,6 +285,7 @@ def _reasoning_effort_value(effort: OpenAIReasoningEffort) -> str:
             return "xhigh"
         case OpenAIReasoningEffort.NONE:
             return "none"
+    assert_never(effort)
 
 
 def _deepseek_reasoning_effort_value(effort: DeepSeekReasoningEffort) -> str:
@@ -282,6 +293,7 @@ def _deepseek_reasoning_effort_value(effort: DeepSeekReasoningEffort) -> str:
 
     :param effort: DeepSeek 推理强度枚举。
     :returns: 字符串字面量。
+    :raises AssertionError: 当枚举出现未处理成员时抛出。
     """
 
     match effort:
@@ -289,6 +301,7 @@ def _deepseek_reasoning_effort_value(effort: DeepSeekReasoningEffort) -> str:
             return "high"
         case DeepSeekReasoningEffort.MAX:
             return "max"
+    assert_never(effort)
 
 
 def _gemini_thinking_level_value(level: GeminiThinkingLevel) -> str:
@@ -296,6 +309,7 @@ def _gemini_thinking_level_value(level: GeminiThinkingLevel) -> str:
 
     :param level: Gemini thinking level 枚举。
     :returns: 字符串字面量。
+    :raises AssertionError: 当枚举出现未处理成员时抛出。
     """
 
     match level:
@@ -307,6 +321,7 @@ def _gemini_thinking_level_value(level: GeminiThinkingLevel) -> str:
             return "medium"
         case GeminiThinkingLevel.HIGH:
             return "high"
+    assert_never(level)
 
 
 def build_request_payload(

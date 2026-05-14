@@ -13,9 +13,9 @@
 - HTTP ``4xx`` 其它 → :attr:`CLIENT_ERROR`（不可重试）。
 - 其它 HTTP 状态（``1xx`` / ``3xx`` / 自定义）→ :attr:`UNKNOWN_HTTP_STATUS`。
 - :class:`asyncio.TimeoutError` / :class:`aiohttp.ServerTimeoutError`
-  / :class:`aiohttp.ClientPayloadError`（超时类）→ :attr:`TIMEOUT`。
-- :class:`aiohttp.ClientConnectionError` / 其它 :class:`aiohttp.ClientError`
-  → :attr:`NETWORK_ERROR`。
+  → :attr:`TIMEOUT`。
+- :class:`aiohttp.ClientConnectionError` / :class:`aiohttp.ClientPayloadError`
+  / 其它 :class:`aiohttp.ClientError` → :attr:`NETWORK_ERROR`。
 """
 
 from __future__ import annotations
@@ -106,7 +106,7 @@ def detect_context_overflow(
     :raises Exception: 不主动抛出异常。
     """
 
-    if http_status < 400 or http_status >= 500:
+    if http_status < 400 or http_status >= 600:
         return False
     payload = _parse_json_object(response_text)
     if payload is not None:

@@ -60,7 +60,12 @@ _LOGGER: logging.Logger = logging.getLogger(__name__)
 
 
 def _make_event(data: RunnerEventData) -> RunnerEvent:
-    """包装为 :class:`RunnerEvent`。"""
+    """包装为 :class:`RunnerEvent`。
+
+    :param data: Runner 事件载荷。
+    :returns: 带当前 UTC 时间戳的 :class:`RunnerEvent`。
+    :raises KeyError: 当 ``data`` 不是非流式 parser 支持的事件载荷时抛出。
+    """
 
     occurred_at = datetime.now(tz=timezone.utc)
     type_map: dict[type, RunnerEventType] = {
@@ -184,7 +189,14 @@ def _emit_from_dict(
     hook: _ReasoningProtocolHook,
     provider_request_id: str | None,
 ) -> Iterator[RunnerEvent]:
-    """从顶层 JSON 对象产出事件序列。"""
+    """从顶层 JSON 对象产出事件序列。
+
+    :param parsed: 已解析的非流式响应 JSON object。
+    :param hook: provider 私有 reasoning 协议钩子。
+    :param provider_request_id: 当前 response header 提供的 request id。
+    :returns: 归一化后的 Runner 事件迭代器。
+    :raises Exception: 不主动抛出异常。
+    """
 
     choices = parsed.get("choices")
     if not isinstance(choices, list) or not choices:
@@ -223,7 +235,6 @@ def _emit_from_dict(
     finish_reason = _resolve_finish_reason(choice)
     message = choice.get("message")
     tool_calls_emitted = False
-    fatal_emitted = False
     content: str | None = None
     reasoning: str | None = None
     if isinstance(message, dict):
@@ -267,7 +278,7 @@ def _emit_from_dict(
                 )
             )
             tool_calls_emitted = True
-    if not tool_calls_emitted and not fatal_emitted:
+    if not tool_calls_emitted:
         yield _make_event(
             RunnerContentCompletedData(
                 content=content,
@@ -301,7 +312,12 @@ def _emit_from_dict(
 
 
 def _resolve_finish_reason(choice: dict[str, JsonValue]) -> FinishReason:
-    """把 choice 的 ``finish_reason`` 字段映射为枚举。"""
+    """把 choice 的 ``finish_reason`` 字段映射为枚举。
+
+    :param choice: 非流式响应中的单个 choice object。
+    :returns: 映射后的 :class:`FinishReason`；缺失或未知时返回 ``STOP``。
+    :raises Exception: 不主动抛出异常。
+    """
 
     raw = choice.get("finish_reason")
     if isinstance(raw, str):
@@ -313,7 +329,12 @@ def _resolve_finish_reason(choice: dict[str, JsonValue]) -> FinishReason:
 
 @dataclass(frozen=True, slots=True)
 class _NonStreamToolCallsResult:
-    """non-stream tool calls 解析结果。"""
+    """non-stream tool calls 解析结果。
+
+    :param tool_calls: 成功归一化的工具调用元组。
+    :param fatal_errors: 阻止成功收口的 fatal 协议错误。
+    :param warnings: 可恢复的协议告警事件。
+    """
 
     tool_calls: tuple[ToolCallRequest, ...]
     fatal_errors: tuple[RunnerProtocolErrorData, ...]
@@ -335,6 +356,11 @@ def _build_tool_calls(
     （只接受字符串 buffer）前先把 Mapping 序列化为 JSON string。
     其它非法类型（list / number / bool）→ ``tool_call_arguments_not_object``
     fatal 错误。
+
+    :param raw_tool_calls: provider 返回的原始 tool_calls 列表。
+    :param provider_request_id: 当前 response header 提供的 request id。
+    :returns: 工具调用解析结果、fatal 错误与 warning。
+    :raises Exception: 不主动抛出异常。
     """
 
     aggregator = ToolCallAggregator(provider_request_id=provider_request_id)
@@ -377,6 +403,12 @@ def _coerce_final_tool_call(
 
     OLD 兼容：``function.arguments`` 为 :class:`Mapping` 时序列化为
     JSON 字符串，避免参数被静默清空。
+
+    :param raw: provider 返回的单个 tool call object。
+    :param index: 当前 tool call 在列表中的位置。
+    :param provider_request_id: 当前 response header 提供的 request id。
+    :returns: 可投喂聚合器的 delta，以及预解析阶段发现的 fatal 错误。
+    :raises Exception: 不主动抛出异常。
     """
 
     delta: _OpenAIToolCallDelta = {"index": index}

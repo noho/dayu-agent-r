@@ -72,3 +72,12 @@ def test_context_length_error_code_is_not_runner_retriable() -> None:
         classify_http_status(400) is RunnerHTTPErrorCode.CLIENT_ERROR
     )
     assert not is_retriable(RunnerHTTPErrorCode.CONTEXT_LENGTH_EXCEEDED)
+
+
+def test_detect_context_overflow_accepts_bounded_5xx_body_marker() -> None:
+    """5xx 错误体中明确 overflow marker 时也应触发 context compact。"""
+
+    assert detect_context_overflow(
+        http_status=500,
+        response_text="context length exceeded while upstream recovered",
+    )
