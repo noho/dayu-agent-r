@@ -61,6 +61,7 @@ durable foundation 当前不实现 public Host command facade、admission orches
 - `closeout_attempt_terminal`：支持 STARTING Attempt / RUNNING Run 的 succeeded、failed、lost terminal closeout；成功释放 active slot 后在新事务中尝试 FIFO promotion。
 - operation idempotency：start / follow-up 使用显式 operation scope，同 key 同 digest 返回既有 Run，不同 digest 返回结构化 conflict；follow-up queue digest 不包含 `resolved_execution_target`。
 - no-op / 测试 wakeup port：只暴露 pending dispatch 和 queue promotion wakeup 端口，不执行 Engine、WorkerProxy、scheduler 或 lane acquire。
+- post-commit wakeup 边界：active slot 释放后的 durable promotion 先于 queue promotion wakeup；promotion 已提交后的 dispatch / queue wakeup `RuntimeError` 只按 best-effort 处理，不回滚或掩盖 durable promotion 结果。
 - 多进程 durable invariant：当前测试覆盖同 slot ensure 只绑定一个 Session、同 Session admission 最多一个 active Run、跨进程 follow-up 幂等重放 / 冲突、queued Run 按 accepted `event_sequence` FIFO promotion、queued cancel 与 promotion 的 first-committer-wins，以及 EventLog `event_sequence` 全局唯一递增。
 
 internal admission 当前不实现 public Host command facade、policy provider integration、真实 dispatch、dispatching / active worker cancel propagation、EngineEvent ingest、steer、retry / replay、wait cancellation、recovery cancellation 或 session-scope cancel facade。

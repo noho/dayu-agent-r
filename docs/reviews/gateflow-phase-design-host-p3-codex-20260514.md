@@ -130,24 +130,24 @@ Phase 3 不应包含：
 
 ## Non-blocking Risks
 
-1. **`create_session(bind_slot=true)` 是否为旧 slot binding 写 canonical fact**  
-   - **working assumption**: Phase 3 可以只写 `SESSION_CREATED`，slot rebinding 是 state index 更新和 snapshot 事实，不新增 canonical event；slot 历史可由 Session / slot row 和 audit/projection 后续解释。  
-   - **风险**: 如果后续 audit 要解释 slot rebind 历史，缺少 dedicated canonical event 可能需要补事件类型。  
+1. **`create_session(bind_slot=true)` 是否为旧 slot binding 写 canonical fact**
+   - **working assumption**: Phase 3 可以只写 `SESSION_CREATED`，slot rebinding 是 state index 更新和 snapshot 事实，不新增 canonical event；slot 历史可由 Session / slot row 和 audit/projection 后续解释。
+   - **风险**: 如果后续 audit 要解释 slot rebind 历史，缺少 dedicated canonical event 可能需要补事件类型。
    - **回看触发**: Phase 4 public API / audit phase 需要按 slot 追踪“哪个请求把 slot 从旧 Session 重绑定到新 Session”。
 
-2. **`start_run` policy=`reject` / `attach_active` 是否在 Phase 3 实现**  
-   - **working assumption**: Phase 3 transition service 支持 admission policy view 输入，但第一版 tests 至少覆盖 queue；reject / attach_active 可作为 state-machine branch 返回，不要求 public facade。  
-   - **风险**: 若完全不测 reject / attach_active，Phase 4 public command path 可能发现 admission branch 未稳定。  
+2. **`start_run` policy=`reject` / `attach_active` 是否在 Phase 3 实现**
+   - **working assumption**: Phase 3 transition service 支持 admission policy view 输入，但第一版 tests 至少覆盖 queue；reject / attach_active 可作为 state-machine branch 返回，不要求 public facade。
+   - **风险**: 若完全不测 reject / attach_active，Phase 4 public command path 可能发现 admission branch 未稳定。
    - **回看触发**: Phase 4 plan 需要暴露 `start_run` 的 queue_policy 全语义。
 
-3. **Session close 与 queued promotion 的关系**  
-   - **working assumption**: 已 close Session 不接受新输入，但 close 前已 queued Run 仍可 promotion，符合 design.md 318。  
-   - **风险**: UI 可能误以为 close 会停止 queued work。  
+3. **Session close 与 queued promotion 的关系**
+   - **working assumption**: 已 close Session 不接受新输入，但 close 前已 queued Run 仍可 promotion，符合 design.md 318。
+   - **风险**: UI 可能误以为 close 会停止 queued work。
    - **回看触发**: Phase 4 close_session public API 文档 / tests。
 
-4. **多进程测试容量**  
-   - **working assumption**: Phase 3 至少做 SQLite shared DB 多进程 smoke，覆盖 active slot invariant、重复 idempotency、queue promotion 和 EventLog sequence；更重压测留到 Phase 11 hardening。  
-   - **风险**: 只做 smoke 可能漏掉高并发 starvation 或 busy retry 参数问题。  
+4. **多进程测试容量**
+   - **working assumption**: Phase 3 至少做 SQLite shared DB 多进程 smoke，覆盖 active slot invariant、重复 idempotency、queue promotion 和 EventLog sequence；更重压测留到 Phase 11 hardening。
+   - **风险**: 只做 smoke 可能漏掉高并发 starvation 或 busy retry 参数问题。
    - **回看触发**: Phase 11 multi-process hardening 或实际 CI flakes。
 
 ## Recommended Design Refinements

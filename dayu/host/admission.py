@@ -49,7 +49,6 @@ from dayu.host.durable.idempotency import (
     IdempotencyScope,
     IdempotencyStore,
 )
-from dayu.host.durable.schema import TABLE_EVENT_LOG
 from dayu.host.durable.run_transition import (
     CancelPredispatchStartingInput,
     CancelQueuedRunInput,
@@ -527,7 +526,11 @@ class HostAdmissionService:
                 id_factory=self.id_factory,
             )
         )
-        _wake_dispatch_if_needed(self.wakeup_port, result.pending_dispatch)
+        _wake_dispatch_if_needed(
+            self.wakeup_port,
+            result.pending_dispatch,
+            suppress_runtime_error=True,
+        )
         return result
 
 
@@ -907,7 +910,9 @@ class _CancelRunOperation:
         _raise_for_cancel_transition_status(transition_result)
         run = _require_transition_run(transition_result.run)
         cancel_request_sequence = _require_event_sequence(
-            transaction, cancel_request_event_id
+            transaction,
+            self.event_log_store,
+            cancel_request_event_id,
         )
         self.idempotency_store.record_idempotent_result(
             transaction,
@@ -968,7 +973,9 @@ class _CancelRunOperation:
         _raise_for_cancel_transition_status(transition_result)
         run = _require_transition_run(transition_result.run)
         cancel_request_sequence = _require_event_sequence(
-            transaction, cancel_request_event_id
+            transaction,
+            self.event_log_store,
+            cancel_request_event_id,
         )
         self.idempotency_store.record_idempotent_result(
             transaction,
@@ -1583,16 +1590,23 @@ def _pending_dispatch_from_row(
 def _wake_dispatch_if_needed(
     wakeup_port: AdmissionWakeupPort,
     pending_dispatch: PendingDispatchRecord | None,
+    *,
+    suppress_runtime_error: bool = False,
 ) -> None:
     """在 commit 后按需调用 dispatch wakeup。
 
     :param wakeup_port: wakeup 端口。
     :param pending_dispatch: pending dispatch 摘要。
+    :param suppress_runtime_error: 是否把 wakeup ``RuntimeError`` 视为 best-effort。
     :returns: ``None``。
     """
 
     if pending_dispatch is not None:
-        wakeup_port.wake_dispatch(pending_dispatch)
+        try:
+            wakeup_port.wake_dispatch(pending_dispatch)
+        except RuntimeError:
+            if not suppress_runtime_error:
+                raise
 
 
 def _promote_after_release(
@@ -1605,8 +1619,12 @@ def _promote_after_release(
     :returns: promotion 结果。
     """
 
-    service.wakeup_port.wake_queue_promotion(session_id)
-    return service.promote_next_queued_run(session_id)
+    promotion = service.promote_next_queued_run(session_id)
+    try:
+        service.wakeup_port.wake_queue_promotion(session_id)
+    except RuntimeError:
+        pass
+    return promotion
 
 
 def _require_transition_run(run: RunRow | None) -> RunRow:
@@ -1646,27 +1664,25 @@ def _require_transition_dispatch_record(
 
 
 def _require_event_sequence(
-    transaction: HostTransaction, event_id: str
+    transaction: HostTransaction, event_log_store: EventLogStore, event_id: str
 ) -> int:
     """按 event id 读取已追加 EventLog sequence。
 
     :param transaction: 当前 Host transaction。
+    :param event_log_store: EventLog store。
     :param event_id: EventLog event id。
     :returns: event sequence。
     :raises HostApiError: event id 缺失或 sequence 类型异常时抛出。
     """
 
-    row = transaction.fetchone(
-        f"SELECT event_sequence FROM {TABLE_EVENT_LOG} WHERE event_id = ?",
-        (event_id,),
-    )
-    if row is None:
+    event = event_log_store.read_event_by_id(transaction, event_id)
+    if event is None:
         raise HostApiError(
             code=HostApiErrorCode.INTERNAL_ERROR,
             message="EventLog row is missing after append",
             retryable=False,
         )
-    value = row.get("event_sequence")
+    value = event.event_sequence
     if not isinstance(value, int):
         raise HostApiError(
             code=HostApiErrorCode.INTERNAL_ERROR,

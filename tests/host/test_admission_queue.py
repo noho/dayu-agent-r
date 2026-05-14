@@ -127,6 +127,38 @@ class _WakeupSpy(AdmissionWakeupPort):
         self.promotions.append(session_id)
 
 
+@dataclass(slots=True)
+class _ToggleFailingWakeupSpy(_WakeupSpy):
+    """可切换失败的 wakeup spy。"""
+
+    fail_dispatch: bool = False
+    fail_queue_promotion: bool = False
+
+    def wake_dispatch(self, record: PendingDispatchRecord) -> None:
+        """记录 dispatch wakeup，并按开关抛出运行时错误。
+
+        :param record: pending dispatch 摘要。
+        :returns: ``None``。
+        :raises RuntimeError: ``fail_dispatch`` 为真时抛出。
+        """
+
+        self.dispatches.append(record)
+        if self.fail_dispatch:
+            raise RuntimeError("forced dispatch wakeup failure")
+
+    def wake_queue_promotion(self, session_id: str) -> None:
+        """记录 promotion wakeup，并按开关抛出运行时错误。
+
+        :param session_id: 目标 Session id。
+        :returns: ``None``。
+        :raises RuntimeError: ``fail_queue_promotion`` 为真时抛出。
+        """
+
+        self.promotions.append(session_id)
+        if self.fail_queue_promotion:
+            raise RuntimeError("forced queue wakeup failure")
+
+
 def _options(tmp_path: Path) -> HostDurableStoreOptions:
     """构造测试用 Host durable store options。
 
@@ -699,6 +731,83 @@ def test_cancel_predispatch_starting_promotes_exactly_one_queued_run(
         assert len(spy.dispatches) == 2
 
 
+def test_cancel_predispatch_starting_promotion_survives_queue_wakeup_failure(
+    tmp_path: Path,
+) -> None:
+    """active cancel 后 queue wakeup 失败不掩盖已完成 promotion。"""
+
+    with open_host_durable_store(_options(tmp_path)) as store:
+        session_id = _ensure_session_id(store.transaction_runner)
+        spy = _ToggleFailingWakeupSpy()
+        service = _service(store.transaction_runner, spy=spy)
+        active = service.start_run(
+            _start_request(session_id=session_id, client_request_id="start-active"),
+            caller_semantic_digest=_CALLER_DIGEST,
+        )
+        queued = service.submit_followup_queue(
+            SubmitFollowupQueueAdmissionInput(
+                request=_followup_request(
+                    session_id=session_id,
+                    client_request_id="follow-wakeup-fails",
+                ),
+                resolved_execution_target="queued-target",
+            ),
+            caller_semantic_digest=_CALLER_DIGEST,
+        )
+        spy.fail_queue_promotion = True
+
+        result = service.cancel_run(
+            active.run.run_id,
+            _cancel_request("cancel-active-wakeup-fails"),
+            caller_semantic_digest=_CALLER_DIGEST,
+        )
+
+        assert result.run.status == RunStatus.CANCELLED
+        assert result.promotion is not None
+        assert result.promotion.promoted_run is not None
+        assert result.promotion.promoted_run.run_id == queued.run.run_id
+        assert _read_run(store.transaction_runner, queued.run.run_id).status == (
+            RunStatus.RUNNING
+        )
+        assert spy.promotions == [session_id]
+
+
+def test_promote_next_queued_run_returns_result_when_dispatch_wakeup_fails(
+    tmp_path: Path,
+) -> None:
+    """promotion 提交后 dispatch wakeup 失败不掩盖 promotion 结果。"""
+
+    with open_host_durable_store(_options(tmp_path)) as store:
+        session_id = _ensure_session_id(store.transaction_runner)
+        spy = _ToggleFailingWakeupSpy()
+        service = _service(store.transaction_runner, spy=spy)
+        active = service.start_run(
+            _start_request(session_id=session_id, client_request_id="start-active"),
+            caller_semantic_digest=_CALLER_DIGEST,
+        )
+        queued = service.submit_followup_queue(
+            SubmitFollowupQueueAdmissionInput(
+                request=_followup_request(
+                    session_id=session_id,
+                    client_request_id="follow-dispatch-wakeup-fails",
+                ),
+                resolved_execution_target="queued-target",
+            ),
+            caller_semantic_digest=_CALLER_DIGEST,
+        )
+        _closeout_active(store.transaction_runner, active.run.run_id)
+        spy.fail_dispatch = True
+
+        result = service.promote_next_queued_run(session_id)
+
+        assert result.promoted_run is not None
+        assert result.promoted_run.run_id == queued.run.run_id
+        assert _read_run(store.transaction_runner, queued.run.run_id).status == (
+            RunStatus.RUNNING
+        )
+        assert len(spy.dispatches) == 2
+
+
 def test_terminal_closeout_promotes_exactly_one_queued_run_after_commit(
     tmp_path: Path,
 ) -> None:
@@ -754,6 +863,52 @@ def test_terminal_closeout_promotes_exactly_one_queued_run_after_commit(
         )
         assert spy.promotions == [session_id]
         assert len(spy.dispatches) == 2
+
+
+def test_terminal_closeout_promotion_survives_queue_wakeup_failure(
+    tmp_path: Path,
+) -> None:
+    """terminal closeout 后 queue wakeup 失败不掩盖已完成 promotion。"""
+
+    with open_host_durable_store(_options(tmp_path)) as store:
+        session_id = _ensure_session_id(store.transaction_runner)
+        spy = _ToggleFailingWakeupSpy()
+        service = _service(store.transaction_runner, spy=spy)
+        active = service.start_run(
+            _start_request(session_id=session_id, client_request_id="start-active"),
+            caller_semantic_digest=_CALLER_DIGEST,
+        )
+        assert active.attempt is not None
+        queued = service.submit_followup_queue(
+            SubmitFollowupQueueAdmissionInput(
+                request=_followup_request(
+                    session_id=session_id,
+                    client_request_id="follow-terminal-wakeup-fails",
+                ),
+                resolved_execution_target="queued-target",
+            ),
+            caller_semantic_digest=_CALLER_DIGEST,
+        )
+        spy.fail_queue_promotion = True
+
+        result = service.closeout_attempt_terminal(
+            CloseoutAttemptTerminalInput(
+                run_id=active.run.run_id,
+                attempt_id=active.attempt.attempt_id,
+                attempt_terminal_status=AttemptStatus.SUCCEEDED,
+                run_terminal_status=RunStatus.SUCCEEDED,
+                terminal_summary_ref=None,
+                terminal_summary_digest=None,
+            )
+        )
+
+        assert result.run.status == RunStatus.SUCCEEDED
+        assert result.promotion.promoted_run is not None
+        assert result.promotion.promoted_run.run_id == queued.run.run_id
+        assert _read_run(store.transaction_runner, queued.run.run_id).status == (
+            RunStatus.RUNNING
+        )
+        assert spy.promotions == [session_id]
 
 
 def test_cancel_terminal_run_returns_invalid_state_without_new_facts(
