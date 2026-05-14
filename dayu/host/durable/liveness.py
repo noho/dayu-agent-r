@@ -10,11 +10,13 @@ from __future__ import annotations
 from dataclasses import dataclass
 from datetime import UTC, datetime
 from enum import StrEnum
+from typing import NoReturn
 
 from dayu.host.durable.codec import format_utc_timestamp
 from dayu.host.durable.errors import (
     HostDurableError,
     HostInstanceIdentityConflictError,
+    HostInstanceLifecycleConflictError,
     HostInstanceNotRegisteredError,
 )
 from dayu.host.durable.schema import TABLE_HOST_INSTANCES
@@ -35,6 +37,22 @@ class HostInstanceStatus(StrEnum):
     STOPPING = "stopping"
     STOPPED = "stopped"
     CRASHED_SUSPECTED = "crashed_suspected"
+
+
+_REGISTER_RUNNING_SOURCE_STATUSES = (
+    HostInstanceStatus.RUNNING,
+    HostInstanceStatus.STOPPING,
+)
+_HEARTBEAT_SOURCE_STATUSES = (HostInstanceStatus.RUNNING,)
+_STOPPING_SOURCE_STATUSES = (HostInstanceStatus.RUNNING,)
+_STOPPED_SOURCE_STATUSES = (
+    HostInstanceStatus.RUNNING,
+    HostInstanceStatus.STOPPING,
+)
+_TERMINAL_STATUSES = (
+    HostInstanceStatus.STOPPED,
+    HostInstanceStatus.CRASHED_SUSPECTED,
+)
 
 
 @dataclass(frozen=True, slots=True)
@@ -92,6 +110,7 @@ class HostInstanceLivenessStore:
         :returns: 已注册或刷新后的 liveness row。
         :raises HostDurableError: identity 字段无效时抛出。
         :raises HostInstanceIdentityConflictError: 同一 id 已绑定不同进程身份时抛出。
+        :raises HostInstanceLifecycleConflictError: 既有 row 已处于不可恢复状态时抛出。
         :raises sqlite3.Error: SQLite 写入失败时由 transaction runner 结构化转换。
         """
 
@@ -107,6 +126,7 @@ class HostInstanceLivenessStore:
         :returns: 刷新后的 liveness row。
         :raises HostInstanceNotRegisteredError: 当前 instance 未注册时抛出。
         :raises HostInstanceIdentityConflictError: 同一 id 已绑定不同进程身份时抛出。
+        :raises HostInstanceLifecycleConflictError: 既有 row 已处于不可 heartbeat 状态时抛出。
         :raises sqlite3.Error: SQLite 写入失败时由 transaction runner 结构化转换。
         """
 
@@ -121,6 +141,7 @@ class HostInstanceLivenessStore:
         :param identity: 当前 Host instance 身份。
         :returns: row 存在时返回更新后的 row；不存在时返回 ``None``。
         :raises HostInstanceIdentityConflictError: 同一 id 已绑定不同进程身份时抛出。
+        :raises HostInstanceLifecycleConflictError: 既有 row 当前状态不允许标记为 stopping 时抛出。
         :raises sqlite3.Error: SQLite 写入失败时由 transaction runner 结构化转换。
         """
 
@@ -135,6 +156,7 @@ class HostInstanceLivenessStore:
         :param identity: 当前 Host instance 身份。
         :returns: row 存在时返回更新后的 row；不存在时返回 ``None``。
         :raises HostInstanceIdentityConflictError: 同一 id 已绑定不同进程身份时抛出。
+        :raises HostInstanceLifecycleConflictError: 既有 row 当前状态不允许标记为 stopped 时抛出。
         :raises sqlite3.Error: SQLite 写入失败时由 transaction runner 结构化转换。
         """
 
@@ -164,6 +186,7 @@ def register_current_instance(
     :returns: 已注册或刷新后的 liveness row。
     :raises HostDurableError: identity 字段无效时抛出。
     :raises HostInstanceIdentityConflictError: 同一 id 已绑定不同进程身份时抛出。
+    :raises HostInstanceLifecycleConflictError: 既有 row 已处于不可恢复状态时抛出。
     :raises sqlite3.Error: SQLite 写入失败时由 transaction runner 结构化转换。
     """
 
@@ -195,17 +218,32 @@ def register_current_instance(
         )
     else:
         _require_same_identity(existing, identity)
-        transaction.execute(
+        if existing.status in _TERMINAL_STATUSES:
+            raise HostInstanceLifecycleConflictError(
+                "Host instance terminal status cannot be registered as running"
+            )
+        source_status_values = _status_values(_REGISTER_RUNNING_SOURCE_STATUSES)
+        result = transaction.execute(
             f"""
             UPDATE {TABLE_HOST_INSTANCES}
             SET heartbeat_at = ?, status = ?
             WHERE host_instance_id = ?
+              AND process_start_token = ?
+              AND status IN ({_status_placeholders(_REGISTER_RUNNING_SOURCE_STATUSES)})
             """,
             (
                 now,
                 HostInstanceStatus.RUNNING.value,
                 identity.host_instance_id,
-            ),
+                identity.process_start_token,
+            )
+            + source_status_values,
+        )
+        _require_single_liveness_update(
+            transaction,
+            identity,
+            rowcount=result.rowcount,
+            allowed_source_statuses=_REGISTER_RUNNING_SOURCE_STATUSES,
         )
     refreshed = read_host_instance(transaction, identity.host_instance_id)
     if refreshed is None:
@@ -223,6 +261,7 @@ def heartbeat_current_instance(
     :returns: 刷新后的 liveness row。
     :raises HostInstanceNotRegisteredError: 当前 instance 未注册时抛出。
     :raises HostInstanceIdentityConflictError: 同一 id 已绑定不同进程身份时抛出。
+    :raises HostInstanceLifecycleConflictError: 既有 row 已处于不可 heartbeat 状态时抛出。
     :raises sqlite3.Error: SQLite 写入失败时由 transaction runner 结构化转换。
     """
 
@@ -232,18 +271,28 @@ def heartbeat_current_instance(
         raise HostInstanceNotRegisteredError("Host instance is not registered")
     _require_same_identity(existing, identity)
     now = format_utc_timestamp(datetime.now(UTC))
-    transaction.execute(
+    source_status_values = _status_values(_HEARTBEAT_SOURCE_STATUSES)
+    result = transaction.execute(
         f"""
         UPDATE {TABLE_HOST_INSTANCES}
         SET heartbeat_at = ?, status = ?
-        WHERE host_instance_id = ? AND process_start_token = ?
+        WHERE host_instance_id = ?
+          AND process_start_token = ?
+          AND status IN ({_status_placeholders(_HEARTBEAT_SOURCE_STATUSES)})
         """,
         (
             now,
             HostInstanceStatus.RUNNING.value,
             identity.host_instance_id,
             identity.process_start_token,
-        ),
+        )
+        + source_status_values,
+    )
+    _require_single_liveness_update(
+        transaction,
+        identity,
+        rowcount=result.rowcount,
+        allowed_source_statuses=_HEARTBEAT_SOURCE_STATUSES,
     )
     refreshed = read_host_instance(transaction, identity.host_instance_id)
     if refreshed is None:
@@ -260,11 +309,15 @@ def mark_current_instance_stopping(
     :param identity: 当前 Host instance 身份。
     :returns: row 存在时返回更新后的 row；不存在时返回 ``None``。
     :raises HostInstanceIdentityConflictError: 同一 id 已绑定不同进程身份时抛出。
+    :raises HostInstanceLifecycleConflictError: 既有 row 当前状态不允许标记为 stopping 时抛出。
     :raises sqlite3.Error: SQLite 写入失败时由 transaction runner 结构化转换。
     """
 
     return _mark_current_instance_status(
-        transaction, identity, HostInstanceStatus.STOPPING
+        transaction,
+        identity,
+        HostInstanceStatus.STOPPING,
+        allowed_source_statuses=_STOPPING_SOURCE_STATUSES,
     )
 
 
@@ -277,11 +330,15 @@ def mark_current_instance_stopped(
     :param identity: 当前 Host instance 身份。
     :returns: row 存在时返回更新后的 row；不存在时返回 ``None``。
     :raises HostInstanceIdentityConflictError: 同一 id 已绑定不同进程身份时抛出。
+    :raises HostInstanceLifecycleConflictError: 既有 row 当前状态不允许标记为 stopped 时抛出。
     :raises sqlite3.Error: SQLite 写入失败时由 transaction runner 结构化转换。
     """
 
     return _mark_current_instance_status(
-        transaction, identity, HostInstanceStatus.STOPPED
+        transaction,
+        identity,
+        HostInstanceStatus.STOPPED,
+        allowed_source_statuses=_STOPPED_SOURCE_STATUSES,
     )
 
 
@@ -321,14 +378,18 @@ def _mark_current_instance_status(
     transaction: HostTransaction,
     identity: HostInstanceIdentity,
     status: HostInstanceStatus,
+    *,
+    allowed_source_statuses: tuple[HostInstanceStatus, ...],
 ) -> HostInstanceRow | None:
     """按当前身份更新 lifecycle 诊断状态。
 
     :param transaction: 调用方提供的 Host durable transaction。
     :param identity: 当前 Host instance 身份。
     :param status: 目标状态。
+    :param allowed_source_statuses: 允许进入目标状态的来源状态集合。
     :returns: row 存在时返回更新后的 row；不存在时返回 ``None``。
     :raises HostInstanceIdentityConflictError: 同一 id 已绑定不同进程身份时抛出。
+    :raises HostInstanceLifecycleConflictError: 既有 row 当前状态不允许进入目标状态时抛出。
     :raises sqlite3.Error: SQLite 写入失败时由 transaction runner 结构化转换。
     """
 
@@ -338,20 +399,114 @@ def _mark_current_instance_status(
         return None
     _require_same_identity(existing, identity)
     now = format_utc_timestamp(datetime.now(UTC))
-    transaction.execute(
+    source_status_values = _status_values(allowed_source_statuses)
+    result = transaction.execute(
         f"""
         UPDATE {TABLE_HOST_INSTANCES}
         SET heartbeat_at = ?, status = ?
-        WHERE host_instance_id = ? AND process_start_token = ?
+        WHERE host_instance_id = ?
+          AND process_start_token = ?
+          AND status IN ({_status_placeholders(allowed_source_statuses)})
         """,
         (
             now,
             status.value,
             identity.host_instance_id,
             identity.process_start_token,
-        ),
+        )
+        + source_status_values,
+    )
+    _require_single_liveness_update(
+        transaction,
+        identity,
+        rowcount=result.rowcount,
+        allowed_source_statuses=allowed_source_statuses,
     )
     return read_host_instance(transaction, identity.host_instance_id)
+
+
+def _status_values(statuses: tuple[HostInstanceStatus, ...]) -> tuple[str, ...]:
+    """把状态枚举集合转换为 SQL 参数值。
+
+    :param statuses: Host instance 状态集合。
+    :returns: 状态字符串元组。
+    :raises HostDurableError: 状态集合为空时抛出。
+    """
+
+    if len(statuses) == 0:
+        raise HostDurableError("Host instance source statuses must not be empty")
+    return tuple(status.value for status in statuses)
+
+
+def _status_placeholders(statuses: tuple[HostInstanceStatus, ...]) -> str:
+    """为状态集合生成 SQLite 占位符片段。
+
+    :param statuses: Host instance 状态集合。
+    :returns: 逗号分隔的 ``?`` 占位符。
+    :raises HostDurableError: 状态集合为空时抛出。
+    """
+
+    _status_values(statuses)
+    return ", ".join("?" for _status in statuses)
+
+
+def _require_single_liveness_update(
+    transaction: HostTransaction,
+    identity: HostInstanceIdentity,
+    *,
+    rowcount: int,
+    allowed_source_statuses: tuple[HostInstanceStatus, ...],
+) -> None:
+    """确认 liveness UPDATE 精确命中当前身份的一行。
+
+    :param transaction: 调用方提供的 Host durable transaction。
+    :param identity: 当前 Host instance 身份。
+    :param rowcount: 刚执行的 UPDATE 影响行数。
+    :param allowed_source_statuses: 本次 UPDATE 允许的来源状态集合。
+    :returns: ``None``。
+    :raises HostInstanceIdentityConflictError: UPDATE 后 row 身份不再匹配时抛出。
+    :raises HostInstanceLifecycleConflictError: UPDATE 后 row 状态不在允许来源内时抛出。
+    :raises HostInstanceNotRegisteredError: UPDATE 前存在的 row 消失时抛出。
+    :raises HostDurableError: UPDATE 命中超过一行时抛出。
+    """
+
+    if rowcount == 1:
+        return
+    if rowcount == 0:
+        _raise_liveness_update_conflict(
+            transaction, identity, allowed_source_statuses=allowed_source_statuses
+        )
+    raise HostDurableError("Host instance liveness update affected multiple rows")
+
+
+def _raise_liveness_update_conflict(
+    transaction: HostTransaction,
+    identity: HostInstanceIdentity,
+    *,
+    allowed_source_statuses: tuple[HostInstanceStatus, ...],
+) -> NoReturn:
+    """把 liveness UPDATE 零命中分类为结构化冲突。
+
+    :param transaction: 调用方提供的 Host durable transaction。
+    :param identity: 当前 Host instance 身份。
+    :param allowed_source_statuses: 本次 UPDATE 允许的来源状态集合。
+    :returns: 不返回；总是抛出结构化异常。
+    :raises HostInstanceIdentityConflictError: durable row 身份与当前身份不一致时抛出。
+    :raises HostInstanceLifecycleConflictError: durable row 状态不允许本次转移时抛出。
+    :raises HostInstanceNotRegisteredError: durable row 不存在时抛出。
+    """
+
+    current = read_host_instance(transaction, identity.host_instance_id)
+    if current is None:
+        raise HostInstanceNotRegisteredError("Host instance is not registered")
+    _require_same_identity(current, identity)
+    if current.status not in allowed_source_statuses:
+        raise HostInstanceLifecycleConflictError(
+            "Host instance lifecycle status does not allow requested update"
+        )
+    raise HostInstanceIdentityConflictError(
+        "Host instance liveness update did not match current identity"
+    )
 
 
 def _validate_identity(identity: HostInstanceIdentity) -> None:
@@ -423,4 +578,3 @@ def _host_instance_row_from_host_row(row: HostRow) -> HostInstanceRow:
         heartbeat_at=_require_text(row.get("heartbeat_at"), field_name="heartbeat_at"),
         status=status,
     )
-

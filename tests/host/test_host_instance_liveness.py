@@ -10,6 +10,7 @@ import pytest
 from dayu.host.durable.connection import open_host_durable_store
 from dayu.host.durable.errors import (
     HostInstanceIdentityConflictError,
+    HostInstanceLifecycleConflictError,
     HostInstanceNotRegisteredError,
 )
 from dayu.host.durable.liveness import (
@@ -26,7 +27,13 @@ from dayu.host.durable.options import (
     HostSQLiteStoragePolicy,
     PayloadStoragePolicy,
 )
-from dayu.host.durable.transaction import HostTransaction
+from dayu.host.durable.schema import TABLE_HOST_INSTANCES
+from dayu.host.durable.transaction import (
+    HostExecuteResult,
+    HostRow,
+    HostTransaction,
+    SQLParameters,
+)
 
 
 def _options(tmp_path: Path) -> HostDurableStoreOptions:
@@ -69,6 +76,95 @@ def _identity(
         process_start_token=process_start_token,
         boot_id=boot_id,
     )
+
+
+def _force_instance_status(
+    transaction: HostTransaction,
+    identity: HostInstanceIdentity,
+    status: HostInstanceStatus,
+) -> None:
+    """测试内直接设置 liveness row 状态。
+
+    :param transaction: Host transaction。
+    :param identity: 目标 Host instance identity。
+    :param status: 目标状态。
+    :returns: ``None``。
+    :raises AssertionError: 状态写入未命中唯一 row 时抛出。
+    """
+
+    result = transaction.execute(
+        f"""
+        UPDATE {TABLE_HOST_INSTANCES}
+        SET status = ?
+        WHERE host_instance_id = ?
+        """,
+        (status.value, identity.host_instance_id),
+    )
+    assert result.rowcount == 1
+
+
+class _IdentityDriftTransaction(HostTransaction):
+    """在 identity precheck 后制造 UPDATE 零命中的测试 transaction。"""
+
+    _delegate: HostTransaction
+    _identity: HostInstanceIdentity
+    _changed: bool
+
+    def __init__(
+        self, delegate: HostTransaction, identity: HostInstanceIdentity
+    ) -> None:
+        """初始化测试 transaction wrapper。
+
+        :param delegate: 实际 Host transaction。
+        :param identity: 需要制造身份漂移的 Host instance identity。
+        :returns: ``None``。
+        :raises Exception: 不主动抛出异常。
+        """
+
+        self._delegate = delegate
+        self._identity = identity
+        self._changed = False
+
+    def execute(
+        self, sql: str, parameters: SQLParameters = ()
+    ) -> HostExecuteResult:
+        """执行 SQL，并在第一次 liveness UPDATE 前改写 token。
+
+        :param sql: SQL statement。
+        :param parameters: SQLite scalar 参数。
+        :returns: 写入摘要。
+        :raises Exception: 透传底层 transaction 写入异常。
+        """
+
+        if (
+            not self._changed
+            and f"UPDATE {TABLE_HOST_INSTANCES}" in sql
+            and "heartbeat_at" in sql
+            and "process_start_token" in sql
+        ):
+            self._changed = True
+            self._delegate.execute(
+                f"""
+                UPDATE {TABLE_HOST_INSTANCES}
+                SET process_start_token = ?
+                WHERE host_instance_id = ?
+                """,
+                ("token-after-precheck", self._identity.host_instance_id),
+            )
+        return self._delegate.execute(sql, parameters)
+
+    def fetchone(
+        self, sql: str, parameters: SQLParameters = ()
+    ) -> HostRow | None:
+        """委托单行查询。
+
+        :param sql: SQL query。
+        :param parameters: SQLite scalar 参数。
+        :returns: 查询结果 row；无结果时为 ``None``。
+        :raises Exception: 透传底层 transaction 查询异常。
+        """
+
+        return self._delegate.fetchone(sql, parameters)
 
 
 def test_register_inserts_running_instance_with_timestamps(
@@ -147,6 +243,97 @@ def test_repeated_register_same_identity_refreshes_heartbeat_and_status(
         assert refreshed_created_at == created_at
         assert heartbeat_at != ""
         assert status is HostInstanceStatus.RUNNING
+
+
+@pytest.mark.parametrize(
+    "terminal_status",
+    (HostInstanceStatus.STOPPED, HostInstanceStatus.CRASHED_SUSPECTED),
+)
+def test_terminal_instance_does_not_revert_to_running_or_stopping(
+    tmp_path: Path, terminal_status: HostInstanceStatus
+) -> None:
+    """STOPPED / CRASHED_SUSPECTED 不能被 register、heartbeat 或 stopping 复活。
+
+    :param tmp_path: pytest 临时目录。
+    :param terminal_status: 被验证的终态状态。
+    :returns: ``None``。
+    :raises AssertionError: 回归断言失败时由 pytest 抛出。
+    """
+
+    identity = _identity()
+    with open_host_durable_store(_options(tmp_path)) as store:
+        store.transaction_runner.run_write(
+            lambda transaction: register_current_instance(transaction, identity)
+        )
+        store.transaction_runner.run_write(
+            lambda transaction: _force_instance_status(
+                transaction, identity, terminal_status
+            )
+        )
+
+        with pytest.raises(HostInstanceLifecycleConflictError):
+            store.transaction_runner.run_write(
+                lambda transaction: register_current_instance(transaction, identity)
+            )
+        with pytest.raises(HostInstanceLifecycleConflictError):
+            store.transaction_runner.run_write(
+                lambda transaction: heartbeat_current_instance(transaction, identity)
+            )
+        with pytest.raises(HostInstanceLifecycleConflictError):
+            store.transaction_runner.run_write(
+                lambda transaction: mark_current_instance_stopping(
+                    transaction, identity
+                )
+            )
+        with pytest.raises(HostInstanceLifecycleConflictError):
+            store.transaction_runner.run_write(
+                lambda transaction: mark_current_instance_stopped(
+                    transaction, identity
+                )
+            )
+
+        row = store.transaction_runner.run_write(
+            lambda transaction: read_host_instance(
+                transaction, identity.host_instance_id
+            )
+        )
+        assert row is not None
+        assert row.status is terminal_status
+
+
+def test_stopping_instance_heartbeat_does_not_revert_to_running(
+    tmp_path: Path,
+) -> None:
+    """STOPPING 不能被自动 heartbeat 静默回退为 RUNNING。
+
+    :param tmp_path: pytest 临时目录。
+    :returns: ``None``。
+    :raises AssertionError: 回归断言失败时由 pytest 抛出。
+    """
+
+    identity = _identity()
+    with open_host_durable_store(_options(tmp_path)) as store:
+        store.transaction_runner.run_write(
+            lambda transaction: register_current_instance(transaction, identity)
+        )
+        store.transaction_runner.run_write(
+            lambda transaction: mark_current_instance_stopping(
+                transaction, identity
+            )
+        )
+
+        with pytest.raises(HostInstanceLifecycleConflictError):
+            store.transaction_runner.run_write(
+                lambda transaction: heartbeat_current_instance(transaction, identity)
+            )
+
+        row = store.transaction_runner.run_write(
+            lambda transaction: read_host_instance(
+                transaction, identity.host_instance_id
+            )
+        )
+        assert row is not None
+        assert row.status is HostInstanceStatus.STOPPING
 
 
 def test_register_same_id_different_token_raises_identity_conflict(
@@ -250,6 +437,102 @@ def test_heartbeat_wrong_token_raises_identity_conflict(
             )
         after = store.transaction_runner.run_write(read_heartbeat)
         assert after == before
+
+
+def test_heartbeat_rowcount_zero_after_identity_precheck_raises_conflict(
+    tmp_path: Path,
+) -> None:
+    """heartbeat identity precheck 后 UPDATE 零命中会作为结构化身份冲突暴露。
+
+    :param tmp_path: pytest 临时目录。
+    :returns: ``None``。
+    :raises AssertionError: 回归断言失败时由 pytest 抛出。
+    """
+
+    identity = _identity()
+    with open_host_durable_store(_options(tmp_path)) as store:
+        store.transaction_runner.run_write(
+            lambda transaction: register_current_instance(transaction, identity)
+        )
+
+        def operation(transaction: HostTransaction) -> None:
+            """用测试 wrapper 在 heartbeat UPDATE 前制造身份漂移。
+
+            :param transaction: Host transaction。
+            :returns: ``None``。
+            :raises HostInstanceIdentityConflictError: UPDATE 零命中分类为身份冲突时抛出。
+            """
+
+            heartbeat_current_instance(
+                _IdentityDriftTransaction(transaction, identity), identity
+            )
+
+        with pytest.raises(HostInstanceIdentityConflictError):
+            store.transaction_runner.run_write(operation)
+
+
+def test_status_mark_rowcount_zero_after_identity_precheck_raises_conflict(
+    tmp_path: Path,
+) -> None:
+    """status mark identity precheck 后 UPDATE 零命中会作为结构化身份冲突暴露。
+
+    :param tmp_path: pytest 临时目录。
+    :returns: ``None``。
+    :raises AssertionError: 回归断言失败时由 pytest 抛出。
+    """
+
+    identity = _identity()
+    with open_host_durable_store(_options(tmp_path)) as store:
+        store.transaction_runner.run_write(
+            lambda transaction: register_current_instance(transaction, identity)
+        )
+
+        def operation(transaction: HostTransaction) -> None:
+            """用测试 wrapper 在 status mark UPDATE 前制造身份漂移。
+
+            :param transaction: Host transaction。
+            :returns: ``None``。
+            :raises HostInstanceIdentityConflictError: UPDATE 零命中分类为身份冲突时抛出。
+            """
+
+            mark_current_instance_stopping(
+                _IdentityDriftTransaction(transaction, identity), identity
+            )
+
+        with pytest.raises(HostInstanceIdentityConflictError):
+            store.transaction_runner.run_write(operation)
+
+
+def test_register_rowcount_zero_after_identity_precheck_raises_conflict(
+    tmp_path: Path,
+) -> None:
+    """register identity precheck 后 UPDATE 零命中会作为结构化身份冲突暴露。
+
+    :param tmp_path: pytest 临时目录。
+    :returns: ``None``。
+    :raises AssertionError: 回归断言失败时由 pytest 抛出。
+    """
+
+    identity = _identity()
+    with open_host_durable_store(_options(tmp_path)) as store:
+        store.transaction_runner.run_write(
+            lambda transaction: register_current_instance(transaction, identity)
+        )
+
+        def operation(transaction: HostTransaction) -> None:
+            """用测试 wrapper 在 register UPDATE 前制造身份漂移。
+
+            :param transaction: Host transaction。
+            :returns: ``None``。
+            :raises HostInstanceIdentityConflictError: UPDATE 零命中分类为身份冲突时抛出。
+            """
+
+            register_current_instance(
+                _IdentityDriftTransaction(transaction, identity), identity
+            )
+
+        with pytest.raises(HostInstanceIdentityConflictError):
+            store.transaction_runner.run_write(operation)
 
 
 def test_liveness_identity_tolerates_missing_boot_id_on_either_side(

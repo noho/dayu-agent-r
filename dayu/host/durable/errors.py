@@ -86,6 +86,10 @@ class HostInstanceIdentityConflictError(HostDurableError):
     """host instance identity 与既有 durable row 冲突。"""
 
 
+class HostInstanceLifecycleConflictError(HostDurableError):
+    """host instance lifecycle 状态转移与既有 durable row 冲突。"""
+
+
 class HostInstanceNotRegisteredError(HostDurableError):
     """当前 host instance 尚未注册。"""
 
