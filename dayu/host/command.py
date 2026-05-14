@@ -293,6 +293,7 @@ def start_run(host: HostCommandHandle, request: StartRunRequest) -> RunSnapshot:
     :raises HostApiError: handle 已关闭、Session 状态非法、active reject 或幂等冲突时抛出。
     """
 
+    host._raise_if_closed()
     result = host._admission_service.start_run(
         request,
         caller_semantic_digest=_start_run_public_semantic_digest(request),
@@ -317,6 +318,7 @@ def submit_followup(
     :raises HostApiError: session id 不一致、steer 未支持或 admission 失败时抛出。
     """
 
+    host._raise_if_closed()
     if session_id != request.session_id:
         raise HostApiError(
             code=HostApiErrorCode.INVALID_STATE,
@@ -365,6 +367,7 @@ def cancel_run(
     :raises HostApiError: Run 缺失、幂等冲突、真实非法前置或 deferred 状态未支持时抛出。
     """
 
+    host._raise_if_closed()
     try:
         result = host._admission_service.cancel_run(
             run_id,
@@ -405,6 +408,7 @@ def cancel_session_runs(
     :raises HostApiError: Session 缺失、幂等冲突或存在 unsupported non-terminal Run 时抛出。
     """
 
+    host._raise_if_closed()
     result = host._admission_service.cancel_session_runs(
         session_id,
         request,
