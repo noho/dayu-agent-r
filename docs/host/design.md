@@ -537,6 +537,20 @@ Host 不允许先 dispatch EngineWorker 再补写用户输入事实。
 
 状态迁移必须通过明确操作触发。不得新增隐式后台迁移来绕过 admission、EventLog 或 Attempt 语义。
 
+Phase 3 owned transition subset：
+
+Phase 3 只实现不需要 Engine dispatch、ToolRuntime、wait record、steer、retry / replay、context compaction 或 recovery 的状态机闭环：
+
+- Session lifecycle：创建 Session、按 slot 幂等确保 Session、关闭 Session；关闭后的 Session 不接受新输入，但不把既有 queued Run 作为内存对象丢弃。
+- start / follow-up admission：接受初始输入或 follow-up queue 输入，追加用户输入与 Run 接受事实，并在无 active Run 时启动 Run，在有 active Run 且 policy 为 queue 时持久化 queued Run。
+- queue promotion：同一 Session 无 active Run 时，按 queued Run 的 accepted `event_sequence` FIFO 推进一个 Run 到 `RUNNING`，创建 Attempt `STARTING` 与 dispatch record `pending`。
+- cancel queued：`QUEUED -> CANCELLED`，不创建 Attempt。
+- cancel pre-dispatch starting：`Run RUNNING + Attempt STARTING + dispatch record pending -> Run CANCELLED + Attempt CANCELLED + dispatch record cancelled`；该路径不通知 WorkerProxy，不启动 Engine。
+- internal terminal closeout helper：仅作为 Phase 3 状态机测试闭环和后续 EngineEvent ingest 复用的内部 transition helper，用于追加 concrete terminal facts、关闭当前 Attempt / Run、释放 active slot；它不实现 EngineEvent ingest。
+- terminal / cancel 成功释放 active slot 后，必须触发同 Session promotion check。promotion check 必须重新进入短事务，并通过 CAS 判定是否仍可推进 queued Run。
+
+Engine final answer / failure ingest、Tool awaiting、`resolve_wait`、steer、retry / replay、context compaction、recovery scan / dispatch 是全局状态迁移矩阵中的 future-owner references，除非后续 phase plan 明确拥有，不属于 Phase 3 实施范围。
+
 | 操作 / 来源 | 前置状态 | 目标状态 | 必须追加的 canonical facts | Attempt 动作 |
 | --- | --- | --- | --- | --- |
 | `start_run` 且无 active Run | Session `OPEN` | Run `RUNNING` / Attempt `STARTING` | `USER_INPUT_ACCEPTED`、`RUN_ACCEPTED`、`RUN_STARTED(start_reason=initial)`、`ATTEMPT_STARTED` | 创建新 Attempt；commit 后 dispatch |
@@ -644,6 +658,19 @@ durable store 语义分区：
 governance truth 只能由 Host transaction 写入。derived state index 可以从 governance truth 重建；diagnostic / trace 不能参与状态恢复判定。
 
 Durable table ownership 跟随语义 owner，而不是跟随实现先后顺序。SQLite / transaction runner / EventLog / payload descriptor / idempotency / host instance liveness 是 durable foundation；Session / Run / Attempt / active index / queue index 属于状态机与 admission；wait record 属于 Tool Awaiting；projection checkpoint、audit、tool trace、outbox、memory snapshot、context artifacts、purge tombstone 等表属于各自 projection 或治理模块。实现不得创建无语义 owner 的空表，也不得让 projection 表成为 governance truth。
+
+Phase 3 durable state / index contract：
+
+Session / Run / Attempt state indexes 是 Host governance truth index，必须与对应 canonical EventLog facts 在同一 SQLite transaction 内更新。
+
+- Session row 必须表达 `session_id`、status、创建时间、关闭时间等 lifecycle truth；Session 关闭是状态迁移，不删除 Session truth。
+- Session slot row 必须表达 `(scope, slot_key) -> session_id` 的当前绑定，并由唯一约束保护 `(scope, slot_key)`。`ensure_session` 必须在同一事务内创建 Session 与 slot binding；遇到唯一约束竞争时，输方重新读取 winning binding，不留下可见孤儿 Session 作为调用结果。
+- Run row 必须表达 `run_id`、`session_id`、status、`client_request_id`、accepted event sequence、当前 Attempt ref、source Run relation 与 terminal event ref 等 state-machine truth。active Run invariant 第一版优先用 SQLite partial unique index on `(session_id)` for active Run statuses 表达，让 active truth 跟随 `runs.status`，避免独立 active table 双写 owner；若后续 implementation 或 review 证明 partial unique index 与 SQLite 或测试约束不匹配，必须回到 design discussion 决策，不得由 implementation agent 自行改为独立 active-run table 或其它 active index 表示。
+- queued Run FIFO 只能由 accepted `event_sequence` 排序；内存队列、进程本地顺序或 after-commit wakeup 顺序都不能成为 queue truth。
+- Attempt row 必须表达 `attempt_id`、`run_id`、`execution_id`、status、started event ref 与 terminal event ref 等 execution lifecycle truth；旧 Attempt 不 resume，新执行必须创建新 Attempt 与新 `execution_id`。
+- Minimal dispatch record row 属于 Attempt startup truth 的一部分。`ATTEMPT_STARTED` 要求 Attempt row 已进入 `STARTING`，且 dispatch record row 在同一事务内创建为 `pending`。Phase 3 只写 dispatch record `pending` 与 `cancelled`；scheduler、lane acquire、WorkerProxy、LocalProxy、RemoteProxy、Engine dispatch、`dispatching` 推进和 `ATTEMPT_RUNNING` 均属于 Phase 5 或后续 phase。
+- 每个 transition service 必须把 CAS preconditions 表达为预期的 Session / Run / Attempt / dispatch record 当前状态。条件更新 `rowcount=0` 表示 CAS loser 或状态已变化；实现必须重新读取 durable snapshot，并返回结构化 conflict、invalid state 或当前结果，不得无条件覆盖最新状态。
+- Operation idempotency 的 `scope_kind`、`scope_id`、`idempotency_key`、semantic digest 输入字段、result kind、result ref 与 first canonical event ref 绑定必须在进入实现前按 operation 固定。不同 operation 不能共用含义模糊的 idempotency scope，也不能把显式参数塞进无结构 extra payload。
 
 SQLite schema convention：
 

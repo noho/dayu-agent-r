@@ -15,8 +15,9 @@ from dayu.host.durable.options import (
     PayloadStoragePolicy,
 )
 from dayu.host.durable.schema import (
-    FOUNDATION_TABLES,
+    HOST_DURABLE_TABLES,
     HOST_SCHEMA_VERSION,
+    PHASE3_STATE_TABLES,
     TABLE_EVENT_LOG,
     TABLE_HOST_INSTANCES,
     TABLE_IDEMPOTENCY_RECORDS,
@@ -90,15 +91,17 @@ def _pragma_text(connection: sqlite3.Connection, sql: str) -> str:
     return str(row[0])
 
 
-def test_fresh_db_creates_foundation_tables_and_pragmas(tmp_path: Path) -> None:
-    """fresh DB bootstrap 只创建 Phase 2 foundation tables 并设置 PRAGMA。"""
+def test_fresh_db_creates_foundation_and_phase3_tables(tmp_path: Path) -> None:
+    """fresh DB bootstrap 创建 foundation 与 Phase 3 state tables 并设置 PRAGMA。"""
 
     options = _options(tmp_path)
     with open_host_durable_store(options) as store:
         connection = store.connect()
         try:
-            assert _table_names(connection) == frozenset(FOUNDATION_TABLES)
-            assert _pragma_int(connection, "PRAGMA user_version") == HOST_SCHEMA_VERSION
+            assert _table_names(connection) == frozenset(HOST_DURABLE_TABLES)
+            assert set(PHASE3_STATE_TABLES).issubset(_table_names(connection))
+            assert _pragma_int(connection, "PRAGMA user_version") == 2
+            assert HOST_SCHEMA_VERSION == 2
             assert _pragma_int(connection, "PRAGMA foreign_keys") == 1
             assert _pragma_text(connection, "PRAGMA journal_mode").lower() == "wal"
             assert _pragma_int(connection, "PRAGMA busy_timeout") == 250
@@ -115,7 +118,7 @@ def test_bootstrap_is_idempotent_for_matching_schema(tmp_path: Path) -> None:
     with open_host_durable_store(options) as store:
         connection = store.connect()
         try:
-            assert _table_names(connection) == frozenset(FOUNDATION_TABLES)
+            assert _table_names(connection) == frozenset(HOST_DURABLE_TABLES)
             assert _pragma_int(connection, "PRAGMA user_version") == HOST_SCHEMA_VERSION
         finally:
             connection.close()
@@ -127,7 +130,7 @@ def test_schema_mismatch_raises_structured_error(tmp_path: Path) -> None:
     db_path = tmp_path / "durable.sqlite3"
     connection = sqlite3.connect(db_path)
     try:
-        connection.execute("PRAGMA user_version=2")
+        connection.execute("PRAGMA user_version=1")
         connection.commit()
         with pytest.raises(HostSchemaMismatchError):
             bootstrap_host_durable_store(connection)
@@ -203,12 +206,9 @@ def test_schema_constraints_are_explicit(tmp_path: Path) -> None:
 
 
 def test_schema_does_not_create_future_phase_tables(tmp_path: Path) -> None:
-    """Slice 1 bootstrap 不得预创建后续 phase 的业务表。"""
+    """Slice 1 bootstrap 不得预创建 Phase 3 之外的 future tables。"""
 
     forbidden_fragments = (
-        "session",
-        "run",
-        "attempt",
         "wait",
         "projection",
         "outbox",
