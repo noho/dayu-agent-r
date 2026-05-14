@@ -569,8 +569,8 @@ Engine final answer / failure ingest、Tool awaiting、`resolve_wait`、steer、
 | `cancel_run` on queued | Run `QUEUED` | Run `CANCELLED` | `CANCEL_REQUESTED`、`RUN_CANCELLED` | 无 |
 | `cancel_run` on waiting | Run `WAITING` | Run `CANCELLED` | `CANCEL_REQUESTED`、wait record cancelled fact、`RUN_CANCELLED` | 旧 Attempt 保持 `SUSPENDED`；不传播 cancel |
 | `cancel_run` on recovering before dispatch | Run `RECOVERING` 且无新 Attempt dispatch committed | Run `CANCELLED` | `CANCEL_REQUESTED`、`RUN_CANCELLED` | 不创建新 Attempt；不进入 `CANCELLING` |
-| `cancel_run` on pre-dispatch starting | Run `RUNNING` / Attempt `STARTING` 且 dispatch record `pending` / `waiting_for_lane` | Run `CANCELLED` / Attempt `CANCELLED` | `CANCEL_REQUESTED`、`ATTEMPT_CANCELLED`、`RUN_CANCELLED` | 标记 dispatch record cancelled；cancel lane wait；不通知 WorkerProxy |
-| `cancel_run` on dispatching / active running | Run `RUNNING` / `CANCELLING` 且 dispatch record `dispatching` 或 Attempt `RUNNING` | Run `CANCELLING`，后续 `CANCELLED` / `WAITING` / `LOST` | `CANCEL_REQUESTED`、`RUN_CANCELLING`，后续 terminal fact | commit 后向当前 Attempt / WorkerProxy 传播 cancel |
+| `cancel_run` on pre-worker starting | Run `RUNNING` / Attempt `STARTING` 且 dispatch record `pending` / `waiting_for_lane` / pre-accept `dispatching` | Run `CANCELLED` / Attempt `CANCELLED` | `CANCEL_REQUESTED`、`ATTEMPT_CANCELLED`、`RUN_CANCELLED` | 标记 dispatch record cancelled；cancel lane wait 或 wake scheduler release held lane；不通知 WorkerProxy |
+| `cancel_run` on active running | Run `RUNNING` / `CANCELLING` 且 Attempt `RUNNING` | Run `CANCELLING`，后续 `CANCELLED` / `WAITING` / `LOST` | `CANCEL_REQUESTED`、`RUN_CANCELLING`，后续 terminal fact | commit 后向当前 Attempt / WorkerProxy 传播 cancel |
 | `retry(run)` | Run `FAILED` 或 recoverable failure | 关联的新 Run `QUEUED` 或 `RUNNING` | `RETRY_REQUESTED`、新 Run 的 `RUN_ACCEPTED`，按 admission 追加 `RUN_QUEUED` 或 `RUN_STARTED(start_reason=initial)` / `ATTEMPT_STARTED` | 原 Run 终态不改；新 Run 创建自己的 Attempt |
 | `replay(run)` | Run `SUCCEEDED`，且 final answer 格式 / schema / 结构需修复 | 关联的新 Run `QUEUED` 或 `RUNNING` | `REPLAY_REQUESTED`、新 Run 的 `RUN_ACCEPTED`，按 admission 追加 `RUN_QUEUED` 或 `RUN_STARTED(start_reason=initial)` / `ATTEMPT_STARTED` | 原 Run 终态不改；新 Run 默认复用已接受工具事实 |
 | recovery scan | Run `RUNNING` / `CANCELLING` 且 active Attempt 不可确认 | Run `RECOVERING` 或 `LOST` | `ATTEMPT_LOST`、`RUN_RECOVERING` 或 `RUN_LOST` | 不 takeover |
@@ -1023,8 +1023,8 @@ Run 接口语义：
 - `stream_run_events`：从全局 `event_sequence` cursor 补读目标 Run 的事件；断线重连只依赖 cursor，不依赖内存订阅是否仍存在。
 - `close_session`：关闭 Session 新输入入口，按 `(session_id, client_request_id)` 幂等；不取消、不终止、不删除已有 Run。
 - `purge_session`：清理已关闭且全部 Run 终态的 Session，按 `(session_id, client_request_id)` 幂等；删除可恢复事实与 projection，只保留最小 purge tombstone / audit record。
-- `cancel_run`：接受取消请求，按 `(run_id, client_request_id)` 幂等；queued Run 直接 `CANCELLED`，pre-dispatch `STARTING` Run 可直接 `CANCELLED`。dispatching / active worker cancel 进入 `CANCELLING` 并向当前 Attempt 传播 cancel 的完整能力由 Phase 5 落地；`WAITING` 与 `RECOVERING` cancel 分别由 Phase 7 / Phase 11 落地。
-- `cancel_session_runs`：接受 session-scope cancel 请求，按 `(session_id, client_request_id)` 幂等；取消该 Session 下所有未终态 Run，不影响其它 Session。Phase 4 只实现 queued / pre-dispatch `STARTING` 子集，完整 dispatching / active worker、`WAITING`、`RECOVERING` cancel 必须由 Phase 5 / 7 / 11 补齐。
+- `cancel_run`：接受取消请求，按 `(run_id, client_request_id)` 幂等；queued Run 直接 `CANCELLED`，pre-worker `STARTING` Run 可直接 `CANCELLED`，包括 `pending`、`waiting_for_lane` 以及 WorkerProxy accepted 前的 `dispatching`。active worker cancel 进入 `CANCELLING` 并向当前 Attempt 传播 cancel 的完整能力由 Phase 5 落地；`WAITING` 与 `RECOVERING` cancel 分别由 Phase 7 / Phase 11 落地。
+- `cancel_session_runs`：接受 session-scope cancel 请求，按 `(session_id, client_request_id)` 幂等；取消该 Session 下所有未终态 Run，不影响其它 Session。Phase 4 只实现 queued / pre-dispatch `STARTING` 子集，完整 pre-worker `dispatching` / active worker、`WAITING`、`RECOVERING` cancel 必须由 Phase 5 / 7 / 11 补齐。
 - `submit_followup`：接受同一 Session 的会话延续输入。聊天界面的普通 prompt 入口应统一使用该接口，不应由调用方先读 active Run 再在 `start_run` / `submit_followup` 之间选择。`behavior=queue` 由 Host admission 在同一事务内决定排队或直接启动；`behavior=steer` 必须命中 `target_run_id` 所指的当前 active Run 并切换 Attempt。Phase 4 只冻结 steer envelope、validation 与 error/detail contract，public facade 对 steer 返回 `unsupported_operation`；完整 Attempt switching 后续落地。
 - `retry_run`：公开 Host control API，由调用方主动发起；函数式语义为 `retry(run)`。它在 confirmed failure / recoverable failure 后创建关联的新 Run。原 Run 保持终态不可变；新 Run 可以按 retry policy 复用旧 Run 已接受工具事实，并创建自己的 Attempt。
 - `replay_run`：公开 Host control API，由调用方主动发起；函数式语义为 `replay(run)`。它只用于 final answer 格式、schema、结构或输出 envelope 失败时创建关联的新 Run。原 `SUCCEEDED` Run 不重开；新 Run 默认复用旧 Run 已接受工具事实，并以 no-tool messages 调用做结构修复。事实内容脏、幻觉、业务归因错误、证据不足或证据冲突不属于 replay 场景。
@@ -1663,16 +1663,23 @@ Remote boundary：
 - cancel 由 Host 发起，通过 Proxy / Stub 传递到 EngineWorker 的 run-local cancellation token；远端不自行决定 Run 终态。
 - Host 不保证 exactly-once 远程物理执行。dispatch 后、Host 确认前发生断连时，旧远端执行可能继续运行；Host 通过 `execution_id` 拒绝迟到事件，并依赖工具级 idempotency key / best-effort cancel 降低外部副作用风险。
 
+LocalProxy / EngineWorker identity boundary：
+
+- Engine 公共 `EngineEvent` 契约只表达 Engine run 内部事件，不提升为 Host Attempt identity carrier；不得为了 Phase 5 让 Engine 理解 Host `Attempt`、Host durable state、dispatch record 或 recovery policy。
+- Host-owned LocalProxy / EngineWorker envelope 负责把一次 Engine run 绑定到 `session_id`、`run_id`、`attempt_id`、`execution_id`、dispatch record 和 cancellation source。Host ingest 只能接受来自该 envelope 的 scoped event；`attempt_id + execution_id` 校验发生在 Host ingest 边界。
+- 本地执行路径中，EngineWorker 可以把 Engine 原始事件与 Host envelope 组合成 Host ingest candidate；该 candidate 不是 Engine 公共契约，不得反向污染 `dayu.engine.contracts`。
+- RemoteProxy 后续必须复用同一 envelope 语义；wire protocol 可以改变传输形态，但不能把 `attempt_id + execution_id` 校验职责转交给 Engine 或 RemoteStub。
+
 Worker dispatch semantic contract：
 
 ```text
 Host transaction commits ATTEMPT_STARTED with status STARTING
   -> dispatch record status = pending
   -> Attempt Dispatch reads dispatch record
-  -> Attempt Dispatch waits for configured LLM lane
+  -> Attempt Dispatch marks dispatch record waiting_for_lane when it starts waiting for configured LLM lane
   -> after lane acquired, open short Host transaction
        -> re-read Run / Attempt / dispatch record
-       -> verify Attempt STARTING, Run dispatchable, execution_id matches, dispatch record pending, no cancel / terminal committed
+       -> verify Attempt STARTING, Run dispatchable, execution_id matches, dispatch record waiting_for_lane or pending, no cancel / terminal committed
        -> if valid: update dispatch record status = dispatching, record dispatcher_instance_id / lane_name diagnostic refs, commit
        -> if invalid: commit nothing, release lane, do not call WorkerProxy
   -> WorkerProxy receives dispatch request with attempt snapshot
@@ -1683,7 +1690,7 @@ Host transaction commits ATTEMPT_STARTED with status STARTING
   -> Host ingests events and owns all state transitions
 ```
 
-LLM lane 控制资源容量，不控制 Session admission。acquire 不到 lane 时，Attempt 保持 `STARTING`，dispatch record 保持 pending / waiting-for-lane，不 append `ATTEMPT_RUNNING`，不启动 EngineWorker。lane acquire 成功后仍必须 recheck durable state，确认 Attempt 仍为 `STARTING`、Run 仍可派发、dispatch record 仍 pending、`execution_id` 仍匹配且 cancel / terminal 没有抢先提交。recheck 成功必须先把 dispatch record 原子推进为 `dispatching`，再调用 WorkerProxy；recheck 失败必须 release lane，不得派发。
+LLM lane 控制资源容量，不控制 Session admission。acquire 不到 lane 时，Attempt 保持 `STARTING`，dispatch record 保持 `pending` 或 `waiting_for_lane`，不 append `ATTEMPT_RUNNING`，不启动 EngineWorker。Phase 5 必须把 `waiting_for_lane` 和 `dispatching` 纳入 dispatch record fresh schema 与 typed enum；这是 Host dispatch 诊断 / 重复派发抑制状态，不是 lease / fencing。lane acquire 成功后仍必须 recheck durable state，确认 Attempt 仍为 `STARTING`、Run 仍可派发、dispatch record 仍处于 `pending` 或 `waiting_for_lane`、`execution_id` 仍匹配且 cancel / terminal 没有抢先提交。recheck 成功必须先把 dispatch record 原子推进为 `dispatching`，再调用 WorkerProxy；recheck 失败必须 release lane，不得派发。
 
 `dispatching` 与 `dispatcher_instance_id` 只用于本机调度诊断、重复派发抑制和 recovery 判断，不是 lease，不是 fencing token，不授权旧 Attempt takeover。lane token 也不是 Host truth、不是 lease、不是 fencing token、不是 Attempt owner；它只是本地或运行时资源 guard。Attempt terminal、dispatch 失败、Host cancel 或 supervisor shutdown 都必须 release / cancel 对应 lane wait 或 held token。
 
@@ -1709,6 +1716,19 @@ dispatch record = dispatching
   -> Run -> FAILED / RECOVERING / LOST by Host policy and recoverability
 ```
 
+Phase 5 本地执行的最小 terminal closeout policy：
+
+| 场景 | Attempt 终态 | Run 终态 | recoverable | 最小诊断 / reason |
+| --- | --- | --- | --- | --- |
+| WorkerProxy 调用前 final pre-call recheck 发现 Attempt 不再是 `STARTING`、dispatch record 不再是 `dispatching` 或 cancel / terminal 已提交 | 不新增终态，由已提交事实决定 | 不新增终态，由已提交事实决定 | false | `dispatch_aborted_by_durable_recheck`，包含 dispatch record ref、attempt status、run status |
+| WorkerProxy 调用异常、worker reject 或 startup timeout，且 worker 未 accepted | `FAILED` | `FAILED` | false | `worker_startup_failed` / `worker_rejected` / `worker_startup_timeout`，包含 dispatch record ref、worker kind、execution target、error code |
+| EngineWorker 已 accepted 后返回结构化 `run_failed` | `FAILED` | `FAILED`，除非当前 phase 已有显式 recovery owner | 取 Engine event `recoverable` 作为诊断，不在 Phase 5 自动 recovery | Engine failure code、message、provider request id、recoverable |
+| EngineEvent stream clean EOF 但没有 accepted terminal event | `FAILED` | `FAILED` | false | `stream_ended_without_terminal`，包含最后 accepted / preview event refs |
+| EngineEvent stream error、transport close 或本地 worker crash，且 terminal result 无法确认 | `LOST` | `LOST` | false in Phase 5 | `worker_lost_before_terminal`，包含 worker lifecycle signal、stream error refs、last observed event refs |
+| Engine emits recoverable failure that requires a later phase owner, such as reactive context compaction before Phase 10 policy exists | `FAILED` | `FAILED` | diagnostic-only in Phase 5 | `unsupported_recovery_policy`，包含 original error code and later owner |
+
+Phase 5 不创建 automatic recovery Attempt，不把 local execution abnormal closeout 直接推入 `RECOVERING`。`RECOVERING` / recovery dispatch 由 Phase 10 reactive context governance 或 Phase 11 lifecycle / recovery 在各自 design refinement 中接入；Phase 5 plan 若要处理 recoverable Engine failure，必须明确只是记录 diagnostic 并失败收口，或证明 fake local execution 不会产生该路径。
+
 Host recovery scan 遇到 `dispatch record = dispatching` 且 Attempt 仍为 `STARTING` 时，必须具备 positive orphan proof 才能把该 Attempt 标为 `LOST`。随后 Run 按 recovery policy 进入 `RECOVERING` 或 `LOST`。`dispatching` / `dispatcher_instance_id` 不授权 takeover，也不允许旧 Attempt 继续拥有 Host 状态。
 
 attempt snapshot 至少包含：
@@ -1719,7 +1739,20 @@ attempt snapshot 至少包含：
 - ToolExecutor capability snapshot。
 - policy snapshot ids / refs required to explain execution.
 
+lane token lifecycle：
+
+- Lane token 从 acquire 成功后开始由 dispatch supervisor 持有；如果 durable recheck 失败，必须立即 release，且不得调用 WorkerProxy。
+- durable recheck 成功并提交 `dispatching` 后，lane token 继续由 dispatch supervisor / worker execution context 持有，直到 Attempt terminal closeout、dispatch abort、WorkerProxy reject、startup timeout、cancel direct closeout 或 supervisor shutdown。
+- WorkerProxy accept 后，lane token 不能在 `ATTEMPT_RUNNING` 前提前释放；否则 LLM provider 容量治理会和真实执行脱钩。
+- cancel path 不直接假设自己持有 lane token。它只提交 canonical cancel / terminal facts、更新 dispatch record，并 wake dispatch scheduler；实际 token release 由持有 token 的 scheduler / worker finally 路径完成。
+
 RemoteProxy、RemoteStub 与 EngineWorker 可以缓存 attempt snapshot 服务本次执行，但该 snapshot 不是远端治理状态；Host durable store 才是治理真源。
+
+Phase 5 ToolRuntime / wait boundary：
+
+- Phase 5 只允许 no-tool 或最小 fake ToolExecutor 支撑本地 Engine 执行闭环；不得实现 ToolRuntime governance、ToolBundle snapshot、Host accept barrier、`fetch_more`、语义级重复工具调用治理或 wait record。
+- Phase 5 不创建 `WAITING` Run，不实现 `resolve_wait`，不把 EngineEvent `tool_awaiting` / `run_suspended` 解释为 Tool Awaiting canonical owner。第一版若收到 awaiting / suspended 路径，只能按当前 phase 的 unsupported execution path 记录诊断并收口为结构化失败，或在 plan 中证明 fake executor 不会产生该路径。
+- Phase 6 / Phase 7 分别拥有 ToolRuntime governance 与 Tool Awaiting / `resolve_wait`；Phase 5 的 implementation 和测试不得通过临时 wait table、局部 ToolRuntime wrapper 或 Engine 特化分支提前实现这些能力。
 
 Tool fact accept ack 语义：
 
@@ -2124,10 +2157,10 @@ client requests cancel
   -> Host appends CANCEL_REQUESTED
   -> if Run is QUEUED: Run -> CANCELLED
   -> if Run is RECOVERING before new dispatch: Run -> CANCELLED
-  -> if Attempt STARTING and dispatch record pending / waiting_for_lane: Attempt -> CANCELLED and Run -> CANCELLED
-  -> if dispatching or active Attempt running: Host appends RUN_CANCELLING and Run -> CANCELLING
+  -> if Attempt STARTING and dispatch record pending / waiting_for_lane / dispatching before WorkerProxy accepted: Attempt -> CANCELLED and Run -> CANCELLED
+  -> if active Attempt RUNNING: Host appends RUN_CANCELLING and Run -> CANCELLING
   -> commit
-  -> Host sends cancel through LocalProxy / RemoteProxy after commit only when dispatching / active worker exists
+  -> Host sends cancel through LocalProxy / RemoteProxy after commit only when active worker exists
   -> EngineWorker maps cancel to run-local cancellation token
   -> Engine emits run_cancelled when cancellation wins execution boundary
   -> Host validates attempt_id + execution_id
@@ -2140,7 +2173,8 @@ client requests cancel
 - `WAITING` Run 被取消时，Host 直接收口为 `CANCELLED`：append `CANCEL_REQUESTED`，标记 active wait record cancelled，append `RUN_CANCELLED`；外部 job 的实际取消属于 adapter best-effort 能力，不作为第一版保证。
 - `RECOVERING` 且新 Attempt 尚未 dispatch committed 时直接进入 `CANCELLED`；不创建新 Attempt，不进入 `CANCELLING`。
 - Attempt `STARTING` 且 dispatch record 仍为 `pending` / `waiting_for_lane` 时直接收口：append `CANCEL_REQUESTED`、`ATTEMPT_CANCELLED`、`RUN_CANCELLED`，标记 dispatch record cancelled，cancel lane wait / wake dispatch scheduler，释放 active slot 并触发 queue promotion check；不通知 EngineWorker。
-- dispatch record 已进入 `dispatching` 或 Attempt 已 `RUNNING` 时，必须 append `CANCEL_REQUESTED` + `RUN_CANCELLING` 并向 WorkerProxy 传播 cancel。`CANCEL_REQUESTED` 表达取消意图，`RUN_CANCELLING` 表达 Run 状态迁移。
+- dispatch record 已进入 `dispatching` 但 Attempt 仍为 `STARTING` 时，表示 lane 已 acquire 且 dispatching commit 已完成，但 WorkerProxy 尚未 accepted。该窗口仍按 pre-worker direct cancel 收口：append `CANCEL_REQUESTED`、`ATTEMPT_CANCELLED`、`RUN_CANCELLED`，标记 dispatch record `cancelled`，wake dispatch scheduler，释放 active slot 并触发 queue promotion check；不得进入 `CANCELLING`，不得等待不存在的 WorkerProxy。持有 lane token 的 dispatch scheduler 必须在 WorkerProxy 调用前做 final pre-call recheck；若看到 cancel / terminal 已提交或 dispatch record 已 `cancelled`，必须 release lane token 并跳过 WorkerProxy。
+- Attempt 已 `RUNNING` 时，必须 append `CANCEL_REQUESTED` + `RUN_CANCELLING` 并向 WorkerProxy 传播 cancel。`CANCEL_REQUESTED` 表达取消意图，`RUN_CANCELLING` 表达 Run 状态迁移。`dispatching` 本身不等于 active worker；只有 `ATTEMPT_RUNNING` 已 durable accepted 后才说明 WorkerProxy / EngineWorker 已接受执行。
 - terminal fact 已提交后，cancel 不能改写 terminal。
 - cancel 只阻止未来工作，不覆盖已接受事实。
 - 已接受 tool result、awaiting outcome、final decision、canonical facts 继续保留。
@@ -2158,11 +2192,11 @@ Phase 4 只实现 `cancel_session_runs` 的 Phase 1-3 可闭环子集：`QUEUED`
 `cancel_session_runs` 语义：
 
 - 作用范围是指定 `session_id` 下所有 non-terminal Run。
-- 包含 `QUEUED`、`RUNNING`、`WAITING`、`CANCELLING`、`RECOVERING`，以及 Attempt `STARTING` / waiting-for-lane 场景。
+- 包含 `QUEUED`、`RUNNING`、`WAITING`、`CANCELLING`、`RECOVERING`，以及 Attempt `STARTING` / `waiting_for_lane` 场景。
 - 不影响其它 Session，不影响已终态 Run。
 - 幂等范围是 `(session_id, client_request_id)`。
 - queued Run 直接 `CANCELLED`，不创建 Attempt。
-- Attempt `STARTING` 且尚未 dispatch / 正在 waiting-for-lane 时直接取消，不通知 EngineWorker。
+- Attempt `STARTING` 且尚未 dispatch / 正在 `waiting_for_lane` 时直接取消，不通知 EngineWorker。
 - 已 dispatch / active running Attempt 走普通 `cancel_run` 传播到 WorkerProxy；Phase 5 owns 该路径。
 - `WAITING` Run 取消 wait record；外部 job 物理取消由 adapter best-effort；Phase 7 owns 该路径。
 - `RECOVERING` Run 的取消由 Phase 11 recovery owner 接入。

@@ -581,6 +581,9 @@ Phase 按依赖关系推进：先实现被其它阶段依赖的公共契约、ru
 - 必须确认 `AgentRunRequest.messages` 由 canonical facts 重建，不读取 UI 临时文本。
 - 必须确认 lane acquire 后 recheck / dispatching / ATTEMPT_RUNNING 的精确 transaction 边界。
 - 必须确认 EngineEvent terminal / non-terminal / stream EOF 的 Host 收口规则。
+- 已确认 Engine 公共 `EngineEvent` 契约不携带 Host Attempt identity；`attempt_id + execution_id` 由 Host-owned LocalProxy / EngineWorker envelope 绑定并在 Host ingest 边界校验。
+- 已确认 Phase 5 fresh schema / typed enum 必须扩展 dispatch record 状态到至少 `pending`、`waiting_for_lane`、`dispatching`、`cancelled`；这些状态只表达 dispatch 诊断与重复派发抑制，不表达 lease / fencing / Attempt owner。
+- 已确认 Phase 5 不实现 ToolRuntime governance、wait record 或 `resolve_wait`；`tool_awaiting` / `run_suspended` 不得在本 phase 创建 `WAITING` canonical truth。
 
 交付物：
 - phase design refinement
@@ -1527,6 +1530,43 @@ terminal `RunSnapshot` 语义不一致；验证为
 destination。Phase 5 进入前必须先做 phase discussion / design refinement，确认 RunInputBuilder typed provider、
 lane acquire 后 recheck / dispatching / `ATTEMPT_RUNNING` transaction 边界，以及 EngineEvent terminal /
 non-terminal / stream EOF 收口规则。
+
+Phase 5 design discussion 已确认以下 design refinement 决策，并写入
+`docs/reviews/gateflow-phase-design-host-p5-codex-20260514.md` 与 `docs/host/design.md`：Engine 公共
+`EngineEvent` 契约保持 Host-agnostic，`attempt_id + execution_id` 由 Host-owned LocalProxy / EngineWorker
+envelope 绑定并在 Host ingest 边界校验；Phase 5 fresh schema / typed enum 必须扩展 dispatch record 状态到至少
+`pending`、`waiting_for_lane`、`dispatching`、`cancelled`；Phase 5 只允许 no-tool 或最小 fake ToolExecutor 支撑本地
+Engine 执行闭环，不实现 ToolRuntime governance、wait record 或 `resolve_wait`，`tool_awaiting` / `run_suspended`
+不得在本 phase 创建 `WAITING` canonical truth。当前 gate 为 Phase 5 design re-review；需要 AgentMiMo 与 AgentDS
+独立 review 后由 controller 裁决，blocking finding 修复并 re-review 通过后才进入 Phase 5 plan gate。
+Phase 5 design re-review artifacts 为 `docs/reviews/gateflow-phase-design-re-review-host-p5-mimo-20260514.md` 与
+`docs/reviews/gateflow-phase-design-re-review-host-p5-ds-20260514.md`。Controller adjudication artifact 为
+`docs/reviews/gateflow-phase-design-re-review-host-p5-controller-adjudication-20260514.md`：AgentMiMo 无 blocking
+finding；AgentDS F1 / F2 已裁决为 accepted-blocking，分别要求补齐本地执行异常 terminal closeout 判定表，以及
+`dispatching + Attempt STARTING` 且 WorkerProxy 尚未 accepted 窗口内的 cancel / lane token owner 语义。
+Design fix artifact 为 `docs/reviews/gateflow-phase-design-fix-host-p5-codex-20260514.md`；fix 已写回
+`docs/host/design.md` §17 / §22。当前 gate 为 Phase 5 design fix re-review；F1 / F2 经 re-review 确认 fixed 后才可进入
+Phase 5 plan gate。DS F3-F6 与 MiMo observation findings 已裁决为 plan-gate 检查项，不阻塞 design fix re-review。
+Phase 5 design fix re-review 已由 AgentMiMo 与 AgentDS 完成，artifacts 分别为
+`docs/reviews/gateflow-phase-design-fix-re-review-host-p5-mimo-20260514.md` 与
+`docs/reviews/gateflow-phase-design-fix-re-review-host-p5-ds-20260514.md`；两者均确认 DS F1 / F2 fixed，且无新
+blocking finding。Controller fix re-review adjudication artifact 为
+`docs/reviews/gateflow-phase-design-fix-re-review-host-p5-controller-adjudication-20260514.md`。当前 gate 为 Phase 5
+handoff implementation-ready plan；plan 必须把 DS F3-F6 与 MiMo observations 作为 plan review 检查项显式覆盖。
+Phase 5 handoff implementation-ready plan 已写入
+`docs/host/phase5-runinputbuilder-local-dispatch-plan.md`。Plan review artifacts 为
+`docs/reviews/gateflow-plan-review-host-p5-runinputbuilder-local-dispatch-mimo-20260514.md` 与
+`docs/reviews/gateflow-plan-review-host-p5-runinputbuilder-local-dispatch-ds-20260514.md`；两份 review 均无 blocking
+finding。Controller plan review adjudication artifact 为
+`docs/reviews/gateflow-plan-review-host-p5-runinputbuilder-local-dispatch-controller-adjudication-20260514.md`，已裁决
+MiMo F001-F006 与 DS F-N1 / F-N2 为 plan-fix items。Plan fix artifact 为
+`docs/reviews/gateflow-plan-fix-host-p5-runinputbuilder-local-dispatch-codex-20260514.md`。Plan fix re-review artifacts 为
+`docs/reviews/gateflow-plan-re-review-host-p5-runinputbuilder-local-dispatch-mimo-20260514.md` 与
+`docs/reviews/gateflow-plan-re-review-host-p5-runinputbuilder-local-dispatch-ds-20260514.md`；两者均确认所有 plan findings
+fixed、无新 blocker。Controller plan re-review adjudication artifact 为
+`docs/reviews/gateflow-plan-re-review-host-p5-runinputbuilder-local-dispatch-controller-adjudication-20260514.md`。当前
+gate 为 Phase 5 accepted plan local checkpoint；checkpoint 后进入 P5-S1 Dispatch Schema And Transition Primitives
+implementation。
 
 历史状态：Phase 1 公共契约与 runtime 基础设施已完成并 merge；Phase 2 Durable Store / EventLog / Payload Foundation 已完成 plan、3 个 implementation slices、aggregate deepreview、aggregate fix、aggregate re-review 与 accepted deepreview commit，本 phase 状态为 completed。Phase 1 design refinement 已写入 `docs/reviews/gateflow-phase-design-host-p1-codex-20260513.md`，controller-accepted design fix 已写入 `docs/reviews/gateflow-phase-design-fix-host-p1-codex-20260513.md`。用户反馈后的 design fixes 已写入 `docs/reviews/gateflow-phase-design-user-feedback-fix-host-p1-codex-20260513.md` 与 `docs/reviews/gateflow-phase-design-user-feedback-fix2-host-p1-codex-20260513.md`。AgentMiMo 与 AgentDS 的 phase design re-review 均确认 accepted findings 已修复且 new blocker 为 0；round2 re-review 进一步确认 lane 已改为 cross-process runtime capacity guard，Phase Map 已重排为 P12 ToolsDiscovery / ScenePrepare、P13 Audit / Tool Trace / Outbox、P14 RemoteProxy、P15 Retention / Purge。Phase 1 plan 已写入 `docs/host/phase1-public-contract-runtime-plan.md`；plan review、controller adjudication、plan fix 与 plan re-review artifacts 已写入 `docs/reviews/`。AgentMiMo 与 AgentDS 的 plan re-review 均确认 finding 数量为 0、blocking finding 数量为 0。用户已确认 Phase 1 plan；accepted plan commit 为 `34b1b41`。Phase 1 Slice 1 accepted slice commit 为 `66d8dc3`，Slice 2 accepted slice commit 为 `27e0d8b`，Slice 3 accepted slice commit 为 `e23e3e4`，Slice 4 accepted slice commit 为 `0393a22`。
 
