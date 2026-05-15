@@ -238,6 +238,7 @@ PASS，blocking design deviation 为 0。Controller adjudication artifact 为
 `docs/reviews/host-phase6-plan-re-review-mimo-20260515.md` 与
 `docs/reviews/host-phase6-plan-re-review-ds-20260515.md`；controller plan re-review adjudication artifact 为
 `docs/reviews/host-phase6-plan-re-review-controller-adjudication-20260515.md`。两路 re-review 均 PASS，blocking count 为 0。
+Phase 6 accepted plan commit 为 `04517f5`。
 当前 gate 为 Phase 6 implementation user confirmation；用户确认后从 P6-S1
 `Effective ToolBundle And RunInputBuilder Wiring` 开始 implementation。需要继续追踪的 non-blocking hardening、
 deferred capability 与后续 phase owner 已写入 `Open Questions 与风险追踪` 的
