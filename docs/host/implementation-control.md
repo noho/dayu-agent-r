@@ -1619,10 +1619,27 @@ Controller re-review adjudication artifact 为
 11 passed；`python -m pyright dayu/host tests/host` 0 errors；`git diff --check` passed。P5-S4 accepted slice commit 为
 `ab256d1`。P5-S4 controlled scope expansion：`dayu/host/durable/state.py` 新增 `cancel_cancelling_run_row` 与
 `cancel_running_attempt_row`，虽不在原 P5-S4 allowed files，但经 MiMo、DS 与 controller 裁决为正确 durable state row CAS
-ownership，优于在 `run_transition.py` 直接写 SQL。P5-S4 residual risks：dispatch scheduler 尚未把 worker stream 接入
-`EngineEventIngestor`；active cancel propagation 到 LocalProxy 属于 P5-S5；preview、unsupported waiting、provider protocol
-error、terminal-late 与 run_cancelled-without-active-cancel 负例可由后续测试 hardening 补齐。当前 gate 为 P5-S5 Active Cancel
-And Session-scope Cancel implementation。
+ownership，优于在 `run_transition.py` 直接写 SQL。P5-S4 residual risks：preview、unsupported waiting、provider protocol
+error、terminal-late 与 run_cancelled-without-active-cancel 负例可由后续测试 hardening 补齐。
+P5-S5 Active Cancel And Session-scope Cancel 已完成 implementation、code review、accepted fix、code re-review、controller
+裁决、README / tests README 同步与 accepted slice commit。Implementation artifact 为
+`docs/reviews/gateflow-implementation-host-p5-s5-active-cancel-session-scope-20260515.md`；code review artifacts 为
+`docs/reviews/gateflow-code-review-host-p5-s5-active-cancel-session-scope-mimo-20260515.md` 与
+`docs/reviews/gateflow-code-review-host-p5-s5-active-cancel-session-scope-ds-20260515.md`。DS Finding 1 与 MiMo F2 已裁决为
+accepted fix items：测试不得以非法裸 SQL 组合伪造 active worker，scheduler 连接 `EngineEventIngestor` 时必须提供实际
+queue promotion wakeup port；fix artifact 为
+`docs/reviews/gateflow-fix-host-p5-s5-active-cancel-session-scope-20260515.md`。Code re-review artifacts 为
+`docs/reviews/gateflow-code-re-review-host-p5-s5-active-cancel-session-scope-mimo-20260515.md` 与
+`docs/reviews/gateflow-code-re-review-host-p5-s5-active-cancel-session-scope-ds-20260515.md`；两者均 PASS 且无 blocking
+finding。Controller re-review adjudication artifact 为
+`docs/reviews/gateflow-code-re-review-host-p5-s5-active-cancel-session-scope-controller-adjudication-20260515.md`。P5-S5
+validation：`pytest tests/host/test_active_cancel_dispatch.py tests/host/test_public_cancel_session_runs.py tests/host/test_public_run_api.py -q`
+22 passed；`python -m pyright dayu/host tests/host` 0 errors；`git diff --check` passed。P5-S5 accepted slice commit 为
+`cdde31d`。P5-S5 residual risks：active cancel watchdog 仍未实现，worker 收到 cancel 后若长期不产出 terminal，Run 可能停留在
+`CANCELLING`；session cancel replay 的 active target truth 仍锚定首个 active cancel event，当前单 active Run invariant 下非
+blocking，若未来扩展多 active 语义必须重设 replay target truth；`cancel_run` 幂等重放不重传播 active cancel target，留给后续
+lifecycle / recovery hardening；terminal 后 queue promotion wakeup 失败目前会浮出 worker event task，`finally` 仍负责 unregister /
+close / release lane，后续可补 diagnostic suppression。当前 gate 为 P5-S6 Integration, Docs And Validation Closeout。
 
 历史状态：Phase 1 公共契约与 runtime 基础设施已完成并 merge；Phase 2 Durable Store / EventLog / Payload Foundation 已完成 plan、3 个 implementation slices、aggregate deepreview、aggregate fix、aggregate re-review 与 accepted deepreview commit，本 phase 状态为 completed。Phase 1 design refinement 已写入 `docs/reviews/gateflow-phase-design-host-p1-codex-20260513.md`，controller-accepted design fix 已写入 `docs/reviews/gateflow-phase-design-fix-host-p1-codex-20260513.md`。用户反馈后的 design fixes 已写入 `docs/reviews/gateflow-phase-design-user-feedback-fix-host-p1-codex-20260513.md` 与 `docs/reviews/gateflow-phase-design-user-feedback-fix2-host-p1-codex-20260513.md`。AgentMiMo 与 AgentDS 的 phase design re-review 均确认 accepted findings 已修复且 new blocker 为 0；round2 re-review 进一步确认 lane 已改为 cross-process runtime capacity guard，Phase Map 已重排为 P12 ToolsDiscovery / ScenePrepare、P13 Audit / Tool Trace / Outbox、P14 RemoteProxy、P15 Retention / Purge。Phase 1 plan 已写入 `docs/host/phase1-public-contract-runtime-plan.md`；plan review、controller adjudication、plan fix 与 plan re-review artifacts 已写入 `docs/reviews/`。AgentMiMo 与 AgentDS 的 plan re-review 均确认 finding 数量为 0、blocking finding 数量为 0。用户已确认 Phase 1 plan；accepted plan commit 为 `34b1b41`。Phase 1 Slice 1 accepted slice commit 为 `66d8dc3`，Slice 2 accepted slice commit 为 `27e0d8b`，Slice 3 accepted slice commit 为 `e23e3e4`，Slice 4 accepted slice commit 为 `0393a22`。
 
