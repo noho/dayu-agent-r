@@ -1671,6 +1671,25 @@ head branch 为 `feat/host-phase5-local-dispatch`，base branch 为 `main`。PR 
 plan、6 个 implementation slices、code review、fix / re-review、aggregate deepreview、controller 裁决、accepted local commits、
 branch push 与 draft PR create 均已完成并记录 artifact / commit hash / PR URL；工作区检查为 clean；剩余风险均已有后续
 owner。后续 Phase 6 / 7 / 9 / 10 / 11 / 13 / 14 以及集成环境验证必须继续接收各自 deferred 项。
+PR 54 手工 review gate 已打开。当前可见手工 review artifacts 为
+`docs/reviews/pr-54-review-20260515-1056.md` 与 `docs/reviews/pr-54-review-20260515-1102.md`；用户说明共有 3 份手工
+review，但 GitHub PR API / thread-aware fetch 与本地文件搜索当前只发现 2 份，第三份暂记为 missing evidence，后续出现时必须追加处理。
+Controller PR review adjudication artifact 为 `docs/reviews/pr-54-review-controller-adjudication-20260515.md`。裁决结论：
+PR 54 退出 ready 状态并进入 PR review fix gate；dispatch / lane / worker lifecycle、Engine ingest idempotency、
+RunInputBuilder message semantics、Phase 5 supported integration tests 与 `HostCommandHandleOptions.local_execution` root-cause
+decision 均为当前 gate 必须处理的 accepted items；schema v2 -> v3 旧库迁移按 fresh schema 约束 rejected；active cancel watchdog、
+default worker hard cancel、retry / replay failure-context projection 等仍保留后续 owner。当前 gate 为 PR 54 review fix。
+PR 54 review fix 已完成。Fix artifact 为
+`docs/reviews/pr-54-review-fix-host-p5-local-dispatch-codex-20260515.md`，accepted fix commit 为 `310c812`。Re-review
+artifacts 为 `docs/reviews/pr-54-review-fix-re-review-host-p5-local-dispatch-mimo-20260515.md` 与
+`docs/reviews/pr-54-review-fix-re-review-host-p5-local-dispatch-ds-20260515.md`；两份 re-review 均 PASS 且无 blocking
+finding。Controller re-review adjudication artifact 为
+`docs/reviews/pr-54-review-fix-re-review-controller-adjudication-20260515.md`。Controller validation：`pytest tests/host/test_public_contracts.py tests/host/test_command_handle.py tests/host/test_dispatch_scheduler.py tests/host/test_engine_ingest_mapping.py tests/host/test_run_input_builder.py tests/host/test_state_schema.py tests/host/test_run_attempt_transitions.py -q`
+103 passed；`pytest tests/host tests/runtime -q` 356 passed；`python -m pyright dayu/host tests/host` 0 errors；
+`python -m pyright dayu/ tests/ utils/` 0 errors；`git diff --check` passed。当前 PR 54 review gate 状态为 accepted；
+current gate 为 PR 54 draft branch update / push。剩余风险均有 owner：active cancel watchdog、pre-registration cancel
+retry / watchdog 与 durable-unavailable recovery 归 Phase 11；ToolRuntime canonical tool facts 归 Phase 6；RunInputBuilder
+读事务一致性与 recoverable RUN_FAILED diagnostic 顺序为后续 cleanup，不阻塞当前 PR。
 
 历史状态：Phase 1 公共契约与 runtime 基础设施已完成并 merge；Phase 2 Durable Store / EventLog / Payload Foundation 已完成 plan、3 个 implementation slices、aggregate deepreview、aggregate fix、aggregate re-review 与 accepted deepreview commit，本 phase 状态为 completed。Phase 1 design refinement 已写入 `docs/reviews/gateflow-phase-design-host-p1-codex-20260513.md`，controller-accepted design fix 已写入 `docs/reviews/gateflow-phase-design-fix-host-p1-codex-20260513.md`。用户反馈后的 design fixes 已写入 `docs/reviews/gateflow-phase-design-user-feedback-fix-host-p1-codex-20260513.md` 与 `docs/reviews/gateflow-phase-design-user-feedback-fix2-host-p1-codex-20260513.md`。AgentMiMo 与 AgentDS 的 phase design re-review 均确认 accepted findings 已修复且 new blocker 为 0；round2 re-review 进一步确认 lane 已改为 cross-process runtime capacity guard，Phase Map 已重排为 P12 ToolsDiscovery / ScenePrepare、P13 Audit / Tool Trace / Outbox、P14 RemoteProxy、P15 Retention / Purge。Phase 1 plan 已写入 `docs/host/phase1-public-contract-runtime-plan.md`；plan review、controller adjudication、plan fix 与 plan re-review artifacts 已写入 `docs/reviews/`。AgentMiMo 与 AgentDS 的 plan re-review 均确认 finding 数量为 0、blocking finding 数量为 0。用户已确认 Phase 1 plan；accepted plan commit 为 `34b1b41`。Phase 1 Slice 1 accepted slice commit 为 `66d8dc3`，Slice 2 accepted slice commit 为 `27e0d8b`，Slice 3 accepted slice commit 为 `e23e3e4`，Slice 4 accepted slice commit 为 `0393a22`。
 
