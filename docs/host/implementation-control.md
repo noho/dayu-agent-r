@@ -1705,7 +1705,7 @@ blocking finding。Controller final adjudication artifact 为
 `docs/reviews/pr-54-review-additional-fix-re-review-controller-adjudication-20260515.md`。Controller validation：
 `pytest tests/host/test_public_contracts.py tests/host/test_import_boundary.py tests/host/test_run_input_builder.py tests/host/test_engine_ingest_mapping.py tests/host/test_dispatch_scheduler.py tests/host/test_local_proxy_engine_ingest.py tests/host/test_run_attempt_transitions.py -q`
 107 passed；`pytest tests/host tests/runtime -q` 375 passed；`python -m pyright dayu/ tests/ utils/` 0 errors；
-`git diff --check` passed。当前 PR 54 additional review gate 状态为 accepted；PR 54 draft branch 待 push，current gate 为
+`git diff --check` passed。当前 PR 54 additional review gate 状态为 accepted；PR 54 draft branch 已 push，current gate 为
 PR 54 draft review-ready。剩余风险均有 owner：active cancel watchdog / post-cancel timeout 与 multi-scheduler cancel port 归 Phase 11；
 RemoteProxy 语义归 Phase 14；scheduler 并发 lane 竞争测试、`_drain_loop` 可观测性、RunInputBuilder optimistic TOCTOU 与
 `_consume_worker_events` cleanup helper 防御性强化为后续 hardening / cleanup，不阻塞当前 PR。
