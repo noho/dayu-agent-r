@@ -256,10 +256,18 @@ adjudication，accepted checkpoint commit 为 `de7a4ae`。P6-S3 artifacts 为
 `docs/reviews/host-phase6-implementation-s3-executor-wrapper-20260515.md`、
 `docs/reviews/host-phase6-code-review-s3-mimo-20260515.md`、
 `docs/reviews/host-phase6-code-review-s3-ds-20260515.md` 与
-`docs/reviews/host-phase6-code-review-s3-controller-adjudication-20260515.md`。当前 gate 为 Phase 6 P6-S4 implementation
-ready。需要继续追踪的 non-blocking hardening、deferred capability 与后续 phase owner 已写入 `Open Questions 与风险追踪` 的
+`docs/reviews/host-phase6-code-review-s3-controller-adjudication-20260515.md`。P6-S4
+`TruncationManager And fetch_more Normal Tool Path` 已完成 implementation、双路 code review 与 controller adjudication，
+accepted checkpoint commit 为 `28adf70`。P6-S4 artifacts 为
+`docs/reviews/host-phase6-implementation-s4-truncation-fetch-more-20260515.md`、
+`docs/reviews/host-phase6-code-review-s4-mimo-20260515.md`、
+`docs/reviews/host-phase6-code-review-s4-ds-20260515.md` 与
+`docs/reviews/host-phase6-code-review-s4-controller-adjudication-20260515.md`；验证为
+`pytest tests/host/test_toolruntime_truncation_fetch_more.py tests/host/test_toolruntime_effective_bundle.py tests/host/test_phase6_toolruntime_integration.py -q`
+15 passed、`python -m pyright dayu/host tests/host` 0 errors、`git diff --check` clean。当前 gate 为 Phase 6 P6-S5
+implementation ready。需要继续追踪的 non-blocking hardening、deferred capability 与后续 phase owner 已写入 `Open Questions 与风险追踪` 的
 `PR 54 / P1-P5 corrected review 残余风险追踪`、P6-S1 controller adjudication residual risks、P6-S2 controller
-adjudication residual risks，以及 P6-S3 controller adjudication residual risks。P6-S3 遗留的真实 `HostDispatchScheduler`
+adjudication residual risks、P6-S3 controller adjudication residual risks，以及 P6-S4 controller adjudication residual risks。P6-S3 遗留的真实 `HostDispatchScheduler`
 仍 no-tool composition wiring 必须在 Phase 6 退出前关闭；优先由 P6-S6 integration 接收，若 P6-S4 / P6-S5 提前触及同一装配边界则可提前补齐。
 
 ## Phase Map
@@ -1491,12 +1499,30 @@ Phase 按依赖关系推进：先实现被其它阶段依赖的公共契约、ru
 - terminal closeout 后 queue promotion wakeup failure 的诊断 / 抑制策略；owner 为 Host dispatch lifecycle hardening。
 - active cancel watchdog、stuck `CANCELLING` 与 orphan recovery；owner 为 Phase 11. Host Lifecycle / Recovery / Multi-process Hardening。
 - RemoteProxy 语义与远端迟到事件治理；owner 为 Phase 14. RemoteProxy / RemoteStub。
-- ToolRuntime / `fetch_more` canonical tool fact accept path；owner 为 Phase 6. ToolRuntime / Truncation / fetch_more / Duplicate Governance。
+- ToolRuntime / `fetch_more` canonical tool fact accept path 已由 P6-S2 accept barrier 与 P6-S4 `fetch_more` 普通工具路径覆盖；剩余 duplicate governance / diagnostic refs 由 P6-S5 接收。
 - `WAITING` / `resolve_wait` 与 wait cancellation；owner 为 Phase 7. Tool Awaiting / resolve_wait / Wait Adapter。
 - Memory、Context Governance 与 compact artifact 真实 provider 接线；owner 分别为 Phase 9. Memory 与 Phase 10. Context Governance / Compaction。
 - runtime lane repeated outer cancellation、untracked release failure 与 idle scheduler sleeping task；owner 为后续 runtime cancellation precision / Host dispatch lifecycle hardening。
 - Engine runner injection / provider abstraction design；owner 为后续 Engine composition / provider abstraction design。
 - God module / class cleanup 与 broader test hardening；owner 为后续 architecture / test hardening。
+
+#### Phase 6 P6-S4 Truncation / fetch_more 残余风险追踪
+
+结论：
+
+- P6-S4 已落地 ToolRuntime-local `TruncationManager`、run-scoped opaque cursor / `scope_token` 校验、`fetch_more`
+  普通 framework tool 注入，以及 `fetch_more` 通过 ToolRuntimeExecutor / accept barrier / EventLog 的普通工具事实路径。
+- P6-S4 不引入 durable cursor table、recovery 续读、Engine / Host 特化分支或跨 Run 续读语义；`truncate` / `fetch_more`
+  只发生在同一个 Run 内。
+- P6-S4 review 未留下 blocking finding；limit 分页测试已补齐。
+
+追踪项：
+
+- `TruncationManager` cursor 仍为内存、ToolRuntime-local、单 Run 生命周期；Phase 11 recovery 不得把 P6-S4 cursor 解释为可恢复 durable truth。
+- 当前测试允许 white-box 篡改 `_cursors` 验证 corrupt / mismatch 防御；若后续 cursor 存储结构迁移，owner 为对应迁移 slice 同步调整测试边界。
+- 当前覆盖以 `text_chars` 为主；`text_lines`、`list_items`、`binary_bytes` 的更细粒度边界 hardening 归后续 ToolRuntime test hardening，不阻塞 P6-S5。
+- duplicate governance、diagnostic refs 和 run-local duplicate matrix 由 P6-S5 接收。
+- 真实 `HostDispatchScheduler` 仍是 no-tool composition wiring；Phase 6 退出前必须关闭，当前 owner 为 P6-S6 integration。
 
 ## 历史记录
 
