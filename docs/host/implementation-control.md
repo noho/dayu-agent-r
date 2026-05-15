@@ -281,11 +281,23 @@ accepted checkpoint commit 为 `53ff69f`。P6-S6 artifacts 为
 `docs/reviews/host-phase6-code-review-s6-mimo-20260515.md`、
 `docs/reviews/host-phase6-code-review-s6-ds-20260515.md` 与
 `docs/reviews/host-phase6-code-review-s6-controller-adjudication-20260515.md`；验证为
-`pytest tests/host -q` 348 passed、`python -m pyright dayu/ tests/ utils/` 0 errors、`git diff --check` clean。当前 gate 为 Phase 6
-aggregate review ready。需要继续追踪的 non-blocking hardening、deferred capability 与后续 phase owner 已写入 `Open Questions 与风险追踪` 的
+`pytest tests/host -q` 348 passed、`python -m pyright dayu/ tests/ utils/` 0 errors、`git diff --check` clean。Phase 6
+aggregate review 已完成，初次 aggregate review artifacts 为
+`docs/reviews/host-phase6-aggregate-review-mimo-20260515.md`、
+`docs/reviews/host-phase6-aggregate-review-ds-20260515.md` 与
+`docs/reviews/host-phase6-aggregate-review-controller-adjudication-20260515.md`；两路 review 均接受 P6-AGG-F1：
+Run-local duplicate governance index 仍跟随 ToolRuntime 实例生命周期，不满足 P6 exit standard。P6-AGG-F1 已通过
+`docs/reviews/host-phase6-aggregate-fix-run-local-duplicate-governance-20260515.md` 修复，并由
+`docs/reviews/host-phase6-aggregate-re-review-mimo-20260515.md`、
+`docs/reviews/host-phase6-aggregate-re-review-ds-20260515.md` 与
+`docs/reviews/host-phase6-aggregate-re-review-controller-adjudication-20260515.md` 确认 PASS。Phase 6 accepted aggregate
+review commit 为 `8f73821`；验证为 `pytest tests/host -q` 349 passed、
+`python -m pyright dayu/ tests/ utils/` 0 errors、`git diff --check` clean。当前 gate 为 ready-to-create-PR。需要继续追踪的
+non-blocking hardening、deferred capability 与后续 phase owner 已写入 `Open Questions 与风险追踪` 的
 `PR 54 / P1-P5 corrected review 残余风险追踪`、P6-S1 controller adjudication residual risks、P6-S2 controller
 adjudication residual risks、P6-S3 controller adjudication residual risks、P6-S4 controller adjudication residual risks，以及
-P6-S5 / P6-S6 controller adjudication residual risks。P6-S3 遗留的真实 `HostDispatchScheduler` no-tool composition wiring 已由 P6-S6 关闭。
+P6-S5 / P6-S6 controller adjudication residual risks。P6-S3 遗留的真实 `HostDispatchScheduler` no-tool composition wiring 已由 P6-S6 关闭；
+P6 aggregate accepted 后按用户指令创建 PR，并在 PR 创建后安排 AgentMiMo 与 AgentDS 执行 `/deepreview PR <pr number>`。
 
 ## Phase Map
 
@@ -1545,7 +1557,7 @@ Phase 按依赖关系推进：先实现被其它阶段依赖的公共契约、ru
 
 结论：
 
-- P6-S5 已落地 ToolRuntime 实例内 run-local duplicate governance matrix：`allow`、`reuse`、`hint`、
+- P6-S5 已落地 run-local duplicate governance matrix：`allow`、`reuse`、`hint`、
   `require_justification` 与 `hard_stop`。
 - duplicate key 排除 `index_in_iteration`；同 iteration 内同工具同 normalized arguments 仍进入 duplicate governance。
 - `reuse` 不调用业务 callable，不追加第二个 `TOOL_RESULT_ACCEPTED`，而是通过 `TOOL_CALL_GOVERNED` 引用 prior accepted refs 后把 prior outcome 返回给 Engine。
@@ -1559,7 +1571,7 @@ Phase 按依赖关系推进：先实现被其它阶段依赖的公共契约、ru
 - `ToolFactAcceptCandidate` 对 `GOVERNED_ERROR` 的 duplicate defensive validation 仍可更严格；owner 为后续 ToolRuntime hardening。
 - `ToolTraceDiagnosticEmitter` typed refs 不等于 durable tool trace；durable trace projection 由 Phase 13 Audit / Tool Trace / Outbox Projections 接收。
 - 真实 `HostDispatchScheduler` no-tool composition wiring 已由 P6-S6 关闭。
-- Run-local duplicate governance 是 P6 既定目标，不是 Attempt-local 目标。P6 aggregate review 必须确认同一 Run 内跨 Attempt 的正常同进程路径不会因重新创建 ToolRuntime 而丢失 duplicate memory；若当前实现只跟随单个 ToolRuntime 实例生命周期，则作为 Phase 6 退出 blocker 进入 fix，不得推迟到 Phase 7 重新裁决。
+- Run-local duplicate governance 是 P6 既定目标，不是 Attempt-local 目标。P6 aggregate review 已接受并修复实例级 duplicate memory blocker：`InMemoryRunScopedDuplicateGovernanceRegistry` 在同一 Host 进程内按 Run 持有 duplicate memory，同 Run 多 ToolRuntime handle 共享 accepted fact，不同 Run 隔离；P6 仍不引入 durable duplicate ledger，也不承诺 crash / restart recovery。
 
 #### Phase 6 P6-S6 Integration / Scheduler Wiring 残余风险追踪
 
@@ -1576,6 +1588,7 @@ Phase 按依赖关系推进：先实现被其它阶段依赖的公共契约、ru
 - `tooling_options` 当前是 construction-time 单 bundle 输入；多 profile / per-scene tool profile 仍归 Phase 12 ToolsDiscovery / ScenePrepare 或后续 policy provider owner。
 - `policy_snapshot_digest` 当前是本地 policy snapshot 的诊断 digest，不是 durable attempt tool snapshot；attempt tool snapshot durability 仍归后续 ToolRuntime hardening / policy provider owner。
 - duplicate governance 的裁决为 Run-local 语义：同一个 Run 因 `WAITING -> resolve_wait -> resume`、steer 或 recovery 创建新 Attempt 时，正常同进程生命周期内必须共享该 Run 的 duplicate memory。P6 不要求 durable duplicate ledger，也不要求 Host 崩溃 / 重启后恢复内存 index；崩溃恢复后的重复风险由 RunInputBuilder 的 accepted facts 重建兜底。Phase 7 / steer / recovery owner 不再重新裁决“是否需要 Run-local”，只按各自路径复用该语义。
+- P6 aggregate fix 已把真实 `HostDispatchScheduler` tool-enabled path 接入 Run-scoped duplicate registry；scheduler 在 terminal closeout、cancel cleanup 与 scheduler close 时清理 registry state。
 - `WAITING -> resolve_wait -> resume` 是新的 LLM request。Host 不能要求无状态模型天然记住上一 Attempt 已经发过某个 tool call；resume RunInputBuilder 必须把已 accepted 的等待结果、工具事实、governance guidance 与必要上下文放回 messages。若模型仍重复发起同一个语义工具调用，Run-local duplicate governance 负责复用、提示、要求说明或阻断。
 - `enable_truncation_manager=True` 是本地 tool-enabled scheduler 默认值；若后续 TruncationManager 初始化成本变重，归 ToolRuntime performance hardening 复核。
 
