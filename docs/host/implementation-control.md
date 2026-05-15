@@ -1687,7 +1687,7 @@ finding。Controller re-review adjudication artifact 为
 `docs/reviews/pr-54-review-fix-re-review-controller-adjudication-20260515.md`。Controller validation：`pytest tests/host/test_public_contracts.py tests/host/test_command_handle.py tests/host/test_dispatch_scheduler.py tests/host/test_engine_ingest_mapping.py tests/host/test_run_input_builder.py tests/host/test_state_schema.py tests/host/test_run_attempt_transitions.py -q`
 103 passed；`pytest tests/host tests/runtime -q` 356 passed；`python -m pyright dayu/host tests/host` 0 errors；
 `python -m pyright dayu/ tests/ utils/` 0 errors；`git diff --check` passed。当前 PR 54 review gate 状态为 accepted；
-PR 54 draft branch 已 push 至 `8f0495d`，current gate 为 PR 54 draft review-ready。剩余风险均有 owner：active cancel watchdog、pre-registration cancel
+PR 54 draft branch 已 push，current gate 为 PR 54 draft review-ready。剩余风险均有 owner：active cancel watchdog、pre-registration cancel
 retry / watchdog 与 durable-unavailable recovery 归 Phase 11；ToolRuntime canonical tool facts 归 Phase 6；RunInputBuilder
 读事务一致性与 recoverable RUN_FAILED diagnostic 顺序为后续 cleanup，不阻塞当前 PR。
 
