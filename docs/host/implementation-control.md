@@ -292,12 +292,13 @@ Run-local duplicate governance index 仍跟随 ToolRuntime 实例生命周期，
 `docs/reviews/host-phase6-aggregate-re-review-ds-20260515.md` 与
 `docs/reviews/host-phase6-aggregate-re-review-controller-adjudication-20260515.md` 确认 PASS。Phase 6 accepted aggregate
 review commit 为 `8f73821`；验证为 `pytest tests/host -q` 349 passed、
-`python -m pyright dayu/ tests/ utils/` 0 errors、`git diff --check` clean。当前 gate 为 ready-to-create-PR。需要继续追踪的
+`python -m pyright dayu/ tests/ utils/` 0 errors、`git diff --check` clean。Phase 6 PR 已创建为
+https://github.com/noho/dayu-agent-r/pull/55；当前 gate 为 PR 55 deepreview。需要继续追踪的
 non-blocking hardening、deferred capability 与后续 phase owner 已写入 `Open Questions 与风险追踪` 的
 `PR 54 / P1-P5 corrected review 残余风险追踪`、P6-S1 controller adjudication residual risks、P6-S2 controller
 adjudication residual risks、P6-S3 controller adjudication residual risks、P6-S4 controller adjudication residual risks，以及
 P6-S5 / P6-S6 controller adjudication residual risks。P6-S3 遗留的真实 `HostDispatchScheduler` no-tool composition wiring 已由 P6-S6 关闭；
-P6 aggregate accepted 后按用户指令创建 PR，并在 PR 创建后安排 AgentMiMo 与 AgentDS 执行 `/deepreview PR <pr number>`。
+PR 55 创建后按用户指令安排 AgentMiMo 与 AgentDS 执行 `/deepreview PR 55`，并根据 PR review findings 执行 fix / re-review 循环直到通过。
 
 ## Phase Map
 
