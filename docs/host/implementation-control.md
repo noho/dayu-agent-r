@@ -227,9 +227,87 @@ PASS，blocking design deviation 为 0。Controller adjudication artifact 为
 `docs/reviews/p1-p5-design-conformance-review-controller-adjudication-20260515.md`。
 
 当前不处于 implementation / fix gate；没有 accepted blocking finding 待修。用户手工 merge PR 54 后，下一步按 `$phaseflow`
-推进 Phase 6 `ToolRuntime / Truncation / fetch_more / Duplicate Governance`。需要继续追踪的 non-blocking hardening、
-deferred capability 与后续 phase owner 已写入 `Open Questions 与风险追踪` 的
-`PR 54 / P1-P5 corrected review 残余风险追踪`，进入 P6 前必须作为 phase discussion / plan 输入。
+推进 Phase 6 `ToolRuntime / Truncation / fetch_more / Duplicate Governance`。Phase 6 design discussion 输入 artifact 为
+`docs/reviews/host-phase6-design-discussion-codex-20260515.md`，controller 裁决 artifact 为
+`docs/reviews/host-phase6-design-discussion-controller-adjudication-20260515.md`；裁决后的 design write-back 已同步到
+`docs/host/design.md` 与本文档。Phase 6 handoff implementation-ready plan 为
+`docs/host/phase6-toolruntime-truncation-fetch-more-plan.md`；plan review artifacts 为
+`docs/reviews/host-phase6-plan-review-mimo-20260515.md` 与
+`docs/reviews/host-phase6-plan-review-ds-20260515.md`；controller plan review adjudication artifact 为
+`docs/reviews/host-phase6-plan-review-controller-adjudication-20260515.md`。Plan fix 后，plan re-review artifacts 为
+`docs/reviews/host-phase6-plan-re-review-mimo-20260515.md` 与
+`docs/reviews/host-phase6-plan-re-review-ds-20260515.md`；controller plan re-review adjudication artifact 为
+`docs/reviews/host-phase6-plan-re-review-controller-adjudication-20260515.md`。两路 re-review 均 PASS，blocking count 为 0。
+Phase 6 accepted plan commits 为 `04517f5` / `a5863ce`。P6-S1
+`Effective ToolBundle And RunInputBuilder Wiring` 已完成 implementation、双路 code review 与 controller adjudication，
+accepted checkpoint commit 为 `b49ba56`。P6-S1 artifacts 为
+`docs/reviews/host-phase6-implementation-s1-effective-toolbundle-20260515.md`、
+`docs/reviews/host-phase6-code-review-s1-mimo-20260515.md`、
+`docs/reviews/host-phase6-code-review-s1-ds-20260515.md` 与
+`docs/reviews/host-phase6-code-review-s1-controller-adjudication-20260515.md`。P6-S2
+`Host Accept Barrier And Tool Canonical Facts` 已完成 implementation、双路 code review 与 controller adjudication，
+accepted checkpoint commit 为 `54184e6`。P6-S2 artifacts 为
+`docs/reviews/host-phase6-implementation-s2-accept-barrier-20260515.md`、
+`docs/reviews/host-phase6-code-review-s2-mimo-20260515.md`、
+`docs/reviews/host-phase6-code-review-s2-ds-20260515.md` 与
+`docs/reviews/host-phase6-code-review-s2-controller-adjudication-20260515.md`。P6-S3
+`ToolExecutor Wrapper, Ack Retry, Side-effect Policy, Awaiting Guard` 已完成 implementation、双路 code review 与 controller
+adjudication，accepted checkpoint commit 为 `de7a4ae`。P6-S3 artifacts 为
+`docs/reviews/host-phase6-implementation-s3-executor-wrapper-20260515.md`、
+`docs/reviews/host-phase6-code-review-s3-mimo-20260515.md`、
+`docs/reviews/host-phase6-code-review-s3-ds-20260515.md` 与
+`docs/reviews/host-phase6-code-review-s3-controller-adjudication-20260515.md`。P6-S4
+`TruncationManager And fetch_more Normal Tool Path` 已完成 implementation、双路 code review 与 controller adjudication，
+accepted checkpoint commit 为 `28adf70`。P6-S4 artifacts 为
+`docs/reviews/host-phase6-implementation-s4-truncation-fetch-more-20260515.md`、
+`docs/reviews/host-phase6-code-review-s4-mimo-20260515.md`、
+`docs/reviews/host-phase6-code-review-s4-ds-20260515.md` 与
+`docs/reviews/host-phase6-code-review-s4-controller-adjudication-20260515.md`；验证为
+`pytest tests/host/test_toolruntime_truncation_fetch_more.py tests/host/test_toolruntime_effective_bundle.py tests/host/test_phase6_toolruntime_integration.py -q`
+15 passed、`python -m pyright dayu/host tests/host` 0 errors、`git diff --check` clean。P6-S5
+`Duplicate Governance And Diagnostic Emitter` 已完成 implementation、双路 code review、accepted finding fix、DS re-review 与
+controller adjudication，accepted checkpoint commit 为 `31ab68d`。P6-S5 artifacts 为
+`docs/reviews/host-phase6-implementation-s5-duplicate-governance-20260515.md`、
+`docs/reviews/host-phase6-code-review-s5-mimo-20260515.md`、
+`docs/reviews/host-phase6-code-review-s5-ds-20260515.md`、
+`docs/reviews/host-phase6-fix-s5-duplicate-governance-20260515.md`、
+`docs/reviews/host-phase6-code-re-review-s5-ds-20260515.md` 与
+`docs/reviews/host-phase6-code-review-s5-controller-adjudication-20260515.md`；验证为
+`pytest tests/host/test_toolruntime_duplicate_governance.py tests/host/test_toolruntime_diagnostics.py tests/host/test_toolruntime_accept_barrier.py -q`
+24 passed、P6 ToolRuntime 相关 46 tests passed、`python -m pyright dayu/host tests/host` 0 errors、`git diff --check` clean。P6-S6
+`Integration, Scheduler Wiring, And Gate Validation` 已完成 implementation、双路 code review 与 controller adjudication，
+accepted checkpoint commit 为 `53ff69f`。P6-S6 artifacts 为
+`docs/reviews/host-phase6-implementation-s6-integration-gate-20260515.md`、
+`docs/reviews/host-phase6-code-review-s6-mimo-20260515.md`、
+`docs/reviews/host-phase6-code-review-s6-ds-20260515.md` 与
+`docs/reviews/host-phase6-code-review-s6-controller-adjudication-20260515.md`；验证为
+`pytest tests/host -q` 348 passed、`python -m pyright dayu/ tests/ utils/` 0 errors、`git diff --check` clean。Phase 6
+aggregate review 已完成，初次 aggregate review artifacts 为
+`docs/reviews/host-phase6-aggregate-review-mimo-20260515.md`、
+`docs/reviews/host-phase6-aggregate-review-ds-20260515.md` 与
+`docs/reviews/host-phase6-aggregate-review-controller-adjudication-20260515.md`；两路 review 均接受 P6-AGG-F1：
+Run-local duplicate governance index 仍跟随 ToolRuntime 实例生命周期，不满足 P6 exit standard。P6-AGG-F1 已通过
+`docs/reviews/host-phase6-aggregate-fix-run-local-duplicate-governance-20260515.md` 修复，并由
+`docs/reviews/host-phase6-aggregate-re-review-mimo-20260515.md`、
+`docs/reviews/host-phase6-aggregate-re-review-ds-20260515.md` 与
+`docs/reviews/host-phase6-aggregate-re-review-controller-adjudication-20260515.md` 确认 PASS。Phase 6 accepted aggregate
+review commit 为 `8f73821`；验证为 `pytest tests/host -q` 349 passed、
+`python -m pyright dayu/ tests/ utils/` 0 errors、`git diff --check` clean。Phase 6 PR 已创建为
+https://github.com/noho/dayu-agent-r/pull/55；当前 gate 为 PR 55 deepreview。需要继续追踪的
+non-blocking hardening、deferred capability 与后续 phase owner 已写入 `Open Questions 与风险追踪` 的
+`PR 54 / P1-P5 corrected review 残余风险追踪`、P6-S1 controller adjudication residual risks、P6-S2 controller
+adjudication residual risks、P6-S3 controller adjudication residual risks、P6-S4 controller adjudication residual risks，以及
+P6-S5 / P6-S6 controller adjudication residual risks。P6-S3 遗留的真实 `HostDispatchScheduler` no-tool composition wiring 已由 P6-S6 关闭；
+PR 55 创建后按用户指令安排 AgentMiMo 与 AgentDS 执行 `/deepreview PR 55`。PR review artifacts 为
+`docs/reviews/pr-55-deepreview-mimo-20260515.md` 与
+`docs/reviews/pr-55-deepreview-ds-20260515.md`；controller adjudication 为
+`docs/reviews/pr-55-deepreview-controller-adjudication-20260515.md`。AgentMiMo PASS；AgentDS PASS 但提出 PR55-DS-1
+中严重度 finding，controller 裁决为 accepted 并由
+`docs/reviews/pr-55-fix-accept-retry-exhausted-20260515.md` 修复，fix commit 为 `c79d6b8`。PR 55 re-review artifacts 为
+`docs/reviews/pr-55-re-review-mimo-20260515.md` 与
+`docs/reviews/pr-55-re-review-ds-20260515.md`，两路均 PASS；验证为 `pytest tests/host -q` 350 passed、
+`python -m pyright dayu/ tests/ utils/` 0 errors、`git diff --check` clean。Phase 6 状态为 completed；PR 55 当前仍为 draft，
+review / fix / re-review 已通过，等待用户后续决定是否切换 ready 或 merge。
 
 ## Phase Map
 
@@ -627,7 +705,7 @@ Phase 按依赖关系推进：先实现被其它阶段依赖的公共契约、ru
 ### Phase 6. ToolRuntime / Truncation / fetch_more / Duplicate Governance
 
 目标：
-- 落地 Host-owned ToolRuntime、ToolBundle snapshot、Host accept barrier、TruncationManager、`fetch_more` 与同 Run 语义级重复工具调用治理。
+- 落地 Host-owned ToolRuntime、effective ToolBundle、Host accept barrier、TruncationManager、`fetch_more` 与同 Run 语义级重复工具调用治理。
 
 对应设计章节：
 - `docs/host/design.md` §18 ToolRuntime
@@ -641,10 +719,10 @@ Phase 按依赖关系推进：先实现被其它阶段依赖的公共契约、ru
 - Phase 2 payload descriptor 与 EventLog append primitive 已完成。
 
 进入条件：
-- 确认 ToolRuntime ports、accept idempotency key、effective ToolBundle 与 truncation descriptor 的最小 typed contract；确认形式为用户确认，或 `docs/host/design.md` 对应章节已细化到可直接生成 typed contract / test matrix。
+- 确认 ToolRuntime ports、accept idempotency key、effective ToolBundle 与 run-scoped truncation / `fetch_more` 的最小 typed contract；确认形式为用户确认，或 `docs/host/design.md` 对应章节已细化到可直接生成 typed contract / test matrix。
 
 范围：
-- 允许修改：ToolRuntime factory、ToolExecutor wrapper、ToolBundle snapshot、tool fact accept path、TruncationManager、fetch_more framework tool、duplicate index、tool trace diagnostic emitter interface。
+- 允许修改：ToolRuntime factory、ToolExecutor wrapper、effective ToolBundle、tool fact accept path、TruncationManager、fetch_more framework tool、duplicate index、tool trace diagnostic emitter interface。
 - 禁止修改：Engine 工具协议语义、Remote wire protocol、业务工具实现。
 
 不做：
@@ -654,7 +732,7 @@ Phase 按依赖关系推进：先实现被其它阶段依赖的公共契约、ru
 
 关键设计问题：
 - 必须确认工具事实 accepted ack 失败 / timeout 的默认治理动作。
-- 必须确认 truncation cursor / scope_token durable descriptor 的存储位置与恢复输入。
+- 必须确认 truncation cursor / `scope_token` 的 run-scoped 边界、失效条件与错误 envelope；Phase 6 不实现 durable cursor descriptor / recovery 续读。
 - 必须确认 replay no-tool 防线如何从 RunInputBuilder 与 ToolRuntime 双层执行。
 
 交付物：
@@ -667,7 +745,7 @@ Phase 按依赖关系推进：先实现被其它阶段依赖的公共契约、ru
 建议 slice 切分：
 - Slice 1: ToolRuntime ports / effective ToolBundle / schema projection。
 - Slice 2: Host accept barrier and tool canonical fact append。
-- Slice 3: TruncationManager / fetch_more / durable descriptors。
+- Slice 3: TruncationManager / fetch_more / run-scoped cursor contract。
 - Slice 4: run-local duplicate governance and tool trace diagnostic emitter。
 
 验证要求：
@@ -867,7 +945,7 @@ Phase 按依赖关系推进：先实现被其它阶段依赖的公共契约、ru
 - Phase 0 Engine context compaction event cleanup 已完成；Phase 10 不消费 Engine overflow event 作为真实 Host budget，必须使用 Host estimator / policy。
 - Phase 9 memory projection 已完成。
 - Phase 5 dispatch / reactive failure closeout 已完成。
-- Phase 6 ToolRuntime / tool fact accept barrier / truncation descriptors 已完成。
+- Phase 6 ToolRuntime / tool fact accept barrier / run-scoped truncation / `fetch_more` contract 已完成。
 
 进入条件：
 - 确认 conservative estimator、provider-aware configured limits、safety margin 与 compact policy 的第一版默认值。
@@ -986,7 +1064,7 @@ Phase 按依赖关系推进：先实现被其它阶段依赖的公共契约、ru
 前置条件：
 - Phase 1 Host public typing、`HostToolingOptions`、`ToolBundleSourceRef`、`ToolBundleSourceKind` 与 `FrameworkToolPolicyView` 已完成。
 - Phase 4 Host public API command path 已完成。
-- Phase 6 ToolRuntime / ToolBundle snapshot / framework tool policy 已完成。
+- Phase 6 ToolRuntime / effective ToolBundle / framework tool policy 已完成。
 
 进入条件：
 - 确认 ToolsDiscovery / ScenePrepare 仍是 Host 外部装配能力，不拥有 Session / Run / Attempt / EventLog truth。
@@ -1265,7 +1343,7 @@ Phase 按依赖关系推进：先实现被其它阶段依赖的公共契约、ru
 - Phase 7. Tool Awaiting / resolve_wait / Wait Adapter 必须定义 wait record 被 Host 标记 cancelled 后，adapter 如何观察该状态。
 - 后续 adapter 可以按能力实现外部 job cancel / revoke / abandon，但必须明确这是 best-effort，不得影响 Host EventLog 和 Run 终态的正确性。
 - 如果外部 job 在 Host 已取消 Run 后仍回调或被 poll 到结果，Host 必须拒绝其结果进入 canonical EventLog，只能记录 diagnostic / tool trace。
-- Phase 6. ToolRuntime / Truncation / fetch_more / Duplicate Governance 必须明确具有外部副作用、付费调用或长耗时资源占用的工具是否提供 job id、cancel handle、idempotency key 和资源清理策略。
+- Phase 6. ToolRuntime / Truncation / fetch_more / Duplicate Governance 必须覆盖具有外部副作用或付费调用工具的 policy / idempotency key 校验；长耗时 awaiting、external job id、cancel handle 与等待资源清理由 Phase 7. Tool Awaiting / resolve_wait / Wait Adapter 接收。
 - 第一版测试至少覆盖：`WAITING -> CANCELLED` 后迟到 `resolve_wait` / callback 不污染 canonical EventLog。
 
 #### Tool Trace / Provider Request 排错追踪
@@ -1363,7 +1441,7 @@ Phase 按依赖关系推进：先实现被其它阶段依赖的公共契约、ru
 追踪项：
 
 - Phase 14. RemoteProxy / RemoteStub 必须测试旧 `execution_id` 的迟到 Engine event、迟到 tool result、迟到 terminal 只能进入 diagnostic / trace，不能污染 canonical EventLog。
-- Phase 6. ToolRuntime / Truncation / fetch_more / Duplicate Governance 必须明确具有外部副作用的工具的 idempotency key、side-effect policy 和可取消能力。
+- Phase 6. ToolRuntime / Truncation / fetch_more / Duplicate Governance 必须明确具有外部副作用的工具的 idempotency key 与 side-effect policy；外部 job 可取消能力由 Phase 7 wait adapter 与后续 adapter hardening 接收。
 - Phase 14. RemoteProxy / RemoteStub 不得引入远端 takeover attempt、远端 append EventLog 或远端更新 Run 状态。
 
 #### Session Purge / Archive 追踪
@@ -1460,12 +1538,69 @@ Phase 按依赖关系推进：先实现被其它阶段依赖的公共契约、ru
 - terminal closeout 后 queue promotion wakeup failure 的诊断 / 抑制策略；owner 为 Host dispatch lifecycle hardening。
 - active cancel watchdog、stuck `CANCELLING` 与 orphan recovery；owner 为 Phase 11. Host Lifecycle / Recovery / Multi-process Hardening。
 - RemoteProxy 语义与远端迟到事件治理；owner 为 Phase 14. RemoteProxy / RemoteStub。
-- ToolRuntime / `fetch_more` canonical tool fact accept path；owner 为 Phase 6. ToolRuntime / Truncation / fetch_more / Duplicate Governance。
+- ToolRuntime / `fetch_more` canonical tool fact accept path 已由 P6-S2 accept barrier 与 P6-S4 `fetch_more` 普通工具路径覆盖；剩余 duplicate governance / diagnostic refs 由 P6-S5 接收。
 - `WAITING` / `resolve_wait` 与 wait cancellation；owner 为 Phase 7. Tool Awaiting / resolve_wait / Wait Adapter。
 - Memory、Context Governance 与 compact artifact 真实 provider 接线；owner 分别为 Phase 9. Memory 与 Phase 10. Context Governance / Compaction。
 - runtime lane repeated outer cancellation、untracked release failure 与 idle scheduler sleeping task；owner 为后续 runtime cancellation precision / Host dispatch lifecycle hardening。
 - Engine runner injection / provider abstraction design；owner 为后续 Engine composition / provider abstraction design。
 - God module / class cleanup 与 broader test hardening；owner 为后续 architecture / test hardening。
+
+#### Phase 6 P6-S4 Truncation / fetch_more 残余风险追踪
+
+结论：
+
+- P6-S4 已落地 ToolRuntime-local `TruncationManager`、run-scoped opaque cursor / `scope_token` 校验、`fetch_more`
+  普通 framework tool 注入，以及 `fetch_more` 通过 ToolRuntimeExecutor / accept barrier / EventLog 的普通工具事实路径。
+- P6-S4 不引入 durable cursor table、recovery 续读、Engine / Host 特化分支或跨 Run 续读语义；`truncate` / `fetch_more`
+  只发生在同一个 Run 内。
+- P6-S4 review 未留下 blocking finding；limit 分页测试已补齐。
+
+追踪项：
+
+- `TruncationManager` cursor 仍为内存、ToolRuntime-local、单 Run 生命周期；Phase 11 recovery 不得把 P6-S4 cursor 解释为可恢复 durable truth。
+- 当前测试允许 white-box 篡改 `_cursors` 验证 corrupt / mismatch 防御；若后续 cursor 存储结构迁移，owner 为对应迁移 slice 同步调整测试边界。
+- 当前覆盖以 `text_chars` 为主；`text_lines`、`list_items`、`binary_bytes` 的更细粒度边界 hardening 归后续 ToolRuntime test hardening，不阻塞 P6-S5。
+- duplicate governance、diagnostic refs 和 run-local duplicate matrix 由 P6-S5 接收。
+- 真实 `HostDispatchScheduler` no-tool composition wiring 已由 P6-S6 关闭。
+
+#### Phase 6 P6-S5 Duplicate Governance / Diagnostics 残余风险追踪
+
+结论：
+
+- P6-S5 已落地 run-local duplicate governance matrix：`allow`、`reuse`、`hint`、
+  `require_justification` 与 `hard_stop`。
+- duplicate key 排除 `index_in_iteration`；同 iteration 内同工具同 normalized arguments 仍进入 duplicate governance。
+- `reuse` 不调用业务 callable，不追加第二个 `TOOL_RESULT_ACCEPTED`，而是通过 `TOOL_CALL_GOVERNED` 引用 prior accepted refs 后把 prior outcome 返回给 Engine。
+- diagnostic emitter 当前只产生 typed diagnostic refs，不写 durable trace projection。
+- DS-F1 至 DS-F4 accepted findings 已修复并通过 re-review；P6-S5 review 没有剩余 blocking finding。
+
+追踪项：
+
+- 默认 duplicate policy 仍为 `allow`；生产 policy provider resolution 不在 P6-S5 范围内，当前 owner 为 P6-S6 integration 或后续 ToolRuntime policy provider work。
+- `semantic_duplicate_key_argument_name` 是 Host 内部 policy 字段且默认关闭；后续 policy provider 若启用它，必须补 dedicated tests 并明确其与 normalized arguments digest 的关系。
+- `ToolFactAcceptCandidate` 对 `GOVERNED_ERROR` 的 duplicate defensive validation 仍可更严格；owner 为后续 ToolRuntime hardening。
+- `ToolTraceDiagnosticEmitter` typed refs 不等于 durable tool trace；durable trace projection 由 Phase 13 Audit / Tool Trace / Outbox Projections 接收。
+- 真实 `HostDispatchScheduler` no-tool composition wiring 已由 P6-S6 关闭。
+- Run-local duplicate governance 是 P6 既定目标，不是 Attempt-local 目标。P6 aggregate review 已接受并修复实例级 duplicate memory blocker：`InMemoryRunScopedDuplicateGovernanceRegistry` 在同一 Host 进程内按 Run 持有 duplicate memory，同 Run 多 ToolRuntime handle 共享 accepted fact，不同 Run 隔离；P6 仍不引入 durable duplicate ledger，也不承诺 crash / restart recovery。
+
+#### Phase 6 P6-S6 Integration / Scheduler Wiring 残余风险追踪
+
+结论：
+
+- P6-S6 已按 Phase 6 退出目标扩展 scope，关闭真实 `HostDispatchScheduler` 固定 no-tool RunInputBuilder 的缺口。
+- 本地 scheduler 在 `HostLocalExecutionOptions.tooling_options` 非空且 `AgentPolicy.allow_tool_calls=True` 时，为当前 Attempt 构造 ToolRuntime handle，并通过 tool-enabled RunInputBuilder 把同源 schema / executor 交给 worker。
+- tooling 缺失或 policy 禁用工具时，scheduler 仍保持 no-tool builder 行为。
+- 新增测试覆盖真实 scheduler path：dispatch -> worker accepted request -> captured `ToolExecutor.execute` -> Host accept barrier -> `TOOL_CALL_REQUESTED` / `TOOL_RESULT_ACCEPTED` canonical facts。
+- P6-S6 review 没有 blocking finding。
+
+追踪项：
+
+- `tooling_options` 当前是 construction-time 单 bundle 输入；多 profile / per-scene tool profile 仍归 Phase 12 ToolsDiscovery / ScenePrepare 或后续 policy provider owner。
+- `policy_snapshot_digest` 当前是本地 policy snapshot 的诊断 digest，不是 durable attempt tool snapshot；attempt tool snapshot durability 仍归后续 ToolRuntime hardening / policy provider owner。
+- duplicate governance 的裁决为 Run-local 语义：同一个 Run 因 `WAITING -> resolve_wait -> resume`、steer 或 recovery 创建新 Attempt 时，正常同进程生命周期内必须共享该 Run 的 duplicate memory。P6 不要求 durable duplicate ledger，也不要求 Host 崩溃 / 重启后恢复内存 index；崩溃恢复后的重复风险由 RunInputBuilder 的 accepted facts 重建兜底。Phase 7 / steer / recovery owner 不再重新裁决“是否需要 Run-local”，只按各自路径复用该语义。
+- P6 aggregate fix 已把真实 `HostDispatchScheduler` tool-enabled path 接入 Run-scoped duplicate registry；scheduler 在 terminal closeout、cancel cleanup 与 scheduler close 时清理 registry state。
+- `WAITING -> resolve_wait -> resume` 是新的 LLM request。Host 不能要求无状态模型天然记住上一 Attempt 已经发过某个 tool call；resume RunInputBuilder 必须把已 accepted 的等待结果、工具事实、governance guidance 与必要上下文放回 messages。若模型仍重复发起同一个语义工具调用，Run-local duplicate governance 负责复用、提示、要求说明或阻断。
+- `enable_truncation_manager=True` 是本地 tool-enabled scheduler 默认值；若后续 TruncationManager 初始化成本变重，归 ToolRuntime performance hardening 复核。
 
 ## 历史记录
 

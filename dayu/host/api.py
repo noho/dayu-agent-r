@@ -2,7 +2,9 @@
 
 本模块只定义 Host 后续阶段可依赖的公共 request、snapshot、status、
 error 与 context 类型。它不实现 command path、durable store、EventLog、
-dispatch、policy provider 或 Engine 调用路径。
+dispatch、policy provider 或 Engine 调用路径。`HostLocalExecutionOptions`
+为 composition root 本地执行装配保留构造期 tooling 输入字段，但 tooling
+类型仍由 `dayu.host.tooling` 直接导出，不进入 `dayu.host.api.__all__`。
 """
 
 from __future__ import annotations
@@ -25,6 +27,7 @@ from dayu.host._public_validation import (
 from dayu.host._public_validation import (
     require_optional_non_empty as _require_optional_non_empty,
 )
+from dayu.host.tooling import HostToolingOptions as _HostToolingOptions
 
 
 HOST_EVENT_STREAM_DEFAULT_LIMIT = 100
@@ -378,6 +381,10 @@ class HostLocalExecutionOptions:
     :param runner_options: Engine Runner 调用参数。
     :param agent_policy: Engine Agent policy。
     :param worker_factory: 本地 worker factory。
+    :param tooling_options: Host construction 阶段传入的业务工具选项；无则
+        本地 dispatch 仍按 no-tool 模式构造 Engine request。
+    :param enable_truncation_manager: tool-enabled 本地 dispatch 是否为当前
+        Attempt 创建 run-scoped truncation manager。
     """
 
     lane_db_path: pathlib.Path
@@ -392,6 +399,8 @@ class HostLocalExecutionOptions:
     runner_options: RunnerCallOptions
     agent_policy: AgentPolicy
     worker_factory: LocalEngineWorkerFactory
+    tooling_options: _HostToolingOptions | None = None
+    enable_truncation_manager: bool = True
 
     def __post_init__(self) -> None:
         """校验本地执行配置。
@@ -459,6 +468,16 @@ class HostLocalExecutionOptions:
         if self.worker_factory is None:
             raise TypeError(
                 "HostLocalExecutionOptions.worker_factory must be non-None"
+            )
+        if self.tooling_options is not None and not isinstance(
+            self.tooling_options, _HostToolingOptions
+        ):
+            raise TypeError(
+                "HostLocalExecutionOptions.tooling_options must be HostToolingOptions"
+            )
+        if not isinstance(self.enable_truncation_manager, bool):
+            raise TypeError(
+                "HostLocalExecutionOptions.enable_truncation_manager must be bool"
             )
 
 

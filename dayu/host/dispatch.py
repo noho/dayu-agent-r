@@ -26,7 +26,7 @@ from dayu.host.api import (
     LocalWorkerHandle,
     RunStatus,
 )
-from dayu.host.durable.codec import format_utc_timestamp
+from dayu.host.durable.codec import format_utc_timestamp, sha256_digest_json
 from dayu.host.durable.event_log import (
     EventClass,
     EventLogAppendRequest,
@@ -61,10 +61,25 @@ from dayu.host.durable.transaction import HostTransaction, HostTransactionRunner
 from dayu.host.engine_ingest import (
     EngineEventCandidate,
     EngineEventIngestor,
+    EngineIngestResult,
     EngineIngestStatus,
     LocalEngineEnvelope,
 )
-from dayu.host.run_input import PolicySnapshot, create_no_tool_run_input_builder
+from dayu.host.run_input import (
+    PolicySnapshot,
+    RunInputBuilder,
+    create_no_tool_run_input_builder,
+    create_tool_enabled_run_input_builder,
+)
+from dayu.host.tool_runtime import (
+    DefaultHostToolFactAcceptPort,
+    DefaultToolRuntimeFactory,
+    EffectiveToolBundleBuildRequest,
+    EffectiveToolBundleBuilder,
+    InMemoryRunScopedDuplicateGovernanceRegistry,
+    ToolRuntimeBuildRequest,
+    ToolRuntimeExecutionScope,
+)
 from dayu.runtime.lane import (
     LaneAcquireCancelled,
     LaneAcquired,
@@ -314,6 +329,9 @@ class HostDispatchScheduler:
         self._drain_task: asyncio.Task[None] | None = None
         self._active_tasks: set[asyncio.Task[None]] = set()
         self._active_handles: set[LocalWorkerHandle] = set()
+        self._duplicate_governance_registry = (
+            InMemoryRunScopedDuplicateGovernanceRegistry()
+        )
 
     @classmethod
     async def open(
@@ -447,6 +465,7 @@ class HostDispatchScheduler:
             active_task.cancel()
             await _suppress_task_cancel(active_task)
         await self._lane_controller.close(reason="scheduler_close")
+        self._duplicate_governance_registry.clear_all()
 
     async def _drain_loop(self) -> None:
         """后台 drain 队列。
@@ -614,14 +633,10 @@ class HostDispatchScheduler:
 
         cancellation_token = _HostCancellationToken()
         snapshot = self._snapshot_from_dispatch(record, cancellation_token)
-        request = create_no_tool_run_input_builder(
-            transaction_runner=self._transaction_runner,
-            policy_snapshot=PolicySnapshot(
-                runner_spec=self._local_execution.runner_spec,
-                runner_options=self._local_execution.runner_options,
-                agent_policy=self._local_execution.agent_policy,
-                policy_snapshot_ref=_LOCAL_POLICY_SNAPSHOT_REF,
-            ),
+        policy_snapshot = self._local_policy_snapshot()
+        request = self._run_input_builder_for_dispatch(
+            snapshot=snapshot,
+            policy_snapshot=policy_snapshot,
         ).build(snapshot)
         try:
             worker = self._local_execution.worker_factory.create_worker(snapshot)
@@ -669,6 +684,73 @@ class HostDispatchScheduler:
         self._active_tasks.add(task)
         task.add_done_callback(self._active_tasks.discard)
         return "dispatched"
+
+    def _run_input_builder_for_dispatch(
+        self, *, snapshot: AttemptDispatchSnapshot, policy_snapshot: PolicySnapshot
+    ) -> RunInputBuilder:
+        """按本地执行配置构造当前 dispatch 使用的 RunInputBuilder。
+
+        :param snapshot: 当前 Attempt dispatch snapshot。
+        :param policy_snapshot: 本地执行 policy snapshot。
+        :returns: no-tool 或 tool-enabled RunInputBuilder。
+        """
+
+        tooling_options = self._local_execution.tooling_options
+        if (
+            tooling_options is None
+            or not policy_snapshot.agent_policy.allow_tool_calls
+        ):
+            return create_no_tool_run_input_builder(
+                transaction_runner=self._transaction_runner,
+                policy_snapshot=policy_snapshot,
+            )
+        tool_runtime = DefaultToolRuntimeFactory(
+            EffectiveToolBundleBuilder()
+        ).create_tool_runtime(
+            ToolRuntimeBuildRequest(
+                effective_bundle_request=EffectiveToolBundleBuildRequest(
+                    business_tool_bundle=tooling_options.business_tool_bundle,
+                    source_refs=tooling_options.source_refs,
+                    framework_tool_policy=tooling_options.framework_tool_policy,
+                    policy_snapshot_digest=_policy_snapshot_digest(
+                        policy_snapshot
+                    ),
+                    enable_truncation_manager=(
+                        self._local_execution.enable_truncation_manager
+                    ),
+                ),
+                execution_scope=ToolRuntimeExecutionScope(
+                    session_id=snapshot.session_id,
+                    run_id=snapshot.run_id,
+                    attempt_id=snapshot.attempt_id,
+                    execution_id=snapshot.execution_id,
+                    allow_tool_calls=policy_snapshot.agent_policy.allow_tool_calls,
+                ),
+                accept_port=DefaultHostToolFactAcceptPort(
+                    transaction_runner=self._transaction_runner,
+                    event_log_store=self._event_log_store,
+                ),
+                duplicate_governance_registry=self._duplicate_governance_registry,
+            )
+        )
+        return create_tool_enabled_run_input_builder(
+            transaction_runner=self._transaction_runner,
+            policy_snapshot=policy_snapshot,
+            tool_runtime_handle=tool_runtime,
+        )
+
+    def _local_policy_snapshot(self) -> PolicySnapshot:
+        """构造本地 dispatch 使用的 policy snapshot。
+
+        :returns: 本地执行 policy snapshot。
+        """
+
+        return PolicySnapshot(
+            runner_spec=self._local_execution.runner_spec,
+            runner_options=self._local_execution.runner_options,
+            agent_policy=self._local_execution.agent_policy,
+            policy_snapshot_ref=_LOCAL_POLICY_SNAPSHOT_REF,
+        )
 
     def _snapshot_from_dispatch(
         self, record: PendingDispatchRecord, cancellation_token: _HostCancellationToken
@@ -823,6 +905,7 @@ class HostDispatchScheduler:
             )
 
         self._transaction_runner.run_write(_operation)
+        self._duplicate_governance_registry.clear_run(record.run_id)
 
     async def _consume_worker_events(
         self,
@@ -841,6 +924,7 @@ class HostDispatchScheduler:
         :returns: ``None``。
         """
 
+        run_terminal_closed = False
         try:
             envelope = LocalEngineEnvelope(
                 session_id=self._read_run_session_id(record.run_id),
@@ -866,16 +950,17 @@ class HostDispatchScheduler:
                     event = await anext(events)
                 except StopAsyncIteration:
                     if not terminal_seen:
-                        ingestor.close_clean_eof(
+                        result = ingestor.close_clean_eof(
                             envelope,
                             observed_at=datetime.now(UTC),
                             last_observed_worker_event_index=worker_event_index,
                         )
+                        run_terminal_closed = _ingest_closed_run(result)
                     break
                 except asyncio.CancelledError:
                     raise
                 except Exception as exc:
-                    ingestor.close_worker_lost(
+                    result = ingestor.close_worker_lost(
                         envelope,
                         observed_at=datetime.now(UTC),
                         worker_lifecycle_signal="worker_stream_error",
@@ -883,6 +968,7 @@ class HostDispatchScheduler:
                         last_observed_worker_event_index=worker_event_index,
                         last_accepted_event_id=last_accepted_event_id,
                     )
+                    run_terminal_closed = _ingest_closed_run(result)
                     break
                 worker_event_index += 1
                 try:
@@ -895,7 +981,7 @@ class HostDispatchScheduler:
                         )
                     )
                 except Exception as exc:
-                    ingestor.close_worker_lost(
+                    result = ingestor.close_worker_lost(
                         envelope,
                         observed_at=datetime.now(UTC),
                         worker_lifecycle_signal="ingest_exception",
@@ -903,6 +989,7 @@ class HostDispatchScheduler:
                         last_observed_worker_event_index=worker_event_index,
                         last_accepted_event_id=last_accepted_event_id,
                     )
+                    run_terminal_closed = _ingest_closed_run(result)
                     break
                 if result.status in (
                     EngineIngestStatus.ACCEPTED,
@@ -912,8 +999,11 @@ class HostDispatchScheduler:
                         last_accepted_event_id = result.events[-1].event_id
                     if result.terminal_closeout:
                         terminal_seen = True
+                        run_terminal_closed = _ingest_closed_run(result)
                         break
         finally:
+            if run_terminal_closed:
+                self._duplicate_governance_registry.clear_run(record.run_id)
             self._active_handles.discard(handle)
             self._active_registry.unregister(
                 attempt_id=record.attempt_id,
@@ -921,6 +1011,19 @@ class HostDispatchScheduler:
             )
             await _safe_close_worker_handle(handle)
             await _safe_release_lane_token(token)
+
+
+def _ingest_closed_run(result: EngineIngestResult) -> bool:
+    """判断 ingest 结果是否表示 Run 已完成 terminal closeout。
+
+    :param result: EngineEvent ingest 结果。
+    :returns: 已接受或确认重复 terminal closeout 时返回 ``True``。
+    """
+
+    return result.terminal_closeout and result.status in (
+        EngineIngestStatus.ACCEPTED,
+        EngineIngestStatus.DUPLICATE,
+    )
 
 
 def _is_dispatchable_recheck(
@@ -1067,6 +1170,28 @@ def _new_event_id(prefix: str) -> str:
     """
 
     return f"{prefix}-{uuid4().hex}"
+
+
+def _policy_snapshot_digest(policy_snapshot: PolicySnapshot) -> str:
+    """计算本地 dispatch policy snapshot 的诊断 digest。
+
+    :param policy_snapshot: 本地执行 policy snapshot。
+    :returns: canonical sha256 digest。
+    """
+
+    return sha256_digest_json(
+        {
+            "policy_snapshot_ref": policy_snapshot.policy_snapshot_ref,
+            "allow_tool_calls": policy_snapshot.agent_policy.allow_tool_calls,
+            "max_iterations": policy_snapshot.agent_policy.max_iterations,
+            "continuation_max_attempts": (
+                policy_snapshot.agent_policy.continuation_max_attempts
+            ),
+            "tool_execution_timeout_seconds": (
+                policy_snapshot.agent_policy.tool_execution_timeout_seconds
+            ),
+        }
+    )
 
 
 def _register_dispatch_host_instance(

@@ -29,7 +29,11 @@ from dayu.engine.contracts.engine_events import (
     RunFailedData,
     RunSuspendedData,
     ToolAwaitingData,
+    ToolCallBatchItemData,
+    ToolCallDeltaData,
     ToolCallRequestedData,
+    ToolCallsBatchDoneData,
+    ToolCallsBatchReadyData,
     ToolResultAcceptedData,
     UsageReportedData,
 )
@@ -501,7 +505,7 @@ def test_provider_protocol_error_is_diagnostic_without_state_change(
 def test_tool_call_requested_and_result_accepted_are_preview(
     tmp_path: Path,
 ) -> None:
-    """Phase 5 no-tool Host 只把 tool request/result 作为 preview 观测事实。"""
+    """Engine 工具请求与结果只能作为 preview，不能写 canonical 工具事实。"""
 
     with open_host_durable_store(_options(tmp_path)) as store:
         seeded = _seed_active_run(store.transaction_runner)
@@ -538,9 +542,74 @@ def test_tool_call_requested_and_result_accepted_are_preview(
         assert second.events[0].event_class == EventClass.PREVIEW
         assert second.events[0].event_type == "TOOL_RESULT_ACCEPTED"
         assert _payload(second.events[0])["outcome_kind"] == "completed"
+        assert _canonical_tool_event_count(store.transaction_runner) == 0
         run_status, attempt_status = _statuses(store.transaction_runner, seeded)
         assert run_status == RunStatus.RUNNING
         assert attempt_status == AttemptStatus.RUNNING
+
+
+def test_tool_batch_and_delta_events_stay_preview_not_canonical(
+    tmp_path: Path,
+) -> None:
+    """Engine batch-ready、batch-done 与 tool delta 不能绕过 accept path。"""
+
+    with open_host_durable_store(_options(tmp_path)) as store:
+        seeded = _seed_active_run(store.transaction_runner)
+        ingestor = EngineEventIngestor(transaction_runner=store.transaction_runner)
+        delta = _candidate(
+            seeded,
+            worker_event_index=13,
+            data=ToolCallDeltaData(
+                iteration_id="iter-tool",
+                tool_call_index=0,
+                tool_call_id="tool-call-1",
+                name_delta="lookup",
+                arguments_delta='{"ticker":"MSFT"}',
+            ),
+            event_type=EngineEventType.TOOL_CALL_DELTA,
+        )
+        ready = _candidate(
+            seeded,
+            worker_event_index=14,
+            data=ToolCallsBatchReadyData(
+                iteration_id="iter-tool",
+                tool_calls=(
+                    ToolCallBatchItemData(
+                        tool_call_id="tool-call-1",
+                        name="lookup",
+                        index_in_iteration=0,
+                        provider_state=None,
+                    ),
+                ),
+            ),
+            event_type=EngineEventType.TOOL_CALLS_BATCH_READY,
+        )
+        done = _candidate(
+            seeded,
+            worker_event_index=15,
+            data=ToolCallsBatchDoneData(
+                iteration_id="iter-tool",
+                tool_call_ids=("tool-call-1",),
+                completed_count=1,
+                failed_count=0,
+                cancelled_count=0,
+            ),
+            event_type=EngineEventType.TOOL_CALLS_BATCH_DONE,
+        )
+
+        results = tuple(ingestor.ingest(item) for item in (delta, ready, done))
+
+        assert [result.events[0].event_class for result in results] == [
+            EventClass.PREVIEW,
+            EventClass.PREVIEW,
+            EventClass.PREVIEW,
+        ]
+        assert [result.events[0].event_type for result in results] == [
+            "TOOL_CALL_DELTA",
+            "TOOL_CALLS_BATCH_READY",
+            "TOOL_CALLS_BATCH_DONE",
+        ]
+        assert _canonical_tool_event_count(store.transaction_runner) == 0
 
 
 def test_late_terminal_event_is_rejected_after_closeout(tmp_path: Path) -> None:
@@ -1044,6 +1113,30 @@ def _event_count(transaction_runner: HostTransactionRunner, event_type: str) -> 
             1
             for row in EventLogStore().read_events_after(transaction, 0, limit=100)
             if row.event_type == event_type
+        )
+
+    return transaction_runner.run_read(_operation)
+
+
+def _canonical_tool_event_count(transaction_runner: HostTransactionRunner) -> int:
+    """统计 canonical 工具事件数量。
+
+    :param transaction_runner: Host transaction runner。
+    :returns: canonical ``TOOL_*`` 事件数量。
+    """
+
+    def _operation(transaction: HostTransaction) -> int:
+        """读取并统计 canonical 工具事件。
+
+        :param transaction: Host transaction。
+        :returns: canonical 工具事件数量。
+        """
+
+        return sum(
+            1
+            for row in EventLogStore().read_events_after(transaction, 0, limit=100)
+            if row.event_class is EventClass.CANONICAL_FACT
+            and row.event_type.startswith("TOOL_")
         )
 
     return transaction_runner.run_read(_operation)
