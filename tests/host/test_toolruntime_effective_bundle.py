@@ -23,6 +23,7 @@ from dayu.host.tool_runtime import (
     DefaultToolRuntimeFactory,
     EffectiveToolBundleBuildRequest,
     EffectiveToolBundleBuilder,
+    FetchMoreToolCallable,
     ToolRuntimeBuildRequest,
     ToolRuntimeUnsupportedExecutor,
 )
@@ -135,6 +136,69 @@ def test_disabled_framework_tools_do_not_inject_fetch_more() -> None:
     assert tuple(schema.function.name for schema in handle.tool_schemas) == (
         "lookup_filing",
     )
+
+
+def test_enabled_fetch_more_injects_schema_and_callable_when_truncation_enabled() -> None:
+    """启用 truncation manager 时 ``fetch_more`` schema 与 callable 同源注入。"""
+
+    handle = DefaultToolRuntimeFactory(EffectiveToolBundleBuilder()).create_tool_runtime(
+        ToolRuntimeBuildRequest(
+            effective_bundle_request=EffectiveToolBundleBuildRequest(
+                business_tool_bundle=ToolBundle(
+                    definitions=(_definition("lookup_filing"),)
+                ),
+                source_refs=(_source_ref(),),
+                framework_tool_policy=FrameworkToolPolicyView(
+                    reserved_framework_tool_names=frozenset(
+                        {FrameworkToolName.FETCH_MORE}
+                    ),
+                    enabled_framework_tools=frozenset({FrameworkToolName.FETCH_MORE}),
+                ),
+                policy_snapshot_digest=None,
+                enable_truncation_manager=True,
+            )
+        )
+    )
+
+    assert FrameworkToolName.FETCH_MORE in (
+        handle.effective_bundle.injected_framework_tool_names
+    )
+    assert tuple(schema.function.name for schema in handle.tool_schemas) == (
+        "lookup_filing",
+        "fetch_more",
+    )
+    fetch_more = handle.effective_bundle.definitions_by_name["fetch_more"]
+    assert fetch_more.schema is handle.tool_schemas[1]
+    assert isinstance(fetch_more.callable, FetchMoreToolCallable)
+    assert fetch_more.callable is handle.effective_bundle.fetch_more_callable
+
+
+def test_enabled_fetch_more_policy_without_truncation_does_not_inject() -> None:
+    """未启用 truncation manager 时即使 policy 启用也不注入 ``fetch_more``。"""
+
+    handle = DefaultToolRuntimeFactory(EffectiveToolBundleBuilder()).create_tool_runtime(
+        ToolRuntimeBuildRequest(
+            effective_bundle_request=EffectiveToolBundleBuildRequest(
+                business_tool_bundle=ToolBundle(
+                    definitions=(_definition("lookup_filing"),)
+                ),
+                source_refs=(_source_ref(),),
+                framework_tool_policy=FrameworkToolPolicyView(
+                    reserved_framework_tool_names=frozenset(
+                        {FrameworkToolName.FETCH_MORE}
+                    ),
+                    enabled_framework_tools=frozenset({FrameworkToolName.FETCH_MORE}),
+                ),
+                policy_snapshot_digest=None,
+                enable_truncation_manager=False,
+            )
+        )
+    )
+
+    assert FrameworkToolName.FETCH_MORE not in (
+        handle.effective_bundle.injected_framework_tool_names
+    )
+    assert "fetch_more" not in handle.effective_bundle.definitions_by_name
 
 
 def _parameters() -> ToolParametersSchema:

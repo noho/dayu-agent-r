@@ -3,17 +3,19 @@
 本模块只落地 Phase 6 S1 需要的 ToolRuntime 装配边界：把外部业务
 ``ToolBundle`` 与可选 framework tool 注入合成为同一个
 ``EffectiveToolBundle``，并由 ``ToolRuntimeHandle`` 同时暴露 Engine
-可见 schema 与批式 ``ToolExecutor``。P6-S2 在同一模块内补齐 Host accept
-barrier 的 typed contract 与 durable accept port；真实工具调用、截断、
-fetch_more callable、重复治理算法仍由后续 slice 实现。
+可见 schema 与批式 ``ToolExecutor``。本模块同时承载 Host accept
+barrier、真实工具调用 wrapper、run-scoped truncation / ``fetch_more`` 普通
+工具路径，以及 Phase 6 当前已落地的最小 duplicate governance。
 """
 
 from __future__ import annotations
 
 import asyncio
+import base64
+import secrets
 from collections.abc import Mapping
-from dataclasses import dataclass, field
-from datetime import UTC, datetime
+from dataclasses import dataclass, field, replace
+from datetime import UTC, datetime, timedelta
 from enum import StrEnum
 from types import MappingProxyType
 from typing import Protocol
@@ -38,11 +40,14 @@ from dayu.contracts.tool_outcome import (
 from dayu.contracts.tool_result import (
     ToolResultFailure,
     ToolResultMeta,
+    ToolResultSuccess,
 )
 from dayu.contracts.tool_schema import (
+    ToolFunctionSchema,
     ToolParametersSchema,
     ToolSchema,
     ToolTruncateSpec,
+    ToolTruncationStrategy,
 )
 from dayu.host.api import AttemptStatus, RunStatus
 from dayu.host.durable.codec import is_sha256_digest, sha256_digest_json
@@ -112,6 +117,28 @@ _TOOL_RUNTIME_ACCEPT_EXCEPTION_REASON = "accept_ack_lost"
 _SIDE_EFFECT_IDEMPOTENCY_HINT = (
     "side-effect or paid tool requires a tool idempotency key"
 )
+_FETCH_MORE_DESCRIPTION = "Fetch more content from a truncated tool result."
+_FETCH_MORE_CURSOR_FIELD = "cursor"
+_FETCH_MORE_SCOPE_TOKEN_FIELD = "scope_token"
+_FETCH_MORE_LIMIT_FIELD = "limit"
+_TRUNCATED_VALUE_FIELD = "value"
+_TRUNCATED_META_FIELD = "fetch_more"
+_TRUNCATED_APPLIED_FIELD = "truncated"
+_TRUNCATION_ERROR_CODE = "truncation_error"
+_TRUNCATION_UNSUPPORTED_REASON = "unsupported_truncation_target"
+_TRUNCATION_CURSOR_MISSING_REASON = "missing_cursor"
+_TRUNCATION_SCOPE_MISMATCH_REASON = "scope_mismatch"
+_TRUNCATION_TOKEN_MISMATCH_REASON = "scope_token_mismatch"
+_TRUNCATION_CURSOR_EXPIRED_REASON = "cursor_expired"
+_TRUNCATION_CURSOR_USED_REASON = "cursor_already_used"
+_TRUNCATION_REMAINDER_DIGEST_REASON = "remainder_digest_mismatch"
+_TRUNCATION_INVALID_REQUEST_REASON = "invalid_fetch_more_request"
+_DEFAULT_TRUNCATION_TTL_SECONDS = 600
+_MIN_TRUNCATION_LIMIT = 1
+_TEXT_CHARS_LIMIT_KEY = "max_chars"
+_TEXT_LINES_LIMIT_KEY = "max_lines"
+_LIST_ITEMS_LIMIT_KEY = "max_items"
+_BINARY_BYTES_LIMIT_KEY = "max_bytes"
 
 
 class ToolPolicyDecisionKind(StrEnum):
@@ -567,6 +594,188 @@ ToolFactAcceptResult = (
 
 
 @dataclass(frozen=True, slots=True)
+class TextCharsRemainderRef:
+    """按字符截断后的剩余文本引用。
+
+    :param remaining_text: 未返回给 LLM 的剩余文本。
+    :param digest: 剩余文本 digest。
+    """
+
+    remaining_text: str
+    digest: str
+
+    def __post_init__(self) -> None:
+        """校验剩余文本引用字段。
+
+        :returns: ``None``。
+        :raises ValueError: digest 非法时抛出。
+        """
+
+        _require_sha256_digest(self.digest, field_name="text_chars_remainder_digest")
+
+
+@dataclass(frozen=True, slots=True)
+class TextLinesRemainderRef:
+    """按行截断后的剩余文本行引用。
+
+    :param remaining_lines: 未返回给 LLM 的剩余文本行。
+    :param digest: 剩余行 digest。
+    """
+
+    remaining_lines: tuple[str, ...]
+    digest: str
+
+    def __post_init__(self) -> None:
+        """校验剩余行引用字段。
+
+        :returns: ``None``。
+        :raises ValueError: digest 非法时抛出。
+        """
+
+        _require_sha256_digest(self.digest, field_name="text_lines_remainder_digest")
+
+
+@dataclass(frozen=True, slots=True)
+class ListItemsRemainderRef:
+    """按列表项截断后的剩余 JSON 项引用。
+
+    :param remaining_items: 未返回给 LLM 的剩余 JSON 项。
+    :param digest: 剩余列表项 digest。
+    """
+
+    remaining_items: tuple[JsonValue, ...]
+    digest: str
+
+    def __post_init__(self) -> None:
+        """校验剩余列表项引用字段。
+
+        :returns: ``None``。
+        :raises ValueError: digest 非法时抛出。
+        """
+
+        _require_sha256_digest(self.digest, field_name="list_items_remainder_digest")
+
+
+@dataclass(frozen=True, slots=True)
+class BinaryBytesRemainderRef:
+    """按字节截断后的剩余二进制引用。
+
+    ``remaining_bytes`` 是内存态能力的一部分，不进入 LLM-facing JSON；
+    ``fetch_more`` 返回时会投影为 base64 ASCII 字符串。
+
+    :param remaining_bytes: 未返回给 LLM 的剩余字节。
+    :param digest: 剩余字节 digest。
+    """
+
+    remaining_bytes: bytes
+    digest: str
+
+    def __post_init__(self) -> None:
+        """校验剩余字节引用字段。
+
+        :returns: ``None``。
+        :raises ValueError: digest 非法时抛出。
+        """
+
+        _require_sha256_digest(self.digest, field_name="binary_bytes_remainder_digest")
+
+
+TruncatedRemainderRef = (
+    TextCharsRemainderRef
+    | TextLinesRemainderRef
+    | ListItemsRemainderRef
+    | BinaryBytesRemainderRef
+)
+"""截断剩余内容的封闭强类型联合。"""
+
+
+@dataclass(frozen=True, slots=True)
+class ToolTruncationCursor:
+    """run-scoped 截断 cursor。
+
+    :param cursor_id: 不透明 cursor id。
+    :param scope_token_digest: scope token digest。
+    :param session_id: cursor 所属 Session id。
+    :param run_id: cursor 所属 Run id。
+    :param attempt_id: cursor 所属 Attempt id。
+    :param tool_call_id: 产生 cursor 的工具调用 id。
+    :param tool_name: 产生 cursor 的工具名。
+    :param strategy: 截断策略。
+    :param created_at: cursor 创建时间。
+    :param expires_at: cursor 过期时间。
+    :param remaining_ref: 剩余内容引用。
+    :param single_use: 是否单次使用。
+    :param used_at: 使用时间；未使用时为 ``None``。
+    """
+
+    cursor_id: str
+    scope_token_digest: str
+    session_id: str
+    run_id: str
+    attempt_id: str
+    tool_call_id: str
+    tool_name: str
+    strategy: ToolTruncationStrategy
+    created_at: datetime
+    expires_at: datetime
+    remaining_ref: TruncatedRemainderRef
+    single_use: bool
+    used_at: datetime | None
+
+    def __post_init__(self) -> None:
+        """校验 cursor 字段。
+
+        :returns: ``None``。
+        :raises ValueError: identity 为空、digest 非法或时间非法时抛出。
+        """
+
+        for field_name, value in (
+            ("cursor_id", self.cursor_id),
+            ("session_id", self.session_id),
+            ("run_id", self.run_id),
+            ("attempt_id", self.attempt_id),
+            ("tool_call_id", self.tool_call_id),
+            ("tool_name", self.tool_name),
+        ):
+            _require_non_empty_text(value, field_name=field_name)
+        _require_sha256_digest(
+            self.scope_token_digest, field_name="scope_token_digest"
+        )
+        if self.expires_at < self.created_at:
+            raise ValueError("expires_at must not be earlier than created_at")
+
+
+@dataclass(frozen=True, slots=True)
+class FetchMoreRequest:
+    """``fetch_more`` 工具请求契约。
+
+    :param cursor: 截断结果中返回的不透明 cursor。
+    :param scope_token: 截断结果中返回的 scope token。
+    :param limit: 可选补读上限；无则返回全部剩余内容。
+    """
+
+    cursor: str
+    scope_token: str
+    limit: int | None
+
+    def __post_init__(self) -> None:
+        """校验 ``fetch_more`` 请求字段。
+
+        :returns: ``None``。
+        :raises ValueError: cursor / token 为空或 limit 非正时抛出。
+        """
+
+        _require_non_empty_text(self.cursor, field_name="cursor")
+        _require_non_empty_text(self.scope_token, field_name="scope_token")
+        if self.limit is not None and self.limit < _MIN_TRUNCATION_LIMIT:
+            raise ValueError("limit must be positive when provided")
+
+
+FetchMoreResult = ToolCompletedOutcome | ToolFailedOutcome
+"""``fetch_more`` 只返回普通 completed / failed 工具结果。"""
+
+
+@dataclass(frozen=True, slots=True)
 class DuplicateDecision:
     """重复工具调用治理决策。
 
@@ -586,10 +795,12 @@ class TruncationAppliedOutcome:
 
     :param outcome: 可能已被截断改写的工具 outcome。
     :param cursor_hint: 普通工具结果中可提示 ``fetch_more`` 的 cursor；无为 ``None``。
+    :param fact: 可写入 Host canonical fact 的截断事实；未截断时为 ``None``。
     """
 
     outcome: ToolExecutionOutcome
     cursor_hint: str | None
+    fact: ToolTruncationFact | None
 
 
 @dataclass(frozen=True, slots=True)
@@ -661,12 +872,14 @@ class TruncationPort(Protocol):
     def apply_truncation(
         self,
         tool_name: str,
+        tool_call_id: str,
         outcome: ToolExecutionOutcome,
         truncate_spec: ToolTruncateSpec | None,
     ) -> TruncationAppliedOutcome:
         """应用工具结果截断策略。
 
         :param tool_name: 工具名。
+        :param tool_call_id: 当前工具调用 id。
         :param outcome: 原始工具 outcome。
         :param truncate_spec: effective bundle 中同名工具的截断声明。
         :returns: 截断后的 outcome 与 cursor hint。
@@ -813,19 +1026,301 @@ class NoopTruncationPort:
     def apply_truncation(
         self,
         tool_name: str,
+        tool_call_id: str,
         outcome: ToolExecutionOutcome,
         truncate_spec: ToolTruncateSpec | None,
     ) -> TruncationAppliedOutcome:
         """原样返回工具 outcome。
 
         :param tool_name: 工具名。
+        :param tool_call_id: 当前工具调用 id。
         :param outcome: 原始工具 outcome。
         :param truncate_spec: effective bundle 中同名工具的截断声明。
         :returns: 未截断 outcome。
         """
 
-        del tool_name, truncate_spec
-        return TruncationAppliedOutcome(outcome=outcome, cursor_hint=None)
+        del tool_name, tool_call_id, truncate_spec
+        return TruncationAppliedOutcome(outcome=outcome, cursor_hint=None, fact=None)
+
+
+class TruncationManager:
+    """ToolRuntime 本地的 run-scoped 截断能力管理器。
+
+    本管理器只保存当前 Run 内短生命周期 cursor，不写 durable cursor 表，
+    不承诺跨进程、跨 restart、跨 recovery 或 replay 可继续补读。
+    """
+
+    def __init__(
+        self,
+        *,
+        session_id: str,
+        run_id: str,
+        attempt_id: str,
+        truncate_specs_by_name: Mapping[str, ToolTruncateSpec],
+    ) -> None:
+        """初始化截断管理器。
+
+        :param session_id: 当前 Session id。
+        :param run_id: 当前 Run id。
+        :param attempt_id: 当前 Attempt id。
+        :param truncate_specs_by_name: 同一个 ``EffectiveToolBundle`` 投影出的截断声明。
+        :returns: ``None``。
+        """
+
+        _require_non_empty_text(session_id, field_name="session_id")
+        _require_non_empty_text(run_id, field_name="run_id")
+        _require_non_empty_text(attempt_id, field_name="attempt_id")
+        self._session_id = session_id
+        self._run_id = run_id
+        self._attempt_id = attempt_id
+        self._truncate_specs_by_name = truncate_specs_by_name
+        self._cursors: dict[str, ToolTruncationCursor] = {}
+
+    def apply_truncation(
+        self,
+        tool_name: str,
+        tool_call_id: str,
+        outcome: ToolExecutionOutcome,
+        truncate_spec: ToolTruncateSpec | None,
+    ) -> TruncationAppliedOutcome:
+        """对普通工具 completed outcome 应用截断声明。
+
+        :param tool_name: 工具名。
+        :param tool_call_id: 当前工具调用 id。
+        :param outcome: 原始工具 outcome。
+        :param truncate_spec: effective bundle 中同名工具的截断声明。
+        :returns: 可能已截断的 outcome 与截断事实。
+        """
+
+        effective_spec = self._truncate_specs_by_name.get(tool_name)
+        if effective_spec is not truncate_spec:
+            truncate_spec = effective_spec
+        if not isinstance(outcome, ToolCompletedOutcome):
+            return TruncationAppliedOutcome(outcome=outcome, cursor_hint=None, fact=None)
+        if truncate_spec is None or not truncate_spec.enabled:
+            return TruncationAppliedOutcome(outcome=outcome, cursor_hint=None, fact=None)
+        strategy = _tool_truncation_strategy(truncate_spec)
+        if strategy is None:
+            return TruncationAppliedOutcome(outcome=outcome, cursor_hint=None, fact=None)
+        selected = _select_truncation_value(outcome.result.value, truncate_spec)
+        if selected is None:
+            return TruncationAppliedOutcome(outcome=outcome, cursor_hint=None, fact=None)
+        created = _truncated_value_for_strategy(
+            strategy=strategy,
+            value=selected.value,
+            spec=truncate_spec,
+        )
+        if created is None:
+            return TruncationAppliedOutcome(outcome=outcome, cursor_hint=None, fact=None)
+        cursor, scope_token = self._store_cursor(
+            tool_name=tool_name,
+            tool_call_id=tool_call_id,
+            strategy=strategy,
+            ttl_seconds=truncate_spec.ttl_seconds,
+            remaining_ref=created.remaining_ref,
+        )
+        truncated_value = _replace_truncation_value(
+            outcome.result.value,
+            truncate_spec,
+            _truncated_public_value(
+                visible_value=created.visible_value,
+                cursor_id=cursor.cursor_id,
+                scope_token=scope_token,
+            ),
+        )
+        if truncated_value is None:
+            return TruncationAppliedOutcome(
+                outcome=_truncation_failure(
+                    _TRUNCATION_UNSUPPORTED_REASON,
+                    "tool result target cannot be replaced safely",
+                ),
+                cursor_hint=None,
+                fact=None,
+            )
+        truncated_outcome = ToolCompletedOutcome(
+            result=ToolResultSuccess(
+                ok=True,
+                value=truncated_value,
+                meta=outcome.result.meta,
+            )
+        )
+        fact = ToolTruncationFact(
+            applied=True,
+            strategy=strategy.value,
+            original_digest=_tool_outcome_digest(outcome),
+            truncated_digest=_tool_outcome_digest(truncated_outcome),
+            cursor_hint=cursor.cursor_id,
+        )
+        return TruncationAppliedOutcome(
+            outcome=truncated_outcome,
+            cursor_hint=cursor.cursor_id,
+            fact=fact,
+        )
+
+    def fetch_more(
+        self,
+        request: FetchMoreRequest,
+        context: BatchToolExecutionContext,
+    ) -> FetchMoreResult:
+        """按 cursor 补读剩余内容。
+
+        :param request: ``fetch_more`` 请求。
+        :param context: 批式工具执行上下文。
+        :returns: 普通 completed 或 failed 工具 outcome。
+        """
+
+        cursor = self._cursors.get(request.cursor)
+        if cursor is None:
+            return _truncation_failure(
+                _TRUNCATION_CURSOR_MISSING_REASON,
+                "truncation cursor is missing or no longer available",
+            )
+        validation_failure = self._validate_cursor(cursor, request, context)
+        if validation_failure is not None:
+            return validation_failure
+        fetched = _fetch_more_value(cursor.remaining_ref, request.limit)
+        if fetched is None:
+            return _truncation_failure(
+                _TRUNCATION_REMAINDER_DIGEST_REASON,
+                "truncation remainder digest mismatch",
+            )
+        now = datetime.now(UTC)
+        if cursor.single_use:
+            self._cursors[cursor.cursor_id] = replace(cursor, used_at=now)
+        return ToolCompletedOutcome(
+            result=ToolResultSuccess(ok=True, value=fetched, meta=None)
+        )
+
+    def _store_cursor(
+        self,
+        *,
+        tool_name: str,
+        tool_call_id: str,
+        strategy: ToolTruncationStrategy,
+        ttl_seconds: int | None,
+        remaining_ref: TruncatedRemainderRef,
+    ) -> tuple[ToolTruncationCursor, str]:
+        """保存 run-local cursor。
+
+        :param tool_name: 工具名。
+        :param tool_call_id: 工具调用 id。
+        :param strategy: 截断策略。
+        :param ttl_seconds: cursor TTL；无则使用默认值。
+        :param remaining_ref: 剩余内容引用。
+        :returns: cursor 与明文 scope token。
+        """
+
+        now = datetime.now(UTC)
+        ttl = ttl_seconds if ttl_seconds is not None else _DEFAULT_TRUNCATION_TTL_SECONDS
+        scope_token = secrets.token_urlsafe(32)
+        cursor_id = f"trunc-{secrets.token_urlsafe(24)}"
+        cursor = ToolTruncationCursor(
+            cursor_id=cursor_id,
+            scope_token_digest=_scope_token_digest(scope_token),
+            session_id=self._session_id,
+            run_id=self._run_id,
+            attempt_id=self._attempt_id,
+            tool_call_id=tool_call_id,
+            tool_name=tool_name,
+            strategy=strategy,
+            created_at=now,
+            expires_at=now + timedelta(seconds=ttl),
+            remaining_ref=remaining_ref,
+            single_use=True,
+            used_at=None,
+        )
+        self._cursors[cursor.cursor_id] = cursor
+        return cursor, scope_token
+
+    def _validate_cursor(
+        self,
+        cursor: ToolTruncationCursor,
+        request: FetchMoreRequest,
+        context: BatchToolExecutionContext,
+    ) -> ToolFailedOutcome | None:
+        """校验 cursor 的 run scope、token、TTL、single-use 与剩余摘要。
+
+        :param cursor: 已查到的 cursor。
+        :param request: ``fetch_more`` 请求。
+        :param context: 批式工具上下文。
+        :returns: 校验失败 outcome；通过时为 ``None``。
+        """
+
+        if (
+            cursor.session_id != self._session_id
+            or cursor.run_id != self._run_id
+            or cursor.attempt_id != self._attempt_id
+            or context.session_id != self._session_id
+            or context.run_id != self._run_id
+        ):
+            return _truncation_failure(
+                _TRUNCATION_SCOPE_MISMATCH_REASON,
+                "truncation cursor does not belong to this run scope",
+            )
+        if cursor.scope_token_digest != _scope_token_digest(request.scope_token):
+            return _truncation_failure(
+                _TRUNCATION_TOKEN_MISMATCH_REASON,
+                "truncation scope token does not match cursor",
+            )
+        if datetime.now(UTC) > cursor.expires_at:
+            return _truncation_failure(
+                _TRUNCATION_CURSOR_EXPIRED_REASON,
+                "truncation cursor expired",
+            )
+        if cursor.single_use and cursor.used_at is not None:
+            return _truncation_failure(
+                _TRUNCATION_CURSOR_USED_REASON,
+                "truncation cursor has already been used",
+            )
+        if not _remainder_digest_matches(cursor.remaining_ref):
+            return _truncation_failure(
+                _TRUNCATION_REMAINDER_DIGEST_REASON,
+                "truncation remainder digest mismatch",
+            )
+        return None
+
+
+class FetchMoreToolCallable:
+    """作为普通 framework tool 注入的 ``fetch_more`` callable。"""
+
+    def __init__(self) -> None:
+        """初始化尚未绑定 manager 的 callable。
+
+        :returns: ``None``。
+        """
+
+        self._manager: TruncationManager | None = None
+
+    def bind_manager(self, manager: TruncationManager) -> None:
+        """绑定同一 effective bundle 派生的截断管理器。
+
+        :param manager: 当前 ToolRuntime 的截断管理器。
+        :returns: ``None``。
+        """
+
+        self._manager = manager
+
+    async def __call__(
+        self,
+        call: ToolCallRequest,
+        context: BatchToolExecutionContext,
+    ) -> ToolExecutionOutcome:
+        """执行普通 ``fetch_more`` 工具调用。
+
+        :param call: 单次工具调用请求。
+        :param context: 批式工具上下文。
+        :returns: 普通 completed 或 failed outcome。
+        """
+
+        if self._manager is None:
+            return _truncation_failure(
+                _TRUNCATION_CURSOR_MISSING_REASON,
+                "truncation manager is not enabled for this run",
+            )
+        request = _fetch_more_request_from_call(call)
+        if isinstance(request, ToolFailedOutcome):
+            return request
+        return self._manager.fetch_more(request, context)
 
 
 class PassThroughDuplicateGovernance:
@@ -1010,6 +1505,18 @@ class DefaultHostToolFactAcceptPort:
 
 
 @dataclass(frozen=True, slots=True)
+class _FrameworkInjectionContext:
+    """framework tool 注入结果。
+
+    :param definitions: 实际注入的工具声明。
+    :param fetch_more_callable: ``fetch_more`` callable；未注入时为 ``None``。
+    """
+
+    definitions: tuple[ToolDefinition, ...]
+    fetch_more_callable: FetchMoreToolCallable | None
+
+
+@dataclass(frozen=True, slots=True)
 class EffectiveToolBundle:
     """Attempt-local effective 工具集合。
 
@@ -1023,6 +1530,7 @@ class EffectiveToolBundle:
     :param business_bundle_digest: 业务 bundle 诊断摘要。
     :param effective_schema_digest: effective schema 诊断摘要。
     :param policy_snapshot_digest: policy snapshot 摘要；无时为 ``None``。
+    :param fetch_more_callable: 注入的 ``fetch_more`` callable；未注入时为 ``None``。
     """
 
     business_bundle: ToolBundle
@@ -1035,6 +1543,7 @@ class EffectiveToolBundle:
     business_bundle_digest: str
     effective_schema_digest: str
     policy_snapshot_digest: str | None
+    fetch_more_callable: FetchMoreToolCallable | None
 
 
 @dataclass(frozen=True, slots=True)
@@ -1045,12 +1554,14 @@ class EffectiveToolBundleBuildRequest:
     :param source_refs: 业务工具来源引用。
     :param framework_tool_policy: framework tool policy view。
     :param policy_snapshot_digest: policy snapshot 摘要；无时为 ``None``。
+    :param enable_truncation_manager: 是否启用 run-scoped truncation manager。
     """
 
     business_tool_bundle: ToolBundle
     source_refs: tuple[ToolBundleSourceRef, ...]
     framework_tool_policy: FrameworkToolPolicyView
     policy_snapshot_digest: str | None
+    enable_truncation_manager: bool = False
 
 
 class EffectiveToolBundleBuilder:
@@ -1084,7 +1595,11 @@ class EffectiveToolBundleBuilder:
             request.framework_tool_policy,
         )
         definitions = list(request.business_tool_bundle.definitions)
-        injected = self._inject_framework_definitions(request.framework_tool_policy)
+        injected_context = self._inject_framework_definitions(
+            request.framework_tool_policy,
+            enable_truncation_manager=request.enable_truncation_manager,
+        )
+        injected = injected_context.definitions
         definitions.extend(injected)
         definitions_by_name = _definitions_by_name(definitions)
         tool_schemas = tuple(
@@ -1110,32 +1625,48 @@ class EffectiveToolBundleBuilder:
             ),
             effective_schema_digest=_tool_schemas_digest(tool_schemas),
             policy_snapshot_digest=request.policy_snapshot_digest,
+            fetch_more_callable=injected_context.fetch_more_callable,
         )
 
     def _inject_framework_definitions(
-        self, policy: FrameworkToolPolicyView
-    ) -> tuple[ToolDefinition, ...]:
+        self,
+        policy: FrameworkToolPolicyView,
+        *,
+        enable_truncation_manager: bool,
+    ) -> "_FrameworkInjectionContext":
         """按 policy 通过 hook 注入 framework tool。
 
         :param policy: framework tool policy view。
-        :returns: 实际注入的工具声明元组。
+        :param enable_truncation_manager: truncation manager 是否启用。
+        :returns: framework 注入上下文。
         :raises ValueError: hook 返回的工具名与请求名称不一致时抛出。
         """
 
-        if self._framework_injector is None:
-            return ()
+        fetch_more_callable: FetchMoreToolCallable | None = None
         definitions: list[ToolDefinition] = []
         for tool_name in sorted(
             policy.enabled_framework_tools, key=lambda item: item.value
         ):
-            definition = self._framework_injector.build_framework_tool(tool_name)
+            if (
+                tool_name is FrameworkToolName.FETCH_MORE
+                and enable_truncation_manager
+            ):
+                fetch_more_callable = FetchMoreToolCallable()
+                definition = _fetch_more_tool_definition(fetch_more_callable)
+            elif self._framework_injector is not None:
+                definition = self._framework_injector.build_framework_tool(tool_name)
+            else:
+                continue
             if definition.name != tool_name.value:
                 raise ValueError(
                     "framework injector returned mismatched tool name:"
                     f" {definition.name}"
                 )
             definitions.append(definition)
-        return tuple(definitions)
+        return _FrameworkInjectionContext(
+            definitions=tuple(definitions),
+            fetch_more_callable=fetch_more_callable,
+        )
 
 
 @dataclass(frozen=True, slots=True)
@@ -1292,6 +1823,7 @@ class ToolRuntimeExecutor:
             )
         truncation = self._truncation_port.apply_truncation(
             call.name,
+            call.tool_call_id,
             outcome,
             self._effective_bundle.truncate_specs_by_name.get(call.name),
         )
@@ -1303,6 +1835,7 @@ class ToolRuntimeExecutor:
             iteration_id=context.iteration_id,
             normalized_arguments_digest=normalized_arguments_digest,
             outcome=accepted_outcome,
+            truncation_fact=truncation.fact,
             policy_decision=policy_decision,
             duplicate_decision=duplicate_decision,
             tool_idempotency_key=_tool_idempotency_key(
@@ -1468,6 +2001,21 @@ class DefaultToolRuntimeFactory:
                 if request.diagnostic_emitter is not None
                 else DeterministicToolTraceDiagnosticEmitter()
             )
+            truncation_port: TruncationPort
+            if request.effective_bundle_request.enable_truncation_manager:
+                truncation_manager = TruncationManager(
+                    session_id=request.execution_scope.session_id,
+                    run_id=request.execution_scope.run_id,
+                    attempt_id=request.execution_scope.attempt_id,
+                    truncate_specs_by_name=effective_bundle.truncate_specs_by_name,
+                )
+                if effective_bundle.fetch_more_callable is not None:
+                    effective_bundle.fetch_more_callable.bind_manager(
+                        truncation_manager
+                    )
+                truncation_port = truncation_manager
+            else:
+                truncation_port = NoopTruncationPort()
             policy_port = DefaultToolRuntimePolicyPort(
                 execution_scope=request.execution_scope,
                 policy_view=request.policy_view,
@@ -1478,7 +2026,7 @@ class DefaultToolRuntimeFactory:
                 dispatcher=DefaultToolDispatcher(effective_bundle),
                 policy_port=policy_port,
                 duplicate_governance=PassThroughDuplicateGovernance(),
-                truncation_port=NoopTruncationPort(),
+                truncation_port=truncation_port,
                 accept_port=request.accept_port,
                 retry_policy=request.retry_policy,
                 policy_view=request.policy_view,
@@ -1491,6 +2039,28 @@ class DefaultToolRuntimeFactory:
             tool_schemas=effective_bundle.tool_schemas,
             tool_executor=executor,
         )
+
+
+@dataclass(frozen=True, slots=True)
+class _SelectedTruncationValue:
+    """待截断的 JSON 值。
+
+    :param value: 从工具结果中选出的目标值。
+    """
+
+    value: JsonValue
+
+
+@dataclass(frozen=True, slots=True)
+class _CreatedTruncation:
+    """一次截断产生的可见值与剩余引用。
+
+    :param visible_value: 截断后可直接返回给 LLM 的值。
+    :param remaining_ref: run-local 剩余内容引用。
+    """
+
+    visible_value: JsonValue
+    remaining_ref: TruncatedRemainderRef
 
 
 @dataclass(frozen=True, slots=True)
@@ -2295,6 +2865,428 @@ def _definitions_by_name(
     return result
 
 
+def _fetch_more_tool_definition(callable_: FetchMoreToolCallable) -> ToolDefinition:
+    """构造内置 ``fetch_more`` framework tool 声明。
+
+    :param callable_: 已创建的 ``fetch_more`` callable。
+    :returns: framework tool 声明。
+    """
+
+    properties: dict[str, JsonValue] = {
+        _FETCH_MORE_CURSOR_FIELD: {"type": "string"},
+        _FETCH_MORE_SCOPE_TOKEN_FIELD: {"type": "string"},
+        _FETCH_MORE_LIMIT_FIELD: {"type": "integer", "minimum": 1},
+    }
+    schema = ToolSchema(
+        type="function",
+        function=ToolFunctionSchema(
+            name=FrameworkToolName.FETCH_MORE.value,
+            description=_FETCH_MORE_DESCRIPTION,
+            parameters=ToolParametersSchema(
+                type="object",
+                properties=properties,
+                required=(
+                    _FETCH_MORE_CURSOR_FIELD,
+                    _FETCH_MORE_SCOPE_TOKEN_FIELD,
+                ),
+                additional_properties=False,
+            ),
+        ),
+    )
+    return ToolDefinition(
+        name=FrameworkToolName.FETCH_MORE.value,
+        schema=schema,
+        callable=callable_,
+        truncate=None,
+        display=None,
+        tags=("framework",),
+    )
+
+
+def _fetch_more_request_from_call(
+    call: ToolCallRequest,
+) -> FetchMoreRequest | ToolFailedOutcome:
+    """从工具调用参数解析 ``FetchMoreRequest``。
+
+    :param call: ``fetch_more`` 工具调用。
+    :returns: 解析后的请求；参数非法时返回普通失败 outcome。
+    """
+
+    cursor = call.arguments.get(_FETCH_MORE_CURSOR_FIELD)
+    scope_token = call.arguments.get(_FETCH_MORE_SCOPE_TOKEN_FIELD)
+    limit_value = call.arguments.get(_FETCH_MORE_LIMIT_FIELD)
+    if not isinstance(cursor, str) or not isinstance(scope_token, str):
+        return _truncation_failure(
+            _TRUNCATION_INVALID_REQUEST_REASON,
+            "fetch_more requires cursor and scope_token string arguments",
+        )
+    limit: int | None = None
+    if limit_value is not None:
+        if isinstance(limit_value, bool) or not isinstance(limit_value, int):
+            return _truncation_failure(
+                _TRUNCATION_INVALID_REQUEST_REASON,
+                "fetch_more limit must be a positive integer",
+            )
+        limit = limit_value
+    try:
+        return FetchMoreRequest(
+            cursor=cursor,
+            scope_token=scope_token,
+            limit=limit,
+        )
+    except ValueError as exc:
+        return _truncation_failure(_TRUNCATION_INVALID_REQUEST_REASON, str(exc))
+
+
+def _tool_truncation_strategy(
+    spec: ToolTruncateSpec,
+) -> ToolTruncationStrategy | None:
+    """把截断声明策略解析为枚举。
+
+    :param spec: 截断声明。
+    :returns: 支持的截断策略；未知时为 ``None``。
+    """
+
+    if spec.strategy is None:
+        return None
+    try:
+        return ToolTruncationStrategy(spec.strategy)
+    except ValueError:
+        return None
+
+
+def _select_truncation_value(
+    value: JsonValue, spec: ToolTruncateSpec
+) -> _SelectedTruncationValue | None:
+    """按截断声明选择目标 JSON 值。
+
+    :param value: 工具 completed payload。
+    :param spec: 截断声明。
+    :returns: 目标值；无法选择时为 ``None``。
+    """
+
+    if spec.field_path is not None:
+        selected = _value_at_path(value, spec.field_path)
+        if selected is None:
+            return None
+        return _SelectedTruncationValue(value=selected)
+    if spec.target_field is not None:
+        if not isinstance(value, Mapping):
+            return None
+        selected = value.get(spec.target_field)
+        if selected is None:
+            return None
+        return _SelectedTruncationValue(value=selected)
+    return _SelectedTruncationValue(value=value)
+
+
+def _value_at_path(value: JsonValue, path: tuple[str, ...]) -> JsonValue | None:
+    """读取嵌套 mapping 路径上的 JSON 值。
+
+    :param value: 根 JSON 值。
+    :param path: 字段路径。
+    :returns: 路径值；不存在时为 ``None``。
+    """
+
+    current = value
+    for item in path:
+        if not isinstance(current, Mapping):
+            return None
+        next_value = current.get(item)
+        if next_value is None:
+            return None
+        current = next_value
+    return current
+
+
+def _replace_truncation_value(
+    value: JsonValue, spec: ToolTruncateSpec, replacement: JsonValue
+) -> JsonValue | None:
+    """把截断后的公开值写回工具 payload。
+
+    :param value: 原始工具 payload。
+    :param spec: 截断声明。
+    :param replacement: 替换值。
+    :returns: 新 payload；无法替换时为 ``None``。
+    """
+
+    if spec.field_path is not None:
+        return _replace_value_at_path(value, spec.field_path, replacement)
+    if spec.target_field is not None:
+        if not isinstance(value, Mapping):
+            return None
+        result: dict[str, JsonValue] = dict(value)
+        result[spec.target_field] = replacement
+        return result
+    return replacement
+
+
+def _replace_value_at_path(
+    value: JsonValue, path: tuple[str, ...], replacement: JsonValue
+) -> JsonValue | None:
+    """替换嵌套 mapping 路径上的 JSON 值。
+
+    :param value: 根 JSON 值。
+    :param path: 字段路径。
+    :param replacement: 替换值。
+    :returns: 新 JSON 值；无法替换时为 ``None``。
+    """
+
+    if not path:
+        return replacement
+    if not isinstance(value, Mapping):
+        return None
+    head = path[0]
+    child = value.get(head)
+    if child is None:
+        return None
+    replaced_child = _replace_value_at_path(child, path[1:], replacement)
+    if replaced_child is None:
+        return None
+    result: dict[str, JsonValue] = dict(value)
+    result[head] = replaced_child
+    return result
+
+
+def _truncated_value_for_strategy(
+    *,
+    strategy: ToolTruncationStrategy,
+    value: JsonValue,
+    spec: ToolTruncateSpec,
+) -> _CreatedTruncation | None:
+    """按策略截断 JSON 值并构造剩余引用。
+
+    :param strategy: 截断策略。
+    :param value: 待截断值。
+    :param spec: 截断声明。
+    :returns: 截断结果；无需截断或不支持时为 ``None``。
+    """
+
+    if strategy is ToolTruncationStrategy.TEXT_CHARS:
+        return _truncate_text_chars(value, spec)
+    if strategy is ToolTruncationStrategy.TEXT_LINES:
+        return _truncate_text_lines(value, spec)
+    if strategy is ToolTruncationStrategy.LIST_ITEMS:
+        return _truncate_list_items(value, spec)
+    if strategy is ToolTruncationStrategy.BINARY_BYTES:
+        return _truncate_binary_bytes(value, spec)
+    return None
+
+
+def _truncate_text_chars(
+    value: JsonValue, spec: ToolTruncateSpec
+) -> _CreatedTruncation | None:
+    """按字符数截断文本。
+
+    :param value: 待截断值。
+    :param spec: 截断声明。
+    :returns: 截断结果；无需截断时为 ``None``。
+    """
+
+    if not isinstance(value, str):
+        return None
+    limit = _positive_limit(spec, _TEXT_CHARS_LIMIT_KEY)
+    if limit is None or len(value) <= limit:
+        return None
+    visible = value[:limit]
+    remaining = value[limit:]
+    return _CreatedTruncation(
+        visible_value=visible,
+        remaining_ref=TextCharsRemainderRef(
+            remaining_text=remaining,
+            digest=sha256_digest_json({"remaining_text": remaining}),
+        ),
+    )
+
+
+def _truncate_text_lines(
+    value: JsonValue, spec: ToolTruncateSpec
+) -> _CreatedTruncation | None:
+    """按行数截断文本。
+
+    :param value: 待截断值。
+    :param spec: 截断声明。
+    :returns: 截断结果；无需截断时为 ``None``。
+    """
+
+    if not isinstance(value, str):
+        return None
+    limit = _positive_limit(spec, _TEXT_LINES_LIMIT_KEY)
+    lines = value.splitlines()
+    if limit is None or len(lines) <= limit:
+        return None
+    visible = "\n".join(lines[:limit])
+    remaining = tuple(lines[limit:])
+    return _CreatedTruncation(
+        visible_value=visible,
+        remaining_ref=TextLinesRemainderRef(
+            remaining_lines=remaining,
+            digest=sha256_digest_json({"remaining_lines": list(remaining)}),
+        ),
+    )
+
+
+def _truncate_list_items(
+    value: JsonValue, spec: ToolTruncateSpec
+) -> _CreatedTruncation | None:
+    """按列表项数截断 JSON 数组。
+
+    :param value: 待截断值。
+    :param spec: 截断声明。
+    :returns: 截断结果；无需截断时为 ``None``。
+    """
+
+    if not isinstance(value, list):
+        return None
+    limit = _positive_limit(spec, _LIST_ITEMS_LIMIT_KEY)
+    if limit is None or len(value) <= limit:
+        return None
+    visible = value[:limit]
+    remaining = tuple(value[limit:])
+    return _CreatedTruncation(
+        visible_value=visible,
+        remaining_ref=ListItemsRemainderRef(
+            remaining_items=remaining,
+            digest=sha256_digest_json({"remaining_items": list(remaining)}),
+        ),
+    )
+
+
+def _truncate_binary_bytes(
+    value: JsonValue, spec: ToolTruncateSpec
+) -> _CreatedTruncation | None:
+    """按原始字节数截断 base64 字符串。
+
+    :param value: base64 ASCII 字符串。
+    :param spec: 截断声明。
+    :returns: 截断结果；无需截断或解码失败时为 ``None``。
+    """
+
+    if not isinstance(value, str):
+        return None
+    limit = _positive_limit(spec, _BINARY_BYTES_LIMIT_KEY)
+    if limit is None:
+        return None
+    try:
+        raw = base64.b64decode(value.encode("ascii"), validate=True)
+    except (ValueError, UnicodeEncodeError):
+        return None
+    if len(raw) <= limit:
+        return None
+    visible = base64.b64encode(raw[:limit]).decode("ascii")
+    remaining = raw[limit:]
+    return _CreatedTruncation(
+        visible_value=visible,
+        remaining_ref=BinaryBytesRemainderRef(
+            remaining_bytes=remaining,
+            digest=sha256_digest_json(
+                {"remaining_bytes_base64": base64.b64encode(remaining).decode("ascii")}
+            ),
+        ),
+    )
+
+
+def _positive_limit(spec: ToolTruncateSpec, key: str) -> int | None:
+    """读取正整数截断上限。
+
+    :param spec: 截断声明。
+    :param key: limit key。
+    :returns: 正整数上限；缺失或非法时为 ``None``。
+    """
+
+    value = spec.limits.get(key)
+    if value is None or value < _MIN_TRUNCATION_LIMIT:
+        return None
+    return value
+
+
+def _truncated_public_value(
+    *, visible_value: JsonValue, cursor_id: str, scope_token: str
+) -> JsonValue:
+    """构造 LLM-facing 截断值。
+
+    :param visible_value: 已截断的可见值。
+    :param cursor_id: 不透明 cursor。
+    :param scope_token: scope token。
+    :returns: JSON 对象，不包含任何内部剩余内容。
+    """
+
+    return {
+        _TRUNCATED_APPLIED_FIELD: True,
+        _TRUNCATED_VALUE_FIELD: visible_value,
+        _TRUNCATED_META_FIELD: {
+            _FETCH_MORE_CURSOR_FIELD: cursor_id,
+            _FETCH_MORE_SCOPE_TOKEN_FIELD: scope_token,
+        },
+    }
+
+
+def _scope_token_digest(scope_token: str) -> str:
+    """计算 scope token digest。
+
+    :param scope_token: 明文 scope token。
+    :returns: Host canonical sha256 digest。
+    """
+
+    return sha256_digest_json({"scope_token": scope_token})
+
+
+def _fetch_more_value(
+    remainder: TruncatedRemainderRef, limit: int | None
+) -> JsonValue | None:
+    """从剩余引用读取公开补读值。
+
+    :param remainder: 剩余内容引用。
+    :param limit: 可选补读上限。
+    :returns: 可返回给 LLM 的 JSON 值；摘要不匹配时为 ``None``。
+    """
+
+    if not _remainder_digest_matches(remainder):
+        return None
+    if isinstance(remainder, TextCharsRemainderRef):
+        return remainder.remaining_text if limit is None else remainder.remaining_text[:limit]
+    if isinstance(remainder, TextLinesRemainderRef):
+        lines = remainder.remaining_lines if limit is None else remainder.remaining_lines[:limit]
+        return "\n".join(lines)
+    if isinstance(remainder, ListItemsRemainderRef):
+        items = remainder.remaining_items if limit is None else remainder.remaining_items[:limit]
+        return list(items)
+    if isinstance(remainder, BinaryBytesRemainderRef):
+        data = remainder.remaining_bytes if limit is None else remainder.remaining_bytes[:limit]
+        return base64.b64encode(data).decode("ascii")
+    return None
+
+
+def _remainder_digest_matches(remainder: TruncatedRemainderRef) -> bool:
+    """校验剩余内容引用 digest。
+
+    :param remainder: 剩余内容引用。
+    :returns: digest 匹配时返回 ``True``。
+    """
+
+    if isinstance(remainder, TextCharsRemainderRef):
+        return remainder.digest == sha256_digest_json(
+            {"remaining_text": remainder.remaining_text}
+        )
+    if isinstance(remainder, TextLinesRemainderRef):
+        return remainder.digest == sha256_digest_json(
+            {"remaining_lines": list(remainder.remaining_lines)}
+        )
+    if isinstance(remainder, ListItemsRemainderRef):
+        return remainder.digest == sha256_digest_json(
+            {"remaining_items": list(remainder.remaining_items)}
+        )
+    if isinstance(remainder, BinaryBytesRemainderRef):
+        return remainder.digest == sha256_digest_json(
+            {
+                "remaining_bytes_base64": base64.b64encode(
+                    remainder.remaining_bytes
+                ).decode("ascii")
+            }
+        )
+    return False
+
+
 def _business_bundle_digest(bundle: ToolBundle) -> str:
     """计算业务 bundle 诊断摘要。
 
@@ -2442,6 +3434,7 @@ def _tool_fact_accept_candidate(
     iteration_id: str,
     normalized_arguments_digest: str,
     outcome: ToolExecutionOutcome,
+    truncation_fact: ToolTruncationFact | None,
     policy_decision: ToolPolicyDecision,
     duplicate_decision: DuplicateDecision,
     tool_idempotency_key: str | None,
@@ -2455,6 +3448,7 @@ def _tool_fact_accept_candidate(
     :param iteration_id: 当前 Engine iteration id。
     :param normalized_arguments_digest: 参数 digest。
     :param outcome: 已治理并可进入 accept path 的 outcome。
+    :param truncation_fact: 截断事实；未截断为 ``None``。
     :param policy_decision: 工具治理决策。
     :param duplicate_decision: duplicate governance 决策。
     :param tool_idempotency_key: 工具级幂等 key。
@@ -2480,6 +3474,7 @@ def _tool_fact_accept_candidate(
         payload_digest=payload_digest,
         policy_decision=policy_decision,
         duplicate_decision=duplicate_decision,
+        truncation_fact=truncation_fact,
     )
     return ToolFactAcceptCandidate(
         session_id=scope.session_id,
@@ -2496,7 +3491,7 @@ def _tool_fact_accept_candidate(
         outcome_digest=outcome_digest,
         payload_digest=payload_digest,
         payload_ref=None,
-        truncation=None,
+        truncation=truncation_fact,
         duplicate_key=duplicate_decision.duplicate_key,
         duplicate_decision=duplicate_decision.kind,
         reuse_prior_event_refs=(),
@@ -2609,6 +3604,7 @@ def _tool_semantic_input_digest(
     payload_digest: str | None,
     policy_decision: ToolPolicyDecision,
     duplicate_decision: DuplicateDecision,
+    truncation_fact: ToolTruncationFact | None,
 ) -> str:
     """计算 accept candidate semantic input digest。
 
@@ -2620,6 +3616,7 @@ def _tool_semantic_input_digest(
     :param payload_digest: payload digest。
     :param policy_decision: policy decision。
     :param duplicate_decision: duplicate decision。
+    :param truncation_fact: 截断事实。
     :returns: Host canonical sha256 digest。
     """
 
@@ -2635,6 +3632,7 @@ def _tool_semantic_input_digest(
             "payload_digest": payload_digest,
             "policy_decision": _policy_decision_json(policy_decision),
             "duplicate_decision": _duplicate_decision_json(duplicate_decision),
+            "truncation": _truncation_json(truncation_fact),
         }
     )
 
@@ -2763,6 +3761,21 @@ def _tool_failed_outcome(
     )
 
 
+def _truncation_failure(reason_code: str, message: str) -> ToolFailedOutcome:
+    """构造截断 / 补读失败工具 outcome。
+
+    :param reason_code: 截断错误原因码。
+    :param message: 人类可读错误。
+    :returns: 普通 ``ToolFailedOutcome``。
+    """
+
+    return _tool_failed_outcome(
+        error=_TRUNCATION_ERROR_CODE,
+        message=message,
+        hint=reason_code,
+    )
+
+
 def _governed_failure_outcome(
     policy_decision: ToolPolicyDecision,
 ) -> ToolFailedOutcome:
@@ -2813,6 +3826,9 @@ __all__ = [
     "EffectiveToolBundle",
     "EffectiveToolBundleBuildRequest",
     "EffectiveToolBundleBuilder",
+    "FetchMoreRequest",
+    "FetchMoreResult",
+    "FetchMoreToolCallable",
     "FrameworkToolInjector",
     "HostEventRef",
     "HostPayloadRef",
@@ -2843,7 +3859,14 @@ __all__ = [
     "ToolTraceDiagnosticEmitter",
     "ToolTraceDiagnosticRecord",
     "ToolTraceDiagnosticRef",
+    "ToolTruncationCursor",
     "ToolTruncationFact",
     "TruncationAppliedOutcome",
+    "TruncatedRemainderRef",
+    "TruncationManager",
     "TruncationPort",
+    "BinaryBytesRemainderRef",
+    "ListItemsRemainderRef",
+    "TextCharsRemainderRef",
+    "TextLinesRemainderRef",
 ]

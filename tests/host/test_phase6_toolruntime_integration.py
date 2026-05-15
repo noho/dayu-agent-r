@@ -11,7 +11,11 @@ from pathlib import Path
 import pytest
 
 from dayu.contracts.json_value import JsonValue
-from dayu.contracts.tool_call import BatchToolExecutionContext, ToolCallRequest
+from dayu.contracts.tool_call import (
+    BatchToolExecutionContext,
+    BatchToolExecutionRequest,
+    ToolCallRequest,
+)
 from dayu.contracts.tool_declaration import ToolBundle, ToolDefinition
 from dayu.contracts.tool_outcome import ToolCompletedOutcome, ToolExecutionOutcome
 from dayu.contracts.tool_result import ToolResultSuccess
@@ -19,6 +23,8 @@ from dayu.contracts.tool_schema import (
     ToolFunctionSchema,
     ToolParametersSchema,
     ToolSchema,
+    ToolTruncateSpec,
+    ToolTruncationStrategy,
 )
 from dayu.engine.agent import _AsyncAgent
 from dayu.engine.contracts.agent_policy import AgentPolicy
@@ -79,12 +85,15 @@ from dayu.host.tool_runtime import (
 )
 from dayu.host.run_input import PolicySnapshot, create_tool_enabled_run_input_builder
 from dayu.host.tooling import (
+    FrameworkToolName,
+    FrameworkToolPolicyView,
     ToolBundleSourceKind,
     ToolBundleSourceRef,
     default_framework_tool_policy_view,
 )
 
 _NOW = datetime(2026, 5, 15, 1, 2, 3, tzinfo=UTC)
+_ITERATION_ID = "iteration-phase6-toolruntime"
 _CALL_CONTEXT_DIGEST = sha256_digest_json({"context": "phase6-toolruntime"})
 _POLICY_DIGEST = "sha256:3333333333333333333333333333333333333333333333333333333333333333"
 
@@ -281,6 +290,93 @@ async def test_engine_continues_only_after_toolruntime_host_accept(
         assert attempt_status is AttemptStatus.RUNNING
 
 
+@pytest.mark.asyncio
+async def test_fetch_more_uses_same_toolruntime_accept_eventlog_path(
+    tmp_path: Path,
+) -> None:
+    """fetch_more 作为普通工具通过 ToolExecutor 与 accept barrier 写 EventLog。"""
+
+    with open_host_durable_store(_options(tmp_path)) as store:
+        seeded = _seed_active_run(store.transaction_runner)
+        tool_runtime = DefaultToolRuntimeFactory(
+            EffectiveToolBundleBuilder()
+        ).create_tool_runtime(
+            ToolRuntimeBuildRequest(
+                effective_bundle_request=EffectiveToolBundleBuildRequest(
+                    business_tool_bundle=ToolBundle(
+                        definitions=(
+                            _definition(
+                                _FakeBusinessTool(),
+                                truncate=_truncate_spec(),
+                            ),
+                        )
+                    ),
+                    source_refs=(_source_ref(),),
+                    framework_tool_policy=FrameworkToolPolicyView(
+                        reserved_framework_tool_names=frozenset(
+                            {FrameworkToolName.FETCH_MORE}
+                        ),
+                        enabled_framework_tools=frozenset(
+                            {FrameworkToolName.FETCH_MORE}
+                        ),
+                    ),
+                    policy_snapshot_digest=_POLICY_DIGEST,
+                    enable_truncation_manager=True,
+                ),
+                execution_scope=ToolRuntimeExecutionScope(
+                    session_id=seeded.session_id,
+                    run_id=seeded.run_id,
+                    attempt_id=seeded.attempt_id,
+                    execution_id=seeded.execution_id,
+                    allow_tool_calls=True,
+                ),
+                accept_port=DefaultHostToolFactAcceptPort(
+                    transaction_runner=store.transaction_runner
+                ),
+            )
+        )
+        _accept_worker_running(store.transaction_runner, seeded)
+
+        first = await tool_runtime.tool_executor.execute(
+            _tool_request(seeded, _tool_call("tool-call-1"))
+        )
+        first_outcome = first.records[0].outcome
+        assert isinstance(first_outcome, ToolCompletedOutcome)
+        first_value = first_outcome.result.value
+        assert isinstance(first_value, dict)
+        fetch_more_ref = first_value["accepted_value"]
+        assert isinstance(fetch_more_ref, dict)
+        fetch_more_args = fetch_more_ref["fetch_more"]
+        assert isinstance(fetch_more_args, dict)
+        cursor = fetch_more_args["cursor"]
+        scope_token = fetch_more_args["scope_token"]
+        assert isinstance(cursor, str)
+        assert isinstance(scope_token, str)
+
+        second = await tool_runtime.tool_executor.execute(
+            _tool_request(
+                seeded,
+                _fetch_more_call("fetch-call-1", cursor, scope_token),
+            )
+        )
+
+        second_outcome = second.records[0].outcome
+        assert isinstance(second_outcome, ToolCompletedOutcome)
+        assert second_outcome.result.value == "-toolruntime"
+        tool_events = _tool_events(store.transaction_runner)
+        assert [row.event_type for row in tool_events] == [
+            "TOOL_CALL_REQUESTED",
+            "TOOL_CALL_GOVERNED",
+            "TOOL_RESULT_ACCEPTED",
+            "TOOL_CALL_REQUESTED",
+            "TOOL_CALL_GOVERNED",
+            "TOOL_RESULT_ACCEPTED",
+        ]
+        payloads = [json.loads(row.payload_json) for row in tool_events]
+        assert payloads[0]["tool_name"] == "fake_tool"
+        assert payloads[3]["tool_name"] == "fetch_more"
+
+
 async def _collect(agent: _AsyncAgent) -> list[EngineEvent]:
     """收集 Engine events。
 
@@ -374,10 +470,14 @@ def _tool_call(tool_call_id: str) -> ToolCallRequest:
     )
 
 
-def _definition(callable_: _FakeBusinessTool) -> ToolDefinition:
+def _definition(
+    callable_: _FakeBusinessTool,
+    truncate: ToolTruncateSpec | None = None,
+) -> ToolDefinition:
     """构造 fake tool definition。
 
     :param callable_: fake business tool。
+    :param truncate: 可选截断声明。
     :returns: ToolDefinition。
     """
 
@@ -392,9 +492,68 @@ def _definition(callable_: _FakeBusinessTool) -> ToolDefinition:
             ),
         ),
         callable=callable_,
-        truncate=None,
+        truncate=truncate,
         display=None,
         tags=("test",),
+    )
+
+
+def _truncate_spec() -> ToolTruncateSpec:
+    """构造 integration test 用截断声明。
+
+    :returns: text_chars 截断声明。
+    """
+
+    return ToolTruncateSpec(
+        enabled=True,
+        strategy=ToolTruncationStrategy.TEXT_CHARS.value,
+        limits={"max_chars": 9},
+        target_field="accepted_value",
+        field_path=None,
+        ttl_seconds=None,
+    )
+
+
+def _tool_request(
+    seeded: _SeededRun, call: ToolCallRequest
+) -> BatchToolExecutionRequest:
+    """构造 ToolRuntime 直接执行请求。
+
+    :param seeded: active Run refs。
+    :param call: 工具调用。
+    :returns: 批式工具请求。
+    """
+
+    return BatchToolExecutionRequest(
+        calls=(call,),
+        context=BatchToolExecutionContext(
+            run_id=seeded.run_id,
+            session_id=seeded.session_id,
+            iteration_id=_ITERATION_ID,
+            timeout_seconds=10.0,
+            cancellation_token=_NeverCancelledToken(),
+            correlation_id="correlation-fetch-more",
+        ),
+    )
+
+
+def _fetch_more_call(
+    tool_call_id: str, cursor: str, scope_token: str
+) -> ToolCallRequest:
+    """构造 fetch_more 工具调用。
+
+    :param tool_call_id: 工具调用 id。
+    :param cursor: cursor。
+    :param scope_token: scope token。
+    :returns: ToolCallRequest。
+    """
+
+    return ToolCallRequest(
+        tool_call_id=tool_call_id,
+        name=FrameworkToolName.FETCH_MORE.value,
+        arguments={"cursor": cursor, "scope_token": scope_token},
+        index_in_iteration=0,
+        provider_state=None,
     )
 
 
