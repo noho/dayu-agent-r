@@ -114,6 +114,13 @@ _TOOL_RUNTIME_UNSUPPORTED_AWAITING_REASON = "unsupported_awaiting"
 _TOOL_RUNTIME_ACCEPT_TIMEOUT_REASON = "accept_timeout"
 _TOOL_RUNTIME_ACCEPT_REJECTED_REASON = "accept_rejected"
 _TOOL_RUNTIME_ACCEPT_EXCEPTION_REASON = "accept_ack_lost"
+_TOOL_RUNTIME_DUPLICATE_REUSE_REASON = "duplicate_reuse"
+_TOOL_RUNTIME_DUPLICATE_HINT_REASON = "duplicate_hint"
+_TOOL_RUNTIME_DUPLICATE_REQUIRE_JUSTIFICATION_REASON = (
+    "duplicate_requires_justification"
+)
+_TOOL_RUNTIME_DUPLICATE_HARD_STOP_REASON = "duplicate_hard_stop"
+_TOOL_RUNTIME_DIAGNOSTIC_NOOP_REF = "tool-diagnostic-noop"
 _SIDE_EFFECT_IDEMPOTENCY_HINT = (
     "side-effect or paid tool requires a tool idempotency key"
 )
@@ -363,16 +370,14 @@ class ToolFactAcceptCandidate:
         if self.tool_fact_kind is ToolFactKind.COMPLETED:
             _require_sha256_digest(self.outcome_digest, field_name="outcome_digest")
             _require_sha256_digest(self.payload_digest, field_name="payload_digest")
-        elif self.tool_fact_kind in (
-            ToolFactKind.FAILED,
-            ToolFactKind.CANCELLED,
-            ToolFactKind.GOVERNED_ERROR,
-        ):
+        elif self.tool_fact_kind in (ToolFactKind.FAILED, ToolFactKind.CANCELLED):
             _require_sha256_digest(self.outcome_digest, field_name="outcome_digest")
             if self.reuse_prior_event_refs:
                 raise ValueError(
                     f"{self.tool_fact_kind.value} must not carry prior reuse refs"
                 )
+        elif self.tool_fact_kind is ToolFactKind.GOVERNED_ERROR:
+            _require_sha256_digest(self.outcome_digest, field_name="outcome_digest")
         elif self.tool_fact_kind is ToolFactKind.REUSE:
             _validate_reuse_candidate(self)
         else:
@@ -524,10 +529,13 @@ class ToolRuntimeToolPolicy:
     :param side_effect_kind: 工具副作用类别。
     :param idempotency_key_argument_name: ``SIDE_EFFECT`` / ``PAID`` 工具从
         哪个工具参数读取工具级幂等 key；read-only 工具为 ``None``。
+    :param semantic_duplicate_key_argument_name: 工具可选提供的 run-local
+        语义重复 key 参数名；无则为 ``None``。
     """
 
     side_effect_kind: ToolSideEffectKind
     idempotency_key_argument_name: str | None
+    semantic_duplicate_key_argument_name: str | None = None
 
     def __post_init__(self) -> None:
         """校验单工具 policy 字段。
@@ -539,6 +547,10 @@ class ToolRuntimeToolPolicy:
         _require_optional_non_empty_text(
             self.idempotency_key_argument_name,
             field_name="idempotency_key_argument_name",
+        )
+        _require_optional_non_empty_text(
+            self.semantic_duplicate_key_argument_name,
+            field_name="semantic_duplicate_key_argument_name",
         )
         if (
             self.side_effect_kind
@@ -585,6 +597,7 @@ class ToolRuntimePolicyView:
         return ToolRuntimeToolPolicy(
             side_effect_kind=ToolSideEffectKind.READ_ONLY,
             idempotency_key_argument_name=None,
+            semantic_duplicate_key_argument_name=None,
         )
 
 
@@ -782,11 +795,137 @@ class DuplicateDecision:
     :param kind: 重复治理类别。
     :param duplicate_key: 当前调用的重复键；未产生时为 ``None``。
     :param prior_event_refs: 可复用的既有事件引用；无复用时为空元组。
+    :param prior_outcome: 可返回给 Engine 的既有 accepted outcome；无复用时为
+        ``None``。
     """
 
     kind: DuplicateDecisionKind
     duplicate_key: str | None
-    prior_event_refs: tuple[str, ...]
+    prior_event_refs: tuple[HostEventRef, ...]
+    prior_outcome: ToolExecutionOutcome | None
+
+
+@dataclass(frozen=True, slots=True)
+class DuplicateGovernancePolicy:
+    """run-local duplicate governance 策略。
+
+    :param default_duplicate_decision: 已命中既有 accepted 记录时的默认治理
+        动作。
+    :param decisions_by_tool_name: 按工具名覆盖的 duplicate 动作。
+    :param justification_argument_names_by_tool_name: ``require_justification``
+        决策可读取的结构化 justification 参数名；未配置时降级为 ``hint``。
+    """
+
+    default_duplicate_decision: DuplicateDecisionKind = DuplicateDecisionKind.ALLOW
+    decisions_by_tool_name: Mapping[str, DuplicateDecisionKind] = field(
+        default_factory=dict
+    )
+    justification_argument_names_by_tool_name: Mapping[str, str] = field(
+        default_factory=dict
+    )
+
+    def __post_init__(self) -> None:
+        """校验 duplicate governance 策略字段。
+
+        :returns: ``None``。
+        :raises ValueError: 工具名或 justification 参数名为空时抛出。
+        """
+
+        if not isinstance(self.default_duplicate_decision, DuplicateDecisionKind):
+            raise ValueError(
+                "default_duplicate_decision must be DuplicateDecisionKind"
+            )
+        for tool_name, decision in self.decisions_by_tool_name.items():
+            _require_non_empty_text(tool_name, field_name="duplicate policy tool_name")
+            if not isinstance(decision, DuplicateDecisionKind):
+                raise ValueError("duplicate policy decision must be DuplicateDecisionKind")
+        for tool_name, argument_name in (
+            self.justification_argument_names_by_tool_name.items()
+        ):
+            _require_non_empty_text(
+                tool_name, field_name="duplicate justification tool_name"
+            )
+            _require_non_empty_text(
+                argument_name, field_name="duplicate justification argument_name"
+            )
+
+
+@dataclass(frozen=True, slots=True)
+class DuplicateGovernanceRequest:
+    """重复治理查询输入。
+
+    :param tool_name: 工具名。
+    :param tool_identity_digest: 工具身份 digest。
+    :param normalized_arguments_digest: canonical 参数 digest。
+    :param arguments: 当前工具参数，用于读取可选 semantic key 或 justification。
+    :param semantic_duplicate_key: 工具可选提供的 run-local 语义重复 key。
+    """
+
+    tool_name: str
+    tool_identity_digest: str
+    normalized_arguments_digest: str
+    arguments: Mapping[str, JsonValue]
+    semantic_duplicate_key: str | None
+
+    def __post_init__(self) -> None:
+        """校验重复治理查询输入。
+
+        :returns: ``None``。
+        :raises ValueError: 工具名为空或 digest 非法时抛出。
+        """
+
+        _require_non_empty_text(self.tool_name, field_name="tool_name")
+        _require_sha256_digest(
+            self.tool_identity_digest, field_name="tool_identity_digest"
+        )
+        _require_sha256_digest(
+            self.normalized_arguments_digest,
+            field_name="normalized_arguments_digest",
+        )
+        _require_optional_non_empty_text(
+            self.semantic_duplicate_key, field_name="semantic_duplicate_key"
+        )
+
+
+@dataclass(frozen=True, slots=True)
+class DuplicateAcceptedRecord:
+    """重复治理 accepted 索引写入记录。
+
+    :param request: 原始 duplicate governance 查询。
+    :param accepted_event_refs: Host accept ack 返回的 accepted refs。
+    :param accepted_outcome: 已 durable accepted 且可复用的工具 outcome。
+    :param result_digest: accepted ack 中的结果 digest。
+    """
+
+    request: DuplicateGovernanceRequest
+    accepted_event_refs: tuple[HostEventRef, ...]
+    accepted_outcome: ToolExecutionOutcome
+    result_digest: str
+
+    def __post_init__(self) -> None:
+        """校验 accepted 索引写入记录。
+
+        :returns: ``None``。
+        :raises ValueError: 缺少 accepted refs 或 result digest 非法时抛出。
+        """
+
+        if not self.accepted_event_refs:
+            raise ValueError("duplicate accepted record requires event refs")
+        _require_sha256_digest(self.result_digest, field_name="result_digest")
+
+
+@dataclass(frozen=True, slots=True)
+class _DuplicateAcceptedEntry:
+    """ToolRuntime 实例内 duplicate index 的 accepted 条目。
+
+    :param accepted_event_refs: 可供后续 reuse 引用的 Host refs。
+    :param accepted_outcome: 可供后续 reuse 返回给 Engine 的 outcome。
+    :param result_digest: accepted ack 的结果 digest。
+    """
+
+    accepted_event_refs: tuple[HostEventRef, ...]
+    accepted_outcome: ToolExecutionOutcome
+    result_digest: str
 
 
 @dataclass(frozen=True, slots=True)
@@ -891,13 +1030,22 @@ class DuplicateGovernancePort(Protocol):
     """重复工具调用治理端口协议。"""
 
     def decide_duplicate(
-        self, tool_name: str, normalized_arguments_digest: str
+        self, request: DuplicateGovernanceRequest
     ) -> DuplicateDecision:
         """判断当前工具调用是否与同 Run 既有调用重复。
 
-        :param tool_name: 工具名。
-        :param normalized_arguments_digest: canonical 参数摘要。
+        :param request: duplicate governance 查询输入。
         :returns: 重复治理决策。
+        :raises ValueError: 实现可在 request 字段非法时抛出。
+        """
+        ...
+
+    def record_accepted(self, record: DuplicateAcceptedRecord) -> None:
+        """记录已 accepted 工具事实供同 Run 后续治理复用。
+
+        :param record: accepted 索引写入记录。
+        :returns: ``None``。
+        :raises ValueError: 实现可在记录字段非法时抛出。
         """
         ...
 
@@ -1323,30 +1471,91 @@ class FetchMoreToolCallable:
         return self._manager.fetch_more(request, context)
 
 
-class PassThroughDuplicateGovernance:
-    """P6-S3 同 Run duplicate governance 的 always-allow stub。"""
+class InMemoryRunLocalDuplicateGovernance:
+    """ToolRuntime 实例内 run-local duplicate governance 实现。
 
-    def decide_duplicate(
-        self, tool_name: str, normalized_arguments_digest: str
-    ) -> DuplicateDecision:
-        """始终允许当前工具调用继续执行。
+    该实现只持有当前 ToolRuntime 实例生命周期内的内存索引，不落 durable
+    duplicate table，也不跨 Run / Session 继承状态。
+    """
 
-        :param tool_name: 工具名。
-        :param normalized_arguments_digest: 规范化参数 digest。
-        :returns: allow 决策与稳定 duplicate key。
+    def __init__(self, policy: DuplicateGovernancePolicy | None = None) -> None:
+        """初始化 run-local duplicate governance。
+
+        :param policy: duplicate governance 策略；无则默认 duplicate 命中也
+            继续 ``allow``。
+        :returns: ``None``。
         """
 
-        duplicate_key = sha256_digest_json(
-            {
-                "tool_name": tool_name,
-                "normalized_arguments_digest": normalized_arguments_digest,
-            }
-        )
+        self._policy = policy if policy is not None else DuplicateGovernancePolicy()
+        self._entries_by_key: dict[str, _DuplicateAcceptedEntry] = {}
+
+    def decide_duplicate(
+        self, request: DuplicateGovernanceRequest
+    ) -> DuplicateDecision:
+        """按 run-local accepted index 生成 duplicate 决策。
+
+        :param request: duplicate governance 查询输入。
+        :returns: duplicate 决策；duplicate key 不包含 ``index_in_iteration``。
+        :raises ValueError: request 字段非法时由 dataclass 校验抛出。
+        """
+
+        duplicate_key = _duplicate_key(request)
+        entry = self._entries_by_key.get(duplicate_key)
+        if entry is None:
+            return DuplicateDecision(
+                kind=DuplicateDecisionKind.ALLOW,
+                duplicate_key=duplicate_key,
+                prior_event_refs=(),
+                prior_outcome=None,
+            )
+        decision = self._decision_for_request(request)
         return DuplicateDecision(
-            kind=DuplicateDecisionKind.ALLOW,
+            kind=decision,
             duplicate_key=duplicate_key,
-            prior_event_refs=(),
+            prior_event_refs=entry.accepted_event_refs,
+            prior_outcome=entry.accepted_outcome,
         )
+
+    def record_accepted(self, record: DuplicateAcceptedRecord) -> None:
+        """记录 accepted ack 返回的 refs 与 outcome。
+
+        :param record: accepted 索引写入记录。
+        :returns: ``None``。
+        :raises ValueError: record 字段非法时由 dataclass 校验抛出。
+        """
+
+        duplicate_key = _duplicate_key(record.request)
+        self._entries_by_key[duplicate_key] = _DuplicateAcceptedEntry(
+            accepted_event_refs=record.accepted_event_refs,
+            accepted_outcome=record.accepted_outcome,
+            result_digest=record.result_digest,
+        )
+
+    def _decision_for_request(
+        self, request: DuplicateGovernanceRequest
+    ) -> DuplicateDecisionKind:
+        """返回命中 duplicate index 后的治理动作。
+
+        :param request: duplicate governance 查询输入。
+        :returns: 当前工具对应的 duplicate 决策。
+        """
+
+        decision = self._policy.decisions_by_tool_name.get(
+            request.tool_name, self._policy.default_duplicate_decision
+        )
+        if decision is DuplicateDecisionKind.REQUIRE_JUSTIFICATION:
+            argument_name = (
+                self._policy.justification_argument_names_by_tool_name.get(
+                    request.tool_name
+                )
+            )
+            if argument_name is None:
+                return DuplicateDecisionKind.HINT
+            value = request.arguments.get(argument_name)
+            if isinstance(value, str) and value.strip() != "":
+                return DuplicateDecisionKind.ALLOW
+            return DuplicateDecisionKind.REQUIRE_JUSTIFICATION
+        return decision
 
 
 class DeterministicToolTraceDiagnosticEmitter:
@@ -1359,6 +1568,8 @@ class DeterministicToolTraceDiagnosticEmitter:
         :returns: 由诊断内容 digest 派生的引用。
         """
 
+        _require_non_empty_text(record.reason_code, field_name="reason_code")
+        _require_non_empty_text(record.message, field_name="message")
         ref_digest = sha256_digest_json(
             {
                 "reason_code": record.reason_code,
@@ -1366,6 +1577,58 @@ class DeterministicToolTraceDiagnosticEmitter:
             }
         ).removeprefix("sha256:")
         return ToolTraceDiagnosticRef(ref_id=f"tool-diagnostic-{ref_digest}")
+
+
+class NoopToolTraceDiagnosticEmitter:
+    """不保存诊断内容的 ToolRuntime 诊断发射器。"""
+
+    def emit(self, record: ToolTraceDiagnosticRecord) -> ToolTraceDiagnosticRef:
+        """忽略诊断内容并返回固定引用。
+
+        :param record: 诊断记录。
+        :returns: 固定 no-op 诊断引用。
+        :raises ValueError: 诊断字段为空时抛出。
+        """
+
+        _require_non_empty_text(record.reason_code, field_name="reason_code")
+        _require_non_empty_text(record.message, field_name="message")
+        return ToolTraceDiagnosticRef(ref_id=_TOOL_RUNTIME_DIAGNOSTIC_NOOP_REF)
+
+
+class InMemoryToolTraceDiagnosticEmitter:
+    """测试用内存态 ToolRuntime 诊断发射器。"""
+
+    def __init__(self) -> None:
+        """初始化内存诊断发射器。
+
+        :returns: ``None``。
+        """
+
+        self._records: list[ToolTraceDiagnosticRecord] = []
+
+    @property
+    def records(self) -> tuple[ToolTraceDiagnosticRecord, ...]:
+        """返回已发出的诊断记录。
+
+        :returns: 按发出顺序排列的诊断记录。
+        """
+
+        return tuple(self._records)
+
+    def emit(self, record: ToolTraceDiagnosticRecord) -> ToolTraceDiagnosticRef:
+        """保存诊断记录并返回内存引用。
+
+        :param record: 诊断记录。
+        :returns: 指向内存序号的诊断引用。
+        :raises ValueError: 诊断字段为空时抛出。
+        """
+
+        _require_non_empty_text(record.reason_code, field_name="reason_code")
+        _require_non_empty_text(record.message, field_name="message")
+        self._records.append(record)
+        return ToolTraceDiagnosticRef(
+            ref_id=f"tool-diagnostic-memory-{len(self._records)}"
+        )
 
 
 class DefaultHostToolFactAcceptPort:
@@ -1678,6 +1941,8 @@ class ToolRuntimeBuildRequest:
     :param accept_port: Host accept barrier；无则只构造未连接 executor。
     :param retry_policy: accept ack 有限重试策略。
     :param policy_view: Host 内部工具 policy view。
+    :param duplicate_governance_policy: ToolRuntime 实例内 run-local duplicate
+        governance 策略。
     :param diagnostic_emitter: 诊断 emitter；无则使用确定性内存引用实现。
     """
 
@@ -1689,6 +1954,9 @@ class ToolRuntimeBuildRequest:
     )
     policy_view: ToolRuntimePolicyView = field(
         default_factory=ToolRuntimePolicyView
+    )
+    duplicate_governance_policy: DuplicateGovernancePolicy = field(
+        default_factory=DuplicateGovernancePolicy
     )
     diagnostic_emitter: ToolTraceDiagnosticEmitter | None = None
 
@@ -1804,8 +2072,22 @@ class ToolRuntimeExecutor:
         """
 
         normalized_arguments_digest = _normalized_arguments_digest(call)
+        schema_digest = _tool_schema_digest_for_call(self._effective_bundle, call)
+        identity_digest = _tool_identity_digest(
+            effective_bundle=self._effective_bundle,
+            tool_name=call.name,
+            schema_digest=schema_digest,
+        )
+        tool_policy = self._policy_view.rule_for_tool(call.name)
+        duplicate_request = DuplicateGovernanceRequest(
+            tool_name=call.name,
+            tool_identity_digest=identity_digest,
+            normalized_arguments_digest=normalized_arguments_digest,
+            arguments=call.arguments,
+            semantic_duplicate_key=_semantic_duplicate_key(call, tool_policy),
+        )
         duplicate_decision = self._duplicate_governance.decide_duplicate(
-            call.name, normalized_arguments_digest
+            duplicate_request
         )
         policy_decision = self._policy_port.decide_tool_call(call)
         if not _request_context_matches_scope(context, self._execution_scope):
@@ -1813,6 +2095,26 @@ class ToolRuntimeExecutor:
                 kind=ToolPolicyDecisionKind.GOVERNED_ERROR,
                 reason_code=_TOOL_RUNTIME_NO_TOOL_REASON,
                 message="tool request context does not match execution scope",
+            )
+        duplicate_governed = (
+            policy_decision.kind is ToolPolicyDecisionKind.ALLOW
+            and duplicate_decision.kind is not DuplicateDecisionKind.ALLOW
+        )
+        duplicate_refs = self._diagnostic_refs_for_duplicate(duplicate_decision)
+        if (
+            policy_decision.kind is ToolPolicyDecisionKind.ALLOW
+            and duplicate_decision.kind is not DuplicateDecisionKind.ALLOW
+        ):
+            policy_decision = _policy_decision_from_duplicate(duplicate_decision)
+        if policy_decision.kind is ToolPolicyDecisionKind.REUSE:
+            return await self._accept_reuse(
+                call=call,
+                context=context,
+                normalized_arguments_digest=normalized_arguments_digest,
+                duplicate_decision=duplicate_decision,
+                policy_decision=policy_decision,
+                tool_idempotency_key=_tool_idempotency_key(call, tool_policy),
+                diagnostic_refs=duplicate_refs,
             )
         if policy_decision.kind is not ToolPolicyDecisionKind.ALLOW:
             outcome = _governed_failure_outcome(policy_decision)
@@ -1838,13 +2140,19 @@ class ToolRuntimeExecutor:
             truncation_fact=truncation.fact,
             policy_decision=policy_decision,
             duplicate_decision=duplicate_decision,
-            tool_idempotency_key=_tool_idempotency_key(
-                call, self._policy_view.rule_for_tool(call.name)
-            ),
-            diagnostic_refs=(),
+            duplicate_governed=duplicate_governed,
+            tool_idempotency_key=_tool_idempotency_key(call, tool_policy),
+            diagnostic_refs=duplicate_refs,
         )
         accept_result = await self._accept_with_retry(candidate)
         if isinstance(accept_result, ToolFactAcceptedAck):
+            self._record_duplicate_accepted(
+                duplicate_request=duplicate_request,
+                accepted_ack=accept_result,
+                accepted_outcome=accepted_outcome,
+                duplicate_decision=duplicate_decision,
+                policy_decision=policy_decision,
+            )
             return BatchToolExecutionRecord(
                 tool_call_id=call.tool_call_id,
                 outcome=accepted_outcome,
@@ -1853,6 +2161,109 @@ class ToolRuntimeExecutor:
         return BatchToolExecutionRecord(
             tool_call_id=call.tool_call_id,
             outcome=governed,
+        )
+
+    async def _accept_reuse(
+        self,
+        *,
+        call: ToolCallRequest,
+        context: BatchToolExecutionContext,
+        normalized_arguments_digest: str,
+        duplicate_decision: DuplicateDecision,
+        policy_decision: ToolPolicyDecision,
+        tool_idempotency_key: str | None,
+        diagnostic_refs: tuple[ToolTraceDiagnosticRef, ...],
+    ) -> BatchToolExecutionRecord:
+        """接受 duplicate reuse governance 并返回 prior outcome。
+
+        :param call: 单次工具调用请求。
+        :param context: 批式工具执行上下文。
+        :param normalized_arguments_digest: 参数 digest。
+        :param duplicate_decision: duplicate reuse 决策。
+        :param policy_decision: reuse policy decision。
+        :param tool_idempotency_key: 工具级幂等 key。
+        :param diagnostic_refs: 已发出的 duplicate 诊断 refs。
+        :returns: 单次工具调用记录。
+        :raises RuntimeError: reuse 决策缺少 prior outcome 时抛出。
+        """
+
+        if duplicate_decision.prior_outcome is None:
+            raise RuntimeError("duplicate reuse requires prior accepted outcome")
+        candidate = _tool_fact_reuse_accept_candidate(
+            scope=self._execution_scope,
+            effective_bundle=self._effective_bundle,
+            call=call,
+            iteration_id=context.iteration_id,
+            normalized_arguments_digest=normalized_arguments_digest,
+            prior_outcome=duplicate_decision.prior_outcome,
+            policy_decision=policy_decision,
+            duplicate_decision=duplicate_decision,
+            tool_idempotency_key=tool_idempotency_key,
+            diagnostic_refs=diagnostic_refs,
+        )
+        accept_result = await self._accept_with_retry(candidate)
+        if isinstance(accept_result, ToolFactAcceptedAck):
+            return BatchToolExecutionRecord(
+                tool_call_id=call.tool_call_id,
+                outcome=duplicate_decision.prior_outcome,
+            )
+        return BatchToolExecutionRecord(
+            tool_call_id=call.tool_call_id,
+            outcome=_accept_failure_outcome(accept_result),
+        )
+
+    def _diagnostic_refs_for_duplicate(
+        self, duplicate_decision: DuplicateDecision
+    ) -> tuple[ToolTraceDiagnosticRef, ...]:
+        """为非 allow duplicate 决策发出诊断 refs。
+
+        :param duplicate_decision: duplicate governance 决策。
+        :returns: 诊断引用；allow 决策返回空元组。
+        """
+
+        if duplicate_decision.kind is DuplicateDecisionKind.ALLOW:
+            return ()
+        ref = self._diagnostic_emitter.emit(
+            ToolTraceDiagnosticRecord(
+                reason_code=_duplicate_reason_code(duplicate_decision.kind),
+                message=(
+                    "duplicate tool call governed by run-local ToolRuntime index"
+                ),
+            )
+        )
+        return (ref,)
+
+    def _record_duplicate_accepted(
+        self,
+        *,
+        duplicate_request: DuplicateGovernanceRequest,
+        accepted_ack: ToolFactAcceptedAck,
+        accepted_outcome: ToolExecutionOutcome,
+        duplicate_decision: DuplicateDecision,
+        policy_decision: ToolPolicyDecision,
+    ) -> None:
+        """在 accepted ack 后写入 run-local duplicate index。
+
+        :param duplicate_request: duplicate 查询输入。
+        :param accepted_ack: Host accepted ack。
+        :param accepted_outcome: 已 accepted 的工具 outcome。
+        :param duplicate_decision: 本次 duplicate 决策。
+        :param policy_decision: 本次工具治理决策。
+        :returns: ``None``。
+        """
+
+        if (
+            policy_decision.kind is not ToolPolicyDecisionKind.ALLOW
+            or duplicate_decision.kind is not DuplicateDecisionKind.ALLOW
+        ):
+            return
+        self._duplicate_governance.record_accepted(
+            DuplicateAcceptedRecord(
+                request=duplicate_request,
+                accepted_event_refs=accepted_ack.accepted_event_refs,
+                accepted_outcome=accepted_outcome,
+                result_digest=accepted_ack.result_digest,
+            )
         )
 
     def _normalize_runtime_outcome(
@@ -1905,6 +2316,14 @@ class ToolRuntimeExecutor:
                     last_error_code=last_error_code,
                     diagnostic_refs=diagnostics,
                 )
+            if isinstance(result, ToolFactRejectedAck) and not result.diagnostic_refs:
+                reject_ref = self._diagnostic_emitter.emit(
+                    ToolTraceDiagnosticRecord(
+                        reason_code=_TOOL_RUNTIME_ACCEPT_REJECTED_REASON,
+                        message="tool fact accept candidate was rejected",
+                    )
+                )
+                result = replace(result, diagnostic_refs=(reject_ref,))
             if isinstance(result, ToolFactAcceptedAck | ToolFactRejectedAck):
                 return result
             last_error_code = result.last_error_code
@@ -2025,7 +2444,9 @@ class DefaultToolRuntimeFactory:
                 execution_scope=request.execution_scope,
                 dispatcher=DefaultToolDispatcher(effective_bundle),
                 policy_port=policy_port,
-                duplicate_governance=PassThroughDuplicateGovernance(),
+                duplicate_governance=InMemoryRunLocalDuplicateGovernance(
+                    request.duplicate_governance_policy
+                ),
                 truncation_port=truncation_port,
                 accept_port=request.accept_port,
                 retry_policy=request.retry_policy,
@@ -3426,6 +3847,95 @@ def _tool_idempotency_key(
     return None
 
 
+def _semantic_duplicate_key(
+    call: ToolCallRequest, rule: ToolRuntimeToolPolicy
+) -> str | None:
+    """从工具参数中读取可选 semantic duplicate key。
+
+    :param call: 单次工具调用请求。
+    :param rule: 单工具 policy。
+    :returns: semantic duplicate key；未配置或参数不是非空字符串时为 ``None``。
+    """
+
+    argument_name = rule.semantic_duplicate_key_argument_name
+    if argument_name is None:
+        return None
+    value = call.arguments.get(argument_name)
+    if isinstance(value, str) and value.strip() != "":
+        return value
+    return None
+
+
+def _duplicate_key(request: DuplicateGovernanceRequest) -> str:
+    """计算 run-local duplicate key。
+
+    :param request: duplicate governance 查询输入。
+    :returns: 稳定 sha256 duplicate key；不包含 ``index_in_iteration``。
+    """
+
+    return sha256_digest_json(
+        {
+            "tool_name": request.tool_name,
+            "tool_identity_digest": request.tool_identity_digest,
+            "normalized_arguments_digest": request.normalized_arguments_digest,
+            "semantic_duplicate_key": request.semantic_duplicate_key,
+        }
+    )
+
+
+def _policy_decision_from_duplicate(
+    decision: DuplicateDecision,
+) -> ToolPolicyDecision:
+    """把 duplicate decision 映射为 ToolRuntime policy decision。
+
+    :param decision: duplicate governance 决策。
+    :returns: 对应 policy decision。
+    """
+
+    reason_code = _duplicate_reason_code(decision.kind)
+    return ToolPolicyDecision(
+        kind=ToolPolicyDecisionKind(decision.kind.value),
+        reason_code=reason_code,
+        message=_duplicate_message(decision.kind),
+    )
+
+
+def _duplicate_reason_code(kind: DuplicateDecisionKind) -> str:
+    """返回 duplicate decision 对应的机器可读原因码。
+
+    :param kind: duplicate 决策类别。
+    :returns: 原因码。
+    """
+
+    if kind is DuplicateDecisionKind.REUSE:
+        return _TOOL_RUNTIME_DUPLICATE_REUSE_REASON
+    if kind is DuplicateDecisionKind.HINT:
+        return _TOOL_RUNTIME_DUPLICATE_HINT_REASON
+    if kind is DuplicateDecisionKind.REQUIRE_JUSTIFICATION:
+        return _TOOL_RUNTIME_DUPLICATE_REQUIRE_JUSTIFICATION_REASON
+    if kind is DuplicateDecisionKind.HARD_STOP:
+        return _TOOL_RUNTIME_DUPLICATE_HARD_STOP_REASON
+    return "duplicate_allowed"
+
+
+def _duplicate_message(kind: DuplicateDecisionKind) -> str:
+    """返回 duplicate decision 对应的人类可读说明。
+
+    :param kind: duplicate 决策类别。
+    :returns: 说明文本。
+    """
+
+    if kind is DuplicateDecisionKind.REUSE:
+        return "reuse prior accepted tool result"
+    if kind is DuplicateDecisionKind.HINT:
+        return "duplicate tool call should use prior accepted result or change evidence scope"
+    if kind is DuplicateDecisionKind.REQUIRE_JUSTIFICATION:
+        return "duplicate tool call requires structured justification"
+    if kind is DuplicateDecisionKind.HARD_STOP:
+        return "duplicate tool call hard-stopped by Host governance"
+    return "duplicate tool call allowed"
+
+
 def _tool_fact_accept_candidate(
     *,
     scope: ToolRuntimeExecutionScope,
@@ -3437,6 +3947,7 @@ def _tool_fact_accept_candidate(
     truncation_fact: ToolTruncationFact | None,
     policy_decision: ToolPolicyDecision,
     duplicate_decision: DuplicateDecision,
+    duplicate_governed: bool,
     tool_idempotency_key: str | None,
     diagnostic_refs: tuple[ToolTraceDiagnosticRef, ...],
 ) -> ToolFactAcceptCandidate:
@@ -3451,6 +3962,8 @@ def _tool_fact_accept_candidate(
     :param truncation_fact: 截断事实；未截断为 ``None``。
     :param policy_decision: 工具治理决策。
     :param duplicate_decision: duplicate governance 决策。
+    :param duplicate_governed: 本次 governed outcome 是否由 duplicate
+        governance 的非 allow 决策触发。
     :param tool_idempotency_key: 工具级幂等 key。
     :param diagnostic_refs: 诊断 refs。
     :returns: Host 工具事实候选。
@@ -3494,7 +4007,11 @@ def _tool_fact_accept_candidate(
         truncation=truncation_fact,
         duplicate_key=duplicate_decision.duplicate_key,
         duplicate_decision=duplicate_decision.kind,
-        reuse_prior_event_refs=(),
+        reuse_prior_event_refs=(
+            duplicate_decision.prior_event_refs
+            if tool_fact_kind is ToolFactKind.GOVERNED_ERROR and duplicate_governed
+            else ()
+        ),
         policy_decision=policy_decision,
         tool_idempotency_key=tool_idempotency_key,
         diagnostic_refs=diagnostic_refs,
@@ -3503,6 +4020,90 @@ def _tool_fact_accept_candidate(
             call=call,
             tool_fact_kind=tool_fact_kind,
             outcome_digest=outcome_digest,
+            policy_decision=policy_decision,
+        ),
+        semantic_input_digest=semantic_input_digest,
+    )
+
+
+def _tool_fact_reuse_accept_candidate(
+    *,
+    scope: ToolRuntimeExecutionScope,
+    effective_bundle: EffectiveToolBundle,
+    call: ToolCallRequest,
+    iteration_id: str,
+    normalized_arguments_digest: str,
+    prior_outcome: ToolExecutionOutcome,
+    policy_decision: ToolPolicyDecision,
+    duplicate_decision: DuplicateDecision,
+    tool_idempotency_key: str | None,
+    diagnostic_refs: tuple[ToolTraceDiagnosticRef, ...],
+) -> ToolFactAcceptCandidate:
+    """从 duplicate reuse 决策构造 Host accept candidate。
+
+    :param scope: ToolRuntime 执行 scope。
+    :param effective_bundle: effective 工具集合。
+    :param call: 单次工具调用请求。
+    :param iteration_id: 当前 Engine iteration id。
+    :param normalized_arguments_digest: 参数 digest。
+    :param prior_outcome: 既有 accepted outcome，用于 digest 解释与返回 Engine。
+    :param policy_decision: reuse policy decision。
+    :param duplicate_decision: duplicate reuse 决策。
+    :param tool_idempotency_key: 工具级幂等 key。
+    :param diagnostic_refs: 诊断 refs。
+    :returns: reuse 工具事实候选。
+    :raises ValueError: duplicate decision 不是 reuse 或缺少 prior refs 时抛出。
+    """
+
+    if duplicate_decision.kind is not DuplicateDecisionKind.REUSE:
+        raise ValueError("reuse candidate requires duplicate reuse decision")
+    if not duplicate_decision.prior_event_refs:
+        raise ValueError("reuse candidate requires prior event refs")
+    schema_digest = _tool_schema_digest_for_call(effective_bundle, call)
+    identity_digest = _tool_identity_digest(
+        effective_bundle=effective_bundle,
+        tool_name=call.name,
+        schema_digest=schema_digest,
+    )
+    prior_outcome_digest = _tool_outcome_digest(prior_outcome)
+    semantic_input_digest = _tool_semantic_input_digest(
+        scope=scope,
+        call=call,
+        tool_fact_kind=ToolFactKind.REUSE,
+        normalized_arguments_digest=normalized_arguments_digest,
+        outcome_digest=prior_outcome_digest,
+        payload_digest=None,
+        policy_decision=policy_decision,
+        duplicate_decision=duplicate_decision,
+        truncation_fact=None,
+    )
+    return ToolFactAcceptCandidate(
+        session_id=scope.session_id,
+        run_id=scope.run_id,
+        attempt_id=scope.attempt_id,
+        execution_id=scope.execution_id,
+        iteration_id=iteration_id,
+        tool_call_id=call.tool_call_id,
+        tool_name=call.name,
+        tool_schema_digest=schema_digest,
+        tool_identity_digest=identity_digest,
+        normalized_arguments_digest=normalized_arguments_digest,
+        tool_fact_kind=ToolFactKind.REUSE,
+        outcome_digest=None,
+        payload_digest=None,
+        payload_ref=None,
+        truncation=None,
+        duplicate_key=duplicate_decision.duplicate_key,
+        duplicate_decision=duplicate_decision.kind,
+        reuse_prior_event_refs=duplicate_decision.prior_event_refs,
+        policy_decision=policy_decision,
+        tool_idempotency_key=tool_idempotency_key,
+        diagnostic_refs=diagnostic_refs,
+        accept_idempotency_key=_tool_accept_idempotency_key(
+            scope=scope,
+            call=call,
+            tool_fact_kind=ToolFactKind.REUSE,
+            outcome_digest=prior_outcome_digest,
             policy_decision=policy_decision,
         ),
         semantic_input_digest=semantic_input_digest,
@@ -3520,7 +4121,7 @@ def _tool_fact_kind(
     :raises TypeError: 收到 P6-S3 不支持的 awaiting outcome 时抛出。
     """
 
-    if policy_decision.kind is ToolPolicyDecisionKind.GOVERNED_ERROR:
+    if policy_decision.kind is not ToolPolicyDecisionKind.ALLOW:
         return ToolFactKind.GOVERNED_ERROR
     if isinstance(outcome, ToolCompletedOutcome):
         return ToolFactKind.COMPLETED
@@ -3735,7 +4336,9 @@ def _duplicate_decision_json(decision: DuplicateDecision) -> JsonValue:
     return {
         "kind": decision.kind.value,
         "duplicate_key": decision.duplicate_key,
-        "prior_event_refs": list(decision.prior_event_refs),
+        "prior_event_refs": [
+            _event_ref_json(ref) for ref in decision.prior_event_refs
+        ],
     }
 
 
@@ -3820,9 +4423,12 @@ __all__ = [
     "DefaultHostToolFactAcceptPort",
     "DefaultToolRuntimePolicyPort",
     "DeterministicToolTraceDiagnosticEmitter",
+    "DuplicateAcceptedRecord",
     "DuplicateDecision",
     "DuplicateDecisionKind",
+    "DuplicateGovernancePolicy",
     "DuplicateGovernancePort",
+    "DuplicateGovernanceRequest",
     "EffectiveToolBundle",
     "EffectiveToolBundleBuildRequest",
     "EffectiveToolBundleBuilder",
@@ -3833,8 +4439,10 @@ __all__ = [
     "HostEventRef",
     "HostPayloadRef",
     "HostToolFactAcceptPort",
+    "InMemoryRunLocalDuplicateGovernance",
+    "InMemoryToolTraceDiagnosticEmitter",
+    "NoopToolTraceDiagnosticEmitter",
     "NoopTruncationPort",
-    "PassThroughDuplicateGovernance",
     "ToolSideEffectKind",
     "ToolAcceptRejectReason",
     "ToolAcceptRetryPolicy",
