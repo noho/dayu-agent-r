@@ -911,10 +911,10 @@ def test_terminal_closeout_promotion_survives_queue_wakeup_failure(
         assert spy.promotions == [session_id]
 
 
-def test_cancel_terminal_run_returns_invalid_state_without_new_facts(
+def test_cancel_terminal_run_returns_current_terminal_without_new_facts(
     tmp_path: Path,
 ) -> None:
-    """terminal Run 的后续 cancel 不能重写 terminal fact。"""
+    """terminal Run 的后续 cancel 返回当前终态且不追加 canonical facts。"""
 
     with open_host_durable_store(_options(tmp_path)) as store:
         session_id = _ensure_session_id(store.transaction_runner)
@@ -936,24 +936,28 @@ def test_cancel_terminal_run_returns_invalid_state_without_new_facts(
         )
         before = _event_count(store.transaction_runner)
 
-        with pytest.raises(HostApiError) as exc_info:
-            service.cancel_run(
-                active.run.run_id,
-                _cancel_request("cancel-terminal"),
-                caller_semantic_digest=_CALLER_DIGEST,
-            )
+        result = service.cancel_run(
+            active.run.run_id,
+            _cancel_request("cancel-terminal"),
+            caller_semantic_digest=_CALLER_DIGEST,
+        )
 
-        assert exc_info.value.code == HostApiErrorCode.INVALID_STATE
+        assert result.run.status == RunStatus.SUCCEEDED
+        assert result.attempt is not None
+        assert result.attempt.status == AttemptStatus.SUCCEEDED
+        assert result.dispatch_record is not None
+        assert result.promotion is None
+        assert result.active_cancel_target is None
         assert _event_count(store.transaction_runner) == before
         assert _read_run(store.transaction_runner, active.run.run_id).status == (
             RunStatus.SUCCEEDED
         )
 
 
-def test_cancel_attempt_running_is_phase3_invalid_state_without_side_effects(
+def test_cancel_attempt_running_enters_cancelling_with_cancel_facts(
     tmp_path: Path,
 ) -> None:
-    """Attempt RUNNING cancel 属于后续 worker cancel propagation，Phase 3 返回 invalid_state。"""
+    """Attempt RUNNING active cancel 进入 CANCELLING 并追加 cancel facts。"""
 
     with open_host_durable_store(_options(tmp_path)) as store:
         session_id = _ensure_session_id(store.transaction_runner)
@@ -970,17 +974,24 @@ def test_cancel_attempt_running_is_phase3_invalid_state_without_side_effects(
         )
         before = _event_count(store.transaction_runner)
 
-        with pytest.raises(HostApiError) as exc_info:
-            service.cancel_run(
-                active.run.run_id,
-                _cancel_request("cancel-running-attempt"),
-                caller_semantic_digest=_CALLER_DIGEST,
-            )
+        result = service.cancel_run(
+            active.run.run_id,
+            _cancel_request("cancel-running-attempt"),
+            caller_semantic_digest=_CALLER_DIGEST,
+        )
 
-        assert exc_info.value.code == HostApiErrorCode.INVALID_STATE
-        assert _event_count(store.transaction_runner) == before
+        assert result.run.status == RunStatus.CANCELLING
+        assert result.attempt is not None
+        assert result.attempt.status == AttemptStatus.RUNNING
+        assert result.active_cancel_target is not None
+        assert result.active_cancel_target.run_id == active.run.run_id
+        assert _event_count(store.transaction_runner) == before + 2
+        assert _event_types_for_run(store.transaction_runner, active.run.run_id)[-2:] == (
+            "CANCEL_REQUESTED",
+            "RUN_CANCELLING",
+        )
         assert _read_run(store.transaction_runner, active.run.run_id).status == (
-            RunStatus.RUNNING
+            RunStatus.CANCELLING
         )
 
 

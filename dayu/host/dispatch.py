@@ -60,6 +60,7 @@ from dayu.host.durable.transaction import HostTransaction, HostTransactionRunner
 from dayu.host.engine_ingest import (
     EngineEventCandidate,
     EngineEventIngestor,
+    EngineIngestStatus,
     LocalEngineEnvelope,
 )
 from dayu.host.run_input import PolicySnapshot, create_no_tool_run_input_builder
@@ -823,10 +824,35 @@ class HostDispatchScheduler:
             wakeup_port=self,
         )
         worker_event_index = 0
+        terminal_seen = False
+        last_accepted_event_id: str | None = None
         try:
-            async for event in handle.events():
+            events = handle.events()
+            while True:
+                try:
+                    event = await anext(events)
+                except StopAsyncIteration:
+                    if not terminal_seen:
+                        ingestor.close_clean_eof(
+                            envelope,
+                            observed_at=datetime.now(UTC),
+                            last_observed_worker_event_index=worker_event_index,
+                        )
+                    break
+                except asyncio.CancelledError:
+                    raise
+                except Exception as exc:
+                    ingestor.close_worker_lost(
+                        envelope,
+                        observed_at=datetime.now(UTC),
+                        worker_lifecycle_signal="worker_stream_error",
+                        stream_error_code=exc.__class__.__name__,
+                        last_observed_worker_event_index=worker_event_index,
+                        last_accepted_event_id=last_accepted_event_id,
+                    )
+                    break
                 worker_event_index += 1
-                ingestor.ingest(
+                result = ingestor.ingest(
                     EngineEventCandidate(
                         envelope=envelope,
                         worker_event_index=worker_event_index,
@@ -834,6 +860,14 @@ class HostDispatchScheduler:
                         observed_at=datetime.now(UTC),
                     )
                 )
+                if result.status in (
+                    EngineIngestStatus.ACCEPTED,
+                    EngineIngestStatus.DUPLICATE,
+                ):
+                    if result.events:
+                        last_accepted_event_id = result.events[-1].event_id
+                    if result.terminal_closeout:
+                        terminal_seen = True
         finally:
             self._active_handles.discard(handle)
             self._active_registry.unregister(

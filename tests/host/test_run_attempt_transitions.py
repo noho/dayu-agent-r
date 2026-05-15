@@ -467,10 +467,10 @@ def test_terminal_closeout_supports_failure_and_lost_facts(
         assert run_event_type in event_types
 
 
-def test_terminal_closeout_rejects_attempt_running_in_phase3(
+def test_terminal_closeout_accepts_attempt_running_in_phase5(
     tmp_path: Path,
 ) -> None:
-    """Attempt RUNNING terminal closeout 在 Phase 3 返回 invalid_state。"""
+    """Attempt RUNNING terminal closeout 在 Phase 5 收口为对应终态。"""
 
     with open_host_durable_store(_options(tmp_path)) as store:
         seeded = _seed_running_run(store, tmp_path)
@@ -518,8 +518,8 @@ def test_terminal_closeout_rejects_attempt_running_in_phase3(
             return result.status.value, result.attempt.status.value
 
         assert store.transaction_runner.run_write(closeout) == (
-            StateMutationStatus.INVALID_STATE.value,
-            AttemptStatus.RUNNING.value,
+            StateMutationStatus.UPDATED.value,
+            AttemptStatus.SUCCEEDED.value,
         )
 
 

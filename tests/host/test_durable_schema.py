@@ -91,8 +91,8 @@ def _pragma_text(connection: sqlite3.Connection, sql: str) -> str:
     return str(row[0])
 
 
-def test_fresh_db_creates_foundation_and_phase3_tables(tmp_path: Path) -> None:
-    """fresh DB bootstrap 创建 foundation 与 Phase 3 state tables 并设置 PRAGMA。"""
+def test_fresh_db_creates_foundation_and_phase5_tables(tmp_path: Path) -> None:
+    """fresh DB bootstrap 创建 foundation 与 Phase 5 state tables 并设置 PRAGMA。"""
 
     options = _options(tmp_path)
     with open_host_durable_store(options) as store:
@@ -100,8 +100,8 @@ def test_fresh_db_creates_foundation_and_phase3_tables(tmp_path: Path) -> None:
         try:
             assert _table_names(connection) == frozenset(HOST_DURABLE_TABLES)
             assert set(PHASE3_STATE_TABLES).issubset(_table_names(connection))
-            assert _pragma_int(connection, "PRAGMA user_version") == 2
-            assert HOST_SCHEMA_VERSION == 2
+            assert _pragma_int(connection, "PRAGMA user_version") == 3
+            assert HOST_SCHEMA_VERSION == 3
             assert _pragma_int(connection, "PRAGMA foreign_keys") == 1
             assert _pragma_text(connection, "PRAGMA journal_mode").lower() == "wal"
             assert _pragma_int(connection, "PRAGMA busy_timeout") == 250
