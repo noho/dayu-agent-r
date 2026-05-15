@@ -1603,6 +1603,69 @@ def cancel_running_run_row(
     )
 
 
+def cancel_cancelling_run_row(
+    transaction: HostTransaction,
+    *,
+    run_id: str,
+    current_attempt_id: str,
+    terminal_event_id: str,
+    terminal_event_sequence: int,
+    terminal_at: str,
+) -> RunMutationResult:
+    """CAS 将 active cancelling Run 收口为 cancelled。
+
+    :param transaction: 调用方提供的 Host transaction。
+    :param run_id: 目标 Run id。
+    :param current_attempt_id: 期望的 current Attempt id。
+    :param terminal_event_id: ``RUN_CANCELLED`` 事件 id。
+    :param terminal_event_sequence: ``RUN_CANCELLED`` 全局事件序号。
+    :param terminal_at: 固定 UTC terminal timestamp 文本。
+    :returns: Run mutation 结果，区分 updated/cas_lost/not_found/invalid_state。
+    :raises HostDurableError: 输入字段无效时抛出。
+    :raises sqlite3.Error: SQLite 写入失败时由 transaction runner 结构化转换。
+    """
+
+    _validate_run_terminal_update(
+        run_id=run_id,
+        terminal_event_id=terminal_event_id,
+        terminal_event_sequence=terminal_event_sequence,
+        terminal_at=terminal_at,
+    )
+    _require_non_empty_text(current_attempt_id, field_name="current_attempt_id")
+    result = transaction.execute(
+        f"""
+        UPDATE {TABLE_HOST_RUNS}
+        SET
+          status = ?,
+          terminal_event_id = ?,
+          terminal_event_sequence = ?,
+          updated_at = ?,
+          terminal_at = ?
+        WHERE run_id = ?
+          AND status = ?
+          AND current_attempt_id = ?
+          AND terminal_event_id IS NULL
+          AND terminal_event_sequence IS NULL
+          AND terminal_at IS NULL
+        """,
+        (
+            serialize_run_status(RunStatus.CANCELLED),
+            terminal_event_id,
+            terminal_event_sequence,
+            terminal_at,
+            terminal_at,
+            run_id,
+            serialize_run_status(RunStatus.CANCELLING),
+            current_attempt_id,
+        ),
+    )
+    return _run_mutation_result_for_active(
+        transaction,
+        run_id=run_id,
+        rowcount=result.rowcount,
+    )
+
+
 def mark_run_cancelling_row(
     transaction: HostTransaction,
     *,
@@ -1843,6 +1906,64 @@ def cancel_starting_attempt_row(
         rowcount=result.rowcount,
         expected_status=AttemptStatus.STARTING,
         cas_lost_when_expected=False,
+    )
+
+
+def cancel_running_attempt_row(
+    transaction: HostTransaction,
+    *,
+    attempt_id: str,
+    terminal_event_id: str,
+    terminal_event_sequence: int,
+    terminal_at: str,
+) -> AttemptMutationResult:
+    """CAS 取消 RUNNING Attempt。
+
+    :param transaction: 调用方提供的 Host transaction。
+    :param attempt_id: 目标 Attempt id。
+    :param terminal_event_id: ``ATTEMPT_CANCELLED`` 事件 id。
+    :param terminal_event_sequence: ``ATTEMPT_CANCELLED`` 全局事件序号。
+    :param terminal_at: 固定 UTC terminal timestamp 文本。
+    :returns: Attempt mutation 结果，区分 updated/cas_lost/not_found/invalid_state。
+    :raises HostDurableError: 输入字段无效时抛出。
+    :raises sqlite3.Error: SQLite 写入失败时由 transaction runner 结构化转换。
+    """
+
+    _validate_attempt_terminal_update(
+        attempt_id=attempt_id,
+        terminal_event_id=terminal_event_id,
+        terminal_event_sequence=terminal_event_sequence,
+        terminal_at=terminal_at,
+    )
+    result = transaction.execute(
+        f"""
+        UPDATE {TABLE_HOST_ATTEMPTS}
+        SET
+          status = ?,
+          terminal_event_id = ?,
+          terminal_event_sequence = ?,
+          updated_at = ?,
+          terminal_at = ?
+        WHERE attempt_id = ?
+          AND status = ?
+          AND terminal_event_id IS NULL
+          AND terminal_event_sequence IS NULL
+          AND terminal_at IS NULL
+        """,
+        (
+            serialize_attempt_status(AttemptStatus.CANCELLED),
+            terminal_event_id,
+            terminal_event_sequence,
+            terminal_at,
+            terminal_at,
+            attempt_id,
+            serialize_attempt_status(AttemptStatus.RUNNING),
+        ),
+    )
+    return _attempt_mutation_result_for_active(
+        transaction,
+        attempt_id=attempt_id,
+        rowcount=result.rowcount,
     )
 
 

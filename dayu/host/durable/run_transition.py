@@ -9,10 +9,12 @@ orchestration、WorkerProxy、Engine dispatch 或 public facade。
 
 from __future__ import annotations
 
+from collections.abc import Mapping
 from dataclasses import dataclass
 from datetime import datetime
 from enum import StrEnum
 
+from dayu.contracts.json_value import JsonValue
 from dayu.host.api import AttemptStatus, CancelMode, RunStatus
 from dayu.host.durable._validation import (
     require_non_empty_text as _require_non_empty_text,
@@ -38,6 +40,8 @@ from dayu.host.durable.state import (
     RunStartReason,
     StateMutationStatus,
     WorkerKind,
+    cancel_cancelling_run_row,
+    cancel_running_attempt_row,
     cancel_starting_dispatch_record_row,
     cancel_queued_run_row,
     cancel_running_run_row,
@@ -220,6 +224,19 @@ class TerminalCloseoutInput:
     :param reason: terminal reason。
     :param terminal_summary_ref: terminal summary 引用；无摘要时为 ``None``。
     :param terminal_summary_digest: terminal summary digest；无摘要时为 ``None``。
+    :param engine_event_ref: 触发收口的 EngineEvent Host event id；无对应事件时为 ``None``。
+    :param finish_reason: Engine finish reason；仅成功路径使用。
+    :param filtered: final answer 是否经过过滤器处理；仅成功路径使用。
+    :param degraded: final answer 是否为降级回答；仅成功路径使用。
+    :param error_code: 失败错误码；仅失败路径使用。
+    :param message: 失败消息；仅失败路径使用。
+    :param provider_request_id: provider request id；无时为 ``None``。
+    :param recoverable: 失败是否可恢复；仅失败路径使用。
+    :param unsupported_later_owner: unsupported 路径后续 owner；无时为 ``None``。
+    :param worker_lifecycle_signal: worker lifecycle signal；仅 lost 路径使用。
+    :param stream_error_code: stream error code；仅 lost 路径使用。
+    :param last_observed_worker_event_index: 最后观察到的 worker event index；仅 lost 路径使用。
+    :param last_accepted_event_id: 最后已接受 EventLog id；无时为 ``None``。
     """
 
     run_id: str
@@ -234,6 +251,19 @@ class TerminalCloseoutInput:
     reason: str
     terminal_summary_ref: str | None
     terminal_summary_digest: str | None
+    engine_event_ref: str | None = None
+    finish_reason: str | None = None
+    filtered: bool | None = None
+    degraded: bool | None = None
+    error_code: str | None = None
+    message: str | None = None
+    provider_request_id: str | None = None
+    recoverable: bool | None = None
+    unsupported_later_owner: str | None = None
+    worker_lifecycle_signal: str | None = None
+    stream_error_code: str | None = None
+    last_observed_worker_event_index: int | None = None
+    last_accepted_event_id: str | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -348,6 +378,40 @@ class CancelActiveAttemptInput:
     reason: str
     mode: CancelMode
     call_context_digest: str
+
+
+@dataclass(frozen=True, slots=True)
+class ActiveCancelCloseoutInput:
+    """active worker 取消完成后的 terminal closeout 输入。
+
+    :param run_id: 目标 Run id。
+    :param attempt_id: 目标 Attempt id。
+    :param attempt_cancelled_event_id: 调用方生成的 ``ATTEMPT_CANCELLED`` event id。
+    :param run_cancelled_event_id: 调用方生成的 ``RUN_CANCELLED`` event id。
+    :param occurred_at: canonical facts 的发生时间。
+    :param actor: 事件 actor。
+    :param source: 事件 source。
+    :param reason: 取消原因。
+    :param cancel_request_event_id: 对应 ``CANCEL_REQUESTED`` event id。
+    :param engine_event_ref: 触发收口的 EngineEvent Host event id。
+    :param requested_at: Host/Engine 观察到的取消请求时间文本。
+    :param accepted_at: Engine 接受取消时间文本。
+    :param finished_at: Engine 完成取消时间文本。
+    """
+
+    run_id: str
+    attempt_id: str
+    attempt_cancelled_event_id: str
+    run_cancelled_event_id: str
+    occurred_at: datetime
+    actor: str
+    source: str
+    reason: str
+    cancel_request_event_id: str
+    engine_event_ref: str
+    requested_at: str
+    accepted_at: str
+    finished_at: str
 
 
 @dataclass(frozen=True, slots=True)
@@ -627,12 +691,28 @@ def terminal_closeout_in_transaction(
         return invalid
     if run is None or attempt is None:
         raise HostDurableError("terminal precondition narrowing failed")
+    dispatch_record = read_dispatch_record_by_attempt_id(
+        transaction, request.attempt_id
+    )
 
     attempt_event = event_log_store.append_event(
-        transaction, _attempt_terminal_event_request(request, run, attempt)
+        transaction,
+        _attempt_terminal_event_request(
+            request=request,
+            run=run,
+            attempt=attempt,
+            dispatch_record=dispatch_record,
+        ),
     ).row
     run_event = event_log_store.append_event(
-        transaction, _run_terminal_event_request(request, run, attempt_event.event_id)
+        transaction,
+        _run_terminal_event_request(
+            request=request,
+            run=run,
+            attempt=attempt,
+            attempt_terminal_event_id=attempt_event.event_id,
+            dispatch_record=dispatch_record,
+        ),
     ).row
     terminal_at = format_utc_timestamp(request.occurred_at)
     attempt_result = terminal_attempt_row(
@@ -664,9 +744,89 @@ def terminal_closeout_in_transaction(
         status=run_result.status,
         run=run_result.row,
         attempt=attempt_result.row,
-        dispatch_record=read_dispatch_record_by_attempt_id(
-            transaction, request.attempt_id
+        dispatch_record=dispatch_record,
+    )
+
+
+def active_cancel_closeout_in_transaction(
+    transaction: HostTransaction,
+    event_log_store: EventLogStore,
+    request: ActiveCancelCloseoutInput,
+) -> RunTransitionResult:
+    """Engine 确认 active cancel 后关闭 Attempt / Run 到 cancelled。
+
+    :param transaction: 调用方提供的 Host transaction。
+    :param event_log_store: EventLog append primitive。
+    :param request: active cancel closeout 输入。
+    :returns: transition 结果，前置状态不满足时返回 not_found/invalid_state/cas_lost。
+    :raises HostDurableError: 输入字段或 SQLite 写入无效时由底层抛出。
+    """
+
+    _validate_active_cancel_closeout_input(request)
+    run = read_run_by_id(transaction, request.run_id)
+    attempt = read_attempt_by_id(transaction, request.attempt_id)
+    dispatch_record = read_dispatch_record_by_attempt_id(
+        transaction, request.attempt_id
+    )
+    invalid = _invalid_active_cancel_closeout_precondition(
+        run=run,
+        attempt=attempt,
+        dispatch_record=dispatch_record,
+        attempt_id=request.attempt_id,
+    )
+    if invalid is not None:
+        return invalid
+    if run is None or attempt is None or dispatch_record is None:
+        raise HostDurableError("active cancel closeout narrowing failed")
+
+    attempt_event = event_log_store.append_event(
+        transaction,
+        _active_attempt_cancelled_event_request(
+            request=request,
+            run=run,
+            attempt=attempt,
+            dispatch_record=dispatch_record,
         ),
+    ).row
+    run_event = event_log_store.append_event(
+        transaction,
+        _active_run_cancelled_event_request(
+            request=request,
+            run=run,
+            attempt=attempt,
+            attempt_cancelled_event_id=attempt_event.event_id,
+            dispatch_record=dispatch_record,
+        ),
+    ).row
+    terminal_at = format_utc_timestamp(request.occurred_at)
+    attempt_result = cancel_running_attempt_row(
+        transaction,
+        attempt_id=attempt.attempt_id,
+        terminal_event_id=attempt_event.event_id,
+        terminal_event_sequence=attempt_event.event_sequence,
+        terminal_at=terminal_at,
+    )
+    attempt_result = _require_attempt_mutation_updated(
+        attempt_result,
+        mutation_name="cancel active Attempt",
+    )
+    run_result = cancel_cancelling_run_row(
+        transaction,
+        run_id=run.run_id,
+        current_attempt_id=attempt.attempt_id,
+        terminal_event_id=run_event.event_id,
+        terminal_event_sequence=run_event.event_sequence,
+        terminal_at=terminal_at,
+    )
+    run_result = _require_run_mutation_updated(
+        run_result,
+        mutation_name="cancel active Run",
+    )
+    return RunTransitionResult(
+        status=run_result.status,
+        run=run_result.row,
+        attempt=attempt_result.row,
+        dispatch_record=dispatch_record,
     )
 
 
@@ -1347,9 +1507,9 @@ def _attempt_running_event_request(
 
 
 def _cancel_requested_event_request(
-    request: CancelQueuedRunInput
-    | CancelPredispatchStartingInput
-    | CancelActiveAttemptInput,
+    request: (
+        CancelQueuedRunInput | CancelPredispatchStartingInput | CancelActiveAttemptInput
+    ),
     run: RunRow,
 ) -> EventLogAppendRequest:
     """构造 ``CANCEL_REQUESTED`` EventLog append request。
@@ -1522,13 +1682,18 @@ def _run_cancelled_event_request(
 
 
 def _attempt_terminal_event_request(
-    request: TerminalCloseoutInput, run: RunRow, attempt: AttemptRow
+    *,
+    request: TerminalCloseoutInput,
+    run: RunRow,
+    attempt: AttemptRow,
+    dispatch_record: DispatchRecordRow | None,
 ) -> EventLogAppendRequest:
     """构造具体 Attempt terminal EventLog append request。
 
     :param request: terminal closeout 输入。
     :param run: 目标 Run row。
     :param attempt: 目标 Attempt row。
+    :param dispatch_record: 目标 dispatch record；缺失时为 ``None``。
     :returns: EventLog append request。
     """
 
@@ -1547,26 +1712,31 @@ def _attempt_terminal_event_request(
         idempotency_key=None,
         policy_decision=None,
         reason={"reason": request.reason},
-        payload_json={
-            "attempt_id": attempt.attempt_id,
-            "execution_id": attempt.execution_id,
-            "reason": request.reason,
-            "terminal_summary_ref": request.terminal_summary_ref,
-            "terminal_summary_digest": request.terminal_summary_digest,
-        },
+        payload_json=_attempt_terminal_payload(
+            request=request,
+            attempt=attempt,
+            dispatch_record=dispatch_record,
+        ),
         payload_ref=None,
         payload_digest=None,
     )
 
 
 def _run_terminal_event_request(
-    request: TerminalCloseoutInput, run: RunRow, attempt_terminal_event_id: str
+    *,
+    request: TerminalCloseoutInput,
+    run: RunRow,
+    attempt: AttemptRow,
+    attempt_terminal_event_id: str,
+    dispatch_record: DispatchRecordRow | None,
 ) -> EventLogAppendRequest:
     """构造具体 Run terminal EventLog append request。
 
     :param request: terminal closeout 输入。
     :param run: 目标 Run row。
+    :param attempt: 目标 Attempt row。
     :param attempt_terminal_event_id: Attempt terminal event id。
+    :param dispatch_record: 目标 dispatch record；缺失时为 ``None``。
     :returns: EventLog append request。
     """
 
@@ -1585,17 +1755,224 @@ def _run_terminal_event_request(
         idempotency_key=None,
         policy_decision=None,
         reason={"reason": request.reason},
+        payload_json=_run_terminal_payload(
+            request=request,
+            run=run,
+            attempt=attempt,
+            attempt_terminal_event_id=attempt_terminal_event_id,
+            dispatch_record=dispatch_record,
+        ),
+        payload_ref=None,
+        payload_digest=None,
+    )
+
+
+def _active_attempt_cancelled_event_request(
+    *,
+    request: ActiveCancelCloseoutInput,
+    run: RunRow,
+    attempt: AttemptRow,
+    dispatch_record: DispatchRecordRow,
+) -> EventLogAppendRequest:
+    """构造 active cancel ``ATTEMPT_CANCELLED`` 事件。
+
+    :param request: active cancel closeout 输入。
+    :param run: 目标 Run row。
+    :param attempt: 目标 Attempt row。
+    :param dispatch_record: 目标 dispatch record。
+    :returns: EventLog append request。
+    """
+
+    return EventLogAppendRequest(
+        event_id=request.attempt_cancelled_event_id,
+        event_class=EventClass.CANONICAL_FACT,
+        session_id=run.session_id,
+        run_id=run.run_id,
+        attempt_id=attempt.attempt_id,
+        execution_id=attempt.execution_id,
+        event_type=_EVENT_TYPE_ATTEMPT_CANCELLED,
+        occurred_at=request.occurred_at,
+        actor=request.actor,
+        source=request.source,
+        client_request_id=None,
+        idempotency_key=None,
+        policy_decision=None,
+        reason={"reason": request.reason},
         payload_json={
-            "run_id": run.run_id,
-            "terminal_attempt_id": request.attempt_id,
-            "attempt_terminal_event_id": attempt_terminal_event_id,
-            "terminal_summary_ref": request.terminal_summary_ref,
-            "terminal_summary_digest": request.terminal_summary_digest,
+            "attempt_id": attempt.attempt_id,
+            "execution_id": attempt.execution_id,
+            "dispatch_record_id": dispatch_record.dispatch_record_id,
+            "cancel_request_event_id": request.cancel_request_event_id,
             "reason": request.reason,
+            "engine_event_ref": request.engine_event_ref,
+            "requested_at": request.requested_at,
+            "accepted_at": request.accepted_at,
+            "finished_at": request.finished_at,
         },
         payload_ref=None,
         payload_digest=None,
     )
+
+
+def _active_run_cancelled_event_request(
+    *,
+    request: ActiveCancelCloseoutInput,
+    run: RunRow,
+    attempt: AttemptRow,
+    attempt_cancelled_event_id: str,
+    dispatch_record: DispatchRecordRow,
+) -> EventLogAppendRequest:
+    """构造 active cancel ``RUN_CANCELLED`` 事件。
+
+    :param request: active cancel closeout 输入。
+    :param run: 目标 Run row。
+    :param attempt: 目标 Attempt row。
+    :param attempt_cancelled_event_id: ``ATTEMPT_CANCELLED`` event id。
+    :param dispatch_record: 目标 dispatch record。
+    :returns: EventLog append request。
+    """
+
+    return EventLogAppendRequest(
+        event_id=request.run_cancelled_event_id,
+        event_class=EventClass.CANONICAL_FACT,
+        session_id=run.session_id,
+        run_id=run.run_id,
+        attempt_id=attempt.attempt_id,
+        execution_id=None,
+        event_type=_EVENT_TYPE_RUN_CANCELLED,
+        occurred_at=request.occurred_at,
+        actor=request.actor,
+        source=request.source,
+        client_request_id=None,
+        idempotency_key=None,
+        policy_decision=None,
+        reason={"reason": request.reason},
+        payload_json={
+            "run_id": run.run_id,
+            "terminal_attempt_id": attempt.attempt_id,
+            "attempt_terminal_event_id": attempt_cancelled_event_id,
+            "dispatch_record_id": dispatch_record.dispatch_record_id,
+            "cancel_request_event_id": request.cancel_request_event_id,
+            "reason": request.reason,
+            "engine_event_ref": request.engine_event_ref,
+            "requested_at": request.requested_at,
+            "accepted_at": request.accepted_at,
+            "finished_at": request.finished_at,
+        },
+        payload_ref=None,
+        payload_digest=None,
+    )
+
+
+def _attempt_terminal_payload(
+    *,
+    request: TerminalCloseoutInput,
+    attempt: AttemptRow,
+    dispatch_record: DispatchRecordRow | None,
+) -> Mapping[str, JsonValue]:
+    """构造 Attempt terminal canonical payload。
+
+    :param request: terminal closeout 输入。
+    :param attempt: 目标 Attempt row。
+    :param dispatch_record: 目标 dispatch record；缺失时为 ``None``。
+    :returns: canonical payload JSON mapping。
+    """
+
+    payload: dict[str, JsonValue] = {
+        "attempt_id": attempt.attempt_id,
+        "execution_id": attempt.execution_id,
+        "dispatch_record_id": _dispatch_record_id(dispatch_record),
+        "reason": request.reason,
+        "terminal_summary_ref": request.terminal_summary_ref,
+        "terminal_summary_digest": request.terminal_summary_digest,
+    }
+    if request.engine_event_ref is not None:
+        payload["engine_event_ref"] = request.engine_event_ref
+    if request.attempt_terminal_status == AttemptStatus.SUCCEEDED:
+        payload["finish_reason"] = request.finish_reason
+        payload["filtered"] = request.filtered
+        payload["degraded"] = request.degraded
+        return payload
+    if request.attempt_terminal_status == AttemptStatus.FAILED:
+        payload["error_code"] = request.error_code
+        payload["message"] = request.message
+        payload["provider_request_id"] = request.provider_request_id
+        payload["recoverable"] = request.recoverable
+        if request.unsupported_later_owner is not None:
+            payload["unsupported_later_owner"] = request.unsupported_later_owner
+        return payload
+    if request.attempt_terminal_status == AttemptStatus.LOST:
+        payload["worker_lifecycle_signal"] = request.worker_lifecycle_signal
+        payload["stream_error_code"] = request.stream_error_code
+        payload["last_observed_worker_event_index"] = (
+            request.last_observed_worker_event_index
+        )
+        payload["last_accepted_event_id"] = request.last_accepted_event_id
+    return payload
+
+
+def _run_terminal_payload(
+    *,
+    request: TerminalCloseoutInput,
+    run: RunRow,
+    attempt: AttemptRow,
+    attempt_terminal_event_id: str,
+    dispatch_record: DispatchRecordRow | None,
+) -> Mapping[str, JsonValue]:
+    """构造 Run terminal canonical payload。
+
+    :param request: terminal closeout 输入。
+    :param run: 目标 Run row。
+    :param attempt: 目标 Attempt row。
+    :param attempt_terminal_event_id: Attempt terminal event id。
+    :param dispatch_record: 目标 dispatch record；缺失时为 ``None``。
+    :returns: canonical payload JSON mapping。
+    """
+
+    payload: dict[str, JsonValue] = {
+        "run_id": run.run_id,
+        "terminal_attempt_id": attempt.attempt_id,
+        "attempt_terminal_event_id": attempt_terminal_event_id,
+        "dispatch_record_id": _dispatch_record_id(dispatch_record),
+        "terminal_summary_ref": request.terminal_summary_ref,
+        "terminal_summary_digest": request.terminal_summary_digest,
+        "reason": request.reason,
+    }
+    if request.engine_event_ref is not None:
+        payload["engine_event_ref"] = request.engine_event_ref
+    if request.run_terminal_status == RunStatus.SUCCEEDED:
+        payload["finish_reason"] = request.finish_reason
+        payload["filtered"] = request.filtered
+        payload["degraded"] = request.degraded
+        return payload
+    if request.run_terminal_status == RunStatus.FAILED:
+        payload["error_code"] = request.error_code
+        payload["message"] = request.message
+        payload["provider_request_id"] = request.provider_request_id
+        payload["recoverable"] = request.recoverable
+        if request.unsupported_later_owner is not None:
+            payload["unsupported_later_owner"] = request.unsupported_later_owner
+        return payload
+    if request.run_terminal_status == RunStatus.LOST:
+        payload["worker_lifecycle_signal"] = request.worker_lifecycle_signal
+        payload["stream_error_code"] = request.stream_error_code
+        payload["last_observed_worker_event_index"] = (
+            request.last_observed_worker_event_index
+        )
+        payload["last_accepted_event_id"] = request.last_accepted_event_id
+    return payload
+
+
+def _dispatch_record_id(dispatch_record: DispatchRecordRow | None) -> str | None:
+    """读取 dispatch record id。
+
+    :param dispatch_record: dispatch record row；缺失时为 ``None``。
+    :returns: dispatch record id 或 ``None``。
+    """
+
+    if dispatch_record is None:
+        return None
+    return dispatch_record.dispatch_record_id
 
 
 def _starting_attempt_row(
@@ -1783,13 +2160,66 @@ def _invalid_terminal_precondition(
         run.status != RunStatus.RUNNING
         or run.current_attempt_id != attempt_id
         or attempt.run_id != run.run_id
-        or attempt.status != AttemptStatus.STARTING
+        or attempt.status not in (AttemptStatus.STARTING, AttemptStatus.RUNNING)
     ):
         return RunTransitionResult(
             status=StateMutationStatus.INVALID_STATE,
             run=run,
             attempt=attempt,
             dispatch_record=None,
+        )
+    return None
+
+
+def _invalid_active_cancel_closeout_precondition(
+    *,
+    run: RunRow | None,
+    attempt: AttemptRow | None,
+    dispatch_record: DispatchRecordRow | None,
+    attempt_id: str,
+) -> RunTransitionResult | None:
+    """检查 active cancel closeout 前置状态。
+
+    :param run: 目标 Run row。
+    :param attempt: 目标 Attempt row。
+    :param dispatch_record: 目标 dispatch record。
+    :param attempt_id: 请求中的 Attempt id。
+    :returns: 前置失败时返回 transition 结果，否则返回 ``None``。
+    """
+
+    if run is None:
+        return RunTransitionResult(
+            status=StateMutationStatus.NOT_FOUND,
+            run=None,
+            attempt=attempt,
+            dispatch_record=dispatch_record,
+        )
+    if attempt is None:
+        return RunTransitionResult(
+            status=StateMutationStatus.NOT_FOUND,
+            run=run,
+            attempt=None,
+            dispatch_record=dispatch_record,
+        )
+    if dispatch_record is None:
+        return RunTransitionResult(
+            status=StateMutationStatus.NOT_FOUND,
+            run=run,
+            attempt=attempt,
+            dispatch_record=None,
+        )
+    if (
+        run.status != RunStatus.CANCELLING
+        or run.current_attempt_id != attempt_id
+        or attempt.run_id != run.run_id
+        or attempt.status != AttemptStatus.RUNNING
+        or dispatch_record.worker_accept_event_id is None
+    ):
+        return RunTransitionResult(
+            status=StateMutationStatus.INVALID_STATE,
+            run=run,
+            attempt=attempt,
+            dispatch_record=dispatch_record,
         )
     return None
 
@@ -1978,9 +2408,7 @@ def _validate_create_running_input(request: CreateRunningRunInput) -> None:
     )
     _require_non_empty_text(request.attempt_id, field_name="attempt_id")
     _require_non_empty_text(request.execution_id, field_name="execution_id")
-    _require_non_empty_text(
-        request.dispatch_record_id, field_name="dispatch_record_id"
-    )
+    _require_non_empty_text(request.dispatch_record_id, field_name="dispatch_record_id")
     if not isinstance(request.start_reason, RunStartReason):
         raise ValueError("start_reason is invalid")
     if not isinstance(request.worker_kind, WorkerKind):
@@ -2028,17 +2456,13 @@ def _validate_common_create_input(
     _require_non_empty_text(client_request_id, field_name="client_request_id")
     _require_non_empty_text(input_event_id, field_name="input_event_id")
     _require_positive_sequence(input_event_sequence, "input_event_sequence")
-    _require_non_empty_text(
-        run_accepted_event_id, field_name="run_accepted_event_id"
-    )
+    _require_non_empty_text(run_accepted_event_id, field_name="run_accepted_event_id")
     _require_non_empty_text(actor, field_name="actor")
     _require_non_empty_text(source, field_name="source")
     _require_non_empty_text(idempotency_key, field_name="idempotency_key")
     _require_non_empty_text(execution_target, field_name="execution_target")
     _require_non_empty_text(queue_policy, field_name="queue_policy")
-    _require_sha256_digest(
-        call_context_digest, field_name="call_context_digest"
-    )
+    _require_sha256_digest(call_context_digest, field_name="call_context_digest")
 
 
 def _validate_promote_input(request: PromoteQueuedRunInput) -> None:
@@ -2058,9 +2482,7 @@ def _validate_promote_input(request: PromoteQueuedRunInput) -> None:
     )
     _require_non_empty_text(request.attempt_id, field_name="attempt_id")
     _require_non_empty_text(request.execution_id, field_name="execution_id")
-    _require_non_empty_text(
-        request.dispatch_record_id, field_name="dispatch_record_id"
-    )
+    _require_non_empty_text(request.dispatch_record_id, field_name="dispatch_record_id")
     _require_non_empty_text(request.actor, field_name="actor")
     _require_non_empty_text(request.source, field_name="source")
     if not isinstance(request.worker_kind, WorkerKind):
@@ -2097,6 +2519,32 @@ def _validate_terminal_input(request: TerminalCloseoutInput) -> None:
     _require_optional_sha256_digest(
         request.terminal_summary_digest, field_name="terminal_summary_digest"
     )
+    _require_optional_non_empty_text(
+        request.engine_event_ref, field_name="engine_event_ref"
+    )
+    _require_optional_non_empty_text(request.finish_reason, field_name="finish_reason")
+    _require_optional_non_empty_text(request.error_code, field_name="error_code")
+    _require_optional_non_empty_text(request.message, field_name="message")
+    _require_optional_non_empty_text(
+        request.provider_request_id, field_name="provider_request_id"
+    )
+    _require_optional_non_empty_text(
+        request.unsupported_later_owner, field_name="unsupported_later_owner"
+    )
+    _require_optional_non_empty_text(
+        request.worker_lifecycle_signal, field_name="worker_lifecycle_signal"
+    )
+    _require_optional_non_empty_text(
+        request.stream_error_code, field_name="stream_error_code"
+    )
+    _require_optional_non_empty_text(
+        request.last_accepted_event_id, field_name="last_accepted_event_id"
+    )
+    if (
+        request.last_observed_worker_event_index is not None
+        and request.last_observed_worker_event_index < 0
+    ):
+        raise HostDurableError("last_observed_worker_event_index must be non-negative")
 
 
 def _validate_accept_worker_running_input(
@@ -2195,6 +2643,42 @@ def _validate_cancel_active_input(request: CancelActiveAttemptInput) -> None:
     )
 
 
+def _validate_active_cancel_closeout_input(
+    request: ActiveCancelCloseoutInput,
+) -> None:
+    """校验 active cancel closeout 输入。
+
+    :param request: active cancel closeout 输入。
+    :returns: ``None``。
+    :raises HostDurableError: 任一字段无效时抛出。
+    """
+
+    _require_non_empty_text(request.run_id, field_name="run_id")
+    _require_non_empty_text(request.attempt_id, field_name="attempt_id")
+    _require_non_empty_text(
+        request.attempt_cancelled_event_id,
+        field_name="attempt_cancelled_event_id",
+    )
+    _require_non_empty_text(
+        request.run_cancelled_event_id,
+        field_name="run_cancelled_event_id",
+    )
+    _require_non_empty_text(request.actor, field_name="actor")
+    _require_non_empty_text(request.source, field_name="source")
+    _require_non_empty_text(request.reason, field_name="reason")
+    _require_non_empty_text(
+        request.cancel_request_event_id,
+        field_name="cancel_request_event_id",
+    )
+    _require_non_empty_text(
+        request.engine_event_ref,
+        field_name="engine_event_ref",
+    )
+    _require_non_empty_text(request.requested_at, field_name="requested_at")
+    _require_non_empty_text(request.accepted_at, field_name="accepted_at")
+    _require_non_empty_text(request.finished_at, field_name="finished_at")
+
+
 def _validate_common_cancel_input(
     *,
     run_id: str,
@@ -2228,9 +2712,7 @@ def _validate_common_cancel_input(
     _require_non_empty_text(
         cancel_request_event_id, field_name="cancel_request_event_id"
     )
-    _require_non_empty_text(
-        run_cancelled_event_id, field_name="run_cancelled_event_id"
-    )
+    _require_non_empty_text(run_cancelled_event_id, field_name="run_cancelled_event_id")
     _require_non_empty_text(actor, field_name="actor")
     _require_non_empty_text(source, field_name="source")
     _require_non_empty_text(client_request_id, field_name="client_request_id")
@@ -2238,9 +2720,7 @@ def _validate_common_cancel_input(
     _require_non_empty_text(reason, field_name="reason")
     if mode != CancelMode.GRACEFUL:
         raise ValueError("cancel mode must be graceful")
-    _require_sha256_digest(
-        call_context_digest, field_name="call_context_digest"
-    )
+    _require_sha256_digest(call_context_digest, field_name="call_context_digest")
 
 
 def _require_positive_sequence(value: int, field_name: str) -> None:

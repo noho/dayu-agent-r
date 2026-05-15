@@ -239,6 +239,28 @@ class EventLogStore:
             before_event_sequence=before_event_sequence,
         )
 
+    def read_latest_run_event_by_type(
+        self,
+        transaction: HostTransaction,
+        *,
+        run_id: str,
+        event_type: str,
+    ) -> EventLogRow | None:
+        """读取某个 Run 下最近的一条指定类型事件。
+
+        :param transaction: 调用方提供的 Host durable transaction。
+        :param run_id: 目标 Run id。
+        :param event_type: 目标 event type。
+        :returns: 找到时返回最近事件，否则返回 ``None``。
+        :raises HostDurableError: 输入字段无效时抛出。
+        """
+
+        return read_latest_run_event_by_type(
+            transaction,
+            run_id=run_id,
+            event_type=event_type,
+        )
+
 
 def append_event(
     transaction: HostTransaction, request: EventLogAppendRequest
@@ -322,9 +344,7 @@ def append_event(
     return EventLogAppendResult(row=row, inserted=True)
 
 
-def read_event_by_id(
-    transaction: HostTransaction, event_id: str
-) -> EventLogRow | None:
+def read_event_by_id(transaction: HostTransaction, event_id: str) -> EventLogRow | None:
     """按 ``event_id`` 读取 EventLog row。
 
     :param transaction: 调用方提供的 Host durable transaction。
@@ -476,6 +496,58 @@ def read_run_input_continuity_events(
         ),
     )
     return tuple(_event_log_row_from_host_row(row) for row in rows)
+
+
+def read_latest_run_event_by_type(
+    transaction: HostTransaction,
+    *,
+    run_id: str,
+    event_type: str,
+) -> EventLogRow | None:
+    """读取某个 Run 下最近的一条指定类型事件。
+
+    :param transaction: 调用方提供的 Host durable transaction。
+    :param run_id: 目标 Run id。
+    :param event_type: 目标 event type。
+    :returns: 找到时返回最近事件，否则返回 ``None``。
+    :raises HostDurableError: 输入字段无效时抛出。
+    """
+
+    _require_non_empty_text(run_id, field_name="run_id")
+    _require_non_empty_text(event_type, field_name="event_type")
+    row = transaction.fetchone(
+        f"""
+        SELECT
+          event_sequence,
+          event_id,
+          event_body_digest,
+          event_class,
+          session_id,
+          run_id,
+          attempt_id,
+          execution_id,
+          event_type,
+          occurred_at,
+          actor,
+          source,
+          client_request_id,
+          idempotency_key,
+          policy_decision_json,
+          reason_json,
+          payload_json,
+          payload_ref,
+          payload_digest,
+          appended_at
+        FROM {TABLE_EVENT_LOG}
+        WHERE run_id = ? AND event_type = ?
+        ORDER BY event_sequence DESC
+        LIMIT 1
+        """,
+        (run_id, event_type),
+    )
+    if row is None:
+        return None
+    return _event_log_row_from_host_row(row)
 
 
 @dataclass(frozen=True, slots=True)
