@@ -1750,7 +1750,7 @@ RemoteProxy、RemoteStub 与 EngineWorker 可以缓存 attempt snapshot 服务�
 
 Phase 5 ToolRuntime / wait boundary：
 
-- Phase 5 只允许 no-tool 或最小 fake ToolExecutor 支撑本地 Engine 执行闭环；不得实现 ToolRuntime governance、ToolBundle snapshot、Host accept barrier、`fetch_more`、语义级重复工具调用治理或 wait record。
+- Phase 5 只允许 no-tool 或最小 fake ToolExecutor 支撑本地 Engine 执行闭环；不得实现 ToolRuntime governance、effective ToolBundle、Host accept barrier、`fetch_more`、语义级重复工具调用治理或 wait record。
 - Phase 5 不创建 `WAITING` Run，不实现 `resolve_wait`，不把 EngineEvent `tool_awaiting` / `run_suspended` 解释为 Tool Awaiting canonical owner。第一版若收到 awaiting / suspended 路径，只能按当前 phase 的 unsupported execution path 记录诊断并收口为结构化失败，或在 plan 中证明 fake executor 不会产生该路径。
 - Phase 6 / Phase 7 分别拥有 ToolRuntime governance 与 Tool Awaiting / `resolve_wait`；Phase 5 的 implementation 和测试不得通过临时 wait table、局部 ToolRuntime wrapper 或 Engine 特化分支提前实现这些能力。
 
@@ -1759,9 +1759,15 @@ Tool fact accept ack 语义：
 - ToolRuntime Host accept path 是工具事实 canonical 写入所有者。
 - ToolRuntime 向 Host submit tool fact candidate 必须携带稳定 accept idempotency key。
 - accept idempotency key 必须能由 attempt identity、tool call identity、tool fact kind、result digest / awaiting digest 等确定性输入派生。
+- Phase 6 工具结果 accept path 的默认幂等范围是当前 Attempt 的单个 tool call：`scope_kind=tool_fact_accept`，
+  `scope_id` 至少绑定 `attempt_id` 与 `tool_call_id`，`semantic_input_digest` 至少覆盖 tool identity、
+  normalized arguments digest、tool fact kind、result / payload digest、policy decision digest 与 truncation metadata digest。
+  同一 scope + key + digest 的重试必须返回既有 accepted ack；同一 scope + key 但 digest 不同必须返回 idempotency conflict。
 - Host 已 durable accepted 但 ack 在本地回调或远程传输中丢失时，ToolRuntime 必须重试 accept；Host 通过 accept idempotency key 返回既有 accepted ack，不追加第二份 canonical fact。
 - ack rejected 表示 Host 明确拒绝该 candidate；ack timeout 只表示 ToolRuntime 未确认 Host 是否 accepted，不能直接把 tool result 返回给 Engine。
-- ToolRuntime 在 ack timeout 后不得让 LLM 消费未确认结果；它必须重试 accept，或按 Host policy 进入 governed tool error / awaiting / Attempt failed / recoverable。
+- Phase 6 第一版采用有限 accept retry；重试后仍未确认时，ToolRuntime 返回 governed tool error，且不得让 LLM 消费原始工具结果。
+  Phase 6 的 ack timeout 默认动作不创建 wait record，不把 Run 推入 `WAITING`，不触发 recovery，也不把 Attempt 自动升级为 recoverable。
+  后续 Phase 7 / Phase 11 若引入 awaiting 或 recovery 分支，必须基于新的 phase plan 扩展本策略。
 
 ## 18. ToolRuntime
 
@@ -1779,8 +1785,7 @@ tool declaration / external tool registration module
   -> ToolBundle
   -> create_host(..., tool_bundle=business_tool_bundle, ...)
   -> Host receives business ToolBundle as explicit construction parameter
-  -> Host stores tool_bundle_digest / schema_digest / source refs in runtime snapshot
-  -> Host creates attempt-local tool snapshot refs / digest
+  -> Host derives attempt-local effective tool view
   -> ToolRuntime factory receives business ToolBundle
   -> ToolRuntime factory injects enabled framework tools
   -> effective ToolBundle
@@ -1797,17 +1802,20 @@ Host 对传入的业务 `ToolBundle` 只做治理所需的防御性校验和派�
 
 - schema 合法性。
 - reserved framework tool name 冲突，例如 `fetch_more`。
-- bundle / schema digest。
-- attempt-local snapshot refs。
+- bundle / schema digest（用于诊断、trace 或后续恢复策略解释；不是防止普通装配 bug 的重型快照机制）。
+- attempt-local effective tool view refs。
 - policy binding refs 是否可解析。
 
-attempt-local snapshot 必须冻结本次 Attempt 使用的业务 `ToolBundle` 派生 refs。工具目录变化不能静默影响已创建 Attempt。
+attempt-local effective tool view 是 RunInputBuilder 暴露 tool schemas 与 ToolRuntime callable dispatch 的单一真源。
+业务工具声明现场的 `ToolDefinition` 已经把 schema 与 `ToolCallable` 同源绑定；Phase 6 不为该普通装配 invariant 引入额外
+durable snapshot 机制。实现必须保证 `AgentRunRequest.tool_schemas` 与 ToolRuntime dispatch 都从同一个
+effective `ToolBundle` 对象派生，并用测试覆盖 `fetch_more` framework tool 注入后的同源行为。
 
 `fetch_more` 不由外部业务 `ToolBundle` 提供。ToolRuntime factory 根据是否启用 TruncationManager 注入 framework tool，生成 attempt-local effective `ToolBundle`。RunInputBuilder 向 Engine 提供的 `tool_schemas` 和 ToolRuntime 执行使用的 callable binding 必须来自同一个 effective `ToolBundle`。`fetch_more` 仍走普通 tool dispatch / policy / accept barrier，不允许 Host 或 Engine 为它写特化分支。
 
 Start / follow-up request 默认不携带 raw `ToolBundle`，因为 `ToolBundle` 包含 callable binding，不是普通 UI / Service request payload。Host construction / composition root 是业务 `ToolBundle` 的默认输入边界。若未来支持多 scene tool profile，Service 可以通过 typed `tool_profile_ref` 或独立 Host handle 选择工具集合；该扩展必须冻结到 Attempt snapshot，不能塞进无结构 metadata。
 
-Retry / resume 默认复用源 Run / Attempt 已接受的 tool snapshot refs；policy 若要为关联新 Run 选择新的 tool snapshot，必须显式记录 source relation、new snapshot refs 与 policy decision。Replay 即使存在 effective `ToolBundle`，也不向模型暴露 tool schemas。
+Retry / resume 默认复用源 Run / Attempt 已接受的 effective tool view refs；policy 若要为关联新 Run 选择新的工具视图，必须显式记录 source relation、new effective view refs 与 policy decision。Replay 即使存在 effective `ToolBundle`，也不向模型暴露 tool schemas。
 
 ### 18.2 ToolRuntime Boundary
 
@@ -1816,7 +1824,7 @@ ToolRuntime 边界：
 ```text
 Host
   -> receives business ToolBundle
-  -> builds attempt-local tool snapshot refs and ToolRuntime snapshot
+  -> builds attempt-local effective tool view refs and ToolRuntime snapshot
   -> ToolRuntime factory builds effective ToolBundle
   -> ToolRuntime implements ToolExecutor
   -> ToolRuntime wraps effective ToolBundle / dispatcher / policies
@@ -1832,7 +1840,7 @@ ToolRuntime 内部必须拆成稳定 ports，避免把注册、执行、治理�
 - tool dispatcher / callable execution port。
 - policy decision port。
 - truncation / fetch_more port。
-- awaiting / wait outcome port。
+- awaiting / wait outcome port placeholder。
 - duplicate governance port。
 - Host tool fact accept port。
 - `ToolTraceDiagnosticEmitter`。
@@ -1847,7 +1855,7 @@ ToolRuntime 内部必须拆成稳定 ports，避免把注册、执行、治理�
 - ToolRuntime 是 `ToolExecutor`。
 - Engine 只看见 `ToolExecutor` protocol。
 - Engine 不知道 `@tool`、`ToolDefinition`、TruncationManager、`fetch_more` 或业务工具实现。
-- Host 不知道具体业务工具实现；Host 只消费外部传入的业务 `ToolBundle`、attempt-local tool snapshot refs 和工具治理策略。
+- Host 不知道具体业务工具实现；Host 只消费外部传入的业务 `ToolBundle`、attempt-local effective tool view refs 和工具治理策略。
 - 远端 ToolRuntime 可以执行和截断，但不能 append EventLog、不能关闭 Attempt、不能更新 Run。
 - ToolRuntime 必须遵守 Host-mediated accept barrier：工具事实必须先交给 Host durable accepted，收到 accepted ack 后，ToolRuntime 才能把对应 tool result 返回给 Engine 继续推理。LLM 不得消费 Host 真源中尚未 durable accepted 的工具事实。EngineEvent ingest 不能替代 ToolRuntime accept path 写工具 canonical facts。
 
@@ -1864,14 +1872,14 @@ Engine requests tool execution through ToolExecutor
   -> ToolRuntime returns tool result to Engine only after accepted ack
 ```
 
-该路径对 LocalProxy 与 RemoteProxy 语义一致。LocalProxy 通过函数调用表达 accepted ack；RemoteProxy 通过等价远程请求 / ack 语义表达。远端 tool execution 本质上是把 LocalProxy 下的 tool execution / Host accept 调用改成远程调用；网络延迟、序列化成本或额外 round trip 不是放松 Host accept barrier 的理由。Remote transport 可以用不同 wire protocol 表达，但不能绕过 Host accept barrier。若 ack rejected 或 timeout，ToolRuntime 不得把对应工具结果返回给 Engine；它必须返回受治理的工具错误、awaiting / suspend，或让 Host policy 将 Attempt 收口为 failed / recoverable。
+该路径对 LocalProxy 与 RemoteProxy 语义一致。LocalProxy 通过函数调用表达 accepted ack；RemoteProxy 通过等价远程请求 / ack 语义表达。远端 tool execution 本质上是把 LocalProxy 下的 tool execution / Host accept 调用改成远程调用；网络延迟、序列化成本或额外 round trip 不是放松 Host accept barrier 的理由。Remote transport 可以用不同 wire protocol 表达，但不能绕过 Host accept barrier。若 ack rejected 或 Phase 6 有限重试后仍 timeout，ToolRuntime 不得把对应工具结果返回给 Engine；Phase 6 默认返回受治理的工具错误。`awaiting` / suspend 与 recovery 分支分别由 Phase 7 / Phase 11 扩展，不在 Phase 6 默认动作中夹带。
 
 tool fact candidate 必须包含足以治理和追溯的信息：
 
 - tool identity 与 tool call identity。
 - normalized args digest 与可选 semantic duplicate key。
 - payload ref / digest / evidence anchors。
-- 截断发生时的 truncation descriptor / `scope_token` descriptor。
+- 截断发生时的 truncation metadata 与 run-scoped `fetch_more` refs。
 - 外部副作用或付费工具适用的 idempotency key。
 - policy decision 与 diagnostic refs。
 - accept idempotency key。
@@ -1881,7 +1889,7 @@ ToolRuntime 负责：
 - 消费 Host 传入的业务 `ToolBundle` 并生成 attempt-local effective `ToolBundle`。
 - 权限 / policy。
 - 并发 / timeout / orphan cleanup。
-- tool awaiting。
+- tool awaiting placeholder；wait record、`WAITING` 与 `resolve_wait` 由 Phase 7 实现。
 - truncation / fetch_more。
 - 语义级重复工具调用治理。
 - 通过 `ToolTraceDiagnosticEmitter` 发出 tool trace 所需诊断。
@@ -1948,8 +1956,12 @@ Truncation handle 语义：
 - `cursor` 标识“从哪个被截断结果、哪个位置继续读”。
 - `scope_token` 是 opaque capability / scope binding，用来证明本次 `fetch_more` 只能读取对应工具结果的后续内容。
 - LLM-facing tool result 只暴露普通 `fetch_more` 所需的 opaque 参数，不暴露 Host 内部 cursor store、artifact path、payload layout 或远端 cache key。
-- `cursor` / `scope_token` 进入 messages 或 EventLog 后，必须可恢复到足以完成后续 `fetch_more` 校验与读取的 durable descriptor；不能只存在于远端 ToolRuntime 进程内存。
-- durable descriptor 保存的是 handle metadata、scope binding、artifact ref、digest、offset / page / path、expiry / retention policy 和 access policy；不要求 Host 持久化完整 raw payload。
+- Phase 6 第一版 `cursor` / `scope_token` 是 Run-scoped、short-lived、ToolRuntime-local capability，只保证创建它的
+  Run 内续读，允许同一 Run 内跨 iteration 使用；不承诺跨 Run、跨 Session、Host restart、Attempt `LOST` /
+  recovery、replay 或长期 memory retrieval 后继续可用。
+- `cursor` / `scope_token` 的生成、single-use、TTL、scope hash 校验和错误 envelope 属于 TruncationManager
+  实现细节，但必须通过测试覆盖。Run 终态后 cursor 失效；过期、scope mismatch、cursor missing 或 token mismatch
+  均返回普通工具错误结果，不推进 Host recovery，也不创建 wait record。
 
 `fetch_more` 是 Host / ToolRuntime 内置 framework tool，但必须作为普通 tool 暴露和执行：
 
@@ -1970,11 +1982,12 @@ Host / ToolRuntime registers built-in @tool("fetch_more", ...)
 - EventLog 视角下，`fetch_more` 是普通 tool request / result。
 - `fetch_more` 不能成为业务工具注册表 public API。
 - `fetch_more` 必须校验 `cursor` 与 `scope_token` 的绑定关系；scope 不匹配、过期、被撤销或 artifact digest 不匹配时，应返回普通工具错误结果，不得旁路读取。
-- 当 truncation cursor / `scope_token` 的 ref 进入 messages 或 EventLog 后，该句柄必须可由 Host-governed durable cursor descriptor、artifact ref 或等价 snapshot 恢复；不能只存在于远端进程内存。
-- Remote ToolRuntime 可以持有 attempt-local TruncationManager 和 short-lived cache，服务同一 Attempt 内的快速续读；这是优化，不是正确性前提。
-- durable 不要求远端 ToolRuntime 在每次 truncate 或每次 `fetch_more` 前同步请求 Host。远端 ToolRuntime 可以随工具结果一次性回传 cursor descriptor / artifact ref / digest / scope binding；Host 接受工具事实时持久化该 descriptor。
-- 跨 Host restart、Attempt `LOST`、resume、steer 或 replay 后，`fetch_more` 必须依赖 Host attempt snapshot / Host-governed cursor descriptor / artifact ref 恢复读取权限，而不是依赖旧远端内存。
-- 远端不能把 cursor 或 `scope_token` 变成远端治理状态；Host 才能决定该句柄是否仍可用于当前 Run / Attempt / tool result。
+- Phase 6 不实现 durable cursor descriptor table，也不要求 Host 在 EventLog 中持久化足以跨 restart 续读的 raw payload /
+  cursor store。EventLog 可以记录截断发生、`fetch_more` 调用、普通工具结果与诊断 refs，但这些记录不把
+  `fetch_more` 升级为跨 Run 可恢复能力。
+- Remote ToolRuntime 可以持有 attempt-local TruncationManager 和 short-lived cache，服务同一 Run 内的快速续读；这是优化，
+  不是正确性前提。Phase 14 若要让远端支持等价 `fetch_more` 语义，必须保持 Host accept barrier，不得让远端拥有
+  Host EventLog、Run / Attempt 或 wait record 状态。
 - cursor 生命周期、TTL、读取 limit、重复续读、错误 envelope 和取消资源收口由 TruncationManager / ToolRuntime policy 定义。
 
 ## 20. Tool Awaiting / Wait Record

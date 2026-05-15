@@ -227,9 +227,21 @@ PASS，blocking design deviation 为 0。Controller adjudication artifact 为
 `docs/reviews/p1-p5-design-conformance-review-controller-adjudication-20260515.md`。
 
 当前不处于 implementation / fix gate；没有 accepted blocking finding 待修。用户手工 merge PR 54 后，下一步按 `$phaseflow`
-推进 Phase 6 `ToolRuntime / Truncation / fetch_more / Duplicate Governance`。需要继续追踪的 non-blocking hardening、
+推进 Phase 6 `ToolRuntime / Truncation / fetch_more / Duplicate Governance`。Phase 6 design discussion 输入 artifact 为
+`docs/reviews/host-phase6-design-discussion-codex-20260515.md`，controller 裁决 artifact 为
+`docs/reviews/host-phase6-design-discussion-controller-adjudication-20260515.md`；裁决后的 design write-back 已同步到
+`docs/host/design.md` 与本文档。Phase 6 handoff implementation-ready plan 为
+`docs/host/phase6-toolruntime-truncation-fetch-more-plan.md`；plan review artifacts 为
+`docs/reviews/host-phase6-plan-review-mimo-20260515.md` 与
+`docs/reviews/host-phase6-plan-review-ds-20260515.md`；controller plan review adjudication artifact 为
+`docs/reviews/host-phase6-plan-review-controller-adjudication-20260515.md`。Plan fix 后，plan re-review artifacts 为
+`docs/reviews/host-phase6-plan-re-review-mimo-20260515.md` 与
+`docs/reviews/host-phase6-plan-re-review-ds-20260515.md`；controller plan re-review adjudication artifact 为
+`docs/reviews/host-phase6-plan-re-review-controller-adjudication-20260515.md`。两路 re-review 均 PASS，blocking count 为 0。
+当前 gate 为 Phase 6 implementation user confirmation；用户确认后从 P6-S1
+`Effective ToolBundle And RunInputBuilder Wiring` 开始 implementation。需要继续追踪的 non-blocking hardening、
 deferred capability 与后续 phase owner 已写入 `Open Questions 与风险追踪` 的
-`PR 54 / P1-P5 corrected review 残余风险追踪`，进入 P6 前必须作为 phase discussion / plan 输入。
+`PR 54 / P1-P5 corrected review 残余风险追踪`，进入 P6 implementation 前必须作为输入。
 
 ## Phase Map
 
@@ -627,7 +639,7 @@ Phase 按依赖关系推进：先实现被其它阶段依赖的公共契约、ru
 ### Phase 6. ToolRuntime / Truncation / fetch_more / Duplicate Governance
 
 目标：
-- 落地 Host-owned ToolRuntime、ToolBundle snapshot、Host accept barrier、TruncationManager、`fetch_more` 与同 Run 语义级重复工具调用治理。
+- 落地 Host-owned ToolRuntime、effective ToolBundle、Host accept barrier、TruncationManager、`fetch_more` 与同 Run 语义级重复工具调用治理。
 
 对应设计章节：
 - `docs/host/design.md` §18 ToolRuntime
@@ -641,10 +653,10 @@ Phase 按依赖关系推进：先实现被其它阶段依赖的公共契约、ru
 - Phase 2 payload descriptor 与 EventLog append primitive 已完成。
 
 进入条件：
-- 确认 ToolRuntime ports、accept idempotency key、effective ToolBundle 与 truncation descriptor 的最小 typed contract；确认形式为用户确认，或 `docs/host/design.md` 对应章节已细化到可直接生成 typed contract / test matrix。
+- 确认 ToolRuntime ports、accept idempotency key、effective ToolBundle 与 run-scoped truncation / `fetch_more` 的最小 typed contract；确认形式为用户确认，或 `docs/host/design.md` 对应章节已细化到可直接生成 typed contract / test matrix。
 
 范围：
-- 允许修改：ToolRuntime factory、ToolExecutor wrapper、ToolBundle snapshot、tool fact accept path、TruncationManager、fetch_more framework tool、duplicate index、tool trace diagnostic emitter interface。
+- 允许修改：ToolRuntime factory、ToolExecutor wrapper、effective ToolBundle、tool fact accept path、TruncationManager、fetch_more framework tool、duplicate index、tool trace diagnostic emitter interface。
 - 禁止修改：Engine 工具协议语义、Remote wire protocol、业务工具实现。
 
 不做：
@@ -654,7 +666,7 @@ Phase 按依赖关系推进：先实现被其它阶段依赖的公共契约、ru
 
 关键设计问题：
 - 必须确认工具事实 accepted ack 失败 / timeout 的默认治理动作。
-- 必须确认 truncation cursor / scope_token durable descriptor 的存储位置与恢复输入。
+- 必须确认 truncation cursor / `scope_token` 的 run-scoped 边界、失效条件与错误 envelope；Phase 6 不实现 durable cursor descriptor / recovery 续读。
 - 必须确认 replay no-tool 防线如何从 RunInputBuilder 与 ToolRuntime 双层执行。
 
 交付物：
@@ -667,7 +679,7 @@ Phase 按依赖关系推进：先实现被其它阶段依赖的公共契约、ru
 建议 slice 切分：
 - Slice 1: ToolRuntime ports / effective ToolBundle / schema projection。
 - Slice 2: Host accept barrier and tool canonical fact append。
-- Slice 3: TruncationManager / fetch_more / durable descriptors。
+- Slice 3: TruncationManager / fetch_more / run-scoped cursor contract。
 - Slice 4: run-local duplicate governance and tool trace diagnostic emitter。
 
 验证要求：
@@ -867,7 +879,7 @@ Phase 按依赖关系推进：先实现被其它阶段依赖的公共契约、ru
 - Phase 0 Engine context compaction event cleanup 已完成；Phase 10 不消费 Engine overflow event 作为真实 Host budget，必须使用 Host estimator / policy。
 - Phase 9 memory projection 已完成。
 - Phase 5 dispatch / reactive failure closeout 已完成。
-- Phase 6 ToolRuntime / tool fact accept barrier / truncation descriptors 已完成。
+- Phase 6 ToolRuntime / tool fact accept barrier / run-scoped truncation / `fetch_more` contract 已完成。
 
 进入条件：
 - 确认 conservative estimator、provider-aware configured limits、safety margin 与 compact policy 的第一版默认值。
@@ -986,7 +998,7 @@ Phase 按依赖关系推进：先实现被其它阶段依赖的公共契约、ru
 前置条件：
 - Phase 1 Host public typing、`HostToolingOptions`、`ToolBundleSourceRef`、`ToolBundleSourceKind` 与 `FrameworkToolPolicyView` 已完成。
 - Phase 4 Host public API command path 已完成。
-- Phase 6 ToolRuntime / ToolBundle snapshot / framework tool policy 已完成。
+- Phase 6 ToolRuntime / effective ToolBundle / framework tool policy 已完成。
 
 进入条件：
 - 确认 ToolsDiscovery / ScenePrepare 仍是 Host 外部装配能力，不拥有 Session / Run / Attempt / EventLog truth。
@@ -1265,7 +1277,7 @@ Phase 按依赖关系推进：先实现被其它阶段依赖的公共契约、ru
 - Phase 7. Tool Awaiting / resolve_wait / Wait Adapter 必须定义 wait record 被 Host 标记 cancelled 后，adapter 如何观察该状态。
 - 后续 adapter 可以按能力实现外部 job cancel / revoke / abandon，但必须明确这是 best-effort，不得影响 Host EventLog 和 Run 终态的正确性。
 - 如果外部 job 在 Host 已取消 Run 后仍回调或被 poll 到结果，Host 必须拒绝其结果进入 canonical EventLog，只能记录 diagnostic / tool trace。
-- Phase 6. ToolRuntime / Truncation / fetch_more / Duplicate Governance 必须明确具有外部副作用、付费调用或长耗时资源占用的工具是否提供 job id、cancel handle、idempotency key 和资源清理策略。
+- Phase 6. ToolRuntime / Truncation / fetch_more / Duplicate Governance 必须覆盖具有外部副作用或付费调用工具的 policy / idempotency key 校验；长耗时 awaiting、external job id、cancel handle 与等待资源清理由 Phase 7. Tool Awaiting / resolve_wait / Wait Adapter 接收。
 - 第一版测试至少覆盖：`WAITING -> CANCELLED` 后迟到 `resolve_wait` / callback 不污染 canonical EventLog。
 
 #### Tool Trace / Provider Request 排错追踪
@@ -1363,7 +1375,7 @@ Phase 按依赖关系推进：先实现被其它阶段依赖的公共契约、ru
 追踪项：
 
 - Phase 14. RemoteProxy / RemoteStub 必须测试旧 `execution_id` 的迟到 Engine event、迟到 tool result、迟到 terminal 只能进入 diagnostic / trace，不能污染 canonical EventLog。
-- Phase 6. ToolRuntime / Truncation / fetch_more / Duplicate Governance 必须明确具有外部副作用的工具的 idempotency key、side-effect policy 和可取消能力。
+- Phase 6. ToolRuntime / Truncation / fetch_more / Duplicate Governance 必须明确具有外部副作用的工具的 idempotency key 与 side-effect policy；外部 job 可取消能力由 Phase 7 wait adapter 与后续 adapter hardening 接收。
 - Phase 14. RemoteProxy / RemoteStub 不得引入远端 takeover attempt、远端 append EventLog 或远端更新 Run 状态。
 
 #### Session Purge / Archive 追踪
