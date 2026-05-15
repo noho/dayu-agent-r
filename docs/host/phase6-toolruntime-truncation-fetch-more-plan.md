@@ -392,6 +392,8 @@ Implementation may modify only files listed in the assigned slice. If a slice ne
   - `dayu/host/_event_payload.py`.
   - `dayu/host/durable/event_log.py` only for governance event payload support.
 - P6-S6:
+  - `dayu/host/api.py` only to add composition-root local execution tooling options.
+  - `dayu/host/dispatch.py` to wire real `HostDispatchScheduler` to tool-enabled RunInputBuilder when construction tooling and policy allow tools.
   - `dayu/host/README.md`.
   - `dayu/README.md`.
   - `tests/README.md` only if new test categories or commands are added.
@@ -582,16 +584,18 @@ The implementation control document suggested four Phase 6 slices. This plan int
 
 ### P6-S6 - Integration, Documentation, And Gate Validation
 
-- **objective**: Finish integration coverage, README sync and phase validation.
+- **objective**: Finish integration coverage, real scheduler ToolRuntime wiring, README sync and phase validation.
 - **allowed files**: P6-S6 files only plus test files already introduced in earlier slices if assertions need final alignment.
 - **prerequisites**: P6-S1 to P6-S5 complete.
 - **exact changes**:
+  - Wire `HostDispatchScheduler` to construct a ToolRuntime handle and use tool-enabled RunInputBuilder when Host construction tooling exists and policy allows tools.
+  - Preserve no-tool behavior when construction tooling is absent or policy disables tools.
   - Add / update integration tests covering the full fake tool path and `fetch_more` path.
   - Add replay no-tool defense integration test.
   - Update README files listed in §8.
   - Ensure all modified/new functions/classes/modules have Chinese docstrings with params / returns / raises where applicable.
   - Ensure no new weak typing exceptions or import boundary violations.
-- **non-goals**: no production behavior beyond prior slices.
+- **non-goals**: no durable tool snapshot table, no Remote transport, no P7 wait record, no P13 trace projection, no business tool discovery.
 - **tests**:
   - full testing matrix in §7.
 - **validation**:

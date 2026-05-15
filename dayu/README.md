@@ -108,9 +108,9 @@ implementation、review、fix 与 re-review 的项目级术语真源。包级 RE
 - `ToolTraceDiagnosticEmitter`：ToolRuntime 内部 typed interface，用于提交结构化工具诊断记录 / refs，供 tool trace projection 生成 hot JSON 与 cold JSONL。它不是 EventLog appender，不拥有 canonical fact，不写 audit，不直接写 trace 文件，也不更新 Run / Attempt 状态。
 - `ToolExecutor`：Engine 可见的工具执行协议。Engine 只调用 `ToolExecutor.execute(...)`；Host / ToolRuntime 负责把工具注册、权限、截断、等待、幂等、审计和重复调用治理包装成该协议。
 - `semantic duplicate tool governance` / `语义级重复工具调用治理`：Host / ToolRuntime 对同一个 Run 内模型复读导致的重复工具调用治理，目标是减少无意义 token 和工具执行浪费。它使用 run-local in-memory duplicate index；不治理跨 Run / 跨 Session 历史相似证据，也不把同一轮正常工具调用视为需要治理的问题。Engine 只处理结构性工具调用协议，不理解工具语义、业务幂等性、历史证据质量或重复读取是否有意义。
-- `TruncationManager`：ToolRuntime 内的工具结果截断治理能力，按工具声明的 `ToolTruncateSpec` 工作，并负责生成可恢复的 truncation cursor descriptor 与 scope binding。Engine 不读取 `ToolTruncateSpec`，也不理解截断策略。
-- `truncation cursor`：被截断工具结果的续读句柄，标识从哪个结果、哪个位置继续读。进入 messages 或 EventLog 后，必须可由 Host-governed durable descriptor、artifact ref 或等价 snapshot 恢复；不能只存在于远端进程内存。
-- `scope_token`：`fetch_more` 使用的 opaque capability / scope binding，用来证明某次续读只允许访问对应工具结果的后续内容。它可以是持久化映射或可验证 token，但不能变成远端 ToolRuntime 的治理状态。
+- `TruncationManager`：ToolRuntime 内的工具结果截断治理能力，按工具声明的 `ToolTruncateSpec` 工作，并负责生成同一 Run 内使用的 truncation cursor 与 scope binding。Engine 不读取 `ToolTruncateSpec`，也不理解截断策略。
+- `truncation cursor`：被截断工具结果的续读句柄，标识从哪个结果、哪个位置继续读。Phase 6 第一版是 Run-scoped、short-lived、ToolRuntime-local capability；它只保证创建它的同一 Run 内安全续读，不提供 Host restart 后 durable recovery 续读。
+- `scope_token`：`fetch_more` 使用的 opaque capability / scope binding，用来证明某次续读只允许访问对应工具结果的后续内容。Phase 6 第一版只在同一 Run 的 ToolRuntime-local `fetch_more` 路径校验，不表达跨 Run、跨 Session 或 recovery 后的读取权限。
 - `fetch_more`：Host / ToolRuntime 内置 framework tool，用普通 `@tool` 方式暴露和执行，用于通过 `cursor` 与 `scope_token` 读取被截断结果的后续内容。它不能有 Host / Engine 特化分支。
 - `ToolAwaitingOutcome` / `wait record`：长事务或外部等待进入 Host 的边界。ToolRuntime 通过 Host accept path 提交 awaiting candidate；Host durable accepted 后同事务追加 `TOOL_AWAITING`、`RUN_WAITING`、`ATTEMPT_SUSPENDED`，持久化 wait record，并让 Run 进入 `WAITING`、Attempt 进入 `SUSPENDED`。Engine 只消费已 accepted 的 awaiting / suspended 语义 refs；Engine `tool_awaiting` / `run_suspended` 只能作为 preview / diagnostic / idempotent confirmation，不拥有 wait record 或 WAITING 状态迁移。Host 通过统一 `resolve_wait` pipeline 创建新 Attempt 继续。
 - `resolve_wait`：Host 的等待结果接收与治理入口，用于把 poll / callback / manual 带回来的长事务结果原子纳入 EventLog，并在通过校验后继续原 Run。它不是等待机制本身，不负责死等外部任务；结果未到时不应阻塞等待，应返回结构化错误或拒绝。它是短事务 command，最多只因 SQLite transaction / CAS / busy timeout 做短等待和重试。poll、callback、manual 等等待结果来源都必须走同一个 resolution pipeline，不能各自改 Run 状态。

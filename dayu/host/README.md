@@ -78,7 +78,7 @@ public semantic digest 在 facade 边界只使用显式请求字段与 `HostCall
 
 ## ToolRuntime Boundary
 
-`dayu.host.tool_runtime` 当前提供 P6-S1 到 P6-S5 的 ToolRuntime typed boundary，不从 `dayu.host` 包根导出，也不进入 `dayu.host.api`。它负责把 Host construction 阶段传入的业务 `ToolBundle` 与 framework tool policy 投影为同一个 `EffectiveToolBundle`，并让 ToolRuntime handle 同时携带 Engine 可见的 `tool_schemas` 与实际执行入口 `tool_executor`。RunInputBuilder 的 tool-enabled factory 只接受同一个 `ToolRuntimeHandle` 投影出的 schema 与 executor；no-tool / replay factory 仍输出空 schema、`NoToolExecutor` 与 `AgentPolicy.allow_tool_calls=False`。
+`dayu.host.tool_runtime` 当前提供 P6-S1 到 P6-S6 的 ToolRuntime typed boundary，不从 `dayu.host` 包根导出，也不进入 `dayu.host.api`。它负责把 Host construction 阶段传入的业务 `ToolBundle` 与 framework tool policy 投影为同一个 `EffectiveToolBundle`，并让 ToolRuntime handle 同时携带 Engine 可见的 `tool_schemas` 与实际执行入口 `tool_executor`。RunInputBuilder 的 tool-enabled factory 只接受同一个 `ToolRuntimeHandle` 投影出的 schema 与 executor；no-tool / replay factory 仍输出空 schema、`NoToolExecutor` 与 `AgentPolicy.allow_tool_calls=False`。
 
 当前 ToolRuntime 已实现 Host accept barrier 的 typed candidate / ack / rejected / timeout contract 与默认 durable accept port。`DefaultHostToolFactAcceptPort` 通过既有 transaction runner、EventLog primitive 与 idempotency primitive 校验 Run / Attempt / execution identity，在同一事务中写入 `TOOL_CALL_REQUESTED`、必要的 `TOOL_CALL_GOVERNED` 与非 reuse 的 `TOOL_RESULT_ACCEPTED` canonical facts；同一 accept scope + key + semantic digest 返回既有 ack，同 key 不同 digest 返回 idempotency conflict rejected ack。EngineEvent ingest 的工具事件只作为 preview / diagnostic，不是工具 canonical fact 写入入口。
 
@@ -88,7 +88,9 @@ public semantic digest 在 facade 边界只使用显式请求字段与 `HostCall
 
 当前 ToolRuntime 已实现 P6-S5 run-local duplicate governance 与最小 diagnostic emitter。`InMemoryRunLocalDuplicateGovernance` 的索引只存在于当前 ToolRuntime 实例内，duplicate key 基于 tool identity digest、normalized arguments digest 与可选 semantic duplicate key，不包含 `index_in_iteration`；同 iteration 内两个相同工具和相同 normalized arguments 仍会进入治理。duplicate action 覆盖 `allow`、`reuse`、`hint`、`require_justification` 与 `hard_stop`；`reuse` 只在 Host accepted governance 后把 prior accepted outcome 返回给 Engine，引用 prior accepted refs，不调用业务 callable，也不追加第二个 `TOOL_RESULT_ACCEPTED`。`ToolTraceDiagnosticEmitter` 当前提供 no-op、确定性引用与内存测试实现；diagnostic refs 会进入 governed candidate、accepted ack、rejected ack 或 timeout governed error 的结构化路径，但不写 audit、trace projection 或 EventLog。
 
-当前 ToolRuntime 仍未实现 policy provider resolution、attempt tool snapshot durability、真实 HostDispatchScheduler tool-enabled composition wiring、长耗时 external job / wait record、durable duplicate ledger 与 durable tool trace projection。
+当前本地 `HostDispatchScheduler` 已接入 tool-enabled composition wiring：当 `HostLocalExecutionOptions.tooling_options` 非空且 `AgentPolicy.allow_tool_calls=True` 时，scheduler 会为当前 Attempt 构造 ToolRuntime handle，并用 tool-enabled RunInputBuilder 把同源 `tool_schemas` 与 `tool_executor` 交给 worker；未提供 tooling 或 policy 禁用工具时仍走 no-tool builder。
+
+当前 ToolRuntime 仍未实现 policy provider resolution、attempt tool snapshot durability、长耗时 external job / wait record、durable duplicate ledger 与 durable tool trace projection。
 
 ## Durable Foundation
 
@@ -144,7 +146,7 @@ internal admission 当前的 session-scope cancel 支持 queued、pre-dispatch /
 - `CancelRunRequest` 与 `CancelSessionRunsRequest` 当前只接受 `CancelMode.GRACEFUL`。
 - `HostApiErrorCode` 包含 `UNSUPPORTED_OPERATION`；`HostApiError.detail` 只接受 `HostApiErrorDetail` typed union 成员，当前成员为 `SteerConflictDetail`。
 - `HostCommandHandleOptions` 校验可选 handle id 非空、路径字段为 `pathlib.Path`、布尔字段为 `bool`、timeout / delay / backoff / payload threshold 为正数、写重试次数非负；`create_host_command_handle` 对非空 `local_execution` fail fast。
-- `HostLocalExecutionOptions` 校验 lane 配置、RunnerSpec、RunnerCallOptions、AgentPolicy 与 worker factory 非空；worker factory 是结构协议，运行时不做 `hasattr` / `getattr` 式协议探测，由 pyright 与显式 scheduler 装配点保障。
+- `HostLocalExecutionOptions` 校验 lane 配置、RunnerSpec、RunnerCallOptions、AgentPolicy、worker factory、可选 `tooling_options` 与 truncation manager 开关；worker factory 是结构协议，运行时不做 `hasattr` / `getattr` 式协议探测，由 pyright 与显式 scheduler 装配点保障。
 - `ToolBundleSourceRef.source_id` 拒绝空字符串或纯空白；可选版本引用与内容摘要存在时也必须非空。
 - `HostToolingOptions.source_refs` 必须非空。
 - `FrameworkToolPolicyView.enabled_framework_tools` 必须是 `reserved_framework_tool_names` 子集。
@@ -162,7 +164,7 @@ Host 若在后续实现中复用 `dayu.runtime.filelock`，只能把它用于普
 
 - policy provider set、RemoteProxy、wait cancellation、recovery classifier、lease / fencing / takeover。
 - artifact cleanup scheduler 与 diagnostics table。
-- ToolRuntime policy resolution、真实 HostDispatchScheduler tool-enabled composition wiring。
+- ToolRuntime policy resolution。
 - durable duplicate ledger、durable tool trace projection。
 - ToolsDiscovery / ScenePrepare provider contract、tool profile registry、Attempt tool snapshot durability。
 - command-handle 本地 scheduler lifecycle wiring、Fins 业务语义、Service / UI 装配逻辑。

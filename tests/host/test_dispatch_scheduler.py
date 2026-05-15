@@ -15,6 +15,20 @@ from dayu.engine.contracts.agent_policy import AgentPolicy
 from dayu.engine.contracts.agent_run import AgentRunRequest
 from dayu.engine.contracts.engine_events import EngineEvent
 from dayu.engine.contracts.runner_spec import RunnerCallOptions, RunnerSpec
+from dayu.contracts.json_value import JsonValue
+from dayu.contracts.tool_call import (
+    BatchToolExecutionContext,
+    BatchToolExecutionRequest,
+    ToolCallRequest,
+)
+from dayu.contracts.tool_declaration import ToolBundle, ToolDefinition
+from dayu.contracts.tool_outcome import ToolCompletedOutcome, ToolExecutionOutcome
+from dayu.contracts.tool_result import ToolResultSuccess
+from dayu.contracts.tool_schema import (
+    ToolFunctionSchema,
+    ToolParametersSchema,
+    ToolSchema,
+)
 from dayu.host.admission import PendingDispatchRecord
 from dayu.host.api import (
     AttemptDispatchSnapshot,
@@ -26,6 +40,11 @@ from dayu.host.api import (
     LocalEngineWorkerFactory,
     LocalWorkerHandle,
     RunStatus,
+)
+from dayu.host.tooling import (
+    HostToolingOptions,
+    ToolBundleSourceKind,
+    ToolBundleSourceRef,
 )
 from dayu.host.dispatch import (
     ActiveCancelMessage,
@@ -402,6 +421,38 @@ class _FakeWorkerFactory:
         return _AcceptingWorker(self)
 
 
+class _CountingTool:
+    """测试用业务工具 callable。"""
+
+    def __init__(self) -> None:
+        """初始化测试工具。
+
+        :returns: ``None``。
+        """
+
+        self.call_count = 0
+
+    async def __call__(
+        self, call: ToolCallRequest, context: BatchToolExecutionContext
+    ) -> ToolExecutionOutcome:
+        """返回当前调用参数并记录调用次数。
+
+        :param call: 工具调用请求。
+        :param context: 批式工具执行上下文。
+        :returns: 工具成功 outcome。
+        """
+
+        del context
+        self.call_count += 1
+        return ToolCompletedOutcome(
+            result=ToolResultSuccess(
+                ok=True,
+                value={"tool_call_id": call.tool_call_id, "arguments": call.arguments},
+                meta=None,
+            )
+        )
+
+
 class _EnqueueOnSecondEmptyQueue(asyncio.Queue[PendingDispatchRecord]):
     """在第二次 empty 检查后注入一条 dispatch，用于复现 wakeup 窗口。"""
 
@@ -465,6 +516,61 @@ async def test_pending_waiting_dispatching_worker_accept_marks_running(
                 == seeded.dispatch_record_id
             )
             assert factory.accepted_requests[0].disable_tools is True
+        finally:
+            await scheduler.close()
+
+
+@pytest.mark.asyncio
+async def test_scheduler_uses_toolruntime_when_tooling_is_configured(
+    tmp_path: Path,
+) -> None:
+    """真实 dispatch scheduler 在 tool-enabled 配置下接入 ToolRuntime。"""
+
+    factory = _FakeWorkerFactory()
+    tool = _CountingTool()
+    with open_host_durable_store(_options(tmp_path)) as store:
+        seeded = _seed_current_run(store)
+        scheduler = await _open_scheduler(
+            tmp_path,
+            store,
+            factory,
+            agent_policy=_agent_policy(True),
+            tooling_options=_tooling_options(tool),
+        )
+        try:
+            scheduler.wake_dispatch(_pending_dispatch(seeded))
+            result = await scheduler.drain_once()
+
+            request = factory.accepted_requests[0]
+            assert result.dispatched == 1
+            assert request.disable_tools is False
+            assert request.agent_policy.allow_tool_calls is True
+            assert [schema.function.name for schema in request.tool_schemas] == [
+                "fake_dispatch_tool"
+            ]
+
+            tool_outcome = await request.tool_executor.execute(
+                _tool_execution_request(
+                    seeded,
+                    request,
+                    ToolCallRequest(
+                        tool_call_id="tool-call-dispatch",
+                        name="fake_dispatch_tool",
+                        arguments={"ticker": "DAYU"},
+                        index_in_iteration=0,
+                        provider_state=None,
+                    ),
+                )
+            )
+
+            assert tool.call_count == 1
+            assert isinstance(tool_outcome.records[0].outcome, ToolCompletedOutcome)
+            assert _read_event_by_type(
+                store.transaction_runner, "TOOL_CALL_REQUESTED"
+            ).run_id == seeded.run_id
+            assert _read_event_by_type(
+                store.transaction_runner, "TOOL_RESULT_ACCEPTED"
+            ).run_id == seeded.run_id
         finally:
             await scheduler.close()
 
@@ -926,6 +1032,8 @@ async def _open_scheduler(
     lane_db_path: Path | None = None,
     lane_default_timeout_seconds: float = 0.01,
     active_registry: ActiveWorkerRegistry | None = None,
+    agent_policy: AgentPolicy | None = None,
+    tooling_options: HostToolingOptions | None = None,
 ) -> HostDispatchScheduler:
     """打开测试 scheduler。
 
@@ -936,6 +1044,8 @@ async def _open_scheduler(
     :param lane_db_path: runtime lane DB 路径。
     :param lane_default_timeout_seconds: lane acquire 默认 timeout。
     :param active_registry: active worker registry。
+    :param agent_policy: 可选 AgentPolicy；无则使用 no-tool policy。
+    :param tooling_options: 可选 Host 工具装配选项。
     :returns: scheduler。
     """
 
@@ -954,13 +1064,11 @@ async def _open_scheduler(
             runner_options=RunnerCallOptions(
                 temperature=None, max_tokens=None, top_p=None, stream=False
             ),
-            agent_policy=AgentPolicy(
-                max_iterations=1,
-                continuation_max_attempts=0,
-                allow_tool_calls=False,
-                tool_execution_timeout_seconds=1.0,
+            agent_policy=(
+                agent_policy if agent_policy is not None else _agent_policy(False)
             ),
             worker_factory=factory,
+            tooling_options=tooling_options,
         ),
         host_handle_id="host-test",
         active_registry=active_registry,
@@ -985,6 +1093,105 @@ def _runner_spec() -> RunnerSpec:
         default_timeout_seconds=1.0,
         max_retries=0,
         provider_request=None,
+    )
+
+
+def _tooling_options(tool: _CountingTool) -> HostToolingOptions:
+    """构造 tool-enabled dispatch 测试用工具装配选项。
+
+    :param tool: 测试业务工具 callable。
+    :returns: HostToolingOptions。
+    """
+
+    return HostToolingOptions(
+        business_tool_bundle=ToolBundle(
+            definitions=(_tool_definition("fake_dispatch_tool", tool),)
+        ),
+        source_refs=(
+            ToolBundleSourceRef(
+                source_kind=ToolBundleSourceKind.EXPLICIT_PROVIDER,
+                source_id="dispatch-tool-test",
+            ),
+        ),
+    )
+
+
+def _tool_definition(name: str, tool: _CountingTool) -> ToolDefinition:
+    """构造测试工具声明。
+
+    :param name: 工具名。
+    :param tool: 测试工具 callable。
+    :returns: ToolDefinition。
+    """
+
+    return ToolDefinition(
+        name=name,
+        schema=ToolSchema(
+            type="function",
+            function=ToolFunctionSchema(
+                name=name,
+                description="dispatch fake tool",
+                parameters=_tool_parameters(),
+            ),
+        ),
+        callable=tool,
+        truncate=None,
+        display=None,
+        tags=("dispatch",),
+    )
+
+
+def _tool_parameters() -> ToolParametersSchema:
+    """构造测试工具参数 schema。
+
+    :returns: ToolParametersSchema。
+    """
+
+    properties: dict[str, JsonValue] = {"ticker": {"type": "string"}}
+    return ToolParametersSchema(
+        type="object",
+        properties=properties,
+        required=("ticker",),
+        additional_properties=False,
+    )
+
+
+def _tool_execution_request(
+    seeded: _SeededRun, request: AgentRunRequest, call: ToolCallRequest
+) -> BatchToolExecutionRequest:
+    """构造 ToolRuntime 批式执行请求。
+
+    :param seeded: seeded Run refs。
+    :param request: scheduler 传给 worker 的 AgentRunRequest。
+    :param call: 工具调用请求。
+    :returns: BatchToolExecutionRequest。
+    """
+
+    return BatchToolExecutionRequest(
+        calls=(call,),
+        context=BatchToolExecutionContext(
+            run_id=seeded.run_id,
+            session_id=seeded.session_id,
+            iteration_id="iteration-dispatch-tool",
+            timeout_seconds=1.0,
+            cancellation_token=request.cancellation_token,
+            correlation_id="correlation-dispatch-tool",
+        ),
+    )
+
+
+def _agent_policy(allow_tool_calls: bool) -> AgentPolicy:
+    """构造测试 AgentPolicy。
+
+    :param allow_tool_calls: 是否允许工具调用。
+    :returns: AgentPolicy。
+    """
+
+    return AgentPolicy(
+        max_iterations=1,
+        continuation_max_attempts=0,
+        allow_tool_calls=allow_tool_calls,
+        tool_execution_timeout_seconds=1.0,
     )
 
 
