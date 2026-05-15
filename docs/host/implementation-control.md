@@ -274,11 +274,18 @@ controller adjudication，accepted checkpoint commit 为 `31ab68d`。P6-S5 artif
 `docs/reviews/host-phase6-code-re-review-s5-ds-20260515.md` 与
 `docs/reviews/host-phase6-code-review-s5-controller-adjudication-20260515.md`；验证为
 `pytest tests/host/test_toolruntime_duplicate_governance.py tests/host/test_toolruntime_diagnostics.py tests/host/test_toolruntime_accept_barrier.py -q`
-24 passed、P6 ToolRuntime 相关 46 tests passed、`python -m pyright dayu/host tests/host` 0 errors、`git diff --check` clean。当前 gate 为 Phase 6 P6-S6
-implementation ready。需要继续追踪的 non-blocking hardening、deferred capability 与后续 phase owner 已写入 `Open Questions 与风险追踪` 的
+24 passed、P6 ToolRuntime 相关 46 tests passed、`python -m pyright dayu/host tests/host` 0 errors、`git diff --check` clean。P6-S6
+`Integration, Scheduler Wiring, And Gate Validation` 已完成 implementation、双路 code review 与 controller adjudication，
+accepted checkpoint commit 为 `53ff69f`。P6-S6 artifacts 为
+`docs/reviews/host-phase6-implementation-s6-integration-gate-20260515.md`、
+`docs/reviews/host-phase6-code-review-s6-mimo-20260515.md`、
+`docs/reviews/host-phase6-code-review-s6-ds-20260515.md` 与
+`docs/reviews/host-phase6-code-review-s6-controller-adjudication-20260515.md`；验证为
+`pytest tests/host -q` 348 passed、`python -m pyright dayu/ tests/ utils/` 0 errors、`git diff --check` clean。当前 gate 为 Phase 6
+aggregate review ready。需要继续追踪的 non-blocking hardening、deferred capability 与后续 phase owner 已写入 `Open Questions 与风险追踪` 的
 `PR 54 / P1-P5 corrected review 残余风险追踪`、P6-S1 controller adjudication residual risks、P6-S2 controller
 adjudication residual risks、P6-S3 controller adjudication residual risks、P6-S4 controller adjudication residual risks，以及
-P6-S5 controller adjudication residual risks。P6-S3 遗留的真实 `HostDispatchScheduler` 仍 no-tool composition wiring 必须在 Phase 6 退出前关闭；由 P6-S6 integration 接收。
+P6-S5 / P6-S6 controller adjudication residual risks。P6-S3 遗留的真实 `HostDispatchScheduler` no-tool composition wiring 已由 P6-S6 关闭。
 
 ## Phase Map
 
@@ -1532,7 +1539,7 @@ Phase 按依赖关系推进：先实现被其它阶段依赖的公共契约、ru
 - 当前测试允许 white-box 篡改 `_cursors` 验证 corrupt / mismatch 防御；若后续 cursor 存储结构迁移，owner 为对应迁移 slice 同步调整测试边界。
 - 当前覆盖以 `text_chars` 为主；`text_lines`、`list_items`、`binary_bytes` 的更细粒度边界 hardening 归后续 ToolRuntime test hardening，不阻塞 P6-S5。
 - duplicate governance、diagnostic refs 和 run-local duplicate matrix 由 P6-S5 接收。
-- 真实 `HostDispatchScheduler` 仍是 no-tool composition wiring；Phase 6 退出前必须关闭，当前 owner 为 P6-S6 integration。
+- 真实 `HostDispatchScheduler` no-tool composition wiring 已由 P6-S6 关闭。
 
 #### Phase 6 P6-S5 Duplicate Governance / Diagnostics 残余风险追踪
 
@@ -1551,7 +1558,24 @@ Phase 按依赖关系推进：先实现被其它阶段依赖的公共契约、ru
 - `semantic_duplicate_key_argument_name` 是 Host 内部 policy 字段且默认关闭；后续 policy provider 若启用它，必须补 dedicated tests 并明确其与 normalized arguments digest 的关系。
 - `ToolFactAcceptCandidate` 对 `GOVERNED_ERROR` 的 duplicate defensive validation 仍可更严格；owner 为后续 ToolRuntime hardening。
 - `ToolTraceDiagnosticEmitter` typed refs 不等于 durable tool trace；durable trace projection 由 Phase 13 Audit / Tool Trace / Outbox Projections 接收。
-- 真实 `HostDispatchScheduler` 仍是 no-tool composition wiring；Phase 6 退出前必须关闭，当前 owner 为 P6-S6 integration。
+- 真实 `HostDispatchScheduler` no-tool composition wiring 已由 P6-S6 关闭。
+
+#### Phase 6 P6-S6 Integration / Scheduler Wiring 残余风险追踪
+
+结论：
+
+- P6-S6 已按 Phase 6 退出目标扩展 scope，关闭真实 `HostDispatchScheduler` 固定 no-tool RunInputBuilder 的缺口。
+- 本地 scheduler 在 `HostLocalExecutionOptions.tooling_options` 非空且 `AgentPolicy.allow_tool_calls=True` 时，为当前 Attempt 构造 ToolRuntime handle，并通过 tool-enabled RunInputBuilder 把同源 schema / executor 交给 worker。
+- tooling 缺失或 policy 禁用工具时，scheduler 仍保持 no-tool builder 行为。
+- 新增测试覆盖真实 scheduler path：dispatch -> worker accepted request -> captured `ToolExecutor.execute` -> Host accept barrier -> `TOOL_CALL_REQUESTED` / `TOOL_RESULT_ACCEPTED` canonical facts。
+- P6-S6 review 没有 blocking finding。
+
+追踪项：
+
+- `tooling_options` 当前是 construction-time 单 bundle 输入；多 profile / per-scene tool profile 仍归 Phase 12 ToolsDiscovery / ScenePrepare 或后续 policy provider owner。
+- `policy_snapshot_digest` 当前是本地 policy snapshot 的诊断 digest，不是 durable attempt tool snapshot；attempt tool snapshot durability 仍归后续 ToolRuntime hardening / policy provider owner。
+- duplicate governance index 当前跟随 ToolRuntime 实例生命周期。未来 Phase 7 wait / resume、steer 或 recovery 若需要同 Run 多 Attempt 共享 duplicate memory，必须重新裁决是否引入 run-level in-memory index。
+- `enable_truncation_manager=True` 是本地 tool-enabled scheduler 默认值；若后续 TruncationManager 初始化成本变重，归 ToolRuntime performance hardening 复核。
 
 ## 历史记录
 
