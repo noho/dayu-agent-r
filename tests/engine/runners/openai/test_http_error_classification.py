@@ -95,6 +95,7 @@ def test_is_retriable_branches() -> None:
     }
     not_retriable = {
         RunnerHTTPErrorCode.CLIENT_ERROR,
+        RunnerHTTPErrorCode.CONTEXT_LENGTH_EXCEEDED,
         RunnerHTTPErrorCode.UNKNOWN_HTTP_STATUS,
     }
     for code in retriable:

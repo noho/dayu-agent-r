@@ -8,6 +8,7 @@ import dayu.host.api as api
 
 EXPECTED_API_EXPORTS: frozenset[str] = frozenset(
     {
+        "AttemptDispatchSnapshot",
         "AttemptStatus",
         "AuthorizationClaim",
         "CancelMode",
@@ -29,8 +30,12 @@ EXPECTED_API_EXPORTS: frozenset[str] = frozenset(
         "HostEventStream",
         "HostEventView",
         "HostInput",
+        "HostLocalExecutionOptions",
         "HostMetadataEntry",
         "HostStreamCursor",
+        "LocalEngineWorker",
+        "LocalEngineWorkerFactory",
+        "LocalWorkerHandle",
         "OperationContext",
         "OutboxSummary",
         "PurgeSessionRequest",
@@ -89,7 +94,7 @@ EXPECTED_HOST_EXPORTS: frozenset[str] = (
 )
 
 
-def test_host_all_matches_phase1_public_contracts() -> None:
+def test_host_all_matches_current_public_contracts() -> None:
     """``dayu.host.__all__`` 匹配当前 public contract。"""
 
     actual = frozenset(host.__all__)
@@ -99,7 +104,7 @@ def test_host_all_matches_phase1_public_contracts() -> None:
 
 
 def test_api_all_stays_request_snapshot_boundary() -> None:
-    """``dayu.host.api.__all__`` 仍只包含 request / snapshot / context 类型。"""
+    """``dayu.host.api.__all__`` 只包含 API 与本地执行配置类型。"""
 
     assert frozenset(api.__all__) == EXPECTED_API_EXPORTS
 

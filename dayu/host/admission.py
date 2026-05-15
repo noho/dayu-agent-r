@@ -52,6 +52,7 @@ from dayu.host.durable.idempotency import (
     IdempotencyStore,
 )
 from dayu.host.durable.run_transition import (
+    CancelActiveAttemptInput,
     CancelPredispatchStartingInput,
     CancelQueuedRunInput,
     CreateQueuedRunInput,
@@ -65,6 +66,7 @@ from dayu.host.durable.run_transition import (
     create_queued_run_in_transaction,
     create_running_run_with_starting_attempt_in_transaction,
     promote_queued_run_in_transaction,
+    request_active_attempt_cancel_in_transaction,
     terminal_closeout_in_transaction,
 )
 from dayu.host.durable.state import (
@@ -143,8 +145,8 @@ class AdmissionIdFactory(Protocol):
 class AdmissionWakeupPort(Protocol):
     """admission commit 后的轻量 wakeup 端口。
 
-    Phase 3 只允许 no-op 或测试 spy，不在此端口内启动 Engine、scheduler、
-    lane acquire 或 WorkerProxy。
+    该端口只负责 commit 后的轻量唤醒；具体实现可以连接 scheduler，但不得在
+    admission transaction 内启动 Engine、lane acquire 或 WorkerProxy。
     """
 
     def wake_dispatch(self, record: "PendingDispatchRecord") -> None:
@@ -245,6 +247,22 @@ class PromotionResult:
 
 
 @dataclass(frozen=True, slots=True)
+class ActiveCancelTarget:
+    """commit 后需要传播到 active worker 的取消目标。
+
+    :param run_id: 目标 Run id。
+    :param attempt_id: 当前 active Attempt id。
+    :param execution_id: 当前 active execution id。
+    :param reason: 调用方取消原因。
+    """
+
+    run_id: str
+    attempt_id: str
+    execution_id: str
+    reason: str
+
+
+@dataclass(frozen=True, slots=True)
 class CloseoutAttemptTerminalInput:
     """admission 层 internal terminal closeout 输入。
 
@@ -272,6 +290,8 @@ class CancelRunResult:
     :param attempt: Run 当前 Attempt；queued cancel 时为 ``None``。
     :param dispatch_record: 当前 Attempt 对应 dispatch record；无 Attempt 时为 ``None``。
     :param promotion: active slot 被释放后触发的 promotion 结果；未释放时为 ``None``。
+    :param active_cancel_target: commit 后需要 best-effort 传播的 active worker
+        cancel 目标；无 active worker 时为 ``None``。
     :param idempotent_replay: 是否命中既有 cancel 幂等记录。
     :param released_active_slot: 本次 cancel 是否释放 active slot。
     """
@@ -280,6 +300,7 @@ class CancelRunResult:
     attempt: AttemptRow | None
     dispatch_record: DispatchRecordRow | None
     promotion: PromotionResult | None
+    active_cancel_target: ActiveCancelTarget | None
     idempotent_replay: bool
     released_active_slot: bool
 
@@ -289,11 +310,14 @@ class SessionCancelResult:
     """admission 层 cancel_session_runs 结果。
 
     :param snapshot: cancel 后或幂等重放读取到的 Session snapshot。
+    :param active_cancel_targets: commit 后需要 best-effort 传播的 active worker
+        cancel 目标集合。
     :param idempotent_replay: 是否命中既有 session-scope cancel 幂等记录。
     :param cancelled_run_count: 本次新取消的 Run 数；幂等重放时为 0。
     """
 
     snapshot: SessionSnapshot
+    active_cancel_targets: tuple[ActiveCancelTarget, ...]
     idempotent_replay: bool
     cancelled_run_count: int
 
@@ -493,6 +517,7 @@ class HostAdmissionService:
                 attempt=result.attempt,
                 dispatch_record=result.dispatch_record,
                 promotion=promotion,
+                active_cancel_target=result.active_cancel_target,
                 idempotent_replay=result.idempotent_replay,
                 released_active_slot=True,
             )
@@ -505,10 +530,10 @@ class HostAdmissionService:
         *,
         caller_semantic_digest: str,
     ) -> SessionCancelResult:
-        """接受 Phase 4 子集的 session-scope cancel 请求。
+        """接受 session-scope cancel 请求。
 
-        本方法只取消 queued Run 与 pre-dispatch ``STARTING`` Run；dispatching /
-        active worker、``WAITING`` 与 ``RECOVERING`` 由后续 phase 负责。
+        本方法取消 queued、pre-dispatch ``STARTING`` 与 active worker Run；
+        ``WAITING`` 与 ``RECOVERING`` 由后续 phase 负责。
 
         :param session_id: 目标 Session id。
         :param request: cancel session runs 请求。
@@ -920,14 +945,34 @@ class _CancelRunOperation:
                 scope=scope,
             )
         if run.status == RunStatus.RUNNING:
-            return self._cancel_predispatch_starting(
+            predispatch = self._cancel_predispatch_starting_or_none(
                 transaction=transaction,
+                semantic_digest=semantic_digest,
+                scope=scope,
+            )
+            if predispatch is not None:
+                return predispatch
+            return self._cancel_active_attempt(
+                transaction=transaction,
+                semantic_digest=semantic_digest,
+                scope=scope,
+            )
+        if run.status == RunStatus.CANCELLING:
+            return self._cancel_active_attempt(
+                transaction=transaction,
+                semantic_digest=semantic_digest,
+                scope=scope,
+            )
+        if _is_terminal_run_status(run.status):
+            return self._record_terminal_replay(
+                transaction=transaction,
+                run=run,
                 semantic_digest=semantic_digest,
                 scope=scope,
             )
         raise HostApiError(
             code=HostApiErrorCode.INVALID_STATE,
-            message="Run status is not cancellable in Phase 3 admission",
+            message="Run status is not cancellable in Phase 5 admission",
             retryable=False,
         )
 
@@ -989,24 +1034,25 @@ class _CancelRunOperation:
             attempt=None,
             dispatch_record=None,
             promotion=None,
+            active_cancel_target=None,
             idempotent_replay=False,
             released_active_slot=False,
         )
 
-    def _cancel_predispatch_starting(
+    def _cancel_predispatch_starting_or_none(
         self,
         *,
         transaction: HostTransaction,
         semantic_digest: str,
         scope: IdempotencyScope,
-    ) -> CancelRunResult:
-        """取消 pre-dispatch STARTING Attempt 并记录幂等结果。
+    ) -> CancelRunResult | None:
+        """尝试取消 pre-worker STARTING Attempt 并记录幂等结果。
 
         :param transaction: 当前 Host transaction。
         :param semantic_digest: cancel semantic digest。
         :param scope: 幂等 scope。
-        :returns: cancel 结果。
-        :raises HostApiError: 状态不是 Phase 3 pre-dispatch cancel 时抛出。
+        :returns: direct cancel 结果；当前 Run 不是 pre-worker 时返回 ``None``。
+        :raises HostApiError: direct cancel transition 竞争失败时抛出。
         """
 
         now = self.clock.now()
@@ -1029,6 +1075,8 @@ class _CancelRunOperation:
                 call_context_digest=_call_context_digest(self.request.context),
             ),
         )
+        if transition_result.status == StateMutationStatus.INVALID_STATE:
+            return None
         _raise_for_cancel_transition_status(transition_result)
         run = _require_transition_run(transition_result.run)
         cancel_request_sequence = _require_event_sequence(
@@ -1052,8 +1100,116 @@ class _CancelRunOperation:
             attempt=transition_result.attempt,
             dispatch_record=transition_result.dispatch_record,
             promotion=None,
+            active_cancel_target=None,
             idempotent_replay=False,
             released_active_slot=True,
+        )
+
+    def _cancel_active_attempt(
+        self,
+        *,
+        transaction: HostTransaction,
+        semantic_digest: str,
+        scope: IdempotencyScope,
+    ) -> CancelRunResult:
+        """请求取消 active RUNNING Attempt 并记录幂等结果。
+
+        :param transaction: 当前 Host transaction。
+        :param semantic_digest: cancel semantic digest。
+        :param scope: 幂等 scope。
+        :returns: cancel 结果，包含 commit 后 active cancel 传播目标。
+        :raises HostApiError: 当前状态不是 Phase 5 active cancel 子集时抛出。
+        """
+
+        now = self.clock.now()
+        cancel_request_event_id = self.id_factory.new_id(_EVENT_ID_PREFIX)
+        transition_result = request_active_attempt_cancel_in_transaction(
+            transaction,
+            self.event_log_store,
+            CancelActiveAttemptInput(
+                run_id=self.run_id,
+                cancel_request_event_id=cancel_request_event_id,
+                run_cancelling_event_id=self.id_factory.new_id(_EVENT_ID_PREFIX),
+                occurred_at=now,
+                actor=self.request.context.actor,
+                source=self.request.context.source,
+                client_request_id=self.request.client_request_id,
+                idempotency_key=self.request.client_request_id,
+                reason=self.request.reason,
+                mode=self.request.mode,
+                call_context_digest=_call_context_digest(self.request.context),
+            ),
+        )
+        _raise_for_cancel_transition_status(transition_result)
+        run = _require_transition_run(transition_result.run)
+        cancel_request_sequence = _require_event_sequence_if_present(
+            transaction,
+            self.event_log_store,
+            cancel_request_event_id,
+        )
+        self.idempotency_store.record_idempotent_result(
+            transaction,
+            scope,
+            semantic_digest,
+            IdempotencyResultRef(
+                result_kind=_IDEMPOTENCY_RESULT_KIND_RUN,
+                result_ref=run.run_id,
+                created_event_id=cancel_request_event_id
+                if cancel_request_sequence is not None
+                else None,
+                created_event_sequence=cancel_request_sequence,
+            ),
+        )
+        return CancelRunResult(
+            run=run,
+            attempt=transition_result.attempt,
+            dispatch_record=transition_result.dispatch_record,
+            promotion=None,
+            active_cancel_target=_active_cancel_target_from_transition(
+                run=run,
+                attempt=transition_result.attempt,
+                reason=self.request.reason,
+            ),
+            idempotent_replay=False,
+            released_active_slot=False,
+        )
+
+    def _record_terminal_replay(
+        self,
+        *,
+        transaction: HostTransaction,
+        run: RunRow,
+        semantic_digest: str,
+        scope: IdempotencyScope,
+    ) -> CancelRunResult:
+        """为已终态 Run 记录 cancel 幂等结果并返回当前终态。
+
+        :param transaction: 当前 Host transaction。
+        :param run: 已终态 Run row。
+        :param semantic_digest: cancel semantic digest。
+        :param scope: 幂等 scope。
+        :returns: 当前 terminal Run 对应的 cancel 结果。
+        """
+
+        self.idempotency_store.record_idempotent_result(
+            transaction,
+            scope,
+            semantic_digest,
+            IdempotencyResultRef(
+                result_kind=_IDEMPOTENCY_RESULT_KIND_RUN,
+                result_ref=run.run_id,
+                created_event_id=None,
+                created_event_sequence=None,
+            ),
+        )
+        return CancelRunResult(
+            run=run,
+            attempt=_read_current_attempt(transaction, run),
+            dispatch_record=_read_current_dispatch_record(transaction, run),
+            promotion=None,
+            active_cancel_target=None,
+            idempotent_replay=False,
+            released_active_slot=False,
         )
 
 
@@ -1064,6 +1220,7 @@ class _SupportedSessionCancelTarget:
     run: RunRow
     attempt: AttemptRow | None
     dispatch_record: DispatchRecordRow | None
+    active_worker: bool
 
 
 @dataclass(frozen=True, slots=True)
@@ -1079,7 +1236,7 @@ class _CancelSessionRunsOperation:
     id_factory: AdmissionIdFactory
 
     def __call__(self, transaction: HostTransaction) -> SessionCancelResult:
-        """执行 Phase 4 子集的 session-scope cancel transaction。
+        """执行 session-scope cancel transaction。
 
         :param transaction: 当前 Host transaction。
         :returns: session-scope cancel 结果。
@@ -1099,21 +1256,42 @@ class _CancelSessionRunsOperation:
         existing = self.idempotency_store.read_idempotency_record(transaction, scope)
         if existing is not None:
             _raise_if_digest_conflict(existing, semantic_digest)
-            return _idempotent_session_cancel_result(transaction, existing)
+            return _idempotent_session_cancel_result(
+                transaction,
+                existing,
+                reason=self.request.reason,
+            )
 
         session = _require_existing_session(transaction, self.session_id)
         targets = self._read_supported_targets_or_raise(transaction)
         first_cancel_event_id: str | None = None
         first_cancel_event_sequence: int | None = None
+        first_active_cancel_event_id: str | None = None
+        first_active_cancel_event_sequence: int | None = None
+        active_cancel_targets: list[ActiveCancelTarget] = []
         for target in targets:
             cancel_event_id = self._cancel_target(transaction, target)
-            if first_cancel_event_id is None:
+            cancel_event_sequence = _require_event_sequence_if_present(
+                transaction,
+                self.event_log_store,
+                cancel_event_id,
+            )
+            if first_cancel_event_id is None and cancel_event_sequence is not None:
                 first_cancel_event_id = cancel_event_id
-                first_cancel_event_sequence = _require_event_sequence(
-                    transaction,
-                    self.event_log_store,
-                    cancel_event_id,
-                )
+                first_cancel_event_sequence = cancel_event_sequence
+            if (
+                target.active_worker
+                and first_active_cancel_event_id is None
+                and cancel_event_sequence is not None
+            ):
+                first_active_cancel_event_id = cancel_event_id
+                first_active_cancel_event_sequence = cancel_event_sequence
+            active_cancel_target = _active_cancel_target_for_session_target(
+                target=target,
+                reason=self.request.reason,
+            )
+            if active_cancel_target is not None:
+                active_cancel_targets.append(active_cancel_target)
         self.idempotency_store.record_idempotent_result(
             transaction,
             scope,
@@ -1121,8 +1299,16 @@ class _CancelSessionRunsOperation:
             IdempotencyResultRef(
                 result_kind=_IDEMPOTENCY_RESULT_KIND_SESSION,
                 result_ref=self.session_id,
-                created_event_id=first_cancel_event_id,
-                created_event_sequence=first_cancel_event_sequence,
+                created_event_id=(
+                    first_active_cancel_event_id
+                    if first_active_cancel_event_id is not None
+                    else first_cancel_event_id
+                ),
+                created_event_sequence=(
+                    first_active_cancel_event_sequence
+                    if first_active_cancel_event_sequence is not None
+                    else first_cancel_event_sequence
+                ),
             ),
         )
         return SessionCancelResult(
@@ -1131,6 +1317,7 @@ class _CancelSessionRunsOperation:
                 session,
                 read_session_slot_by_session_id(transaction, self.session_id),
             ),
+            active_cancel_targets=tuple(active_cancel_targets),
             idempotent_replay=False,
             cancelled_run_count=len(targets),
         )
@@ -1142,7 +1329,7 @@ class _CancelSessionRunsOperation:
 
         :param transaction: 当前 Host transaction。
         :returns: 支持取消的目标元组。
-        :raises HostApiError: 存在 Phase 4 不支持的非终态 Run 时抛出。
+        :raises HostApiError: 存在当前不支持的非终态 Run 时抛出。
         """
 
         targets: list[_SupportedSessionCancelTarget] = []
@@ -1152,8 +1339,9 @@ class _CancelSessionRunsOperation:
                 raise HostApiError(
                     code=HostApiErrorCode.UNSUPPORTED_OPERATION,
                     message=(
-                        "cancel_session_runs supports only queued and "
-                        "pre-dispatch STARTING Runs in Phase 4"
+                        "cancel_session_runs supports only queued, pre-dispatch "
+                        "STARTING, and active worker Runs in the current Host "
+                        "cancel scope"
                     ),
                     retryable=False,
                 )
@@ -1173,6 +1361,8 @@ class _CancelSessionRunsOperation:
 
         if target.run.status == RunStatus.QUEUED:
             return self._cancel_queued_target(transaction, target.run)
+        if target.active_worker:
+            return self._cancel_active_target(transaction, target.run)
         return self._cancel_predispatch_target(transaction, target.run)
 
     def _cancel_queued_target(
@@ -1229,6 +1419,39 @@ class _CancelSessionRunsOperation:
                 cancel_request_event_id=cancel_request_event_id,
                 attempt_cancelled_event_id=self.id_factory.new_id(_EVENT_ID_PREFIX),
                 run_cancelled_event_id=self.id_factory.new_id(_EVENT_ID_PREFIX),
+                occurred_at=now,
+                actor=self.request.context.actor,
+                source=self.request.context.source,
+                client_request_id=self.request.client_request_id,
+                idempotency_key=self.request.client_request_id,
+                reason=self.request.reason,
+                mode=self.request.mode,
+                call_context_digest=_call_context_digest(self.request.context),
+            ),
+        )
+        _raise_for_session_cancel_transition_status(result)
+        return cancel_request_event_id
+
+    def _cancel_active_target(
+        self, transaction: HostTransaction, run: RunRow
+    ) -> str:
+        """请求取消一个 active worker Run。
+
+        :param transaction: 当前 Host transaction。
+        :param run: 已校验为 active worker 的 Run。
+        :returns: ``CANCEL_REQUESTED`` event id；已 CANCELLING 时返回未写入的候选 id。
+        :raises HostApiError: transition 失败时抛出。
+        """
+
+        now = self.clock.now()
+        cancel_request_event_id = self.id_factory.new_id(_EVENT_ID_PREFIX)
+        result = request_active_attempt_cancel_in_transaction(
+            transaction,
+            self.event_log_store,
+            CancelActiveAttemptInput(
+                run_id=run.run_id,
+                cancel_request_event_id=cancel_request_event_id,
+                run_cancelling_event_id=self.id_factory.new_id(_EVENT_ID_PREFIX),
                 occurred_at=now,
                 actor=self.request.context.actor,
                 source=self.request.context.source,
@@ -1760,18 +1983,20 @@ def _idempotent_cancel_result(
         attempt=_read_current_attempt(transaction, run),
         dispatch_record=_read_current_dispatch_record(transaction, run),
         promotion=None,
+        active_cancel_target=None,
         idempotent_replay=True,
         released_active_slot=False,
     )
 
 
 def _idempotent_session_cancel_result(
-    transaction: HostTransaction, record: IdempotencyRecord
+    transaction: HostTransaction, record: IdempotencyRecord, *, reason: str
 ) -> SessionCancelResult:
     """从幂等记录恢复 cancel_session_runs 结果。
 
     :param transaction: 当前 Host transaction。
     :param record: 已持久化幂等记录。
+    :param reason: 本次 replay 的取消原因，用于 best-effort 重新传播。
     :returns: 当前 Session snapshot；不会取消首次操作后新增的 Run。
     :raises HostApiError: 结果类型错误或 Session 缺失时抛出。
     """
@@ -1794,6 +2019,12 @@ def _idempotent_session_cancel_result(
             transaction,
             session,
             read_session_slot_by_session_id(transaction, session.session_id),
+        ),
+        active_cancel_targets=_active_cancelling_targets_for_session_replay(
+            transaction,
+            session.session_id,
+            record=record,
+            reason=reason,
         ),
         idempotent_replay=True,
         cancelled_run_count=0,
@@ -1848,10 +2079,119 @@ def _read_current_dispatch_record(
     return dispatch_record
 
 
+def _dispatch_record_is_direct_cancelable(
+    dispatch_record: DispatchRecordRow,
+) -> bool:
+    """判断 dispatch record 是否仍处于 worker accept 前 direct cancel 窗口。
+
+    :param dispatch_record: dispatch record row。
+    :returns: 可 direct cancel 时返回 ``True``。
+    """
+
+    if dispatch_record.status in (
+        DispatchRecordStatus.PENDING,
+        DispatchRecordStatus.WAITING_FOR_LANE,
+    ):
+        return True
+    return (
+        dispatch_record.status == DispatchRecordStatus.DISPATCHING
+        and dispatch_record.worker_accepted_at is None
+        and dispatch_record.worker_accept_event_id is None
+        and dispatch_record.worker_accept_event_sequence is None
+    )
+
+
+def _active_cancel_target_from_transition(
+    *, run: RunRow, attempt: AttemptRow | None, reason: str
+) -> ActiveCancelTarget | None:
+    """从 active cancel transition 结果提取 post-commit 传播目标。
+
+    :param run: transition 返回的 Run row。
+    :param attempt: transition 返回的 Attempt row。
+    :param reason: cancel reason。
+    :returns: active worker 目标；当前状态不需要传播时返回 ``None``。
+    """
+
+    if (
+        run.status != RunStatus.CANCELLING
+        or attempt is None
+        or attempt.status != AttemptStatus.RUNNING
+    ):
+        return None
+    return ActiveCancelTarget(
+        run_id=run.run_id,
+        attempt_id=attempt.attempt_id,
+        execution_id=attempt.execution_id,
+        reason=reason,
+    )
+
+
+def _active_cancel_target_for_session_target(
+    *, target: _SupportedSessionCancelTarget, reason: str
+) -> ActiveCancelTarget | None:
+    """从 session-scope cancel target 提取 post-commit active cancel 目标。
+
+    :param target: 已校验并执行取消的 session target。
+    :param reason: cancel reason。
+    :returns: active worker 目标；非 active worker 时返回 ``None``。
+    """
+
+    if not target.active_worker or target.attempt is None:
+        return None
+    return ActiveCancelTarget(
+        run_id=target.run.run_id,
+        attempt_id=target.attempt.attempt_id,
+        execution_id=target.attempt.execution_id,
+        reason=reason,
+    )
+
+
+def _active_cancelling_targets_for_session_replay(
+    transaction: HostTransaction,
+    session_id: str,
+    *,
+    record: IdempotencyRecord,
+    reason: str,
+) -> tuple[ActiveCancelTarget, ...]:
+    """读取 session cancel replay 可重新传播的同源 active CANCELLING 目标。
+
+    :param transaction: 当前 Host transaction。
+    :param session_id: Session id。
+    :param record: 首次 session cancel 的幂等记录。
+    :param reason: replay 请求中的 cancel reason。
+    :returns: 仍处于 active cancelling 的 worker 目标集合。
+    """
+
+    if record.created_event_id is None:
+        return ()
+    event = EventLogStore().read_event_by_id(transaction, record.created_event_id)
+    if event is None or event.session_id != session_id or event.run_id is None:
+        return ()
+    run = read_run_by_id(transaction, event.run_id)
+    if (
+        run is None
+        or run.session_id != session_id
+        or run.status != RunStatus.CANCELLING
+        or run.current_attempt_id is None
+    ):
+        return ()
+    attempt = read_attempt_by_id(transaction, run.current_attempt_id)
+    if attempt is None or attempt.status != AttemptStatus.RUNNING:
+        return ()
+    return (
+        ActiveCancelTarget(
+            run_id=run.run_id,
+            attempt_id=attempt.attempt_id,
+            execution_id=attempt.execution_id,
+            reason=reason,
+        ),
+    )
+
+
 def _session_cancel_target_for_run(
     transaction: HostTransaction, run: RunRow
 ) -> _SupportedSessionCancelTarget | None:
-    """判断 Run 是否属于 Phase 4 session-scope cancel 支持子集。
+    """判断 Run 是否属于当前 session-scope cancel 支持子集。
 
     :param transaction: 当前 Host transaction。
     :param run: 待判断的非终态 Run。
@@ -1864,13 +2204,16 @@ def _session_cancel_target_for_run(
             run=run,
             attempt=None,
             dispatch_record=None,
+            active_worker=False,
         )
-    if run.status != RunStatus.RUNNING:
+    if run.status in (RunStatus.WAITING, RunStatus.RECOVERING):
+        return None
+    if run.status not in (RunStatus.RUNNING, RunStatus.CANCELLING):
         return None
     if run.current_attempt_id is None:
         raise HostApiError(
             code=HostApiErrorCode.INTERNAL_ERROR,
-            message="Running Run has no current Attempt",
+            message="Active Run has no current Attempt",
             retryable=False,
         )
     attempt = read_attempt_by_id(transaction, run.current_attempt_id)
@@ -1880,17 +2223,29 @@ def _session_cancel_target_for_run(
     if attempt is None or dispatch_record is None:
         raise HostApiError(
             code=HostApiErrorCode.INTERNAL_ERROR,
-            message="Running Run current Attempt or dispatch record is missing",
+            message="Active Run current Attempt or dispatch record is missing",
             retryable=False,
         )
     if (
-        attempt.status == AttemptStatus.STARTING
-        and dispatch_record.status == DispatchRecordStatus.PENDING
+        run.status == RunStatus.RUNNING
+        and attempt.status == AttemptStatus.STARTING
+        and _dispatch_record_is_direct_cancelable(dispatch_record)
     ):
         return _SupportedSessionCancelTarget(
             run=run,
             attempt=attempt,
             dispatch_record=dispatch_record,
+            active_worker=False,
+        )
+    if (
+        run.status in (RunStatus.RUNNING, RunStatus.CANCELLING)
+        and attempt.status == AttemptStatus.RUNNING
+    ):
+        return _SupportedSessionCancelTarget(
+            run=run,
+            attempt=attempt,
+            dispatch_record=dispatch_record,
+            active_worker=True,
         )
     return None
 
@@ -2019,6 +2374,49 @@ def _require_event_sequence(
     return value
 
 
+def _require_event_sequence_if_present(
+    transaction: HostTransaction, event_log_store: EventLogStore, event_id: str
+) -> int | None:
+    """按 event id 读取可选 EventLog sequence。
+
+    active cancel 对已处于 ``CANCELLING`` 的 Run 不重复追加
+    ``CANCEL_REQUESTED``，因此调用方生成的候选 event id 可能不存在。
+
+    :param transaction: 当前 Host transaction。
+    :param event_log_store: EventLog store。
+    :param event_id: EventLog event id。
+    :returns: event sequence；事件未写入时返回 ``None``。
+    :raises HostApiError: sequence 类型异常时抛出。
+    """
+
+    event = event_log_store.read_event_by_id(transaction, event_id)
+    if event is None:
+        return None
+    value = event.event_sequence
+    if not isinstance(value, int):
+        raise HostApiError(
+            code=HostApiErrorCode.INTERNAL_ERROR,
+            message="EventLog sequence is invalid",
+            retryable=False,
+        )
+    return value
+
+
+def _is_terminal_run_status(status: RunStatus) -> bool:
+    """判断 Run 状态是否为终态。
+
+    :param status: Run 状态。
+    :returns: 是终态时返回 ``True``。
+    """
+
+    return status in (
+        RunStatus.SUCCEEDED,
+        RunStatus.FAILED,
+        RunStatus.CANCELLED,
+        RunStatus.LOST,
+    )
+
+
 def _raise_for_cancel_transition_status(
     result: DurableRunTransitionResult,
 ) -> None:
@@ -2039,7 +2437,7 @@ def _raise_for_cancel_transition_status(
         )
     raise HostApiError(
         code=HostApiErrorCode.INVALID_STATE,
-        message="Run state is not cancellable in Phase 3 admission",
+        message="Run state is not cancellable in Phase 5 admission",
         retryable=False,
     )
 
@@ -2064,7 +2462,7 @@ def _raise_for_session_cancel_transition_status(
         )
     raise HostApiError(
         code=HostApiErrorCode.UNSUPPORTED_OPERATION,
-        message="Run state is not supported by Phase 4 session cancel",
+        message="Run state is not supported by Phase 5 session cancel",
         retryable=False,
     )
 

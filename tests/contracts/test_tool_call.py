@@ -189,6 +189,31 @@ def test_batch_tool_execution_request_rejects_empty_calls() -> None:
         )
 
 
+def test_batch_tool_execution_request_rejects_duplicate_tool_call_id() -> None:
+    """批式工具执行请求必须拒绝重复 ``tool_call_id``。"""
+
+    first = ToolCallRequest(
+        tool_call_id="id-1",
+        name="get_value",
+        arguments={"k": "v"},
+        index_in_iteration=0,
+        provider_state=None,
+    )
+    duplicated = ToolCallRequest(
+        tool_call_id="id-1",
+        name="get_other_value",
+        arguments={"x": "y"},
+        index_in_iteration=1,
+        provider_state=None,
+    )
+
+    with pytest.raises(ValueError, match="unique"):
+        BatchToolExecutionRequest(
+            calls=(first, duplicated),
+            context=_make_valid_context(),
+        )
+
+
 def test_batch_tool_execution_request_accepts_non_empty_calls() -> None:
     """``calls`` 非空时构造合法。"""
 

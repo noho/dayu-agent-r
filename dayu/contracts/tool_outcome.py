@@ -111,8 +111,8 @@ class ToolCancelledOutcome:
 
         :returns: 无返回值。
         :raises ValueError: ``reason`` 不在
-            :data:`ALLOWED_TOOL_CANCELLED_REASONS` 内或 ``message``
-            为空 / 纯空白时抛出。
+            :data:`ALLOWED_TOOL_CANCELLED_REASONS` 内，或 ``message`` /
+            ``hint`` 为空 / 纯空白时抛出。
         """
 
         if self.reason not in ALLOWED_TOOL_CANCELLED_REASONS:
@@ -122,6 +122,8 @@ class ToolCancelledOutcome:
             )
         if self.message.strip() == "":
             raise ValueError("ToolCancelledOutcome.message must be non-empty")
+        if self.hint is not None and self.hint.strip() == "":
+            raise ValueError("ToolCancelledOutcome.hint must be non-empty")
 
 
 ToolExecutionOutcome: TypeAlias = (

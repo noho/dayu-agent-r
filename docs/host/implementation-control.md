@@ -218,6 +218,19 @@ Phase Map 中每个 phase 必须使用统一条目格式。模板如下：
 - 每个 phase 产生的潜在影响、未覆盖项、deferred risk、后续 phase 依赖和明确不做项，必须回写到本文档的追踪区；
   不得只保留在对话、临时 artifact 或 phase plan 中。
 
+## 当前状态
+
+Phase 5 `RunInputBuilder 与本地执行 Dispatch` 已完成。PR 54
+`Host Phase 5 RunInputBuilder and local dispatch` 已完成 Phase 5 aggregate review、PR review fix、追加并行 review、全仓 review
+与 P1-P5 corrected design conformance review；最近一次 corrected gate 的 AgentMiMo、AgentDS、AgentCodex 三路 verdict 均为
+PASS，blocking design deviation 为 0。Controller adjudication artifact 为
+`docs/reviews/p1-p5-design-conformance-review-controller-adjudication-20260515.md`。
+
+当前不处于 implementation / fix gate；没有 accepted blocking finding 待修。用户手工 merge PR 54 后，下一步按 `$phaseflow`
+推进 Phase 6 `ToolRuntime / Truncation / fetch_more / Duplicate Governance`。需要继续追踪的 non-blocking hardening、
+deferred capability 与后续 phase owner 已写入 `Open Questions 与风险追踪` 的
+`PR 54 / P1-P5 corrected review 残余风险追踪`，进入 P6 前必须作为 phase discussion / plan 输入。
+
 ## Phase Map
 
 Phase 按依赖关系推进：先实现被其它阶段依赖的公共契约、runtime 基础能力、durable store、EventLog 与状态机，再连接执行路径、工具治理、projection core、memory、context governance、recovery 与 remote。Audit、Tool Trace、Outbox 是独立 projection sinks，后置到核心治理路径稳定之后实现。Phase 0 是 Engine cleanup 前置 work unit，只阻塞 Phase 10 Context Governance，不阻塞 Phase 1-9。每个 phase 开始时仍必须先和用户讨论并细化对应 `docs/host/design.md` 章节，再生成 handoff implementation-ready plan。
@@ -581,6 +594,9 @@ Phase 按依赖关系推进：先实现被其它阶段依赖的公共契约、ru
 - 必须确认 `AgentRunRequest.messages` 由 canonical facts 重建，不读取 UI 临时文本。
 - 必须确认 lane acquire 后 recheck / dispatching / ATTEMPT_RUNNING 的精确 transaction 边界。
 - 必须确认 EngineEvent terminal / non-terminal / stream EOF 的 Host 收口规则。
+- 已确认 Engine 公共 `EngineEvent` 契约不携带 Host Attempt identity；`attempt_id + execution_id` 由 Host-owned LocalProxy / EngineWorker envelope 绑定并在 Host ingest 边界校验。
+- 已确认 Phase 5 fresh schema / typed enum 必须扩展 dispatch record 状态到至少 `pending`、`waiting_for_lane`、`dispatching`、`cancelled`；这些状态只表达 dispatch 诊断与重复派发抑制，不表达 lease / fencing / Attempt owner。
+- 已确认 Phase 5 不实现 ToolRuntime governance、wait record 或 `resolve_wait`；`tool_awaiting` / `run_suspended` 不得在本 phase 创建 `WAITING` canonical truth。
 
 交付物：
 - phase design refinement
@@ -1300,7 +1316,7 @@ Phase 按依赖关系推进：先实现被其它阶段依赖的公共契约、ru
 - P3-S3 / P3-S4 owner 必须填充并验证 `SessionSnapshot.active_run_id` 与 `queued_run_ids` 对 Run / Attempt 写入、admission 与 queue 状态的读取语义；P3-S2 只提供读取 helper。
 - P3-S4 admission owner 必须覆盖 closed Session 拒绝新 Run / follow-up 的行为；P3-S2 只负责关闭 Session row，不实现 admission。
 - P3-S4 / EngineEvent ingest owner 必须补充 FAILED / LOST terminal closeout 的 higher-level 覆盖；P3-S3 已提供具体 terminal event type 映射与低层 helper。
-- P3-S4 / Phase 5 cancel owner 必须补充 dispatch 非 pending、dispatching / running cancel 的 higher-level 覆盖；P3-S3 只覆盖 pre-dispatch pending cancel。
+- P3-S4 / Phase 5 cancel owner 已补充 dispatch 非 pending、dispatching / running cancel 的 higher-level 覆盖；P3-S3 只覆盖 pre-dispatch pending cancel。
 - P3-S4 admission owner 必须覆盖 admission idempotency、after-commit promotion / wakeup 与多进程 active race；P3-S3 只提供低层 transaction primitives。
 - P3-S5 owner 必须接入 terminal / cancel 后自动 promotion trigger；P3-S4 只定义 no-op / test wakeup port 与显式 `promote_next_queued_run`。
 - P3-S6 owner 已补充多进程 admission race、idempotency race 与 queue promotion race；P3-S4 只覆盖 slice 内并发 promotion at-most-one。
@@ -1309,11 +1325,11 @@ Phase 按依赖关系推进：先实现被其它阶段依赖的公共契约、ru
 - Phase 4 public API owner 必须在 public command facade wiring 后补充 API 级 queued cancel / promotion race 覆盖；P3-S6 只验证内部 durable first-committer-wins，不覆盖 public facade 入口。
 - Phase 4 public API owner 必须澄清 `attach_active` 的 public audit / read-model 表达：若需要把 attach-active request 作为可查询事实呈现，必须先更新 `docs/host/design.md` 明确 canonical event shape，不能在 Phase 3 PR fix 中临时发明 EventLog 事件。
 - Phase 4 public API owner 必须按 design fix 固定 `FollowupSnapshot.accepted_run_id` / `accepted_run_status`、`HostApiErrorCode.UNSUPPORTED_OPERATION`、受限 typed `HostApiError.detail`、`stream_run_events` cursor contract 与 deferred facade 行为矩阵。
-- Phase 4 `cancel_session_runs` 只允许实现 queued / pre-dispatch `STARTING` 子集；Phase 5 / 7 / 11 owner 必须在各自 phase 补齐 dispatching / active worker、`WAITING`、`RECOVERING` 的完整 session-scope cancel 能力。
+- Phase 4 `cancel_session_runs` 只允许实现 queued / pre-dispatch `STARTING` 子集；Phase 5 已补齐 dispatching / active worker session-scope cancel 子集，`WAITING` 与 `RECOVERING` 的完整 session-scope cancel 能力仍分别由 Phase 7 / 11 接收。
 - Phase 4 repo-review follow-up 已修复 admission-backed public facade 关闭 handle 后绕过 lifecycle guard 的问题；`retry_run`、`replay_run`、`resolve_wait`、`purge_session` 当前仍是 stable unsupported deferred facade，不接触 admission service 或 durable store。该 residual risk 由本总控追踪区持有：当前不作为 Phase 4 follow-up fix scope；若后续公共契约要求所有 deferred facade 在 closed handle 后也优先返回 `HostApiErrorCode.INVALID_STATE`，必须作为新的 Host public API contract work unit 进入独立 Gateflow，并由对应 deferred capability owner 先回写 `docs/host/design.md` 与 phase plan。
-- Phase 5 / later dispatch owner 必须补充 dispatch 非 pending、dispatching / active worker cancel propagation、wait cancellation 与 recovery cancellation；P3-S5 只覆盖 queued cancel 与 pre-dispatch STARTING cancel。
-- Phase 5. RunInputBuilder 与本地执行 Dispatch owns scheduler、lane acquire、dispatch record `dispatching`、WorkerProxy / LocalProxy、Engine dispatch、`ATTEMPT_RUNNING` 与 EngineEvent ingest startup 边界。
-- Phase 5 scheduler / wakeup owner 必须定义 after-commit promotion 独立事务失败后的重试或扫描路径；Phase 3 只保证失败不会回滚已提交的 terminal / cancel 主事务，queued Run 可留待后续 wakeup。
+- Phase 5 / later dispatch owner 已补充 dispatch 非 pending、dispatching / active worker cancel propagation；wait cancellation 与 recovery cancellation 仍分别由 Phase 7 / 11 接收。
+- Phase 5. RunInputBuilder 与本地执行 Dispatch 已完成 scheduler、lane acquire、dispatch record `dispatching`、WorkerProxy / LocalProxy、Engine dispatch、`ATTEMPT_RUNNING` 与 EngineEvent ingest startup 边界。
+- Phase 5 scheduler / wakeup owner 已接入 terminal closeout 后的 queue promotion 独立事务与 scheduler wakeup；after-commit promotion 的重试 / 扫描 hardening 仍由 Phase 11 lifecycle / recovery 接收。
 - Phase 7 Tool Awaiting / resolve_wait owner 必须接入 `WAITING` Run closeout 语义；Phase 3 的 `terminal_run_row` 仅为后续 wait resolve 路径预留 `WAITING` CAS 源状态，Phase 3 调用方只传 `RUNNING`。
 - Phase 11. Host Lifecycle / Recovery / Multi-process Hardening owns dispatch record recovery join、positive orphan proof、RECOVERING dispatch、startup recovery scan 与多进程 hardening。
 - Phase 11. Host Lifecycle / Recovery / Multi-process Hardening owns SQLite 多进程 busy / retry 策略的长期 hardening；Phase 3 只验证当前 modest process count 下的 correctness invariant。
@@ -1377,7 +1393,7 @@ Phase 按依赖关系推进：先实现被其它阶段依赖的公共契约、ru
 
 - Phase 3. Session / Run / Attempt 状态机与 Admission 必须提供 Run / Attempt / Session 状态迁移单元测试。
 - Phase 2. Durable Store / EventLog / Payload Foundation 必须提供 SQLite transaction、CAS、唯一约束、多进程竞争和 crash recovery foundation 测试。
-- Phase 5. RunInputBuilder 与本地执行 Dispatch 必须提供 WorkerProxy fake integration；Phase 14. RemoteProxy / RemoteStub 必须提供迟到事件、断连、重发和 accept ack 测试。
+- Phase 5. RunInputBuilder 与本地执行 Dispatch 已提供 WorkerProxy fake integration；Phase 14. RemoteProxy / RemoteStub 必须提供迟到事件、断连、重发和 accept ack 测试。
 - Phase 6. ToolRuntime / Truncation / fetch_more / Duplicate Governance 必须提供外部业务 `ToolBundle` 输入、attempt-local effective `ToolBundle`、`fetch_more` 注入、tool fact accept barrier、truncate / fetch_more、重复工具调用治理和 side-effect policy 测试。
 - Phase 8. Projection Core / Host Event Stream / Minimal Read Model 必须提供 EventLog replay、checkpoint、Host event stream、minimal read model 的幂等追平测试；Phase 13. Audit / Tool Trace / Outbox Projections 必须提供 Outbox、audit、usage、tool trace 的幂等追平测试。
 - Phase 11. Host Lifecycle / Recovery / Multi-process Hardening 必须提供 Host restart、positive orphan proof、LOST / RECOVERABLE_LOST、prompt 已 accepted 但 answer 未返回的恢复测试。
@@ -1428,7 +1444,30 @@ Phase 按依赖关系推进：先实现被其它阶段依赖的公共契约、ru
 - Host 外部 Service / UI 后续 work unit 必须覆盖：客户端在线已展示 final answer 后离线重连，从 Outbox 读取增量时不会重复显示同一 terminal answer。
 - Host 外部 UI 显示聊天记录必须按 terminal identity upsert / dedupe，不得按 final answer 文本内容去重。
 
-## 当前状态
+#### PR 54 / P1-P5 corrected review 残余风险追踪
+
+结论：
+
+- PR 54 已完成 Phase 5 aggregate review、PR review fixes、追加并行 review、全仓 review、P5-only design conformance review 与 P1-P5 corrected design conformance review。
+- P1-P5 corrected design conformance review 已确认当前全部代码 snapshot 未发现 blocking 设计偏离。
+- PR 54 当前不需要进入新的 fix gate；draft PR 仍处于 review-ready 状态。
+
+追踪项：
+
+- `accept_worker_running_in_transaction` 诊断 payload 弱于 scheduler 生产路径；owner 为 Host durable transition hardening。
+- `mark_dispatching_after_lane_row` 底层 helper 能力宽于生产 scheduler 路径；owner 为 Host durable API tightening。
+- `DEFAULT_ACTIVE_WORKER_REGISTRY` module-level singleton 的多 handle cancel 边界风险；owner 为 Host dispatch lifecycle hardening。
+- terminal closeout 后 queue promotion wakeup failure 的诊断 / 抑制策略；owner 为 Host dispatch lifecycle hardening。
+- active cancel watchdog、stuck `CANCELLING` 与 orphan recovery；owner 为 Phase 11. Host Lifecycle / Recovery / Multi-process Hardening。
+- RemoteProxy 语义与远端迟到事件治理；owner 为 Phase 14. RemoteProxy / RemoteStub。
+- ToolRuntime / `fetch_more` canonical tool fact accept path；owner 为 Phase 6. ToolRuntime / Truncation / fetch_more / Duplicate Governance。
+- `WAITING` / `resolve_wait` 与 wait cancellation；owner 为 Phase 7. Tool Awaiting / resolve_wait / Wait Adapter。
+- Memory、Context Governance 与 compact artifact 真实 provider 接线；owner 分别为 Phase 9. Memory 与 Phase 10. Context Governance / Compaction。
+- runtime lane repeated outer cancellation、untracked release failure 与 idle scheduler sleeping task；owner 为后续 runtime cancellation precision / Host dispatch lifecycle hardening。
+- Engine runner injection / provider abstraction design；owner 为后续 Engine composition / provider abstraction design。
+- God module / class cleanup 与 broader test hardening；owner 为后续 architecture / test hardening。
+
+## 历史记录
 
 P0：Engine Context Compaction Event 语义前置已完成 implementation 与 review loop；P0-S1 accepted slice commit 为 `ad6d116`，P0-S2 accepted slice commit 为 `6f6e716`。P0 后续状态进入 push / PR 路径，不再是当前 Host phase design gate。
 
@@ -1527,6 +1566,234 @@ terminal `RunSnapshot` 语义不一致；验证为
 destination。Phase 5 进入前必须先做 phase discussion / design refinement，确认 RunInputBuilder typed provider、
 lane acquire 后 recheck / dispatching / `ATTEMPT_RUNNING` transaction 边界，以及 EngineEvent terminal /
 non-terminal / stream EOF 收口规则。
+
+Phase 5 design discussion 已确认以下 design refinement 决策，并写入
+`docs/reviews/gateflow-phase-design-host-p5-codex-20260514.md` 与 `docs/host/design.md`：Engine 公共
+`EngineEvent` 契约保持 Host-agnostic，`attempt_id + execution_id` 由 Host-owned LocalProxy / EngineWorker
+envelope 绑定并在 Host ingest 边界校验；Phase 5 fresh schema / typed enum 必须扩展 dispatch record 状态到至少
+`pending`、`waiting_for_lane`、`dispatching`、`cancelled`；Phase 5 只允许 no-tool 或最小 fake ToolExecutor 支撑本地
+Engine 执行闭环，不实现 ToolRuntime governance、wait record 或 `resolve_wait`，`tool_awaiting` / `run_suspended`
+不得在本 phase 创建 `WAITING` canonical truth。当前 gate 为 Phase 5 design re-review；需要 AgentMiMo 与 AgentDS
+独立 review 后由 controller 裁决，blocking finding 修复并 re-review 通过后才进入 Phase 5 plan gate。
+Phase 5 design re-review artifacts 为 `docs/reviews/gateflow-phase-design-re-review-host-p5-mimo-20260514.md` 与
+`docs/reviews/gateflow-phase-design-re-review-host-p5-ds-20260514.md`。Controller adjudication artifact 为
+`docs/reviews/gateflow-phase-design-re-review-host-p5-controller-adjudication-20260514.md`：AgentMiMo 无 blocking
+finding；AgentDS F1 / F2 已裁决为 accepted-blocking，分别要求补齐本地执行异常 terminal closeout 判定表，以及
+`dispatching + Attempt STARTING` 且 WorkerProxy 尚未 accepted 窗口内的 cancel / lane token owner 语义。
+Design fix artifact 为 `docs/reviews/gateflow-phase-design-fix-host-p5-codex-20260514.md`；fix 已写回
+`docs/host/design.md` §17 / §22。当前 gate 为 Phase 5 design fix re-review；F1 / F2 经 re-review 确认 fixed 后才可进入
+Phase 5 plan gate。DS F3-F6 与 MiMo observation findings 已裁决为 plan-gate 检查项，不阻塞 design fix re-review。
+Phase 5 design fix re-review 已由 AgentMiMo 与 AgentDS 完成，artifacts 分别为
+`docs/reviews/gateflow-phase-design-fix-re-review-host-p5-mimo-20260514.md` 与
+`docs/reviews/gateflow-phase-design-fix-re-review-host-p5-ds-20260514.md`；两者均确认 DS F1 / F2 fixed，且无新
+blocking finding。Controller fix re-review adjudication artifact 为
+`docs/reviews/gateflow-phase-design-fix-re-review-host-p5-controller-adjudication-20260514.md`。当前 gate 为 Phase 5
+handoff implementation-ready plan；plan 必须把 DS F3-F6 与 MiMo observations 作为 plan review 检查项显式覆盖。
+Phase 5 handoff implementation-ready plan 已写入
+`docs/host/phase5-runinputbuilder-local-dispatch-plan.md`。Plan review artifacts 为
+`docs/reviews/gateflow-plan-review-host-p5-runinputbuilder-local-dispatch-mimo-20260514.md` 与
+`docs/reviews/gateflow-plan-review-host-p5-runinputbuilder-local-dispatch-ds-20260514.md`；两份 review 均无 blocking
+finding。Controller plan review adjudication artifact 为
+`docs/reviews/gateflow-plan-review-host-p5-runinputbuilder-local-dispatch-controller-adjudication-20260514.md`，已裁决
+MiMo F001-F006 与 DS F-N1 / F-N2 为 plan-fix items。Plan fix artifact 为
+`docs/reviews/gateflow-plan-fix-host-p5-runinputbuilder-local-dispatch-codex-20260514.md`。Plan fix re-review artifacts 为
+`docs/reviews/gateflow-plan-re-review-host-p5-runinputbuilder-local-dispatch-mimo-20260514.md` 与
+`docs/reviews/gateflow-plan-re-review-host-p5-runinputbuilder-local-dispatch-ds-20260514.md`；两者均确认所有 plan findings
+fixed、无新 blocker。Controller plan re-review adjudication artifact 为
+`docs/reviews/gateflow-plan-re-review-host-p5-runinputbuilder-local-dispatch-controller-adjudication-20260514.md`。Phase 5
+accepted plan commit 为 `bacc4e7`。
+P5-S1 Dispatch Schema And Transition Primitives 已完成 implementation、code review、accepted fix 与 code re-review。
+Implementation artifact 为 `docs/reviews/gateflow-implementation-host-p5-s1-dispatch-schema-transitions-20260514.md`；code review
+artifacts 为 `docs/reviews/gateflow-code-review-host-p5-s1-dispatch-schema-transitions-mimo-20260514.md` 与
+`docs/reviews/gateflow-code-review-host-p5-s1-dispatch-schema-transitions-ds-20260514.md`。DS M1 / MiMo F2 已由
+`docs/reviews/gateflow-fix-host-p5-s1-dispatch-schema-transitions-20260514.md` 修复，并由
+`docs/reviews/gateflow-code-re-review-host-p5-s1-dispatch-schema-transitions-mimo-20260514.md` 与
+`docs/reviews/gateflow-code-re-review-host-p5-s1-dispatch-schema-transitions-ds-20260514.md` 确认 fixed / no new blocker。
+Controller re-review adjudication artifact 为
+`docs/reviews/gateflow-code-re-review-host-p5-s1-dispatch-schema-transitions-controller-adjudication-20260514.md`。P5-S1 validation：
+`pytest tests/host/test_state_schema.py tests/host/test_run_attempt_transitions.py tests/host/test_weak_typing_guard.py -q`
+34 passed，`python -m pyright dayu/host tests/host` 0 errors，`git diff --check` passed。P5-S1 accepted slice commit 为
+`8ad5f10`。P5-S1 residual risk：`ATTEMPT_RUNNING` payload 的 `local_worker_id`、`worker_accepted_at`、`lane_name`
+与 `lane_claim_id` 由 P5-S3 LocalProxy / scheduler 接入时补齐。
+P5-S2 RunInputBuilder And No-tool Provider Boundary 已完成 implementation 与 code review。Implementation artifact 为
+`docs/reviews/gateflow-implementation-host-p5-s2-runinputbuilder-no-tool-provider-20260514.md`；code review artifacts 为
+`docs/reviews/gateflow-code-review-host-p5-s2-runinputbuilder-no-tool-provider-mimo-20260514.md` 与
+`docs/reviews/gateflow-code-review-host-p5-s2-runinputbuilder-no-tool-provider-ds-20260514.md`。两份 review 均无
+blocking finding；Controller adjudication artifact 为
+`docs/reviews/gateflow-code-review-host-p5-s2-runinputbuilder-no-tool-provider-controller-adjudication-20260514.md`。P5-S2 validation：
+`pytest tests/host/test_run_input_builder.py tests/host/test_package_exports.py tests/host/test_weak_typing_guard.py -q`
+11 passed，`python -m pyright dayu/host tests/host` 0 errors，`git diff --check` passed。P5-S2 accepted slice commit 为
+`411e01e`。P5-S2 residual risks：artifact-backed current prompt loading 未实现，当前 builder 要求 durable `display_text`；
+Memory / compact / ToolRuntime real providers 分别由 Phase 9 / 10 / 6 接入；LocalProxy / scheduler 创建真实
+`AttemptDispatchSnapshot` 属于 P5-S3。
+P5-S3 Dispatch Scheduler, Lane And LocalProxy 已完成 implementation、code review、controller 裁决、README / tests README
+同步与 accepted slice commit。Implementation artifact 为
+`docs/reviews/gateflow-implementation-host-p5-s3-dispatch-scheduler-localproxy-20260514.md`；code review artifacts 为
+`docs/reviews/gateflow-code-review-host-p5-s3-dispatch-scheduler-localproxy-mimo-20260515.md` 与
+`docs/reviews/gateflow-code-review-host-p5-s3-dispatch-scheduler-localproxy-ds-20260514.md`；controller adjudication artifact 为
+`docs/reviews/gateflow-code-review-host-p5-s3-dispatch-scheduler-localproxy-controller-adjudication-20260514.md`。两份 review
+均无 blocking finding，Controller 裁决接受此 slice。P5-S3 validation：
+`pytest tests/host/test_dispatch_scheduler.py tests/host/test_local_proxy_engine_ingest.py tests/host/test_command_handle.py tests/runtime/test_lane.py -q`
+27 passed；`pytest tests/host/test_package_exports.py tests/host/test_weak_typing_guard.py -q` 6 passed；`python -m pyright dayu/host tests/host`
+0 errors；`git diff --check` passed。P5-S3 accepted slice commit 为 `659a8e4`。P5-S3 residual risks：
+`HostCommandHandleOptions.local_execution` 已 typed 且默认为 no-op，但 command-handle scheduler lifecycle wiring 尚未接入；
+`_NeverCancelledToken` 仍是 P5-S3 占位，run-local cancellation token propagation 属于 P5-S5；scheduler close pending acquire /
+active worker cancel 覆盖需随 P5-S5 或 lifecycle wiring scope 补齐；`_consume_worker_events` 当前只 drain / release lane，EngineEvent
+ingest mapping 和 terminal closeout 属于 P5-S4。
+P5-S4 EngineEvent Ingest Mapping And Terminal Closeout 已完成 implementation、code review、blocking fix、code re-review、
+controller 裁决、README / tests README 同步与 accepted slice commit。Implementation artifact 为
+`docs/reviews/gateflow-implementation-host-p5-s4-engine-event-ingest-20260515.md`；code review artifacts 为
+`docs/reviews/gateflow-code-review-host-p5-s4-engine-event-ingest-mimo-20260515.md` 与
+`docs/reviews/gateflow-code-review-host-p5-s4-engine-event-ingest-ds-20260515.md`。MiMo B1 已裁决为 accepted blocking：
+duplicate terminal replay 必须重试 queue promotion wakeup；fix artifact 为
+`docs/reviews/gateflow-fix-host-p5-s4-engine-event-ingest-20260515.md`。Code re-review artifacts 为
+`docs/reviews/gateflow-code-re-review-host-p5-s4-engine-event-ingest-mimo-20260515.md` 与
+`docs/reviews/gateflow-code-re-review-host-p5-s4-engine-event-ingest-ds-20260515.md`；两者均确认 B1 fixed 且无新 blocker。
+Controller re-review adjudication artifact 为
+`docs/reviews/gateflow-code-re-review-host-p5-s4-engine-event-ingest-controller-adjudication-20260515.md`。P5-S4 validation：
+`pytest tests/host/test_engine_ingest_mapping.py tests/host/test_phase5_local_execution_integration.py tests/host/test_weak_typing_guard.py -q`
+11 passed；`python -m pyright dayu/host tests/host` 0 errors；`git diff --check` passed。P5-S4 accepted slice commit 为
+`ab256d1`。P5-S4 controlled scope expansion：`dayu/host/durable/state.py` 新增 `cancel_cancelling_run_row` 与
+`cancel_running_attempt_row`，虽不在原 P5-S4 allowed files，但经 MiMo、DS 与 controller 裁决为正确 durable state row CAS
+ownership，优于在 `run_transition.py` 直接写 SQL。P5-S4 residual risks：preview、unsupported waiting、provider protocol
+error、terminal-late 与 run_cancelled-without-active-cancel 负例可由后续测试 hardening 补齐。
+P5-S5 Active Cancel And Session-scope Cancel 已完成 implementation、code review、accepted fix、code re-review、controller
+裁决、README / tests README 同步与 accepted slice commit。Implementation artifact 为
+`docs/reviews/gateflow-implementation-host-p5-s5-active-cancel-session-scope-20260515.md`；code review artifacts 为
+`docs/reviews/gateflow-code-review-host-p5-s5-active-cancel-session-scope-mimo-20260515.md` 与
+`docs/reviews/gateflow-code-review-host-p5-s5-active-cancel-session-scope-ds-20260515.md`。DS Finding 1 与 MiMo F2 已裁决为
+accepted fix items：测试不得以非法裸 SQL 组合伪造 active worker，scheduler 连接 `EngineEventIngestor` 时必须提供实际
+queue promotion wakeup port；fix artifact 为
+`docs/reviews/gateflow-fix-host-p5-s5-active-cancel-session-scope-20260515.md`。Code re-review artifacts 为
+`docs/reviews/gateflow-code-re-review-host-p5-s5-active-cancel-session-scope-mimo-20260515.md` 与
+`docs/reviews/gateflow-code-re-review-host-p5-s5-active-cancel-session-scope-ds-20260515.md`；两者均 PASS 且无 blocking
+finding。Controller re-review adjudication artifact 为
+`docs/reviews/gateflow-code-re-review-host-p5-s5-active-cancel-session-scope-controller-adjudication-20260515.md`。P5-S5
+validation：`pytest tests/host/test_active_cancel_dispatch.py tests/host/test_public_cancel_session_runs.py tests/host/test_public_run_api.py -q`
+22 passed；`python -m pyright dayu/host tests/host` 0 errors；`git diff --check` passed。P5-S5 accepted slice commit 为
+`cdde31d`。P5-S5 residual risks：active cancel watchdog 仍未实现，worker 收到 cancel 后若长期不产出 terminal，Run 可能停留在
+`CANCELLING`；session cancel replay 的 active target truth 仍锚定首个 active cancel event，当前单 active Run invariant 下非
+blocking，若未来扩展多 active 语义必须重设 replay target truth；`cancel_run` 幂等重放不重传播 active cancel target，留给后续
+lifecycle / recovery hardening；terminal 后 queue promotion wakeup 失败目前会浮出 worker event task，`finally` 仍负责 unregister /
+close / release lane，后续可补 diagnostic suppression。
+P5-S6 Integration, Docs And Validation Closeout 已完成 implementation、code review、controller 裁决、README / tests README
+同步与 accepted slice commit。Implementation artifact 为
+`docs/reviews/gateflow-implementation-host-p5-s6-integration-docs-validation-20260515.md`。P5-S6 controlled scope expansions：
+`dayu/host/dispatch.py` 纳入本 slice，用于修复 scheduler worker stream clean EOF / stream exception 未调用
+`EngineEventIngestor.close_clean_eof` / `close_worker_lost` 的真实生产缺口；`tests/host/test_admission_queue.py`、
+`tests/host/test_durable_schema.py`、`tests/host/test_run_attempt_transitions.py` 纳入本 slice，用于把 Phase 3-era 断言迁移到
+Phase 5 accepted truth，而不是在生产代码中保留兼容逻辑。Code review artifacts 为
+`docs/reviews/gateflow-code-review-host-p5-s6-integration-docs-validation-mimo-20260515.md` 与
+`docs/reviews/gateflow-code-review-host-p5-s6-integration-docs-validation-ds-20260515.md`；两者均 PASS 且无 blocking
+finding。Controller adjudication artifact 为
+`docs/reviews/gateflow-code-review-host-p5-s6-integration-docs-validation-controller-adjudication-20260515.md`。P5-S6 validation：
+`pytest tests/host/test_phase5_local_execution_integration.py tests/host/test_import_boundary.py -q` 14 passed；controlled expansion
+targeted tests 4 passed；`pytest tests/host tests/runtime -q` 334 passed；`python -m pyright dayu/host tests/host` 0 errors；
+`python -m pyright dayu/ tests/ utils/` 0 errors；`git diff --check` passed。P5-S6 accepted slice commit 为 `2a1e0db`。
+P5-S6 residual risks：真实 provider runner 的外部网络 / provider API smoke 不属于 Phase 5 必测；active cancel watchdog 和
+post-cancel timeout policy 仍留给后续 lifecycle / recovery hardening；ToolRuntime / `fetch_more` 归 Phase 6，`WAITING` /
+`resolve_wait` 归 Phase 7，Memory 归 Phase 9，Context Governance 归 Phase 10，Recovery 归 Phase 11，Observer / Sink
+归 Phase 13，RemoteProxy 归 Phase 14。
+Phase 5 aggregate deepreview 已完成。Aggregate deepreview artifacts 为
+`docs/reviews/gateflow-aggregate-deepreview-host-p5-local-dispatch-mimo-20260515.md` 与
+`docs/reviews/gateflow-aggregate-deepreview-host-p5-local-dispatch-ds-20260515.md`；两份独立 review 均 PASS 且无
+blocking finding。Controller aggregate adjudication artifact 为
+`docs/reviews/gateflow-aggregate-deepreview-host-p5-local-dispatch-controller-adjudication-20260515.md`。Controller aggregate
+validation baseline：`pytest tests/host tests/runtime -q` 334 passed；`python -m pyright dayu/host tests/host` 0 errors；
+`python -m pyright dayu/ tests/ utils/` 0 errors；`git diff --check` passed。Phase 5 accepted aggregate review commit 为
+`ae86a0a`。Phase 5 状态为 completed；ready-to-create-PR 已执行，PR 54
+`https://github.com/noho/dayu-agent-r/pull/54` 已创建为 draft PR，title 为 `Host Phase 5 RunInputBuilder and local dispatch`，
+head branch 为 `feat/host-phase5-local-dispatch`，base branch 为 `main`。PR readiness：所有 Phase 5 design refinement、
+plan、6 个 implementation slices、code review、fix / re-review、aggregate deepreview、controller 裁决、accepted local commits、
+branch push 与 draft PR create 均已完成并记录 artifact / commit hash / PR URL；工作区检查为 clean；剩余风险均已有后续
+owner。后续 Phase 6 / 7 / 9 / 10 / 11 / 13 / 14 以及集成环境验证必须继续接收各自 deferred 项。
+PR 54 手工 review gate 已打开。当前可见手工 review artifacts 为
+`docs/reviews/pr-54-review-20260515-1056.md` 与 `docs/reviews/pr-54-review-20260515-1102.md`；用户说明共有 3 份手工
+review，但 GitHub PR API / thread-aware fetch 与本地文件搜索当前只发现 2 份，第三份暂记为 missing evidence，后续出现时必须追加处理。
+Controller PR review adjudication artifact 为 `docs/reviews/pr-54-review-controller-adjudication-20260515.md`。裁决结论：
+PR 54 退出 ready 状态并进入 PR review fix gate；dispatch / lane / worker lifecycle、Engine ingest idempotency、
+RunInputBuilder message semantics、Phase 5 supported integration tests 与 `HostCommandHandleOptions.local_execution` root-cause
+decision 均为当前 gate 必须处理的 accepted items；schema v2 -> v3 旧库迁移按 fresh schema 约束 rejected；active cancel watchdog、
+default worker hard cancel、retry / replay failure-context projection 等仍保留后续 owner。当前 gate 为 PR 54 review fix。
+PR 54 review fix 已完成。Fix artifact 为
+`docs/reviews/pr-54-review-fix-host-p5-local-dispatch-codex-20260515.md`，accepted fix commit 为 `310c812`。Re-review
+artifacts 为 `docs/reviews/pr-54-review-fix-re-review-host-p5-local-dispatch-mimo-20260515.md` 与
+`docs/reviews/pr-54-review-fix-re-review-host-p5-local-dispatch-ds-20260515.md`；两份 re-review 均 PASS 且无 blocking
+finding。Controller re-review adjudication artifact 为
+`docs/reviews/pr-54-review-fix-re-review-controller-adjudication-20260515.md`。Controller validation：`pytest tests/host/test_public_contracts.py tests/host/test_command_handle.py tests/host/test_dispatch_scheduler.py tests/host/test_engine_ingest_mapping.py tests/host/test_run_input_builder.py tests/host/test_state_schema.py tests/host/test_run_attempt_transitions.py -q`
+103 passed；`pytest tests/host tests/runtime -q` 356 passed；`python -m pyright dayu/host tests/host` 0 errors；
+`python -m pyright dayu/ tests/ utils/` 0 errors；`git diff --check` passed。当前 PR 54 review gate 状态为 accepted；
+PR 54 draft branch 已 push，current gate 为 PR 54 draft review-ready。剩余风险均有 owner：active cancel watchdog、pre-registration cancel
+retry / watchdog 与 durable-unavailable recovery 归 Phase 11；ToolRuntime canonical tool facts 归 Phase 6；RunInputBuilder
+读事务一致性与 recoverable RUN_FAILED diagnostic 顺序为后续 cleanup，不阻塞当前 PR。
+PR 54 追加本地并行 review gate 已完成。新增 review artifacts 为
+`docs/reviews/pr-54-review-20260515-1221.md` 与 `docs/reviews/pr-54-review-20260515-1224.md`；Controller additional
+adjudication artifact 为 `docs/reviews/pr-54-review-additional-controller-adjudication-20260515.md`。裁决结论：A1-A10
+accepted current fix，覆盖 `_consume_worker_events` pre-event 资源释放、preview event data 类型校验、RunInputBuilder
+dispatchable 状态校验、`AttemptDispatchSnapshot` cancellation token 校验、active Run terminal CAS-lost 分类、terminal input
+异常契约、scheduler close handle ownership、Default LocalProxy close 语义、LocalProxy 真实 Engine 边界错误路径测试，以及 Host
+import boundary 禁止 `dayu.config`。Fix artifact 为
+`docs/reviews/pr-54-review-additional-fix-host-p5-local-dispatch-codex-20260515.md`，accepted additional fix commit 为
+`e302862`。Re-review artifacts 为
+`docs/reviews/pr-54-review-additional-fix-re-review-host-p5-local-dispatch-mimo-20260515.md` 与
+`docs/reviews/pr-54-review-additional-fix-re-review-host-p5-local-dispatch-ds-20260515.md`；两份 re-review 均 PASS 且无
+blocking finding。Controller final adjudication artifact 为
+`docs/reviews/pr-54-review-additional-fix-re-review-controller-adjudication-20260515.md`。Controller validation：
+`pytest tests/host/test_public_contracts.py tests/host/test_import_boundary.py tests/host/test_run_input_builder.py tests/host/test_engine_ingest_mapping.py tests/host/test_dispatch_scheduler.py tests/host/test_local_proxy_engine_ingest.py tests/host/test_run_attempt_transitions.py -q`
+107 passed；`pytest tests/host tests/runtime -q` 375 passed；`python -m pyright dayu/ tests/ utils/` 0 errors；
+`git diff --check` passed。当前 PR 54 additional review gate 状态为 accepted；PR 54 draft branch 已 push，current gate 为
+PR 54 draft review-ready。剩余风险均有 owner：active cancel watchdog / post-cancel timeout 与 multi-scheduler cancel port 归 Phase 11；
+RemoteProxy 语义归 Phase 14；scheduler 并发 lane 竞争测试、`_drain_loop` 可观测性、RunInputBuilder optimistic TOCTOU 与
+`_consume_worker_events` cleanup helper 防御性强化为后续 hardening / cleanup，不阻塞当前 PR。
+PR 54 全仓并行 review gate 已完成。Full-repo review artifacts 为
+`docs/reviews/repo-review-20260515-1338.md` 与 `docs/reviews/repo-review-20260515-1346.md`；Controller adjudication artifact 为
+`docs/reviews/repo-review-controller-adjudication-20260515.md`。裁决结论：只接受当前 PR 可安全修复且不重排 phase 边界的
+A1-A10，包括 runtime lane shielded cancellation / release 一致性、dispatch drain loop empty / sleep wakeup race、
+`BatchToolExecutionRequest` duplicate `tool_call_id` 拒绝、`is_retriable` `assert_never` 穷尽守卫、`ToolCancelledOutcome.hint`
+空白拒绝、`wait_for_or_cancel` docstring 修正、`_HostCancellationToken` 显式实现 `CancellationToken` Protocol、Host EventLog
+payload helper 抽取、Host public validation helper 抽取与 `run_input.py` dead import cleanup。Fix artifact 为
+`docs/reviews/repo-review-fix-host-p5-full-repo-codex-20260515.md`，accepted full-repo fix commit 为 `4527585`。
+Re-review artifacts 为 `docs/reviews/repo-review-fix-re-review-host-p5-full-repo-mimo-20260515.md` 与
+`docs/reviews/repo-review-fix-re-review-host-p5-full-repo-ds-20260515.md`；两份 re-review 均 PASS 且无 blocking finding。
+Controller final adjudication artifact 为 `docs/reviews/repo-review-fix-re-review-controller-adjudication-20260515.md`。
+Controller validation：受影响测试 126 passed；`pytest tests/host tests/runtime tests/contracts tests/engine -q` 741 passed；
+`python -m pyright dayu/ tests/ utils/` 0 errors；`git diff --check` passed。当前 full-repo review gate 状态为 accepted；
+PR 54 draft branch 已 push，current gate 为 PR 54 draft review-ready。剩余风险均有 owner：runtime lane repeated outer cancellation
+与 untracked release failure 归后续 runtime cancellation precision / 既有 TTL cleanup；idle scheduler sleeping task 归 Host dispatch
+lifecycle；Engine runner injection 归后续 Engine composition / provider abstraction design；active cancel watchdog 归 Phase 11；
+RemoteProxy 归 Phase 14；God module/class cleanup 与 broader test hardening 归后续 architecture / test hardening。
+P5 design conformance review gate 已完成。用户要求 AgentMiMo、AgentDS、AgentCodex 三路同时审查 P5 实现是否偏离
+`docs/host/design.md`、边界是否清晰、生产接线是否正确以及后续 phase 接线是否按设计预留。Review artifacts 为
+`docs/reviews/p5-design-conformance-review-mimo-20260515.md`、
+`docs/reviews/p5-design-conformance-review-ds-20260515.md` 与
+`docs/reviews/p5-design-conformance-review-codex-20260515.md`；三路 verdict 均 PASS，blocking design deviations 为 0。
+Controller adjudication artifact 为
+`docs/reviews/p5-design-conformance-review-controller-adjudication-20260515.md`。Controller 裁决：P5 design conformance gate
+通过；Host 强治理真源、LocalProxy envelope、EngineEvent boundary、dispatch record 非 owner truth、RunInputBuilder typed provider
+boundary、runtime 层中立、生产 scheduler / lane / LocalProxy / ingest / queue promotion 接线与后续 phase stub/no-op/fail-fast
+路径均符合设计。非阻断 hardening items：`accept_worker_running_in_transaction` 这条非生产 durable helper 的 `ATTEMPT_RUNNING`
+payload diagnostics 弱于 scheduler 生产路径，owner 为 Host durable transition hardening；`mark_dispatching_after_lane_row` 底层
+helper 能力宽于生产 scheduler 路径，owner 为 Host durable API tightening。其它 residual risk 维持既有 owner：terminal promotion
+wakeup failure 归 Host dispatch lifecycle hardening，active cancel watchdog 归 Phase 11，RemoteProxy 归 Phase 14，lifecycle composition
+归后续 Host composition design。本 gate 不要求当前 blocker fix，PR 54 仍为 draft review-ready。
+
+P1-P5 corrected design conformance review gate 已完成。用户澄清上一轮应审查的是“实现到 P5 后，P1-P5 当前全部代码
+snapshot 是否偏离设计”，因此上一段 P5-only review 只作为子集证据，不作为 P1-P5 全量结论。Corrected review artifacts 为
+`docs/reviews/p1-p5-design-conformance-review-mimo-20260515.md`、
+`docs/reviews/p1-p5-design-conformance-review-ds-20260515.md` 与
+`docs/reviews/p1-p5-design-conformance-review-codex-20260515.md`；三路 verdict 均 PASS，blocking design deviation 均为 0。
+Controller adjudication artifact 为
+`docs/reviews/p1-p5-design-conformance-review-controller-adjudication-20260515.md`。Controller 裁决：P1 public contract /
+runtime boundary、P2 durable store / EventLog、P3 session / run / attempt / admission、P4 public API command path、P5
+RunInputBuilder / local dispatch / local proxy / Engine ingest / cancel、跨 phase 分层、生产接线与后续 phase 预留均未发现
+blocking 设计偏离；PR 54 不需要进入新的 fix gate，仍为 draft review-ready。Non-blocking hardening / cleanup 均已有 owner：
+`accept_worker_running_in_transaction` 诊断 payload 弱于 scheduler 生产路径归 Host durable transition hardening；
+`mark_dispatching_after_lane_row` 底层 helper 能力宽于生产 scheduler 路径归 Host durable API tightening；
+`DEFAULT_ACTIVE_WORKER_REGISTRY` module-level singleton 的多 handle cancel 边界风险归 Host dispatch lifecycle hardening；compact
+artifact message slot 与 plan 摘要顺序不完全一致归 Phase 10 / RunInputBuilder documentation cleanup。其它 residual risk 维持既有
+owner：terminal promotion wakeup failure 归 Host dispatch lifecycle hardening，active cancel watchdog / stuck `CANCELLING` /
+orphan recovery 归 Phase 11，RemoteProxy 归 Phase 14，ToolRuntime / `fetch_more` 归 Phase 6，WAITING / `resolve_wait` 归
+Phase 7，Memory / Context Governance / compact artifact 分别归 Phase 9 / Phase 10。
 
 历史状态：Phase 1 公共契约与 runtime 基础设施已完成并 merge；Phase 2 Durable Store / EventLog / Payload Foundation 已完成 plan、3 个 implementation slices、aggregate deepreview、aggregate fix、aggregate re-review 与 accepted deepreview commit，本 phase 状态为 completed。Phase 1 design refinement 已写入 `docs/reviews/gateflow-phase-design-host-p1-codex-20260513.md`，controller-accepted design fix 已写入 `docs/reviews/gateflow-phase-design-fix-host-p1-codex-20260513.md`。用户反馈后的 design fixes 已写入 `docs/reviews/gateflow-phase-design-user-feedback-fix-host-p1-codex-20260513.md` 与 `docs/reviews/gateflow-phase-design-user-feedback-fix2-host-p1-codex-20260513.md`。AgentMiMo 与 AgentDS 的 phase design re-review 均确认 accepted findings 已修复且 new blocker 为 0；round2 re-review 进一步确认 lane 已改为 cross-process runtime capacity guard，Phase Map 已重排为 P12 ToolsDiscovery / ScenePrepare、P13 Audit / Tool Trace / Outbox、P14 RemoteProxy、P15 Retention / Purge。Phase 1 plan 已写入 `docs/host/phase1-public-contract-runtime-plan.md`；plan review、controller adjudication、plan fix 与 plan re-review artifacts 已写入 `docs/reviews/`。AgentMiMo 与 AgentDS 的 plan re-review 均确认 finding 数量为 0、blocking finding 数量为 0。用户已确认 Phase 1 plan；accepted plan commit 为 `34b1b41`。Phase 1 Slice 1 accepted slice commit 为 `66d8dc3`，Slice 2 accepted slice commit 为 `27e0d8b`，Slice 3 accepted slice commit 为 `e23e3e4`，Slice 4 accepted slice commit 为 `0393a22`。
 

@@ -8,6 +8,7 @@ dispatch、ToolRuntime factory 与 policy provider 均不在当前包根导出�
 from __future__ import annotations
 
 from dayu.host.api import (
+    AttemptDispatchSnapshot,
     AttemptStatus,
     AuthorizationClaim,
     CancelMode,
@@ -26,11 +27,15 @@ from dayu.host.api import (
     HostCallContext,
     HostCommandFacet,
     HostCommandHandleOptions,
+    HostLocalExecutionOptions,
     HostEventStream,
     HostEventView,
     HostInput,
     HostMetadataEntry,
     HostStreamCursor,
+    LocalEngineWorker,
+    LocalEngineWorkerFactory,
+    LocalWorkerHandle,
     OperationContext,
     OutboxSummary,
     PurgeSessionRequest,
@@ -76,6 +81,7 @@ from dayu.host.tooling import (
 )
 
 __all__ = [
+    "AttemptDispatchSnapshot",
     "AttemptStatus",
     "AuthorizationClaim",
     "CancelMode",
@@ -97,11 +103,15 @@ __all__ = [
     "HostCommandHandle",
     "HostCommandFacet",
     "HostCommandHandleOptions",
+    "HostLocalExecutionOptions",
     "HostEventStream",
     "HostEventView",
     "HostInput",
     "HostMetadataEntry",
     "HostStreamCursor",
+    "LocalEngineWorker",
+    "LocalEngineWorkerFactory",
+    "LocalWorkerHandle",
     "HostToolingOptions",
     "OperationContext",
     "OutboxSummary",

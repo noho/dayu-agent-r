@@ -185,3 +185,16 @@ def test_cancelled_rejects_whitespace_message() -> None:
                 hint=None,
                 meta=None,
             )
+
+
+def test_cancelled_rejects_empty_or_whitespace_hint() -> None:
+    """``hint`` 存在时必须是非空文本。"""
+
+    for invalid_hint in ("", "   ", "\t", "\n", "  \t  \n"):
+        with pytest.raises(ValueError):
+            ToolCancelledOutcome(
+                reason=TOOL_CANCELLED_REASON_APPROVAL_DENIED,
+                message="approval denied",
+                hint=invalid_hint,
+                meta=None,
+            )
