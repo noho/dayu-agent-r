@@ -3,13 +3,14 @@
 本模块实现 Phase 5 的内部 RunInputBuilder。它只从 durable EventLog /
 Run / Attempt / dispatch record 与显式注入的 policy snapshot 构造 Engine
 ``AgentRunRequest``，不读取 UI / Service 临时状态，不实现 scheduler、
-LocalProxy、ToolRuntime、Memory projection 或 Context Governance。
+LocalProxy、ToolRuntime 执行、Memory projection 或 Context Governance。
 """
 
 from __future__ import annotations
 
 from collections.abc import Mapping
 from dataclasses import dataclass
+from enum import StrEnum
 from typing import Protocol
 
 from dayu.contracts.json_value import JsonValue
@@ -58,6 +59,7 @@ from dayu.host.durable.state import (
     read_run_by_id,
 )
 from dayu.host.durable.transaction import HostTransaction, HostTransactionRunner
+from dayu.host.tool_runtime import ToolRuntimeHandle
 
 _EVENT_TYPE_USER_INPUT_ACCEPTED = "USER_INPUT_ACCEPTED"
 _EVENT_TYPE_RUN_ACCEPTED = "RUN_ACCEPTED"
@@ -70,6 +72,19 @@ _PAYLOAD_FIELD_FINAL_ANSWER = "final_answer"
 _PAYLOAD_FIELD_CONTENT = "content"
 _PAYLOAD_FIELD_SUMMARY_TEXT = "summary_text"
 _NO_TOOL_CANCEL_MESSAGE = "tools are disabled for this attempt"
+
+
+class ToolExecutionMode(StrEnum):
+    """RunInputBuilder 的显式工具执行模式。
+
+    - ``TOOL_ENABLED``：普通允许工具的 Attempt。
+    - ``NO_TOOL_REPLAY``：replay Attempt，结构修复但不暴露工具。
+    - ``NO_TOOL_DISABLED``：显式禁用工具的 Attempt。
+    """
+
+    TOOL_ENABLED = "tool_enabled"
+    NO_TOOL_REPLAY = "no_tool_replay"
+    NO_TOOL_DISABLED = "no_tool_disabled"
 
 
 @dataclass(frozen=True, slots=True)
@@ -138,10 +153,13 @@ class ToolSchemaSnapshot:
 
     :param tool_schemas: 暴露给 Engine 的工具 schema 元组。
     :param disable_tools: 是否禁用工具调用。
+    :param tool_runtime_handle: tool-enabled 模式下的 ToolRuntime handle；
+        no-tool / replay 模式下为 ``None``。
     """
 
     tool_schemas: tuple[ToolSchema, ...]
     disable_tools: bool
+    tool_runtime_handle: ToolRuntimeHandle | None
 
 
 @dataclass(frozen=True, slots=True)
@@ -160,16 +178,14 @@ class PolicySnapshot:
     policy_snapshot_ref: str
 
     def __post_init__(self) -> None:
-        """校验 no-tool policy snapshot。
+        """校验 policy snapshot 的基础一致性。
 
         :returns: ``None``。
-        :raises ValueError: policy ref 为空或允许工具调用时抛出。
+        :raises ValueError: policy ref 为空时抛出。
         """
 
         if self.policy_snapshot_ref.strip() == "":
             raise ValueError("policy_snapshot_ref must be non-empty")
-        if self.agent_policy.allow_tool_calls:
-            raise ValueError("AgentPolicy.allow_tool_calls must be False")
 
 
 class CurrentRunFactProvider(Protocol):
@@ -263,6 +279,21 @@ class ToolExecutorProvider(Protocol):
         ...
 
 
+class ToolRuntimeHandleProvider(Protocol):
+    """ToolRuntime handle provider 协议。"""
+
+    def load_tool_runtime_handle(
+        self, snapshot: AttemptDispatchSnapshot, current_facts: CurrentRunFacts
+    ) -> ToolRuntimeHandle:
+        """读取 tool-enabled Attempt 使用的 ToolRuntime handle。
+
+        :param snapshot: Attempt dispatch snapshot。
+        :param current_facts: 当前 Run facts。
+        :returns: ToolRuntimeHandle。
+        """
+        ...
+
+
 class SceneParameterProvider(Protocol):
     """Scene parameter provider 协议。"""
 
@@ -271,12 +302,14 @@ class SceneParameterProvider(Protocol):
         snapshot: AttemptDispatchSnapshot,
         current_facts: CurrentRunFacts,
         policy_snapshot: PolicySnapshot,
+        tool_execution_mode: ToolExecutionMode,
     ) -> tuple[SystemMessage, ...]:
         """构造 system scene / execution target / policy messages。
 
         :param snapshot: Attempt dispatch snapshot。
         :param current_facts: 当前 Run facts。
         :param policy_snapshot: policy snapshot。
+        :param tool_execution_mode: 显式工具执行模式。
         :returns: system message 元组。
         """
         ...
@@ -500,7 +533,9 @@ class NoopToolSchemaSnapshotProvider:
         """
 
         del snapshot, current_facts
-        return ToolSchemaSnapshot(tool_schemas=(), disable_tools=True)
+        return ToolSchemaSnapshot(
+            tool_schemas=(), disable_tools=True, tool_runtime_handle=None
+        )
 
 
 class NoToolExecutor:
@@ -556,6 +591,91 @@ class NoToolExecutorProvider:
         return self._executor
 
 
+class StaticToolRuntimeHandleProvider:
+    """显式注入 ToolRuntimeHandle 的 provider。"""
+
+    def __init__(self, tool_runtime_handle: ToolRuntimeHandle) -> None:
+        """初始化 provider。
+
+        :param tool_runtime_handle: tool-enabled Attempt 使用的 handle。
+        :returns: ``None``。
+        """
+
+        self._tool_runtime_handle = tool_runtime_handle
+
+    def load_tool_runtime_handle(
+        self, snapshot: AttemptDispatchSnapshot, current_facts: CurrentRunFacts
+    ) -> ToolRuntimeHandle:
+        """返回构造时注入的 ToolRuntimeHandle。
+
+        :param snapshot: Attempt dispatch snapshot。
+        :param current_facts: 当前 Run facts。
+        :returns: ToolRuntimeHandle。
+        """
+
+        del snapshot, current_facts
+        return self._tool_runtime_handle
+
+
+class ToolRuntimeSchemaSnapshotProvider:
+    """从同一个 ToolRuntimeHandle 投影 tool schemas。"""
+
+    def __init__(self, handle_provider: ToolRuntimeHandleProvider) -> None:
+        """初始化 provider。
+
+        :param handle_provider: ToolRuntimeHandle provider。
+        :returns: ``None``。
+        """
+
+        self._handle_provider = handle_provider
+
+    def load_tool_schema_snapshot(
+        self, snapshot: AttemptDispatchSnapshot, current_facts: CurrentRunFacts
+    ) -> ToolSchemaSnapshot:
+        """读取 tool-enabled schema snapshot。
+
+        :param snapshot: Attempt dispatch snapshot。
+        :param current_facts: 当前 Run facts。
+        :returns: 带 ToolRuntimeHandle 的 schema snapshot。
+        """
+
+        handle = self._handle_provider.load_tool_runtime_handle(
+            snapshot, current_facts
+        )
+        return ToolSchemaSnapshot(
+            tool_schemas=handle.tool_schemas,
+            disable_tools=False,
+            tool_runtime_handle=handle,
+        )
+
+
+class ToolRuntimeExecutorProvider:
+    """从同一个 ToolRuntimeHandle 读取 ToolExecutor。"""
+
+    def __init__(self, handle_provider: ToolRuntimeHandleProvider) -> None:
+        """初始化 provider。
+
+        :param handle_provider: ToolRuntimeHandle provider。
+        :returns: ``None``。
+        """
+
+        self._handle_provider = handle_provider
+
+    def load_tool_executor(
+        self, snapshot: AttemptDispatchSnapshot, current_facts: CurrentRunFacts
+    ) -> ToolExecutor:
+        """读取 tool-enabled ToolExecutor。
+
+        :param snapshot: Attempt dispatch snapshot。
+        :param current_facts: 当前 Run facts。
+        :returns: ToolRuntimeHandle 暴露的 executor。
+        """
+
+        return self._handle_provider.load_tool_runtime_handle(
+            snapshot, current_facts
+        ).tool_executor
+
+
 class DefaultSceneParameterProvider:
     """默认 system scene / execution target provider。"""
 
@@ -564,15 +684,18 @@ class DefaultSceneParameterProvider:
         snapshot: AttemptDispatchSnapshot,
         current_facts: CurrentRunFacts,
         policy_snapshot: PolicySnapshot,
+        tool_execution_mode: ToolExecutionMode,
     ) -> tuple[SystemMessage, ...]:
         """构造确定性的 system scene message。
 
         :param snapshot: Attempt dispatch snapshot。
         :param current_facts: 当前 Run facts。
         :param policy_snapshot: policy snapshot。
+        :param tool_execution_mode: 显式工具执行模式。
         :returns: system message 元组。
         """
 
+        del snapshot
         execution_target = _execution_target_from_accepted_event(
             current_facts.run_accepted_event,
             fallback=current_facts.run.execution_target,
@@ -584,7 +707,7 @@ class DefaultSceneParameterProvider:
                 f"execution_target={execution_target}",
                 f"queue_policy={current_facts.run.queue_policy}",
                 f"policy_snapshot_ref={policy_snapshot.policy_snapshot_ref}",
-                "tools=disabled",
+                _tools_scene_line(tool_execution_mode),
             )
         )
         return (
@@ -635,6 +758,7 @@ class RunInputBuilder:
         tool_executor_provider: ToolExecutorProvider,
         scene_parameter_provider: SceneParameterProvider,
         policy_snapshot_provider: PolicySnapshotProvider,
+        tool_execution_mode: ToolExecutionMode,
     ) -> None:
         """初始化 RunInputBuilder。
 
@@ -646,6 +770,7 @@ class RunInputBuilder:
         :param tool_executor_provider: ToolExecutor provider。
         :param scene_parameter_provider: Scene parameter provider。
         :param policy_snapshot_provider: Policy snapshot provider。
+        :param tool_execution_mode: 显式工具执行模式。
         :returns: ``None``。
         """
 
@@ -657,13 +782,14 @@ class RunInputBuilder:
         self._tool_executor_provider = tool_executor_provider
         self._scene_parameter_provider = scene_parameter_provider
         self._policy_snapshot_provider = policy_snapshot_provider
+        self._tool_execution_mode = tool_execution_mode
 
     def build(self, attempt_snapshot: AttemptDispatchSnapshot) -> AgentRunRequest:
-        """构造 no-tool AgentRunRequest。
+        """构造 AgentRunRequest。
 
         :param attempt_snapshot: Attempt dispatch snapshot。
         :returns: Engine AgentRunRequest。
-        :raises HostDurableError: durable facts 缺失、不匹配或 provider 违反 no-tool 约束时抛出。
+        :raises HostDurableError: durable facts 缺失、不匹配或 provider 违反工具模式约束时抛出。
         """
 
         current_facts = self._current_run_provider.load_current_run_facts(
@@ -684,10 +810,21 @@ class RunInputBuilder:
         tool_snapshot = self._tool_schema_snapshot_provider.load_tool_schema_snapshot(
             attempt_snapshot, current_facts
         )
-        _validate_no_tool_snapshot(tool_snapshot, policy_snapshot)
+        tool_executor = self._tool_executor_provider.load_tool_executor(
+            attempt_snapshot, current_facts
+        )
+        _validate_tool_mode_snapshot(
+            self._tool_execution_mode,
+            tool_snapshot,
+            policy_snapshot,
+            tool_executor,
+        )
         messages = (
             *self._scene_parameter_provider.build_scene_messages(
-                attempt_snapshot, current_facts, policy_snapshot
+                attempt_snapshot,
+                current_facts,
+                policy_snapshot,
+                self._tool_execution_mode,
             ),
             *memory.messages,
             *compact.messages,
@@ -706,9 +843,7 @@ class RunInputBuilder:
             runner_options=policy_snapshot.runner_options,
             agent_policy=policy_snapshot.agent_policy,
             tool_schemas=tool_snapshot.tool_schemas,
-            tool_executor=self._tool_executor_provider.load_tool_executor(
-                attempt_snapshot, current_facts
-            ),
+            tool_executor=tool_executor,
             cancellation_token=attempt_snapshot.cancellation_token,
         )
 
@@ -717,14 +852,19 @@ def create_no_tool_run_input_builder(
     *,
     transaction_runner: HostTransactionRunner,
     policy_snapshot: PolicySnapshot,
+    tool_execution_mode: ToolExecutionMode = ToolExecutionMode.NO_TOOL_DISABLED,
 ) -> RunInputBuilder:
     """创建 Phase 5 默认 no-tool RunInputBuilder。
 
     :param transaction_runner: Host durable transaction runner。
     :param policy_snapshot: 显式 policy snapshot。
+    :param tool_execution_mode: no-tool 工具执行模式，只能是 replay 或 disabled。
     :returns: RunInputBuilder。
+    :raises ValueError: 传入 ``TOOL_ENABLED`` 时抛出。
     """
 
+    if tool_execution_mode == ToolExecutionMode.TOOL_ENABLED:
+        raise ValueError("create_no_tool_run_input_builder requires no-tool mode")
     return RunInputBuilder(
         current_run_provider=DurableCurrentRunFactProvider(transaction_runner),
         session_continuity_provider=DurableSessionContinuityProvider(
@@ -736,6 +876,39 @@ def create_no_tool_run_input_builder(
         tool_executor_provider=NoToolExecutorProvider(),
         scene_parameter_provider=DefaultSceneParameterProvider(),
         policy_snapshot_provider=StaticPolicySnapshotProvider(policy_snapshot),
+        tool_execution_mode=tool_execution_mode,
+    )
+
+
+def create_tool_enabled_run_input_builder(
+    *,
+    transaction_runner: HostTransactionRunner,
+    policy_snapshot: PolicySnapshot,
+    tool_runtime_handle: ToolRuntimeHandle,
+) -> RunInputBuilder:
+    """创建 tool-enabled RunInputBuilder。
+
+    :param transaction_runner: Host durable transaction runner。
+    :param policy_snapshot: 显式 policy snapshot，必须允许工具调用。
+    :param tool_runtime_handle: ToolRuntime handle。
+    :returns: RunInputBuilder。
+    """
+
+    handle_provider = StaticToolRuntimeHandleProvider(tool_runtime_handle)
+    return RunInputBuilder(
+        current_run_provider=DurableCurrentRunFactProvider(transaction_runner),
+        session_continuity_provider=DurableSessionContinuityProvider(
+            transaction_runner
+        ),
+        memory_snapshot_provider=NoopMemorySnapshotProvider(),
+        compact_artifact_provider=NoopCompactArtifactProvider(),
+        tool_schema_snapshot_provider=ToolRuntimeSchemaSnapshotProvider(
+            handle_provider
+        ),
+        tool_executor_provider=ToolRuntimeExecutorProvider(handle_provider),
+        scene_parameter_provider=DefaultSceneParameterProvider(),
+        policy_snapshot_provider=StaticPolicySnapshotProvider(policy_snapshot),
+        tool_execution_mode=ToolExecutionMode.TOOL_ENABLED,
     )
 
 
@@ -961,6 +1134,30 @@ def _assistant_summary_from_payload(
     return None
 
 
+def _validate_tool_mode_snapshot(
+    tool_execution_mode: ToolExecutionMode,
+    tool_snapshot: ToolSchemaSnapshot,
+    policy_snapshot: PolicySnapshot,
+    tool_executor: ToolExecutor,
+) -> None:
+    """按显式工具模式校验 request 约束。
+
+    :param tool_execution_mode: 显式工具执行模式。
+    :param tool_snapshot: tool schema snapshot。
+    :param policy_snapshot: policy snapshot。
+    :param tool_executor: ToolExecutor provider 输出。
+    :returns: ``None``。
+    :raises HostDurableError: provider 违反对应工具模式约束时抛出。
+    """
+
+    if tool_execution_mode == ToolExecutionMode.TOOL_ENABLED:
+        _validate_tool_enabled_snapshot(
+            tool_snapshot, policy_snapshot, tool_executor
+        )
+        return
+    _validate_no_tool_snapshot(tool_snapshot, policy_snapshot)
+
+
 def _validate_no_tool_snapshot(
     tool_snapshot: ToolSchemaSnapshot, policy_snapshot: PolicySnapshot
 ) -> None:
@@ -978,6 +1175,50 @@ def _validate_no_tool_snapshot(
         raise HostDurableError("RunInputBuilder no-tool schema snapshot must be empty")
     if policy_snapshot.agent_policy.allow_tool_calls:
         raise HostDurableError("RunInputBuilder requires allow_tool_calls=False")
+    if tool_snapshot.tool_runtime_handle is not None:
+        raise HostDurableError("RunInputBuilder no-tool mode must not carry handle")
+
+
+def _validate_tool_enabled_snapshot(
+    tool_snapshot: ToolSchemaSnapshot,
+    policy_snapshot: PolicySnapshot,
+    tool_executor: ToolExecutor,
+) -> None:
+    """校验 tool-enabled request 约束。
+
+    :param tool_snapshot: tool schema snapshot。
+    :param policy_snapshot: policy snapshot。
+    :param tool_executor: ToolExecutor provider 输出。
+    :returns: ``None``。
+    :raises HostDurableError: provider 违反 tool-enabled 约束时抛出。
+    """
+
+    if tool_snapshot.disable_tools:
+        raise HostDurableError("RunInputBuilder requires disable_tools=False")
+    if not policy_snapshot.agent_policy.allow_tool_calls:
+        raise HostDurableError("RunInputBuilder requires allow_tool_calls=True")
+    if tool_snapshot.tool_runtime_handle is None:
+        raise HostDurableError("RunInputBuilder tool-enabled mode requires handle")
+    if tool_snapshot.tool_runtime_handle.tool_schemas != tool_snapshot.tool_schemas:
+        raise HostDurableError(
+            "RunInputBuilder tool schemas must come from ToolRuntimeHandle"
+        )
+    if tool_snapshot.tool_runtime_handle.tool_executor is not tool_executor:
+        raise HostDurableError(
+            "RunInputBuilder tool executor must come from same ToolRuntimeHandle"
+        )
+
+
+def _tools_scene_line(tool_execution_mode: ToolExecutionMode) -> str:
+    """返回 scene message 中的工具状态行。
+
+    :param tool_execution_mode: 显式工具执行模式。
+    :returns: 工具状态行。
+    """
+
+    if tool_execution_mode == ToolExecutionMode.TOOL_ENABLED:
+        return "tools=enabled"
+    return "tools=disabled"
 
 
 __all__ = [
@@ -1002,8 +1243,14 @@ __all__ = [
     "SessionContinuityProvider",
     "SessionContinuityView",
     "StaticPolicySnapshotProvider",
+    "StaticToolRuntimeHandleProvider",
+    "ToolExecutionMode",
     "ToolExecutorProvider",
+    "ToolRuntimeExecutorProvider",
+    "ToolRuntimeHandleProvider",
+    "ToolRuntimeSchemaSnapshotProvider",
     "ToolSchemaSnapshot",
     "ToolSchemaSnapshotProvider",
     "create_no_tool_run_input_builder",
+    "create_tool_enabled_run_input_builder",
 ]

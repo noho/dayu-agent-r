@@ -10,6 +10,18 @@ import pytest
 
 from dayu.contracts.cancellation import CancellationToken
 from dayu.contracts.json_value import JsonValue
+from dayu.contracts.tool_call import BatchToolExecutionContext, ToolCallRequest
+from dayu.contracts.tool_declaration import ToolBundle, ToolDefinition
+from dayu.contracts.tool_outcome import (
+    TOOL_CANCELLED_REASON_HOST_CANCELLED,
+    ToolCancelledOutcome,
+    ToolExecutionOutcome,
+)
+from dayu.contracts.tool_schema import (
+    ToolFunctionSchema,
+    ToolParametersSchema,
+    ToolSchema,
+)
 from dayu.engine.contracts.agent_policy import AgentPolicy
 from dayu.engine.contracts.agent_run import AgentRunRequest
 from dayu.engine.contracts.messages import (
@@ -63,7 +75,21 @@ from dayu.host.durable.transaction import HostRow, HostTransaction, HostTransact
 from dayu.host.run_input import (
     NoToolExecutor,
     PolicySnapshot,
+    ToolExecutionMode,
     create_no_tool_run_input_builder,
+    create_tool_enabled_run_input_builder,
+)
+from dayu.host.tool_runtime import (
+    DefaultToolRuntimeFactory,
+    EffectiveToolBundleBuildRequest,
+    EffectiveToolBundleBuilder,
+    ToolRuntimeHandle,
+    ToolRuntimeBuildRequest,
+)
+from dayu.host.tooling import (
+    ToolBundleSourceKind,
+    ToolBundleSourceRef,
+    default_framework_tool_policy_view,
 )
 
 _NOW = datetime(2026, 5, 15, 1, 2, 3, tzinfo=UTC)
@@ -283,6 +309,78 @@ def test_no_tool_request_fields_are_disabled(tmp_path: Path) -> None:
         assert request.tool_schemas == ()
         assert request.agent_policy.allow_tool_calls is False
         assert isinstance(request.tool_executor, NoToolExecutor)
+
+
+def test_tool_enabled_request_uses_toolruntime_handle(tmp_path: Path) -> None:
+    """tool-enabled RunInputBuilder 使用同一个 ToolRuntimeHandle 暴露 schema 与 executor。"""
+
+    with open_host_durable_store(_options(tmp_path)) as store:
+        session_id = _ensure_session_id(store.transaction_runner)
+        seeded = _seed_current_run(
+            store,
+            session_id=session_id,
+            payload=_user_input_payload("current question"),
+        )
+        tool_runtime_handle = _tool_runtime_handle()
+        policy_snapshot = _policy_snapshot(allow_tool_calls=True)
+
+        request = create_tool_enabled_run_input_builder(
+            transaction_runner=store.transaction_runner,
+            policy_snapshot=policy_snapshot,
+            tool_runtime_handle=tool_runtime_handle,
+        ).build(_attempt_snapshot(seeded))
+
+        assert request.disable_tools is False
+        assert request.agent_policy.allow_tool_calls is True
+        assert request.tool_schemas == tool_runtime_handle.tool_schemas
+        assert request.tool_executor is tool_runtime_handle.tool_executor
+        assert "tools=disabled" not in _message_content(request.messages[0])
+        assert "tools=enabled" in _message_content(request.messages[0])
+
+
+def test_replay_no_tool_request_keeps_tools_disabled(tmp_path: Path) -> None:
+    """replay no-tool 模式不暴露 schema，且 scene 仍表达工具禁用。"""
+
+    with open_host_durable_store(_options(tmp_path)) as store:
+        session_id = _ensure_session_id(store.transaction_runner)
+        seeded = _seed_current_run(
+            store,
+            session_id=session_id,
+            payload=_user_input_payload("current question"),
+        )
+
+        builder = create_no_tool_run_input_builder(
+            transaction_runner=store.transaction_runner,
+            policy_snapshot=_policy_snapshot(),
+            tool_execution_mode=ToolExecutionMode.NO_TOOL_REPLAY,
+        )
+        request = builder.build(_attempt_snapshot(seeded))
+
+        assert request.disable_tools is True
+        assert request.tool_schemas == ()
+        assert request.agent_policy.allow_tool_calls is False
+        assert isinstance(request.tool_executor, NoToolExecutor)
+        assert "tools=disabled" in _message_content(request.messages[0])
+
+
+def test_no_tool_builder_rejects_tool_enabled_mode(tmp_path: Path) -> None:
+    """no-tool builder 拒绝 TOOL_ENABLED 模式。"""
+
+    with open_host_durable_store(_options(tmp_path)) as store:
+        with pytest.raises(ValueError, match="no-tool mode"):
+            create_no_tool_run_input_builder(
+                transaction_runner=store.transaction_runner,
+                policy_snapshot=_policy_snapshot(),
+                tool_execution_mode=ToolExecutionMode.TOOL_ENABLED,
+            )
+
+
+def test_policy_snapshot_allows_tool_policy_for_tool_enabled() -> None:
+    """PolicySnapshot 构造期不再把 allow_tool_calls=True 当作 no-tool 错误。"""
+
+    snapshot = _policy_snapshot(allow_tool_calls=True)
+
+    assert snapshot.agent_policy.allow_tool_calls is True
 
 
 @pytest.mark.parametrize(
@@ -612,17 +710,25 @@ def _build_request(
         transaction_runner=store.transaction_runner,
         policy_snapshot=_policy_snapshot(),
     )
-    return builder.build(
-        AttemptDispatchSnapshot(
-            session_id=seeded.session_id,
-            run_id=seeded.run_id,
-            attempt_id=seeded.attempt_id,
-            execution_id=seeded.execution_id,
-            dispatch_record_id=seeded.dispatch_record_id,
-            execution_target="local-default",
-            policy_snapshot_ref=_POLICY_REF,
-            cancellation_token=_token(),
-        )
+    return builder.build(_attempt_snapshot(seeded))
+
+
+def _attempt_snapshot(seeded: _SeededRun) -> AttemptDispatchSnapshot:
+    """构造测试用 AttemptDispatchSnapshot。
+
+    :param seeded: seeded Run 引用。
+    :returns: AttemptDispatchSnapshot。
+    """
+
+    return AttemptDispatchSnapshot(
+        session_id=seeded.session_id,
+        run_id=seeded.run_id,
+        attempt_id=seeded.attempt_id,
+        execution_id=seeded.execution_id,
+        dispatch_record_id=seeded.dispatch_record_id,
+        execution_target="local-default",
+        policy_snapshot_ref=_POLICY_REF,
+        cancellation_token=_token(),
     )
 
 
@@ -635,9 +741,10 @@ def _token() -> CancellationToken:
     return _NeverCancelledToken()
 
 
-def _policy_snapshot() -> PolicySnapshot:
-    """构造测试用 no-tool policy snapshot。
+def _policy_snapshot(*, allow_tool_calls: bool = False) -> PolicySnapshot:
+    """构造测试用 policy snapshot。
 
+    :param allow_tool_calls: AgentPolicy 是否允许工具调用。
     :returns: PolicySnapshot。
     """
 
@@ -664,10 +771,97 @@ def _policy_snapshot() -> PolicySnapshot:
         agent_policy=AgentPolicy(
             max_iterations=1,
             continuation_max_attempts=0,
-            allow_tool_calls=False,
+            allow_tool_calls=allow_tool_calls,
             tool_execution_timeout_seconds=1.0,
         ),
         policy_snapshot_ref=_POLICY_REF,
+    )
+
+
+def _tool_runtime_handle() -> ToolRuntimeHandle:
+    """构造测试用 ToolRuntimeHandle。
+
+    :returns: ToolRuntimeHandle。
+    """
+
+    return DefaultToolRuntimeFactory(EffectiveToolBundleBuilder()).create_tool_runtime(
+        ToolRuntimeBuildRequest(
+            effective_bundle_request=EffectiveToolBundleBuildRequest(
+                business_tool_bundle=ToolBundle(
+                    definitions=(_tool_definition("lookup_filing"),)
+                ),
+                source_refs=(
+                    ToolBundleSourceRef(
+                        source_kind=ToolBundleSourceKind.EXPLICIT_PROVIDER,
+                        source_id="run-input-test-provider",
+                    ),
+                ),
+                framework_tool_policy=default_framework_tool_policy_view(),
+                policy_snapshot_digest=_POLICY_REF,
+            )
+        )
+    )
+
+
+async def _tool_callable(
+    call: ToolCallRequest,
+    context: BatchToolExecutionContext,
+) -> ToolExecutionOutcome:
+    """测试用工具 callable。
+
+    :param call: 单次工具调用请求。
+    :param context: 批式工具执行上下文。
+    :returns: 测试用取消 outcome。
+    :raises Exception: 不主动抛出异常。
+    """
+
+    del call, context
+    return ToolCancelledOutcome(
+        reason=TOOL_CANCELLED_REASON_HOST_CANCELLED,
+        message="test tool callable",
+        hint=None,
+        meta=None,
+    )
+
+
+def _tool_definition(name: str) -> ToolDefinition:
+    """构造测试用工具声明。
+
+    :param name: 工具名。
+    :returns: 工具声明。
+    """
+
+    return ToolDefinition(
+        name=name,
+        schema=ToolSchema(
+            type="function",
+            function=ToolFunctionSchema(
+                name=name,
+                description=f"{name} test tool",
+                parameters=_tool_parameters(),
+            ),
+        ),
+        callable=_tool_callable,
+        truncate=None,
+        display=None,
+        tags=(),
+    )
+
+
+def _tool_parameters() -> ToolParametersSchema:
+    """构造测试用工具参数 schema。
+
+    :returns: 工具参数 schema。
+    """
+
+    properties: dict[str, JsonValue] = {
+        "ticker": {"type": "string"},
+    }
+    return ToolParametersSchema(
+        type="object",
+        properties=properties,
+        required=("ticker",),
+        additional_properties=False,
     )
 
 
