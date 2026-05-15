@@ -218,6 +218,17 @@ Phase Map 中每个 phase 必须使用统一条目格式。模板如下：
 - 每个 phase 产生的潜在影响、未覆盖项、deferred risk、后续 phase 依赖和明确不做项，必须回写到本文档的追踪区；
   不得只保留在对话、临时 artifact 或 phase plan 中。
 
+## 当前状态
+
+PR 54 `Host Phase 5 RunInputBuilder and local dispatch` 当前为 OPEN draft PR，branch 为 `feat/host-phase5-local-dispatch`，
+当前 gate 为 draft review-ready。最近一次 corrected gate 是 P1-P5 当前全量 snapshot design conformance review；AgentMiMo、
+AgentDS、AgentCodex 三路 verdict 均为 PASS，blocking design deviation 为 0。Controller adjudication artifact 为
+`docs/reviews/p1-p5-design-conformance-review-controller-adjudication-20260515.md`。
+
+当前不处于 implementation / fix gate；没有 accepted blocking finding 待修。需要继续追踪的 non-blocking hardening、
+deferred capability 与后续 phase owner 已写入 `Open Questions 与风险追踪` 的
+`PR 54 / P1-P5 corrected review 残余风险追踪`。
+
 ## Phase Map
 
 Phase 按依赖关系推进：先实现被其它阶段依赖的公共契约、runtime 基础能力、durable store、EventLog 与状态机，再连接执行路径、工具治理、projection core、memory、context governance、recovery 与 remote。Audit、Tool Trace、Outbox 是独立 projection sinks，后置到核心治理路径稳定之后实现。Phase 0 是 Engine cleanup 前置 work unit，只阻塞 Phase 10 Context Governance，不阻塞 Phase 1-9。每个 phase 开始时仍必须先和用户讨论并细化对应 `docs/host/design.md` 章节，再生成 handoff implementation-ready plan。
@@ -1453,18 +1464,6 @@ Phase 按依赖关系推进：先实现被其它阶段依赖的公共契约、ru
 - runtime lane repeated outer cancellation、untracked release failure 与 idle scheduler sleeping task；owner 为后续 runtime cancellation precision / Host dispatch lifecycle hardening。
 - Engine runner injection / provider abstraction design；owner 为后续 Engine composition / provider abstraction design。
 - God module / class cleanup 与 broader test hardening；owner 为后续 architecture / test hardening。
-
-## 当前状态
-
-PR 54 `Host Phase 5 RunInputBuilder and local dispatch` 当前为 OPEN draft PR，branch 为 `feat/host-phase5-local-dispatch`，
-当前 gate 为 draft review-ready。最近一次 corrected gate 是 P1-P5 当前全量 snapshot design conformance review；AgentMiMo、
-AgentDS、AgentCodex 三路 verdict 均为 PASS，blocking design deviation 为 0。Controller adjudication artifact 为
-`docs/reviews/p1-p5-design-conformance-review-controller-adjudication-20260515.md`。
-
-当前不处于 implementation / fix gate；没有 accepted blocking finding 待修。需要继续追踪的 non-blocking hardening、
-deferred capability 与后续 phase owner 已写入上方 `PR 54 / P1-P5 corrected review 残余风险追踪`。
-
-本次总控文档整理只调整文档结构，不改变设计真源、不改变代码、不改变 PR 54 ready 状态。
 
 ## 历史记录
 
