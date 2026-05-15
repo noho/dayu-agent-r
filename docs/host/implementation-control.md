@@ -1709,6 +1709,23 @@ blocking finding。Controller final adjudication artifact 为
 PR 54 draft review-ready。剩余风险均有 owner：active cancel watchdog / post-cancel timeout 与 multi-scheduler cancel port 归 Phase 11；
 RemoteProxy 语义归 Phase 14；scheduler 并发 lane 竞争测试、`_drain_loop` 可观测性、RunInputBuilder optimistic TOCTOU 与
 `_consume_worker_events` cleanup helper 防御性强化为后续 hardening / cleanup，不阻塞当前 PR。
+PR 54 全仓并行 review gate 已完成。Full-repo review artifacts 为
+`docs/reviews/repo-review-20260515-1338.md` 与 `docs/reviews/repo-review-20260515-1346.md`；Controller adjudication artifact 为
+`docs/reviews/repo-review-controller-adjudication-20260515.md`。裁决结论：只接受当前 PR 可安全修复且不重排 phase 边界的
+A1-A10，包括 runtime lane shielded cancellation / release 一致性、dispatch drain loop empty / sleep wakeup race、
+`BatchToolExecutionRequest` duplicate `tool_call_id` 拒绝、`is_retriable` `assert_never` 穷尽守卫、`ToolCancelledOutcome.hint`
+空白拒绝、`wait_for_or_cancel` docstring 修正、`_HostCancellationToken` 显式实现 `CancellationToken` Protocol、Host EventLog
+payload helper 抽取、Host public validation helper 抽取与 `run_input.py` dead import cleanup。Fix artifact 为
+`docs/reviews/repo-review-fix-host-p5-full-repo-codex-20260515.md`，accepted full-repo fix commit 为 `4527585`。
+Re-review artifacts 为 `docs/reviews/repo-review-fix-re-review-host-p5-full-repo-mimo-20260515.md` 与
+`docs/reviews/repo-review-fix-re-review-host-p5-full-repo-ds-20260515.md`；两份 re-review 均 PASS 且无 blocking finding。
+Controller final adjudication artifact 为 `docs/reviews/repo-review-fix-re-review-controller-adjudication-20260515.md`。
+Controller validation：受影响测试 126 passed；`pytest tests/host tests/runtime tests/contracts tests/engine -q` 741 passed；
+`python -m pyright dayu/ tests/ utils/` 0 errors；`git diff --check` passed。当前 full-repo review gate 状态为 accepted；
+PR 54 draft branch 待 push，current gate 为 PR 54 draft review-ready。剩余风险均有 owner：runtime lane repeated outer cancellation
+与 untracked release failure 归后续 runtime cancellation precision / 既有 TTL cleanup；idle scheduler sleeping task 归 Host dispatch
+lifecycle；Engine runner injection 归后续 Engine composition / provider abstraction design；active cancel watchdog 归 Phase 11；
+RemoteProxy 归 Phase 14；God module/class cleanup 与 broader test hardening 归后续 architecture / test hardening。
 
 历史状态：Phase 1 公共契约与 runtime 基础设施已完成并 merge；Phase 2 Durable Store / EventLog / Payload Foundation 已完成 plan、3 个 implementation slices、aggregate deepreview、aggregate fix、aggregate re-review 与 accepted deepreview commit，本 phase 状态为 completed。Phase 1 design refinement 已写入 `docs/reviews/gateflow-phase-design-host-p1-codex-20260513.md`，controller-accepted design fix 已写入 `docs/reviews/gateflow-phase-design-fix-host-p1-codex-20260513.md`。用户反馈后的 design fixes 已写入 `docs/reviews/gateflow-phase-design-user-feedback-fix-host-p1-codex-20260513.md` 与 `docs/reviews/gateflow-phase-design-user-feedback-fix2-host-p1-codex-20260513.md`。AgentMiMo 与 AgentDS 的 phase design re-review 均确认 accepted findings 已修复且 new blocker 为 0；round2 re-review 进一步确认 lane 已改为 cross-process runtime capacity guard，Phase Map 已重排为 P12 ToolsDiscovery / ScenePrepare、P13 Audit / Tool Trace / Outbox、P14 RemoteProxy、P15 Retention / Purge。Phase 1 plan 已写入 `docs/host/phase1-public-contract-runtime-plan.md`；plan review、controller adjudication、plan fix 与 plan re-review artifacts 已写入 `docs/reviews/`。AgentMiMo 与 AgentDS 的 plan re-review 均确认 finding 数量为 0、blocking finding 数量为 0。用户已确认 Phase 1 plan；accepted plan commit 为 `34b1b41`。Phase 1 Slice 1 accepted slice commit 为 `66d8dc3`，Slice 2 accepted slice commit 为 `27e0d8b`，Slice 3 accepted slice commit 为 `e23e3e4`，Slice 4 accepted slice commit 为 `0393a22`。
 
