@@ -1665,10 +1665,12 @@ blocking finding。Controller aggregate adjudication artifact 为
 `docs/reviews/gateflow-aggregate-deepreview-host-p5-local-dispatch-controller-adjudication-20260515.md`。Controller aggregate
 validation baseline：`pytest tests/host tests/runtime -q` 334 passed；`python -m pyright dayu/host tests/host` 0 errors；
 `python -m pyright dayu/ tests/ utils/` 0 errors；`git diff --check` passed。Phase 5 accepted aggregate review commit 为
-`ae86a0a`。Phase 5 状态为 completed；当前 gate 为 `ready-to-create-PR`。PR readiness：所有 Phase 5 design refinement、
-plan、6 个 implementation slices、code review、fix / re-review、aggregate deepreview、controller 裁决和 accepted local commits
-均已完成并记录 artifact / commit hash；工作区检查为 clean；剩余风险均已有后续 owner。后续 Phase 6 / 7 / 9 / 10 / 11 /
-13 / 14 以及集成环境验证必须继续接收各自 deferred 项。
+`ae86a0a`。Phase 5 状态为 completed；ready-to-create-PR 已执行，PR 54
+`https://github.com/noho/dayu-agent-r/pull/54` 已创建为 draft PR，title 为 `Host Phase 5 RunInputBuilder and local dispatch`，
+head branch 为 `feat/host-phase5-local-dispatch`，base branch 为 `main`。PR readiness：所有 Phase 5 design refinement、
+plan、6 个 implementation slices、code review、fix / re-review、aggregate deepreview、controller 裁决、accepted local commits、
+branch push 与 draft PR create 均已完成并记录 artifact / commit hash / PR URL；工作区检查为 clean；剩余风险均已有后续
+owner。后续 Phase 6 / 7 / 9 / 10 / 11 / 13 / 14 以及集成环境验证必须继续接收各自 deferred 项。
 
 历史状态：Phase 1 公共契约与 runtime 基础设施已完成并 merge；Phase 2 Durable Store / EventLog / Payload Foundation 已完成 plan、3 个 implementation slices、aggregate deepreview、aggregate fix、aggregate re-review 与 accepted deepreview commit，本 phase 状态为 completed。Phase 1 design refinement 已写入 `docs/reviews/gateflow-phase-design-host-p1-codex-20260513.md`，controller-accepted design fix 已写入 `docs/reviews/gateflow-phase-design-fix-host-p1-codex-20260513.md`。用户反馈后的 design fixes 已写入 `docs/reviews/gateflow-phase-design-user-feedback-fix-host-p1-codex-20260513.md` 与 `docs/reviews/gateflow-phase-design-user-feedback-fix2-host-p1-codex-20260513.md`。AgentMiMo 与 AgentDS 的 phase design re-review 均确认 accepted findings 已修复且 new blocker 为 0；round2 re-review 进一步确认 lane 已改为 cross-process runtime capacity guard，Phase Map 已重排为 P12 ToolsDiscovery / ScenePrepare、P13 Audit / Tool Trace / Outbox、P14 RemoteProxy、P15 Retention / Purge。Phase 1 plan 已写入 `docs/host/phase1-public-contract-runtime-plan.md`；plan review、controller adjudication、plan fix 与 plan re-review artifacts 已写入 `docs/reviews/`。AgentMiMo 与 AgentDS 的 plan re-review 均确认 finding 数量为 0、blocking finding 数量为 0。用户已确认 Phase 1 plan；accepted plan commit 为 `34b1b41`。Phase 1 Slice 1 accepted slice commit 为 `66d8dc3`，Slice 2 accepted slice commit 为 `27e0d8b`，Slice 3 accepted slice commit 为 `e23e3e4`，Slice 4 accepted slice commit 为 `0393a22`。
 
