@@ -220,14 +220,16 @@ Phase Map 中每个 phase 必须使用统一条目格式。模板如下：
 
 ## 当前状态
 
-PR 54 `Host Phase 5 RunInputBuilder and local dispatch` 当前为 OPEN draft PR，branch 为 `feat/host-phase5-local-dispatch`，
-当前 gate 为 draft review-ready。最近一次 corrected gate 是 P1-P5 当前全量 snapshot design conformance review；AgentMiMo、
-AgentDS、AgentCodex 三路 verdict 均为 PASS，blocking design deviation 为 0。Controller adjudication artifact 为
+Phase 5 `RunInputBuilder 与本地执行 Dispatch` 已完成。PR 54
+`Host Phase 5 RunInputBuilder and local dispatch` 已完成 Phase 5 aggregate review、PR review fix、追加并行 review、全仓 review
+与 P1-P5 corrected design conformance review；最近一次 corrected gate 的 AgentMiMo、AgentDS、AgentCodex 三路 verdict 均为
+PASS，blocking design deviation 为 0。Controller adjudication artifact 为
 `docs/reviews/p1-p5-design-conformance-review-controller-adjudication-20260515.md`。
 
-当前不处于 implementation / fix gate；没有 accepted blocking finding 待修。需要继续追踪的 non-blocking hardening、
+当前不处于 implementation / fix gate；没有 accepted blocking finding 待修。用户手工 merge PR 54 后，下一步按 `$phaseflow`
+推进 Phase 6 `ToolRuntime / Truncation / fetch_more / Duplicate Governance`。需要继续追踪的 non-blocking hardening、
 deferred capability 与后续 phase owner 已写入 `Open Questions 与风险追踪` 的
-`PR 54 / P1-P5 corrected review 残余风险追踪`。
+`PR 54 / P1-P5 corrected review 残余风险追踪`，进入 P6 前必须作为 phase discussion / plan 输入。
 
 ## Phase Map
 
