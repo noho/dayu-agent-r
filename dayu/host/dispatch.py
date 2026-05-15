@@ -13,11 +13,12 @@ import asyncio
 import os
 from dataclasses import dataclass
 from datetime import UTC, datetime
+from threading import RLock
 from uuid import uuid4
 
 from dayu.contracts.cancellation import CancellationToken
 from dayu.contracts.json_value import JsonValue
-from dayu.host.admission import PendingDispatchRecord
+from dayu.host.admission import PendingDispatchRecord, create_host_admission_service
 from dayu.host.api import (
     AttemptDispatchSnapshot,
     AttemptStatus,
@@ -56,6 +57,11 @@ from dayu.host.durable.state import (
     read_run_by_id,
 )
 from dayu.host.durable.transaction import HostTransaction, HostTransactionRunner
+from dayu.host.engine_ingest import (
+    EngineEventCandidate,
+    EngineEventIngestor,
+    LocalEngineEnvelope,
+)
 from dayu.host.run_input import PolicySnapshot, create_no_tool_run_input_builder
 from dayu.runtime.lane import (
     LaneAcquireCancelled,
@@ -96,32 +102,172 @@ class DispatchDrainResult:
     timed_out: int
 
 
-class _NeverCancelledToken:
-    """当前 Phase 使用的未取消 token。"""
+@dataclass(frozen=True, slots=True)
+class ActiveCancelMessage:
+    """active worker cancel registry 的最小取消消息。
+
+    :param run_id: 目标 Run id。
+    :param attempt_id: 目标 Attempt id。
+    :param execution_id: 目标 execution id。
+    :param reason: 取消原因。
+    """
+
+    run_id: str
+    attempt_id: str
+    execution_id: str
+    reason: str
+
+
+@dataclass(frozen=True, slots=True)
+class _ActiveWorkerEntry:
+    """active worker registry 内部条目。
+
+    :param run_id: 目标 Run id。
+    :param handle: worker handle。
+    :param cancellation_token: Host 注入 Engine 的取消 token。
+    """
+
+    run_id: str
+    handle: LocalWorkerHandle
+    cancellation_token: "_HostCancellationToken"
+
+
+class ActiveWorkerRegistry:
+    """进程内 active worker handle registry。
+
+    registry 只提供 best-effort cancel 传播；durable EventLog / Run state
+    仍是取消请求是否被接受的真源。
+    """
+
+    def __init__(self) -> None:
+        """初始化空 registry。
+
+        :returns: ``None``。
+        """
+
+        self._lock = RLock()
+        self._entries: dict[tuple[str, str], _ActiveWorkerEntry] = {}
+
+    def register(
+        self,
+        *,
+        run_id: str,
+        attempt_id: str,
+        execution_id: str,
+        handle: LocalWorkerHandle,
+        cancellation_token: "_HostCancellationToken",
+    ) -> None:
+        """注册 active worker handle。
+
+        :param run_id: 目标 Run id。
+        :param attempt_id: active Attempt id。
+        :param execution_id: active execution id。
+        :param handle: worker handle。
+        :param cancellation_token: 注入 Engine 的取消 token。
+        :returns: ``None``。
+        """
+
+        with self._lock:
+            self._entries[(attempt_id, execution_id)] = _ActiveWorkerEntry(
+                run_id=run_id,
+                handle=handle,
+                cancellation_token=cancellation_token,
+            )
+
+    def unregister(self, *, attempt_id: str, execution_id: str) -> None:
+        """注销 active worker handle。
+
+        :param attempt_id: active Attempt id。
+        :param execution_id: active execution id。
+        :returns: ``None``。
+        """
+
+        with self._lock:
+            self._entries.pop((attempt_id, execution_id), None)
+
+    def cancel(self, message: ActiveCancelMessage) -> bool:
+        """向 active worker best-effort 传播 cancel。
+
+        :param message: 最小取消消息。
+        :returns: 找到匹配 active worker 时返回 ``True``。
+        """
+
+        with self._lock:
+            entry = self._entries.get((message.attempt_id, message.execution_id))
+        if entry is None or entry.run_id != message.run_id:
+            return False
+        entry.cancellation_token.request_cancel(message.reason)
+        try:
+            entry.handle.cancel(message.reason)
+        except RuntimeError:
+            return True
+        return True
+
+
+class _HostCancellationToken:
+    """Host 可写入、Engine 可观察的取消 token。"""
 
     def is_cancelled(self) -> bool:
         """返回是否已取消。
 
-        :returns: 始终为 ``False``。
+        :returns: 已请求取消时返回 ``True``。
         """
 
-        return False
+        with self._lock:
+            return self._reason is not None
 
     def cancel_reason(self) -> str | None:
         """返回取消原因。
 
-        :returns: 始终为 ``None``。
+        :returns: 取消原因；未取消时返回 ``None``。
         """
 
-        return None
+        with self._lock:
+            return self._reason
 
     def requested_at(self) -> datetime | None:
         """返回取消请求时间。
 
-        :returns: 始终为 ``None``。
+        :returns: 请求时间；未取消时返回 ``None``。
         """
 
-        return None
+        with self._lock:
+            return self._requested_at
+
+    def __init__(self) -> None:
+        """初始化未取消 token。
+
+        :returns: ``None``。
+        """
+
+        self._lock = RLock()
+        self._reason: str | None = None
+        self._requested_at: datetime | None = None
+
+    def request_cancel(self, reason: str) -> None:
+        """标记 token 已请求取消。
+
+        :param reason: 取消原因。
+        :returns: ``None``。
+        """
+
+        with self._lock:
+            if self._reason is None:
+                self._reason = reason
+                self._requested_at = datetime.now(UTC)
+
+
+DEFAULT_ACTIVE_WORKER_REGISTRY = ActiveWorkerRegistry()
+
+
+def cancel_active_worker(message: ActiveCancelMessage) -> bool:
+    """通过默认 active registry best-effort 传播 cancel。
+
+    :param message: 最小取消消息。
+    :returns: 找到匹配 active worker 时返回 ``True``。
+    """
+
+    return DEFAULT_ACTIVE_WORKER_REGISTRY.cancel(message)
 
 
 class HostDispatchScheduler:
@@ -135,6 +281,7 @@ class HostDispatchScheduler:
         local_execution: HostLocalExecutionOptions,
         lane_controller: LaneController,
         host_handle_id: str,
+        active_registry: ActiveWorkerRegistry | None = None,
     ) -> None:
         """初始化 dispatch scheduler。
 
@@ -143,6 +290,7 @@ class HostDispatchScheduler:
         :param local_execution: 本地执行配置。
         :param lane_controller: 已打开的 runtime lane controller。
         :param host_handle_id: Host handle 诊断 id。
+        :param active_registry: active worker registry；不传时使用默认 registry。
         :returns: ``None``。
         :raises ValueError: ``host_handle_id`` 为空时抛出。
         """
@@ -154,6 +302,11 @@ class HostDispatchScheduler:
         self._local_execution = local_execution
         self._lane_controller = lane_controller
         self._host_handle_id = host_handle_id
+        self._active_registry = (
+            active_registry
+            if active_registry is not None
+            else DEFAULT_ACTIVE_WORKER_REGISTRY
+        )
         self._queue: asyncio.Queue[PendingDispatchRecord] = asyncio.Queue()
         self._closed = False
         self._drain_task: asyncio.Task[None] | None = None
@@ -167,12 +320,14 @@ class HostDispatchScheduler:
         transaction_runner: HostTransactionRunner,
         local_execution: HostLocalExecutionOptions,
         host_handle_id: str,
+        active_registry: ActiveWorkerRegistry | None = None,
     ) -> "HostDispatchScheduler":
         """打开本地 dispatch scheduler。
 
         :param transaction_runner: Host durable transaction runner。
         :param local_execution: 本地执行配置。
         :param host_handle_id: Host handle 诊断 id。
+        :param active_registry: active worker registry；不传时使用默认 registry。
         :returns: 已打开 scheduler。
         """
 
@@ -209,6 +364,7 @@ class HostDispatchScheduler:
             local_execution=local_execution,
             lane_controller=lane_controller,
             host_handle_id=host_handle_id,
+            active_registry=active_registry,
         )
 
     def wake_dispatch(self, record: PendingDispatchRecord) -> None:
@@ -224,6 +380,21 @@ class HostDispatchScheduler:
         self._queue.put_nowait(record)
         if self._drain_task is None or self._drain_task.done():
             self._drain_task = asyncio.create_task(self._drain_loop())
+
+    def wake_queue_promotion(self, session_id: str) -> None:
+        """唤醒同 Session 的 queued Run promotion。
+
+        :param session_id: 目标 Session id。
+        :returns: ``None``。
+        :raises RuntimeError: scheduler 已关闭时抛出。
+        """
+
+        if self._closed:
+            raise RuntimeError("HostDispatchScheduler is closed")
+        create_host_admission_service(
+            self._transaction_runner,
+            wakeup_port=self,
+        ).promote_next_queued_run(session_id)
 
     async def drain_once(self) -> DispatchDrainResult:
         """同步处理当前队列中的 dispatch wakeup。
@@ -429,7 +600,8 @@ class HostDispatchScheduler:
         :returns: ``dispatched``、``skipped`` 或 ``timed_out``。
         """
 
-        snapshot = self._snapshot_from_dispatch(record)
+        cancellation_token = _HostCancellationToken()
+        snapshot = self._snapshot_from_dispatch(record, cancellation_token)
         request = create_no_tool_run_input_builder(
             transaction_runner=self._transaction_runner,
             policy_snapshot=PolicySnapshot(
@@ -458,22 +630,37 @@ class HostDispatchScheduler:
             await handle.close()
             await token.release()
             return "skipped"
-        task = asyncio.create_task(self._consume_worker_events(handle, token))
+        self._active_registry.register(
+            run_id=record.run_id,
+            attempt_id=record.attempt_id,
+            execution_id=record.execution_id,
+            handle=handle,
+            cancellation_token=cancellation_token,
+        )
+        task = asyncio.create_task(
+            self._consume_worker_events(
+                record=record,
+                handle=handle,
+                token=token,
+                cancellation_token=cancellation_token,
+            )
+        )
         self._active_handles.add(handle)
         self._active_tasks.add(task)
         task.add_done_callback(self._active_tasks.discard)
         return "dispatched"
 
     def _snapshot_from_dispatch(
-        self, record: PendingDispatchRecord
+        self, record: PendingDispatchRecord, cancellation_token: _HostCancellationToken
     ) -> AttemptDispatchSnapshot:
         """从 durable dispatch row 构造 RunInputBuilder snapshot。
 
         :param record: pending dispatch 摘要。
+        :param cancellation_token: Host 注入 Engine 的取消 token。
         :returns: Attempt dispatch snapshot。
         """
 
-        token: CancellationToken = _NeverCancelledToken()
+        token: CancellationToken = cancellation_token
         return AttemptDispatchSnapshot(
             session_id=self._read_run_session_id(record.run_id),
             run_id=record.run_id,
@@ -604,20 +791,55 @@ class HostDispatchScheduler:
         self._transaction_runner.run_write(_operation)
 
     async def _consume_worker_events(
-        self, handle: LocalWorkerHandle, token: LaneClaimToken
+        self,
+        *,
+        record: PendingDispatchRecord,
+        handle: LocalWorkerHandle,
+        token: LaneClaimToken,
+        cancellation_token: _HostCancellationToken,
     ) -> None:
         """消费 worker EngineEvent stream 并在结束时释放 lane。
 
+        :param record: pending dispatch 摘要。
         :param handle: worker handle。
         :param token: runtime lane token。
+        :param cancellation_token: Host 注入 Engine 的取消 token。
         :returns: ``None``。
         """
 
+        envelope = LocalEngineEnvelope(
+            session_id=self._read_run_session_id(record.run_id),
+            run_id=record.run_id,
+            attempt_id=record.attempt_id,
+            execution_id=record.execution_id,
+            dispatch_record_id=record.dispatch_record_id,
+            worker_kind=record.worker_kind,
+            execution_target=record.execution_target,
+            local_worker_id=handle.local_worker_id,
+            cancellation_token=cancellation_token,
+        )
+        ingestor = EngineEventIngestor(
+            transaction_runner=self._transaction_runner,
+            wakeup_port=self,
+        )
+        worker_event_index = 0
         try:
-            async for _event in handle.events():
-                pass
+            async for event in handle.events():
+                worker_event_index += 1
+                ingestor.ingest(
+                    EngineEventCandidate(
+                        envelope=envelope,
+                        worker_event_index=worker_event_index,
+                        engine_event=event,
+                        observed_at=datetime.now(UTC),
+                    )
+                )
         finally:
             self._active_handles.discard(handle)
+            self._active_registry.unregister(
+                attempt_id=record.attempt_id,
+                execution_id=record.execution_id,
+            )
             await handle.close()
             await token.release()
 
@@ -805,4 +1027,11 @@ async def _suppress_task_cancel(task: asyncio.Task[None]) -> None:
         return
 
 
-__all__ = ["DispatchDrainResult", "HostDispatchScheduler"]
+__all__ = [
+    "ActiveCancelMessage",
+    "ActiveWorkerRegistry",
+    "DEFAULT_ACTIVE_WORKER_REGISTRY",
+    "DispatchDrainResult",
+    "HostDispatchScheduler",
+    "cancel_active_worker",
+]

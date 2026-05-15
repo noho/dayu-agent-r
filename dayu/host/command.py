@@ -77,6 +77,7 @@ from dayu.host.durable.transaction import (
     HostTransactionRunner,
     T,
 )
+from dayu.host.dispatch import ActiveCancelMessage, cancel_active_worker
 
 _GENERATED_HANDLE_ID_PREFIX = "host-command"
 _OPERATION_CREATE_SESSION = "create_session"
@@ -356,9 +357,9 @@ def cancel_run(
 ) -> RunSnapshot:
     """取消单个 Run，并返回最新 Run snapshot。
 
-    Phase 4 只覆盖 queued 与 pre-dispatch ``STARTING``；dispatching /
-    active worker 取消由 Phase 5 负责，``WAITING`` 取消由 Phase 7 负责，
-    ``RECOVERING`` 取消由 Phase 11 负责。
+    当前覆盖 queued、pre-dispatch ``STARTING``、pre-accept dispatching 与
+    active worker；``WAITING`` 取消由 Phase 7 负责，``RECOVERING`` 取消由
+    Phase 11 负责。
 
     :param host: Host command handle。
     :param run_id: 目标 Run id。
@@ -387,6 +388,18 @@ def cancel_run(
                 retryable=False,
             ) from exc
         raise
+    _propagate_active_cancel_targets(
+        (
+            ActiveCancelMessage(
+                run_id=result.active_cancel_target.run_id,
+                attempt_id=result.active_cancel_target.attempt_id,
+                execution_id=result.active_cancel_target.execution_id,
+                reason=result.active_cancel_target.reason,
+            ),
+        )
+        if result.active_cancel_target is not None
+        else ()
+    )
     return run_snapshot_from_row(result.run)
 
 
@@ -395,11 +408,11 @@ def cancel_session_runs(
     session_id: str,
     request: CancelSessionRunsRequest,
 ) -> SessionSnapshot:
-    """取消指定 Session 下 Phase 4 支持子集中的所有非终态 Run。
+    """取消指定 Session 下当前支持子集中的所有非终态 Run。
 
-    Phase 4 只覆盖 queued 与 pre-dispatch ``STARTING``；dispatching /
-    active worker、``WAITING``、``RECOVERING`` 分别由 Phase 5、Phase 7、
-    Phase 11 负责。
+    当前覆盖 queued、pre-dispatch ``STARTING``、pre-accept dispatching 与
+    active worker；``WAITING``、``RECOVERING`` 分别由 Phase 7、Phase 11
+    负责。
 
     :param host: Host command handle。
     :param session_id: 目标 Session id。
@@ -416,6 +429,17 @@ def cancel_session_runs(
             session_id=session_id,
             request=request,
         ),
+    )
+    _propagate_active_cancel_targets(
+        tuple(
+            ActiveCancelMessage(
+                run_id=target.run_id,
+                attempt_id=target.attempt_id,
+                execution_id=target.execution_id,
+                reason=target.reason,
+            )
+            for target in result.active_cancel_targets
+        )
     )
     return result.snapshot
 
@@ -781,6 +805,19 @@ def _operation_context_json_value(context: OperationContext) -> JsonValue:
     }
 
 
+def _propagate_active_cancel_targets(
+    targets: tuple[ActiveCancelMessage, ...]
+) -> None:
+    """向 active worker registry best-effort 传播取消。
+
+    :param targets: durable commit 后需要传播的 active cancel 目标集合。
+    :returns: ``None``。
+    """
+
+    for target in targets:
+        cancel_active_worker(target)
+
+
 def _is_deferred_cancel_state(host: HostCommandHandle, run_id: str) -> bool:
     """判断当前 Run 状态是否属于后续 phase 的 cancel 能力。
 
@@ -811,19 +848,21 @@ class _IsDeferredCancelStateOperation:
             return False
         if run.status in (
             RunStatus.WAITING,
-            RunStatus.CANCELLING,
             RunStatus.RECOVERING,
         ):
             return True
-        if run.status != RunStatus.RUNNING:
+        if run.status not in (RunStatus.RUNNING, RunStatus.CANCELLING):
             return False
-        return not _is_predispatch_starting_run(transaction, run)
+        return not (
+            _is_predispatch_starting_run(transaction, run)
+            or _is_active_worker_cancelable_run(transaction, run)
+        )
 
 
 def _is_predispatch_starting_run(
     transaction: HostTransaction, run: RunRow
 ) -> bool:
-    """判断 Run 是否仍是 Phase 4 可直接取消的 pre-dispatch STARTING。
+    """判断 Run 是否仍是可直接取消的 pre-dispatch STARTING。
 
     :param transaction: 当前 Host transaction。
     :param run: 目标 Run row。
@@ -835,7 +874,43 @@ def _is_predispatch_starting_run(
         attempt is not None
         and attempt.status == AttemptStatus.STARTING
         and dispatch_record is not None
-        and dispatch_record.status == DispatchRecordStatus.PENDING
+        and _is_direct_cancelable_dispatch_record(dispatch_record)
+    )
+
+
+def _is_active_worker_cancelable_run(
+    transaction: HostTransaction, run: RunRow
+) -> bool:
+    """判断 Run 是否处于 Phase 5 active worker cancel 子集。
+
+    :param transaction: 当前 Host transaction。
+    :param run: 目标 Run row。
+    :returns: 可 active cancel 时返回 ``True``。
+    """
+
+    attempt, _dispatch_record = _read_attempt_and_dispatch_for_run(transaction, run)
+    return attempt is not None and attempt.status == AttemptStatus.RUNNING
+
+
+def _is_direct_cancelable_dispatch_record(
+    dispatch_record: DispatchRecordRow,
+) -> bool:
+    """判断 dispatch record 是否仍可 pre-worker direct cancel。
+
+    :param dispatch_record: dispatch record row。
+    :returns: 可 direct cancel 时返回 ``True``。
+    """
+
+    if dispatch_record.status in (
+        DispatchRecordStatus.PENDING,
+        DispatchRecordStatus.WAITING_FOR_LANE,
+    ):
+        return True
+    return (
+        dispatch_record.status == DispatchRecordStatus.DISPATCHING
+        and dispatch_record.worker_accepted_at is None
+        and dispatch_record.worker_accept_event_id is None
+        and dispatch_record.worker_accept_event_sequence is None
     )
 
 

@@ -2,7 +2,9 @@
 
 from __future__ import annotations
 
+import os
 import sqlite3
+from datetime import UTC, datetime
 from pathlib import Path
 
 import pytest
@@ -29,6 +31,30 @@ from dayu.host import (
     submit_followup,
 )
 from dayu.host.api import EnsureSessionRequest
+from dayu.host.durable.connection import open_host_durable_store
+from dayu.host.durable.event_log import EventLogStore
+from dayu.host.durable.liveness import (
+    HostInstanceIdentity,
+    register_current_instance,
+)
+from dayu.host.durable.options import (
+    HostDurableStoreOptions,
+    HostSQLiteStoragePolicy,
+    PayloadStoragePolicy,
+)
+from dayu.host.durable.run_transition import (
+    AcceptWorkerRunningInput,
+    accept_worker_running_in_transaction,
+)
+from dayu.host.durable.state import (
+    StateMutationStatus,
+    mark_dispatch_waiting_for_lane_row,
+    mark_dispatching_after_lane_row,
+)
+from dayu.host.durable.transaction import HostTransaction, HostTransactionRunner
+
+_NOW = datetime(2026, 5, 15, 1, 2, 3, tzinfo=UTC)
+_LANE_NAME = "llm"
 
 
 def _options(tmp_path: Path) -> HostCommandHandleOptions:
@@ -49,6 +75,26 @@ def _options(tmp_path: Path) -> HostCommandHandleOptions:
         sqlite_write_retry_backoff_multiplier=1.2,
         sqlite_write_retry_max_delay_seconds=0.02,
         payload_inline_threshold_bytes=4096,
+    )
+
+
+def _durable_options(tmp_path: Path) -> HostDurableStoreOptions:
+    """构造测试用 durable store options。
+
+    :param tmp_path: pytest 临时目录。
+    :returns: Host durable store options。
+    """
+
+    return HostDurableStoreOptions(
+        db_path=tmp_path / "host.sqlite3",
+        payload_policy=PayloadStoragePolicy(artifact_root=tmp_path / "artifacts"),
+        sqlite_policy=HostSQLiteStoragePolicy(
+            busy_timeout_seconds=1.0,
+            write_busy_retry_count=8,
+            write_retry_initial_delay_seconds=0.001,
+            write_retry_backoff_multiplier=1.2,
+            write_retry_max_delay_seconds=0.02,
+        ),
     )
 
 
@@ -169,6 +215,23 @@ def _event_count(db_path: Path) -> int:
     return int(row[0])
 
 
+def _event_type_count(db_path: Path, event_type: str) -> int:
+    """统计指定 EventLog 类型数量。
+
+    :param db_path: SQLite DB 路径。
+    :param event_type: event type。
+    :returns: 指定类型 row 数。
+    """
+
+    with sqlite3.connect(db_path) as connection:
+        row = connection.execute(
+            "SELECT COUNT(*) FROM event_log WHERE event_type = ?",
+            (event_type,),
+        ).fetchone()
+    assert row is not None
+    return int(row[0])
+
+
 def _run_status(db_path: Path, run_id: str) -> RunStatus:
     """从 durable Run table 读取当前 Run 状态。
 
@@ -187,18 +250,77 @@ def _run_status(db_path: Path, run_id: str) -> RunStatus:
     return RunStatus(str(row[0]))
 
 
-def _mark_attempt_running(db_path: Path, attempt_id: str) -> None:
-    """把 Attempt 直接改成 RUNNING 以模拟 Phase 5 active worker 状态。
+def _accept_active_worker(
+    transaction_runner: HostTransactionRunner, *, run_id: str, attempt_id: str
+) -> None:
+    """用 durable transition helper 构造 active worker accepted 状态。
+
+    :param transaction_runner: Host transaction runner。
+    :param run_id: 目标 Run id。
+    :param attempt_id: Attempt id。
+    :returns: 无返回值。
+    """
+
+    def _operation(transaction: HostTransaction) -> None:
+        register_current_instance(
+            transaction,
+            HostInstanceIdentity(
+                host_instance_id="host-cancel-session-api",
+                pid=os.getpid(),
+                process_start_token="public-cancel-session-api",
+                boot_id=None,
+            ),
+        )
+        waiting_result = mark_dispatch_waiting_for_lane_row(
+            transaction,
+            attempt_id=attempt_id,
+            owner_host_instance_id="host-cancel-session-api",
+            lane_name=_LANE_NAME,
+            waiting_for_lane_at="2026-05-15T01:02:03.000000Z",
+        )
+        assert waiting_result.status == StateMutationStatus.UPDATED
+        dispatching_result = mark_dispatching_after_lane_row(
+            transaction,
+            attempt_id=attempt_id,
+            owner_host_instance_id="host-cancel-session-api",
+            lane_name=_LANE_NAME,
+            lane_claim_id=f"claim-{attempt_id}",
+            lane_owner_id="owner-cancel-session-api",
+            lane_acquired_at="2026-05-15T01:02:03.000000Z",
+            dispatching_at="2026-05-15T01:02:03.000000Z",
+        )
+        assert dispatching_result.status == StateMutationStatus.UPDATED
+        accepted = accept_worker_running_in_transaction(
+            transaction,
+            EventLogStore(),
+            AcceptWorkerRunningInput(
+                run_id=run_id,
+                attempt_id=attempt_id,
+                attempt_running_event_id=f"event-attempt-running-{attempt_id}",
+                occurred_at=_NOW,
+                actor="host.dispatch",
+                source="host.dispatch",
+                worker_accept_reason="local_worker_accepted",
+            ),
+        )
+        assert accepted.status == StateMutationStatus.UPDATED
+
+    transaction_runner.run_write(_operation)
+
+
+def _mark_run_status(db_path: Path, run_id: str, status: RunStatus) -> None:
+    """直接更新 Run status 以构造 deferred non-terminal 状态。
 
     :param db_path: SQLite DB 路径。
-    :param attempt_id: Attempt id。
+    :param run_id: Run id。
+    :param status: 目标 Run status。
     :returns: 无返回值。
     """
 
     with sqlite3.connect(db_path) as connection:
         connection.execute(
-            "UPDATE host_attempts SET status = ? WHERE attempt_id = ?",
-            ("running", attempt_id),
+            "UPDATE host_runs SET status = ? WHERE run_id = ?",
+            (status.value, run_id),
         )
 
 
@@ -262,16 +384,17 @@ def test_cancel_session_runs_idempotent_replay_does_not_cancel_new_run(
 def test_cancel_session_runs_unsupported_non_terminal_has_no_partial_mutation(
     tmp_path: Path,
 ) -> None:
-    """存在 unsupported non-terminal 时返回 unsupported 且不部分取消 queued Run。"""
+    """存在 WAITING non-terminal 时返回 unsupported 且不部分取消 queued Run。"""
 
     options = _options(tmp_path)
     host = create_host_command_handle(options)
     try:
         session_id = _session_id(host, "slot-a")
         active = start_run(host, _start_request(session_id, "start-active"))
-        assert active.current_attempt_id is not None
         queued = start_run(host, _start_request(session_id, "start-queued"))
-        _mark_attempt_running(options.db_path, active.current_attempt_id)
+        # 这里仅构造 WAITING 分类测试所需的 deferred 状态，不模拟生产
+        # transition；该用例只验证 unsupported 分类不会产生 partial mutation。
+        _mark_run_status(options.db_path, active.run_id, RunStatus.WAITING)
         before_cancel = _event_count(options.db_path)
 
         with pytest.raises(HostApiError) as exc_info:
@@ -281,8 +404,72 @@ def test_cancel_session_runs_unsupported_non_terminal_has_no_partial_mutation(
 
         assert exc_info.value.code == HostApiErrorCode.UNSUPPORTED_OPERATION
         assert _event_count(options.db_path) == before_cancel
-        assert _run_status(options.db_path, active.run_id) == RunStatus.RUNNING
+        assert _run_status(options.db_path, active.run_id) == RunStatus.WAITING
         assert _run_status(options.db_path, queued.run_id) == RunStatus.QUEUED
+    finally:
+        host.close()
+
+
+def test_cancel_session_runs_cancels_queued_and_active_worker(
+    tmp_path: Path,
+) -> None:
+    """cancel_session_runs 支持 queued 与 active worker 子集。"""
+
+    options = _options(tmp_path)
+    host = create_host_command_handle(options)
+    try:
+        session_id = _session_id(host, "slot-a")
+        active = start_run(host, _start_request(session_id, "start-active"))
+        assert active.current_attempt_id is not None
+        queued = start_run(host, _start_request(session_id, "start-queued"))
+        with open_host_durable_store(_durable_options(tmp_path)) as store:
+            _accept_active_worker(
+                store.transaction_runner,
+                run_id=active.run_id,
+                attempt_id=active.current_attempt_id,
+            )
+
+        snapshot = cancel_session_runs(
+            host, session_id, _cancel_request("cancel-session-active")
+        )
+
+        assert snapshot.active_run_id == active.run_id
+        assert snapshot.queued_run_ids == ()
+        assert _run_status(options.db_path, active.run_id) == RunStatus.CANCELLING
+        assert _run_status(options.db_path, queued.run_id) == RunStatus.CANCELLED
+        assert _event_type_count(options.db_path, "RUN_CANCELLING") == 1
+    finally:
+        host.close()
+
+
+def test_cancel_session_runs_active_replay_does_not_append_facts(
+    tmp_path: Path,
+) -> None:
+    """active session cancel replay 不重复追加 CANCEL_REQUESTED / RUN_CANCELLING。"""
+
+    options = _options(tmp_path)
+    host = create_host_command_handle(options)
+    try:
+        session_id = _session_id(host, "slot-a")
+        active = start_run(host, _start_request(session_id, "start-active"))
+        assert active.current_attempt_id is not None
+        with open_host_durable_store(_durable_options(tmp_path)) as store:
+            _accept_active_worker(
+                store.transaction_runner,
+                run_id=active.run_id,
+                attempt_id=active.current_attempt_id,
+            )
+        request = _cancel_request("cancel-session-active")
+
+        first = cancel_session_runs(host, session_id, request)
+        after_first_events = _event_count(options.db_path)
+        replay = cancel_session_runs(host, session_id, request)
+
+        assert first == replay
+        assert _run_status(options.db_path, active.run_id) == RunStatus.CANCELLING
+        assert _event_count(options.db_path) == after_first_events
+        assert _event_type_count(options.db_path, "CANCEL_REQUESTED") == 1
+        assert _event_type_count(options.db_path, "RUN_CANCELLING") == 1
     finally:
         host.close()
 
