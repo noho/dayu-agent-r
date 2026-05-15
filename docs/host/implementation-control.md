@@ -238,11 +238,15 @@ PASS，blocking design deviation 为 0。Controller adjudication artifact 为
 `docs/reviews/host-phase6-plan-re-review-mimo-20260515.md` 与
 `docs/reviews/host-phase6-plan-re-review-ds-20260515.md`；controller plan re-review adjudication artifact 为
 `docs/reviews/host-phase6-plan-re-review-controller-adjudication-20260515.md`。两路 re-review 均 PASS，blocking count 为 0。
-Phase 6 accepted plan commit 为 `04517f5`。
-当前 gate 为 Phase 6 implementation user confirmation；用户确认后从 P6-S1
-`Effective ToolBundle And RunInputBuilder Wiring` 开始 implementation。需要继续追踪的 non-blocking hardening、
-deferred capability 与后续 phase owner 已写入 `Open Questions 与风险追踪` 的
-`PR 54 / P1-P5 corrected review 残余风险追踪`，进入 P6 implementation 前必须作为输入。
+Phase 6 accepted plan commits 为 `04517f5` / `a5863ce`。P6-S1
+`Effective ToolBundle And RunInputBuilder Wiring` 已完成 implementation、双路 code review 与 controller adjudication，
+accepted checkpoint commit 为 `b49ba56`。P6-S1 artifacts 为
+`docs/reviews/host-phase6-implementation-s1-effective-toolbundle-20260515.md`、
+`docs/reviews/host-phase6-code-review-s1-mimo-20260515.md`、
+`docs/reviews/host-phase6-code-review-s1-ds-20260515.md` 与
+`docs/reviews/host-phase6-code-review-s1-controller-adjudication-20260515.md`。当前 gate 为 Phase 6 P6-S2 implementation
+ready。需要继续追踪的 non-blocking hardening、deferred capability 与后续 phase owner 已写入 `Open Questions 与风险追踪` 的
+`PR 54 / P1-P5 corrected review 残余风险追踪` 以及 P6-S1 controller adjudication residual risks。
 
 ## Phase Map
 
