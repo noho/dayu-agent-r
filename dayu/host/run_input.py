@@ -8,10 +8,9 @@ LocalProxy、ToolRuntime、Memory projection 或 Context Governance。
 
 from __future__ import annotations
 
-import json
 from collections.abc import Mapping
 from dataclasses import dataclass
-from typing import Protocol, cast
+from typing import Protocol
 
 from dayu.contracts.json_value import JsonValue
 from dayu.contracts.tool_call import BatchToolExecutionRequest
@@ -33,6 +32,12 @@ from dayu.engine.contracts.messages import (
     UserMessage,
 )
 from dayu.engine.contracts.runner_spec import RunnerCallOptions, RunnerSpec
+from dayu.host._event_payload import (
+    payload_object as _payload_object,
+)
+from dayu.host._event_payload import (
+    required_payload_text as _required_payload_text,
+)
 from dayu.host.api import AttemptDispatchSnapshot
 from dayu.host.api import AttemptStatus, RunStatus
 from dayu.host.durable.event_log import (
@@ -810,40 +815,6 @@ def _validate_current_event_scope(
 
     if event.session_id != snapshot.session_id or event.run_id != snapshot.run_id:
         raise HostDurableError("RunInputBuilder current event scope mismatch")
-
-
-def _payload_object(event: EventLogRow) -> Mapping[str, JsonValue]:
-    """解析 EventLog payload JSON 映射。
-
-    :param event: EventLog row。
-    :returns: payload 映射。
-    :raises HostDurableError: payload 不是 JSON 映射时抛出。
-    """
-
-    try:
-        value = cast(JsonValue, json.loads(event.payload_json))
-    except json.JSONDecodeError as exc:
-        raise HostDurableError("EventLog payload_json is invalid") from exc
-    if not isinstance(value, Mapping):
-        raise HostDurableError("EventLog payload_json must be a JSON mapping")
-    return cast(Mapping[str, JsonValue], value)
-
-
-def _required_payload_text(
-    payload: Mapping[str, JsonValue], *, field_name: str
-) -> str:
-    """读取 payload 中的必填文本字段。
-
-    :param payload: payload 映射。
-    :param field_name: 字段名。
-    :returns: 文本值。
-    :raises HostDurableError: 字段缺失或不是非空文本时抛出。
-    """
-
-    value = payload.get(field_name)
-    if not isinstance(value, str) or value.strip() == "":
-        raise HostDurableError(f"payload field {field_name} must be non-empty text")
-    return value
 
 
 def _optional_payload_text(

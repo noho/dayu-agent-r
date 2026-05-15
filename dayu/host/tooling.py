@@ -12,34 +12,12 @@ from dataclasses import dataclass, field
 from enum import StrEnum
 
 from dayu.contracts.tool_declaration import ToolBundle
-
-
-def _require_non_empty(value: str, *, field_name: str) -> None:
-    """校验必填字符串字段非空。
-
-    :param value: 待校验的字符串值。
-    :param field_name: 错误消息中使用的字段名。
-    :returns: 无返回值。
-    :raises ValueError: 字符串为空或仅包含空白字符时抛出。
-    """
-
-    if value.strip() == "":
-        raise ValueError(f"{field_name} must be non-empty")
-
-
-def _require_optional_non_empty(
-    value: str | None, *, field_name: str
-) -> None:
-    """校验可选字符串字段在存在时非空。
-
-    :param value: 待校验的可选字符串值。
-    :param field_name: 错误消息中使用的字段名。
-    :returns: 无返回值。
-    :raises ValueError: 字符串存在但为空或仅包含空白字符时抛出。
-    """
-
-    if value is not None:
-        _require_non_empty(value, field_name=field_name)
+from dayu.host._public_validation import (
+    require_non_empty as _require_non_empty,
+)
+from dayu.host._public_validation import (
+    require_optional_non_empty as _require_optional_non_empty,
+)
 
 
 class ToolBundleSourceKind(StrEnum):

@@ -170,9 +170,9 @@ async def wait_for_or_cancel(
     :param poll_interval_seconds: 轮询 token 的间隔秒数。
     :returns: 封闭联合 :data:`WaitOutcome`。
 
-    :raises Exception: 透传 ``pending`` 自身的异常（仅在 ``pending``
-        完成分支由调用方读取 ``pending.result()`` 时显式抛出；本 helper
-        不读取 ``pending.result()``，仅返回 ``pending`` 包装值）。
+    :raises Exception: 透传 ``pending`` 自身的异常；``pending`` 完成分支会
+        读取 ``pending.result()``，因此 pending task 中抛出的异常会从本
+        helper 直接传播给调用方。
     """
 
     started_at = time.monotonic()

@@ -134,13 +134,21 @@ class BatchToolExecutionRequest:
         """校验批式入参最小完整性。
 
         :returns: 无返回值。
-        :raises ValueError: ``calls`` 为空时抛出。
+        :raises ValueError: ``calls`` 为空或含重复 ``tool_call_id`` 时抛出。
         """
 
         if not self.calls:
             raise ValueError(
                 "BatchToolExecutionRequest.calls must be non-empty"
             )
+        seen_tool_call_ids: set[str] = set()
+        for call in self.calls:
+            if call.tool_call_id in seen_tool_call_ids:
+                raise ValueError(
+                    "BatchToolExecutionRequest.calls must have unique "
+                    f"tool_call_id values; duplicated {call.tool_call_id!r}"
+                )
+            seen_tool_call_ids.add(call.tool_call_id)
 
 
 __all__ = [

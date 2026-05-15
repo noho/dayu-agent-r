@@ -206,7 +206,7 @@ class ActiveWorkerRegistry:
         return True
 
 
-class _HostCancellationToken:
+class _HostCancellationToken(CancellationToken):
     """Host 可写入、Engine 可观察的取消 token。"""
 
     def is_cancelled(self) -> bool:
@@ -460,8 +460,6 @@ class HostDispatchScheduler:
                 await asyncio.sleep(
                     self._local_execution.dispatch_poll_interval_seconds
                 )
-                if self._queue.empty():
-                    return
             await self.drain_once()
 
     async def _dispatch_one(self, record: PendingDispatchRecord) -> str:

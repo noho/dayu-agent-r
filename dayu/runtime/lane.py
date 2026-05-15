@@ -9,6 +9,7 @@ fencing、Attempt owner、EventLog ordering、admission 或 recovery proof。
 from __future__ import annotations
 
 import asyncio
+import logging
 import os
 import secrets
 import sqlite3
@@ -30,6 +31,7 @@ _SQLITE_MILLISECONDS_PER_SECOND: Final[int] = 1000
 _CLAIM_ID_BYTES: Final[int] = 16
 _OWNER_ID_BYTES: Final[int] = 8
 _CLAIMS_TABLE: Final[str] = "runtime_lane_claims"
+_LOGGER = logging.getLogger(__name__)
 
 
 class RuntimeLaneError(Exception):
@@ -549,10 +551,23 @@ class LaneController:
         )
         try:
             return await asyncio.shield(claim_task)
-        except asyncio.CancelledError:
+        except asyncio.CancelledError as cancelled:
             claim = await claim_task
             if claim.acquired and claim.claim_id is not None:
-                await self._release_untracked_claim(lane_config.name, claim.claim_id)
+                try:
+                    await self._release_untracked_claim(
+                        lane_config.name, claim.claim_id
+                    )
+                except RuntimeLaneError:
+                    _LOGGER.exception(
+                        "runtime lane untracked claim release failed "
+                        "after outer cancellation; claim will rely on TTL cleanup",
+                        extra={
+                            "lane_name": lane_config.name,
+                            "claim_id": claim.claim_id,
+                        },
+                    )
+                    raise cancelled
             raise
 
     def _try_claim_once_sync(self, lane_config: LaneConfig) -> _ClaimAttempt:
@@ -693,7 +708,32 @@ class LaneController:
         release_task = asyncio.create_task(
             asyncio.to_thread(self._release_claim_sync, token.name, token.claim_id)
         )
-        await asyncio.shield(release_task)
+        try:
+            await asyncio.shield(release_task)
+        except asyncio.CancelledError as cancelled:
+            try:
+                await asyncio.shield(release_task)
+            except RuntimeLaneError:
+                _LOGGER.exception(
+                    "runtime lane tracked claim release failed "
+                    "after outer cancellation",
+                    extra={
+                        "lane_name": token.name,
+                        "claim_id": token.claim_id,
+                    },
+                )
+                raise cancelled
+            self._mark_token_released(token)
+            raise
+        self._mark_token_released(token)
+
+    def _mark_token_released(self, token: LaneClaimToken) -> None:
+        """同步标记 token 已释放并唤醒等待者。
+
+        :param token: 已成功释放 DB claim 的 token。
+        :returns: ``None``。
+        """
+
         token.released = True
         self._held_tokens.pop((token.name, token.claim_id), None)
         self._wake_waiters()
@@ -715,7 +755,19 @@ class LaneController:
         release_task = asyncio.create_task(
             asyncio.to_thread(self._release_claim_sync, lane_name, claim_id)
         )
-        await asyncio.shield(release_task)
+        try:
+            await asyncio.shield(release_task)
+        except asyncio.CancelledError as cancelled:
+            try:
+                await asyncio.shield(release_task)
+            except RuntimeLaneError:
+                _LOGGER.exception(
+                    "runtime lane untracked claim release failed "
+                    "after outer cancellation; claim will rely on TTL cleanup",
+                    extra={"lane_name": lane_name, "claim_id": claim_id},
+                )
+                raise cancelled
+            raise
 
     def _release_claim_sync(self, lane_name: str, claim_id: str) -> None:
         """同步删除一个 claim row。

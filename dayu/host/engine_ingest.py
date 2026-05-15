@@ -14,7 +14,6 @@ from collections.abc import Mapping
 from dataclasses import dataclass
 from datetime import UTC, datetime
 from enum import StrEnum
-from typing import cast
 
 from dayu.contracts.cancellation import CancellationToken
 from dayu.contracts.json_value import JsonValue
@@ -76,6 +75,12 @@ from dayu.host.durable.state import (
     read_attempt_by_id,
     read_dispatch_record_by_attempt_id,
     read_run_by_id,
+)
+from dayu.host._event_payload import (
+    payload_object as _payload_object,
+)
+from dayu.host._event_payload import (
+    required_payload_text as _required_payload_text,
 )
 from dayu.host.durable.transaction import HostTransaction, HostTransactionRunner
 
@@ -1836,37 +1841,6 @@ def _tool_awaiting_payload(
         "unsupported_later_owner": _OWNER_PHASE7,
     }
 
-
-def _payload_object(event: EventLogRow) -> Mapping[str, JsonValue]:
-    """解析 EventLog payload JSON 映射。
-
-    :param event: EventLog row。
-    :returns: payload 映射。
-    :raises HostDurableError: payload 不是 JSON 映射时抛出。
-    """
-
-    try:
-        value = cast(JsonValue, json.loads(event.payload_json))
-    except json.JSONDecodeError as exc:
-        raise HostDurableError("EventLog payload_json is invalid") from exc
-    if not isinstance(value, Mapping):
-        raise HostDurableError("EventLog payload_json must be a JSON mapping")
-    return cast(Mapping[str, JsonValue], value)
-
-
-def _required_payload_text(payload: Mapping[str, JsonValue], *, field_name: str) -> str:
-    """读取 payload 中的必填文本字段。
-
-    :param payload: payload 映射。
-    :param field_name: 字段名。
-    :returns: 文本值。
-    :raises HostDurableError: 字段缺失或不是非空文本时抛出。
-    """
-
-    value = payload.get(field_name)
-    if not isinstance(value, str) or value.strip() == "":
-        raise HostDurableError(f"payload.{field_name} must be non-empty text")
-    return value
 
 
 def _single_event_result(row: EventLogRow) -> EngineIngestResult:

@@ -402,6 +402,33 @@ class _FakeWorkerFactory:
         return _AcceptingWorker(self)
 
 
+class _EnqueueOnSecondEmptyQueue(asyncio.Queue[PendingDispatchRecord]):
+    """在第二次 empty 检查后注入一条 dispatch，用于复现 wakeup 窗口。"""
+
+    def __init__(self, injected_record: PendingDispatchRecord) -> None:
+        """初始化测试队列。
+
+        :param injected_record: 第二次 empty 检查时注入的 dispatch 摘要。
+        :returns: ``None``。
+        """
+
+        super().__init__()
+        self._injected_record = injected_record
+        self._empty_calls = 0
+
+    def empty(self) -> bool:
+        """第二次 empty 仍返回 True，但在返回前模拟并发入队。
+
+        :returns: 当前测试队列是否报告为空。
+        """
+
+        self._empty_calls += 1
+        if self._empty_calls == 2:
+            self.put_nowait(self._injected_record)
+            return True
+        return super().empty()
+
+
 @pytest.mark.asyncio
 async def test_pending_waiting_dispatching_worker_accept_marks_running(
     tmp_path: Path,
@@ -438,6 +465,29 @@ async def test_pending_waiting_dispatching_worker_accept_marks_running(
                 == seeded.dispatch_record_id
             )
             assert factory.accepted_requests[0].disable_tools is True
+        finally:
+            await scheduler.close()
+
+
+@pytest.mark.asyncio
+async def test_drain_loop_continues_when_dispatch_arrives_during_empty_window(
+    tmp_path: Path,
+) -> None:
+    """empty / sleep / return 窗口内入队的 dispatch 不应被遗留在队列中。"""
+
+    factory = _FakeWorkerFactory()
+    with open_host_durable_store(_options(tmp_path)) as store:
+        seeded = _seed_current_run(store)
+        scheduler = await _open_scheduler(tmp_path, store, factory)
+        scheduler._queue = _EnqueueOnSecondEmptyQueue(_pending_dispatch(seeded))
+        scheduler._drain_task = asyncio.create_task(scheduler._drain_loop())
+        try:
+            for _ in range(50):
+                if factory.created == 1:
+                    break
+                await asyncio.sleep(0.01)
+            assert factory.created == 1
+            assert scheduler._queue.empty() is True
         finally:
             await scheduler.close()
 

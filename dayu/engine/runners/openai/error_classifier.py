@@ -23,6 +23,7 @@ from __future__ import annotations
 import asyncio
 import json
 from collections.abc import Mapping
+from typing import assert_never
 
 import aiohttp
 
@@ -142,6 +143,8 @@ def is_retriable(error_code: RunnerHTTPErrorCode) -> bool:
             | RunnerHTTPErrorCode.UNKNOWN_HTTP_STATUS
         ):
             return False
+        case _:
+            assert_never(error_code)
 
 
 def _parse_json_object(response_text: str) -> Mapping[str, JsonValue] | None:

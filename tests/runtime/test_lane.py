@@ -8,9 +8,11 @@ controller close 语义。
 from __future__ import annotations
 
 import asyncio
+import logging
 import sqlite3
 from datetime import UTC, datetime
 from pathlib import Path
+from threading import Event
 
 import pytest
 
@@ -27,6 +29,7 @@ from dayu.runtime.lane import (
     RuntimeLaneConfigError,
     RuntimeLaneError,
     SQLiteLaneCoordinatorConfig,
+    _ClaimAttempt,
 )
 
 _LANE_NAME = "llm"
@@ -38,6 +41,7 @@ _FAST_POLL_SECONDS = 0.01
 _SHORT_TIMEOUT_SECONDS = 0.04
 _SLOW_OPERATION_SECONDS = 5.0
 _CANCEL_REASON = "user-stop"
+_THREAD_EVENT_TIMEOUT_SECONDS = 1.0
 
 
 class _FakeCancellationToken:
@@ -175,6 +179,19 @@ def _table_columns(db_path: Path) -> set[str]:
         return {str(row[1]) for row in rows}
     finally:
         connection.close()
+
+
+async def _wait_for_thread_event(event: Event) -> None:
+    """等待线程事件触发，避免取消竞态测试依赖随机 sleep。
+
+    :param event: 待等待的线程事件。
+    :returns: ``None``。
+    """
+
+    triggered = await asyncio.to_thread(
+        event.wait, _THREAD_EVENT_TIMEOUT_SECONDS
+    )
+    assert triggered is True
 
 
 @pytest.mark.asyncio
@@ -444,6 +461,155 @@ async def test_task_cancel_propagates_without_extra_claim(
 
     await held.token.release()
     await controller.close()
+
+
+@pytest.mark.asyncio
+async def test_cancel_during_successful_claim_preserves_cancelled_error_when_cleanup_fails(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """claim 已写入但 cleanup 失败时仍必须向调用方透传 ``CancelledError``。"""
+
+    db_path = tmp_path / "runtime_lanes.sqlite3"
+    controller = await LaneController.open(
+        [_lane_config()], coordinator=_coordinator(db_path)
+    )
+    claim_started = Event()
+    release_claim = Event()
+    original_try_claim_once_sync = controller._try_claim_once_sync
+
+    def slow_claim(lane_config: LaneConfig) -> _ClaimAttempt:
+        """阻塞同步 claim，让测试能稳定取消外层 task。
+
+        :param lane_config: lane 配置。
+        :returns: 原始同步 claim 结果。
+        """
+
+        claim_started.set()
+        assert release_claim.wait(_THREAD_EVENT_TIMEOUT_SECONDS) is True
+        return original_try_claim_once_sync(lane_config)
+
+    def fail_release(lane_name: str, claim_id: str) -> None:
+        """模拟取消清理阶段 release 失败。
+
+        :param lane_name: lane 名称。
+        :param claim_id: claim id。
+        :returns: 不返回。
+        :raises RuntimeLaneError: 始终抛出 release 失败。
+        """
+
+        del lane_name, claim_id
+        raise RuntimeLaneError("release failed")
+
+    monkeypatch.setattr(controller, "_try_claim_once_sync", slow_claim)
+    monkeypatch.setattr(controller, "_release_claim_sync", fail_release)
+    caplog.set_level(logging.ERROR, logger="dayu.runtime.lane")
+
+    task = asyncio.create_task(
+        controller.acquire(_LANE_NAME, timeout_seconds=_SLOW_OPERATION_SECONDS)
+    )
+    await _wait_for_thread_event(claim_started)
+    task.cancel()
+    release_claim.set()
+
+    with pytest.raises(asyncio.CancelledError):
+        await task
+    assert "untracked claim release failed" in caplog.text
+    assert _claim_count(db_path) == 1
+    await controller.close(reason="test-done")
+
+
+@pytest.mark.asyncio
+async def test_release_token_waits_for_shielded_release_after_outer_cancel(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """release 被外层取消时必须等 DB release 完成后再更新内存状态。"""
+
+    db_path = tmp_path / "runtime_lanes.sqlite3"
+    controller = await LaneController.open(
+        [_lane_config()], coordinator=_coordinator(db_path)
+    )
+    acquired = await controller.acquire(_LANE_NAME, timeout_seconds=0)
+    assert isinstance(acquired, LaneAcquired)
+    release_started = Event()
+    finish_release = Event()
+    original_release_claim_sync = controller._release_claim_sync
+
+    def slow_release(lane_name: str, claim_id: str) -> None:
+        """阻塞同步 release，让测试能稳定取消外层 task。
+
+        :param lane_name: lane 名称。
+        :param claim_id: claim id。
+        :returns: ``None``。
+        """
+
+        release_started.set()
+        assert finish_release.wait(_THREAD_EVENT_TIMEOUT_SECONDS) is True
+        original_release_claim_sync(lane_name, claim_id)
+
+    monkeypatch.setattr(controller, "_release_claim_sync", slow_release)
+
+    release_task = asyncio.create_task(acquired.token.release())
+    await _wait_for_thread_event(release_started)
+    release_task.cancel()
+    finish_release.set()
+
+    with pytest.raises(asyncio.CancelledError):
+        await release_task
+    assert acquired.token.released is True
+    assert _claim_count(db_path) == 0
+
+    reacquired = await controller.acquire(_LANE_NAME, timeout_seconds=0)
+    assert isinstance(reacquired, LaneAcquired)
+    await reacquired.token.release()
+    await controller.close(reason="test-done")
+
+
+@pytest.mark.asyncio
+async def test_untracked_release_failure_after_outer_cancel_preserves_cancelled_error(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """untracked release 在取消后失败时只记录错误并重新抛出取消。"""
+
+    db_path = tmp_path / "runtime_lanes.sqlite3"
+    controller = await LaneController.open(
+        [_lane_config()], coordinator=_coordinator(db_path)
+    )
+    release_started = Event()
+    finish_release = Event()
+
+    def fail_slow_release(lane_name: str, claim_id: str) -> None:
+        """模拟 untracked release 慢操作随后失败。
+
+        :param lane_name: lane 名称。
+        :param claim_id: claim id。
+        :returns: 不返回。
+        :raises RuntimeLaneError: 始终抛出 release 失败。
+        """
+
+        del lane_name, claim_id
+        release_started.set()
+        assert finish_release.wait(_THREAD_EVENT_TIMEOUT_SECONDS) is True
+        raise RuntimeLaneError("release failed")
+
+    monkeypatch.setattr(controller, "_release_claim_sync", fail_slow_release)
+    caplog.set_level(logging.ERROR, logger="dayu.runtime.lane")
+
+    release_task = asyncio.create_task(
+        controller._release_untracked_claim(_LANE_NAME, "claim-missing")
+    )
+    await _wait_for_thread_event(release_started)
+    release_task.cancel()
+    finish_release.set()
+
+    with pytest.raises(asyncio.CancelledError):
+        await release_task
+    assert "untracked claim release failed" in caplog.text
+    await controller.close(reason="test-done")
 
 
 @pytest.mark.asyncio
