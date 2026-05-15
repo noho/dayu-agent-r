@@ -1,0 +1,596 @@
+"""Host ToolRuntimeExecutor P6-S3 测试。"""
+
+from __future__ import annotations
+
+from datetime import datetime
+
+import pytest
+
+from dayu.contracts.json_value import JsonValue
+from dayu.contracts.tool_await import ToolAwaitKind, ToolAwaitSpec
+from dayu.contracts.tool_call import (
+    BatchToolExecutionContext,
+    BatchToolExecutionRequest,
+    ToolCallRequest,
+)
+from dayu.contracts.tool_declaration import ToolBundle, ToolDefinition
+from dayu.contracts.tool_executor import ToolExecutor
+from dayu.contracts.tool_outcome import (
+    ToolAwaitingOutcome,
+    ToolCompletedOutcome,
+    ToolExecutionOutcome,
+    ToolFailedOutcome,
+)
+from dayu.contracts.tool_result import ToolResultSuccess
+from dayu.contracts.tool_schema import (
+    ToolFunctionSchema,
+    ToolParametersSchema,
+    ToolSchema,
+)
+from dayu.host.tool_runtime import (
+    DefaultToolRuntimeFactory,
+    EffectiveToolBundleBuildRequest,
+    EffectiveToolBundleBuilder,
+    HostEventRef,
+    HostPayloadRef,
+    HostToolFactAcceptPort,
+    ToolAcceptRejectReason,
+    ToolAcceptRetryPolicy,
+    ToolFactAcceptCandidate,
+    ToolFactAcceptResult,
+    ToolFactAcceptTimedOut,
+    ToolFactAcceptedAck,
+    ToolFactKind,
+    ToolFactRejectedAck,
+    ToolPolicyDecision,
+    ToolPolicyDecisionKind,
+    ToolRuntimeBuildRequest,
+    ToolRuntimeExecutionScope,
+    ToolRuntimePolicyView,
+    ToolRuntimeToolPolicy,
+    ToolSideEffectKind,
+)
+from dayu.host.durable.codec import sha256_digest_json
+from dayu.host.tooling import (
+    ToolBundleSourceKind,
+    ToolBundleSourceRef,
+    default_framework_tool_policy_view,
+)
+
+_SESSION_ID = "session-toolruntime"
+_RUN_ID = "run-toolruntime"
+_ATTEMPT_ID = "attempt-toolruntime"
+_EXECUTION_ID = "execution-toolruntime"
+_ITERATION_ID = "iteration-toolruntime"
+_POLICY_DIGEST = "sha256:2222222222222222222222222222222222222222222222222222222222222222"
+
+
+class _NeverCancelledToken:
+    """测试用未取消 token。"""
+
+    def is_cancelled(self) -> bool:
+        """返回是否已取消。
+
+        :returns: 始终为 ``False``。
+        """
+
+        return False
+
+    def cancel_reason(self) -> str | None:
+        """返回取消原因。
+
+        :returns: 始终为 ``None``。
+        """
+
+        return None
+
+    def requested_at(self) -> datetime | None:
+        """返回取消请求时间。
+
+        :returns: 始终为 ``None``。
+        """
+
+        return None
+
+
+class _CountingCallable:
+    """返回固定成功结果并记录调用次数的 fake 工具。"""
+
+    def __init__(self, value: JsonValue) -> None:
+        """初始化 fake callable。
+
+        :param value: 工具成功载荷。
+        :returns: ``None``。
+        """
+
+        self._value = value
+        self.call_count = 0
+
+    async def __call__(
+        self,
+        call: ToolCallRequest,
+        context: BatchToolExecutionContext,
+    ) -> ToolExecutionOutcome:
+        """返回固定成功结果。
+
+        :param call: 单次工具调用请求。
+        :param context: 批式工具执行上下文。
+        :returns: 工具成功 outcome。
+        """
+
+        del call, context
+        self.call_count += 1
+        return ToolCompletedOutcome(
+            result=ToolResultSuccess(ok=True, value=self._value, meta=None)
+        )
+
+
+class _AwaitingCallable:
+    """返回 awaiting outcome 的 fake 工具。"""
+
+    def __init__(self) -> None:
+        """初始化 fake callable。
+
+        :returns: ``None``。
+        """
+
+        self.call_count = 0
+
+    async def __call__(
+        self,
+        call: ToolCallRequest,
+        context: BatchToolExecutionContext,
+    ) -> ToolExecutionOutcome:
+        """返回 P6-S3 不支持的 awaiting outcome。
+
+        :param call: 单次工具调用请求。
+        :param context: 批式工具执行上下文。
+        :returns: awaiting outcome。
+        """
+
+        del call, context
+        self.call_count += 1
+        return ToolAwaitingOutcome(
+            await_spec=ToolAwaitSpec(
+                await_kind=ToolAwaitKind.EXTERNAL_JOB,
+                deadline=None,
+                resume_token="resume-token",
+            ),
+            snapshot=None,
+        )
+
+
+class _SequencedAcceptPort(HostToolFactAcceptPort):
+    """按序返回 accept 结果的 fake accept port。"""
+
+    def __init__(self, results: tuple[ToolFactAcceptResult, ...]) -> None:
+        """初始化 fake accept port。
+
+        :param results: 每次 accept 调用返回的结果序列。
+        :returns: ``None``。
+        """
+
+        self._results = results
+        self.candidates: list[ToolFactAcceptCandidate] = []
+
+    def accept_tool_fact(
+        self, candidate: ToolFactAcceptCandidate
+    ) -> ToolFactAcceptResult:
+        """记录 candidate 并返回脚本化结果。
+
+        :param candidate: 工具事实候选。
+        :returns: 脚本化 accept 结果。
+        """
+
+        self.candidates.append(candidate)
+        index = len(self.candidates) - 1
+        if index >= len(self._results):
+            return _accepted_ack(candidate)
+        return self._results[index]
+
+
+@pytest.mark.asyncio
+async def test_fake_tool_result_returns_only_after_accepted_ack() -> None:
+    """fake tool 原始结果只有 accepted ack 后才返回给 Engine。"""
+
+    callable_ = _CountingCallable({"secret": "visible-after-accept"})
+    accept_port = _SequencedAcceptPort((_accepted_ack_for_call("tool-call-1"),))
+    executor = _executor(callable_, accept_port)
+
+    outcome = await executor.execute(_request(_call("tool-call-1")))
+
+    record = outcome.records[0]
+    assert callable_.call_count == 1
+    assert len(accept_port.candidates) == 1
+    assert isinstance(record.outcome, ToolCompletedOutcome)
+    assert record.outcome.result.value == {"secret": "visible-after-accept"}
+
+
+@pytest.mark.asyncio
+async def test_accept_rejected_does_not_expose_raw_fake_result() -> None:
+    """accepted ack 被拒绝时不向 Engine 暴露原始 fake result。"""
+
+    callable_ = _CountingCallable({"secret": "must-not-leak"})
+    accept_port = _SequencedAcceptPort(
+        (
+            ToolFactRejectedAck(
+                reason_code=ToolAcceptRejectReason.IDEMPOTENCY_CONFLICT,
+                message="reject fake result",
+                diagnostic_refs=(),
+                retryable=False,
+            ),
+        )
+    )
+    executor = _executor(callable_, accept_port)
+
+    outcome = await executor.execute(_request(_call("tool-call-1")))
+
+    record = outcome.records[0]
+    assert callable_.call_count == 1
+    assert isinstance(record.outcome, ToolFailedOutcome)
+    assert record.outcome.result.error == "tool_accept_rejected"
+    assert "must-not-leak" not in record.outcome.result.message
+
+
+@pytest.mark.asyncio
+async def test_accept_timeout_bounded_retry_returns_governed_error() -> None:
+    """accept timeout 只有限重试，耗尽后返回 governed error。"""
+
+    callable_ = _CountingCallable({"secret": "timeout-raw"})
+    accept_port = _SequencedAcceptPort(
+        (
+            ToolFactAcceptTimedOut(
+                attempt_count=1,
+                last_error_code="ack_lost",
+                diagnostic_refs=(),
+            ),
+            ToolFactAcceptTimedOut(
+                attempt_count=2,
+                last_error_code="ack_lost",
+                diagnostic_refs=(),
+            ),
+        )
+    )
+    executor = _executor(
+        callable_,
+        accept_port,
+        retry_policy=ToolAcceptRetryPolicy(max_attempts=2, backoff_seconds=0.0),
+    )
+
+    outcome = await executor.execute(_request(_call("tool-call-1")))
+
+    record = outcome.records[0]
+    assert callable_.call_count == 1
+    assert len(accept_port.candidates) == 2
+    assert isinstance(record.outcome, ToolFailedOutcome)
+    assert record.outcome.result.error == "tool_accept_timeout"
+    assert "timeout-raw" not in record.outcome.result.message
+
+
+@pytest.mark.asyncio
+async def test_side_effect_tool_missing_idempotency_key_never_calls_callable() -> None:
+    """side-effect 工具缺少必需幂等 key 时不得调用 callable。"""
+
+    callable_ = _CountingCallable({"secret": "side-effect"})
+    accept_port = _SequencedAcceptPort((_accepted_ack_for_call("tool-call-1"),))
+    policy_view = ToolRuntimePolicyView(
+        rules_by_tool_name={
+            "fake_tool": ToolRuntimeToolPolicy(
+                side_effect_kind=ToolSideEffectKind.SIDE_EFFECT,
+                idempotency_key_argument_name="tool_idempotency_key",
+            )
+        }
+    )
+    executor = _executor(callable_, accept_port, policy_view=policy_view)
+
+    outcome = await executor.execute(_request(_call("tool-call-1")))
+
+    record = outcome.records[0]
+    assert callable_.call_count == 0
+    assert accept_port.candidates[0].tool_fact_kind is ToolFactKind.GOVERNED_ERROR
+    assert accept_port.candidates[0].policy_decision.reason_code == (
+        "tool_idempotency_key_required"
+    )
+    assert isinstance(record.outcome, ToolFailedOutcome)
+
+
+@pytest.mark.asyncio
+async def test_awaiting_outcome_becomes_governed_error_candidate() -> None:
+    """awaiting outcome 只能进入 governed_error fact，不进入 WAITING。"""
+
+    callable_ = _AwaitingCallable()
+    accept_port = _SequencedAcceptPort((_accepted_ack_for_call("tool-call-1"),))
+    executor = _executor(callable_, accept_port)
+
+    outcome = await executor.execute(_request(_call("tool-call-1")))
+
+    record = outcome.records[0]
+    candidate = accept_port.candidates[0]
+    assert callable_.call_count == 1
+    assert candidate.tool_fact_kind is ToolFactKind.GOVERNED_ERROR
+    assert candidate.policy_decision.kind is ToolPolicyDecisionKind.GOVERNED_ERROR
+    assert candidate.policy_decision.reason_code == "unsupported_awaiting"
+    assert isinstance(record.outcome, ToolFailedOutcome)
+    assert record.outcome.result.hint == "unsupported_awaiting"
+
+
+@pytest.mark.asyncio
+async def test_no_tool_scope_rejects_model_tool_call() -> None:
+    """replay/no-tool scope 下即使模型发起工具调用也必须拒绝。"""
+
+    callable_ = _CountingCallable({"secret": "no-tool"})
+    accept_port = _SequencedAcceptPort((_accepted_ack_for_call("tool-call-1"),))
+    executor = _executor(callable_, accept_port, allow_tool_calls=False)
+
+    outcome = await executor.execute(_request(_call("tool-call-1")))
+
+    record = outcome.records[0]
+    assert callable_.call_count == 0
+    assert accept_port.candidates[0].tool_fact_kind is ToolFactKind.GOVERNED_ERROR
+    assert accept_port.candidates[0].policy_decision.reason_code == (
+        "tool_call_not_allowed_in_scope"
+    )
+    assert isinstance(record.outcome, ToolFailedOutcome)
+
+
+@pytest.mark.asyncio
+async def test_batch_mixed_accept_outcomes_keep_accepted_visible() -> None:
+    """批内 accepted call 可见，rejected / timeout call 只返回 governed error。"""
+
+    callable_ = _CountingCallable({"accepted": True})
+    accept_port = _SequencedAcceptPort(
+        (
+            _accepted_ack_for_call("tool-call-1"),
+            ToolFactRejectedAck(
+                reason_code=ToolAcceptRejectReason.EXPLICIT_POLICY_REJECT,
+                message="reject second",
+                diagnostic_refs=(),
+                retryable=False,
+            ),
+            ToolFactAcceptTimedOut(
+                attempt_count=1,
+                last_error_code="ack_lost",
+                diagnostic_refs=(),
+            ),
+        )
+    )
+    executor = _executor(
+        callable_,
+        accept_port,
+        retry_policy=ToolAcceptRetryPolicy(max_attempts=1, backoff_seconds=0.0),
+    )
+
+    outcome = await executor.execute(
+        _request(
+            _call("tool-call-1"),
+            _call("tool-call-2"),
+            _call("tool-call-3"),
+        )
+    )
+
+    first, second, third = (record.outcome for record in outcome.records)
+    assert callable_.call_count == 3
+    assert isinstance(first, ToolCompletedOutcome)
+    assert first.result.value == {"accepted": True}
+    assert isinstance(second, ToolFailedOutcome)
+    assert second.result.error == "tool_accept_rejected"
+    assert isinstance(third, ToolFailedOutcome)
+    assert third.result.error == "tool_accept_timeout"
+
+
+def _executor(
+    callable_: _CountingCallable | _AwaitingCallable,
+    accept_port: HostToolFactAcceptPort,
+    *,
+    retry_policy: ToolAcceptRetryPolicy | None = None,
+    policy_view: ToolRuntimePolicyView | None = None,
+    allow_tool_calls: bool = True,
+) -> ToolExecutor:
+    """构造测试用 ToolRuntime executor。
+
+    :param callable_: fake 工具 callable。
+    :param accept_port: fake accept port。
+    :param retry_policy: accept retry policy。
+    :param policy_view: Host 内部工具 policy view。
+    :param allow_tool_calls: ToolRuntime scope 是否允许工具调用。
+    :returns: ToolExecutor protocol 实现。
+    """
+
+    handle = DefaultToolRuntimeFactory(EffectiveToolBundleBuilder()).create_tool_runtime(
+        ToolRuntimeBuildRequest(
+            effective_bundle_request=EffectiveToolBundleBuildRequest(
+                business_tool_bundle=ToolBundle(
+                    definitions=(_definition("fake_tool", callable_),)
+                ),
+                source_refs=(_source_ref(),),
+                framework_tool_policy=default_framework_tool_policy_view(),
+                policy_snapshot_digest=_POLICY_DIGEST,
+            ),
+            execution_scope=ToolRuntimeExecutionScope(
+                session_id=_SESSION_ID,
+                run_id=_RUN_ID,
+                attempt_id=_ATTEMPT_ID,
+                execution_id=_EXECUTION_ID,
+                allow_tool_calls=allow_tool_calls,
+            ),
+            accept_port=accept_port,
+            retry_policy=(
+                retry_policy
+                if retry_policy is not None
+                else ToolAcceptRetryPolicy(max_attempts=1, backoff_seconds=0.0)
+            ),
+            policy_view=policy_view if policy_view is not None else ToolRuntimePolicyView(),
+        )
+    )
+    return handle.tool_executor
+
+
+def _request(*calls: ToolCallRequest) -> BatchToolExecutionRequest:
+    """构造批式工具执行请求。
+
+    :param calls: 单次工具调用请求。
+    :returns: 批式工具执行请求。
+    """
+
+    return BatchToolExecutionRequest(
+        calls=calls,
+        context=BatchToolExecutionContext(
+            run_id=_RUN_ID,
+            session_id=_SESSION_ID,
+            iteration_id=_ITERATION_ID,
+            timeout_seconds=10.0,
+            cancellation_token=_NeverCancelledToken(),
+            correlation_id="correlation-toolruntime",
+        ),
+    )
+
+
+def _call(tool_call_id: str) -> ToolCallRequest:
+    """构造 fake 工具调用。
+
+    :param tool_call_id: 工具调用 id。
+    :returns: 工具调用请求。
+    """
+
+    return ToolCallRequest(
+        tool_call_id=tool_call_id,
+        name="fake_tool",
+        arguments={"ticker": "DAYU"},
+        index_in_iteration=0,
+        provider_state=None,
+    )
+
+
+def _definition(
+    name: str, callable_: _CountingCallable | _AwaitingCallable
+) -> ToolDefinition:
+    """构造工具声明。
+
+    :param name: 工具名。
+    :param callable_: 工具 callable。
+    :returns: 工具声明。
+    """
+
+    return ToolDefinition(
+        name=name,
+        schema=ToolSchema(
+            type="function",
+            function=ToolFunctionSchema(
+                name=name,
+                description="fake tool",
+                parameters=_parameters(),
+            ),
+        ),
+        callable=callable_,
+        truncate=None,
+        display=None,
+        tags=("test",),
+    )
+
+
+def _parameters() -> ToolParametersSchema:
+    """构造工具参数 schema。
+
+    :returns: 参数 schema。
+    """
+
+    properties: dict[str, JsonValue] = {
+        "ticker": {"type": "string"},
+        "tool_idempotency_key": {"type": "string"},
+    }
+    return ToolParametersSchema(
+        type="object",
+        properties=properties,
+        required=("ticker",),
+        additional_properties=False,
+    )
+
+
+def _source_ref() -> ToolBundleSourceRef:
+    """构造工具来源引用。
+
+    :returns: ToolBundleSourceRef。
+    """
+
+    return ToolBundleSourceRef(
+        source_kind=ToolBundleSourceKind.EXPLICIT_PROVIDER,
+        source_id="toolruntime-test",
+    )
+
+
+def _accepted_ack_for_call(tool_call_id: str) -> ToolFactAcceptedAck:
+    """构造 accepted ack。
+
+    :param tool_call_id: 工具调用 id。
+    :returns: accepted ack。
+    """
+
+    candidate = ToolFactAcceptCandidate(
+        session_id=_SESSION_ID,
+        run_id=_RUN_ID,
+        attempt_id=_ATTEMPT_ID,
+        execution_id=_EXECUTION_ID,
+        iteration_id=_ITERATION_ID,
+        tool_call_id=tool_call_id,
+        tool_name="fake_tool",
+        tool_schema_digest=sha256_digest_json({"schema": tool_call_id}),
+        tool_identity_digest=sha256_digest_json({"identity": tool_call_id}),
+        normalized_arguments_digest=sha256_digest_json({"arguments": tool_call_id}),
+        tool_fact_kind=ToolFactKind.COMPLETED,
+        outcome_digest=sha256_digest_json({"outcome": tool_call_id}),
+        payload_digest=sha256_digest_json({"payload": tool_call_id}),
+        payload_ref=None,
+        truncation=None,
+        duplicate_key=None,
+        duplicate_decision=None,
+        reuse_prior_event_refs=(),
+        policy_decision=ToolPolicyDecision(
+            kind=ToolPolicyDecisionKind.ALLOW,
+            reason_code=None,
+            message=None,
+        ),
+        tool_idempotency_key=None,
+        diagnostic_refs=(),
+        accept_idempotency_key=f"accept-{tool_call_id}",
+        semantic_input_digest=sha256_digest_json({"semantic": tool_call_id}),
+    )
+    return _accepted_ack(candidate)
+
+
+def _accepted_ack(candidate: ToolFactAcceptCandidate) -> ToolFactAcceptedAck:
+    """按 candidate 构造 accepted ack。
+
+    :param candidate: 工具事实候选。
+    :returns: accepted ack。
+    """
+
+    requested_ref = HostEventRef(
+        event_id=f"event-requested-{candidate.tool_call_id}",
+        event_sequence=1,
+    )
+    result_ref = HostEventRef(
+        event_id=f"event-result-{candidate.tool_call_id}",
+        event_sequence=2,
+    )
+    result_digest = (
+        candidate.outcome_digest
+        if candidate.outcome_digest is not None
+        else candidate.semantic_input_digest
+    )
+    result_payload_ref = (
+        HostPayloadRef("payload-ref", candidate.payload_digest)
+        if candidate.payload_digest is not None
+        else None
+    )
+    return ToolFactAcceptedAck(
+        accepted_event_refs=(requested_ref, result_ref),
+        tool_fact_id=f"tool-fact-{candidate.tool_call_id}",
+        tool_call_requested_event_ref=requested_ref,
+        tool_call_governed_event_ref=None,
+        tool_result_event_ref=result_ref,
+        result_payload_ref=result_payload_ref,
+        result_digest=result_digest,
+        reuse_prior_event_refs=(),
+        diagnostic_refs=(),
+        idempotency_record_ref=f"idempotency-{candidate.tool_call_id}",
+    )

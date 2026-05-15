@@ -10,8 +10,9 @@ fetch_more callable、重复治理算法仍由后续 slice 实现。
 
 from __future__ import annotations
 
+import asyncio
 from collections.abc import Mapping
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from datetime import UTC, datetime
 from enum import StrEnum
 from types import MappingProxyType
@@ -28,10 +29,16 @@ from dayu.contracts.tool_executor import ToolExecutor
 from dayu.contracts.tool_outcome import (
     BatchToolExecutionOutcome,
     BatchToolExecutionRecord,
+    ToolAwaitingOutcome,
+    ToolCancelledOutcome,
+    ToolCompletedOutcome,
     ToolExecutionOutcome,
     ToolFailedOutcome,
 )
-from dayu.contracts.tool_result import ToolResultFailure
+from dayu.contracts.tool_result import (
+    ToolResultFailure,
+    ToolResultMeta,
+)
 from dayu.contracts.tool_schema import (
     ToolParametersSchema,
     ToolSchema,
@@ -88,6 +95,23 @@ _TOOL_ACCEPT_EVENT_ACTOR = "host.tool_runtime"
 _TOOL_ACCEPT_EVENT_SOURCE = "host.tool_runtime.accept"
 _MIN_ACCEPT_RETRY_ATTEMPTS = 1
 _MIN_ACCEPT_BACKOFF_SECONDS = 0.0
+_DEFAULT_ACCEPT_RETRY_ATTEMPTS = 2
+_DEFAULT_ACCEPT_BACKOFF_SECONDS = 0.0
+_TOOL_RUNTIME_GOVERNED_ERROR = "host_tool_governed_error"
+_TOOL_RUNTIME_POLICY_BLOCKED_ERROR = "tool_call_governed"
+_TOOL_RUNTIME_ACCEPT_REJECTED_ERROR = "tool_accept_rejected"
+_TOOL_RUNTIME_ACCEPT_TIMEOUT_ERROR = "tool_accept_timeout"
+_TOOL_RUNTIME_UNKNOWN_TOOL_ERROR = "tool_not_found"
+_TOOL_RUNTIME_CALLABLE_FAILED_ERROR = "tool_callable_failed"
+_TOOL_RUNTIME_NO_TOOL_REASON = "tool_call_not_allowed_in_scope"
+_TOOL_RUNTIME_IDEMPOTENCY_REASON = "tool_idempotency_key_required"
+_TOOL_RUNTIME_UNSUPPORTED_AWAITING_REASON = "unsupported_awaiting"
+_TOOL_RUNTIME_ACCEPT_TIMEOUT_REASON = "accept_timeout"
+_TOOL_RUNTIME_ACCEPT_REJECTED_REASON = "accept_rejected"
+_TOOL_RUNTIME_ACCEPT_EXCEPTION_REASON = "accept_ack_lost"
+_SIDE_EFFECT_IDEMPOTENCY_HINT = (
+    "side-effect or paid tool requires a tool idempotency key"
+)
 
 
 class ToolPolicyDecisionKind(StrEnum):
@@ -134,6 +158,18 @@ class ToolAcceptRejectReason(StrEnum):
     CAS_CONFLICT = "cas_conflict"
     EXPLICIT_POLICY_REJECT = "explicit_policy_reject"
     PAYLOAD_REFERENCE_INVALID = "payload_reference_invalid"
+
+
+class ToolSideEffectKind(StrEnum):
+    """工具副作用类别。
+
+    ``READ_ONLY`` 工具不要求工具级幂等 key；``SIDE_EFFECT`` 与 ``PAID``
+    工具必须由 Host 内部 policy 指定从哪个工具参数读取幂等 key。
+    """
+
+    READ_ONLY = "read_only"
+    SIDE_EFFECT = "side_effect"
+    PAID = "paid"
 
 
 @dataclass(frozen=True, slots=True)
@@ -387,6 +423,18 @@ class ToolFactAcceptTimedOut:
         )
 
 
+def _default_tool_accept_retry_policy() -> "ToolAcceptRetryPolicy":
+    """构造默认 accept ack 有限重试策略。
+
+    :returns: 默认重试策略。
+    """
+
+    return ToolAcceptRetryPolicy(
+        max_attempts=_DEFAULT_ACCEPT_RETRY_ATTEMPTS,
+        backoff_seconds=_DEFAULT_ACCEPT_BACKOFF_SECONDS,
+    )
+
+
 @dataclass(frozen=True, slots=True)
 class ToolAcceptRetryPolicy:
     """ToolRuntime accept ack 有限重试策略。
@@ -409,6 +457,108 @@ class ToolAcceptRetryPolicy:
             raise ValueError("max_attempts must be positive")
         if self.backoff_seconds < _MIN_ACCEPT_BACKOFF_SECONDS:
             raise ValueError("backoff_seconds must be non-negative")
+
+
+@dataclass(frozen=True, slots=True)
+class ToolRuntimeExecutionScope:
+    """ToolRuntime 执行期 attempt identity 与工具开关。
+
+    :param session_id: 当前 Attempt 所属 Session id。
+    :param run_id: 当前 Attempt 所属 Run id。
+    :param attempt_id: 当前 Attempt id。
+    :param execution_id: 当前 Attempt execution id。
+    :param allow_tool_calls: 当前执行范围是否允许工具调用；replay / no-tool
+        防线传入 ``False``。
+    """
+
+    session_id: str
+    run_id: str
+    attempt_id: str
+    execution_id: str
+    allow_tool_calls: bool
+
+    def __post_init__(self) -> None:
+        """校验执行范围字段。
+
+        :returns: ``None``。
+        :raises ValueError: 任一 identity 为空时抛出。
+        """
+
+        _require_non_empty_text(self.session_id, field_name="session_id")
+        _require_non_empty_text(self.run_id, field_name="run_id")
+        _require_non_empty_text(self.attempt_id, field_name="attempt_id")
+        _require_non_empty_text(self.execution_id, field_name="execution_id")
+
+
+@dataclass(frozen=True, slots=True)
+class ToolRuntimeToolPolicy:
+    """单工具 Host 内部执行 policy。
+
+    :param side_effect_kind: 工具副作用类别。
+    :param idempotency_key_argument_name: ``SIDE_EFFECT`` / ``PAID`` 工具从
+        哪个工具参数读取工具级幂等 key；read-only 工具为 ``None``。
+    """
+
+    side_effect_kind: ToolSideEffectKind
+    idempotency_key_argument_name: str | None
+
+    def __post_init__(self) -> None:
+        """校验单工具 policy 字段。
+
+        :returns: ``None``。
+        :raises ValueError: 副作用 / 付费工具缺少幂等 key 参数绑定时抛出。
+        """
+
+        _require_optional_non_empty_text(
+            self.idempotency_key_argument_name,
+            field_name="idempotency_key_argument_name",
+        )
+        if (
+            self.side_effect_kind
+            in (ToolSideEffectKind.SIDE_EFFECT, ToolSideEffectKind.PAID)
+            and self.idempotency_key_argument_name is None
+        ):
+            raise ValueError(
+                "side-effect or paid tool policy requires idempotency binding"
+            )
+
+
+@dataclass(frozen=True, slots=True)
+class ToolRuntimePolicyView:
+    """ToolRuntime Host 内部 policy view。
+
+    :param rules_by_tool_name: 按工具名索引的 policy；未列出的工具按
+        read-only 处理。
+    """
+
+    rules_by_tool_name: Mapping[str, ToolRuntimeToolPolicy] = field(
+        default_factory=dict
+    )
+
+    def __post_init__(self) -> None:
+        """校验 policy view 字段。
+
+        :returns: ``None``。
+        :raises ValueError: 工具名为空时抛出。
+        """
+
+        for tool_name in self.rules_by_tool_name:
+            _require_non_empty_text(tool_name, field_name="tool policy tool_name")
+
+    def rule_for_tool(self, tool_name: str) -> ToolRuntimeToolPolicy:
+        """返回指定工具的 policy rule。
+
+        :param tool_name: 工具名。
+        :returns: 工具 policy；未配置时返回 read-only policy。
+        """
+
+        rule = self.rules_by_tool_name.get(tool_name)
+        if rule is not None:
+            return rule
+        return ToolRuntimeToolPolicy(
+            side_effect_kind=ToolSideEffectKind.READ_ONLY,
+            idempotency_key_argument_name=None,
+        )
 
 
 ToolFactAcceptResult = (
@@ -563,6 +713,164 @@ class ToolTraceDiagnosticEmitter(Protocol):
         :returns: 诊断引用。
         """
         ...
+
+
+class DefaultToolDispatcher:
+    """基于 ``EffectiveToolBundle`` 的默认单工具 dispatcher。"""
+
+    def __init__(self, effective_bundle: "EffectiveToolBundle") -> None:
+        """初始化 dispatcher。
+
+        :param effective_bundle: 当前 attempt-local effective bundle。
+        :returns: ``None``。
+        """
+
+        self._effective_bundle = effective_bundle
+
+    async def dispatch_tool_call(
+        self, call: ToolCallRequest, context: BatchToolExecutionContext
+    ) -> ToolExecutionOutcome:
+        """查找并异步调用业务工具，异常归一为工具失败。
+
+        :param call: 单次工具调用请求。
+        :param context: 批式工具执行上下文。
+        :returns: 工具执行 outcome。
+        """
+
+        definition = self._effective_bundle.definitions_by_name.get(call.name)
+        if definition is None:
+            return _tool_failed_outcome(
+                error=_TOOL_RUNTIME_UNKNOWN_TOOL_ERROR,
+                message=f"tool is not available: {call.name}",
+                hint=None,
+            )
+        try:
+            return await definition.callable(call, context)
+        except Exception as exc:
+            return _tool_failed_outcome(
+                error=_TOOL_RUNTIME_CALLABLE_FAILED_ERROR,
+                message=f"{exc.__class__.__name__}: {exc}",
+                hint=None,
+            )
+
+
+class DefaultToolRuntimePolicyPort:
+    """默认 ToolRuntime policy port。
+
+    本实现只覆盖 P6-S3 的 no-tool / replay 防线与 side-effect / paid
+    幂等 key 必填策略；完整重复治理与等待策略由后续 slice 扩展。
+    """
+
+    def __init__(
+        self,
+        *,
+        execution_scope: "ToolRuntimeExecutionScope",
+        policy_view: ToolRuntimePolicyView,
+    ) -> None:
+        """初始化 policy port。
+
+        :param execution_scope: ToolRuntime 执行范围。
+        :param policy_view: Host 内部工具 policy view。
+        :returns: ``None``。
+        """
+
+        self._execution_scope = execution_scope
+        self._policy_view = policy_view
+
+    def decide_tool_call(self, call: ToolCallRequest) -> ToolPolicyDecision:
+        """为单次工具调用生成治理决策。
+
+        :param call: 单次工具调用请求。
+        :returns: P6-S3 工具治理决策。
+        """
+
+        if not self._execution_scope.allow_tool_calls:
+            return ToolPolicyDecision(
+                kind=ToolPolicyDecisionKind.GOVERNED_ERROR,
+                reason_code=_TOOL_RUNTIME_NO_TOOL_REASON,
+                message="tool calls are disabled for this execution scope",
+            )
+        rule = self._policy_view.rule_for_tool(call.name)
+        if _tool_idempotency_key(call, rule) is None and (
+            rule.side_effect_kind
+            in (ToolSideEffectKind.SIDE_EFFECT, ToolSideEffectKind.PAID)
+        ):
+            return ToolPolicyDecision(
+                kind=ToolPolicyDecisionKind.GOVERNED_ERROR,
+                reason_code=_TOOL_RUNTIME_IDEMPOTENCY_REASON,
+                message=_SIDE_EFFECT_IDEMPOTENCY_HINT,
+            )
+        return ToolPolicyDecision(
+            kind=ToolPolicyDecisionKind.ALLOW,
+            reason_code=None,
+            message=None,
+        )
+
+
+class NoopTruncationPort:
+    """P6-S3 不截断的 TruncationPort。"""
+
+    def apply_truncation(
+        self,
+        tool_name: str,
+        outcome: ToolExecutionOutcome,
+        truncate_spec: ToolTruncateSpec | None,
+    ) -> TruncationAppliedOutcome:
+        """原样返回工具 outcome。
+
+        :param tool_name: 工具名。
+        :param outcome: 原始工具 outcome。
+        :param truncate_spec: effective bundle 中同名工具的截断声明。
+        :returns: 未截断 outcome。
+        """
+
+        del tool_name, truncate_spec
+        return TruncationAppliedOutcome(outcome=outcome, cursor_hint=None)
+
+
+class PassThroughDuplicateGovernance:
+    """P6-S3 同 Run duplicate governance 的 always-allow stub。"""
+
+    def decide_duplicate(
+        self, tool_name: str, normalized_arguments_digest: str
+    ) -> DuplicateDecision:
+        """始终允许当前工具调用继续执行。
+
+        :param tool_name: 工具名。
+        :param normalized_arguments_digest: 规范化参数 digest。
+        :returns: allow 决策与稳定 duplicate key。
+        """
+
+        duplicate_key = sha256_digest_json(
+            {
+                "tool_name": tool_name,
+                "normalized_arguments_digest": normalized_arguments_digest,
+            }
+        )
+        return DuplicateDecision(
+            kind=DuplicateDecisionKind.ALLOW,
+            duplicate_key=duplicate_key,
+            prior_event_refs=(),
+        )
+
+
+class DeterministicToolTraceDiagnosticEmitter:
+    """不落盘的确定性 ToolRuntime 诊断引用发射器。"""
+
+    def emit(self, record: ToolTraceDiagnosticRecord) -> ToolTraceDiagnosticRef:
+        """发出确定性诊断引用。
+
+        :param record: 诊断记录。
+        :returns: 由诊断内容 digest 派生的引用。
+        """
+
+        ref_digest = sha256_digest_json(
+            {
+                "reason_code": record.reason_code,
+                "message": record.message,
+            }
+        ).removeprefix("sha256:")
+        return ToolTraceDiagnosticRef(ref_id=f"tool-diagnostic-{ref_digest}")
 
 
 class DefaultHostToolFactAcceptPort:
@@ -835,9 +1143,23 @@ class ToolRuntimeBuildRequest:
     """ToolRuntime factory 构造输入。
 
     :param effective_bundle_request: effective bundle 构造输入。
+    :param execution_scope: 执行期 attempt identity；无则只构造未连接 executor。
+    :param accept_port: Host accept barrier；无则只构造未连接 executor。
+    :param retry_policy: accept ack 有限重试策略。
+    :param policy_view: Host 内部工具 policy view。
+    :param diagnostic_emitter: 诊断 emitter；无则使用确定性内存引用实现。
     """
 
     effective_bundle_request: EffectiveToolBundleBuildRequest
+    execution_scope: ToolRuntimeExecutionScope | None = None
+    accept_port: HostToolFactAcceptPort | None = None
+    retry_policy: ToolAcceptRetryPolicy = field(
+        default_factory=_default_tool_accept_retry_policy
+    )
+    policy_view: ToolRuntimePolicyView = field(
+        default_factory=ToolRuntimePolicyView
+    )
+    diagnostic_emitter: ToolTraceDiagnosticEmitter | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -874,6 +1196,200 @@ class ToolRuntimeUnsupportedExecutor:
                 )
                 for call in request.calls
             )
+        )
+
+
+class ToolRuntimeExecutor:
+    """Host-governed ToolExecutor 实现。
+
+    本 executor 是 Engine 与 Host ToolRuntime 的唯一工具执行桥：业务
+    callable 的结果必须先经 Host accept barrier accepted，才会返回给
+    Engine；rejected ack、timeout、policy rejection 与 awaiting 均只返回
+    受治理的工具错误。
+    """
+
+    def __init__(
+        self,
+        *,
+        effective_bundle: EffectiveToolBundle,
+        execution_scope: ToolRuntimeExecutionScope,
+        dispatcher: ToolDispatcher,
+        policy_port: ToolRuntimePolicyPort,
+        duplicate_governance: DuplicateGovernancePort,
+        truncation_port: TruncationPort,
+        accept_port: HostToolFactAcceptPort,
+        retry_policy: ToolAcceptRetryPolicy,
+        policy_view: ToolRuntimePolicyView,
+        diagnostic_emitter: ToolTraceDiagnosticEmitter,
+    ) -> None:
+        """初始化 ToolRuntimeExecutor。
+
+        :param effective_bundle: attempt-local effective bundle。
+        :param execution_scope: ToolRuntime 执行范围。
+        :param dispatcher: 单工具 dispatcher。
+        :param policy_port: 工具治理决策端口。
+        :param duplicate_governance: duplicate governance 端口。
+        :param truncation_port: 截断端口。
+        :param accept_port: Host accept barrier。
+        :param retry_policy: accept ack 有限重试策略。
+        :param policy_view: Host 内部工具 policy view。
+        :param diagnostic_emitter: 诊断 emitter。
+        :returns: ``None``。
+        """
+
+        self._effective_bundle = effective_bundle
+        self._execution_scope = execution_scope
+        self._dispatcher = dispatcher
+        self._policy_port = policy_port
+        self._duplicate_governance = duplicate_governance
+        self._truncation_port = truncation_port
+        self._accept_port = accept_port
+        self._retry_policy = retry_policy
+        self._policy_view = policy_view
+        self._diagnostic_emitter = diagnostic_emitter
+
+    async def execute(
+        self, request: BatchToolExecutionRequest
+    ) -> BatchToolExecutionOutcome:
+        """执行批式工具调用并等待 Host accepted ack。
+
+        :param request: Engine 发起的批式工具执行请求。
+        :returns: 与输入 calls 严格双射的批式工具 outcome。
+        """
+
+        records: list[BatchToolExecutionRecord] = []
+        for call in request.calls:
+            records.append(await self._execute_one(call, request.context))
+        return BatchToolExecutionOutcome(records=tuple(records))
+
+    async def _execute_one(
+        self, call: ToolCallRequest, context: BatchToolExecutionContext
+    ) -> BatchToolExecutionRecord:
+        """执行单次工具调用。
+
+        :param call: 单次工具调用请求。
+        :param context: 批式工具执行上下文。
+        :returns: 单次工具调用记录。
+        """
+
+        normalized_arguments_digest = _normalized_arguments_digest(call)
+        duplicate_decision = self._duplicate_governance.decide_duplicate(
+            call.name, normalized_arguments_digest
+        )
+        policy_decision = self._policy_port.decide_tool_call(call)
+        if not _request_context_matches_scope(context, self._execution_scope):
+            policy_decision = ToolPolicyDecision(
+                kind=ToolPolicyDecisionKind.GOVERNED_ERROR,
+                reason_code=_TOOL_RUNTIME_NO_TOOL_REASON,
+                message="tool request context does not match execution scope",
+            )
+        if policy_decision.kind is not ToolPolicyDecisionKind.ALLOW:
+            outcome = _governed_failure_outcome(policy_decision)
+        else:
+            raw_outcome = await self._dispatcher.dispatch_tool_call(call, context)
+            outcome, policy_decision = self._normalize_runtime_outcome(
+                raw_outcome, policy_decision
+            )
+        truncation = self._truncation_port.apply_truncation(
+            call.name,
+            outcome,
+            self._effective_bundle.truncate_specs_by_name.get(call.name),
+        )
+        accepted_outcome = truncation.outcome
+        candidate = _tool_fact_accept_candidate(
+            scope=self._execution_scope,
+            effective_bundle=self._effective_bundle,
+            call=call,
+            iteration_id=context.iteration_id,
+            normalized_arguments_digest=normalized_arguments_digest,
+            outcome=accepted_outcome,
+            policy_decision=policy_decision,
+            duplicate_decision=duplicate_decision,
+            tool_idempotency_key=_tool_idempotency_key(
+                call, self._policy_view.rule_for_tool(call.name)
+            ),
+            diagnostic_refs=(),
+        )
+        accept_result = await self._accept_with_retry(candidate)
+        if isinstance(accept_result, ToolFactAcceptedAck):
+            return BatchToolExecutionRecord(
+                tool_call_id=call.tool_call_id,
+                outcome=accepted_outcome,
+            )
+        governed = _accept_failure_outcome(accept_result)
+        return BatchToolExecutionRecord(
+            tool_call_id=call.tool_call_id,
+            outcome=governed,
+        )
+
+    def _normalize_runtime_outcome(
+        self,
+        outcome: ToolExecutionOutcome,
+        policy_decision: ToolPolicyDecision,
+    ) -> tuple[ToolExecutionOutcome, ToolPolicyDecision]:
+        """把 P6-S3 不支持的 awaiting outcome 转为 governed error。
+
+        :param outcome: dispatcher 返回的工具 outcome。
+        :param policy_decision: 当前治理决策。
+        :returns: 可进入 accept path 的 outcome 与 policy decision。
+        """
+
+        if isinstance(outcome, ToolAwaitingOutcome):
+            self._diagnostic_emitter.emit(
+                ToolTraceDiagnosticRecord(
+                    reason_code=_TOOL_RUNTIME_UNSUPPORTED_AWAITING_REASON,
+                    message="ToolAwaitingOutcome is unsupported in Phase 6",
+                )
+            )
+            governed_decision = ToolPolicyDecision(
+                kind=ToolPolicyDecisionKind.GOVERNED_ERROR,
+                reason_code=_TOOL_RUNTIME_UNSUPPORTED_AWAITING_REASON,
+                message="awaiting tool outcome is unsupported in this phase",
+            )
+            return _governed_failure_outcome(governed_decision), governed_decision
+        return outcome, policy_decision
+
+    async def _accept_with_retry(
+        self, candidate: ToolFactAcceptCandidate
+    ) -> ToolFactAcceptResult:
+        """通过 Host accept barrier 有限重试等待 ack。
+
+        :param candidate: 工具事实候选。
+        :returns: accept 结果；rejected ack 不重试。
+        """
+
+        attempt_count = 0
+        last_error_code: str | None = None
+        diagnostics: tuple[ToolTraceDiagnosticRef, ...] = ()
+        while attempt_count < self._retry_policy.max_attempts:
+            attempt_count += 1
+            try:
+                result = self._accept_port.accept_tool_fact(candidate)
+            except TimeoutError:
+                last_error_code = _TOOL_RUNTIME_ACCEPT_EXCEPTION_REASON
+                result = ToolFactAcceptTimedOut(
+                    attempt_count=attempt_count,
+                    last_error_code=last_error_code,
+                    diagnostic_refs=diagnostics,
+                )
+            if isinstance(result, ToolFactAcceptedAck | ToolFactRejectedAck):
+                return result
+            last_error_code = result.last_error_code
+            diagnostics = result.diagnostic_refs
+            if attempt_count >= self._retry_policy.max_attempts:
+                break
+            if self._retry_policy.backoff_seconds > 0:
+                await asyncio.sleep(self._retry_policy.backoff_seconds)
+        timeout_ref = self._diagnostic_emitter.emit(
+            ToolTraceDiagnosticRecord(
+                reason_code=_TOOL_RUNTIME_ACCEPT_TIMEOUT_REASON,
+                message="tool fact accept ack was not received after bounded retry",
+            )
+        )
+        return ToolFactAcceptTimedOut(
+            attempt_count=attempt_count,
+            last_error_code=last_error_code,
+            diagnostic_refs=(*diagnostics, timeout_ref),
         )
 
 
@@ -920,7 +1436,9 @@ class ToolRuntimeFactory(Protocol):
 class DefaultToolRuntimeFactory:
     """默认 ToolRuntime handle factory。
 
-    本 factory 只创建 P6-S1 的 unsupported executor，不执行真实工具。
+    当构造请求提供 execution scope 与 accept port 时创建真实
+    ``ToolRuntimeExecutor``；未提供时保留未连接 executor，避免没有 Host
+    accept barrier 的装配路径误执行业务工具。
     """
 
     def __init__(self, bundle_builder: EffectiveToolBundleBuilder) -> None:
@@ -944,10 +1462,34 @@ class DefaultToolRuntimeFactory:
         effective_bundle = self._bundle_builder.build(
             request.effective_bundle_request
         )
+        if request.execution_scope is not None and request.accept_port is not None:
+            diagnostic_emitter = (
+                request.diagnostic_emitter
+                if request.diagnostic_emitter is not None
+                else DeterministicToolTraceDiagnosticEmitter()
+            )
+            policy_port = DefaultToolRuntimePolicyPort(
+                execution_scope=request.execution_scope,
+                policy_view=request.policy_view,
+            )
+            executor: ToolExecutor = ToolRuntimeExecutor(
+                effective_bundle=effective_bundle,
+                execution_scope=request.execution_scope,
+                dispatcher=DefaultToolDispatcher(effective_bundle),
+                policy_port=policy_port,
+                duplicate_governance=PassThroughDuplicateGovernance(),
+                truncation_port=NoopTruncationPort(),
+                accept_port=request.accept_port,
+                retry_policy=request.retry_policy,
+                policy_view=request.policy_view,
+                diagnostic_emitter=diagnostic_emitter,
+            )
+        else:
+            executor = ToolRuntimeUnsupportedExecutor(effective_bundle)
         return ToolRuntimeHandle(
             effective_bundle=effective_bundle,
             tool_schemas=effective_bundle.tool_schemas,
-            tool_executor=ToolRuntimeUnsupportedExecutor(effective_bundle),
+            tool_executor=executor,
         )
 
 
@@ -1850,9 +2392,421 @@ def _truncate_spec_json(spec: ToolTruncateSpec | None) -> JsonValue:
     }
 
 
+def _request_context_matches_scope(
+    context: BatchToolExecutionContext, scope: ToolRuntimeExecutionScope
+) -> bool:
+    """判断批式工具上下文是否属于当前 ToolRuntime scope。
+
+    :param context: 批式工具执行上下文。
+    :param scope: ToolRuntime 执行 scope。
+    :returns: session / run 匹配时返回 ``True``。
+    """
+
+    return context.session_id == scope.session_id and context.run_id == scope.run_id
+
+
+def _normalized_arguments_digest(call: ToolCallRequest) -> str:
+    """计算工具参数规范化 digest。
+
+    :param call: 单次工具调用请求。
+    :returns: Host canonical sha256 digest。
+    """
+
+    return sha256_digest_json({"arguments": call.arguments})
+
+
+def _tool_idempotency_key(
+    call: ToolCallRequest, rule: ToolRuntimeToolPolicy
+) -> str | None:
+    """按 Host policy 从工具参数中提取工具级幂等 key。
+
+    :param call: 单次工具调用请求。
+    :param rule: 单工具 policy。
+    :returns: 幂等 key；未配置或参数不是非空字符串时为 ``None``。
+    """
+
+    argument_name = rule.idempotency_key_argument_name
+    if argument_name is None:
+        return None
+    value = call.arguments.get(argument_name)
+    if isinstance(value, str) and value.strip() != "":
+        return value
+    return None
+
+
+def _tool_fact_accept_candidate(
+    *,
+    scope: ToolRuntimeExecutionScope,
+    effective_bundle: EffectiveToolBundle,
+    call: ToolCallRequest,
+    iteration_id: str,
+    normalized_arguments_digest: str,
+    outcome: ToolExecutionOutcome,
+    policy_decision: ToolPolicyDecision,
+    duplicate_decision: DuplicateDecision,
+    tool_idempotency_key: str | None,
+    diagnostic_refs: tuple[ToolTraceDiagnosticRef, ...],
+) -> ToolFactAcceptCandidate:
+    """从工具 outcome 构造 Host accept candidate。
+
+    :param scope: ToolRuntime 执行 scope。
+    :param effective_bundle: effective 工具集合。
+    :param call: 单次工具调用请求。
+    :param iteration_id: 当前 Engine iteration id。
+    :param normalized_arguments_digest: 参数 digest。
+    :param outcome: 已治理并可进入 accept path 的 outcome。
+    :param policy_decision: 工具治理决策。
+    :param duplicate_decision: duplicate governance 决策。
+    :param tool_idempotency_key: 工具级幂等 key。
+    :param diagnostic_refs: 诊断 refs。
+    :returns: Host 工具事实候选。
+    """
+
+    tool_fact_kind = _tool_fact_kind(outcome, policy_decision)
+    outcome_digest = _tool_outcome_digest(outcome)
+    payload_digest = _tool_payload_digest(outcome)
+    schema_digest = _tool_schema_digest_for_call(effective_bundle, call)
+    identity_digest = _tool_identity_digest(
+        effective_bundle=effective_bundle,
+        tool_name=call.name,
+        schema_digest=schema_digest,
+    )
+    semantic_input_digest = _tool_semantic_input_digest(
+        scope=scope,
+        call=call,
+        tool_fact_kind=tool_fact_kind,
+        normalized_arguments_digest=normalized_arguments_digest,
+        outcome_digest=outcome_digest,
+        payload_digest=payload_digest,
+        policy_decision=policy_decision,
+        duplicate_decision=duplicate_decision,
+    )
+    return ToolFactAcceptCandidate(
+        session_id=scope.session_id,
+        run_id=scope.run_id,
+        attempt_id=scope.attempt_id,
+        execution_id=scope.execution_id,
+        iteration_id=iteration_id,
+        tool_call_id=call.tool_call_id,
+        tool_name=call.name,
+        tool_schema_digest=schema_digest,
+        tool_identity_digest=identity_digest,
+        normalized_arguments_digest=normalized_arguments_digest,
+        tool_fact_kind=tool_fact_kind,
+        outcome_digest=outcome_digest,
+        payload_digest=payload_digest,
+        payload_ref=None,
+        truncation=None,
+        duplicate_key=duplicate_decision.duplicate_key,
+        duplicate_decision=duplicate_decision.kind,
+        reuse_prior_event_refs=(),
+        policy_decision=policy_decision,
+        tool_idempotency_key=tool_idempotency_key,
+        diagnostic_refs=diagnostic_refs,
+        accept_idempotency_key=_tool_accept_idempotency_key(
+            scope=scope,
+            call=call,
+            tool_fact_kind=tool_fact_kind,
+            outcome_digest=outcome_digest,
+            policy_decision=policy_decision,
+        ),
+        semantic_input_digest=semantic_input_digest,
+    )
+
+
+def _tool_fact_kind(
+    outcome: ToolExecutionOutcome, policy_decision: ToolPolicyDecision
+) -> ToolFactKind:
+    """把工具 outcome 映射为 canonical fact kind。
+
+    :param outcome: 工具 outcome。
+    :param policy_decision: 工具治理决策。
+    :returns: Host canonical fact kind。
+    :raises TypeError: 收到 P6-S3 不支持的 awaiting outcome 时抛出。
+    """
+
+    if policy_decision.kind is ToolPolicyDecisionKind.GOVERNED_ERROR:
+        return ToolFactKind.GOVERNED_ERROR
+    if isinstance(outcome, ToolCompletedOutcome):
+        return ToolFactKind.COMPLETED
+    if isinstance(outcome, ToolFailedOutcome):
+        return ToolFactKind.FAILED
+    if isinstance(outcome, ToolCancelledOutcome):
+        return ToolFactKind.CANCELLED
+    if isinstance(outcome, ToolAwaitingOutcome):
+        raise TypeError("ToolAwaitingOutcome must be normalized before accept")
+    raise TypeError("unsupported tool outcome")
+
+
+def _tool_outcome_digest(outcome: ToolExecutionOutcome) -> str:
+    """计算工具 outcome digest。
+
+    :param outcome: 工具 outcome。
+    :returns: Host canonical sha256 digest。
+    """
+
+    return sha256_digest_json(_tool_outcome_json(outcome))
+
+
+def _tool_payload_digest(outcome: ToolExecutionOutcome) -> str | None:
+    """计算 completed outcome 的 payload digest。
+
+    :param outcome: 工具 outcome。
+    :returns: completed payload digest；其它 outcome 为 ``None``。
+    """
+
+    if isinstance(outcome, ToolCompletedOutcome):
+        return sha256_digest_json({"value": outcome.result.value})
+    return None
+
+
+def _tool_schema_digest_for_call(
+    effective_bundle: EffectiveToolBundle, call: ToolCallRequest
+) -> str:
+    """计算单工具 schema digest。
+
+    :param effective_bundle: effective 工具集合。
+    :param call: 单次工具调用请求。
+    :returns: 单工具 schema digest；未知工具使用诊断 digest。
+    """
+
+    definition = effective_bundle.definitions_by_name.get(call.name)
+    if definition is None:
+        return sha256_digest_json({"unknown_tool_name": call.name})
+    return sha256_digest_json(_tool_schema_json(definition.schema))
+
+
+def _tool_identity_digest(
+    *,
+    effective_bundle: EffectiveToolBundle,
+    tool_name: str,
+    schema_digest: str,
+) -> str:
+    """计算工具身份 digest。
+
+    :param effective_bundle: effective 工具集合。
+    :param tool_name: 工具名。
+    :param schema_digest: 单工具 schema digest。
+    :returns: 工具身份 digest。
+    """
+
+    return sha256_digest_json(
+        {
+            "tool_name": tool_name,
+            "schema_digest": schema_digest,
+            "business_bundle_digest": effective_bundle.business_bundle_digest,
+        }
+    )
+
+
+def _tool_semantic_input_digest(
+    *,
+    scope: ToolRuntimeExecutionScope,
+    call: ToolCallRequest,
+    tool_fact_kind: ToolFactKind,
+    normalized_arguments_digest: str,
+    outcome_digest: str,
+    payload_digest: str | None,
+    policy_decision: ToolPolicyDecision,
+    duplicate_decision: DuplicateDecision,
+) -> str:
+    """计算 accept candidate semantic input digest。
+
+    :param scope: ToolRuntime 执行 scope。
+    :param call: 单次工具调用请求。
+    :param tool_fact_kind: canonical fact kind。
+    :param normalized_arguments_digest: 参数 digest。
+    :param outcome_digest: outcome digest。
+    :param payload_digest: payload digest。
+    :param policy_decision: policy decision。
+    :param duplicate_decision: duplicate decision。
+    :returns: Host canonical sha256 digest。
+    """
+
+    return sha256_digest_json(
+        {
+            "attempt_id": scope.attempt_id,
+            "execution_id": scope.execution_id,
+            "tool_call_id": call.tool_call_id,
+            "tool_name": call.name,
+            "tool_fact_kind": tool_fact_kind.value,
+            "normalized_arguments_digest": normalized_arguments_digest,
+            "outcome_digest": outcome_digest,
+            "payload_digest": payload_digest,
+            "policy_decision": _policy_decision_json(policy_decision),
+            "duplicate_decision": _duplicate_decision_json(duplicate_decision),
+        }
+    )
+
+
+def _tool_accept_idempotency_key(
+    *,
+    scope: ToolRuntimeExecutionScope,
+    call: ToolCallRequest,
+    tool_fact_kind: ToolFactKind,
+    outcome_digest: str,
+    policy_decision: ToolPolicyDecision,
+) -> str:
+    """派生 Host accept 幂等 key。
+
+    :param scope: ToolRuntime 执行 scope。
+    :param call: 单次工具调用请求。
+    :param tool_fact_kind: canonical fact kind。
+    :param outcome_digest: outcome digest。
+    :param policy_decision: policy decision。
+    :returns: 稳定 accept 幂等 key。
+    """
+
+    digest = sha256_digest_json(
+        {
+            "attempt_id": scope.attempt_id,
+            "execution_id": scope.execution_id,
+            "tool_call_id": call.tool_call_id,
+            "tool_fact_kind": tool_fact_kind.value,
+            "outcome_digest": outcome_digest,
+            "policy_decision": _policy_decision_json(policy_decision),
+        }
+    ).removeprefix("sha256:")
+    return f"tool-accept-{digest}"
+
+
+def _tool_outcome_json(outcome: ToolExecutionOutcome) -> JsonValue:
+    """把工具 outcome 投影为 JSON digest 输入。
+
+    :param outcome: 工具 outcome。
+    :returns: JSON digest 输入。
+    :raises TypeError: 收到 awaiting outcome 时抛出。
+    """
+
+    if isinstance(outcome, ToolCompletedOutcome):
+        return {
+            "kind": "completed",
+            "result": {
+                "ok": outcome.result.ok,
+                "value": outcome.result.value,
+                "meta": _tool_result_meta_json(outcome.result.meta),
+            },
+        }
+    if isinstance(outcome, ToolFailedOutcome):
+        return {
+            "kind": "failed",
+            "result": {
+                "ok": outcome.result.ok,
+                "error": outcome.result.error,
+                "message": outcome.result.message,
+                "hint": outcome.result.hint,
+                "meta": _tool_result_meta_json(outcome.result.meta),
+            },
+        }
+    if isinstance(outcome, ToolCancelledOutcome):
+        return {
+            "kind": "cancelled",
+            "reason": outcome.reason,
+            "message": outcome.message,
+            "hint": outcome.hint,
+            "meta": _tool_result_meta_json(outcome.meta),
+        }
+    if isinstance(outcome, ToolAwaitingOutcome):
+        raise TypeError("ToolAwaitingOutcome must be normalized before digest")
+    raise TypeError("unsupported tool outcome")
+
+
+def _tool_result_meta_json(meta: ToolResultMeta | None) -> JsonValue:
+    """把工具结果 meta 投影为 JSON。
+
+    :param meta: 工具结果 meta。
+    :returns: JSON 值。
+    """
+
+    if meta is None:
+        return None
+    return {
+        "tool_name": meta.tool_name,
+        "started_at": meta.started_at.isoformat(),
+        "finished_at": meta.finished_at.isoformat(),
+    }
+
+
+def _duplicate_decision_json(decision: DuplicateDecision) -> JsonValue:
+    """把 duplicate decision 投影为 JSON。
+
+    :param decision: duplicate decision。
+    :returns: JSON mapping。
+    """
+
+    return {
+        "kind": decision.kind.value,
+        "duplicate_key": decision.duplicate_key,
+        "prior_event_refs": list(decision.prior_event_refs),
+    }
+
+
+def _tool_failed_outcome(
+    *, error: str, message: str, hint: str | None
+) -> ToolFailedOutcome:
+    """构造工具失败 outcome。
+
+    :param error: 错误码。
+    :param message: 人类可读错误。
+    :param hint: 可选恢复提示。
+    :returns: ``ToolFailedOutcome``。
+    """
+
+    return ToolFailedOutcome(
+        result=ToolResultFailure(
+            ok=False,
+            error=error,
+            message=message,
+            hint=hint,
+            meta=None,
+        )
+    )
+
+
+def _governed_failure_outcome(
+    policy_decision: ToolPolicyDecision,
+) -> ToolFailedOutcome:
+    """按 policy decision 构造 governed failure outcome。
+
+    :param policy_decision: 工具治理决策。
+    :returns: governed ``ToolFailedOutcome``。
+    """
+
+    return _tool_failed_outcome(
+        error=_TOOL_RUNTIME_POLICY_BLOCKED_ERROR,
+        message=policy_decision.message or _TOOL_RUNTIME_GOVERNED_ERROR,
+        hint=policy_decision.reason_code,
+    )
+
+
+def _accept_failure_outcome(
+    result: ToolFactRejectedAck | ToolFactAcceptTimedOut,
+) -> ToolFailedOutcome:
+    """把 accept failure 归一为不含原始业务结果的 governed error。
+
+    :param result: rejected ack 或 timeout。
+    :returns: governed ``ToolFailedOutcome``。
+    """
+
+    if isinstance(result, ToolFactRejectedAck):
+        return _tool_failed_outcome(
+            error=_TOOL_RUNTIME_ACCEPT_REJECTED_ERROR,
+            message=result.message,
+            hint=f"{_TOOL_RUNTIME_ACCEPT_REJECTED_REASON}:{result.reason_code.value}",
+        )
+    return _tool_failed_outcome(
+        error=_TOOL_RUNTIME_ACCEPT_TIMEOUT_ERROR,
+        message="tool fact accept ack timed out",
+        hint=result.last_error_code or _TOOL_RUNTIME_ACCEPT_TIMEOUT_REASON,
+    )
+
+
 __all__ = [
+    "DefaultToolDispatcher",
     "DefaultToolRuntimeFactory",
     "DefaultHostToolFactAcceptPort",
+    "DefaultToolRuntimePolicyPort",
+    "DeterministicToolTraceDiagnosticEmitter",
     "DuplicateDecision",
     "DuplicateDecisionKind",
     "DuplicateGovernancePort",
@@ -1863,6 +2817,9 @@ __all__ = [
     "HostEventRef",
     "HostPayloadRef",
     "HostToolFactAcceptPort",
+    "NoopTruncationPort",
+    "PassThroughDuplicateGovernance",
+    "ToolSideEffectKind",
     "ToolAcceptRejectReason",
     "ToolAcceptRetryPolicy",
     "ToolDispatcher",
@@ -1874,6 +2831,10 @@ __all__ = [
     "ToolFactRejectedAck",
     "ToolPolicyDecision",
     "ToolPolicyDecisionKind",
+    "ToolRuntimeExecutionScope",
+    "ToolRuntimeExecutor",
+    "ToolRuntimePolicyView",
+    "ToolRuntimeToolPolicy",
     "ToolRuntimeBuildRequest",
     "ToolRuntimeFactory",
     "ToolRuntimeHandle",
