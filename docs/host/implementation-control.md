@@ -306,7 +306,8 @@ PR 55 创建后按用户指令安排 AgentMiMo 与 AgentDS 执行 `/deepreview P
 `docs/reviews/pr-55-fix-accept-retry-exhausted-20260515.md` 修复，fix commit 为 `c79d6b8`。PR 55 re-review artifacts 为
 `docs/reviews/pr-55-re-review-mimo-20260515.md` 与
 `docs/reviews/pr-55-re-review-ds-20260515.md`，两路均 PASS；验证为 `pytest tests/host -q` 350 passed、
-`python -m pyright dayu/ tests/ utils/` 0 errors、`git diff --check` clean。当前 gate 为 PR 55 review passed，等待用户后续处理。
+`python -m pyright dayu/ tests/ utils/` 0 errors、`git diff --check` clean。Phase 6 状态为 completed；PR 55 当前仍为 draft，
+review / fix / re-review 已通过，等待用户后续决定是否切换 ready 或 merge。
 
 ## Phase Map
 
