@@ -1303,7 +1303,7 @@ Phase 按依赖关系推进：先实现被其它阶段依赖的公共契约、ru
 - P3-S3 / P3-S4 owner 必须填充并验证 `SessionSnapshot.active_run_id` 与 `queued_run_ids` 对 Run / Attempt 写入、admission 与 queue 状态的读取语义；P3-S2 只提供读取 helper。
 - P3-S4 admission owner 必须覆盖 closed Session 拒绝新 Run / follow-up 的行为；P3-S2 只负责关闭 Session row，不实现 admission。
 - P3-S4 / EngineEvent ingest owner 必须补充 FAILED / LOST terminal closeout 的 higher-level 覆盖；P3-S3 已提供具体 terminal event type 映射与低层 helper。
-- P3-S4 / Phase 5 cancel owner 必须补充 dispatch 非 pending、dispatching / running cancel 的 higher-level 覆盖；P3-S3 只覆盖 pre-dispatch pending cancel。
+- P3-S4 / Phase 5 cancel owner 已补充 dispatch 非 pending、dispatching / running cancel 的 higher-level 覆盖；P3-S3 只覆盖 pre-dispatch pending cancel。
 - P3-S4 admission owner 必须覆盖 admission idempotency、after-commit promotion / wakeup 与多进程 active race；P3-S3 只提供低层 transaction primitives。
 - P3-S5 owner 必须接入 terminal / cancel 后自动 promotion trigger；P3-S4 只定义 no-op / test wakeup port 与显式 `promote_next_queued_run`。
 - P3-S6 owner 已补充多进程 admission race、idempotency race 与 queue promotion race；P3-S4 只覆盖 slice 内并发 promotion at-most-one。
@@ -1312,11 +1312,11 @@ Phase 按依赖关系推进：先实现被其它阶段依赖的公共契约、ru
 - Phase 4 public API owner 必须在 public command facade wiring 后补充 API 级 queued cancel / promotion race 覆盖；P3-S6 只验证内部 durable first-committer-wins，不覆盖 public facade 入口。
 - Phase 4 public API owner 必须澄清 `attach_active` 的 public audit / read-model 表达：若需要把 attach-active request 作为可查询事实呈现，必须先更新 `docs/host/design.md` 明确 canonical event shape，不能在 Phase 3 PR fix 中临时发明 EventLog 事件。
 - Phase 4 public API owner 必须按 design fix 固定 `FollowupSnapshot.accepted_run_id` / `accepted_run_status`、`HostApiErrorCode.UNSUPPORTED_OPERATION`、受限 typed `HostApiError.detail`、`stream_run_events` cursor contract 与 deferred facade 行为矩阵。
-- Phase 4 `cancel_session_runs` 只允许实现 queued / pre-dispatch `STARTING` 子集；Phase 5 / 7 / 11 owner 必须在各自 phase 补齐 dispatching / active worker、`WAITING`、`RECOVERING` 的完整 session-scope cancel 能力。
+- Phase 4 `cancel_session_runs` 只允许实现 queued / pre-dispatch `STARTING` 子集；Phase 5 已补齐 dispatching / active worker session-scope cancel 子集，`WAITING` 与 `RECOVERING` 的完整 session-scope cancel 能力仍分别由 Phase 7 / 11 接收。
 - Phase 4 repo-review follow-up 已修复 admission-backed public facade 关闭 handle 后绕过 lifecycle guard 的问题；`retry_run`、`replay_run`、`resolve_wait`、`purge_session` 当前仍是 stable unsupported deferred facade，不接触 admission service 或 durable store。该 residual risk 由本总控追踪区持有：当前不作为 Phase 4 follow-up fix scope；若后续公共契约要求所有 deferred facade 在 closed handle 后也优先返回 `HostApiErrorCode.INVALID_STATE`，必须作为新的 Host public API contract work unit 进入独立 Gateflow，并由对应 deferred capability owner 先回写 `docs/host/design.md` 与 phase plan。
-- Phase 5 / later dispatch owner 必须补充 dispatch 非 pending、dispatching / active worker cancel propagation、wait cancellation 与 recovery cancellation；P3-S5 只覆盖 queued cancel 与 pre-dispatch STARTING cancel。
-- Phase 5. RunInputBuilder 与本地执行 Dispatch owns scheduler、lane acquire、dispatch record `dispatching`、WorkerProxy / LocalProxy、Engine dispatch、`ATTEMPT_RUNNING` 与 EngineEvent ingest startup 边界。
-- Phase 5 scheduler / wakeup owner 必须定义 after-commit promotion 独立事务失败后的重试或扫描路径；Phase 3 只保证失败不会回滚已提交的 terminal / cancel 主事务，queued Run 可留待后续 wakeup。
+- Phase 5 / later dispatch owner 已补充 dispatch 非 pending、dispatching / active worker cancel propagation；wait cancellation 与 recovery cancellation 仍分别由 Phase 7 / 11 接收。
+- Phase 5. RunInputBuilder 与本地执行 Dispatch 已完成 scheduler、lane acquire、dispatch record `dispatching`、WorkerProxy / LocalProxy、Engine dispatch、`ATTEMPT_RUNNING` 与 EngineEvent ingest startup 边界。
+- Phase 5 scheduler / wakeup owner 已接入 terminal closeout 后的 queue promotion 独立事务与 scheduler wakeup；after-commit promotion 的重试 / 扫描 hardening 仍由 Phase 11 lifecycle / recovery 接收。
 - Phase 7 Tool Awaiting / resolve_wait owner 必须接入 `WAITING` Run closeout 语义；Phase 3 的 `terminal_run_row` 仅为后续 wait resolve 路径预留 `WAITING` CAS 源状态，Phase 3 调用方只传 `RUNNING`。
 - Phase 11. Host Lifecycle / Recovery / Multi-process Hardening owns dispatch record recovery join、positive orphan proof、RECOVERING dispatch、startup recovery scan 与多进程 hardening。
 - Phase 11. Host Lifecycle / Recovery / Multi-process Hardening owns SQLite 多进程 busy / retry 策略的长期 hardening；Phase 3 只验证当前 modest process count 下的 correctness invariant。
@@ -1380,7 +1380,7 @@ Phase 按依赖关系推进：先实现被其它阶段依赖的公共契约、ru
 
 - Phase 3. Session / Run / Attempt 状态机与 Admission 必须提供 Run / Attempt / Session 状态迁移单元测试。
 - Phase 2. Durable Store / EventLog / Payload Foundation 必须提供 SQLite transaction、CAS、唯一约束、多进程竞争和 crash recovery foundation 测试。
-- Phase 5. RunInputBuilder 与本地执行 Dispatch 必须提供 WorkerProxy fake integration；Phase 14. RemoteProxy / RemoteStub 必须提供迟到事件、断连、重发和 accept ack 测试。
+- Phase 5. RunInputBuilder 与本地执行 Dispatch 已提供 WorkerProxy fake integration；Phase 14. RemoteProxy / RemoteStub 必须提供迟到事件、断连、重发和 accept ack 测试。
 - Phase 6. ToolRuntime / Truncation / fetch_more / Duplicate Governance 必须提供外部业务 `ToolBundle` 输入、attempt-local effective `ToolBundle`、`fetch_more` 注入、tool fact accept barrier、truncate / fetch_more、重复工具调用治理和 side-effect policy 测试。
 - Phase 8. Projection Core / Host Event Stream / Minimal Read Model 必须提供 EventLog replay、checkpoint、Host event stream、minimal read model 的幂等追平测试；Phase 13. Audit / Tool Trace / Outbox Projections 必须提供 Outbox、audit、usage、tool trace 的幂等追平测试。
 - Phase 11. Host Lifecycle / Recovery / Multi-process Hardening 必须提供 Host restart、positive orphan proof、LOST / RECOVERABLE_LOST、prompt 已 accepted 但 answer 未返回的恢复测试。
@@ -1657,7 +1657,18 @@ targeted tests 4 passed；`pytest tests/host tests/runtime -q` 334 passed；`pyt
 P5-S6 residual risks：真实 provider runner 的外部网络 / provider API smoke 不属于 Phase 5 必测；active cancel watchdog 和
 post-cancel timeout policy 仍留给后续 lifecycle / recovery hardening；ToolRuntime / `fetch_more` 归 Phase 6，`WAITING` /
 `resolve_wait` 归 Phase 7，Memory 归 Phase 9，Context Governance 归 Phase 10，Recovery 归 Phase 11，Observer / Sink
-归 Phase 13，RemoteProxy 归 Phase 14。当前 gate 为 Phase 5 aggregate deepreview。
+归 Phase 13，RemoteProxy 归 Phase 14。
+Phase 5 aggregate deepreview 已完成。Aggregate deepreview artifacts 为
+`docs/reviews/gateflow-aggregate-deepreview-host-p5-local-dispatch-mimo-20260515.md` 与
+`docs/reviews/gateflow-aggregate-deepreview-host-p5-local-dispatch-ds-20260515.md`；两份独立 review 均 PASS 且无
+blocking finding。Controller aggregate adjudication artifact 为
+`docs/reviews/gateflow-aggregate-deepreview-host-p5-local-dispatch-controller-adjudication-20260515.md`。Controller aggregate
+validation baseline：`pytest tests/host tests/runtime -q` 334 passed；`python -m pyright dayu/host tests/host` 0 errors；
+`python -m pyright dayu/ tests/ utils/` 0 errors；`git diff --check` passed。Phase 5 accepted aggregate review commit 为
+`ae86a0a`。Phase 5 状态为 completed；当前 gate 为 `ready-to-create-PR`。PR readiness：所有 Phase 5 design refinement、
+plan、6 个 implementation slices、code review、fix / re-review、aggregate deepreview、controller 裁决和 accepted local commits
+均已完成并记录 artifact / commit hash；工作区检查为 clean；剩余风险均已有后续 owner。后续 Phase 6 / 7 / 9 / 10 / 11 /
+13 / 14 以及集成环境验证必须继续接收各自 deferred 项。
 
 历史状态：Phase 1 公共契约与 runtime 基础设施已完成并 merge；Phase 2 Durable Store / EventLog / Payload Foundation 已完成 plan、3 个 implementation slices、aggregate deepreview、aggregate fix、aggregate re-review 与 accepted deepreview commit，本 phase 状态为 completed。Phase 1 design refinement 已写入 `docs/reviews/gateflow-phase-design-host-p1-codex-20260513.md`，controller-accepted design fix 已写入 `docs/reviews/gateflow-phase-design-fix-host-p1-codex-20260513.md`。用户反馈后的 design fixes 已写入 `docs/reviews/gateflow-phase-design-user-feedback-fix-host-p1-codex-20260513.md` 与 `docs/reviews/gateflow-phase-design-user-feedback-fix2-host-p1-codex-20260513.md`。AgentMiMo 与 AgentDS 的 phase design re-review 均确认 accepted findings 已修复且 new blocker 为 0；round2 re-review 进一步确认 lane 已改为 cross-process runtime capacity guard，Phase Map 已重排为 P12 ToolsDiscovery / ScenePrepare、P13 Audit / Tool Trace / Outbox、P14 RemoteProxy、P15 Retention / Purge。Phase 1 plan 已写入 `docs/host/phase1-public-contract-runtime-plan.md`；plan review、controller adjudication、plan fix 与 plan re-review artifacts 已写入 `docs/reviews/`。AgentMiMo 与 AgentDS 的 plan re-review 均确认 finding 数量为 0、blocking finding 数量为 0。用户已确认 Phase 1 plan；accepted plan commit 为 `34b1b41`。Phase 1 Slice 1 accepted slice commit 为 `66d8dc3`，Slice 2 accepted slice commit 为 `27e0d8b`，Slice 3 accepted slice commit 为 `e23e3e4`，Slice 4 accepted slice commit 为 `0393a22`。
 
