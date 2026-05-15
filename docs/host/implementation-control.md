@@ -250,10 +250,17 @@ accepted checkpoint commit 为 `54184e6`。P6-S2 artifacts 为
 `docs/reviews/host-phase6-implementation-s2-accept-barrier-20260515.md`、
 `docs/reviews/host-phase6-code-review-s2-mimo-20260515.md`、
 `docs/reviews/host-phase6-code-review-s2-ds-20260515.md` 与
-`docs/reviews/host-phase6-code-review-s2-controller-adjudication-20260515.md`。当前 gate 为 Phase 6 P6-S3 implementation
+`docs/reviews/host-phase6-code-review-s2-controller-adjudication-20260515.md`。P6-S3
+`ToolExecutor Wrapper, Ack Retry, Side-effect Policy, Awaiting Guard` 已完成 implementation、双路 code review 与 controller
+adjudication，accepted checkpoint commit 为 `de7a4ae`。P6-S3 artifacts 为
+`docs/reviews/host-phase6-implementation-s3-executor-wrapper-20260515.md`、
+`docs/reviews/host-phase6-code-review-s3-mimo-20260515.md`、
+`docs/reviews/host-phase6-code-review-s3-ds-20260515.md` 与
+`docs/reviews/host-phase6-code-review-s3-controller-adjudication-20260515.md`。当前 gate 为 Phase 6 P6-S4 implementation
 ready。需要继续追踪的 non-blocking hardening、deferred capability 与后续 phase owner 已写入 `Open Questions 与风险追踪` 的
-`PR 54 / P1-P5 corrected review 残余风险追踪`、P6-S1 controller adjudication residual risks，以及 P6-S2 controller
-adjudication residual risks。
+`PR 54 / P1-P5 corrected review 残余风险追踪`、P6-S1 controller adjudication residual risks、P6-S2 controller
+adjudication residual risks，以及 P6-S3 controller adjudication residual risks。P6-S3 遗留的真实 `HostDispatchScheduler`
+仍 no-tool composition wiring 必须在 Phase 6 退出前关闭；优先由 P6-S6 integration 接收，若 P6-S4 / P6-S5 提前触及同一装配边界则可提前补齐。
 
 ## Phase Map
 
