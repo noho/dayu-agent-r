@@ -1741,6 +1741,24 @@ helper 能力宽于生产 scheduler 路径，owner 为 Host durable API tighteni
 wakeup failure 归 Host dispatch lifecycle hardening，active cancel watchdog 归 Phase 11，RemoteProxy 归 Phase 14，lifecycle composition
 归后续 Host composition design。本 gate 不要求当前 blocker fix，PR 54 仍为 draft review-ready。
 
+P1-P5 corrected design conformance review gate 已完成。用户澄清上一轮应审查的是“实现到 P5 后，P1-P5 当前全部代码
+snapshot 是否偏离设计”，因此上一段 P5-only review 只作为子集证据，不作为 P1-P5 全量结论。Corrected review artifacts 为
+`docs/reviews/p1-p5-design-conformance-review-mimo-20260515.md`、
+`docs/reviews/p1-p5-design-conformance-review-ds-20260515.md` 与
+`docs/reviews/p1-p5-design-conformance-review-codex-20260515.md`；三路 verdict 均 PASS，blocking design deviation 均为 0。
+Controller adjudication artifact 为
+`docs/reviews/p1-p5-design-conformance-review-controller-adjudication-20260515.md`。Controller 裁决：P1 public contract /
+runtime boundary、P2 durable store / EventLog、P3 session / run / attempt / admission、P4 public API command path、P5
+RunInputBuilder / local dispatch / local proxy / Engine ingest / cancel、跨 phase 分层、生产接线与后续 phase 预留均未发现
+blocking 设计偏离；PR 54 不需要进入新的 fix gate，仍为 draft review-ready。Non-blocking hardening / cleanup 均已有 owner：
+`accept_worker_running_in_transaction` 诊断 payload 弱于 scheduler 生产路径归 Host durable transition hardening；
+`mark_dispatching_after_lane_row` 底层 helper 能力宽于生产 scheduler 路径归 Host durable API tightening；
+`DEFAULT_ACTIVE_WORKER_REGISTRY` module-level singleton 的多 handle cancel 边界风险归 Host dispatch lifecycle hardening；compact
+artifact message slot 与 plan 摘要顺序不完全一致归 Phase 10 / RunInputBuilder documentation cleanup。其它 residual risk 维持既有
+owner：terminal promotion wakeup failure 归 Host dispatch lifecycle hardening，active cancel watchdog / stuck `CANCELLING` /
+orphan recovery 归 Phase 11，RemoteProxy 归 Phase 14，ToolRuntime / `fetch_more` 归 Phase 6，WAITING / `resolve_wait` 归
+Phase 7，Memory / Context Governance / compact artifact 分别归 Phase 9 / Phase 10。
+
 历史状态：Phase 1 公共契约与 runtime 基础设施已完成并 merge；Phase 2 Durable Store / EventLog / Payload Foundation 已完成 plan、3 个 implementation slices、aggregate deepreview、aggregate fix、aggregate re-review 与 accepted deepreview commit，本 phase 状态为 completed。Phase 1 design refinement 已写入 `docs/reviews/gateflow-phase-design-host-p1-codex-20260513.md`，controller-accepted design fix 已写入 `docs/reviews/gateflow-phase-design-fix-host-p1-codex-20260513.md`。用户反馈后的 design fixes 已写入 `docs/reviews/gateflow-phase-design-user-feedback-fix-host-p1-codex-20260513.md` 与 `docs/reviews/gateflow-phase-design-user-feedback-fix2-host-p1-codex-20260513.md`。AgentMiMo 与 AgentDS 的 phase design re-review 均确认 accepted findings 已修复且 new blocker 为 0；round2 re-review 进一步确认 lane 已改为 cross-process runtime capacity guard，Phase Map 已重排为 P12 ToolsDiscovery / ScenePrepare、P13 Audit / Tool Trace / Outbox、P14 RemoteProxy、P15 Retention / Purge。Phase 1 plan 已写入 `docs/host/phase1-public-contract-runtime-plan.md`；plan review、controller adjudication、plan fix 与 plan re-review artifacts 已写入 `docs/reviews/`。AgentMiMo 与 AgentDS 的 plan re-review 均确认 finding 数量为 0、blocking finding 数量为 0。用户已确认 Phase 1 plan；accepted plan commit 为 `34b1b41`。Phase 1 Slice 1 accepted slice commit 为 `66d8dc3`，Slice 2 accepted slice commit 为 `27e0d8b`，Slice 3 accepted slice commit 为 `e23e3e4`，Slice 4 accepted slice commit 为 `0393a22`。
 
 Phase 1 implementation 收口验证：
