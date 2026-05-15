@@ -244,9 +244,16 @@ accepted checkpoint commit 为 `b49ba56`。P6-S1 artifacts 为
 `docs/reviews/host-phase6-implementation-s1-effective-toolbundle-20260515.md`、
 `docs/reviews/host-phase6-code-review-s1-mimo-20260515.md`、
 `docs/reviews/host-phase6-code-review-s1-ds-20260515.md` 与
-`docs/reviews/host-phase6-code-review-s1-controller-adjudication-20260515.md`。当前 gate 为 Phase 6 P6-S2 implementation
+`docs/reviews/host-phase6-code-review-s1-controller-adjudication-20260515.md`。P6-S2
+`Host Accept Barrier And Tool Canonical Facts` 已完成 implementation、双路 code review 与 controller adjudication，
+accepted checkpoint commit 为 `54184e6`。P6-S2 artifacts 为
+`docs/reviews/host-phase6-implementation-s2-accept-barrier-20260515.md`、
+`docs/reviews/host-phase6-code-review-s2-mimo-20260515.md`、
+`docs/reviews/host-phase6-code-review-s2-ds-20260515.md` 与
+`docs/reviews/host-phase6-code-review-s2-controller-adjudication-20260515.md`。当前 gate 为 Phase 6 P6-S3 implementation
 ready。需要继续追踪的 non-blocking hardening、deferred capability 与后续 phase owner 已写入 `Open Questions 与风险追踪` 的
-`PR 54 / P1-P5 corrected review 残余风险追踪` 以及 P6-S1 controller adjudication residual risks。
+`PR 54 / P1-P5 corrected review 残余风险追踪`、P6-S1 controller adjudication residual risks，以及 P6-S2 controller
+adjudication residual risks。
 
 ## Phase Map
 
