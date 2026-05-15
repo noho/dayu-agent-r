@@ -1603,7 +1603,26 @@ P5-S3 Dispatch Scheduler, Lane And LocalProxy 已完成 implementation、code re
 `HostCommandHandleOptions.local_execution` 已 typed 且默认为 no-op，但 command-handle scheduler lifecycle wiring 尚未接入；
 `_NeverCancelledToken` 仍是 P5-S3 占位，run-local cancellation token propagation 属于 P5-S5；scheduler close pending acquire /
 active worker cancel 覆盖需随 P5-S5 或 lifecycle wiring scope 补齐；`_consume_worker_events` 当前只 drain / release lane，EngineEvent
-ingest mapping 和 terminal closeout 属于 P5-S4。当前 gate 为 P5-S4 EngineEvent Ingest Mapping And Terminal Closeout implementation。
+ingest mapping 和 terminal closeout 属于 P5-S4。
+P5-S4 EngineEvent Ingest Mapping And Terminal Closeout 已完成 implementation、code review、blocking fix、code re-review、
+controller 裁决、README / tests README 同步与 accepted slice commit。Implementation artifact 为
+`docs/reviews/gateflow-implementation-host-p5-s4-engine-event-ingest-20260515.md`；code review artifacts 为
+`docs/reviews/gateflow-code-review-host-p5-s4-engine-event-ingest-mimo-20260515.md` 与
+`docs/reviews/gateflow-code-review-host-p5-s4-engine-event-ingest-ds-20260515.md`。MiMo B1 已裁决为 accepted blocking：
+duplicate terminal replay 必须重试 queue promotion wakeup；fix artifact 为
+`docs/reviews/gateflow-fix-host-p5-s4-engine-event-ingest-20260515.md`。Code re-review artifacts 为
+`docs/reviews/gateflow-code-re-review-host-p5-s4-engine-event-ingest-mimo-20260515.md` 与
+`docs/reviews/gateflow-code-re-review-host-p5-s4-engine-event-ingest-ds-20260515.md`；两者均确认 B1 fixed 且无新 blocker。
+Controller re-review adjudication artifact 为
+`docs/reviews/gateflow-code-re-review-host-p5-s4-engine-event-ingest-controller-adjudication-20260515.md`。P5-S4 validation：
+`pytest tests/host/test_engine_ingest_mapping.py tests/host/test_phase5_local_execution_integration.py tests/host/test_weak_typing_guard.py -q`
+11 passed；`python -m pyright dayu/host tests/host` 0 errors；`git diff --check` passed。P5-S4 accepted slice commit 为
+`ab256d1`。P5-S4 controlled scope expansion：`dayu/host/durable/state.py` 新增 `cancel_cancelling_run_row` 与
+`cancel_running_attempt_row`，虽不在原 P5-S4 allowed files，但经 MiMo、DS 与 controller 裁决为正确 durable state row CAS
+ownership，优于在 `run_transition.py` 直接写 SQL。P5-S4 residual risks：dispatch scheduler 尚未把 worker stream 接入
+`EngineEventIngestor`；active cancel propagation 到 LocalProxy 属于 P5-S5；preview、unsupported waiting、provider protocol
+error、terminal-late 与 run_cancelled-without-active-cancel 负例可由后续测试 hardening 补齐。当前 gate 为 P5-S5 Active Cancel
+And Session-scope Cancel implementation。
 
 历史状态：Phase 1 公共契约与 runtime 基础设施已完成并 merge；Phase 2 Durable Store / EventLog / Payload Foundation 已完成 plan、3 个 implementation slices、aggregate deepreview、aggregate fix、aggregate re-review 与 accepted deepreview commit，本 phase 状态为 completed。Phase 1 design refinement 已写入 `docs/reviews/gateflow-phase-design-host-p1-codex-20260513.md`，controller-accepted design fix 已写入 `docs/reviews/gateflow-phase-design-fix-host-p1-codex-20260513.md`。用户反馈后的 design fixes 已写入 `docs/reviews/gateflow-phase-design-user-feedback-fix-host-p1-codex-20260513.md` 与 `docs/reviews/gateflow-phase-design-user-feedback-fix2-host-p1-codex-20260513.md`。AgentMiMo 与 AgentDS 的 phase design re-review 均确认 accepted findings 已修复且 new blocker 为 0；round2 re-review 进一步确认 lane 已改为 cross-process runtime capacity guard，Phase Map 已重排为 P12 ToolsDiscovery / ScenePrepare、P13 Audit / Tool Trace / Outbox、P14 RemoteProxy、P15 Retention / Purge。Phase 1 plan 已写入 `docs/host/phase1-public-contract-runtime-plan.md`；plan review、controller adjudication、plan fix 与 plan re-review artifacts 已写入 `docs/reviews/`。AgentMiMo 与 AgentDS 的 plan re-review 均确认 finding 数量为 0、blocking finding 数量为 0。用户已确认 Phase 1 plan；accepted plan commit 为 `34b1b41`。Phase 1 Slice 1 accepted slice commit 为 `66d8dc3`，Slice 2 accepted slice commit 为 `27e0d8b`，Slice 3 accepted slice commit 为 `e23e3e4`，Slice 4 accepted slice commit 为 `0393a22`。
 
