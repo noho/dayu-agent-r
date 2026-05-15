@@ -1431,7 +1431,42 @@ Phase 按依赖关系推进：先实现被其它阶段依赖的公共契约、ru
 - Host 外部 Service / UI 后续 work unit 必须覆盖：客户端在线已展示 final answer 后离线重连，从 Outbox 读取增量时不会重复显示同一 terminal answer。
 - Host 外部 UI 显示聊天记录必须按 terminal identity upsert / dedupe，不得按 final answer 文本内容去重。
 
+#### PR 54 / P1-P5 corrected review 残余风险追踪
+
+结论：
+
+- PR 54 已完成 Phase 5 aggregate review、PR review fixes、追加并行 review、全仓 review、P5-only design conformance review 与 P1-P5 corrected design conformance review。
+- P1-P5 corrected design conformance review 已确认当前全部代码 snapshot 未发现 blocking 设计偏离。
+- PR 54 当前不需要进入新的 fix gate；draft PR 仍处于 review-ready 状态。
+
+追踪项：
+
+- `accept_worker_running_in_transaction` 诊断 payload 弱于 scheduler 生产路径；owner 为 Host durable transition hardening。
+- `mark_dispatching_after_lane_row` 底层 helper 能力宽于生产 scheduler 路径；owner 为 Host durable API tightening。
+- `DEFAULT_ACTIVE_WORKER_REGISTRY` module-level singleton 的多 handle cancel 边界风险；owner 为 Host dispatch lifecycle hardening。
+- terminal closeout 后 queue promotion wakeup failure 的诊断 / 抑制策略；owner 为 Host dispatch lifecycle hardening。
+- active cancel watchdog、stuck `CANCELLING` 与 orphan recovery；owner 为 Phase 11. Host Lifecycle / Recovery / Multi-process Hardening。
+- RemoteProxy 语义与远端迟到事件治理；owner 为 Phase 14. RemoteProxy / RemoteStub。
+- ToolRuntime / `fetch_more` canonical tool fact accept path；owner 为 Phase 6. ToolRuntime / Truncation / fetch_more / Duplicate Governance。
+- `WAITING` / `resolve_wait` 与 wait cancellation；owner 为 Phase 7. Tool Awaiting / resolve_wait / Wait Adapter。
+- Memory、Context Governance 与 compact artifact 真实 provider 接线；owner 分别为 Phase 9. Memory 与 Phase 10. Context Governance / Compaction。
+- runtime lane repeated outer cancellation、untracked release failure 与 idle scheduler sleeping task；owner 为后续 runtime cancellation precision / Host dispatch lifecycle hardening。
+- Engine runner injection / provider abstraction design；owner 为后续 Engine composition / provider abstraction design。
+- God module / class cleanup 与 broader test hardening；owner 为后续 architecture / test hardening。
+
 ## 当前状态
+
+PR 54 `Host Phase 5 RunInputBuilder and local dispatch` 当前为 OPEN draft PR，branch 为 `feat/host-phase5-local-dispatch`，
+当前 gate 为 draft review-ready。最近一次 corrected gate 是 P1-P5 当前全量 snapshot design conformance review；AgentMiMo、
+AgentDS、AgentCodex 三路 verdict 均为 PASS，blocking design deviation 为 0。Controller adjudication artifact 为
+`docs/reviews/p1-p5-design-conformance-review-controller-adjudication-20260515.md`。
+
+当前不处于 implementation / fix gate；没有 accepted blocking finding 待修。需要继续追踪的 non-blocking hardening、
+deferred capability 与后续 phase owner 已写入上方 `PR 54 / P1-P5 corrected review 残余风险追踪`。
+
+本次总控文档整理只调整文档结构，不改变设计真源、不改变代码、不改变 PR 54 ready 状态。
+
+## 历史记录
 
 P0：Engine Context Compaction Event 语义前置已完成 implementation 与 review loop；P0-S1 accepted slice commit 为 `ad6d116`，P0-S2 accepted slice commit 为 `6f6e716`。P0 后续状态进入 push / PR 路径，不再是当前 Host phase design gate。
 
