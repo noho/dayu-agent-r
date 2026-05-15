@@ -1722,7 +1722,7 @@ Re-review artifacts 为 `docs/reviews/repo-review-fix-re-review-host-p5-full-rep
 Controller final adjudication artifact 为 `docs/reviews/repo-review-fix-re-review-controller-adjudication-20260515.md`。
 Controller validation：受影响测试 126 passed；`pytest tests/host tests/runtime tests/contracts tests/engine -q` 741 passed；
 `python -m pyright dayu/ tests/ utils/` 0 errors；`git diff --check` passed。当前 full-repo review gate 状态为 accepted；
-PR 54 draft branch 待 push，current gate 为 PR 54 draft review-ready。剩余风险均有 owner：runtime lane repeated outer cancellation
+PR 54 draft branch 已 push，current gate 为 PR 54 draft review-ready。剩余风险均有 owner：runtime lane repeated outer cancellation
 与 untracked release failure 归后续 runtime cancellation precision / 既有 TTL cleanup；idle scheduler sleeping task 归 Host dispatch
 lifecycle；Engine runner injection 归后续 Engine composition / provider abstraction design；active cancel watchdog 归 Phase 11；
 RemoteProxy 归 Phase 14；God module/class cleanup 与 broader test hardening 归后续 architecture / test hardening。
