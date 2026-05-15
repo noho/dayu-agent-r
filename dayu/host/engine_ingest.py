@@ -18,6 +18,11 @@ from typing import cast
 
 from dayu.contracts.cancellation import CancellationToken
 from dayu.contracts.json_value import JsonValue
+from dayu.contracts.tool_outcome import (
+    ToolCancelledOutcome,
+    ToolCompletedOutcome,
+    ToolFailedOutcome,
+)
 from dayu.engine.contracts.engine_events import (
     ContentCompleteData,
     ContentDeltaData,
@@ -33,9 +38,11 @@ from dayu.engine.contracts.engine_events import (
     RunFailedData,
     RunSuspendedData,
     ToolAwaitingData,
+    ToolCallRequestedData,
     ToolCallDeltaData,
     ToolCallsBatchDoneData,
     ToolCallsBatchReadyData,
+    ToolResultAcceptedData,
     UsageReportedData,
 )
 from dayu.host.admission import AdmissionWakeupPort, NoopAdmissionWakeupPort
@@ -1261,6 +1268,21 @@ def _duplicate_terminal_event_ids(
     if event.type == EngineEventType.RUN_FAILED and isinstance(
         event.data, RunFailedData
     ):
+        if event.data.error_code == _REASON_WORKER_LOST_BEFORE_TERMINAL:
+            return (
+                _event_id(
+                    candidate,
+                    EventClass.CANONICAL_FACT,
+                    _EVENT_TYPE_ATTEMPT_LOST,
+                    0,
+                ),
+                _event_id(
+                    candidate,
+                    EventClass.CANONICAL_FACT,
+                    _EVENT_TYPE_RUN_LOST,
+                    1,
+                ),
+            )
         if event.data.recoverable:
             return (
                 _event_id(
@@ -1332,6 +1354,27 @@ def _duplicate_terminal_event_ids(
                 2,
             ),
         )
+    if event.type in (EngineEventType.RUN_SUSPENDED, EngineEventType.TOOL_AWAITING):
+        return (
+            _event_id(
+                candidate,
+                EventClass.DIAGNOSTIC,
+                _EVENT_TYPE_ENGINE_EVENT_DIAGNOSTIC,
+                0,
+            ),
+            _event_id(
+                candidate,
+                EventClass.CANONICAL_FACT,
+                _EVENT_TYPE_ATTEMPT_FAILED,
+                1,
+            ),
+            _event_id(
+                candidate,
+                EventClass.CANONICAL_FACT,
+                _EVENT_TYPE_RUN_FAILED,
+                2,
+            ),
+        )
     return ()
 
 
@@ -1342,9 +1385,16 @@ def _engine_event_ref(candidate: EngineEventCandidate) -> str:
     :returns: EngineEvent 引用文本。
     """
 
+    event_type = candidate.engine_event.type.value
+    if (
+        candidate.engine_event.type == EngineEventType.RUN_FAILED
+        and isinstance(candidate.engine_event.data, RunFailedData)
+        and candidate.engine_event.data.error_code == _REASON_WORKER_LOST_BEFORE_TERMINAL
+    ):
+        event_type = _REASON_WORKER_LOST_BEFORE_TERMINAL
     return (
         f"engine:{candidate.envelope.execution_id}:"
-        f"{candidate.worker_event_index}:{candidate.engine_event.type.value}"
+        f"{candidate.worker_event_index}:{event_type}"
     )
 
 
@@ -1619,6 +1669,8 @@ def _is_preview_event(event: EngineEvent) -> bool:
         EngineEventType.CONTENT_COMPLETED,
         EngineEventType.TOOL_CALL_DELTA,
         EngineEventType.TOOL_CALLS_BATCH_READY,
+        EngineEventType.TOOL_CALL_REQUESTED,
+        EngineEventType.TOOL_RESULT_ACCEPTED,
         EngineEventType.TOOL_CALLS_BATCH_DONE,
         EngineEventType.ITERATION_COMPLETED,
     }
@@ -1663,6 +1715,19 @@ def _preview_payload(context: _ValidatedCandidate) -> Mapping[str, JsonValue]:
     elif isinstance(data, ToolCallsBatchReadyData):
         common["iteration_id"] = data.iteration_id
         common["tool_call_count"] = len(data.tool_calls)
+    elif isinstance(data, ToolCallRequestedData):
+        common["iteration_id"] = data.iteration_id
+        common["tool_call_id"] = data.tool_call_id
+        common["tool_name"] = data.name
+        common["index_in_iteration"] = data.index_in_iteration
+        common["argument_key_count"] = len(data.arguments)
+        common["provider_state_present"] = data.provider_state is not None
+    elif isinstance(data, ToolResultAcceptedData):
+        common["iteration_id"] = data.iteration_id
+        common["tool_call_id"] = data.record.call.tool_call_id
+        common["tool_name"] = data.record.call.name
+        common["index_in_iteration"] = data.record.call.index_in_iteration
+        common["outcome_kind"] = _accepted_tool_outcome_kind(data)
     elif isinstance(data, ToolCallsBatchDoneData):
         common["iteration_id"] = data.iteration_id
         common["tool_call_count"] = len(data.tool_call_ids)
@@ -1674,6 +1739,24 @@ def _preview_payload(context: _ValidatedCandidate) -> Mapping[str, JsonValue]:
         common["finish_reason"] = data.finish_reason.value
         common["provider_request_id"] = data.provider_request_id
     return common
+
+
+def _accepted_tool_outcome_kind(data: ToolResultAcceptedData) -> str:
+    """返回 accepted tool result 的中性 outcome 分类。
+
+    :param data: tool_result_accepted data。
+    :returns: ``completed``、``failed`` 或 ``cancelled``。
+    :raises HostDurableError: 遇到未知 outcome 类型时抛出。
+    """
+
+    outcome = data.record.outcome
+    if isinstance(outcome, ToolCompletedOutcome):
+        return "completed"
+    if isinstance(outcome, ToolFailedOutcome):
+        return "failed"
+    if isinstance(outcome, ToolCancelledOutcome):
+        return "cancelled"
+    raise HostDurableError("unsupported accepted tool outcome")
 
 
 def _context_compaction_payload(

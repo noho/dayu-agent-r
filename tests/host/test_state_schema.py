@@ -8,7 +8,7 @@ from pathlib import Path
 import pytest
 
 from dayu.host.api import AttemptStatus, RunStatus, SessionStatus
-from dayu.host.durable.connection import open_host_durable_store
+from dayu.host.durable.connection import HostDurableStore, open_host_durable_store
 from dayu.host.durable.errors import HostDurableError, HostUniqueConstraintError
 from dayu.host.durable.options import (
     HostDurableStoreOptions,
@@ -605,6 +605,75 @@ def test_dispatch_record_nullability_rules_reject_invalid_shapes(
         assert str(error_info.value) == "Host durable CHECK constraint failed"
 
 
+def test_dispatch_record_nullability_rules_reject_each_status_invalid_shape(
+    tmp_path: Path,
+) -> None:
+    """dispatch record 四个状态各自拒绝越界诊断字段组合。"""
+
+    options = _options(tmp_path)
+    with open_host_durable_store(options) as store:
+        _assert_invalid_dispatch_shape(
+            store,
+            attempt_id="attempt-invalid-pending",
+            status=DispatchRecordStatus.PENDING,
+            owner_host_instance_id=None,
+            waiting_for_lane_at=_TIMESTAMP,
+            lane_name=None,
+            lane_claim_id=None,
+            lane_owner_id=None,
+            lane_acquired_at=None,
+            dispatching_at=None,
+            cancelled_event_id=None,
+            cancelled_event_sequence=None,
+            cancelled_at=None,
+        )
+        _assert_invalid_dispatch_shape(
+            store,
+            attempt_id="attempt-invalid-waiting",
+            status=DispatchRecordStatus.WAITING_FOR_LANE,
+            owner_host_instance_id="host-instance-1",
+            waiting_for_lane_at=_TIMESTAMP,
+            lane_name=None,
+            lane_claim_id=None,
+            lane_owner_id=None,
+            lane_acquired_at=None,
+            dispatching_at=None,
+            cancelled_event_id=None,
+            cancelled_event_sequence=None,
+            cancelled_at=None,
+        )
+        _assert_invalid_dispatch_shape(
+            store,
+            attempt_id="attempt-invalid-dispatching",
+            status=DispatchRecordStatus.DISPATCHING,
+            owner_host_instance_id="host-instance-1",
+            waiting_for_lane_at=_TIMESTAMP,
+            lane_name="llm",
+            lane_claim_id=None,
+            lane_owner_id="lane-owner-1",
+            lane_acquired_at=_TIMESTAMP,
+            dispatching_at=_TIMESTAMP,
+            cancelled_event_id=None,
+            cancelled_event_sequence=None,
+            cancelled_at=None,
+        )
+        _assert_invalid_dispatch_shape(
+            store,
+            attempt_id="attempt-invalid-cancelled",
+            status=DispatchRecordStatus.CANCELLED,
+            owner_host_instance_id=None,
+            waiting_for_lane_at=None,
+            lane_name=None,
+            lane_claim_id=None,
+            lane_owner_id=None,
+            lane_acquired_at=None,
+            dispatching_at=None,
+            cancelled_event_id="event-cancelled-missing-sequence",
+            cancelled_event_sequence=None,
+            cancelled_at=_TIMESTAMP,
+        )
+
+
 def test_status_deserializers_reject_unknown_values() -> None:
     """状态反序列化 helper 对未知值结构化失败。"""
 
@@ -712,6 +781,93 @@ def _required_row_text(row: HostRow, *, column: str) -> str:
     value = row.get(column)
     assert isinstance(value, str)
     return value
+
+
+def _assert_invalid_dispatch_shape(
+    store: HostDurableStore,
+    *,
+    attempt_id: str,
+    status: DispatchRecordStatus,
+    owner_host_instance_id: str | None,
+    waiting_for_lane_at: str | None,
+    lane_name: str | None,
+    lane_claim_id: str | None,
+    lane_owner_id: str | None,
+    lane_acquired_at: str | None,
+    dispatching_at: str | None,
+    cancelled_event_id: str | None,
+    cancelled_event_sequence: int | None,
+    cancelled_at: str | None,
+) -> None:
+    """断言一组 dispatch record 诊断字段组合被 schema 拒绝。
+
+    :param store: Host durable store。
+    :param attempt_id: 测试 Attempt id。
+    :param status: dispatch record 状态。
+    :param owner_host_instance_id: owner Host instance id。
+    :param waiting_for_lane_at: lane 等待时间。
+    :param lane_name: lane 名称。
+    :param lane_claim_id: lane claim id。
+    :param lane_owner_id: lane owner id。
+    :param lane_acquired_at: lane 获取时间。
+    :param dispatching_at: dispatching 时间。
+    :param cancelled_event_id: cancel event id。
+    :param cancelled_event_sequence: cancel event sequence。
+    :param cancelled_at: cancel 时间。
+    :returns: ``None``。
+    """
+
+    def operation(transaction: HostTransaction) -> None:
+        """写入非法 dispatch record。
+
+        :param transaction: Host transaction。
+        :returns: ``None``。
+        """
+
+        _insert_session_tx(transaction, session_id="session-1")
+        _insert_run_tx(
+            transaction,
+            run_id=f"run-{attempt_id}",
+            session_id="session-1",
+            status=RunStatus.RUNNING,
+            client_request_id=f"request-{attempt_id}",
+        )
+        _insert_attempt_tx(
+            transaction,
+            attempt_id=attempt_id,
+            run_id=f"run-{attempt_id}",
+            execution_id=f"execution-{attempt_id}",
+        )
+        if owner_host_instance_id is not None:
+            _ensure_host_instance_tx(
+                transaction,
+                host_instance_id=owner_host_instance_id,
+            )
+        _insert_dispatch_record_with_diagnostics_tx(
+            transaction,
+            dispatch_record_id=f"dispatch-{attempt_id}",
+            run_id=f"run-{attempt_id}",
+            attempt_id=attempt_id,
+            execution_id=f"execution-{attempt_id}",
+            status=status,
+            owner_host_instance_id=owner_host_instance_id,
+            waiting_for_lane_at=waiting_for_lane_at,
+            lane_name=lane_name,
+            lane_claim_id=lane_claim_id,
+            lane_owner_id=lane_owner_id,
+            lane_acquired_at=lane_acquired_at,
+            dispatching_at=dispatching_at,
+            worker_accepted_at=None,
+            worker_accept_event_id=None,
+            worker_accept_event_sequence=None,
+            cancelled_event_id=cancelled_event_id,
+            cancelled_event_sequence=cancelled_event_sequence,
+            cancelled_at=cancelled_at,
+        )
+
+    with pytest.raises(HostDurableError) as error_info:
+        store.transaction_runner.run_write(operation)
+    assert str(error_info.value) == "Host durable CHECK constraint failed"
 
 
 def _insert_session_tx(transaction: HostTransaction, *, session_id: str) -> None:

@@ -59,6 +59,7 @@ from dayu.host.durable.state import (
     RunStartReason,
     StateMutationStatus,
     WorkerKind,
+    cancel_starting_dispatch_record_row,
     mark_attempt_running_row,
     mark_dispatch_worker_accepted_row,
     mark_dispatch_waiting_for_lane_row,
@@ -66,6 +67,7 @@ from dayu.host.durable.state import (
     read_attempt_by_id,
     read_dispatch_record_by_attempt_id,
     read_run_by_id,
+    terminal_run_row,
 )
 from dayu.host.durable.transaction import HostRow, HostTransaction, HostTransactionRunner
 
@@ -831,19 +833,22 @@ def test_dispatch_record_waiting_dispatching_and_worker_accept_refs(
         )
 
 
-def test_dispatching_requires_waiting_for_lane_source(tmp_path: Path) -> None:
-    """pending dispatch record 不能跳过 waiting_for_lane 直接进入 dispatching。"""
+def test_dispatching_supports_pending_direct_lane_recheck(tmp_path: Path) -> None:
+    """pending dispatch record 可在 lane acquired recheck 后直跳 dispatching。"""
 
     with open_host_durable_store(_options(tmp_path)) as store:
         seeded = _seed_running_run(store, tmp_path)
 
-        def operation(transaction: HostTransaction) -> tuple[str, str]:
-            """对 pending dispatch record 直接执行 dispatching mutation。
+        def operation(
+            transaction: HostTransaction,
+        ) -> tuple[str, str, str | None, str | None, str | None]:
+            """对 pending dispatch record 执行 direct dispatching mutation。
 
             :param transaction: Host transaction。
-            :returns: mutation 状态与最新 dispatch record 状态。
+            :returns: mutation 状态、dispatch 状态与关键诊断字段。
             """
 
+            _ensure_host_instance_tx(transaction)
             result = mark_dispatching_after_lane_row(
                 transaction,
                 attempt_id=seeded.attempt_id,
@@ -855,11 +860,20 @@ def test_dispatching_requires_waiting_for_lane_source(tmp_path: Path) -> None:
                 dispatching_at="2026-05-14T01:02:06Z",
             )
             assert result.row is not None
-            return result.status.value, result.row.status.value
+            return (
+                result.status.value,
+                result.row.status.value,
+                result.row.waiting_for_lane_at,
+                result.row.lane_name,
+                result.row.owner_host_instance_id,
+            )
 
         assert store.transaction_runner.run_write(operation) == (
-            StateMutationStatus.INVALID_STATE.value,
-            DispatchRecordStatus.PENDING.value,
+            StateMutationStatus.UPDATED.value,
+            DispatchRecordStatus.DISPATCHING.value,
+            "2026-05-14T01:02:05Z",
+            "llm",
+            "host-instance-1",
         )
 
 
@@ -911,6 +925,107 @@ def test_cancel_predispatch_starting_supports_all_pre_accept_dispatch_statuses(
             RunStatus.CANCELLED.value,
             AttemptStatus.CANCELLED.value,
             DispatchRecordStatus.CANCELLED.value,
+        )
+
+
+def test_cancel_starting_dispatch_record_absorbs_already_cancelled(
+    tmp_path: Path,
+) -> None:
+    """底层 dispatch cancel CAS 对已 CANCELLED row 返回 CAS_LOST。"""
+
+    with open_host_durable_store(_options(tmp_path)) as store:
+        seeded = _seed_running_run(store, tmp_path)
+
+        def operation(transaction: HostTransaction) -> tuple[str, str]:
+            """先完成 pre-dispatch cancel，再重放底层 dispatch cancel。
+
+            :param transaction: Host transaction。
+            :returns: mutation 状态与 dispatch row 状态。
+            """
+
+            cancelled = cancel_predispatch_starting_in_transaction(
+                transaction,
+                EventLogStore(),
+                _cancel_predispatch_input(
+                    run_id=seeded.run_id,
+                    event_suffix="first",
+                ),
+            )
+            assert cancelled.status == StateMutationStatus.UPDATED
+            event = EventLogStore().append_event(
+                transaction,
+                _test_event(
+                    event_id="event-dispatch-cancel-replay",
+                    session_id=seeded.session_id,
+                    run_id=seeded.run_id,
+                    event_type="ATTEMPT_CANCELLED",
+                    payload={"attempt_id": seeded.attempt_id},
+                ),
+            ).row
+            result = cancel_starting_dispatch_record_row(
+                transaction,
+                attempt_id=seeded.attempt_id,
+                cancelled_event_id=event.event_id,
+                cancelled_event_sequence=event.event_sequence,
+                cancelled_at="2026-05-14T01:02:09Z",
+            )
+            assert result.row is not None
+            return result.status.value, result.row.status.value
+
+        assert store.transaction_runner.run_write(operation) == (
+            StateMutationStatus.CAS_LOST.value,
+            DispatchRecordStatus.CANCELLED.value,
+        )
+
+
+@pytest.mark.parametrize(
+    "active_status",
+    (RunStatus.CANCELLING, RunStatus.RECOVERING),
+)
+def test_terminal_run_row_reports_cas_lost_for_deferred_active_statuses(
+    tmp_path: Path, active_status: RunStatus
+) -> None:
+    """terminal Run CAS 看到 CANCELLING/RECOVERING 时归类为 CAS_LOST。"""
+
+    with open_host_durable_store(_options(tmp_path)) as store:
+        seeded = _seed_running_run(store, tmp_path)
+
+        def operation(transaction: HostTransaction) -> tuple[str, str]:
+            """构造 deferred active 状态后执行 terminal Run CAS。
+
+            :param transaction: Host transaction。
+            :returns: mutation 状态与最新 Run 状态。
+            """
+
+            transaction.execute(
+                "UPDATE host_runs SET status = ? WHERE run_id = ?",
+                (active_status.value, seeded.run_id),
+            )
+            event = EventLogStore().append_event(
+                transaction,
+                _test_event(
+                    event_id=f"event-terminal-{active_status.value}",
+                    session_id=seeded.session_id,
+                    run_id=seeded.run_id,
+                    event_type="RUN_FAILED",
+                    payload={"reason": "cas-test"},
+                ),
+            ).row
+            result = terminal_run_row(
+                transaction,
+                run_id=seeded.run_id,
+                current_attempt_id=seeded.attempt_id,
+                terminal_status=RunStatus.FAILED,
+                terminal_event_id=event.event_id,
+                terminal_event_sequence=event.event_sequence,
+                terminal_at="2026-05-14T01:02:10Z",
+            )
+            assert result.row is not None
+            return result.status.value, result.row.status.value
+
+        assert store.transaction_runner.run_write(operation) == (
+            StateMutationStatus.CAS_LOST.value,
+            active_status.value,
         )
 
 

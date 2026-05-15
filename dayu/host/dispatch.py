@@ -47,6 +47,7 @@ from dayu.host.durable.state import (
     RunRow,
     StateMutationStatus,
     WorkerKind,
+    cancel_starting_dispatch_record_row,
     mark_attempt_running_row,
     mark_dispatch_waiting_for_lane_row,
     mark_dispatch_worker_accepted_row,
@@ -200,7 +201,7 @@ class ActiveWorkerRegistry:
         entry.cancellation_token.request_cancel(message.reason)
         try:
             entry.handle.cancel(message.reason)
-        except RuntimeError:
+        except Exception:
             return True
         return True
 
@@ -441,8 +442,8 @@ class HostDispatchScheduler:
             task.cancel()
             await _suppress_task_cancel(task)
         for handle in tuple(self._active_handles):
-            handle.cancel("scheduler_close")
-            await handle.close()
+            _safe_cancel_worker_handle(handle, "scheduler_close")
+            await _safe_close_worker_handle(handle)
         for active_task in tuple(self._active_tasks):
             active_task.cancel()
             await _suppress_task_cancel(active_task)
@@ -482,19 +483,32 @@ class HostDispatchScheduler:
             self._closeout_worker_startup_timeout(record)
             return "timed_out"
         if isinstance(acquire, LaneAcquireCancelled):
-            return "skipped"
+            if self._closed:
+                return "skipped"
+            self._closeout_worker_startup_timeout(record)
+            return "timed_out"
         if not isinstance(acquire, LaneAcquired):
             return "skipped"
         token = acquire.token
-        dispatching_row = self._mark_dispatching_after_recheck(record, token)
-        if dispatching_row is None:
-            await token.release()
-            return "skipped"
-        await asyncio.sleep(0)
-        if not self._dispatch_record_still_pre_accept(dispatching_row):
-            await token.release()
-            return "skipped"
-        return await self._start_worker(record, dispatching_row, token)
+        try:
+            dispatching_row = self._mark_dispatching_after_recheck(record, token)
+            if dispatching_row is None:
+                await _safe_release_lane_token(token)
+                return "skipped"
+            await asyncio.sleep(0)
+            if not self._dispatch_record_still_pre_accept(dispatching_row):
+                await _safe_release_lane_token(token)
+                return "skipped"
+            return await self._start_worker(record, dispatching_row, token)
+        except asyncio.CancelledError:
+            await _safe_release_lane_token(token)
+            raise
+        except Exception:
+            try:
+                self._closeout_worker_startup_timeout(record)
+            finally:
+                await _safe_release_lane_token(token)
+            return "timed_out"
 
     def _mark_waiting_for_lane(
         self, record: PendingDispatchRecord
@@ -612,15 +626,23 @@ class HostDispatchScheduler:
                 policy_snapshot_ref=_LOCAL_POLICY_SNAPSHOT_REF,
             ),
         ).build(snapshot)
-        worker = self._local_execution.worker_factory.create_worker(snapshot)
         try:
+            worker = self._local_execution.worker_factory.create_worker(snapshot)
             handle = await asyncio.wait_for(
                 worker.accept(snapshot, request),
                 timeout=self._local_execution.worker_startup_timeout_seconds,
             )
         except TimeoutError:
-            self._closeout_worker_startup_timeout(record)
-            await token.release()
+            try:
+                self._closeout_worker_startup_timeout(record)
+            finally:
+                await _safe_release_lane_token(token)
+            return "timed_out"
+        except Exception:
+            try:
+                self._closeout_worker_startup_timeout(record)
+            finally:
+                await _safe_release_lane_token(token)
             return "timed_out"
         if not self._accept_worker_running(
             record=record,
@@ -628,8 +650,8 @@ class HostDispatchScheduler:
             token=token,
             handle=handle,
         ):
-            await handle.close()
-            await token.release()
+            await _safe_close_worker_handle(handle)
+            await _safe_release_lane_token(token)
             return "skipped"
         self._active_registry.register(
             run_id=record.run_id,
@@ -768,15 +790,14 @@ class HostDispatchScheduler:
         """
 
         def _operation(transaction: HostTransaction) -> None:
-            terminal_closeout_in_transaction(
+            attempt_event_id = _new_event_id(_EVENT_ID_ATTEMPT_FAILED_PREFIX)
+            result = terminal_closeout_in_transaction(
                 transaction,
                 self._event_log_store,
                 TerminalCloseoutInput(
                     run_id=record.run_id,
                     attempt_id=record.attempt_id,
-                    attempt_terminal_event_id=_new_event_id(
-                        _EVENT_ID_ATTEMPT_FAILED_PREFIX
-                    ),
+                    attempt_terminal_event_id=attempt_event_id,
                     run_terminal_event_id=_new_event_id(_EVENT_ID_RUN_FAILED_PREFIX),
                     attempt_terminal_status=AttemptStatus.FAILED,
                     run_terminal_status=RunStatus.FAILED,
@@ -787,6 +808,21 @@ class HostDispatchScheduler:
                     terminal_summary_ref=None,
                     terminal_summary_digest=None,
                 ),
+            )
+            if result.status != StateMutationStatus.UPDATED:
+                return
+            event = self._event_log_store.read_event_by_id(
+                transaction,
+                attempt_event_id,
+            )
+            if event is None:
+                return
+            cancel_starting_dispatch_record_row(
+                transaction,
+                attempt_id=record.attempt_id,
+                cancelled_event_id=event.event_id,
+                cancelled_event_sequence=event.event_sequence,
+                cancelled_at=format_utc_timestamp(datetime.now(UTC)),
             )
 
         self._transaction_runner.run_write(_operation)
@@ -852,14 +888,25 @@ class HostDispatchScheduler:
                     )
                     break
                 worker_event_index += 1
-                result = ingestor.ingest(
-                    EngineEventCandidate(
-                        envelope=envelope,
-                        worker_event_index=worker_event_index,
-                        engine_event=event,
-                        observed_at=datetime.now(UTC),
+                try:
+                    result = ingestor.ingest(
+                        EngineEventCandidate(
+                            envelope=envelope,
+                            worker_event_index=worker_event_index,
+                            engine_event=event,
+                            observed_at=datetime.now(UTC),
+                        )
                     )
-                )
+                except Exception as exc:
+                    ingestor.close_worker_lost(
+                        envelope,
+                        observed_at=datetime.now(UTC),
+                        worker_lifecycle_signal="ingest_exception",
+                        stream_error_code=exc.__class__.__name__,
+                        last_observed_worker_event_index=worker_event_index,
+                        last_accepted_event_id=last_accepted_event_id,
+                    )
+                    break
                 if result.status in (
                     EngineIngestStatus.ACCEPTED,
                     EngineIngestStatus.DUPLICATE,
@@ -868,14 +915,15 @@ class HostDispatchScheduler:
                         last_accepted_event_id = result.events[-1].event_id
                     if result.terminal_closeout:
                         terminal_seen = True
+                        break
         finally:
             self._active_handles.discard(handle)
             self._active_registry.unregister(
                 attempt_id=record.attempt_id,
                 execution_id=record.execution_id,
             )
-            await handle.close()
-            await token.release()
+            await _safe_close_worker_handle(handle)
+            await _safe_release_lane_token(token)
 
 
 def _is_dispatchable_recheck(
@@ -902,7 +950,8 @@ def _is_dispatchable_recheck(
         and run.current_attempt_id == record.attempt_id
         and attempt.status == AttemptStatus.STARTING
         and attempt.execution_id == record.execution_id
-        and dispatch_record.status == DispatchRecordStatus.WAITING_FOR_LANE
+        and dispatch_record.status
+        in (DispatchRecordStatus.PENDING, DispatchRecordStatus.WAITING_FOR_LANE)
         and dispatch_record.dispatch_record_id == record.dispatch_record_id
         and dispatch_record.execution_id == record.execution_id
         and dispatch_record.worker_accept_event_id is None
@@ -1046,6 +1095,46 @@ def _register_dispatch_host_instance(
         register_current_instance(transaction, identity)
 
     transaction_runner.run_write(_operation)
+
+
+def _safe_cancel_worker_handle(handle: LocalWorkerHandle, reason: str) -> None:
+    """best-effort 取消 worker handle，避免清理路径被 handle 异常打断。
+
+    :param handle: worker handle。
+    :param reason: 取消原因。
+    :returns: ``None``。
+    """
+
+    try:
+        handle.cancel(reason)
+    except Exception:
+        return
+
+
+async def _safe_close_worker_handle(handle: LocalWorkerHandle) -> None:
+    """best-effort 关闭 worker handle。
+
+    :param handle: worker handle。
+    :returns: ``None``。
+    """
+
+    try:
+        await handle.close()
+    except Exception:
+        return
+
+
+async def _safe_release_lane_token(token: LaneClaimToken) -> None:
+    """best-effort 释放 runtime lane token。
+
+    :param token: lane claim token。
+    :returns: ``None``。
+    """
+
+    try:
+        await token.release()
+    except Exception:
+        return
 
 
 async def _suppress_task_cancel(task: asyncio.Task[None]) -> None:

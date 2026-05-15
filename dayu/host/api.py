@@ -467,6 +467,18 @@ class HostLocalExecutionOptions:
                 "HostLocalExecutionOptions.dispatch_poll_interval_seconds"
             ),
         )
+        if not isinstance(self.runner_spec, RunnerSpec):
+            raise TypeError("HostLocalExecutionOptions.runner_spec must be RunnerSpec")
+        if not isinstance(self.runner_options, RunnerCallOptions):
+            raise TypeError(
+                "HostLocalExecutionOptions.runner_options must be RunnerCallOptions"
+            )
+        if not isinstance(self.agent_policy, AgentPolicy):
+            raise TypeError("HostLocalExecutionOptions.agent_policy must be AgentPolicy")
+        if self.worker_factory is None:
+            raise TypeError(
+                "HostLocalExecutionOptions.worker_factory must be non-None"
+            )
 
 
 class HostApiErrorCode(StrEnum):

@@ -10,15 +10,30 @@ from pathlib import Path
 from typing import cast
 
 from dayu.contracts.json_value import JsonValue
+from dayu.contracts.tool_await import ToolAwaitKind, ToolAwaitSpec
+from dayu.contracts.tool_call import ToolCallRequest
+from dayu.contracts.tool_outcome import ToolCompletedOutcome
+from dayu.contracts.tool_result import ToolResultSuccess
 from dayu.engine.contracts.engine_events import (
     ContextCompactionRequestedData,
     EngineEvent,
     EngineEventType,
     FinalAnswerData,
+    ProviderProtocolErrorData,
+    RunCancelledData,
     RunFailedData,
+    RunSuspendedData,
+    ToolAwaitingData,
+    ToolCallRequestedData,
+    ToolResultAcceptedData,
     UsageReportedData,
 )
 from dayu.engine.contracts.finish_reason import FinishReason
+from dayu.engine.contracts.tool_records import (
+    AcceptedToolExecutionRecord,
+    AssistantToolCallBatchSnapshot,
+    AwaitingToolExecutionRecord,
+)
 from dayu.host.admission import PendingDispatchRecord
 from dayu.host.api import AttemptStatus, EnsureSessionRequest, RunStatus
 from dayu.host.durable.codec import sha256_digest_json
@@ -272,6 +287,71 @@ def test_context_compaction_requested_accepts_none_budget_and_fails(
         assert run_status == RunStatus.FAILED
 
 
+def test_run_suspended_fails_waiting_path_and_duplicate_is_idempotent(
+    tmp_path: Path,
+) -> None:
+    """run_suspended 在 Phase 5 写 diagnostic 后 FAILED，重复 ingest 返回 DUPLICATE。"""
+
+    with open_host_durable_store(_options(tmp_path)) as store:
+        seeded = _seed_active_run(store.transaction_runner)
+        candidate = _candidate(
+            seeded,
+            worker_event_index=5,
+            data=RunSuspendedData(
+                reason="tool_awaiting",
+                resume_hint=None,
+                accepted_records=(_accepted_tool_record(),),
+                awaiting_records=(_awaiting_tool_record(),),
+            ),
+            event_type=EngineEventType.RUN_SUSPENDED,
+        )
+        ingestor = EngineEventIngestor(transaction_runner=store.transaction_runner)
+
+        first = ingestor.ingest(candidate)
+        second = ingestor.ingest(candidate)
+
+        assert first.status == EngineIngestStatus.ACCEPTED
+        assert second.status == EngineIngestStatus.DUPLICATE
+        assert [event.event_type for event in first.events] == [
+            "ENGINE_EVENT_DIAGNOSTIC",
+            "ATTEMPT_FAILED",
+            "RUN_FAILED",
+        ]
+        assert _payload(first.events[0])["unsupported_later_owner"] == "phase7"
+        assert _event_count(store.transaction_runner, "RUN_FAILED") == 1
+
+
+def test_tool_awaiting_fails_waiting_path_and_duplicate_is_idempotent(
+    tmp_path: Path,
+) -> None:
+    """tool_awaiting 在 Phase 5 写 diagnostic 后 FAILED，重复 ingest 返回 DUPLICATE。"""
+
+    with open_host_durable_store(_options(tmp_path)) as store:
+        seeded = _seed_active_run(store.transaction_runner)
+        candidate = _candidate(
+            seeded,
+            worker_event_index=6,
+            data=ToolAwaitingData(
+                iteration_id="iter-await",
+                record=_awaiting_tool_record(),
+            ),
+            event_type=EngineEventType.TOOL_AWAITING,
+        )
+        ingestor = EngineEventIngestor(transaction_runner=store.transaction_runner)
+
+        first = ingestor.ingest(candidate)
+        second = ingestor.ingest(candidate)
+
+        assert first.status == EngineIngestStatus.ACCEPTED
+        assert second.status == EngineIngestStatus.DUPLICATE
+        assert [event.event_type for event in first.events] == [
+            "ENGINE_EVENT_DIAGNOSTIC",
+            "ATTEMPT_FAILED",
+            "RUN_FAILED",
+        ]
+        assert _event_count(store.transaction_runner, "RUN_FAILED") == 1
+
+
 def test_usage_reported_is_projection_signal_without_state_change(
     tmp_path: Path,
 ) -> None:
@@ -281,7 +361,7 @@ def test_usage_reported_is_projection_signal_without_state_change(
         seeded = _seed_active_run(store.transaction_runner)
         candidate = _candidate(
             seeded,
-            worker_event_index=5,
+            worker_event_index=7,
             data=UsageReportedData(
                 iteration_id="iter-usage",
                 prompt_tokens=10,
@@ -311,7 +391,7 @@ def test_duplicate_candidate_returns_existing_result(tmp_path: Path) -> None:
         wakeup = _WakeupSpy()
         candidate = _candidate(
             seeded,
-            worker_event_index=6,
+            worker_event_index=8,
             data=FinalAnswerData(
                 content="重复",
                 filtered=False,
@@ -357,7 +437,7 @@ def test_stale_execution_id_is_rejected_diagnostic(tmp_path: Path) -> None:
         )
         candidate = _candidate(
             stale,
-            worker_event_index=7,
+            worker_event_index=9,
             data=FinalAnswerData(
                 content="过期",
                 filtered=False,
@@ -378,6 +458,218 @@ def test_stale_execution_id_is_rejected_diagnostic(tmp_path: Path) -> None:
         run_status, attempt_status = _statuses(store.transaction_runner, seeded)
         assert run_status == RunStatus.RUNNING
         assert attempt_status == AttemptStatus.RUNNING
+
+
+def test_provider_protocol_error_is_diagnostic_without_state_change(
+    tmp_path: Path,
+) -> None:
+    """provider_protocol_error 写 diagnostic，不改变 active Run 状态。"""
+
+    with open_host_durable_store(_options(tmp_path)) as store:
+        seeded = _seed_active_run(store.transaction_runner)
+        candidate = _candidate(
+            seeded,
+            worker_event_index=10,
+            data=ProviderProtocolErrorData(
+                iteration_id="iter-protocol",
+                error_code="invalid_stream",
+                message="bad stream",
+                provider_request_id="req-protocol",
+                raw_payload={"raw": "payload"},
+                partial_tool_calls=(),
+            ),
+            event_type=EngineEventType.PROVIDER_PROTOCOL_ERROR,
+        )
+
+        result = EngineEventIngestor(
+            transaction_runner=store.transaction_runner
+        ).ingest(candidate)
+
+        assert result.events[0].event_class == EventClass.DIAGNOSTIC
+        assert result.events[0].event_type == "PROVIDER_PROTOCOL_ERROR"
+        assert _payload(result.events[0])["raw_payload_ref"] is not None
+        run_status, attempt_status = _statuses(store.transaction_runner, seeded)
+        assert run_status == RunStatus.RUNNING
+        assert attempt_status == AttemptStatus.RUNNING
+
+
+def test_tool_call_requested_and_result_accepted_are_preview(
+    tmp_path: Path,
+) -> None:
+    """Phase 5 no-tool Host 只把 tool request/result 作为 preview 观测事实。"""
+
+    with open_host_durable_store(_options(tmp_path)) as store:
+        seeded = _seed_active_run(store.transaction_runner)
+        requested = _candidate(
+            seeded,
+            worker_event_index=11,
+            data=ToolCallRequestedData(
+                iteration_id="iter-tool",
+                tool_call_id="tool-call-1",
+                name="lookup",
+                arguments={"ticker": "MSFT"},
+                index_in_iteration=0,
+                provider_state=None,
+            ),
+            event_type=EngineEventType.TOOL_CALL_REQUESTED,
+        )
+        accepted = _candidate(
+            seeded,
+            worker_event_index=12,
+            data=ToolResultAcceptedData(
+                iteration_id="iter-tool",
+                record=_accepted_tool_record(),
+            ),
+            event_type=EngineEventType.TOOL_RESULT_ACCEPTED,
+        )
+        ingestor = EngineEventIngestor(transaction_runner=store.transaction_runner)
+
+        first = ingestor.ingest(requested)
+        second = ingestor.ingest(accepted)
+
+        assert first.events[0].event_class == EventClass.PREVIEW
+        assert first.events[0].event_type == "TOOL_CALL_REQUESTED"
+        assert _payload(first.events[0])["argument_key_count"] == 1
+        assert second.events[0].event_class == EventClass.PREVIEW
+        assert second.events[0].event_type == "TOOL_RESULT_ACCEPTED"
+        assert _payload(second.events[0])["outcome_kind"] == "completed"
+        run_status, attempt_status = _statuses(store.transaction_runner, seeded)
+        assert run_status == RunStatus.RUNNING
+        assert attempt_status == AttemptStatus.RUNNING
+
+
+def test_late_terminal_event_is_rejected_after_closeout(tmp_path: Path) -> None:
+    """Run terminal 后迟到 terminal candidate 写 rejected diagnostic。"""
+
+    with open_host_durable_store(_options(tmp_path)) as store:
+        seeded = _seed_active_run(store.transaction_runner)
+        ingestor = EngineEventIngestor(transaction_runner=store.transaction_runner)
+        first = _candidate(
+            seeded,
+            worker_event_index=13,
+            data=FinalAnswerData(
+                content="done",
+                filtered=False,
+                degraded=False,
+                finish_reason=FinishReason.STOP,
+            ),
+            event_type=EngineEventType.FINAL_ANSWER,
+        )
+        late = _candidate(
+            seeded,
+            worker_event_index=14,
+            data=RunFailedData(
+                error_code="late",
+                message="late",
+                provider_request_id=None,
+                recoverable=False,
+            ),
+            event_type=EngineEventType.RUN_FAILED,
+        )
+
+        ingestor.ingest(first)
+        result = ingestor.ingest(late)
+
+        assert result.status == EngineIngestStatus.REJECTED
+        assert result.events[0].event_type == "ENGINE_EVENT_REJECTED"
+        assert _payload(result.events[0])["reason"] == "terminal_already_closed"
+
+
+def test_run_cancelled_without_active_cancel_is_rejected(tmp_path: Path) -> None:
+    """缺少 Host active cancel fact 的 run_cancelled 不关闭 Run。"""
+
+    with open_host_durable_store(_options(tmp_path)) as store:
+        seeded = _seed_active_run(store.transaction_runner)
+        candidate = _candidate(
+            seeded,
+            worker_event_index=15,
+            data=RunCancelledData(
+                reason="user_stop",
+                requested_at=_NOW,
+                accepted_at=_NOW,
+                finished_at=_NOW,
+            ),
+            event_type=EngineEventType.RUN_CANCELLED,
+        )
+
+        result = EngineEventIngestor(
+            transaction_runner=store.transaction_runner
+        ).ingest(candidate)
+
+        assert result.status == EngineIngestStatus.REJECTED
+        assert _payload(result.events[0])["reason"] == (
+            "run_cancelled_without_active_cancel"
+        )
+        run_status, attempt_status = _statuses(store.transaction_runner, seeded)
+        assert run_status == RunStatus.RUNNING
+        assert attempt_status == AttemptStatus.RUNNING
+
+
+def test_worker_lost_closeout_uses_lost_event_ids_and_duplicate(
+    tmp_path: Path,
+) -> None:
+    """worker lost synthetic lifecycle 使用 LOST facts，重复 closeout 幂等。"""
+
+    with open_host_durable_store(_options(tmp_path)) as store:
+        seeded = _seed_active_run(store.transaction_runner)
+        ingestor = EngineEventIngestor(transaction_runner=store.transaction_runner)
+        envelope = _envelope(seeded)
+
+        first = ingestor.close_worker_lost(
+            envelope,
+            observed_at=_NOW,
+            worker_lifecycle_signal="worker_stream_error",
+            stream_error_code="RuntimeError",
+            last_observed_worker_event_index=0,
+            last_accepted_event_id=None,
+        )
+        second = ingestor.close_worker_lost(
+            envelope,
+            observed_at=_NOW,
+            worker_lifecycle_signal="worker_stream_error",
+            stream_error_code="RuntimeError",
+            last_observed_worker_event_index=0,
+            last_accepted_event_id=None,
+        )
+
+        assert first.status == EngineIngestStatus.ACCEPTED
+        assert second.status == EngineIngestStatus.DUPLICATE
+        assert [event.event_type for event in first.events] == [
+            "ATTEMPT_LOST",
+            "RUN_LOST",
+        ]
+        payload = _payload(first.events[1])
+        assert payload["engine_event_ref"] == (
+            f"engine:{seeded.execution_id}:1:worker_lost_before_terminal"
+        )
+        run_status, attempt_status = _statuses(store.transaction_runner, seeded)
+        assert run_status == RunStatus.LOST
+        assert attempt_status == AttemptStatus.LOST
+
+
+def test_unsupported_engine_event_shape_is_rejected(tmp_path: Path) -> None:
+    """EngineEvent type/data 不匹配时写 rejected diagnostic。"""
+
+    with open_host_durable_store(_options(tmp_path)) as store:
+        seeded = _seed_active_run(store.transaction_runner)
+        candidate = _candidate(
+            seeded,
+            worker_event_index=16,
+            data=FinalAnswerData(
+                content="wrong shape",
+                filtered=False,
+                degraded=False,
+                finish_reason=FinishReason.STOP,
+            ),
+            event_type=EngineEventType.RUN_FAILED,
+        )
+
+        result = EngineEventIngestor(
+            transaction_runner=store.transaction_runner
+        ).ingest(candidate)
+
+        assert result.status == EngineIngestStatus.REJECTED
+        assert _payload(result.events[0])["reason"] == "unsupported_engine_event_type"
 
 
 def _options(tmp_path: Path) -> HostDurableStoreOptions:
@@ -525,7 +817,13 @@ def _candidate(
         FinalAnswerData
         | RunFailedData
         | ContextCompactionRequestedData
+        | RunSuspendedData
+        | ToolAwaitingData
         | UsageReportedData
+        | ProviderProtocolErrorData
+        | ToolCallRequestedData
+        | ToolResultAcceptedData
+        | RunCancelledData
     ),
     event_type: EngineEventType,
 ) -> EngineEventCandidate:
@@ -560,6 +858,98 @@ def _candidate(
             metadata=None,
         ),
         observed_at=_NOW,
+    )
+
+
+def _envelope(seeded: _SeededRun) -> LocalEngineEnvelope:
+    """构造测试用 LocalEngineEnvelope。
+
+    :param seeded: seeded run。
+    :returns: LocalEngineEnvelope。
+    """
+
+    return LocalEngineEnvelope(
+        session_id=seeded.session_id,
+        run_id=seeded.run_id,
+        attempt_id=seeded.attempt_id,
+        execution_id=seeded.execution_id,
+        dispatch_record_id=seeded.dispatch_record_id,
+        worker_kind=WorkerKind.LOCAL,
+        execution_target="target-ingest",
+        local_worker_id="local-worker-ingest",
+        cancellation_token=_NeverCancelledToken(),
+    )
+
+
+def _accepted_tool_record() -> AcceptedToolExecutionRecord:
+    """构造测试用 accepted tool execution record。
+
+    :returns: accepted tool record。
+    """
+
+    call = _tool_call()
+    return AcceptedToolExecutionRecord(
+        batch_snapshot=_tool_batch_snapshot(call),
+        call=call,
+        outcome=ToolCompletedOutcome(
+            result=ToolResultSuccess(
+                ok=True,
+                value={"answer": "ok"},
+                meta=None,
+            ),
+        ),
+    )
+
+
+def _awaiting_tool_record() -> AwaitingToolExecutionRecord:
+    """构造测试用 awaiting tool execution record。
+
+    :returns: awaiting tool record。
+    """
+
+    call = _tool_call()
+    return AwaitingToolExecutionRecord(
+        batch_snapshot=_tool_batch_snapshot(call),
+        call=call,
+        await_spec=ToolAwaitSpec(
+            await_kind=ToolAwaitKind.EXTERNAL_JOB,
+            deadline=None,
+            resume_token="resume-token",
+        ),
+        snapshot=None,
+    )
+
+
+def _tool_batch_snapshot(
+    call: ToolCallRequest,
+) -> AssistantToolCallBatchSnapshot:
+    """构造测试用 assistant tool call batch snapshot。
+
+    :param call: 工具调用请求。
+    :returns: batch snapshot。
+    """
+
+    return AssistantToolCallBatchSnapshot(
+        iteration_id="iter-tool",
+        tool_calls=(call,),
+        content=None,
+        reasoning_content=None,
+        provider_request_id="provider-tool",
+    )
+
+
+def _tool_call() -> ToolCallRequest:
+    """构造测试用 tool call。
+
+    :returns: tool call request。
+    """
+
+    return ToolCallRequest(
+        tool_call_id="tool-call-1",
+        name="lookup",
+        arguments={"ticker": "MSFT"},
+        index_in_iteration=0,
+        provider_state=None,
     )
 
 

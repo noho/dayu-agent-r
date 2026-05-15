@@ -5,6 +5,7 @@ from __future__ import annotations
 import ast
 import sqlite3
 from pathlib import Path
+from typing import cast
 
 import dayu.host as host_package
 import pytest
@@ -22,6 +23,8 @@ from dayu.host import (
     HostCommandHandle,
     HostCommandHandleOptions,
     HostInput,
+    HostLocalExecutionOptions,
+    LocalEngineWorkerFactory,
     OperationContext,
     StartRunRequest,
     SubmitFollowupRequest,
@@ -32,12 +35,22 @@ from dayu.host import (
     start_run,
     submit_followup,
 )
+from dayu.engine.contracts.agent_policy import AgentPolicy
+from dayu.engine.contracts.runner_spec import RunnerCallOptions, RunnerSpec
 
 _FORBIDDEN_IMPORT_PREFIXES: tuple[str, ...] = (
     "dayu.fins",
     "dayu.service",
     "dayu.ui",
 )
+
+
+class _WorkerFactoryToken:
+    """测试用 worker factory token。
+
+    public sync command handle 不消费该结构协议；真实 scheduler 装配由
+    HostDispatchScheduler.open 与 pyright 保障。
+    """
 
 
 def _options(tmp_path: Path, host_handle_id: str | None = "host-test") -> HostCommandHandleOptions:
@@ -59,6 +72,51 @@ def _options(tmp_path: Path, host_handle_id: str | None = "host-test") -> HostCo
         sqlite_write_retry_backoff_multiplier=1.2,
         sqlite_write_retry_max_delay_seconds=0.01,
         payload_inline_threshold_bytes=4096,
+    )
+
+
+def _local_execution_options(tmp_path: Path) -> HostLocalExecutionOptions:
+    """构造测试用 local execution options。
+
+    :param tmp_path: pytest 临时目录。
+    :returns: HostLocalExecutionOptions。
+    """
+
+    return HostLocalExecutionOptions(
+        lane_db_path=tmp_path / "lane.sqlite3",
+        lane_name="llm",
+        lane_capacity=1,
+        lane_default_timeout_seconds=0.1,
+        lane_claim_ttl_seconds=1.0,
+        lane_heartbeat_interval_seconds=0.1,
+        worker_startup_timeout_seconds=1.0,
+        dispatch_poll_interval_seconds=0.01,
+        runner_spec=RunnerSpec(
+            provider="test",
+            model="test-model",
+            endpoint="https://example.invalid",
+            api_key_ref="secret:test",
+            headers={},
+            supports_tool_calling=False,
+            supports_streaming=False,
+            supports_stream_usage=False,
+            default_timeout_seconds=1.0,
+            max_retries=0,
+            provider_request=None,
+        ),
+        runner_options=RunnerCallOptions(
+            temperature=None,
+            max_tokens=None,
+            top_p=None,
+            stream=False,
+        ),
+        agent_policy=AgentPolicy(
+            max_iterations=1,
+            continuation_max_attempts=0,
+            allow_tool_calls=False,
+            tool_execution_timeout_seconds=1.0,
+        ),
+        worker_factory=cast(LocalEngineWorkerFactory, _WorkerFactoryToken()),
     )
 
 
@@ -293,6 +351,42 @@ def test_factory_opens_fresh_database_and_returns_public_handle(
         assert ensure_session(command_handle, _ensure_request()).session_id
     finally:
         command_handle.close()
+
+
+def test_factory_rejects_local_execution_without_hidden_scheduler(
+    tmp_path: Path,
+) -> None:
+    """sync command handle factory 不隐式消费 local execution 配置。"""
+
+    options = _options(tmp_path)
+    local_options = _local_execution_options(tmp_path)
+
+    with pytest.raises(ValueError, match="local_execution"):
+        create_host_command_handle(
+            HostCommandHandleOptions(
+                host_handle_id=options.host_handle_id,
+                db_path=options.db_path,
+                artifact_root=options.artifact_root,
+                create_parent_dirs=options.create_parent_dirs,
+                sqlite_busy_timeout_seconds=options.sqlite_busy_timeout_seconds,
+                sqlite_write_busy_retry_count=(
+                    options.sqlite_write_busy_retry_count
+                ),
+                sqlite_write_retry_initial_delay_seconds=(
+                    options.sqlite_write_retry_initial_delay_seconds
+                ),
+                sqlite_write_retry_backoff_multiplier=(
+                    options.sqlite_write_retry_backoff_multiplier
+                ),
+                sqlite_write_retry_max_delay_seconds=(
+                    options.sqlite_write_retry_max_delay_seconds
+                ),
+                payload_inline_threshold_bytes=(
+                    options.payload_inline_threshold_bytes
+                ),
+                local_execution=local_options,
+            )
+        )
 
 
 def test_generated_handle_id_is_stable_for_handle_lifetime(

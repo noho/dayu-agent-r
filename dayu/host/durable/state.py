@@ -2087,6 +2087,14 @@ def mark_dispatching_after_lane_row(
 ) -> DispatchRecordMutationResult:
     """CAS 将 lane recheck 通过的 dispatch record 标记为 dispatching。
 
+    该 helper 支持两种安全来源：
+
+    - ``WAITING_FOR_LANE``：保留已写入的 waiting timestamp 与 lane name，
+      只补齐 lane claim / owner / dispatching 诊断字段。
+    - ``PENDING``：允许 scheduler 在已获得 lane token 后直跳
+      ``DISPATCHING``，并用本次 lane acquire 信息补齐 schema 要求的
+      waiting / lane / dispatching 全部诊断字段。
+
     :param transaction: 调用方提供的 Host transaction。
     :param attempt_id: 目标 Attempt id。
     :param owner_host_instance_id: 记录本次调度诊断的 Host instance id。
@@ -2115,6 +2123,7 @@ def mark_dispatching_after_lane_row(
         SET
           status = ?,
           owner_host_instance_id = ?,
+          waiting_for_lane_at = COALESCE(waiting_for_lane_at, ?),
           lane_name = ?,
           lane_claim_id = ?,
           lane_owner_id = ?,
@@ -2122,19 +2131,27 @@ def mark_dispatching_after_lane_row(
           dispatching_at = ?,
           updated_at = ?
         WHERE attempt_id = ?
-          AND status = ?
-          AND waiting_for_lane_at IS NOT NULL
-          AND lane_name = ?
+          AND status IN (?, ?)
           AND lane_claim_id IS NULL
           AND lane_owner_id IS NULL
           AND lane_acquired_at IS NULL
           AND dispatching_at IS NULL
           AND worker_accept_event_id IS NULL
           AND cancelled_event_id IS NULL
+          AND (
+            (status = ?
+              AND waiting_for_lane_at IS NULL
+              AND lane_name IS NULL)
+            OR
+            (status = ?
+              AND waiting_for_lane_at IS NOT NULL
+              AND lane_name = ?)
+          )
         """,
         (
             serialize_dispatch_record_status(DispatchRecordStatus.DISPATCHING),
             owner_host_instance_id,
+            lane_acquired_at,
             lane_name,
             lane_claim_id,
             lane_owner_id,
@@ -2142,6 +2159,9 @@ def mark_dispatching_after_lane_row(
             dispatching_at,
             dispatching_at,
             attempt_id,
+            serialize_dispatch_record_status(DispatchRecordStatus.PENDING),
+            serialize_dispatch_record_status(DispatchRecordStatus.WAITING_FOR_LANE),
+            serialize_dispatch_record_status(DispatchRecordStatus.PENDING),
             serialize_dispatch_record_status(DispatchRecordStatus.WAITING_FOR_LANE),
             lane_name,
         ),
@@ -2274,6 +2294,7 @@ def cancel_starting_dispatch_record_row(
     if latest.status in (
         DispatchRecordStatus.PENDING,
         DispatchRecordStatus.WAITING_FOR_LANE,
+        DispatchRecordStatus.CANCELLED,
     ):
         return DispatchRecordMutationResult(
             status=StateMutationStatus.CAS_LOST,
@@ -2925,7 +2946,12 @@ def _run_mutation_result_for_active(
         return RunMutationResult(status=StateMutationStatus.UPDATED, row=latest)
     if latest is None:
         return RunMutationResult(status=StateMutationStatus.NOT_FOUND, row=None)
-    if latest.status in (RunStatus.RUNNING, RunStatus.WAITING):
+    if latest.status in (
+        RunStatus.RUNNING,
+        RunStatus.WAITING,
+        RunStatus.CANCELLING,
+        RunStatus.RECOVERING,
+    ):
         return RunMutationResult(status=StateMutationStatus.CAS_LOST, row=latest)
     return RunMutationResult(status=StateMutationStatus.INVALID_STATE, row=latest)
 
@@ -3081,7 +3107,10 @@ def _dispatch_record_mutation_result_for_lane_dispatching(
         return DispatchRecordMutationResult(
             status=StateMutationStatus.NOT_FOUND, row=None
         )
-    if latest.status == DispatchRecordStatus.WAITING_FOR_LANE:
+    if latest.status in (
+        DispatchRecordStatus.PENDING,
+        DispatchRecordStatus.WAITING_FOR_LANE,
+    ):
         return DispatchRecordMutationResult(
             status=StateMutationStatus.CAS_LOST, row=latest
         )

@@ -433,14 +433,12 @@ class DurableSessionContinuityProvider:
             session_id=snapshot.session_id,
             before_event_sequence=current_facts.attempt.started_event_sequence,
         )
-        messages: list[AgentMessage] = []
-        for event in events:
-            if event.run_id == snapshot.run_id:
-                continue
-            message = _continuity_message_from_event(event)
-            if message is not None:
-                messages.append(message)
-        return SessionContinuityView(messages=tuple(messages))
+        return SessionContinuityView(
+            messages=_successful_run_continuity_messages(
+                events=events,
+                current_run_id=snapshot.run_id,
+            )
+        )
 
 
 class NoopMemorySnapshotProvider:
@@ -579,8 +577,6 @@ class DefaultSceneParameterProvider:
                 f"execution_target={execution_target}",
                 f"queue_policy={current_facts.run.queue_policy}",
                 f"policy_snapshot_ref={policy_snapshot.policy_snapshot_ref}",
-                f"attempt_id={snapshot.attempt_id}",
-                f"execution_id={snapshot.execution_id}",
                 "tools=disabled",
             )
         )
@@ -910,6 +906,59 @@ def _continuity_message_from_event(event: EventLogRow) -> AgentMessage | None:
             tool_calls=(),
         )
     return None
+
+
+def _successful_run_continuity_messages(
+    *, events: tuple[EventLogRow, ...], current_run_id: str
+) -> tuple[AgentMessage, ...]:
+    """只把已成功收口的历史 Run 投影为完整 user/assistant 对。
+
+    :param events: 按 EventLog sequence 排序的 continuity events。
+    :param current_run_id: 当前 Run id；该 Run 的事件不进入历史 continuity。
+    :returns: 可进入 Engine request 的历史消息。
+    :raises HostDurableError: payload 字段无法投影时抛出。
+    """
+
+    ordered_run_ids: list[str] = []
+    events_by_run_id: dict[str, list[EventLogRow]] = {}
+    for event in events:
+        run_id = event.run_id
+        if run_id is None or run_id == current_run_id:
+            continue
+        if run_id not in events_by_run_id:
+            events_by_run_id[run_id] = []
+            ordered_run_ids.append(run_id)
+        events_by_run_id[run_id].append(event)
+
+    messages: list[AgentMessage] = []
+    for run_id in ordered_run_ids:
+        projected = _successful_run_message_pair(events_by_run_id[run_id])
+        if projected is not None:
+            messages.extend(projected)
+    return tuple(messages)
+
+
+def _successful_run_message_pair(
+    events: list[EventLogRow],
+) -> tuple[UserMessage, AssistantMessage] | None:
+    """从单个成功历史 Run 中提取 user/assistant 对。
+
+    :param events: 同一个 Run 的 continuity events。
+    :returns: 两条完整消息；缺少任一端时返回 ``None``。
+    :raises HostDurableError: payload 字段无法投影时抛出。
+    """
+
+    user_message: UserMessage | None = None
+    assistant_message: AssistantMessage | None = None
+    for event in events:
+        message = _continuity_message_from_event(event)
+        if isinstance(message, UserMessage):
+            user_message = message
+        elif isinstance(message, AssistantMessage):
+            assistant_message = message
+    if user_message is None or assistant_message is None:
+        return None
+    return (user_message, assistant_message)
 
 
 def _assistant_summary_from_payload(

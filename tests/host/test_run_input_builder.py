@@ -190,15 +190,49 @@ def test_continuity_uses_event_sequence_and_ignores_non_canonical(
         contents = tuple(_message_content(message) for message in request.messages)
 
         assert contents == (
-            _expected_system_content(
-                attempt_id=seeded.attempt_id,
-                execution_id=seeded.execution_id,
-            ),
+            _expected_system_content(),
             "first question",
             "first answer",
-            "second question",
             "current question",
         )
+
+
+def test_continuity_skips_unsuccessful_prior_runs(tmp_path: Path) -> None:
+    """failed/cancelled/lost 历史 Run 不留下孤立 user message。"""
+
+    with open_host_durable_store(_options(tmp_path)) as store:
+        session_id = _ensure_session_id(store.transaction_runner)
+        _append_prior_user_and_terminal(
+            store.transaction_runner,
+            session_id=session_id,
+            run_id="run-failed",
+            user_text="failed question",
+            terminal_event_type="RUN_FAILED",
+        )
+        _append_prior_user_and_terminal(
+            store.transaction_runner,
+            session_id=session_id,
+            run_id="run-cancelled",
+            user_text="cancelled question",
+            terminal_event_type="RUN_CANCELLED",
+        )
+        _append_prior_user_and_terminal(
+            store.transaction_runner,
+            session_id=session_id,
+            run_id="run-lost",
+            user_text="lost question",
+            terminal_event_type="RUN_LOST",
+        )
+        seeded = _seed_current_run(
+            store,
+            session_id=session_id,
+            payload=_user_input_payload("current question"),
+        )
+
+        request = _build_request(store, seeded)
+        contents = tuple(_message_content(message) for message in request.messages)
+
+        assert contents == (_expected_system_content(), "current question")
 
 
 def test_noop_providers_do_not_create_durable_rows(tmp_path: Path) -> None:
@@ -513,6 +547,54 @@ def _append_prior_user(
     )
 
 
+def _append_prior_user_and_terminal(
+    transaction_runner: HostTransactionRunner,
+    *,
+    session_id: str,
+    run_id: str,
+    user_text: str,
+    terminal_event_type: str,
+) -> None:
+    """追加一个非成功历史 Run 的 user 与 terminal fact。
+
+    :param transaction_runner: Host transaction runner。
+    :param session_id: Session id。
+    :param run_id: Run id。
+    :param user_text: user 文本。
+    :param terminal_event_type: terminal event type。
+    :returns: ``None``。
+    """
+
+    def operation(transaction: HostTransaction) -> None:
+        """追加测试 facts。
+
+        :param transaction: Host transaction。
+        :returns: ``None``。
+        """
+
+        _append_user_input_tx(
+            transaction,
+            session_id=session_id,
+            run_id=run_id,
+            event_id=f"event-{run_id}-input",
+            payload=_user_input_payload(user_text),
+            event_class=EventClass.CANONICAL_FACT,
+        )
+        EventLogStore().append_event(
+            transaction,
+            _event_request(
+                event_id=f"event-{run_id}-terminal",
+                event_class=EventClass.CANONICAL_FACT,
+                session_id=session_id,
+                run_id=run_id,
+                event_type=terminal_event_type,
+                payload={"reason": terminal_event_type.lower()},
+            ),
+        )
+
+    transaction_runner.run_write(operation)
+
+
 def _append_prior_success(
     transaction_runner: HostTransactionRunner,
     *,
@@ -739,11 +821,9 @@ def _message_content(message: AgentMessage) -> str:
     raise AssertionError("tool messages are not expected in RunInputBuilder tests")
 
 
-def _expected_system_content(*, attempt_id: str, execution_id: str) -> str:
+def _expected_system_content() -> str:
     """构造期望 system message 内容。
 
-    :param attempt_id: Attempt id。
-    :param execution_id: execution id。
     :returns: system message content。
     """
 
@@ -754,8 +834,6 @@ def _expected_system_content(*, attempt_id: str, execution_id: str) -> str:
             "execution_target=local-default",
             "queue_policy=queue",
             f"policy_snapshot_ref={_POLICY_REF}",
-            f"attempt_id={attempt_id}",
-            f"execution_id={execution_id}",
             "tools=disabled",
         )
     )

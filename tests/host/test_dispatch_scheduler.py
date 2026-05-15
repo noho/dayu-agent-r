@@ -133,6 +133,55 @@ class _FakeHandle:
         self.closed = True
 
 
+class _CrashingHandle(_FakeHandle):
+    """事件流抛异常的 fake handle。"""
+
+    async def events(self) -> AsyncIterator[EngineEvent]:
+        """抛出 worker stream 异常。
+
+        :returns: 不会正常返回事件。
+        :raises RuntimeError: 始终模拟 worker stream crash。
+        """
+
+        raise RuntimeError("worker stream crashed")
+        if False:
+            yield _unreachable_engine_event()
+
+
+class _CloseFailingHandle(_FakeHandle):
+    """关闭时抛异常的 fake handle。"""
+
+    async def events(self) -> AsyncIterator[EngineEvent]:
+        """保持事件流未结束直到 scheduler close。
+
+        :returns: 不会正常返回事件。
+        """
+
+        await asyncio.sleep(10.0)
+        if False:
+            yield _unreachable_engine_event()
+
+    def cancel(self, reason: str) -> None:
+        """模拟 handle cancel 异常。
+
+        :param reason: 取消原因。
+        :returns: ``None``。
+        :raises RuntimeError: 始终抛出取消异常。
+        """
+
+        del reason
+        raise RuntimeError("cancel failed")
+
+    async def close(self) -> None:
+        """模拟 handle close 异常。
+
+        :returns: ``None``。
+        :raises RuntimeError: 始终抛出关闭异常。
+        """
+
+        raise RuntimeError("close failed")
+
+
 class _AcceptingWorker:
     """测试用立即 accept worker。"""
 
@@ -160,6 +209,50 @@ class _AcceptingWorker:
         return _FakeHandle()
 
 
+class _HandleWorker:
+    """返回指定 handle 的 fake worker。"""
+
+    def __init__(self, handle: LocalWorkerHandle) -> None:
+        """初始化 worker。
+
+        :param handle: accept 返回的 handle。
+        :returns: ``None``。
+        """
+
+        self._handle = handle
+
+    async def accept(
+        self, snapshot: AttemptDispatchSnapshot, request: AgentRunRequest
+    ) -> LocalWorkerHandle:
+        """返回预置 handle。
+
+        :param snapshot: dispatch snapshot。
+        :param request: Engine request。
+        :returns: 预置 handle。
+        """
+
+        del snapshot, request
+        return self._handle
+
+
+class _FailingAcceptWorker:
+    """accept 时抛异常的 fake worker。"""
+
+    async def accept(
+        self, snapshot: AttemptDispatchSnapshot, request: AgentRunRequest
+    ) -> LocalWorkerHandle:
+        """模拟非 timeout accept 异常。
+
+        :param snapshot: dispatch snapshot。
+        :param request: Engine request。
+        :returns: 不会返回。
+        :raises RuntimeError: 始终抛出 accept 异常。
+        """
+
+        del snapshot, request
+        raise RuntimeError("accept failed")
+
+
 class _SlowWorker:
     """测试用超时 worker。"""
 
@@ -181,10 +274,13 @@ class _SlowWorker:
 class _FakeWorkerFactory:
     """测试用 worker factory。"""
 
-    def __init__(self, *, slow: bool = False) -> None:
+    def __init__(
+        self, *, slow: bool = False, worker: LocalEngineWorker | None = None
+    ) -> None:
         """初始化 factory。
 
         :param slow: 是否返回超时 worker。
+        :param worker: 指定 worker；不传时按 ``slow`` 构造。
         :returns: ``None``。
         """
 
@@ -192,6 +288,7 @@ class _FakeWorkerFactory:
         self.accepted_snapshots: list[AttemptDispatchSnapshot] = []
         self.accepted_requests: list[AgentRunRequest] = []
         self._slow = slow
+        self._worker = worker
 
     def create_worker(self, snapshot: AttemptDispatchSnapshot) -> LocalEngineWorker:
         """创建 fake worker。
@@ -202,6 +299,8 @@ class _FakeWorkerFactory:
 
         del snapshot
         self.created += 1
+        if self._worker is not None:
+            return self._worker
         if self._slow:
             return _SlowWorker()
         return _AcceptingWorker(self)
@@ -269,6 +368,37 @@ async def test_cancelled_dispatch_is_skipped_before_worker_call(
 
 
 @pytest.mark.asyncio
+async def test_pending_dispatch_can_direct_mark_dispatching_after_lane_recheck(
+    tmp_path: Path,
+) -> None:
+    """scheduler durable recheck 接受 pending 并直跳 dispatching。"""
+
+    factory = _FakeWorkerFactory()
+    with open_host_durable_store(_options(tmp_path)) as store:
+        seeded = _seed_current_run(store)
+        scheduler = await _open_scheduler(tmp_path, store, factory)
+        claim = await scheduler._lane_controller.acquire(
+            _LANE_NAME,
+            timeout_seconds=0,
+        )
+        assert isinstance(claim, LaneAcquired)
+        try:
+            dispatch_record = scheduler._mark_dispatching_after_recheck(
+                _pending_dispatch(seeded),
+                claim.token,
+            )
+
+            assert dispatch_record is not None
+            assert dispatch_record.status == DispatchRecordStatus.DISPATCHING
+            assert dispatch_record.waiting_for_lane_at is not None
+            assert dispatch_record.lane_name == _LANE_NAME
+            assert dispatch_record.lane_claim_id == claim.token.claim_id
+        finally:
+            await claim.token.release()
+            await scheduler.close()
+
+
+@pytest.mark.asyncio
 async def test_worker_startup_timeout_closes_starting_attempt_failed(
     tmp_path: Path,
 ) -> None:
@@ -287,16 +417,86 @@ async def test_worker_startup_timeout_closes_starting_attempt_failed(
             scheduler.wake_dispatch(_pending_dispatch(seeded))
             result = await scheduler.drain_once()
 
-            run, attempt, _dispatch_record = _read_rows(
+            run, attempt, dispatch_record = _read_rows(
                 store.transaction_runner, seeded
             )
             event = _read_event_by_type(store.transaction_runner, "RUN_FAILED")
             assert result.timed_out == 1
             assert run.status == RunStatus.FAILED
             assert attempt.status == AttemptStatus.FAILED
+            assert dispatch_record.status == DispatchRecordStatus.CANCELLED
             assert json.loads(_require_text(event.reason_json))["reason"] == (
                 "worker_startup_timeout"
             )
+        finally:
+            await scheduler.close()
+
+
+@pytest.mark.asyncio
+async def test_worker_accept_exception_closes_failed_and_cancels_dispatch(
+    tmp_path: Path,
+) -> None:
+    """worker accept 非 timeout 异常按 startup failure 收口并取消 dispatch row。"""
+
+    factory = _FakeWorkerFactory(worker=_FailingAcceptWorker())
+    with open_host_durable_store(_options(tmp_path)) as store:
+        seeded = _seed_current_run(store)
+        scheduler = await _open_scheduler(tmp_path, store, factory)
+        try:
+            scheduler.wake_dispatch(_pending_dispatch(seeded))
+            result = await scheduler.drain_once()
+
+            run, attempt, dispatch_record = _read_rows(
+                store.transaction_runner, seeded
+            )
+            assert result.timed_out == 1
+            assert run.status == RunStatus.FAILED
+            assert attempt.status == AttemptStatus.FAILED
+            assert dispatch_record.status == DispatchRecordStatus.CANCELLED
+            assert dispatch_record.cancelled_event_id is not None
+        finally:
+            await scheduler.close()
+
+
+@pytest.mark.asyncio
+async def test_worker_startup_closeout_error_still_releases_lane(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """startup closeout 抛错时仍释放 lane token。"""
+
+    factory = _FakeWorkerFactory(worker=_FailingAcceptWorker())
+    with open_host_durable_store(_options(tmp_path)) as store:
+        seeded = _seed_current_run(store)
+        scheduler = await _open_scheduler(tmp_path, store, factory)
+
+        def raise_closeout(record: PendingDispatchRecord) -> None:
+            """模拟 durable closeout 失败。
+
+            :param record: pending dispatch record。
+            :returns: ``None``。
+            :raises RuntimeError: 始终抛出 closeout 失败。
+            """
+
+            del record
+            raise RuntimeError("closeout failed")
+
+        monkeypatch.setattr(
+            scheduler,
+            "_closeout_worker_startup_timeout",
+            raise_closeout,
+        )
+        try:
+            scheduler.wake_dispatch(_pending_dispatch(seeded))
+            with pytest.raises(RuntimeError, match="closeout failed"):
+                await scheduler.drain_once()
+
+            claim = await scheduler._lane_controller.acquire(
+                _LANE_NAME,
+                timeout_seconds=0,
+            )
+            assert isinstance(claim, LaneAcquired)
+            await claim.token.release()
         finally:
             await scheduler.close()
 
@@ -336,7 +536,7 @@ async def test_lane_acquire_timeout_closes_starting_attempt_failed(
             scheduler.wake_dispatch(_pending_dispatch(seeded))
             result = await scheduler.drain_once()
 
-            run, attempt, _dispatch_record = _read_rows(
+            run, attempt, dispatch_record = _read_rows(
                 store.transaction_runner, seeded
             )
             event = _read_event_by_type(store.transaction_runner, "RUN_FAILED")
@@ -345,6 +545,7 @@ async def test_lane_acquire_timeout_closes_starting_attempt_failed(
             assert factory.created == 0
             assert run.status == RunStatus.FAILED
             assert attempt.status == AttemptStatus.FAILED
+            assert dispatch_record.status == DispatchRecordStatus.CANCELLED
             assert json.loads(_require_text(event.reason_json))["reason"] == (
                 "worker_startup_timeout"
             )
@@ -352,6 +553,85 @@ async def test_lane_acquire_timeout_closes_starting_attempt_failed(
             await scheduler.close()
             await claim.token.release()
             await lane_holder.close()
+
+
+@pytest.mark.asyncio
+async def test_worker_clean_eof_closes_run_failed_from_scheduler(
+    tmp_path: Path,
+) -> None:
+    """accepted worker clean EOF 由 scheduler 映射为 FAILED closeout。"""
+
+    factory = _FakeWorkerFactory()
+    with open_host_durable_store(_options(tmp_path)) as store:
+        seeded = _seed_current_run(store)
+        scheduler = await _open_scheduler(tmp_path, store, factory)
+        try:
+            scheduler.wake_dispatch(_pending_dispatch(seeded))
+            result = await scheduler.drain_once()
+            run, attempt, _dispatch_record = await _wait_for_statuses(
+                store.transaction_runner,
+                seeded,
+                expected_run=RunStatus.FAILED,
+                expected_attempt=AttemptStatus.FAILED,
+            )
+
+            assert result.dispatched == 1
+            assert run.status == RunStatus.FAILED
+            assert attempt.status == AttemptStatus.FAILED
+            event = _read_event_by_type(store.transaction_runner, "RUN_FAILED")
+            assert json.loads(_require_text(event.reason_json))["reason"] == (
+                "stream_ended_without_terminal"
+            )
+        finally:
+            await scheduler.close()
+
+
+@pytest.mark.asyncio
+async def test_worker_stream_exception_closes_run_lost_from_scheduler(
+    tmp_path: Path,
+) -> None:
+    """accepted worker stream 异常由 scheduler 映射为 LOST closeout。"""
+
+    factory = _FakeWorkerFactory(worker=_HandleWorker(_CrashingHandle()))
+    with open_host_durable_store(_options(tmp_path)) as store:
+        seeded = _seed_current_run(store)
+        scheduler = await _open_scheduler(tmp_path, store, factory)
+        try:
+            scheduler.wake_dispatch(_pending_dispatch(seeded))
+            result = await scheduler.drain_once()
+            run, attempt, _dispatch_record = await _wait_for_statuses(
+                store.transaction_runner,
+                seeded,
+                expected_run=RunStatus.LOST,
+                expected_attempt=AttemptStatus.LOST,
+            )
+
+            assert result.dispatched == 1
+            assert run.status == RunStatus.LOST
+            assert attempt.status == AttemptStatus.LOST
+            event = _read_event_by_type(store.transaction_runner, "RUN_LOST")
+            assert json.loads(_require_text(event.reason_json))["reason"] == (
+                "worker_lost_before_terminal"
+            )
+        finally:
+            await scheduler.close()
+
+
+@pytest.mark.asyncio
+async def test_scheduler_close_suppresses_handle_close_exception(
+    tmp_path: Path,
+) -> None:
+    """scheduler close 不被 active handle cancel/close 异常打断。"""
+
+    factory = _FakeWorkerFactory(worker=_HandleWorker(_CloseFailingHandle()))
+    with open_host_durable_store(_options(tmp_path)) as store:
+        seeded = _seed_current_run(store)
+        scheduler = await _open_scheduler(tmp_path, store, factory)
+        scheduler.wake_dispatch(_pending_dispatch(seeded))
+        result = await scheduler.drain_once()
+
+        assert result.dispatched == 1
+        await scheduler.close()
 
 
 def _options(tmp_path: Path) -> HostDurableStoreOptions:
@@ -598,6 +878,36 @@ def _read_rows(
         return run, attempt, dispatch_record
 
     return transaction_runner.run_read(_operation)
+
+
+async def _wait_for_statuses(
+    transaction_runner: HostTransactionRunner,
+    seeded: _SeededRun,
+    *,
+    expected_run: RunStatus,
+    expected_attempt: AttemptStatus,
+) -> tuple[RunRow, AttemptRow, DispatchRecordRow]:
+    """等待异步 worker consume task 写入目标 Run / Attempt 状态。
+
+    :param transaction_runner: transaction runner。
+    :param seeded: seeded run。
+    :param expected_run: 期望 Run 状态。
+    :param expected_attempt: 期望 Attempt 状态。
+    :returns: 目标状态下的 durable rows。
+    :raises AssertionError: 超时未达到目标状态时抛出。
+    """
+
+    for _index in range(100):
+        rows = _read_rows(transaction_runner, seeded)
+        run, attempt, _dispatch_record = rows
+        if run.status == expected_run and attempt.status == expected_attempt:
+            return rows
+        await asyncio.sleep(0.01)
+    run, attempt, _dispatch_record = _read_rows(transaction_runner, seeded)
+    raise AssertionError(
+        "status did not converge: "
+        f"run={run.status.value} attempt={attempt.status.value}"
+    )
 
 
 def _read_event_by_type(

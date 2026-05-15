@@ -199,10 +199,16 @@ def create_host_command_handle(
 
     :param options: Host command handle 公共构造选项。
     :returns: 已打开 durable store 并装配内部依赖的 ``HostCommandHandle``。
+    :raises ValueError: ``local_execution`` 非空时抛出；scheduler 需显式异步装配。
     :raises HostDurableConfigError: durable store 配置非法时由底层抛出。
     :raises HostDurableError: durable store 打开或 schema bootstrap 失败时由底层抛出。
     """
 
+    if options.local_execution is not None:
+        raise ValueError(
+            "HostCommandHandleOptions.local_execution is not supported by "
+            "create_host_command_handle; open HostDispatchScheduler explicitly"
+        )
     durable_options = _durable_options_from_public_options(options)
     durable_store = open_host_durable_store(durable_options)
     try:

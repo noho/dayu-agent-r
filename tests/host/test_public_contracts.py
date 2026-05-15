@@ -29,6 +29,8 @@ from dayu.host import (
     HostEventStream,
     HostEventView,
     HostInput,
+    HostLocalExecutionOptions,
+    LocalEngineWorkerFactory,
     HostMetadataEntry,
     HostStreamCursor,
     HostCommandHandleOptions,
@@ -51,6 +53,8 @@ from dayu.host import (
     TerminalResultSummary,
     WaitResolutionSource,
 )
+from dayu.engine.contracts.agent_policy import AgentPolicy
+from dayu.engine.contracts.runner_spec import RunnerCallOptions, RunnerSpec
 
 
 class _DataclassParams(Protocol):
@@ -64,6 +68,14 @@ class _FrozenSlotsDataclassClass(Protocol):
 
     __dataclass_params__: _DataclassParams
     __slots__: tuple[str, ...]
+
+
+class _WorkerFactoryToken:
+    """测试用 worker factory token。
+
+    HostLocalExecutionOptions 当前只在构造期拒绝 ``None``；结构协议由
+    pyright 与真实装配点保障。
+    """
 
 
 PUBLIC_HOST_DATACLASS_TYPES: tuple[_FrozenSlotsDataclassClass, ...] = (
@@ -167,6 +179,77 @@ def _host_command_handle_options() -> HostCommandHandleOptions:
         sqlite_write_retry_backoff_multiplier=2.0,
         sqlite_write_retry_max_delay_seconds=1.0,
         payload_inline_threshold_bytes=4096,
+    )
+
+
+def _runner_spec() -> RunnerSpec:
+    """构造测试用 RunnerSpec。
+
+    :returns: RunnerSpec。
+    """
+
+    return RunnerSpec(
+        provider="test",
+        model="test-model",
+        endpoint="https://example.invalid",
+        api_key_ref="secret:test",
+        headers={},
+        supports_tool_calling=False,
+        supports_streaming=False,
+        supports_stream_usage=False,
+        default_timeout_seconds=1.0,
+        max_retries=0,
+        provider_request=None,
+    )
+
+
+def _runner_options() -> RunnerCallOptions:
+    """构造测试用 RunnerCallOptions。
+
+    :returns: RunnerCallOptions。
+    """
+
+    return RunnerCallOptions(
+        temperature=None,
+        max_tokens=None,
+        top_p=None,
+        stream=False,
+    )
+
+
+def _agent_policy() -> AgentPolicy:
+    """构造测试用 AgentPolicy。
+
+    :returns: AgentPolicy。
+    """
+
+    return AgentPolicy(
+        max_iterations=1,
+        continuation_max_attempts=0,
+        allow_tool_calls=False,
+        tool_execution_timeout_seconds=1.0,
+    )
+
+
+def _local_execution_options() -> HostLocalExecutionOptions:
+    """构造测试用 HostLocalExecutionOptions。
+
+    :returns: HostLocalExecutionOptions。
+    """
+
+    return HostLocalExecutionOptions(
+        lane_db_path=pathlib.Path("workspace/lane.sqlite3"),
+        lane_name="llm",
+        lane_capacity=1,
+        lane_default_timeout_seconds=0.1,
+        lane_claim_ttl_seconds=1.0,
+        lane_heartbeat_interval_seconds=0.1,
+        worker_startup_timeout_seconds=1.0,
+        dispatch_poll_interval_seconds=0.01,
+        runner_spec=_runner_spec(),
+        runner_options=_runner_options(),
+        agent_policy=_agent_policy(),
+        worker_factory=cast(LocalEngineWorkerFactory, _WorkerFactoryToken()),
     )
 
 
@@ -373,6 +456,42 @@ def test_host_command_handle_options_rejects_invalid_numeric_values() -> None:
         replace(
             _host_command_handle_options(),
             payload_inline_threshold_bytes=cast(int, True),
+        )
+
+
+def test_host_local_execution_options_accept_valid_shape() -> None:
+    """HostLocalExecutionOptions 接受当前 scheduler typed 装配边界。"""
+
+    options = _local_execution_options()
+
+    assert options.lane_name == "llm"
+    assert options.runner_spec.provider == "test"
+    assert options.runner_options.stream is False
+    assert options.agent_policy.allow_tool_calls is False
+
+
+def test_host_local_execution_options_rejects_invalid_typed_fields() -> None:
+    """HostLocalExecutionOptions 拒绝错误 typed field 与 None worker factory。"""
+
+    with pytest.raises(TypeError, match="runner_spec"):
+        replace(
+            _local_execution_options(),
+            runner_spec=cast(RunnerSpec, _runner_options()),
+        )
+    with pytest.raises(TypeError, match="runner_options"):
+        replace(
+            _local_execution_options(),
+            runner_options=cast(RunnerCallOptions, _runner_spec()),
+        )
+    with pytest.raises(TypeError, match="agent_policy"):
+        replace(
+            _local_execution_options(),
+            agent_policy=cast(AgentPolicy, _runner_spec()),
+        )
+    with pytest.raises(TypeError, match="worker_factory"):
+        replace(
+            _local_execution_options(),
+            worker_factory=cast(LocalEngineWorkerFactory, None),
         )
 
 
