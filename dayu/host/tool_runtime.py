@@ -5,7 +5,8 @@
 ``EffectiveToolBundle``，并由 ``ToolRuntimeHandle`` 同时暴露 Engine
 可见 schema 与批式 ``ToolExecutor``。本模块同时承载 Host accept
 barrier、真实工具调用 wrapper、run-scoped truncation / ``fetch_more`` 普通
-工具路径，以及 Phase 6 当前已落地的最小 duplicate governance。
+工具路径，以及 Phase 6 当前已落地的 run-scoped in-memory duplicate
+governance。
 """
 
 from __future__ import annotations
@@ -17,6 +18,7 @@ from collections.abc import Mapping
 from dataclasses import dataclass, field, replace
 from datetime import UTC, datetime, timedelta
 from enum import StrEnum
+from threading import RLock
 from types import MappingProxyType
 from typing import Protocol
 
@@ -1050,6 +1052,42 @@ class DuplicateGovernancePort(Protocol):
         ...
 
 
+class RunScopedDuplicateGovernanceRegistry(Protocol):
+    """Run 作用域重复治理内存 owner 协议。
+
+    registry 只表达同一 Host 进程内、同一 Run 生命周期内的 accepted 事实
+    共享，不提供 durable ledger、跨进程恢复或重启恢复语义。
+    """
+
+    def duplicate_governance_for_run(
+        self, *, run_id: str, policy: DuplicateGovernancePolicy
+    ) -> DuplicateGovernancePort:
+        """返回指定 Run 的 duplicate governance 端口。
+
+        :param run_id: Run id。
+        :param policy: 当前 ToolRuntime 使用的 duplicate governance 策略。
+        :returns: 绑定到该 Run 内存索引的 governance 端口。
+        :raises ValueError: Run id 为空时抛出。
+        """
+        ...
+
+    def clear_run(self, run_id: str) -> None:
+        """清理指定 Run 的重复治理内存。
+
+        :param run_id: Run id。
+        :returns: ``None``。
+        :raises ValueError: Run id 为空时抛出。
+        """
+        ...
+
+    def clear_all(self) -> None:
+        """清理 registry 当前持有的全部 Run 内存。
+
+        :returns: ``None``。
+        """
+        ...
+
+
 class HostToolFactAcceptPort(Protocol):
     """工具 canonical fact accept barrier 端口协议。"""
 
@@ -1471,23 +1509,69 @@ class FetchMoreToolCallable:
         return self._manager.fetch_more(request, context)
 
 
-class InMemoryRunLocalDuplicateGovernance:
-    """ToolRuntime 实例内 run-local duplicate governance 实现。
+class _RunLocalDuplicateGovernanceState:
+    """单个 Run 的 accepted duplicate 内存索引。"""
 
-    该实现只持有当前 ToolRuntime 实例生命周期内的内存索引，不落 durable
-    duplicate table，也不跨 Run / Session 继承状态。
+    def __init__(self) -> None:
+        """初始化空 Run duplicate 索引。
+
+        :returns: ``None``。
+        """
+
+        self._lock = RLock()
+        self._entries_by_key: dict[str, _DuplicateAcceptedEntry] = {}
+
+    def find(self, duplicate_key: str) -> _DuplicateAcceptedEntry | None:
+        """读取 duplicate key 对应的 accepted 条目。
+
+        :param duplicate_key: duplicate key。
+        :returns: 命中的 accepted 条目；未命中时为 ``None``。
+        """
+
+        with self._lock:
+            return self._entries_by_key.get(duplicate_key)
+
+    def record(
+        self, *, duplicate_key: str, entry: _DuplicateAcceptedEntry
+    ) -> None:
+        """写入 duplicate key 对应的 accepted 条目。
+
+        :param duplicate_key: duplicate key。
+        :param entry: accepted 条目。
+        :returns: ``None``。
+        """
+
+        with self._lock:
+            self._entries_by_key[duplicate_key] = entry
+
+
+class InMemoryRunLocalDuplicateGovernance:
+    """绑定到单个 Run 内存索引的 duplicate governance 实现。
+
+    该实现不落 durable duplicate table，也不承诺跨进程、跨 restart 或
+    crash recovery。若由 ``InMemoryRunScopedDuplicateGovernanceRegistry``
+    注入共享 state，同一 Run 的多个 ToolRuntime handle 会共享 accepted
+    duplicate 记忆；未注入 state 时只在当前 governance 实例内生效。
     """
 
-    def __init__(self, policy: DuplicateGovernancePolicy | None = None) -> None:
+    def __init__(
+        self,
+        policy: DuplicateGovernancePolicy | None = None,
+        *,
+        state: _RunLocalDuplicateGovernanceState | None = None,
+    ) -> None:
         """初始化 run-local duplicate governance。
 
         :param policy: duplicate governance 策略；无则默认 duplicate 命中也
             继续 ``allow``。
+        :param state: 可选 Run 级共享内存索引；无则创建实例私有索引。
         :returns: ``None``。
         """
 
         self._policy = policy if policy is not None else DuplicateGovernancePolicy()
-        self._entries_by_key: dict[str, _DuplicateAcceptedEntry] = {}
+        self._state = (
+            state if state is not None else _RunLocalDuplicateGovernanceState()
+        )
 
     def decide_duplicate(
         self, request: DuplicateGovernanceRequest
@@ -1500,7 +1584,7 @@ class InMemoryRunLocalDuplicateGovernance:
         """
 
         duplicate_key = _duplicate_key(request)
-        entry = self._entries_by_key.get(duplicate_key)
+        entry = self._state.find(duplicate_key)
         if entry is None:
             return DuplicateDecision(
                 kind=DuplicateDecisionKind.ALLOW,
@@ -1525,10 +1609,13 @@ class InMemoryRunLocalDuplicateGovernance:
         """
 
         duplicate_key = _duplicate_key(record.request)
-        self._entries_by_key[duplicate_key] = _DuplicateAcceptedEntry(
-            accepted_event_refs=record.accepted_event_refs,
-            accepted_outcome=record.accepted_outcome,
-            result_digest=record.result_digest,
+        self._state.record(
+            duplicate_key=duplicate_key,
+            entry=_DuplicateAcceptedEntry(
+                accepted_event_refs=record.accepted_event_refs,
+                accepted_outcome=record.accepted_outcome,
+                result_digest=record.result_digest,
+            ),
         )
 
     def _decision_for_request(
@@ -1556,6 +1643,73 @@ class InMemoryRunLocalDuplicateGovernance:
                 return DuplicateDecisionKind.ALLOW
             return DuplicateDecisionKind.REQUIRE_JUSTIFICATION
         return decision
+
+
+class InMemoryRunScopedDuplicateGovernanceRegistry:
+    """进程内 Run-scoped duplicate governance owner。
+
+    registry 按 ``run_id`` 持有短生命周期内存索引，使同一 Host 进程内同一
+    Run 的多个 ToolRuntime handle 共享 duplicate 记忆；不同 Run 互相隔离。
+    registry 不写 durable ledger，不承诺进程崩溃、重启或跨进程恢复。
+    """
+
+    def __init__(self) -> None:
+        """初始化空 registry。
+
+        :returns: ``None``。
+        """
+
+        self._lock = RLock()
+        self._states_by_run_id: dict[str, _RunLocalDuplicateGovernanceState] = {}
+
+    def duplicate_governance_for_run(
+        self, *, run_id: str, policy: DuplicateGovernancePolicy
+    ) -> DuplicateGovernancePort:
+        """返回指定 Run 的 duplicate governance 端口。
+
+        :param run_id: Run id。
+        :param policy: 当前 ToolRuntime 使用的 duplicate governance 策略。
+        :returns: 绑定到该 Run 内存索引的 governance 端口。
+        :raises ValueError: Run id 为空时抛出。
+        """
+
+        _require_non_empty_text(run_id, field_name="run_id")
+        with self._lock:
+            state = self._states_by_run_id.get(run_id)
+            if state is None:
+                state = _RunLocalDuplicateGovernanceState()
+                self._states_by_run_id[run_id] = state
+        return InMemoryRunLocalDuplicateGovernance(policy, state=state)
+
+    def clear_run(self, run_id: str) -> None:
+        """清理指定 Run 的 duplicate 内存索引。
+
+        :param run_id: Run id。
+        :returns: ``None``。
+        :raises ValueError: Run id 为空时抛出。
+        """
+
+        _require_non_empty_text(run_id, field_name="run_id")
+        with self._lock:
+            self._states_by_run_id.pop(run_id, None)
+
+    def clear_all(self) -> None:
+        """清理当前进程内全部 Run duplicate 内存索引。
+
+        :returns: ``None``。
+        """
+
+        with self._lock:
+            self._states_by_run_id.clear()
+
+    def active_run_count(self) -> int:
+        """返回当前 registry 持有内存索引的 Run 数量。
+
+        :returns: Run 数量。
+        """
+
+        with self._lock:
+            return len(self._states_by_run_id)
 
 
 class DeterministicToolTraceDiagnosticEmitter:
@@ -1941,8 +2095,11 @@ class ToolRuntimeBuildRequest:
     :param accept_port: Host accept barrier；无则只构造未连接 executor。
     :param retry_policy: accept ack 有限重试策略。
     :param policy_view: Host 内部工具 policy view。
-    :param duplicate_governance_policy: ToolRuntime 实例内 run-local duplicate
-        governance 策略。
+    :param duplicate_governance_policy: ToolRuntime 使用的 duplicate governance
+        策略。
+    :param duplicate_governance_registry: 可选 Run-scoped duplicate governance
+        内存 owner；提供时同一 Run 的多个 ToolRuntime handle 共享 duplicate
+        记忆。
     :param diagnostic_emitter: 诊断 emitter；无则使用确定性内存引用实现。
     """
 
@@ -1958,6 +2115,7 @@ class ToolRuntimeBuildRequest:
     duplicate_governance_policy: DuplicateGovernancePolicy = field(
         default_factory=DuplicateGovernancePolicy
     )
+    duplicate_governance_registry: RunScopedDuplicateGovernanceRegistry | None = None
     diagnostic_emitter: ToolTraceDiagnosticEmitter | None = None
 
 
@@ -2439,14 +2597,22 @@ class DefaultToolRuntimeFactory:
                 execution_scope=request.execution_scope,
                 policy_view=request.policy_view,
             )
+            duplicate_governance = (
+                request.duplicate_governance_registry.duplicate_governance_for_run(
+                    run_id=request.execution_scope.run_id,
+                    policy=request.duplicate_governance_policy,
+                )
+                if request.duplicate_governance_registry is not None
+                else InMemoryRunLocalDuplicateGovernance(
+                    request.duplicate_governance_policy
+                )
+            )
             executor: ToolExecutor = ToolRuntimeExecutor(
                 effective_bundle=effective_bundle,
                 execution_scope=request.execution_scope,
                 dispatcher=DefaultToolDispatcher(effective_bundle),
                 policy_port=policy_port,
-                duplicate_governance=InMemoryRunLocalDuplicateGovernance(
-                    request.duplicate_governance_policy
-                ),
+                duplicate_governance=duplicate_governance,
                 truncation_port=truncation_port,
                 accept_port=request.accept_port,
                 retry_policy=request.retry_policy,
@@ -4440,6 +4606,7 @@ __all__ = [
     "HostPayloadRef",
     "HostToolFactAcceptPort",
     "InMemoryRunLocalDuplicateGovernance",
+    "InMemoryRunScopedDuplicateGovernanceRegistry",
     "InMemoryToolTraceDiagnosticEmitter",
     "NoopToolTraceDiagnosticEmitter",
     "NoopTruncationPort",
@@ -4464,6 +4631,7 @@ __all__ = [
     "ToolRuntimeHandle",
     "ToolRuntimePolicyPort",
     "ToolRuntimeUnsupportedExecutor",
+    "RunScopedDuplicateGovernanceRegistry",
     "ToolTraceDiagnosticEmitter",
     "ToolTraceDiagnosticRecord",
     "ToolTraceDiagnosticRef",

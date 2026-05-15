@@ -61,6 +61,7 @@ from dayu.host.durable.transaction import HostTransaction, HostTransactionRunner
 from dayu.host.engine_ingest import (
     EngineEventCandidate,
     EngineEventIngestor,
+    EngineIngestResult,
     EngineIngestStatus,
     LocalEngineEnvelope,
 )
@@ -75,6 +76,7 @@ from dayu.host.tool_runtime import (
     DefaultToolRuntimeFactory,
     EffectiveToolBundleBuildRequest,
     EffectiveToolBundleBuilder,
+    InMemoryRunScopedDuplicateGovernanceRegistry,
     ToolRuntimeBuildRequest,
     ToolRuntimeExecutionScope,
 )
@@ -327,6 +329,9 @@ class HostDispatchScheduler:
         self._drain_task: asyncio.Task[None] | None = None
         self._active_tasks: set[asyncio.Task[None]] = set()
         self._active_handles: set[LocalWorkerHandle] = set()
+        self._duplicate_governance_registry = (
+            InMemoryRunScopedDuplicateGovernanceRegistry()
+        )
 
     @classmethod
     async def open(
@@ -460,6 +465,7 @@ class HostDispatchScheduler:
             active_task.cancel()
             await _suppress_task_cancel(active_task)
         await self._lane_controller.close(reason="scheduler_close")
+        self._duplicate_governance_registry.clear_all()
 
     async def _drain_loop(self) -> None:
         """后台 drain 队列。
@@ -724,6 +730,7 @@ class HostDispatchScheduler:
                     transaction_runner=self._transaction_runner,
                     event_log_store=self._event_log_store,
                 ),
+                duplicate_governance_registry=self._duplicate_governance_registry,
             )
         )
         return create_tool_enabled_run_input_builder(
@@ -898,6 +905,7 @@ class HostDispatchScheduler:
             )
 
         self._transaction_runner.run_write(_operation)
+        self._duplicate_governance_registry.clear_run(record.run_id)
 
     async def _consume_worker_events(
         self,
@@ -916,6 +924,7 @@ class HostDispatchScheduler:
         :returns: ``None``。
         """
 
+        run_terminal_closed = False
         try:
             envelope = LocalEngineEnvelope(
                 session_id=self._read_run_session_id(record.run_id),
@@ -941,16 +950,17 @@ class HostDispatchScheduler:
                     event = await anext(events)
                 except StopAsyncIteration:
                     if not terminal_seen:
-                        ingestor.close_clean_eof(
+                        result = ingestor.close_clean_eof(
                             envelope,
                             observed_at=datetime.now(UTC),
                             last_observed_worker_event_index=worker_event_index,
                         )
+                        run_terminal_closed = _ingest_closed_run(result)
                     break
                 except asyncio.CancelledError:
                     raise
                 except Exception as exc:
-                    ingestor.close_worker_lost(
+                    result = ingestor.close_worker_lost(
                         envelope,
                         observed_at=datetime.now(UTC),
                         worker_lifecycle_signal="worker_stream_error",
@@ -958,6 +968,7 @@ class HostDispatchScheduler:
                         last_observed_worker_event_index=worker_event_index,
                         last_accepted_event_id=last_accepted_event_id,
                     )
+                    run_terminal_closed = _ingest_closed_run(result)
                     break
                 worker_event_index += 1
                 try:
@@ -970,7 +981,7 @@ class HostDispatchScheduler:
                         )
                     )
                 except Exception as exc:
-                    ingestor.close_worker_lost(
+                    result = ingestor.close_worker_lost(
                         envelope,
                         observed_at=datetime.now(UTC),
                         worker_lifecycle_signal="ingest_exception",
@@ -978,6 +989,7 @@ class HostDispatchScheduler:
                         last_observed_worker_event_index=worker_event_index,
                         last_accepted_event_id=last_accepted_event_id,
                     )
+                    run_terminal_closed = _ingest_closed_run(result)
                     break
                 if result.status in (
                     EngineIngestStatus.ACCEPTED,
@@ -987,8 +999,11 @@ class HostDispatchScheduler:
                         last_accepted_event_id = result.events[-1].event_id
                     if result.terminal_closeout:
                         terminal_seen = True
+                        run_terminal_closed = _ingest_closed_run(result)
                         break
         finally:
+            if run_terminal_closed:
+                self._duplicate_governance_registry.clear_run(record.run_id)
             self._active_handles.discard(handle)
             self._active_registry.unregister(
                 attempt_id=record.attempt_id,
@@ -996,6 +1011,19 @@ class HostDispatchScheduler:
             )
             await _safe_close_worker_handle(handle)
             await _safe_release_lane_token(token)
+
+
+def _ingest_closed_run(result: EngineIngestResult) -> bool:
+    """判断 ingest 结果是否表示 Run 已完成 terminal closeout。
+
+    :param result: EngineEvent ingest 结果。
+    :returns: 已接受或确认重复 terminal closeout 时返回 ``True``。
+    """
+
+    return result.terminal_closeout and result.status in (
+        EngineIngestStatus.ACCEPTED,
+        EngineIngestStatus.DUPLICATE,
+    )
 
 
 def _is_dispatchable_recheck(

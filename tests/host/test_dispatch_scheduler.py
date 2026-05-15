@@ -548,6 +548,7 @@ async def test_scheduler_uses_toolruntime_when_tooling_is_configured(
             assert [schema.function.name for schema in request.tool_schemas] == [
                 "fake_dispatch_tool"
             ]
+            assert scheduler._duplicate_governance_registry.active_run_count() == 1
 
             tool_outcome = await request.tool_executor.execute(
                 _tool_execution_request(
@@ -573,6 +574,7 @@ async def test_scheduler_uses_toolruntime_when_tooling_is_configured(
             ).run_id == seeded.run_id
         finally:
             await scheduler.close()
+            assert scheduler._duplicate_governance_registry.active_run_count() == 0
 
 
 @pytest.mark.asyncio

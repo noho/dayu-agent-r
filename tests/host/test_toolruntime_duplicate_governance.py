@@ -31,6 +31,7 @@ from dayu.host.tool_runtime import (
     HostEventRef,
     HostPayloadRef,
     HostToolFactAcceptPort,
+    InMemoryRunScopedDuplicateGovernanceRegistry,
     InMemoryToolTraceDiagnosticEmitter,
     ToolAcceptRetryPolicy,
     ToolFactAcceptCandidate,
@@ -434,20 +435,75 @@ async def test_plain_policy_rejection_does_not_carry_duplicate_prior_refs() -> N
 
 
 @pytest.mark.asyncio
-async def test_new_runtime_does_not_inherit_duplicate_index() -> None:
-    """新的 ToolRuntime 实例不继承上一实例的 run-local duplicate index。"""
+async def test_same_run_runtime_handles_share_duplicate_index() -> None:
+    """同 Run 同进程多个 ToolRuntime handle 共享 duplicate accepted 记忆。"""
 
     first_tool = _CountingTool({"accepted": "first-runtime"})
     second_tool = _CountingTool({"accepted": "second-runtime"})
+    first_accept_port = _AcceptingPort()
+    second_accept_port = _AcceptingPort()
+    registry = InMemoryRunScopedDuplicateGovernanceRegistry()
     policy = DuplicateGovernancePolicy(
         default_duplicate_decision=DuplicateDecisionKind.REUSE
     )
 
-    await _executor(first_tool, _AcceptingPort(), policy).execute(
+    await _executor(
+        first_tool,
+        first_accept_port,
+        policy,
+        duplicate_governance_registry=registry,
+    ).execute(
         _request(_call("tool-call-1", {"ticker": "DAYU"}, index=0))
     )
-    await _executor(second_tool, _AcceptingPort(), policy).execute(
+    outcome = await _executor(
+        second_tool,
+        second_accept_port,
+        policy,
+        duplicate_governance_registry=registry,
+    ).execute(
+        _request(_call("tool-call-2", {"ticker": "DAYU"}, index=0))
+    )
+
+    assert first_tool.call_count == 1
+    assert second_tool.call_count == 0
+    assert isinstance(outcome.records[0].outcome, ToolCompletedOutcome)
+    assert outcome.records[0].outcome.result.value == {"accepted": "first-runtime"}
+    assert second_accept_port.candidates[0].tool_fact_kind is ToolFactKind.REUSE
+    assert second_accept_port.candidates[0].reuse_prior_event_refs == (
+        first_accept_port.acks[0].accepted_event_refs
+    )
+
+
+@pytest.mark.asyncio
+async def test_different_runs_do_not_share_duplicate_index() -> None:
+    """不同 Run 即使共用同一进程 registry 也不共享 duplicate accepted 记忆。"""
+
+    first_tool = _CountingTool({"accepted": "first-run"})
+    second_tool = _CountingTool({"accepted": "second-run"})
+    registry = InMemoryRunScopedDuplicateGovernanceRegistry()
+    policy = DuplicateGovernancePolicy(
+        default_duplicate_decision=DuplicateDecisionKind.REUSE
+    )
+
+    await _executor(
+        first_tool,
+        _AcceptingPort(),
+        policy,
+        duplicate_governance_registry=registry,
+    ).execute(
         _request(_call("tool-call-1", {"ticker": "DAYU"}, index=0))
+    )
+    await _executor(
+        second_tool,
+        _AcceptingPort(),
+        policy,
+        run_id="run-other",
+        duplicate_governance_registry=registry,
+    ).execute(
+        _request(
+            _call("tool-call-2", {"ticker": "DAYU"}, index=0),
+            run_id="run-other",
+        )
     )
 
     assert first_tool.call_count == 1
@@ -461,6 +517,10 @@ def _executor(
     *,
     diagnostic_emitter: InMemoryToolTraceDiagnosticEmitter | None = None,
     policy_view: ToolRuntimePolicyView | None = None,
+    run_id: str = _RUN_ID,
+    duplicate_governance_registry: (
+        InMemoryRunScopedDuplicateGovernanceRegistry | None
+    ) = None,
 ) -> ToolExecutor:
     """构造测试用 ToolRuntime executor。
 
@@ -469,6 +529,8 @@ def _executor(
     :param duplicate_policy: duplicate governance 策略。
     :param diagnostic_emitter: 可选内存诊断 emitter。
     :param policy_view: 可选工具 policy view。
+    :param run_id: ToolRuntime execution scope 的 Run id。
+    :param duplicate_governance_registry: 可选 Run-scoped duplicate registry。
     :returns: ToolExecutor protocol 实现。
     """
 
@@ -484,7 +546,7 @@ def _executor(
             ),
             execution_scope=ToolRuntimeExecutionScope(
                 session_id=_SESSION_ID,
-                run_id=_RUN_ID,
+                run_id=run_id,
                 attempt_id=_ATTEMPT_ID,
                 execution_id=_EXECUTION_ID,
                 allow_tool_calls=True,
@@ -495,6 +557,7 @@ def _executor(
                 policy_view if policy_view is not None else ToolRuntimePolicyView()
             ),
             duplicate_governance_policy=duplicate_policy,
+            duplicate_governance_registry=duplicate_governance_registry,
             diagnostic_emitter=diagnostic_emitter,
         )
     ).tool_executor
