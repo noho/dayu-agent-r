@@ -1908,7 +1908,9 @@ Engine 只负责同一次模型响应内的结构性工具调用协议，不理�
 - optional tool-provided semantic key：工具声明的 run-local 语义重复 key。
 - accepted result digest / evidence anchor：当前 Run 内已接受结果是否等价或覆盖当前请求。
 
-ToolRuntime 维护 run-local in-memory duplicate index，不需要 session-scope durable ledger。Host 崩溃后新 Attempt 不继承该内存索引；如需避免重复，依赖 RunInputBuilder 把已接受工具事实放回 messages，让模型看到已经查过什么。
+ToolRuntime 维护 run-local in-memory duplicate index，不需要 session-scope durable ledger。这里的 run-local 是同一个 Run 的治理语义，不是单个 Attempt 或单个 ToolRuntime 实例的生命周期语义。同进程且未丢失 Host 运行期状态时，同一个 Run 因 `WAITING -> resolve_wait -> resume`、steer 或 recovery 创建的新 Attempt 必须继续复用该 Run 的 duplicate index，不能因为重新创建 ToolRuntime 而忘记已 accepted 的工具事实。
+
+Host 崩溃或重启后的恢复不要求继承该内存索引；P6 第一版不引入 durable duplicate ledger。崩溃恢复或内存索引丢失后，重复风险由 RunInputBuilder 把已接受工具事实放回 messages 来降低；如果后续需要从 EventLog 重建 duplicate index，必须作为独立设计进入对应 phase。
 
 policy action 必须分级：
 
@@ -2064,6 +2066,8 @@ resolve_wait(wait_id, outcome, source, idempotency_key)
 
 resume policy 覆盖 internal / manual、poll、callback 三类入口。所有入口都必须走同一个 `resolve_wait` pipeline，不能各自更新 Run / Attempt / EventLog。
 
+`WAITING -> resolve_wait -> resume` 会创建一次新的模型请求。模型本身是无状态调用方，Host 不能把“模型没有天然记住上一个 Attempt 已经发过某个 tool call”作为协议前提，也不能要求模型在新请求里自动避免重复 tool call。resume 的 RunInputBuilder 必须从 EventLog canonical facts 重建足够的 messages，把已 accepted 的等待结果、工具事实、governance guidance 与必要上下文放回模型输入；若模型仍发出同一个语义工具调用，Run-local duplicate governance 负责复用、提示、要求说明或阻断。
+
 约束：
 
 - 如果工具启动外部 job，必须返回稳定 `external_job_id` 或等价 ref。
@@ -2119,6 +2123,8 @@ wait condition satisfied
   -> Host rebuilds complete AgentRunRequest.messages from EventLog canonical facts
   -> Host dispatches through LocalProxy / RemoteProxy
 ```
+
+Resume 是同一 Run 内的新 Attempt，不是恢复旧 Attempt，也不是让旧模型进程继续执行。由于模型请求无状态，Host 必须在 rebuild messages 阶段显式提供已 accepted 的工具事实、等待结果和必要 guidance。模型在 resume 后重复发起与上一 Attempt 等价的 tool call 时，这属于 Host duplicate governance 的输入，不是模型协议违规；同 Run 的 duplicate index 必须在正常同进程生命周期内跨 Attempt 生效。
 
 Retry：
 
