@@ -264,11 +264,21 @@ accepted checkpoint commit 为 `28adf70`。P6-S4 artifacts 为
 `docs/reviews/host-phase6-code-review-s4-ds-20260515.md` 与
 `docs/reviews/host-phase6-code-review-s4-controller-adjudication-20260515.md`；验证为
 `pytest tests/host/test_toolruntime_truncation_fetch_more.py tests/host/test_toolruntime_effective_bundle.py tests/host/test_phase6_toolruntime_integration.py -q`
-15 passed、`python -m pyright dayu/host tests/host` 0 errors、`git diff --check` clean。当前 gate 为 Phase 6 P6-S5
+15 passed、`python -m pyright dayu/host tests/host` 0 errors、`git diff --check` clean。P6-S5
+`Duplicate Governance And Diagnostic Emitter` 已完成 implementation、双路 code review、accepted finding fix、DS re-review 与
+controller adjudication，accepted checkpoint commit 为 `31ab68d`。P6-S5 artifacts 为
+`docs/reviews/host-phase6-implementation-s5-duplicate-governance-20260515.md`、
+`docs/reviews/host-phase6-code-review-s5-mimo-20260515.md`、
+`docs/reviews/host-phase6-code-review-s5-ds-20260515.md`、
+`docs/reviews/host-phase6-fix-s5-duplicate-governance-20260515.md`、
+`docs/reviews/host-phase6-code-re-review-s5-ds-20260515.md` 与
+`docs/reviews/host-phase6-code-review-s5-controller-adjudication-20260515.md`；验证为
+`pytest tests/host/test_toolruntime_duplicate_governance.py tests/host/test_toolruntime_diagnostics.py tests/host/test_toolruntime_accept_barrier.py -q`
+24 passed、P6 ToolRuntime 相关 46 tests passed、`python -m pyright dayu/host tests/host` 0 errors、`git diff --check` clean。当前 gate 为 Phase 6 P6-S6
 implementation ready。需要继续追踪的 non-blocking hardening、deferred capability 与后续 phase owner 已写入 `Open Questions 与风险追踪` 的
 `PR 54 / P1-P5 corrected review 残余风险追踪`、P6-S1 controller adjudication residual risks、P6-S2 controller
-adjudication residual risks、P6-S3 controller adjudication residual risks，以及 P6-S4 controller adjudication residual risks。P6-S3 遗留的真实 `HostDispatchScheduler`
-仍 no-tool composition wiring 必须在 Phase 6 退出前关闭；优先由 P6-S6 integration 接收，若 P6-S4 / P6-S5 提前触及同一装配边界则可提前补齐。
+adjudication residual risks、P6-S3 controller adjudication residual risks、P6-S4 controller adjudication residual risks，以及
+P6-S5 controller adjudication residual risks。P6-S3 遗留的真实 `HostDispatchScheduler` 仍 no-tool composition wiring 必须在 Phase 6 退出前关闭；由 P6-S6 integration 接收。
 
 ## Phase Map
 
@@ -1522,6 +1532,25 @@ Phase 按依赖关系推进：先实现被其它阶段依赖的公共契约、ru
 - 当前测试允许 white-box 篡改 `_cursors` 验证 corrupt / mismatch 防御；若后续 cursor 存储结构迁移，owner 为对应迁移 slice 同步调整测试边界。
 - 当前覆盖以 `text_chars` 为主；`text_lines`、`list_items`、`binary_bytes` 的更细粒度边界 hardening 归后续 ToolRuntime test hardening，不阻塞 P6-S5。
 - duplicate governance、diagnostic refs 和 run-local duplicate matrix 由 P6-S5 接收。
+- 真实 `HostDispatchScheduler` 仍是 no-tool composition wiring；Phase 6 退出前必须关闭，当前 owner 为 P6-S6 integration。
+
+#### Phase 6 P6-S5 Duplicate Governance / Diagnostics 残余风险追踪
+
+结论：
+
+- P6-S5 已落地 ToolRuntime 实例内 run-local duplicate governance matrix：`allow`、`reuse`、`hint`、
+  `require_justification` 与 `hard_stop`。
+- duplicate key 排除 `index_in_iteration`；同 iteration 内同工具同 normalized arguments 仍进入 duplicate governance。
+- `reuse` 不调用业务 callable，不追加第二个 `TOOL_RESULT_ACCEPTED`，而是通过 `TOOL_CALL_GOVERNED` 引用 prior accepted refs 后把 prior outcome 返回给 Engine。
+- diagnostic emitter 当前只产生 typed diagnostic refs，不写 durable trace projection。
+- DS-F1 至 DS-F4 accepted findings 已修复并通过 re-review；P6-S5 review 没有剩余 blocking finding。
+
+追踪项：
+
+- 默认 duplicate policy 仍为 `allow`；生产 policy provider resolution 不在 P6-S5 范围内，当前 owner 为 P6-S6 integration 或后续 ToolRuntime policy provider work。
+- `semantic_duplicate_key_argument_name` 是 Host 内部 policy 字段且默认关闭；后续 policy provider 若启用它，必须补 dedicated tests 并明确其与 normalized arguments digest 的关系。
+- `ToolFactAcceptCandidate` 对 `GOVERNED_ERROR` 的 duplicate defensive validation 仍可更严格；owner 为后续 ToolRuntime hardening。
+- `ToolTraceDiagnosticEmitter` typed refs 不等于 durable tool trace；durable trace projection 由 Phase 13 Audit / Tool Trace / Outbox Projections 接收。
 - 真实 `HostDispatchScheduler` 仍是 no-tool composition wiring；Phase 6 退出前必须关闭，当前 owner 为 P6-S6 integration。
 
 ## 历史记录
