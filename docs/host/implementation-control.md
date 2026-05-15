@@ -1639,7 +1639,25 @@ validation：`pytest tests/host/test_active_cancel_dispatch.py tests/host/test_p
 `CANCELLING`；session cancel replay 的 active target truth 仍锚定首个 active cancel event，当前单 active Run invariant 下非
 blocking，若未来扩展多 active 语义必须重设 replay target truth；`cancel_run` 幂等重放不重传播 active cancel target，留给后续
 lifecycle / recovery hardening；terminal 后 queue promotion wakeup 失败目前会浮出 worker event task，`finally` 仍负责 unregister /
-close / release lane，后续可补 diagnostic suppression。当前 gate 为 P5-S6 Integration, Docs And Validation Closeout。
+close / release lane，后续可补 diagnostic suppression。
+P5-S6 Integration, Docs And Validation Closeout 已完成 implementation、code review、controller 裁决、README / tests README
+同步与 accepted slice commit。Implementation artifact 为
+`docs/reviews/gateflow-implementation-host-p5-s6-integration-docs-validation-20260515.md`。P5-S6 controlled scope expansions：
+`dayu/host/dispatch.py` 纳入本 slice，用于修复 scheduler worker stream clean EOF / stream exception 未调用
+`EngineEventIngestor.close_clean_eof` / `close_worker_lost` 的真实生产缺口；`tests/host/test_admission_queue.py`、
+`tests/host/test_durable_schema.py`、`tests/host/test_run_attempt_transitions.py` 纳入本 slice，用于把 Phase 3-era 断言迁移到
+Phase 5 accepted truth，而不是在生产代码中保留兼容逻辑。Code review artifacts 为
+`docs/reviews/gateflow-code-review-host-p5-s6-integration-docs-validation-mimo-20260515.md` 与
+`docs/reviews/gateflow-code-review-host-p5-s6-integration-docs-validation-ds-20260515.md`；两者均 PASS 且无 blocking
+finding。Controller adjudication artifact 为
+`docs/reviews/gateflow-code-review-host-p5-s6-integration-docs-validation-controller-adjudication-20260515.md`。P5-S6 validation：
+`pytest tests/host/test_phase5_local_execution_integration.py tests/host/test_import_boundary.py -q` 14 passed；controlled expansion
+targeted tests 4 passed；`pytest tests/host tests/runtime -q` 334 passed；`python -m pyright dayu/host tests/host` 0 errors；
+`python -m pyright dayu/ tests/ utils/` 0 errors；`git diff --check` passed。P5-S6 accepted slice commit 为 `2a1e0db`。
+P5-S6 residual risks：真实 provider runner 的外部网络 / provider API smoke 不属于 Phase 5 必测；active cancel watchdog 和
+post-cancel timeout policy 仍留给后续 lifecycle / recovery hardening；ToolRuntime / `fetch_more` 归 Phase 6，`WAITING` /
+`resolve_wait` 归 Phase 7，Memory 归 Phase 9，Context Governance 归 Phase 10，Recovery 归 Phase 11，Observer / Sink
+归 Phase 13，RemoteProxy 归 Phase 14。当前 gate 为 Phase 5 aggregate deepreview。
 
 历史状态：Phase 1 公共契约与 runtime 基础设施已完成并 merge；Phase 2 Durable Store / EventLog / Payload Foundation 已完成 plan、3 个 implementation slices、aggregate deepreview、aggregate fix、aggregate re-review 与 accepted deepreview commit，本 phase 状态为 completed。Phase 1 design refinement 已写入 `docs/reviews/gateflow-phase-design-host-p1-codex-20260513.md`，controller-accepted design fix 已写入 `docs/reviews/gateflow-phase-design-fix-host-p1-codex-20260513.md`。用户反馈后的 design fixes 已写入 `docs/reviews/gateflow-phase-design-user-feedback-fix-host-p1-codex-20260513.md` 与 `docs/reviews/gateflow-phase-design-user-feedback-fix2-host-p1-codex-20260513.md`。AgentMiMo 与 AgentDS 的 phase design re-review 均确认 accepted findings 已修复且 new blocker 为 0；round2 re-review 进一步确认 lane 已改为 cross-process runtime capacity guard，Phase Map 已重排为 P12 ToolsDiscovery / ScenePrepare、P13 Audit / Tool Trace / Outbox、P14 RemoteProxy、P15 Retention / Purge。Phase 1 plan 已写入 `docs/host/phase1-public-contract-runtime-plan.md`；plan review、controller adjudication、plan fix 与 plan re-review artifacts 已写入 `docs/reviews/`。AgentMiMo 与 AgentDS 的 plan re-review 均确认 finding 数量为 0、blocking finding 数量为 0。用户已确认 Phase 1 plan；accepted plan commit 为 `34b1b41`。Phase 1 Slice 1 accepted slice commit 为 `66d8dc3`，Slice 2 accepted slice commit 为 `27e0d8b`，Slice 3 accepted slice commit 为 `e23e3e4`，Slice 4 accepted slice commit 为 `0393a22`。
 
