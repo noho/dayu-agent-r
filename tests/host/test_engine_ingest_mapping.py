@@ -9,6 +9,8 @@ from datetime import UTC, datetime
 from pathlib import Path
 from typing import cast
 
+import pytest
+
 from dayu.contracts.json_value import JsonValue
 from dayu.contracts.tool_await import ToolAwaitKind, ToolAwaitSpec
 from dayu.contracts.tool_call import ToolCallRequest
@@ -16,9 +18,12 @@ from dayu.contracts.tool_outcome import ToolCompletedOutcome
 from dayu.contracts.tool_result import ToolResultSuccess
 from dayu.engine.contracts.engine_events import (
     ContextCompactionRequestedData,
+    ContentDeltaData,
     EngineEvent,
+    EngineEventData,
     EngineEventType,
     FinalAnswerData,
+    IterationStartedData,
     ProviderProtocolErrorData,
     RunCancelledData,
     RunFailedData,
@@ -672,6 +677,67 @@ def test_unsupported_engine_event_shape_is_rejected(tmp_path: Path) -> None:
         assert _payload(result.events[0])["reason"] == "unsupported_engine_event_type"
 
 
+@pytest.mark.parametrize(
+    ("worker_event_index", "data"),
+    (
+        (17, cast(EngineEventData, None)),
+        (
+            18,
+            IterationStartedData(
+                iteration_id="iter-wrong",
+                iteration_index=0,
+                message_count=1,
+            ),
+        ),
+    ),
+)
+def test_preview_event_rejects_missing_or_wrong_data(
+    tmp_path: Path,
+    worker_event_index: int,
+    data: EngineEventData,
+) -> None:
+    """preview event 必须同时匹配 event type 与 data 类型。"""
+
+    with open_host_durable_store(_options(tmp_path)) as store:
+        seeded = _seed_active_run(store.transaction_runner)
+        candidate = _candidate(
+            seeded,
+            worker_event_index=worker_event_index,
+            data=data,
+            event_type=EngineEventType.CONTENT_DELTA,
+        )
+
+        result = EngineEventIngestor(
+            transaction_runner=store.transaction_runner
+        ).ingest(candidate)
+
+        assert result.status == EngineIngestStatus.REJECTED
+        assert result.events[0].event_class == EventClass.DIAGNOSTIC
+        assert _payload(result.events[0])["reason"] == "unsupported_engine_event_type"
+        assert _event_count(store.transaction_runner, "CONTENT_DELTA") == 0
+
+
+def test_preview_event_accepts_matching_type_and_data(tmp_path: Path) -> None:
+    """匹配 data 类型的 preview event 仍正常写入 preview payload。"""
+
+    with open_host_durable_store(_options(tmp_path)) as store:
+        seeded = _seed_active_run(store.transaction_runner)
+        candidate = _candidate(
+            seeded,
+            worker_event_index=19,
+            data=ContentDeltaData(iteration_id="iter-ok", delta="hello"),
+            event_type=EngineEventType.CONTENT_DELTA,
+        )
+
+        result = EngineEventIngestor(
+            transaction_runner=store.transaction_runner
+        ).ingest(candidate)
+
+        assert result.status == EngineIngestStatus.ACCEPTED
+        assert result.events[0].event_class == EventClass.PREVIEW
+        assert _payload(result.events[0])["delta"] == "hello"
+
+
 def _options(tmp_path: Path) -> HostDurableStoreOptions:
     """构造测试 durable store options。
 
@@ -813,18 +879,7 @@ def _candidate(
     seeded: _SeededRun,
     *,
     worker_event_index: int,
-    data: (
-        FinalAnswerData
-        | RunFailedData
-        | ContextCompactionRequestedData
-        | RunSuspendedData
-        | ToolAwaitingData
-        | UsageReportedData
-        | ProviderProtocolErrorData
-        | ToolCallRequestedData
-        | ToolResultAcceptedData
-        | RunCancelledData
-    ),
+    data: EngineEventData,
     event_type: EngineEventType,
 ) -> EngineEventCandidate:
     """构造 EngineEvent candidate。

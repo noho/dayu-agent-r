@@ -34,6 +34,7 @@ from dayu.engine.contracts.messages import (
 )
 from dayu.engine.contracts.runner_spec import RunnerCallOptions, RunnerSpec
 from dayu.host.api import AttemptDispatchSnapshot
+from dayu.host.api import AttemptStatus, RunStatus
 from dayu.host.durable.event_log import (
     EventClass,
     EventLogRow,
@@ -45,6 +46,7 @@ from dayu.host.durable.errors import HostDurableError
 from dayu.host.durable.state import (
     AttemptRow,
     DispatchRecordRow,
+    DispatchRecordStatus,
     RunRow,
     read_attempt_by_id,
     read_dispatch_record_by_attempt_id,
@@ -769,6 +771,12 @@ def _validate_snapshot_rows(
         raise HostDurableError("RunInputBuilder dispatch identity mismatch")
     if run.execution_target != snapshot.execution_target:
         raise HostDurableError("RunInputBuilder execution_target mismatch")
+    if run.status != RunStatus.RUNNING:
+        raise HostDurableError("RunInputBuilder requires RUNNING Run")
+    if attempt.status != AttemptStatus.STARTING:
+        raise HostDurableError("RunInputBuilder requires STARTING Attempt")
+    if dispatch_record.status != DispatchRecordStatus.DISPATCHING:
+        raise HostDurableError("RunInputBuilder requires DISPATCHING dispatch record")
 
 
 def _require_event(row: EventLogRow | None, *, expected_type: str) -> EventLogRow:

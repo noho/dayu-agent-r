@@ -2508,8 +2508,11 @@ def _validate_terminal_input(request: TerminalCloseoutInput) -> None:
     _require_non_empty_text(
         request.run_terminal_event_id, field_name="run_terminal_event_id"
     )
-    _attempt_terminal_event_type(request.attempt_terminal_status)
-    _run_terminal_event_type(request.run_terminal_status)
+    try:
+        _attempt_terminal_event_type(request.attempt_terminal_status)
+        _run_terminal_event_type(request.run_terminal_status)
+    except ValueError as exc:
+        raise HostDurableError(str(exc)) from exc
     _require_non_empty_text(request.actor, field_name="actor")
     _require_non_empty_text(request.source, field_name="source")
     _require_non_empty_text(request.reason, field_name="reason")

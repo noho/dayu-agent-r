@@ -287,9 +287,10 @@ class AttemptDispatchSnapshot:
     cancellation_token: CancellationToken
 
     def __post_init__(self) -> None:
-        """校验快照必填文本字段。
+        """校验快照必填字段。
 
         :returns: ``None``。
+        :raises TypeError: 取消 token 不是 ``CancellationToken`` 时抛出。
         :raises ValueError: 任一必填文本为空时抛出。
         """
 
@@ -304,6 +305,8 @@ class AttemptDispatchSnapshot:
         _require_non_empty(
             self.policy_snapshot_ref, field_name="policy_snapshot_ref"
         )
+        if not isinstance(self.cancellation_token, CancellationToken):
+            raise TypeError("cancellation_token must implement CancellationToken")
 
 
 class LocalWorkerHandle(Protocol):

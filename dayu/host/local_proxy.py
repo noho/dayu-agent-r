@@ -78,6 +78,7 @@ class _DefaultLocalWorkerHandle:
         self._local_worker_id = local_worker_id
         self._request = request
         self._events: AsyncGenerator[EngineEvent, None] | None = None
+        self._closed = False
 
     @property
     def local_worker_id(self) -> str:
@@ -92,8 +93,11 @@ class _DefaultLocalWorkerHandle:
         """返回本次 Engine run 的事件流。
 
         :returns: EngineEvent 异步迭代器。
+        :raises RuntimeError: handle 已关闭时抛出。
         """
 
+        if self._closed:
+            raise RuntimeError("local worker handle is closed")
         if self._events is None:
             self._events = run_agent_messages(self._request)
         return self._events
@@ -116,7 +120,11 @@ class _DefaultLocalWorkerHandle:
         :returns: ``None``。
         """
 
+        if self._closed:
+            return
         events = self._events
+        self._events = None
+        self._closed = True
         if events is not None:
             await events.aclose()
 

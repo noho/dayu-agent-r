@@ -22,6 +22,7 @@ from dayu.host.api import (
 )
 
 HOST_FORBIDDEN_PREFIXES: tuple[str, ...] = (
+    "dayu.config",
     "dayu.fins",
     "dayu.service",
     "dayu.ui",
@@ -109,7 +110,7 @@ def _matches_prefix(module: str, prefixes: tuple[str, ...]) -> bool:
 
 
 def test_host_does_not_import_upper_or_business_layers() -> None:
-    """``dayu.host`` 不得导入 Engine / Fins / Service / UI。"""
+    """``dayu.host`` 不得导入 Config / Fins / Service / UI。"""
 
     violations: list[tuple[str, str]] = []
     for file_path in _iter_python_files(_host_root()):

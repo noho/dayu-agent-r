@@ -525,6 +525,63 @@ def test_terminal_closeout_accepts_attempt_running_in_phase5(
         )
 
 
+@pytest.mark.parametrize(
+    ("attempt_status", "run_status", "message"),
+    (
+        (
+            AttemptStatus.CANCELLED,
+            RunStatus.FAILED,
+            "unsupported Attempt terminal status",
+        ),
+        (
+            AttemptStatus.FAILED,
+            RunStatus.CANCELLED,
+            "unsupported Run terminal status",
+        ),
+    ),
+)
+def test_terminal_closeout_wraps_terminal_event_type_errors(
+    tmp_path: Path,
+    attempt_status: AttemptStatus,
+    run_status: RunStatus,
+    message: str,
+) -> None:
+    """terminal closeout 输入非法终态时统一抛 HostDurableError。"""
+
+    with open_host_durable_store(_options(tmp_path)) as store:
+        seeded = _seed_running_run(store, tmp_path)
+
+        def closeout(transaction: HostTransaction) -> None:
+            """执行非法 terminal closeout。
+
+            :param transaction: Host transaction。
+            :returns: ``None``。
+            :raises HostDurableError: terminal 状态不受支持时抛出。
+            """
+
+            terminal_closeout_in_transaction(
+                transaction,
+                EventLogStore(),
+                TerminalCloseoutInput(
+                    run_id=seeded.run_id,
+                    attempt_id=seeded.attempt_id,
+                    attempt_terminal_event_id="event-attempt-invalid-terminal",
+                    run_terminal_event_id="event-run-invalid-terminal",
+                    attempt_terminal_status=attempt_status,
+                    run_terminal_status=run_status,
+                    occurred_at=_NOW,
+                    actor="analyst",
+                    source="pytest",
+                    reason="phase3_internal_closeout",
+                    terminal_summary_ref=None,
+                    terminal_summary_digest=None,
+                ),
+            )
+
+        with pytest.raises(HostDurableError, match=message):
+            store.transaction_runner.run_write(closeout)
+
+
 def test_promote_cas_loser_keeps_queued_state(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
@@ -1026,6 +1083,71 @@ def test_terminal_run_row_reports_cas_lost_for_deferred_active_statuses(
         assert store.transaction_runner.run_write(operation) == (
             StateMutationStatus.CAS_LOST.value,
             active_status.value,
+        )
+
+
+@pytest.mark.parametrize(
+    "terminal_status",
+    (
+        RunStatus.SUCCEEDED,
+        RunStatus.FAILED,
+        RunStatus.CANCELLED,
+        RunStatus.LOST,
+    ),
+)
+def test_terminal_run_row_reports_cas_lost_for_latest_terminal_status(
+    tmp_path: Path, terminal_status: RunStatus
+) -> None:
+    """terminal Run CAS 看到最新 Run 已终态时归类为 CAS_LOST。"""
+
+    with open_host_durable_store(_options(tmp_path)) as store:
+        seeded = _seed_running_run(store, tmp_path)
+
+        def operation(transaction: HostTransaction) -> tuple[str, str]:
+            """构造 terminal 状态后执行 terminal Run CAS。
+
+            :param transaction: Host transaction。
+            :returns: mutation 状态与最新 Run 状态。
+            """
+
+            event = EventLogStore().append_event(
+                transaction,
+                _test_event(
+                    event_id=f"event-terminal-latest-{terminal_status.value}",
+                    session_id=seeded.session_id,
+                    run_id=seeded.run_id,
+                    event_type="RUN_FAILED",
+                    payload={"reason": "cas-terminal-test"},
+                ),
+            ).row
+            transaction.execute(
+                "UPDATE host_runs "
+                "SET status = ?, terminal_event_id = ?, "
+                "terminal_event_sequence = ?, terminal_at = ? "
+                "WHERE run_id = ?",
+                (
+                    terminal_status.value,
+                    event.event_id,
+                    event.event_sequence,
+                    "2026-05-14T01:02:10Z",
+                    seeded.run_id,
+                ),
+            )
+            result = terminal_run_row(
+                transaction,
+                run_id=seeded.run_id,
+                current_attempt_id=seeded.attempt_id,
+                terminal_status=RunStatus.FAILED,
+                terminal_event_id=event.event_id,
+                terminal_event_sequence=event.event_sequence,
+                terminal_at="2026-05-14T01:02:11Z",
+            )
+            assert result.row is not None
+            return result.status.value, result.row.status.value
+
+        assert store.transaction_runner.run_write(operation) == (
+            StateMutationStatus.CAS_LOST.value,
+            terminal_status.value,
         )
 
 

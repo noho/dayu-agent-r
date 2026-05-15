@@ -87,6 +87,105 @@ async def test_default_local_worker_uses_run_agent_messages(monkeypatch: pytest.
     assert handle.local_worker_id.startswith("local-worker-")
 
 
+@pytest.mark.asyncio
+async def test_default_local_worker_propagates_engine_stream_error(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """默认 LocalProxy worker 不吞掉 Engine stream 异常。"""
+
+    async def _raising_run_agent_messages(
+        incoming: AgentRunRequest,
+    ) -> AsyncIterator[EngineEvent]:
+        """替换为抛错 Engine stream。
+
+        :param incoming: Engine request。
+        :returns: 不会正常返回事件。
+        :raises RuntimeError: 始终抛出 stream 异常。
+        """
+
+        del incoming
+        raise RuntimeError("engine stream failed")
+        if False:
+            yield _engine_event()
+
+    monkeypatch.setattr(
+        "dayu.host.local_proxy.run_agent_messages",
+        _raising_run_agent_messages,
+    )
+
+    worker = DefaultLocalEngineWorkerFactory().create_worker(_snapshot())
+    handle = await worker.accept(_snapshot(), _request())
+    with pytest.raises(RuntimeError, match="engine stream failed"):
+        [event async for event in handle.events()]
+    await handle.close()
+
+
+@pytest.mark.asyncio
+async def test_default_local_worker_allows_empty_engine_stream(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """默认 LocalProxy worker 显式暴露 Engine clean EOF 空流。"""
+
+    async def _empty_run_agent_messages(
+        incoming: AgentRunRequest,
+    ) -> AsyncIterator[EngineEvent]:
+        """替换为空 Engine stream。
+
+        :param incoming: Engine request。
+        :returns: 空 EngineEvent stream。
+        """
+
+        del incoming
+        if False:
+            yield _engine_event()
+
+    monkeypatch.setattr(
+        "dayu.host.local_proxy.run_agent_messages",
+        _empty_run_agent_messages,
+    )
+
+    worker = DefaultLocalEngineWorkerFactory().create_worker(_snapshot())
+    handle = await worker.accept(_snapshot(), _request())
+    events = [event async for event in handle.events()]
+    await handle.close()
+
+    assert events == []
+
+
+@pytest.mark.asyncio
+async def test_default_local_worker_close_is_idempotent_and_events_fail_after_close(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """默认 LocalProxy handle close 后清空 stream 且拒绝再次读取 events。"""
+
+    async def _empty_run_agent_messages(
+        incoming: AgentRunRequest,
+    ) -> AsyncIterator[EngineEvent]:
+        """替换为空 Engine stream。
+
+        :param incoming: Engine request。
+        :returns: 空 EngineEvent stream。
+        """
+
+        del incoming
+        if False:
+            yield _engine_event()
+
+    monkeypatch.setattr(
+        "dayu.host.local_proxy.run_agent_messages",
+        _empty_run_agent_messages,
+    )
+
+    worker = DefaultLocalEngineWorkerFactory().create_worker(_snapshot())
+    handle = await worker.accept(_snapshot(), _request())
+    assert [event async for event in handle.events()] == []
+    await handle.close()
+    await handle.close()
+
+    with pytest.raises(RuntimeError, match="closed"):
+        handle.events()
+
+
 def _snapshot() -> AttemptDispatchSnapshot:
     """构造 dispatch snapshot。
 

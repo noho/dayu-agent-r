@@ -9,7 +9,9 @@ from typing import Protocol, cast
 
 import pytest
 
+from dayu.contracts.cancellation import CancellationToken
 from dayu.host import (
+    AttemptDispatchSnapshot,
     AttemptStatus,
     AuthorizationClaim,
     CancelMode,
@@ -492,6 +494,22 @@ def test_host_local_execution_options_rejects_invalid_typed_fields() -> None:
         replace(
             _local_execution_options(),
             worker_factory=cast(LocalEngineWorkerFactory, None),
+        )
+
+
+def test_attempt_dispatch_snapshot_rejects_none_cancellation_token() -> None:
+    """Attempt dispatch snapshot 必须拒绝空取消观察 token。"""
+
+    with pytest.raises(TypeError, match="cancellation_token"):
+        AttemptDispatchSnapshot(
+            session_id="session-1",
+            run_id="run-1",
+            attempt_id="attempt-1",
+            execution_id="execution-1",
+            dispatch_record_id="dispatch-1",
+            execution_target="local-default",
+            policy_snapshot_ref="policy-1",
+            cancellation_token=cast(CancellationToken, None),
         )
 
 

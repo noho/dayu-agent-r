@@ -2951,7 +2951,7 @@ def _run_mutation_result_for_active(
         RunStatus.WAITING,
         RunStatus.CANCELLING,
         RunStatus.RECOVERING,
-    ):
+    ) or _is_terminal_run_status(latest.status):
         return RunMutationResult(status=StateMutationStatus.CAS_LOST, row=latest)
     return RunMutationResult(status=StateMutationStatus.INVALID_STATE, row=latest)
 

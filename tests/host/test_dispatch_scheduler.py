@@ -23,10 +23,15 @@ from dayu.host.api import (
     EnsureSessionRequest,
     HostLocalExecutionOptions,
     LocalEngineWorker,
+    LocalEngineWorkerFactory,
     LocalWorkerHandle,
     RunStatus,
 )
-from dayu.host.dispatch import HostDispatchScheduler
+from dayu.host.dispatch import (
+    ActiveCancelMessage,
+    ActiveWorkerRegistry,
+    HostDispatchScheduler,
+)
 from dayu.host.durable.codec import sha256_digest_json
 from dayu.host.durable.connection import HostDurableStore, open_host_durable_store
 from dayu.host.durable.event_log import (
@@ -61,6 +66,7 @@ from dayu.host.durable.state import (
     read_run_by_id,
 )
 from dayu.host.durable.transaction import HostTransaction, HostTransactionRunner
+from dayu.host.local_proxy import DefaultLocalEngineWorkerFactory
 from dayu.runtime.lane import (
     LaneAcquired,
     LaneConfig,
@@ -180,6 +186,96 @@ class _CloseFailingHandle(_FakeHandle):
         """
 
         raise RuntimeError("close failed")
+
+
+class _CloseCountingHandle(_FakeHandle):
+    """记录 cancel / close 次数且事件流长期挂起的 fake handle。"""
+
+    def __init__(self) -> None:
+        """初始化计数 handle。
+
+        :returns: ``None``。
+        """
+
+        super().__init__()
+        self.cancel_count = 0
+        self.close_count = 0
+
+    async def events(self) -> AsyncIterator[EngineEvent]:
+        """保持事件流未结束直到 scheduler close。
+
+        :returns: 不会正常返回事件。
+        """
+
+        await asyncio.sleep(10.0)
+        if False:
+            yield _unreachable_engine_event()
+
+    def cancel(self, reason: str) -> None:
+        """记录取消请求。
+
+        :param reason: 取消原因。
+        :returns: ``None``。
+        """
+
+        del reason
+        self.cancel_count += 1
+
+    async def close(self) -> None:
+        """记录关闭次数。
+
+        :returns: ``None``。
+        """
+
+        self.close_count += 1
+        await super().close()
+
+
+class _FlakyLocalWorkerIdHandle(_FakeHandle):
+    """第二次读取 ``local_worker_id`` 时抛错的 fake handle。"""
+
+    def __init__(self) -> None:
+        """初始化 fake handle。
+
+        :returns: ``None``。
+        """
+
+        super().__init__("local-worker-first-read")
+        self.local_worker_id_reads = 0
+        self.close_count = 0
+
+    @property
+    def local_worker_id(self) -> str:
+        """第一次返回 worker id，后续模拟 pre-event envelope 构造失败。
+
+        :returns: 本地 worker id。
+        :raises RuntimeError: 第二次及后续读取时抛出。
+        """
+
+        self.local_worker_id_reads += 1
+        if self.local_worker_id_reads == 1:
+            return "local-worker-first-read"
+        raise RuntimeError("local worker id unavailable")
+
+    async def events(self) -> AsyncIterator[EngineEvent]:
+        """该测试路径不应进入事件流。
+
+        :returns: 不会正常返回事件。
+        :raises AssertionError: 若被调用则抛出。
+        """
+
+        raise AssertionError("events must not be consumed")
+        if False:
+            yield _unreachable_engine_event()
+
+    async def close(self) -> None:
+        """记录关闭次数。
+
+        :returns: ``None``。
+        """
+
+        self.close_count += 1
+        await super().close()
 
 
 class _AcceptingWorker:
@@ -634,6 +730,123 @@ async def test_scheduler_close_suppresses_handle_close_exception(
         await scheduler.close()
 
 
+@pytest.mark.asyncio
+async def test_scheduler_close_lets_active_task_own_handle_close(
+    tmp_path: Path,
+) -> None:
+    """scheduler close 只发 cancel，handle close 由 active task finally 执行一次。"""
+
+    handle = _CloseCountingHandle()
+    factory = _FakeWorkerFactory(worker=_HandleWorker(handle))
+    with open_host_durable_store(_options(tmp_path)) as store:
+        seeded = _seed_current_run(store)
+        scheduler = await _open_scheduler(tmp_path, store, factory)
+        scheduler.wake_dispatch(_pending_dispatch(seeded))
+        result = await scheduler.drain_once()
+
+        assert result.dispatched == 1
+        await scheduler.close()
+        assert handle.cancel_count == 1
+        assert handle.close_count == 1
+
+
+@pytest.mark.asyncio
+async def test_consume_pre_event_exception_releases_lane_and_unregisters(
+    tmp_path: Path,
+) -> None:
+    """consume task 在 pre-event 构造失败时仍释放 lane 并注销 active worker。"""
+
+    handle = _FlakyLocalWorkerIdHandle()
+    registry = ActiveWorkerRegistry()
+    factory = _FakeWorkerFactory(worker=_HandleWorker(handle))
+    with open_host_durable_store(_options(tmp_path)) as store:
+        seeded = _seed_current_run(store)
+        scheduler = await _open_scheduler(
+            tmp_path,
+            store,
+            factory,
+            active_registry=registry,
+        )
+        try:
+            scheduler.wake_dispatch(_pending_dispatch(seeded))
+            result = await scheduler.drain_once()
+            await _wait_for_active_tasks_to_finish(scheduler)
+
+            assert result.dispatched == 1
+            assert handle.close_count == 1
+            assert registry.cancel(
+                ActiveCancelMessage(
+                    run_id=seeded.run_id,
+                    attempt_id=seeded.attempt_id,
+                    execution_id=seeded.execution_id,
+                    reason="test_cancel_after_failure",
+                )
+            ) is False
+            claim = await scheduler._lane_controller.acquire(
+                _LANE_NAME,
+                timeout_seconds=0,
+            )
+            assert isinstance(claim, LaneAcquired)
+            await claim.token.release()
+        finally:
+            await scheduler.close()
+
+
+@pytest.mark.asyncio
+async def test_scheduler_with_default_local_proxy_stream_error_closes_lost(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """真实 DefaultLocalProxy 的 Engine stream 异常经 scheduler 映射为 LOST。"""
+
+    async def raising_run_agent_messages(
+        request: AgentRunRequest,
+    ) -> AsyncIterator[EngineEvent]:
+        """模拟 Engine public entry 在 stream 迭代时抛错。
+
+        :param request: Engine request。
+        :returns: 不会正常返回事件。
+        :raises RuntimeError: 始终抛出 stream 异常。
+        """
+
+        del request
+        raise RuntimeError("engine stream failed")
+        if False:
+            yield _unreachable_engine_event()
+
+    monkeypatch.setattr(
+        "dayu.host.local_proxy.run_agent_messages",
+        raising_run_agent_messages,
+    )
+
+    with open_host_durable_store(_options(tmp_path)) as store:
+        seeded = _seed_current_run(store)
+        scheduler = await _open_scheduler(
+            tmp_path,
+            store,
+            DefaultLocalEngineWorkerFactory(),
+        )
+        try:
+            scheduler.wake_dispatch(_pending_dispatch(seeded))
+            result = await scheduler.drain_once()
+            run, attempt, _dispatch_record = await _wait_for_statuses(
+                store.transaction_runner,
+                seeded,
+                expected_run=RunStatus.LOST,
+                expected_attempt=AttemptStatus.LOST,
+            )
+
+            assert result.dispatched == 1
+            assert run.status == RunStatus.LOST
+            assert attempt.status == AttemptStatus.LOST
+            event = _read_event_by_type(store.transaction_runner, "RUN_LOST")
+            assert json.loads(_require_text(event.reason_json))["reason"] == (
+                "worker_lost_before_terminal"
+            )
+        finally:
+            await scheduler.close()
+
+
 def _options(tmp_path: Path) -> HostDurableStoreOptions:
     """构造 Host durable store options。
 
@@ -657,20 +870,22 @@ def _options(tmp_path: Path) -> HostDurableStoreOptions:
 async def _open_scheduler(
     tmp_path: Path,
     store: HostDurableStore,
-    factory: _FakeWorkerFactory,
+    factory: LocalEngineWorkerFactory,
     *,
     worker_startup_timeout_seconds: float = 1.0,
     lane_db_path: Path | None = None,
     lane_default_timeout_seconds: float = 0.01,
+    active_registry: ActiveWorkerRegistry | None = None,
 ) -> HostDispatchScheduler:
     """打开测试 scheduler。
 
     :param tmp_path: pytest 临时目录。
     :param store: durable store。
-    :param factory: fake worker factory。
+    :param factory: worker factory。
     :param worker_startup_timeout_seconds: worker startup timeout。
     :param lane_db_path: runtime lane DB 路径。
     :param lane_default_timeout_seconds: lane acquire 默认 timeout。
+    :param active_registry: active worker registry。
     :returns: scheduler。
     """
 
@@ -698,6 +913,7 @@ async def _open_scheduler(
             worker_factory=factory,
         ),
         host_handle_id="host-test",
+        active_registry=active_registry,
     )
 
 
@@ -908,6 +1124,23 @@ async def _wait_for_statuses(
         "status did not converge: "
         f"run={run.status.value} attempt={attempt.status.value}"
     )
+
+
+async def _wait_for_active_tasks_to_finish(
+    scheduler: HostDispatchScheduler,
+) -> None:
+    """等待 scheduler active consume tasks 全部结束。
+
+    :param scheduler: 目标 scheduler。
+    :returns: ``None``。
+    :raises AssertionError: 超时仍有 active task 时抛出。
+    """
+
+    for _index in range(100):
+        if not scheduler._active_tasks:
+            return
+        await asyncio.sleep(0.01)
+    raise AssertionError("active tasks did not finish")
 
 
 def _read_event_by_type(

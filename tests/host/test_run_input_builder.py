@@ -6,6 +6,8 @@ from dataclasses import dataclass
 from datetime import UTC, datetime
 from pathlib import Path
 
+import pytest
+
 from dayu.contracts.cancellation import CancellationToken
 from dayu.contracts.json_value import JsonValue
 from dayu.engine.contracts.agent_policy import AgentPolicy
@@ -20,11 +22,13 @@ from dayu.engine.contracts.messages import (
 from dayu.engine.contracts.runner_spec import RunnerCallOptions, RunnerSpec
 from dayu.host.api import (
     AttemptDispatchSnapshot,
+    AttemptStatus,
     AuthorizationClaim,
     EnsureSessionRequest,
     HostCallContext,
     HostMetadataEntry,
     OperationContext,
+    RunStatus,
 )
 from dayu.host.durable.codec import sha256_digest_json
 from dayu.host.durable.connection import HostDurableStore, open_host_durable_store
@@ -33,6 +37,10 @@ from dayu.host.durable.event_log import (
     EventLogAppendRequest,
     EventLogRow,
     EventLogStore,
+)
+from dayu.host.durable.liveness import (
+    HostInstanceIdentity,
+    register_current_instance,
 )
 from dayu.host.durable.options import (
     HostDurableStoreOptions,
@@ -44,7 +52,13 @@ from dayu.host.durable.run_transition import (
     create_running_run_with_starting_attempt_in_transaction,
 )
 from dayu.host.durable.session_lifecycle import ensure_session
-from dayu.host.durable.state import RunStartReason, WorkerKind
+from dayu.host.durable.state import (
+    DispatchRecordStatus,
+    RunStartReason,
+    WorkerKind,
+    mark_dispatching_after_lane_row,
+)
+from dayu.host.durable.errors import HostDurableError
 from dayu.host.durable.transaction import HostRow, HostTransaction, HostTransactionRunner
 from dayu.host.run_input import (
     NoToolExecutor,
@@ -271,6 +285,57 @@ def test_no_tool_request_fields_are_disabled(tmp_path: Path) -> None:
         assert isinstance(request.tool_executor, NoToolExecutor)
 
 
+@pytest.mark.parametrize(
+    ("run_status", "attempt_status", "dispatch_status", "message"),
+    (
+        (
+            RunStatus.FAILED,
+            AttemptStatus.STARTING,
+            DispatchRecordStatus.DISPATCHING,
+            "RUNNING Run",
+        ),
+        (
+            RunStatus.RUNNING,
+            AttemptStatus.CANCELLED,
+            DispatchRecordStatus.DISPATCHING,
+            "STARTING Attempt",
+        ),
+        (
+            RunStatus.RUNNING,
+            AttemptStatus.STARTING,
+            DispatchRecordStatus.PENDING,
+            "DISPATCHING dispatch record",
+        ),
+    ),
+)
+def test_current_facts_reject_non_dispatchable_snapshot_state(
+    tmp_path: Path,
+    run_status: RunStatus,
+    attempt_status: AttemptStatus,
+    dispatch_status: DispatchRecordStatus,
+    message: str,
+) -> None:
+    """RunInputBuilder 只接受当前 dispatch 快照的可派发 durable 状态。"""
+
+    with open_host_durable_store(_options(tmp_path)) as store:
+        session_id = _ensure_session_id(store.transaction_runner)
+        seeded = _seed_current_run(
+            store,
+            session_id=session_id,
+            payload=_user_input_payload("current question"),
+        )
+        _force_dispatch_snapshot_state(
+            store.transaction_runner,
+            seeded,
+            run_status=run_status,
+            attempt_status=attempt_status,
+            dispatch_status=dispatch_status,
+        )
+
+        with pytest.raises(HostDurableError, match=message):
+            _build_request(store, seeded)
+
+
 def _options(tmp_path: Path) -> HostDurableStoreOptions:
     """构造测试用 Host durable store options。
 
@@ -388,6 +453,25 @@ def _seed_current_run(
                 call_context_digest=_CALL_CONTEXT_DIGEST,
             ),
         )
+        register_current_instance(
+            transaction,
+            HostInstanceIdentity(
+                host_instance_id="host-run-input",
+                pid=1,
+                process_start_token="run-input-test",
+                boot_id=None,
+            ),
+        )
+        mark_dispatching_after_lane_row(
+            transaction,
+            attempt_id="attempt-current",
+            owner_host_instance_id="host-run-input",
+            lane_name="llm",
+            lane_claim_id="claim-run-input",
+            lane_owner_id="owner-run-input",
+            lane_acquired_at="2026-05-15T01:02:03.000000Z",
+            dispatching_at="2026-05-15T01:02:03.000000Z",
+        )
         return _SeededRun(
             session_id=session_id,
             run_id="run-current",
@@ -397,6 +481,121 @@ def _seed_current_run(
         )
 
     return store.transaction_runner.run_write(operation)
+
+
+def _force_dispatch_snapshot_state(
+    transaction_runner: HostTransactionRunner,
+    seeded: _SeededRun,
+    *,
+    run_status: RunStatus,
+    attempt_status: AttemptStatus,
+    dispatch_status: DispatchRecordStatus,
+) -> None:
+    """强制修改 RunInputBuilder 快照关联 durable 状态。
+
+    :param transaction_runner: Host transaction runner。
+    :param seeded: seeded Run 引用。
+    :param run_status: 目标 Run 状态。
+    :param attempt_status: 目标 Attempt 状态。
+    :param dispatch_status: 目标 dispatch record 状态。
+    :returns: ``None``。
+    """
+
+    def operation(transaction: HostTransaction) -> None:
+        """执行状态改写。
+
+        :param transaction: Host transaction。
+        :returns: ``None``。
+        """
+
+        if run_status in (
+            RunStatus.SUCCEEDED,
+            RunStatus.FAILED,
+            RunStatus.CANCELLED,
+            RunStatus.LOST,
+        ):
+            run_event = EventLogStore().append_event(
+                transaction,
+                _event_request(
+                    event_id="event-force-run-terminal",
+                    event_class=EventClass.CANONICAL_FACT,
+                    session_id=seeded.session_id,
+                    run_id=seeded.run_id,
+                    event_type="RUN_FAILED",
+                    payload={"reason": "force_run_terminal"},
+                ),
+            ).row
+            transaction.execute(
+                "UPDATE host_runs "
+                "SET status = ?, terminal_event_id = ?, "
+                "terminal_event_sequence = ?, terminal_at = ? WHERE run_id = ?",
+                (
+                    run_status.value,
+                    run_event.event_id,
+                    run_event.event_sequence,
+                    "2026-05-15T01:02:04.000000Z",
+                    seeded.run_id,
+                ),
+            )
+        else:
+            transaction.execute(
+                "UPDATE host_runs SET status = ? WHERE run_id = ?",
+                (run_status.value, seeded.run_id),
+            )
+        if attempt_status in (
+            AttemptStatus.SUCCEEDED,
+            AttemptStatus.FAILED,
+            AttemptStatus.CANCELLED,
+            AttemptStatus.SUSPENDED,
+            AttemptStatus.STEERED,
+            AttemptStatus.LOST,
+        ):
+            attempt_event = EventLogStore().append_event(
+                transaction,
+                _event_request(
+                    event_id="event-force-attempt-terminal",
+                    event_class=EventClass.CANONICAL_FACT,
+                    session_id=seeded.session_id,
+                    run_id=seeded.run_id,
+                    event_type="ATTEMPT_CANCELLED",
+                    payload={"reason": "force_attempt_terminal"},
+                ),
+            ).row
+            transaction.execute(
+                "UPDATE host_attempts "
+                "SET status = ?, terminal_event_id = ?, "
+                "terminal_event_sequence = ?, terminal_at = ? WHERE attempt_id = ?",
+                (
+                    attempt_status.value,
+                    attempt_event.event_id,
+                    attempt_event.event_sequence,
+                    "2026-05-15T01:02:04.000000Z",
+                    seeded.attempt_id,
+                ),
+            )
+        else:
+            transaction.execute(
+                "UPDATE host_attempts SET status = ? WHERE attempt_id = ?",
+                (attempt_status.value, seeded.attempt_id),
+            )
+        if dispatch_status == DispatchRecordStatus.PENDING:
+            transaction.execute(
+                "UPDATE host_attempt_dispatch_records "
+                "SET status = ?, owner_host_instance_id = NULL, "
+                "waiting_for_lane_at = NULL, lane_name = NULL, "
+                "lane_claim_id = NULL, lane_owner_id = NULL, "
+                "lane_acquired_at = NULL, dispatching_at = NULL "
+                "WHERE dispatch_record_id = ?",
+                (dispatch_status.value, seeded.dispatch_record_id),
+            )
+        else:
+            transaction.execute(
+                "UPDATE host_attempt_dispatch_records "
+                "SET status = ? WHERE dispatch_record_id = ?",
+                (dispatch_status.value, seeded.dispatch_record_id),
+            )
+
+    transaction_runner.run_write(operation)
 
 
 def _build_request(

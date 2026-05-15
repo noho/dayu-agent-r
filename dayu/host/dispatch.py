@@ -443,7 +443,6 @@ class HostDispatchScheduler:
             await _suppress_task_cancel(task)
         for handle in tuple(self._active_handles):
             _safe_cancel_worker_handle(handle, "scheduler_close")
-            await _safe_close_worker_handle(handle)
         for active_task in tuple(self._active_tasks):
             active_task.cancel()
             await _suppress_task_cancel(active_task)
@@ -844,25 +843,25 @@ class HostDispatchScheduler:
         :returns: ``None``。
         """
 
-        envelope = LocalEngineEnvelope(
-            session_id=self._read_run_session_id(record.run_id),
-            run_id=record.run_id,
-            attempt_id=record.attempt_id,
-            execution_id=record.execution_id,
-            dispatch_record_id=record.dispatch_record_id,
-            worker_kind=record.worker_kind,
-            execution_target=record.execution_target,
-            local_worker_id=handle.local_worker_id,
-            cancellation_token=cancellation_token,
-        )
-        ingestor = EngineEventIngestor(
-            transaction_runner=self._transaction_runner,
-            wakeup_port=self,
-        )
-        worker_event_index = 0
-        terminal_seen = False
-        last_accepted_event_id: str | None = None
         try:
+            envelope = LocalEngineEnvelope(
+                session_id=self._read_run_session_id(record.run_id),
+                run_id=record.run_id,
+                attempt_id=record.attempt_id,
+                execution_id=record.execution_id,
+                dispatch_record_id=record.dispatch_record_id,
+                worker_kind=record.worker_kind,
+                execution_target=record.execution_target,
+                local_worker_id=handle.local_worker_id,
+                cancellation_token=cancellation_token,
+            )
+            ingestor = EngineEventIngestor(
+                transaction_runner=self._transaction_runner,
+                wakeup_port=self,
+            )
+            worker_event_index = 0
+            terminal_seen = False
+            last_accepted_event_id: str | None = None
             events = handle.events()
             while True:
                 try:

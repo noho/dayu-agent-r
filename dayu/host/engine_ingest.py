@@ -1659,21 +1659,40 @@ def _is_preview_event(event: EngineEvent) -> bool:
     """判断 Engine event 是否属于 Phase 5 preview。
 
     :param event: Engine event。
-    :returns: 是 preview 时返回 ``True``。
+    :returns: type 与 data 均匹配 preview 契约时返回 ``True``。
     """
 
-    return event.type in {
-        EngineEventType.ITERATION_STARTED,
-        EngineEventType.CONTENT_DELTA,
-        EngineEventType.REASONING_DELTA,
-        EngineEventType.CONTENT_COMPLETED,
-        EngineEventType.TOOL_CALL_DELTA,
-        EngineEventType.TOOL_CALLS_BATCH_READY,
-        EngineEventType.TOOL_CALL_REQUESTED,
-        EngineEventType.TOOL_RESULT_ACCEPTED,
-        EngineEventType.TOOL_CALLS_BATCH_DONE,
-        EngineEventType.ITERATION_COMPLETED,
-    }
+    return (
+        event.type == EngineEventType.ITERATION_STARTED
+        and isinstance(event.data, IterationStartedData)
+    ) or (
+        event.type == EngineEventType.CONTENT_DELTA
+        and isinstance(event.data, ContentDeltaData)
+    ) or (
+        event.type == EngineEventType.REASONING_DELTA
+        and isinstance(event.data, ReasoningDeltaData)
+    ) or (
+        event.type == EngineEventType.CONTENT_COMPLETED
+        and isinstance(event.data, ContentCompleteData)
+    ) or (
+        event.type == EngineEventType.TOOL_CALL_DELTA
+        and isinstance(event.data, ToolCallDeltaData)
+    ) or (
+        event.type == EngineEventType.TOOL_CALLS_BATCH_READY
+        and isinstance(event.data, ToolCallsBatchReadyData)
+    ) or (
+        event.type == EngineEventType.TOOL_CALL_REQUESTED
+        and isinstance(event.data, ToolCallRequestedData)
+    ) or (
+        event.type == EngineEventType.TOOL_RESULT_ACCEPTED
+        and isinstance(event.data, ToolResultAcceptedData)
+    ) or (
+        event.type == EngineEventType.TOOL_CALLS_BATCH_DONE
+        and isinstance(event.data, ToolCallsBatchDoneData)
+    ) or (
+        event.type == EngineEventType.ITERATION_COMPLETED
+        and isinstance(event.data, IterationCompletedData)
+    )
 
 
 def _preview_payload(context: _ValidatedCandidate) -> Mapping[str, JsonValue]:
