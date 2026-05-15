@@ -57,6 +57,7 @@ from dayu.host.durable.errors import (
     HostDurableError,
     HostIdempotencyConflictError,
     HostPayloadReferenceError,
+    HostTransactionRetryExhaustedError,
 )
 from dayu.host.durable.event_log import (
     EventClass,
@@ -2467,7 +2468,7 @@ class ToolRuntimeExecutor:
             attempt_count += 1
             try:
                 result = self._accept_port.accept_tool_fact(candidate)
-            except TimeoutError:
+            except (HostTransactionRetryExhaustedError, TimeoutError):
                 last_error_code = _TOOL_RUNTIME_ACCEPT_EXCEPTION_REASON
                 result = ToolFactAcceptTimedOut(
                     attempt_count=attempt_count,

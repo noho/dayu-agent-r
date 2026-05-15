@@ -51,6 +51,7 @@ from dayu.host.tool_runtime import (
     ToolSideEffectKind,
 )
 from dayu.host.durable.codec import sha256_digest_json
+from dayu.host.durable.errors import HostTransactionRetryExhaustedError
 from dayu.host.tooling import (
     ToolBundleSourceKind,
     ToolBundleSourceRef,
@@ -189,6 +190,34 @@ class _SequencedAcceptPort(HostToolFactAcceptPort):
         return self._results[index]
 
 
+class _RetryExhaustedAcceptPort(HostToolFactAcceptPort):
+    """始终模拟 durable transaction busy retry exhausted 的 accept port。"""
+
+    def __init__(self) -> None:
+        """初始化 fake accept port。
+
+        :returns: ``None``。
+        """
+
+        self.candidates: list[ToolFactAcceptCandidate] = []
+
+    def accept_tool_fact(
+        self, candidate: ToolFactAcceptCandidate
+    ) -> ToolFactAcceptResult:
+        """记录 candidate 并抛出 transaction retry exhausted。
+
+        :param candidate: 工具事实候选。
+        :returns: 本实现不会正常返回。
+        :raises HostTransactionRetryExhaustedError: 始终抛出以模拟 SQLite busy。
+        """
+
+        self.candidates.append(candidate)
+        raise HostTransactionRetryExhaustedError(
+            "busy retry exhausted in fake accept port",
+            attempts=len(self.candidates),
+        )
+
+
 @pytest.mark.asyncio
 async def test_fake_tool_result_returns_only_after_accepted_ack() -> None:
     """fake tool 原始结果只有 accepted ack 后才返回给 Engine。"""
@@ -265,6 +294,28 @@ async def test_accept_timeout_bounded_retry_returns_governed_error() -> None:
     assert isinstance(record.outcome, ToolFailedOutcome)
     assert record.outcome.result.error == "tool_accept_timeout"
     assert "timeout-raw" not in record.outcome.result.message
+
+
+@pytest.mark.asyncio
+async def test_accept_retry_exhausted_returns_governed_timeout() -> None:
+    """durable transaction retry exhausted 被治理成 accept timeout。"""
+
+    callable_ = _CountingCallable({"secret": "retry-exhausted-raw"})
+    accept_port = _RetryExhaustedAcceptPort()
+    executor = _executor(
+        callable_,
+        accept_port,
+        retry_policy=ToolAcceptRetryPolicy(max_attempts=2, backoff_seconds=0.0),
+    )
+
+    outcome = await executor.execute(_request(_call("tool-call-1")))
+
+    record = outcome.records[0]
+    assert callable_.call_count == 1
+    assert len(accept_port.candidates) == 2
+    assert isinstance(record.outcome, ToolFailedOutcome)
+    assert record.outcome.result.error == "tool_accept_timeout"
+    assert "retry-exhausted-raw" not in record.outcome.result.message
 
 
 @pytest.mark.asyncio
