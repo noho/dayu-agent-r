@@ -80,6 +80,7 @@ from dayu.host.tool_runtime import (
     ToolRuntimeBuildRequest,
     ToolRuntimeExecutionScope,
 )
+from dayu.host.waiting import DefaultHostToolAwaitingAcceptPort
 from dayu.runtime.lane import (
     LaneAcquireCancelled,
     LaneAcquired,
@@ -730,6 +731,11 @@ class HostDispatchScheduler:
                     transaction_runner=self._transaction_runner,
                     event_log_store=self._event_log_store,
                 ),
+                awaiting_accept_port=DefaultHostToolAwaitingAcceptPort(
+                    transaction_runner=self._transaction_runner,
+                    event_log_store=self._event_log_store,
+                ),
+                wait_adapter_registry=tooling_options.wait_adapter_registry,
                 duplicate_governance_registry=self._duplicate_governance_registry,
             )
         )

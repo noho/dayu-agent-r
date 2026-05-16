@@ -3,8 +3,11 @@
 from __future__ import annotations
 
 import asyncio
+from collections.abc import AsyncIterator
 from datetime import UTC, datetime
 from pathlib import Path
+
+import pytest
 
 from dayu.contracts.tool_executor import ToolExecutor
 from dayu.contracts.tool_await import ToolAwaitKind, ToolAwaitSpec
@@ -24,16 +27,41 @@ from dayu.contracts.tool_schema import (
     ToolParametersSchema,
     ToolSchema,
 )
-from dayu.host import AttemptStatus, RunStatus, create_host_command_handle, resolve_wait
-from dayu.host.api import EnsureSessionRequest, WaitAdapterKey
+from dayu.engine.contracts.agent_policy import AgentPolicy
+from dayu.engine.contracts.agent_run import AgentRunRequest
+from dayu.engine.contracts.engine_events import EngineEvent
+from dayu.engine.contracts.runner_spec import RunnerCallOptions, RunnerSpec
+from dayu.host import (
+    AttemptStatus,
+    AuthorizationClaim,
+    HostCallContext,
+    HostInput,
+    HostLocalExecutionOptions,
+    LocalEngineWorker,
+    LocalEngineWorkerFactory,
+    LocalWorkerHandle,
+    OperationContext,
+    RunStatus,
+    StartRunRequest,
+    create_host_command_handle,
+    ensure_session as ensure_public_session,
+    resolve_wait,
+    start_run,
+)
+from dayu.host.admission import PendingDispatchRecord
+from dayu.host.api import AttemptDispatchSnapshot, EnsureSessionRequest, WaitAdapterKey
+from dayu.host.dispatch import HostDispatchScheduler
 from dayu.host.durable.session_lifecycle import ensure_session
 from dayu.host.durable.state import (
+    DispatchRecordRow,
     RunRow,
     WaitRecordRow,
     WaitRecordStatus,
     WaitResumePolicy,
+    WorkerKind,
     read_attempt_by_id,
     read_active_wait_records_for_run,
+    read_dispatch_record_by_attempt_id,
     read_run_by_id,
 )
 from dayu.host.durable.transaction import HostTransactionRunner
@@ -46,6 +74,7 @@ from dayu.host.tool_runtime import (
     ToolRuntimeExecutionScope,
 )
 from dayu.host.tooling import (
+    HostToolingOptions,
     ToolBundleSourceKind,
     ToolBundleSourceRef,
     default_framework_tool_policy_view,
@@ -134,6 +163,109 @@ class _AwaitingBusinessTool:
         )
 
 
+class _HoldingWorkerHandle:
+    """保持 Engine 事件流打开的 fake worker handle。"""
+
+    def __init__(self) -> None:
+        """初始化 fake worker handle。
+
+        :returns: ``None``。
+        """
+
+        self._closed = asyncio.Event()
+        self.cancel_reasons: list[str] = []
+        self.closed = False
+
+    @property
+    def local_worker_id(self) -> str:
+        """返回本地 worker id。
+
+        :returns: 稳定测试 worker id。
+        """
+
+        return "phase7-awaiting-worker"
+
+    async def events(self) -> AsyncIterator[EngineEvent]:
+        """保持 worker event stream 打开直到测试关闭 scheduler。
+
+        :returns: 空 EngineEvent 异步迭代器。
+        """
+
+        await self._closed.wait()
+        if False:
+            yield _unreachable_engine_event()
+
+    def cancel(self, reason: str) -> None:
+        """记录取消请求。
+
+        :param reason: 取消原因。
+        :returns: ``None``。
+        """
+
+        self.cancel_reasons.append(reason)
+        self._closed.set()
+
+    async def close(self) -> None:
+        """关闭 fake worker handle。
+
+        :returns: ``None``。
+        """
+
+        self.closed = True
+        self._closed.set()
+
+
+class _CapturingWorker:
+    """捕获 scheduler 构造出的 Engine request。"""
+
+    def __init__(self, factory: "_CapturingWorkerFactory") -> None:
+        """初始化 worker。
+
+        :param factory: 所属 factory。
+        :returns: ``None``。
+        """
+
+        self._factory = factory
+
+    async def accept(
+        self, snapshot: AttemptDispatchSnapshot, request: AgentRunRequest
+    ) -> LocalWorkerHandle:
+        """接受 scheduler dispatch 请求。
+
+        :param snapshot: dispatch snapshot。
+        :param request: Engine request。
+        :returns: 保持事件流打开的 fake handle。
+        """
+
+        self._factory.accepted_snapshots.append(snapshot)
+        self._factory.accepted_requests.append(request)
+        return self._factory.handle
+
+
+class _CapturingWorkerFactory:
+    """测试用本地 worker factory。"""
+
+    def __init__(self) -> None:
+        """初始化 factory。
+
+        :returns: ``None``。
+        """
+
+        self.accepted_snapshots: list[AttemptDispatchSnapshot] = []
+        self.accepted_requests: list[AgentRunRequest] = []
+        self.handle = _HoldingWorkerHandle()
+
+    def create_worker(self, snapshot: AttemptDispatchSnapshot) -> LocalEngineWorker:
+        """创建捕获请求的 worker。
+
+        :param snapshot: dispatch snapshot。
+        :returns: fake worker。
+        """
+
+        del snapshot
+        return _CapturingWorker(self)
+
+
 def test_phase7_resolve_wait_public_entry_is_importable() -> None:
     """P7 integration 测试集包含 public resolve_wait 入口。"""
 
@@ -215,6 +347,93 @@ def test_local_awaiting_tool_manual_resolve_resumes_run(
         host.close()
 
 
+@pytest.mark.asyncio
+async def test_scheduler_awaiting_tool_enters_waiting_and_manual_resolve_resumes(
+    tmp_path: Path,
+) -> None:
+    """真实 scheduler 生产 ToolRuntime wiring 支持 awaiting -> WAITING -> resume。"""
+
+    host = create_host_command_handle(_options(tmp_path))
+    factory = _CapturingWorkerFactory()
+    tool = _AwaitingBusinessTool()
+    scheduler = await HostDispatchScheduler.open(
+        transaction_runner=host._transaction_runner(),
+        local_execution=_local_execution_options(tmp_path, factory, tool),
+        host_handle_id="phase7-awaiting-production",
+    )
+    try:
+        session = ensure_public_session(
+            host,
+            EnsureSessionRequest(
+                scope="workspace",
+                slot_key="phase7-production",
+                metadata=(),
+            ),
+        )
+        started = start_run(
+            host,
+            StartRunRequest(
+                context=_public_context(),
+                session_id=session.session_id,
+                client_request_id="phase7-production-start",
+                input=HostInput(
+                    display_text="start awaiting production path",
+                    payload_ref=None,
+                    payload_digest=None,
+                ),
+                execution_target="phase7-production-target",
+                queue_policy="queue",
+            ),
+        )
+        pending = _pending_dispatch_from_started_run(
+            host._transaction_runner(), started.current_attempt_id
+        )
+
+        scheduler.wake_dispatch(pending)
+        result = await scheduler.drain_once()
+        request = factory.accepted_requests[0]
+        tool_outcome = await request.tool_executor.execute(
+            _scheduler_awaiting_tool_request(
+                session_id=session.session_id,
+                run_id=started.run_id,
+                request=request,
+            )
+        )
+        wait = _active_wait(host._transaction_runner(), started.run_id)
+        run_before_resolve = _run(host._transaction_runner(), started.run_id)
+        attempt_before_resolve = _attempt_status(
+            host._transaction_runner(), pending.attempt_id
+        )
+
+        assert result.dispatched == 1
+        assert request.disable_tools is False
+        assert isinstance(tool_outcome.records[0].outcome, ToolAwaitingOutcome)
+        assert tool.call_count == 1
+        assert run_before_resolve.status is RunStatus.WAITING
+        assert attempt_before_resolve is AttemptStatus.SUSPENDED
+        assert wait.status is WaitRecordStatus.WAITING
+        assert wait.external_job_ref is not None
+        assert wait.external_job_ref.external_job_id == _RESUME_TOKEN
+
+        resolved = resolve_wait(
+            host,
+            wait.wait_id,
+            _completed_request("phase7-production-manual-resolve"),
+        )
+        resume_dispatch = _dispatch_for_attempt(
+            host._transaction_runner(), resolved.current_attempt_id
+        )
+
+        assert resolved.status is RunStatus.RUNNING
+        assert resolved.current_attempt_id is not None
+        assert resolved.current_attempt_id != pending.attempt_id
+        assert resume_dispatch.run_id == started.run_id
+        assert resume_dispatch.worker_kind is WorkerKind.LOCAL
+    finally:
+        await scheduler.close()
+        host.close()
+
+
 def _seed_active_integration_run(
     transaction_runner: HostTransactionRunner,
 ) -> _SeededWaitingRun:
@@ -279,6 +498,79 @@ def _execute_tool_runtime(
     """
 
     return asyncio.run(tool_executor.execute(request))
+
+
+def _scheduler_awaiting_tool_request(
+    *, session_id: str, run_id: str, request: AgentRunRequest
+) -> BatchToolExecutionRequest:
+    """构造 scheduler 生产 ToolRuntime 的 awaiting 工具请求。
+
+    :param session_id: Session id。
+    :param run_id: Run id。
+    :param request: scheduler 交给 worker 的 Engine request。
+    :returns: 批式工具执行请求。
+    """
+
+    return BatchToolExecutionRequest(
+        calls=(
+            ToolCallRequest(
+                tool_call_id="tool-call-phase7-production-awaiting",
+                name=_TOOL_NAME,
+                arguments={"ticker": "DAYU"},
+                index_in_iteration=0,
+                provider_state=None,
+            ),
+        ),
+        context=BatchToolExecutionContext(
+            run_id=run_id,
+            session_id=session_id,
+            iteration_id="iteration-phase7-production-awaiting",
+            timeout_seconds=10.0,
+            cancellation_token=request.cancellation_token,
+            correlation_id="phase7-production-awaiting",
+        ),
+    )
+
+
+def _pending_dispatch_from_started_run(
+    transaction_runner: HostTransactionRunner, attempt_id: str | None
+) -> PendingDispatchRecord:
+    """从 public start_run 结果读取 pending dispatch 摘要。
+
+    :param transaction_runner: Host transaction runner。
+    :param attempt_id: start_run 创建的 current Attempt id。
+    :returns: pending dispatch 摘要。
+    """
+
+    dispatch = _dispatch_for_attempt(transaction_runner, attempt_id)
+    return PendingDispatchRecord(
+        dispatch_record_id=dispatch.dispatch_record_id,
+        run_id=dispatch.run_id,
+        attempt_id=dispatch.attempt_id,
+        execution_id=dispatch.execution_id,
+        execution_target=dispatch.execution_target,
+        worker_kind=dispatch.worker_kind,
+    )
+
+
+def _dispatch_for_attempt(
+    transaction_runner: HostTransactionRunner, attempt_id: str | None
+) -> DispatchRecordRow:
+    """读取 Attempt 对应 dispatch record。
+
+    :param transaction_runner: Host transaction runner。
+    :param attempt_id: Attempt id。
+    :returns: dispatch record row。
+    """
+
+    assert attempt_id is not None
+    row = transaction_runner.run_read(
+        lambda transaction: read_dispatch_record_by_attempt_id(
+            transaction, attempt_id
+        )
+    )
+    assert row is not None
+    return row
 
 
 def _active_wait(
@@ -357,6 +649,105 @@ def _definition(callable_: _AwaitingBusinessTool) -> ToolDefinition:
         display=None,
         tags=("test",),
     )
+
+
+def _local_execution_options(
+    tmp_path: Path,
+    factory: LocalEngineWorkerFactory,
+    tool: _AwaitingBusinessTool,
+) -> HostLocalExecutionOptions:
+    """构造真实 scheduler 使用的本地执行配置。
+
+    :param tmp_path: pytest 临时目录。
+    :param factory: 本地 worker factory。
+    :param tool: awaiting 业务工具。
+    :returns: HostLocalExecutionOptions。
+    """
+
+    return HostLocalExecutionOptions(
+        lane_db_path=tmp_path / "lane.sqlite3",
+        lane_name="llm",
+        lane_capacity=1,
+        lane_default_timeout_seconds=0.1,
+        lane_claim_ttl_seconds=1.0,
+        lane_heartbeat_interval_seconds=0.1,
+        worker_startup_timeout_seconds=1.0,
+        dispatch_poll_interval_seconds=0.01,
+        runner_spec=_runner_spec(),
+        runner_options=RunnerCallOptions(
+            temperature=None,
+            max_tokens=None,
+            top_p=None,
+            stream=False,
+        ),
+        agent_policy=AgentPolicy(
+            max_iterations=1,
+            continuation_max_attempts=0,
+            allow_tool_calls=True,
+            tool_execution_timeout_seconds=10.0,
+        ),
+        worker_factory=factory,
+        tooling_options=HostToolingOptions(
+            business_tool_bundle=ToolBundle(definitions=(_definition(tool),)),
+            source_refs=(_source_ref(),),
+            framework_tool_policy=default_framework_tool_policy_view(),
+            wait_adapter_registry=_wait_adapter_registry(),
+        ),
+    )
+
+
+def _runner_spec() -> RunnerSpec:
+    """构造支持工具调用的测试 RunnerSpec。
+
+    :returns: RunnerSpec。
+    """
+
+    return RunnerSpec(
+        provider="test",
+        model="test-model",
+        endpoint="https://example.invalid",
+        api_key_ref="secret:test",
+        headers={},
+        supports_tool_calling=True,
+        supports_streaming=False,
+        supports_stream_usage=False,
+        default_timeout_seconds=1.0,
+        max_retries=0,
+        provider_request=None,
+    )
+
+
+def _public_context() -> HostCallContext:
+    """构造 public start_run 调用上下文。
+
+    :returns: HostCallContext。
+    """
+
+    return HostCallContext(
+        actor="analyst",
+        source="pytest",
+        request_id="trace-phase7-production-awaiting",
+        authorization_claims=(AuthorizationClaim(name="role", value="research"),),
+        operation_context=OperationContext(
+            operation_name="phase7_awaiting_production_wiring",
+            operation_kind="unit_test",
+            business_domain="host",
+            business_object_type=None,
+            business_object_id=None,
+            scenario="phase7",
+            correlation_id="corr-phase7-production-awaiting",
+        ),
+    )
+
+
+def _unreachable_engine_event() -> EngineEvent:
+    """构造不可达 EngineEvent 占位。
+
+    :returns: 不会返回。
+    :raises AssertionError: 始终抛出。
+    """
+
+    raise AssertionError("unreachable engine event")
 
 
 def _source_ref() -> ToolBundleSourceRef:

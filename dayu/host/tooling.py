@@ -10,6 +10,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass, field
 from enum import StrEnum
+from typing import TYPE_CHECKING
 
 from dayu.contracts.tool_declaration import ToolBundle
 from dayu.host._public_validation import (
@@ -18,6 +19,9 @@ from dayu.host._public_validation import (
 from dayu.host._public_validation import (
     require_optional_non_empty as _require_optional_non_empty,
 )
+
+if TYPE_CHECKING:
+    from dayu.host.wait_adapter import WaitAdapterRegistry
 
 
 class ToolBundleSourceKind(StrEnum):
@@ -124,6 +128,8 @@ class HostToolingOptions:
     :param business_tool_bundle: 外部装配好的业务 ``ToolBundle``。
     :param source_refs: 解释业务工具来源的引用集合，必须非空。
     :param framework_tool_policy: framework tool 预留名与启用集合视图。
+    :param wait_adapter_registry: 可选等待 adapter registry；仅用于本地
+        ToolRuntime awaiting production wiring，不进入 durable row 或 per-run request。
     """
 
     business_tool_bundle: ToolBundle
@@ -131,6 +137,7 @@ class HostToolingOptions:
     framework_tool_policy: FrameworkToolPolicyView = field(
         default_factory=default_framework_tool_policy_view
     )
+    wait_adapter_registry: WaitAdapterRegistry | None = None
 
     def __post_init__(self) -> None:
         """校验 Host 工具输入选项。

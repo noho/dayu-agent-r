@@ -400,6 +400,15 @@ F2 `WaitPollLost` 测试缺口为当前 PR fix，fix artifact 为
 clean。F3 cross-test helper import coupling deferred 到后续 tests cleanup；F4-F8 低/信息性 hardening 建议均 deferred。
 PR 56 当前 gate 状态为 draft-PR-pass / draft review-ready；是否转 ready-for-review 仍需用户额外授权。
 
+P1-P7 design conformance follow-up fix gate：Controller adjudication artifact
+`docs/reviews/p1-p7-design-conformance-controller-adjudication-20260516.md` 接受 blocking finding
+C-P1P7-001：P7 awaiting production wiring 未接入 `HostDispatchScheduler`。当前 fix gate 在分支
+`fix/host-p1-p7-awaiting-production-wiring` 修复该 production wiring：`HostToolingOptions` 承载 construction-scope
+`wait_adapter_registry`，`HostDispatchScheduler` 在 tool-enabled production path 构造 `ToolRuntimeBuildRequest` 时注入
+`DefaultHostToolAwaitingAcceptPort` 与该 registry；adapter object 仍不进入 per-run request 或 durable wait row。Fix artifact 为
+`docs/reviews/p1-p7-design-conformance-fix-awaiting-production-wiring-20260516.md`。验证结果以该 artifact 为准；本 fix
+不实现 callback endpoint、poller 后台循环、recovery scan、remote worker 或 external job physical cancel。
+
 ## Phase Map
 
 Phase 按依赖关系推进：先实现被其它阶段依赖的公共契约、runtime 基础能力、durable store、EventLog 与状态机，再连接执行路径、工具治理、projection core、memory、context governance、recovery 与 remote。Audit、Tool Trace、Outbox 是独立 projection sinks，后置到核心治理路径稳定之后实现。Phase 0 是 Engine cleanup 前置 work unit，只阻塞 Phase 10 Context Governance，不阻塞 Phase 1-9。每个 phase 开始时仍必须先和用户讨论并细化对应 `docs/host/design.md` 章节，再生成 handoff implementation-ready plan。
