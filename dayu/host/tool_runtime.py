@@ -75,7 +75,10 @@ from dayu.host.durable.state import (
     AttemptRow,
     DispatchRecordRow,
     DispatchRecordStatus,
+    ExternalJobRef,
     RunRow,
+    WaitResumePolicy,
+    WaitSnapshotRef,
     read_attempt_by_id,
     read_dispatch_record_by_attempt_id,
     read_run_by_id,
@@ -85,6 +88,18 @@ from dayu.host.tooling import (
     FrameworkToolName,
     FrameworkToolPolicyView,
     ToolBundleSourceRef,
+)
+from dayu.host.wait_adapter import WaitAdapterBinding, WaitAdapterRegistry
+from dayu.host.waiting import (
+    HostToolAwaitingAcceptPort,
+    ToolAwaitingAcceptCandidate,
+    ToolAwaitingAcceptRejectReason,
+    ToolAwaitingAcceptResult,
+    ToolAwaitingAcceptTimedOut,
+    ToolAwaitingAcceptedAck,
+    ToolAwaitingEventRef,
+    ToolAwaitingRejectedAck,
+    build_tool_awaiting_accept_identity_digest,
 )
 
 _UNSUPPORTED_EXECUTOR_ERROR = "tool_runtime_not_connected"
@@ -109,11 +124,16 @@ _TOOL_RUNTIME_GOVERNED_ERROR = "host_tool_governed_error"
 _TOOL_RUNTIME_POLICY_BLOCKED_ERROR = "tool_call_governed"
 _TOOL_RUNTIME_ACCEPT_REJECTED_ERROR = "tool_accept_rejected"
 _TOOL_RUNTIME_ACCEPT_TIMEOUT_ERROR = "tool_accept_timeout"
+_TOOL_RUNTIME_AWAITING_ACCEPT_REJECTED_ERROR = "tool_awaiting_accept_rejected"
+_TOOL_RUNTIME_AWAITING_ACCEPT_TIMEOUT_ERROR = "tool_awaiting_accept_timeout"
 _TOOL_RUNTIME_UNKNOWN_TOOL_ERROR = "tool_not_found"
 _TOOL_RUNTIME_CALLABLE_FAILED_ERROR = "tool_callable_failed"
 _TOOL_RUNTIME_NO_TOOL_REASON = "tool_call_not_allowed_in_scope"
 _TOOL_RUNTIME_IDEMPOTENCY_REASON = "tool_idempotency_key_required"
 _TOOL_RUNTIME_UNSUPPORTED_AWAITING_REASON = "unsupported_awaiting"
+_TOOL_RUNTIME_AWAITING_BINDING_REASON = "awaiting_adapter_not_configured"
+_TOOL_RUNTIME_AWAITING_EXTERNAL_JOB_REASON = "awaiting_external_job_missing"
+_TOOL_RUNTIME_AWAITING_BATCH_SUSPENDED_REASON = "run_suspended_by_tool_awaiting"
 _TOOL_RUNTIME_ACCEPT_TIMEOUT_REASON = "accept_timeout"
 _TOOL_RUNTIME_ACCEPT_REJECTED_REASON = "accept_rejected"
 _TOOL_RUNTIME_ACCEPT_EXCEPTION_REASON = "accept_ack_lost"
@@ -2073,6 +2093,10 @@ class ToolRuntimeBuildRequest:
     :param effective_bundle_request: effective bundle 构造输入。
     :param execution_scope: 执行期 attempt identity；无则只构造未连接 executor。
     :param accept_port: Host accept barrier；无则只构造未连接 executor。
+    :param awaiting_accept_port: Host awaiting accept barrier；无则 awaiting
+        outcome 返回受治理错误。
+    :param wait_adapter_registry: Host 等待 adapter registry；无则 awaiting
+        outcome 返回受治理错误。
     :param retry_policy: accept ack 有限重试策略。
     :param policy_view: Host 内部工具 policy view。
     :param duplicate_governance_policy: ToolRuntime 使用的 duplicate governance
@@ -2086,6 +2110,8 @@ class ToolRuntimeBuildRequest:
     effective_bundle_request: EffectiveToolBundleBuildRequest
     execution_scope: ToolRuntimeExecutionScope | None = None
     accept_port: HostToolFactAcceptPort | None = None
+    awaiting_accept_port: HostToolAwaitingAcceptPort | None = None
+    wait_adapter_registry: WaitAdapterRegistry | None = None
     retry_policy: ToolAcceptRetryPolicy = field(
         default_factory=_default_tool_accept_retry_policy
     )
@@ -2155,6 +2181,8 @@ class ToolRuntimeExecutor:
         duplicate_governance: DuplicateGovernancePort,
         truncation_port: TruncationPort,
         accept_port: HostToolFactAcceptPort,
+        awaiting_accept_port: HostToolAwaitingAcceptPort | None,
+        wait_adapter_registry: WaitAdapterRegistry | None,
         retry_policy: ToolAcceptRetryPolicy,
         policy_view: ToolRuntimePolicyView,
         diagnostic_emitter: ToolTraceDiagnosticEmitter,
@@ -2168,6 +2196,8 @@ class ToolRuntimeExecutor:
         :param duplicate_governance: duplicate governance 端口。
         :param truncation_port: 截断端口。
         :param accept_port: Host accept barrier。
+        :param awaiting_accept_port: Host awaiting accept barrier。
+        :param wait_adapter_registry: Host 等待 adapter registry。
         :param retry_policy: accept ack 有限重试策略。
         :param policy_view: Host 内部工具 policy view。
         :param diagnostic_emitter: 诊断 emitter。
@@ -2181,6 +2211,8 @@ class ToolRuntimeExecutor:
         self._duplicate_governance = duplicate_governance
         self._truncation_port = truncation_port
         self._accept_port = accept_port
+        self._awaiting_accept_port = awaiting_accept_port
+        self._wait_adapter_registry = wait_adapter_registry
         self._retry_policy = retry_policy
         self._policy_view = policy_view
         self._diagnostic_emitter = diagnostic_emitter
@@ -2195,8 +2227,30 @@ class ToolRuntimeExecutor:
         """
 
         records: list[BatchToolExecutionRecord] = []
+        run_suspended_by_awaiting = False
         for call in request.calls:
-            records.append(await self._execute_one(call, request.context))
+            if run_suspended_by_awaiting:
+                records.append(
+                    BatchToolExecutionRecord(
+                        tool_call_id=call.tool_call_id,
+                        outcome=_governed_failure_outcome(
+                            ToolPolicyDecision(
+                                kind=ToolPolicyDecisionKind.GOVERNED_ERROR,
+                                reason_code=(
+                                    _TOOL_RUNTIME_AWAITING_BATCH_SUSPENDED_REASON
+                                ),
+                                message=(
+                                    "tool batch stopped after awaiting suspension"
+                                ),
+                            )
+                        ),
+                    )
+                )
+                continue
+            record = await self._execute_one(call, request.context)
+            records.append(record)
+            if isinstance(record.outcome, ToolAwaitingOutcome):
+                run_suspended_by_awaiting = True
         return BatchToolExecutionOutcome(records=tuple(records))
 
     async def _execute_one(
@@ -2258,6 +2312,19 @@ class ToolRuntimeExecutor:
             outcome = _governed_failure_outcome(policy_decision)
         else:
             raw_outcome = await self._dispatcher.dispatch_tool_call(call, context)
+            if isinstance(raw_outcome, ToolAwaitingOutcome):
+                return await self._accept_awaiting(
+                    call=call,
+                    context=context,
+                    normalized_arguments_digest=normalized_arguments_digest,
+                    schema_digest=schema_digest,
+                    identity_digest=identity_digest,
+                    awaiting_outcome=raw_outcome,
+                    duplicate_request=duplicate_request,
+                    duplicate_decision=duplicate_decision,
+                    policy_decision=policy_decision,
+                    diagnostic_refs=duplicate_refs,
+                )
             outcome, policy_decision = self._normalize_runtime_outcome(
                 raw_outcome, policy_decision
             )
@@ -2350,6 +2417,167 @@ class ToolRuntimeExecutor:
             outcome=_accept_failure_outcome(accept_result),
         )
 
+    async def _accept_awaiting(
+        self,
+        *,
+        call: ToolCallRequest,
+        context: BatchToolExecutionContext,
+        normalized_arguments_digest: str,
+        schema_digest: str,
+        identity_digest: str,
+        awaiting_outcome: ToolAwaitingOutcome,
+        duplicate_request: DuplicateGovernanceRequest,
+        duplicate_decision: DuplicateDecision,
+        policy_decision: ToolPolicyDecision,
+        diagnostic_refs: tuple[ToolTraceDiagnosticRef, ...],
+    ) -> BatchToolExecutionRecord:
+        """通过 Host awaiting accept path 接受等待型工具 outcome。
+
+        :param call: 单次工具调用请求。
+        :param context: 批式工具执行上下文。
+        :param normalized_arguments_digest: 参数 digest。
+        :param schema_digest: 工具 schema digest。
+        :param identity_digest: 工具身份 digest。
+        :param awaiting_outcome: 工具等待 outcome。
+        :param duplicate_request: duplicate 查询输入。
+        :param duplicate_decision: duplicate 决策。
+        :param policy_decision: 工具治理决策。
+        :param diagnostic_refs: 已发出的 duplicate 诊断 refs。
+        :returns: 单次工具调用记录。
+        """
+
+        if (
+            self._awaiting_accept_port is None
+            or self._wait_adapter_registry is None
+        ):
+            return BatchToolExecutionRecord(
+                tool_call_id=call.tool_call_id,
+                outcome=self._awaiting_configuration_failure(),
+            )
+        binding = self._wait_adapter_registry.resolve_binding(
+            tool_name=call.name,
+            await_kind=awaiting_outcome.await_spec.await_kind,
+        )
+        if binding is None:
+            return BatchToolExecutionRecord(
+                tool_call_id=call.tool_call_id,
+                outcome=self._awaiting_configuration_failure(),
+            )
+        external_job_ref = binding.external_job_ref(awaiting_outcome.await_spec)
+        if (
+            binding.resume_policy is WaitResumePolicy.POLL
+            and external_job_ref is None
+        ):
+            return BatchToolExecutionRecord(
+                tool_call_id=call.tool_call_id,
+                outcome=self._awaiting_external_job_failure(),
+            )
+        snapshot_ref = _wait_snapshot_ref(awaiting_outcome)
+        candidate = _tool_awaiting_accept_candidate(
+            scope=self._execution_scope,
+            call=call,
+            iteration_id=context.iteration_id,
+            tool_schema_digest=schema_digest,
+            tool_identity_digest=identity_digest,
+            normalized_arguments_digest=normalized_arguments_digest,
+            awaiting_outcome=awaiting_outcome,
+            snapshot_ref=snapshot_ref,
+            binding=binding,
+            external_job_ref=external_job_ref,
+            duplicate_decision=duplicate_decision,
+            policy_decision=policy_decision,
+        )
+        accept_result = await self._accept_awaiting_with_retry(candidate)
+        if isinstance(accept_result, ToolAwaitingAcceptedAck):
+            # Awaiting 是等待中间态，不写入 duplicate accepted index；等待
+            # 解析后的工具结果事实由 resolve_wait / resume path 负责。
+            del duplicate_request
+            return BatchToolExecutionRecord(
+                tool_call_id=call.tool_call_id,
+                outcome=awaiting_outcome,
+            )
+        return BatchToolExecutionRecord(
+            tool_call_id=call.tool_call_id,
+            outcome=_awaiting_accept_failure_outcome(accept_result),
+        )
+
+    def _awaiting_configuration_failure(self) -> ToolFailedOutcome:
+        """构造 awaiting adapter 未配置的受治理错误。
+
+        :returns: 工具失败 outcome。
+        """
+
+        self._diagnostic_emitter.emit(
+            ToolTraceDiagnosticRecord(
+                reason_code=_TOOL_RUNTIME_AWAITING_BINDING_REASON,
+                message="ToolAwaitingOutcome has no Host wait adapter binding",
+            )
+        )
+        return _governed_failure_outcome(
+            ToolPolicyDecision(
+                kind=ToolPolicyDecisionKind.GOVERNED_ERROR,
+                reason_code=_TOOL_RUNTIME_AWAITING_BINDING_REASON,
+                message="awaiting adapter binding is not configured",
+            )
+        )
+
+    def _awaiting_external_job_failure(self) -> ToolFailedOutcome:
+        """构造 poll awaiting 缺少外部 job 引用的受治理错误。
+
+        :returns: 工具失败 outcome。
+        """
+
+        self._diagnostic_emitter.emit(
+            ToolTraceDiagnosticRecord(
+                reason_code=_TOOL_RUNTIME_AWAITING_EXTERNAL_JOB_REASON,
+                message="poll awaiting binding did not produce external job ref",
+            )
+        )
+        return _governed_failure_outcome(
+            ToolPolicyDecision(
+                kind=ToolPolicyDecisionKind.GOVERNED_ERROR,
+                reason_code=_TOOL_RUNTIME_AWAITING_EXTERNAL_JOB_REASON,
+                message="poll awaiting requires a durable external job ref",
+            )
+        )
+
+    async def _accept_awaiting_with_retry(
+        self, candidate: ToolAwaitingAcceptCandidate
+    ) -> ToolAwaitingAcceptResult:
+        """通过 Host awaiting accept barrier 有限重试等待 ack。
+
+        :param candidate: awaiting candidate。
+        :returns: awaiting accept 结果；rejected ack 不重试。
+        """
+
+        if self._awaiting_accept_port is None:
+            raise RuntimeError("awaiting accept port is required")
+        attempt_count = 0
+        last_error_code: str | None = None
+        while attempt_count < self._retry_policy.max_attempts:
+            attempt_count += 1
+            try:
+                result = self._awaiting_accept_port.accept_tool_awaiting(
+                    candidate
+                )
+            except (HostTransactionRetryExhaustedError, TimeoutError):
+                last_error_code = _TOOL_RUNTIME_ACCEPT_EXCEPTION_REASON
+                result = ToolAwaitingAcceptTimedOut(
+                    attempt_count=attempt_count,
+                    last_error_code=last_error_code,
+                )
+            if isinstance(result, ToolAwaitingAcceptedAck | ToolAwaitingRejectedAck):
+                return result
+            last_error_code = result.last_error_code
+            if attempt_count >= self._retry_policy.max_attempts:
+                break
+            if self._retry_policy.backoff_seconds > 0:
+                await asyncio.sleep(self._retry_policy.backoff_seconds)
+        return ToolAwaitingAcceptTimedOut(
+            attempt_count=attempt_count,
+            last_error_code=last_error_code,
+        )
+
     def _diagnostic_refs_for_duplicate(
         self, duplicate_decision: DuplicateDecision
     ) -> tuple[ToolTraceDiagnosticRef, ...]:
@@ -2409,26 +2637,17 @@ class ToolRuntimeExecutor:
         outcome: ToolExecutionOutcome,
         policy_decision: ToolPolicyDecision,
     ) -> tuple[ToolExecutionOutcome, ToolPolicyDecision]:
-        """把 P6-S3 不支持的 awaiting outcome 转为 governed error。
+        """归一化普通工具 outcome。
+
+        P7-S2 起 awaiting outcome 已在调用点分流到 Host awaiting accept
+        path；本 helper 当前只保留普通工具 outcome 的扩展点，避免后续治理
+        归一化重新混入 awaiting 分支。
 
         :param outcome: dispatcher 返回的工具 outcome。
         :param policy_decision: 当前治理决策。
         :returns: 可进入 accept path 的 outcome 与 policy decision。
         """
 
-        if isinstance(outcome, ToolAwaitingOutcome):
-            self._diagnostic_emitter.emit(
-                ToolTraceDiagnosticRecord(
-                    reason_code=_TOOL_RUNTIME_UNSUPPORTED_AWAITING_REASON,
-                    message="ToolAwaitingOutcome is unsupported in Phase 6",
-                )
-            )
-            governed_decision = ToolPolicyDecision(
-                kind=ToolPolicyDecisionKind.GOVERNED_ERROR,
-                reason_code=_TOOL_RUNTIME_UNSUPPORTED_AWAITING_REASON,
-                message="awaiting tool outcome is unsupported in this phase",
-            )
-            return _governed_failure_outcome(governed_decision), governed_decision
         return outcome, policy_decision
 
     async def _accept_with_retry(
@@ -2595,6 +2814,8 @@ class DefaultToolRuntimeFactory:
                 duplicate_governance=duplicate_governance,
                 truncation_port=truncation_port,
                 accept_port=request.accept_port,
+                awaiting_accept_port=request.awaiting_accept_port,
+                wait_adapter_registry=request.wait_adapter_registry,
                 retry_policy=request.retry_policy,
                 policy_view=request.policy_view,
                 diagnostic_emitter=diagnostic_emitter,
@@ -4256,6 +4477,102 @@ def _tool_fact_reuse_accept_candidate(
     )
 
 
+def _tool_awaiting_accept_candidate(
+    *,
+    scope: ToolRuntimeExecutionScope,
+    call: ToolCallRequest,
+    iteration_id: str,
+    tool_schema_digest: str,
+    tool_identity_digest: str,
+    normalized_arguments_digest: str,
+    awaiting_outcome: ToolAwaitingOutcome,
+    snapshot_ref: WaitSnapshotRef | None,
+    binding: WaitAdapterBinding,
+    external_job_ref: ExternalJobRef | None,
+    duplicate_decision: DuplicateDecision,
+    policy_decision: ToolPolicyDecision,
+) -> ToolAwaitingAcceptCandidate:
+    """构造 awaiting accept candidate。
+
+    :param scope: ToolRuntime 执行 scope。
+    :param call: 单次工具调用请求。
+    :param iteration_id: Engine iteration id。
+    :param tool_schema_digest: 工具 schema digest。
+    :param tool_identity_digest: 工具身份 digest。
+    :param normalized_arguments_digest: 参数 digest。
+    :param awaiting_outcome: 等待 outcome。
+    :param snapshot_ref: 可选等待快照引用。
+    :param binding: Host wait adapter binding。
+    :param external_job_ref: 可选外部 job 引用。
+    :param duplicate_decision: duplicate governance 决策。
+    :param policy_decision: 工具治理决策。
+    :returns: awaiting accept candidate。
+    """
+
+    base_digest = build_tool_awaiting_accept_identity_digest(
+        session_id=scope.session_id,
+        run_id=scope.run_id,
+        attempt_id=scope.attempt_id,
+        execution_id=scope.execution_id,
+        iteration_id=iteration_id,
+        tool_call_id=call.tool_call_id,
+        tool_name=call.name,
+        await_spec=awaiting_outcome.await_spec,
+        adapter_key=binding.adapter_key.value,
+        resume_policy=binding.resume_policy.value,
+        external_job_id=(
+            external_job_ref.external_job_id if external_job_ref is not None else None
+        ),
+        snapshot_id=snapshot_ref.snapshot_id if snapshot_ref is not None else None,
+        normalized_arguments_digest=normalized_arguments_digest,
+    )
+    semantic_input_digest = sha256_digest_json(
+        {
+            "base_digest": base_digest,
+            "tool_schema_digest": tool_schema_digest,
+            "tool_identity_digest": tool_identity_digest,
+            "policy_decision": _policy_decision_json(policy_decision),
+            "duplicate_decision": _duplicate_decision_json(duplicate_decision),
+        }
+    )
+    digest = semantic_input_digest.removeprefix("sha256:")
+    return ToolAwaitingAcceptCandidate(
+        session_id=scope.session_id,
+        run_id=scope.run_id,
+        attempt_id=scope.attempt_id,
+        execution_id=scope.execution_id,
+        iteration_id=iteration_id,
+        tool_call_id=call.tool_call_id,
+        tool_name=call.name,
+        tool_schema_digest=tool_schema_digest,
+        tool_identity_digest=tool_identity_digest,
+        normalized_arguments_digest=normalized_arguments_digest,
+        await_spec=awaiting_outcome.await_spec,
+        snapshot_ref=snapshot_ref,
+        binding=binding,
+        external_job_ref=external_job_ref,
+        wait_id=f"wait-{digest}",
+        accept_idempotency_key=f"tool-await-{digest}",
+        semantic_input_digest=semantic_input_digest,
+    )
+
+
+def _wait_snapshot_ref(outcome: ToolAwaitingOutcome) -> WaitSnapshotRef | None:
+    """从 awaiting outcome 构造 wait snapshot ref。
+
+    :param outcome: 等待 outcome。
+    :returns: wait snapshot ref；无快照时为 ``None``。
+    """
+
+    if outcome.snapshot is None:
+        return None
+    return WaitSnapshotRef(
+        snapshot_id=outcome.snapshot.snapshot_id,
+        captured_at=outcome.snapshot.captured_at,
+        snapshot_digest=None,
+    )
+
+
 def _tool_fact_kind(
     outcome: ToolExecutionOutcome, policy_decision: ToolPolicyDecision
 ) -> ToolFactKind:
@@ -4452,7 +4769,26 @@ def _tool_outcome_json(outcome: ToolExecutionOutcome) -> JsonValue:
             "meta": _tool_result_meta_json(outcome.meta),
         }
     if isinstance(outcome, ToolAwaitingOutcome):
-        raise TypeError("ToolAwaitingOutcome must be normalized before digest")
+        return {
+            "kind": "awaiting",
+            "await_spec": {
+                "await_kind": outcome.await_spec.await_kind.value,
+                "deadline": (
+                    outcome.await_spec.deadline.isoformat()
+                    if outcome.await_spec.deadline is not None
+                    else None
+                ),
+                "resume_token": outcome.await_spec.resume_token,
+            },
+            "snapshot": (
+                {
+                    "snapshot_id": outcome.snapshot.snapshot_id,
+                    "captured_at": outcome.snapshot.captured_at.isoformat(),
+                }
+                if outcome.snapshot is not None
+                else None
+            ),
+        }
     raise TypeError("unsupported tool outcome")
 
 
@@ -4563,6 +4899,31 @@ def _accept_failure_outcome(
     )
 
 
+def _awaiting_accept_failure_outcome(
+    result: ToolAwaitingRejectedAck | ToolAwaitingAcceptTimedOut,
+) -> ToolFailedOutcome:
+    """把 awaiting accept failure 归一为不含原始业务结果的 governed error。
+
+    :param result: awaiting rejected ack 或 timeout。
+    :returns: governed ``ToolFailedOutcome``。
+    """
+
+    if isinstance(result, ToolAwaitingRejectedAck):
+        return _tool_failed_outcome(
+            error=_TOOL_RUNTIME_AWAITING_ACCEPT_REJECTED_ERROR,
+            message=result.message,
+            hint=(
+                f"{_TOOL_RUNTIME_ACCEPT_REJECTED_REASON}:"
+                f"{result.reason_code.value}"
+            ),
+        )
+    return _tool_failed_outcome(
+        error=_TOOL_RUNTIME_AWAITING_ACCEPT_TIMEOUT_ERROR,
+        message="tool awaiting accept ack timed out",
+        hint=result.last_error_code or _TOOL_RUNTIME_ACCEPT_TIMEOUT_REASON,
+    )
+
+
 __all__ = [
     "DefaultToolDispatcher",
     "DefaultToolRuntimeFactory",
@@ -4585,6 +4946,7 @@ __all__ = [
     "HostEventRef",
     "HostPayloadRef",
     "HostToolFactAcceptPort",
+    "HostToolAwaitingAcceptPort",
     "InMemoryRunLocalDuplicateGovernance",
     "InMemoryRunScopedDuplicateGovernanceRegistry",
     "InMemoryToolTraceDiagnosticEmitter",
@@ -4600,6 +4962,13 @@ __all__ = [
     "ToolFactAcceptedAck",
     "ToolFactKind",
     "ToolFactRejectedAck",
+    "ToolAwaitingAcceptCandidate",
+    "ToolAwaitingAcceptRejectReason",
+    "ToolAwaitingAcceptResult",
+    "ToolAwaitingAcceptTimedOut",
+    "ToolAwaitingAcceptedAck",
+    "ToolAwaitingEventRef",
+    "ToolAwaitingRejectedAck",
     "ToolPolicyDecision",
     "ToolPolicyDecisionKind",
     "ToolRuntimeExecutionScope",
