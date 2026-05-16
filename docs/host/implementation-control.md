@@ -473,7 +473,17 @@ implementation、双路 code review、accepted finding fix、双路 code re-revi
 `docs/reviews/host-phase8-aggregate-re-review-mimo-20260516.md`、
 `docs/reviews/host-phase8-aggregate-re-review-ds-20260516.md` 与
 `docs/reviews/host-phase8-aggregate-re-review-controller-adjudication-20260516.md`。两路 re-review 均 PASS，blocking count 为
-0。当前 gate 为 Phase 8 accepted deepreview commit。
+0。Phase 8 accepted deepreview commit 为 `5b2b92e`。Ready validation 期间发现 dispatch ToolRuntime wiring
+测试夹具未保持 worker stream 打开，已通过
+`docs/reviews/host-phase8-readiness-validation-fix-20260516.md` 修复，修复提交为 `57975fe`。最终验证为
+`pytest tests/host -q` 435 passed、`python -m pyright dayu/ tests/ utils/` 0 errors、`git diff --check`
+clean。Phase 8 状态为 completed，当前 gate 为 ready-to-open-draft-PR。Phase 8 exit accepted：committed EventLog
+consumer framework、projection checkpoint / failure store、typed consumer contract、Host EventLog-backed event stream cursor
+truth regression coverage、minimal RunResult / Session timeline read model、internal repair helper 与 rebuild tests 均已落地。
+Phase 8 remaining risks / owners：automatic after-commit projection catch-up 归 Phase 9 owner；heavy sink /
+batch-transaction runner 归 Phase 13 / Phase 15 owner；per-session repair filter 归 Phase 15 owner；RunResult summary refs
+接入 public `RunSnapshot` 归 Phase 9 / Phase 15 或后续 public read enhancement owner；Audit / Tool Trace / Outbox
+concrete sinks 归 Phase 13 owner。
 
 ## Phase Map
 
