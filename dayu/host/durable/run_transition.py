@@ -26,6 +26,7 @@ from dayu.host.durable.codec import format_utc_timestamp
 from dayu.host.durable.event_log import (
     EventClass,
     EventLogAppendRequest,
+    EventLogRow,
     EventLogStore,
 )
 from dayu.host.durable.errors import HostDurableError
@@ -39,6 +40,9 @@ from dayu.host.durable.state import (
     RunMutationResult,
     RunStartReason,
     StateMutationStatus,
+    WaitRecordMutationResult,
+    WaitRecordRow,
+    WaitRecordStatus,
     WorkerKind,
     cancel_cancelling_run_row,
     cancel_running_attempt_row,
@@ -49,15 +53,21 @@ from dayu.host.durable.state import (
     insert_attempt,
     insert_dispatch_record,
     insert_run,
+    mark_wait_record_failed_row,
+    mark_wait_record_lost_row,
+    mark_wait_record_resolved_row,
     mark_attempt_running_row,
     mark_dispatch_worker_accepted_row,
     mark_run_cancelling_row,
     promote_queued_run_row,
     read_active_run_for_session,
+    read_active_wait_records_for_run,
     read_attempt_by_id,
     read_dispatch_record_by_attempt_id,
     read_earliest_queued_run,
     read_run_by_id,
+    read_wait_record_by_id,
+    resume_waiting_run_row,
     terminal_attempt_row,
     terminal_run_row,
 )
@@ -78,6 +88,8 @@ _EVENT_TYPE_ATTEMPT_LOST = "ATTEMPT_LOST"
 _EVENT_TYPE_RUN_SUCCEEDED = "RUN_SUCCEEDED"
 _EVENT_TYPE_RUN_FAILED = "RUN_FAILED"
 _EVENT_TYPE_RUN_LOST = "RUN_LOST"
+_EVENT_TYPE_RESUME_REQUESTED = "RESUME_REQUESTED"
+_EVENT_TYPE_TOOL_RESULT_ACCEPTED = "TOOL_RESULT_ACCEPTED"
 
 
 class PromotionSkipReason(StrEnum):
@@ -267,6 +279,96 @@ class TerminalCloseoutInput:
 
 
 @dataclass(frozen=True, slots=True)
+class ResumeRunFromWaitingInput:
+    """waiting Run 恢复为新 Attempt 的 transition 输入。
+
+    :param wait_id: 被 resolve 的 wait record id。
+    :param run_id: wait 所属 Run id。
+    :param suspended_attempt_id: 产生等待并已 SUSPENDED 的 Attempt id。
+    :param resume_attempt_id: 新建 resume Attempt id。
+    :param resume_execution_id: 新建 execution id。
+    :param resume_dispatch_record_id: 新建 dispatch record id。
+    :param resume_requested_event_id: 调用方生成的 ``RESUME_REQUESTED`` id。
+    :param tool_result_event_id: 调用方生成的 ``TOOL_RESULT_ACCEPTED`` id。
+    :param run_started_event_id: 调用方生成的 resume ``RUN_STARTED`` id。
+    :param attempt_started_event_id: 调用方生成的 ``ATTEMPT_STARTED`` id。
+    :param occurred_at: canonical facts 的发生时间。
+    :param actor: 事件 actor。
+    :param source: 事件 source。
+    :param resolution_idempotency_key: resolve wait 幂等键。
+    :param resolution_digest: resolve wait 语义 digest。
+    :param resume_requested_payload: ``RESUME_REQUESTED`` payload。
+    :param tool_result_payload: ``TOOL_RESULT_ACCEPTED`` payload。
+    :param tool_result_payload_ref: EventLog payload descriptor 引用；无则为 ``None``。
+    :param tool_result_payload_digest: EventLog payload digest；无则为 ``None``。
+    :param worker_kind: resume Attempt 的 worker 类型。
+    :param owner_host_instance_id: owner Host instance id；无则为 ``None``。
+    """
+
+    wait_id: str
+    run_id: str
+    suspended_attempt_id: str
+    resume_attempt_id: str
+    resume_execution_id: str
+    resume_dispatch_record_id: str
+    resume_requested_event_id: str
+    tool_result_event_id: str
+    run_started_event_id: str
+    attempt_started_event_id: str
+    occurred_at: datetime
+    actor: str
+    source: str
+    resolution_idempotency_key: str
+    resolution_digest: str
+    resume_requested_payload: JsonValue
+    tool_result_payload: JsonValue
+    tool_result_payload_ref: str | None
+    tool_result_payload_digest: str | None
+    worker_kind: WorkerKind
+    owner_host_instance_id: str | None
+
+
+@dataclass(frozen=True, slots=True)
+class WaitingRunTerminalInput:
+    """waiting Run 因等待结果失败或 lost 收口的 transition 输入。
+
+    :param wait_id: 被 resolve 的 wait record id。
+    :param run_id: wait 所属 Run id。
+    :param suspended_attempt_id: 产生等待并已 SUSPENDED 的 Attempt id。
+    :param tool_result_event_id: 调用方生成的 ``TOOL_RESULT_ACCEPTED`` id。
+    :param run_terminal_event_id: 调用方生成的 ``RUN_FAILED`` 或 ``RUN_LOST`` id。
+    :param run_terminal_status: 目标 Run 终态，只允许 failed 或 lost。
+    :param wait_terminal_status: 目标 wait 终态，只允许 failed 或 lost。
+    :param occurred_at: canonical facts 的发生时间。
+    :param actor: 事件 actor。
+    :param source: 事件 source。
+    :param reason: terminal reason。
+    :param resolution_idempotency_key: resolve wait 幂等键。
+    :param resolution_digest: resolve wait 语义 digest。
+    :param tool_result_payload: ``TOOL_RESULT_ACCEPTED`` payload。
+    :param tool_result_payload_ref: EventLog payload descriptor 引用；无则为 ``None``。
+    :param tool_result_payload_digest: EventLog payload digest；无则为 ``None``。
+    """
+
+    wait_id: str
+    run_id: str
+    suspended_attempt_id: str
+    tool_result_event_id: str
+    run_terminal_event_id: str
+    run_terminal_status: RunStatus
+    wait_terminal_status: WaitRecordStatus
+    occurred_at: datetime
+    actor: str
+    source: str
+    reason: str
+    resolution_idempotency_key: str
+    resolution_digest: str
+    tool_result_payload: JsonValue
+    tool_result_payload_ref: str | None
+    tool_result_payload_digest: str | None
+
+
+@dataclass(frozen=True, slots=True)
 class AcceptWorkerRunningInput:
     """WorkerProxy accepted 后推进 Attempt RUNNING 的输入。
 
@@ -446,6 +548,32 @@ class PromotionResult:
     attempt: AttemptRow | None
     dispatch_record: DispatchRecordRow | None
     skip_reason: str | None
+
+
+@dataclass(frozen=True, slots=True)
+class WaitResolutionTransitionResult:
+    """wait resolution transition helper 结果。
+
+    :param status: transition 结果分类。
+    :param run: 最新 Run row。
+    :param attempt: resume Attempt；未创建时为 ``None``。
+    :param dispatch_record: resume dispatch record；未创建时为 ``None``。
+    :param wait_record: 最新 wait record row。
+    :param resume_requested_event: ``RESUME_REQUESTED`` row；未创建时为 ``None``。
+    :param tool_result_event: ``TOOL_RESULT_ACCEPTED`` row；未创建时为 ``None``。
+    :param run_event: ``RUN_STARTED`` / ``RUN_FAILED`` / ``RUN_LOST`` row。
+    :param attempt_started_event: ``ATTEMPT_STARTED`` row；未创建时为 ``None``。
+    """
+
+    status: StateMutationStatus
+    run: RunRow | None
+    attempt: AttemptRow | None
+    dispatch_record: DispatchRecordRow | None
+    wait_record: WaitRecordRow | None
+    resume_requested_event: EventLogRow | None
+    tool_result_event: EventLogRow | None
+    run_event: EventLogRow | None
+    attempt_started_event: EventLogRow | None
 
 
 def create_queued_run_in_transaction(
@@ -666,6 +794,259 @@ def promote_queued_run_in_transaction(
             transaction, request.attempt_id
         ),
         skip_reason=None,
+    )
+
+
+def resume_run_from_waiting_in_transaction(
+    transaction: HostTransaction,
+    event_log_store: EventLogStore,
+    request: ResumeRunFromWaitingInput,
+) -> WaitResolutionTransitionResult:
+    """resolve wait 成功后把 waiting Run 原子恢复为新 STARTING Attempt。
+
+    :param transaction: 调用方提供的 Host transaction。
+    :param event_log_store: EventLog append primitive。
+    :param request: waiting resume 输入。
+    :returns: wait resolution transition 结果。
+    :raises HostDurableError: 输入字段或 SQLite 写入无效时由底层抛出。
+    """
+
+    _validate_resume_waiting_input(request)
+    run = read_run_by_id(transaction, request.run_id)
+    source_attempt = read_attempt_by_id(transaction, request.suspended_attempt_id)
+    wait_record = read_wait_record_by_id(transaction, request.wait_id)
+    invalid = _invalid_waiting_resolution_precondition(
+        transaction=transaction,
+        run=run,
+        source_attempt=source_attempt,
+        wait_record=wait_record,
+        run_id=request.run_id,
+        suspended_attempt_id=request.suspended_attempt_id,
+    )
+    if invalid is not None:
+        return invalid
+    if run is None or source_attempt is None or wait_record is None:
+        raise HostDurableError("resume waiting precondition narrowing failed")
+
+    resume_requested = event_log_store.append_event(
+        transaction, _resume_requested_event_request(request, run)
+    ).row
+    tool_result = event_log_store.append_event(
+        transaction, _waiting_tool_result_event_request(request, run)
+    ).row
+    terminal_at = format_utc_timestamp(request.occurred_at)
+    wait_result = mark_wait_record_resolved_row(
+        transaction,
+        wait_id=request.wait_id,
+        resolve_idempotency_key=request.resolution_idempotency_key,
+        resolve_semantic_digest=request.resolution_digest,
+        updated_event_id=tool_result.event_id,
+        updated_event_sequence=tool_result.event_sequence,
+        updated_at=terminal_at,
+        terminal_at=terminal_at,
+    )
+    wait_result = _require_wait_record_mutation_updated(
+        wait_result, mutation_name="resolve wait record"
+    )
+    run_started = event_log_store.append_event(
+        transaction,
+        _resume_run_started_event_request(
+            request=request,
+            run=run,
+            resume_requested=resume_requested,
+            tool_result=tool_result,
+        ),
+    ).row
+    attempt_started = event_log_store.append_event(
+        transaction, _resume_attempt_started_event_request(request, run)
+    ).row
+    attempt = _resume_attempt_row(
+        request=request,
+        started_event_id=attempt_started.event_id,
+        started_event_sequence=attempt_started.event_sequence,
+        created_at=terminal_at,
+    )
+    dispatch_record = _resume_dispatch_record_row(
+        request=request,
+        run=run,
+        created_event_id=attempt_started.event_id,
+        created_event_sequence=attempt_started.event_sequence,
+        created_at=terminal_at,
+    )
+    insert_attempt(transaction, attempt)
+    run_result = resume_waiting_run_row(
+        transaction,
+        session_id=run.session_id,
+        run_id=run.run_id,
+        suspended_attempt_id=source_attempt.attempt_id,
+        resumed_attempt_id=request.resume_attempt_id,
+        started_event_id=run_started.event_id,
+        started_event_sequence=run_started.event_sequence,
+        updated_at=terminal_at,
+    )
+    run_result = _require_run_mutation_updated(
+        run_result, mutation_name="resume waiting Run"
+    )
+    insert_dispatch_record(transaction, dispatch_record)
+    return WaitResolutionTransitionResult(
+        status=run_result.status,
+        run=run_result.row,
+        attempt=read_attempt_by_id(transaction, request.resume_attempt_id),
+        dispatch_record=read_dispatch_record_by_attempt_id(
+            transaction, request.resume_attempt_id
+        ),
+        wait_record=wait_result.row,
+        resume_requested_event=resume_requested,
+        tool_result_event=tool_result,
+        run_event=run_started,
+        attempt_started_event=attempt_started,
+    )
+
+
+def fail_run_from_waiting_in_transaction(
+    transaction: HostTransaction,
+    event_log_store: EventLogStore,
+    request: WaitingRunTerminalInput,
+) -> WaitResolutionTransitionResult:
+    """resolve wait 失败后把 waiting Run 原子收口为 FAILED。
+
+    :param transaction: 调用方提供的 Host transaction。
+    :param event_log_store: EventLog append primitive。
+    :param request: waiting terminal 输入。
+    :returns: wait resolution transition 结果。
+    :raises HostDurableError: 输入字段或 SQLite 写入无效时由底层抛出。
+    """
+
+    return _terminal_run_from_waiting_in_transaction(
+        transaction=transaction,
+        event_log_store=event_log_store,
+        request=request,
+        expected_run_status=RunStatus.FAILED,
+        expected_wait_status=WaitRecordStatus.FAILED,
+    )
+
+
+def mark_run_lost_from_waiting_in_transaction(
+    transaction: HostTransaction,
+    event_log_store: EventLogStore,
+    request: WaitingRunTerminalInput,
+) -> WaitResolutionTransitionResult:
+    """resolve wait lost 后把 waiting Run 原子收口为 LOST。
+
+    :param transaction: 调用方提供的 Host transaction。
+    :param event_log_store: EventLog append primitive。
+    :param request: waiting terminal 输入。
+    :returns: wait resolution transition 结果。
+    :raises HostDurableError: 输入字段或 SQLite 写入无效时由底层抛出。
+    """
+
+    return _terminal_run_from_waiting_in_transaction(
+        transaction=transaction,
+        event_log_store=event_log_store,
+        request=request,
+        expected_run_status=RunStatus.LOST,
+        expected_wait_status=WaitRecordStatus.LOST,
+    )
+
+
+def _terminal_run_from_waiting_in_transaction(
+    *,
+    transaction: HostTransaction,
+    event_log_store: EventLogStore,
+    request: WaitingRunTerminalInput,
+    expected_run_status: RunStatus,
+    expected_wait_status: WaitRecordStatus,
+) -> WaitResolutionTransitionResult:
+    """按显式终态收口 waiting Run。
+
+    :param transaction: 调用方提供的 Host transaction。
+    :param event_log_store: EventLog append primitive。
+    :param request: waiting terminal 输入。
+    :param expected_run_status: 调用路径允许的 Run 终态。
+    :param expected_wait_status: 调用路径允许的 wait 终态。
+    :returns: wait resolution transition 结果。
+    """
+
+    _validate_waiting_terminal_input(
+        request,
+        expected_run_status=expected_run_status,
+        expected_wait_status=expected_wait_status,
+    )
+    run = read_run_by_id(transaction, request.run_id)
+    source_attempt = read_attempt_by_id(transaction, request.suspended_attempt_id)
+    wait_record = read_wait_record_by_id(transaction, request.wait_id)
+    invalid = _invalid_waiting_resolution_precondition(
+        transaction=transaction,
+        run=run,
+        source_attempt=source_attempt,
+        wait_record=wait_record,
+        run_id=request.run_id,
+        suspended_attempt_id=request.suspended_attempt_id,
+    )
+    if invalid is not None:
+        return invalid
+    if run is None or source_attempt is None or wait_record is None:
+        raise HostDurableError("terminal waiting precondition narrowing failed")
+
+    tool_result = event_log_store.append_event(
+        transaction, _waiting_tool_result_event_request(request, run)
+    ).row
+    terminal_at = format_utc_timestamp(request.occurred_at)
+    if expected_wait_status is WaitRecordStatus.FAILED:
+        wait_result = mark_wait_record_failed_row(
+            transaction,
+            wait_id=request.wait_id,
+            resolve_idempotency_key=request.resolution_idempotency_key,
+            resolve_semantic_digest=request.resolution_digest,
+            updated_event_id=tool_result.event_id,
+            updated_event_sequence=tool_result.event_sequence,
+            updated_at=terminal_at,
+            terminal_at=terminal_at,
+        )
+    elif expected_wait_status is WaitRecordStatus.LOST:
+        wait_result = mark_wait_record_lost_row(
+            transaction,
+            wait_id=request.wait_id,
+            resolve_idempotency_key=request.resolution_idempotency_key,
+            resolve_semantic_digest=request.resolution_digest,
+            updated_event_id=tool_result.event_id,
+            updated_event_sequence=tool_result.event_sequence,
+            updated_at=terminal_at,
+            terminal_at=terminal_at,
+        )
+    else:
+        raise HostDurableError("waiting terminal wait status is invalid")
+    wait_result = _require_wait_record_mutation_updated(
+        wait_result, mutation_name="terminal wait record"
+    )
+    run_terminal = event_log_store.append_event(
+        transaction,
+        _waiting_run_terminal_event_request(
+            request=request, run=run, tool_result=tool_result
+        ),
+    ).row
+    run_result = terminal_run_row(
+        transaction,
+        run_id=run.run_id,
+        current_attempt_id=source_attempt.attempt_id,
+        terminal_status=request.run_terminal_status,
+        terminal_event_id=run_terminal.event_id,
+        terminal_event_sequence=run_terminal.event_sequence,
+        terminal_at=terminal_at,
+    )
+    run_result = _require_run_mutation_updated(
+        run_result, mutation_name="terminal waiting Run"
+    )
+    return WaitResolutionTransitionResult(
+        status=run_result.status,
+        run=run_result.row,
+        attempt=None,
+        dispatch_record=None,
+        wait_record=wait_result.row,
+        resume_requested_event=None,
+        tool_result_event=tool_result,
+        run_event=run_terminal,
+        attempt_started_event=None,
     )
 
 
@@ -1191,6 +1572,25 @@ def _require_attempt_mutation_updated(
     return result
 
 
+def _require_wait_record_mutation_updated(
+    result: WaitRecordMutationResult, *, mutation_name: str
+) -> WaitRecordMutationResult:
+    """断言 wait record mutation 已完成。
+
+    :param result: 低层 wait record mutation 结果。
+    :param mutation_name: mutation 语义名称，用于错误信息。
+    :returns: ``UPDATED`` 的原始 mutation 结果。
+    :raises HostDurableError: mutation 不是 ``UPDATED`` 时抛出以触发事务回滚。
+    """
+
+    if result.status != StateMutationStatus.UPDATED:
+        _raise_after_event_append_mutation_failure(
+            mutation_name=mutation_name,
+            status=result.status,
+        )
+    return result
+
+
 def _require_dispatch_record_mutation_updated(
     result: DispatchRecordMutationResult, *, mutation_name: str
 ) -> DispatchRecordMutationResult:
@@ -1462,6 +1862,201 @@ def _promotion_attempt_started_event_request(
     )
 
 
+def _resume_requested_event_request(
+    request: ResumeRunFromWaitingInput, run: RunRow
+) -> EventLogAppendRequest:
+    """构造 ``RESUME_REQUESTED`` EventLog append request。
+
+    :param request: resume waiting 输入。
+    :param run: 目标 Run row。
+    :returns: EventLog append request。
+    """
+
+    return EventLogAppendRequest(
+        event_id=request.resume_requested_event_id,
+        event_class=EventClass.CANONICAL_FACT,
+        session_id=run.session_id,
+        run_id=run.run_id,
+        attempt_id=request.suspended_attempt_id,
+        execution_id=None,
+        event_type=_EVENT_TYPE_RESUME_REQUESTED,
+        occurred_at=request.occurred_at,
+        actor=request.actor,
+        source=request.source,
+        client_request_id=None,
+        idempotency_key=request.resolution_idempotency_key,
+        policy_decision=None,
+        reason={"reason": "wait_resolved"},
+        payload_json=request.resume_requested_payload,
+        payload_ref=None,
+        payload_digest=None,
+    )
+
+
+def _waiting_tool_result_event_request(
+    request: ResumeRunFromWaitingInput | WaitingRunTerminalInput,
+    run: RunRow,
+) -> EventLogAppendRequest:
+    """构造 wait resolution ``TOOL_RESULT_ACCEPTED`` EventLog append request。
+
+    :param request: resume 或 terminal waiting 输入。
+    :param run: 目标 Run row。
+    :returns: EventLog append request。
+    """
+
+    return EventLogAppendRequest(
+        event_id=request.tool_result_event_id,
+        event_class=EventClass.CANONICAL_FACT,
+        session_id=run.session_id,
+        run_id=run.run_id,
+        attempt_id=request.suspended_attempt_id,
+        execution_id=None,
+        event_type=_EVENT_TYPE_TOOL_RESULT_ACCEPTED,
+        occurred_at=request.occurred_at,
+        actor=request.actor,
+        source=request.source,
+        client_request_id=None,
+        idempotency_key=request.resolution_idempotency_key,
+        policy_decision=None,
+        reason={"reason": "wait_resolution"},
+        payload_json=request.tool_result_payload,
+        payload_ref=request.tool_result_payload_ref,
+        payload_digest=request.tool_result_payload_digest,
+    )
+
+
+def _resume_run_started_event_request(
+    *,
+    request: ResumeRunFromWaitingInput,
+    run: RunRow,
+    resume_requested: EventLogRow,
+    tool_result: EventLogRow,
+) -> EventLogAppendRequest:
+    """构造 resume ``RUN_STARTED`` EventLog append request。
+
+    :param request: resume waiting 输入。
+    :param run: 目标 Run row。
+    :param resume_requested: 已追加的 ``RESUME_REQUESTED`` row。
+    :param tool_result: 已追加的 ``TOOL_RESULT_ACCEPTED`` row。
+    :returns: EventLog append request。
+    """
+
+    return EventLogAppendRequest(
+        event_id=request.run_started_event_id,
+        event_class=EventClass.CANONICAL_FACT,
+        session_id=run.session_id,
+        run_id=run.run_id,
+        attempt_id=None,
+        execution_id=None,
+        event_type=_EVENT_TYPE_RUN_STARTED,
+        occurred_at=request.occurred_at,
+        actor=request.actor,
+        source=request.source,
+        client_request_id=run.client_request_id,
+        idempotency_key=request.resolution_idempotency_key,
+        policy_decision=None,
+        reason={"start_reason": RunStartReason.RESUME.value},
+        payload_json={
+            "run_id": run.run_id,
+            "start_reason": RunStartReason.RESUME.value,
+            "accepted_event_id": run.accepted_event_id,
+            "accepted_event_sequence": run.accepted_event_sequence,
+            "attempt_id": request.resume_attempt_id,
+            "dispatch_record_id": request.resume_dispatch_record_id,
+            "wait_id": request.wait_id,
+            "source_attempt_id": request.suspended_attempt_id,
+            "resume_requested_event_ref": _event_ref_json_from_row(
+                resume_requested
+            ),
+            "tool_result_event_ref": _event_ref_json_from_row(tool_result),
+        },
+        payload_ref=None,
+        payload_digest=None,
+    )
+
+
+def _resume_attempt_started_event_request(
+    request: ResumeRunFromWaitingInput, run: RunRow
+) -> EventLogAppendRequest:
+    """构造 resume ``ATTEMPT_STARTED`` EventLog append request。
+
+    :param request: resume waiting 输入。
+    :param run: 目标 Run row。
+    :returns: EventLog append request。
+    """
+
+    return EventLogAppendRequest(
+        event_id=request.attempt_started_event_id,
+        event_class=EventClass.CANONICAL_FACT,
+        session_id=run.session_id,
+        run_id=run.run_id,
+        attempt_id=request.resume_attempt_id,
+        execution_id=request.resume_execution_id,
+        event_type=_EVENT_TYPE_ATTEMPT_STARTED,
+        occurred_at=request.occurred_at,
+        actor=request.actor,
+        source=request.source,
+        client_request_id=None,
+        idempotency_key=request.resolution_idempotency_key,
+        policy_decision=None,
+        reason=None,
+        payload_json={
+            "attempt_id": request.resume_attempt_id,
+            "execution_id": request.resume_execution_id,
+            "dispatch_record_id": request.resume_dispatch_record_id,
+            "worker_kind": request.worker_kind.value,
+            "execution_target": run.execution_target,
+            "owner_host_instance_id": request.owner_host_instance_id,
+            "wait_id": request.wait_id,
+            "source_attempt_id": request.suspended_attempt_id,
+        },
+        payload_ref=None,
+        payload_digest=None,
+    )
+
+
+def _waiting_run_terminal_event_request(
+    *,
+    request: WaitingRunTerminalInput,
+    run: RunRow,
+    tool_result: EventLogRow,
+) -> EventLogAppendRequest:
+    """构造 waiting resolve terminal Run event request。
+
+    :param request: waiting terminal 输入。
+    :param run: 目标 Run row。
+    :param tool_result: 已追加的 ``TOOL_RESULT_ACCEPTED`` row。
+    :returns: EventLog append request。
+    """
+
+    return EventLogAppendRequest(
+        event_id=request.run_terminal_event_id,
+        event_class=EventClass.CANONICAL_FACT,
+        session_id=run.session_id,
+        run_id=run.run_id,
+        attempt_id=request.suspended_attempt_id,
+        execution_id=None,
+        event_type=_run_terminal_event_type(request.run_terminal_status),
+        occurred_at=request.occurred_at,
+        actor=request.actor,
+        source=request.source,
+        client_request_id=None,
+        idempotency_key=request.resolution_idempotency_key,
+        policy_decision=None,
+        reason={"reason": request.reason},
+        payload_json={
+            "run_id": run.run_id,
+            "attempt_id": request.suspended_attempt_id,
+            "wait_id": request.wait_id,
+            "terminal_status": request.run_terminal_status.value,
+            "reason": request.reason,
+            "tool_result_event_ref": _event_ref_json_from_row(tool_result),
+        },
+        payload_ref=None,
+        payload_digest=None,
+    )
+
+
 def _attempt_running_event_request(
     *,
     request: AcceptWorkerRunningInput,
@@ -1679,6 +2274,19 @@ def _run_cancelled_event_request(
         payload_ref=None,
         payload_digest=None,
     )
+
+
+def _event_ref_json_from_row(row: EventLogRow) -> JsonValue:
+    """把 EventLog row 投影成事件引用 JSON。
+
+    :param row: EventLog row。
+    :returns: JSON mapping。
+    """
+
+    return {
+        "event_id": row.event_id,
+        "event_sequence": row.event_sequence,
+    }
 
 
 def _attempt_terminal_event_request(
@@ -2131,6 +2739,83 @@ def _promotion_dispatch_record_row(
     )
 
 
+def _resume_attempt_row(
+    *,
+    request: ResumeRunFromWaitingInput,
+    started_event_id: str,
+    started_event_sequence: int,
+    created_at: str,
+) -> AttemptRow:
+    """构造 resume STARTING Attempt row。
+
+    :param request: resume waiting 输入。
+    :param started_event_id: ATTEMPT_STARTED event id。
+    :param started_event_sequence: ATTEMPT_STARTED event sequence。
+    :param created_at: 创建 timestamp。
+    :returns: Attempt row。
+    """
+
+    return AttemptRow(
+        attempt_id=request.resume_attempt_id,
+        run_id=request.run_id,
+        execution_id=request.resume_execution_id,
+        status=AttemptStatus.STARTING,
+        started_event_id=started_event_id,
+        started_event_sequence=started_event_sequence,
+        terminal_event_id=None,
+        terminal_event_sequence=None,
+        created_at=created_at,
+        updated_at=created_at,
+        terminal_at=None,
+    )
+
+
+def _resume_dispatch_record_row(
+    *,
+    request: ResumeRunFromWaitingInput,
+    run: RunRow,
+    created_event_id: str,
+    created_event_sequence: int,
+    created_at: str,
+) -> DispatchRecordRow:
+    """构造 resume pending dispatch record row。
+
+    :param request: resume waiting 输入。
+    :param run: 目标 Run row。
+    :param created_event_id: ATTEMPT_STARTED event id。
+    :param created_event_sequence: ATTEMPT_STARTED event sequence。
+    :param created_at: 创建 timestamp。
+    :returns: dispatch record row。
+    """
+
+    return DispatchRecordRow(
+        dispatch_record_id=request.resume_dispatch_record_id,
+        run_id=run.run_id,
+        attempt_id=request.resume_attempt_id,
+        execution_id=request.resume_execution_id,
+        status=DispatchRecordStatus.PENDING,
+        worker_kind=request.worker_kind,
+        execution_target=run.execution_target,
+        owner_host_instance_id=request.owner_host_instance_id,
+        created_event_id=created_event_id,
+        created_event_sequence=created_event_sequence,
+        waiting_for_lane_at=None,
+        lane_name=None,
+        lane_claim_id=None,
+        lane_owner_id=None,
+        lane_acquired_at=None,
+        dispatching_at=None,
+        worker_accepted_at=None,
+        worker_accept_event_id=None,
+        worker_accept_event_sequence=None,
+        cancelled_event_id=None,
+        cancelled_event_sequence=None,
+        created_at=created_at,
+        updated_at=created_at,
+        cancelled_at=None,
+    )
+
+
 def _invalid_terminal_precondition(
     run: RunRow | None, attempt: AttemptRow | None, attempt_id: str
 ) -> RunTransitionResult | None:
@@ -2167,6 +2852,79 @@ def _invalid_terminal_precondition(
             run=run,
             attempt=attempt,
             dispatch_record=None,
+        )
+    return None
+
+
+def _invalid_waiting_resolution_precondition(
+    *,
+    transaction: HostTransaction,
+    run: RunRow | None,
+    source_attempt: AttemptRow | None,
+    wait_record: WaitRecordRow | None,
+    run_id: str,
+    suspended_attempt_id: str,
+) -> WaitResolutionTransitionResult | None:
+    """检查 waiting resolve 前置状态。
+
+    :param transaction: 当前 Host transaction。
+    :param run: 目标 Run row。
+    :param source_attempt: 源 Attempt row。
+    :param wait_record: 目标 wait record row。
+    :param run_id: 请求中的 Run id。
+    :param suspended_attempt_id: 请求中的 SUSPENDED Attempt id。
+    :returns: 前置失败时返回 transition 结果，否则为 ``None``。
+    """
+
+    if run is None:
+        return WaitResolutionTransitionResult(
+            status=StateMutationStatus.NOT_FOUND,
+            run=None,
+            attempt=source_attempt,
+            dispatch_record=None,
+            wait_record=wait_record,
+            resume_requested_event=None,
+            tool_result_event=None,
+            run_event=None,
+            attempt_started_event=None,
+        )
+    if source_attempt is None or wait_record is None:
+        return WaitResolutionTransitionResult(
+            status=StateMutationStatus.NOT_FOUND,
+            run=run,
+            attempt=source_attempt,
+            dispatch_record=None,
+            wait_record=wait_record,
+            resume_requested_event=None,
+            tool_result_event=None,
+            run_event=None,
+            attempt_started_event=None,
+        )
+    active_waits = read_active_wait_records_for_run(transaction, run_id)
+    if (
+        run.status != RunStatus.WAITING
+        or run.current_attempt_id != suspended_attempt_id
+        or source_attempt.run_id != run.run_id
+        or source_attempt.status != AttemptStatus.SUSPENDED
+        or wait_record.run_id != run.run_id
+        or wait_record.attempt_id != source_attempt.attempt_id
+        or wait_record.status != WaitRecordStatus.WAITING
+        or len(active_waits) != 1
+        or active_waits[0].wait_id != wait_record.wait_id
+        or run.terminal_event_id is not None
+        or run.terminal_event_sequence is not None
+        or run.terminal_at is not None
+    ):
+        return WaitResolutionTransitionResult(
+            status=StateMutationStatus.INVALID_STATE,
+            run=run,
+            attempt=source_attempt,
+            dispatch_record=None,
+            wait_record=wait_record,
+            resume_requested_event=None,
+            tool_result_event=None,
+            run_event=None,
+            attempt_started_event=None,
         )
     return None
 
@@ -2489,6 +3247,98 @@ def _validate_promote_input(request: PromoteQueuedRunInput) -> None:
         raise ValueError("worker_kind is invalid")
     _require_optional_non_empty_text(
         request.owner_host_instance_id, field_name="owner_host_instance_id"
+    )
+
+
+def _validate_resume_waiting_input(request: ResumeRunFromWaitingInput) -> None:
+    """校验 waiting resume 输入。
+
+    :param request: waiting resume 输入。
+    :returns: ``None``。
+    :raises HostDurableError: 任一字段无效时抛出。
+    """
+
+    _require_non_empty_text(request.wait_id, field_name="wait_id")
+    _require_non_empty_text(request.run_id, field_name="run_id")
+    _require_non_empty_text(
+        request.suspended_attempt_id, field_name="suspended_attempt_id"
+    )
+    _require_non_empty_text(request.resume_attempt_id, field_name="resume_attempt_id")
+    _require_non_empty_text(request.resume_execution_id, field_name="resume_execution_id")
+    _require_non_empty_text(
+        request.resume_dispatch_record_id, field_name="resume_dispatch_record_id"
+    )
+    _require_non_empty_text(
+        request.resume_requested_event_id, field_name="resume_requested_event_id"
+    )
+    _require_non_empty_text(request.tool_result_event_id, field_name="tool_result_event_id")
+    _require_non_empty_text(request.run_started_event_id, field_name="run_started_event_id")
+    _require_non_empty_text(
+        request.attempt_started_event_id, field_name="attempt_started_event_id"
+    )
+    _require_non_empty_text(request.actor, field_name="actor")
+    _require_non_empty_text(request.source, field_name="source")
+    _require_non_empty_text(
+        request.resolution_idempotency_key,
+        field_name="resolution_idempotency_key",
+    )
+    _require_sha256_digest(request.resolution_digest, field_name="resolution_digest")
+    _require_optional_non_empty_text(
+        request.tool_result_payload_ref, field_name="tool_result_payload_ref"
+    )
+    _require_optional_sha256_digest(
+        request.tool_result_payload_digest,
+        field_name="tool_result_payload_digest",
+    )
+    if not isinstance(request.worker_kind, WorkerKind):
+        raise HostDurableError("worker_kind is invalid")
+    _require_optional_non_empty_text(
+        request.owner_host_instance_id, field_name="owner_host_instance_id"
+    )
+
+
+def _validate_waiting_terminal_input(
+    request: WaitingRunTerminalInput,
+    *,
+    expected_run_status: RunStatus,
+    expected_wait_status: WaitRecordStatus,
+) -> None:
+    """校验 waiting terminal 输入。
+
+    :param request: waiting terminal 输入。
+    :param expected_run_status: 调用路径允许的 Run 终态。
+    :param expected_wait_status: 调用路径允许的 wait 终态。
+    :returns: ``None``。
+    :raises HostDurableError: 任一字段无效时抛出。
+    """
+
+    _require_non_empty_text(request.wait_id, field_name="wait_id")
+    _require_non_empty_text(request.run_id, field_name="run_id")
+    _require_non_empty_text(
+        request.suspended_attempt_id, field_name="suspended_attempt_id"
+    )
+    _require_non_empty_text(request.tool_result_event_id, field_name="tool_result_event_id")
+    _require_non_empty_text(
+        request.run_terminal_event_id, field_name="run_terminal_event_id"
+    )
+    if request.run_terminal_status is not expected_run_status:
+        raise HostDurableError("waiting terminal Run status is invalid")
+    if request.wait_terminal_status is not expected_wait_status:
+        raise HostDurableError("waiting terminal wait status is invalid")
+    _require_non_empty_text(request.actor, field_name="actor")
+    _require_non_empty_text(request.source, field_name="source")
+    _require_non_empty_text(request.reason, field_name="reason")
+    _require_non_empty_text(
+        request.resolution_idempotency_key,
+        field_name="resolution_idempotency_key",
+    )
+    _require_sha256_digest(request.resolution_digest, field_name="resolution_digest")
+    _require_optional_non_empty_text(
+        request.tool_result_payload_ref, field_name="tool_result_payload_ref"
+    )
+    _require_optional_sha256_digest(
+        request.tool_result_payload_digest,
+        field_name="tool_result_payload_digest",
     )
 
 

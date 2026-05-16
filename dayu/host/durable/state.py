@@ -2511,6 +2511,93 @@ def mark_run_waiting_row(
     )
 
 
+def resume_waiting_run_row(
+    transaction: HostTransaction,
+    *,
+    session_id: str,
+    run_id: str,
+    suspended_attempt_id: str,
+    resumed_attempt_id: str,
+    started_event_id: str,
+    started_event_sequence: int,
+    updated_at: str,
+) -> RunMutationResult:
+    """CAS 将 waiting Run 恢复为 running 并切换 current Attempt。
+
+    :param transaction: 调用方提供的 Host transaction。
+    :param session_id: Run 所属 Session id。
+    :param run_id: 目标 Run id。
+    :param suspended_attempt_id: 期望的原 SUSPENDED Attempt id。
+    :param resumed_attempt_id: 新建 resume Attempt id。
+    :param started_event_id: ``RUN_STARTED`` resume 事件 id。
+    :param started_event_sequence: ``RUN_STARTED`` resume 事件序号。
+    :param updated_at: 固定 UTC 更新时间文本。
+    :returns: Run mutation 结果，区分 updated/cas_lost/not_found/invalid_state。
+    :raises HostDurableError: 输入字段无效时抛出。
+    """
+
+    _validate_run_start_update(
+        session_id=session_id,
+        run_id=run_id,
+        started_event_id=started_event_id,
+        started_event_sequence=started_event_sequence,
+        current_attempt_id=resumed_attempt_id,
+        updated_at=updated_at,
+    )
+    _require_non_empty_text(
+        suspended_attempt_id, field_name="suspended_attempt_id"
+    )
+    result = transaction.execute(
+        f"""
+        UPDATE {TABLE_HOST_RUNS}
+        SET
+          status = ?,
+          started_event_id = ?,
+          started_event_sequence = ?,
+          current_attempt_id = ?,
+          updated_at = ?
+        WHERE run_id = ?
+          AND session_id = ?
+          AND status = ?
+          AND current_attempt_id = ?
+          AND terminal_event_id IS NULL
+          AND terminal_event_sequence IS NULL
+          AND terminal_at IS NULL
+          AND NOT EXISTS (
+            SELECT 1
+            FROM {TABLE_HOST_RUNS} active_run
+            WHERE active_run.session_id = ?
+              AND active_run.run_id <> ?
+              AND active_run.status IN (?, ?, ?, ?)
+          )
+        """,
+        (
+            serialize_run_status(RunStatus.RUNNING),
+            started_event_id,
+            started_event_sequence,
+            resumed_attempt_id,
+            updated_at,
+            run_id,
+            session_id,
+            serialize_run_status(RunStatus.WAITING),
+            suspended_attempt_id,
+            session_id,
+            run_id,
+            serialize_run_status(RunStatus.RUNNING),
+            serialize_run_status(RunStatus.WAITING),
+            serialize_run_status(RunStatus.CANCELLING),
+            serialize_run_status(RunStatus.RECOVERING),
+        ),
+    )
+    return _run_mutation_result(
+        transaction,
+        run_id=run_id,
+        rowcount=result.rowcount,
+        expected_status=RunStatus.WAITING,
+        cas_lost_when_expected=True,
+    )
+
+
 def terminal_run_row(
     transaction: HostTransaction,
     *,

@@ -8,6 +8,7 @@ LocalProxy、ToolRuntime 执行、Memory projection 或 Context Governance。
 
 from __future__ import annotations
 
+import json
 from collections.abc import Mapping
 from dataclasses import dataclass
 from enum import StrEnum
@@ -65,12 +66,16 @@ _EVENT_TYPE_USER_INPUT_ACCEPTED = "USER_INPUT_ACCEPTED"
 _EVENT_TYPE_RUN_ACCEPTED = "RUN_ACCEPTED"
 _EVENT_TYPE_RUN_STARTED = "RUN_STARTED"
 _EVENT_TYPE_RUN_SUCCEEDED = "RUN_SUCCEEDED"
+_EVENT_TYPE_TOOL_RESULT_ACCEPTED = "TOOL_RESULT_ACCEPTED"
 _PAYLOAD_FIELD_DISPLAY_TEXT = "display_text"
 _PAYLOAD_FIELD_OPERATION_KIND = "operation_kind"
 _PAYLOAD_FIELD_EXECUTION_TARGET = "execution_target"
 _PAYLOAD_FIELD_FINAL_ANSWER = "final_answer"
 _PAYLOAD_FIELD_CONTENT = "content"
 _PAYLOAD_FIELD_SUMMARY_TEXT = "summary_text"
+_PAYLOAD_FIELD_START_REASON = "start_reason"
+_PAYLOAD_FIELD_TOOL_RESULT_EVENT_REF = "tool_result_event_ref"
+_PAYLOAD_FIELD_EVENT_ID = "event_id"
 _NO_TOOL_CANCEL_MESSAGE = "tools are disabled for this attempt"
 
 
@@ -473,12 +478,16 @@ class DurableSessionContinuityProvider:
             session_id=snapshot.session_id,
             before_event_sequence=current_facts.attempt.started_event_sequence,
         )
-        return SessionContinuityView(
-            messages=_successful_run_continuity_messages(
-                events=events,
-                current_run_id=snapshot.run_id,
-            )
+        historical = _successful_run_continuity_messages(
+            events=events,
+            current_run_id=snapshot.run_id,
         )
+        resume_message = _resume_wait_message_from_current_start(
+            transaction, current_facts
+        )
+        if resume_message is None:
+            return SessionContinuityView(messages=historical)
+        return SessionContinuityView(messages=(*historical, resume_message))
 
 
 class NoopMemorySnapshotProvider:
@@ -1058,6 +1067,72 @@ def _continuity_message_from_event(event: EventLogRow) -> AgentMessage | None:
             tool_calls=(),
         )
     return None
+
+
+def _resume_wait_message_from_current_start(
+    transaction: HostTransaction, current_facts: CurrentRunFacts
+) -> SystemMessage | None:
+    """从当前 resume ``RUN_STARTED`` 重建 wait result fact message。
+
+    :param transaction: Host durable transaction。
+    :param current_facts: 当前 Run facts。
+    :returns: resume wait fact system message；非 resume Attempt 返回 ``None``。
+    :raises HostDurableError: resume payload 或引用事件无法投影时抛出。
+    """
+
+    start_payload = _payload_object(current_facts.run_started_event)
+    start_reason = _optional_payload_text(
+        start_payload, field_name=_PAYLOAD_FIELD_START_REASON
+    )
+    if start_reason != "resume":
+        return None
+    tool_result_event_id = _event_id_from_payload_ref(
+        start_payload, field_name=_PAYLOAD_FIELD_TOOL_RESULT_EVENT_REF
+    )
+    tool_result_event = read_event_by_id(transaction, tool_result_event_id)
+    if tool_result_event is None:
+        raise HostDurableError("resume tool result event not found")
+    _require_event(
+        tool_result_event,
+        expected_type=_EVENT_TYPE_TOOL_RESULT_ACCEPTED,
+    )
+    payload = _payload_object(tool_result_event)
+    content = "\n".join(
+        (
+            "Accepted wait result fact:",
+            f"wait_id={_required_payload_text(payload, field_name='wait_id')}",
+            "tool_call_id="
+            f"{_required_payload_text(payload, field_name='tool_call_id')}",
+            f"tool_name={_required_payload_text(payload, field_name='tool_name')}",
+            "resolution_kind="
+            f"{_required_payload_text(payload, field_name='resolution_kind')}",
+            "tool_fact_kind="
+            f"{_required_payload_text(payload, field_name='tool_fact_kind')}",
+            "result="
+            f"{json.dumps(payload.get('result'), sort_keys=True, separators=(',', ':'))}",
+        )
+    )
+    return SystemMessage(role=AgentMessageRole.SYSTEM, content=content)
+
+
+def _event_id_from_payload_ref(
+    payload: Mapping[str, JsonValue], *, field_name: str
+) -> str:
+    """从 payload 中读取嵌套 event ref 的 event_id。
+
+    :param payload: payload 映射。
+    :param field_name: event ref 字段名。
+    :returns: event_id 文本。
+    :raises HostDurableError: 字段缺失或类型非法时抛出。
+    """
+
+    value = payload.get(field_name)
+    if not isinstance(value, Mapping):
+        raise HostDurableError(f"payload field {field_name} must be event ref")
+    event_id = value.get(_PAYLOAD_FIELD_EVENT_ID)
+    if not isinstance(event_id, str) or event_id.strip() == "":
+        raise HostDurableError(f"payload field {field_name}.event_id is invalid")
+    return event_id
 
 
 def _successful_run_continuity_messages(

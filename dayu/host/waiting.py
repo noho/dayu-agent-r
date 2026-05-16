@@ -7,17 +7,36 @@ wait record，并把 Run / Attempt 推进到 ``WAITING`` / ``SUSPENDED``。
 
 from __future__ import annotations
 
+from collections.abc import Mapping
 from dataclasses import dataclass
 from datetime import UTC, datetime
 from enum import StrEnum
 
+from dayu.contracts.json_value import JsonValue
+from dayu.contracts.tool_outcome import ToolCancelledOutcome
+from dayu.contracts.tool_result import ToolResultFailure, ToolResultMeta, ToolResultSuccess
 from dayu.contracts.tool_await import ToolAwaitSpec
 from dayu.host._event_payload import (
     attempt_suspended_payload,
+    resume_requested_payload,
     run_waiting_payload,
     tool_awaiting_payload,
+    tool_result_wait_resolution_payload,
 )
-from dayu.host.api import AttemptStatus, RunStatus
+from dayu.host.api import (
+    AttemptStatus,
+    HostApiError,
+    HostApiErrorCode,
+    HostPayloadRef,
+    ResolveWaitCancelledOutcome,
+    ResolveWaitCompletedOutcome,
+    ResolveWaitFailedOutcome,
+    ResolveWaitLostOutcome,
+    ResolveWaitOutcome,
+    ResolveWaitRequest,
+    RunStatus,
+    WaitProviderStatusRef,
+)
 from dayu.host.durable.codec import format_utc_timestamp, sha256_digest_json
 from dayu.host.durable.event_log import (
     EventClass,
@@ -32,9 +51,18 @@ from dayu.host.durable.idempotency import (
     IdempotencyScope,
     IdempotencyStore,
 )
+from dayu.host.durable.run_transition import (
+    ResumeRunFromWaitingInput,
+    WaitingRunTerminalInput,
+    fail_run_from_waiting_in_transaction,
+    mark_run_lost_from_waiting_in_transaction,
+    resume_run_from_waiting_in_transaction,
+)
 from dayu.host.durable.state import (
     DispatchRecordStatus,
+    DispatchRecordRow,
     ExternalJobRef,
+    RunRow,
     StateMutationStatus,
     WaitRecordRow,
     WaitRecordStatus,
@@ -47,6 +75,8 @@ from dayu.host.durable.state import (
     read_dispatch_record_by_attempt_id,
     read_run_by_id,
     read_wait_record_by_id,
+    run_snapshot_from_row,
+    WorkerKind,
 )
 from dayu.host.durable.transaction import HostTransaction, HostTransactionRunner
 from dayu.host.wait_adapter import WaitAdapterBinding
@@ -56,11 +86,30 @@ _TOOL_AWAITING_ACCEPT_RESULT_KIND = "tool_awaiting_accept_ack"
 _EVENT_TYPE_TOOL_AWAITING = "TOOL_AWAITING"
 _EVENT_TYPE_RUN_WAITING = "RUN_WAITING"
 _EVENT_TYPE_ATTEMPT_SUSPENDED = "ATTEMPT_SUSPENDED"
+_WAIT_RESOLUTION_SCOPE_KIND = "wait_resolution"
+_WAIT_RESOLUTION_RESULT_KIND = "wait_resolution"
 _AWAITING_ACCEPT_ACTOR = "host.tool_runtime"
 _AWAITING_ACCEPT_SOURCE = "host.tool_runtime.awaiting_accept"
 _EVENT_ID_TOOL_AWAITING_PREFIX = "event-tool-awaiting-"
 _EVENT_ID_RUN_WAITING_PREFIX = "event-run-waiting-"
 _EVENT_ID_ATTEMPT_SUSPENDED_PREFIX = "event-attempt-suspended-"
+_EVENT_ID_RESUME_REQUESTED_PREFIX = "event-resume-requested-"
+_EVENT_ID_WAIT_TOOL_RESULT_PREFIX = "event-tool-result-wait-resolution-"
+_EVENT_ID_RESUME_RUN_STARTED_PREFIX = "event-run-started-resume-"
+_EVENT_ID_RESUME_ATTEMPT_STARTED_PREFIX = "event-attempt-started-resume-"
+_EVENT_ID_WAIT_RUN_FAILED_PREFIX = "event-run-failed-wait-resolution-"
+_EVENT_ID_WAIT_RUN_LOST_PREFIX = "event-run-lost-wait-resolution-"
+_RESUME_ATTEMPT_ID_PREFIX = "attempt-resume-"
+_RESUME_EXECUTION_ID_PREFIX = "execution-resume-"
+_RESUME_DISPATCH_ID_PREFIX = "dispatch-resume-"
+_TOOL_FACT_ID_PREFIX = "tool-fact-wait-"
+_TOOL_FACT_KIND_COMPLETED = "completed"
+_TOOL_FACT_KIND_FAILED = "failed"
+_TOOL_FACT_KIND_CANCELLED = "cancelled"
+_TOOL_FACT_KIND_LOST = "lost"
+_WAIT_RESOLUTION_SOURCE = "host.resolve_wait"
+_WAIT_TERMINAL_REASON_FAILED = "wait_result_failed"
+_WAIT_TERMINAL_REASON_LOST = "wait_result_lost"
 
 
 class _AwaitingAcceptStateConflictError(HostDurableError):
@@ -231,6 +280,50 @@ ToolAwaitingAcceptResult = (
     ToolAwaitingAcceptedAck | ToolAwaitingRejectedAck | ToolAwaitingAcceptTimedOut
 )
 """awaiting accept 结果封闭联合。"""
+
+
+@dataclass(frozen=True, slots=True)
+class ResolveWaitResult:
+    """resolve wait command 内部结果。
+
+    :param run: resolve 后最新 Run row。
+    :param dispatch_record: 新建 resume dispatch record；无则为 ``None``。
+    :param idempotent_replay: 本次是否为幂等重放。
+    """
+
+    run: RunRow
+    dispatch_record: DispatchRecordRow | None
+    idempotent_replay: bool
+
+
+@dataclass(frozen=True, slots=True)
+class _ResolveWaitEventPlan:
+    """resolve wait 派生 id 规划。"""
+
+    suffix: str
+    tool_fact_id: str
+    resume_requested_event_id: str
+    tool_result_event_id: str
+    run_started_event_id: str
+    attempt_started_event_id: str
+    run_failed_event_id: str
+    run_lost_event_id: str
+    resume_attempt_id: str
+    resume_execution_id: str
+    resume_dispatch_record_id: str
+
+
+@dataclass(frozen=True, slots=True)
+class _WaitResolutionPayloadPlan:
+    """resolve wait transition payload 规划。"""
+
+    resolution_kind: str
+    tool_fact_kind: str
+    outcome_digest: str
+    payload_digest: str | None
+    payload_ref: HostPayloadRef | None
+    provider_status_ref: WaitProviderStatusRef | None
+    result_json: JsonValue
 
 
 class HostToolAwaitingAcceptPort:
@@ -408,6 +501,408 @@ class DefaultHostToolAwaitingAcceptPort(HostToolAwaitingAcceptPort):
         )
 
 
+class DefaultHostResolveWaitService:
+    """基于 Host durable store 的 resolve wait command service。"""
+
+    def __init__(
+        self,
+        *,
+        transaction_runner: HostTransactionRunner,
+        event_log_store: EventLogStore | None = None,
+        idempotency_store: IdempotencyStore | None = None,
+    ) -> None:
+        """初始化默认 resolve wait service。
+
+        :param transaction_runner: Host durable transaction runner。
+        :param event_log_store: EventLog primitive；无则创建默认实现。
+        :param idempotency_store: Idempotency primitive；无则创建默认实现。
+        :returns: ``None``。
+        """
+
+        self._transaction_runner = transaction_runner
+        self._event_log_store = (
+            event_log_store if event_log_store is not None else EventLogStore()
+        )
+        self._idempotency_store = (
+            idempotency_store
+            if idempotency_store is not None
+            else IdempotencyStore()
+        )
+
+    def resolve_wait(self, wait_id: str, request: ResolveWaitRequest) -> ResolveWaitResult:
+        """接收等待结果并推进 Run。
+
+        :param wait_id: wait record id。
+        :param request: typed resolve wait 请求。
+        :returns: resolve 后最新 Run 与可选 resume dispatch。
+        :raises HostApiError: wait 缺失、状态非法或幂等冲突时抛出。
+        """
+
+        if wait_id.strip() == "":
+            raise HostApiError(
+                code=HostApiErrorCode.INVALID_STATE,
+                message="wait_id must be non-empty",
+                retryable=False,
+            )
+        try:
+            return self._transaction_runner.run_write(
+                lambda transaction: self._resolve_in_transaction(
+                    transaction, wait_id, request
+                )
+            )
+        except HostIdempotencyConflictError as exc:
+            raise HostApiError(
+                code=HostApiErrorCode.IDEMPOTENCY_CONFLICT,
+                message="resolve wait idempotency conflict",
+                retryable=False,
+            ) from exc
+
+    def _resolve_in_transaction(
+        self,
+        transaction: HostTransaction,
+        wait_id: str,
+        request: ResolveWaitRequest,
+    ) -> ResolveWaitResult:
+        """在单个 Host write transaction 内执行 resolve wait。
+
+        :param transaction: 当前 Host transaction。
+        :param wait_id: wait record id。
+        :param request: typed resolve wait 请求。
+        :returns: resolve 结果。
+        """
+
+        wait_record = read_wait_record_by_id(transaction, wait_id)
+        if wait_record is None:
+            raise HostApiError(
+                code=HostApiErrorCode.NOT_FOUND,
+                message="wait record not found",
+                retryable=False,
+            )
+        scope = _wait_resolution_scope(wait_id, request.idempotency_key)
+        resolution_digest = _wait_resolution_digest(wait_id, request)
+        if wait_record.status in (
+            WaitRecordStatus.RESOLVED,
+            WaitRecordStatus.FAILED,
+            WaitRecordStatus.LOST,
+        ):
+            return self._replay_terminal_resolution(
+                transaction=transaction,
+                wait_record=wait_record,
+                scope=scope,
+                resolution_digest=resolution_digest,
+            )
+        if wait_record.status is not WaitRecordStatus.WAITING:
+            raise HostApiError(
+                code=HostApiErrorCode.INVALID_STATE,
+                message="wait record is not resolvable",
+                retryable=False,
+            )
+        existing = self._idempotency_store.read_idempotency_record(
+            transaction, scope
+        )
+        if existing is not None:
+            if existing.semantic_input_digest != resolution_digest:
+                raise HostApiError(
+                    code=HostApiErrorCode.IDEMPOTENCY_CONFLICT,
+                    message="resolve wait idempotency conflict",
+                    retryable=False,
+                )
+            return _resolve_wait_result_from_existing(transaction, wait_record)
+
+        payload_plan = _wait_resolution_payload_plan(request)
+        event_plan = _resolve_wait_event_plan(resolution_digest)
+        if isinstance(
+            request.outcome,
+            (ResolveWaitCompletedOutcome, ResolveWaitCancelledOutcome),
+        ):
+            result = self._resolve_resume(
+                transaction=transaction,
+                wait_record=wait_record,
+                request=request,
+                resolution_digest=resolution_digest,
+                event_plan=event_plan,
+                payload_plan=payload_plan,
+            )
+        elif isinstance(request.outcome, ResolveWaitFailedOutcome):
+            result = self._resolve_failed(
+                transaction=transaction,
+                wait_record=wait_record,
+                request=request,
+                resolution_digest=resolution_digest,
+                event_plan=event_plan,
+                payload_plan=payload_plan,
+            )
+        elif isinstance(request.outcome, ResolveWaitLostOutcome):
+            result = self._resolve_lost(
+                transaction=transaction,
+                wait_record=wait_record,
+                request=request,
+                resolution_digest=resolution_digest,
+                event_plan=event_plan,
+                payload_plan=payload_plan,
+            )
+        else:
+            raise HostApiError(
+                code=HostApiErrorCode.INVALID_STATE,
+                message="resolve wait outcome is invalid",
+                retryable=False,
+            )
+        created_event = result.dispatch_record
+        created_event_id = (
+            result.run.started_event_id
+            if created_event is not None
+            else result.run.terminal_event_id
+        )
+        created_event_sequence = (
+            result.run.started_event_sequence
+            if created_event is not None
+            else result.run.terminal_event_sequence
+        )
+        self._idempotency_store.record_idempotent_result(
+            transaction,
+            scope,
+            resolution_digest,
+            IdempotencyResultRef(
+                result_kind=_WAIT_RESOLUTION_RESULT_KIND,
+                result_ref=wait_id,
+                created_event_id=created_event_id,
+                created_event_sequence=created_event_sequence,
+            ),
+        )
+        return result
+
+    def _replay_terminal_resolution(
+        self,
+        *,
+        transaction: HostTransaction,
+        wait_record: WaitRecordRow,
+        scope: IdempotencyScope,
+        resolution_digest: str,
+    ) -> ResolveWaitResult:
+        """重放已完成的 resolved/failed wait resolution。
+
+        :param transaction: 当前 Host transaction。
+        :param wait_record: 已终态 wait record。
+        :param scope: resolve wait 幂等作用域。
+        :param resolution_digest: 本次请求 digest。
+        :returns: 幂等重放结果。
+        :raises HostApiError: 不存在相同幂等记录或 digest 冲突时抛出。
+        """
+
+        record = self._idempotency_store.read_idempotency_record(
+            transaction, scope
+        )
+        if record is None:
+            raise HostApiError(
+                code=HostApiErrorCode.INVALID_STATE,
+                message="wait record is already resolved by another key",
+                retryable=False,
+            )
+        if record.semantic_input_digest != resolution_digest:
+            raise HostApiError(
+                code=HostApiErrorCode.IDEMPOTENCY_CONFLICT,
+                message="resolve wait idempotency conflict",
+                retryable=False,
+            )
+        return _resolve_wait_result_from_existing(transaction, wait_record)
+
+    def _resolve_resume(
+        self,
+        *,
+        transaction: HostTransaction,
+        wait_record: WaitRecordRow,
+        request: ResolveWaitRequest,
+        resolution_digest: str,
+        event_plan: _ResolveWaitEventPlan,
+        payload_plan: _WaitResolutionPayloadPlan,
+    ) -> ResolveWaitResult:
+        """处理 completed/cancelled 等待结果并创建 resume Attempt。
+
+        :param transaction: 当前 Host transaction。
+        :param wait_record: active wait record。
+        :param request: resolve wait 请求。
+        :param resolution_digest: 语义 digest。
+        :param event_plan: 稳定 id 规划。
+        :param payload_plan: payload 规划。
+        :returns: resolve 结果。
+        """
+
+        transition = resume_run_from_waiting_in_transaction(
+            transaction,
+            self._event_log_store,
+            ResumeRunFromWaitingInput(
+                wait_id=wait_record.wait_id,
+                run_id=wait_record.run_id,
+                suspended_attempt_id=wait_record.attempt_id,
+                resume_attempt_id=event_plan.resume_attempt_id,
+                resume_execution_id=event_plan.resume_execution_id,
+                resume_dispatch_record_id=event_plan.resume_dispatch_record_id,
+                resume_requested_event_id=event_plan.resume_requested_event_id,
+                tool_result_event_id=event_plan.tool_result_event_id,
+                run_started_event_id=event_plan.run_started_event_id,
+                attempt_started_event_id=event_plan.attempt_started_event_id,
+                occurred_at=request.observed_at,
+                actor=request.context.actor,
+                source=_WAIT_RESOLUTION_SOURCE,
+                resolution_idempotency_key=request.idempotency_key,
+                resolution_digest=resolution_digest,
+                resume_requested_payload=_resume_requested_payload(
+                    wait_record=wait_record,
+                    request=request,
+                    payload_plan=payload_plan,
+                    event_plan=event_plan,
+                ),
+                tool_result_payload=_tool_result_resolution_payload(
+                    wait_record=wait_record,
+                    request=request,
+                    payload_plan=payload_plan,
+                    event_plan=event_plan,
+                    wait_status_after=WaitRecordStatus.RESOLVED,
+                    resume=True,
+                ),
+                tool_result_payload_ref=_payload_ref_text(payload_plan.payload_ref),
+                tool_result_payload_digest=_event_payload_digest(payload_plan),
+                worker_kind=WorkerKind.LOCAL,
+                owner_host_instance_id=None,
+            ),
+        )
+        if transition.status is not StateMutationStatus.UPDATED or transition.run is None:
+            raise HostApiError(
+                code=HostApiErrorCode.INVALID_STATE,
+                message="wait record is no longer resolvable",
+                retryable=True,
+            )
+        return ResolveWaitResult(
+            run=transition.run,
+            dispatch_record=transition.dispatch_record,
+            idempotent_replay=False,
+        )
+
+    def _resolve_failed(
+        self,
+        *,
+        transaction: HostTransaction,
+        wait_record: WaitRecordRow,
+        request: ResolveWaitRequest,
+        resolution_digest: str,
+        event_plan: _ResolveWaitEventPlan,
+        payload_plan: _WaitResolutionPayloadPlan,
+    ) -> ResolveWaitResult:
+        """处理 failed 等待结果并收口 Run。
+
+        :param transaction: 当前 Host transaction。
+        :param wait_record: active wait record。
+        :param request: resolve wait 请求。
+        :param resolution_digest: 语义 digest。
+        :param event_plan: 稳定 id 规划。
+        :param payload_plan: payload 规划。
+        :returns: resolve 结果。
+        """
+
+        transition = fail_run_from_waiting_in_transaction(
+            transaction,
+            self._event_log_store,
+            WaitingRunTerminalInput(
+                wait_id=wait_record.wait_id,
+                run_id=wait_record.run_id,
+                suspended_attempt_id=wait_record.attempt_id,
+                tool_result_event_id=event_plan.tool_result_event_id,
+                run_terminal_event_id=event_plan.run_failed_event_id,
+                run_terminal_status=RunStatus.FAILED,
+                wait_terminal_status=WaitRecordStatus.FAILED,
+                occurred_at=request.observed_at,
+                actor=request.context.actor,
+                source=_WAIT_RESOLUTION_SOURCE,
+                reason=_WAIT_TERMINAL_REASON_FAILED,
+                resolution_idempotency_key=request.idempotency_key,
+                resolution_digest=resolution_digest,
+                tool_result_payload=_tool_result_resolution_payload(
+                    wait_record=wait_record,
+                    request=request,
+                    payload_plan=payload_plan,
+                    event_plan=event_plan,
+                    wait_status_after=WaitRecordStatus.FAILED,
+                    resume=False,
+                ),
+                tool_result_payload_ref=_payload_ref_text(payload_plan.payload_ref),
+                tool_result_payload_digest=_event_payload_digest(payload_plan),
+            ),
+        )
+        if transition.status is not StateMutationStatus.UPDATED or transition.run is None:
+            raise HostApiError(
+                code=HostApiErrorCode.INVALID_STATE,
+                message="wait record is no longer resolvable",
+                retryable=True,
+            )
+        return ResolveWaitResult(
+            run=transition.run,
+            dispatch_record=None,
+            idempotent_replay=False,
+        )
+
+    def _resolve_lost(
+        self,
+        *,
+        transaction: HostTransaction,
+        wait_record: WaitRecordRow,
+        request: ResolveWaitRequest,
+        resolution_digest: str,
+        event_plan: _ResolveWaitEventPlan,
+        payload_plan: _WaitResolutionPayloadPlan,
+    ) -> ResolveWaitResult:
+        """处理 lost 等待结果并收口 Run。
+
+        :param transaction: 当前 Host transaction。
+        :param wait_record: active wait record。
+        :param request: resolve wait 请求。
+        :param resolution_digest: 语义 digest。
+        :param event_plan: 稳定 id 规划。
+        :param payload_plan: payload 规划。
+        :returns: resolve 结果。
+        """
+
+        transition = mark_run_lost_from_waiting_in_transaction(
+            transaction,
+            self._event_log_store,
+            WaitingRunTerminalInput(
+                wait_id=wait_record.wait_id,
+                run_id=wait_record.run_id,
+                suspended_attempt_id=wait_record.attempt_id,
+                tool_result_event_id=event_plan.tool_result_event_id,
+                run_terminal_event_id=event_plan.run_lost_event_id,
+                run_terminal_status=RunStatus.LOST,
+                wait_terminal_status=WaitRecordStatus.LOST,
+                occurred_at=request.observed_at,
+                actor=request.context.actor,
+                source=_WAIT_RESOLUTION_SOURCE,
+                reason=_WAIT_TERMINAL_REASON_LOST,
+                resolution_idempotency_key=request.idempotency_key,
+                resolution_digest=resolution_digest,
+                tool_result_payload=_tool_result_resolution_payload(
+                    wait_record=wait_record,
+                    request=request,
+                    payload_plan=payload_plan,
+                    event_plan=event_plan,
+                    wait_status_after=WaitRecordStatus.LOST,
+                    resume=False,
+                ),
+                tool_result_payload_ref=_payload_ref_text(payload_plan.payload_ref),
+                tool_result_payload_digest=_event_payload_digest(payload_plan),
+            ),
+        )
+        if transition.status is not StateMutationStatus.UPDATED or transition.run is None:
+            raise HostApiError(
+                code=HostApiErrorCode.INVALID_STATE,
+                message="wait record is no longer resolvable",
+                retryable=True,
+            )
+        return ResolveWaitResult(
+            run=transition.run,
+            dispatch_record=None,
+            idempotent_replay=False,
+        )
+
+
 @dataclass(frozen=True, slots=True)
 class _AwaitingEventPlan:
     """awaiting accept path 的稳定事件 id 规划。"""
@@ -415,6 +910,470 @@ class _AwaitingEventPlan:
     tool_awaiting_id: str
     run_waiting_id: str
     attempt_suspended_id: str
+
+
+def _wait_resolution_scope(wait_id: str, idempotency_key: str) -> IdempotencyScope:
+    """构造 wait resolution 幂等作用域。
+
+    :param wait_id: wait record id。
+    :param idempotency_key: resolve wait 幂等键。
+    :returns: 幂等作用域。
+    """
+
+    return IdempotencyScope(
+        scope_kind=_WAIT_RESOLUTION_SCOPE_KIND,
+        scope_id=wait_id,
+        idempotency_key=idempotency_key,
+    )
+
+
+def _wait_resolution_digest(wait_id: str, request: ResolveWaitRequest) -> str:
+    """计算 resolve wait 语义 digest。
+
+    :param wait_id: wait record id。
+    :param request: resolve wait 请求。
+    :returns: Host canonical sha256 digest。
+    """
+
+    return sha256_digest_json(
+        {
+            "wait_id": wait_id,
+            "idempotency_key": request.idempotency_key,
+            "source": request.source.value,
+            "observed_at": request.observed_at.isoformat(),
+            "outcome": _resolve_outcome_json(request.outcome),
+        }
+    )
+
+
+def _resolve_wait_event_plan(resolution_digest: str) -> _ResolveWaitEventPlan:
+    """从 resolution digest 派生稳定事件与 row id。
+
+    :param resolution_digest: resolve wait 语义 digest。
+    :returns: 事件 id 规划。
+    """
+
+    suffix = resolution_digest.removeprefix("sha256:")
+    return _ResolveWaitEventPlan(
+        suffix=suffix,
+        tool_fact_id=f"{_TOOL_FACT_ID_PREFIX}{suffix}",
+        resume_requested_event_id=f"{_EVENT_ID_RESUME_REQUESTED_PREFIX}{suffix}",
+        tool_result_event_id=f"{_EVENT_ID_WAIT_TOOL_RESULT_PREFIX}{suffix}",
+        run_started_event_id=f"{_EVENT_ID_RESUME_RUN_STARTED_PREFIX}{suffix}",
+        attempt_started_event_id=f"{_EVENT_ID_RESUME_ATTEMPT_STARTED_PREFIX}{suffix}",
+        run_failed_event_id=f"{_EVENT_ID_WAIT_RUN_FAILED_PREFIX}{suffix}",
+        run_lost_event_id=f"{_EVENT_ID_WAIT_RUN_LOST_PREFIX}{suffix}",
+        resume_attempt_id=f"{_RESUME_ATTEMPT_ID_PREFIX}{suffix}",
+        resume_execution_id=f"{_RESUME_EXECUTION_ID_PREFIX}{suffix}",
+        resume_dispatch_record_id=f"{_RESUME_DISPATCH_ID_PREFIX}{suffix}",
+    )
+
+
+def _wait_resolution_payload_plan(
+    request: ResolveWaitRequest,
+) -> _WaitResolutionPayloadPlan:
+    """构造等待结果 payload 规划。
+
+    :param request: resolve wait 请求。
+    :returns: payload 规划。
+    :raises TypeError: outcome envelope 非封闭联合成员时抛出。
+    """
+
+    outcome = request.outcome
+    if isinstance(outcome, ResolveWaitCompletedOutcome):
+        result_json = _tool_success_json(outcome.result)
+        return _WaitResolutionPayloadPlan(
+            resolution_kind=_TOOL_FACT_KIND_COMPLETED,
+            tool_fact_kind=_TOOL_FACT_KIND_COMPLETED,
+            outcome_digest=sha256_digest_json(
+                {"kind": _TOOL_FACT_KIND_COMPLETED, "result": result_json}
+            ),
+            payload_digest=_completed_payload_digest(outcome),
+            payload_ref=outcome.payload_ref,
+            provider_status_ref=None,
+            result_json={
+                "kind": _TOOL_FACT_KIND_COMPLETED,
+                "result": result_json,
+            },
+        )
+    if isinstance(outcome, ResolveWaitFailedOutcome):
+        result_json = _tool_failure_json(outcome.result)
+        return _WaitResolutionPayloadPlan(
+            resolution_kind=_TOOL_FACT_KIND_FAILED,
+            tool_fact_kind=_TOOL_FACT_KIND_FAILED,
+            outcome_digest=sha256_digest_json(
+                {"kind": _TOOL_FACT_KIND_FAILED, "result": result_json}
+            ),
+            payload_digest=outcome.payload_ref.payload_digest
+            if outcome.payload_ref is not None
+            else None,
+            payload_ref=outcome.payload_ref,
+            provider_status_ref=None,
+            result_json={"kind": _TOOL_FACT_KIND_FAILED, "result": result_json},
+        )
+    if isinstance(outcome, ResolveWaitCancelledOutcome):
+        result_json = _tool_cancelled_json(outcome.result)
+        return _WaitResolutionPayloadPlan(
+            resolution_kind=_TOOL_FACT_KIND_CANCELLED,
+            tool_fact_kind=_TOOL_FACT_KIND_CANCELLED,
+            outcome_digest=sha256_digest_json(
+                {"kind": _TOOL_FACT_KIND_CANCELLED, "result": result_json}
+            ),
+            payload_digest=outcome.payload_ref.payload_digest
+            if outcome.payload_ref is not None
+            else None,
+            payload_ref=outcome.payload_ref,
+            provider_status_ref=None,
+            result_json={
+                "kind": _TOOL_FACT_KIND_CANCELLED,
+                "result": result_json,
+            },
+        )
+    if isinstance(outcome, ResolveWaitLostOutcome):
+        result_json = _tool_lost_json(outcome)
+        return _WaitResolutionPayloadPlan(
+            resolution_kind=_TOOL_FACT_KIND_LOST,
+            tool_fact_kind=_TOOL_FACT_KIND_LOST,
+            outcome_digest=sha256_digest_json(
+                {"kind": _TOOL_FACT_KIND_LOST, "result": result_json}
+            ),
+            payload_digest=None,
+            payload_ref=None,
+            provider_status_ref=outcome.provider_status_ref,
+            result_json={"kind": _TOOL_FACT_KIND_LOST, "result": result_json},
+        )
+    raise TypeError("unsupported resolve wait outcome")
+
+
+def _completed_payload_digest(outcome: ResolveWaitCompletedOutcome) -> str:
+    """计算 completed outcome payload digest。
+
+    :param outcome: completed outcome。
+    :returns: payload digest。
+    """
+
+    if outcome.payload_ref is not None:
+        return outcome.payload_ref.payload_digest
+    return sha256_digest_json({"value": outcome.result.value})
+
+
+def _resume_requested_payload(
+    *,
+    wait_record: WaitRecordRow,
+    request: ResolveWaitRequest,
+    payload_plan: _WaitResolutionPayloadPlan,
+    event_plan: _ResolveWaitEventPlan,
+) -> JsonValue:
+    """构造 ``RESUME_REQUESTED`` payload。
+
+    :param wait_record: active wait record。
+    :param request: resolve wait 请求。
+    :param payload_plan: payload 规划。
+    :param event_plan: 稳定 id 规划。
+    :returns: JSON payload。
+    """
+
+    return resume_requested_payload(
+        session_id=wait_record.session_id,
+        run_id=wait_record.run_id,
+        wait_id=wait_record.wait_id,
+        source_attempt_id=wait_record.attempt_id,
+        resume_attempt_id=event_plan.resume_attempt_id,
+        resume_dispatch_record_id=event_plan.resume_dispatch_record_id,
+        resolution_source=request.source.value,
+        resolution_kind=payload_plan.resolution_kind,
+        resolution_idempotency_key=request.idempotency_key,
+        observed_at=request.observed_at.isoformat(),
+        wait_created_event_ref=_wait_created_event_ref(wait_record),
+        wait_updated_event_ref=_wait_updated_event_ref(wait_record),
+    )
+
+
+def _tool_result_resolution_payload(
+    *,
+    wait_record: WaitRecordRow,
+    request: ResolveWaitRequest,
+    payload_plan: _WaitResolutionPayloadPlan,
+    event_plan: _ResolveWaitEventPlan,
+    wait_status_after: WaitRecordStatus,
+    resume: bool,
+) -> JsonValue:
+    """构造 resolve wait ``TOOL_RESULT_ACCEPTED`` payload。
+
+    :param wait_record: active wait record。
+    :param request: resolve wait 请求。
+    :param payload_plan: payload 规划。
+    :param event_plan: 稳定 id 规划。
+    :param wait_status_after: 本次更新后的 wait 状态。
+    :param resume: 是否创建 resume Attempt。
+    :returns: JSON payload。
+    """
+
+    return tool_result_wait_resolution_payload(
+        tool_fact_id=event_plan.tool_fact_id,
+        session_id=wait_record.session_id,
+        run_id=wait_record.run_id,
+        attempt_id=wait_record.attempt_id,
+        execution_id=wait_record.execution_id,
+        iteration_id=wait_record.wait_id,
+        tool_call_id=wait_record.tool_call_id,
+        tool_name=wait_record.tool_name,
+        tool_schema_digest=wait_record.resolve_semantic_digest
+        or payload_plan.outcome_digest,
+        tool_identity_digest=wait_record.resolve_semantic_digest
+        or payload_plan.outcome_digest,
+        normalized_arguments_digest=wait_record.resolve_semantic_digest
+        or payload_plan.outcome_digest,
+        tool_fact_kind=payload_plan.tool_fact_kind,
+        outcome_digest=payload_plan.outcome_digest,
+        payload_digest=payload_plan.payload_digest,
+        payload_ref=payload_plan.payload_ref,
+        resolution_result=payload_plan.result_json,
+        wait_id=wait_record.wait_id,
+        resolution_source=request.source.value,
+        resolution_kind=payload_plan.resolution_kind,
+        resolution_idempotency_key=request.idempotency_key,
+        observed_at=request.observed_at.isoformat(),
+        wait_record_status_before=wait_record.status.value,
+        wait_record_status_after=wait_status_after.value,
+        wait_created_event_ref=_wait_created_event_ref(wait_record),
+        wait_updated_event_ref={
+            "event_id": event_plan.tool_result_event_id,
+            "event_sequence": None,
+        },
+        adapter_key=wait_record.adapter_key.value,
+        external_job_ref=wait_record.external_job_ref,
+        snapshot_ref=wait_record.snapshot_ref,
+        provider_status_ref=payload_plan.provider_status_ref,
+        resume_attempt_id=event_plan.resume_attempt_id if resume else None,
+        resume_dispatch_record_id=(
+            event_plan.resume_dispatch_record_id if resume else None
+        ),
+    )
+
+
+def _resolve_wait_result_from_existing(
+    transaction: HostTransaction, wait_record: WaitRecordRow
+) -> ResolveWaitResult:
+    """从 durable truth 重建 resolve wait 幂等重放结果。
+
+    :param transaction: 当前 Host transaction。
+    :param wait_record: 已终态 wait record。
+    :returns: resolve wait 结果。
+    :raises HostApiError: Run row 缺失时抛出。
+    """
+
+    run = read_run_by_id(transaction, wait_record.run_id)
+    if run is None:
+        raise HostApiError(
+            code=HostApiErrorCode.NOT_FOUND,
+            message="wait owner run not found",
+            retryable=False,
+        )
+    dispatch_record = (
+        read_dispatch_record_by_attempt_id(transaction, run.current_attempt_id)
+        if run.status is RunStatus.RUNNING and run.current_attempt_id is not None
+        else None
+    )
+    return ResolveWaitResult(
+        run=run,
+        dispatch_record=dispatch_record,
+        idempotent_replay=True,
+    )
+
+
+def _payload_ref_text(payload_ref: HostPayloadRef | None) -> str | None:
+    """读取 EventLog row 的 payload_ref 文本。
+
+    :param payload_ref: payload 引用或 ``None``。
+    :returns: payload_ref 文本或 ``None``。
+    """
+
+    if payload_ref is None:
+        return None
+    return payload_ref.payload_ref
+
+
+def _event_payload_digest(payload_plan: _WaitResolutionPayloadPlan) -> str | None:
+    """读取 EventLog row 的 payload_digest 文本。
+
+    :param payload_plan: payload 规划。
+    :returns: payload digest 或 ``None``。
+    """
+
+    if payload_plan.payload_ref is None:
+        return None
+    return payload_plan.payload_ref.payload_digest
+
+
+def _resolve_outcome_json(outcome: ResolveWaitOutcome) -> JsonValue:
+    """把 resolve wait outcome 投影为 digest JSON。
+
+    :param outcome: resolve wait outcome。
+    :returns: JSON 值。
+    :raises TypeError: outcome 非封闭联合成员时抛出。
+    """
+
+    if isinstance(outcome, ResolveWaitCompletedOutcome):
+        return {
+            "kind": _TOOL_FACT_KIND_COMPLETED,
+            "result": _tool_success_json(outcome.result),
+            "payload_ref": _host_payload_ref_json(outcome.payload_ref),
+        }
+    if isinstance(outcome, ResolveWaitFailedOutcome):
+        return {
+            "kind": _TOOL_FACT_KIND_FAILED,
+            "result": _tool_failure_json(outcome.result),
+            "payload_ref": _host_payload_ref_json(outcome.payload_ref),
+        }
+    if isinstance(outcome, ResolveWaitCancelledOutcome):
+        return {
+            "kind": _TOOL_FACT_KIND_CANCELLED,
+            "result": _tool_cancelled_json(outcome.result),
+            "payload_ref": _host_payload_ref_json(outcome.payload_ref),
+        }
+    if isinstance(outcome, ResolveWaitLostOutcome):
+        return {
+            "kind": _TOOL_FACT_KIND_LOST,
+            "result": _tool_lost_json(outcome),
+        }
+    raise TypeError("unsupported resolve wait outcome")
+
+
+def _tool_success_json(result: ToolResultSuccess) -> JsonValue:
+    """把工具成功结果投影为 JSON。
+
+    :param result: 工具成功结果。
+    :returns: JSON mapping。
+    """
+
+    return {
+        "ok": result.ok,
+        "value": result.value,
+        "meta": _tool_result_meta_json(result.meta),
+    }
+
+
+def _tool_failure_json(result: ToolResultFailure) -> JsonValue:
+    """把工具失败结果投影为 JSON。
+
+    :param result: 工具失败结果。
+    :returns: JSON mapping。
+    """
+
+    return {
+        "ok": result.ok,
+        "error": result.error,
+        "message": result.message,
+        "hint": result.hint,
+        "meta": _tool_result_meta_json(result.meta),
+    }
+
+
+def _tool_cancelled_json(result: ToolCancelledOutcome) -> JsonValue:
+    """把工具级取消结果投影为 JSON。
+
+    :param result: 工具级取消结果。
+    :returns: JSON mapping。
+    """
+
+    return {
+        "reason": result.reason,
+        "message": result.message,
+        "hint": result.hint,
+        "meta": _tool_result_meta_json(result.meta),
+    }
+
+
+def _tool_lost_json(outcome: ResolveWaitLostOutcome) -> JsonValue:
+    """把 lost 等待结果投影为 JSON。
+
+    :param outcome: lost outcome。
+    :returns: JSON mapping。
+    """
+
+    return {
+        "reason_code": outcome.reason_code,
+        "message": outcome.message,
+        "provider_status_ref": _provider_status_ref_json(
+            outcome.provider_status_ref
+        ),
+    }
+
+
+def _tool_result_meta_json(meta: ToolResultMeta | None) -> JsonValue:
+    """把工具结果 meta 投影为 JSON。
+
+    :param meta: 工具结果 meta。
+    :returns: JSON 值。
+    """
+
+    if meta is None:
+        return None
+    return {
+        "tool_name": meta.tool_name,
+        "started_at": meta.started_at.isoformat(),
+        "finished_at": meta.finished_at.isoformat(),
+    }
+
+
+def _host_payload_ref_json(payload_ref: HostPayloadRef | None) -> JsonValue:
+    """把 Host payload 引用投影为 JSON。
+
+    :param payload_ref: payload 引用或 ``None``。
+    :returns: JSON 值。
+    """
+
+    if payload_ref is None:
+        return None
+    return {
+        "payload_ref": payload_ref.payload_ref,
+        "payload_digest": payload_ref.payload_digest,
+    }
+
+
+def _provider_status_ref_json(
+    provider_status_ref: WaitProviderStatusRef | None,
+) -> JsonValue:
+    """把 provider 状态引用投影为 JSON。
+
+    :param provider_status_ref: provider 状态引用或 ``None``。
+    :returns: JSON 值。
+    """
+
+    if provider_status_ref is None:
+        return None
+    return {
+        "adapter_key": provider_status_ref.adapter_key.value,
+        "status_ref": provider_status_ref.status_ref,
+        "status_digest": provider_status_ref.status_digest,
+    }
+
+
+def _wait_created_event_ref(wait_record: WaitRecordRow) -> Mapping[str, JsonValue]:
+    """构造 wait created event ref JSON。
+
+    :param wait_record: wait record row。
+    :returns: JSON mapping。
+    """
+
+    return {
+        "event_id": wait_record.created_event_id,
+        "event_sequence": wait_record.created_event_sequence,
+    }
+
+
+def _wait_updated_event_ref(wait_record: WaitRecordRow) -> Mapping[str, JsonValue]:
+    """构造 wait current updated event ref JSON。
+
+    :param wait_record: wait record row。
+    :returns: JSON mapping。
+    """
+
+    return {
+        "event_id": wait_record.updated_event_id,
+        "event_sequence": wait_record.updated_event_sequence,
+    }
 
 
 def _accept_idempotency_scope(

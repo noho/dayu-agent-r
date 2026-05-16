@@ -15,6 +15,7 @@ from uuid import uuid4
 from dayu.contracts.json_value import JsonValue
 from dayu.host.admission import (
     HostAdmissionService,
+    PendingDispatchRecord,
     SubmitFollowupQueueAdmissionInput,
     create_host_admission_service,
 )
@@ -78,6 +79,7 @@ from dayu.host.durable.transaction import (
     T,
 )
 from dayu.host.dispatch import ActiveCancelMessage, cancel_active_worker
+from dayu.host.waiting import DefaultHostResolveWaitService
 
 _GENERATED_HANDLE_ID_PREFIX = "host-command"
 _OPERATION_CREATE_SESSION = "create_session"
@@ -487,18 +489,27 @@ def replay_run(
 def resolve_wait(
     host: HostCommandHandle, wait_id: str, request: ResolveWaitRequest
 ) -> RunSnapshot:
-    """稳定拒绝 Phase 4 尚未实现的 wait result accept。
+    """接收 wait result 并返回最新 Run snapshot。
 
-    本函数不打开 transaction、不追加 EventLog、不写 idempotency record。
-
-    :param host: Host command handle；Phase 4 deferred 路径不读取该 handle。
+    :param host: Host command handle。
     :param wait_id: 待接收结果的 wait id。
     :param request: resolve wait 请求。
-    :returns: 当前阶段不会返回。
-    :raises HostApiError: 始终以 ``UNSUPPORTED_OPERATION`` 抛出。
+    :returns: 最新 Run snapshot。
+    :raises HostApiError: handle 已关闭、wait 缺失、状态非法或幂等冲突时抛出。
     """
 
-    _raise_unsupported_operation("resolve_wait")
+    transaction_runner = host._transaction_runner()
+    service = DefaultHostResolveWaitService(
+        transaction_runner=transaction_runner,
+        event_log_store=host._admission_service.event_log_store,
+        idempotency_store=host._admission_service.idempotency_store,
+    )
+    result = service.resolve_wait(wait_id, request)
+    if result.dispatch_record is not None and not result.idempotent_replay:
+        host._admission_service.wakeup_port.wake_dispatch(
+            _pending_dispatch_from_row(result.dispatch_record)
+        )
+    return run_snapshot_from_row(result.run)
 
 
 def purge_session(
@@ -917,6 +928,25 @@ def _is_direct_cancelable_dispatch_record(
         and dispatch_record.worker_accepted_at is None
         and dispatch_record.worker_accept_event_id is None
         and dispatch_record.worker_accept_event_sequence is None
+    )
+
+
+def _pending_dispatch_from_row(
+    dispatch_record: DispatchRecordRow,
+) -> PendingDispatchRecord:
+    """把 durable dispatch row 转为 wakeup 摘要。
+
+    :param dispatch_record: durable dispatch record row。
+    :returns: pending dispatch 摘要。
+    """
+
+    return PendingDispatchRecord(
+        dispatch_record_id=dispatch_record.dispatch_record_id,
+        run_id=dispatch_record.run_id,
+        attempt_id=dispatch_record.attempt_id,
+        execution_id=dispatch_record.execution_id,
+        execution_target=dispatch_record.execution_target,
+        worker_kind=dispatch_record.worker_kind,
     )
 
 
