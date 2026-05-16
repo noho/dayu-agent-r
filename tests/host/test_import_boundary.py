@@ -42,6 +42,23 @@ HOST_ENGINE_CONTRACT_ALLOWED_MODULES: tuple[str, ...] = (
     "local_proxy.py",
     "run_input.py",
 )
+PROJECTION_MODULES: tuple[str, ...] = (
+    "projection.py",
+    "durable/projection.py",
+)
+PROJECTION_FORBIDDEN_PREFIXES: tuple[str, ...] = (
+    "dayu.engine",
+    "dayu.service",
+    "dayu.ui",
+    "dayu.fins",
+    "dayu.config",
+    "dayu.runtime",
+    "dayu.host.admission",
+    "dayu.host.waiting",
+    "dayu.host.engine_ingest",
+    "dayu.host.dispatch",
+    "dayu.host.recovery",
+)
 
 
 def _host_root() -> Path:
@@ -151,6 +168,21 @@ def test_runtime_does_not_import_host_or_engine_layers() -> None:
             if _matches_prefix(module, RUNTIME_FORBIDDEN_PREFIXES):
                 violations.append((str(file_path), module))
     assert not violations, f"runtime forbidden imports: {violations}"
+
+
+def test_projection_modules_do_not_import_forbidden_layers_or_mutators() -> None:
+    """projection modules 不得导入上层、runtime 或 Host mutator owner。"""
+
+    host_root = _host_root()
+    violations: list[tuple[str, str]] = []
+    for relative_path in PROJECTION_MODULES:
+        file_path = host_root / relative_path
+        for module in _imported_module_names(
+            file_path.read_text(encoding="utf-8")
+        ):
+            if _matches_prefix(module, PROJECTION_FORBIDDEN_PREFIXES):
+                violations.append((str(file_path), module))
+    assert not violations, f"projection forbidden imports: {violations}"
 
 
 def test_engine_does_not_import_host_layer() -> None:

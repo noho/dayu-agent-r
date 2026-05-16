@@ -21,7 +21,7 @@ from dayu.host.api import (
 )
 from dayu.host.durable.errors import HostSchemaMismatchError
 
-HOST_SCHEMA_VERSION = 4
+HOST_SCHEMA_VERSION = 5
 """当前 Host durable SQLite schema version。"""
 
 TABLE_EVENT_LOG = "event_log"
@@ -35,6 +35,8 @@ TABLE_HOST_RUNS = "host_runs"
 TABLE_HOST_ATTEMPTS = "host_attempts"
 TABLE_HOST_ATTEMPT_DISPATCH_RECORDS = "host_attempt_dispatch_records"
 TABLE_HOST_WAIT_RECORDS = "host_wait_records"
+TABLE_HOST_PROJECTION_CHECKPOINTS = "host_projection_checkpoints"
+TABLE_HOST_PROJECTION_FAILURES = "host_projection_failures"
 
 INDEX_HOST_RUNS_ONE_ACTIVE_PER_SESSION = "host_runs_one_active_per_session"
 INDEX_HOST_RUNS_QUEUE_FIFO = "host_runs_queue_fifo"
@@ -64,7 +66,15 @@ PHASE3_STATE_TABLES: tuple[str, ...] = (
 )
 """Phase 3 Session / Run / Attempt durable state table 名称集合。"""
 
-HOST_DURABLE_TABLES: tuple[str, ...] = FOUNDATION_TABLES + PHASE3_STATE_TABLES
+PROJECTION_TABLES: tuple[str, ...] = (
+    TABLE_HOST_PROJECTION_CHECKPOINTS,
+    TABLE_HOST_PROJECTION_FAILURES,
+)
+"""Phase 8 projection checkpoint / failure table 名称集合。"""
+
+HOST_DURABLE_TABLES: tuple[str, ...] = (
+    FOUNDATION_TABLES + PHASE3_STATE_TABLES + PROJECTION_TABLES
+)
 """当前 fresh bootstrap 应创建的 Host durable table 名称集合。"""
 
 _SQLITE_PAYLOADS_DDL = f"""
@@ -542,6 +552,39 @@ CREATE TABLE IF NOT EXISTS {TABLE_HOST_WAIT_RECORDS} (
 )
 """
 
+_HOST_PROJECTION_CHECKPOINTS_DDL = f"""
+CREATE TABLE IF NOT EXISTS {TABLE_HOST_PROJECTION_CHECKPOINTS} (
+  consumer_id TEXT PRIMARY KEY,
+  checkpoint_event_sequence INTEGER NOT NULL CHECK (
+    checkpoint_event_sequence >= 0
+  ),
+  checkpoint_event_id TEXT NULL,
+  last_success_at TEXT NULL,
+  updated_at TEXT NOT NULL,
+  FOREIGN KEY(checkpoint_event_id) REFERENCES {TABLE_EVENT_LOG}(event_id),
+  CHECK (
+    (checkpoint_event_sequence = 0 AND checkpoint_event_id IS NULL)
+    OR
+    (checkpoint_event_sequence > 0 AND checkpoint_event_id IS NOT NULL)
+  )
+)
+"""
+
+_HOST_PROJECTION_FAILURES_DDL = f"""
+CREATE TABLE IF NOT EXISTS {TABLE_HOST_PROJECTION_FAILURES} (
+  consumer_id TEXT PRIMARY KEY,
+  failed_event_sequence INTEGER NOT NULL CHECK (failed_event_sequence > 0),
+  failed_event_id TEXT NOT NULL,
+  failure_count INTEGER NOT NULL CHECK (failure_count > 0),
+  last_error_code TEXT NOT NULL,
+  last_error_message TEXT NOT NULL,
+  first_failed_at TEXT NOT NULL,
+  last_failed_at TEXT NOT NULL,
+  retry_after TEXT NULL,
+  FOREIGN KEY(failed_event_id) REFERENCES {TABLE_EVENT_LOG}(event_id)
+)
+"""
+
 _HOST_RUNS_ONE_ACTIVE_PER_SESSION_INDEX_DDL = f"""
 CREATE UNIQUE INDEX IF NOT EXISTS {INDEX_HOST_RUNS_ONE_ACTIVE_PER_SESSION}
 ON {TABLE_HOST_RUNS}(session_id)
@@ -605,8 +648,14 @@ PHASE3_INDEX_DDL: tuple[str, ...] = (
 )
 """Phase 3 state table index DDL。"""
 
+PROJECTION_DDL: tuple[str, ...] = (
+    _HOST_PROJECTION_CHECKPOINTS_DDL,
+    _HOST_PROJECTION_FAILURES_DDL,
+)
+"""按外键依赖顺序排列的 Phase 8 projection table DDL。"""
+
 HOST_DURABLE_DDL: tuple[str, ...] = (
-    FOUNDATION_DDL + PHASE3_STATE_DDL + PHASE3_INDEX_DDL
+    FOUNDATION_DDL + PHASE3_STATE_DDL + PROJECTION_DDL + PHASE3_INDEX_DDL
 )
 """当前 Host durable fresh bootstrap 全量 DDL。"""
 
