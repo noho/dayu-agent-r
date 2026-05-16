@@ -22,7 +22,9 @@ from dayu.host import (
     resolve_wait,
 )
 from dayu.host.durable.codec import sha256_digest_json
+from dayu.host.durable.schema import TABLE_HOST_WAIT_RECORDS
 from dayu.host.durable.state import WaitRecordRow, WaitRecordStatus
+from dayu.host.durable.transaction import HostTransaction
 from dayu.host.wait_adapter import (
     WaitPollAdapter,
     WaitPollAdapterRegistration,
@@ -111,6 +113,40 @@ class _SequenceAdapter:
         """
 
         self.abandoned.append(wait_record.wait_id)
+
+
+class _AbandonValueErrorThenNotReadyAdapter:
+    """先在 abandon 抛 ValueError，再对后续 poll 返回 not-ready 的 adapter。"""
+
+    def __init__(self) -> None:
+        """初始化调用记录。
+
+        :returns: ``None``。
+        """
+
+        self.abandoned: list[str] = []
+        self.polled: list[str] = []
+
+    def poll_wait(self, wait_record: WaitRecordRow) -> WaitPollResult:
+        """记录 poll wait 并返回 not-ready。
+
+        :param wait_record: wait record。
+        :returns: not-ready poll 结果。
+        """
+
+        self.polled.append(wait_record.wait_id)
+        return WaitPollNotReady()
+
+    def abandon_wait(self, wait_record: WaitRecordRow) -> None:
+        """记录 abandon wait 并抛出普通异常。
+
+        :param wait_record: wait record。
+        :returns: 不返回；始终抛出 ``ValueError``。
+        :raises ValueError: 始终抛出，用于验证普通异常隔离。
+        """
+
+        self.abandoned.append(wait_record.wait_id)
+        raise ValueError("adapter abandon failed")
 
 
 def test_poll_adapter_ready_result_resolves_wait(
@@ -238,6 +274,41 @@ def test_cancelled_poll_wait_is_abandoned_without_resolve(
         host.close()
 
 
+def test_adapter_non_runtime_exception_isolated_per_wait_record(
+    tmp_path: Path,
+) -> None:
+    """adapter 普通异常只影响单条 wait record，后续记录继续处理。"""
+
+    host = create_host_command_handle(_options(tmp_path))
+    try:
+        seeded = _seed_waiting_run(host)
+        cancel_run(
+            host,
+            seeded.run_id,
+            CancelRunRequest(
+                context=_context("poll-cancel-for-error"),
+                client_request_id="poll-cancel-for-error",
+                reason="user_cancel",
+                mode=CancelMode.GRACEFUL,
+            ),
+        )
+        followup_wait_id = "zz-wait-followup"
+        _insert_followup_wait_record(host, seeded.wait_id, followup_wait_id)
+        adapter = _AbandonValueErrorThenNotReadyAdapter()
+        poller = _poller(host, adapter, seeded.wait_id)
+
+        result = poller.poll_once()
+
+        assert result.observed == 2
+        assert result.adapter_errors == 1
+        assert result.not_ready == 1
+        assert result.abandoned == 0
+        assert adapter.abandoned == [seeded.wait_id]
+        assert adapter.polled == [followup_wait_id]
+    finally:
+        host.close()
+
+
 def _poller(
     host: HostCommandHandle, adapter: WaitPollAdapter, wait_id: str
 ) -> WaitPoller:
@@ -265,3 +336,95 @@ def _poller(
         context=_context("poller"),
         clock=_FixedClock(),
     )
+
+
+def _insert_followup_wait_record(
+    host: HostCommandHandle, source_wait_id: str, followup_wait_id: str
+) -> None:
+    """复制一条 waiting poll record，用于验证 poller 单条异常隔离。
+
+    :param host: Host command handle。
+    :param source_wait_id: 已存在的 wait id。
+    :param followup_wait_id: 新 waiting wait id。
+    :returns: ``None``。
+    """
+
+    def operation(transaction: HostTransaction) -> None:
+        """执行 wait record 复制。
+
+        :param transaction: Host transaction。
+        :returns: ``None``。
+        """
+
+        transaction.execute(
+            f"""
+            INSERT INTO {TABLE_HOST_WAIT_RECORDS} (
+              wait_id,
+              session_id,
+              run_id,
+              attempt_id,
+              execution_id,
+              tool_call_id,
+              tool_name,
+              adapter_key,
+              await_kind,
+              resume_policy,
+              resume_token,
+              snapshot_ref,
+              snapshot_captured_at,
+              snapshot_digest,
+              external_job_id,
+              accept_idempotency_key,
+              resolve_idempotency_key,
+              resolve_semantic_digest,
+              deadline_at,
+              expires_at,
+              status,
+              created_event_id,
+              created_event_sequence,
+              updated_event_id,
+              updated_event_sequence,
+              created_at,
+              updated_at,
+              terminal_at
+            )
+            SELECT
+              ?,
+              session_id,
+              run_id,
+              attempt_id,
+              execution_id,
+              tool_call_id || '-followup',
+              tool_name,
+              adapter_key,
+              await_kind,
+              resume_policy,
+              resume_token || '-followup',
+              snapshot_ref,
+              snapshot_captured_at,
+              snapshot_digest,
+              external_job_id || '-followup',
+              accept_idempotency_key || '-followup',
+              NULL,
+              NULL,
+              deadline_at,
+              expires_at,
+              ?,
+              created_event_id,
+              created_event_sequence,
+              created_event_id,
+              created_event_sequence,
+              created_at,
+              created_at,
+              NULL
+            FROM {TABLE_HOST_WAIT_RECORDS}
+            WHERE wait_id = ?
+            """,
+            (
+                followup_wait_id,
+                WaitRecordStatus.WAITING.value,
+                source_wait_id,
+            ),
+        )
+
+    host._transaction_runner().run_write(operation)

@@ -92,6 +92,12 @@ _EVENT_TYPE_RUN_FAILED = "RUN_FAILED"
 _EVENT_TYPE_RUN_LOST = "RUN_LOST"
 _EVENT_TYPE_RESUME_REQUESTED = "RESUME_REQUESTED"
 _EVENT_TYPE_TOOL_RESULT_ACCEPTED = "TOOL_RESULT_ACCEPTED"
+_TERMINAL_STATUS_PAIRS: tuple[tuple[AttemptStatus, RunStatus], ...] = (
+    (AttemptStatus.SUCCEEDED, RunStatus.SUCCEEDED),
+    (AttemptStatus.FAILED, RunStatus.FAILED),
+    (AttemptStatus.CANCELLED, RunStatus.CANCELLED),
+    (AttemptStatus.LOST, RunStatus.LOST),
+)
 
 
 class PromotionSkipReason(StrEnum):
@@ -1128,10 +1134,9 @@ def terminal_closeout_in_transaction(
         ),
     ).row
     terminal_at = format_utc_timestamp(request.occurred_at)
-    attempt_result = terminal_attempt_row(
-        transaction,
-        attempt_id=request.attempt_id,
-        terminal_status=request.attempt_terminal_status,
+    attempt_result = _terminal_attempt_row_for_closeout(
+        transaction=transaction,
+        request=request,
         terminal_event_id=attempt_event.event_id,
         terminal_event_sequence=attempt_event.event_sequence,
         terminal_at=terminal_at,
@@ -1140,11 +1145,9 @@ def terminal_closeout_in_transaction(
         attempt_result,
         mutation_name="terminal Attempt",
     )
-    run_result = terminal_run_row(
-        transaction,
-        run_id=request.run_id,
-        current_attempt_id=request.attempt_id,
-        terminal_status=request.run_terminal_status,
+    run_result = _terminal_run_row_for_closeout(
+        transaction=transaction,
+        request=request,
         terminal_event_id=run_event.event_id,
         terminal_event_sequence=run_event.event_sequence,
         terminal_at=terminal_at,
@@ -1158,6 +1161,82 @@ def terminal_closeout_in_transaction(
         run=run_result.row,
         attempt=attempt_result.row,
         dispatch_record=dispatch_record,
+    )
+
+
+def _terminal_attempt_row_for_closeout(
+    *,
+    transaction: HostTransaction,
+    request: TerminalCloseoutInput,
+    terminal_event_id: str,
+    terminal_event_sequence: int,
+    terminal_at: str,
+) -> AttemptMutationResult:
+    """按 terminal closeout 输入推进 Attempt 终态。
+
+    :param transaction: 调用方提供的 Host transaction。
+    :param request: terminal closeout 输入。
+    :param terminal_event_id: 具体 Attempt terminal event id。
+    :param terminal_event_sequence: 具体 Attempt terminal event 全局序号。
+    :param terminal_at: 固定 UTC terminal timestamp 文本。
+    :returns: Attempt mutation 结果。
+    :raises HostDurableError: 输入字段或当前状态无效时抛出。
+    """
+
+    if request.attempt_terminal_status is AttemptStatus.CANCELLED:
+        return cancel_running_attempt_row(
+            transaction,
+            attempt_id=request.attempt_id,
+            terminal_event_id=terminal_event_id,
+            terminal_event_sequence=terminal_event_sequence,
+            terminal_at=terminal_at,
+        )
+    return terminal_attempt_row(
+        transaction,
+        attempt_id=request.attempt_id,
+        terminal_status=request.attempt_terminal_status,
+        terminal_event_id=terminal_event_id,
+        terminal_event_sequence=terminal_event_sequence,
+        terminal_at=terminal_at,
+    )
+
+
+def _terminal_run_row_for_closeout(
+    *,
+    transaction: HostTransaction,
+    request: TerminalCloseoutInput,
+    terminal_event_id: str,
+    terminal_event_sequence: int,
+    terminal_at: str,
+) -> RunMutationResult:
+    """按 terminal closeout 输入推进 Run 终态。
+
+    :param transaction: 调用方提供的 Host transaction。
+    :param request: terminal closeout 输入。
+    :param terminal_event_id: 具体 Run terminal event id。
+    :param terminal_event_sequence: 具体 Run terminal event 全局序号。
+    :param terminal_at: 固定 UTC terminal timestamp 文本。
+    :returns: Run mutation 结果。
+    :raises HostDurableError: 输入字段或当前状态无效时抛出。
+    """
+
+    if request.run_terminal_status is RunStatus.CANCELLED:
+        return cancel_running_run_row(
+            transaction,
+            run_id=request.run_id,
+            current_attempt_id=request.attempt_id,
+            terminal_event_id=terminal_event_id,
+            terminal_event_sequence=terminal_event_sequence,
+            terminal_at=terminal_at,
+        )
+    return terminal_run_row(
+        transaction,
+        run_id=request.run_id,
+        current_attempt_id=request.attempt_id,
+        terminal_status=request.run_terminal_status,
+        terminal_event_id=terminal_event_id,
+        terminal_event_sequence=terminal_event_sequence,
+        terminal_at=terminal_at,
     )
 
 
@@ -3249,13 +3328,15 @@ def _attempt_terminal_event_type(status: AttemptStatus) -> str:
 
     :param status: Attempt 终态。
     :returns: event type。
-    :raises ValueError: 状态不是 P3-S3 支持的 terminal 状态时抛出。
+    :raises ValueError: 状态不是 terminal closeout 支持的终态时抛出。
     """
 
     if status == AttemptStatus.SUCCEEDED:
         return _EVENT_TYPE_ATTEMPT_SUCCEEDED
     if status == AttemptStatus.FAILED:
         return _EVENT_TYPE_ATTEMPT_FAILED
+    if status == AttemptStatus.CANCELLED:
+        return _EVENT_TYPE_ATTEMPT_CANCELLED
     if status == AttemptStatus.LOST:
         return _EVENT_TYPE_ATTEMPT_LOST
     raise ValueError("unsupported Attempt terminal status")
@@ -3266,16 +3347,31 @@ def _run_terminal_event_type(status: RunStatus) -> str:
 
     :param status: Run 终态。
     :returns: event type。
-    :raises ValueError: 状态不是 P3-S3 支持的 terminal 状态时抛出。
+    :raises ValueError: 状态不是 terminal closeout 支持的终态时抛出。
     """
 
     if status == RunStatus.SUCCEEDED:
         return _EVENT_TYPE_RUN_SUCCEEDED
     if status == RunStatus.FAILED:
         return _EVENT_TYPE_RUN_FAILED
+    if status == RunStatus.CANCELLED:
+        return _EVENT_TYPE_RUN_CANCELLED
     if status == RunStatus.LOST:
         return _EVENT_TYPE_RUN_LOST
     raise ValueError("unsupported Run terminal status")
+
+
+def _terminal_status_pair_is_compatible(
+    *, attempt_status: AttemptStatus, run_status: RunStatus
+) -> bool:
+    """判断 Attempt / Run terminal status 是否是合法配对。
+
+    :param attempt_status: Attempt 终态。
+    :param run_status: Run 终态。
+    :returns: 配对合法返回 ``True``，否则返回 ``False``。
+    """
+
+    return (attempt_status, run_status) in _TERMINAL_STATUS_PAIRS
 
 
 def _validate_create_queued_input(request: CreateQueuedRunInput) -> None:
@@ -3534,6 +3630,11 @@ def _validate_terminal_input(request: TerminalCloseoutInput) -> None:
         _run_terminal_event_type(request.run_terminal_status)
     except ValueError as exc:
         raise HostDurableError(str(exc)) from exc
+    if not _terminal_status_pair_is_compatible(
+        attempt_status=request.attempt_terminal_status,
+        run_status=request.run_terminal_status,
+    ):
+        raise HostDurableError("terminal Attempt and Run status pair is invalid")
     _require_non_empty_text(request.actor, field_name="actor")
     _require_non_empty_text(request.source, field_name="source")
     _require_non_empty_text(request.reason, field_name="reason")

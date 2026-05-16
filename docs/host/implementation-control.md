@@ -477,13 +477,24 @@ implementation、双路 code review、accepted finding fix、双路 code re-revi
 测试夹具未保持 worker stream 打开，已通过
 `docs/reviews/host-phase8-readiness-validation-fix-20260516.md` 修复，修复提交为 `57975fe`。最终验证为
 `pytest tests/host -q` 435 passed、`python -m pyright dayu/ tests/ utils/` 0 errors、`git diff --check`
-clean。Phase 8 状态为 completed，当前 gate 为 ready-to-open-draft-PR。Phase 8 exit accepted：committed EventLog
+clean。追加全仓 deepreview 闭环 artifacts 为 `docs/reviews/repo-review-20260516-2105.md`、
+`docs/reviews/repo-review-20260516-2059.md`、
+`docs/reviews/repo-review-controller-adjudication-20260516-2109.md`、
+`docs/reviews/repo-review-fix-codex-20260516.md`、
+`docs/reviews/repo-review-fix-re-review-mimo-20260516.md`、
+`docs/reviews/repo-review-fix-re-review-ds-20260516.md` 与
+`docs/reviews/repo-review-fix-re-review-controller-adjudication-20260516-2130.md`。Controller accepted
+DR-ALL-A1 至 DR-ALL-A5 已修复，MiMo / DS re-review 均 PASS。Phase 8 状态为 completed，当前 gate 为
+ready-to-open-draft-PR。Phase 8 exit accepted：committed EventLog
 consumer framework、projection checkpoint / failure store、typed consumer contract、Host EventLog-backed event stream cursor
 truth regression coverage、minimal RunResult / Session timeline read model、internal repair helper 与 rebuild tests 均已落地。
 Phase 8 remaining risks / owners：automatic after-commit projection catch-up 归 Phase 9 owner；heavy sink /
 batch-transaction runner 归 Phase 13 / Phase 15 owner；per-session repair filter 归 Phase 15 owner；RunResult summary refs
 接入 public `RunSnapshot` 归 Phase 9 / Phase 15 或后续 public read enhancement owner；Audit / Tool Trace / Outbox
-concrete sinks 归 Phase 13 owner。
+concrete sinks 归 Phase 13 owner；Engine / OpenAI runner / parser findings 归 Engine hardening gate owner；schema CHECK
+hardening 归后续 schema hardening owner；scheduler close active Run reconciliation 归 Phase 11 recovery owner；awaiting
+accepted ack 当前状态重校验归 Phase 7 / Phase 11 wait lifecycle hardening owner；poller LIMIT / CANCELLED abandon 退避归
+Phase 15 / production polling scale owner。
 
 ## Phase Map
 

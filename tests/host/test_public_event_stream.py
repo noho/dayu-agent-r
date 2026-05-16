@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import sqlite3
+from datetime import UTC, datetime
 from pathlib import Path
 
 import pytest
@@ -17,6 +18,7 @@ from dayu.host import (
     HostCallContext,
     HostCommandHandle,
     HostCommandHandleOptions,
+    HostEventClass,
     HostEventView,
     HostInput,
     HostStreamCursor,
@@ -32,6 +34,12 @@ from dayu.host.durable.schema import (
     TABLE_HOST_PROJECTION_CHECKPOINTS,
     TABLE_HOST_PROJECTION_FAILURES,
 )
+from dayu.host.durable.event_log import (
+    EventClass,
+    EventLogAppendRequest,
+    EventLogStore,
+)
+from dayu.host.durable.transaction import HostTransaction
 
 _PROJECTION_CONSUMER_ID = "phase8-stream-boundary"
 _PROJECTION_TEST_NOW = "2026-05-16T00:00:00Z"
@@ -478,6 +486,65 @@ def test_stream_run_events_returns_only_target_run_events(
         assert stream.next_cursor.event_sequence == _max_event_sequence(
             options.db_path
         )
+    finally:
+        host.close()
+
+
+def test_stream_run_events_exposes_event_class_for_preview_rows(
+    tmp_path: Path,
+) -> None:
+    """stream_run_events 必须暴露 EventLog row 的 public event class。"""
+
+    options = _options(tmp_path)
+    host = create_host_command_handle(options)
+    try:
+        session_id = _session_id(host, "target")
+        target = start_run(host, _start_request(session_id, "target-run"))
+
+        def append_preview(transaction: HostTransaction) -> None:
+            """追加同一 Run 的 preview EventLog row。
+
+            :param transaction: Host transaction。
+            :returns: ``None``。
+            """
+
+            EventLogStore().append_event(
+                transaction,
+                EventLogAppendRequest(
+                    event_id="event-preview-content-delta",
+                    event_class=EventClass.PREVIEW,
+                    session_id=session_id,
+                    run_id=target.run_id,
+                    attempt_id=None,
+                    execution_id=None,
+                    event_type="CONTENT_DELTA",
+                    occurred_at=datetime(2026, 5, 16, 1, 2, 3, tzinfo=UTC),
+                    actor="engine",
+                    source="pytest",
+                    client_request_id=None,
+                    idempotency_key="preview-content-delta",
+                    policy_decision=None,
+                    reason=None,
+                    payload_json={"text": "delta"},
+                    payload_ref=None,
+                    payload_digest=None,
+                ),
+            )
+
+        host._transaction_runner().run_write(append_preview)
+
+        stream = stream_run_events(
+            host,
+            target.run_id,
+            HostStreamCursor(event_sequence=0),
+            limit=HOST_EVENT_STREAM_MAX_LIMIT,
+        )
+
+        event_classes = tuple(event.event_class for event in stream.events)
+        assert HostEventClass.CANONICAL_FACT in event_classes
+        assert HostEventClass.PREVIEW in event_classes
+        assert stream.events[-1].event_class is HostEventClass.PREVIEW
+        assert stream.events[-1].event_type == "CONTENT_DELTA"
     finally:
         host.close()
 

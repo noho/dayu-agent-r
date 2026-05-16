@@ -326,17 +326,24 @@ def _run_after_commit(callbacks: tuple[AfterCommitCallback, ...]) -> None:
 
     :param callbacks: after-commit 回调元组。
     :returns: ``None``。
-    :raises HostAfterCommitError: 任一 callback 失败时抛出。
+    :raises HostAfterCommitError: 任一 callback 失败时，在尝试全部 callback 后
+        抛出第一个失败。
     """
 
+    first_error: Exception | None = None
+    first_error_index = 0
     for index, callback in enumerate(callbacks):
         try:
             callback()
         except Exception as exc:
-            raise HostAfterCommitError(
-                "Host durable after-commit callback failed",
-                callback_index=index,
-            ) from exc
+            if first_error is None:
+                first_error = exc
+                first_error_index = index
+    if first_error is not None:
+        raise HostAfterCommitError(
+            "Host durable after-commit callback failed",
+            callback_index=first_error_index,
+        ) from first_error
 
 
 def _classify_sqlite_error(error: sqlite3.Error) -> HostDurableError:

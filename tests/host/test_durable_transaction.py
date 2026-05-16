@@ -231,6 +231,65 @@ def test_after_commit_failure_preserves_durable_commit(tmp_path: Path) -> None:
             check_connection.close()
 
 
+def test_after_commit_failure_still_attempts_later_callbacks(
+    tmp_path: Path,
+) -> None:
+    """首个 after-commit 失败时仍必须尝试后续 callback。"""
+
+    options = _options(tmp_path)
+    with open_host_durable_store(options) as store:
+        setup_connection = store.connect()
+        try:
+            _create_notes_table(setup_connection)
+        finally:
+            setup_connection.close()
+        callback_events: list[str] = []
+
+        def operation(transaction: HostTransaction) -> None:
+            """写入 durable row。
+
+            :param transaction: Host transaction。
+            :returns: ``None``。
+            """
+
+            transaction.execute(
+                "INSERT INTO notes (id, body) VALUES (?, ?)",
+                ("n1", "hello"),
+            )
+
+        def first_callback() -> None:
+            """记录第一个 callback 并模拟失败。
+
+            :returns: 永不返回。
+            :raises RuntimeError: 始终抛出。
+            """
+
+            callback_events.append("first")
+            raise RuntimeError("first callback failed")
+
+        def second_callback() -> None:
+            """记录第二个 callback 已执行。
+
+            :returns: ``None``。
+            """
+
+            callback_events.append("second")
+
+        with pytest.raises(HostAfterCommitError) as error_info:
+            store.transaction_runner.run_write(
+                operation,
+                after_commit=(first_callback, second_callback),
+            )
+
+        assert error_info.value.callback_index == 0
+        assert callback_events == ["first", "second"]
+        check_connection = store.connect()
+        try:
+            assert _count_rows(check_connection, "notes") == 1
+        finally:
+            check_connection.close()
+
+
 def test_busy_locked_retries_are_finite_and_do_not_run_after_commit(
     tmp_path: Path,
 ) -> None:

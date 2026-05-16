@@ -77,7 +77,7 @@ class WaitPollAdapter(Protocol):
 
         :param wait_record: 当前 wait record 快照。
         :returns: poll 结果。
-        :raises RuntimeError: adapter 可在外部系统调用失败时抛出。
+        :raises Exception: adapter 可在外部系统调用失败时抛出普通异常。
         """
 
         ...
@@ -87,7 +87,7 @@ class WaitPollAdapter(Protocol):
 
         :param wait_record: 已取消 wait record 快照。
         :returns: ``None``。
-        :raises RuntimeError: adapter 可在外部系统调用失败时抛出。
+        :raises Exception: adapter 可在外部系统调用失败时抛出普通异常。
         """
 
         ...
@@ -344,12 +344,12 @@ class WaitPoller:
                 try:
                     adapter.abandon_wait(record)
                     abandoned += 1
-                except RuntimeError:
+                except Exception:
                     adapter_errors += 1
                 continue
             try:
                 poll_result = adapter.poll_wait(record)
-            except RuntimeError:
+            except Exception:
                 adapter_errors += 1
                 continue
             if isinstance(poll_result, WaitPollNotReady):
