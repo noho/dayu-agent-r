@@ -359,7 +359,20 @@ re-review、DS current-version code review 与 controller adjudication，accepte
 `docs/reviews/host-phase7-code-re-review-s3-controller-adjudication-20260516.md`。验证为
 `pytest tests/host/test_resolve_wait_command.py tests/host/test_run_attempt_transitions.py tests/host/test_run_input_builder.py tests/host/test_dispatch_scheduler.py tests/host/test_phase7_waiting_integration.py -q`
 64 passed、`pytest tests/host -q` 381 passed、`python -m pyright dayu/host tests/host` 0 errors、`git diff --check`
-clean。当前 gate 为 P7-S4 `WAITING Cancel, Late Result Diagnostic, Poll / Manual Adapter, EngineEvent Confirmation` implementation。
+clean。P7-S4 `WAITING Cancel, Late Result Diagnostic, Poll / Manual Adapter, EngineEvent Confirmation` 已完成
+implementation、双路 code review 与 controller adjudication，accepted slice commit 为 `3ccddbf`。P7-S4 artifacts 为
+`docs/reviews/host-phase7-implementation-s4-wait-cancel-late-poll-20260516.md`、
+`docs/reviews/host-phase7-code-review-s4-mimo-20260516.md`、
+`docs/reviews/host-phase7-code-review-s4-ds-20260516.md` 与
+`docs/reviews/host-phase7-code-review-s4-controller-adjudication-20260516.md`。验证为
+`pytest tests/host/test_wait_cancel_late_result.py tests/host/test_wait_adapter_polling.py tests/host/test_engine_ingest_mapping.py tests/host/test_public_cancel_session_runs.py tests/host/test_public_run_api.py -q`
+42 passed、`pytest tests/host -q` 388 passed、`python -m pyright dayu/host tests/host` 0 errors、`git diff --check`
+clean。P7-S4 residual risks：Engine contract 当前不携带 Host accepted wait refs，P7-S4 只能做 diagnostic /
+idempotent confirmation，不能验证 Engine awaiting event 与 Host accepted wait refs 完全匹配；Poller 仍是最小单轮
+`poll_once()`，不包含后台调度循环、退避、并发 in-flight fencing 或 adapter 错误重试治理；`WAITING` Run + 非
+`SUSPENDED` Attempt 的防御性 internal invariant error、poller retry 外部化后的幂等 digest 策略、late result typed
+public error detail 均为后续 hardening / API contract 扩展项。当前 gate 为 P7-S5 `Integration, Docs, Gate Validation`
+implementation。
 
 ## Phase Map
 
