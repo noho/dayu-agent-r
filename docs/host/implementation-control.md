@@ -325,7 +325,7 @@ handoff implementation-ready plan。Phase 7 handoff implementation-ready plan �
 `docs/reviews/host-phase7-plan-re-review-mimo-20260516.md` 与
 `docs/reviews/host-phase7-plan-re-review-ds-20260516.md`；controller plan re-review adjudication artifact 为
 `docs/reviews/host-phase7-plan-re-review-controller-adjudication-20260516.md`。两路 re-review 均 PASS，blocking count 为 0。
-当前 gate 为 accepted plan commit。
+Phase 7 accepted plan commit 为 `d017fd7`。当前 gate 为 P7-S1 `Public Contracts And Durable Wait Record` implementation。
 
 ## Phase Map
 
