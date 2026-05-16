@@ -325,7 +325,21 @@ handoff implementation-ready plan。Phase 7 handoff implementation-ready plan �
 `docs/reviews/host-phase7-plan-re-review-mimo-20260516.md` 与
 `docs/reviews/host-phase7-plan-re-review-ds-20260516.md`；controller plan re-review adjudication artifact 为
 `docs/reviews/host-phase7-plan-re-review-controller-adjudication-20260516.md`。两路 re-review 均 PASS，blocking count 为 0。
-Phase 7 accepted plan commit 为 `d017fd7`。当前 gate 为 P7-S1 `Public Contracts And Durable Wait Record` implementation。
+Phase 7 accepted plan commit 为 `d017fd7`。
+P7-S1 `Public Contracts And Durable Wait Record` 已完成 implementation、双路 code review、accepted finding fix、双路 code
+re-review 与 controller adjudication，accepted checkpoint commit 为 `aaa107a`。P7-S1 artifacts 为
+`docs/reviews/host-phase7-s1-controller-decision-test-ownership-20260516.md`、
+`docs/reviews/host-phase7-implementation-s1-public-contracts-wait-record-20260516.md`、
+`docs/reviews/host-phase7-code-review-s1-mimo-20260516.md`、
+`docs/reviews/host-phase7-code-review-s1-ds-20260516.md`、
+`docs/reviews/host-phase7-code-review-s1-controller-adjudication-20260516.md`、
+`docs/reviews/host-phase7-fix-s1-public-contracts-wait-record-20260516.md`、
+`docs/reviews/host-phase7-code-re-review-s1-mimo-20260516.md`、
+`docs/reviews/host-phase7-code-re-review-s1-ds-20260516.md` 与
+`docs/reviews/host-phase7-code-re-review-s1-controller-adjudication-20260516.md`。验证为
+`pytest tests/host/test_public_contracts.py tests/host/test_import_boundary.py tests/host/test_package_exports.py tests/host/test_durable_schema.py tests/host/test_state_schema.py tests/host/test_wait_record_state.py tests/host/test_public_run_api.py -q`
+84 passed、`python -m pyright dayu/host tests/host` 0 errors、`git diff --check` clean。当前 gate 为 P7-S2
+`ToolRuntime Awaiting Accept Path` implementation。
 
 ## Phase Map
 
