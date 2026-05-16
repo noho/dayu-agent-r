@@ -455,7 +455,8 @@ review 与 controller adjudication。P8-S2 artifacts 为
 `docs/reviews/host-phase8-code-review-s2-mimo-20260516.md`、
 `docs/reviews/host-phase8-code-review-s2-ds-20260516.md` 与
 `docs/reviews/host-phase8-code-review-s2-controller-adjudication-20260516.md`。两路 review 均 PASS，blocking count 为 0。
-当前 gate 为 P8-S2 accepted slice commit。
+P8-S2 accepted slice commit 为 `c891792`。当前 gate 为 P8-S3 `Minimal RunResult / Session Timeline Read Model / Repair`
+implementation。
 
 ## Phase Map
 
