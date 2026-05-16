@@ -909,6 +909,30 @@ async def test_scheduler_close_lets_active_task_own_handle_close(
 
 
 @pytest.mark.asyncio
+async def test_default_active_registry_is_scheduler_local(tmp_path: Path) -> None:
+    """未显式注入 registry 时，不同 scheduler 不共享默认 registry。"""
+
+    with open_host_durable_store(_options(tmp_path)) as store:
+        first = await _open_scheduler(
+            tmp_path,
+            store,
+            _FakeWorkerFactory(),
+            lane_db_path=tmp_path / "lane-first.sqlite3",
+        )
+        second = await _open_scheduler(
+            tmp_path,
+            store,
+            _FakeWorkerFactory(),
+            lane_db_path=tmp_path / "lane-second.sqlite3",
+        )
+        try:
+            assert first._active_registry is not second._active_registry
+        finally:
+            await first.close()
+            await second.close()
+
+
+@pytest.mark.asyncio
 async def test_consume_pre_event_exception_releases_lane_and_unregisters(
     tmp_path: Path,
 ) -> None:

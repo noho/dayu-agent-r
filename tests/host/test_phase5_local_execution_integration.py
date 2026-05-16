@@ -52,7 +52,7 @@ from dayu.host.api import (
     EnsureSessionRequest,
     RunStatus,
 )
-from dayu.host.dispatch import HostDispatchScheduler
+from dayu.host.dispatch import ActiveWorkerRegistry, HostDispatchScheduler
 from dayu.host.durable.codec import sha256_digest_json
 from dayu.host.durable.connection import HostDurableStore, open_host_durable_store
 from dayu.host.durable.event_log import (
@@ -528,7 +528,8 @@ async def test_cancel_active_fake_worker_closes_cancelled(tmp_path: Path) -> Non
     """active fake local worker 收到 cancel 后以 RUN_CANCELLED 收口。"""
 
     options = _command_options(tmp_path)
-    host = create_host_command_handle(options)
+    active_registry = ActiveWorkerRegistry()
+    host = create_host_command_handle(options, active_registry=active_registry)
     handle = _ScriptedLocalWorkerHandle(
         local_worker_id="worker-cancelled",
         mode=_WORKER_MODE_CANCELLED,
@@ -540,6 +541,7 @@ async def test_cancel_active_fake_worker_closes_cancelled(tmp_path: Path) -> Non
                 tmp_path,
                 store,
                 _SequencedLocalWorkerFactory((handle,)),
+                active_registry=active_registry,
             )
             try:
                 scheduler.wake_dispatch(_pending_dispatch(refs))
@@ -624,7 +626,10 @@ async def test_queue_promotion_after_terminal_and_cancel_wakes_dispatch(
         terminal_host.close()
 
     cancel_options = _command_options(tmp_path / "cancel")
-    cancel_host = create_host_command_handle(cancel_options)
+    active_registry = ActiveWorkerRegistry()
+    cancel_host = create_host_command_handle(
+        cancel_options, active_registry=active_registry
+    )
     first_cancel = _ScriptedLocalWorkerHandle(
         local_worker_id="worker-cancel-first",
         mode=_WORKER_MODE_CANCELLED,
@@ -649,6 +654,7 @@ async def test_queue_promotion_after_terminal_and_cancel_wakes_dispatch(
                 tmp_path / "cancel",
                 store,
                 _SequencedLocalWorkerFactory((first_cancel, promoted_cancel)),
+                active_registry=active_registry,
             )
             try:
                 scheduler.wake_dispatch(_pending_dispatch(cancel_refs))
@@ -1055,12 +1061,15 @@ async def _open_scheduler(
     tmp_path: Path,
     store: HostDurableStore,
     worker_factory: LocalEngineWorkerFactory,
+    *,
+    active_registry: ActiveWorkerRegistry | None = None,
 ) -> HostDispatchScheduler:
     """打开 public/scheduler 集成测试 scheduler。
 
     :param tmp_path: pytest 临时目录。
     :param store: Host durable store。
     :param worker_factory: fake local worker factory。
+    :param active_registry: 可选 active worker registry。
     :returns: 已打开的 dispatch scheduler。
     """
 
@@ -1091,6 +1100,7 @@ async def _open_scheduler(
             worker_factory=worker_factory,
         ),
         host_handle_id="host-phase5-integration",
+        active_registry=active_registry,
     )
 
 

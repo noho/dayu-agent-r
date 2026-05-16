@@ -78,7 +78,10 @@ from dayu.host.durable.transaction import (
     HostTransactionRunner,
     T,
 )
-from dayu.host.dispatch import ActiveCancelMessage, cancel_active_worker
+from dayu.host.dispatch import (
+    ActiveCancelMessage,
+    ActiveWorkerRegistry,
+)
 from dayu.host.waiting import DefaultHostResolveWaitService
 
 _GENERATED_HANDLE_ID_PREFIX = "host-command"
@@ -97,10 +100,12 @@ class HostCommandHandle:
     :param host_handle_id: 稳定诊断 handle id。
     :param durable_store: 当前 handle 私有持有的 durable store。
     :param admission_service: 当前 handle 私有持有的内部 admission service。
+    :param active_registry: 当前 handle 用于 active worker cancel 传播的 registry。
     """
 
     __slots__ = (
         "_admission_service",
+        "_active_registry",
         "_closed",
         "_durable_store",
         "_host_handle_id",
@@ -112,12 +117,14 @@ class HostCommandHandle:
         host_handle_id: str,
         durable_store: HostDurableStore,
         admission_service: HostAdmissionService,
+        active_registry: ActiveWorkerRegistry,
     ) -> None:
         """初始化 Host command handle。
 
         :param host_handle_id: 稳定诊断 handle id。
         :param durable_store: 已打开的 Host durable store。
         :param admission_service: 内部 admission service 依赖。
+        :param active_registry: active worker cancel 传播 registry。
         :returns: 无返回值。
         :raises ValueError: ``host_handle_id`` 为空时抛出。
         """
@@ -127,6 +134,7 @@ class HostCommandHandle:
         self._host_handle_id = host_handle_id
         self._durable_store = durable_store
         self._admission_service = admission_service
+        self._active_registry = active_registry
         self._closed = False
 
     @property
@@ -196,10 +204,13 @@ class HostCommandHandle:
 
 def create_host_command_handle(
     options: HostCommandHandleOptions,
+    *,
+    active_registry: ActiveWorkerRegistry | None = None,
 ) -> HostCommandHandle:
     """创建 Host public command handle。
 
     :param options: Host command handle 公共构造选项。
+    :param active_registry: active worker registry；不传时为当前 handle 创建新 registry。
     :returns: 已打开 durable store 并装配内部依赖的 ``HostCommandHandle``。
     :raises ValueError: ``local_execution`` 非空时抛出；scheduler 需显式异步装配。
     :raises HostDurableConfigError: durable store 配置非法时由底层抛出。
@@ -221,6 +232,11 @@ def create_host_command_handle(
             host_handle_id=_host_handle_id_from_options(options),
             durable_store=durable_store,
             admission_service=admission_service,
+            active_registry=(
+                active_registry
+                if active_registry is not None
+                else ActiveWorkerRegistry()
+            ),
         )
     except Exception:
         durable_store.close()
@@ -365,9 +381,8 @@ def cancel_run(
 ) -> RunSnapshot:
     """取消单个 Run，并返回最新 Run snapshot。
 
-    当前覆盖 queued、pre-dispatch ``STARTING``、pre-accept dispatching 与
-    active worker；``WAITING`` 取消由 Phase 7 负责，``RECOVERING`` 取消由
-    Phase 11 负责。
+    当前覆盖 queued、pre-dispatch ``STARTING``、pre-accept dispatching、
+    active worker 与 ``WAITING``；``RECOVERING`` 取消由 Phase 11 负责。
 
     :param host: Host command handle。
     :param run_id: 目标 Run id。
@@ -397,6 +412,7 @@ def cancel_run(
             ) from exc
         raise
     _propagate_active_cancel_targets(
+        host,
         (
             ActiveCancelMessage(
                 run_id=result.active_cancel_target.run_id,
@@ -418,9 +434,8 @@ def cancel_session_runs(
 ) -> SessionSnapshot:
     """取消指定 Session 下当前支持子集中的所有非终态 Run。
 
-    当前覆盖 queued、pre-dispatch ``STARTING``、pre-accept dispatching 与
-    active worker；``WAITING``、``RECOVERING`` 分别由 Phase 7、Phase 11
-    负责。
+    当前覆盖 queued、pre-dispatch ``STARTING``、pre-accept dispatching、
+    active worker 与 ``WAITING``；``RECOVERING`` 取消由 Phase 11 负责。
 
     :param host: Host command handle。
     :param session_id: 目标 Session id。
@@ -439,6 +454,7 @@ def cancel_session_runs(
         ),
     )
     _propagate_active_cancel_targets(
+        host,
         tuple(
             ActiveCancelMessage(
                 run_id=target.run_id,
@@ -823,16 +839,18 @@ def _operation_context_json_value(context: OperationContext) -> JsonValue:
 
 
 def _propagate_active_cancel_targets(
-    targets: tuple[ActiveCancelMessage, ...]
+    host: HostCommandHandle,
+    targets: tuple[ActiveCancelMessage, ...],
 ) -> None:
     """向 active worker registry best-effort 传播取消。
 
+    :param host: Host command handle。
     :param targets: durable commit 后需要传播的 active cancel 目标集合。
     :returns: ``None``。
     """
 
     for target in targets:
-        cancel_active_worker(target)
+        host._active_registry.cancel(target)
 
 
 def _is_deferred_cancel_state(host: HostCommandHandle, run_id: str) -> bool:

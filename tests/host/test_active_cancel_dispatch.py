@@ -46,7 +46,7 @@ from dayu.host import (
 )
 from dayu.host.admission import PendingDispatchRecord
 from dayu.host.api import AttemptDispatchSnapshot, AttemptStatus, EnsureSessionRequest
-from dayu.host.dispatch import HostDispatchScheduler
+from dayu.host.dispatch import ActiveWorkerRegistry, HostDispatchScheduler
 from dayu.host.durable.connection import HostDurableStore, open_host_durable_store
 from dayu.host.durable.liveness import (
     HostInstanceIdentity,
@@ -342,14 +342,17 @@ async def test_cancel_run_active_worker_propagates_and_closes_cancelled(
     """Attempt RUNNING cancel 进入 CANCELLING，worker run_cancelled 后终态取消。"""
 
     options = _command_options(tmp_path)
-    host = create_host_command_handle(options)
+    active_registry = ActiveWorkerRegistry()
+    host = create_host_command_handle(options, active_registry=active_registry)
     handle = _CancelAwareHandle(local_worker_id="worker-active", terminal="cancelled")
     try:
         session_id = _session_id(host)
         snapshot = start_run(host, _start_request(session_id, "start-active"))
         refs = _refs(options.db_path, snapshot.run_id)
         with open_host_durable_store(_durable_options(tmp_path)) as store:
-            scheduler = await _open_scheduler(tmp_path, store, handle)
+            scheduler = await _open_scheduler(
+                tmp_path, store, handle, active_registry=active_registry
+            )
             try:
                 scheduler.wake_dispatch(_pending_dispatch(refs))
                 drain = await scheduler.drain_once()
@@ -473,7 +476,8 @@ async def test_cancel_session_replay_repropagates_active_without_new_facts(
     """session cancel replay 不追加 facts，但可重放仍 active 的 worker cancel。"""
 
     options = _command_options(tmp_path)
-    host = create_host_command_handle(options)
+    active_registry = ActiveWorkerRegistry()
+    host = create_host_command_handle(options, active_registry=active_registry)
     handle = _CancelAwareHandle(local_worker_id="worker-session", terminal="hang")
     try:
         session_id = _session_id(host)
@@ -481,7 +485,9 @@ async def test_cancel_session_replay_repropagates_active_without_new_facts(
         refs = _refs(options.db_path, snapshot.run_id)
         request = _cancel_session_request("cancel-session")
         with open_host_durable_store(_durable_options(tmp_path)) as store:
-            scheduler = await _open_scheduler(tmp_path, store, handle)
+            scheduler = await _open_scheduler(
+                tmp_path, store, handle, active_registry=active_registry
+            )
             try:
                 scheduler.wake_dispatch(_pending_dispatch(refs))
                 drain = await scheduler.drain_once()
@@ -552,6 +558,7 @@ async def _open_scheduler(
     *,
     worker_factory: LocalEngineWorkerFactory | None = None,
     lane_timeout_seconds: float | None = 0.01,
+    active_registry: ActiveWorkerRegistry | None = None,
 ) -> HostDispatchScheduler:
     """打开测试 scheduler。
 
@@ -560,6 +567,7 @@ async def _open_scheduler(
     :param handle: worker handle。
     :param worker_factory: 可选 worker factory；不传时使用单 handle factory。
     :param lane_timeout_seconds: lane acquire timeout 秒数。
+    :param active_registry: 可选 active worker registry。
     :returns: scheduler。
     """
 
@@ -591,6 +599,7 @@ async def _open_scheduler(
             ),
         ),
         host_handle_id="host-active-cancel",
+        active_registry=active_registry,
     )
 
 

@@ -707,6 +707,7 @@ command path handle 只服务同步治理命令，例如 `start_run`、`submit_f
 - RunInputBuilder。
 - state transition services。
 - typed policy views / immutable policy snapshot refs。
+- active worker cancel registry；默认值只能在 composition root 构造时创建 fresh registry。command handle 与 scheduler 需要共享 active cancel 传播时，必须由 production composition root 显式传入同一个 registry 对象；不得依赖模块级 mutable singleton 或 public helper 绕过 Host handle ownership。
 - clock / id generator。
 - after-commit wakeup port。
 
@@ -1315,7 +1316,6 @@ ATTEMPT_STEERED
 ATTEMPT_LOST
 
 USER_INPUT_ACCEPTED
-FOLLOWUP_QUEUED
 STEER_REQUESTED
 CANCEL_REQUESTED
 RESUME_REQUESTED
@@ -1326,7 +1326,6 @@ TOOL_CALL_REQUESTED
 TOOL_CALL_GOVERNED
 TOOL_RESULT_ACCEPTED
 TOOL_AWAITING
-TOOL_TERMINAL_RESULT
 GUIDANCE_INSERTED
 CONTEXT_COMPACTION_REQUESTED
 CONTEXT_COMPACTED
@@ -1352,10 +1351,10 @@ canonical event contract 必须转成 typed dataclass / enum / validation tests�
 | `ATTEMPT_STARTED` | `session_id`、`run_id`、`attempt_id`、`execution_id` | worker target / dispatch record ref | 创建 Attempt row，status=`STARTING` | resume 不消费，除非用于诊断 | audit yes / Host event stream optional |
 | `ATTEMPT_RUNNING` | `session_id`、`run_id`、`attempt_id`、`execution_id` | worker accepted / dispatch accepted info | Attempt status=`RUNNING` | resume 不消费，除非用于诊断 | audit yes / Host event stream optional |
 | `ATTEMPT_SUCCEEDED` / `ATTEMPT_FAILED` / `ATTEMPT_CANCELLED` / `ATTEMPT_SUSPENDED` / `ATTEMPT_STEERED` / `ATTEMPT_LOST` | `session_id`、`run_id`、`attempt_id`、`execution_id` | terminal reason / error / wait_id | 关闭 Attempt | resume 按需消费 suspended / lost reason | audit yes / Host event stream emit |
-| `FOLLOWUP_QUEUED` / `STEER_REQUESTED` / `CANCEL_REQUESTED` / `RESUME_REQUESTED` / `RETRY_REQUESTED` / `REPLAY_REQUESTED` | `session_id`、`run_id`、operation idempotency key | control input / reason / policy / source_run_id when retry or replay | 触发对应状态机；retry / replay 创建关联新 Run，不重开源 Run | 改变模型语义时进入 messages | audit yes / Host event stream emit |
+| `STEER_REQUESTED` / `CANCEL_REQUESTED` / `RESUME_REQUESTED` / `RETRY_REQUESTED` / `REPLAY_REQUESTED` | `session_id`、`run_id`、operation idempotency key | control input / reason / policy / source_run_id when retry or replay | 触发对应状态机；retry / replay 创建关联新 Run，不重开源 Run | 改变模型语义时进入 messages | audit yes / Host event stream emit |
 | `TOOL_CALL_REQUESTED` | `session_id`、`run_id`、`attempt_id`、`execution_id` | tool_call_id / tool name / normalized args digest | 记录工具调用 intent | accepted into model history 时 resume 消费 | audit 是 / tool trace 是 |
 | `TOOL_CALL_GOVERNED` | `session_id`、`run_id`、`attempt_id`、`execution_id` | policy decision / duplicate key / action | 不直接改 Run；可触发 guidance / hard stop | action 影响模型继续时进入 messages | audit 是 / tool trace 是 |
-| `TOOL_RESULT_ACCEPTED` / `TOOL_TERMINAL_RESULT` | `session_id`、`run_id`、`attempt_id`、`execution_id` | result ref / digest / evidence anchors / status | 记录工具事实 | resume 是 / memory 工具事实 | audit 是 / tool trace 是 |
+| `TOOL_RESULT_ACCEPTED` | `session_id`、`run_id`、`attempt_id`、`execution_id` | result ref / digest / evidence anchors / status；wait terminal result 通过 wait-specific fields 表达来源与状态 | 记录工具事实；P1-P7 accepted waiting terminal result 不另建 `TOOL_TERMINAL_RESULT` canonical fact | resume 是 / memory 工具事实 | audit 是 / tool trace 是 |
 | `TOOL_AWAITING` | `session_id`、`run_id`、`attempt_id`、`execution_id` | wait_id / await_spec / external_job_id | 与 `RUN_WAITING`、`ATTEMPT_SUSPENDED` 同事务创建 wait record；Run -> `WAITING`；Attempt -> `SUSPENDED` | resume 是 | audit 是 / tool trace 是 |
 | `GUIDANCE_INSERTED` | `session_id`、`run_id` | guidance text / source policy / reason | 不直接改 terminal；影响下一 Attempt messages | 插入 messages 时 resume 消费 | audit yes / Host event stream emit |
 | `CONTEXT_COMPACTION_REQUESTED` | `session_id`、`run_id`；`trigger_source=reactive` 时必须有 `attempt_id`、`execution_id`；`trigger_source=proactive` 时可以没有 | trigger source / budget reason / provider error refs / snapshot refs | 触发 context governance；proactive path 是 pre-dispatch input governance；reactive path 可关闭当前 Attempt 并让 Run -> `RECOVERING` | resume 是；memory projection 按需消费 | audit yes / trace 是 |
@@ -1367,7 +1366,7 @@ canonical event 的 required fields 不能被塞进无结构 `metadata`；`metad
 control event 的 `run_id` 绑定规则：
 
 - `STEER_REQUESTED` 的 `run_id` 是被 steer 的目标 Run。
-- `FOLLOWUP_QUEUED` 的 `run_id` 是 queued / created Run。
+- `submit_followup(queue)` 不引入独立 `FOLLOWUP_QUEUED` canonical event；它的 canonical 表达是 `USER_INPUT_ACCEPTED` 加 `RUN_ACCEPTED`，并按 active Run 竞态结果追加 `RUN_QUEUED` 或 `RUN_STARTED`。
 - `RETRY_REQUESTED` 与 `REPLAY_REQUESTED` 的 `run_id` 是源 Run；关联的新 Run 必须通过后续 `RUN_ACCEPTED` 的 `source_run_id` / `source_run_relation` 或等价 typed payload 表达。
 - `RESUME_REQUESTED` 的 `run_id` 是从 `WAITING` / `RECOVERING` 继续的同一 Run。
 - `CANCEL_REQUESTED` 的 `run_id` 是被取消的 Run。
@@ -1927,7 +1926,7 @@ EventLog 规则：
 
 - 工具调用意图进入 `TOOL_CALL_REQUESTED`。
 - policy 决策进入 `TOOL_CALL_GOVERNED`，至少包含 duplicate key、决策、scope、reason、相关 prior event refs。
-- 真正执行并被接受的结果进入 `TOOL_RESULT_ACCEPTED` / `TOOL_TERMINAL_RESULT`。
+- 真正执行并被接受的结果进入 `TOOL_RESULT_ACCEPTED`。P1-P7 的 accepted waiting terminal result 同样使用 `TOOL_RESULT_ACCEPTED` 作为唯一 accepted tool result canonical event，通过 payload 的 wait-specific fields 区分等待完成来源、wait id、resolution kind 与 wait record 状态，避免追加第二份 canonical tool fact。
 - `reuse` 不伪造新的工具事实；它引用 prior accepted result，并在 messages 中表达为 Host 复用的已接受事实。
 - audit / tool trace 必须能解释为什么某次重复调用被允许、复用、提示或阻断。
 

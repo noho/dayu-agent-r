@@ -1648,7 +1648,10 @@ Phase 按依赖关系推进：先实现被其它阶段依赖的公共契约、ru
 
 - `accept_worker_running_in_transaction` 诊断 payload 弱于 scheduler 生产路径；owner 为 Host durable transition hardening。
 - `mark_dispatching_after_lane_row` 底层 helper 能力宽于生产 scheduler 路径；owner 为 Host durable API tightening。
-- `DEFAULT_ACTIVE_WORKER_REGISTRY` module-level singleton 的多 handle cancel 边界风险；owner 为 Host dispatch lifecycle hardening。
+- active worker registry composition root 边界已由
+  `docs/reviews/p1-p7-design-goals-fix-codex-20260516.md` 关闭：模块级
+  `DEFAULT_ACTIVE_WORKER_REGISTRY` / `cancel_active_worker()` 已移除，command handle 与 scheduler 默认各自创建 fresh
+  registry，需要 active cancel 传播时由 production composition root 显式传同一个 `ActiveWorkerRegistry`。
 - terminal closeout 后 queue promotion wakeup failure 的诊断 / 抑制策略；owner 为 Host dispatch lifecycle hardening。
 - active cancel watchdog、stuck `CANCELLING` 与 orphan recovery；owner 为 Phase 11. Host Lifecycle / Recovery / Multi-process Hardening。
 - RemoteProxy 语义与远端迟到事件治理；owner 为 Phase 14. RemoteProxy / RemoteStub。
@@ -2038,7 +2041,7 @@ RunInputBuilder / local dispatch / local proxy / Engine ingest / cancel、跨 ph
 blocking 设计偏离；PR 54 不需要进入新的 fix gate，仍为 draft review-ready。Non-blocking hardening / cleanup 均已有 owner：
 `accept_worker_running_in_transaction` 诊断 payload 弱于 scheduler 生产路径归 Host durable transition hardening；
 `mark_dispatching_after_lane_row` 底层 helper 能力宽于生产 scheduler 路径归 Host durable API tightening；
-`DEFAULT_ACTIVE_WORKER_REGISTRY` module-level singleton 的多 handle cancel 边界风险归 Host dispatch lifecycle hardening；compact
+active worker registry composition root 边界已由 P1-P7 design-goals fix 关闭；compact
 artifact message slot 与 plan 摘要顺序不完全一致归 Phase 10 / RunInputBuilder documentation cleanup。其它 residual risk 维持既有
 owner：terminal promotion wakeup failure 归 Host dispatch lifecycle hardening，active cancel watchdog / stuck `CANCELLING` /
 orphan recovery 归 Phase 11，RemoteProxy 归 Phase 14，ToolRuntime / `fetch_more` 归 Phase 6，WAITING / `resolve_wait` 归
