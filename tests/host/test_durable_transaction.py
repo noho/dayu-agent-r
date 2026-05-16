@@ -29,7 +29,14 @@ from dayu.host.durable.options import (
     HostSQLiteStoragePolicy,
     PayloadStoragePolicy,
 )
-from dayu.host.durable.transaction import HostTransaction, HostTransactionRunner
+from dayu.host.durable.transaction import (
+    HostTransaction,
+    HostTransactionRunner,
+    _is_busy_or_locked,
+)
+
+_SQLITE_BUSY_EXTENDED_TEST_CODE = sqlite3.SQLITE_BUSY | (1 << 8)
+_SQLITE_LOCKED_EXTENDED_TEST_CODE = sqlite3.SQLITE_LOCKED | (2 << 8)
 
 
 def _options(
@@ -273,6 +280,24 @@ def test_busy_locked_retries_are_finite_and_do_not_run_after_commit(
             lock_connection.close()
         assert operation_calls == []
         assert callback_events == []
+
+
+@pytest.mark.parametrize(
+    "sqlite_errorcode",
+    (
+        _SQLITE_BUSY_EXTENDED_TEST_CODE,
+        _SQLITE_LOCKED_EXTENDED_TEST_CODE,
+    ),
+)
+def test_busy_locked_classification_accepts_extended_result_codes(
+    sqlite_errorcode: int,
+) -> None:
+    """busy / locked retry 分类必须识别 SQLite extended result code。"""
+
+    error = sqlite3.OperationalError("synthetic busy or locked")
+    setattr(error, "sqlite_errorcode", sqlite_errorcode)
+
+    assert _is_busy_or_locked(error)
 
 
 def test_unique_and_foreign_key_errors_are_not_retried(tmp_path: Path) -> None:

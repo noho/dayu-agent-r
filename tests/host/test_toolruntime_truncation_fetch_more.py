@@ -188,8 +188,9 @@ async def test_fetch_more_dispatches_as_normal_tool_and_is_single_use() -> None:
     second_outcome = second.records[0].outcome
     assert isinstance(first_outcome, ToolCompletedOutcome)
     assert first_outcome.result.value == "EFGHIJ"
+    assert cursor not in _manager_from_handle(handle)._cursors
     assert isinstance(second_outcome, ToolFailedOutcome)
-    assert second_outcome.result.hint == "cursor_already_used"
+    assert second_outcome.result.hint == "missing_cursor"
     assert [candidate.tool_name for candidate in accept_port.candidates] == [
         "fake_tool",
         "fetch_more",
@@ -259,6 +260,26 @@ async def test_fetch_more_rejects_ttl_expiry() -> None:
     record = outcome.records[0]
     assert isinstance(record.outcome, ToolFailedOutcome)
     assert record.outcome.result.hint == "cursor_expired"
+    assert cursor not in _manager_from_handle(handle)._cursors
+
+
+@pytest.mark.asyncio
+async def test_store_cursor_cleans_expired_cursors_bounded() -> None:
+    """新增 cursor 时有界清理已过期 cursor。"""
+
+    handle, _accept_port = _handle(_TextTool("ABCDEFGHIJ"), _truncate_spec(max_chars=4))
+    first_cursor, _first_scope_token = await _create_cursor(handle)
+    manager = _manager_from_handle(handle)
+    stored = manager._cursors[first_cursor]
+    manager._cursors[first_cursor] = replace(
+        stored,
+        expires_at=stored.created_at,
+    )
+
+    second_cursor, _second_scope_token = await _create_cursor(handle)
+
+    assert first_cursor not in manager._cursors
+    assert second_cursor in manager._cursors
 
 
 @pytest.mark.asyncio
@@ -498,7 +519,7 @@ def _truncate_spec(max_chars: int, ttl_seconds: int | None = None) -> ToolTrunca
 
     return ToolTruncateSpec(
         enabled=True,
-        strategy=ToolTruncationStrategy.TEXT_CHARS.value,
+        strategy=ToolTruncationStrategy.TEXT_CHARS,
         limits={"max_chars": max_chars},
         target_field=None,
         field_path=None,

@@ -506,7 +506,7 @@ def _truncate_spec() -> ToolTruncateSpec:
 
     return ToolTruncateSpec(
         enabled=True,
-        strategy=ToolTruncationStrategy.TEXT_CHARS.value,
+        strategy=ToolTruncationStrategy.TEXT_CHARS,
         limits={"max_chars": 9},
         target_field="accepted_value",
         field_path=None,

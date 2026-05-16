@@ -112,6 +112,9 @@ _REASON_WAITING_EVENT_CONFIRMATION = "waiting_event_confirmation"
 _REASON_WAITING_EVENT_WITHOUT_HOST_ACCEPTED_REFS = (
     "waiting_event_without_host_accepted_refs"
 )
+_REASON_RUN_CANCELLED_INVALID_ACTIVE_CANCEL_PAYLOAD = (
+    "run_cancelled_invalid_active_cancel_payload"
+)
 _OWNER_PHASE7 = "phase7"
 _OWNER_PHASE10 = "phase10"
 
@@ -674,10 +677,13 @@ class EngineEventIngestor:
                 candidate=candidate,
                 reason="run_cancelled_without_active_cancel",
             )
-        cancel_request_event_id = _required_payload_text(
-            _payload_object(cancelling),
-            field_name="cancel_request_event_id",
-        )
+        cancel_request_event_id = _cancel_request_event_id_from_cancelling(cancelling)
+        if cancel_request_event_id is None:
+            return self._append_rejected_diagnostic(
+                transaction,
+                candidate=candidate,
+                reason=_REASON_RUN_CANCELLED_INVALID_ACTIVE_CANCEL_PAYLOAD,
+            )
         result = active_cancel_closeout_in_transaction(
             transaction,
             self._event_log_store,
@@ -1855,6 +1861,25 @@ def _tool_awaiting_payload(
         "unsupported_later_owner": _OWNER_PHASE7,
     }
 
+
+def _cancel_request_event_id_from_cancelling(event: EventLogRow) -> str | None:
+    """从 ``RUN_CANCELLING`` fact 读取 active cancel request event id。
+
+    durable 事件 payload 可能被外部写入或历史 bug 破坏；ingest 不能让该
+    结构错误逃逸出事务边界，而应把当前 Engine terminal candidate 收敛为
+    受治理 rejected diagnostic。
+
+    :param event: 最新 ``RUN_CANCELLING`` EventLog row。
+    :returns: cancel request event id；payload 缺失或非法时返回 ``None``。
+    """
+
+    try:
+        return _required_payload_text(
+            _payload_object(event),
+            field_name="cancel_request_event_id",
+        )
+    except HostDurableError:
+        return None
 
 
 def _single_event_result(row: EventLogRow) -> EngineIngestResult:

@@ -19,6 +19,7 @@ from dayu.contracts import (
     ToolResultSuccess,
     ToolSchema,
     ToolTruncateSpec,
+    ToolTruncationStrategy,
     tool,
 )
 
@@ -75,7 +76,7 @@ def _truncate_spec() -> ToolTruncateSpec:
 
     return ToolTruncateSpec(
         enabled=True,
-        strategy="text_chars",
+        strategy=ToolTruncationStrategy.TEXT_CHARS,
         limits={"max_chars": 8},
         target_field=None,
         field_path=None,

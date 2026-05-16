@@ -681,6 +681,81 @@ def test_run_cancelled_without_active_cancel_is_rejected(tmp_path: Path) -> None
         assert attempt_status == AttemptStatus.RUNNING
 
 
+def test_run_cancelled_with_malformed_active_cancel_payload_is_rejected(
+    tmp_path: Path,
+) -> None:
+    """RUN_CANCELLING payload 缺少 request id 时返回 rejected diagnostic。"""
+
+    with open_host_durable_store(_options(tmp_path)) as store:
+        seeded = _seed_active_run(store.transaction_runner)
+        store.transaction_runner.run_write(
+            _AppendMalformedRunCancellingOperation(seeded)
+        )
+        candidate = _candidate(
+            seeded,
+            worker_event_index=16,
+            data=RunCancelledData(
+                reason="user_stop",
+                requested_at=_NOW,
+                accepted_at=_NOW,
+                finished_at=_NOW,
+            ),
+            event_type=EngineEventType.RUN_CANCELLED,
+        )
+
+        result = EngineEventIngestor(
+            transaction_runner=store.transaction_runner
+        ).ingest(candidate)
+
+        assert result.status == EngineIngestStatus.REJECTED
+        assert _payload(result.events[0])["reason"] == (
+            "run_cancelled_invalid_active_cancel_payload"
+        )
+        run_status, attempt_status = _statuses(store.transaction_runner, seeded)
+        assert run_status == RunStatus.RUNNING
+        assert attempt_status == AttemptStatus.RUNNING
+
+
+@dataclass(frozen=True, slots=True)
+class _AppendMalformedRunCancellingOperation:
+    """写入缺少 ``cancel_request_event_id`` 的 RUN_CANCELLING fact。
+
+    :param seeded: 已创建的 active run 测试数据。
+    """
+
+    seeded: _SeededRun
+
+    def __call__(self, transaction: HostTransaction) -> None:
+        """执行测试数据写入。
+
+        :param transaction: Host transaction。
+        :returns: ``None``。
+        """
+
+        EventLogStore().append_event(
+            transaction,
+            EventLogAppendRequest(
+                event_id="event-run-cancelling-malformed",
+                event_class=EventClass.CANONICAL_FACT,
+                session_id=self.seeded.session_id,
+                run_id=self.seeded.run_id,
+                attempt_id=self.seeded.attempt_id,
+                execution_id=self.seeded.execution_id,
+                event_type="RUN_CANCELLING",
+                occurred_at=_NOW,
+                actor="tester",
+                source="pytest",
+                client_request_id=None,
+                idempotency_key=None,
+                policy_decision=None,
+                reason="malformed",
+                payload_json={"reason": "malformed"},
+                payload_ref=None,
+                payload_digest=None,
+            ),
+        )
+
+
 def test_worker_lost_closeout_uses_lost_event_ids_and_duplicate(
     tmp_path: Path,
 ) -> None:
