@@ -411,6 +411,13 @@ C-P1P7-001：P7 awaiting production wiring 未接入 `HostDispatchScheduler`。�
 Controller fix adjudication artifact 为
 `docs/reviews/p1-p7-design-conformance-fix-controller-adjudication-20260516.md`，MiMo / DS fix re-review 均 PASS；
 本地 accepted fix checkpoint commit 为 `d03e064`。
+随后用户明确决定 `fetch_more` cursor 只存在内存，其它 review findings 改按当前 `docs/host/design.md` 的设计目标与最佳实践裁决。
+Controller decision artifact 为 `docs/reviews/p1-p7-design-goals-controller-decision-20260516.md`，Codex fix artifact 为
+`docs/reviews/p1-p7-design-goals-fix-codex-20260516.md`，MiMo / DS fix review artifact 为
+`docs/reviews/p1-p7-design-goals-fix-review-mimo-20260516.md` 与
+`docs/reviews/p1-p7-design-goals-fix-review-ds-20260516.md`，final adjudication artifact 为
+`docs/reviews/p1-p7-design-goals-fix-controller-adjudication-20260516.md`。本地 accepted design-goals fix checkpoint commit 为
+`86bcc5a`。
 
 ## Phase Map
 
