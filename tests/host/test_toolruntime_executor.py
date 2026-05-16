@@ -27,6 +27,8 @@ from dayu.contracts.tool_schema import (
     ToolParametersSchema,
     ToolSchema,
 )
+from dayu.host.api import WaitAdapterKey
+from dayu.host.durable.state import WaitResumePolicy
 from dayu.host.tool_runtime import (
     DefaultToolRuntimeFactory,
     EffectiveToolBundleBuildRequest,
@@ -34,6 +36,7 @@ from dayu.host.tool_runtime import (
     HostEventRef,
     HostPayloadRef,
     HostToolFactAcceptPort,
+    HostToolAwaitingAcceptPort,
     ToolAcceptRejectReason,
     ToolAcceptRetryPolicy,
     ToolFactAcceptCandidate,
@@ -42,6 +45,13 @@ from dayu.host.tool_runtime import (
     ToolFactAcceptedAck,
     ToolFactKind,
     ToolFactRejectedAck,
+    ToolAwaitingAcceptRejectReason,
+    ToolAwaitingAcceptCandidate,
+    ToolAwaitingAcceptResult,
+    ToolAwaitingAcceptedAck,
+    ToolAwaitingAcceptTimedOut,
+    ToolAwaitingEventRef,
+    ToolAwaitingRejectedAck,
     ToolPolicyDecision,
     ToolPolicyDecisionKind,
     ToolRuntimeBuildRequest,
@@ -49,6 +59,11 @@ from dayu.host.tool_runtime import (
     ToolRuntimePolicyView,
     ToolRuntimeToolPolicy,
     ToolSideEffectKind,
+)
+from dayu.host.wait_adapter import (
+    WaitAdapterBinding,
+    WaitAdapterRegistry,
+    WaitExternalJobRefSource,
 )
 from dayu.host.durable.codec import sha256_digest_json
 from dayu.host.durable.errors import HostTransactionRetryExhaustedError
@@ -218,6 +233,89 @@ class _RetryExhaustedAcceptPort(HostToolFactAcceptPort):
         )
 
 
+class _AwaitingAcceptPort(HostToolAwaitingAcceptPort):
+    """记录 awaiting candidate 并返回 accepted ack 的 fake port。"""
+
+    def __init__(self) -> None:
+        """初始化 fake awaiting accept port。
+
+        :returns: ``None``。
+        """
+
+        self.candidates: list[ToolAwaitingAcceptCandidate] = []
+
+    def accept_tool_awaiting(
+        self, candidate: ToolAwaitingAcceptCandidate
+    ) -> ToolAwaitingAcceptResult:
+        """记录 candidate 并返回 accepted ack。
+
+        :param candidate: awaiting candidate。
+        :returns: accepted ack。
+        """
+
+        self.candidates.append(candidate)
+        return ToolAwaitingAcceptedAck(
+            accepted_event_refs=(
+                ToolAwaitingEventRef(
+                    event_id=f"event-tool-awaiting-{candidate.tool_call_id}",
+                    event_sequence=1,
+                ),
+                ToolAwaitingEventRef(
+                    event_id=f"event-run-waiting-{candidate.tool_call_id}",
+                    event_sequence=2,
+                ),
+                ToolAwaitingEventRef(
+                    event_id=f"event-attempt-suspended-{candidate.tool_call_id}",
+                    event_sequence=3,
+                ),
+            ),
+            wait_id=candidate.wait_id,
+            tool_awaiting_event_ref=ToolAwaitingEventRef(
+                event_id=f"event-tool-awaiting-{candidate.tool_call_id}",
+                event_sequence=1,
+            ),
+            run_waiting_event_ref=ToolAwaitingEventRef(
+                event_id=f"event-run-waiting-{candidate.tool_call_id}",
+                event_sequence=2,
+            ),
+            attempt_suspended_event_ref=ToolAwaitingEventRef(
+                event_id=f"event-attempt-suspended-{candidate.tool_call_id}",
+                event_sequence=3,
+            ),
+            result_digest=candidate.semantic_input_digest,
+            idempotency_record_ref=f"awaiting:{candidate.wait_id}",
+        )
+
+
+class _SequencedAwaitingAcceptPort(HostToolAwaitingAcceptPort):
+    """按序返回 awaiting accept 结果的 fake port。"""
+
+    def __init__(self, results: tuple[ToolAwaitingAcceptResult, ...]) -> None:
+        """初始化 fake awaiting accept port。
+
+        :param results: 每次 awaiting accept 调用返回的结果序列。
+        :returns: ``None``。
+        """
+
+        self._results = results
+        self.candidates: list[ToolAwaitingAcceptCandidate] = []
+
+    def accept_tool_awaiting(
+        self, candidate: ToolAwaitingAcceptCandidate
+    ) -> ToolAwaitingAcceptResult:
+        """记录 candidate 并返回脚本化结果。
+
+        :param candidate: awaiting candidate。
+        :returns: 脚本化 awaiting accept 结果。
+        """
+
+        self.candidates.append(candidate)
+        index = len(self.candidates) - 1
+        if index >= len(self._results):
+            return _AwaitingAcceptPort().accept_tool_awaiting(candidate)
+        return self._results[index]
+
+
 @pytest.mark.asyncio
 async def test_fake_tool_result_returns_only_after_accepted_ack() -> None:
     """fake tool 原始结果只有 accepted ack 后才返回给 Engine。"""
@@ -346,8 +444,35 @@ async def test_side_effect_tool_missing_idempotency_key_never_calls_callable() -
 
 
 @pytest.mark.asyncio
-async def test_awaiting_outcome_becomes_governed_error_candidate() -> None:
-    """awaiting outcome 只能进入 governed_error fact，不进入 WAITING。"""
+async def test_awaiting_outcome_returns_only_after_awaiting_accepted_ack() -> None:
+    """awaiting outcome 只有 Host awaiting accepted ack 后才返回给 Engine。"""
+
+    callable_ = _AwaitingCallable()
+    accept_port = _SequencedAcceptPort((_accepted_ack_for_call("tool-call-1"),))
+    awaiting_accept_port = _AwaitingAcceptPort()
+    executor = _executor(
+        callable_,
+        accept_port,
+        awaiting_accept_port=awaiting_accept_port,
+        wait_adapter_registry=_wait_adapter_registry(),
+    )
+
+    outcome = await executor.execute(_request(_call("tool-call-1")))
+
+    record = outcome.records[0]
+    assert callable_.call_count == 1
+    assert accept_port.candidates == []
+    assert len(awaiting_accept_port.candidates) == 1
+    assert isinstance(record.outcome, ToolAwaitingOutcome)
+    assert awaiting_accept_port.candidates[0].external_job_ref is not None
+    assert awaiting_accept_port.candidates[0].external_job_ref.external_job_id == (
+        "resume-token"
+    )
+
+
+@pytest.mark.asyncio
+async def test_awaiting_outcome_without_adapter_binding_is_governed_error() -> None:
+    """缺少 Host adapter binding 时 awaiting outcome 不进入普通 accept。"""
 
     callable_ = _AwaitingCallable()
     accept_port = _SequencedAcceptPort((_accepted_ack_for_call("tool-call-1"),))
@@ -356,13 +481,115 @@ async def test_awaiting_outcome_becomes_governed_error_candidate() -> None:
     outcome = await executor.execute(_request(_call("tool-call-1")))
 
     record = outcome.records[0]
-    candidate = accept_port.candidates[0]
     assert callable_.call_count == 1
-    assert candidate.tool_fact_kind is ToolFactKind.GOVERNED_ERROR
-    assert candidate.policy_decision.kind is ToolPolicyDecisionKind.GOVERNED_ERROR
-    assert candidate.policy_decision.reason_code == "unsupported_awaiting"
+    assert accept_port.candidates == []
     assert isinstance(record.outcome, ToolFailedOutcome)
-    assert record.outcome.result.hint == "unsupported_awaiting"
+    assert record.outcome.result.hint == "awaiting_adapter_not_configured"
+
+
+@pytest.mark.asyncio
+async def test_awaiting_accept_rejected_returns_governed_error() -> None:
+    """awaiting accept rejected ack 不向 Engine 暴露 awaiting outcome。"""
+
+    callable_ = _AwaitingCallable()
+    accept_port = _SequencedAcceptPort((_accepted_ack_for_call("tool-call-1"),))
+    awaiting_accept_port = _SequencedAwaitingAcceptPort(
+        (
+            ToolAwaitingRejectedAck(
+                reason_code=ToolAwaitingAcceptRejectReason.IDEMPOTENCY_CONFLICT,
+                message="awaiting conflict",
+                retryable=False,
+            ),
+        )
+    )
+    executor = _executor(
+        callable_,
+        accept_port,
+        awaiting_accept_port=awaiting_accept_port,
+        wait_adapter_registry=_wait_adapter_registry(),
+    )
+
+    outcome = await executor.execute(_request(_call("tool-call-1")))
+
+    record = outcome.records[0]
+    assert isinstance(record.outcome, ToolFailedOutcome)
+    assert record.outcome.result.error == "tool_awaiting_accept_rejected"
+    assert record.outcome.result.hint == "accept_rejected:idempotency_conflict"
+
+
+@pytest.mark.asyncio
+async def test_awaiting_accept_timeout_returns_governed_error() -> None:
+    """awaiting accept timeout 不向 Engine 暴露 awaiting outcome。"""
+
+    callable_ = _AwaitingCallable()
+    accept_port = _SequencedAcceptPort((_accepted_ack_for_call("tool-call-1"),))
+    awaiting_accept_port = _SequencedAwaitingAcceptPort(
+        (
+            ToolAwaitingAcceptTimedOut(
+                attempt_count=1,
+                last_error_code="accept_ack_lost",
+            ),
+        )
+    )
+    executor = _executor(
+        callable_,
+        accept_port,
+        awaiting_accept_port=awaiting_accept_port,
+        wait_adapter_registry=_wait_adapter_registry(),
+    )
+
+    outcome = await executor.execute(_request(_call("tool-call-1")))
+
+    record = outcome.records[0]
+    assert isinstance(record.outcome, ToolFailedOutcome)
+    assert record.outcome.result.error == "tool_awaiting_accept_timeout"
+    assert record.outcome.result.hint == "accept_ack_lost"
+
+
+@pytest.mark.asyncio
+async def test_poll_awaiting_without_external_job_ref_is_governed_error() -> None:
+    """POLL binding 未派生 external_job_ref 时返回受治理错误。"""
+
+    callable_ = _AwaitingCallable()
+    accept_port = _SequencedAcceptPort((_accepted_ack_for_call("tool-call-1"),))
+    awaiting_accept_port = _AwaitingAcceptPort()
+    executor = _executor(
+        callable_,
+        accept_port,
+        awaiting_accept_port=awaiting_accept_port,
+        wait_adapter_registry=_wait_adapter_registry_without_external_job_ref(),
+    )
+
+    outcome = await executor.execute(_request(_call("tool-call-1")))
+
+    record = outcome.records[0]
+    assert awaiting_accept_port.candidates == []
+    assert isinstance(record.outcome, ToolFailedOutcome)
+    assert record.outcome.result.hint == "awaiting_external_job_missing"
+
+
+@pytest.mark.asyncio
+async def test_awaiting_outcome_stops_remaining_batch_calls() -> None:
+    """批内首个 awaiting accepted 后不得继续调用后续业务工具。"""
+
+    callable_ = _AwaitingCallable()
+    accept_port = _SequencedAcceptPort((_accepted_ack_for_call("tool-call-1"),))
+    executor = _executor(
+        callable_,
+        accept_port,
+        awaiting_accept_port=_AwaitingAcceptPort(),
+        wait_adapter_registry=_wait_adapter_registry(),
+    )
+
+    outcome = await executor.execute(
+        _request(_call("tool-call-1"), _call("tool-call-2"))
+    )
+
+    first, second = (record.outcome for record in outcome.records)
+    assert callable_.call_count == 1
+    assert isinstance(first, ToolAwaitingOutcome)
+    assert isinstance(second, ToolFailedOutcome)
+    assert second.result.hint == "run_suspended_by_tool_awaiting"
 
 
 @pytest.mark.asyncio
@@ -433,6 +660,8 @@ def _executor(
     callable_: _CountingCallable | _AwaitingCallable,
     accept_port: HostToolFactAcceptPort,
     *,
+    awaiting_accept_port: HostToolAwaitingAcceptPort | None = None,
+    wait_adapter_registry: WaitAdapterRegistry | None = None,
     retry_policy: ToolAcceptRetryPolicy | None = None,
     policy_view: ToolRuntimePolicyView | None = None,
     allow_tool_calls: bool = True,
@@ -441,6 +670,8 @@ def _executor(
 
     :param callable_: fake 工具 callable。
     :param accept_port: fake accept port。
+    :param awaiting_accept_port: fake awaiting accept port。
+    :param wait_adapter_registry: wait adapter registry。
     :param retry_policy: accept retry policy。
     :param policy_view: Host 内部工具 policy view。
     :param allow_tool_calls: ToolRuntime scope 是否允许工具调用。
@@ -465,6 +696,8 @@ def _executor(
                 allow_tool_calls=allow_tool_calls,
             ),
             accept_port=accept_port,
+            awaiting_accept_port=awaiting_accept_port,
+            wait_adapter_registry=wait_adapter_registry,
             retry_policy=(
                 retry_policy
                 if retry_policy is not None
@@ -566,6 +799,44 @@ def _source_ref() -> ToolBundleSourceRef:
     return ToolBundleSourceRef(
         source_kind=ToolBundleSourceKind.EXPLICIT_PROVIDER,
         source_id="toolruntime-test",
+    )
+
+
+def _wait_adapter_registry() -> WaitAdapterRegistry:
+    """构造测试用 wait adapter registry。
+
+    :returns: wait adapter registry。
+    """
+
+    return WaitAdapterRegistry(
+        (
+            WaitAdapterBinding(
+                tool_name="fake_tool",
+                await_kind=ToolAwaitKind.EXTERNAL_JOB,
+                adapter_key=WaitAdapterKey("poll:fake-tool"),
+                resume_policy=WaitResumePolicy.POLL,
+                external_job_ref_source=WaitExternalJobRefSource.RESUME_TOKEN,
+            ),
+        )
+    )
+
+
+def _wait_adapter_registry_without_external_job_ref() -> WaitAdapterRegistry:
+    """构造不会派生 external job ref 的 poll registry。
+
+    :returns: wait adapter registry。
+    """
+
+    return WaitAdapterRegistry(
+        (
+            WaitAdapterBinding(
+                tool_name="fake_tool",
+                await_kind=ToolAwaitKind.EXTERNAL_JOB,
+                adapter_key=WaitAdapterKey("poll:fake-tool"),
+                resume_policy=WaitResumePolicy.POLL,
+                external_job_ref_source=WaitExternalJobRefSource.NONE,
+            ),
+        )
     )
 
 

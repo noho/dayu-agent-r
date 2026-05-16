@@ -296,10 +296,10 @@ def test_context_compaction_requested_accepts_none_budget_and_fails(
         assert run_status == RunStatus.FAILED
 
 
-def test_run_suspended_fails_waiting_path_and_duplicate_is_idempotent(
+def test_run_suspended_only_writes_diagnostic_and_duplicate_is_idempotent(
     tmp_path: Path,
 ) -> None:
-    """run_suspended 在 Phase 5 写 diagnostic 后 FAILED，重复 ingest 返回 DUPLICATE。"""
+    """run_suspended 只写 diagnostic，不创建 wait state 或失败收口。"""
 
     with open_host_durable_store(_options(tmp_path)) as store:
         seeded = _seed_active_run(store.transaction_runner)
@@ -323,17 +323,18 @@ def test_run_suspended_fails_waiting_path_and_duplicate_is_idempotent(
         assert second.status == EngineIngestStatus.DUPLICATE
         assert [event.event_type for event in first.events] == [
             "ENGINE_EVENT_DIAGNOSTIC",
-            "ATTEMPT_FAILED",
-            "RUN_FAILED",
         ]
-        assert _payload(first.events[0])["unsupported_later_owner"] == "phase7"
-        assert _event_count(store.transaction_runner, "RUN_FAILED") == 1
+        assert _payload(first.events[0])["run_status"] == "running"
+        assert _event_count(store.transaction_runner, "RUN_FAILED") == 0
+        run_status, attempt_status = _statuses(store.transaction_runner, seeded)
+        assert run_status == RunStatus.RUNNING
+        assert attempt_status == AttemptStatus.RUNNING
 
 
-def test_tool_awaiting_fails_waiting_path_and_duplicate_is_idempotent(
+def test_tool_awaiting_only_writes_diagnostic_and_duplicate_is_idempotent(
     tmp_path: Path,
 ) -> None:
-    """tool_awaiting 在 Phase 5 写 diagnostic 后 FAILED，重复 ingest 返回 DUPLICATE。"""
+    """tool_awaiting 只写 diagnostic，不创建 wait state 或失败收口。"""
 
     with open_host_durable_store(_options(tmp_path)) as store:
         seeded = _seed_active_run(store.transaction_runner)
@@ -355,10 +356,11 @@ def test_tool_awaiting_fails_waiting_path_and_duplicate_is_idempotent(
         assert second.status == EngineIngestStatus.DUPLICATE
         assert [event.event_type for event in first.events] == [
             "ENGINE_EVENT_DIAGNOSTIC",
-            "ATTEMPT_FAILED",
-            "RUN_FAILED",
         ]
-        assert _event_count(store.transaction_runner, "RUN_FAILED") == 1
+        assert _event_count(store.transaction_runner, "RUN_FAILED") == 0
+        run_status, attempt_status = _statuses(store.transaction_runner, seeded)
+        assert run_status == RunStatus.RUNNING
+        assert attempt_status == AttemptStatus.RUNNING
 
 
 def test_usage_reported_is_projection_signal_without_state_change(

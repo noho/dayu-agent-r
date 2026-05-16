@@ -8,21 +8,22 @@
 
 当前包根导出包含以下类型：
 
-- constants：`HOST_EVENT_STREAM_DEFAULT_LIMIT`、`HOST_EVENT_STREAM_MAX_LIMIT`。
+- constants：`HOST_EVENT_STREAM_DEFAULT_LIMIT`、`HOST_EVENT_STREAM_MAX_LIMIT`，以及 wait record / wait adapter / wait snapshot / external job / payload ref 的公共长度上限常量。
 - status / enum：`SessionStatus`、`RunStatus`、`AttemptStatus`、`FollowupBehavior`、`CancelMode`、`WaitResolutionSource`、`SourceRunRelation`、`HostApiErrorCode`。
-- context / input：`OperationContext`、`AuthorizationClaim`、`HostCallContext`、`HostMetadataEntry`、`HostInput`、`SessionSlotRef`、`HostStreamCursor`。
+- context / input：`OperationContext`、`AuthorizationClaim`、`HostCallContext`、`HostMetadataEntry`、`HostInput`、`SessionSlotRef`、`HostStreamCursor`、`HostPayloadRef`。
 - command handle：`HostCommandHandle`、`create_host_command_handle`、`HostCommandFacet`；public handle 只暴露稳定 `host_handle_id` 与幂等 `close()`，不暴露 durable store、transaction runner、store connection 或 admission service。
 - command handle options：`HostCommandHandleOptions`，显式描述 Host command handle 的 durable DB、artifact root、SQLite timeout / retry、payload inline threshold 与可选本地执行构造选项。
 - local execution options：`HostLocalExecutionOptions`、`LocalWorkerHandle`、`LocalEngineWorker`、`LocalEngineWorkerFactory`，描述 Host 本地 dispatch scheduler 接入 runtime lane、Runner 配置、Agent policy 与 LocalProxy worker factory 的 typed 边界。
 - Session facade：`ensure_session`、`create_session`、`get_session`、`close_session`，均返回 `SessionSnapshot`。
 - Run facade：`start_run`、`submit_followup`、`get_run`、`stream_run_events`、`cancel_run`、`cancel_session_runs`；当前 command 路径覆盖 admission、pending dispatch wakeup、本地 no-tool dispatch baseline 与 active worker cancel 子集，读取路径只使用 durable Run / EventLog truth。
-- deferred facade：`retry_run`、`replay_run`、`resolve_wait`、`purge_session` 当前是 stable unsupported public functions，固定返回 `UNSUPPORTED_OPERATION`，不追加 EventLog，也不写 idempotency record。
-- requests：`EnsureSessionRequest`、`CreateSessionRequest`、`CloseSessionRequest`、`PurgeSessionRequest`、`StartRunRequest`、`CancelRunRequest`、`CancelSessionRunsRequest`、`SubmitFollowupRequest`、`RetryRunRequest`、`ReplayRunRequest`、`ResolveWaitRequest`。
+- Wait facade：`resolve_wait` 接收 active wait result，并按 outcome 原子恢复或收口等待中的 Run。
+- deferred facade：`retry_run`、`replay_run`、`purge_session` 当前是 stable unsupported public functions，固定返回 `UNSUPPORTED_OPERATION`，不追加 EventLog，也不写 idempotency record。
+- requests：`EnsureSessionRequest`、`CreateSessionRequest`、`CloseSessionRequest`、`PurgeSessionRequest`、`StartRunRequest`、`CancelRunRequest`、`CancelSessionRunsRequest`、`SubmitFollowupRequest`、`RetryRunRequest`、`ReplayRunRequest`、`ResolveWaitRequest`，以及 `ResolveWaitCompletedOutcome`、`ResolveWaitFailedOutcome`、`ResolveWaitCancelledOutcome`、`ResolveWaitLostOutcome`、`WaitAdapterKey`、`WaitProviderStatusRef`。
 - snapshots / stream：`TerminalResultSummary`、`OutboxSummary`、`SessionSnapshot`、`RunSnapshot`、`FollowupSnapshot`、`PurgeSessionResult`、`HostEventView`、`HostEventStream`。
 - error：`HostApiError`、`HostApiErrorDetail`、`SteerConflictDetail`。
 - tooling construction options：`ToolBundleSourceKind`、`FrameworkToolName`、`ToolBundleSourceRef`、`FrameworkToolPolicyView`、`HostToolingOptions`、`default_framework_tool_policy_view`。
 
-`dayu.host.api.__all__` 包含 request、snapshot、status、error、context、stream cursor 与本地执行配置契约类型。Session / Run read facade 位于 `dayu.host.read_api`，Session / Run command facade 与 deferred facade 位于 `dayu.host.command`，并由包根导出，但不进入 `dayu.host.api`。Host construction tooling 类型位于 `dayu.host.tooling`，由包根导出，但不进入 `dayu.host.api`。
+`dayu.host.api.__all__` 包含 request、snapshot、status、error、context、stream cursor 与本地执行配置契约类型。Session / Run read facade 位于 `dayu.host.read_api`，Session / Run command facade、Wait command facade 与 deferred facade 位于 `dayu.host.command`，并由包根导出，但不进入 `dayu.host.api`。Host construction tooling 类型位于 `dayu.host.tooling`，由包根导出，但不进入 `dayu.host.api`。
 
 ## Public Session Command Path
 
@@ -46,8 +47,8 @@ public semantic digest 在 facade 边界只使用显式请求字段与 `HostCall
 - `submit_followup(host, session_id, request)`：要求路径参数 `session_id` 等于 `request.session_id`。`behavior=queue` 复用 internal `submit_followup_queue`，active 存在时返回 `accepted_run_status=QUEUED`，无 active 时返回 `accepted_run_status=RUNNING`；`behavior=steer` 返回 `UNSUPPORTED_OPERATION` 且不追加 EventLog。
 - `get_run(host, run_id)`：通过只读 transaction 读取 durable Run row，缺失时返回 `NOT_FOUND`。`current_attempt_id` 来自 Run row；`event_cursor` 是 Run row 中 input、accepted、queued、started、terminal event sequence 的最大非空值。所有从 durable Run row 构造的 public `RunSnapshot` 都使用同一映射：非终态 Run 的 `terminal_result_summary` 为 `None`；终态 Run 当前返回 status-only `TerminalResultSummary(status=..., summary_ref=None, summary_digest=None)`，因为 Phase 4 尚未引入 typed terminal payload decoder，不从 untyped EventLog payload 字符串临时解析 summary refs。`outbox_summary` 在 Phase 4 始终为 `None`。
 - `stream_run_events(host, run_id, cursor, limit=None)`：先校验目标 Run 存在，再按全局 EventLog `event_sequence > cursor.event_sequence` 扫描。`limit=None` 使用 `HOST_EVENT_STREAM_DEFAULT_LIMIT`，`limit <= 0` 或超过 `HOST_EVENT_STREAM_MAX_LIMIT` 返回 `INVALID_STATE`。`limit` 是全局 EventLog row 扫描窗口，也是返回事件上限；扫描后只返回 `row.run_id == run_id` 的 `HostEventView`。`next_cursor` 是本次扫描到的最大全局 `event_sequence`；没有扫描到 row 时等于输入 cursor。扫描窗口内只有无关 Run 事件时，返回空 `events` 但仍推进 `next_cursor`。
-- `cancel_run(host, run_id, request)`：复用 internal cancel，支持 queued Run cancel、pre-dispatch `RUNNING` / Attempt `STARTING` / dispatch `PENDING` cancel、pre-accept dispatching cancel 与 active worker cancel；active worker cancel 会先把 Run 推进到 `CANCELLING`，再通过 active worker registry best-effort 传播取消。`WAITING` 取消由 Phase 7 负责，`RECOVERING` 取消由 Phase 11 负责。
-- `cancel_session_runs(host, session_id, request)`：在一个 write transaction 内批量取消同 Session 下 queued、pre-dispatch / pre-accept dispatching 与 active worker Run。若存在 `WAITING`、`RECOVERING` 或其它 unsupported non-terminal Run，会在追加任何 cancel fact 前返回 `UNSUPPORTED_OPERATION`；active worker target 在 commit 后通过 registry best-effort 传播取消。
+- `cancel_run(host, run_id, request)`：复用 internal cancel，支持 queued Run cancel、pre-dispatch `RUNNING` / Attempt `STARTING` / dispatch `PENDING` cancel、pre-accept dispatching cancel、active worker cancel 与 `WAITING` Run cancel；active worker cancel 会先把 Run 推进到 `CANCELLING`，再通过 active worker registry best-effort 传播取消。`WAITING` cancel 会标记 active wait records 为 `cancelled` 并把 Run 收口为 `CANCELLED`，不创建 resume Attempt；`RECOVERING` 取消由 Phase 11 负责。
+- `cancel_session_runs(host, session_id, request)`：在一个 write transaction 内批量取消同 Session 下 queued、pre-dispatch / pre-accept dispatching、active worker 与 `WAITING` Run。若存在 `RECOVERING` 或其它 unsupported non-terminal Run，会在追加任何 cancel fact 前返回 `UNSUPPORTED_OPERATION`；active worker target 在 commit 后通过 registry best-effort 传播取消，`WAITING` wait abandon 只依赖 poller / adapter 后续观察。
 
 `stream_run_events` 只暴露 `event_sequence`、`event_id`、`event_type`、`session_id`、`run_id`、`payload_ref` 与 `payload_digest`，不暴露 policy decision JSON、reason JSON 或 inline payload JSON。该 API 不读取 projection checkpoint、memory state、outbox state、in-memory subscription position、session-local cursor 或 client sequence。
 
@@ -59,10 +60,23 @@ public semantic digest 在 facade 边界只使用显式请求字段与 `HostCall
 
 - `retry_run(host, run_id, request)`
 - `replay_run(host, run_id, request)`
-- `resolve_wait(host, wait_id, request)`
 - `purge_session(host, session_id, request)`
 
-这些函数保留稳定签名，但当前固定返回 `HostApiError(code=UNSUPPORTED_OPERATION, retryable=False, detail=None)`，不读取或写入 EventLog、idempotency record、purge tombstone、wait record 或 retry / replay Run。
+这些函数保留稳定签名，但当前固定返回 `HostApiError(code=UNSUPPORTED_OPERATION, retryable=False, detail=None)`，不读取或写入 EventLog、idempotency record、purge tombstone 或 retry / replay Run。
+
+## Public Wait Command Path
+
+`resolve_wait(host, wait_id, request)` 通过 Host durable wait resolution service 接收 active wait result。`ResolveWaitRequest` 必须携带 UTC-aware `observed_at`、`source`（`poll` / `callback` / `manual`）、`idempotency_key` 与强类型 `outcome` envelope。幂等作用域是 `(wait_id, request.idempotency_key)`；同 key 同 semantic digest 重放返回当前 durable `RunSnapshot`，同 key 不同 digest 返回 `IDEMPOTENCY_CONFLICT`。目标 wait 缺失返回 `NOT_FOUND`，非 active / 非等待中状态返回 `INVALID_STATE`。
+
+`ResolveWaitCompletedOutcome` 与工具级 `ResolveWaitCancelledOutcome` 会在同一个 write transaction 内关闭 wait record、写入 `RESUME_REQUESTED` 与 `TOOL_RESULT_ACCEPTED`、把 Run 从 `WAITING` 恢复到 `RUNNING`、创建新的 resume Attempt 与 pending dispatch record，并在 commit 后 best-effort 唤醒 dispatch scheduler。新的 resume `RUN_STARTED` 使用 `start_reason=resume`，RunInputBuilder 会从其引用的 `TOOL_RESULT_ACCEPTED` 重建 accepted wait/tool fact system message，交给下一次 Engine Attempt。
+
+`ResolveWaitFailedOutcome` 会关闭 wait record 并把 Run 收口为 `FAILED`；`ResolveWaitLostOutcome` 会写入 lost 工具事实并把 Run 收口为 `LOST`。这两个 outcome 不创建 resume Attempt，也不触发 pending dispatch wakeup。
+
+取消已经进入 `WAITING` 的 Run 时，`cancel_run` 与 `cancel_session_runs` 会复用同一 Host admission transition：写入 cancel facts、把 active wait records 标记为 `cancelled`、把 Run 收口为 `CANCELLED`，不创建 resume Attempt。取消后的 late result、`LOST` wait 的 late result 或 terminal Run 上的 late result 只写入 `WAIT_LATE_RESULT_REJECTED` diagnostic，并使用独立 `wait_late_rejection` 幂等 scope；同 key 同 digest 不重复写 diagnostic，同 key 不同 digest 返回 `IDEMPOTENCY_CONFLICT`。
+
+Host 还提供最小 `WaitPoller` / `WaitPollAdapter` 层内契约。poller 只读取 durable poll wait 快照，外部 adapter 调用发生在 Host transaction 外；ready / lost 结果统一提交给 `resolve_wait`，cancelled wait 只通知 adapter abandon。当前 poller 只提供单轮 `poll_once()` 入口，不包含后台调度循环或外部 job physical cancel 保证。
+
+Engine `TOOL_AWAITING` / `RUN_SUSPENDED` 事件当前只作为 diagnostic confirmation 处理：Host 不从 EngineEvent 创建 wait record，不把 Run 推入 `WAITING`，也不因迟到确认把已经 `WAITING` 的 Run 失败收口。callback HTTP endpoint、callback 认证 / 重放防护、recovery scan、远端 worker wait 恢复、外部 job physical cancel / revoke、durable duplicate ledger 与 durable tool trace projection 均未实现。
 
 ## Host Tooling Options
 
@@ -82,7 +96,9 @@ public semantic digest 在 facade 边界只使用显式请求字段与 `HostCall
 
 当前 ToolRuntime 已实现 Host accept barrier 的 typed candidate / ack / rejected / timeout contract 与默认 durable accept port。`DefaultHostToolFactAcceptPort` 通过既有 transaction runner、EventLog primitive 与 idempotency primitive 校验 Run / Attempt / execution identity，在同一事务中写入 `TOOL_CALL_REQUESTED`、必要的 `TOOL_CALL_GOVERNED` 与非 reuse 的 `TOOL_RESULT_ACCEPTED` canonical facts；同一 accept scope + key + semantic digest 返回既有 ack，同 key 不同 digest 返回 idempotency conflict rejected ack。EngineEvent ingest 的工具事件只作为 preview / diagnostic，不是工具 canonical fact 写入入口。
 
-当前 ToolRuntime 已实现 P6-S3 批式 `ToolExecutor` wrapper：按 effective bundle 查找并异步调用业务 callable，将 callable 异常归一为 `ToolFailedOutcome`，对每个工具结果先提交 Host accept barrier，只有收到 `ToolFactAcceptedAck` 后才把结果返回给 Engine。`ToolFactRejectedAck` 与 accept timeout / ack lost 有限重试耗尽都会返回受治理的工具错误，不暴露原始业务结果，不创建 wait record，不进入 `WAITING`，也不触发 recovery。side-effect / paid 工具当前通过 Host 内部 `ToolRuntimePolicyView` 指定工具级幂等 key 参数绑定，缺失 key 时 callable 不会被调用。`ToolAwaitingOutcome` 当前只映射为 canonical `governed_error` 工具失败，`unsupported_awaiting` 只作为 policy reason / diagnostic reason。
+当前 ToolRuntime 已实现 P6-S3 批式 `ToolExecutor` wrapper：按 effective bundle 查找并异步调用业务 callable，将 callable 异常归一为 `ToolFailedOutcome`，对普通 completed / failed / cancelled 工具结果先提交 Host accept barrier，只有收到 `ToolFactAcceptedAck` 后才把结果返回给 Engine。`ToolFactRejectedAck` 与 accept timeout / ack lost 有限重试耗尽都会返回受治理的工具错误，不暴露原始业务结果。side-effect / paid 工具当前通过 Host 内部 `ToolRuntimePolicyView` 指定工具级幂等 key 参数绑定，缺失 key 时 callable 不会被调用。
+
+当前 ToolRuntime 已实现 P7-S2 awaiting accept path：当 `ToolAwaitingOutcome` 命中 Host wait adapter registry 且 awaiting accept port 返回 accepted ack 时，Host 在单个 write transaction 内写入 `TOOL_AWAITING`、`RUN_WAITING`、`ATTEMPT_SUSPENDED`，创建 active wait record，并把 Run / Attempt 推进到 `WAITING` / `SUSPENDED`；ToolRuntime 只有收到 accepted ack 后才把 awaiting outcome 返回给 Engine。同一 accept key + 同 digest 重放返回既有 refs；同 key + 不同 digest 返回 rejected ack。缺少 adapter binding、poll binding 无 external job ref、awaiting accept rejected / timeout 都返回受治理工具错误，不走普通 `TOOL_RESULT_ACCEPTED` 路径。批内一旦某个工具 accepted awaiting，后续工具调用不再调用业务 callable，只返回受治理错误。
 
 当前 ToolRuntime 已实现 P6-S4 run-scoped truncation / `fetch_more` 普通工具路径。`TruncationManager` 是 ToolRuntime-local 内存能力，不写 durable cursor 表；截断后的普通工具结果只暴露不透明 cursor 与 scope token。启用 `FETCH_MORE` framework tool 且启用 truncation manager 时，`EffectiveToolBundleBuilder` 注入同一个 effective bundle 内的 `fetch_more` schema 与 callable；`fetch_more` 作为普通工具经过 `ToolExecutor`、dispatcher、Host accept barrier 与 EventLog canonical path。cursor 校验覆盖 run scope、scope token、TTL、single-use、missing cursor 与 remainder digest mismatch；失败返回普通工具错误，不进入 wait / recovery。
 
@@ -90,7 +106,7 @@ public semantic digest 在 facade 边界只使用显式请求字段与 `HostCall
 
 当前本地 `HostDispatchScheduler` 已接入 tool-enabled composition wiring：当 `HostLocalExecutionOptions.tooling_options` 非空且 `AgentPolicy.allow_tool_calls=True` 时，scheduler 会为当前 Attempt 构造 ToolRuntime handle，并用 tool-enabled RunInputBuilder 把同源 `tool_schemas` 与 `tool_executor` 交给 worker；未提供 tooling 或 policy 禁用工具时仍走 no-tool builder。
 
-当前 ToolRuntime 仍未实现 policy provider resolution、attempt tool snapshot durability、长耗时 external job / wait record、durable duplicate ledger 与 durable tool trace projection。
+当前 ToolRuntime 仍未实现 policy provider resolution、attempt tool snapshot durability、callback endpoint、durable duplicate ledger 与 durable tool trace projection。
 
 ## Durable Foundation
 
@@ -109,7 +125,8 @@ public semantic digest 在 facade 边界只使用显式请求字段与 `HostCall
 - Phase 3 / 5 internal lifecycle / transition primitives：在调用方提供的 `HostTransaction` 内实现 Session / slot lifecycle，以及 Run / Attempt / dispatch record 的低层 transition helper；当前 durable primitive 覆盖 pre-dispatch cancel、`pending -> waiting_for_lane -> dispatching` 诊断推进、worker accepted refs、Attempt `STARTING -> RUNNING`、active Run `RUNNING -> CANCELLING` 和 active cancel terminal closeout。EventLog fact 与 state row mutation 必须处于同一 SQLite write transaction。
 - Phase 5 / 6 RunInputBuilder boundary：通过 typed providers 从 durable Run / Attempt / dispatch record 与 canonical EventLog facts 构造 deterministic `AgentRunRequest`；只接受同一 snapshot identity 下的 Run `RUNNING`、Attempt `STARTING`、dispatch record `DISPATCHING` 当前事实。当前用户 prompt 只来自 durable `USER_INPUT_ACCEPTED`，continuity 只读 canonical facts 并按 `event_sequence` 排序。no-op memory / compact providers 不创建 durable rows。no-tool / replay 模式输出 `disable_tools=True`、`tool_schemas=()`、`AgentPolicy.allow_tool_calls=False`；tool-enabled 模式要求 `disable_tools=False`、`AgentPolicy.allow_tool_calls=True`，且 schema 与 executor 必须来自同一个 `ToolRuntimeHandle`。
 - Phase 5 dispatch scheduler / LocalProxy baseline：`HostDispatchScheduler` 接收 pending dispatch wakeup，将 dispatch record 从 `pending` 推进到 `waiting_for_lane`，通过独立 runtime lane DB acquire capacity，再经 durable recheck 推进到 `dispatching`；后台 drain loop 持续轮询直到 scheduler close，避免 empty / sleep 窗口内的 wakeup 被遗留。worker accept 后追加 `ATTEMPT_RUNNING`、推进 Attempt `STARTING -> RUNNING`，并记录 worker accept refs。Default LocalProxy worker 调用 Engine public `run_agent_messages(request)` 并暴露 EngineEvent stream；handle close 后不再允许重新读取 events。scheduler 消费 worker event stream 时把自身作为 admission wakeup port 传给 `EngineEventIngestor`，active task 的 finally 单点负责 active registry 注销、worker handle close 与 lane release；scheduler close 只传播 cancel signal 并取消 active task。`final_answer` 收口为 `SUCCEEDED`，`run_failed` 与 clean EOF without terminal 收口为 `FAILED`，worker stream crash / unknown terminal 收口为 `LOST`；terminal closeout 后会触发 queued Run promotion 并唤醒 promoted dispatch。
-- Phase 5 EngineEvent ingest mapping：`EngineEventIngestor` 只接收 Host-owned `EngineEventCandidate` envelope，不要求 Engine 公共 `EngineEvent` 携带 Host Attempt identity；当前映射覆盖 final answer succeeded、run failed、active cancel 后 run cancelled、usage projection signal、preview / diagnostic、unsupported recovery / waiting diagnostic + failed closeout、clean EOF failed closeout 和 worker lost closeout。preview 事件只有在 `EngineEventType` 与对应 data 类型同时匹配时才写入 preview payload，否则写 rejected diagnostic。terminal closeout 后会触发 queue promotion wakeup，duplicate terminal replay 也会重试 promotion wakeup。
+- Phase 5 / 7 EngineEvent ingest mapping：`EngineEventIngestor` 只接收 Host-owned `EngineEventCandidate` envelope，不要求 Engine 公共 `EngineEvent` 携带 Host Attempt identity；当前映射覆盖 final answer succeeded、run failed、active cancel 后 run cancelled、usage projection signal、preview / diagnostic、unsupported recovery diagnostic + failed closeout、Engine awaiting / suspended confirmation diagnostic、clean EOF failed closeout 和 worker lost closeout。Engine `TOOL_AWAITING` / `RUN_SUSPENDED` 事件不创建 wait record，也不把已经 `WAITING` 的 Run 失败收口。preview 事件只有在 `EngineEventType` 与对应 data 类型同时匹配时才写入 preview payload，否则写 rejected diagnostic。terminal closeout 后会触发 queue promotion wakeup，duplicate terminal replay 也会重试 promotion wakeup。
+- Phase 7 wait record / resolve / cancel / poll foundation：创建 `host_wait_records` fresh schema / index / CHECK 约束，提供 typed wait record status、resume policy、snapshot / external job refs、row codec、insert / read / CAS helper 与 `RunStartReason.RESUME`。ToolRuntime awaiting accept path 已使用该 foundation 创建 active wait record 并推进 Run / Attempt 到 `WAITING` / `SUSPENDED`；public `resolve_wait` 已接入 wait record mutation、resolution idempotency、completed / tool-cancelled resume Attempt、failed closeout、lost closeout 与 late result diagnostic；public cancel 已支持 `WAITING` Run closeout；最小 poller 已支持 active poll waits 的 ready / lost / cancelled observation。callback endpoint 尚未接入。
 
 durable foundation 当前不实现 policy provider set、RemoteProxy、recovery classifier、lease / fencing / takeover、artifact cleanup scheduler、projection、audit、outbox、ToolRuntime durable snapshot 或 ToolRuntime durable cursor。
 
@@ -122,15 +139,15 @@ durable foundation 当前不实现 policy provider set、RemoteProxy、recovery 
 - `start_run`：在 open Session 上根据 `queue_policy` 执行 direct start、queue、reject 或 attach active；创建 running Run 时只写 pending dispatch record，不启动真实 dispatch。
 - `submit_followup_queue`：接收调用方显式提供的 `resolved_execution_target`，在 active Run 存在时创建 queued Run，在无 active Run 时直接创建 running Run、STARTING Attempt 与 pending dispatch record。
 - `promote_next_queued_run`：按 queued Run 的 accepted `event_sequence` FIFO promotion 一个 Run；active Run 存在时返回 skipped。
-- `cancel_run`：支持 queued Run cancel 与 pre-dispatch STARTING cancel；queued cancel 不创建 Attempt，pre-dispatch cancel 会把 pending dispatch record、Attempt 与 Run 同事务收口为 cancelled。
+- `cancel_run`：支持 queued Run cancel、pre-dispatch STARTING cancel、active worker cancel 与 WAITING cancel；queued cancel 不创建 Attempt，pre-dispatch cancel 会把 pending dispatch record、Attempt 与 Run 同事务收口为 cancelled，WAITING cancel 会标记 active wait records 为 cancelled 并把 Run 收口为 cancelled。
 - `closeout_attempt_terminal`：支持 STARTING Attempt / RUNNING Run 的 succeeded、failed、lost terminal closeout；成功释放 active slot 后在新事务中尝试 FIFO promotion。
 - operation idempotency：start / follow-up 使用显式 operation scope，同 key 同 digest 返回既有 Run，不同 digest 返回结构化 conflict；follow-up queue digest 不包含 `resolved_execution_target`。
 - wakeup port：暴露 pending dispatch 和 queue promotion wakeup 端口；admission 默认可使用 no-op / 测试 spy，dispatch scheduler 则实现该端口以连接 terminal closeout 后的 FIFO promotion 与 pending dispatch 唤醒。
 - post-commit wakeup 边界：active slot 释放后的 durable promotion 先于 queue promotion wakeup；promotion 已提交后的 dispatch / queue wakeup `RuntimeError` 只按 best-effort 处理，不回滚或掩盖 durable promotion 结果。
 - 多进程 durable invariant：当前测试覆盖同 slot ensure 只绑定一个 Session、同 Session admission 最多一个 active Run、跨进程 follow-up 幂等重放 / 冲突、queued Run 按 accepted `event_sequence` FIFO promotion、queued cancel 与 promotion 的 first-committer-wins，以及 EventLog `event_sequence` 全局唯一递增。
 
-internal admission 当前不实现 policy provider integration、steer、retry / replay、wait cancellation 或 recovery cancellation。
-internal admission 当前的 session-scope cancel 支持 queued、pre-dispatch / pre-accept dispatching 与 active worker 子集；Phase 7 负责 `WAITING` cancel，Phase 11 负责 `RECOVERING` cancel。
+internal admission 当前不实现 policy provider integration、steer、retry / replay 或 recovery cancellation。
+internal admission 当前的 session-scope cancel 支持 queued、pre-dispatch / pre-accept dispatching、active worker 与 WAITING 子集；Phase 11 负责 `RECOVERING` cancel。
 
 ## 校验边界
 
@@ -151,6 +168,7 @@ internal admission 当前的 session-scope cancel 支持 queued、pre-dispatch /
 - `HostToolingOptions.source_refs` 必须非空。
 - `FrameworkToolPolicyView.enabled_framework_tools` 必须是 `reserved_framework_tool_names` 子集。
 - 业务 `ToolBundle` 不得占用 reserved framework tool name。
+- `HostPayloadRef`、`WaitAdapterKey`、`WaitProviderStatusRef` 与 resolve wait outcome 类型拒绝空白 id / kind / digest / message / diagnostic ref，长度按公共 `HOST_WAIT_*_MAX_LENGTH` 常量校验；`ResolveWaitRequest.observed_at` 必须是 UTC-aware `datetime`。
 
 ## 架构边界
 
@@ -162,9 +180,10 @@ Host 若在后续实现中复用 `dayu.runtime.filelock`，只能把它用于普
 
 当前未实现：
 
-- policy provider set、RemoteProxy、wait cancellation、recovery classifier、lease / fencing / takeover。
+- policy provider set、RemoteProxy、recovery classifier、lease / fencing / takeover。
 - artifact cleanup scheduler 与 diagnostics table。
 - ToolRuntime policy resolution。
+- wait callback endpoint 与 poller 后台调度循环。
 - durable duplicate ledger、durable tool trace projection。
 - ToolsDiscovery / ScenePrepare provider contract、tool profile registry、Attempt tool snapshot durability。
 - command-handle 本地 scheduler lifecycle wiring、Fins 业务语义、Service / UI 装配逻辑。
@@ -178,6 +197,6 @@ pytest tests/host -q
 python -m pyright dayu/host tests/host
 ```
 
-测试覆盖包根导出白名单、枚举字符串值、请求校验失败路径、Host tooling options 校验、ToolRuntime effective bundle / handle 同源约束、ToolRuntime accept barrier 幂等 / 冲突 / stale execution / canonical facts、ToolRuntimeExecutor accepted ack barrier / rejected ack / timeout retry / side-effect idempotency guard / awaiting unsupported guard / no-tool defense / mixed batch、ToolRuntime truncation / `fetch_more` scope guard、run-local duplicate governance matrix、diagnostic emitter refs、Host import 边界、弱类型守卫、Host command handle factory / close lifecycle、Session public facade 幂等、冲突、读取与关闭语义，以及 Run public facade 的 start / follow-up queue / steer unsupported / get_run / EventLog stream / cancel / session-scope cancel 子集 / deferred unsupported 函数。
+测试覆盖包根导出白名单、枚举字符串值、请求校验失败路径、Host payload / wait adapter / resolve wait outcome 校验、Host tooling options 校验、ToolRuntime effective bundle / handle 同源约束、ToolRuntime accept barrier 幂等 / 冲突 / stale execution / canonical facts、ToolRuntimeExecutor accepted ack barrier / rejected ack / timeout retry / side-effect idempotency guard / awaiting accepted ack / awaiting rejected / awaiting timeout / awaiting missing adapter / awaiting missing external job / awaiting batch stop / no-tool defense / mixed batch、ToolRuntime truncation / `fetch_more` scope guard、run-local duplicate governance matrix、diagnostic emitter refs、Host import 边界、弱类型守卫、Host command handle factory / close lifecycle、Session public facade 幂等、冲突、读取与关闭语义，以及 Run public facade 的 start / follow-up queue / steer unsupported / get_run / EventLog stream / cancel / session-scope cancel / WAITING cancel / retry-replay-purge deferred unsupported 函数。
 
-durable foundation、RunInputBuilder、dispatch scheduler / LocalProxy、EngineEvent ingest mapping、ToolRuntime accept barrier / executor 与 internal admission 测试覆盖 SQLite schema bootstrap / transaction runner、EventLog append / read / idempotency、payload descriptor、local artifact helper、host instance liveness、EventLog 多进程 sequence smoke、Session lifecycle、Run / Attempt transition primitive、dispatch record 四状态 schema、waiting / dispatching / worker accept refs、active cancel durable primitive、RunInputBuilder durable prompt / canonical continuity / no-tool request / tool-enabled ToolRuntime handle 投影 / 非可派发状态拒绝、scheduler pending / waiting / dispatching / worker accept、pre-accept cancel race、lane acquire timeout、worker startup timeout、active task 资源释放、LocalProxy Engine entry boundary、final answer / failed / cancelled / usage / preview data 校验 / unsupported recovery EngineEvent mapping、Engine 工具事件 preview 边界、clean EOF / worker lost closeout、terminal duplicate promotion retry、accept key 幂等重放 / conflict / stale execution reject / reuse governance canonical fact、ToolRuntimeExecutor fake business tool accepted 后返回、accept reject / timeout 不泄漏 raw result、awaiting governed_error、side-effect 缺 key 不调用 callable、duplicate key 规范化与排除 `index_in_iteration`、`allow` / `reuse` / `hint` / `require_justification` / `hard_stop` matrix、diagnostic refs、Engine 经 ToolRuntime durable accepted 后继续第二轮、start / follow-up admission、queue policy、idempotency、FIFO promotion、queued / pre-dispatch cancel、terminal closeout、admission 多进程 durable invariant，以及 Host 包根不导出 durable 内部模块。
+durable foundation、RunInputBuilder、dispatch scheduler / LocalProxy、EngineEvent ingest mapping、ToolRuntime accept barrier / executor 与 internal admission 测试覆盖 SQLite schema bootstrap / transaction runner、EventLog append / read / idempotency、payload descriptor、local artifact helper、host instance liveness、EventLog 多进程 sequence smoke、Session lifecycle、Run / Attempt transition primitive、dispatch record 四状态 schema、wait record schema / row codec / DDL CHECK / CAS helper、awaiting accept 三事实原子写入 / wait record 创建 / WAITING 和 SUSPENDED 状态推进 / replay / conflict / stale execution reject、resolve_wait completed resume / tool-cancelled resume / failed closeout / lost closeout / idempotent replay / conflict / resume RunInputBuilder continuity / late result diagnostic、WAITING cancel / session-scope WAITING cancel、wait poller ready / not-ready / cancelled abandon、waiting / dispatching / worker accept refs、active cancel durable primitive、RunInputBuilder durable prompt / canonical continuity / no-tool request / tool-enabled ToolRuntime handle 投影 / 非可派发状态拒绝、scheduler pending / waiting / dispatching / worker accept、pre-accept cancel race、lane acquire timeout、worker startup timeout、active task 资源释放、LocalProxy Engine entry boundary、final answer / failed / cancelled / usage / preview data 校验 / unsupported recovery EngineEvent mapping / Engine awaiting confirmation diagnostic、Engine 工具事件 preview 边界、clean EOF / worker lost closeout、terminal duplicate promotion retry、accept key 幂等重放 / conflict / stale execution reject / reuse governance canonical fact、ToolRuntimeExecutor fake business tool accepted 后返回、accept reject / timeout 不泄漏 raw result、side-effect 缺 key 不调用 callable、duplicate key 规范化与排除 `index_in_iteration`、`allow` / `reuse` / `hint` / `require_justification` / `hard_stop` matrix、diagnostic refs、Engine 经 ToolRuntime durable accepted 后继续第二轮、start / follow-up admission、queue policy、idempotency、FIFO promotion、queued / pre-dispatch cancel、terminal closeout、admission 多进程 durable invariant，以及 Host 包根不导出 durable 内部模块。

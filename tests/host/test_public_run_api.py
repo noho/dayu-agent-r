@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import sqlite3
 from concurrent.futures import ThreadPoolExecutor
+from datetime import UTC, datetime
 from pathlib import Path
 
 import pytest
@@ -22,19 +23,16 @@ from dayu.host import (
     OperationContext,
     PurgeSessionRequest,
     ReplayRunRequest,
-    ResolveWaitRequest,
     RetryRunRequest,
     RunStatus,
     StartRunRequest,
     SubmitFollowupRequest,
-    WaitResolutionSource,
     cancel_run,
     create_host_command_handle,
     ensure_session,
     get_run,
     purge_session,
     replay_run,
-    resolve_wait,
     retry_run,
     start_run,
     submit_followup,
@@ -558,7 +556,7 @@ def test_public_cancel_and_promotion_race_preserves_run_invariants(
 def test_deferred_public_functions_are_stable_unsupported_without_writes(
     tmp_path: Path,
 ) -> None:
-    """retry/replay/resolve_wait/purge_session 返回 unsupported 且不写事实。"""
+    """retry/replay/purge_session 返回 unsupported 且不写事实。"""
 
     options = _options(tmp_path)
     host = create_host_command_handle(options)
@@ -589,18 +587,6 @@ def test_deferred_public_functions_are_stable_unsupported_without_writes(
                     repair_instruction="repair structure",
                 ),
             )
-        with pytest.raises(HostApiError) as resolve_exc:
-            resolve_wait(
-                host,
-                "wait-1",
-                ResolveWaitRequest(
-                    context=_context(),
-                    idempotency_key="resolve-1",
-                    outcome_ref="outcome-1",
-                    source=WaitResolutionSource.MANUAL,
-                    observed_at="2026-05-14T00:00:00.000000Z",
-                ),
-            )
         with pytest.raises(HostApiError) as purge_exc:
             purge_session(
                 host,
@@ -612,7 +598,7 @@ def test_deferred_public_functions_are_stable_unsupported_without_writes(
                 ),
             )
 
-        for exc_info in (retry_exc, replay_exc, resolve_exc, purge_exc):
+        for exc_info in (retry_exc, replay_exc, purge_exc):
             assert exc_info.value.code == HostApiErrorCode.UNSUPPORTED_OPERATION
             assert exc_info.value.retryable is False
             assert exc_info.value.detail is None

@@ -306,8 +306,99 @@ PR 55 创建后按用户指令安排 AgentMiMo 与 AgentDS 执行 `/deepreview P
 `docs/reviews/pr-55-fix-accept-retry-exhausted-20260515.md` 修复，fix commit 为 `c79d6b8`。PR 55 re-review artifacts 为
 `docs/reviews/pr-55-re-review-mimo-20260515.md` 与
 `docs/reviews/pr-55-re-review-ds-20260515.md`，两路均 PASS；验证为 `pytest tests/host -q` 350 passed、
-`python -m pyright dayu/ tests/ utils/` 0 errors、`git diff --check` clean。Phase 6 状态为 completed；PR 55 当前仍为 draft，
-review / fix / re-review 已通过，等待用户后续决定是否切换 ready 或 merge。
+`python -m pyright dayu/ tests/ utils/` 0 errors、`git diff --check` clean。Phase 6 状态为 completed；PR 55 已由用户手工
+merge。Phase 7 `Tool Awaiting / resolve_wait / Wait Adapter` design discussion、design write-back、双路 design re-review、
+accepted design findings fix 与双路 design fix re-review 已完成。Artifacts 为
+`docs/reviews/host-phase7-design-discussion-codex-20260516.md`、
+`docs/reviews/host-phase7-design-re-review-mimo-20260516.md`、
+`docs/reviews/host-phase7-design-re-review-ds-20260516.md`、
+`docs/reviews/host-phase7-design-re-review-controller-adjudication-20260516.md`、
+`docs/reviews/host-phase7-design-fix-re-review-mimo-20260516.md`、
+`docs/reviews/host-phase7-design-fix-re-review-ds-20260516.md` 与
+`docs/reviews/host-phase7-design-fix-re-review-controller-adjudication-20260516.md`。当前 gate 为 Phase 7
+handoff implementation-ready plan。Phase 7 handoff implementation-ready plan 已写入
+`docs/host/phase7-tool-awaiting-resolve-wait-plan.md`。Plan review artifacts 为
+`docs/reviews/host-phase7-plan-review-mimo-20260516.md` 与
+`docs/reviews/host-phase7-plan-review-ds-20260516.md`；controller plan review adjudication artifact 为
+`docs/reviews/host-phase7-plan-review-controller-adjudication-20260516.md`。Plan fix artifact 为
+`docs/reviews/host-phase7-plan-fix-codex-20260516.md`。Plan re-review artifacts 为
+`docs/reviews/host-phase7-plan-re-review-mimo-20260516.md` 与
+`docs/reviews/host-phase7-plan-re-review-ds-20260516.md`；controller plan re-review adjudication artifact 为
+`docs/reviews/host-phase7-plan-re-review-controller-adjudication-20260516.md`。两路 re-review 均 PASS，blocking count 为 0。
+Phase 7 accepted plan commit 为 `d017fd7`。
+P7-S1 `Public Contracts And Durable Wait Record` 已完成 implementation、双路 code review、accepted finding fix、双路 code
+re-review 与 controller adjudication，accepted checkpoint commit 为 `aaa107a`。P7-S1 artifacts 为
+`docs/reviews/host-phase7-s1-controller-decision-test-ownership-20260516.md`、
+`docs/reviews/host-phase7-implementation-s1-public-contracts-wait-record-20260516.md`、
+`docs/reviews/host-phase7-code-review-s1-mimo-20260516.md`、
+`docs/reviews/host-phase7-code-review-s1-ds-20260516.md`、
+`docs/reviews/host-phase7-code-review-s1-controller-adjudication-20260516.md`、
+`docs/reviews/host-phase7-fix-s1-public-contracts-wait-record-20260516.md`、
+`docs/reviews/host-phase7-code-re-review-s1-mimo-20260516.md`、
+`docs/reviews/host-phase7-code-re-review-s1-ds-20260516.md` 与
+`docs/reviews/host-phase7-code-re-review-s1-controller-adjudication-20260516.md`。验证为
+`pytest tests/host/test_public_contracts.py tests/host/test_import_boundary.py tests/host/test_package_exports.py tests/host/test_durable_schema.py tests/host/test_state_schema.py tests/host/test_wait_record_state.py tests/host/test_public_run_api.py -q`
+84 passed、`python -m pyright dayu/host tests/host` 0 errors、`git diff --check` clean。
+P7-S2 `ToolRuntime Awaiting Accept Path` 已完成 implementation、双路 code review、accepted finding fix、双路 code
+re-review 与 controller adjudication，accepted checkpoint commit 为 `42f972a`。P7-S2 artifacts 为
+`docs/reviews/host-phase7-implementation-s2-tool-awaiting-accept-20260516.md`、
+`docs/reviews/host-phase7-code-review-s2-mimo-20260516.md`、
+`docs/reviews/host-phase7-code-review-s2-ds-20260516.md`、
+`docs/reviews/host-phase7-fix-s2-tool-awaiting-accept-20260516.md`、
+`docs/reviews/host-phase7-code-re-review-s2-mimo-20260516.md`、
+`docs/reviews/host-phase7-code-re-review-s2-ds-20260516.md` 与
+`docs/reviews/host-phase7-code-re-review-s2-controller-adjudication-20260516.md`。验证为
+`pytest tests/host -q` 374 passed、`python -m pyright dayu/host tests/host` 0 errors、`git diff --check`
+clean。P7-S3 `resolve_wait Command And Resume Attempt` 已完成 implementation、MiMo code review、controller accepted finding fix、MiMo
+re-review、DS current-version code review 与 controller adjudication，accepted slice commit 为 `4712101`。P7-S3 artifacts 为
+`docs/reviews/host-phase7-implementation-s3-resolve-wait-resume-20260516.md`、
+`docs/reviews/host-phase7-code-review-s3-mimo-20260516.md`、
+`docs/reviews/host-phase7-fix-s3-resolve-wait-resume-20260516.md`、
+`docs/reviews/host-phase7-code-re-review-s3-mimo-20260516.md`、
+`docs/reviews/host-phase7-code-review-s3-ds-20260516.md` 与
+`docs/reviews/host-phase7-code-re-review-s3-controller-adjudication-20260516.md`。验证为
+`pytest tests/host/test_resolve_wait_command.py tests/host/test_run_attempt_transitions.py tests/host/test_run_input_builder.py tests/host/test_dispatch_scheduler.py tests/host/test_phase7_waiting_integration.py -q`
+64 passed、`pytest tests/host -q` 381 passed、`python -m pyright dayu/host tests/host` 0 errors、`git diff --check`
+clean。P7-S4 `WAITING Cancel, Late Result Diagnostic, Poll / Manual Adapter, EngineEvent Confirmation` 已完成
+implementation、双路 code review 与 controller adjudication，accepted slice commit 为 `3ccddbf`。P7-S4 artifacts 为
+`docs/reviews/host-phase7-implementation-s4-wait-cancel-late-poll-20260516.md`、
+`docs/reviews/host-phase7-code-review-s4-mimo-20260516.md`、
+`docs/reviews/host-phase7-code-review-s4-ds-20260516.md` 与
+`docs/reviews/host-phase7-code-review-s4-controller-adjudication-20260516.md`。验证为
+`pytest tests/host/test_wait_cancel_late_result.py tests/host/test_wait_adapter_polling.py tests/host/test_engine_ingest_mapping.py tests/host/test_public_cancel_session_runs.py tests/host/test_public_run_api.py -q`
+42 passed、`pytest tests/host -q` 388 passed、`python -m pyright dayu/host tests/host` 0 errors、`git diff --check`
+clean。P7-S4 residual risks：Engine contract 当前不携带 Host accepted wait refs，P7-S4 只能做 diagnostic /
+idempotent confirmation，不能验证 Engine awaiting event 与 Host accepted wait refs 完全匹配；Poller 仍是最小单轮
+`poll_once()`，不包含后台调度循环、退避、并发 in-flight fencing 或 adapter 错误重试治理；`WAITING` Run + 非
+`SUSPENDED` Attempt 的防御性 internal invariant error、poller retry 外部化后的幂等 digest 策略、late result typed
+public error detail 均为后续 hardening / API contract 扩展项。当前 gate 为 P7-S5 `Integration, Docs, Gate Validation`
+implementation。P7-S5 `Integration, Docs, Gate Validation` 已完成 implementation、双路 aggregate review 与 controller
+adjudication，accepted slice commit 为 `c974acf`。P7-S5 / aggregate artifacts 为
+`docs/reviews/host-phase7-implementation-s5-integration-docs-gate-validation-20260516.md`、
+`docs/reviews/host-phase7-aggregate-review-s5-mimo-20260516.md`、
+`docs/reviews/host-phase7-aggregate-review-s5-ds-20260516.md` 与
+`docs/reviews/host-phase7-aggregate-review-s5-controller-adjudication-20260516.md`。验证为 `pytest tests/host -q`
+389 passed、`python -m pyright dayu/ tests/ utils/` 0 errors、`git diff --check` clean。Phase 7 aggregate exit
+accepted：typed wait outcome envelope、durable wait record、ToolRuntime awaiting accept、`resolve_wait` resume / terminal
+closeout、`WAITING` cancel、late diagnostic、poller 与 EngineEvent confirmation boundary 均已落地。Phase 7 remaining
+risks / owners：callback endpoint / auth / replay 归后续 callback adapter owner；poller 后台 loop / backoff /
+in-flight fencing / adapter retry 归后续 poller runtime hardening owner；`WAITING` recovery observation 归 Phase 11；
+Engine matching-ref 强校验归后续 Engine contract 演进；external job physical cancel / revoke 归后续 adapter hardening；
+durable duplicate ledger 与 durable tool trace projection 分别归后续 duplicate hardening / projection or tool trace owner。
+当前 gate 为 Phase 7 ready-to-open-draft-PR。Phase 7 draft PR 已创建：PR 56
+`https://github.com/noho/dayu-agent-r/pull/56`，title 为 `Host Phase 7 Tool Awaiting / resolve_wait / Wait Adapter`，
+head branch 为 `feat/host-phase7-tool-awaiting-resolve-wait`，PR 当前保持 draft。PR 56 deepreview artifacts 为
+`docs/reviews/pr-56-deepreview-mimo-20260516.md` 与 `docs/reviews/pr-56-deepreview-ds-20260516.md`。MiMo review
+PASS，无 blocking finding；DS review PASS，提出 6 个 Low 与 2 个 Info finding。Controller 接受 F1 digest 校验一致性与
+F2 `WaitPollLost` 测试缺口为当前 PR fix，fix artifact 为
+`docs/reviews/pr-56-fix-digest-and-poll-lost-20260516.md`，fix commit 为 `dd32948`。PR 56 fix re-review artifacts
+为 `docs/reviews/pr-56-fix-re-review-mimo-20260516.md`、
+`docs/reviews/pr-56-fix-re-review-ds-20260516.md` 与
+`docs/reviews/pr-56-fix-re-review-controller-adjudication-20260516.md`；两份 re-review 均确认 F1 / F2 fixed、
+无回归。Fix validation：`pytest tests/host/test_wait_awaiting_accept.py tests/host/test_wait_adapter_polling.py tests/host/test_resolve_wait_command.py -q`
+15 passed、`pytest tests/host -q` 391 passed、`python -m pyright dayu/ tests/ utils/` 0 errors、`git diff --check`
+clean。F3 cross-test helper import coupling deferred 到后续 tests cleanup；F4-F8 低/信息性 hardening 建议均 deferred。
+PR 56 当前 gate 状态为 draft-PR-pass / draft review-ready；是否转 ready-for-review 仍需用户额外授权。
 
 ## Phase Map
 
@@ -776,7 +867,9 @@ Phase 按依赖关系推进：先实现被其它阶段依赖的公共契约、ru
 - Phase 5 dispatch / resume attempt creation path 已完成。
 
 进入条件：
-- 确认第一版实现 internal / manual resolve + poll adapter，callback 只预留 adapter contract；必须复核 Phase 4 已冻结的 `resolve_wait` public signature / request envelope，如需变更，先回到 Public API contract 讨论。
+- 已确认第一版实现 internal / manual resolve + poll adapter，callback 只预留 adapter contract；已确认 Phase 4 冻结的
+  `ResolveWaitRequest.outcome_ref` 需要在 Phase 7 改为强类型等待结果 envelope，至少区分 completed / failed /
+  cancelled / lost。
 
 范围：
 - 允许修改：wait record table / store、wait adapter durable refs、ToolAwaitingOutcome accept path、resolve_wait command、wait poller background adapter、WAITING cancel / steer / resume。
@@ -788,9 +881,15 @@ Phase 按依赖关系推进：先实现被其它阶段依赖的公共契约、ru
 - 不实现远端 worker 自治 resume。
 
 关键设计问题：
-- 必须确认 wait record adapter key / await_spec / external_job_id 的 typed fields。
-- 必须确认 `resolve_wait` 非阻塞短事务错误 shape。
-- 必须确认 WAITING cancel 后迟到结果进入 diagnostic / tool trace 的路径。
+- 已确认 wait record 必须落地为 Host typed durable model，字段至少覆盖 `wait_id`、`run_id`、`attempt_id`、
+  `tool_call_id`、`tool_name`、`adapter_key`、`await_kind`、`resume_token`、`snapshot_ref`、`external_job_id`、
+  `idempotency_key`、deadline / expiry、status 与 created / updated event refs。
+- 已确认 `resolve_wait` 是非阻塞短事务 command；结果未到应由 poll / callback / manual 入口避免调用，或返回
+  `outcome_not_ready`、`invalid_state`、`wait_not_found` 等结构化拒绝。
+- 已确认 `WAITING` cancel 后 active wait record 标记 `cancelled`，Run 进入 `CANCELLED`，不创建 resume Attempt；迟到
+  poll / callback / manual result 只能进入 diagnostic / tool trace，不得追加 canonical tool result。
+- 已确认迟到等待结果不能静默丢弃；Phase 7 必须至少追加 `WAIT_LATE_RESULT_REJECTED` diagnostic EventLog event，作为后续
+  tool trace / projection 的输入，不要求本 phase 实现完整 tool trace 投影。
 
 交付物：
 - phase design refinement
@@ -805,13 +904,16 @@ Phase 按依赖关系推进：先实现被其它阶段依赖的公共契约、ru
 - Slice 3: poll / manual adapter and WAITING cancel / late result handling。
 
 验证要求：
-- unit tests: wait record state machine、resolve_wait idempotency、late result rejection。
+- unit tests: wait record state machine、resolve_wait idempotency、late result rejection、cancel-vs-resolve first-committer-wins、
+  poll adapter observes cancelled wait and stops / abandons observation、late result writes diagnostic EventLog event。
 - integration tests: awaiting -> resolve -> resumed local run。
 - pyright: wait adapter modules 通过。
 - docs: Host README wait / resume 语义同步。
 
 退出条件：
 - 长事务工具可以让 Run 进入 WAITING，并由统一 `resolve_wait` 创建新 Attempt 继续。
+- `ResolveWaitRequest.outcome_ref` 已被 typed outcome envelope 替代；`observed_at` 类型或解析策略、lost outcome 与
+  wait record lost 状态区别、`adapter_key` 来源、`snapshot_ref` / `external_job_id` typed ref 约束均在 plan 与实现中明确。
 
 后续依赖：
 - 后续 phase 可依赖的稳定契约：wait record、resolve_wait pipeline、wait poller background runtime。
