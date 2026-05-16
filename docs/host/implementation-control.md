@@ -449,7 +449,13 @@ implementation、双路 code review、accepted finding fix、双路 code re-revi
 `docs/reviews/host-phase8-code-re-review-s1-mimo-20260516.md`、
 `docs/reviews/host-phase8-code-re-review-s1-ds-20260516.md` 与
 `docs/reviews/host-phase8-code-re-review-s1-controller-adjudication-20260516.md`。两路 re-review 均 PASS，blocking count 为
-0。P8-S1 accepted slice commit 为 `80c12a2`。当前 gate 为 P8-S2 `Host Event Stream Cursor Truth` implementation。
+0。P8-S1 accepted slice commit 为 `80c12a2`。P8-S2 `Host Event Stream Cursor Truth` 已完成 implementation、双路 code
+review 与 controller adjudication。P8-S2 artifacts 为
+`docs/reviews/host-phase8-implementation-s2-event-stream-cursor-20260516.md`、
+`docs/reviews/host-phase8-code-review-s2-mimo-20260516.md`、
+`docs/reviews/host-phase8-code-review-s2-ds-20260516.md` 与
+`docs/reviews/host-phase8-code-review-s2-controller-adjudication-20260516.md`。两路 review 均 PASS，blocking count 为 0。
+当前 gate 为 P8-S2 accepted slice commit。
 
 ## Phase Map
 
