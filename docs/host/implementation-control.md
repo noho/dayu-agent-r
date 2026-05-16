@@ -398,7 +398,7 @@ F2 `WaitPollLost` 测试缺口为当前 PR fix，fix artifact 为
 无回归。Fix validation：`pytest tests/host/test_wait_awaiting_accept.py tests/host/test_wait_adapter_polling.py tests/host/test_resolve_wait_command.py -q`
 15 passed、`pytest tests/host -q` 391 passed、`python -m pyright dayu/ tests/ utils/` 0 errors、`git diff --check`
 clean。F3 cross-test helper import coupling deferred 到后续 tests cleanup；F4-F8 低/信息性 hardening 建议均 deferred。
-PR 56 当前 gate 状态为 draft-PR-pass / draft review-ready；是否转 ready-for-review 仍需用户额外授权。
+PR 56 deepreview / fix / re-review gate 已完成并通过。
 
 P1-P7 design conformance follow-up fix gate：Controller adjudication artifact
 `docs/reviews/p1-p7-design-conformance-controller-adjudication-20260516.md` 接受 blocking finding
@@ -417,7 +417,16 @@ Controller decision artifact 为 `docs/reviews/p1-p7-design-goals-controller-dec
 `docs/reviews/p1-p7-design-goals-fix-review-mimo-20260516.md` 与
 `docs/reviews/p1-p7-design-goals-fix-review-ds-20260516.md`，final adjudication artifact 为
 `docs/reviews/p1-p7-design-goals-fix-controller-adjudication-20260516.md`。本地 accepted design-goals fix checkpoint commit 为
-`86bcc5a`。
+`86bcc5a`。随后用户要求按 `$gateflow` 对当前仓库执行双路全仓 deepreview，AgentMiMo 与 AgentDS review artifacts 为
+`docs/reviews/repo-review-20260516-1557.md` 与 `docs/reviews/repo-review-20260516-1551.md`；controller adjudication artifact 为
+`docs/reviews/gateflow-deepreview-controller-adjudication-20260516-1619.md`。Controller 接受 DS-1、DS-2、DS-4、DS-5、
+DS-6、DS-18 与 MiMo-2，AgentCodex fix artifact 为
+`docs/reviews/gateflow-deepreview-fix-agentcodex-20260516.md`，MiMo / DS fix re-review artifacts 为
+`docs/reviews/gateflow-deepreview-fix-re-review-mimo-20260516.md` 与
+`docs/reviews/gateflow-deepreview-fix-re-review-ds-20260516.md`；两路 re-review 均 PASS。验证为
+`pytest tests/contracts/test_tool_schema.py tests/contracts/test_tool_declaration.py tests/host/test_durable_transaction.py tests/host/test_engine_ingest_mapping.py tests/host/test_toolruntime_executor.py tests/host/test_toolruntime_truncation_fetch_more.py tests/host/test_phase6_toolruntime_integration.py`
+69 passed、`python -m pyright` 0 errors、`git diff --check` clean。本地 accepted deepreview checkpoint commit 为
+`52bba89`。Phase 7 状态为 completed。
 
 ## Phase Map
 
