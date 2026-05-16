@@ -385,7 +385,20 @@ risks / owners：callback endpoint / auth / replay 归后续 callback adapter ow
 in-flight fencing / adapter retry 归后续 poller runtime hardening owner；`WAITING` recovery observation 归 Phase 11；
 Engine matching-ref 强校验归后续 Engine contract 演进；external job physical cancel / revoke 归后续 adapter hardening；
 durable duplicate ledger 与 durable tool trace projection 分别归后续 duplicate hardening / projection or tool trace owner。
-当前 gate 为 Phase 7 ready-to-open-draft-PR。
+当前 gate 为 Phase 7 ready-to-open-draft-PR。Phase 7 draft PR 已创建：PR 56
+`https://github.com/noho/dayu-agent-r/pull/56`，title 为 `Host Phase 7 Tool Awaiting / resolve_wait / Wait Adapter`，
+head branch 为 `feat/host-phase7-tool-awaiting-resolve-wait`，PR 当前保持 draft。PR 56 deepreview artifacts 为
+`docs/reviews/pr-56-deepreview-mimo-20260516.md` 与 `docs/reviews/pr-56-deepreview-ds-20260516.md`。MiMo review
+PASS，无 blocking finding；DS review PASS，提出 6 个 Low 与 2 个 Info finding。Controller 接受 F1 digest 校验一致性与
+F2 `WaitPollLost` 测试缺口为当前 PR fix，fix artifact 为
+`docs/reviews/pr-56-fix-digest-and-poll-lost-20260516.md`，fix commit 为 `dd32948`。PR 56 fix re-review artifacts
+为 `docs/reviews/pr-56-fix-re-review-mimo-20260516.md`、
+`docs/reviews/pr-56-fix-re-review-ds-20260516.md` 与
+`docs/reviews/pr-56-fix-re-review-controller-adjudication-20260516.md`；两份 re-review 均确认 F1 / F2 fixed、
+无回归。Fix validation：`pytest tests/host/test_wait_awaiting_accept.py tests/host/test_wait_adapter_polling.py tests/host/test_resolve_wait_command.py -q`
+15 passed、`pytest tests/host -q` 391 passed、`python -m pyright dayu/ tests/ utils/` 0 errors、`git diff --check`
+clean。F3 cross-test helper import coupling deferred 到后续 tests cleanup；F4-F8 低/信息性 hardening 建议均 deferred。
+PR 56 当前 gate 状态为 draft-PR-pass / draft review-ready；是否转 ready-for-review 仍需用户额外授权。
 
 ## Phase Map
 
