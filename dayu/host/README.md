@@ -47,8 +47,8 @@ public semantic digest 在 facade 边界只使用显式请求字段与 `HostCall
 - `submit_followup(host, session_id, request)`：要求路径参数 `session_id` 等于 `request.session_id`。`behavior=queue` 复用 internal `submit_followup_queue`，active 存在时返回 `accepted_run_status=QUEUED`，无 active 时返回 `accepted_run_status=RUNNING`；`behavior=steer` 返回 `UNSUPPORTED_OPERATION` 且不追加 EventLog。
 - `get_run(host, run_id)`：通过只读 transaction 读取 durable Run row，缺失时返回 `NOT_FOUND`。`current_attempt_id` 来自 Run row；`event_cursor` 是 Run row 中 input、accepted、queued、started、terminal event sequence 的最大非空值。所有从 durable Run row 构造的 public `RunSnapshot` 都使用同一映射：非终态 Run 的 `terminal_result_summary` 为 `None`；终态 Run 当前返回 status-only `TerminalResultSummary(status=..., summary_ref=None, summary_digest=None)`，因为 Phase 4 尚未引入 typed terminal payload decoder，不从 untyped EventLog payload 字符串临时解析 summary refs。`outbox_summary` 在 Phase 4 始终为 `None`。
 - `stream_run_events(host, run_id, cursor, limit=None)`：先校验目标 Run 存在，再按全局 EventLog `event_sequence > cursor.event_sequence` 扫描。`limit=None` 使用 `HOST_EVENT_STREAM_DEFAULT_LIMIT`，`limit <= 0` 或超过 `HOST_EVENT_STREAM_MAX_LIMIT` 返回 `INVALID_STATE`。`limit` 是全局 EventLog row 扫描窗口，也是返回事件上限；扫描后只返回 `row.run_id == run_id` 的 `HostEventView`。`next_cursor` 是本次扫描到的最大全局 `event_sequence`；没有扫描到 row 时等于输入 cursor。扫描窗口内只有无关 Run 事件时，返回空 `events` 但仍推进 `next_cursor`。
-- `cancel_run(host, run_id, request)`：复用 internal cancel，支持 queued Run cancel、pre-dispatch `RUNNING` / Attempt `STARTING` / dispatch `PENDING` cancel、pre-accept dispatching cancel 与 active worker cancel；active worker cancel 会先把 Run 推进到 `CANCELLING`，再通过 active worker registry best-effort 传播取消。`WAITING` 取消由 Phase 7 负责，`RECOVERING` 取消由 Phase 11 负责。
-- `cancel_session_runs(host, session_id, request)`：在一个 write transaction 内批量取消同 Session 下 queued、pre-dispatch / pre-accept dispatching 与 active worker Run。若存在 `WAITING`、`RECOVERING` 或其它 unsupported non-terminal Run，会在追加任何 cancel fact 前返回 `UNSUPPORTED_OPERATION`；active worker target 在 commit 后通过 registry best-effort 传播取消。
+- `cancel_run(host, run_id, request)`：复用 internal cancel，支持 queued Run cancel、pre-dispatch `RUNNING` / Attempt `STARTING` / dispatch `PENDING` cancel、pre-accept dispatching cancel、active worker cancel 与 `WAITING` Run cancel；active worker cancel 会先把 Run 推进到 `CANCELLING`，再通过 active worker registry best-effort 传播取消。`WAITING` cancel 会标记 active wait records 为 `cancelled` 并把 Run 收口为 `CANCELLED`，不创建 resume Attempt；`RECOVERING` 取消由 Phase 11 负责。
+- `cancel_session_runs(host, session_id, request)`：在一个 write transaction 内批量取消同 Session 下 queued、pre-dispatch / pre-accept dispatching、active worker 与 `WAITING` Run。若存在 `RECOVERING` 或其它 unsupported non-terminal Run，会在追加任何 cancel fact 前返回 `UNSUPPORTED_OPERATION`；active worker target 在 commit 后通过 registry best-effort 传播取消，`WAITING` wait abandon 只依赖 poller / adapter 后续观察。
 
 `stream_run_events` 只暴露 `event_sequence`、`event_id`、`event_type`、`session_id`、`run_id`、`payload_ref` 与 `payload_digest`，不暴露 policy decision JSON、reason JSON 或 inline payload JSON。该 API 不读取 projection checkpoint、memory state、outbox state、in-memory subscription position、session-local cursor 或 client sequence。
 
@@ -66,7 +66,7 @@ public semantic digest 在 facade 边界只使用显式请求字段与 `HostCall
 
 ## Public Wait Command Path
 
-`resolve_wait(host, wait_id, request)` 通过 Host durable wait resolution service 接收 active wait result。幂等作用域是 `(wait_id, request.idempotency_key)`；同 key 同 semantic digest 重放返回当前 durable `RunSnapshot`，同 key 不同 digest 返回 `IDEMPOTENCY_CONFLICT`。目标 wait 缺失返回 `NOT_FOUND`，非 active / 非等待中状态返回可重试 `INVALID_STATE`。
+`resolve_wait(host, wait_id, request)` 通过 Host durable wait resolution service 接收 active wait result。`ResolveWaitRequest` 必须携带 UTC-aware `observed_at`、`source`（`poll` / `callback` / `manual`）、`idempotency_key` 与强类型 `outcome` envelope。幂等作用域是 `(wait_id, request.idempotency_key)`；同 key 同 semantic digest 重放返回当前 durable `RunSnapshot`，同 key 不同 digest 返回 `IDEMPOTENCY_CONFLICT`。目标 wait 缺失返回 `NOT_FOUND`，非 active / 非等待中状态返回 `INVALID_STATE`。
 
 `ResolveWaitCompletedOutcome` 与工具级 `ResolveWaitCancelledOutcome` 会在同一个 write transaction 内关闭 wait record、写入 `RESUME_REQUESTED` 与 `TOOL_RESULT_ACCEPTED`、把 Run 从 `WAITING` 恢复到 `RUNNING`、创建新的 resume Attempt 与 pending dispatch record，并在 commit 后 best-effort 唤醒 dispatch scheduler。新的 resume `RUN_STARTED` 使用 `start_reason=resume`，RunInputBuilder 会从其引用的 `TOOL_RESULT_ACCEPTED` 重建 accepted wait/tool fact system message，交给下一次 Engine Attempt。
 
@@ -75,6 +75,8 @@ public semantic digest 在 facade 边界只使用显式请求字段与 `HostCall
 取消已经进入 `WAITING` 的 Run 时，`cancel_run` 与 `cancel_session_runs` 会复用同一 Host admission transition：写入 cancel facts、把 active wait records 标记为 `cancelled`、把 Run 收口为 `CANCELLED`，不创建 resume Attempt。取消后的 late result、`LOST` wait 的 late result 或 terminal Run 上的 late result 只写入 `WAIT_LATE_RESULT_REJECTED` diagnostic，并使用独立 `wait_late_rejection` 幂等 scope；同 key 同 digest 不重复写 diagnostic，同 key 不同 digest 返回 `IDEMPOTENCY_CONFLICT`。
 
 Host 还提供最小 `WaitPoller` / `WaitPollAdapter` 层内契约。poller 只读取 durable poll wait 快照，外部 adapter 调用发生在 Host transaction 外；ready / lost 结果统一提交给 `resolve_wait`，cancelled wait 只通知 adapter abandon。当前 poller 只提供单轮 `poll_once()` 入口，不包含后台调度循环或外部 job physical cancel 保证。
+
+Engine `TOOL_AWAITING` / `RUN_SUSPENDED` 事件当前只作为 diagnostic confirmation 处理：Host 不从 EngineEvent 创建 wait record，不把 Run 推入 `WAITING`，也不因迟到确认把已经 `WAITING` 的 Run 失败收口。callback HTTP endpoint、callback 认证 / 重放防护、recovery scan、远端 worker wait 恢复、外部 job physical cancel / revoke、durable duplicate ledger 与 durable tool trace projection 均未实现。
 
 ## Host Tooling Options
 
@@ -137,15 +139,15 @@ durable foundation 当前不实现 policy provider set、RemoteProxy、recovery 
 - `start_run`：在 open Session 上根据 `queue_policy` 执行 direct start、queue、reject 或 attach active；创建 running Run 时只写 pending dispatch record，不启动真实 dispatch。
 - `submit_followup_queue`：接收调用方显式提供的 `resolved_execution_target`，在 active Run 存在时创建 queued Run，在无 active Run 时直接创建 running Run、STARTING Attempt 与 pending dispatch record。
 - `promote_next_queued_run`：按 queued Run 的 accepted `event_sequence` FIFO promotion 一个 Run；active Run 存在时返回 skipped。
-- `cancel_run`：支持 queued Run cancel 与 pre-dispatch STARTING cancel；queued cancel 不创建 Attempt，pre-dispatch cancel 会把 pending dispatch record、Attempt 与 Run 同事务收口为 cancelled。
+- `cancel_run`：支持 queued Run cancel、pre-dispatch STARTING cancel、active worker cancel 与 WAITING cancel；queued cancel 不创建 Attempt，pre-dispatch cancel 会把 pending dispatch record、Attempt 与 Run 同事务收口为 cancelled，WAITING cancel 会标记 active wait records 为 cancelled 并把 Run 收口为 cancelled。
 - `closeout_attempt_terminal`：支持 STARTING Attempt / RUNNING Run 的 succeeded、failed、lost terminal closeout；成功释放 active slot 后在新事务中尝试 FIFO promotion。
 - operation idempotency：start / follow-up 使用显式 operation scope，同 key 同 digest 返回既有 Run，不同 digest 返回结构化 conflict；follow-up queue digest 不包含 `resolved_execution_target`。
 - wakeup port：暴露 pending dispatch 和 queue promotion wakeup 端口；admission 默认可使用 no-op / 测试 spy，dispatch scheduler 则实现该端口以连接 terminal closeout 后的 FIFO promotion 与 pending dispatch 唤醒。
 - post-commit wakeup 边界：active slot 释放后的 durable promotion 先于 queue promotion wakeup；promotion 已提交后的 dispatch / queue wakeup `RuntimeError` 只按 best-effort 处理，不回滚或掩盖 durable promotion 结果。
 - 多进程 durable invariant：当前测试覆盖同 slot ensure 只绑定一个 Session、同 Session admission 最多一个 active Run、跨进程 follow-up 幂等重放 / 冲突、queued Run 按 accepted `event_sequence` FIFO promotion、queued cancel 与 promotion 的 first-committer-wins，以及 EventLog `event_sequence` 全局唯一递增。
 
-internal admission 当前不实现 policy provider integration、steer、retry / replay、wait cancellation 或 recovery cancellation。
-internal admission 当前的 session-scope cancel 支持 queued、pre-dispatch / pre-accept dispatching 与 active worker 子集；Phase 7 负责 `WAITING` cancel，Phase 11 负责 `RECOVERING` cancel。
+internal admission 当前不实现 policy provider integration、steer、retry / replay 或 recovery cancellation。
+internal admission 当前的 session-scope cancel 支持 queued、pre-dispatch / pre-accept dispatching、active worker 与 WAITING 子集；Phase 11 负责 `RECOVERING` cancel。
 
 ## 校验边界
 
