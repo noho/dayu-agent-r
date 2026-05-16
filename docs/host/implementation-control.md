@@ -349,7 +349,17 @@ re-review 与 controller adjudication，accepted checkpoint commit 为 `42f972a`
 `docs/reviews/host-phase7-code-re-review-s2-ds-20260516.md` 与
 `docs/reviews/host-phase7-code-re-review-s2-controller-adjudication-20260516.md`。验证为
 `pytest tests/host -q` 374 passed、`python -m pyright dayu/host tests/host` 0 errors、`git diff --check`
-clean。当前 gate 为 P7-S3 `resolve_wait Command And Resume Attempt` implementation。
+clean。P7-S3 `resolve_wait Command And Resume Attempt` 已完成 implementation、MiMo code review、controller accepted finding fix、MiMo
+re-review、DS current-version code review 与 controller adjudication，accepted slice commit 为 `4712101`。P7-S3 artifacts 为
+`docs/reviews/host-phase7-implementation-s3-resolve-wait-resume-20260516.md`、
+`docs/reviews/host-phase7-code-review-s3-mimo-20260516.md`、
+`docs/reviews/host-phase7-fix-s3-resolve-wait-resume-20260516.md`、
+`docs/reviews/host-phase7-code-re-review-s3-mimo-20260516.md`、
+`docs/reviews/host-phase7-code-review-s3-ds-20260516.md` 与
+`docs/reviews/host-phase7-code-re-review-s3-controller-adjudication-20260516.md`。验证为
+`pytest tests/host/test_resolve_wait_command.py tests/host/test_run_attempt_transitions.py tests/host/test_run_input_builder.py tests/host/test_dispatch_scheduler.py tests/host/test_phase7_waiting_integration.py -q`
+64 passed、`pytest tests/host -q` 381 passed、`python -m pyright dayu/host tests/host` 0 errors、`git diff --check`
+clean。当前 gate 为 P7-S4 `WAITING Cancel, Late Result Diagnostic, Poll / Manual Adapter, EngineEvent Confirmation` implementation。
 
 ## Phase Map
 
