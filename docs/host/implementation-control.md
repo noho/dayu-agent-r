@@ -408,6 +408,9 @@ C-P1P7-001：P7 awaiting production wiring 未接入 `HostDispatchScheduler`。�
 `DefaultHostToolAwaitingAcceptPort` 与该 registry；adapter object 仍不进入 per-run request 或 durable wait row。Fix artifact 为
 `docs/reviews/p1-p7-design-conformance-fix-awaiting-production-wiring-20260516.md`。验证结果以该 artifact 为准；本 fix
 不实现 callback endpoint、poller 后台循环、recovery scan、remote worker 或 external job physical cancel。
+Controller fix adjudication artifact 为
+`docs/reviews/p1-p7-design-conformance-fix-controller-adjudication-20260516.md`，MiMo / DS fix re-review 均 PASS；
+本地 accepted fix checkpoint commit 为 `d03e064`。
 
 ## Phase Map
 
