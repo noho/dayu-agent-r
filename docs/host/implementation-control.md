@@ -220,7 +220,7 @@ Phase Map 中每个 phase 必须使用统一条目格式。模板如下：
 
 ## 当前状态
 
-P8 完成。
+P9 handoff implementation-ready plan accepted；下一步等待用户确认进入 P9 implementation gate。
 
 约束：本节只保留当前 gate 结论；phase 过程流水必须归档到 `历史记录`，仍需追踪的风险或后续 owner 必须写入 `Open Questions 与风险追踪` 的 `追踪区`。
 
@@ -806,6 +806,11 @@ Phase 按依赖关系推进：先实现被其它阶段依赖的公共契约、ru
 
 ### Phase 9. Conversation Memory / Session Memory Projection
 
+状态：
+- P9 phase discussion / design refinement 已完成。用户确认 P9 的核心定位是“财报分析工作台状态投影”，不是聊天记录压缩器。
+- P9 handoff implementation-ready plan 已完成双路 review、fix、双路 re-review 与 controller adjudication，verdict 为 PASS。
+- 下一步等待用户确认进入 P9 implementation gate。
+
 目标：
 - 实现 session-level Conversation Memory projection、stable layer、history pool、snapshot cursor、RunInputBuilder memory provider 与 projection repair path。
 
@@ -820,6 +825,10 @@ Phase 按依赖关系推进：先实现被其它阶段依赖的公共契约、ru
 
 进入条件：
 - 确认第一版只做 session memory，不做长期 memory public edit / reset / forget API。
+- 已确认 P9 只做 session-level memory projection，不实现长期 retrieval index、业务 signal ledger、signal-to-outcome verification、
+  public memory edit / reset / forget API 或原始证据仓储。
+- 已确认 P9 必须为后续跨多年弱信号归因召回预留 Host 中立 evidence anchor、claim status、provenance 与 trace included /
+  excluded reason 边界，但不得把财报业务语义塞入 Host。
 
 范围：
 - 允许修改：memory projection、memory snapshot store、stable layer / history pool policy、RunInputBuilder MemorySnapshotProvider、memory lag diagnostic / repair path。
@@ -831,9 +840,18 @@ Phase 按依赖关系推进：先实现被其它阶段依赖的公共契约、ru
 - 不让 memory projection 写 EventLog。
 
 关键设计问题：
-- 必须确认 stable layer 默认预算、recent raw turns floor、history pool 降级顺序。
-- 必须确认 projection lag 阈值与 RunInputBuilder fallback 策略。
-- 必须确认 assistant conclusion / verified fact 的投影规则。
+- 已确认 memory view 分为 `pinned_state`、`verified_facts`、`working_assumptions`、`conversation_continuity` 四类；不得把
+  tool-verified fact、assistant conclusion、用户说法和 episode summary 混成无结构字符串列表。
+- 已确认 verified fact 只接受工具事实，并必须保留 fact summary、producer / tool name、`event_id` / `event_sequence`、
+  tool result ref、digest / source ref，以及可选 evidence anchor / opaque subject refs。
+- 已确认 RunInputBuilder memory 注入顺序为：用户目标与约束、已确认主体和口径、tool-verified facts、open questions /
+  working assumptions、recent raw turns、episode summaries。
+- 已确认预算策略必须克制：pinned / verified facts 不参与 history pool 竞争但有结构化尺寸上限与诊断；recent raw turns floor
+  是下限不是上限；older raw turns 与 episode summaries 共用单一 history pool；超预算时先降级 summary / older raw turns。
+- 已确认 projection lag 必须显式可观测：小 delta 可由 EventLog 补齐并记录 diagnostic；缺失、损坏或超阈值进入 projection repair /
+  context governance path；不得触发 Run recovery。
+- 已确认 P9 不实现 LLM compaction 写 truth。LLM 产出的 pinned patch、episode summary 或 conclusion 默认只能成为 candidate /
+  assumption / continuity view；proactive compaction 编排归 Phase 10 Context Governance。
 
 交付物：
 - phase design refinement
@@ -850,6 +868,9 @@ Phase 按依赖关系推进：先实现被其它阶段依赖的公共契约、ru
 验证要求：
 - unit tests: final_answer not verified fact、tool facts verified、snapshot cursor coverage。
 - integration tests: multi-run continuity with memory projection rebuild。
+- anti-hallucination tests: 用户输入只进入约束或 assumption，不进入 verified facts；episode summary 不能替代 evidence anchor；
+  memory snapshot rebuild 后 provenance 不丢；projection lag 不改变 Run 状态；同一 EventLog + 同一 policy 生成稳定 messages；
+  recent turns floor 在预算低时仍保持追问连续性。
 - pyright: memory modules 通过。
 - docs: Host README / dayu/README.md 按触发规则同步。
 
@@ -858,7 +879,8 @@ Phase 按依赖关系推进：先实现被其它阶段依赖的公共契约、ru
 
 后续依赖：
 - 后续 phase 可依赖的稳定契约：memory snapshot cursor、stable layer input provider、projection repair semantics。
-- 需要追踪到后续 phase 的事项：长期 memory / query-time retrieval 后续单独设计。
+- 需要追踪到后续 phase 的事项：长期 memory / query-time retrieval、业务 signal ledger、signal-to-outcome verification 后续单独设计；
+  P9 只预留 Host 中立 evidence anchor / claim status / provenance / trace 边界。
 
 ### Phase 10. Context Governance / Compaction
 
@@ -1507,7 +1529,70 @@ Phase 按依赖关系推进：先实现被其它阶段依赖的公共契约、ru
 - Engine / OpenAI runner / parser findings owner 为 Engine hardening gate。
 - Schema CHECK hardening owner 为后续 schema hardening work unit。
 
+#### Phase 9 Conversation Memory / Session Memory Projection design refinement 追踪
+
+结论：
+
+- P9 的核心定位是“财报分析工作台状态投影”，不是聊天记录压缩器。
+- P9 memory view 必须明确区分 `pinned_state`、`verified_facts`、`working_assumptions` 与
+  `conversation_continuity`；不得把工具事实、assistant conclusion、用户说法和 episode summary 混成无结构字符串列表。
+- P9 必须为后续跨多年弱信号归因召回预留 Host 中立 evidence anchor、claim status、provenance 与 trace included /
+  excluded reason 边界；长期 retrieval index、业务 signal ledger、signal-to-outcome verification 与 public memory edit / reset /
+  forget API 不进入 P9。
+- P9 不实现 LLM compaction 写 truth；LLM 产出的 pinned patch、episode summary 或 conclusion 默认只能成为 candidate /
+  assumption / continuity view。proactive compaction 编排归 Phase 10 Context Governance。
+
+追踪项：
+
+- P9 plan 必须把 memory snapshot schema、claim status、provenance refs、snapshot cursor、policy digest、included / excluded reason、
+  lag threshold 与 repair trigger 落成可实现的 typed contract 与测试矩阵。
+- P9 plan 必须保持 Host 业务中立，不得让 Host import `dayu.fins`、不得保存网页新闻 / 公告 / 研报摘录 / 财报 chunk 原文、
+  不得把 company / business-line / technology release 等财报业务语义写进 Host memory schema。
+- Issue 39 owner 后续实现 query-time retrieval 与 signal-to-outcome verification 时，必须复用 P9 的中立 anchor / claim /
+  provenance / trace 边界；若发现边界不足，先回写 `docs/host/design.md` 再实施。
+
+#### Phase 9 plan gate 追踪
+
+结论：
+
+- P9 handoff implementation-ready plan artifact 为 `docs/host/phase9-conversation-memory-plan.md`。
+- Plan review artifacts 为 `docs/reviews/p9-plan-review-mimo-20260516.md` 与
+  `docs/reviews/p9-plan-review-ds-20260516.md`。
+- Plan re-review artifacts 为 `docs/reviews/p9-plan-rereview-mimo-20260516.md` 与
+  `docs/reviews/p9-plan-rereview-ds-20260516.md`。
+- Controller adjudication artifact 为 `docs/reviews/p9-plan-review-controller-adjudication-20260516.md`。
+- Re-review verdict：AgentMiMo PASS，AgentDS PASS，remaining blocking findings 为 0。
+
+追踪项：
+
+- 当前无 accepted blocking plan finding。
+- P9 implementation 必须按 accepted plan 的 slice 顺序推进；若 implementation agent 发现现有 `TOOL_RESULT_ACCEPTED` 无法提供任何可审计
+  summary / ref / digest 组合、repair-required 无法在不修改 Run 状态机的情况下表达、Memory provider 接入需要修改 Engine message
+  contract，或必须让 Host 理解财报业务 subject 类型，必须停回 design / control gate。
+
 ## 历史记录
+
+### 2026-05-16 P9 plan accepted
+
+P9 handoff implementation-ready plan 已生成于 `docs/host/phase9-conversation-memory-plan.md`。双路 plan review 已完成：
+AgentMiMo 初审 verdict 为 PASS with findings，提出 2 个 blocking、5 个 medium、3 个 low findings；AgentDS 初审 verdict 为 PASS，
+提出 0 个 blocking、2 个 medium、3 个 low、1 个 info finding。Controller 裁决接受 provider 接线、`MemorySnapshotView` shape、
+claim status lifecycle、`RUN_SUCCEEDED` continuity、`required_event_sequence`、`open_questions` placement、history pool 算法、
+Host-neutral ref、`TOOL_RESULT_ACCEPTED` mapping、diagnostic/failure 分工与 digest canonicalization 等修正项；拒绝固定 40 / 60
+magic budget split 和业务词 blocklist 作为修复方式。Planning agent 已修正 plan。双路 re-review 均 PASS，remaining blocking findings 为
+0。Controller adjudication artifact 为 `docs/reviews/p9-plan-review-controller-adjudication-20260516.md`。当前 gate 为等待用户确认进入
+P9 implementation。
+
+### 2026-05-16 P9 design refinement
+
+Controller 按 `$phaseflow` 启动 P9。总控文档识别当前状态为 P8 completed / draft-PR-pass，下一 work unit 为 Phase 9
+`Conversation Memory / Session Memory Projection`。用户确认 P9 phase discussion 裁决：P9 是“财报分析工作台状态投影”，
+不是聊天记录压缩器；memory view 分为 `pinned_state`、`verified_facts`、`working_assumptions`、
+`conversation_continuity`；verified facts 只接受工具事实并保留 evidence / provenance refs；RunInputBuilder 注入顺序按财报分析优先级固定；
+预算策略保持克制；projection lag 必须显式可观测且不得触发 Run recovery；P9 不实现 LLM compaction 写 truth；测试重点围绕反幻觉与
+EventLog 可重建。用户同时确认参考 issue 39 的未来长期证据召回目标，但 P9 只预留 Host 中立 evidence anchor / claim status /
+provenance / trace included-excluded 边界，不实现长期 retrieval、业务 signal ledger 或 signal-to-outcome verification。`docs/host/design.md`
+§24 与本文档 Phase 9 条目已写回上述裁决。当前 gate 为 P9 handoff implementation-ready plan，下一步派发 planning agent。
 
 ### 2026-05-16 P8 完成前滚动状态归档
 
