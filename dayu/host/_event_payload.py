@@ -390,6 +390,28 @@ def required_payload_text(
     return value
 
 
+def optional_payload_text(
+    payload: Mapping[str, JsonValue], *, field_name: str
+) -> str | None:
+    """读取 payload 中的可选文本字段。
+
+    字段缺失或显式为 ``null`` 时返回 ``None``；字段存在但不是非空文本时
+    抛出 durable error，避免 projection consumer 从非 typed 字段猜测语义。
+
+    :param payload: payload 映射。
+    :param field_name: 字段名。
+    :returns: 文本值或 ``None``。
+    :raises HostDurableError: 字段存在但不是非空文本时抛出。
+    """
+
+    value = payload.get(field_name)
+    if value is None:
+        return None
+    if isinstance(value, str) and value.strip() != "":
+        return value
+    raise HostDurableError(f"payload field {field_name} must be non-empty text")
+
+
 def _await_spec_json(await_spec: ToolAwaitSpec) -> JsonValue:
     """把工具等待规约投影为 JSON。
 

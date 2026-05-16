@@ -211,6 +211,19 @@ def _event_id_for_sequence(db_path: Path, event_sequence: int) -> str:
     return str(row[0])
 
 
+def _delete_minimal_read_model_rows(db_path: Path) -> None:
+    """删除 minimal read model rows，模拟 projection 缺失。
+
+    :param db_path: SQLite DB 路径。
+    :returns: ``None``。
+    """
+
+    with sqlite3.connect(db_path) as connection:
+        connection.execute("DELETE FROM host_session_timeline_items")
+        connection.execute("DELETE FROM host_run_results")
+        connection.commit()
+
+
 def _first_event_sequence(db_path: Path) -> int:
     """读取 EventLog 第一条全局 event sequence。
 
@@ -538,6 +551,36 @@ def test_stream_run_events_ignores_projection_failure_row(
         )
         assert stream.next_cursor.event_sequence == _max_scanned_event_sequence(
             options.db_path, cursor, limit
+        )
+    finally:
+        host.close()
+
+
+def test_stream_run_events_ignores_missing_minimal_read_model(
+    tmp_path: Path,
+) -> None:
+    """minimal read model 缺失时 stream 仍只读取 EventLog truth。"""
+
+    options = _options(tmp_path)
+    host = create_host_command_handle(options)
+    try:
+        session_id = _session_id(host, "target")
+        target = start_run(host, _start_request(session_id, "target-run"))
+        cursor = HostStreamCursor(event_sequence=0)
+        _delete_minimal_read_model_rows(options.db_path)
+
+        stream = stream_run_events(
+            host,
+            target.run_id,
+            cursor,
+            limit=HOST_EVENT_STREAM_MAX_LIMIT,
+        )
+
+        assert _stream_event_views(stream.events) == _event_views_for_run_after(
+            options.db_path,
+            target.run_id,
+            cursor,
+            HOST_EVENT_STREAM_MAX_LIMIT,
         )
     finally:
         host.close()

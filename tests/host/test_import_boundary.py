@@ -45,6 +45,8 @@ HOST_ENGINE_CONTRACT_ALLOWED_MODULES: tuple[str, ...] = (
 PROJECTION_MODULES: tuple[str, ...] = (
     "projection.py",
     "durable/projection.py",
+    "read_model.py",
+    "durable/read_model.py",
 )
 PROJECTION_FORBIDDEN_PREFIXES: tuple[str, ...] = (
     "dayu.engine",
