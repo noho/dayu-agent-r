@@ -1,8 +1,9 @@
 """Host durable SQLite schema bootstrap 与版本校验。
 
 本模块是 Host durable schema convention 的唯一 DDL 真源。它创建 Phase 2
-foundation tables，以及 Phase 3 Session / Run / Attempt durable state tables；
-不承载 command、admission、projection、outbox、memory 或 purge 相关逻辑。
+foundation tables、Phase 3 Session / Run / Attempt durable state tables，
+以及 Phase 8 projection / read model tables；不承载 command、admission、
+outbox、memory 或 purge 相关逻辑。
 """
 
 from __future__ import annotations
@@ -21,7 +22,7 @@ from dayu.host.api import (
 )
 from dayu.host.durable.errors import HostSchemaMismatchError
 
-HOST_SCHEMA_VERSION = 4
+HOST_SCHEMA_VERSION = 5
 """当前 Host durable SQLite schema version。"""
 
 TABLE_EVENT_LOG = "event_log"
@@ -35,6 +36,10 @@ TABLE_HOST_RUNS = "host_runs"
 TABLE_HOST_ATTEMPTS = "host_attempts"
 TABLE_HOST_ATTEMPT_DISPATCH_RECORDS = "host_attempt_dispatch_records"
 TABLE_HOST_WAIT_RECORDS = "host_wait_records"
+TABLE_HOST_PROJECTION_CHECKPOINTS = "host_projection_checkpoints"
+TABLE_HOST_PROJECTION_FAILURES = "host_projection_failures"
+TABLE_HOST_RUN_RESULTS = "host_run_results"
+TABLE_HOST_SESSION_TIMELINE_ITEMS = "host_session_timeline_items"
 
 INDEX_HOST_RUNS_ONE_ACTIVE_PER_SESSION = "host_runs_one_active_per_session"
 INDEX_HOST_RUNS_QUEUE_FIFO = "host_runs_queue_fifo"
@@ -44,6 +49,15 @@ INDEX_HOST_WAIT_RECORDS_ONE_ACTIVE_PER_RUN = (
 )
 INDEX_HOST_WAIT_RECORDS_ACTIVE_POLL = "host_wait_records_active_poll"
 INDEX_HOST_WAIT_RECORDS_EXTERNAL_JOB = "host_wait_records_external_job"
+INDEX_HOST_RUN_RESULTS_SESSION_TERMINAL_SEQUENCE = (
+    "host_run_results_session_terminal_sequence"
+)
+INDEX_HOST_SESSION_TIMELINE_ITEMS_SESSION_SEQUENCE = (
+    "host_session_timeline_items_session_sequence"
+)
+INDEX_HOST_SESSION_TIMELINE_ITEMS_RUN_SEQUENCE = (
+    "host_session_timeline_items_run_sequence"
+)
 
 FOUNDATION_TABLES: tuple[str, ...] = (
     TABLE_EVENT_LOG,
@@ -64,7 +78,17 @@ PHASE3_STATE_TABLES: tuple[str, ...] = (
 )
 """Phase 3 Session / Run / Attempt durable state table 名称集合。"""
 
-HOST_DURABLE_TABLES: tuple[str, ...] = FOUNDATION_TABLES + PHASE3_STATE_TABLES
+PROJECTION_TABLES: tuple[str, ...] = (
+    TABLE_HOST_PROJECTION_CHECKPOINTS,
+    TABLE_HOST_PROJECTION_FAILURES,
+    TABLE_HOST_RUN_RESULTS,
+    TABLE_HOST_SESSION_TIMELINE_ITEMS,
+)
+"""Phase 8 projection checkpoint / failure / read model table 名称集合。"""
+
+HOST_DURABLE_TABLES: tuple[str, ...] = (
+    FOUNDATION_TABLES + PHASE3_STATE_TABLES + PROJECTION_TABLES
+)
 """当前 fresh bootstrap 应创建的 Host durable table 名称集合。"""
 
 _SQLITE_PAYLOADS_DDL = f"""
@@ -542,6 +566,96 @@ CREATE TABLE IF NOT EXISTS {TABLE_HOST_WAIT_RECORDS} (
 )
 """
 
+_HOST_PROJECTION_CHECKPOINTS_DDL = f"""
+CREATE TABLE IF NOT EXISTS {TABLE_HOST_PROJECTION_CHECKPOINTS} (
+  consumer_id TEXT PRIMARY KEY,
+  checkpoint_event_sequence INTEGER NOT NULL CHECK (
+    checkpoint_event_sequence >= 0
+  ),
+  checkpoint_event_id TEXT NULL,
+  last_success_at TEXT NULL,
+  updated_at TEXT NOT NULL,
+  FOREIGN KEY(checkpoint_event_id) REFERENCES {TABLE_EVENT_LOG}(event_id),
+  CHECK (
+    (checkpoint_event_sequence = 0 AND checkpoint_event_id IS NULL)
+    OR
+    (checkpoint_event_sequence > 0 AND checkpoint_event_id IS NOT NULL)
+  )
+)
+"""
+
+_HOST_PROJECTION_FAILURES_DDL = f"""
+CREATE TABLE IF NOT EXISTS {TABLE_HOST_PROJECTION_FAILURES} (
+  consumer_id TEXT PRIMARY KEY,
+  failed_event_sequence INTEGER NOT NULL CHECK (failed_event_sequence > 0),
+  failed_event_id TEXT NOT NULL,
+  failure_count INTEGER NOT NULL CHECK (failure_count > 0),
+  last_error_code TEXT NOT NULL,
+  last_error_message TEXT NOT NULL,
+  first_failed_at TEXT NOT NULL,
+  last_failed_at TEXT NOT NULL,
+  retry_after TEXT NULL,
+  FOREIGN KEY(failed_event_id) REFERENCES {TABLE_EVENT_LOG}(event_id)
+)
+"""
+
+_HOST_RUN_RESULTS_DDL = f"""
+CREATE TABLE IF NOT EXISTS {TABLE_HOST_RUN_RESULTS} (
+  run_id TEXT PRIMARY KEY,
+  session_id TEXT NOT NULL,
+  terminal_status TEXT NOT NULL CHECK (
+    terminal_status IN ('succeeded', 'failed', 'cancelled', 'lost')
+  ),
+  terminal_event_id TEXT NOT NULL UNIQUE,
+  terminal_event_sequence INTEGER NOT NULL,
+  result_ref TEXT NULL,
+  result_digest TEXT NULL,
+  summary_ref TEXT NULL,
+  summary_digest TEXT NULL,
+  projected_at TEXT NOT NULL,
+  updated_at TEXT NOT NULL,
+  FOREIGN KEY(run_id) REFERENCES {TABLE_HOST_RUNS}(run_id),
+  FOREIGN KEY(session_id) REFERENCES {TABLE_HOST_SESSIONS}(session_id),
+  FOREIGN KEY(terminal_event_id) REFERENCES {TABLE_EVENT_LOG}(event_id),
+  FOREIGN KEY(terminal_event_sequence) REFERENCES {TABLE_EVENT_LOG}(event_sequence),
+  CHECK (
+    (result_ref IS NULL AND result_digest IS NULL)
+    OR
+    (result_ref IS NOT NULL AND result_digest IS NOT NULL)
+  ),
+  CHECK (
+    (summary_ref IS NULL AND summary_digest IS NULL)
+    OR
+    (summary_ref IS NOT NULL AND summary_digest IS NOT NULL)
+  )
+)
+"""
+
+_HOST_SESSION_TIMELINE_ITEMS_DDL = f"""
+CREATE TABLE IF NOT EXISTS {TABLE_HOST_SESSION_TIMELINE_ITEMS} (
+  timeline_item_id TEXT PRIMARY KEY,
+  session_id TEXT NOT NULL,
+  run_id TEXT NULL,
+  event_id TEXT NOT NULL UNIQUE,
+  event_sequence INTEGER NOT NULL,
+  item_kind TEXT NOT NULL,
+  event_type TEXT NOT NULL,
+  display_text TEXT NULL,
+  payload_ref TEXT NULL,
+  payload_digest TEXT NULL,
+  projected_at TEXT NOT NULL,
+  FOREIGN KEY(session_id) REFERENCES {TABLE_HOST_SESSIONS}(session_id),
+  FOREIGN KEY(run_id) REFERENCES {TABLE_HOST_RUNS}(run_id),
+  FOREIGN KEY(event_id) REFERENCES {TABLE_EVENT_LOG}(event_id),
+  FOREIGN KEY(event_sequence) REFERENCES {TABLE_EVENT_LOG}(event_sequence),
+  CHECK (
+    (payload_ref IS NULL AND payload_digest IS NULL)
+    OR
+    (payload_ref IS NOT NULL AND payload_digest IS NOT NULL)
+  )
+)
+"""
+
 _HOST_RUNS_ONE_ACTIVE_PER_SESSION_INDEX_DDL = f"""
 CREATE UNIQUE INDEX IF NOT EXISTS {INDEX_HOST_RUNS_ONE_ACTIVE_PER_SESSION}
 ON {TABLE_HOST_RUNS}(session_id)
@@ -576,6 +690,22 @@ ON {TABLE_HOST_WAIT_RECORDS}(adapter_key, external_job_id)
 WHERE external_job_id IS NOT NULL
 """
 
+_HOST_RUN_RESULTS_SESSION_TERMINAL_SEQUENCE_INDEX_DDL = f"""
+CREATE INDEX IF NOT EXISTS {INDEX_HOST_RUN_RESULTS_SESSION_TERMINAL_SEQUENCE}
+ON {TABLE_HOST_RUN_RESULTS}(session_id, terminal_event_sequence)
+"""
+
+_HOST_SESSION_TIMELINE_ITEMS_SESSION_SEQUENCE_INDEX_DDL = f"""
+CREATE INDEX IF NOT EXISTS {INDEX_HOST_SESSION_TIMELINE_ITEMS_SESSION_SEQUENCE}
+ON {TABLE_HOST_SESSION_TIMELINE_ITEMS}(session_id, event_sequence)
+"""
+
+_HOST_SESSION_TIMELINE_ITEMS_RUN_SEQUENCE_INDEX_DDL = f"""
+CREATE INDEX IF NOT EXISTS {INDEX_HOST_SESSION_TIMELINE_ITEMS_RUN_SEQUENCE}
+ON {TABLE_HOST_SESSION_TIMELINE_ITEMS}(run_id, event_sequence)
+WHERE run_id IS NOT NULL
+"""
+
 FOUNDATION_DDL: tuple[str, ...] = (
     _SQLITE_PAYLOADS_DDL,
     _PAYLOAD_DESCRIPTORS_DDL,
@@ -605,8 +735,27 @@ PHASE3_INDEX_DDL: tuple[str, ...] = (
 )
 """Phase 3 state table index DDL。"""
 
+PROJECTION_DDL: tuple[str, ...] = (
+    _HOST_PROJECTION_CHECKPOINTS_DDL,
+    _HOST_PROJECTION_FAILURES_DDL,
+    _HOST_RUN_RESULTS_DDL,
+    _HOST_SESSION_TIMELINE_ITEMS_DDL,
+)
+"""按外键依赖顺序排列的 Phase 8 projection / read model table DDL。"""
+
+PROJECTION_INDEX_DDL: tuple[str, ...] = (
+    _HOST_RUN_RESULTS_SESSION_TERMINAL_SEQUENCE_INDEX_DDL,
+    _HOST_SESSION_TIMELINE_ITEMS_SESSION_SEQUENCE_INDEX_DDL,
+    _HOST_SESSION_TIMELINE_ITEMS_RUN_SEQUENCE_INDEX_DDL,
+)
+"""Phase 8 projection / read model index DDL。"""
+
 HOST_DURABLE_DDL: tuple[str, ...] = (
-    FOUNDATION_DDL + PHASE3_STATE_DDL + PHASE3_INDEX_DDL
+    FOUNDATION_DDL
+    + PHASE3_STATE_DDL
+    + PROJECTION_DDL
+    + PHASE3_INDEX_DDL
+    + PROJECTION_INDEX_DDL
 )
 """当前 Host durable fresh bootstrap 全量 DDL。"""
 

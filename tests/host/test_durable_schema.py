@@ -18,8 +18,16 @@ from dayu.host.durable.schema import (
     HOST_DURABLE_TABLES,
     HOST_SCHEMA_VERSION,
     PHASE3_STATE_TABLES,
+    PROJECTION_TABLES,
+    INDEX_HOST_RUN_RESULTS_SESSION_TERMINAL_SEQUENCE,
+    INDEX_HOST_SESSION_TIMELINE_ITEMS_RUN_SEQUENCE,
+    INDEX_HOST_SESSION_TIMELINE_ITEMS_SESSION_SEQUENCE,
     TABLE_EVENT_LOG,
     TABLE_HOST_INSTANCES,
+    TABLE_HOST_PROJECTION_CHECKPOINTS,
+    TABLE_HOST_PROJECTION_FAILURES,
+    TABLE_HOST_RUN_RESULTS,
+    TABLE_HOST_SESSION_TIMELINE_ITEMS,
     TABLE_HOST_WAIT_RECORDS,
     INDEX_HOST_WAIT_RECORDS_ACTIVE_POLL,
     INDEX_HOST_WAIT_RECORDS_EXTERNAL_JOB,
@@ -95,8 +103,43 @@ def _pragma_text(connection: sqlite3.Connection, sql: str) -> str:
     return str(row[0])
 
 
-def test_fresh_db_creates_foundation_and_phase7_tables(tmp_path: Path) -> None:
-    """fresh DB bootstrap 创建 foundation 与 Phase 7 state tables 并设置 PRAGMA。"""
+def _insert_event_log_probe(connection: sqlite3.Connection, event_id: str) -> None:
+    """插入 schema 约束测试用 EventLog row。
+
+    :param connection: SQLite connection。
+    :param event_id: EventLog id。
+    :returns: 无。
+    :raises sqlite3.Error: 插入失败时由 SQLite 抛出。
+    """
+
+    connection.execute(
+        f"""
+        INSERT INTO {TABLE_EVENT_LOG} (
+          event_id,
+          event_body_digest,
+          event_class,
+          session_id,
+          event_type,
+          occurred_at,
+          payload_json,
+          appended_at
+        ) VALUES (
+          ?,
+          'digest',
+          'canonical_fact',
+          'session-1',
+          'TYPE_A',
+          '2026-05-16T00:00:00.000000Z',
+          '{{}}',
+          '2026-05-16T00:00:00.000000Z'
+        )
+        """,
+        (event_id,),
+    )
+
+
+def test_fresh_db_creates_foundation_and_phase8_tables(tmp_path: Path) -> None:
+    """fresh DB bootstrap 创建 foundation、state 与 projection tables 并设置 PRAGMA。"""
 
     options = _options(tmp_path)
     with open_host_durable_store(options) as store:
@@ -104,8 +147,9 @@ def test_fresh_db_creates_foundation_and_phase7_tables(tmp_path: Path) -> None:
         try:
             assert _table_names(connection) == frozenset(HOST_DURABLE_TABLES)
             assert set(PHASE3_STATE_TABLES).issubset(_table_names(connection))
-            assert _pragma_int(connection, "PRAGMA user_version") == 4
-            assert HOST_SCHEMA_VERSION == 4
+            assert set(PROJECTION_TABLES).issubset(_table_names(connection))
+            assert _pragma_int(connection, "PRAGMA user_version") == 5
+            assert HOST_SCHEMA_VERSION == 5
             assert _pragma_int(connection, "PRAGMA foreign_keys") == 1
             assert _pragma_text(connection, "PRAGMA journal_mode").lower() == "wal"
             assert _pragma_int(connection, "PRAGMA busy_timeout") == 250
@@ -236,11 +280,233 @@ def test_wait_record_table_and_indexes_are_created(tmp_path: Path) -> None:
             connection.close()
 
 
-def test_schema_does_not_create_future_phase_tables(tmp_path: Path) -> None:
-    """Slice 1 bootstrap 不得预创建 wait record 之外的 future tables。"""
+def test_projection_checkpoint_and_failure_tables_are_created(
+    tmp_path: Path,
+) -> None:
+    """fresh schema 创建 projection checkpoint / failure tables。"""
+
+    options = _options(tmp_path)
+    with open_host_durable_store(options) as store:
+        connection = store.connect()
+        try:
+            assert TABLE_HOST_PROJECTION_CHECKPOINTS in _table_names(connection)
+            assert TABLE_HOST_PROJECTION_FAILURES in _table_names(connection)
+            assert TABLE_HOST_RUN_RESULTS in _table_names(connection)
+            assert TABLE_HOST_SESSION_TIMELINE_ITEMS in _table_names(connection)
+            assert _primary_key_columns(
+                connection, TABLE_HOST_PROJECTION_CHECKPOINTS
+            ) == ("consumer_id",)
+            assert _primary_key_columns(
+                connection, TABLE_HOST_PROJECTION_FAILURES
+            ) == ("consumer_id",)
+            assert _primary_key_columns(connection, TABLE_HOST_RUN_RESULTS) == (
+                "run_id",
+            )
+            assert _primary_key_columns(
+                connection, TABLE_HOST_SESSION_TIMELINE_ITEMS
+            ) == ("timeline_item_id",)
+            run_result_indexes = connection.execute(
+                f"PRAGMA index_list({TABLE_HOST_RUN_RESULTS})"
+            ).fetchall()
+            timeline_indexes = connection.execute(
+                f"PRAGMA index_list({TABLE_HOST_SESSION_TIMELINE_ITEMS})"
+            ).fetchall()
+            assert INDEX_HOST_RUN_RESULTS_SESSION_TERMINAL_SEQUENCE in {
+                str(row[1]) for row in run_result_indexes
+            }
+            assert {
+                INDEX_HOST_SESSION_TIMELINE_ITEMS_SESSION_SEQUENCE,
+                INDEX_HOST_SESSION_TIMELINE_ITEMS_RUN_SEQUENCE,
+            }.issubset({str(row[1]) for row in timeline_indexes})
+        finally:
+            connection.close()
+
+
+def test_projection_schema_constraints_reject_invalid_rows(
+    tmp_path: Path,
+) -> None:
+    """projection schema CHECK / FK 约束拒绝非法 checkpoint 与 failure row。"""
+
+    options = _options(tmp_path)
+    with open_host_durable_store(options) as store:
+        connection = store.connect()
+        try:
+            _insert_event_log_probe(connection, "event-1")
+            with pytest.raises(sqlite3.IntegrityError):
+                connection.execute(
+                    f"""
+                    INSERT INTO {TABLE_HOST_PROJECTION_CHECKPOINTS} (
+                      consumer_id,
+                      checkpoint_event_sequence,
+                      checkpoint_event_id,
+                      updated_at
+                    ) VALUES ('consumer', -1, NULL, '2026-05-16T00:00:00.000000Z')
+                    """
+                )
+            with pytest.raises(sqlite3.IntegrityError):
+                connection.execute(
+                    f"""
+                    INSERT INTO {TABLE_HOST_PROJECTION_FAILURES} (
+                      consumer_id,
+                      failed_event_sequence,
+                      failed_event_id,
+                      failure_count,
+                      last_error_code,
+                      last_error_message,
+                      first_failed_at,
+                      last_failed_at
+                    ) VALUES (
+                      'consumer',
+                      1,
+                      'missing-event',
+                      0,
+                      'ProjectionError',
+                      'failed',
+                      '2026-05-16T00:00:00.000000Z',
+                      '2026-05-16T00:00:00.000000Z'
+                    )
+                    """
+                )
+            with pytest.raises(sqlite3.IntegrityError):
+                connection.execute(
+                    f"""
+                    INSERT INTO {TABLE_HOST_PROJECTION_CHECKPOINTS} (
+                      consumer_id,
+                      checkpoint_event_sequence,
+                      checkpoint_event_id,
+                      updated_at
+                    ) VALUES (
+                      'consumer-zero-with-event',
+                      0,
+                      'event-1',
+                      '2026-05-16T00:00:00.000000Z'
+                    )
+                    """
+                )
+            with pytest.raises(sqlite3.IntegrityError):
+                connection.execute(
+                    f"""
+                    INSERT INTO {TABLE_HOST_PROJECTION_CHECKPOINTS} (
+                      consumer_id,
+                      checkpoint_event_sequence,
+                      checkpoint_event_id,
+                      updated_at
+                    ) VALUES (
+                      'consumer-positive-without-event',
+                      1,
+                      NULL,
+                      '2026-05-16T00:00:00.000000Z'
+                    )
+                    """
+                )
+            with pytest.raises(sqlite3.IntegrityError):
+                connection.execute(
+                    f"""
+                    INSERT INTO {TABLE_HOST_PROJECTION_CHECKPOINTS} (
+                      consumer_id,
+                      checkpoint_event_sequence,
+                      checkpoint_event_id,
+                      updated_at
+                    ) VALUES (
+                      'consumer',
+                      1,
+                      'missing-event',
+                      '2026-05-16T00:00:00.000000Z'
+                    )
+                    """
+                )
+            with pytest.raises(sqlite3.IntegrityError):
+                connection.execute(
+                    f"""
+                    INSERT INTO {TABLE_HOST_RUN_RESULTS} (
+                      run_id,
+                      session_id,
+                      terminal_status,
+                      terminal_event_id,
+                      terminal_event_sequence,
+                      result_ref,
+                      result_digest,
+                      projected_at,
+                      updated_at
+                    ) VALUES (
+                      'run-1',
+                      'session-1',
+                      'running',
+                      'event-1',
+                      1,
+                      'result-ref',
+                      NULL,
+                      '2026-05-16T00:00:00.000000Z',
+                      '2026-05-16T00:00:00.000000Z'
+                    )
+                    """
+                )
+            with pytest.raises(sqlite3.IntegrityError):
+                connection.execute(
+                    f"""
+                    INSERT INTO {TABLE_HOST_SESSION_TIMELINE_ITEMS} (
+                      timeline_item_id,
+                      session_id,
+                      event_id,
+                      event_sequence,
+                      item_kind,
+                      event_type,
+                      payload_ref,
+                      payload_digest,
+                      projected_at
+                    ) VALUES (
+                      'event-1',
+                      'session-1',
+                      'event-1',
+                      1,
+                      'user_input',
+                      'USER_INPUT_ACCEPTED',
+                      'payload-ref',
+                      NULL,
+                      '2026-05-16T00:00:00.000000Z'
+                    )
+                    """
+                )
+        finally:
+            connection.close()
+
+
+def test_event_sequence_is_sqlite_foreign_key_parent_key(
+    tmp_path: Path,
+) -> None:
+    """event_log(event_sequence) 是 SQLite FK 可引用的 primary key。"""
+
+    options = _options(tmp_path)
+    with open_host_durable_store(options) as store:
+        connection = store.connect()
+        try:
+            event_columns = connection.execute(
+                f"PRAGMA table_info({TABLE_EVENT_LOG})"
+            ).fetchall()
+            event_sequence = next(
+                row for row in event_columns if str(row[1]) == "event_sequence"
+            )
+            assert int(event_sequence[5]) == 1
+            connection.execute(
+                """
+                CREATE TABLE projection_fk_probe (
+                  event_sequence INTEGER NOT NULL,
+                  FOREIGN KEY(event_sequence) REFERENCES event_log(event_sequence)
+                )
+                """
+            )
+            with pytest.raises(sqlite3.IntegrityError):
+                connection.execute(
+                    "INSERT INTO projection_fk_probe (event_sequence) VALUES (999)"
+                )
+        finally:
+            connection.close()
+
+
+def test_schema_does_not_create_future_sink_tables(tmp_path: Path) -> None:
+    """Slice 1 bootstrap 不得预创建 projection 之外的 future sink tables。"""
 
     forbidden_fragments = (
-        "projection",
         "outbox",
         "memory",
         "purge",

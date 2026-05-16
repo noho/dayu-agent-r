@@ -42,6 +42,40 @@ HOST_ENGINE_CONTRACT_ALLOWED_MODULES: tuple[str, ...] = (
     "local_proxy.py",
     "run_input.py",
 )
+PROJECTION_MODULES: tuple[str, ...] = (
+    "projection.py",
+    "durable/projection.py",
+    "read_model.py",
+    "durable/read_model.py",
+)
+PROJECTION_FORBIDDEN_PREFIXES: tuple[str, ...] = (
+    "dayu.engine",
+    "dayu.service",
+    "dayu.ui",
+    "dayu.fins",
+    "dayu.config",
+    "dayu.runtime",
+    "dayu.host.admission",
+    "dayu.host.waiting",
+    "dayu.host.engine_ingest",
+    "dayu.host.dispatch",
+    "dayu.host.recovery",
+)
+READ_API_EVENT_STREAM_FORBIDDEN_PREFIXES: tuple[str, ...] = (
+    "dayu.host.projection",
+    "dayu.host.durable.projection",
+    "dayu.host.read_model",
+    "dayu.host.fanout",
+    "dayu.host.notification",
+)
+READ_API_EVENT_STREAM_FORBIDDEN_TOKENS: tuple[str, ...] = (
+    "host_projection_checkpoints",
+    "host_projection_failures",
+    "host_session_timeline_items",
+    "repair_minimal_read_models",
+    "fanout",
+    "wakeup",
+)
 
 
 def _host_root() -> Path:
@@ -151,6 +185,42 @@ def test_runtime_does_not_import_host_or_engine_layers() -> None:
             if _matches_prefix(module, RUNTIME_FORBIDDEN_PREFIXES):
                 violations.append((str(file_path), module))
     assert not violations, f"runtime forbidden imports: {violations}"
+
+
+def test_projection_modules_do_not_import_forbidden_layers_or_mutators() -> None:
+    """projection modules 不得导入上层、runtime 或 Host mutator owner。"""
+
+    host_root = _host_root()
+    violations: list[tuple[str, str]] = []
+    for relative_path in PROJECTION_MODULES:
+        file_path = host_root / relative_path
+        for module in _imported_module_names(
+            file_path.read_text(encoding="utf-8")
+        ):
+            if _matches_prefix(module, PROJECTION_FORBIDDEN_PREFIXES):
+                violations.append((str(file_path), module))
+    assert not violations, f"projection forbidden imports: {violations}"
+
+
+def test_read_api_stream_does_not_reference_projection_or_fanout_truth() -> None:
+    """read_api 不得引用 projection / fanout / repair 作为 stream truth。"""
+
+    file_path = _host_root() / "read_api.py"
+    source = file_path.read_text(encoding="utf-8")
+    imported_violations: list[str] = []
+    for module in _imported_module_names(source):
+        if _matches_prefix(module, READ_API_EVENT_STREAM_FORBIDDEN_PREFIXES):
+            imported_violations.append(module)
+    token_violations = tuple(
+        token for token in READ_API_EVENT_STREAM_FORBIDDEN_TOKENS if token in source
+    )
+
+    assert not imported_violations, (
+        f"read_api forbidden stream imports: {imported_violations}"
+    )
+    assert not token_violations, (
+        f"read_api forbidden stream truth tokens: {token_violations}"
+    )
 
 
 def test_engine_does_not_import_host_layer() -> None:

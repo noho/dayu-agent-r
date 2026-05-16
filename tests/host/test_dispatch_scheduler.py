@@ -321,6 +321,8 @@ class _AcceptingWorker:
 
         self._factory.accepted_snapshots.append(snapshot)
         self._factory.accepted_requests.append(request)
+        if self._factory.accepted_handle is not None:
+            return self._factory.accepted_handle
         return _FakeHandle()
 
 
@@ -390,12 +392,17 @@ class _FakeWorkerFactory:
     """测试用 worker factory。"""
 
     def __init__(
-        self, *, slow: bool = False, worker: LocalEngineWorker | None = None
+        self,
+        *,
+        slow: bool = False,
+        worker: LocalEngineWorker | None = None,
+        accepted_handle: LocalWorkerHandle | None = None,
     ) -> None:
         """初始化 factory。
 
         :param slow: 是否返回超时 worker。
         :param worker: 指定 worker；不传时按 ``slow`` 构造。
+        :param accepted_handle: 默认 accepting worker 返回的指定 handle。
         :returns: ``None``。
         """
 
@@ -404,6 +411,7 @@ class _FakeWorkerFactory:
         self.accepted_requests: list[AgentRunRequest] = []
         self._slow = slow
         self._worker = worker
+        self.accepted_handle = accepted_handle
 
     def create_worker(self, snapshot: AttemptDispatchSnapshot) -> LocalEngineWorker:
         """创建 fake worker。
@@ -486,7 +494,7 @@ async def test_pending_waiting_dispatching_worker_accept_marks_running(
 ) -> None:
     """pending dispatch 可推进到 worker accepted，Attempt 进入 RUNNING。"""
 
-    factory = _FakeWorkerFactory()
+    factory = _FakeWorkerFactory(accepted_handle=_CloseCountingHandle())
     with open_host_durable_store(_options(tmp_path)) as store:
         seeded = _seed_current_run(store)
         scheduler = await _open_scheduler(tmp_path, store, factory)
@@ -526,7 +534,7 @@ async def test_scheduler_uses_toolruntime_when_tooling_is_configured(
 ) -> None:
     """真实 dispatch scheduler 在 tool-enabled 配置下接入 ToolRuntime。"""
 
-    factory = _FakeWorkerFactory()
+    factory = _FakeWorkerFactory(accepted_handle=_CloseCountingHandle())
     tool = _CountingTool()
     with open_host_durable_store(_options(tmp_path)) as store:
         seeded = _seed_current_run(store)

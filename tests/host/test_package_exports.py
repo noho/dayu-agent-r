@@ -36,6 +36,7 @@ EXPECTED_API_EXPORTS: frozenset[str] = frozenset(
         "HostCallContext",
         "HostCommandFacet",
         "HostCommandHandleOptions",
+        "HostEventClass",
         "HostEventStream",
         "HostEventView",
         "HostInput",

@@ -220,6 +220,19 @@ def _idempotency_count(db_path: Path) -> int:
     return int(row[0])
 
 
+def _delete_minimal_read_model_rows(db_path: Path) -> None:
+    """删除 minimal read model rows，模拟 projection 缺失。
+
+    :param db_path: SQLite DB 路径。
+    :returns: ``None``。
+    """
+
+    with sqlite3.connect(db_path) as connection:
+        connection.execute("DELETE FROM host_session_timeline_items")
+        connection.execute("DELETE FROM host_run_results")
+        connection.commit()
+
+
 def _known_run_event_cursor(db_path: Path, run_id: str) -> int:
     """按 Run row 已知事件序列计算 public event cursor。
 
@@ -489,6 +502,27 @@ def test_cancel_run_queued_and_predispatch_starting(tmp_path: Path) -> None:
 
         assert cancelled_queued.status == RunStatus.CANCELLED
         assert cancelled_active.status == RunStatus.CANCELLED
+    finally:
+        host.close()
+
+
+def test_get_run_uses_durable_status_when_minimal_read_model_is_missing(
+    tmp_path: Path,
+) -> None:
+    """minimal RunResult 缺失不改变 public RunSnapshot durable truth。"""
+
+    options = _options(tmp_path)
+    host = create_host_command_handle(options)
+    try:
+        session_id = _session_id(host)
+        run = start_run(host, _start_request(session_id, "start-1"))
+        before = get_run(host, run.run_id)
+        _delete_minimal_read_model_rows(options.db_path)
+        after = get_run(host, run.run_id)
+
+        assert after.status == before.status
+        assert after.event_cursor == before.event_cursor
+        assert after.terminal_result_summary == before.terminal_result_summary
     finally:
         host.close()
 

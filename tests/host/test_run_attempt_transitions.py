@@ -402,6 +402,108 @@ def test_terminal_closeout_appends_concrete_terminal_events(
     ("attempt_status", "run_status", "attempt_event_type", "run_event_type"),
     (
         (
+            AttemptStatus.SUCCEEDED,
+            RunStatus.SUCCEEDED,
+            "ATTEMPT_SUCCEEDED",
+            "RUN_SUCCEEDED",
+        ),
+        (
+            AttemptStatus.FAILED,
+            RunStatus.FAILED,
+            "ATTEMPT_FAILED",
+            "RUN_FAILED",
+        ),
+        (
+            AttemptStatus.CANCELLED,
+            RunStatus.CANCELLED,
+            "ATTEMPT_CANCELLED",
+            "RUN_CANCELLED",
+        ),
+        (
+            AttemptStatus.LOST,
+            RunStatus.LOST,
+            "ATTEMPT_LOST",
+            "RUN_LOST",
+        ),
+    ),
+)
+def test_terminal_closeout_accepts_compatible_terminal_status_pairs(
+    tmp_path: Path,
+    attempt_status: AttemptStatus,
+    run_status: RunStatus,
+    attempt_event_type: str,
+    run_event_type: str,
+) -> None:
+    """terminal closeout 只接受 Attempt / Run 语义一致的终态配对。"""
+
+    with open_host_durable_store(_options(tmp_path)) as store:
+        seeded = _seed_running_run(store, tmp_path)
+        if attempt_status is AttemptStatus.CANCELLED:
+
+            def mark_running(transaction: HostTransaction) -> None:
+                """将 Attempt 推进到 RUNNING 以满足取消 CAS 源状态。
+
+                :param transaction: Host transaction。
+                :returns: ``None``。
+                """
+
+                result = mark_attempt_running_row(
+                    transaction,
+                    attempt_id=seeded.attempt_id,
+                    updated_at="2026-05-14T01:02:03.000000Z",
+                )
+                assert result.status is StateMutationStatus.UPDATED
+
+            store.transaction_runner.run_write(mark_running)
+
+        def closeout(transaction: HostTransaction) -> tuple[str, str, tuple[str, ...]]:
+            """按参数执行 terminal closeout。
+
+            :param transaction: Host transaction。
+            :returns: Run 状态、Attempt 状态与事件类型序列。
+            """
+
+            result = terminal_closeout_in_transaction(
+                transaction,
+                EventLogStore(),
+                TerminalCloseoutInput(
+                    run_id=seeded.run_id,
+                    attempt_id=seeded.attempt_id,
+                    attempt_terminal_event_id=(
+                        f"event-compatible-attempt-{attempt_status.value}"
+                    ),
+                    run_terminal_event_id=f"event-compatible-run-{run_status.value}",
+                    attempt_terminal_status=attempt_status,
+                    run_terminal_status=run_status,
+                    occurred_at=_NOW,
+                    actor="analyst",
+                    source="pytest",
+                    reason="phase3_internal_closeout",
+                    terminal_summary_ref=None,
+                    terminal_summary_digest=None,
+                ),
+            )
+            assert result.run is not None
+            assert result.attempt is not None
+            return (
+                result.run.status.value,
+                result.attempt.status.value,
+                _event_types(transaction),
+            )
+
+        run_value, attempt_value, event_types = store.transaction_runner.run_write(
+            closeout
+        )
+        assert run_value == run_status.value
+        assert attempt_value == attempt_status.value
+        assert attempt_event_type in event_types
+        assert run_event_type in event_types
+
+
+@pytest.mark.parametrize(
+    ("attempt_status", "run_status", "attempt_event_type", "run_event_type"),
+    (
+        (
             AttemptStatus.FAILED,
             RunStatus.FAILED,
             "ATTEMPT_FAILED",
@@ -529,14 +631,14 @@ def test_terminal_closeout_accepts_attempt_running_in_phase5(
     ("attempt_status", "run_status", "message"),
     (
         (
-            AttemptStatus.CANCELLED,
+            AttemptStatus.SUCCEEDED,
             RunStatus.FAILED,
-            "unsupported Attempt terminal status",
+            "terminal Attempt and Run status pair is invalid",
         ),
         (
-            AttemptStatus.FAILED,
-            RunStatus.CANCELLED,
-            "unsupported Run terminal status",
+            AttemptStatus.SUSPENDED,
+            RunStatus.SUCCEEDED,
+            "unsupported Attempt terminal status",
         ),
     ),
 )

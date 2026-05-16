@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import sqlite3
+from datetime import UTC, datetime
 from pathlib import Path
 
 import pytest
@@ -17,6 +18,8 @@ from dayu.host import (
     HostCallContext,
     HostCommandHandle,
     HostCommandHandleOptions,
+    HostEventClass,
+    HostEventView,
     HostInput,
     HostStreamCursor,
     OperationContext,
@@ -26,6 +29,20 @@ from dayu.host import (
     start_run,
     stream_run_events,
 )
+from dayu.host.durable.schema import (
+    TABLE_EVENT_LOG,
+    TABLE_HOST_PROJECTION_CHECKPOINTS,
+    TABLE_HOST_PROJECTION_FAILURES,
+)
+from dayu.host.durable.event_log import (
+    EventClass,
+    EventLogAppendRequest,
+    EventLogStore,
+)
+from dayu.host.durable.transaction import HostTransaction
+
+_PROJECTION_CONSUMER_ID = "phase8-stream-boundary"
+_PROJECTION_TEST_NOW = "2026-05-16T00:00:00Z"
 
 
 def _options(tmp_path: Path) -> HostCommandHandleOptions:
@@ -180,6 +197,269 @@ def _max_scanned_event_sequence(
     return int(row[0])
 
 
+def _event_id_for_sequence(db_path: Path, event_sequence: int) -> str:
+    """读取指定 EventLog sequence 对应的 event id。
+
+    :param db_path: SQLite DB 路径。
+    :param event_sequence: 目标全局 event sequence。
+    :returns: EventLog event id。
+    :raises AssertionError: 指定 sequence 不存在时抛出。
+    """
+
+    with sqlite3.connect(db_path) as connection:
+        row = connection.execute(
+            f"""
+            SELECT event_id
+            FROM {TABLE_EVENT_LOG}
+            WHERE event_sequence = ?
+            """,
+            (event_sequence,),
+        ).fetchone()
+    assert row is not None
+    return str(row[0])
+
+
+def _delete_minimal_read_model_rows(db_path: Path) -> None:
+    """删除 minimal read model rows，模拟 projection 缺失。
+
+    :param db_path: SQLite DB 路径。
+    :returns: ``None``。
+    """
+
+    with sqlite3.connect(db_path) as connection:
+        connection.execute("DELETE FROM host_session_timeline_items")
+        connection.execute("DELETE FROM host_run_results")
+        connection.commit()
+
+
+def _first_event_sequence(db_path: Path) -> int:
+    """读取 EventLog 第一条全局 event sequence。
+
+    :param db_path: SQLite DB 路径。
+    :returns: 最小 event sequence。
+    :raises AssertionError: EventLog 为空时抛出。
+    """
+
+    with sqlite3.connect(db_path) as connection:
+        row = connection.execute(
+            f"SELECT MIN(event_sequence) FROM {TABLE_EVENT_LOG}"
+        ).fetchone()
+    assert row is not None
+    assert row[0] is not None
+    return int(row[0])
+
+
+def _event_views_for_run_after(
+    db_path: Path, run_id: str, cursor: HostStreamCursor, limit: int
+) -> tuple[tuple[int, str, str], ...]:
+    """按 stream scan-window contract 从 EventLog 读取目标 Run 事件视图。
+
+    :param db_path: SQLite DB 路径。
+    :param run_id: 目标 Run id。
+    :param cursor: 输入 Host stream cursor。
+    :param limit: 最大扫描 row 数。
+    :returns: 目标 Run 的 ``(event_sequence, event_id, event_type)`` 元组。
+    """
+
+    with sqlite3.connect(db_path) as connection:
+        rows = connection.execute(
+            f"""
+            WITH scanned AS (
+              SELECT event_sequence, event_id, event_type, run_id
+              FROM {TABLE_EVENT_LOG}
+              WHERE event_sequence > ?
+              ORDER BY event_sequence ASC
+              LIMIT ?
+            )
+            SELECT event_sequence, event_id, event_type
+            FROM scanned
+            WHERE run_id = ?
+            ORDER BY event_sequence ASC
+            """,
+            (cursor.event_sequence, limit, run_id),
+        ).fetchall()
+    return tuple((int(row[0]), str(row[1]), str(row[2])) for row in rows)
+
+
+def _stream_event_views(
+    stream_events: tuple[HostEventView, ...],
+) -> tuple[tuple[int, str, str], ...]:
+    """提取 public stream event 的稳定断言字段。
+
+    :param stream_events: public stream event 元组。
+    :returns: ``(event_sequence, event_id, event_type)`` 元组。
+    """
+
+    return tuple(
+        (event.event_sequence, event.event_id, event.event_type)
+        for event in stream_events
+    )
+
+
+def _write_projection_checkpoint(
+    db_path: Path, consumer_id: str, event_sequence: int
+) -> None:
+    """直接写入 projection checkpoint 干扰 row。
+
+    :param db_path: SQLite DB 路径。
+    :param consumer_id: projection consumer id。
+    :param event_sequence: checkpoint EventLog sequence。
+    :returns: ``None``。
+    """
+
+    event_id = _event_id_for_sequence(db_path, event_sequence)
+    with sqlite3.connect(db_path) as connection:
+        connection.execute(
+            f"""
+            INSERT INTO {TABLE_HOST_PROJECTION_CHECKPOINTS} (
+              consumer_id,
+              checkpoint_event_sequence,
+              checkpoint_event_id,
+              last_success_at,
+              updated_at
+            ) VALUES (?, ?, ?, ?, ?)
+            ON CONFLICT(consumer_id) DO UPDATE SET
+              checkpoint_event_sequence = excluded.checkpoint_event_sequence,
+              checkpoint_event_id = excluded.checkpoint_event_id,
+              last_success_at = excluded.last_success_at,
+              updated_at = excluded.updated_at
+            """,
+            (
+                consumer_id,
+                event_sequence,
+                event_id,
+                _PROJECTION_TEST_NOW,
+                _PROJECTION_TEST_NOW,
+            ),
+        )
+        connection.commit()
+
+
+def _write_projection_failure(
+    db_path: Path, consumer_id: str, event_sequence: int
+) -> None:
+    """直接写入 projection failure 干扰 row。
+
+    :param db_path: SQLite DB 路径。
+    :param consumer_id: projection consumer id。
+    :param event_sequence: 失败 EventLog sequence。
+    :returns: ``None``。
+    """
+
+    event_id = _event_id_for_sequence(db_path, event_sequence)
+    with sqlite3.connect(db_path) as connection:
+        connection.execute(
+            f"""
+            INSERT INTO {TABLE_HOST_PROJECTION_FAILURES} (
+              consumer_id,
+              failed_event_sequence,
+              failed_event_id,
+              failure_count,
+              last_error_code,
+              last_error_message,
+              first_failed_at,
+              last_failed_at,
+              retry_after
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, NULL)
+            ON CONFLICT(consumer_id) DO UPDATE SET
+              failed_event_sequence = excluded.failed_event_sequence,
+              failed_event_id = excluded.failed_event_id,
+              failure_count = excluded.failure_count,
+              last_error_code = excluded.last_error_code,
+              last_error_message = excluded.last_error_message,
+              last_failed_at = excluded.last_failed_at,
+              retry_after = excluded.retry_after
+            """,
+            (
+                consumer_id,
+                event_sequence,
+                event_id,
+                1,
+                "ProjectionError",
+                "stream boundary test failure",
+                _PROJECTION_TEST_NOW,
+                _PROJECTION_TEST_NOW,
+            ),
+        )
+        connection.commit()
+
+
+def _projection_checkpoint_rows(
+    db_path: Path,
+) -> tuple[tuple[str, int, str | None, str | None, str], ...]:
+    """读取 projection checkpoint rows 作为副作用断言基线。
+
+    :param db_path: SQLite DB 路径。
+    :returns: checkpoint row 字段元组。
+    """
+
+    with sqlite3.connect(db_path) as connection:
+        rows = connection.execute(
+            f"""
+            SELECT
+              consumer_id,
+              checkpoint_event_sequence,
+              checkpoint_event_id,
+              last_success_at,
+              updated_at
+            FROM {TABLE_HOST_PROJECTION_CHECKPOINTS}
+            ORDER BY consumer_id ASC
+            """
+        ).fetchall()
+    return tuple(
+        (
+            str(row[0]),
+            int(row[1]),
+            None if row[2] is None else str(row[2]),
+            None if row[3] is None else str(row[3]),
+            str(row[4]),
+        )
+        for row in rows
+    )
+
+
+def _projection_failure_rows(
+    db_path: Path,
+) -> tuple[tuple[str, int, str, int, str, str, str, str, str | None], ...]:
+    """读取 projection failure rows 作为副作用断言基线。
+
+    :param db_path: SQLite DB 路径。
+    :returns: failure row 字段元组。
+    """
+
+    with sqlite3.connect(db_path) as connection:
+        rows = connection.execute(
+            f"""
+            SELECT
+              consumer_id,
+              failed_event_sequence,
+              failed_event_id,
+              failure_count,
+              last_error_code,
+              last_error_message,
+              first_failed_at,
+              last_failed_at,
+              retry_after
+            FROM {TABLE_HOST_PROJECTION_FAILURES}
+            ORDER BY consumer_id ASC
+            """
+        ).fetchall()
+    return tuple(
+        (
+            str(row[0]),
+            int(row[1]),
+            str(row[2]),
+            int(row[3]),
+            str(row[4]),
+            str(row[5]),
+            str(row[6]),
+            str(row[7]),
+            None if row[8] is None else str(row[8]),
+        )
+        for row in rows
+    )
+
+
 def test_stream_run_events_returns_only_target_run_events(
     tmp_path: Path,
 ) -> None:
@@ -206,6 +486,203 @@ def test_stream_run_events_returns_only_target_run_events(
         assert stream.next_cursor.event_sequence == _max_event_sequence(
             options.db_path
         )
+    finally:
+        host.close()
+
+
+def test_stream_run_events_exposes_event_class_for_preview_rows(
+    tmp_path: Path,
+) -> None:
+    """stream_run_events 必须暴露 EventLog row 的 public event class。"""
+
+    options = _options(tmp_path)
+    host = create_host_command_handle(options)
+    try:
+        session_id = _session_id(host, "target")
+        target = start_run(host, _start_request(session_id, "target-run"))
+
+        def append_preview(transaction: HostTransaction) -> None:
+            """追加同一 Run 的 preview EventLog row。
+
+            :param transaction: Host transaction。
+            :returns: ``None``。
+            """
+
+            EventLogStore().append_event(
+                transaction,
+                EventLogAppendRequest(
+                    event_id="event-preview-content-delta",
+                    event_class=EventClass.PREVIEW,
+                    session_id=session_id,
+                    run_id=target.run_id,
+                    attempt_id=None,
+                    execution_id=None,
+                    event_type="CONTENT_DELTA",
+                    occurred_at=datetime(2026, 5, 16, 1, 2, 3, tzinfo=UTC),
+                    actor="engine",
+                    source="pytest",
+                    client_request_id=None,
+                    idempotency_key="preview-content-delta",
+                    policy_decision=None,
+                    reason=None,
+                    payload_json={"text": "delta"},
+                    payload_ref=None,
+                    payload_digest=None,
+                ),
+            )
+
+        host._transaction_runner().run_write(append_preview)
+
+        stream = stream_run_events(
+            host,
+            target.run_id,
+            HostStreamCursor(event_sequence=0),
+            limit=HOST_EVENT_STREAM_MAX_LIMIT,
+        )
+
+        event_classes = tuple(event.event_class for event in stream.events)
+        assert HostEventClass.CANONICAL_FACT in event_classes
+        assert HostEventClass.PREVIEW in event_classes
+        assert stream.events[-1].event_class is HostEventClass.PREVIEW
+        assert stream.events[-1].event_type == "CONTENT_DELTA"
+    finally:
+        host.close()
+
+
+def test_stream_run_events_ignores_projection_checkpoint_lag(
+    tmp_path: Path,
+) -> None:
+    """projection checkpoint 落后 EventLog 时 stream 仍按 EventLog cursor 补读。"""
+
+    options = _options(tmp_path)
+    host = create_host_command_handle(options)
+    try:
+        target_session_id = _session_id(host, "target")
+        other_session_id = _session_id(host, "other")
+        target = start_run(host, _start_request(target_session_id, "target-run"))
+        start_run(host, _start_request(other_session_id, "other-run"))
+        cursor = HostStreamCursor(event_sequence=0)
+        lagged_checkpoint = _first_event_sequence(options.db_path)
+        assert lagged_checkpoint < _max_event_sequence(options.db_path)
+        _write_projection_checkpoint(
+            options.db_path, _PROJECTION_CONSUMER_ID, lagged_checkpoint
+        )
+
+        stream = stream_run_events(
+            host,
+            target.run_id,
+            cursor,
+            limit=HOST_EVENT_STREAM_MAX_LIMIT,
+        )
+
+        assert _stream_event_views(stream.events) == _event_views_for_run_after(
+            options.db_path,
+            target.run_id,
+            cursor,
+            HOST_EVENT_STREAM_MAX_LIMIT,
+        )
+        assert stream.next_cursor.event_sequence == _max_event_sequence(
+            options.db_path
+        )
+    finally:
+        host.close()
+
+
+def test_stream_run_events_ignores_projection_failure_row(
+    tmp_path: Path,
+) -> None:
+    """projection failure row 存在时 stream 仍返回 EventLog rows 与正确 cursor。"""
+
+    options = _options(tmp_path)
+    host = create_host_command_handle(options)
+    try:
+        target_session_id = _session_id(host, "target")
+        other_session_id = _session_id(host, "other")
+        target = start_run(host, _start_request(target_session_id, "target-run"))
+        start_run(host, _start_request(other_session_id, "other-run"))
+        cursor = HostStreamCursor(event_sequence=0)
+        limit = 3
+        _write_projection_failure(
+            options.db_path,
+            _PROJECTION_CONSUMER_ID,
+            _first_event_sequence(options.db_path),
+        )
+
+        stream = stream_run_events(host, target.run_id, cursor, limit=limit)
+
+        assert _stream_event_views(stream.events) == _event_views_for_run_after(
+            options.db_path,
+            target.run_id,
+            cursor,
+            limit,
+        )
+        assert stream.next_cursor.event_sequence == _max_scanned_event_sequence(
+            options.db_path, cursor, limit
+        )
+    finally:
+        host.close()
+
+
+def test_stream_run_events_ignores_missing_minimal_read_model(
+    tmp_path: Path,
+) -> None:
+    """minimal read model 缺失时 stream 仍只读取 EventLog truth。"""
+
+    options = _options(tmp_path)
+    host = create_host_command_handle(options)
+    try:
+        session_id = _session_id(host, "target")
+        target = start_run(host, _start_request(session_id, "target-run"))
+        cursor = HostStreamCursor(event_sequence=0)
+        _delete_minimal_read_model_rows(options.db_path)
+
+        stream = stream_run_events(
+            host,
+            target.run_id,
+            cursor,
+            limit=HOST_EVENT_STREAM_MAX_LIMIT,
+        )
+
+        assert _stream_event_views(stream.events) == _event_views_for_run_after(
+            options.db_path,
+            target.run_id,
+            cursor,
+            HOST_EVENT_STREAM_MAX_LIMIT,
+        )
+    finally:
+        host.close()
+
+
+def test_stream_run_events_does_not_write_projection_tables(
+    tmp_path: Path,
+) -> None:
+    """stream_run_events 不推进 checkpoint、不修复 failure、不写 projection 表。"""
+
+    options = _options(tmp_path)
+    host = create_host_command_handle(options)
+    try:
+        session_id = _session_id(host, "target")
+        target = start_run(host, _start_request(session_id, "target-run"))
+        first_sequence = _first_event_sequence(options.db_path)
+        _write_projection_checkpoint(
+            options.db_path, _PROJECTION_CONSUMER_ID, first_sequence
+        )
+        _write_projection_failure(
+            options.db_path, _PROJECTION_CONSUMER_ID, first_sequence
+        )
+        checkpoint_rows_before = _projection_checkpoint_rows(options.db_path)
+        failure_rows_before = _projection_failure_rows(options.db_path)
+
+        stream = stream_run_events(
+            host,
+            target.run_id,
+            HostStreamCursor(event_sequence=0),
+            limit=HOST_EVENT_STREAM_MAX_LIMIT,
+        )
+
+        assert stream.events != ()
+        assert _projection_checkpoint_rows(options.db_path) == checkpoint_rows_before
+        assert _projection_failure_rows(options.db_path) == failure_rows_before
     finally:
         host.close()
 

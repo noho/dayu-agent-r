@@ -1,10 +1,11 @@
 """Host 公共 API 类型契约。
 
-本模块只定义 Host 后续阶段可依赖的公共 request、snapshot、status、
-error 与 context 类型。它不实现 command path、durable store、EventLog、
-dispatch、policy provider 或 Engine 调用路径。`HostLocalExecutionOptions`
-为 composition root 本地执行装配保留构造期 tooling 输入字段，但 tooling
-类型仍由 `dayu.host.tooling` 直接导出，不进入 `dayu.host.api.__all__`。
+本模块定义 Host 后续阶段可依赖的公共 request、snapshot、status、event
+stream、error、context 与本地执行装配类型。它不实现 command path、
+durable store、EventLog 写入、dispatch scheduler、policy provider 或
+Engine 调用路径。`HostLocalExecutionOptions` 为 composition root 本地执行
+装配保留构造期 tooling 输入字段，但 tooling 类型仍由 `dayu.host.tooling`
+直接导出，不进入 `dayu.host.api.__all__`。
 """
 
 from __future__ import annotations
@@ -317,6 +318,19 @@ class WaitResolutionSource(StrEnum):
     POLL = "poll"
     CALLBACK = "callback"
     MANUAL = "manual"
+
+
+class HostEventClass(StrEnum):
+    """Host public event stream 事件分类。
+
+    成员与 durable EventLog row 的事件分类一一对应，但作为 public API
+    类型暴露，避免调用方依赖 durable 内部模块。
+    """
+
+    CANONICAL_FACT = "canonical_fact"
+    PREVIEW = "preview"
+    DIAGNOSTIC = "diagnostic"
+    PROJECTION_SIGNAL = "projection_signal"
 
 
 @dataclass(frozen=True, slots=True)
@@ -1851,6 +1865,8 @@ class HostEventView:
 
     - ``event_sequence``：全局单调事件序列。
     - ``event_id``：canonical event id。
+    - ``event_class``：事件分类，用于区分 canonical fact、preview、
+      diagnostic 与 projection signal。
     - ``event_type``：事件类型标识。
     - ``session_id``：关联 Session id。
     - ``run_id``：关联 Run id；事件不绑定 Run 时为 ``None``。
@@ -1860,6 +1876,7 @@ class HostEventView:
 
     event_sequence: int
     event_id: str
+    event_class: HostEventClass
     event_type: str
     session_id: str
     run_id: str | None
@@ -1877,6 +1894,8 @@ class HostEventView:
             self.event_sequence, field_name="HostEventView.event_sequence"
         )
         _require_non_empty(self.event_id, field_name="HostEventView.event_id")
+        if not isinstance(self.event_class, HostEventClass):
+            raise ValueError("HostEventView.event_class must be HostEventClass")
         _require_non_empty(
             self.event_type, field_name="HostEventView.event_type"
         )
@@ -1980,6 +1999,7 @@ __all__ = [
     "HostCommandFacet",
     "HostCommandHandleOptions",
     "HostLocalExecutionOptions",
+    "HostEventClass",
     "HostEventStream",
     "HostEventView",
     "HostInput",

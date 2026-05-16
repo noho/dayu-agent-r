@@ -14,6 +14,7 @@ from dayu.host.api import (
     HOST_EVENT_STREAM_MAX_LIMIT,
     HostApiError,
     HostApiErrorCode,
+    HostEventClass,
     HostEventStream,
     HostEventView,
     HostStreamCursor,
@@ -209,6 +210,7 @@ def _event_view_from_row(row: EventLogRow) -> HostEventView:
     return HostEventView(
         event_sequence=row.event_sequence,
         event_id=row.event_id,
+        event_class=HostEventClass(row.event_class.value),
         event_type=row.event_type,
         session_id=row.session_id,
         run_id=row.run_id,

@@ -145,9 +145,12 @@ class RuntimeFileLock:
         :returns: 已获取锁的 token。
         :raises RuntimeFileLockTimeoutError: non-blocking 或限时 acquire 超时时
             抛出。
-        :raises RuntimeFileLockError: parent directory、路径或 acquire 失败时抛出。
+        :raises RuntimeFileLockError: parent directory、路径、同实例重叠 acquire
+            或 acquire 失败时抛出。
         """
 
+        if self._active_token is not None and not self._active_token.released:
+            raise RuntimeFileLockError("runtime file lock token is already active")
         effective_timeout = _effective_timeout_seconds(
             timeout_seconds=timeout_seconds,
             default_timeout_seconds=self.options.timeout_seconds,
@@ -161,21 +164,21 @@ class RuntimeFileLock:
         except Exception as exc:
             raise RuntimeFileLockError("获取 runtime file lock 失败") from exc
 
-        return RuntimeFileLockToken(
+        token = RuntimeFileLockToken(
             lock_path=self.options.lock_path,
             third_party_lock=self._third_party_lock,
         )
+        self._active_token = token
+        return token
 
     def __enter__(self) -> RuntimeFileLockToken:
         """进入同步 context manager 并获取文件锁。
 
         :returns: 已获取锁的 token。
-        :raises RuntimeFileLockError: 获取锁失败时抛出。
+        :raises RuntimeFileLockError: 获取锁失败或同实例 token 未释放时抛出。
         """
 
-        token = self.acquire()
-        self._active_token = token
-        return token
+        return self.acquire()
 
     def __exit__(
         self,
@@ -193,9 +196,9 @@ class RuntimeFileLock:
         """
 
         token = self._active_token
-        self._active_token = None
         if token is not None:
             token.release()
+            self._active_token = None
 
 
 def file_lock(

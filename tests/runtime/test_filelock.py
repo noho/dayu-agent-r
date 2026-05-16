@@ -43,6 +43,19 @@ class _CountingThirdPartyLock:
         self.release_calls += 1
 
 
+class _FailingReleaseToken(RuntimeFileLockToken):
+    """测试用 release 失败 token。"""
+
+    def release(self) -> None:
+        """模拟底层 release 失败。
+
+        :returns: 不返回；始终抛出 ``RuntimeFileLockError``。
+        :raises RuntimeFileLockError: 始终抛出，用于验证 active token 保留。
+        """
+
+        raise RuntimeFileLockError("release failed")
+
+
 def _raise_marker_restore_error(_lock_path: Path) -> None:
     """模拟 marker 恢复失败。
 
@@ -112,6 +125,81 @@ def test_context_manager_releases_on_exception_path(tmp_path: Path) -> None:
 
     assert token is not None
     assert token.released
+
+
+def test_context_manager_release_failure_keeps_active_token_and_reacquire_fails_fast(
+    tmp_path: Path,
+) -> None:
+    """context manager release 失败时必须保留 active token 并拒绝再次 acquire。"""
+
+    lock_path = _lock_path(tmp_path)
+    third_party_lock = _CountingThirdPartyLock()
+    lock = file_lock(lock_path)
+    failing_token = _FailingReleaseToken(
+        lock_path=lock_path,
+        third_party_lock=cast(FileLock, third_party_lock),
+    )
+    lock._active_token = failing_token
+
+    with pytest.raises(RuntimeFileLockError, match="release failed"):
+        lock.__exit__(None, None, None)
+
+    assert lock._active_token is failing_token
+    with pytest.raises(RuntimeFileLockError, match="already active"):
+        lock.acquire(timeout_seconds=0)
+
+
+def test_nested_context_manager_on_same_instance_fails_fast(tmp_path: Path) -> None:
+    """同一 lock 实例嵌套 context 必须拒绝，避免覆盖 active token。"""
+
+    lock = file_lock(_lock_path(tmp_path))
+
+    with lock as outer_token:
+        with pytest.raises(RuntimeFileLockError, match="already active"):
+            with lock:
+                raise AssertionError("nested context must not enter")
+
+    assert outer_token.released
+
+
+def test_manual_acquire_inside_context_fails_fast(tmp_path: Path) -> None:
+    """context 持有 token 时同实例手动 acquire 必须拒绝。"""
+
+    lock = file_lock(_lock_path(tmp_path))
+
+    with lock as token:
+        with pytest.raises(RuntimeFileLockError, match="already active"):
+            lock.acquire(timeout_seconds=0)
+
+    assert token.released
+
+
+def test_context_enter_after_manual_acquire_fails_fast(tmp_path: Path) -> None:
+    """手动 acquire 未释放时，同实例 context enter 必须拒绝。"""
+
+    lock = file_lock(_lock_path(tmp_path))
+    token = lock.acquire(timeout_seconds=0)
+    try:
+        with pytest.raises(RuntimeFileLockError, match="already active"):
+            with lock:
+                raise AssertionError("context must not enter")
+    finally:
+        token.release()
+
+
+def test_manual_release_allows_same_instance_reacquire(tmp_path: Path) -> None:
+    """手动 token release 后，同一 lock 实例必须允许再次 acquire。"""
+
+    lock = file_lock(_lock_path(tmp_path))
+    first_token = lock.acquire(timeout_seconds=0)
+    first_token.release()
+
+    second_token = lock.acquire(timeout_seconds=0)
+    try:
+        assert second_token is not first_token
+        assert not second_token.released
+    finally:
+        second_token.release()
 
 
 def test_release_is_idempotent(tmp_path: Path) -> None:
