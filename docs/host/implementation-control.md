@@ -338,8 +338,18 @@ re-review 与 controller adjudication，accepted checkpoint commit 为 `aaa107a`
 `docs/reviews/host-phase7-code-re-review-s1-ds-20260516.md` 与
 `docs/reviews/host-phase7-code-re-review-s1-controller-adjudication-20260516.md`。验证为
 `pytest tests/host/test_public_contracts.py tests/host/test_import_boundary.py tests/host/test_package_exports.py tests/host/test_durable_schema.py tests/host/test_state_schema.py tests/host/test_wait_record_state.py tests/host/test_public_run_api.py -q`
-84 passed、`python -m pyright dayu/host tests/host` 0 errors、`git diff --check` clean。当前 gate 为 P7-S2
-`ToolRuntime Awaiting Accept Path` implementation。
+84 passed、`python -m pyright dayu/host tests/host` 0 errors、`git diff --check` clean。
+P7-S2 `ToolRuntime Awaiting Accept Path` 已完成 implementation、双路 code review、accepted finding fix、双路 code
+re-review 与 controller adjudication，accepted checkpoint commit 为 `42f972a`。P7-S2 artifacts 为
+`docs/reviews/host-phase7-implementation-s2-tool-awaiting-accept-20260516.md`、
+`docs/reviews/host-phase7-code-review-s2-mimo-20260516.md`、
+`docs/reviews/host-phase7-code-review-s2-ds-20260516.md`、
+`docs/reviews/host-phase7-fix-s2-tool-awaiting-accept-20260516.md`、
+`docs/reviews/host-phase7-code-re-review-s2-mimo-20260516.md`、
+`docs/reviews/host-phase7-code-re-review-s2-ds-20260516.md` 与
+`docs/reviews/host-phase7-code-re-review-s2-controller-adjudication-20260516.md`。验证为
+`pytest tests/host -q` 374 passed、`python -m pyright dayu/host tests/host` 0 errors、`git diff --check`
+clean。当前 gate 为 P7-S3 `resolve_wait Command And Resume Attempt` implementation。
 
 ## Phase Map
 
