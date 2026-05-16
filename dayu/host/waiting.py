@@ -38,7 +38,11 @@ from dayu.host.api import (
     RunStatus,
     WaitProviderStatusRef,
 )
-from dayu.host.durable.codec import format_utc_timestamp, sha256_digest_json
+from dayu.host.durable.codec import (
+    format_utc_timestamp,
+    is_sha256_digest,
+    sha256_digest_json,
+)
 from dayu.host.durable.event_log import (
     EventClass,
     EventLogAppendRequest,
@@ -233,7 +237,7 @@ class ToolAwaitingAcceptCandidate:
             (self.normalized_arguments_digest, "normalized_arguments_digest"),
             (self.semantic_input_digest, "semantic_input_digest"),
         ):
-            if not value.startswith("sha256:") or len(value) != 71:
+            if not is_sha256_digest(value):
                 raise ValueError(f"{field_name} must be sha256 digest")
         if self.binding.resume_policy is WaitResumePolicy.POLL:
             if self.external_job_ref is None:

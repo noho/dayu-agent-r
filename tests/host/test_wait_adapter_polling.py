@@ -11,17 +11,23 @@ from dayu.host import (
     CancelRunRequest,
     HostCommandHandle,
     ResolveWaitCompletedOutcome,
+    ResolveWaitLostOutcome,
     ResolveWaitRequest,
     RunSnapshot,
+    RunStatus,
+    WaitProviderStatusRef,
     cancel_run,
     create_host_command_handle,
+    get_run,
     resolve_wait,
 )
+from dayu.host.durable.codec import sha256_digest_json
 from dayu.host.durable.state import WaitRecordRow, WaitRecordStatus
 from dayu.host.wait_adapter import (
     WaitPollAdapter,
     WaitPollAdapterRegistration,
     WaitPollAdapterRegistry,
+    WaitPollLost,
     WaitPollNotReady,
     WaitPollReady,
     WaitPollResult,
@@ -154,6 +160,48 @@ def test_poll_adapter_not_ready_leaves_wait_active(
         assert result.not_ready == 1
         assert adapter.poll_count == 1
         assert wait_record.status is WaitRecordStatus.WAITING
+    finally:
+        host.close()
+
+
+def test_poll_adapter_lost_result_closes_run(
+    tmp_path: Path,
+) -> None:
+    """poll adapter lost 结果通过 resolve_wait 收口 Run。"""
+
+    host = create_host_command_handle(_options(tmp_path))
+    try:
+        seeded = _seed_waiting_run(host)
+        adapter = _SequenceAdapter(
+            (
+                WaitPollLost(
+                    ResolveWaitLostOutcome(
+                        reason_code="adapter_lost",
+                        message="external job status is no longer observable",
+                        provider_status_ref=WaitProviderStatusRef(
+                            adapter_key=_read_wait(
+                                host._transaction_runner(), seeded.wait_id
+                            ).adapter_key,
+                            status_ref="provider-status-lost",
+                            status_digest=sha256_digest_json(
+                                {"status": "poll-lost"}
+                            ),
+                        ),
+                    )
+                ),
+            )
+        )
+        poller = _poller(host, adapter, seeded.wait_id)
+
+        result = poller.poll_once()
+
+        wait_record = _read_wait(host._transaction_runner(), seeded.wait_id)
+        snapshot = get_run(host, seeded.run_id)
+        assert result.resolved == 0
+        assert result.lost == 1
+        assert adapter.poll_count == 1
+        assert wait_record.status is WaitRecordStatus.LOST
+        assert snapshot.status is RunStatus.LOST
     finally:
         host.close()
 

@@ -6,6 +6,8 @@ from dataclasses import replace
 from datetime import UTC, datetime
 from pathlib import Path
 
+import pytest
+
 from dayu.contracts.tool_await import ToolAwaitKind, ToolAwaitSpec
 from dayu.host.api import AttemptStatus, EnsureSessionRequest, RunStatus, WaitAdapterKey
 from dayu.host.durable.codec import sha256_digest_json
@@ -147,6 +149,22 @@ def test_awaiting_accept_same_key_different_digest_rejects_without_new_facts(
         assert isinstance(second, ToolAwaitingRejectedAck)
         assert second.reason_code.value == "idempotency_conflict"
         assert after == before
+
+
+def test_awaiting_accept_candidate_rejects_non_hex_digest(
+    tmp_path: Path,
+) -> None:
+    """awaiting accept candidate 拒绝非十六进制 sha256 digest。"""
+
+    with open_host_durable_store(_options(tmp_path)) as store:
+        seeded = _seed_active_run(store.transaction_runner)
+        candidate = _awaiting_candidate(seeded)
+
+        with pytest.raises(ValueError, match="tool_schema_digest must be sha256 digest"):
+            replace(
+                candidate,
+                tool_schema_digest="sha256:" + "g" * 64,
+            )
 
 
 def test_awaiting_accept_stale_execution_rejects_without_wait_record(
