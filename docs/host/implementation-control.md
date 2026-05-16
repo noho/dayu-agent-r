@@ -426,7 +426,20 @@ DS-6、DS-18 与 MiMo-2，AgentCodex fix artifact 为
 `docs/reviews/gateflow-deepreview-fix-re-review-ds-20260516.md`；两路 re-review 均 PASS。验证为
 `pytest tests/contracts/test_tool_schema.py tests/contracts/test_tool_declaration.py tests/host/test_durable_transaction.py tests/host/test_engine_ingest_mapping.py tests/host/test_toolruntime_executor.py tests/host/test_toolruntime_truncation_fetch_more.py tests/host/test_phase6_toolruntime_integration.py`
 69 passed、`python -m pyright` 0 errors、`git diff --check` clean。本地 accepted deepreview checkpoint commit 为
-`52bba89`。Phase 7 状态为 completed。
+`52bba89`。Phase 7 状态为 completed。Phase 8 `Projection Core / Host Event Stream / Minimal Read Model` design
+discussion 已完成，输入 artifact 为 `docs/reviews/host-phase8-design-discussion-codex-20260516.md`，controller
+adjudication artifact 为 `docs/reviews/host-phase8-design-discussion-controller-adjudication-20260516.md`。Controller
+裁决为 PASS：Phase 8 动机成立，`docs/host/design.md` §14 / §16 与本文档 Phase 8 条目已足够进入 handoff
+implementation-ready plan，无 blocking open question，无必须先写回 design / control 的 design gap。Phase 8 handoff
+implementation-ready plan 已写入 `docs/host/phase8-projection-core-event-stream-plan.md`。Plan review artifacts 为
+`docs/reviews/host-phase8-plan-review-mimo-20260516.md` 与 `docs/reviews/host-phase8-plan-review-ds-20260516.md`；
+controller plan review adjudication artifact 为
+`docs/reviews/host-phase8-plan-review-controller-adjudication-20260516.md`。Accepted plan findings 已由
+`docs/reviews/host-phase8-plan-fix-codex-20260516.md` 修复。Plan re-review artifacts 为
+`docs/reviews/host-phase8-plan-re-review-mimo-20260516.md` 与
+`docs/reviews/host-phase8-plan-re-review-ds-20260516.md`；controller plan re-review adjudication artifact 为
+`docs/reviews/host-phase8-plan-re-review-controller-adjudication-20260516.md`。两路 re-review 均 PASS，blocking count 为
+0。当前 gate 为 Phase 8 accepted plan commit。
 
 ## Phase Map
 
