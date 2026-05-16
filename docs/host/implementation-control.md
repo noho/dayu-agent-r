@@ -372,7 +372,20 @@ idempotent confirmation，不能验证 Engine awaiting event 与 Host accepted w
 `poll_once()`，不包含后台调度循环、退避、并发 in-flight fencing 或 adapter 错误重试治理；`WAITING` Run + 非
 `SUSPENDED` Attempt 的防御性 internal invariant error、poller retry 外部化后的幂等 digest 策略、late result typed
 public error detail 均为后续 hardening / API contract 扩展项。当前 gate 为 P7-S5 `Integration, Docs, Gate Validation`
-implementation。
+implementation。P7-S5 `Integration, Docs, Gate Validation` 已完成 implementation、双路 aggregate review 与 controller
+adjudication，accepted slice commit 为 `c974acf`。P7-S5 / aggregate artifacts 为
+`docs/reviews/host-phase7-implementation-s5-integration-docs-gate-validation-20260516.md`、
+`docs/reviews/host-phase7-aggregate-review-s5-mimo-20260516.md`、
+`docs/reviews/host-phase7-aggregate-review-s5-ds-20260516.md` 与
+`docs/reviews/host-phase7-aggregate-review-s5-controller-adjudication-20260516.md`。验证为 `pytest tests/host -q`
+389 passed、`python -m pyright dayu/ tests/ utils/` 0 errors、`git diff --check` clean。Phase 7 aggregate exit
+accepted：typed wait outcome envelope、durable wait record、ToolRuntime awaiting accept、`resolve_wait` resume / terminal
+closeout、`WAITING` cancel、late diagnostic、poller 与 EngineEvent confirmation boundary 均已落地。Phase 7 remaining
+risks / owners：callback endpoint / auth / replay 归后续 callback adapter owner；poller 后台 loop / backoff /
+in-flight fencing / adapter retry 归后续 poller runtime hardening owner；`WAITING` recovery observation 归 Phase 11；
+Engine matching-ref 强校验归后续 Engine contract 演进；external job physical cancel / revoke 归后续 adapter hardening；
+durable duplicate ledger 与 durable tool trace projection 分别归后续 duplicate hardening / projection or tool trace owner。
+当前 gate 为 Phase 7 ready-to-open-draft-PR。
 
 ## Phase Map
 
