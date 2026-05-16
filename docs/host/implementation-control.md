@@ -439,7 +439,8 @@ controller plan review adjudication artifact 为
 `docs/reviews/host-phase8-plan-re-review-mimo-20260516.md` 与
 `docs/reviews/host-phase8-plan-re-review-ds-20260516.md`；controller plan re-review adjudication artifact 为
 `docs/reviews/host-phase8-plan-re-review-controller-adjudication-20260516.md`。两路 re-review 均 PASS，blocking count 为
-0。当前 gate 为 Phase 8 accepted plan commit。
+0。Phase 8 accepted plan commit 为 `b85fd8e`。当前 gate 为 P8-S1 `Projection Runner / Checkpoint / Typed Consumer
+Contracts` implementation。
 
 ## Phase Map
 
