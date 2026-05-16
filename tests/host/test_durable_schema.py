@@ -138,7 +138,7 @@ def _insert_event_log_probe(connection: sqlite3.Connection, event_id: str) -> No
     )
 
 
-def test_fresh_db_creates_foundation_and_phase7_tables(tmp_path: Path) -> None:
+def test_fresh_db_creates_foundation_and_phase8_tables(tmp_path: Path) -> None:
     """fresh DB bootstrap 创建 foundation、state 与 projection tables 并设置 PRAGMA。"""
 
     options = _options(tmp_path)
@@ -148,8 +148,8 @@ def test_fresh_db_creates_foundation_and_phase7_tables(tmp_path: Path) -> None:
             assert _table_names(connection) == frozenset(HOST_DURABLE_TABLES)
             assert set(PHASE3_STATE_TABLES).issubset(_table_names(connection))
             assert set(PROJECTION_TABLES).issubset(_table_names(connection))
-            assert _pragma_int(connection, "PRAGMA user_version") == 6
-            assert HOST_SCHEMA_VERSION == 6
+            assert _pragma_int(connection, "PRAGMA user_version") == 5
+            assert HOST_SCHEMA_VERSION == 5
             assert _pragma_int(connection, "PRAGMA foreign_keys") == 1
             assert _pragma_text(connection, "PRAGMA journal_mode").lower() == "wal"
             assert _pragma_int(connection, "PRAGMA busy_timeout") == 250

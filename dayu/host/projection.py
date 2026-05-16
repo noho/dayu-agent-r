@@ -304,6 +304,27 @@ class _ProjectionApplyFailed(Exception):
         super().__init__(str(original_exception))
 
 
+class _ProjectionEventViewFailed(Exception):
+    """EventLog row 无法构造成 typed projection view 的内部控制流异常。"""
+
+    event_row: EventLogRow
+    original_exception: HostDurableError
+
+    def __init__(
+        self, event_row: EventLogRow, original_exception: HostDurableError
+    ) -> None:
+        """初始化内部 projection view failure。
+
+        :param event_row: 失败的 EventLog durable row。
+        :param original_exception: 构造 typed projection view 时抛出的异常。
+        :returns: ``None``。
+        """
+
+        self.event_row = event_row
+        self.original_exception = original_exception
+        super().__init__(str(original_exception))
+
+
 class ProjectionRunner:
     """基于 committed EventLog 的 projection runner。
 
@@ -343,7 +364,9 @@ class ProjectionRunner:
         每个 EventLog row 都在独立 ``HostTransactionRunner.run_write()``
         transaction 内完成 consumer write 与 checkpoint advance。consumer
         失败时，该 row 的 consumer write 会 rollback，runner 随后只写
-        projection-local failure row，并停止当前批次。
+        projection-local failure row，并停止当前批次。EventLog payload 无法
+        构造成 typed projection view 时同样记录 projection-local failure，
+        不推进 checkpoint。
 
         :param consumer_id: 要运行的 consumer id。
         :param limit: 本次最多扫描的 EventLog row 数，必须为正数。
@@ -370,7 +393,21 @@ class ProjectionRunner:
                     )
                 )
             except _ProjectionApplyFailed as exc:
-                self._record_failure(consumer_id, exc.event, exc.original_exception)
+                self._record_failure(
+                    consumer_id,
+                    event_sequence=exc.event.event_sequence,
+                    event_id=exc.event.event_id,
+                    exception=exc.original_exception,
+                )
+                failures += 1
+                break
+            except _ProjectionEventViewFailed as exc:
+                self._record_failure(
+                    consumer_id,
+                    event_sequence=exc.event_row.event_sequence,
+                    event_id=exc.event_row.event_id,
+                    exception=exc.original_exception,
+                )
                 failures += 1
                 break
             finished_cursor = step.finished_cursor
@@ -450,6 +487,7 @@ class ProjectionRunner:
         :param consumer: concrete projection consumer。
         :returns: 单步处理结果。
         :raises _ProjectionApplyFailed: consumer apply 失败时抛出。
+        :raises _ProjectionEventViewFailed: EventLog payload 无法构造 view 时抛出。
         :raises HostDurableError: checkpoint 或 EventLog 读取失败时抛出。
         """
 
@@ -470,7 +508,11 @@ class ProjectionRunner:
                 matched=False,
                 apply_status=None,
             )
-        event = projection_event_view_from_row(rows[0])
+        row = rows[0]
+        try:
+            event = projection_event_view_from_row(row)
+        except HostDurableError as exc:
+            raise _ProjectionEventViewFailed(row, exc) from exc
         apply_status: ProjectionApplyStatus | None = None
         if consumer.event_filter.matches(event):
             try:
@@ -498,14 +540,17 @@ class ProjectionRunner:
     def _record_failure(
         self,
         consumer_id: ProjectionConsumerId,
-        event: ProjectionEventView,
+        *,
+        event_sequence: int,
+        event_id: str,
         exception: BaseException,
     ) -> None:
         """记录 projection-local failure row。
 
         :param consumer_id: 稳定 consumer id。
-        :param event: 失败 EventLog view。
-        :param exception: consumer 抛出的异常。
+        :param event_sequence: 失败 EventLog sequence。
+        :param event_id: 失败 EventLog id。
+        :param exception: consumer 或 view 构造抛出的异常。
         :returns: ``None``。
         :raises HostDurableError: failure row 写入失败时抛出。
         """
@@ -518,8 +563,8 @@ class ProjectionRunner:
             lambda transaction: write_projection_failure(
                 transaction,
                 consumer_id.value,
-                failed_event_sequence=event.event_sequence,
-                failed_event_id=event.event_id,
+                failed_event_sequence=event_sequence,
+                failed_event_id=event_id,
                 error_code=error_code,
                 error_message=error_message,
                 now=_utc_now_text(),

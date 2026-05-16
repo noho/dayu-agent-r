@@ -1,8 +1,9 @@
 """Host durable SQLite schema bootstrap 与版本校验。
 
 本模块是 Host durable schema convention 的唯一 DDL 真源。它创建 Phase 2
-foundation tables，以及 Phase 3 Session / Run / Attempt durable state tables；
-不承载 command、admission、projection、outbox、memory 或 purge 相关逻辑。
+foundation tables、Phase 3 Session / Run / Attempt durable state tables，
+以及 Phase 8 projection / read model tables；不承载 command、admission、
+outbox、memory 或 purge 相关逻辑。
 """
 
 from __future__ import annotations
@@ -21,7 +22,7 @@ from dayu.host.api import (
 )
 from dayu.host.durable.errors import HostSchemaMismatchError
 
-HOST_SCHEMA_VERSION = 6
+HOST_SCHEMA_VERSION = 5
 """当前 Host durable SQLite schema version。"""
 
 TABLE_EVENT_LOG = "event_log"

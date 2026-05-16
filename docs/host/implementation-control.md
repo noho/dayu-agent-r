@@ -465,7 +465,15 @@ implementation、双路 code review、accepted finding fix、双路 code re-revi
 `docs/reviews/host-phase8-code-re-review-s3-mimo-20260516.md`、
 `docs/reviews/host-phase8-code-re-review-s3-ds-20260516.md` 与
 `docs/reviews/host-phase8-code-re-review-s3-controller-adjudication-20260516.md`。两路 re-review 均 PASS，blocking count 为
-0。P8-S3 accepted slice commit 为 `d31803d`。当前 gate 为 Phase 8 aggregate deepreview。
+0。P8-S3 accepted slice commit 为 `d31803d`。Phase 8 aggregate review 已完成，aggregate review artifacts 为
+`docs/reviews/host-phase8-aggregate-review-mimo-20260516.md`、
+`docs/reviews/host-phase8-aggregate-review-ds-20260516.md` 与
+`docs/reviews/host-phase8-aggregate-review-controller-adjudication-20260516.md`。Accepted aggregate findings 已由
+`docs/reviews/host-phase8-aggregate-fix-20260516.md` 修复。Aggregate re-review artifacts 为
+`docs/reviews/host-phase8-aggregate-re-review-mimo-20260516.md`、
+`docs/reviews/host-phase8-aggregate-re-review-ds-20260516.md` 与
+`docs/reviews/host-phase8-aggregate-re-review-controller-adjudication-20260516.md`。两路 re-review 均 PASS，blocking count 为
+0。当前 gate 为 Phase 8 accepted deepreview commit。
 
 ## Phase Map
 

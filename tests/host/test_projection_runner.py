@@ -26,6 +26,7 @@ from dayu.host.durable.projection import (
     read_projection_checkpoint,
     read_projection_failure,
 )
+from dayu.host.durable.schema import TABLE_EVENT_LOG
 from dayu.host.durable.transaction import HostTransaction, HostTransactionRunner
 from dayu.host.projection import (
     ProjectionApplyResult,
@@ -170,6 +171,32 @@ def _append_event(
                 payload_digest=None,
             ),
         ).row
+    )
+
+
+def _replace_event_payload_json(
+    transaction_runner: HostTransactionRunner,
+    *,
+    event_id: str,
+    payload_json: str,
+) -> None:
+    """直接替换测试 EventLog row 的 payload_json。
+
+    :param transaction_runner: Host durable transaction runner。
+    :param event_id: EventLog id。
+    :param payload_json: 写入 EventLog row 的 payload_json 文本。
+    :returns: ``None``。
+    """
+
+    transaction_runner.run_write(
+        lambda transaction: transaction.execute(
+            f"""
+            UPDATE {TABLE_EVENT_LOG}
+            SET payload_json = ?
+            WHERE event_id = ?
+            """,
+            (payload_json, event_id),
+        )
     )
 
 
@@ -437,6 +464,57 @@ def test_consumer_write_failure_rolls_back_write_and_checkpoint(
         assert failure.failed_event_sequence == event.event_sequence
         assert failure.failed_event_id == event.event_id
         assert seen_rows == ()
+
+
+@pytest.mark.parametrize(
+    ("payload_json", "expected_error_message"),
+    (
+        ("[]", "EventLog payload_json must be a JSON mapping"),
+        ("{", "EventLog payload_json is invalid"),
+    ),
+)
+def test_payload_parsing_failure_records_failure_without_advancing_checkpoint(
+    tmp_path: Path,
+    payload_json: str,
+    expected_error_message: str,
+) -> None:
+    """payload 无法构造 typed view 时记录 failure，且不推进 checkpoint。"""
+
+    options = _options(tmp_path)
+    with open_host_durable_store(options) as store:
+        event = _append_event(
+            store.transaction_runner,
+            event_id="event-1",
+            event_class=EventClass.CANONICAL_FACT,
+            event_type="TYPE_A",
+            marker="one",
+        )
+        _replace_event_payload_json(
+            store.transaction_runner,
+            event_id=event.event_id,
+            payload_json=payload_json,
+        )
+        consumer = _FakeConsumer("consumer", _canonical_type_filter("TYPE_A"))
+        result = ProjectionRunner(store.transaction_runner, (consumer,)).run_once(
+            ProjectionConsumerId("consumer"), limit=1
+        )
+        checkpoint = store.transaction_runner.run_write(
+            lambda transaction: read_projection_checkpoint(transaction, "consumer")
+        )
+        failure = store.transaction_runner.run_write(
+            lambda transaction: read_projection_failure(transaction, "consumer")
+        )
+        assert result.failures == 1
+        assert result.finished_cursor == 0
+        assert result.events_scanned == 0
+        assert consumer.applied_events == []
+        assert checkpoint is not None
+        assert checkpoint.checkpoint_event_sequence == 0
+        assert failure is not None
+        assert failure.failed_event_sequence == event.event_sequence
+        assert failure.failed_event_id == event.event_id
+        assert failure.last_error_code == "HostDurableError"
+        assert failure.last_error_message == expected_error_message
 
 
 def test_duplicate_apply_result_still_advances_checkpoint(
