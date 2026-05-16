@@ -220,288 +220,9 @@ Phase Map 中每个 phase 必须使用统一条目格式。模板如下：
 
 ## 当前状态
 
-Phase 5 `RunInputBuilder 与本地执行 Dispatch` 已完成。PR 54
-`Host Phase 5 RunInputBuilder and local dispatch` 已完成 Phase 5 aggregate review、PR review fix、追加并行 review、全仓 review
-与 P1-P5 corrected design conformance review；最近一次 corrected gate 的 AgentMiMo、AgentDS、AgentCodex 三路 verdict 均为
-PASS，blocking design deviation 为 0。Controller adjudication artifact 为
-`docs/reviews/p1-p5-design-conformance-review-controller-adjudication-20260515.md`。
+P8 完成。
 
-当前不处于 implementation / fix gate；没有 accepted blocking finding 待修。用户手工 merge PR 54 后，下一步按 `$phaseflow`
-推进 Phase 6 `ToolRuntime / Truncation / fetch_more / Duplicate Governance`。Phase 6 design discussion 输入 artifact 为
-`docs/reviews/host-phase6-design-discussion-codex-20260515.md`，controller 裁决 artifact 为
-`docs/reviews/host-phase6-design-discussion-controller-adjudication-20260515.md`；裁决后的 design write-back 已同步到
-`docs/host/design.md` 与本文档。Phase 6 handoff implementation-ready plan 为
-`docs/host/phase6-toolruntime-truncation-fetch-more-plan.md`；plan review artifacts 为
-`docs/reviews/host-phase6-plan-review-mimo-20260515.md` 与
-`docs/reviews/host-phase6-plan-review-ds-20260515.md`；controller plan review adjudication artifact 为
-`docs/reviews/host-phase6-plan-review-controller-adjudication-20260515.md`。Plan fix 后，plan re-review artifacts 为
-`docs/reviews/host-phase6-plan-re-review-mimo-20260515.md` 与
-`docs/reviews/host-phase6-plan-re-review-ds-20260515.md`；controller plan re-review adjudication artifact 为
-`docs/reviews/host-phase6-plan-re-review-controller-adjudication-20260515.md`。两路 re-review 均 PASS，blocking count 为 0。
-Phase 6 accepted plan commits 为 `04517f5` / `a5863ce`。P6-S1
-`Effective ToolBundle And RunInputBuilder Wiring` 已完成 implementation、双路 code review 与 controller adjudication，
-accepted checkpoint commit 为 `b49ba56`。P6-S1 artifacts 为
-`docs/reviews/host-phase6-implementation-s1-effective-toolbundle-20260515.md`、
-`docs/reviews/host-phase6-code-review-s1-mimo-20260515.md`、
-`docs/reviews/host-phase6-code-review-s1-ds-20260515.md` 与
-`docs/reviews/host-phase6-code-review-s1-controller-adjudication-20260515.md`。P6-S2
-`Host Accept Barrier And Tool Canonical Facts` 已完成 implementation、双路 code review 与 controller adjudication，
-accepted checkpoint commit 为 `54184e6`。P6-S2 artifacts 为
-`docs/reviews/host-phase6-implementation-s2-accept-barrier-20260515.md`、
-`docs/reviews/host-phase6-code-review-s2-mimo-20260515.md`、
-`docs/reviews/host-phase6-code-review-s2-ds-20260515.md` 与
-`docs/reviews/host-phase6-code-review-s2-controller-adjudication-20260515.md`。P6-S3
-`ToolExecutor Wrapper, Ack Retry, Side-effect Policy, Awaiting Guard` 已完成 implementation、双路 code review 与 controller
-adjudication，accepted checkpoint commit 为 `de7a4ae`。P6-S3 artifacts 为
-`docs/reviews/host-phase6-implementation-s3-executor-wrapper-20260515.md`、
-`docs/reviews/host-phase6-code-review-s3-mimo-20260515.md`、
-`docs/reviews/host-phase6-code-review-s3-ds-20260515.md` 与
-`docs/reviews/host-phase6-code-review-s3-controller-adjudication-20260515.md`。P6-S4
-`TruncationManager And fetch_more Normal Tool Path` 已完成 implementation、双路 code review 与 controller adjudication，
-accepted checkpoint commit 为 `28adf70`。P6-S4 artifacts 为
-`docs/reviews/host-phase6-implementation-s4-truncation-fetch-more-20260515.md`、
-`docs/reviews/host-phase6-code-review-s4-mimo-20260515.md`、
-`docs/reviews/host-phase6-code-review-s4-ds-20260515.md` 与
-`docs/reviews/host-phase6-code-review-s4-controller-adjudication-20260515.md`；验证为
-`pytest tests/host/test_toolruntime_truncation_fetch_more.py tests/host/test_toolruntime_effective_bundle.py tests/host/test_phase6_toolruntime_integration.py -q`
-15 passed、`python -m pyright dayu/host tests/host` 0 errors、`git diff --check` clean。P6-S5
-`Duplicate Governance And Diagnostic Emitter` 已完成 implementation、双路 code review、accepted finding fix、DS re-review 与
-controller adjudication，accepted checkpoint commit 为 `31ab68d`。P6-S5 artifacts 为
-`docs/reviews/host-phase6-implementation-s5-duplicate-governance-20260515.md`、
-`docs/reviews/host-phase6-code-review-s5-mimo-20260515.md`、
-`docs/reviews/host-phase6-code-review-s5-ds-20260515.md`、
-`docs/reviews/host-phase6-fix-s5-duplicate-governance-20260515.md`、
-`docs/reviews/host-phase6-code-re-review-s5-ds-20260515.md` 与
-`docs/reviews/host-phase6-code-review-s5-controller-adjudication-20260515.md`；验证为
-`pytest tests/host/test_toolruntime_duplicate_governance.py tests/host/test_toolruntime_diagnostics.py tests/host/test_toolruntime_accept_barrier.py -q`
-24 passed、P6 ToolRuntime 相关 46 tests passed、`python -m pyright dayu/host tests/host` 0 errors、`git diff --check` clean。P6-S6
-`Integration, Scheduler Wiring, And Gate Validation` 已完成 implementation、双路 code review 与 controller adjudication，
-accepted checkpoint commit 为 `53ff69f`。P6-S6 artifacts 为
-`docs/reviews/host-phase6-implementation-s6-integration-gate-20260515.md`、
-`docs/reviews/host-phase6-code-review-s6-mimo-20260515.md`、
-`docs/reviews/host-phase6-code-review-s6-ds-20260515.md` 与
-`docs/reviews/host-phase6-code-review-s6-controller-adjudication-20260515.md`；验证为
-`pytest tests/host -q` 348 passed、`python -m pyright dayu/ tests/ utils/` 0 errors、`git diff --check` clean。Phase 6
-aggregate review 已完成，初次 aggregate review artifacts 为
-`docs/reviews/host-phase6-aggregate-review-mimo-20260515.md`、
-`docs/reviews/host-phase6-aggregate-review-ds-20260515.md` 与
-`docs/reviews/host-phase6-aggregate-review-controller-adjudication-20260515.md`；两路 review 均接受 P6-AGG-F1：
-Run-local duplicate governance index 仍跟随 ToolRuntime 实例生命周期，不满足 P6 exit standard。P6-AGG-F1 已通过
-`docs/reviews/host-phase6-aggregate-fix-run-local-duplicate-governance-20260515.md` 修复，并由
-`docs/reviews/host-phase6-aggregate-re-review-mimo-20260515.md`、
-`docs/reviews/host-phase6-aggregate-re-review-ds-20260515.md` 与
-`docs/reviews/host-phase6-aggregate-re-review-controller-adjudication-20260515.md` 确认 PASS。Phase 6 accepted aggregate
-review commit 为 `8f73821`；验证为 `pytest tests/host -q` 349 passed、
-`python -m pyright dayu/ tests/ utils/` 0 errors、`git diff --check` clean。Phase 6 PR 已创建为
-https://github.com/noho/dayu-agent-r/pull/55；当前 gate 为 PR 55 deepreview。需要继续追踪的
-non-blocking hardening、deferred capability 与后续 phase owner 已写入 `Open Questions 与风险追踪` 的
-`PR 54 / P1-P5 corrected review 残余风险追踪`、P6-S1 controller adjudication residual risks、P6-S2 controller
-adjudication residual risks、P6-S3 controller adjudication residual risks、P6-S4 controller adjudication residual risks，以及
-P6-S5 / P6-S6 controller adjudication residual risks。P6-S3 遗留的真实 `HostDispatchScheduler` no-tool composition wiring 已由 P6-S6 关闭；
-PR 55 创建后按用户指令安排 AgentMiMo 与 AgentDS 执行 `/deepreview PR 55`。PR review artifacts 为
-`docs/reviews/pr-55-deepreview-mimo-20260515.md` 与
-`docs/reviews/pr-55-deepreview-ds-20260515.md`；controller adjudication 为
-`docs/reviews/pr-55-deepreview-controller-adjudication-20260515.md`。AgentMiMo PASS；AgentDS PASS 但提出 PR55-DS-1
-中严重度 finding，controller 裁决为 accepted 并由
-`docs/reviews/pr-55-fix-accept-retry-exhausted-20260515.md` 修复，fix commit 为 `c79d6b8`。PR 55 re-review artifacts 为
-`docs/reviews/pr-55-re-review-mimo-20260515.md` 与
-`docs/reviews/pr-55-re-review-ds-20260515.md`，两路均 PASS；验证为 `pytest tests/host -q` 350 passed、
-`python -m pyright dayu/ tests/ utils/` 0 errors、`git diff --check` clean。Phase 6 状态为 completed；PR 55 已由用户手工
-merge。Phase 7 `Tool Awaiting / resolve_wait / Wait Adapter` design discussion、design write-back、双路 design re-review、
-accepted design findings fix 与双路 design fix re-review 已完成。Artifacts 为
-`docs/reviews/host-phase7-design-discussion-codex-20260516.md`、
-`docs/reviews/host-phase7-design-re-review-mimo-20260516.md`、
-`docs/reviews/host-phase7-design-re-review-ds-20260516.md`、
-`docs/reviews/host-phase7-design-re-review-controller-adjudication-20260516.md`、
-`docs/reviews/host-phase7-design-fix-re-review-mimo-20260516.md`、
-`docs/reviews/host-phase7-design-fix-re-review-ds-20260516.md` 与
-`docs/reviews/host-phase7-design-fix-re-review-controller-adjudication-20260516.md`。当前 gate 为 Phase 7
-handoff implementation-ready plan。Phase 7 handoff implementation-ready plan 已写入
-`docs/host/phase7-tool-awaiting-resolve-wait-plan.md`。Plan review artifacts 为
-`docs/reviews/host-phase7-plan-review-mimo-20260516.md` 与
-`docs/reviews/host-phase7-plan-review-ds-20260516.md`；controller plan review adjudication artifact 为
-`docs/reviews/host-phase7-plan-review-controller-adjudication-20260516.md`。Plan fix artifact 为
-`docs/reviews/host-phase7-plan-fix-codex-20260516.md`。Plan re-review artifacts 为
-`docs/reviews/host-phase7-plan-re-review-mimo-20260516.md` 与
-`docs/reviews/host-phase7-plan-re-review-ds-20260516.md`；controller plan re-review adjudication artifact 为
-`docs/reviews/host-phase7-plan-re-review-controller-adjudication-20260516.md`。两路 re-review 均 PASS，blocking count 为 0。
-Phase 7 accepted plan commit 为 `d017fd7`。
-P7-S1 `Public Contracts And Durable Wait Record` 已完成 implementation、双路 code review、accepted finding fix、双路 code
-re-review 与 controller adjudication，accepted checkpoint commit 为 `aaa107a`。P7-S1 artifacts 为
-`docs/reviews/host-phase7-s1-controller-decision-test-ownership-20260516.md`、
-`docs/reviews/host-phase7-implementation-s1-public-contracts-wait-record-20260516.md`、
-`docs/reviews/host-phase7-code-review-s1-mimo-20260516.md`、
-`docs/reviews/host-phase7-code-review-s1-ds-20260516.md`、
-`docs/reviews/host-phase7-code-review-s1-controller-adjudication-20260516.md`、
-`docs/reviews/host-phase7-fix-s1-public-contracts-wait-record-20260516.md`、
-`docs/reviews/host-phase7-code-re-review-s1-mimo-20260516.md`、
-`docs/reviews/host-phase7-code-re-review-s1-ds-20260516.md` 与
-`docs/reviews/host-phase7-code-re-review-s1-controller-adjudication-20260516.md`。验证为
-`pytest tests/host/test_public_contracts.py tests/host/test_import_boundary.py tests/host/test_package_exports.py tests/host/test_durable_schema.py tests/host/test_state_schema.py tests/host/test_wait_record_state.py tests/host/test_public_run_api.py -q`
-84 passed、`python -m pyright dayu/host tests/host` 0 errors、`git diff --check` clean。
-P7-S2 `ToolRuntime Awaiting Accept Path` 已完成 implementation、双路 code review、accepted finding fix、双路 code
-re-review 与 controller adjudication，accepted checkpoint commit 为 `42f972a`。P7-S2 artifacts 为
-`docs/reviews/host-phase7-implementation-s2-tool-awaiting-accept-20260516.md`、
-`docs/reviews/host-phase7-code-review-s2-mimo-20260516.md`、
-`docs/reviews/host-phase7-code-review-s2-ds-20260516.md`、
-`docs/reviews/host-phase7-fix-s2-tool-awaiting-accept-20260516.md`、
-`docs/reviews/host-phase7-code-re-review-s2-mimo-20260516.md`、
-`docs/reviews/host-phase7-code-re-review-s2-ds-20260516.md` 与
-`docs/reviews/host-phase7-code-re-review-s2-controller-adjudication-20260516.md`。验证为
-`pytest tests/host -q` 374 passed、`python -m pyright dayu/host tests/host` 0 errors、`git diff --check`
-clean。P7-S3 `resolve_wait Command And Resume Attempt` 已完成 implementation、MiMo code review、controller accepted finding fix、MiMo
-re-review、DS current-version code review 与 controller adjudication，accepted slice commit 为 `4712101`。P7-S3 artifacts 为
-`docs/reviews/host-phase7-implementation-s3-resolve-wait-resume-20260516.md`、
-`docs/reviews/host-phase7-code-review-s3-mimo-20260516.md`、
-`docs/reviews/host-phase7-fix-s3-resolve-wait-resume-20260516.md`、
-`docs/reviews/host-phase7-code-re-review-s3-mimo-20260516.md`、
-`docs/reviews/host-phase7-code-review-s3-ds-20260516.md` 与
-`docs/reviews/host-phase7-code-re-review-s3-controller-adjudication-20260516.md`。验证为
-`pytest tests/host/test_resolve_wait_command.py tests/host/test_run_attempt_transitions.py tests/host/test_run_input_builder.py tests/host/test_dispatch_scheduler.py tests/host/test_phase7_waiting_integration.py -q`
-64 passed、`pytest tests/host -q` 381 passed、`python -m pyright dayu/host tests/host` 0 errors、`git diff --check`
-clean。P7-S4 `WAITING Cancel, Late Result Diagnostic, Poll / Manual Adapter, EngineEvent Confirmation` 已完成
-implementation、双路 code review 与 controller adjudication，accepted slice commit 为 `3ccddbf`。P7-S4 artifacts 为
-`docs/reviews/host-phase7-implementation-s4-wait-cancel-late-poll-20260516.md`、
-`docs/reviews/host-phase7-code-review-s4-mimo-20260516.md`、
-`docs/reviews/host-phase7-code-review-s4-ds-20260516.md` 与
-`docs/reviews/host-phase7-code-review-s4-controller-adjudication-20260516.md`。验证为
-`pytest tests/host/test_wait_cancel_late_result.py tests/host/test_wait_adapter_polling.py tests/host/test_engine_ingest_mapping.py tests/host/test_public_cancel_session_runs.py tests/host/test_public_run_api.py -q`
-42 passed、`pytest tests/host -q` 388 passed、`python -m pyright dayu/host tests/host` 0 errors、`git diff --check`
-clean。P7-S4 residual risks：Engine contract 当前不携带 Host accepted wait refs，P7-S4 只能做 diagnostic /
-idempotent confirmation，不能验证 Engine awaiting event 与 Host accepted wait refs 完全匹配；Poller 仍是最小单轮
-`poll_once()`，不包含后台调度循环、退避、并发 in-flight fencing 或 adapter 错误重试治理；`WAITING` Run + 非
-`SUSPENDED` Attempt 的防御性 internal invariant error、poller retry 外部化后的幂等 digest 策略、late result typed
-public error detail 均为后续 hardening / API contract 扩展项。当前 gate 为 P7-S5 `Integration, Docs, Gate Validation`
-implementation。P7-S5 `Integration, Docs, Gate Validation` 已完成 implementation、双路 aggregate review 与 controller
-adjudication，accepted slice commit 为 `c974acf`。P7-S5 / aggregate artifacts 为
-`docs/reviews/host-phase7-implementation-s5-integration-docs-gate-validation-20260516.md`、
-`docs/reviews/host-phase7-aggregate-review-s5-mimo-20260516.md`、
-`docs/reviews/host-phase7-aggregate-review-s5-ds-20260516.md` 与
-`docs/reviews/host-phase7-aggregate-review-s5-controller-adjudication-20260516.md`。验证为 `pytest tests/host -q`
-389 passed、`python -m pyright dayu/ tests/ utils/` 0 errors、`git diff --check` clean。Phase 7 aggregate exit
-accepted：typed wait outcome envelope、durable wait record、ToolRuntime awaiting accept、`resolve_wait` resume / terminal
-closeout、`WAITING` cancel、late diagnostic、poller 与 EngineEvent confirmation boundary 均已落地。Phase 7 remaining
-risks / owners：callback endpoint / auth / replay 归后续 callback adapter owner；poller 后台 loop / backoff /
-in-flight fencing / adapter retry 归后续 poller runtime hardening owner；`WAITING` recovery observation 归 Phase 11；
-Engine matching-ref 强校验归后续 Engine contract 演进；external job physical cancel / revoke 归后续 adapter hardening；
-durable duplicate ledger 与 durable tool trace projection 分别归后续 duplicate hardening / projection or tool trace owner。
-当前 gate 为 Phase 7 ready-to-open-draft-PR。Phase 7 draft PR 已创建：PR 56
-`https://github.com/noho/dayu-agent-r/pull/56`，title 为 `Host Phase 7 Tool Awaiting / resolve_wait / Wait Adapter`，
-head branch 为 `feat/host-phase7-tool-awaiting-resolve-wait`，PR 当前保持 draft。PR 56 deepreview artifacts 为
-`docs/reviews/pr-56-deepreview-mimo-20260516.md` 与 `docs/reviews/pr-56-deepreview-ds-20260516.md`。MiMo review
-PASS，无 blocking finding；DS review PASS，提出 6 个 Low 与 2 个 Info finding。Controller 接受 F1 digest 校验一致性与
-F2 `WaitPollLost` 测试缺口为当前 PR fix，fix artifact 为
-`docs/reviews/pr-56-fix-digest-and-poll-lost-20260516.md`，fix commit 为 `dd32948`。PR 56 fix re-review artifacts
-为 `docs/reviews/pr-56-fix-re-review-mimo-20260516.md`、
-`docs/reviews/pr-56-fix-re-review-ds-20260516.md` 与
-`docs/reviews/pr-56-fix-re-review-controller-adjudication-20260516.md`；两份 re-review 均确认 F1 / F2 fixed、
-无回归。Fix validation：`pytest tests/host/test_wait_awaiting_accept.py tests/host/test_wait_adapter_polling.py tests/host/test_resolve_wait_command.py -q`
-15 passed、`pytest tests/host -q` 391 passed、`python -m pyright dayu/ tests/ utils/` 0 errors、`git diff --check`
-clean。F3 cross-test helper import coupling deferred 到后续 tests cleanup；F4-F8 低/信息性 hardening 建议均 deferred。
-PR 56 deepreview / fix / re-review gate 已完成并通过。
-
-P1-P7 design conformance follow-up fix gate：Controller adjudication artifact
-`docs/reviews/p1-p7-design-conformance-controller-adjudication-20260516.md` 接受 blocking finding
-C-P1P7-001：P7 awaiting production wiring 未接入 `HostDispatchScheduler`。当前 fix gate 在分支
-`fix/host-p1-p7-awaiting-production-wiring` 修复该 production wiring：`HostToolingOptions` 承载 construction-scope
-`wait_adapter_registry`，`HostDispatchScheduler` 在 tool-enabled production path 构造 `ToolRuntimeBuildRequest` 时注入
-`DefaultHostToolAwaitingAcceptPort` 与该 registry；adapter object 仍不进入 per-run request 或 durable wait row。Fix artifact 为
-`docs/reviews/p1-p7-design-conformance-fix-awaiting-production-wiring-20260516.md`。验证结果以该 artifact 为准；本 fix
-不实现 callback endpoint、poller 后台循环、recovery scan、remote worker 或 external job physical cancel。
-Controller fix adjudication artifact 为
-`docs/reviews/p1-p7-design-conformance-fix-controller-adjudication-20260516.md`，MiMo / DS fix re-review 均 PASS；
-本地 accepted fix checkpoint commit 为 `d03e064`。
-随后用户明确决定 `fetch_more` cursor 只存在内存，其它 review findings 改按当前 `docs/host/design.md` 的设计目标与最佳实践裁决。
-Controller decision artifact 为 `docs/reviews/p1-p7-design-goals-controller-decision-20260516.md`，Codex fix artifact 为
-`docs/reviews/p1-p7-design-goals-fix-codex-20260516.md`，MiMo / DS fix review artifact 为
-`docs/reviews/p1-p7-design-goals-fix-review-mimo-20260516.md` 与
-`docs/reviews/p1-p7-design-goals-fix-review-ds-20260516.md`，final adjudication artifact 为
-`docs/reviews/p1-p7-design-goals-fix-controller-adjudication-20260516.md`。本地 accepted design-goals fix checkpoint commit 为
-`86bcc5a`。随后用户要求按 `$gateflow` 对当前仓库执行双路全仓 deepreview，AgentMiMo 与 AgentDS review artifacts 为
-`docs/reviews/repo-review-20260516-1557.md` 与 `docs/reviews/repo-review-20260516-1551.md`；controller adjudication artifact 为
-`docs/reviews/gateflow-deepreview-controller-adjudication-20260516-1619.md`。Controller 接受 DS-1、DS-2、DS-4、DS-5、
-DS-6、DS-18 与 MiMo-2，AgentCodex fix artifact 为
-`docs/reviews/gateflow-deepreview-fix-agentcodex-20260516.md`，MiMo / DS fix re-review artifacts 为
-`docs/reviews/gateflow-deepreview-fix-re-review-mimo-20260516.md` 与
-`docs/reviews/gateflow-deepreview-fix-re-review-ds-20260516.md`；两路 re-review 均 PASS。验证为
-`pytest tests/contracts/test_tool_schema.py tests/contracts/test_tool_declaration.py tests/host/test_durable_transaction.py tests/host/test_engine_ingest_mapping.py tests/host/test_toolruntime_executor.py tests/host/test_toolruntime_truncation_fetch_more.py tests/host/test_phase6_toolruntime_integration.py`
-69 passed、`python -m pyright` 0 errors、`git diff --check` clean。本地 accepted deepreview checkpoint commit 为
-`52bba89`。Phase 7 状态为 completed。Phase 8 `Projection Core / Host Event Stream / Minimal Read Model` design
-discussion 已完成，输入 artifact 为 `docs/reviews/host-phase8-design-discussion-codex-20260516.md`，controller
-adjudication artifact 为 `docs/reviews/host-phase8-design-discussion-controller-adjudication-20260516.md`。Controller
-裁决为 PASS：Phase 8 动机成立，`docs/host/design.md` §14 / §16 与本文档 Phase 8 条目已足够进入 handoff
-implementation-ready plan，无 blocking open question，无必须先写回 design / control 的 design gap。Phase 8 handoff
-implementation-ready plan 已写入 `docs/host/phase8-projection-core-event-stream-plan.md`。Plan review artifacts 为
-`docs/reviews/host-phase8-plan-review-mimo-20260516.md` 与 `docs/reviews/host-phase8-plan-review-ds-20260516.md`；
-controller plan review adjudication artifact 为
-`docs/reviews/host-phase8-plan-review-controller-adjudication-20260516.md`。Accepted plan findings 已由
-`docs/reviews/host-phase8-plan-fix-codex-20260516.md` 修复。Plan re-review artifacts 为
-`docs/reviews/host-phase8-plan-re-review-mimo-20260516.md` 与
-`docs/reviews/host-phase8-plan-re-review-ds-20260516.md`；controller plan re-review adjudication artifact 为
-`docs/reviews/host-phase8-plan-re-review-controller-adjudication-20260516.md`。两路 re-review 均 PASS，blocking count 为
-0。Phase 8 accepted plan commit 为 `b85fd8e`。P8-S1 `Projection Runner / Checkpoint / Typed Consumer Contracts` 已完成
-implementation、双路 code review、accepted finding fix、双路 code re-review 与 controller adjudication。P8-S1 artifacts 为
-`docs/reviews/host-phase8-implementation-s1-projection-runner-20260516.md`、
-`docs/reviews/host-phase8-code-review-s1-mimo-20260516.md`、
-`docs/reviews/host-phase8-code-review-s1-ds-20260516.md`、
-`docs/reviews/host-phase8-code-review-s1-controller-adjudication-20260516.md`、
-`docs/reviews/host-phase8-fix-s1-projection-runner-20260516.md`、
-`docs/reviews/host-phase8-code-re-review-s1-mimo-20260516.md`、
-`docs/reviews/host-phase8-code-re-review-s1-ds-20260516.md` 与
-`docs/reviews/host-phase8-code-re-review-s1-controller-adjudication-20260516.md`。两路 re-review 均 PASS，blocking count 为
-0。P8-S1 accepted slice commit 为 `80c12a2`。P8-S2 `Host Event Stream Cursor Truth` 已完成 implementation、双路 code
-review 与 controller adjudication。P8-S2 artifacts 为
-`docs/reviews/host-phase8-implementation-s2-event-stream-cursor-20260516.md`、
-`docs/reviews/host-phase8-code-review-s2-mimo-20260516.md`、
-`docs/reviews/host-phase8-code-review-s2-ds-20260516.md` 与
-`docs/reviews/host-phase8-code-review-s2-controller-adjudication-20260516.md`。两路 review 均 PASS，blocking count 为 0。
-P8-S2 accepted slice commit 为 `c891792`。P8-S3 `Minimal RunResult / Session Timeline Read Model / Repair` 已完成
-implementation、双路 code review、accepted finding fix、双路 code re-review 与 controller adjudication。P8-S3 artifacts 为
-`docs/reviews/host-phase8-implementation-s3-read-model-repair-20260516.md`、
-`docs/reviews/host-phase8-code-review-s3-mimo-20260516.md`、
-`docs/reviews/host-phase8-code-review-s3-ds-20260516.md`、
-`docs/reviews/host-phase8-code-review-s3-controller-adjudication-20260516.md`、
-`docs/reviews/host-phase8-fix-s3-read-model-repair-20260516.md`、
-`docs/reviews/host-phase8-code-re-review-s3-mimo-20260516.md`、
-`docs/reviews/host-phase8-code-re-review-s3-ds-20260516.md` 与
-`docs/reviews/host-phase8-code-re-review-s3-controller-adjudication-20260516.md`。两路 re-review 均 PASS，blocking count 为
-0。P8-S3 accepted slice commit 为 `d31803d`。Phase 8 aggregate review 已完成，aggregate review artifacts 为
-`docs/reviews/host-phase8-aggregate-review-mimo-20260516.md`、
-`docs/reviews/host-phase8-aggregate-review-ds-20260516.md` 与
-`docs/reviews/host-phase8-aggregate-review-controller-adjudication-20260516.md`。Accepted aggregate findings 已由
-`docs/reviews/host-phase8-aggregate-fix-20260516.md` 修复。Aggregate re-review artifacts 为
-`docs/reviews/host-phase8-aggregate-re-review-mimo-20260516.md`、
-`docs/reviews/host-phase8-aggregate-re-review-ds-20260516.md` 与
-`docs/reviews/host-phase8-aggregate-re-review-controller-adjudication-20260516.md`。两路 re-review 均 PASS，blocking count 为
-0。Phase 8 accepted deepreview commit 为 `5b2b92e`。Ready validation 期间发现 dispatch ToolRuntime wiring
-测试夹具未保持 worker stream 打开，已通过
-`docs/reviews/host-phase8-readiness-validation-fix-20260516.md` 修复，修复提交为 `57975fe`。最终验证为
-`pytest tests/host -q` 435 passed、`python -m pyright dayu/ tests/ utils/` 0 errors、`git diff --check`
-clean。追加全仓 deepreview 闭环 artifacts 为 `docs/reviews/repo-review-20260516-2105.md`、
-`docs/reviews/repo-review-20260516-2059.md`、
-`docs/reviews/repo-review-controller-adjudication-20260516-2109.md`、
-`docs/reviews/repo-review-fix-codex-20260516.md`、
-`docs/reviews/repo-review-fix-re-review-mimo-20260516.md`、
-`docs/reviews/repo-review-fix-re-review-ds-20260516.md` 与
-`docs/reviews/repo-review-fix-re-review-controller-adjudication-20260516-2130.md`。Controller accepted
-DR-ALL-A1 至 DR-ALL-A5 已修复，MiMo / DS re-review 均 PASS；accepted full-repo deepreview loop commit 为
-`3d60fdd`。Phase 8 draft PR 已创建：PR 58
-`https://github.com/noho/dayu-agent-r/pull/58`。PR 58 review artifacts 为
-`docs/reviews/pr-58-review-mimo-20260516.md`、`docs/reviews/pr-58-review-ds-20260516.md` 与
-`docs/reviews/pr-58-review-controller-adjudication-20260516.md`。Accepted PR finding PR58-F1 已由
-`docs/reviews/pr-58-fix-codex-20260516.md` 修复，并由
-`docs/reviews/pr-58-fix-re-review-ds-20260516.md` 与
-`docs/reviews/pr-58-fix-re-review-controller-adjudication-20260516.md` 确认 PASS；accepted PR review commit 为
-`a6cc2aa`，已 push 到 PR 58。当前 gate 为 draft-PR-pass。Phase 8 状态为 completed。Phase 8 exit accepted：committed EventLog
-consumer framework、projection checkpoint / failure store、typed consumer contract、Host EventLog-backed event stream cursor
-truth regression coverage、minimal RunResult / Session timeline read model、internal repair helper 与 rebuild tests 均已落地。
-Phase 8 remaining risks / owners：automatic after-commit projection catch-up 归 Phase 9 owner；heavy sink /
-batch-transaction runner 归 Phase 13 / Phase 15 owner；per-session repair filter 归 Phase 15 owner；RunResult summary refs
-接入 public `RunSnapshot` 归 Phase 9 / Phase 15 或后续 public read enhancement owner；Audit / Tool Trace / Outbox
-concrete sinks 归 Phase 13 owner；Engine / OpenAI runner / parser findings 归 Engine hardening gate owner；schema CHECK
-hardening 归后续 schema hardening owner；scheduler close active Run reconciliation 归 Phase 11 recovery owner；awaiting
-accepted ack 当前状态重校验归 Phase 7 / Phase 11 wait lifecycle hardening owner；poller LIMIT / CANCELLED abandon 退避归
-Phase 15 / production polling scale owner。
+约束：本节只保留当前 gate 结论；phase 过程流水必须归档到 `历史记录`，仍需追踪的风险或后续 owner 必须写入 `Open Questions 与风险追踪` 的 `追踪区`。
 
 ## Phase Map
 
@@ -1532,10 +1253,6 @@ Phase 按依赖关系推进：先实现被其它阶段依赖的公共契约、ru
 
 追踪项：
 
-- P0-S2 已同步 `dayu/engine/README.md`、`docs/engine/design.md`、`dayu/README.md` 中的相关术语与边界。
-- `docs/host/design.md` 已明确：proactive threshold compaction 属于 Host Context Governance；Engine provider overflow event
-  只是 reactive fallback。Phase 10. Context Governance / Compaction 只能按该语义实施。
-- Phase 5 owns EngineEvent ingest validation：必须接受 `budget_state=None` 的 Engine event shape，不把 `None` 当作协议错误，不要求 Engine 提供 Host budget ref。
 - Phase 10 owns Context Governance semantic interpretation：当 Engine overflow budget unknown 时，必须使用 Host estimator / policy 生成 before / after budget refs，并决策 compact / recovery。
 - Phase 10. Context Governance / Compaction 的测试设计必须覆盖：Engine overflow event 中预算 unknown 时，Host 仍使用自身 budget estimator 进行 compact 诊断与恢复决策。
 
@@ -1548,11 +1265,8 @@ Phase 按依赖关系推进：先实现被其它阶段依赖的公共契约、ru
 
 追踪项：
 
-- Phase 7. Tool Awaiting / resolve_wait / Wait Adapter 必须定义 wait record 被 Host 标记 cancelled 后，adapter 如何观察该状态。
-- 后续 adapter 可以按能力实现外部 job cancel / revoke / abandon，但必须明确这是 best-effort，不得影响 Host EventLog 和 Run 终态的正确性。
-- 如果外部 job 在 Host 已取消 Run 后仍回调或被 poll 到结果，Host 必须拒绝其结果进入 canonical EventLog，只能记录 diagnostic / tool trace。
-- Phase 6. ToolRuntime / Truncation / fetch_more / Duplicate Governance 必须覆盖具有外部副作用或付费调用工具的 policy / idempotency key 校验；长耗时 awaiting、external job id、cancel handle 与等待资源清理由 Phase 7. Tool Awaiting / resolve_wait / Wait Adapter 接收。
-- 第一版测试至少覆盖：`WAITING -> CANCELLED` 后迟到 `resolve_wait` / callback 不污染 canonical EventLog。
+- 后续 callback / poller adapter owner 若实现外部 job cancel / revoke / abandon，必须保持 best-effort 语义，不得影响 Host EventLog 和 Run 终态的正确性。
+- 后续 callback / poller adapter owner 必须保持迟到结果治理：外部 job 在 Host 已取消 Run 后仍回调或被 poll 到结果时，结果不得进入 canonical EventLog，只能进入 diagnostic / tool trace。
 
 #### Tool Trace / Provider Request 排错追踪
 
@@ -1580,9 +1294,7 @@ Phase 按依赖关系推进：先实现被其它阶段依赖的公共契约、ru
 
 追踪项：
 
-- Phase 2. Durable Store / EventLog / Payload Foundation 已确认 SQLite 连接配置、WAL、busy timeout、transaction 边界、retry 策略和错误分类的设计边界；handoff-ready plan 必须把这些决策转成 typed API、schema、错误类型和测试断言。
-- Phase 3. Session / Run / Attempt 状态机与 Admission 的多进程测试必须覆盖同 Session 并发 `start_run`、重复 `client_request_id`、active slot admission、queue promotion、cancel / terminal race、EventLog `event_sequence` 单调性。
-- phase plan 不得把 SQLite 写竞争作为引入服务化 DB 或消息队列的默认理由。
+- Phase 11. Host Lifecycle / Recovery / Multi-process Hardening owns SQLite 多进程 busy / retry 策略、startup recovery scan 与容量 hardening；在压测或生产观察证明需要前，不得把 SQLite 写竞争作为引入服务化 DB 或消息队列的默认理由。
 
 #### Phase 3 Dispatch Intent / State Index 决策追踪
 
@@ -1596,30 +1308,10 @@ Phase 按依赖关系推进：先实现被其它阶段依赖的公共契约、ru
 
 追踪项：
 
-- Phase 3 plan gate 前必须完成 design fix re-review；若 re-review 发现 dispatch record、active index、CAS loser 语义或 idempotency operation contract 仍不足以直接生成实现，继续停留在 design refinement，不得进入 plan gate。
-- Phase 3 implementation 不得实现 scheduler、lane acquire、WorkerProxy、LocalProxy、RemoteProxy、Engine dispatch、dispatch record `dispatching` 或 `ATTEMPT_RUNNING`。
-- P3-S4 admission / follow-up owner 必须在新增 Run / follow-up 幂等写入模式时继续保证不同 semantic digest 的幂等冲突在 Host API 边界表现为 `HostApiErrorCode.IDEMPOTENCY_CONFLICT`；该项来自 P3-S2 F001 的 rejected-with-reason 注意项。
-- P3-S3 / P3-S4 owner 必须填充并验证 `SessionSnapshot.active_run_id` 与 `queued_run_ids` 对 Run / Attempt 写入、admission 与 queue 状态的读取语义；P3-S2 只提供读取 helper。
-- P3-S4 admission owner 必须覆盖 closed Session 拒绝新 Run / follow-up 的行为；P3-S2 只负责关闭 Session row，不实现 admission。
-- P3-S4 / EngineEvent ingest owner 必须补充 FAILED / LOST terminal closeout 的 higher-level 覆盖；P3-S3 已提供具体 terminal event type 映射与低层 helper。
-- P3-S4 / Phase 5 cancel owner 已补充 dispatch 非 pending、dispatching / running cancel 的 higher-level 覆盖；P3-S3 只覆盖 pre-dispatch pending cancel。
-- P3-S4 admission owner 必须覆盖 admission idempotency、after-commit promotion / wakeup 与多进程 active race；P3-S3 只提供低层 transaction primitives。
-- P3-S5 owner 必须接入 terminal / cancel 后自动 promotion trigger；P3-S4 只定义 no-op / test wakeup port 与显式 `promote_next_queued_run`。
-- P3-S6 owner 已补充多进程 admission race、idempotency race 与 queue promotion race；P3-S4 只覆盖 slice 内并发 promotion at-most-one。
-- Phase 4 public API owner 必须把 internal admission service 接入 public Host command facade；P3-S4 不导出 public facade。
-- P3-S6 owner 已补充低层 durable 多进程 cancel / promotion race；P3-S5 已覆盖单进程 rollback 不触发 wakeup / promotion。
-- Phase 4 public API owner 必须在 public command facade wiring 后补充 API 级 queued cancel / promotion race 覆盖；P3-S6 只验证内部 durable first-committer-wins，不覆盖 public facade 入口。
-- Phase 4 public API owner 必须澄清 `attach_active` 的 public audit / read-model 表达：若需要把 attach-active request 作为可查询事实呈现，必须先更新 `docs/host/design.md` 明确 canonical event shape，不能在 Phase 3 PR fix 中临时发明 EventLog 事件。
-- Phase 4 public API owner 必须按 design fix 固定 `FollowupSnapshot.accepted_run_id` / `accepted_run_status`、`HostApiErrorCode.UNSUPPORTED_OPERATION`、受限 typed `HostApiError.detail`、`stream_run_events` cursor contract 与 deferred facade 行为矩阵。
-- Phase 4 `cancel_session_runs` 只允许实现 queued / pre-dispatch `STARTING` 子集；Phase 5 已补齐 dispatching / active worker session-scope cancel 子集，`WAITING` 与 `RECOVERING` 的完整 session-scope cancel 能力仍分别由 Phase 7 / 11 接收。
 - Phase 4 repo-review follow-up 已修复 admission-backed public facade 关闭 handle 后绕过 lifecycle guard 的问题；`retry_run`、`replay_run`、`resolve_wait`、`purge_session` 当前仍是 stable unsupported deferred facade，不接触 admission service 或 durable store。该 residual risk 由本总控追踪区持有：当前不作为 Phase 4 follow-up fix scope；若后续公共契约要求所有 deferred facade 在 closed handle 后也优先返回 `HostApiErrorCode.INVALID_STATE`，必须作为新的 Host public API contract work unit 进入独立 Gateflow，并由对应 deferred capability owner 先回写 `docs/host/design.md` 与 phase plan。
-- Phase 5 / later dispatch owner 已补充 dispatch 非 pending、dispatching / active worker cancel propagation；wait cancellation 与 recovery cancellation 仍分别由 Phase 7 / 11 接收。
-- Phase 5. RunInputBuilder 与本地执行 Dispatch 已完成 scheduler、lane acquire、dispatch record `dispatching`、WorkerProxy / LocalProxy、Engine dispatch、`ATTEMPT_RUNNING` 与 EngineEvent ingest startup 边界。
-- Phase 5 scheduler / wakeup owner 已接入 terminal closeout 后的 queue promotion 独立事务与 scheduler wakeup；after-commit promotion 的重试 / 扫描 hardening 仍由 Phase 11 lifecycle / recovery 接收。
-- Phase 7 Tool Awaiting / resolve_wait owner 必须接入 `WAITING` Run closeout 语义；Phase 3 的 `terminal_run_row` 仅为后续 wait resolve 路径预留 `WAITING` CAS 源状态，Phase 3 调用方只传 `RUNNING`。
+- Phase 11. Host Lifecycle / Recovery / Multi-process Hardening owns terminal closeout 后 queue promotion wakeup failure 的诊断、重试、扫描与恢复。
 - Phase 11. Host Lifecycle / Recovery / Multi-process Hardening owns dispatch record recovery join、positive orphan proof、RECOVERING dispatch、startup recovery scan 与多进程 hardening。
-- Phase 11. Host Lifecycle / Recovery / Multi-process Hardening owns SQLite 多进程 busy / retry 策略的长期 hardening；Phase 3 只验证当前 modest process count 下的 correctness invariant。
-- Tool awaiting / `resolve_wait` owner 为 Phase 7；steer、retry / replay、context compaction 分别由其对应 phase plan 接入，不得由 Phase 3 提前实现。
+- Steer、retry / replay、context compaction 分别由其对应 phase plan 接入，不得回退到 Phase 3 dispatch primitive 中补实现。
 
 #### Phase 1 Runtime Lane 风险追踪
 
@@ -1631,10 +1323,6 @@ Phase 按依赖关系推进：先实现被其它阶段依赖的公共契约、ru
 
 追踪项：
 
-- Phase 1 implementation 必须明确 runtime lane SQLite busy timeout 默认值、错误包装和测试断言；不得把 busy timeout 失败解释为 Host admission 或 recovery failure。
-- Phase 1 implementation 必须测试 heartbeat 只能刷新当前 token owner 的 active claim，release 幂等且不释放其它 claim。
-- Phase 1 implementation 必须按 TTL eventual consistency 处理 stale claim cleanup；测试只能断言 TTL 过期后可清理并重新 acquire，不得假设跨进程时钟完全同步或严格公平。
-- Phase 1 implementation 必须说明 runtime lane DB 的默认路径注入和 workspace cleanup 责任；若默认路径仍不足以由设计真源决定，implementation agent 必须停下交给 controller，不得自行选择。
 - Phase 11. Host Lifecycle / Recovery / Multi-process Hardening 可基于 Phase 1 lane DB 行为补充压力测试和长期残留 DB cleanup 策略，但不得把 lane token 升级为 Host truth。
 
 #### Remote 物理执行 exactly-once 非目标
@@ -1649,7 +1337,7 @@ Phase 按依赖关系推进：先实现被其它阶段依赖的公共契约、ru
 追踪项：
 
 - Phase 14. RemoteProxy / RemoteStub 必须测试旧 `execution_id` 的迟到 Engine event、迟到 tool result、迟到 terminal 只能进入 diagnostic / trace，不能污染 canonical EventLog。
-- Phase 6. ToolRuntime / Truncation / fetch_more / Duplicate Governance 必须明确具有外部副作用的工具的 idempotency key 与 side-effect policy；外部 job 可取消能力由 Phase 7 wait adapter 与后续 adapter hardening 接收。
+- 后续 tool policy provider / adapter hardening owner 必须保持外部副作用工具的 idempotency key、side-effect policy 与 best-effort cancel / revoke 边界。
 - Phase 14. RemoteProxy / RemoteStub 不得引入远端 takeover attempt、远端 append EventLog 或远端更新 Run 状态。
 
 #### Session Purge / Archive 追踪
@@ -1663,7 +1351,7 @@ Phase 按依赖关系推进：先实现被其它阶段依赖的公共契约、ru
 
 追踪项：
 
-- Phase 4. Host Public API Command Path 必须稳定 `purge_session` 的 request、幂等、错误形状和 `PurgeSessionResult` 公共契约；Phase 15. Retention / Purge / Production Hardening 必须细化删除范围、tombstone 存储位置和 destructive cleanup 语义。
+- Phase 15. Retention / Purge / Production Hardening 必须细化 `purge_session` 删除范围、tombstone 存储位置和 destructive cleanup 语义。
 - Phase 15. Retention / Purge / Production Hardening 必须定义共享 cold artifact 的引用计数或 ref 检查，防止 purge 删除仍被其它 Session 引用的 artifact。
 - 后续单独追踪 `archive_session` 的需求和边界；不得用 `purge_session` 模拟 archive。
 
@@ -1677,26 +1365,9 @@ Phase 按依赖关系推进：先实现被其它阶段依赖的公共契约、ru
 
 追踪项：
 
-- Phase 3. Session / Run / Attempt 状态机与 Admission 必须提供 Run / Attempt / Session 状态迁移单元测试。
-- Phase 2. Durable Store / EventLog / Payload Foundation 必须提供 SQLite transaction、CAS、唯一约束、多进程竞争和 crash recovery foundation 测试。
-- Phase 5. RunInputBuilder 与本地执行 Dispatch 已提供 WorkerProxy fake integration；Phase 14. RemoteProxy / RemoteStub 必须提供迟到事件、断连、重发和 accept ack 测试。
-- Phase 6. ToolRuntime / Truncation / fetch_more / Duplicate Governance 必须提供外部业务 `ToolBundle` 输入、attempt-local effective `ToolBundle`、`fetch_more` 注入、tool fact accept barrier、truncate / fetch_more、重复工具调用治理和 side-effect policy 测试。
-- Phase 8. Projection Core / Host Event Stream / Minimal Read Model 必须提供 EventLog replay、checkpoint、Host event stream、minimal read model 的幂等追平测试；Phase 13. Audit / Tool Trace / Outbox Projections 必须提供 Outbox、audit、usage、tool trace 的幂等追平测试。
+- Phase 13. Audit / Tool Trace / Outbox Projections 必须提供 Outbox、audit、usage、tool trace 的幂等追平测试。
+- Phase 14. RemoteProxy / RemoteStub 必须提供迟到事件、断连、重发和 accept ack 测试。
 - Phase 11. Host Lifecycle / Recovery / Multi-process Hardening 必须提供 Host restart、positive orphan proof、LOST / RECOVERABLE_LOST、prompt 已 accepted 但 answer 未返回的恢复测试。
-
-#### Phase 2 EventLog / Idempotency Slice 2 追踪
-
-结论：
-
-- Phase 2 Slice 2 已落地 EventLog append / read / 全局 `event_sequence`、`event_id` 幂等重复处理、事件体 digest、idempotency primitive 与多进程 append smoke。
-- Slice 2 不实现 payload descriptor writer、artifact helper、host instance liveness、Session / Run / Attempt 状态机、projection、audit、outbox、ToolRuntime、Engine dispatch 或 command path。
-- Slice 2 code re-review 已确认 `DS-F1` 至 `DS-F4` 均已修复，未留下 accepted finding。
-
-追踪项：
-
-- Phase 2 Slice 3 已覆盖合法非空 `payload_ref` 的 EventLog append 路径；该项已关闭。
-- 第三个 durable validation consumer 已触发共享 private validation helper 抽取；该项已关闭，后续如再出现重复校验逻辑，归属对应新增 consumer 所在 phase 就近处理。
-- `created_event_sequence <= 0` 的防御性校验当前无直接负例测试；该项不阻塞 Phase 2，owner 为首个扩展 idempotency public consumer 的 phase，当前预计是 Phase 4 Host Public API Command Path。若 Phase 4 未扩展该路径，则继续转交给后续首次扩展 idempotency API 的 phase。
 
 #### Phase 2 Aggregate Deepreview 追踪
 
@@ -1710,7 +1381,7 @@ Phase 按依赖关系推进：先实现被其它阶段依赖的公共契约、ru
 
 - Phase 11 Host Lifecycle / Recovery / Multi-process Hardening 不得把 Phase 2 `host_instances` liveness row 解释为 lease、fencing、owner、takeover 或 positive orphan proof；Phase 11 只能在 dispatch record、pid / process_start_token / boot id 与 heartbeat 等 durable facts 共同满足 positive orphan proof 后推进 recovery。
 - `heartbeat_current_instance` / repeated `register_current_instance` 当前可把同一当前 instance row 从 `stopping` 刷回 `running`；owner 为 Phase 11 Host Lifecycle / Recovery / Multi-process Hardening。Phase 11 若引入严格 lifecycle 解释，必须先决定是否收紧该 transition，并补充状态回退测试。
-- `SQLitePayloadWriteRequest.payload_json=None` 在 `canonical_json` 格式下表示合法 JSON `null`；owner 为 Phase 4 Host Public API Command Path 与 Phase 6 ToolRuntime / Truncation / fetch_more / Duplicate Governance。若 public command path 或 tool accept path 不允许隐式 null，必须在对应构造边界显式收紧，而不是修改 Phase 2 durable primitive。
+- `SQLitePayloadWriteRequest.payload_json=None` 在 `canonical_json` 格式下表示合法 JSON `null`；后续 public command 或 tool accept hardening 若不允许隐式 null，必须在对应构造边界显式收紧，而不是修改 Phase 2 durable primitive。
 - Artifact orphan cleanup owner 为 Phase 15 Retention / Purge / Production Hardening。Phase 2 只保证 rollback 后 orphan 文件不是 accepted fact；Phase 15 必须决定 orphan cleanup 是 manual diagnostic、startup diagnostic 还是 background cleanup，并补测试 / 文档。
 - Artifact directory fsync failure 当前仍作为结构化 durable write error 暴露，不为平台兼容而吞掉；这是 aggregate adjudication 明确拒绝的修复方向，不安排为后续实现项。若 Phase 15 production hardening 后续要改变平台兼容策略，必须重新做 design discussion。
 
@@ -1742,15 +1413,9 @@ Phase 按依赖关系推进：先实现被其它阶段依赖的公共契约、ru
 
 - `accept_worker_running_in_transaction` 诊断 payload 弱于 scheduler 生产路径；owner 为 Host durable transition hardening。
 - `mark_dispatching_after_lane_row` 底层 helper 能力宽于生产 scheduler 路径；owner 为 Host durable API tightening。
-- active worker registry composition root 边界已由
-  `docs/reviews/p1-p7-design-goals-fix-codex-20260516.md` 关闭：模块级
-  `DEFAULT_ACTIVE_WORKER_REGISTRY` / `cancel_active_worker()` 已移除，command handle 与 scheduler 默认各自创建 fresh
-  registry，需要 active cancel 传播时由 production composition root 显式传同一个 `ActiveWorkerRegistry`。
-- terminal closeout 后 queue promotion wakeup failure 的诊断 / 抑制策略；owner 为 Host dispatch lifecycle hardening。
+- terminal closeout 后 queue promotion wakeup failure 的诊断 / 抑制策略；owner 为 Phase 11. Host Lifecycle / Recovery / Multi-process Hardening。
 - active cancel watchdog、stuck `CANCELLING` 与 orphan recovery；owner 为 Phase 11. Host Lifecycle / Recovery / Multi-process Hardening。
 - RemoteProxy 语义与远端迟到事件治理；owner 为 Phase 14. RemoteProxy / RemoteStub。
-- ToolRuntime / `fetch_more` canonical tool fact accept path 已由 P6-S2 accept barrier 与 P6-S4 `fetch_more` 普通工具路径覆盖；剩余 duplicate governance / diagnostic refs 由 P6-S5 接收。
-- `WAITING` / `resolve_wait` 与 wait cancellation；owner 为 Phase 7. Tool Awaiting / resolve_wait / Wait Adapter。
 - Memory、Context Governance 与 compact artifact 真实 provider 接线；owner 分别为 Phase 9. Memory 与 Phase 10. Context Governance / Compaction。
 - runtime lane repeated outer cancellation、untracked release failure 与 idle scheduler sleeping task；owner 为后续 runtime cancellation precision / Host dispatch lifecycle hardening。
 - Engine runner injection / provider abstraction design；owner 为后续 Engine composition / provider abstraction design。
@@ -1771,8 +1436,6 @@ Phase 按依赖关系推进：先实现被其它阶段依赖的公共契约、ru
 - `TruncationManager` cursor 仍为内存、ToolRuntime-local、单 Run 生命周期；Phase 11 recovery 不得把 P6-S4 cursor 解释为可恢复 durable truth。
 - 当前测试允许 white-box 篡改 `_cursors` 验证 corrupt / mismatch 防御；若后续 cursor 存储结构迁移，owner 为对应迁移 slice 同步调整测试边界。
 - 当前覆盖以 `text_chars` 为主；`text_lines`、`list_items`、`binary_bytes` 的更细粒度边界 hardening 归后续 ToolRuntime test hardening，不阻塞 P6-S5。
-- duplicate governance、diagnostic refs 和 run-local duplicate matrix 由 P6-S5 接收。
-- 真实 `HostDispatchScheduler` no-tool composition wiring 已由 P6-S6 关闭。
 
 #### Phase 6 P6-S5 Duplicate Governance / Diagnostics 残余风险追踪
 
@@ -1787,12 +1450,11 @@ Phase 按依赖关系推进：先实现被其它阶段依赖的公共契约、ru
 
 追踪项：
 
-- 默认 duplicate policy 仍为 `allow`；生产 policy provider resolution 不在 P6-S5 范围内，当前 owner 为 P6-S6 integration 或后续 ToolRuntime policy provider work。
+- 默认 duplicate policy 仍为 `allow`；生产 policy provider resolution owner 为 Phase 12 ToolsDiscovery / ScenePrepare 或后续 ToolRuntime policy provider work。
 - `semantic_duplicate_key_argument_name` 是 Host 内部 policy 字段且默认关闭；后续 policy provider 若启用它，必须补 dedicated tests 并明确其与 normalized arguments digest 的关系。
 - `ToolFactAcceptCandidate` 对 `GOVERNED_ERROR` 的 duplicate defensive validation 仍可更严格；owner 为后续 ToolRuntime hardening。
 - `ToolTraceDiagnosticEmitter` typed refs 不等于 durable tool trace；durable trace projection 由 Phase 13 Audit / Tool Trace / Outbox Projections 接收。
-- 真实 `HostDispatchScheduler` no-tool composition wiring 已由 P6-S6 关闭。
-- Run-local duplicate governance 是 P6 既定目标，不是 Attempt-local 目标。P6 aggregate review 已接受并修复实例级 duplicate memory blocker：`InMemoryRunScopedDuplicateGovernanceRegistry` 在同一 Host 进程内按 Run 持有 duplicate memory，同 Run 多 ToolRuntime handle 共享 accepted fact，不同 Run 隔离；P6 仍不引入 durable duplicate ledger，也不承诺 crash / restart recovery。
+- Durable duplicate ledger 不属于 P6；若后续需要跨进程 / crash 后恢复 duplicate index，owner 为后续 duplicate hardening 或 Phase 13 tool trace / projection owner。
 
 #### Phase 6 P6-S6 Integration / Scheduler Wiring 残余风险追踪
 
@@ -1809,11 +1471,328 @@ Phase 按依赖关系推进：先实现被其它阶段依赖的公共契约、ru
 - `tooling_options` 当前是 construction-time 单 bundle 输入；多 profile / per-scene tool profile 仍归 Phase 12 ToolsDiscovery / ScenePrepare 或后续 policy provider owner。
 - `policy_snapshot_digest` 当前是本地 policy snapshot 的诊断 digest，不是 durable attempt tool snapshot；attempt tool snapshot durability 仍归后续 ToolRuntime hardening / policy provider owner。
 - duplicate governance 的裁决为 Run-local 语义：同一个 Run 因 `WAITING -> resolve_wait -> resume`、steer 或 recovery 创建新 Attempt 时，正常同进程生命周期内必须共享该 Run 的 duplicate memory。P6 不要求 durable duplicate ledger，也不要求 Host 崩溃 / 重启后恢复内存 index；崩溃恢复后的重复风险由 RunInputBuilder 的 accepted facts 重建兜底。Phase 7 / steer / recovery owner 不再重新裁决“是否需要 Run-local”，只按各自路径复用该语义。
-- P6 aggregate fix 已把真实 `HostDispatchScheduler` tool-enabled path 接入 Run-scoped duplicate registry；scheduler 在 terminal closeout、cancel cleanup 与 scheduler close 时清理 registry state。
 - `WAITING -> resolve_wait -> resume` 是新的 LLM request。Host 不能要求无状态模型天然记住上一 Attempt 已经发过某个 tool call；resume RunInputBuilder 必须把已 accepted 的等待结果、工具事实、governance guidance 与必要上下文放回 messages。若模型仍重复发起同一个语义工具调用，Run-local duplicate governance 负责复用、提示、要求说明或阻断。
 - `enable_truncation_manager=True` 是本地 tool-enabled scheduler 默认值；若后续 TruncationManager 初始化成本变重，归 ToolRuntime performance hardening 复核。
 
+#### Phase 7 Tool Awaiting / resolve_wait / Wait Adapter 残余风险追踪
+
+结论：
+
+- Phase 7 已落地 typed wait outcome envelope、durable wait record、ToolRuntime awaiting accept、`resolve_wait` resume / terminal closeout、`WAITING` cancel、late diagnostic、poller 与 EngineEvent confirmation boundary。
+- Phase 7 不实现 callback endpoint、poller 后台循环、external job physical cancel / revoke、durable duplicate ledger 或 durable tool trace projection。
+
+追踪项：
+
+- Callback endpoint / auth / replay owner 为后续 callback adapter work unit。
+- Poller 后台 loop、backoff、in-flight fencing、adapter retry、`LIMIT` / `CANCELLED` abandon 退避 owner 为 Phase 15. Retention / Purge / Production Hardening 或后续 production polling scale work unit。
+- `WAITING` recovery observation、awaiting accepted ack 当前状态重校验与 scheduler close active Run reconciliation owner 为 Phase 11. Host Lifecycle / Recovery / Multi-process Hardening。
+- Engine matching-ref 强校验 owner 为后续 Engine contract evolution。
+- External job physical cancel / revoke owner 为后续 adapter hardening。
+- Durable duplicate ledger owner 为后续 duplicate hardening；durable tool trace projection owner 为 Phase 13. Audit / Tool Trace / Outbox Projections。
+
+#### Phase 8 Projection Core / Host Event Stream / Minimal Read Model 残余风险追踪
+
+结论：
+
+- Phase 8 已落地 committed EventLog consumer framework、projection checkpoint / failure store、typed consumer contract、Host EventLog-backed event stream cursor truth regression coverage、minimal RunResult / Session timeline read model、internal repair helper 与 rebuild tests。
+- Phase 8 不实现 Audit / Tool Trace / Outbox concrete sinks，不实现 automatic after-commit projection catch-up，不把 projection/read model 升级为治理真源。
+
+追踪项：
+
+- Automatic after-commit projection catch-up owner 为 Phase 9. Conversation Memory / Session Memory Projection。
+- Heavy sink / batch-transaction runner owner 为 Phase 13. Audit / Tool Trace / Outbox Projections 与 Phase 15. Retention / Purge / Production Hardening。
+- Per-session repair filter owner 为 Phase 15. Retention / Purge / Production Hardening。
+- RunResult summary refs 接入 public `RunSnapshot` owner 为 Phase 9 / Phase 15 或后续 public read enhancement work unit。
+- Audit / Tool Trace / Outbox concrete sinks owner 为 Phase 13. Audit / Tool Trace / Outbox Projections。
+- Engine / OpenAI runner / parser findings owner 为 Engine hardening gate。
+- Schema CHECK hardening owner 为后续 schema hardening work unit。
+
 ## 历史记录
+
+### 2026-05-16 P8 完成前滚动状态归档
+
+Phase 5 `RunInputBuilder 与本地执行 Dispatch` 已完成。PR 54
+`Host Phase 5 RunInputBuilder and local dispatch` 已完成 Phase 5 aggregate review、PR review fix、追加并行 review、全仓 review
+与 P1-P5 corrected design conformance review；最近一次 corrected gate 的 AgentMiMo、AgentDS、AgentCodex 三路 verdict 均为
+PASS，blocking design deviation 为 0。Controller adjudication artifact 为
+`docs/reviews/p1-p5-design-conformance-review-controller-adjudication-20260515.md`。
+
+当前不处于 implementation / fix gate；没有 accepted blocking finding 待修。用户手工 merge PR 54 后，下一步按 `$phaseflow`
+推进 Phase 6 `ToolRuntime / Truncation / fetch_more / Duplicate Governance`。Phase 6 design discussion 输入 artifact 为
+`docs/reviews/host-phase6-design-discussion-codex-20260515.md`，controller 裁决 artifact 为
+`docs/reviews/host-phase6-design-discussion-controller-adjudication-20260515.md`；裁决后的 design write-back 已同步到
+`docs/host/design.md` 与本文档。Phase 6 handoff implementation-ready plan 为
+`docs/host/phase6-toolruntime-truncation-fetch-more-plan.md`；plan review artifacts 为
+`docs/reviews/host-phase6-plan-review-mimo-20260515.md` 与
+`docs/reviews/host-phase6-plan-review-ds-20260515.md`；controller plan review adjudication artifact 为
+`docs/reviews/host-phase6-plan-review-controller-adjudication-20260515.md`。Plan fix 后，plan re-review artifacts 为
+`docs/reviews/host-phase6-plan-re-review-mimo-20260515.md` 与
+`docs/reviews/host-phase6-plan-re-review-ds-20260515.md`；controller plan re-review adjudication artifact 为
+`docs/reviews/host-phase6-plan-re-review-controller-adjudication-20260515.md`。两路 re-review 均 PASS，blocking count 为 0。
+Phase 6 accepted plan commits 为 `04517f5` / `a5863ce`。P6-S1
+`Effective ToolBundle And RunInputBuilder Wiring` 已完成 implementation、双路 code review 与 controller adjudication，
+accepted checkpoint commit 为 `b49ba56`。P6-S1 artifacts 为
+`docs/reviews/host-phase6-implementation-s1-effective-toolbundle-20260515.md`、
+`docs/reviews/host-phase6-code-review-s1-mimo-20260515.md`、
+`docs/reviews/host-phase6-code-review-s1-ds-20260515.md` 与
+`docs/reviews/host-phase6-code-review-s1-controller-adjudication-20260515.md`。P6-S2
+`Host Accept Barrier And Tool Canonical Facts` 已完成 implementation、双路 code review 与 controller adjudication，
+accepted checkpoint commit 为 `54184e6`。P6-S2 artifacts 为
+`docs/reviews/host-phase6-implementation-s2-accept-barrier-20260515.md`、
+`docs/reviews/host-phase6-code-review-s2-mimo-20260515.md`、
+`docs/reviews/host-phase6-code-review-s2-ds-20260515.md` 与
+`docs/reviews/host-phase6-code-review-s2-controller-adjudication-20260515.md`。P6-S3
+`ToolExecutor Wrapper, Ack Retry, Side-effect Policy, Awaiting Guard` 已完成 implementation、双路 code review 与 controller
+adjudication，accepted checkpoint commit 为 `de7a4ae`。P6-S3 artifacts 为
+`docs/reviews/host-phase6-implementation-s3-executor-wrapper-20260515.md`、
+`docs/reviews/host-phase6-code-review-s3-mimo-20260515.md`、
+`docs/reviews/host-phase6-code-review-s3-ds-20260515.md` 与
+`docs/reviews/host-phase6-code-review-s3-controller-adjudication-20260515.md`。P6-S4
+`TruncationManager And fetch_more Normal Tool Path` 已完成 implementation、双路 code review 与 controller adjudication，
+accepted checkpoint commit 为 `28adf70`。P6-S4 artifacts 为
+`docs/reviews/host-phase6-implementation-s4-truncation-fetch-more-20260515.md`、
+`docs/reviews/host-phase6-code-review-s4-mimo-20260515.md`、
+`docs/reviews/host-phase6-code-review-s4-ds-20260515.md` 与
+`docs/reviews/host-phase6-code-review-s4-controller-adjudication-20260515.md`；验证为
+`pytest tests/host/test_toolruntime_truncation_fetch_more.py tests/host/test_toolruntime_effective_bundle.py tests/host/test_phase6_toolruntime_integration.py -q`
+15 passed、`python -m pyright dayu/host tests/host` 0 errors、`git diff --check` clean。P6-S5
+`Duplicate Governance And Diagnostic Emitter` 已完成 implementation、双路 code review、accepted finding fix、DS re-review 与
+controller adjudication，accepted checkpoint commit 为 `31ab68d`。P6-S5 artifacts 为
+`docs/reviews/host-phase6-implementation-s5-duplicate-governance-20260515.md`、
+`docs/reviews/host-phase6-code-review-s5-mimo-20260515.md`、
+`docs/reviews/host-phase6-code-review-s5-ds-20260515.md`、
+`docs/reviews/host-phase6-fix-s5-duplicate-governance-20260515.md`、
+`docs/reviews/host-phase6-code-re-review-s5-ds-20260515.md` 与
+`docs/reviews/host-phase6-code-review-s5-controller-adjudication-20260515.md`；验证为
+`pytest tests/host/test_toolruntime_duplicate_governance.py tests/host/test_toolruntime_diagnostics.py tests/host/test_toolruntime_accept_barrier.py -q`
+24 passed、P6 ToolRuntime 相关 46 tests passed、`python -m pyright dayu/host tests/host` 0 errors、`git diff --check` clean。P6-S6
+`Integration, Scheduler Wiring, And Gate Validation` 已完成 implementation、双路 code review 与 controller adjudication，
+accepted checkpoint commit 为 `53ff69f`。P6-S6 artifacts 为
+`docs/reviews/host-phase6-implementation-s6-integration-gate-20260515.md`、
+`docs/reviews/host-phase6-code-review-s6-mimo-20260515.md`、
+`docs/reviews/host-phase6-code-review-s6-ds-20260515.md` 与
+`docs/reviews/host-phase6-code-review-s6-controller-adjudication-20260515.md`；验证为
+`pytest tests/host -q` 348 passed、`python -m pyright dayu/ tests/ utils/` 0 errors、`git diff --check` clean。Phase 6
+aggregate review 已完成，初次 aggregate review artifacts 为
+`docs/reviews/host-phase6-aggregate-review-mimo-20260515.md`、
+`docs/reviews/host-phase6-aggregate-review-ds-20260515.md` 与
+`docs/reviews/host-phase6-aggregate-review-controller-adjudication-20260515.md`；两路 review 均接受 P6-AGG-F1：
+Run-local duplicate governance index 仍跟随 ToolRuntime 实例生命周期，不满足 P6 exit standard。P6-AGG-F1 已通过
+`docs/reviews/host-phase6-aggregate-fix-run-local-duplicate-governance-20260515.md` 修复，并由
+`docs/reviews/host-phase6-aggregate-re-review-mimo-20260515.md`、
+`docs/reviews/host-phase6-aggregate-re-review-ds-20260515.md` 与
+`docs/reviews/host-phase6-aggregate-re-review-controller-adjudication-20260515.md` 确认 PASS。Phase 6 accepted aggregate
+review commit 为 `8f73821`；验证为 `pytest tests/host -q` 349 passed、
+`python -m pyright dayu/ tests/ utils/` 0 errors、`git diff --check` clean。Phase 6 PR 已创建为
+https://github.com/noho/dayu-agent-r/pull/55；当前 gate 为 PR 55 deepreview。需要继续追踪的
+non-blocking hardening、deferred capability 与后续 phase owner 已写入 `Open Questions 与风险追踪` 的
+`PR 54 / P1-P5 corrected review 残余风险追踪`、P6-S1 controller adjudication residual risks、P6-S2 controller
+adjudication residual risks、P6-S3 controller adjudication residual risks、P6-S4 controller adjudication residual risks，以及
+P6-S5 / P6-S6 controller adjudication residual risks。P6-S3 遗留的真实 `HostDispatchScheduler` no-tool composition wiring 已由 P6-S6 关闭；
+PR 55 创建后按用户指令安排 AgentMiMo 与 AgentDS 执行 `/deepreview PR 55`。PR review artifacts 为
+`docs/reviews/pr-55-deepreview-mimo-20260515.md` 与
+`docs/reviews/pr-55-deepreview-ds-20260515.md`；controller adjudication 为
+`docs/reviews/pr-55-deepreview-controller-adjudication-20260515.md`。AgentMiMo PASS；AgentDS PASS 但提出 PR55-DS-1
+中严重度 finding，controller 裁决为 accepted 并由
+`docs/reviews/pr-55-fix-accept-retry-exhausted-20260515.md` 修复，fix commit 为 `c79d6b8`。PR 55 re-review artifacts 为
+`docs/reviews/pr-55-re-review-mimo-20260515.md` 与
+`docs/reviews/pr-55-re-review-ds-20260515.md`，两路均 PASS；验证为 `pytest tests/host -q` 350 passed、
+`python -m pyright dayu/ tests/ utils/` 0 errors、`git diff --check` clean。Phase 6 状态为 completed；PR 55 已由用户手工
+merge。Phase 7 `Tool Awaiting / resolve_wait / Wait Adapter` design discussion、design write-back、双路 design re-review、
+accepted design findings fix 与双路 design fix re-review 已完成。Artifacts 为
+`docs/reviews/host-phase7-design-discussion-codex-20260516.md`、
+`docs/reviews/host-phase7-design-re-review-mimo-20260516.md`、
+`docs/reviews/host-phase7-design-re-review-ds-20260516.md`、
+`docs/reviews/host-phase7-design-re-review-controller-adjudication-20260516.md`、
+`docs/reviews/host-phase7-design-fix-re-review-mimo-20260516.md`、
+`docs/reviews/host-phase7-design-fix-re-review-ds-20260516.md` 与
+`docs/reviews/host-phase7-design-fix-re-review-controller-adjudication-20260516.md`。当前 gate 为 Phase 7
+handoff implementation-ready plan。Phase 7 handoff implementation-ready plan 已写入
+`docs/host/phase7-tool-awaiting-resolve-wait-plan.md`。Plan review artifacts 为
+`docs/reviews/host-phase7-plan-review-mimo-20260516.md` 与
+`docs/reviews/host-phase7-plan-review-ds-20260516.md`；controller plan review adjudication artifact 为
+`docs/reviews/host-phase7-plan-review-controller-adjudication-20260516.md`。Plan fix artifact 为
+`docs/reviews/host-phase7-plan-fix-codex-20260516.md`。Plan re-review artifacts 为
+`docs/reviews/host-phase7-plan-re-review-mimo-20260516.md` 与
+`docs/reviews/host-phase7-plan-re-review-ds-20260516.md`；controller plan re-review adjudication artifact 为
+`docs/reviews/host-phase7-plan-re-review-controller-adjudication-20260516.md`。两路 re-review 均 PASS，blocking count 为 0。
+Phase 7 accepted plan commit 为 `d017fd7`。
+P7-S1 `Public Contracts And Durable Wait Record` 已完成 implementation、双路 code review、accepted finding fix、双路 code
+re-review 与 controller adjudication，accepted checkpoint commit 为 `aaa107a`。P7-S1 artifacts 为
+`docs/reviews/host-phase7-s1-controller-decision-test-ownership-20260516.md`、
+`docs/reviews/host-phase7-implementation-s1-public-contracts-wait-record-20260516.md`、
+`docs/reviews/host-phase7-code-review-s1-mimo-20260516.md`、
+`docs/reviews/host-phase7-code-review-s1-ds-20260516.md`、
+`docs/reviews/host-phase7-code-review-s1-controller-adjudication-20260516.md`、
+`docs/reviews/host-phase7-fix-s1-public-contracts-wait-record-20260516.md`、
+`docs/reviews/host-phase7-code-re-review-s1-mimo-20260516.md`、
+`docs/reviews/host-phase7-code-re-review-s1-ds-20260516.md` 与
+`docs/reviews/host-phase7-code-re-review-s1-controller-adjudication-20260516.md`。验证为
+`pytest tests/host/test_public_contracts.py tests/host/test_import_boundary.py tests/host/test_package_exports.py tests/host/test_durable_schema.py tests/host/test_state_schema.py tests/host/test_wait_record_state.py tests/host/test_public_run_api.py -q`
+84 passed、`python -m pyright dayu/host tests/host` 0 errors、`git diff --check` clean。
+P7-S2 `ToolRuntime Awaiting Accept Path` 已完成 implementation、双路 code review、accepted finding fix、双路 code
+re-review 与 controller adjudication，accepted checkpoint commit 为 `42f972a`。P7-S2 artifacts 为
+`docs/reviews/host-phase7-implementation-s2-tool-awaiting-accept-20260516.md`、
+`docs/reviews/host-phase7-code-review-s2-mimo-20260516.md`、
+`docs/reviews/host-phase7-code-review-s2-ds-20260516.md`、
+`docs/reviews/host-phase7-fix-s2-tool-awaiting-accept-20260516.md`、
+`docs/reviews/host-phase7-code-re-review-s2-mimo-20260516.md`、
+`docs/reviews/host-phase7-code-re-review-s2-ds-20260516.md` 与
+`docs/reviews/host-phase7-code-re-review-s2-controller-adjudication-20260516.md`。验证为
+`pytest tests/host -q` 374 passed、`python -m pyright dayu/host tests/host` 0 errors、`git diff --check`
+clean。P7-S3 `resolve_wait Command And Resume Attempt` 已完成 implementation、MiMo code review、controller accepted finding fix、MiMo
+re-review、DS current-version code review 与 controller adjudication，accepted slice commit 为 `4712101`。P7-S3 artifacts 为
+`docs/reviews/host-phase7-implementation-s3-resolve-wait-resume-20260516.md`、
+`docs/reviews/host-phase7-code-review-s3-mimo-20260516.md`、
+`docs/reviews/host-phase7-fix-s3-resolve-wait-resume-20260516.md`、
+`docs/reviews/host-phase7-code-re-review-s3-mimo-20260516.md`、
+`docs/reviews/host-phase7-code-review-s3-ds-20260516.md` 与
+`docs/reviews/host-phase7-code-re-review-s3-controller-adjudication-20260516.md`。验证为
+`pytest tests/host/test_resolve_wait_command.py tests/host/test_run_attempt_transitions.py tests/host/test_run_input_builder.py tests/host/test_dispatch_scheduler.py tests/host/test_phase7_waiting_integration.py -q`
+64 passed、`pytest tests/host -q` 381 passed、`python -m pyright dayu/host tests/host` 0 errors、`git diff --check`
+clean。P7-S4 `WAITING Cancel, Late Result Diagnostic, Poll / Manual Adapter, EngineEvent Confirmation` 已完成
+implementation、双路 code review 与 controller adjudication，accepted slice commit 为 `3ccddbf`。P7-S4 artifacts 为
+`docs/reviews/host-phase7-implementation-s4-wait-cancel-late-poll-20260516.md`、
+`docs/reviews/host-phase7-code-review-s4-mimo-20260516.md`、
+`docs/reviews/host-phase7-code-review-s4-ds-20260516.md` 与
+`docs/reviews/host-phase7-code-review-s4-controller-adjudication-20260516.md`。验证为
+`pytest tests/host/test_wait_cancel_late_result.py tests/host/test_wait_adapter_polling.py tests/host/test_engine_ingest_mapping.py tests/host/test_public_cancel_session_runs.py tests/host/test_public_run_api.py -q`
+42 passed、`pytest tests/host -q` 388 passed、`python -m pyright dayu/host tests/host` 0 errors、`git diff --check`
+clean。P7-S4 residual risks：Engine contract 当前不携带 Host accepted wait refs，P7-S4 只能做 diagnostic /
+idempotent confirmation，不能验证 Engine awaiting event 与 Host accepted wait refs 完全匹配；Poller 仍是最小单轮
+`poll_once()`，不包含后台调度循环、退避、并发 in-flight fencing 或 adapter 错误重试治理；`WAITING` Run + 非
+`SUSPENDED` Attempt 的防御性 internal invariant error、poller retry 外部化后的幂等 digest 策略、late result typed
+public error detail 均为后续 hardening / API contract 扩展项。当前 gate 为 P7-S5 `Integration, Docs, Gate Validation`
+implementation。P7-S5 `Integration, Docs, Gate Validation` 已完成 implementation、双路 aggregate review 与 controller
+adjudication，accepted slice commit 为 `c974acf`。P7-S5 / aggregate artifacts 为
+`docs/reviews/host-phase7-implementation-s5-integration-docs-gate-validation-20260516.md`、
+`docs/reviews/host-phase7-aggregate-review-s5-mimo-20260516.md`、
+`docs/reviews/host-phase7-aggregate-review-s5-ds-20260516.md` 与
+`docs/reviews/host-phase7-aggregate-review-s5-controller-adjudication-20260516.md`。验证为 `pytest tests/host -q`
+389 passed、`python -m pyright dayu/ tests/ utils/` 0 errors、`git diff --check` clean。Phase 7 aggregate exit
+accepted：typed wait outcome envelope、durable wait record、ToolRuntime awaiting accept、`resolve_wait` resume / terminal
+closeout、`WAITING` cancel、late diagnostic、poller 与 EngineEvent confirmation boundary 均已落地。Phase 7 remaining
+risks / owners：callback endpoint / auth / replay 归后续 callback adapter owner；poller 后台 loop / backoff /
+in-flight fencing / adapter retry 归后续 poller runtime hardening owner；`WAITING` recovery observation 归 Phase 11；
+Engine matching-ref 强校验归后续 Engine contract 演进；external job physical cancel / revoke 归后续 adapter hardening；
+durable duplicate ledger 与 durable tool trace projection 分别归后续 duplicate hardening / projection or tool trace owner。
+当前 gate 为 Phase 7 ready-to-open-draft-PR。Phase 7 draft PR 已创建：PR 56
+`https://github.com/noho/dayu-agent-r/pull/56`，title 为 `Host Phase 7 Tool Awaiting / resolve_wait / Wait Adapter`，
+head branch 为 `feat/host-phase7-tool-awaiting-resolve-wait`，PR 当前保持 draft。PR 56 deepreview artifacts 为
+`docs/reviews/pr-56-deepreview-mimo-20260516.md` 与 `docs/reviews/pr-56-deepreview-ds-20260516.md`。MiMo review
+PASS，无 blocking finding；DS review PASS，提出 6 个 Low 与 2 个 Info finding。Controller 接受 F1 digest 校验一致性与
+F2 `WaitPollLost` 测试缺口为当前 PR fix，fix artifact 为
+`docs/reviews/pr-56-fix-digest-and-poll-lost-20260516.md`，fix commit 为 `dd32948`。PR 56 fix re-review artifacts
+为 `docs/reviews/pr-56-fix-re-review-mimo-20260516.md`、
+`docs/reviews/pr-56-fix-re-review-ds-20260516.md` 与
+`docs/reviews/pr-56-fix-re-review-controller-adjudication-20260516.md`；两份 re-review 均确认 F1 / F2 fixed、
+无回归。Fix validation：`pytest tests/host/test_wait_awaiting_accept.py tests/host/test_wait_adapter_polling.py tests/host/test_resolve_wait_command.py -q`
+15 passed、`pytest tests/host -q` 391 passed、`python -m pyright dayu/ tests/ utils/` 0 errors、`git diff --check`
+clean。F3 cross-test helper import coupling deferred 到后续 tests cleanup；F4-F8 低/信息性 hardening 建议均 deferred。
+PR 56 deepreview / fix / re-review gate 已完成并通过。
+
+P1-P7 design conformance follow-up fix gate：Controller adjudication artifact
+`docs/reviews/p1-p7-design-conformance-controller-adjudication-20260516.md` 接受 blocking finding
+C-P1P7-001：P7 awaiting production wiring 未接入 `HostDispatchScheduler`。当前 fix gate 在分支
+`fix/host-p1-p7-awaiting-production-wiring` 修复该 production wiring：`HostToolingOptions` 承载 construction-scope
+`wait_adapter_registry`，`HostDispatchScheduler` 在 tool-enabled production path 构造 `ToolRuntimeBuildRequest` 时注入
+`DefaultHostToolAwaitingAcceptPort` 与该 registry；adapter object 仍不进入 per-run request 或 durable wait row。Fix artifact 为
+`docs/reviews/p1-p7-design-conformance-fix-awaiting-production-wiring-20260516.md`。验证结果以该 artifact 为准；本 fix
+不实现 callback endpoint、poller 后台循环、recovery scan、remote worker 或 external job physical cancel。
+Controller fix adjudication artifact 为
+`docs/reviews/p1-p7-design-conformance-fix-controller-adjudication-20260516.md`，MiMo / DS fix re-review 均 PASS；
+本地 accepted fix checkpoint commit 为 `d03e064`。
+随后用户明确决定 `fetch_more` cursor 只存在内存，其它 review findings 改按当前 `docs/host/design.md` 的设计目标与最佳实践裁决。
+Controller decision artifact 为 `docs/reviews/p1-p7-design-goals-controller-decision-20260516.md`，Codex fix artifact 为
+`docs/reviews/p1-p7-design-goals-fix-codex-20260516.md`，MiMo / DS fix review artifact 为
+`docs/reviews/p1-p7-design-goals-fix-review-mimo-20260516.md` 与
+`docs/reviews/p1-p7-design-goals-fix-review-ds-20260516.md`，final adjudication artifact 为
+`docs/reviews/p1-p7-design-goals-fix-controller-adjudication-20260516.md`。本地 accepted design-goals fix checkpoint commit 为
+`86bcc5a`。随后用户要求按 `$gateflow` 对当前仓库执行双路全仓 deepreview，AgentMiMo 与 AgentDS review artifacts 为
+`docs/reviews/repo-review-20260516-1557.md` 与 `docs/reviews/repo-review-20260516-1551.md`；controller adjudication artifact 为
+`docs/reviews/gateflow-deepreview-controller-adjudication-20260516-1619.md`。Controller 接受 DS-1、DS-2、DS-4、DS-5、
+DS-6、DS-18 与 MiMo-2，AgentCodex fix artifact 为
+`docs/reviews/gateflow-deepreview-fix-agentcodex-20260516.md`，MiMo / DS fix re-review artifacts 为
+`docs/reviews/gateflow-deepreview-fix-re-review-mimo-20260516.md` 与
+`docs/reviews/gateflow-deepreview-fix-re-review-ds-20260516.md`；两路 re-review 均 PASS。验证为
+`pytest tests/contracts/test_tool_schema.py tests/contracts/test_tool_declaration.py tests/host/test_durable_transaction.py tests/host/test_engine_ingest_mapping.py tests/host/test_toolruntime_executor.py tests/host/test_toolruntime_truncation_fetch_more.py tests/host/test_phase6_toolruntime_integration.py`
+69 passed、`python -m pyright` 0 errors、`git diff --check` clean。本地 accepted deepreview checkpoint commit 为
+`52bba89`。Phase 7 状态为 completed。Phase 8 `Projection Core / Host Event Stream / Minimal Read Model` design
+discussion 已完成，输入 artifact 为 `docs/reviews/host-phase8-design-discussion-codex-20260516.md`，controller
+adjudication artifact 为 `docs/reviews/host-phase8-design-discussion-controller-adjudication-20260516.md`。Controller
+裁决为 PASS：Phase 8 动机成立，`docs/host/design.md` §14 / §16 与本文档 Phase 8 条目已足够进入 handoff
+implementation-ready plan，无 blocking open question，无必须先写回 design / control 的 design gap。Phase 8 handoff
+implementation-ready plan 已写入 `docs/host/phase8-projection-core-event-stream-plan.md`。Plan review artifacts 为
+`docs/reviews/host-phase8-plan-review-mimo-20260516.md` 与 `docs/reviews/host-phase8-plan-review-ds-20260516.md`；
+controller plan review adjudication artifact 为
+`docs/reviews/host-phase8-plan-review-controller-adjudication-20260516.md`。Accepted plan findings 已由
+`docs/reviews/host-phase8-plan-fix-codex-20260516.md` 修复。Plan re-review artifacts 为
+`docs/reviews/host-phase8-plan-re-review-mimo-20260516.md` 与
+`docs/reviews/host-phase8-plan-re-review-ds-20260516.md`；controller plan re-review adjudication artifact 为
+`docs/reviews/host-phase8-plan-re-review-controller-adjudication-20260516.md`。两路 re-review 均 PASS，blocking count 为
+0。Phase 8 accepted plan commit 为 `b85fd8e`。P8-S1 `Projection Runner / Checkpoint / Typed Consumer Contracts` 已完成
+implementation、双路 code review、accepted finding fix、双路 code re-review 与 controller adjudication。P8-S1 artifacts 为
+`docs/reviews/host-phase8-implementation-s1-projection-runner-20260516.md`、
+`docs/reviews/host-phase8-code-review-s1-mimo-20260516.md`、
+`docs/reviews/host-phase8-code-review-s1-ds-20260516.md`、
+`docs/reviews/host-phase8-code-review-s1-controller-adjudication-20260516.md`、
+`docs/reviews/host-phase8-fix-s1-projection-runner-20260516.md`、
+`docs/reviews/host-phase8-code-re-review-s1-mimo-20260516.md`、
+`docs/reviews/host-phase8-code-re-review-s1-ds-20260516.md` 与
+`docs/reviews/host-phase8-code-re-review-s1-controller-adjudication-20260516.md`。两路 re-review 均 PASS，blocking count 为
+0。P8-S1 accepted slice commit 为 `80c12a2`。P8-S2 `Host Event Stream Cursor Truth` 已完成 implementation、双路 code
+review 与 controller adjudication。P8-S2 artifacts 为
+`docs/reviews/host-phase8-implementation-s2-event-stream-cursor-20260516.md`、
+`docs/reviews/host-phase8-code-review-s2-mimo-20260516.md`、
+`docs/reviews/host-phase8-code-review-s2-ds-20260516.md` 与
+`docs/reviews/host-phase8-code-review-s2-controller-adjudication-20260516.md`。两路 review 均 PASS，blocking count 为 0。
+P8-S2 accepted slice commit 为 `c891792`。P8-S3 `Minimal RunResult / Session Timeline Read Model / Repair` 已完成
+implementation、双路 code review、accepted finding fix、双路 code re-review 与 controller adjudication。P8-S3 artifacts 为
+`docs/reviews/host-phase8-implementation-s3-read-model-repair-20260516.md`、
+`docs/reviews/host-phase8-code-review-s3-mimo-20260516.md`、
+`docs/reviews/host-phase8-code-review-s3-ds-20260516.md`、
+`docs/reviews/host-phase8-code-review-s3-controller-adjudication-20260516.md`、
+`docs/reviews/host-phase8-fix-s3-read-model-repair-20260516.md`、
+`docs/reviews/host-phase8-code-re-review-s3-mimo-20260516.md`、
+`docs/reviews/host-phase8-code-re-review-s3-ds-20260516.md` 与
+`docs/reviews/host-phase8-code-re-review-s3-controller-adjudication-20260516.md`。两路 re-review 均 PASS，blocking count 为
+0。P8-S3 accepted slice commit 为 `d31803d`。Phase 8 aggregate review 已完成，aggregate review artifacts 为
+`docs/reviews/host-phase8-aggregate-review-mimo-20260516.md`、
+`docs/reviews/host-phase8-aggregate-review-ds-20260516.md` 与
+`docs/reviews/host-phase8-aggregate-review-controller-adjudication-20260516.md`。Accepted aggregate findings 已由
+`docs/reviews/host-phase8-aggregate-fix-20260516.md` 修复。Aggregate re-review artifacts 为
+`docs/reviews/host-phase8-aggregate-re-review-mimo-20260516.md`、
+`docs/reviews/host-phase8-aggregate-re-review-ds-20260516.md` 与
+`docs/reviews/host-phase8-aggregate-re-review-controller-adjudication-20260516.md`。两路 re-review 均 PASS，blocking count 为
+0。Phase 8 accepted deepreview commit 为 `5b2b92e`。Ready validation 期间发现 dispatch ToolRuntime wiring
+测试夹具未保持 worker stream 打开，已通过
+`docs/reviews/host-phase8-readiness-validation-fix-20260516.md` 修复，修复提交为 `57975fe`。最终验证为
+`pytest tests/host -q` 435 passed、`python -m pyright dayu/ tests/ utils/` 0 errors、`git diff --check`
+clean。追加全仓 deepreview 闭环 artifacts 为 `docs/reviews/repo-review-20260516-2105.md`、
+`docs/reviews/repo-review-20260516-2059.md`、
+`docs/reviews/repo-review-controller-adjudication-20260516-2109.md`、
+`docs/reviews/repo-review-fix-codex-20260516.md`、
+`docs/reviews/repo-review-fix-re-review-mimo-20260516.md`、
+`docs/reviews/repo-review-fix-re-review-ds-20260516.md` 与
+`docs/reviews/repo-review-fix-re-review-controller-adjudication-20260516-2130.md`。Controller accepted
+DR-ALL-A1 至 DR-ALL-A5 已修复，MiMo / DS re-review 均 PASS；accepted full-repo deepreview loop commit 为
+`3d60fdd`。Phase 8 draft PR 已创建：PR 58
+`https://github.com/noho/dayu-agent-r/pull/58`。PR 58 review artifacts 为
+`docs/reviews/pr-58-review-mimo-20260516.md`、`docs/reviews/pr-58-review-ds-20260516.md` 与
+`docs/reviews/pr-58-review-controller-adjudication-20260516.md`。Accepted PR finding PR58-F1 已由
+`docs/reviews/pr-58-fix-codex-20260516.md` 修复，并由
+`docs/reviews/pr-58-fix-re-review-ds-20260516.md` 与
+`docs/reviews/pr-58-fix-re-review-controller-adjudication-20260516.md` 确认 PASS；accepted PR review commit 为
+`a6cc2aa`，已 push 到 PR 58。当前 gate 为 draft-PR-pass。Phase 8 状态为 completed。Phase 8 exit accepted：committed EventLog
+consumer framework、projection checkpoint / failure store、typed consumer contract、Host EventLog-backed event stream cursor
+truth regression coverage、minimal RunResult / Session timeline read model、internal repair helper 与 rebuild tests 均已落地。
+Phase 8 remaining risks / owners：automatic after-commit projection catch-up 归 Phase 9 owner；heavy sink /
+batch-transaction runner 归 Phase 13 / Phase 15 owner；per-session repair filter 归 Phase 15 owner；RunResult summary refs
+接入 public `RunSnapshot` 归 Phase 9 / Phase 15 或后续 public read enhancement owner；Audit / Tool Trace / Outbox
+concrete sinks 归 Phase 13 owner；Engine / OpenAI runner / parser findings 归 Engine hardening gate owner；schema CHECK
+hardening 归后续 schema hardening owner；scheduler close active Run reconciliation 归 Phase 11 recovery owner；awaiting
+accepted ack 当前状态重校验归 Phase 7 / Phase 11 wait lifecycle hardening owner；poller LIMIT / CANCELLED abandon 退避归
+Phase 15 / production polling scale owner。
 
 P0：Engine Context Compaction Event 语义前置已完成 implementation 与 review loop；P0-S1 accepted slice commit 为 `ad6d116`，P0-S2 accepted slice commit 为 `6f6e716`。P0 后续状态进入 push / PR 路径，不再是当前 Host phase design gate。
 
