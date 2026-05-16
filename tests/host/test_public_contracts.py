@@ -3,12 +3,18 @@
 from __future__ import annotations
 
 import pathlib
-from dataclasses import is_dataclass, replace
+from dataclasses import fields, is_dataclass, replace
+from datetime import UTC, datetime, timedelta, timezone
 from enum import StrEnum
 from typing import Protocol, cast
 
 import pytest
 
+from dayu.contracts.tool_outcome import (
+    TOOL_CANCELLED_REASON_TIMEOUT,
+    ToolCancelledOutcome,
+)
+from dayu.contracts.tool_result import ToolResultFailure, ToolResultSuccess
 from dayu.contracts.cancellation import CancellationToken
 from dayu.host import (
     AttemptDispatchSnapshot,
@@ -24,6 +30,8 @@ from dayu.host import (
     FollowupSnapshot,
     HOST_EVENT_STREAM_DEFAULT_LIMIT,
     HOST_EVENT_STREAM_MAX_LIMIT,
+    HOST_WAIT_IDEMPOTENCY_KEY_MAX_LENGTH,
+    HOST_WAIT_PROVIDER_STATUS_REF_MAX_LENGTH,
     HostApiError,
     HostApiErrorCode,
     HostApiErrorDetail,
@@ -32,6 +40,7 @@ from dayu.host import (
     HostEventView,
     HostInput,
     HostLocalExecutionOptions,
+    HostPayloadRef,
     LocalEngineWorkerFactory,
     HostMetadataEntry,
     HostStreamCursor,
@@ -41,6 +50,10 @@ from dayu.host import (
     PurgeSessionRequest,
     PurgeSessionResult,
     ReplayRunRequest,
+    ResolveWaitCancelledOutcome,
+    ResolveWaitCompletedOutcome,
+    ResolveWaitFailedOutcome,
+    ResolveWaitLostOutcome,
     ResolveWaitRequest,
     RetryRunRequest,
     RunSnapshot,
@@ -53,8 +66,11 @@ from dayu.host import (
     SteerConflictDetail,
     SubmitFollowupRequest,
     TerminalResultSummary,
+    WaitAdapterKey,
+    WaitProviderStatusRef,
     WaitResolutionSource,
 )
+from dayu.host.tool_runtime import ToolFactKind
 from dayu.engine.contracts.agent_policy import AgentPolicy
 from dayu.engine.contracts.runner_spec import RunnerCallOptions, RunnerSpec
 
@@ -85,6 +101,13 @@ PUBLIC_HOST_DATACLASS_TYPES: tuple[_FrozenSlotsDataclassClass, ...] = (
     cast(_FrozenSlotsDataclassClass, AuthorizationClaim),
     cast(_FrozenSlotsDataclassClass, HostCallContext),
     cast(_FrozenSlotsDataclassClass, HostMetadataEntry),
+    cast(_FrozenSlotsDataclassClass, HostPayloadRef),
+    cast(_FrozenSlotsDataclassClass, WaitAdapterKey),
+    cast(_FrozenSlotsDataclassClass, WaitProviderStatusRef),
+    cast(_FrozenSlotsDataclassClass, ResolveWaitCompletedOutcome),
+    cast(_FrozenSlotsDataclassClass, ResolveWaitFailedOutcome),
+    cast(_FrozenSlotsDataclassClass, ResolveWaitCancelledOutcome),
+    cast(_FrozenSlotsDataclassClass, ResolveWaitLostOutcome),
     cast(_FrozenSlotsDataclassClass, HostInput),
     cast(_FrozenSlotsDataclassClass, SessionSlotRef),
     cast(_FrozenSlotsDataclassClass, HostStreamCursor),
@@ -159,6 +182,62 @@ def _host_input() -> HostInput:
         display_text="请分析财报",
         payload_ref=None,
         payload_digest=None,
+    )
+
+
+def _success_result() -> ToolResultSuccess:
+    """构造测试用工具成功结果。
+
+    :returns: ``ToolResultSuccess``。
+    """
+
+    return ToolResultSuccess(ok=True, value={"accepted": True}, meta=None)
+
+
+def _failure_result() -> ToolResultFailure:
+    """构造测试用工具失败结果。
+
+    :returns: ``ToolResultFailure``。
+    """
+
+    return ToolResultFailure(
+        ok=False,
+        error="provider_failed",
+        message="provider failed",
+        hint=None,
+        meta=None,
+    )
+
+
+def _cancelled_result() -> ToolCancelledOutcome:
+    """构造测试用工具级取消结果。
+
+    :returns: ``ToolCancelledOutcome``。
+    """
+
+    return ToolCancelledOutcome(
+        reason=TOOL_CANCELLED_REASON_TIMEOUT,
+        message="tool timed out",
+        hint=None,
+        meta=None,
+    )
+
+
+def _resolve_wait_request() -> ResolveWaitRequest:
+    """构造测试用 resolve wait 请求。
+
+    :returns: ``ResolveWaitRequest``。
+    """
+
+    return ResolveWaitRequest(
+        context=_call_context(),
+        idempotency_key="resolve-1",
+        outcome=ResolveWaitCompletedOutcome(
+            result=_success_result(),
+            payload_ref=None,
+        ),
+        source=WaitResolutionSource.MANUAL,
+        observed_at=datetime(2026, 5, 16, tzinfo=UTC),
     )
 
 
@@ -371,6 +450,116 @@ def test_event_stream_limit_constants_are_stable() -> None:
     assert HOST_EVENT_STREAM_DEFAULT_LIMIT == 100
     assert HOST_EVENT_STREAM_MAX_LIMIT == 1000
     assert HOST_EVENT_STREAM_DEFAULT_LIMIT <= HOST_EVENT_STREAM_MAX_LIMIT
+
+
+def test_resolve_wait_request_uses_typed_outcome_envelope() -> None:
+    """ResolveWaitRequest 必须使用 typed outcome envelope 而不是 outcome_ref。"""
+
+    request = _resolve_wait_request()
+
+    field_names = {field.name for field in fields(ResolveWaitRequest)}
+    assert "outcome" in field_names
+    assert "outcome_ref" not in field_names
+    assert request.context == _call_context()
+    assert isinstance(request.outcome, ResolveWaitCompletedOutcome)
+    assert request.outcome.result == _success_result()
+    assert request.observed_at.tzinfo is UTC
+
+
+def test_resolve_wait_request_rejects_invalid_idempotency_and_time() -> None:
+    """ResolveWaitRequest 拒绝空幂等键、超长幂等键和非 UTC 观测时间。"""
+
+    with pytest.raises(ValueError, match="idempotency_key"):
+        replace(_resolve_wait_request(), idempotency_key=" ")
+    with pytest.raises(ValueError, match="idempotency_key"):
+        replace(
+            _resolve_wait_request(),
+            idempotency_key="x" * (HOST_WAIT_IDEMPOTENCY_KEY_MAX_LENGTH + 1),
+        )
+    with pytest.raises(ValueError, match="observed_at"):
+        replace(
+            _resolve_wait_request(),
+            observed_at=datetime(2026, 5, 16),
+        )
+    with pytest.raises(ValueError, match="observed_at"):
+        replace(
+            _resolve_wait_request(),
+            observed_at=datetime(
+                2026,
+                5,
+                16,
+                tzinfo=timezone(timedelta(hours=8)),
+            ),
+        )
+
+
+def test_resolve_wait_outcome_envelope_shapes_are_closed() -> None:
+    """等待结果 envelope 必须把 payload ref 与 provider status ref 分流。"""
+
+    payload_ref = HostPayloadRef(
+        payload_ref="payload-1",
+        payload_digest="sha256:" + "0" * 64,
+    )
+    adapter_key = WaitAdapterKey("poll.primary")
+    provider_ref = WaitProviderStatusRef(
+        adapter_key=adapter_key,
+        status_ref="provider-status-1",
+        status_digest="sha256:" + "1" * 64,
+    )
+
+    completed = ResolveWaitCompletedOutcome(
+        result=_success_result(),
+        payload_ref=payload_ref,
+    )
+    failed = ResolveWaitFailedOutcome(
+        result=_failure_result(),
+        payload_ref=payload_ref,
+    )
+    cancelled = ResolveWaitCancelledOutcome(
+        result=_cancelled_result(),
+        payload_ref=payload_ref,
+    )
+    lost = ResolveWaitLostOutcome(
+        reason_code="provider_status_lost",
+        message="provider status is not readable",
+        provider_status_ref=provider_ref,
+    )
+
+    assert completed.payload_ref == payload_ref
+    assert failed.payload_ref == payload_ref
+    assert cancelled.payload_ref == payload_ref
+    assert lost.provider_status_ref == provider_ref
+    assert "provider_status_ref" not in {
+        field.name for field in fields(ResolveWaitCompletedOutcome)
+    }
+    assert "payload_ref" not in {field.name for field in fields(ResolveWaitLostOutcome)}
+
+
+def test_tool_fact_kind_includes_lost_for_wait_resolution() -> None:
+    """ToolRuntime 工具事实类别预留 lost 等待结果终态。"""
+
+    assert ToolFactKind.LOST.value == "lost"
+
+
+def test_wait_ref_validation_rejects_invalid_lengths_and_digest() -> None:
+    """等待相关 public refs 拒绝非法字符、超长文本与非法 digest。"""
+
+    with pytest.raises(ValueError, match="invalid characters"):
+        WaitAdapterKey("bad key")
+    with pytest.raises(ValueError, match="status_ref"):
+        WaitProviderStatusRef(
+            adapter_key=WaitAdapterKey("manual"),
+            status_ref="x" * (HOST_WAIT_PROVIDER_STATUS_REF_MAX_LENGTH + 1),
+            status_digest=None,
+        )
+    with pytest.raises(ValueError, match="status_digest"):
+        WaitProviderStatusRef(
+            adapter_key=WaitAdapterKey("manual"),
+            status_ref="provider-status",
+            status_digest="not-a-digest",
+        )
+    with pytest.raises(ValueError, match="payload_digest"):
+        HostPayloadRef(payload_ref="payload-1", payload_digest="not-a-digest")
 
 
 def test_host_command_handle_options_accept_valid_shape() -> None:

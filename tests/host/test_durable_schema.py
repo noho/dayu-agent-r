@@ -20,6 +20,10 @@ from dayu.host.durable.schema import (
     PHASE3_STATE_TABLES,
     TABLE_EVENT_LOG,
     TABLE_HOST_INSTANCES,
+    TABLE_HOST_WAIT_RECORDS,
+    INDEX_HOST_WAIT_RECORDS_ACTIVE_POLL,
+    INDEX_HOST_WAIT_RECORDS_EXTERNAL_JOB,
+    INDEX_HOST_WAIT_RECORDS_ONE_ACTIVE_PER_RUN,
     TABLE_IDEMPOTENCY_RECORDS,
     TABLE_PAYLOAD_DESCRIPTORS,
     TABLE_SQLITE_PAYLOADS,
@@ -91,8 +95,8 @@ def _pragma_text(connection: sqlite3.Connection, sql: str) -> str:
     return str(row[0])
 
 
-def test_fresh_db_creates_foundation_and_phase5_tables(tmp_path: Path) -> None:
-    """fresh DB bootstrap 创建 foundation 与 Phase 5 state tables 并设置 PRAGMA。"""
+def test_fresh_db_creates_foundation_and_phase7_tables(tmp_path: Path) -> None:
+    """fresh DB bootstrap 创建 foundation 与 Phase 7 state tables 并设置 PRAGMA。"""
 
     options = _options(tmp_path)
     with open_host_durable_store(options) as store:
@@ -100,8 +104,8 @@ def test_fresh_db_creates_foundation_and_phase5_tables(tmp_path: Path) -> None:
         try:
             assert _table_names(connection) == frozenset(HOST_DURABLE_TABLES)
             assert set(PHASE3_STATE_TABLES).issubset(_table_names(connection))
-            assert _pragma_int(connection, "PRAGMA user_version") == 3
-            assert HOST_SCHEMA_VERSION == 3
+            assert _pragma_int(connection, "PRAGMA user_version") == 4
+            assert HOST_SCHEMA_VERSION == 4
             assert _pragma_int(connection, "PRAGMA foreign_keys") == 1
             assert _pragma_text(connection, "PRAGMA journal_mode").lower() == "wal"
             assert _pragma_int(connection, "PRAGMA busy_timeout") == 250
@@ -205,11 +209,37 @@ def test_schema_constraints_are_explicit(tmp_path: Path) -> None:
             connection.close()
 
 
+def test_wait_record_table_and_indexes_are_created(tmp_path: Path) -> None:
+    """fresh schema 创建 wait record table 与 Phase 7 指定索引。"""
+
+    options = _options(tmp_path)
+    with open_host_durable_store(options) as store:
+        connection = store.connect()
+        try:
+            assert TABLE_HOST_WAIT_RECORDS in _table_names(connection)
+            wait_indexes = connection.execute(
+                f"PRAGMA index_list({TABLE_HOST_WAIT_RECORDS})"
+            ).fetchall()
+            wait_index_names = {str(row[1]) for row in wait_indexes}
+            assert INDEX_HOST_WAIT_RECORDS_ONE_ACTIVE_PER_RUN in wait_index_names
+            assert INDEX_HOST_WAIT_RECORDS_ACTIVE_POLL in wait_index_names
+            assert INDEX_HOST_WAIT_RECORDS_EXTERNAL_JOB in wait_index_names
+
+            active_index_row = next(
+                row
+                for row in wait_indexes
+                if str(row[1]) == INDEX_HOST_WAIT_RECORDS_ONE_ACTIVE_PER_RUN
+            )
+            assert int(active_index_row[2]) == 1
+            assert int(active_index_row[4]) == 1
+        finally:
+            connection.close()
+
+
 def test_schema_does_not_create_future_phase_tables(tmp_path: Path) -> None:
-    """Slice 1 bootstrap 不得预创建 Phase 3 之外的 future tables。"""
+    """Slice 1 bootstrap 不得预创建 wait record 之外的 future tables。"""
 
     forbidden_fragments = (
-        "wait",
         "projection",
         "outbox",
         "memory",

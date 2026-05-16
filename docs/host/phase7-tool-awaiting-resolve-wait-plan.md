@@ -510,6 +510,7 @@ Implementation may modify only files listed in the assigned slice. If a slice ne
   - `tests/host/test_public_contracts.py`
   - `tests/host/test_import_boundary.py`
   - `tests/host/test_package_exports.py`
+  - `tests/host/test_public_run_api.py`
   - `tests/host/test_durable_schema.py`
   - `tests/host/test_state_schema.py`
   - `tests/host/test_wait_record_state.py` new.
@@ -566,6 +567,7 @@ Implementation may modify only files listed in the assigned slice. If a slice ne
   - `ResolveWaitRequest` rejects empty idempotency key, naive datetime, non-UTC datetime, invalid lost/provider ref combinations.
   - `ResolveWaitRequest.context` remains required and participates in dataclass construction.
   - `ResolveWaitRequest` no longer has `outcome_ref` in dataclass fields.
+  - Existing `tests/host/test_public_run_api.py` deferred unsupported request construction uses the new typed outcome envelope and UTC-aware `observed_at` without adding old-field compatibility.
   - Lost outcome rejects `payload_ref`; non-lost outcomes reject `provider_status_ref`.
   - Max length validation and DDL CHECK reject overlong `adapter_key`、`snapshot_id`、`external_job_id`、provider status ref and idempotency keys.
   - Public enum/export tests include new outcome/ref types and `RunStartReason.RESUME` codec.

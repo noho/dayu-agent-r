@@ -25,16 +25,19 @@ from dayu.host.durable.schema import (
 )
 from dayu.host.durable.state import (
     DispatchRecordStatus,
+    RunStartReason,
     WorkerKind,
     attempt_row_from_host_row,
     deserialize_dispatch_record_status,
     deserialize_run_status,
+    deserialize_run_start_reason,
     deserialize_worker_kind,
     dispatch_record_row_from_host_row,
     run_row_from_host_row,
     serialize_attempt_status,
     serialize_dispatch_record_status,
     serialize_run_status,
+    serialize_run_start_reason,
     serialize_session_status,
     serialize_worker_kind,
     session_row_from_host_row,
@@ -108,6 +111,18 @@ def test_active_run_partial_unique_index_shape(tmp_path: Path) -> None:
                 assert f"'{status}'" in normalized_sql
         finally:
             connection.close()
+
+
+def test_run_start_reason_resume_codec_round_trips() -> None:
+    """RunStartReason 增加 resume 且 codec 保持封闭 enum。"""
+
+    assert serialize_run_start_reason(RunStartReason.RESUME) == "resume"
+    assert deserialize_run_start_reason("resume") == RunStartReason.RESUME
+    assert {item.name: item.value for item in RunStartReason} == {
+        "INITIAL": "initial",
+        "QUEUE_PROMOTION": "queue_promotion",
+        "RESUME": "resume",
+    }
 
 
 def test_queue_fifo_index_shape(tmp_path: Path) -> None:

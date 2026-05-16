@@ -8,11 +8,19 @@ Session lifecycle、admission、promotion、cancel 或 command path 语义。
 from __future__ import annotations
 
 from dataclasses import dataclass
+from datetime import datetime
 from enum import StrEnum
 from typing import TypeVar
 
 from dayu.host.api import (
     AttemptStatus,
+    HOST_WAIT_EXTERNAL_JOB_ID_MAX_LENGTH,
+    HOST_WAIT_IDEMPOTENCY_KEY_MAX_LENGTH,
+    HOST_WAIT_ID_MAX_LENGTH,
+    HOST_WAIT_RESUME_TOKEN_MAX_LENGTH,
+    HOST_WAIT_SNAPSHOT_ID_MAX_LENGTH,
+    HOST_WAIT_TOOL_CALL_ID_MAX_LENGTH,
+    HOST_WAIT_TOOL_NAME_MAX_LENGTH,
     HostStreamCursor,
     RunSnapshot,
     RunStatus,
@@ -21,7 +29,9 @@ from dayu.host.api import (
     SessionStatus,
     SourceRunRelation,
     TerminalResultSummary,
+    WaitAdapterKey,
 )
+from dayu.host.durable.codec import format_utc_timestamp, parse_utc_timestamp
 from dayu.host.durable._validation import (
     optional_int as _optional_int,
     optional_text as _optional_text,
@@ -37,6 +47,7 @@ from dayu.host.durable.schema import (
     TABLE_HOST_RUNS,
     TABLE_HOST_SESSION_SLOTS,
     TABLE_HOST_SESSIONS,
+    TABLE_HOST_WAIT_RECORDS,
 )
 from dayu.host.durable.transaction import HostRow
 from dayu.host.durable.transaction import HostTransaction
@@ -45,6 +56,38 @@ _StatusT = TypeVar("_StatusT", bound=StrEnum)
 _TERMINAL_RUN_STATUSES = frozenset(
     (RunStatus.SUCCEEDED, RunStatus.FAILED, RunStatus.CANCELLED, RunStatus.LOST)
 )
+_WAIT_RECORD_SELECT_SQL = f"""
+SELECT
+  wait_id,
+  session_id,
+  run_id,
+  attempt_id,
+  execution_id,
+  tool_call_id,
+  tool_name,
+  adapter_key,
+  await_kind,
+  resume_policy,
+  resume_token,
+  snapshot_ref,
+  snapshot_captured_at,
+  snapshot_digest,
+  external_job_id,
+  accept_idempotency_key,
+  resolve_idempotency_key,
+  resolve_semantic_digest,
+  deadline_at,
+  expires_at,
+  status,
+  created_event_id,
+  created_event_sequence,
+  updated_event_id,
+  updated_event_sequence,
+  created_at,
+  updated_at,
+  terminal_at
+FROM {TABLE_HOST_WAIT_RECORDS}
+"""
 
 
 class DispatchRecordStatus(StrEnum):
@@ -73,6 +116,25 @@ class RunStartReason(StrEnum):
 
     INITIAL = "initial"
     QUEUE_PROMOTION = "queue_promotion"
+    RESUME = "resume"
+
+
+class WaitRecordStatus(StrEnum):
+    """Host durable wait record 状态。"""
+
+    WAITING = "waiting"
+    RESOLVED = "resolved"
+    FAILED = "failed"
+    CANCELLED = "cancelled"
+    LOST = "lost"
+
+
+class WaitResumePolicy(StrEnum):
+    """等待恢复策略。"""
+
+    POLL = "poll"
+    CALLBACK = "callback"
+    MANUAL = "manual"
 
 
 class StateMutationStatus(StrEnum):
@@ -241,6 +303,129 @@ class DispatchRecordMutationResult:
     row: DispatchRecordRow | None
 
 
+@dataclass(frozen=True, slots=True)
+class WaitSnapshotRef:
+    """等待接受时捕获的快照引用。
+
+    :param snapshot_id: 快照标识。
+    :param captured_at: 快照采集时间，必须为 UTC aware ``datetime``。
+    :param snapshot_digest: 快照摘要；无摘要时为 ``None``。
+    """
+
+    snapshot_id: str
+    captured_at: datetime
+    snapshot_digest: str | None
+
+    def __post_init__(self) -> None:
+        """校验快照引用字段。
+
+        :returns: ``None``。
+        :raises HostDurableError: 快照 id 为空、超长或时间格式非法时抛出。
+        """
+
+        _require_text_max_length(
+            self.snapshot_id,
+            field_name="snapshot_id",
+            max_length=HOST_WAIT_SNAPSHOT_ID_MAX_LENGTH,
+        )
+        if not isinstance(self.captured_at, datetime):
+            raise HostDurableError("snapshot_captured_at must be datetime")
+        try:
+            format_utc_timestamp(self.captured_at)
+        except ValueError as exc:
+            raise HostDurableError("snapshot_captured_at must be UTC aware") from exc
+        _require_optional_non_empty_text(
+            self.snapshot_digest, field_name="snapshot_digest"
+        )
+
+
+@dataclass(frozen=True, slots=True)
+class ExternalJobRef:
+    """等待适配器可重读的外部 job 引用。
+
+    :param adapter_key: 产生外部 job 引用的 Host 等待适配器键。
+    :param external_job_id: 外部 job 稳定 id。
+    """
+
+    adapter_key: WaitAdapterKey
+    external_job_id: str
+
+    def __post_init__(self) -> None:
+        """校验外部 job 引用。
+
+        :returns: ``None``。
+        :raises HostDurableError: adapter key 类型或外部 id 非法时抛出。
+        """
+
+        if not isinstance(self.adapter_key, WaitAdapterKey):
+            raise HostDurableError("external job adapter_key is invalid")
+        _require_text_max_length(
+            self.external_job_id,
+            field_name="external_job_id",
+            max_length=HOST_WAIT_EXTERNAL_JOB_ID_MAX_LENGTH,
+        )
+
+
+@dataclass(frozen=True, slots=True)
+class WaitRecordRow:
+    """``host_wait_records`` durable row。
+
+    字段保存 Host-owned wait record truth；只保存可重读引用，不保存外部
+    adapter object、provider payload 或业务工具私有状态。
+    """
+
+    wait_id: str
+    session_id: str
+    run_id: str
+    attempt_id: str
+    execution_id: str
+    tool_call_id: str
+    tool_name: str
+    adapter_key: WaitAdapterKey
+    await_kind: str
+    resume_policy: WaitResumePolicy
+    resume_token: str
+    snapshot_ref: WaitSnapshotRef | None
+    external_job_ref: ExternalJobRef | None
+    accept_idempotency_key: str
+    resolve_idempotency_key: str | None
+    resolve_semantic_digest: str | None
+    deadline_at: str | None
+    expires_at: str | None
+    status: WaitRecordStatus
+    created_event_id: str
+    created_event_sequence: int
+    updated_event_id: str
+    updated_event_sequence: int
+    created_at: str
+    updated_at: str
+    terminal_at: str | None
+
+
+@dataclass(frozen=True, slots=True)
+class WaitRecordMutationResult:
+    """单条 wait record CAS mutation 结果。
+
+    :param status: mutation 结果分类。
+    :param row: mutation 后读取到的最新 wait record row；缺失时为 ``None``。
+    """
+
+    status: StateMutationStatus
+    row: WaitRecordRow | None
+
+
+@dataclass(frozen=True, slots=True)
+class WaitRecordsMutationResult:
+    """多条 wait record CAS mutation 结果。
+
+    :param status: mutation 结果分类。
+    :param rows: mutation 后读取到的 wait record rows。
+    """
+
+    status: StateMutationStatus
+    rows: tuple[WaitRecordRow, ...]
+
+
 def serialize_session_status(status: SessionStatus) -> str:
     """序列化公共 Session 状态。
 
@@ -381,6 +566,147 @@ def deserialize_run_start_reason(value: str) -> RunStartReason:
     return _deserialize_str_enum(
         value, enum_type=RunStartReason, enum_name="RunStartReason"
     )
+
+
+def serialize_wait_record_status(status: WaitRecordStatus) -> str:
+    """序列化 wait record 状态。
+
+    :param status: wait record status enum。
+    :returns: schema 中存储的文本值。
+    :raises HostDurableError: ``status`` 不是合法 ``WaitRecordStatus`` 时抛出。
+    """
+
+    return _serialize_str_enum(status, enum_name="WaitRecordStatus")
+
+
+def deserialize_wait_record_status(value: str) -> WaitRecordStatus:
+    """反序列化 wait record 状态。
+
+    :param value: SQLite row 中读取的状态文本。
+    :returns: ``WaitRecordStatus``。
+    :raises HostDurableError: 文本为空或不属于 ``WaitRecordStatus`` 时抛出。
+    """
+
+    return _deserialize_str_enum(
+        value, enum_type=WaitRecordStatus, enum_name="WaitRecordStatus"
+    )
+
+
+def serialize_wait_resume_policy(policy: WaitResumePolicy) -> str:
+    """序列化等待恢复策略。
+
+    :param policy: wait resume policy enum。
+    :returns: schema 中存储的文本值。
+    :raises HostDurableError: ``policy`` 不是合法 ``WaitResumePolicy`` 时抛出。
+    """
+
+    return _serialize_str_enum(policy, enum_name="WaitResumePolicy")
+
+
+def deserialize_wait_resume_policy(value: str) -> WaitResumePolicy:
+    """反序列化等待恢复策略。
+
+    :param value: SQLite row 中读取的恢复策略文本。
+    :returns: ``WaitResumePolicy``。
+    :raises HostDurableError: 文本为空或不属于 ``WaitResumePolicy`` 时抛出。
+    """
+
+    return _deserialize_str_enum(
+        value, enum_type=WaitResumePolicy, enum_name="WaitResumePolicy"
+    )
+
+
+def serialize_wait_snapshot_ref(ref: WaitSnapshotRef | None) -> str | None:
+    """序列化 wait snapshot ref 的 id 列。
+
+    :param ref: wait snapshot ref 或 ``None``。
+    :returns: snapshot id 或 ``None``。
+    """
+
+    if ref is None:
+        return None
+    return ref.snapshot_id
+
+
+def serialize_wait_snapshot_captured_at(ref: WaitSnapshotRef | None) -> str | None:
+    """序列化 wait snapshot ref 的采集时间列。
+
+    :param ref: wait snapshot ref 或 ``None``。
+    :returns: 固定 UTC timestamp 文本或 ``None``。
+    """
+
+    if ref is None:
+        return None
+    return format_utc_timestamp(ref.captured_at)
+
+
+def serialize_wait_snapshot_digest(ref: WaitSnapshotRef | None) -> str | None:
+    """序列化 wait snapshot ref 的摘要列。
+
+    :param ref: wait snapshot ref 或 ``None``。
+    :returns: snapshot digest 或 ``None``。
+    """
+
+    if ref is None:
+        return None
+    return ref.snapshot_digest
+
+
+def deserialize_wait_snapshot_ref(
+    snapshot_id: str | None,
+    captured_at: str | None,
+    snapshot_digest: str | None,
+) -> WaitSnapshotRef | None:
+    """从 SQLite 三列反序列化 wait snapshot ref。
+
+    :param snapshot_id: snapshot id 列。
+    :param captured_at: snapshot 采集时间列。
+    :param snapshot_digest: snapshot digest 列。
+    :returns: ``WaitSnapshotRef`` 或 ``None``。
+    :raises HostDurableError: nullable 字段组合或 timestamp 格式非法时抛出。
+    """
+
+    if snapshot_id is None and captured_at is None and snapshot_digest is None:
+        return None
+    if snapshot_id is None or captured_at is None:
+        raise HostDurableError("snapshot ref columns must be paired")
+    try:
+        parsed = parse_utc_timestamp(captured_at)
+    except ValueError as exc:
+        raise HostDurableError("snapshot_captured_at is invalid") from exc
+    return WaitSnapshotRef(
+        snapshot_id=snapshot_id,
+        captured_at=parsed,
+        snapshot_digest=snapshot_digest,
+    )
+
+
+def serialize_external_job_id(ref: ExternalJobRef | None) -> str | None:
+    """序列化外部 job 引用的 id 列。
+
+    :param ref: 外部 job 引用或 ``None``。
+    :returns: external job id 或 ``None``。
+    """
+
+    if ref is None:
+        return None
+    return ref.external_job_id
+
+
+def deserialize_external_job_ref(
+    adapter_key: WaitAdapterKey, external_job_id: str | None
+) -> ExternalJobRef | None:
+    """从 adapter key 与外部 job id 列反序列化外部 job 引用。
+
+    :param adapter_key: wait record adapter key。
+    :param external_job_id: SQLite external job id 列。
+    :returns: ``ExternalJobRef`` 或 ``None``。
+    :raises HostDurableError: external job id 非法时抛出。
+    """
+
+    if external_job_id is None:
+        return None
+    return ExternalJobRef(adapter_key=adapter_key, external_job_id=external_job_id)
 
 
 def session_row_from_host_row(row: HostRow) -> SessionRow:
@@ -605,6 +931,78 @@ def dispatch_record_row_from_host_row(row: HostRow) -> DispatchRecordRow:
         created_at=_require_text(row.get("created_at"), field_name="created_at"),
         updated_at=_require_text(row.get("updated_at"), field_name="updated_at"),
         cancelled_at=_optional_text(row.get("cancelled_at"), field_name="cancelled_at"),
+    )
+
+
+def wait_record_row_from_host_row(row: HostRow) -> WaitRecordRow:
+    """把通用 HostRow 转换为 WaitRecordRow。
+
+    :param row: ``HostTransaction`` 查询返回的 row。
+    :returns: ``WaitRecordRow``。
+    :raises HostDurableError: row 字段类型、状态 enum 或 typed ref 无效时抛出。
+    """
+
+    adapter_key = _wait_adapter_key_from_text(
+        _require_text(row.get("adapter_key"), field_name="adapter_key")
+    )
+    snapshot_ref = deserialize_wait_snapshot_ref(
+        _optional_text(row.get("snapshot_ref"), field_name="snapshot_ref"),
+        _optional_text(
+            row.get("snapshot_captured_at"), field_name="snapshot_captured_at"
+        ),
+        _optional_text(row.get("snapshot_digest"), field_name="snapshot_digest"),
+    )
+    external_job_ref = deserialize_external_job_ref(
+        adapter_key,
+        _optional_text(row.get("external_job_id"), field_name="external_job_id"),
+    )
+    return WaitRecordRow(
+        wait_id=_require_text(row.get("wait_id"), field_name="wait_id"),
+        session_id=_require_text(row.get("session_id"), field_name="session_id"),
+        run_id=_require_text(row.get("run_id"), field_name="run_id"),
+        attempt_id=_require_text(row.get("attempt_id"), field_name="attempt_id"),
+        execution_id=_require_text(row.get("execution_id"), field_name="execution_id"),
+        tool_call_id=_require_text(row.get("tool_call_id"), field_name="tool_call_id"),
+        tool_name=_require_text(row.get("tool_name"), field_name="tool_name"),
+        adapter_key=adapter_key,
+        await_kind=_require_text(row.get("await_kind"), field_name="await_kind"),
+        resume_policy=deserialize_wait_resume_policy(
+            _require_text(row.get("resume_policy"), field_name="resume_policy")
+        ),
+        resume_token=_require_text(row.get("resume_token"), field_name="resume_token"),
+        snapshot_ref=snapshot_ref,
+        external_job_ref=external_job_ref,
+        accept_idempotency_key=_require_text(
+            row.get("accept_idempotency_key"), field_name="accept_idempotency_key"
+        ),
+        resolve_idempotency_key=_optional_text(
+            row.get("resolve_idempotency_key"),
+            field_name="resolve_idempotency_key",
+        ),
+        resolve_semantic_digest=_optional_text(
+            row.get("resolve_semantic_digest"),
+            field_name="resolve_semantic_digest",
+        ),
+        deadline_at=_optional_text(row.get("deadline_at"), field_name="deadline_at"),
+        expires_at=_optional_text(row.get("expires_at"), field_name="expires_at"),
+        status=deserialize_wait_record_status(
+            _require_text(row.get("status"), field_name="status")
+        ),
+        created_event_id=_require_text(
+            row.get("created_event_id"), field_name="created_event_id"
+        ),
+        created_event_sequence=_require_int(
+            row.get("created_event_sequence"), field_name="created_event_sequence"
+        ),
+        updated_event_id=_require_text(
+            row.get("updated_event_id"), field_name="updated_event_id"
+        ),
+        updated_event_sequence=_require_int(
+            row.get("updated_event_sequence"), field_name="updated_event_sequence"
+        ),
+        created_at=_require_text(row.get("created_at"), field_name="created_at"),
+        updated_at=_require_text(row.get("updated_at"), field_name="updated_at"),
+        terminal_at=_optional_text(row.get("terminal_at"), field_name="terminal_at"),
     )
 
 
@@ -1060,6 +1458,52 @@ def read_dispatch_record_by_id(
     return dispatch_record_row_from_host_row(row)
 
 
+def read_wait_record_by_id(
+    transaction: HostTransaction, wait_id: str
+) -> WaitRecordRow | None:
+    """按 wait id 读取 wait record row。
+
+    :param transaction: 调用方提供的 Host transaction。
+    :param wait_id: wait record id。
+    :returns: 找到时返回 ``WaitRecordRow``，否则返回 ``None``。
+    :raises HostDurableError: ``wait_id`` 为空或 row 字段无效时抛出。
+    :raises sqlite3.Error: SQLite 查询失败时由 transaction runner 结构化转换。
+    """
+
+    _require_non_empty_text(wait_id, field_name="wait_id")
+    row = transaction.fetchone(
+        _WAIT_RECORD_SELECT_SQL + " WHERE wait_id = ?",
+        (wait_id,),
+    )
+    if row is None:
+        return None
+    return wait_record_row_from_host_row(row)
+
+
+def read_active_wait_records_for_run(
+    transaction: HostTransaction, run_id: str
+) -> tuple[WaitRecordRow, ...]:
+    """读取 Run 下仍处于 waiting 的 wait records。
+
+    :param transaction: 调用方提供的 Host transaction。
+    :param run_id: Run id。
+    :returns: active wait record 元组，按创建事件序号升序排列。
+    :raises HostDurableError: ``run_id`` 为空或 row 字段无效时抛出。
+    :raises sqlite3.Error: SQLite 查询失败时由 transaction runner 结构化转换。
+    """
+
+    _require_non_empty_text(run_id, field_name="run_id")
+    rows = transaction.fetchall(
+        _WAIT_RECORD_SELECT_SQL
+        + """
+        WHERE run_id = ? AND status = ?
+        ORDER BY created_event_sequence ASC, wait_id ASC
+        """,
+        (run_id, serialize_wait_record_status(WaitRecordStatus.WAITING)),
+    )
+    return tuple(wait_record_row_from_host_row(row) for row in rows)
+
+
 def insert_session(
     transaction: HostTransaction, session: SessionRow
 ) -> None:
@@ -1404,6 +1848,305 @@ def insert_dispatch_record(
             dispatch_record.updated_at,
             dispatch_record.cancelled_at,
         ),
+    )
+
+
+def insert_wait_record(transaction: HostTransaction, row: WaitRecordRow) -> None:
+    """插入 wait record row。
+
+    :param transaction: 调用方提供的 Host transaction。
+    :param row: 待插入的 wait record row。
+    :returns: ``None``。
+    :raises HostDurableError: row 字段无效时抛出。
+    :raises sqlite3.Error: SQLite 写入失败时由 transaction runner 结构化转换。
+    """
+
+    _validate_wait_record_for_insert(row)
+    transaction.execute(
+        f"""
+        INSERT INTO {TABLE_HOST_WAIT_RECORDS} (
+          wait_id,
+          session_id,
+          run_id,
+          attempt_id,
+          execution_id,
+          tool_call_id,
+          tool_name,
+          adapter_key,
+          await_kind,
+          resume_policy,
+          resume_token,
+          snapshot_ref,
+          snapshot_captured_at,
+          snapshot_digest,
+          external_job_id,
+          accept_idempotency_key,
+          resolve_idempotency_key,
+          resolve_semantic_digest,
+          deadline_at,
+          expires_at,
+          status,
+          created_event_id,
+          created_event_sequence,
+          updated_event_id,
+          updated_event_sequence,
+          created_at,
+          updated_at,
+          terminal_at
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        """,
+        (
+            row.wait_id,
+            row.session_id,
+            row.run_id,
+            row.attempt_id,
+            row.execution_id,
+            row.tool_call_id,
+            row.tool_name,
+            row.adapter_key.value,
+            row.await_kind,
+            serialize_wait_resume_policy(row.resume_policy),
+            row.resume_token,
+            serialize_wait_snapshot_ref(row.snapshot_ref),
+            serialize_wait_snapshot_captured_at(row.snapshot_ref),
+            serialize_wait_snapshot_digest(row.snapshot_ref),
+            serialize_external_job_id(row.external_job_ref),
+            row.accept_idempotency_key,
+            row.resolve_idempotency_key,
+            row.resolve_semantic_digest,
+            row.deadline_at,
+            row.expires_at,
+            serialize_wait_record_status(row.status),
+            row.created_event_id,
+            row.created_event_sequence,
+            row.updated_event_id,
+            row.updated_event_sequence,
+            row.created_at,
+            row.updated_at,
+            row.terminal_at,
+        ),
+    )
+
+
+def mark_wait_record_resolved_row(
+    transaction: HostTransaction,
+    *,
+    wait_id: str,
+    resolve_idempotency_key: str,
+    resolve_semantic_digest: str,
+    updated_event_id: str,
+    updated_event_sequence: int,
+    updated_at: str,
+    terminal_at: str,
+) -> WaitRecordMutationResult:
+    """CAS 标记 waiting wait record 为 resolved。
+
+    :param transaction: 调用方提供的 Host transaction。
+    :param wait_id: wait record id。
+    :param resolve_idempotency_key: resolve wait 幂等键。
+    :param resolve_semantic_digest: resolve wait 语义 digest。
+    :param updated_event_id: 更新该 wait record 的事件 id。
+    :param updated_event_sequence: 更新事件全局序号。
+    :param updated_at: 固定 UTC 更新时间文本。
+    :param terminal_at: 固定 UTC 终态时间文本。
+    :returns: wait record mutation 结果。
+    :raises HostDurableError: 输入字段无效时抛出。
+    """
+
+    return _mark_wait_record_terminal_row(
+        transaction,
+        wait_id=wait_id,
+        status=WaitRecordStatus.RESOLVED,
+        resolve_idempotency_key=resolve_idempotency_key,
+        resolve_semantic_digest=resolve_semantic_digest,
+        updated_event_id=updated_event_id,
+        updated_event_sequence=updated_event_sequence,
+        updated_at=updated_at,
+        terminal_at=terminal_at,
+    )
+
+
+def mark_wait_record_failed_row(
+    transaction: HostTransaction,
+    *,
+    wait_id: str,
+    resolve_idempotency_key: str,
+    resolve_semantic_digest: str,
+    updated_event_id: str,
+    updated_event_sequence: int,
+    updated_at: str,
+    terminal_at: str,
+) -> WaitRecordMutationResult:
+    """CAS 标记 waiting wait record 为 failed。
+
+    :param transaction: 调用方提供的 Host transaction。
+    :param wait_id: wait record id。
+    :param resolve_idempotency_key: resolve wait 幂等键。
+    :param resolve_semantic_digest: resolve wait 语义 digest。
+    :param updated_event_id: 更新该 wait record 的事件 id。
+    :param updated_event_sequence: 更新事件全局序号。
+    :param updated_at: 固定 UTC 更新时间文本。
+    :param terminal_at: 固定 UTC 终态时间文本。
+    :returns: wait record mutation 结果。
+    :raises HostDurableError: 输入字段无效时抛出。
+    """
+
+    return _mark_wait_record_terminal_row(
+        transaction,
+        wait_id=wait_id,
+        status=WaitRecordStatus.FAILED,
+        resolve_idempotency_key=resolve_idempotency_key,
+        resolve_semantic_digest=resolve_semantic_digest,
+        updated_event_id=updated_event_id,
+        updated_event_sequence=updated_event_sequence,
+        updated_at=updated_at,
+        terminal_at=terminal_at,
+    )
+
+
+def mark_wait_record_cancelled_row(
+    transaction: HostTransaction,
+    *,
+    wait_id: str,
+    updated_event_id: str,
+    updated_event_sequence: int,
+    updated_at: str,
+    terminal_at: str,
+) -> WaitRecordMutationResult:
+    """CAS 标记 waiting wait record 为 cancelled。
+
+    :param transaction: 调用方提供的 Host transaction。
+    :param wait_id: wait record id。
+    :param updated_event_id: 更新该 wait record 的事件 id。
+    :param updated_event_sequence: 更新事件全局序号。
+    :param updated_at: 固定 UTC 更新时间文本。
+    :param terminal_at: 固定 UTC 终态时间文本。
+    :returns: wait record mutation 结果。
+    :raises HostDurableError: 输入字段无效时抛出。
+    """
+
+    return _mark_wait_record_terminal_row(
+        transaction,
+        wait_id=wait_id,
+        status=WaitRecordStatus.CANCELLED,
+        resolve_idempotency_key=None,
+        resolve_semantic_digest=None,
+        updated_event_id=updated_event_id,
+        updated_event_sequence=updated_event_sequence,
+        updated_at=updated_at,
+        terminal_at=terminal_at,
+    )
+
+
+def mark_wait_record_lost_row(
+    transaction: HostTransaction,
+    *,
+    wait_id: str,
+    resolve_idempotency_key: str,
+    resolve_semantic_digest: str,
+    updated_event_id: str,
+    updated_event_sequence: int,
+    updated_at: str,
+    terminal_at: str,
+) -> WaitRecordMutationResult:
+    """CAS 标记 waiting wait record 为 lost。
+
+    :param transaction: 调用方提供的 Host transaction。
+    :param wait_id: wait record id。
+    :param resolve_idempotency_key: resolve wait 幂等键。
+    :param resolve_semantic_digest: resolve wait 语义 digest。
+    :param updated_event_id: 更新该 wait record 的事件 id。
+    :param updated_event_sequence: 更新事件全局序号。
+    :param updated_at: 固定 UTC 更新时间文本。
+    :param terminal_at: 固定 UTC 终态时间文本。
+    :returns: wait record mutation 结果。
+    :raises HostDurableError: 输入字段无效时抛出。
+    """
+
+    return _mark_wait_record_terminal_row(
+        transaction,
+        wait_id=wait_id,
+        status=WaitRecordStatus.LOST,
+        resolve_idempotency_key=resolve_idempotency_key,
+        resolve_semantic_digest=resolve_semantic_digest,
+        updated_event_id=updated_event_id,
+        updated_event_sequence=updated_event_sequence,
+        updated_at=updated_at,
+        terminal_at=terminal_at,
+    )
+
+
+def cancel_active_wait_records_for_run(
+    transaction: HostTransaction,
+    *,
+    run_id: str,
+    updated_event_id: str,
+    updated_event_sequence: int,
+    updated_at: str,
+    terminal_at: str,
+) -> WaitRecordsMutationResult:
+    """CAS 取消 Run 下全部 active wait records。
+
+    :param transaction: 调用方提供的 Host transaction。
+    :param run_id: Run id。
+    :param updated_event_id: 更新 wait records 的事件 id。
+    :param updated_event_sequence: 更新事件全局序号。
+    :param updated_at: 固定 UTC 更新时间文本。
+    :param terminal_at: 固定 UTC 终态时间文本。
+    :returns: 多条 wait record mutation 结果。
+    :raises HostDurableError: 输入字段无效时抛出。
+    """
+
+    _require_non_empty_text(run_id, field_name="run_id")
+    _validate_wait_batch_terminal_update(
+        updated_event_id=updated_event_id,
+        updated_event_sequence=updated_event_sequence,
+        updated_at=updated_at,
+        terminal_at=terminal_at,
+    )
+    before_rows = read_active_wait_records_for_run(transaction, run_id)
+    if not before_rows:
+        existing = _read_wait_record_count_for_run(transaction, run_id)
+        status = (
+            StateMutationStatus.INVALID_STATE
+            if existing > 0
+            else StateMutationStatus.NOT_FOUND
+        )
+        return WaitRecordsMutationResult(status=status, rows=())
+    result = transaction.execute(
+        f"""
+        UPDATE {TABLE_HOST_WAIT_RECORDS}
+        SET
+          status = ?,
+          updated_event_id = ?,
+          updated_event_sequence = ?,
+          updated_at = ?,
+          terminal_at = ?
+        WHERE run_id = ? AND status = ?
+        """,
+        (
+            serialize_wait_record_status(WaitRecordStatus.CANCELLED),
+            updated_event_id,
+            updated_event_sequence,
+            updated_at,
+            terminal_at,
+            run_id,
+            serialize_wait_record_status(WaitRecordStatus.WAITING),
+        ),
+    )
+    rows = _read_terminal_wait_records_for_run(
+        transaction,
+        run_id=run_id,
+        updated_event_id=updated_event_id,
+        updated_event_sequence=updated_event_sequence,
+    )
+    if result.rowcount == len(before_rows):
+        return WaitRecordsMutationResult(
+            status=StateMutationStatus.UPDATED, rows=rows
+        )
+    return WaitRecordsMutationResult(
+        status=StateMutationStatus.CAS_LOST,
+        rows=read_active_wait_records_for_run(transaction, run_id),
     )
 
 
@@ -3136,6 +3879,351 @@ def _optional_source_run_relation_text(
     return relation.value
 
 
+def _wait_adapter_key_from_text(value: str) -> WaitAdapterKey:
+    """从 durable 文本构造 ``WaitAdapterKey``。
+
+    :param value: SQLite 中保存的 adapter key 文本。
+    :returns: ``WaitAdapterKey``。
+    :raises HostDurableError: adapter key 文本非法时抛出。
+    """
+
+    try:
+        return WaitAdapterKey(value)
+    except ValueError as exc:
+        raise HostDurableError("wait adapter_key is invalid") from exc
+
+
+def _validate_wait_record_for_insert(row: WaitRecordRow) -> None:
+    """校验待插入 wait record row。
+
+    :param row: 待校验 wait record row。
+    :returns: ``None``。
+    :raises HostDurableError: 任一字段违反 wait record 约束时抛出。
+    """
+
+    _require_text_max_length(
+        row.wait_id, field_name="wait_id", max_length=HOST_WAIT_ID_MAX_LENGTH
+    )
+    _require_non_empty_text(row.session_id, field_name="session_id")
+    _require_non_empty_text(row.run_id, field_name="run_id")
+    _require_non_empty_text(row.attempt_id, field_name="attempt_id")
+    _require_non_empty_text(row.execution_id, field_name="execution_id")
+    _require_text_max_length(
+        row.tool_call_id,
+        field_name="tool_call_id",
+        max_length=HOST_WAIT_TOOL_CALL_ID_MAX_LENGTH,
+    )
+    _require_text_max_length(
+        row.tool_name,
+        field_name="tool_name",
+        max_length=HOST_WAIT_TOOL_NAME_MAX_LENGTH,
+    )
+    if not isinstance(row.adapter_key, WaitAdapterKey):
+        raise HostDurableError("wait adapter_key is invalid")
+    _require_non_empty_text(row.await_kind, field_name="await_kind")
+    if not isinstance(row.resume_policy, WaitResumePolicy):
+        raise HostDurableError("wait resume_policy is invalid")
+    _require_text_max_length(
+        row.resume_token,
+        field_name="resume_token",
+        max_length=HOST_WAIT_RESUME_TOKEN_MAX_LENGTH,
+    )
+    if row.snapshot_ref is not None and not isinstance(
+        row.snapshot_ref, WaitSnapshotRef
+    ):
+        raise HostDurableError("wait snapshot_ref is invalid")
+    _validate_wait_external_job_ref(row)
+    _require_text_max_length(
+        row.accept_idempotency_key,
+        field_name="accept_idempotency_key",
+        max_length=HOST_WAIT_IDEMPOTENCY_KEY_MAX_LENGTH,
+    )
+    _validate_wait_resolution_refs(row)
+    _require_optional_non_empty_text(row.deadline_at, field_name="deadline_at")
+    _require_optional_non_empty_text(row.expires_at, field_name="expires_at")
+    if not isinstance(row.status, WaitRecordStatus):
+        raise HostDurableError("wait status is invalid")
+    _require_non_empty_text(row.created_event_id, field_name="created_event_id")
+    _require_positive_sequence(
+        row.created_event_sequence, "created_event_sequence"
+    )
+    _require_non_empty_text(row.updated_event_id, field_name="updated_event_id")
+    _require_positive_sequence(
+        row.updated_event_sequence, "updated_event_sequence"
+    )
+    _require_non_empty_text(row.created_at, field_name="created_at")
+    _require_non_empty_text(row.updated_at, field_name="updated_at")
+    _require_optional_non_empty_text(row.terminal_at, field_name="terminal_at")
+    if row.status == WaitRecordStatus.WAITING and row.terminal_at is not None:
+        raise HostDurableError("waiting wait record terminal_at must be unset")
+    if row.status != WaitRecordStatus.WAITING and row.terminal_at is None:
+        raise HostDurableError("terminal wait record requires terminal_at")
+
+
+def _validate_wait_external_job_ref(row: WaitRecordRow) -> None:
+    """校验 wait record 外部 job ref 与 adapter key 一致。
+
+    :param row: 待校验 wait record row。
+    :returns: ``None``。
+    :raises HostDurableError: 外部 job 引用类型或 adapter key 不一致时抛出。
+    """
+
+    if row.external_job_ref is None:
+        return
+    if not isinstance(row.external_job_ref, ExternalJobRef):
+        raise HostDurableError("wait external_job_ref is invalid")
+    if row.external_job_ref.adapter_key != row.adapter_key:
+        raise HostDurableError("external_job_ref adapter_key must match wait row")
+
+
+def _validate_wait_resolution_refs(row: WaitRecordRow) -> None:
+    """校验 wait record resolve 幂等字段组合。
+
+    :param row: 待校验 wait record row。
+    :returns: ``None``。
+    :raises HostDurableError: resolve 字段未成对或状态组合非法时抛出。
+    """
+
+    _require_optional_text_max_length(
+        row.resolve_idempotency_key,
+        field_name="resolve_idempotency_key",
+        max_length=HOST_WAIT_IDEMPOTENCY_KEY_MAX_LENGTH,
+    )
+    _require_optional_non_empty_text(
+        row.resolve_semantic_digest, field_name="resolve_semantic_digest"
+    )
+    if (row.resolve_idempotency_key is None) != (
+        row.resolve_semantic_digest is None
+    ):
+        raise HostDurableError("wait resolve fields must be paired")
+    if row.status in (
+        WaitRecordStatus.RESOLVED,
+        WaitRecordStatus.FAILED,
+        WaitRecordStatus.LOST,
+    ) and row.resolve_idempotency_key is None:
+        raise HostDurableError("resolved, failed or lost wait requires resolve refs")
+    if row.status in (
+        WaitRecordStatus.WAITING,
+        WaitRecordStatus.CANCELLED,
+    ) and row.resolve_idempotency_key is not None:
+        raise HostDurableError("waiting or cancelled wait must not carry resolve refs")
+
+
+def _mark_wait_record_terminal_row(
+    transaction: HostTransaction,
+    *,
+    wait_id: str,
+    status: WaitRecordStatus,
+    resolve_idempotency_key: str | None,
+    resolve_semantic_digest: str | None,
+    updated_event_id: str,
+    updated_event_sequence: int,
+    updated_at: str,
+    terminal_at: str,
+) -> WaitRecordMutationResult:
+    """CAS 标记单条 wait record 为终态。
+
+    :param transaction: 调用方提供的 Host transaction。
+    :param wait_id: wait record id。
+    :param status: 目标终态。
+    :param resolve_idempotency_key: resolve 幂等键；取消路径为 ``None``。
+    :param resolve_semantic_digest: resolve 语义 digest；取消路径为 ``None``。
+    :param updated_event_id: 更新事件 id。
+    :param updated_event_sequence: 更新事件序号。
+    :param updated_at: 更新时间文本。
+    :param terminal_at: 终态时间文本。
+    :returns: wait record mutation 结果。
+    :raises HostDurableError: 输入字段无效时抛出。
+    """
+
+    _validate_wait_terminal_update(
+        wait_id=wait_id,
+        updated_event_id=updated_event_id,
+        updated_event_sequence=updated_event_sequence,
+        updated_at=updated_at,
+        terminal_at=terminal_at,
+        resolve_idempotency_key=resolve_idempotency_key,
+        resolve_semantic_digest=resolve_semantic_digest,
+    )
+    if not isinstance(status, WaitRecordStatus) or status == WaitRecordStatus.WAITING:
+        raise HostDurableError("wait terminal status is invalid")
+    result = transaction.execute(
+        f"""
+        UPDATE {TABLE_HOST_WAIT_RECORDS}
+        SET
+          status = ?,
+          resolve_idempotency_key = ?,
+          resolve_semantic_digest = ?,
+          updated_event_id = ?,
+          updated_event_sequence = ?,
+          updated_at = ?,
+          terminal_at = ?
+        WHERE wait_id = ? AND status = ?
+        """,
+        (
+            serialize_wait_record_status(status),
+            resolve_idempotency_key,
+            resolve_semantic_digest,
+            updated_event_id,
+            updated_event_sequence,
+            updated_at,
+            terminal_at,
+            wait_id,
+            serialize_wait_record_status(WaitRecordStatus.WAITING),
+        ),
+    )
+    return _wait_record_mutation_result(
+        transaction, wait_id=wait_id, rowcount=result.rowcount
+    )
+
+
+def _validate_wait_terminal_update(
+    *,
+    wait_id: str,
+    updated_event_id: str,
+    updated_event_sequence: int,
+    updated_at: str,
+    terminal_at: str,
+    resolve_idempotency_key: str | None,
+    resolve_semantic_digest: str | None,
+) -> None:
+    """校验 wait record 终态更新字段。
+
+    :param wait_id: wait record id。
+    :param updated_event_id: 更新事件 id。
+    :param updated_event_sequence: 更新事件序号。
+    :param updated_at: 更新时间文本。
+    :param terminal_at: 终态时间文本。
+    :param resolve_idempotency_key: resolve 幂等键或 ``None``。
+    :param resolve_semantic_digest: resolve 语义 digest 或 ``None``。
+    :returns: ``None``。
+    :raises HostDurableError: 任一字段无效时抛出。
+    """
+
+    _require_text_max_length(
+        wait_id, field_name="wait_id", max_length=HOST_WAIT_ID_MAX_LENGTH
+    )
+    _require_optional_text_max_length(
+        resolve_idempotency_key,
+        field_name="resolve_idempotency_key",
+        max_length=HOST_WAIT_IDEMPOTENCY_KEY_MAX_LENGTH,
+    )
+    _require_optional_non_empty_text(
+        resolve_semantic_digest, field_name="resolve_semantic_digest"
+    )
+    if (resolve_idempotency_key is None) != (resolve_semantic_digest is None):
+        raise HostDurableError("wait resolve fields must be paired")
+    _require_non_empty_text(updated_event_id, field_name="updated_event_id")
+    _require_positive_sequence(updated_event_sequence, "updated_event_sequence")
+    _require_non_empty_text(updated_at, field_name="updated_at")
+    _require_non_empty_text(terminal_at, field_name="terminal_at")
+
+
+def _validate_wait_batch_terminal_update(
+    *,
+    updated_event_id: str,
+    updated_event_sequence: int,
+    updated_at: str,
+    terminal_at: str,
+) -> None:
+    """校验批量 wait record 终态更新字段。
+
+    :param updated_event_id: 更新事件 id。
+    :param updated_event_sequence: 更新事件序号。
+    :param updated_at: 更新时间文本。
+    :param terminal_at: 终态时间文本。
+    :returns: ``None``。
+    :raises HostDurableError: 任一字段无效时抛出。
+    """
+
+    _require_non_empty_text(updated_event_id, field_name="updated_event_id")
+    _require_positive_sequence(updated_event_sequence, "updated_event_sequence")
+    _require_non_empty_text(updated_at, field_name="updated_at")
+    _require_non_empty_text(terminal_at, field_name="terminal_at")
+
+
+def _wait_record_mutation_result(
+    transaction: HostTransaction, *, wait_id: str, rowcount: int
+) -> WaitRecordMutationResult:
+    """构造单条 wait record mutation 结果。
+
+    :param transaction: 调用方提供的 Host transaction。
+    :param wait_id: wait record id。
+    :param rowcount: UPDATE rowcount。
+    :returns: wait record mutation 结果。
+    """
+
+    latest = read_wait_record_by_id(transaction, wait_id)
+    if rowcount == 1:
+        return WaitRecordMutationResult(
+            status=StateMutationStatus.UPDATED, row=latest
+        )
+    if latest is None:
+        return WaitRecordMutationResult(
+            status=StateMutationStatus.NOT_FOUND, row=None
+        )
+    if latest.status == WaitRecordStatus.WAITING:
+        return WaitRecordMutationResult(
+            status=StateMutationStatus.CAS_LOST, row=latest
+        )
+    return WaitRecordMutationResult(
+        status=StateMutationStatus.INVALID_STATE, row=latest
+    )
+
+
+def _read_wait_record_count_for_run(
+    transaction: HostTransaction, run_id: str
+) -> int:
+    """读取 Run 下 wait record 总数。
+
+    :param transaction: 调用方提供的 Host transaction。
+    :param run_id: Run id。
+    :returns: wait record 数量。
+    :raises HostDurableError: row 字段无效时抛出。
+    """
+
+    row = transaction.fetchone(
+        f"""
+        SELECT COUNT(*) AS count
+        FROM {TABLE_HOST_WAIT_RECORDS}
+        WHERE run_id = ?
+        """,
+        (run_id,),
+    )
+    if row is None:
+        raise HostDurableError("wait record count is unreadable")
+    return _require_int(row.get("count"), field_name="count")
+
+
+def _read_terminal_wait_records_for_run(
+    transaction: HostTransaction,
+    *,
+    run_id: str,
+    updated_event_id: str,
+    updated_event_sequence: int,
+) -> tuple[WaitRecordRow, ...]:
+    """读取本次批量终态更新写入的 wait records。
+
+    :param transaction: 调用方提供的 Host transaction。
+    :param run_id: Run id。
+    :param updated_event_id: 更新事件 id。
+    :param updated_event_sequence: 更新事件序号。
+    :returns: wait record row 元组。
+    """
+
+    rows = transaction.fetchall(
+        _WAIT_RECORD_SELECT_SQL
+        + """
+        WHERE run_id = ?
+          AND updated_event_id = ?
+          AND updated_event_sequence = ?
+        ORDER BY created_event_sequence ASC, wait_id ASC
+        """,
+        (run_id, updated_event_id, updated_event_sequence),
+    )
+    return tuple(wait_record_row_from_host_row(row) for row in rows)
+
+
 def _require_positive_sequence(value: int, field_name: str) -> None:
     """校验事件序号为正整数。
 
@@ -3162,6 +4250,41 @@ def _require_optional_positive_sequence(
 
     if value is not None:
         _require_positive_sequence(value, field_name)
+
+
+def _require_text_max_length(
+    value: str, *, field_name: str, max_length: int
+) -> None:
+    """校验必填文本非空且不超过长度上限。
+
+    :param value: 待校验文本。
+    :param field_name: 字段名。
+    :param max_length: 最大字符数。
+    :returns: ``None``。
+    :raises HostDurableError: 文本为空或超长时抛出。
+    """
+
+    _require_non_empty_text(value, field_name=field_name)
+    if len(value) > max_length:
+        raise HostDurableError(f"{field_name} length must be <= {max_length}")
+
+
+def _require_optional_text_max_length(
+    value: str | None, *, field_name: str, max_length: int
+) -> None:
+    """校验 optional 文本存在时非空且不超过长度上限。
+
+    :param value: 待校验文本或 ``None``。
+    :param field_name: 字段名。
+    :param max_length: 最大字符数。
+    :returns: ``None``。
+    :raises HostDurableError: 文本存在但为空或超长时抛出。
+    """
+
+    if value is not None:
+        _require_text_max_length(
+            value, field_name=field_name, max_length=max_length
+        )
 
 
 def _is_terminal_run_status(status: RunStatus) -> bool:

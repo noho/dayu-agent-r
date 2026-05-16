@@ -9,9 +9,19 @@ from __future__ import annotations
 
 import sqlite3
 
+from dayu.host.api import (
+    HOST_WAIT_ADAPTER_KEY_MAX_LENGTH,
+    HOST_WAIT_EXTERNAL_JOB_ID_MAX_LENGTH,
+    HOST_WAIT_IDEMPOTENCY_KEY_MAX_LENGTH,
+    HOST_WAIT_ID_MAX_LENGTH,
+    HOST_WAIT_RESUME_TOKEN_MAX_LENGTH,
+    HOST_WAIT_SNAPSHOT_ID_MAX_LENGTH,
+    HOST_WAIT_TOOL_CALL_ID_MAX_LENGTH,
+    HOST_WAIT_TOOL_NAME_MAX_LENGTH,
+)
 from dayu.host.durable.errors import HostSchemaMismatchError
 
-HOST_SCHEMA_VERSION = 3
+HOST_SCHEMA_VERSION = 4
 """当前 Host durable SQLite schema version。"""
 
 TABLE_EVENT_LOG = "event_log"
@@ -24,10 +34,16 @@ TABLE_HOST_SESSION_SLOTS = "host_session_slots"
 TABLE_HOST_RUNS = "host_runs"
 TABLE_HOST_ATTEMPTS = "host_attempts"
 TABLE_HOST_ATTEMPT_DISPATCH_RECORDS = "host_attempt_dispatch_records"
+TABLE_HOST_WAIT_RECORDS = "host_wait_records"
 
 INDEX_HOST_RUNS_ONE_ACTIVE_PER_SESSION = "host_runs_one_active_per_session"
 INDEX_HOST_RUNS_QUEUE_FIFO = "host_runs_queue_fifo"
 INDEX_HOST_RUNS_SESSION_STATUS = "host_runs_session_status"
+INDEX_HOST_WAIT_RECORDS_ONE_ACTIVE_PER_RUN = (
+    "host_wait_records_one_active_per_run"
+)
+INDEX_HOST_WAIT_RECORDS_ACTIVE_POLL = "host_wait_records_active_poll"
+INDEX_HOST_WAIT_RECORDS_EXTERNAL_JOB = "host_wait_records_external_job"
 
 FOUNDATION_TABLES: tuple[str, ...] = (
     TABLE_EVENT_LOG,
@@ -44,6 +60,7 @@ PHASE3_STATE_TABLES: tuple[str, ...] = (
     TABLE_HOST_RUNS,
     TABLE_HOST_ATTEMPTS,
     TABLE_HOST_ATTEMPT_DISPATCH_RECORDS,
+    TABLE_HOST_WAIT_RECORDS,
 )
 """Phase 3 Session / Run / Attempt durable state table 名称集合。"""
 
@@ -439,6 +456,92 @@ CREATE TABLE IF NOT EXISTS {TABLE_HOST_ATTEMPT_DISPATCH_RECORDS} (
 )
 """
 
+_HOST_WAIT_RECORDS_DDL = f"""
+CREATE TABLE IF NOT EXISTS {TABLE_HOST_WAIT_RECORDS} (
+  wait_id TEXT PRIMARY KEY CHECK (
+    length(wait_id) BETWEEN 1 AND {HOST_WAIT_ID_MAX_LENGTH}
+  ),
+  session_id TEXT NOT NULL,
+  run_id TEXT NOT NULL,
+  attempt_id TEXT NOT NULL,
+  execution_id TEXT NOT NULL,
+  tool_call_id TEXT NOT NULL CHECK (
+    length(tool_call_id) BETWEEN 1 AND {HOST_WAIT_TOOL_CALL_ID_MAX_LENGTH}
+  ),
+  tool_name TEXT NOT NULL CHECK (
+    length(tool_name) BETWEEN 1 AND {HOST_WAIT_TOOL_NAME_MAX_LENGTH}
+  ),
+  adapter_key TEXT NOT NULL CHECK (
+    length(adapter_key) BETWEEN 1 AND {HOST_WAIT_ADAPTER_KEY_MAX_LENGTH}
+  ),
+  await_kind TEXT NOT NULL,
+  resume_policy TEXT NOT NULL CHECK (
+    resume_policy IN ('poll', 'callback', 'manual')
+  ),
+  resume_token TEXT NOT NULL CHECK (
+    length(resume_token) BETWEEN 1 AND {HOST_WAIT_RESUME_TOKEN_MAX_LENGTH}
+  ),
+  snapshot_ref TEXT NULL CHECK (
+    snapshot_ref IS NULL
+      OR length(snapshot_ref) BETWEEN 1 AND {HOST_WAIT_SNAPSHOT_ID_MAX_LENGTH}
+  ),
+  snapshot_captured_at TEXT NULL,
+  snapshot_digest TEXT NULL,
+  external_job_id TEXT NULL CHECK (
+    external_job_id IS NULL
+      OR length(external_job_id) BETWEEN 1 AND {HOST_WAIT_EXTERNAL_JOB_ID_MAX_LENGTH}
+  ),
+  accept_idempotency_key TEXT NOT NULL CHECK (
+    length(accept_idempotency_key)
+      BETWEEN 1 AND {HOST_WAIT_IDEMPOTENCY_KEY_MAX_LENGTH}
+  ),
+  resolve_idempotency_key TEXT NULL CHECK (
+    resolve_idempotency_key IS NULL
+      OR length(resolve_idempotency_key)
+        BETWEEN 1 AND {HOST_WAIT_IDEMPOTENCY_KEY_MAX_LENGTH}
+  ),
+  resolve_semantic_digest TEXT NULL,
+  deadline_at TEXT NULL,
+  expires_at TEXT NULL,
+  status TEXT NOT NULL CHECK (
+    status IN ('waiting', 'resolved', 'failed', 'cancelled', 'lost')
+  ),
+  created_event_id TEXT NOT NULL,
+  created_event_sequence INTEGER NOT NULL,
+  updated_event_id TEXT NOT NULL,
+  updated_event_sequence INTEGER NOT NULL,
+  created_at TEXT NOT NULL,
+  updated_at TEXT NOT NULL,
+  terminal_at TEXT NULL,
+  FOREIGN KEY(session_id) REFERENCES {TABLE_HOST_SESSIONS}(session_id),
+  FOREIGN KEY(run_id) REFERENCES {TABLE_HOST_RUNS}(run_id),
+  FOREIGN KEY(attempt_id) REFERENCES {TABLE_HOST_ATTEMPTS}(attempt_id),
+  FOREIGN KEY(execution_id) REFERENCES {TABLE_HOST_ATTEMPTS}(execution_id),
+  FOREIGN KEY(created_event_id) REFERENCES {TABLE_EVENT_LOG}(event_id),
+  FOREIGN KEY(created_event_sequence) REFERENCES {TABLE_EVENT_LOG}(event_sequence),
+  FOREIGN KEY(updated_event_id) REFERENCES {TABLE_EVENT_LOG}(event_id),
+  FOREIGN KEY(updated_event_sequence) REFERENCES {TABLE_EVENT_LOG}(event_sequence),
+  CHECK (
+    (snapshot_ref IS NULL
+      AND snapshot_captured_at IS NULL
+      AND snapshot_digest IS NULL)
+    OR
+    (snapshot_ref IS NOT NULL AND snapshot_captured_at IS NOT NULL)
+  ),
+  CHECK (
+    (status = 'waiting' AND terminal_at IS NULL)
+    OR
+    (status IN ('resolved', 'failed', 'cancelled', 'lost')
+      AND terminal_at IS NOT NULL)
+  ),
+  CHECK (
+    (resolve_idempotency_key IS NULL AND resolve_semantic_digest IS NULL)
+    OR
+    (resolve_idempotency_key IS NOT NULL AND resolve_semantic_digest IS NOT NULL)
+  )
+)
+"""
+
 _HOST_RUNS_ONE_ACTIVE_PER_SESSION_INDEX_DDL = f"""
 CREATE UNIQUE INDEX IF NOT EXISTS {INDEX_HOST_RUNS_ONE_ACTIVE_PER_SESSION}
 ON {TABLE_HOST_RUNS}(session_id)
@@ -456,6 +559,23 @@ CREATE INDEX IF NOT EXISTS {INDEX_HOST_RUNS_SESSION_STATUS}
 ON {TABLE_HOST_RUNS}(session_id, status, accepted_event_sequence)
 """
 
+_HOST_WAIT_RECORDS_ONE_ACTIVE_PER_RUN_INDEX_DDL = f"""
+CREATE UNIQUE INDEX IF NOT EXISTS {INDEX_HOST_WAIT_RECORDS_ONE_ACTIVE_PER_RUN}
+ON {TABLE_HOST_WAIT_RECORDS}(run_id)
+WHERE status = 'waiting'
+"""
+
+_HOST_WAIT_RECORDS_ACTIVE_POLL_INDEX_DDL = f"""
+CREATE INDEX IF NOT EXISTS {INDEX_HOST_WAIT_RECORDS_ACTIVE_POLL}
+ON {TABLE_HOST_WAIT_RECORDS}(resume_policy, status, deadline_at, expires_at)
+"""
+
+_HOST_WAIT_RECORDS_EXTERNAL_JOB_INDEX_DDL = f"""
+CREATE INDEX IF NOT EXISTS {INDEX_HOST_WAIT_RECORDS_EXTERNAL_JOB}
+ON {TABLE_HOST_WAIT_RECORDS}(adapter_key, external_job_id)
+WHERE external_job_id IS NOT NULL
+"""
+
 FOUNDATION_DDL: tuple[str, ...] = (
     _SQLITE_PAYLOADS_DDL,
     _PAYLOAD_DESCRIPTORS_DDL,
@@ -471,6 +591,7 @@ PHASE3_STATE_DDL: tuple[str, ...] = (
     _HOST_RUNS_DDL,
     _HOST_ATTEMPTS_DDL,
     _HOST_ATTEMPT_DISPATCH_RECORDS_DDL,
+    _HOST_WAIT_RECORDS_DDL,
 )
 """按外键依赖顺序排列的 Phase 3 state table DDL。"""
 
@@ -478,6 +599,9 @@ PHASE3_INDEX_DDL: tuple[str, ...] = (
     _HOST_RUNS_ONE_ACTIVE_PER_SESSION_INDEX_DDL,
     _HOST_RUNS_QUEUE_FIFO_INDEX_DDL,
     _HOST_RUNS_SESSION_STATUS_INDEX_DDL,
+    _HOST_WAIT_RECORDS_ONE_ACTIVE_PER_RUN_INDEX_DDL,
+    _HOST_WAIT_RECORDS_ACTIVE_POLL_INDEX_DDL,
+    _HOST_WAIT_RECORDS_EXTERNAL_JOB_INDEX_DDL,
 )
 """Phase 3 state table index DDL。"""
 

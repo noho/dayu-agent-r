@@ -10,13 +10,17 @@ dispatch、policy provider 或 Engine 调用路径。`HostLocalExecutionOptions`
 from __future__ import annotations
 
 import pathlib
+import re
 from collections.abc import AsyncIterator
 from dataclasses import dataclass
+from datetime import UTC, datetime
 from enum import StrEnum
 from typing import Protocol, TypeAlias
 
 from dayu.contracts.cancellation import CancellationToken
 from dayu.contracts.json_value import JsonValue
+from dayu.contracts.tool_outcome import ToolCancelledOutcome
+from dayu.contracts.tool_result import ToolResultFailure, ToolResultSuccess
 from dayu.engine.contracts.agent_policy import AgentPolicy
 from dayu.engine.contracts.agent_run import AgentRunRequest
 from dayu.engine.contracts.engine_events import EngineEvent
@@ -32,6 +36,18 @@ from dayu.host.tooling import HostToolingOptions as _HostToolingOptions
 
 HOST_EVENT_STREAM_DEFAULT_LIMIT = 100
 HOST_EVENT_STREAM_MAX_LIMIT = 1000
+HOST_WAIT_ID_MAX_LENGTH = 128
+HOST_WAIT_ADAPTER_KEY_MAX_LENGTH = 128
+HOST_WAIT_TOOL_CALL_ID_MAX_LENGTH = 256
+HOST_WAIT_TOOL_NAME_MAX_LENGTH = 128
+HOST_WAIT_RESUME_TOKEN_MAX_LENGTH = 2048
+HOST_WAIT_SNAPSHOT_ID_MAX_LENGTH = 256
+HOST_WAIT_EXTERNAL_JOB_ID_MAX_LENGTH = 512
+HOST_WAIT_PROVIDER_STATUS_REF_MAX_LENGTH = 512
+HOST_WAIT_IDEMPOTENCY_KEY_MAX_LENGTH = 256
+
+_WAIT_ADAPTER_KEY_PATTERN = re.compile(r"^[A-Za-z0-9_.:-]+$")
+_SHA256_DIGEST_PATTERN = re.compile(r"^sha256:[0-9a-f]{64}$")
 
 
 def _require_non_negative(value: int, *, field_name: str) -> None:
@@ -119,6 +135,81 @@ def _require_bool(value: bool, *, field_name: str) -> None:
 
     if not isinstance(value, bool):
         raise TypeError(f"{field_name} must be bool")
+
+
+def _require_max_length(value: str, *, field_name: str, max_length: int) -> None:
+    """校验必填字符串非空且不超过长度上限。
+
+    :param value: 待校验字符串。
+    :param field_name: 错误消息中使用的字段名。
+    :param max_length: 允许的最大字符数。
+    :returns: 无返回值。
+    :raises ValueError: 字符串为空或超过长度上限时抛出。
+    """
+
+    _require_non_empty(value, field_name=field_name)
+    if len(value) > max_length:
+        raise ValueError(f"{field_name} length must be <= {max_length}")
+
+
+def _require_optional_max_length(
+    value: str | None, *, field_name: str, max_length: int
+) -> None:
+    """校验可选字符串存在时非空且不超过长度上限。
+
+    :param value: 待校验字符串或 ``None``。
+    :param field_name: 错误消息中使用的字段名。
+    :param max_length: 允许的最大字符数。
+    :returns: 无返回值。
+    :raises ValueError: 字符串存在但为空或超过长度上限时抛出。
+    """
+
+    if value is not None:
+        _require_max_length(value, field_name=field_name, max_length=max_length)
+
+
+def _require_sha256_digest(value: str, *, field_name: str) -> None:
+    """校验字符串为 Host 标准 sha256 digest。
+
+    :param value: 待校验 digest。
+    :param field_name: 错误消息中使用的字段名。
+    :returns: 无返回值。
+    :raises ValueError: digest 格式无效时抛出。
+    """
+
+    if _SHA256_DIGEST_PATTERN.fullmatch(value) is None:
+        raise ValueError(f"{field_name} must be a sha256 digest")
+
+
+def _require_optional_sha256_digest(
+    value: str | None, *, field_name: str
+) -> None:
+    """校验可选字符串存在时为 Host 标准 sha256 digest。
+
+    :param value: 待校验 digest 或 ``None``。
+    :param field_name: 错误消息中使用的字段名。
+    :returns: 无返回值。
+    :raises ValueError: digest 格式无效时抛出。
+    """
+
+    if value is not None:
+        _require_sha256_digest(value, field_name=field_name)
+
+
+def _require_utc_datetime(value: datetime, *, field_name: str) -> None:
+    """校验时间为 timezone-aware UTC ``datetime``。
+
+    :param value: 待校验时间。
+    :param field_name: 错误消息中使用的字段名。
+    :returns: 无返回值。
+    :raises TypeError: ``value`` 不是 ``datetime`` 时抛出。
+    :raises ValueError: ``value`` 是 naive 或非 UTC 时间时抛出。
+    """
+
+    if not isinstance(value, datetime):
+        raise TypeError(f"{field_name} must be datetime")
+    if value.tzinfo is None or value.utcoffset() != UTC.utcoffset(None):
+        raise ValueError(f"{field_name} must be timezone.utc aware")
 
 
 def _require_metadata_entries(
@@ -226,6 +317,215 @@ class WaitResolutionSource(StrEnum):
     POLL = "poll"
     CALLBACK = "callback"
     MANUAL = "manual"
+
+
+@dataclass(frozen=True, slots=True)
+class WaitAdapterKey:
+    """Host 等待适配器稳定注册键。
+
+    :param value: 适配器注册键，只允许 ASCII 字母、数字、下划线、点、冒号与连字符。
+    """
+
+    value: str
+
+    def __post_init__(self) -> None:
+        """校验适配器键格式与长度。
+
+        :returns: 无返回值。
+        :raises ValueError: ``value`` 为空、超长或含非法字符时抛出。
+        """
+
+        _require_max_length(
+            self.value,
+            field_name="WaitAdapterKey.value",
+            max_length=HOST_WAIT_ADAPTER_KEY_MAX_LENGTH,
+        )
+        if _WAIT_ADAPTER_KEY_PATTERN.fullmatch(self.value) is None:
+            raise ValueError("WaitAdapterKey.value contains invalid characters")
+
+
+@dataclass(frozen=True, slots=True)
+class HostPayloadRef:
+    """Host payload descriptor 引用。
+
+    :param payload_ref: payload descriptor 标识。
+    :param payload_digest: payload 内容 digest。
+    """
+
+    payload_ref: str
+    payload_digest: str
+
+    def __post_init__(self) -> None:
+        """校验 payload 引用字段。
+
+        :returns: 无返回值。
+        :raises ValueError: 引用为空或 digest 非法时抛出。
+        """
+
+        _require_non_empty(self.payload_ref, field_name="HostPayloadRef.payload_ref")
+        _require_sha256_digest(
+            self.payload_digest, field_name="HostPayloadRef.payload_digest"
+        )
+
+
+@dataclass(frozen=True, slots=True)
+class WaitProviderStatusRef:
+    """等待适配器可重读 provider 状态引用。
+
+    :param adapter_key: 产生该状态引用的 Host 等待适配器键。
+    :param status_ref: provider 状态引用，不承载 provider payload。
+    :param status_digest: provider 状态摘要；无摘要时为 ``None``。
+    """
+
+    adapter_key: WaitAdapterKey
+    status_ref: str
+    status_digest: str | None
+
+    def __post_init__(self) -> None:
+        """校验 provider 状态引用。
+
+        :returns: 无返回值。
+        :raises TypeError: ``adapter_key`` 类型非法时抛出。
+        :raises ValueError: ``status_ref`` 为空、超长或 digest 非法时抛出。
+        """
+
+        if not isinstance(self.adapter_key, WaitAdapterKey):
+            raise TypeError("WaitProviderStatusRef.adapter_key must be WaitAdapterKey")
+        _require_max_length(
+            self.status_ref,
+            field_name="WaitProviderStatusRef.status_ref",
+            max_length=HOST_WAIT_PROVIDER_STATUS_REF_MAX_LENGTH,
+        )
+        _require_optional_sha256_digest(
+            self.status_digest, field_name="WaitProviderStatusRef.status_digest"
+        )
+
+
+@dataclass(frozen=True, slots=True)
+class ResolveWaitCompletedOutcome:
+    """等待完成后返回工具成功结果的 envelope。
+
+    :param result: 工具成功结果。
+    :param payload_ref: 可选 Host payload descriptor 引用。
+    """
+
+    result: ToolResultSuccess
+    payload_ref: HostPayloadRef | None
+
+    def __post_init__(self) -> None:
+        """校验成功结果 envelope。
+
+        :returns: 无返回值。
+        :raises TypeError: ``result`` 或 ``payload_ref`` 类型非法时抛出。
+        """
+
+        if not isinstance(self.result, ToolResultSuccess):
+            raise TypeError("ResolveWaitCompletedOutcome.result must be ToolResultSuccess")
+        if self.payload_ref is not None and not isinstance(
+            self.payload_ref, HostPayloadRef
+        ):
+            raise TypeError(
+                "ResolveWaitCompletedOutcome.payload_ref must be HostPayloadRef"
+            )
+
+
+@dataclass(frozen=True, slots=True)
+class ResolveWaitFailedOutcome:
+    """等待完成后返回工具失败结果的 envelope。
+
+    :param result: 工具失败结果。
+    :param payload_ref: 可选 Host payload descriptor 引用。
+    """
+
+    result: ToolResultFailure
+    payload_ref: HostPayloadRef | None
+
+    def __post_init__(self) -> None:
+        """校验失败结果 envelope。
+
+        :returns: 无返回值。
+        :raises TypeError: ``result`` 或 ``payload_ref`` 类型非法时抛出。
+        """
+
+        if not isinstance(self.result, ToolResultFailure):
+            raise TypeError("ResolveWaitFailedOutcome.result must be ToolResultFailure")
+        if self.payload_ref is not None and not isinstance(
+            self.payload_ref, HostPayloadRef
+        ):
+            raise TypeError("ResolveWaitFailedOutcome.payload_ref must be HostPayloadRef")
+
+
+@dataclass(frozen=True, slots=True)
+class ResolveWaitCancelledOutcome:
+    """等待完成后返回工具级取消结果的 envelope。
+
+    :param result: 工具级取消结果。
+    :param payload_ref: 可选 Host payload descriptor 引用。
+    """
+
+    result: ToolCancelledOutcome
+    payload_ref: HostPayloadRef | None
+
+    def __post_init__(self) -> None:
+        """校验工具级取消 envelope。
+
+        :returns: 无返回值。
+        :raises TypeError: ``result`` 或 ``payload_ref`` 类型非法时抛出。
+        """
+
+        if not isinstance(self.result, ToolCancelledOutcome):
+            raise TypeError(
+                "ResolveWaitCancelledOutcome.result must be ToolCancelledOutcome"
+            )
+        if self.payload_ref is not None and not isinstance(
+            self.payload_ref, HostPayloadRef
+        ):
+            raise TypeError(
+                "ResolveWaitCancelledOutcome.payload_ref must be HostPayloadRef"
+            )
+
+
+@dataclass(frozen=True, slots=True)
+class ResolveWaitLostOutcome:
+    """等待适配器报告无法确认外部 job 状态的 envelope。
+
+    :param reason_code: 机器可读 lost 原因码。
+    :param message: 人类可读说明。
+    :param provider_status_ref: 可选 provider 状态引用。
+    """
+
+    reason_code: str
+    message: str
+    provider_status_ref: WaitProviderStatusRef | None
+
+    def __post_init__(self) -> None:
+        """校验 lost outcome 字段。
+
+        :returns: 无返回值。
+        :raises TypeError: ``provider_status_ref`` 类型非法时抛出。
+        :raises ValueError: 原因或说明为空时抛出。
+        """
+
+        _require_non_empty(
+            self.reason_code, field_name="ResolveWaitLostOutcome.reason_code"
+        )
+        _require_non_empty(self.message, field_name="ResolveWaitLostOutcome.message")
+        if self.provider_status_ref is not None and not isinstance(
+            self.provider_status_ref, WaitProviderStatusRef
+        ):
+            raise TypeError(
+                "ResolveWaitLostOutcome.provider_status_ref must be "
+                "WaitProviderStatusRef"
+            )
+
+
+ResolveWaitOutcome: TypeAlias = (
+    ResolveWaitCompletedOutcome
+    | ResolveWaitFailedOutcome
+    | ResolveWaitCancelledOutcome
+    | ResolveWaitLostOutcome
+)
+"""``resolve_wait`` 接收的等待结果封闭联合。"""
 
 
 class SourceRunRelation(StrEnum):
@@ -1238,32 +1538,43 @@ class ResolveWaitRequest:
 
     - ``context``：调用上下文。
     - ``idempotency_key``：等待结果接收幂等键。
-    - ``outcome_ref``：等待结果引用。
+    - ``outcome``：强类型等待结果 envelope。
     - ``source``：等待结果来源。
-    - ``observed_at``：结果观测时间字符串。
+    - ``observed_at``：UTC aware 结果观测时间。
     """
 
     context: HostCallContext
     idempotency_key: str
-    outcome_ref: str
+    outcome: ResolveWaitOutcome
     source: WaitResolutionSource
-    observed_at: str
+    observed_at: datetime
 
     def __post_init__(self) -> None:
         """校验 resolve wait 请求字段。
 
         :returns: 无返回值。
-        :raises ValueError: 幂等键、结果引用或观测时间为空时抛出。
+        :raises TypeError: ``outcome`` 或 ``observed_at`` 类型非法时抛出。
+        :raises ValueError: 幂等键为空、超长或观测时间不是 UTC 时抛出。
         """
 
-        _require_non_empty(
+        _require_max_length(
             self.idempotency_key,
             field_name="ResolveWaitRequest.idempotency_key",
+            max_length=HOST_WAIT_IDEMPOTENCY_KEY_MAX_LENGTH,
         )
-        _require_non_empty(
-            self.outcome_ref, field_name="ResolveWaitRequest.outcome_ref"
-        )
-        _require_non_empty(
+        if not isinstance(
+            self.outcome,
+            (
+                ResolveWaitCompletedOutcome,
+                ResolveWaitFailedOutcome,
+                ResolveWaitCancelledOutcome,
+                ResolveWaitLostOutcome,
+            ),
+        ):
+            raise TypeError("ResolveWaitRequest.outcome must be ResolveWaitOutcome")
+        if not isinstance(self.source, WaitResolutionSource):
+            raise TypeError("ResolveWaitRequest.source must be WaitResolutionSource")
+        _require_utc_datetime(
             self.observed_at, field_name="ResolveWaitRequest.observed_at"
         )
 
@@ -1653,6 +1964,15 @@ __all__ = [
     "FollowupSnapshot",
     "HOST_EVENT_STREAM_DEFAULT_LIMIT",
     "HOST_EVENT_STREAM_MAX_LIMIT",
+    "HOST_WAIT_ADAPTER_KEY_MAX_LENGTH",
+    "HOST_WAIT_EXTERNAL_JOB_ID_MAX_LENGTH",
+    "HOST_WAIT_IDEMPOTENCY_KEY_MAX_LENGTH",
+    "HOST_WAIT_ID_MAX_LENGTH",
+    "HOST_WAIT_PROVIDER_STATUS_REF_MAX_LENGTH",
+    "HOST_WAIT_RESUME_TOKEN_MAX_LENGTH",
+    "HOST_WAIT_SNAPSHOT_ID_MAX_LENGTH",
+    "HOST_WAIT_TOOL_CALL_ID_MAX_LENGTH",
+    "HOST_WAIT_TOOL_NAME_MAX_LENGTH",
     "HostApiError",
     "HostApiErrorCode",
     "HostApiErrorDetail",
@@ -1664,6 +1984,7 @@ __all__ = [
     "HostEventView",
     "HostInput",
     "HostMetadataEntry",
+    "HostPayloadRef",
     "HostStreamCursor",
     "LocalEngineWorker",
     "LocalEngineWorkerFactory",
@@ -1673,6 +1994,11 @@ __all__ = [
     "PurgeSessionRequest",
     "PurgeSessionResult",
     "ReplayRunRequest",
+    "ResolveWaitCancelledOutcome",
+    "ResolveWaitCompletedOutcome",
+    "ResolveWaitFailedOutcome",
+    "ResolveWaitLostOutcome",
+    "ResolveWaitOutcome",
     "ResolveWaitRequest",
     "RetryRunRequest",
     "RunSnapshot",
@@ -1685,5 +2011,7 @@ __all__ = [
     "SteerConflictDetail",
     "SubmitFollowupRequest",
     "TerminalResultSummary",
+    "WaitAdapterKey",
+    "WaitProviderStatusRef",
     "WaitResolutionSource",
 ]

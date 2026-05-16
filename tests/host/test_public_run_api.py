@@ -4,10 +4,12 @@ from __future__ import annotations
 
 import sqlite3
 from concurrent.futures import ThreadPoolExecutor
+from datetime import UTC, datetime
 from pathlib import Path
 
 import pytest
 
+from dayu.contracts.tool_result import ToolResultSuccess
 from dayu.host import (
     AuthorizationClaim,
     CancelMode,
@@ -22,6 +24,7 @@ from dayu.host import (
     OperationContext,
     PurgeSessionRequest,
     ReplayRunRequest,
+    ResolveWaitCompletedOutcome,
     ResolveWaitRequest,
     RetryRunRequest,
     RunStatus,
@@ -596,9 +599,16 @@ def test_deferred_public_functions_are_stable_unsupported_without_writes(
                 ResolveWaitRequest(
                     context=_context(),
                     idempotency_key="resolve-1",
-                    outcome_ref="outcome-1",
+                    outcome=ResolveWaitCompletedOutcome(
+                        result=ToolResultSuccess(
+                            ok=True,
+                            value={"resolved": True},
+                            meta=None,
+                        ),
+                        payload_ref=None,
+                    ),
                     source=WaitResolutionSource.MANUAL,
-                    observed_at="2026-05-14T00:00:00.000000Z",
+                    observed_at=datetime(2026, 5, 14, tzinfo=UTC),
                 ),
             )
         with pytest.raises(HostApiError) as purge_exc:

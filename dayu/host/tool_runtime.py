@@ -51,7 +51,7 @@ from dayu.contracts.tool_schema import (
     ToolTruncateSpec,
     ToolTruncationStrategy,
 )
-from dayu.host.api import AttemptStatus, RunStatus
+from dayu.host.api import AttemptStatus, HostPayloadRef, RunStatus
 from dayu.host.durable.codec import is_sha256_digest, sha256_digest_json
 from dayu.host.durable.errors import (
     HostDurableError,
@@ -181,6 +181,7 @@ class ToolFactKind(StrEnum):
     COMPLETED = "completed"
     FAILED = "failed"
     CANCELLED = "cancelled"
+    LOST = "lost"
     REUSE = "reuse"
     GOVERNED_ERROR = "governed_error"
 
@@ -244,28 +245,6 @@ class HostEventRef:
         _require_non_empty_text(self.event_id, field_name="event_id")
         if self.event_sequence <= 0:
             raise ValueError("event_sequence must be positive")
-
-
-@dataclass(frozen=True, slots=True)
-class HostPayloadRef:
-    """Host payload descriptor 引用。
-
-    :param payload_ref: payload descriptor 标识。
-    :param payload_digest: payload 内容 digest。
-    """
-
-    payload_ref: str
-    payload_digest: str
-
-    def __post_init__(self) -> None:
-        """校验 payload 引用字段。
-
-        :returns: ``None``。
-        :raises ValueError: 引用为空或 digest 非法时抛出。
-        """
-
-        _require_non_empty_text(self.payload_ref, field_name="payload_ref")
-        _require_sha256_digest(self.payload_digest, field_name="payload_digest")
 
 
 @dataclass(frozen=True, slots=True)
