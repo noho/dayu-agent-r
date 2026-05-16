@@ -398,7 +398,35 @@ F2 `WaitPollLost` 测试缺口为当前 PR fix，fix artifact 为
 无回归。Fix validation：`pytest tests/host/test_wait_awaiting_accept.py tests/host/test_wait_adapter_polling.py tests/host/test_resolve_wait_command.py -q`
 15 passed、`pytest tests/host -q` 391 passed、`python -m pyright dayu/ tests/ utils/` 0 errors、`git diff --check`
 clean。F3 cross-test helper import coupling deferred 到后续 tests cleanup；F4-F8 低/信息性 hardening 建议均 deferred。
-PR 56 当前 gate 状态为 draft-PR-pass / draft review-ready；是否转 ready-for-review 仍需用户额外授权。
+PR 56 deepreview / fix / re-review gate 已完成并通过。
+
+P1-P7 design conformance follow-up fix gate：Controller adjudication artifact
+`docs/reviews/p1-p7-design-conformance-controller-adjudication-20260516.md` 接受 blocking finding
+C-P1P7-001：P7 awaiting production wiring 未接入 `HostDispatchScheduler`。当前 fix gate 在分支
+`fix/host-p1-p7-awaiting-production-wiring` 修复该 production wiring：`HostToolingOptions` 承载 construction-scope
+`wait_adapter_registry`，`HostDispatchScheduler` 在 tool-enabled production path 构造 `ToolRuntimeBuildRequest` 时注入
+`DefaultHostToolAwaitingAcceptPort` 与该 registry；adapter object 仍不进入 per-run request 或 durable wait row。Fix artifact 为
+`docs/reviews/p1-p7-design-conformance-fix-awaiting-production-wiring-20260516.md`。验证结果以该 artifact 为准；本 fix
+不实现 callback endpoint、poller 后台循环、recovery scan、remote worker 或 external job physical cancel。
+Controller fix adjudication artifact 为
+`docs/reviews/p1-p7-design-conformance-fix-controller-adjudication-20260516.md`，MiMo / DS fix re-review 均 PASS；
+本地 accepted fix checkpoint commit 为 `d03e064`。
+随后用户明确决定 `fetch_more` cursor 只存在内存，其它 review findings 改按当前 `docs/host/design.md` 的设计目标与最佳实践裁决。
+Controller decision artifact 为 `docs/reviews/p1-p7-design-goals-controller-decision-20260516.md`，Codex fix artifact 为
+`docs/reviews/p1-p7-design-goals-fix-codex-20260516.md`，MiMo / DS fix review artifact 为
+`docs/reviews/p1-p7-design-goals-fix-review-mimo-20260516.md` 与
+`docs/reviews/p1-p7-design-goals-fix-review-ds-20260516.md`，final adjudication artifact 为
+`docs/reviews/p1-p7-design-goals-fix-controller-adjudication-20260516.md`。本地 accepted design-goals fix checkpoint commit 为
+`86bcc5a`。随后用户要求按 `$gateflow` 对当前仓库执行双路全仓 deepreview，AgentMiMo 与 AgentDS review artifacts 为
+`docs/reviews/repo-review-20260516-1557.md` 与 `docs/reviews/repo-review-20260516-1551.md`；controller adjudication artifact 为
+`docs/reviews/gateflow-deepreview-controller-adjudication-20260516-1619.md`。Controller 接受 DS-1、DS-2、DS-4、DS-5、
+DS-6、DS-18 与 MiMo-2，AgentCodex fix artifact 为
+`docs/reviews/gateflow-deepreview-fix-agentcodex-20260516.md`，MiMo / DS fix re-review artifacts 为
+`docs/reviews/gateflow-deepreview-fix-re-review-mimo-20260516.md` 与
+`docs/reviews/gateflow-deepreview-fix-re-review-ds-20260516.md`；两路 re-review 均 PASS。验证为
+`pytest tests/contracts/test_tool_schema.py tests/contracts/test_tool_declaration.py tests/host/test_durable_transaction.py tests/host/test_engine_ingest_mapping.py tests/host/test_toolruntime_executor.py tests/host/test_toolruntime_truncation_fetch_more.py tests/host/test_phase6_toolruntime_integration.py`
+69 passed、`python -m pyright` 0 errors、`git diff --check` clean。本地 accepted deepreview checkpoint commit 为
+`52bba89`。Phase 7 状态为 completed。
 
 ## Phase Map
 
@@ -1636,7 +1664,10 @@ Phase 按依赖关系推进：先实现被其它阶段依赖的公共契约、ru
 
 - `accept_worker_running_in_transaction` 诊断 payload 弱于 scheduler 生产路径；owner 为 Host durable transition hardening。
 - `mark_dispatching_after_lane_row` 底层 helper 能力宽于生产 scheduler 路径；owner 为 Host durable API tightening。
-- `DEFAULT_ACTIVE_WORKER_REGISTRY` module-level singleton 的多 handle cancel 边界风险；owner 为 Host dispatch lifecycle hardening。
+- active worker registry composition root 边界已由
+  `docs/reviews/p1-p7-design-goals-fix-codex-20260516.md` 关闭：模块级
+  `DEFAULT_ACTIVE_WORKER_REGISTRY` / `cancel_active_worker()` 已移除，command handle 与 scheduler 默认各自创建 fresh
+  registry，需要 active cancel 传播时由 production composition root 显式传同一个 `ActiveWorkerRegistry`。
 - terminal closeout 后 queue promotion wakeup failure 的诊断 / 抑制策略；owner 为 Host dispatch lifecycle hardening。
 - active cancel watchdog、stuck `CANCELLING` 与 orphan recovery；owner 为 Phase 11. Host Lifecycle / Recovery / Multi-process Hardening。
 - RemoteProxy 语义与远端迟到事件治理；owner 为 Phase 14. RemoteProxy / RemoteStub。
@@ -2026,7 +2057,7 @@ RunInputBuilder / local dispatch / local proxy / Engine ingest / cancel、跨 ph
 blocking 设计偏离；PR 54 不需要进入新的 fix gate，仍为 draft review-ready。Non-blocking hardening / cleanup 均已有 owner：
 `accept_worker_running_in_transaction` 诊断 payload 弱于 scheduler 生产路径归 Host durable transition hardening；
 `mark_dispatching_after_lane_row` 底层 helper 能力宽于生产 scheduler 路径归 Host durable API tightening；
-`DEFAULT_ACTIVE_WORKER_REGISTRY` module-level singleton 的多 handle cancel 边界风险归 Host dispatch lifecycle hardening；compact
+active worker registry composition root 边界已由 P1-P7 design-goals fix 关闭；compact
 artifact message slot 与 plan 摘要顺序不完全一致归 Phase 10 / RunInputBuilder documentation cleanup。其它 residual risk 维持既有
 owner：terminal promotion wakeup failure 归 Host dispatch lifecycle hardening，active cancel watchdog / stuck `CANCELLING` /
 orphan recovery 归 Phase 11，RemoteProxy 归 Phase 14，ToolRuntime / `fetch_more` 归 Phase 6，WAITING / `resolve_wait` 归

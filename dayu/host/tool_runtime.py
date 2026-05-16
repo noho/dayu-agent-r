@@ -14,6 +14,7 @@ from __future__ import annotations
 import asyncio
 import base64
 import secrets
+import time
 from collections.abc import Mapping
 from dataclasses import dataclass, field, replace
 from datetime import UTC, datetime, timedelta
@@ -84,6 +85,13 @@ from dayu.host.durable.state import (
     read_run_by_id,
 )
 from dayu.host.durable.transaction import HostTransaction, HostTransactionRunner
+from dayu.runtime.cancellation import (
+    WaitCancelled,
+    WaitCompleted,
+    WaitTimedOut,
+    await_or_cancel,
+    await_or_cancel_or_timeout,
+)
 from dayu.host.tooling import (
     FrameworkToolName,
     FrameworkToolPolicyView,
@@ -134,6 +142,8 @@ _TOOL_RUNTIME_UNSUPPORTED_AWAITING_REASON = "unsupported_awaiting"
 _TOOL_RUNTIME_AWAITING_BINDING_REASON = "awaiting_adapter_not_configured"
 _TOOL_RUNTIME_AWAITING_EXTERNAL_JOB_REASON = "awaiting_external_job_missing"
 _TOOL_RUNTIME_AWAITING_BATCH_SUSPENDED_REASON = "run_suspended_by_tool_awaiting"
+_TOOL_RUNTIME_CANCELLED_REASON = "tool_runtime_cancelled"
+_TOOL_RUNTIME_TIMEOUT_REASON = "tool_runtime_timeout"
 _TOOL_RUNTIME_ACCEPT_TIMEOUT_REASON = "accept_timeout"
 _TOOL_RUNTIME_ACCEPT_REJECTED_REASON = "accept_rejected"
 _TOOL_RUNTIME_ACCEPT_EXCEPTION_REASON = "accept_ack_lost"
@@ -164,6 +174,8 @@ _TRUNCATION_CURSOR_USED_REASON = "cursor_already_used"
 _TRUNCATION_REMAINDER_DIGEST_REASON = "remainder_digest_mismatch"
 _TRUNCATION_INVALID_REQUEST_REASON = "invalid_fetch_more_request"
 _DEFAULT_TRUNCATION_TTL_SECONDS = 600
+_TRUNCATION_EXPIRED_CLEANUP_LIMIT = 64
+_TRUNCATION_EXPIRED_CLEANUP_SCAN_LIMIT = 256
 _MIN_TRUNCATION_LIMIT = 1
 _TEXT_CHARS_LIMIT_KEY = "max_chars"
 _TEXT_LINES_LIMIT_KEY = "max_lines"
@@ -1357,22 +1369,27 @@ class TruncationManager:
 
         cursor = self._cursors.get(request.cursor)
         if cursor is None:
+            self._cleanup_expired_cursors(datetime.now(UTC))
             return _truncation_failure(
                 _TRUNCATION_CURSOR_MISSING_REASON,
                 "truncation cursor is missing or no longer available",
             )
         validation_failure = self._validate_cursor(cursor, request, context)
         if validation_failure is not None:
+            if datetime.now(UTC) > cursor.expires_at:
+                self._cursors.pop(cursor.cursor_id, None)
+            self._cleanup_expired_cursors(datetime.now(UTC))
             return validation_failure
         fetched = _fetch_more_value(cursor.remaining_ref, request.limit)
         if fetched is None:
+            self._cleanup_expired_cursors(datetime.now(UTC))
             return _truncation_failure(
                 _TRUNCATION_REMAINDER_DIGEST_REASON,
                 "truncation remainder digest mismatch",
             )
-        now = datetime.now(UTC)
         if cursor.single_use:
-            self._cursors[cursor.cursor_id] = replace(cursor, used_at=now)
+            self._cursors.pop(cursor.cursor_id, None)
+        self._cleanup_expired_cursors(datetime.now(UTC))
         return ToolCompletedOutcome(
             result=ToolResultSuccess(ok=True, value=fetched, meta=None)
         )
@@ -1397,6 +1414,7 @@ class TruncationManager:
         """
 
         now = datetime.now(UTC)
+        self._cleanup_expired_cursors(now)
         ttl = ttl_seconds if ttl_seconds is not None else _DEFAULT_TRUNCATION_TTL_SECONDS
         scope_token = secrets.token_urlsafe(32)
         cursor_id = f"trunc-{secrets.token_urlsafe(24)}"
@@ -1417,6 +1435,27 @@ class TruncationManager:
         )
         self._cursors[cursor.cursor_id] = cursor
         return cursor, scope_token
+
+    def _cleanup_expired_cursors(self, now: datetime) -> None:
+        """有界清理已过期 cursor。
+
+        :param now: 当前 UTC 时间。
+        :returns: ``None``。
+        """
+
+        scanned_count = 0
+        expired_cursor_ids: list[str] = []
+        for cursor_id, cursor in self._cursors.items():
+            if (
+                scanned_count >= _TRUNCATION_EXPIRED_CLEANUP_SCAN_LIMIT
+                or len(expired_cursor_ids) >= _TRUNCATION_EXPIRED_CLEANUP_LIMIT
+            ):
+                break
+            scanned_count += 1
+            if now > cursor.expires_at:
+                expired_cursor_ids.append(cursor_id)
+        for cursor_id in expired_cursor_ids:
+            self._cursors.pop(cursor_id, None)
 
     def _validate_cursor(
         self,
@@ -2227,6 +2266,7 @@ class ToolRuntimeExecutor:
         """
 
         records: list[BatchToolExecutionRecord] = []
+        batch_deadline = _batch_timeout_deadline(request.context.timeout_seconds)
         run_suspended_by_awaiting = False
         for call in request.calls:
             if run_suspended_by_awaiting:
@@ -2247,19 +2287,23 @@ class ToolRuntimeExecutor:
                     )
                 )
                 continue
-            record = await self._execute_one(call, request.context)
+            record = await self._execute_one(call, request.context, batch_deadline)
             records.append(record)
             if isinstance(record.outcome, ToolAwaitingOutcome):
                 run_suspended_by_awaiting = True
         return BatchToolExecutionOutcome(records=tuple(records))
 
     async def _execute_one(
-        self, call: ToolCallRequest, context: BatchToolExecutionContext
+        self,
+        call: ToolCallRequest,
+        context: BatchToolExecutionContext,
+        batch_deadline: float | None,
     ) -> BatchToolExecutionRecord:
         """执行单次工具调用。
 
         :param call: 单次工具调用请求。
         :param context: 批式工具执行上下文。
+        :param batch_deadline: 批级 timeout 单调时钟 deadline；无 timeout 时为 ``None``。
         :returns: 单次工具调用记录。
         """
 
@@ -2311,7 +2355,11 @@ class ToolRuntimeExecutor:
         if policy_decision.kind is not ToolPolicyDecisionKind.ALLOW:
             outcome = _governed_failure_outcome(policy_decision)
         else:
-            raw_outcome = await self._dispatcher.dispatch_tool_call(call, context)
+            raw_outcome, bounded_policy_decision = await (
+                self._dispatch_tool_call_with_bounds(call, context, batch_deadline)
+            )
+            if bounded_policy_decision is not None:
+                policy_decision = bounded_policy_decision
             if isinstance(raw_outcome, ToolAwaitingOutcome):
                 return await self._accept_awaiting(
                     call=call,
@@ -2367,6 +2415,48 @@ class ToolRuntimeExecutor:
             tool_call_id=call.tool_call_id,
             outcome=governed,
         )
+
+    async def _dispatch_tool_call_with_bounds(
+        self,
+        call: ToolCallRequest,
+        context: BatchToolExecutionContext,
+        batch_deadline: float | None,
+    ) -> tuple[ToolExecutionOutcome, ToolPolicyDecision | None]:
+        """按批级 timeout 与 cancellation token 包裹业务工具调用。
+
+        :param call: 单次工具调用请求。
+        :param context: 批式工具执行上下文。
+        :param batch_deadline: 批级 timeout 单调时钟 deadline；无 timeout 时为 ``None``。
+        :returns: 工具 outcome；若由 ToolRuntime runtime 治理产生失败，则同时返回治理决策。
+        """
+
+        timeout_seconds = _remaining_batch_timeout_seconds(batch_deadline)
+        if timeout_seconds is not None and timeout_seconds <= 0:
+            decision = _runtime_timeout_policy_decision(elapsed_seconds=0.0)
+            return _governed_failure_outcome(decision), decision
+        awaitable = self._dispatcher.dispatch_tool_call(call, context)
+        if timeout_seconds is None:
+            wait_result = await await_or_cancel(
+                awaitable,
+                token=context.cancellation_token,
+            )
+        else:
+            wait_result = await await_or_cancel_or_timeout(
+                awaitable,
+                token=context.cancellation_token,
+                timeout_seconds=timeout_seconds,
+            )
+        if isinstance(wait_result, WaitCompleted):
+            return wait_result.value, None
+        if isinstance(wait_result, WaitCancelled):
+            decision = _runtime_cancelled_policy_decision(wait_result.reason)
+            return _governed_failure_outcome(decision), decision
+        if isinstance(wait_result, WaitTimedOut):
+            decision = _runtime_timeout_policy_decision(
+                elapsed_seconds=wait_result.elapsed_seconds
+            )
+            return _governed_failure_outcome(decision), decision
+        raise TypeError("unsupported ToolRuntime wait outcome")
 
     async def _accept_reuse(
         self,
@@ -3729,18 +3819,13 @@ def _fetch_more_request_from_call(
 def _tool_truncation_strategy(
     spec: ToolTruncateSpec,
 ) -> ToolTruncationStrategy | None:
-    """把截断声明策略解析为枚举。
+    """读取截断声明策略。
 
     :param spec: 截断声明。
-    :returns: 支持的截断策略；未知时为 ``None``。
+    :returns: 已启用的截断策略；未声明时为 ``None``。
     """
 
-    if spec.strategy is None:
-        return None
-    try:
-        return ToolTruncationStrategy(spec.strategy)
-    except ValueError:
-        return None
+    return spec.strategy
 
 
 def _select_truncation_value(
@@ -4843,6 +4928,61 @@ def _tool_failed_outcome(
             hint=hint,
             meta=None,
         )
+    )
+
+
+def _batch_timeout_deadline(timeout_seconds: float | None) -> float | None:
+    """把批级 timeout 秒数转换为单调时钟 deadline。
+
+    :param timeout_seconds: 批级 timeout 秒数；无 timeout 时为 ``None``。
+    :returns: 单调时钟 deadline；无 timeout 时为 ``None``。
+    """
+
+    if timeout_seconds is None:
+        return None
+    return time.monotonic() + timeout_seconds
+
+
+def _remaining_batch_timeout_seconds(deadline: float | None) -> float | None:
+    """读取批级 timeout 剩余秒数。
+
+    :param deadline: 单调时钟 deadline；无 timeout 时为 ``None``。
+    :returns: 剩余秒数；无 timeout 时为 ``None``。
+    """
+
+    if deadline is None:
+        return None
+    return deadline - time.monotonic()
+
+
+def _runtime_cancelled_policy_decision(reason: str | None) -> ToolPolicyDecision:
+    """构造 ToolRuntime cancellation 治理决策。
+
+    :param reason: cancellation token 提供的取消原因。
+    :returns: governed error 决策。
+    """
+
+    message = "tool execution cancelled before completion"
+    if reason is not None:
+        message = f"{message}: {reason}"
+    return ToolPolicyDecision(
+        kind=ToolPolicyDecisionKind.GOVERNED_ERROR,
+        reason_code=_TOOL_RUNTIME_CANCELLED_REASON,
+        message=message,
+    )
+
+
+def _runtime_timeout_policy_decision(elapsed_seconds: float) -> ToolPolicyDecision:
+    """构造 ToolRuntime timeout 治理决策。
+
+    :param elapsed_seconds: runtime helper 观察到的等待耗时秒数。
+    :returns: governed error 决策。
+    """
+
+    return ToolPolicyDecision(
+        kind=ToolPolicyDecisionKind.GOVERNED_ERROR,
+        reason_code=_TOOL_RUNTIME_TIMEOUT_REASON,
+        message=f"tool execution timed out after {elapsed_seconds:.6f} seconds",
     )
 
 

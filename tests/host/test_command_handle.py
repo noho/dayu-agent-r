@@ -353,6 +353,24 @@ def test_factory_opens_fresh_database_and_returns_public_handle(
         command_handle.close()
 
 
+def test_factory_default_active_registry_is_handle_local(
+    tmp_path: Path,
+) -> None:
+    """未显式注入 registry 时，不同 command handle 不共享默认 registry。"""
+
+    first = create_host_command_handle(
+        _options(tmp_path / "first", host_handle_id="host-first")
+    )
+    second = create_host_command_handle(
+        _options(tmp_path / "second", host_handle_id="host-second")
+    )
+    try:
+        assert first._active_registry is not second._active_registry
+    finally:
+        first.close()
+        second.close()
+
+
 def test_factory_rejects_local_execution_without_hidden_scheduler(
     tmp_path: Path,
 ) -> None:

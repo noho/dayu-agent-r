@@ -80,6 +80,7 @@ from dayu.host.tool_runtime import (
     ToolRuntimeBuildRequest,
     ToolRuntimeExecutionScope,
 )
+from dayu.host.waiting import DefaultHostToolAwaitingAcceptPort
 from dayu.runtime.lane import (
     LaneAcquireCancelled,
     LaneAcquired,
@@ -274,19 +275,6 @@ class _HostCancellationToken(CancellationToken):
                 self._requested_at = datetime.now(UTC)
 
 
-DEFAULT_ACTIVE_WORKER_REGISTRY = ActiveWorkerRegistry()
-
-
-def cancel_active_worker(message: ActiveCancelMessage) -> bool:
-    """通过默认 active registry best-effort 传播 cancel。
-
-    :param message: 最小取消消息。
-    :returns: 找到匹配 active worker 时返回 ``True``。
-    """
-
-    return DEFAULT_ACTIVE_WORKER_REGISTRY.cancel(message)
-
-
 class HostDispatchScheduler:
     """Host 本地 dispatch scheduler。"""
 
@@ -307,7 +295,7 @@ class HostDispatchScheduler:
         :param local_execution: 本地执行配置。
         :param lane_controller: 已打开的 runtime lane controller。
         :param host_handle_id: Host handle 诊断 id。
-        :param active_registry: active worker registry；不传时使用默认 registry。
+        :param active_registry: active worker registry；不传时创建 scheduler 私有 registry。
         :returns: ``None``。
         :raises ValueError: ``host_handle_id`` 为空时抛出。
         """
@@ -320,9 +308,7 @@ class HostDispatchScheduler:
         self._lane_controller = lane_controller
         self._host_handle_id = host_handle_id
         self._active_registry = (
-            active_registry
-            if active_registry is not None
-            else DEFAULT_ACTIVE_WORKER_REGISTRY
+            active_registry if active_registry is not None else ActiveWorkerRegistry()
         )
         self._queue: asyncio.Queue[PendingDispatchRecord] = asyncio.Queue()
         self._closed = False
@@ -347,7 +333,7 @@ class HostDispatchScheduler:
         :param transaction_runner: Host durable transaction runner。
         :param local_execution: 本地执行配置。
         :param host_handle_id: Host handle 诊断 id。
-        :param active_registry: active worker registry；不传时使用默认 registry。
+        :param active_registry: active worker registry；不传时创建 scheduler 私有 registry。
         :returns: 已打开 scheduler。
         """
 
@@ -730,6 +716,11 @@ class HostDispatchScheduler:
                     transaction_runner=self._transaction_runner,
                     event_log_store=self._event_log_store,
                 ),
+                awaiting_accept_port=DefaultHostToolAwaitingAcceptPort(
+                    transaction_runner=self._transaction_runner,
+                    event_log_store=self._event_log_store,
+                ),
+                wait_adapter_registry=tooling_options.wait_adapter_registry,
                 duplicate_governance_registry=self._duplicate_governance_registry,
             )
         )
@@ -1275,8 +1266,6 @@ async def _suppress_task_cancel(task: asyncio.Task[None]) -> None:
 __all__ = [
     "ActiveCancelMessage",
     "ActiveWorkerRegistry",
-    "DEFAULT_ACTIVE_WORKER_REGISTRY",
     "DispatchDrainResult",
     "HostDispatchScheduler",
-    "cancel_active_worker",
 ]

@@ -2,10 +2,12 @@
 
 from __future__ import annotations
 
+import asyncio
 from datetime import datetime
 
 import pytest
 
+from dayu.contracts.cancellation import CancellationToken
 from dayu.contracts.json_value import JsonValue
 from dayu.contracts.tool_await import ToolAwaitKind, ToolAwaitSpec
 from dayu.contracts.tool_call import (
@@ -79,6 +81,8 @@ _ATTEMPT_ID = "attempt-toolruntime"
 _EXECUTION_ID = "execution-toolruntime"
 _ITERATION_ID = "iteration-toolruntime"
 _POLICY_DIGEST = "sha256:2222222222222222222222222222222222222222222222222222222222222222"
+_DEFAULT_TOOL_TIMEOUT_SECONDS = 10.0
+_FAST_TOOL_TIMEOUT_SECONDS = 0.001
 
 
 class _NeverCancelledToken:
@@ -104,6 +108,34 @@ class _NeverCancelledToken:
         """返回取消请求时间。
 
         :returns: 始终为 ``None``。
+        """
+
+        return None
+
+
+class _AlreadyCancelledToken:
+    """测试用已取消 token。"""
+
+    def is_cancelled(self) -> bool:
+        """返回是否已取消。
+
+        :returns: 始终为 ``True``。
+        """
+
+        return True
+
+    def cancel_reason(self) -> str | None:
+        """返回取消原因。
+
+        :returns: 测试取消原因。
+        """
+
+        return "test_cancel"
+
+    def requested_at(self) -> datetime | None:
+        """返回取消请求时间。
+
+        :returns: 本测试不关心请求时间，返回 ``None``。
         """
 
         return None
@@ -138,6 +170,44 @@ class _CountingCallable:
         self.call_count += 1
         return ToolCompletedOutcome(
             result=ToolResultSuccess(ok=True, value=self._value, meta=None)
+        )
+
+
+class _BlockingCallable:
+    """挂起直到被取消的 fake 工具。"""
+
+    def __init__(self) -> None:
+        """初始化 fake callable。
+
+        :returns: ``None``。
+        """
+
+        self.call_count = 0
+        self.cancelled = False
+        self._ready = asyncio.Event()
+
+    async def __call__(
+        self,
+        call: ToolCallRequest,
+        context: BatchToolExecutionContext,
+    ) -> ToolExecutionOutcome:
+        """等待一个不会主动完成的事件。
+
+        :param call: 单次工具调用请求。
+        :param context: 批式工具执行上下文。
+        :returns: 本测试不会正常返回。
+        :raises asyncio.CancelledError: ToolRuntime timeout 取消等待时抛出。
+        """
+
+        del call, context
+        self.call_count += 1
+        try:
+            await self._ready.wait()
+        except asyncio.CancelledError:
+            self.cancelled = True
+            raise
+        return ToolCompletedOutcome(
+            result=ToolResultSuccess(ok=True, value={"unexpected": True}, meta=None)
         )
 
 
@@ -444,6 +514,54 @@ async def test_side_effect_tool_missing_idempotency_key_never_calls_callable() -
 
 
 @pytest.mark.asyncio
+async def test_tool_runtime_timeout_returns_governed_failure() -> None:
+    """业务工具超过批级 timeout 时返回受治理失败且取消底层 task。"""
+
+    callable_ = _BlockingCallable()
+    accept_port = _SequencedAcceptPort((_accepted_ack_for_call("tool-call-1"),))
+    executor = _executor(callable_, accept_port)
+
+    outcome = await executor.execute(
+        _request(_call("tool-call-1"), timeout_seconds=_FAST_TOOL_TIMEOUT_SECONDS)
+    )
+
+    record = outcome.records[0]
+    assert callable_.call_count == 1
+    assert callable_.cancelled
+    assert len(accept_port.candidates) == 1
+    assert accept_port.candidates[0].policy_decision.reason_code == (
+        "tool_runtime_timeout"
+    )
+    assert isinstance(record.outcome, ToolFailedOutcome)
+    assert record.outcome.result.error == "tool_call_governed"
+    assert record.outcome.result.hint == "tool_runtime_timeout"
+
+
+@pytest.mark.asyncio
+async def test_tool_runtime_pre_cancelled_context_returns_governed_failure() -> None:
+    """context token 已取消时不得调用业务工具，并返回受治理失败。"""
+
+    callable_ = _CountingCallable({"secret": "must-not-run"})
+    accept_port = _SequencedAcceptPort((_accepted_ack_for_call("tool-call-1"),))
+    executor = _executor(callable_, accept_port)
+
+    outcome = await executor.execute(
+        _request(_call("tool-call-1"), cancellation_token=_AlreadyCancelledToken())
+    )
+
+    record = outcome.records[0]
+    assert callable_.call_count == 0
+    assert len(accept_port.candidates) == 1
+    assert accept_port.candidates[0].policy_decision.reason_code == (
+        "tool_runtime_cancelled"
+    )
+    assert isinstance(record.outcome, ToolFailedOutcome)
+    assert record.outcome.result.error == "tool_call_governed"
+    assert record.outcome.result.hint == "tool_runtime_cancelled"
+    assert "must-not-run" not in record.outcome.result.message
+
+
+@pytest.mark.asyncio
 async def test_awaiting_outcome_returns_only_after_awaiting_accepted_ack() -> None:
     """awaiting outcome 只有 Host awaiting accepted ack 后才返回给 Engine。"""
 
@@ -657,7 +775,7 @@ async def test_batch_mixed_accept_outcomes_keep_accepted_visible() -> None:
 
 
 def _executor(
-    callable_: _CountingCallable | _AwaitingCallable,
+    callable_: _CountingCallable | _AwaitingCallable | _BlockingCallable,
     accept_port: HostToolFactAcceptPort,
     *,
     awaiting_accept_port: HostToolAwaitingAcceptPort | None = None,
@@ -709,10 +827,16 @@ def _executor(
     return handle.tool_executor
 
 
-def _request(*calls: ToolCallRequest) -> BatchToolExecutionRequest:
+def _request(
+    *calls: ToolCallRequest,
+    timeout_seconds: float | None = _DEFAULT_TOOL_TIMEOUT_SECONDS,
+    cancellation_token: CancellationToken | None = None,
+) -> BatchToolExecutionRequest:
     """构造批式工具执行请求。
 
     :param calls: 单次工具调用请求。
+    :param timeout_seconds: 批式工具执行 timeout。
+    :param cancellation_token: 批式工具执行 cancellation token。
     :returns: 批式工具执行请求。
     """
 
@@ -722,8 +846,12 @@ def _request(*calls: ToolCallRequest) -> BatchToolExecutionRequest:
             run_id=_RUN_ID,
             session_id=_SESSION_ID,
             iteration_id=_ITERATION_ID,
-            timeout_seconds=10.0,
-            cancellation_token=_NeverCancelledToken(),
+            timeout_seconds=timeout_seconds,
+            cancellation_token=(
+                cancellation_token
+                if cancellation_token is not None
+                else _NeverCancelledToken()
+            ),
             correlation_id="correlation-toolruntime",
         ),
     )
@@ -746,7 +874,7 @@ def _call(tool_call_id: str) -> ToolCallRequest:
 
 
 def _definition(
-    name: str, callable_: _CountingCallable | _AwaitingCallable
+    name: str, callable_: _CountingCallable | _AwaitingCallable | _BlockingCallable
 ) -> ToolDefinition:
     """构造工具声明。
 

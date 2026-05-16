@@ -77,6 +77,7 @@ from dayu.host.waiting import (
 
 _NOW = datetime(2026, 5, 16, 1, 2, 3, tzinfo=UTC)
 _OBSERVED = datetime(2026, 5, 16, 1, 5, 7, tzinfo=UTC)
+_OBSERVED_REPLAY = datetime(2026, 5, 16, 1, 6, 8, tzinfo=UTC)
 _CALL_CONTEXT_DIGEST = sha256_digest_json({"context": "resolve-wait-test"})
 
 
@@ -121,23 +122,28 @@ def test_resolve_wait_completed_resumes_run_and_wakes_dispatch(
         host.close()
 
 
-def test_resolve_wait_same_key_replays_without_second_attempt(
+def test_resolve_wait_same_key_same_outcome_replays_with_different_observed_at(
     tmp_path: Path,
 ) -> None:
-    """同 wait_id + idempotency_key + outcome 重放不创建第二个 Attempt。"""
+    """同 wait_id + idempotency_key + outcome 不因 observed_at 变化而冲突。"""
 
     host = create_host_command_handle(_options(tmp_path))
     try:
         seeded = _seed_waiting_run(host)
         request = _completed_request("resolve-replay")
+        replay_request = replace(request, observed_at=_OBSERVED_REPLAY)
 
         first = resolve_wait(host, seeded.wait_id, request)
         before_events = _events(host._transaction_runner())
-        second = resolve_wait(host, seeded.wait_id, request)
+        before_tool_results = _events_by_type(before_events, "TOOL_RESULT_ACCEPTED")
+        second = resolve_wait(host, seeded.wait_id, replay_request)
         after_events = _events(host._transaction_runner())
 
         assert second.current_attempt_id == first.current_attempt_id
         assert after_events == before_events
+        assert _events_by_type(after_events, "TOOL_RESULT_ACCEPTED") == (
+            before_tool_results
+        )
     finally:
         host.close()
 
@@ -812,3 +818,16 @@ def _events(transaction_runner: HostTransactionRunner) -> tuple[EventLogRow, ...
             transaction, 0, limit=100
         )
     )
+
+
+def _events_by_type(
+    events: tuple[EventLogRow, ...], event_type: str
+) -> tuple[EventLogRow, ...]:
+    """按 event type 过滤 EventLog rows。
+
+    :param events: EventLog rows。
+    :param event_type: 目标 event type。
+    :returns: 匹配事件元组。
+    """
+
+    return tuple(event for event in events if event.event_type == event_type)

@@ -1094,8 +1094,6 @@ def _wait_resolution_digest(wait_id: str, request: ResolveWaitRequest) -> str:
         {
             "wait_id": wait_id,
             "idempotency_key": request.idempotency_key,
-            "source": request.source.value,
-            "observed_at": request.observed_at.isoformat(),
             "outcome": _resolve_outcome_json(request.outcome),
         }
     )

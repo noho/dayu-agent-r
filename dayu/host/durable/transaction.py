@@ -27,6 +27,7 @@ _SQLITE_CONSTRAINT_UNIQUE = sqlite3.SQLITE_CONSTRAINT_UNIQUE
 _SQLITE_CONSTRAINT_PRIMARYKEY = sqlite3.SQLITE_CONSTRAINT_PRIMARYKEY
 _SQLITE_CONSTRAINT_FOREIGNKEY = sqlite3.SQLITE_CONSTRAINT_FOREIGNKEY
 _SQLITE_CONSTRAINT_CHECK = sqlite3.SQLITE_CONSTRAINT_CHECK
+_SQLITE_EXTENDED_RESULT_CODE_MASK = 0xFF
 _SQLITE_MILLISECONDS_PER_SECOND = 1000
 
 T = TypeVar("T")
@@ -362,8 +363,24 @@ def _is_busy_or_locked(error: sqlite3.Error) -> bool:
     :returns: busy 或 locked 返回 ``True``，否则返回 ``False``。
     """
 
-    code = _sqlite_error_code(error)
+    code = _sqlite_base_error_code(error)
     return code in (sqlite3.SQLITE_BUSY, sqlite3.SQLITE_LOCKED)
+
+
+def _sqlite_base_error_code(error: sqlite3.Error) -> int | None:
+    """读取 SQLite base result code。
+
+    Python 3.11 暴露的 ``sqlite_errorcode`` 可能是 extended result code；
+    busy / locked retry 分类必须按低 8 位 base code 判断。
+
+    :param error: SQLite error。
+    :returns: SQLite base result code；缺失时返回 ``None``。
+    """
+
+    code = _sqlite_error_code(error)
+    if code is None:
+        return None
+    return code & _SQLITE_EXTENDED_RESULT_CODE_MASK
 
 
 def _sqlite_error_code(error: sqlite3.Error) -> int | None:
