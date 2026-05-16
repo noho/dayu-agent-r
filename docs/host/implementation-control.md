@@ -1024,6 +1024,9 @@ Phase 按依赖关系推进：先实现被其它阶段依赖的公共契约、ru
 
 ### Phase 8. Projection Core / Host Event Stream / Minimal Read Model
 
+状态：
+- P8 completed。PR 58 已达到 `draft-PR-pass`，后续 merge 由用户手工执行。
+
 目标：
 - 实现 committed EventLog 消费基础、projection checkpoint、Host event stream cursor 与最小 RunResult / Session timeline read model，为 Memory、Recovery 和后续 projection sinks 提供稳定基座。
 
