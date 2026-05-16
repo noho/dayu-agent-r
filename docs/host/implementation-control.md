@@ -1562,6 +1562,7 @@ Phase 按依赖关系推进：先实现被其它阶段依赖的公共契约、ru
   `docs/reviews/p9-plan-rereview-ds-20260516.md`。
 - Controller adjudication artifact 为 `docs/reviews/p9-plan-review-controller-adjudication-20260516.md`。
 - Re-review verdict：AgentMiMo PASS，AgentDS PASS，remaining blocking findings 为 0。
+- Accepted plan commit 为 `469baaa`。
 
 追踪项：
 
@@ -1581,7 +1582,7 @@ claim status lifecycle、`RUN_SUCCEEDED` continuity、`required_event_sequence`�
 Host-neutral ref、`TOOL_RESULT_ACCEPTED` mapping、diagnostic/failure 分工与 digest canonicalization 等修正项；拒绝固定 40 / 60
 magic budget split 和业务词 blocklist 作为修复方式。Planning agent 已修正 plan。双路 re-review 均 PASS，remaining blocking findings 为
 0。Controller adjudication artifact 为 `docs/reviews/p9-plan-review-controller-adjudication-20260516.md`。当前 gate 为等待用户确认进入
-P9 implementation。
+P9 implementation。Accepted plan commit 为 `469baaa`。
 
 ### 2026-05-16 P9 design refinement
 
