@@ -55,6 +55,7 @@ from dayu.host.durable.run_transition import (
     CancelActiveAttemptInput,
     CancelPredispatchStartingInput,
     CancelQueuedRunInput,
+    CancelWaitingRunInput,
     CreateQueuedRunInput,
     CreateRunningRunInput,
     PromoteQueuedRunInput,
@@ -63,6 +64,7 @@ from dayu.host.durable.run_transition import (
     TerminalCloseoutInput,
     cancel_predispatch_starting_in_transaction,
     cancel_queued_in_transaction,
+    cancel_waiting_run_in_transaction,
     create_queued_run_in_transaction,
     create_running_run_with_starting_attempt_in_transaction,
     promote_queued_run_in_transaction,
@@ -963,6 +965,12 @@ class _CancelRunOperation:
                 semantic_digest=semantic_digest,
                 scope=scope,
             )
+        if run.status == RunStatus.WAITING:
+            return self._cancel_waiting(
+                transaction=transaction,
+                semantic_digest=semantic_digest,
+                scope=scope,
+            )
         if _is_terminal_run_status(run.status):
             return self._record_terminal_replay(
                 transaction=transaction,
@@ -1174,6 +1182,69 @@ class _CancelRunOperation:
             released_active_slot=False,
         )
 
+    def _cancel_waiting(
+        self,
+        *,
+        transaction: HostTransaction,
+        semantic_digest: str,
+        scope: IdempotencyScope,
+    ) -> CancelRunResult:
+        """取消 WAITING Run 并记录幂等结果。
+
+        :param transaction: 当前 Host transaction。
+        :param semantic_digest: cancel semantic digest。
+        :param scope: 幂等 scope。
+        :returns: cancel 结果。
+        :raises HostApiError: 当前状态不满足 waiting cancel 前置条件时抛出。
+        """
+
+        now = self.clock.now()
+        cancel_request_event_id = self.id_factory.new_id(_EVENT_ID_PREFIX)
+        transition_result = cancel_waiting_run_in_transaction(
+            transaction,
+            self.event_log_store,
+            CancelWaitingRunInput(
+                run_id=self.run_id,
+                cancel_request_event_id=cancel_request_event_id,
+                run_cancelled_event_id=self.id_factory.new_id(_EVENT_ID_PREFIX),
+                occurred_at=now,
+                actor=self.request.context.actor,
+                source=self.request.context.source,
+                client_request_id=self.request.client_request_id,
+                idempotency_key=self.request.client_request_id,
+                reason=self.request.reason,
+                mode=self.request.mode,
+                call_context_digest=_call_context_digest(self.request.context),
+            ),
+        )
+        _raise_for_cancel_transition_status(transition_result)
+        run = _require_transition_run(transition_result.run)
+        cancel_request_sequence = _require_event_sequence(
+            transaction,
+            self.event_log_store,
+            cancel_request_event_id,
+        )
+        self.idempotency_store.record_idempotent_result(
+            transaction,
+            scope,
+            semantic_digest,
+            IdempotencyResultRef(
+                result_kind=_IDEMPOTENCY_RESULT_KIND_RUN,
+                result_ref=run.run_id,
+                created_event_id=cancel_request_event_id,
+                created_event_sequence=cancel_request_sequence,
+            ),
+        )
+        return CancelRunResult(
+            run=run,
+            attempt=transition_result.attempt,
+            dispatch_record=transition_result.dispatch_record,
+            promotion=None,
+            active_cancel_target=None,
+            idempotent_replay=False,
+            released_active_slot=True,
+        )
+
     def _record_terminal_replay(
         self,
         *,
@@ -1221,6 +1292,7 @@ class _SupportedSessionCancelTarget:
     attempt: AttemptRow | None
     dispatch_record: DispatchRecordRow | None
     active_worker: bool
+    waiting: bool
 
 
 @dataclass(frozen=True, slots=True)
@@ -1340,8 +1412,8 @@ class _CancelSessionRunsOperation:
                     code=HostApiErrorCode.UNSUPPORTED_OPERATION,
                     message=(
                         "cancel_session_runs supports only queued, pre-dispatch "
-                        "STARTING, and active worker Runs in the current Host "
-                        "cancel scope"
+                        "STARTING, active worker, and WAITING Runs in the "
+                        "current Host cancel scope"
                     ),
                     retryable=False,
                 )
@@ -1361,6 +1433,8 @@ class _CancelSessionRunsOperation:
 
         if target.run.status == RunStatus.QUEUED:
             return self._cancel_queued_target(transaction, target.run)
+        if target.waiting:
+            return self._cancel_waiting_target(transaction, target.run)
         if target.active_worker:
             return self._cancel_active_target(transaction, target.run)
         return self._cancel_predispatch_target(transaction, target.run)
@@ -1452,6 +1526,39 @@ class _CancelSessionRunsOperation:
                 run_id=run.run_id,
                 cancel_request_event_id=cancel_request_event_id,
                 run_cancelling_event_id=self.id_factory.new_id(_EVENT_ID_PREFIX),
+                occurred_at=now,
+                actor=self.request.context.actor,
+                source=self.request.context.source,
+                client_request_id=self.request.client_request_id,
+                idempotency_key=self.request.client_request_id,
+                reason=self.request.reason,
+                mode=self.request.mode,
+                call_context_digest=_call_context_digest(self.request.context),
+            ),
+        )
+        _raise_for_session_cancel_transition_status(result)
+        return cancel_request_event_id
+
+    def _cancel_waiting_target(
+        self, transaction: HostTransaction, run: RunRow
+    ) -> str:
+        """取消一个 WAITING Run。
+
+        :param transaction: 当前 Host transaction。
+        :param run: 已校验为 WAITING 的 Run。
+        :returns: ``CANCEL_REQUESTED`` event id。
+        :raises HostApiError: transition 失败时抛出。
+        """
+
+        now = self.clock.now()
+        cancel_request_event_id = self.id_factory.new_id(_EVENT_ID_PREFIX)
+        result = cancel_waiting_run_in_transaction(
+            transaction,
+            self.event_log_store,
+            CancelWaitingRunInput(
+                run_id=run.run_id,
+                cancel_request_event_id=cancel_request_event_id,
+                run_cancelled_event_id=self.id_factory.new_id(_EVENT_ID_PREFIX),
                 occurred_at=now,
                 actor=self.request.context.actor,
                 source=self.request.context.source,
@@ -2205,8 +2312,35 @@ def _session_cancel_target_for_run(
             attempt=None,
             dispatch_record=None,
             active_worker=False,
+            waiting=False,
         )
-    if run.status in (RunStatus.WAITING, RunStatus.RECOVERING):
+    if run.status == RunStatus.WAITING:
+        if run.current_attempt_id is None:
+            raise HostApiError(
+                code=HostApiErrorCode.INTERNAL_ERROR,
+                message="WAITING Run has no current Attempt",
+                retryable=False,
+            )
+        attempt = read_attempt_by_id(transaction, run.current_attempt_id)
+        dispatch_record = read_dispatch_record_by_attempt_id(
+            transaction, run.current_attempt_id
+        )
+        if attempt is None:
+            raise HostApiError(
+                code=HostApiErrorCode.INTERNAL_ERROR,
+                message="WAITING Run current Attempt is missing",
+                retryable=False,
+            )
+        if attempt.status != AttemptStatus.SUSPENDED:
+            return None
+        return _SupportedSessionCancelTarget(
+            run=run,
+            attempt=attempt,
+            dispatch_record=dispatch_record,
+            active_worker=False,
+            waiting=True,
+        )
+    if run.status == RunStatus.RECOVERING:
         return None
     if run.status not in (RunStatus.RUNNING, RunStatus.CANCELLING):
         return None
@@ -2236,6 +2370,7 @@ def _session_cancel_target_for_run(
             attempt=attempt,
             dispatch_record=dispatch_record,
             active_worker=False,
+            waiting=False,
         )
     if (
         run.status in (RunStatus.RUNNING, RunStatus.CANCELLING)
@@ -2246,6 +2381,7 @@ def _session_cancel_target_for_run(
             attempt=attempt,
             dispatch_record=dispatch_record,
             active_worker=True,
+            waiting=False,
         )
     return None
 

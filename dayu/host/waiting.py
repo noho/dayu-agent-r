@@ -22,6 +22,7 @@ from dayu.host._event_payload import (
     run_waiting_payload,
     tool_awaiting_payload,
     tool_result_wait_resolution_payload,
+    wait_late_result_rejected_payload,
 )
 from dayu.host.api import (
     AttemptStatus,
@@ -88,6 +89,8 @@ _EVENT_TYPE_RUN_WAITING = "RUN_WAITING"
 _EVENT_TYPE_ATTEMPT_SUSPENDED = "ATTEMPT_SUSPENDED"
 _WAIT_RESOLUTION_SCOPE_KIND = "wait_resolution"
 _WAIT_RESOLUTION_RESULT_KIND = "wait_resolution"
+_WAIT_LATE_REJECTION_SCOPE_KIND = "wait_late_rejection"
+_WAIT_LATE_REJECTION_RESULT_KIND = "wait_late_rejection_diagnostic"
 _AWAITING_ACCEPT_ACTOR = "host.tool_runtime"
 _AWAITING_ACCEPT_SOURCE = "host.tool_runtime.awaiting_accept"
 _EVENT_ID_TOOL_AWAITING_PREFIX = "event-tool-awaiting-"
@@ -99,6 +102,7 @@ _EVENT_ID_RESUME_RUN_STARTED_PREFIX = "event-run-started-resume-"
 _EVENT_ID_RESUME_ATTEMPT_STARTED_PREFIX = "event-attempt-started-resume-"
 _EVENT_ID_WAIT_RUN_FAILED_PREFIX = "event-run-failed-wait-resolution-"
 _EVENT_ID_WAIT_RUN_LOST_PREFIX = "event-run-lost-wait-resolution-"
+_EVENT_ID_WAIT_LATE_RESULT_REJECTED_PREFIX = "event-wait-late-result-rejected-"
 _RESUME_ATTEMPT_ID_PREFIX = "attempt-resume-"
 _RESUME_EXECUTION_ID_PREFIX = "execution-resume-"
 _RESUME_DISPATCH_ID_PREFIX = "dispatch-resume-"
@@ -110,6 +114,7 @@ _TOOL_FACT_KIND_LOST = "lost"
 _WAIT_RESOLUTION_SOURCE = "host.resolve_wait"
 _WAIT_TERMINAL_REASON_FAILED = "wait_result_failed"
 _WAIT_TERMINAL_REASON_LOST = "wait_result_lost"
+_EVENT_TYPE_WAIT_LATE_RESULT_REJECTED = "WAIT_LATE_RESULT_REJECTED"
 
 
 class _AwaitingAcceptStateConflictError(HostDurableError):
@@ -123,6 +128,18 @@ class ToolAwaitingAcceptRejectReason(StrEnum):
     INVALID_ATTEMPT = "invalid_attempt"
     STALE_EXECUTION = "stale_execution"
     CAS_CONFLICT = "cas_conflict"
+
+
+class WaitLateRejectionReason(StrEnum):
+    """晚到 wait result 拒绝原因。"""
+
+    WAIT_CANCELLED = "wait_cancelled"
+    WAIT_LOST = "wait_lost"
+    WAIT_ALREADY_RESOLVED = "wait_already_resolved"
+    WAIT_ALREADY_FAILED = "wait_already_failed"
+    RUN_TERMINAL = "run_terminal"
+    IDEMPOTENCY_CONFLICT = "idempotency_conflict"
+    INVALID_WAIT_STATE = "invalid_wait_state"
 
 
 @dataclass(frozen=True, slots=True)
@@ -294,6 +311,16 @@ class ResolveWaitResult:
     run: RunRow
     dispatch_record: DispatchRecordRow | None
     idempotent_replay: bool
+
+
+@dataclass(frozen=True, slots=True)
+class _LateRejectResult:
+    """late wait result 已完成 durable diagnostic 后的内部拒绝结果。
+
+    :param message: 对外错误消息。
+    """
+
+    message: str
 
 
 @dataclass(frozen=True, slots=True)
@@ -545,11 +572,18 @@ class DefaultHostResolveWaitService:
                 retryable=False,
             )
         try:
-            return self._transaction_runner.run_write(
+            result = self._transaction_runner.run_write(
                 lambda transaction: self._resolve_in_transaction(
                     transaction, wait_id, request
                 )
             )
+            if isinstance(result, _LateRejectResult):
+                raise HostApiError(
+                    code=HostApiErrorCode.INVALID_STATE,
+                    message=result.message,
+                    retryable=False,
+                )
+            return result
         except HostIdempotencyConflictError as exc:
             raise HostApiError(
                 code=HostApiErrorCode.IDEMPOTENCY_CONFLICT,
@@ -562,7 +596,7 @@ class DefaultHostResolveWaitService:
         transaction: HostTransaction,
         wait_id: str,
         request: ResolveWaitRequest,
-    ) -> ResolveWaitResult:
+    ) -> ResolveWaitResult | _LateRejectResult:
         """在单个 Host write transaction 内执行 resolve wait。
 
         :param transaction: 当前 Host transaction。
@@ -580,22 +614,66 @@ class DefaultHostResolveWaitService:
             )
         scope = _wait_resolution_scope(wait_id, request.idempotency_key)
         resolution_digest = _wait_resolution_digest(wait_id, request)
+        owner_run = read_run_by_id(transaction, wait_record.run_id)
+        if owner_run is None:
+            raise HostApiError(
+                code=HostApiErrorCode.NOT_FOUND,
+                message="wait owner run not found",
+                retryable=False,
+            )
         if wait_record.status in (
             WaitRecordStatus.RESOLVED,
             WaitRecordStatus.FAILED,
             WaitRecordStatus.LOST,
         ):
-            return self._replay_terminal_resolution(
+            replay = self._replay_terminal_resolution_or_none(
                 transaction=transaction,
                 wait_record=wait_record,
                 scope=scope,
                 resolution_digest=resolution_digest,
             )
+            if replay is not None:
+                return replay
+            if wait_record.status in (
+                WaitRecordStatus.RESOLVED,
+                WaitRecordStatus.FAILED,
+            ):
+                raise HostApiError(
+                    code=HostApiErrorCode.INVALID_STATE,
+                    message="wait record is already resolved by another key",
+                    retryable=False,
+                )
+            return self._reject_late_result(
+                transaction=transaction,
+                wait_record=wait_record,
+                request=request,
+                rejection_reason=_terminal_wait_rejection_reason(wait_record.status),
+            )
+        if wait_record.status is WaitRecordStatus.CANCELLED:
+            return self._reject_late_result(
+                transaction=transaction,
+                wait_record=wait_record,
+                request=request,
+                rejection_reason=WaitLateRejectionReason.WAIT_CANCELLED,
+            )
         if wait_record.status is not WaitRecordStatus.WAITING:
-            raise HostApiError(
-                code=HostApiErrorCode.INVALID_STATE,
-                message="wait record is not resolvable",
-                retryable=False,
+            return self._reject_late_result(
+                transaction=transaction,
+                wait_record=wait_record,
+                request=request,
+                rejection_reason=WaitLateRejectionReason.INVALID_WAIT_STATE,
+            )
+        if owner_run.status in (
+            RunStatus.SUCCEEDED,
+            RunStatus.FAILED,
+            RunStatus.CANCELLED,
+            RunStatus.LOST,
+        ):
+            return self._reject_late_result(
+                transaction=transaction,
+                wait_record=wait_record,
+                request=request,
+                rejection_reason=WaitLateRejectionReason.RUN_TERMINAL,
             )
         existing = self._idempotency_store.read_idempotency_record(
             transaction, scope
@@ -671,33 +749,29 @@ class DefaultHostResolveWaitService:
         )
         return result
 
-    def _replay_terminal_resolution(
+    def _replay_terminal_resolution_or_none(
         self,
         *,
         transaction: HostTransaction,
         wait_record: WaitRecordRow,
         scope: IdempotencyScope,
         resolution_digest: str,
-    ) -> ResolveWaitResult:
-        """重放已完成的 resolved/failed wait resolution。
+    ) -> ResolveWaitResult | None:
+        """重放已完成的 wait resolution。
 
         :param transaction: 当前 Host transaction。
         :param wait_record: 已终态 wait record。
         :param scope: resolve wait 幂等作用域。
         :param resolution_digest: 本次请求 digest。
-        :returns: 幂等重放结果。
-        :raises HostApiError: 不存在相同幂等记录或 digest 冲突时抛出。
+        :returns: 幂等重放结果；不同 key 晚到结果返回 ``None``。
+        :raises HostApiError: 相同 key 但 digest 冲突时抛出。
         """
 
         record = self._idempotency_store.read_idempotency_record(
             transaction, scope
         )
         if record is None:
-            raise HostApiError(
-                code=HostApiErrorCode.INVALID_STATE,
-                message="wait record is already resolved by another key",
-                retryable=False,
-            )
+            return None
         if record.semantic_input_digest != resolution_digest:
             raise HostApiError(
                 code=HostApiErrorCode.IDEMPOTENCY_CONFLICT,
@@ -705,6 +779,66 @@ class DefaultHostResolveWaitService:
                 retryable=False,
             )
         return _resolve_wait_result_from_existing(transaction, wait_record)
+
+    def _reject_late_result(
+        self,
+        *,
+        transaction: HostTransaction,
+        wait_record: WaitRecordRow,
+        request: ResolveWaitRequest,
+        rejection_reason: WaitLateRejectionReason,
+    ) -> _LateRejectResult:
+        """记录晚到 wait result diagnostic 并拒绝请求。
+
+        :param transaction: 当前 Host transaction。
+        :param wait_record: 非可解析 wait record。
+        :param request: resolve wait 请求。
+        :param rejection_reason: 拒绝原因。
+        :returns: transaction commit 后由外层转成 ``HostApiError`` 的拒绝结果。
+        :raises HostApiError: 幂等冲突时抛出。
+        """
+
+        payload_plan = _wait_resolution_payload_plan(request)
+        late_digest = _wait_late_rejection_digest(
+            wait_record=wait_record,
+            request=request,
+            rejection_reason=rejection_reason,
+            payload_plan=payload_plan,
+        )
+        scope = _wait_late_rejection_scope(wait_record.wait_id, request.idempotency_key)
+        existing = self._idempotency_store.read_idempotency_record(transaction, scope)
+        if existing is not None:
+            if existing.semantic_input_digest != late_digest:
+                raise HostApiError(
+                    code=HostApiErrorCode.IDEMPOTENCY_CONFLICT,
+                    message="late wait result idempotency conflict",
+                    retryable=False,
+                )
+            return _LateRejectResult(
+                message="late wait result was already rejected"
+            )
+        event = self._event_log_store.append_event(
+            transaction,
+            _wait_late_result_rejected_event_request(
+                event_id=_wait_late_result_rejected_event_id(late_digest),
+                wait_record=wait_record,
+                request=request,
+                rejection_reason=rejection_reason,
+                payload_plan=payload_plan,
+            ),
+        ).row
+        self._idempotency_store.record_idempotent_result(
+            transaction,
+            scope,
+            late_digest,
+            IdempotencyResultRef(
+                result_kind=_WAIT_LATE_REJECTION_RESULT_KIND,
+                result_ref=event.event_id,
+                created_event_id=event.event_id,
+                created_event_sequence=event.event_sequence,
+            ),
+        )
+        return _LateRejectResult(message="wait result is late and was rejected")
 
     def _resolve_resume(
         self,
@@ -927,6 +1061,23 @@ def _wait_resolution_scope(wait_id: str, idempotency_key: str) -> IdempotencySco
     )
 
 
+def _wait_late_rejection_scope(
+    wait_id: str, idempotency_key: str
+) -> IdempotencyScope:
+    """构造 wait late rejection 幂等作用域。
+
+    :param wait_id: wait record id。
+    :param idempotency_key: late result 幂等键。
+    :returns: 幂等作用域。
+    """
+
+    return IdempotencyScope(
+        scope_kind=_WAIT_LATE_REJECTION_SCOPE_KIND,
+        scope_id=wait_id,
+        idempotency_key=idempotency_key,
+    )
+
+
 def _wait_resolution_digest(wait_id: str, request: ResolveWaitRequest) -> str:
     """计算 resolve wait 语义 digest。
 
@@ -944,6 +1095,68 @@ def _wait_resolution_digest(wait_id: str, request: ResolveWaitRequest) -> str:
             "outcome": _resolve_outcome_json(request.outcome),
         }
     )
+
+
+def _wait_late_rejection_digest(
+    *,
+    wait_record: WaitRecordRow,
+    request: ResolveWaitRequest,
+    rejection_reason: WaitLateRejectionReason,
+    payload_plan: _WaitResolutionPayloadPlan,
+) -> str:
+    """计算 wait late rejection 语义 digest。
+
+    :param wait_record: wait record。
+    :param request: resolve wait 请求。
+    :param rejection_reason: 拒绝原因。
+    :param payload_plan: resolve payload 规划。
+    :returns: Host canonical sha256 digest。
+    """
+
+    return sha256_digest_json(
+        {
+            "wait_id": wait_record.wait_id,
+            "run_id": wait_record.run_id,
+            "idempotency_key": request.idempotency_key,
+            "source": request.source.value,
+            "observed_at": request.observed_at.isoformat(),
+            "wait_status": wait_record.status.value,
+            "rejection_reason": rejection_reason.value,
+            "outcome_kind": payload_plan.resolution_kind,
+            "outcome_digest": payload_plan.outcome_digest,
+            "outcome": _resolve_outcome_json(request.outcome),
+        }
+    )
+
+
+def _wait_late_result_rejected_event_id(late_digest: str) -> str:
+    """从 late rejection digest 派生 diagnostic event id。
+
+    :param late_digest: late rejection digest。
+    :returns: EventLog event id。
+    """
+
+    suffix = late_digest.removeprefix("sha256:")
+    return f"{_EVENT_ID_WAIT_LATE_RESULT_REJECTED_PREFIX}{suffix}"
+
+
+def _terminal_wait_rejection_reason(
+    status: WaitRecordStatus,
+) -> WaitLateRejectionReason:
+    """把 terminal wait 状态映射为 late rejection reason。
+
+    :param status: wait record 状态。
+    :returns: late rejection reason。
+    :raises ValueError: 非 terminal 状态传入时抛出。
+    """
+
+    if status is WaitRecordStatus.RESOLVED:
+        return WaitLateRejectionReason.WAIT_ALREADY_RESOLVED
+    if status is WaitRecordStatus.FAILED:
+        return WaitLateRejectionReason.WAIT_ALREADY_FAILED
+    if status is WaitRecordStatus.LOST:
+        return WaitLateRejectionReason.WAIT_LOST
+    raise ValueError("wait status is not a terminal late rejection status")
 
 
 def _resolve_wait_event_plan(resolution_digest: str) -> _ResolveWaitEventPlan:
@@ -1149,6 +1362,62 @@ def _tool_result_resolution_payload(
         resume_dispatch_record_id=(
             event_plan.resume_dispatch_record_id if resume else None
         ),
+    )
+
+
+def _wait_late_result_rejected_event_request(
+    *,
+    event_id: str,
+    wait_record: WaitRecordRow,
+    request: ResolveWaitRequest,
+    rejection_reason: WaitLateRejectionReason,
+    payload_plan: _WaitResolutionPayloadPlan,
+) -> EventLogAppendRequest:
+    """构造 ``WAIT_LATE_RESULT_REJECTED`` diagnostic append request。
+
+    :param event_id: diagnostic event id。
+    :param wait_record: 被拒绝结果对应的 wait record。
+    :param request: resolve wait 请求。
+    :param rejection_reason: 拒绝原因。
+    :param payload_plan: 等待结果 payload 规划。
+    :returns: EventLog append request。
+    """
+
+    return EventLogAppendRequest(
+        event_id=event_id,
+        event_class=EventClass.DIAGNOSTIC,
+        session_id=wait_record.session_id,
+        run_id=wait_record.run_id,
+        attempt_id=wait_record.attempt_id,
+        execution_id=wait_record.execution_id,
+        event_type=_EVENT_TYPE_WAIT_LATE_RESULT_REJECTED,
+        occurred_at=request.observed_at,
+        actor=request.context.actor,
+        source=_WAIT_RESOLUTION_SOURCE,
+        client_request_id=None,
+        idempotency_key=request.idempotency_key,
+        policy_decision=None,
+        reason={"reason_code": rejection_reason.value},
+        payload_json=wait_late_result_rejected_payload(
+            wait_id=wait_record.wait_id,
+            run_id=wait_record.run_id,
+            attempt_id=wait_record.attempt_id,
+            tool_call_id=wait_record.tool_call_id,
+            tool_name=wait_record.tool_name,
+            source=request.source.value,
+            idempotency_key=request.idempotency_key,
+            observed_at=request.observed_at.isoformat(),
+            wait_status=wait_record.status.value,
+            rejection_reason=rejection_reason.value,
+            outcome_kind=payload_plan.resolution_kind,
+            outcome_digest=payload_plan.outcome_digest,
+            payload_ref=payload_plan.payload_ref,
+            provider_status_ref=payload_plan.provider_status_ref,
+            external_job_ref=wait_record.external_job_ref,
+            adapter_key=wait_record.adapter_key.value,
+        ),
+        payload_ref=None,
+        payload_digest=None,
     )
 
 

@@ -1504,6 +1504,37 @@ def read_active_wait_records_for_run(
     return tuple(wait_record_row_from_host_row(row) for row in rows)
 
 
+def read_wait_records_for_poll_observation(
+    transaction: HostTransaction,
+) -> tuple[WaitRecordRow, ...]:
+    """读取 poller 本轮可观察的 wait records。
+
+    本 helper 只返回 ``resume_policy=poll`` 且状态仍需 poller 处理的 row。
+    ``cancelled`` row 用于让 adapter 放弃外部 job；调用方不得把它交给
+    ``resolve_wait``。
+
+    :param transaction: 调用方提供的 Host transaction。
+    :returns: poller 可观察 wait record 元组。
+    :raises HostDurableError: row 字段无效时抛出。
+    :raises sqlite3.Error: SQLite 查询失败时由 transaction runner 结构化转换。
+    """
+
+    rows = transaction.fetchall(
+        _WAIT_RECORD_SELECT_SQL
+        + """
+        WHERE resume_policy = ?
+          AND status IN (?, ?)
+        ORDER BY created_event_sequence ASC, wait_id ASC
+        """,
+        (
+            serialize_wait_resume_policy(WaitResumePolicy.POLL),
+            serialize_wait_record_status(WaitRecordStatus.WAITING),
+            serialize_wait_record_status(WaitRecordStatus.CANCELLED),
+        ),
+    )
+    return tuple(wait_record_row_from_host_row(row) for row in rows)
+
+
 def insert_session(
     transaction: HostTransaction, session: SessionRow
 ) -> None:
@@ -2587,6 +2618,70 @@ def resume_waiting_run_row(
             serialize_run_status(RunStatus.WAITING),
             serialize_run_status(RunStatus.CANCELLING),
             serialize_run_status(RunStatus.RECOVERING),
+        ),
+    )
+    return _run_mutation_result(
+        transaction,
+        run_id=run_id,
+        rowcount=result.rowcount,
+        expected_status=RunStatus.WAITING,
+        cas_lost_when_expected=True,
+    )
+
+
+def cancel_waiting_run_row(
+    transaction: HostTransaction,
+    *,
+    run_id: str,
+    current_attempt_id: str,
+    terminal_event_id: str,
+    terminal_event_sequence: int,
+    terminal_at: str,
+) -> RunMutationResult:
+    """CAS 取消 waiting Run。
+
+    :param transaction: 调用方提供的 Host transaction。
+    :param run_id: 目标 Run id。
+    :param current_attempt_id: 期望的 SUSPENDED Attempt id。
+    :param terminal_event_id: ``RUN_CANCELLED`` 事件 id。
+    :param terminal_event_sequence: ``RUN_CANCELLED`` 全局事件序号。
+    :param terminal_at: 固定 UTC terminal timestamp 文本。
+    :returns: Run mutation 结果，区分 updated/cas_lost/not_found/invalid_state。
+    :raises HostDurableError: 输入字段无效时抛出。
+    """
+
+    _validate_run_terminal_update(
+        run_id=run_id,
+        terminal_event_id=terminal_event_id,
+        terminal_event_sequence=terminal_event_sequence,
+        terminal_at=terminal_at,
+    )
+    _require_non_empty_text(current_attempt_id, field_name="current_attempt_id")
+    result = transaction.execute(
+        f"""
+        UPDATE {TABLE_HOST_RUNS}
+        SET
+          status = ?,
+          terminal_event_id = ?,
+          terminal_event_sequence = ?,
+          updated_at = ?,
+          terminal_at = ?
+        WHERE run_id = ?
+          AND status = ?
+          AND current_attempt_id = ?
+          AND terminal_event_id IS NULL
+          AND terminal_event_sequence IS NULL
+          AND terminal_at IS NULL
+        """,
+        (
+            serialize_run_status(RunStatus.CANCELLED),
+            terminal_event_id,
+            terminal_event_sequence,
+            terminal_at,
+            terminal_at,
+            run_id,
+            serialize_run_status(RunStatus.WAITING),
+            current_attempt_id,
         ),
     )
     return _run_mutation_result(

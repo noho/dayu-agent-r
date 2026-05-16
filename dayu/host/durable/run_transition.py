@@ -45,6 +45,8 @@ from dayu.host.durable.state import (
     WaitRecordStatus,
     WorkerKind,
     cancel_cancelling_run_row,
+    cancel_active_wait_records_for_run,
+    cancel_waiting_run_row,
     cancel_running_attempt_row,
     cancel_starting_dispatch_record_row,
     cancel_queued_run_row,
@@ -472,6 +474,36 @@ class CancelActiveAttemptInput:
     run_id: str
     cancel_request_event_id: str
     run_cancelling_event_id: str
+    occurred_at: datetime
+    actor: str
+    source: str
+    client_request_id: str
+    idempotency_key: str
+    reason: str
+    mode: CancelMode
+    call_context_digest: str
+
+
+@dataclass(frozen=True, slots=True)
+class CancelWaitingRunInput:
+    """取消 waiting Run 的输入。
+
+    :param run_id: 目标 Run id。
+    :param cancel_request_event_id: 调用方生成的 ``CANCEL_REQUESTED`` event id。
+    :param run_cancelled_event_id: 调用方生成的 ``RUN_CANCELLED`` event id。
+    :param occurred_at: canonical facts 的发生时间。
+    :param actor: 事件 actor。
+    :param source: 事件 source。
+    :param client_request_id: 客户端幂等请求 id。
+    :param idempotency_key: 幂等 key。
+    :param reason: cancel reason。
+    :param mode: cancel mode。
+    :param call_context_digest: 调用上下文 digest。
+    """
+
+    run_id: str
+    cancel_request_event_id: str
+    run_cancelled_event_id: str
     occurred_at: datetime
     actor: str
     source: str
@@ -1277,6 +1309,93 @@ def accept_worker_running_in_transaction(
         run=read_run_by_id(transaction, run.run_id),
         attempt=attempt_result.row,
         dispatch_record=dispatch_result.row,
+    )
+
+
+def cancel_waiting_run_in_transaction(
+    transaction: HostTransaction,
+    event_log_store: EventLogStore,
+    request: CancelWaitingRunInput,
+) -> RunTransitionResult:
+    """取消 WAITING Run 并标记 active wait records 为 cancelled。
+
+    :param transaction: 调用方提供的 Host transaction。
+    :param event_log_store: EventLog append primitive。
+    :param request: waiting cancel 输入。
+    :returns: transition 结果；前置状态不满足时返回 not_found/invalid_state。
+    :raises HostDurableError: 输入字段或 SQLite 写入无效时由底层抛出。
+    """
+
+    _validate_cancel_waiting_input(request)
+    run = read_run_by_id(transaction, request.run_id)
+    if run is None:
+        return RunTransitionResult(
+            status=StateMutationStatus.NOT_FOUND,
+            run=None,
+            attempt=None,
+            dispatch_record=None,
+        )
+    if run.status != RunStatus.WAITING or run.current_attempt_id is None:
+        return RunTransitionResult(
+            status=StateMutationStatus.INVALID_STATE,
+            run=run,
+            attempt=None,
+            dispatch_record=None,
+        )
+    attempt = read_attempt_by_id(transaction, run.current_attempt_id)
+    active_waits = read_active_wait_records_for_run(transaction, run.run_id)
+    if attempt is None or attempt.status != AttemptStatus.SUSPENDED or not active_waits:
+        return RunTransitionResult(
+            status=StateMutationStatus.INVALID_STATE,
+            run=run,
+            attempt=attempt,
+            dispatch_record=_read_dispatch_for_attempt(transaction, attempt),
+        )
+
+    cancel_request_event = event_log_store.append_event(
+        transaction, _cancel_requested_event_request(request, run)
+    ).row
+    terminal_at = format_utc_timestamp(request.occurred_at)
+    wait_result = cancel_active_wait_records_for_run(
+        transaction,
+        run_id=run.run_id,
+        updated_event_id=cancel_request_event.event_id,
+        updated_event_sequence=cancel_request_event.event_sequence,
+        updated_at=terminal_at,
+        terminal_at=terminal_at,
+    )
+    if wait_result.status != StateMutationStatus.UPDATED:
+        _raise_after_event_append_mutation_failure(
+            mutation_name="cancel active wait records",
+            status=wait_result.status,
+        )
+    run_cancelled_event = event_log_store.append_event(
+        transaction,
+        _waiting_run_cancelled_event_request(
+            request=request,
+            run=run,
+            attempt=attempt,
+            cancel_request_event_id=cancel_request_event.event_id,
+            wait_ids=tuple(row.wait_id for row in wait_result.rows),
+        ),
+    ).row
+    run_result = cancel_waiting_run_row(
+        transaction,
+        run_id=run.run_id,
+        current_attempt_id=attempt.attempt_id,
+        terminal_event_id=run_cancelled_event.event_id,
+        terminal_event_sequence=run_cancelled_event.event_sequence,
+        terminal_at=terminal_at,
+    )
+    run_result = _require_run_mutation_updated(
+        run_result,
+        mutation_name="cancel waiting Run",
+    )
+    return RunTransitionResult(
+        status=run_result.status,
+        run=run_result.row,
+        attempt=attempt,
+        dispatch_record=_read_dispatch_for_attempt(transaction, attempt),
     )
 
 
@@ -2103,7 +2222,10 @@ def _attempt_running_event_request(
 
 def _cancel_requested_event_request(
     request: (
-        CancelQueuedRunInput | CancelPredispatchStartingInput | CancelActiveAttemptInput
+        CancelQueuedRunInput
+        | CancelPredispatchStartingInput
+        | CancelActiveAttemptInput
+        | CancelWaitingRunInput
     ),
     run: RunRow,
 ) -> EventLogAppendRequest:
@@ -2370,6 +2492,55 @@ def _run_terminal_event_request(
             attempt_terminal_event_id=attempt_terminal_event_id,
             dispatch_record=dispatch_record,
         ),
+        payload_ref=None,
+        payload_digest=None,
+    )
+
+
+def _waiting_run_cancelled_event_request(
+    *,
+    request: CancelWaitingRunInput,
+    run: RunRow,
+    attempt: AttemptRow,
+    cancel_request_event_id: str,
+    wait_ids: tuple[str, ...],
+) -> EventLogAppendRequest:
+    """构造 waiting Run ``RUN_CANCELLED`` EventLog append request。
+
+    :param request: waiting cancel 输入。
+    :param run: 目标 Run row。
+    :param attempt: 已 SUSPENDED 的当前 Attempt row。
+    :param cancel_request_event_id: ``CANCEL_REQUESTED`` event id。
+    :param wait_ids: 本次取消的 wait record id 列表。
+    :returns: EventLog append request。
+    """
+
+    return EventLogAppendRequest(
+        event_id=request.run_cancelled_event_id,
+        event_class=EventClass.CANONICAL_FACT,
+        session_id=run.session_id,
+        run_id=run.run_id,
+        attempt_id=attempt.attempt_id,
+        execution_id=None,
+        event_type=_EVENT_TYPE_RUN_CANCELLED,
+        occurred_at=request.occurred_at,
+        actor=request.actor,
+        source=request.source,
+        client_request_id=request.client_request_id,
+        idempotency_key=request.idempotency_key,
+        policy_decision=None,
+        reason={"reason": request.reason, "mode": request.mode.value},
+        payload_json={
+            "run_id": run.run_id,
+            "cancel_request_event_id": cancel_request_event_id,
+            "terminal_attempt_id": attempt.attempt_id,
+            "terminal_attempt_event_id": attempt.terminal_event_id,
+            "waiting_cancelled": True,
+            "wait_ids": list(wait_ids),
+            "reason": request.reason,
+            "mode": request.mode.value,
+            "call_context_digest": request.call_context_digest,
+        },
         payload_ref=None,
         payload_digest=None,
     )
@@ -3493,6 +3664,31 @@ def _validate_cancel_active_input(request: CancelActiveAttemptInput) -> None:
         reason=request.reason,
         mode=request.mode,
         call_context_digest=request.call_context_digest,
+    )
+
+
+def _validate_cancel_waiting_input(request: CancelWaitingRunInput) -> None:
+    """校验 waiting cancel 输入。
+
+    :param request: waiting cancel 输入。
+    :returns: ``None``。
+    :raises HostDurableError: 任一字段无效时抛出。
+    """
+
+    _validate_common_cancel_input(
+        run_id=request.run_id,
+        cancel_request_event_id=request.cancel_request_event_id,
+        run_cancelled_event_id=request.run_cancelled_event_id,
+        actor=request.actor,
+        source=request.source,
+        client_request_id=request.client_request_id,
+        idempotency_key=request.idempotency_key,
+        reason=request.reason,
+        mode=request.mode,
+        call_context_digest=request.call_context_digest,
+    )
+    _require_non_empty_text(
+        request.run_cancelled_event_id, field_name="run_cancelled_event_id"
     )
 
 

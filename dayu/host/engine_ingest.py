@@ -108,6 +108,10 @@ _REASON_STREAM_ENDED_WITHOUT_TERMINAL = "stream_ended_without_terminal"
 _REASON_WORKER_LOST_BEFORE_TERMINAL = "worker_lost_before_terminal"
 _REASON_STALE_EXECUTION_ID = "stale_execution_id"
 _REASON_TERMINAL_ALREADY_CLOSED = "terminal_already_closed"
+_REASON_WAITING_EVENT_CONFIRMATION = "waiting_event_confirmation"
+_REASON_WAITING_EVENT_WITHOUT_HOST_ACCEPTED_REFS = (
+    "waiting_event_without_host_accepted_refs"
+)
 _OWNER_PHASE7 = "phase7"
 _OWNER_PHASE10 = "phase10"
 
@@ -450,7 +454,7 @@ class EngineEventIngestor:
         if event.type == EngineEventType.RUN_SUSPENDED and isinstance(
             event.data, RunSuspendedData
         ):
-            return self._diagnostic_then_failed_waiting(
+            return self._confirm_waiting_engine_event(
                 transaction,
                 context,
                 _run_suspended_payload(context, event.data),
@@ -458,7 +462,7 @@ class EngineEventIngestor:
         if event.type == EngineEventType.TOOL_AWAITING and isinstance(
             event.data, ToolAwaitingData
         ):
-            return self._diagnostic_then_failed_waiting(
+            return self._confirm_waiting_engine_event(
                 transaction,
                 context,
                 _tool_awaiting_payload(context, event.data),
@@ -714,13 +718,13 @@ class EngineEventIngestor:
             reason=data.reason,
         )
 
-    def _diagnostic_then_failed_waiting(
+    def _confirm_waiting_engine_event(
         self,
         transaction: HostTransaction,
         context: _ValidatedCandidate,
         payload: Mapping[str, JsonValue],
     ) -> EngineIngestResult:
-        """写 unsupported waiting diagnostic 后失败收口。
+        """写 Engine 等待事件确认 diagnostic，不改变 Host wait 状态。
 
         :param transaction: 当前 Host transaction。
         :param context: 已校验 candidate 上下文。
@@ -728,21 +732,45 @@ class EngineEventIngestor:
         :returns: ingest 结果。
         """
 
-        diagnostic = self._append_diagnostic_event(
+        reason = (
+            _REASON_WAITING_EVENT_CONFIRMATION
+            if context.run.status is RunStatus.WAITING
+            and context.attempt.status is AttemptStatus.SUSPENDED
+            else _REASON_WAITING_EVENT_WITHOUT_HOST_ACCEPTED_REFS
+        )
+        event_id = _event_id(
+            context.candidate,
+            EventClass.DIAGNOSTIC,
+            _EVENT_TYPE_ENGINE_EVENT_DIAGNOSTIC,
+            0,
+        )
+        existing = _existing_rows(self._event_log_store, transaction, (event_id,))
+        if len(existing) == 1:
+            return EngineIngestResult(
+                status=EngineIngestStatus.DUPLICATE,
+                events=existing,
+                terminal_closeout=False,
+                promotion_triggered=False,
+                reason=reason,
+            )
+        diagnostic_payload: dict[str, JsonValue] = dict(payload)
+        diagnostic_payload["run_status"] = context.run.status.value
+        diagnostic_payload["attempt_status"] = context.attempt.status.value
+        row = self._append_diagnostic_event(
             transaction,
             context=context,
             event_type=_EVENT_TYPE_ENGINE_EVENT_DIAGNOSTIC,
-            reason=_REASON_UNSUPPORTED_WAITING_PATH,
-            payload=payload,
+            reason=reason,
+            payload=diagnostic_payload,
             sub_index=0,
         )
-        closeout = self._close_terminal(
-            transaction,
-            context,
-            _unsupported_waiting_plan(),
-            sub_index_offset=1,
+        return EngineIngestResult(
+            status=EngineIngestStatus.ACCEPTED,
+            events=(row,),
+            terminal_closeout=False,
+            promotion_triggered=False,
+            reason=reason,
         )
-        return _merge_diagnostic_and_closeout(diagnostic, closeout)
 
     def _close_worker_lifecycle(
         self,
@@ -1149,6 +1177,13 @@ def _late_rejection_reason(context: _ValidatedCandidate) -> str | None:
     """
 
     if (
+        context.candidate.engine_event.type
+        in (EngineEventType.RUN_SUSPENDED, EngineEventType.TOOL_AWAITING)
+        and context.run.status is RunStatus.WAITING
+        and context.attempt.status is AttemptStatus.SUSPENDED
+    ):
+        return None
+    if (
         context.run.terminal_event_id is not None
         or context.attempt.terminal_event_id is not None
     ):
@@ -1339,27 +1374,6 @@ def _duplicate_terminal_event_ids(
             ),
         )
     if event.type == EngineEventType.CONTEXT_COMPACTION_REQUESTED:
-        return (
-            _event_id(
-                candidate,
-                EventClass.DIAGNOSTIC,
-                _EVENT_TYPE_ENGINE_EVENT_DIAGNOSTIC,
-                0,
-            ),
-            _event_id(
-                candidate,
-                EventClass.CANONICAL_FACT,
-                _EVENT_TYPE_ATTEMPT_FAILED,
-                1,
-            ),
-            _event_id(
-                candidate,
-                EventClass.CANONICAL_FACT,
-                _EVENT_TYPE_RUN_FAILED,
-                2,
-            ),
-        )
-    if event.type in (EngineEventType.RUN_SUSPENDED, EngineEventType.TOOL_AWAITING):
         return (
             _event_id(
                 candidate,

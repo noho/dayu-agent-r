@@ -296,6 +296,66 @@ def tool_result_wait_resolution_payload(
     }
 
 
+def wait_late_result_rejected_payload(
+    *,
+    wait_id: str,
+    run_id: str,
+    attempt_id: str,
+    tool_call_id: str,
+    tool_name: str,
+    source: str,
+    idempotency_key: str,
+    observed_at: str,
+    wait_status: str,
+    rejection_reason: str,
+    outcome_kind: str,
+    outcome_digest: str,
+    payload_ref: HostPayloadRef | None,
+    provider_status_ref: WaitProviderStatusRef | None,
+    external_job_ref: ExternalJobRef | None,
+    adapter_key: str,
+) -> JsonValue:
+    """构造 ``WAIT_LATE_RESULT_REJECTED`` diagnostic payload。
+
+    :param wait_id: Host wait record id。
+    :param run_id: Run id。
+    :param attempt_id: 产生 wait 的 Attempt id。
+    :param tool_call_id: 工具调用 id。
+    :param tool_name: 工具名。
+    :param source: resolve wait 来源。
+    :param idempotency_key: resolve wait 幂等键。
+    :param observed_at: 外部结果观察时间。
+    :param wait_status: 拒绝时 wait record 状态。
+    :param rejection_reason: 拒绝原因码。
+    :param outcome_kind: 等待结果类别。
+    :param outcome_digest: 等待结果 digest。
+    :param payload_ref: 可选 Host payload descriptor 引用。
+    :param provider_status_ref: 可选 provider 状态引用。
+    :param external_job_ref: 可选外部 job 引用。
+    :param adapter_key: wait adapter key。
+    :returns: 可写入 EventLog 的 JSON payload。
+    """
+
+    return {
+        "wait_id": wait_id,
+        "run_id": run_id,
+        "attempt_id": attempt_id,
+        "tool_call_id": tool_call_id,
+        "tool_name": tool_name,
+        "source": source,
+        "idempotency_key": idempotency_key,
+        "observed_at": observed_at,
+        "wait_status": wait_status,
+        "rejection_reason": rejection_reason,
+        "outcome_kind": outcome_kind,
+        "outcome_digest": outcome_digest,
+        "payload_ref": _payload_ref_json(payload_ref),
+        "provider_status_ref": _provider_status_ref_json(provider_status_ref),
+        "external_job_ref": _external_job_ref_json(external_job_ref),
+        "adapter_key": adapter_key,
+    }
+
+
 def payload_object(event: EventLogRow) -> Mapping[str, JsonValue]:
     """解析 EventLog payload JSON 映射。
 
