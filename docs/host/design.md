@@ -1029,6 +1029,9 @@ Run 接口语义：
 - `retry_run`：公开 Host control API，由调用方主动发起；函数式语义为 `retry(run)`。它在 confirmed failure / recoverable failure 后创建关联的新 Run。原 Run 保持终态不可变；新 Run 可以按 retry policy 复用旧 Run 已接受工具事实，并创建自己的 Attempt。
 - `replay_run`：公开 Host control API，由调用方主动发起；函数式语义为 `replay(run)`。它只用于 final answer 格式、schema、结构或输出 envelope 失败时创建关联的新 Run。原 `SUCCEEDED` Run 不重开；新 Run 默认复用旧 Run 已接受工具事实，并以 no-tool messages 调用做结构修复。事实内容脏、幻觉、业务归因错误、证据不足或证据冲突不属于 replay 场景。
 - `resolve_wait`：等待结果接收与治理入口；接收 poll / callback / manual 已取得的结果，关闭 wait record，append tool terminal/result fact，并创建新 Attempt resume。它不负责等待外部长事务完成。
+  Phase 7 起，`ResolveWaitRequest.outcome_ref: str` 必须被强类型 `outcome` envelope 替代；request 至少区分 completed /
+  failed / cancelled / lost。外部结果引用或 payload ref 只能作为 `outcome` envelope 的受限字段，不能替代显式 outcome
+  类型与 Host 状态机含义。`resolve_wait(host, wait_id, request)` 成功返回当前 `RunSnapshot`。
 
 第一版公共 API 不暴露开放式 policy knobs。Host policy 可以有默认值，但 request 不能携带无结构 `policy_overrides`。`CancelRunRequest.mode` 第一版唯一值为 `graceful`；不支持 `force` / `immediate`。`retry_run` 是否复用 accepted tool facts、重试次数和退避由 Host retry policy 决定。`replay_run` 固定复用源 Run accepted tool facts / evidence anchors，固定 no tools，固定只做结构修复。
 
@@ -2025,14 +2028,24 @@ run_id
 attempt_id
 tool_call_id
 tool_name
-await_spec
+adapter_key
+await_kind
+resume_token
 snapshot_ref?
 external_job_id?
 idempotency_key?
+created_event_id / created_event_sequence
+updated_event_id / updated_event_sequence
 resume_policy: callback | poll | manual
 deadline / expires_at?
 status: waiting | resolved | failed | cancelled | lost
 ```
+
+wait record 是 Host durable state index，不是 EventLog 的替代品，也不是 projection / timeline truth。EventLog 记录
+`TOOL_AWAITING`、`RUN_WAITING`、`ATTEMPT_SUSPENDED`、`RESUME_REQUESTED` 和 tool terminal facts；wait record 负责
+active wait 查询、adapter observation 恢复、取消 CAS、resolution CAS 与 late result 拒绝。`adapter_key`、`await_kind`、
+`resume_token`、`external_job_id` 与 `snapshot_ref` 必须是强类型字段或受限 typed refs，不能把 adapter 对象、callable、
+无结构 metadata bag 或外部系统私有 payload 放进 durable row。
 
 wait record 状态语义：
 
@@ -2059,10 +2072,15 @@ wait signal source
 `poll`、`callback`、`manual` 只是发现等待结果已经到达的 adapter。稳定核心是 Host 内部统一的等待结果接收与治理入口：
 
 ```text
-resolve_wait(wait_id, outcome, source, idempotency_key)
+resolve_wait(wait_id, request) -> RunSnapshot
 ```
 
-`resolve_wait` 不等待外部长事务完成，也不死等业务结果。结果未到时，poll adapter / callback endpoint / manual operator 不应调用它，或调用后得到结构化拒绝，例如 `outcome_not_ready`、`invalid_state`、`wait_not_found`。`resolve_wait` 本身是短事务 command，最多只因 SQLite transaction、CAS 或 busy timeout 做短等待和重试。
+`resolve_wait` request 必须携带 `source`、`idempotency_key`、`observed_at` 与强类型等待结果 envelope。等待结果 envelope
+至少覆盖 completed / failed / cancelled / lost；Host pipeline 负责把 envelope 转成 durable payload、tool terminal canonical
+fact、wait record terminal update 与 resume / closeout 状态迁移。`resolve_wait` 不等待外部长事务完成，也不死等业务结果。
+结果未到时，poll adapter / callback endpoint / manual operator 不应调用它，或调用后得到结构化拒绝，例如
+`outcome_not_ready`、`invalid_state`、`wait_not_found`。`resolve_wait` 本身是短事务 command，最多只因 SQLite transaction、
+CAS 或 busy timeout 做短等待和重试。
 
 resume policy 覆盖 internal / manual、poll、callback 三类入口。所有入口都必须走同一个 `resolve_wait` pipeline，不能各自更新 Run / Attempt / EventLog。
 
@@ -2079,7 +2097,9 @@ resume policy 覆盖 internal / manual、poll、callback 三类入口。所有�
 - Host recovery scan 遇到 `WAITING` Run 时不得创建新 Attempt；它只能恢复 wait record 的 adapter 状态。
 - wait record 的 `resume_policy` / `await_spec` / `external_job_id` 必须包含足以在 Host restart 后恢复 adapter observation 的 durable refs。adapter registry / lookup 由 Host composition root 提供 typed adapter binding；wait record 只保存 adapter key / policy ref / external job refs，不保存进程内 adapter 对象。
 - `poll` adapter 从 wait record 读取 `external_job_id` / `await_spec` 后继续轮询，并在完成时调用同一个 `resolve_wait`。
-- `callback` 入口必须验证认证、重放防护和 idempotency key，然后调用同一个 `resolve_wait`。
+- `callback` source 在 Phase 7 只保留 adapter contract 与 common pipeline 入口；专属 HTTP callback 服务、认证入口、复杂
+  重放防护和外部系统专属 callback adapter 不属于第一版实现。后续 callback 产品化入口必须验证认证、重放防护和 idempotency
+  key，然后调用同一个 `resolve_wait`。
 - `manual` resolve 只能由受控入口触发，并必须写 audit projection。
 - wait poller 是 background runtime 中的 trigger / adapter。它观察 wait record 与外部 job，但只能通过 `resolve_wait` command path 提交结果；不得持有 EventLog appender，不得直接更新 Run / Attempt / wait record terminal state。
 - wait record resolution 与 `RESUME_REQUESTED`、tool terminal/result fact、`RUN_STARTED(start_reason=resume)`、new Attempt row、`ATTEMPT_STARTED`、dispatch record 创建必须在同一事务或等价原子流程中收口。
@@ -2089,7 +2109,10 @@ resume policy 覆盖 internal / manual、poll、callback 三类入口。所有�
 - 同一幂等键 + 不同 outcome 必须返回 `idempotency_conflict`。
 - 已 `resolved` 的 wait record 只允许幂等重放既有结果，不允许第二次 resolution。
 - 非 `waiting` 状态的 wait record 不得被新的 resolution 改写；`cancelled` / `lost` 的迟到结果只能进入 diagnostic / tool trace。
-- `cancelled` / `lost` wait record 的迟到 poll / callback result 不得作为 `canonical_fact` 进入 EventLog；只能进入 diagnostic / tool trace。
+- `cancelled` / `lost` wait record 的迟到 poll / callback result 不得作为 `canonical_fact` 进入 EventLog；必须至少追加
+  `event_class=diagnostic`、`event_type=WAIT_LATE_RESULT_REJECTED` 的 EventLog diagnostic event，payload 包含 `wait_id`、
+  `run_id`、`source`、`idempotency_key`、`observed_at`、rejection reason 与 outcome digest / refs。完整 tool trace
+  projection 可由后续 phase 消费该 diagnostic event 生成。
 - adapter 观察到 wait record cancelled 后，可以 best-effort cancel / revoke / abandon 外部 job；该能力不能影响 Host Run terminal 正确性。
 
 ## 21. Suspend / Resume / Retry / Replay
@@ -2189,7 +2212,10 @@ client requests cancel
 规则：
 
 - `QUEUED` 且尚未创建 Attempt 的 Run 被取消时，直接进入 `CANCELLED`，不创建 Attempt。
-- `WAITING` Run 被取消时，Host 直接收口为 `CANCELLED`：append `CANCEL_REQUESTED`，标记 active wait record cancelled，append `RUN_CANCELLED`；外部 job 的实际取消属于 adapter best-effort 能力，不作为第一版保证。
+- `WAITING` Run 被取消时，Host 直接收口为 `CANCELLED`：append `CANCEL_REQUESTED`，CAS 标记该 Run 下所有
+  active `status=waiting` wait records 为 `cancelled`，append `RUN_CANCELLED`；不创建 resume Attempt。Phase 7 第一版应保持
+  同一 Run 同时只有一个 active wait record 的 invariant，并用测试守护；复数更新是防御性状态收口。外部 job 的实际取消 /
+  revoke / abandon 属于 adapter best-effort 能力，不作为第一版保证，也不能影响 Host terminal correctness。
 - `RECOVERING` 且新 Attempt 尚未 dispatch committed 时直接进入 `CANCELLED`；不创建新 Attempt，不进入 `CANCELLING`。
 - Attempt `STARTING` 且 dispatch record 仍为 `pending` / `waiting_for_lane` 时直接收口：append `CANCEL_REQUESTED`、`ATTEMPT_CANCELLED`、`RUN_CANCELLED`，标记 dispatch record cancelled，cancel lane wait / wake dispatch scheduler，释放 active slot 并触发 queue promotion check；不通知 EngineWorker。
 - dispatch record 已进入 `dispatching` 但 Attempt 仍为 `STARTING` 时，表示 lane 已 acquire 且 dispatching commit 已完成，但 WorkerProxy 尚未 accepted。该窗口仍按 pre-worker direct cancel 收口：append `CANCEL_REQUESTED`、`ATTEMPT_CANCELLED`、`RUN_CANCELLED`，标记 dispatch record `cancelled`，wake dispatch scheduler，释放 active slot 并触发 queue promotion check；不得进入 `CANCELLING`，不得等待不存在的 WorkerProxy。持有 lane token 的 dispatch scheduler 必须在 WorkerProxy 调用前做 final pre-call recheck；若看到 cancel / terminal 已提交或 dispatch record 已 `cancelled`，必须 release lane token 并跳过 WorkerProxy。
@@ -2198,7 +2224,9 @@ client requests cancel
 - cancel 只阻止未来工作，不覆盖已接受事实。
 - 已接受 tool result、awaiting outcome、final decision、canonical facts 继续保留。
 - cancel 与 suspend 同时发生时，由 Host ingest 事务提交顺序决定。suspend / awaiting 已 canonical accepted 后，late cancel 不覆盖它，后续走 `WAITING -> CANCELLED`；cancel 已提交后，late suspend / awaiting candidate 不得把 Run 推入 `WAITING`，只能进入 diagnostic / tool trace 或被拒绝为 canonical fact。
-- 如果外部 job 在 Run 已 `CANCELLED` 后回调或被 poll 到结果，Host 必须拒绝其结果作为 `canonical_fact` 进入 EventLog，只能记录 diagnostic / tool trace。
+- 如果外部 job 在 Run 已 `CANCELLED` 后回调或被 poll / manual 入口带回结果，Host 必须拒绝其结果作为
+  `canonical_fact` 进入 EventLog，并至少追加 `WAIT_LATE_RESULT_REJECTED` diagnostic EventLog event；完整 tool trace 可由
+  后续 projection 消费该 diagnostic event 生成。
 - cancel 控制消息最小携带 `run_id`、`attempt_id`、`execution_id`。
 - 未引入 watchdog 强化治理前，cancel 请求发出后如果 active Attempt 超时仍无法确认，旧 Attempt 进入 `LOST`；若 `CANCEL_REQUESTED` 已 durable accepted 且 terminal fact 未抢先提交，Host 不得继续用户目标，Run 应按 policy 收口到 `CANCELLED` 或 `LOST`，不得创建新的正常执行 Attempt。
 - 同一 `(run_id, client_request_id)` cancel 重试必须返回既有结果，不重复 append `RUN_CANCELLING`。Run 已是 `CANCELLING` 时，新的不同 cancel 请求不能重复制造状态迁移；可按 policy 返回当前状态或记录 diagnostic。
