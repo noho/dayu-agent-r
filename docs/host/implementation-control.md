@@ -485,7 +485,8 @@ clean。追加全仓 deepreview 闭环 artifacts 为 `docs/reviews/repo-review-2
 `docs/reviews/repo-review-fix-re-review-ds-20260516.md` 与
 `docs/reviews/repo-review-fix-re-review-controller-adjudication-20260516-2130.md`。Controller accepted
 DR-ALL-A1 至 DR-ALL-A5 已修复，MiMo / DS re-review 均 PASS；accepted full-repo deepreview loop commit 为
-`3d60fdd`。Phase 8 状态为 completed，当前 gate 为 ready-to-open-draft-PR。Phase 8 exit accepted：committed EventLog
+`3d60fdd`。Phase 8 draft PR 已创建：PR 58
+`https://github.com/noho/dayu-agent-r/pull/58`。当前 gate 为 PR 58 deepreview。Phase 8 状态为 completed。Phase 8 exit accepted：committed EventLog
 consumer framework、projection checkpoint / failure store、typed consumer contract、Host EventLog-backed event stream cursor
 truth regression coverage、minimal RunResult / Session timeline read model、internal repair helper 与 rebuild tests 均已落地。
 Phase 8 remaining risks / owners：automatic after-commit projection catch-up 归 Phase 9 owner；heavy sink /
