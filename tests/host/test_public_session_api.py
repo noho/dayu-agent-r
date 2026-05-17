@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from pathlib import Path
+from typing import cast
 
 import pytest
 
@@ -25,6 +26,12 @@ from dayu.host import (
     ensure_session,
     get_session,
 )
+from dayu.host.durable.errors import HostDurableError
+from dayu.host.durable.state import (
+    SessionRow,
+    _public_session_status_from_durable,
+)
+from dayu.host.durable.transaction import HostTransaction
 
 
 def _options(tmp_path: Path) -> HostCommandHandleOptions:
@@ -56,6 +63,79 @@ def _open_handle(tmp_path: Path) -> HostCommandHandle:
     """
 
     return create_host_command_handle(_options(tmp_path))
+
+
+def _durable_session_row(status: SessionStatus) -> SessionRow:
+    """构造 Session status mapping 测试用 durable Session row。
+
+    :param status: durable Session status。
+    :returns: Session row。
+    """
+
+    return SessionRow(
+        session_id="session-mapping",
+        status=status,
+        metadata_json="{}",
+        created_event_id="event-created",
+        created_event_sequence=1,
+        closed_event_id=None,
+        closed_event_sequence=None,
+        created_at="2026-05-16T00:00:00.000000Z",
+        closed_at=None,
+    )
+
+
+class _UnknownSessionStatusReader:
+    """get_session monkeypatch 用 Session reader。"""
+
+    def __call__(
+        self, transaction: HostTransaction, session_id: str
+    ) -> SessionRow | None:
+        """返回带未知 status 的 durable Session row。
+
+        :param transaction: Host transaction。
+        :param session_id: Session id。
+        :returns: Session row。
+        """
+
+        return _durable_session_row(cast(SessionStatus, "future_session_status"))
+
+
+def test_session_status_mapping_covers_current_session_statuses() -> None:
+    """durable Session status 到 public SessionStatus 的映射覆盖当前枚举。"""
+
+    for status in SessionStatus:
+        assert _public_session_status_from_durable(status) is status
+
+
+def test_session_status_mapping_rejects_unknown_session_status() -> None:
+    """Session status mapping 对未知 durable status fail closed。"""
+
+    with pytest.raises(HostDurableError):
+        _public_session_status_from_durable(
+            cast(SessionStatus, "future_session_status")
+        )
+
+
+def test_get_session_unknown_durable_status_returns_internal_error(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """public get_session 把 durable status mapping 失败转为 HostApiError。"""
+
+    command_handle = _open_handle(tmp_path)
+    try:
+        monkeypatch.setattr(
+            "dayu.host.read_api.read_session_by_id",
+            _UnknownSessionStatusReader(),
+        )
+
+        with pytest.raises(HostApiError) as exc_info:
+            get_session(command_handle, "session-mapping")
+
+        assert exc_info.value.code == HostApiErrorCode.INTERNAL_ERROR
+        assert exc_info.value.retryable is False
+    finally:
+        command_handle.close()
 
 
 def _context(actor: str = "analyst", request_id: str = "trace-1") -> HostCallContext:

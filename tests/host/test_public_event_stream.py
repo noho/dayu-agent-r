@@ -3,8 +3,10 @@
 from __future__ import annotations
 
 import sqlite3
+from dataclasses import dataclass
 from datetime import UTC, datetime
 from pathlib import Path
+from typing import cast
 
 import pytest
 
@@ -37,9 +39,12 @@ from dayu.host.durable.schema import (
 from dayu.host.durable.event_log import (
     EventClass,
     EventLogAppendRequest,
+    EventLogRow,
     EventLogStore,
 )
+from dayu.host.durable.errors import HostDurableError
 from dayu.host.durable.transaction import HostTransaction
+from dayu.host.read_api import _event_view_from_row
 
 _PROJECTION_CONSUMER_ID = "phase8-stream-boundary"
 _PROJECTION_TEST_NOW = "2026-05-16T00:00:00Z"
@@ -76,6 +81,49 @@ def _open_handle(tmp_path: Path) -> HostCommandHandle:
     return create_host_command_handle(_options(tmp_path))
 
 
+def test_event_view_mapping_covers_current_event_classes() -> None:
+    """EventLog class 到 public event class 的映射覆盖当前枚举。"""
+
+    for event_class in EventClass:
+        view = _event_view_from_row(_event_log_row(event_class))
+        assert view.event_class == HostEventClass(event_class.value)
+
+
+def test_event_view_mapping_rejects_unknown_event_class() -> None:
+    """EventLog class mapping 对未知 durable enum fail closed。"""
+
+    with pytest.raises(HostDurableError):
+        _event_view_from_row(
+            _event_log_row(cast(EventClass, "future_event_class"))
+        )
+
+
+def test_stream_run_events_unknown_event_class_returns_internal_error(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """public stream facade 把 EventLog class mapping 失败转为 HostApiError。"""
+
+    host = _open_handle(tmp_path)
+    try:
+        session_id = _session_id(host, "slot-unknown-class")
+        run = start_run(host, _start_request(session_id, "start-run"))
+
+        monkeypatch.setattr(
+            "dayu.host.read_api.read_events_after",
+            _UnknownEventClassReader(run_id=run.run_id, session_id=run.session_id),
+        )
+
+        with pytest.raises(HostApiError) as exc_info:
+            stream_run_events(
+                host, run.run_id, HostStreamCursor(event_sequence=0), limit=1
+            )
+
+        assert exc_info.value.code == HostApiErrorCode.INTERNAL_ERROR
+        assert exc_info.value.retryable is False
+    finally:
+        host.close()
+
+
 def _context(request_id: str = "trace-stream") -> HostCallContext:
     """构造测试用 Host call context。
 
@@ -98,6 +146,71 @@ def _context(request_id: str = "trace-stream") -> HostCallContext:
             correlation_id="corr-stream",
         ),
     )
+
+
+def _event_log_row(
+    event_class: EventClass,
+    *,
+    run_id: str | None = "run-1",
+    session_id: str = "session-1",
+) -> EventLogRow:
+    """构造 event view mapping 测试用 EventLog row。
+
+    :param event_class: durable EventLog class。
+    :param run_id: 可选 Run id。
+    :param session_id: Session id。
+    :returns: EventLog row。
+    """
+
+    return EventLogRow(
+        event_sequence=1,
+        event_id="event-1",
+        event_body_digest="digest",
+        event_class=event_class,
+        session_id=session_id,
+        run_id=run_id,
+        attempt_id=None,
+        execution_id=None,
+        event_type="TYPE_A",
+        occurred_at="2026-05-16T00:00:00.000000Z",
+        actor=None,
+        source=None,
+        client_request_id=None,
+        idempotency_key=None,
+        policy_decision_json=None,
+        reason_json=None,
+        payload_json="{}",
+        payload_ref=None,
+        payload_digest=None,
+        appended_at="2026-05-16T00:00:00.000000Z",
+    )
+
+
+@dataclass(frozen=True, slots=True)
+class _UnknownEventClassReader:
+    """stream_run_events monkeypatch 用 EventLog reader。"""
+
+    run_id: str
+    session_id: str
+
+    def __call__(
+        self, transaction: HostTransaction, cursor: int, *, limit: int
+    ) -> tuple[EventLogRow, ...]:
+        """返回带未知 event_class 的 EventLog row。
+
+        :param transaction: Host transaction。
+        :param cursor: 调用方 cursor。
+        :param limit: 调用方 scan limit。
+        :returns: EventLog row 元组。
+        """
+
+        return (
+            _event_log_row(
+                cast(EventClass, "future_event_class"),
+                run_id=self.run_id,
+                session_id=self.session_id,
+            ),
+        )
 
 
 def _input(display_text: str) -> HostInput:

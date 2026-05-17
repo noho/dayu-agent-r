@@ -3364,7 +3364,7 @@ def session_snapshot_from_rows(
 
     return SessionSnapshot(
         session_id=session.session_id,
-        status=session.status,
+        status=_public_session_status_from_durable(session.status),
         slot=_slot_ref_from_row(slot),
         active_run_id=_read_active_run_id(transaction, session.session_id),
         queued_run_ids=_read_queued_run_ids(transaction, session.session_id),
@@ -3383,22 +3383,50 @@ def run_snapshot_from_row(run: RunRow) -> RunSnapshot:
 
     :param run: durable Run row。
     :returns: 公共 Run snapshot。
+    :raises HostDurableError: Run status 不是当前公共状态 enum 时抛出。
     :raises ValueError: Run row 字段无法满足公共 snapshot 约束时抛出。
     """
 
+    status = _public_run_status_from_durable(run.status)
     return RunSnapshot(
         run_id=run.run_id,
         session_id=run.session_id,
-        status=run.status,
+        status=status,
         current_attempt_id=run.current_attempt_id,
         terminal_result_summary=_terminal_result_summary_from_status(
-            run.status
+            status
         ),
         event_cursor=HostStreamCursor(event_sequence=_run_event_cursor(run)),
         source_run_id=run.source_run_id,
         source_run_relation=run.source_run_relation,
         outbox_summary=None,
     )
+
+
+def _public_session_status_from_durable(status: SessionStatus) -> SessionStatus:
+    """把 durable Session row 状态映射为 public SessionStatus。
+
+    :param status: durable row 中的 Session 状态。
+    :returns: public SessionStatus。
+    :raises HostDurableError: 状态不是当前 public enum 成员时抛出。
+    """
+
+    if not isinstance(status, SessionStatus):
+        raise HostDurableError("Session row status is invalid")
+    return status
+
+
+def _public_run_status_from_durable(status: RunStatus) -> RunStatus:
+    """把 durable Run row 状态映射为 public RunStatus。
+
+    :param status: durable row 中的 Run 状态。
+    :returns: public RunStatus。
+    :raises HostDurableError: 状态不是当前 public enum 成员时抛出。
+    """
+
+    if not isinstance(status, RunStatus):
+        raise HostDurableError("Run row status is invalid")
+    return status
 
 
 def _terminal_result_summary_from_status(
