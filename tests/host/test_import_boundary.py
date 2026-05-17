@@ -34,6 +34,14 @@ RUNTIME_FORBIDDEN_PREFIXES: tuple[str, ...] = (
     "dayu.ui",
     "dayu.fins",
 )
+HOST_BUSINESS_TOOL_SCAN_FORBIDDEN_PREFIXES: tuple[str, ...] = (
+    "importlib",
+    "pkgutil",
+)
+FETCH_MORE_ALLOWED_RELATIVE_FILES: frozenset[str] = frozenset(
+    {"host/tool_runtime.py", "host/tooling.py"}
+)
+FETCH_MORE_OWNERSHIP_TOKEN: str = "fetch_more"
 ENGINE_FORBIDDEN_PREFIXES: tuple[str, ...] = ("dayu.host",)
 HOST_ENGINE_CONTRACT_ALLOWED_MODULES: tuple[str, ...] = (
     "api.py",
@@ -178,6 +186,40 @@ def test_host_does_not_import_upper_or_business_layers() -> None:
             if _matches_prefix(module, HOST_FORBIDDEN_PREFIXES):
                 violations.append((str(file_path), module))
     assert not violations, f"host forbidden imports: {violations}"
+
+
+def test_host_does_not_import_business_tool_scanners() -> None:
+    """Host 不得通过 importlib / pkgutil 扫描业务工具模块。
+
+    :returns: ``None``。
+    :raises AssertionError: Host 模块导入动态模块扫描能力时抛出。
+    """
+
+    violations: list[tuple[str, str]] = []
+    for file_path in _iter_python_files(_host_root()):
+        for module in _imported_module_names(file_path.read_text(encoding="utf-8")):
+            if _matches_prefix(module, HOST_BUSINESS_TOOL_SCAN_FORBIDDEN_PREFIXES):
+                violations.append((str(file_path), module))
+    assert not violations, f"host business tool scanner imports: {violations}"
+
+
+def test_fetch_more_token_stays_inside_toolruntime_owner_modules() -> None:
+    """``fetch_more`` 只能出现在 ToolRuntime factory / tooling policy owner。
+
+    :returns: ``None``。
+    :raises AssertionError: Host 其它模块或 Engine / contracts / runtime 引用
+        ``fetch_more`` 时抛出。
+    """
+
+    dayu_root = _host_root().parent
+    violations: list[str] = []
+    for file_path in _iter_python_files(dayu_root):
+        relative_path = file_path.relative_to(dayu_root).as_posix()
+        if relative_path in FETCH_MORE_ALLOWED_RELATIVE_FILES:
+            continue
+        if FETCH_MORE_OWNERSHIP_TOKEN in file_path.read_text(encoding="utf-8"):
+            violations.append(str(file_path))
+    assert not violations, f"fetch_more references outside ToolRuntime owner: {violations}"
 
 
 def test_host_engine_imports_stay_on_allowed_boundary_modules() -> None:

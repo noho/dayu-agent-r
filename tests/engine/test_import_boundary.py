@@ -32,11 +32,14 @@ ENGINE_CORE_FORBIDDEN_PREFIXES: tuple[str, ...] = (
 
 ENGINE_CORE_FORBIDDEN_SUBSTRINGS: tuple[str, ...] = ("tool_trace",)
 ENGINE_TOOL_DECLARATION_MODULE: str = "dayu.contracts.tool_declaration"
+ENGINE_TOOL_DECLARATION_FORBIDDEN_MODULES: tuple[str, ...] = (
+    ENGINE_TOOL_DECLARATION_MODULE,
+)
 ENGINE_TOOL_OWNERSHIP_FORBIDDEN_SYMBOLS: frozenset[str] = frozenset(
-    {"ToolRuntime", "ToolBundle", "ToolDefinition"}
+    {"ToolRuntime", "ToolBundle", "ToolCallable", "ToolDefinition"}
 )
 ENGINE_TOOL_DECLARATION_STAR_IMPORT_FORBIDDEN_SYMBOLS: frozenset[str] = frozenset(
-    {"ToolBundle", "ToolDefinition"}
+    {"ToolBundle", "ToolCallable", "ToolDefinition"}
 )
 STAR_IMPORT_SYMBOL: str = "*"
 
@@ -100,6 +103,9 @@ def _engine_tool_ownership_import_violations(
     """
 
     violations: list[tuple[str, str, str]] = []
+    for module in _imported_module_names(source):
+        if _matches_prefix(module, ENGINE_TOOL_DECLARATION_FORBIDDEN_MODULES):
+            violations.append((str(file_path), module, "module"))
     for module, symbol in _imported_symbol_refs(source):
         if symbol in ENGINE_TOOL_OWNERSHIP_FORBIDDEN_SYMBOLS:
             violations.append((str(file_path), module, symbol))
@@ -190,6 +196,8 @@ def test_engine_tool_ownership_boundary_detects_tool_declaration_star_import() -
     source = "from dayu.contracts.tool_declaration import *\n"
 
     assert _engine_tool_ownership_import_violations(file_path, source) == [
+        (str(file_path), ENGINE_TOOL_DECLARATION_MODULE, "module"),
         (str(file_path), ENGINE_TOOL_DECLARATION_MODULE, "ToolBundle"),
+        (str(file_path), ENGINE_TOOL_DECLARATION_MODULE, "ToolCallable"),
         (str(file_path), ENGINE_TOOL_DECLARATION_MODULE, "ToolDefinition"),
     ]

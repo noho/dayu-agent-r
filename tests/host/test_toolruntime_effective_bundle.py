@@ -24,6 +24,7 @@ from dayu.host.tool_runtime import (
     EffectiveToolBundleBuildRequest,
     EffectiveToolBundleBuilder,
     FetchMoreToolCallable,
+    ToolRuntimeHandle,
     ToolRuntimeBuildRequest,
     ToolRuntimeUnsupportedExecutor,
 )
@@ -199,6 +200,68 @@ def test_enabled_fetch_more_policy_without_truncation_does_not_inject() -> None:
         handle.effective_bundle.injected_framework_tool_names
     )
     assert "fetch_more" not in handle.effective_bundle.definitions_by_name
+
+
+def test_factory_creates_attempt_local_fetch_more_callable() -> None:
+    """factory 每次构造 attempt-local effective bundle 与 fetch_more callable。
+
+    :returns: ``None``。
+    :raises AssertionError: ``fetch_more`` callable 被跨 attempt 复用或污染
+        business bundle 时抛出。
+    """
+
+    first_handle = _fetch_more_enabled_handle()
+    second_handle = _fetch_more_enabled_handle()
+
+    assert first_handle.effective_bundle is not second_handle.effective_bundle
+    assert (
+        first_handle.effective_bundle.fetch_more_callable
+        is not second_handle.effective_bundle.fetch_more_callable
+    )
+    assert first_handle.effective_bundle.fetch_more_callable is (
+        first_handle.effective_bundle.definitions_by_name["fetch_more"].callable
+    )
+    assert second_handle.effective_bundle.fetch_more_callable is (
+        second_handle.effective_bundle.definitions_by_name["fetch_more"].callable
+    )
+    assert first_handle.effective_bundle.business_bundle is not (
+        second_handle.effective_bundle.business_bundle
+    )
+    assert "fetch_more" not in {
+        definition.name
+        for definition in first_handle.effective_bundle.business_bundle.definitions
+    }
+    assert "fetch_more" not in {
+        definition.name
+        for definition in second_handle.effective_bundle.business_bundle.definitions
+    }
+
+
+def _fetch_more_enabled_handle() -> ToolRuntimeHandle:
+    """构造启用 ``fetch_more`` 的 attempt-local ToolRuntime handle。
+
+    :returns: 启用截断 manager 与 ``fetch_more`` framework tool 的 handle。
+    :raises Exception: ToolRuntime 构造过程透传异常。
+    """
+
+    return DefaultToolRuntimeFactory(EffectiveToolBundleBuilder()).create_tool_runtime(
+        ToolRuntimeBuildRequest(
+            effective_bundle_request=EffectiveToolBundleBuildRequest(
+                business_tool_bundle=ToolBundle(
+                    definitions=(_definition("lookup_filing"),)
+                ),
+                source_refs=(_source_ref(),),
+                framework_tool_policy=FrameworkToolPolicyView(
+                    reserved_framework_tool_names=frozenset(
+                        {FrameworkToolName.FETCH_MORE}
+                    ),
+                    enabled_framework_tools=frozenset({FrameworkToolName.FETCH_MORE}),
+                ),
+                policy_snapshot_digest=None,
+                enable_truncation_manager=True,
+            )
+        )
+    )
 
 
 def _parameters() -> ToolParametersSchema:
