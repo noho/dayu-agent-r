@@ -223,7 +223,7 @@ Phase Map 中每个 phase 必须使用统一条目格式。模板如下：
 约束：本节只保留当前 gate 结论；phase 过程流水必须归档到 `历史记录`，仍需追踪的风险或后续 owner 必须写入 `Open Questions 与风险追踪` 的 `追踪区`。
 
 当前 work unit：P9.5 Pre-P10 Cross-Repository Hardening PR。
-当前 gate：draft-PR-pass。
+当前 gate：P9.5 completed。
 下一 gate：用户手工 review / merge decision。
 
 ## Phase Map
@@ -2032,6 +2032,15 @@ P9.5 收口清单：
 - 当前无 PR review blocking fix。
 
 ## 历史记录
+
+### 2026-05-18 P9.5 completed
+
+P9.5 Pre-P10 Cross-Repository Hardening PR 已完成。P9.5 已完成 design discussion、implementation-ready plan、
+S1-S18 implementation / review / accepted commits、aggregate deepreview、accepted aggregate fixes、draft PR create、
+PR review 与 `draft-PR-pass`。Draft PR 为 PR 60：
+`https://github.com/noho/dayu-agent-r/pull/60`。PR 仍为 draft；mark ready for review、merge、request reviewers、
+approve、delete branch 或对外 comment 仍需用户额外授权。当前 gate 为 `P9.5 completed`，后续入口为用户手工
+review / merge decision。
 
 ### 2026-05-17 P9.5 draft PR gate passed
 
