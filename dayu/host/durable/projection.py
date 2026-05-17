@@ -162,7 +162,7 @@ def advance_projection_checkpoint(
     checkpoint = ensure_projection_checkpoint(transaction, consumer_id, now=now)
     if event_sequence <= checkpoint.checkpoint_event_sequence:
         raise HostDurableError("projection checkpoint cannot move backwards")
-    transaction.execute(
+    result = transaction.execute(
         f"""
         UPDATE {TABLE_HOST_PROJECTION_CHECKPOINTS}
         SET
@@ -171,12 +171,27 @@ def advance_projection_checkpoint(
           last_success_at = ?,
           updated_at = ?
         WHERE consumer_id = ?
+          AND checkpoint_event_sequence = ?
         """,
-        (event_sequence, event_id, now, now, consumer_id),
+        (
+            event_sequence,
+            event_id,
+            now,
+            now,
+            consumer_id,
+            checkpoint.checkpoint_event_sequence,
+        ),
     )
+    if result.rowcount != 1:
+        raise HostDurableError("projection checkpoint advance lost CAS race")
     updated = read_projection_checkpoint(transaction, consumer_id)
     if updated is None:
         raise HostDurableError("projection checkpoint advance failed")
+    if (
+        updated.checkpoint_event_sequence != event_sequence
+        or updated.checkpoint_event_id != event_id
+    ):
+        raise HostDurableError("projection checkpoint advance lost CAS race")
     return updated
 
 

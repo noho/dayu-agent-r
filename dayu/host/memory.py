@@ -154,6 +154,7 @@ class MemoryDiagnosticReason(StrEnum):
     INLINE_DELTA_REPAIR_INCLUDED = "inline_delta_repair_included"
     SNAPSHOT_MISSING = "snapshot_missing"
     SNAPSHOT_DAMAGED = "snapshot_damaged"
+    UNSUPPORTED_EVENT_TYPE = "unsupported_event_type"
     SNAPSHOT_LAG_OVER_THRESHOLD = "snapshot_lag_over_threshold"
     BUDGET_LIMIT_REACHED = "budget_limit_reached"
     EMPTY_EVENT_LOG_SNAPSHOT = "empty_event_log_snapshot"
@@ -1712,10 +1713,6 @@ def _unsupported_event_type_diagnostic(
 ) -> MemoryDiagnostic:
     """构造未知 event type 的非静默 diagnostic。
 
-    当前 durable schema 尚未允许独立的 ``unsupported_event_type`` diagnostic
-    reason，因此 reason 使用可持久化的 ``SNAPSHOT_DAMAGED``，并在 message
-    中记录 Host 中立的 unsupported event type code。
-
     :param event: 未识别的 projection event。
     :param policy_digest: memory policy digest。
     :returns: memory diagnostic。
@@ -1724,11 +1721,11 @@ def _unsupported_event_type_diagnostic(
     item_id = _item_id(event, MemoryExcludedReason.UNSUPPORTED_EVENT_TYPE.value)
     return MemoryDiagnostic(
         diagnostic_id=_diagnostic_id(
-            MemoryDiagnosticReason.SNAPSHOT_DAMAGED,
+            MemoryDiagnosticReason.UNSUPPORTED_EVENT_TYPE,
             event_sequence=event.event_sequence,
             item_id=item_id,
         ),
-        reason=MemoryDiagnosticReason.SNAPSHOT_DAMAGED,
+        reason=MemoryDiagnosticReason.UNSUPPORTED_EVENT_TYPE,
         message=(
             f"{MemoryExcludedReason.UNSUPPORTED_EVENT_TYPE.value}: "
             f"event_type={event.event_type}"

@@ -7,6 +7,7 @@ namespace 下的诊断日志，且不污染 RunnerEvent 流。
 
 from __future__ import annotations
 
+import asyncio
 import logging
 
 import pytest
@@ -31,6 +32,31 @@ def _attach_caplog_to_dayu(
     namespace_logger = logging.getLogger("dayu")
     namespace_logger.addHandler(caplog.handler)
     return namespace_logger
+
+
+async def _never_finishing_readany() -> bytes:
+    """模拟永不自然返回的 ``readany``。
+
+    :returns: 不会返回。
+    :raises asyncio.CancelledError: task 被取消时由 ``asyncio.sleep`` 抛出。
+    """
+
+    await asyncio.sleep(3600.0)
+    return b""
+
+
+async def _readany_raises_runtime_error_on_cancel() -> bytes:
+    """模拟 ``readany`` 在取消清理阶段抛出普通异常。
+
+    :returns: 不会返回。
+    :raises RuntimeError: task 被取消后抛出。
+    """
+
+    try:
+        await asyncio.sleep(3600.0)
+    except asyncio.CancelledError as exc:
+        raise RuntimeError("read cleanup failed") from exc
+    return b""
 
 
 @pytest.mark.asyncio
@@ -105,6 +131,42 @@ async def test_cancelled_diagnostic_logged(
     assert any(
         "runner.cancelled" in r.getMessage() for r in caplog.records
     )
+
+
+@pytest.mark.asyncio
+async def test_cancel_pending_readany_cancelled_error_is_silent(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """pending readany 正常响应取消时不写 warning。"""
+
+    task = asyncio.create_task(_never_finishing_readany())
+    await asyncio.sleep(0)
+
+    with caplog.at_level(
+        logging.WARNING, logger="dayu.engine.runners.openai.runner"
+    ):
+        await AsyncOpenAIRunner._cancel_pending_readany(task)
+
+    assert task.cancelled()
+    assert "runner.pending_readany_cancel_failed" not in caplog.text
+
+
+@pytest.mark.asyncio
+async def test_cancel_pending_readany_exception_logs_warning(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """pending readany 取消清理抛普通异常时记录 warning 与异常类型。"""
+
+    task = asyncio.create_task(_readany_raises_runtime_error_on_cancel())
+    await asyncio.sleep(0)
+
+    with caplog.at_level(
+        logging.WARNING, logger="dayu.engine.runners.openai.runner"
+    ):
+        await AsyncOpenAIRunner._cancel_pending_readany(task)
+
+    assert "runner.pending_readany_cancel_failed" in caplog.text
+    assert "error_type=RuntimeError" in caplog.text
 
 
 @pytest.mark.asyncio

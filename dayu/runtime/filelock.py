@@ -197,8 +197,10 @@ class RuntimeFileLock:
 
         token = self._active_token
         if token is not None:
-            token.release()
-            self._active_token = None
+            try:
+                token.release()
+            finally:
+                self._active_token = None
 
 
 def file_lock(

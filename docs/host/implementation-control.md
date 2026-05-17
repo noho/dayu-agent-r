@@ -221,7 +221,8 @@ Phase Map 中每个 phase 必须使用统一条目格式。模板如下：
 ## 当前状态
 
 Phase 9 draft PR 已创建：PR 59 https://github.com/noho/dayu-agent-r/pull/59。Accepted PR review commit 为 `67458cb`。
-当前 gate 为 draft-PR-pass。
+P9 all-repository follow-up fix pass 已完成本地验证；最终 MiMo / DS re-review 均 PASS。
+当前 gate 为 draft-PR-pass follow-up accepted。
 
 约束：本节只保留当前 gate 结论；phase 过程流水必须归档到 `历史记录`，仍需追踪的风险或后续 owner 必须写入 `Open Questions 与风险追踪` 的 `追踪区`。
 
@@ -817,6 +818,11 @@ Phase 按依赖关系推进：先实现被其它阶段依赖的公共契约、ru
 - P9 aggregate deepreview completed；verdict 为 PASS；accepted deepreview commit 为 `cc05f79`。
 - P9 draft PR created：PR 59 https://github.com/noho/dayu-agent-r/pull/59；PR review gate completed，verdict 为 PASS；
   accepted PR review commit 为 `67458cb`。
+- P9 all-repository follow-up review 已由 AgentMiMo 与 AgentDS 执行，初审发现若干跨仓 correctness / observability hardening；
+  controller 已接受其中低风险项并完成 fix / validation。最新 DS follow-up finding 中，SSE 已产出事件后的 retry、SSE tool-call
+  final finish parity 与 runtime file lock release failure cleanup 已修复；minimal read model consumer isolation 作为 schema
+  design debt deferred。最终 AgentMiMo / AgentDS re-review 均 PASS。Controller adjudication artifact 为
+  `docs/reviews/p9-all-repo-review-controller-adjudication-20260517.md`。
 
 目标：
 - 实现 session-level Conversation Memory projection、stable layer、history pool、snapshot cursor、RunInputBuilder memory provider 与 projection repair path。
@@ -889,6 +895,38 @@ Phase 按依赖关系推进：先实现被其它阶段依赖的公共契约、ru
 - 后续 phase 可依赖的稳定契约：memory snapshot cursor、stable layer input provider、projection repair semantics。
 - 需要追踪到后续 phase 的事项：长期 memory / query-time retrieval、业务 signal ledger、signal-to-outcome verification 后续单独设计；
   P9 只预留 Host 中立 evidence anchor / claim status / provenance / trace 边界。
+- P9 all-repository follow-up 已明确 defer 的非 P9 blocking 架构债：Engine runner factory / registry、minimal read model
+  multi-consumer schema、Phase 11 RECOVERING 流程测试、Host durable/API error taxonomy、ToolRuntime / memory 模块拆分、
+  LocalProxy close/events race、read API enum mapping、lane heartbeat/shield hardening 与消息 / 工具结果大小治理。
+
+#### Phase 9 all-repository follow-up 追踪
+
+结论：
+
+- All-repository review artifacts 为 `docs/reviews/repo-review-20260517-1402.md`、
+  `docs/reviews/repo-review-20260517-1411.md`、`docs/reviews/repo-review-20260517-1435.md`、
+  `docs/reviews/repo-review-20260517-1434.md`、`docs/reviews/repo-review-20260517-1503.md` 与
+  `docs/reviews/repo-review-20260517-1507.md`；DS follow-up artifact 为
+  `docs/reviews/repo-review-ds-20260517-1521.md`。Final re-review artifacts 为
+  `docs/reviews/repo-review-final-mimo-20260517.md` 与 `docs/reviews/repo-review-final-ds-20260517.md`，两者均 PASS。
+- Controller adjudication artifact 为 `docs/reviews/p9-all-repo-review-controller-adjudication-20260517.md`。
+- Controller 接受并修复 projection checkpoint CAS、non-stream / SSE tool call parity、tool call content fallback、timeout
+  elapsed 统计、active worker / wait adapter / readany / startup closeout 日志、unsupported memory event diagnostic reason、
+  EventLog run/type index、runtime weak typing guard、RunnerSpec 边界校验、BatchToolExecutionOutcome record identity 校验与
+  malformed SSE usage 非终止处理、dispatch durable retry exhausted 非终态重排、SSE 已产出事件后的 retriable read failure 禁止跨
+  attempt retry、SSE tool-call final finish 强制 `TOOL_CALLS`，以及 runtime file lock release failure 后清理 active token。
+
+验证：
+
+- `pytest -q`：966 passed。
+- `pyright dayu tests`：0 errors。
+- `git diff --check`：通过。
+
+追踪项：
+
+- Engine runner DI / factory、minimal read model 多 consumer reset、RECOVERING 状态机、durable/API error taxonomy、Command
+  service caching、LocalProxy race、read API enum mapping、ToolRuntime / memory 模块拆分、lane hardening 与消息 / 工具结果大小上限
+  均为后续 owned work，不阻塞 P9。
 
 ### Phase 10. Context Governance / Compaction
 
@@ -1635,8 +1673,8 @@ Phase 按依赖关系推进：先实现被其它阶段依赖的公共契约、ru
 
 - Slice 3 必须确保 `RunInputBuilder` 按 P9 固定顺序消费 memory stable layer，且 legacy `SessionContinuityProvider`
   不再注入未经过 memory history pool 预算的 historical raw turns。S3 已完成。
-- Unsupported event type 目前复用现有 durable diagnostic reason，并在 message 中写入 `unsupported_event_type` code；
-  若后续需要独立 diagnostic reason，必须作为 schema hardening work unit 处理，不夹带进 S3。
+- Unsupported event type 初版曾复用通用 diagnostic reason；P9 all-repository follow-up 已新增独立
+  `unsupported_event_type` reason，并随 schema v7 落地。
 - `stable_layer_size_units` 在 S2 仍未消费；S3 memory message renderer 必须裁决该上限如何约束 rendered stable layer。
   S3 已裁决为：stable memory blocks 按 P9 优先级消费该 cap，超预算 block 记录 transient
   `BUDGET_LIMIT_REACHED` diagnostic；recent raw turns、episode summaries 与当前 prompt 不进入 stable layer cap。
@@ -1692,8 +1730,8 @@ Phase 按依赖关系推进：先实现被其它阶段依赖的公共契约、ru
 
 追踪项：
 
-- `MemoryIncludedReason` / `MemoryExcludedReason` 粒度低于 plan 规格、unsupported event diagnostic reason 与 per-item
-  excluded reason 精度，owner 为 Phase 10 / Tool Trace / schema hardening。
+- `MemoryIncludedReason` / `MemoryExcludedReason` 粒度低于 plan 规格与 per-item excluded reason 精度，owner 为
+  Phase 10 / Tool Trace / schema hardening；unsupported event diagnostic reason 已在 all-repository follow-up 修复。
 - `WorkingAssumptionView` 暂无主动数据填充路径，owner 为 Phase 10 proactive compaction / issue 39 retrieval。
 - `current_goal` first-write-wins、`SessionContinuityProvider` snapshot 参数清理、preview facts exclusion 专项测试、memory import
   boundary 自动化测试与 catch-up end-to-end 专项测试，owner 为 Host hardening。

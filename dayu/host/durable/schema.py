@@ -22,7 +22,7 @@ from dayu.host.api import (
 )
 from dayu.host.durable.errors import HostSchemaMismatchError
 
-HOST_SCHEMA_VERSION = 6
+HOST_SCHEMA_VERSION = 7
 """当前 Host durable SQLite schema version。"""
 
 TABLE_EVENT_LOG = "event_log"
@@ -68,6 +68,7 @@ INDEX_HOST_MEMORY_ITEMS_SESSION_SEQUENCE = "host_memory_items_session_sequence"
 INDEX_HOST_MEMORY_DIAGNOSTICS_SESSION_REASON = (
     "host_memory_diagnostics_session_reason"
 )
+INDEX_EVENT_LOG_RUN_TYPE_SEQUENCE = "event_log_run_type_sequence"
 
 FOUNDATION_TABLES: tuple[str, ...] = (
     TABLE_EVENT_LOG,
@@ -192,6 +193,12 @@ CREATE TABLE IF NOT EXISTS {TABLE_EVENT_LOG} (
   FOREIGN KEY(payload_ref) REFERENCES {TABLE_PAYLOAD_DESCRIPTORS}(payload_ref),
   CHECK (payload_ref IS NULL OR payload_digest IS NOT NULL)
 )
+"""
+
+_EVENT_LOG_RUN_TYPE_SEQUENCE_INDEX_DDL = f"""
+CREATE INDEX IF NOT EXISTS {INDEX_EVENT_LOG_RUN_TYPE_SEQUENCE}
+ON {TABLE_EVENT_LOG}(run_id, event_type, event_sequence)
+WHERE run_id IS NOT NULL
 """
 
 _IDEMPOTENCY_RECORDS_DDL = f"""
@@ -759,6 +766,7 @@ CREATE TABLE IF NOT EXISTS {TABLE_HOST_MEMORY_DIAGNOSTICS} (
       'inline_delta_repair_included',
       'snapshot_missing',
       'snapshot_damaged',
+      'unsupported_event_type',
       'snapshot_lag_over_threshold',
       'budget_limit_reached',
       'empty_event_log_snapshot'
@@ -854,6 +862,11 @@ FOUNDATION_DDL: tuple[str, ...] = (
 )
 """按外键依赖顺序排列的 Phase 2 foundation DDL。"""
 
+FOUNDATION_INDEX_DDL: tuple[str, ...] = (
+    _EVENT_LOG_RUN_TYPE_SEQUENCE_INDEX_DDL,
+)
+"""Phase 2 foundation table index DDL。"""
+
 PHASE3_STATE_DDL: tuple[str, ...] = (
     _HOST_SESSIONS_DDL,
     _HOST_SESSION_SLOTS_DDL,
@@ -908,6 +921,7 @@ HOST_DURABLE_DDL: tuple[str, ...] = (
     + PHASE3_STATE_DDL
     + PROJECTION_DDL
     + MEMORY_PROJECTION_DDL
+    + FOUNDATION_INDEX_DDL
     + PHASE3_INDEX_DDL
     + PROJECTION_INDEX_DDL
     + MEMORY_PROJECTION_INDEX_DDL

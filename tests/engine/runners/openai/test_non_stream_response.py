@@ -112,3 +112,120 @@ def test_non_stream_tool_calls_emitted() -> None:
     assert len(done) == 1
     assert isinstance(done[0].data, RunnerDoneData)
     assert done[0].data.finish_reason is FinishReason.TOOL_CALLS
+
+
+def test_non_stream_tool_calls_without_finish_reason_done_as_tool_calls() -> None:
+    """非流式 tool_calls 缺 finish_reason 时与 SSE 路径一致收口为 TOOL_CALLS。"""
+
+    payload = json.dumps(
+        {
+            "choices": [
+                {
+                    "message": {
+                        "role": "assistant",
+                        "content": "I will call a tool.",
+                        "tool_calls": [
+                            {
+                                "id": "c1",
+                                "type": "function",
+                                "function": {
+                                    "name": "ping",
+                                    "arguments": "{\"a\":1}",
+                                },
+                            }
+                        ],
+                    },
+                }
+            ]
+        }
+    ).encode("utf-8")
+    events = list(
+        parse_non_stream_response(
+            payload, hook=make_no_thought_hook(), provider_request_id=None
+        )
+    )
+
+    done = [event for event in events if event.type is RunnerEventType.RUNNER_DONE]
+    assert len(done) == 1
+    assert isinstance(done[0].data, RunnerDoneData)
+    assert done[0].data.finish_reason is FinishReason.TOOL_CALLS
+
+
+def test_non_stream_tool_calls_with_stop_finish_reason_done_as_tool_calls() -> None:
+    """provider 返回 tool_calls 但 finish_reason=stop 时 Done 仍为 TOOL_CALLS。"""
+
+    payload = json.dumps(
+        {
+            "choices": [
+                {
+                    "finish_reason": "stop",
+                    "message": {
+                        "role": "assistant",
+                        "content": "I will call a tool.",
+                        "tool_calls": [
+                            {
+                                "id": "c1",
+                                "type": "function",
+                                "function": {
+                                    "name": "ping",
+                                    "arguments": "{\"a\":1}",
+                                },
+                            }
+                        ],
+                    },
+                }
+            ]
+        }
+    ).encode("utf-8")
+    events = list(
+        parse_non_stream_response(
+            payload, hook=make_no_thought_hook(), provider_request_id=None
+        )
+    )
+
+    done = [event for event in events if event.type is RunnerEventType.RUNNER_DONE]
+    assert len(done) == 1
+    assert isinstance(done[0].data, RunnerDoneData)
+    assert done[0].data.finish_reason is FinishReason.TOOL_CALLS
+
+
+def test_non_stream_tool_call_index_ignores_non_dict_elements() -> None:
+    """非流式 tool_calls 的 index fallback 只按有效对象计数。"""
+
+    payload = json.dumps(
+        {
+            "choices": [
+                {
+                    "finish_reason": "tool_calls",
+                    "message": {
+                        "role": "assistant",
+                        "tool_calls": [
+                            None,
+                            {
+                                "id": "c1",
+                                "type": "function",
+                                "function": {
+                                    "name": "ping",
+                                    "arguments": "{}",
+                                },
+                            },
+                        ],
+                    },
+                }
+            ]
+        }
+    ).encode("utf-8")
+    events = list(
+        parse_non_stream_response(
+            payload, hook=make_no_thought_hook(), provider_request_id=None
+        )
+    )
+
+    completed = [
+        e for e in events
+        if e.type is RunnerEventType.RUNNER_TOOL_CALLS_COMPLETED
+    ]
+    assert len(completed) == 1
+    data = completed[0].data
+    assert isinstance(data, RunnerToolCallsCompletedData)
+    assert data.tool_calls[0].index_in_iteration == 0

@@ -1327,6 +1327,10 @@ def test_unknown_event_type_records_diagnostic_and_advances_cursor() -> None:
     assert snapshot.conversation_continuity.items == ()
     assert len(snapshot.diagnostics) == 1
     assert (
+        snapshot.diagnostics[0].reason
+        is MemoryDiagnosticReason.UNSUPPORTED_EVENT_TYPE
+    )
+    assert (
         MemoryExcludedReason.UNSUPPORTED_EVENT_TYPE.value
         in snapshot.diagnostics[0].message
     )

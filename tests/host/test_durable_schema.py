@@ -17,6 +17,7 @@ from dayu.host.durable.options import (
 from dayu.host.durable.schema import (
     HOST_DURABLE_TABLES,
     HOST_SCHEMA_VERSION,
+    INDEX_EVENT_LOG_RUN_TYPE_SEQUENCE,
     MEMORY_PROJECTION_TABLES,
     PHASE3_STATE_TABLES,
     PROJECTION_TABLES,
@@ -110,6 +111,21 @@ def _pragma_text(connection: sqlite3.Connection, sql: str) -> str:
     return str(row[0])
 
 
+def _index_exists(connection: sqlite3.Connection, index_name: str) -> bool:
+    """判断 SQLite index 是否存在。
+
+    :param connection: SQLite connection。
+    :param index_name: 目标 index 名称。
+    :returns: 存在则返回 ``True``。
+    """
+
+    row = connection.execute(
+        "SELECT name FROM sqlite_master WHERE type='index' AND name = ?",
+        (index_name,),
+    ).fetchone()
+    return row is not None
+
+
 def _insert_event_log_probe(connection: sqlite3.Connection, event_id: str) -> None:
     """插入 schema 约束测试用 EventLog row。
 
@@ -160,8 +176,8 @@ def test_fresh_db_creates_foundation_phase8_and_memory_tables(
             assert set(MEMORY_PROJECTION_TABLES).issubset(
                 _table_names(connection)
             )
-            assert _pragma_int(connection, "PRAGMA user_version") == 6
-            assert HOST_SCHEMA_VERSION == 6
+            assert _pragma_int(connection, "PRAGMA user_version") == 7
+            assert HOST_SCHEMA_VERSION == 7
             assert _pragma_int(connection, "PRAGMA foreign_keys") == 1
             assert _pragma_text(connection, "PRAGMA journal_mode").lower() == "wal"
             assert _pragma_int(connection, "PRAGMA busy_timeout") == 250
@@ -523,6 +539,23 @@ def test_projection_schema_constraints_reject_invalid_rows(
                     )
                     """
                 )
+            connection.execute(
+                f"""
+                INSERT INTO {TABLE_HOST_MEMORY_DIAGNOSTICS} (
+                  diagnostic_id,
+                  session_id,
+                  reason,
+                  diagnostic_json,
+                  recorded_at
+                ) VALUES (
+                  'diagnostic-unsupported',
+                  'session-1',
+                  'unsupported_event_type',
+                  '{{}}',
+                  '2026-05-16T00:00:00.000000Z'
+                )
+                """
+            )
         finally:
             connection.close()
 
@@ -555,6 +588,18 @@ def test_event_sequence_is_sqlite_foreign_key_parent_key(
                 connection.execute(
                     "INSERT INTO projection_fk_probe (event_sequence) VALUES (999)"
                 )
+        finally:
+            connection.close()
+
+
+def test_event_log_run_type_sequence_index_exists(tmp_path: Path) -> None:
+    """EventLog 支持按 Run 与 event type 读取最近事件的索引。"""
+
+    options = _options(tmp_path)
+    with open_host_durable_store(options) as store:
+        connection = store.connect()
+        try:
+            assert _index_exists(connection, INDEX_EVENT_LOG_RUN_TYPE_SEQUENCE)
         finally:
             connection.close()
 

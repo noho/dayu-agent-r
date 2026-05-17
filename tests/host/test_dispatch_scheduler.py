@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+import logging
 from collections.abc import AsyncIterator
 from dataclasses import dataclass
 from datetime import UTC, datetime
@@ -53,6 +54,7 @@ from dayu.host.dispatch import (
 )
 from dayu.host.durable.codec import sha256_digest_json
 from dayu.host.durable.connection import HostDurableStore, open_host_durable_store
+from dayu.host.durable.errors import HostTransactionRetryExhaustedError
 from dayu.host.durable.event_log import (
     EventClass,
     EventLogAppendRequest,
@@ -89,6 +91,7 @@ from dayu.host.local_proxy import DefaultLocalEngineWorkerFactory
 from dayu.host.projection import ProjectionCatchupPort
 from dayu.runtime.lane import (
     LaneAcquired,
+    LaneClaimToken,
     LaneConfig,
     LaneController,
     SQLiteLaneCoordinatorConfig,
@@ -769,8 +772,9 @@ async def test_worker_accept_exception_closes_failed_and_cancels_dispatch(
 async def test_worker_startup_closeout_error_still_releases_lane(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
+    caplog: pytest.LogCaptureFixture,
 ) -> None:
-    """startup closeout 抛错时仍释放 lane token。"""
+    """startup closeout 抛错时仍返回 timed_out 并释放 lane token。"""
 
     factory = _FakeWorkerFactory(worker=_FailingAcceptWorker())
     with open_host_durable_store(_options(tmp_path)) as store:
@@ -795,8 +799,74 @@ async def test_worker_startup_closeout_error_still_releases_lane(
         )
         try:
             scheduler.wake_dispatch(_pending_dispatch(seeded))
-            with pytest.raises(RuntimeError, match="closeout failed"):
-                await scheduler.drain_once()
+            with caplog.at_level(logging.WARNING, logger="dayu.host.dispatch"):
+                result = await scheduler.drain_once()
+
+            assert result.timed_out == 1
+            claim = await scheduler._lane_controller.acquire(
+                _LANE_NAME,
+                timeout_seconds=0,
+            )
+            assert isinstance(claim, LaneAcquired)
+            await claim.token.release()
+            assert "worker startup closeout failed; continuing" in caplog.text
+            assert "error_type=RuntimeError" in caplog.text
+            assert "original_error_type=RuntimeError" in caplog.text
+        finally:
+            await scheduler.close()
+
+
+@pytest.mark.asyncio
+async def test_dispatch_retry_exhausted_requeues_without_terminal_closeout(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """dispatch durable 重试耗尽只释放 lane 并重排，不按 startup timeout 收口。"""
+
+    factory = _FakeWorkerFactory()
+    with open_host_durable_store(_options(tmp_path)) as store:
+        seeded = _seed_current_run(store)
+        scheduler = await _open_scheduler(tmp_path, store, factory)
+
+        def raise_retry_exhausted(
+            record: PendingDispatchRecord, token: LaneClaimToken
+        ) -> DispatchRecordRow | None:
+            """模拟 dispatching recheck 写事务 busy 重试耗尽。
+
+            :param record: pending dispatch record。
+            :param token: 已获取的 lane token。
+            :returns: 不会返回。
+            :raises HostTransactionRetryExhaustedError: 始终抛出以模拟 busy。
+            """
+
+            del record, token
+            raise HostTransactionRetryExhaustedError(
+                "dispatch recheck busy", attempts=3
+            )
+
+        monkeypatch.setattr(
+            scheduler,
+            "_mark_dispatching_after_recheck",
+            raise_retry_exhausted,
+        )
+        try:
+            scheduler._queue.put_nowait(_pending_dispatch(seeded))
+            with caplog.at_level(logging.WARNING, logger="dayu.host.dispatch"):
+                result = await scheduler.drain_once()
+            await asyncio.sleep(0)
+
+            run, attempt, dispatch_record = _read_rows(
+                store.transaction_runner, seeded
+            )
+            assert result.processed == 1
+            assert result.skipped == 1
+            assert result.timed_out == 0
+            assert run.status is RunStatus.RUNNING
+            assert attempt.status is AttemptStatus.STARTING
+            assert dispatch_record.status is DispatchRecordStatus.WAITING_FOR_LANE
+            assert dispatch_record.cancelled_event_id is None
+            assert scheduler._queue.qsize() == 1
 
             claim = await scheduler._lane_controller.acquire(
                 _LANE_NAME,
@@ -804,6 +874,11 @@ async def test_worker_startup_closeout_error_still_releases_lane(
             )
             assert isinstance(claim, LaneAcquired)
             await claim.token.release()
+            assert "dispatch durable retry exhausted; requeueing" in caplog.text
+            assert seeded.run_id in caplog.text
+            assert seeded.attempt_id in caplog.text
+            assert seeded.dispatch_record_id in caplog.text
+            assert "error_type=HostTransactionRetryExhaustedError" in caplog.text
         finally:
             await scheduler.close()
 
@@ -927,6 +1002,7 @@ async def test_worker_stream_exception_closes_run_lost_from_scheduler(
 @pytest.mark.asyncio
 async def test_scheduler_close_suppresses_handle_close_exception(
     tmp_path: Path,
+    caplog: pytest.LogCaptureFixture,
 ) -> None:
     """scheduler close 不被 active handle cancel/close 异常打断。"""
 
@@ -938,7 +1014,9 @@ async def test_scheduler_close_suppresses_handle_close_exception(
         result = await scheduler.drain_once()
 
         assert result.dispatched == 1
-        await scheduler.close()
+        with caplog.at_level("WARNING", logger="dayu.host.dispatch"):
+            await scheduler.close()
+        assert "active worker cancel failed; continuing" in caplog.text
 
 
 @pytest.mark.asyncio

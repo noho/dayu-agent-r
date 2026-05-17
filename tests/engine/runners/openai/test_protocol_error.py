@@ -10,9 +10,11 @@ import pytest
 
 from dayu.engine.contracts.finish_reason import FinishReason
 from dayu.engine.contracts.runner_events import (
+    RunnerContentCompletedData,
     RunnerDoneData,
     RunnerEventType,
     RunnerProtocolErrorData,
+    RunnerToolCallsCompletedData,
 )
 from dayu.engine.contracts.partial_tool_call import (
     PARTIAL_TOOL_CALL_ID_MAX_CHARS,
@@ -182,9 +184,14 @@ async def test_sse_partial_tool_call_summary_has_hard_bounds() -> None:
 
 
 @pytest.mark.asyncio
-async def test_sse_usage_malformed_after_tool_delta_is_fatal() -> None:
-    """tool call delta 后 malformed usage 必须错误收口且不产出 completed。"""
+async def test_sse_usage_malformed_after_tool_delta_logs_and_continues(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """tool call delta 后 malformed usage 只记日志，后续仍可 completed。"""
 
+    caplog.set_level(
+        logging.WARNING, logger="dayu.engine.runners.openai.sse_parser"
+    )
     tool_payload = json.dumps(
         {
             "choices": [
@@ -232,20 +239,69 @@ async def test_sse_usage_malformed_after_tool_delta_is_fatal() -> None:
     types = [e.type for e in events]
     assert types == [
         RunnerEventType.RUNNER_TOOL_CALL_DELTA,
-        RunnerEventType.PROVIDER_PROTOCOL_ERROR,
+        RunnerEventType.RUNNER_TOOL_CALLS_COMPLETED,
         RunnerEventType.RUNNER_DONE,
     ]
-    protocol_error = events[1].data
-    assert isinstance(protocol_error, RunnerProtocolErrorData)
-    assert protocol_error.error_code == "usage_field_malformed"
-    assert len(protocol_error.partial_tool_calls) == 1
-    assert protocol_error.partial_tool_calls[0].tool_call_id == "call-1"
-    assert protocol_error.partial_tool_calls[0].name_fragment == "lookup"
+    completed = events[1].data
+    assert isinstance(completed, RunnerToolCallsCompletedData)
+    assert len(completed.tool_calls) == 1
+    assert completed.tool_calls[0].tool_call_id == "call-1"
+    assert completed.tool_calls[0].name == "lookup"
     done = events[2].data
     assert isinstance(done, RunnerDoneData)
-    assert done.finish_reason is FinishReason.ERROR
-    assert RunnerEventType.RUNNER_TOOL_CALLS_COMPLETED not in types
-    assert RunnerEventType.RUNNER_CONTENT_COMPLETED not in types
+    assert done.finish_reason is FinishReason.TOOL_CALLS
+    assert RunnerEventType.PROVIDER_PROTOCOL_ERROR not in types
+    assert any(
+        "usage_field_malformed" in record.getMessage()
+        for record in caplog.records
+    )
+
+
+@pytest.mark.asyncio
+async def test_sse_usage_malformed_before_content_completion_continues(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """malformed usage 后继续收到 content 时仍按正常内容完成。"""
+
+    caplog.set_level(
+        logging.WARNING, logger="dayu.engine.runners.openai.sse_parser"
+    )
+    malformed_usage_payload = json.dumps(
+        {
+            "choices": [],
+            "usage": {
+                "prompt_tokens": 1,
+                "completion_tokens": "bad",
+                "total_tokens": 2,
+            },
+        },
+        separators=(",", ":"),
+    )
+    events = await parse_sse(
+        [
+            _sse_json_chunk(malformed_usage_payload),
+            b'data: {"choices":[{"delta":{"content":"ok"}}]}\n\n',
+            b'data: {"choices":[{"finish_reason":"stop","delta":{}}]}\n\n',
+            b"data: [DONE]\n\n",
+        ]
+    )
+
+    types = [event.type for event in events]
+    assert RunnerEventType.PROVIDER_PROTOCOL_ERROR not in types
+    assert RunnerEventType.RUNNER_CONTENT_COMPLETED in types
+    completed_events = [
+        event for event in events
+        if event.type is RunnerEventType.RUNNER_CONTENT_COMPLETED
+    ]
+    assert len(completed_events) == 1
+    completed = completed_events[0].data
+    assert isinstance(completed, RunnerContentCompletedData)
+    assert completed.content == "ok"
+    assert completed.finish_reason is FinishReason.STOP
+    assert any(
+        "usage_field_malformed" in record.getMessage()
+        for record in caplog.records
+    )
 
 
 @pytest.mark.asyncio

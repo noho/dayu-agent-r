@@ -124,7 +124,7 @@ Engine 消费这些字段完成单次 run；不从配置文件、调用方状态
 - `is_supports_tool_calling()`：返回 Runner 是否支持工具调用。
 - `close()`：关闭 Runner 并释放底层连接。
 
-`RunnerSpec` 描述 Runner 规约，字段包括 provider、model、endpoint、api key 引用、headers、tool calling / streaming 能力、默认 timeout、最大重试次数、provider 请求扩展和 SSE idle 配置。
+`RunnerSpec` 描述 Runner 规约，字段包括 provider、model、endpoint、api key 引用、headers、tool calling / streaming 能力、默认 timeout、最大重试次数、provider 请求扩展和 SSE idle 配置。默认 timeout 必须为正数，最大重试次数必须为非负整数。
 
 `RunnerCallOptions` 描述单次调用参数，字段包括 `temperature`、`max_tokens`、`top_p`、`stream`。
 
@@ -178,7 +178,7 @@ Engine 公共契约分为 Engine 专属契约与跨层共享契约。Engine 专�
 - `BatchToolExecutionRequest`：批式工具执行请求。形状包含 `calls: tuple[ToolCallRequest, ...]` 与 `context: BatchToolExecutionContext`。
 - `BatchToolExecutionContext`：批式工具执行上下文。形状包含 `run_id`、`session_id`、`iteration_id`、`timeout_seconds`、`cancellation_token`、`correlation_id`。
 - `ToolExecutionOutcome`：单工具执行结果封闭联合。成员包括 `ToolCompletedOutcome`、`ToolFailedOutcome`、`ToolAwaitingOutcome`、`ToolCancelledOutcome`。
-- `BatchToolExecutionOutcome`：批式工具执行结果。形状包含 `records: tuple[BatchToolExecutionRecord, ...]`，每个 record 与输入 tool call id 严格对应。
+- `BatchToolExecutionOutcome`：批式工具执行结果。形状包含 `records: tuple[BatchToolExecutionRecord, ...]`，构造期要求 record 的 tool call id 非空且不重复；与输入 calls 的完整双射由 Engine 校验。
 - `ToolAwaitingOutcome`：长事务等待结果。形状包含 `await_spec: ToolAwaitSpec` 与 `snapshot: ToolAwaitSnapshot | None`。
 - `cancellation_token`：Engine 可观察的取消入口。形状是 `CancellationToken`，包含 `is_cancelled()`、`cancel_reason()`、`requested_at()`。
 - `RunnerHTTPErrorCode`：Runner HTTP / 网络 / 超时错误枚举。成员包括 `rate_limit_exceeded`、`server_error`、`client_error`、`network_error`、`timeout`、`context_length_exceeded`、`unknown_http_status`。
@@ -393,7 +393,7 @@ Runner 的 `runner_done` 只表示本次 RunnerEvent 流结束；提升到 Engin
 
 当本批工具包含 `ToolAwaitingOutcome` 时，Engine 先逐个产出 accepted 工具的 `tool_result_accepted`，再为每个 awaiting 工具产出 `tool_awaiting`，随后直接以 `run_suspended` 收口；**不**产出 `tool_calls_batch_done`。换言之，`tool_calls_batch_done` 仅在本批不含 awaiting 时产出，作为 "本批 accepted outcome 已全部接受、可进入下一轮 Runner" 的信号；调用方依赖批处理完整性时必须同时识别 `tool_awaiting` + `run_suspended` 的 awaiting 路径。
 
-HTTP 200 response 在 effective stream 为 `True` 且 `Content-Type` 为 `text/event-stream` 或不含 JSON 时按 SSE 解析；`Content-Type` 含 JSON 或 effective stream 为 `False` 时按非流式 JSON 解析。
+HTTP 200 response 在 effective stream 为 `True` 且 `Content-Type` 为 `text/event-stream` 或不含 JSON 时按 SSE 解析；`Content-Type` 含 JSON 或 effective stream 为 `False` 时按非流式 JSON 解析。SSE `usage` 字段只承载附加 token 统计，字段格式错误会记录协议诊断日志并忽略该 usage，不终止后续 content / tool call 收口。
 
 ## 关键机制
 

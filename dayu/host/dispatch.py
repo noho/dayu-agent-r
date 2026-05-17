@@ -10,6 +10,7 @@ Attempt ``RUNNING``。``dispatching`` 与 lane token 只作为诊断和容量控
 from __future__ import annotations
 
 import asyncio
+import logging
 import os
 from dataclasses import dataclass
 from datetime import UTC, datetime
@@ -35,6 +36,7 @@ from dayu.host.durable.event_log import (
     EventLogAppendRequest,
     EventLogStore,
 )
+from dayu.host.durable.errors import HostTransactionRetryExhaustedError
 from dayu.host.durable.liveness import (
     HostInstanceIdentity,
     register_current_instance,
@@ -109,6 +111,7 @@ _EVENT_ID_ATTEMPT_RUNNING_PREFIX = "event-attempt-running"
 _EVENT_ID_ATTEMPT_FAILED_PREFIX = "event-attempt-failed"
 _EVENT_ID_RUN_FAILED_PREFIX = "event-run-failed"
 _LANE_OWNER_PREFIX = "host-dispatch"
+_LOGGER = logging.getLogger(__name__)
 
 
 @dataclass(frozen=True, slots=True)
@@ -224,7 +227,15 @@ class ActiveWorkerRegistry:
         entry.cancellation_token.request_cancel(message.reason)
         try:
             entry.handle.cancel(message.reason)
-        except Exception:
+        except Exception as exc:
+            _LOGGER.warning(
+                "active worker cancel failed; continuing attempt_id=%s "
+                "execution_id=%s run_id=%s error_type=%s",
+                message.attempt_id,
+                message.execution_id,
+                message.run_id,
+                exc.__class__.__name__,
+            )
             return True
         return True
 
@@ -497,12 +508,12 @@ class HostDispatchScheduler:
             timeout_seconds=self._local_execution.lane_default_timeout_seconds,
         )
         if isinstance(acquire, LaneAcquireTimedOut):
-            self._closeout_worker_startup_timeout(record)
+            self._safe_closeout_worker_startup_timeout(record)
             return "timed_out"
         if isinstance(acquire, LaneAcquireCancelled):
             if self._closed:
                 return "skipped"
-            self._closeout_worker_startup_timeout(record)
+            self._safe_closeout_worker_startup_timeout(record)
             return "timed_out"
         if not isinstance(acquire, LaneAcquired):
             return "skipped"
@@ -520,12 +531,37 @@ class HostDispatchScheduler:
         except asyncio.CancelledError:
             await _safe_release_lane_token(token)
             raise
-        except Exception:
+        except HostTransactionRetryExhaustedError as exc:
+            await _safe_release_lane_token(token)
+            _LOGGER.warning(
+                "dispatch durable retry exhausted; requeueing run_id=%s "
+                "attempt_id=%s dispatch_record_id=%s error_type=%s",
+                record.run_id,
+                record.attempt_id,
+                record.dispatch_record_id,
+                exc.__class__.__name__,
+            )
+            self._rewake_dispatch_after_current_drain(record)
+            return "skipped"
+        except Exception as exc:
             try:
-                self._closeout_worker_startup_timeout(record)
+                self._safe_closeout_worker_startup_timeout(
+                    record, original_error=exc
+                )
             finally:
                 await _safe_release_lane_token(token)
             return "timed_out"
+
+    def _rewake_dispatch_after_current_drain(
+        self, record: PendingDispatchRecord
+    ) -> None:
+        """在当前 drain 轮次之后重新投递 dispatch wakeup。
+
+        :param record: 需要重试的 pending dispatch 摘要。
+        :returns: ``None``。
+        """
+
+        asyncio.get_running_loop().call_soon(self._queue.put_nowait, record)
 
     def _mark_waiting_for_lane(
         self, record: PendingDispatchRecord
@@ -645,15 +681,19 @@ class HostDispatchScheduler:
                 worker.accept(snapshot, request),
                 timeout=self._local_execution.worker_startup_timeout_seconds,
             )
-        except TimeoutError:
+        except TimeoutError as exc:
             try:
-                self._closeout_worker_startup_timeout(record)
+                self._safe_closeout_worker_startup_timeout(
+                    record, original_error=exc
+                )
             finally:
                 await _safe_release_lane_token(token)
             return "timed_out"
-        except Exception:
+        except Exception as exc:
             try:
-                self._closeout_worker_startup_timeout(record)
+                self._safe_closeout_worker_startup_timeout(
+                    record, original_error=exc
+                )
             finally:
                 await _safe_release_lane_token(token)
             return "timed_out"
@@ -913,6 +953,40 @@ class HostDispatchScheduler:
 
         self._transaction_runner.run_write(_operation)
         self._duplicate_governance_registry.clear_run(record.run_id)
+
+    def _safe_closeout_worker_startup_timeout(
+        self,
+        record: PendingDispatchRecord,
+        *,
+        original_error: BaseException | None = None,
+    ) -> None:
+        """best-effort 关闭 worker startup 失败路径。
+
+        :param record: pending dispatch 摘要。
+        :param original_error: 触发 startup failure 的原始异常；无原始异常时
+            为 ``None``。
+        :returns: ``None``。
+        """
+
+        try:
+            self._closeout_worker_startup_timeout(record)
+        except Exception as exc:
+            original_error_type = (
+                original_error.__class__.__name__
+                if original_error is not None
+                else "None"
+            )
+            _LOGGER.warning(
+                "worker startup closeout failed; continuing run_id=%s "
+                "attempt_id=%s execution_id=%s error_type=%s "
+                "original_error_type=%s",
+                record.run_id,
+                record.attempt_id,
+                record.execution_id,
+                exc.__class__.__name__,
+                original_error_type,
+                exc_info=True,
+            )
 
     async def _consume_worker_events(
         self,
@@ -1236,7 +1310,12 @@ def _safe_cancel_worker_handle(handle: LocalWorkerHandle, reason: str) -> None:
 
     try:
         handle.cancel(reason)
-    except Exception:
+    except Exception as exc:
+        _LOGGER.warning(
+            "active worker cancel failed; continuing reason=%s error_type=%s",
+            reason,
+            exc.__class__.__name__,
+        )
         return
 
 
