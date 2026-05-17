@@ -76,6 +76,19 @@ READ_API_EVENT_STREAM_FORBIDDEN_TOKENS: tuple[str, ...] = (
     "fanout",
     "wakeup",
 )
+HOST_ROOT_FORBIDDEN_TOOL_EXPORTS: frozenset[str] = frozenset(
+    {"ToolRuntime", "ToolRuntimeHandle", "ToolBundle", "ToolDefinition"}
+)
+TOOL_RUNTIME_SCHEMA_PROJECTION_FORBIDDEN_PREFIXES: tuple[str, ...] = (
+    "dayu.engine",
+    "dayu.service",
+    "dayu.ui",
+    "dayu.fins",
+    "dayu.host.dispatch",
+    "dayu.host.engine_ingest",
+    "dayu.host.projection",
+    "dayu.host.waiting",
+)
 
 
 def _host_root() -> Path:
@@ -220,6 +233,31 @@ def test_read_api_stream_does_not_reference_projection_or_fanout_truth() -> None
     )
     assert not token_violations, (
         f"read_api forbidden stream truth tokens: {token_violations}"
+    )
+
+
+def test_host_root_does_not_export_toolruntime_or_tool_declaration_owners() -> None:
+    """``dayu.host`` 包根不得导出 ToolRuntime 或工具声明 owner。"""
+
+    root_exports = frozenset(host.__all__)
+    root_namespace = vars(host)
+    assert HOST_ROOT_FORBIDDEN_TOOL_EXPORTS.isdisjoint(root_exports)
+    for symbol in HOST_ROOT_FORBIDDEN_TOOL_EXPORTS:
+        assert symbol not in root_namespace
+
+
+def test_toolruntime_schema_projection_stays_private_host_owner() -> None:
+    """ToolRuntime schema 投影 helper 不得依赖 Engine 或 Host mutator owner。"""
+
+    file_path = _host_root() / "tool_runtime_schema_projection.py"
+    violations: list[str] = []
+    for module in _imported_module_names(file_path.read_text(encoding="utf-8")):
+        if _matches_prefix(
+            module, TOOL_RUNTIME_SCHEMA_PROJECTION_FORBIDDEN_PREFIXES
+        ):
+            violations.append(module)
+    assert not violations, (
+        f"tool runtime schema projection forbidden imports: {violations}"
     )
 
 

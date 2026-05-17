@@ -101,6 +101,21 @@ from dayu.host.tooling import (
     FrameworkToolPolicyView,
     ToolBundleSourceRef,
 )
+from dayu.host.tool_runtime_schema_projection import (
+    business_bundle_digest as _business_bundle_digest,
+)
+from dayu.host.tool_runtime_schema_projection import (
+    definitions_by_name as _definitions_by_name,
+)
+from dayu.host.tool_runtime_schema_projection import (
+    tool_schemas_digest as _tool_schemas_digest,
+)
+from dayu.host.tool_runtime_schema_projection import (
+    tool_schema_json as _tool_schema_json,
+)
+from dayu.host.tool_runtime_schema_projection import (
+    validate_reserved_name_conflicts as _validate_reserved_name_conflicts,
+)
 from dayu.host.wait_adapter import WaitAdapterBinding, WaitAdapterRegistry
 from dayu.host.waiting import (
     HostToolAwaitingAcceptPort,
@@ -3716,46 +3731,6 @@ def _require_optional_sha256_digest(
         raise ValueError(f"{field_name} must be a sha256 digest when provided")
 
 
-def _validate_reserved_name_conflicts(
-    bundle: ToolBundle, policy: FrameworkToolPolicyView
-) -> None:
-    """校验业务工具没有占用 framework 预留名。
-
-    :param bundle: 业务工具集合。
-    :param policy: framework tool policy view。
-    :returns: ``None``。
-    :raises ValueError: 业务工具名占用预留名时抛出。
-    """
-
-    reserved = frozenset(
-        tool_name.value for tool_name in policy.reserved_framework_tool_names
-    )
-    for definition in bundle.definitions:
-        if definition.name in reserved:
-            raise ValueError(
-                "business ToolBundle contains reserved framework tool name:"
-                f" {definition.name}"
-            )
-
-
-def _definitions_by_name(
-    definitions: list[ToolDefinition],
-) -> dict[str, ToolDefinition]:
-    """按工具名索引工具声明并拒绝重复名称。
-
-    :param definitions: effective 工具声明列表。
-    :returns: 按名称索引的声明字典。
-    :raises ValueError: 出现重复工具名时抛出。
-    """
-
-    result: dict[str, ToolDefinition] = {}
-    for definition in definitions:
-        if definition.name in result:
-            raise ValueError(f"duplicate effective tool name: {definition.name}")
-        result[definition.name] = definition
-    return result
-
-
 def _fetch_more_tool_definition(callable_: FetchMoreToolCallable) -> ToolDefinition:
     """构造内置 ``fetch_more`` framework tool 声明。
 
@@ -4171,103 +4146,6 @@ def _remainder_digest_matches(remainder: TruncatedRemainderRef) -> bool:
             }
         )
     return False
-
-
-def _business_bundle_digest(bundle: ToolBundle) -> str:
-    """计算业务 bundle 诊断摘要。
-
-    :param bundle: 业务工具集合。
-    :returns: Host canonical sha256 digest。
-    """
-
-    return sha256_digest_json(
-        {
-            "definitions": [
-                _tool_definition_digest_json(definition)
-                for definition in bundle.definitions
-            ]
-        }
-    )
-
-
-def _tool_schemas_digest(tool_schemas: tuple[ToolSchema, ...]) -> str:
-    """计算 effective schema 诊断摘要。
-
-    :param tool_schemas: effective schema 元组。
-    :returns: Host canonical sha256 digest。
-    """
-
-    return sha256_digest_json(
-        {"tool_schemas": [_tool_schema_json(schema) for schema in tool_schemas]}
-    )
-
-
-def _tool_definition_digest_json(definition: ToolDefinition) -> JsonValue:
-    """把工具声明投影为 digest JSON。
-
-    :param definition: 工具声明。
-    :returns: 可用于 canonical digest 的 JSON 值。
-    """
-
-    return {
-        "name": definition.name,
-        "schema": _tool_schema_json(definition.schema),
-        "truncate": _truncate_spec_json(definition.truncate),
-        "tags": list(definition.tags),
-    }
-
-
-def _tool_schema_json(schema: ToolSchema) -> JsonValue:
-    """把 ToolSchema 投影为 digest JSON。
-
-    :param schema: 工具 schema。
-    :returns: JSON 形态 schema。
-    """
-
-    return {
-        "type": schema.type,
-        "function": {
-            "name": schema.function.name,
-            "description": schema.function.description,
-            "parameters": _parameters_json(schema.function.parameters),
-        },
-    }
-
-
-def _parameters_json(parameters: ToolParametersSchema) -> JsonValue:
-    """把工具参数 schema 投影为 digest JSON。
-
-    :param parameters: 工具参数 schema。
-    :returns: JSON 形态参数 schema。
-    """
-
-    result: dict[str, JsonValue] = {
-        "type": parameters.type,
-        "properties": parameters.properties,
-        "required": list(parameters.required),
-    }
-    if parameters.additional_properties is not None:
-        result["additionalProperties"] = parameters.additional_properties
-    return result
-
-
-def _truncate_spec_json(spec: ToolTruncateSpec | None) -> JsonValue:
-    """把截断声明投影为 digest JSON。
-
-    :param spec: 截断声明；无声明时为 ``None``。
-    :returns: JSON 形态截断声明。
-    """
-
-    if spec is None:
-        return None
-    return {
-        "enabled": spec.enabled,
-        "strategy": spec.strategy,
-        "limits": spec.limits,
-        "target_field": spec.target_field,
-        "field_path": list(spec.field_path) if spec.field_path is not None else None,
-        "ttl_seconds": spec.ttl_seconds,
-    }
 
 
 def _request_context_matches_scope(
