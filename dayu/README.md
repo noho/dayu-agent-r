@@ -218,7 +218,7 @@ Dayu 的日志用于诊断系统执行过程，不承担 UI 输出职责。面�
 - `@tool(...)` 是工具声明入口，用于在工具现场同源声明 `ToolSchema`、截断声明、展示 metadata、标签和单工具 callable。
 - `ToolDefinition` 是 Host / ToolRuntime 的装配输入，包含 schema、truncate、display、tags 与 `ToolCallable`；它不进入 Engine request，也不作为 Engine 稳定接口。
 - 外部工具注册组件是工具发现 / 注册边界，产出业务 `ToolBundle` 并通过 `HostToolingOptions` 传给 Host construction。Host 包不得 import 具体业务工具模块；新增工具应通过外部注册组件 / 配置 / Service composition 接入。
-- `fetch_more` 不由外部业务 `ToolBundle` 提供；ToolRuntime factory 根据 TruncationManager 注入 framework tool，生成 attempt-local effective `ToolBundle`。RunInputBuilder 投影给 Engine 的 `tool_schemas` 必须来自 effective ToolBundle。
+- `fetch_more` 不由外部业务 `ToolBundle` 提供；ToolRuntime factory 根据 TruncationManager 注入 framework tool，生成 attempt-local effective `ToolBundle`。RunInputBuilder 投影给 Engine 的 `tool_schemas` 与 ToolRuntime 执行使用的 `tool_executor` 必须来自同一个 effective ToolBundle。
 - `ToolCallable` 是单工具调用协议，形状是 `async (call: ToolCallRequest, context: BatchToolExecutionContext) -> ToolExecutionOutcome`。工具函数可以通过闭包捕获 Web client、仓储、manager 等 Host 私有依赖。
 - `ToolExecutor` 是 Host / ToolRuntime 治理后的 batch 执行入口，形状是 `execute(BatchToolExecutionRequest) -> BatchToolExecutionOutcome`。Engine 只调用这个入口，不调用单工具 callable。
 

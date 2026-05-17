@@ -71,8 +71,9 @@ level name、不安装 handler、不读取配置。当前 `dayu.runtime.log` 负
   工具模块；新增工具应通过外部注册组件 / 配置 / Service composition 接入。
 - `fetch_more` 不由外部业务 `ToolBundle` 提供；ToolRuntime factory 根据
   TruncationManager 注入 framework tool，生成 attempt-local effective
-  `ToolBundle`。RunInputBuilder 投影给 Engine 的 `tool_schemas` 必须来自
-  effective ToolBundle。
+  `ToolBundle`。RunInputBuilder 投影给 Engine 的 `tool_schemas` 与
+  ToolRuntime 执行使用的 `tool_executor` 必须来自同一个 effective
+  ToolBundle。
 - `ToolCallable` 是单工具调用协议，形状是
   `async (call: ToolCallRequest, context: BatchToolExecutionContext) -> ToolExecutionOutcome`。
   工具函数可以通过闭包捕获 Web client、仓储、manager 等工具运行所需依赖；

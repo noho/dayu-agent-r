@@ -418,7 +418,7 @@ Runner close 是 run-scoped 收尾机制。`run_agent_messages` 在生成器结�
 
 ## 扩展点
 
-扩展 provider Runner 时，实现 `AsyncRunner`，把 provider 原生响应归一为 RunnerEvent，并保持工具执行、迭代决策和终态判定在 Agent 协调层。当前函数式入口创建的是内置 OpenAI-compatible Runner；接入其它 Runner 需要同步调整明确的 Runner 选择契约与装配代码。
+扩展 provider Runner 时，实现 `AsyncRunner`，把 provider 原生响应归一为 RunnerEvent，并保持工具执行、迭代决策和终态判定在 Agent 协调层。当前函数式入口通过私有默认装配点创建内置 OpenAI-compatible Runner；该私有装配点不是公共 factory、registry 或 runner 选择扩展点。
 
 扩展 Engine 公共事件时，必须同步扩展 `EngineEventType`、对应 data dataclass、`EngineEventData` 封闭联合，以及 RunnerEvent 提升或 Agent 产出路径。
 
