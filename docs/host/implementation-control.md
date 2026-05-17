@@ -223,8 +223,8 @@ Phase Map 中每个 phase 必须使用统一条目格式。模板如下：
 约束：本节只保留当前 gate 结论；phase 过程流水必须归档到 `历史记录`，仍需追踪的风险或后续 owner 必须写入 `Open Questions 与风险追踪` 的 `追踪区`。
 
 当前 work unit：P9.5 Pre-P10 Cross-Repository Hardening PR。
-当前 gate：P9.5 aggregate deepreview。
-下一 gate：P9.5 aggregate deepreview adjudication。
+当前 gate：ready-to-open-draft-PR。
+下一 gate：draft PR create / draft PR validation。
 
 ## Phase Map
 
@@ -2032,6 +2032,26 @@ P9.5 收口清单：
 - 当前无 PR review blocking fix。
 
 ## 历史记录
+
+### 2026-05-17 P9.5 aggregate deepreview accepted
+
+P9.5 aggregate deepreview 已完成。Aggregate deepreview artifacts 为
+`docs/reviews/p9-5-aggregate-deepreview-mimo-20260517.md` 与
+`docs/reviews/p9-5-aggregate-deepreview-ds-20260517.md`。MiMo F1 / F2 / F3 已由 controller 裁决为
+accepted fix items：EventLog canonical inline payload 阈值必须从 durable store policy 显式注入，不得在 EventLog
+primitive 中硬编码默认值；dispatch waiting / worker accepted CAS 需要补齐 `cancelled_event_sequence IS NULL`；
+TruncationManager 截断后仍超限或替换失败时必须清理未返回 cursor。F4 裁决为 rejected-as-current-fix，因
+`fetch_more` 当前必须先 materialize continuation 才能按 canonical tool outcome 计算 inline size，且 request limit
+已有上界；F5 / F6 / F7 均不构成当前 blocker。
+
+Accepted-finding fix re-review artifacts 为
+`docs/reviews/p9-5-aggregate-fix-rereview-mimo-20260517.md` 与
+`docs/reviews/p9-5-aggregate-fix-rereview-ds-20260517.md`；两份 re-review 均 PASS，0 blocking / high / medium /
+low finding。Controller aggregate adjudication artifact 为
+`docs/reviews/p9-5-aggregate-deepreview-controller-adjudication-20260517.md`。Controller validation：
+`pytest tests/host/test_event_log_store.py tests/host/test_durable_transaction.py tests/host/test_toolruntime_executor.py tests/host/test_run_attempt_transitions.py -q`
+77 passed；`pytest -q` 1068 passed；`python -m pyright dayu tests` 0 errors / 0 warnings / 0 informations；
+`git diff --check` clean。Accepted aggregate deepreview commit 为 `392f914`。当前 gate 为 `ready-to-open-draft-PR`。
 
 ### 2026-05-17 P9.5 S18 Aggregate Validation And Readiness Evidence accepted
 
