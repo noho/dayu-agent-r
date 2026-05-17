@@ -223,8 +223,8 @@ Phase Map 中每个 phase 必须使用统一条目格式。模板如下：
 约束：本节只保留当前 gate 结论；phase 过程流水必须归档到 `历史记录`，仍需追踪的风险或后续 owner 必须写入 `Open Questions 与风险追踪` 的 `追踪区`。
 
 当前 work unit：P9.5 Pre-P10 Cross-Repository Hardening PR。
-当前 gate：P9.5 S12 ToolRuntime Truncation / Duplicate Defensive Hardening implementation。
-下一 gate：P9.5 S12 code review。
+当前 gate：P9.5 S13 Message / Tool Result Size Governance implementation。
+下一 gate：P9.5 S13 code review。
 
 ## Phase Map
 
@@ -2032,6 +2032,27 @@ P9.5 收口清单：
 - 当前无 PR review blocking fix。
 
 ## 历史记录
+
+### 2026-05-17 P9.5 S12 ToolRuntime Truncation / Duplicate Defensive Hardening accepted
+
+P9.5 S12 ToolRuntime Truncation / Duplicate Defensive Hardening 已完成。Implementation artifact 为
+`docs/reviews/p9-5-s12-toolruntime-truncation-duplicate-hardening-implementation-20260517.md`。Code review /
+controller adjudication artifacts 为 `docs/reviews/p9-5-s12-code-review-mimo-20260517.md`、
+`docs/reviews/p9-5-s12-code-review-ds-20260517.md` 与
+`docs/reviews/p9-5-s12-code-review-controller-adjudication-20260517.md`。
+
+Controller 裁决：AgentMiMo 与 AgentDS review 均为 0 blocking findings。实现补齐 `text_lines`、
+`list_items`、`binary_bytes`、used cursor 与 invalid limit 的 truncation / `fetch_more` focused tests，
+收紧 `ToolFactAcceptCandidate` 对 ordinary result facts、plain governed error、duplicate governed outcome 与 `REUSE`
+fact 的 policy kind、prior refs、reason 和 message 一致性校验，并确认 `TruncationManager` 初始化是 run-scoped
+轻量对象，无 Phase 15 production scale reassignment 需求。MiMo residual risks 与 DS observation 均裁决为 non-blocking：
+truncation cursor 仍是 memory / run-scoped / ToolRuntime-local capability；duplicate registry 仍是同进程 run-local
+memory；`ToolPolicyDecisionKind` 与 `DuplicateDecisionKind` 的 value 对齐可在 S16 Contract Ownership audit 中复核。
+本地验证通过：S12 targeted tests 为 60 passed；`pytest tests/host/test_toolruntime_*.py tests/host/test_phase6_toolruntime_integration.py`
+为 67 passed；`pytest tests/host` 为 544 passed；`python -m pyright dayu/host tests/host` 为 0 errors /
+0 warnings / 0 informations；`python -m pyright dayu tests` 为 0 errors / 0 warnings / 0 informations；
+`git diff --check` clean。Accepted slice commit 为 `df8d636`。当前 gate 为 P9.5 S13 Message / Tool Result
+Size Governance implementation。
 
 ### 2026-05-17 P9.5 S11 ToolRuntime Boundary Cleanup accepted
 
