@@ -2,8 +2,8 @@
 
 本模块是 Host durable schema convention 的唯一 DDL 真源。它创建 Phase 2
 foundation tables、Phase 3 Session / Run / Attempt durable state tables，
-以及 Phase 8 projection / read model tables；不承载 command、admission、
-outbox、memory 或 purge 相关逻辑。
+Phase 8 projection / read model tables，以及 Phase 9 memory projection
+tables；不承载 command、admission、outbox 或 purge 相关逻辑。
 """
 
 from __future__ import annotations
@@ -22,7 +22,7 @@ from dayu.host.api import (
 )
 from dayu.host.durable.errors import HostSchemaMismatchError
 
-HOST_SCHEMA_VERSION = 5
+HOST_SCHEMA_VERSION = 6
 """当前 Host durable SQLite schema version。"""
 
 TABLE_EVENT_LOG = "event_log"
@@ -40,6 +40,9 @@ TABLE_HOST_PROJECTION_CHECKPOINTS = "host_projection_checkpoints"
 TABLE_HOST_PROJECTION_FAILURES = "host_projection_failures"
 TABLE_HOST_RUN_RESULTS = "host_run_results"
 TABLE_HOST_SESSION_TIMELINE_ITEMS = "host_session_timeline_items"
+TABLE_HOST_MEMORY_SNAPSHOTS = "host_memory_snapshots"
+TABLE_HOST_MEMORY_ITEMS = "host_memory_items"
+TABLE_HOST_MEMORY_DIAGNOSTICS = "host_memory_diagnostics"
 
 INDEX_HOST_RUNS_ONE_ACTIVE_PER_SESSION = "host_runs_one_active_per_session"
 INDEX_HOST_RUNS_QUEUE_FIFO = "host_runs_queue_fifo"
@@ -57,6 +60,13 @@ INDEX_HOST_SESSION_TIMELINE_ITEMS_SESSION_SEQUENCE = (
 )
 INDEX_HOST_SESSION_TIMELINE_ITEMS_RUN_SEQUENCE = (
     "host_session_timeline_items_run_sequence"
+)
+INDEX_HOST_MEMORY_SNAPSHOTS_SESSION_CURSOR = (
+    "host_memory_snapshots_session_cursor"
+)
+INDEX_HOST_MEMORY_ITEMS_SESSION_SEQUENCE = "host_memory_items_session_sequence"
+INDEX_HOST_MEMORY_DIAGNOSTICS_SESSION_REASON = (
+    "host_memory_diagnostics_session_reason"
 )
 
 FOUNDATION_TABLES: tuple[str, ...] = (
@@ -86,8 +96,18 @@ PROJECTION_TABLES: tuple[str, ...] = (
 )
 """Phase 8 projection checkpoint / failure / read model table 名称集合。"""
 
+MEMORY_PROJECTION_TABLES: tuple[str, ...] = (
+    TABLE_HOST_MEMORY_SNAPSHOTS,
+    TABLE_HOST_MEMORY_ITEMS,
+    TABLE_HOST_MEMORY_DIAGNOSTICS,
+)
+"""Phase 9 memory projection-owned table 名称集合。"""
+
 HOST_DURABLE_TABLES: tuple[str, ...] = (
-    FOUNDATION_TABLES + PHASE3_STATE_TABLES + PROJECTION_TABLES
+    FOUNDATION_TABLES
+    + PHASE3_STATE_TABLES
+    + PROJECTION_TABLES
+    + MEMORY_PROJECTION_TABLES
 )
 """当前 fresh bootstrap 应创建的 Host durable table 名称集合。"""
 
@@ -656,6 +676,105 @@ CREATE TABLE IF NOT EXISTS {TABLE_HOST_SESSION_TIMELINE_ITEMS} (
 )
 """
 
+_HOST_MEMORY_SNAPSHOTS_DDL = f"""
+CREATE TABLE IF NOT EXISTS {TABLE_HOST_MEMORY_SNAPSHOTS} (
+  snapshot_id TEXT PRIMARY KEY,
+  session_id TEXT NOT NULL,
+  consumer_id TEXT NOT NULL,
+  checkpoint_event_sequence INTEGER NOT NULL CHECK (
+    checkpoint_event_sequence >= 0
+  ),
+  checkpoint_event_id TEXT NULL,
+  policy_digest TEXT NOT NULL,
+  snapshot_digest TEXT NOT NULL,
+  snapshot_json TEXT NOT NULL,
+  built_at TEXT NOT NULL,
+  updated_at TEXT NOT NULL,
+  FOREIGN KEY(checkpoint_event_id) REFERENCES {TABLE_EVENT_LOG}(event_id),
+  CHECK (
+    (checkpoint_event_sequence = 0 AND checkpoint_event_id IS NULL)
+    OR
+    (checkpoint_event_sequence > 0 AND checkpoint_event_id IS NOT NULL)
+  )
+)
+"""
+
+_HOST_MEMORY_ITEMS_DDL = f"""
+CREATE TABLE IF NOT EXISTS {TABLE_HOST_MEMORY_ITEMS} (
+  item_id TEXT PRIMARY KEY,
+  snapshot_id TEXT NOT NULL,
+  session_id TEXT NOT NULL,
+  item_kind TEXT NOT NULL CHECK (
+    item_kind IN (
+      'verified_fact',
+      'working_assumption',
+      'raw_user_turn',
+      'raw_assistant_turn',
+      'assistant_conclusion',
+      'episode_summary'
+    )
+  ),
+  claim_status TEXT NOT NULL CHECK (
+    claim_status IN (
+      'tool_verified',
+      'assumption',
+      'candidate',
+      'conflicted',
+      'stale',
+      'superseded'
+    )
+  ),
+  event_id TEXT NOT NULL,
+  event_sequence INTEGER NOT NULL CHECK (event_sequence > 0),
+  producer_kind TEXT NOT NULL CHECK (
+    producer_kind IN ('tool', 'user', 'assistant', 'host_projection')
+  ),
+  producer_name TEXT NOT NULL,
+  payload_ref TEXT NULL,
+  payload_digest TEXT NULL,
+  item_json TEXT NOT NULL,
+  included_reason TEXT NULL,
+  excluded_reason TEXT NULL,
+  FOREIGN KEY(snapshot_id) REFERENCES {TABLE_HOST_MEMORY_SNAPSHOTS}(snapshot_id)
+    ON DELETE CASCADE,
+  FOREIGN KEY(event_id) REFERENCES {TABLE_EVENT_LOG}(event_id),
+  FOREIGN KEY(event_sequence) REFERENCES {TABLE_EVENT_LOG}(event_sequence),
+  CHECK (
+    (payload_ref IS NULL AND payload_digest IS NULL)
+    OR
+    (payload_ref IS NOT NULL AND payload_digest IS NOT NULL)
+  ),
+  CHECK (included_reason IS NULL OR excluded_reason IS NULL)
+)
+"""
+
+_HOST_MEMORY_DIAGNOSTICS_DDL = f"""
+CREATE TABLE IF NOT EXISTS {TABLE_HOST_MEMORY_DIAGNOSTICS} (
+  diagnostic_id TEXT PRIMARY KEY,
+  session_id TEXT NOT NULL,
+  snapshot_id TEXT NULL,
+  reason TEXT NOT NULL CHECK (
+    reason IN (
+      'missing_fact_summary_fallback',
+      'inline_delta_repair_included',
+      'snapshot_missing',
+      'snapshot_damaged',
+      'snapshot_lag_over_threshold',
+      'budget_limit_reached',
+      'empty_event_log_snapshot'
+    )
+  ),
+  event_sequence INTEGER NULL CHECK (
+    event_sequence IS NULL OR event_sequence > 0
+  ),
+  policy_digest TEXT NULL,
+  diagnostic_json TEXT NOT NULL,
+  recorded_at TEXT NOT NULL,
+  FOREIGN KEY(snapshot_id) REFERENCES {TABLE_HOST_MEMORY_SNAPSHOTS}(snapshot_id)
+    ON DELETE CASCADE
+)
+"""
+
 _HOST_RUNS_ONE_ACTIVE_PER_SESSION_INDEX_DDL = f"""
 CREATE UNIQUE INDEX IF NOT EXISTS {INDEX_HOST_RUNS_ONE_ACTIVE_PER_SESSION}
 ON {TABLE_HOST_RUNS}(session_id)
@@ -706,6 +825,26 @@ ON {TABLE_HOST_SESSION_TIMELINE_ITEMS}(run_id, event_sequence)
 WHERE run_id IS NOT NULL
 """
 
+_HOST_MEMORY_SNAPSHOTS_SESSION_CURSOR_INDEX_DDL = f"""
+CREATE INDEX IF NOT EXISTS {INDEX_HOST_MEMORY_SNAPSHOTS_SESSION_CURSOR}
+ON {TABLE_HOST_MEMORY_SNAPSHOTS}(
+  session_id,
+  consumer_id,
+  policy_digest,
+  checkpoint_event_sequence
+)
+"""
+
+_HOST_MEMORY_ITEMS_SESSION_SEQUENCE_INDEX_DDL = f"""
+CREATE INDEX IF NOT EXISTS {INDEX_HOST_MEMORY_ITEMS_SESSION_SEQUENCE}
+ON {TABLE_HOST_MEMORY_ITEMS}(session_id, event_sequence, item_kind)
+"""
+
+_HOST_MEMORY_DIAGNOSTICS_SESSION_REASON_INDEX_DDL = f"""
+CREATE INDEX IF NOT EXISTS {INDEX_HOST_MEMORY_DIAGNOSTICS_SESSION_REASON}
+ON {TABLE_HOST_MEMORY_DIAGNOSTICS}(session_id, reason, recorded_at)
+"""
+
 FOUNDATION_DDL: tuple[str, ...] = (
     _SQLITE_PAYLOADS_DDL,
     _PAYLOAD_DESCRIPTORS_DDL,
@@ -743,6 +882,13 @@ PROJECTION_DDL: tuple[str, ...] = (
 )
 """按外键依赖顺序排列的 Phase 8 projection / read model table DDL。"""
 
+MEMORY_PROJECTION_DDL: tuple[str, ...] = (
+    _HOST_MEMORY_SNAPSHOTS_DDL,
+    _HOST_MEMORY_ITEMS_DDL,
+    _HOST_MEMORY_DIAGNOSTICS_DDL,
+)
+"""按外键依赖顺序排列的 Phase 9 memory projection table DDL。"""
+
 PROJECTION_INDEX_DDL: tuple[str, ...] = (
     _HOST_RUN_RESULTS_SESSION_TERMINAL_SEQUENCE_INDEX_DDL,
     _HOST_SESSION_TIMELINE_ITEMS_SESSION_SEQUENCE_INDEX_DDL,
@@ -750,12 +896,21 @@ PROJECTION_INDEX_DDL: tuple[str, ...] = (
 )
 """Phase 8 projection / read model index DDL。"""
 
+MEMORY_PROJECTION_INDEX_DDL: tuple[str, ...] = (
+    _HOST_MEMORY_SNAPSHOTS_SESSION_CURSOR_INDEX_DDL,
+    _HOST_MEMORY_ITEMS_SESSION_SEQUENCE_INDEX_DDL,
+    _HOST_MEMORY_DIAGNOSTICS_SESSION_REASON_INDEX_DDL,
+)
+"""Phase 9 memory projection index DDL。"""
+
 HOST_DURABLE_DDL: tuple[str, ...] = (
     FOUNDATION_DDL
     + PHASE3_STATE_DDL
     + PROJECTION_DDL
+    + MEMORY_PROJECTION_DDL
     + PHASE3_INDEX_DDL
     + PROJECTION_INDEX_DDL
+    + MEMORY_PROJECTION_INDEX_DDL
 )
 """当前 Host durable fresh bootstrap 全量 DDL。"""
 

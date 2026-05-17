@@ -220,7 +220,8 @@ Phase Map 中每个 phase 必须使用统一条目格式。模板如下：
 
 ## 当前状态
 
-P9 handoff implementation-ready plan accepted；下一步等待用户确认进入 P9 implementation gate。
+P9-S1 `Durable Memory Contracts and Schema` code review accepted；下一步创建 accepted slice commit 后进入 P9-S2
+`Stable Layer and History Pool` implementation。
 
 约束：本节只保留当前 gate 结论；phase 过程流水必须归档到 `历史记录`，仍需追踪的风险或后续 owner 必须写入 `Open Questions 与风险追踪` 的 `追踪区`。
 
@@ -809,7 +810,7 @@ Phase 按依赖关系推进：先实现被其它阶段依赖的公共契约、ru
 状态：
 - P9 phase discussion / design refinement 已完成。用户确认 P9 的核心定位是“财报分析工作台状态投影”，不是聊天记录压缩器。
 - P9 handoff implementation-ready plan 已完成双路 review、fix、双路 re-review 与 controller adjudication，verdict 为 PASS。
-- 下一步等待用户确认进入 P9 implementation gate。
+- P9-S1 `Durable Memory Contracts and Schema` code review accepted，remaining blocking findings 为 0；等待 accepted slice commit。
 
 目标：
 - 实现 session-level Conversation Memory projection、stable layer、history pool、snapshot cursor、RunInputBuilder memory provider 与 projection repair path。
@@ -1571,7 +1572,48 @@ Phase 按依赖关系推进：先实现被其它阶段依赖的公共契约、ru
   summary / ref / digest 组合、repair-required 无法在不修改 Run 状态机的情况下表达、Memory provider 接入需要修改 Engine message
   contract，或必须让 Host 理解财报业务 subject 类型，必须停回 design / control gate。
 
+#### Phase 9 Slice 1 Durable Memory Contracts and Schema 追踪
+
+结论：
+
+- P9-S1 implementation 已完成，交付 memory typed contracts、schema v6 memory projection tables、transaction-scoped durable
+  read / write primitive 与 focused tests。
+- Code review artifacts 为 `docs/reviews/p9-s1-code-review-mimo-20260517.md` 与
+  `docs/reviews/p9-s1-code-review-ds-20260517.md`。
+- Code re-review artifacts 为 `docs/reviews/p9-s1-code-rereview-mimo-20260517.md` 与
+  `docs/reviews/p9-s1-code-rereview-ds-20260517.md`。
+- Controller adjudication artifact 为 `docs/reviews/p9-s1-code-review-controller-adjudication-20260517.md`。
+- Re-review verdict：AgentMiMo PASS，AgentDS PASS，remaining blocking findings 为 0。
+- Accepted slice commit 待写入。
+
+验证：
+
+- `pytest tests/host/test_memory_projection.py tests/host/test_durable_schema.py`：21 passed。
+- `pytest tests/host/test_weak_typing_guard.py`：1 passed。
+- `pyright dayu/host tests/host`：0 errors。
+- `git diff --check`：通过。
+
+追踪项：
+
+- DS C1 non-TOOL `producer_name` 语义精度由 P9-S2 projection consumer / stable layer owner 处理；当前 fallback
+  不产生 false tool provenance，不阻塞 S1。
+- MiMo N1 included / excluded reason 命名稳定性由 P9-S2 在下游 rendering / trace consumer 固化前复核。
+- MiMo N3 `MemoryDiagnostic.recorded_at` optional type surface、DS C3 optional JSON helper wording、DS S3 empty snapshot 双实例构造、
+  DS T1 cast 注释属于后续 Host hardening，不阻塞 P9。
+- DS A1 snapshot upsert 并发 guard 由 P9-S2 / P9-S4 在 projection writer concurrency 与 repair 语义明确后裁决。
+
 ## 历史记录
+
+### 2026-05-17 P9-S1 code review accepted
+
+P9-S1 `Durable Memory Contracts and Schema` implementation 已完成。实现范围包含 `dayu.host.memory` typed contracts、
+`dayu.host.durable.memory` transaction-scoped memory snapshot / diagnostic read-write primitive、schema v6 memory projection
+tables 与 focused tests。双路 code review 已完成：AgentMiMo 初审 verdict 为 CONDITIONAL PASS，提出 1 个 blocking 与 3 个
+non-blocking findings；AgentDS 初审 verdict 为 PASS with findings，提出 0 个 blocking、3 个 medium、3 个 low 与 2 个 info
+findings。Controller 接受 MiMo B1 / DS C2 digest deterministic fix 与 MiMo N2 reserved claim status test coverage fix，defer
+non-blocking producer name precision、reason naming、diagnostic timestamp type surface 与 hardening items 到 P9-S2 / P9-S4 或后续
+Host hardening owner。Fix 后双路 re-review 均 PASS，remaining blocking findings 为 0。Controller adjudication artifact 为
+`docs/reviews/p9-s1-code-review-controller-adjudication-20260517.md`。当前 gate 为 P9-S1 accepted slice commit。
 
 ### 2026-05-16 P9 plan accepted
 
