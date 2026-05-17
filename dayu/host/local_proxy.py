@@ -7,6 +7,7 @@ EngineEvent durable ingest、terminal closeout、ToolRuntime 或 recovery。
 
 from __future__ import annotations
 
+import asyncio
 from collections.abc import AsyncGenerator, AsyncIterator
 from uuid import uuid4
 
@@ -77,8 +78,10 @@ class _DefaultLocalWorkerHandle:
             raise ValueError("local_worker_id must be non-empty")
         self._local_worker_id = local_worker_id
         self._request = request
-        self._events: AsyncGenerator[EngineEvent, None] | None = None
+        self._event_stream: _DefaultLocalWorkerEventStream | None = None
+        self._events_started = False
         self._closed = False
+        self._close_lock = asyncio.Lock()
 
     @property
     def local_worker_id(self) -> str:
@@ -93,14 +96,18 @@ class _DefaultLocalWorkerHandle:
         """返回本次 Engine run 的事件流。
 
         :returns: EngineEvent 异步迭代器。
-        :raises RuntimeError: handle 已关闭时抛出。
+        :raises RuntimeError: handle 已关闭或事件流已被读取时抛出。
         """
 
         if self._closed:
             raise RuntimeError("local worker handle is closed")
-        if self._events is None:
-            self._events = run_agent_messages(self._request)
-        return self._events
+        if self._events_started:
+            raise RuntimeError("local worker events have already been opened")
+        self._events_started = True
+        self._event_stream = _DefaultLocalWorkerEventStream(
+            run_agent_messages(self._request)
+        )
+        return self._event_stream
 
     def cancel(self, reason: str) -> None:
         """向本地 worker 发起 best-effort 取消。
@@ -120,13 +127,100 @@ class _DefaultLocalWorkerHandle:
         :returns: ``None``。
         """
 
-        if self._closed:
+        async with self._close_lock:
+            if self._closed:
+                return
+            self._closed = True
+            event_stream = self._event_stream
+        if event_stream is not None:
+            await event_stream.close()
+
+
+class _DefaultLocalWorkerEventStream:
+    """默认本地 worker event stream 包装器。
+
+    包装器确保一个 handle 只有一个 Engine async generator，并在 handle close
+    与消费 task 取消时关闭底层 generator。
+    """
+
+    def __init__(self, events: AsyncGenerator[EngineEvent, None]) -> None:
+        """初始化 event stream。
+
+        :param events: Engine async generator。
+        :returns: ``None``。
+        """
+
+        self._events = events
+        self._closed = False
+        self._lock = asyncio.Lock()
+        self._active_anext: asyncio.Task[EngineEvent] | None = None
+
+    def __aiter__(self) -> "_DefaultLocalWorkerEventStream":
+        """返回异步迭代器自身。
+
+        :returns: 当前 event stream。
+        """
+
+        return self
+
+    async def __anext__(self) -> EngineEvent:
+        """读取下一条 EngineEvent。
+
+        :returns: 下一条 EngineEvent。
+        :raises StopAsyncIteration: stream 已关闭或底层生成器结束时抛出。
+        :raises RuntimeError: 同一 stream 被并发读取时抛出。
+        """
+
+        async with self._lock:
+            if self._closed:
+                raise StopAsyncIteration
+            if self._active_anext is not None:
+                raise RuntimeError("local worker events are already being consumed")
+            task = asyncio.create_task(anext(self._events))
+            self._active_anext = task
+        try:
+            return await task
+        except StopAsyncIteration:
+            async with self._lock:
+                self._closed = True
+            raise
+        finally:
+            async with self._lock:
+                if self._active_anext is task:
+                    self._active_anext = None
+
+    async def close(self) -> None:
+        """关闭 event stream 与底层 Engine generator。
+
+        :returns: ``None``。
+        """
+
+        async with self._lock:
+            if self._closed:
+                return
+            self._closed = True
+            task = self._active_anext
+        if task is not None and not task.done():
+            task.cancel()
+            try:
+                await _suppress_task_cancel(task)
+            finally:
+                await self._events.aclose()
             return
-        events = self._events
-        self._events = None
-        self._closed = True
-        if events is not None:
-            await events.aclose()
+        await self._events.aclose()
+
+
+async def _suppress_task_cancel(task: asyncio.Task[EngineEvent]) -> None:
+    """等待 task 结束并吞掉取消异常。
+
+    :param task: 待等待 task。
+    :returns: ``None``。
+    """
+
+    try:
+        await task
+    except asyncio.CancelledError:
+        return
 
 
 __all__ = [
