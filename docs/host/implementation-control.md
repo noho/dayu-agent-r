@@ -223,8 +223,8 @@ Phase Map 中每个 phase 必须使用统一条目格式。模板如下：
 约束：本节只保留当前 gate 结论；phase 过程流水必须归档到 `历史记录`，仍需追踪的风险或后续 owner 必须写入 `Open Questions 与风险追踪` 的 `追踪区`。
 
 当前 work unit：P9.5 Pre-P10 Cross-Repository Hardening PR。
-当前 gate：P9.5 S3 Host Public Error Taxonomy And Command Handle Encapsulation implementation。
-下一 gate：P9.5 S3 code review。
+当前 gate：P9.5 S4 Host Durable Helper API Tightening implementation。
+下一 gate：P9.5 S4 code review。
 
 ## Phase Map
 
@@ -2032,6 +2032,21 @@ P9.5 收口清单：
 - 当前无 PR review blocking fix。
 
 ## 历史记录
+
+### 2026-05-17 P9.5 S3 Host Public Error Taxonomy And Command Handle Encapsulation accepted
+
+P9.5 S3 Host Public Error Taxonomy And Command Handle Encapsulation 已完成。Implementation artifact 为
+`docs/reviews/p9-5-s3-host-public-error-command-handle-implementation-20260517.md`。Code review / controller
+adjudication artifacts 为 `docs/reviews/p9-5-s3-code-review-mimo-20260517.md` 与
+`docs/reviews/p9-5-s3-code-review-controller-adjudication-20260517.md`。
+
+Controller 裁决：AgentMiMo review 为 0 blocking findings；F1 `_run_read` / `_run_write` 双层 durable error
+转换、F2 `resolve_wait` closed guard 风格、F3 generic durable subtype fallback 均为 info observation，无需当前
+slice fix。AgentDS 在两次 S3 review dispatch 与一次窄 prompt 后仍未产出 artifact，裁决记录为 reviewer unavailable
+而不继续阻塞流程。本地验证通过：`pytest tests/host/test_command_handle.py tests/host/test_package_exports.py
+tests/host/test_public_contracts.py tests/host/test_public_session_api.py tests/host/test_public_run_api.py` 为
+69 passed；`python -m pyright dayu/host tests/host` 为 0 errors / 0 warnings / 0 informations；`git diff --check`
+clean。Accepted slice commit 为 `02a75ec`。当前 gate 为 P9.5 S4 Host Durable Helper API Tightening implementation。
 
 ### 2026-05-17 P9.5 S2 Engine / OpenAI Runner / Parser Hardening accepted
 
