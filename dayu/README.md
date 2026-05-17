@@ -142,7 +142,8 @@ implementation、review、fix 与 re-review 的项目级术语真源。包级 RE
 - 取消等待 / race helper。
 - `lane`：cross-process named semaphore / capacity guard。调用方显式传入独立 SQLite runtime lane DB 路径，并通过
   `LaneController` 获取、刷新和释放具名容量 claim；等待 acquire 支持 timeout、协作式 cancellation 与
-  `Task.cancel()` 透传，controller close 会取消 pending acquire 并尽力释放当前 tokens。lane 只表达 runtime capacity
+  `Task.cancel()` 透传，协作式取消优先于 timeout。heartbeat / token lost 与 release failure 会通过 runtime lane
+  error 或 warning 暴露；controller close 会取消 pending acquire 并尽力释放当前 tokens。lane 只表达 runtime capacity
   claim，不保存 Session / Run / Attempt / EventLog / Tool / Fins 字段，也不承诺 FIFO、公平性、lease / fencing、
   Attempt owner、Host admission 或 recovery proof。
 - `filelock`：对第三方 `FileLock` 的同步 wrapper，只用于普通文件访问互斥。调用方传入显式 lock file 路径，可选择创建

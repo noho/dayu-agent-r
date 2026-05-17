@@ -19,7 +19,7 @@ from dataclasses import dataclass, field
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from types import TracebackType
-from typing import Final, TypeAlias, cast
+from typing import Final, TypeAlias, TypeVar, cast
 
 from dayu.contracts.cancellation import CancellationToken
 
@@ -31,7 +31,19 @@ _SQLITE_MILLISECONDS_PER_SECOND: Final[int] = 1000
 _CLAIM_ID_BYTES: Final[int] = 16
 _OWNER_ID_BYTES: Final[int] = 8
 _CLAIMS_TABLE: Final[str] = "runtime_lane_claims"
+_LOG_TRACKED_RELEASE_FAILED_AFTER_CANCEL: Final[str] = (
+    "runtime lane tracked claim release failed after outer cancellation"
+)
+_LOG_UNTRACKED_RELEASE_FAILED: Final[str] = (
+    "runtime lane untracked claim release failed; claim will rely on TTL cleanup"
+)
+_LOG_UNTRACKED_RELEASE_FAILED_AFTER_CANCEL: Final[str] = (
+    "runtime lane untracked claim release failed after outer cancellation; "
+    "claim will rely on TTL cleanup"
+)
+_CLOSE_REASON_HEARTBEAT_ERROR: Final[str] = "lane heartbeat error"
 _LOGGER = logging.getLogger(__name__)
+_TaskResult = TypeVar("_TaskResult")
 
 
 class RuntimeLaneError(Exception):
@@ -552,21 +564,18 @@ class LaneController:
         try:
             return await asyncio.shield(claim_task)
         except asyncio.CancelledError as cancelled:
-            claim = await claim_task
+            try:
+                claim = await _await_task_after_outer_cancellation(claim_task)
+            except RuntimeLaneError:
+                raise cancelled
             if claim.acquired and claim.claim_id is not None:
                 try:
                     await self._release_untracked_claim(
-                        lane_config.name, claim.claim_id
+                        lane_config.name,
+                        claim.claim_id,
+                        failure_message=_LOG_UNTRACKED_RELEASE_FAILED_AFTER_CANCEL,
                     )
                 except RuntimeLaneError:
-                    _LOGGER.exception(
-                        "runtime lane untracked claim release failed "
-                        "after outer cancellation; claim will rely on TTL cleanup",
-                        extra={
-                            "lane_name": lane_config.name,
-                            "claim_id": claim.claim_id,
-                        },
-                    )
                     raise cancelled
             raise
 
@@ -712,11 +721,10 @@ class LaneController:
             await asyncio.shield(release_task)
         except asyncio.CancelledError as cancelled:
             try:
-                await asyncio.shield(release_task)
+                await _await_task_after_outer_cancellation(release_task)
             except RuntimeLaneError:
                 _LOGGER.exception(
-                    "runtime lane tracked claim release failed "
-                    "after outer cancellation",
+                    _LOG_TRACKED_RELEASE_FAILED_AFTER_CANCEL,
                     extra={
                         "lane_name": token.name,
                         "claim_id": token.claim_id,
@@ -738,7 +746,13 @@ class LaneController:
         self._held_tokens.pop((token.name, token.claim_id), None)
         self._wake_waiters()
 
-    async def _release_untracked_claim(self, lane_name: str, claim_id: str) -> None:
+    async def _release_untracked_claim(
+        self,
+        lane_name: str,
+        claim_id: str,
+        *,
+        failure_message: str = _LOG_UNTRACKED_RELEASE_FAILED,
+    ) -> None:
         """释放尚未登记到 held token 集合的 claim。
 
         该路径用于 acquire 与 close / cancellation / timeout 竞态：SQLite 短
@@ -748,6 +762,7 @@ class LaneController:
 
         :param lane_name: lane 名称。
         :param claim_id: claim id。
+        :param failure_message: release 失败时写入日志的稳定消息。
         :returns: ``None``。
         :raises RuntimeLaneError: SQLite 操作失败时抛出。
         """
@@ -757,13 +772,19 @@ class LaneController:
         )
         try:
             await asyncio.shield(release_task)
+        except RuntimeLaneError:
+            _LOGGER.warning(
+                failure_message,
+                extra={"lane_name": lane_name, "claim_id": claim_id},
+                exc_info=True,
+            )
+            raise
         except asyncio.CancelledError as cancelled:
             try:
-                await asyncio.shield(release_task)
+                await _await_task_after_outer_cancellation(release_task)
             except RuntimeLaneError:
                 _LOGGER.exception(
-                    "runtime lane untracked claim release failed "
-                    "after outer cancellation; claim will rely on TTL cleanup",
+                    _LOG_UNTRACKED_RELEASE_FAILED_AFTER_CANCEL,
                     extra={"lane_name": lane_name, "claim_id": claim_id},
                 )
                 raise cancelled
@@ -868,7 +889,7 @@ class LaneController:
         if self._heartbeat_error is None:
             self._heartbeat_error = error
         self._closed = True
-        self._close_reason = "lane heartbeat error"
+        self._close_reason = _CLOSE_REASON_HEARTBEAT_ERROR
         self._wake_waiters()
 
     def _raise_heartbeat_error_if_present(self) -> None:
@@ -947,6 +968,30 @@ class _suppress_cancelled_error:
         """
 
         return exc_type is asyncio.CancelledError
+
+
+async def _await_task_after_outer_cancellation(
+    task: asyncio.Task[_TaskResult],
+) -> _TaskResult:
+    """外层取消已发生后等待 shielded task 完成。
+
+    该 helper 用于 DB claim / release 已交给线程执行后的 cleanup 路径。
+    外层 task 可能被重复 cancel；这里持续等待底层 task 完成，把最终结果
+    交还给调用方，由调用方继续重新抛出最初的 ``CancelledError``。
+
+    :param task: 已创建且必须完成收尾的 asyncio task。
+    :returns: task 的结果。
+    :raises RuntimeLaneError: task 以 runtime lane 错误失败时透传。
+    :raises asyncio.CancelledError: task 自身被取消时透传。
+    """
+
+    while True:
+        try:
+            return await asyncio.shield(task)
+        except asyncio.CancelledError:
+            if task.done():
+                return task.result()
+            continue
 
 
 def _require_non_blank(value: str, *, field_name: str) -> None:
