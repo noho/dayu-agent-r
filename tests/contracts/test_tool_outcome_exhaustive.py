@@ -8,7 +8,7 @@
 from __future__ import annotations
 
 from datetime import datetime
-from typing import assert_never
+from typing import assert_never, cast
 
 import pytest
 
@@ -19,6 +19,9 @@ from dayu.contracts.tool_await import (
 )
 from dayu.contracts.tool_outcome import (
     TOOL_CANCELLED_REASON_APPROVAL_DENIED,
+    ToolCancelledReason,
+    BatchToolExecutionOutcome,
+    BatchToolExecutionRecord,
     ToolAwaitingOutcome,
     ToolCancelledOutcome,
     ToolCompletedOutcome,
@@ -149,7 +152,7 @@ def test_cancelled_rejects_invalid_reason() -> None:
 
     with pytest.raises(ValueError):
         ToolCancelledOutcome(
-            reason="not_a_real_reason",
+            reason=cast(ToolCancelledReason, "not_a_real_reason"),
             message="x",
             hint=None,
             meta=None,
@@ -198,3 +201,36 @@ def test_cancelled_rejects_empty_or_whitespace_hint() -> None:
                 hint=invalid_hint,
                 meta=None,
             )
+
+
+def test_batch_outcome_rejects_blank_tool_call_id() -> None:
+    """批式 outcome record 的 ``tool_call_id`` 不能为空或纯空白。"""
+
+    for invalid_id in ("", "   ", "\t", "\n", "  \t  \n"):
+        with pytest.raises(ValueError, match="tool_call_id must be non-empty"):
+            BatchToolExecutionOutcome(
+                records=(
+                    BatchToolExecutionRecord(
+                        tool_call_id=invalid_id,
+                        outcome=_make_completed(),
+                    ),
+                )
+            )
+
+
+def test_batch_outcome_rejects_duplicate_tool_call_id() -> None:
+    """批式 outcome record 的 ``tool_call_id`` 不得重复。"""
+
+    with pytest.raises(ValueError, match="tool_call_id must be unique"):
+        BatchToolExecutionOutcome(
+            records=(
+                BatchToolExecutionRecord(
+                    tool_call_id="call-1",
+                    outcome=_make_completed(),
+                ),
+                BatchToolExecutionRecord(
+                    tool_call_id="call-1",
+                    outcome=_make_failed(),
+                ),
+            )
+        )

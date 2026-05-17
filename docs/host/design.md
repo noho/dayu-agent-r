@@ -2341,16 +2341,27 @@ Conversation Memory 从买方财报分析 Agent 的会话不变量出发：
 - memory 克制。
 - 展示态与运行态分离。
 
+Conversation Memory 不是聊天记录压缩器，而是财报分析工作台状态投影。它回答下一轮分析所需的稳定问题：
+
+- 现在分析谁。
+- 分析什么期间。
+- 按什么口径。
+- 哪些事实已由工具确认。
+- 哪些仍是假设或待验证线索。
+- 下一步需要验证什么。
+
 结构：
 
 ```text
 Conversation Memory
   -> stable layer
       -> pinned_state
-      -> tool-verified facts
-      -> assumptions / open questions
-      -> evidence anchors / tool facts
+      -> verified_facts
+      -> working_assumptions
+      -> open_questions
+      -> evidence anchors / tool facts / provenance
   -> history pool
+      -> conversation_continuity
       -> recent raw turns floor
       -> older raw turns
       -> episode summaries
@@ -2363,20 +2374,50 @@ Conversation Memory
 - `user_constraints`
 - `open_questions`
 
+`verified_facts` 只来自工具事实。每条 verified fact 必须能解释其证据来源，至少保留 fact summary、producer / tool name、
+`event_id` / `event_sequence`、tool result ref、digest / source ref，以及可选的 evidence anchor / entity / subject /
+period / metric / section opaque refs。Host 只保存中立 ref 与 provenance，不保存财报业务原文，不理解 company /
+business-line / technology release 等业务语义。
+
+`working_assumptions` 承载用户说法、assistant 推断、早期弱信号和待验证候选。它们不能冒充 verified facts；后续若被用于关键归因，
+必须由当前 Run 召回并验证对应工具事实后，才能形成 evidence-backed claim。
+
+`conversation_continuity` 承载最近 raw turns、assistant conclusion 与 episode summaries，只服务追问连续性。episode summary
+只能做导航，不能替代 evidence anchor、source ref、chunk ref、fingerprint 或 claim status。
+
+RunInputBuilder 注入 memory 的顺序必须体现财报分析优先级：
+
+1. 用户目标与约束。
+2. 已确认主体和口径。
+3. tool-verified facts。
+4. open questions / working assumptions。
+5. recent raw turns。
+6. episode summaries。
+
 不变量：
 
 - `pinned_state` 与 tool-verified stable facts 全量注入，不参与 history pool 竞争。
+- `pinned_state` 与 verified facts 虽不参与 history pool 竞争，但必须有结构化尺寸上限、降级诊断和 trace 记录；不得无限扩大 memory
+  挤占财报材料、工具结果、章节上下文和当前问题的预算。
 - `final_answer` 是 assistant role 产出的最终回答，只能作为 raw turn / assistant conclusion 参与连续性。
 - `final_answer` 绝不能自动升级为 verified fact。
 - verified fact 只接受工具事实。
 - 用户输入进入 pinned state、约束或待验证候选，不直接成为 verified fact。
 - memory projection 只消费 canonical facts。
 - preview / reasoning / display-only facts 不进入 memory。
+- LLM 产出的 pinned patch、episode summary 或 conclusion 默认只能成为 candidate / assumption / continuity view；它们不能直接写入
+  Host truth，也不能直接产生 verified fact。proactive compaction 编排属于 Context Governance。
 - memory snapshot 是 read model，可重建、可修复，不是事实真源。
 - 第一版 memory snapshot 与 projection checkpoint 使用同一 SQLite durable store transaction 提交；checkpoint 不得先于 snapshot 落库。
 - 跨存储 atomic commit marker 不进入第一版默认实现，只作为后续 memory storage split 能力。
 - RunInputBuilder 消费 memory snapshot 时必须记录 snapshot cursor；后续 replay / audit 能解释当时看到的是哪一版 memory。
 - RunInputBuilder 消费 memory snapshot 前必须校验 snapshot cursor 覆盖本次构造 messages 所需的 EventLog cursor。projection lag 不能改变同一 EventLog + policy 下的 messages。
+- RunInputBuilder 的 trace / tool trace 必须记录 memory item included / excluded reason、snapshot cursor、policy digest、预算原因、
+  stale / conflict / missing-evidence reason。P9 不创建独立 RunInputBuildTrace 子系统。
+- recent raw turns floor 是下限保底，不是 history 上限；预算允许时可以注入更多 older raw turns。older raw turns 与 episode summaries
+  共享单一 history pool，超预算时先降级 episode summaries / older raw turns，最后才降级 recent raw turns。
+- P9 只实现 session-level memory projection 与 provider 边界；长期 retrieval index、业务 signal ledger、signal-to-outcome
+  verification 与 public memory edit / reset / forget API 均不进入第一版。
 
 memory snapshot 缺失或滞后的处理：
 

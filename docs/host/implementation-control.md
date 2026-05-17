@@ -220,7 +220,12 @@ Phase Map 中每个 phase 必须使用统一条目格式。模板如下：
 
 ## 当前状态
 
-P8 完成。
+Phase 9 draft PR 已创建：PR 59 https://github.com/noho/dayu-agent-r/pull/59。Accepted PR review commit 为 `67458cb`。
+P9 all-repository follow-up fix pass 已完成本地验证；最终 MiMo / DS re-review 均 PASS；accepted follow-up commit 为
+`6e12641`。
+当前 gate 为 draft-PR-pass follow-up accepted。
+下一 planned work unit：在 P9 后、P10 前新增 P9.5 Pre-P10 Cross-Repository Hardening PR，收口当前追踪区中不依赖
+P10+ phase owner、也不属于本轮已裁决排除项的 hardening / cleanup。
 
 约束：本节只保留当前 gate 结论；phase 过程流水必须归档到 `历史记录`，仍需追踪的风险或后续 owner 必须写入 `Open Questions 与风险追踪` 的 `追踪区`。
 
@@ -806,6 +811,22 @@ Phase 按依赖关系推进：先实现被其它阶段依赖的公共契约、ru
 
 ### Phase 9. Conversation Memory / Session Memory Projection
 
+状态：
+- P9 phase discussion / design refinement 已完成。用户确认 P9 的核心定位是“财报分析工作台状态投影”，不是聊天记录压缩器。
+- P9 handoff implementation-ready plan 已完成双路 review、fix、双路 re-review 与 controller adjudication，verdict 为 PASS。
+- P9-S1 `Durable Memory Contracts and Schema` completed；accepted slice commit 为 `f221aeb`。
+- P9-S2 `Projection Consumer and Stable Layer Builder` completed；accepted slice commit 为 `4f35da6`。
+- P9-S3 `RunInputBuilder MemorySnapshotProvider and Lag Fallback` completed；accepted slice commit 为 `b416d37`。
+- P9-S4 `Projection Repair / Rebuild Entry and Diagnostics` completed；accepted slice commit 为 `1d30725`。
+- P9 aggregate deepreview completed；verdict 为 PASS；accepted deepreview commit 为 `cc05f79`。
+- P9 draft PR created：PR 59 https://github.com/noho/dayu-agent-r/pull/59；PR review gate completed，verdict 为 PASS；
+  accepted PR review commit 为 `67458cb`。
+- P9 all-repository follow-up review 已由 AgentMiMo 与 AgentDS 执行，初审发现若干跨仓 correctness / observability hardening；
+  controller 已接受其中低风险项并完成 fix / validation。最新 DS follow-up finding 中，SSE 已产出事件后的 retry、SSE tool-call
+  final finish parity 与 runtime file lock release failure cleanup 已修复；minimal read model consumer isolation 作为 schema
+  design debt deferred。最终 AgentMiMo / AgentDS re-review 均 PASS。Controller adjudication artifact 为
+  `docs/reviews/p9-all-repo-review-controller-adjudication-20260517.md`。
+
 目标：
 - 实现 session-level Conversation Memory projection、stable layer、history pool、snapshot cursor、RunInputBuilder memory provider 与 projection repair path。
 
@@ -820,6 +841,10 @@ Phase 按依赖关系推进：先实现被其它阶段依赖的公共契约、ru
 
 进入条件：
 - 确认第一版只做 session memory，不做长期 memory public edit / reset / forget API。
+- 已确认 P9 只做 session-level memory projection，不实现长期 retrieval index、业务 signal ledger、signal-to-outcome verification、
+  public memory edit / reset / forget API 或原始证据仓储。
+- 已确认 P9 必须为后续跨多年弱信号归因召回预留 Host 中立 evidence anchor、claim status、provenance 与 trace included /
+  excluded reason 边界，但不得把财报业务语义塞入 Host。
 
 范围：
 - 允许修改：memory projection、memory snapshot store、stable layer / history pool policy、RunInputBuilder MemorySnapshotProvider、memory lag diagnostic / repair path。
@@ -831,9 +856,18 @@ Phase 按依赖关系推进：先实现被其它阶段依赖的公共契约、ru
 - 不让 memory projection 写 EventLog。
 
 关键设计问题：
-- 必须确认 stable layer 默认预算、recent raw turns floor、history pool 降级顺序。
-- 必须确认 projection lag 阈值与 RunInputBuilder fallback 策略。
-- 必须确认 assistant conclusion / verified fact 的投影规则。
+- 已确认 memory view 分为 `pinned_state`、`verified_facts`、`working_assumptions`、`conversation_continuity` 四类；不得把
+  tool-verified fact、assistant conclusion、用户说法和 episode summary 混成无结构字符串列表。
+- 已确认 verified fact 只接受工具事实，并必须保留 fact summary、producer / tool name、`event_id` / `event_sequence`、
+  tool result ref、digest / source ref，以及可选 evidence anchor / opaque subject refs。
+- 已确认 RunInputBuilder memory 注入顺序为：用户目标与约束、已确认主体和口径、tool-verified facts、open questions /
+  working assumptions、recent raw turns、episode summaries。
+- 已确认预算策略必须克制：pinned / verified facts 不参与 history pool 竞争但有结构化尺寸上限与诊断；recent raw turns floor
+  是下限不是上限；older raw turns 与 episode summaries 共用单一 history pool；超预算时先降级 summary / older raw turns。
+- 已确认 projection lag 必须显式可观测：小 delta 可由 EventLog 补齐并记录 diagnostic；缺失、损坏或超阈值进入 projection repair /
+  context governance path；不得触发 Run recovery。
+- 已确认 P9 不实现 LLM compaction 写 truth。LLM 产出的 pinned patch、episode summary 或 conclusion 默认只能成为 candidate /
+  assumption / continuity view；proactive compaction 编排归 Phase 10 Context Governance。
 
 交付物：
 - phase design refinement
@@ -846,10 +880,14 @@ Phase 按依赖关系推进：先实现被其它阶段依赖的公共契约、ru
 - Slice 1: memory projection data model and checkpoint。
 - Slice 2: stable layer / history pool builder。
 - Slice 3: RunInputBuilder MemorySnapshotProvider and lag fallback。
+- Slice 4: projection repair / rebuild entry and after-commit catch-up wiring。
 
 验证要求：
 - unit tests: final_answer not verified fact、tool facts verified、snapshot cursor coverage。
 - integration tests: multi-run continuity with memory projection rebuild。
+- anti-hallucination tests: 用户输入只进入约束或 assumption，不进入 verified facts；episode summary 不能替代 evidence anchor；
+  memory snapshot rebuild 后 provenance 不丢；projection lag 不改变 Run 状态；同一 EventLog + 同一 policy 生成稳定 messages；
+  recent turns floor 在预算低时仍保持追问连续性。
 - pyright: memory modules 通过。
 - docs: Host README / dayu/README.md 按触发规则同步。
 
@@ -858,7 +896,125 @@ Phase 按依赖关系推进：先实现被其它阶段依赖的公共契约、ru
 
 后续依赖：
 - 后续 phase 可依赖的稳定契约：memory snapshot cursor、stable layer input provider、projection repair semantics。
-- 需要追踪到后续 phase 的事项：长期 memory / query-time retrieval 后续单独设计。
+- 需要追踪到后续 phase 的事项：长期 memory / query-time retrieval、业务 signal ledger、signal-to-outcome verification 后续单独设计；
+  P9 只预留 Host 中立 evidence anchor / claim status / provenance / trace 边界。
+- P9 all-repository follow-up 已明确 defer 的非 P9 blocking 架构债：Engine runner factory / registry、minimal read model
+  multi-consumer schema、Phase 11 RECOVERING 流程测试、Host durable/API error taxonomy、ToolRuntime / memory 模块拆分、
+  LocalProxy close/events race、read API enum mapping、lane heartbeat/shield hardening 与消息 / 工具结果大小治理。
+
+#### Phase 9 all-repository follow-up 追踪
+
+结论：
+
+- All-repository review artifacts 为 `docs/reviews/repo-review-20260517-1402.md`、
+  `docs/reviews/repo-review-20260517-1411.md`、`docs/reviews/repo-review-20260517-1435.md`、
+  `docs/reviews/repo-review-20260517-1434.md`、`docs/reviews/repo-review-20260517-1503.md` 与
+  `docs/reviews/repo-review-20260517-1507.md`；DS follow-up artifact 为
+  `docs/reviews/repo-review-ds-20260517-1521.md`。Final re-review artifacts 为
+  `docs/reviews/repo-review-final-mimo-20260517.md` 与 `docs/reviews/repo-review-final-ds-20260517.md`，两者均 PASS。
+- Controller adjudication artifact 为 `docs/reviews/p9-all-repo-review-controller-adjudication-20260517.md`。
+- Controller 接受并修复 projection checkpoint CAS、non-stream / SSE tool call parity、tool call content fallback、timeout
+  elapsed 统计、active worker / wait adapter / readany / startup closeout 日志、unsupported memory event diagnostic reason、
+  EventLog run/type index、runtime weak typing guard、RunnerSpec 边界校验、BatchToolExecutionOutcome record identity 校验与
+  malformed SSE usage 非终止处理、dispatch durable retry exhausted 非终态重排、SSE 已产出事件后的 retriable read failure 禁止跨
+  attempt retry、SSE tool-call final finish 强制 `TOOL_CALLS`，以及 runtime file lock release failure 后清理 active token。
+- Accepted all-repository follow-up commit 为 `6e12641`。
+
+验证：
+
+- `pytest -q`：966 passed。
+- `pyright dayu tests`：0 errors。
+- `git diff --check`：通过。
+
+追踪项：
+
+- Engine runner DI / factory、minimal read model 多 consumer reset、RECOVERING 状态机、durable/API error taxonomy、Command
+  service caching、LocalProxy race、read API enum mapping、ToolRuntime / memory 模块拆分、lane hardening 与消息 / 工具结果大小上限
+  均为后续 owned work，不阻塞 P9。其中除 RECOVERING 状态机归 Phase 11 外，其余不依赖 P10+ phase owner 的项目纳入 P9.5
+  Pre-P10 Cross-Repository Hardening PR。
+
+### Phase 9.5. Pre-P10 Cross-Repository Hardening PR
+
+状态：
+- planned；在 P9 draft-PR-pass follow-up accepted 后执行，必须在 Phase 10 Context Governance / Compaction 前完成或显式裁决
+  剩余项不阻塞 P10。
+
+目标：
+- 收口当前 `Open Questions 与风险追踪` 中不依赖 P10+ phase owner 的跨仓 hardening、cleanup 与 public contract repair。
+- 降低 Phase 10 前的基础设施噪音，避免 Context Governance 开始时继续携带 Engine / Host public contract / durable helper /
+  read API / LocalProxy / runtime lane 的已知非阻塞债。
+
+对应设计章节：
+- `docs/host/design.md` §4 Run / Attempt 状态模型
+- `docs/host/design.md` §10 Durable Store / Transaction / State Index
+- `docs/host/design.md` §12 Command Path / Background Runtime / Policy Provider
+- `docs/host/design.md` §16 Read Model / Host Event Stream / Outbox
+- `docs/host/design.md` §17 Host Dispatch / WorkerProxy / LocalProxy
+- `docs/host/design.md` §18 ToolRuntime Boundary
+- `docs/host/design.md` §24 Conversation Memory
+- `dayu/engine/README.md` 与 Engine runner / contracts 文档
+
+前置条件：
+- P9 已完成并通过 all-repository follow-up fix / re-review。
+- 用户确认 P9.5 不改变 P10 / P11 / P12 / P13 / P14 / P15 的语义 owner，只清理不依赖这些 owner 的当前追踪项。
+
+范围：
+- 允许修改：Engine runner factory / registry 边界、minimal read model consumer isolation、durable / public API error taxonomy、
+  Command service caching、LocalProxy close / events race、read API enum mapping、
+  ToolRuntime / memory 模块拆分、runtime lane hardening、message / tool result size governance、Host durable helper API tightening、
+  schema CHECK hardening、Engine / OpenAI runner / parser hardening、production memory projection catch-up composition wiring 中不触及
+  snapshot history 保留模型的部分、相关 README 与测试。
+- 禁止修改：Context Governance / compact provider、RECOVERING recovery scan / dispatch、RemoteProxy / RemoteStub、Audit / Tool Trace /
+  Outbox concrete sinks、ToolsDiscovery / ScenePrepare manifest provider、长期 memory / query-time retrieval、external job physical
+  cancel / callback 产品化、purge / retention production hardening。
+
+不做：
+- 不实现 Phase 10 Context Governance。
+- 不实现 Phase 11 RECOVERING / positive orphan proof / active cancel watchdog。
+- 不实现 Phase 12 ToolsDiscovery / ScenePrepare。
+- 不实现 Phase 13 Audit / Tool Trace / Outbox sinks。
+- 不实现 Phase 14 RemoteProxy。
+- 不实现 Phase 15 purge / retention / production scale。
+- 不处理本轮已裁决排除项：Conversation Memory snapshot history、`cancel_active_wait_records_for_run` TOCTOU、
+  session cancel replay 多 active worker 幂等、Gemini provider state 合约、Runner usage-only / tool-call-delta retry 粒度、
+  `RECOVERING` Run。
+
+P9.5 收口清单：
+- Engine runner DI / factory / registry：解除 Engine Agent 对具体 OpenAI runner 的硬编码装配，建立清晰 factory / provider
+  selection contract。
+- minimal read model multi-consumer schema：补齐 consumer isolation 或明确 minimal read model 单 consumer public contract，避免 reset
+  跨 consumer 清表。
+- durable / public API error taxonomy：收敛 durable error、public HostApiError detail 与 retryable 分类。
+- Command service caching：确认 command handle / service 缓存边界，不绕过 lifecycle guard 或 durable truth。
+- LocalProxy close / events race：补齐 worker handle close、events stream EOF / exception 与 late event 竞态测试及修复。
+- read API enum mapping：统一 durable row enum、public enum 与 event view enum 的映射边界。
+- ToolRuntime / memory 模块拆分：拆分 God module / 聚合模块中已暴露的过宽职责，但不得改变工具治理或 memory 语义。
+- ToolRuntime truncation / duplicate defensive hardening：补齐 truncation 多类型边界测试、duplicate governed error 防御性校验与
+  不依赖 durable duplicate ledger 的本地治理测试。
+- Engine wait confirmation matching-ref hardening：收紧 Engine awaiting / confirmation event 与 Host accepted refs 的匹配契约；
+  不引入 callback endpoint、poller 后台循环或 external job physical cancel。
+- runtime lane hardening：处理 lane heartbeat / shield / cancellation precision / release failure 诊断等不涉及 recovery owner 的问题。
+- Host dispatch lifecycle / RunInputBuilder non-recovery cleanup：收口 scheduler lane 竞争测试、`_drain_loop` 可观测性、
+  RunInputBuilder optimistic TOCTOU 与 `_consume_worker_events` cleanup 等不需要 Phase 11 recovery 语义的 hardening。
+- message / tool result size governance：补齐 Host / Engine 边界上的消息与工具结果大小上限、诊断和测试。
+- Host durable helper API tightening：收紧 `accept_worker_running_in_transaction` diagnostic payload、`mark_dispatching_after_lane_row`
+  等 helper 能力宽于生产路径的问题。
+- schema CHECK hardening：补齐不依赖后续 schema phase 的 SQLite CHECK / index / invariant 测试。
+- Engine / OpenAI runner / parser hardening：收口不涉及 P10 语义的 runner / parser correctness 和 observability findings。
+- P9 memory cleanup / test hardening：只收口 `current_goal`、legacy `SessionContinuityProvider` 参数、preview facts exclusion、
+  import boundary 与 catch-up end-to-end 等不涉及 snapshot history 保留模型的 cleanup / tests。
+- production memory projection catch-up composition wiring：补齐 command / admission / scheduler composition 中不改变 snapshot
+  history 保留模型的 concrete catch-up port 注入；snapshot history 本身仍按单独 PR 裁决处理。
+
+验证要求：
+- `pytest -q`。
+- `python -m pyright dayu tests`。
+- `git diff --check`。
+- 覆盖每个 P9.5 收口项的 targeted tests；不能只靠全量测试偶然覆盖。
+
+退出条件：
+- P9.5 收口清单全部完成、显式裁决为不修复，或重新归属到 P10+ phase owner且写明依赖理由。
+- P10 开始前，追踪区不得再存在“无 owner / 后续 hardening”但实际不依赖 P10+ 的项目。
 
 ### Phase 10. Context Governance / Compaction
 
@@ -1235,6 +1391,89 @@ Phase 按依赖关系推进：先实现被其它阶段依赖的公共契约、ru
 
 ### 追踪区
 
+#### P9.5 Pre-P10 Cross-Repository Hardening PR 归属追踪
+
+背景决议：
+
+- P9 已完成；P10 Context Governance 开始前，先新增一个 P9.5 PR 收口当前追踪区中不依赖 P10+ phase owner 的
+  hardening / cleanup。
+- P9.5 不接收刚才已重新裁决的排除项：Conversation Memory snapshot history、`cancel_active_wait_records_for_run`
+  TOCTOU、session cancel replay 多 active worker 幂等、Gemini provider state 合约、Runner usage-only / tool-call-delta
+  retry 粒度、`RECOVERING` Run。
+
+归属到 P9.5 的追踪项：
+
+- Engine runner DI / factory / registry。
+- minimal read model multi-consumer schema。
+- durable / public API error taxonomy。
+- Command service caching。
+- LocalProxy close / events race。
+- read API enum mapping。
+- ToolRuntime / memory 模块拆分。
+- ToolRuntime truncation / duplicate defensive validation 与 focused test hardening。
+- Engine wait confirmation matching-ref contract hardening。
+- runtime lane hardening。
+- Host dispatch lifecycle / RunInputBuilder non-recovery cleanup 与 targeted tests。
+- message / tool result size governance。
+- Host durable helper API tightening。
+- schema CHECK hardening。
+- Engine / OpenAI runner / parser hardening。
+- P9 memory 代码中不涉及 snapshot history 的 Host cleanup / test hardening。
+- production memory projection catch-up composition wiring 中不触及 snapshot history 保留模型的部分。
+- God module / class cleanup 与 broader test hardening 中不依赖 P10+ owner 的部分。
+
+退出规则：
+
+- P9.5 结束时，上述项目必须已修复、明确裁决为不修复，或因发现真实 P10+ 依赖而重新归属到具体后续 phase owner。
+- 不允许继续保留“后续 hardening”这类无明确 owner / destination 的追踪表述。
+
+#### 2026-05-17 全仓 Review Fix Gate 残余风险追踪
+
+背景决议：
+
+- 2026-05-17 全仓 review fix gate 已由 AgentCodex 修复，并经 AgentMiMo / AgentDS re-review PASS。
+- 本轮修复 artifact 为 `docs/reviews/repo-review-fix-agentcodex-20260517.md`；re-review artifact 为
+  `docs/reviews/repo-review-fix-rereview-mimo-20260517.md` 与
+  `docs/reviews/repo-review-fix-rereview-ds-20260517.md`。
+- 用户明确要求本轮不修改 `dayu/engine/agent.py` 的 `AsyncOpenAIRunner` 直接装配问题。
+
+追踪项：
+
+- Conversation Memory snapshot history：当前 dispatch 按 Attempt cursor 做 bounded catch-up，并用
+  at-or-before snapshot 读取阻止 queued future input 泄漏。残余风险是 snapshot 表仍按 session / consumer / policy 保留
+  latest snapshot；若其它 composition root 在 dispatch 前把同一 consumer catch-up 到 future cursor，旧 cursor snapshot
+  可能已不可读。裁决为单独 PR 修复；触发条件为新增 dispatch 外 memory catch-up composition root、需要多 cursor snapshot
+  保留，或需要跨 worker projection lifecycle owner。
+- `cancel_active_wait_records_for_run` TOCTOU：裁决为不修复当前 finding。`WAITING` cancel / resolve 属于 Phase 7 已完成能力，
+  当前设计要求同一 Run 同时只有一个 active wait record，Host 写事务是短事务且 CAS / first-committer-wins 是治理边界；
+  原 finding 的“多 active wait + 读后被其它 writer 抢先 resolve”复现场景不符合当前不变量。若后续放宽 active wait record
+  invariant，必须重新进入 Phase 7 wait cancel contract design。
+- session cancel replay 多 active worker 幂等：裁决为不修复当前 finding。设计真源要求同一个 Session 同时最多一个 active
+  Run，当前 session cancel replay 不需要支持多 active worker truth。若后续设计允许同一 Session 多 active Run / 多 worker
+  并行，必须先重写 admission invariant 与 session cancel replay contract。
+- Gemini provider state 合约：`GeminiToolCallState` 仍是 provider-specific public contract。裁决为单独 PR 修复，归属
+  Engine provider abstraction / contracts neutralization work unit；触发条件为新增非 Gemini provider-specific tool-call
+  continuation state，或决定把 provider state 统一为 provider-neutral tagged structure。
+- Runner usage-only / tool-call-delta retry 粒度：裁决为不修复当前 finding。此前 re-review 已接受“任意已 yield
+  RunnerEvent 后不跨 attempt retry”作为当前一致性边界；细分 usage-only / partial delta 可重试性必须先定义调用方可见事件、
+  审计、成本记录与重放安全契约，不能作为局部 retry tweak。
+- `RECOVERING` Run：该状态由 Phase 11 recovery owner 接入，当前 P9 生产转换代码尚不写入；本轮不围绕未接入状态增加分支。裁决为归到后续 phase owner；
+  destination 为
+  Phase 11 recovery dispatch；触发条件为实现 `RECOVERING` 入边 / 出边转换、startup recovery scan 或 recovery dispatch。
+
+#### Engine Runner Factory 解耦追踪
+
+背景决议：
+
+- 2026-05-17 全仓 review fix gate 中，用户明确要求本轮不修改 “Engine Agent 硬编码依赖 `AsyncOpenAIRunner`，违反 Protocol 解耦约束” 这一项代码。
+- 本轮不改 `dayu/engine/agent.py`，不引入 runner factory，不改变 Engine public entry 或 Host 调用方式。
+
+追踪项：
+
+- destination：P9.5 Pre-P10 Cross-Repository Hardening PR。
+- 触发条件：新增非 OpenAI-compatible 原生 runner、需要测试注入 runner factory、或 Engine public entry 需要支持 provider selection contract。
+- 后续处理要求：先明确 `AsyncRunner` factory 协议与 provider selection contract，再修改 Engine agent composition；不得用 lazy import、兼容 wrapper 或 metadata bag 作为解耦替代品。
+
 #### Engine Context Compaction Event 语义前置
 
 背景决议：
@@ -1337,7 +1576,7 @@ Phase 按依赖关系推进：先实现被其它阶段依赖的公共契约、ru
 追踪项：
 
 - Phase 14. RemoteProxy / RemoteStub 必须测试旧 `execution_id` 的迟到 Engine event、迟到 tool result、迟到 terminal 只能进入 diagnostic / trace，不能污染 canonical EventLog。
-- 后续 tool policy provider / adapter hardening owner 必须保持外部副作用工具的 idempotency key、side-effect policy 与 best-effort cancel / revoke 边界。
+- Phase 12 tool policy provider 与 adapter hardening owner 必须保持外部副作用工具的 idempotency key、side-effect policy 与 best-effort cancel / revoke 边界。
 - Phase 14. RemoteProxy / RemoteStub 不得引入远端 takeover attempt、远端 append EventLog 或远端更新 Run 状态。
 
 #### Session Purge / Archive 追踪
@@ -1381,7 +1620,7 @@ Phase 按依赖关系推进：先实现被其它阶段依赖的公共契约、ru
 
 - Phase 11 Host Lifecycle / Recovery / Multi-process Hardening 不得把 Phase 2 `host_instances` liveness row 解释为 lease、fencing、owner、takeover 或 positive orphan proof；Phase 11 只能在 dispatch record、pid / process_start_token / boot id 与 heartbeat 等 durable facts 共同满足 positive orphan proof 后推进 recovery。
 - `heartbeat_current_instance` / repeated `register_current_instance` 当前可把同一当前 instance row 从 `stopping` 刷回 `running`；owner 为 Phase 11 Host Lifecycle / Recovery / Multi-process Hardening。Phase 11 若引入严格 lifecycle 解释，必须先决定是否收紧该 transition，并补充状态回退测试。
-- `SQLitePayloadWriteRequest.payload_json=None` 在 `canonical_json` 格式下表示合法 JSON `null`；后续 public command 或 tool accept hardening 若不允许隐式 null，必须在对应构造边界显式收紧，而不是修改 Phase 2 durable primitive。
+- `SQLitePayloadWriteRequest.payload_json=None` 在 `canonical_json` 格式下表示合法 JSON `null`；后续对应 public command 或 tool accept contract work unit 若不允许隐式 null，必须在对应构造边界显式收紧，而不是修改 Phase 2 durable primitive。
 - Artifact orphan cleanup owner 为 Phase 15 Retention / Purge / Production Hardening。Phase 2 只保证 rollback 后 orphan 文件不是 accepted fact；Phase 15 必须决定 orphan cleanup 是 manual diagnostic、startup diagnostic 还是 background cleanup，并补测试 / 文档。
 - Artifact directory fsync failure 当前仍作为结构化 durable write error 暴露，不为平台兼容而吞掉；这是 aggregate adjudication 明确拒绝的修复方向，不安排为后续实现项。若 Phase 15 production hardening 后续要改变平台兼容策略，必须重新做 design discussion。
 
@@ -1411,15 +1650,15 @@ Phase 按依赖关系推进：先实现被其它阶段依赖的公共契约、ru
 
 追踪项：
 
-- `accept_worker_running_in_transaction` 诊断 payload 弱于 scheduler 生产路径；owner 为 Host durable transition hardening。
-- `mark_dispatching_after_lane_row` 底层 helper 能力宽于生产 scheduler 路径；owner 为 Host durable API tightening。
+- `accept_worker_running_in_transaction` 诊断 payload 弱于 scheduler 生产路径；owner 为 P9.5 Pre-P10 Cross-Repository Hardening PR。
+- `mark_dispatching_after_lane_row` 底层 helper 能力宽于生产 scheduler 路径；owner 为 P9.5 Pre-P10 Cross-Repository Hardening PR。
 - terminal closeout 后 queue promotion wakeup failure 的诊断 / 抑制策略；owner 为 Phase 11. Host Lifecycle / Recovery / Multi-process Hardening。
 - active cancel watchdog、stuck `CANCELLING` 与 orphan recovery；owner 为 Phase 11. Host Lifecycle / Recovery / Multi-process Hardening。
 - RemoteProxy 语义与远端迟到事件治理；owner 为 Phase 14. RemoteProxy / RemoteStub。
 - Memory、Context Governance 与 compact artifact 真实 provider 接线；owner 分别为 Phase 9. Memory 与 Phase 10. Context Governance / Compaction。
-- runtime lane repeated outer cancellation、untracked release failure 与 idle scheduler sleeping task；owner 为后续 runtime cancellation precision / Host dispatch lifecycle hardening。
-- Engine runner injection / provider abstraction design；owner 为后续 Engine composition / provider abstraction design。
-- God module / class cleanup 与 broader test hardening；owner 为后续 architecture / test hardening。
+- runtime lane repeated outer cancellation、untracked release failure 与 idle scheduler sleeping task；owner 为 P9.5 Pre-P10 Cross-Repository Hardening PR。
+- Engine runner injection / provider abstraction design；owner 为 P9.5 Pre-P10 Cross-Repository Hardening PR。
+- God module / class cleanup 与 broader test hardening；owner 为 P9.5 Pre-P10 Cross-Repository Hardening PR 中不依赖 P10+ owner 的部分。
 
 #### Phase 6 P6-S4 Truncation / fetch_more 残余风险追踪
 
@@ -1435,7 +1674,7 @@ Phase 按依赖关系推进：先实现被其它阶段依赖的公共契约、ru
 
 - `TruncationManager` cursor 仍为内存、ToolRuntime-local、单 Run 生命周期；Phase 11 recovery 不得把 P6-S4 cursor 解释为可恢复 durable truth。
 - 当前测试允许 white-box 篡改 `_cursors` 验证 corrupt / mismatch 防御；若后续 cursor 存储结构迁移，owner 为对应迁移 slice 同步调整测试边界。
-- 当前覆盖以 `text_chars` 为主；`text_lines`、`list_items`、`binary_bytes` 的更细粒度边界 hardening 归后续 ToolRuntime test hardening，不阻塞 P6-S5。
+- 当前覆盖以 `text_chars` 为主；`text_lines`、`list_items`、`binary_bytes` 的更细粒度边界 hardening 归 P9.5 Pre-P10 Cross-Repository Hardening PR，不阻塞 P6-S5。
 
 #### Phase 6 P6-S5 Duplicate Governance / Diagnostics 残余风险追踪
 
@@ -1450,11 +1689,11 @@ Phase 按依赖关系推进：先实现被其它阶段依赖的公共契约、ru
 
 追踪项：
 
-- 默认 duplicate policy 仍为 `allow`；生产 policy provider resolution owner 为 Phase 12 ToolsDiscovery / ScenePrepare 或后续 ToolRuntime policy provider work。
+- 默认 duplicate policy 仍为 `allow`；生产 policy provider resolution owner 为 Phase 12 ToolsDiscovery / ScenePrepare / ToolRuntime policy provider work。
 - `semantic_duplicate_key_argument_name` 是 Host 内部 policy 字段且默认关闭；后续 policy provider 若启用它，必须补 dedicated tests 并明确其与 normalized arguments digest 的关系。
-- `ToolFactAcceptCandidate` 对 `GOVERNED_ERROR` 的 duplicate defensive validation 仍可更严格；owner 为后续 ToolRuntime hardening。
+- `ToolFactAcceptCandidate` 对 `GOVERNED_ERROR` 的 duplicate defensive validation 仍可更严格；owner 为 P9.5 Pre-P10 Cross-Repository Hardening PR。
 - `ToolTraceDiagnosticEmitter` typed refs 不等于 durable tool trace；durable trace projection 由 Phase 13 Audit / Tool Trace / Outbox Projections 接收。
-- Durable duplicate ledger 不属于 P6；若后续需要跨进程 / crash 后恢复 duplicate index，owner 为后续 duplicate hardening 或 Phase 13 tool trace / projection owner。
+- Durable duplicate ledger 不属于 P6；若后续需要跨进程 / crash 后恢复 duplicate index，owner 为 Phase 13 tool trace / projection owner 或单独 duplicate ledger design PR。
 
 #### Phase 6 P6-S6 Integration / Scheduler Wiring 残余风险追踪
 
@@ -1469,10 +1708,10 @@ Phase 按依赖关系推进：先实现被其它阶段依赖的公共契约、ru
 追踪项：
 
 - `tooling_options` 当前是 construction-time 单 bundle 输入；多 profile / per-scene tool profile 仍归 Phase 12 ToolsDiscovery / ScenePrepare 或后续 policy provider owner。
-- `policy_snapshot_digest` 当前是本地 policy snapshot 的诊断 digest，不是 durable attempt tool snapshot；attempt tool snapshot durability 仍归后续 ToolRuntime hardening / policy provider owner。
+- `policy_snapshot_digest` 当前是本地 policy snapshot 的诊断 digest，不是 durable attempt tool snapshot；attempt tool snapshot durability 仍归 Phase 12 ToolsDiscovery / ScenePrepare / ToolRuntime policy provider owner。
 - duplicate governance 的裁决为 Run-local 语义：同一个 Run 因 `WAITING -> resolve_wait -> resume`、steer 或 recovery 创建新 Attempt 时，正常同进程生命周期内必须共享该 Run 的 duplicate memory。P6 不要求 durable duplicate ledger，也不要求 Host 崩溃 / 重启后恢复内存 index；崩溃恢复后的重复风险由 RunInputBuilder 的 accepted facts 重建兜底。Phase 7 / steer / recovery owner 不再重新裁决“是否需要 Run-local”，只按各自路径复用该语义。
 - `WAITING -> resolve_wait -> resume` 是新的 LLM request。Host 不能要求无状态模型天然记住上一 Attempt 已经发过某个 tool call；resume RunInputBuilder 必须把已 accepted 的等待结果、工具事实、governance guidance 与必要上下文放回 messages。若模型仍重复发起同一个语义工具调用，Run-local duplicate governance 负责复用、提示、要求说明或阻断。
-- `enable_truncation_manager=True` 是本地 tool-enabled scheduler 默认值；若后续 TruncationManager 初始化成本变重，归 ToolRuntime performance hardening 复核。
+- `enable_truncation_manager=True` 是本地 tool-enabled scheduler 默认值；TruncationManager 初始化成本复核归 P9.5 Pre-P10 Cross-Repository Hardening PR，若发现需要 production scale policy 再转交 Phase 15。
 
 #### Phase 7 Tool Awaiting / resolve_wait / Wait Adapter 残余风险追踪
 
@@ -1483,12 +1722,12 @@ Phase 按依赖关系推进：先实现被其它阶段依赖的公共契约、ru
 
 追踪项：
 
-- Callback endpoint / auth / replay owner 为后续 callback adapter work unit。
+- Callback endpoint / auth / replay owner 为 callback adapter work unit。
 - Poller 后台 loop、backoff、in-flight fencing、adapter retry、`LIMIT` / `CANCELLED` abandon 退避 owner 为 Phase 15. Retention / Purge / Production Hardening 或后续 production polling scale work unit。
 - `WAITING` recovery observation、awaiting accepted ack 当前状态重校验与 scheduler close active Run reconciliation owner 为 Phase 11. Host Lifecycle / Recovery / Multi-process Hardening。
-- Engine matching-ref 强校验 owner 为后续 Engine contract evolution。
-- External job physical cancel / revoke owner 为后续 adapter hardening。
-- Durable duplicate ledger owner 为后续 duplicate hardening；durable tool trace projection owner 为 Phase 13. Audit / Tool Trace / Outbox Projections。
+- Engine matching-ref 强校验 owner 为 P9.5 Pre-P10 Cross-Repository Hardening PR。
+- External job physical cancel / revoke owner 为 adapter hardening work unit。
+- Durable duplicate ledger owner 为单独 duplicate ledger design PR；durable tool trace projection owner 为 Phase 13. Audit / Tool Trace / Outbox Projections。
 
 #### Phase 8 Projection Core / Host Event Stream / Minimal Read Model 残余风险追踪
 
@@ -1499,15 +1738,322 @@ Phase 按依赖关系推进：先实现被其它阶段依赖的公共契约、ru
 
 追踪项：
 
-- Automatic after-commit projection catch-up owner 为 Phase 9. Conversation Memory / Session Memory Projection。
+- Automatic after-commit projection catch-up 已由 P9-S4 以 injectable `ProjectionCatchupPort` 与 best-effort post-commit hooks
+  落地；production composition root concrete port 注入中不触及 snapshot history 保留模型的部分归 P9.5 Pre-P10 Cross-Repository
+  Hardening PR。
 - Heavy sink / batch-transaction runner owner 为 Phase 13. Audit / Tool Trace / Outbox Projections 与 Phase 15. Retention / Purge / Production Hardening。
 - Per-session repair filter owner 为 Phase 15. Retention / Purge / Production Hardening。
 - RunResult summary refs 接入 public `RunSnapshot` owner 为 Phase 9 / Phase 15 或后续 public read enhancement work unit。
 - Audit / Tool Trace / Outbox concrete sinks owner 为 Phase 13. Audit / Tool Trace / Outbox Projections。
-- Engine / OpenAI runner / parser findings owner 为 Engine hardening gate。
-- Schema CHECK hardening owner 为后续 schema hardening work unit。
+- Engine / OpenAI runner / parser findings owner 为 P9.5 Pre-P10 Cross-Repository Hardening PR。
+- Schema CHECK hardening owner 为 P9.5 Pre-P10 Cross-Repository Hardening PR。
+
+#### Phase 9 Conversation Memory / Session Memory Projection design refinement 追踪
+
+结论：
+
+- P9 的核心定位是“财报分析工作台状态投影”，不是聊天记录压缩器。
+- P9 memory view 必须明确区分 `pinned_state`、`verified_facts`、`working_assumptions` 与
+  `conversation_continuity`；不得把工具事实、assistant conclusion、用户说法和 episode summary 混成无结构字符串列表。
+- P9 必须为后续跨多年弱信号归因召回预留 Host 中立 evidence anchor、claim status、provenance 与 trace included /
+  excluded reason 边界；长期 retrieval index、业务 signal ledger、signal-to-outcome verification 与 public memory edit / reset /
+  forget API 不进入 P9。
+- P9 不实现 LLM compaction 写 truth；LLM 产出的 pinned patch、episode summary 或 conclusion 默认只能成为 candidate /
+  assumption / continuity view。proactive compaction 编排归 Phase 10 Context Governance。
+
+追踪项：
+
+- P9 plan 必须把 memory snapshot schema、claim status、provenance refs、snapshot cursor、policy digest、included / excluded reason、
+  lag threshold 与 repair trigger 落成可实现的 typed contract 与测试矩阵。
+- P9 plan 必须保持 Host 业务中立，不得让 Host import `dayu.fins`、不得保存网页新闻 / 公告 / 研报摘录 / 财报 chunk 原文、
+  不得把 company / business-line / technology release 等财报业务语义写进 Host memory schema。
+- Issue 39 owner 后续实现 query-time retrieval 与 signal-to-outcome verification 时，必须复用 P9 的中立 anchor / claim /
+  provenance / trace 边界；若发现边界不足，先回写 `docs/host/design.md` 再实施。
+
+#### Phase 9 plan gate 追踪
+
+结论：
+
+- P9 handoff implementation-ready plan artifact 为 `docs/host/phase9-conversation-memory-plan.md`。
+- Plan review artifacts 为 `docs/reviews/p9-plan-review-mimo-20260516.md` 与
+  `docs/reviews/p9-plan-review-ds-20260516.md`。
+- Plan re-review artifacts 为 `docs/reviews/p9-plan-rereview-mimo-20260516.md` 与
+  `docs/reviews/p9-plan-rereview-ds-20260516.md`。
+- Controller adjudication artifact 为 `docs/reviews/p9-plan-review-controller-adjudication-20260516.md`。
+- Re-review verdict：AgentMiMo PASS，AgentDS PASS，remaining blocking findings 为 0。
+- Accepted plan commit 为 `469baaa`。
+
+追踪项：
+
+- 当前无 accepted blocking plan finding。
+- P9 implementation 必须按 accepted plan 的 slice 顺序推进；若 implementation agent 发现现有 `TOOL_RESULT_ACCEPTED` 无法提供任何可审计
+  summary / ref / digest 组合、repair-required 无法在不修改 Run 状态机的情况下表达、Memory provider 接入需要修改 Engine message
+  contract，或必须让 Host 理解财报业务 subject 类型，必须停回 design / control gate。
+
+#### Phase 9 Slice 1 Durable Memory Contracts and Schema 追踪
+
+结论：
+
+- P9-S1 implementation 已完成，交付 memory typed contracts、schema v6 memory projection tables、transaction-scoped durable
+  read / write primitive 与 focused tests。
+- Code review artifacts 为 `docs/reviews/p9-s1-code-review-mimo-20260517.md` 与
+  `docs/reviews/p9-s1-code-review-ds-20260517.md`。
+- Code re-review artifacts 为 `docs/reviews/p9-s1-code-rereview-mimo-20260517.md` 与
+  `docs/reviews/p9-s1-code-rereview-ds-20260517.md`。
+- Controller adjudication artifact 为 `docs/reviews/p9-s1-code-review-controller-adjudication-20260517.md`。
+- Re-review verdict：AgentMiMo PASS，AgentDS PASS，remaining blocking findings 为 0。
+- Accepted slice commit 为 `f221aeb`。
+
+验证：
+
+- `pytest tests/host/test_memory_projection.py tests/host/test_durable_schema.py`：21 passed。
+- `pytest tests/host/test_weak_typing_guard.py`：1 passed。
+- `pyright dayu/host tests/host`：0 errors。
+- `git diff --check`：通过。
+
+追踪项：
+
+- DS C1 non-TOOL `producer_name` 语义精度由 P9-S2 projection consumer / stable layer owner 处理；当前 fallback
+  不产生 false tool provenance，不阻塞 S1。
+- MiMo N1 included / excluded reason 命名稳定性由 P9-S2 在下游 rendering / trace consumer 固化前复核。
+- MiMo N3 `MemoryDiagnostic.recorded_at` optional type surface、DS C3 optional JSON helper wording、DS S3 empty snapshot 双实例构造、
+  DS T1 cast 注释属于 P9.5 Pre-P10 Cross-Repository Hardening PR 的 Host cleanup / test hardening，不阻塞 P9。
+- DS A1 snapshot upsert 并发 guard 由 P9-S2 / P9-S4 在 projection writer concurrency 与 repair 语义明确后裁决。
+
+#### Phase 9 Slice 2 Projection Consumer and Stable Layer Builder 追踪
+
+结论：
+
+- P9-S2 implementation 已完成，交付 `ConversationMemoryProjectionConsumer`、EventLog-to-memory pure builder、verified fact
+  extraction、working assumption / continuity classification、history pool budget 选择与 ProjectionRunner integration tests。
+- Code review artifacts 为 `docs/reviews/p9-s2-code-review-mimo-20260517-0905.md` 与
+  `docs/reviews/p9-s2-code-review-ds-20260517.md`。
+- Code re-review artifacts 为 `docs/reviews/p9-s2-code-rereview-mimo-20260517.md` 与
+  `docs/reviews/p9-s2-code-rereview-ds-20260517.md`。
+- Controller adjudication artifact 为 `docs/reviews/p9-s2-code-review-controller-adjudication-20260517.md`。
+- Re-review verdict：AgentMiMo PASS，AgentDS PASS，remaining blocking findings 为 0。
+- Accepted slice commit 为 `4f35da6`。
+
+验证：
+
+- `pytest tests/host/test_memory_projection.py tests/host/test_durable_schema.py`：35 passed。
+- `pytest tests/host/test_weak_typing_guard.py`：1 passed。
+- `pyright dayu/host/memory.py dayu/host/durable/memory.py tests/host/test_memory_projection.py`：0 errors。
+- `git diff --check`：通过。
+
+追踪项：
+
+- Slice 3 必须确保 `RunInputBuilder` 按 P9 固定顺序消费 memory stable layer，且 legacy `SessionContinuityProvider`
+  不再注入未经过 memory history pool 预算的 historical raw turns。S3 已完成。
+- Unsupported event type 初版曾复用通用 diagnostic reason；P9 all-repository follow-up 已新增独立
+  `unsupported_event_type` reason，并随 schema v7 落地。
+- `stable_layer_size_units` 在 S2 仍未消费；S3 memory message renderer 必须裁决该上限如何约束 rendered stable layer。
+  S3 已裁决为：stable memory blocks 按 P9 优先级消费该 cap，超预算 block 记录 transient
+  `BUDGET_LIMIT_REACHED` diagnostic；recent raw turns、episode summaries 与当前 prompt 不进入 stable layer cap。
+
+#### Phase 9 Slice 4 Projection Repair / Rebuild Entry and Diagnostics 追踪
+
+结论：
+
+- P9-S4 implementation 已完成，交付 `dayu.host.memory_repair` rebuild / catch-up entry、consumer-scoped memory projection
+  reset、通用 `ProjectionCatchupPort` / no-op port / best-effort helper，以及 start / follow-up / terminal closeout /
+  scheduler promotion / ToolRuntime tool fact accept / resolve_wait after-commit catch-up wiring。
+- Code review artifacts 为 `docs/reviews/p9-s4-code-review-mimo-20260517.md` 与
+  `docs/reviews/p9-s4-code-review-ds-20260517.md`。
+- Code re-review artifacts 为 `docs/reviews/p9-s4-code-rereview-mimo-20260517.md` 与
+  `docs/reviews/p9-s4-code-rereview-ds-20260517.md`。
+- Controller adjudication artifact 为 `docs/reviews/p9-s4-code-review-controller-adjudication-20260517.md`。
+- Re-review verdict：AgentMiMo PASS，AgentDS PASS，remaining blocking findings 为 0。
+- Accepted slice commit 为 `1d30725`。
+
+验证：
+
+- `pytest tests/host/test_toolruntime_accept_barrier.py tests/host/test_resolve_wait_command.py tests/host/test_admission_queue.py tests/host/test_dispatch_scheduler.py tests/host/test_memory_projection.py tests/host/test_run_input_builder.py tests/host/test_projection_runner.py tests/host/test_projection_checkpoint.py tests/host/test_import_boundary.py tests/host/test_weak_typing_guard.py`：129 passed。
+- `pyright dayu/host tests/host`：0 errors。
+- `git diff --check`：通过。
+
+追踪项：
+
+- P9-S4 不把 catch-up failure 升级为 Run recovery，也不让 catch-up failure 回滚已提交 command / accept result；失败通过
+  `dayu.host.projection` logger 和 projection-local failure row 观测。
+- 默认 command handle / admission service 使用 no-op catch-up port；production concrete memory catch-up port 注入中不触及 snapshot
+  history 保留模型的部分归 P9.5 Pre-P10 Cross-Repository Hardening PR，不阻塞 P9。
+- Late `resolve_wait` rejection 可能额外触发一次 catch-up；当前只产生低风险冗余，不改变 EventLog、Run 状态或 projection
+  truth，归 P9.5 Pre-P10 Cross-Repository Hardening PR。
+- Heavy sink / batch runner、per-session repair filter 与 Audit / Tool Trace / Outbox concrete sinks 仍归 Phase 13 / Phase 15。
+
+#### Phase 9 aggregate deepreview 追踪
+
+结论：
+
+- P9 aggregate deepreview 已完成，review 范围为 `f27ce8a..1b19b35` 的 Phase 9 plan、implementation、docs 与历史 slice
+  裁决。
+- Aggregate review artifacts 为 `docs/reviews/p9-aggregate-deepreview-mimo-20260517.md` 与
+  `docs/reviews/p9-aggregate-deepreview-ds-20260517.md`。
+- Controller adjudication artifact 为 `docs/reviews/p9-aggregate-deepreview-controller-adjudication-20260517.md`。
+- Verdict：AgentMiMo PASS，AgentDS PASS，remaining blocking findings 为 0。
+- Accepted deepreview commit 为 `cc05f79`。
+
+验证：
+
+- P9-S4 final validation：129 focused Host tests passed；`pyright dayu/host tests/host` 0 errors；`git diff --check` 通过。
+- AgentMiMo 额外验证：memory / run_input / durable schema subset 63 passed；memory / run_input / projection pyright subset 0 errors。
+- AgentDS 额外验证：手动验证 memory import boundary 与 weak typing discipline，无 blocking finding。
+
+追踪项：
+
+- `MemoryIncludedReason` / `MemoryExcludedReason` 粒度低于 plan 规格与 per-item excluded reason 精度，owner 为
+  Phase 10 Context Governance / Phase 13 Tool Trace / memory reason schema owner；unsupported event diagnostic reason 已在 all-repository follow-up 修复。
+- `WorkingAssumptionView` 暂无主动数据填充路径，owner 为 Phase 10 proactive compaction / issue 39 retrieval。
+- `current_goal` first-write-wins、`SessionContinuityProvider` snapshot 参数清理、preview facts exclusion 专项测试、memory import
+  boundary 自动化测试与 catch-up end-to-end 专项测试，owner 为 P9.5 Pre-P10 Cross-Repository Hardening PR；若实施中触及
+  Conversation Memory snapshot history 保留模型，则该子项必须转交前述单独 PR。
+- production concrete memory catch-up port 注入中不触及 snapshot history 保留模型的部分，owner 为 P9.5 Pre-P10 Cross-Repository
+  Hardening PR。
+- Synchronous best-effort catch-up 的 batch 化与性能治理，owner 为 Phase 13 / Phase 15。
+
+#### Phase 9 draft PR gate 追踪
+
+结论：
+
+- Draft PR 已创建：PR 59 https://github.com/noho/dayu-agent-r/pull/59。
+- PR review artifacts 为 `docs/reviews/p9-pr-review-mimo-20260517.md` 与
+  `docs/reviews/p9-pr-review-ds-20260517.md`。
+- Controller PR review adjudication artifact 为 `docs/reviews/p9-pr-review-controller-adjudication-20260517.md`。
+- Verdict：AgentMiMo PASS，AgentDS PASS，remaining blocking findings 为 0。
+- GitHub 当前未上报 checks；本地 final validation 与 PR review gate 均通过。
+- Accepted PR review commit 为 `67458cb`。
+
+追踪项：
+
+- PR 59 仍为 draft。mark ready for review、merge、request reviewers、delete branch 或对外 comment 需额外授权。
+- 当前无 PR review blocking fix。
 
 ## 历史记录
+
+### 2026-05-17 P9 draft PR review accepted
+
+P9 draft PR 已创建：PR 59 https://github.com/noho/dayu-agent-r/pull/59。PR review gate 已完成：
+AgentMiMo artifact 为 `docs/reviews/p9-pr-review-mimo-20260517.md`，AgentDS artifact 为
+`docs/reviews/p9-pr-review-ds-20260517.md`。Controller adjudication artifact 为
+`docs/reviews/p9-pr-review-controller-adjudication-20260517.md`。
+
+Verdict：AgentMiMo PASS，AgentDS PASS，remaining blocking findings 为 0。PR review 未发现 release-blocking issue；
+当前 GitHub 未上报 checks。
+
+Accepted PR review commit 为 `67458cb`。当前 gate 为 draft-PR-pass。
+
+### 2026-05-17 P9 aggregate deepreview accepted
+
+P9 aggregate deepreview 已完成。AgentMiMo artifact 为
+`docs/reviews/p9-aggregate-deepreview-mimo-20260517.md`，AgentDS artifact 为
+`docs/reviews/p9-aggregate-deepreview-ds-20260517.md`。Controller adjudication artifact 为
+`docs/reviews/p9-aggregate-deepreview-controller-adjudication-20260517.md`。
+
+Verdict：AgentMiMo PASS，AgentDS PASS，remaining blocking findings 为 0。Controller 接受 aggregate deepreview 为
+Phase 9 exit gate；non-blocking findings 已写入 Phase 9 aggregate deepreview 追踪项并分配 owner。当前 gate 为
+draft PR gate；用户已授权 push、创建 draft PR 并继续推进 PR review。
+
+Accepted deepreview commit 为 `cc05f79`。
+
+### 2026-05-17 P9-S4 code review accepted
+
+P9-S4 `Projection Repair / Rebuild Entry and Diagnostics` implementation 已完成。实现范围包含 memory projection rebuild /
+catch-up service、consumer-scoped reset、ProjectionRunner-backed catch-up、projection-local failure recording、after-commit
+best-effort catch-up hooks，以及 command / scheduler / ToolRuntime / resolve_wait 接线。
+
+双路 code review artifacts 为 `docs/reviews/p9-s4-code-review-mimo-20260517.md` 与
+`docs/reviews/p9-s4-code-review-ds-20260517.md`。双路 re-review artifacts 为
+`docs/reviews/p9-s4-code-rereview-mimo-20260517.md` 与
+`docs/reviews/p9-s4-code-rereview-ds-20260517.md`。Controller adjudication artifact 为
+`docs/reviews/p9-s4-code-review-controller-adjudication-20260517.md`。Re-review verdict：AgentMiMo PASS，AgentDS
+PASS，remaining blocking findings 为 0。
+
+Controller 接受并修复 resolve_wait hook、ToolRuntime tool fact accept hook、catch-up failure logging 与
+`ProjectionCatchupPort` ownership 迁移；接受 consumer-scoped reset 清理同 consumer 全部 policy snapshot，因为 projection
+checkpoint 是 consumer-scoped。Controller defer late rejection extra catch-up、future duplicate hook cleanup 与 synchronous
+best-effort catch-up 性能优化，均不阻塞 P9。
+
+验证：
+
+- `pytest tests/host/test_toolruntime_accept_barrier.py tests/host/test_resolve_wait_command.py tests/host/test_admission_queue.py tests/host/test_dispatch_scheduler.py tests/host/test_memory_projection.py tests/host/test_run_input_builder.py tests/host/test_projection_runner.py tests/host/test_projection_checkpoint.py tests/host/test_import_boundary.py tests/host/test_weak_typing_guard.py`：129 passed。
+- `pyright dayu/host tests/host`：0 errors。
+- `git diff --check`：通过。
+
+Accepted slice commit 为 `1d30725`。当前 gate 为 P9 aggregate deepreview。
+
+### 2026-05-17 P9-S3 code review accepted
+
+P9-S3 `RunInputBuilder MemorySnapshotProvider and Lag Fallback` implementation 已完成。实现范围包含
+`DurableMemorySnapshotProvider`、`MemoryProjectionRepairRequired`、RunInputBuilder memory snapshot 渲染、small-lag inline
+delta fallback、missing / damaged / over-threshold / ahead-of-required repair-required 路径，以及 legacy
+`DurableSessionContinuityProvider` 收敛为 resume-specific continuity。
+
+双路 code review artifacts 为 `docs/reviews/p9-s3-code-review-mimo-20260517.md` 与
+`docs/reviews/p9-s3-code-review-ds-20260517.md`。双路 re-review artifacts 为
+`docs/reviews/p9-s3-code-rereview-mimo-20260517.md` 与
+`docs/reviews/p9-s3-code-rereview-ds-20260517.md`。Controller adjudication artifact 为
+`docs/reviews/p9-s3-code-review-controller-adjudication-20260517.md`。Re-review verdict：AgentMiMo PASS，AgentDS
+PASS，remaining blocking findings 为 0。
+
+Controller 接受并修复 snapshot ahead-of-required repair、stable layer budget consumption、当前 prompt event-id-only 去重、
+episode summary event 常量、covered snapshot cursor 测试一致性，以及 inline delta + stable budget 交叉测试。DS 关于生产
+required cursor 改为 Run started boundary 的建议不接受；P9 plan 明确规定使用
+`current_facts.attempt.started_event_sequence - 1`，以允许 resume / steer / recovery 新 Attempt 前 committed facts 进入
+memory。
+
+验证：
+
+- `pytest tests/host/test_run_input_builder.py tests/host/test_memory_projection.py tests/host/test_weak_typing_guard.py`：49 passed。
+- `pyright dayu/host/run_input.py dayu/host/memory.py dayu/host/durable/memory.py tests/host`：0 errors。
+- `git diff --check`：通过。
+
+Accepted slice commit 为 `b416d37`。当前 gate 为 P9-S4 `Projection Repair / Rebuild Entry and Diagnostics` implementation。
+
+### 2026-05-17 P9-S2 code review accepted
+
+P9-S2 `Projection Consumer and Stable Layer Builder` implementation 已完成。实现范围包含 `dayu.host.memory` 中的
+`MemoryProjectionEvent`、EventLog-to-memory snapshot builder、verified fact extraction、history pool policy；以及
+`dayu.host.durable.memory` 中的 `ConversationMemoryProjectionConsumer`。双路 code review 已完成：AgentMiMo 初审 verdict 为
+PASS，提出 1 个 medium 与 2 个 low findings；AgentDS 初审 verdict 为 PASS，提出 3 个 medium 与 1 个 low finding。Controller
+接受 assistant conclusion budget、`recent_raw_turns_floor=0`、missing `tool_name` provenance、malformed `source_refs` 与
+unknown event type diagnostic 五项修复。Fix 后双路 re-review 均 PASS，remaining blocking findings 为 0。Controller
+adjudication artifact 为 `docs/reviews/p9-s2-code-review-controller-adjudication-20260517.md`。Accepted slice commit 为 `4f35da6`。
+当前 gate 为 P9-S3 `RunInputBuilder MemorySnapshotProvider and Lag Fallback` implementation。
+
+### 2026-05-17 P9-S1 code review accepted
+
+P9-S1 `Durable Memory Contracts and Schema` implementation 已完成。实现范围包含 `dayu.host.memory` typed contracts、
+`dayu.host.durable.memory` transaction-scoped memory snapshot / diagnostic read-write primitive、schema v6 memory projection
+tables 与 focused tests。双路 code review 已完成：AgentMiMo 初审 verdict 为 CONDITIONAL PASS，提出 1 个 blocking 与 3 个
+non-blocking findings；AgentDS 初审 verdict 为 PASS with findings，提出 0 个 blocking、3 个 medium、3 个 low 与 2 个 info
+findings。Controller 接受 MiMo B1 / DS C2 digest deterministic fix 与 MiMo N2 reserved claim status test coverage fix，defer
+non-blocking producer name precision、reason naming、diagnostic timestamp type surface 与 hardening items 到 P9-S2 / P9-S4 或 P9.5
+Pre-P10 Cross-Repository Hardening PR。Fix 后双路 re-review 均 PASS，remaining blocking findings 为 0。Controller adjudication artifact 为
+`docs/reviews/p9-s1-code-review-controller-adjudication-20260517.md`。Accepted slice commit 为 `f221aeb`。当前 gate 为
+P9-S2 `Projection Consumer and Stable Layer Builder` implementation。
+
+### 2026-05-16 P9 plan accepted
+
+P9 handoff implementation-ready plan 已生成于 `docs/host/phase9-conversation-memory-plan.md`。双路 plan review 已完成：
+AgentMiMo 初审 verdict 为 PASS with findings，提出 2 个 blocking、5 个 medium、3 个 low findings；AgentDS 初审 verdict 为 PASS，
+提出 0 个 blocking、2 个 medium、3 个 low、1 个 info finding。Controller 裁决接受 provider 接线、`MemorySnapshotView` shape、
+claim status lifecycle、`RUN_SUCCEEDED` continuity、`required_event_sequence`、`open_questions` placement、history pool 算法、
+Host-neutral ref、`TOOL_RESULT_ACCEPTED` mapping、diagnostic/failure 分工与 digest canonicalization 等修正项；拒绝固定 40 / 60
+magic budget split 和业务词 blocklist 作为修复方式。Planning agent 已修正 plan。双路 re-review 均 PASS，remaining blocking findings 为
+0。Controller adjudication artifact 为 `docs/reviews/p9-plan-review-controller-adjudication-20260516.md`。当前 gate 为等待用户确认进入
+P9 implementation。Accepted plan commit 为 `469baaa`。
+
+### 2026-05-16 P9 design refinement
+
+Controller 按 `$phaseflow` 启动 P9。总控文档识别当前状态为 P8 completed / draft-PR-pass，下一 work unit 为 Phase 9
+`Conversation Memory / Session Memory Projection`。用户确认 P9 phase discussion 裁决：P9 是“财报分析工作台状态投影”，
+不是聊天记录压缩器；memory view 分为 `pinned_state`、`verified_facts`、`working_assumptions`、
+`conversation_continuity`；verified facts 只接受工具事实并保留 evidence / provenance refs；RunInputBuilder 注入顺序按财报分析优先级固定；
+预算策略保持克制；projection lag 必须显式可观测且不得触发 Run recovery；P9 不实现 LLM compaction 写 truth；测试重点围绕反幻觉与
+EventLog 可重建。用户同时确认参考 issue 39 的未来长期证据召回目标，但 P9 只预留 Host 中立 evidence anchor / claim status /
+provenance / trace included-excluded 边界，不实现长期 retrieval、业务 signal ledger 或 signal-to-outcome verification。`docs/host/design.md`
+§24 与本文档 Phase 9 条目已写回上述裁决。当前 gate 为 P9 handoff implementation-ready plan，下一步派发 planning agent。
 
 ### 2026-05-16 P8 完成前滚动状态归档
 
@@ -1661,8 +2207,8 @@ implementation、双路 code review 与 controller adjudication，accepted slice
 clean。P7-S4 residual risks：Engine contract 当前不携带 Host accepted wait refs，P7-S4 只能做 diagnostic /
 idempotent confirmation，不能验证 Engine awaiting event 与 Host accepted wait refs 完全匹配；Poller 仍是最小单轮
 `poll_once()`，不包含后台调度循环、退避、并发 in-flight fencing 或 adapter 错误重试治理；`WAITING` Run + 非
-`SUSPENDED` Attempt 的防御性 internal invariant error、poller retry 外部化后的幂等 digest 策略、late result typed
-public error detail 均为后续 hardening / API contract 扩展项。当前 gate 为 P7-S5 `Integration, Docs, Gate Validation`
+`SUSPENDED` Attempt 的防御性 internal invariant error 与 late result typed public error detail 归 P9.5 Pre-P10
+Cross-Repository Hardening PR；poller retry 外部化后的幂等 digest 策略归 Phase 15 / production polling scale owner。当前 gate 为 P7-S5 `Integration, Docs, Gate Validation`
 implementation。P7-S5 `Integration, Docs, Gate Validation` 已完成 implementation、双路 aggregate review 与 controller
 adjudication，accepted slice commit 为 `c974acf`。P7-S5 / aggregate artifacts 为
 `docs/reviews/host-phase7-implementation-s5-integration-docs-gate-validation-20260516.md`、
@@ -1672,10 +2218,10 @@ adjudication，accepted slice commit 为 `c974acf`。P7-S5 / aggregate artifacts
 389 passed、`python -m pyright dayu/ tests/ utils/` 0 errors、`git diff --check` clean。Phase 7 aggregate exit
 accepted：typed wait outcome envelope、durable wait record、ToolRuntime awaiting accept、`resolve_wait` resume / terminal
 closeout、`WAITING` cancel、late diagnostic、poller 与 EngineEvent confirmation boundary 均已落地。Phase 7 remaining
-risks / owners：callback endpoint / auth / replay 归后续 callback adapter owner；poller 后台 loop / backoff /
-in-flight fencing / adapter retry 归后续 poller runtime hardening owner；`WAITING` recovery observation 归 Phase 11；
-Engine matching-ref 强校验归后续 Engine contract 演进；external job physical cancel / revoke 归后续 adapter hardening；
-durable duplicate ledger 与 durable tool trace projection 分别归后续 duplicate hardening / projection or tool trace owner。
+risks / owners：callback endpoint / auth / replay 归 callback adapter owner；poller 后台 loop / backoff /
+in-flight fencing / adapter retry 归 Phase 15 / production polling scale owner；`WAITING` recovery observation 归 Phase 11；
+Engine matching-ref 强校验归 P9.5 Pre-P10 Cross-Repository Hardening PR；external job physical cancel / revoke 归 adapter hardening owner；
+durable duplicate ledger 与 durable tool trace projection 分别归单独 duplicate ledger design PR / Phase 13 projection or tool trace owner。
 当前 gate 为 Phase 7 ready-to-open-draft-PR。Phase 7 draft PR 已创建：PR 56
 `https://github.com/noho/dayu-agent-r/pull/56`，title 为 `Host Phase 7 Tool Awaiting / resolve_wait / Wait Adapter`，
 head branch 为 `feat/host-phase7-tool-awaiting-resolve-wait`，PR 当前保持 draft。PR 56 deepreview artifacts 为
@@ -1688,7 +2234,7 @@ F2 `WaitPollLost` 测试缺口为当前 PR fix，fix artifact 为
 `docs/reviews/pr-56-fix-re-review-controller-adjudication-20260516.md`；两份 re-review 均确认 F1 / F2 fixed、
 无回归。Fix validation：`pytest tests/host/test_wait_awaiting_accept.py tests/host/test_wait_adapter_polling.py tests/host/test_resolve_wait_command.py -q`
 15 passed、`pytest tests/host -q` 391 passed、`python -m pyright dayu/ tests/ utils/` 0 errors、`git diff --check`
-clean。F3 cross-test helper import coupling deferred 到后续 tests cleanup；F4-F8 低/信息性 hardening 建议均 deferred。
+clean。F3 cross-test helper import coupling deferred 到 P9.5 Pre-P10 Cross-Repository Hardening PR；F4-F8 低/信息性 hardening 建议均 deferred。
 PR 56 deepreview / fix / re-review gate 已完成并通过。
 
 P1-P7 design conformance follow-up fix gate：Controller adjudication artifact
@@ -1789,8 +2335,8 @@ truth regression coverage、minimal RunResult / Session timeline read model、in
 Phase 8 remaining risks / owners：automatic after-commit projection catch-up 归 Phase 9 owner；heavy sink /
 batch-transaction runner 归 Phase 13 / Phase 15 owner；per-session repair filter 归 Phase 15 owner；RunResult summary refs
 接入 public `RunSnapshot` 归 Phase 9 / Phase 15 或后续 public read enhancement owner；Audit / Tool Trace / Outbox
-concrete sinks 归 Phase 13 owner；Engine / OpenAI runner / parser findings 归 Engine hardening gate owner；schema CHECK
-hardening 归后续 schema hardening owner；scheduler close active Run reconciliation 归 Phase 11 recovery owner；awaiting
+concrete sinks 归 Phase 13 owner；Engine / OpenAI runner / parser findings 与 schema CHECK hardening 归 P9.5 Pre-P10
+Cross-Repository Hardening PR；scheduler close active Run reconciliation 归 Phase 11 recovery owner；awaiting
 accepted ack 当前状态重校验归 Phase 7 / Phase 11 wait lifecycle hardening owner；poller LIMIT / CANCELLED abandon 退避归
 Phase 15 / production polling scale owner。
 
@@ -2016,7 +2562,7 @@ finding。Controller adjudication artifact 为
 targeted tests 4 passed；`pytest tests/host tests/runtime -q` 334 passed；`python -m pyright dayu/host tests/host` 0 errors；
 `python -m pyright dayu/ tests/ utils/` 0 errors；`git diff --check` passed。P5-S6 accepted slice commit 为 `2a1e0db`。
 P5-S6 residual risks：真实 provider runner 的外部网络 / provider API smoke 不属于 Phase 5 必测；active cancel watchdog 和
-post-cancel timeout policy 仍留给后续 lifecycle / recovery hardening；ToolRuntime / `fetch_more` 归 Phase 6，`WAITING` /
+post-cancel timeout policy 归 Phase 11 lifecycle / recovery owner；ToolRuntime / `fetch_more` 归 Phase 6，`WAITING` /
 `resolve_wait` 归 Phase 7，Memory 归 Phase 9，Context Governance 归 Phase 10，Recovery 归 Phase 11，Observer / Sink
 归 Phase 13，RemoteProxy 归 Phase 14。
 Phase 5 aggregate deepreview 已完成。Aggregate deepreview artifacts 为
@@ -2069,7 +2615,7 @@ blocking finding。Controller final adjudication artifact 为
 `git diff --check` passed。当前 PR 54 additional review gate 状态为 accepted；PR 54 draft branch 已 push，current gate 为
 PR 54 draft review-ready。剩余风险均有 owner：active cancel watchdog / post-cancel timeout 与 multi-scheduler cancel port 归 Phase 11；
 RemoteProxy 语义归 Phase 14；scheduler 并发 lane 竞争测试、`_drain_loop` 可观测性、RunInputBuilder optimistic TOCTOU 与
-`_consume_worker_events` cleanup helper 防御性强化为后续 hardening / cleanup，不阻塞当前 PR。
+`_consume_worker_events` cleanup helper 防御性强化归 P9.5 Pre-P10 Cross-Repository Hardening PR，不阻塞当前 PR。
 PR 54 全仓并行 review gate 已完成。Full-repo review artifacts 为
 `docs/reviews/repo-review-20260515-1338.md` 与 `docs/reviews/repo-review-20260515-1346.md`；Controller adjudication artifact 为
 `docs/reviews/repo-review-controller-adjudication-20260515.md`。裁决结论：只接受当前 PR 可安全修复且不重排 phase 边界的
@@ -2084,9 +2630,9 @@ Controller final adjudication artifact 为 `docs/reviews/repo-review-fix-re-revi
 Controller validation：受影响测试 126 passed；`pytest tests/host tests/runtime tests/contracts tests/engine -q` 741 passed；
 `python -m pyright dayu/ tests/ utils/` 0 errors；`git diff --check` passed。当前 full-repo review gate 状态为 accepted；
 PR 54 draft branch 已 push，current gate 为 PR 54 draft review-ready。剩余风险均有 owner：runtime lane repeated outer cancellation
-与 untracked release failure 归后续 runtime cancellation precision / 既有 TTL cleanup；idle scheduler sleeping task 归 Host dispatch
-lifecycle；Engine runner injection 归后续 Engine composition / provider abstraction design；active cancel watchdog 归 Phase 11；
-RemoteProxy 归 Phase 14；God module/class cleanup 与 broader test hardening 归后续 architecture / test hardening。
+与 untracked release failure、idle scheduler sleeping task、Engine runner injection、God module/class cleanup 与 broader test
+hardening 中不依赖 P10+ owner 的部分归 P9.5 Pre-P10 Cross-Repository Hardening PR；active cancel watchdog 归 Phase 11；
+RemoteProxy 归 Phase 14。
 P5 design conformance review gate 已完成。用户要求 AgentMiMo、AgentDS、AgentCodex 三路同时审查 P5 实现是否偏离
 `docs/host/design.md`、边界是否清晰、生产接线是否正确以及后续 phase 接线是否按设计预留。Review artifacts 为
 `docs/reviews/p5-design-conformance-review-mimo-20260515.md`、
@@ -2097,10 +2643,10 @@ Controller adjudication artifact 为
 通过；Host 强治理真源、LocalProxy envelope、EngineEvent boundary、dispatch record 非 owner truth、RunInputBuilder typed provider
 boundary、runtime 层中立、生产 scheduler / lane / LocalProxy / ingest / queue promotion 接线与后续 phase stub/no-op/fail-fast
 路径均符合设计。非阻断 hardening items：`accept_worker_running_in_transaction` 这条非生产 durable helper 的 `ATTEMPT_RUNNING`
-payload diagnostics 弱于 scheduler 生产路径，owner 为 Host durable transition hardening；`mark_dispatching_after_lane_row` 底层
-helper 能力宽于生产 scheduler 路径，owner 为 Host durable API tightening。其它 residual risk 维持既有 owner：terminal promotion
-wakeup failure 归 Host dispatch lifecycle hardening，active cancel watchdog 归 Phase 11，RemoteProxy 归 Phase 14，lifecycle composition
-归后续 Host composition design。本 gate 不要求当前 blocker fix，PR 54 仍为 draft review-ready。
+payload diagnostics 弱于 scheduler 生产路径，以及 `mark_dispatching_after_lane_row` 底层 helper 能力宽于生产 scheduler 路径，
+owner 均为 P9.5 Pre-P10 Cross-Repository Hardening PR。其它 residual risk 维持既有 owner：terminal promotion
+wakeup failure 归 Phase 11，active cancel watchdog 归 Phase 11，RemoteProxy 归 Phase 14；不涉及 lifecycle / recovery owner 的
+composition cleanup 归 P9.5 Pre-P10 Cross-Repository Hardening PR。本 gate 不要求当前 blocker fix，PR 54 仍为 draft review-ready。
 
 P1-P5 corrected design conformance review gate 已完成。用户澄清上一轮应审查的是“实现到 P5 后，P1-P5 当前全部代码
 snapshot 是否偏离设计”，因此上一段 P5-only review 只作为子集证据，不作为 P1-P5 全量结论。Corrected review artifacts 为
@@ -2112,11 +2658,11 @@ Controller adjudication artifact 为
 runtime boundary、P2 durable store / EventLog、P3 session / run / attempt / admission、P4 public API command path、P5
 RunInputBuilder / local dispatch / local proxy / Engine ingest / cancel、跨 phase 分层、生产接线与后续 phase 预留均未发现
 blocking 设计偏离；PR 54 不需要进入新的 fix gate，仍为 draft review-ready。Non-blocking hardening / cleanup 均已有 owner：
-`accept_worker_running_in_transaction` 诊断 payload 弱于 scheduler 生产路径归 Host durable transition hardening；
-`mark_dispatching_after_lane_row` 底层 helper 能力宽于生产 scheduler 路径归 Host durable API tightening；
+`accept_worker_running_in_transaction` 诊断 payload 弱于 scheduler 生产路径与
+`mark_dispatching_after_lane_row` 底层 helper 能力宽于生产 scheduler 路径归 P9.5 Pre-P10 Cross-Repository Hardening PR；
 active worker registry composition root 边界已由 P1-P7 design-goals fix 关闭；compact
 artifact message slot 与 plan 摘要顺序不完全一致归 Phase 10 / RunInputBuilder documentation cleanup。其它 residual risk 维持既有
-owner：terminal promotion wakeup failure 归 Host dispatch lifecycle hardening，active cancel watchdog / stuck `CANCELLING` /
+owner：terminal promotion wakeup failure 归 Phase 11，active cancel watchdog / stuck `CANCELLING` /
 orphan recovery 归 Phase 11，RemoteProxy 归 Phase 14，ToolRuntime / `fetch_more` 归 Phase 6，WAITING / `resolve_wait` 归
 Phase 7，Memory / Context Governance / compact artifact 分别归 Phase 9 / Phase 10。
 

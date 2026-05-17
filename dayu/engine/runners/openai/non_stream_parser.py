@@ -25,6 +25,7 @@ import logging
 from collections.abc import Iterator, Mapping
 from dataclasses import dataclass
 from datetime import datetime, timezone
+from typing import TypeAlias, assert_never
 
 from dayu.contracts.json_value import JsonValue
 from dayu.contracts.tool_call import ToolCallRequest
@@ -33,7 +34,6 @@ from dayu.engine.contracts.runner_events import (
     RunnerContentCompletedData,
     RunnerDoneData,
     RunnerEvent,
-    RunnerEventData,
     RunnerEventType,
     RunnerProtocolErrorData,
     RunnerToolCallsCompletedData,
@@ -58,26 +58,37 @@ _FINISH_REASON_MAP: dict[str, FinishReason] = {
 
 _LOGGER: logging.Logger = logging.getLogger(__name__)
 
+_NonStreamRunnerEventData: TypeAlias = (
+    RunnerContentCompletedData
+    | RunnerToolCallsCompletedData
+    | RunnerUsageRecordedData
+    | RunnerProtocolErrorData
+    | RunnerDoneData
+)
 
-def _make_event(data: RunnerEventData) -> RunnerEvent:
+
+def _make_event(data: _NonStreamRunnerEventData) -> RunnerEvent:
     """包装为 :class:`RunnerEvent`。
 
     :param data: Runner 事件载荷。
     :returns: 带当前 UTC 时间戳的 :class:`RunnerEvent`。
-    :raises KeyError: 当 ``data`` 不是非流式 parser 支持的事件载荷时抛出。
     """
 
     occurred_at = datetime.now(tz=timezone.utc)
-    type_map: dict[type, RunnerEventType] = {
-        RunnerContentCompletedData: RunnerEventType.RUNNER_CONTENT_COMPLETED,
-        RunnerToolCallsCompletedData: RunnerEventType.RUNNER_TOOL_CALLS_COMPLETED,
-        RunnerUsageRecordedData: RunnerEventType.RUNNER_USAGE_RECORDED,
-        RunnerProtocolErrorData: RunnerEventType.PROVIDER_PROTOCOL_ERROR,
-        RunnerDoneData: RunnerEventType.RUNNER_DONE,
-    }
-    return RunnerEvent(
-        type=type_map[type(data)], data=data, occurred_at=occurred_at
-    )
+    match data:
+        case RunnerContentCompletedData():
+            event_type = RunnerEventType.RUNNER_CONTENT_COMPLETED
+        case RunnerToolCallsCompletedData():
+            event_type = RunnerEventType.RUNNER_TOOL_CALLS_COMPLETED
+        case RunnerUsageRecordedData():
+            event_type = RunnerEventType.RUNNER_USAGE_RECORDED
+        case RunnerProtocolErrorData():
+            event_type = RunnerEventType.PROVIDER_PROTOCOL_ERROR
+        case RunnerDoneData():
+            event_type = RunnerEventType.RUNNER_DONE
+        case _:
+            assert_never(data)
+    return RunnerEvent(type=event_type, data=data, occurred_at=occurred_at)
 
 
 def parse_non_stream_response(
@@ -303,6 +314,8 @@ def _emit_from_dict(
                     total_tokens=total_tokens,
                 )
             )
+    if tool_calls_emitted:
+        finish_reason = FinishReason.TOOL_CALLS
     yield _make_event(
         RunnerDoneData(
             finish_reason=finish_reason,
@@ -324,6 +337,11 @@ def _resolve_finish_reason(choice: dict[str, JsonValue]) -> FinishReason:
         mapped = _FINISH_REASON_MAP.get(raw)
         if mapped is not None:
             return mapped
+        _LOGGER.warning(
+            "non_stream.protocol_diagnostic code=unknown_finish_reason "
+            "finish_reason=%s",
+            raw,
+        )
     return FinishReason.STOP
 
 
@@ -365,12 +383,14 @@ def _build_tool_calls(
 
     aggregator = ToolCallAggregator(provider_request_id=provider_request_id)
     fatal_errors: list[RunnerProtocolErrorData] = []
-    for index, raw in enumerate(raw_tool_calls):
+    index = 0
+    for raw in raw_tool_calls:
         if not isinstance(raw, dict):
             continue
         delta, pre_error = _coerce_final_tool_call(
             raw, index=index, provider_request_id=provider_request_id
         )
+        index += 1
         if pre_error is not None:
             fatal_errors.append(pre_error)
             continue

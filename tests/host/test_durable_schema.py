@@ -17,13 +17,21 @@ from dayu.host.durable.options import (
 from dayu.host.durable.schema import (
     HOST_DURABLE_TABLES,
     HOST_SCHEMA_VERSION,
+    INDEX_EVENT_LOG_RUN_TYPE_SEQUENCE,
+    MEMORY_PROJECTION_TABLES,
     PHASE3_STATE_TABLES,
     PROJECTION_TABLES,
+    INDEX_HOST_MEMORY_DIAGNOSTICS_SESSION_REASON,
+    INDEX_HOST_MEMORY_ITEMS_SESSION_SEQUENCE,
+    INDEX_HOST_MEMORY_SNAPSHOTS_SESSION_CURSOR,
     INDEX_HOST_RUN_RESULTS_SESSION_TERMINAL_SEQUENCE,
     INDEX_HOST_SESSION_TIMELINE_ITEMS_RUN_SEQUENCE,
     INDEX_HOST_SESSION_TIMELINE_ITEMS_SESSION_SEQUENCE,
     TABLE_EVENT_LOG,
     TABLE_HOST_INSTANCES,
+    TABLE_HOST_MEMORY_DIAGNOSTICS,
+    TABLE_HOST_MEMORY_ITEMS,
+    TABLE_HOST_MEMORY_SNAPSHOTS,
     TABLE_HOST_PROJECTION_CHECKPOINTS,
     TABLE_HOST_PROJECTION_FAILURES,
     TABLE_HOST_RUN_RESULTS,
@@ -103,6 +111,21 @@ def _pragma_text(connection: sqlite3.Connection, sql: str) -> str:
     return str(row[0])
 
 
+def _index_exists(connection: sqlite3.Connection, index_name: str) -> bool:
+    """判断 SQLite index 是否存在。
+
+    :param connection: SQLite connection。
+    :param index_name: 目标 index 名称。
+    :returns: 存在则返回 ``True``。
+    """
+
+    row = connection.execute(
+        "SELECT name FROM sqlite_master WHERE type='index' AND name = ?",
+        (index_name,),
+    ).fetchone()
+    return row is not None
+
+
 def _insert_event_log_probe(connection: sqlite3.Connection, event_id: str) -> None:
     """插入 schema 约束测试用 EventLog row。
 
@@ -138,8 +161,10 @@ def _insert_event_log_probe(connection: sqlite3.Connection, event_id: str) -> No
     )
 
 
-def test_fresh_db_creates_foundation_and_phase8_tables(tmp_path: Path) -> None:
-    """fresh DB bootstrap 创建 foundation、state 与 projection tables 并设置 PRAGMA。"""
+def test_fresh_db_creates_foundation_phase8_and_memory_tables(
+    tmp_path: Path,
+) -> None:
+    """fresh DB bootstrap 创建 foundation、state、projection 与 memory tables。"""
 
     options = _options(tmp_path)
     with open_host_durable_store(options) as store:
@@ -148,8 +173,11 @@ def test_fresh_db_creates_foundation_and_phase8_tables(tmp_path: Path) -> None:
             assert _table_names(connection) == frozenset(HOST_DURABLE_TABLES)
             assert set(PHASE3_STATE_TABLES).issubset(_table_names(connection))
             assert set(PROJECTION_TABLES).issubset(_table_names(connection))
-            assert _pragma_int(connection, "PRAGMA user_version") == 5
-            assert HOST_SCHEMA_VERSION == 5
+            assert set(MEMORY_PROJECTION_TABLES).issubset(
+                _table_names(connection)
+            )
+            assert _pragma_int(connection, "PRAGMA user_version") == 7
+            assert HOST_SCHEMA_VERSION == 7
             assert _pragma_int(connection, "PRAGMA foreign_keys") == 1
             assert _pragma_text(connection, "PRAGMA journal_mode").lower() == "wal"
             assert _pragma_int(connection, "PRAGMA busy_timeout") == 250
@@ -322,6 +350,50 @@ def test_projection_checkpoint_and_failure_tables_are_created(
             connection.close()
 
 
+def test_memory_projection_tables_and_indexes_are_created(
+    tmp_path: Path,
+) -> None:
+    """fresh schema 创建 memory projection tables 与索引。"""
+
+    options = _options(tmp_path)
+    with open_host_durable_store(options) as store:
+        connection = store.connect()
+        try:
+            assert TABLE_HOST_MEMORY_SNAPSHOTS in _table_names(connection)
+            assert TABLE_HOST_MEMORY_ITEMS in _table_names(connection)
+            assert TABLE_HOST_MEMORY_DIAGNOSTICS in _table_names(connection)
+            assert _primary_key_columns(connection, TABLE_HOST_MEMORY_SNAPSHOTS) == (
+                "snapshot_id",
+            )
+            assert _primary_key_columns(connection, TABLE_HOST_MEMORY_ITEMS) == (
+                "item_id",
+            )
+            assert _primary_key_columns(
+                connection, TABLE_HOST_MEMORY_DIAGNOSTICS
+            ) == ("diagnostic_id",)
+
+            snapshot_indexes = connection.execute(
+                f"PRAGMA index_list({TABLE_HOST_MEMORY_SNAPSHOTS})"
+            ).fetchall()
+            item_indexes = connection.execute(
+                f"PRAGMA index_list({TABLE_HOST_MEMORY_ITEMS})"
+            ).fetchall()
+            diagnostic_indexes = connection.execute(
+                f"PRAGMA index_list({TABLE_HOST_MEMORY_DIAGNOSTICS})"
+            ).fetchall()
+            assert INDEX_HOST_MEMORY_SNAPSHOTS_SESSION_CURSOR in {
+                str(row[1]) for row in snapshot_indexes
+            }
+            assert INDEX_HOST_MEMORY_ITEMS_SESSION_SEQUENCE in {
+                str(row[1]) for row in item_indexes
+            }
+            assert INDEX_HOST_MEMORY_DIAGNOSTICS_SESSION_REASON in {
+                str(row[1]) for row in diagnostic_indexes
+            }
+        finally:
+            connection.close()
+
+
 def test_projection_schema_constraints_reject_invalid_rows(
     tmp_path: Path,
 ) -> None:
@@ -467,6 +539,23 @@ def test_projection_schema_constraints_reject_invalid_rows(
                     )
                     """
                 )
+            connection.execute(
+                f"""
+                INSERT INTO {TABLE_HOST_MEMORY_DIAGNOSTICS} (
+                  diagnostic_id,
+                  session_id,
+                  reason,
+                  diagnostic_json,
+                  recorded_at
+                ) VALUES (
+                  'diagnostic-unsupported',
+                  'session-1',
+                  'unsupported_event_type',
+                  '{{}}',
+                  '2026-05-16T00:00:00.000000Z'
+                )
+                """
+            )
         finally:
             connection.close()
 
@@ -503,12 +592,139 @@ def test_event_sequence_is_sqlite_foreign_key_parent_key(
             connection.close()
 
 
-def test_schema_does_not_create_future_sink_tables(tmp_path: Path) -> None:
-    """Slice 1 bootstrap 不得预创建 projection 之外的 future sink tables。"""
+def test_event_log_run_type_sequence_index_exists(tmp_path: Path) -> None:
+    """EventLog 支持按 Run 与 event type 读取最近事件的索引。"""
+
+    options = _options(tmp_path)
+    with open_host_durable_store(options) as store:
+        connection = store.connect()
+        try:
+            assert _index_exists(connection, INDEX_EVENT_LOG_RUN_TYPE_SEQUENCE)
+        finally:
+            connection.close()
+
+
+def test_memory_schema_constraints_reject_invalid_rows(
+    tmp_path: Path,
+) -> None:
+    """memory schema CHECK / FK 约束拒绝非法 snapshot、item 与 diagnostic row。"""
+
+    options = _options(tmp_path)
+    with open_host_durable_store(options) as store:
+        connection = store.connect()
+        try:
+            with pytest.raises(sqlite3.IntegrityError):
+                connection.execute(
+                    f"""
+                    INSERT INTO {TABLE_HOST_MEMORY_SNAPSHOTS} (
+                      snapshot_id,
+                      session_id,
+                      consumer_id,
+                      checkpoint_event_sequence,
+                      checkpoint_event_id,
+                      policy_digest,
+                      snapshot_digest,
+                      snapshot_json,
+                      built_at,
+                      updated_at
+                    ) VALUES (
+                      'snapshot-invalid',
+                      'session-1',
+                      'host.memory.session.v1',
+                      -1,
+                      NULL,
+                      'policy-digest',
+                      'snapshot-digest',
+                      '{{}}',
+                      '2026-05-16T00:00:00.000000Z',
+                      '2026-05-16T00:00:00.000000Z'
+                    )
+                    """
+                )
+            connection.execute(
+                f"""
+                INSERT INTO {TABLE_HOST_MEMORY_SNAPSHOTS} (
+                  snapshot_id,
+                  session_id,
+                  consumer_id,
+                  checkpoint_event_sequence,
+                  checkpoint_event_id,
+                  policy_digest,
+                  snapshot_digest,
+                  snapshot_json,
+                  built_at,
+                  updated_at
+                ) VALUES (
+                  'snapshot-1',
+                  'session-1',
+                  'host.memory.session.v1',
+                  0,
+                  NULL,
+                  'policy-digest',
+                  'snapshot-digest',
+                  '{{}}',
+                  '2026-05-16T00:00:00.000000Z',
+                  '2026-05-16T00:00:00.000000Z'
+                )
+                """
+            )
+            with pytest.raises(sqlite3.IntegrityError):
+                connection.execute(
+                    f"""
+                    INSERT INTO {TABLE_HOST_MEMORY_ITEMS} (
+                      item_id,
+                      snapshot_id,
+                      session_id,
+                      item_kind,
+                      claim_status,
+                      event_id,
+                      event_sequence,
+                      producer_kind,
+                      producer_name,
+                      item_json
+                    ) VALUES (
+                      'item-1',
+                      'snapshot-1',
+                      'session-1',
+                      'company',
+                      'tool_verified',
+                      'event-1',
+                      1,
+                      'tool',
+                      'tool-a',
+                      '{{}}'
+                    )
+                    """
+                )
+            with pytest.raises(sqlite3.IntegrityError):
+                connection.execute(
+                    f"""
+                    INSERT INTO {TABLE_HOST_MEMORY_DIAGNOSTICS} (
+                      diagnostic_id,
+                      session_id,
+                      reason,
+                      diagnostic_json,
+                      recorded_at
+                    ) VALUES (
+                      'diagnostic-1',
+                      'session-1',
+                      'projection_exception',
+                      '{{}}',
+                      '2026-05-16T00:00:00.000000Z'
+                    )
+                    """
+                )
+        finally:
+            connection.close()
+
+
+def test_schema_does_not_create_unowned_future_sink_tables(
+    tmp_path: Path,
+) -> None:
+    """Phase 9 bootstrap 不得预创建未归属的 future sink tables。"""
 
     forbidden_fragments = (
         "outbox",
-        "memory",
         "purge",
     )
     options = _options(tmp_path)

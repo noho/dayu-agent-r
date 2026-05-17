@@ -238,8 +238,8 @@ class RunnerSpec:
         ``stream_options.include_usage``。仅当为 ``True`` 时 Runner
         会在请求中追加 ``stream_options.include_usage=True``；为
         ``False`` 时**不**写入该字段。
-    :param default_timeout_seconds: 默认请求超时秒数。
-    :param max_retries: 最大重试次数。
+    :param default_timeout_seconds: 默认请求超时秒数，必须为正数。
+    :param max_retries: 最大重试次数，必须为非负整数。
     :param provider_request: provider 请求扩展；为 ``None`` 表示不带扩展。
     :param stream_idle_timeout_seconds: SSE 流字节空闲 timeout 秒数；
         为 ``None`` 表示不启用流空闲检测。Runner 在两个连续 byte chunk
@@ -265,8 +265,10 @@ class RunnerSpec:
     stream_idle_heartbeat_seconds: float | None = None
 
     def __post_init__(self) -> None:
-        """校验 ``stream_idle_*`` 字段的语义一致性。
+        """校验 RunnerSpec 字段的语义一致性。
 
+        - ``default_timeout_seconds`` 必须为正数（> 0）。
+        - ``max_retries`` 必须为非负整数（>= 0）。
         - ``stream_idle_heartbeat_seconds`` 启用时 ``stream_idle_timeout_seconds``
           必须同时启用。
         - 两者都必须为正数（> 0）。
@@ -277,6 +279,16 @@ class RunnerSpec:
 
         timeout = self.stream_idle_timeout_seconds
         heartbeat = self.stream_idle_heartbeat_seconds
+        if self.default_timeout_seconds <= 0:
+            raise ValueError(
+                "default_timeout_seconds must be > 0; "
+                f"got {self.default_timeout_seconds!r}"
+            )
+        if self.max_retries < 0:
+            raise ValueError(
+                "max_retries must be >= 0; "
+                f"got {self.max_retries!r}"
+            )
         if timeout is None and heartbeat is not None:
             raise ValueError(
                 "stream_idle_heartbeat_seconds requires "

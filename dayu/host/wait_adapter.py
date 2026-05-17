@@ -7,6 +7,7 @@ endpoint 或外部系统协议，也不让 Engine 选择 adapter。
 
 from __future__ import annotations
 
+import logging
 from dataclasses import dataclass
 from datetime import UTC, datetime
 from enum import StrEnum
@@ -31,6 +32,8 @@ from dayu.host.durable.state import (
     read_wait_records_for_poll_observation,
 )
 from dayu.host.durable.transaction import HostTransaction, HostTransactionRunner
+
+_LOGGER = logging.getLogger(__name__)
 
 
 class WaitExternalJobRefSource(StrEnum):
@@ -338,18 +341,38 @@ class WaitPoller:
         for record in records:
             adapter = self._adapter_registry.resolve_adapter(record.adapter_key)
             if adapter is None:
+                _LOGGER.warning(
+                    "wait poll adapter not registered; skipping wait_id=%s "
+                    "adapter_key=%s",
+                    record.wait_id,
+                    record.adapter_key.value,
+                )
                 adapter_errors += 1
                 continue
             if record.status is WaitRecordStatus.CANCELLED:
                 try:
                     adapter.abandon_wait(record)
                     abandoned += 1
-                except Exception:
+                except Exception as exc:
+                    _LOGGER.warning(
+                        "wait adapter abandon failed; continuing wait_id=%s "
+                        "adapter_key=%s error_type=%s",
+                        record.wait_id,
+                        record.adapter_key.value,
+                        exc.__class__.__name__,
+                    )
                     adapter_errors += 1
                 continue
             try:
                 poll_result = adapter.poll_wait(record)
-            except Exception:
+            except Exception as exc:
+                _LOGGER.warning(
+                    "wait adapter poll failed; continuing wait_id=%s "
+                    "adapter_key=%s error_type=%s",
+                    record.wait_id,
+                    record.adapter_key.value,
+                    exc.__class__.__name__,
+                )
                 adapter_errors += 1
                 continue
             if isinstance(poll_result, WaitPollNotReady):

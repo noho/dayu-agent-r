@@ -68,6 +68,18 @@ class ToolResultFailure:
     hint: str | None
     meta: ToolResultMeta | None
 
+    def __post_init__(self) -> None:
+        """校验失败结果的最小完整性。
+
+        :returns: ``None``。
+        :raises ValueError: ``error`` 或 ``message`` 为空 / 纯空白时抛出。
+        """
+
+        if self.error.strip() == "":
+            raise ValueError("ToolResultFailure.error must be non-empty")
+        if self.message.strip() == "":
+            raise ValueError("ToolResultFailure.message must be non-empty")
+
 
 ToolResultEnvelope: TypeAlias = ToolResultSuccess | ToolResultFailure
 """工具结果信封封闭联合。"""

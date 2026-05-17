@@ -891,6 +891,7 @@ class LaneController:
         token._lost = True
         token.released = True
         self._held_tokens.pop((token.name, token.claim_id), None)
+        self._wake_waiters()
 
     def _wake_waiters(self) -> None:
         """唤醒所有 pending acquire waiter。

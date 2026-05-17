@@ -1,0 +1,1649 @@
+"""Host memory projection contracts 与 durable primitive 测试。"""
+
+from __future__ import annotations
+
+from dataclasses import fields
+from datetime import UTC, datetime
+from pathlib import Path
+from typing import cast
+
+import pytest
+
+from dayu.contracts.json_value import JsonValue
+from dayu.host.durable.connection import open_host_durable_store
+from dayu.host.durable.errors import HostDurableError
+from dayu.host.durable.event_log import (
+    EventClass,
+    EventLogAppendRequest,
+    EventLogRow,
+    append_event,
+)
+from dayu.host.durable.memory import (
+    ConversationMemoryProjectionConsumer,
+    MemoryDiagnosticRow,
+    MemorySnapshotRow,
+    read_latest_memory_snapshot,
+    read_memory_diagnostic,
+    reset_conversation_memory_projection,
+    write_memory_diagnostic,
+    write_memory_snapshot_with_checkpoint,
+)
+from dayu.host.durable.options import (
+    HostDurableStoreOptions,
+    HostSQLiteStoragePolicy,
+    PayloadStoragePolicy,
+)
+from dayu.host.durable.projection import (
+    ProjectionCheckpointRow,
+    ProjectionFailureRow,
+    read_projection_checkpoint,
+    read_projection_failure,
+)
+from dayu.host.durable.schema import TABLE_EVENT_LOG, TABLE_HOST_MEMORY_SNAPSHOTS
+from dayu.host.durable.transaction import HostTransaction
+from dayu.host.memory import (
+    CONVERSATION_MEMORY_CONSUMER_ID,
+    ConversationContinuityItem,
+    ConversationContinuityKind,
+    ConversationContinuityView,
+    ConversationMemorySnapshot,
+    HostNeutralRefKind,
+    MemoryClaimStatus,
+    MemoryDiagnostic,
+    MemoryDiagnosticReason,
+    MemoryExcludedReason,
+    MemoryIncludedReason,
+    MemoryProjectionEvent,
+    MemoryProducerKind,
+    MemoryProjectionPolicy,
+    MemoryProvenanceRef,
+    MemorySizeUnits,
+    MemorySnapshotCursor,
+    OpaqueMemoryRef,
+    PinnedStateView,
+    VerifiedFactView,
+    WorkingAssumptionView,
+    build_empty_conversation_memory_snapshot,
+    build_conversation_memory_snapshot_from_events,
+    calculate_memory_snapshot_digest,
+    digest_memory_projection_policy,
+    estimate_memory_size_units,
+)
+from dayu.host.memory_repair import (
+    catch_up_conversation_memory_projection,
+    rebuild_conversation_memory_projection,
+)
+from dayu.host.projection import ProjectionConsumerId, ProjectionRunner
+
+_CONSUMER_ID = "host.memory.session.v1"
+_SESSION_ID = "session-1"
+_NOW = "2026-05-16T00:00:00.000000Z"
+_OCCURRED_AT = datetime(2026, 5, 16, tzinfo=UTC)
+_DIGEST_A = "sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+_DIGEST_B = "sha256:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"
+_FORBIDDEN_BUSINESS_TERMS = (
+    "company",
+    "business_line",
+    "technology_release",
+)
+
+
+def _options(tmp_path: Path) -> HostDurableStoreOptions:
+    """构造测试用 Host durable store options。
+
+    :param tmp_path: pytest 临时目录。
+    :returns: Host durable store options。
+    """
+
+    return HostDurableStoreOptions(
+        db_path=tmp_path / "host" / "durable.sqlite3",
+        payload_policy=PayloadStoragePolicy(
+            artifact_root=tmp_path / "artifacts"
+        ),
+        sqlite_policy=HostSQLiteStoragePolicy(busy_timeout_seconds=0.25),
+    )
+
+
+def _policy() -> MemoryProjectionPolicy:
+    """构造测试用 memory projection policy。
+
+    :returns: memory projection policy。
+    """
+
+    return MemoryProjectionPolicy(
+        max_pinned_items=8,
+        max_verified_facts=16,
+        max_working_assumptions=8,
+        recent_raw_turns_floor=2,
+        max_raw_turn_size_units=1024,
+        history_pool_size_units=4096,
+        stable_layer_size_units=2048,
+        max_lag_events_for_inline_delta=4,
+        max_delta_repair_events=16,
+    )
+
+
+def _low_history_policy() -> MemoryProjectionPolicy:
+    """构造低 history pool 预算的测试 policy。
+
+    :returns: memory projection policy。
+    """
+
+    return MemoryProjectionPolicy(
+        max_pinned_items=8,
+        max_verified_facts=16,
+        max_working_assumptions=8,
+        recent_raw_turns_floor=2,
+        max_raw_turn_size_units=1024,
+        history_pool_size_units=3,
+        stable_layer_size_units=2048,
+        max_lag_events_for_inline_delta=4,
+        max_delta_repair_events=16,
+    )
+
+
+def _assistant_budget_policy() -> MemoryProjectionPolicy:
+    """构造 assistant conclusion 预算竞争测试 policy。
+
+    :returns: memory projection policy。
+    """
+
+    return MemoryProjectionPolicy(
+        max_pinned_items=8,
+        max_verified_facts=16,
+        max_working_assumptions=8,
+        recent_raw_turns_floor=1,
+        max_raw_turn_size_units=1024,
+        history_pool_size_units=4,
+        stable_layer_size_units=2048,
+        max_lag_events_for_inline_delta=4,
+        max_delta_repair_events=16,
+    )
+
+
+def _zero_recent_floor_policy() -> MemoryProjectionPolicy:
+    """构造 recent raw floor 为 0 的测试 policy。
+
+    :returns: memory projection policy。
+    """
+
+    return MemoryProjectionPolicy(
+        max_pinned_items=8,
+        max_verified_facts=16,
+        max_working_assumptions=8,
+        recent_raw_turns_floor=0,
+        max_raw_turn_size_units=1024,
+        history_pool_size_units=2,
+        stable_layer_size_units=2048,
+        max_lag_events_for_inline_delta=4,
+        max_delta_repair_events=16,
+    )
+
+
+def _memory_event(
+    *,
+    event_sequence: int,
+    event_id: str,
+    event_type: str,
+    payload: dict[str, JsonValue],
+    run_id: str | None = "run-1",
+    attempt_id: str | None = "attempt-1",
+    execution_id: str | None = "execution-1",
+    payload_ref: str | None = None,
+    payload_digest: str | None = None,
+) -> MemoryProjectionEvent:
+    """构造 memory projection 测试 event。
+
+    :param event_sequence: EventLog sequence。
+    :param event_id: EventLog id。
+    :param event_type: EventLog type。
+    :param payload: canonical payload。
+    :param run_id: 可选 Run id。
+    :param attempt_id: 可选 Attempt id。
+    :param execution_id: 可选 execution id。
+    :param payload_ref: 可选 payload ref。
+    :param payload_digest: 可选 payload digest。
+    :returns: memory projection event。
+    """
+
+    return MemoryProjectionEvent(
+        event_sequence=event_sequence,
+        event_id=event_id,
+        event_class=EventClass.CANONICAL_FACT.value,
+        event_type=event_type,
+        session_id=_SESSION_ID,
+        run_id=run_id,
+        attempt_id=attempt_id,
+        execution_id=execution_id,
+        occurred_at=_NOW,
+        payload_ref=payload_ref,
+        payload_digest=payload_digest,
+        payload=payload,
+    )
+
+
+def _build_snapshot(
+    events: tuple[MemoryProjectionEvent, ...],
+    policy: MemoryProjectionPolicy | None = None,
+) -> ConversationMemorySnapshot:
+    """按测试 events 构造 memory snapshot。
+
+    :param events: projection events。
+    :param policy: 可选 memory policy。
+    :returns: memory snapshot。
+    """
+
+    actual_policy = _policy() if policy is None else policy
+    return build_conversation_memory_snapshot_from_events(
+        events=events,
+        session_id=_SESSION_ID,
+        consumer_id=_CONSUMER_ID,
+        policy=actual_policy,
+        built_at=_NOW,
+    )
+
+
+def _tool_payload(*, summary: str | None) -> dict[str, JsonValue]:
+    """构造 TOOL_RESULT_ACCEPTED payload。
+
+    :param summary: 可选 fact summary。
+    :returns: payload dict。
+    """
+
+    payload: dict[str, JsonValue] = {
+        "session_id": _SESSION_ID,
+        "run_id": "run-1",
+        "attempt_id": "attempt-1",
+        "execution_id": "execution-1",
+        "tool_call_id": "call-1",
+        "tool_name": "filing.lookup",
+        "tool_fact_kind": "completed",
+        "tool_identity_digest": _DIGEST_A,
+        "normalized_arguments_digest": _DIGEST_B,
+        "outcome_digest": _DIGEST_A,
+        "payload_digest": _DIGEST_B,
+        "payload_ref": {
+            "payload_ref": "payload-tool-1",
+            "payload_digest": _DIGEST_B,
+        },
+        "tool_call_requested_event_ref": {
+            "event_id": "event-tool-requested",
+            "event_sequence": 1,
+        },
+    }
+    if summary is not None:
+        payload["fact_summary"] = summary
+    return payload
+
+
+def _append_memory_event(
+    transaction: HostTransaction,
+    *,
+    event_id: str,
+    event_type: str,
+    payload: dict[str, JsonValue],
+) -> EventLogRow:
+    """在 transaction 内追加 memory projection 测试 EventLog row。
+
+    :param transaction: Host transaction。
+    :param event_id: EventLog id。
+    :param event_type: EventLog type。
+    :param payload: payload JSON。
+    :returns: EventLog row。
+    """
+
+    return append_event(
+        transaction,
+        EventLogAppendRequest(
+            event_id=event_id,
+            event_class=EventClass.CANONICAL_FACT,
+            session_id=_SESSION_ID,
+            run_id="run-1",
+            attempt_id="attempt-1",
+            execution_id="execution-1",
+            event_type=event_type,
+            occurred_at=_OCCURRED_AT,
+            actor="pytest",
+            source="pytest",
+            client_request_id=None,
+            idempotency_key=None,
+            policy_decision=None,
+            reason=None,
+            payload_json=payload,
+            payload_ref=None,
+            payload_digest=None,
+        ),
+    ).row
+
+
+def _event_log_count(transaction: HostTransaction) -> int:
+    """读取 EventLog row 数。
+
+    :param transaction: Host transaction。
+    :returns: EventLog row 数。
+    :raises HostDurableError: count row 缺失或类型非法时抛出。
+    """
+
+    row = transaction.fetchone(f"SELECT COUNT(*) AS count FROM {TABLE_EVENT_LOG}", ())
+    if row is None:
+        raise HostDurableError("event log count row missing")
+    value = row.get("count")
+    if not isinstance(value, int):
+        raise HostDurableError("event log count must be int")
+    return value
+
+
+def _damage_latest_memory_snapshot(
+    transaction: HostTransaction, *, policy_digest: str
+) -> None:
+    """破坏 latest memory snapshot JSON。
+
+    :param transaction: Host transaction。
+    :param policy_digest: memory policy digest。
+    :returns: ``None``。
+    """
+
+    row = read_latest_memory_snapshot(
+        transaction,
+        session_id=_SESSION_ID,
+        consumer_id=_CONSUMER_ID,
+        policy_digest=policy_digest,
+    )
+    if row is None:
+        raise HostDurableError("memory snapshot missing")
+    transaction.execute(
+        f"UPDATE {TABLE_HOST_MEMORY_SNAPSHOTS} SET snapshot_json = ? WHERE snapshot_id = ?",
+        ('{"snapshot_id":"damaged"}', row.snapshot.snapshot_id),
+    )
+
+
+def _tool_provenance() -> MemoryProvenanceRef:
+    """构造 TOOL provenance。
+
+    :returns: TOOL provenance ref。
+    """
+
+    return MemoryProvenanceRef(
+        producer_kind=MemoryProducerKind.TOOL,
+        producer_name="tool-a",
+        event_id="event-1",
+        event_sequence=1,
+        run_id="run-1",
+        attempt_id="attempt-1",
+        execution_id="execution-1",
+        tool_result_ref="event-1",
+        payload_ref="payload-1",
+        digest_ref="sha256:1111111111111111111111111111111111111111111111111111111111111111",
+        source_refs=(),
+    )
+
+
+def _user_provenance() -> MemoryProvenanceRef:
+    """构造 USER provenance。
+
+    :returns: USER provenance ref。
+    """
+
+    return MemoryProvenanceRef(
+        producer_kind=MemoryProducerKind.USER,
+        producer_name="user",
+        event_id="event-1",
+        event_sequence=1,
+        run_id="run-1",
+        attempt_id=None,
+        execution_id=None,
+        tool_result_ref=None,
+        payload_ref=None,
+        digest_ref="sha256:2222222222222222222222222222222222222222222222222222222222222222",
+        source_refs=(),
+    )
+
+
+class _WriteSnapshotOperation:
+    """写入 snapshot 的 transaction operation。
+
+    :param snapshot_id: snapshot id。
+    """
+
+    def __init__(self, snapshot_id: str) -> None:
+        """初始化 operation。
+
+        :param snapshot_id: snapshot id。
+        :returns: ``None``。
+        """
+
+        self._snapshot_id = snapshot_id
+        self.policy_digest = digest_memory_projection_policy(_policy())
+
+    def __call__(self, transaction: HostTransaction) -> MemorySnapshotRow:
+        """写入空 memory snapshot 并确保 checkpoint。
+
+        :param transaction: Host durable transaction。
+        :returns: 写入后的 snapshot row。
+        :raises HostDurableError: durable 写入失败时抛出。
+        """
+
+        snapshot = build_empty_conversation_memory_snapshot(
+            snapshot_id=self._snapshot_id,
+            session_id=_SESSION_ID,
+            consumer_id=_CONSUMER_ID,
+            policy_digest=self.policy_digest,
+            built_at=_NOW,
+        )
+        return write_memory_snapshot_with_checkpoint(
+            transaction,
+            snapshot,
+            now=_NOW,
+        )
+
+
+class _ReadLatestSnapshotOperation:
+    """读取最新 snapshot 的 transaction operation。
+
+    :param policy_digest: memory policy digest。
+    """
+
+    def __init__(self, policy_digest: str) -> None:
+        """初始化 operation。
+
+        :param policy_digest: memory policy digest。
+        :returns: ``None``。
+        """
+
+        self._policy_digest = policy_digest
+
+    def __call__(self, transaction: HostTransaction) -> MemorySnapshotRow | None:
+        """读取最新 memory snapshot。
+
+        :param transaction: Host durable transaction。
+        :returns: snapshot row 或 ``None``。
+        :raises HostDurableError: durable 读取失败时抛出。
+        """
+
+        return read_latest_memory_snapshot(
+            transaction,
+            session_id=_SESSION_ID,
+            consumer_id=_CONSUMER_ID,
+            policy_digest=self._policy_digest,
+        )
+
+
+class _ReadCheckpointOperation:
+    """读取 projection checkpoint 的 transaction operation。"""
+
+    def __call__(
+        self, transaction: HostTransaction
+    ) -> ProjectionCheckpointRow | None:
+        """读取 memory consumer checkpoint。
+
+        :param transaction: Host durable transaction。
+        :returns: checkpoint row 或 ``None``。
+        :raises HostDurableError: durable 读取失败时抛出。
+        """
+
+        return read_projection_checkpoint(transaction, _CONSUMER_ID)
+
+
+class _ReadCheckpointForConsumerOperation:
+    """按 consumer id 读取 projection checkpoint 的 transaction operation。
+
+    :param consumer_id: projection consumer id。
+    """
+
+    def __init__(self, consumer_id: str) -> None:
+        """初始化 operation。
+
+        :param consumer_id: projection consumer id。
+        :returns: ``None``。
+        """
+
+        self._consumer_id = consumer_id
+
+    def __call__(
+        self, transaction: HostTransaction
+    ) -> ProjectionCheckpointRow | None:
+        """读取目标 consumer checkpoint。
+
+        :param transaction: Host transaction。
+        :returns: checkpoint row 或 ``None``。
+        :raises HostDurableError: durable 读取失败时抛出。
+        """
+
+        return read_projection_checkpoint(transaction, self._consumer_id)
+
+
+class _ReadProjectionFailureOperation:
+    """读取 projection failure 的 transaction operation。
+
+    :param consumer_id: projection consumer id。
+    """
+
+    def __init__(self, consumer_id: str) -> None:
+        """初始化 operation。
+
+        :param consumer_id: projection consumer id。
+        :returns: ``None``。
+        """
+
+        self._consumer_id = consumer_id
+
+    def __call__(self, transaction: HostTransaction) -> ProjectionFailureRow | None:
+        """读取 projection failure row。
+
+        :param transaction: Host transaction。
+        :returns: projection failure row 或 ``None``。
+        :raises HostDurableError: durable 读取失败时抛出。
+        """
+
+        return read_projection_failure(transaction, self._consumer_id)
+
+
+class _WriteThenFailOperation:
+    """写入 snapshot 后抛错的 transaction operation。
+
+    :param snapshot_id: snapshot id。
+    """
+
+    def __init__(self, snapshot_id: str) -> None:
+        """初始化 operation。
+
+        :param snapshot_id: snapshot id。
+        :returns: ``None``。
+        """
+
+        self._write_operation = _WriteSnapshotOperation(snapshot_id)
+        self.policy_digest = self._write_operation.policy_digest
+
+    def __call__(self, transaction: HostTransaction) -> None:
+        """写入 snapshot 后抛出结构化错误以验证 rollback。
+
+        :param transaction: Host durable transaction。
+        :returns: ``None``。
+        :raises HostDurableError: 始终抛出以触发 rollback。
+        """
+
+        self._write_operation(transaction)
+        raise HostDurableError("force rollback")
+
+
+class _WriteDiagnosticOperation:
+    """写入 diagnostic 的 transaction operation。
+
+    :param diagnostic: memory diagnostic。
+    """
+
+    def __init__(self, diagnostic: MemoryDiagnostic) -> None:
+        """初始化 operation。
+
+        :param diagnostic: memory diagnostic。
+        :returns: ``None``。
+        """
+
+        self._diagnostic = diagnostic
+
+    def __call__(self, transaction: HostTransaction) -> MemoryDiagnosticRow:
+        """写入 memory diagnostic。
+
+        :param transaction: Host durable transaction。
+        :returns: 写入后的 diagnostic row。
+        :raises HostDurableError: durable 写入失败时抛出。
+        """
+
+        return write_memory_diagnostic(
+            transaction,
+            session_id=_SESSION_ID,
+            snapshot_id=None,
+            diagnostic=self._diagnostic,
+            recorded_at=_NOW,
+        )
+
+
+class _ReadDiagnosticOperation:
+    """读取 diagnostic 的 transaction operation。
+
+    :param diagnostic_id: diagnostic id。
+    """
+
+    def __init__(self, diagnostic_id: str) -> None:
+        """初始化 operation。
+
+        :param diagnostic_id: diagnostic id。
+        :returns: ``None``。
+        """
+
+        self._diagnostic_id = diagnostic_id
+
+    def __call__(self, transaction: HostTransaction) -> MemoryDiagnosticRow | None:
+        """读取 memory diagnostic。
+
+        :param transaction: Host durable transaction。
+        :returns: diagnostic row 或 ``None``。
+        :raises HostDurableError: durable 读取失败时抛出。
+        """
+
+        return read_memory_diagnostic(transaction, self._diagnostic_id)
+
+
+def test_empty_event_log_snapshot_can_be_created_and_read(
+    tmp_path: Path,
+) -> None:
+    """空 EventLog 下可以创建并读取空 memory snapshot。"""
+
+    operation = _WriteSnapshotOperation("snapshot-empty")
+    with open_host_durable_store(_options(tmp_path)) as store:
+        written = store.transaction_runner.run_write(operation)
+        read_back = store.transaction_runner.run_read(
+            _ReadLatestSnapshotOperation(operation.policy_digest)
+        )
+        checkpoint = store.transaction_runner.run_read(_ReadCheckpointOperation())
+
+        assert written.snapshot.snapshot_id == "snapshot-empty"
+        assert read_back is not None
+        assert read_back.snapshot.verified_facts == ()
+        assert read_back.snapshot.working_assumptions == ()
+        assert read_back.snapshot.conversation_continuity.items == ()
+        assert read_back.snapshot.cursor.checkpoint_event_sequence == 0
+        assert checkpoint is not None
+        assert checkpoint.checkpoint_event_sequence == 0
+
+
+def test_snapshot_and_checkpoint_rollback_together(tmp_path: Path) -> None:
+    """snapshot 与 checkpoint 在同一 transaction 内提交或一起 rollback。"""
+
+    operation = _WriteThenFailOperation("snapshot-rollback")
+    with open_host_durable_store(_options(tmp_path)) as store:
+        with pytest.raises(HostDurableError):
+            store.transaction_runner.run_write(operation)
+        read_back = store.transaction_runner.run_read(
+            _ReadLatestSnapshotOperation(operation.policy_digest)
+        )
+        checkpoint = store.transaction_runner.run_read(_ReadCheckpointOperation())
+
+        assert read_back is None
+        assert checkpoint is None
+
+
+def test_typed_contracts_reject_invalid_ids_cursor_and_verified_fact() -> None:
+    """typed contracts 拒绝空 id、非法 cursor 与非 TOOL verified fact。"""
+
+    with pytest.raises(ValueError):
+        OpaqueMemoryRef(ref_kind=HostNeutralRefKind.SUBJECT, ref_id="")
+    with pytest.raises(ValueError):
+        MemorySnapshotCursor(
+            consumer_id=_CONSUMER_ID,
+            checkpoint_event_sequence=0,
+            checkpoint_event_id="event-1",
+            session_id=_SESSION_ID,
+        )
+    with pytest.raises(ValueError):
+        MemorySnapshotCursor(
+            consumer_id=_CONSUMER_ID,
+            checkpoint_event_sequence=1,
+            checkpoint_event_id=None,
+            session_id=_SESSION_ID,
+        )
+    with pytest.raises(ValueError):
+        VerifiedFactView(
+            item_id="fact-1",
+            fact_summary="summary",
+            claim_status=MemoryClaimStatus.ASSUMPTION,
+            provenance=_tool_provenance(),
+            evidence_anchor=None,
+            subject_refs=(),
+            included_reason=MemoryIncludedReason.TOOL_VERIFIED_FACT,
+            excluded_reason=None,
+            size_units=MemorySizeUnits(units=7),
+        )
+    with pytest.raises(ValueError):
+        VerifiedFactView(
+            item_id="fact-1",
+            fact_summary="summary",
+            claim_status=MemoryClaimStatus.TOOL_VERIFIED,
+            provenance=_user_provenance(),
+            evidence_anchor=None,
+            subject_refs=(),
+            included_reason=MemoryIncludedReason.TOOL_VERIFIED_FACT,
+            excluded_reason=None,
+            size_units=MemorySizeUnits(units=7),
+        )
+
+
+def test_pinned_state_open_questions_are_not_duplicated() -> None:
+    """PinnedStateView 拥有 open_questions 且不在 working assumption 中重复建模。"""
+
+    view = PinnedStateView(
+        current_goal="goal",
+        confirmed_subjects=(),
+        user_constraints=("constraint",),
+        open_questions=("question",),
+    )
+
+    assert view.current_goal == "goal"
+    assert view.open_questions == ("question",)
+    assert "open_questions" not in {
+        field.name for field in fields(WorkingAssumptionView)
+    }
+    with pytest.raises(ValueError):
+        PinnedStateView(
+            current_goal=None,
+            confirmed_subjects=(),
+            user_constraints=(),
+            open_questions=("question", "question"),
+        )
+
+
+def test_host_neutral_ref_kind_rejects_business_specific_kind() -> None:
+    """OpaqueMemoryRef.ref_kind 只接受 Host-neutral enum 值。"""
+
+    with pytest.raises(ValueError):
+        OpaqueMemoryRef(
+            ref_kind=cast(HostNeutralRefKind, "company"),
+            ref_id="opaque-company-ref",
+        )
+    assert {kind.value for kind in HostNeutralRefKind} == {
+        "source",
+        "chunk",
+        "entity",
+        "subject",
+        "topic",
+        "evidence",
+        "payload",
+        "external",
+    }
+
+
+def test_memory_contracts_do_not_expose_business_specific_fields() -> None:
+    """Host memory contracts 不包含业务专有字段。"""
+
+    contract_names = {
+        name
+        for contract in (
+            OpaqueMemoryRef,
+            MemoryProvenanceRef,
+            PinnedStateView,
+            VerifiedFactView,
+            WorkingAssumptionView,
+            ConversationContinuityItem,
+            MemoryDiagnostic,
+        )
+        for name in (field.name for field in fields(contract))
+    }
+    enum_values = {
+        value
+        for enum_values in (
+            (kind.value for kind in HostNeutralRefKind),
+            (status.value for status in MemoryClaimStatus),
+        )
+        for value in enum_values
+    }
+    searchable = " ".join(sorted(contract_names | enum_values))
+
+    assert all(term not in searchable for term in _FORBIDDEN_BUSINESS_TERMS)
+
+
+def test_memory_diagnostic_contract_round_trips_through_durable_store(
+    tmp_path: Path,
+) -> None:
+    """MemoryDiagnostic 使用 memory diagnostics table 持久化。"""
+
+    policy_digest = digest_memory_projection_policy(_policy())
+    diagnostic = MemoryDiagnostic(
+        diagnostic_id="diagnostic-1",
+        reason=MemoryDiagnosticReason.EMPTY_EVENT_LOG_SNAPSHOT,
+        message="empty event log snapshot created",
+        event_sequence=None,
+        item_id=None,
+        policy_digest=policy_digest,
+        recorded_at=_NOW,
+    )
+
+    with open_host_durable_store(_options(tmp_path)) as store:
+        written = store.transaction_runner.run_write(
+            _WriteDiagnosticOperation(diagnostic)
+        )
+        read_back = store.transaction_runner.run_read(
+            _ReadDiagnosticOperation("diagnostic-1")
+        )
+
+        assert (
+            written.diagnostic.reason
+            is MemoryDiagnosticReason.EMPTY_EVENT_LOG_SNAPSHOT
+        )
+        assert read_back is not None
+        assert read_back.diagnostic.policy_digest == policy_digest
+        assert read_back.session_id == _SESSION_ID
+
+
+def test_snapshot_digest_ignores_nondeterministic_diagnostic_fields() -> None:
+    """snapshot digest 不受 diagnostic_id 与 recorded_at 影响。"""
+
+    policy_digest = digest_memory_projection_policy(_policy())
+    first = ConversationMemorySnapshot(
+        snapshot_id="snapshot-1",
+        session_id=_SESSION_ID,
+        cursor=MemorySnapshotCursor(
+            consumer_id=_CONSUMER_ID,
+            checkpoint_event_sequence=0,
+            checkpoint_event_id=None,
+            session_id=_SESSION_ID,
+        ),
+        policy_digest=policy_digest,
+        pinned_state=PinnedStateView(
+            current_goal="goal",
+            confirmed_subjects=(),
+            user_constraints=("constraint",),
+            open_questions=("question",),
+        ),
+        verified_facts=(),
+        working_assumptions=(),
+        conversation_continuity=ConversationContinuityView(items=()),
+        diagnostics=(
+            MemoryDiagnostic(
+                diagnostic_id="diagnostic-a",
+                reason=MemoryDiagnosticReason.BUDGET_LIMIT_REACHED,
+                message="stable diagnostic semantic",
+                event_sequence=1,
+                item_id="item-1",
+                policy_digest=policy_digest,
+                recorded_at="2026-05-16T00:00:00.000000Z",
+            ),
+        ),
+        built_at="2026-05-16T00:00:00.000000Z",
+        snapshot_digest="pending",
+    )
+    second = ConversationMemorySnapshot(
+        snapshot_id="snapshot-2",
+        session_id=_SESSION_ID,
+        cursor=first.cursor,
+        policy_digest=policy_digest,
+        pinned_state=first.pinned_state,
+        verified_facts=(),
+        working_assumptions=(),
+        conversation_continuity=first.conversation_continuity,
+        diagnostics=(
+            MemoryDiagnostic(
+                diagnostic_id="diagnostic-b",
+                reason=MemoryDiagnosticReason.BUDGET_LIMIT_REACHED,
+                message="stable diagnostic semantic",
+                event_sequence=1,
+                item_id="item-1",
+                policy_digest=policy_digest,
+                recorded_at="2026-05-17T00:00:00.000000Z",
+            ),
+        ),
+        built_at="2026-05-17T00:00:00.000000Z",
+        snapshot_digest="pending",
+    )
+
+    assert calculate_memory_snapshot_digest(first) == calculate_memory_snapshot_digest(
+        second
+    )
+
+
+def test_p9_contracts_do_not_synthesize_conflict_stale_or_superseded() -> None:
+    """P9 typed view 主动投影只接受工具确认事实与 assumption。"""
+
+    reserved_statuses = (
+        MemoryClaimStatus.CONFLICTED,
+        MemoryClaimStatus.STALE,
+        MemoryClaimStatus.SUPERSEDED,
+    )
+    for status in reserved_statuses:
+        with pytest.raises(ValueError):
+            WorkingAssumptionView(
+                item_id=f"assumption-{status.value}",
+                assumption_summary="summary",
+                claim_status=status,
+                producer_kind=MemoryProducerKind.USER,
+                event_id="event-1",
+                event_sequence=1,
+                run_id="run-1",
+                subject_refs=(),
+                included_reason=MemoryIncludedReason.WORKING_ASSUMPTION,
+                excluded_reason=None,
+                size_units=estimate_memory_size_units("summary"),
+            )
+        with pytest.raises(ValueError):
+            ConversationContinuityItem(
+                item_id=f"continuity-{status.value}",
+                item_kind=ConversationContinuityKind.ASSISTANT_CONCLUSION,
+                producer_kind=MemoryProducerKind.ASSISTANT,
+                claim_status=status,
+                event_id="event-1",
+                event_sequence=1,
+                run_id="run-1",
+                summary_text="summary",
+                payload_ref=None,
+                payload_digest=None,
+                included_reason=None,
+                excluded_reason=MemoryExcludedReason.POLICY_EXCLUDED,
+                size_units=estimate_memory_size_units("summary"),
+            )
+
+
+def test_final_answer_enters_continuity_not_verified_fact() -> None:
+    """RUN_SUCCEEDED final_answer 只进入 continuity，不进入 verified facts。"""
+
+    snapshot = _build_snapshot(
+        (
+            _memory_event(
+                event_sequence=1,
+                event_id="event-final",
+                event_type="RUN_SUCCEEDED",
+                payload={"final_answer": "assistant conclusion"},
+                run_id="run-final",
+                attempt_id=None,
+                execution_id=None,
+            ),
+        )
+    )
+
+    assert snapshot.verified_facts == ()
+    assert len(snapshot.conversation_continuity.items) == 1
+    item = snapshot.conversation_continuity.items[0]
+    assert item.item_kind is ConversationContinuityKind.ASSISTANT_CONCLUSION
+    assert item.producer_kind is MemoryProducerKind.ASSISTANT
+    assert item.claim_status is MemoryClaimStatus.ASSUMPTION
+    assert item.summary_text == "assistant conclusion"
+
+
+def test_user_input_never_enters_verified_facts() -> None:
+    """USER_INPUT_ACCEPTED 可进入 pinned / continuity，但不得成为 verified fact。"""
+
+    snapshot = _build_snapshot(
+        (
+            _memory_event(
+                event_sequence=1,
+                event_id="event-user",
+                event_type="USER_INPUT_ACCEPTED",
+                payload={"display_text": "use fiscal year 2025"},
+                run_id="run-user",
+                attempt_id=None,
+                execution_id=None,
+            ),
+        )
+    )
+
+    assert snapshot.verified_facts == ()
+    assert snapshot.pinned_state.user_constraints == ("use fiscal year 2025",)
+    assert len(snapshot.conversation_continuity.items) == 1
+    assert (
+        snapshot.conversation_continuity.items[0].item_kind
+        is ConversationContinuityKind.RAW_USER_TURN
+    )
+    assert (
+        snapshot.conversation_continuity.items[0].producer_kind
+        is MemoryProducerKind.USER
+    )
+
+
+def test_tool_result_accepted_produces_verified_fact_with_refs() -> None:
+    """TOOL_RESULT_ACCEPTED 生成带 producer 与 provenance refs 的 verified fact。"""
+
+    snapshot = _build_snapshot(
+        (
+            _memory_event(
+                event_sequence=2,
+                event_id="event-tool-result",
+                event_type="TOOL_RESULT_ACCEPTED",
+                payload=_tool_payload(summary="tool supplied neutral summary"),
+                run_id="run-1",
+                attempt_id="attempt-1",
+                execution_id="execution-1",
+            ),
+        )
+    )
+
+    assert len(snapshot.verified_facts) == 1
+    fact = snapshot.verified_facts[0]
+    assert fact.fact_summary == "tool supplied neutral summary"
+    assert fact.claim_status is MemoryClaimStatus.TOOL_VERIFIED
+    assert fact.provenance.producer_kind is MemoryProducerKind.TOOL
+    assert fact.provenance.producer_name == "filing.lookup"
+    assert fact.provenance.event_id == "event-tool-result"
+    assert fact.provenance.event_sequence == 2
+    assert fact.provenance.run_id == "run-1"
+    assert fact.provenance.attempt_id == "attempt-1"
+    assert fact.provenance.execution_id == "execution-1"
+    assert fact.provenance.tool_result_ref == "event-tool-result"
+    assert fact.provenance.payload_ref == "payload-tool-1"
+    assert fact.provenance.digest_ref == _DIGEST_B
+    assert fact.evidence_anchor is not None
+    assert fact.evidence_anchor.ref_id == "payload:payload-tool-1"
+    assert any(
+        ref.ref_kind is HostNeutralRefKind.PAYLOAD
+        and ref.ref_id == "payload:payload-tool-1"
+        for ref in fact.provenance.source_refs
+    )
+
+
+def test_missing_tool_fact_summary_uses_neutral_fallback_diagnostic() -> None:
+    """缺失工具 fact summary 时使用中立 fallback 并记录 diagnostic。"""
+
+    snapshot = _build_snapshot(
+        (
+            _memory_event(
+                event_sequence=3,
+                event_id="event-tool-missing-summary",
+                event_type="TOOL_RESULT_ACCEPTED",
+                payload=_tool_payload(summary=None),
+            ),
+        )
+    )
+
+    assert len(snapshot.verified_facts) == 1
+    fact = snapshot.verified_facts[0]
+    assert "tool_name=filing.lookup" in fact.fact_summary
+    assert "payload_ref=payload-tool-1" in fact.fact_summary
+    assert all(term not in fact.fact_summary for term in _FORBIDDEN_BUSINESS_TERMS)
+    assert tuple(diagnostic.reason for diagnostic in snapshot.diagnostics) == (
+        MemoryDiagnosticReason.MISSING_FACT_SUMMARY_FALLBACK,
+    )
+    assert snapshot.diagnostics[0].item_id == fact.item_id
+
+
+def test_missing_tool_name_uses_unknown_tool_producer() -> None:
+    """缺失 tool_name 时 TOOL producer 使用中立 unknown tool 名称。"""
+
+    payload = _tool_payload(summary=None)
+    del payload["tool_name"]
+    snapshot = _build_snapshot(
+        (
+            _memory_event(
+                event_sequence=3,
+                event_id="event-tool-missing-name",
+                event_type="TOOL_RESULT_ACCEPTED",
+                payload=payload,
+            ),
+        )
+    )
+
+    fact = snapshot.verified_facts[0]
+    assert fact.provenance.producer_kind is MemoryProducerKind.TOOL
+    assert fact.provenance.producer_name == "unknown_tool"
+    assert "tool_name=unknown_tool" in fact.fact_summary
+
+
+def test_invalid_source_refs_are_skipped_without_dropping_fact() -> None:
+    """Malformed source_refs 不应导致 TOOL_RESULT_ACCEPTED 投影失败。"""
+
+    payload = _tool_payload(summary="summary with malformed refs")
+    payload["source_refs"] = [
+        {"ref_kind": "invalid-kind", "ref_id": "bad-ref"},
+        {"ref_kind": HostNeutralRefKind.SOURCE.value, "ref_id": "good-ref"},
+    ]
+    snapshot = _build_snapshot(
+        (
+            _memory_event(
+                event_sequence=3,
+                event_id="event-tool-bad-source-ref",
+                event_type="TOOL_RESULT_ACCEPTED",
+                payload=payload,
+            ),
+        )
+    )
+
+    fact = snapshot.verified_facts[0]
+    assert fact.fact_summary == "summary with malformed refs"
+    assert any(ref.ref_id == "good-ref" for ref in fact.provenance.source_refs)
+    assert all(ref.ref_id != "bad-ref" for ref in fact.provenance.source_refs)
+
+
+def test_projection_ignores_reserved_claim_status_from_payload() -> None:
+    """P9 projection 不从 payload 主动合成 reserved claim statuses。"""
+
+    payload = _tool_payload(summary="tool supplied neutral summary")
+    payload["claim_status"] = MemoryClaimStatus.CONFLICTED.value
+    snapshot = _build_snapshot(
+        (
+            _memory_event(
+                event_sequence=4,
+                event_id="event-tool-reserved-status",
+                event_type="TOOL_RESULT_ACCEPTED",
+                payload=payload,
+            ),
+        )
+    )
+
+    statuses = {
+        item.claim_status
+        for item in snapshot.verified_facts
+    } | {
+        item.claim_status
+        for item in snapshot.working_assumptions
+    } | {
+        item.claim_status
+        for item in snapshot.conversation_continuity.items
+    }
+    assert MemoryClaimStatus.CONFLICTED not in statuses
+    assert MemoryClaimStatus.STALE not in statuses
+    assert MemoryClaimStatus.SUPERSEDED not in statuses
+    assert statuses == {MemoryClaimStatus.TOOL_VERIFIED}
+
+
+def test_episode_summary_does_not_replace_evidence_anchor() -> None:
+    """Episode summary 只是 continuity navigation，不替代工具 evidence anchor。"""
+
+    snapshot = _build_snapshot(
+        (
+            _memory_event(
+                event_sequence=1,
+                event_id="event-tool-with-evidence",
+                event_type="TOOL_RESULT_ACCEPTED",
+                payload=_tool_payload(summary="tool supplied neutral summary"),
+            ),
+            _memory_event(
+                event_sequence=2,
+                event_id="event-episode",
+                event_type="EPISODE_SUMMARY_ACCEPTED",
+                payload={"summary_text": "navigation only"},
+                run_id=None,
+                attempt_id=None,
+                execution_id=None,
+            ),
+        )
+    )
+
+    assert len(snapshot.verified_facts) == 1
+    assert snapshot.verified_facts[0].evidence_anchor is not None
+    assert snapshot.verified_facts[0].evidence_anchor.ref_id == "payload:payload-tool-1"
+    assert len(snapshot.conversation_continuity.items) == 1
+    assert (
+        snapshot.conversation_continuity.items[0].item_kind
+        is ConversationContinuityKind.EPISODE_SUMMARY
+    )
+
+
+def test_history_pool_preserves_recent_floor_and_drops_summaries_first() -> None:
+    """低预算下 recent raw turn floor 保留，summary 先于 older raw turn 被丢弃。"""
+
+    snapshot = _build_snapshot(
+        (
+            _memory_event(
+                event_sequence=1,
+                event_id="event-old-user",
+                event_type="USER_INPUT_ACCEPTED",
+                payload={"display_text": "old"},
+                attempt_id=None,
+                execution_id=None,
+            ),
+            _memory_event(
+                event_sequence=2,
+                event_id="event-episode",
+                event_type="EPISODE_SUMMARY_ACCEPTED",
+                payload={"summary_text": "episode-summary"},
+                run_id=None,
+                attempt_id=None,
+                execution_id=None,
+            ),
+            _memory_event(
+                event_sequence=3,
+                event_id="event-recent-user-1",
+                event_type="USER_INPUT_ACCEPTED",
+                payload={"display_text": "r1"},
+                attempt_id=None,
+                execution_id=None,
+            ),
+            _memory_event(
+                event_sequence=4,
+                event_id="event-recent-user-2",
+                event_type="USER_INPUT_ACCEPTED",
+                payload={"display_text": "r2"},
+                attempt_id=None,
+                execution_id=None,
+            ),
+        ),
+        policy=_low_history_policy(),
+    )
+
+    continuity_texts = tuple(
+        item.summary_text for item in snapshot.conversation_continuity.items
+    )
+    assert continuity_texts == ("old", "r1", "r2")
+    assert all(
+        item.item_kind is not ConversationContinuityKind.EPISODE_SUMMARY
+        for item in snapshot.conversation_continuity.items
+    )
+    assert any(
+        diagnostic.reason is MemoryDiagnosticReason.BUDGET_LIMIT_REACHED
+        for diagnostic in snapshot.diagnostics
+    )
+
+
+def test_history_pool_limits_assistant_conclusions_before_episode_summaries() -> None:
+    """assistant conclusions 参与 history pool 预算并优先于 episode summaries。"""
+
+    snapshot = _build_snapshot(
+        (
+            _memory_event(
+                event_sequence=1,
+                event_id="event-recent-user",
+                event_type="USER_INPUT_ACCEPTED",
+                payload={"display_text": "recent user"},
+                attempt_id=None,
+                execution_id=None,
+            ),
+            _memory_event(
+                event_sequence=2,
+                event_id="event-final-1",
+                event_type="RUN_SUCCEEDED",
+                payload={"final_answer": "aaaa"},
+                attempt_id=None,
+                execution_id=None,
+            ),
+            _memory_event(
+                event_sequence=3,
+                event_id="event-final-2",
+                event_type="RUN_SUCCEEDED",
+                payload={"final_answer": "bbbb"},
+                attempt_id=None,
+                execution_id=None,
+            ),
+            _memory_event(
+                event_sequence=4,
+                event_id="event-episode-budget",
+                event_type="EPISODE_SUMMARY_ACCEPTED",
+                payload={"summary_text": "zz"},
+                run_id=None,
+                attempt_id=None,
+                execution_id=None,
+            ),
+        ),
+        policy=_assistant_budget_policy(),
+    )
+
+    continuity_texts = tuple(
+        item.summary_text for item in snapshot.conversation_continuity.items
+    )
+    assert continuity_texts == ("recent user", "bbbb")
+    assert all(
+        item.item_kind is not ConversationContinuityKind.EPISODE_SUMMARY
+        for item in snapshot.conversation_continuity.items
+    )
+    assert any(
+        diagnostic.reason is MemoryDiagnosticReason.BUDGET_LIMIT_REACHED
+        for diagnostic in snapshot.diagnostics
+    )
+
+
+def test_recent_raw_turns_floor_zero_keeps_no_raw_floor() -> None:
+    """recent_raw_turns_floor 为 0 时不通过 ``-0`` 切片保留全部 raw turns。"""
+
+    snapshot = _build_snapshot(
+        (
+            _memory_event(
+                event_sequence=1,
+                event_id="event-user-1",
+                event_type="USER_INPUT_ACCEPTED",
+                payload={"display_text": "u1"},
+                attempt_id=None,
+                execution_id=None,
+            ),
+            _memory_event(
+                event_sequence=2,
+                event_id="event-user-2",
+                event_type="USER_INPUT_ACCEPTED",
+                payload={"display_text": "u2"},
+                attempt_id=None,
+                execution_id=None,
+            ),
+            _memory_event(
+                event_sequence=3,
+                event_id="event-user-3",
+                event_type="USER_INPUT_ACCEPTED",
+                payload={"display_text": "u3"},
+                attempt_id=None,
+                execution_id=None,
+            ),
+        ),
+        policy=_zero_recent_floor_policy(),
+    )
+
+    continuity_texts = tuple(
+        item.summary_text for item in snapshot.conversation_continuity.items
+    )
+    assert continuity_texts == ("u3",)
+
+
+def test_unknown_event_type_records_diagnostic_and_advances_cursor() -> None:
+    """未知 event type 不应静默忽略，且 snapshot cursor 覆盖该事件。"""
+
+    snapshot = _build_snapshot(
+        (
+            _memory_event(
+                event_sequence=7,
+                event_id="event-unknown",
+                event_type="UNKNOWN_MEMORY_EVENT",
+                payload={"summary_text": "ignored"},
+                run_id=None,
+                attempt_id=None,
+                execution_id=None,
+            ),
+        )
+    )
+
+    assert snapshot.cursor.checkpoint_event_sequence == 7
+    assert snapshot.verified_facts == ()
+    assert snapshot.conversation_continuity.items == ()
+    assert len(snapshot.diagnostics) == 1
+    assert (
+        snapshot.diagnostics[0].reason
+        is MemoryDiagnosticReason.UNSUPPORTED_EVENT_TYPE
+    )
+    assert (
+        MemoryExcludedReason.UNSUPPORTED_EVENT_TYPE.value
+        in snapshot.diagnostics[0].message
+    )
+
+
+def test_snapshot_rebuild_preserves_provenance_and_digest_is_deterministic() -> None:
+    """固定 events 与 policy rebuild 后 provenance 不丢且 digest 稳定。"""
+
+    events = (
+        _memory_event(
+            event_sequence=1,
+            event_id="event-tool-rebuild",
+            event_type="TOOL_RESULT_ACCEPTED",
+            payload=_tool_payload(summary="tool supplied neutral summary"),
+        ),
+        _memory_event(
+            event_sequence=2,
+            event_id="event-final-rebuild",
+            event_type="RUN_SUCCEEDED",
+            payload={"final_answer": "assistant conclusion"},
+            run_id="run-1",
+            attempt_id=None,
+            execution_id=None,
+        ),
+    )
+    first = _build_snapshot(events)
+    second = build_conversation_memory_snapshot_from_events(
+        events=events,
+        session_id=_SESSION_ID,
+        consumer_id=_CONSUMER_ID,
+        policy=_policy(),
+        built_at="2026-05-17T00:00:00.000000Z",
+    )
+
+    assert first.snapshot_digest == second.snapshot_digest
+    assert first.verified_facts[0].provenance == second.verified_facts[0].provenance
+    assert first.verified_facts[0].provenance.payload_ref == "payload-tool-1"
+    assert first.cursor.checkpoint_event_sequence == 2
+    assert second.cursor.checkpoint_event_sequence == 2
+
+
+def test_projection_consumer_writes_snapshot_with_runner_checkpoint(
+    tmp_path: Path,
+) -> None:
+    """ProjectionRunner 可用 memory consumer 从 committed EventLog 构建 snapshot。"""
+
+    policy = _policy()
+    consumer = ConversationMemoryProjectionConsumer(policy)
+    with open_host_durable_store(_options(tmp_path)) as store:
+        store.transaction_runner.run_write(
+            lambda transaction: _append_memory_event(
+                transaction,
+                event_id="event-user-durable",
+                event_type="USER_INPUT_ACCEPTED",
+                payload={"display_text": "durable user input"},
+            )
+        )
+        store.transaction_runner.run_write(
+            lambda transaction: _append_memory_event(
+                transaction,
+                event_id="event-tool-durable",
+                event_type="TOOL_RESULT_ACCEPTED",
+                payload=_tool_payload(summary="durable tool summary"),
+            )
+        )
+        result = ProjectionRunner(
+            store.transaction_runner, (consumer,)
+        ).run_once(
+            ProjectionConsumerId(CONVERSATION_MEMORY_CONSUMER_ID),
+            limit=10,
+        )
+        read_back = store.transaction_runner.run_read(
+            _ReadLatestSnapshotOperation(digest_memory_projection_policy(policy))
+        )
+        checkpoint = store.transaction_runner.run_read(_ReadCheckpointOperation())
+
+        assert result.events_applied == 2
+        assert read_back is not None
+        assert read_back.snapshot.verified_facts[0].fact_summary == (
+            "durable tool summary"
+        )
+        assert read_back.snapshot.cursor.checkpoint_event_sequence == 2
+        assert checkpoint is not None
+        assert checkpoint.checkpoint_event_sequence == 2
+
+
+def test_reset_conversation_memory_projection_deletes_consumer_scope_only(
+    tmp_path: Path,
+) -> None:
+    """reset 清目标 consumer 全部 policy snapshot，但保留其它 consumer rows。"""
+
+    target_policy = _policy()
+    other_policy = _low_history_policy()
+    other_consumer_id = "host.memory.other-consumer"
+    target = _build_snapshot(
+        (
+            _memory_event(
+                event_sequence=1,
+                event_id="event-target-reset",
+                event_type="USER_INPUT_ACCEPTED",
+                payload={"display_text": "target memory"},
+                attempt_id=None,
+                execution_id=None,
+            ),
+        ),
+        policy=target_policy,
+    )
+    other_consumer = build_conversation_memory_snapshot_from_events(
+        events=(
+            _memory_event(
+                event_sequence=2,
+                event_id="event-other-consumer-reset",
+                event_type="USER_INPUT_ACCEPTED",
+                payload={"display_text": "other consumer memory"},
+                attempt_id=None,
+                execution_id=None,
+            ),
+        ),
+        session_id=_SESSION_ID,
+        consumer_id=other_consumer_id,
+        policy=target_policy,
+        built_at=_NOW,
+    )
+    other_policy_snapshot = build_empty_conversation_memory_snapshot(
+        snapshot_id="snapshot-other-policy-reset",
+        session_id=_SESSION_ID,
+        consumer_id=_CONSUMER_ID,
+        policy_digest=digest_memory_projection_policy(other_policy),
+        built_at=_NOW,
+    )
+
+    with open_host_durable_store(_options(tmp_path)) as store:
+        store.transaction_runner.run_write(
+            lambda transaction: _append_memory_event(
+                transaction,
+                event_id="event-target-reset",
+                event_type="USER_INPUT_ACCEPTED",
+                payload={"display_text": "target memory"},
+            )
+        )
+        store.transaction_runner.run_write(
+            lambda transaction: _append_memory_event(
+                transaction,
+                event_id="event-other-consumer-reset",
+                event_type="USER_INPUT_ACCEPTED",
+                payload={"display_text": "other consumer memory"},
+            )
+        )
+        store.transaction_runner.run_write(
+            lambda transaction: write_memory_snapshot_with_checkpoint(
+                transaction,
+                target,
+                now=_NOW,
+            )
+        )
+        store.transaction_runner.run_write(
+            lambda transaction: write_memory_snapshot_with_checkpoint(
+                transaction,
+                other_consumer,
+                now=_NOW,
+            )
+        )
+        store.transaction_runner.run_write(
+            lambda transaction: write_memory_snapshot_with_checkpoint(
+                transaction,
+                other_policy_snapshot,
+                now=_NOW,
+            )
+        )
+
+        store.transaction_runner.run_write(
+            lambda transaction: reset_conversation_memory_projection(
+                transaction,
+                consumer_id=_CONSUMER_ID,
+            )
+        )
+        target_read = store.transaction_runner.run_read(
+            _ReadLatestSnapshotOperation(digest_memory_projection_policy(target_policy))
+        )
+        other_policy_read = store.transaction_runner.run_read(
+            _ReadLatestSnapshotOperation(digest_memory_projection_policy(other_policy))
+        )
+        other_consumer_read = store.transaction_runner.run_read(
+            lambda transaction: read_latest_memory_snapshot(
+                transaction,
+                session_id=_SESSION_ID,
+                consumer_id=other_consumer_id,
+                policy_digest=digest_memory_projection_policy(target_policy),
+            )
+        )
+        target_checkpoint = store.transaction_runner.run_read(
+            _ReadCheckpointForConsumerOperation(_CONSUMER_ID)
+        )
+        other_checkpoint = store.transaction_runner.run_read(
+            _ReadCheckpointForConsumerOperation(other_consumer_id)
+        )
+
+        assert target_read is None
+        assert other_policy_read is None
+        assert other_consumer_read is not None
+        assert target_checkpoint is None
+        assert other_checkpoint is not None
+
+
+def test_rebuild_conversation_memory_projection_is_stable_and_does_not_append_eventlog(
+    tmp_path: Path,
+) -> None:
+    """rebuild 从 committed EventLog 重建 snapshot，保留 provenance 且不写 EventLog。"""
+
+    policy = _policy()
+    with open_host_durable_store(_options(tmp_path)) as store:
+        store.transaction_runner.run_write(
+            lambda transaction: _append_memory_event(
+                transaction,
+                event_id="event-tool-rebuild-service",
+                event_type="TOOL_RESULT_ACCEPTED",
+                payload=_tool_payload(summary="service rebuild tool summary"),
+            )
+        )
+        store.transaction_runner.run_write(
+            lambda transaction: _append_memory_event(
+                transaction,
+                event_id="event-final-rebuild-service",
+                event_type="RUN_SUCCEEDED",
+                payload={"final_answer": "service rebuild conclusion"},
+            )
+        )
+        before_count = store.transaction_runner.run_read(_event_log_count)
+
+        first = rebuild_conversation_memory_projection(
+            store.transaction_runner,
+            policy=policy,
+            batch_size=1,
+        )
+        first_snapshot = store.transaction_runner.run_read(
+            _ReadLatestSnapshotOperation(digest_memory_projection_policy(policy))
+        )
+        second = rebuild_conversation_memory_projection(
+            store.transaction_runner,
+            policy=policy,
+            batch_size=2,
+        )
+        second_snapshot = store.transaction_runner.run_read(
+            _ReadLatestSnapshotOperation(digest_memory_projection_policy(policy))
+        )
+        after_count = store.transaction_runner.run_read(_event_log_count)
+        checkpoint = store.transaction_runner.run_read(_ReadCheckpointOperation())
+
+        assert first.failures == 0
+        assert second.failures == 0
+        assert first_snapshot is not None
+        assert second_snapshot is not None
+        assert first_snapshot.snapshot.snapshot_digest == (
+            second_snapshot.snapshot.snapshot_digest
+        )
+        assert first_snapshot.snapshot.verified_facts[0].provenance.event_id == (
+            "event-tool-rebuild-service"
+        )
+        assert first_snapshot.snapshot.verified_facts[0].provenance.event_sequence == 1
+        assert first_snapshot.snapshot.verified_facts[0].provenance.payload_ref == (
+            "payload-tool-1"
+        )
+        assert before_count == after_count
+        assert checkpoint is not None
+        assert checkpoint.checkpoint_event_sequence == (
+            second_snapshot.snapshot.cursor.checkpoint_event_sequence
+        )
+
+
+def test_catch_up_projection_failure_row_remains_observable(tmp_path: Path) -> None:
+    """consumer apply 失败时 catch-up 返回 failure 且 projection failure row 可读。"""
+
+    policy = _policy()
+    policy_digest = digest_memory_projection_policy(policy)
+    with open_host_durable_store(_options(tmp_path)) as store:
+        store.transaction_runner.run_write(
+            lambda transaction: _append_memory_event(
+                transaction,
+                event_id="event-before-damage",
+                event_type="USER_INPUT_ACCEPTED",
+                payload={"display_text": "before damage"},
+            )
+        )
+        rebuild_conversation_memory_projection(
+            store.transaction_runner,
+            policy=policy,
+            batch_size=8,
+        )
+        store.transaction_runner.run_write(
+            lambda transaction: _damage_latest_memory_snapshot(
+                transaction,
+                policy_digest=policy_digest,
+            )
+        )
+        store.transaction_runner.run_write(
+            lambda transaction: _append_memory_event(
+                transaction,
+                event_id="event-after-damage",
+                event_type="USER_INPUT_ACCEPTED",
+                payload={"display_text": "after damage"},
+            )
+        )
+
+        result = catch_up_conversation_memory_projection(
+            store.transaction_runner,
+            policy=policy,
+            batch_size=8,
+        )
+        failure = store.transaction_runner.run_read(
+            _ReadProjectionFailureOperation(_CONSUMER_ID)
+        )
+
+        assert result.failures == 1
+        assert failure is not None
+        assert failure.failed_event_id == "event-after-damage"
+        assert failure.last_error_code == "HostDurableError"

@@ -292,10 +292,12 @@ class AsyncOpenAIRunner:
                     attempt,
                     effective_options.stream,
                 )
+                attempt_yielded_event = False
                 try:
                     async for event in self._do_attempt(
                         payload, effective_options
                     ):
+                        attempt_yielded_event = True
                         yield event
                     return
                 except _AttemptFailedTerminal as failure:
@@ -324,6 +326,31 @@ class AsyncOpenAIRunner:
                     )
                     return
                 except _AttemptFailedRetriable as failure:
+                    if attempt_yielded_event:
+                        _LOGGER.warning(
+                            "runner.attempt.retriable_after_event "
+                            "provider=%s model=%s attempt=%d error_code=%s "
+                            "http_status=%s provider_request_id=%s",
+                            self._spec.provider,
+                            self._spec.model,
+                            attempt,
+                            failure.error_code.value,
+                            failure.http_status,
+                            failure.provider_request_id,
+                        )
+                        yield self._make_http_error_event(
+                            error_code=failure.error_code,
+                            http_status=failure.http_status,
+                            message_text=failure.message_text,
+                            provider_request_id=failure.provider_request_id,
+                            raw_payload=failure.raw_payload,
+                            attempt=attempt,
+                        )
+                        yield self._make_done_event(
+                            FinishReason.ERROR,
+                            provider_request_id=failure.provider_request_id,
+                        )
+                        return
                     decision = compute_retry_decision(
                         error_code=failure.error_code,
                         attempt=attempt,
@@ -509,9 +536,19 @@ class AsyncOpenAIRunner:
                 ):
                     yield event
             else:
-                body = await await_or_cancel(
-                    response.read(), token=self._token
-                )
+                try:
+                    body = await await_or_cancel(
+                        response.read(), token=self._token
+                    )
+                except (aiohttp.ClientError, asyncio.TimeoutError) as exc:
+                    raise _AttemptFailedRetriable(
+                        error_code=classify_exception(exc),
+                        http_status=None,
+                        message_text=str(exc) or type(exc).__name__,
+                        provider_request_id=provider_request_id,
+                        raw_payload=None,
+                        retry_after_seconds=None,
+                    ) from exc
                 for event in parse_non_stream_response(
                     body, hook=hook, provider_request_id=provider_request_id
                 ):
@@ -753,7 +790,8 @@ class AsyncOpenAIRunner:
         """取消并等待 ``readany`` pending task 收口。
 
         :param pending: 需要取消的 readany task。
-        :returns: 无返回值；吞掉 ``CancelledError`` 与读取异常。
+        :returns: 无返回值；静默吞掉 ``CancelledError``，普通异常记录
+            warning 后吞掉。
         """
 
         if pending.done():
@@ -761,8 +799,13 @@ class AsyncOpenAIRunner:
         pending.cancel()
         try:
             await pending
-        except (asyncio.CancelledError, Exception):  # noqa: BLE001
+        except asyncio.CancelledError:
             pass
+        except Exception as exc:
+            _LOGGER.warning(
+                "runner.pending_readany_cancel_failed error_type=%s",
+                exc.__class__.__name__,
+            )
 
     async def _safe_read_error_body(
         self, response: aiohttp.ClientResponse

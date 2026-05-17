@@ -111,6 +111,10 @@ class RuntimeFileLockToken:
 class RuntimeFileLock:
     """同步 runtime 文件锁。
 
+    同一个 :class:`RuntimeFileLock` 实例只承诺单线程 / 单控制流使用；
+    多线程需要各自创建独立实例并依赖底层文件锁协调，不得共享实例上的
+    active token 跟踪状态。
+
     :param options: 文件锁配置。
     :raises RuntimeFileLockError: 配置非法时抛出。
     """
@@ -138,6 +142,9 @@ class RuntimeFileLock:
 
     def acquire(self, timeout_seconds: float | None = None) -> RuntimeFileLockToken:
         """同步获取文件锁。
+
+        本方法不提供同一 wrapper 实例内的线程安全 active token 跟踪；
+        多线程调用方应为每个线程创建独立 wrapper 实例。
 
         :param timeout_seconds: 本次 acquire timeout；``None`` 时使用
             ``RuntimeFileLockOptions.timeout_seconds``，若后者也是 ``None`` 则
@@ -197,8 +204,10 @@ class RuntimeFileLock:
 
         token = self._active_token
         if token is not None:
-            token.release()
-            self._active_token = None
+            try:
+                token.release()
+            finally:
+                self._active_token = None
 
 
 def file_lock(

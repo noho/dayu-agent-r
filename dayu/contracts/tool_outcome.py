@@ -14,14 +14,15 @@ pyright 通过 ``typing.assert_never`` 守护。
 本模块同时定义批式执行的 record / outcome 容器：
 
 - :class:`BatchToolExecutionRecord`：单次工具调用对应的输出记录。
-- :class:`BatchToolExecutionOutcome`：批式握手的整体返回，承载与输入
-  ``calls`` 一一对应的 record 序列。
+- :class:`BatchToolExecutionOutcome`：批式握手的整体返回，承载 record
+  序列，并在构造期校验 record id 的最小完整性。由于 outcome 本身不携带
+  request.calls，完整双射仍由 Engine 结合输入 calls 校验。
 """
 
 from __future__ import annotations
 
 from dataclasses import dataclass
-from typing import TypeAlias
+from typing import Final, Literal, TypeAlias
 
 from dayu.contracts.tool_await import ToolAwaitSnapshot, ToolAwaitSpec
 from dayu.contracts.tool_result import (
@@ -31,13 +32,20 @@ from dayu.contracts.tool_result import (
 )
 
 
-TOOL_CANCELLED_REASON_APPROVAL_DENIED: str = "approval_denied"
+ToolCancelledReason: TypeAlias = Literal[
+    "approval_denied",
+    "host_cancelled",
+    "timeout",
+]
+"""工具级取消原因静态类型。"""
+
+TOOL_CANCELLED_REASON_APPROVAL_DENIED: Final[ToolCancelledReason] = "approval_denied"
 """工具级取消原因常量：审批被拒。"""
 
-TOOL_CANCELLED_REASON_HOST_CANCELLED: str = "host_cancelled"
+TOOL_CANCELLED_REASON_HOST_CANCELLED: Final[ToolCancelledReason] = "host_cancelled"
 """工具级取消原因常量：Host 治理决策取消该工具。"""
 
-TOOL_CANCELLED_REASON_TIMEOUT: str = "timeout"
+TOOL_CANCELLED_REASON_TIMEOUT: Final[ToolCancelledReason] = "timeout"
 """工具级取消原因常量：工具自身超时取消。"""
 
 ALLOWED_TOOL_CANCELLED_REASONS: frozenset[str] = frozenset(
@@ -101,7 +109,7 @@ class ToolCancelledOutcome:
         与其它 outcome 保持一致；无元信息时为 ``None``。
     """
 
-    reason: str
+    reason: ToolCancelledReason
     message: str
     hint: str | None
     meta: ToolResultMeta | None
@@ -151,7 +159,9 @@ class BatchToolExecutionRecord:
 class BatchToolExecutionOutcome:
     """批式工具执行整体返回。
 
-    与输入 :class:`BatchToolExecutionRequest.calls` 形成严格双射：
+    本类型只做不依赖 request 的轻量校验：每条 record 的
+    ``tool_call_id`` 必须非空且不得重复。与输入
+    :class:`BatchToolExecutionRequest.calls` 的完整双射由 Engine 校验：
 
     - ``len(records) == len(calls)``；
     - 每个 ``tool_call_id`` 在 ``records`` 中恰好出现一次；
@@ -165,6 +175,27 @@ class BatchToolExecutionOutcome:
 
     records: tuple[BatchToolExecutionRecord, ...]
 
+    def __post_init__(self) -> None:
+        """校验 record id 的最小完整性。
+
+        :returns: ``None``。
+        :raises ValueError: 任一 ``tool_call_id`` 为空 / 纯空白或重复时抛出。
+        """
+
+        seen_ids: set[str] = set()
+        for record in self.records:
+            if record.tool_call_id.strip() == "":
+                raise ValueError(
+                    "BatchToolExecutionOutcome record tool_call_id must be "
+                    "non-empty"
+                )
+            if record.tool_call_id in seen_ids:
+                raise ValueError(
+                    "BatchToolExecutionOutcome record tool_call_id must be "
+                    f"unique; duplicate {record.tool_call_id!r}"
+                )
+            seen_ids.add(record.tool_call_id)
+
 
 __all__ = [
     "ALLOWED_TOOL_CANCELLED_REASONS",
@@ -173,6 +204,7 @@ __all__ = [
     "TOOL_CANCELLED_REASON_APPROVAL_DENIED",
     "TOOL_CANCELLED_REASON_HOST_CANCELLED",
     "TOOL_CANCELLED_REASON_TIMEOUT",
+    "ToolCancelledReason",
     "ToolAwaitingOutcome",
     "ToolCancelledOutcome",
     "ToolCompletedOutcome",

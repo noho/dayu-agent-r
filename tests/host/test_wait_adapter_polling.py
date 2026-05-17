@@ -2,8 +2,11 @@
 
 from __future__ import annotations
 
+import logging
 from datetime import UTC, datetime
 from pathlib import Path
+
+import pytest
 
 from dayu.contracts.tool_result import ToolResultSuccess
 from dayu.host import (
@@ -274,8 +277,37 @@ def test_cancelled_poll_wait_is_abandoned_without_resolve(
         host.close()
 
 
+def test_missing_poll_adapter_registration_logs_warning(
+    tmp_path: Path, caplog: pytest.LogCaptureFixture
+) -> None:
+    """poll adapter 未注册时记录 wait id 与 adapter key。"""
+
+    host = create_host_command_handle(_options(tmp_path))
+    try:
+        seeded = _seed_waiting_run(host)
+        wait_record = _read_wait(host._transaction_runner(), seeded.wait_id)
+        poller = WaitPoller(
+            transaction_runner=host._transaction_runner(),
+            adapter_registry=WaitPollAdapterRegistry(()),
+            resolver=_PublicCommandResolver(host),
+            context=_context("poller-missing-adapter"),
+            clock=_FixedClock(),
+        )
+
+        with caplog.at_level(logging.WARNING, logger="dayu.host.wait_adapter"):
+            result = poller.poll_once()
+
+        assert result.observed == 1
+        assert result.adapter_errors == 1
+        assert "wait poll adapter not registered; skipping" in caplog.text
+        assert seeded.wait_id in caplog.text
+        assert wait_record.adapter_key.value in caplog.text
+    finally:
+        host.close()
+
+
 def test_adapter_non_runtime_exception_isolated_per_wait_record(
-    tmp_path: Path,
+    tmp_path: Path, caplog: pytest.LogCaptureFixture
 ) -> None:
     """adapter 普通异常只影响单条 wait record，后续记录继续处理。"""
 
@@ -297,7 +329,8 @@ def test_adapter_non_runtime_exception_isolated_per_wait_record(
         adapter = _AbandonValueErrorThenNotReadyAdapter()
         poller = _poller(host, adapter, seeded.wait_id)
 
-        result = poller.poll_once()
+        with caplog.at_level(logging.WARNING, logger="dayu.host.wait_adapter"):
+            result = poller.poll_once()
 
         assert result.observed == 2
         assert result.adapter_errors == 1
@@ -305,6 +338,7 @@ def test_adapter_non_runtime_exception_isolated_per_wait_record(
         assert result.abandoned == 0
         assert adapter.abandoned == [seeded.wait_id]
         assert adapter.polled == [followup_wait_id]
+        assert "wait adapter abandon failed; continuing" in caplog.text
     finally:
         host.close()
 

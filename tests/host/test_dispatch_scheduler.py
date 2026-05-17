@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+import logging
 from collections.abc import AsyncIterator
 from dataclasses import dataclass
 from datetime import UTC, datetime
@@ -14,6 +15,7 @@ import pytest
 from dayu.engine.contracts.agent_policy import AgentPolicy
 from dayu.engine.contracts.agent_run import AgentRunRequest
 from dayu.engine.contracts.engine_events import EngineEvent
+from dayu.engine.contracts.messages import AgentMessage
 from dayu.engine.contracts.runner_spec import RunnerCallOptions, RunnerSpec
 from dayu.contracts.json_value import JsonValue
 from dayu.contracts.tool_call import (
@@ -49,10 +51,12 @@ from dayu.host.tooling import (
 from dayu.host.dispatch import (
     ActiveCancelMessage,
     ActiveWorkerRegistry,
+    DispatchDrainResult,
     HostDispatchScheduler,
 )
 from dayu.host.durable.codec import sha256_digest_json
 from dayu.host.durable.connection import HostDurableStore, open_host_durable_store
+from dayu.host.durable.errors import HostTransactionRetryExhaustedError
 from dayu.host.durable.event_log import (
     EventClass,
     EventLogAppendRequest,
@@ -86,8 +90,10 @@ from dayu.host.durable.state import (
 )
 from dayu.host.durable.transaction import HostTransaction, HostTransactionRunner
 from dayu.host.local_proxy import DefaultLocalEngineWorkerFactory
+from dayu.host.projection import ProjectionCatchupPort
 from dayu.runtime.lane import (
     LaneAcquired,
+    LaneClaimToken,
     LaneConfig,
     LaneController,
     SQLiteLaneCoordinatorConfig,
@@ -107,6 +113,23 @@ class _SeededRun:
     attempt_id: str
     execution_id: str
     dispatch_record_id: str
+
+
+@dataclass(slots=True)
+class _FailingProjectionCatchup(ProjectionCatchupPort):
+    """测试用失败 projection catch-up port。"""
+
+    calls: int = 0
+
+    def catch_up_projection(self) -> None:
+        """记录调用并模拟 catch-up 失败。
+
+        :returns: ``None``。
+        :raises RuntimeError: 始终抛出测试错误。
+        """
+
+        self.calls += 1
+        raise RuntimeError("forced scheduler projection catch-up failure")
 
 
 class _FakeHandle:
@@ -488,6 +511,19 @@ class _EnqueueOnSecondEmptyQueue(asyncio.Queue[PendingDispatchRecord]):
         return super().empty()
 
 
+class _FailingDrainLoopScheduler(HostDispatchScheduler):
+    """测试用 drain_once 崩溃 scheduler。"""
+
+    async def drain_once(self) -> DispatchDrainResult:
+        """模拟 drain_once 未预期异常。
+
+        :returns: 不会返回。
+        :raises RuntimeError: 始终抛出测试异常。
+        """
+
+        raise RuntimeError("drain failure")
+
+
 @pytest.mark.asyncio
 async def test_pending_waiting_dispatching_worker_accept_marks_running(
     tmp_path: Path,
@@ -529,6 +565,95 @@ async def test_pending_waiting_dispatching_worker_accept_marks_running(
 
 
 @pytest.mark.asyncio
+async def test_drain_loop_logs_unexpected_exception(
+    tmp_path: Path,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """drain loop 未预期异常退出时必须记录诊断日志。"""
+
+    caplog.set_level(logging.WARNING, logger="dayu.host.dispatch")
+    with open_host_durable_store(_options(tmp_path)) as store:
+        lane_controller = await LaneController.open(
+            [
+                LaneConfig(
+                    name=_LANE_NAME,
+                    capacity=1,
+                    default_timeout_seconds=0.1,
+                    claim_ttl_seconds=1.0,
+                    heartbeat_interval_seconds=0.1,
+                )
+            ],
+            coordinator=SQLiteLaneCoordinatorConfig(
+                db_path=tmp_path / "lane-drain-loop.sqlite3"
+            ),
+        )
+        scheduler = _FailingDrainLoopScheduler(
+            transaction_runner=store.transaction_runner,
+            event_log_store=EventLogStore(),
+            local_execution=HostLocalExecutionOptions(
+                lane_db_path=tmp_path / "lane-drain-loop.sqlite3",
+                lane_name=_LANE_NAME,
+                lane_capacity=1,
+                lane_default_timeout_seconds=0.1,
+                lane_claim_ttl_seconds=1.0,
+                lane_heartbeat_interval_seconds=0.1,
+                worker_startup_timeout_seconds=1.0,
+                dispatch_poll_interval_seconds=0.01,
+                runner_spec=_runner_spec(),
+                runner_options=RunnerCallOptions(
+                    temperature=None, max_tokens=None, top_p=None, stream=False
+                ),
+                agent_policy=_agent_policy(False),
+                worker_factory=_FakeWorkerFactory(),
+            ),
+            lane_controller=lane_controller,
+            host_handle_id="host-drain-loop-log",
+        )
+        try:
+            await scheduler._drain_loop()
+        finally:
+            await scheduler.close()
+
+    assert any(
+        "dispatch drain loop stopped unexpectedly" in record.getMessage()
+        for record in caplog.records
+    )
+
+
+@pytest.mark.asyncio
+async def test_scheduler_injects_durable_memory_for_no_tool_dispatch(
+    tmp_path: Path,
+) -> None:
+    """no-tool dispatch 默认接入 durable memory provider。"""
+
+    factory = _FakeWorkerFactory(accepted_handle=_CloseCountingHandle())
+    with open_host_durable_store(_options(tmp_path)) as store:
+        session_id = _ensure_session_id(store.transaction_runner)
+        _append_user_input(
+            store.transaction_runner,
+            session_id=session_id,
+            run_id="run-memory-previous",
+            event_id="event-input-memory-previous",
+            display_text="previous memory prompt",
+            client_request_id="client-memory-previous",
+            idempotency_key="idem-memory-previous",
+        )
+        seeded = _seed_current_run(store, session_id=session_id)
+        scheduler = await _open_scheduler(tmp_path, store, factory)
+        try:
+            scheduler.wake_dispatch(_pending_dispatch(seeded))
+            result = await scheduler.drain_once()
+
+            request = factory.accepted_requests[0]
+            contents = tuple(_message_text(message) for message in request.messages)
+            assert result.dispatched == 1
+            assert "previous memory prompt" in contents
+            assert contents[-1] == "dispatch prompt"
+        finally:
+            await scheduler.close()
+
+
+@pytest.mark.asyncio
 async def test_scheduler_uses_toolruntime_when_tooling_is_configured(
     tmp_path: Path,
 ) -> None:
@@ -536,23 +661,37 @@ async def test_scheduler_uses_toolruntime_when_tooling_is_configured(
 
     factory = _FakeWorkerFactory(accepted_handle=_CloseCountingHandle())
     tool = _CountingTool()
+    projection = _FailingProjectionCatchup()
     with open_host_durable_store(_options(tmp_path)) as store:
-        seeded = _seed_current_run(store)
+        session_id = _ensure_session_id(store.transaction_runner)
+        _append_user_input(
+            store.transaction_runner,
+            session_id=session_id,
+            run_id="run-tool-memory-previous",
+            event_id="event-input-tool-memory-previous",
+            display_text="tool-enabled previous memory prompt",
+            client_request_id="client-tool-memory-previous",
+            idempotency_key="idem-tool-memory-previous",
+        )
+        seeded = _seed_current_run(store, session_id=session_id)
         scheduler = await _open_scheduler(
             tmp_path,
             store,
             factory,
             agent_policy=_agent_policy(True),
             tooling_options=_tooling_options(tool),
+            projection_catchup=projection,
         )
         try:
             scheduler.wake_dispatch(_pending_dispatch(seeded))
             result = await scheduler.drain_once()
 
             request = factory.accepted_requests[0]
+            contents = tuple(_message_text(message) for message in request.messages)
             assert result.dispatched == 1
             assert request.disable_tools is False
             assert request.agent_policy.allow_tool_calls is True
+            assert "tool-enabled previous memory prompt" in contents
             assert [schema.function.name for schema in request.tool_schemas] == [
                 "fake_dispatch_tool"
             ]
@@ -580,6 +719,7 @@ async def test_scheduler_uses_toolruntime_when_tooling_is_configured(
             assert _read_event_by_type(
                 store.transaction_runner, "TOOL_RESULT_ACCEPTED"
             ).run_id == seeded.run_id
+            assert projection.calls == 1
         finally:
             await scheduler.close()
             assert scheduler._duplicate_governance_registry.active_run_count() == 0
@@ -695,6 +835,30 @@ async def test_worker_startup_timeout_closes_starting_attempt_failed(
 
 
 @pytest.mark.asyncio
+async def test_scheduler_queue_promotion_survives_projection_catchup_failure(
+    tmp_path: Path,
+) -> None:
+    """scheduler promotion wakeup 中 projection catch-up 失败不阻断 promotion。"""
+
+    factory = _FakeWorkerFactory()
+    projection = _FailingProjectionCatchup()
+    with open_host_durable_store(_options(tmp_path)) as store:
+        session_id = _ensure_session_id(store.transaction_runner)
+        scheduler = await _open_scheduler(
+            tmp_path,
+            store,
+            factory,
+            projection_catchup=projection,
+        )
+        try:
+            scheduler.wake_queue_promotion(session_id)
+
+            assert projection.calls == 1
+        finally:
+            await scheduler.close()
+
+
+@pytest.mark.asyncio
 async def test_worker_accept_exception_closes_failed_and_cancels_dispatch(
     tmp_path: Path,
 ) -> None:
@@ -724,8 +888,9 @@ async def test_worker_accept_exception_closes_failed_and_cancels_dispatch(
 async def test_worker_startup_closeout_error_still_releases_lane(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
+    caplog: pytest.LogCaptureFixture,
 ) -> None:
-    """startup closeout 抛错时仍释放 lane token。"""
+    """startup closeout 抛错时仍返回 timed_out 并释放 lane token。"""
 
     factory = _FakeWorkerFactory(worker=_FailingAcceptWorker())
     with open_host_durable_store(_options(tmp_path)) as store:
@@ -750,8 +915,74 @@ async def test_worker_startup_closeout_error_still_releases_lane(
         )
         try:
             scheduler.wake_dispatch(_pending_dispatch(seeded))
-            with pytest.raises(RuntimeError, match="closeout failed"):
-                await scheduler.drain_once()
+            with caplog.at_level(logging.WARNING, logger="dayu.host.dispatch"):
+                result = await scheduler.drain_once()
+
+            assert result.timed_out == 1
+            claim = await scheduler._lane_controller.acquire(
+                _LANE_NAME,
+                timeout_seconds=0,
+            )
+            assert isinstance(claim, LaneAcquired)
+            await claim.token.release()
+            assert "worker startup closeout failed; continuing" in caplog.text
+            assert "error_type=RuntimeError" in caplog.text
+            assert "original_error_type=RuntimeError" in caplog.text
+        finally:
+            await scheduler.close()
+
+
+@pytest.mark.asyncio
+async def test_dispatch_retry_exhausted_requeues_without_terminal_closeout(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """dispatch durable 重试耗尽只释放 lane 并重排，不按 startup timeout 收口。"""
+
+    factory = _FakeWorkerFactory()
+    with open_host_durable_store(_options(tmp_path)) as store:
+        seeded = _seed_current_run(store)
+        scheduler = await _open_scheduler(tmp_path, store, factory)
+
+        def raise_retry_exhausted(
+            record: PendingDispatchRecord, token: LaneClaimToken
+        ) -> DispatchRecordRow | None:
+            """模拟 dispatching recheck 写事务 busy 重试耗尽。
+
+            :param record: pending dispatch record。
+            :param token: 已获取的 lane token。
+            :returns: 不会返回。
+            :raises HostTransactionRetryExhaustedError: 始终抛出以模拟 busy。
+            """
+
+            del record, token
+            raise HostTransactionRetryExhaustedError(
+                "dispatch recheck busy", attempts=3
+            )
+
+        monkeypatch.setattr(
+            scheduler,
+            "_mark_dispatching_after_recheck",
+            raise_retry_exhausted,
+        )
+        try:
+            scheduler._queue.put_nowait(_pending_dispatch(seeded))
+            with caplog.at_level(logging.WARNING, logger="dayu.host.dispatch"):
+                result = await scheduler.drain_once()
+            await asyncio.sleep(0)
+
+            run, attempt, dispatch_record = _read_rows(
+                store.transaction_runner, seeded
+            )
+            assert result.processed == 1
+            assert result.skipped == 1
+            assert result.timed_out == 0
+            assert run.status is RunStatus.RUNNING
+            assert attempt.status is AttemptStatus.STARTING
+            assert dispatch_record.status is DispatchRecordStatus.WAITING_FOR_LANE
+            assert dispatch_record.cancelled_event_id is None
+            assert scheduler._queue.qsize() == 1
 
             claim = await scheduler._lane_controller.acquire(
                 _LANE_NAME,
@@ -759,6 +990,11 @@ async def test_worker_startup_closeout_error_still_releases_lane(
             )
             assert isinstance(claim, LaneAcquired)
             await claim.token.release()
+            assert "dispatch durable retry exhausted; requeueing" in caplog.text
+            assert seeded.run_id in caplog.text
+            assert seeded.attempt_id in caplog.text
+            assert seeded.dispatch_record_id in caplog.text
+            assert "error_type=HostTransactionRetryExhaustedError" in caplog.text
         finally:
             await scheduler.close()
 
@@ -882,6 +1118,7 @@ async def test_worker_stream_exception_closes_run_lost_from_scheduler(
 @pytest.mark.asyncio
 async def test_scheduler_close_suppresses_handle_close_exception(
     tmp_path: Path,
+    caplog: pytest.LogCaptureFixture,
 ) -> None:
     """scheduler close 不被 active handle cancel/close 异常打断。"""
 
@@ -893,7 +1130,9 @@ async def test_scheduler_close_suppresses_handle_close_exception(
         result = await scheduler.drain_once()
 
         assert result.dispatched == 1
-        await scheduler.close()
+        with caplog.at_level("WARNING", logger="dayu.host.dispatch"):
+            await scheduler.close()
+        assert "active worker cancel failed; continuing" in caplog.text
 
 
 @pytest.mark.asyncio
@@ -1068,6 +1307,7 @@ async def _open_scheduler(
     active_registry: ActiveWorkerRegistry | None = None,
     agent_policy: AgentPolicy | None = None,
     tooling_options: HostToolingOptions | None = None,
+    projection_catchup: ProjectionCatchupPort | None = None,
 ) -> HostDispatchScheduler:
     """打开测试 scheduler。
 
@@ -1080,6 +1320,7 @@ async def _open_scheduler(
     :param active_registry: active worker registry。
     :param agent_policy: 可选 AgentPolicy；无则使用 no-tool policy。
     :param tooling_options: 可选 Host 工具装配选项。
+    :param projection_catchup: 可选 projection catch-up port。
     :returns: scheduler。
     """
 
@@ -1106,6 +1347,7 @@ async def _open_scheduler(
         ),
         host_handle_id="host-test",
         active_registry=active_registry,
+        projection_catchup_port=projection_catchup,
     )
 
 
@@ -1214,6 +1456,16 @@ def _tool_execution_request(
     )
 
 
+def _message_text(message: AgentMessage) -> str | None:
+    """读取 Agent message 的文本内容。
+
+    :param message: Agent message。
+    :returns: 文本内容；assistant 空内容时返回 ``None``。
+    """
+
+    return message.content
+
+
 def _agent_policy(allow_tool_calls: bool) -> AgentPolicy:
     """构造测试 AgentPolicy。
 
@@ -1229,24 +1481,31 @@ def _agent_policy(allow_tool_calls: bool) -> AgentPolicy:
     )
 
 
-def _seed_current_run(store: HostDurableStore) -> _SeededRun:
+def _seed_current_run(
+    store: HostDurableStore, *, session_id: str | None = None
+) -> _SeededRun:
     """创建 running Run、STARTING Attempt 和 pending dispatch。
 
     :param store: durable store。
+    :param session_id: 可选已有 Session id；不传则创建默认测试 Session。
     :returns: seeded run 摘要。
     """
 
-    session_id = _ensure_session_id(store.transaction_runner)
+    actual_session_id = (
+        _ensure_session_id(store.transaction_runner)
+        if session_id is None
+        else session_id
+    )
     seeded = _SeededRun(
-        session_id=session_id,
+        session_id=actual_session_id,
         run_id="run-dispatch",
         attempt_id="attempt-dispatch",
         execution_id="execution-dispatch",
         dispatch_record_id="dispatch-dispatch",
     )
-    _append_user_input(
+    input_event_sequence = _append_user_input(
         store.transaction_runner,
-        session_id=session_id,
+        session_id=actual_session_id,
         run_id=seeded.run_id,
         event_id="event-input-dispatch",
     )
@@ -1256,11 +1515,11 @@ def _seed_current_run(store: HostDurableStore) -> _SeededRun:
             transaction,
             EventLogStore(),
             CreateRunningRunInput(
-                session_id=session_id,
+                session_id=actual_session_id,
                 run_id=seeded.run_id,
                 client_request_id="client-dispatch",
                 input_event_id="event-input-dispatch",
-                input_event_sequence=2,
+                input_event_sequence=input_event_sequence,
                 run_accepted_event_id="event-run-accepted-dispatch",
                 run_started_event_id="event-run-started-dispatch",
                 attempt_started_event_id="event-attempt-started-dispatch",
@@ -1303,18 +1562,24 @@ def _append_user_input(
     session_id: str,
     run_id: str,
     event_id: str,
-) -> None:
+    display_text: str = "dispatch prompt",
+    client_request_id: str = "client-dispatch",
+    idempotency_key: str = "idem-input",
+) -> int:
     """追加 USER_INPUT_ACCEPTED。
 
     :param transaction_runner: transaction runner。
     :param session_id: Session id。
     :param run_id: Run id。
     :param event_id: event id。
-    :returns: ``None``。
+    :param display_text: 用户输入展示文本。
+    :param client_request_id: EventLog client request id。
+    :param idempotency_key: EventLog idempotency key。
+    :returns: 追加后的 EventLog sequence。
     """
 
-    def _operation(transaction: HostTransaction) -> None:
-        EventLogStore().append_event(
+    def _operation(transaction: HostTransaction) -> int:
+        event = EventLogStore().append_event(
             transaction,
             EventLogAppendRequest(
                 event_id=event_id,
@@ -1327,12 +1592,12 @@ def _append_user_input(
                 occurred_at=_NOW,
                 actor="tester",
                 source="pytest",
-                client_request_id="client-dispatch",
-                idempotency_key="idem-input",
+                client_request_id=client_request_id,
+                idempotency_key=idempotency_key,
                 policy_decision=None,
                 reason=None,
                 payload_json={
-                    "display_text": "dispatch prompt",
+                    "display_text": display_text,
                     "operation_kind": "unit_test",
                     "execution_target": "target-dispatch",
                 },
@@ -1340,8 +1605,9 @@ def _append_user_input(
                 payload_digest=None,
             ),
         )
+        return event.row.event_sequence
 
-    transaction_runner.run_write(_operation)
+    return transaction_runner.run_write(_operation)
 
 
 def _pending_dispatch(seeded: _SeededRun) -> PendingDispatchRecord:

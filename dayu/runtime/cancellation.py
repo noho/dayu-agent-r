@@ -260,8 +260,9 @@ async def await_or_cancel_or_timeout(
         if token.is_cancelled():
             await _cancel_task_and_wait(target_task)
             return WaitCancelled(reason=token.cancel_reason())
+        elapsed_seconds = time.monotonic() - started_at
         await _cancel_task_and_wait(target_task)
-        return WaitTimedOut(elapsed_seconds=time.monotonic() - started_at)
+        return WaitTimedOut(elapsed_seconds=elapsed_seconds)
     except asyncio.CancelledError:
         await _cancel_task_and_wait(target_task)
         raise

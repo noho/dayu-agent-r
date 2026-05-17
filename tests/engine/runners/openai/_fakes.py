@@ -36,11 +36,14 @@ class FakeResponseSpec:
     :param headers: 响应头映射。
     :param body_chunks: 响应体字节切片序列；流式由多个 chunk 表达，
         非流式合并为单个 chunk。
+    :param read_exception: ``read()`` 抛出的异常；为 ``None`` 时正常返回
+        ``body_chunks`` 拼接结果。
     """
 
     status: int
     headers: Mapping[str, str]
     body_chunks: Sequence[bytes]
+    read_exception: BaseException | None = None
 
 
 @dataclass(slots=True)
@@ -72,6 +75,7 @@ class FakeResponse:
         self.status: int = spec.status
         self.headers: Mapping[str, str] = dict(spec.headers)
         self._body_chunks: list[bytes] = list(spec.body_chunks)
+        self._read_exception: BaseException | None = spec.read_exception
         self.content: FakeContent = FakeContent(deque(self._body_chunks))
         self.released: bool = False
 
@@ -79,8 +83,11 @@ class FakeResponse:
         """返回完整响应体字节串。
 
         :returns: 拼接后的字节串。
+        :raises BaseException: ``FakeResponseSpec.read_exception`` 存在时抛出。
         """
 
+        if self._read_exception is not None:
+            raise self._read_exception
         return b"".join(self._body_chunks)
 
     async def text(self) -> str:

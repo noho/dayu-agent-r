@@ -59,6 +59,10 @@ from dayu.engine.runners.openai.xml_tag_extractor import (
 _DONE_TOKEN: str = "[DONE]"
 _DATA_PREFIX: str = "data:"
 _LOGGER: logging.Logger = logging.getLogger(__name__)
+_ERROR_FIELD: str = "error"
+_ERROR_MESSAGE_FIELD: str = "message"
+_MISSING_CHOICES_CODE: str = "sse_missing_choices"
+_PROVIDER_ERROR_CODE: str = "sse_provider_error"
 _FINISH_REASON_MAP: dict[str, FinishReason] = {
     "stop": FinishReason.STOP,
     "length": FinishReason.LENGTH,
@@ -111,6 +115,23 @@ def _event_type_for(data: RunnerEventData) -> RunnerEventType:
             raise AssertionError(
                 f"unexpected event data type for SSE parser: {type(data)!r}"
             )
+
+
+def _provider_error_message(error_payload: JsonValue) -> str:
+    """从 provider error payload 中提取有界错误摘要。
+
+    :param error_payload: provider 返回的 ``error`` 字段。
+    :returns: 人类可读错误摘要。
+    :raises Exception: 不主动抛出异常。
+    """
+
+    if isinstance(error_payload, str) and error_payload.strip() != "":
+        return error_payload
+    if isinstance(error_payload, dict):
+        message = error_payload.get(_ERROR_MESSAGE_FIELD)
+        if isinstance(message, str) and message.strip() != "":
+            return message
+    return "SSE provider returned an error object"
 
 
 class SSEParser:
@@ -304,8 +325,59 @@ class SSEParser:
         :raises Exception: 不主动抛出异常。
         """
 
+        if _ERROR_FIELD in parsed:
+            _LOGGER.warning(
+                "sse.protocol_error code=%s", _PROVIDER_ERROR_CODE
+            )
+            self._terminated = True
+            yield _make_event(
+                RunnerProtocolErrorData(
+                    error_code=_PROVIDER_ERROR_CODE,
+                    message=_provider_error_message(parsed[_ERROR_FIELD]),
+                    provider_request_id=self._provider_request_id,
+                    raw_payload=dict(parsed),
+                    partial_tool_calls=self._aggregator.partial_summaries(),
+                )
+            )
+            yield _make_event(
+                RunnerDoneData(
+                    finish_reason=FinishReason.ERROR,
+                    provider_request_id=self._provider_request_id,
+                )
+            )
+            return
+
         choices = parsed.get("choices")
         usage = parsed.get("usage")
+        has_valid_choices = isinstance(choices, list) and len(choices) > 0
+        has_valid_usage = isinstance(usage, dict)
+        if not has_valid_choices and not has_valid_usage:
+            _LOGGER.warning(
+                "sse.protocol_error code=%s choices_type=%s usage_type=%s",
+                _MISSING_CHOICES_CODE,
+                type(choices).__name__,
+                type(usage).__name__,
+            )
+            self._terminated = True
+            yield _make_event(
+                RunnerProtocolErrorData(
+                    error_code=_MISSING_CHOICES_CODE,
+                    message=(
+                        "SSE data line must contain non-empty choices or "
+                        "valid usage"
+                    ),
+                    provider_request_id=self._provider_request_id,
+                    raw_payload=dict(parsed),
+                    partial_tool_calls=self._aggregator.partial_summaries(),
+                )
+            )
+            yield _make_event(
+                RunnerDoneData(
+                    finish_reason=FinishReason.ERROR,
+                    provider_request_id=self._provider_request_id,
+                )
+            )
+            return
         if isinstance(choices, list) and choices:
             for index, choice in enumerate(choices):
                 if not isinstance(choice, dict):
@@ -355,13 +427,15 @@ class SSEParser:
             tool_calls_delta = delta.get("tool_calls")
             if isinstance(tool_calls_delta, list):
                 self._tool_calls_seen = True
-                for position, raw in enumerate(tool_calls_delta):
+                position = 0
+                for raw in tool_calls_delta:
                     if not isinstance(raw, dict):
                         continue
                     typed_delta = self._coerce_tool_call_delta(raw)
                     resolved_index = self._aggregator.feed(
                         typed_delta, position=position
                     )
+                    position += 1
                     yield _make_event(
                         self._tool_call_delta_event(
                             typed_delta, resolved_index=resolved_index
@@ -372,6 +446,12 @@ class SSEParser:
             mapped = _FINISH_REASON_MAP.get(finish_reason)
             if mapped is not None:
                 self._finish_reason = mapped
+            else:
+                _LOGGER.warning(
+                    "sse.protocol_diagnostic code=unknown_finish_reason "
+                    "finish_reason=%s",
+                    finish_reason,
+                )
 
     def _coerce_tool_call_delta(
         self, raw: dict[str, JsonValue]
@@ -454,7 +534,13 @@ class SSEParser:
     async def _handle_usage(
         self, usage: dict[str, JsonValue]
     ) -> AsyncIterator[RunnerEvent]:
-        """处理 ``usage`` 字段。"""
+        """处理 ``usage`` 字段。
+
+        :param usage: provider 返回的 usage object。
+        :returns: usage 字段完整时产出 token 统计事件；字段格式错误时只记录
+            warning 并忽略该 usage，不终止 SSE 主事件流。
+        :raises Exception: 不主动抛出异常。
+        """
 
         prompt_tokens = usage.get("prompt_tokens")
         completion_tokens = usage.get("completion_tokens")
@@ -464,21 +550,13 @@ class SSEParser:
             or not isinstance(completion_tokens, int)
             or not isinstance(total_tokens, int)
         ):
-            yield _make_event(
-                RunnerProtocolErrorData(
-                    error_code="usage_field_malformed",
-                    message="usage fields are not all integers",
-                    provider_request_id=self._provider_request_id,
-                    raw_payload=None,
-                    partial_tool_calls=self._aggregator.partial_summaries(),
-                )
-            )
-            self._terminated = True
-            yield _make_event(
-                RunnerDoneData(
-                    finish_reason=FinishReason.ERROR,
-                    provider_request_id=self._provider_request_id,
-                )
+            _LOGGER.warning(
+                "sse.protocol_diagnostic code=usage_field_malformed "
+                "prompt_tokens_type=%s completion_tokens_type=%s "
+                "total_tokens_type=%s",
+                type(prompt_tokens).__name__,
+                type(completion_tokens).__name__,
+                type(total_tokens).__name__,
             )
             return
         normalized: _OpenAIUsage = {
@@ -542,10 +620,10 @@ class SSEParser:
                     finish_reason=self._finish_reason or FinishReason.STOP,
                 )
             )
-        finish = self._finish_reason or (
+        finish = (
             FinishReason.TOOL_CALLS
             if self._tool_calls_seen
-            else FinishReason.STOP
+            else self._finish_reason or FinishReason.STOP
         )
         self._terminated = True
         yield _make_event(

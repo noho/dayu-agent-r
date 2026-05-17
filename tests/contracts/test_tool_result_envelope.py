@@ -9,6 +9,8 @@ from __future__ import annotations
 
 import dataclasses
 
+import pytest
+
 from dayu.contracts.tool_result import (
     ToolResultFailure,
     ToolResultSuccess,
@@ -33,6 +35,19 @@ def test_failure_envelope_has_ok_false_and_error() -> None:
     assert f.ok is False
     assert isinstance(f, ToolResultFailure)
     assert not isinstance(f, ToolResultSuccess)
+
+
+def test_failure_envelope_rejects_empty_error_or_message() -> None:
+    """失败结果必须携带非空错误码与说明。"""
+
+    with pytest.raises(ValueError, match="error"):
+        ToolResultFailure(
+            ok=False, error="", message="x", hint=None, meta=None
+        )
+    with pytest.raises(ValueError, match="message"):
+        ToolResultFailure(
+            ok=False, error="E_X", message="  ", hint=None, meta=None
+        )
 
 
 def test_envelope_field_sets_do_not_contain_await_spec() -> None:

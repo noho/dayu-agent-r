@@ -32,6 +32,10 @@ from dayu.engine.contracts.messages import (
     UserMessage,
 )
 from dayu.engine.contracts.runner_spec import RunnerCallOptions, RunnerSpec
+from dayu.host._event_payload import (
+    payload_object as _payload_object,
+    required_payload_text as _required_payload_text,
+)
 from dayu.host.api import (
     AttemptDispatchSnapshot,
     AttemptStatus,
@@ -50,6 +54,8 @@ from dayu.host.durable.event_log import (
     EventLogRow,
     EventLogStore,
 )
+from dayu.host.durable.memory import write_memory_snapshot_with_checkpoint
+from dayu.host.durable.projection import read_projection_checkpoint
 from dayu.host.durable.liveness import (
     HostInstanceIdentity,
     register_current_instance,
@@ -72,12 +78,42 @@ from dayu.host.durable.state import (
 )
 from dayu.host.durable.errors import HostDurableError
 from dayu.host.durable.transaction import HostRow, HostTransaction, HostTransactionRunner
+from dayu.host.memory_repair import catch_up_conversation_memory_projection
 from dayu.host.run_input import (
+    DurableCurrentRunFactProvider,
+    DurableMemorySnapshotProvider,
+    MemoryProjectionRepairRequired,
+    NoopMemorySnapshotProvider,
     NoToolExecutor,
     PolicySnapshot,
     ToolExecutionMode,
     create_no_tool_run_input_builder,
     create_tool_enabled_run_input_builder,
+)
+from dayu.host.memory import (
+    CONVERSATION_MEMORY_CONSUMER_ID,
+    ConversationContinuityItem,
+    ConversationContinuityKind,
+    ConversationContinuityView,
+    ConversationMemorySnapshot,
+    HostNeutralRefKind,
+    MemoryClaimStatus,
+    MemoryDiagnosticReason,
+    MemoryIncludedReason,
+    MemoryProducerKind,
+    MemoryProjectionEvent,
+    MemoryProjectionPolicy,
+    MemoryProvenanceRef,
+    MemoryRepairReason,
+    MemorySizeUnits,
+    MemorySnapshotCursor,
+    OpaqueMemoryRef,
+    PinnedStateView,
+    VerifiedFactView,
+    WorkingAssumptionView,
+    build_conversation_memory_snapshot_from_events,
+    calculate_memory_snapshot_digest,
+    digest_memory_projection_policy,
 )
 from dayu.host.tool_runtime import (
     DefaultToolRuntimeFactory,
@@ -96,6 +132,8 @@ _NOW = datetime(2026, 5, 15, 1, 2, 3, tzinfo=UTC)
 _CALL_CONTEXT_DIGEST = sha256_digest_json({"context": "run-input-test"})
 _INPUT_DIGEST = sha256_digest_json({"input": "current"})
 _POLICY_REF = "policy-snapshot-p5-s2"
+_DIGEST_A = "sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+_DIGEST_B = "sha256:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"
 
 
 @dataclass(frozen=True, slots=True)
@@ -182,10 +220,10 @@ def test_build_is_deterministic_for_same_eventlog_and_policy(
         )
 
 
-def test_continuity_uses_event_sequence_and_ignores_non_canonical(
+def test_session_continuity_does_not_emit_unbudgeted_historical_raw_turns(
     tmp_path: Path,
 ) -> None:
-    """continuity provider 按 event_sequence 排序且不消费非 canonical 事件。"""
+    """SessionContinuityProvider 不再绕过 memory budget 注入历史 raw turns。"""
 
     with open_host_durable_store(_options(tmp_path)) as store:
         session_id = _ensure_session_id(store.transaction_runner)
@@ -231,8 +269,6 @@ def test_continuity_uses_event_sequence_and_ignores_non_canonical(
 
         assert contents == (
             _expected_system_content(),
-            "first question",
-            "first answer",
             "current question",
         )
 
@@ -383,6 +419,470 @@ def test_policy_snapshot_allows_tool_policy_for_tool_enabled() -> None:
     assert snapshot.agent_policy.allow_tool_calls is True
 
 
+def test_durable_memory_provider_uses_covered_snapshot(tmp_path: Path) -> None:
+    """cursor 已覆盖 required sequence 时直接使用 durable snapshot。"""
+
+    policy = _memory_policy()
+    with open_host_durable_store(_options(tmp_path)) as store:
+        session_id = _ensure_session_id(store.transaction_runner)
+        _append_rich_memory_source_events(store.transaction_runner, session_id)
+        seeded = _seed_current_run(
+            store,
+            session_id=session_id,
+            payload=_user_input_payload("current prompt"),
+        )
+        cursor = _required_memory_cursor(store.transaction_runner, seeded)
+        snapshot = _rich_memory_snapshot(session_id, policy, cursor)
+        _write_memory_snapshot(store.transaction_runner, snapshot)
+
+        request = _build_request_with_memory(store, seeded, policy)
+        current_facts = DurableCurrentRunFactProvider(
+            store.transaction_runner
+        ).load_current_run_facts(_attempt_snapshot(seeded))
+        memory_view = DurableMemorySnapshotProvider(
+            store.transaction_runner, policy
+        ).load_memory_snapshot(_attempt_snapshot(seeded), current_facts)
+        contents = tuple(_message_content(message) for message in request.messages)
+
+        assert contents[0] == _expected_system_content()
+        assert contents[1].startswith("Memory user goals and constraints:")
+        assert contents[2].startswith("Memory confirmed subjects and methodology:")
+        assert contents[3].startswith("Memory tool-verified facts:")
+        assert contents[4].startswith("Memory open questions and working assumptions:")
+        assert contents[5] == "recent raw user"
+        assert contents[6] == "recent assistant conclusion"
+        assert contents[7].startswith("Memory episode summaries:")
+        assert contents[-1] == "current prompt"
+        assert all("inline delta" not in content for content in contents)
+        assert all(
+            diagnostic.reason is not MemoryDiagnosticReason.INLINE_DELTA_REPAIR_INCLUDED
+            for diagnostic in memory_view.diagnostics
+        )
+
+
+def test_memory_provider_applies_stable_layer_budget(tmp_path: Path) -> None:
+    """stable layer 超预算时跳过 stable blocks 并保留 continuity 与当前 prompt。"""
+
+    policy = _memory_policy(stable_layer_size_units=24)
+    with open_host_durable_store(_options(tmp_path)) as store:
+        session_id = _ensure_session_id(store.transaction_runner)
+        _append_rich_memory_source_events(store.transaction_runner, session_id)
+        seeded = _seed_current_run(
+            store,
+            session_id=session_id,
+            payload=_user_input_payload("current prompt"),
+        )
+        cursor = _required_memory_cursor(store.transaction_runner, seeded)
+        snapshot = _rich_memory_snapshot(session_id, policy, cursor)
+        _write_memory_snapshot(store.transaction_runner, snapshot)
+
+        request = _build_request_with_memory(store, seeded, policy)
+        current_facts = DurableCurrentRunFactProvider(
+            store.transaction_runner
+        ).load_current_run_facts(_attempt_snapshot(seeded))
+        memory_view = DurableMemorySnapshotProvider(
+            store.transaction_runner, policy
+        ).load_memory_snapshot(_attempt_snapshot(seeded), current_facts)
+        contents = tuple(_message_content(message) for message in request.messages)
+
+        assert all(
+            not content.startswith("Memory tool-verified facts:")
+            for content in contents
+        )
+        assert "recent raw user" in contents
+        assert contents[-1] == "current prompt"
+        assert any(
+            diagnostic.reason is MemoryDiagnosticReason.BUDGET_LIMIT_REACHED
+            and diagnostic.item_id == "stable:verified_facts"
+            for diagnostic in memory_view.diagnostics
+        )
+
+
+def test_noop_memory_snapshot_provider_returns_empty_typed_view(
+    tmp_path: Path,
+) -> None:
+    """Noop memory provider 保持空 messages 并返回新增 typed 字段。"""
+
+    with open_host_durable_store(_options(tmp_path)) as store:
+        session_id = _ensure_session_id(store.transaction_runner)
+        seeded = _seed_current_run(
+            store,
+            session_id=session_id,
+            payload=_user_input_payload("current prompt"),
+        )
+        attempt_snapshot = _attempt_snapshot(seeded)
+        current_facts = DurableCurrentRunFactProvider(
+            store.transaction_runner
+        ).load_current_run_facts(attempt_snapshot)
+
+        view = NoopMemorySnapshotProvider().load_memory_snapshot(
+            snapshot=attempt_snapshot,
+            current_facts=current_facts,
+        )
+
+        assert view.messages == ()
+        assert view.memory_snapshot_cursor is None
+        assert view.policy_digest is None
+        assert view.diagnostics == ()
+
+
+def test_covered_memory_snapshot_filters_current_user_input(
+    tmp_path: Path,
+) -> None:
+    """covered snapshot 含当前 USER_INPUT_ACCEPTED 时不重复渲染当前 prompt。"""
+
+    policy = _memory_policy()
+    with open_host_durable_store(_options(tmp_path)) as store:
+        session_id = _ensure_session_id(store.transaction_runner)
+        seeded = _seed_current_run(
+            store,
+            session_id=session_id,
+            payload=_user_input_payload("current prompt"),
+        )
+        current_input = _read_event_by_id(
+            store.transaction_runner, "event-current-input"
+        )
+        cursor = _required_memory_cursor(store.transaction_runner, seeded)
+        snapshot = _current_input_memory_snapshot(
+            session_id=session_id,
+            policy=policy,
+            cursor=cursor,
+            current_input=current_input,
+            current_prompt="current prompt",
+        )
+        _write_memory_snapshot(store.transaction_runner, snapshot)
+
+        request = _build_request_with_memory(store, seeded, policy)
+        contents = tuple(_message_content(message) for message in request.messages)
+
+        assert contents[-1] == "current prompt"
+        assert _message_occurrences(contents, "current prompt") == 1
+
+
+def test_inline_delta_filters_current_user_input(tmp_path: Path) -> None:
+    """inline delta 含当前 USER_INPUT_ACCEPTED 时不重复渲染当前 prompt。"""
+
+    policy = _memory_policy(max_lag_events_for_inline_delta=16)
+    with open_host_durable_store(_options(tmp_path)) as store:
+        session_id = _ensure_session_id(store.transaction_runner)
+        seeded = _seed_current_run(
+            store,
+            session_id=session_id,
+            payload=_user_input_payload("current prompt"),
+        )
+        snapshot = build_conversation_memory_snapshot_from_events(
+            events=(),
+            session_id=session_id,
+            consumer_id=CONVERSATION_MEMORY_CONSUMER_ID,
+            policy=policy,
+            built_at="2026-05-15T01:02:03.000000Z",
+        )
+        _write_memory_snapshot(store.transaction_runner, snapshot)
+
+        request = _build_request_with_memory(store, seeded, policy)
+        contents = tuple(_message_content(message) for message in request.messages)
+
+        assert contents[-1] == "current prompt"
+        assert _message_occurrences(contents, "current prompt") == 1
+
+
+def test_inline_delta_applies_stable_layer_budget(tmp_path: Path) -> None:
+    """inline delta 修复后的 stable blocks 仍受 stable layer budget 约束。"""
+
+    policy = _memory_policy(
+        max_lag_events_for_inline_delta=16,
+        stable_layer_size_units=24,
+    )
+    with open_host_durable_store(_options(tmp_path)) as store:
+        session_id = _ensure_session_id(store.transaction_runner)
+        _append_rich_memory_source_events(store.transaction_runner, session_id)
+        snapshot = build_conversation_memory_snapshot_from_events(
+            events=(),
+            session_id=session_id,
+            consumer_id=CONVERSATION_MEMORY_CONSUMER_ID,
+            policy=policy,
+            built_at="2026-05-15T01:02:03.000000Z",
+        )
+        _write_memory_snapshot(store.transaction_runner, snapshot)
+        seeded = _seed_current_run(
+            store,
+            session_id=session_id,
+            payload=_user_input_payload("current prompt"),
+        )
+
+        current_facts = DurableCurrentRunFactProvider(
+            store.transaction_runner
+        ).load_current_run_facts(_attempt_snapshot(seeded))
+        memory_view = DurableMemorySnapshotProvider(
+            store.transaction_runner, policy
+        ).load_memory_snapshot(_attempt_snapshot(seeded), current_facts)
+
+        assert any(
+            diagnostic.reason is MemoryDiagnosticReason.INLINE_DELTA_REPAIR_INCLUDED
+            for diagnostic in memory_view.diagnostics
+        )
+        assert any(
+            diagnostic.reason is MemoryDiagnosticReason.BUDGET_LIMIT_REACHED
+            and diagnostic.item_id == "stable:verified_facts"
+            for diagnostic in memory_view.diagnostics
+        )
+
+
+def test_missing_memory_snapshot_raises_repair_without_state_mutation(
+    tmp_path: Path,
+) -> None:
+    """snapshot 缺失时进入 repair-required，且不改 Run / Attempt / EventLog。"""
+
+    policy = _memory_policy()
+    with open_host_durable_store(_options(tmp_path)) as store:
+        session_id = _ensure_session_id(store.transaction_runner)
+        _append_rich_memory_source_events(store.transaction_runner, session_id)
+        seeded = _seed_current_run(
+            store,
+            session_id=session_id,
+            payload=_user_input_payload("current prompt"),
+        )
+        before = _run_attempt_eventlog_state(store.transaction_runner, seeded)
+
+        with pytest.raises(MemoryProjectionRepairRequired) as exc_info:
+            _build_request_with_memory(store, seeded, policy)
+
+        after = _run_attempt_eventlog_state(store.transaction_runner, seeded)
+        assert exc_info.value.repair_request.reason is MemoryRepairReason.SNAPSHOT_MISSING
+        assert after == before
+
+
+def test_damaged_memory_snapshot_raises_repair_required(tmp_path: Path) -> None:
+    """snapshot digest 损坏时进入结构化 repair-required。"""
+
+    policy = _memory_policy()
+    with open_host_durable_store(_options(tmp_path)) as store:
+        session_id = _ensure_session_id(store.transaction_runner)
+        _append_rich_memory_source_events(store.transaction_runner, session_id)
+        seeded = _seed_current_run(
+            store,
+            session_id=session_id,
+            payload=_user_input_payload("current prompt"),
+        )
+        cursor = _required_memory_cursor(store.transaction_runner, seeded)
+        snapshot = _rich_memory_snapshot(session_id, policy, cursor)
+        _write_memory_snapshot(store.transaction_runner, snapshot)
+        _damage_memory_snapshot_json(store.transaction_runner, snapshot.snapshot_id)
+
+        with pytest.raises(MemoryProjectionRepairRequired) as exc_info:
+            _build_request_with_memory(store, seeded, policy)
+
+        assert exc_info.value.repair_request.reason is MemoryRepairReason.SNAPSHOT_DAMAGED
+
+
+def test_small_memory_lag_repairs_inline_without_checkpoint_advance(
+    tmp_path: Path,
+) -> None:
+    """小滞后从 EventLog delta 临时补齐，并且不推进 projection checkpoint。"""
+
+    policy = _memory_policy()
+    with open_host_durable_store(_options(tmp_path)) as store:
+        session_id = _ensure_session_id(store.transaction_runner)
+        prior_event = _append_prior_user_event(
+            store.transaction_runner,
+            session_id=session_id,
+            run_id="run-prior-memory",
+            event_id="event-prior-memory-input",
+            text="prior memory prompt",
+        )
+        snapshot = build_conversation_memory_snapshot_from_events(
+            events=(
+                _memory_projection_event_from_test_row(prior_event),
+            ),
+            session_id=session_id,
+            consumer_id=CONVERSATION_MEMORY_CONSUMER_ID,
+            policy=policy,
+            built_at="2026-05-15T01:02:03.000000Z",
+        )
+        _write_memory_snapshot(store.transaction_runner, snapshot)
+        seeded = _seed_current_run(
+            store,
+            session_id=session_id,
+            payload=_user_input_payload("current prompt"),
+        )
+
+        request = _build_request_with_memory(store, seeded, policy)
+        current_facts = DurableCurrentRunFactProvider(
+            store.transaction_runner
+        ).load_current_run_facts(_attempt_snapshot(seeded))
+        memory_view = DurableMemorySnapshotProvider(
+            store.transaction_runner, policy
+        ).load_memory_snapshot(_attempt_snapshot(seeded), current_facts)
+        checkpoint = _read_memory_checkpoint_sequence(store.transaction_runner)
+        contents = tuple(_message_content(message) for message in request.messages)
+
+        assert checkpoint == prior_event.event_sequence
+        assert any(
+            diagnostic.reason is MemoryDiagnosticReason.INLINE_DELTA_REPAIR_INCLUDED
+            for diagnostic in memory_view.diagnostics
+        )
+        assert "current prompt" in contents[-1]
+        assert any("current_goal=prior memory prompt" in content for content in contents)
+
+
+def test_over_threshold_memory_lag_raises_repair_required(
+    tmp_path: Path,
+) -> None:
+    """超过 inline threshold 的 snapshot lag 进入 repair-required。"""
+
+    policy = _memory_policy(max_lag_events_for_inline_delta=0)
+    with open_host_durable_store(_options(tmp_path)) as store:
+        session_id = _ensure_session_id(store.transaction_runner)
+        _append_rich_memory_source_events(store.transaction_runner, session_id)
+        seeded = _seed_current_run(
+            store,
+            session_id=session_id,
+            payload=_user_input_payload("current prompt"),
+        )
+        snapshot = _rich_memory_snapshot(
+            session_id,
+            policy,
+            MemorySnapshotCursor(
+                consumer_id=CONVERSATION_MEMORY_CONSUMER_ID,
+                checkpoint_event_sequence=0,
+                checkpoint_event_id=None,
+                session_id=session_id,
+            ),
+        )
+        _write_memory_snapshot(store.transaction_runner, snapshot)
+
+        with pytest.raises(MemoryProjectionRepairRequired) as exc_info:
+            _build_request_with_memory(store, seeded, policy)
+
+        assert (
+            exc_info.value.repair_request.reason
+            is MemoryRepairReason.SNAPSHOT_LAG_OVER_THRESHOLD
+        )
+
+
+def test_only_future_memory_snapshot_raises_missing_repair_required(
+    tmp_path: Path,
+) -> None:
+    """只有未来 snapshot 时不得注入未来 memory。"""
+
+    policy = _memory_policy()
+    with open_host_durable_store(_options(tmp_path)) as store:
+        session_id = _ensure_session_id(store.transaction_runner)
+        seeded = _seed_current_run(
+            store,
+            session_id=session_id,
+            payload=_user_input_payload("current prompt"),
+        )
+        future_event = _append_prior_user_event(
+            store.transaction_runner,
+            session_id=session_id,
+            run_id="run-future-memory",
+            event_id="event-future-memory-input",
+            text="future prompt must not leak",
+        )
+        snapshot = build_conversation_memory_snapshot_from_events(
+            events=(
+                _memory_projection_event_from_test_row(future_event),
+            ),
+            session_id=session_id,
+            consumer_id=CONVERSATION_MEMORY_CONSUMER_ID,
+            policy=policy,
+            built_at="2026-05-15T01:02:03.000000Z",
+        )
+        _write_memory_snapshot(store.transaction_runner, snapshot)
+
+        with pytest.raises(MemoryProjectionRepairRequired) as exc_info:
+            _build_request_with_memory(store, seeded, policy)
+
+        assert (
+            exc_info.value.repair_request.reason
+            is MemoryRepairReason.SNAPSHOT_MISSING
+        )
+
+
+def test_memory_provider_uses_latest_snapshot_before_required_cursor(
+    tmp_path: Path,
+) -> None:
+    """同一 Session 有 queued future input 时读取 required cursor 前的 snapshot。"""
+
+    policy = _memory_policy()
+    with open_host_durable_store(_options(tmp_path)) as store:
+        session_id = _ensure_session_id(store.transaction_runner)
+        prior_event = _append_prior_user_event(
+            store.transaction_runner,
+            session_id=session_id,
+            run_id="run-prior-memory",
+            event_id="event-prior-memory-input",
+            text="prior prompt should be visible",
+        )
+        seeded = _seed_current_run(
+            store,
+            session_id=session_id,
+            payload=_user_input_payload("current prompt"),
+        )
+        future_event = _append_prior_user_event(
+            store.transaction_runner,
+            session_id=session_id,
+            run_id="run-future-memory",
+            event_id="event-future-memory-input",
+            text="future prompt must not leak",
+        )
+        del prior_event, future_event
+        required_cursor = _required_memory_cursor(store.transaction_runner, seeded)
+        catch_up_conversation_memory_projection(
+            store.transaction_runner,
+            policy=policy,
+            batch_size=16,
+            max_event_sequence=required_cursor.checkpoint_event_sequence,
+        )
+
+        request = _build_request_with_memory(store, seeded, policy)
+        contents = tuple(_message_content(message) for message in request.messages)
+
+        assert "prior prompt should be visible" in contents
+        assert "future prompt must not leak" not in contents
+        assert contents[-1] == "current prompt"
+
+
+def test_memory_messages_are_stable_for_same_eventlog_and_policy(
+    tmp_path: Path,
+) -> None:
+    """同一 EventLog 与同一 memory policy 生成稳定 memory messages。"""
+
+    policy = _memory_policy()
+    with open_host_durable_store(_options(tmp_path)) as store:
+        session_id = _ensure_session_id(store.transaction_runner)
+        prior_event = _append_prior_user_event(
+            store.transaction_runner,
+            session_id=session_id,
+            run_id="run-prior-memory",
+            event_id="event-prior-memory-input",
+            text="prior memory prompt",
+        )
+        snapshot = build_conversation_memory_snapshot_from_events(
+            events=(
+                _memory_projection_event_from_test_row(prior_event),
+            ),
+            session_id=session_id,
+            consumer_id=CONVERSATION_MEMORY_CONSUMER_ID,
+            policy=policy,
+            built_at="2026-05-15T01:02:03.000000Z",
+        )
+        _write_memory_snapshot(store.transaction_runner, snapshot)
+        seeded = _seed_current_run(
+            store,
+            session_id=session_id,
+            payload=_user_input_payload("current prompt"),
+        )
+
+        first = _build_request_with_memory(store, seeded, policy)
+        second = _build_request_with_memory(store, seeded, policy)
+
+        assert tuple(_message_content(message) for message in first.messages) == tuple(
+            _message_content(message) for message in second.messages
+        )
+
+
 @pytest.mark.parametrize(
     ("run_status", "attempt_status", "dispatch_status", "message"),
     (
@@ -432,6 +932,606 @@ def test_current_facts_reject_non_dispatchable_snapshot_state(
 
         with pytest.raises(HostDurableError, match=message):
             _build_request(store, seeded)
+
+
+def _memory_policy(
+    *,
+    max_lag_events_for_inline_delta: int = 4,
+    history_pool_size_units: int = 4096,
+    stable_layer_size_units: int = 2048,
+) -> MemoryProjectionPolicy:
+    """构造 RunInputBuilder memory provider 测试 policy。
+
+    :param max_lag_events_for_inline_delta: inline repair 最大滞后事件数。
+    :param history_pool_size_units: history pool 尺寸。
+    :param stable_layer_size_units: stable layer 尺寸。
+    :returns: memory projection policy。
+    """
+
+    return MemoryProjectionPolicy(
+        max_pinned_items=8,
+        max_verified_facts=16,
+        max_working_assumptions=8,
+        recent_raw_turns_floor=2,
+        max_raw_turn_size_units=1024,
+        history_pool_size_units=history_pool_size_units,
+        stable_layer_size_units=stable_layer_size_units,
+        max_lag_events_for_inline_delta=max_lag_events_for_inline_delta,
+        max_delta_repair_events=16,
+    )
+
+
+def _build_request_with_memory(
+    store: HostDurableStore,
+    seeded: _SeededRun,
+    policy: MemoryProjectionPolicy,
+) -> AgentRunRequest:
+    """通过 durable memory provider 构造 AgentRunRequest。
+
+    :param store: Host durable store。
+    :param seeded: seeded Run 引用。
+    :param policy: memory projection policy。
+    :returns: AgentRunRequest。
+    """
+
+    provider = DurableMemorySnapshotProvider(store.transaction_runner, policy)
+    builder = create_no_tool_run_input_builder(
+        transaction_runner=store.transaction_runner,
+        policy_snapshot=_policy_snapshot(),
+        memory_snapshot_provider=provider,
+    )
+    return builder.build(_attempt_snapshot(seeded))
+
+
+def _required_memory_cursor(
+    transaction_runner: HostTransactionRunner, seeded: _SeededRun
+) -> MemorySnapshotCursor:
+    """读取当前 Attempt 所需 memory cursor。
+
+    :param transaction_runner: Host transaction runner。
+    :param seeded: seeded Run 引用。
+    :returns: required memory cursor。
+    """
+
+    def operation(transaction: HostTransaction) -> MemorySnapshotCursor:
+        """读取 ATTEMPT_STARTED 前一条 EventLog row。
+
+        :param transaction: Host transaction。
+        :returns: memory cursor。
+        """
+
+        started = EventLogStore().read_event_by_id(
+            transaction, "event-attempt-started-current"
+        )
+        assert started is not None
+        required_sequence = started.event_sequence - 1
+        row = transaction.fetchone(
+            """
+            SELECT event_id
+            FROM event_log
+            WHERE event_sequence = ?
+            """,
+            (required_sequence,),
+        )
+        assert row is not None
+        event_id = row.get("event_id")
+        assert isinstance(event_id, str)
+        return MemorySnapshotCursor(
+            consumer_id=CONVERSATION_MEMORY_CONSUMER_ID,
+            checkpoint_event_sequence=required_sequence,
+            checkpoint_event_id=event_id,
+            session_id=seeded.session_id,
+        )
+
+    return transaction_runner.run_read(operation)
+
+
+def _rich_memory_snapshot(
+    session_id: str,
+    policy: MemoryProjectionPolicy,
+    cursor: MemorySnapshotCursor,
+) -> ConversationMemorySnapshot:
+    """构造覆盖所有 memory message 分组的 snapshot。
+
+    :param session_id: Session id。
+    :param policy: memory projection policy。
+    :param cursor: snapshot cursor。
+    :returns: memory snapshot。
+    """
+
+    policy_digest = digest_memory_projection_policy(policy)
+    snapshot_without_digest = ConversationMemorySnapshot(
+        snapshot_id=f"memory-snapshot-test-{session_id}",
+        session_id=session_id,
+        cursor=cursor,
+        policy_digest=policy_digest,
+        pinned_state=PinnedStateView(
+            current_goal="compare revenue quality",
+            confirmed_subjects=(
+                OpaqueMemoryRef(
+                    ref_kind=HostNeutralRefKind.SUBJECT,
+                    ref_id="subject:alpha",
+                    digest=_DIGEST_A,
+                ),
+            ),
+            user_constraints=("use reported currency",),
+            open_questions=("what changed in margin?",),
+        ),
+        verified_facts=(
+            VerifiedFactView(
+                item_id="memory-item:verified:test",
+                fact_summary="tool verified revenue increased",
+                claim_status=MemoryClaimStatus.TOOL_VERIFIED,
+                provenance=MemoryProvenanceRef(
+                    producer_kind=MemoryProducerKind.TOOL,
+                    producer_name="filing.lookup",
+                    event_id="event-memory-tool",
+                    event_sequence=1,
+                    run_id="run-memory",
+                    attempt_id="attempt-memory",
+                    execution_id="execution-memory",
+                    tool_result_ref="event-memory-tool",
+                    payload_ref="payload-memory-tool",
+                    digest_ref=_DIGEST_A,
+                    source_refs=(),
+                ),
+                evidence_anchor=None,
+                subject_refs=(),
+                included_reason=MemoryIncludedReason.TOOL_VERIFIED_FACT,
+                excluded_reason=None,
+                size_units=MemorySizeUnits(31),
+            ),
+        ),
+        working_assumptions=(
+            WorkingAssumptionView(
+                item_id="memory-item:assumption:test",
+                assumption_summary="margin mix may have shifted",
+                claim_status=MemoryClaimStatus.ASSUMPTION,
+                producer_kind=MemoryProducerKind.USER,
+                event_id="event-memory-assumption",
+                event_sequence=2,
+                run_id="run-memory",
+                subject_refs=(),
+                included_reason=MemoryIncludedReason.WORKING_ASSUMPTION,
+                excluded_reason=None,
+                size_units=MemorySizeUnits(27),
+            ),
+        ),
+        conversation_continuity=ConversationContinuityView(
+            items=(
+                ConversationContinuityItem(
+                    item_id="memory-item:raw-user:test",
+                    item_kind=ConversationContinuityKind.RAW_USER_TURN,
+                    producer_kind=MemoryProducerKind.USER,
+                    claim_status=MemoryClaimStatus.ASSUMPTION,
+                    event_id="event-memory-raw-user",
+                    event_sequence=3,
+                    run_id="run-memory",
+                    summary_text="recent raw user",
+                    payload_ref=None,
+                    payload_digest=None,
+                    included_reason=MemoryIncludedReason.RECENT_RAW_TURN,
+                    excluded_reason=None,
+                    size_units=MemorySizeUnits(15),
+                ),
+                ConversationContinuityItem(
+                    item_id="memory-item:assistant:test",
+                    item_kind=ConversationContinuityKind.ASSISTANT_CONCLUSION,
+                    producer_kind=MemoryProducerKind.ASSISTANT,
+                    claim_status=MemoryClaimStatus.ASSUMPTION,
+                    event_id="event-memory-assistant",
+                    event_sequence=4,
+                    run_id="run-memory",
+                    summary_text="recent assistant conclusion",
+                    payload_ref=None,
+                    payload_digest=None,
+                    included_reason=MemoryIncludedReason.RECENT_RAW_TURN,
+                    excluded_reason=None,
+                    size_units=MemorySizeUnits(27),
+                ),
+                ConversationContinuityItem(
+                    item_id="memory-item:episode:test",
+                    item_kind=ConversationContinuityKind.EPISODE_SUMMARY,
+                    producer_kind=MemoryProducerKind.HOST_PROJECTION,
+                    claim_status=MemoryClaimStatus.ASSUMPTION,
+                    event_id="event-memory-episode",
+                    event_sequence=5,
+                    run_id=None,
+                    summary_text="episode navigation only",
+                    payload_ref=None,
+                    payload_digest=None,
+                    included_reason=MemoryIncludedReason.EPISODE_SUMMARY,
+                    excluded_reason=None,
+                    size_units=MemorySizeUnits(23),
+                ),
+            )
+        ),
+        diagnostics=(),
+        built_at="2026-05-15T01:02:03.000000Z",
+        snapshot_digest="pending",
+    )
+    return ConversationMemorySnapshot(
+        snapshot_id=snapshot_without_digest.snapshot_id,
+        session_id=snapshot_without_digest.session_id,
+        cursor=snapshot_without_digest.cursor,
+        policy_digest=snapshot_without_digest.policy_digest,
+        pinned_state=snapshot_without_digest.pinned_state,
+        verified_facts=snapshot_without_digest.verified_facts,
+        working_assumptions=snapshot_without_digest.working_assumptions,
+        conversation_continuity=snapshot_without_digest.conversation_continuity,
+        diagnostics=snapshot_without_digest.diagnostics,
+        built_at=snapshot_without_digest.built_at,
+        snapshot_digest=calculate_memory_snapshot_digest(snapshot_without_digest),
+    )
+
+
+def _current_input_memory_snapshot(
+    *,
+    session_id: str,
+    policy: MemoryProjectionPolicy,
+    cursor: MemorySnapshotCursor,
+    current_input: EventLogRow,
+    current_prompt: str,
+) -> ConversationMemorySnapshot:
+    """构造包含当前用户输入的测试 memory snapshot。
+
+    :param session_id: Session id。
+    :param policy: memory projection policy。
+    :param cursor: snapshot cursor。
+    :param current_input: 当前 USER_INPUT_ACCEPTED event。
+    :param current_prompt: 当前 prompt 文本。
+    :returns: memory snapshot。
+    """
+
+    policy_digest = digest_memory_projection_policy(policy)
+    snapshot_without_digest = ConversationMemorySnapshot(
+        snapshot_id=f"memory-snapshot-current-{session_id}",
+        session_id=session_id,
+        cursor=cursor,
+        policy_digest=policy_digest,
+        pinned_state=PinnedStateView(
+            current_goal=current_prompt,
+            confirmed_subjects=(),
+            user_constraints=(current_prompt,),
+            open_questions=(),
+        ),
+        verified_facts=(),
+        working_assumptions=(),
+        conversation_continuity=ConversationContinuityView(
+            items=(
+                ConversationContinuityItem(
+                    item_id="memory-item:raw-user:current",
+                    item_kind=ConversationContinuityKind.RAW_USER_TURN,
+                    producer_kind=MemoryProducerKind.USER,
+                    claim_status=MemoryClaimStatus.ASSUMPTION,
+                    event_id=current_input.event_id,
+                    event_sequence=current_input.event_sequence,
+                    run_id=current_input.run_id,
+                    summary_text=current_prompt,
+                    payload_ref=None,
+                    payload_digest=None,
+                    included_reason=MemoryIncludedReason.RECENT_RAW_TURN,
+                    excluded_reason=None,
+                    size_units=MemorySizeUnits(len(current_prompt)),
+                ),
+            )
+        ),
+        diagnostics=(),
+        built_at="2026-05-15T01:02:03.000000Z",
+        snapshot_digest="pending",
+    )
+    return ConversationMemorySnapshot(
+        snapshot_id=snapshot_without_digest.snapshot_id,
+        session_id=snapshot_without_digest.session_id,
+        cursor=snapshot_without_digest.cursor,
+        policy_digest=snapshot_without_digest.policy_digest,
+        pinned_state=snapshot_without_digest.pinned_state,
+        verified_facts=snapshot_without_digest.verified_facts,
+        working_assumptions=snapshot_without_digest.working_assumptions,
+        conversation_continuity=snapshot_without_digest.conversation_continuity,
+        diagnostics=snapshot_without_digest.diagnostics,
+        built_at=snapshot_without_digest.built_at,
+        snapshot_digest=calculate_memory_snapshot_digest(snapshot_without_digest),
+    )
+
+
+def _write_memory_snapshot(
+    transaction_runner: HostTransactionRunner,
+    snapshot: ConversationMemorySnapshot,
+) -> None:
+    """写入 memory snapshot 与 projection checkpoint。
+
+    :param transaction_runner: Host transaction runner。
+    :param snapshot: memory snapshot。
+    :returns: ``None``。
+    """
+
+    transaction_runner.run_write(
+        lambda transaction: write_memory_snapshot_with_checkpoint(
+            transaction,
+            snapshot,
+            now="2026-05-15T01:02:03.000000Z",
+        )
+    )
+
+
+def _append_rich_memory_source_events(
+    transaction_runner: HostTransactionRunner, session_id: str
+) -> None:
+    """追加 rich snapshot item 需要引用的 EventLog rows。
+
+    :param transaction_runner: Host transaction runner。
+    :param session_id: Session id。
+    :returns: ``None``。
+    """
+
+    def operation(transaction: HostTransaction) -> None:
+        """追加 source events。
+
+        :param transaction: Host transaction。
+        :returns: ``None``。
+        """
+
+        EventLogStore().append_event(
+            transaction,
+            _event_request(
+                event_id="event-memory-tool",
+                event_class=EventClass.CANONICAL_FACT,
+                session_id=session_id,
+                run_id="run-memory",
+                event_type="TOOL_RESULT_ACCEPTED",
+                payload={
+                    "tool_name": "filing.lookup",
+                    "tool_call_id": "call-memory",
+                    "tool_fact_kind": "completed",
+                    "fact_summary": "tool verified revenue increased",
+                    "outcome_digest": _DIGEST_A,
+                    "payload_digest": _DIGEST_B,
+                },
+            ),
+        )
+        EventLogStore().append_event(
+            transaction,
+            _event_request(
+                event_id="event-memory-assumption",
+                event_class=EventClass.CANONICAL_FACT,
+                session_id=session_id,
+                run_id="run-memory",
+                event_type="USER_INPUT_ACCEPTED",
+                payload=_user_input_payload("margin mix may have shifted"),
+            ),
+        )
+        EventLogStore().append_event(
+            transaction,
+            _event_request(
+                event_id="event-memory-raw-user",
+                event_class=EventClass.CANONICAL_FACT,
+                session_id=session_id,
+                run_id="run-memory",
+                event_type="USER_INPUT_ACCEPTED",
+                payload=_user_input_payload("recent raw user"),
+            ),
+        )
+        EventLogStore().append_event(
+            transaction,
+            _event_request(
+                event_id="event-memory-assistant",
+                event_class=EventClass.CANONICAL_FACT,
+                session_id=session_id,
+                run_id="run-memory",
+                event_type="RUN_SUCCEEDED",
+                payload={"final_answer": "recent assistant conclusion"},
+            ),
+        )
+        EventLogStore().append_event(
+            transaction,
+            _event_request(
+                event_id="event-memory-episode",
+                event_class=EventClass.CANONICAL_FACT,
+                session_id=session_id,
+                run_id="run-memory",
+                event_type="EPISODE_SUMMARY_ACCEPTED",
+                payload={"summary_text": "episode navigation only"},
+            ),
+        )
+
+    transaction_runner.run_write(operation)
+
+
+def _read_event_by_id(
+    transaction_runner: HostTransactionRunner, event_id: str
+) -> EventLogRow:
+    """按 event id 读取测试 EventLog row。
+
+    :param transaction_runner: Host transaction runner。
+    :param event_id: event id。
+    :returns: EventLog row。
+    """
+
+    def operation(transaction: HostTransaction) -> EventLogRow:
+        """读取 EventLog row。
+
+        :param transaction: Host transaction。
+        :returns: EventLog row。
+        """
+
+        row = EventLogStore().read_event_by_id(transaction, event_id)
+        assert row is not None
+        return row
+
+    return transaction_runner.run_read(operation)
+
+
+def _message_occurrences(contents: tuple[str, ...], needle: str) -> int:
+    """统计消息内容中包含指定文本的条数。
+
+    :param contents: message content 元组。
+    :param needle: 目标文本。
+    :returns: 出现次数。
+    """
+
+    return sum(1 for content in contents if needle in content)
+
+
+def _damage_memory_snapshot_json(
+    transaction_runner: HostTransactionRunner, snapshot_id: str
+) -> None:
+    """破坏 durable snapshot JSON 内的 digest。
+
+    :param transaction_runner: Host transaction runner。
+    :param snapshot_id: snapshot id。
+    :returns: ``None``。
+    """
+
+    def operation(transaction: HostTransaction) -> None:
+        """执行 JSON digest 破坏。
+
+        :param transaction: Host transaction。
+        :returns: ``None``。
+        """
+
+        row = transaction.fetchone(
+            "SELECT snapshot_json FROM host_memory_snapshots WHERE snapshot_id = ?",
+            (snapshot_id,),
+        )
+        assert row is not None
+        snapshot_json = row.get("snapshot_json")
+        assert isinstance(snapshot_json, str)
+        damaged = snapshot_json.replace("sha256:", "sha256-damaged:", 1)
+        transaction.execute(
+            "UPDATE host_memory_snapshots SET snapshot_json = ? WHERE snapshot_id = ?",
+            (damaged, snapshot_id),
+        )
+
+    transaction_runner.run_write(operation)
+
+
+def _run_attempt_eventlog_state(
+    transaction_runner: HostTransactionRunner, seeded: _SeededRun
+) -> tuple[str, str, int]:
+    """读取 Run / Attempt 状态与 EventLog row 数。
+
+    :param transaction_runner: Host transaction runner。
+    :param seeded: seeded Run 引用。
+    :returns: run status、attempt status 与 EventLog row 数。
+    """
+
+    def operation(transaction: HostTransaction) -> tuple[str, str, int]:
+        """读取状态快照。
+
+        :param transaction: Host transaction。
+        :returns: 状态快照。
+        """
+
+        run = transaction.fetchone(
+            "SELECT status FROM host_runs WHERE run_id = ?",
+            (seeded.run_id,),
+        )
+        attempt = transaction.fetchone(
+            "SELECT status FROM host_attempts WHERE attempt_id = ?",
+            (seeded.attempt_id,),
+        )
+        total = transaction.fetchone("SELECT COUNT(*) AS total FROM event_log")
+        assert run is not None
+        assert attempt is not None
+        assert total is not None
+        run_status = run.get("status")
+        attempt_status = attempt.get("status")
+        eventlog_count = total.get("total")
+        assert isinstance(run_status, str)
+        assert isinstance(attempt_status, str)
+        assert isinstance(eventlog_count, int)
+        return run_status, attempt_status, eventlog_count
+
+    return transaction_runner.run_read(operation)
+
+
+def _append_prior_user_event(
+    transaction_runner: HostTransactionRunner,
+    *,
+    session_id: str,
+    run_id: str,
+    event_id: str,
+    text: str,
+) -> EventLogRow:
+    """追加并返回历史 USER_INPUT_ACCEPTED event。
+
+    :param transaction_runner: Host transaction runner。
+    :param session_id: Session id。
+    :param run_id: Run id。
+    :param event_id: event id。
+    :param text: 用户文本。
+    :returns: EventLog row。
+    """
+
+    return transaction_runner.run_write(
+        lambda transaction: _append_user_input_tx(
+            transaction,
+            session_id=session_id,
+            run_id=run_id,
+            event_id=event_id,
+            payload=_user_input_payload(text),
+            event_class=EventClass.CANONICAL_FACT,
+        )
+    )
+
+
+def _memory_projection_event_from_test_row(row: EventLogRow) -> MemoryProjectionEvent:
+    """把测试 EventLog row 转成 memory projection event。
+
+    :param row: EventLog row。
+    :returns: MemoryProjectionEvent。
+    """
+
+    return MemoryProjectionEvent(
+        event_sequence=row.event_sequence,
+        event_id=row.event_id,
+        event_class=row.event_class.value,
+        event_type=row.event_type,
+        session_id=row.session_id,
+        run_id=row.run_id,
+        attempt_id=row.attempt_id,
+        execution_id=row.execution_id,
+        occurred_at=row.occurred_at,
+        payload_ref=row.payload_ref,
+        payload_digest=row.payload_digest,
+        payload={"display_text": _message_text_from_user_event(row)},
+    )
+
+
+def _message_text_from_user_event(row: EventLogRow) -> str:
+    """从测试 USER_INPUT_ACCEPTED row 读取 display text。
+
+    :param row: EventLog row。
+    :returns: display text。
+    """
+
+    return _required_payload_text(_payload_object(row), field_name="display_text")
+
+
+def _read_memory_checkpoint_sequence(
+    transaction_runner: HostTransactionRunner,
+) -> int:
+    """读取 memory projection checkpoint sequence。
+
+    :param transaction_runner: Host transaction runner。
+    :returns: checkpoint sequence。
+    """
+
+    def operation(transaction: HostTransaction) -> int:
+        """读取 checkpoint row。
+
+        :param transaction: Host transaction。
+        :returns: checkpoint sequence。
+        """
+
+        checkpoint = read_projection_checkpoint(
+            transaction, CONVERSATION_MEMORY_CONSUMER_ID
+        )
+        assert checkpoint is not None
+        return checkpoint.checkpoint_event_sequence
+
+    return transaction_runner.run_read(operation)
 
 
 def _options(tmp_path: Path) -> HostDurableStoreOptions:

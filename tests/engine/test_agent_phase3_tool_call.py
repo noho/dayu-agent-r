@@ -992,6 +992,48 @@ async def test_tool_call_iteration_preserves_streamed_content_delta() -> None:
 
 
 @pytest.mark.asyncio
+async def test_tool_call_iteration_empty_tool_content_falls_back_to_completed_content() -> None:
+    """tool_calls content 为空字符串时保留已完成正文。"""
+
+    executor = _RecordingToolExecutor(outcomes={"tc_1": _success({"sum": 5})})
+    runner = _ScriptedRunner(
+        scripts=(
+            (
+                _event(
+                    RunnerEventType.RUNNER_CONTENT_COMPLETED,
+                    RunnerContentCompletedData(
+                        content="先说明",
+                        reasoning_content=None,
+                        finish_reason=FinishReason.TOOL_CALLS,
+                    ),
+                ),
+                _event(
+                    RunnerEventType.RUNNER_TOOL_CALLS_COMPLETED,
+                    RunnerToolCallsCompletedData(
+                        tool_calls=(_tool_call("tc_1"),),
+                        content="",
+                    ),
+                ),
+                _event(
+                    RunnerEventType.RUNNER_DONE,
+                    RunnerDoneData(
+                        finish_reason=FinishReason.TOOL_CALLS,
+                        provider_request_id=None,
+                    ),
+                ),
+            ),
+            _final_script("5"),
+        )
+    )
+
+    await _collect(_AsyncAgent(request=_request(executor=executor), runner=runner))
+
+    second_messages = runner.messages_seen[1]
+    assert isinstance(second_messages[-2], AssistantMessage)
+    assert second_messages[-2].content == "先说明"
+
+
+@pytest.mark.asyncio
 async def test_non_stream_tool_calls_preserve_reasoning_content() -> None:
     """非流式 tool_calls 的 reasoning_content 必须进入下一轮 assistant。"""
 

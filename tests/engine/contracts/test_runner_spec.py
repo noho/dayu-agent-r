@@ -212,6 +212,25 @@ def test_runner_spec_supports_stream_usage_false_construction() -> None:
     assert spec.supports_stream_usage is False
 
 
+def test_runner_spec_default_timeout_seconds_must_be_positive() -> None:
+    """``default_timeout_seconds`` 非正数必须报错。"""
+
+    for value in (0.0, -1.0):
+        kwargs = _base_spec_kwargs()
+        kwargs["default_timeout_seconds"] = value
+        with pytest.raises(ValueError, match="default_timeout_seconds must be > 0"):
+            RunnerSpec(**kwargs)  # type: ignore[arg-type]
+
+
+def test_runner_spec_max_retries_must_be_non_negative() -> None:
+    """``max_retries`` 为负数必须报错。"""
+
+    kwargs = _base_spec_kwargs()
+    kwargs["max_retries"] = -1
+    with pytest.raises(ValueError, match="max_retries must be >= 0"):
+        RunnerSpec(**kwargs)  # type: ignore[arg-type]
+
+
 def test_runner_spec_stream_idle_defaults_to_none() -> None:
     """两个 stream idle 字段默认 ``None``。"""
 

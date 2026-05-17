@@ -127,10 +127,10 @@ def test_context_manager_releases_on_exception_path(tmp_path: Path) -> None:
     assert token.released
 
 
-def test_context_manager_release_failure_keeps_active_token_and_reacquire_fails_fast(
+def test_context_manager_release_failure_clears_active_token_and_allows_reacquire(
     tmp_path: Path,
 ) -> None:
-    """context manager release 失败时必须保留 active token 并拒绝再次 acquire。"""
+    """context manager release 失败时也必须清理 active token。"""
 
     lock_path = _lock_path(tmp_path)
     third_party_lock = _CountingThirdPartyLock()
@@ -144,9 +144,12 @@ def test_context_manager_release_failure_keeps_active_token_and_reacquire_fails_
     with pytest.raises(RuntimeFileLockError, match="release failed"):
         lock.__exit__(None, None, None)
 
-    assert lock._active_token is failing_token
-    with pytest.raises(RuntimeFileLockError, match="already active"):
-        lock.acquire(timeout_seconds=0)
+    assert lock._active_token is None
+    token = lock.acquire(timeout_seconds=0)
+    try:
+        assert token is not failing_token
+    finally:
+        token.release()
 
 
 def test_nested_context_manager_on_same_instance_fails_fast(tmp_path: Path) -> None:

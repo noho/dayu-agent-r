@@ -12,7 +12,7 @@ import json
 from collections.abc import Mapping
 from dataclasses import dataclass
 from enum import StrEnum
-from typing import Protocol
+from typing import NoReturn, Protocol
 
 from dayu.contracts.json_value import JsonValue
 from dayu.contracts.tool_call import BatchToolExecutionRequest
@@ -47,9 +47,9 @@ from dayu.host.durable.event_log import (
     EventLogRow,
     EventLogStore,
     read_event_by_id,
-    read_run_input_continuity_events,
 )
 from dayu.host.durable.errors import HostDurableError
+from dayu.host.durable.memory import read_latest_memory_snapshot_at_or_before
 from dayu.host.durable.state import (
     AttemptRow,
     DispatchRecordRow,
@@ -60,6 +60,27 @@ from dayu.host.durable.state import (
     read_run_by_id,
 )
 from dayu.host.durable.transaction import HostTransaction, HostTransactionRunner
+from dayu.host.memory import (
+    CONVERSATION_MEMORY_CONSUMER_ID,
+    ConversationContinuityItem,
+    ConversationContinuityKind,
+    ConversationMemorySnapshot,
+    MemoryDiagnostic,
+    MemoryProjectionEvent,
+    MemoryProjectionPolicy,
+    MemoryRepairReason,
+    MemoryRepairRequest,
+    MemorySnapshotCursor,
+    OpaqueMemoryRef,
+    VerifiedFactView,
+    WorkingAssumptionView,
+    build_inline_delta_repair_diagnostic,
+    build_memory_budget_diagnostic,
+    digest_memory_projection_policy,
+    estimate_memory_size_units,
+    memory_snapshot_with_cursor_and_diagnostics,
+    project_conversation_memory_event,
+)
 from dayu.host.tool_runtime import ToolRuntimeHandle
 
 _EVENT_TYPE_USER_INPUT_ACCEPTED = "USER_INPUT_ACCEPTED"
@@ -67,6 +88,7 @@ _EVENT_TYPE_RUN_ACCEPTED = "RUN_ACCEPTED"
 _EVENT_TYPE_RUN_STARTED = "RUN_STARTED"
 _EVENT_TYPE_RUN_SUCCEEDED = "RUN_SUCCEEDED"
 _EVENT_TYPE_TOOL_RESULT_ACCEPTED = "TOOL_RESULT_ACCEPTED"
+_EVENT_TYPE_EPISODE_SUMMARY_ACCEPTED = "EPISODE_SUMMARY_ACCEPTED"
 _PAYLOAD_FIELD_DISPLAY_TEXT = "display_text"
 _PAYLOAD_FIELD_OPERATION_KIND = "operation_kind"
 _PAYLOAD_FIELD_EXECUTION_TARGET = "execution_target"
@@ -77,6 +99,14 @@ _PAYLOAD_FIELD_START_REASON = "start_reason"
 _PAYLOAD_FIELD_TOOL_RESULT_EVENT_REF = "tool_result_event_ref"
 _PAYLOAD_FIELD_EVENT_ID = "event_id"
 _NO_TOOL_CANCEL_MESSAGE = "tools are disabled for this attempt"
+_MEMORY_EVENT_TYPES = frozenset(
+    (
+        _EVENT_TYPE_USER_INPUT_ACCEPTED,
+        _EVENT_TYPE_RUN_SUCCEEDED,
+        _EVENT_TYPE_TOOL_RESULT_ACCEPTED,
+        _EVENT_TYPE_EPISODE_SUMMARY_ACCEPTED,
+    )
+)
 
 
 class ToolExecutionMode(StrEnum):
@@ -130,12 +160,78 @@ class SessionContinuityView:
 class MemorySnapshotView:
     """Memory snapshot provider 输出。
 
-    :param messages: memory stable layer messages；Phase 5 noop 为空。
-    :param memory_snapshot_cursor: memory snapshot cursor；Phase 5 noop 为 ``None``。
+    :param messages: memory stable layer messages。
+    :param memory_snapshot_cursor: memory snapshot cursor；no-op provider 为 ``None``。
+    :param policy_digest: memory policy digest；no-op provider 为 ``None``。
+    :param diagnostics: memory provider 产生或透传的 diagnostics。
     """
 
     messages: tuple[AgentMessage, ...]
     memory_snapshot_cursor: str | None
+    policy_digest: str | None
+    diagnostics: tuple[MemoryDiagnostic, ...]
+
+
+class MemoryProjectionRepairRequired(HostDurableError):
+    """RunInputBuilder 需要 memory projection repair 的结构化错误。
+
+    :param repair_request: repair 请求。
+    """
+
+    repair_request: MemoryRepairRequest
+
+    def __init__(self, repair_request: MemoryRepairRequest) -> None:
+        """初始化 repair-required 错误。
+
+        :param repair_request: repair 请求。
+        :returns: ``None``。
+        """
+
+        self.repair_request = repair_request
+        super().__init__(
+            "memory projection repair required: "
+            f"reason={repair_request.reason.value}, "
+            f"session_id={repair_request.session_id}, "
+            f"required_event_sequence={repair_request.required_event_sequence}"
+        )
+
+
+@dataclass(frozen=True, slots=True)
+class _CurrentMemoryRenderScope:
+    """本次 RunInputBuilder 渲染 memory 时需要排除的当前 Run facts。
+
+    :param run_id: 当前 Run id。
+    :param user_input_event_id: 当前 ``USER_INPUT_ACCEPTED`` event id。
+    :param user_prompt: 当前用户 prompt。
+    """
+
+    run_id: str
+    user_input_event_id: str
+    user_prompt: str
+
+
+@dataclass(frozen=True, slots=True)
+class _MemoryStableBlock:
+    """RunInputBuilder 渲染前的 stable memory block。
+
+    :param block_id: 可诊断的稳定 block id。
+    :param message: 待注入的 system message。
+    """
+
+    block_id: str
+    message: SystemMessage
+
+
+@dataclass(frozen=True, slots=True)
+class _RenderedMemoryMessages:
+    """Memory snapshot 渲染结果。
+
+    :param messages: 可交给 Engine 的 messages。
+    :param diagnostics: 渲染阶段产生的 transient diagnostics。
+    """
+
+    messages: tuple[AgentMessage, ...]
+    diagnostics: tuple[MemoryDiagnostic, ...]
 
 
 @dataclass(frozen=True, slots=True)
@@ -431,7 +527,7 @@ class DurableCurrentRunFactProvider:
 
 
 class DurableSessionContinuityProvider:
-    """基于 EventLog 的 Session continuity provider。"""
+    """基于 EventLog 的 resume-specific Session continuity provider。"""
 
     def __init__(self, transaction_runner: HostTransactionRunner) -> None:
         """初始化 provider。
@@ -465,7 +561,7 @@ class DurableSessionContinuityProvider:
         snapshot: AttemptDispatchSnapshot,
         current_facts: CurrentRunFacts,
     ) -> SessionContinuityView:
-        """在 read transaction 内读取 continuity events。
+        """在 read transaction 内读取非历史 continuity facts。
 
         :param transaction: Host durable transaction。
         :param snapshot: Attempt dispatch snapshot。
@@ -473,21 +569,13 @@ class DurableSessionContinuityProvider:
         :returns: Session continuity view。
         """
 
-        events = read_run_input_continuity_events(
-            transaction,
-            session_id=snapshot.session_id,
-            before_event_sequence=current_facts.attempt.started_event_sequence,
-        )
-        historical = _successful_run_continuity_messages(
-            events=events,
-            current_run_id=snapshot.run_id,
-        )
+        del snapshot
         resume_message = _resume_wait_message_from_current_start(
             transaction, current_facts
         )
         if resume_message is None:
-            return SessionContinuityView(messages=historical)
-        return SessionContinuityView(messages=(*historical, resume_message))
+            return SessionContinuityView(messages=())
+        return SessionContinuityView(messages=(resume_message,))
 
 
 class NoopMemorySnapshotProvider:
@@ -504,7 +592,297 @@ class NoopMemorySnapshotProvider:
         """
 
         del snapshot, current_facts
-        return MemorySnapshotView(messages=(), memory_snapshot_cursor=None)
+        return MemorySnapshotView(
+            messages=(),
+            memory_snapshot_cursor=None,
+            policy_digest=None,
+            diagnostics=(),
+        )
+
+
+class DurableMemorySnapshotProvider:
+    """基于 durable memory projection 的 RunInputBuilder provider。
+
+    本 provider 只读取 durable snapshot 和 EventLog delta；小滞后时返回临时
+    inline repair 结果，不写 EventLog、不修改 Run / Attempt 状态，也不推进
+    projection checkpoint。
+
+    :param transaction_runner: Host durable transaction runner。
+    :param policy: memory projection policy。
+    :param consumer_id: memory projection consumer id。
+    """
+
+    def __init__(
+        self,
+        transaction_runner: HostTransactionRunner,
+        policy: MemoryProjectionPolicy,
+        *,
+        consumer_id: str = CONVERSATION_MEMORY_CONSUMER_ID,
+    ) -> None:
+        """初始化 durable memory provider。
+
+        :param transaction_runner: Host durable transaction runner。
+        :param policy: memory projection policy。
+        :param consumer_id: memory projection consumer id。
+        :returns: ``None``。
+        """
+
+        self._transaction_runner = transaction_runner
+        self._policy = policy
+        self._policy_digest = digest_memory_projection_policy(policy)
+        self._consumer_id = consumer_id
+        self._event_log_store = EventLogStore()
+
+    def load_memory_snapshot(
+        self, snapshot: AttemptDispatchSnapshot, current_facts: CurrentRunFacts
+    ) -> MemorySnapshotView:
+        """读取并校验 memory snapshot。
+
+        :param snapshot: Attempt dispatch snapshot。
+        :param current_facts: 当前 Run facts。
+        :returns: Memory snapshot view。
+        :raises MemoryProjectionRepairRequired: snapshot 缺失、损坏或滞后超过阈值时抛出。
+        :raises HostDurableError: EventLog delta 无法读取或投影时抛出。
+        """
+
+        return self._transaction_runner.run_read(
+            lambda transaction: self._load_memory_snapshot_tx(
+                transaction, snapshot, current_facts
+            )
+        )
+
+    def _load_memory_snapshot_tx(
+        self,
+        transaction: HostTransaction,
+        snapshot: AttemptDispatchSnapshot,
+        current_facts: CurrentRunFacts,
+    ) -> MemorySnapshotView:
+        """在 read transaction 内读取 memory snapshot。
+
+        :param transaction: Host durable transaction。
+        :param snapshot: Attempt dispatch snapshot。
+        :param current_facts: 当前 Run facts。
+        :returns: Memory snapshot view。
+        :raises MemoryProjectionRepairRequired: 需要 projection repair 时抛出。
+        """
+
+        required_event_sequence = _required_memory_event_sequence(current_facts)
+        memory_snapshot = self._read_latest_snapshot_or_repair(
+            transaction,
+            session_id=snapshot.session_id,
+            required_event_sequence=required_event_sequence,
+        )
+        self._validate_snapshot_cursor(
+            transaction,
+            memory_snapshot=memory_snapshot,
+            required_event_sequence=required_event_sequence,
+        )
+        lag_events = (
+            required_event_sequence
+            - memory_snapshot.cursor.checkpoint_event_sequence
+        )
+        if lag_events < 0:
+            self._raise_repair_required(
+                session_id=snapshot.session_id,
+                reason=MemoryRepairReason.SNAPSHOT_AHEAD_OF_REQUIRED,
+                required_event_sequence=required_event_sequence,
+                observed_cursor=memory_snapshot.cursor,
+            )
+        if lag_events <= 0:
+            return _memory_snapshot_view(
+                memory_snapshot, current_facts, self._policy
+            )
+        if (
+            lag_events > self._policy.max_lag_events_for_inline_delta
+            or lag_events > self._policy.max_delta_repair_events
+        ):
+            self._raise_repair_required(
+                session_id=snapshot.session_id,
+                reason=MemoryRepairReason.SNAPSHOT_LAG_OVER_THRESHOLD,
+                required_event_sequence=required_event_sequence,
+                observed_cursor=memory_snapshot.cursor,
+            )
+        repaired = self._repair_inline_delta(
+            transaction,
+            snapshot=memory_snapshot,
+            required_event_sequence=required_event_sequence,
+            lag_events=lag_events,
+        )
+        return _memory_snapshot_view(repaired, current_facts, self._policy)
+
+    def _read_latest_snapshot_or_repair(
+        self,
+        transaction: HostTransaction,
+        *,
+        session_id: str,
+        required_event_sequence: int,
+    ) -> ConversationMemorySnapshot:
+        """读取 latest snapshot，缺失或损坏时转成 repair-required。
+
+        :param transaction: Host durable transaction。
+        :param session_id: Session id。
+        :param required_event_sequence: 本次需要覆盖的 EventLog cursor。
+        :returns: durable memory snapshot。
+        :raises MemoryProjectionRepairRequired: snapshot 缺失或损坏时抛出。
+        """
+
+        try:
+            row = read_latest_memory_snapshot_at_or_before(
+                transaction,
+                session_id=session_id,
+                consumer_id=self._consumer_id,
+                policy_digest=self._policy_digest,
+                max_checkpoint_event_sequence=required_event_sequence,
+            )
+        except HostDurableError as exc:
+            repair_request = MemoryRepairRequest(
+                session_id=session_id,
+                reason=MemoryRepairReason.SNAPSHOT_DAMAGED,
+                required_event_sequence=required_event_sequence,
+                observed_cursor=None,
+                policy_digest=self._policy_digest,
+            )
+            raise MemoryProjectionRepairRequired(repair_request) from exc
+        if row is None:
+            self._raise_repair_required(
+                session_id=session_id,
+                reason=MemoryRepairReason.SNAPSHOT_MISSING,
+                required_event_sequence=required_event_sequence,
+                observed_cursor=None,
+            )
+        return row.snapshot
+
+    def _validate_snapshot_cursor(
+        self,
+        transaction: HostTransaction,
+        *,
+        memory_snapshot: ConversationMemorySnapshot,
+        required_event_sequence: int,
+    ) -> None:
+        """校验 snapshot cursor 指向真实 EventLog row。
+
+        :param transaction: Host durable transaction。
+        :param memory_snapshot: 已读取的 memory snapshot。
+        :param required_event_sequence: 本次需要覆盖的 EventLog cursor。
+        :returns: ``None``。
+        :raises MemoryProjectionRepairRequired: cursor 损坏时抛出。
+        """
+
+        cursor = memory_snapshot.cursor
+        if cursor.checkpoint_event_sequence == 0:
+            return
+        if cursor.checkpoint_event_id is None:
+            self._raise_repair_required(
+                session_id=memory_snapshot.session_id,
+                reason=MemoryRepairReason.SNAPSHOT_DAMAGED,
+                required_event_sequence=required_event_sequence,
+                observed_cursor=cursor,
+            )
+        row = read_event_by_id(transaction, cursor.checkpoint_event_id)
+        if (
+            row is None
+            or row.event_sequence != cursor.checkpoint_event_sequence
+            or row.session_id != memory_snapshot.session_id
+        ):
+            self._raise_repair_required(
+                session_id=memory_snapshot.session_id,
+                reason=MemoryRepairReason.SNAPSHOT_DAMAGED,
+                required_event_sequence=required_event_sequence,
+                observed_cursor=cursor,
+            )
+
+    def _repair_inline_delta(
+        self,
+        transaction: HostTransaction,
+        *,
+        snapshot: ConversationMemorySnapshot,
+        required_event_sequence: int,
+        lag_events: int,
+    ) -> ConversationMemorySnapshot:
+        """用 EventLog delta 临时修复小滞后 snapshot。
+
+        :param transaction: Host durable transaction。
+        :param snapshot: 滞后的 memory snapshot。
+        :param required_event_sequence: 需要覆盖到的 EventLog cursor。
+        :param lag_events: 滞后事件数。
+        :returns: 临时 repaired snapshot。
+        :raises MemoryProjectionRepairRequired: delta 无法覆盖 required cursor 时抛出。
+        """
+
+        rows = self._event_log_store.read_events_after(
+            transaction,
+            snapshot.cursor.checkpoint_event_sequence,
+            limit=lag_events,
+        )
+        if len(rows) != lag_events:
+            self._raise_repair_required(
+                session_id=snapshot.session_id,
+                reason=MemoryRepairReason.SNAPSHOT_DAMAGED,
+                required_event_sequence=required_event_sequence,
+                observed_cursor=snapshot.cursor,
+            )
+        required_row = rows[-1]
+        if (
+            required_row.event_sequence != required_event_sequence
+            or required_row.session_id != snapshot.session_id
+        ):
+            self._raise_repair_required(
+                session_id=snapshot.session_id,
+                reason=MemoryRepairReason.SNAPSHOT_DAMAGED,
+                required_event_sequence=required_event_sequence,
+                observed_cursor=snapshot.cursor,
+            )
+        repaired = snapshot
+        for row in rows:
+            if _is_memory_projection_row(row, session_id=snapshot.session_id):
+                repaired = project_conversation_memory_event(
+                    previous_snapshot=repaired,
+                    event=_memory_projection_event_from_row(row),
+                    policy=self._policy,
+                    built_at=row.occurred_at,
+                    consumer_id=self._consumer_id,
+                )
+        diagnostic = build_inline_delta_repair_diagnostic(
+            event_sequence=required_event_sequence,
+            policy_digest=self._policy_digest,
+        )
+        return memory_snapshot_with_cursor_and_diagnostics(
+            snapshot=repaired,
+            cursor=MemorySnapshotCursor(
+                consumer_id=self._consumer_id,
+                checkpoint_event_sequence=required_row.event_sequence,
+                checkpoint_event_id=required_row.event_id,
+                session_id=snapshot.session_id,
+            ),
+            diagnostics=(diagnostic,),
+        )
+
+    def _raise_repair_required(
+        self,
+        *,
+        session_id: str,
+        reason: MemoryRepairReason,
+        required_event_sequence: int,
+        observed_cursor: MemorySnapshotCursor | None,
+    ) -> NoReturn:
+        """抛出结构化 repair-required 错误。
+
+        :param session_id: Session id。
+        :param reason: repair reason。
+        :param required_event_sequence: 需要覆盖的 EventLog cursor。
+        :param observed_cursor: 已观测 cursor。
+        :raises MemoryProjectionRepairRequired: 始终抛出。
+        """
+
+        raise MemoryProjectionRepairRequired(
+            MemoryRepairRequest(
+                session_id=session_id,
+                reason=reason,
+                required_event_sequence=required_event_sequence,
+                observed_cursor=observed_cursor,
+                policy_digest=self._policy_digest,
+            )
+        )
 
 
 class NoopCompactArtifactProvider:
@@ -861,12 +1239,14 @@ def create_no_tool_run_input_builder(
     *,
     transaction_runner: HostTransactionRunner,
     policy_snapshot: PolicySnapshot,
+    memory_snapshot_provider: MemorySnapshotProvider | None = None,
     tool_execution_mode: ToolExecutionMode = ToolExecutionMode.NO_TOOL_DISABLED,
 ) -> RunInputBuilder:
     """创建 Phase 5 默认 no-tool RunInputBuilder。
 
     :param transaction_runner: Host durable transaction runner。
     :param policy_snapshot: 显式 policy snapshot。
+    :param memory_snapshot_provider: 可选 memory snapshot provider；默认 no-op。
     :param tool_execution_mode: no-tool 工具执行模式，只能是 replay 或 disabled。
     :returns: RunInputBuilder。
     :raises ValueError: 传入 ``TOOL_ENABLED`` 时抛出。
@@ -879,7 +1259,11 @@ def create_no_tool_run_input_builder(
         session_continuity_provider=DurableSessionContinuityProvider(
             transaction_runner
         ),
-        memory_snapshot_provider=NoopMemorySnapshotProvider(),
+        memory_snapshot_provider=(
+            NoopMemorySnapshotProvider()
+            if memory_snapshot_provider is None
+            else memory_snapshot_provider
+        ),
         compact_artifact_provider=NoopCompactArtifactProvider(),
         tool_schema_snapshot_provider=NoopToolSchemaSnapshotProvider(),
         tool_executor_provider=NoToolExecutorProvider(),
@@ -894,12 +1278,14 @@ def create_tool_enabled_run_input_builder(
     transaction_runner: HostTransactionRunner,
     policy_snapshot: PolicySnapshot,
     tool_runtime_handle: ToolRuntimeHandle,
+    memory_snapshot_provider: MemorySnapshotProvider | None = None,
 ) -> RunInputBuilder:
     """创建 tool-enabled RunInputBuilder。
 
     :param transaction_runner: Host durable transaction runner。
     :param policy_snapshot: 显式 policy snapshot，必须允许工具调用。
     :param tool_runtime_handle: ToolRuntime handle。
+    :param memory_snapshot_provider: 可选 memory snapshot provider；默认 no-op。
     :returns: RunInputBuilder。
     """
 
@@ -909,7 +1295,11 @@ def create_tool_enabled_run_input_builder(
         session_continuity_provider=DurableSessionContinuityProvider(
             transaction_runner
         ),
-        memory_snapshot_provider=NoopMemorySnapshotProvider(),
+        memory_snapshot_provider=(
+            NoopMemorySnapshotProvider()
+            if memory_snapshot_provider is None
+            else memory_snapshot_provider
+        ),
         compact_artifact_provider=NoopCompactArtifactProvider(),
         tool_schema_snapshot_provider=ToolRuntimeSchemaSnapshotProvider(
             handle_provider
@@ -997,6 +1387,413 @@ def _validate_current_event_scope(
 
     if event.session_id != snapshot.session_id or event.run_id != snapshot.run_id:
         raise HostDurableError("RunInputBuilder current event scope mismatch")
+
+
+def _required_memory_event_sequence(current_facts: CurrentRunFacts) -> int:
+    """计算本次 memory snapshot 需要覆盖的 EventLog cursor。
+
+    :param current_facts: 当前 Run facts。
+    :returns: 当前 Attempt start 之前的最大 EventLog sequence。
+    :raises HostDurableError: Attempt started sequence 非法时抛出。
+    """
+
+    required_event_sequence = current_facts.attempt.started_event_sequence - 1
+    if required_event_sequence < 0:
+        raise HostDurableError("memory required event sequence is invalid")
+    return required_event_sequence
+
+
+def _memory_snapshot_view(
+    snapshot: ConversationMemorySnapshot,
+    current_facts: CurrentRunFacts,
+    policy: MemoryProjectionPolicy,
+) -> MemorySnapshotView:
+    """把 typed memory snapshot 渲染为 provider view。
+
+    :param snapshot: memory snapshot。
+    :param current_facts: 当前 Run facts。
+    :param policy: memory projection policy。
+    :returns: RunInputBuilder memory view。
+    """
+
+    render_scope = _CurrentMemoryRenderScope(
+        run_id=current_facts.run.run_id,
+        user_input_event_id=current_facts.user_input_event.event_id,
+        user_prompt=current_facts.user_prompt,
+    )
+    rendered = _memory_messages(snapshot, render_scope, policy)
+    return MemorySnapshotView(
+        messages=rendered.messages,
+        memory_snapshot_cursor=_memory_cursor_ref(snapshot.cursor),
+        policy_digest=snapshot.policy_digest,
+        diagnostics=snapshot.diagnostics + rendered.diagnostics,
+    )
+
+
+def _memory_messages(
+    snapshot: ConversationMemorySnapshot,
+    render_scope: _CurrentMemoryRenderScope,
+    policy: MemoryProjectionPolicy,
+) -> _RenderedMemoryMessages:
+    """按 P9 固定顺序渲染 memory messages。
+
+    :param snapshot: memory snapshot。
+    :param render_scope: 当前 Run memory 渲染排除范围。
+    :param policy: memory projection policy。
+    :returns: memory provider messages 与 transient diagnostics。
+    """
+
+    messages: list[AgentMessage] = []
+    stable = _bounded_stable_memory_messages(
+        blocks=_memory_stable_blocks(snapshot, render_scope),
+        snapshot=snapshot,
+        policy=policy,
+    )
+    messages.extend(stable.messages)
+    messages.extend(
+        _memory_raw_turn_messages(
+            snapshot.conversation_continuity.items, render_scope
+        )
+    )
+    episode = _memory_episode_summary_message(
+        snapshot.conversation_continuity.items, render_scope
+    )
+    if episode is not None:
+        messages.append(episode)
+    return _RenderedMemoryMessages(
+        messages=tuple(messages),
+        diagnostics=stable.diagnostics,
+    )
+
+
+def _memory_stable_blocks(
+    snapshot: ConversationMemorySnapshot, render_scope: _CurrentMemoryRenderScope
+) -> tuple[_MemoryStableBlock, ...]:
+    """按固定优先级构造 stable memory blocks。
+
+    :param snapshot: memory snapshot。
+    :param render_scope: 当前 Run memory 渲染排除范围。
+    :returns: stable memory blocks。
+    """
+
+    blocks: list[_MemoryStableBlock] = []
+    goals = _memory_goal_and_constraint_message(snapshot, render_scope)
+    if goals is not None:
+        blocks.append(_MemoryStableBlock(block_id="stable:goals", message=goals))
+    subjects = _memory_subject_message(snapshot)
+    if subjects is not None:
+        blocks.append(_MemoryStableBlock(block_id="stable:subjects", message=subjects))
+    facts = _memory_verified_fact_message(snapshot.verified_facts)
+    if facts is not None:
+        blocks.append(_MemoryStableBlock(block_id="stable:verified_facts", message=facts))
+    assumptions = _memory_question_and_assumption_message(snapshot)
+    if assumptions is not None:
+        blocks.append(
+            _MemoryStableBlock(
+                block_id="stable:questions_assumptions",
+                message=assumptions,
+            )
+        )
+    return tuple(blocks)
+
+
+def _bounded_stable_memory_messages(
+    *,
+    blocks: tuple[_MemoryStableBlock, ...],
+    snapshot: ConversationMemorySnapshot,
+    policy: MemoryProjectionPolicy,
+) -> _RenderedMemoryMessages:
+    """按 ``stable_layer_size_units`` 限制 stable memory blocks。
+
+    :param blocks: 按 P9 优先级排序的 stable blocks。
+    :param snapshot: memory snapshot。
+    :param policy: memory projection policy。
+    :returns: 被保留的 stable messages 与 budget diagnostics。
+    """
+
+    kept: list[AgentMessage] = []
+    diagnostics: list[MemoryDiagnostic] = []
+    budget_used = 0
+    for block in blocks:
+        block_units = estimate_memory_size_units(block.message.content).units
+        if budget_used + block_units <= policy.stable_layer_size_units:
+            kept.append(block.message)
+            budget_used += block_units
+            continue
+        diagnostics.append(
+            build_memory_budget_diagnostic(
+                event_sequence=snapshot.cursor.checkpoint_event_sequence,
+                item_id=block.block_id,
+                policy_digest=snapshot.policy_digest,
+                message="stable memory block skipped by stable layer budget",
+            )
+        )
+    return _RenderedMemoryMessages(
+        messages=tuple(kept),
+        diagnostics=tuple(diagnostics),
+    )
+
+
+def _memory_goal_and_constraint_message(
+    snapshot: ConversationMemorySnapshot, render_scope: _CurrentMemoryRenderScope
+) -> SystemMessage | None:
+    """渲染用户目标与约束 memory block。
+
+    :param snapshot: memory snapshot。
+    :param render_scope: 当前 Run memory 渲染排除范围。
+    :returns: system message；无内容时返回 ``None``。
+    """
+
+    lines: list[str] = ["Memory user goals and constraints:"]
+    if (
+        snapshot.pinned_state.current_goal is not None
+        and snapshot.pinned_state.current_goal != render_scope.user_prompt
+    ):
+        lines.append(f"current_goal={snapshot.pinned_state.current_goal}")
+    for constraint in snapshot.pinned_state.user_constraints:
+        if constraint == render_scope.user_prompt:
+            continue
+        lines.append(f"user_constraint={constraint}")
+    if len(lines) == 1:
+        return None
+    return SystemMessage(
+        role=AgentMessageRole.SYSTEM,
+        content="\n".join(lines),
+    )
+
+
+def _memory_subject_message(
+    snapshot: ConversationMemorySnapshot,
+) -> SystemMessage | None:
+    """渲染已确认主体和口径 memory block。
+
+    :param snapshot: memory snapshot。
+    :returns: system message；无内容时返回 ``None``。
+    """
+
+    if not snapshot.pinned_state.confirmed_subjects:
+        return None
+    lines = ["Memory confirmed subjects and methodology:"]
+    for ref in snapshot.pinned_state.confirmed_subjects:
+        lines.append(f"confirmed_subject={_opaque_ref_text(ref)}")
+    return SystemMessage(
+        role=AgentMessageRole.SYSTEM,
+        content="\n".join(lines),
+    )
+
+
+def _memory_verified_fact_message(
+    facts: tuple[VerifiedFactView, ...],
+) -> SystemMessage | None:
+    """渲染 tool-verified facts memory block。
+
+    :param facts: verified fact 元组。
+    :returns: system message；无内容时返回 ``None``。
+    """
+
+    if not facts:
+        return None
+    lines = ["Memory tool-verified facts:"]
+    for fact in facts:
+        lines.append(
+            "fact="
+            f"{fact.fact_summary}; "
+            f"tool={fact.provenance.producer_name}; "
+            f"event_id={fact.provenance.event_id}; "
+            f"event_sequence={fact.provenance.event_sequence}; "
+            f"digest_ref={fact.provenance.digest_ref}"
+        )
+    return SystemMessage(
+        role=AgentMessageRole.SYSTEM,
+        content="\n".join(lines),
+    )
+
+
+def _memory_question_and_assumption_message(
+    snapshot: ConversationMemorySnapshot,
+) -> SystemMessage | None:
+    """渲染 open questions / working assumptions memory block。
+
+    :param snapshot: memory snapshot。
+    :returns: system message；无内容时返回 ``None``。
+    """
+
+    lines: list[str] = ["Memory open questions and working assumptions:"]
+    for question in snapshot.pinned_state.open_questions:
+        lines.append(f"open_question={question}")
+    for assumption in snapshot.working_assumptions:
+        lines.append(
+            "working_assumption="
+            f"{assumption.assumption_summary}; "
+            f"event_id={assumption.event_id}; "
+            f"event_sequence={assumption.event_sequence}"
+        )
+    if len(lines) == 1:
+        return None
+    return SystemMessage(
+        role=AgentMessageRole.SYSTEM,
+        content="\n".join(lines),
+    )
+
+
+def _memory_raw_turn_messages(
+    items: tuple[ConversationContinuityItem, ...],
+    render_scope: _CurrentMemoryRenderScope,
+) -> tuple[AgentMessage, ...]:
+    """渲染 recent raw turns continuity messages。
+
+    :param items: continuity items。
+    :param render_scope: 当前 Run memory 渲染排除范围。
+    :returns: raw turn messages。
+    """
+
+    messages: list[AgentMessage] = []
+    for item in items:
+        if item.item_kind is ConversationContinuityKind.EPISODE_SUMMARY:
+            continue
+        if _is_current_run_user_input_memory_item(item, render_scope):
+            continue
+        content = _continuity_item_text(item)
+        if item.item_kind is ConversationContinuityKind.RAW_USER_TURN:
+            messages.append(
+                UserMessage(role=AgentMessageRole.USER, content=content)
+            )
+        else:
+            messages.append(
+                AssistantMessage(
+                    role=AgentMessageRole.ASSISTANT,
+                    content=content,
+                    reasoning_content=None,
+                    tool_calls=(),
+                )
+            )
+    return tuple(messages)
+
+
+def _memory_episode_summary_message(
+    items: tuple[ConversationContinuityItem, ...],
+    render_scope: _CurrentMemoryRenderScope,
+) -> SystemMessage | None:
+    """渲染 episode summaries memory block。
+
+    :param items: continuity items。
+    :param render_scope: 当前 Run memory 渲染排除范围。
+    :returns: system message；无 episode summary 时返回 ``None``。
+    """
+
+    episode_items = tuple(
+        item
+        for item in items
+        if item.item_kind is ConversationContinuityKind.EPISODE_SUMMARY
+        and not _is_current_run_user_input_memory_item(item, render_scope)
+    )
+    if not episode_items:
+        return None
+    lines = ["Memory episode summaries:"]
+    for item in episode_items:
+        lines.append(f"episode_summary={_continuity_item_text(item)}")
+    return SystemMessage(
+        role=AgentMessageRole.SYSTEM,
+        content="\n".join(lines),
+    )
+
+
+def _continuity_item_text(item: ConversationContinuityItem) -> str:
+    """读取 continuity item 可渲染文本。
+
+    :param item: continuity item。
+    :returns: 可进入 Engine message 的文本。
+    """
+
+    if item.summary_text is not None:
+        return item.summary_text
+    if item.payload_ref is not None and item.payload_digest is not None:
+        return f"payload_ref={item.payload_ref}; payload_digest={item.payload_digest}"
+    return f"event_ref={item.event_id}"
+
+
+def _is_current_run_user_input_memory_item(
+    item: ConversationContinuityItem, render_scope: _CurrentMemoryRenderScope
+) -> bool:
+    """判断 continuity item 是否是当前 Run 的用户输入。
+
+    :param item: continuity item。
+    :param render_scope: 当前 Run memory 渲染排除范围。
+    :returns: 属于当前 ``USER_INPUT_ACCEPTED`` raw turn 时返回 ``True``。
+    """
+
+    if item.item_kind is not ConversationContinuityKind.RAW_USER_TURN:
+        return False
+    if item.event_id == render_scope.user_input_event_id:
+        return True
+    return False
+
+
+def _opaque_ref_text(ref: OpaqueMemoryRef) -> str:
+    """渲染 Host 中立 opaque ref。
+
+    :param ref: opaque memory ref。
+    :returns: 稳定文本。
+    """
+
+    if ref.digest is None:
+        return f"{ref.ref_kind.value}:{ref.ref_id}"
+    return f"{ref.ref_kind.value}:{ref.ref_id}; digest={ref.digest}"
+
+
+def _memory_cursor_ref(cursor: MemorySnapshotCursor) -> str:
+    """渲染 memory snapshot cursor ref。
+
+    :param cursor: memory snapshot cursor。
+    :returns: 稳定 cursor ref。
+    """
+
+    event_id = "" if cursor.checkpoint_event_id is None else cursor.checkpoint_event_id
+    return (
+        f"consumer_id={cursor.consumer_id};"
+        f"session_id={cursor.session_id};"
+        f"checkpoint_event_sequence={cursor.checkpoint_event_sequence};"
+        f"checkpoint_event_id={event_id}"
+    )
+
+
+def _is_memory_projection_row(row: EventLogRow, *, session_id: str) -> bool:
+    """判断 EventLog row 是否应进入 memory delta projection。
+
+    :param row: EventLog row。
+    :param session_id: 当前 Session id。
+    :returns: 命中 memory projection 返回 ``True``。
+    """
+
+    return (
+        row.session_id == session_id
+        and row.event_class == EventClass.CANONICAL_FACT
+        and row.event_type in _MEMORY_EVENT_TYPES
+    )
+
+
+def _memory_projection_event_from_row(row: EventLogRow) -> MemoryProjectionEvent:
+    """把 EventLog row 转换为 memory projection event。
+
+    :param row: EventLog row。
+    :returns: memory projection event。
+    :raises HostDurableError: payload 不是 JSON object 时抛出。
+    """
+
+    return MemoryProjectionEvent(
+        event_sequence=row.event_sequence,
+        event_id=row.event_id,
+        event_class=row.event_class.value,
+        event_type=row.event_type,
+        session_id=row.session_id,
+        run_id=row.run_id,
+        attempt_id=row.attempt_id,
+        execution_id=row.execution_id,
+        occurred_at=row.occurred_at,
+        payload_ref=row.payload_ref,
+        payload_digest=row.payload_digest,
+        payload=_payload_object(row),
+    )
 
 
 def _optional_payload_text(
@@ -1303,7 +2100,9 @@ __all__ = [
     "CurrentRunFacts",
     "DefaultSceneParameterProvider",
     "DurableCurrentRunFactProvider",
+    "DurableMemorySnapshotProvider",
     "DurableSessionContinuityProvider",
+    "MemoryProjectionRepairRequired",
     "MemorySnapshotProvider",
     "MemorySnapshotView",
     "NoToolExecutor",

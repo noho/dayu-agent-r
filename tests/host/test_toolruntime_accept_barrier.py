@@ -41,6 +41,7 @@ from dayu.host.durable.state import (
     mark_dispatching_after_lane_row,
 )
 from dayu.host.durable.transaction import HostTransaction, HostTransactionRunner
+from dayu.host.projection import ProjectionCatchupPort
 from dayu.host.tool_runtime import (
     DefaultHostToolFactAcceptPort,
     DuplicateDecisionKind,
@@ -71,6 +72,23 @@ class _SeededRun:
     dispatch_record_id: str
 
 
+@dataclass(slots=True)
+class _FailingProjectionCatchup(ProjectionCatchupPort):
+    """测试用失败 projection catch-up port。"""
+
+    calls: int = 0
+
+    def catch_up_projection(self) -> None:
+        """记录调用并模拟 catch-up 失败。
+
+        :returns: ``None``。
+        :raises RuntimeError: 始终抛出测试错误。
+        """
+
+        self.calls += 1
+        raise RuntimeError("forced tool accept projection catch-up failure")
+
+
 def test_same_accept_key_and_digest_returns_existing_ack_without_duplicate_facts(
     tmp_path: Path,
 ) -> None:
@@ -97,6 +115,34 @@ def test_same_accept_key_and_digest_returns_existing_ack_without_duplicate_facts
             "TOOL_RESULT_ACCEPTED",
         ]
         assert all(row.event_class is EventClass.CANONICAL_FACT for row in after)
+
+
+def test_tool_fact_accept_survives_projection_catchup_failure(
+    tmp_path: Path, caplog: pytest.LogCaptureFixture
+) -> None:
+    """TOOL_RESULT_ACCEPTED 后 projection catch-up 失败不影响 accept ack。"""
+
+    with open_host_durable_store(_options(tmp_path)) as store:
+        seeded = _seed_active_run(store.transaction_runner)
+        projection = _FailingProjectionCatchup()
+        accept_port = DefaultHostToolFactAcceptPort(
+            transaction_runner=store.transaction_runner,
+            projection_catchup_port=projection,
+        )
+
+        with caplog.at_level("ERROR", logger="dayu.host.projection"):
+            result = accept_port.accept_tool_fact(
+                _completed_candidate(seeded, tool_call_id="tool-call-catchup")
+            )
+
+        assert isinstance(result, ToolFactAcceptedAck)
+        assert result.tool_result_event_ref is not None
+        assert projection.calls == 1
+        assert [row.event_type for row in _tool_events(store.transaction_runner)] == [
+            "TOOL_CALL_REQUESTED",
+            "TOOL_RESULT_ACCEPTED",
+        ]
+        assert "projection catch-up failed; continuing" in caplog.text
 
 
 def test_same_accept_key_with_different_digest_returns_idempotency_conflict(

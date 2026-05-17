@@ -6,6 +6,7 @@ import pytest
 
 from dayu.engine.contracts.finish_reason import FinishReason
 from dayu.engine.contracts.runner_events import (
+    RunnerDoneData,
     RunnerEventType,
     RunnerToolCallDeltaData,
     RunnerToolCallsCompletedData,
@@ -65,5 +66,59 @@ async def test_tool_call_aggregated_across_chunks() -> None:
     # finish_reason 为 tool_calls
     from dayu.engine.contracts.runner_events import RunnerDoneData
 
+    assert isinstance(done[0].data, RunnerDoneData)
+    assert done[0].data.finish_reason is FinishReason.TOOL_CALLS
+
+
+@pytest.mark.asyncio
+async def test_tool_call_position_ignores_non_dict_elements() -> None:
+    """无 index 的 tool_call 位置只按有效对象计数。"""
+
+    chunks = [
+        (
+            b'data: {"choices":[{"delta":{"tool_calls":'
+            b'[null,{"id":"call-1","type":"function",'
+            b'"function":{"name":"search","arguments":"{}"}}]}}]}\n\n'
+        ),
+        b'data: {"choices":[{"finish_reason":"tool_calls","delta":{}}]}\n\n',
+        b"data: [DONE]\n\n",
+    ]
+    events = await parse_sse(chunks)
+
+    deltas = [
+        e for e in events
+        if e.type is RunnerEventType.RUNNER_TOOL_CALL_DELTA
+    ]
+    assert len(deltas) == 1
+    assert isinstance(deltas[0].data, RunnerToolCallDeltaData)
+    assert deltas[0].data.tool_call_index == 0
+    completed = [
+        e for e in events
+        if e.type is RunnerEventType.RUNNER_TOOL_CALLS_COMPLETED
+    ]
+    assert len(completed) == 1
+    data = completed[0].data
+    assert isinstance(data, RunnerToolCallsCompletedData)
+    assert data.tool_calls[0].index_in_iteration == 0
+
+
+@pytest.mark.asyncio
+async def test_tool_call_done_finish_reason_prefers_tool_calls_over_stop() -> None:
+    """流式响应出现 tool_calls 时，Done 必须以 TOOL_CALLS 收口。"""
+
+    chunks = [
+        (
+            b'data: {"choices":[{"delta":{"tool_calls":'
+            b'[{"index":0,"id":"call-1","type":"function",'
+            b'"function":{"name":"search","arguments":"{}"}}]}}]}\n\n'
+        ),
+        b'data: {"choices":[{"finish_reason":"stop","delta":{}}]}\n\n',
+        b"data: [DONE]\n\n",
+    ]
+    events = await parse_sse(chunks)
+
+    done = [e for e in events if e.type is RunnerEventType.RUNNER_DONE]
+
+    assert len(done) == 1
     assert isinstance(done[0].data, RunnerDoneData)
     assert done[0].data.finish_reason is FinishReason.TOOL_CALLS

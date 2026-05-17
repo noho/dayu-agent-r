@@ -1329,13 +1329,7 @@ class _AsyncAgent:
                 data.reasoning_content is not None,
             )
             return None
-        state.failure_candidate = RunFailedData(
-            error_code=_ERROR_RUNNER_EXCEPTION,
-            message="runner event data did not match supported union",
-            provider_request_id=None,
-            recoverable=False,
-        )
-        return None
+        assert_never(data)
 
     def _classify_iteration(
         self,
@@ -1398,18 +1392,20 @@ class _AsyncAgent:
                     provider_request_id=state.provider_request_id,
                     recoverable=False,
                 )
-            content = state.tool_calls_content
-            if content is None:
-                content = state.completed_content
-            if content is None and state.content_chunks:
-                content = "".join(state.content_chunks)
-            if content == "":
-                content = None
-            reasoning = state.tool_calls_reasoning_content
-            if reasoning is None:
-                reasoning = state.completed_reasoning_content
-            if reasoning is None and state.reasoning_chunks:
-                reasoning = "".join(state.reasoning_chunks)
+            content = (
+                state.tool_calls_content
+                or state.completed_content
+                or ("".join(state.content_chunks) if state.content_chunks else None)
+            )
+            reasoning = (
+                state.tool_calls_reasoning_content
+                or state.completed_reasoning_content
+                or (
+                    "".join(state.reasoning_chunks)
+                    if state.reasoning_chunks
+                    else None
+                )
+            )
             return _ToolCallsDecision(
                 iteration_id=iteration_id,
                 iteration_index=iteration_index,
