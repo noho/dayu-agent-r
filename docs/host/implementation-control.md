@@ -220,8 +220,8 @@ Phase Map 中每个 phase 必须使用统一条目格式。模板如下：
 
 ## 当前状态
 
-P9-S2 `Projection Consumer and Stable Layer Builder` completed；accepted slice commit 为 `4f35da6`。当前 gate 为 P9-S3
-`RunInputBuilder MemorySnapshotProvider and Lag Fallback` implementation。
+P9-S3 `RunInputBuilder MemorySnapshotProvider and Lag Fallback` completed；accepted slice commit 为 `b416d37`。当前 gate 为 P9-S4
+`Projection Repair / Rebuild Entry and Diagnostics` implementation。
 
 约束：本节只保留当前 gate 结论；phase 过程流水必须归档到 `历史记录`，仍需追踪的风险或后续 owner 必须写入 `Open Questions 与风险追踪` 的 `追踪区`。
 
@@ -812,7 +812,7 @@ Phase 按依赖关系推进：先实现被其它阶段依赖的公共契约、ru
 - P9 handoff implementation-ready plan 已完成双路 review、fix、双路 re-review 与 controller adjudication，verdict 为 PASS。
 - P9-S1 `Durable Memory Contracts and Schema` completed；accepted slice commit 为 `f221aeb`。
 - P9-S2 `Projection Consumer and Stable Layer Builder` completed；accepted slice commit 为 `4f35da6`。
-- P9-S3 `RunInputBuilder MemorySnapshotProvider and Lag Fallback` completed；accepted slice commit pending。
+- P9-S3 `RunInputBuilder MemorySnapshotProvider and Lag Fallback` completed；accepted slice commit 为 `b416d37`。
 
 目标：
 - 实现 session-level Conversation Memory projection、stable layer、history pool、snapshot cursor、RunInputBuilder memory provider 与 projection repair path。
@@ -1663,7 +1663,7 @@ memory。
 - `pyright dayu/host/run_input.py dayu/host/memory.py dayu/host/durable/memory.py tests/host`：0 errors。
 - `git diff --check`：通过。
 
-Accepted slice commit pending。当前 gate 为 P9-S4 `Projection Repair / Rebuild Entry and Diagnostics` implementation。
+Accepted slice commit 为 `b416d37`。当前 gate 为 P9-S4 `Projection Repair / Rebuild Entry and Diagnostics` implementation。
 
 ### 2026-05-17 P9-S2 code review accepted
 
