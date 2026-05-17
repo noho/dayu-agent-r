@@ -220,7 +220,7 @@ Phase Map 中每个 phase 必须使用统一条目格式。模板如下：
 
 ## 当前状态
 
-P9-S2 `Projection Consumer and Stable Layer Builder` code review accepted；下一步创建 accepted slice commit 后进入 P9-S3
+P9-S2 `Projection Consumer and Stable Layer Builder` completed；accepted slice commit 为 `4f35da6`。当前 gate 为 P9-S3
 `RunInputBuilder MemorySnapshotProvider and Lag Fallback` implementation。
 
 约束：本节只保留当前 gate 结论；phase 过程流水必须归档到 `历史记录`，仍需追踪的风险或后续 owner 必须写入 `Open Questions 与风险追踪` 的 `追踪区`。
@@ -811,7 +811,8 @@ Phase 按依赖关系推进：先实现被其它阶段依赖的公共契约、ru
 - P9 phase discussion / design refinement 已完成。用户确认 P9 的核心定位是“财报分析工作台状态投影”，不是聊天记录压缩器。
 - P9 handoff implementation-ready plan 已完成双路 review、fix、双路 re-review 与 controller adjudication，verdict 为 PASS。
 - P9-S1 `Durable Memory Contracts and Schema` completed；accepted slice commit 为 `f221aeb`。
-- P9-S2 `Projection Consumer and Stable Layer Builder` code review accepted，remaining blocking findings 为 0；等待 accepted slice commit。
+- P9-S2 `Projection Consumer and Stable Layer Builder` completed；accepted slice commit 为 `4f35da6`。
+- P9-S3 `RunInputBuilder MemorySnapshotProvider and Lag Fallback` implementation in progress。
 
 目标：
 - 实现 session-level Conversation Memory projection、stable layer、history pool、snapshot cursor、RunInputBuilder memory provider 与 projection repair path。
@@ -1615,7 +1616,7 @@ Phase 按依赖关系推进：先实现被其它阶段依赖的公共契约、ru
   `docs/reviews/p9-s2-code-rereview-ds-20260517.md`。
 - Controller adjudication artifact 为 `docs/reviews/p9-s2-code-review-controller-adjudication-20260517.md`。
 - Re-review verdict：AgentMiMo PASS，AgentDS PASS，remaining blocking findings 为 0。
-- Accepted slice commit 待写入。
+- Accepted slice commit 为 `4f35da6`。
 
 验证：
 
@@ -1642,8 +1643,8 @@ P9-S2 `Projection Consumer and Stable Layer Builder` implementation 已完成。
 PASS，提出 1 个 medium 与 2 个 low findings；AgentDS 初审 verdict 为 PASS，提出 3 个 medium 与 1 个 low finding。Controller
 接受 assistant conclusion budget、`recent_raw_turns_floor=0`、missing `tool_name` provenance、malformed `source_refs` 与
 unknown event type diagnostic 五项修复。Fix 后双路 re-review 均 PASS，remaining blocking findings 为 0。Controller
-adjudication artifact 为 `docs/reviews/p9-s2-code-review-controller-adjudication-20260517.md`。当前 gate 为 P9-S2 accepted slice
-commit。
+adjudication artifact 为 `docs/reviews/p9-s2-code-review-controller-adjudication-20260517.md`。Accepted slice commit 为 `4f35da6`。
+当前 gate 为 P9-S3 `RunInputBuilder MemorySnapshotProvider and Lag Fallback` implementation。
 
 ### 2026-05-17 P9-S1 code review accepted
 
