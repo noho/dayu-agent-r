@@ -223,8 +223,8 @@ Phase Map 中每个 phase 必须使用统一条目格式。模板如下：
 约束：本节只保留当前 gate 结论；phase 过程流水必须归档到 `历史记录`，仍需追踪的风险或后续 owner 必须写入 `Open Questions 与风险追踪` 的 `追踪区`。
 
 当前 work unit：P9.5 Pre-P10 Cross-Repository Hardening PR。
-当前 gate：P9.5 S13 Message / Tool Result Size Governance implementation。
-下一 gate：P9.5 S13 code review。
+当前 gate：P9.5 S14 P9 Memory Cleanup And Production Catch-Up Wiring implementation。
+下一 gate：P9.5 S14 code review。
 
 ## Phase Map
 
@@ -2032,6 +2032,27 @@ P9.5 收口清单：
 - 当前无 PR review blocking fix。
 
 ## 历史记录
+
+### 2026-05-17 P9.5 S13 Message / Tool Result Size Governance accepted
+
+P9.5 S13 Message / Tool Result Size Governance 已完成。Implementation artifact 为
+`docs/reviews/p9-5-s13-message-tool-result-size-governance-implementation-20260517.md`。Code review /
+re-review / controller adjudication artifacts 为 `docs/reviews/p9-5-s13-code-review-mimo-20260517.md`、
+`docs/reviews/p9-5-s13-code-review-ds-20260517.md`、
+`docs/reviews/p9-5-s13-code-re-review-ds-20260517.md` 与
+`docs/reviews/p9-5-s13-code-review-controller-adjudication-20260517.md`。
+
+Controller 裁决：AgentMiMo 与 AgentDS review 均为 PASS，0 blocking findings。Controller 接受 DS O1/O4 为
+S13 内应修复问题：Engine per-iteration inline guard 必须有 run loop 集成测试；Assistant tool call arguments 也是
+回送 Runner 的 inline message 边界。Fix 已将 Assistant tool call id / name / arguments JSON / Gemini provider_state
+signature 纳入 `_message_inline_texts(...)`，并补 `test_oversized_assistant_tool_call_arguments_require_context_boundary`
+与 `test_oversized_tool_message_fails_before_next_runner_call`。DS re-review 确认 O1/O4 fixed，0 new blocking。
+不阻塞项包括 Engine / Host inline 阈值暂独立定义、defensive failure 不 emit `CONTEXT_COMPACTION_REQUESTED`、
+oversized `fetch_more` continuation 失败时 cursor 保留到 TTL、ToolRuntime truncation path 与总 outcome path 双重大小检查。
+S13 未新增 public error taxonomy，未实现 P10 proactive compaction，未改变 Host / Engine 分层。本地验证通过：
+S13 targeted tests 为 115 passed；`pytest tests/host tests/engine` 为 913 passed；`python -m pyright dayu tests`
+为 0 errors / 0 warnings / 0 informations；`git diff --check` clean。Accepted slice commit 为 `8b3718d`。
+当前 gate 为 P9.5 S14 P9 Memory Cleanup And Production Catch-Up Wiring implementation。
 
 ### 2026-05-17 P9.5 S12 ToolRuntime Truncation / Duplicate Defensive Hardening accepted
 
