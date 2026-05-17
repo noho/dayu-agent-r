@@ -393,7 +393,7 @@ Runner 的 `runner_done` 只表示本次 RunnerEvent 流结束；提升到 Engin
 
 当本批工具包含 `ToolAwaitingOutcome` 时，Engine 先逐个产出 accepted 工具的 `tool_result_accepted`，再为每个 awaiting 工具产出 `tool_awaiting`，随后直接以 `run_suspended` 收口；**不**产出 `tool_calls_batch_done`。换言之，`tool_calls_batch_done` 仅在本批不含 awaiting 时产出，作为 "本批 accepted outcome 已全部接受、可进入下一轮 Runner" 的信号；调用方依赖批处理完整性时必须同时识别 `tool_awaiting` + `run_suspended` 的 awaiting 路径。
 
-HTTP 200 response 在 effective stream 为 `True` 且 `Content-Type` 为 `text/event-stream` 或不含 JSON 时按 SSE 解析；`Content-Type` 含 JSON 或 effective stream 为 `False` 时按非流式 JSON 解析。SSE `usage` 字段只承载附加 token 统计，字段格式错误会记录协议诊断日志并忽略该 usage，不终止后续 content / tool call 收口。
+HTTP 200 response 在 effective stream 为 `True` 且 `Content-Type` 为 `text/event-stream` 或不含 JSON 时按 SSE 解析；`Content-Type` 含 JSON 或 effective stream 为 `False` 时按非流式 JSON 解析。SSE 顶层 `error` object、既无有效 `choices` 也无有效 `usage` 的 chunk 会产出 `provider_protocol_error` 并以 `runner_done(error)` 收口；usage-only chunk 是合法统计 chunk。SSE `usage` 字段只承载附加 token 统计，字段格式错误会记录协议诊断日志并忽略该 usage，不终止后续 content / tool call 收口。SSE 与非流式响应遇到未知 provider `finish_reason` 时保留当前 `stop` 回落并记录 warning 诊断，避免 provider 协议变化被完全静默吞掉。
 
 ## 关键机制
 

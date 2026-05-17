@@ -783,6 +783,8 @@ CREATE TABLE IF NOT EXISTS {TABLE_HOST_MEMORY_DIAGNOSTICS} (
 )
 """
 
+# ``recovering`` 由 Phase 11 recovery owner 写入；当前 P9 transition
+# 代码尚不写入该状态，schema 与 active Run 单例约束先保留识别能力。
 _HOST_RUNS_ONE_ACTIVE_PER_SESSION_INDEX_DDL = f"""
 CREATE UNIQUE INDEX IF NOT EXISTS {INDEX_HOST_RUNS_ONE_ACTIVE_PER_SESSION}
 ON {TABLE_HOST_RUNS}(session_id)

@@ -22,7 +22,7 @@ pyright 通过 ``typing.assert_never`` 守护。
 from __future__ import annotations
 
 from dataclasses import dataclass
-from typing import TypeAlias
+from typing import Final, Literal, TypeAlias
 
 from dayu.contracts.tool_await import ToolAwaitSnapshot, ToolAwaitSpec
 from dayu.contracts.tool_result import (
@@ -32,13 +32,20 @@ from dayu.contracts.tool_result import (
 )
 
 
-TOOL_CANCELLED_REASON_APPROVAL_DENIED: str = "approval_denied"
+ToolCancelledReason: TypeAlias = Literal[
+    "approval_denied",
+    "host_cancelled",
+    "timeout",
+]
+"""工具级取消原因静态类型。"""
+
+TOOL_CANCELLED_REASON_APPROVAL_DENIED: Final[ToolCancelledReason] = "approval_denied"
 """工具级取消原因常量：审批被拒。"""
 
-TOOL_CANCELLED_REASON_HOST_CANCELLED: str = "host_cancelled"
+TOOL_CANCELLED_REASON_HOST_CANCELLED: Final[ToolCancelledReason] = "host_cancelled"
 """工具级取消原因常量：Host 治理决策取消该工具。"""
 
-TOOL_CANCELLED_REASON_TIMEOUT: str = "timeout"
+TOOL_CANCELLED_REASON_TIMEOUT: Final[ToolCancelledReason] = "timeout"
 """工具级取消原因常量：工具自身超时取消。"""
 
 ALLOWED_TOOL_CANCELLED_REASONS: frozenset[str] = frozenset(
@@ -102,7 +109,7 @@ class ToolCancelledOutcome:
         与其它 outcome 保持一致；无元信息时为 ``None``。
     """
 
-    reason: str
+    reason: ToolCancelledReason
     message: str
     hint: str | None
     meta: ToolResultMeta | None
@@ -197,6 +204,7 @@ __all__ = [
     "TOOL_CANCELLED_REASON_APPROVAL_DENIED",
     "TOOL_CANCELLED_REASON_HOST_CANCELLED",
     "TOOL_CANCELLED_REASON_TIMEOUT",
+    "ToolCancelledReason",
     "ToolAwaitingOutcome",
     "ToolCancelledOutcome",
     "ToolCompletedOutcome",

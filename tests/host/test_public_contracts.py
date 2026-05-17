@@ -71,6 +71,7 @@ from dayu.host import (
     WaitResolutionSource,
 )
 from dayu.host.tool_runtime import ToolFactKind
+from dayu.host.memory import MemoryProjectionPolicy
 from dayu.engine.contracts.agent_policy import AgentPolicy
 from dayu.engine.contracts.runner_spec import RunnerCallOptions, RunnerSpec
 
@@ -659,6 +660,8 @@ def test_host_local_execution_options_accept_valid_shape() -> None:
     assert options.runner_spec.provider == "test"
     assert options.runner_options.stream is False
     assert options.agent_policy.allow_tool_calls is False
+    assert options.memory_projection_policy.max_verified_facts > 0
+    assert options.memory_projection_catchup_batch_size > 0
 
 
 def test_host_local_execution_options_rejects_invalid_typed_fields() -> None:
@@ -684,6 +687,22 @@ def test_host_local_execution_options_rejects_invalid_typed_fields() -> None:
             _local_execution_options(),
             worker_factory=cast(LocalEngineWorkerFactory, None),
         )
+    with pytest.raises(TypeError, match="memory_projection_policy"):
+        replace(
+            _local_execution_options(),
+            memory_projection_policy=cast(MemoryProjectionPolicy, _runner_spec()),
+        )
+    with pytest.raises(ValueError, match="memory_projection_catchup_batch_size"):
+        replace(_local_execution_options(), memory_projection_catchup_batch_size=0)
+
+
+def test_operation_context_rejects_empty_optional_text_fields() -> None:
+    """OperationContext 可选字符串存在时必须非空。"""
+
+    with pytest.raises(ValueError, match="business_object_type"):
+        replace(_operation_context(), business_object_type="")
+    with pytest.raises(ValueError, match="scenario"):
+        replace(_operation_context(), scenario=" ")
 
 
 def test_attempt_dispatch_snapshot_rejects_none_cancellation_token() -> None:

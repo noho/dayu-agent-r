@@ -68,6 +68,114 @@ async def test_sse_invalid_json_emits_protocol_error() -> None:
 
 
 @pytest.mark.asyncio
+async def test_sse_provider_error_object_emits_protocol_error() -> None:
+    """SSE 200 流内 provider error object 必须失败收口。"""
+
+    payload_json = json.dumps(
+        {"error": {"message": "bad upstream", "type": "server_error"}},
+        separators=(",", ":"),
+    )
+    events = await parse_sse(
+        [_sse_json_chunk(payload_json), b"data: [DONE]\n\n"],
+        provider_request_id="req_provider_error",
+    )
+
+    assert [event.type for event in events] == [
+        RunnerEventType.PROVIDER_PROTOCOL_ERROR,
+        RunnerEventType.RUNNER_DONE,
+    ]
+    error = events[0].data
+    assert isinstance(error, RunnerProtocolErrorData)
+    assert error.error_code == "sse_provider_error"
+    assert error.message == "bad upstream"
+    assert error.provider_request_id == "req_provider_error"
+    assert error.raw_payload == {
+        "error": {"message": "bad upstream", "type": "server_error"}
+    }
+    done = events[1].data
+    assert isinstance(done, RunnerDoneData)
+    assert done.finish_reason is FinishReason.ERROR
+
+
+@pytest.mark.asyncio
+async def test_sse_missing_choices_without_usage_emits_protocol_error() -> None:
+    """既无有效 choices 也无有效 usage 的 SSE object 必须失败收口。"""
+
+    events = await parse_sse(
+        [_sse_json_chunk('{"id":"chunk-without-choices"}'), b"data: [DONE]\n\n"]
+    )
+
+    assert [event.type for event in events] == [
+        RunnerEventType.PROVIDER_PROTOCOL_ERROR,
+        RunnerEventType.RUNNER_DONE,
+    ]
+    error = events[0].data
+    assert isinstance(error, RunnerProtocolErrorData)
+    assert error.error_code == "sse_missing_choices"
+    done = events[1].data
+    assert isinstance(done, RunnerDoneData)
+    assert done.finish_reason is FinishReason.ERROR
+
+
+@pytest.mark.asyncio
+async def test_sse_usage_only_chunk_does_not_protocol_error() -> None:
+    """usage-only chunk 是合法诊断 chunk，不应被 missing choices 误伤。"""
+
+    payload_json = json.dumps(
+        {
+            "usage": {
+                "prompt_tokens": 5,
+                "completion_tokens": 0,
+                "total_tokens": 5,
+            }
+        },
+        separators=(",", ":"),
+    )
+    events = await parse_sse(
+        [_sse_json_chunk(payload_json), b"data: [DONE]\n\n"]
+    )
+
+    assert not any(
+        event.type is RunnerEventType.PROVIDER_PROTOCOL_ERROR
+        for event in events
+    )
+    assert any(
+        event.type is RunnerEventType.RUNNER_USAGE_RECORDED for event in events
+    )
+
+
+@pytest.mark.asyncio
+async def test_sse_unknown_finish_reason_logs_diagnostic(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """SSE 未知 finish_reason 保留 STOP 回落，同时记录诊断日志。"""
+
+    caplog.set_level(
+        logging.WARNING, logger="dayu.engine.runners.openai.sse_parser"
+    )
+    events = await parse_sse(
+        [
+            b'data: {"choices":[{"delta":{"content":"ok"}}]}\n\n',
+            b'data: {"choices":[{"finish_reason":"safety_stop","delta":{}}]}\n\n',
+            b"data: [DONE]\n\n",
+        ]
+    )
+
+    completed_events = [
+        event for event in events
+        if event.type is RunnerEventType.RUNNER_CONTENT_COMPLETED
+    ]
+    assert len(completed_events) == 1
+    completed = completed_events[0].data
+    assert isinstance(completed, RunnerContentCompletedData)
+    assert completed.finish_reason is FinishReason.STOP
+    assert any(
+        "unknown_finish_reason" in record.getMessage()
+        for record in caplog.records
+    )
+
+
+@pytest.mark.asyncio
 async def test_sse_invalid_json_reports_bounded_partial_tool_call() -> None:
     """SSE 中途失败时协议错误携带 partial tool call 摘要且不含 raw arguments。"""
 

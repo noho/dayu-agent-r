@@ -337,6 +337,11 @@ def _resolve_finish_reason(choice: dict[str, JsonValue]) -> FinishReason:
         mapped = _FINISH_REASON_MAP.get(raw)
         if mapped is not None:
             return mapped
+        _LOGGER.warning(
+            "non_stream.protocol_diagnostic code=unknown_finish_reason "
+            "finish_reason=%s",
+            raw,
+        )
     return FinishReason.STOP
 
 

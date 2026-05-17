@@ -3,6 +3,9 @@
 from __future__ import annotations
 
 import json
+import logging
+
+import pytest
 
 from dayu.engine.contracts.finish_reason import FinishReason
 from dayu.engine.contracts.runner_events import (
@@ -60,6 +63,40 @@ def test_non_stream_content_completed_and_usage_and_done() -> None:
     done = events[2].data
     assert isinstance(done, RunnerDoneData)
     assert done.finish_reason is FinishReason.STOP
+
+
+def test_non_stream_unknown_finish_reason_logs_diagnostic(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """非流式未知 finish_reason 保留 STOP 回落，同时记录诊断日志。"""
+
+    caplog.set_level(
+        logging.WARNING, logger="dayu.engine.runners.openai.non_stream_parser"
+    )
+    payload = json.dumps(
+        {
+            "choices": [
+                {
+                    "finish_reason": "safety_stop",
+                    "message": {"role": "assistant", "content": "answer"},
+                }
+            ]
+        }
+    ).encode("utf-8")
+
+    events = list(
+        parse_non_stream_response(
+            payload, hook=make_no_thought_hook(), provider_request_id=None
+        )
+    )
+
+    completed = events[0].data
+    assert isinstance(completed, RunnerContentCompletedData)
+    assert completed.finish_reason is FinishReason.STOP
+    assert any(
+        "unknown_finish_reason" in record.getMessage()
+        for record in caplog.records
+    )
 
 
 def test_non_stream_tool_calls_emitted() -> None:

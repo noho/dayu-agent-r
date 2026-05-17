@@ -31,6 +31,7 @@ EXPECTED_EXPORTS: frozenset[str] = frozenset(
         "ToolCallRequest",
         "ToolCallable",
         "ToolCancelledOutcome",
+        "ToolCancelledReason",
         "ToolCompletedOutcome",
         "ToolDefinition",
         "ToolDisplayInfo",

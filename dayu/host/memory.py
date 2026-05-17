@@ -35,6 +35,16 @@ _EMPTY_SIZE_UNITS = 0
 CONVERSATION_MEMORY_CONSUMER_ID = "host.memory.session.v1"
 """Conversation memory projection consumer 稳定 id。"""
 
+DEFAULT_MEMORY_MAX_PINNED_ITEMS = 8
+DEFAULT_MEMORY_MAX_VERIFIED_FACTS = 16
+DEFAULT_MEMORY_MAX_WORKING_ASSUMPTIONS = 8
+DEFAULT_MEMORY_RECENT_RAW_TURNS_FLOOR = 2
+DEFAULT_MEMORY_MAX_RAW_TURN_SIZE_UNITS = 1024
+DEFAULT_MEMORY_HISTORY_POOL_SIZE_UNITS = 4096
+DEFAULT_MEMORY_STABLE_LAYER_SIZE_UNITS = 2048
+DEFAULT_MEMORY_MAX_LAG_EVENTS_FOR_INLINE_DELTA = 16
+DEFAULT_MEMORY_MAX_DELTA_REPAIR_EVENTS = 32
+
 _EVENT_TYPE_USER_INPUT_ACCEPTED = "USER_INPUT_ACCEPTED"
 _EVENT_TYPE_RUN_SUCCEEDED = "RUN_SUCCEEDED"
 _EVENT_TYPE_TOOL_RESULT_ACCEPTED = "TOOL_RESULT_ACCEPTED"
@@ -608,6 +618,28 @@ class MemoryProjectionPolicy:
             "max_lag_events_for_inline_delta",
         )
         _require_non_negative(self.max_delta_repair_events, "max_delta_repair_events")
+
+
+def default_memory_projection_policy() -> MemoryProjectionPolicy:
+    """构造 Host 本地执行默认 conversation memory projection policy。
+
+    :returns: 默认 memory projection policy。
+    :raises ValueError: 默认常量非法时抛出。
+    """
+
+    return MemoryProjectionPolicy(
+        max_pinned_items=DEFAULT_MEMORY_MAX_PINNED_ITEMS,
+        max_verified_facts=DEFAULT_MEMORY_MAX_VERIFIED_FACTS,
+        max_working_assumptions=DEFAULT_MEMORY_MAX_WORKING_ASSUMPTIONS,
+        recent_raw_turns_floor=DEFAULT_MEMORY_RECENT_RAW_TURNS_FLOOR,
+        max_raw_turn_size_units=DEFAULT_MEMORY_MAX_RAW_TURN_SIZE_UNITS,
+        history_pool_size_units=DEFAULT_MEMORY_HISTORY_POOL_SIZE_UNITS,
+        stable_layer_size_units=DEFAULT_MEMORY_STABLE_LAYER_SIZE_UNITS,
+        max_lag_events_for_inline_delta=(
+            DEFAULT_MEMORY_MAX_LAG_EVENTS_FOR_INLINE_DELTA
+        ),
+        max_delta_repair_events=DEFAULT_MEMORY_MAX_DELTA_REPAIR_EVENTS,
+    )
 
 
 @dataclass(frozen=True, slots=True)

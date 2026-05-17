@@ -8,7 +8,7 @@
 from __future__ import annotations
 
 from datetime import datetime
-from typing import assert_never
+from typing import assert_never, cast
 
 import pytest
 
@@ -19,6 +19,7 @@ from dayu.contracts.tool_await import (
 )
 from dayu.contracts.tool_outcome import (
     TOOL_CANCELLED_REASON_APPROVAL_DENIED,
+    ToolCancelledReason,
     BatchToolExecutionOutcome,
     BatchToolExecutionRecord,
     ToolAwaitingOutcome,
@@ -151,7 +152,7 @@ def test_cancelled_rejects_invalid_reason() -> None:
 
     with pytest.raises(ValueError):
         ToolCancelledOutcome(
-            reason="not_a_real_reason",
+            reason=cast(ToolCancelledReason, "not_a_real_reason"),
             message="x",
             hint=None,
             meta=None,

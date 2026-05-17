@@ -13,7 +13,7 @@ from __future__ import annotations
 import pathlib
 import re
 from collections.abc import AsyncIterator
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from datetime import UTC, datetime
 from enum import StrEnum
 from typing import Protocol, TypeAlias
@@ -31,6 +31,10 @@ from dayu.host._public_validation import (
 )
 from dayu.host._public_validation import (
     require_optional_non_empty as _require_optional_non_empty,
+)
+from dayu.host.memory import (
+    MemoryProjectionPolicy,
+    default_memory_projection_policy,
 )
 from dayu.host.tooling import HostToolingOptions as _HostToolingOptions
 
@@ -258,7 +262,8 @@ class RunStatus(StrEnum):
     """Run 生命周期状态。
 
     成员覆盖 Host 对用户可见目标的排队、执行、等待、取消、恢复与终态。
-    ``SUCCEEDED``、``FAILED``、``CANCELLED``、``LOST`` 是终态。
+    ``RECOVERING`` 由 Phase 11 recovery owner 接入；当前 P9 生产转换代码
+    尚不写入。``SUCCEEDED``、``FAILED``、``CANCELLED``、``LOST`` 是终态。
     """
 
     QUEUED = "queued"
@@ -695,6 +700,10 @@ class HostLocalExecutionOptions:
     :param runner_options: Engine Runner 调用参数。
     :param agent_policy: Engine Agent policy。
     :param worker_factory: 本地 worker factory。
+    :param memory_projection_policy: 本地 dispatch 注入 RunInputBuilder 的
+        durable conversation memory policy。
+    :param memory_projection_catchup_batch_size: worker 启动前追平 memory
+        projection 时单批最大扫描 EventLog row 数。
     :param tooling_options: Host construction 阶段传入的业务工具选项；无则
         本地 dispatch 仍按 no-tool 模式构造 Engine request。
     :param enable_truncation_manager: tool-enabled 本地 dispatch 是否为当前
@@ -713,6 +722,10 @@ class HostLocalExecutionOptions:
     runner_options: RunnerCallOptions
     agent_policy: AgentPolicy
     worker_factory: LocalEngineWorkerFactory
+    memory_projection_policy: MemoryProjectionPolicy = field(
+        default_factory=default_memory_projection_policy
+    )
+    memory_projection_catchup_batch_size: int = 128
     tooling_options: _HostToolingOptions | None = None
     enable_truncation_manager: bool = True
 
@@ -783,6 +796,17 @@ class HostLocalExecutionOptions:
             raise TypeError(
                 "HostLocalExecutionOptions.worker_factory must be non-None"
             )
+        if not isinstance(self.memory_projection_policy, MemoryProjectionPolicy):
+            raise TypeError(
+                "HostLocalExecutionOptions.memory_projection_policy must be "
+                "MemoryProjectionPolicy"
+            )
+        _require_positive_int(
+            self.memory_projection_catchup_batch_size,
+            field_name=(
+                "HostLocalExecutionOptions.memory_projection_catchup_batch_size"
+            ),
+        )
         if self.tooling_options is not None and not isinstance(
             self.tooling_options, _HostToolingOptions
         ):
@@ -886,8 +910,15 @@ class OperationContext:
             self.business_domain, field_name="OperationContext.business_domain"
         )
         _require_optional_non_empty(
+            self.business_object_type,
+            field_name="OperationContext.business_object_type",
+        )
+        _require_optional_non_empty(
             self.business_object_id,
             field_name="OperationContext.business_object_id",
+        )
+        _require_optional_non_empty(
+            self.scenario, field_name="OperationContext.scenario"
         )
         _require_optional_non_empty(
             self.correlation_id, field_name="OperationContext.correlation_id"

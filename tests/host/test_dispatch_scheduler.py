@@ -15,6 +15,7 @@ import pytest
 from dayu.engine.contracts.agent_policy import AgentPolicy
 from dayu.engine.contracts.agent_run import AgentRunRequest
 from dayu.engine.contracts.engine_events import EngineEvent
+from dayu.engine.contracts.messages import AgentMessage
 from dayu.engine.contracts.runner_spec import RunnerCallOptions, RunnerSpec
 from dayu.contracts.json_value import JsonValue
 from dayu.contracts.tool_call import (
@@ -50,6 +51,7 @@ from dayu.host.tooling import (
 from dayu.host.dispatch import (
     ActiveCancelMessage,
     ActiveWorkerRegistry,
+    DispatchDrainResult,
     HostDispatchScheduler,
 )
 from dayu.host.durable.codec import sha256_digest_json
@@ -509,6 +511,19 @@ class _EnqueueOnSecondEmptyQueue(asyncio.Queue[PendingDispatchRecord]):
         return super().empty()
 
 
+class _FailingDrainLoopScheduler(HostDispatchScheduler):
+    """测试用 drain_once 崩溃 scheduler。"""
+
+    async def drain_once(self) -> DispatchDrainResult:
+        """模拟 drain_once 未预期异常。
+
+        :returns: 不会返回。
+        :raises RuntimeError: 始终抛出测试异常。
+        """
+
+        raise RuntimeError("drain failure")
+
+
 @pytest.mark.asyncio
 async def test_pending_waiting_dispatching_worker_accept_marks_running(
     tmp_path: Path,
@@ -550,6 +565,95 @@ async def test_pending_waiting_dispatching_worker_accept_marks_running(
 
 
 @pytest.mark.asyncio
+async def test_drain_loop_logs_unexpected_exception(
+    tmp_path: Path,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """drain loop 未预期异常退出时必须记录诊断日志。"""
+
+    caplog.set_level(logging.WARNING, logger="dayu.host.dispatch")
+    with open_host_durable_store(_options(tmp_path)) as store:
+        lane_controller = await LaneController.open(
+            [
+                LaneConfig(
+                    name=_LANE_NAME,
+                    capacity=1,
+                    default_timeout_seconds=0.1,
+                    claim_ttl_seconds=1.0,
+                    heartbeat_interval_seconds=0.1,
+                )
+            ],
+            coordinator=SQLiteLaneCoordinatorConfig(
+                db_path=tmp_path / "lane-drain-loop.sqlite3"
+            ),
+        )
+        scheduler = _FailingDrainLoopScheduler(
+            transaction_runner=store.transaction_runner,
+            event_log_store=EventLogStore(),
+            local_execution=HostLocalExecutionOptions(
+                lane_db_path=tmp_path / "lane-drain-loop.sqlite3",
+                lane_name=_LANE_NAME,
+                lane_capacity=1,
+                lane_default_timeout_seconds=0.1,
+                lane_claim_ttl_seconds=1.0,
+                lane_heartbeat_interval_seconds=0.1,
+                worker_startup_timeout_seconds=1.0,
+                dispatch_poll_interval_seconds=0.01,
+                runner_spec=_runner_spec(),
+                runner_options=RunnerCallOptions(
+                    temperature=None, max_tokens=None, top_p=None, stream=False
+                ),
+                agent_policy=_agent_policy(False),
+                worker_factory=_FakeWorkerFactory(),
+            ),
+            lane_controller=lane_controller,
+            host_handle_id="host-drain-loop-log",
+        )
+        try:
+            await scheduler._drain_loop()
+        finally:
+            await scheduler.close()
+
+    assert any(
+        "dispatch drain loop stopped unexpectedly" in record.getMessage()
+        for record in caplog.records
+    )
+
+
+@pytest.mark.asyncio
+async def test_scheduler_injects_durable_memory_for_no_tool_dispatch(
+    tmp_path: Path,
+) -> None:
+    """no-tool dispatch 默认接入 durable memory provider。"""
+
+    factory = _FakeWorkerFactory(accepted_handle=_CloseCountingHandle())
+    with open_host_durable_store(_options(tmp_path)) as store:
+        session_id = _ensure_session_id(store.transaction_runner)
+        _append_user_input(
+            store.transaction_runner,
+            session_id=session_id,
+            run_id="run-memory-previous",
+            event_id="event-input-memory-previous",
+            display_text="previous memory prompt",
+            client_request_id="client-memory-previous",
+            idempotency_key="idem-memory-previous",
+        )
+        seeded = _seed_current_run(store, session_id=session_id)
+        scheduler = await _open_scheduler(tmp_path, store, factory)
+        try:
+            scheduler.wake_dispatch(_pending_dispatch(seeded))
+            result = await scheduler.drain_once()
+
+            request = factory.accepted_requests[0]
+            contents = tuple(_message_text(message) for message in request.messages)
+            assert result.dispatched == 1
+            assert "previous memory prompt" in contents
+            assert contents[-1] == "dispatch prompt"
+        finally:
+            await scheduler.close()
+
+
+@pytest.mark.asyncio
 async def test_scheduler_uses_toolruntime_when_tooling_is_configured(
     tmp_path: Path,
 ) -> None:
@@ -559,7 +663,17 @@ async def test_scheduler_uses_toolruntime_when_tooling_is_configured(
     tool = _CountingTool()
     projection = _FailingProjectionCatchup()
     with open_host_durable_store(_options(tmp_path)) as store:
-        seeded = _seed_current_run(store)
+        session_id = _ensure_session_id(store.transaction_runner)
+        _append_user_input(
+            store.transaction_runner,
+            session_id=session_id,
+            run_id="run-tool-memory-previous",
+            event_id="event-input-tool-memory-previous",
+            display_text="tool-enabled previous memory prompt",
+            client_request_id="client-tool-memory-previous",
+            idempotency_key="idem-tool-memory-previous",
+        )
+        seeded = _seed_current_run(store, session_id=session_id)
         scheduler = await _open_scheduler(
             tmp_path,
             store,
@@ -573,9 +687,11 @@ async def test_scheduler_uses_toolruntime_when_tooling_is_configured(
             result = await scheduler.drain_once()
 
             request = factory.accepted_requests[0]
+            contents = tuple(_message_text(message) for message in request.messages)
             assert result.dispatched == 1
             assert request.disable_tools is False
             assert request.agent_policy.allow_tool_calls is True
+            assert "tool-enabled previous memory prompt" in contents
             assert [schema.function.name for schema in request.tool_schemas] == [
                 "fake_dispatch_tool"
             ]
@@ -1340,6 +1456,16 @@ def _tool_execution_request(
     )
 
 
+def _message_text(message: AgentMessage) -> str | None:
+    """读取 Agent message 的文本内容。
+
+    :param message: Agent message。
+    :returns: 文本内容；assistant 空内容时返回 ``None``。
+    """
+
+    return message.content
+
+
 def _agent_policy(allow_tool_calls: bool) -> AgentPolicy:
     """构造测试 AgentPolicy。
 
@@ -1355,24 +1481,31 @@ def _agent_policy(allow_tool_calls: bool) -> AgentPolicy:
     )
 
 
-def _seed_current_run(store: HostDurableStore) -> _SeededRun:
+def _seed_current_run(
+    store: HostDurableStore, *, session_id: str | None = None
+) -> _SeededRun:
     """创建 running Run、STARTING Attempt 和 pending dispatch。
 
     :param store: durable store。
+    :param session_id: 可选已有 Session id；不传则创建默认测试 Session。
     :returns: seeded run 摘要。
     """
 
-    session_id = _ensure_session_id(store.transaction_runner)
+    actual_session_id = (
+        _ensure_session_id(store.transaction_runner)
+        if session_id is None
+        else session_id
+    )
     seeded = _SeededRun(
-        session_id=session_id,
+        session_id=actual_session_id,
         run_id="run-dispatch",
         attempt_id="attempt-dispatch",
         execution_id="execution-dispatch",
         dispatch_record_id="dispatch-dispatch",
     )
-    _append_user_input(
+    input_event_sequence = _append_user_input(
         store.transaction_runner,
-        session_id=session_id,
+        session_id=actual_session_id,
         run_id=seeded.run_id,
         event_id="event-input-dispatch",
     )
@@ -1382,11 +1515,11 @@ def _seed_current_run(store: HostDurableStore) -> _SeededRun:
             transaction,
             EventLogStore(),
             CreateRunningRunInput(
-                session_id=session_id,
+                session_id=actual_session_id,
                 run_id=seeded.run_id,
                 client_request_id="client-dispatch",
                 input_event_id="event-input-dispatch",
-                input_event_sequence=2,
+                input_event_sequence=input_event_sequence,
                 run_accepted_event_id="event-run-accepted-dispatch",
                 run_started_event_id="event-run-started-dispatch",
                 attempt_started_event_id="event-attempt-started-dispatch",
@@ -1429,18 +1562,24 @@ def _append_user_input(
     session_id: str,
     run_id: str,
     event_id: str,
-) -> None:
+    display_text: str = "dispatch prompt",
+    client_request_id: str = "client-dispatch",
+    idempotency_key: str = "idem-input",
+) -> int:
     """追加 USER_INPUT_ACCEPTED。
 
     :param transaction_runner: transaction runner。
     :param session_id: Session id。
     :param run_id: Run id。
     :param event_id: event id。
-    :returns: ``None``。
+    :param display_text: 用户输入展示文本。
+    :param client_request_id: EventLog client request id。
+    :param idempotency_key: EventLog idempotency key。
+    :returns: 追加后的 EventLog sequence。
     """
 
-    def _operation(transaction: HostTransaction) -> None:
-        EventLogStore().append_event(
+    def _operation(transaction: HostTransaction) -> int:
+        event = EventLogStore().append_event(
             transaction,
             EventLogAppendRequest(
                 event_id=event_id,
@@ -1453,12 +1592,12 @@ def _append_user_input(
                 occurred_at=_NOW,
                 actor="tester",
                 source="pytest",
-                client_request_id="client-dispatch",
-                idempotency_key="idem-input",
+                client_request_id=client_request_id,
+                idempotency_key=idempotency_key,
                 policy_decision=None,
                 reason=None,
                 payload_json={
-                    "display_text": "dispatch prompt",
+                    "display_text": display_text,
                     "operation_kind": "unit_test",
                     "execution_target": "target-dispatch",
                 },
@@ -1466,8 +1605,9 @@ def _append_user_input(
                 payload_digest=None,
             ),
         )
+        return event.row.event_sequence
 
-    transaction_runner.run_write(_operation)
+    return transaction_runner.run_write(_operation)
 
 
 def _pending_dispatch(seeded: _SeededRun) -> PendingDispatchRecord:

@@ -283,6 +283,53 @@ def read_latest_memory_snapshot(
     return _snapshot_row_from_host_row(row)
 
 
+def read_latest_memory_snapshot_at_or_before(
+    transaction: HostTransaction,
+    *,
+    session_id: str,
+    consumer_id: str,
+    policy_digest: str,
+    max_checkpoint_event_sequence: int,
+) -> MemorySnapshotRow | None:
+    """读取不超过指定 cursor 的最新 memory snapshot。
+
+    :param transaction: 调用方提供的 Host durable transaction。
+    :param session_id: session id。
+    :param consumer_id: memory projection consumer id。
+    :param policy_digest: memory policy digest。
+    :param max_checkpoint_event_sequence: 最大允许 checkpoint event sequence。
+    :returns: 存在时返回最新 snapshot row，否则返回 ``None``。
+    :raises HostDurableError: 输入无效、cursor 为负、durable row 类型不符合预期或 digest 校验失败时抛出。
+    """
+
+    _require_non_empty_text(session_id, field_name="session_id")
+    _require_non_empty_text(consumer_id, field_name="consumer_id")
+    _require_non_empty_text(policy_digest, field_name="policy_digest")
+    if max_checkpoint_event_sequence < _ZERO_CURSOR_SEQUENCE:
+        raise HostDurableError("max_checkpoint_event_sequence must be non-negative")
+    row = transaction.fetchone(
+        f"""
+        SELECT snapshot_json, updated_at
+        FROM {TABLE_HOST_MEMORY_SNAPSHOTS}
+        WHERE session_id = ?
+          AND consumer_id = ?
+          AND policy_digest = ?
+          AND checkpoint_event_sequence <= ?
+        ORDER BY checkpoint_event_sequence DESC, updated_at DESC, snapshot_id DESC
+        LIMIT 1
+        """,
+        (
+            session_id,
+            consumer_id,
+            policy_digest,
+            max_checkpoint_event_sequence,
+        ),
+    )
+    if row is None:
+        return None
+    return _snapshot_row_from_host_row(row)
+
+
 def write_memory_snapshot(
     transaction: HostTransaction,
     snapshot: ConversationMemorySnapshot,

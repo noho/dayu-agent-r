@@ -49,7 +49,7 @@ from dayu.host.durable.event_log import (
     read_event_by_id,
 )
 from dayu.host.durable.errors import HostDurableError
-from dayu.host.durable.memory import read_latest_memory_snapshot
+from dayu.host.durable.memory import read_latest_memory_snapshot_at_or_before
 from dayu.host.durable.state import (
     AttemptRow,
     DispatchRecordRow,
@@ -727,11 +727,12 @@ class DurableMemorySnapshotProvider:
         """
 
         try:
-            row = read_latest_memory_snapshot(
+            row = read_latest_memory_snapshot_at_or_before(
                 transaction,
                 session_id=session_id,
                 consumer_id=self._consumer_id,
                 policy_digest=self._policy_digest,
+                max_checkpoint_event_sequence=required_event_sequence,
             )
         except HostDurableError as exc:
             repair_request = MemoryRepairRequest(

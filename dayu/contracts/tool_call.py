@@ -72,6 +72,23 @@ class ToolCallRequest:
     index_in_iteration: int
     provider_state: ToolCallProviderState | None
 
+    def __post_init__(self) -> None:
+        """校验工具调用请求的最小完整性。
+
+        :returns: ``None``。
+        :raises ValueError: ``tool_call_id`` 或 ``name`` 为空 / 纯空白，
+            或 ``index_in_iteration`` 为负数时抛出。
+        """
+
+        if self.tool_call_id.strip() == "":
+            raise ValueError("ToolCallRequest.tool_call_id must be non-empty")
+        if self.name.strip() == "":
+            raise ValueError("ToolCallRequest.name must be non-empty")
+        if self.index_in_iteration < 0:
+            raise ValueError(
+                "ToolCallRequest.index_in_iteration must be non-negative"
+            )
+
 
 @dataclass(frozen=True, slots=True)
 class BatchToolExecutionContext:

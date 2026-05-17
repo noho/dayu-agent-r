@@ -75,11 +75,14 @@ from dayu.host.projection import (
     catch_up_projection_best_effort,
 )
 from dayu.host.run_input import (
+    DurableMemorySnapshotProvider,
+    MemoryProjectionRepairRequired,
     PolicySnapshot,
     RunInputBuilder,
     create_no_tool_run_input_builder,
     create_tool_enabled_run_input_builder,
 )
+from dayu.host.memory_repair import catch_up_conversation_memory_projection
 from dayu.host.tool_runtime import (
     DefaultHostToolFactAcceptPort,
     DefaultToolRuntimeFactory,
@@ -106,6 +109,7 @@ _EVENT_ACTOR = "host.dispatch"
 _EVENT_TYPE_ATTEMPT_RUNNING = "ATTEMPT_RUNNING"
 _WORKER_ACCEPT_REASON = "local_worker_accepted"
 _WORKER_STARTUP_TIMEOUT_REASON = "worker_startup_timeout"
+_MEMORY_PROJECTION_REPAIR_REQUIRED_REASON = "memory_projection_repair_required"
 _LOCAL_POLICY_SNAPSHOT_REF = "host-local-no-tool-policy"
 _EVENT_ID_ATTEMPT_RUNNING_PREFIX = "event-attempt-running"
 _EVENT_ID_ATTEMPT_FAILED_PREFIX = "event-attempt-failed"
@@ -486,12 +490,23 @@ class HostDispatchScheduler:
         :raises asyncio.CancelledError: scheduler close 时透传取消。
         """
 
-        while not self._closed:
-            if self._queue.empty():
-                await asyncio.sleep(
-                    self._local_execution.dispatch_poll_interval_seconds
-                )
-            await self.drain_once()
+        try:
+            while not self._closed:
+                if self._queue.empty():
+                    await asyncio.sleep(
+                        self._local_execution.dispatch_poll_interval_seconds
+                    )
+                await self.drain_once()
+        except asyncio.CancelledError:
+            raise
+        except Exception as exc:
+            _LOGGER.warning(
+                "dispatch drain loop stopped unexpectedly; continuing "
+                "host_handle_id=%s error_type=%s",
+                self._host_handle_id,
+                exc.__class__.__name__,
+                exc_info=True,
+            )
 
     async def _dispatch_one(self, record: PendingDispatchRecord) -> str:
         """处理一个 dispatch wakeup。
@@ -508,12 +523,16 @@ class HostDispatchScheduler:
             timeout_seconds=self._local_execution.lane_default_timeout_seconds,
         )
         if isinstance(acquire, LaneAcquireTimedOut):
-            self._safe_closeout_worker_startup_timeout(record)
+            self._safe_closeout_worker_startup_timeout(
+                record, reason=_WORKER_STARTUP_TIMEOUT_REASON
+            )
             return "timed_out"
         if isinstance(acquire, LaneAcquireCancelled):
             if self._closed:
                 return "skipped"
-            self._safe_closeout_worker_startup_timeout(record)
+            self._safe_closeout_worker_startup_timeout(
+                record, reason=_WORKER_STARTUP_TIMEOUT_REASON
+            )
             return "timed_out"
         if not isinstance(acquire, LaneAcquired):
             return "skipped"
@@ -546,7 +565,9 @@ class HostDispatchScheduler:
         except Exception as exc:
             try:
                 self._safe_closeout_worker_startup_timeout(
-                    record, original_error=exc
+                    record,
+                    reason=_WORKER_STARTUP_TIMEOUT_REASON,
+                    original_error=exc,
                 )
             finally:
                 await _safe_release_lane_token(token)
@@ -668,23 +689,44 @@ class HostDispatchScheduler:
         :returns: ``dispatched``、``skipped`` 或 ``timed_out``。
         """
 
-        cancellation_token = _HostCancellationToken()
-        snapshot = self._snapshot_from_dispatch(record, cancellation_token)
-        policy_snapshot = self._local_policy_snapshot()
-        request = self._run_input_builder_for_dispatch(
-            snapshot=snapshot,
-            policy_snapshot=policy_snapshot,
-        ).build(snapshot)
         try:
+            cancellation_token = _HostCancellationToken()
+            snapshot = self._snapshot_from_dispatch(record, cancellation_token)
+            self._catch_up_memory_projection_before_worker(record)
+            policy_snapshot = self._local_policy_snapshot()
+            request = self._run_input_builder_for_dispatch(
+                snapshot=snapshot,
+                policy_snapshot=policy_snapshot,
+            ).build(snapshot)
             worker = self._local_execution.worker_factory.create_worker(snapshot)
             handle = await asyncio.wait_for(
                 worker.accept(snapshot, request),
                 timeout=self._local_execution.worker_startup_timeout_seconds,
             )
+        except MemoryProjectionRepairRequired as exc:
+            try:
+                _LOGGER.warning(
+                    "dispatch memory projection repair required; closing run "
+                    "run_id=%s attempt_id=%s execution_id=%s reason=%s",
+                    record.run_id,
+                    record.attempt_id,
+                    record.execution_id,
+                    exc.repair_request.reason.value,
+                )
+                self._safe_closeout_worker_startup_timeout(
+                    record,
+                    reason=_MEMORY_PROJECTION_REPAIR_REQUIRED_REASON,
+                    original_error=exc,
+                )
+            finally:
+                await _safe_release_lane_token(token)
+            return "timed_out"
         except TimeoutError as exc:
             try:
                 self._safe_closeout_worker_startup_timeout(
-                    record, original_error=exc
+                    record,
+                    reason=_WORKER_STARTUP_TIMEOUT_REASON,
+                    original_error=exc,
                 )
             finally:
                 await _safe_release_lane_token(token)
@@ -692,7 +734,9 @@ class HostDispatchScheduler:
         except Exception as exc:
             try:
                 self._safe_closeout_worker_startup_timeout(
-                    record, original_error=exc
+                    record,
+                    reason=_WORKER_STARTUP_TIMEOUT_REASON,
+                    original_error=exc,
                 )
             finally:
                 await _safe_release_lane_token(token)
@@ -737,6 +781,10 @@ class HostDispatchScheduler:
         """
 
         tooling_options = self._local_execution.tooling_options
+        memory_provider = DurableMemorySnapshotProvider(
+            self._transaction_runner,
+            self._local_execution.memory_projection_policy,
+        )
         if (
             tooling_options is None
             or not policy_snapshot.agent_policy.allow_tool_calls
@@ -744,6 +792,7 @@ class HostDispatchScheduler:
             return create_no_tool_run_input_builder(
                 transaction_runner=self._transaction_runner,
                 policy_snapshot=policy_snapshot,
+                memory_snapshot_provider=memory_provider,
             )
         tool_runtime = DefaultToolRuntimeFactory(
             EffectiveToolBundleBuilder()
@@ -784,7 +833,50 @@ class HostDispatchScheduler:
             transaction_runner=self._transaction_runner,
             policy_snapshot=policy_snapshot,
             tool_runtime_handle=tool_runtime,
+            memory_snapshot_provider=memory_provider,
         )
+
+    def _catch_up_memory_projection_before_worker(
+        self, record: PendingDispatchRecord
+    ) -> None:
+        """在构造 Engine request 前追平 conversation memory projection。
+
+        :param record: pending dispatch 摘要。
+        :returns: ``None``。
+        :raises HostDurableError: projection runner 或 durable 操作失败时抛出。
+        """
+
+        catch_up_conversation_memory_projection(
+            self._transaction_runner,
+            policy=self._local_execution.memory_projection_policy,
+            batch_size=(
+                self._local_execution.memory_projection_catchup_batch_size
+            ),
+            max_event_sequence=(
+                self._required_memory_event_sequence_for_dispatch(record)
+            ),
+        )
+
+    def _required_memory_event_sequence_for_dispatch(
+        self, record: PendingDispatchRecord
+    ) -> int:
+        """读取当前 dispatch 允许 memory projection 覆盖的最大 EventLog cursor。
+
+        :param record: pending dispatch 摘要。
+        :returns: 当前 Attempt started event 之前的 EventLog sequence。
+        :raises RuntimeError: Attempt 缺失或 started cursor 非法时抛出。
+        """
+
+        def _operation(transaction: HostTransaction) -> int:
+            attempt = read_attempt_by_id(transaction, record.attempt_id)
+            if attempt is None:
+                raise RuntimeError("dispatch Attempt is missing")
+            required_event_sequence = attempt.started_event_sequence - 1
+            if required_event_sequence < 0:
+                raise RuntimeError("dispatch memory cursor is invalid")
+            return required_event_sequence
+
+        return self._transaction_runner.run_read(_operation)
 
     def _local_policy_snapshot(self) -> PolicySnapshot:
         """构造本地 dispatch 使用的 policy snapshot。
@@ -907,11 +999,12 @@ class HostDispatchScheduler:
         return self._transaction_runner.run_write(_operation)
 
     def _closeout_worker_startup_timeout(
-        self, record: PendingDispatchRecord
+        self, record: PendingDispatchRecord, *, reason: str
     ) -> None:
         """worker accept timeout 后关闭 STARTING Attempt。
 
         :param record: pending dispatch 摘要。
+        :param reason: 写入 terminal closeout 的失败原因。
         :returns: ``None``。
         """
 
@@ -930,7 +1023,7 @@ class HostDispatchScheduler:
                     occurred_at=datetime.now(UTC),
                     actor=_EVENT_ACTOR,
                     source=_EVENT_SOURCE,
-                    reason=_WORKER_STARTUP_TIMEOUT_REASON,
+                    reason=reason,
                     terminal_summary_ref=None,
                     terminal_summary_digest=None,
                 ),
@@ -958,18 +1051,20 @@ class HostDispatchScheduler:
         self,
         record: PendingDispatchRecord,
         *,
+        reason: str,
         original_error: BaseException | None = None,
     ) -> None:
         """best-effort 关闭 worker startup 失败路径。
 
         :param record: pending dispatch 摘要。
+        :param reason: 写入 terminal closeout 的失败原因。
         :param original_error: 触发 startup failure 的原始异常；无原始异常时
             为 ``None``。
         :returns: ``None``。
         """
 
         try:
-            self._closeout_worker_startup_timeout(record)
+            self._closeout_worker_startup_timeout(record, reason=reason)
         except Exception as exc:
             original_error_type = (
                 original_error.__class__.__name__

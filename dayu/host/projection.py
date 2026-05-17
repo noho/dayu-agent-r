@@ -403,7 +403,11 @@ class ProjectionRunner:
         self._consumer_by_id = consumer_by_id
 
     def run_once(
-        self, consumer_id: ProjectionConsumerId, *, limit: int
+        self,
+        consumer_id: ProjectionConsumerId,
+        *,
+        limit: int,
+        max_event_sequence: int | None = None,
     ) -> ProjectionRunResult:
         """按 checkpoint 为单个 consumer catch up 一批 EventLog rows。
 
@@ -416,12 +420,16 @@ class ProjectionRunner:
 
         :param consumer_id: 要运行的 consumer id。
         :param limit: 本次最多扫描的 EventLog row 数，必须为正数。
+        :param max_event_sequence: 可选最大 EventLog sequence；下一条事件超过
+            该值时停止，不推进 checkpoint。
         :returns: 本次运行结果。
         :raises HostDurableError: consumer 不存在或 limit 无效时抛出。
         """
 
         if limit < _MIN_BATCH_LIMIT:
             raise HostDurableError("projection runner limit must be positive")
+        if max_event_sequence is not None and max_event_sequence < _NO_EVENTS_CURSOR:
+            raise HostDurableError("projection runner max_event_sequence is invalid")
         consumer = self._consumer_for_id(consumer_id)
         started_cursor = self._ensure_checkpoint(consumer_id)
         finished_cursor = started_cursor
@@ -435,7 +443,9 @@ class ProjectionRunner:
             try:
                 step = self._transaction_runner.run_write(
                     lambda transaction: self._process_next_event(
-                        transaction, consumer
+                        transaction,
+                        consumer,
+                        max_event_sequence=max_event_sequence,
                     )
                 )
             except _ProjectionApplyFailed as exc:
@@ -525,12 +535,17 @@ class ProjectionRunner:
         return checkpoint.checkpoint_event_sequence
 
     def _process_next_event(
-        self, transaction: HostTransaction, consumer: ProjectionConsumer
+        self,
+        transaction: HostTransaction,
+        consumer: ProjectionConsumer,
+        *,
+        max_event_sequence: int | None,
     ) -> _ProjectionStepResult:
         """在单个 write transaction 内处理 checkpoint 后的下一条 EventLog。
 
         :param transaction: 当前 Host durable transaction。
         :param consumer: concrete projection consumer。
+        :param max_event_sequence: 可选最大 EventLog sequence。
         :returns: 单步处理结果。
         :raises _ProjectionApplyFailed: consumer apply 失败时抛出。
         :raises _ProjectionEventViewFailed: EventLog payload 无法构造 view 时抛出。
@@ -555,6 +570,17 @@ class ProjectionRunner:
                 apply_status=None,
             )
         row = rows[0]
+        if (
+            max_event_sequence is not None
+            and row.event_sequence > max_event_sequence
+        ):
+            return _ProjectionStepResult(
+                started_cursor=checkpoint.checkpoint_event_sequence,
+                finished_cursor=checkpoint.checkpoint_event_sequence,
+                scanned=False,
+                matched=False,
+                apply_status=None,
+            )
         try:
             event = projection_event_view_from_row(row)
         except HostDurableError as exc:

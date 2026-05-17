@@ -145,6 +145,7 @@ def catch_up_conversation_memory_projection(
     policy: MemoryProjectionPolicy,
     batch_size: int,
     consumer_id: str = CONVERSATION_MEMORY_CONSUMER_ID,
+    max_event_sequence: int | None = None,
 ) -> ConversationMemoryProjectionRepairResult:
     """从当前 checkpoint 追平 conversation memory projection。
 
@@ -156,6 +157,8 @@ def catch_up_conversation_memory_projection(
     :param policy: 固定 memory projection policy。
     :param batch_size: 每批最多扫描的 EventLog row 数，必须为正数。
     :param consumer_id: memory projection consumer id。
+    :param max_event_sequence: 可选最大 EventLog sequence；下一条事件超过
+        该值时停止，不推进 projection checkpoint。
     :returns: catch-up 汇总结果。
     :raises HostDurableError: batch size 非法或 projection runner 初始化失败时抛出。
     """
@@ -167,6 +170,7 @@ def catch_up_conversation_memory_projection(
         batch_size=batch_size,
         consumer_id=ProjectionConsumerId(consumer_id),
         reset_checkpoint=False,
+        max_event_sequence=max_event_sequence,
     )
 
 
@@ -177,6 +181,7 @@ def _run_memory_projection_until_idle(
     batch_size: int,
     consumer_id: ProjectionConsumerId,
     reset_checkpoint: bool,
+    max_event_sequence: int | None = None,
 ) -> ConversationMemoryProjectionRepairResult:
     """运行 memory projection runner 直到 idle 或遇到 failure。
 
@@ -185,6 +190,7 @@ def _run_memory_projection_until_idle(
     :param batch_size: 每批最多扫描的 EventLog row 数。
     :param consumer_id: memory projection consumer id。
     :param reset_checkpoint: 本次是否为 reset 后 rebuild。
+    :param max_event_sequence: 可选最大 EventLog sequence。
     :returns: repair 汇总结果。
     """
 
@@ -205,7 +211,11 @@ def _run_memory_projection_until_idle(
     duplicates = 0
     failures = 0
     while True:
-        batch_result = runner.run_once(consumer_id, limit=batch_size)
+        batch_result = runner.run_once(
+            consumer_id,
+            limit=batch_size,
+            max_event_sequence=max_event_sequence,
+        )
         if started_cursor is None:
             started_cursor = batch_result.started_cursor
         finished_cursor = batch_result.finished_cursor

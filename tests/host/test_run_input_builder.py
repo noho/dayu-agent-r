@@ -78,6 +78,7 @@ from dayu.host.durable.state import (
 )
 from dayu.host.durable.errors import HostDurableError
 from dayu.host.durable.transaction import HostRow, HostTransaction, HostTransactionRunner
+from dayu.host.memory_repair import catch_up_conversation_memory_projection
 from dayu.host.run_input import (
     DurableCurrentRunFactProvider,
     DurableMemorySnapshotProvider,
@@ -759,8 +760,10 @@ def test_over_threshold_memory_lag_raises_repair_required(
         )
 
 
-def test_ahead_memory_snapshot_raises_repair_required(tmp_path: Path) -> None:
-    """snapshot cursor 超过 required cursor 时不得注入未来 memory。"""
+def test_only_future_memory_snapshot_raises_missing_repair_required(
+    tmp_path: Path,
+) -> None:
+    """只有未来 snapshot 时不得注入未来 memory。"""
 
     policy = _memory_policy()
     with open_host_durable_store(_options(tmp_path)) as store:
@@ -793,8 +796,52 @@ def test_ahead_memory_snapshot_raises_repair_required(tmp_path: Path) -> None:
 
         assert (
             exc_info.value.repair_request.reason
-            is MemoryRepairReason.SNAPSHOT_AHEAD_OF_REQUIRED
+            is MemoryRepairReason.SNAPSHOT_MISSING
         )
+
+
+def test_memory_provider_uses_latest_snapshot_before_required_cursor(
+    tmp_path: Path,
+) -> None:
+    """同一 Session 有 queued future input 时读取 required cursor 前的 snapshot。"""
+
+    policy = _memory_policy()
+    with open_host_durable_store(_options(tmp_path)) as store:
+        session_id = _ensure_session_id(store.transaction_runner)
+        prior_event = _append_prior_user_event(
+            store.transaction_runner,
+            session_id=session_id,
+            run_id="run-prior-memory",
+            event_id="event-prior-memory-input",
+            text="prior prompt should be visible",
+        )
+        seeded = _seed_current_run(
+            store,
+            session_id=session_id,
+            payload=_user_input_payload("current prompt"),
+        )
+        future_event = _append_prior_user_event(
+            store.transaction_runner,
+            session_id=session_id,
+            run_id="run-future-memory",
+            event_id="event-future-memory-input",
+            text="future prompt must not leak",
+        )
+        del prior_event, future_event
+        required_cursor = _required_memory_cursor(store.transaction_runner, seeded)
+        catch_up_conversation_memory_projection(
+            store.transaction_runner,
+            policy=policy,
+            batch_size=16,
+            max_event_sequence=required_cursor.checkpoint_event_sequence,
+        )
+
+        request = _build_request_with_memory(store, seeded, policy)
+        contents = tuple(_message_content(message) for message in request.messages)
+
+        assert "prior prompt should be visible" in contents
+        assert "future prompt must not leak" not in contents
+        assert contents[-1] == "current prompt"
 
 
 def test_memory_messages_are_stable_for_same_eventlog_and_policy(

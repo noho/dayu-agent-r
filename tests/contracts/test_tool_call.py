@@ -101,6 +101,40 @@ def test_tool_call_request_provider_state_none_default_construction() -> None:
     assert _describe_provider_state(request.provider_state) == "none"
 
 
+def test_tool_call_request_rejects_blank_id_or_name() -> None:
+    """``tool_call_id`` 与 ``name`` 为空时必须在构造期被拒。"""
+
+    with pytest.raises(ValueError, match="tool_call_id"):
+        ToolCallRequest(
+            tool_call_id=" ",
+            name="get_value",
+            arguments={"k": "v"},
+            index_in_iteration=0,
+            provider_state=None,
+        )
+    with pytest.raises(ValueError, match="name"):
+        ToolCallRequest(
+            tool_call_id="id-1",
+            name="\n",
+            arguments={"k": "v"},
+            index_in_iteration=0,
+            provider_state=None,
+        )
+
+
+def test_tool_call_request_rejects_negative_index() -> None:
+    """``index_in_iteration`` 为负数时必须在构造期被拒。"""
+
+    with pytest.raises(ValueError, match="index_in_iteration"):
+        ToolCallRequest(
+            tool_call_id="id-1",
+            name="get_value",
+            arguments={"k": "v"},
+            index_in_iteration=-1,
+            provider_state=None,
+        )
+
+
 def test_tool_call_request_with_gemini_provider_state_equality() -> None:
     """构造时携带 Gemini 续航状态 → 等值与字段值正确。"""
 

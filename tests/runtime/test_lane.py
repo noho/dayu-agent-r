@@ -741,6 +741,38 @@ async def test_heartbeat_lost_claim_does_not_close_controller(
 
 
 @pytest.mark.asyncio
+async def test_heartbeat_lost_claim_wakes_waiting_acquire(
+    tmp_path: Path,
+) -> None:
+    """heartbeat 标记 lost token 后应立即唤醒等待中的 acquire。"""
+
+    db_path = tmp_path / "runtime_lanes.sqlite3"
+    controller = await LaneController.open(
+        [_lane_config(capacity=1)],
+        coordinator=SQLiteLaneCoordinatorConfig(
+            db_path=db_path,
+            busy_timeout_seconds=1.0,
+            poll_interval_seconds=10.0,
+        ),
+    )
+    first = await controller.acquire(_LANE_NAME, timeout_seconds=0)
+    assert isinstance(first, LaneAcquired)
+
+    waiter = asyncio.create_task(
+        controller.acquire(_LANE_NAME, timeout_seconds=0.5)
+    )
+    await asyncio.sleep(_FAST_HEARTBEAT_SECONDS)
+    _delete_claim(db_path, first.token.claim_id)
+    second = await waiter
+
+    assert isinstance(second, LaneAcquired)
+    assert first.token.released is True
+    await second.token.release()
+    assert _claim_count(db_path) == 0
+    await controller.close()
+
+
+@pytest.mark.asyncio
 async def test_concurrent_acquire_keeps_capacity_invariant(
     tmp_path: Path,
 ) -> None:
