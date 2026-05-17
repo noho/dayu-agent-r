@@ -223,8 +223,8 @@ Phase Map 中每个 phase 必须使用统一条目格式。模板如下：
 约束：本节只保留当前 gate 结论；phase 过程流水必须归档到 `历史记录`，仍需追踪的风险或后续 owner 必须写入 `Open Questions 与风险追踪` 的 `追踪区`。
 
 当前 work unit：P9.5 Pre-P10 Cross-Repository Hardening PR。
-当前 gate：P9.5 S11 ToolRuntime Boundary Cleanup implementation。
-下一 gate：P9.5 S11 code review。
+当前 gate：P9.5 S12 ToolRuntime Truncation / Duplicate Defensive Hardening implementation。
+下一 gate：P9.5 S12 code review。
 
 ## Phase Map
 
@@ -2032,6 +2032,29 @@ P9.5 收口清单：
 - 当前无 PR review blocking fix。
 
 ## 历史记录
+
+### 2026-05-17 P9.5 S11 ToolRuntime Boundary Cleanup accepted
+
+P9.5 S11 ToolRuntime Boundary Cleanup 已完成。Implementation artifact 为
+`docs/reviews/p9-5-s11-toolruntime-boundary-cleanup-implementation-20260517.md`。Code review / fix /
+re-review / controller adjudication artifacts 为 `docs/reviews/p9-5-s11-code-review-mimo-20260517.md`、
+`docs/reviews/p9-5-s11-code-review-ds-20260517.md`、
+`docs/reviews/p9-5-s11-toolruntime-boundary-cleanup-fix-20260517.md`、
+`docs/reviews/p9-5-s11-code-re-review-ds-20260517.md` 与
+`docs/reviews/p9-5-s11-code-review-controller-adjudication-20260517.md`。
+
+Controller 裁决：S11 只把 ToolRuntime effective schema projection / digest helper 抽到私有
+`dayu.host.tool_runtime_schema_projection`，保留 `ToolRuntimeHandle`、factory、accept barrier、EventLog facts、
+duplicate semantics、truncation cursor scope、diagnostics 与 `dayu.host.tool_runtime` public `__all__` 不变。
+该取舍避免 compatibility re-export、test-only private re-export、facade、lazy import seam、public API 变化、
+ToolRuntime 下沉到 `contracts` / `runtime` 或 Engine 拥有工具声明 / 执行治理。AgentMiMo review 为 0 blocking；
+AgentDS review 接受 1 个 LOW finding：Engine tool ownership import-boundary 测试未覆盖
+`from dayu.contracts.tool_declaration import *`。Fix 已将该 star import 窄范围展开为 `ToolBundle` /
+`ToolDefinition` 违规并补合成源码测试，AgentDS re-review 确认 fixed，0 blocking。本地验证通过：S11
+targeted tests 为 46 passed；`pytest tests/host/test_toolruntime_*.py` 为 55 passed；`pytest tests/host tests/engine`
+为 897 passed；`python -m pyright dayu tests` 为 0 errors / 0 warnings / 0 informations；`git diff --check`
+clean。Accepted slice commit 为 `f026a53`。当前 gate 为 P9.5 S12 ToolRuntime Truncation / Duplicate
+Defensive Hardening implementation。
 
 ### 2026-05-17 P9.5 S10 Host Dispatch Lifecycle / RunInputBuilder Non-Recovery Cleanup accepted
 
