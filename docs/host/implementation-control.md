@@ -220,8 +220,8 @@ Phase Map 中每个 phase 必须使用统一条目格式。模板如下：
 
 ## 当前状态
 
-P9 aggregate deepreview completed，verdict 为 PASS，remaining blocking findings 为 0。当前 gate 为 ready-to-open-draft-PR；
-用户已授权进入 draft PR gate。
+P9 aggregate deepreview completed；accepted deepreview commit 为 `cc05f79`。当前 gate 为 draft PR gate；
+用户已授权 push、创建 draft PR 并继续推进 PR review。
 
 约束：本节只保留当前 gate 结论；phase 过程流水必须归档到 `历史记录`，仍需追踪的风险或后续 owner 必须写入 `Open Questions 与风险追踪` 的 `追踪区`。
 
@@ -814,7 +814,7 @@ Phase 按依赖关系推进：先实现被其它阶段依赖的公共契约、ru
 - P9-S2 `Projection Consumer and Stable Layer Builder` completed；accepted slice commit 为 `4f35da6`。
 - P9-S3 `RunInputBuilder MemorySnapshotProvider and Lag Fallback` completed；accepted slice commit 为 `b416d37`。
 - P9-S4 `Projection Repair / Rebuild Entry and Diagnostics` completed；accepted slice commit 为 `1d30725`。
-- P9 aggregate deepreview completed；verdict 为 PASS；accepted deepreview commit 待记录。
+- P9 aggregate deepreview completed；verdict 为 PASS；accepted deepreview commit 为 `cc05f79`。
 
 目标：
 - 实现 session-level Conversation Memory projection、stable layer、history pool、snapshot cursor、RunInputBuilder memory provider 与 projection repair path。
@@ -1680,7 +1680,7 @@ Phase 按依赖关系推进：先实现被其它阶段依赖的公共契约、ru
   `docs/reviews/p9-aggregate-deepreview-ds-20260517.md`。
 - Controller adjudication artifact 为 `docs/reviews/p9-aggregate-deepreview-controller-adjudication-20260517.md`。
 - Verdict：AgentMiMo PASS，AgentDS PASS，remaining blocking findings 为 0。
-- Accepted deepreview commit 待记录。
+- Accepted deepreview commit 为 `cc05f79`。
 
 验证：
 
@@ -1709,9 +1709,9 @@ P9 aggregate deepreview 已完成。AgentMiMo artifact 为
 
 Verdict：AgentMiMo PASS，AgentDS PASS，remaining blocking findings 为 0。Controller 接受 aggregate deepreview 为
 Phase 9 exit gate；non-blocking findings 已写入 Phase 9 aggregate deepreview 追踪项并分配 owner。当前 gate 为
-ready-to-open-draft-PR；用户已授权进入 draft PR gate。
+draft PR gate；用户已授权 push、创建 draft PR 并继续推进 PR review。
 
-Accepted deepreview commit 待记录。
+Accepted deepreview commit 为 `cc05f79`。
 
 ### 2026-05-17 P9-S4 code review accepted
 
