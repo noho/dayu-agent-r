@@ -223,8 +223,8 @@ Phase Map 中每个 phase 必须使用统一条目格式。模板如下：
 约束：本节只保留当前 gate 结论；phase 过程流水必须归档到 `历史记录`，仍需追踪的风险或后续 owner 必须写入 `Open Questions 与风险追踪` 的 `追踪区`。
 
 当前 work unit：P9.5 Pre-P10 Cross-Repository Hardening PR。
-当前 gate：P9.5 S14 P9 Memory Cleanup And Production Catch-Up Wiring implementation。
-下一 gate：P9.5 S14 code review。
+当前 gate：P9.5 S15 Engine / Host Necessary Logs By Level implementation。
+下一 gate：P9.5 S15 code review。
 
 ## Phase Map
 
@@ -2032,6 +2032,28 @@ P9.5 收口清单：
 - 当前无 PR review blocking fix。
 
 ## 历史记录
+
+### 2026-05-17 P9.5 S14 P9 Memory Cleanup And Production Catch-Up Wiring accepted
+
+P9.5 S14 P9 Memory Cleanup And Production Catch-Up Wiring 已完成。Implementation artifact 为
+`docs/reviews/p9-5-s14-memory-cleanup-catchup-implementation-20260517.md`。Code review /
+controller adjudication artifacts 为 `docs/reviews/p9-5-s14-code-review-mimo-20260517.md`、
+`docs/reviews/p9-5-s14-code-review-ds-20260517.md` 与
+`docs/reviews/p9-5-s14-code-review-controller-adjudication-20260517.md`。
+
+Controller 裁决：AgentMiMo 与 AgentDS review 均为 PASS，0 blocking findings。S14 保持
+`current_goal` first-write-wins 生产实现不变，只补多输入与 inline-delta targeted tests；删除 unused legacy
+`read_run_input_continuity_events(...)` / `EventLogStore.read_run_input_continuity_events(...)`，未保留兼容 wrapper
+或 re-export；`DurableSessionContinuityProvider` 仍只保留 resume-specific continuity，不发射 historical raw turns。
+S14 补齐 preview / reasoning / display-only event exclusion、memory import-boundary automation，以及显式 concrete
+catch-up port 对 start_run user input、ToolRuntime accepted tool fact、`resolve_wait` committed tool fact 的端到端测试。
+实现还修复了无 `payload_ref` 工具事实写 durable memory item 时误写 `payload_digest` 导致 schema CHECK 失败的
+root cause。Controller 复核时曾发现 generic concrete catch-up 默认接入 command handle / scheduler 会在 queued
+future input 场景把 latest-only snapshot 推过当前 dispatch cursor，触发 S14 stop condition；最终裁决为不默认接入
+generic post-commit catch-up，仅保留显式注入与 dispatch worker 前 cursor-bound catch-up。验证通过：S14 targeted
+tests 为 7 passed / 12 passed / 59 passed；regression tests 为 3 passed；`pytest tests/host` 为 554 passed；
+`python -m pyright dayu tests` 为 0 errors / 0 warnings / 0 informations；`git diff --check` clean。
+Accepted slice commit 为 `4b7d1a5`。当前 gate 为 P9.5 S15 Engine / Host Necessary Logs By Level implementation。
 
 ### 2026-05-17 P9.5 S13 Message / Tool Result Size Governance accepted
 
