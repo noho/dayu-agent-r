@@ -62,6 +62,7 @@ from dayu.host.durable.state import (
     read_run_by_id,
 )
 from dayu.host.durable.transaction import HostRow, HostTransaction, HostTransactionRunner
+from dayu.host.projection import ProjectionCatchupPort
 
 _NOW = datetime(2026, 5, 14, 9, 30, 0, tzinfo=UTC)
 _CALLER_DIGEST = sha256_digest_json({"caller": "admission-test"})
@@ -157,6 +158,23 @@ class _ToggleFailingWakeupSpy(_WakeupSpy):
         self.promotions.append(session_id)
         if self.fail_queue_promotion:
             raise RuntimeError("forced queue wakeup failure")
+
+
+@dataclass(slots=True)
+class _FailingProjectionCatchup(ProjectionCatchupPort):
+    """测试用失败 projection catch-up port。"""
+
+    calls: int = 0
+
+    def catch_up_projection(self) -> None:
+        """记录调用并模拟 projection catch-up 失败。
+
+        :returns: ``None``。
+        :raises RuntimeError: 始终抛出测试错误。
+        """
+
+        self.calls += 1
+        raise RuntimeError("forced projection catch-up failure")
 
 
 def _options(tmp_path: Path) -> HostDurableStoreOptions:
@@ -808,6 +826,32 @@ def test_promote_next_queued_run_returns_result_when_dispatch_wakeup_fails(
         assert len(spy.dispatches) == 2
 
 
+def test_start_run_survives_after_commit_projection_catchup_failure(
+    tmp_path: Path,
+) -> None:
+    """start_run commit 后 projection catch-up 失败不掩盖命令结果。"""
+
+    with open_host_durable_store(_options(tmp_path)) as store:
+        session_id = _ensure_session_id(store.transaction_runner)
+        projection = _FailingProjectionCatchup()
+        service = _service(
+            store.transaction_runner,
+            projection_catchup=projection,
+        )
+
+        result = service.start_run(
+            _start_request(
+                session_id=session_id,
+                client_request_id="start-projection-catchup-fails",
+            ),
+            caller_semantic_digest=_CALLER_DIGEST,
+        )
+
+        assert result.run.status == RunStatus.RUNNING
+        assert result.pending_dispatch is not None
+        assert projection.calls == 1
+
+
 def test_terminal_closeout_promotes_exactly_one_queued_run_after_commit(
     tmp_path: Path,
 ) -> None:
@@ -863,6 +907,51 @@ def test_terminal_closeout_promotes_exactly_one_queued_run_after_commit(
         )
         assert spy.promotions == [session_id]
         assert len(spy.dispatches) == 2
+
+
+def test_terminal_closeout_survives_after_commit_projection_catchup_failure(
+    tmp_path: Path,
+) -> None:
+    """terminal closeout 后 projection catch-up 失败不影响 closeout / promotion。"""
+
+    with open_host_durable_store(_options(tmp_path)) as store:
+        session_id = _ensure_session_id(store.transaction_runner)
+        projection = _FailingProjectionCatchup()
+        service = _service(
+            store.transaction_runner,
+            projection_catchup=projection,
+        )
+        active = service.start_run(
+            _start_request(session_id=session_id, client_request_id="start-active"),
+            caller_semantic_digest=_CALLER_DIGEST,
+        )
+        assert active.attempt is not None
+        queued = service.submit_followup_queue(
+            SubmitFollowupQueueAdmissionInput(
+                request=_followup_request(
+                    session_id=session_id,
+                    client_request_id="follow-after-catchup-fails",
+                ),
+                resolved_execution_target="queued-target",
+            ),
+            caller_semantic_digest=_CALLER_DIGEST,
+        )
+
+        result = service.closeout_attempt_terminal(
+            CloseoutAttemptTerminalInput(
+                run_id=active.run.run_id,
+                attempt_id=active.attempt.attempt_id,
+                attempt_terminal_status=AttemptStatus.SUCCEEDED,
+                run_terminal_status=RunStatus.SUCCEEDED,
+                terminal_summary_ref=None,
+                terminal_summary_digest=None,
+            )
+        )
+
+        assert result.run.status == RunStatus.SUCCEEDED
+        assert result.promotion.promoted_run is not None
+        assert result.promotion.promoted_run.run_id == queued.run.run_id
+        assert projection.calls == 3
 
 
 def test_terminal_closeout_promotion_survives_queue_wakeup_failure(
@@ -1121,12 +1210,14 @@ def _service(
     transaction_runner: HostTransactionRunner,
     *,
     spy: _WakeupSpy | None = None,
+    projection_catchup: ProjectionCatchupPort | None = None,
     label: str = "main",
 ) -> HostAdmissionService:
     """构造测试 admission service。
 
     :param transaction_runner: Host transaction runner。
     :param spy: 可选 wakeup spy。
+    :param projection_catchup: 可选 projection catch-up port。
     :param label: id factory 标签。
     :returns: HostAdmissionService。
     """
@@ -1136,6 +1227,7 @@ def _service(
         clock=_FixedClock(),
         id_factory=_SequentialIdFactory(label),
         wakeup_port=spy if spy is not None else _WakeupSpy(),
+        projection_catchup_port=projection_catchup,
     )
 
 

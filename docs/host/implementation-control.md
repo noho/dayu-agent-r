@@ -220,8 +220,8 @@ Phase Map 中每个 phase 必须使用统一条目格式。模板如下：
 
 ## 当前状态
 
-P9-S3 `RunInputBuilder MemorySnapshotProvider and Lag Fallback` completed；accepted slice commit 为 `b416d37`。当前 gate 为 P9-S4
-`Projection Repair / Rebuild Entry and Diagnostics` implementation。
+P9-S4 `Projection Repair / Rebuild Entry and Diagnostics` implementation、双路 code review、fix、双路 re-review 与 controller
+adjudication 已完成；remaining blocking findings 为 0。当前 gate 为 P9-S4 accepted slice commit。
 
 约束：本节只保留当前 gate 结论；phase 过程流水必须归档到 `历史记录`，仍需追踪的风险或后续 owner 必须写入 `Open Questions 与风险追踪` 的 `追踪区`。
 
@@ -813,6 +813,7 @@ Phase 按依赖关系推进：先实现被其它阶段依赖的公共契约、ru
 - P9-S1 `Durable Memory Contracts and Schema` completed；accepted slice commit 为 `f221aeb`。
 - P9-S2 `Projection Consumer and Stable Layer Builder` completed；accepted slice commit 为 `4f35da6`。
 - P9-S3 `RunInputBuilder MemorySnapshotProvider and Lag Fallback` completed；accepted slice commit 为 `b416d37`。
+- P9-S4 `Projection Repair / Rebuild Entry and Diagnostics` completed；accepted slice commit 待记录。
 
 目标：
 - 实现 session-level Conversation Memory projection、stable layer、history pool、snapshot cursor、RunInputBuilder memory provider 与 projection repair path。
@@ -867,6 +868,7 @@ Phase 按依赖关系推进：先实现被其它阶段依赖的公共契约、ru
 - Slice 1: memory projection data model and checkpoint。
 - Slice 2: stable layer / history pool builder。
 - Slice 3: RunInputBuilder MemorySnapshotProvider and lag fallback。
+- Slice 4: projection repair / rebuild entry and after-commit catch-up wiring。
 
 验证要求：
 - unit tests: final_answer not verified fact、tool facts verified、snapshot cursor coverage。
@@ -1524,7 +1526,8 @@ Phase 按依赖关系推进：先实现被其它阶段依赖的公共契约、ru
 
 追踪项：
 
-- Automatic after-commit projection catch-up owner 为 Phase 9. Conversation Memory / Session Memory Projection。
+- Automatic after-commit projection catch-up 已由 P9-S4 以 injectable `ProjectionCatchupPort` 与 best-effort post-commit hooks
+  落地；production composition root concrete port 注入仍归后续 Host / Service wiring owner。
 - Heavy sink / batch-transaction runner owner 为 Phase 13. Audit / Tool Trace / Outbox Projections 与 Phase 15. Retention / Purge / Production Hardening。
 - Per-session repair filter owner 为 Phase 15. Retention / Purge / Production Hardening。
 - RunResult summary refs 接入 public `RunSnapshot` owner 为 Phase 9 / Phase 15 或后续 public read enhancement work unit。
@@ -1635,7 +1638,64 @@ Phase 按依赖关系推进：先实现被其它阶段依赖的公共契约、ru
   S3 已裁决为：stable memory blocks 按 P9 优先级消费该 cap，超预算 block 记录 transient
   `BUDGET_LIMIT_REACHED` diagnostic；recent raw turns、episode summaries 与当前 prompt 不进入 stable layer cap。
 
+#### Phase 9 Slice 4 Projection Repair / Rebuild Entry and Diagnostics 追踪
+
+结论：
+
+- P9-S4 implementation 已完成，交付 `dayu.host.memory_repair` rebuild / catch-up entry、consumer-scoped memory projection
+  reset、通用 `ProjectionCatchupPort` / no-op port / best-effort helper，以及 start / follow-up / terminal closeout /
+  scheduler promotion / ToolRuntime tool fact accept / resolve_wait after-commit catch-up wiring。
+- Code review artifacts 为 `docs/reviews/p9-s4-code-review-mimo-20260517.md` 与
+  `docs/reviews/p9-s4-code-review-ds-20260517.md`。
+- Code re-review artifacts 为 `docs/reviews/p9-s4-code-rereview-mimo-20260517.md` 与
+  `docs/reviews/p9-s4-code-rereview-ds-20260517.md`。
+- Controller adjudication artifact 为 `docs/reviews/p9-s4-code-review-controller-adjudication-20260517.md`。
+- Re-review verdict：AgentMiMo PASS，AgentDS PASS，remaining blocking findings 为 0。
+- Accepted slice commit 待记录。
+
+验证：
+
+- `pytest tests/host/test_toolruntime_accept_barrier.py tests/host/test_resolve_wait_command.py tests/host/test_admission_queue.py tests/host/test_dispatch_scheduler.py tests/host/test_memory_projection.py tests/host/test_run_input_builder.py tests/host/test_projection_runner.py tests/host/test_projection_checkpoint.py tests/host/test_import_boundary.py tests/host/test_weak_typing_guard.py`：129 passed。
+- `pyright dayu/host tests/host`：0 errors。
+- `git diff --check`：通过。
+
+追踪项：
+
+- P9-S4 不把 catch-up failure 升级为 Run recovery，也不让 catch-up failure 回滚已提交 command / accept result；失败通过
+  `dayu.host.projection` logger 和 projection-local failure row 观测。
+- 默认 command handle / admission service 使用 no-op catch-up port；production concrete memory catch-up port 注入由后续 Host /
+  Service composition owner 处理，不阻塞 P9。
+- Late `resolve_wait` rejection 可能额外触发一次 catch-up；当前只产生低风险冗余，不改变 EventLog、Run 状态或 projection
+  truth，归后续 Host hardening cleanup。
+- Heavy sink / batch runner、per-session repair filter 与 Audit / Tool Trace / Outbox concrete sinks 仍归 Phase 13 / Phase 15。
+
 ## 历史记录
+
+### 2026-05-17 P9-S4 code review accepted
+
+P9-S4 `Projection Repair / Rebuild Entry and Diagnostics` implementation 已完成。实现范围包含 memory projection rebuild /
+catch-up service、consumer-scoped reset、ProjectionRunner-backed catch-up、projection-local failure recording、after-commit
+best-effort catch-up hooks，以及 command / scheduler / ToolRuntime / resolve_wait 接线。
+
+双路 code review artifacts 为 `docs/reviews/p9-s4-code-review-mimo-20260517.md` 与
+`docs/reviews/p9-s4-code-review-ds-20260517.md`。双路 re-review artifacts 为
+`docs/reviews/p9-s4-code-rereview-mimo-20260517.md` 与
+`docs/reviews/p9-s4-code-rereview-ds-20260517.md`。Controller adjudication artifact 为
+`docs/reviews/p9-s4-code-review-controller-adjudication-20260517.md`。Re-review verdict：AgentMiMo PASS，AgentDS
+PASS，remaining blocking findings 为 0。
+
+Controller 接受并修复 resolve_wait hook、ToolRuntime tool fact accept hook、catch-up failure logging 与
+`ProjectionCatchupPort` ownership 迁移；接受 consumer-scoped reset 清理同 consumer 全部 policy snapshot，因为 projection
+checkpoint 是 consumer-scoped。Controller defer late rejection extra catch-up、future duplicate hook cleanup 与 synchronous
+best-effort catch-up 性能优化，均不阻塞 P9。
+
+验证：
+
+- `pytest tests/host/test_toolruntime_accept_barrier.py tests/host/test_resolve_wait_command.py tests/host/test_admission_queue.py tests/host/test_dispatch_scheduler.py tests/host/test_memory_projection.py tests/host/test_run_input_builder.py tests/host/test_projection_runner.py tests/host/test_projection_checkpoint.py tests/host/test_import_boundary.py tests/host/test_weak_typing_guard.py`：129 passed。
+- `pyright dayu/host tests/host`：0 errors。
+- `git diff --check`：通过。
+
+Accepted slice commit 待记录。当前 gate 为 P9 aggregate deepreview。
 
 ### 2026-05-17 P9-S3 code review accepted
 

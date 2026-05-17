@@ -86,6 +86,7 @@ from dayu.host.durable.state import (
 )
 from dayu.host.durable.transaction import HostTransaction, HostTransactionRunner
 from dayu.host.local_proxy import DefaultLocalEngineWorkerFactory
+from dayu.host.projection import ProjectionCatchupPort
 from dayu.runtime.lane import (
     LaneAcquired,
     LaneConfig,
@@ -107,6 +108,23 @@ class _SeededRun:
     attempt_id: str
     execution_id: str
     dispatch_record_id: str
+
+
+@dataclass(slots=True)
+class _FailingProjectionCatchup(ProjectionCatchupPort):
+    """测试用失败 projection catch-up port。"""
+
+    calls: int = 0
+
+    def catch_up_projection(self) -> None:
+        """记录调用并模拟 catch-up 失败。
+
+        :returns: ``None``。
+        :raises RuntimeError: 始终抛出测试错误。
+        """
+
+        self.calls += 1
+        raise RuntimeError("forced scheduler projection catch-up failure")
 
 
 class _FakeHandle:
@@ -536,6 +554,7 @@ async def test_scheduler_uses_toolruntime_when_tooling_is_configured(
 
     factory = _FakeWorkerFactory(accepted_handle=_CloseCountingHandle())
     tool = _CountingTool()
+    projection = _FailingProjectionCatchup()
     with open_host_durable_store(_options(tmp_path)) as store:
         seeded = _seed_current_run(store)
         scheduler = await _open_scheduler(
@@ -544,6 +563,7 @@ async def test_scheduler_uses_toolruntime_when_tooling_is_configured(
             factory,
             agent_policy=_agent_policy(True),
             tooling_options=_tooling_options(tool),
+            projection_catchup=projection,
         )
         try:
             scheduler.wake_dispatch(_pending_dispatch(seeded))
@@ -580,6 +600,7 @@ async def test_scheduler_uses_toolruntime_when_tooling_is_configured(
             assert _read_event_by_type(
                 store.transaction_runner, "TOOL_RESULT_ACCEPTED"
             ).run_id == seeded.run_id
+            assert projection.calls == 1
         finally:
             await scheduler.close()
             assert scheduler._duplicate_governance_registry.active_run_count() == 0
@@ -690,6 +711,30 @@ async def test_worker_startup_timeout_closes_starting_attempt_failed(
             assert json.loads(_require_text(event.reason_json))["reason"] == (
                 "worker_startup_timeout"
             )
+        finally:
+            await scheduler.close()
+
+
+@pytest.mark.asyncio
+async def test_scheduler_queue_promotion_survives_projection_catchup_failure(
+    tmp_path: Path,
+) -> None:
+    """scheduler promotion wakeup 中 projection catch-up 失败不阻断 promotion。"""
+
+    factory = _FakeWorkerFactory()
+    projection = _FailingProjectionCatchup()
+    with open_host_durable_store(_options(tmp_path)) as store:
+        session_id = _ensure_session_id(store.transaction_runner)
+        scheduler = await _open_scheduler(
+            tmp_path,
+            store,
+            factory,
+            projection_catchup=projection,
+        )
+        try:
+            scheduler.wake_queue_promotion(session_id)
+
+            assert projection.calls == 1
         finally:
             await scheduler.close()
 
@@ -1068,6 +1113,7 @@ async def _open_scheduler(
     active_registry: ActiveWorkerRegistry | None = None,
     agent_policy: AgentPolicy | None = None,
     tooling_options: HostToolingOptions | None = None,
+    projection_catchup: ProjectionCatchupPort | None = None,
 ) -> HostDispatchScheduler:
     """打开测试 scheduler。
 
@@ -1080,6 +1126,7 @@ async def _open_scheduler(
     :param active_registry: active worker registry。
     :param agent_policy: 可选 AgentPolicy；无则使用 no-tool policy。
     :param tooling_options: 可选 Host 工具装配选项。
+    :param projection_catchup: 可选 projection catch-up port。
     :returns: scheduler。
     """
 
@@ -1106,6 +1153,7 @@ async def _open_scheduler(
         ),
         host_handle_id="host-test",
         active_registry=active_registry,
+        projection_catchup_port=projection_catchup,
     )
 
 

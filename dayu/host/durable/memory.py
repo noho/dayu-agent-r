@@ -26,6 +26,8 @@ from dayu.host.durable.projection import (
     ensure_projection_checkpoint,
 )
 from dayu.host.durable.schema import (
+    TABLE_HOST_PROJECTION_CHECKPOINTS,
+    TABLE_HOST_PROJECTION_FAILURES,
     TABLE_HOST_MEMORY_DIAGNOSTICS,
     TABLE_HOST_MEMORY_ITEMS,
     TABLE_HOST_MEMORY_SNAPSHOTS,
@@ -419,6 +421,59 @@ def write_memory_diagnostic(
     if written is None:
         raise HostDurableError("memory diagnostic write failed")
     return written
+
+
+def reset_conversation_memory_projection(
+    transaction: HostTransaction, *, consumer_id: str
+) -> None:
+    """清空目标 conversation memory projection rows 及其 cursor / failure。
+
+    projection checkpoint / failure 当前是 ``consumer_id`` 粒度，因此 reset
+    必须清理该 consumer 的全部 snapshot 及其关联 item / diagnostic rows，
+    避免同 consumer 其它 policy snapshot 与新 checkpoint 脱节。其它 consumer
+    的 memory rows 不受影响；``snapshot_id`` 为空的独立 diagnostic 不属于某个
+    snapshot，不能在这里无条件删除。
+
+    :param transaction: 调用方提供的 Host durable transaction。
+    :param consumer_id: memory projection consumer id。
+    :returns: ``None``。
+    :raises HostDurableError: ``consumer_id`` 为空时抛出。
+    """
+
+    _require_non_empty_text(consumer_id, field_name="consumer_id")
+    snapshot_filter = (
+        f"SELECT snapshot_id FROM {TABLE_HOST_MEMORY_SNAPSHOTS} "
+        "WHERE consumer_id = ?"
+    )
+    transaction.execute(
+        f"""
+        DELETE FROM {TABLE_HOST_MEMORY_DIAGNOSTICS}
+        WHERE snapshot_id IN ({snapshot_filter})
+        """,
+        (consumer_id,),
+    )
+    transaction.execute(
+        f"""
+        DELETE FROM {TABLE_HOST_MEMORY_ITEMS}
+        WHERE snapshot_id IN ({snapshot_filter})
+        """,
+        (consumer_id,),
+    )
+    transaction.execute(
+        f"""
+        DELETE FROM {TABLE_HOST_MEMORY_SNAPSHOTS}
+        WHERE consumer_id = ?
+        """,
+        (consumer_id,),
+    )
+    transaction.execute(
+        f"DELETE FROM {TABLE_HOST_PROJECTION_FAILURES} WHERE consumer_id = ?",
+        (consumer_id,),
+    )
+    transaction.execute(
+        f"DELETE FROM {TABLE_HOST_PROJECTION_CHECKPOINTS} WHERE consumer_id = ?",
+        (consumer_id,),
+    )
 
 
 def read_memory_diagnostic(

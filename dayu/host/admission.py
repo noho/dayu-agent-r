@@ -90,6 +90,11 @@ from dayu.host.durable.state import (
     session_snapshot_from_rows,
 )
 from dayu.host.durable.transaction import HostTransaction, HostTransactionRunner
+from dayu.host.projection import (
+    NoopProjectionCatchupPort,
+    ProjectionCatchupPort,
+    catch_up_projection_best_effort,
+)
 
 _EVENT_TYPE_USER_INPUT_ACCEPTED = "USER_INPUT_ACCEPTED"
 _EVENT_SOURCE = "host.admission"
@@ -403,6 +408,7 @@ class HostAdmissionService:
     :param clock: admission 事件时间来源。
     :param id_factory: admission id 生成端口。
     :param wakeup_port: commit 后 no-op/测试 wakeup 端口。
+    :param projection_catchup_port: commit 后 best-effort projection catch-up 端口。
     """
 
     transaction_runner: HostTransactionRunner
@@ -411,6 +417,7 @@ class HostAdmissionService:
     clock: AdmissionClock
     id_factory: AdmissionIdFactory
     wakeup_port: AdmissionWakeupPort
+    projection_catchup_port: ProjectionCatchupPort
 
     def start_run(
         self, request: StartRunRequest, *, caller_semantic_digest: str
@@ -440,6 +447,7 @@ class HostAdmissionService:
                 id_factory=self.id_factory,
             )
         )
+        catch_up_projection_best_effort(self.projection_catchup_port)
         _wake_dispatch_if_needed(self.wakeup_port, result.pending_dispatch)
         return result
 
@@ -473,6 +481,7 @@ class HostAdmissionService:
                 id_factory=self.id_factory,
             )
         )
+        catch_up_projection_best_effort(self.projection_catchup_port)
         _wake_dispatch_if_needed(self.wakeup_port, result.pending_dispatch)
         return result
 
@@ -583,6 +592,7 @@ class HostAdmissionService:
                 id_factory=self.id_factory,
             )
         )
+        catch_up_projection_best_effort(self.projection_catchup_port)
         promotion = _promote_after_release(
             service=self,
             session_id=result.run.session_id,
@@ -628,6 +638,7 @@ def create_host_admission_service(
     clock: AdmissionClock | None = None,
     id_factory: AdmissionIdFactory | None = None,
     wakeup_port: AdmissionWakeupPort | None = None,
+    projection_catchup_port: ProjectionCatchupPort | None = None,
 ) -> HostAdmissionService:
     """创建默认依赖装配的内部 admission service。
 
@@ -637,6 +648,7 @@ def create_host_admission_service(
     :param clock: 可选 clock 端口。
     :param id_factory: 可选 id factory 端口。
     :param wakeup_port: 可选 wakeup 端口。
+    :param projection_catchup_port: 可选 projection catch-up 端口。
     :returns: Host admission service。
     """
 
@@ -649,6 +661,11 @@ def create_host_admission_service(
         clock=clock if clock is not None else UtcAdmissionClock(),
         id_factory=id_factory if id_factory is not None else UuidAdmissionIdFactory(),
         wakeup_port=wakeup_port if wakeup_port is not None else NoopAdmissionWakeupPort(),
+        projection_catchup_port=(
+            projection_catchup_port
+            if projection_catchup_port is not None
+            else NoopProjectionCatchupPort()
+        ),
     )
 
 

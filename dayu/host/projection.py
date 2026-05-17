@@ -8,6 +8,7 @@ EventLog 并推进 projection-local checkpoint；不得自建 SQLite connection�
 
 from __future__ import annotations
 
+import logging
 import re
 from collections.abc import Mapping
 from dataclasses import dataclass
@@ -36,6 +37,7 @@ _MIN_BATCH_LIMIT = 1
 _READ_ONE_EVENT_LIMIT = 1
 _NO_EVENTS_CURSOR = 0
 _EMPTY_ERROR_MESSAGE = "<empty projection error message>"
+_LOGGER = logging.getLogger(__name__)
 
 
 @dataclass(frozen=True, slots=True)
@@ -244,6 +246,50 @@ class ProjectionConsumer(Protocol):
         """
 
         ...
+
+
+class ProjectionCatchupPort(Protocol):
+    """committed EventLog projection catch-up 通用端口。
+
+    该端口只允许连接 projection-local catch-up；实现不得参与调用方 command
+    transaction，也不得修改 Run / Attempt / wait / dispatch 等治理状态。
+    """
+
+    def catch_up_projection(self) -> None:
+        """追平已提交 EventLog 的 projection。
+
+        :returns: ``None``。
+        :raises Exception: 具体实现可在 catch-up 失败时抛出自身错误。
+        """
+
+        ...
+
+
+class NoopProjectionCatchupPort:
+    """默认 no-op projection catch-up port。"""
+
+    def catch_up_projection(self) -> None:
+        """忽略 projection catch-up。
+
+        :returns: ``None``。
+        """
+
+
+def catch_up_projection_best_effort(
+    projection_catchup_port: ProjectionCatchupPort | None,
+) -> None:
+    """best-effort 触发 projection catch-up 并记录失败。
+
+    :param projection_catchup_port: 可选 projection catch-up 端口。
+    :returns: ``None``。
+    """
+
+    if projection_catchup_port is None:
+        return
+    try:
+        projection_catchup_port.catch_up_projection()
+    except Exception:
+        _LOGGER.exception("projection catch-up failed; continuing")
 
 
 @dataclass(frozen=True, slots=True)

@@ -519,6 +519,7 @@ def resolve_wait(
         transaction_runner=transaction_runner,
         event_log_store=host._admission_service.event_log_store,
         idempotency_store=host._admission_service.idempotency_store,
+        projection_catchup_port=host._admission_service.projection_catchup_port,
     )
     result = service.resolve_wait(wait_id, request)
     if result.dispatch_record is not None and not result.idempotent_replay:

@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from dataclasses import replace
+from dataclasses import dataclass, replace
 from datetime import UTC, datetime
 from pathlib import Path
 
@@ -67,6 +67,8 @@ from dayu.host.durable.state import (
     read_wait_record_by_id,
 )
 from dayu.host.durable.transaction import HostTransaction, HostTransactionRunner
+from dayu.host.admission import create_host_admission_service
+from dayu.host.projection import ProjectionCatchupPort
 from dayu.host.run_input import PolicySnapshot, create_no_tool_run_input_builder
 from dayu.host.wait_adapter import WaitAdapterBinding, WaitExternalJobRefSource
 from dayu.host.waiting import (
@@ -79,6 +81,23 @@ _NOW = datetime(2026, 5, 16, 1, 2, 3, tzinfo=UTC)
 _OBSERVED = datetime(2026, 5, 16, 1, 5, 7, tzinfo=UTC)
 _OBSERVED_REPLAY = datetime(2026, 5, 16, 1, 6, 8, tzinfo=UTC)
 _CALL_CONTEXT_DIGEST = sha256_digest_json({"context": "resolve-wait-test"})
+
+
+@dataclass(slots=True)
+class _FailingProjectionCatchup(ProjectionCatchupPort):
+    """测试用失败 projection catch-up port。"""
+
+    calls: int = 0
+
+    def catch_up_projection(self) -> None:
+        """记录调用并模拟 catch-up 失败。
+
+        :returns: ``None``。
+        :raises RuntimeError: 始终抛出测试错误。
+        """
+
+        self.calls += 1
+        raise RuntimeError("forced resolve wait projection catch-up failure")
 
 
 def test_resolve_wait_completed_resumes_run_and_wakes_dispatch(
@@ -118,6 +137,28 @@ def test_resolve_wait_completed_resumes_run_and_wakes_dispatch(
             and seeded.wait_id in message.content
             for message in request_for_resume.messages
         )
+    finally:
+        host.close()
+
+
+def test_resolve_wait_survives_projection_catchup_failure(
+    tmp_path: Path,
+) -> None:
+    """resolve_wait commit 后 projection catch-up 失败不影响恢复结果。"""
+
+    host = create_host_command_handle(_options(tmp_path))
+    projection = _FailingProjectionCatchup()
+    host._admission_service = create_host_admission_service(
+        host._transaction_runner(),
+        projection_catchup_port=projection,
+    )
+    try:
+        seeded = _seed_waiting_run(host)
+        snapshot = resolve_wait(host, seeded.wait_id, _completed_request("resolve-catchup"))
+
+        assert snapshot.status is RunStatus.RUNNING
+        assert snapshot.current_attempt_id is not None
+        assert projection.calls == 1
     finally:
         host.close()
 

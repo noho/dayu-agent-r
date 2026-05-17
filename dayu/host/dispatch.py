@@ -18,7 +18,10 @@ from uuid import uuid4
 
 from dayu.contracts.cancellation import CancellationToken
 from dayu.contracts.json_value import JsonValue
-from dayu.host.admission import PendingDispatchRecord, create_host_admission_service
+from dayu.host.admission import (
+    PendingDispatchRecord,
+    create_host_admission_service,
+)
 from dayu.host.api import (
     AttemptDispatchSnapshot,
     AttemptStatus,
@@ -64,6 +67,10 @@ from dayu.host.engine_ingest import (
     EngineIngestResult,
     EngineIngestStatus,
     LocalEngineEnvelope,
+)
+from dayu.host.projection import (
+    ProjectionCatchupPort,
+    catch_up_projection_best_effort,
 )
 from dayu.host.run_input import (
     PolicySnapshot,
@@ -287,6 +294,7 @@ class HostDispatchScheduler:
         lane_controller: LaneController,
         host_handle_id: str,
         active_registry: ActiveWorkerRegistry | None = None,
+        projection_catchup_port: ProjectionCatchupPort | None = None,
     ) -> None:
         """初始化 dispatch scheduler。
 
@@ -296,6 +304,7 @@ class HostDispatchScheduler:
         :param lane_controller: 已打开的 runtime lane controller。
         :param host_handle_id: Host handle 诊断 id。
         :param active_registry: active worker registry；不传时创建 scheduler 私有 registry。
+        :param projection_catchup_port: commit 后 best-effort projection catch-up 端口。
         :returns: ``None``。
         :raises ValueError: ``host_handle_id`` 为空时抛出。
         """
@@ -310,6 +319,7 @@ class HostDispatchScheduler:
         self._active_registry = (
             active_registry if active_registry is not None else ActiveWorkerRegistry()
         )
+        self._projection_catchup_port = projection_catchup_port
         self._queue: asyncio.Queue[PendingDispatchRecord] = asyncio.Queue()
         self._closed = False
         self._drain_task: asyncio.Task[None] | None = None
@@ -327,6 +337,7 @@ class HostDispatchScheduler:
         local_execution: HostLocalExecutionOptions,
         host_handle_id: str,
         active_registry: ActiveWorkerRegistry | None = None,
+        projection_catchup_port: ProjectionCatchupPort | None = None,
     ) -> "HostDispatchScheduler":
         """打开本地 dispatch scheduler。
 
@@ -334,6 +345,7 @@ class HostDispatchScheduler:
         :param local_execution: 本地执行配置。
         :param host_handle_id: Host handle 诊断 id。
         :param active_registry: active worker registry；不传时创建 scheduler 私有 registry。
+        :param projection_catchup_port: commit 后 best-effort projection catch-up 端口。
         :returns: 已打开 scheduler。
         """
 
@@ -371,6 +383,7 @@ class HostDispatchScheduler:
             lane_controller=lane_controller,
             host_handle_id=host_handle_id,
             active_registry=active_registry,
+            projection_catchup_port=projection_catchup_port,
         )
 
     def wake_dispatch(self, record: PendingDispatchRecord) -> None:
@@ -397,9 +410,11 @@ class HostDispatchScheduler:
 
         if self._closed:
             raise RuntimeError("HostDispatchScheduler is closed")
+        catch_up_projection_best_effort(self._projection_catchup_port)
         create_host_admission_service(
             self._transaction_runner,
             wakeup_port=self,
+            projection_catchup_port=self._projection_catchup_port,
         ).promote_next_queued_run(session_id)
 
     async def drain_once(self) -> DispatchDrainResult:
@@ -715,6 +730,7 @@ class HostDispatchScheduler:
                 accept_port=DefaultHostToolFactAcceptPort(
                     transaction_runner=self._transaction_runner,
                     event_log_store=self._event_log_store,
+                    projection_catchup_port=self._projection_catchup_port,
                 ),
                 awaiting_accept_port=DefaultHostToolAwaitingAcceptPort(
                     transaction_runner=self._transaction_runner,

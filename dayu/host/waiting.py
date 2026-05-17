@@ -84,6 +84,10 @@ from dayu.host.durable.state import (
     WorkerKind,
 )
 from dayu.host.durable.transaction import HostTransaction, HostTransactionRunner
+from dayu.host.projection import (
+    ProjectionCatchupPort,
+    catch_up_projection_best_effort,
+)
 from dayu.host.wait_adapter import WaitAdapterBinding
 
 _TOOL_AWAITING_ACCEPT_SCOPE_KIND = "tool_awaiting_accept"
@@ -541,12 +545,14 @@ class DefaultHostResolveWaitService:
         transaction_runner: HostTransactionRunner,
         event_log_store: EventLogStore | None = None,
         idempotency_store: IdempotencyStore | None = None,
+        projection_catchup_port: ProjectionCatchupPort | None = None,
     ) -> None:
         """初始化默认 resolve wait service。
 
         :param transaction_runner: Host durable transaction runner。
         :param event_log_store: EventLog primitive；无则创建默认实现。
         :param idempotency_store: Idempotency primitive；无则创建默认实现。
+        :param projection_catchup_port: commit 后 best-effort projection catch-up 端口。
         :returns: ``None``。
         """
 
@@ -559,6 +565,7 @@ class DefaultHostResolveWaitService:
             if idempotency_store is not None
             else IdempotencyStore()
         )
+        self._projection_catchup_port = projection_catchup_port
 
     def resolve_wait(self, wait_id: str, request: ResolveWaitRequest) -> ResolveWaitResult:
         """接收等待结果并推进 Run。
@@ -581,6 +588,7 @@ class DefaultHostResolveWaitService:
                     transaction, wait_id, request
                 )
             )
+            catch_up_projection_best_effort(self._projection_catchup_port)
             if isinstance(result, _LateRejectResult):
                 raise HostApiError(
                     code=HostApiErrorCode.INVALID_STATE,

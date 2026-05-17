@@ -85,6 +85,10 @@ from dayu.host.durable.state import (
     read_run_by_id,
 )
 from dayu.host.durable.transaction import HostTransaction, HostTransactionRunner
+from dayu.host.projection import (
+    ProjectionCatchupPort,
+    catch_up_projection_best_effort,
+)
 from dayu.runtime.cancellation import (
     WaitCancelled,
     WaitCompleted,
@@ -1833,12 +1837,14 @@ class DefaultHostToolFactAcceptPort:
         transaction_runner: HostTransactionRunner,
         event_log_store: EventLogStore | None = None,
         idempotency_store: IdempotencyStore | None = None,
+        projection_catchup_port: ProjectionCatchupPort | None = None,
     ) -> None:
         """初始化默认 accept port。
 
         :param transaction_runner: Host durable transaction runner。
         :param event_log_store: EventLog primitive；无则创建默认实现。
         :param idempotency_store: Idempotency primitive；无则创建默认实现。
+        :param projection_catchup_port: commit 后 best-effort projection catch-up 端口。
         :returns: ``None``。
         """
 
@@ -1851,6 +1857,7 @@ class DefaultHostToolFactAcceptPort:
             if idempotency_store is not None
             else IdempotencyStore()
         )
+        self._projection_catchup_port = projection_catchup_port
 
     def accept_tool_fact(
         self, candidate: ToolFactAcceptCandidate
@@ -1862,11 +1869,17 @@ class DefaultHostToolFactAcceptPort:
         """
 
         try:
-            return self._transaction_runner.run_write(
+            result = self._transaction_runner.run_write(
                 lambda transaction: self._accept_in_transaction(
                     transaction, candidate
                 )
             )
+            if (
+                isinstance(result, ToolFactAcceptedAck)
+                and result.tool_result_event_ref is not None
+            ):
+                catch_up_projection_best_effort(self._projection_catchup_port)
+            return result
         except HostIdempotencyConflictError:
             return _rejected_ack(
                 candidate,

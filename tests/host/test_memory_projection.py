@@ -24,6 +24,7 @@ from dayu.host.durable.memory import (
     MemorySnapshotRow,
     read_latest_memory_snapshot,
     read_memory_diagnostic,
+    reset_conversation_memory_projection,
     write_memory_diagnostic,
     write_memory_snapshot_with_checkpoint,
 )
@@ -34,8 +35,11 @@ from dayu.host.durable.options import (
 )
 from dayu.host.durable.projection import (
     ProjectionCheckpointRow,
+    ProjectionFailureRow,
     read_projection_checkpoint,
+    read_projection_failure,
 )
+from dayu.host.durable.schema import TABLE_EVENT_LOG, TABLE_HOST_MEMORY_SNAPSHOTS
 from dayu.host.durable.transaction import HostTransaction
 from dayu.host.memory import (
     CONVERSATION_MEMORY_CONSUMER_ID,
@@ -64,6 +68,10 @@ from dayu.host.memory import (
     calculate_memory_snapshot_digest,
     digest_memory_projection_policy,
     estimate_memory_size_units,
+)
+from dayu.host.memory_repair import (
+    catch_up_conversation_memory_projection,
+    rebuild_conversation_memory_projection,
 )
 from dayu.host.projection import ProjectionConsumerId, ProjectionRunner
 
@@ -308,6 +316,47 @@ def _append_memory_event(
     ).row
 
 
+def _event_log_count(transaction: HostTransaction) -> int:
+    """读取 EventLog row 数。
+
+    :param transaction: Host transaction。
+    :returns: EventLog row 数。
+    :raises HostDurableError: count row 缺失或类型非法时抛出。
+    """
+
+    row = transaction.fetchone(f"SELECT COUNT(*) AS count FROM {TABLE_EVENT_LOG}", ())
+    if row is None:
+        raise HostDurableError("event log count row missing")
+    value = row.get("count")
+    if not isinstance(value, int):
+        raise HostDurableError("event log count must be int")
+    return value
+
+
+def _damage_latest_memory_snapshot(
+    transaction: HostTransaction, *, policy_digest: str
+) -> None:
+    """破坏 latest memory snapshot JSON。
+
+    :param transaction: Host transaction。
+    :param policy_digest: memory policy digest。
+    :returns: ``None``。
+    """
+
+    row = read_latest_memory_snapshot(
+        transaction,
+        session_id=_SESSION_ID,
+        consumer_id=_CONSUMER_ID,
+        policy_digest=policy_digest,
+    )
+    if row is None:
+        raise HostDurableError("memory snapshot missing")
+    transaction.execute(
+        f"UPDATE {TABLE_HOST_MEMORY_SNAPSHOTS} SET snapshot_json = ? WHERE snapshot_id = ?",
+        ('{"snapshot_id":"damaged"}', row.snapshot.snapshot_id),
+    )
+
+
 def _tool_provenance() -> MemoryProvenanceRef:
     """构造 TOOL provenance。
 
@@ -433,6 +482,60 @@ class _ReadCheckpointOperation:
         """
 
         return read_projection_checkpoint(transaction, _CONSUMER_ID)
+
+
+class _ReadCheckpointForConsumerOperation:
+    """按 consumer id 读取 projection checkpoint 的 transaction operation。
+
+    :param consumer_id: projection consumer id。
+    """
+
+    def __init__(self, consumer_id: str) -> None:
+        """初始化 operation。
+
+        :param consumer_id: projection consumer id。
+        :returns: ``None``。
+        """
+
+        self._consumer_id = consumer_id
+
+    def __call__(
+        self, transaction: HostTransaction
+    ) -> ProjectionCheckpointRow | None:
+        """读取目标 consumer checkpoint。
+
+        :param transaction: Host transaction。
+        :returns: checkpoint row 或 ``None``。
+        :raises HostDurableError: durable 读取失败时抛出。
+        """
+
+        return read_projection_checkpoint(transaction, self._consumer_id)
+
+
+class _ReadProjectionFailureOperation:
+    """读取 projection failure 的 transaction operation。
+
+    :param consumer_id: projection consumer id。
+    """
+
+    def __init__(self, consumer_id: str) -> None:
+        """初始化 operation。
+
+        :param consumer_id: projection consumer id。
+        :returns: ``None``。
+        """
+
+        self._consumer_id = consumer_id
+
+    def __call__(self, transaction: HostTransaction) -> ProjectionFailureRow | None:
+        """读取 projection failure row。
+
+        :param transaction: Host transaction。
+        :returns: projection failure row 或 ``None``。
+        :raises HostDurableError: durable 读取失败时抛出。
+        """
+
+        return read_projection_failure(transaction, self._consumer_id)
 
 
 class _WriteThenFailOperation:
@@ -1308,3 +1411,235 @@ def test_projection_consumer_writes_snapshot_with_runner_checkpoint(
         assert read_back.snapshot.cursor.checkpoint_event_sequence == 2
         assert checkpoint is not None
         assert checkpoint.checkpoint_event_sequence == 2
+
+
+def test_reset_conversation_memory_projection_deletes_consumer_scope_only(
+    tmp_path: Path,
+) -> None:
+    """reset 清目标 consumer 全部 policy snapshot，但保留其它 consumer rows。"""
+
+    target_policy = _policy()
+    other_policy = _low_history_policy()
+    other_consumer_id = "host.memory.other-consumer"
+    target = _build_snapshot(
+        (
+            _memory_event(
+                event_sequence=1,
+                event_id="event-target-reset",
+                event_type="USER_INPUT_ACCEPTED",
+                payload={"display_text": "target memory"},
+                attempt_id=None,
+                execution_id=None,
+            ),
+        ),
+        policy=target_policy,
+    )
+    other_consumer = build_conversation_memory_snapshot_from_events(
+        events=(
+            _memory_event(
+                event_sequence=2,
+                event_id="event-other-consumer-reset",
+                event_type="USER_INPUT_ACCEPTED",
+                payload={"display_text": "other consumer memory"},
+                attempt_id=None,
+                execution_id=None,
+            ),
+        ),
+        session_id=_SESSION_ID,
+        consumer_id=other_consumer_id,
+        policy=target_policy,
+        built_at=_NOW,
+    )
+    other_policy_snapshot = build_empty_conversation_memory_snapshot(
+        snapshot_id="snapshot-other-policy-reset",
+        session_id=_SESSION_ID,
+        consumer_id=_CONSUMER_ID,
+        policy_digest=digest_memory_projection_policy(other_policy),
+        built_at=_NOW,
+    )
+
+    with open_host_durable_store(_options(tmp_path)) as store:
+        store.transaction_runner.run_write(
+            lambda transaction: _append_memory_event(
+                transaction,
+                event_id="event-target-reset",
+                event_type="USER_INPUT_ACCEPTED",
+                payload={"display_text": "target memory"},
+            )
+        )
+        store.transaction_runner.run_write(
+            lambda transaction: _append_memory_event(
+                transaction,
+                event_id="event-other-consumer-reset",
+                event_type="USER_INPUT_ACCEPTED",
+                payload={"display_text": "other consumer memory"},
+            )
+        )
+        store.transaction_runner.run_write(
+            lambda transaction: write_memory_snapshot_with_checkpoint(
+                transaction,
+                target,
+                now=_NOW,
+            )
+        )
+        store.transaction_runner.run_write(
+            lambda transaction: write_memory_snapshot_with_checkpoint(
+                transaction,
+                other_consumer,
+                now=_NOW,
+            )
+        )
+        store.transaction_runner.run_write(
+            lambda transaction: write_memory_snapshot_with_checkpoint(
+                transaction,
+                other_policy_snapshot,
+                now=_NOW,
+            )
+        )
+
+        store.transaction_runner.run_write(
+            lambda transaction: reset_conversation_memory_projection(
+                transaction,
+                consumer_id=_CONSUMER_ID,
+            )
+        )
+        target_read = store.transaction_runner.run_read(
+            _ReadLatestSnapshotOperation(digest_memory_projection_policy(target_policy))
+        )
+        other_policy_read = store.transaction_runner.run_read(
+            _ReadLatestSnapshotOperation(digest_memory_projection_policy(other_policy))
+        )
+        other_consumer_read = store.transaction_runner.run_read(
+            lambda transaction: read_latest_memory_snapshot(
+                transaction,
+                session_id=_SESSION_ID,
+                consumer_id=other_consumer_id,
+                policy_digest=digest_memory_projection_policy(target_policy),
+            )
+        )
+        target_checkpoint = store.transaction_runner.run_read(
+            _ReadCheckpointForConsumerOperation(_CONSUMER_ID)
+        )
+        other_checkpoint = store.transaction_runner.run_read(
+            _ReadCheckpointForConsumerOperation(other_consumer_id)
+        )
+
+        assert target_read is None
+        assert other_policy_read is None
+        assert other_consumer_read is not None
+        assert target_checkpoint is None
+        assert other_checkpoint is not None
+
+
+def test_rebuild_conversation_memory_projection_is_stable_and_does_not_append_eventlog(
+    tmp_path: Path,
+) -> None:
+    """rebuild 从 committed EventLog 重建 snapshot，保留 provenance 且不写 EventLog。"""
+
+    policy = _policy()
+    with open_host_durable_store(_options(tmp_path)) as store:
+        store.transaction_runner.run_write(
+            lambda transaction: _append_memory_event(
+                transaction,
+                event_id="event-tool-rebuild-service",
+                event_type="TOOL_RESULT_ACCEPTED",
+                payload=_tool_payload(summary="service rebuild tool summary"),
+            )
+        )
+        store.transaction_runner.run_write(
+            lambda transaction: _append_memory_event(
+                transaction,
+                event_id="event-final-rebuild-service",
+                event_type="RUN_SUCCEEDED",
+                payload={"final_answer": "service rebuild conclusion"},
+            )
+        )
+        before_count = store.transaction_runner.run_read(_event_log_count)
+
+        first = rebuild_conversation_memory_projection(
+            store.transaction_runner,
+            policy=policy,
+            batch_size=1,
+        )
+        first_snapshot = store.transaction_runner.run_read(
+            _ReadLatestSnapshotOperation(digest_memory_projection_policy(policy))
+        )
+        second = rebuild_conversation_memory_projection(
+            store.transaction_runner,
+            policy=policy,
+            batch_size=2,
+        )
+        second_snapshot = store.transaction_runner.run_read(
+            _ReadLatestSnapshotOperation(digest_memory_projection_policy(policy))
+        )
+        after_count = store.transaction_runner.run_read(_event_log_count)
+        checkpoint = store.transaction_runner.run_read(_ReadCheckpointOperation())
+
+        assert first.failures == 0
+        assert second.failures == 0
+        assert first_snapshot is not None
+        assert second_snapshot is not None
+        assert first_snapshot.snapshot.snapshot_digest == (
+            second_snapshot.snapshot.snapshot_digest
+        )
+        assert first_snapshot.snapshot.verified_facts[0].provenance.event_id == (
+            "event-tool-rebuild-service"
+        )
+        assert first_snapshot.snapshot.verified_facts[0].provenance.event_sequence == 1
+        assert first_snapshot.snapshot.verified_facts[0].provenance.payload_ref == (
+            "payload-tool-1"
+        )
+        assert before_count == after_count
+        assert checkpoint is not None
+        assert checkpoint.checkpoint_event_sequence == (
+            second_snapshot.snapshot.cursor.checkpoint_event_sequence
+        )
+
+
+def test_catch_up_projection_failure_row_remains_observable(tmp_path: Path) -> None:
+    """consumer apply 失败时 catch-up 返回 failure 且 projection failure row 可读。"""
+
+    policy = _policy()
+    policy_digest = digest_memory_projection_policy(policy)
+    with open_host_durable_store(_options(tmp_path)) as store:
+        store.transaction_runner.run_write(
+            lambda transaction: _append_memory_event(
+                transaction,
+                event_id="event-before-damage",
+                event_type="USER_INPUT_ACCEPTED",
+                payload={"display_text": "before damage"},
+            )
+        )
+        rebuild_conversation_memory_projection(
+            store.transaction_runner,
+            policy=policy,
+            batch_size=8,
+        )
+        store.transaction_runner.run_write(
+            lambda transaction: _damage_latest_memory_snapshot(
+                transaction,
+                policy_digest=policy_digest,
+            )
+        )
+        store.transaction_runner.run_write(
+            lambda transaction: _append_memory_event(
+                transaction,
+                event_id="event-after-damage",
+                event_type="USER_INPUT_ACCEPTED",
+                payload={"display_text": "after damage"},
+            )
+        )
+
+        result = catch_up_conversation_memory_projection(
+            store.transaction_runner,
+            policy=policy,
+            batch_size=8,
+        )
+        failure = store.transaction_runner.run_read(
+            _ReadProjectionFailureOperation(_CONSUMER_ID)
+        )
+
+        assert result.failures == 1
+        assert failure is not None
+        assert failure.failed_event_id == "event-after-damage"
+        assert failure.last_error_code == "HostDurableError"
