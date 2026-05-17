@@ -15,6 +15,8 @@ from dayu.host import (
     CancelMode,
     CancelRunRequest,
     CancelSessionRunsRequest,
+    CloseSessionRequest,
+    CreateSessionRequest,
     EnsureSessionRequest,
     FollowupBehavior,
     HostApiError,
@@ -24,15 +26,27 @@ from dayu.host import (
     HostCommandHandleOptions,
     HostInput,
     HostLocalExecutionOptions,
+    HostStreamCursor,
     LocalEngineWorkerFactory,
     OperationContext,
+    PurgeSessionRequest,
+    ReplayRunRequest,
+    RetryRunRequest,
     StartRunRequest,
     SubmitFollowupRequest,
     cancel_run,
     cancel_session_runs,
+    close_session,
+    create_session,
     create_host_command_handle,
     ensure_session,
+    get_run,
+    get_session,
+    purge_session,
+    replay_run,
+    retry_run,
     start_run,
+    stream_run_events,
     submit_followup,
 )
 from dayu.engine.contracts.agent_policy import AgentPolicy
@@ -71,6 +85,27 @@ def _options(tmp_path: Path, host_handle_id: str | None = "host-test") -> HostCo
         sqlite_write_retry_initial_delay_seconds=0.001,
         sqlite_write_retry_backoff_multiplier=1.2,
         sqlite_write_retry_max_delay_seconds=0.01,
+        payload_inline_threshold_bytes=4096,
+    )
+
+
+def _options_without_write_retry(tmp_path: Path) -> HostCommandHandleOptions:
+    """构造不重试 busy write transaction 的测试 options。
+
+    :param tmp_path: pytest 临时目录。
+    :returns: Host command handle options。
+    """
+
+    return HostCommandHandleOptions(
+        host_handle_id="host-busy-test",
+        db_path=tmp_path / "host.sqlite3",
+        artifact_root=tmp_path / "artifacts",
+        create_parent_dirs=True,
+        sqlite_busy_timeout_seconds=0.001,
+        sqlite_write_busy_retry_count=0,
+        sqlite_write_retry_initial_delay_seconds=0.001,
+        sqlite_write_retry_backoff_multiplier=1.2,
+        sqlite_write_retry_max_delay_seconds=0.001,
         payload_inline_threshold_bytes=4096,
     )
 
@@ -127,6 +162,37 @@ def _ensure_request() -> EnsureSessionRequest:
     """
 
     return EnsureSessionRequest(scope="workspace", slot_key="slot-a", metadata=())
+
+
+def _create_request(client_request_id: str) -> CreateSessionRequest:
+    """构造 create_session 请求。
+
+    :param client_request_id: 幂等请求 id。
+    :returns: create session 请求。
+    """
+
+    return CreateSessionRequest(
+        context=_context(),
+        client_request_id=client_request_id,
+        bind_slot=False,
+        scope=None,
+        slot_key=None,
+        metadata=(),
+    )
+
+
+def _close_request(client_request_id: str) -> CloseSessionRequest:
+    """构造 close_session 请求。
+
+    :param client_request_id: 幂等请求 id。
+    :returns: close session 请求。
+    """
+
+    return CloseSessionRequest(
+        context=_context(),
+        client_request_id=client_request_id,
+        reason="close_after_closed",
+    )
 
 
 def _context(request_id: str = "trace-command-handle") -> HostCallContext:
@@ -246,6 +312,49 @@ def _cancel_session_runs_request(
         client_request_id=client_request_id,
         reason="user_stop_all",
         mode=CancelMode.GRACEFUL,
+    )
+
+
+def _retry_request(client_request_id: str) -> RetryRunRequest:
+    """构造 retry_run 请求。
+
+    :param client_request_id: 幂等请求 id。
+    :returns: retry run 请求。
+    """
+
+    return RetryRunRequest(
+        context=_context(),
+        client_request_id=client_request_id,
+        reason="retry_after_closed",
+    )
+
+
+def _replay_request(client_request_id: str) -> ReplayRunRequest:
+    """构造 replay_run 请求。
+
+    :param client_request_id: 幂等请求 id。
+    :returns: replay run 请求。
+    """
+
+    return ReplayRunRequest(
+        context=_context(),
+        client_request_id=client_request_id,
+        reason="replay_after_closed",
+        repair_instruction="repair run input",
+    )
+
+
+def _purge_request(client_request_id: str) -> PurgeSessionRequest:
+    """构造 purge_session 请求。
+
+    :param client_request_id: 幂等请求 id。
+    :returns: purge session 请求。
+    """
+
+    return PurgeSessionRequest(
+        context=_context(),
+        client_request_id=client_request_id,
+        reason="purge_after_closed",
     )
 
 
@@ -407,6 +516,43 @@ def test_factory_rejects_local_execution_without_hidden_scheduler(
         )
 
 
+def test_factory_translates_durable_config_error_to_public_error(
+    tmp_path: Path,
+) -> None:
+    """factory 不把 durable config error 暴露给 public 调用方。"""
+
+    options = _options(tmp_path / "missing-parent")
+
+    with pytest.raises(HostApiError) as exc_info:
+        create_host_command_handle(
+            HostCommandHandleOptions(
+                host_handle_id=options.host_handle_id,
+                db_path=options.db_path,
+                artifact_root=options.artifact_root,
+                create_parent_dirs=False,
+                sqlite_busy_timeout_seconds=options.sqlite_busy_timeout_seconds,
+                sqlite_write_busy_retry_count=(
+                    options.sqlite_write_busy_retry_count
+                ),
+                sqlite_write_retry_initial_delay_seconds=(
+                    options.sqlite_write_retry_initial_delay_seconds
+                ),
+                sqlite_write_retry_backoff_multiplier=(
+                    options.sqlite_write_retry_backoff_multiplier
+                ),
+                sqlite_write_retry_max_delay_seconds=(
+                    options.sqlite_write_retry_max_delay_seconds
+                ),
+                payload_inline_threshold_bytes=(
+                    options.payload_inline_threshold_bytes
+                ),
+            )
+        )
+
+    assert exc_info.value.code == HostApiErrorCode.INVALID_STATE
+    assert exc_info.value.retryable is False
+
+
 def test_generated_handle_id_is_stable_for_handle_lifetime(
     tmp_path: Path,
 ) -> None:
@@ -457,6 +603,54 @@ def test_handle_close_is_idempotent_and_facade_fails_after_close(
     with pytest.raises(HostApiError) as exc_info:
         ensure_session(command_handle, _ensure_request())
     _assert_closed_handle_error(exc_info.value)
+
+
+def test_session_and_read_facades_fail_closed_before_durable(
+    tmp_path: Path,
+) -> None:
+    """关闭后 session/read public facade 先返回 lifecycle 错误。"""
+
+    options = _options(tmp_path)
+    command_handle = create_host_command_handle(options)
+    session_id = ensure_session(command_handle, _ensure_request()).session_id
+    run = start_run(command_handle, _start_request(session_id, "start-open"))
+    before_events = _event_count(options.db_path)
+    before_idempotency = _idempotency_count(options.db_path)
+
+    command_handle.close()
+
+    with pytest.raises(HostApiError) as ensure_exc:
+        ensure_session(command_handle, _ensure_request())
+    with pytest.raises(HostApiError) as create_exc:
+        create_session(command_handle, _create_request("create-closed"))
+    with pytest.raises(HostApiError) as close_exc:
+        close_session(
+            command_handle,
+            session_id,
+            _close_request("close-closed"),
+        )
+    with pytest.raises(HostApiError) as get_session_exc:
+        get_session(command_handle, session_id)
+    with pytest.raises(HostApiError) as get_run_exc:
+        get_run(command_handle, run.run_id)
+    with pytest.raises(HostApiError) as stream_exc:
+        stream_run_events(
+            command_handle,
+            run.run_id,
+            HostStreamCursor(event_sequence=0),
+        )
+
+    for exc_info in (
+        ensure_exc,
+        create_exc,
+        close_exc,
+        get_session_exc,
+        get_run_exc,
+        stream_exc,
+    ):
+        _assert_closed_handle_error(exc_info.value)
+    assert _event_count(options.db_path) == before_events
+    assert _idempotency_count(options.db_path) == before_idempotency
 
 
 def test_admission_backed_facades_fail_closed_before_public_branches(
@@ -520,6 +714,67 @@ def test_admission_backed_facades_fail_closed_before_public_branches(
         _assert_closed_handle_error(exc_info.value)
     assert _event_count(options.db_path) == before_events
     assert _idempotency_count(options.db_path) == before_idempotency
+
+
+def test_deferred_public_facades_fail_closed_before_unsupported(
+    tmp_path: Path,
+) -> None:
+    """关闭后 deferred public facade 先返回 handle lifecycle 错误。"""
+
+    options = _options(tmp_path)
+    command_handle = create_host_command_handle(options)
+    session_id = ensure_session(command_handle, _ensure_request()).session_id
+    run = start_run(command_handle, _start_request(session_id, "start-open"))
+    before_events = _event_count(options.db_path)
+    before_idempotency = _idempotency_count(options.db_path)
+
+    command_handle.close()
+
+    with pytest.raises(HostApiError) as retry_exc:
+        retry_run(command_handle, run.run_id, _retry_request("retry-closed"))
+    with pytest.raises(HostApiError) as replay_exc:
+        replay_run(command_handle, run.run_id, _replay_request("replay-closed"))
+    with pytest.raises(HostApiError) as purge_exc:
+        purge_session(
+            command_handle, session_id, _purge_request("purge-closed")
+        )
+
+    for exc_info in (retry_exc, replay_exc, purge_exc):
+        _assert_closed_handle_error(exc_info.value)
+    assert _event_count(options.db_path) == before_events
+    assert _idempotency_count(options.db_path) == before_idempotency
+
+
+def test_retryable_durable_transaction_busy_returns_public_error(
+    tmp_path: Path,
+) -> None:
+    """durable write busy 重试耗尽时返回可重试 public internal error。"""
+
+    options = _options_without_write_retry(tmp_path)
+    command_handle = create_host_command_handle(options)
+    ensure_session(command_handle, _ensure_request())
+    lock_connection = sqlite3.connect(
+        options.db_path,
+        timeout=0.001,
+        isolation_level=None,
+    )
+    try:
+        lock_connection.execute("BEGIN IMMEDIATE")
+
+        with pytest.raises(HostApiError) as exc_info:
+            ensure_session(
+                command_handle,
+                EnsureSessionRequest(
+                    scope="workspace", slot_key="slot-b", metadata=()
+                ),
+            )
+
+        assert exc_info.value.code == HostApiErrorCode.INTERNAL_ERROR
+        assert exc_info.value.retryable is True
+    finally:
+        lock_connection.execute("ROLLBACK")
+        lock_connection.close()
+        command_handle.close()
 
 
 def test_host_import_boundary_still_excludes_upper_layers() -> None:

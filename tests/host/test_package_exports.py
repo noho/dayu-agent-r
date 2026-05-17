@@ -111,6 +111,22 @@ EXPECTED_HOST_EXPORTS: frozenset[str] = (
     EXPECTED_API_EXPORTS | EXPECTED_TOOLING_EXPORTS | EXPECTED_COMMAND_EXPORTS
 )
 
+FORBIDDEN_HOST_ROOT_EXPORTS: frozenset[str] = frozenset(
+    {
+        "ActiveWorkerRegistry",
+        "DefaultToolRuntimeFactory",
+        "HostAdmissionService",
+        "HostDispatchScheduler",
+        "HostDurableStore",
+        "HostDurableStoreOptions",
+        "ToolRuntimeBuildRequest",
+        "ToolRuntimeExecutionScope",
+        "ToolRuntimeFactory",
+        "ToolRuntimeHandle",
+        "open_host_durable_store",
+    }
+)
+
 
 def test_host_all_matches_current_public_contracts() -> None:
     """``dayu.host.__all__`` 匹配当前 public contract。"""
@@ -119,6 +135,13 @@ def test_host_all_matches_current_public_contracts() -> None:
     assert actual == EXPECTED_HOST_EXPORTS, (
         f"missing={EXPECTED_HOST_EXPORTS - actual}; extra={actual - EXPECTED_HOST_EXPORTS}"
     )
+
+
+def test_host_root_does_not_export_internal_services() -> None:
+    """Service/UI 从包根不能取得 Host 内部 service 或 runtime 边界。"""
+
+    package_symbols = vars(host)
+    assert not (FORBIDDEN_HOST_ROOT_EXPORTS & frozenset(package_symbols))
 
 
 def test_api_all_stays_request_snapshot_boundary() -> None:
