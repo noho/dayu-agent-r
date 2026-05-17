@@ -220,8 +220,8 @@ Phase Map 中每个 phase 必须使用统一条目格式。模板如下：
 
 ## 当前状态
 
-P9-S1 `Durable Memory Contracts and Schema` code review accepted；下一步创建 accepted slice commit 后进入 P9-S2
-`Stable Layer and History Pool` implementation。
+P9-S1 `Durable Memory Contracts and Schema` completed；accepted slice commit 为 `f221aeb`。当前 gate 为 P9-S2
+`Projection Consumer and Stable Layer Builder` implementation。
 
 约束：本节只保留当前 gate 结论；phase 过程流水必须归档到 `历史记录`，仍需追踪的风险或后续 owner 必须写入 `Open Questions 与风险追踪` 的 `追踪区`。
 
@@ -810,7 +810,8 @@ Phase 按依赖关系推进：先实现被其它阶段依赖的公共契约、ru
 状态：
 - P9 phase discussion / design refinement 已完成。用户确认 P9 的核心定位是“财报分析工作台状态投影”，不是聊天记录压缩器。
 - P9 handoff implementation-ready plan 已完成双路 review、fix、双路 re-review 与 controller adjudication，verdict 为 PASS。
-- P9-S1 `Durable Memory Contracts and Schema` code review accepted，remaining blocking findings 为 0；等待 accepted slice commit。
+- P9-S1 `Durable Memory Contracts and Schema` completed；accepted slice commit 为 `f221aeb`。
+- P9-S2 `Projection Consumer and Stable Layer Builder` implementation in progress。
 
 目标：
 - 实现 session-level Conversation Memory projection、stable layer、history pool、snapshot cursor、RunInputBuilder memory provider 与 projection repair path。
@@ -1584,7 +1585,7 @@ Phase 按依赖关系推进：先实现被其它阶段依赖的公共契约、ru
   `docs/reviews/p9-s1-code-rereview-ds-20260517.md`。
 - Controller adjudication artifact 为 `docs/reviews/p9-s1-code-review-controller-adjudication-20260517.md`。
 - Re-review verdict：AgentMiMo PASS，AgentDS PASS，remaining blocking findings 为 0。
-- Accepted slice commit 待写入。
+- Accepted slice commit 为 `f221aeb`。
 
 验证：
 
@@ -1613,7 +1614,8 @@ non-blocking findings；AgentDS 初审 verdict 为 PASS with findings，提出 0
 findings。Controller 接受 MiMo B1 / DS C2 digest deterministic fix 与 MiMo N2 reserved claim status test coverage fix，defer
 non-blocking producer name precision、reason naming、diagnostic timestamp type surface 与 hardening items 到 P9-S2 / P9-S4 或后续
 Host hardening owner。Fix 后双路 re-review 均 PASS，remaining blocking findings 为 0。Controller adjudication artifact 为
-`docs/reviews/p9-s1-code-review-controller-adjudication-20260517.md`。当前 gate 为 P9-S1 accepted slice commit。
+`docs/reviews/p9-s1-code-review-controller-adjudication-20260517.md`。Accepted slice commit 为 `f221aeb`。当前 gate 为
+P9-S2 `Projection Consumer and Stable Layer Builder` implementation。
 
 ### 2026-05-16 P9 plan accepted
 
