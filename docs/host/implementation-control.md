@@ -223,8 +223,8 @@ Phase Map 中每个 phase 必须使用统一条目格式。模板如下：
 约束：本节只保留当前 gate 结论；phase 过程流水必须归档到 `历史记录`，仍需追踪的风险或后续 owner 必须写入 `Open Questions 与风险追踪` 的 `追踪区`。
 
 当前 work unit：P9.5 Pre-P10 Cross-Repository Hardening PR。
-当前 gate：P9.5 S9 Runtime Lane Hardening implementation。
-下一 gate：P9.5 S9 code review。
+当前 gate：P9.5 S10 Host Dispatch Lifecycle / RunInputBuilder Non-Recovery Cleanup implementation。
+下一 gate：P9.5 S10 code review。
 
 ## Phase Map
 
@@ -2032,6 +2032,24 @@ P9.5 收口清单：
 - 当前无 PR review blocking fix。
 
 ## 历史记录
+
+### 2026-05-17 P9.5 S9 Runtime Lane Hardening accepted
+
+P9.5 S9 Runtime Lane Hardening 已完成。Implementation artifact 为
+`docs/reviews/p9-5-s9-runtime-lane-hardening-implementation-20260517.md`。Code review /
+controller adjudication artifacts 为 `docs/reviews/p9-5-s9-code-review-mimo-20260517.md`、
+`docs/reviews/p9-5-s9-code-review-ds-20260517.md` 与
+`docs/reviews/p9-5-s9-code-review-controller-adjudication-20260517.md`。
+
+Controller 裁决：AgentMiMo 与 AgentDS review 均为 0 blocking findings。两份 review 均确认
+`Task.cancel()` 透传、`CancellationToken` 返回 `LaneAcquireCancelled`、取消优先于 timeout、repeated outer
+cancellation 不打断已插入 claim cleanup，untracked release failure 通过 warning / `RuntimeLaneError`
+暴露，`LaneController.close(reason=...)` 保持 best-effort release 且不引入 Host truth。MiMo info
+observation 与 DS residual risks 均裁决为 non-goal 或未来扩展风险，不需要 S9 fix。本地验证通过：S9
+targeted tests 为 31 passed；`pytest tests/runtime` 为 93 passed；`python -m pyright dayu/runtime tests/runtime`
+为 0 errors / 0 warnings / 0 informations；`git diff --check` clean。Accepted slice commit
+为 `d40a3cc`。当前 gate 为 P9.5 S10 Host Dispatch Lifecycle / RunInputBuilder Non-Recovery Cleanup
+implementation。
 
 ### 2026-05-17 P9.5 S8 Engine Wait Confirmation Matching-Ref Hardening accepted
 
