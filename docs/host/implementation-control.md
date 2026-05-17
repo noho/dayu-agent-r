@@ -223,8 +223,8 @@ Phase Map 中每个 phase 必须使用统一条目格式。模板如下：
 约束：本节只保留当前 gate 结论；phase 过程流水必须归档到 `历史记录`，仍需追踪的风险或后续 owner 必须写入 `Open Questions 与风险追踪` 的 `追踪区`。
 
 当前 work unit：P9.5 Pre-P10 Cross-Repository Hardening PR。
-当前 gate：P9.5 S18 Aggregate Validation And Readiness Evidence implementation。
-下一 gate：P9.5 S18 code review。
+当前 gate：P9.5 aggregate deepreview。
+下一 gate：P9.5 aggregate deepreview adjudication。
 
 ## Phase Map
 
@@ -2032,6 +2032,23 @@ P9.5 收口清单：
 - 当前无 PR review blocking fix。
 
 ## 历史记录
+
+### 2026-05-17 P9.5 S18 Aggregate Validation And Readiness Evidence accepted
+
+P9.5 S18 Aggregate Validation And Readiness Evidence 已完成。Readiness implementation artifact 为
+`docs/reviews/p9-5-s18-aggregate-validation-readiness-implementation-20260517.md`。Readiness review /
+re-review / controller adjudication artifacts 为 `docs/reviews/p9-5-s18-readiness-review-mimo-20260517.md`、
+`docs/reviews/p9-5-s18-readiness-review-ds-20260517.md`、
+`docs/reviews/p9-5-s18-readiness-re-review-ds-20260517.md` 与
+`docs/reviews/p9-5-s18-readiness-review-controller-adjudication-20260517.md`。
+
+Controller 裁决：AgentMiMo readiness review 为 PASS；AgentDS readiness review 为 PASS with one
+non-blocking finding。DS F3 指出 readiness artifact 曾将 `minimal read model single-consumer reset contract`
+误映射为 S2，controller 接受并修正为 S6，DS re-review 确认 fixed。S18 aggregate validation 通过：
+`pytest -q` 为 1066 passed；`python -m pyright dayu tests` 为 0 errors / 0 warnings / 0 informations；
+`git diff --check` clean。S18 readiness artifact 已将 P9.5 tracking items 映射为 fixed、明确不修且有原因，
+或重新归属到具体 P10+ owner；generic default memory catch-up 仍明确不属于 P9.5，因为需要 snapshot history /
+cursor coverage 语义。Accepted slice commit 为 `79db0e1`。当前 gate 为 P9.5 aggregate deepreview。
 
 ### 2026-05-17 P9.5 S17 Documentation And Control Tracking accepted
 
