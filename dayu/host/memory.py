@@ -10,7 +10,7 @@ from __future__ import annotations
 from collections.abc import Mapping
 from dataclasses import dataclass
 from enum import StrEnum
-from typing import TypeAlias
+from typing import Protocol, TypeAlias, TypeVar
 
 from dayu.contracts.json_value import JsonValue
 from dayu.host.durable.codec import sha256_digest_json
@@ -27,9 +27,62 @@ HostEventRef: TypeAlias = str
 HostPayloadRef: TypeAlias = str
 """Host payload descriptor ref 文本。"""
 
+_MemoryItemT = TypeVar("_MemoryItemT", bound="_MemoryItemWithId")
+
 _MIN_SEQUENCE = 0
 _MIN_POSITIVE_LIMIT = 1
 _EMPTY_SIZE_UNITS = 0
+CONVERSATION_MEMORY_CONSUMER_ID = "host.memory.session.v1"
+"""Conversation memory projection consumer 稳定 id。"""
+
+_EVENT_TYPE_USER_INPUT_ACCEPTED = "USER_INPUT_ACCEPTED"
+_EVENT_TYPE_RUN_SUCCEEDED = "RUN_SUCCEEDED"
+_EVENT_TYPE_TOOL_RESULT_ACCEPTED = "TOOL_RESULT_ACCEPTED"
+_EVENT_TYPE_EPISODE_SUMMARY_ACCEPTED = "EPISODE_SUMMARY_ACCEPTED"
+_PRODUCER_NAME_HOST_PROJECTION = "host_projection"
+_SNAPSHOT_DIGEST_PENDING = "pending"
+_PAYLOAD_FIELD_DISPLAY_TEXT = "display_text"
+_PAYLOAD_FIELD_FINAL_ANSWER = "final_answer"
+_PAYLOAD_FIELD_SUMMARY_TEXT = "summary_text"
+_PAYLOAD_FIELD_FACT_SUMMARY = "fact_summary"
+_PAYLOAD_FIELD_RESULT_SUMMARY = "result_summary"
+_PAYLOAD_FIELD_SUMMARY = "summary"
+_PAYLOAD_FIELD_RESULT = "result"
+_PAYLOAD_FIELD_TOOL_NAME = "tool_name"
+_PAYLOAD_FIELD_TOOL_CALL_ID = "tool_call_id"
+_PAYLOAD_FIELD_TOOL_IDENTITY_DIGEST = "tool_identity_digest"
+_PAYLOAD_FIELD_OUTCOME_DIGEST = "outcome_digest"
+_PAYLOAD_FIELD_TOOL_CALL_REQUESTED_EVENT_REF = "tool_call_requested_event_ref"
+_PAYLOAD_FIELD_PAYLOAD_REF = "payload_ref"
+_PAYLOAD_FIELD_PAYLOAD_DIGEST = "payload_digest"
+_PAYLOAD_FIELD_SOURCE_REFS = "source_refs"
+_PAYLOAD_FIELD_REF_KIND = "ref_kind"
+_PAYLOAD_FIELD_REF_ID = "ref_id"
+_PAYLOAD_FIELD_DIGEST = "digest"
+_PAYLOAD_FIELD_EVENT_ID = "event_id"
+_PAYLOAD_FIELD_RUN_ID = "run_id"
+_PAYLOAD_FIELD_ATTEMPT_ID = "attempt_id"
+_PAYLOAD_FIELD_EXECUTION_ID = "execution_id"
+_PAYLOAD_REF_PREFIX = "payload:"
+_TOOL_CALL_REF_PREFIX = "tool_call:"
+_EVENT_REF_PREFIX = "event:"
+_SNAPSHOT_ID_DIGEST_PREFIX = "memory-snapshot-"
+_ITEM_ID_PREFIX = "memory-item"
+_DIAGNOSTIC_ID_PREFIX = "memory-diagnostic"
+_UNKNOWN_TOOL_PRODUCER_NAME = "unknown_tool"
+
+
+class _MemoryItemWithId(Protocol):
+    """仅用于内部泛型去重的 item id 协议。"""
+
+    @property
+    def item_id(self) -> str:
+        """返回 item id。
+
+        :returns: item id。
+        """
+
+        ...
 
 
 class MemoryClaimStatus(StrEnum):
@@ -561,6 +614,60 @@ class ConversationMemorySnapshot:
             raise ValueError("snapshot session_id must match cursor session_id")
 
 
+@dataclass(frozen=True, slots=True)
+class MemoryProjectionEvent:
+    """Memory projection 使用的 Host 中立 EventLog view。
+
+    :param event_sequence: EventLog 全局 sequence。
+    :param event_id: EventLog id。
+    :param event_class: EventLog class 文本。
+    :param event_type: EventLog type 文本。
+    :param session_id: Session id。
+    :param run_id: 可选 Run id。
+    :param attempt_id: 可选 Attempt id。
+    :param execution_id: 可选 execution id。
+    :param occurred_at: 事件发生 UTC timestamp 文本。
+    :param payload_ref: 可选 payload descriptor ref。
+    :param payload_digest: 可选 payload digest。
+    :param payload: 已解析 canonical payload。
+    """
+
+    event_sequence: int
+    event_id: str
+    event_class: str
+    event_type: str
+    session_id: str
+    run_id: str | None
+    attempt_id: str | None
+    execution_id: str | None
+    occurred_at: str
+    payload_ref: str | None
+    payload_digest: str | None
+    payload: Mapping[str, JsonValue]
+
+    def __post_init__(self) -> None:
+        """校验 projection event 的最小字段。
+
+        :returns: ``None``。
+        :raises ValueError: 必填文本为空、sequence 非正数或 payload ref 不成对时抛出。
+        """
+
+        if self.event_sequence <= _MIN_SEQUENCE:
+            raise ValueError("event_sequence must be positive")
+        _require_non_empty(self.event_id, "event_id")
+        _require_non_empty(self.event_class, "event_class")
+        _require_non_empty(self.event_type, "event_type")
+        _require_non_empty(self.session_id, "session_id")
+        _require_non_empty(self.occurred_at, "occurred_at")
+        _require_optional_non_empty(self.run_id, "run_id")
+        _require_optional_non_empty(self.attempt_id, "attempt_id")
+        _require_optional_non_empty(self.execution_id, "execution_id")
+        _require_optional_non_empty(self.payload_ref, "payload_ref")
+        _require_optional_non_empty(self.payload_digest, "payload_digest")
+        if (self.payload_ref is None) != (self.payload_digest is None):
+            raise ValueError("payload_ref and payload_digest must be paired")
+
+
 def estimate_memory_size_units(text: str) -> MemorySizeUnits:
     """用统一保守口径估算 memory 文本尺寸。
 
@@ -643,7 +750,7 @@ def build_empty_conversation_memory_snapshot(
         conversation_continuity=ConversationContinuityView(items=()),
         diagnostics=(),
         built_at=built_at,
-        snapshot_digest="pending",
+        snapshot_digest=_SNAPSHOT_DIGEST_PENDING,
     )
     digest = calculate_memory_snapshot_digest(snapshot_without_digest)
     return ConversationMemorySnapshot(
@@ -659,6 +766,1132 @@ def build_empty_conversation_memory_snapshot(
         built_at=built_at,
         snapshot_digest=digest,
     )
+
+
+def build_conversation_memory_snapshot_from_events(
+    *,
+    events: tuple[MemoryProjectionEvent, ...],
+    session_id: str,
+    consumer_id: str,
+    policy: MemoryProjectionPolicy,
+    built_at: str,
+) -> ConversationMemorySnapshot:
+    """从固定 EventLog event 集合重建 session memory snapshot。
+
+    本函数只消费传入 events，不读取 durable store。它用于 projection rebuild
+    与单元测试验证“同一 EventLog + policy”可生成稳定 snapshot digest。
+
+    :param events: 按 EventLog sequence 升序排列的 projection events。
+    :param session_id: 目标 session id。
+    :param consumer_id: memory projection consumer id。
+    :param policy: memory projection policy。
+    :param built_at: snapshot 构建时间；不参与 digest。
+    :returns: 重建后的 memory snapshot。
+    :raises ValueError: 输入文本为空或事件顺序倒退时抛出。
+    """
+
+    _require_non_empty(session_id, "session_id")
+    _require_non_empty(consumer_id, "consumer_id")
+    _require_non_empty(built_at, "built_at")
+    snapshot: ConversationMemorySnapshot | None = None
+    previous_sequence = _MIN_SEQUENCE
+    for event in events:
+        if event.event_sequence <= previous_sequence:
+            raise ValueError("memory projection events must be ordered by sequence")
+        previous_sequence = event.event_sequence
+        if event.session_id != session_id:
+            continue
+        snapshot = project_conversation_memory_event(
+            previous_snapshot=snapshot,
+            event=event,
+            policy=policy,
+            built_at=built_at,
+            consumer_id=consumer_id,
+        )
+    if snapshot is not None:
+        return snapshot
+    return build_empty_conversation_memory_snapshot(
+        snapshot_id=stable_memory_snapshot_id(
+            session_id=session_id,
+            consumer_id=consumer_id,
+            policy_digest=digest_memory_projection_policy(policy),
+        ),
+        session_id=session_id,
+        consumer_id=consumer_id,
+        policy_digest=digest_memory_projection_policy(policy),
+        built_at=built_at,
+    )
+
+
+def project_conversation_memory_event(
+    *,
+    previous_snapshot: ConversationMemorySnapshot | None,
+    event: MemoryProjectionEvent,
+    policy: MemoryProjectionPolicy,
+    built_at: str,
+    consumer_id: str,
+) -> ConversationMemorySnapshot:
+    """把单个 canonical EventLog event 投影到新的 memory snapshot。
+
+    :param previous_snapshot: 同一 session / policy 下的既有 snapshot。
+    :param event: 当前 projection event。
+    :param policy: memory projection policy。
+    :param built_at: 新 snapshot 构建时间；不参与 digest。
+    :param consumer_id: memory projection consumer id。
+    :returns: 覆盖当前 event cursor 的新 snapshot。
+    :raises ValueError: snapshot 与 event / policy 不一致时抛出。
+    """
+
+    _require_non_empty(built_at, "built_at")
+    _require_non_empty(consumer_id, "consumer_id")
+    policy_digest = digest_memory_projection_policy(policy)
+    base = _empty_or_valid_previous_snapshot(
+        previous_snapshot=previous_snapshot,
+        event=event,
+        policy_digest=policy_digest,
+        consumer_id=consumer_id,
+        built_at=built_at,
+    )
+    pinned_state = base.pinned_state
+    verified_facts = base.verified_facts
+    working_assumptions = base.working_assumptions
+    continuity_items = base.conversation_continuity.items
+    diagnostics = base.diagnostics
+
+    if event.event_type == _EVENT_TYPE_TOOL_RESULT_ACCEPTED:
+        fact, fact_diagnostics = _verified_fact_from_projection_event(
+            event, policy_digest=policy_digest
+        )
+        verified_facts = _replace_item_by_id(verified_facts, fact)
+        diagnostics = diagnostics + fact_diagnostics
+    elif event.event_type == _EVENT_TYPE_USER_INPUT_ACCEPTED:
+        pinned_state = _pinned_state_with_user_input(
+            pinned_state,
+            event,
+            policy=policy,
+        )
+        item = _raw_user_turn_from_projection_event(event)
+        continuity_items = _replace_item_by_id(continuity_items, item)
+    elif event.event_type == _EVENT_TYPE_RUN_SUCCEEDED:
+        item = _assistant_conclusion_from_projection_event(event, policy=policy)
+        continuity_items = _replace_item_by_id(continuity_items, item)
+    elif event.event_type == _EVENT_TYPE_EPISODE_SUMMARY_ACCEPTED:
+        item = _episode_summary_from_projection_event(event, policy=policy)
+        continuity_items = _replace_item_by_id(continuity_items, item)
+    else:
+        diagnostics = diagnostics + (
+            _unsupported_event_type_diagnostic(
+                event,
+                policy_digest=policy_digest,
+            ),
+        )
+
+    limited_pinned_state = _limit_pinned_state(pinned_state, policy)
+    limited_verified_facts, fact_budget_diagnostics = _limit_verified_facts(
+        verified_facts,
+        policy=policy,
+        policy_digest=policy_digest,
+    )
+    limited_assumptions, assumption_budget_diagnostics = _limit_working_assumptions(
+        working_assumptions,
+        policy=policy,
+        policy_digest=policy_digest,
+    )
+    limited_continuity, continuity_budget_diagnostics = _limit_continuity_items(
+        continuity_items,
+        policy=policy,
+        policy_digest=policy_digest,
+    )
+    cursor = MemorySnapshotCursor(
+        consumer_id=consumer_id,
+        checkpoint_event_sequence=event.event_sequence,
+        checkpoint_event_id=event.event_id,
+        session_id=event.session_id,
+    )
+    snapshot_without_digest = ConversationMemorySnapshot(
+        snapshot_id=stable_memory_snapshot_id(
+            session_id=event.session_id,
+            consumer_id=consumer_id,
+            policy_digest=policy_digest,
+        ),
+        session_id=event.session_id,
+        cursor=cursor,
+        policy_digest=policy_digest,
+        pinned_state=limited_pinned_state,
+        verified_facts=limited_verified_facts,
+        working_assumptions=limited_assumptions,
+        conversation_continuity=ConversationContinuityView(
+            items=limited_continuity
+        ),
+        diagnostics=_dedupe_diagnostics(
+            diagnostics
+            + fact_budget_diagnostics
+            + assumption_budget_diagnostics
+            + continuity_budget_diagnostics
+        ),
+        built_at=built_at,
+        snapshot_digest=_SNAPSHOT_DIGEST_PENDING,
+    )
+    return ConversationMemorySnapshot(
+        snapshot_id=snapshot_without_digest.snapshot_id,
+        session_id=snapshot_without_digest.session_id,
+        cursor=snapshot_without_digest.cursor,
+        policy_digest=snapshot_without_digest.policy_digest,
+        pinned_state=snapshot_without_digest.pinned_state,
+        verified_facts=snapshot_without_digest.verified_facts,
+        working_assumptions=snapshot_without_digest.working_assumptions,
+        conversation_continuity=snapshot_without_digest.conversation_continuity,
+        diagnostics=snapshot_without_digest.diagnostics,
+        built_at=snapshot_without_digest.built_at,
+        snapshot_digest=calculate_memory_snapshot_digest(snapshot_without_digest),
+    )
+
+
+def stable_memory_snapshot_id(
+    *,
+    session_id: str,
+    consumer_id: str,
+    policy_digest: MemoryPolicyDigest,
+) -> str:
+    """派生稳定 memory snapshot id。
+
+    :param session_id: Session id。
+    :param consumer_id: memory projection consumer id。
+    :param policy_digest: memory policy digest。
+    :returns: 稳定 snapshot id。
+    :raises ValueError: 任一文本为空时抛出。
+    """
+
+    _require_non_empty(session_id, "session_id")
+    _require_non_empty(consumer_id, "consumer_id")
+    _require_non_empty(policy_digest, "policy_digest")
+    digest = sha256_digest_json(
+        {
+            "consumer_id": consumer_id,
+            "policy_digest": policy_digest,
+            "session_id": session_id,
+        }
+    ).removeprefix("sha256:")
+    return f"{_SNAPSHOT_ID_DIGEST_PREFIX}{digest}"
+
+
+def _empty_or_valid_previous_snapshot(
+    *,
+    previous_snapshot: ConversationMemorySnapshot | None,
+    event: MemoryProjectionEvent,
+    policy_digest: MemoryPolicyDigest,
+    consumer_id: str,
+    built_at: str,
+) -> ConversationMemorySnapshot:
+    """读取既有 snapshot 或构造同 policy 空 snapshot。
+
+    :param previous_snapshot: 既有 snapshot 或 ``None``。
+    :param event: 当前 projection event。
+    :param policy_digest: 当前 policy digest。
+    :param consumer_id: memory consumer id。
+    :param built_at: 空 snapshot 构建时间。
+    :returns: 可作为本次投影基础的 snapshot。
+    :raises ValueError: 既有 snapshot 与当前 event / policy 不一致时抛出。
+    """
+
+    if previous_snapshot is None:
+        return build_empty_conversation_memory_snapshot(
+            snapshot_id=stable_memory_snapshot_id(
+                session_id=event.session_id,
+                consumer_id=consumer_id,
+                policy_digest=policy_digest,
+            ),
+            session_id=event.session_id,
+            consumer_id=consumer_id,
+            policy_digest=policy_digest,
+            built_at=built_at,
+        )
+    if previous_snapshot.session_id != event.session_id:
+        raise ValueError("previous memory snapshot belongs to another session")
+    if previous_snapshot.policy_digest != policy_digest:
+        raise ValueError("previous memory snapshot uses another policy")
+    if previous_snapshot.cursor.consumer_id != consumer_id:
+        raise ValueError("previous memory snapshot uses another consumer")
+    if previous_snapshot.cursor.checkpoint_event_sequence > event.event_sequence:
+        raise ValueError("memory projection event is behind previous snapshot")
+    return previous_snapshot
+
+
+def _verified_fact_from_projection_event(
+    event: MemoryProjectionEvent, *, policy_digest: MemoryPolicyDigest
+) -> tuple[VerifiedFactView, tuple[MemoryDiagnostic, ...]]:
+    """从 ``TOOL_RESULT_ACCEPTED`` event 提取 verified fact。
+
+    :param event: TOOL_RESULT_ACCEPTED projection event。
+    :param policy_digest: 当前 policy digest。
+    :returns: verified fact 及可能的 fallback diagnostic。
+    """
+
+    tool_name = _optional_payload_str(event.payload, _PAYLOAD_FIELD_TOOL_NAME)
+    if tool_name is None:
+        tool_name = _UNKNOWN_TOOL_PRODUCER_NAME
+    fact_summary = _tool_fact_summary(event.payload)
+    diagnostics: tuple[MemoryDiagnostic, ...] = ()
+    payload_ref, payload_digest = _payload_ref_pair_from_event(event)
+    digest_ref = _tool_fact_digest_ref(event, payload_digest=payload_digest)
+    if fact_summary is None:
+        fact_summary = _neutral_tool_fact_fallback(
+            tool_name=tool_name,
+            outcome_digest=_optional_payload_str(
+                event.payload, _PAYLOAD_FIELD_OUTCOME_DIGEST
+            ),
+            payload_ref=payload_ref,
+            payload_digest=payload_digest,
+            digest_ref=digest_ref,
+        )
+        item_id = _item_id(event, "verified_fact")
+        diagnostics = (
+            MemoryDiagnostic(
+                diagnostic_id=_diagnostic_id(
+                    MemoryDiagnosticReason.MISSING_FACT_SUMMARY_FALLBACK,
+                    event_sequence=event.event_sequence,
+                    item_id=item_id,
+                ),
+                reason=MemoryDiagnosticReason.MISSING_FACT_SUMMARY_FALLBACK,
+                message="tool result fact summary missing; neutral fallback used",
+                event_sequence=event.event_sequence,
+                item_id=item_id,
+                policy_digest=policy_digest,
+                recorded_at=None,
+            ),
+        )
+    provenance = MemoryProvenanceRef(
+        producer_kind=MemoryProducerKind.TOOL,
+        producer_name=tool_name,
+        event_id=event.event_id,
+        event_sequence=event.event_sequence,
+        run_id=_event_or_payload_str(event, _PAYLOAD_FIELD_RUN_ID),
+        attempt_id=_event_or_payload_str(event, _PAYLOAD_FIELD_ATTEMPT_ID),
+        execution_id=_event_or_payload_str(event, _PAYLOAD_FIELD_EXECUTION_ID),
+        tool_result_ref=event.event_id,
+        payload_ref=payload_ref,
+        digest_ref=digest_ref,
+        source_refs=_tool_source_refs(event, payload_ref=payload_ref),
+    )
+    fact = VerifiedFactView(
+        item_id=_item_id(event, "verified_fact"),
+        fact_summary=fact_summary,
+        claim_status=MemoryClaimStatus.TOOL_VERIFIED,
+        provenance=provenance,
+        evidence_anchor=_payload_evidence_anchor(payload_ref, payload_digest),
+        subject_refs=(),
+        included_reason=MemoryIncludedReason.TOOL_VERIFIED_FACT,
+        excluded_reason=None,
+        size_units=estimate_memory_size_units(fact_summary),
+    )
+    return fact, diagnostics
+
+
+def _raw_user_turn_from_projection_event(
+    event: MemoryProjectionEvent,
+) -> ConversationContinuityItem:
+    """从 ``USER_INPUT_ACCEPTED`` event 构造 raw user continuity item。
+
+    :param event: USER_INPUT_ACCEPTED projection event。
+    :returns: raw user turn item。
+    """
+
+    summary_text = _user_visible_text(event)
+    return ConversationContinuityItem(
+        item_id=_item_id(event, "raw_user_turn"),
+        item_kind=ConversationContinuityKind.RAW_USER_TURN,
+        producer_kind=MemoryProducerKind.USER,
+        claim_status=MemoryClaimStatus.ASSUMPTION,
+        event_id=event.event_id,
+        event_sequence=event.event_sequence,
+        run_id=event.run_id,
+        summary_text=summary_text,
+        payload_ref=None,
+        payload_digest=None,
+        included_reason=MemoryIncludedReason.RECENT_RAW_TURN,
+        excluded_reason=None,
+        size_units=estimate_memory_size_units(summary_text),
+    )
+
+
+def _assistant_conclusion_from_projection_event(
+    event: MemoryProjectionEvent, *, policy: MemoryProjectionPolicy
+) -> ConversationContinuityItem:
+    """从 ``RUN_SUCCEEDED`` event 构造 assistant conclusion continuity item。
+
+    :param event: RUN_SUCCEEDED projection event。
+    :param policy: memory projection policy。
+    :returns: assistant conclusion item。
+    """
+
+    payload_ref, payload_digest = _payload_ref_pair_from_event(event)
+    final_answer = _optional_payload_str(event.payload, _PAYLOAD_FIELD_FINAL_ANSWER)
+    summary_text = _bounded_summary_text(
+        final_answer,
+        max_size_units=policy.max_raw_turn_size_units,
+        prefer_ref=payload_ref is not None,
+    )
+    size_text = summary_text if summary_text is not None else _ref_summary_text(
+        payload_ref=payload_ref,
+        payload_digest=payload_digest,
+        fallback_event_id=event.event_id,
+    )
+    return ConversationContinuityItem(
+        item_id=_item_id(event, "assistant_conclusion"),
+        item_kind=ConversationContinuityKind.ASSISTANT_CONCLUSION,
+        producer_kind=MemoryProducerKind.ASSISTANT,
+        claim_status=MemoryClaimStatus.ASSUMPTION,
+        event_id=event.event_id,
+        event_sequence=event.event_sequence,
+        run_id=event.run_id,
+        summary_text=summary_text,
+        payload_ref=payload_ref,
+        payload_digest=payload_digest,
+        included_reason=MemoryIncludedReason.RECENT_RAW_TURN,
+        excluded_reason=None,
+        size_units=estimate_memory_size_units(size_text),
+    )
+
+
+def _episode_summary_from_projection_event(
+    event: MemoryProjectionEvent, *, policy: MemoryProjectionPolicy
+) -> ConversationContinuityItem:
+    """从 episode summary event 构造 continuity navigation item。
+
+    :param event: EPISODE_SUMMARY_ACCEPTED projection event。
+    :param policy: memory projection policy。
+    :returns: episode summary item。
+    """
+
+    summary_text = _bounded_summary_text(
+        _episode_summary_text(event),
+        max_size_units=policy.max_raw_turn_size_units,
+        prefer_ref=False,
+    )
+    if summary_text is None:
+        summary_text = _ref_summary_text(
+            payload_ref=event.payload_ref,
+            payload_digest=event.payload_digest,
+            fallback_event_id=event.event_id,
+        )
+    return ConversationContinuityItem(
+        item_id=_item_id(event, "episode_summary"),
+        item_kind=ConversationContinuityKind.EPISODE_SUMMARY,
+        producer_kind=MemoryProducerKind.HOST_PROJECTION,
+        claim_status=MemoryClaimStatus.ASSUMPTION,
+        event_id=event.event_id,
+        event_sequence=event.event_sequence,
+        run_id=event.run_id,
+        summary_text=summary_text,
+        payload_ref=None,
+        payload_digest=None,
+        included_reason=MemoryIncludedReason.EPISODE_SUMMARY,
+        excluded_reason=None,
+        size_units=estimate_memory_size_units(summary_text),
+    )
+
+
+def _pinned_state_with_user_input(
+    pinned_state: PinnedStateView,
+    event: MemoryProjectionEvent,
+    *,
+    policy: MemoryProjectionPolicy,
+) -> PinnedStateView:
+    """把用户输入纳入 pinned constraints。
+
+    :param pinned_state: 既有 pinned state。
+    :param event: USER_INPUT_ACCEPTED projection event。
+    :param policy: memory projection policy。
+    :returns: 更新后的 pinned state。
+    """
+
+    text = _bounded_summary_text(
+        _user_visible_text(event),
+        max_size_units=policy.max_raw_turn_size_units,
+        prefer_ref=False,
+    )
+    if text is None:
+        text = _ref_summary_text(
+            payload_ref=event.payload_ref,
+            payload_digest=event.payload_digest,
+            fallback_event_id=event.event_id,
+        )
+    current_goal = pinned_state.current_goal
+    if current_goal is None:
+        current_goal = text
+    return PinnedStateView(
+        current_goal=current_goal,
+        confirmed_subjects=pinned_state.confirmed_subjects,
+        user_constraints=pinned_state.user_constraints + (text,),
+        open_questions=pinned_state.open_questions,
+    )
+
+
+def _limit_pinned_state(
+    pinned_state: PinnedStateView, policy: MemoryProjectionPolicy
+) -> PinnedStateView:
+    """按 policy 限制 pinned state 条目数量。
+
+    :param pinned_state: 原始 pinned state。
+    :param policy: memory projection policy。
+    :returns: 限制后的 pinned state。
+    """
+
+    return PinnedStateView(
+        current_goal=pinned_state.current_goal,
+        confirmed_subjects=pinned_state.confirmed_subjects[
+            -policy.max_pinned_items :
+        ],
+        user_constraints=pinned_state.user_constraints[-policy.max_pinned_items :],
+        open_questions=pinned_state.open_questions[-policy.max_pinned_items :],
+    )
+
+
+def _limit_verified_facts(
+    items: tuple[VerifiedFactView, ...],
+    *,
+    policy: MemoryProjectionPolicy,
+    policy_digest: MemoryPolicyDigest,
+) -> tuple[tuple[VerifiedFactView, ...], tuple[MemoryDiagnostic, ...]]:
+    """按 policy 限制 verified facts 数量。
+
+    :param items: 原始 verified facts。
+    :param policy: memory projection policy。
+    :param policy_digest: memory policy digest。
+    :returns: 限制后的 facts 与 budget diagnostics。
+    """
+
+    if len(items) <= policy.max_verified_facts:
+        return items, ()
+    kept = items[-policy.max_verified_facts :]
+    return kept, (
+        _budget_diagnostic(
+            event_sequence=items[0].provenance.event_sequence,
+            item_id=items[0].item_id,
+            policy_digest=policy_digest,
+            message="verified facts limited by memory policy",
+        ),
+    )
+
+
+def _limit_working_assumptions(
+    items: tuple[WorkingAssumptionView, ...],
+    *,
+    policy: MemoryProjectionPolicy,
+    policy_digest: MemoryPolicyDigest,
+) -> tuple[tuple[WorkingAssumptionView, ...], tuple[MemoryDiagnostic, ...]]:
+    """按 policy 限制 working assumptions 数量。
+
+    :param items: 原始 working assumptions。
+    :param policy: memory projection policy。
+    :param policy_digest: memory policy digest。
+    :returns: 限制后的 assumptions 与 budget diagnostics。
+    """
+
+    if len(items) <= policy.max_working_assumptions:
+        return items, ()
+    kept = items[-policy.max_working_assumptions :]
+    return kept, (
+        _budget_diagnostic(
+            event_sequence=items[0].event_sequence,
+            item_id=items[0].item_id,
+            policy_digest=policy_digest,
+            message="working assumptions limited by memory policy",
+        ),
+    )
+
+
+def _limit_continuity_items(
+    items: tuple[ConversationContinuityItem, ...],
+    *,
+    policy: MemoryProjectionPolicy,
+    policy_digest: MemoryPolicyDigest,
+) -> tuple[tuple[ConversationContinuityItem, ...], tuple[MemoryDiagnostic, ...]]:
+    """按 history pool policy 选择 continuity items。
+
+    recent raw turns 使用 count-based floor；older raw turns、assistant
+    conclusions 与其它非 episode continuity 先共用一个 size budget，episode
+    summaries 只使用剩余 budget。
+
+    :param items: 原始 continuity items。
+    :param policy: memory projection policy。
+    :param policy_digest: memory policy digest。
+    :returns: 选择后的 continuity items 与 budget diagnostics。
+    """
+
+    raw_items = tuple(item for item in items if _is_raw_turn(item))
+    if policy.recent_raw_turns_floor == _MIN_SEQUENCE:
+        recent_raw: tuple[ConversationContinuityItem, ...] = ()
+    else:
+        recent_raw = raw_items[-policy.recent_raw_turns_floor :]
+    recent_ids = frozenset(item.item_id for item in recent_raw)
+    primary_pool_items = tuple(
+        item for item in items if not _is_raw_turn(item) and not _is_episode(item)
+    )
+    older_raw = tuple(item for item in raw_items if item.item_id not in recent_ids)
+    episode_summaries = tuple(item for item in items if _is_episode(item))
+    selected_ids: set[str] = set(item.item_id for item in recent_raw)
+    budget_used = _EMPTY_SIZE_UNITS
+    for item in reversed(_event_ordered_items(older_raw + primary_pool_items)):
+        if budget_used + item.size_units.units <= policy.history_pool_size_units:
+            selected_ids.add(item.item_id)
+            budget_used += item.size_units.units
+    for item in reversed(episode_summaries):
+        if budget_used + item.size_units.units <= policy.history_pool_size_units:
+            selected_ids.add(item.item_id)
+            budget_used += item.size_units.units
+    selected = tuple(
+        _mark_continuity_item_included(item)
+        for item in items
+        if item.item_id in selected_ids
+    )
+    if len(selected) == len(items):
+        return selected, ()
+    first_dropped = next(item for item in items if item.item_id not in selected_ids)
+    return selected, (
+        _budget_diagnostic(
+            event_sequence=first_dropped.event_sequence,
+            item_id=first_dropped.item_id,
+            policy_digest=policy_digest,
+            message="conversation continuity limited by history pool budget",
+        ),
+    )
+
+
+def _event_ordered_items(
+    items: tuple[ConversationContinuityItem, ...],
+) -> tuple[ConversationContinuityItem, ...]:
+    """按 EventLog sequence 稳定排序 continuity items。
+
+    :param items: continuity items。
+    :returns: 按 event sequence 升序排列的 items。
+    """
+
+    return tuple(sorted(items, key=lambda item: item.event_sequence))
+
+
+def _replace_item_by_id(
+    items: tuple[_MemoryItemT, ...], item: _MemoryItemT
+) -> tuple[_MemoryItemT, ...]:
+    """按 item id 替换或追加 item。
+
+    :param items: 原始 item 元组。
+    :param item: 新 item。
+    :returns: 替换或追加后的 item 元组。
+    """
+
+    kept = tuple(existing for existing in items if existing.item_id != item.item_id)
+    return kept + (item,)
+
+
+def _dedupe_diagnostics(
+    diagnostics: tuple[MemoryDiagnostic, ...],
+) -> tuple[MemoryDiagnostic, ...]:
+    """按 diagnostic id 去重并保持稳定顺序。
+
+    :param diagnostics: 原始 diagnostics。
+    :returns: 去重后的 diagnostics。
+    """
+
+    seen: set[str] = set()
+    result: list[MemoryDiagnostic] = []
+    for diagnostic in diagnostics:
+        if diagnostic.diagnostic_id in seen:
+            continue
+        seen.add(diagnostic.diagnostic_id)
+        result.append(diagnostic)
+    return tuple(result)
+
+
+def _tool_fact_summary(payload: Mapping[str, JsonValue]) -> str | None:
+    """按安全字段优先级读取工具事实摘要。
+
+    :param payload: TOOL_RESULT_ACCEPTED payload。
+    :returns: 摘要文本或 ``None``。
+    """
+
+    for field_name in (
+        _PAYLOAD_FIELD_FACT_SUMMARY,
+        _PAYLOAD_FIELD_SUMMARY_TEXT,
+        _PAYLOAD_FIELD_RESULT_SUMMARY,
+        _PAYLOAD_FIELD_DISPLAY_TEXT,
+        _PAYLOAD_FIELD_SUMMARY,
+    ):
+        value = _optional_payload_str(payload, field_name)
+        if value is not None:
+            return value
+    result = _optional_payload_mapping(payload, _PAYLOAD_FIELD_RESULT)
+    if result is None:
+        return None
+    for field_name in (
+        _PAYLOAD_FIELD_FACT_SUMMARY,
+        _PAYLOAD_FIELD_SUMMARY_TEXT,
+        _PAYLOAD_FIELD_RESULT_SUMMARY,
+        _PAYLOAD_FIELD_DISPLAY_TEXT,
+        _PAYLOAD_FIELD_SUMMARY,
+    ):
+        value = _optional_payload_str(result, field_name)
+        if value is not None:
+            return value
+    return None
+
+
+def _tool_fact_digest_ref(
+    event: MemoryProjectionEvent, *, payload_digest: str | None
+) -> MemoryDigestRef:
+    """选择工具事实 digest ref。
+
+    :param event: TOOL_RESULT_ACCEPTED projection event。
+    :param payload_digest: 已解析 payload digest。
+    :returns: 非空 digest ref。
+    """
+
+    for candidate in (
+        event.payload_digest,
+        payload_digest,
+        _optional_payload_str(event.payload, _PAYLOAD_FIELD_PAYLOAD_DIGEST),
+        _optional_payload_str(event.payload, _PAYLOAD_FIELD_OUTCOME_DIGEST),
+    ):
+        if candidate is not None:
+            return candidate
+    return sha256_digest_json(event.payload)
+
+
+def _neutral_tool_fact_fallback(
+    *,
+    tool_name: str,
+    outcome_digest: str | None,
+    payload_ref: str | None,
+    payload_digest: str | None,
+    digest_ref: str,
+) -> str:
+    """构造不含业务结论的工具事实 fallback 摘要。
+
+    :param tool_name: 工具名。
+    :param outcome_digest: 可选 outcome digest。
+    :param payload_ref: 可选 payload ref。
+    :param payload_digest: 可选 payload digest。
+    :param digest_ref: 最终 digest ref。
+    :returns: 中立 fallback 摘要。
+    """
+
+    parts = [f"tool_name={tool_name}"]
+    if outcome_digest is not None:
+        parts.append(f"outcome_digest={outcome_digest}")
+    if payload_ref is not None:
+        parts.append(f"payload_ref={payload_ref}")
+    if payload_digest is not None:
+        parts.append(f"payload_digest={payload_digest}")
+    parts.append(f"digest_ref={digest_ref}")
+    return "; ".join(parts)
+
+
+def _tool_source_refs(
+    event: MemoryProjectionEvent, *, payload_ref: str | None
+) -> tuple[OpaqueMemoryRef, ...]:
+    """从工具 payload 提取 Host 中立 source refs。
+
+    :param event: TOOL_RESULT_ACCEPTED projection event。
+    :param payload_ref: 已解析 payload ref。
+    :returns: opaque source refs。
+    """
+
+    refs: list[OpaqueMemoryRef] = []
+    for ref in _explicit_source_refs(event.payload):
+        refs.append(ref)
+    tool_call_id = _optional_payload_str(event.payload, _PAYLOAD_FIELD_TOOL_CALL_ID)
+    if tool_call_id is not None:
+        refs.append(
+            OpaqueMemoryRef(
+                ref_kind=HostNeutralRefKind.EXTERNAL,
+                ref_id=f"{_TOOL_CALL_REF_PREFIX}{tool_call_id}",
+                digest=_optional_payload_str(
+                    event.payload, _PAYLOAD_FIELD_TOOL_IDENTITY_DIGEST
+                ),
+            )
+        )
+    requested_ref = _optional_payload_mapping(
+        event.payload, _PAYLOAD_FIELD_TOOL_CALL_REQUESTED_EVENT_REF
+    )
+    requested_event_id = (
+        None
+        if requested_ref is None
+        else _optional_payload_str(requested_ref, _PAYLOAD_FIELD_EVENT_ID)
+    )
+    if requested_event_id is not None:
+        refs.append(
+            OpaqueMemoryRef(
+                ref_kind=HostNeutralRefKind.SOURCE,
+                ref_id=f"{_EVENT_REF_PREFIX}{requested_event_id}",
+            )
+        )
+    if payload_ref is not None:
+        refs.append(
+            OpaqueMemoryRef(
+                ref_kind=HostNeutralRefKind.PAYLOAD,
+                ref_id=f"{_PAYLOAD_REF_PREFIX}{payload_ref}",
+                digest=_payload_ref_pair_from_event(event)[1],
+            )
+        )
+    return tuple(refs)
+
+
+def _explicit_source_refs(
+    payload: Mapping[str, JsonValue],
+) -> tuple[OpaqueMemoryRef, ...]:
+    """读取 payload 中显式携带的 opaque source refs。
+
+    :param payload: JSON payload。
+    :returns: 可识别的 opaque refs。
+    """
+
+    value = payload.get(_PAYLOAD_FIELD_SOURCE_REFS)
+    if not isinstance(value, list):
+        return ()
+    refs: list[OpaqueMemoryRef] = []
+    for item in value:
+        if not isinstance(item, Mapping):
+            continue
+        ref_kind_text = _optional_payload_str(item, _PAYLOAD_FIELD_REF_KIND)
+        ref_id = _optional_payload_str(item, _PAYLOAD_FIELD_REF_ID)
+        if ref_kind_text is None or ref_id is None:
+            continue
+        try:
+            refs.append(
+                OpaqueMemoryRef(
+                    ref_kind=HostNeutralRefKind(ref_kind_text),
+                    ref_id=ref_id,
+                    digest=_optional_payload_str(item, _PAYLOAD_FIELD_DIGEST),
+                )
+            )
+        except ValueError:
+            continue
+    return tuple(refs)
+
+
+def _unsupported_event_type_diagnostic(
+    event: MemoryProjectionEvent, *, policy_digest: MemoryPolicyDigest
+) -> MemoryDiagnostic:
+    """构造未知 event type 的非静默 diagnostic。
+
+    当前 durable schema 尚未允许独立的 ``unsupported_event_type`` diagnostic
+    reason，因此 reason 使用可持久化的 ``SNAPSHOT_DAMAGED``，并在 message
+    中记录 Host 中立的 unsupported event type code。
+
+    :param event: 未识别的 projection event。
+    :param policy_digest: memory policy digest。
+    :returns: memory diagnostic。
+    """
+
+    item_id = _item_id(event, MemoryExcludedReason.UNSUPPORTED_EVENT_TYPE.value)
+    return MemoryDiagnostic(
+        diagnostic_id=_diagnostic_id(
+            MemoryDiagnosticReason.SNAPSHOT_DAMAGED,
+            event_sequence=event.event_sequence,
+            item_id=item_id,
+        ),
+        reason=MemoryDiagnosticReason.SNAPSHOT_DAMAGED,
+        message=(
+            f"{MemoryExcludedReason.UNSUPPORTED_EVENT_TYPE.value}: "
+            f"event_type={event.event_type}"
+        ),
+        event_sequence=event.event_sequence,
+        item_id=item_id,
+        policy_digest=policy_digest,
+        recorded_at=None,
+    )
+
+
+def _payload_evidence_anchor(
+    payload_ref: str | None, payload_digest: str | None
+) -> OpaqueMemoryRef | None:
+    """把 payload ref 映射为可选 evidence anchor。
+
+    :param payload_ref: payload ref。
+    :param payload_digest: payload digest。
+    :returns: evidence opaque ref 或 ``None``。
+    """
+
+    if payload_ref is None:
+        return None
+    return OpaqueMemoryRef(
+        ref_kind=HostNeutralRefKind.EVIDENCE,
+        ref_id=f"{_PAYLOAD_REF_PREFIX}{payload_ref}",
+        digest=payload_digest,
+    )
+
+
+def _payload_ref_pair_from_event(
+    event: MemoryProjectionEvent,
+) -> tuple[str | None, str | None]:
+    """读取 event row 或 payload 内的 payload ref / digest。
+
+    :param event: projection event。
+    :returns: payload ref / digest 成对结果。
+    """
+
+    if event.payload_ref is not None and event.payload_digest is not None:
+        return event.payload_ref, event.payload_digest
+    nested = _optional_payload_mapping(event.payload, _PAYLOAD_FIELD_PAYLOAD_REF)
+    if nested is not None:
+        nested_ref = _optional_payload_str(nested, _PAYLOAD_FIELD_PAYLOAD_REF)
+        nested_digest = _optional_payload_str(nested, _PAYLOAD_FIELD_PAYLOAD_DIGEST)
+        if nested_ref is not None and nested_digest is not None:
+            return nested_ref, nested_digest
+    payload_ref = _optional_payload_str(event.payload, _PAYLOAD_FIELD_PAYLOAD_REF)
+    payload_digest = _optional_payload_str(
+        event.payload, _PAYLOAD_FIELD_PAYLOAD_DIGEST
+    )
+    if payload_ref is not None and payload_digest is not None:
+        return payload_ref, payload_digest
+    return None, None
+
+
+def _event_or_payload_str(
+    event: MemoryProjectionEvent, field_name: str
+) -> str | None:
+    """优先读取 event row 字段，其次读取 payload 同名字段。
+
+    :param event: projection event。
+    :param field_name: payload 字段名。
+    :returns: 文本值或 ``None``。
+    """
+
+    if field_name == _PAYLOAD_FIELD_RUN_ID and event.run_id is not None:
+        return event.run_id
+    if field_name == _PAYLOAD_FIELD_ATTEMPT_ID and event.attempt_id is not None:
+        return event.attempt_id
+    if field_name == _PAYLOAD_FIELD_EXECUTION_ID and event.execution_id is not None:
+        return event.execution_id
+    return _optional_payload_str(event.payload, field_name)
+
+
+def _user_visible_text(event: MemoryProjectionEvent) -> str:
+    """读取用户输入可见文本，缺失时返回中立 ref 摘要。
+
+    :param event: USER_INPUT_ACCEPTED projection event。
+    :returns: 用户输入连续性文本。
+    """
+
+    display_text = _optional_payload_str(event.payload, _PAYLOAD_FIELD_DISPLAY_TEXT)
+    if display_text is not None:
+        return display_text
+    return _ref_summary_text(
+        payload_ref=event.payload_ref,
+        payload_digest=event.payload_digest,
+        fallback_event_id=event.event_id,
+    )
+
+
+def _episode_summary_text(event: MemoryProjectionEvent) -> str:
+    """读取 episode summary 文本，缺失时返回中立 ref 摘要。
+
+    :param event: EPISODE_SUMMARY_ACCEPTED projection event。
+    :returns: episode summary 文本。
+    """
+
+    for field_name in (
+        _PAYLOAD_FIELD_SUMMARY_TEXT,
+        _PAYLOAD_FIELD_SUMMARY,
+        _PAYLOAD_FIELD_DISPLAY_TEXT,
+    ):
+        value = _optional_payload_str(event.payload, field_name)
+        if value is not None:
+            return value
+    return _ref_summary_text(
+        payload_ref=event.payload_ref,
+        payload_digest=event.payload_digest,
+        fallback_event_id=event.event_id,
+    )
+
+
+def _bounded_summary_text(
+    text: str | None, *, max_size_units: int, prefer_ref: bool
+) -> str | None:
+    """按单条 raw turn cap 选择是否保留摘要文本。
+
+    :param text: 候选摘要文本。
+    :param max_size_units: policy 单条尺寸上限。
+    :param prefer_ref: 有 payload ref 时是否优先不复制文本。
+    :returns: 可保留文本或 ``None``。
+    """
+
+    if text is None or prefer_ref:
+        return None
+    if estimate_memory_size_units(text).units > max_size_units:
+        return None
+    return text
+
+
+def _ref_summary_text(
+    *,
+    payload_ref: str | None,
+    payload_digest: str | None,
+    fallback_event_id: str,
+) -> str:
+    """构造 continuity 使用的中立 ref 摘要。
+
+    :param payload_ref: 可选 payload ref。
+    :param payload_digest: 可选 payload digest。
+    :param fallback_event_id: 缺少 payload ref 时的 event id。
+    :returns: 中立 ref 摘要。
+    """
+
+    if payload_ref is None:
+        return f"event_ref={fallback_event_id}"
+    if payload_digest is None:
+        return f"payload_ref={payload_ref}"
+    return f"payload_ref={payload_ref}; payload_digest={payload_digest}"
+
+
+def _mark_continuity_item_included(
+    item: ConversationContinuityItem,
+) -> ConversationContinuityItem:
+    """把 continuity item 标记为纳入 snapshot。
+
+    :param item: 原始 item。
+    :returns: 标记后的 item。
+    """
+
+    reason = item.included_reason
+    if reason is None:
+        if item.item_kind is ConversationContinuityKind.EPISODE_SUMMARY:
+            reason = MemoryIncludedReason.EPISODE_SUMMARY
+        else:
+            reason = MemoryIncludedReason.RECENT_RAW_TURN
+    return ConversationContinuityItem(
+        item_id=item.item_id,
+        item_kind=item.item_kind,
+        producer_kind=item.producer_kind,
+        claim_status=item.claim_status,
+        event_id=item.event_id,
+        event_sequence=item.event_sequence,
+        run_id=item.run_id,
+        summary_text=item.summary_text,
+        payload_ref=item.payload_ref,
+        payload_digest=item.payload_digest,
+        included_reason=reason,
+        excluded_reason=None,
+        size_units=item.size_units,
+    )
+
+
+def _is_raw_turn(item: ConversationContinuityItem) -> bool:
+    """判断 item 是否为 raw turn。
+
+    :param item: continuity item。
+    :returns: raw turn 返回 ``True``。
+    """
+
+    return item.item_kind in (
+        ConversationContinuityKind.RAW_USER_TURN,
+        ConversationContinuityKind.RAW_ASSISTANT_TURN,
+    )
+
+
+def _is_episode(item: ConversationContinuityItem) -> bool:
+    """判断 item 是否为 episode summary。
+
+    :param item: continuity item。
+    :returns: episode summary 返回 ``True``。
+    """
+
+    return item.item_kind is ConversationContinuityKind.EPISODE_SUMMARY
+
+
+def _budget_diagnostic(
+    *,
+    event_sequence: int,
+    item_id: str,
+    policy_digest: MemoryPolicyDigest,
+    message: str,
+) -> MemoryDiagnostic:
+    """构造 budget limit diagnostic。
+
+    :param event_sequence: 关联 event sequence。
+    :param item_id: 关联 item id。
+    :param policy_digest: memory policy digest。
+    :param message: diagnostic message。
+    :returns: memory diagnostic。
+    """
+
+    return MemoryDiagnostic(
+        diagnostic_id=_diagnostic_id(
+            MemoryDiagnosticReason.BUDGET_LIMIT_REACHED,
+            event_sequence=event_sequence,
+            item_id=item_id,
+        ),
+        reason=MemoryDiagnosticReason.BUDGET_LIMIT_REACHED,
+        message=message,
+        event_sequence=event_sequence,
+        item_id=item_id,
+        policy_digest=policy_digest,
+        recorded_at=None,
+    )
+
+
+def _item_id(event: MemoryProjectionEvent, item_kind: str) -> str:
+    """构造稳定 memory item id。
+
+    :param event: projection event。
+    :param item_kind: item kind 文本。
+    :returns: 稳定 item id。
+    """
+
+    return f"{_ITEM_ID_PREFIX}:{item_kind}:{event.event_id}"
+
+
+def _diagnostic_id(
+    reason: MemoryDiagnosticReason, *, event_sequence: int, item_id: str
+) -> str:
+    """构造稳定 diagnostic id。
+
+    :param reason: diagnostic reason。
+    :param event_sequence: 关联 event sequence。
+    :param item_id: 关联 item id。
+    :returns: 稳定 diagnostic id。
+    """
+
+    digest = sha256_digest_json(
+        {
+            "event_sequence": event_sequence,
+            "item_id": item_id,
+            "reason": reason.value,
+        }
+    ).removeprefix("sha256:")
+    return f"{_DIAGNOSTIC_ID_PREFIX}:{digest}"
+
+
+def _optional_payload_mapping(
+    payload: Mapping[str, JsonValue], field_name: str
+) -> Mapping[str, JsonValue] | None:
+    """读取 optional payload mapping 字段。
+
+    :param payload: JSON payload。
+    :param field_name: 字段名。
+    :returns: mapping 或 ``None``；其它类型按缺失处理。
+    """
+
+    value = payload.get(field_name)
+    if isinstance(value, Mapping):
+        return value
+    return None
+
+
+def _optional_payload_str(
+    payload: Mapping[str, JsonValue], field_name: str
+) -> str | None:
+    """读取 optional payload 文本字段。
+
+    :param payload: JSON payload。
+    :param field_name: 字段名。
+    :returns: 非空文本或 ``None``。
+    """
+
+    value = payload.get(field_name)
+    if isinstance(value, str) and value.strip() != "":
+        return value
+    return None
 
 
 def memory_projection_policy_to_json_value(

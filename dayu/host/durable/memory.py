@@ -32,25 +32,163 @@ from dayu.host.durable.schema import (
 )
 from dayu.host.durable.transaction import HostRow, HostTransaction
 from dayu.host.memory import (
+    CONVERSATION_MEMORY_CONSUMER_ID,
     ConversationContinuityItem,
     ConversationMemorySnapshot,
     MemoryClaimStatus,
     MemoryDiagnostic,
     MemoryExcludedReason,
     MemoryIncludedReason,
+    MemoryProjectionEvent,
     MemoryProducerKind,
+    MemoryProjectionPolicy,
     VerifiedFactView,
     WorkingAssumptionView,
     calculate_memory_snapshot_digest,
     conversation_memory_snapshot_from_json_value,
     conversation_memory_snapshot_to_json_value,
+    digest_memory_projection_policy,
     memory_diagnostic_from_json_value,
     memory_diagnostic_to_json_value,
+    project_conversation_memory_event,
 )
+from dayu.host.projection import (
+    ProjectionApplyResult,
+    ProjectionApplyStatus,
+    ProjectionConsumerId,
+    ProjectionEventClassFilter,
+    ProjectionEventFilter,
+    ProjectionEventView,
+)
+from dayu.host.durable.event_log import EventClass
 
 _ZERO_CURSOR_SEQUENCE = 0
 _ITEM_KIND_VERIFIED_FACT = "verified_fact"
 _ITEM_KIND_WORKING_ASSUMPTION = "working_assumption"
+_EVENT_TYPE_USER_INPUT_ACCEPTED = "USER_INPUT_ACCEPTED"
+_EVENT_TYPE_RUN_SUCCEEDED = "RUN_SUCCEEDED"
+_EVENT_TYPE_TOOL_RESULT_ACCEPTED = "TOOL_RESULT_ACCEPTED"
+_EVENT_TYPE_EPISODE_SUMMARY_ACCEPTED = "EPISODE_SUMMARY_ACCEPTED"
+_EVENT_TYPE_FILTER = (
+    _EVENT_TYPE_USER_INPUT_ACCEPTED,
+    _EVENT_TYPE_RUN_SUCCEEDED,
+    _EVENT_TYPE_TOOL_RESULT_ACCEPTED,
+    _EVENT_TYPE_EPISODE_SUMMARY_ACCEPTED,
+)
+
+
+class ConversationMemoryProjectionConsumer:
+    """Conversation memory projection consumer。
+
+    本 consumer 只消费已提交 canonical EventLog facts，并在当前 projection
+    transaction 内写 memory-owned snapshot / item / diagnostic tables；Run /
+    Attempt 状态与 EventLog 均不由本 consumer 修改。
+
+    :param policy: memory projection policy。
+    :param consumer_id: 可选稳定 consumer id；默认使用 P9 memory consumer id。
+    """
+
+    def __init__(
+        self,
+        policy: MemoryProjectionPolicy,
+        *,
+        consumer_id: str = CONVERSATION_MEMORY_CONSUMER_ID,
+    ) -> None:
+        """初始化 consumer。
+
+        :param policy: memory projection policy。
+        :param consumer_id: 稳定 projection consumer id。
+        :returns: ``None``。
+        """
+
+        self._policy = policy
+        self._policy_digest = digest_memory_projection_policy(policy)
+        self._consumer_id = ProjectionConsumerId(consumer_id)
+        self._event_filter = ProjectionEventFilter(
+            (
+                ProjectionEventClassFilter(
+                    event_class=EventClass.CANONICAL_FACT,
+                    event_types=_EVENT_TYPE_FILTER,
+                ),
+            )
+        )
+
+    @property
+    def consumer_id(self) -> ProjectionConsumerId:
+        """返回稳定 projection consumer id。
+
+        :returns: projection consumer id。
+        """
+
+        return self._consumer_id
+
+    @property
+    def event_filter(self) -> ProjectionEventFilter:
+        """返回 memory projection event filter。
+
+        :returns: 只消费 canonical memory 相关 event type 的 filter。
+        """
+
+        return self._event_filter
+
+    def apply_event(
+        self, transaction: HostTransaction, event: ProjectionEventView
+    ) -> ProjectionApplyResult:
+        """在当前 transaction 内投影单个 EventLog event。
+
+        :param transaction: Host durable transaction。
+        :param event: projection runner 构造的 typed event view。
+        :returns: projection apply result。
+        :raises HostDurableError: snapshot 读取、投影或写入失败时抛出。
+        """
+
+        latest = read_latest_memory_snapshot(
+            transaction,
+            session_id=event.session_id,
+            consumer_id=self._consumer_id.value,
+            policy_digest=self._policy_digest,
+        )
+        previous_snapshot = None if latest is None else latest.snapshot
+        if (
+            previous_snapshot is not None
+            and previous_snapshot.cursor.checkpoint_event_sequence
+            >= event.event_sequence
+        ):
+            return ProjectionApplyResult(ProjectionApplyStatus.DUPLICATE)
+        snapshot = project_conversation_memory_event(
+            previous_snapshot=previous_snapshot,
+            event=_memory_projection_event_from_view(event),
+            policy=self._policy,
+            built_at=event.occurred_at,
+            consumer_id=self._consumer_id.value,
+        )
+        write_memory_snapshot(transaction, snapshot, updated_at=event.occurred_at)
+        return ProjectionApplyResult(ProjectionApplyStatus.APPLIED)
+
+
+def _memory_projection_event_from_view(
+    event: ProjectionEventView,
+) -> MemoryProjectionEvent:
+    """把 projection runner event view 转换为 memory projection event。
+
+    :param event: projection runner event view。
+    :returns: memory projection event。
+    """
+
+    return MemoryProjectionEvent(
+        event_sequence=event.event_sequence,
+        event_id=event.event_id,
+        event_class=event.event_class.value,
+        event_type=event.event_type,
+        session_id=event.session_id,
+        run_id=event.run_id,
+        attempt_id=event.attempt_id,
+        execution_id=event.execution_id,
+        occurred_at=event.occurred_at,
+        payload_ref=event.payload_ref,
+        payload_digest=event.payload_digest,
+        payload=event.payload,
+    )
 
 
 @dataclass(frozen=True, slots=True)

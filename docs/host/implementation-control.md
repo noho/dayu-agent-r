@@ -220,8 +220,8 @@ Phase Map 中每个 phase 必须使用统一条目格式。模板如下：
 
 ## 当前状态
 
-P9-S1 `Durable Memory Contracts and Schema` completed；accepted slice commit 为 `f221aeb`。当前 gate 为 P9-S2
-`Projection Consumer and Stable Layer Builder` implementation。
+P9-S2 `Projection Consumer and Stable Layer Builder` code review accepted；下一步创建 accepted slice commit 后进入 P9-S3
+`RunInputBuilder MemorySnapshotProvider and Lag Fallback` implementation。
 
 约束：本节只保留当前 gate 结论；phase 过程流水必须归档到 `历史记录`，仍需追踪的风险或后续 owner 必须写入 `Open Questions 与风险追踪` 的 `追踪区`。
 
@@ -811,7 +811,7 @@ Phase 按依赖关系推进：先实现被其它阶段依赖的公共契约、ru
 - P9 phase discussion / design refinement 已完成。用户确认 P9 的核心定位是“财报分析工作台状态投影”，不是聊天记录压缩器。
 - P9 handoff implementation-ready plan 已完成双路 review、fix、双路 re-review 与 controller adjudication，verdict 为 PASS。
 - P9-S1 `Durable Memory Contracts and Schema` completed；accepted slice commit 为 `f221aeb`。
-- P9-S2 `Projection Consumer and Stable Layer Builder` implementation in progress。
+- P9-S2 `Projection Consumer and Stable Layer Builder` code review accepted，remaining blocking findings 为 0；等待 accepted slice commit。
 
 目标：
 - 实现 session-level Conversation Memory projection、stable layer、history pool、snapshot cursor、RunInputBuilder memory provider 与 projection repair path。
@@ -1603,7 +1603,47 @@ Phase 按依赖关系推进：先实现被其它阶段依赖的公共契约、ru
   DS T1 cast 注释属于后续 Host hardening，不阻塞 P9。
 - DS A1 snapshot upsert 并发 guard 由 P9-S2 / P9-S4 在 projection writer concurrency 与 repair 语义明确后裁决。
 
+#### Phase 9 Slice 2 Projection Consumer and Stable Layer Builder 追踪
+
+结论：
+
+- P9-S2 implementation 已完成，交付 `ConversationMemoryProjectionConsumer`、EventLog-to-memory pure builder、verified fact
+  extraction、working assumption / continuity classification、history pool budget 选择与 ProjectionRunner integration tests。
+- Code review artifacts 为 `docs/reviews/p9-s2-code-review-mimo-20260517-0905.md` 与
+  `docs/reviews/p9-s2-code-review-ds-20260517.md`。
+- Code re-review artifacts 为 `docs/reviews/p9-s2-code-rereview-mimo-20260517.md` 与
+  `docs/reviews/p9-s2-code-rereview-ds-20260517.md`。
+- Controller adjudication artifact 为 `docs/reviews/p9-s2-code-review-controller-adjudication-20260517.md`。
+- Re-review verdict：AgentMiMo PASS，AgentDS PASS，remaining blocking findings 为 0。
+- Accepted slice commit 待写入。
+
+验证：
+
+- `pytest tests/host/test_memory_projection.py tests/host/test_durable_schema.py`：35 passed。
+- `pytest tests/host/test_weak_typing_guard.py`：1 passed。
+- `pyright dayu/host/memory.py dayu/host/durable/memory.py tests/host/test_memory_projection.py`：0 errors。
+- `git diff --check`：通过。
+
+追踪项：
+
+- Slice 3 必须确保 `RunInputBuilder` 按 P9 固定顺序消费 memory stable layer，且 legacy `SessionContinuityProvider`
+  不再注入未经过 memory history pool 预算的 historical raw turns。
+- Unsupported event type 目前复用现有 durable diagnostic reason，并在 message 中写入 `unsupported_event_type` code；
+  若后续需要独立 diagnostic reason，必须作为 schema hardening work unit 处理，不夹带进 S3。
+- `stable_layer_size_units` 在 S2 仍未消费；S3 memory message renderer 必须裁决该上限如何约束 rendered stable layer。
+
 ## 历史记录
+
+### 2026-05-17 P9-S2 code review accepted
+
+P9-S2 `Projection Consumer and Stable Layer Builder` implementation 已完成。实现范围包含 `dayu.host.memory` 中的
+`MemoryProjectionEvent`、EventLog-to-memory snapshot builder、verified fact extraction、history pool policy；以及
+`dayu.host.durable.memory` 中的 `ConversationMemoryProjectionConsumer`。双路 code review 已完成：AgentMiMo 初审 verdict 为
+PASS，提出 1 个 medium 与 2 个 low findings；AgentDS 初审 verdict 为 PASS，提出 3 个 medium 与 1 个 low finding。Controller
+接受 assistant conclusion budget、`recent_raw_turns_floor=0`、missing `tool_name` provenance、malformed `source_refs` 与
+unknown event type diagnostic 五项修复。Fix 后双路 re-review 均 PASS，remaining blocking findings 为 0。Controller
+adjudication artifact 为 `docs/reviews/p9-s2-code-review-controller-adjudication-20260517.md`。当前 gate 为 P9-S2 accepted slice
+commit。
 
 ### 2026-05-17 P9-S1 code review accepted
 
