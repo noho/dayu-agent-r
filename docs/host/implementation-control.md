@@ -223,8 +223,8 @@ Phase Map 中每个 phase 必须使用统一条目格式。模板如下：
 约束：本节只保留当前 gate 结论；phase 过程流水必须归档到 `历史记录`，仍需追踪的风险或后续 owner 必须写入 `Open Questions 与风险追踪` 的 `追踪区`。
 
 当前 work unit：P9.5 Pre-P10 Cross-Repository Hardening PR。
-当前 gate：P9.5 S16 Contract Ownership Audit And Import/Public Surface Fixes implementation。
-下一 gate：P9.5 S16 code review。
+当前 gate：P9.5 S17 Documentation And Control Tracking implementation。
+下一 gate：P9.5 S17 code review。
 
 ## Phase Map
 
@@ -2032,6 +2032,28 @@ P9.5 收口清单：
 - 当前无 PR review blocking fix。
 
 ## 历史记录
+
+### 2026-05-17 P9.5 S16 Contract Ownership Audit And Import/Public Surface Fixes accepted
+
+P9.5 S16 Contract Ownership Audit And Import/Public Surface Fixes 已完成。Implementation artifact 为
+`docs/reviews/p9-5-s16-contract-ownership-audit-implementation-20260517.md`。Code review /
+controller adjudication artifacts 为 `docs/reviews/p9-5-s16-code-review-mimo-20260517.md`、
+`docs/reviews/p9-5-s16-code-review-ds-20260517.md` 与
+`docs/reviews/p9-5-s16-code-review-controller-adjudication-20260517.md`。
+
+Controller 裁决：AgentMiMo 与 AgentDS review 均为 PASS，0 blocking findings。S16 作为
+Contract Ownership audit / guardrail slice 被接受为 test-only 变更；未发现需要移动 public contract、修改
+生产代码或创建兼容 wrapper 的直接违规。新增测试明确防止 `dayu.contracts` 反向依赖 `dayu.runtime`；
+Engine 直接导入 `dayu.contracts.tool_declaration`、`ToolDefinition`、`ToolBundle` 或 `ToolCallable`；
+Host 使用 `importlib` / `pkgutil` 扫描业务工具模块；以及 `fetch_more` 字符串出现在 ToolRuntime owner
+之外。`fetch_more` 行为测试补充验证 ToolRuntime factory 每次创建 attempt-local `EffectiveToolBundle` 与
+独立 `FetchMoreToolCallable`，且不污染业务 `ToolBundle`。Public exports 未变更，`dayu.engine.__all__` /
+`dayu.host.__all__` 既有白名单测试仍是公共表面真源。README 未更新：本次只补既有 Contract Ownership
+规则的测试 guard，不改变 API、分层、ToolRuntime/fetch_more 行为或测试运行约定。验证通过：S16 baseline
+targeted tests 为 71 passed；S16 targeted tests 为 77 passed；AgentDS 额外 `pytest tests/host -q` 为
+562 passed；`python -m pyright dayu tests` 为 0 errors / 0 warnings / 0 informations；`git diff --check`
+clean。Accepted slice commit 为 `f1f903d`。当前 gate 为 P9.5 S17 Documentation And Control Tracking
+implementation。
 
 ### 2026-05-17 P9.5 S15 Engine / Host Necessary Logs By Level accepted
 
