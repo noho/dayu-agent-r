@@ -223,8 +223,8 @@ Phase Map 中每个 phase 必须使用统一条目格式。模板如下：
 约束：本节只保留当前 gate 结论；phase 过程流水必须归档到 `历史记录`，仍需追踪的风险或后续 owner 必须写入 `Open Questions 与风险追踪` 的 `追踪区`。
 
 当前 work unit：P9.5 Pre-P10 Cross-Repository Hardening PR。
-当前 gate：P9.5 S2 Engine / OpenAI Runner / Parser Hardening implementation。
-下一 gate：P9.5 S2 code review。
+当前 gate：P9.5 S3 Host Public Error Taxonomy And Command Handle Encapsulation implementation。
+下一 gate：P9.5 S3 code review。
 
 ## Phase Map
 
@@ -2032,6 +2032,25 @@ P9.5 收口清单：
 - 当前无 PR review blocking fix。
 
 ## 历史记录
+
+### 2026-05-17 P9.5 S2 Engine / OpenAI Runner / Parser Hardening accepted
+
+P9.5 S2 Engine / OpenAI Runner / Parser Hardening 已完成。Implementation artifact 为
+`docs/reviews/p9-5-s2-engine-openai-runner-parser-implementation-20260517.md`。Code review / fix / re-review
+artifacts 为 `docs/reviews/p9-5-s2-code-review-ds-20260517.md`、
+`docs/reviews/p9-5-s2-code-review-controller-adjudication-20260517.md`、
+`docs/reviews/p9-5-s2-fix-20260517.md`、
+`docs/reviews/p9-5-s2-code-re-review-mimo-20260517.md`、
+`docs/reviews/p9-5-s2-code-re-review-ds-20260517.md` 与
+`docs/reviews/p9-5-s2-code-re-review-controller-adjudication-20260517.md`。
+
+Controller 裁决：AgentDS 初审为 0 blocking findings，但 F1 `_OpenAIUsage` dead code、F2 bool index in
+`_coerce_tool_call_delta` 与 F3 bool index in `ToolCallAggregator._resolve_index` 被 controller 接受为 required fix。
+Fix 后 AgentMiMo / AgentDS re-review 均确认 fixed，new blockers 为 0。本地验证通过：
+`pytest tests/engine/runners/openai tests/engine/test_metadata_boundary.py tests/engine/test_engine_event_contract.py`
+为 229 passed；`python -m pyright dayu/engine tests/engine` 为 0 errors / 0 warnings / 0 informations；
+`git diff --check` clean。Accepted slice commit 为 `5fd28be`。当前 gate 为 P9.5 S3 Host Public Error Taxonomy
+And Command Handle Encapsulation implementation。
 
 ### 2026-05-17 P9.5 S1 Engine Runner Protocol Decoupling accepted
 
