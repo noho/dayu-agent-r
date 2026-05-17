@@ -413,6 +413,59 @@ async def test_sse_usage_malformed_before_content_completion_continues(
 
 
 @pytest.mark.asyncio
+async def test_sse_bool_usage_logs_warning_and_continues(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """SSE usage 的 bool token 计数必须视为 malformed 且不阻断内容收口。
+
+    :param caplog: pytest 日志捕获夹具。
+    :returns: 无返回值。
+    :raises AssertionError: 行为不符合预期时由 pytest 抛出。
+    """
+
+    caplog.set_level(
+        logging.WARNING, logger="dayu.engine.runners.openai.sse_parser"
+    )
+    malformed_usage_payload = json.dumps(
+        {
+            "choices": [],
+            "usage": {
+                "prompt_tokens": 1,
+                "completion_tokens": False,
+                "total_tokens": 1,
+            },
+        },
+        separators=(",", ":"),
+    )
+    events = await parse_sse(
+        [
+            _sse_json_chunk(malformed_usage_payload),
+            b'data: {"choices":[{"delta":{"content":"ok"}}]}\n\n',
+            b'data: {"choices":[{"finish_reason":"stop","delta":{}}]}\n\n',
+            b"data: [DONE]\n\n",
+        ]
+    )
+
+    assert not any(
+        event.type is RunnerEventType.RUNNER_USAGE_RECORDED
+        for event in events
+    )
+    completed_events = [
+        event for event in events
+        if event.type is RunnerEventType.RUNNER_CONTENT_COMPLETED
+    ]
+    assert len(completed_events) == 1
+    completed = completed_events[0].data
+    assert isinstance(completed, RunnerContentCompletedData)
+    assert completed.content == "ok"
+    assert any(
+        "usage_field_malformed" in record.getMessage()
+        and "completion_tokens_type=bool" in record.getMessage()
+        for record in caplog.records
+    )
+
+
+@pytest.mark.asyncio
 async def test_sse_non_object_choice_logs_diagnostic(
     caplog: pytest.LogCaptureFixture,
 ) -> None:

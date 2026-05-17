@@ -149,14 +149,6 @@ class _OpenAIToolCallFinal(TypedDict, total=False):
     extra_content: Mapping[str, Mapping[str, JsonValue]]
 
 
-class _OpenAIUsage(TypedDict, total=False):
-    """OpenAI usage 字段。"""
-
-    prompt_tokens: int
-    completion_tokens: int
-    total_tokens: int
-
-
 class _OpenAIChoiceFinalMessage(TypedDict, total=False):
     """non-stream choice ``message`` 字段。"""
 
@@ -223,7 +215,6 @@ __all__ = [
     "_OpenAIRequestPayload",
     "_OpenAIToolCallDelta",
     "_OpenAIToolCallFinal",
-    "_OpenAIUsage",
     "_OpenAIChoiceFinalMessage",
     "_OpenAIChoiceFinal",
     "_RetryDecision",

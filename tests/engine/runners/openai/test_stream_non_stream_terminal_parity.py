@@ -28,6 +28,7 @@ from dayu.engine.runners.openai.non_stream_parser import (
 )
 
 from tests.engine.runners.openai._sse_helpers import (
+    make_no_thought_hook,
     make_thought_hook,
     parse_sse,
 )
@@ -112,3 +113,67 @@ async def test_stream_and_non_stream_thought_strip_terminal_parity() -> None:
         is ns_done.finish_reason
         is FinishReason.STOP
     )
+
+
+@pytest.mark.parametrize(
+    "provider_finish_reason, expected",
+    (
+        ("stop", FinishReason.STOP),
+        ("length", FinishReason.LENGTH),
+        ("content_filter", FinishReason.CONTENT_FILTER),
+    ),
+)
+@pytest.mark.asyncio
+async def test_stream_and_non_stream_content_finish_reason_parity(
+    provider_finish_reason: str,
+    expected: FinishReason,
+) -> None:
+    """正文完成 finish_reason 在流式与非流式路径中保持一致。
+
+    :param provider_finish_reason: provider 返回的 finish_reason 字符串。
+    :param expected: 期望映射到的 Runner finish reason。
+    :returns: 无返回值。
+    :raises AssertionError: 两条解析路径不一致时由 pytest 抛出。
+    """
+
+    stream_chunks = [
+        b'data: {"choices":[{"delta":{"content":"answer"}}]}\n\n',
+        (
+            b'data: {"choices":[{"finish_reason":"'
+            + provider_finish_reason.encode("utf-8")
+            + b'","delta":{}}]}\n\n'
+        ),
+        b"data: [DONE]\n\n",
+    ]
+    stream_events = await parse_sse(stream_chunks, hook=make_no_thought_hook())
+    stream_completed, stream_done = _extract_completed_and_done(
+        list(stream_events)
+    )
+
+    non_stream_payload = json.dumps(
+        {
+            "choices": [
+                {
+                    "finish_reason": provider_finish_reason,
+                    "message": {
+                        "role": "assistant",
+                        "content": "answer",
+                    },
+                }
+            ]
+        }
+    ).encode("utf-8")
+    non_stream_events = list(
+        parse_non_stream_response(
+            non_stream_payload,
+            hook=make_no_thought_hook(),
+            provider_request_id=None,
+        )
+    )
+    ns_completed, ns_done = _extract_completed_and_done(non_stream_events)
+
+    assert stream_completed.content == ns_completed.content == "answer"
+    assert stream_completed.finish_reason is ns_completed.finish_reason
+    assert stream_completed.finish_reason is expected
+    assert stream_done.finish_reason is ns_done.finish_reason
+    assert stream_done.finish_reason is expected

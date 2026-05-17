@@ -65,6 +65,57 @@ def test_non_stream_content_completed_and_usage_and_done() -> None:
     assert done.finish_reason is FinishReason.STOP
 
 
+def test_non_stream_bool_usage_logs_warning_and_omits_usage(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """非流式 usage 的 bool token 计数必须视为 malformed。
+
+    :param caplog: pytest 日志捕获夹具。
+    :returns: 无返回值。
+    :raises AssertionError: 行为不符合预期时由 pytest 抛出。
+    """
+
+    caplog.set_level(
+        logging.WARNING, logger="dayu.engine.runners.openai.non_stream_parser"
+    )
+    payload = json.dumps(
+        {
+            "choices": [
+                {
+                    "finish_reason": "stop",
+                    "message": {"role": "assistant", "content": "answer"},
+                }
+            ],
+            "usage": {
+                "prompt_tokens": True,
+                "completion_tokens": 2,
+                "total_tokens": 3,
+            },
+        }
+    ).encode("utf-8")
+
+    events = list(
+        parse_non_stream_response(
+            payload, hook=make_no_thought_hook(), provider_request_id=None
+        )
+    )
+
+    assert [
+        event.type for event in events
+    ] == [
+        RunnerEventType.RUNNER_CONTENT_COMPLETED,
+        RunnerEventType.RUNNER_DONE,
+    ]
+    done = events[-1].data
+    assert isinstance(done, RunnerDoneData)
+    assert done.finish_reason is FinishReason.STOP
+    assert any(
+        "usage_field_malformed" in record.getMessage()
+        and "prompt_tokens_type=bool" in record.getMessage()
+        for record in caplog.records
+    )
+
+
 def test_non_stream_unknown_finish_reason_logs_diagnostic(
     caplog: pytest.LogCaptureFixture,
 ) -> None:
