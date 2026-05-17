@@ -221,7 +221,8 @@ Phase Map 中每个 phase 必须使用统一条目格式。模板如下：
 ## 当前状态
 
 Phase 9 draft PR 已创建：PR 59 https://github.com/noho/dayu-agent-r/pull/59。Accepted PR review commit 为 `67458cb`。
-P9 all-repository follow-up fix pass 已完成本地验证；最终 MiMo / DS re-review 均 PASS。
+P9 all-repository follow-up fix pass 已完成本地验证；最终 MiMo / DS re-review 均 PASS；accepted follow-up commit 为
+`6e12641`。
 当前 gate 为 draft-PR-pass follow-up accepted。
 
 约束：本节只保留当前 gate 结论；phase 过程流水必须归档到 `历史记录`，仍需追踪的风险或后续 owner 必须写入 `Open Questions 与风险追踪` 的 `追踪区`。
@@ -915,6 +916,7 @@ Phase 按依赖关系推进：先实现被其它阶段依赖的公共契约、ru
   EventLog run/type index、runtime weak typing guard、RunnerSpec 边界校验、BatchToolExecutionOutcome record identity 校验与
   malformed SSE usage 非终止处理、dispatch durable retry exhausted 非终态重排、SSE 已产出事件后的 retriable read failure 禁止跨
   attempt retry、SSE tool-call final finish 强制 `TOOL_CALLS`，以及 runtime file lock release failure 后清理 active token。
+- Accepted all-repository follow-up commit 为 `6e12641`。
 
 验证：
 
