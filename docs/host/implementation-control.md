@@ -223,8 +223,8 @@ Phase Map 中每个 phase 必须使用统一条目格式。模板如下：
 约束：本节只保留当前 gate 结论；phase 过程流水必须归档到 `历史记录`，仍需追踪的风险或后续 owner 必须写入 `Open Questions 与风险追踪` 的 `追踪区`。
 
 当前 work unit：P9.5 Pre-P10 Cross-Repository Hardening PR。
-当前 gate：P9.5 implementation-ready handoff plan accepted。
-下一 gate：P9.5 S0 Controller Preflight And Scope Lock implementation。
+当前 gate：P9.5 S1 Engine Runner Protocol Decoupling implementation。
+下一 gate：P9.5 S1 code review。
 
 ## Phase Map
 
@@ -2049,8 +2049,12 @@ Plan re-review artifacts：
 - Controller adjudication：`docs/reviews/p9-5-plan-re-review-controller-adjudication-20260517.md`
 
 Controller 裁决：AgentDS F1 / F2 作为 required plan fix 接受并已修复；其余 accepted non-blocking guidance 已写回
-plan。两份 re-review 均确认 accepted findings fixed，new blockers 为 0。当前 gate 为 P9.5 accepted plan commit；
-commit 后进入 P9.5 S0 Controller Preflight And Scope Lock implementation。
+plan。两份 re-review 均确认 accepted findings fixed，new blockers 为 0。Accepted plan commit 为 `ed72437`。
+
+S0 Controller Preflight And Scope Lock 已完成，artifact 为
+`docs/reviews/p9-5-s0-controller-preflight-implementation-20260517.md`。S0 验证结果：当前分支为
+`p9.5-pre-p10-hardening`，worktree clean，`source .venv/bin/activate && python -m pyright dayu tests` 为
+0 errors / 0 warnings / 0 informations。当前 gate 为 P9.5 S1 Engine Runner Protocol Decoupling implementation。
 
 ### 2026-05-17 P9.5 design discussion accepted
 
