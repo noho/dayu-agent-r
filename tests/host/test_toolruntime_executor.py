@@ -88,6 +88,8 @@ _ITERATION_ID = "iteration-toolruntime"
 _POLICY_DIGEST = "sha256:2222222222222222222222222222222222222222222222222222222222222222"
 _DEFAULT_TOOL_TIMEOUT_SECONDS = 10.0
 _FAST_TOOL_TIMEOUT_SECONDS = 0.001
+_OVERSIZED_INLINE_TEXT_LENGTH = 70010
+_OVERSIZED_TRUNCATED_TEXT_LIMIT = 70000
 
 
 class _NeverCancelledToken:
@@ -463,7 +465,11 @@ def test_fetch_more_rejects_oversized_inline_continuation() -> None:
         "fake_tool",
         "tool-call-1",
         ToolCompletedOutcome(
-            result=ToolResultSuccess(ok=True, value="x" * 70010, meta=None)
+            result=ToolResultSuccess(
+                ok=True,
+                value="x" * _OVERSIZED_INLINE_TEXT_LENGTH,
+                meta=None,
+            )
         ),
         spec,
     )
@@ -488,6 +494,42 @@ def test_fetch_more_rejects_oversized_inline_continuation() -> None:
     assert isinstance(fetched, ToolFailedOutcome)
     assert fetched.result.error == "truncation_error"
     assert fetched.result.hint == "tool_result_inline_size_limit_exceeded"
+
+
+def test_truncation_discards_cursor_when_inline_result_still_too_large() -> None:
+    """截断后 inline outcome 仍超限时清理已创建 cursor。"""
+
+    spec = ToolTruncateSpec(
+        enabled=True,
+        strategy=ToolTruncationStrategy.TEXT_CHARS,
+        limits={"max_chars": _OVERSIZED_TRUNCATED_TEXT_LIMIT},
+        target_field=None,
+        field_path=None,
+        ttl_seconds=None,
+    )
+    manager = TruncationManager(
+        session_id=_SESSION_ID,
+        run_id=_RUN_ID,
+        attempt_id=_ATTEMPT_ID,
+        truncate_specs_by_name={"fake_tool": spec},
+    )
+
+    applied = manager.apply_truncation(
+        "fake_tool",
+        "tool-call-1",
+        ToolCompletedOutcome(
+            result=ToolResultSuccess(
+                ok=True,
+                value="x" * _OVERSIZED_INLINE_TEXT_LENGTH,
+                meta=None,
+            )
+        ),
+        spec,
+    )
+
+    assert isinstance(applied.outcome, ToolFailedOutcome)
+    assert applied.cursor_hint is None
+    assert manager._cursors == {}
 
 
 @pytest.mark.asyncio

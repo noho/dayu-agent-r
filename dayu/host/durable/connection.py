@@ -46,7 +46,11 @@ class HostDurableStore:
         self._options = options
         self._connection = connection
         self._transaction_runner = HostTransactionRunner(
-            connection, options.sqlite_policy
+            connection,
+            options.sqlite_policy,
+            payload_inline_threshold_bytes=(
+                options.payload_policy.payload_inline_threshold_bytes
+            ),
         )
         self._closed = False
 

@@ -34,17 +34,30 @@ from dayu.host.durable.options import (
 from dayu.host.durable.schema import TABLE_EVENT_LOG
 from dayu.host.durable.transaction import HostTransaction
 
+_CUSTOM_INLINE_THRESHOLD_BYTES = 8
+_OVERSIZED_INLINE_PAYLOAD_TEXT = "123456789"
 
-def _options(tmp_path: Path) -> HostDurableStoreOptions:
+
+def _options(
+    tmp_path: Path, *, payload_inline_threshold_bytes: int | None = None
+) -> HostDurableStoreOptions:
     """构造测试用 Host durable store options。
 
     :param tmp_path: pytest 临时目录。
+    :param payload_inline_threshold_bytes: 可选 payload inline 阈值覆盖。
     :returns: Host durable store options。
     """
 
+    if payload_inline_threshold_bytes is None:
+        payload_policy = PayloadStoragePolicy(artifact_root=tmp_path / "artifacts")
+    else:
+        payload_policy = PayloadStoragePolicy(
+            artifact_root=tmp_path / "artifacts",
+            payload_inline_threshold_bytes=payload_inline_threshold_bytes,
+        )
     return HostDurableStoreOptions(
         db_path=tmp_path / "durable.sqlite3",
-        payload_policy=PayloadStoragePolicy(artifact_root=tmp_path / "artifacts"),
+        payload_policy=payload_policy,
         sqlite_policy=HostSQLiteStoragePolicy(
             busy_timeout_seconds=0.05,
             write_busy_retry_count=2,
@@ -163,6 +176,37 @@ def test_multiple_event_classes_share_one_global_cursor(tmp_path: Path) -> None:
             )
 
         assert store.transaction_runner.run_write(operation) == (1, 2, 3, 4)
+
+
+def test_canonical_inline_payload_limit_uses_store_policy(
+    tmp_path: Path,
+) -> None:
+    """canonical fact inline payload 使用当前 store 注入的阈值。"""
+
+    with open_host_durable_store(
+        _options(
+            tmp_path,
+            payload_inline_threshold_bytes=_CUSTOM_INLINE_THRESHOLD_BYTES,
+        )
+    ) as store:
+
+        def operation(transaction: HostTransaction) -> None:
+            """追加超过自定义阈值的 canonical fact。
+
+            :param transaction: Host transaction。
+            :returns: ``None``。
+            """
+
+            append_event(
+                transaction,
+                _request(
+                    "event-oversized",
+                    payload_json=_OVERSIZED_INLINE_PAYLOAD_TEXT,
+                ),
+            )
+
+        with pytest.raises(HostPayloadReferenceError, match="inline payload limit"):
+            store.transaction_runner.run_write(operation)
 
 
 def test_duplicate_event_id_same_body_returns_existing_row(

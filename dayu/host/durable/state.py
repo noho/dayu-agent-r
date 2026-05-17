@@ -3092,6 +3092,7 @@ def mark_dispatch_waiting_for_lane_row(
           AND dispatching_at IS NULL
           AND worker_accept_event_id IS NULL
           AND cancelled_event_id IS NULL
+          AND cancelled_event_sequence IS NULL
         """,
         (
             serialize_dispatch_record_status(DispatchRecordStatus.WAITING_FOR_LANE),
@@ -3244,6 +3245,7 @@ def mark_dispatch_worker_accepted_row(
           AND worker_accept_event_id IS NULL
           AND worker_accept_event_sequence IS NULL
           AND cancelled_event_id IS NULL
+          AND cancelled_event_sequence IS NULL
         """,
         (
             worker_accepted_at,

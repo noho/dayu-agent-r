@@ -571,7 +571,13 @@ def test_runner_can_be_constructed_with_independent_connection(
         connection = store.connect()
         try:
             _create_notes_table(connection)
-            runner = HostTransactionRunner(connection, options.sqlite_policy)
+            runner = HostTransactionRunner(
+                connection,
+                options.sqlite_policy,
+                payload_inline_threshold_bytes=(
+                    options.payload_policy.payload_inline_threshold_bytes
+                ),
+            )
 
             def operation(transaction: HostTransaction) -> None:
                 """写入测试 row。

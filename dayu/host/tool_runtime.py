@@ -1375,6 +1375,7 @@ class TruncationManager:
             ),
         )
         if truncated_value is None:
+            self._cursors.pop(cursor.cursor_id, None)
             return TruncationAppliedOutcome(
                 outcome=_truncation_failure(
                     _TRUNCATION_UNSUPPORTED_REASON,
@@ -1394,6 +1395,7 @@ class TruncationManager:
             _tool_outcome_inline_size_bytes(truncated_outcome)
             > _MAX_LLM_INLINE_TOOL_RESULT_BYTES
         ):
+            self._cursors.pop(cursor.cursor_id, None)
             return TruncationAppliedOutcome(
                 outcome=_truncation_failure(
                     _TOOL_RUNTIME_RESULT_TOO_LARGE_REASON,

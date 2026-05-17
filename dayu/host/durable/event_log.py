@@ -33,16 +33,14 @@ from dayu.host.durable.errors import (
     HostEventIdentityConflictError,
     HostPayloadReferenceError,
 )
-from dayu.host.durable.options import (
-    _DEFAULT_PAYLOAD_INLINE_THRESHOLD_BYTES as _DEFAULT_INLINE_PAYLOAD_MAX_BYTES,
-)
 from dayu.host.durable.payload import PayloadKind, read_payload_descriptor
 from dayu.host.durable.schema import TABLE_EVENT_LOG
 from dayu.host.durable.transaction import HostRow, HostTransaction
 
 _MIN_READ_LIMIT = 1
 _MIN_EVENT_CURSOR = 0
-_MAX_CANONICAL_INLINE_PAYLOAD_BYTES = _DEFAULT_INLINE_PAYLOAD_MAX_BYTES
+
+
 class EventClass(StrEnum):
     """EventLog 事件分类。
 
@@ -251,7 +249,7 @@ def append_event(
         encoded = _encode_append_request(request)
     except (TypeError, ValueError) as exc:
         raise HostDurableError("EventLog append request encoding failed") from exc
-    _validate_canonical_inline_payload_size(request, encoded)
+    _validate_canonical_inline_payload_size(transaction, request, encoded)
     existing = read_event_by_id(transaction, request.event_id)
     if existing is not None:
         if existing.event_body_digest == encoded.event_body_digest:
@@ -580,20 +578,23 @@ def _validate_payload_reference(
 
 
 def _validate_canonical_inline_payload_size(
-    request: EventLogAppendRequest, encoded: _EncodedAppendRequest
+    transaction: HostTransaction,
+    request: EventLogAppendRequest,
+    encoded: _EncodedAppendRequest,
 ) -> None:
     """校验 canonical fact 不把大内容塞入 inline payload。
 
+    :param transaction: 调用方提供的 Host durable transaction。
     :param request: EventLog append 请求。
     :param encoded: 已 canonical 编码的 append 请求。
     :returns: ``None``。
-    :raises HostPayloadReferenceError: canonical inline payload 超过当前 payload inline 阈值时抛出。
+    :raises HostPayloadReferenceError: canonical inline payload 超过当前 store 的 payload inline 阈值时抛出。
     """
 
     if request.event_class is not EventClass.CANONICAL_FACT:
         return
     payload_size_bytes = len(encoded.payload_json.encode("utf-8"))
-    if payload_size_bytes <= _MAX_CANONICAL_INLINE_PAYLOAD_BYTES:
+    if payload_size_bytes <= transaction.payload_inline_threshold_bytes:
         return
     raise HostPayloadReferenceError(
         "EventLog canonical_fact payload_json exceeds inline payload limit; "
