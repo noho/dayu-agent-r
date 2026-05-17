@@ -161,6 +161,60 @@ def _insert_event_log_probe(connection: sqlite3.Connection, event_id: str) -> No
     )
 
 
+def _insert_payload_descriptor_probe(
+    connection: sqlite3.Connection, payload_ref: str
+) -> None:
+    """插入 schema 约束测试用 payload descriptor row。
+
+    :param connection: SQLite connection。
+    :param payload_ref: payload descriptor 引用。
+    :returns: 无。
+    :raises sqlite3.Error: 插入失败时由 SQLite 抛出。
+    """
+
+    connection.execute(
+        f"""
+        INSERT INTO {TABLE_SQLITE_PAYLOADS} (
+          payload_id,
+          payload_format,
+          payload_json,
+          payload_size_bytes,
+          payload_digest,
+          created_at
+        ) VALUES (
+          'payload-1',
+          'canonical_json',
+          '{{}}',
+          2,
+          'sha256:0000000000000000000000000000000000000000000000000000000000000000',
+          '2026-05-16T00:00:00.000000Z'
+        )
+        """
+    )
+    connection.execute(
+        f"""
+        INSERT INTO {TABLE_PAYLOAD_DESCRIPTORS} (
+          payload_ref,
+          payload_kind,
+          payload_digest,
+          payload_size_bytes,
+          sqlite_payload_id,
+          metadata_json,
+          created_at
+        ) VALUES (
+          ?,
+          'sqlite_payload',
+          'sha256:0000000000000000000000000000000000000000000000000000000000000000',
+          2,
+          'payload-1',
+          '{{}}',
+          '2026-05-16T00:00:00.000000Z'
+        )
+        """,
+        (payload_ref,),
+    )
+
+
 def test_fresh_db_creates_foundation_phase8_and_memory_tables(
     tmp_path: Path,
 ) -> None:
@@ -176,8 +230,8 @@ def test_fresh_db_creates_foundation_phase8_and_memory_tables(
             assert set(MEMORY_PROJECTION_TABLES).issubset(
                 _table_names(connection)
             )
-            assert _pragma_int(connection, "PRAGMA user_version") == 7
-            assert HOST_SCHEMA_VERSION == 7
+            assert _pragma_int(connection, "PRAGMA user_version") == 8
+            assert HOST_SCHEMA_VERSION == 8
             assert _pragma_int(connection, "PRAGMA foreign_keys") == 1
             assert _pragma_text(connection, "PRAGMA journal_mode").lower() == "wal"
             assert _pragma_int(connection, "PRAGMA busy_timeout") == 250
@@ -277,6 +331,160 @@ def test_schema_constraints_are_explicit(tmp_path: Path) -> None:
             assert _primary_key_columns(connection, TABLE_HOST_INSTANCES) == (
                 "host_instance_id",
             )
+        finally:
+            connection.close()
+
+
+def test_event_log_schema_rejects_unpaired_payload_reference(
+    tmp_path: Path,
+) -> None:
+    """EventLog payload_ref / payload_digest DDL 约束拒绝单边引用。"""
+
+    options = _options(tmp_path)
+    with open_host_durable_store(options) as store:
+        connection = store.connect()
+        try:
+            _insert_payload_descriptor_probe(connection, "payload-ref-1")
+            with pytest.raises(sqlite3.IntegrityError):
+                connection.execute(
+                    f"""
+                    INSERT INTO {TABLE_EVENT_LOG} (
+                      event_id,
+                      event_body_digest,
+                      event_class,
+                      session_id,
+                      event_type,
+                      occurred_at,
+                      payload_json,
+                      payload_ref,
+                      appended_at
+                    ) VALUES (
+                      'event-payload-ref-only',
+                      'digest',
+                      'canonical_fact',
+                      'session-1',
+                      'TYPE_A',
+                      '2026-05-16T00:00:00.000000Z',
+                      '{{}}',
+                      'payload-ref-1',
+                      '2026-05-16T00:00:00.000000Z'
+                    )
+                    """
+                )
+            with pytest.raises(sqlite3.IntegrityError):
+                connection.execute(
+                    f"""
+                    INSERT INTO {TABLE_EVENT_LOG} (
+                      event_id,
+                      event_body_digest,
+                      event_class,
+                      session_id,
+                      event_type,
+                      occurred_at,
+                      payload_json,
+                      payload_digest,
+                      appended_at
+                    ) VALUES (
+                      'event-payload-digest-only',
+                      'digest',
+                      'canonical_fact',
+                      'session-1',
+                      'TYPE_A',
+                      '2026-05-16T00:00:00.000000Z',
+                      '{{}}',
+                      'sha256:0000000000000000000000000000000000000000000000000000000000000000',
+                      '2026-05-16T00:00:00.000000Z'
+                    )
+                    """
+                )
+        finally:
+            connection.close()
+
+
+def test_idempotency_schema_rejects_unpaired_event_reference(
+    tmp_path: Path,
+) -> None:
+    """Idempotency result event DDL 约束拒绝单边引用与非正序号。"""
+
+    options = _options(tmp_path)
+    with open_host_durable_store(options) as store:
+        connection = store.connect()
+        try:
+            _insert_event_log_probe(connection, "event-1")
+            with pytest.raises(sqlite3.IntegrityError):
+                connection.execute(
+                    f"""
+                    INSERT INTO {TABLE_IDEMPOTENCY_RECORDS} (
+                      scope_kind,
+                      scope_id,
+                      idempotency_key,
+                      semantic_input_digest,
+                      result_kind,
+                      result_ref,
+                      created_event_id,
+                      created_at
+                    ) VALUES (
+                      'scope',
+                      'scope-1',
+                      'key-id-only',
+                      'digest',
+                      'result',
+                      'result-1',
+                      'event-1',
+                      '2026-05-16T00:00:00.000000Z'
+                    )
+                    """
+                )
+            with pytest.raises(sqlite3.IntegrityError):
+                connection.execute(
+                    f"""
+                    INSERT INTO {TABLE_IDEMPOTENCY_RECORDS} (
+                      scope_kind,
+                      scope_id,
+                      idempotency_key,
+                      semantic_input_digest,
+                      result_kind,
+                      result_ref,
+                      created_event_sequence,
+                      created_at
+                    ) VALUES (
+                      'scope',
+                      'scope-1',
+                      'key-sequence-only',
+                      'digest',
+                      'result',
+                      'result-1',
+                      1,
+                      '2026-05-16T00:00:00.000000Z'
+                    )
+                    """
+                )
+            with pytest.raises(sqlite3.IntegrityError):
+                connection.execute(
+                    f"""
+                    INSERT INTO {TABLE_IDEMPOTENCY_RECORDS} (
+                      scope_kind,
+                      scope_id,
+                      idempotency_key,
+                      semantic_input_digest,
+                      result_kind,
+                      result_ref,
+                      created_event_id,
+                      created_event_sequence,
+                      created_at
+                    ) VALUES (
+                      'scope',
+                      'scope-1',
+                      'key-zero-sequence',
+                      'digest',
+                      'result',
+                      'result-1',
+                      'event-1',
+                      0,
+                      '2026-05-16T00:00:00.000000Z'
+                    )
+                    """
+                )
         finally:
             connection.close()
 

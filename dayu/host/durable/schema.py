@@ -22,7 +22,7 @@ from dayu.host.api import (
 )
 from dayu.host.durable.errors import HostSchemaMismatchError
 
-HOST_SCHEMA_VERSION = 7
+HOST_SCHEMA_VERSION = 8
 """当前 Host durable SQLite schema version。"""
 
 TABLE_EVENT_LOG = "event_log"
@@ -191,7 +191,11 @@ CREATE TABLE IF NOT EXISTS {TABLE_EVENT_LOG} (
   payload_digest TEXT NULL,
   appended_at TEXT NOT NULL,
   FOREIGN KEY(payload_ref) REFERENCES {TABLE_PAYLOAD_DESCRIPTORS}(payload_ref),
-  CHECK (payload_ref IS NULL OR payload_digest IS NOT NULL)
+  CHECK (
+    (payload_ref IS NULL AND payload_digest IS NULL)
+    OR
+    (payload_ref IS NOT NULL AND payload_digest IS NOT NULL)
+  )
 )
 """
 
@@ -214,7 +218,15 @@ CREATE TABLE IF NOT EXISTS {TABLE_IDEMPOTENCY_RECORDS} (
   created_at TEXT NOT NULL,
   PRIMARY KEY(scope_kind, scope_id, idempotency_key),
   FOREIGN KEY(created_event_id) REFERENCES {TABLE_EVENT_LOG}(event_id),
-  FOREIGN KEY(created_event_sequence) REFERENCES {TABLE_EVENT_LOG}(event_sequence)
+  FOREIGN KEY(created_event_sequence) REFERENCES {TABLE_EVENT_LOG}(event_sequence),
+  CHECK (
+    (created_event_id IS NULL AND created_event_sequence IS NULL)
+    OR
+    (created_event_id IS NOT NULL AND created_event_sequence IS NOT NULL)
+  ),
+  CHECK (
+    created_event_sequence IS NULL OR created_event_sequence > 0
+  )
 )
 """
 
