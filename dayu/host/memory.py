@@ -159,6 +159,15 @@ class MemoryDiagnosticReason(StrEnum):
     EMPTY_EVENT_LOG_SNAPSHOT = "empty_event_log_snapshot"
 
 
+class MemoryRepairReason(StrEnum):
+    """Memory snapshot 需要 repair 的结构化原因。"""
+
+    SNAPSHOT_MISSING = "snapshot_missing"
+    SNAPSHOT_DAMAGED = "snapshot_damaged"
+    SNAPSHOT_LAG_OVER_THRESHOLD = "snapshot_lag_over_threshold"
+    SNAPSHOT_AHEAD_OF_REQUIRED = "snapshot_ahead_of_required"
+
+
 @dataclass(frozen=True, slots=True)
 class MemorySizeUnits:
     """Memory item 的统一尺寸单位。
@@ -517,6 +526,38 @@ class MemoryDiagnostic:
 
 
 @dataclass(frozen=True, slots=True)
+class MemoryRepairRequest:
+    """Memory projection repair 请求。
+
+    :param session_id: 需要 repair 的 Session id。
+    :param reason: repair 结构化原因。
+    :param required_event_sequence: RunInputBuilder 本次需要覆盖的 EventLog cursor。
+    :param observed_cursor: 已观测到的 snapshot cursor；缺失 snapshot 时为 ``None``。
+    :param policy_digest: 当前 memory policy digest。
+    """
+
+    session_id: str
+    reason: MemoryRepairReason
+    required_event_sequence: int
+    observed_cursor: MemorySnapshotCursor | None
+    policy_digest: MemoryPolicyDigest
+
+    def __post_init__(self) -> None:
+        """校验 repair 请求字段。
+
+        :returns: ``None``。
+        :raises ValueError: 字段为空、reason 非法或 required cursor 为负数时抛出。
+        """
+
+        _require_non_empty(self.session_id, "session_id")
+        if not isinstance(self.reason, MemoryRepairReason):
+            raise ValueError("reason must be MemoryRepairReason")
+        if self.required_event_sequence < _MIN_SEQUENCE:
+            raise ValueError("required_event_sequence must be non-negative")
+        _require_non_empty(self.policy_digest, "policy_digest")
+
+
+@dataclass(frozen=True, slots=True)
 class MemoryProjectionPolicy:
     """Memory projection policy。
 
@@ -707,6 +748,103 @@ def calculate_memory_snapshot_digest(
     """
 
     return sha256_digest_json(_snapshot_digest_json_value(snapshot))
+
+
+def memory_snapshot_with_cursor_and_diagnostics(
+    *,
+    snapshot: ConversationMemorySnapshot,
+    cursor: MemorySnapshotCursor,
+    diagnostics: tuple[MemoryDiagnostic, ...],
+) -> ConversationMemorySnapshot:
+    """返回替换 cursor 并追加 diagnostics 后的新 snapshot。
+
+    :param snapshot: 原始 memory snapshot。
+    :param cursor: 新 snapshot cursor。
+    :param diagnostics: 需要追加的 diagnostics。
+    :returns: 重新计算 digest 后的 snapshot。
+    :raises ValueError: cursor session 与 snapshot session 不一致时抛出。
+    """
+
+    if cursor.session_id != snapshot.session_id:
+        raise ValueError("cursor session_id must match snapshot session_id")
+    snapshot_without_digest = ConversationMemorySnapshot(
+        snapshot_id=snapshot.snapshot_id,
+        session_id=snapshot.session_id,
+        cursor=cursor,
+        policy_digest=snapshot.policy_digest,
+        pinned_state=snapshot.pinned_state,
+        verified_facts=snapshot.verified_facts,
+        working_assumptions=snapshot.working_assumptions,
+        conversation_continuity=snapshot.conversation_continuity,
+        diagnostics=_dedupe_diagnostics(snapshot.diagnostics + diagnostics),
+        built_at=snapshot.built_at,
+        snapshot_digest=_SNAPSHOT_DIGEST_PENDING,
+    )
+    return ConversationMemorySnapshot(
+        snapshot_id=snapshot_without_digest.snapshot_id,
+        session_id=snapshot_without_digest.session_id,
+        cursor=snapshot_without_digest.cursor,
+        policy_digest=snapshot_without_digest.policy_digest,
+        pinned_state=snapshot_without_digest.pinned_state,
+        verified_facts=snapshot_without_digest.verified_facts,
+        working_assumptions=snapshot_without_digest.working_assumptions,
+        conversation_continuity=snapshot_without_digest.conversation_continuity,
+        diagnostics=snapshot_without_digest.diagnostics,
+        built_at=snapshot_without_digest.built_at,
+        snapshot_digest=calculate_memory_snapshot_digest(snapshot_without_digest),
+    )
+
+
+def build_inline_delta_repair_diagnostic(
+    *,
+    event_sequence: int,
+    policy_digest: MemoryPolicyDigest,
+) -> MemoryDiagnostic:
+    """构造 inline delta repair diagnostic。
+
+    :param event_sequence: inline repair 覆盖到的 EventLog sequence。
+    :param policy_digest: 当前 memory policy digest。
+    :returns: 结构化 memory diagnostic。
+    """
+
+    item_id = f"cursor:{event_sequence}"
+    return MemoryDiagnostic(
+        diagnostic_id=_diagnostic_id(
+            MemoryDiagnosticReason.INLINE_DELTA_REPAIR_INCLUDED,
+            event_sequence=event_sequence,
+            item_id=item_id,
+        ),
+        reason=MemoryDiagnosticReason.INLINE_DELTA_REPAIR_INCLUDED,
+        message="memory snapshot lag repaired inline from EventLog delta",
+        event_sequence=event_sequence,
+        item_id=item_id,
+        policy_digest=policy_digest,
+        recorded_at=None,
+    )
+
+
+def build_memory_budget_diagnostic(
+    *,
+    event_sequence: int,
+    item_id: str,
+    policy_digest: MemoryPolicyDigest,
+    message: str,
+) -> MemoryDiagnostic:
+    """构造对外可复用的 memory budget diagnostic。
+
+    :param event_sequence: 关联 EventLog sequence。
+    :param item_id: 关联 memory item 或渲染 block id。
+    :param policy_digest: memory policy digest。
+    :param message: diagnostic message。
+    :returns: 结构化 memory diagnostic。
+    """
+
+    return _budget_diagnostic(
+        event_sequence=event_sequence,
+        item_id=item_id,
+        policy_digest=policy_digest,
+        message=message,
+    )
 
 
 def build_empty_conversation_memory_snapshot(

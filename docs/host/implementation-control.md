@@ -812,7 +812,7 @@ Phase 按依赖关系推进：先实现被其它阶段依赖的公共契约、ru
 - P9 handoff implementation-ready plan 已完成双路 review、fix、双路 re-review 与 controller adjudication，verdict 为 PASS。
 - P9-S1 `Durable Memory Contracts and Schema` completed；accepted slice commit 为 `f221aeb`。
 - P9-S2 `Projection Consumer and Stable Layer Builder` completed；accepted slice commit 为 `4f35da6`。
-- P9-S3 `RunInputBuilder MemorySnapshotProvider and Lag Fallback` implementation in progress。
+- P9-S3 `RunInputBuilder MemorySnapshotProvider and Lag Fallback` completed；accepted slice commit pending。
 
 目标：
 - 实现 session-level Conversation Memory projection、stable layer、history pool、snapshot cursor、RunInputBuilder memory provider 与 projection repair path。
@@ -1628,12 +1628,42 @@ Phase 按依赖关系推进：先实现被其它阶段依赖的公共契约、ru
 追踪项：
 
 - Slice 3 必须确保 `RunInputBuilder` 按 P9 固定顺序消费 memory stable layer，且 legacy `SessionContinuityProvider`
-  不再注入未经过 memory history pool 预算的 historical raw turns。
+  不再注入未经过 memory history pool 预算的 historical raw turns。S3 已完成。
 - Unsupported event type 目前复用现有 durable diagnostic reason，并在 message 中写入 `unsupported_event_type` code；
   若后续需要独立 diagnostic reason，必须作为 schema hardening work unit 处理，不夹带进 S3。
 - `stable_layer_size_units` 在 S2 仍未消费；S3 memory message renderer 必须裁决该上限如何约束 rendered stable layer。
+  S3 已裁决为：stable memory blocks 按 P9 优先级消费该 cap，超预算 block 记录 transient
+  `BUDGET_LIMIT_REACHED` diagnostic；recent raw turns、episode summaries 与当前 prompt 不进入 stable layer cap。
 
 ## 历史记录
+
+### 2026-05-17 P9-S3 code review accepted
+
+P9-S3 `RunInputBuilder MemorySnapshotProvider and Lag Fallback` implementation 已完成。实现范围包含
+`DurableMemorySnapshotProvider`、`MemoryProjectionRepairRequired`、RunInputBuilder memory snapshot 渲染、small-lag inline
+delta fallback、missing / damaged / over-threshold / ahead-of-required repair-required 路径，以及 legacy
+`DurableSessionContinuityProvider` 收敛为 resume-specific continuity。
+
+双路 code review artifacts 为 `docs/reviews/p9-s3-code-review-mimo-20260517.md` 与
+`docs/reviews/p9-s3-code-review-ds-20260517.md`。双路 re-review artifacts 为
+`docs/reviews/p9-s3-code-rereview-mimo-20260517.md` 与
+`docs/reviews/p9-s3-code-rereview-ds-20260517.md`。Controller adjudication artifact 为
+`docs/reviews/p9-s3-code-review-controller-adjudication-20260517.md`。Re-review verdict：AgentMiMo PASS，AgentDS
+PASS，remaining blocking findings 为 0。
+
+Controller 接受并修复 snapshot ahead-of-required repair、stable layer budget consumption、当前 prompt event-id-only 去重、
+episode summary event 常量、covered snapshot cursor 测试一致性，以及 inline delta + stable budget 交叉测试。DS 关于生产
+required cursor 改为 Run started boundary 的建议不接受；P9 plan 明确规定使用
+`current_facts.attempt.started_event_sequence - 1`，以允许 resume / steer / recovery 新 Attempt 前 committed facts 进入
+memory。
+
+验证：
+
+- `pytest tests/host/test_run_input_builder.py tests/host/test_memory_projection.py tests/host/test_weak_typing_guard.py`：49 passed。
+- `pyright dayu/host/run_input.py dayu/host/memory.py dayu/host/durable/memory.py tests/host`：0 errors。
+- `git diff --check`：通过。
+
+Accepted slice commit pending。当前 gate 为 P9-S4 `Projection Repair / Rebuild Entry and Diagnostics` implementation。
 
 ### 2026-05-17 P9-S2 code review accepted
 
