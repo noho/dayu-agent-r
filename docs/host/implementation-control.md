@@ -223,8 +223,8 @@ Phase Map 中每个 phase 必须使用统一条目格式。模板如下：
 约束：本节只保留当前 gate 结论；phase 过程流水必须归档到 `历史记录`，仍需追踪的风险或后续 owner 必须写入 `Open Questions 与风险追踪` 的 `追踪区`。
 
 当前 work unit：P9.5 Pre-P10 Cross-Repository Hardening PR。
-当前 gate：P9.5 S17 Documentation And Control Tracking implementation。
-下一 gate：P9.5 S17 code review。
+当前 gate：P9.5 S18 Aggregate Validation And Readiness Evidence implementation。
+下一 gate：P9.5 S18 code review。
 
 ## Phase Map
 
@@ -2032,6 +2032,28 @@ P9.5 收口清单：
 - 当前无 PR review blocking fix。
 
 ## 历史记录
+
+### 2026-05-17 P9.5 S17 Documentation And Control Tracking accepted
+
+P9.5 S17 Documentation And Control Tracking 已完成。Implementation artifact 为
+`docs/reviews/p9-5-s17-documentation-control-tracking-implementation-20260517.md`。Documentation review /
+re-review / controller adjudication artifacts 为 `docs/reviews/p9-5-s17-doc-review-mimo-20260517.md`、
+`docs/reviews/p9-5-s17-doc-re-review-mimo-20260517.md`、
+`docs/reviews/p9-5-s17-doc-review-ds-20260517.md` 与
+`docs/reviews/p9-5-s17-doc-review-controller-adjudication-20260517.md`。
+
+Controller 裁决：AgentDS review 为 PASS，0 blocking findings；AgentMiMo 的 LOW precision finding 被接受并
+修复，`tests/README.md` 已将 Engine import boundary 从独立 `memory` 项校准为 `Host（含 memory）`，
+re-review 确认 fixed。S17 只做稳定文档校准：`dayu/README.md` 与 `docs/design.md` 补齐 `tool_schemas`
+和 ToolRuntime `tool_executor` 必须来自同一个 attempt-local effective `ToolBundle`；`dayu/engine/README.md`
+明确当前函数式入口通过私有默认 OpenAI-compatible Runner 装配点创建 Runner，该装配点不是 public factory /
+registry / runner selection extension；`dayu/host/README.md` 将 projection catch-up failure 描述校准为
+projection-local `WARNING` + `error_type`，不再写 logger exception；`tests/README.md` 同步 runtime /
+contracts / engine / host import-boundary guard 当前事实，包括 Host business tool scanner 禁止与 `fetch_more`
+ToolRuntime / tooling owner guard。S17 未更新 `docs/host/design.md`，因为 Host 专题设计已有对应设计目标且
+本轮未改变语义；未在 README 中写过程流水、未来承诺或实现细节。验证通过：`git diff --check` clean；
+AgentDS 额外 `python -m pyright dayu tests` 为 0 errors / 0 warnings / 0 informations。Accepted slice
+commit 为 `e50dee4`。当前 gate 为 P9.5 S18 Aggregate Validation And Readiness Evidence implementation。
 
 ### 2026-05-17 P9.5 S16 Contract Ownership Audit And Import/Public Surface Fixes accepted
 
