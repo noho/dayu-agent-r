@@ -640,6 +640,7 @@ def _seed_active_run(
                 actor="tester",
                 source="pytest",
                 worker_accept_reason="accepted",
+                local_worker_id="local-worker-resolve",
             ),
         )
 

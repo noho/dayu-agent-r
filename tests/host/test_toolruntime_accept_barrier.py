@@ -463,6 +463,7 @@ def _seed_active_run(transaction_runner: HostTransactionRunner) -> _SeededRun:
                 actor="tester",
                 source="pytest",
                 worker_accept_reason="accepted",
+                local_worker_id="local-worker-tool-accept",
             ),
         )
 

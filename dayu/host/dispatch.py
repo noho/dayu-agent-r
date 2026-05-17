@@ -1226,10 +1226,12 @@ def _is_dispatchable_recheck(
         and run.current_attempt_id == record.attempt_id
         and attempt.status == AttemptStatus.STARTING
         and attempt.execution_id == record.execution_id
-        and dispatch_record.status
-        in (DispatchRecordStatus.PENDING, DispatchRecordStatus.WAITING_FOR_LANE)
+        and dispatch_record.status == DispatchRecordStatus.WAITING_FOR_LANE
         and dispatch_record.dispatch_record_id == record.dispatch_record_id
         and dispatch_record.execution_id == record.execution_id
+        and dispatch_record.owner_host_instance_id is not None
+        and dispatch_record.waiting_for_lane_at is not None
+        and dispatch_record.lane_name is not None
         and dispatch_record.worker_accept_event_id is None
         and dispatch_record.cancelled_event_id is None
     )

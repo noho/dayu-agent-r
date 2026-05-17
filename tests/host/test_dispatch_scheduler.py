@@ -770,10 +770,44 @@ async def test_cancelled_dispatch_is_skipped_before_worker_call(
 
 
 @pytest.mark.asyncio
-async def test_pending_dispatch_can_direct_mark_dispatching_after_lane_recheck(
+async def test_dispatching_after_recheck_requires_waiting_for_lane(
     tmp_path: Path,
 ) -> None:
-    """scheduler durable recheck 接受 pending 并直跳 dispatching。"""
+    """scheduler durable recheck 只接受已进入 waiting_for_lane 的 dispatch。"""
+
+    factory = _FakeWorkerFactory()
+    with open_host_durable_store(_options(tmp_path)) as store:
+        seeded = _seed_current_run(store)
+        scheduler = await _open_scheduler(tmp_path, store, factory)
+        claim = await scheduler._lane_controller.acquire(
+            _LANE_NAME,
+            timeout_seconds=0,
+        )
+        assert isinstance(claim, LaneAcquired)
+        try:
+            wait_row = scheduler._mark_waiting_for_lane(_pending_dispatch(seeded))
+            assert wait_row is not None
+            assert wait_row.status == DispatchRecordStatus.WAITING_FOR_LANE
+            dispatch_record = scheduler._mark_dispatching_after_recheck(
+                _pending_dispatch(seeded),
+                claim.token,
+            )
+
+            assert dispatch_record is not None
+            assert dispatch_record.status == DispatchRecordStatus.DISPATCHING
+            assert dispatch_record.waiting_for_lane_at is not None
+            assert dispatch_record.lane_name == _LANE_NAME
+            assert dispatch_record.lane_claim_id == claim.token.claim_id
+        finally:
+            await claim.token.release()
+            await scheduler.close()
+
+
+@pytest.mark.asyncio
+async def test_pending_dispatch_recheck_without_waiting_is_skipped(
+    tmp_path: Path,
+) -> None:
+    """scheduler durable recheck 不允许绕过 waiting_for_lane。"""
 
     factory = _FakeWorkerFactory()
     with open_host_durable_store(_options(tmp_path)) as store:
@@ -790,11 +824,7 @@ async def test_pending_dispatch_can_direct_mark_dispatching_after_lane_recheck(
                 claim.token,
             )
 
-            assert dispatch_record is not None
-            assert dispatch_record.status == DispatchRecordStatus.DISPATCHING
-            assert dispatch_record.waiting_for_lane_at is not None
-            assert dispatch_record.lane_name == _LANE_NAME
-            assert dispatch_record.lane_claim_id == claim.token.claim_id
+            assert dispatch_record is None
         finally:
             await claim.token.release()
             await scheduler.close()

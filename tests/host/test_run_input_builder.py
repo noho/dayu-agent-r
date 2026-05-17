@@ -74,6 +74,7 @@ from dayu.host.durable.state import (
     DispatchRecordStatus,
     RunStartReason,
     WorkerKind,
+    mark_dispatch_waiting_for_lane_row,
     mark_dispatching_after_lane_row,
 )
 from dayu.host.durable.errors import HostDurableError
@@ -1660,6 +1661,13 @@ def _seed_current_run(
                 boot_id=None,
             ),
         )
+        mark_dispatch_waiting_for_lane_row(
+            transaction,
+            attempt_id="attempt-current",
+            owner_host_instance_id="host-run-input",
+            lane_name="llm",
+            waiting_for_lane_at="2026-05-15T01:02:03.000000Z",
+        )
         mark_dispatching_after_lane_row(
             transaction,
             attempt_id="attempt-current",
@@ -1782,15 +1790,54 @@ def _force_dispatch_snapshot_state(
                 "SET status = ?, owner_host_instance_id = NULL, "
                 "waiting_for_lane_at = NULL, lane_name = NULL, "
                 "lane_claim_id = NULL, lane_owner_id = NULL, "
-                "lane_acquired_at = NULL, dispatching_at = NULL "
+                "lane_acquired_at = NULL, dispatching_at = NULL, "
+                "worker_accepted_at = NULL, worker_accept_event_id = NULL, "
+                "worker_accept_event_sequence = NULL, cancelled_event_id = NULL, "
+                "cancelled_event_sequence = NULL, cancelled_at = NULL "
                 "WHERE dispatch_record_id = ?",
                 (dispatch_status.value, seeded.dispatch_record_id),
+            )
+        elif dispatch_status == DispatchRecordStatus.WAITING_FOR_LANE:
+            transaction.execute(
+                "UPDATE host_attempt_dispatch_records "
+                "SET status = ?, owner_host_instance_id = ?, "
+                "waiting_for_lane_at = ?, lane_name = ?, "
+                "lane_claim_id = NULL, lane_owner_id = NULL, "
+                "lane_acquired_at = NULL, dispatching_at = NULL, "
+                "worker_accepted_at = NULL, worker_accept_event_id = NULL, "
+                "worker_accept_event_sequence = NULL, cancelled_event_id = NULL, "
+                "cancelled_event_sequence = NULL, cancelled_at = NULL "
+                "WHERE dispatch_record_id = ?",
+                (
+                    dispatch_status.value,
+                    "host-run-input",
+                    "2026-05-15T01:02:03.000000Z",
+                    "llm",
+                    seeded.dispatch_record_id,
+                ),
             )
         else:
             transaction.execute(
                 "UPDATE host_attempt_dispatch_records "
-                "SET status = ? WHERE dispatch_record_id = ?",
-                (dispatch_status.value, seeded.dispatch_record_id),
+                "SET status = ?, owner_host_instance_id = ?, "
+                "waiting_for_lane_at = ?, lane_name = ?, "
+                "lane_claim_id = ?, lane_owner_id = ?, "
+                "lane_acquired_at = ?, dispatching_at = ?, "
+                "worker_accepted_at = NULL, worker_accept_event_id = NULL, "
+                "worker_accept_event_sequence = NULL, cancelled_event_id = NULL, "
+                "cancelled_event_sequence = NULL, cancelled_at = NULL "
+                "WHERE dispatch_record_id = ?",
+                (
+                    dispatch_status.value,
+                    "host-run-input",
+                    "2026-05-15T01:02:03.000000Z",
+                    "llm",
+                    "claim-run-input",
+                    "owner-run-input",
+                    "2026-05-15T01:02:03.000000Z",
+                    "2026-05-15T01:02:03.000000Z",
+                    seeded.dispatch_record_id,
+                ),
             )
 
     transaction_runner.run_write(operation)

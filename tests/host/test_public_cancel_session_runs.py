@@ -301,6 +301,7 @@ def _accept_active_worker(
                 actor="host.dispatch",
                 source="host.dispatch",
                 worker_accept_reason="local_worker_accepted",
+                local_worker_id=f"local-worker-{attempt_id}",
             ),
         )
         assert accepted.status == StateMutationStatus.UPDATED
