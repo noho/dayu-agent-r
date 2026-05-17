@@ -220,14 +220,11 @@ Phase Map 中每个 phase 必须使用统一条目格式。模板如下：
 
 ## 当前状态
 
-Phase 9 draft PR 已创建：PR 59 https://github.com/noho/dayu-agent-r/pull/59。Accepted PR review commit 为 `67458cb`。
-P9 all-repository follow-up fix pass 已完成本地验证；最终 MiMo / DS re-review 均 PASS；accepted follow-up commit 为
-`6e12641`。
-当前 gate 为 draft-PR-pass follow-up accepted。
-下一 planned work unit：在 P9 后、P10 前新增 P9.5 Pre-P10 Cross-Repository Hardening PR，收口当前追踪区中不依赖
-P10+ phase owner、也不属于本轮已裁决排除项的 hardening / cleanup。
-
 约束：本节只保留当前 gate 结论；phase 过程流水必须归档到 `历史记录`，仍需追踪的风险或后续 owner 必须写入 `Open Questions 与风险追踪` 的 `追踪区`。
+
+当前 work unit：P9.5 Pre-P10 Cross-Repository Hardening PR。
+当前 gate：P9.5 design discussion accepted。
+下一 gate：P9.5 implementation-ready handoff plan。
 
 ## Phase Map
 
@@ -823,8 +820,8 @@ Phase 按依赖关系推进：先实现被其它阶段依赖的公共契约、ru
   accepted PR review commit 为 `67458cb`。
 - P9 all-repository follow-up review 已由 AgentMiMo 与 AgentDS 执行，初审发现若干跨仓 correctness / observability hardening；
   controller 已接受其中低风险项并完成 fix / validation。最新 DS follow-up finding 中，SSE 已产出事件后的 retry、SSE tool-call
-  final finish parity 与 runtime file lock release failure cleanup 已修复；minimal read model consumer isolation 作为 schema
-  design debt deferred。最终 AgentMiMo / AgentDS re-review 均 PASS。Controller adjudication artifact 为
+  final finish parity 与 runtime file lock release failure cleanup 已修复；minimal read model reset contract 作为
+  single-consumer ownership clarification deferred。最终 AgentMiMo / AgentDS re-review 均 PASS。Controller adjudication artifact 为
   `docs/reviews/p9-all-repo-review-controller-adjudication-20260517.md`。
 
 目标：
@@ -898,8 +895,8 @@ Phase 按依赖关系推进：先实现被其它阶段依赖的公共契约、ru
 - 后续 phase 可依赖的稳定契约：memory snapshot cursor、stable layer input provider、projection repair semantics。
 - 需要追踪到后续 phase 的事项：长期 memory / query-time retrieval、业务 signal ledger、signal-to-outcome verification 后续单独设计；
   P9 只预留 Host 中立 evidence anchor / claim status / provenance / trace 边界。
-- P9 all-repository follow-up 已明确 defer 的非 P9 blocking 架构债：Engine runner factory / registry、minimal read model
-  multi-consumer schema、Phase 11 RECOVERING 流程测试、Host durable/API error taxonomy、ToolRuntime / memory 模块拆分、
+- P9 all-repository follow-up 已明确 defer 的非 P9 blocking 架构债：Engine runner protocol decoupling、minimal read model
+  single-consumer reset contract、Phase 11 RECOVERING 流程测试、Host durable/API error taxonomy、ToolRuntime / memory 模块拆分、
   LocalProxy close/events race、read API enum mapping、lane heartbeat/shield hardening 与消息 / 工具结果大小治理。
 
 #### Phase 9 all-repository follow-up 追踪
@@ -928,21 +925,26 @@ Phase 按依赖关系推进：先实现被其它阶段依赖的公共契约、ru
 
 追踪项：
 
-- Engine runner DI / factory、minimal read model 多 consumer reset、RECOVERING 状态机、durable/API error taxonomy、Command
-  service caching、LocalProxy race、read API enum mapping、ToolRuntime / memory 模块拆分、lane hardening 与消息 / 工具结果大小上限
+- Engine runner protocol decoupling、minimal read model single-consumer reset contract、RECOVERING 状态机、durable/API error taxonomy、Command
+  handle internal service encapsulation / lifecycle guard、LocalProxy race、read API enum mapping、ToolRuntime / memory 模块拆分、lane hardening 与消息 / 工具结果大小上限
   均为后续 owned work，不阻塞 P9。其中除 RECOVERING 状态机归 Phase 11 外，其余不依赖 P10+ phase owner 的项目纳入 P9.5
   Pre-P10 Cross-Repository Hardening PR。
 
 ### Phase 9.5. Pre-P10 Cross-Repository Hardening PR
 
 状态：
-- planned；在 P9 draft-PR-pass follow-up accepted 后执行，必须在 Phase 10 Context Governance / Compaction 前完成或显式裁决
+- design discussion accepted；下一步必须生成 implementation-ready handoff plan，并经双路 plan review / controller
+  adjudication 通过后才可进入 implementation。P9.5 必须在 Phase 10 Context Governance / Compaction 前完成或显式裁决
   剩余项不阻塞 P10。
 
 目标：
 - 收口当前 `Open Questions 与风险追踪` 中不依赖 P10+ phase owner 的跨仓 hardening、cleanup 与 public contract repair。
 - 降低 Phase 10 前的基础设施噪音，避免 Context Governance 开始时继续携带 Engine / Host public contract / durable helper /
   read API / LocalProxy / runtime lane 的已知非阻塞债。
+- 按 `dayu/README.md` “日志级别语义”，为 Engine 与 Host P1-P9 已实现路径补充必要 log，并校准日志级别、字段、脱敏和
+  invariant 诊断边界。
+- 按 `dayu/README.md` “Contract Ownership”，检查 Engine / Host / runtime / contracts 已实现类型、事件、stream、projection、
+  ToolRuntime 与 ToolBundle 等 contract 归属是否正确。
 
 对应设计章节：
 - `docs/host/design.md` §4 Run / Attempt 状态模型
@@ -959,11 +961,13 @@ Phase 按依赖关系推进：先实现被其它阶段依赖的公共契约、ru
 - 用户确认 P9.5 不改变 P10 / P11 / P12 / P13 / P14 / P15 的语义 owner，只清理不依赖这些 owner 的当前追踪项。
 
 范围：
-- 允许修改：Engine runner factory / registry 边界、minimal read model consumer isolation、durable / public API error taxonomy、
-  Command service caching、LocalProxy close / events race、read API enum mapping、
+- 允许修改：Engine runner protocol 边界、minimal read model single-consumer reset contract、durable / public API error taxonomy、
+  Command handle internal service encapsulation / lifecycle guard、LocalProxy close / events race、read API enum mapping、
   ToolRuntime / memory 模块拆分、runtime lane hardening、message / tool result size governance、Host durable helper API tightening、
-  schema CHECK hardening、Engine / OpenAI runner / parser hardening、production memory projection catch-up composition wiring 中不触及
-  snapshot history 保留模型的部分、相关 README 与测试。
+  schema CHECK hardening、Engine / OpenAI runner / parser hardening、TruncationManager initialization cost review、
+  late `resolve_wait` redundant catch-up cleanup、production memory projection catch-up composition wiring 中不触及 snapshot history
+  保留模型的部分、memory import boundary / preview facts / catch-up end-to-end targeted tests、Engine / Host P1-P9 已实现路径按
+  日志级别语义补必要 log、Contract Ownership conformance audit、相关 README 与测试。
 - 禁止修改：Context Governance / compact provider、RECOVERING recovery scan / dispatch、RemoteProxy / RemoteStub、Audit / Tool Trace /
   Outbox concrete sinks、ToolsDiscovery / ScenePrepare manifest provider、长期 memory / query-time retrieval、external job physical
   cancel / callback 产品化、purge / retention production hardening。
@@ -980,31 +984,109 @@ Phase 按依赖关系推进：先实现被其它阶段依赖的公共契约、ru
   `RECOVERING` Run。
 
 P9.5 收口清单：
-- Engine runner DI / factory / registry：解除 Engine Agent 对具体 OpenAI runner 的硬编码装配，建立清晰 factory / provider
-  selection contract。
-- minimal read model multi-consumer schema：补齐 consumer isolation 或明确 minimal read model 单 consumer public contract，避免 reset
-  跨 consumer 清表。
-- durable / public API error taxonomy：收敛 durable error、public HostApiError detail 与 retryable 分类。
-- Command service caching：确认 command handle / service 缓存边界，不绕过 lifecycle guard 或 durable truth。
-- LocalProxy close / events race：补齐 worker handle close、events stream EOF / exception 与 late event 竞态测试及修复。
-- read API enum mapping：统一 durable row enum、public enum 与 event view enum 的映射边界。
-- ToolRuntime / memory 模块拆分：拆分 God module / 聚合模块中已暴露的过宽职责，但不得改变工具治理或 memory 语义。
+- Engine runner protocol decoupling：解除 Engine Agent 主链路对具体 OpenAI runner 类型的直接依赖，使 `_AsyncAgent` 只接收并消费
+  `AsyncRunner` protocol；`run_agent_messages` 默认 public entry 仍可通过私有 helper 集中装配当前默认 OpenAI-compatible
+  runner。该 helper 只表达当前默认 runner 装配边界，不是扩展点；不引入 runner factory / registry / provider selection
+  contract，也不得以“方便未来扩展”为理由增加胶水 seam。
+- minimal read model single-consumer reset contract：确认 `host_run_results` 与 `host_session_timeline_items` 是
+  `host.minimal-read-model` 固定 consumer 独占的 read model 表；reset 全表后从 EventLog replay 是合法 repair / rebuild
+  手段。P9.5 不引入 multi-consumer schema；只有未来真实出现第二个 minimal read model consumer 且必须共享同一物理表时，
+  才单独设计 consumer isolation。
+- durable / public API error taxonomy：梳理并收敛现有 durable error 到 public `HostApiError` 的翻译边界，确保 not found、
+  invalid state、conflict、idempotency conflict、unsupported operation、internal error 与 `retryable` 语义在不同 public facade
+  中一致；`detail` 仍只能使用 typed detail union，不引入无结构 payload 或新的复杂错误系统。
+- Command handle internal service encapsulation / lifecycle guard：确认 `HostCommandHandle` 内部持有的 durable store、
+  admission service 与 active registry 只是私有实现细节；`dayu.host` public exports、Service / UI 调用方和测试不得取得或依赖
+  internal service，也不得绕过 handle close 写 durable truth。补 public export / import boundary / facade behavior tests，优先用
+  public facade 行为验证，减少对白盒 `_xxx` 私有字段的依赖。
+- LocalProxy close / events race：这是本地执行路径必须收口的 correctness 边界；补齐 worker handle close 后禁止重读
+  `events()`、Engine event stream clean EOF without terminal、event stream exception / worker crash、terminal accepted 后 late event、
+  scheduler close / active task cleanup、worker handle / lane token / active registry 释放，以及 close 与 event consumption 并发的
+  targeted race tests 与必要修复。不得引入 RemoteProxy、exactly-once 或 Phase 11 recovery 语义。
+- read API enum mapping：梳理 durable row enum、public API enum 与 read/event view enum 或文本的映射位置，确保
+  `get_run()`、`get_session()`、`stream_run_events()` 与 minimal read model 对同一状态 / event type 的展示一致；映射应有单一真源
+  或受控 helper，未知值必须 fail closed，不能静默降级为其它状态。补全当前 Run / Attempt / Session / event type 映射测试；不改变
+  状态机、不新增状态、不改 EventLog facts、不把 read model 升级为 truth。
+- ToolRuntime / memory module boundary cleanup：按既有职责把过大的聚合模块拆到清晰边界，例如 ToolRuntime 的
+  effective bundle / schema projection、Host accept barrier、duplicate governance、truncation / `fetch_more`、diagnostics，以及
+  Memory 的 contracts、projection builder、budgeting、serialization / codec、durable repository；只做 ownership 与 import
+  boundary cleanup，不改变 ToolRuntime accept barrier、EventLog facts、memory snapshot 语义、projection truth 或状态机。
 - ToolRuntime truncation / duplicate defensive hardening：补齐 truncation 多类型边界测试、duplicate governed error 防御性校验与
-  不依赖 durable duplicate ledger 的本地治理测试。
+  不依赖 durable duplicate ledger 的本地治理测试。覆盖 `text_lines`、`list_items`、`binary_bytes` 等 truncation targeted
+  tests，补 `fetch_more` cursor / `scope_token` / digest / expired / missing guard tests；收紧 `ToolFactAcceptCandidate`
+  对 `GOVERNED_ERROR` / duplicate governed outcome 的 validation，补 duplicate `allow` / `reuse` / `hint` /
+  `require_justification` / `hard_stop` focused tests，确认 `reuse` 不伪造新工具事实也不重复调用 business callable。
+  复核 TruncationManager 默认启用时的初始化成本，若发现 production scale policy 问题再转交 Phase 15。不得新增 durable
+  cursor table，不让 `fetch_more` 变成 Host / Engine 特化分支，不实现 durable duplicate ledger，不改变 duplicate policy 默认值，
+  不落地 Tool Trace projection。
 - Engine wait confirmation matching-ref hardening：收紧 Engine awaiting / confirmation event 与 Host accepted refs 的匹配契约；
-  不引入 callback endpoint、poller 后台循环或 external job physical cancel。
-- runtime lane hardening：处理 lane heartbeat / shield / cancellation precision / release failure 诊断等不涉及 recovery owner 的问题。
+  Engine `tool_awaiting` / `run_suspended` 只能确认 ToolRuntime Host accept path 已接受的 awaiting refs，不能创建 wait
+  record、关闭 Attempt 或推进 Run `WAITING`。补 accepted refs 缺失、错 run、错 attempt、错 `execution_id`、旧 Attempt late
+  confirmation 的 mismatch tests；不匹配只能 diagnostic / reject，不能进入 canonical owner 路径。保持 LocalProxy 与未来
+  RemoteProxy 语义一致；不引入 callback endpoint、poller 后台循环、external job physical cancel 或 RemoteProxy wire protocol。
+- runtime lane hardening：处理 `dayu.runtime.lane` 作为层中立资源容量 primitive 的稳定性问题，包括 acquire cancellation
+  precision、heartbeat / token lost、release failure / repeated release 诊断、supervisor shutdown 时等待 acquire 或已持有 token 的
+  清理，以及 repeated outer cancellation、untracked release failure、idle scheduler sleeping task 的 targeted tests / fix。lane
+  token 仍只表示 runtime capacity claim，不得进入 EventLog、Attempt owner、dispatch truth、Host admission、Run / Attempt 状态机或
+  recovery 判断；不引入 lease / fencing / takeover 语义。
 - Host dispatch lifecycle / RunInputBuilder non-recovery cleanup：收口 scheduler lane 竞争测试、`_drain_loop` 可观测性、
-  RunInputBuilder optimistic TOCTOU 与 `_consume_worker_events` cleanup 等不需要 Phase 11 recovery 语义的 hardening。
-- message / tool result size governance：补齐 Host / Engine 边界上的消息与工具结果大小上限、诊断和测试。
+  RunInputBuilder optimistic TOCTOU、late `resolve_wait` rejection 额外触发 catch-up 的低风险冗余与
+  `_consume_worker_events` cleanup 等不需要 Phase 11 recovery 语义的 hardening。补 targeted tests 覆盖 durable recheck /
+  lane release / dispatch requeue、drain loop 空队列 / sleep / 异常退出可观测性、worker event consumption 异常路径下的
+  worker handle close / lane token release / active registry 注销、RunInputBuilder stale snapshot fail-closed，以及 late
+  `resolve_wait` rejection redundant catch-up cleanup。不得夹带 Phase 11 recovery、`RECOVERING` dispatch、orphan proof、
+  RemoteProxy 或状态机语义变更。
+- message / tool result size governance：梳理 Host / Engine 边界已有大小常量、默认值与最大值，明确大消息、大工具结果、
+  大 payload 必须外移到 payload / artifact / ref / digest，而不是塞进 EventLog canonical fact 或无界 Engine messages。
+  超限必须产生结构化诊断或明确 public error，不能静默丢内容；补 message size / tool result size targeted tests，并确认
+  truncation / `fetch_more` 不绕过该治理。不得实现 Phase 10 Context Governance、provider-specific tokenizer、proactive
+  compaction、memory snapshot history 或业务规则。
 - Host durable helper API tightening：收紧 `accept_worker_running_in_transaction` diagnostic payload、`mark_dispatching_after_lane_row`
-  等 helper 能力宽于生产路径的问题。
-- schema CHECK hardening：补齐不依赖后续 schema phase 的 SQLite CHECK / index / invariant 测试。
-- Engine / OpenAI runner / parser hardening：收口不涉及 P10 语义的 runner / parser correctness 和 observability findings。
-- P9 memory cleanup / test hardening：只收口 `current_goal`、legacy `SessionContinuityProvider` 参数、preview facts exclusion、
-  import boundary 与 catch-up end-to-end 等不涉及 snapshot history 保留模型的 cleanup / tests。
+  等 helper 能力宽于生产路径的问题。明确底层 helper 只能服务 scheduler / transition owner 的真实路径，不能被测试或后续代码用来
+  绕过 lane wait、durable recheck、dispatch record 状态校验、execution_id 校验或 cancel race；状态不满足时必须 fail
+  closed。补 helper diagnostic payload、production-path invariant tests，并减少直接用 helper 构造不真实状态的白盒测试。不把
+  helper 提升为 public API，不为旧测试保留宽松 wrapper。
+- schema CHECK hardening：把 SQLite schema 作为 Host durable truth 的最后结构防线，梳理当前 CHECK / FK / index 是否覆盖
+  enum/status、ref/digest 成对字段、dispatch record、projection checkpoint / failure、minimal read model、memory rows、wait
+  records、payload descriptors 等不变量。补不依赖后续 phase 的 CHECK / invariant 与 targeted durable schema tests，直接插入非法
+  row 验证 SQLite 拒绝，并确保 Python validation 与 DB CHECK 一致。不做旧库兼容 migration，不新增 P10 / P11 / P13 /
+  P15 状态或表，不改业务语义。
+- Engine / OpenAI runner / parser hardening：收口不涉及 P10 语义的 OpenAI-compatible runner / parser correctness 与
+  observability findings，包括 SSE / non-stream parser 边界、provider protocol error / context overflow 分类、tool call
+  aggregation、finish reason parity、Engine event stream 不泄漏 log record、metadata 不承载契约事实，以及 run-scoped Runner
+  生命周期测试。不做 runner factory / registry，不重开 usage-only / partial tool-call-delta retry 粒度，不做 proactive context
+  governance，不把 Host 状态、memory 或 tool governance 放进 Engine，不引入 provider-specific public state 新合约。
+- Engine / Host necessary log by level semantics：按照 `dayu/README.md` “日志级别语义”，为 Engine 与 Host P1-P9
+  已实现路径补必要 log，并校准已有 log 的级别、字段命名、脱敏和 invariant 诊断。覆盖 Engine / Runner、Host command
+  path、dispatch / LocalProxy、EngineEvent ingest、ToolRuntime accept barrier、wait resolve / late rejection、projection catch-up /
+  repair、memory catch-up 等已实现路径；日志只记录 typed ids、refs、digest、cursor、policy / diagnostic refs，不记录完整
+  prompt、完整工具参数 / 结果、delta 全量、财报原文、authorization claims 原文或大 payload。补 logging targeted tests /
+  caplog tests，确认 `VERBOSE` 只表达执行骨架、`DEBUG` 表达受控细节、`WARN` 表达可恢复异常、`ERROR` 表达本次操作失败、
+  `CRITICAL` 表达 invariant / contract 破坏。该任务只补必要 log，不建设新的 observability 平台；不得把日志升级为
+  EventLog truth、audit、tool trace、projection checkpoint 或 UI 输出；不得提前实现 P10+ 未落地路径。
+- Contract Ownership conformance audit：按照 `dayu/README.md` “Contract Ownership” 检查 P1-P9 已实现的 Engine /
+  Host / runtime / contracts 类型、事件、stream、projection、ToolRuntime、ToolBundle、RunSnapshot / SessionSnapshot、
+  EventLog / Host event stream、RunnerEvent / EngineEvent 等 contract 归属是否正确。重点检查 Host 私有治理状态是否误放进
+  `dayu.contracts`、Engine 是否理解 Host 状态、Host 是否把 projection / read model 当 truth、runtime 是否承载业务或 Host
+  治理语义、ToolRuntime / ToolBundle 边界是否被 Service / UI 或 Engine 误拥有。按照 `docs/design.md` “工具定义与执行边界”
+  增加专项检查：Engine 不得 import / 持有 / 分支判断 `@tool`、`ToolDefinition`、`ToolBundle`、`ToolCallable`、
+  ToolRuntime 或具体工具实现；Host 不得扫描业务工具模块或在 per-run request / metadata 中塞 raw `ToolBundle`；
+  `fetch_more` 只能由 ToolRuntime factory 注入 attempt-local effective `ToolBundle`。补 import boundary / public export /
+  package surface tests；发现归属错误时按当前设计真源移动到正确层，不做兼容 re-export / wrapper。不得借该 audit 引入未来
+  P10+ contracts 或重写 public API。
+- P9 memory cleanup / test hardening：只收口 `current_goal` first-write-wins、legacy `SessionContinuityProvider` 参数、
+  preview facts exclusion 专项测试、memory import boundary 自动化测试、catch-up end-to-end 专项测试、optional JSON helper
+  wording、empty snapshot 双实例构造与 cast 注释等不涉及 snapshot history 保留模型的 cleanup / tests。确认 legacy
+  `SessionContinuityProvider` 不绕过 memory history pool budget，preview / reasoning / display-only events 不进入 memory，
+  memory import boundary 不依赖上层或业务模块，catch-up concrete wiring 能端到端追平。不得修 Conversation Memory snapshot
+  history，不实现长期 retrieval index、public memory edit / reset / forget，不让 final answer 升级为 verified fact，不让 Host
+  import `dayu.fins`。
 - production memory projection catch-up composition wiring：补齐 command / admission / scheduler composition 中不改变 snapshot
-  history 保留模型的 concrete catch-up port 注入；snapshot history 本身仍按单独 PR 裁决处理。
+  history 保留模型的 concrete catch-up port 注入；梳理 production command handle、admission service 与 scheduler worker accept
+  前使用 no-op 还是 concrete memory catch-up port，并明确 test / dev no-op 边界。补 end-to-end tests 覆盖用户输入、tool
+  fact、`resolve_wait` 等提交后 memory projection 被 catch up；catch-up 失败只记录 projection-local failure / logger，不回滚
+  已提交 command，不修改 Run / Attempt / EventLog。snapshot history 本身仍按单独 PR 裁决处理；不引入跨 cursor snapshot
+  retention，不把 projection lag 变成 Run recovery，不实现 P10 Context Governance 或 heavy sink / batch runner。
 
 验证要求：
 - `pytest -q`。
@@ -1403,24 +1485,41 @@ P9.5 收口清单：
 
 归属到 P9.5 的追踪项：
 
-- Engine runner DI / factory / registry。
-- minimal read model multi-consumer schema。
+- Engine runner protocol decoupling。
+- minimal read model single-consumer reset contract；不引入 multi-consumer schema。
 - durable / public API error taxonomy。
-- Command service caching。
+- Command handle internal service encapsulation / lifecycle guard；补 public export / import boundary / facade behavior tests，防止
+  Service / UI 或测试越过 `HostCommandHandle` 直接依赖 internal service。
 - LocalProxy close / events race。
 - read API enum mapping。
-- ToolRuntime / memory 模块拆分。
+- ToolRuntime / memory module boundary cleanup；只拆分既有职责和 import boundary，不改变工具治理、memory snapshot、
+  EventLog facts、projection truth 或状态机。
 - ToolRuntime truncation / duplicate defensive validation 与 focused test hardening。
+- TruncationManager initialization cost review：基于当前初始化路径的直接证据复核默认 `enable_truncation_manager=True`
+  是否存在 hot path 重初始化成本；轻对象则裁决为不修，真实 production scale policy 问题转交 Phase 15。不得引入全局
+  TruncationManager singleton、durable cursor table、跨 Run cursor 复用或 Host / Engine `fetch_more` 特化分支。
 - Engine wait confirmation matching-ref contract hardening。
 - runtime lane hardening。
 - Host dispatch lifecycle / RunInputBuilder non-recovery cleanup 与 targeted tests。
+- late `resolve_wait` rejection redundant catch-up cleanup / tests：确认 late wait result rejection 不写 canonical tool fact、
+  不推进 Run、不创建 Attempt，只保留 diagnostic / rejection 可观测性；检查 rejection 后是否额外触发 projection catch-up，能轻量
+  抑制则抑制，复杂度过高则用测试和注释明确为低风险冗余。不得改变 `resolve_wait` first-committer-wins、`WAITING`
+  cancel / resolve 竞态规则，不实现 callback / poller 后台循环、external job cancel，也不得把 late result 变成 canonical fact。
 - message / tool result size governance。
 - Host durable helper API tightening。
 - schema CHECK hardening。
 - Engine / OpenAI runner / parser hardening。
+- Engine / Host P1-P9 implemented-path necessary log under `dayu/README.md` level semantics。
+- Contract Ownership conformance audit under `dayu/README.md` Contract Ownership。
 - P9 memory 代码中不涉及 snapshot history 的 Host cleanup / test hardening。
+- P9 memory import boundary、preview facts exclusion、catch-up end-to-end、optional JSON helper wording、empty snapshot 双实例构造与
+  cast 注释 cleanup / tests。
 - production memory projection catch-up composition wiring 中不触及 snapshot history 保留模型的部分。
-- God module / class cleanup 与 broader test hardening 中不依赖 P10+ owner 的部分。
+- God module / class cleanup 与 broader test hardening 中不依赖 P10+ owner 的部分：不得作为独立大 slice 或无限重构口袋；
+  只能接收已归属到上述具体 P9.5 条目的 cleanup，并为每个 cleanup 标明 owner（ToolRuntime、memory、dispatch、Engine
+  runner、read API、durable helper 等）。只允许机械拆分、import boundary、测试整理、命名 / 注释清晰化与 focused tests；
+  若发现需要改 public contract、状态机、ToolRuntime / memory 语义、P10+ owner 能力或跨模块大重构，必须停下并重新归属。
+  P9.5 结束前不得保留无 owner 的 broader hardening 表述。
 
 退出规则：
 
@@ -1461,18 +1560,21 @@ P9.5 收口清单：
   destination 为
   Phase 11 recovery dispatch；触发条件为实现 `RECOVERING` 入边 / 出边转换、startup recovery scan 或 recovery dispatch。
 
-#### Engine Runner Factory 解耦追踪
+#### Engine Runner Protocol 解耦追踪
 
 背景决议：
 
 - 2026-05-17 全仓 review fix gate 中，用户明确要求本轮不修改 “Engine Agent 硬编码依赖 `AsyncOpenAIRunner`，违反 Protocol 解耦约束” 这一项代码。
-- 本轮不改 `dayu/engine/agent.py`，不引入 runner factory，不改变 Engine public entry 或 Host 调用方式。
+- 本轮不改 `dayu/engine/agent.py`，不引入 runner factory / registry，不改变 Engine public entry 或 Host 调用方式。
+- 用户在 P9.5 discussion 前确认：P9.5 不做 runner factory；只做 Engine Agent 主链路对 `AsyncRunner` protocol 的解耦。
 
 追踪项：
 
 - destination：P9.5 Pre-P10 Cross-Repository Hardening PR。
-- 触发条件：新增非 OpenAI-compatible 原生 runner、需要测试注入 runner factory、或 Engine public entry 需要支持 provider selection contract。
-- 后续处理要求：先明确 `AsyncRunner` factory 协议与 provider selection contract，再修改 Engine agent composition；不得用 lazy import、兼容 wrapper 或 metadata bag 作为解耦替代品。
+- 触发条件：需要在 Engine Agent 主链路测试中注入 `AsyncRunner` protocol 实现，或新增非 OpenAI-compatible 原生 runner 时发现当前主链路仍绑定具体 OpenAI runner。
+- 后续处理要求：先明确 `_AsyncAgent` 如何只消费 `AsyncRunner` protocol，以及 `run_agent_messages` 默认 public entry 如何通过
+  私有 helper 装配当前默认 OpenAI-compatible runner；该 helper 不是扩展点。不得引入 runner factory / registry、lazy import、
+  兼容 wrapper 或 metadata bag 作为解耦替代品。
 
 #### Engine Context Compaction Event 语义前置
 
@@ -1930,6 +2032,24 @@ P9.5 收口清单：
 - 当前无 PR review blocking fix。
 
 ## 历史记录
+
+### 2026-05-17 P9.5 design discussion accepted
+
+P9.5 Pre-P10 Cross-Repository Hardening PR design discussion 已完成，设计讨论结果已写入 `dayu/README.md`、
+`docs/design.md` 与本文档。已确认的 P9.5 scope 包含 Engine runner protocol decoupling、minimal read model
+single-consumer reset contract、durable / public API error taxonomy、Command handle internal service encapsulation /
+lifecycle guard、LocalProxy close / events race、read API enum mapping、ToolRuntime / memory boundary cleanup、runtime
+lane hardening、message / tool result size governance、Host durable helper API tightening、schema CHECK hardening、Engine /
+OpenAI runner / parser hardening、Engine / Host necessary log by level semantics、Contract Ownership conformance audit、
+P9 memory cleanup / test hardening，以及不触及 snapshot history 保留模型的 production memory projection catch-up
+composition wiring。
+
+用户已确认关键裁决：Engine runner 不做 factory / registry，只做 Agent 主链路消费 `AsyncRunner` protocol；minimal read
+model 维持 single-consumer reset contract，不引入 multi-consumer schema；Command handle 内部 service 不暴露给 Service /
+UI 或测试；工具定义与执行边界按 `docs/design.md` 写入 Contract Ownership audit 检查点。
+
+当前 gate 为 P9.5 accepted design discussion commit；commit 后进入 P9.5 implementation-ready handoff plan。plan 必须先经
+AgentMiMo / AgentDS 双路 plan review 与 controller adjudication 通过，才可派发 implementation。
 
 ### 2026-05-17 P9 draft PR review accepted
 

@@ -163,12 +163,12 @@ Dayu 的日志用于诊断系统执行过程，不承担 UI 输出职责。面�
 
 | 级别 | 用途 |
 | --- | --- |
-| `DEBUG` | 看清执行细节。用于 Engine / Runner 的有界策略分支、事件分类、计数、finish reason、usage token、retry 判断等诊断信息。不得输出大 prompt、大 tool result、delta 全量、provider secret 或大段响应。 |
-| `VERBOSE` | 看清执行路径。用于 Engine run 开始 / 结束、iteration 边界、Runner 调用开始 / 结束、tool loop 进入 / 退出、fallback / continuation 与 terminal 产出等骨架日志。它应比 `DEBUG` 更安静，适合人工跟踪一次 run 的主路径。 |
-| `INFO` | 汇报重要信息。用于进程启动、smoke 摘要、run finished 摘要等调用方或运维人员需要知道的非异常信息。生产默认 `INFO` 应保持克制。 |
-| `WARN` | 汇报可恢复异常。用于 provider 临时失败后 retry、可降级协议差异等需要关注但本次执行仍可继续的情况。 |
-| `ERROR` | 汇报本次操作失败。用于 Engine run failed、provider 协议错误导致执行失败等。 |
-| `CRITICAL` | 汇报系统 invariant / contract 被破坏。用于按设计绝不应发生的断言级事件，例如 EngineEvent stream 结束但没有 terminal event。 |
+| `DEBUG` | 看清执行细节。用于 Engine / Runner 的有界策略分支、事件分类、计数、finish reason、usage token、retry 判断，以及 Host command / dispatch / ingest / projection / ToolRuntime / wait adapter 的受控分支、CAS 结果、cursor、计数和 diagnostic refs。不得输出大 prompt、大 tool result、delta 全量、provider secret、完整业务 payload 或大段响应。 |
+| `VERBOSE` | 看清执行路径。用于 Engine run 开始 / 结束、iteration 边界、Runner 调用开始 / 结束、tool loop 进入 / 退出、fallback / continuation 与 terminal 产出，以及 Host command accepted / committed、dispatch 状态推进、WorkerProxy accept、EngineEvent ingest、terminal closeout、projection catch-up、wait resolve 等骨架日志。它应比 `DEBUG` 更安静，适合人工跟踪一次 run 的主路径。 |
+| `INFO` | 汇报重要信息。用于进程启动、Host handle / scheduler 启停、smoke 摘要、run finished 摘要等调用方或运维人员需要知道的非异常信息。生产默认 `INFO` 应保持克制。 |
+| `WARN` | 汇报可恢复异常。用于 provider 临时失败后 retry、可降级协议差异、Host projection catch-up 失败但 command 已提交、wait adapter 单条 observation 失败、worker startup / closeout 可诊断失败等需要关注但不破坏 Host truth 的情况。 |
+| `ERROR` | 汇报本次操作失败。用于 Engine run failed、provider 协议错误导致执行失败、Host command 无法完成、dispatch / worker 本次执行失败、projection repair 明确失败等。 |
+| `CRITICAL` | 汇报系统 invariant / contract 被破坏。用于按设计绝不应发生的断言级事件，例如 EngineEvent stream 结束但没有 terminal event、Host canonical owner 边界被破坏、EventLog / state index 不一致、ToolRuntime accept barrier 被绕过等。 |
 
 `dayu.runtime.log_levels` 是层中立日志 level 数值真源，统一定义 Dayu 使用的标准级别整数常量与 `VERBOSE=15` 数值；该模块无装配副作用，不注册 stdlib level name、不安装 handler、不读取配置。
 
@@ -178,13 +178,23 @@ Dayu 的日志用于诊断系统执行过程，不承担 UI 输出职责。面�
 
 - Engine 负责记录自身状态机路径：run 开始、iteration 边界、Runner 调用、Runner event 分类后的关键决策、tool loop、fallback、continuation、terminal。
 - Runner / provider 层负责记录传输诊断信息：HTTP attempt、响应状态、provider request id、retry / backoff、SSE idle heartbeat / timeout 等。
-- Engine / Runner 日志不得泄漏 provider secret、完整 prompt、完整工具参数、完整工具结果、delta 全量或大段响应。
+- Host 负责记录治理路径：public command validation / accepted / committed、EventLog append 与 canonical owner 决策、dispatch record 状态推进、lane acquire / release 结果、WorkerProxy accept / close、EngineEvent ingest 分类、Run / Attempt terminal closeout、ToolRuntime accept barrier、wait resolve / late rejection、projection catch-up / repair 和 after-commit wakeup。
+- Host projection / sink / wait adapter 日志只表达 projection-local 或 adapter-local 观测，不得让日志成为事实真源；projection / sink / adapter 失败不能通过日志反向改变 EventLog、Run / Attempt 或 wait record 状态。
+- Engine / Runner / Host 日志不得泄漏 provider secret、完整 prompt、完整工具参数、完整工具结果、delta 全量、财报原文、大 payload、authorization claims 原文或大段响应。需要关联大对象时只记录 typed ref、digest、event id、event sequence、payload ref、tool call id 或 policy / diagnostic ref。
+- 日志不是 public API，不承担 UI 输出、审计真源、tool trace 热 / 冷数据、EventLog canonical fact 或 projection checkpoint 职责。需要稳定查询、审计、恢复或投递的事实必须进入对应 typed EventLog / projection / audit / tool trace 机制。
 
 日志字段命名统一使用以下词汇：
 
 - `run_id`：一次 Engine run 标识。
+- `session_id`：Host Session 标识。
+- `attempt_id` / `execution_id`：Host 当前 Attempt 与执行 epoch；用于判断事件是否属于当前 active attempt。
+- `event_id` / `event_sequence`：Host EventLog 事件标识与全局 cursor。
+- `dispatch_record_id` / `dispatch_status`：Host dispatch record 诊断标识与状态。
+- `wait_id` / `adapter_key`：Host wait record 与 wait adapter 诊断标识。
 - `iteration_id` / `iteration_index`：Engine 内一次模型调用与后续决策循环。
 - `provider` / `request_id`：Runner / provider 传输诊断标识。
+- `tool_call_id` / `tool_name`：工具调用诊断标识；日志只记录工具名、调用 id、digest 或 refs，不记录完整参数 / 结果。
+- `consumer_id` / `cursor`：projection / sink consumer 与 checkpoint / catch-up cursor。
 
 ## Contract Ownership
 
