@@ -223,8 +223,8 @@ Phase Map 中每个 phase 必须使用统一条目格式。模板如下：
 约束：本节只保留当前 gate 结论；phase 过程流水必须归档到 `历史记录`，仍需追踪的风险或后续 owner 必须写入 `Open Questions 与风险追踪` 的 `追踪区`。
 
 当前 work unit：P9.5 Pre-P10 Cross-Repository Hardening PR。
-当前 gate：ready-to-open-draft-PR。
-下一 gate：draft PR create / draft PR validation。
+当前 gate：draft-PR-pass。
+下一 gate：用户手工 review / merge decision。
 
 ## Phase Map
 
@@ -2032,6 +2032,20 @@ P9.5 收口清单：
 - 当前无 PR review blocking fix。
 
 ## 历史记录
+
+### 2026-05-17 P9.5 draft PR gate passed
+
+P9.5 draft PR gate 已完成。Branch `p9.5-pre-p10-hardening` 已 push 到 GitHub，draft PR 60 已创建：
+`https://github.com/noho/dayu-agent-r/pull/60`，title 为 `P9.5 Pre-P10 cross-repository hardening`，head branch 为
+`p9.5-pre-p10-hardening`，base branch 为 `main`。PR state 为 open draft；`mergeStateStatus=CLEAN`，`mergeable=MERGEABLE`。
+GitHub checks 当前返回 no checks reported on the branch。
+
+PR review artifacts 为 `docs/reviews/pr-60-review-p9-5-mimo-20260517.md` 与
+`docs/reviews/pr-60-review-p9-5-ds-20260517.md`；两份 review 均 PASS，0 blocking / high / medium / low finding。
+Controller PR review adjudication artifact 为 `docs/reviews/pr-60-review-controller-adjudication-20260517.md`。Accepted PR
+review commit 为 `7f9bf67`。PR gate validation 继承 aggregate gate：`pytest -q` 1068 passed；
+`python -m pyright dayu tests` 0 errors / 0 warnings / 0 informations；`git diff --check` clean。当前 gate 为
+`draft-PR-pass`。后续 merge、mark ready for review、request reviewers、approve、delete branch 或对外 comment 仍需用户额外授权。
 
 ### 2026-05-17 P9.5 aggregate deepreview accepted
 
