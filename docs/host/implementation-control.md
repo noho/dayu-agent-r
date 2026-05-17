@@ -223,8 +223,8 @@ Phase Map 中每个 phase 必须使用统一条目格式。模板如下：
 约束：本节只保留当前 gate 结论；phase 过程流水必须归档到 `历史记录`，仍需追踪的风险或后续 owner 必须写入 `Open Questions 与风险追踪` 的 `追踪区`。
 
 当前 work unit：P9.5 Pre-P10 Cross-Repository Hardening PR。
-当前 gate：P9.5 S15 Engine / Host Necessary Logs By Level implementation。
-下一 gate：P9.5 S15 code review。
+当前 gate：P9.5 S16 Contract Ownership Audit And Import/Public Surface Fixes implementation。
+下一 gate：P9.5 S16 code review。
 
 ## Phase Map
 
@@ -2032,6 +2032,31 @@ P9.5 收口清单：
 - 当前无 PR review blocking fix。
 
 ## 历史记录
+
+### 2026-05-17 P9.5 S15 Engine / Host Necessary Logs By Level accepted
+
+P9.5 S15 Engine / Host Necessary Logs By Level 已完成。Implementation artifact 为
+`docs/reviews/p9-5-s15-necessary-logs-implementation-20260517.md`。Code review /
+controller adjudication artifacts 为 `docs/reviews/p9-5-s15-code-review-mimo-20260517.md`、
+`docs/reviews/p9-5-s15-code-review-ds-20260517.md` 与
+`docs/reviews/p9-5-s15-code-review-controller-adjudication-20260517.md`。
+
+Controller 裁决：AgentDS review 为 PASS，0 blocking findings；AgentMiMo 的 Engine / dispatch scope gap
+finding 不作为 blocking 接受。S15 plan 明确要求先审计现有日志并只补必要日志，Engine agent 与 OpenAI
+runner 已有 run / iteration / runner call / tool loop / terminal、provider protocol、idle / cancellation 等
+日志覆盖，当前没有直接证据表明还存在必要缺口；机械修改 Engine 会增加日志噪音与敏感字段回归面。Host
+侧补齐 public command accepted / committed、admission committed、EngineEvent ingest accepted / committed、
+LocalProxy accept / event stream opened / close、ToolRuntime accept barrier、awaiting accept、resolve_wait、
+memory projection catch-up / repair 等已实现路径日志；projection catch-up failure 从 error/exception 语义校准为
+recoverable `WARNING`，只记录 `error_type`，不输出 exception message 或 traceback。新增 caplog 测试覆盖
+command、LocalProxy、memory catch-up、resolve_wait、ToolRuntime accept 与 projection catch-up warning 级别 /
+字段 / 脱敏。S15 未新增 audit / tool trace / outbox sink，日志仍不作为 truth、public API、projection
+checkpoint 或恢复输入。README 未更新：现有 `dayu/README.md` 日志级别语义、字段词汇、脱敏与“日志非真源”
+说明仍准确，本次只实现既有规则。验证通过：5 条 logging focused tests passed；293 条
+Engine/Host logging / diagnostics / dispatch / ingest / projection / toolruntime 选择集 passed；163 条 touched
+Host subset passed；`pytest tests/host` 为 559 passed；`python -m pyright dayu tests` 为 0 errors /
+0 warnings / 0 informations；`git diff --check` clean。Accepted slice commit 为 `743bd30`。当前 gate 为
+P9.5 S16 Contract Ownership Audit And Import/Public Surface Fixes implementation。
 
 ### 2026-05-17 P9.5 S14 P9 Memory Cleanup And Production Catch-Up Wiring accepted
 
