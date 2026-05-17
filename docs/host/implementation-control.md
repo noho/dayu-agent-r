@@ -220,8 +220,8 @@ Phase Map 中每个 phase 必须使用统一条目格式。模板如下：
 
 ## 当前状态
 
-P9-S4 `Projection Repair / Rebuild Entry and Diagnostics` completed；accepted slice commit 为 `1d30725`。当前 gate 为 P9
-aggregate deepreview。
+P9 aggregate deepreview completed，verdict 为 PASS，remaining blocking findings 为 0。当前 gate 为 ready-to-open-draft-PR；
+用户已授权进入 draft PR gate。
 
 约束：本节只保留当前 gate 结论；phase 过程流水必须归档到 `历史记录`，仍需追踪的风险或后续 owner 必须写入 `Open Questions 与风险追踪` 的 `追踪区`。
 
@@ -814,6 +814,7 @@ Phase 按依赖关系推进：先实现被其它阶段依赖的公共契约、ru
 - P9-S2 `Projection Consumer and Stable Layer Builder` completed；accepted slice commit 为 `4f35da6`。
 - P9-S3 `RunInputBuilder MemorySnapshotProvider and Lag Fallback` completed；accepted slice commit 为 `b416d37`。
 - P9-S4 `Projection Repair / Rebuild Entry and Diagnostics` completed；accepted slice commit 为 `1d30725`。
+- P9 aggregate deepreview completed；verdict 为 PASS；accepted deepreview commit 待记录。
 
 目标：
 - 实现 session-level Conversation Memory projection、stable layer、history pool、snapshot cursor、RunInputBuilder memory provider 与 projection repair path。
@@ -1669,7 +1670,48 @@ Phase 按依赖关系推进：先实现被其它阶段依赖的公共契约、ru
   truth，归后续 Host hardening cleanup。
 - Heavy sink / batch runner、per-session repair filter 与 Audit / Tool Trace / Outbox concrete sinks 仍归 Phase 13 / Phase 15。
 
+#### Phase 9 aggregate deepreview 追踪
+
+结论：
+
+- P9 aggregate deepreview 已完成，review 范围为 `f27ce8a..1b19b35` 的 Phase 9 plan、implementation、docs 与历史 slice
+  裁决。
+- Aggregate review artifacts 为 `docs/reviews/p9-aggregate-deepreview-mimo-20260517.md` 与
+  `docs/reviews/p9-aggregate-deepreview-ds-20260517.md`。
+- Controller adjudication artifact 为 `docs/reviews/p9-aggregate-deepreview-controller-adjudication-20260517.md`。
+- Verdict：AgentMiMo PASS，AgentDS PASS，remaining blocking findings 为 0。
+- Accepted deepreview commit 待记录。
+
+验证：
+
+- P9-S4 final validation：129 focused Host tests passed；`pyright dayu/host tests/host` 0 errors；`git diff --check` 通过。
+- AgentMiMo 额外验证：memory / run_input / durable schema subset 63 passed；memory / run_input / projection pyright subset 0 errors。
+- AgentDS 额外验证：手动验证 memory import boundary 与 weak typing discipline，无 blocking finding。
+
+追踪项：
+
+- `MemoryIncludedReason` / `MemoryExcludedReason` 粒度低于 plan 规格、unsupported event diagnostic reason 与 per-item
+  excluded reason 精度，owner 为 Phase 10 / Tool Trace / schema hardening。
+- `WorkingAssumptionView` 暂无主动数据填充路径，owner 为 Phase 10 proactive compaction / issue 39 retrieval。
+- `current_goal` first-write-wins、`SessionContinuityProvider` snapshot 参数清理、preview facts exclusion 专项测试、memory import
+  boundary 自动化测试与 catch-up end-to-end 专项测试，owner 为 Host hardening。
+- production concrete memory catch-up port 注入，owner 为后续 Host / Service composition wiring。
+- Synchronous best-effort catch-up 的 batch 化与性能治理，owner 为 Phase 13 / Phase 15。
+
 ## 历史记录
+
+### 2026-05-17 P9 aggregate deepreview accepted
+
+P9 aggregate deepreview 已完成。AgentMiMo artifact 为
+`docs/reviews/p9-aggregate-deepreview-mimo-20260517.md`，AgentDS artifact 为
+`docs/reviews/p9-aggregate-deepreview-ds-20260517.md`。Controller adjudication artifact 为
+`docs/reviews/p9-aggregate-deepreview-controller-adjudication-20260517.md`。
+
+Verdict：AgentMiMo PASS，AgentDS PASS，remaining blocking findings 为 0。Controller 接受 aggregate deepreview 为
+Phase 9 exit gate；non-blocking findings 已写入 Phase 9 aggregate deepreview 追踪项并分配 owner。当前 gate 为
+ready-to-open-draft-PR；用户已授权进入 draft PR gate。
+
+Accepted deepreview commit 待记录。
 
 ### 2026-05-17 P9-S4 code review accepted
 
