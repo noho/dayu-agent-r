@@ -220,8 +220,8 @@ Phase Map 中每个 phase 必须使用统一条目格式。模板如下：
 
 ## 当前状态
 
-Phase 9 draft PR 已创建：PR 59 https://github.com/noho/dayu-agent-r/pull/59。PR review gate completed，verdict 为
-PASS，remaining blocking findings 为 0。当前 gate 为 accepted PR review commit。
+Phase 9 draft PR 已创建：PR 59 https://github.com/noho/dayu-agent-r/pull/59。Accepted PR review commit 为 `67458cb`。
+当前 gate 为 draft-PR-pass。
 
 约束：本节只保留当前 gate 结论；phase 过程流水必须归档到 `历史记录`，仍需追踪的风险或后续 owner 必须写入 `Open Questions 与风险追踪` 的 `追踪区`。
 
@@ -816,7 +816,7 @@ Phase 按依赖关系推进：先实现被其它阶段依赖的公共契约、ru
 - P9-S4 `Projection Repair / Rebuild Entry and Diagnostics` completed；accepted slice commit 为 `1d30725`。
 - P9 aggregate deepreview completed；verdict 为 PASS；accepted deepreview commit 为 `cc05f79`。
 - P9 draft PR created：PR 59 https://github.com/noho/dayu-agent-r/pull/59；PR review gate completed，verdict 为 PASS；
-  accepted PR review commit 待记录。
+  accepted PR review commit 为 `67458cb`。
 
 目标：
 - 实现 session-level Conversation Memory projection、stable layer、history pool、snapshot cursor、RunInputBuilder memory provider 与 projection repair path。
@@ -1710,7 +1710,7 @@ Phase 按依赖关系推进：先实现被其它阶段依赖的公共契约、ru
 - Controller PR review adjudication artifact 为 `docs/reviews/p9-pr-review-controller-adjudication-20260517.md`。
 - Verdict：AgentMiMo PASS，AgentDS PASS，remaining blocking findings 为 0。
 - GitHub 当前未上报 checks；本地 final validation 与 PR review gate 均通过。
-- Accepted PR review commit 待记录。
+- Accepted PR review commit 为 `67458cb`。
 
 追踪项：
 
@@ -1729,7 +1729,7 @@ AgentMiMo artifact 为 `docs/reviews/p9-pr-review-mimo-20260517.md`，AgentDS ar
 Verdict：AgentMiMo PASS，AgentDS PASS，remaining blocking findings 为 0。PR review 未发现 release-blocking issue；
 当前 GitHub 未上报 checks。
 
-Accepted PR review commit 待记录。
+Accepted PR review commit 为 `67458cb`。当前 gate 为 draft-PR-pass。
 
 ### 2026-05-17 P9 aggregate deepreview accepted
 
