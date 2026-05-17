@@ -83,6 +83,7 @@ from dayu.host.waiting import (
     ToolAwaitingAcceptCandidate,
     ToolAwaitingAcceptedAck,
 )
+from dayu.runtime.log_levels import VERBOSE_LOG_LEVEL
 
 _NOW = datetime(2026, 5, 16, 1, 2, 3, tzinfo=UTC)
 _OBSERVED = datetime(2026, 5, 16, 1, 5, 7, tzinfo=UTC)
@@ -214,6 +215,37 @@ def test_resolve_wait_committed_tool_fact_catches_up_memory(
                 _events(host._transaction_runner()), "TOOL_RESULT_ACCEPTED"
             )
         }
+    finally:
+        host.close()
+
+
+def test_resolve_wait_logs_ids_without_result_payload(
+    tmp_path: Path, caplog: pytest.LogCaptureFixture
+) -> None:
+    """resolve_wait 日志记录 wait / run ids，不记录 result payload。
+
+    :param tmp_path: pytest 临时目录。
+    :param caplog: pytest 日志捕获夹具。
+    :returns: ``None``。
+    :raises AssertionError: 日志缺少字段或泄漏 result payload 时抛出。
+    """
+
+    host = create_host_command_handle(_options(tmp_path))
+    try:
+        seeded = _seed_waiting_run(host)
+
+        with caplog.at_level(VERBOSE_LOG_LEVEL, logger="dayu.host.waiting"):
+            snapshot = resolve_wait(
+                host, seeded.wait_id, _completed_request("resolve-logging")
+            )
+
+        assert snapshot.status is RunStatus.RUNNING
+        assert "host.waiting.resolve_wait.accepted" in caplog.text
+        assert "host.waiting.resolve_wait.committed" in caplog.text
+        assert seeded.wait_id in caplog.text
+        assert seeded.run_id in caplog.text
+        assert '"answer": 42' not in caplog.text
+        assert "result" not in caplog.text
     finally:
         host.close()
 

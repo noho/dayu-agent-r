@@ -63,6 +63,7 @@ from dayu.host.tool_runtime import (
     ToolPolicyDecision,
     ToolPolicyDecisionKind,
 )
+from dayu.runtime.log_levels import VERBOSE_LOG_LEVEL
 
 _NOW = datetime(2026, 5, 15, 1, 2, 3, tzinfo=UTC)
 _CALL_CONTEXT_DIGEST = sha256_digest_json({"context": "tool-accept-test"})
@@ -137,7 +138,7 @@ def test_tool_fact_accept_survives_projection_catchup_failure(
             projection_catchup_port=projection,
         )
 
-        with caplog.at_level("ERROR", logger="dayu.host.projection"):
+        with caplog.at_level("WARNING", logger="dayu.host.projection"):
             result = accept_port.accept_tool_fact(
                 _completed_candidate(seeded, tool_call_id="tool-call-catchup")
             )
@@ -150,6 +151,40 @@ def test_tool_fact_accept_survives_projection_catchup_failure(
             "TOOL_RESULT_ACCEPTED",
         ]
         assert "projection catch-up failed; continuing" in caplog.text
+        assert all(record.levelname == "WARNING" for record in caplog.records)
+
+
+def test_tool_fact_accept_logs_ids_without_tool_payload(
+    tmp_path: Path, caplog: pytest.LogCaptureFixture
+) -> None:
+    """工具事实 accept 日志记录 ids / refs，不记录工具结果 payload。
+
+    :param tmp_path: pytest 临时目录。
+    :param caplog: pytest 日志捕获夹具。
+    :returns: ``None``。
+    :raises AssertionError: 日志缺少字段或泄漏 payload 时抛出。
+    """
+
+    with open_host_durable_store(_options(tmp_path)) as store:
+        seeded = _seed_active_run(store.transaction_runner)
+        accept_port = DefaultHostToolFactAcceptPort(
+            transaction_runner=store.transaction_runner
+        )
+
+        with caplog.at_level(VERBOSE_LOG_LEVEL, logger="dayu.host.tool_runtime"):
+            result = accept_port.accept_tool_fact(
+                _completed_candidate(seeded, tool_call_id="tool-call-logging")
+            )
+
+        assert isinstance(result, ToolFactAcceptedAck)
+        assert "host.tool_runtime.accept_tool_fact.accepted" in caplog.text
+        assert "host.tool_runtime.accept_tool_fact.committed" in caplog.text
+        assert seeded.run_id in caplog.text
+        assert seeded.attempt_id in caplog.text
+        assert "tool_call_id=tool-call-logging" in caplog.text
+        assert "tool_name=lookup" in caplog.text
+        assert "{\"outcome\":" not in caplog.text
+        assert "{\"payload\":" not in caplog.text
 
 
 def test_tool_fact_accept_concrete_memory_catchup_projects_verified_fact(

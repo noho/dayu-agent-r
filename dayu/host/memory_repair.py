@@ -8,6 +8,7 @@ transaction runner；不追加 EventLog，不修改 Run / Attempt / wait / dispa
 
 from __future__ import annotations
 
+import logging
 from dataclasses import dataclass
 
 from dayu.host.durable.errors import HostDurableError
@@ -21,9 +22,11 @@ from dayu.host.memory import (
     MemoryProjectionPolicy,
 )
 from dayu.host.projection import ProjectionConsumerId, ProjectionRunner
+from dayu.runtime.log_levels import VERBOSE_LOG_LEVEL
 
 _MIN_REPAIR_BATCH_SIZE = 1
 _INITIAL_CURSOR = 0
+_LOGGER = logging.getLogger(__name__)
 
 
 @dataclass(frozen=True, slots=True)
@@ -124,19 +127,27 @@ def rebuild_conversation_memory_projection(
 
     _validate_batch_size(batch_size)
     projection_consumer_id = ProjectionConsumerId(consumer_id)
+    _LOGGER.log(
+        VERBOSE_LOG_LEVEL,
+        "host.memory_repair.rebuild.start consumer_id=%s batch_size=%s",
+        projection_consumer_id.value,
+        batch_size,
+    )
     transaction_runner.run_write(
         lambda transaction: reset_conversation_memory_projection(
             transaction,
             consumer_id=projection_consumer_id.value,
         )
     )
-    return _run_memory_projection_until_idle(
+    result = _run_memory_projection_until_idle(
         transaction_runner,
         policy=policy,
         batch_size=batch_size,
         consumer_id=projection_consumer_id,
         reset_checkpoint=True,
     )
+    _log_memory_projection_result("rebuild", result)
+    return result
 
 
 def catch_up_conversation_memory_projection(
@@ -164,14 +175,27 @@ def catch_up_conversation_memory_projection(
     """
 
     _validate_batch_size(batch_size)
-    return _run_memory_projection_until_idle(
+    projection_consumer_id = ProjectionConsumerId(consumer_id)
+    _LOGGER.log(
+        VERBOSE_LOG_LEVEL,
+        (
+            "host.memory_repair.catch_up.start consumer_id=%s "
+            "batch_size=%s max_event_sequence=%s"
+        ),
+        projection_consumer_id.value,
+        batch_size,
+        max_event_sequence,
+    )
+    result = _run_memory_projection_until_idle(
         transaction_runner,
         policy=policy,
         batch_size=batch_size,
-        consumer_id=ProjectionConsumerId(consumer_id),
+        consumer_id=projection_consumer_id,
         reset_checkpoint=False,
         max_event_sequence=max_event_sequence,
     )
+    _log_memory_projection_result("catch_up", result)
+    return result
 
 
 def _run_memory_projection_until_idle(
@@ -238,6 +262,52 @@ def _run_memory_projection_until_idle(
         events_applied=events_applied,
         duplicates=duplicates,
         failures=failures,
+    )
+
+
+def _log_memory_projection_result(
+    operation: str, result: ConversationMemoryProjectionRepairResult
+) -> None:
+    """记录 memory projection repair / catch-up 汇总。
+
+    :param operation: ``rebuild`` 或 ``catch_up`` 操作名称。
+    :param result: projection runner 汇总结果。
+    :returns: ``None``。
+    """
+
+    if result.failures > 0:
+        _LOGGER.warning(
+            (
+                "host.memory_repair.%s.failed consumer_id=%s "
+                "started_cursor=%s finished_cursor=%s events_scanned=%s "
+                "events_matched=%s events_applied=%s duplicates=%s failures=%s"
+            ),
+            operation,
+            result.consumer_id.value,
+            result.started_cursor,
+            result.finished_cursor,
+            result.events_scanned,
+            result.events_matched,
+            result.events_applied,
+            result.duplicates,
+            result.failures,
+        )
+        return
+    _LOGGER.log(
+        VERBOSE_LOG_LEVEL,
+        (
+            "host.memory_repair.%s.committed consumer_id=%s "
+            "started_cursor=%s finished_cursor=%s events_scanned=%s "
+            "events_matched=%s events_applied=%s duplicates=%s"
+        ),
+        operation,
+        result.consumer_id.value,
+        result.started_cursor,
+        result.finished_cursor,
+        result.events_scanned,
+        result.events_matched,
+        result.events_applied,
+        result.duplicates,
     )
 
 

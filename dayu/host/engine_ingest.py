@@ -10,6 +10,7 @@ Host Attempt identity；attempt / execution / dispatch identity 只来自
 from __future__ import annotations
 
 import json
+import logging
 from collections.abc import Mapping
 from dataclasses import dataclass
 from datetime import UTC, datetime
@@ -92,7 +93,9 @@ from dayu.host._event_payload import (
     required_payload_text as _required_payload_text,
 )
 from dayu.host.durable.transaction import HostTransaction, HostTransactionRunner
+from dayu.runtime.log_levels import VERBOSE_LOG_LEVEL
 
+_LOGGER = logging.getLogger(__name__)
 _EVENT_SOURCE = "host.engine_ingest"
 _EVENT_ACTOR = "host.engine_ingest"
 _EVENT_ID_PREFIX = "event-engine-"
@@ -298,6 +301,20 @@ class EngineEventIngestor:
         """
 
         _validate_candidate_shape(candidate)
+        _LOGGER.log(
+            VERBOSE_LOG_LEVEL,
+            (
+                "host.engine_ingest.accepted session_id=%s run_id=%s "
+                "attempt_id=%s execution_id=%s worker_event_index=%s "
+                "engine_event_type=%s"
+            ),
+            candidate.envelope.session_id,
+            candidate.envelope.run_id,
+            candidate.envelope.attempt_id,
+            candidate.envelope.execution_id,
+            candidate.worker_event_index,
+            candidate.engine_event.type.value,
+        )
 
         def _operation(transaction: HostTransaction) -> EngineIngestResult:
             context = self._validate_durable_context(transaction, candidate)
@@ -320,10 +337,31 @@ class EngineEventIngestor:
             return self._ingest_validated(transaction, context)
 
         result = self._transaction_runner.run_write(_operation)
-        return self._with_terminal_promotion_retry(
+        promoted = self._with_terminal_promotion_retry(
             result,
             session_id=candidate.envelope.session_id,
         )
+        _LOGGER.log(
+            VERBOSE_LOG_LEVEL,
+            (
+                "host.engine_ingest.committed session_id=%s run_id=%s "
+                "attempt_id=%s execution_id=%s worker_event_index=%s "
+                "engine_event_type=%s ingest_status=%s event_count=%s "
+                "terminal_closeout=%s promotion_triggered=%s reason=%s"
+            ),
+            candidate.envelope.session_id,
+            candidate.envelope.run_id,
+            candidate.envelope.attempt_id,
+            candidate.envelope.execution_id,
+            candidate.worker_event_index,
+            candidate.engine_event.type.value,
+            promoted.status.value,
+            len(promoted.events),
+            promoted.terminal_closeout,
+            promoted.promotion_triggered,
+            promoted.reason,
+        )
+        return promoted
 
     def _duplicate_terminal_result(
         self, transaction: HostTransaction, context: _ValidatedCandidate

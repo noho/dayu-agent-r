@@ -13,6 +13,7 @@ from __future__ import annotations
 
 import asyncio
 import base64
+import logging
 import secrets
 import time
 from collections.abc import Mapping
@@ -135,7 +136,9 @@ from dayu.host.waiting import (
     ToolAwaitingRejectedAck,
     build_tool_awaiting_accept_identity_digest,
 )
+from dayu.runtime.log_levels import VERBOSE_LOG_LEVEL
 
+_LOGGER = logging.getLogger(__name__)
 _UNSUPPORTED_EXECUTOR_ERROR = "tool_runtime_not_connected"
 _UNSUPPORTED_EXECUTOR_MESSAGE = (
     "ToolRuntime executor is not connected in Phase 6 S1"
@@ -1932,11 +1935,27 @@ class DefaultHostToolFactAcceptPort:
         """
 
         try:
+            _LOGGER.log(
+                VERBOSE_LOG_LEVEL,
+                (
+                    "host.tool_runtime.accept_tool_fact.accepted "
+                    "session_id=%s run_id=%s attempt_id=%s execution_id=%s "
+                    "tool_call_id=%s tool_name=%s tool_fact_kind=%s"
+                ),
+                candidate.session_id,
+                candidate.run_id,
+                candidate.attempt_id,
+                candidate.execution_id,
+                candidate.tool_call_id,
+                candidate.tool_name,
+                candidate.tool_fact_kind.value,
+            )
             result = self._transaction_runner.run_write(
                 lambda transaction: self._accept_in_transaction(
                     transaction, candidate
                 )
             )
+            _log_tool_fact_accept_result(candidate, result)
             if (
                 isinstance(result, ToolFactAcceptedAck)
                 and result.tool_result_event_ref is not None
@@ -1944,19 +1963,23 @@ class DefaultHostToolFactAcceptPort:
                 catch_up_projection_best_effort(self._projection_catchup_port)
             return result
         except HostIdempotencyConflictError:
-            return _rejected_ack(
+            result = _rejected_ack(
                 candidate,
                 ToolAcceptRejectReason.IDEMPOTENCY_CONFLICT,
                 "tool fact accept idempotency conflict",
                 retryable=False,
             )
+            _log_tool_fact_accept_result(candidate, result)
+            return result
         except HostPayloadReferenceError:
-            return _rejected_ack(
+            result = _rejected_ack(
                 candidate,
                 ToolAcceptRejectReason.PAYLOAD_REFERENCE_INVALID,
                 "tool fact payload reference is invalid",
                 retryable=False,
             )
+            _log_tool_fact_accept_result(candidate, result)
+            return result
 
     def _accept_in_transaction(
         self, transaction: HostTransaction, candidate: ToolFactAcceptCandidate
@@ -3092,6 +3115,73 @@ class _ToolAcceptEventPlan:
     requested_id: str
     governed_id: str
     result_id: str
+
+
+def _log_tool_fact_accept_result(
+    candidate: ToolFactAcceptCandidate, result: ToolFactAcceptResult
+) -> None:
+    """记录工具事实 accept barrier 的有界结果。
+
+    :param candidate: 工具事实候选。
+    :param result: accept barrier 结果。
+    :returns: ``None``。
+    """
+
+    if isinstance(result, ToolFactAcceptedAck):
+        _LOGGER.log(
+            VERBOSE_LOG_LEVEL,
+            (
+                "host.tool_runtime.accept_tool_fact.committed "
+                "session_id=%s run_id=%s attempt_id=%s execution_id=%s "
+                "tool_call_id=%s tool_name=%s tool_fact_kind=%s "
+                "tool_fact_id=%s tool_result_event_id=%s accepted_event_count=%s"
+            ),
+            candidate.session_id,
+            candidate.run_id,
+            candidate.attempt_id,
+            candidate.execution_id,
+            candidate.tool_call_id,
+            candidate.tool_name,
+            candidate.tool_fact_kind.value,
+            result.tool_fact_id,
+            None
+            if result.tool_result_event_ref is None
+            else result.tool_result_event_ref.event_id,
+            len(result.accepted_event_refs),
+        )
+        return
+    if isinstance(result, ToolFactRejectedAck):
+        _LOGGER.debug(
+            (
+                "host.tool_runtime.accept_tool_fact.rejected "
+                "session_id=%s run_id=%s attempt_id=%s execution_id=%s "
+                "tool_call_id=%s tool_name=%s reason=%s retryable=%s"
+            ),
+            candidate.session_id,
+            candidate.run_id,
+            candidate.attempt_id,
+            candidate.execution_id,
+            candidate.tool_call_id,
+            candidate.tool_name,
+            result.reason_code.value,
+            result.retryable,
+        )
+        return
+    _LOGGER.debug(
+        (
+            "host.tool_runtime.accept_tool_fact.timed_out "
+            "session_id=%s run_id=%s attempt_id=%s execution_id=%s "
+            "tool_call_id=%s tool_name=%s attempt_count=%s last_error_code=%s"
+        ),
+        candidate.session_id,
+        candidate.run_id,
+        candidate.attempt_id,
+        candidate.execution_id,
+        candidate.tool_call_id,
+        candidate.tool_name,
+        result.attempt_count,
+        result.last_error_code,
+    )
 
 
 def _accept_idempotency_scope(candidate: ToolFactAcceptCandidate) -> IdempotencyScope:

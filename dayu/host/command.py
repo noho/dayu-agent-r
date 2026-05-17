@@ -8,6 +8,7 @@ supervisor，不实现 Engine dispatch、EventLog stream 或 purge。
 
 from __future__ import annotations
 
+import logging
 from dataclasses import dataclass
 from typing import NoReturn
 from uuid import uuid4
@@ -92,8 +93,10 @@ from dayu.host.dispatch import (
     ActiveWorkerRegistry,
 )
 from dayu.host.waiting import DefaultHostResolveWaitService
+from dayu.runtime.log_levels import VERBOSE_LOG_LEVEL
 
 _GENERATED_HANDLE_ID_PREFIX = "host-command"
+_LOGGER = logging.getLogger(__name__)
 _OPERATION_CREATE_SESSION = "create_session"
 _OPERATION_CLOSE_SESSION = "close_session"
 _OPERATION_START_RUN = "start_run"
@@ -351,6 +354,11 @@ def start_run(host: HostCommandHandle, request: StartRunRequest) -> RunSnapshot:
     """
 
     host._raise_if_closed()
+    _LOGGER.log(
+        VERBOSE_LOG_LEVEL,
+        "host.command.accepted operation=start_run session_id=%s",
+        request.session_id,
+    )
     try:
         result = host._admission_service.start_run(
             request,
@@ -358,6 +366,17 @@ def start_run(host: HostCommandHandle, request: StartRunRequest) -> RunSnapshot:
         )
     except HostDurableError as exc:
         raise _host_api_error_from_durable_error(exc) from exc
+    _LOGGER.log(
+        VERBOSE_LOG_LEVEL,
+        (
+            "host.command.committed operation=start_run session_id=%s "
+            "run_id=%s run_status=%s input_event_id=%s"
+        ),
+        result.run.session_id,
+        result.run.run_id,
+        result.run.status.value,
+        result.run.input_event_id,
+    )
     return run_snapshot_from_row(result.run)
 
 
@@ -391,6 +410,11 @@ def submit_followup(
             message="submit_followup steer is deferred beyond Phase 4",
             retryable=False,
         )
+    _LOGGER.log(
+        VERBOSE_LOG_LEVEL,
+        "host.command.accepted operation=submit_followup session_id=%s",
+        request.session_id,
+    )
     try:
         result = host._admission_service.submit_followup_queue(
             SubmitFollowupQueueAdmissionInput(
@@ -405,6 +429,17 @@ def submit_followup(
         )
     except HostDurableError as exc:
         raise _host_api_error_from_durable_error(exc) from exc
+    _LOGGER.log(
+        VERBOSE_LOG_LEVEL,
+        (
+            "host.command.committed operation=submit_followup session_id=%s "
+            "run_id=%s run_status=%s input_event_id=%s"
+        ),
+        result.run.session_id,
+        result.run.run_id,
+        result.run.status.value,
+        result.run.input_event_id,
+    )
     return FollowupSnapshot(
         accepted_input_ref=result.run.input_event_id,
         behavior=FollowupBehavior.QUEUE,
@@ -563,6 +598,12 @@ def resolve_wait(
     :raises HostApiError: handle 已关闭、wait 缺失、状态非法或幂等冲突时抛出。
     """
 
+    host._raise_if_closed()
+    _LOGGER.log(
+        VERBOSE_LOG_LEVEL,
+        "host.command.accepted operation=resolve_wait wait_id=%s",
+        wait_id,
+    )
     try:
         transaction_runner = host._transaction_runner()
         service = DefaultHostResolveWaitService(
@@ -580,6 +621,20 @@ def resolve_wait(
         host._admission_service.wakeup_port.wake_dispatch(
             _pending_dispatch_from_row(result.dispatch_record)
         )
+    _LOGGER.log(
+        VERBOSE_LOG_LEVEL,
+        (
+            "host.command.committed operation=resolve_wait session_id=%s "
+            "run_id=%s run_status=%s wait_id=%s dispatch_record_id=%s"
+        ),
+        result.run.session_id,
+        result.run.run_id,
+        result.run.status.value,
+        wait_id,
+        None
+        if result.dispatch_record is None
+        else result.dispatch_record.dispatch_record_id,
+    )
     return run_snapshot_from_row(result.run)
 
 

@@ -8,6 +8,7 @@ EngineEvent durable ingest、terminal closeout、ToolRuntime 或 recovery。
 from __future__ import annotations
 
 import asyncio
+import logging
 from collections.abc import AsyncGenerator, AsyncIterator
 from uuid import uuid4
 
@@ -20,8 +21,10 @@ from dayu.host.api import (
     LocalEngineWorkerFactory,
     LocalWorkerHandle,
 )
+from dayu.runtime.log_levels import VERBOSE_LOG_LEVEL
 
 _LOCAL_WORKER_ID_PREFIX = "local-worker"
+_LOGGER = logging.getLogger(__name__)
 
 
 class DefaultLocalEngineWorkerFactory:
@@ -53,9 +56,25 @@ class DefaultLocalEngineWorker:
         :returns: 本地 worker handle。
         """
 
-        del snapshot
+        local_worker_id = f"{_LOCAL_WORKER_ID_PREFIX}-{uuid4().hex}"
+        _LOGGER.log(
+            VERBOSE_LOG_LEVEL,
+            (
+                "host.local_proxy.accept session_id=%s run_id=%s "
+                "attempt_id=%s execution_id=%s dispatch_record_id=%s "
+                "local_worker_id=%s message_count=%s disable_tools=%s"
+            ),
+            snapshot.session_id,
+            snapshot.run_id,
+            snapshot.attempt_id,
+            snapshot.execution_id,
+            snapshot.dispatch_record_id,
+            local_worker_id,
+            len(request.messages),
+            request.disable_tools,
+        )
         return _DefaultLocalWorkerHandle(
-            local_worker_id=f"{_LOCAL_WORKER_ID_PREFIX}-{uuid4().hex}",
+            local_worker_id=local_worker_id,
             request=request,
         )
 
@@ -104,6 +123,11 @@ class _DefaultLocalWorkerHandle:
         if self._events_started:
             raise RuntimeError("local worker events have already been opened")
         self._events_started = True
+        _LOGGER.log(
+            VERBOSE_LOG_LEVEL,
+            "host.local_proxy.events_opened local_worker_id=%s",
+            self._local_worker_id,
+        )
         self._event_stream = _DefaultLocalWorkerEventStream(
             run_agent_messages(self._request)
         )
@@ -134,6 +158,11 @@ class _DefaultLocalWorkerHandle:
             event_stream = self._event_stream
         if event_stream is not None:
             await event_stream.close()
+        _LOGGER.log(
+            VERBOSE_LOG_LEVEL,
+            "host.local_proxy.closed local_worker_id=%s",
+            self._local_worker_id,
+        )
 
 
 class _DefaultLocalWorkerEventStream:

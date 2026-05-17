@@ -7,6 +7,7 @@ wait record，并把 Run / Attempt 推进到 ``WAITING`` / ``SUSPENDED``。
 
 from __future__ import annotations
 
+import logging
 from collections.abc import Mapping
 from dataclasses import dataclass
 from datetime import UTC, datetime
@@ -89,7 +90,9 @@ from dayu.host.projection import (
     catch_up_projection_best_effort,
 )
 from dayu.host.wait_adapter import WaitAdapterBinding
+from dayu.runtime.log_levels import VERBOSE_LOG_LEVEL
 
+_LOGGER = logging.getLogger(__name__)
 _TOOL_AWAITING_ACCEPT_SCOPE_KIND = "tool_awaiting_accept"
 _TOOL_AWAITING_ACCEPT_RESULT_KIND = "tool_awaiting_accept_ack"
 _EVENT_TYPE_TOOL_AWAITING = "TOOL_AWAITING"
@@ -414,23 +417,44 @@ class DefaultHostToolAwaitingAcceptPort(HostToolAwaitingAcceptPort):
         """
 
         try:
-            return self._transaction_runner.run_write(
+            _LOGGER.log(
+                VERBOSE_LOG_LEVEL,
+                (
+                    "host.waiting.accept_tool_awaiting.accepted "
+                    "session_id=%s run_id=%s attempt_id=%s execution_id=%s "
+                    "tool_call_id=%s tool_name=%s adapter_key=%s"
+                ),
+                candidate.session_id,
+                candidate.run_id,
+                candidate.attempt_id,
+                candidate.execution_id,
+                candidate.tool_call_id,
+                candidate.tool_name,
+                candidate.binding.adapter_key.value,
+            )
+            result = self._transaction_runner.run_write(
                 lambda transaction: self._accept_in_transaction(
                     transaction, candidate
                 )
             )
+            _log_tool_awaiting_accept_result(candidate, result)
+            return result
         except HostIdempotencyConflictError:
-            return ToolAwaitingRejectedAck(
+            result = ToolAwaitingRejectedAck(
                 reason_code=ToolAwaitingAcceptRejectReason.IDEMPOTENCY_CONFLICT,
                 message="tool awaiting accept idempotency conflict",
                 retryable=False,
             )
+            _log_tool_awaiting_accept_result(candidate, result)
+            return result
         except _AwaitingAcceptStateConflictError:
-            return ToolAwaitingRejectedAck(
+            result = ToolAwaitingRejectedAck(
                 reason_code=ToolAwaitingAcceptRejectReason.CAS_CONFLICT,
                 message="tool awaiting accept state CAS failed",
                 retryable=False,
             )
+            _log_tool_awaiting_accept_result(candidate, result)
+            return result
 
     def _accept_in_transaction(
         self, transaction: HostTransaction, candidate: ToolAwaitingAcceptCandidate
@@ -583,6 +607,11 @@ class DefaultHostResolveWaitService:
                 retryable=False,
             )
         try:
+            _LOGGER.log(
+                VERBOSE_LOG_LEVEL,
+                "host.waiting.resolve_wait.accepted wait_id=%s",
+                wait_id,
+            )
             result = self._transaction_runner.run_write(
                 lambda transaction: self._resolve_in_transaction(
                     transaction, wait_id, request
@@ -595,6 +624,22 @@ class DefaultHostResolveWaitService:
                     retryable=False,
                 )
             catch_up_projection_best_effort(self._projection_catchup_port)
+            _LOGGER.log(
+                VERBOSE_LOG_LEVEL,
+                (
+                    "host.waiting.resolve_wait.committed session_id=%s "
+                    "run_id=%s run_status=%s wait_id=%s dispatch_record_id=%s "
+                    "idempotent_replay=%s"
+                ),
+                result.run.session_id,
+                result.run.run_id,
+                result.run.status.value,
+                wait_id,
+                None
+                if result.dispatch_record is None
+                else result.dispatch_record.dispatch_record_id,
+                result.idempotent_replay,
+            )
             return result
         except HostIdempotencyConflictError as exc:
             raise HostApiError(
@@ -1653,6 +1698,74 @@ def _wait_updated_event_ref(wait_record: WaitRecordRow) -> Mapping[str, JsonValu
         "event_id": wait_record.updated_event_id,
         "event_sequence": wait_record.updated_event_sequence,
     }
+
+
+def _log_tool_awaiting_accept_result(
+    candidate: ToolAwaitingAcceptCandidate, result: ToolAwaitingAcceptResult
+) -> None:
+    """记录工具等待 accept barrier 的有界结果。
+
+    :param candidate: awaiting candidate。
+    :param result: awaiting accept 结果。
+    :returns: ``None``。
+    """
+
+    if isinstance(result, ToolAwaitingAcceptedAck):
+        _LOGGER.log(
+            VERBOSE_LOG_LEVEL,
+            (
+                "host.waiting.accept_tool_awaiting.committed "
+                "session_id=%s run_id=%s attempt_id=%s execution_id=%s "
+                "tool_call_id=%s tool_name=%s adapter_key=%s wait_id=%s "
+                "accepted_event_count=%s"
+            ),
+            candidate.session_id,
+            candidate.run_id,
+            candidate.attempt_id,
+            candidate.execution_id,
+            candidate.tool_call_id,
+            candidate.tool_name,
+            candidate.binding.adapter_key.value,
+            result.wait_id,
+            len(result.accepted_event_refs),
+        )
+        return
+    if isinstance(result, ToolAwaitingRejectedAck):
+        _LOGGER.debug(
+            (
+                "host.waiting.accept_tool_awaiting.rejected "
+                "session_id=%s run_id=%s attempt_id=%s execution_id=%s "
+                "tool_call_id=%s tool_name=%s adapter_key=%s reason=%s "
+                "retryable=%s"
+            ),
+            candidate.session_id,
+            candidate.run_id,
+            candidate.attempt_id,
+            candidate.execution_id,
+            candidate.tool_call_id,
+            candidate.tool_name,
+            candidate.binding.adapter_key.value,
+            result.reason_code.value,
+            result.retryable,
+        )
+        return
+    _LOGGER.debug(
+        (
+            "host.waiting.accept_tool_awaiting.timed_out "
+            "session_id=%s run_id=%s attempt_id=%s execution_id=%s "
+            "tool_call_id=%s tool_name=%s adapter_key=%s attempt_count=%s "
+            "last_error_code=%s"
+        ),
+        candidate.session_id,
+        candidate.run_id,
+        candidate.attempt_id,
+        candidate.execution_id,
+        candidate.tool_call_id,
+        candidate.tool_name,
+        candidate.binding.adapter_key.value,
+        result.attempt_count,
+        result.last_error_code,
+    )
 
 
 def _accept_idempotency_scope(

@@ -10,6 +10,7 @@ steer、retry、replay、wait 或 recovery。
 
 from __future__ import annotations
 
+import logging
 from dataclasses import dataclass
 from datetime import UTC, datetime
 from enum import StrEnum
@@ -95,7 +96,9 @@ from dayu.host.projection import (
     ProjectionCatchupPort,
     catch_up_projection_best_effort,
 )
+from dayu.runtime.log_levels import VERBOSE_LOG_LEVEL
 
+_LOGGER = logging.getLogger(__name__)
 _EVENT_TYPE_USER_INPUT_ACCEPTED = "USER_INPUT_ACCEPTED"
 _EVENT_SOURCE = "host.admission"
 _INTERNAL_ACTOR = "host"
@@ -447,6 +450,7 @@ class HostAdmissionService:
                 id_factory=self.id_factory,
             )
         )
+        _log_run_admission_result(_OPERATION_START_RUN, result)
         catch_up_projection_best_effort(self.projection_catchup_port)
         _wake_dispatch_if_needed(self.wakeup_port, result.pending_dispatch)
         return result
@@ -481,6 +485,7 @@ class HostAdmissionService:
                 id_factory=self.id_factory,
             )
         )
+        _log_run_admission_result(_OPERATION_SUBMIT_FOLLOWUP_QUEUE, result)
         catch_up_projection_best_effort(self.projection_catchup_port)
         _wake_dispatch_if_needed(self.wakeup_port, result.pending_dispatch)
         return result
@@ -622,6 +627,17 @@ class HostAdmissionService:
                 id_factory=self.id_factory,
             )
         )
+        _LOGGER.log(
+            VERBOSE_LOG_LEVEL,
+            (
+                "host.admission.promotion_committed session_id=%s "
+                "promoted_run_id=%s pending_dispatch=%s skip_reason=%s"
+            ),
+            session_id,
+            None if result.promoted_run is None else result.promoted_run.run_id,
+            result.pending_dispatch is not None,
+            None if result.skip_reason is None else result.skip_reason.value,
+        )
         _wake_dispatch_if_needed(
             self.wakeup_port,
             result.pending_dispatch,
@@ -666,6 +682,36 @@ def create_host_admission_service(
             if projection_catchup_port is not None
             else NoopProjectionCatchupPort()
         ),
+    )
+
+
+def _log_run_admission_result(operation: str, result: RunAdmissionResult) -> None:
+    """记录 admission 已提交 Run 结果的骨架日志。
+
+    :param operation: admission operation 名称。
+    :param result: durable transaction 已提交后的 admission 结果。
+    :returns: ``None``。
+    """
+
+    _LOGGER.log(
+        VERBOSE_LOG_LEVEL,
+        (
+            "host.admission.run_committed operation=%s session_id=%s "
+            "run_id=%s run_status=%s attempt_id=%s dispatch_record_id=%s "
+            "created=%s queued=%s idempotent_replay=%s pending_dispatch=%s"
+        ),
+        operation,
+        result.run.session_id,
+        result.run.run_id,
+        result.run.status.value,
+        None if result.attempt is None else result.attempt.attempt_id,
+        None
+        if result.dispatch_record is None
+        else result.dispatch_record.dispatch_record_id,
+        result.created,
+        result.queued,
+        result.idempotent_replay,
+        result.pending_dispatch is not None,
     )
 
 
