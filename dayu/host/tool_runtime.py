@@ -53,12 +53,19 @@ from dayu.contracts.tool_schema import (
     ToolTruncationStrategy,
 )
 from dayu.host.api import AttemptStatus, HostPayloadRef, RunStatus
-from dayu.host.durable.codec import is_sha256_digest, sha256_digest_json
+from dayu.host.durable.codec import (
+    canonical_json_dumps,
+    is_sha256_digest,
+    sha256_digest_json,
+)
 from dayu.host.durable.errors import (
     HostDurableError,
     HostIdempotencyConflictError,
     HostPayloadReferenceError,
     HostTransactionRetryExhaustedError,
+)
+from dayu.host.durable.options import (
+    _DEFAULT_PAYLOAD_INLINE_THRESHOLD_BYTES as _DEFAULT_INLINE_TOOL_RESULT_MAX_BYTES,
 )
 from dayu.host.durable.event_log import (
     EventClass,
@@ -147,6 +154,7 @@ _MIN_ACCEPT_RETRY_ATTEMPTS = 1
 _MIN_ACCEPT_BACKOFF_SECONDS = 0.0
 _DEFAULT_ACCEPT_RETRY_ATTEMPTS = 2
 _DEFAULT_ACCEPT_BACKOFF_SECONDS = 0.0
+_MAX_LLM_INLINE_TOOL_RESULT_BYTES = _DEFAULT_INLINE_TOOL_RESULT_MAX_BYTES
 _TOOL_RUNTIME_GOVERNED_ERROR = "host_tool_governed_error"
 _TOOL_RUNTIME_POLICY_BLOCKED_ERROR = "tool_call_governed"
 _TOOL_RUNTIME_ACCEPT_REJECTED_ERROR = "tool_accept_rejected"
@@ -160,6 +168,7 @@ _TOOL_RUNTIME_IDEMPOTENCY_REASON = "tool_idempotency_key_required"
 _TOOL_RUNTIME_UNSUPPORTED_AWAITING_REASON = "unsupported_awaiting"
 _TOOL_RUNTIME_AWAITING_BINDING_REASON = "awaiting_adapter_not_configured"
 _TOOL_RUNTIME_AWAITING_EXTERNAL_JOB_REASON = "awaiting_external_job_missing"
+_TOOL_RUNTIME_RESULT_TOO_LARGE_REASON = "tool_result_inline_size_limit_exceeded"
 _TOOL_RUNTIME_AWAITING_BATCH_SUSPENDED_REASON = "run_suspended_by_tool_awaiting"
 _TOOL_RUNTIME_CANCELLED_REASON = "tool_runtime_cancelled"
 _TOOL_RUNTIME_TIMEOUT_REASON = "tool_runtime_timeout"
@@ -979,6 +988,20 @@ class TruncationAppliedOutcome:
 
 
 @dataclass(frozen=True, slots=True)
+class _InlineToolResultGovernance:
+    """LLM inline 工具结果大小治理输出。
+
+    :param outcome: 可安全返回给 Engine 的工具 outcome。
+    :param policy_decision: 与 outcome 匹配的治理决策。
+    :param diagnostic_refs: 本次治理产生的诊断 refs。
+    """
+
+    outcome: ToolExecutionOutcome
+    policy_decision: ToolPolicyDecision
+    diagnostic_refs: tuple["ToolTraceDiagnosticRef", ...]
+
+
+@dataclass(frozen=True, slots=True)
 class ToolTraceDiagnosticRecord:
     """ToolRuntime 诊断记录。
 
@@ -1364,6 +1387,18 @@ class TruncationManager:
                 meta=outcome.result.meta,
             )
         )
+        if (
+            _tool_outcome_inline_size_bytes(truncated_outcome)
+            > _MAX_LLM_INLINE_TOOL_RESULT_BYTES
+        ):
+            return TruncationAppliedOutcome(
+                outcome=_truncation_failure(
+                    _TOOL_RUNTIME_RESULT_TOO_LARGE_REASON,
+                    "truncated tool result exceeded LLM inline size limit",
+                ),
+                cursor_hint=None,
+                fact=None,
+            )
         fact = ToolTruncationFact(
             applied=True,
             strategy=strategy.value,
@@ -1409,12 +1444,22 @@ class TruncationManager:
                 _TRUNCATION_REMAINDER_DIGEST_REASON,
                 "truncation remainder digest mismatch",
             )
+        fetched_outcome = ToolCompletedOutcome(
+            result=ToolResultSuccess(ok=True, value=fetched, meta=None)
+        )
+        if (
+            _tool_outcome_inline_size_bytes(fetched_outcome)
+            > _MAX_LLM_INLINE_TOOL_RESULT_BYTES
+        ):
+            self._cleanup_expired_cursors(datetime.now(UTC))
+            return _truncation_failure(
+                _TOOL_RUNTIME_RESULT_TOO_LARGE_REASON,
+                "fetch_more result exceeded LLM inline size limit",
+            )
         if cursor.single_use:
             self._cursors.pop(cursor.cursor_id, None)
         self._cleanup_expired_cursors(datetime.now(UTC))
-        return ToolCompletedOutcome(
-            result=ToolResultSuccess(ok=True, value=fetched, meta=None)
-        )
+        return fetched_outcome
 
     def _store_cursor(
         self,
@@ -2414,6 +2459,12 @@ class ToolRuntimeExecutor:
             self._effective_bundle.truncate_specs_by_name.get(call.name),
         )
         accepted_outcome = truncation.outcome
+        bounded_result = self._govern_inline_tool_result(
+            accepted_outcome, policy_decision
+        )
+        accepted_outcome = bounded_result.outcome
+        policy_decision = bounded_result.policy_decision
+        diagnostic_refs = (*duplicate_refs, *bounded_result.diagnostic_refs)
         candidate = _tool_fact_accept_candidate(
             scope=self._execution_scope,
             effective_bundle=self._effective_bundle,
@@ -2426,7 +2477,7 @@ class ToolRuntimeExecutor:
             duplicate_decision=duplicate_decision,
             duplicate_governed=duplicate_governed,
             tool_idempotency_key=_tool_idempotency_key(call, tool_policy),
-            diagnostic_refs=duplicate_refs,
+            diagnostic_refs=diagnostic_refs,
         )
         accept_result = await self._accept_with_retry(candidate)
         if isinstance(accept_result, ToolFactAcceptedAck):
@@ -2445,6 +2496,44 @@ class ToolRuntimeExecutor:
         return BatchToolExecutionRecord(
             tool_call_id=call.tool_call_id,
             outcome=governed,
+        )
+
+    def _govern_inline_tool_result(
+        self,
+        outcome: ToolExecutionOutcome,
+        policy_decision: ToolPolicyDecision,
+    ) -> "_InlineToolResultGovernance":
+        """对将返回给 Engine 的工具结果执行 inline 大小治理。
+
+        :param outcome: 截断后准备进入 accept barrier 的工具 outcome。
+        :param policy_decision: 当前工具治理决策。
+        :returns: 治理后的 outcome、policy decision 与诊断引用。
+        """
+
+        if _tool_outcome_inline_size_bytes(outcome) <= _MAX_LLM_INLINE_TOOL_RESULT_BYTES:
+            return _InlineToolResultGovernance(
+                outcome=outcome,
+                policy_decision=policy_decision,
+                diagnostic_refs=(),
+            )
+        diagnostic_ref = self._diagnostic_emitter.emit(
+            ToolTraceDiagnosticRecord(
+                reason_code=_TOOL_RUNTIME_RESULT_TOO_LARGE_REASON,
+                message=(
+                    "tool result exceeded LLM inline size limit; use "
+                    "truncation, fetch_more limits, payload ref, or artifact ref"
+                ),
+            )
+        )
+        governed_decision = ToolPolicyDecision(
+            kind=ToolPolicyDecisionKind.GOVERNED_ERROR,
+            reason_code=_TOOL_RUNTIME_RESULT_TOO_LARGE_REASON,
+            message="tool result exceeded LLM inline size limit",
+        )
+        return _InlineToolResultGovernance(
+            outcome=_governed_failure_outcome(governed_decision),
+            policy_decision=governed_decision,
+            diagnostic_refs=(diagnostic_ref,),
         )
 
     async def _dispatch_tool_call_with_bounds(
@@ -4686,6 +4775,17 @@ def _tool_outcome_digest(outcome: ToolExecutionOutcome) -> str:
     """
 
     return sha256_digest_json(_tool_outcome_json(outcome))
+
+
+def _tool_outcome_inline_size_bytes(outcome: ToolExecutionOutcome) -> int:
+    """估算工具 outcome 进入 LLM inline tool message 的 UTF-8 字节数。
+
+    :param outcome: 工具 outcome。
+    :returns: canonical JSON 投影的 UTF-8 字节数。
+    :raises TypeError: 收到不支持的工具 outcome 时抛出。
+    """
+
+    return len(canonical_json_dumps(_tool_outcome_json(outcome)).encode("utf-8"))
 
 
 def _tool_payload_digest(outcome: ToolExecutionOutcome) -> str | None:

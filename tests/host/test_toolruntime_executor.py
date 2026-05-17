@@ -28,6 +28,8 @@ from dayu.contracts.tool_schema import (
     ToolFunctionSchema,
     ToolParametersSchema,
     ToolSchema,
+    ToolTruncateSpec,
+    ToolTruncationStrategy,
 )
 from dayu.host.api import WaitAdapterKey
 from dayu.host.durable.state import WaitResumePolicy
@@ -35,10 +37,12 @@ from dayu.host.tool_runtime import (
     DefaultToolRuntimeFactory,
     EffectiveToolBundleBuildRequest,
     EffectiveToolBundleBuilder,
+    FetchMoreRequest,
     HostEventRef,
     HostPayloadRef,
     HostToolFactAcceptPort,
     HostToolAwaitingAcceptPort,
+    InMemoryToolTraceDiagnosticEmitter,
     ToolAcceptRejectReason,
     ToolAcceptRetryPolicy,
     ToolFactAcceptCandidate,
@@ -61,6 +65,7 @@ from dayu.host.tool_runtime import (
     ToolRuntimePolicyView,
     ToolRuntimeToolPolicy,
     ToolSideEffectKind,
+    TruncationManager,
 )
 from dayu.host.wait_adapter import (
     WaitAdapterBinding,
@@ -401,6 +406,88 @@ async def test_fake_tool_result_returns_only_after_accepted_ack() -> None:
     assert len(accept_port.candidates) == 1
     assert isinstance(record.outcome, ToolCompletedOutcome)
     assert record.outcome.result.value == {"secret": "visible-after-accept"}
+
+
+@pytest.mark.asyncio
+async def test_oversized_tool_result_returns_governed_diagnostic_outcome() -> None:
+    """超大工具结果不进入 Engine inline message，而是转为治理诊断 outcome。"""
+
+    oversized_value = {"content": "x" * 70000}
+    callable_ = _CountingCallable(oversized_value)
+    accept_port = _SequencedAcceptPort((_accepted_ack_for_call("tool-call-1"),))
+    diagnostics = InMemoryToolTraceDiagnosticEmitter()
+    executor = _executor(
+        callable_,
+        accept_port,
+        diagnostic_emitter=diagnostics,
+    )
+
+    outcome = await executor.execute(_request(_call("tool-call-1")))
+
+    record = outcome.records[0]
+    assert callable_.call_count == 1
+    assert len(accept_port.candidates) == 1
+    candidate = accept_port.candidates[0]
+    assert candidate.tool_fact_kind is ToolFactKind.GOVERNED_ERROR
+    assert candidate.policy_decision.reason_code == (
+        "tool_result_inline_size_limit_exceeded"
+    )
+    assert candidate.policy_decision.message is not None
+    assert oversized_value["content"] not in candidate.policy_decision.message
+    assert diagnostics.records[0].reason_code == (
+        "tool_result_inline_size_limit_exceeded"
+    )
+    assert isinstance(record.outcome, ToolFailedOutcome)
+    assert record.outcome.result.error == "tool_call_governed"
+    assert oversized_value["content"] not in record.outcome.result.message
+
+
+def test_fetch_more_rejects_oversized_inline_continuation() -> None:
+    """fetch_more 不允许无上限返回超大 inline continuation。"""
+
+    spec = ToolTruncateSpec(
+        enabled=True,
+        strategy=ToolTruncationStrategy.TEXT_CHARS,
+        limits={"max_chars": 1},
+        target_field=None,
+        field_path=None,
+        ttl_seconds=None,
+    )
+    manager = TruncationManager(
+        session_id=_SESSION_ID,
+        run_id=_RUN_ID,
+        attempt_id=_ATTEMPT_ID,
+        truncate_specs_by_name={"fake_tool": spec},
+    )
+    applied = manager.apply_truncation(
+        "fake_tool",
+        "tool-call-1",
+        ToolCompletedOutcome(
+            result=ToolResultSuccess(ok=True, value="x" * 70010, meta=None)
+        ),
+        spec,
+    )
+    assert applied.cursor_hint is not None
+    assert isinstance(applied.outcome, ToolCompletedOutcome)
+    truncated_value = applied.outcome.result.value
+    assert isinstance(truncated_value, dict)
+    fetch_more = truncated_value["fetch_more"]
+    assert isinstance(fetch_more, dict)
+    scope_token = fetch_more["scope_token"]
+    assert isinstance(scope_token, str)
+
+    fetched = manager.fetch_more(
+        FetchMoreRequest(
+            cursor=applied.cursor_hint,
+            scope_token=scope_token,
+            limit=None,
+        ),
+        _request(_call("tool-call-1")).context,
+    )
+
+    assert isinstance(fetched, ToolFailedOutcome)
+    assert fetched.result.error == "truncation_error"
+    assert fetched.result.hint == "tool_result_inline_size_limit_exceeded"
 
 
 @pytest.mark.asyncio
@@ -783,6 +870,7 @@ def _executor(
     retry_policy: ToolAcceptRetryPolicy | None = None,
     policy_view: ToolRuntimePolicyView | None = None,
     allow_tool_calls: bool = True,
+    diagnostic_emitter: InMemoryToolTraceDiagnosticEmitter | None = None,
 ) -> ToolExecutor:
     """构造测试用 ToolRuntime executor。
 
@@ -793,6 +881,7 @@ def _executor(
     :param retry_policy: accept retry policy。
     :param policy_view: Host 内部工具 policy view。
     :param allow_tool_calls: ToolRuntime scope 是否允许工具调用。
+    :param diagnostic_emitter: 可选内存诊断发射器。
     :returns: ToolExecutor protocol 实现。
     """
 
@@ -822,6 +911,7 @@ def _executor(
                 else ToolAcceptRetryPolicy(max_attempts=1, backoff_seconds=0.0)
             ),
             policy_view=policy_view if policy_view is not None else ToolRuntimePolicyView(),
+            diagnostic_emitter=diagnostic_emitter,
         )
     )
     return handle.tool_executor

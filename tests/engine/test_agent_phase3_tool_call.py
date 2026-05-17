@@ -96,6 +96,7 @@ _INVALID_TOOL_EXECUTION_TIMEOUTS: tuple[float, ...] = (
     math.inf,
 )
 _OVERSIZED_RESUME_TOKEN_LENGTH: int = 2049
+_OVERSIZED_INLINE_CONTENT_LENGTH: int = 70000
 _TOOL_EXECUTOR_EXCEPTION_ERROR: str = "tool_executor_exception"
 
 
@@ -955,6 +956,31 @@ async def test_completed_tool_call_injects_messages_and_reaches_final() -> None:
     assert json.loads(second_messages[-1].content) == {"sum": 5}
     assert runner.tools_seen[0] == (_schema(),)
     assert runner.close_count == 1
+
+
+@pytest.mark.asyncio
+async def test_oversized_tool_message_fails_before_next_runner_call() -> None:
+    """工具结果注入 messages 后，下一轮 Runner 调用前必须被 inline guard 拦截。"""
+
+    executor = _RecordingToolExecutor(
+        outcomes={
+            "tc_1": _success(
+                {"content": "x" * _OVERSIZED_INLINE_CONTENT_LENGTH}
+            )
+        }
+    )
+    runner = _ScriptedRunner(
+        scripts=(_tool_script(_tool_call("tc_1")), _final_script("unreachable"))
+    )
+
+    events = await _collect(_AsyncAgent(request=_request(executor=executor), runner=runner))
+
+    failure = _failed_data(events)
+    assert failure.error_code == "context_compaction_required"
+    assert failure.recoverable is True
+    assert runner.call_count == 1
+    assert runner.close_count == 1
+    assert len(executor.requests) == 1
 
 
 @pytest.mark.asyncio

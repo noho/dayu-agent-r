@@ -26,6 +26,7 @@ from dayu.contracts.json_value import JsonValue
 from dayu.contracts.tool_call import (
     BatchToolExecutionContext,
     BatchToolExecutionRequest,
+    GeminiToolCallState,
     ToolCallRequest,
 )
 from dayu.contracts.tool_outcome import (
@@ -88,6 +89,7 @@ from dayu.engine.contracts.messages import (
     AgentMessageRole,
     AssistantMessage,
     AssistantToolCall,
+    SystemMessage,
     ToolMessage,
     UserMessage,
 )
@@ -174,6 +176,7 @@ _CONSECUTIVE_FAILED_TOOL_BATCHES_MESSAGE: str = (
 _CONTINUATION_TOOL_CALL_NOT_ALLOWED_MESSAGE: str = (
     "continuation runner call produced tool calls while tools were disabled"
 )
+_MAX_ENGINE_MESSAGE_CONTENT_BYTES: int = 65536
 _EXCEPTION_MESSAGE_REDACTED: str = "exception message redacted"
 _EXCEPTION_MESSAGE_MAX_LENGTH: int = 240
 _EXCEPTION_MESSAGE_TRUNCATED_SUFFIX: str = "... [truncated]"
@@ -351,6 +354,86 @@ def _project_tool_outcome_for_llm(
     else:
         assert_never(outcome)
     return json.dumps(projected, ensure_ascii=False, sort_keys=True)
+
+
+def _message_inline_texts(message: AgentMessage) -> tuple[str, ...]:
+    """读取单条 Engine message 的 inline 文本字段。
+
+    :param message: Engine message。
+    :returns: 需要进入 Runner messages 的文本字段元组。
+    :raises Exception: 不主动抛出异常。
+    """
+
+    if isinstance(message, SystemMessage | UserMessage | ToolMessage):
+        return (message.content,)
+    if isinstance(message, AssistantMessage):
+        assistant_texts = tuple(
+            text
+            for text in (message.content, message.reasoning_content)
+            if text is not None
+        )
+        tool_call_texts = tuple(
+            text
+            for tool_call in message.tool_calls
+            for text in _assistant_tool_call_inline_texts(tool_call)
+        )
+        return (*assistant_texts, *tool_call_texts)
+    assert_never(message)
+
+
+def _assistant_tool_call_inline_texts(
+    tool_call: AssistantToolCall,
+) -> tuple[str, ...]:
+    """读取 assistant tool call 会回送 Runner 的 inline 文本字段。
+
+    :param tool_call: Assistant message 中的 tool call。
+    :returns: tool call outbound 序列化会携带的文本字段。
+    :raises TypeError: arguments 不能序列化为 JSON 时抛出。
+    """
+
+    provider_state_texts: tuple[str, ...]
+    if tool_call.provider_state is None:
+        provider_state_texts = ()
+    else:
+        match tool_call.provider_state:
+            case GeminiToolCallState(thought_signature=signature):
+                provider_state_texts = (signature,)
+            case _:
+                assert_never(tool_call.provider_state)
+    return (
+        tool_call.id,
+        tool_call.name,
+        json.dumps(dict(tool_call.arguments), ensure_ascii=False, sort_keys=True),
+        *provider_state_texts,
+    )
+
+
+def _message_inline_size_failure(
+    messages: Sequence[AgentMessage],
+) -> RunFailedData | None:
+    """检查 Engine messages 是否超过防御性 inline 大小上限。
+
+    :param messages: 即将交给 Runner 的 Engine messages。
+    :returns: 超限时返回既有 context compaction 失败数据，否则返回 ``None``。
+    :raises Exception: 不主动抛出异常。
+    """
+
+    for message in messages:
+        for text in _message_inline_texts(message):
+            size_bytes = len(text.encode("utf-8"))
+            if size_bytes <= _MAX_ENGINE_MESSAGE_CONTENT_BYTES:
+                continue
+            return RunFailedData(
+                error_code=_ERROR_CONTEXT_COMPACTION_REQUIRED,
+                message=(
+                    "engine message inline content exceeded size limit; "
+                    "Host must provide bounded messages through ref, digest, "
+                    "payload, or compact artifact boundaries"
+                ),
+                provider_request_id=None,
+                recoverable=True,
+            )
+    return None
 
 
 @dataclass(slots=True)
@@ -612,12 +695,24 @@ class _AsyncAgent:
                 return
 
             messages: list[AgentMessage] = list(self._request.messages)
+            message_size_failure = _message_inline_size_failure(messages)
+            if message_size_failure is not None:
+                yield await self._make_failed_or_cancelled_terminal_with_close(
+                    message_size_failure
+                )
+                return
             ordinary_iterations = self._request.agent_policy.max_iterations
             continuation_content_parts: list[str] = []
             continuation_attempts = 0
             continuation_active = False
 
             for iteration_index in range(ordinary_iterations):
+                message_size_failure = _message_inline_size_failure(messages)
+                if message_size_failure is not None:
+                    yield await self._make_failed_or_cancelled_terminal_with_close(
+                        message_size_failure
+                    )
+                    return
                 iteration_id = self._iteration_id(iteration_index)
                 effective_tools = (
                     () if continuation_active else self._effective_tools()

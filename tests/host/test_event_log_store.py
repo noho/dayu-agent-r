@@ -9,6 +9,7 @@ from typing import cast
 
 import pytest
 
+from dayu.contracts.json_value import JsonValue
 from dayu.host.durable.codec import is_sha256_digest, sha256_digest_json
 from dayu.host.durable.connection import open_host_durable_store
 from dayu.host.durable.event_log import (
@@ -60,7 +61,7 @@ def _request(
     event_class: EventClass = EventClass.CANONICAL_FACT,
     session_id: str = "session-1",
     event_type: str = "host.test",
-    payload_json: str = "payload",
+    payload_json: JsonValue = "payload",
     payload_ref: str | None = None,
     payload_digest: str | None = None,
 ) -> EventLogAppendRequest:
@@ -253,6 +254,37 @@ def test_append_optional_none_fields_preserves_nulls_and_digest_idempotency(
             )
 
         assert store.transaction_runner.run_write(operation) == (True, False, True)
+
+
+def test_canonical_fact_rejects_oversized_inline_payload_json(
+    tmp_path: Path,
+) -> None:
+    """canonical fact inline payload 超过 payload 阈值时必须要求 ref/digest 边界。"""
+
+    oversized_text = "x" * 70000
+    with open_host_durable_store(_options(tmp_path)) as store:
+
+        def operation(transaction: HostTransaction) -> None:
+            """尝试追加超大 inline canonical fact。
+
+            :param transaction: Host transaction。
+            :returns: ``None``。
+            :raises HostPayloadReferenceError: inline canonical payload 超限时抛出。
+            """
+
+            append_event(
+                transaction,
+                _request(
+                    "event-oversized-inline",
+                    payload_json={"content": oversized_text},
+                ),
+            )
+
+        with pytest.raises(
+            HostPayloadReferenceError,
+            match="canonical_fact payload_json exceeds inline payload limit",
+        ):
+            store.transaction_runner.run_write(operation)
 
 
 def test_duplicate_event_id_different_body_raises_identity_conflict(
