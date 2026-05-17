@@ -223,8 +223,8 @@ Phase Map 中每个 phase 必须使用统一条目格式。模板如下：
 约束：本节只保留当前 gate 结论；phase 过程流水必须归档到 `历史记录`，仍需追踪的风险或后续 owner 必须写入 `Open Questions 与风险追踪` 的 `追踪区`。
 
 当前 work unit：P9.5 Pre-P10 Cross-Repository Hardening PR。
-当前 gate：P9.5 S6 Read API Enum Mapping And Minimal Read Model Reset Contract implementation。
-下一 gate：P9.5 S6 code review。
+当前 gate：P9.5 S7 LocalProxy Close / Events Race implementation。
+下一 gate：P9.5 S7 code review。
 
 ## Phase Map
 
@@ -2032,6 +2032,20 @@ P9.5 收口清单：
 - 当前无 PR review blocking fix。
 
 ## 历史记录
+
+### 2026-05-17 P9.5 S6 Read API Enum Mapping And Minimal Read Model Reset Contract accepted
+
+P9.5 S6 Read API Enum Mapping And Minimal Read Model Reset Contract 已完成。Implementation artifact 为
+`docs/reviews/p9-5-s6-read-api-enum-reset-implementation-20260517.md`。Code review / controller adjudication
+artifacts 为 `docs/reviews/p9-5-s6-code-review-mimo-20260517.md` 与
+`docs/reviews/p9-5-s6-code-review-controller-adjudication-20260517.md`。
+
+Controller 裁决：AgentMiMo review 为 0 blocking findings；F1 enum 双重防御、F2 timeline kind closed set
+同步、F3 terminal Run status closed set 同步均裁决为 info observation，无需 fix。AgentDS 在 S6 review
+中压缩后跑偏到旧 S2 上下文，窄 prompt 重试后仍未产出 artifact，裁决记录为 reviewer unavailable 而不继续阻塞流程。
+本地验证通过：`pytest tests/host` 为 517 passed；`python -m pyright dayu/host tests/host` 为 0 errors /
+0 warnings / 0 informations；`git diff --check` clean。Accepted slice commit 为 `39d3582`。当前 gate 为
+P9.5 S7 LocalProxy Close / Events Race implementation。
 
 ### 2026-05-17 P9.5 S5 Schema CHECK Hardening accepted
 
