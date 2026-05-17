@@ -223,8 +223,8 @@ Phase Map 中每个 phase 必须使用统一条目格式。模板如下：
 约束：本节只保留当前 gate 结论；phase 过程流水必须归档到 `历史记录`，仍需追踪的风险或后续 owner 必须写入 `Open Questions 与风险追踪` 的 `追踪区`。
 
 当前 work unit：P9.5 Pre-P10 Cross-Repository Hardening PR。
-当前 gate：P9.5 S10 Host Dispatch Lifecycle / RunInputBuilder Non-Recovery Cleanup implementation。
-下一 gate：P9.5 S10 code review。
+当前 gate：P9.5 S11 ToolRuntime Boundary Cleanup implementation。
+下一 gate：P9.5 S11 code review。
 
 ## Phase Map
 
@@ -2032,6 +2032,28 @@ P9.5 收口清单：
 - 当前无 PR review blocking fix。
 
 ## 历史记录
+
+### 2026-05-17 P9.5 S10 Host Dispatch Lifecycle / RunInputBuilder Non-Recovery Cleanup accepted
+
+P9.5 S10 Host Dispatch Lifecycle / RunInputBuilder Non-Recovery Cleanup 已完成。Implementation artifact 为
+`docs/reviews/p9-5-s10-dispatch-runinput-non-recovery-cleanup-implementation-20260517.md`。Code review /
+controller adjudication artifacts 为 `docs/reviews/p9-5-s10-code-review-mimo-20260517.md`、
+`docs/reviews/p9-5-s10-code-review-ds-20260517.md` 与
+`docs/reviews/p9-5-s10-code-review-controller-adjudication-20260517.md`。
+
+Controller 裁决：AgentMiMo 与 AgentDS review 均为 0 blocking findings。两份 review 均确认 S10
+未引入 Phase 11 recovery、`RECOVERING` dispatch、startup recovery scan、orphan proof、RemoteProxy 或状态机语义变更。
+实现覆盖 `_drain_loop` 空队列 / close / 异常退出可观测性、lane acquire 后 pre-accept cancel race 的 lane release
+与 no-worker-call、worker stream exception 后 active registry 注销 / worker handle close / lane token release、
+RunInputBuilder stale snapshot identity fail-closed，以及 late `resolve_wait` rejection 不触发 projection catch-up、
+不创建 resume Attempt、不追加 resume facts。MiMo 与 DS 的 info / low findings 均裁决为 non-goal、non-blocking
+或后续 owner 风险：`_drain_loop` 异常退出后的重启 / watchdog / startup recovery scan 归 Phase 11 lifecycle /
+recovery owner；late rejection 后 read model 即时刷新通过后续成功 command 或显式 repair / catch-up 处理；测试 helper
+复用与其它 late rejection reason 的更细专项测试归后续 wait / test hardening owner。本地验证通过：S10 targeted
+tests 为 65 passed；`pytest tests/host` 为 532 passed；`python -m pyright dayu/host tests/host` 为
+0 errors / 0 warnings / 0 informations；`python -m pyright dayu tests` 为 0 errors / 0 warnings /
+0 informations；`git diff --check` clean。Accepted slice commit 为 `c32b370`。当前 gate 为 P9.5 S11
+ToolRuntime Boundary Cleanup implementation。
 
 ### 2026-05-17 P9.5 S9 Runtime Lane Hardening accepted
 
