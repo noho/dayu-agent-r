@@ -46,6 +46,7 @@ from dayu.host.durable.event_log import (
     EventLogRow,
     EventLogStore,
 )
+from dayu.host.durable.memory import read_latest_memory_snapshot
 from dayu.host.durable.liveness import HostInstanceIdentity, register_current_instance
 from dayu.host.durable.run_transition import (
     AcceptWorkerRunningInput,
@@ -68,6 +69,12 @@ from dayu.host.durable.state import (
 )
 from dayu.host.durable.transaction import HostTransaction, HostTransactionRunner
 from dayu.host.admission import create_host_admission_service
+from dayu.host.memory import (
+    CONVERSATION_MEMORY_CONSUMER_ID,
+    default_memory_projection_policy,
+    digest_memory_projection_policy,
+)
+from dayu.host.memory_repair import ConversationMemoryProjectionCatchupPort
 from dayu.host.projection import ProjectionCatchupPort
 from dayu.host.run_input import PolicySnapshot, create_no_tool_run_input_builder
 from dayu.host.wait_adapter import WaitAdapterBinding, WaitExternalJobRefSource
@@ -159,6 +166,54 @@ def test_resolve_wait_survives_projection_catchup_failure(
         assert snapshot.status is RunStatus.RUNNING
         assert snapshot.current_attempt_id is not None
         assert projection.calls == 1
+    finally:
+        host.close()
+
+
+def test_resolve_wait_committed_tool_fact_catches_up_memory(
+    tmp_path: Path,
+) -> None:
+    """显式 concrete catch-up port 会投影 resolve_wait 工具事实。
+
+    :param tmp_path: pytest 临时目录。
+    :returns: ``None``。
+    :raises AssertionError: resolve_wait committed 工具事实未进入 memory 时抛出。
+    """
+
+    policy = default_memory_projection_policy()
+    host = create_host_command_handle(_options(tmp_path))
+    host._admission_service = create_host_admission_service(
+        host._transaction_runner(),
+        projection_catchup_port=ConversationMemoryProjectionCatchupPort(
+            transaction_runner=host._transaction_runner(),
+            policy=policy,
+            batch_size=8,
+        ),
+    )
+    try:
+        seeded = _seed_waiting_run(host)
+
+        snapshot = resolve_wait(
+            host, seeded.wait_id, _completed_request("resolve-memory-catchup")
+        )
+        memory_snapshot = host._transaction_runner().run_read(
+            lambda transaction: read_latest_memory_snapshot(
+                transaction,
+                session_id=seeded.session_id,
+                consumer_id=CONVERSATION_MEMORY_CONSUMER_ID,
+                policy_digest=digest_memory_projection_policy(policy),
+            )
+        )
+
+        assert snapshot.status is RunStatus.RUNNING
+        assert memory_snapshot is not None
+        assert len(memory_snapshot.snapshot.verified_facts) == 1
+        assert memory_snapshot.snapshot.verified_facts[0].provenance.event_id in {
+            row.event_id
+            for row in _events_by_type(
+                _events(host._transaction_runner()), "TOOL_RESULT_ACCEPTED"
+            )
+        }
     finally:
         host.close()
 

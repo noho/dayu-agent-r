@@ -18,6 +18,7 @@ from dayu.host.durable.event_log import (
     EventLogRow,
     EventLogStore,
 )
+from dayu.host.durable.memory import read_latest_memory_snapshot
 from dayu.host.durable.liveness import (
     HostInstanceIdentity,
     register_current_instance,
@@ -41,6 +42,12 @@ from dayu.host.durable.state import (
     mark_dispatching_after_lane_row,
 )
 from dayu.host.durable.transaction import HostTransaction, HostTransactionRunner
+from dayu.host.memory import (
+    CONVERSATION_MEMORY_CONSUMER_ID,
+    default_memory_projection_policy,
+    digest_memory_projection_policy,
+)
+from dayu.host.memory_repair import ConversationMemoryProjectionCatchupPort
 from dayu.host.projection import ProjectionCatchupPort
 from dayu.host.tool_runtime import (
     DefaultHostToolFactAcceptPort,
@@ -143,6 +150,49 @@ def test_tool_fact_accept_survives_projection_catchup_failure(
             "TOOL_RESULT_ACCEPTED",
         ]
         assert "projection catch-up failed; continuing" in caplog.text
+
+
+def test_tool_fact_accept_concrete_memory_catchup_projects_verified_fact(
+    tmp_path: Path,
+) -> None:
+    """TOOL_RESULT_ACCEPTED commit 后 concrete catch-up 会写入 verified fact。
+
+    :param tmp_path: pytest 临时目录。
+    :returns: ``None``。
+    :raises AssertionError: accepted 工具事实未被 memory catch-up 投影时抛出。
+    """
+
+    policy = default_memory_projection_policy()
+    with open_host_durable_store(_options(tmp_path)) as store:
+        seeded = _seed_active_run(store.transaction_runner)
+        accept_port = DefaultHostToolFactAcceptPort(
+            transaction_runner=store.transaction_runner,
+            projection_catchup_port=ConversationMemoryProjectionCatchupPort(
+                transaction_runner=store.transaction_runner,
+                policy=policy,
+                batch_size=8,
+            ),
+        )
+
+        result = accept_port.accept_tool_fact(
+            _completed_candidate(seeded, tool_call_id="tool-call-memory-catchup")
+        )
+        snapshot = store.transaction_runner.run_read(
+            lambda transaction: read_latest_memory_snapshot(
+                transaction,
+                session_id=seeded.session_id,
+                consumer_id=CONVERSATION_MEMORY_CONSUMER_ID,
+                policy_digest=digest_memory_projection_policy(policy),
+            )
+        )
+
+        assert isinstance(result, ToolFactAcceptedAck)
+        assert result.tool_result_event_ref is not None
+        assert snapshot is not None
+        assert len(snapshot.snapshot.verified_facts) == 1
+        assert snapshot.snapshot.verified_facts[0].provenance.event_id == (
+            result.tool_result_event_ref.event_id
+        )
 
 
 def test_same_accept_key_with_different_digest_returns_idempotency_conflict(

@@ -68,6 +68,7 @@ from dayu.host.memory import (
     calculate_memory_snapshot_digest,
     digest_memory_projection_policy,
     estimate_memory_size_units,
+    project_conversation_memory_event,
 )
 from dayu.host.memory_repair import (
     catch_up_conversation_memory_projection,
@@ -282,6 +283,7 @@ def _append_memory_event(
     event_id: str,
     event_type: str,
     payload: dict[str, JsonValue],
+    event_class: EventClass = EventClass.CANONICAL_FACT,
 ) -> EventLogRow:
     """在 transaction 内追加 memory projection 测试 EventLog row。
 
@@ -289,6 +291,7 @@ def _append_memory_event(
     :param event_id: EventLog id。
     :param event_type: EventLog type。
     :param payload: payload JSON。
+    :param event_class: EventLog class。
     :returns: EventLog row。
     """
 
@@ -296,7 +299,7 @@ def _append_memory_event(
         transaction,
         EventLogAppendRequest(
             event_id=event_id,
-            event_class=EventClass.CANONICAL_FACT,
+            event_class=event_class,
             session_id=_SESSION_ID,
             run_id="run-1",
             attempt_id="attempt-1",
@@ -977,6 +980,82 @@ def test_user_input_never_enters_verified_facts() -> None:
     )
 
 
+def test_current_goal_first_write_wins_and_later_inputs_are_constraints() -> None:
+    """多次 USER_INPUT_ACCEPTED 只把第一条写入 current_goal。
+
+    :returns: ``None``。
+    :raises AssertionError: first-write-wins 或后续约束投影不符合预期时抛出。
+    """
+
+    snapshot = _build_snapshot(
+        (
+            _memory_event(
+                event_sequence=1,
+                event_id="event-user-first-goal",
+                event_type="USER_INPUT_ACCEPTED",
+                payload={"display_text": "first accepted goal"},
+            ),
+            _memory_event(
+                event_sequence=2,
+                event_id="event-user-second-constraint",
+                event_type="USER_INPUT_ACCEPTED",
+                payload={"display_text": "second accepted constraint"},
+            ),
+            _memory_event(
+                event_sequence=3,
+                event_id="event-user-third-constraint",
+                event_type="USER_INPUT_ACCEPTED",
+                payload={"display_text": "third accepted constraint"},
+            ),
+        )
+    )
+
+    assert snapshot.pinned_state.current_goal == "first accepted goal"
+    assert snapshot.pinned_state.user_constraints == (
+        "first accepted goal",
+        "second accepted constraint",
+        "third accepted constraint",
+    )
+
+
+def test_current_goal_preserved_when_projecting_later_user_delta() -> None:
+    """已有 current_goal 的 snapshot 投影后续用户输入时保留原目标。
+
+    :returns: ``None``。
+    :raises AssertionError: 后续 delta 覆盖既有 current_goal 时抛出。
+    """
+
+    base = _build_snapshot(
+        (
+            _memory_event(
+                event_sequence=1,
+                event_id="event-user-existing-goal",
+                event_type="USER_INPUT_ACCEPTED",
+                payload={"display_text": "existing goal"},
+            ),
+        )
+    )
+
+    repaired = project_conversation_memory_event(
+        previous_snapshot=base,
+        event=_memory_event(
+            event_sequence=2,
+            event_id="event-user-inline-delta",
+            event_type="USER_INPUT_ACCEPTED",
+            payload={"display_text": "newer inline delta prompt"},
+        ),
+        policy=_policy(),
+        built_at=_NOW,
+        consumer_id=_CONSUMER_ID,
+    )
+
+    assert repaired.pinned_state.current_goal == "existing goal"
+    assert repaired.pinned_state.user_constraints == (
+        "existing goal",
+        "newer inline delta prompt",
+    )
+
+
 def test_tool_result_accepted_produces_verified_fact_with_refs() -> None:
     """TOOL_RESULT_ACCEPTED 生成带 producer 与 provenance refs 的 verified fact。"""
 
@@ -1415,6 +1494,74 @@ def test_projection_consumer_writes_snapshot_with_runner_checkpoint(
         assert read_back.snapshot.cursor.checkpoint_event_sequence == 2
         assert checkpoint is not None
         assert checkpoint.checkpoint_event_sequence == 2
+
+
+def test_preview_reasoning_and_display_only_events_do_not_enter_memory(
+    tmp_path: Path,
+) -> None:
+    """preview / reasoning / display-only events 不进入 memory snapshot。
+
+    :param tmp_path: pytest 临时目录。
+    :returns: ``None``。
+    :raises AssertionError: 非 canonical display-only 事件进入 memory 时抛出。
+    """
+
+    policy = _policy()
+    with open_host_durable_store(_options(tmp_path)) as store:
+        store.transaction_runner.run_write(
+            lambda transaction: _append_memory_event(
+                transaction,
+                event_id="event-preview-content",
+                event_type="CONTENT_DELTA",
+                payload={"display_text": "ignored content preview"},
+                event_class=EventClass.PREVIEW,
+            )
+        )
+        store.transaction_runner.run_write(
+            lambda transaction: _append_memory_event(
+                transaction,
+                event_id="event-preview-reasoning",
+                event_type="REASONING_DELTA",
+                payload={"display_text": "ignored reasoning preview"},
+                event_class=EventClass.PREVIEW,
+            )
+        )
+        store.transaction_runner.run_write(
+            lambda transaction: _append_memory_event(
+                transaction,
+                event_id="event-display-only-final",
+                event_type="RUN_SUCCEEDED",
+                payload={"final_answer": "ignored display-only conclusion"},
+                event_class=EventClass.DIAGNOSTIC,
+            )
+        )
+        store.transaction_runner.run_write(
+            lambda transaction: _append_memory_event(
+                transaction,
+                event_id="event-canonical-user",
+                event_type="USER_INPUT_ACCEPTED",
+                payload={"display_text": "canonical user fact"},
+            )
+        )
+
+        result = catch_up_conversation_memory_projection(
+            store.transaction_runner,
+            policy=policy,
+            batch_size=8,
+        )
+        read_back = store.transaction_runner.run_read(
+            _ReadLatestSnapshotOperation(digest_memory_projection_policy(policy))
+        )
+
+        assert result.events_scanned == 4
+        assert result.events_matched == 1
+        assert read_back is not None
+        assert read_back.snapshot.pinned_state.current_goal == "canonical user fact"
+        assert read_back.snapshot.verified_facts == ()
+        assert tuple(
+            item.summary_text
+            for item in read_back.snapshot.conversation_continuity.items
+        ) == ("canonical user fact",)
 
 
 def test_reset_conversation_memory_projection_deletes_consumer_scope_only(

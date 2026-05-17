@@ -89,6 +89,17 @@ TOOL_RUNTIME_SCHEMA_PROJECTION_FORBIDDEN_PREFIXES: tuple[str, ...] = (
     "dayu.host.projection",
     "dayu.host.waiting",
 )
+MEMORY_MODULES: tuple[str, ...] = (
+    "memory.py",
+    "memory_repair.py",
+    "durable/memory.py",
+)
+MEMORY_FORBIDDEN_PREFIXES: tuple[str, ...] = (
+    "dayu.engine",
+    "dayu.service",
+    "dayu.ui",
+    "dayu.fins",
+)
 
 
 def _host_root() -> Path:
@@ -259,6 +270,25 @@ def test_toolruntime_schema_projection_stays_private_host_owner() -> None:
     assert not violations, (
         f"tool runtime schema projection forbidden imports: {violations}"
     )
+
+
+def test_memory_modules_do_not_import_upper_business_or_engine_layers() -> None:
+    """memory 模块不得依赖 Engine、Service、UI 或 Fins 实现层。
+
+    :returns: ``None``。
+    :raises AssertionError: memory 模块出现禁止 import 时抛出。
+    """
+
+    host_root = _host_root()
+    violations: list[tuple[str, str]] = []
+    for relative_path in MEMORY_MODULES:
+        file_path = host_root / relative_path
+        for module in _imported_module_names(
+            file_path.read_text(encoding="utf-8")
+        ):
+            if _matches_prefix(module, MEMORY_FORBIDDEN_PREFIXES):
+                violations.append((str(file_path), module))
+    assert not violations, f"memory forbidden imports: {violations}"
 
 
 def test_engine_does_not_import_host_layer() -> None:
