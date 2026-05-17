@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import base64
 from dataclasses import replace
 from datetime import datetime
 
@@ -90,12 +91,12 @@ class _NeverCancelledToken:
 
 
 class _TextTool:
-    """返回固定文本并记录调用次数的测试工具。"""
+    """返回固定 JSON 值并记录调用次数的测试工具。"""
 
-    def __init__(self, value: str) -> None:
+    def __init__(self, value: JsonValue) -> None:
         """初始化测试工具。
 
-        :param value: 工具返回文本。
+        :param value: 工具返回 JSON 值。
         :returns: ``None``。
         """
 
@@ -200,6 +201,115 @@ async def test_fetch_more_dispatches_as_normal_tool_and_is_single_use() -> None:
 
 
 @pytest.mark.asyncio
+async def test_text_lines_truncation_fetch_more_returns_remaining_lines() -> None:
+    """text_lines 截断只公开可见行并通过 fetch_more 补读剩余行。"""
+
+    handle, _accept_port = _handle(
+        _TextTool("line-1\nline-2\nline-3\nline-4"),
+        _truncate_strategy_spec(
+            strategy=ToolTruncationStrategy.TEXT_LINES,
+            limits={"max_lines": 2},
+        ),
+    )
+
+    outcome = await handle.tool_executor.execute(_request(_call("tool-call-1")))
+    record = outcome.records[0]
+    assert isinstance(record.outcome, ToolCompletedOutcome)
+    value = record.outcome.result.value
+    assert isinstance(value, dict)
+    assert value["value"] == "line-1\nline-2"
+    fetch_more = value["fetch_more"]
+    assert isinstance(fetch_more, dict)
+    fetched = await handle.tool_executor.execute(
+        _request(
+            _fetch_more_call(
+                "fetch-call-1",
+                str(fetch_more["cursor"]),
+                str(fetch_more["scope_token"]),
+            )
+        )
+    )
+
+    fetched_record = fetched.records[0]
+    assert isinstance(fetched_record.outcome, ToolCompletedOutcome)
+    assert fetched_record.outcome.result.value == "line-3\nline-4"
+
+
+@pytest.mark.asyncio
+async def test_list_items_truncation_fetch_more_returns_remaining_items() -> None:
+    """list_items 截断只公开可见项并通过 fetch_more 补读剩余项。"""
+
+    handle, _accept_port = _handle(
+        _TextTool(["first", {"second": True}, 3]),
+        _truncate_strategy_spec(
+            strategy=ToolTruncationStrategy.LIST_ITEMS,
+            limits={"max_items": 1},
+        ),
+    )
+
+    outcome = await handle.tool_executor.execute(_request(_call("tool-call-1")))
+    record = outcome.records[0]
+    assert isinstance(record.outcome, ToolCompletedOutcome)
+    value = record.outcome.result.value
+    assert isinstance(value, dict)
+    assert value["value"] == ["first"]
+    fetch_more = value["fetch_more"]
+    assert isinstance(fetch_more, dict)
+    fetched = await handle.tool_executor.execute(
+        _request(
+            _fetch_more_call(
+                "fetch-call-1",
+                str(fetch_more["cursor"]),
+                str(fetch_more["scope_token"]),
+            )
+        )
+    )
+
+    fetched_record = fetched.records[0]
+    assert isinstance(fetched_record.outcome, ToolCompletedOutcome)
+    assert fetched_record.outcome.result.value == [{"second": True}, 3]
+
+
+@pytest.mark.asyncio
+async def test_binary_bytes_truncation_fetch_more_returns_base64_remainder() -> None:
+    """binary_bytes 截断 base64 字符串并按字节补读 base64 剩余内容。"""
+
+    encoded = base64.b64encode(b"abcdef").decode("ascii")
+    handle, _accept_port = _handle(
+        _TextTool(encoded),
+        _truncate_strategy_spec(
+            strategy=ToolTruncationStrategy.BINARY_BYTES,
+            limits={"max_bytes": 2},
+        ),
+    )
+
+    outcome = await handle.tool_executor.execute(_request(_call("tool-call-1")))
+    record = outcome.records[0]
+    assert isinstance(record.outcome, ToolCompletedOutcome)
+    value = record.outcome.result.value
+    assert isinstance(value, dict)
+    assert value["value"] == base64.b64encode(b"ab").decode("ascii")
+    fetch_more = value["fetch_more"]
+    assert isinstance(fetch_more, dict)
+    fetched = await handle.tool_executor.execute(
+        _request(
+            _fetch_more_call(
+                "fetch-call-1",
+                str(fetch_more["cursor"]),
+                str(fetch_more["scope_token"]),
+                limit=2,
+            )
+        )
+    )
+
+    fetched_record = fetched.records[0]
+    assert isinstance(fetched_record.outcome, ToolCompletedOutcome)
+    assert fetched_record.outcome.result.value == base64.b64encode(b"cd").decode(
+        "ascii"
+    )
+
+
+@pytest.mark.asyncio
 async def test_fetch_more_limit_returns_prefix_of_remaining_value() -> None:
     """fetch_more 的 limit 只返回剩余内容前缀。"""
 
@@ -244,6 +354,41 @@ async def test_fetch_more_rejects_token_mismatch() -> None:
     record = outcome.records[0]
     assert isinstance(record.outcome, ToolFailedOutcome)
     assert record.outcome.result.hint == "scope_token_mismatch"
+
+
+@pytest.mark.asyncio
+async def test_fetch_more_rejects_used_cursor() -> None:
+    """cursor 已标记使用时 fetch_more 返回普通工具错误。"""
+
+    handle, _accept_port = _handle(_TextTool("ABCDEFGHIJ"), _truncate_spec(max_chars=4))
+    cursor, scope_token = await _create_cursor(handle)
+    manager = _manager_from_handle(handle)
+    stored = manager._cursors[cursor]
+    manager._cursors[cursor] = replace(stored, used_at=stored.created_at)
+
+    outcome = await handle.tool_executor.execute(
+        _request(_fetch_more_call("fetch-call-1", cursor, scope_token))
+    )
+
+    record = outcome.records[0]
+    assert isinstance(record.outcome, ToolFailedOutcome)
+    assert record.outcome.result.hint == "cursor_already_used"
+
+
+@pytest.mark.asyncio
+async def test_fetch_more_rejects_invalid_limit() -> None:
+    """非正 limit 在 fetch_more 普通工具路径中返回普通工具错误。"""
+
+    handle, _accept_port = _handle(_TextTool("ABCDEFGHIJ"), _truncate_spec(max_chars=4))
+    cursor, scope_token = await _create_cursor(handle)
+
+    outcome = await handle.tool_executor.execute(
+        _request(_fetch_more_call("fetch-call-1", cursor, scope_token, limit=0))
+    )
+
+    record = outcome.records[0]
+    assert isinstance(record.outcome, ToolFailedOutcome)
+    assert record.outcome.result.hint == "invalid_fetch_more_request"
 
 
 @pytest.mark.asyncio
@@ -521,6 +666,30 @@ def _truncate_spec(max_chars: int, ttl_seconds: int | None = None) -> ToolTrunca
         enabled=True,
         strategy=ToolTruncationStrategy.TEXT_CHARS,
         limits={"max_chars": max_chars},
+        target_field=None,
+        field_path=None,
+        ttl_seconds=ttl_seconds,
+    )
+
+
+def _truncate_strategy_spec(
+    *,
+    strategy: ToolTruncationStrategy,
+    limits: dict[str, int],
+    ttl_seconds: int | None = None,
+) -> ToolTruncateSpec:
+    """构造指定策略的截断声明。
+
+    :param strategy: 截断策略。
+    :param limits: 策略上限配置。
+    :param ttl_seconds: cursor TTL。
+    :returns: 截断声明。
+    """
+
+    return ToolTruncateSpec(
+        enabled=True,
+        strategy=strategy,
+        limits=limits,
         target_field=None,
         field_path=None,
         ttl_seconds=ttl_seconds,

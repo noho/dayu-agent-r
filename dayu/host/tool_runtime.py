@@ -401,9 +401,11 @@ class ToolFactAcceptCandidate:
         _validate_common_candidate_fields(self)
         _validate_duplicate_fields(self)
         if self.tool_fact_kind is ToolFactKind.COMPLETED:
+            _validate_result_fact_policy(self)
             _require_sha256_digest(self.outcome_digest, field_name="outcome_digest")
             _require_sha256_digest(self.payload_digest, field_name="payload_digest")
         elif self.tool_fact_kind in (ToolFactKind.FAILED, ToolFactKind.CANCELLED):
+            _validate_result_fact_policy(self)
             _require_sha256_digest(self.outcome_digest, field_name="outcome_digest")
             if self.reuse_prior_event_refs:
                 raise ValueError(
@@ -411,6 +413,7 @@ class ToolFactAcceptCandidate:
                 )
         elif self.tool_fact_kind is ToolFactKind.GOVERNED_ERROR:
             _require_sha256_digest(self.outcome_digest, field_name="outcome_digest")
+            _validate_governed_error_candidate(self)
         elif self.tool_fact_kind is ToolFactKind.REUSE:
             _validate_reuse_candidate(self)
         else:
@@ -2897,6 +2900,9 @@ class DefaultToolRuntimeFactory:
             )
             truncation_port: TruncationPort
             if request.effective_bundle_request.enable_truncation_manager:
+                # TruncationManager 是 run-scoped 轻量对象：构造期只保存
+                # identity、effective bundle 的截断声明只读视图和空 cursor
+                # dict；不打开文件、DB、后台任务或 durable cursor table。
                 truncation_manager = TruncationManager(
                     session_id=request.execution_scope.session_id,
                     run_id=request.execution_scope.run_id,
@@ -3627,6 +3633,7 @@ def _validate_common_candidate_fields(candidate: ToolFactAcceptCandidate) -> Non
     )
     if not isinstance(candidate.policy_decision, ToolPolicyDecision):
         raise ValueError("policy_decision must be ToolPolicyDecision")
+    _validate_policy_decision_fields(candidate.policy_decision)
     if not isinstance(candidate.tool_fact_kind, ToolFactKind):
         raise ValueError("tool_fact_kind must be ToolFactKind")
 
@@ -3657,6 +3664,94 @@ def _validate_duplicate_fields(candidate: ToolFactAcceptCandidate) -> None:
         raise ValueError("duplicate decision requires duplicate_key")
 
 
+def _validate_policy_decision_fields(decision: ToolPolicyDecision) -> None:
+    """校验工具治理决策字段组合。
+
+    :param decision: 工具治理决策。
+    :returns: ``None``。
+    :raises ValueError: 决策类别或原因字段组合非法时抛出。
+    """
+
+    if not isinstance(decision.kind, ToolPolicyDecisionKind):
+        raise ValueError("policy_decision.kind must be ToolPolicyDecisionKind")
+    _require_optional_non_empty_text(
+        decision.reason_code, field_name="policy_decision.reason_code"
+    )
+    _require_optional_non_empty_text(
+        decision.message, field_name="policy_decision.message"
+    )
+    if decision.kind is ToolPolicyDecisionKind.ALLOW:
+        if decision.reason_code is not None or decision.message is not None:
+            raise ValueError("allow policy decision must not carry reason or message")
+        return
+    if decision.reason_code is None or decision.message is None:
+        raise ValueError("governed policy decision requires reason and message")
+
+
+def _validate_governed_error_candidate(candidate: ToolFactAcceptCandidate) -> None:
+    """校验 governed error 工具事实候选。
+
+    :param candidate: 工具事实候选。
+    :returns: ``None``。
+    :raises ValueError: policy / duplicate 字段组合不符合 governed error
+        语义时抛出。
+    """
+
+    if candidate.policy_decision.kind in (
+        ToolPolicyDecisionKind.ALLOW,
+        ToolPolicyDecisionKind.REUSE,
+    ):
+        raise ValueError("governed_error requires governed policy decision")
+    if candidate.policy_decision.kind is ToolPolicyDecisionKind.GOVERNED_ERROR:
+        if candidate.reuse_prior_event_refs:
+            raise ValueError("plain governed_error must not carry prior reuse refs")
+        return
+    _validate_duplicate_governed_candidate(candidate)
+
+
+def _validate_duplicate_governed_candidate(
+    candidate: ToolFactAcceptCandidate,
+) -> None:
+    """校验 duplicate 触发的 governed error 候选。
+
+    :param candidate: 工具事实候选。
+    :returns: ``None``。
+    :raises ValueError: duplicate 决策、prior refs 或 reason/message
+        与 policy 决策不一致时抛出。
+    """
+
+    decision = candidate.duplicate_decision
+    if decision is None or decision not in (
+        DuplicateDecisionKind.HINT,
+        DuplicateDecisionKind.REQUIRE_JUSTIFICATION,
+        DuplicateDecisionKind.HARD_STOP,
+    ):
+        raise ValueError("duplicate governed error requires duplicate decision")
+    if candidate.policy_decision.kind.value != decision.value:
+        raise ValueError("duplicate governed policy kind must match decision")
+    if not candidate.reuse_prior_event_refs:
+        raise ValueError("duplicate governed error requires prior event refs")
+    expected_reason = _duplicate_reason_code(decision)
+    if candidate.policy_decision.reason_code != expected_reason:
+        raise ValueError("duplicate governed reason must match decision")
+    expected_message = _duplicate_message(decision)
+    if candidate.policy_decision.message != expected_message:
+        raise ValueError("duplicate governed message must match decision")
+
+
+def _validate_result_fact_policy(candidate: ToolFactAcceptCandidate) -> None:
+    """校验普通结果事实只携带 allow policy。
+
+    :param candidate: 工具事实候选。
+    :returns: ``None``。
+    :raises ValueError: 普通 completed / failed / cancelled fact 携带非
+        allow policy 时抛出。
+    """
+
+    if candidate.policy_decision.kind is not ToolPolicyDecisionKind.ALLOW:
+        raise ValueError(f"{candidate.tool_fact_kind.value} requires allow policy")
+
+
 def _validate_reuse_candidate(candidate: ToolFactAcceptCandidate) -> None:
     """校验 reuse 工具事实候选。
 
@@ -3669,6 +3764,16 @@ def _validate_reuse_candidate(candidate: ToolFactAcceptCandidate) -> None:
         raise ValueError("reuse requires duplicate_key")
     if candidate.duplicate_decision is not DuplicateDecisionKind.REUSE:
         raise ValueError("reuse requires duplicate_decision=reuse")
+    if candidate.policy_decision.kind is not ToolPolicyDecisionKind.REUSE:
+        raise ValueError("reuse requires policy_decision=reuse")
+    if candidate.policy_decision.reason_code != _duplicate_reason_code(
+        DuplicateDecisionKind.REUSE
+    ):
+        raise ValueError("reuse reason must match duplicate decision")
+    if candidate.policy_decision.message != _duplicate_message(
+        DuplicateDecisionKind.REUSE
+    ):
+        raise ValueError("reuse message must match duplicate decision")
     if not candidate.reuse_prior_event_refs:
         raise ValueError("reuse requires prior event refs")
     if candidate.payload_ref is not None or candidate.payload_digest is not None:

@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from collections.abc import Mapping
+from dataclasses import replace
 from datetime import datetime
 
 import pytest
@@ -38,6 +39,7 @@ from dayu.host.tool_runtime import (
     ToolFactAcceptResult,
     ToolFactAcceptedAck,
     ToolFactKind,
+    ToolPolicyDecision,
     ToolPolicyDecisionKind,
     ToolRuntimeBuildRequest,
     ToolRuntimeExecutionScope,
@@ -311,6 +313,99 @@ async def test_duplicate_governed_matrix_produces_diagnostics(
 
 
 @pytest.mark.asyncio
+async def test_governed_duplicate_candidate_validation_rejects_missing_prior_refs() -> None:
+    """duplicate governed_error candidate 必须携带 prior accepted refs。"""
+
+    governed_candidate = await _governed_duplicate_candidate(
+        DuplicateDecisionKind.HINT
+    )
+
+    with pytest.raises(ValueError, match="requires prior event refs"):
+        replace(governed_candidate, reuse_prior_event_refs=())
+
+
+@pytest.mark.asyncio
+async def test_governed_duplicate_candidate_validation_rejects_policy_mismatch() -> None:
+    """duplicate governed_error candidate 的 policy kind 必须匹配决策类别。"""
+
+    governed_candidate = await _governed_duplicate_candidate(
+        DuplicateDecisionKind.HINT
+    )
+
+    with pytest.raises(ValueError, match="policy kind must match decision"):
+        replace(
+            governed_candidate,
+            policy_decision=ToolPolicyDecision(
+                kind=ToolPolicyDecisionKind.HARD_STOP,
+                reason_code="duplicate_hint",
+                message=(
+                    "duplicate tool call should use prior accepted result "
+                    "or change evidence scope"
+                ),
+            ),
+        )
+
+
+@pytest.mark.asyncio
+async def test_governed_duplicate_candidate_validation_rejects_reason_mismatch() -> None:
+    """duplicate governed_error candidate 的 reason 必须匹配决策类别。"""
+
+    governed_candidate = await _governed_duplicate_candidate(
+        DuplicateDecisionKind.HARD_STOP
+    )
+
+    with pytest.raises(ValueError, match="reason must match decision"):
+        replace(
+            governed_candidate,
+            policy_decision=ToolPolicyDecision(
+                kind=ToolPolicyDecisionKind.HARD_STOP,
+                reason_code="duplicate_hint",
+                message="duplicate tool call hard-stopped by Host governance",
+            ),
+        )
+
+
+@pytest.mark.asyncio
+async def test_governed_duplicate_candidate_validation_rejects_message_mismatch() -> None:
+    """duplicate governed_error candidate 的 message 必须匹配决策类别。"""
+
+    governed_candidate = await _governed_duplicate_candidate(
+        DuplicateDecisionKind.REQUIRE_JUSTIFICATION
+    )
+
+    with pytest.raises(ValueError, match="message must match decision"):
+        replace(
+            governed_candidate,
+            policy_decision=ToolPolicyDecision(
+                kind=ToolPolicyDecisionKind.REQUIRE_JUSTIFICATION,
+                reason_code="duplicate_requires_justification",
+                message="wrong duplicate governance message",
+            ),
+        )
+
+
+@pytest.mark.asyncio
+async def test_governed_error_candidate_validation_rejects_allow_policy() -> None:
+    """governed_error fact 不允许携带 allow policy。"""
+
+    governed_candidate = await _governed_duplicate_candidate(
+        DuplicateDecisionKind.HINT
+    )
+
+    with pytest.raises(ValueError, match="requires governed policy decision"):
+        replace(
+            governed_candidate,
+            duplicate_decision=None,
+            reuse_prior_event_refs=(),
+            policy_decision=ToolPolicyDecision(
+                kind=ToolPolicyDecisionKind.ALLOW,
+                reason_code=None,
+                message=None,
+            ),
+        )
+
+
+@pytest.mark.asyncio
 async def test_require_justification_with_valid_argument_allows_execution() -> None:
     """require_justification 命中且已有结构化说明时允许执行。"""
 
@@ -561,6 +656,42 @@ def _executor(
             diagnostic_emitter=diagnostic_emitter,
         )
     ).tool_executor
+
+
+async def _governed_duplicate_candidate(
+    decision: DuplicateDecisionKind,
+) -> ToolFactAcceptCandidate:
+    """执行重复调用并返回 duplicate governed candidate。
+
+    :param decision: duplicate governance 决策。
+    :returns: 第二次重复调用产生的 governed candidate。
+    """
+
+    tool = _CountingTool({"accepted": "prior"})
+    accept_port = _AcceptingPort()
+    executor = _executor(
+        tool,
+        accept_port,
+        DuplicateGovernancePolicy(
+            default_duplicate_decision=decision,
+            justification_argument_names_by_tool_name=(
+                {"fake_tool": "duplicate_justification"}
+                if decision is DuplicateDecisionKind.REQUIRE_JUSTIFICATION
+                else {}
+            ),
+        ),
+    )
+
+    await executor.execute(
+        _request(
+            _call("tool-call-1", {"ticker": "DAYU"}, index=0),
+            _call("tool-call-2", {"ticker": "DAYU"}, index=1),
+        )
+    )
+
+    candidate = accept_port.candidates[1]
+    assert candidate.tool_fact_kind is ToolFactKind.GOVERNED_ERROR
+    return candidate
 
 
 def _request(

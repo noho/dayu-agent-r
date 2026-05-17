@@ -545,7 +545,7 @@ def _reuse_candidate(
         policy_decision=ToolPolicyDecision(
             kind=ToolPolicyDecisionKind.REUSE,
             reason_code="duplicate_reuse",
-            message="reuse prior accepted result",
+            message="reuse prior accepted tool result",
         ),
         tool_idempotency_key=None,
         diagnostic_refs=(),
