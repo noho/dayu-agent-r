@@ -13,6 +13,7 @@ from __future__ import annotations
 
 import asyncio
 import base64
+import logging
 import secrets
 import time
 from collections.abc import Mapping
@@ -53,12 +54,19 @@ from dayu.contracts.tool_schema import (
     ToolTruncationStrategy,
 )
 from dayu.host.api import AttemptStatus, HostPayloadRef, RunStatus
-from dayu.host.durable.codec import is_sha256_digest, sha256_digest_json
+from dayu.host.durable.codec import (
+    canonical_json_dumps,
+    is_sha256_digest,
+    sha256_digest_json,
+)
 from dayu.host.durable.errors import (
     HostDurableError,
     HostIdempotencyConflictError,
     HostPayloadReferenceError,
     HostTransactionRetryExhaustedError,
+)
+from dayu.host.durable.options import (
+    _DEFAULT_PAYLOAD_INLINE_THRESHOLD_BYTES as _DEFAULT_INLINE_TOOL_RESULT_MAX_BYTES,
 )
 from dayu.host.durable.event_log import (
     EventClass,
@@ -101,6 +109,21 @@ from dayu.host.tooling import (
     FrameworkToolPolicyView,
     ToolBundleSourceRef,
 )
+from dayu.host.tool_runtime_schema_projection import (
+    business_bundle_digest as _business_bundle_digest,
+)
+from dayu.host.tool_runtime_schema_projection import (
+    definitions_by_name as _definitions_by_name,
+)
+from dayu.host.tool_runtime_schema_projection import (
+    tool_schemas_digest as _tool_schemas_digest,
+)
+from dayu.host.tool_runtime_schema_projection import (
+    tool_schema_json as _tool_schema_json,
+)
+from dayu.host.tool_runtime_schema_projection import (
+    validate_reserved_name_conflicts as _validate_reserved_name_conflicts,
+)
 from dayu.host.wait_adapter import WaitAdapterBinding, WaitAdapterRegistry
 from dayu.host.waiting import (
     HostToolAwaitingAcceptPort,
@@ -113,7 +136,9 @@ from dayu.host.waiting import (
     ToolAwaitingRejectedAck,
     build_tool_awaiting_accept_identity_digest,
 )
+from dayu.runtime.log_levels import VERBOSE_LOG_LEVEL
 
+_LOGGER = logging.getLogger(__name__)
 _UNSUPPORTED_EXECUTOR_ERROR = "tool_runtime_not_connected"
 _UNSUPPORTED_EXECUTOR_MESSAGE = (
     "ToolRuntime executor is not connected in Phase 6 S1"
@@ -132,6 +157,7 @@ _MIN_ACCEPT_RETRY_ATTEMPTS = 1
 _MIN_ACCEPT_BACKOFF_SECONDS = 0.0
 _DEFAULT_ACCEPT_RETRY_ATTEMPTS = 2
 _DEFAULT_ACCEPT_BACKOFF_SECONDS = 0.0
+_MAX_LLM_INLINE_TOOL_RESULT_BYTES = _DEFAULT_INLINE_TOOL_RESULT_MAX_BYTES
 _TOOL_RUNTIME_GOVERNED_ERROR = "host_tool_governed_error"
 _TOOL_RUNTIME_POLICY_BLOCKED_ERROR = "tool_call_governed"
 _TOOL_RUNTIME_ACCEPT_REJECTED_ERROR = "tool_accept_rejected"
@@ -145,6 +171,7 @@ _TOOL_RUNTIME_IDEMPOTENCY_REASON = "tool_idempotency_key_required"
 _TOOL_RUNTIME_UNSUPPORTED_AWAITING_REASON = "unsupported_awaiting"
 _TOOL_RUNTIME_AWAITING_BINDING_REASON = "awaiting_adapter_not_configured"
 _TOOL_RUNTIME_AWAITING_EXTERNAL_JOB_REASON = "awaiting_external_job_missing"
+_TOOL_RUNTIME_RESULT_TOO_LARGE_REASON = "tool_result_inline_size_limit_exceeded"
 _TOOL_RUNTIME_AWAITING_BATCH_SUSPENDED_REASON = "run_suspended_by_tool_awaiting"
 _TOOL_RUNTIME_CANCELLED_REASON = "tool_runtime_cancelled"
 _TOOL_RUNTIME_TIMEOUT_REASON = "tool_runtime_timeout"
@@ -386,9 +413,11 @@ class ToolFactAcceptCandidate:
         _validate_common_candidate_fields(self)
         _validate_duplicate_fields(self)
         if self.tool_fact_kind is ToolFactKind.COMPLETED:
+            _validate_result_fact_policy(self)
             _require_sha256_digest(self.outcome_digest, field_name="outcome_digest")
             _require_sha256_digest(self.payload_digest, field_name="payload_digest")
         elif self.tool_fact_kind in (ToolFactKind.FAILED, ToolFactKind.CANCELLED):
+            _validate_result_fact_policy(self)
             _require_sha256_digest(self.outcome_digest, field_name="outcome_digest")
             if self.reuse_prior_event_refs:
                 raise ValueError(
@@ -396,6 +425,7 @@ class ToolFactAcceptCandidate:
                 )
         elif self.tool_fact_kind is ToolFactKind.GOVERNED_ERROR:
             _require_sha256_digest(self.outcome_digest, field_name="outcome_digest")
+            _validate_governed_error_candidate(self)
         elif self.tool_fact_kind is ToolFactKind.REUSE:
             _validate_reuse_candidate(self)
         else:
@@ -961,6 +991,20 @@ class TruncationAppliedOutcome:
 
 
 @dataclass(frozen=True, slots=True)
+class _InlineToolResultGovernance:
+    """LLM inline 工具结果大小治理输出。
+
+    :param outcome: 可安全返回给 Engine 的工具 outcome。
+    :param policy_decision: 与 outcome 匹配的治理决策。
+    :param diagnostic_refs: 本次治理产生的诊断 refs。
+    """
+
+    outcome: ToolExecutionOutcome
+    policy_decision: ToolPolicyDecision
+    diagnostic_refs: tuple["ToolTraceDiagnosticRef", ...]
+
+
+@dataclass(frozen=True, slots=True)
 class ToolTraceDiagnosticRecord:
     """ToolRuntime 诊断记录。
 
@@ -1331,6 +1375,7 @@ class TruncationManager:
             ),
         )
         if truncated_value is None:
+            self._cursors.pop(cursor.cursor_id, None)
             return TruncationAppliedOutcome(
                 outcome=_truncation_failure(
                     _TRUNCATION_UNSUPPORTED_REASON,
@@ -1346,6 +1391,19 @@ class TruncationManager:
                 meta=outcome.result.meta,
             )
         )
+        if (
+            _tool_outcome_inline_size_bytes(truncated_outcome)
+            > _MAX_LLM_INLINE_TOOL_RESULT_BYTES
+        ):
+            self._cursors.pop(cursor.cursor_id, None)
+            return TruncationAppliedOutcome(
+                outcome=_truncation_failure(
+                    _TOOL_RUNTIME_RESULT_TOO_LARGE_REASON,
+                    "truncated tool result exceeded LLM inline size limit",
+                ),
+                cursor_hint=None,
+                fact=None,
+            )
         fact = ToolTruncationFact(
             applied=True,
             strategy=strategy.value,
@@ -1391,12 +1449,22 @@ class TruncationManager:
                 _TRUNCATION_REMAINDER_DIGEST_REASON,
                 "truncation remainder digest mismatch",
             )
+        fetched_outcome = ToolCompletedOutcome(
+            result=ToolResultSuccess(ok=True, value=fetched, meta=None)
+        )
+        if (
+            _tool_outcome_inline_size_bytes(fetched_outcome)
+            > _MAX_LLM_INLINE_TOOL_RESULT_BYTES
+        ):
+            self._cleanup_expired_cursors(datetime.now(UTC))
+            return _truncation_failure(
+                _TOOL_RUNTIME_RESULT_TOO_LARGE_REASON,
+                "fetch_more result exceeded LLM inline size limit",
+            )
         if cursor.single_use:
             self._cursors.pop(cursor.cursor_id, None)
         self._cleanup_expired_cursors(datetime.now(UTC))
-        return ToolCompletedOutcome(
-            result=ToolResultSuccess(ok=True, value=fetched, meta=None)
-        )
+        return fetched_outcome
 
     def _store_cursor(
         self,
@@ -1869,11 +1937,27 @@ class DefaultHostToolFactAcceptPort:
         """
 
         try:
+            _LOGGER.log(
+                VERBOSE_LOG_LEVEL,
+                (
+                    "host.tool_runtime.accept_tool_fact.accepted "
+                    "session_id=%s run_id=%s attempt_id=%s execution_id=%s "
+                    "tool_call_id=%s tool_name=%s tool_fact_kind=%s"
+                ),
+                candidate.session_id,
+                candidate.run_id,
+                candidate.attempt_id,
+                candidate.execution_id,
+                candidate.tool_call_id,
+                candidate.tool_name,
+                candidate.tool_fact_kind.value,
+            )
             result = self._transaction_runner.run_write(
                 lambda transaction: self._accept_in_transaction(
                     transaction, candidate
                 )
             )
+            _log_tool_fact_accept_result(candidate, result)
             if (
                 isinstance(result, ToolFactAcceptedAck)
                 and result.tool_result_event_ref is not None
@@ -1881,19 +1965,23 @@ class DefaultHostToolFactAcceptPort:
                 catch_up_projection_best_effort(self._projection_catchup_port)
             return result
         except HostIdempotencyConflictError:
-            return _rejected_ack(
+            result = _rejected_ack(
                 candidate,
                 ToolAcceptRejectReason.IDEMPOTENCY_CONFLICT,
                 "tool fact accept idempotency conflict",
                 retryable=False,
             )
+            _log_tool_fact_accept_result(candidate, result)
+            return result
         except HostPayloadReferenceError:
-            return _rejected_ack(
+            result = _rejected_ack(
                 candidate,
                 ToolAcceptRejectReason.PAYLOAD_REFERENCE_INVALID,
                 "tool fact payload reference is invalid",
                 retryable=False,
             )
+            _log_tool_fact_accept_result(candidate, result)
+            return result
 
     def _accept_in_transaction(
         self, transaction: HostTransaction, candidate: ToolFactAcceptCandidate
@@ -2396,6 +2484,12 @@ class ToolRuntimeExecutor:
             self._effective_bundle.truncate_specs_by_name.get(call.name),
         )
         accepted_outcome = truncation.outcome
+        bounded_result = self._govern_inline_tool_result(
+            accepted_outcome, policy_decision
+        )
+        accepted_outcome = bounded_result.outcome
+        policy_decision = bounded_result.policy_decision
+        diagnostic_refs = (*duplicate_refs, *bounded_result.diagnostic_refs)
         candidate = _tool_fact_accept_candidate(
             scope=self._execution_scope,
             effective_bundle=self._effective_bundle,
@@ -2408,7 +2502,7 @@ class ToolRuntimeExecutor:
             duplicate_decision=duplicate_decision,
             duplicate_governed=duplicate_governed,
             tool_idempotency_key=_tool_idempotency_key(call, tool_policy),
-            diagnostic_refs=duplicate_refs,
+            diagnostic_refs=diagnostic_refs,
         )
         accept_result = await self._accept_with_retry(candidate)
         if isinstance(accept_result, ToolFactAcceptedAck):
@@ -2427,6 +2521,44 @@ class ToolRuntimeExecutor:
         return BatchToolExecutionRecord(
             tool_call_id=call.tool_call_id,
             outcome=governed,
+        )
+
+    def _govern_inline_tool_result(
+        self,
+        outcome: ToolExecutionOutcome,
+        policy_decision: ToolPolicyDecision,
+    ) -> "_InlineToolResultGovernance":
+        """对将返回给 Engine 的工具结果执行 inline 大小治理。
+
+        :param outcome: 截断后准备进入 accept barrier 的工具 outcome。
+        :param policy_decision: 当前工具治理决策。
+        :returns: 治理后的 outcome、policy decision 与诊断引用。
+        """
+
+        if _tool_outcome_inline_size_bytes(outcome) <= _MAX_LLM_INLINE_TOOL_RESULT_BYTES:
+            return _InlineToolResultGovernance(
+                outcome=outcome,
+                policy_decision=policy_decision,
+                diagnostic_refs=(),
+            )
+        diagnostic_ref = self._diagnostic_emitter.emit(
+            ToolTraceDiagnosticRecord(
+                reason_code=_TOOL_RUNTIME_RESULT_TOO_LARGE_REASON,
+                message=(
+                    "tool result exceeded LLM inline size limit; use "
+                    "truncation, fetch_more limits, payload ref, or artifact ref"
+                ),
+            )
+        )
+        governed_decision = ToolPolicyDecision(
+            kind=ToolPolicyDecisionKind.GOVERNED_ERROR,
+            reason_code=_TOOL_RUNTIME_RESULT_TOO_LARGE_REASON,
+            message="tool result exceeded LLM inline size limit",
+        )
+        return _InlineToolResultGovernance(
+            outcome=_governed_failure_outcome(governed_decision),
+            policy_decision=governed_decision,
+            diagnostic_refs=(diagnostic_ref,),
         )
 
     async def _dispatch_tool_call_with_bounds(
@@ -2882,6 +3014,9 @@ class DefaultToolRuntimeFactory:
             )
             truncation_port: TruncationPort
             if request.effective_bundle_request.enable_truncation_manager:
+                # TruncationManager 是 run-scoped 轻量对象：构造期只保存
+                # identity、effective bundle 的截断声明只读视图和空 cursor
+                # dict；不打开文件、DB、后台任务或 durable cursor table。
                 truncation_manager = TruncationManager(
                     session_id=request.execution_scope.session_id,
                     run_id=request.execution_scope.run_id,
@@ -2982,6 +3117,73 @@ class _ToolAcceptEventPlan:
     requested_id: str
     governed_id: str
     result_id: str
+
+
+def _log_tool_fact_accept_result(
+    candidate: ToolFactAcceptCandidate, result: ToolFactAcceptResult
+) -> None:
+    """记录工具事实 accept barrier 的有界结果。
+
+    :param candidate: 工具事实候选。
+    :param result: accept barrier 结果。
+    :returns: ``None``。
+    """
+
+    if isinstance(result, ToolFactAcceptedAck):
+        _LOGGER.log(
+            VERBOSE_LOG_LEVEL,
+            (
+                "host.tool_runtime.accept_tool_fact.committed "
+                "session_id=%s run_id=%s attempt_id=%s execution_id=%s "
+                "tool_call_id=%s tool_name=%s tool_fact_kind=%s "
+                "tool_fact_id=%s tool_result_event_id=%s accepted_event_count=%s"
+            ),
+            candidate.session_id,
+            candidate.run_id,
+            candidate.attempt_id,
+            candidate.execution_id,
+            candidate.tool_call_id,
+            candidate.tool_name,
+            candidate.tool_fact_kind.value,
+            result.tool_fact_id,
+            None
+            if result.tool_result_event_ref is None
+            else result.tool_result_event_ref.event_id,
+            len(result.accepted_event_refs),
+        )
+        return
+    if isinstance(result, ToolFactRejectedAck):
+        _LOGGER.debug(
+            (
+                "host.tool_runtime.accept_tool_fact.rejected "
+                "session_id=%s run_id=%s attempt_id=%s execution_id=%s "
+                "tool_call_id=%s tool_name=%s reason=%s retryable=%s"
+            ),
+            candidate.session_id,
+            candidate.run_id,
+            candidate.attempt_id,
+            candidate.execution_id,
+            candidate.tool_call_id,
+            candidate.tool_name,
+            result.reason_code.value,
+            result.retryable,
+        )
+        return
+    _LOGGER.debug(
+        (
+            "host.tool_runtime.accept_tool_fact.timed_out "
+            "session_id=%s run_id=%s attempt_id=%s execution_id=%s "
+            "tool_call_id=%s tool_name=%s attempt_count=%s last_error_code=%s"
+        ),
+        candidate.session_id,
+        candidate.run_id,
+        candidate.attempt_id,
+        candidate.execution_id,
+        candidate.tool_call_id,
+        candidate.tool_name,
+        result.attempt_count,
+        result.last_error_code,
+    )
 
 
 def _accept_idempotency_scope(candidate: ToolFactAcceptCandidate) -> IdempotencyScope:
@@ -3612,6 +3814,7 @@ def _validate_common_candidate_fields(candidate: ToolFactAcceptCandidate) -> Non
     )
     if not isinstance(candidate.policy_decision, ToolPolicyDecision):
         raise ValueError("policy_decision must be ToolPolicyDecision")
+    _validate_policy_decision_fields(candidate.policy_decision)
     if not isinstance(candidate.tool_fact_kind, ToolFactKind):
         raise ValueError("tool_fact_kind must be ToolFactKind")
 
@@ -3642,6 +3845,94 @@ def _validate_duplicate_fields(candidate: ToolFactAcceptCandidate) -> None:
         raise ValueError("duplicate decision requires duplicate_key")
 
 
+def _validate_policy_decision_fields(decision: ToolPolicyDecision) -> None:
+    """校验工具治理决策字段组合。
+
+    :param decision: 工具治理决策。
+    :returns: ``None``。
+    :raises ValueError: 决策类别或原因字段组合非法时抛出。
+    """
+
+    if not isinstance(decision.kind, ToolPolicyDecisionKind):
+        raise ValueError("policy_decision.kind must be ToolPolicyDecisionKind")
+    _require_optional_non_empty_text(
+        decision.reason_code, field_name="policy_decision.reason_code"
+    )
+    _require_optional_non_empty_text(
+        decision.message, field_name="policy_decision.message"
+    )
+    if decision.kind is ToolPolicyDecisionKind.ALLOW:
+        if decision.reason_code is not None or decision.message is not None:
+            raise ValueError("allow policy decision must not carry reason or message")
+        return
+    if decision.reason_code is None or decision.message is None:
+        raise ValueError("governed policy decision requires reason and message")
+
+
+def _validate_governed_error_candidate(candidate: ToolFactAcceptCandidate) -> None:
+    """校验 governed error 工具事实候选。
+
+    :param candidate: 工具事实候选。
+    :returns: ``None``。
+    :raises ValueError: policy / duplicate 字段组合不符合 governed error
+        语义时抛出。
+    """
+
+    if candidate.policy_decision.kind in (
+        ToolPolicyDecisionKind.ALLOW,
+        ToolPolicyDecisionKind.REUSE,
+    ):
+        raise ValueError("governed_error requires governed policy decision")
+    if candidate.policy_decision.kind is ToolPolicyDecisionKind.GOVERNED_ERROR:
+        if candidate.reuse_prior_event_refs:
+            raise ValueError("plain governed_error must not carry prior reuse refs")
+        return
+    _validate_duplicate_governed_candidate(candidate)
+
+
+def _validate_duplicate_governed_candidate(
+    candidate: ToolFactAcceptCandidate,
+) -> None:
+    """校验 duplicate 触发的 governed error 候选。
+
+    :param candidate: 工具事实候选。
+    :returns: ``None``。
+    :raises ValueError: duplicate 决策、prior refs 或 reason/message
+        与 policy 决策不一致时抛出。
+    """
+
+    decision = candidate.duplicate_decision
+    if decision is None or decision not in (
+        DuplicateDecisionKind.HINT,
+        DuplicateDecisionKind.REQUIRE_JUSTIFICATION,
+        DuplicateDecisionKind.HARD_STOP,
+    ):
+        raise ValueError("duplicate governed error requires duplicate decision")
+    if candidate.policy_decision.kind.value != decision.value:
+        raise ValueError("duplicate governed policy kind must match decision")
+    if not candidate.reuse_prior_event_refs:
+        raise ValueError("duplicate governed error requires prior event refs")
+    expected_reason = _duplicate_reason_code(decision)
+    if candidate.policy_decision.reason_code != expected_reason:
+        raise ValueError("duplicate governed reason must match decision")
+    expected_message = _duplicate_message(decision)
+    if candidate.policy_decision.message != expected_message:
+        raise ValueError("duplicate governed message must match decision")
+
+
+def _validate_result_fact_policy(candidate: ToolFactAcceptCandidate) -> None:
+    """校验普通结果事实只携带 allow policy。
+
+    :param candidate: 工具事实候选。
+    :returns: ``None``。
+    :raises ValueError: 普通 completed / failed / cancelled fact 携带非
+        allow policy 时抛出。
+    """
+
+    if candidate.policy_decision.kind is not ToolPolicyDecisionKind.ALLOW:
+        raise ValueError(f"{candidate.tool_fact_kind.value} requires allow policy")
+
+
 def _validate_reuse_candidate(candidate: ToolFactAcceptCandidate) -> None:
     """校验 reuse 工具事实候选。
 
@@ -3654,6 +3945,16 @@ def _validate_reuse_candidate(candidate: ToolFactAcceptCandidate) -> None:
         raise ValueError("reuse requires duplicate_key")
     if candidate.duplicate_decision is not DuplicateDecisionKind.REUSE:
         raise ValueError("reuse requires duplicate_decision=reuse")
+    if candidate.policy_decision.kind is not ToolPolicyDecisionKind.REUSE:
+        raise ValueError("reuse requires policy_decision=reuse")
+    if candidate.policy_decision.reason_code != _duplicate_reason_code(
+        DuplicateDecisionKind.REUSE
+    ):
+        raise ValueError("reuse reason must match duplicate decision")
+    if candidate.policy_decision.message != _duplicate_message(
+        DuplicateDecisionKind.REUSE
+    ):
+        raise ValueError("reuse message must match duplicate decision")
     if not candidate.reuse_prior_event_refs:
         raise ValueError("reuse requires prior event refs")
     if candidate.payload_ref is not None or candidate.payload_digest is not None:
@@ -3714,46 +4015,6 @@ def _require_optional_sha256_digest(
 
     if value is not None and not is_sha256_digest(value):
         raise ValueError(f"{field_name} must be a sha256 digest when provided")
-
-
-def _validate_reserved_name_conflicts(
-    bundle: ToolBundle, policy: FrameworkToolPolicyView
-) -> None:
-    """校验业务工具没有占用 framework 预留名。
-
-    :param bundle: 业务工具集合。
-    :param policy: framework tool policy view。
-    :returns: ``None``。
-    :raises ValueError: 业务工具名占用预留名时抛出。
-    """
-
-    reserved = frozenset(
-        tool_name.value for tool_name in policy.reserved_framework_tool_names
-    )
-    for definition in bundle.definitions:
-        if definition.name in reserved:
-            raise ValueError(
-                "business ToolBundle contains reserved framework tool name:"
-                f" {definition.name}"
-            )
-
-
-def _definitions_by_name(
-    definitions: list[ToolDefinition],
-) -> dict[str, ToolDefinition]:
-    """按工具名索引工具声明并拒绝重复名称。
-
-    :param definitions: effective 工具声明列表。
-    :returns: 按名称索引的声明字典。
-    :raises ValueError: 出现重复工具名时抛出。
-    """
-
-    result: dict[str, ToolDefinition] = {}
-    for definition in definitions:
-        if definition.name in result:
-            raise ValueError(f"duplicate effective tool name: {definition.name}")
-        result[definition.name] = definition
-    return result
 
 
 def _fetch_more_tool_definition(callable_: FetchMoreToolCallable) -> ToolDefinition:
@@ -4171,103 +4432,6 @@ def _remainder_digest_matches(remainder: TruncatedRemainderRef) -> bool:
             }
         )
     return False
-
-
-def _business_bundle_digest(bundle: ToolBundle) -> str:
-    """计算业务 bundle 诊断摘要。
-
-    :param bundle: 业务工具集合。
-    :returns: Host canonical sha256 digest。
-    """
-
-    return sha256_digest_json(
-        {
-            "definitions": [
-                _tool_definition_digest_json(definition)
-                for definition in bundle.definitions
-            ]
-        }
-    )
-
-
-def _tool_schemas_digest(tool_schemas: tuple[ToolSchema, ...]) -> str:
-    """计算 effective schema 诊断摘要。
-
-    :param tool_schemas: effective schema 元组。
-    :returns: Host canonical sha256 digest。
-    """
-
-    return sha256_digest_json(
-        {"tool_schemas": [_tool_schema_json(schema) for schema in tool_schemas]}
-    )
-
-
-def _tool_definition_digest_json(definition: ToolDefinition) -> JsonValue:
-    """把工具声明投影为 digest JSON。
-
-    :param definition: 工具声明。
-    :returns: 可用于 canonical digest 的 JSON 值。
-    """
-
-    return {
-        "name": definition.name,
-        "schema": _tool_schema_json(definition.schema),
-        "truncate": _truncate_spec_json(definition.truncate),
-        "tags": list(definition.tags),
-    }
-
-
-def _tool_schema_json(schema: ToolSchema) -> JsonValue:
-    """把 ToolSchema 投影为 digest JSON。
-
-    :param schema: 工具 schema。
-    :returns: JSON 形态 schema。
-    """
-
-    return {
-        "type": schema.type,
-        "function": {
-            "name": schema.function.name,
-            "description": schema.function.description,
-            "parameters": _parameters_json(schema.function.parameters),
-        },
-    }
-
-
-def _parameters_json(parameters: ToolParametersSchema) -> JsonValue:
-    """把工具参数 schema 投影为 digest JSON。
-
-    :param parameters: 工具参数 schema。
-    :returns: JSON 形态参数 schema。
-    """
-
-    result: dict[str, JsonValue] = {
-        "type": parameters.type,
-        "properties": parameters.properties,
-        "required": list(parameters.required),
-    }
-    if parameters.additional_properties is not None:
-        result["additionalProperties"] = parameters.additional_properties
-    return result
-
-
-def _truncate_spec_json(spec: ToolTruncateSpec | None) -> JsonValue:
-    """把截断声明投影为 digest JSON。
-
-    :param spec: 截断声明；无声明时为 ``None``。
-    :returns: JSON 形态截断声明。
-    """
-
-    if spec is None:
-        return None
-    return {
-        "enabled": spec.enabled,
-        "strategy": spec.strategy,
-        "limits": spec.limits,
-        "target_field": spec.target_field,
-        "field_path": list(spec.field_path) if spec.field_path is not None else None,
-        "ttl_seconds": spec.ttl_seconds,
-    }
 
 
 def _request_context_matches_scope(
@@ -4703,6 +4867,17 @@ def _tool_outcome_digest(outcome: ToolExecutionOutcome) -> str:
     """
 
     return sha256_digest_json(_tool_outcome_json(outcome))
+
+
+def _tool_outcome_inline_size_bytes(outcome: ToolExecutionOutcome) -> int:
+    """估算工具 outcome 进入 LLM inline tool message 的 UTF-8 字节数。
+
+    :param outcome: 工具 outcome。
+    :returns: canonical JSON 投影的 UTF-8 字节数。
+    :raises TypeError: 收到不支持的工具 outcome 时抛出。
+    """
+
+    return len(canonical_json_dumps(_tool_outcome_json(outcome)).encode("utf-8"))
 
 
 def _tool_payload_digest(outcome: ToolExecutionOutcome) -> str | None:

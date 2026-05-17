@@ -115,6 +115,20 @@ _EVENT_ID_ATTEMPT_RUNNING_PREFIX = "event-attempt-running"
 _EVENT_ID_ATTEMPT_FAILED_PREFIX = "event-attempt-failed"
 _EVENT_ID_RUN_FAILED_PREFIX = "event-run-failed"
 _LANE_OWNER_PREFIX = "host-dispatch"
+_LOG_DRAIN_LOOP_EMPTY_SLEEPING = (
+    "dispatch drain loop empty queue; sleeping host_handle_id=%s interval_seconds=%s"
+)
+_LOG_DRAIN_LOOP_CLOSE_EXIT = "dispatch drain loop exiting after close host_handle_id=%s"
+_LOG_DRAIN_LOOP_CANCELLED_FOR_CLOSE = (
+    "dispatch drain loop cancelled during close host_handle_id=%s"
+)
+_LOG_DRAIN_LOOP_CANCELLED_EXTERNALLY = (
+    "dispatch drain loop cancelled externally host_handle_id=%s"
+)
+_LOG_DRAIN_LOOP_UNEXPECTED_EXCEPTION = (
+    "dispatch drain loop stopped unexpectedly; continuing host_handle_id=%s "
+    "error_type=%s"
+)
 _LOGGER = logging.getLogger(__name__)
 
 
@@ -493,16 +507,27 @@ class HostDispatchScheduler:
         try:
             while not self._closed:
                 if self._queue.empty():
+                    _LOGGER.debug(
+                        _LOG_DRAIN_LOOP_EMPTY_SLEEPING,
+                        self._host_handle_id,
+                        self._local_execution.dispatch_poll_interval_seconds,
+                    )
                     await asyncio.sleep(
                         self._local_execution.dispatch_poll_interval_seconds
                     )
                 await self.drain_once()
+            _LOGGER.debug(_LOG_DRAIN_LOOP_CLOSE_EXIT, self._host_handle_id)
         except asyncio.CancelledError:
+            _LOGGER.debug(
+                _LOG_DRAIN_LOOP_CANCELLED_FOR_CLOSE
+                if self._closed
+                else _LOG_DRAIN_LOOP_CANCELLED_EXTERNALLY,
+                self._host_handle_id,
+            )
             raise
         except Exception as exc:
             _LOGGER.warning(
-                "dispatch drain loop stopped unexpectedly; continuing "
-                "host_handle_id=%s error_type=%s",
+                _LOG_DRAIN_LOOP_UNEXPECTED_EXCEPTION,
                 self._host_handle_id,
                 exc.__class__.__name__,
                 exc_info=True,
@@ -1226,10 +1251,12 @@ def _is_dispatchable_recheck(
         and run.current_attempt_id == record.attempt_id
         and attempt.status == AttemptStatus.STARTING
         and attempt.execution_id == record.execution_id
-        and dispatch_record.status
-        in (DispatchRecordStatus.PENDING, DispatchRecordStatus.WAITING_FOR_LANE)
+        and dispatch_record.status == DispatchRecordStatus.WAITING_FOR_LANE
         and dispatch_record.dispatch_record_id == record.dispatch_record_id
         and dispatch_record.execution_id == record.execution_id
+        and dispatch_record.owner_host_instance_id is not None
+        and dispatch_record.waiting_for_lane_at is not None
+        and dispatch_record.lane_name is not None
         and dispatch_record.worker_accept_event_id is None
         and dispatch_record.cancelled_event_id is None
     )

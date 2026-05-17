@@ -142,7 +142,8 @@ implementation、review、fix 与 re-review 的项目级术语真源。包级 RE
 - 取消等待 / race helper。
 - `lane`：cross-process named semaphore / capacity guard。调用方显式传入独立 SQLite runtime lane DB 路径，并通过
   `LaneController` 获取、刷新和释放具名容量 claim；等待 acquire 支持 timeout、协作式 cancellation 与
-  `Task.cancel()` 透传，controller close 会取消 pending acquire 并尽力释放当前 tokens。lane 只表达 runtime capacity
+  `Task.cancel()` 透传，协作式取消优先于 timeout。heartbeat / token lost 与 release failure 会通过 runtime lane
+  error 或 warning 暴露；controller close 会取消 pending acquire 并尽力释放当前 tokens。lane 只表达 runtime capacity
   claim，不保存 Session / Run / Attempt / EventLog / Tool / Fins 字段，也不承诺 FIFO、公平性、lease / fencing、
   Attempt owner、Host admission 或 recovery proof。
 - `filelock`：对第三方 `FileLock` 的同步 wrapper，只用于普通文件访问互斥。调用方传入显式 lock file 路径，可选择创建
@@ -163,12 +164,12 @@ Dayu 的日志用于诊断系统执行过程，不承担 UI 输出职责。面�
 
 | 级别 | 用途 |
 | --- | --- |
-| `DEBUG` | 看清执行细节。用于 Engine / Runner 的有界策略分支、事件分类、计数、finish reason、usage token、retry 判断等诊断信息。不得输出大 prompt、大 tool result、delta 全量、provider secret 或大段响应。 |
-| `VERBOSE` | 看清执行路径。用于 Engine run 开始 / 结束、iteration 边界、Runner 调用开始 / 结束、tool loop 进入 / 退出、fallback / continuation 与 terminal 产出等骨架日志。它应比 `DEBUG` 更安静，适合人工跟踪一次 run 的主路径。 |
-| `INFO` | 汇报重要信息。用于进程启动、smoke 摘要、run finished 摘要等调用方或运维人员需要知道的非异常信息。生产默认 `INFO` 应保持克制。 |
-| `WARN` | 汇报可恢复异常。用于 provider 临时失败后 retry、可降级协议差异等需要关注但本次执行仍可继续的情况。 |
-| `ERROR` | 汇报本次操作失败。用于 Engine run failed、provider 协议错误导致执行失败等。 |
-| `CRITICAL` | 汇报系统 invariant / contract 被破坏。用于按设计绝不应发生的断言级事件，例如 EngineEvent stream 结束但没有 terminal event。 |
+| `DEBUG` | 看清执行细节。用于 Engine / Runner 的有界策略分支、事件分类、计数、finish reason、usage token、retry 判断，以及 Host command / dispatch / ingest / projection / ToolRuntime / wait adapter 的受控分支、CAS 结果、cursor、计数和 diagnostic refs。不得输出大 prompt、大 tool result、delta 全量、provider secret、完整业务 payload 或大段响应。 |
+| `VERBOSE` | 看清执行路径。用于 Engine run 开始 / 结束、iteration 边界、Runner 调用开始 / 结束、tool loop 进入 / 退出、fallback / continuation 与 terminal 产出，以及 Host command accepted / committed、dispatch 状态推进、WorkerProxy accept、EngineEvent ingest、terminal closeout、projection catch-up、wait resolve 等骨架日志。它应比 `DEBUG` 更安静，适合人工跟踪一次 run 的主路径。 |
+| `INFO` | 汇报重要信息。用于进程启动、Host handle / scheduler 启停、smoke 摘要、run finished 摘要等调用方或运维人员需要知道的非异常信息。生产默认 `INFO` 应保持克制。 |
+| `WARN` | 汇报可恢复异常。用于 provider 临时失败后 retry、可降级协议差异、Host projection catch-up 失败但 command 已提交、wait adapter 单条 observation 失败、worker startup / closeout 可诊断失败等需要关注但不破坏 Host truth 的情况。 |
+| `ERROR` | 汇报本次操作失败。用于 Engine run failed、provider 协议错误导致执行失败、Host command 无法完成、dispatch / worker 本次执行失败、projection repair 明确失败等。 |
+| `CRITICAL` | 汇报系统 invariant / contract 被破坏。用于按设计绝不应发生的断言级事件，例如 EngineEvent stream 结束但没有 terminal event、Host canonical owner 边界被破坏、EventLog / state index 不一致、ToolRuntime accept barrier 被绕过等。 |
 
 `dayu.runtime.log_levels` 是层中立日志 level 数值真源，统一定义 Dayu 使用的标准级别整数常量与 `VERBOSE=15` 数值；该模块无装配副作用，不注册 stdlib level name、不安装 handler、不读取配置。
 
@@ -178,13 +179,23 @@ Dayu 的日志用于诊断系统执行过程，不承担 UI 输出职责。面�
 
 - Engine 负责记录自身状态机路径：run 开始、iteration 边界、Runner 调用、Runner event 分类后的关键决策、tool loop、fallback、continuation、terminal。
 - Runner / provider 层负责记录传输诊断信息：HTTP attempt、响应状态、provider request id、retry / backoff、SSE idle heartbeat / timeout 等。
-- Engine / Runner 日志不得泄漏 provider secret、完整 prompt、完整工具参数、完整工具结果、delta 全量或大段响应。
+- Host 负责记录治理路径：public command validation / accepted / committed、EventLog append 与 canonical owner 决策、dispatch record 状态推进、lane acquire / release 结果、WorkerProxy accept / close、EngineEvent ingest 分类、Run / Attempt terminal closeout、ToolRuntime accept barrier、wait resolve / late rejection、projection catch-up / repair 和 after-commit wakeup。
+- Host projection / sink / wait adapter 日志只表达 projection-local 或 adapter-local 观测，不得让日志成为事实真源；projection / sink / adapter 失败不能通过日志反向改变 EventLog、Run / Attempt 或 wait record 状态。
+- Engine / Runner / Host 日志不得泄漏 provider secret、完整 prompt、完整工具参数、完整工具结果、delta 全量、财报原文、大 payload、authorization claims 原文或大段响应。需要关联大对象时只记录 typed ref、digest、event id、event sequence、payload ref、tool call id 或 policy / diagnostic ref。
+- 日志不是 public API，不承担 UI 输出、审计真源、tool trace 热 / 冷数据、EventLog canonical fact 或 projection checkpoint 职责。需要稳定查询、审计、恢复或投递的事实必须进入对应 typed EventLog / projection / audit / tool trace 机制。
 
 日志字段命名统一使用以下词汇：
 
 - `run_id`：一次 Engine run 标识。
+- `session_id`：Host Session 标识。
+- `attempt_id` / `execution_id`：Host 当前 Attempt 与执行 epoch；用于判断事件是否属于当前 active attempt。
+- `event_id` / `event_sequence`：Host EventLog 事件标识与全局 cursor。
+- `dispatch_record_id` / `dispatch_status`：Host dispatch record 诊断标识与状态。
+- `wait_id` / `adapter_key`：Host wait record 与 wait adapter 诊断标识。
 - `iteration_id` / `iteration_index`：Engine 内一次模型调用与后续决策循环。
 - `provider` / `request_id`：Runner / provider 传输诊断标识。
+- `tool_call_id` / `tool_name`：工具调用诊断标识；日志只记录工具名、调用 id、digest 或 refs，不记录完整参数 / 结果。
+- `consumer_id` / `cursor`：projection / sink consumer 与 checkpoint / catch-up cursor。
 
 ## Contract Ownership
 
@@ -207,7 +218,7 @@ Dayu 的日志用于诊断系统执行过程，不承担 UI 输出职责。面�
 - `@tool(...)` 是工具声明入口，用于在工具现场同源声明 `ToolSchema`、截断声明、展示 metadata、标签和单工具 callable。
 - `ToolDefinition` 是 Host / ToolRuntime 的装配输入，包含 schema、truncate、display、tags 与 `ToolCallable`；它不进入 Engine request，也不作为 Engine 稳定接口。
 - 外部工具注册组件是工具发现 / 注册边界，产出业务 `ToolBundle` 并通过 `HostToolingOptions` 传给 Host construction。Host 包不得 import 具体业务工具模块；新增工具应通过外部注册组件 / 配置 / Service composition 接入。
-- `fetch_more` 不由外部业务 `ToolBundle` 提供；ToolRuntime factory 根据 TruncationManager 注入 framework tool，生成 attempt-local effective `ToolBundle`。RunInputBuilder 投影给 Engine 的 `tool_schemas` 必须来自 effective ToolBundle。
+- `fetch_more` 不由外部业务 `ToolBundle` 提供；ToolRuntime factory 根据 TruncationManager 注入 framework tool，生成 attempt-local effective `ToolBundle`。RunInputBuilder 投影给 Engine 的 `tool_schemas` 与 ToolRuntime 执行使用的 `tool_executor` 必须来自同一个 effective ToolBundle。
 - `ToolCallable` 是单工具调用协议，形状是 `async (call: ToolCallRequest, context: BatchToolExecutionContext) -> ToolExecutionOutcome`。工具函数可以通过闭包捕获 Web client、仓储、manager 等 Host 私有依赖。
 - `ToolExecutor` 是 Host / ToolRuntime 治理后的 batch 执行入口，形状是 `execute(BatchToolExecutionRequest) -> BatchToolExecutionOutcome`。Engine 只调用这个入口，不调用单工具 callable。
 

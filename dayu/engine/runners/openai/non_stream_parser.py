@@ -45,6 +45,7 @@ from dayu.engine.runners.openai._types import (
     _ReasoningProtocolHook,
 )
 from dayu.engine.runners.openai.tool_call_aggregator import ToolCallAggregator
+from dayu.engine.runners.openai.usage import coerce_usage
 from dayu.engine.runners.openai.xml_tag_extractor import (
     StreamingXMLTagExtractor,
 )
@@ -299,19 +300,25 @@ def _emit_from_dict(
         )
     usage = parsed.get("usage")
     if isinstance(usage, dict):
-        prompt_tokens = usage.get("prompt_tokens")
-        completion_tokens = usage.get("completion_tokens")
-        total_tokens = usage.get("total_tokens")
-        if (
-            isinstance(prompt_tokens, int)
-            and isinstance(completion_tokens, int)
-            and isinstance(total_tokens, int)
-        ):
+        normalized = coerce_usage(usage)
+        if normalized is None:
+            prompt_tokens = usage.get("prompt_tokens")
+            completion_tokens = usage.get("completion_tokens")
+            total_tokens = usage.get("total_tokens")
+            _LOGGER.warning(
+                "non_stream.protocol_diagnostic code=usage_field_malformed "
+                "prompt_tokens_type=%s completion_tokens_type=%s "
+                "total_tokens_type=%s",
+                type(prompt_tokens).__name__,
+                type(completion_tokens).__name__,
+                type(total_tokens).__name__,
+            )
+        else:
             yield _make_event(
                 RunnerUsageRecordedData(
-                    prompt_tokens=prompt_tokens,
-                    completion_tokens=completion_tokens,
-                    total_tokens=total_tokens,
+                    prompt_tokens=normalized.prompt_tokens,
+                    completion_tokens=normalized.completion_tokens,
+                    total_tokens=normalized.total_tokens,
                 )
             )
     if tool_calls_emitted:

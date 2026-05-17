@@ -8,6 +8,7 @@ supervisor，不实现 Engine dispatch、EventLog stream 或 purge。
 
 from __future__ import annotations
 
+import logging
 from dataclasses import dataclass
 from typing import NoReturn
 from uuid import uuid4
@@ -51,6 +52,15 @@ from dayu.host.durable.connection import (
     HostDurableStore,
     open_host_durable_store,
 )
+from dayu.host.durable.errors import (
+    HostDurableConfigError,
+    HostDurableError,
+    HostForeignKeyError,
+    HostIdempotencyConflictError,
+    HostTransactionBusyError,
+    HostTransactionRetryExhaustedError,
+    HostUniqueConstraintError,
+)
 from dayu.host.durable.options import (
     HostDurableStoreOptions,
     HostSQLiteStoragePolicy,
@@ -83,8 +93,10 @@ from dayu.host.dispatch import (
     ActiveWorkerRegistry,
 )
 from dayu.host.waiting import DefaultHostResolveWaitService
+from dayu.runtime.log_levels import VERBOSE_LOG_LEVEL
 
 _GENERATED_HANDLE_ID_PREFIX = "host-command"
+_LOGGER = logging.getLogger(__name__)
 _OPERATION_CREATE_SESSION = "create_session"
 _OPERATION_CLOSE_SESSION = "close_session"
 _OPERATION_START_RUN = "start_run"
@@ -165,27 +177,36 @@ class HostCommandHandle:
         """
 
         self._raise_if_closed()
-        return self._durable_store.transaction_runner
+        try:
+            return self._durable_store.transaction_runner
+        except HostDurableError as exc:
+            raise _host_api_error_from_durable_error(exc) from exc
 
     def _run_read(self, operation: HostReadTransactionOperation[T]) -> T:
         """在 handle 私有 store 上执行 read transaction。
 
         :param operation: read transaction body。
         :returns: operation 返回值。
-        :raises HostApiError: handle 已关闭时抛出。
+        :raises HostApiError: handle 已关闭或 durable 读取失败时抛出。
         """
 
-        return self._transaction_runner().run_read(operation)
+        try:
+            return self._transaction_runner().run_read(operation)
+        except HostDurableError as exc:
+            raise _host_api_error_from_durable_error(exc) from exc
 
     def _run_write(self, operation: HostTransactionOperation[T]) -> T:
         """在 handle 私有 store 上执行 write transaction。
 
         :param operation: write transaction body。
         :returns: operation 返回值。
-        :raises HostApiError: handle 已关闭时抛出。
+        :raises HostApiError: handle 已关闭或 durable 写入失败时抛出。
         """
 
-        return self._transaction_runner().run_write(operation)
+        try:
+            return self._transaction_runner().run_write(operation)
+        except HostDurableError as exc:
+            raise _host_api_error_from_durable_error(exc) from exc
 
     def _raise_if_closed(self) -> None:
         """检查 handle 是否已经关闭。
@@ -213,8 +234,7 @@ def create_host_command_handle(
     :param active_registry: active worker registry；不传时为当前 handle 创建新 registry。
     :returns: 已打开 durable store 并装配内部依赖的 ``HostCommandHandle``。
     :raises ValueError: ``local_execution`` 非空时抛出；scheduler 需显式异步装配。
-    :raises HostDurableConfigError: durable store 配置非法时由底层抛出。
-    :raises HostDurableError: durable store 打开或 schema bootstrap 失败时由底层抛出。
+    :raises HostApiError: durable store 配置、打开或 schema bootstrap 失败时抛出。
     """
 
     if options.local_execution is not None:
@@ -223,7 +243,10 @@ def create_host_command_handle(
             "create_host_command_handle; open HostDispatchScheduler explicitly"
         )
     durable_options = _durable_options_from_public_options(options)
-    durable_store = open_host_durable_store(durable_options)
+    try:
+        durable_store = open_host_durable_store(durable_options)
+    except HostDurableError as exc:
+        raise _host_api_error_from_durable_error(exc) from exc
     try:
         admission_service = create_host_admission_service(
             durable_store.transaction_runner
@@ -238,6 +261,9 @@ def create_host_command_handle(
                 else ActiveWorkerRegistry()
             ),
         )
+    except HostDurableError as exc:
+        durable_store.close()
+        raise _host_api_error_from_durable_error(exc) from exc
     except Exception:
         durable_store.close()
         raise
@@ -254,7 +280,10 @@ def ensure_session(
     :raises HostApiError: handle 已关闭或 durable session 不一致时抛出。
     """
 
-    result = _ensure_session_in_durable(host._transaction_runner(), request)
+    try:
+        result = _ensure_session_in_durable(host._transaction_runner(), request)
+    except HostDurableError as exc:
+        raise _host_api_error_from_durable_error(exc) from exc
     return result.snapshot
 
 
@@ -275,11 +304,14 @@ def create_session(
 
     caller_digest = _create_session_public_semantic_digest(request)
     durable_request = _request_without_create_metadata(request)
-    result = _create_session_in_durable(
-        host._transaction_runner(),
-        durable_request,
-        caller_semantic_digest=caller_digest,
-    )
+    try:
+        result = _create_session_in_durable(
+            host._transaction_runner(),
+            durable_request,
+            caller_semantic_digest=caller_digest,
+        )
+    except HostDurableError as exc:
+        raise _host_api_error_from_durable_error(exc) from exc
     return result.snapshot
 
 
@@ -300,12 +332,15 @@ def close_session(
     caller_digest = _close_session_public_semantic_digest(
         session_id=session_id, request=request
     )
-    result = _close_session_in_durable(
-        host._transaction_runner(),
-        session_id,
-        request,
-        caller_semantic_digest=caller_digest,
-    )
+    try:
+        result = _close_session_in_durable(
+            host._transaction_runner(),
+            session_id,
+            request,
+            caller_semantic_digest=caller_digest,
+        )
+    except HostDurableError as exc:
+        raise _host_api_error_from_durable_error(exc) from exc
     return result.snapshot
 
 
@@ -319,9 +354,28 @@ def start_run(host: HostCommandHandle, request: StartRunRequest) -> RunSnapshot:
     """
 
     host._raise_if_closed()
-    result = host._admission_service.start_run(
-        request,
-        caller_semantic_digest=_start_run_public_semantic_digest(request),
+    _LOGGER.log(
+        VERBOSE_LOG_LEVEL,
+        "host.command.accepted operation=start_run session_id=%s",
+        request.session_id,
+    )
+    try:
+        result = host._admission_service.start_run(
+            request,
+            caller_semantic_digest=_start_run_public_semantic_digest(request),
+        )
+    except HostDurableError as exc:
+        raise _host_api_error_from_durable_error(exc) from exc
+    _LOGGER.log(
+        VERBOSE_LOG_LEVEL,
+        (
+            "host.command.committed operation=start_run session_id=%s "
+            "run_id=%s run_status=%s input_event_id=%s"
+        ),
+        result.run.session_id,
+        result.run.run_id,
+        result.run.status.value,
+        result.run.input_event_id,
     )
     return run_snapshot_from_row(result.run)
 
@@ -356,12 +410,35 @@ def submit_followup(
             message="submit_followup steer is deferred beyond Phase 4",
             retryable=False,
         )
-    result = host._admission_service.submit_followup_queue(
-        SubmitFollowupQueueAdmissionInput(
-            request=request,
-            resolved_execution_target=_PUBLIC_FOLLOWUP_DEFAULT_EXECUTION_TARGET,
+    _LOGGER.log(
+        VERBOSE_LOG_LEVEL,
+        "host.command.accepted operation=submit_followup session_id=%s",
+        request.session_id,
+    )
+    try:
+        result = host._admission_service.submit_followup_queue(
+            SubmitFollowupQueueAdmissionInput(
+                request=request,
+                resolved_execution_target=(
+                    _PUBLIC_FOLLOWUP_DEFAULT_EXECUTION_TARGET
+                ),
+            ),
+            caller_semantic_digest=_submit_followup_public_semantic_digest(
+                request
+            ),
+        )
+    except HostDurableError as exc:
+        raise _host_api_error_from_durable_error(exc) from exc
+    _LOGGER.log(
+        VERBOSE_LOG_LEVEL,
+        (
+            "host.command.committed operation=submit_followup session_id=%s "
+            "run_id=%s run_status=%s input_event_id=%s"
         ),
-        caller_semantic_digest=_submit_followup_public_semantic_digest(request),
+        result.run.session_id,
+        result.run.run_id,
+        result.run.status.value,
+        result.run.input_event_id,
     )
     return FollowupSnapshot(
         accepted_input_ref=result.run.input_event_id,
@@ -401,6 +478,8 @@ def cancel_run(
                 request=request,
             ),
         )
+    except HostDurableError as exc:
+        raise _host_api_error_from_durable_error(exc) from exc
     except HostApiError as exc:
         if exc.code == HostApiErrorCode.INVALID_STATE and _is_deferred_cancel_state(
             host, run_id
@@ -445,14 +524,17 @@ def cancel_session_runs(
     """
 
     host._raise_if_closed()
-    result = host._admission_service.cancel_session_runs(
-        session_id,
-        request,
-        caller_semantic_digest=_cancel_session_runs_public_semantic_digest(
-            session_id=session_id,
-            request=request,
-        ),
-    )
+    try:
+        result = host._admission_service.cancel_session_runs(
+            session_id,
+            request,
+            caller_semantic_digest=_cancel_session_runs_public_semantic_digest(
+                session_id=session_id,
+                request=request,
+            ),
+        )
+    except HostDurableError as exc:
+        raise _host_api_error_from_durable_error(exc) from exc
     _propagate_active_cancel_targets(
         host,
         tuple(
@@ -482,6 +564,7 @@ def retry_run(
     :raises HostApiError: 始终以 ``UNSUPPORTED_OPERATION`` 抛出。
     """
 
+    host._raise_if_closed()
     _raise_unsupported_operation("retry_run")
 
 
@@ -499,6 +582,7 @@ def replay_run(
     :raises HostApiError: 始终以 ``UNSUPPORTED_OPERATION`` 抛出。
     """
 
+    host._raise_if_closed()
     _raise_unsupported_operation("replay_run")
 
 
@@ -514,18 +598,43 @@ def resolve_wait(
     :raises HostApiError: handle 已关闭、wait 缺失、状态非法或幂等冲突时抛出。
     """
 
-    transaction_runner = host._transaction_runner()
-    service = DefaultHostResolveWaitService(
-        transaction_runner=transaction_runner,
-        event_log_store=host._admission_service.event_log_store,
-        idempotency_store=host._admission_service.idempotency_store,
-        projection_catchup_port=host._admission_service.projection_catchup_port,
+    host._raise_if_closed()
+    _LOGGER.log(
+        VERBOSE_LOG_LEVEL,
+        "host.command.accepted operation=resolve_wait wait_id=%s",
+        wait_id,
     )
-    result = service.resolve_wait(wait_id, request)
+    try:
+        transaction_runner = host._transaction_runner()
+        service = DefaultHostResolveWaitService(
+            transaction_runner=transaction_runner,
+            event_log_store=host._admission_service.event_log_store,
+            idempotency_store=host._admission_service.idempotency_store,
+            projection_catchup_port=(
+                host._admission_service.projection_catchup_port
+            ),
+        )
+        result = service.resolve_wait(wait_id, request)
+    except HostDurableError as exc:
+        raise _host_api_error_from_durable_error(exc) from exc
     if result.dispatch_record is not None and not result.idempotent_replay:
         host._admission_service.wakeup_port.wake_dispatch(
             _pending_dispatch_from_row(result.dispatch_record)
         )
+    _LOGGER.log(
+        VERBOSE_LOG_LEVEL,
+        (
+            "host.command.committed operation=resolve_wait session_id=%s "
+            "run_id=%s run_status=%s wait_id=%s dispatch_record_id=%s"
+        ),
+        result.run.session_id,
+        result.run.run_id,
+        result.run.status.value,
+        wait_id,
+        None
+        if result.dispatch_record is None
+        else result.dispatch_record.dispatch_record_id,
+    )
     return run_snapshot_from_row(result.run)
 
 
@@ -545,7 +654,54 @@ def purge_session(
     :raises HostApiError: 始终以 ``UNSUPPORTED_OPERATION`` 抛出。
     """
 
+    host._raise_if_closed()
     _raise_unsupported_operation("purge_session")
+
+
+def _host_api_error_from_durable_error(error: HostDurableError) -> HostApiError:
+    """把 durable/internal 错误转换为 public Host API 错误。
+
+    :param error: durable 层或内部运行期抛出的结构化错误。
+    :returns: public Host API 错误。
+    """
+
+    if isinstance(error, HostIdempotencyConflictError):
+        return HostApiError(
+            code=HostApiErrorCode.IDEMPOTENCY_CONFLICT,
+            message="Host command idempotency conflict",
+            retryable=False,
+        )
+    if isinstance(error, HostForeignKeyError):
+        return HostApiError(
+            code=HostApiErrorCode.NOT_FOUND,
+            message="Host command referenced durable row was not found",
+            retryable=False,
+        )
+    if isinstance(error, HostUniqueConstraintError):
+        return HostApiError(
+            code=HostApiErrorCode.CONFLICT,
+            message="Host command durable identity conflict",
+            retryable=False,
+        )
+    if isinstance(
+        error, HostTransactionBusyError | HostTransactionRetryExhaustedError
+    ):
+        return HostApiError(
+            code=HostApiErrorCode.INTERNAL_ERROR,
+            message="Host durable transaction is busy",
+            retryable=True,
+        )
+    if isinstance(error, HostDurableConfigError):
+        return HostApiError(
+            code=HostApiErrorCode.INVALID_STATE,
+            message="Host durable configuration is invalid",
+            retryable=False,
+        )
+    return HostApiError(
+        code=HostApiErrorCode.INTERNAL_ERROR,
+        message="Host durable operation failed",
+        retryable=False,
+    )
 
 
 def _durable_options_from_public_options(

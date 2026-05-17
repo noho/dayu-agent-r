@@ -3,8 +3,8 @@
 通过 AST 扫描 ``dayu/contracts/`` 下所有 ``.py`` 文件的 import 语句，
 确保：
 
-- 永久禁止：``dayu.engine`` / ``dayu.host`` / ``dayu.service`` /
-  ``dayu.ui`` / ``dayu.fins``（任意子模块）。
+- 永久禁止：``dayu.engine`` / ``dayu.host`` / ``dayu.runtime`` /
+  ``dayu.service`` / ``dayu.ui`` / ``dayu.fins``（任意子模块）。
 - Phase 0 当前禁止：``aiohttp`` / ``requests`` / ``httpx``。
 
 公共契约层不允许反向依赖任何上层包。
@@ -22,6 +22,7 @@ PHASE0_FORBIDDEN_PREFIXES: tuple[str, ...] = ("aiohttp", "requests", "httpx")
 CONTRACTS_PERMANENT_FORBIDDEN_PREFIXES: tuple[str, ...] = (
     "dayu.engine",
     "dayu.host",
+    "dayu.runtime",
     "dayu.service",
     "dayu.ui",
     "dayu.fins",

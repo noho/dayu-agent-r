@@ -22,7 +22,8 @@ from dayu.host.api import (
     SessionSnapshot,
 )
 from dayu.host.command import HostCommandHandle
-from dayu.host.durable.event_log import EventLogRow, read_events_after
+from dayu.host.durable.errors import HostDurableError
+from dayu.host.durable.event_log import EventClass, EventLogRow, read_events_after
 from dayu.host.durable.state import (
     read_run_by_id,
     read_session_by_id,
@@ -205,18 +206,35 @@ def _event_view_from_row(row: EventLogRow) -> HostEventView:
 
     :param row: EventLog durable row。
     :returns: 不包含 policy decision、reason 或 inline payload 的事件视图。
+    :raises HostDurableError: EventLog class 不是当前 public event class 时抛出。
     """
 
     return HostEventView(
         event_sequence=row.event_sequence,
         event_id=row.event_id,
-        event_class=HostEventClass(row.event_class.value),
+        event_class=_public_event_class_from_durable(row.event_class),
         event_type=row.event_type,
         session_id=row.session_id,
         run_id=row.run_id,
         payload_ref=row.payload_ref,
         payload_digest=row.payload_digest,
     )
+
+
+def _public_event_class_from_durable(event_class: EventClass) -> HostEventClass:
+    """把 durable EventLog class 映射为 public HostEventClass。
+
+    :param event_class: durable EventLog row 的事件分类。
+    :returns: public event class。
+    :raises HostDurableError: 事件分类不是当前 public enum 成员时抛出。
+    """
+
+    if not isinstance(event_class, EventClass):
+        raise HostDurableError("EventLog event_class is invalid")
+    try:
+        return HostEventClass(event_class.value)
+    except ValueError as exc:
+        raise HostDurableError("EventLog event_class is not public") from exc
 
 
 __all__ = ["get_run", "get_session", "stream_run_events"]

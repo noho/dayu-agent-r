@@ -44,7 +44,17 @@ from dayu.engine.contracts.tool_records import (
     AwaitingToolExecutionRecord,
 )
 from dayu.host.admission import PendingDispatchRecord
-from dayu.host.api import AttemptStatus, EnsureSessionRequest, RunStatus
+from dayu.host.api import (
+    AttemptStatus,
+    EnsureSessionRequest,
+    HostCallContext,
+    OperationContext,
+    ResolveWaitCompletedOutcome,
+    ResolveWaitRequest,
+    RunStatus,
+    WaitAdapterKey,
+    WaitResolutionSource,
+)
 from dayu.host.durable.codec import sha256_digest_json
 from dayu.host.durable.connection import open_host_durable_store
 from dayu.host.durable.event_log import (
@@ -72,6 +82,7 @@ from dayu.host.durable.session_lifecycle import ensure_session
 from dayu.host.durable.state import (
     DispatchRecordStatus,
     RunStartReason,
+    WaitResumePolicy,
     WorkerKind,
     mark_dispatch_waiting_for_lane_row,
     mark_dispatching_after_lane_row,
@@ -80,6 +91,13 @@ from dayu.host.durable.state import (
     read_run_by_id,
 )
 from dayu.host.durable.transaction import HostTransaction, HostTransactionRunner
+from dayu.host.wait_adapter import WaitAdapterBinding, WaitExternalJobRefSource
+from dayu.host.waiting import (
+    DefaultHostResolveWaitService,
+    DefaultHostToolAwaitingAcceptPort,
+    ToolAwaitingAcceptCandidate,
+    ToolAwaitingAcceptedAck,
+)
 from dayu.host.engine_ingest import (
     EngineEventCandidate,
     EngineEventIngestor,
@@ -361,6 +379,244 @@ def test_tool_awaiting_only_writes_diagnostic_and_duplicate_is_idempotent(
         run_status, attempt_status = _statuses(store.transaction_runner, seeded)
         assert run_status == RunStatus.RUNNING
         assert attempt_status == AttemptStatus.RUNNING
+
+
+def test_tool_awaiting_confirms_only_matching_host_accepted_wait_refs(
+    tmp_path: Path,
+) -> None:
+    """tool_awaiting 只有匹配 Host accepted wait refs 时才记为确认。"""
+
+    with open_host_durable_store(_options(tmp_path)) as store:
+        seeded = _seed_active_run(store.transaction_runner)
+        accept_result = DefaultHostToolAwaitingAcceptPort(
+            transaction_runner=store.transaction_runner
+        ).accept_tool_awaiting(_awaiting_accept_candidate(seeded))
+        assert isinstance(accept_result, ToolAwaitingAcceptedAck)
+        candidate = _candidate(
+            seeded,
+            worker_event_index=20,
+            data=ToolAwaitingData(
+                iteration_id="iter-tool",
+                record=_awaiting_tool_record(),
+            ),
+            event_type=EngineEventType.TOOL_AWAITING,
+        )
+
+        result = EngineEventIngestor(
+            transaction_runner=store.transaction_runner
+        ).ingest(candidate)
+
+        assert result.status == EngineIngestStatus.ACCEPTED
+        assert result.reason == "waiting_event_confirmation"
+        payload = _payload(result.events[0])
+        assert payload["waiting_confirmation_accepted"] is True
+        assert payload["waiting_confirmation_mismatch_reason"] is None
+        assert payload["wait_id"] == accept_result.wait_id
+        assert _canonical_tool_event_count(store.transaction_runner) == 1
+        run_status, attempt_status = _statuses(store.transaction_runner, seeded)
+        assert run_status == RunStatus.WAITING
+        assert attempt_status == AttemptStatus.SUSPENDED
+
+
+def test_run_suspended_confirms_only_matching_host_accepted_wait_refs(
+    tmp_path: Path,
+) -> None:
+    """run_suspended 只有匹配 Host accepted wait refs 时才记为确认。"""
+
+    with open_host_durable_store(_options(tmp_path)) as store:
+        seeded = _seed_active_run(store.transaction_runner)
+        accept_result = DefaultHostToolAwaitingAcceptPort(
+            transaction_runner=store.transaction_runner
+        ).accept_tool_awaiting(_awaiting_accept_candidate(seeded))
+        assert isinstance(accept_result, ToolAwaitingAcceptedAck)
+        candidate = _candidate(
+            seeded,
+            worker_event_index=21,
+            data=RunSuspendedData(
+                reason="tool_awaiting",
+                resume_hint=None,
+                accepted_records=(),
+                awaiting_records=(_awaiting_tool_record(),),
+            ),
+            event_type=EngineEventType.RUN_SUSPENDED,
+        )
+
+        result = EngineEventIngestor(
+            transaction_runner=store.transaction_runner
+        ).ingest(candidate)
+
+        assert result.status == EngineIngestStatus.ACCEPTED
+        assert result.reason == "waiting_event_confirmation"
+        payload = _payload(result.events[0])
+        assert payload["waiting_confirmation_accepted"] is True
+        assert payload["wait_id"] == accept_result.wait_id
+        assert _event_count(store.transaction_runner, "ATTEMPT_SUSPENDED") == 1
+        run_status, attempt_status = _statuses(store.transaction_runner, seeded)
+        assert run_status == RunStatus.WAITING
+        assert attempt_status == AttemptStatus.SUSPENDED
+
+
+def test_tool_awaiting_rejects_mismatched_engine_record_without_state_change(
+    tmp_path: Path,
+) -> None:
+    """Engine awaiting record 不匹配 wait record 时只能写未确认 diagnostic。"""
+
+    with open_host_durable_store(_options(tmp_path)) as store:
+        seeded = _seed_active_run(store.transaction_runner)
+        accept_result = DefaultHostToolAwaitingAcceptPort(
+            transaction_runner=store.transaction_runner
+        ).accept_tool_awaiting(_awaiting_accept_candidate(seeded))
+        assert isinstance(accept_result, ToolAwaitingAcceptedAck)
+        candidate = _candidate(
+            seeded,
+            worker_event_index=22,
+            data=ToolAwaitingData(
+                iteration_id="iter-tool",
+                record=_awaiting_tool_record(
+                    await_spec=ToolAwaitSpec(
+                        await_kind=ToolAwaitKind.EXTERNAL_JOB,
+                        deadline=None,
+                        resume_token="wrong-resume-token",
+                    )
+                ),
+            ),
+            event_type=EngineEventType.TOOL_AWAITING,
+        )
+
+        result = EngineEventIngestor(
+            transaction_runner=store.transaction_runner
+        ).ingest(candidate)
+
+        assert result.status == EngineIngestStatus.ACCEPTED
+        assert result.reason == "waiting_event_without_host_accepted_refs"
+        payload = _payload(result.events[0])
+        assert payload["waiting_confirmation_accepted"] is False
+        assert payload["waiting_confirmation_mismatch_reason"] == "awaiting_spec_mismatch"
+        assert payload["wait_id"] == accept_result.wait_id
+        assert _canonical_tool_event_count(store.transaction_runner) == 1
+        run_status, attempt_status = _statuses(store.transaction_runner, seeded)
+        assert run_status == RunStatus.WAITING
+        assert attempt_status == AttemptStatus.SUSPENDED
+
+
+def test_waiting_confirmation_wrong_attempt_identity_is_rejected(
+    tmp_path: Path,
+) -> None:
+    """错 Attempt identity 的 waiting confirmation 不读取其它 Attempt 的 wait refs。"""
+
+    with open_host_durable_store(_options(tmp_path)) as store:
+        seeded = _seed_active_run(store.transaction_runner)
+        accept_result = DefaultHostToolAwaitingAcceptPort(
+            transaction_runner=store.transaction_runner
+        ).accept_tool_awaiting(_awaiting_accept_candidate(seeded))
+        assert isinstance(accept_result, ToolAwaitingAcceptedAck)
+        wrong_attempt = _SeededRun(
+            session_id=seeded.session_id,
+            run_id=seeded.run_id,
+            attempt_id="attempt-wrong",
+            execution_id=seeded.execution_id,
+            dispatch_record_id=seeded.dispatch_record_id,
+        )
+        candidate = _candidate(
+            wrong_attempt,
+            worker_event_index=23,
+            data=ToolAwaitingData(
+                iteration_id="iter-tool",
+                record=_awaiting_tool_record(),
+            ),
+            event_type=EngineEventType.TOOL_AWAITING,
+        )
+
+        result = EngineEventIngestor(
+            transaction_runner=store.transaction_runner
+        ).ingest(candidate)
+
+        assert result.status == EngineIngestStatus.REJECTED
+        assert result.reason == "stale_execution_id"
+        assert _payload(result.events[0])["reason"] == "stale_execution_id"
+        assert _canonical_tool_event_count(store.transaction_runner) == 1
+        run_status, attempt_status = _statuses(store.transaction_runner, seeded)
+        assert run_status == RunStatus.WAITING
+        assert attempt_status == AttemptStatus.SUSPENDED
+
+
+def test_waiting_confirmation_wrong_execution_identity_is_rejected(
+    tmp_path: Path,
+) -> None:
+    """错 execution identity 的 waiting confirmation 不确认 Host wait refs。"""
+
+    with open_host_durable_store(_options(tmp_path)) as store:
+        seeded = _seed_active_run(store.transaction_runner)
+        accept_result = DefaultHostToolAwaitingAcceptPort(
+            transaction_runner=store.transaction_runner
+        ).accept_tool_awaiting(_awaiting_accept_candidate(seeded))
+        assert isinstance(accept_result, ToolAwaitingAcceptedAck)
+        wrong_execution = _SeededRun(
+            session_id=seeded.session_id,
+            run_id=seeded.run_id,
+            attempt_id=seeded.attempt_id,
+            execution_id="execution-wrong",
+            dispatch_record_id=seeded.dispatch_record_id,
+        )
+        candidate = _candidate(
+            wrong_execution,
+            worker_event_index=24,
+            data=ToolAwaitingData(
+                iteration_id="iter-tool",
+                record=_awaiting_tool_record(),
+            ),
+            event_type=EngineEventType.TOOL_AWAITING,
+        )
+
+        result = EngineEventIngestor(
+            transaction_runner=store.transaction_runner
+        ).ingest(candidate)
+
+        assert result.status == EngineIngestStatus.REJECTED
+        assert result.reason == "stale_execution_id"
+        assert _event_count(store.transaction_runner, "ENGINE_EVENT_REJECTED") == 1
+        assert _canonical_tool_event_count(store.transaction_runner) == 1
+        run_status, attempt_status = _statuses(store.transaction_runner, seeded)
+        assert run_status == RunStatus.WAITING
+        assert attempt_status == AttemptStatus.SUSPENDED
+
+
+def test_old_attempt_late_waiting_confirmation_is_rejected_after_resolve(
+    tmp_path: Path,
+) -> None:
+    """旧 Attempt 在 wait resolved 后的 late waiting confirmation 只能被拒绝。"""
+
+    with open_host_durable_store(_options(tmp_path)) as store:
+        seeded = _seed_active_run(store.transaction_runner)
+        accept_result = DefaultHostToolAwaitingAcceptPort(
+            transaction_runner=store.transaction_runner
+        ).accept_tool_awaiting(_awaiting_accept_candidate(seeded))
+        assert isinstance(accept_result, ToolAwaitingAcceptedAck)
+        resolved = DefaultHostResolveWaitService(
+            transaction_runner=store.transaction_runner
+        ).resolve_wait(
+            accept_result.wait_id,
+            _resolve_wait_completed_request("resolve-old-attempt"),
+        )
+        assert resolved.run.status == RunStatus.RUNNING
+        candidate = _candidate(
+            seeded,
+            worker_event_index=25,
+            data=ToolAwaitingData(
+                iteration_id="iter-tool",
+                record=_awaiting_tool_record(),
+            ),
+            event_type=EngineEventType.TOOL_AWAITING,
+        )
+
+        result = EngineEventIngestor(
+            transaction_runner=store.transaction_runner
+        ).ingest(candidate)
+
+        assert result.status == EngineIngestStatus.REJECTED
+        assert result.reason == "terminal_already_closed"
+        assert _payload(result.events[0])["reason"] == "terminal_already_closed"
+        assert _canonical_tool_event_count(store.transaction_runner) == 2
 
 
 def test_usage_reported_is_projection_signal_without_state_change(
@@ -1102,9 +1358,12 @@ def _accepted_tool_record() -> AcceptedToolExecutionRecord:
     )
 
 
-def _awaiting_tool_record() -> AwaitingToolExecutionRecord:
+def _awaiting_tool_record(
+    *, await_spec: ToolAwaitSpec | None = None
+) -> AwaitingToolExecutionRecord:
     """构造测试用 awaiting tool execution record。
 
+    :param await_spec: 可选等待规约；无则使用默认规约。
     :returns: awaiting tool record。
     """
 
@@ -1112,12 +1371,100 @@ def _awaiting_tool_record() -> AwaitingToolExecutionRecord:
     return AwaitingToolExecutionRecord(
         batch_snapshot=_tool_batch_snapshot(call),
         call=call,
-        await_spec=ToolAwaitSpec(
-            await_kind=ToolAwaitKind.EXTERNAL_JOB,
-            deadline=None,
-            resume_token="resume-token",
+        await_spec=(
+            await_spec
+            if await_spec is not None
+            else ToolAwaitSpec(
+                await_kind=ToolAwaitKind.EXTERNAL_JOB,
+                deadline=None,
+                resume_token="resume-token",
+            )
         ),
         snapshot=None,
+    )
+
+
+def _awaiting_accept_candidate(seeded: _SeededRun) -> ToolAwaitingAcceptCandidate:
+    """构造与 ``_awaiting_tool_record`` 匹配的 Host awaiting accept candidate。
+
+    :param seeded: seeded run。
+    :returns: awaiting accept candidate。
+    """
+
+    await_spec = ToolAwaitSpec(
+        await_kind=ToolAwaitKind.EXTERNAL_JOB,
+        deadline=None,
+        resume_token="resume-token",
+    )
+    binding = WaitAdapterBinding(
+        tool_name="lookup",
+        await_kind=ToolAwaitKind.EXTERNAL_JOB,
+        adapter_key=WaitAdapterKey("poll:lookup"),
+        resume_policy=WaitResumePolicy.POLL,
+        external_job_ref_source=WaitExternalJobRefSource.RESUME_TOKEN,
+    )
+    digest = sha256_digest_json({"awaiting": "engine-ingest"})
+    return ToolAwaitingAcceptCandidate(
+        session_id=seeded.session_id,
+        run_id=seeded.run_id,
+        attempt_id=seeded.attempt_id,
+        execution_id=seeded.execution_id,
+        iteration_id="iter-tool",
+        tool_call_id="tool-call-1",
+        tool_name="lookup",
+        tool_schema_digest=sha256_digest_json({"schema": "lookup"}),
+        tool_identity_digest=sha256_digest_json({"identity": "lookup"}),
+        normalized_arguments_digest=sha256_digest_json({"arguments": "lookup"}),
+        await_spec=await_spec,
+        snapshot_ref=None,
+        binding=binding,
+        external_job_ref=binding.external_job_ref(await_spec),
+        wait_id=f"wait-{digest.removeprefix('sha256:')}",
+        accept_idempotency_key=f"tool-await-{digest.removeprefix('sha256:')}",
+        semantic_input_digest=digest,
+    )
+
+
+def _resolve_wait_completed_request(idempotency_key: str) -> ResolveWaitRequest:
+    """构造 completed resolve wait 请求。
+
+    :param idempotency_key: resolve wait 幂等键。
+    :returns: resolve wait request。
+    """
+
+    return ResolveWaitRequest(
+        context=_host_call_context(idempotency_key),
+        idempotency_key=idempotency_key,
+        outcome=ResolveWaitCompletedOutcome(
+            result=ToolResultSuccess(ok=True, value={"answer": "resolved"}, meta=None),
+            payload_ref=None,
+        ),
+        source=WaitResolutionSource.MANUAL,
+        observed_at=_NOW,
+    )
+
+
+def _host_call_context(request_id: str) -> HostCallContext:
+    """构造测试用 Host call context。
+
+    :param request_id: request id。
+    :returns: Host call context。
+    """
+
+    return HostCallContext(
+        actor="tester",
+        source="pytest",
+        request_id=request_id,
+        authorization_claims=(),
+        operation_context=OperationContext(
+            operation_name="resolve_wait",
+            operation_kind="test",
+            business_domain="host",
+            business_object_type=None,
+            business_object_id=None,
+            scenario="engine-ingest",
+            correlation_id=None,
+        ),
     )
 
 

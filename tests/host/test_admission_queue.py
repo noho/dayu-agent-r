@@ -41,6 +41,7 @@ from dayu.host.api import (
 from dayu.host.durable.codec import sha256_digest_json
 from dayu.host.durable.connection import open_host_durable_store
 from dayu.host.durable.event_log import EventLogStore
+from dayu.host.durable.memory import read_latest_memory_snapshot
 from dayu.host.durable.options import (
     HostDurableStoreOptions,
     HostSQLiteStoragePolicy,
@@ -62,6 +63,12 @@ from dayu.host.durable.state import (
     read_run_by_id,
 )
 from dayu.host.durable.transaction import HostRow, HostTransaction, HostTransactionRunner
+from dayu.host.memory import (
+    CONVERSATION_MEMORY_CONSUMER_ID,
+    default_memory_projection_policy,
+    digest_memory_projection_policy,
+)
+from dayu.host.memory_repair import ConversationMemoryProjectionCatchupPort
 from dayu.host.projection import ProjectionCatchupPort
 
 _NOW = datetime(2026, 5, 14, 9, 30, 0, tzinfo=UTC)
@@ -850,6 +857,49 @@ def test_start_run_survives_after_commit_projection_catchup_failure(
         assert result.run.status == RunStatus.RUNNING
         assert result.pending_dispatch is not None
         assert projection.calls == 1
+
+
+def test_start_run_concrete_memory_catchup_projects_user_input(
+    tmp_path: Path,
+) -> None:
+    """注入 concrete catch-up port 后 start_run 会追平用户输入 memory。
+
+    :param tmp_path: pytest 临时目录。
+    :returns: ``None``。
+    :raises AssertionError: committed 用户输入未被 memory catch-up 投影时抛出。
+    """
+
+    policy = default_memory_projection_policy()
+    with open_host_durable_store(_options(tmp_path)) as store:
+        session_id = _ensure_session_id(store.transaction_runner)
+        service = _service(
+            store.transaction_runner,
+            projection_catchup=ConversationMemoryProjectionCatchupPort(
+                transaction_runner=store.transaction_runner,
+                policy=policy,
+                batch_size=8,
+            ),
+        )
+
+        result = service.start_run(
+            _start_request(
+                session_id=session_id,
+                client_request_id="start-memory-catch-up",
+            ),
+            caller_semantic_digest=_CALLER_DIGEST,
+        )
+        snapshot = store.transaction_runner.run_read(
+            lambda transaction: read_latest_memory_snapshot(
+                transaction,
+                session_id=session_id,
+                consumer_id=CONVERSATION_MEMORY_CONSUMER_ID,
+                policy_digest=digest_memory_projection_policy(policy),
+            )
+        )
+
+        assert result.run.status == RunStatus.RUNNING
+        assert snapshot is not None
+        assert snapshot.snapshot.pinned_state.current_goal == "start input"
 
 
 def test_terminal_closeout_promotes_exactly_one_queued_run_after_commit(

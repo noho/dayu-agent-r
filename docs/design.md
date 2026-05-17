@@ -56,3 +56,38 @@ level name、不安装 handler、不读取配置。当前 `dayu.runtime.log` 负
 
 不使用 `turn` 表达 Host / Engine 执行路径。多轮会话可以在用户语义层描述为
 多次 run，但日志字段仍使用 `run`、`attempt`、`iteration`。
+
+## 2. 工具定义与执行边界
+
+工具能力分为声明、治理和执行三个边界。
+
+- `@tool(...)` 是工具声明入口，用于在工具现场同源声明 `ToolSchema`、
+  截断声明、展示 metadata、标签和单工具 callable。
+- `ToolDefinition` 是 Host / ToolRuntime 的装配输入，包含 schema、
+  truncate、display、tags 与 `ToolCallable`；它不进入 Engine request，
+  也不作为 Engine 稳定接口。
+- 外部工具注册组件是工具发现 / 注册边界，产出业务 `ToolBundle` 并通过
+  `HostToolingOptions` 传给 Host construction。Host 包不得 import 具体业务
+  工具模块；新增工具应通过外部注册组件 / 配置 / Service composition 接入。
+- `fetch_more` 不由外部业务 `ToolBundle` 提供；ToolRuntime factory 根据
+  TruncationManager 注入 framework tool，生成 attempt-local effective
+  `ToolBundle`。RunInputBuilder 投影给 Engine 的 `tool_schemas` 与
+  ToolRuntime 执行使用的 `tool_executor` 必须来自同一个 effective
+  ToolBundle。
+- `ToolCallable` 是单工具调用协议，形状是
+  `async (call: ToolCallRequest, context: BatchToolExecutionContext) -> ToolExecutionOutcome`。
+  工具函数可以通过闭包捕获 Web client、仓储、manager 等工具运行所需依赖；
+  Host 仍只消费外部传入的业务 `ToolBundle`，不扫描业务工具模块。
+- `ToolExecutor` 是 Host / ToolRuntime 治理后的 batch 执行入口，形状是
+  `execute(BatchToolExecutionRequest) -> BatchToolExecutionOutcome`。Engine 只调用
+  这个入口，不调用单工具 callable。
+
+Host 接收业务 `ToolBundle`；ToolRuntime factory 生成 effective `ToolBundle`，
+把其中的 `ToolSchema` 投影给 Engine，并把 `ToolCallable` 包装进受治理的
+`ToolExecutor`。权限、审批、限流、并发、内部 timeout、审计、长事务
+awaiting、orphan cleanup 和工具级取消都属于 Host / ToolRuntime；
+`dayu.contracts` 不提供默认执行器，也不定义 batch 内部执行策略。
+
+Engine 只接收 `tool_schemas` 和 `tool_executor`。Engine 不导入、不持有、
+不分支判断 `@tool`、`ToolDefinition`、`ToolCallable`、具体工具实现或工具
+运行时治理对象。

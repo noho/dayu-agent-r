@@ -387,6 +387,7 @@ class AcceptWorkerRunningInput:
     :param actor: 事件 actor。
     :param source: 事件 source。
     :param worker_accept_reason: worker accept 诊断原因。
+    :param local_worker_id: 本地 worker id；测试或非本地 worker 路径可为 ``None``。
     """
 
     run_id: str
@@ -396,6 +397,7 @@ class AcceptWorkerRunningInput:
     actor: str
     source: str
     worker_accept_reason: str
+    local_worker_id: str | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -2292,6 +2294,10 @@ def _attempt_running_event_request(
             "dispatch_record_id": dispatch_record.dispatch_record_id,
             "worker_kind": dispatch_record.worker_kind.value,
             "execution_target": dispatch_record.execution_target,
+            "local_worker_id": request.local_worker_id,
+            "worker_accepted_at": format_utc_timestamp(request.occurred_at),
+            "lane_name": dispatch_record.lane_name,
+            "lane_claim_id": dispatch_record.lane_claim_id,
             "reason": request.worker_accept_reason,
         },
         payload_ref=None,
@@ -3274,8 +3280,22 @@ def _invalid_accept_worker_precondition(
         or run.current_attempt_id != attempt_id
         or attempt.run_id != run.run_id
         or attempt.status != AttemptStatus.STARTING
+        or attempt.execution_id != dispatch_record.execution_id
+        or dispatch_record.run_id != run.run_id
+        or dispatch_record.attempt_id != attempt.attempt_id
         or dispatch_record.status != DispatchRecordStatus.DISPATCHING
+        or dispatch_record.owner_host_instance_id is None
+        or dispatch_record.waiting_for_lane_at is None
+        or dispatch_record.lane_name is None
+        or dispatch_record.lane_claim_id is None
+        or dispatch_record.lane_owner_id is None
+        or dispatch_record.lane_acquired_at is None
+        or dispatch_record.dispatching_at is None
+        or dispatch_record.worker_accepted_at is not None
         or dispatch_record.worker_accept_event_id is not None
+        or dispatch_record.worker_accept_event_sequence is not None
+        or dispatch_record.cancelled_event_id is not None
+        or dispatch_record.cancelled_event_sequence is not None
     ):
         return RunTransitionResult(
             status=StateMutationStatus.INVALID_STATE,
@@ -3693,6 +3713,9 @@ def _validate_accept_worker_running_input(
     _require_non_empty_text(
         request.worker_accept_reason,
         field_name="worker_accept_reason",
+    )
+    _require_optional_non_empty_text(
+        request.local_worker_id, field_name="local_worker_id"
     )
 
 

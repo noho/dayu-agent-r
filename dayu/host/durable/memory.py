@@ -626,11 +626,29 @@ def _insert_verified_fact_item(
         producer_kind=item.provenance.producer_kind,
         producer_name=item.provenance.producer_name,
         payload_ref=item.provenance.payload_ref,
-        payload_digest=item.provenance.digest_ref,
+        payload_digest=_payload_digest_for_verified_fact(item),
         item_json=canonical_json_dumps(_verified_fact_item_json_value(item)),
         included_reason=item.included_reason,
         excluded_reason=item.excluded_reason,
     )
+
+
+def _payload_digest_for_verified_fact(item: VerifiedFactView) -> str | None:
+    """返回 verified fact item row 的 payload digest 列值。
+
+    item row 的 ``payload_ref`` / ``payload_digest`` 列只表示 payload
+    descriptor 成对索引；工具 outcome digest 等非 payload digest 保留在
+    item JSON 的 provenance 中，不能写入该列破坏 schema CHECK。
+
+    :param item: verified fact item。
+    :returns: payload ref 存在时返回 payload digest 列值，否则返回 ``None``。
+    """
+
+    if item.provenance.payload_ref is None:
+        return None
+    if item.evidence_anchor is not None and item.evidence_anchor.digest is not None:
+        return item.evidence_anchor.digest
+    return item.provenance.digest_ref
 
 
 def _insert_working_assumption_item(

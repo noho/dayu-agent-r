@@ -797,6 +797,7 @@ def _accept_worker_running(
                 actor="tester",
                 source="pytest",
                 worker_accept_reason="accepted",
+                local_worker_id="local-worker-phase6",
             ),
         )
 

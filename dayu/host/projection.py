@@ -288,8 +288,11 @@ def catch_up_projection_best_effort(
         return
     try:
         projection_catchup_port.catch_up_projection()
-    except Exception:
-        _LOGGER.exception("projection catch-up failed; continuing")
+    except Exception as exc:
+        _LOGGER.warning(
+            "projection catch-up failed; continuing error_type=%s",
+            type(exc).__name__,
+        )
 
 
 @dataclass(frozen=True, slots=True)

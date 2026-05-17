@@ -10,6 +10,7 @@ from __future__ import annotations
 from dataclasses import dataclass
 from enum import StrEnum
 
+from dayu.host.api import RunStatus
 from dayu.host.durable._validation import (
     optional_text as _optional_text,
     require_int as _require_int,
@@ -32,6 +33,12 @@ class ReadModelWriteStatus(StrEnum):
 
     INSERTED = "inserted"
     DUPLICATE = "duplicate"
+
+
+_TERMINAL_RUN_STATUSES = frozenset(
+    (RunStatus.SUCCEEDED, RunStatus.FAILED, RunStatus.CANCELLED, RunStatus.LOST)
+)
+_TIMELINE_ITEM_KINDS = frozenset(("user_input", "run_lifecycle", "run_terminal"))
 
 
 @dataclass(frozen=True, slots=True)
@@ -282,6 +289,10 @@ def reset_minimal_read_model_projection(
 ) -> None:
     """清空 minimal read model rows 及其 projection cursor/failure。
 
+    ``host_run_results`` 与 ``host_session_timeline_items`` 由固定
+    ``host.minimal-read-model`` consumer 独占。repair 时允许清空这两张表，
+    再从 committed EventLog replay 重建；它们不是 Host governance truth。
+
     :param transaction: 调用方提供的 Host durable transaction。
     :param consumer_id: minimal read model consumer id。
     :returns: ``None``。
@@ -311,7 +322,7 @@ def _validate_run_result(row: RunResultRow) -> None:
 
     _require_non_empty_text(row.run_id, field_name="run_id")
     _require_non_empty_text(row.session_id, field_name="session_id")
-    _require_non_empty_text(row.terminal_status, field_name="terminal_status")
+    _terminal_status_from_text(row.terminal_status)
     if row.terminal_event_sequence <= 0:
         raise HostDurableError("terminal_event_sequence must be positive")
     _require_non_empty_text(row.terminal_event_id, field_name="terminal_event_id")
@@ -345,7 +356,7 @@ def _validate_timeline_item(row: SessionTimelineItemRow) -> None:
     _require_non_empty_text(row.event_id, field_name="event_id")
     if row.event_sequence <= 0:
         raise HostDurableError("event_sequence must be positive")
-    _require_non_empty_text(row.item_kind, field_name="item_kind")
+    _validate_timeline_item_kind(row.item_kind)
     _require_non_empty_text(row.event_type, field_name="event_type")
     _require_optional_non_empty_text(row.display_text, field_name="display_text")
     _require_non_empty_text(row.projected_at, field_name="projected_at")
@@ -391,9 +402,9 @@ def _run_result_from_host_row(row: HostRow) -> RunResultRow:
     return RunResultRow(
         run_id=_require_text(row.get("run_id"), field_name="run_id"),
         session_id=_require_text(row.get("session_id"), field_name="session_id"),
-        terminal_status=_require_text(
-            row.get("terminal_status"), field_name="terminal_status"
-        ),
+        terminal_status=_terminal_status_from_text(
+            _require_text(row.get("terminal_status"), field_name="terminal_status")
+        ).value,
         terminal_event_id=_require_text(
             row.get("terminal_event_id"), field_name="terminal_event_id"
         ),
@@ -429,7 +440,9 @@ def _timeline_item_from_host_row(row: HostRow) -> SessionTimelineItemRow:
         run_id=_optional_text(row.get("run_id"), field_name="run_id"),
         event_id=_require_text(row.get("event_id"), field_name="event_id"),
         event_sequence=_require_int(row.get("event_sequence"), field_name="event_sequence"),
-        item_kind=_require_text(row.get("item_kind"), field_name="item_kind"),
+        item_kind=_validated_timeline_item_kind_text(
+            _require_text(row.get("item_kind"), field_name="item_kind")
+        ),
         event_type=_require_text(row.get("event_type"), field_name="event_type"),
         display_text=_optional_text(row.get("display_text"), field_name="display_text"),
         payload_ref=_optional_text(row.get("payload_ref"), field_name="payload_ref"),
@@ -438,3 +451,46 @@ def _timeline_item_from_host_row(row: HostRow) -> SessionTimelineItemRow:
         ),
         projected_at=_require_text(row.get("projected_at"), field_name="projected_at"),
     )
+
+
+def _terminal_status_from_text(value: str) -> RunStatus:
+    """把 minimal RunResult terminal_status 文本映射为当前 RunStatus。
+
+    :param value: RunResult row 中的 terminal status 文本。
+    :returns: 当前 public RunStatus 终态成员。
+    :raises HostDurableError: 文本为空、不是 RunStatus 或不是终态时抛出。
+    """
+
+    _require_non_empty_text(value, field_name="terminal_status")
+    try:
+        status = RunStatus(value)
+    except ValueError as exc:
+        raise HostDurableError("RunResult terminal_status is invalid") from exc
+    if status not in _TERMINAL_RUN_STATUSES:
+        raise HostDurableError("RunResult terminal_status is not terminal")
+    return status
+
+
+def _validate_timeline_item_kind(value: str) -> None:
+    """校验 minimal timeline item kind 属于当前封闭集合。
+
+    :param value: timeline item kind 文本。
+    :returns: ``None``。
+    :raises HostDurableError: 文本为空或不属于当前集合时抛出。
+    """
+
+    _validated_timeline_item_kind_text(value)
+
+
+def _validated_timeline_item_kind_text(value: str) -> str:
+    """返回已校验的 minimal timeline item kind 文本。
+
+    :param value: timeline item kind 文本。
+    :returns: 原始文本。
+    :raises HostDurableError: 文本为空或不属于当前集合时抛出。
+    """
+
+    _require_non_empty_text(value, field_name="item_kind")
+    if value not in _TIMELINE_ITEM_KINDS:
+        raise HostDurableError("SessionTimeline item_kind is invalid")
+    return value

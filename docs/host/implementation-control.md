@@ -220,14 +220,11 @@ Phase Map 中每个 phase 必须使用统一条目格式。模板如下：
 
 ## 当前状态
 
-Phase 9 draft PR 已创建：PR 59 https://github.com/noho/dayu-agent-r/pull/59。Accepted PR review commit 为 `67458cb`。
-P9 all-repository follow-up fix pass 已完成本地验证；最终 MiMo / DS re-review 均 PASS；accepted follow-up commit 为
-`6e12641`。
-当前 gate 为 draft-PR-pass follow-up accepted。
-下一 planned work unit：在 P9 后、P10 前新增 P9.5 Pre-P10 Cross-Repository Hardening PR，收口当前追踪区中不依赖
-P10+ phase owner、也不属于本轮已裁决排除项的 hardening / cleanup。
-
 约束：本节只保留当前 gate 结论；phase 过程流水必须归档到 `历史记录`，仍需追踪的风险或后续 owner 必须写入 `Open Questions 与风险追踪` 的 `追踪区`。
+
+当前 work unit：P9.5 Pre-P10 Cross-Repository Hardening PR。
+当前 gate：P9.5 completed。
+下一 gate：用户手工 review / merge decision。
 
 ## Phase Map
 
@@ -823,8 +820,8 @@ Phase 按依赖关系推进：先实现被其它阶段依赖的公共契约、ru
   accepted PR review commit 为 `67458cb`。
 - P9 all-repository follow-up review 已由 AgentMiMo 与 AgentDS 执行，初审发现若干跨仓 correctness / observability hardening；
   controller 已接受其中低风险项并完成 fix / validation。最新 DS follow-up finding 中，SSE 已产出事件后的 retry、SSE tool-call
-  final finish parity 与 runtime file lock release failure cleanup 已修复；minimal read model consumer isolation 作为 schema
-  design debt deferred。最终 AgentMiMo / AgentDS re-review 均 PASS。Controller adjudication artifact 为
+  final finish parity 与 runtime file lock release failure cleanup 已修复；minimal read model reset contract 作为
+  single-consumer ownership clarification deferred。最终 AgentMiMo / AgentDS re-review 均 PASS。Controller adjudication artifact 为
   `docs/reviews/p9-all-repo-review-controller-adjudication-20260517.md`。
 
 目标：
@@ -898,8 +895,8 @@ Phase 按依赖关系推进：先实现被其它阶段依赖的公共契约、ru
 - 后续 phase 可依赖的稳定契约：memory snapshot cursor、stable layer input provider、projection repair semantics。
 - 需要追踪到后续 phase 的事项：长期 memory / query-time retrieval、业务 signal ledger、signal-to-outcome verification 后续单独设计；
   P9 只预留 Host 中立 evidence anchor / claim status / provenance / trace 边界。
-- P9 all-repository follow-up 已明确 defer 的非 P9 blocking 架构债：Engine runner factory / registry、minimal read model
-  multi-consumer schema、Phase 11 RECOVERING 流程测试、Host durable/API error taxonomy、ToolRuntime / memory 模块拆分、
+- P9 all-repository follow-up 已明确 defer 的非 P9 blocking 架构债：Engine runner protocol decoupling、minimal read model
+  single-consumer reset contract、Phase 11 RECOVERING 流程测试、Host durable/API error taxonomy、ToolRuntime / memory 模块拆分、
   LocalProxy close/events race、read API enum mapping、lane heartbeat/shield hardening 与消息 / 工具结果大小治理。
 
 #### Phase 9 all-repository follow-up 追踪
@@ -928,21 +925,26 @@ Phase 按依赖关系推进：先实现被其它阶段依赖的公共契约、ru
 
 追踪项：
 
-- Engine runner DI / factory、minimal read model 多 consumer reset、RECOVERING 状态机、durable/API error taxonomy、Command
-  service caching、LocalProxy race、read API enum mapping、ToolRuntime / memory 模块拆分、lane hardening 与消息 / 工具结果大小上限
+- Engine runner protocol decoupling、minimal read model single-consumer reset contract、RECOVERING 状态机、durable/API error taxonomy、Command
+  handle internal service encapsulation / lifecycle guard、LocalProxy race、read API enum mapping、ToolRuntime / memory 模块拆分、lane hardening 与消息 / 工具结果大小上限
   均为后续 owned work，不阻塞 P9。其中除 RECOVERING 状态机归 Phase 11 外，其余不依赖 P10+ phase owner 的项目纳入 P9.5
   Pre-P10 Cross-Repository Hardening PR。
 
 ### Phase 9.5. Pre-P10 Cross-Repository Hardening PR
 
 状态：
-- planned；在 P9 draft-PR-pass follow-up accepted 后执行，必须在 Phase 10 Context Governance / Compaction 前完成或显式裁决
+- design discussion accepted；下一步必须生成 implementation-ready handoff plan，并经双路 plan review / controller
+  adjudication 通过后才可进入 implementation。P9.5 必须在 Phase 10 Context Governance / Compaction 前完成或显式裁决
   剩余项不阻塞 P10。
 
 目标：
 - 收口当前 `Open Questions 与风险追踪` 中不依赖 P10+ phase owner 的跨仓 hardening、cleanup 与 public contract repair。
 - 降低 Phase 10 前的基础设施噪音，避免 Context Governance 开始时继续携带 Engine / Host public contract / durable helper /
   read API / LocalProxy / runtime lane 的已知非阻塞债。
+- 按 `dayu/README.md` “日志级别语义”，为 Engine 与 Host P1-P9 已实现路径补充必要 log，并校准日志级别、字段、脱敏和
+  invariant 诊断边界。
+- 按 `dayu/README.md` “Contract Ownership”，检查 Engine / Host / runtime / contracts 已实现类型、事件、stream、projection、
+  ToolRuntime 与 ToolBundle 等 contract 归属是否正确。
 
 对应设计章节：
 - `docs/host/design.md` §4 Run / Attempt 状态模型
@@ -959,11 +961,13 @@ Phase 按依赖关系推进：先实现被其它阶段依赖的公共契约、ru
 - 用户确认 P9.5 不改变 P10 / P11 / P12 / P13 / P14 / P15 的语义 owner，只清理不依赖这些 owner 的当前追踪项。
 
 范围：
-- 允许修改：Engine runner factory / registry 边界、minimal read model consumer isolation、durable / public API error taxonomy、
-  Command service caching、LocalProxy close / events race、read API enum mapping、
+- 允许修改：Engine runner protocol 边界、minimal read model single-consumer reset contract、durable / public API error taxonomy、
+  Command handle internal service encapsulation / lifecycle guard、LocalProxy close / events race、read API enum mapping、
   ToolRuntime / memory 模块拆分、runtime lane hardening、message / tool result size governance、Host durable helper API tightening、
-  schema CHECK hardening、Engine / OpenAI runner / parser hardening、production memory projection catch-up composition wiring 中不触及
-  snapshot history 保留模型的部分、相关 README 与测试。
+  schema CHECK hardening、Engine / OpenAI runner / parser hardening、TruncationManager initialization cost review、
+  late `resolve_wait` redundant catch-up cleanup、production memory projection catch-up composition wiring 中不触及 snapshot history
+  保留模型的部分、memory import boundary / preview facts / catch-up end-to-end targeted tests、Engine / Host P1-P9 已实现路径按
+  日志级别语义补必要 log、Contract Ownership conformance audit、相关 README 与测试。
 - 禁止修改：Context Governance / compact provider、RECOVERING recovery scan / dispatch、RemoteProxy / RemoteStub、Audit / Tool Trace /
   Outbox concrete sinks、ToolsDiscovery / ScenePrepare manifest provider、长期 memory / query-time retrieval、external job physical
   cancel / callback 产品化、purge / retention production hardening。
@@ -980,31 +984,109 @@ Phase 按依赖关系推进：先实现被其它阶段依赖的公共契约、ru
   `RECOVERING` Run。
 
 P9.5 收口清单：
-- Engine runner DI / factory / registry：解除 Engine Agent 对具体 OpenAI runner 的硬编码装配，建立清晰 factory / provider
-  selection contract。
-- minimal read model multi-consumer schema：补齐 consumer isolation 或明确 minimal read model 单 consumer public contract，避免 reset
-  跨 consumer 清表。
-- durable / public API error taxonomy：收敛 durable error、public HostApiError detail 与 retryable 分类。
-- Command service caching：确认 command handle / service 缓存边界，不绕过 lifecycle guard 或 durable truth。
-- LocalProxy close / events race：补齐 worker handle close、events stream EOF / exception 与 late event 竞态测试及修复。
-- read API enum mapping：统一 durable row enum、public enum 与 event view enum 的映射边界。
-- ToolRuntime / memory 模块拆分：拆分 God module / 聚合模块中已暴露的过宽职责，但不得改变工具治理或 memory 语义。
+- Engine runner protocol decoupling：解除 Engine Agent 主链路对具体 OpenAI runner 类型的直接依赖，使 `_AsyncAgent` 只接收并消费
+  `AsyncRunner` protocol；`run_agent_messages` 默认 public entry 仍可通过私有 helper 集中装配当前默认 OpenAI-compatible
+  runner。该 helper 只表达当前默认 runner 装配边界，不是扩展点；不引入 runner factory / registry / provider selection
+  contract，也不得以“方便未来扩展”为理由增加胶水 seam。
+- minimal read model single-consumer reset contract：确认 `host_run_results` 与 `host_session_timeline_items` 是
+  `host.minimal-read-model` 固定 consumer 独占的 read model 表；reset 全表后从 EventLog replay 是合法 repair / rebuild
+  手段。P9.5 不引入 multi-consumer schema；只有未来真实出现第二个 minimal read model consumer 且必须共享同一物理表时，
+  才单独设计 consumer isolation。
+- durable / public API error taxonomy：梳理并收敛现有 durable error 到 public `HostApiError` 的翻译边界，确保 not found、
+  invalid state、conflict、idempotency conflict、unsupported operation、internal error 与 `retryable` 语义在不同 public facade
+  中一致；`detail` 仍只能使用 typed detail union，不引入无结构 payload 或新的复杂错误系统。
+- Command handle internal service encapsulation / lifecycle guard：确认 `HostCommandHandle` 内部持有的 durable store、
+  admission service 与 active registry 只是私有实现细节；`dayu.host` public exports、Service / UI 调用方和测试不得取得或依赖
+  internal service，也不得绕过 handle close 写 durable truth。补 public export / import boundary / facade behavior tests，优先用
+  public facade 行为验证，减少对白盒 `_xxx` 私有字段的依赖。
+- LocalProxy close / events race：这是本地执行路径必须收口的 correctness 边界；补齐 worker handle close 后禁止重读
+  `events()`、Engine event stream clean EOF without terminal、event stream exception / worker crash、terminal accepted 后 late event、
+  scheduler close / active task cleanup、worker handle / lane token / active registry 释放，以及 close 与 event consumption 并发的
+  targeted race tests 与必要修复。不得引入 RemoteProxy、exactly-once 或 Phase 11 recovery 语义。
+- read API enum mapping：梳理 durable row enum、public API enum 与 read/event view enum 或文本的映射位置，确保
+  `get_run()`、`get_session()`、`stream_run_events()` 与 minimal read model 对同一状态 / event type 的展示一致；映射应有单一真源
+  或受控 helper，未知值必须 fail closed，不能静默降级为其它状态。补全当前 Run / Attempt / Session / event type 映射测试；不改变
+  状态机、不新增状态、不改 EventLog facts、不把 read model 升级为 truth。
+- ToolRuntime / memory module boundary cleanup：按既有职责把过大的聚合模块拆到清晰边界，例如 ToolRuntime 的
+  effective bundle / schema projection、Host accept barrier、duplicate governance、truncation / `fetch_more`、diagnostics，以及
+  Memory 的 contracts、projection builder、budgeting、serialization / codec、durable repository；只做 ownership 与 import
+  boundary cleanup，不改变 ToolRuntime accept barrier、EventLog facts、memory snapshot 语义、projection truth 或状态机。
 - ToolRuntime truncation / duplicate defensive hardening：补齐 truncation 多类型边界测试、duplicate governed error 防御性校验与
-  不依赖 durable duplicate ledger 的本地治理测试。
+  不依赖 durable duplicate ledger 的本地治理测试。覆盖 `text_lines`、`list_items`、`binary_bytes` 等 truncation targeted
+  tests，补 `fetch_more` cursor / `scope_token` / digest / expired / missing guard tests；收紧 `ToolFactAcceptCandidate`
+  对 `GOVERNED_ERROR` / duplicate governed outcome 的 validation，补 duplicate `allow` / `reuse` / `hint` /
+  `require_justification` / `hard_stop` focused tests，确认 `reuse` 不伪造新工具事实也不重复调用 business callable。
+  复核 TruncationManager 默认启用时的初始化成本，若发现 production scale policy 问题再转交 Phase 15。不得新增 durable
+  cursor table，不让 `fetch_more` 变成 Host / Engine 特化分支，不实现 durable duplicate ledger，不改变 duplicate policy 默认值，
+  不落地 Tool Trace projection。
 - Engine wait confirmation matching-ref hardening：收紧 Engine awaiting / confirmation event 与 Host accepted refs 的匹配契约；
-  不引入 callback endpoint、poller 后台循环或 external job physical cancel。
-- runtime lane hardening：处理 lane heartbeat / shield / cancellation precision / release failure 诊断等不涉及 recovery owner 的问题。
+  Engine `tool_awaiting` / `run_suspended` 只能确认 ToolRuntime Host accept path 已接受的 awaiting refs，不能创建 wait
+  record、关闭 Attempt 或推进 Run `WAITING`。补 accepted refs 缺失、错 run、错 attempt、错 `execution_id`、旧 Attempt late
+  confirmation 的 mismatch tests；不匹配只能 diagnostic / reject，不能进入 canonical owner 路径。保持 LocalProxy 与未来
+  RemoteProxy 语义一致；不引入 callback endpoint、poller 后台循环、external job physical cancel 或 RemoteProxy wire protocol。
+- runtime lane hardening：处理 `dayu.runtime.lane` 作为层中立资源容量 primitive 的稳定性问题，包括 acquire cancellation
+  precision、heartbeat / token lost、release failure / repeated release 诊断、supervisor shutdown 时等待 acquire 或已持有 token 的
+  清理，以及 repeated outer cancellation、untracked release failure、idle scheduler sleeping task 的 targeted tests / fix。lane
+  token 仍只表示 runtime capacity claim，不得进入 EventLog、Attempt owner、dispatch truth、Host admission、Run / Attempt 状态机或
+  recovery 判断；不引入 lease / fencing / takeover 语义。
 - Host dispatch lifecycle / RunInputBuilder non-recovery cleanup：收口 scheduler lane 竞争测试、`_drain_loop` 可观测性、
-  RunInputBuilder optimistic TOCTOU 与 `_consume_worker_events` cleanup 等不需要 Phase 11 recovery 语义的 hardening。
-- message / tool result size governance：补齐 Host / Engine 边界上的消息与工具结果大小上限、诊断和测试。
+  RunInputBuilder optimistic TOCTOU、late `resolve_wait` rejection 额外触发 catch-up 的低风险冗余与
+  `_consume_worker_events` cleanup 等不需要 Phase 11 recovery 语义的 hardening。补 targeted tests 覆盖 durable recheck /
+  lane release / dispatch requeue、drain loop 空队列 / sleep / 异常退出可观测性、worker event consumption 异常路径下的
+  worker handle close / lane token release / active registry 注销、RunInputBuilder stale snapshot fail-closed，以及 late
+  `resolve_wait` rejection redundant catch-up cleanup。不得夹带 Phase 11 recovery、`RECOVERING` dispatch、orphan proof、
+  RemoteProxy 或状态机语义变更。
+- message / tool result size governance：梳理 Host / Engine 边界已有大小常量、默认值与最大值，明确大消息、大工具结果、
+  大 payload 必须外移到 payload / artifact / ref / digest，而不是塞进 EventLog canonical fact 或无界 Engine messages。
+  超限必须产生结构化诊断或明确 public error，不能静默丢内容；补 message size / tool result size targeted tests，并确认
+  truncation / `fetch_more` 不绕过该治理。不得实现 Phase 10 Context Governance、provider-specific tokenizer、proactive
+  compaction、memory snapshot history 或业务规则。
 - Host durable helper API tightening：收紧 `accept_worker_running_in_transaction` diagnostic payload、`mark_dispatching_after_lane_row`
-  等 helper 能力宽于生产路径的问题。
-- schema CHECK hardening：补齐不依赖后续 schema phase 的 SQLite CHECK / index / invariant 测试。
-- Engine / OpenAI runner / parser hardening：收口不涉及 P10 语义的 runner / parser correctness 和 observability findings。
-- P9 memory cleanup / test hardening：只收口 `current_goal`、legacy `SessionContinuityProvider` 参数、preview facts exclusion、
-  import boundary 与 catch-up end-to-end 等不涉及 snapshot history 保留模型的 cleanup / tests。
+  等 helper 能力宽于生产路径的问题。明确底层 helper 只能服务 scheduler / transition owner 的真实路径，不能被测试或后续代码用来
+  绕过 lane wait、durable recheck、dispatch record 状态校验、execution_id 校验或 cancel race；状态不满足时必须 fail
+  closed。补 helper diagnostic payload、production-path invariant tests，并减少直接用 helper 构造不真实状态的白盒测试。不把
+  helper 提升为 public API，不为旧测试保留宽松 wrapper。
+- schema CHECK hardening：把 SQLite schema 作为 Host durable truth 的最后结构防线，梳理当前 CHECK / FK / index 是否覆盖
+  enum/status、ref/digest 成对字段、dispatch record、projection checkpoint / failure、minimal read model、memory rows、wait
+  records、payload descriptors 等不变量。补不依赖后续 phase 的 CHECK / invariant 与 targeted durable schema tests，直接插入非法
+  row 验证 SQLite 拒绝，并确保 Python validation 与 DB CHECK 一致。不做旧库兼容 migration，不新增 P10 / P11 / P13 /
+  P15 状态或表，不改业务语义。
+- Engine / OpenAI runner / parser hardening：收口不涉及 P10 语义的 OpenAI-compatible runner / parser correctness 与
+  observability findings，包括 SSE / non-stream parser 边界、provider protocol error / context overflow 分类、tool call
+  aggregation、finish reason parity、Engine event stream 不泄漏 log record、metadata 不承载契约事实，以及 run-scoped Runner
+  生命周期测试。不做 runner factory / registry，不重开 usage-only / partial tool-call-delta retry 粒度，不做 proactive context
+  governance，不把 Host 状态、memory 或 tool governance 放进 Engine，不引入 provider-specific public state 新合约。
+- Engine / Host necessary log by level semantics：按照 `dayu/README.md` “日志级别语义”，为 Engine 与 Host P1-P9
+  已实现路径补必要 log，并校准已有 log 的级别、字段命名、脱敏和 invariant 诊断。覆盖 Engine / Runner、Host command
+  path、dispatch / LocalProxy、EngineEvent ingest、ToolRuntime accept barrier、wait resolve / late rejection、projection catch-up /
+  repair、memory catch-up 等已实现路径；日志只记录 typed ids、refs、digest、cursor、policy / diagnostic refs，不记录完整
+  prompt、完整工具参数 / 结果、delta 全量、财报原文、authorization claims 原文或大 payload。补 logging targeted tests /
+  caplog tests，确认 `VERBOSE` 只表达执行骨架、`DEBUG` 表达受控细节、`WARN` 表达可恢复异常、`ERROR` 表达本次操作失败、
+  `CRITICAL` 表达 invariant / contract 破坏。该任务只补必要 log，不建设新的 observability 平台；不得把日志升级为
+  EventLog truth、audit、tool trace、projection checkpoint 或 UI 输出；不得提前实现 P10+ 未落地路径。
+- Contract Ownership conformance audit：按照 `dayu/README.md` “Contract Ownership” 检查 P1-P9 已实现的 Engine /
+  Host / runtime / contracts 类型、事件、stream、projection、ToolRuntime、ToolBundle、RunSnapshot / SessionSnapshot、
+  EventLog / Host event stream、RunnerEvent / EngineEvent 等 contract 归属是否正确。重点检查 Host 私有治理状态是否误放进
+  `dayu.contracts`、Engine 是否理解 Host 状态、Host 是否把 projection / read model 当 truth、runtime 是否承载业务或 Host
+  治理语义、ToolRuntime / ToolBundle 边界是否被 Service / UI 或 Engine 误拥有。按照 `docs/design.md` “工具定义与执行边界”
+  增加专项检查：Engine 不得 import / 持有 / 分支判断 `@tool`、`ToolDefinition`、`ToolBundle`、`ToolCallable`、
+  ToolRuntime 或具体工具实现；Host 不得扫描业务工具模块或在 per-run request / metadata 中塞 raw `ToolBundle`；
+  `fetch_more` 只能由 ToolRuntime factory 注入 attempt-local effective `ToolBundle`。补 import boundary / public export /
+  package surface tests；发现归属错误时按当前设计真源移动到正确层，不做兼容 re-export / wrapper。不得借该 audit 引入未来
+  P10+ contracts 或重写 public API。
+- P9 memory cleanup / test hardening：只收口 `current_goal` first-write-wins、legacy `SessionContinuityProvider` 参数、
+  preview facts exclusion 专项测试、memory import boundary 自动化测试、catch-up end-to-end 专项测试、optional JSON helper
+  wording、empty snapshot 双实例构造与 cast 注释等不涉及 snapshot history 保留模型的 cleanup / tests。确认 legacy
+  `SessionContinuityProvider` 不绕过 memory history pool budget，preview / reasoning / display-only events 不进入 memory，
+  memory import boundary 不依赖上层或业务模块，catch-up concrete wiring 能端到端追平。不得修 Conversation Memory snapshot
+  history，不实现长期 retrieval index、public memory edit / reset / forget，不让 final answer 升级为 verified fact，不让 Host
+  import `dayu.fins`。
 - production memory projection catch-up composition wiring：补齐 command / admission / scheduler composition 中不改变 snapshot
-  history 保留模型的 concrete catch-up port 注入；snapshot history 本身仍按单独 PR 裁决处理。
+  history 保留模型的 concrete catch-up port 注入；梳理 production command handle、admission service 与 scheduler worker accept
+  前使用 no-op 还是 concrete memory catch-up port，并明确 test / dev no-op 边界。补 end-to-end tests 覆盖用户输入、tool
+  fact、`resolve_wait` 等提交后 memory projection 被 catch up；catch-up 失败只记录 projection-local failure / logger，不回滚
+  已提交 command，不修改 Run / Attempt / EventLog。snapshot history 本身仍按单独 PR 裁决处理；不引入跨 cursor snapshot
+  retention，不把 projection lag 变成 Run recovery，不实现 P10 Context Governance 或 heavy sink / batch runner。
 
 验证要求：
 - `pytest -q`。
@@ -1403,24 +1485,41 @@ P9.5 收口清单：
 
 归属到 P9.5 的追踪项：
 
-- Engine runner DI / factory / registry。
-- minimal read model multi-consumer schema。
+- Engine runner protocol decoupling。
+- minimal read model single-consumer reset contract；不引入 multi-consumer schema。
 - durable / public API error taxonomy。
-- Command service caching。
+- Command handle internal service encapsulation / lifecycle guard；补 public export / import boundary / facade behavior tests，防止
+  Service / UI 或测试越过 `HostCommandHandle` 直接依赖 internal service。
 - LocalProxy close / events race。
 - read API enum mapping。
-- ToolRuntime / memory 模块拆分。
+- ToolRuntime / memory module boundary cleanup；只拆分既有职责和 import boundary，不改变工具治理、memory snapshot、
+  EventLog facts、projection truth 或状态机。
 - ToolRuntime truncation / duplicate defensive validation 与 focused test hardening。
+- TruncationManager initialization cost review：基于当前初始化路径的直接证据复核默认 `enable_truncation_manager=True`
+  是否存在 hot path 重初始化成本；轻对象则裁决为不修，真实 production scale policy 问题转交 Phase 15。不得引入全局
+  TruncationManager singleton、durable cursor table、跨 Run cursor 复用或 Host / Engine `fetch_more` 特化分支。
 - Engine wait confirmation matching-ref contract hardening。
 - runtime lane hardening。
 - Host dispatch lifecycle / RunInputBuilder non-recovery cleanup 与 targeted tests。
+- late `resolve_wait` rejection redundant catch-up cleanup / tests：确认 late wait result rejection 不写 canonical tool fact、
+  不推进 Run、不创建 Attempt，只保留 diagnostic / rejection 可观测性；检查 rejection 后是否额外触发 projection catch-up，能轻量
+  抑制则抑制，复杂度过高则用测试和注释明确为低风险冗余。不得改变 `resolve_wait` first-committer-wins、`WAITING`
+  cancel / resolve 竞态规则，不实现 callback / poller 后台循环、external job cancel，也不得把 late result 变成 canonical fact。
 - message / tool result size governance。
 - Host durable helper API tightening。
 - schema CHECK hardening。
 - Engine / OpenAI runner / parser hardening。
+- Engine / Host P1-P9 implemented-path necessary log under `dayu/README.md` level semantics。
+- Contract Ownership conformance audit under `dayu/README.md` Contract Ownership。
 - P9 memory 代码中不涉及 snapshot history 的 Host cleanup / test hardening。
+- P9 memory import boundary、preview facts exclusion、catch-up end-to-end、optional JSON helper wording、empty snapshot 双实例构造与
+  cast 注释 cleanup / tests。
 - production memory projection catch-up composition wiring 中不触及 snapshot history 保留模型的部分。
-- God module / class cleanup 与 broader test hardening 中不依赖 P10+ owner 的部分。
+- God module / class cleanup 与 broader test hardening 中不依赖 P10+ owner 的部分：不得作为独立大 slice 或无限重构口袋；
+  只能接收已归属到上述具体 P9.5 条目的 cleanup，并为每个 cleanup 标明 owner（ToolRuntime、memory、dispatch、Engine
+  runner、read API、durable helper 等）。只允许机械拆分、import boundary、测试整理、命名 / 注释清晰化与 focused tests；
+  若发现需要改 public contract、状态机、ToolRuntime / memory 语义、P10+ owner 能力或跨模块大重构，必须停下并重新归属。
+  P9.5 结束前不得保留无 owner 的 broader hardening 表述。
 
 退出规则：
 
@@ -1461,18 +1560,21 @@ P9.5 收口清单：
   destination 为
   Phase 11 recovery dispatch；触发条件为实现 `RECOVERING` 入边 / 出边转换、startup recovery scan 或 recovery dispatch。
 
-#### Engine Runner Factory 解耦追踪
+#### Engine Runner Protocol 解耦追踪
 
 背景决议：
 
 - 2026-05-17 全仓 review fix gate 中，用户明确要求本轮不修改 “Engine Agent 硬编码依赖 `AsyncOpenAIRunner`，违反 Protocol 解耦约束” 这一项代码。
-- 本轮不改 `dayu/engine/agent.py`，不引入 runner factory，不改变 Engine public entry 或 Host 调用方式。
+- 本轮不改 `dayu/engine/agent.py`，不引入 runner factory / registry，不改变 Engine public entry 或 Host 调用方式。
+- 用户在 P9.5 discussion 前确认：P9.5 不做 runner factory；只做 Engine Agent 主链路对 `AsyncRunner` protocol 的解耦。
 
 追踪项：
 
 - destination：P9.5 Pre-P10 Cross-Repository Hardening PR。
-- 触发条件：新增非 OpenAI-compatible 原生 runner、需要测试注入 runner factory、或 Engine public entry 需要支持 provider selection contract。
-- 后续处理要求：先明确 `AsyncRunner` factory 协议与 provider selection contract，再修改 Engine agent composition；不得用 lazy import、兼容 wrapper 或 metadata bag 作为解耦替代品。
+- 触发条件：需要在 Engine Agent 主链路测试中注入 `AsyncRunner` protocol 实现，或新增非 OpenAI-compatible 原生 runner 时发现当前主链路仍绑定具体 OpenAI runner。
+- 后续处理要求：先明确 `_AsyncAgent` 如何只消费 `AsyncRunner` protocol，以及 `run_agent_messages` 默认 public entry 如何通过
+  私有 helper 装配当前默认 OpenAI-compatible runner；该 helper 不是扩展点。不得引入 runner factory / registry、lazy import、
+  兼容 wrapper 或 metadata bag 作为解耦替代品。
 
 #### Engine Context Compaction Event 语义前置
 
@@ -1930,6 +2032,432 @@ P9.5 收口清单：
 - 当前无 PR review blocking fix。
 
 ## 历史记录
+
+### 2026-05-18 P9.5 completed
+
+P9.5 Pre-P10 Cross-Repository Hardening PR 已完成。P9.5 已完成 design discussion、implementation-ready plan、
+S1-S18 implementation / review / accepted commits、aggregate deepreview、accepted aggregate fixes、draft PR create、
+PR review 与 `draft-PR-pass`。Draft PR 为 PR 60：
+`https://github.com/noho/dayu-agent-r/pull/60`。PR 仍为 draft；mark ready for review、merge、request reviewers、
+approve、delete branch 或对外 comment 仍需用户额外授权。当前 gate 为 `P9.5 completed`，后续入口为用户手工
+review / merge decision。
+
+### 2026-05-17 P9.5 draft PR gate passed
+
+P9.5 draft PR gate 已完成。Branch `p9.5-pre-p10-hardening` 已 push 到 GitHub，draft PR 60 已创建：
+`https://github.com/noho/dayu-agent-r/pull/60`，title 为 `P9.5 Pre-P10 cross-repository hardening`，head branch 为
+`p9.5-pre-p10-hardening`，base branch 为 `main`。PR state 为 open draft；`mergeStateStatus=CLEAN`，`mergeable=MERGEABLE`。
+GitHub checks 当前返回 no checks reported on the branch。
+
+PR review artifacts 为 `docs/reviews/pr-60-review-p9-5-mimo-20260517.md` 与
+`docs/reviews/pr-60-review-p9-5-ds-20260517.md`；两份 review 均 PASS，0 blocking / high / medium / low finding。
+Controller PR review adjudication artifact 为 `docs/reviews/pr-60-review-controller-adjudication-20260517.md`。Accepted PR
+review commit 为 `7f9bf67`。PR gate validation 继承 aggregate gate：`pytest -q` 1068 passed；
+`python -m pyright dayu tests` 0 errors / 0 warnings / 0 informations；`git diff --check` clean。当前 gate 为
+`draft-PR-pass`。后续 merge、mark ready for review、request reviewers、approve、delete branch 或对外 comment 仍需用户额外授权。
+
+### 2026-05-17 P9.5 aggregate deepreview accepted
+
+P9.5 aggregate deepreview 已完成。Aggregate deepreview artifacts 为
+`docs/reviews/p9-5-aggregate-deepreview-mimo-20260517.md` 与
+`docs/reviews/p9-5-aggregate-deepreview-ds-20260517.md`。MiMo F1 / F2 / F3 已由 controller 裁决为
+accepted fix items：EventLog canonical inline payload 阈值必须从 durable store policy 显式注入，不得在 EventLog
+primitive 中硬编码默认值；dispatch waiting / worker accepted CAS 需要补齐 `cancelled_event_sequence IS NULL`；
+TruncationManager 截断后仍超限或替换失败时必须清理未返回 cursor。F4 裁决为 rejected-as-current-fix，因
+`fetch_more` 当前必须先 materialize continuation 才能按 canonical tool outcome 计算 inline size，且 request limit
+已有上界；F5 / F6 / F7 均不构成当前 blocker。
+
+Accepted-finding fix re-review artifacts 为
+`docs/reviews/p9-5-aggregate-fix-rereview-mimo-20260517.md` 与
+`docs/reviews/p9-5-aggregate-fix-rereview-ds-20260517.md`；两份 re-review 均 PASS，0 blocking / high / medium /
+low finding。Controller aggregate adjudication artifact 为
+`docs/reviews/p9-5-aggregate-deepreview-controller-adjudication-20260517.md`。Controller validation：
+`pytest tests/host/test_event_log_store.py tests/host/test_durable_transaction.py tests/host/test_toolruntime_executor.py tests/host/test_run_attempt_transitions.py -q`
+77 passed；`pytest -q` 1068 passed；`python -m pyright dayu tests` 0 errors / 0 warnings / 0 informations；
+`git diff --check` clean。Accepted aggregate deepreview commit 为 `392f914`。当前 gate 为 `ready-to-open-draft-PR`。
+
+### 2026-05-17 P9.5 S18 Aggregate Validation And Readiness Evidence accepted
+
+P9.5 S18 Aggregate Validation And Readiness Evidence 已完成。Readiness implementation artifact 为
+`docs/reviews/p9-5-s18-aggregate-validation-readiness-implementation-20260517.md`。Readiness review /
+re-review / controller adjudication artifacts 为 `docs/reviews/p9-5-s18-readiness-review-mimo-20260517.md`、
+`docs/reviews/p9-5-s18-readiness-review-ds-20260517.md`、
+`docs/reviews/p9-5-s18-readiness-re-review-ds-20260517.md` 与
+`docs/reviews/p9-5-s18-readiness-review-controller-adjudication-20260517.md`。
+
+Controller 裁决：AgentMiMo readiness review 为 PASS；AgentDS readiness review 为 PASS with one
+non-blocking finding。DS F3 指出 readiness artifact 曾将 `minimal read model single-consumer reset contract`
+误映射为 S2，controller 接受并修正为 S6，DS re-review 确认 fixed。S18 aggregate validation 通过：
+`pytest -q` 为 1066 passed；`python -m pyright dayu tests` 为 0 errors / 0 warnings / 0 informations；
+`git diff --check` clean。S18 readiness artifact 已将 P9.5 tracking items 映射为 fixed、明确不修且有原因，
+或重新归属到具体 P10+ owner；generic default memory catch-up 仍明确不属于 P9.5，因为需要 snapshot history /
+cursor coverage 语义。Accepted slice commit 为 `79db0e1`。当前 gate 为 P9.5 aggregate deepreview。
+
+### 2026-05-17 P9.5 S17 Documentation And Control Tracking accepted
+
+P9.5 S17 Documentation And Control Tracking 已完成。Implementation artifact 为
+`docs/reviews/p9-5-s17-documentation-control-tracking-implementation-20260517.md`。Documentation review /
+re-review / controller adjudication artifacts 为 `docs/reviews/p9-5-s17-doc-review-mimo-20260517.md`、
+`docs/reviews/p9-5-s17-doc-re-review-mimo-20260517.md`、
+`docs/reviews/p9-5-s17-doc-review-ds-20260517.md` 与
+`docs/reviews/p9-5-s17-doc-review-controller-adjudication-20260517.md`。
+
+Controller 裁决：AgentDS review 为 PASS，0 blocking findings；AgentMiMo 的 LOW precision finding 被接受并
+修复，`tests/README.md` 已将 Engine import boundary 从独立 `memory` 项校准为 `Host（含 memory）`，
+re-review 确认 fixed。S17 只做稳定文档校准：`dayu/README.md` 与 `docs/design.md` 补齐 `tool_schemas`
+和 ToolRuntime `tool_executor` 必须来自同一个 attempt-local effective `ToolBundle`；`dayu/engine/README.md`
+明确当前函数式入口通过私有默认 OpenAI-compatible Runner 装配点创建 Runner，该装配点不是 public factory /
+registry / runner selection extension；`dayu/host/README.md` 将 projection catch-up failure 描述校准为
+projection-local `WARNING` + `error_type`，不再写 logger exception；`tests/README.md` 同步 runtime /
+contracts / engine / host import-boundary guard 当前事实，包括 Host business tool scanner 禁止与 `fetch_more`
+ToolRuntime / tooling owner guard。S17 未更新 `docs/host/design.md`，因为 Host 专题设计已有对应设计目标且
+本轮未改变语义；未在 README 中写过程流水、未来承诺或实现细节。验证通过：`git diff --check` clean；
+AgentDS 额外 `python -m pyright dayu tests` 为 0 errors / 0 warnings / 0 informations。Accepted slice
+commit 为 `e50dee4`。当前 gate 为 P9.5 S18 Aggregate Validation And Readiness Evidence implementation。
+
+### 2026-05-17 P9.5 S16 Contract Ownership Audit And Import/Public Surface Fixes accepted
+
+P9.5 S16 Contract Ownership Audit And Import/Public Surface Fixes 已完成。Implementation artifact 为
+`docs/reviews/p9-5-s16-contract-ownership-audit-implementation-20260517.md`。Code review /
+controller adjudication artifacts 为 `docs/reviews/p9-5-s16-code-review-mimo-20260517.md`、
+`docs/reviews/p9-5-s16-code-review-ds-20260517.md` 与
+`docs/reviews/p9-5-s16-code-review-controller-adjudication-20260517.md`。
+
+Controller 裁决：AgentMiMo 与 AgentDS review 均为 PASS，0 blocking findings。S16 作为
+Contract Ownership audit / guardrail slice 被接受为 test-only 变更；未发现需要移动 public contract、修改
+生产代码或创建兼容 wrapper 的直接违规。新增测试明确防止 `dayu.contracts` 反向依赖 `dayu.runtime`；
+Engine 直接导入 `dayu.contracts.tool_declaration`、`ToolDefinition`、`ToolBundle` 或 `ToolCallable`；
+Host 使用 `importlib` / `pkgutil` 扫描业务工具模块；以及 `fetch_more` 字符串出现在 ToolRuntime owner
+之外。`fetch_more` 行为测试补充验证 ToolRuntime factory 每次创建 attempt-local `EffectiveToolBundle` 与
+独立 `FetchMoreToolCallable`，且不污染业务 `ToolBundle`。Public exports 未变更，`dayu.engine.__all__` /
+`dayu.host.__all__` 既有白名单测试仍是公共表面真源。README 未更新：本次只补既有 Contract Ownership
+规则的测试 guard，不改变 API、分层、ToolRuntime/fetch_more 行为或测试运行约定。验证通过：S16 baseline
+targeted tests 为 71 passed；S16 targeted tests 为 77 passed；AgentDS 额外 `pytest tests/host -q` 为
+562 passed；`python -m pyright dayu tests` 为 0 errors / 0 warnings / 0 informations；`git diff --check`
+clean。Accepted slice commit 为 `f1f903d`。当前 gate 为 P9.5 S17 Documentation And Control Tracking
+implementation。
+
+### 2026-05-17 P9.5 S15 Engine / Host Necessary Logs By Level accepted
+
+P9.5 S15 Engine / Host Necessary Logs By Level 已完成。Implementation artifact 为
+`docs/reviews/p9-5-s15-necessary-logs-implementation-20260517.md`。Code review /
+controller adjudication artifacts 为 `docs/reviews/p9-5-s15-code-review-mimo-20260517.md`、
+`docs/reviews/p9-5-s15-code-review-ds-20260517.md` 与
+`docs/reviews/p9-5-s15-code-review-controller-adjudication-20260517.md`。
+
+Controller 裁决：AgentDS review 为 PASS，0 blocking findings；AgentMiMo 的 Engine / dispatch scope gap
+finding 不作为 blocking 接受。S15 plan 明确要求先审计现有日志并只补必要日志，Engine agent 与 OpenAI
+runner 已有 run / iteration / runner call / tool loop / terminal、provider protocol、idle / cancellation 等
+日志覆盖，当前没有直接证据表明还存在必要缺口；机械修改 Engine 会增加日志噪音与敏感字段回归面。Host
+侧补齐 public command accepted / committed、admission committed、EngineEvent ingest accepted / committed、
+LocalProxy accept / event stream opened / close、ToolRuntime accept barrier、awaiting accept、resolve_wait、
+memory projection catch-up / repair 等已实现路径日志；projection catch-up failure 从 error/exception 语义校准为
+recoverable `WARNING`，只记录 `error_type`，不输出 exception message 或 traceback。新增 caplog 测试覆盖
+command、LocalProxy、memory catch-up、resolve_wait、ToolRuntime accept 与 projection catch-up warning 级别 /
+字段 / 脱敏。S15 未新增 audit / tool trace / outbox sink，日志仍不作为 truth、public API、projection
+checkpoint 或恢复输入。README 未更新：现有 `dayu/README.md` 日志级别语义、字段词汇、脱敏与“日志非真源”
+说明仍准确，本次只实现既有规则。验证通过：5 条 logging focused tests passed；293 条
+Engine/Host logging / diagnostics / dispatch / ingest / projection / toolruntime 选择集 passed；163 条 touched
+Host subset passed；`pytest tests/host` 为 559 passed；`python -m pyright dayu tests` 为 0 errors /
+0 warnings / 0 informations；`git diff --check` clean。Accepted slice commit 为 `743bd30`。当前 gate 为
+P9.5 S16 Contract Ownership Audit And Import/Public Surface Fixes implementation。
+
+### 2026-05-17 P9.5 S14 P9 Memory Cleanup And Production Catch-Up Wiring accepted
+
+P9.5 S14 P9 Memory Cleanup And Production Catch-Up Wiring 已完成。Implementation artifact 为
+`docs/reviews/p9-5-s14-memory-cleanup-catchup-implementation-20260517.md`。Code review /
+controller adjudication artifacts 为 `docs/reviews/p9-5-s14-code-review-mimo-20260517.md`、
+`docs/reviews/p9-5-s14-code-review-ds-20260517.md` 与
+`docs/reviews/p9-5-s14-code-review-controller-adjudication-20260517.md`。
+
+Controller 裁决：AgentMiMo 与 AgentDS review 均为 PASS，0 blocking findings。S14 保持
+`current_goal` first-write-wins 生产实现不变，只补多输入与 inline-delta targeted tests；删除 unused legacy
+`read_run_input_continuity_events(...)` / `EventLogStore.read_run_input_continuity_events(...)`，未保留兼容 wrapper
+或 re-export；`DurableSessionContinuityProvider` 仍只保留 resume-specific continuity，不发射 historical raw turns。
+S14 补齐 preview / reasoning / display-only event exclusion、memory import-boundary automation，以及显式 concrete
+catch-up port 对 start_run user input、ToolRuntime accepted tool fact、`resolve_wait` committed tool fact 的端到端测试。
+实现还修复了无 `payload_ref` 工具事实写 durable memory item 时误写 `payload_digest` 导致 schema CHECK 失败的
+root cause。Controller 复核时曾发现 generic concrete catch-up 默认接入 command handle / scheduler 会在 queued
+future input 场景把 latest-only snapshot 推过当前 dispatch cursor，触发 S14 stop condition；最终裁决为不默认接入
+generic post-commit catch-up，仅保留显式注入与 dispatch worker 前 cursor-bound catch-up。验证通过：S14 targeted
+tests 为 7 passed / 12 passed / 59 passed；regression tests 为 3 passed；`pytest tests/host` 为 554 passed；
+`python -m pyright dayu tests` 为 0 errors / 0 warnings / 0 informations；`git diff --check` clean。
+Accepted slice commit 为 `4b7d1a5`。当前 gate 为 P9.5 S15 Engine / Host Necessary Logs By Level implementation。
+
+### 2026-05-17 P9.5 S13 Message / Tool Result Size Governance accepted
+
+P9.5 S13 Message / Tool Result Size Governance 已完成。Implementation artifact 为
+`docs/reviews/p9-5-s13-message-tool-result-size-governance-implementation-20260517.md`。Code review /
+re-review / controller adjudication artifacts 为 `docs/reviews/p9-5-s13-code-review-mimo-20260517.md`、
+`docs/reviews/p9-5-s13-code-review-ds-20260517.md`、
+`docs/reviews/p9-5-s13-code-re-review-ds-20260517.md` 与
+`docs/reviews/p9-5-s13-code-review-controller-adjudication-20260517.md`。
+
+Controller 裁决：AgentMiMo 与 AgentDS review 均为 PASS，0 blocking findings。Controller 接受 DS O1/O4 为
+S13 内应修复问题：Engine per-iteration inline guard 必须有 run loop 集成测试；Assistant tool call arguments 也是
+回送 Runner 的 inline message 边界。Fix 已将 Assistant tool call id / name / arguments JSON / Gemini provider_state
+signature 纳入 `_message_inline_texts(...)`，并补 `test_oversized_assistant_tool_call_arguments_require_context_boundary`
+与 `test_oversized_tool_message_fails_before_next_runner_call`。DS re-review 确认 O1/O4 fixed，0 new blocking。
+不阻塞项包括 Engine / Host inline 阈值暂独立定义、defensive failure 不 emit `CONTEXT_COMPACTION_REQUESTED`、
+oversized `fetch_more` continuation 失败时 cursor 保留到 TTL、ToolRuntime truncation path 与总 outcome path 双重大小检查。
+S13 未新增 public error taxonomy，未实现 P10 proactive compaction，未改变 Host / Engine 分层。本地验证通过：
+S13 targeted tests 为 115 passed；`pytest tests/host tests/engine` 为 913 passed；`python -m pyright dayu tests`
+为 0 errors / 0 warnings / 0 informations；`git diff --check` clean。Accepted slice commit 为 `8b3718d`。
+当前 gate 为 P9.5 S14 P9 Memory Cleanup And Production Catch-Up Wiring implementation。
+
+### 2026-05-17 P9.5 S12 ToolRuntime Truncation / Duplicate Defensive Hardening accepted
+
+P9.5 S12 ToolRuntime Truncation / Duplicate Defensive Hardening 已完成。Implementation artifact 为
+`docs/reviews/p9-5-s12-toolruntime-truncation-duplicate-hardening-implementation-20260517.md`。Code review /
+controller adjudication artifacts 为 `docs/reviews/p9-5-s12-code-review-mimo-20260517.md`、
+`docs/reviews/p9-5-s12-code-review-ds-20260517.md` 与
+`docs/reviews/p9-5-s12-code-review-controller-adjudication-20260517.md`。
+
+Controller 裁决：AgentMiMo 与 AgentDS review 均为 0 blocking findings。实现补齐 `text_lines`、
+`list_items`、`binary_bytes`、used cursor 与 invalid limit 的 truncation / `fetch_more` focused tests，
+收紧 `ToolFactAcceptCandidate` 对 ordinary result facts、plain governed error、duplicate governed outcome 与 `REUSE`
+fact 的 policy kind、prior refs、reason 和 message 一致性校验，并确认 `TruncationManager` 初始化是 run-scoped
+轻量对象，无 Phase 15 production scale reassignment 需求。MiMo residual risks 与 DS observation 均裁决为 non-blocking：
+truncation cursor 仍是 memory / run-scoped / ToolRuntime-local capability；duplicate registry 仍是同进程 run-local
+memory；`ToolPolicyDecisionKind` 与 `DuplicateDecisionKind` 的 value 对齐可在 S16 Contract Ownership audit 中复核。
+本地验证通过：S12 targeted tests 为 60 passed；`pytest tests/host/test_toolruntime_*.py tests/host/test_phase6_toolruntime_integration.py`
+为 67 passed；`pytest tests/host` 为 544 passed；`python -m pyright dayu/host tests/host` 为 0 errors /
+0 warnings / 0 informations；`python -m pyright dayu tests` 为 0 errors / 0 warnings / 0 informations；
+`git diff --check` clean。Accepted slice commit 为 `df8d636`。当前 gate 为 P9.5 S13 Message / Tool Result
+Size Governance implementation。
+
+### 2026-05-17 P9.5 S11 ToolRuntime Boundary Cleanup accepted
+
+P9.5 S11 ToolRuntime Boundary Cleanup 已完成。Implementation artifact 为
+`docs/reviews/p9-5-s11-toolruntime-boundary-cleanup-implementation-20260517.md`。Code review / fix /
+re-review / controller adjudication artifacts 为 `docs/reviews/p9-5-s11-code-review-mimo-20260517.md`、
+`docs/reviews/p9-5-s11-code-review-ds-20260517.md`、
+`docs/reviews/p9-5-s11-toolruntime-boundary-cleanup-fix-20260517.md`、
+`docs/reviews/p9-5-s11-code-re-review-ds-20260517.md` 与
+`docs/reviews/p9-5-s11-code-review-controller-adjudication-20260517.md`。
+
+Controller 裁决：S11 只把 ToolRuntime effective schema projection / digest helper 抽到私有
+`dayu.host.tool_runtime_schema_projection`，保留 `ToolRuntimeHandle`、factory、accept barrier、EventLog facts、
+duplicate semantics、truncation cursor scope、diagnostics 与 `dayu.host.tool_runtime` public `__all__` 不变。
+该取舍避免 compatibility re-export、test-only private re-export、facade、lazy import seam、public API 变化、
+ToolRuntime 下沉到 `contracts` / `runtime` 或 Engine 拥有工具声明 / 执行治理。AgentMiMo review 为 0 blocking；
+AgentDS review 接受 1 个 LOW finding：Engine tool ownership import-boundary 测试未覆盖
+`from dayu.contracts.tool_declaration import *`。Fix 已将该 star import 窄范围展开为 `ToolBundle` /
+`ToolDefinition` 违规并补合成源码测试，AgentDS re-review 确认 fixed，0 blocking。本地验证通过：S11
+targeted tests 为 46 passed；`pytest tests/host/test_toolruntime_*.py` 为 55 passed；`pytest tests/host tests/engine`
+为 897 passed；`python -m pyright dayu tests` 为 0 errors / 0 warnings / 0 informations；`git diff --check`
+clean。Accepted slice commit 为 `f026a53`。当前 gate 为 P9.5 S12 ToolRuntime Truncation / Duplicate
+Defensive Hardening implementation。
+
+### 2026-05-17 P9.5 S10 Host Dispatch Lifecycle / RunInputBuilder Non-Recovery Cleanup accepted
+
+P9.5 S10 Host Dispatch Lifecycle / RunInputBuilder Non-Recovery Cleanup 已完成。Implementation artifact 为
+`docs/reviews/p9-5-s10-dispatch-runinput-non-recovery-cleanup-implementation-20260517.md`。Code review /
+controller adjudication artifacts 为 `docs/reviews/p9-5-s10-code-review-mimo-20260517.md`、
+`docs/reviews/p9-5-s10-code-review-ds-20260517.md` 与
+`docs/reviews/p9-5-s10-code-review-controller-adjudication-20260517.md`。
+
+Controller 裁决：AgentMiMo 与 AgentDS review 均为 0 blocking findings。两份 review 均确认 S10
+未引入 Phase 11 recovery、`RECOVERING` dispatch、startup recovery scan、orphan proof、RemoteProxy 或状态机语义变更。
+实现覆盖 `_drain_loop` 空队列 / close / 异常退出可观测性、lane acquire 后 pre-accept cancel race 的 lane release
+与 no-worker-call、worker stream exception 后 active registry 注销 / worker handle close / lane token release、
+RunInputBuilder stale snapshot identity fail-closed，以及 late `resolve_wait` rejection 不触发 projection catch-up、
+不创建 resume Attempt、不追加 resume facts。MiMo 与 DS 的 info / low findings 均裁决为 non-goal、non-blocking
+或后续 owner 风险：`_drain_loop` 异常退出后的重启 / watchdog / startup recovery scan 归 Phase 11 lifecycle /
+recovery owner；late rejection 后 read model 即时刷新通过后续成功 command 或显式 repair / catch-up 处理；测试 helper
+复用与其它 late rejection reason 的更细专项测试归后续 wait / test hardening owner。本地验证通过：S10 targeted
+tests 为 65 passed；`pytest tests/host` 为 532 passed；`python -m pyright dayu/host tests/host` 为
+0 errors / 0 warnings / 0 informations；`python -m pyright dayu tests` 为 0 errors / 0 warnings /
+0 informations；`git diff --check` clean。Accepted slice commit 为 `c32b370`。当前 gate 为 P9.5 S11
+ToolRuntime Boundary Cleanup implementation。
+
+### 2026-05-17 P9.5 S9 Runtime Lane Hardening accepted
+
+P9.5 S9 Runtime Lane Hardening 已完成。Implementation artifact 为
+`docs/reviews/p9-5-s9-runtime-lane-hardening-implementation-20260517.md`。Code review /
+controller adjudication artifacts 为 `docs/reviews/p9-5-s9-code-review-mimo-20260517.md`、
+`docs/reviews/p9-5-s9-code-review-ds-20260517.md` 与
+`docs/reviews/p9-5-s9-code-review-controller-adjudication-20260517.md`。
+
+Controller 裁决：AgentMiMo 与 AgentDS review 均为 0 blocking findings。两份 review 均确认
+`Task.cancel()` 透传、`CancellationToken` 返回 `LaneAcquireCancelled`、取消优先于 timeout、repeated outer
+cancellation 不打断已插入 claim cleanup，untracked release failure 通过 warning / `RuntimeLaneError`
+暴露，`LaneController.close(reason=...)` 保持 best-effort release 且不引入 Host truth。MiMo info
+observation 与 DS residual risks 均裁决为 non-goal 或未来扩展风险，不需要 S9 fix。本地验证通过：S9
+targeted tests 为 31 passed；`pytest tests/runtime` 为 93 passed；`python -m pyright dayu/runtime tests/runtime`
+为 0 errors / 0 warnings / 0 informations；`git diff --check` clean。Accepted slice commit
+为 `d40a3cc`。当前 gate 为 P9.5 S10 Host Dispatch Lifecycle / RunInputBuilder Non-Recovery Cleanup
+implementation。
+
+### 2026-05-17 P9.5 S8 Engine Wait Confirmation Matching-Ref Hardening accepted
+
+P9.5 S8 Engine Wait Confirmation Matching-Ref Hardening 已完成。Implementation artifact 为
+`docs/reviews/p9-5-s8-engine-wait-confirmation-matching-ref-implementation-20260517.md`。Code review /
+controller adjudication artifacts 为 `docs/reviews/p9-5-s8-code-review-mimo-20260517.md`、
+`docs/reviews/p9-5-s8-code-review-ds-20260517.md` 与
+`docs/reviews/p9-5-s8-code-review-controller-adjudication-20260517.md`。
+
+Controller 裁决：AgentMiMo 与 AgentDS review 均为 0 blocking findings。两份 review 均确认
+`TOOL_AWAITING` / `RUN_SUSPENDED` 只在 Host durable accepted wait record、canonical refs、envelope
+identity 与 Engine awaiting record 匹配时记为 diagnostic confirmation；缺失或不匹配只 diagnostic /
+rejection，不创建 wait record、不推进 Run `WAITING`、不关闭 Attempt、不追加 canonical tool fact。MiMo
+info observations 与 DS residual risks 均裁决为后续语义扩展风险，不需要 S8 fix。本地验证通过：S8
+targeted tests 为 38 passed；`pytest tests/host` 为 527 passed；`python -m pyright dayu/host tests/host`
+为 0 errors / 0 warnings / 0 informations；`git diff --check` clean。Accepted slice commit
+为 `31a1ee5`。当前 gate 为 P9.5 S9 Runtime Lane Hardening implementation。
+
+### 2026-05-17 P9.5 S7 LocalProxy Close / Events Race accepted
+
+P9.5 S7 LocalProxy Close / Events Race 已完成。Implementation artifact 为
+`docs/reviews/p9-5-s7-local-proxy-close-events-implementation-20260517.md`。Code review / fix /
+re-review / controller adjudication artifacts 为 `docs/reviews/p9-5-s7-code-review-mimo-20260517.md`、
+`docs/reviews/p9-5-s7-code-review-ds-20260517.md`、`docs/reviews/p9-5-s7-fix-20260517.md`、
+`docs/reviews/p9-5-s7-code-re-review-mimo-20260517.md`、
+`docs/reviews/p9-5-s7-code-re-review-ds-20260517.md` 与
+`docs/reviews/p9-5-s7-code-re-review-controller-adjudication-20260517.md`。
+
+Controller 裁决：AgentMiMo 与 AgentDS 初审均为 0 blocking findings。AgentMiMo F1 指出 active
+`anext()` task 在极窄竞争窗口以非取消异常完成时可能跳过底层 Engine generator `aclose()`，被接受为
+resource-boundary hardening fix；修复后 AgentMiMo / AgentDS re-review 均确认 fixed 且无新 blocking finding。
+本地验证通过：S7 targeted tests 为 49 passed；`pytest tests/host` 为 521 passed；
+`python -m pyright dayu/host tests/host` 为 0 errors / 0 warnings / 0 informations；`git diff --check`
+clean。Accepted slice commit 为 `2f8cf91`。当前 gate 为 P9.5 S8 Engine Wait Confirmation Matching-Ref
+Hardening implementation。
+
+### 2026-05-17 P9.5 S6 Read API Enum Mapping And Minimal Read Model Reset Contract accepted
+
+P9.5 S6 Read API Enum Mapping And Minimal Read Model Reset Contract 已完成。Implementation artifact 为
+`docs/reviews/p9-5-s6-read-api-enum-reset-implementation-20260517.md`。Code review / controller adjudication
+artifacts 为 `docs/reviews/p9-5-s6-code-review-mimo-20260517.md` 与
+`docs/reviews/p9-5-s6-code-review-controller-adjudication-20260517.md`。
+
+Controller 裁决：AgentMiMo review 为 0 blocking findings；F1 enum 双重防御、F2 timeline kind closed set
+同步、F3 terminal Run status closed set 同步均裁决为 info observation，无需 fix。AgentDS 在 S6 review
+中压缩后跑偏到旧 S2 上下文，窄 prompt 重试后仍未产出 artifact，裁决记录为 reviewer unavailable 而不继续阻塞流程。
+本地验证通过：`pytest tests/host` 为 517 passed；`python -m pyright dayu/host tests/host` 为 0 errors /
+0 warnings / 0 informations；`git diff --check` clean。Accepted slice commit 为 `39d3582`。当前 gate 为
+P9.5 S7 LocalProxy Close / Events Race implementation。
+
+### 2026-05-17 P9.5 S5 Schema CHECK Hardening accepted
+
+P9.5 S5 Schema CHECK Hardening 已完成。Implementation artifact 为
+`docs/reviews/p9-5-s5-schema-check-hardening-implementation-20260517.md`。Code review / controller
+adjudication artifacts 为 `docs/reviews/p9-5-s5-code-review-mimo-20260517.md`、
+`docs/reviews/p9-5-s5-code-review-ds-20260517.md` 与
+`docs/reviews/p9-5-s5-code-review-controller-adjudication-20260517.md`。
+
+Controller 裁决：AgentMiMo 与 AgentDS review 均为 0 blocking findings；MiMo 两个 info observation 均裁决为
+S5 预期结果或分层正确性，无需 fix。本地验证通过：`pytest tests/host` 为 502 passed；
+`python -m pyright dayu/host tests/host` 为 0 errors / 0 warnings / 0 informations；`git diff --check`
+clean。Accepted slice commit 为 `12f90c6`。当前 gate 为 P9.5 S6 Read API Enum Mapping And Minimal Read Model
+Reset Contract implementation。
+
+### 2026-05-17 P9.5 S4 Host Durable Helper API Tightening accepted
+
+P9.5 S4 Host Durable Helper API Tightening 已完成。Implementation artifact 为
+`docs/reviews/p9-5-s4-host-durable-helper-tightening-implementation-20260517.md`。Code review / fix /
+controller adjudication artifacts 为 `docs/reviews/p9-5-s4-code-review-mimo-20260517.md`、
+`docs/reviews/p9-5-s4-code-review-ds-20260517.md`、
+`docs/reviews/p9-5-s4-fix-20260517.md` 与
+`docs/reviews/p9-5-s4-code-review-controller-adjudication-20260517.md`。
+
+Controller 裁决：AgentMiMo 与 AgentDS review 均为 0 blocking findings；AgentDS F1 / AgentMiMo F1
+关于 Python 前置检查与 SQL CAS 双重检查意图说明不足被接受为 low documentation fix，并已通过
+`docs/reviews/p9-5-s4-fix-20260517.md` 关闭。本地验证通过：
+`pytest tests/host/test_run_attempt_transitions.py tests/host/test_dispatch_scheduler.py tests/host/test_resolve_wait_command.py
+tests/host/test_public_cancel_session_runs.py tests/host/test_run_input_builder.py tests/host/test_phase6_toolruntime_integration.py
+tests/host/test_toolruntime_accept_barrier.py` 为 103 passed；`pytest tests/host` 为 500 passed；
+`python -m pyright dayu/host tests/host` 为 0 errors / 0 warnings / 0 informations；`git diff --check`
+clean。Accepted slice commit 为 `e5e13e4`。当前 gate 为 P9.5 S5 Schema CHECK Hardening implementation。
+
+### 2026-05-17 P9.5 S3 Host Public Error Taxonomy And Command Handle Encapsulation accepted
+
+P9.5 S3 Host Public Error Taxonomy And Command Handle Encapsulation 已完成。Implementation artifact 为
+`docs/reviews/p9-5-s3-host-public-error-command-handle-implementation-20260517.md`。Code review / controller
+adjudication artifacts 为 `docs/reviews/p9-5-s3-code-review-mimo-20260517.md` 与
+`docs/reviews/p9-5-s3-code-review-controller-adjudication-20260517.md`。
+
+Controller 裁决：AgentMiMo review 为 0 blocking findings；F1 `_run_read` / `_run_write` 双层 durable error
+转换、F2 `resolve_wait` closed guard 风格、F3 generic durable subtype fallback 均为 info observation，无需当前
+slice fix。AgentDS 在两次 S3 review dispatch 与一次窄 prompt 后仍未产出 artifact，裁决记录为 reviewer unavailable
+而不继续阻塞流程。本地验证通过：`pytest tests/host/test_command_handle.py tests/host/test_package_exports.py
+tests/host/test_public_contracts.py tests/host/test_public_session_api.py tests/host/test_public_run_api.py` 为
+69 passed；`python -m pyright dayu/host tests/host` 为 0 errors / 0 warnings / 0 informations；`git diff --check`
+clean。Accepted slice commit 为 `02a75ec`。当前 gate 为 P9.5 S4 Host Durable Helper API Tightening implementation。
+
+### 2026-05-17 P9.5 S2 Engine / OpenAI Runner / Parser Hardening accepted
+
+P9.5 S2 Engine / OpenAI Runner / Parser Hardening 已完成。Implementation artifact 为
+`docs/reviews/p9-5-s2-engine-openai-runner-parser-implementation-20260517.md`。Code review / fix / re-review
+artifacts 为 `docs/reviews/p9-5-s2-code-review-ds-20260517.md`、
+`docs/reviews/p9-5-s2-code-review-controller-adjudication-20260517.md`、
+`docs/reviews/p9-5-s2-fix-20260517.md`、
+`docs/reviews/p9-5-s2-code-re-review-mimo-20260517.md`、
+`docs/reviews/p9-5-s2-code-re-review-ds-20260517.md` 与
+`docs/reviews/p9-5-s2-code-re-review-controller-adjudication-20260517.md`。
+
+Controller 裁决：AgentDS 初审为 0 blocking findings，但 F1 `_OpenAIUsage` dead code、F2 bool index in
+`_coerce_tool_call_delta` 与 F3 bool index in `ToolCallAggregator._resolve_index` 被 controller 接受为 required fix。
+Fix 后 AgentMiMo / AgentDS re-review 均确认 fixed，new blockers 为 0。本地验证通过：
+`pytest tests/engine/runners/openai tests/engine/test_metadata_boundary.py tests/engine/test_engine_event_contract.py`
+为 229 passed；`python -m pyright dayu/engine tests/engine` 为 0 errors / 0 warnings / 0 informations；
+`git diff --check` clean。Accepted slice commit 为 `5fd28be`。当前 gate 为 P9.5 S3 Host Public Error Taxonomy
+And Command Handle Encapsulation implementation。
+
+### 2026-05-17 P9.5 S1 Engine Runner Protocol Decoupling accepted
+
+P9.5 S1 Engine Runner Protocol Decoupling 已完成。Implementation artifact 为
+`docs/reviews/p9-5-s1-engine-runner-protocol-implementation-20260517.md`。Code review artifacts 为
+`docs/reviews/p9-5-s1-code-review-mimo-20260517.md`、
+`docs/reviews/p9-5-s1-code-review-ds-20260517.md` 与
+`docs/reviews/p9-5-s1-code-review-controller-adjudication-20260517.md`。
+
+Controller 裁决：AgentMiMo 与 AgentDS 均为 0 blocking findings；非阻塞 observations 均裁决为不需要当前 slice fix。
+本地验证通过：`pytest tests/engine/test_protocols_surface.py tests/engine/test_agent_phase2.py
+tests/engine/test_agent_phase3_tool_call.py` 为 66 passed；`python -m pyright dayu/engine tests/engine` 为 0 errors /
+0 warnings / 0 informations；`git diff --check` clean。Accepted slice commit 为 `e89969a`。当前 gate 为
+P9.5 S2 Engine / OpenAI Runner / Parser Hardening implementation。
+
+### 2026-05-17 P9.5 implementation-ready plan accepted
+
+P9.5 Pre-P10 Cross-Repository Hardening PR implementation-ready handoff plan 已生成并通过双路 plan review、controller
+adjudication、plan fix 与双路 re-review。Plan artifact 为 `docs/host/p9-5-pre-p10-hardening-plan.md`。
+
+Plan review artifacts：
+- AgentMiMo：`docs/reviews/p9-5-plan-review-mimo-20260517.md`
+- AgentDS：`docs/reviews/p9-5-plan-review-ds-20260517.md`
+- Controller adjudication：`docs/reviews/p9-5-plan-review-controller-adjudication-20260517.md`
+
+Plan re-review artifacts：
+- AgentMiMo：`docs/reviews/p9-5-plan-re-review-mimo-20260517.md`
+- AgentDS：`docs/reviews/p9-5-plan-re-review-ds-20260517.md`
+- Controller adjudication：`docs/reviews/p9-5-plan-re-review-controller-adjudication-20260517.md`
+
+Controller 裁决：AgentDS F1 / F2 作为 required plan fix 接受并已修复；其余 accepted non-blocking guidance 已写回
+plan。两份 re-review 均确认 accepted findings fixed，new blockers 为 0。Accepted plan commit 为 `ed72437`。
+
+S0 Controller Preflight And Scope Lock 已完成，artifact 为
+`docs/reviews/p9-5-s0-controller-preflight-implementation-20260517.md`。S0 验证结果：当前分支为
+`p9.5-pre-p10-hardening`，worktree clean，`source .venv/bin/activate && python -m pyright dayu tests` 为
+0 errors / 0 warnings / 0 informations。当前 gate 为 P9.5 S1 Engine Runner Protocol Decoupling implementation。
+
+### 2026-05-17 P9.5 design discussion accepted
+
+P9.5 Pre-P10 Cross-Repository Hardening PR design discussion 已完成，设计讨论结果已写入 `dayu/README.md`、
+`docs/design.md` 与本文档。已确认的 P9.5 scope 包含 Engine runner protocol decoupling、minimal read model
+single-consumer reset contract、durable / public API error taxonomy、Command handle internal service encapsulation /
+lifecycle guard、LocalProxy close / events race、read API enum mapping、ToolRuntime / memory boundary cleanup、runtime
+lane hardening、message / tool result size governance、Host durable helper API tightening、schema CHECK hardening、Engine /
+OpenAI runner / parser hardening、Engine / Host necessary log by level semantics、Contract Ownership conformance audit、
+P9 memory cleanup / test hardening，以及不触及 snapshot history 保留模型的 production memory projection catch-up
+composition wiring。
+
+用户已确认关键裁决：Engine runner 不做 factory / registry，只做 Agent 主链路消费 `AsyncRunner` protocol；minimal read
+model 维持 single-consumer reset contract，不引入 multi-consumer schema；Command handle 内部 service 不暴露给 Service /
+UI 或测试；工具定义与执行边界按 `docs/design.md` 写入 Contract Ownership audit 检查点。
+
+当前 gate 为 P9.5 accepted design discussion commit；commit 后进入 P9.5 implementation-ready handoff plan。plan 必须先经
+AgentMiMo / AgentDS 双路 plan review 与 controller adjudication 通过，才可派发 implementation。
 
 ### 2026-05-17 P9 draft PR review accepted
 

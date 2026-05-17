@@ -39,18 +39,6 @@ from dayu.host.durable.transaction import HostRow, HostTransaction
 
 _MIN_READ_LIMIT = 1
 _MIN_EVENT_CURSOR = 0
-_EVENT_TYPE_USER_INPUT_ACCEPTED = "USER_INPUT_ACCEPTED"
-_EVENT_TYPE_RUN_SUCCEEDED = "RUN_SUCCEEDED"
-_EVENT_TYPE_RUN_FAILED = "RUN_FAILED"
-_EVENT_TYPE_RUN_CANCELLED = "RUN_CANCELLED"
-_EVENT_TYPE_RUN_LOST = "RUN_LOST"
-_RUN_INPUT_CONTINUITY_EVENT_TYPES: tuple[str, ...] = (
-    _EVENT_TYPE_USER_INPUT_ACCEPTED,
-    _EVENT_TYPE_RUN_SUCCEEDED,
-    _EVENT_TYPE_RUN_FAILED,
-    _EVENT_TYPE_RUN_CANCELLED,
-    _EVENT_TYPE_RUN_LOST,
-)
 
 
 class EventClass(StrEnum):
@@ -217,28 +205,6 @@ class EventLogStore:
 
         return read_events_after(transaction, cursor, limit=limit)
 
-    def read_run_input_continuity_events(
-        self,
-        transaction: HostTransaction,
-        *,
-        session_id: str,
-        before_event_sequence: int,
-    ) -> tuple[EventLogRow, ...]:
-        """读取 RunInputBuilder 需要的 session continuity canonical facts。
-
-        :param transaction: 调用方提供的 Host durable transaction。
-        :param session_id: 目标 Session id。
-        :param before_event_sequence: 当前 Attempt 边界 event sequence。
-        :returns: 按全局 ``event_sequence`` 升序排列的 canonical facts。
-        :raises HostDurableError: 输入无效时抛出。
-        """
-
-        return read_run_input_continuity_events(
-            transaction,
-            session_id=session_id,
-            before_event_sequence=before_event_sequence,
-        )
-
     def read_latest_run_event_by_type(
         self,
         transaction: HostTransaction,
@@ -283,6 +249,7 @@ def append_event(
         encoded = _encode_append_request(request)
     except (TypeError, ValueError) as exc:
         raise HostDurableError("EventLog append request encoding failed") from exc
+    _validate_canonical_inline_payload_size(transaction, request, encoded)
     existing = read_event_by_id(transaction, request.event_id)
     if existing is not None:
         if existing.event_body_digest == encoded.event_body_digest:
@@ -432,68 +399,6 @@ def read_events_after(
         LIMIT ?
         """,
         (cursor, limit),
-    )
-    return tuple(_event_log_row_from_host_row(row) for row in rows)
-
-
-def read_run_input_continuity_events(
-    transaction: HostTransaction,
-    *,
-    session_id: str,
-    before_event_sequence: int,
-) -> tuple[EventLogRow, ...]:
-    """读取 RunInputBuilder continuity provider 所需 canonical facts。
-
-    本 reader 只返回与 RunInputBuilder Phase 5 continuity 相关的 canonical
-    facts，并按 EventLog 全局顺序稳定排序；preview、diagnostic 和
-    projection_signal 事件不会返回。
-
-    :param transaction: 调用方提供的 Host durable transaction。
-    :param session_id: 目标 Session id。
-    :param before_event_sequence: 当前 Attempt 边界 event sequence。
-    :returns: 符合 RunInputBuilder continuity 白名单的事件元组。
-    :raises HostDurableError: ``session_id`` 为空或序号非法时抛出。
-    """
-
-    _require_non_empty_text(session_id, field_name="session_id")
-    if before_event_sequence <= 0:
-        raise HostDurableError("before_event_sequence must be positive")
-    rows = transaction.fetchall(
-        f"""
-        SELECT
-          event_sequence,
-          event_id,
-          event_body_digest,
-          event_class,
-          session_id,
-          run_id,
-          attempt_id,
-          execution_id,
-          event_type,
-          occurred_at,
-          actor,
-          source,
-          client_request_id,
-          idempotency_key,
-          policy_decision_json,
-          reason_json,
-          payload_json,
-          payload_ref,
-          payload_digest,
-          appended_at
-        FROM {TABLE_EVENT_LOG}
-        WHERE session_id = ?
-          AND event_class = ?
-          AND event_sequence < ?
-          AND event_type IN (?, ?, ?, ?, ?)
-        ORDER BY event_sequence ASC
-        """,
-        (
-            session_id,
-            EventClass.CANONICAL_FACT.value,
-            before_event_sequence,
-            *_RUN_INPUT_CONTINUITY_EVENT_TYPES,
-        ),
     )
     return tuple(_event_log_row_from_host_row(row) for row in rows)
 
@@ -670,6 +575,31 @@ def _validate_payload_reference(
         )
     if not is_sha256_digest(payload_digest):
         raise HostPayloadReferenceError("EventLog payload_digest is invalid")
+
+
+def _validate_canonical_inline_payload_size(
+    transaction: HostTransaction,
+    request: EventLogAppendRequest,
+    encoded: _EncodedAppendRequest,
+) -> None:
+    """校验 canonical fact 不把大内容塞入 inline payload。
+
+    :param transaction: 调用方提供的 Host durable transaction。
+    :param request: EventLog append 请求。
+    :param encoded: 已 canonical 编码的 append 请求。
+    :returns: ``None``。
+    :raises HostPayloadReferenceError: canonical inline payload 超过当前 store 的 payload inline 阈值时抛出。
+    """
+
+    if request.event_class is not EventClass.CANONICAL_FACT:
+        return
+    payload_size_bytes = len(encoded.payload_json.encode("utf-8"))
+    if payload_size_bytes <= transaction.payload_inline_threshold_bytes:
+        return
+    raise HostPayloadReferenceError(
+        "EventLog canonical_fact payload_json exceeds inline payload limit; "
+        "use payload_ref and payload_digest for large canonical content"
+    )
 
 
 def _validate_existing_payload_descriptor(

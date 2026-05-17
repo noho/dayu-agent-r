@@ -10,6 +10,8 @@ from datetime import datetime, timezone
 import pytest
 
 import dayu.engine.agent as agent_module
+import dayu.engine._default_runner as default_runner_module
+from dayu.contracts.cancellation import CancellationToken
 from dayu.contracts.tool_call import BatchToolExecutionRequest
 from dayu.contracts.tool_outcome import (
     BatchToolExecutionOutcome,
@@ -248,6 +250,97 @@ class _ScriptedRunner:
                 await self.release_event.wait()
 
 
+class _PublicEntryDefaultRunner:
+    """测试 public entry 默认 Runner 装配与关闭的 fake OpenAI Runner。"""
+
+    constructed: list["_PublicEntryDefaultRunner"] = []
+
+    def __init__(
+        self,
+        *,
+        spec: RunnerSpec,
+        cancellation_token: CancellationToken,
+    ) -> None:
+        """记录默认 Runner 构造参数。
+
+        :param spec: Runner 规约。
+        :param cancellation_token: 取消 token。
+        :returns: 无返回值。
+        :raises Exception: 不主动抛出异常。
+        """
+
+        self.spec: RunnerSpec = spec
+        self.cancellation_token: CancellationToken = cancellation_token
+        self.close_count: int = 0
+        type(self).constructed.append(self)
+
+    def call(
+        self,
+        messages: Sequence[AgentMessage],
+        options: RunnerCallOptions,
+        tools: Sequence[ToolSchema],
+    ) -> AsyncIterator[RunnerEvent]:
+        """返回空 RunnerEvent 流。
+
+        :param messages: Agent 消息。
+        :param options: Runner 调用选项。
+        :param tools: 暴露给模型的工具 schema。
+        :returns: 空 RunnerEvent 异步流。
+        :raises Exception: 不主动抛出异常。
+        """
+
+        return self._iter_events()
+
+    def is_supports_tool_calling(self) -> bool:
+        """声明支持工具调用。
+
+        :returns: ``True``。
+        :raises Exception: 不主动抛出异常。
+        """
+
+        return True
+
+    async def close(self) -> None:
+        """记录 close 调用。
+
+        :returns: 无返回值。
+        :raises Exception: 不主动抛出异常。
+        """
+
+        self.close_count += 1
+
+    async def _iter_events(self) -> AsyncIterator[RunnerEvent]:
+        """产出空事件流。
+
+        :returns: 空 RunnerEvent 异步流。
+        :raises Exception: 不主动抛出异常。
+        """
+
+        events: tuple[RunnerEvent, ...] = ()
+        for event in events:
+            yield event
+
+
+class _ExplodingDefaultRunner:
+    """若 ``_AsyncAgent`` 误走默认 Runner 装配，本类会使测试失败。"""
+
+    def __init__(
+        self,
+        *,
+        spec: RunnerSpec,
+        cancellation_token: CancellationToken,
+    ) -> None:
+        """阻止测试误实例化默认 Runner。
+
+        :param spec: Runner 规约。
+        :param cancellation_token: 取消 token。
+        :returns: 无返回值。
+        :raises AssertionError: 始终抛出，表示走错路径。
+        """
+
+        raise AssertionError("_AsyncAgent must use the injected runner")
+
+
 def _event(event_type: RunnerEventType, data: RunnerEventData) -> RunnerEvent:
     """构造 RunnerEvent。
 
@@ -415,6 +508,44 @@ async def test_success_run_lifts_runner_events_and_agent_final() -> None:
     assert {event.run_id for event in events} == {"run_phase2"}
     assert runner.close_count == 1
     _assert_single_terminal_at_end(events)
+
+
+@pytest.mark.asyncio
+async def test_async_agent_uses_injected_runner_without_default_runner(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """``_AsyncAgent`` 主链路只消费注入的 ``AsyncRunner`` 协议实例。"""
+
+    monkeypatch.setattr(
+        default_runner_module,
+        "AsyncOpenAIRunner",
+        _ExplodingDefaultRunner,
+    )
+    runner = _ScriptedRunner(
+        events=(
+            _event(
+                RunnerEventType.RUNNER_CONTENT_COMPLETED,
+                RunnerContentCompletedData(
+                    content="ok",
+                    reasoning_content=None,
+                    finish_reason=FinishReason.STOP,
+                ),
+            ),
+            _event(
+                RunnerEventType.RUNNER_DONE,
+                RunnerDoneData(
+                    finish_reason=FinishReason.STOP,
+                    provider_request_id=None,
+                ),
+            ),
+        )
+    )
+
+    events = await _collect(_AsyncAgent(request=_request(), runner=runner))
+
+    assert runner.call_count == 1
+    assert runner.close_count == 1
+    assert _final_event(events).type is EngineEventType.FINAL_ANSWER
 
 
 @pytest.mark.asyncio
@@ -1078,6 +1209,32 @@ async def test_run_agent_and_wait_maps_final_failed_cancelled(
         )
         result = await agent_module.run_agent_and_wait(current_request)
         assert isinstance(result, expected_type)
+
+
+@pytest.mark.asyncio
+async def test_run_agent_messages_builds_default_runner_and_closes_on_stream_close(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """public entry 使用当前默认 OpenAI-compatible Runner 装配并在关闭流时 close。"""
+
+    _PublicEntryDefaultRunner.constructed.clear()
+    monkeypatch.setattr(
+        default_runner_module,
+        "AsyncOpenAIRunner",
+        _PublicEntryDefaultRunner,
+    )
+    request = _request()
+    stream = agent_module.run_agent_messages(request)
+
+    first_event = await anext(stream)
+    await stream.aclose()
+
+    assert first_event.type is EngineEventType.ITERATION_STARTED
+    assert len(_PublicEntryDefaultRunner.constructed) == 1
+    runner = _PublicEntryDefaultRunner.constructed[0]
+    assert runner.spec is request.runner_spec
+    assert runner.cancellation_token is request.cancellation_token
+    assert runner.close_count == 1
 
 
 @pytest.mark.asyncio

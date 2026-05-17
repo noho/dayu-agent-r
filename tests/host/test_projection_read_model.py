@@ -5,6 +5,8 @@ from __future__ import annotations
 from datetime import UTC, datetime
 from pathlib import Path
 
+import pytest
+
 from dayu.contracts.json_value import JsonValue
 from dayu.host import (
     AuthorizationClaim,
@@ -16,6 +18,7 @@ from dayu.host import (
     HostCommandHandleOptions,
     HostInput,
     OperationContext,
+    RunStatus,
     StartRunRequest,
     SubmitFollowupRequest,
     cancel_run,
@@ -38,16 +41,23 @@ from dayu.host.durable.projection import (
 from dayu.host.durable.read_model import (
     RunResultRow,
     SessionTimelineItemRow,
+    insert_run_result_if_absent,
+    insert_session_timeline_item_if_absent,
     read_run_result,
     read_session_timeline_items,
 )
+from dayu.host.durable.errors import HostDurableError
 from dayu.host.durable.schema import (
     TABLE_HOST_PROJECTION_CHECKPOINTS,
     TABLE_HOST_RUN_RESULTS,
     TABLE_HOST_SESSION_TIMELINE_ITEMS,
 )
 from dayu.host.durable.transaction import HostTransactionRunner
-from dayu.host.projection import ProjectionConsumerId, ProjectionRunner
+from dayu.host.projection import (
+    ProjectionConsumerId,
+    ProjectionEventView,
+    ProjectionRunner,
+)
 from dayu.host.read_model import (
     MINIMAL_READ_MODEL_CONSUMER_ID,
     MinimalReadModelProjectionConsumer,
@@ -266,6 +276,23 @@ def _delete_checkpoint(transaction_runner: HostTransactionRunner) -> None:
     )
 
 
+def _delete_minimal_read_model_owned_rows(
+    transaction_runner: HostTransactionRunner,
+) -> None:
+    """删除 fixed minimal read model consumer 独占的 row。
+
+    :param transaction_runner: Host transaction runner。
+    :returns: ``None``。
+    """
+
+    transaction_runner.run_write(
+        lambda transaction: (
+            transaction.execute(f"DELETE FROM {TABLE_HOST_SESSION_TIMELINE_ITEMS}"),
+            transaction.execute(f"DELETE FROM {TABLE_HOST_RUN_RESULTS}"),
+        )
+    )
+
+
 def _read_user_input_texts(
     transaction_runner: HostTransactionRunner, session_id: str
 ) -> tuple[str | None, ...]:
@@ -431,6 +458,141 @@ def test_terminal_event_projects_run_result_and_duplicate_replay_is_noop(
         assert result.summary_digest == _DIGEST_A
         assert total is not None
         assert total.get("total") == 1
+    finally:
+        host.close()
+
+
+def test_terminal_event_mapping_covers_current_run_terminal_statuses(
+    tmp_path: Path,
+) -> None:
+    """minimal read model terminal event 映射覆盖当前 Run 终态。"""
+
+    terminal_cases = (
+        ("RUN_SUCCEEDED", RunStatus.SUCCEEDED),
+        ("RUN_FAILED", RunStatus.FAILED),
+        ("RUN_CANCELLED", RunStatus.CANCELLED),
+        ("RUN_LOST", RunStatus.LOST),
+    )
+    host = create_host_command_handle(_options(tmp_path))
+    try:
+        session_id = _session_id(host)
+        transaction_runner = host._transaction_runner()
+        consumer = MinimalReadModelProjectionConsumer()
+        run_ids = tuple(
+            start_run(
+                host,
+                _start_request(
+                    session_id,
+                    f"start-terminal-mapping-{index}",
+                    queue_policy="queue",
+                ),
+            ).run_id
+            for index in range(1, len(terminal_cases) + 1)
+        )
+        terminal_events: list[EventLogRow] = []
+        for index, (event_type, status) in enumerate(terminal_cases):
+            terminal_events.append(
+                _append_event(
+                    transaction_runner,
+                    event_id=f"event-terminal-{status.value}",
+                    session_id=session_id,
+                    run_id=run_ids[index],
+                    event_type=event_type,
+                    payload={},
+                )
+            )
+
+        for index, event in enumerate(terminal_events):
+            transaction_runner.run_write(
+                lambda transaction, event=event, index=index: consumer.apply_event(
+                        transaction,
+                        ProjectionEventView(
+                            event_sequence=event.event_sequence,
+                            event_id=event.event_id,
+                            event_class=event.event_class,
+                            event_type=event.event_type,
+                            session_id=event.session_id,
+                            run_id=run_ids[index],
+                            attempt_id=None,
+                            execution_id=None,
+                            occurred_at=event.occurred_at,
+                            payload_ref=None,
+                            payload_digest=None,
+                            payload={},
+                        ),
+                    )
+            )
+
+        for index, (_event_type, status) in enumerate(terminal_cases):
+            result = transaction_runner.run_write(
+                lambda transaction, run_id=run_ids[index]: read_run_result(
+                    transaction, run_id
+                )
+            )
+            assert result is not None
+            assert result.terminal_status == status.value
+    finally:
+        host.close()
+
+
+def test_read_model_python_validation_rejects_unknown_terminal_status(
+    tmp_path: Path,
+) -> None:
+    """RunResult Python validation 对未知 terminal_status fail closed。"""
+
+    host = create_host_command_handle(_options(tmp_path))
+    try:
+        transaction_runner = host._transaction_runner()
+        row = RunResultRow(
+            run_id="run-invalid-status",
+            session_id="session-1",
+            terminal_status="future_terminal",
+            terminal_event_id="event-terminal",
+            terminal_event_sequence=1,
+            result_ref=None,
+            result_digest=None,
+            summary_ref=None,
+            summary_digest=None,
+            projected_at="2026-05-16T00:00:00.000000Z",
+            updated_at="2026-05-16T00:00:00.000000Z",
+        )
+
+        with pytest.raises(HostDurableError):
+            transaction_runner.run_write(
+                lambda transaction: insert_run_result_if_absent(transaction, row)
+            )
+    finally:
+        host.close()
+
+
+def test_read_model_python_validation_rejects_unknown_timeline_kind(
+    tmp_path: Path,
+) -> None:
+    """SessionTimeline Python validation 对未知 item_kind fail closed。"""
+
+    host = create_host_command_handle(_options(tmp_path))
+    try:
+        transaction_runner = host._transaction_runner()
+        row = SessionTimelineItemRow(
+            timeline_item_id="timeline-invalid-kind",
+            session_id="session-1",
+            run_id=None,
+            event_id="event-1",
+            event_sequence=1,
+            item_kind="future_kind",
+            event_type="USER_INPUT_ACCEPTED",
+            display_text=None,
+            payload_ref=None,
+            payload_digest=None,
+            projected_at="2026-05-16T00:00:00.000000Z",
+        )
+
+        with pytest.raises(HostDurableError):
+            transaction_runner.run_write(
+                lambda transaction: insert_session_timeline_item_if_absent(
+                    transaction, row
+                )
+            )
     finally:
         host.close()
 
@@ -672,6 +834,57 @@ def test_repair_rebuilds_rows_after_deletion_and_reset(tmp_path: Path) -> None:
             lambda transaction: read_session_timeline_items(transaction, session_id)
         )
 
+        assert repair.failures == 0
+        assert _stable_run_result(before_result) == _stable_run_result(after_result)
+        assert _stable_timeline(before_timeline) == _stable_timeline(after_timeline)
+    finally:
+        host.close()
+
+
+def test_minimal_read_model_reset_replays_fixed_consumer_owned_tables(
+    tmp_path: Path,
+) -> None:
+    """fixed minimal consumer 可清空独占 read model tables 并从 EventLog 重建。"""
+
+    host = create_host_command_handle(_options(tmp_path))
+    try:
+        session_id = _session_id(host)
+        run = start_run(host, _start_request(session_id, "start-reset-replay"))
+        transaction_runner = host._transaction_runner()
+        _append_event(
+            transaction_runner,
+            event_id="event-terminal-reset-replay",
+            session_id=session_id,
+            run_id=run.run_id,
+            event_type="RUN_SUCCEEDED",
+            payload={
+                "terminal_summary_ref": "summary-reset-replay",
+                "terminal_summary_digest": _DIGEST_A,
+            },
+        )
+        repair_minimal_read_models(
+            transaction_runner, reset_checkpoint=True, batch_size=2
+        )
+        before_result = transaction_runner.run_write(
+            lambda transaction: read_run_result(transaction, run.run_id)
+        )
+        before_timeline = transaction_runner.run_write(
+            lambda transaction: read_session_timeline_items(transaction, session_id)
+        )
+
+        _delete_minimal_read_model_owned_rows(transaction_runner)
+        repair = repair_minimal_read_models(
+            transaction_runner, reset_checkpoint=True, batch_size=2
+        )
+        after_result = transaction_runner.run_write(
+            lambda transaction: read_run_result(transaction, run.run_id)
+        )
+        after_timeline = transaction_runner.run_write(
+            lambda transaction: read_session_timeline_items(transaction, session_id)
+        )
+
+        assert repair.consumer_id == MINIMAL_READ_MODEL_CONSUMER_ID
+        assert repair.started_cursor == 0
         assert repair.failures == 0
         assert _stable_run_result(before_result) == _stable_run_result(after_result)
         assert _stable_timeline(before_timeline) == _stable_timeline(after_timeline)

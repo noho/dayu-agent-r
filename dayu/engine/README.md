@@ -67,7 +67,7 @@ from dayu.engine.contracts import AgentRunRequest, RunnerSpec
 
 - `run_id`：调用方传入的本次 run 标识；Engine 只随事件与工具执行上下文透传，不拥有 run 生命周期。
 - `session_id`：调用方传入的 session 标识；Engine 只随事件与工具执行上下文透传，不拥有 session 生命周期。
-- `messages`：进入本次 run 的 `AgentMessage` 元组。
+- `messages`：进入本次 run 的 `AgentMessage` 元组；Engine 会在 Runner 调用前执行防御性 inline 内容大小检查，超限时以既有 `context_compaction_required` recoverable failure 收口，要求调用方通过 ref / digest / payload / compact artifact 边界重建有界 messages。
 - `disable_tools`：是否禁用工具调用。
 - `runner_spec`：Runner 规约。
 - `runner_options`：单次 Runner 调用参数。
@@ -222,9 +222,10 @@ Stream 术语边界：
 run_agent_messages(request)
   -> create run-scoped Runner from request.runner_spec
   -> create run-scoped Agent from request + Runner
-  -> Agent.run_messages
+      -> Agent.run_messages
       -> observe cancellation_token before work
       -> validate agent_policy.max_iterations >= 1
+      -> validate messages inline size before Runner calls
       -> emit EngineEvent.iteration_started
       -> run ordinary iterations within agent_policy.max_iterations
       -> compute effective tools from disable_tools / AgentPolicy / Runner capability
@@ -417,7 +418,7 @@ Runner close 是 run-scoped 收尾机制。`run_agent_messages` 在生成器结�
 
 ## 扩展点
 
-扩展 provider Runner 时，实现 `AsyncRunner`，把 provider 原生响应归一为 RunnerEvent，并保持工具执行、迭代决策和终态判定在 Agent 协调层。当前函数式入口创建的是内置 OpenAI-compatible Runner；接入其它 Runner 需要同步调整明确的 Runner 选择契约与装配代码。
+扩展 provider Runner 时，实现 `AsyncRunner`，把 provider 原生响应归一为 RunnerEvent，并保持工具执行、迭代决策和终态判定在 Agent 协调层。当前函数式入口通过私有默认装配点创建内置 OpenAI-compatible Runner；该私有装配点不是公共 factory、registry 或 runner 选择扩展点。
 
 扩展 Engine 公共事件时，必须同步扩展 `EngineEventType`、对应 data dataclass、`EngineEventData` 封闭联合，以及 RunnerEvent 提升或 Agent 产出路径。
 

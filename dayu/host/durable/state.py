@@ -3092,6 +3092,7 @@ def mark_dispatch_waiting_for_lane_row(
           AND dispatching_at IS NULL
           AND worker_accept_event_id IS NULL
           AND cancelled_event_id IS NULL
+          AND cancelled_event_sequence IS NULL
         """,
         (
             serialize_dispatch_record_status(DispatchRecordStatus.WAITING_FOR_LANE),
@@ -3121,13 +3122,9 @@ def mark_dispatching_after_lane_row(
 ) -> DispatchRecordMutationResult:
     """CAS 将 lane recheck 通过的 dispatch record 标记为 dispatching。
 
-    该 helper 支持两种安全来源：
-
-    - ``WAITING_FOR_LANE``：保留已写入的 waiting timestamp 与 lane name，
-      只补齐 lane claim / owner / dispatching 诊断字段。
-    - ``PENDING``：允许 scheduler 在已获得 lane token 后直跳
-      ``DISPATCHING``，并用本次 lane acquire 信息补齐 schema 要求的
-      waiting / lane / dispatching 全部诊断字段。
+    该 helper 只接受 production scheduler 已完成 durable recheck 后的
+    ``WAITING_FOR_LANE`` row，保留已写入的 waiting timestamp 与 lane name，
+    只补齐 lane claim / owner / dispatching 诊断字段。
 
     :param transaction: 调用方提供的 Host transaction。
     :param attempt_id: 目标 Attempt id。
@@ -3151,13 +3148,20 @@ def mark_dispatching_after_lane_row(
     _require_non_empty_text(lane_owner_id, field_name="lane_owner_id")
     _require_non_empty_text(lane_acquired_at, field_name="lane_acquired_at")
     _require_non_empty_text(dispatching_at, field_name="dispatching_at")
+    invalid = _invalid_dispatching_after_lane_precondition(
+        transaction,
+        attempt_id=attempt_id,
+        owner_host_instance_id=owner_host_instance_id,
+        lane_name=lane_name,
+    )
+    if invalid is not None:
+        return invalid
     result = transaction.execute(
         f"""
         UPDATE {TABLE_HOST_ATTEMPT_DISPATCH_RECORDS}
         SET
           status = ?,
           owner_host_instance_id = ?,
-          waiting_for_lane_at = COALESCE(waiting_for_lane_at, ?),
           lane_name = ?,
           lane_claim_id = ?,
           lane_owner_id = ?,
@@ -3165,27 +3169,23 @@ def mark_dispatching_after_lane_row(
           dispatching_at = ?,
           updated_at = ?
         WHERE attempt_id = ?
-          AND status IN (?, ?)
+          AND status = ?
+          AND owner_host_instance_id = ?
+          AND waiting_for_lane_at IS NOT NULL
+          AND lane_name = ?
           AND lane_claim_id IS NULL
           AND lane_owner_id IS NULL
           AND lane_acquired_at IS NULL
           AND dispatching_at IS NULL
+          AND worker_accepted_at IS NULL
           AND worker_accept_event_id IS NULL
+          AND worker_accept_event_sequence IS NULL
           AND cancelled_event_id IS NULL
-          AND (
-            (status = ?
-              AND waiting_for_lane_at IS NULL
-              AND lane_name IS NULL)
-            OR
-            (status = ?
-              AND waiting_for_lane_at IS NOT NULL
-              AND lane_name = ?)
-          )
+          AND cancelled_event_sequence IS NULL
         """,
         (
             serialize_dispatch_record_status(DispatchRecordStatus.DISPATCHING),
             owner_host_instance_id,
-            lane_acquired_at,
             lane_name,
             lane_claim_id,
             lane_owner_id,
@@ -3193,10 +3193,8 @@ def mark_dispatching_after_lane_row(
             dispatching_at,
             dispatching_at,
             attempt_id,
-            serialize_dispatch_record_status(DispatchRecordStatus.PENDING),
             serialize_dispatch_record_status(DispatchRecordStatus.WAITING_FOR_LANE),
-            serialize_dispatch_record_status(DispatchRecordStatus.PENDING),
-            serialize_dispatch_record_status(DispatchRecordStatus.WAITING_FOR_LANE),
+            owner_host_instance_id,
             lane_name,
         ),
     )
@@ -3247,6 +3245,7 @@ def mark_dispatch_worker_accepted_row(
           AND worker_accept_event_id IS NULL
           AND worker_accept_event_sequence IS NULL
           AND cancelled_event_id IS NULL
+          AND cancelled_event_sequence IS NULL
         """,
         (
             worker_accepted_at,
@@ -3367,7 +3366,7 @@ def session_snapshot_from_rows(
 
     return SessionSnapshot(
         session_id=session.session_id,
-        status=session.status,
+        status=_public_session_status_from_durable(session.status),
         slot=_slot_ref_from_row(slot),
         active_run_id=_read_active_run_id(transaction, session.session_id),
         queued_run_ids=_read_queued_run_ids(transaction, session.session_id),
@@ -3386,22 +3385,50 @@ def run_snapshot_from_row(run: RunRow) -> RunSnapshot:
 
     :param run: durable Run row。
     :returns: 公共 Run snapshot。
+    :raises HostDurableError: Run status 不是当前公共状态 enum 时抛出。
     :raises ValueError: Run row 字段无法满足公共 snapshot 约束时抛出。
     """
 
+    status = _public_run_status_from_durable(run.status)
     return RunSnapshot(
         run_id=run.run_id,
         session_id=run.session_id,
-        status=run.status,
+        status=status,
         current_attempt_id=run.current_attempt_id,
         terminal_result_summary=_terminal_result_summary_from_status(
-            run.status
+            status
         ),
         event_cursor=HostStreamCursor(event_sequence=_run_event_cursor(run)),
         source_run_id=run.source_run_id,
         source_run_relation=run.source_run_relation,
         outbox_summary=None,
     )
+
+
+def _public_session_status_from_durable(status: SessionStatus) -> SessionStatus:
+    """把 durable Session row 状态映射为 public SessionStatus。
+
+    :param status: durable row 中的 Session 状态。
+    :returns: public SessionStatus。
+    :raises HostDurableError: 状态不是当前 public enum 成员时抛出。
+    """
+
+    if not isinstance(status, SessionStatus):
+        raise HostDurableError("Session row status is invalid")
+    return status
+
+
+def _public_run_status_from_durable(status: RunStatus) -> RunStatus:
+    """把 durable Run row 状态映射为 public RunStatus。
+
+    :param status: durable row 中的 Run 状态。
+    :returns: public RunStatus。
+    :raises HostDurableError: 状态不是当前 public enum 成员时抛出。
+    """
+
+    if not isinstance(status, RunStatus):
+        raise HostDurableError("Run row status is invalid")
+    return status
 
 
 def _terminal_result_summary_from_status(
@@ -4141,16 +4168,78 @@ def _dispatch_record_mutation_result_for_lane_dispatching(
         return DispatchRecordMutationResult(
             status=StateMutationStatus.NOT_FOUND, row=None
         )
-    if latest.status in (
-        DispatchRecordStatus.PENDING,
-        DispatchRecordStatus.WAITING_FOR_LANE,
-    ):
+    if latest.status == DispatchRecordStatus.WAITING_FOR_LANE:
         return DispatchRecordMutationResult(
             status=StateMutationStatus.CAS_LOST, row=latest
         )
     return DispatchRecordMutationResult(
         status=StateMutationStatus.INVALID_STATE, row=latest
     )
+
+
+def _invalid_dispatching_after_lane_precondition(
+    transaction: HostTransaction,
+    *,
+    attempt_id: str,
+    owner_host_instance_id: str,
+    lane_name: str,
+) -> DispatchRecordMutationResult | None:
+    """检查 lane acquired 后 dispatching mutation 的完整前置。
+
+    本函数提供结构化 ``NOT_FOUND`` / ``INVALID_STATE`` 诊断；随后
+    ``mark_dispatching_after_lane_row`` 的 SQL ``WHERE`` 仍保留最终 CAS 防线，
+    用来防止同事务后续维护或未来调用路径绕过原子条件。
+
+    :param transaction: 调用方提供的 Host transaction。
+    :param attempt_id: Attempt id。
+    :param owner_host_instance_id: scheduler owner Host instance id。
+    :param lane_name: runtime lane 名称。
+    :returns: 前置失败时返回 mutation 结果，否则返回 ``None``。
+    """
+
+    dispatch_record = read_dispatch_record_by_attempt_id(
+        transaction, attempt_id
+    )
+    if dispatch_record is None:
+        return DispatchRecordMutationResult(
+            status=StateMutationStatus.NOT_FOUND, row=None
+        )
+    attempt = read_attempt_by_id(transaction, attempt_id)
+    if attempt is None:
+        return DispatchRecordMutationResult(
+            status=StateMutationStatus.NOT_FOUND, row=dispatch_record
+        )
+    run = read_run_by_id(transaction, dispatch_record.run_id)
+    if run is None:
+        return DispatchRecordMutationResult(
+            status=StateMutationStatus.NOT_FOUND, row=dispatch_record
+        )
+    if (
+        dispatch_record.status != DispatchRecordStatus.WAITING_FOR_LANE
+        or dispatch_record.owner_host_instance_id != owner_host_instance_id
+        or dispatch_record.waiting_for_lane_at is None
+        or dispatch_record.lane_name != lane_name
+        or dispatch_record.run_id != run.run_id
+        or dispatch_record.attempt_id != attempt.attempt_id
+        or dispatch_record.execution_id != attempt.execution_id
+        or run.status != RunStatus.RUNNING
+        or run.current_attempt_id != attempt_id
+        or attempt.run_id != run.run_id
+        or attempt.status != AttemptStatus.STARTING
+        or dispatch_record.lane_claim_id is not None
+        or dispatch_record.lane_owner_id is not None
+        or dispatch_record.lane_acquired_at is not None
+        or dispatch_record.dispatching_at is not None
+        or dispatch_record.worker_accepted_at is not None
+        or dispatch_record.worker_accept_event_id is not None
+        or dispatch_record.worker_accept_event_sequence is not None
+        or dispatch_record.cancelled_event_id is not None
+        or dispatch_record.cancelled_event_sequence is not None
+    ):
+        return DispatchRecordMutationResult(
+            status=StateMutationStatus.INVALID_STATE, row=dispatch_record
+        )
+    return None
 
 
 def _optional_source_run_relation_text(

@@ -2,9 +2,11 @@
 
 from __future__ import annotations
 
+import json
 from dataclasses import dataclass
 from datetime import UTC, datetime
 from pathlib import Path
+from typing import cast
 
 import pytest
 
@@ -934,7 +936,9 @@ def test_dispatch_record_waiting_dispatching_and_worker_accept_refs(
     with open_host_durable_store(_options(tmp_path)) as store:
         seeded = _seed_running_run(store, tmp_path)
 
-        def operation(transaction: HostTransaction) -> tuple[str, str, bool]:
+        def operation(
+            transaction: HostTransaction,
+        ) -> tuple[str, str, bool, bool, bool, bool, bool]:
             """推进 dispatch record 并执行 worker accept。
 
             :param transaction: Host transaction。
@@ -972,28 +976,42 @@ def test_dispatch_record_waiting_dispatching_and_worker_accept_refs(
                     actor="analyst",
                     source="pytest",
                     worker_accept_reason="worker_accepted",
+                    local_worker_id="local-worker-1",
                 ),
             )
             assert accepted.attempt is not None
             assert accepted.dispatch_record is not None
             dispatch_record = accepted.dispatch_record
+            event_payload = _event_payload(
+                transaction,
+                event_id="event-attempt-running",
+            )
             return (
                 accepted.attempt.status.value,
                 dispatch_record.status.value,
                 dispatch_record.worker_accept_event_id is not None
                 and dispatch_record.worker_accept_event_sequence is not None
                 and dispatch_record.worker_accepted_at is not None,
+                event_payload["local_worker_id"] == "local-worker-1",
+                event_payload["worker_accepted_at"]
+                == dispatch_record.worker_accepted_at,
+                event_payload["lane_name"] == dispatch_record.lane_name,
+                event_payload["lane_claim_id"] == dispatch_record.lane_claim_id,
             )
 
         assert store.transaction_runner.run_write(operation) == (
             AttemptStatus.RUNNING.value,
             DispatchRecordStatus.DISPATCHING.value,
             True,
+            True,
+            True,
+            True,
+            True,
         )
 
 
-def test_dispatching_supports_pending_direct_lane_recheck(tmp_path: Path) -> None:
-    """pending dispatch record 可在 lane acquired recheck 后直跳 dispatching。"""
+def test_dispatching_rejects_pending_direct_lane_bypass(tmp_path: Path) -> None:
+    """pending dispatch record 不能绕过 waiting_for_lane 直跳 dispatching。"""
 
     with open_host_durable_store(_options(tmp_path)) as store:
         seeded = _seed_running_run(store, tmp_path)
@@ -1028,11 +1046,11 @@ def test_dispatching_supports_pending_direct_lane_recheck(tmp_path: Path) -> Non
             )
 
         assert store.transaction_runner.run_write(operation) == (
-            StateMutationStatus.UPDATED.value,
-            DispatchRecordStatus.DISPATCHING.value,
-            "2026-05-14T01:02:05Z",
-            "llm",
-            "host-instance-1",
+            StateMutationStatus.INVALID_STATE.value,
+            DispatchRecordStatus.PENDING.value,
+            None,
+            None,
+            None,
         )
 
 
@@ -1371,6 +1389,7 @@ def test_active_cancel_appends_run_cancelling_once(tmp_path: Path) -> None:
                     actor="analyst",
                     source="pytest",
                     worker_accept_reason="worker_accepted",
+                    local_worker_id="local-worker-active",
                 ),
             )
             assert accepted.status == StateMutationStatus.UPDATED
@@ -1884,6 +1903,27 @@ def _count_events(transaction: HostTransaction, event_type: str) -> int:
     )
     assert row is not None
     return _required_int(row, "total")
+
+
+def _event_payload(
+    transaction: HostTransaction, *, event_id: str
+) -> dict[str, JsonValue]:
+    """读取指定 EventLog row 的 payload JSON。
+
+    :param transaction: Host transaction。
+    :param event_id: EventLog id。
+    :returns: payload JSON object。
+    :raises AssertionError: 事件缺失或 payload 不是 JSON object 时抛出。
+    """
+
+    row = transaction.fetchone(
+        "SELECT payload_json FROM event_log WHERE event_id = ?",
+        (event_id,),
+    )
+    assert row is not None
+    payload = json.loads(_required_text(row, "payload_json"))
+    assert isinstance(payload, dict)
+    return cast(dict[str, JsonValue], payload)
 
 
 def _count_run_events(

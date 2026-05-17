@@ -2,9 +2,10 @@
 
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from datetime import UTC, datetime
 from pathlib import Path
+from typing import Literal
 
 import pytest
 
@@ -74,6 +75,7 @@ from dayu.host.durable.state import (
     DispatchRecordStatus,
     RunStartReason,
     WorkerKind,
+    mark_dispatch_waiting_for_lane_row,
     mark_dispatching_after_lane_row,
 )
 from dayu.host.durable.errors import HostDurableError
@@ -934,6 +936,71 @@ def test_current_facts_reject_non_dispatchable_snapshot_state(
             _build_request(store, seeded)
 
 
+@pytest.mark.parametrize(
+    ("snapshot_field", "snapshot_value", "message"),
+    (
+        (
+            "execution_id",
+            "execution-stale",
+            "attempt identity mismatch",
+        ),
+        (
+            "dispatch_record_id",
+            "dispatch-stale",
+            "dispatch identity mismatch",
+        ),
+        (
+            "execution_target",
+            "target-stale",
+            "execution_target mismatch",
+        ),
+    ),
+)
+def test_current_facts_reject_stale_snapshot_identity(
+    tmp_path: Path,
+    snapshot_field: Literal[
+        "execution_id", "dispatch_record_id", "execution_target"
+    ],
+    snapshot_value: str,
+    message: str,
+) -> None:
+    """RunInputBuilder 对 stale dispatch snapshot 按既有错误语义 fail closed。
+
+    :param tmp_path: pytest 临时目录。
+    :param snapshot_field: 需要覆盖的 snapshot 字段名。
+    :param snapshot_value: 需要覆盖的 snapshot 字段值。
+    :param message: 期望错误消息片段。
+    :returns: ``None``。
+    """
+
+    with open_host_durable_store(_options(tmp_path)) as store:
+        session_id = _ensure_session_id(store.transaction_runner)
+        seeded = _seed_current_run(
+            store,
+            session_id=session_id,
+            payload=_user_input_payload("current question"),
+        )
+        if snapshot_field == "execution_id":
+            stale_snapshot = replace(
+                _attempt_snapshot(seeded), execution_id=snapshot_value
+            )
+        elif snapshot_field == "dispatch_record_id":
+            stale_snapshot = replace(
+                _attempt_snapshot(seeded), dispatch_record_id=snapshot_value
+            )
+        else:
+            stale_snapshot = replace(
+                _attempt_snapshot(seeded), execution_target=snapshot_value
+            )
+        builder = create_no_tool_run_input_builder(
+            transaction_runner=store.transaction_runner,
+            policy_snapshot=_policy_snapshot(),
+        )
+
+        with pytest.raises(HostDurableError, match=message):
+            builder.build(stale_snapshot)
+
+
 def _memory_policy(
     *,
     max_lag_events_for_inline_delta: int = 4,
@@ -1660,6 +1727,13 @@ def _seed_current_run(
                 boot_id=None,
             ),
         )
+        mark_dispatch_waiting_for_lane_row(
+            transaction,
+            attempt_id="attempt-current",
+            owner_host_instance_id="host-run-input",
+            lane_name="llm",
+            waiting_for_lane_at="2026-05-15T01:02:03.000000Z",
+        )
         mark_dispatching_after_lane_row(
             transaction,
             attempt_id="attempt-current",
@@ -1782,15 +1856,54 @@ def _force_dispatch_snapshot_state(
                 "SET status = ?, owner_host_instance_id = NULL, "
                 "waiting_for_lane_at = NULL, lane_name = NULL, "
                 "lane_claim_id = NULL, lane_owner_id = NULL, "
-                "lane_acquired_at = NULL, dispatching_at = NULL "
+                "lane_acquired_at = NULL, dispatching_at = NULL, "
+                "worker_accepted_at = NULL, worker_accept_event_id = NULL, "
+                "worker_accept_event_sequence = NULL, cancelled_event_id = NULL, "
+                "cancelled_event_sequence = NULL, cancelled_at = NULL "
                 "WHERE dispatch_record_id = ?",
                 (dispatch_status.value, seeded.dispatch_record_id),
+            )
+        elif dispatch_status == DispatchRecordStatus.WAITING_FOR_LANE:
+            transaction.execute(
+                "UPDATE host_attempt_dispatch_records "
+                "SET status = ?, owner_host_instance_id = ?, "
+                "waiting_for_lane_at = ?, lane_name = ?, "
+                "lane_claim_id = NULL, lane_owner_id = NULL, "
+                "lane_acquired_at = NULL, dispatching_at = NULL, "
+                "worker_accepted_at = NULL, worker_accept_event_id = NULL, "
+                "worker_accept_event_sequence = NULL, cancelled_event_id = NULL, "
+                "cancelled_event_sequence = NULL, cancelled_at = NULL "
+                "WHERE dispatch_record_id = ?",
+                (
+                    dispatch_status.value,
+                    "host-run-input",
+                    "2026-05-15T01:02:03.000000Z",
+                    "llm",
+                    seeded.dispatch_record_id,
+                ),
             )
         else:
             transaction.execute(
                 "UPDATE host_attempt_dispatch_records "
-                "SET status = ? WHERE dispatch_record_id = ?",
-                (dispatch_status.value, seeded.dispatch_record_id),
+                "SET status = ?, owner_host_instance_id = ?, "
+                "waiting_for_lane_at = ?, lane_name = ?, "
+                "lane_claim_id = ?, lane_owner_id = ?, "
+                "lane_acquired_at = ?, dispatching_at = ?, "
+                "worker_accepted_at = NULL, worker_accept_event_id = NULL, "
+                "worker_accept_event_sequence = NULL, cancelled_event_id = NULL, "
+                "cancelled_event_sequence = NULL, cancelled_at = NULL "
+                "WHERE dispatch_record_id = ?",
+                (
+                    dispatch_status.value,
+                    "host-run-input",
+                    "2026-05-15T01:02:03.000000Z",
+                    "llm",
+                    "claim-run-input",
+                    "owner-run-input",
+                    "2026-05-15T01:02:03.000000Z",
+                    "2026-05-15T01:02:03.000000Z",
+                    seeded.dispatch_record_id,
+                ),
             )
 
     transaction_runner.run_write(operation)

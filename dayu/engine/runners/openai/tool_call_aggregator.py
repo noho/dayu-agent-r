@@ -20,6 +20,7 @@ import hashlib
 import json
 from collections.abc import Mapping
 from dataclasses import dataclass, field
+from typing import TypeGuard
 
 from dayu.contracts.json_value import JsonValue
 from dayu.contracts.tool_call import (
@@ -42,6 +43,17 @@ _KNOWN_GEMINI_KEYS: frozenset[str] = frozenset(
 )
 PARTIAL_TOOL_CALL_SUMMARY_MAX_ITEMS: int = 16
 PARTIAL_TOOL_CALL_NAME_FRAGMENT_MAX_CHARS: int = 128
+
+
+def _is_tool_call_index(value: JsonValue | None) -> TypeGuard[int]:
+    """判断值是否为合法 tool call index。
+
+    :param value: provider 返回或内部 delta 携带的 index 值。
+    :returns: 非 ``bool`` 的 ``int`` 返回 ``True``；其它返回 ``False``。
+    :raises Exception: 不主动抛出异常。
+    """
+
+    return isinstance(value, int) and not isinstance(value, bool)
 
 
 def _bounded_name_fragment(name: str) -> str | None:
@@ -155,7 +167,7 @@ class ToolCallAggregator:
         """
 
         delta_index = delta.get("index")
-        if isinstance(delta_index, int):
+        if _is_tool_call_index(delta_index):
             return delta_index
         delta_id = delta.get("id")
         if isinstance(delta_id, str) and delta_id:

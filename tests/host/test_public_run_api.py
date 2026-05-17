@@ -6,11 +6,13 @@ import sqlite3
 from concurrent.futures import ThreadPoolExecutor
 from datetime import UTC, datetime
 from pathlib import Path
+from typing import cast
 
 import pytest
 
 from dayu.host import (
     AuthorizationClaim,
+    AttemptStatus,
     CancelMode,
     CancelRunRequest,
     FollowupBehavior,
@@ -38,6 +40,17 @@ from dayu.host import (
     submit_followup,
 )
 from dayu.host.api import EnsureSessionRequest
+from dayu.host.durable.errors import HostDurableError
+from dayu.host.durable.state import (
+    RunRow,
+    deserialize_attempt_status,
+    run_snapshot_from_row,
+)
+from dayu.host.durable.transaction import HostTransaction
+
+_TERMINAL_RUN_STATUSES = frozenset(
+    (RunStatus.SUCCEEDED, RunStatus.FAILED, RunStatus.CANCELLED, RunStatus.LOST)
+)
 
 
 def _options(tmp_path: Path) -> HostCommandHandleOptions:
@@ -69,6 +82,111 @@ def _open_handle(tmp_path: Path) -> HostCommandHandle:
     """
 
     return create_host_command_handle(_options(tmp_path))
+
+
+def _durable_run_row(status: RunStatus) -> RunRow:
+    """构造 RunSnapshot mapping 测试用 durable Run row。
+
+    :param status: durable Run status。
+    :returns: Run row。
+    """
+
+    return RunRow(
+        run_id="run-mapping",
+        session_id="session-mapping",
+        status=status,
+        client_request_id="request-mapping",
+        input_event_id="event-input",
+        input_event_sequence=1,
+        accepted_event_id="event-accepted",
+        accepted_event_sequence=2,
+        queued_event_id=None,
+        queued_event_sequence=None,
+        started_event_id=None,
+        started_event_sequence=None,
+        terminal_event_id=None,
+        terminal_event_sequence=None,
+        current_attempt_id=None,
+        source_run_id=None,
+        source_run_relation=None,
+        execution_target="local",
+        queue_policy="queue",
+        created_at="2026-05-16T00:00:00.000000Z",
+        updated_at="2026-05-16T00:00:00.000000Z",
+        terminal_at=None,
+    )
+
+
+class _UnknownRunStatusReader:
+    """get_run monkeypatch 用 Run reader。"""
+
+    def __call__(
+        self, transaction: HostTransaction, run_id: str
+    ) -> RunRow | None:
+        """返回带未知 status 的 durable Run row。
+
+        :param transaction: Host transaction。
+        :param run_id: Run id。
+        :returns: Run row。
+        """
+
+        return _durable_run_row(cast(RunStatus, "future_run_status"))
+
+
+def test_run_snapshot_mapping_covers_current_run_statuses() -> None:
+    """durable Run status 到 public RunSnapshot status 的映射覆盖当前枚举。"""
+
+    for status in RunStatus:
+        snapshot = run_snapshot_from_row(_durable_run_row(status))
+        assert snapshot.status is status
+        if status in _TERMINAL_RUN_STATUSES:
+            assert snapshot.terminal_result_summary is not None
+            assert snapshot.terminal_result_summary.status is status
+        else:
+            assert snapshot.terminal_result_summary is None
+
+
+def test_run_snapshot_mapping_rejects_unknown_run_status() -> None:
+    """RunSnapshot mapping 对未知 durable Run status fail closed。"""
+
+    with pytest.raises(HostDurableError):
+        run_snapshot_from_row(
+            _durable_run_row(cast(RunStatus, "future_run_status"))
+        )
+
+
+def test_attempt_status_mapping_covers_current_attempt_statuses() -> None:
+    """durable Attempt status 文本映射覆盖当前 AttemptStatus 枚举。"""
+
+    for status in AttemptStatus:
+        assert deserialize_attempt_status(status.value) is status
+
+
+def test_attempt_status_mapping_rejects_unknown_attempt_status() -> None:
+    """Attempt status mapping 对未知 durable status fail closed。"""
+
+    with pytest.raises(HostDurableError):
+        deserialize_attempt_status("future_attempt_status")
+
+
+def test_get_run_unknown_durable_status_returns_internal_error(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """public get_run 把 durable status mapping 失败转为 HostApiError。"""
+
+    host = _open_handle(tmp_path)
+    try:
+        monkeypatch.setattr(
+            "dayu.host.read_api.read_run_by_id", _UnknownRunStatusReader()
+        )
+
+        with pytest.raises(HostApiError) as exc_info:
+            get_run(host, "run-mapping")
+
+        assert exc_info.value.code == HostApiErrorCode.INTERNAL_ERROR
+        assert exc_info.value.retryable is False
+    finally:
+        host.close()
 
 
 def _context(

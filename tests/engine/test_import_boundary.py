@@ -31,6 +31,17 @@ ENGINE_CORE_FORBIDDEN_PREFIXES: tuple[str, ...] = (
 )
 
 ENGINE_CORE_FORBIDDEN_SUBSTRINGS: tuple[str, ...] = ("tool_trace",)
+ENGINE_TOOL_DECLARATION_MODULE: str = "dayu.contracts.tool_declaration"
+ENGINE_TOOL_DECLARATION_FORBIDDEN_MODULES: tuple[str, ...] = (
+    ENGINE_TOOL_DECLARATION_MODULE,
+)
+ENGINE_TOOL_OWNERSHIP_FORBIDDEN_SYMBOLS: frozenset[str] = frozenset(
+    {"ToolRuntime", "ToolBundle", "ToolCallable", "ToolDefinition"}
+)
+ENGINE_TOOL_DECLARATION_STAR_IMPORT_FORBIDDEN_SYMBOLS: frozenset[str] = frozenset(
+    {"ToolBundle", "ToolCallable", "ToolDefinition"}
+)
+STAR_IMPORT_SYMBOL: str = "*"
 
 
 def _engine_root() -> Path:
@@ -61,6 +72,50 @@ def _imported_module_names(source: str) -> list[str]:
             if node.module is not None and node.level == 0:
                 names.append(node.module)
     return names
+
+
+def _imported_symbol_refs(source: str) -> list[tuple[str, str]]:
+    """从源码 AST 中提取 ``from ... import ...`` 的模块与符号名。
+
+    :param source: Python 源码。
+    :returns: ``(module, symbol)`` 列表。
+    """
+
+    tree = ast.parse(source)
+    refs: list[tuple[str, str]] = []
+    for node in ast.walk(tree):
+        if isinstance(node, ast.ImportFrom):
+            if node.module is not None and node.level == 0:
+                for alias in node.names:
+                    refs.append((node.module, alias.name))
+    return refs
+
+
+def _engine_tool_ownership_import_violations(
+    file_path: Path, source: str
+) -> list[tuple[str, str, str]]:
+    """提取 Engine 工具 owner 导入违规。
+
+    :param file_path: 被扫描的源码文件路径。
+    :param source: Python 源码。
+    :returns: ``(file_path, module, symbol)`` 违规列表。
+    :raises SyntaxError: 源码无法解析时由 :func:`ast.parse` 抛出。
+    """
+
+    violations: list[tuple[str, str, str]] = []
+    for module in _imported_module_names(source):
+        if _matches_prefix(module, ENGINE_TOOL_DECLARATION_FORBIDDEN_MODULES):
+            violations.append((str(file_path), module, "module"))
+    for module, symbol in _imported_symbol_refs(source):
+        if symbol in ENGINE_TOOL_OWNERSHIP_FORBIDDEN_SYMBOLS:
+            violations.append((str(file_path), module, symbol))
+            continue
+        if module == ENGINE_TOOL_DECLARATION_MODULE and symbol == STAR_IMPORT_SYMBOL:
+            for forbidden_symbol in sorted(
+                ENGINE_TOOL_DECLARATION_STAR_IMPORT_FORBIDDEN_SYMBOLS
+            ):
+                violations.append((str(file_path), module, forbidden_symbol))
+    return violations
 
 
 def _matches_prefix(module: str, prefixes: tuple[str, ...]) -> bool:
@@ -115,3 +170,34 @@ def test_engine_does_not_import_engine_core_forbidden_modules() -> None:
             elif _matches_substring(module, ENGINE_CORE_FORBIDDEN_SUBSTRINGS):
                 violations.append((str(file_path), module))
     assert not violations, f"Engine core forbidden imports: {violations}"
+
+
+def test_engine_does_not_import_toolruntime_or_tool_declaration_owners() -> None:
+    """Engine 不得导入 Host / ToolRuntime 拥有的工具声明对象。"""
+
+    violations: list[tuple[str, str, str]] = []
+    for file_path in _iter_engine_python_files():
+        violations.extend(
+            _engine_tool_ownership_import_violations(
+                file_path, file_path.read_text(encoding="utf-8")
+            )
+        )
+    assert not violations, f"Engine forbidden tool owner imports: {violations}"
+
+
+def test_engine_tool_ownership_boundary_detects_tool_declaration_star_import() -> None:
+    """Engine ownership 边界测试必须覆盖工具声明模块的 star import。
+
+    :returns: 无返回值。
+    :raises AssertionError: star import 未被识别为工具 owner 导入违规时抛出。
+    """
+
+    file_path = _engine_root() / "synthetic_star_import.py"
+    source = "from dayu.contracts.tool_declaration import *\n"
+
+    assert _engine_tool_ownership_import_violations(file_path, source) == [
+        (str(file_path), ENGINE_TOOL_DECLARATION_MODULE, "module"),
+        (str(file_path), ENGINE_TOOL_DECLARATION_MODULE, "ToolBundle"),
+        (str(file_path), ENGINE_TOOL_DECLARATION_MODULE, "ToolCallable"),
+        (str(file_path), ENGINE_TOOL_DECLARATION_MODULE, "ToolDefinition"),
+    ]

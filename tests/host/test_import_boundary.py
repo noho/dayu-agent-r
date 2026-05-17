@@ -34,6 +34,14 @@ RUNTIME_FORBIDDEN_PREFIXES: tuple[str, ...] = (
     "dayu.ui",
     "dayu.fins",
 )
+HOST_BUSINESS_TOOL_SCAN_FORBIDDEN_PREFIXES: tuple[str, ...] = (
+    "importlib",
+    "pkgutil",
+)
+FETCH_MORE_ALLOWED_RELATIVE_FILES: frozenset[str] = frozenset(
+    {"host/tool_runtime.py", "host/tooling.py"}
+)
+FETCH_MORE_OWNERSHIP_TOKEN: str = "fetch_more"
 ENGINE_FORBIDDEN_PREFIXES: tuple[str, ...] = ("dayu.host",)
 HOST_ENGINE_CONTRACT_ALLOWED_MODULES: tuple[str, ...] = (
     "api.py",
@@ -75,6 +83,30 @@ READ_API_EVENT_STREAM_FORBIDDEN_TOKENS: tuple[str, ...] = (
     "repair_minimal_read_models",
     "fanout",
     "wakeup",
+)
+HOST_ROOT_FORBIDDEN_TOOL_EXPORTS: frozenset[str] = frozenset(
+    {"ToolRuntime", "ToolRuntimeHandle", "ToolBundle", "ToolDefinition"}
+)
+TOOL_RUNTIME_SCHEMA_PROJECTION_FORBIDDEN_PREFIXES: tuple[str, ...] = (
+    "dayu.engine",
+    "dayu.service",
+    "dayu.ui",
+    "dayu.fins",
+    "dayu.host.dispatch",
+    "dayu.host.engine_ingest",
+    "dayu.host.projection",
+    "dayu.host.waiting",
+)
+MEMORY_MODULES: tuple[str, ...] = (
+    "memory.py",
+    "memory_repair.py",
+    "durable/memory.py",
+)
+MEMORY_FORBIDDEN_PREFIXES: tuple[str, ...] = (
+    "dayu.engine",
+    "dayu.service",
+    "dayu.ui",
+    "dayu.fins",
 )
 
 
@@ -156,6 +188,40 @@ def test_host_does_not_import_upper_or_business_layers() -> None:
     assert not violations, f"host forbidden imports: {violations}"
 
 
+def test_host_does_not_import_business_tool_scanners() -> None:
+    """Host 不得通过 importlib / pkgutil 扫描业务工具模块。
+
+    :returns: ``None``。
+    :raises AssertionError: Host 模块导入动态模块扫描能力时抛出。
+    """
+
+    violations: list[tuple[str, str]] = []
+    for file_path in _iter_python_files(_host_root()):
+        for module in _imported_module_names(file_path.read_text(encoding="utf-8")):
+            if _matches_prefix(module, HOST_BUSINESS_TOOL_SCAN_FORBIDDEN_PREFIXES):
+                violations.append((str(file_path), module))
+    assert not violations, f"host business tool scanner imports: {violations}"
+
+
+def test_fetch_more_token_stays_inside_toolruntime_owner_modules() -> None:
+    """``fetch_more`` 只能出现在 ToolRuntime factory / tooling policy owner。
+
+    :returns: ``None``。
+    :raises AssertionError: Host 其它模块或 Engine / contracts / runtime 引用
+        ``fetch_more`` 时抛出。
+    """
+
+    dayu_root = _host_root().parent
+    violations: list[str] = []
+    for file_path in _iter_python_files(dayu_root):
+        relative_path = file_path.relative_to(dayu_root).as_posix()
+        if relative_path in FETCH_MORE_ALLOWED_RELATIVE_FILES:
+            continue
+        if FETCH_MORE_OWNERSHIP_TOKEN in file_path.read_text(encoding="utf-8"):
+            violations.append(str(file_path))
+    assert not violations, f"fetch_more references outside ToolRuntime owner: {violations}"
+
+
 def test_host_engine_imports_stay_on_allowed_boundary_modules() -> None:
     """Host 只有本地执行边界模块可依赖 Engine contracts / entry。"""
 
@@ -221,6 +287,50 @@ def test_read_api_stream_does_not_reference_projection_or_fanout_truth() -> None
     assert not token_violations, (
         f"read_api forbidden stream truth tokens: {token_violations}"
     )
+
+
+def test_host_root_does_not_export_toolruntime_or_tool_declaration_owners() -> None:
+    """``dayu.host`` 包根不得导出 ToolRuntime 或工具声明 owner。"""
+
+    root_exports = frozenset(host.__all__)
+    root_namespace = vars(host)
+    assert HOST_ROOT_FORBIDDEN_TOOL_EXPORTS.isdisjoint(root_exports)
+    for symbol in HOST_ROOT_FORBIDDEN_TOOL_EXPORTS:
+        assert symbol not in root_namespace
+
+
+def test_toolruntime_schema_projection_stays_private_host_owner() -> None:
+    """ToolRuntime schema 投影 helper 不得依赖 Engine 或 Host mutator owner。"""
+
+    file_path = _host_root() / "tool_runtime_schema_projection.py"
+    violations: list[str] = []
+    for module in _imported_module_names(file_path.read_text(encoding="utf-8")):
+        if _matches_prefix(
+            module, TOOL_RUNTIME_SCHEMA_PROJECTION_FORBIDDEN_PREFIXES
+        ):
+            violations.append(module)
+    assert not violations, (
+        f"tool runtime schema projection forbidden imports: {violations}"
+    )
+
+
+def test_memory_modules_do_not_import_upper_business_or_engine_layers() -> None:
+    """memory 模块不得依赖 Engine、Service、UI 或 Fins 实现层。
+
+    :returns: ``None``。
+    :raises AssertionError: memory 模块出现禁止 import 时抛出。
+    """
+
+    host_root = _host_root()
+    violations: list[tuple[str, str]] = []
+    for relative_path in MEMORY_MODULES:
+        file_path = host_root / relative_path
+        for module in _imported_module_names(
+            file_path.read_text(encoding="utf-8")
+        ):
+            if _matches_prefix(module, MEMORY_FORBIDDEN_PREFIXES):
+                violations.append((str(file_path), module))
+    assert not violations, f"memory forbidden imports: {violations}"
 
 
 def test_engine_does_not_import_host_layer() -> None:

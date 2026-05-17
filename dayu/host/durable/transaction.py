@@ -126,17 +126,34 @@ class HostExecuteResult:
 class HostTransaction:
     """Host durable 内部 SQLite transaction wrapper。
 
-    :param connection: 已进入 write transaction 的 SQLite connection。
+    :param connection: 已进入 transaction 的 SQLite connection。
+    :param payload_inline_threshold_bytes: 当前 durable store 的 payload inline 阈值。
     """
 
-    def __init__(self, connection: sqlite3.Connection) -> None:
+    def __init__(
+        self,
+        connection: sqlite3.Connection,
+        *,
+        payload_inline_threshold_bytes: int,
+    ) -> None:
         """初始化 transaction wrapper。
 
-        :param connection: 已进入 write transaction 的 SQLite connection。
+        :param connection: 已进入 transaction 的 SQLite connection。
+        :param payload_inline_threshold_bytes: 当前 durable store 的 payload inline 阈值。
         :returns: ``None``。
         """
 
         self._connection = connection
+        self._payload_inline_threshold_bytes = payload_inline_threshold_bytes
+
+    @property
+    def payload_inline_threshold_bytes(self) -> int:
+        """返回当前 durable store 的 payload inline 阈值。
+
+        :returns: payload inline 阈值字节数。
+        """
+
+        return self._payload_inline_threshold_bytes
 
     def execute(
         self, sql: str, parameters: SQLParameters = ()
@@ -193,22 +210,27 @@ class HostTransactionRunner:
 
     :param connection: runner 持有的 SQLite connection。
     :param sqlite_policy: busy timeout 与 write retry 策略。
+    :param payload_inline_threshold_bytes: 当前 durable store 的 payload inline 阈值。
     """
 
     def __init__(
         self,
         connection: sqlite3.Connection,
         sqlite_policy: HostSQLiteStoragePolicy,
+        *,
+        payload_inline_threshold_bytes: int,
     ) -> None:
         """初始化 transaction runner。
 
         :param connection: runner 持有的 SQLite connection。
         :param sqlite_policy: busy timeout 与 write retry 策略。
+        :param payload_inline_threshold_bytes: 当前 durable store 的 payload inline 阈值。
         :returns: ``None``。
         """
 
         self._connection = connection
         self._sqlite_policy = sqlite_policy
+        self._payload_inline_threshold_bytes = payload_inline_threshold_bytes
 
     def run_write(
         self,
@@ -236,7 +258,14 @@ class HostTransactionRunner:
             attempt += 1
             try:
                 self._connection.execute("BEGIN IMMEDIATE")
-                result = operation(HostTransaction(self._connection))
+                result = operation(
+                    HostTransaction(
+                        self._connection,
+                        payload_inline_threshold_bytes=(
+                            self._payload_inline_threshold_bytes
+                        ),
+                    )
+                )
                 self._connection.execute("COMMIT")
             except sqlite3.Error as exc:
                 _rollback(self._connection)
@@ -275,7 +304,14 @@ class HostTransactionRunner:
 
         try:
             self._connection.execute("BEGIN")
-            result = operation(HostTransaction(self._connection))
+            result = operation(
+                HostTransaction(
+                    self._connection,
+                    payload_inline_threshold_bytes=(
+                        self._payload_inline_threshold_bytes
+                    ),
+                )
+            )
             self._connection.execute("COMMIT")
         except sqlite3.Error as exc:
             _rollback(self._connection)

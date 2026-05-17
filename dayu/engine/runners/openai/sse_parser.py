@@ -48,10 +48,13 @@ from dayu.engine.contracts.runner_events import (
 from dayu.engine.runners.openai._types import (
     _OpenAIToolCallDelta,
     _OpenAIToolCallFunction,
-    _OpenAIUsage,
     _ReasoningProtocolHook,
 )
-from dayu.engine.runners.openai.tool_call_aggregator import ToolCallAggregator
+from dayu.engine.runners.openai.tool_call_aggregator import (
+    ToolCallAggregator,
+    _is_tool_call_index,
+)
+from dayu.engine.runners.openai.usage import coerce_usage
 from dayu.engine.runners.openai.xml_tag_extractor import (
     StreamingXMLTagExtractor,
 )
@@ -463,7 +466,7 @@ class SSEParser:
 
         delta: _OpenAIToolCallDelta = {}
         index = raw.get("index")
-        if isinstance(index, int):
+        if _is_tool_call_index(index):
             delta["index"] = index
         delta_id = raw.get("id")
         if isinstance(delta_id, str):
@@ -542,14 +545,11 @@ class SSEParser:
         :raises Exception: 不主动抛出异常。
         """
 
-        prompt_tokens = usage.get("prompt_tokens")
-        completion_tokens = usage.get("completion_tokens")
-        total_tokens = usage.get("total_tokens")
-        if (
-            not isinstance(prompt_tokens, int)
-            or not isinstance(completion_tokens, int)
-            or not isinstance(total_tokens, int)
-        ):
+        normalized = coerce_usage(usage)
+        if normalized is None:
+            prompt_tokens = usage.get("prompt_tokens")
+            completion_tokens = usage.get("completion_tokens")
+            total_tokens = usage.get("total_tokens")
             _LOGGER.warning(
                 "sse.protocol_diagnostic code=usage_field_malformed "
                 "prompt_tokens_type=%s completion_tokens_type=%s "
@@ -559,16 +559,11 @@ class SSEParser:
                 type(total_tokens).__name__,
             )
             return
-        normalized: _OpenAIUsage = {
-            "prompt_tokens": prompt_tokens,
-            "completion_tokens": completion_tokens,
-            "total_tokens": total_tokens,
-        }
         yield _make_event(
             RunnerUsageRecordedData(
-                prompt_tokens=normalized["prompt_tokens"],
-                completion_tokens=normalized["completion_tokens"],
-                total_tokens=normalized["total_tokens"],
+                prompt_tokens=normalized.prompt_tokens,
+                completion_tokens=normalized.completion_tokens,
+                total_tokens=normalized.total_tokens,
             )
         )
 

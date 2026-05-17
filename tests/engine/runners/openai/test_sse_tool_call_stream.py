@@ -11,6 +11,8 @@ from dayu.engine.contracts.runner_events import (
     RunnerToolCallDeltaData,
     RunnerToolCallsCompletedData,
 )
+from dayu.engine.runners.openai._types import _OpenAIToolCallDelta
+from dayu.engine.runners.openai.tool_call_aggregator import ToolCallAggregator
 
 from tests.engine.runners.openai._sse_helpers import parse_sse
 
@@ -122,3 +124,83 @@ async def test_tool_call_done_finish_reason_prefers_tool_calls_over_stop() -> No
     assert len(done) == 1
     assert isinstance(done[0].data, RunnerDoneData)
     assert done[0].data.finish_reason is FinishReason.TOOL_CALLS
+
+
+@pytest.mark.asyncio
+async def test_bool_index_tool_calls_stay_separate_by_id() -> None:
+    """bool index 必须被 parser 拒绝，并按 id fallback 稳定聚合。
+
+    :returns: 无返回值。
+    :raises AssertionError: 聚合顺序或参数归属错误时由 pytest 抛出。
+    """
+
+    chunks = [
+        (
+            b'data: {"choices":[{"delta":{"tool_calls":'
+            b'[{"index":true,"id":"call-a","type":"function",'
+            b'"function":{"name":"lookup","arguments":"{\\"ticker\\":"}},'
+            b'{"index":false,"id":"call-b","type":"function",'
+            b'"function":{"name":"price","arguments":"{\\"symbol\\":"}}'
+            b']}}]}\n\n'
+        ),
+        (
+            b'data: {"choices":[{"delta":{"tool_calls":'
+            b'[{"index":true,"id":"call-a",'
+            b'"function":{"arguments":"\\"AAPL\\"}"}},'
+            b'{"index":false,"id":"call-b",'
+            b'"function":{"arguments":"\\"MSFT\\"}"}}'
+            b']}}]}\n\n'
+        ),
+        b'data: {"choices":[{"finish_reason":"tool_calls","delta":{}}]}\n\n',
+        b"data: [DONE]\n\n",
+    ]
+
+    events = await parse_sse(chunks)
+
+    deltas: list[RunnerToolCallDeltaData] = []
+    for event in events:
+        if event.type is RunnerEventType.RUNNER_TOOL_CALL_DELTA:
+            assert isinstance(event.data, RunnerToolCallDeltaData)
+            deltas.append(event.data)
+    assert len(deltas) == 4
+    assert [delta.tool_call_index for delta in deltas] == [0, 1, 0, 1]
+
+    completed_events = [
+        event for event in events
+        if event.type is RunnerEventType.RUNNER_TOOL_CALLS_COMPLETED
+    ]
+    assert len(completed_events) == 1
+    completed = completed_events[0].data
+    assert isinstance(completed, RunnerToolCallsCompletedData)
+    assert [
+        (call.tool_call_id, call.name, call.arguments)
+        for call in completed.tool_calls
+    ] == [
+        ("call-a", "lookup", {"ticker": "AAPL"}),
+        ("call-b", "price", {"symbol": "MSFT"}),
+    ]
+
+
+def test_aggregator_rejects_bool_index_and_falls_back_to_id() -> None:
+    """aggregator 直接收到 bool index 时也必须按非法 index 处理。
+
+    :returns: 无返回值。
+    :raises AssertionError: bool index 被误当作 int 路由时由 pytest 抛出。
+    """
+
+    aggregator = ToolCallAggregator(provider_request_id=None)
+    delta: _OpenAIToolCallDelta = {
+        "index": True,
+        "id": "call-bool",
+        "function": {"name": "lookup", "arguments": "{}"},
+    }
+
+    resolved_index = aggregator.feed(delta)
+
+    assert resolved_index == 0
+    assert resolved_index is not True
+    result = aggregator.finalize()
+    assert result.fatal_errors == ()
+    assert len(result.tool_calls) == 1
+    assert result.tool_calls[0].tool_call_id == "call-bool"
+    assert result.tool_calls[0].index_in_iteration == 0

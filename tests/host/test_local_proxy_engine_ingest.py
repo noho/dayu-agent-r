@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import asyncio
 from collections.abc import AsyncIterator
 from datetime import UTC, datetime
 from pathlib import Path
@@ -184,6 +185,97 @@ async def test_default_local_worker_close_is_idempotent_and_events_fail_after_cl
 
     with pytest.raises(RuntimeError, match="closed"):
         handle.events()
+
+
+@pytest.mark.asyncio
+async def test_default_local_worker_events_can_only_be_opened_once(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """默认 LocalProxy handle 不允许为同一 handle 重复打开事件流。"""
+
+    async def _empty_run_agent_messages(
+        incoming: AgentRunRequest,
+    ) -> AsyncIterator[EngineEvent]:
+        """替换为空 Engine stream。
+
+        :param incoming: Engine request。
+        :returns: 空 EngineEvent stream。
+        """
+
+        del incoming
+        if False:
+            yield _engine_event()
+
+    monkeypatch.setattr(
+        "dayu.host.local_proxy.run_agent_messages",
+        _empty_run_agent_messages,
+    )
+
+    worker = DefaultLocalEngineWorkerFactory().create_worker(_snapshot())
+    handle = await worker.accept(_snapshot(), _request())
+    first_events = handle.events()
+
+    with pytest.raises(RuntimeError, match="already been opened"):
+        handle.events()
+
+    assert [event async for event in first_events] == []
+    await handle.close()
+
+
+@pytest.mark.asyncio
+async def test_default_local_worker_close_cancels_active_event_stream(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """close 与活跃事件消费并发时会关闭底层 Engine generator。"""
+
+    stream_started = asyncio.Event()
+    stream_finalized = asyncio.Event()
+    release_stream = asyncio.Event()
+
+    async def _blocked_run_agent_messages(
+        incoming: AgentRunRequest,
+    ) -> AsyncIterator[EngineEvent]:
+        """替换为受控阻塞 Engine stream。
+
+        :param incoming: Engine request。
+        :returns: 受控 EngineEvent stream。
+        """
+
+        del incoming
+        stream_started.set()
+        try:
+            await release_stream.wait()
+            yield _engine_event()
+        finally:
+            stream_finalized.set()
+
+    monkeypatch.setattr(
+        "dayu.host.local_proxy.run_agent_messages",
+        _blocked_run_agent_messages,
+    )
+
+    worker = DefaultLocalEngineWorkerFactory().create_worker(_snapshot())
+    handle = await worker.accept(_snapshot(), _request())
+    event_stream = handle.events()
+    pending_read = asyncio.create_task(_read_one_event(event_stream))
+    await stream_started.wait()
+
+    await handle.close()
+
+    assert stream_finalized.is_set()
+    assert pending_read.cancelled()
+    with pytest.raises(RuntimeError, match="closed"):
+        handle.events()
+
+
+async def _read_one_event(event_stream: AsyncIterator[EngineEvent]) -> EngineEvent:
+    """读取单个 EngineEvent。
+
+    :param event_stream: Engine event stream。
+    :returns: 下一条 EngineEvent。
+    """
+
+    return await anext(event_stream)
 
 
 def _snapshot() -> AttemptDispatchSnapshot:

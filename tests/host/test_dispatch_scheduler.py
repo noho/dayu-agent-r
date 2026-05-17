@@ -5,7 +5,7 @@ from __future__ import annotations
 import asyncio
 import json
 import logging
-from collections.abc import AsyncIterator
+from collections.abc import AsyncIterator, Callable
 from dataclasses import dataclass
 from datetime import UTC, datetime
 from pathlib import Path
@@ -14,7 +14,13 @@ import pytest
 
 from dayu.engine.contracts.agent_policy import AgentPolicy
 from dayu.engine.contracts.agent_run import AgentRunRequest
-from dayu.engine.contracts.engine_events import EngineEvent
+from dayu.engine.contracts.engine_events import (
+    EngineEvent,
+    EngineEventType,
+    FinalAnswerData,
+    RunFailedData,
+)
+from dayu.engine.contracts.finish_reason import FinishReason
 from dayu.engine.contracts.messages import AgentMessage
 from dayu.engine.contracts.runner_spec import RunnerCallOptions, RunnerSpec
 from dayu.contracts.json_value import JsonValue
@@ -96,6 +102,7 @@ from dayu.runtime.lane import (
     LaneClaimToken,
     LaneConfig,
     LaneController,
+    LaneOwner,
     SQLiteLaneCoordinatorConfig,
 )
 
@@ -265,6 +272,56 @@ class _CloseCountingHandle(_FakeHandle):
 
     async def close(self) -> None:
         """记录关闭次数。
+
+        :returns: ``None``。
+        """
+
+        self.close_count += 1
+        await super().close()
+
+
+class _ControlledBlockingHandle(_FakeHandle):
+    """用 asyncio.Event 控制事件流生命周期的 fake handle。"""
+
+    def __init__(self) -> None:
+        """初始化受控 handle。
+
+        :returns: ``None``。
+        """
+
+        super().__init__()
+        self.cancel_count = 0
+        self.close_count = 0
+        self.events_started = asyncio.Event()
+        self.events_finalized = asyncio.Event()
+        self.release_events = asyncio.Event()
+
+    async def events(self) -> AsyncIterator[EngineEvent]:
+        """阻塞事件流直到测试释放或 task 被取消。
+
+        :returns: 不会自然返回事件，除非测试显式释放。
+        """
+
+        self.events_started.set()
+        try:
+            await self.release_events.wait()
+        finally:
+            self.events_finalized.set()
+        if False:
+            yield _unreachable_engine_event()
+
+    def cancel(self, reason: str) -> None:
+        """记录取消请求。
+
+        :param reason: 取消原因。
+        :returns: ``None``。
+        """
+
+        del reason
+        self.cancel_count += 1
+
+    async def close(self) -> None:
+        """记录关闭请求。
 
         :returns: ``None``。
         """
@@ -511,6 +568,61 @@ class _EnqueueOnSecondEmptyQueue(asyncio.Queue[PendingDispatchRecord]):
         return super().empty()
 
 
+class _ObservedEmptyQueue(asyncio.Queue[PendingDispatchRecord]):
+    """记录 empty 检查的测试队列。"""
+
+    def __init__(self) -> None:
+        """初始化测试队列。
+
+        :returns: ``None``。
+        """
+
+        super().__init__()
+        self.empty_checked = asyncio.Event()
+
+    def empty(self) -> bool:
+        """记录 empty 检查并返回真实队列状态。
+
+        :returns: 当前队列是否为空。
+        """
+
+        self.empty_checked.set()
+        return super().empty()
+
+
+class _CancelBeforePreAcceptRecheck:
+    """在 scheduler pre-accept recheck 前注入 durable cancel 的测试 callable。"""
+
+    def __init__(
+        self,
+        *,
+        transaction_runner: HostTransactionRunner,
+        seeded: _SeededRun,
+        original_recheck: Callable[[DispatchRecordRow], bool],
+    ) -> None:
+        """初始化 cancel race 注入器。
+
+        :param transaction_runner: Host transaction runner。
+        :param seeded: seeded run。
+        :param original_recheck: scheduler 原始 pre-accept recheck。
+        :returns: ``None``。
+        """
+
+        self._transaction_runner = transaction_runner
+        self._seeded = seeded
+        self._original_recheck = original_recheck
+
+    def __call__(self, dispatch_record: DispatchRecordRow) -> bool:
+        """注入 cancel race 后执行原始 pre-accept recheck。
+
+        :param dispatch_record: 当前 dispatching row。
+        :returns: 原始 pre-accept recheck 结果。
+        """
+
+        _cancel_predispatch_dispatching(self._transaction_runner, self._seeded)
+        return self._original_recheck(dispatch_record)
+
+
 class _FailingDrainLoopScheduler(HostDispatchScheduler):
     """测试用 drain_once 崩溃 scheduler。"""
 
@@ -616,6 +728,40 @@ async def test_drain_loop_logs_unexpected_exception(
 
     assert any(
         "dispatch drain loop stopped unexpectedly" in record.getMessage()
+        for record in caplog.records
+    )
+
+
+@pytest.mark.asyncio
+async def test_drain_loop_logs_empty_sleep_and_close(
+    tmp_path: Path,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """drain loop 空队列睡眠和 close 取消路径写入 debug 诊断。
+
+    :param tmp_path: pytest 临时目录。
+    :param caplog: pytest 日志捕获 fixture。
+    :returns: ``None``。
+    """
+
+    caplog.set_level(logging.DEBUG, logger="dayu.host.dispatch")
+    factory = _FakeWorkerFactory()
+    with open_host_durable_store(_options(tmp_path)) as store:
+        scheduler = await _open_scheduler(tmp_path, store, factory)
+        observed_queue = _ObservedEmptyQueue()
+        scheduler._queue = observed_queue
+        scheduler._drain_task = asyncio.create_task(scheduler._drain_loop())
+        try:
+            await observed_queue.empty_checked.wait()
+        finally:
+            await scheduler.close()
+
+    assert any(
+        "dispatch drain loop empty queue; sleeping" in record.getMessage()
+        for record in caplog.records
+    )
+    assert any(
+        "dispatch drain loop cancelled during close" in record.getMessage()
         for record in caplog.records
     )
 
@@ -770,10 +916,116 @@ async def test_cancelled_dispatch_is_skipped_before_worker_call(
 
 
 @pytest.mark.asyncio
-async def test_pending_dispatch_can_direct_mark_dispatching_after_lane_recheck(
+async def test_cancel_race_after_lane_acquire_releases_lane_without_worker(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """lane acquire 后 durable cancel race 会释放 lane 且不调用 worker。
+
+    :param tmp_path: pytest 临时目录。
+    :param monkeypatch: pytest monkeypatch fixture。
+    :returns: ``None``。
+    """
+
+    factory = _FakeWorkerFactory()
+    lane_db_path = tmp_path / "lane-cancel-race.sqlite3"
+    with open_host_durable_store(_options(tmp_path)) as store:
+        seeded = _seed_current_run(store)
+        scheduler = await _open_scheduler(
+            tmp_path,
+            store,
+            factory,
+            lane_db_path=lane_db_path,
+        )
+        original_recheck = scheduler._dispatch_record_still_pre_accept
+        monkeypatch.setattr(
+            scheduler,
+            "_dispatch_record_still_pre_accept",
+            _CancelBeforePreAcceptRecheck(
+                transaction_runner=store.transaction_runner,
+                seeded=seeded,
+                original_recheck=original_recheck,
+            ),
+        )
+        try:
+            scheduler.wake_dispatch(_pending_dispatch(seeded))
+            result = await scheduler.drain_once()
+            run, attempt, dispatch_record = _read_rows(
+                store.transaction_runner, seeded
+            )
+
+            assert result.processed == 1
+            assert result.skipped == 1
+            assert factory.created == 0
+            assert run.status is RunStatus.CANCELLED
+            assert attempt.status is AttemptStatus.CANCELLED
+            assert dispatch_record.status is DispatchRecordStatus.CANCELLED
+            verifier = await LaneController.open(
+                [
+                    LaneConfig(
+                        name=_LANE_NAME,
+                        capacity=1,
+                        default_timeout_seconds=0,
+                        claim_ttl_seconds=1.0,
+                        heartbeat_interval_seconds=0.1,
+                    )
+                ],
+                coordinator=SQLiteLaneCoordinatorConfig(db_path=lane_db_path),
+                owner=LaneOwner(
+                    owner_id="lane-cancel-race-verifier",
+                    pid=1,
+                    process_start_token=None,
+                ),
+            )
+            try:
+                reopened = await verifier.acquire(_LANE_NAME, timeout_seconds=0)
+                assert isinstance(reopened, LaneAcquired)
+                await reopened.token.release()
+            finally:
+                await verifier.close()
+        finally:
+            await scheduler.close()
+
+
+@pytest.mark.asyncio
+async def test_dispatching_after_recheck_requires_waiting_for_lane(
     tmp_path: Path,
 ) -> None:
-    """scheduler durable recheck 接受 pending 并直跳 dispatching。"""
+    """scheduler durable recheck 只接受已进入 waiting_for_lane 的 dispatch。"""
+
+    factory = _FakeWorkerFactory()
+    with open_host_durable_store(_options(tmp_path)) as store:
+        seeded = _seed_current_run(store)
+        scheduler = await _open_scheduler(tmp_path, store, factory)
+        claim = await scheduler._lane_controller.acquire(
+            _LANE_NAME,
+            timeout_seconds=0,
+        )
+        assert isinstance(claim, LaneAcquired)
+        try:
+            wait_row = scheduler._mark_waiting_for_lane(_pending_dispatch(seeded))
+            assert wait_row is not None
+            assert wait_row.status == DispatchRecordStatus.WAITING_FOR_LANE
+            dispatch_record = scheduler._mark_dispatching_after_recheck(
+                _pending_dispatch(seeded),
+                claim.token,
+            )
+
+            assert dispatch_record is not None
+            assert dispatch_record.status == DispatchRecordStatus.DISPATCHING
+            assert dispatch_record.waiting_for_lane_at is not None
+            assert dispatch_record.lane_name == _LANE_NAME
+            assert dispatch_record.lane_claim_id == claim.token.claim_id
+        finally:
+            await claim.token.release()
+            await scheduler.close()
+
+
+@pytest.mark.asyncio
+async def test_pending_dispatch_recheck_without_waiting_is_skipped(
+    tmp_path: Path,
+) -> None:
+    """scheduler durable recheck 不允许绕过 waiting_for_lane。"""
 
     factory = _FakeWorkerFactory()
     with open_host_durable_store(_options(tmp_path)) as store:
@@ -790,11 +1042,7 @@ async def test_pending_dispatch_can_direct_mark_dispatching_after_lane_recheck(
                 claim.token,
             )
 
-            assert dispatch_record is not None
-            assert dispatch_record.status == DispatchRecordStatus.DISPATCHING
-            assert dispatch_record.waiting_for_lane_at is not None
-            assert dispatch_record.lane_name == _LANE_NAME
-            assert dispatch_record.lane_claim_id == claim.token.claim_id
+            assert dispatch_record is None
         finally:
             await claim.token.release()
             await scheduler.close()
@@ -1090,10 +1338,19 @@ async def test_worker_stream_exception_closes_run_lost_from_scheduler(
 ) -> None:
     """accepted worker stream 异常由 scheduler 映射为 LOST closeout。"""
 
-    factory = _FakeWorkerFactory(worker=_HandleWorker(_CrashingHandle()))
+    handle = _CrashingHandle()
+    registry = ActiveWorkerRegistry()
+    factory = _FakeWorkerFactory(worker=_HandleWorker(handle))
+    lane_db_path = tmp_path / "lane-stream-exception.sqlite3"
     with open_host_durable_store(_options(tmp_path)) as store:
         seeded = _seed_current_run(store)
-        scheduler = await _open_scheduler(tmp_path, store, factory)
+        scheduler = await _open_scheduler(
+            tmp_path,
+            store,
+            factory,
+            lane_db_path=lane_db_path,
+            active_registry=registry,
+        )
         try:
             scheduler.wake_dispatch(_pending_dispatch(seeded))
             result = await scheduler.drain_once()
@@ -1103,6 +1360,7 @@ async def test_worker_stream_exception_closes_run_lost_from_scheduler(
                 expected_run=RunStatus.LOST,
                 expected_attempt=AttemptStatus.LOST,
             )
+            await _wait_for_active_tasks_to_finish(scheduler)
 
             assert result.dispatched == 1
             assert run.status == RunStatus.LOST
@@ -1111,6 +1369,38 @@ async def test_worker_stream_exception_closes_run_lost_from_scheduler(
             assert json.loads(_require_text(event.reason_json))["reason"] == (
                 "worker_lost_before_terminal"
             )
+            assert handle.closed is True
+            assert registry.cancel(
+                ActiveCancelMessage(
+                    run_id=seeded.run_id,
+                    attempt_id=seeded.attempt_id,
+                    execution_id=seeded.execution_id,
+                    reason="after_stream_exception",
+                )
+            ) is False
+            verifier = await LaneController.open(
+                [
+                    LaneConfig(
+                        name=_LANE_NAME,
+                        capacity=1,
+                        default_timeout_seconds=0,
+                        claim_ttl_seconds=1.0,
+                        heartbeat_interval_seconds=0.1,
+                    )
+                ],
+                coordinator=SQLiteLaneCoordinatorConfig(db_path=lane_db_path),
+                owner=LaneOwner(
+                    owner_id="lane-stream-exception-verifier",
+                    pid=1,
+                    process_start_token=None,
+                ),
+            )
+            try:
+                reopened = await verifier.acquire(_LANE_NAME, timeout_seconds=0)
+                assert isinstance(reopened, LaneAcquired)
+                await reopened.token.release()
+            finally:
+                await verifier.close()
         finally:
             await scheduler.close()
 
@@ -1153,6 +1443,68 @@ async def test_scheduler_close_lets_active_task_own_handle_close(
         await scheduler.close()
         assert handle.cancel_count == 1
         assert handle.close_count == 1
+
+
+@pytest.mark.asyncio
+async def test_scheduler_close_during_active_events_releases_all_resources(
+    tmp_path: Path,
+) -> None:
+    """scheduler close 期间活跃事件消费被取消后会释放 lane 与 registry。"""
+
+    handle = _ControlledBlockingHandle()
+    registry = ActiveWorkerRegistry()
+    factory = _FakeWorkerFactory(worker=_HandleWorker(handle))
+    lane_db_path = tmp_path / "lane-close-active.sqlite3"
+    with open_host_durable_store(_options(tmp_path)) as store:
+        seeded = _seed_current_run(store)
+        scheduler = await _open_scheduler(
+            tmp_path,
+            store,
+            factory,
+            lane_db_path=lane_db_path,
+            active_registry=registry,
+        )
+        scheduler.wake_dispatch(_pending_dispatch(seeded))
+        result = await scheduler.drain_once()
+        await handle.events_started.wait()
+
+        assert result.dispatched == 1
+        await scheduler.close()
+
+        assert handle.cancel_count == 1
+        assert handle.close_count == 1
+        assert handle.events_finalized.is_set()
+        assert registry.cancel(
+            ActiveCancelMessage(
+                run_id=seeded.run_id,
+                attempt_id=seeded.attempt_id,
+                execution_id=seeded.execution_id,
+                reason="after_scheduler_close",
+            )
+        ) is False
+        verifier = await LaneController.open(
+            [
+                LaneConfig(
+                    name=_LANE_NAME,
+                    capacity=1,
+                    default_timeout_seconds=0,
+                    claim_ttl_seconds=1.0,
+                    heartbeat_interval_seconds=0.1,
+                )
+            ],
+            coordinator=SQLiteLaneCoordinatorConfig(db_path=lane_db_path),
+            owner=LaneOwner(
+                owner_id="lane-verifier",
+                pid=1,
+                process_start_token=None,
+            ),
+        )
+        try:
+            reopened = await verifier.acquire(_LANE_NAME, timeout_seconds=0)
+            assert isinstance(reopened, LaneAcquired)
+            await reopened.token.release()
+        finally:
+            await verifier.close()
 
 
 @pytest.mark.asyncio
@@ -1272,6 +1624,88 @@ async def test_scheduler_with_default_local_proxy_stream_error_closes_lost(
             assert json.loads(_require_text(event.reason_json))["reason"] == (
                 "worker_lost_before_terminal"
             )
+        finally:
+            await scheduler.close()
+
+
+@pytest.mark.asyncio
+async def test_scheduler_closes_default_local_proxy_after_terminal_before_late_event(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """terminal accepted 后 scheduler 关闭 worker stream，不继续读取 late event。"""
+
+    stream_finalized = asyncio.Event()
+    late_event_reached = asyncio.Event()
+
+    async def terminal_then_late_run_agent_messages(
+        request: AgentRunRequest,
+    ) -> AsyncIterator[EngineEvent]:
+        """先产出 terminal，再暴露一个不应被读取的 late event。
+
+        :param request: Engine request。
+        :returns: 受控 EngineEvent stream。
+        """
+
+        try:
+            yield EngineEvent(
+                occurred_at=_NOW,
+                session_id=request.session_id,
+                run_id=request.run_id,
+                type=EngineEventType.FINAL_ANSWER,
+                data=FinalAnswerData(
+                    content="done",
+                    filtered=False,
+                    degraded=False,
+                    finish_reason=FinishReason.STOP,
+                ),
+                metadata=None,
+            )
+            late_event_reached.set()
+            yield EngineEvent(
+                occurred_at=_NOW,
+                session_id=request.session_id,
+                run_id=request.run_id,
+                type=EngineEventType.RUN_FAILED,
+                data=RunFailedData(
+                    error_code="late",
+                    message="late event must not be consumed",
+                    provider_request_id=None,
+                    recoverable=False,
+                ),
+                metadata=None,
+            )
+        finally:
+            stream_finalized.set()
+
+    monkeypatch.setattr(
+        "dayu.host.local_proxy.run_agent_messages",
+        terminal_then_late_run_agent_messages,
+    )
+
+    with open_host_durable_store(_options(tmp_path)) as store:
+        seeded = _seed_current_run(store)
+        scheduler = await _open_scheduler(
+            tmp_path,
+            store,
+            DefaultLocalEngineWorkerFactory(),
+        )
+        try:
+            scheduler.wake_dispatch(_pending_dispatch(seeded))
+            result = await scheduler.drain_once()
+            run, attempt, _dispatch_record = await _wait_for_statuses(
+                store.transaction_runner,
+                seeded,
+                expected_run=RunStatus.SUCCEEDED,
+                expected_attempt=AttemptStatus.SUCCEEDED,
+            )
+            await _wait_for_active_tasks_to_finish(scheduler)
+
+            assert result.dispatched == 1
+            assert run.status == RunStatus.SUCCEEDED
+            assert attempt.status == AttemptStatus.SUCCEEDED
+            assert stream_finalized.is_set()
+            assert not late_event_reached.is_set()
         finally:
             await scheduler.close()
 
@@ -1761,6 +2195,45 @@ def _mark_dispatching_and_cancel(
                 source="pytest",
                 client_request_id="client-cancel",
                 idempotency_key="idem-cancel",
+                reason="user_stop",
+                mode=CancelMode.GRACEFUL,
+                call_context_digest=_CALL_CONTEXT_DIGEST,
+            ),
+        )
+
+    transaction_runner.run_write(_operation)
+
+
+def _cancel_predispatch_dispatching(
+    transaction_runner: HostTransactionRunner, seeded: _SeededRun
+) -> None:
+    """取消已进入 pre-accept dispatching 的 seeded Run。
+
+    :param transaction_runner: transaction runner。
+    :param seeded: seeded run。
+    :returns: ``None``。
+    """
+
+    def _operation(transaction: HostTransaction) -> None:
+        """执行 durable cancel。
+
+        :param transaction: Host transaction。
+        :returns: ``None``。
+        """
+
+        cancel_predispatch_starting_in_transaction(
+            transaction,
+            EventLogStore(),
+            CancelPredispatchStartingInput(
+                run_id=seeded.run_id,
+                cancel_request_event_id="event-cancel-race-requested",
+                attempt_cancelled_event_id="event-cancel-race-attempt",
+                run_cancelled_event_id="event-cancel-race-run",
+                occurred_at=_NOW,
+                actor="tester",
+                source="pytest",
+                client_request_id="client-cancel-race",
+                idempotency_key="idem-cancel-race",
                 reason="user_stop",
                 mode=CancelMode.GRACEFUL,
                 call_context_digest=_CALL_CONTEXT_DIGEST,
