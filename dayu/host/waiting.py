@@ -588,13 +588,13 @@ class DefaultHostResolveWaitService:
                     transaction, wait_id, request
                 )
             )
-            catch_up_projection_best_effort(self._projection_catchup_port)
             if isinstance(result, _LateRejectResult):
                 raise HostApiError(
                     code=HostApiErrorCode.INVALID_STATE,
                     message=result.message,
                     retryable=False,
                 )
+            catch_up_projection_best_effort(self._projection_catchup_port)
             return result
         except HostIdempotencyConflictError as exc:
             raise HostApiError(

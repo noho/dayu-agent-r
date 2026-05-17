@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from dataclasses import replace
+from dataclasses import dataclass, replace
 from pathlib import Path
 
 import pytest
@@ -21,8 +21,11 @@ from dayu.host import (
     create_host_command_handle,
     resolve_wait,
 )
+from dayu.host.admission import create_host_admission_service
 from dayu.host.durable.event_log import EventLogRow
 from dayu.host.durable.state import WaitRecordStatus
+from dayu.host.durable.transaction import HostTransaction, HostTransactionRunner
+from dayu.host.projection import ProjectionCatchupPort
 from tests.host.test_resolve_wait_command import (
     _completed_request,
     _context,
@@ -32,6 +35,23 @@ from tests.host.test_resolve_wait_command import (
     _read_wait,
     _seed_waiting_run,
 )
+
+_ATTEMPT_COUNT_SQL = "SELECT COUNT(*) AS total FROM host_attempts"
+
+
+@dataclass(slots=True)
+class _CountingProjectionCatchup(ProjectionCatchupPort):
+    """测试用 projection catch-up 调用计数器。"""
+
+    calls: int = 0
+
+    def catch_up_projection(self) -> None:
+        """记录 catch-up 调用次数。
+
+        :returns: ``None``。
+        """
+
+        self.calls += 1
 
 
 def test_cancel_run_cancels_waiting_run_without_resume_attempt(
@@ -96,9 +116,18 @@ def test_cancel_session_runs_cancels_waiting_run(
 def test_late_result_after_cancel_writes_bounded_diagnostic(
     tmp_path: Path,
 ) -> None:
-    """取消后的 late result 只写 diagnostic，重复不追加，冲突不追加。"""
+    """取消后的 late result 只写 diagnostic，重复不追加，冲突不追加。
+
+    :param tmp_path: pytest 临时目录。
+    :returns: ``None``。
+    """
 
     host = create_host_command_handle(_options(tmp_path))
+    projection = _CountingProjectionCatchup()
+    host._admission_service = create_host_admission_service(
+        host._transaction_runner(),
+        projection_catchup_port=projection,
+    )
     try:
         seeded = _seed_waiting_run(host)
         cancel_run(
@@ -112,6 +141,8 @@ def test_late_result_after_cancel_writes_bounded_diagnostic(
             ),
         )
         request = _completed_request("late-result")
+        attempt_count_before_late = _attempt_count(host._transaction_runner())
+        events_before_late = _events(host._transaction_runner())
 
         with pytest.raises(HostApiError) as first_error:
             resolve_wait(host, seeded.wait_id, request)
@@ -137,6 +168,13 @@ def test_late_result_after_cancel_writes_bounded_diagnostic(
         assert diagnostics[0].reason_json == '{"reason_code":"wait_cancelled"}'
         assert after_replay == after_first
         assert _events(host._transaction_runner()) == after_first
+        assert projection.calls == 0
+        assert _attempt_count(host._transaction_runner()) == attempt_count_before_late
+        late_event_types = [
+            event.event_type for event in after_first[len(events_before_late) :]
+        ]
+        assert "RESUME_REQUESTED" not in late_event_types
+        assert "ATTEMPT_STARTED" not in late_event_types
     finally:
         host.close()
 
@@ -197,3 +235,26 @@ def _events_by_type(
     """
 
     return tuple(event for event in events if event.event_type == event_type)
+
+
+def _attempt_count(transaction_runner: HostTransactionRunner) -> int:
+    """统计当前 durable store 中的 Attempt 行数。
+
+    :param transaction_runner: Host transaction runner。
+    :returns: Attempt row count。
+    """
+
+    def operation(transaction: HostTransaction) -> int:
+        """读取 Attempt 行数。
+
+        :param transaction: Host transaction。
+        :returns: Attempt row count。
+        """
+
+        row = transaction.fetchone(_ATTEMPT_COUNT_SQL)
+        assert row is not None
+        total = row.get("total")
+        assert isinstance(total, int)
+        return total
+
+    return transaction_runner.run_read(operation)

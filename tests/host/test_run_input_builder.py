@@ -2,9 +2,10 @@
 
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from datetime import UTC, datetime
 from pathlib import Path
+from typing import Literal
 
 import pytest
 
@@ -933,6 +934,71 @@ def test_current_facts_reject_non_dispatchable_snapshot_state(
 
         with pytest.raises(HostDurableError, match=message):
             _build_request(store, seeded)
+
+
+@pytest.mark.parametrize(
+    ("snapshot_field", "snapshot_value", "message"),
+    (
+        (
+            "execution_id",
+            "execution-stale",
+            "attempt identity mismatch",
+        ),
+        (
+            "dispatch_record_id",
+            "dispatch-stale",
+            "dispatch identity mismatch",
+        ),
+        (
+            "execution_target",
+            "target-stale",
+            "execution_target mismatch",
+        ),
+    ),
+)
+def test_current_facts_reject_stale_snapshot_identity(
+    tmp_path: Path,
+    snapshot_field: Literal[
+        "execution_id", "dispatch_record_id", "execution_target"
+    ],
+    snapshot_value: str,
+    message: str,
+) -> None:
+    """RunInputBuilder 对 stale dispatch snapshot 按既有错误语义 fail closed。
+
+    :param tmp_path: pytest 临时目录。
+    :param snapshot_field: 需要覆盖的 snapshot 字段名。
+    :param snapshot_value: 需要覆盖的 snapshot 字段值。
+    :param message: 期望错误消息片段。
+    :returns: ``None``。
+    """
+
+    with open_host_durable_store(_options(tmp_path)) as store:
+        session_id = _ensure_session_id(store.transaction_runner)
+        seeded = _seed_current_run(
+            store,
+            session_id=session_id,
+            payload=_user_input_payload("current question"),
+        )
+        if snapshot_field == "execution_id":
+            stale_snapshot = replace(
+                _attempt_snapshot(seeded), execution_id=snapshot_value
+            )
+        elif snapshot_field == "dispatch_record_id":
+            stale_snapshot = replace(
+                _attempt_snapshot(seeded), dispatch_record_id=snapshot_value
+            )
+        else:
+            stale_snapshot = replace(
+                _attempt_snapshot(seeded), execution_target=snapshot_value
+            )
+        builder = create_no_tool_run_input_builder(
+            transaction_runner=store.transaction_runner,
+            policy_snapshot=_policy_snapshot(),
+        )
+
+        with pytest.raises(HostDurableError, match=message):
+            builder.build(stale_snapshot)
 
 
 def _memory_policy(
