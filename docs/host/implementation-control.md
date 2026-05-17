@@ -220,8 +220,8 @@ Phase Map 中每个 phase 必须使用统一条目格式。模板如下：
 
 ## 当前状态
 
-P9-S4 `Projection Repair / Rebuild Entry and Diagnostics` implementation、双路 code review、fix、双路 re-review 与 controller
-adjudication 已完成；remaining blocking findings 为 0。当前 gate 为 P9-S4 accepted slice commit。
+P9-S4 `Projection Repair / Rebuild Entry and Diagnostics` completed；accepted slice commit 为 `1d30725`。当前 gate 为 P9
+aggregate deepreview。
 
 约束：本节只保留当前 gate 结论；phase 过程流水必须归档到 `历史记录`，仍需追踪的风险或后续 owner 必须写入 `Open Questions 与风险追踪` 的 `追踪区`。
 
@@ -813,7 +813,7 @@ Phase 按依赖关系推进：先实现被其它阶段依赖的公共契约、ru
 - P9-S1 `Durable Memory Contracts and Schema` completed；accepted slice commit 为 `f221aeb`。
 - P9-S2 `Projection Consumer and Stable Layer Builder` completed；accepted slice commit 为 `4f35da6`。
 - P9-S3 `RunInputBuilder MemorySnapshotProvider and Lag Fallback` completed；accepted slice commit 为 `b416d37`。
-- P9-S4 `Projection Repair / Rebuild Entry and Diagnostics` completed；accepted slice commit 待记录。
+- P9-S4 `Projection Repair / Rebuild Entry and Diagnostics` completed；accepted slice commit 为 `1d30725`。
 
 目标：
 - 实现 session-level Conversation Memory projection、stable layer、history pool、snapshot cursor、RunInputBuilder memory provider 与 projection repair path。
@@ -1651,7 +1651,7 @@ Phase 按依赖关系推进：先实现被其它阶段依赖的公共契约、ru
   `docs/reviews/p9-s4-code-rereview-ds-20260517.md`。
 - Controller adjudication artifact 为 `docs/reviews/p9-s4-code-review-controller-adjudication-20260517.md`。
 - Re-review verdict：AgentMiMo PASS，AgentDS PASS，remaining blocking findings 为 0。
-- Accepted slice commit 待记录。
+- Accepted slice commit 为 `1d30725`。
 
 验证：
 
@@ -1695,7 +1695,7 @@ best-effort catch-up 性能优化，均不阻塞 P9。
 - `pyright dayu/host tests/host`：0 errors。
 - `git diff --check`：通过。
 
-Accepted slice commit 待记录。当前 gate 为 P9 aggregate deepreview。
+Accepted slice commit 为 `1d30725`。当前 gate 为 P9 aggregate deepreview。
 
 ### 2026-05-17 P9-S3 code review accepted
 
