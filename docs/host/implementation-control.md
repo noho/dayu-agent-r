@@ -223,8 +223,8 @@ Phase Map 中每个 phase 必须使用统一条目格式。模板如下：
 约束：本节只保留当前 gate 结论；phase 过程流水必须归档到 `历史记录`，仍需追踪的风险或后续 owner 必须写入 `Open Questions 与风险追踪` 的 `追踪区`。
 
 当前 work unit：P9.5 Pre-P10 Cross-Repository Hardening PR。
-当前 gate：P9.5 S4 Host Durable Helper API Tightening implementation。
-下一 gate：P9.5 S4 code review。
+当前 gate：P9.5 S5 Schema CHECK Hardening implementation。
+下一 gate：P9.5 S5 code review。
 
 ## Phase Map
 
@@ -2032,6 +2032,24 @@ P9.5 收口清单：
 - 当前无 PR review blocking fix。
 
 ## 历史记录
+
+### 2026-05-17 P9.5 S4 Host Durable Helper API Tightening accepted
+
+P9.5 S4 Host Durable Helper API Tightening 已完成。Implementation artifact 为
+`docs/reviews/p9-5-s4-host-durable-helper-tightening-implementation-20260517.md`。Code review / fix /
+controller adjudication artifacts 为 `docs/reviews/p9-5-s4-code-review-mimo-20260517.md`、
+`docs/reviews/p9-5-s4-code-review-ds-20260517.md`、
+`docs/reviews/p9-5-s4-fix-20260517.md` 与
+`docs/reviews/p9-5-s4-code-review-controller-adjudication-20260517.md`。
+
+Controller 裁决：AgentMiMo 与 AgentDS review 均为 0 blocking findings；AgentDS F1 / AgentMiMo F1
+关于 Python 前置检查与 SQL CAS 双重检查意图说明不足被接受为 low documentation fix，并已通过
+`docs/reviews/p9-5-s4-fix-20260517.md` 关闭。本地验证通过：
+`pytest tests/host/test_run_attempt_transitions.py tests/host/test_dispatch_scheduler.py tests/host/test_resolve_wait_command.py
+tests/host/test_public_cancel_session_runs.py tests/host/test_run_input_builder.py tests/host/test_phase6_toolruntime_integration.py
+tests/host/test_toolruntime_accept_barrier.py` 为 103 passed；`pytest tests/host` 为 500 passed；
+`python -m pyright dayu/host tests/host` 为 0 errors / 0 warnings / 0 informations；`git diff --check`
+clean。Accepted slice commit 为 `e5e13e4`。当前 gate 为 P9.5 S5 Schema CHECK Hardening implementation。
 
 ### 2026-05-17 P9.5 S3 Host Public Error Taxonomy And Command Handle Encapsulation accepted
 
