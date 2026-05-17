@@ -10,6 +10,7 @@
 
 from __future__ import annotations
 
+import dayu.engine.agent as agent_module
 from dayu.engine.contracts.runner import AsyncRunner
 
 
@@ -46,3 +47,9 @@ def test_async_runner_does_not_expose_old_methods() -> None:
     assert "set_tools" not in surface
     assert "get_schemas" not in surface
     assert "get_tool_display_info" not in surface
+
+
+def test_agent_module_does_not_import_concrete_openai_runner_symbol() -> None:
+    """Agent 协调模块不得直接持有 OpenAI Runner 实现类符号。"""
+
+    assert "AsyncOpenAIRunner" not in vars(agent_module)

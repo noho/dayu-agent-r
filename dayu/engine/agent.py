@@ -106,7 +106,7 @@ from dayu.engine.contracts.runner_events import (
     RunnerToolCallsCompletedData,
     RunnerUsageRecordedData,
 )
-from dayu.engine.runners.openai.runner import AsyncOpenAIRunner
+from dayu.engine._default_runner import build_default_runner
 from dayu.runtime.cancellation import (
     WaitCancelled,
     WaitCompleted,
@@ -247,18 +247,15 @@ def _fallback_error_message(error_code: str) -> str:
 def _build_runner(request: AgentRunRequest) -> AsyncRunner:
     """根据请求构造当前内置 Runner。
 
-    当前只装配 OpenAI-compatible Runner；后续如果需要其它 Runner，必须先
-    新增明确的 runner 选择契约，而不是在本函数塞入开放插件机制。
+    当前只委托私有默认装配点构造 OpenAI-compatible Runner；本函数不是
+    factory、registry 或扩展点。
 
     :param request: Agent run 请求。
     :returns: 新建的 Runner 实例。
     :raises Exception: Runner 构造失败时透传底层异常。
     """
 
-    return AsyncOpenAIRunner(
-        spec=request.runner_spec,
-        cancellation_token=request.cancellation_token,
-    )
+    return build_default_runner(request)
 
 
 def _plain_json_value(value: JsonValue) -> _PlainJsonValue:
