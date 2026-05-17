@@ -220,8 +220,8 @@ Phase Map 中每个 phase 必须使用统一条目格式。模板如下：
 
 ## 当前状态
 
-P9 aggregate deepreview completed；accepted deepreview commit 为 `cc05f79`。当前 gate 为 draft PR gate；
-用户已授权 push、创建 draft PR 并继续推进 PR review。
+Phase 9 draft PR 已创建：PR 59 https://github.com/noho/dayu-agent-r/pull/59。PR review gate completed，verdict 为
+PASS，remaining blocking findings 为 0。当前 gate 为 accepted PR review commit。
 
 约束：本节只保留当前 gate 结论；phase 过程流水必须归档到 `历史记录`，仍需追踪的风险或后续 owner 必须写入 `Open Questions 与风险追踪` 的 `追踪区`。
 
@@ -815,6 +815,8 @@ Phase 按依赖关系推进：先实现被其它阶段依赖的公共契约、ru
 - P9-S3 `RunInputBuilder MemorySnapshotProvider and Lag Fallback` completed；accepted slice commit 为 `b416d37`。
 - P9-S4 `Projection Repair / Rebuild Entry and Diagnostics` completed；accepted slice commit 为 `1d30725`。
 - P9 aggregate deepreview completed；verdict 为 PASS；accepted deepreview commit 为 `cc05f79`。
+- P9 draft PR created：PR 59 https://github.com/noho/dayu-agent-r/pull/59；PR review gate completed，verdict 为 PASS；
+  accepted PR review commit 待记录。
 
 目标：
 - 实现 session-level Conversation Memory projection、stable layer、history pool、snapshot cursor、RunInputBuilder memory provider 与 projection repair path。
@@ -1698,7 +1700,36 @@ Phase 按依赖关系推进：先实现被其它阶段依赖的公共契约、ru
 - production concrete memory catch-up port 注入，owner 为后续 Host / Service composition wiring。
 - Synchronous best-effort catch-up 的 batch 化与性能治理，owner 为 Phase 13 / Phase 15。
 
+#### Phase 9 draft PR gate 追踪
+
+结论：
+
+- Draft PR 已创建：PR 59 https://github.com/noho/dayu-agent-r/pull/59。
+- PR review artifacts 为 `docs/reviews/p9-pr-review-mimo-20260517.md` 与
+  `docs/reviews/p9-pr-review-ds-20260517.md`。
+- Controller PR review adjudication artifact 为 `docs/reviews/p9-pr-review-controller-adjudication-20260517.md`。
+- Verdict：AgentMiMo PASS，AgentDS PASS，remaining blocking findings 为 0。
+- GitHub 当前未上报 checks；本地 final validation 与 PR review gate 均通过。
+- Accepted PR review commit 待记录。
+
+追踪项：
+
+- PR 59 仍为 draft。mark ready for review、merge、request reviewers、delete branch 或对外 comment 需额外授权。
+- 当前无 PR review blocking fix。
+
 ## 历史记录
+
+### 2026-05-17 P9 draft PR review accepted
+
+P9 draft PR 已创建：PR 59 https://github.com/noho/dayu-agent-r/pull/59。PR review gate 已完成：
+AgentMiMo artifact 为 `docs/reviews/p9-pr-review-mimo-20260517.md`，AgentDS artifact 为
+`docs/reviews/p9-pr-review-ds-20260517.md`。Controller adjudication artifact 为
+`docs/reviews/p9-pr-review-controller-adjudication-20260517.md`。
+
+Verdict：AgentMiMo PASS，AgentDS PASS，remaining blocking findings 为 0。PR review 未发现 release-blocking issue；
+当前 GitHub 未上报 checks。
+
+Accepted PR review commit 待记录。
 
 ### 2026-05-17 P9 aggregate deepreview accepted
 
