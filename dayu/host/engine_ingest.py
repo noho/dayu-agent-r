@@ -22,6 +22,7 @@ from dayu.contracts.tool_outcome import (
     ToolCompletedOutcome,
     ToolFailedOutcome,
 )
+from dayu.contracts.tool_await import ToolAwaitSnapshot
 from dayu.engine.contracts.engine_events import (
     ContentCompleteData,
     ContentDeltaData,
@@ -32,6 +33,7 @@ from dayu.engine.contracts.engine_events import (
     IterationCompletedData,
     IterationStartedData,
     ProviderProtocolErrorData,
+    RUN_SUSPENDED_REASON_TOOL_AWAITING,
     ReasoningDeltaData,
     RunCancelledData,
     RunFailedData,
@@ -46,7 +48,11 @@ from dayu.engine.contracts.engine_events import (
 )
 from dayu.host.admission import AdmissionWakeupPort, NoopAdmissionWakeupPort
 from dayu.host.api import AttemptStatus, RunStatus
-from dayu.host.durable.codec import format_utc_timestamp, sha256_digest_json
+from dayu.host.durable.codec import (
+    format_utc_timestamp,
+    parse_utc_timestamp,
+    sha256_digest_json,
+)
 from dayu.host.durable.event_log import (
     EventClass,
     EventLogAppendRequest,
@@ -71,7 +77,10 @@ from dayu.host.durable.state import (
     DispatchRecordRow,
     RunRow,
     StateMutationStatus,
+    WaitRecordRow,
+    WaitRecordStatus,
     WorkerKind,
+    read_active_wait_records_for_run,
     read_attempt_by_id,
     read_dispatch_record_by_attempt_id,
     read_run_by_id,
@@ -101,6 +110,9 @@ _EVENT_TYPE_RUN_CANCELLED = "RUN_CANCELLED"
 _EVENT_TYPE_ATTEMPT_LOST = "ATTEMPT_LOST"
 _EVENT_TYPE_RUN_LOST = "RUN_LOST"
 _EVENT_TYPE_RUN_CANCELLING = "RUN_CANCELLING"
+_EVENT_TYPE_TOOL_AWAITING = "TOOL_AWAITING"
+_EVENT_TYPE_RUN_WAITING = "RUN_WAITING"
+_EVENT_TYPE_ATTEMPT_SUSPENDED = "ATTEMPT_SUSPENDED"
 _REASON_FINAL_ANSWER = "final_answer"
 _REASON_UNSUPPORTED_RECOVERY_POLICY = "unsupported_recovery_policy"
 _REASON_UNSUPPORTED_WAITING_PATH = "unsupported_waiting_path"
@@ -219,6 +231,30 @@ class _TerminalPlan:
     stream_error_code: str | None
     last_observed_worker_event_index: int | None
     last_accepted_event_id: str | None
+
+
+@dataclass(frozen=True, slots=True)
+class _WaitingConfirmationCheck:
+    """Engine waiting confirmation 与 Host accepted refs 的匹配结果。
+
+    :param accepted: 是否可作为已接受等待的确认。
+    :param wait_record: 匹配到的 active wait record；未匹配时为 ``None``。
+    :param mismatch_reason: 未确认时的内部诊断原因；确认成功时为 ``None``。
+    """
+
+    accepted: bool
+    wait_record: WaitRecordRow | None
+    mismatch_reason: str | None
+
+
+@dataclass(frozen=True, slots=True)
+class _AcceptedWaitingRefs:
+    """Host accepted waiting refs 的已校验视图。
+
+    :param tool_awaiting_payload: ``TOOL_AWAITING`` canonical payload。
+    """
+
+    tool_awaiting_payload: Mapping[str, JsonValue]
 
 
 class EngineEventIngestor:
@@ -460,6 +496,7 @@ class EngineEventIngestor:
             return self._confirm_waiting_engine_event(
                 transaction,
                 context,
+                event.data,
                 _run_suspended_payload(context, event.data),
             )
         if event.type == EngineEventType.TOOL_AWAITING and isinstance(
@@ -468,6 +505,7 @@ class EngineEventIngestor:
             return self._confirm_waiting_engine_event(
                 transaction,
                 context,
+                event.data,
                 _tool_awaiting_payload(context, event.data),
             )
         if event.type == EngineEventType.USAGE_REPORTED and isinstance(
@@ -728,20 +766,27 @@ class EngineEventIngestor:
         self,
         transaction: HostTransaction,
         context: _ValidatedCandidate,
+        data: ToolAwaitingData | RunSuspendedData,
         payload: Mapping[str, JsonValue],
     ) -> EngineIngestResult:
         """写 Engine 等待事件确认 diagnostic，不改变 Host wait 状态。
 
         :param transaction: 当前 Host transaction。
         :param context: 已校验 candidate 上下文。
+        :param data: Engine waiting confirmation data。
         :param payload: diagnostic payload。
         :returns: ingest 结果。
         """
 
+        check = _validate_waiting_confirmation(
+            transaction=transaction,
+            event_log_store=self._event_log_store,
+            context=context,
+            data=data,
+        )
         reason = (
             _REASON_WAITING_EVENT_CONFIRMATION
-            if context.run.status is RunStatus.WAITING
-            and context.attempt.status is AttemptStatus.SUSPENDED
+            if check.accepted
             else _REASON_WAITING_EVENT_WITHOUT_HOST_ACCEPTED_REFS
         )
         event_id = _event_id(
@@ -762,6 +807,13 @@ class EngineEventIngestor:
         diagnostic_payload: dict[str, JsonValue] = dict(payload)
         diagnostic_payload["run_status"] = context.run.status.value
         diagnostic_payload["attempt_status"] = context.attempt.status.value
+        diagnostic_payload["waiting_confirmation_accepted"] = check.accepted
+        diagnostic_payload["wait_id"] = (
+            check.wait_record.wait_id if check.wait_record is not None else None
+        )
+        diagnostic_payload["waiting_confirmation_mismatch_reason"] = (
+            check.mismatch_reason
+        )
         row = self._append_diagnostic_event(
             transaction,
             context=context,
@@ -1195,6 +1247,447 @@ def _late_rejection_reason(context: _ValidatedCandidate) -> str | None:
     ):
         return _REASON_TERMINAL_ALREADY_CLOSED
     return None
+
+
+def _validate_waiting_confirmation(
+    *,
+    transaction: HostTransaction,
+    event_log_store: EventLogStore,
+    context: _ValidatedCandidate,
+    data: ToolAwaitingData | RunSuspendedData,
+) -> _WaitingConfirmationCheck:
+    """校验 Engine waiting event 是否匹配 Host accepted wait refs。
+
+    Engine 的 ``TOOL_AWAITING`` / ``RUN_SUSPENDED`` 只允许确认已经由
+    ToolRuntime Host accept path 写入的 durable 等待事实；本函数只读取
+    durable truth，不创建 wait record、不推进 Run，也不关闭 Attempt。
+
+    :param transaction: 当前 Host transaction。
+    :param event_log_store: EventLog primitive。
+    :param context: 已校验 candidate 上下文。
+    :param data: Engine waiting event data。
+    :returns: confirmation 校验结果。
+    """
+
+    if (
+        context.run.status is not RunStatus.WAITING
+        or context.attempt.status is not AttemptStatus.SUSPENDED
+    ):
+        return _waiting_confirmation_rejected("run_attempt_not_waiting")
+    active_waits = tuple(
+        wait_record
+        for wait_record in read_active_wait_records_for_run(
+            transaction, context.run.run_id
+        )
+        if wait_record.attempt_id == context.attempt.attempt_id
+        and wait_record.execution_id == context.attempt.execution_id
+    )
+    if len(active_waits) != 1:
+        return _waiting_confirmation_rejected("active_wait_record_not_unique")
+    wait_record = active_waits[0]
+    if wait_record.status is not WaitRecordStatus.WAITING:
+        return _waiting_confirmation_rejected(
+            "active_wait_record_not_waiting", wait_record=wait_record
+        )
+    refs = _accepted_waiting_refs_or_none(
+        transaction=transaction,
+        event_log_store=event_log_store,
+        context=context,
+        wait_record=wait_record,
+    )
+    if refs is None:
+        return _waiting_confirmation_rejected(
+            "accepted_wait_refs_mismatch", wait_record=wait_record
+        )
+    mismatch = _engine_awaiting_record_mismatch(
+        data=data,
+        wait_record=wait_record,
+        tool_awaiting_payload=refs.tool_awaiting_payload,
+    )
+    if mismatch is not None:
+        return _waiting_confirmation_rejected(mismatch, wait_record=wait_record)
+    return _WaitingConfirmationCheck(
+        accepted=True,
+        wait_record=wait_record,
+        mismatch_reason=None,
+    )
+
+
+def _waiting_confirmation_rejected(
+    mismatch_reason: str, *, wait_record: WaitRecordRow | None = None
+) -> _WaitingConfirmationCheck:
+    """构造 Engine waiting confirmation 拒绝结果。
+
+    :param mismatch_reason: 内部诊断原因。
+    :param wait_record: 已匹配到的 wait record；没有则为 ``None``。
+    :returns: 拒绝结果。
+    """
+
+    return _WaitingConfirmationCheck(
+        accepted=False,
+        wait_record=wait_record,
+        mismatch_reason=mismatch_reason,
+    )
+
+
+def _accepted_waiting_refs_or_none(
+    *,
+    transaction: HostTransaction,
+    event_log_store: EventLogStore,
+    context: _ValidatedCandidate,
+    wait_record: WaitRecordRow,
+) -> _AcceptedWaitingRefs | None:
+    """读取并校验 Host accepted waiting canonical refs。
+
+    :param transaction: 当前 Host transaction。
+    :param event_log_store: EventLog primitive。
+    :param context: 已校验 candidate 上下文。
+    :param wait_record: active wait record。
+    :returns: refs 校验通过时的 payload 视图；不匹配时返回 ``None``。
+    """
+
+    tool_awaiting = event_log_store.read_latest_run_event_by_type(
+        transaction,
+        run_id=context.run.run_id,
+        event_type=_EVENT_TYPE_TOOL_AWAITING,
+    )
+    run_waiting = event_log_store.read_latest_run_event_by_type(
+        transaction,
+        run_id=context.run.run_id,
+        event_type=_EVENT_TYPE_RUN_WAITING,
+    )
+    attempt_suspended = event_log_store.read_latest_run_event_by_type(
+        transaction,
+        run_id=context.run.run_id,
+        event_type=_EVENT_TYPE_ATTEMPT_SUSPENDED,
+    )
+    if (
+        tool_awaiting is None
+        or run_waiting is None
+        or attempt_suspended is None
+    ):
+        return None
+    if not (
+        _waiting_event_row_matches_context(tool_awaiting, context)
+        and _waiting_event_row_matches_context(run_waiting, context)
+        and _waiting_event_row_matches_context(attempt_suspended, context)
+    ):
+        return None
+    if (
+        tool_awaiting.event_id != wait_record.created_event_id
+        or tool_awaiting.event_sequence != wait_record.created_event_sequence
+        or attempt_suspended.event_id != wait_record.updated_event_id
+        or attempt_suspended.event_sequence != wait_record.updated_event_sequence
+    ):
+        return None
+    try:
+        tool_payload = _payload_object(tool_awaiting)
+        run_payload = _payload_object(run_waiting)
+        attempt_payload = _payload_object(attempt_suspended)
+    except HostDurableError:
+        return None
+    if not (
+        _tool_awaiting_payload_matches_wait(tool_payload, wait_record)
+        and _run_waiting_payload_matches_wait(
+            run_payload, wait_record, tool_awaiting
+        )
+        and _attempt_suspended_payload_matches_wait(
+            attempt_payload, wait_record, run_waiting
+        )
+    ):
+        return None
+    return _AcceptedWaitingRefs(tool_awaiting_payload=tool_payload)
+
+
+def _waiting_event_row_matches_context(
+    row: EventLogRow, context: _ValidatedCandidate
+) -> bool:
+    """判断 waiting canonical row 是否与 envelope identity 同源。
+
+    :param row: EventLog row。
+    :param context: 已校验 candidate 上下文。
+    :returns: 同源时为 ``True``。
+    """
+
+    return (
+        row.event_class is EventClass.CANONICAL_FACT
+        and row.session_id == context.run.session_id
+        and row.run_id == context.run.run_id
+        and row.attempt_id == context.attempt.attempt_id
+        and row.execution_id == context.attempt.execution_id
+    )
+
+
+def _tool_awaiting_payload_matches_wait(
+    payload: Mapping[str, JsonValue], wait_record: WaitRecordRow
+) -> bool:
+    """校验 ``TOOL_AWAITING`` payload 与 wait record 同源。
+
+    :param payload: canonical payload。
+    :param wait_record: active wait record。
+    :returns: 匹配时为 ``True``。
+    """
+
+    try:
+        return (
+            _required_payload_text(payload, field_name="session_id")
+            == wait_record.session_id
+            and _required_payload_text(payload, field_name="run_id")
+            == wait_record.run_id
+            and _required_payload_text(payload, field_name="attempt_id")
+            == wait_record.attempt_id
+            and _required_payload_text(payload, field_name="execution_id")
+            == wait_record.execution_id
+            and _required_payload_text(payload, field_name="wait_id")
+            == wait_record.wait_id
+            and _required_payload_text(payload, field_name="tool_call_id")
+            == wait_record.tool_call_id
+            and _required_payload_text(payload, field_name="tool_name")
+            == wait_record.tool_name
+            and _required_payload_text(payload, field_name="accept_idempotency_key")
+            == wait_record.accept_idempotency_key
+            and _required_payload_text(payload, field_name="adapter_key")
+            == wait_record.adapter_key.value
+            and _required_payload_text(payload, field_name="resume_policy")
+            == wait_record.resume_policy.value
+            and _payload_await_spec_matches_wait(payload, wait_record)
+            and _payload_snapshot_matches_wait(payload, wait_record)
+            and _payload_external_job_matches_wait(payload, wait_record)
+        )
+    except HostDurableError:
+        return False
+
+
+def _run_waiting_payload_matches_wait(
+    payload: Mapping[str, JsonValue],
+    wait_record: WaitRecordRow,
+    tool_awaiting: EventLogRow,
+) -> bool:
+    """校验 ``RUN_WAITING`` payload 与 wait record / TOOL_AWAITING ref 同源。
+
+    :param payload: canonical payload。
+    :param wait_record: active wait record。
+    :param tool_awaiting: ``TOOL_AWAITING`` row。
+    :returns: 匹配时为 ``True``。
+    """
+
+    try:
+        return (
+            _required_payload_text(payload, field_name="session_id")
+            == wait_record.session_id
+            and _required_payload_text(payload, field_name="run_id")
+            == wait_record.run_id
+            and _required_payload_text(payload, field_name="attempt_id")
+            == wait_record.attempt_id
+            and _required_payload_text(payload, field_name="wait_id")
+            == wait_record.wait_id
+            and _payload_event_ref_matches(
+                payload, field_name="tool_awaiting_event_ref", row=tool_awaiting
+            )
+        )
+    except HostDurableError:
+        return False
+
+
+def _attempt_suspended_payload_matches_wait(
+    payload: Mapping[str, JsonValue],
+    wait_record: WaitRecordRow,
+    run_waiting: EventLogRow,
+) -> bool:
+    """校验 ``ATTEMPT_SUSPENDED`` payload 与 wait record / RUN_WAITING ref 同源。
+
+    :param payload: canonical payload。
+    :param wait_record: active wait record。
+    :param run_waiting: ``RUN_WAITING`` row。
+    :returns: 匹配时为 ``True``。
+    """
+
+    try:
+        return (
+            _required_payload_text(payload, field_name="session_id")
+            == wait_record.session_id
+            and _required_payload_text(payload, field_name="run_id")
+            == wait_record.run_id
+            and _required_payload_text(payload, field_name="attempt_id")
+            == wait_record.attempt_id
+            and _required_payload_text(payload, field_name="execution_id")
+            == wait_record.execution_id
+            and _required_payload_text(payload, field_name="wait_id")
+            == wait_record.wait_id
+            and _required_payload_text(payload, field_name="tool_call_id")
+            == wait_record.tool_call_id
+            and _payload_event_ref_matches(
+                payload, field_name="run_waiting_event_ref", row=run_waiting
+            )
+        )
+    except HostDurableError:
+        return False
+
+
+def _payload_await_spec_matches_wait(
+    payload: Mapping[str, JsonValue], wait_record: WaitRecordRow
+) -> bool:
+    """校验 payload 中的 await spec 与 wait record 一致。
+
+    :param payload: ``TOOL_AWAITING`` payload。
+    :param wait_record: active wait record。
+    :returns: 匹配时为 ``True``。
+    """
+
+    value = payload.get("await_spec")
+    if not isinstance(value, Mapping):
+        return False
+    deadline = value.get("deadline")
+    try:
+        expected_deadline = (
+            parse_utc_timestamp(wait_record.deadline_at).isoformat()
+            if wait_record.deadline_at is not None
+            else None
+        )
+    except ValueError:
+        return False
+    return (
+        value.get("await_kind") == wait_record.await_kind
+        and value.get("resume_token") == wait_record.resume_token
+        and deadline == expected_deadline
+    )
+
+
+def _payload_snapshot_matches_wait(
+    payload: Mapping[str, JsonValue], wait_record: WaitRecordRow
+) -> bool:
+    """校验 payload 中的 snapshot ref 与 wait record 一致。
+
+    :param payload: ``TOOL_AWAITING`` payload。
+    :param wait_record: active wait record。
+    :returns: 匹配时为 ``True``。
+    """
+
+    value = payload.get("snapshot_ref")
+    if wait_record.snapshot_ref is None:
+        return value is None
+    if not isinstance(value, Mapping):
+        return False
+    return (
+        value.get("snapshot_id") == wait_record.snapshot_ref.snapshot_id
+        and value.get("captured_at") == wait_record.snapshot_ref.captured_at.isoformat()
+        and value.get("snapshot_digest") == wait_record.snapshot_ref.snapshot_digest
+    )
+
+
+def _payload_external_job_matches_wait(
+    payload: Mapping[str, JsonValue], wait_record: WaitRecordRow
+) -> bool:
+    """校验 payload 中的 external job ref 与 wait record 一致。
+
+    :param payload: ``TOOL_AWAITING`` payload。
+    :param wait_record: active wait record。
+    :returns: 匹配时为 ``True``。
+    """
+
+    value = payload.get("external_job_ref")
+    if wait_record.external_job_ref is None:
+        return value is None
+    if not isinstance(value, Mapping):
+        return False
+    return (
+        value.get("adapter_key") == wait_record.external_job_ref.adapter_key.value
+        and value.get("external_job_id")
+        == wait_record.external_job_ref.external_job_id
+    )
+
+
+def _payload_event_ref_matches(
+    payload: Mapping[str, JsonValue], *, field_name: str, row: EventLogRow
+) -> bool:
+    """校验 payload 中的 EventLog ref 是否指向指定 row。
+
+    :param payload: canonical payload。
+    :param field_name: ref 字段名。
+    :param row: 目标 EventLog row。
+    :returns: 匹配时为 ``True``。
+    """
+
+    value = payload.get(field_name)
+    if not isinstance(value, Mapping):
+        return False
+    return (
+        value.get("event_id") == row.event_id
+        and value.get("event_sequence") == row.event_sequence
+    )
+
+
+def _engine_awaiting_record_mismatch(
+    *,
+    data: ToolAwaitingData | RunSuspendedData,
+    wait_record: WaitRecordRow,
+    tool_awaiting_payload: Mapping[str, JsonValue],
+) -> str | None:
+    """比较 Engine awaiting record 与 Host accepted wait record。
+
+    :param data: Engine waiting event data。
+    :param wait_record: active wait record。
+    :param tool_awaiting_payload: ``TOOL_AWAITING`` canonical payload。
+    :returns: 不匹配原因；匹配时为 ``None``。
+    """
+
+    if isinstance(data, ToolAwaitingData):
+        record = data.record
+        iteration_id = data.iteration_id
+    else:
+        if data.reason != RUN_SUSPENDED_REASON_TOOL_AWAITING:
+            return "run_suspended_reason_mismatch"
+        if len(data.awaiting_records) != 1:
+            return "run_suspended_awaiting_record_count_mismatch"
+        record = data.awaiting_records[0]
+        iteration_id = record.batch_snapshot.iteration_id
+    if record.batch_snapshot.iteration_id != iteration_id:
+        return "awaiting_iteration_mismatch"
+    if tool_awaiting_payload.get("iteration_id") != iteration_id:
+        return "awaiting_iteration_mismatch"
+    if (
+        record.call.tool_call_id != wait_record.tool_call_id
+        or record.call.name != wait_record.tool_name
+    ):
+        return "awaiting_tool_identity_mismatch"
+    if (
+        record.await_spec.await_kind.value != wait_record.await_kind
+        or record.await_spec.resume_token != wait_record.resume_token
+    ):
+        return "awaiting_spec_mismatch"
+    try:
+        deadline_at = (
+            format_utc_timestamp(record.await_spec.deadline)
+            if record.await_spec.deadline is not None
+            else None
+        )
+    except ValueError:
+        return "awaiting_deadline_mismatch"
+    if deadline_at != wait_record.deadline_at:
+        return "awaiting_deadline_mismatch"
+    if not _engine_snapshot_matches_wait(record.snapshot, wait_record):
+        return "awaiting_snapshot_mismatch"
+    return None
+
+
+def _engine_snapshot_matches_wait(
+    snapshot: ToolAwaitSnapshot | None, wait_record: WaitRecordRow
+) -> bool:
+    """校验 Engine awaiting snapshot 与 wait record snapshot ref 一致。
+
+    :param snapshot: Engine ``ToolAwaitSnapshot`` 或 ``None``。
+    :param wait_record: active wait record。
+    :returns: 匹配时为 ``True``。
+    """
+
+    if snapshot is None:
+        return wait_record.snapshot_ref is None
+    if wait_record.snapshot_ref is None:
+        return False
+    return (
+        snapshot.snapshot_id == wait_record.snapshot_ref.snapshot_id
+        and snapshot.captured_at == wait_record.snapshot_ref.captured_at
+    )
 
 
 def _event_id(
