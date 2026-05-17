@@ -223,8 +223,8 @@ Phase Map 中每个 phase 必须使用统一条目格式。模板如下：
 约束：本节只保留当前 gate 结论；phase 过程流水必须归档到 `历史记录`，仍需追踪的风险或后续 owner 必须写入 `Open Questions 与风险追踪` 的 `追踪区`。
 
 当前 work unit：P9.5 Pre-P10 Cross-Repository Hardening PR。
-当前 gate：P9.5 design discussion accepted。
-下一 gate：P9.5 implementation-ready handoff plan。
+当前 gate：P9.5 implementation-ready handoff plan accepted。
+下一 gate：P9.5 S0 Controller Preflight And Scope Lock implementation。
 
 ## Phase Map
 
@@ -2032,6 +2032,25 @@ P9.5 收口清单：
 - 当前无 PR review blocking fix。
 
 ## 历史记录
+
+### 2026-05-17 P9.5 implementation-ready plan accepted
+
+P9.5 Pre-P10 Cross-Repository Hardening PR implementation-ready handoff plan 已生成并通过双路 plan review、controller
+adjudication、plan fix 与双路 re-review。Plan artifact 为 `docs/host/p9-5-pre-p10-hardening-plan.md`。
+
+Plan review artifacts：
+- AgentMiMo：`docs/reviews/p9-5-plan-review-mimo-20260517.md`
+- AgentDS：`docs/reviews/p9-5-plan-review-ds-20260517.md`
+- Controller adjudication：`docs/reviews/p9-5-plan-review-controller-adjudication-20260517.md`
+
+Plan re-review artifacts：
+- AgentMiMo：`docs/reviews/p9-5-plan-re-review-mimo-20260517.md`
+- AgentDS：`docs/reviews/p9-5-plan-re-review-ds-20260517.md`
+- Controller adjudication：`docs/reviews/p9-5-plan-re-review-controller-adjudication-20260517.md`
+
+Controller 裁决：AgentDS F1 / F2 作为 required plan fix 接受并已修复；其余 accepted non-blocking guidance 已写回
+plan。两份 re-review 均确认 accepted findings fixed，new blockers 为 0。当前 gate 为 P9.5 accepted plan commit；
+commit 后进入 P9.5 S0 Controller Preflight And Scope Lock implementation。
 
 ### 2026-05-17 P9.5 design discussion accepted
 
