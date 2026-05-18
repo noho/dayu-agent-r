@@ -223,8 +223,8 @@ Phase Map 中每个 phase 必须使用统一条目格式。模板如下：
 约束：本节只保留当前 gate 结论；phase 过程流水必须归档到 `历史记录`，仍需追踪的风险或后续 owner 必须写入 `Open Questions 与风险追踪` 的 `追踪区`。
 
 当前 work unit：Phase 10. Context Governance / Compaction。
-当前 gate：Phase 10 Slice 2 implementation。
-下一 gate：Phase 10 Slice 2 implementation review。
+当前 gate：Phase 10 Slice 3 implementation。
+下一 gate：Phase 10 Slice 3 implementation review。
 
 ## Phase Map
 
@@ -2042,6 +2042,35 @@ P9.5 收口清单：
 - 当前无 PR review blocking fix。
 
 ## 历史记录
+
+### 2026-05-18 Phase 10 S2 Compaction Contracts accepted
+
+Phase 10 S2 Compactor Contracts / Fake Compactor / Quality Check / Artifact Store 已完成。Implementation
+artifact 为 `docs/reviews/phase10-s2-compaction-contracts-implementation-20260518.md`。Code review artifacts 为
+`docs/reviews/phase10-s2-code-review-mimo-20260518.md` 与
+`docs/reviews/phase10-s2-code-review-ds-20260518.md`。
+
+Controller 裁决：AgentMiMo review 为 PASS，AgentDS review 为 CHANGES_REQUESTED。Controller 接受 DS B1、
+M1、M2 与 residual R2 为当前 slice fix items：`CompactionRequest.__post_init__` 必须先校验
+`CurrentMessageSummary` 类型再访问属性；非法 current-message-summary 类型、`CompactQualityCheckResult`
+accepted/rejected invariant 必须有直测；reactive compaction request 必须携带非空 `attempt_id` 与
+`execution_id`，proactive compact 可省略。Fix artifact 为
+`docs/reviews/phase10-s2-code-review-fix-codex-20260518.md`。Re-review artifacts 为
+`docs/reviews/phase10-s2-code-rereview-mimo-20260518.md` 与
+`docs/reviews/phase10-s2-code-rereview-ds-20260518.md`；两份 re-review 均 PASS，remaining blocking / high
+findings 为 0。Controller adjudication artifact 为
+`docs/reviews/phase10-s2-code-review-controller-adjudication-20260518.md`。
+
+S2 交付：新增 Host typed compactor contract、deterministic fake compactor、quality checker、compact artifact
+store 与 focused tests。Quality checker 拒绝丢失当前用户输入、丢失 accepted tool fact refs、summary 伪造
+verified fact、缺 preservation evidence、evidence anchor 未保留、pinned patch 三态非法或引用未知 evidence。
+Compact artifact store 只写 canonical JSON artifact 与 payload descriptor，不写 EventLog；fake compactor 只允许
+测试 / 本地开发显式注入。README 同步：`dayu/host/README.md` 与 `tests/README.md` 已记录当前实现事实与测试入口。
+
+Validation：`pytest tests/host/test_compaction_contract.py tests/host/test_compact_artifact_store.py -q` 17 passed；
+`pyright` 0 errors / 0 warnings / 0 informations；`git diff --check` clean。当前 gate 进入 Phase 10 S3 Canonical
+Compact Events And P9 Memory Projection Consumption implementation。Accepted slice commit 在本条记录提交后由 git
+commit 记录。
 
 ### 2026-05-18 Phase 10 S1 Context Budget Policy accepted
 
