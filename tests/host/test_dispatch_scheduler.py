@@ -646,6 +646,73 @@ class _ReactiveRecoveryWorkerFactory:
         return _ReactiveRecoveryWorker(self)
 
 
+class _FinalAnswerWorker:
+    """接受请求后立即返回 final_answer 的 fake worker。"""
+
+    def __init__(self, factory: "_FinalAnswerWorkerFactory") -> None:
+        """初始化 worker。
+
+        :param factory: 所属 factory。
+        :returns: ``None``。
+        """
+
+        self._factory = factory
+
+    async def accept(
+        self, snapshot: AttemptDispatchSnapshot, request: AgentRunRequest
+    ) -> LocalWorkerHandle:
+        """记录请求并返回 final_answer handle。
+
+        :param snapshot: dispatch snapshot。
+        :param request: Engine request。
+        :returns: scripted final answer handle。
+        """
+
+        self._factory.accepted_snapshots.append(snapshot)
+        self._factory.accepted_requests.append(request)
+        return _SnapshotEventHandle(
+            snapshot,
+            EngineEvent(
+                occurred_at=_NOW,
+                session_id=snapshot.session_id,
+                run_id=snapshot.run_id,
+                type=EngineEventType.FINAL_ANSWER,
+                data=FinalAnswerData(
+                    content=f"final:{snapshot.run_id}",
+                    filtered=False,
+                    degraded=False,
+                    finish_reason=FinishReason.STOP,
+                ),
+                metadata=None,
+            ),
+        )
+
+
+class _FinalAnswerWorkerFactory:
+    """按真实 dispatch 接受顺序记录 Engine request 的 fake factory。"""
+
+    def __init__(self) -> None:
+        """初始化 factory。
+
+        :returns: ``None``。
+        """
+
+        self.created = 0
+        self.accepted_snapshots: list[AttemptDispatchSnapshot] = []
+        self.accepted_requests: list[AgentRunRequest] = []
+
+    def create_worker(self, snapshot: AttemptDispatchSnapshot) -> LocalEngineWorker:
+        """创建 final answer worker。
+
+        :param snapshot: dispatch snapshot。
+        :returns: fake worker。
+        """
+
+        del snapshot
+        self.created += 1
+        return _FinalAnswerWorker(self)
+
+
 class _CountingTool:
     """测试用业务工具 callable。"""
 
@@ -2015,6 +2082,108 @@ async def test_pre_start_governance_corrupted_compact_count_fails_closed(
 
 
 @pytest.mark.asyncio
+async def test_multi_turn_proactive_compact_feeds_subsequent_run_input(
+    tmp_path: Path,
+) -> None:
+    """多轮 Run 经 proactive compact 后把 compact memory 注入后续 Engine request。"""
+
+    factory = _FinalAnswerWorkerFactory()
+    with open_host_durable_store(_options(tmp_path)) as store:
+        scheduler = await _open_scheduler(
+            tmp_path,
+            store,
+            factory,
+            context_budget_policy=_soft_compact_policy(),
+            context_compactor=FakeContextCompactor(),
+            compact_artifact_root=tmp_path / "compact-artifacts",
+        )
+        try:
+            first = await _dispatch_accepted_final_run(
+                scheduler=scheduler,
+                store=store,
+                factory=factory,
+                run_id="run-multi-turn-1",
+                display_text="first raw turn for memory",
+                expected_request_count=1,
+            )
+            assert first.session_id != ""
+
+            await _dispatch_accepted_final_run(
+                scheduler=scheduler,
+                store=store,
+                factory=factory,
+                run_id="run-multi-turn-2",
+                display_text="follow-up under budget",
+                expected_request_count=2,
+            )
+            second_contents = tuple(
+                _message_text(message)
+                for message in factory.accepted_requests[1].messages
+            )
+            assert "first raw turn for memory" in second_contents
+            assert second_contents[-1] == "follow-up under budget"
+
+            compacted = await _dispatch_accepted_final_run(
+                scheduler=scheduler,
+                store=store,
+                factory=factory,
+                run_id="run-multi-turn-3",
+                display_text=_soft_threshold_prompt(),
+                expected_request_count=3,
+            )
+            event_types = _event_types_for_run(
+                store.transaction_runner, compacted.run_id
+            )
+            compacted_request_contents = tuple(
+                content
+                for content in (
+                    _message_text(message)
+                    for message in factory.accepted_requests[2].messages
+                )
+                if content is not None
+            )
+            assert event_types.index(CONTEXT_COMPACTED) < event_types.index(
+                "RUN_STARTED"
+            )
+            assert _content_index(
+                compacted_request_contents,
+                "Accepted compact artifact is available for this run.",
+            ) < len(compacted_request_contents) - 1
+            assert compacted_request_contents[-1] == _soft_threshold_prompt()
+
+            await _dispatch_accepted_final_run(
+                scheduler=scheduler,
+                store=store,
+                factory=factory,
+                run_id="run-multi-turn-4",
+                display_text="after compact prompt",
+                expected_request_count=4,
+            )
+            after_compact_contents = tuple(
+                content
+                for content in (
+                    _message_text(message)
+                    for message in factory.accepted_requests[3].messages
+                )
+                if content is not None
+            )
+            joined = "\n\n".join(after_compact_contents)
+            goal_index = _content_index(after_compact_contents, "current_goal=")
+            raw_index = after_compact_contents.index("follow-up under budget")
+            episode_index = _content_index(
+                after_compact_contents, "Memory episode summaries:"
+            )
+
+            assert "current_goal=" in joined
+            assert "confirmed_subject=subject:" in joined
+            assert "title=Session " in joined
+            assert goal_index < raw_index < episode_index
+            assert after_compact_contents[-1] == "after compact prompt"
+        finally:
+            await scheduler.close()
+
+
+@pytest.mark.asyncio
 async def test_reactive_overflow_recovers_and_dispatches_new_attempt(
     tmp_path: Path,
 ) -> None:
@@ -2746,6 +2915,77 @@ async def _wait_for_run_status(
     )
     assert row is not None
     raise AssertionError(f"run status did not converge: {row.status.value}")
+
+
+async def _dispatch_accepted_final_run(
+    *,
+    scheduler: HostDispatchScheduler,
+    store: HostDurableStore,
+    factory: _FinalAnswerWorkerFactory,
+    run_id: str,
+    display_text: str,
+    expected_request_count: int,
+) -> _AcceptedSeededRun:
+    """创建 accepted Run，经 scheduler gate dispatch，并等待 final_answer 收口。
+
+    :param scheduler: Host dispatch scheduler。
+    :param store: durable store。
+    :param factory: 记录 Engine request 的 final-answer worker factory。
+    :param run_id: 新 Run id。
+    :param display_text: 当前用户输入文本。
+    :param expected_request_count: 期望累计 accept 次数。
+    :returns: accepted Run 摘要。
+    :raises AssertionError: dispatch 或状态收口未在测试时间内完成时抛出。
+    """
+
+    seeded = _seed_accepted_run(
+        store,
+        run_id=run_id,
+        display_text=display_text,
+    )
+    scheduler.wake_queue_promotion(seeded.session_id)
+    await _wait_for_final_request_count(factory, expected_request_count)
+    await _wait_for_run_status(
+        store.transaction_runner,
+        seeded.run_id,
+        expected_run=RunStatus.SUCCEEDED,
+    )
+    return seeded
+
+
+async def _wait_for_final_request_count(
+    factory: _FinalAnswerWorkerFactory, expected_count: int
+) -> None:
+    """等待 final-answer worker factory 接受指定次数。
+
+    :param factory: final-answer worker factory。
+    :param expected_count: 期望累计 accept 次数。
+    :returns: ``None``。
+    :raises AssertionError: 超时未达到次数时抛出。
+    """
+
+    for _index in range(200):
+        if len(factory.accepted_requests) >= expected_count:
+            return
+        await asyncio.sleep(0.01)
+    raise AssertionError(
+        f"worker request count did not converge: {len(factory.accepted_requests)}"
+    )
+
+
+def _content_index(contents: tuple[str, ...], expected_fragment: str) -> int:
+    """返回包含指定片段的 message index。
+
+    :param contents: Engine request message 文本。
+    :param expected_fragment: 需要查找的文本片段。
+    :returns: 第一个匹配 index。
+    :raises AssertionError: 找不到片段时抛出。
+    """
+
+    for index, content in enumerate(contents):
+        if expected_fragment in content:
+            return index
+    raise AssertionError(f"message fragment not found: {expected_fragment}")
 
 
 async def _wait_for_accepted_snapshot_count(

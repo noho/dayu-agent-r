@@ -528,6 +528,8 @@ def _command_options(tmp_path: Path) -> HostCommandHandleOptions:
         sqlite_write_retry_backoff_multiplier=1.2,
         sqlite_write_retry_max_delay_seconds=0.02,
         payload_inline_threshold_bytes=4096,
+        context_window_size=8192,
+        reserved_output_tokens=1024,
     )
 
 

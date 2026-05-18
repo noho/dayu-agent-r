@@ -26,7 +26,11 @@ from dayu.engine.contracts.agent_policy import AgentPolicy
 from dayu.engine.contracts.agent_run import AgentRunRequest
 from dayu.engine.contracts.engine_events import EngineEvent
 from dayu.engine.contracts.runner_spec import RunnerCallOptions, RunnerSpec
-from dayu.host.context_policy import ContextBudgetPolicy
+from dayu.host.context_policy import (
+    ContextBudgetPolicy,
+    DEFAULT_MINIMUM_PROTECTION_TOKENS,
+    default_context_budget_policy,
+)
 from dayu.host.compaction import ContextCompactor
 from dayu.host._public_validation import (
     require_non_empty as _require_non_empty,
@@ -1148,6 +1152,10 @@ class HostCommandHandleOptions:
     - ``sqlite_write_retry_backoff_multiplier``：写重试退避倍率。
     - ``sqlite_write_retry_max_delay_seconds``：写重试最大等待秒数。
     - ``payload_inline_threshold_bytes``：payload 内联存储阈值字节数。
+    - ``context_window_size``：Host Context Governance 输入窗口 token 数。
+    - ``reserved_output_tokens``：Host Context Governance 输出预留 token 数。
+    - ``context_budget_hard_threshold_tokens``：可选 hard threshold；``None`` 时按 policy 默认计算。
+    - ``context_budget_minimum_protection_tokens``：可选最小保护 token；``None`` 时按 policy 默认计算。
     - ``local_execution``：本地执行配置；``None`` 保持 no-op dispatch wakeup。
     """
 
@@ -1161,6 +1169,10 @@ class HostCommandHandleOptions:
     sqlite_write_retry_backoff_multiplier: float
     sqlite_write_retry_max_delay_seconds: float
     payload_inline_threshold_bytes: int
+    context_window_size: int
+    reserved_output_tokens: int
+    context_budget_hard_threshold_tokens: int | None = None
+    context_budget_minimum_protection_tokens: int | None = None
     local_execution: HostLocalExecutionOptions | None = None
 
     def __post_init__(self) -> None:
@@ -1225,6 +1237,31 @@ class HostCommandHandleOptions:
                 "HostCommandHandleOptions.payload_inline_threshold_bytes"
             ),
         )
+        _validate_command_context_budget_fields(self)
+
+
+def _validate_command_context_budget_fields(
+    options: HostCommandHandleOptions,
+) -> None:
+    """校验 command handle 上的 context budget typed 输入。
+
+    :param options: Host command handle options。
+    :returns: ``None``。
+    :raises TypeError: 整数字段类型非法时抛出。
+    :raises ValueError: 预算字段非法时抛出。
+    """
+
+    minimum_protection_tokens = (
+        options.context_budget_minimum_protection_tokens
+        if options.context_budget_minimum_protection_tokens is not None
+        else DEFAULT_MINIMUM_PROTECTION_TOKENS
+    )
+    default_context_budget_policy(
+        context_window_size=options.context_window_size,
+        reserved_output_tokens=options.reserved_output_tokens,
+        hard_threshold_tokens=options.context_budget_hard_threshold_tokens,
+        minimum_protection_tokens=minimum_protection_tokens,
+    )
 
 
 @dataclass(frozen=True, slots=True)

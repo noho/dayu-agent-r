@@ -223,8 +223,8 @@ Phase Map 中每个 phase 必须使用统一条目格式。模板如下：
 约束：本节只保留当前 gate 结论；phase 过程流水必须归档到 `历史记录`，仍需追踪的风险或后续 owner 必须写入 `Open Questions 与风险追踪` 的 `追踪区`。
 
 当前 work unit：Phase 10. Context Governance / Compaction。
-当前 gate：Phase 10 Slice 6 implementation。
-下一 gate：Phase 10 Slice 6 implementation review。
+当前 gate：Phase 10 aggregate deepreview。
+下一 gate：Phase 10 aggregate deepreview review / fix loop。
 
 ## Phase Map
 
@@ -1518,6 +1518,27 @@ P9.5 收口清单：
 - `RECOVERING` cancel、startup recovery scan、positive orphan proof 和通用 recovery scan 不属于 P10 S5；Phase 11
   Host Lifecycle / Recovery / Multi-process Hardening 必须接管。
 
+#### Phase 10 S6 Production Composition / Multi-turn Integration 残余风险追踪
+
+背景决议：
+
+- Phase 10 S6 已实现 command-level explicit budget input、composition helper、multi-turn proactive compact aggregate
+  integration 与 README 同步。
+- S6 initial review 中 DS F2 / F4 被 controller 接受为当前 slice fix item 并已修复；re-review 中 AgentMiMo 与
+  AgentDS 均 PASS。Controller 接受 F1 / F3 为 residual，不作为 S6 当前阻塞项。
+
+追踪项：
+
+- `compose_host_local_execution_options(...)` 是 Host 层 public composition helper；真实 Service / composition root
+  caller 尚未在 Host 包内实现。后续 production composition owner 必须显式调用该 helper 或等价 typed wiring，
+  不能从 Engine spec、per-run metadata 或 caller payload 读取预算参数。
+- 真实 production LLM compactor adapter 未在 S6 默认注入。production composition owner 必须显式提供
+  `ContextCompactor` 实现；未配置 compactor 时继续 fail closed，不得隐式使用 `FakeContextCompactor`。
+- S6 aggregate multi-turn test 串起 proactive compact -> memory projection -> subsequent Engine request，但完整业务工具
+  verified fact public fake-worker 链路仍由 ToolRuntime accept、memory projection 与 RunInputBuilder 的分层测试覆盖；
+  aggregate review 若要求更高保真业务工具 E2E，应作为 Phase 10 aggregate fix item，而不是把 fake compactor 注入
+  生产默认路径。
+
 #### P9.5 Pre-P10 Cross-Repository Hardening PR 归属追踪
 
 背景决议：
@@ -2077,6 +2098,39 @@ P9.5 收口清单：
 - 当前无 PR review blocking fix。
 
 ## 历史记录
+
+### 2026-05-18 Phase 10 S6 Production Composition / Multi-turn Integration accepted
+
+Phase 10 S6 Production Composition Wiring / Multi-turn Integration / Docs Sync 已完成。Implementation artifact 为
+`docs/reviews/phase10-s6-production-composition-integration-implementation-20260518.md`。Initial code review artifacts
+为 `docs/reviews/phase10-s6-code-review-mimo-20260518.md` 与
+`docs/reviews/phase10-s6-code-review-ds-20260518.md`。
+
+Controller 裁决：AgentMiMo review 为 PASS；AgentDS review 为 PASS_WITH_RESIDUAL，但提出两个 medium finding。
+Controller 接受 DS F2 / F4 为当前 slice fix item：`HostCommandHandleOptions.context_window_size` 与
+`reserved_output_tokens` 必须是 composition root 显式 typed input，不得有 production 默认值；Phase 10 必须补一个
+multi-turn aggregate integration test 串起 proactive compact、memory projection catch-up 与 subsequent Engine request。
+Controller 接受 DS F1 / F3 为 residual：composition helper 不由同步 command factory 隐式调用，production helper 不默认注入
+fake compactor。Fix artifact 为 `docs/reviews/phase10-s6-review-fix-codex-20260518.md`。
+
+Re-review artifacts 为 `docs/reviews/phase10-s6-code-rereview-mimo-20260518.md` 与
+`docs/reviews/phase10-s6-code-rereview-ds-20260518.md`；两份 re-review 均 PASS，remaining blocking / high /
+medium findings 为 0。Controller adjudication artifact 为
+`docs/reviews/phase10-s6-code-review-controller-adjudication-20260518.md`。
+
+S6 交付：`HostCommandHandleOptions` 新增必填 `context_window_size` 与 `reserved_output_tokens`，可选
+hard threshold / minimum protection tokens；`compose_host_local_execution_options(...)` 从 command options 构造 typed
+`ContextBudgetPolicy` 并注入 compact artifact root，保持 memory projection policy 与 context budget policy 分离；
+新增 multi-turn aggregate integration 覆盖 follow-up under budget raw turn、soft threshold proactive compact、
+`CONTEXT_COMPACTED` pre-start ordering、compact artifact provider 与 subsequent Run memory 注入。
+
+Validation：`pytest tests/host/test_public_contracts.py tests/host/test_phase5_local_execution_integration.py
+tests/host/test_dispatch_scheduler.py -q` 81 passed；`pytest tests/host/test_context_budget.py
+tests/host/test_compaction_contract.py tests/host/test_compact_artifact_store.py tests/host/test_context_compact_events.py
+tests/host/test_memory_projection.py tests/host/test_run_input_builder.py tests/host/test_engine_ingest_mapping.py
+tests/host/test_run_attempt_transitions.py -q` 180 passed；`pyright` 0 errors / 0 warnings / 0 informations；
+`git diff --check` clean。当前 gate 进入 Phase 10 aggregate deepreview。Accepted slice commit 在本条记录提交后由
+git commit 记录。
 
 ### 2026-05-18 Phase 10 S5 Reactive Overflow Recovery accepted
 
