@@ -4,32 +4,32 @@
 
 ## 当前公共命名空间
 
-`dayu.host` 当前提供 Host 公共 API 的类型契约、Session / Run public command facade、Host construction 的业务工具输入边界、本地执行配置契约、ToolRuntime typed boundary、本地 dispatch scheduler 与 LocalProxy 基线能力，供 UI / Service 按 `UI -> Service -> Host -> Engine` 的依赖方向向下引用。
+`dayu.host` 包根当前提供普通 Service-facing 的 Host public contract：`open_host(options)` opener、异步 `Host` / `HostHandle` 协议、`OpenHostOptions`、普通 Run / compactor 执行基线、Host-owned typed `HostEvent` 终态视图、生命周期异常 `HostClosedError`、Session / Run request / snapshot 类型，以及 Host construction 的业务工具输入边界。低层同步 command handle、run-level event 补读与本地执行装配仍保留在内部模块路径，普通 Service 不应从包根依赖这些名字。
 
 当前包根导出包含以下类型：
 
 - constants：`HOST_EVENT_STREAM_DEFAULT_LIMIT`、`HOST_EVENT_STREAM_MAX_LIMIT`，以及 wait record / wait adapter / wait snapshot / external job / payload ref 的公共长度上限常量。
-- status / enum：`SessionStatus`、`RunStatus`、`AttemptStatus`、`FollowupBehavior`、`CancelMode`、`WaitResolutionSource`、`SourceRunRelation`、`HostEventClass`、`HostApiErrorCode`。
+- status / enum：`SessionStatus`、`RunStatus`、`AttemptStatus`、`FollowupBehavior`、`CancelMode`、`WaitResolutionSource`、`SourceRunRelation`、`HostEventClass`、`HostEventKind`、`HostTerminalStatus`、`HostApiErrorCode`。
 - context / input：`OperationContext`、`AuthorizationClaim`、`HostCallContext`、`HostMetadataEntry`、`HostInput`、`SessionSlotRef`、`HostStreamCursor`、`HostPayloadRef`。
-- command handle：`HostCommandHandle`、`create_host_command_handle`、`HostCommandFacet`；public handle 只暴露稳定 `host_handle_id` 与幂等 `close()`，不暴露 durable store、transaction runner、store connection 或 admission service。
-- command handle options：`HostCommandHandleOptions`，显式描述 Host command handle 的 durable DB、artifact root、SQLite timeout / retry、payload inline threshold、必填 context window / reserved output token budget 与可选本地执行构造选项。
-- local execution options：`HostLocalExecutionOptions`、`LocalWorkerHandle`、`LocalEngineWorker`、`LocalEngineWorkerFactory`，描述 Host 本地 dispatch scheduler 接入 runtime lane、Runner 配置、Agent policy、context budget policy、conversation memory policy 与 LocalProxy worker factory 的 typed 边界。
+- opener / handle：`open_host`、`OpenHostOptions`、`OrdinaryRunExecutionBaseline`、`CompactorExecutionBaseline`、`Host`、`HostHandle`、`HostClosedError`。
+- command handle options：`HostCommandHandleOptions`、`HostCommandFacet`；低层 command handle factory 不再由包根作为普通 Service-facing 入口导出。
+- local worker protocols：`LocalWorkerHandle`、`LocalEngineWorker`、`LocalEngineWorkerFactory`，用于 typed construction boundary；`HostLocalExecutionOptions` 是内部本地执行装配类型，不再进入包根 `__all__`。
 - Session facade：`ensure_session`、`create_session`、`get_session`、`close_session`，均返回 `SessionSnapshot`。
-- Run facade：`start_run`、`submit_followup`、`get_run`、`stream_run_events`、`cancel_run`、`cancel_session_runs`；当前 command 路径覆盖 admission、pending dispatch wakeup、本地 no-tool dispatch baseline 与 active worker cancel 子集，读取路径只使用 durable Run / EventLog truth。
+- Run facade：`submit_followup`、`get_run`、`cancel_run`、`cancel_session_runs`；`start_run` 与 run-level `stream_run_events` 已降级为低层 / diagnostic 路径，不再进入包根 `__all__` 的普通 Service-facing contract。
 - Wait facade：`resolve_wait` 接收 active wait result，并按 outcome 原子恢复或收口等待中的 Run。
 - deferred facade：`retry_run`、`replay_run`、`purge_session` 当前是 stable unsupported public functions，固定返回 `UNSUPPORTED_OPERATION`，不追加 EventLog，也不写 idempotency record。
 - requests：`EnsureSessionRequest`、`CreateSessionRequest`、`CloseSessionRequest`、`PurgeSessionRequest`、`StartRunRequest`、`CancelRunRequest`、`CancelSessionRunsRequest`、`SubmitFollowupRequest`、`RetryRunRequest`、`ReplayRunRequest`、`ResolveWaitRequest`，以及 `ResolveWaitCompletedOutcome`、`ResolveWaitFailedOutcome`、`ResolveWaitCancelledOutcome`、`ResolveWaitLostOutcome`、`WaitAdapterKey`、`WaitProviderStatusRef`。
-- snapshots / stream：`TerminalResultSummary`、`OutboxSummary`、`SessionSnapshot`、`RunSnapshot`、`FollowupSnapshot`、`PurgeSessionResult`、`HostEventView`、`HostEventStream`。
+- snapshots / event：`TerminalResultSummary`、`OutboxSummary`、`SessionSnapshot`、`RunSnapshot`、`FollowupSnapshot`、`PurgeSessionResult`、`HostFinalAnswerView`、`HostEvent`。
 - error：`HostApiError`、`HostApiErrorDetail`、`SteerConflictDetail`。
 - tooling construction options：`ToolBundleSourceKind`、`FrameworkToolName`、`ToolBundleSourceRef`、`FrameworkToolPolicyView`、`HostToolingOptions`、`default_framework_tool_policy_view`。
 
-`dayu.host.api.__all__` 包含 request、snapshot、status、error、context、stream cursor 与本地执行配置契约类型。Session / Run read facade 位于 `dayu.host.read_api`，Session / Run command facade、Wait command facade 与 deferred facade 位于 `dayu.host.command`，并由包根导出，但不进入 `dayu.host.api`。Host construction tooling 类型位于 `dayu.host.tooling`，由包根导出，但不进入 `dayu.host.api`。
+`dayu.host.api.__all__` 包含 request、snapshot、status、error、context、stream cursor、public opener options、HostEvent typed view 与低层本地执行配置契约类型。Session / Run read facade 位于 `dayu.host.read_api`，Session / Run command facade、Wait command facade 与 deferred facade 位于 `dayu.host.command`；普通 Service-facing 包根导出只保留 P10.5 Slice 1 冻结的入口。Host construction tooling 类型位于 `dayu.host.tooling`，由包根导出，但不进入 `dayu.host.api`。
 
-## Public Session Command Path
+## Low-level Session Command Path
 
-`create_host_command_handle(options, active_registry=None)` 会根据 `HostCommandHandleOptions` 打开 fresh/bootstrap 后的 Host durable SQLite store，并装配内部 no-op admission service 与 active worker cancel registry。`active_registry=None` 会为当前 command handle 创建 fresh registry，不与其它 handle 或 scheduler 共享；需要 active worker cancel 跨 command handle 与 scheduler 传播时，生产 composition root 必须把同一个 `ActiveWorkerRegistry` 对象同时传给 `create_host_command_handle(..., active_registry=...)` 与 `HostDispatchScheduler.open(..., active_registry=...)`。该同步 factory 当前不消费 `local_execution`，传入非空 `HostCommandHandleOptions.local_execution` 会 fail fast；本地 scheduler 需要由调用方显式 `await HostDispatchScheduler.open(...)` 装配和关闭，避免在同步 command handle 内隐藏 async worker lifecycle。production composition root 必须显式传入 `HostCommandHandleOptions.context_window_size` 与 `reserved_output_tokens`；`compose_host_local_execution_options(options)` 供 production composition root 在打开 scheduler 前把 command options 中的这两个必填值、可选 hard threshold 与 minimum protection tokens 转为 typed `ContextBudgetPolicy`，并把 command artifact root 作为 compact artifact root 注入本地执行配置；它不读取 Engine spec、per-run metadata、caller payload 或 provider overflow budget。该 handle 是 public facade 的 opaque command handle；关闭 handle 后再次调用 public facade 会返回 `HostApiError(code=INVALID_STATE, retryable=False)`。
+`create_host_command_handle(options, active_registry=None)` 会根据 `HostCommandHandleOptions` 打开 fresh/bootstrap 后的 Host durable SQLite store，并装配内部 no-op admission service 与 active worker cancel registry。`active_registry=None` 会为当前 command handle 创建 fresh registry，不与其它 handle 或 scheduler 共享；需要 active worker cancel 跨 command handle 与 scheduler 传播时，production composition root 必须把同一个 `ActiveWorkerRegistry` 对象同时传给 `create_host_command_handle(..., active_registry=...)` 与 `HostDispatchScheduler.open(..., active_registry=...)`。该同步 factory 当前不消费 `local_execution`，传入非空 `HostCommandHandleOptions.local_execution` 会 fail fast；本地 scheduler 需要由调用方显式 `await HostDispatchScheduler.open(...)` 装配和关闭，避免在同步 command handle 内隐藏 async worker lifecycle。production composition root 必须显式传入 `HostCommandHandleOptions.context_window_size` 与 `reserved_output_tokens`；`compose_host_local_execution_options(options)` 供 production composition root 在打开 scheduler 前把 command options 中的这两个必填值、可选 hard threshold 与 minimum protection tokens 转为 typed `ContextBudgetPolicy`，并把 command artifact root 作为 compact artifact root 注入本地执行配置；它不读取 Engine spec、per-run metadata、caller payload 或 provider overflow budget。该 handle 是低层 command facade 的 opaque handle；关闭 handle 后再次调用低层 facade 会返回 `HostApiError(code=INVALID_STATE, retryable=False)`。
 
-当前已实现的 Session public facade：
+当前低层 Session command facade：
 
 - `ensure_session(host, request)`：按 `(scope, slot_key)` 原子创建或复用当前 slot Session，返回 durable truth 生成的 `SessionSnapshot`。
 - `create_session(host, request)`：按 `client_request_id` 幂等创建显式新 Session，可选择重绑定 slot；同 key 同 semantic digest 返回同一 Session，同 key 不同 digest 返回 `IDEMPOTENCY_CONFLICT`。
@@ -39,9 +39,9 @@
 public semantic digest 在 facade 边界只使用显式请求字段与 `HostCallContext` 的语义 digest，不包含 runtime-only object、内部依赖或 metadata bag。
 当前 `create_session` public facade 不持久化 `request.metadata`；metadata 持久化语义尚未成为 public contract。`ensure_session` 仍按 durable lifecycle 保存首次创建时的 metadata 摘要。
 
-## Public Run Command Path
+## Low-level Run Command Path
 
-当前已实现的 Run public facade：
+当前低层 Run command facade：
 
 - `start_run(host, request)`：复用 internal admission，支持无 active Run 时 direct `RUNNING`、有 active Run 时按 `queue_policy` 执行 `queue` / `reject` / `attach_active`。`attach_active` 只记录幂等结果并返回当前 active `RunSnapshot`，不追加 canonical attach fact。
 - `submit_followup(host, session_id, request)`：要求路径参数 `session_id` 等于 `request.session_id`。`behavior=queue` 复用 internal `submit_followup_queue`，active 存在时返回 `accepted_run_status=QUEUED`，无 active 时返回 `accepted_run_status=RUNNING`；`behavior=steer` 返回 `UNSUPPORTED_OPERATION` 且不追加 EventLog。

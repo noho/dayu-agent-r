@@ -33,24 +33,34 @@ EXPECTED_API_EXPORTS: frozenset[str] = frozenset(
         "HostApiError",
         "HostApiErrorCode",
         "HostApiErrorDetail",
+        "Host",
         "HostCallContext",
+        "HostClosedError",
         "HostCommandFacet",
         "HostCommandHandleOptions",
+        "HostEvent",
         "HostEventClass",
+        "HostEventKind",
         "HostEventStream",
         "HostEventView",
+        "HostFinalAnswerView",
+        "HostHandle",
         "HostInput",
         "HostLocalExecutionOptions",
         "HostMetadataEntry",
         "HostPayloadRef",
         "HostStreamCursor",
+        "HostTerminalStatus",
         "LocalEngineWorker",
         "LocalEngineWorkerFactory",
         "LocalWorkerHandle",
+        "OpenHostOptions",
         "OperationContext",
+        "OrdinaryRunExecutionBaseline",
         "OutboxSummary",
         "PurgeSessionRequest",
         "PurgeSessionResult",
+        "CompactorExecutionBaseline",
         "ReplayRunRequest",
         "ResolveWaitCancelledOutcome",
         "ResolveWaitCompletedOutcome",
@@ -88,27 +98,34 @@ EXPECTED_TOOLING_EXPORTS: frozenset[str] = frozenset(
 
 EXPECTED_COMMAND_EXPORTS: frozenset[str] = frozenset(
     {
-        "HostCommandHandle",
         "cancel_run",
         "cancel_session_runs",
         "close_session",
-        "create_host_command_handle",
         "create_session",
         "ensure_session",
         "get_run",
         "get_session",
+        "open_host",
         "purge_session",
         "replay_run",
         "resolve_wait",
         "retry_run",
-        "start_run",
-        "stream_run_events",
         "submit_followup",
     }
 )
 
+ROOT_INTERNAL_API_NAMES: frozenset[str] = frozenset(
+    {
+        "HostEventStream",
+        "HostEventView",
+        "HostLocalExecutionOptions",
+    }
+)
+
 EXPECTED_HOST_EXPORTS: frozenset[str] = (
-    EXPECTED_API_EXPORTS | EXPECTED_TOOLING_EXPORTS | EXPECTED_COMMAND_EXPORTS
+    (EXPECTED_API_EXPORTS - ROOT_INTERNAL_API_NAMES)
+    | EXPECTED_TOOLING_EXPORTS
+    | EXPECTED_COMMAND_EXPORTS
 )
 
 FORBIDDEN_HOST_ROOT_EXPORTS: frozenset[str] = frozenset(
@@ -124,6 +141,18 @@ FORBIDDEN_HOST_ROOT_EXPORTS: frozenset[str] = frozenset(
         "ToolRuntimeFactory",
         "ToolRuntimeHandle",
         "open_host_durable_store",
+    }
+)
+
+REMOVED_SERVICE_FACING_ALL_EXPORTS: frozenset[str] = frozenset(
+    {
+        "HostCommandHandle",
+        "HostEventStream",
+        "HostEventView",
+        "HostLocalExecutionOptions",
+        "create_host_command_handle",
+        "start_run",
+        "stream_run_events",
     }
 )
 
@@ -153,7 +182,7 @@ def test_api_all_stays_request_snapshot_boundary() -> None:
 def test_exported_symbols_are_same_objects_as_api_symbols() -> None:
     """api 类型在包根导出时必须直接来自 ``dayu.host.api``。"""
 
-    for name in EXPECTED_API_EXPORTS:
+    for name in EXPECTED_API_EXPORTS - ROOT_INTERNAL_API_NAMES:
         assert vars(host)[name] is vars(api)[name]
 
 
@@ -171,3 +200,9 @@ def test_command_symbols_are_exported_from_package_root_only() -> None:
     for name in EXPECTED_COMMAND_EXPORTS:
         assert name in vars(host)
         assert name not in vars(api)
+
+
+def test_removed_low_level_symbols_are_not_service_facing_all_exports() -> None:
+    """低层历史入口不再进入 ``dayu.host.__all__`` 的 Service-facing 边界。"""
+
+    assert not (REMOVED_SERVICE_FACING_ALL_EXPORTS & frozenset(host.__all__))
