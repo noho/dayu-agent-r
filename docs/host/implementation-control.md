@@ -222,13 +222,15 @@ Phase Map 中每个 phase 必须使用统一条目格式。模板如下：
 
 约束：本节只保留当前 gate 结论；phase 过程流水必须归档到 `历史记录`，仍需追踪的风险或后续 owner 必须写入 `Open Questions 与风险追踪` 的 `追踪区`。
 
-当前 work unit：Phase 10. Context Governance / Compaction。
-当前 gate：draft-PR-pass。
-下一 gate：用户手工 review / merge decision。
+当前 work unit：Phase 10.5. Ordinary Local Multi-turn Public Contract Freeze。
+当前 gate：discussion / challenge review。
+下一 gate：P10.5 public API / contract decision discussion。
+
+当前 gate 事实：Phase 10 已完成；P10.5 已插入 Phase Map，用于冻结普通本地多轮会话的 Host public interface / contract。P10.5 目标与任务清单写入 `docs/host/post-p10.md`。按 `$init-agents` 已派发 challenge review 给在线 review Agent；`AgentMiMo` artifact 为 `docs/reviews/post-p10-public-contract-challenge-mimo-20260518.md`，`AgentDS` artifact 为 `docs/reviews/post-p10-wiring-smoke-challenge-ds-20260518.md`。用户明确授权 `AgentCodex` 作为第三 challenge reviewer，artifact 为 `docs/reviews/post-p10-codex-challenge-20260518.md`。`AgentGLM` 当前未在 `tmux-cli status` 中发现，未派发。三方裁决结论：`docs/host/post-p10.md` 可以作为 P10.5 public API / contract decision discussion 输入，但还不能直接交给 Agent 写 implementation-ready plan，更不能直接 implementation。
 
 ## Phase Map
 
-Phase 按依赖关系推进：先实现被其它阶段依赖的公共契约、runtime 基础能力、durable store、EventLog 与状态机，再连接执行路径、工具治理、projection core、memory、context governance、recovery 与 remote。Audit、Tool Trace、Outbox 是独立 projection sinks，后置到核心治理路径稳定之后实现。Phase 0 是 Engine cleanup 前置 work unit，只阻塞 Phase 10 Context Governance，不阻塞 Phase 1-9。每个 phase 开始时仍必须先和用户讨论并细化对应 `docs/host/design.md` 章节，再生成 handoff implementation-ready plan。
+Phase 按依赖关系推进：先实现被其它阶段依赖的公共契约、runtime 基础能力、durable store、EventLog 与状态机，再连接执行路径、工具治理、projection core、memory、context governance、ordinary local multi-turn public contract freeze、recovery 与 remote。Audit、Tool Trace、Outbox 是独立 projection sinks，后置到核心治理路径稳定之后实现。Phase 0 是 Engine cleanup 前置 work unit，只阻塞 Phase 10 Context Governance，不阻塞 Phase 1-9。每个 phase 开始时仍必须先和用户讨论并细化对应 `docs/host/design.md` 章节，再生成 handoff implementation-ready plan。
 
 ### Phase 0. Engine Context Compaction Event 语义前置
 
@@ -526,7 +528,7 @@ Phase 按依赖关系推进：先实现被其它阶段依赖的公共契约、ru
 - 不实现 dispatching / active worker、`WAITING`、`RECOVERING` 的完整 cancel；不得把 Phase 4 queued / pre-dispatch cancel 子集写成最终语义。
 
 关键设计问题：
-- `submit_followup(queue)` 使用 `accepted_run_id` + `accepted_run_status` 表达 accepted follow-up 结果；无 active Run 时可直接返回新 `RUNNING` Run，不能把 running Run 塞进 `queued_run_id`。
+- `submit_followup(queue)` 使用 `accepted_run_id` + `accepted_run_status` 表达 accepted follow-up 结果；P10 后无 active / start-blocking Run 时返回新 `ACCEPTED` Run，不能把 accepted / running Run 塞进 `queued_run_id`。
 - `HostApiErrorCode` 必须包含 `UNSUPPORTED_OPERATION`；`HostApiError.detail` 是受限 typed detail union，至少包含 steer conflict detail，禁止无结构 extra payload / god bag。
 - `submit_followup(steer)` Phase 4 只冻结 public envelope、validation 与 error/detail contract；完整 steer owner 后续 phase。
 - `stream_run_events` 以全局 EventLog cursor 为 truth，固定 public `limit`、默认 / 最大 limit、run 过滤、empty result `next_cursor` 与 `HostEventView` 映射；Phase 4 不引入 projection truth。
@@ -1167,10 +1169,113 @@ P9.5 收口清单：
 - 后续 phase 可依赖的稳定契约：compact events、compact artifacts、context budget policy view、accepted episode summary / pinned state patch projection contract。
 - 需要追踪到后续 phase 的事项：provider-specific tokenizer adapter、长期 retrieval、public memory edit / reset / forget API、Audit / Tool Trace sinks 是后续能力。
 
+### Phase 10.5. Ordinary Local Multi-turn Public Contract Freeze
+
+目标：
+- 冻结普通本地多轮会话的 Host public interface / contract，查漏补缺生产接线和组件，确保后续真实生产系统 Service 调用 Host public interface / contract 即可完成多轮会话闭环。
+- P10.5 自身必须把真实生产系统 Service 将来接入所需的 Host 普通多轮生产接线做实；真实 CLI / web / GUI 在 P11-P15 实施完毕后会通过 Service 使用 P10.5 冻结的 Host public interface / contract 接入，不能等到真实入口接入时再补一条新接线。后续 P11-P15 仅扩展 Host 能力，不改变普通多轮会话的生产接线。
+- Public contract 面向 Codex / Claude Code 类调用方：打开 Host、取得 / 新建 / 读取 Session、提交 prompt、读取 / 订阅 Session 事件、在 HostEventStream 中观察 terminal final answer、关闭 Host；不得要求上层理解 scheduler、runner、tooling、memory catch-up、wakeup 或 `HostLocalRuntime` 装配细节。
+- P10.5 冻结 async-only Host opener / handle；Service-facing 打开入口名称固定为 `open_host(options)`。不提供 Host 层同步 wrapper，不冻结同步 close / cancel / timeout / stream iteration 语义。CLI 或同步上层如需使用 Host，由 Service / CLI adapter 包装 async contract。
+- `open_host(options)` 的 options 只承载打开 Host、驱动 Host -> Engine 本地运行所需的 construction-time 参数；每次 Run 会变化的参数不得塞进 options，必须进入对应 public request。
+- Session acquisition 和 Run interaction 分离：`ensure_session(...)` / `create_session(...)` / `get_session(...)` 只负责取得 `SessionSnapshot`；拿到 `session_id` 后，第一条 prompt 与后续普通 prompt 都统一使用 `submit_followup(queue)`。`start_run(...)` 从 public namespace 移除，Host 内部 admission primitive 固定命名为 `_start_run(...)`。
+- `create_host_command_handle(...)` 降为 Host 内部 / 低层测试 composition primitive，不作为 Service-facing 打开入口；`HostLocalRuntime` 与 `HostLocalExecutionOptions` 改为内部 contract / implementation type；scheduler / wakeup / dispatch control API 不暴露给 Service。
+- Command mutation 与 event observation 分离：`submit_followup(...)`、`submit_followup(steer)`、`retry_run(...)`、`replay_run(...)` 不要求和 event loop 顺序绑定。设计已确定聊天主入口是 session-level live Host event stream；run-level EventLog 补读 / `HostEventView` 改为内部 diagnostic / detail / debug / drill-down 契约，不进入普通 Service-facing public contract。拿到 / attach Session 前发生的 terminal/final answer 通知由 Outbox 路径承接。Service 拿到 `session_id` 后，用客户端保存的 `last_seen_terminal_event_sequence` / `seen_terminal_event_ids` 去 Outbox 读离线 terminal/final answer 增量，同时或随后打开 `watch_session_events(session_id)`，并用 `terminal_event_id` / `event_sequence` / `run_id` 去重。
+- 补齐 `submit_followup(steer)`、`retry_run(...)`、`replay_run(...)` 的本地 public 语义。当前它们只是 stable unsupported envelope；P10.5 后普通 agent session 的控制输入、失败重试和结构修复不应再没有 owner。
+- memory catch-up 与 context overflow compact 属于 P10.5 查漏补缺范围。普通 Service 不能为了完成多轮闭环而手工装配 memory projection、compact artifact store、scheduler pre-start governance 或 dispatch internals；Host public opener / handle 必须提供明确 construction-time contract 来接收 / 配置 compactor、compactor execution baseline、budget policy、artifact root 和 memory catch-up。Compactor 的模型、温度、max tokens、provider 选择或 compact scene policy 是独立于 ordinary Run execution override 的 opener baseline。
+- 明确薄 Service 只是最小 consumer 证明样例，不是 Host 特殊接口类型；P10.5 不得把测试专用或薄 Service 专用入口未经讨论变成 Host contract。
+- 用 smoke 验证 public contract 冻结目标成立：no-tool multi-turn、mock-tool multi-turn、real-runner multi-turn、compact multi-turn 必须走同一 `open_host(options)` / public command / public read path。
+
+对应设计章节：
+- `docs/host/design.md` §10.1 Host Handle / Composition Root
+- `docs/host/design.md` §11 Host 公共接口
+- `docs/host/design.md` §12 Follow-up 与 Steer
+- `docs/host/design.md` §21 Suspend / Resume / Retry / Replay
+- `docs/host/design.md` §17 WorkerProxy / EngineWorker
+- `docs/host/design.md` §18 ToolRuntime
+- `docs/host/design.md` §23 RunInputBuilder
+- `docs/host/design.md` §24 Conversation Memory
+- `docs/host/design.md` §25 Context Governance
+
+前置条件：
+- Phase 10 Context Governance / Compaction draft PR gate 已通过，且普通多轮会话主体能力已经落地到 Host 内部组件。
+- `docs/host/post-p10.md` 已记录 P10.5 目标与任务清单、缺口清单、测试替身约束与 smoke coverage matrix。
+
+进入条件：
+- 已确认 P10.5 不考虑 Recovery，不迁移 `/Users/leo/workspace/dayu-agent` 的 web tools，不要求 Service / CLI / WeChat / GUI 真实入口改造，不要求业务工具发现 / 动态 ScenePrepare。
+- 已确认若 P10.5 发现需要新增、删除或改变 `dayu.host` public API，必须先和用户讨论并更新 `docs/host/post-p10.md` 或 phase plan，不能由 implementation agent 直接改。
+- 已确认真实 runner smoke 可参考 `dayu/config/llm_models.json` 写死 runner 参数，不实现 ConfigLoader；至少覆盖 mimo、ds/deepseek、gemini、qwen 四类配置。API key / 网络不可用时允许对对应 provider 显式 skip 并记录原因，但测试文件和 wiring 必须存在。mock runner smoke 已删除；runner test double 只能作为低层辅助测试，不能计入 P10.5 smoke success signal。mock tool 不得按 expected answer、run id、轮次或测试私有状态凑结果。
+
+范围：
+- 允许修改：Host opener / public handle 与内部 composition root、public command facade 与 scheduler wakeup 接线、session-level live Host event stream、typed HostEvent terminal final answer view、memory catch-up 与 context overflow compact 的 public opener construction contract、compactor execution baseline 接线、`submit_followup(steer)`、`retry_run(...)`、`replay_run(...)` 本地语义、public Run API 状态语义测试与文档、普通本地多轮 smoke harness、mock tool 测试实现、runner test double 低层辅助测试、compact smoke、真实 runner smoke 的受控配置接线。
+- 禁止修改：Recovery / startup scan / positive orphan proof / `RECOVERING` 通用恢复语义、RemoteProxy、业务工具发现 / 注册 / provider 配置、真实 Service / CLI / WeChat / GUI 接入、web tools 迁移、Engine 主动理解 Host memory / governance。
+
+不做：
+- 不实现 Phase 11 Recovery，不把 projection lag、memory lag 或 failed dispatch 解释成 recovery；`retry_run(...)` 对 `LOST` / `RECOVERING` 的恢复相关行为仍归 Phase 11。
+- 不迁移旧仓库 web tools；核心 smoke 使用 no-tool 或 mock tool。
+- 不实现 ConfigLoader；真实 runner 所需参数可以写死在 P10.5 受控代码或测试配置中。
+- 不实现业务财报工具端到端、动态 ScenePrepare、真实 Service / CLI / WeChat / GUI 接入。
+- 不实现 callback HTTP endpoint、callback auth / replay、wait poller 后台 loop、backoff / in-flight fencing 或 external job physical cancel / revoke；P10.5 只验证 `WAITING` 后由调用方 / tool adapter 通过 Host public `resolve_wait(...)` 提交已取得结果并恢复执行。
+- 不实现 `purge_session(...)` destructive cleanup、purge tombstone、删除矩阵、payload / memory / projection / outbox / tool trace 清理、audit 查询或 retention hardening；这些继续归 Phase 15。P10.5 只要求 `close_session(...)` public contract 可用，并保留 purge public envelope / error boundary。
+- 不实现 Outbox concrete read / drain API 或离线 terminal delivery smoke；P10.5 只冻结 attach / reconnect recipe、terminal identity 与去重要求。Phase 13 必须实现 Outbox read / drain API、OutboxSink terminal delivery queue projection 与离线 terminal 补读 smoke。
+- 不为测试或薄 Service 增加未经讨论的专用 public API。
+- 不定义 `wait_final_answer(...)`、public payload reader、`read_payload(ref)` 或 `get_run_result(...)`；不把 `stream_run_events(...)` / `HostEventView` 放进普通 Service-facing public contract；final answer 主路径只能是 terminal HostEvent。
+
+关键设计问题：
+- 必须确认 `open_host(options)` public handle 的 options shape、生命周期、错误语义，以及它如何内部复用或替代现有 `create_host_command_handle(...)`。关闭语义不得重开讨论，必须按 `docs/host/design.md` 已定的 `close_session` 与 Host graceful shutdown 语义接入。`HostLocalRuntime` / `HostLocalExecutionOptions` 只能作为内部 contract，不得要求业务上层理解。
+- P10.5 已确认 Host opener close shutdown order 是 implementation requirement：先关闭 public gate 并拒绝新 API；停止 scheduler / promotion / background supervisor；关闭 session live watch fanout；取消或关闭当前 handle 持有的 active worker task、lane wait、worker stream consumer task；flush / close projection catch-up 与本地 runtime resources；最后关闭 durable store。全程不得写 `RUN_CANCELLED` / `RUN_FAILED` 或其它 terminal fact 来伪装用户意图。
+- 必须确认 public command accepted / queued / resolve-wait 后如何在 `open_host(options)` 内部唤醒 scheduler，确保 Service 不需要也不能读取内部 dispatch row、调用 scheduler / wakeup / dispatch control API 或调用 `dayu.host.dispatch` 私有入口。
+- 必须按 `docs/host/design.md` 已定 contract 落地并验证 session-level live Host event stream：在线 / 已 attach 客户端通过 `watch_session_events(session_id)` live watch 观察 typed `HostEvent`，支持多客户端打开同一 Session、queue、steer、retry / replay；run-level `stream_run_events(...)` / `HostEventView` 只作为内部 diagnostic / detail / debug / drill-down 契约，不作为聊天主入口，也不进入普通 Service-facing public contract。P13 Audit / Tool Trace / Outbox 不依赖 `HostEventView`，只消费 committed EventLog / typed projection input view。`watch_session_events` 不接收 cursor，不承担离线补读；拿到 / attach Session 前发生的 terminal/final answer 通知由 Outbox 承接。
+- P10.5 已确认多客户端写入策略：同一 Session 不引入 client ownership、session write lock 或 attach token。多个客户端可同时 `watch_session_events(session_id)`，也可同时提交 `submit_followup(queue)` / cancel / retry / replay 等 public command；写入顺序、幂等和冲突处理只能由 Host durable admission transaction、`client_request_id`、Run 状态 precondition、`event_sequence` 与 scheduler governance 决定。P10.5 smoke 必须覆盖多个 watcher 独立观察同一 Session，以及两个不同 `client_request_id` 的 queued prompts 按 durable accepted order 后续执行；相同 `(session_id, client_request_id)` 重放不得重复创建 Run。
+- P10.5 已确认 Outbox 裁剪：只冻结 attach / reconnect recipe、terminal identity 与去重要求；P10.5 不提供 Outbox concrete read / drain API，不把离线 terminal 补读计入 smoke coverage。Phase 13 必须补 concrete Outbox read / drain API、OutboxSink terminal delivery queue projection、terminal item idempotency 与离线 terminal delivery smoke，证明 Outbox drain 与随后 / 并发 live watch attach 不漏投、不重复展示同一 terminal answer。
+- P10.5 已确认 `submit_followup(queue)` request / response contract：第一条 prompt 和后续普通 prompt 使用同一个 `SubmitFollowupRequest` shape，不为首轮增加专用字段；`FollowupSnapshot` 以 `accepted_run_id`、`accepted_run_status` 和 command commit event sequence / durable read watermark 表达 command commit 后 durable 状态；该 watermark 不是 `watch_session_events` 的 cursor。无 active / start-blocking Run 时返回 `ACCEPTED`，有 active / start-blocking Run 时通常返回 `QUEUED`，随后由 scheduler governance 推进到 `RUNNING` / terminal；`queued_run_id` 不进入普通 Service-facing 主 contract。`start_run(...)` 的既有测试、README 和包根导出必须同步调整为内部 `_start_run(...)` 边界。
+- P10.5 已确认 per-run tool selection contract：Host opener / construction options 注入全量业务 `ToolBundle`；`SubmitFollowupRequest.tool_names` 只选择本次 Run 的业务工具名，不携带 raw `ToolBundle`、`ToolDefinition`、callable binding 或 discovery adapter。`None` / 省略表示全部业务工具，空集合表示禁用业务工具，非空集合表示指定子集。Host admission 必须校验工具名并冻结本次 effective tool set。
+- P10.5 已确认 memory catch-up / compactor / compactor execution baseline / budget policy / compact artifact root 的 Host opener construction contract。Compactor 共享 Host runtime / durable / memory / artifact 环境，但不共享每个 ordinary Run 的 `runner_spec` / `runner_options` / `agent_policy` / `tool_names` override；P10.5 必须验证 ordinary Service 只通过 public opener / handle 即可跑通 compact 后的多轮 continuity。P10.5 compact smoke 必须接入真实 compactor adapter；mock / test-double compactor 只能用于低层单元测试或辅助回归，不能作为 compact success signal，也不得绕过 canonical compact event、artifact 写入、memory projection consumption 和下一轮 RunInputBuilder 注入。
+- P10.5 已确认长事务裁剪：`WAITING` / wait record / `resolve_wait(...)` public resume path 纳入 public contract freeze 与 smoke；生产级 callback endpoint、callback auth / replay、poller 后台 loop、backoff / in-flight fencing、external job physical cancel / revoke 不纳入 P10.5。P10.5 必须验证 Run 进入 `WAITING` 后，调用方只通过 Host public `resolve_wait(...)` 提交 poll / callback / manual 已取得结果，Host 内部 wake scheduler / dispatch 并最终通过 `watch_session_events(...)` 产出 terminal HostEvent。
+- P10.5 已确认 Session cleanup 裁剪：只要求 `close_session(...)` public contract 可用并纳入 smoke；`purge_session(...)` destructive cleanup 继续归 Phase 15。P10.5 必须验证 `close_session(...)`、Host opener close 与 cancel 是三个不同动作：`close_session(...)` 只关闭 Session 新输入入口，不停止本地 runtime，不删除事实；Host opener close 只关闭当前 handle 的本地 runtime，不把 Session 改成 `CLOSED`，不写用户 cancel facts；cancel 才表达用户停止 Run 的治理意图。Session closed 后读取 / live watch 既有事实仍可用，新 `submit_followup(...)` 返回明确 invalid-state / typed error。Recommended Service policy 是用户意图为“结束会话并停止当前工作”时，Service 显式先调用 `cancel_session_runs(...)`，确认 cancel 可见后再 `close_session(...)`；Host 不在 `close_session(...)` 内自动 cancel。`purge_session(...)` 在 P10.5 可保持 unsupported / deferred 或 precondition error，但必须有清晰 public envelope / closed-handle guard，不能被当作 archive / close / cancel 使用。
+- P10.5 已确认 HostEventStream typed `HostEvent` terminal contract：普通 Service 通过 `watch_session_events(...)` 观察 terminal HostEvent 并展示 final answer，不直接查询 EventLog / payload 内部表；raw `EngineEvent` 不进入 Service-facing public API，`HostEventView` 改为 Host 内部 run-level diagnostic / detail DTO，不从 `dayu.host` public namespace 导出。P10.5 不定义 `wait_final_answer(...)` public API；final answer 主路径只能是 terminal HostEvent。第一版 terminal final answer view 字段固定为 `content`、`filtered`、`degraded`、`finish_reason` 与 terminal status；超时、取消、错误和 terminal 判断语义随 `watch_session_events(...)` / HostEventStream lifecycle 一并落地。
+- `steer`、`retry`、`replay` 的语义不作为 P10.5 开放设计问题重开；必须按 `docs/host/design.md` 已有定义落地本地语义、状态迁移、terminal race、idempotency 与 smoke。P10.5 的 phase-scope 裁剪只有：Recovery 专属 `LOST` / `RECOVERING` retry / cancel / recovery 处理不进入本 phase，继续归 Phase 11；不新增 `interrupt_*` public API，UI interrupt 文案只能映射到 `cancel_run(...)` 或 `submit_followup(steer)`。
+- P10.5 已确认 smoke 覆盖矩阵：real-runner no-tool multi-turn、mock-tool wiring、real-runner matrix、compact、WAITING resume、steer / retry / replay、cancel、`close_session(...)` public contract。mock runner smoke 已删除；对本轮不覆盖但接受的项必须有 owner 和后续 destination。
+- 若改变 public interface / contract，先和用户讨论并写回 `docs/host/post-p10.md` 或对应 phase plan。
+
+交付物：
+- phase design refinement / P10.5 discussion artifact
+- handoff implementation-ready plan
+- implementation slices
+- tests
+- docs update
+
+建议 slice 切分：
+- Slice 1: async Host opener / public handle、内部 composition root 与 public command -> scheduler wakeup 接线。
+- Slice 2: session-level live Host event stream、typed HostEvent、terminal final answer view、public Run API 状态语义测试与 Host README 同步。
+- Slice 3: 按 `docs/host/design.md` 已有定义实现 `submit_followup(steer)` 本地语义、terminal race、cancel / dispatch 接线与 tests；不新增 interrupt public API。
+- Slice 4: 按 `docs/host/design.md` 已有定义实现 `retry_run(...)` / `replay_run(...)` 本地语义、source Run 关联、retry policy tool fact reuse、no-tool replay policy 与 tests；`LOST` / `RECOVERING` retry 归 Phase 11。
+- Slice 5: real-runner no-tool / mock-tool wiring / cancel smoke，覆盖 `docs/host/post-p10.md` 的 S1 / S2 / S5 coverage matrix 与测试替身约束，并覆盖 steer / retry / replay / cancel smoke；mock runner 不计入 smoke success signal。
+- Slice 6: real-runner matrix smoke，使用硬编码 runner 参数并走同一 runtime / public command / public read path；至少覆盖 mimo、ds/deepseek、gemini、qwen 四类配置，环境不可用时对对应 provider 明确 skip 并记录原因。
+
+验证要求：
+- unit tests: public contract validation、Host opener lifecycle、per-run tool_names selector validation / effective tool set freeze、session-level live watch lifecycle / fanout / filter semantics、typed HostEvent 与 terminal final answer view、public Run API `ACCEPTED -> scheduler governance -> RUNNING / terminal` 状态语义、steer / retry / replay request validation、idempotency、状态迁移与错误语义。
+- integration tests: real-runner no-tool multi-turn smoke、mock-tool wiring smoke、real-runner matrix smoke、真实 compactor compact smoke、WAITING -> public `resolve_wait(...)` resume smoke、steer / retry / replay local smoke、cancel smoke、`close_session(...)` public contract smoke。
+- smoke 覆盖：必须按 `docs/host/post-p10.md` 的 Smoke Coverage Matrix 标注 covered / not covered but accepted / blocking gap。
+- pyright: 受影响 Host / tests 通过，且不新增或扩散类型错误。
+- docs: `dayu/host/README.md`、`tests/README.md` 及必要的 `docs/host/post-p10.md` / phase plan 同步。
+
+退出条件：
+- 普通 Service 只调用 Host public interface / contract，即可完成普通本地多轮会话闭环：打开 Host、创建 / 取得 / 读取 session、通过 session-level live Host event stream 读取 / 订阅 typed HostEvent、通过 `submit_followup(queue)` 提交第一条与后续普通 prompt、在 terminal HostEvent 中观察 final answer、关闭 Host。
+- `submit_followup(steer)`、`retry_run(...)`、`replay_run(...)` 不再是普通本地语义下的 stable unsupported；它们的本地状态迁移、dispatch 接线、read / event 可见性和 smoke 已覆盖。Recovery-only 状态仍按 Phase 11 owner 处理。
+- real-runner no-tool、mock-tool wiring、real-runner matrix 与 cancel smoke 均使用同一 `open_host(options)` / public command / public read path；不得手工调用 scheduler internals、读取 dispatch row、直接查询 durable 内部表取得 answer / cancel result，或让 runner test double / mock tool 凑 expected answer。mock runner smoke 不进入 P10.5 success signal。
+- P10.5 对普通本地多轮会话 public interface / contract 的冻结结论已写入 `docs/host/post-p10.md` 或 phase closeout；任何未冻结项都有明确 owner 和后续 destination。
+- P10.5 已经把真实生产系统 Service 将来接入所需的 Host 普通多轮生产接线做实；真实 CLI / web / GUI 后续通过 Service 接入时，不需要绕过、替换或重写 P10.5 冻结的 Host public interface / contract。
+- P11 Recovery 可以在不破坏 P10.5 已冻结普通本地多轮 public contract 的前提下继续实施；若 P11 必须改变 public API 或核心契约，必须先回到用户讨论。
+- P11-P15 完成后，真实 CLI / web / GUI 接入不得要求重写 P10.5 已冻结的普通多轮生产接线；这些后续 phase 只能在该 public contract 上扩展 Recovery、ToolsDiscovery / ScenePrepare、Audit / Tool Trace / Outbox、RemoteProxy 与 Retention / Purge 能力。
+
+后续依赖：
+- 后续 phase 可依赖的稳定契约：普通本地多轮 Host public interface / contract、`open_host(options)` / public handle、internal composition root、command -> scheduler 内部接线、session-level live Host event stream、typed HostEvent terminal final answer view、steer / retry / replay 本地语义、no-tool / mock-tool / real-runner smoke coverage baseline。
+- 需要追踪到后续 phase 的事项：Recovery / startup crash recovery / positive orphan proof 归 Phase 11；ToolsDiscovery / ScenePrepare 归 Phase 12；Audit / Tool Trace / Outbox 归 Phase 13；RemoteProxy 归 Phase 14；Retention / Purge production hardening 归 Phase 15。
+
 ### Phase 11. Host Lifecycle / Recovery / Multi-process Hardening
 
 目标：
-- 实现 Host startup recovery scan、positive orphan proof、prompt accepted but answer not returned 的恢复语义、graceful shutdown 与多进程一致性硬化。
+- 实现 Host startup recovery scan、positive orphan proof、prompt accepted but answer not returned 的恢复语义、graceful shutdown 与多进程一致性硬化。P11 明确拥有“未被 LLM 响应的 prompt，崩溃退出重进恢复”：已 durable accepted 的 prompt 或已启动但未 terminal 的 Run，在 Host 重启后必须通过 recovery scan / positive orphan proof / recovery dispatch 继续，或按 policy 给出确定 terminal。
 
 对应设计章节：
 - `docs/host/design.md` §27 Host Lifecycle / Recovery
@@ -1179,6 +1284,8 @@ P9.5 收口清单：
 - `docs/host/design.md` §17 WorkerProxy / EngineWorker
 
 前置条件：
+- Phase 10.5 ordinary local multi-turn public contract freeze 已完成；P11 不得破坏 P10.5 已冻结的普通本地多轮 Host public interface / contract，若 Recovery 必须新增或调整 public API / 核心契约，必须先回到用户讨论。
+- P10.5 不证明 crash recovery，但已经冻结 Service 调用方式；P11 必须在同一 `open_host(...)` / session acquisition / `watch_session_events(...)` / public command contract 上补 recovery，不能要求真实 Service 改走另一套恢复入口。
 - Phase 5 dispatch record / LocalProxy 已完成。
 - Phase 2 host instance liveness foundation 已完成。
 - Phase 3 state transition / admission 已完成。
@@ -1295,7 +1402,7 @@ P9.5 收口清单：
 ### Phase 13. Audit / Tool Trace / Outbox Projections
 
 目标：
-- 在已稳定的 EventLog consumer framework 上实现 LogAuditSink、tool trace hot / cold storage 与 Outbox terminal delivery queue projection。
+- 在已稳定的 EventLog consumer framework 上实现 LogAuditSink、tool trace hot / cold storage、Outbox terminal delivery queue projection，以及 concrete Outbox read / drain API 与离线 terminal delivery smoke。
 
 对应设计章节：
 - `docs/host/design.md` §14 Observer / Sink / Projection
@@ -1322,7 +1429,7 @@ P9.5 收口清单：
 
 关键设计问题：
 - 必须确认 tool trace hot JSON 与 cold JSONL 的最小字段，以及 provider request id / operation context refs 的查询口径。
-- 必须确认 Outbox item identity 与 UI / Service seen cursor 推荐语义。
+- 必须确认 Outbox item identity、UI / Service seen cursor 推荐语义、concrete Outbox read / drain API shape，以及 Outbox drain 与随后 / 并发 session live watch attach 的去重 / 防漏窗口。
 - 必须确认 LogAuditSink 路径注入、append-only JSONL、sink failure 和 purge tombstone 查询语义。
 
 交付物：
@@ -1335,19 +1442,19 @@ P9.5 收口清单：
 建议 slice 切分：
 - Slice 1: LogAuditSink and audit JSONL。
 - Slice 2: tool trace hot JSON / cold JSONL。
-- Slice 3: OutboxSink and terminal delivery queue projection。
+- Slice 3: OutboxSink, terminal delivery queue projection, concrete read / drain API, offline terminal delivery smoke。
 
 验证要求：
-- unit tests: sink checkpoint idempotency、sink retry、audit / trace / outbox projection rebuild。
-- integration tests: terminal EventLog -> audit / tool trace / outbox；sink failure 不影响 Run terminal。
+- unit tests: sink checkpoint idempotency、sink retry、audit / trace / outbox projection rebuild、outbox item idempotency、read / drain cursor and dedupe semantics。
+- integration tests: terminal EventLog -> audit / tool trace / outbox；sink failure 不影响 Run terminal；离线 terminal 补读后再 attach `watch_session_events(...)` 不漏投、不重复展示同一 terminal answer。
 - pyright: projection sink modules 通过。
 - docs: Host README / tool trace analysis docs 按触发规则同步。
 
 退出条件：
-- Audit、Tool Trace、Outbox 均能从 committed EventLog 独立追平；任一 sink 失败只造成 projection lag 或 sink-local error，不影响 Host command path。
+- Audit、Tool Trace、Outbox 均能从 committed EventLog 独立追平；任一 sink 失败只造成 projection lag 或 sink-local error，不影响 Host command path。Service 可通过 concrete Outbox read / drain API 补读离线 terminal/final answer 增量，并用 terminal identity 与 session live watch 去重。
 
 后续依赖：
-- 后续 phase 可依赖的稳定契约：audit JSONL、tool trace hot / cold、outbox terminal delivery queue。
+- 后续 phase 可依赖的稳定契约：audit JSONL、tool trace hot / cold、outbox terminal delivery queue、concrete Outbox read / drain API 与离线 terminal delivery smoke baseline。
 - 需要追踪到后续 phase 的事项：Service / UI channel delivery、外部 audit 系统和长期归档策略不属于本 phase。
 
 ### Phase 14. RemoteProxy / RemoteStub

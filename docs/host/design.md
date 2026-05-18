@@ -1,5 +1,9 @@
 # Host 设计
 
+本文档是 Host 唯一设计真源。稳定架构边界、公共接口、状态机、EventLog 语义、恢复语义、执行路径、工具治理、memory / context governance 与后续 public contract 决策只以本文档为准。
+
+`docs/host/implementation-control.md` 只记录 phase 编排、gate 状态、交付物、验证要求和风险追踪；`docs/host/post-p10.md` 只记录 P10.5 的目标、任务、coverage 和讨论待决项。两者不得替代本文档承载稳定设计语义。
+
 ## 1. 设计目标
 
 Host 的设计目标是支撑生产级买方财报分析 Agent。系统范式是“宿主强约束下的 LLM in the loop”：
@@ -307,10 +311,10 @@ CLOSED
 
 `close_session` 只关闭 Session 的新输入入口，不取消、不终止、不删除已有 Run。`CLOSED` Session 的语义：
 
-- `start_run`、`submit_followup(queue)`、`submit_followup(steer)` 返回 `invalid_state`。
+- `submit_followup(queue)`、`submit_followup(steer)` 返回 `invalid_state`；内部新 Run admission primitive 同样不得绕过 Session closed 前置条件。
 - `ensure_session(scope, slot_key)` 可以返回当前 slot Session，snapshot 标记为 `CLOSED`。
 - `create_session` 仍允许创建新 Session；UI / Service 若要继续聊天，应显式调用 `create_session(bind_slot=true, scope, slot_key)` 创建并重绑定新 Session。
-- `get_session`、`get_run`、`stream_run_events` 仍允许读取。
+- `get_session`、`get_run` 仍允许读取；Host 内部 diagnostic EventLog 补读仍可用于排查。
 - `cancel_run` 仍允许取消已有 Run。
 - `resolve_wait` 仍允许让已有 `WAITING` Run 继续收口。
 - `retry_run` / `replay_run` 默认拒绝在 closed Session 内创建关联新 Run，除非显式 policy 把新 Run 创建到其它 Session。
@@ -337,7 +341,11 @@ CLOSED
 
 `purge_session` 不删除已经写入的 append-only audit JSONL 记录。purge 必须写入 purge tombstone audit record；既有 audit JSONL 行可以保留对已删除 EventLog rows 的 refs，audit 查询 / analyze 工具必须能识别 purge tombstone，并报告源 EventLog facts 已被 purge。
 
-purge 后该 Session 不再支持 `get_session`、`get_run`、`stream_run_events`、`retry_run`、`replay_run` 或 final answer 恢复。读取接口应返回 `not_found` / `gone` 或 tombstone snapshot；具体错误形状属于 Public API phase。
+purge 后该 Session 不再支持 `get_session`、`get_run`、`retry_run`、`replay_run` 或 final answer 恢复；Host 内部 EventLog 补读也不得再恢复该 Session 的可恢复事实。读取接口应返回 `not_found` / `gone` 或 tombstone snapshot；具体错误形状属于 Public API phase。
+
+P10.5 ordinary local multi-turn public contract 只要求 `close_session(...)` public contract 可用，不要求 `purge_session(...)` destructive cleanup 可用。P10.5 必须验证 `close_session(...)` 只关闭 Session 新输入入口，不取消、不终止、不删除已有 Run；关闭后 `get_session(...)`、`get_run(...)` 与 `watch_session_events(...)` 仍可读取 / 观察既有事实，新的 `submit_followup(...)` 必须返回明确 invalid-state / typed error。P10.5 还必须验证 `close_session(...)`、Host opener close 与 cancel 的边界：`close_session(...)` 不停止本地 runtime，Host opener close 不把 Session 改成 `CLOSED`，二者都不写用户 cancel facts；只有 `cancel_run(...)` / `cancel_session_runs(...)` 表达用户停止 Run 的治理意图。`purge_session(...)` 可以保留 public envelope、closed-handle guard、unsupported / deferred 或 precondition error 边界，但 purge tombstone、删除矩阵、payload / memory / projection / outbox / tool trace 清理、audit 查询与 retention hardening 继续归 Phase 15。
+
+Recommended Service policy：当上层产品语义是“结束会话并停止当前工作”时，Service 应显式调用 `cancel_session_runs(...)`，等待 cancel 结果通过 `watch_session_events(...)` 或 `get_run(...)` 可见后，再调用 `close_session(...)` 关闭新输入入口。Host 不在 `close_session(...)` 内自动 cancel，因为 close / cancel 是不同治理事实，必须在 EventLog 中保持可解释边界。
 
 ## 6. Session Slot
 
@@ -380,6 +388,7 @@ CreateSessionRequest:
 Run 状态集合：
 
 ```text
+ACCEPTED
 QUEUED
 RUNNING
 WAITING
@@ -402,6 +411,7 @@ LOST
 
 状态语义：
 
+- `ACCEPTED`：Run 已被 Host durable accepted，且当前 Session 没有更早的 active / start-blocking Run；它尚未创建 Attempt，等待 scheduler / pre-start governance 将其推进到 `RUNNING` 或 terminal failure。
 - `QUEUED`：Run 已被 Host durable accepted，但尚未创建 active Attempt。
 - `RUNNING`：Run 已占用 Session active slot，并已有 active Attempt lifecycle；active Attempt 可以处于 `STARTING` 或 `RUNNING`。
 - `WAITING`：当前 Attempt 已因外部等待条件收口为 `SUSPENDED`，Run 等待 Host 后续 resume。
@@ -472,6 +482,8 @@ Run -> CANCELLED / RECOVERING / LOST
 
 同一个 Session 同时最多一个 active Run。
 
+多客户端可以同时打开和写入同一个 Session。Host 不维护 client ownership truth，不发放 session write lock，不要求 attach token，也不把某个 watcher 视为 Session owner。多个客户端同时调用 `submit_followup(queue)` 时，写入顺序、幂等和冲突处理只由 Host durable admission transaction、`(session_id, client_request_id)` 幂等、Run 状态 precondition、全局 `event_sequence` 与 scheduler governance 决定。不同 `client_request_id` 的 prompt 按 durable accepted order 进入 `ACCEPTED` / `QUEUED` 和后续 FIFO promotion；相同 `(session_id, client_request_id)` 重放必须返回同一 accepted Run，不重复创建。客户端身份、权限、channel delivery 和本地 UI 去重属于 Service / UI 边界，不进入 Host Session ownership 语义。
+
 active Run 状态：
 
 ```text
@@ -485,7 +497,7 @@ RECOVERING
 
 新输入 admission：
 
-- `queue`：`submit_followup(queue)` 在同一个 Host admission transaction 内检查 active Run；有 active Run 时输入进入 durable queue，成为后续 Run；无 active Run 时直接创建并启动新 Run。
+- `queue`：`submit_followup(queue)` 在同一个 Host admission transaction 内检查 active / start-blocking Run；有 active / start-blocking Run 时输入进入 durable queue，成为后续 Run；无 active / start-blocking Run 时创建 `ACCEPTED` Run，后续由 scheduler / pre-start governance 启动。
 - `reject`：当前 Session 有 active Run 时，拒绝创建新 Run，并返回 active run conflict。
 - `attach_active`：当前 Session 有 active Run 时，返回当前 active `RunSnapshot`，不触发新执行，不新增 canonical EventLog fact。第一版只通过幂等记录、diagnostic refs 或后续 audit/read-model projection 解释 attach request；如果后续需要把 attach 作为可查询业务事实，必须先补充新的 canonical event shape，不能由 public facade 临时发明事件。
 - `steer`：必须命中 active Run precondition；它在同一 Run 内切换 Attempt，不创建新 Run。
@@ -494,7 +506,7 @@ RECOVERING
 
 - `ensure_session` 由 `(scope, slot_key)` 幂等映射到当前 Session。
 - `create_session` 由 `client_request_id` 幂等映射到一次明确的新建 Session 动作；绑定 slot 时，同一 `client_request_id` 重试不能重复创建或重复重绑定。
-- `start_run` 由 `(session_id, client_request_id)` 幂等映射到同一个 Run。
+- 内部新 Run admission primitive 由 `(session_id, client_request_id)` 幂等映射到同一个 Run；Service-facing 普通 prompt 入口统一为 `submit_followup(queue)`。
 - queued follow-up / queued run 也必须按 `(session_id, client_request_id)` 幂等。
 - `cancel_run` 由 `(run_id, client_request_id)` 幂等映射到同一个 cancel 操作。
 - `cancel_session_runs` 由 `(session_id, client_request_id)` 幂等映射到同一个 session-scope cancel 操作。
@@ -542,22 +554,22 @@ Phase 3 owned transition subset：
 Phase 3 只实现不需要 Engine dispatch、ToolRuntime、wait record、steer、retry / replay、context compaction 或 recovery 的状态机闭环：
 
 - Session lifecycle：创建 Session、按 slot 幂等确保 Session、关闭 Session；关闭后的 Session 不接受新输入，但不把既有 queued Run 作为内存对象丢弃。
-- start / follow-up admission：接受初始输入或 follow-up queue 输入，追加用户输入与 Run 接受事实，并在无 active Run 时启动 Run，在有 active Run 且 policy 为 queue 时持久化 queued Run。
-- queue promotion：同一 Session 无 active Run 时，按 queued Run 的 accepted `event_sequence` FIFO 推进一个 Run 到 `RUNNING`，创建 Attempt `STARTING` 与 dispatch record `pending`。
-- cancel queued：`QUEUED -> CANCELLED`，不创建 Attempt。
+- start / follow-up admission：接受初始输入或 follow-up queue 输入，追加用户输入与 Run 接受事实；无 active / start-blocking Run 时创建 `ACCEPTED` Run，有 active / start-blocking Run 且 policy 为 queue 时持久化 `QUEUED` Run。
+- scheduler start / queue promotion：同一 Session 无 active Run 时，优先推进 `ACCEPTED` Run，或按 queued Run 的 accepted `event_sequence` FIFO 推进一个 Run 到 `RUNNING`，创建 Attempt `STARTING` 与 dispatch record `pending`。
+- cancel accepted / queued：`ACCEPTED` / `QUEUED -> CANCELLED`，不创建 Attempt。
 - cancel pre-dispatch starting：`Run RUNNING + Attempt STARTING + dispatch record pending -> Run CANCELLED + Attempt CANCELLED + dispatch record cancelled`；该路径不通知 WorkerProxy，不启动 Engine。
 - internal terminal closeout helper：仅作为 Phase 3 状态机测试闭环和后续 EngineEvent ingest 复用的内部 transition helper，用于追加 concrete terminal facts、关闭当前 Attempt / Run、释放 active slot；它不实现 EngineEvent ingest。
-- terminal / cancel 成功释放 active slot 后，必须触发同 Session promotion check。promotion check 必须重新进入短事务，并通过 CAS 判定是否仍可推进 queued Run。
+- terminal / cancel 成功释放 active slot 后，必须触发同 Session scheduler start / promotion check。promotion check 必须重新进入短事务，并通过 CAS 判定是否仍可推进 accepted / queued Run。
 
 Engine final answer / failure ingest、Tool awaiting、`resolve_wait`、steer、retry / replay、context compaction、recovery scan / dispatch 是全局状态迁移矩阵中的 future-owner references，除非后续 phase plan 明确拥有，不属于 Phase 3 实施范围。
 
 | 操作 / 来源 | 前置状态 | 目标状态 | 必须追加的 canonical facts | Attempt 动作 |
 | --- | --- | --- | --- | --- |
-| `start_run` 且无 active Run | Session `OPEN` | Run `RUNNING` / Attempt `STARTING` | `USER_INPUT_ACCEPTED`、`RUN_ACCEPTED`、`RUN_STARTED(start_reason=initial)`、`ATTEMPT_STARTED` | 创建新 Attempt；commit 后 dispatch |
-| `start_run` 且有 active Run，policy=`queue` | Session `OPEN` | Run `QUEUED` | `USER_INPUT_ACCEPTED`、`RUN_ACCEPTED`、`RUN_QUEUED` | 不创建 Attempt |
-| `submit_followup(queue)` 且有 active Run | Session `OPEN` | 新 Run `QUEUED` | `USER_INPUT_ACCEPTED`、`RUN_ACCEPTED`、`RUN_QUEUED` | 不创建 Attempt |
-| `submit_followup(queue)` 且无 active Run | Session `OPEN` | 新 Run `RUNNING` / Attempt `STARTING` | `USER_INPUT_ACCEPTED`、`RUN_ACCEPTED`、`RUN_STARTED(start_reason=initial)`、`ATTEMPT_STARTED` | 创建新 Attempt；commit 后 dispatch |
-| queue promotion | Run `QUEUED` 且 Session 无 active Run | Run `RUNNING` / Attempt `STARTING` | `RUN_STARTED(start_reason=queue_promotion)`、`ATTEMPT_STARTED` | 创建新 Attempt；commit 后 dispatch |
+| 内部新 Run admission primitive 且无 active / start-blocking Run | Session `OPEN` | Run `ACCEPTED` | `USER_INPUT_ACCEPTED`、`RUN_ACCEPTED` | 不创建 Attempt；commit 后 wake scheduler |
+| 内部新 Run admission primitive 且有 active / start-blocking Run，policy=`queue` | Session `OPEN` | Run `QUEUED` | `USER_INPUT_ACCEPTED`、`RUN_ACCEPTED`、`RUN_QUEUED` | 不创建 Attempt；Service-facing prompt 入口不暴露该分支，使用 `submit_followup(queue)` |
+| `submit_followup(queue)` 且有 active / start-blocking Run | Session `OPEN` | 新 Run `QUEUED` | `USER_INPUT_ACCEPTED`、`RUN_ACCEPTED`、`RUN_QUEUED` | 不创建 Attempt |
+| `submit_followup(queue)` 且无 active / start-blocking Run | Session `OPEN` | 新 Run `ACCEPTED` | `USER_INPUT_ACCEPTED`、`RUN_ACCEPTED` | 不创建 Attempt；commit 后 wake scheduler |
+| scheduler starts accepted / queued Run | Run `ACCEPTED` 或 `QUEUED` 且 Session 无 active Run | Run `RUNNING` / Attempt `STARTING` | `RUN_STARTED(start_reason=initial 或 queue_promotion)`、`ATTEMPT_STARTED` | 创建新 Attempt；commit 后 dispatch |
 | Engine final answer | Run `RUNNING` / Attempt `RUNNING` | Run `SUCCEEDED` / Attempt `SUCCEEDED` | `RUN_SUCCEEDED`、`ATTEMPT_SUCCEEDED` | 关闭当前 Attempt |
 | Engine failure | Run `RUNNING` / Attempt `RUNNING` | Run `FAILED` / Attempt `FAILED`，或按 policy 进入 retry | `RUN_FAILED`、`ATTEMPT_FAILED` | 关闭当前 Attempt |
 | context compaction proactive | Run accepted before Attempt creation / dispatch | Run `RUNNING` / Attempt `STARTING` after compact | `CONTEXT_COMPACTION_REQUESTED(trigger_source=proactive)`、`CONTEXT_COMPACTED`，随后 `RUN_STARTED`、`ATTEMPT_STARTED` | pre-dispatch input governance；不进入 `RECOVERING` |
@@ -566,13 +578,13 @@ Engine final answer / failure ingest、Tool awaiting、`resolve_wait`、steer、
 | `resolve_wait` | Run `WAITING` | Run `RUNNING` | `RESUME_REQUESTED`、tool terminal/result fact、`RUN_STARTED(start_reason=resume)`、`ATTEMPT_STARTED` | 创建新 Attempt 并 dispatch |
 | `submit_followup(steer)` on running | target Run 是当前 active Run，且状态为 `RUNNING` | 同一 Run `RUNNING` / new Attempt `STARTING` | `STEER_REQUESTED`、`ATTEMPT_STEERED`、`RUN_STARTED(start_reason=steer)`、`ATTEMPT_STARTED` | 运行中 Attempt 收口为 `STEERED`；创建新 Attempt；commit 后 dispatch |
 | `submit_followup(steer)` on waiting | target Run 是当前 active Run，且状态为 `WAITING` | 同一 Run `RUNNING` / new Attempt `STARTING` | `STEER_REQUESTED`、wait record cancelled with reason `steered`、`RUN_STARTED(start_reason=steer)`、`ATTEMPT_STARTED` | 旧 Attempt 保持 `SUSPENDED`；创建新 Attempt；commit 后 dispatch |
-| `cancel_run` on queued | Run `QUEUED` | Run `CANCELLED` | `CANCEL_REQUESTED`、`RUN_CANCELLED` | 无 |
+| `cancel_run` on accepted / queued | Run `ACCEPTED` 或 `QUEUED` | Run `CANCELLED` | `CANCEL_REQUESTED`、`RUN_CANCELLED` | 无 |
 | `cancel_run` on waiting | Run `WAITING` | Run `CANCELLED` | `CANCEL_REQUESTED`、wait record cancelled fact、`RUN_CANCELLED` | 旧 Attempt 保持 `SUSPENDED`；不传播 cancel |
 | `cancel_run` on recovering before dispatch | Run `RECOVERING` 且无新 Attempt dispatch committed | Run `CANCELLED` | `CANCEL_REQUESTED`、`RUN_CANCELLED` | 不创建新 Attempt；不进入 `CANCELLING` |
 | `cancel_run` on pre-worker starting | Run `RUNNING` / Attempt `STARTING` 且 dispatch record `pending` / `waiting_for_lane` / pre-accept `dispatching` | Run `CANCELLED` / Attempt `CANCELLED` | `CANCEL_REQUESTED`、`ATTEMPT_CANCELLED`、`RUN_CANCELLED` | 标记 dispatch record cancelled；cancel lane wait 或 wake scheduler release held lane；不通知 WorkerProxy |
 | `cancel_run` on active running | Run `RUNNING` / `CANCELLING` 且 Attempt `RUNNING` | Run `CANCELLING`，后续 `CANCELLED` / `WAITING` / `LOST` | `CANCEL_REQUESTED`、`RUN_CANCELLING`，后续 terminal fact | commit 后向当前 Attempt / WorkerProxy 传播 cancel |
-| `retry(run)` | Run `FAILED` 或 recoverable failure | 关联的新 Run `QUEUED` 或 `RUNNING` | `RETRY_REQUESTED`、新 Run 的 `RUN_ACCEPTED`，按 admission 追加 `RUN_QUEUED` 或 `RUN_STARTED(start_reason=initial)` / `ATTEMPT_STARTED` | 原 Run 终态不改；新 Run 创建自己的 Attempt |
-| `replay(run)` | Run `SUCCEEDED`，且 final answer 格式 / schema / 结构需修复 | 关联的新 Run `QUEUED` 或 `RUNNING` | `REPLAY_REQUESTED`、新 Run 的 `RUN_ACCEPTED`，按 admission 追加 `RUN_QUEUED` 或 `RUN_STARTED(start_reason=initial)` / `ATTEMPT_STARTED` | 原 Run 终态不改；新 Run 默认复用已接受工具事实 |
+| `retry(run)` | Run `FAILED` 或 recoverable failure | 关联的新 Run `ACCEPTED` 或 `QUEUED` | `RETRY_REQUESTED`、新 Run 的 `RUN_ACCEPTED`，按 admission 可追加 `RUN_QUEUED` | 原 Run 终态不改；新 Run 由 scheduler 创建自己的 Attempt |
+| `replay(run)` | Run `SUCCEEDED`，且 final answer 格式 / schema / 结构需修复 | 关联的新 Run `ACCEPTED` 或 `QUEUED` | `REPLAY_REQUESTED`、新 Run 的 `RUN_ACCEPTED`，按 admission 可追加 `RUN_QUEUED` | 原 Run 终态不改；新 Run 默认复用已接受工具事实，并由 scheduler 创建 Attempt |
 | recovery scan | Run `RUNNING` / `CANCELLING` 且 active Attempt 不可确认 | Run `RECOVERING` 或 `LOST` | `ATTEMPT_LOST`、`RUN_RECOVERING` 或 `RUN_LOST` | 不 takeover |
 | recovery dispatch | Run `RECOVERING` 且可重建 messages | Run `RUNNING` / Attempt `STARTING` | `RUN_STARTED(start_reason=recovery)`、`ATTEMPT_STARTED` | 创建新 Attempt；commit 后 dispatch |
 
@@ -597,9 +609,13 @@ Attempt startup 边界：
 标准启动路径：
 
 ```text
-start_run admitted
+initial prompt admitted through submit_followup(queue) or internal admission primitive
   -> append USER_INPUT_ACCEPTED
   -> append RUN_ACCEPTED
+  -> Run.status = ACCEPTED
+  -> commit
+  -> after-commit scheduler wakeup
+  -> scheduler pre-start governance
   -> append RUN_STARTED(start_reason=initial)
   -> create Attempt(status=STARTING)
   -> append ATTEMPT_STARTED
@@ -697,7 +713,7 @@ Host 公共函数接收的 `host` 是 composition root / handle，不是业务 G
 
 Host composition root 可以拥有两类能力：command path handle 与 background runtime supervisor。二者可以由同一个构造入口装配，但必须向调用方和子系统暴露不同 facet。
 
-command path handle 只服务同步治理命令，例如 `start_run`、`submit_followup`、`cancel_run`、`cancel_session_runs`、`resolve_wait`、`retry_run`、`replay_run`。它可以持有：
+command path handle 只服务同步治理命令，例如 `submit_followup`、`cancel_run`、`cancel_session_runs`、`resolve_wait`、`retry_run`、`replay_run`。它可以持有内部新 Run admission primitive，但不把 `start_run` 作为 Service-facing public API 暴露。它可以持有：
 
 - durable store / transaction runner。
 - EventLog appender / reader。
@@ -711,13 +727,15 @@ command path handle 只服务同步治理命令，例如 `start_run`、`submit_f
 - clock / id generator。
 - after-commit wakeup port。
 
+内部新 Run admission primitive 的实现名固定为 `_start_run`。`_start_run` 是 Host 内部 contract，不从 `dayu.host` public namespace 导出，不进入普通 Service-facing public API，不进入 P10.5 thin Service recipe。第一条 prompt 与后续普通 prompt 的 Service-facing 入口统一是 `submit_followup(queue)`。
+
 background runtime supervisor 只服务已提交事实的追平、投影和投递。它可以持有：
 
 - Observer / Sink runner。
 - Outbox projection runner。
 - stream fanout。
 - projection workers。
-- wait poller。
+- wait poller adapter / supervisor（P10.5 不要求实现生产后台 loop）。
 - sink-local checkpoint / retry state。
 
 每个依赖必须有清晰 ownership；Host handle 不能让 Service、UI、RemoteStub 或 Sink 绕过 Host 状态机直接写 durable truth。
@@ -739,7 +757,7 @@ command path 不直接运行慢 projection、outbox projection、tool trace 写�
 
 - Host 运行参数可以有默认值，但默认值只能在 Host composition root 构造时应用。
 - 所有影响持久化、执行、恢复、投影、工具治理或外部通信的运行参数，都必须有显式接口可由调用方传入；不得只能通过模块级全局变量、隐式单例、环境变量或硬编码路径取得。
-- EventLog / durable store 所在数据库、payload / artifact 目录、projection / outbox 存储位置、worker target、policy provider、clock、id generator、truncation / context budget policy 都属于可注入运行参数。
+- EventLog / durable store 所在数据库、payload / artifact 目录、projection / outbox 存储位置、worker target、policy provider、clock、id generator、truncation / context budget policy、ContextCompactor、compact artifact root、memory catch-up port 都属于可注入运行参数。
 - 外部业务 `ToolBundle` 是 Host construction / composition root 的显式输入参数。Host handle 必须记录 tool bundle digest、schema digest 和 source refs，用于 Attempt snapshot、audit 和 diagnostic 解释。
 - Host 公共操作函数不接收零散全局配置；它们接收已构造好的 Host handle。Host handle 的构造函数或工厂函数必须暴露 typed options / request，用于传入上述运行参数。
 - 默认参数必须能被显式传入值完全覆盖；覆盖后的值必须进入 Host snapshot / diagnostic / audit 所需的可解释 refs，便于排查不同入口或进程使用的运行配置。
@@ -775,7 +793,18 @@ FrameworkToolPolicyView
   enabled_framework_tools: frozenset[FrameworkToolName]
 ```
 
-`HostToolingOptions` 属于 Host construction options 的一部分，只能在 composition root / host factory 接收。`business_tool_bundle` 不得出现在 `StartRunRequest`、`SubmitFollowupRequest`、retry / replay / resume request 或无结构 metadata 中。`ToolBundleSourceRef` 只记录可解释来源、版本与 digest；它不携带 callable，不反向指向具体业务工具模块，也不要求 Host 能重新执行 discovery。
+`HostToolingOptions` 属于 Host construction options 的一部分，只能在 composition root / host factory 接收。`business_tool_bundle` 不得出现在 `StartRunRequest`、`SubmitFollowupRequest`、retry / replay / resume request 或无结构 metadata 中。`SubmitFollowupRequest` 可以携带本次 Run 的 business tool selector，但只能是 typed tool name selector，不能携带 raw `ToolBundle`、`ToolDefinition`、callable binding 或 discovery adapter。`ToolBundleSourceRef` 只记录可解释来源、版本与 digest；它不携带 callable，不反向指向具体业务工具模块，也不要求 Host 能重新执行 discovery。
+
+P10.5 per-run business tool selection 语义：
+
+- Host opener / construction options 接收全量业务 `ToolBundle`。
+- `SubmitFollowupRequest.tool_names` 是本次 Run 的业务工具选择器。
+- `tool_names is None` 或字段省略表示本次 Run 允许使用全量业务工具。
+- `tool_names == ()` 或空集合表示本次 Run 禁用业务工具；framework tools 是否可用仍由 framework tool policy 决定。
+- `tool_names` 为非空集合时表示只允许这些工具名。
+- Host admission 必须校验每个 tool name 都存在于 construction-time `business_tool_bundle`，并把 resolved effective business tool names / digest 冻结到 Run / Attempt 可解释 snapshot 或 source refs 中。
+- `tool_names` 不得使用无结构 metadata、逗号分隔字符串、自然语言工具描述或 tool schema 片段表达。
+- `None=all` 与 `empty=none` 必须严格区分；空集合不得被解释成全部工具，避免调用方 bug 导致权限扩大。
 
 `ToolBundleSourceKind` 必须使用 Python 3.11 `enum.StrEnum`，不得实现为普通 `str` 常量或 `typing.Literal`，以保证 source refs 具备稳定字符串序列化和受限取值。`FrameworkToolName` 同样必须使用 Python 3.11 `enum.StrEnum`，不得实现为普通 `str` 常量或 `typing.Literal`；当前 framework tool 名称集合至少包含 `fetch_more`。`FrameworkToolPolicyView.reserved_framework_tool_names` 用于禁止业务 `ToolBundle` 占用 Host framework tool 名称，即使某个 framework tool 当前未启用也可以被保留。`FrameworkToolPolicyView.enabled_framework_tools` 只表达 construction-time policy view，表示本 Host handle 允许后续 ToolRuntime factory 注入的 framework tool 名称集合；它不得在 Phase 1 触发 ToolRuntime 注入、tool governance policy resolution 或 per-run policy override。
 
@@ -817,6 +846,70 @@ HostPolicyProviderSet at composition root
 
 Host 公共接口采用函数式风格，但不得依赖全局隐式单例。公共函数接收明确的 Host handle / context 与 request，返回稳定 snapshot 或 Host event stream。
 
+Service-facing 第一版应表现为一个简单 Host opener / handle，而不是把 scheduler、runner、tooling、memory catch-up、wakeup 或 `HostLocalRuntime` 暴露给上层。调用方形态是打开 Host、取得 / 新建 / 读取 Session、提交 prompt 或控制命令、读取 / 订阅 Session 事件、在 terminal event 中观察 final answer、关闭 Host。内部可以使用 composition root / runtime 装配 command handle、durable store、scheduler、active registry、local execution、ToolRuntime、compactor 与 projection catch-up，但这些只是 Host 内部实现边界。
+
+P10.5 冻结 async-only Host opener / handle。Service-facing opener 名称固定为 `open_host(options)`，并且必须是 async context manager：`async with open_host(options) as host:`。handle methods 与 event stream consumption 均以 async public contract 为准。Host public contract 不提供同步 wrapper，不冻结同步 close / cancel / timeout / stream iteration 语义。CLI 或同步上层如需使用 Host，应在 Service / CLI adapter 边界用 `asyncio.run(...)` 或等价机制包装 async Host contract，不要求 Host 层维护第二套同步 API。
+
+Host opener close 是 Host handle lifecycle 语义，不是 Session / Run 治理事实。`host.close()` 与 `open_host(...).__aexit__` 必须幂等；重复 close 不报错。close 完成后，调用该 handle 上的 `ensure_session`、`create_session`、`get_session`、`close_session`、`purge_session`、`get_run`、`watch_session_events`、`submit_followup`、`cancel_run`、`cancel_session_runs`、`resolve_wait`、`retry_run`、`replay_run` 等 Host API，必须 fail-fast 抛出 typed `HostClosedError` 或等价 Host lifecycle exception。这个错误不写 EventLog，不返回 command-level `invalid_state`，也不与 `Session CLOSED`、not found、purged、retry precondition failed 等业务状态混淆。已经进入 admission / command transaction 的调用按正常事务语义完成；close gate 之后新进入的调用统一抛 closed-handle exception。
+
+Host opener close 会终止当前 handle 持有的本地运行环境，但不得伪装成用户取消。close 流程必须停止 scheduler / promotion / background supervisor，不再启动新的 Attempt；必须关闭或取消当前 handle 持有的 active worker task、lane wait、stream fanout task 与本地 runtime resource，避免进程内任务泄漏。若 close 过程中 active worker 已经产出可确认 terminal event，Host 按正常 ingest / terminal closeout 追加事实。若 active worker 没有可确认 terminal，Host close 不得写 `CANCEL_REQUESTED`、`RUN_CANCELLED`、`RUN_FAILED` 或其它伪装用户意图 / 确认失败的 canonical fact；未收口 active Attempt 后续只能通过 Host lifecycle / Recovery 的 positive orphan proof 路径进入 `ATTEMPT_LOST`，再按 policy 进入 `RUN_RECOVERING` 或 `RUN_LOST`。P10.5 不实现完整 Recovery，但必须保证 opener close 后 Service 不会误以为该 active Run 仍在当前 Host handle 中继续执行。调用方若要表达用户明确停止，应在 close 前显式调用 `cancel_run(...)` 或 `cancel_session_runs(...)`。
+
+P10.5 的 Host opener close shutdown order 是 implementation requirement，不是新的 public API 设计点。推荐顺序是：先关闭 public gate 并拒绝新进入 API；停止 scheduler / promotion / background supervisor，避免启动新 Attempt；关闭 session live watch fanout，让 watcher 正常结束或收到 Host lifecycle termination；取消或关闭当前 handle 持有的 active worker task、lane wait、worker stream consumer task；flush / close projection catch-up 与本地 runtime resources；最后关闭 durable store。全程不得写 `RUN_CANCELLED` / `RUN_FAILED` 或其它 terminal fact 来伪装用户意图；已经在 close 过程中确认的真实 terminal event 仍按正常 ingest / terminal closeout 处理。
+
+P10.5 冻结的是后续真实生产系统 Service 使用的普通多轮生产接线，不是 smoke 专用接线。P10.5 自身必须把真实生产系统 Service 将来接入所需的 Host 普通多轮生产接线做实；真实 CLI / web / GUI 在 P11-P15 实施完毕后会通过 Service 使用这里冻结的 Host public interface / contract 接入，不能等到真实入口接入时再补一条新接线。后续 phase 可以扩展 Recovery、ToolsDiscovery / ScenePrepare、Audit / Tool Trace / Outbox、RemoteProxy 与 Retention / Purge 能力，但不得要求真实入口绕过、替换或重写普通多轮会话的 Host 生产接线。
+
+`open_host(options)` 的 options 只承载打开 Host、驱动 Host -> Engine 本地运行所需的 construction-time 参数。Host public API 保持朴素接口形式：内部运行真正需要外部提供的 durable store / payload / artifact roots、runner / worker factory、全量 business `ToolBundle`、ToolRuntime policy、ContextCompactor、context budget policy、memory catch-up、stream fanout / background supervisor 所需端口和运行目录等依赖，由调用方通过 typed function 参数显式传入；Host 不在 P10.5 引入 ConfigLoader、全局配置系统或 service locator。scheduler、wakeup、active worker registry、dispatch control 等 Host 内部接线由 `open_host` composition root 自行创建或连接，不作为 Service-facing 参数暴露。每次 Run 会变化的参数不得塞进 `open_host` options；它们必须进入对应 public request，例如普通 prompt / per-run tool selection / run-local instruction 进入 `SubmitFollowupRequest`，retry / replay 控制参数进入各自 request，后续若新增 per-run profile / target 也必须作为明确 request contract 讨论和冻结。
+
+一个 `open_host(options)` 表达一个 Host runtime environment 与默认 ordinary Run execution baseline。durable store、scheduler / worker wiring、memory / artifact roots、全量 business `ToolBundle`、Host policy 基线与默认 `RunnerSpec` / `RunnerCallOptions` / `AgentPolicy` 都属于 construction-time baseline。真实生产系统在同一个 Session 的不同 Run 中切换模型是正常需求；P10.5 不通过 `profile_id` / registry lookup 表达这件事，而是允许 `SubmitFollowupRequest` 直接携带可选 typed override 对象：`runner_spec?: RunnerSpec`、`runner_options?: RunnerCallOptions`、`agent_policy?: AgentPolicy`。字段省略时使用 `open_host(options)` 的默认 ordinary Run baseline；字段出现时使用该 Run 显式传入的 typed value。Host 不接收 raw provider client、API key 明文、callable、无结构 dict override、extra payload 或 `policy_overrides`。`RunnerSpec.api_key_ref` 仍只是 secret 引用名，不是 secret 本体。Host admission / dispatch 必须校验并冻结每个 Run 的 effective runner spec / runner options / agent policy 到 Run / Attempt 可解释 snapshot 或 source refs，保证 retry / replay / recovery 能解释当时使用的执行配置。普通每 Run 其它可变项第一版包括显式 `system_prompt`、`user_prompt`、`tool_names` 以及必要的 `client_request_id`、actor / source refs 等 request metadata。后续若新增更细粒度 per-run override，也必须作为 typed request field 讨论并冻结。
+
+LLM compactor 与 ordinary Run 共享同一个 Host runtime environment、durable store、memory / artifact roots、budget governance 与 canonical event / artifact 接线，但不共享每个 Run 的 execution override。compactor 的模型、温度、max tokens、provider 选择、compact scene policy 或等价执行参数，必须作为 `open_host(options)` 的独立 typed construction-time baseline 显式传入，例如 `context_compactor`、`compactor_runner_spec`、`compactor_runner_options`、`compactor_policy`、context budget policy 与 compact artifact root。`SubmitFollowupRequest.runner_spec` / `runner_options` / `agent_policy`、`tool_names`、`system_prompt` 不影响 compactor；compactor 不创建用户可见 Run，不产出 final answer，不使用 business ToolRuntime。后续如需 per-session 或 per-run compact override，必须作为单独 typed public contract 讨论，不能借用 ordinary Run override、metadata 或 extra payload。
+
+Scheduler wakeup ownership 已由本设计冻结，不是 P10.5 待讨论 public contract。`submit_followup(queue)`、`retry_run(...)`、`replay_run(...)`、`resolve_wait(...)`、terminal closeout 与 cancel 释放 active slot 等命令提交后，需要唤醒 scheduler / promotion / dispatch 的地方，都必须通过 Host 内部 after-commit wakeup port 或等价 background supervisor 接线完成。Service 不得调用 scheduler wakeup、读取 dispatch row 或控制 dispatch。P10.5 的责任是把 production `open_host(options)` 中的 command facade、after-commit wakeup port、background supervisor、scheduler 与 shared active worker registry 接到同一 composition root 上，并用 public-path smoke 证明命令 commit 后无需 Service 额外唤醒即可推进执行。
+
+P10.5 冻结的普通本地多轮会话 contract 必须包含 memory catch-up 与 context overflow compact 的 public opener 接线。普通 Service 不得为了完成多轮闭环而直接装配或调用 memory projection、compact artifact store、scheduler pre-start governance、dispatch scheduler 或 RunInputBuilder 内部接口。Host opener / handle 的 typed construction options 必须能接收或配置 ContextCompactor、compactor execution baseline、context budget policy、compact artifact root 与 memory catch-up；Host 内部负责在 accepted / queued Run dispatch 前完成必要 catch-up、compact artifact 写入、canonical compact event 追加、memory projection consumption 与 subsequent RunInputBuilder 注入。P10.5 compact smoke 必须接入真实 compactor adapter；mock / test-double compactor 只能作为低层测试或显式本地辅助回归，不能作为普通本地多轮闭环的 compact success signal，也不得成为 production opener 的隐式默认值。
+
+P10.5 的普通 Service dialing 形态固定为 async Host handle + session-level async event iterator。Service 仍必须保存 Outbox attach / reconnect 所需的 terminal watermark / seen ids，但 P10.5 不实现 Outbox read / drain API；离线 terminal 补读归 Phase 13。以下伪代码表达 P10.5 public contract 形状：
+
+```python
+async with open_host(options) as host:
+    session = await host.ensure_session(...)
+    session_id = session.session_id
+
+    events = host.watch_session_events(session_id)
+    event_task = asyncio.create_task(consume_session_events(events))
+
+    await host.submit_followup(
+        session_id,
+        SubmitFollowupRequest(...),
+    )
+
+    # final answer is rendered by consume_session_events from terminal HostEvent.
+    event_task.cancel()
+```
+
+等价地，调用方可以直接在 async iterator 上消费事件：
+
+```python
+async with open_host(options) as host:
+    session = await host.get_session(session_id)
+
+    events = host.watch_session_events(session.session_id)
+    await host.submit_followup(session.session_id, request)
+
+    async for event in events:
+        render_once_by_terminal_identity(event)
+```
+
+这两个形态都以 `watch_session_events(session_id) -> AsyncIterator[HostEvent]` 为普通聊天主事件入口；`watch_session_events` 是 live watch，不接收 cursor，不负责离线补读。该 async iterator 在 session live watch 路径中产出 Host-owned typed `HostEvent`，不是 raw `EngineEvent`，也不是当前内部 EventLog 补读使用的薄 `HostEventView`。它对齐 Engine `run_agent_messages(...)` 的朴素 async generator 形态：调用方正常用 `async for` 消费；提前停止消费时，由调用方 cancel consumer task 或在返回对象支持 `aclose()` 时显式 `aclose()`，这只关闭本次 watch 订阅，不写 EventLog、不 cancel Run、不影响其它 watcher。terminal `HostEvent` 只是 iterator 中的一个事件，不让 iterator 自动结束；同一 Session 后续 queue / retry / replay / follow-up 事件仍可继续出现。Host handle 已 close 时打开 watch 必须抛 typed `HostClosedError` 或等价 lifecycle exception；session 不存在 / 已 purge 时抛 typed not-found / gone；Session `CLOSED` 仍允许 watch，因为它只拒绝新输入，不禁止读取事件。Host close 时已打开的 iterator 结束或抛 Host lifecycle termination，但不得写 EventLog 或 cancel Run。Service 拿到 `session_id` 后必须把 Outbox terminal 增量补读与 session live watch attach 视为同一个 attach / reconnect 协议：用客户端保存的 `last_seen_terminal_event_sequence` / `seen_terminal_event_ids` 读取 Outbox 中离线 terminal / final answer 增量，同时或随后打开 `watch_session_events(session_id)`，并用 `terminal_event_id` / `event_sequence` / `run_id` 去重，避免离线补读与 live watch 之间漏投或重复展示 terminal answer。一个 Run 的 terminal `HostEvent`，包括 final answer typed view，可在该 Session 的 async event iterator 中观察到。P10.5 不实现 Outbox read / drain API，不把离线 terminal 补读计入 smoke coverage；P10.5 只冻结 attach / reconnect recipe、terminal identity 与去重要求，Outbox concrete projection / read API / delivery queue 继续归 Phase 13。P10.5 不定义 `wait_final_answer(...)` public API；普通 Service 必须从 `watch_session_events(session_id)` 的 terminal HostEvent 取得在线 final answer，smoke 也不得用等待 helper 替代 live watch 主路径。
+
+`HostEvent` 的边界：
+
+- `HostEvent` 是 Host ingest / 校验 / governance / EventLog commit 后形成的 Service-facing typed event。它可以引用原始 EngineEvent provenance，但不得把 raw `EngineEvent` 或 Host internal envelope 原样暴露给 Service。
+- 第一版 `HostEvent` 固定携带 `event_id`、`event_sequence`、`session_id`、`run_id?`、typed kind、dedupe identity 和 display payload。terminal HostEvent 必须包含 typed terminal view；`SUCCEEDED` terminal 必须 inline 可展示的 final answer view，字段固定为 `content`、`filtered`、`degraded`、`finish_reason` 与 terminal status。
+- tool event、thinking delta、content delta 是否展示由 UI 决定；Host 只负责把它们作为 typed HostEvent 暴露为可选择显示的事件，不在 Host 内部决定 UI 展示策略。
+- `HostEventView` 是 EventLog row 的 Host 内部薄读模型 / diagnostic DTO，可服务内部 run-scoped EventLog 补读、debug、diagnostic、drill-down 和局部断言；它不作为普通聊天主事件流的元素类型，也不从 `dayu.host` Service-facing public namespace 导出。
+- Phase 13 的 Audit / Tool Trace / Outbox 与 `watch_session_events` 一样消费 committed EventLog / typed projection input view；它们不需要也不得依赖 `HostEventView`、`watch_session_events` 或 Service-facing `HostEvent` display view，也不得从 raw EngineEvent 直接派生 truth。
+
 类型归属规则：
 
 - `dayu.contracts` 只承载 Host 与 Engine / ToolRuntime 边界都必须理解的层间协作契约，例如现有 `ToolBundle`、`ToolDefinition`、`ToolSchema`、`ToolExecutor`、批式工具调用 / outcome、取消观察 token 与严格 JSON 值。
@@ -833,9 +926,8 @@ get_session(host, session_id) -> SessionSnapshot
 close_session(host, session_id, request) -> SessionSnapshot
 purge_session(host, session_id, request) -> PurgeSessionResult
 
-start_run(host, request) -> RunSnapshot
 get_run(host, run_id) -> RunSnapshot
-stream_run_events(host, run_id, cursor, limit?) -> HostEventStream
+watch_session_events(host, session_id) -> AsyncIterator[HostEvent]
 cancel_run(host, run_id, request) -> RunSnapshot
 cancel_session_runs(host, session_id, request) -> SessionSnapshot
 submit_followup(host, session_id, request) -> FollowupSnapshot
@@ -843,6 +935,15 @@ retry_run(host, run_id, request) -> RunSnapshot
 replay_run(host, run_id, request) -> RunSnapshot
 resolve_wait(host, wait_id, request) -> RunSnapshot
 ```
+
+以下能力不属于普通 Service-facing public contract：
+
+- `start_run(...)` / `_start_run(...)`：`_start_run` 是 Host 内部 admission primitive，普通 Service 不可调用。
+- `create_host_command_handle(...)`：降为 Host 内部 / 低层测试 composition primitive，不作为 Service 打开 Host 的入口；Service-facing 打开入口只有 `open_host(options)`。
+- `HostLocalRuntime`、`HostLocalExecutionOptions`：均为 Host 内部 contract 或 implementation type，不从普通 Service-facing public namespace 暴露。
+- scheduler / wakeup / dispatch control API：Service 不得调用 scheduler wakeup、读取 dispatch row 或控制 dispatch；这些接线由 `open_host(options)` 内部完成。
+- `stream_run_events(...)` / `HostEventView`：只作为 Host 内部 diagnostic / detail / debug / drill-down 补读契约保留，不进入普通 Service-facing public contract。若未来需要公开 run-scoped diagnostic read API，必须另行讨论并定义不同于内部 `HostEventView` 的 public typed DTO。
+- public payload reader / `read_payload(ref)` / `get_run_result(...)`：P10.5 不定义这些 public API。final answer 只能通过 terminal HostEvent 展示；大 payload、分页或 result read-model 如未来需要，必须另行讨论 public contract，不能成为普通多轮主路径。
 
 外部语义采用函数式操作。`retry_run(host, run_id, request)` 与 `replay_run(host, run_id, request)` 的语义分别是 `retry(run)` / `replay(run)`：输入是源 Run，输出是关联的新 RunSnapshot；它们不是在原 Run 上调用 `Run.retry` / `Run.replay` 来重开终态。
 
@@ -854,10 +955,9 @@ Phase 4 public function behavior matrix：
 | `create_session` | 完整实现 | 只依赖 Phase 1-3 durable store、slot binding 与 session lifecycle。 |
 | `get_session` | 完整实现 | 从 durable truth / minimal read path 构造 snapshot，不触发 projection worker。 |
 | `close_session` | 完整实现 | 关闭新输入入口；不 cancel、不 purge。 |
-| `start_run` | 完整实现 Phase 1-3 可闭环 admission | 支持 `queue` / `reject` / `attach_active` 的当前 durable 语义；`attach_active` 返回 active `RunSnapshot`，不新增 canonical fact。 |
 | `submit_followup(queue)` | 完整实现 | 在同一 admission transaction 内吸收 active Run 竞态；结果用 `accepted_run_id` + `accepted_run_status` 表达。 |
 | `get_run` | 完整实现 | 从 durable Run / Attempt truth 构造 snapshot。 |
-| `stream_run_events` | 完整实现 EventLog-backed read path | 全局 EventLog cursor 是唯一 cursor truth；Phase 4 不引入 projection truth。 |
+| internal `stream_run_events` / run-scoped EventLog 补读 | 完整实现 EventLog-backed read path | 全局 EventLog cursor 是唯一 cursor truth；Phase 4 不引入 projection truth；P10.5 后该路径降为内部 diagnostic / detail contract。 |
 | `cancel_run` queued / pre-dispatch `STARTING` | 完整实现 | 覆盖 Phase 1-3 已有可闭环路径：`QUEUED` 与 dispatch record 尚未进入 dispatching 的 Attempt `STARTING`。 |
 | `cancel_session_runs` queued / pre-dispatch `STARTING` | 子集实现并追踪后续完善 | Phase 4 只批量覆盖上述 `cancel_run` 可闭环子集；dispatching / active worker、`WAITING`、`RECOVERING` cancel deferred。 |
 | `submit_followup(steer)` | stable unsupported / deferred | Phase 4 只冻结 envelope、validation、error/detail contract；public facade 返回 `unsupported_operation`。完整 Attempt switching 由后续 steer / dispatch / wait owner 落地。 |
@@ -988,9 +1088,14 @@ reason
 ```text
 session_id
 client_request_id
-input
+system_prompt?
+user_prompt
 behavior: queue | steer
 target_run_id?        # required when behavior=steer
+tool_names?           # None / omitted = all business tools; empty = no business tools; non-empty = selected tool names
+runner_spec?          # optional typed per-run override; omitted = open_host default
+runner_options?       # optional typed per-run override; omitted = open_host default
+agent_policy?         # optional typed per-run override; omitted = open_host default
 ```
 
 `RetryRunRequest`：
@@ -1019,17 +1124,19 @@ observed_at
 
 Run 接口语义：
 
-- `start_run`：接受显式新建独立 Run 目标，按 `(session_id, client_request_id)` 幂等创建或返回同一个 Run；根据 admission 决定立即 `RUNNING`、进入 `QUEUED`、拒绝或 attach active。它不是聊天界面每次发送普通 prompt 的默认入口。
+- `submit_followup(queue)` 是 Service / UI 发送普通 prompt 的统一入口，包括同一 Session 的第一条 prompt。调用方取得 Session 后不需要判断“首轮调用 `start_run`、后续调用 `submit_followup`”；Host 在 admission transaction 内决定该输入是直接成为可启动 Run，还是排到当前 active Run 后面。
 - `get_run`：读取 RunSnapshot；不触发执行、不触发 queue promotion、不改变 Run / Attempt 状态。
-- `stream_run_events`：从全局 `event_sequence` cursor 补读目标 Run 的事件；断线重连只依赖 cursor，不依赖内存订阅是否仍存在。
+- `watch_session_events` / session-level Host event stream：Service / UI 观察 agent session 的主事件流。在线 / 已 attach 客户端通过 live watch 接收目标 Session 的事件，适合多客户端打开同一 Session、排队 Run、steer、retry / replay 链路和 final answer 展示。调用方可以先打开 session event stream，再并发提交 `submit_followup(...)` / `retry_run(...)` / `replay_run(...)` 等 mutation；事件观察与命令提交是两条并行通道，不要求 `submit_followup` 后才开始读某个 run stream。`watch_session_events` 不接收 cursor，不承担离线补读；Service 取得 Session 后进入 attach / reconnect 流程：先按客户端已保存的 terminal watermark / seen ids 补读 Outbox terminal 增量，再进入或保持 session live watch；实现上必须用 `terminal_event_id` / `event_sequence` / `run_id` 去重，避免 Outbox drain 与 live watch attach 之间出现漏消息窗口。断线后的在线 terminal/final answer 补读由 Outbox terminal delivery queue 承接；未 attach / 离线渠道不靠 live watch 接收中间过程。
+- 普通 Service 的官方事件入口只有 `watch_session_events(session_id)`。普通多轮 recipe、thin Service proof、P10.5 no-tool / mock-tool / real-runner smoke 都必须走 session-level live watch，不能用内部 run-level EventLog 补读绕过 session live watch 来证明多轮闭环。
+- 内部 `stream_run_events` / run-scoped EventLog 补读：从全局 `event_sequence` cursor 补读目标 Run 的事件。它是 Host 内部 diagnostic / detail / debug / drill-down helper，只服务内部测试、排查某次 retry / replay source run 或运维诊断；不得和 `watch_session_events` 并列成为 Service-facing 聊天入口。若未来要公开给 Run detail 页面，必须先定义 public diagnostic event DTO，不得直接暴露内部 `HostEventView`。
 - `close_session`：关闭 Session 新输入入口，按 `(session_id, client_request_id)` 幂等；不取消、不终止、不删除已有 Run。
 - `purge_session`：清理已关闭且全部 Run 终态的 Session，按 `(session_id, client_request_id)` 幂等；删除可恢复事实与 projection，只保留最小 purge tombstone / audit record。
 - `cancel_run`：接受取消请求，按 `(run_id, client_request_id)` 幂等；queued Run 直接 `CANCELLED`，pre-worker `STARTING` Run 可直接 `CANCELLED`，包括 `pending`、`waiting_for_lane` 以及 WorkerProxy accepted 前的 `dispatching`。active worker cancel 进入 `CANCELLING` 并向当前 Attempt 传播 cancel 的完整能力由 Phase 5 落地；`WAITING` 与 `RECOVERING` cancel 分别由 Phase 7 / Phase 11 落地。
 - `cancel_session_runs`：接受 session-scope cancel 请求，按 `(session_id, client_request_id)` 幂等；取消该 Session 下所有未终态 Run，不影响其它 Session。Phase 4 只实现 queued / pre-dispatch `STARTING` 子集，完整 pre-worker `dispatching` / active worker、`WAITING`、`RECOVERING` cancel 必须由 Phase 5 / 7 / 11 补齐。
-- `submit_followup`：接受同一 Session 的会话延续输入。聊天界面的普通 prompt 入口应统一使用该接口，不应由调用方先读 active Run 再在 `start_run` / `submit_followup` 之间选择。`behavior=queue` 由 Host admission 在同一事务内决定排队或直接启动；`behavior=steer` 必须命中 `target_run_id` 所指的当前 active Run 并切换 Attempt。Phase 4 只冻结 steer envelope、validation 与 error/detail contract，public facade 对 steer 返回 `unsupported_operation`；完整 Attempt switching 后续落地。
+- `submit_followup`：接受同一 Session 的普通 prompt 或控制输入。聊天界面的普通 prompt 入口应统一使用该接口，不应由调用方先读 active Run 再在 `start_run` / `submit_followup` 之间选择。`behavior=queue` 由 Host admission 在同一事务内决定排队或直接启动；`behavior=steer` 必须命中 `target_run_id` 所指的当前 active Run 并切换 Attempt。Phase 4 只冻结 steer envelope、validation 与 error/detail contract，public facade 对 steer 返回 `unsupported_operation`；完整 Attempt switching 后续落地。
 - `retry_run`：公开 Host control API，由调用方主动发起；函数式语义为 `retry(run)`。它在 confirmed failure / recoverable failure 后创建关联的新 Run。原 Run 保持终态不可变；新 Run 可以按 retry policy 复用旧 Run 已接受工具事实，并创建自己的 Attempt。
 - `replay_run`：公开 Host control API，由调用方主动发起；函数式语义为 `replay(run)`。它只用于 final answer 格式、schema、结构或输出 envelope 失败时创建关联的新 Run。原 `SUCCEEDED` Run 不重开；新 Run 默认复用旧 Run 已接受工具事实，并以 no-tool messages 调用做结构修复。事实内容脏、幻觉、业务归因错误、证据不足或证据冲突不属于 replay 场景。
-- `resolve_wait`：等待结果接收与治理入口；接收 poll / callback / manual 已取得的结果，关闭 wait record，append tool terminal/result fact，并创建新 Attempt resume。它不负责等待外部长事务完成。
+- `resolve_wait`：等待结果接收与治理入口；接收 poll / callback / manual 已取得的结果，关闭 wait record，append tool terminal/result fact，并创建新 Attempt resume。它不负责等待外部长事务完成，不启动 poll loop，不阻塞等待外部结果，也不承载 callback HTTP endpoint / callback auth / replay 防护。
   Phase 7 起，`ResolveWaitRequest.outcome_ref: str` 必须被强类型 `outcome` envelope 替代；request 至少区分 completed /
   failed / cancelled / lost。外部结果引用或 payload ref 只能作为 `outcome` envelope 的受限字段，不能替代显式 outcome
   类型与 Host 状态机含义。`resolve_wait(host, wait_id, request)` 成功返回当前 `RunSnapshot`。
@@ -1038,27 +1145,32 @@ Run 接口语义：
 
 Run 读取与结果边界：
 
-- Run 当前结果通过 `get_run` 的 `RunSnapshot.terminal result summary` 与 `stream_run_events` 的 terminal event 暴露。
-- 第一版不单独定义 `get_run_result`；如果后续需要大结果分页或多版本 replay result，可作为 read-model API 扩展，不能成为事实真源。
-- Session timeline 仍通过 `get_session` snapshot 或后续 read-model API 暴露；它不能替代 `stream_run_events` 的恢复 cursor。
+- Run 当前结果通过 `get_run` 的 `RunSnapshot.terminal result summary`、session-level Host event stream 的 terminal HostEvent 暴露。内部 run-scoped EventLog 补读也能按 Run 维度读取同一 terminal fact，但只作为 diagnostic / detail / debug / drill-down 内部视图。P10.5 不定义 `wait_final_answer(run_id)` public API；final answer 的普通 Service 主展示路径只能是 `watch_session_events(session_id)` 的 terminal HostEvent。
+- P10.5 不定义 public payload reader、`read_payload(ref)` 或 `get_run_result(...)`；普通 Service 不得为了展示 final answer 读取内部 payload 表。若后续需要大结果分页或多版本 replay result，必须作为新的 read-model public contract 单独讨论，且不能成为事实真源。
+- Session timeline 仍通过 `get_session` snapshot 或后续 read-model API 暴露；它不能替代 Host event stream 的 live watch 语义，也不能替代 Outbox 的离线 terminal 投递职责。
 
 接口分层：
 
-- `ensure_session`、`create_session`、`get_session`、`close_session`、`purge_session`、`start_run`、`get_run`、`stream_run_events`、`cancel_run`、`cancel_session_runs`、`submit_followup` 是多入口稳定公共能力。
+- `ensure_session`、`create_session`、`get_session`、`close_session`、`purge_session`、`get_run`、`watch_session_events`、`cancel_run`、`cancel_session_runs`、`submit_followup` 是普通 Service-facing 稳定公共能力。
+- `stream_run_events` 不进入 P10.5 普通 Service-facing public contract；现有实现若保留，只能作为 Host 内部 diagnostic / detail read path。未来若要公开 run-scoped diagnostic read API，必须另行讨论 public contract，且不能直接暴露内部 `HostEventView`。
 - `cancel_session_runs` 是客户端退出 / supervisor shutdown 的便利公共能力；它只取消指定 Session 下未终态 Run，不表达客户端拥有的 Session 集合。
 - `ensure_session` 表示“给我这个 slot 的当前会话，必要时创建并绑定”。
 - `create_session` 表示“明确分配一个新 Session”，可选绑定 slot。
+- `start_run` 不作为 Service-facing public API 暴露。内部 admission primitive 命名为 `_start_run`，用于表达“创建独立 Run”的低层语义，但普通 Service 不应依赖它；P10.5 必须把包根 public export、README 与 tests 调整到这一边界。
 - `retry_run`、`replay_run` 是 Host control API；UI / Service 可以暴露，但必须保留 `retry(run)` / `replay(run)` 的函数式语义、Host 幂等与状态机。
 - `resolve_wait` 是 Host 内部 / adapter API；poller、callback handler、manual admin 入口都必须走它，不能各自写 Run 状态。
-- 读取 Session timeline 通过 `get_session` 的 snapshot 或后续 read-model API 暴露；它必须从 EventLog / projection 读取，不触发执行。
+- P10.5 ordinary local multi-turn public contract 只冻结并验证 `WAITING` / wait record / `resolve_wait(...)` 的 public resume path：调用方或 tool adapter 已经通过 poll、callback 或 manual 操作拿到外部结果后，调用 Host public `resolve_wait(...)`，Host 通过 after-commit wakeup 创建 resume Attempt、推进 dispatch，并在 session-level `watch_session_events(...)` 中暴露后续 terminal HostEvent。生产级 callback endpoint、callback auth / replay、poller 后台 loop、backoff / in-flight fencing 与 external job physical cancel / revoke 不属于 P10.5 阻塞项；它们是后续生产集成 / scale owner，不能改变 `resolve_wait(...)` 作为唯一等待结果治理入口的边界。
+- 读取 Session timeline 通过 `get_session` 的 snapshot、session-level Host event stream 或后续 read-model API 暴露；它必须从 EventLog / projection 读取，不触发执行。离线 / 未 attach 客户端的 final answer 通知通过 Outbox terminal delivery queue 读取，不通过 session live watch 追补完整中间过程。
 
 Snapshot 最小语义：
 
 - `SessionSnapshot`：`session_id`、status、slot、active run、queued runs、timeline cursor。timeline cursor 使用全局 `event_sequence` cursor；session-local cursor 只能作为 read model 优化，不能替代全局 cursor。
 - `RunSnapshot`：`run_id`、`session_id`、status、current attempt、terminal result summary、event_sequence cursor、source_run_id?、source_run_relation?、outbox summary。
-- `FollowupSnapshot`：accepted input ref、behavior、`accepted_run_id`、`accepted_run_status`、current cursor。`accepted_run_status` 使用公共 `RunStatus`，queue 分支可为 `QUEUED` 或 `RUNNING`，用于表达无 active Run 时直接启动的新 Run。`queued_run_id?` 若保留，只能作为派生可选字段表达真正处于 `QUEUED` 的 Run，不能作为 queue 分支唯一结果字段；steer 分支可携带 `target_run_id?`，但 Phase 4 steer 返回 `unsupported_operation`，不会产生 accepted steer snapshot。
+- `FollowupSnapshot`：accepted input ref、behavior、`accepted_run_id`、`accepted_run_status`、command commit event sequence / durable read watermark。`accepted_run_status` 使用公共 `RunStatus`，表达 command commit 后该 Run 的 durable 状态；该 watermark 不得被解释为 `watch_session_events` 的 cursor，因为 session live watch 不接收 cursor。`submit_followup(queue)` 有 active / start-blocking Run 时通常为 `QUEUED`，无 active / start-blocking Run 时为 `ACCEPTED`，随后由 scheduler / pre-start governance 推进到 `RUNNING` 或 terminal。`queued_run_id` 不进入普通 Service-facing 主 contract；如内部或 diagnostic view 保留，只能作为派生可选字段表达真正处于 `QUEUED` 的 Run，不能承载 accepted / running Run id，也不能替代 `accepted_run_id`。steer 分支可携带 `target_run_id?`，但 Phase 4 steer 返回 `unsupported_operation`，不会产生 accepted steer snapshot。
 - `PurgeSessionResult`：`session_id`、purged marker、purge tombstone ref、deleted counts / digest。
-- `HostEventStream`：Host event stream 的返回对象，按全局 `event_sequence` 递增返回，携带 next `event_sequence` cursor。
+- `HostEvent`：session live watch 的 Service-facing typed event。它由 committed EventLog / Host ingest result 派生，不能是 raw `EngineEvent` passthrough；terminal HostEvent 必须 inline typed terminal / final answer display view。
+- `HostEventView`：EventLog row 的 Host 内部薄读模型 / diagnostic DTO，主要用于内部 run-scoped EventLog 补读、diagnostic / detail / debug / drill-down、测试局部断言，字段只包含 event identity、class/type、scope 与 payload ref / digest；不从 `dayu.host` Service-facing public namespace 导出。
+- session live watch：`watch_session_events(session_id) -> AsyncIterator[HostEvent]`，返回 typed `HostEvent` 异步流，必须保留全局 `event_sequence` ordering truth。只有内部 run-level EventLog 补读接收 cursor；普通 Service-facing live watch 不接收 cursor。`HostEventStream` 若在代码中保留，只能作为内部实现或类型别名表达 async event iterator，不得成为需要 Service 理解的 context manager / subscription handle。
 
 公共错误分类至少包括：
 
@@ -1090,15 +1202,15 @@ SteerConflictDetail:
 
 `SteerConflictDetail` 只携带足以解释 steer precondition 失败的 Run id 与状态摘要，不嵌入完整 `RunSnapshot`，不暴露 Host durable row。后续新增错误 detail 时必须新增具体 typed detail，不得把显式参数塞进无结构 payload。
 
-`stream_run_events` 从 EventLog `event_sequence` cursor 补读，不触发新执行。Phase 4 cursor contract：
+内部 run-scoped EventLog 补读从 EventLog `event_sequence` cursor 读取，不触发新执行。Phase 4 既有 cursor contract 在 P10.5 后降为内部 diagnostic / detail read path：
 
 - 全局 EventLog `event_sequence` 是唯一 cursor truth；projection checkpoint、session-local cursor、client sequence 或内存订阅位置都不能替代它。
-- public signature 包含可选 `limit`；未传时使用 Host public read 默认 limit，超过 Host public read 最大 limit 时返回 `invalid_state` 或等价 validation error，不静默无上限扫描。默认值和最大值必须以公共常量暴露，不能在实现中散落魔法数字。
-- `stream_run_events(host, run_id, cursor, limit?)` 只返回与目标 `run_id` 相关的 HostEventView；需要 session timeline 时走 `get_session` snapshot 或后续 read-model API，不把 session projection 当作本接口真源。
+- internal signature 包含可选 `limit`；未传时使用 Host read 默认 limit，超过 Host read 最大 limit 时返回 `invalid_state` 或等价 validation error，不静默无上限扫描。默认值和最大值必须集中定义，不能在实现中散落魔法数字。
+- 内部 run-scoped EventLog 补读只返回与目标 `run_id` 相关的 `HostEventView`；需要 Service-facing session timeline 时走 `get_session` snapshot、`watch_session_events` 或后续 read-model API，不把 session projection 当作本接口真源。
 - filtering 发生在 EventLog read path 上，`next_cursor` 以本次已经扫描过的最大全局 `event_sequence` 为准；即使过滤后结果为空，只要扫描推进，`next_cursor` 也必须前进，避免重连时重复扫描同一窗口。
 - 如果没有扫描到任何大于 cursor 的 EventLog row，返回空 events，`next_cursor` 等于输入 cursor。
-- `HostEventView` 是 EventLog row 的公共视图映射：携带 `event_id`、`event_sequence`、event type / class、`run_id`、`session_id?`、payload ref / digest 与必要的 public summary；不得暴露 durable row 私有列，也不得从 projection 派生新的事实。
-- Phase 4 不引入 projection truth；Phase 8 可以基于同一 cursor contract 建 projection / read model，但不能改变本接口的 truth 来源。
+- `HostEventView` 是 EventLog row 的内部视图映射：携带 `event_id`、`event_sequence`、event type / class、`run_id`、`session_id?`、payload ref / digest 与必要 summary；不得暴露 durable row 私有列，也不得从 projection 派生新的事实。`HostEventView` 不承担 Service-facing live watch display payload；session live watch 必须产出 typed `HostEvent`。
+- Phase 4 不引入 projection truth；Phase 8 可以基于同一 cursor contract 建 projection / read model，但不能改变内部补读路径的 truth 来源。
 
 ## 12. Follow-up 与 Steer
 
@@ -1109,10 +1221,11 @@ SteerConflictDetail:
 `queue` 语义：
 
 - `submit_followup(queue)` 必须由 Host 在同一个 admission transaction 内吸收 active Run 竞态。
-- 当前 Session 有 active Run 时，follow-up 输入排队为后续 Run 的输入，不打断当前 active Run。
-- 当前 Session 没有 active Run 时，follow-up 创建并启动新 Run；execution target 通过 Host policy 归一化并持久化。
+- 当前 Session 有 active / start-blocking Run 时，follow-up 输入排队为后续 Run 的输入，不打断当前 active Run。
+- 当前 Session 没有 active / start-blocking Run 时，follow-up 创建 `ACCEPTED` Run；execution target 通过 Host policy 归一化并持久化，随后由 scheduler / pre-start governance 启动。
+- 普通多轮 follow-up 使用当前 Host handle 的 default execution baseline，除非 `SubmitFollowupRequest` 显式携带 typed `runner_spec`、`runner_options` 或 `agent_policy` override。`SubmitFollowupRequest` 不携带 per-run target / profile id；每轮可变项第一版通过 typed `system_prompt`、`user_prompt`、`tool_names` 与可选 typed execution override 对象表达。
 - 排队输入使用 `(session_id, client_request_id)` 幂等。
-- queue follow-up 的 public result 必须使用 `accepted_run_id` + `accepted_run_status` 表达被接受的新 Run。active Run 存在时通常返回 `accepted_run_status=QUEUED`；无 active Run 时返回 `accepted_run_status=RUNNING` 或当前 admission 真实状态。`queued_run_id` 不能承载 running Run id。
+- queue follow-up 的 public result 必须使用 `accepted_run_id` + `accepted_run_status` + command commit event sequence / durable read watermark 表达被接受的新 Run。active / start-blocking Run 存在时通常返回 `accepted_run_status=QUEUED`；无 active / start-blocking Run 时返回 `accepted_run_status=ACCEPTED`。调用方不应根据 submit 返回值推断 Engine 已开始执行；是否进入 `RUNNING` / terminal 必须通过 `watch_session_events(...)` 或 `get_run(...)` 观察。`watch_session_events` 没有 cursor；这里的 watermark 只用于解释 command commit 后的 durable 读取位置。`queued_run_id` 不作为普通 Service-facing contract 字段；若为兼容内部 diagnostic 暂留，也不能承载 accepted / running Run id。
 - `submit_followup(queue)` 的 `invalid_state` / `conflict` 不应表示 active Run 竞态；它应表示 Session closed、幂等冲突、权限不满足、输入不合法等真实错误。
 
 `steer` 语义：
@@ -1173,7 +1286,7 @@ steerable Run 状态只有 `RUNNING` 与 `WAITING`。`CANCELLING`、`RECOVERING`
 - 目标 Run 已 terminal：返回 `invalid_state`；聊天 UI 可用同一条输入重新调用 `submit_followup(queue)`，控制型 UI 可以只提示用户 steer 已失效。
 - 目标 Run 是当前 active Run 但状态不可 steer：返回 `invalid_state`；调用方可选择 cancel、queue 或稍后重试。
 
-Host 不自动把 steer 降级成 queue / start_run / replay；这些是 UI / Service 的显式策略。
+Host 不自动把 steer 降级成 queue / replay；这些是 UI / Service 的显式策略。
 
 terminal / steer 竞态规则：
 
@@ -1188,7 +1301,7 @@ terminal / steer 竞态规则：
 - 已 accepted 的用户输入是 `USER_INPUT_ACCEPTED` canonical fact，不支持原地修改、覆盖或删除。
 - 用户在 final answer 返回前取消 prompt A、编辑后发送 prompt B 时，Host 真源必须保留两条输入事实：prompt A 对应 Run A 并最终 `CANCELLED`，prompt B 对应新的 Run B。
 - 聊天 UI 可以在 Session timeline projection 中折叠或弱化显示已取消的 prompt A，但这不能改变 EventLog、RunInputBuilder、audit、memory 或 recovery 事实。
-- prompt B 必须通过 `submit_followup(queue)` 或显式 `start_run` 进入 Host；聊天界面默认使用 `submit_followup(queue)`。
+- prompt B 必须通过 `submit_followup(queue)` 进入 Host；聊天界面默认使用 `submit_followup(queue)`。
 
 ## 13. EventLog
 
@@ -1240,7 +1353,7 @@ event_log
 - client operation id、remote event identity、canonical event identity 必须分层。`client_request_id` 标识客户端 API 操作幂等；remote event identity 标识 Proxy / Stub / EngineWorker 回传来源事件；canonical `event_id` 标识 Host EventLog 中单条 canonical fact。
 - 一个 remote event 如果映射为多个 canonical events，每个 canonical event 都必须有独立、稳定、可去重的 identity，例如由 `execution_id`、remote event identity、canonical event type 与 sub-index 派生。Host-generated state transition event 也必须有明确幂等来源，不能混用 `client_request_id` 或 remote event identity。
 - `run_sequence` / `session_sequence` 可作为 read model 优化，但不得替代全局 `event_sequence`。
-- `stream_run_events(run_id, cursor, limit?)` 使用全局 `event_sequence` cursor 过滤目标 run，保证断线重连稳定补读。空结果也必须返回稳定 `next_cursor`：扫描窗口有推进时使用本次扫描过的最大全局 sequence，没有新 row 时保持输入 cursor。Phase 4 不引入 projection cursor truth。
+- 内部 run-scoped EventLog 补读使用全局 `event_sequence` cursor 过滤目标 run，保证诊断补读稳定。空结果也必须返回稳定 `next_cursor`：扫描窗口有推进时使用本次扫描过的最大全局 sequence，没有新 row 时保持输入 cursor。Phase 4 不引入 projection cursor truth；P10.5 后该路径不作为普通 Service-facing public contract。
 - 远端事件携带的 sequence 只用于 remote-side ordering / diagnostics；是否作为 `canonical_fact` 进入 EventLog 由 Host 决定，并由 Host 重新分配 `event_sequence`。
 
 idempotency record primitive：
@@ -1366,7 +1479,7 @@ canonical event 的 required fields 不能被塞进无结构 `metadata`；`metad
 control event 的 `run_id` 绑定规则：
 
 - `STEER_REQUESTED` 的 `run_id` 是被 steer 的目标 Run。
-- `submit_followup(queue)` 不引入独立 `FOLLOWUP_QUEUED` canonical event；它的 canonical 表达是 `USER_INPUT_ACCEPTED` 加 `RUN_ACCEPTED`，并按 active Run 竞态结果追加 `RUN_QUEUED` 或 `RUN_STARTED`。
+- `submit_followup(queue)` 不引入独立 `FOLLOWUP_QUEUED` canonical event；它的 canonical 表达是 `USER_INPUT_ACCEPTED` 加 `RUN_ACCEPTED`，并在命中 active / start-blocking Run 时追加 `RUN_QUEUED`。`RUN_STARTED` 由后续 scheduler / pre-start governance 追加，不由 submit command 直接追加。
 - `RETRY_REQUESTED` 与 `REPLAY_REQUESTED` 的 `run_id` 是源 Run；关联的新 Run 必须通过后续 `RUN_ACCEPTED` 的 `source_run_id` / `source_run_relation` 或等价 typed payload 表达。
 - `RESUME_REQUESTED` 的 `run_id` 是从 `WAITING` / `RECOVERING` 继续的同一 Run。
 - `CANCEL_REQUESTED` 的 `run_id` 是被取消的 Run。
@@ -1543,8 +1656,11 @@ EventLog 是真源；Run result、Session timeline、Host event stream、audit�
 get_run(run_id)
   -> RunSnapshot(status, terminal summary, active attempt, cursors)
 
-stream_run_events(run_id, cursor, limit?)
-  -> ordered Host event stream from EventLog event_sequence cursor
+watch_session_events(session_id)
+  -> live Host event stream for a Session, ordered by EventLog event_sequence
+
+internal stream_run_events(run_id, cursor, limit?)
+  -> internal run-scoped diagnostic / detail / debug stream from EventLog event_sequence cursor
 
 get_session(session_id)
   -> SessionSnapshot(session status, active run, queued runs, timeline summary)
@@ -1555,20 +1671,23 @@ get_session(session_id)
 - `RunResult` 是 Run 终态投影，不是事实真源。
 - `Session timeline` 是 UI / read model，不是事实真源。
 - Session timeline 必须能表达“已取消的用户输入”和后续新输入是两条不同 `USER_INPUT_ACCEPTED`。聊天 UI 可以折叠或弱化 cancelled input，但不能把新输入建模为旧输入的 edit。
-- `stream_run_events` 不触发新执行。
+- `watch_session_events` 是普通 Service-facing 官方事件入口：在线 / 已 attach 客户端通过 live watch 接收 attach 之后的 Session 事件；它不接收 cursor，不承担离线补读。
+- internal `stream_run_events` 不触发新执行，只提供 Host 内部 run-scoped diagnostic / detail / debug / drill-down 读取，不进入普通 Service 多轮 recipe、public contract 或 smoke 主路径。
 - 投影损坏或缺失时应能从 EventLog 重建。
 - resume、memory、audit 责任链必须读取 EventLog canonical facts。
 
 Outbox：
 
 - Run terminal fact 提交后，final answer 已成为 Host 真源中的结果。
-- 在线 / 已 attach 客户端的阅读路径是 Host event stream、Session timeline、RunSnapshot 或 read model；断线后通过 cursor 或 snapshot 补读。
+- 在线 / 已 attach 客户端的阅读路径是 Host event stream、Session timeline、RunSnapshot 或 read model；未 attach / 离线期间错过的 terminal/final answer 通知通过 Outbox terminal watermark / seen terminal ids 补读。P10.5 只冻结这一 attach / reconnect recipe 与 terminal identity / 去重边界，不实现 Outbox concrete read / drain API；Outbox projection、delivery queue、concrete read / drain API 与离线 terminal delivery smoke 归 Phase 13。
 - Outbox 不是客户端阅读 final answer 的通用接口，也不是 UI read model。
 - Outbox 是离线 / 外部投递路径的 durable terminal delivery queue，表达 terminal result 可投递 / 可通知的 durable item。
 - Outbox 解决的问题是：离线客户端或外部渠道不需要回放中间过程，也不能丢 final answer / terminal notification。
 - Outbox 不包含完整 run timeline，不补 preview / progress / reasoning / streaming content。
 - 在线阅读路径和 Outbox 离线投递路径必须指向同一个 terminal identity。UI / Service 应使用 `terminal_event_id` / `event_sequence` / `run_id` 去重，不得用 final answer 文本内容去重。
-- UI 本地聊天记录应保存已展示 terminal answer 的 cursor，例如 `last_seen_terminal_event_sequence` 或 `seen_terminal_event_ids`。客户端重连时，Service / channel adapter 按该 cursor 从 Outbox 读取 terminal 增量；已展示过的 terminal item 不得作为新消息重复投递。
+- UI 本地聊天记录应保存已展示 terminal answer 的 terminal watermark，例如 `last_seen_terminal_event_sequence` 或 `seen_terminal_event_ids`。客户端重连时，Service / channel adapter 按该 watermark 从 Outbox 读取 terminal 增量；已展示过的 terminal item 不得作为新消息重复投递。
+- Service 取得或重新打开 Session 后，必须把 Outbox terminal 增量补读和 session live watch attach 视为一个 attach / reconnect 协议。业务语义上先补离线 terminal，再接入 live watch；实现上可以先建立 `watch_session_events(session_id)` 再 drain Outbox，也可以先 drain Outbox 再打开 live watch，但必须依靠 `terminal_event_id` / `event_sequence` / `run_id` 去重，并证明两步之间没有漏投 terminal 的窗口。
+- Outbox 只补未 attach / 离线期间的 terminal/final answer 通知，不补完整中间过程；reasoning delta、content delta、tool progress、preview 等在线过程事件只属于 session live watch / read model。
 - Host 不负责 deliver to UI，不判断哪些客户端应该收到，不记录 GUI / CLI / WeChat / Web 的 channel 投递成功状态。
 - Session 不持有唯一 default delivery target；HostCallContext 不包含 delivery target / delivery hint。
 - 具体投递目标、投递成功状态、channel retry、WeChat / Web / notification binding 属于 Service / UI / channel adapter。
@@ -1585,7 +1704,7 @@ Outbox：
 Host EventLog
   -> Host event stream / Session timeline / RunSnapshot
       -> UI read path: GUI / Web / CLI / attached clients read here
-      -> UI stores seen terminal cursor / terminal ids in local or Service state
+      -> UI stores seen terminal watermark / terminal ids in local or Service state
 ```
 
 OutboxSink 路径：
@@ -1606,10 +1725,10 @@ outbox item idempotency key 必须由 terminal event identity、`run_id` 和 res
 ```text
 UI restores local chat history
   -> reads last_seen_terminal_event_sequence or seen terminal_event_ids
-  -> Service / channel adapter queries Outbox terminal items after cursor
+  -> Service / channel adapter queries Outbox terminal items after terminal watermark
   -> returns only unseen final answer / terminal notification items
   -> UI upserts by terminal_event_id / run_id before display
-  -> UI / Service advances seen cursor after display or delivery ack
+  -> UI / Service advances seen terminal watermark after display or delivery ack
 ```
 
 OutboxSink 只读 EventLog / Run durable truth，并写 outbox projection / work queue。它不能 append EventLog、不能更新 Run / Attempt，也不能改变 terminal 结果。
@@ -1798,7 +1917,7 @@ tool declaration / external tool registration module
 
 外部工具注册组件负责收集业务工具并生成业务 `ToolBundle`。它可以使用显式 provider 列表、配置绑定、包入口或 Service 装配；这些只是 discovery adapter，不改变 Host 语义契约。新增业务工具应通过新增工具包 / provider / 配置装配完成，不要求修改 Host 源码。
 
-Host construction input 只能接收 `HostToolingOptions` 这样的 typed options：业务 `ToolBundle`、工具来源 refs、framework tool policy view 与后续治理所需的可解释 digest/ref。Host 不接收 discovery adapter 本体，不调用 provider 列表，不扫描业务包，也不把 per-run `tool_profile_ref` 作为 Phase 1 能力。未来若支持多个 scene tool profile，必须先定义 profile registry / ref 的 typed contract，并保证 profile 选择冻结到 Attempt snapshot；在此之前，Phase 1 只支持单个 construction-time business `ToolBundle`。
+Host construction input 只能接收 `HostToolingOptions` 这样的 typed options：业务 `ToolBundle`、工具来源 refs、framework tool policy view 与后续治理所需的可解释 digest/ref。Host 不接收 discovery adapter 本体，不调用 provider 列表，不扫描业务包，也不把 per-run `tool_profile_ref` 作为 Phase 1 能力。P10.5 的 per-run tool variation 不通过多个 raw bundle 或 profile registry 表达，而是通过 `SubmitFollowupRequest.tool_names` 从 construction-time 全量业务 `ToolBundle` 中选择本次 Run 的工具子集。
 
 Host 对传入的业务 `ToolBundle` 只做治理所需的防御性校验和派生 metadata：
 
@@ -1815,9 +1934,9 @@ effective `ToolBundle` 对象派生，并用测试覆盖 `fetch_more` framework 
 
 `fetch_more` 不由外部业务 `ToolBundle` 提供。ToolRuntime factory 根据是否启用 TruncationManager 注入 framework tool，生成 attempt-local effective `ToolBundle`。RunInputBuilder 向 Engine 提供的 `tool_schemas` 和 ToolRuntime 执行使用的 callable binding 必须来自同一个 effective `ToolBundle`。`fetch_more` 仍走普通 tool dispatch / policy / accept barrier，不允许 Host 或 Engine 为它写特化分支。
 
-Start / follow-up request 默认不携带 raw `ToolBundle`，因为 `ToolBundle` 包含 callable binding，不是普通 UI / Service request payload。Host construction / composition root 是业务 `ToolBundle` 的默认输入边界。若未来支持多 scene tool profile，Service 可以通过 typed `tool_profile_ref` 或独立 Host handle 选择工具集合；该扩展必须冻结到 Attempt snapshot，不能塞进无结构 metadata。
+Start / follow-up request 不得携带 raw `ToolBundle`，因为 `ToolBundle` 包含 callable binding，不是普通 UI / Service request payload。Host construction / composition root 是业务 `ToolBundle` 的输入边界。普通每 Run 工具差异通过 `SubmitFollowupRequest.tool_names` 选择 construction-time 全量业务工具的子集：`None` / 省略表示全量业务工具，空集合表示禁用业务工具，非空集合表示指定子集。若未来需要跨 bundle / 跨来源 / 动态 discovery profile 切换，Service 可以通过 typed `tool_profile_ref` 或独立 Host handle 选择工具集合；该扩展必须冻结到 Attempt snapshot，不能塞进无结构 metadata。
 
-Retry / resume 默认复用源 Run / Attempt 已接受的 effective tool view refs；policy 若要为关联新 Run 选择新的工具视图，必须显式记录 source relation、new effective view refs 与 policy decision。Replay 即使存在 effective `ToolBundle`，也不向模型暴露 tool schemas。
+Retry / resume 默认复用源 Run / Attempt 已接受的 effective tool view refs，包括本次 Run 的 `tool_names` selector 解析结果；policy 若要为关联新 Run 选择新的工具视图，必须显式记录 source relation、new effective view refs 与 policy decision。Replay 即使存在 effective `ToolBundle`，也不向模型暴露 tool schemas。
 
 ### 18.2 ToolRuntime Boundary
 
@@ -2187,6 +2306,8 @@ Retry / Replay 默认前置条件：
 | `QUEUED` | `invalid_state` | `invalid_state` |
 | `CANCELLED` | 默认拒绝；未来 policy 可支持显式 rerun | 拒绝 |
 
+P10.5 ordinary local multi-turn scope 不改变上表的长期语义，但只实现普通本地 `FAILED` retry 与 `SUCCEEDED` structure replay。`LOST` / `RECOVERING` retry、recovery cancel、startup recovery、positive orphan proof 与 recovery dispatch 继续归 Phase 11；P10.5 implementation 不得为了通过 retry / replay / cancel smoke 提前实现或改变 Recovery 路径。
+
 ## 22. Cancel
 
 取消由 Host 发起和治理，Engine 只观察 run-local cancellation token。取消不是普通 error，也不是工具失败。
@@ -2210,7 +2331,7 @@ client requests cancel
 
 规则：
 
-- `QUEUED` 且尚未创建 Attempt 的 Run 被取消时，直接进入 `CANCELLED`，不创建 Attempt。
+- `ACCEPTED` / `QUEUED` 且尚未创建 Attempt 的 Run 被取消时，直接进入 `CANCELLED`，不创建 Attempt。
 - `WAITING` Run 被取消时，Host 直接收口为 `CANCELLED`：append `CANCEL_REQUESTED`，CAS 标记该 Run 下所有
   active `status=waiting` wait records 为 `cancelled`，append `RUN_CANCELLED`；不创建 resume Attempt。Phase 7 第一版应保持
   同一 Run 同时只有一个 active wait record 的 invariant，并用测试守护；复数更新是防御性状态收口。外部 job 的实际取消 /
@@ -2241,7 +2362,7 @@ Phase 4 只实现 `cancel_session_runs` 的 Phase 1-3 可闭环子集：`QUEUED`
 - 包含 `QUEUED`、`RUNNING`、`WAITING`、`CANCELLING`、`RECOVERING`，以及 Attempt `STARTING` / `waiting_for_lane` 场景。
 - 不影响其它 Session，不影响已终态 Run。
 - 幂等范围是 `(session_id, client_request_id)`。
-- queued Run 直接 `CANCELLED`，不创建 Attempt。
+- accepted / queued Run 直接 `CANCELLED`，不创建 Attempt。
 - Attempt `STARTING` 且尚未 dispatch / 正在 `waiting_for_lane` 时直接取消，不通知 EngineWorker。
 - 已 dispatch / active running Attempt 走普通 `cancel_run` 传播到 WorkerProxy；Phase 5 owns 该路径。
 - `WAITING` Run 取消 wait record；外部 job 物理取消由 adapter best-effort；Phase 7 owns 该路径。
@@ -2552,6 +2673,7 @@ provider tokenizer adapter 是 Host 预算治理的后续精确能力，不进�
 
 Host 启动时必须执行 recovery scan：
 
+- `ACCEPTED` Run 保持 `ACCEPTED`，等待 scheduler / pre-start governance；它不是 orphan Attempt，不得进入 `RECOVERING`。
 - `QUEUED` Run 保持 `QUEUED`，等待调度。
 - `WAITING` Run 保持 `WAITING`，等待 wait record resolution。
 - `RUNNING` / `CANCELLING` Run 的 active Attempt 只有在具备 positive orphan proof 时，才能进入 `LOST`。
@@ -2668,7 +2790,7 @@ dispatch record 不是 lease，也不是 fencing token。它帮助 Host 识别�
 
 Host graceful shutdown：
 
-- 停止接收新 start_run。
+- 停止接收新的 prompt admission。
 - 尽力向 active Attempt 传播 cancel / shutdown signal。
 - 持久化 shutdown diagnostic fact 或 projection diagnostic。
 - 不得伪造成功 terminal。
