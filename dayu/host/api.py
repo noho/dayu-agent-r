@@ -2796,9 +2796,7 @@ class Host(Protocol):
 
         ...
 
-    async def watch_session_events(
-        self, session_id: str
-    ) -> AsyncIterator[HostEvent]:
+    def watch_session_events(self, session_id: str) -> AsyncIterator[HostEvent]:
         """创建 Session live HostEvent 订阅。
 
         :param session_id: 目标 Session id。

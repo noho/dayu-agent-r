@@ -46,11 +46,11 @@ from dayu.host import (
     replay_run,
     retry_run,
     start_run,
-    stream_run_events,
     submit_followup,
 )
 from dayu.engine.contracts.agent_policy import AgentPolicy
 from dayu.engine.contracts.runner_spec import RunnerCallOptions, RunnerSpec
+from dayu.host.read_api import stream_run_events
 
 _FORBIDDEN_IMPORT_PREFIXES: tuple[str, ...] = (
     "dayu.fins",

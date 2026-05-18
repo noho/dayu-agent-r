@@ -36,8 +36,6 @@ from dayu.host import (
     HostApiErrorCode,
     HostApiErrorDetail,
     HostCallContext,
-    HostEventStream,
-    HostEventView,
     HostInput,
     HostLocalExecutionOptions,
     HostPayloadRef,
@@ -70,6 +68,7 @@ from dayu.host import (
     WaitProviderStatusRef,
     WaitResolutionSource,
 )
+from dayu.host.api import HostEventStream, HostEventView
 from dayu.host.command import compose_host_local_execution_options
 from dayu.host.tool_runtime import ToolFactKind
 from dayu.host.context_policy import ContextBudgetPolicy, default_context_budget_policy

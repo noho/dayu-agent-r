@@ -136,11 +136,14 @@ FORBIDDEN_HOST_ROOT_EXPORTS: frozenset[str] = frozenset(
         "HostDispatchScheduler",
         "HostDurableStore",
         "HostDurableStoreOptions",
+        "HostEventStream",
+        "HostEventView",
         "ToolRuntimeBuildRequest",
         "ToolRuntimeExecutionScope",
         "ToolRuntimeFactory",
         "ToolRuntimeHandle",
         "open_host_durable_store",
+        "stream_run_events",
     }
 )
 

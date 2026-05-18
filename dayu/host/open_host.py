@@ -8,6 +8,7 @@ public handle，不接触 scheduler、wakeup port 或 durable internals。
 
 from __future__ import annotations
 
+import asyncio
 from collections.abc import AsyncIterator
 from contextlib import AbstractAsyncContextManager
 from dataclasses import dataclass
@@ -59,6 +60,12 @@ from dayu.host.memory_repair import catch_up_conversation_memory_projection
 from dayu.host.projection import ProjectionCatchupPort
 from dayu.host.read_api import get_run as _get_run
 from dayu.host.read_api import get_session as _get_session
+from dayu.host.read_api import (
+    read_session_host_events_after as _read_session_host_events_after,
+)
+from dayu.host.read_api import (
+    session_live_event_start_cursor as _session_live_event_start_cursor,
+)
 
 _GENERATED_OPEN_HOST_ID_PREFIX = "open-host"
 _INTERNAL_COMMAND_FALLBACK_CONTEXT_WINDOW_SIZE = 8192
@@ -66,6 +73,9 @@ _INTERNAL_COMMAND_FALLBACK_CONTEXT_WINDOW_SIZE = 8192
 
 _INTERNAL_COMMAND_FALLBACK_RESERVED_OUTPUT_TOKENS = 1024
 """``context_budget_policy=None`` 时内部 command options 使用的兜底输出预留。"""
+
+_SESSION_WATCH_POLL_INTERVAL_SECONDS = 0.02
+"""session live watch 未读取到新事件时的轻量轮询间隔。"""
 
 
 @dataclass(frozen=True, slots=True)
@@ -290,22 +300,47 @@ class _PublicHostHandle:
         self._raise_if_closed()
         return _close_session(self._command_handle, session_id, request)
 
-    async def watch_session_events(
-        self, session_id: str
-    ) -> AsyncIterator[HostEvent]:
+    def watch_session_events(self, session_id: str) -> AsyncIterator[HostEvent]:
         """创建 Session live HostEvent 订阅。
 
-        Slice 4 才实现 session-level live fanout；Slice 2 只负责 closed
-        handle 生命周期校验与 public handle 形态。
-
         :param session_id: 目标 Session id。
-        :returns: 当前 slice 不会返回事件迭代器。
+        :returns: Host-owned typed event async iterator。
         :raises HostClosedError: Host handle 已关闭时抛出。
-        :raises NotImplementedError: Slice 4 fanout 尚未实现时抛出。
+        :raises HostApiError: Session 不存在或不可 watch 时抛出。
         """
 
         self._raise_if_closed()
-        raise NotImplementedError("watch_session_events is owned by P10.5 Slice 4")
+        cursor = _session_live_event_start_cursor(
+            self._command_handle,
+            session_id,
+        )
+        return self._watch_session_events_after(session_id, cursor)
+
+    async def _watch_session_events_after(
+        self, session_id: str, cursor: int
+    ) -> AsyncIterator[HostEvent]:
+        """从指定 cursor 后持续产出 Session live HostEvent。
+
+        :param session_id: 目标 Session id。
+        :param cursor: live watch attach 时的 EventLog 全局序号。
+        :returns: Host-owned typed event async iterator。
+        :raises HostApiError: Session 在 watch 期间消失时抛出。
+        :raises HostDurableError: EventLog 或 payload 投影失败时抛出。
+        """
+
+        next_cursor = cursor
+        while not self._closed:
+            batch = _read_session_host_events_after(
+                self._command_handle,
+                session_id,
+                next_cursor,
+            )
+            next_cursor = batch.next_cursor
+            if len(batch.events) == 0:
+                await asyncio.sleep(_SESSION_WATCH_POLL_INTERVAL_SECONDS)
+                continue
+            for event in batch.events:
+                yield event
 
     async def close(self) -> None:
         """关闭当前 Host handle lifecycle。

@@ -41,8 +41,6 @@ from dayu.host.api import (
     HostEvent,
     HostEventClass,
     HostEventKind,
-    HostEventStream,
-    HostEventView,
     HostFinalAnswerView,
     HostHandle,
     HostInput,
@@ -98,7 +96,7 @@ from dayu.host.command import (
     start_run,
     submit_followup,
 )
-from dayu.host.read_api import get_run, get_session, stream_run_events
+from dayu.host.read_api import get_run, get_session
 from dayu.host.open_host import open_host
 from dayu.host.tooling import (
     FrameworkToolName,
