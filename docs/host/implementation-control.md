@@ -223,8 +223,8 @@ Phase Map 中每个 phase 必须使用统一条目格式。模板如下：
 约束：本节只保留当前 gate 结论；phase 过程流水必须归档到 `历史记录`，仍需追踪的风险或后续 owner 必须写入 `Open Questions 与风险追踪` 的 `追踪区`。
 
 当前 work unit：Phase 10. Context Governance / Compaction。
-当前 gate：Phase 10 Slice 3 implementation。
-下一 gate：Phase 10 Slice 3 implementation review。
+当前 gate：Phase 10 Slice 4 implementation。
+下一 gate：Phase 10 Slice 4 implementation review。
 
 ## Phase Map
 
@@ -2042,6 +2042,34 @@ P9.5 收口清单：
 - 当前无 PR review blocking fix。
 
 ## 历史记录
+
+### 2026-05-18 Phase 10 S3 Canonical Compact Events accepted
+
+Phase 10 S3 Compact Canonical Events / P9 Memory Projection Consumption 已完成。Implementation artifact 为
+`docs/reviews/phase10-s3-context-events-memory-projection-implementation-20260518.md`。Code review artifacts 为
+`docs/reviews/phase10-s3-code-review-mimo-20260518.md` 与
+`docs/reviews/phase10-s3-code-review-ds-20260518.md`。
+
+Controller 裁决：AgentMiMo review 为 PASS，AgentDS review 为 PASS with accepted medium hardening item。Controller
+接受 DS M1 为当前 slice fix item：`CONTEXT_COMPACTED` validator 必须拒绝非空
+`episode_summary_candidate.proposed_verified_fact_refs`，防止 accepted compact summary 在 canonical payload 层
+携带“新建 verified fact”提议；同时前置补强 replace patch value validator。Fix artifact 为
+`docs/reviews/phase10-s3-code-review-fix-codex-20260518.md`。Re-review artifacts 为
+`docs/reviews/phase10-s3-code-rereview-mimo-20260518.md` 与
+`docs/reviews/phase10-s3-code-rereview-ds-20260518.md`；两份 re-review 均 PASS，remaining blocking / high /
+medium findings 为 0。Controller adjudication artifact 为
+`docs/reviews/phase10-s3-code-review-controller-adjudication-20260518.md`。
+
+S3 交付：新增 `dayu.host.context_events` 作为 `CONTEXT_COMPACTION_REQUESTED`、`CONTEXT_COMPACTED` 与
+`CONTEXT_COMPACTION_FAILED` payload builder / validator 真源；P9 memory projection 改为消费 accepted
+`CONTEXT_COMPACTED`，episode summary 只物化为 assumption continuity item，pinned state patch candidate 按
+missing / clear / replace 三态更新，verified facts 仍只来自 `TOOL_RESULT_ACCEPTED`。Production memory consumer /
+RunInputBuilder inline delta filter 纳入 `CONTEXT_COMPACTED`，不消费 `CONTEXT_COMPACTION_FAILED`。
+
+Validation：`pytest tests/host/test_context_compact_events.py tests/host/test_memory_projection.py
+tests/host/test_run_input_builder.py -q` 79 passed；`pyright` 0 errors / 0 warnings / 0 informations；
+`git diff --check` clean。当前 gate 进入 Phase 10 S4 Proactive Context Governance Orchestration implementation。
+Accepted slice commit 在本条记录提交后由 git commit 记录。
 
 ### 2026-05-18 Phase 10 S2 Compaction Contracts accepted
 

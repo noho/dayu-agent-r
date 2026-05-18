@@ -846,6 +846,38 @@ def test_memory_provider_uses_latest_snapshot_before_required_cursor(
         assert contents[-1] == "current prompt"
 
 
+def test_run_input_memory_messages_include_context_compacted_projection(
+    tmp_path: Path,
+) -> None:
+    """projection catch-up 后 RunInputBuilder 注入 compacted pinned state 与 summary。"""
+
+    policy = _memory_policy()
+    with open_host_durable_store(_options(tmp_path)) as store:
+        session_id = _ensure_session_id(store.transaction_runner)
+        _append_rich_memory_source_events(store.transaction_runner, session_id)
+        seeded = _seed_current_run(
+            store,
+            session_id=session_id,
+            payload=_user_input_payload("current prompt"),
+        )
+        required_cursor = _required_memory_cursor(store.transaction_runner, seeded)
+        catch_up_conversation_memory_projection(
+            store.transaction_runner,
+            policy=policy,
+            batch_size=16,
+            max_event_sequence=required_cursor.checkpoint_event_sequence,
+        )
+
+        request = _build_request_with_memory(store, seeded, policy)
+        contents = tuple(_message_content(message) for message in request.messages)
+
+        assert any("current_goal=compact pinned goal" in content for content in contents)
+        assert any("confirmed_subject=subject:issuer-a" in content for content in contents)
+        assert any("open_question=compact open question" in content for content in contents)
+        assert any("episode_summary=episode navigation only" in content for content in contents)
+        assert contents[-1] == "current prompt"
+
+
 def test_memory_messages_are_stable_for_same_eventlog_and_policy(
     tmp_path: Path,
 ) -> None:
@@ -1397,8 +1429,28 @@ def _append_rich_memory_source_events(
                 event_class=EventClass.CANONICAL_FACT,
                 session_id=session_id,
                 run_id="run-memory",
-                event_type="EPISODE_SUMMARY_ACCEPTED",
-                payload={"summary_text": "episode navigation only"},
+                event_type="CONTEXT_COMPACTED",
+                payload=_compact_payload(
+                    summary_text="episode navigation only",
+                    pinned_patch={
+                        "candidate_id": "patch-memory",
+                        "current_goal": {
+                            "operation": "replace",
+                            "value": "compact pinned goal",
+                            "evidence_refs": ["evidence-1"],
+                        },
+                        "confirmed_subjects": {
+                            "operation": "replace",
+                            "value": ["subject:issuer-a"],
+                            "evidence_refs": ["evidence-1"],
+                        },
+                        "open_questions": {
+                            "operation": "replace",
+                            "value": ["compact open question"],
+                            "evidence_refs": ["evidence-1"],
+                        },
+                    },
+                ),
             ),
         )
 
@@ -2408,6 +2460,66 @@ def _user_input_payload(text: str) -> dict[str, JsonValue]:
         "payload_digest": None,
         "operation_kind": "start_run",
         "call_context_digest": _CALL_CONTEXT_DIGEST,
+    }
+
+
+def _compact_payload(
+    *,
+    summary_text: str,
+    pinned_patch: dict[str, JsonValue],
+) -> dict[str, JsonValue]:
+    """构造测试用 CONTEXT_COMPACTED payload。
+
+    :param summary_text: episode summary 文本。
+    :param pinned_patch: pinned patch candidate。
+    :returns: compacted payload。
+    """
+
+    return {
+        "compact_artifact_ref": "compact-artifact:test",
+        "compact_artifact_digest": _DIGEST_A,
+        "episode_summary_candidate": {
+            "candidate_id": "summary-memory",
+            "summary_text": summary_text,
+            "episode_title": "episode",
+            "goal": "compact goal",
+            "completed_actions": [],
+            "confirmed_fact_refs": [],
+            "confirmed_fact_summaries": [],
+            "user_constraints": [],
+            "open_questions": ["compact open question"],
+            "next_step": None,
+            "tool_finding_refs": [],
+            "source_event_refs": ["event-memory-raw-user"],
+            "evidence_refs": ["evidence-1"],
+            "proposed_verified_fact_refs": [],
+        },
+        "pinned_state_patch_candidate": pinned_patch,
+        "preservation_evidence": [
+            {
+                "evidence_id": "evidence-1",
+                "input_event_refs": ["event-memory-raw-user"],
+                "tool_fact_refs": [],
+                "memory_snapshot_cursor": None,
+                "compact_input_range": None,
+            }
+        ],
+        "preserved_fact_refs": {"tool_fact_refs": [], "verified_fact_refs": []},
+        "dropped_ranges": [],
+        "summarized_ranges": [],
+        "evidence_anchors_retained": True,
+        "quality_check_result": {
+            "accepted": True,
+            "rejection_reasons": [],
+            "current_user_input_retained": True,
+            "accepted_tool_fact_refs_retained": True,
+            "evidence_anchors_retained": True,
+            "open_questions_retained": True,
+            "retained_evidence_refs": ["evidence-1"],
+            "dropped_ranges": [],
+            "summarized_ranges": [],
+        },
+        "budget_after_compact": 128,
     }
 
 

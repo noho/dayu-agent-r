@@ -13,6 +13,10 @@ from enum import StrEnum
 from typing import Protocol, TypeAlias, TypeVar
 
 from dayu.contracts.json_value import JsonValue
+from dayu.host.context_events import (
+    CONTEXT_COMPACTED as _EVENT_TYPE_CONTEXT_COMPACTED,
+    validate_context_compacted_payload,
+)
 from dayu.host.durable.codec import sha256_digest_json
 
 MemoryPolicyDigest: TypeAlias = str
@@ -48,12 +52,28 @@ DEFAULT_MEMORY_MAX_DELTA_REPAIR_EVENTS = 32
 _EVENT_TYPE_USER_INPUT_ACCEPTED = "USER_INPUT_ACCEPTED"
 _EVENT_TYPE_RUN_SUCCEEDED = "RUN_SUCCEEDED"
 _EVENT_TYPE_TOOL_RESULT_ACCEPTED = "TOOL_RESULT_ACCEPTED"
-_EVENT_TYPE_EPISODE_SUMMARY_ACCEPTED = "EPISODE_SUMMARY_ACCEPTED"
 _PRODUCER_NAME_HOST_PROJECTION = "host_projection"
 _SNAPSHOT_DIGEST_PENDING = "pending"
 _PAYLOAD_FIELD_DISPLAY_TEXT = "display_text"
 _PAYLOAD_FIELD_FINAL_ANSWER = "final_answer"
 _PAYLOAD_FIELD_SUMMARY_TEXT = "summary_text"
+_PAYLOAD_FIELD_EPISODE_SUMMARY_CANDIDATE = "episode_summary_candidate"
+_PAYLOAD_FIELD_PINNED_STATE_PATCH_CANDIDATE = "pinned_state_patch_candidate"
+_PAYLOAD_FIELD_EPISODE_TITLE = "episode_title"
+_PAYLOAD_FIELD_TITLE = "title"
+_PAYLOAD_FIELD_GOAL = "goal"
+_PAYLOAD_FIELD_COMPLETED_ACTIONS = "completed_actions"
+_PAYLOAD_FIELD_OPEN_QUESTIONS = "open_questions"
+_PAYLOAD_FIELD_NEXT_STEP = "next_step"
+_PAYLOAD_FIELD_USER_CONSTRAINTS = "user_constraints"
+_PAYLOAD_FIELD_CONFIRMED_FACT_REFS = "confirmed_fact_refs"
+_PAYLOAD_FIELD_CONFIRMED_SUBJECTS = "confirmed_subjects"
+_PAYLOAD_FIELD_CURRENT_GOAL = "current_goal"
+_PAYLOAD_FIELD_OPERATION = "operation"
+_PAYLOAD_FIELD_VALUE = "value"
+_PAYLOAD_FIELD_REF_KIND = "ref_kind"
+_PAYLOAD_FIELD_REF_ID = "ref_id"
+_PAYLOAD_FIELD_DIGEST = "digest"
 _PAYLOAD_FIELD_FACT_SUMMARY = "fact_summary"
 _PAYLOAD_FIELD_RESULT_SUMMARY = "result_summary"
 _PAYLOAD_FIELD_SUMMARY = "summary"
@@ -66,9 +86,6 @@ _PAYLOAD_FIELD_TOOL_CALL_REQUESTED_EVENT_REF = "tool_call_requested_event_ref"
 _PAYLOAD_FIELD_PAYLOAD_REF = "payload_ref"
 _PAYLOAD_FIELD_PAYLOAD_DIGEST = "payload_digest"
 _PAYLOAD_FIELD_SOURCE_REFS = "source_refs"
-_PAYLOAD_FIELD_REF_KIND = "ref_kind"
-_PAYLOAD_FIELD_REF_ID = "ref_id"
-_PAYLOAD_FIELD_DIGEST = "digest"
 _PAYLOAD_FIELD_EVENT_ID = "event_id"
 _PAYLOAD_FIELD_RUN_ID = "run_id"
 _PAYLOAD_FIELD_ATTEMPT_ID = "attempt_id"
@@ -1046,9 +1063,16 @@ def project_conversation_memory_event(
     elif event.event_type == _EVENT_TYPE_RUN_SUCCEEDED:
         item = _assistant_conclusion_from_projection_event(event, policy=policy)
         continuity_items = _replace_item_by_id(continuity_items, item)
-    elif event.event_type == _EVENT_TYPE_EPISODE_SUMMARY_ACCEPTED:
-        item = _episode_summary_from_projection_event(event, policy=policy)
+    elif event.event_type == _EVENT_TYPE_CONTEXT_COMPACTED:
+        validate_context_compacted_payload(event.payload)
+        _validate_compact_summary_fact_refs(event, base.verified_facts)
+        item = _compact_episode_summary_from_projection_event(event, policy=policy)
         continuity_items = _replace_item_by_id(continuity_items, item)
+        pinned_state = _apply_pinned_state_patch_candidate(
+            pinned_state,
+            event,
+            policy=policy,
+        )
     else:
         diagnostics = diagnostics + (
             _unsupported_event_type_diagnostic(
@@ -1324,18 +1348,18 @@ def _assistant_conclusion_from_projection_event(
     )
 
 
-def _episode_summary_from_projection_event(
+def _compact_episode_summary_from_projection_event(
     event: MemoryProjectionEvent, *, policy: MemoryProjectionPolicy
 ) -> ConversationContinuityItem:
-    """从 episode summary event 构造 continuity navigation item。
+    """从 ``CONTEXT_COMPACTED`` event 构造 continuity navigation item。
 
-    :param event: EPISODE_SUMMARY_ACCEPTED projection event。
+    :param event: CONTEXT_COMPACTED projection event。
     :param policy: memory projection policy。
     :returns: episode summary item。
     """
 
     summary_text = _bounded_summary_text(
-        _episode_summary_text(event),
+        _compact_episode_summary_text(event),
         max_size_units=policy.max_raw_turn_size_units,
         prefer_ref=False,
     )
@@ -1360,6 +1384,349 @@ def _episode_summary_from_projection_event(
         excluded_reason=None,
         size_units=estimate_memory_size_units(summary_text),
     )
+
+
+def _apply_pinned_state_patch_candidate(
+    pinned_state: PinnedStateView,
+    event: MemoryProjectionEvent,
+    *,
+    policy: MemoryProjectionPolicy,
+) -> PinnedStateView:
+    """应用 ``CONTEXT_COMPACTED`` accepted pinned state patch candidate。
+
+    :param pinned_state: 既有 pinned state。
+    :param event: CONTEXT_COMPACTED projection event。
+    :param policy: memory projection policy。
+    :returns: 应用字段级三态 patch 后的 pinned state。
+    :raises ValueError: patch JSON 结构或 confirmed subjects ref 非法时抛出。
+    """
+
+    patch = _required_payload_mapping(
+        event.payload,
+        _PAYLOAD_FIELD_PINNED_STATE_PATCH_CANDIDATE,
+    )
+    return PinnedStateView(
+        current_goal=_patched_text_field(
+            patch,
+            _PAYLOAD_FIELD_CURRENT_GOAL,
+            current_value=pinned_state.current_goal,
+            event=event,
+            policy=policy,
+        ),
+        confirmed_subjects=_patched_confirmed_subjects(
+            patch,
+            current_value=pinned_state.confirmed_subjects,
+        ),
+        user_constraints=_patched_text_tuple_field(
+            patch,
+            _PAYLOAD_FIELD_USER_CONSTRAINTS,
+            current_value=pinned_state.user_constraints,
+            event=event,
+            policy=policy,
+        ),
+        open_questions=_patched_text_tuple_field(
+            patch,
+            _PAYLOAD_FIELD_OPEN_QUESTIONS,
+            current_value=pinned_state.open_questions,
+            event=event,
+            policy=policy,
+        ),
+    )
+
+
+def _patched_text_field(
+    patch: Mapping[str, JsonValue],
+    field_name: str,
+    *,
+    current_value: str | None,
+    event: MemoryProjectionEvent,
+    policy: MemoryProjectionPolicy,
+) -> str | None:
+    """按三态语义应用 pinned text patch 字段。
+
+    :param patch: pinned patch candidate JSON object。
+    :param field_name: 字段名。
+    :param current_value: 既有字段值。
+    :param event: CONTEXT_COMPACTED projection event。
+    :param policy: memory projection policy。
+    :returns: 更新后的字段值。
+    :raises ValueError: patch 字段类型非法时抛出。
+    """
+
+    if field_name not in patch:
+        return current_value
+    value = patch[field_name]
+    if value is None:
+        return None
+    if isinstance(value, str):
+        return _bounded_patch_text(value, event=event, policy=policy)
+    mapping = _as_mapping(value, field_name)
+    operation = _patch_operation(mapping)
+    if operation == "missing":
+        return current_value
+    if operation == "clear":
+        return None
+    if operation == "replace":
+        return _bounded_patch_text(
+            _required_str(mapping, _PAYLOAD_FIELD_VALUE),
+            event=event,
+            policy=policy,
+        )
+    raise ValueError(f"{field_name} operation is invalid")
+
+
+def _patched_text_tuple_field(
+    patch: Mapping[str, JsonValue],
+    field_name: str,
+    *,
+    current_value: tuple[str, ...],
+    event: MemoryProjectionEvent,
+    policy: MemoryProjectionPolicy,
+) -> tuple[str, ...]:
+    """按三态语义应用 pinned 文本 tuple patch 字段。
+
+    :param patch: pinned patch candidate JSON object。
+    :param field_name: 字段名。
+    :param current_value: 既有字段值。
+    :param event: CONTEXT_COMPACTED projection event。
+    :param policy: memory projection policy。
+    :returns: 更新后的字段值。
+    :raises ValueError: patch 字段类型非法时抛出。
+    """
+
+    if field_name not in patch:
+        return current_value
+    value = patch[field_name]
+    if value is None:
+        return ()
+    if isinstance(value, list):
+        return _bounded_patch_text_tuple(value, event=event, policy=policy)
+    mapping = _as_mapping(value, field_name)
+    operation = _patch_operation(mapping)
+    if operation == "missing":
+        return current_value
+    if operation == "clear":
+        return ()
+    if operation == "replace":
+        return _bounded_patch_text_tuple(
+            _required_list(mapping, _PAYLOAD_FIELD_VALUE),
+            event=event,
+            policy=policy,
+        )
+    raise ValueError(f"{field_name} operation is invalid")
+
+
+def _patched_confirmed_subjects(
+    patch: Mapping[str, JsonValue],
+    *,
+    current_value: tuple[OpaqueMemoryRef, ...],
+) -> tuple[OpaqueMemoryRef, ...]:
+    """按三态语义应用 confirmed subjects patch 字段。
+
+    :param patch: pinned patch candidate JSON object。
+    :param current_value: 既有 confirmed subjects。
+    :returns: 更新后的 confirmed subjects。
+    :raises ValueError: patch 值不是 Host-neutral opaque ref 时抛出。
+    """
+
+    field_name = _PAYLOAD_FIELD_CONFIRMED_SUBJECTS
+    if field_name not in patch:
+        return current_value
+    value = patch[field_name]
+    if value is None:
+        return ()
+    if isinstance(value, list):
+        return _opaque_ref_tuple_from_patch_values(value)
+    mapping = _as_mapping(value, field_name)
+    operation = _patch_operation(mapping)
+    if operation == "missing":
+        return current_value
+    if operation == "clear":
+        return ()
+    if operation == "replace":
+        return _opaque_ref_tuple_from_patch_values(
+            _required_list(mapping, _PAYLOAD_FIELD_VALUE)
+        )
+    raise ValueError("confirmed_subjects operation is invalid")
+
+
+def _patch_operation(mapping: Mapping[str, JsonValue]) -> str:
+    """读取 patch operation。
+
+    :param mapping: patch field JSON object。
+    :returns: operation 文本。
+    :raises ValueError: operation 不是三态枚举值时抛出。
+    """
+
+    operation = _required_str(mapping, _PAYLOAD_FIELD_OPERATION)
+    if operation not in {"missing", "clear", "replace"}:
+        raise ValueError("patch operation is invalid")
+    return operation
+
+
+def _bounded_patch_text(
+    text: str,
+    *,
+    event: MemoryProjectionEvent,
+    policy: MemoryProjectionPolicy,
+) -> str:
+    """按 memory policy 限制 compact patch 文本。
+
+    :param text: patch 文本。
+    :param event: CONTEXT_COMPACTED projection event。
+    :param policy: memory projection policy。
+    :returns: 原文本或中立 event ref fallback。
+    """
+
+    bounded = _bounded_summary_text(
+        text,
+        max_size_units=policy.max_raw_turn_size_units,
+        prefer_ref=False,
+    )
+    if bounded is not None:
+        return bounded
+    return _ref_summary_text(
+        payload_ref=event.payload_ref,
+        payload_digest=event.payload_digest,
+        fallback_event_id=event.event_id,
+    )
+
+
+def _bounded_patch_text_tuple(
+    values: list[JsonValue],
+    *,
+    event: MemoryProjectionEvent,
+    policy: MemoryProjectionPolicy,
+) -> tuple[str, ...]:
+    """按 memory policy 限制 compact patch 文本 tuple。
+
+    :param values: patch JSON array。
+    :param event: CONTEXT_COMPACTED projection event。
+    :param policy: memory projection policy。
+    :returns: bounded 文本 tuple。
+    :raises ValueError: 元素不是非空文本时抛出。
+    """
+
+    result: list[str] = []
+    for value in values:
+        result.append(
+            _bounded_patch_text(
+                _as_str(value, "pinned patch item"),
+                event=event,
+                policy=policy,
+            )
+        )
+    return tuple(result)
+
+
+def _opaque_ref_tuple_from_patch_values(
+    values: list[JsonValue],
+) -> tuple[OpaqueMemoryRef, ...]:
+    """从 patch JSON array 解析 Host-neutral opaque refs。
+
+    :param values: confirmed subjects patch value。
+    :returns: opaque refs。
+    :raises ValueError: 任一元素不是合法 opaque ref 时抛出。
+    """
+
+    refs: list[OpaqueMemoryRef] = []
+    for value in values:
+        refs.append(_opaque_ref_from_patch_value(value))
+    return tuple(refs)
+
+
+def _opaque_ref_from_patch_value(value: JsonValue) -> OpaqueMemoryRef:
+    """从 JSON 值解析 confirmed subject opaque ref。
+
+    :param value: JSON ref 值。
+    :returns: opaque memory ref。
+    :raises ValueError: 值为自由业务字符串或 ref 结构非法时抛出。
+    """
+
+    if isinstance(value, Mapping):
+        return _opaque_ref_from_patch_mapping(value)
+    if isinstance(value, str):
+        return _opaque_ref_from_text(value)
+    raise ValueError("confirmed subject ref must be opaque ref")
+
+
+def _opaque_ref_from_patch_mapping(
+    value: Mapping[str, JsonValue],
+) -> OpaqueMemoryRef:
+    """从 compact patch mapping 解析 Host-neutral opaque ref。
+
+    :param value: opaque ref JSON object。
+    :returns: opaque memory ref。
+    :raises ValueError: ref kind、ref id 或 digest 非法时抛出。
+    """
+
+    return OpaqueMemoryRef(
+        ref_kind=HostNeutralRefKind(_required_str(value, _PAYLOAD_FIELD_REF_KIND)),
+        ref_id=_required_str(value, _PAYLOAD_FIELD_REF_ID),
+        digest=_optional_patch_str(value, _PAYLOAD_FIELD_DIGEST),
+    )
+
+
+def _opaque_ref_from_text(value: str) -> OpaqueMemoryRef:
+    """解析 ``kind:ref_id`` 形式的 Host-neutral opaque ref。
+
+    :param value: opaque ref 文本。
+    :returns: opaque memory ref。
+    :raises ValueError: 文本缺少 ref kind 或 ref id 时抛出。
+    """
+
+    _require_non_empty(value, "confirmed_subjects")
+    if ":" not in value:
+        raise ValueError("confirmed subject ref must include Host-neutral kind")
+    kind_text, ref_id = value.split(":", 1)
+    _require_non_empty(ref_id, "confirmed_subjects.ref_id")
+    return OpaqueMemoryRef(
+        ref_kind=HostNeutralRefKind(kind_text),
+        ref_id=ref_id,
+        digest=None,
+    )
+
+
+def _validate_compact_summary_fact_refs(
+    event: MemoryProjectionEvent,
+    verified_facts: tuple[VerifiedFactView, ...],
+) -> None:
+    """校验 summary confirmed fact refs 只引用已有工具事实。
+
+    :param event: CONTEXT_COMPACTED projection event。
+    :param verified_facts: 当前 snapshot 中已有 tool verified facts。
+    :returns: ``None``。
+    :raises ValueError: summary 引用了未知 fact ref 时抛出。
+    """
+
+    summary = _required_payload_mapping(
+        event.payload,
+        _PAYLOAD_FIELD_EPISODE_SUMMARY_CANDIDATE,
+    )
+    refs = _optional_text_tuple(summary, _PAYLOAD_FIELD_CONFIRMED_FACT_REFS)
+    allowed_refs = _existing_tool_fact_refs(verified_facts)
+    if not set(refs).issubset(allowed_refs):
+        raise ValueError("compact summary confirmed_fact_refs must reference tool facts")
+
+
+def _existing_tool_fact_refs(
+    verified_facts: tuple[VerifiedFactView, ...],
+) -> set[str]:
+    """汇总已有 tool verified fact refs。
+
+    :param verified_facts: 当前 snapshot 的 verified facts。
+    :returns: 可被 compact summary 引用的 ref 集合。
+    """
+
+    refs: set[str] = set()
+    for fact in verified_facts:
+        refs.add(fact.item_id)
+        refs.add(fact.provenance.event_id)
+        if fact.provenance.tool_result_ref is not None:
+            refs.add(fact.provenance.tool_result_ref)
+        if fact.provenance.payload_ref is not None:
+            refs.add(fact.provenance.payload_ref)
+    return refs
 
 
 def _pinned_state_with_user_input(
@@ -1850,26 +2217,113 @@ def _user_visible_text(event: MemoryProjectionEvent) -> str:
     )
 
 
-def _episode_summary_text(event: MemoryProjectionEvent) -> str:
-    """读取 episode summary 文本，缺失时返回中立 ref 摘要。
+def _compact_episode_summary_text(event: MemoryProjectionEvent) -> str:
+    """读取 accepted compact episode summary 文本。
 
-    :param event: EPISODE_SUMMARY_ACCEPTED projection event。
+    :param event: CONTEXT_COMPACTED projection event。
     :returns: episode summary 文本。
     """
 
-    for field_name in (
-        _PAYLOAD_FIELD_SUMMARY_TEXT,
-        _PAYLOAD_FIELD_SUMMARY,
-        _PAYLOAD_FIELD_DISPLAY_TEXT,
-    ):
-        value = _optional_payload_str(event.payload, field_name)
+    summary = _required_payload_mapping(
+        event.payload,
+        _PAYLOAD_FIELD_EPISODE_SUMMARY_CANDIDATE,
+    )
+    for field_name in (_PAYLOAD_FIELD_SUMMARY_TEXT, _PAYLOAD_FIELD_SUMMARY):
+        value = _optional_payload_str(summary, field_name)
         if value is not None:
             return value
+    parts = _compact_episode_summary_parts(summary)
+    if len(parts) > 0:
+        return "\n".join(parts)
     return _ref_summary_text(
         payload_ref=event.payload_ref,
         payload_digest=event.payload_digest,
         fallback_event_id=event.event_id,
     )
+
+
+def _compact_episode_summary_parts(
+    summary: Mapping[str, JsonValue],
+) -> tuple[str, ...]:
+    """把 typed compact summary 字段确定性拼为导航文本。
+
+    :param summary: episode summary candidate JSON object。
+    :returns: 文本片段 tuple。
+    """
+
+    parts: list[str] = []
+    title = _optional_payload_str(summary, _PAYLOAD_FIELD_TITLE)
+    if title is None:
+        title = _optional_payload_str(summary, _PAYLOAD_FIELD_EPISODE_TITLE)
+    if title is not None:
+        parts.append(f"title={title}")
+    goal = _optional_payload_str(summary, _PAYLOAD_FIELD_GOAL)
+    if goal is not None:
+        parts.append(f"goal={goal}")
+    for action in _optional_text_tuple(summary, _PAYLOAD_FIELD_COMPLETED_ACTIONS):
+        parts.append(f"completed_action={action}")
+    for question in _optional_text_tuple(summary, _PAYLOAD_FIELD_OPEN_QUESTIONS):
+        parts.append(f"open_question={question}")
+    next_step = _optional_payload_str(summary, _PAYLOAD_FIELD_NEXT_STEP)
+    if next_step is not None:
+        parts.append(f"next_step={next_step}")
+    return tuple(parts)
+
+
+def _required_payload_mapping(
+    payload: Mapping[str, JsonValue], field_name: str
+) -> Mapping[str, JsonValue]:
+    """读取必填 payload mapping 字段。
+
+    :param payload: JSON payload。
+    :param field_name: 字段名。
+    :returns: JSON mapping。
+    :raises ValueError: 字段缺失或不是 mapping 时抛出。
+    """
+
+    value = payload.get(field_name)
+    if isinstance(value, Mapping):
+        return value
+    raise ValueError(f"{field_name} must be JSON mapping")
+
+
+def _optional_text_tuple(
+    payload: Mapping[str, JsonValue], field_name: str
+) -> tuple[str, ...]:
+    """读取 optional payload 文本数组字段。
+
+    :param payload: JSON payload。
+    :param field_name: 字段名。
+    :returns: 文本 tuple；字段缺失时返回空 tuple。
+    :raises ValueError: 字段存在但不是文本数组时抛出。
+    """
+
+    value = payload.get(field_name)
+    if value is None:
+        return ()
+    if not isinstance(value, list):
+        raise ValueError(f"{field_name} must be list")
+    result: list[str] = []
+    for item in value:
+        result.append(_as_str(item, field_name))
+    return tuple(result)
+
+
+def _optional_patch_str(
+    mapping: Mapping[str, JsonValue], field_name: str
+) -> str | None:
+    """读取 compact patch optional 字符串字段。
+
+    :param mapping: JSON mapping。
+    :param field_name: 字段名。
+    :returns: 字符串值或 ``None``。
+    :raises ValueError: 字段存在但不是非空字符串时抛出。
+    """
+
+    value = mapping.get(field_name)
+    if value is None:
+        return None
+    return _as_str(value, field_name)
 
 
 def _bounded_summary_text(

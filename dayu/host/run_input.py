@@ -42,6 +42,7 @@ from dayu.host._event_payload import (
 )
 from dayu.host.api import AttemptDispatchSnapshot
 from dayu.host.api import AttemptStatus, RunStatus
+from dayu.host.context_events import CONTEXT_COMPACTED
 from dayu.host.durable.event_log import (
     EventClass,
     EventLogRow,
@@ -88,7 +89,6 @@ _EVENT_TYPE_RUN_ACCEPTED = "RUN_ACCEPTED"
 _EVENT_TYPE_RUN_STARTED = "RUN_STARTED"
 _EVENT_TYPE_RUN_SUCCEEDED = "RUN_SUCCEEDED"
 _EVENT_TYPE_TOOL_RESULT_ACCEPTED = "TOOL_RESULT_ACCEPTED"
-_EVENT_TYPE_EPISODE_SUMMARY_ACCEPTED = "EPISODE_SUMMARY_ACCEPTED"
 _PAYLOAD_FIELD_DISPLAY_TEXT = "display_text"
 _PAYLOAD_FIELD_OPERATION_KIND = "operation_kind"
 _PAYLOAD_FIELD_EXECUTION_TARGET = "execution_target"
@@ -104,7 +104,7 @@ _MEMORY_EVENT_TYPES = frozenset(
         _EVENT_TYPE_USER_INPUT_ACCEPTED,
         _EVENT_TYPE_RUN_SUCCEEDED,
         _EVENT_TYPE_TOOL_RESULT_ACCEPTED,
-        _EVENT_TYPE_EPISODE_SUMMARY_ACCEPTED,
+        CONTEXT_COMPACTED,
     )
 )
 
