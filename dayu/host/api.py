@@ -26,6 +26,7 @@ from dayu.engine.contracts.agent_policy import AgentPolicy
 from dayu.engine.contracts.agent_run import AgentRunRequest
 from dayu.engine.contracts.engine_events import EngineEvent
 from dayu.engine.contracts.runner_spec import RunnerCallOptions, RunnerSpec
+from dayu.host.context_policy import ContextBudgetPolicy
 from dayu.host._public_validation import (
     require_non_empty as _require_non_empty,
 )
@@ -700,6 +701,8 @@ class HostLocalExecutionOptions:
     :param runner_options: Engine Runner 调用参数。
     :param agent_policy: Engine Agent policy。
     :param worker_factory: 本地 worker factory。
+    :param context_budget_policy: Host Context Governance 的 typed 预算策略；
+        ``None`` 表示 Slice 1 仅暴露装配边界，production orchestration 尚未接入。
     :param memory_projection_policy: 本地 dispatch 注入 RunInputBuilder 的
         durable conversation memory policy。
     :param memory_projection_catchup_batch_size: worker 启动前追平 memory
@@ -722,6 +725,7 @@ class HostLocalExecutionOptions:
     runner_options: RunnerCallOptions
     agent_policy: AgentPolicy
     worker_factory: LocalEngineWorkerFactory
+    context_budget_policy: ContextBudgetPolicy | None = None
     memory_projection_policy: MemoryProjectionPolicy = field(
         default_factory=default_memory_projection_policy
     )
@@ -795,6 +799,13 @@ class HostLocalExecutionOptions:
         if self.worker_factory is None:
             raise TypeError(
                 "HostLocalExecutionOptions.worker_factory must be non-None"
+            )
+        if self.context_budget_policy is not None and not isinstance(
+            self.context_budget_policy, ContextBudgetPolicy
+        ):
+            raise TypeError(
+                "HostLocalExecutionOptions.context_budget_policy must be "
+                "ContextBudgetPolicy"
             )
         if not isinstance(self.memory_projection_policy, MemoryProjectionPolicy):
             raise TypeError(

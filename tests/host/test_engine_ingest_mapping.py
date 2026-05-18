@@ -287,7 +287,7 @@ def test_run_failed_recoverable_true_is_diagnostic_then_failed(tmp_path: Path) -
 def test_context_compaction_requested_accepts_none_budget_and_fails(
     tmp_path: Path,
 ) -> None:
-    """context_compaction_requested 允许 budget_state=None 并按 unsupported recovery 失败收口。"""
+    """provider overflow budget_state=None 不成为 Host budget truth。"""
 
     with open_host_durable_store(_options(tmp_path)) as store:
         seeded = _seed_active_run(store.transaction_runner)
@@ -308,7 +308,11 @@ def test_context_compaction_requested_accepts_none_budget_and_fails(
         ).ingest(candidate)
 
         assert result.events[0].event_class == EventClass.DIAGNOSTIC
+        assert result.events[0].event_type == "ENGINE_EVENT_DIAGNOSTIC"
         assert result.events[1].event_type == "ATTEMPT_FAILED"
+        assert "CONTEXT_COMPACTION_REQUESTED" not in (
+            event.event_type for event in result.events
+        )
         assert _payload(result.events[0])["budget_state_present"] is False
         run_status, _attempt_status = _statuses(store.transaction_runner, seeded)
         assert run_status == RunStatus.FAILED
@@ -644,7 +648,10 @@ def test_usage_reported_is_projection_signal_without_state_change(
 
         assert result.events[0].event_class == EventClass.PROJECTION_SIGNAL
         assert result.events[0].event_type == "USAGE_REPORTED"
-        assert _payload(result.events[0])["total_tokens"] == 30
+        payload = _payload(result.events[0])
+        assert payload["total_tokens"] == 30
+        assert "policy_ref" not in payload
+        assert "estimator_digest" not in payload
         run_status, attempt_status = _statuses(store.transaction_runner, seeded)
         assert run_status == RunStatus.RUNNING
         assert attempt_status == AttemptStatus.RUNNING

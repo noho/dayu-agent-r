@@ -223,8 +223,8 @@ Phase Map 中每个 phase 必须使用统一条目格式。模板如下：
 约束：本节只保留当前 gate 结论；phase 过程流水必须归档到 `历史记录`，仍需追踪的风险或后续 owner 必须写入 `Open Questions 与风险追踪` 的 `追踪区`。
 
 当前 work unit：Phase 10. Context Governance / Compaction。
-当前 gate：Phase 10 implementation。
-下一 gate：Phase 10 Slice 1 implementation review。
+当前 gate：Phase 10 Slice 2 implementation。
+下一 gate：Phase 10 Slice 2 implementation review。
 
 ## Phase Map
 
@@ -2042,6 +2042,34 @@ P9.5 收口清单：
 - 当前无 PR review blocking fix。
 
 ## 历史记录
+
+### 2026-05-18 Phase 10 S1 Context Budget Policy accepted
+
+Phase 10 S1 Context Budget Policy / Estimator / Usage Observation 已完成。Implementation artifact 为
+`docs/reviews/phase10-s1-context-budget-implementation-20260518.md`。Code review artifacts 为
+`docs/reviews/phase10-s1-code-review-mimo-20260518.md` 与
+`docs/reviews/phase10-s1-code-review-ds-20260518.md`。
+
+Controller 裁决：两份 initial review 均为 PASS，但接受 DS H1 与 MiMo/DS M1/M3、DS M2 作为当前 slice fix
+items：`dayu.host.durable.event_log` 不得导入 context policy 语义；重复整数 validation helper 必须收敛到
+Host 层共享校验真源；soft threshold ratio 不得与默认 safety margin 形成双真源；EventLog payload filter
+fail-closed 边界必须有测试覆盖。Fix artifact 为
+`docs/reviews/phase10-s1-code-review-fix-codex-20260518.md`。Re-review artifacts 为
+`docs/reviews/phase10-s1-code-rereview-mimo-20260518.md` 与
+`docs/reviews/phase10-s1-code-rereview-ds-20260518.md`；两份 re-review 均 PASS，remaining blocking / high /
+medium findings 为 0。Controller adjudication artifact 为
+`docs/reviews/phase10-s1-code-review-controller-adjudication-20260518.md`。
+
+S1 交付：新增 Host context budget typed policy / static provider、conservative estimator、usage observation
+typed model、`HostLocalExecutionOptions.context_budget_policy` typed 接收点，以及 durable-neutral
+`EventPayloadTextEqualsFilter` + transaction-scoped committed fact count helper。预算真源仍只来自 Host typed policy；
+`USAGE_REPORTED` payload 未扩展，provider overflow `budget_state=None` 不成为 Host budget truth。README 同步：
+`dayu/host/README.md` 已记录当前 Host local execution options context budget policy typed 边界与 EventLog
+committed fact 统计能力。
+
+Validation：`pytest tests/host/test_context_budget.py tests/host/test_public_contracts.py tests/host/test_engine_ingest_mapping.py -q`
+81 passed；`pyright` 0 errors / 0 warnings / 0 informations；`git diff --check` clean。当前 gate 进入 Phase 10
+S2 Compactor Contracts / Fake Compactor / Quality Check / Artifact Store implementation。Accepted slice commit 在本条记录提交后由 git commit 记录。
 
 ### 2026-05-18 Phase 10 implementation-ready plan accepted
 

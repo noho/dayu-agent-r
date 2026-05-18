@@ -71,6 +71,7 @@ from dayu.host import (
     WaitResolutionSource,
 )
 from dayu.host.tool_runtime import ToolFactKind
+from dayu.host.context_policy import ContextBudgetPolicy, default_context_budget_policy
 from dayu.host.memory import MemoryProjectionPolicy
 from dayu.engine.contracts.agent_policy import AgentPolicy
 from dayu.engine.contracts.runner_spec import RunnerCallOptions, RunnerSpec
@@ -660,8 +661,19 @@ def test_host_local_execution_options_accept_valid_shape() -> None:
     assert options.runner_spec.provider == "test"
     assert options.runner_options.stream is False
     assert options.agent_policy.allow_tool_calls is False
+    assert options.context_budget_policy is None
     assert options.memory_projection_policy.max_verified_facts > 0
     assert options.memory_projection_catchup_batch_size > 0
+
+    with_budget = replace(
+        options,
+        context_budget_policy=default_context_budget_policy(
+            context_window_size=2048,
+            reserved_output_tokens=512,
+        ),
+    )
+    assert with_budget.context_budget_policy is not None
+    assert with_budget.context_budget_policy.context_window_size == 2048
 
 
 def test_host_local_execution_options_rejects_invalid_typed_fields() -> None:
@@ -686,6 +698,14 @@ def test_host_local_execution_options_rejects_invalid_typed_fields() -> None:
         replace(
             _local_execution_options(),
             worker_factory=cast(LocalEngineWorkerFactory, None),
+        )
+    with pytest.raises(TypeError, match="context_budget_policy"):
+        replace(
+            _local_execution_options(),
+            context_budget_policy=cast(
+                ContextBudgetPolicy,
+                _runner_spec(),
+            ),
         )
     with pytest.raises(TypeError, match="memory_projection_policy"):
         replace(
