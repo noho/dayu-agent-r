@@ -259,6 +259,7 @@ async def test_public_host_close_closes_command_handle_when_scheduler_close_rais
     projection_catchup_port = _RecordingProjectionCatchupPort()
     host = _PublicHostHandle(
         command_handle=cast(HostCommandHandle, command_handle),
+        host_handle_id="host-open-runtime-test",
         scheduler=cast(HostDispatchScheduler, scheduler),
         projection_catchup_port=projection_catchup_port,
     )

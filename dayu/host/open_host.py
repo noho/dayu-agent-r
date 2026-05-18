@@ -9,6 +9,7 @@ public handle，不接触 scheduler、wakeup port 或 durable internals。
 from __future__ import annotations
 
 import asyncio
+import logging
 from collections.abc import AsyncIterator
 from contextlib import AbstractAsyncContextManager
 from dataclasses import dataclass
@@ -66,8 +67,10 @@ from dayu.host.read_api import (
 from dayu.host.read_api import (
     session_live_event_start_cursor as _session_live_event_start_cursor,
 )
+from dayu.runtime.log_levels import VERBOSE_LOG_LEVEL
 
 _GENERATED_OPEN_HOST_ID_PREFIX = "open-host"
+_LOGGER = logging.getLogger(__name__)
 _INTERNAL_COMMAND_FALLBACK_CONTEXT_WINDOW_SIZE = 8192
 """``context_budget_policy=None`` 时内部 command options 使用的兜底窗口。"""
 
@@ -130,6 +133,7 @@ class _PublicHostHandle:
     __slots__ = (
         "_closed",
         "_command_handle",
+        "_host_handle_id",
         "_projection_catchup_port",
         "_scheduler",
     )
@@ -138,18 +142,21 @@ class _PublicHostHandle:
         self,
         *,
         command_handle: HostCommandHandle,
+        host_handle_id: str,
         scheduler: HostDispatchScheduler,
         projection_catchup_port: ProjectionCatchupPort,
     ) -> None:
         """初始化 public Host handle。
 
         :param command_handle: 内部同步 command handle。
+        :param host_handle_id: 当前 Host handle 诊断 id。
         :param scheduler: 内部 dispatch scheduler。
         :param projection_catchup_port: close 阶段使用的 projection flush 端口。
         :returns: ``None``。
         """
 
         self._command_handle = command_handle
+        self._host_handle_id = host_handle_id
         self._scheduler = scheduler
         self._projection_catchup_port = projection_catchup_port
         self._closed = False
@@ -314,6 +321,14 @@ class _PublicHostHandle:
             self._command_handle,
             session_id,
         )
+        _LOGGER.log(
+            VERBOSE_LOG_LEVEL,
+            "host.public_handle.watch_attached host_handle_id=%s "
+            "session_id=%s cursor=%s",
+            self._host_handle_id,
+            session_id,
+            cursor,
+        )
         return self._watch_session_events_after(session_id, cursor)
 
     async def _watch_session_events_after(
@@ -355,6 +370,10 @@ class _PublicHostHandle:
         if self._closed:
             return
         self._closed = True
+        _LOGGER.info(
+            "host.public_handle.close_start host_handle_id=%s",
+            self._host_handle_id,
+        )
         try:
             await self._scheduler.close()
         finally:
@@ -362,6 +381,10 @@ class _PublicHostHandle:
                 self._projection_catchup_port.catch_up_projection()
             finally:
                 self._command_handle.close()
+                _LOGGER.info(
+                    "host.public_handle.close_done host_handle_id=%s",
+                    self._host_handle_id,
+                )
 
     def _raise_if_closed(self) -> None:
         """校验 public handle 仍处于打开状态。
@@ -407,6 +430,11 @@ class _OpenHostContextManager(AbstractAsyncContextManager[Host]):
         local_execution = _local_execution_options_from_open_host_options(
             self._options
         )
+        host_handle_id = _host_handle_id_from_options(command_options)
+        _LOGGER.info(
+            "host.open.start host_handle_id=%s",
+            host_handle_id,
+        )
         durable_store = open_host_durable_store(
             _durable_options_from_command_options(command_options)
         )
@@ -416,7 +444,6 @@ class _OpenHostContextManager(AbstractAsyncContextManager[Host]):
                 durable_store=durable_store,
                 options=self._options,
             )
-            host_handle_id = _host_handle_id_from_options(command_options)
             scheduler = await HostDispatchScheduler.open(
                 transaction_runner=durable_store.transaction_runner,
                 local_execution=local_execution,
@@ -439,11 +466,21 @@ class _OpenHostContextManager(AbstractAsyncContextManager[Host]):
             )
             self._host = _PublicHostHandle(
                 command_handle=command_handle,
+                host_handle_id=host_handle_id,
                 scheduler=scheduler,
                 projection_catchup_port=projection_catchup_port,
             )
+            _LOGGER.info(
+                "host.open.ready host_handle_id=%s",
+                host_handle_id,
+            )
             return self._host
         except Exception:
+            _LOGGER.error(
+                "host.open.failed host_handle_id=%s",
+                host_handle_id,
+                exc_info=True,
+            )
             durable_store.close()
             raise
 

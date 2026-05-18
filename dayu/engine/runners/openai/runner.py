@@ -76,6 +76,7 @@ from dayu.runtime.cancellation import (
     await_or_cancel as _runtime_await_or_cancel,
     wait_for_or_cancel as _runtime_wait_for_or_cancel,
 )
+from dayu.runtime.log_levels import VERBOSE_LOG_LEVEL
 
 _LOGGER: logging.Logger = logging.getLogger(__name__)
 
@@ -281,6 +282,17 @@ class AsyncOpenAIRunner:
             spec=self._spec,
         )
         attempt = 0
+        event_count = 0
+        _LOGGER.log(
+            VERBOSE_LOG_LEVEL,
+            "runner.call.start provider=%s model=%s message_count=%s "
+            "tool_schema_count=%s stream=%s",
+            self._spec.provider,
+            self._spec.model,
+            len(messages),
+            len(tools),
+            effective_options.stream,
+        )
         try:
             while True:
                 attempt += 1
@@ -298,7 +310,17 @@ class AsyncOpenAIRunner:
                         payload, effective_options
                     ):
                         attempt_yielded_event = True
+                        event_count += 1
                         yield event
+                    _LOGGER.log(
+                        VERBOSE_LOG_LEVEL,
+                        "runner.call.done provider=%s model=%s attempts=%s "
+                        "event_count=%s",
+                        self._spec.provider,
+                        self._spec.model,
+                        attempt,
+                        event_count,
+                    )
                     return
                 except _AttemptFailedTerminal as failure:
                     _LOGGER.warning(
@@ -320,9 +342,20 @@ class AsyncOpenAIRunner:
                         raw_payload=failure.raw_payload,
                         attempt=attempt,
                     )
+                    event_count += 1
                     yield self._make_done_event(
                         FinishReason.ERROR,
                         provider_request_id=failure.provider_request_id,
+                    )
+                    event_count += 1
+                    _LOGGER.log(
+                        VERBOSE_LOG_LEVEL,
+                        "runner.call.done provider=%s model=%s attempts=%s "
+                        "event_count=%s",
+                        self._spec.provider,
+                        self._spec.model,
+                        attempt,
+                        event_count,
                     )
                     return
                 except _AttemptFailedRetriable as failure:
@@ -346,9 +379,20 @@ class AsyncOpenAIRunner:
                             raw_payload=failure.raw_payload,
                             attempt=attempt,
                         )
+                        event_count += 1
                         yield self._make_done_event(
                             FinishReason.ERROR,
                             provider_request_id=failure.provider_request_id,
+                        )
+                        event_count += 1
+                        _LOGGER.log(
+                            VERBOSE_LOG_LEVEL,
+                            "runner.call.done provider=%s model=%s attempts=%s "
+                            "event_count=%s",
+                            self._spec.provider,
+                            self._spec.model,
+                            attempt,
+                            event_count,
                         )
                         return
                     decision = compute_retry_decision(
@@ -377,12 +421,23 @@ class AsyncOpenAIRunner:
                             raw_payload=failure.raw_payload,
                             attempt=attempt,
                         )
+                        event_count += 1
                         yield self._make_done_event(
                             FinishReason.ERROR,
                             provider_request_id=failure.provider_request_id,
                         )
+                        event_count += 1
+                        _LOGGER.log(
+                            VERBOSE_LOG_LEVEL,
+                            "runner.call.done provider=%s model=%s attempts=%s "
+                            "event_count=%s",
+                            self._spec.provider,
+                            self._spec.model,
+                            attempt,
+                            event_count,
+                        )
                         return
-                    _LOGGER.info(
+                    _LOGGER.warning(
                         "runner.attempt.retry provider=%s model=%s "
                         "attempt=%d error_code=%s sleep=%.3fs",
                         self._spec.provider,
@@ -397,11 +452,14 @@ class AsyncOpenAIRunner:
                     )
         except _RunnerInterrupted:
             # 取消例外：直接退出生成器，不补 RunnerDoneData。
-            _LOGGER.debug(
-                "runner.cancelled provider=%s model=%s attempt=%d",
+            _LOGGER.log(
+                VERBOSE_LOG_LEVEL,
+                "runner.cancelled provider=%s model=%s attempt=%d "
+                "event_count=%s",
                 self._spec.provider,
                 self._spec.model,
                 attempt,
+                event_count,
             )
             return
 
