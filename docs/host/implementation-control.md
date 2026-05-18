@@ -223,8 +223,8 @@ Phase Map 中每个 phase 必须使用统一条目格式。模板如下：
 约束：本节只保留当前 gate 结论；phase 过程流水必须归档到 `历史记录`，仍需追踪的风险或后续 owner 必须写入 `Open Questions 与风险追踪` 的 `追踪区`。
 
 当前 work unit：Phase 10. Context Governance / Compaction。
-当前 gate：Phase 10 Slice 4 implementation。
-下一 gate：Phase 10 Slice 4 implementation review。
+当前 gate：Phase 10 Slice 5 implementation。
+下一 gate：Phase 10 Slice 5 implementation review。
 
 ## Phase Map
 
@@ -1483,6 +1483,24 @@ P9.5 收口清单：
 
 ### 追踪区
 
+#### Phase 10 S4 Proactive Context Governance 残余风险追踪
+
+背景决议：
+
+- Phase 10 S4 已实现 accepted pre-start governance gate、proactive compact canonical events / artifact、
+  memory projection catch-up 后 start Attempt，以及 RunInputBuilder durable compact artifact provider。
+- S4 code review 没有 blocking / high / medium finding。Controller 接受 3 个 residual，不作为 S4 当前阻塞项。
+
+追踪项：
+
+- Compactor 调用与 compact artifact 文件写入当前位于 SQLite write transaction 内。真实异步 LLM compactor 接入前，
+  Phase 10 后续 reactive / production compactor owner 必须设计 durable in-progress / fencing，避免移出 transaction 后产生
+  重复 wakeup、cancel 与 compact limit 竞态。
+- Budget estimate 当前只覆盖当前 user input display text。后续 tokenizer / sizing owner 必须覆盖 RunInputBuilder messages、
+  tool schemas、memory snapshot 与 compact artifact refs；provider-specific tokenizer 仍归后续能力。
+- `promote_next_queued_run` legacy helper 当前仍保留 public method 表面。Phase 10 closeout 或后续 Host public API cleanup
+  必须复查是否收敛接口面，或让 helper 强制走 governance gate。
+
 #### P9.5 Pre-P10 Cross-Repository Hardening PR 归属追踪
 
 背景决议：
@@ -2042,6 +2060,32 @@ P9.5 收口清单：
 - 当前无 PR review blocking fix。
 
 ## 历史记录
+
+### 2026-05-18 Phase 10 S4 Proactive Context Governance accepted
+
+Phase 10 S4 Proactive Pre-dispatch Context Governance / RunInputBuilder Compact Provider 已完成。Implementation artifact 为
+`docs/reviews/phase10-s4-proactive-context-governance-implementation-20260518.md`。Code review artifacts 为
+`docs/reviews/phase10-s4-code-review-mimo-20260518.md` 与
+`docs/reviews/phase10-s4-code-review-ds-20260518.md`。
+
+Controller 裁决：AgentMiMo review 为 PASS，AgentDS review 为 ACCEPTED_WITH_RESIDUAL。Controller 接受 3 个
+residual：compactor / artifact write 位于 SQLite write transaction 内、budget estimate 只覆盖当前 prompt、
+`promote_next_queued_run` legacy helper 表面仍存在。上述 residual 已写入追踪区，不阻塞 S4 accepted。
+Controller adjudication artifact 为
+`docs/reviews/phase10-s4-code-review-controller-adjudication-20260518.md`。
+
+S4 交付：新增 `RunStatus.ACCEPTED` 与 schema v9，admission `start_run` 先创建 accepted Run 且不创建 Attempt；
+scheduler `wake_queue_promotion` 成为 production pre-start governance gate；soft threshold 触发 proactive compact，
+hard threshold / compact failure 以 attempt-free `RUN_FAILED` 收口；compact accepted 后先 catch up P9 memory projection，
+再创建 `RUN_STARTED` / `ATTEMPT_STARTED` / dispatch record。RunInputBuilder production path 注入
+`DurableCompactArtifactProvider`，只向 Engine 暴露 compact artifact ref / digest、compacted event refs、preserved fact refs
+与 bounded episode summary。
+
+Validation：`pytest tests/host/test_run_attempt_transitions.py tests/host/test_admission_queue.py
+tests/host/test_dispatch_scheduler.py tests/host/test_phase5_local_execution_integration.py
+tests/host/test_run_input_builder.py -q` 124 passed；`pyright` 0 errors / 0 warnings / 0 informations；
+`git diff --check` clean。当前 gate 进入 Phase 10 S5 Reactive Engine Overflow Recovery implementation。
+Accepted slice commit 在本条记录提交后由 git commit 记录。
 
 ### 2026-05-18 Phase 10 S3 Canonical Compact Events accepted
 

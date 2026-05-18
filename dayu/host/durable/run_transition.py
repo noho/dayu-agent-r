@@ -70,7 +70,9 @@ from dayu.host.durable.state import (
     read_run_by_id,
     read_wait_record_by_id,
     resume_waiting_run_row,
+    start_unstarted_run_row,
     terminal_attempt_row,
+    terminal_unstarted_run_row,
     terminal_run_row,
 )
 from dayu.host.durable.transaction import HostTransaction
@@ -149,6 +151,40 @@ class CreateQueuedRunInput:
 
 
 @dataclass(frozen=True, slots=True)
+class CreateAcceptedRunInput:
+    """创建 pre-start accepted Run 的输入。
+
+    :param session_id: 所属 Session id。
+    :param run_id: 调用方生成的 Run id。
+    :param client_request_id: 客户端幂等请求 id。
+    :param input_event_id: 已存在 ``USER_INPUT_ACCEPTED`` event id。
+    :param input_event_sequence: 已存在 ``USER_INPUT_ACCEPTED`` event sequence。
+    :param run_accepted_event_id: 调用方生成的 ``RUN_ACCEPTED`` event id。
+    :param occurred_at: canonical fact 的发生时间。
+    :param actor: 事件 actor。
+    :param source: 事件 source。
+    :param idempotency_key: 幂等 key。
+    :param execution_target: 已解析执行目标。
+    :param queue_policy: Run queue policy。
+    :param call_context_digest: 调用上下文 digest。
+    """
+
+    session_id: str
+    run_id: str
+    client_request_id: str
+    input_event_id: str
+    input_event_sequence: int
+    run_accepted_event_id: str
+    occurred_at: datetime
+    actor: str
+    source: str
+    idempotency_key: str
+    execution_target: str
+    queue_policy: str
+    call_context_digest: str
+
+
+@dataclass(frozen=True, slots=True)
 class CreateRunningRunInput:
     """创建 running Run、STARTING Attempt 与 pending dispatch 的输入。
 
@@ -196,6 +232,66 @@ class CreateRunningRunInput:
     worker_kind: WorkerKind
     owner_host_instance_id: str | None
     call_context_digest: str
+
+
+@dataclass(frozen=True, slots=True)
+class StartGovernedRunInput:
+    """pre-start governance 通过后启动 accepted 或 queued Run 的输入。
+
+    :param run_id: 目标 Run id。
+    :param expected_status: 期望源状态，只允许 accepted 或 queued。
+    :param run_started_event_id: 调用方生成的 ``RUN_STARTED`` event id。
+    :param attempt_started_event_id: 调用方生成的 ``ATTEMPT_STARTED`` event id。
+    :param attempt_id: 调用方生成的 Attempt id。
+    :param execution_id: 调用方生成的 execution id。
+    :param dispatch_record_id: 调用方生成的 dispatch record id。
+    :param occurred_at: canonical facts 的发生时间。
+    :param actor: 事件 actor。
+    :param source: 事件 source。
+    :param start_reason: Run start reason。
+    :param worker_kind: worker 类型。
+    :param owner_host_instance_id: owner Host instance id；Phase 10 可为 ``None``。
+    """
+
+    run_id: str
+    expected_status: RunStatus
+    run_started_event_id: str
+    attempt_started_event_id: str
+    attempt_id: str
+    execution_id: str
+    dispatch_record_id: str
+    occurred_at: datetime
+    actor: str
+    source: str
+    start_reason: RunStartReason
+    worker_kind: WorkerKind
+    owner_host_instance_id: str | None
+
+
+@dataclass(frozen=True, slots=True)
+class FailUnstartedRunInput:
+    """pre-start governance 失败后收口未创建 Attempt 的 Run。
+
+    :param run_id: 目标 Run id。
+    :param expected_status: 期望源状态，只允许 accepted 或 queued。
+    :param run_failed_event_id: 调用方生成的 ``RUN_FAILED`` event id。
+    :param occurred_at: canonical fact 的发生时间。
+    :param actor: 事件 actor。
+    :param source: 事件 source。
+    :param reason: 失败原因。
+    :param error_code: 错误码。
+    :param message: 失败消息。
+    """
+
+    run_id: str
+    expected_status: RunStatus
+    run_failed_event_id: str
+    occurred_at: datetime
+    actor: str
+    source: str
+    reason: str
+    error_code: str
+    message: str
 
 
 @dataclass(frozen=True, slots=True)
@@ -616,6 +712,58 @@ class WaitResolutionTransitionResult:
     attempt_started_event: EventLogRow | None
 
 
+def create_accepted_run_in_transaction(
+    transaction: HostTransaction,
+    event_log_store: EventLogStore,
+    request: CreateAcceptedRunInput,
+) -> RunTransitionResult:
+    """创建 pre-start accepted Run，不创建 Attempt 或 dispatch record。
+
+    :param transaction: 调用方提供的 Host transaction。
+    :param event_log_store: EventLog append primitive。
+    :param request: 创建 accepted Run 输入。
+    :returns: transition 结果，成功时 ``status`` 为 ``updated``。
+    :raises HostDurableError: 输入字段或 SQLite 写入无效时由底层抛出。
+    """
+
+    _validate_create_accepted_input(request)
+    accepted_event = event_log_store.append_event(
+        transaction, _run_accepted_event_request(request)
+    ).row
+    created_at = format_utc_timestamp(request.occurred_at)
+    run = RunRow(
+        run_id=request.run_id,
+        session_id=request.session_id,
+        status=RunStatus.ACCEPTED,
+        client_request_id=request.client_request_id,
+        input_event_id=request.input_event_id,
+        input_event_sequence=request.input_event_sequence,
+        accepted_event_id=accepted_event.event_id,
+        accepted_event_sequence=accepted_event.event_sequence,
+        queued_event_id=None,
+        queued_event_sequence=None,
+        started_event_id=None,
+        started_event_sequence=None,
+        terminal_event_id=None,
+        terminal_event_sequence=None,
+        current_attempt_id=None,
+        source_run_id=None,
+        source_run_relation=None,
+        execution_target=request.execution_target,
+        queue_policy=request.queue_policy,
+        created_at=created_at,
+        updated_at=created_at,
+        terminal_at=None,
+    )
+    insert_run(transaction, run)
+    return RunTransitionResult(
+        status=StateMutationStatus.UPDATED,
+        run=read_run_by_id(transaction, request.run_id),
+        attempt=None,
+        dispatch_record=None,
+    )
+
+
 def create_queued_run_in_transaction(
     transaction: HostTransaction,
     event_log_store: EventLogStore,
@@ -752,6 +900,135 @@ def create_running_run_with_starting_attempt_in_transaction(
         dispatch_record=read_dispatch_record_by_attempt_id(
             transaction, request.attempt_id
         ),
+    )
+
+
+def start_governed_run_with_starting_attempt_in_transaction(
+    transaction: HostTransaction,
+    event_log_store: EventLogStore,
+    request: StartGovernedRunInput,
+) -> RunTransitionResult:
+    """将 accepted/queued Run 启动为 running 并创建 STARTING Attempt。
+
+    :param transaction: 调用方提供的 Host transaction。
+    :param event_log_store: EventLog append primitive。
+    :param request: governance 通过后的启动输入。
+    :returns: transition 结果。
+    :raises HostDurableError: 输入字段或 SQLite 写入无效时由底层抛出。
+    """
+
+    _validate_start_governed_input(request)
+    run = read_run_by_id(transaction, request.run_id)
+    if run is None:
+        return RunTransitionResult(
+            status=StateMutationStatus.NOT_FOUND,
+            run=None,
+            attempt=None,
+            dispatch_record=None,
+        )
+    if run.status != request.expected_status or run.current_attempt_id is not None:
+        return RunTransitionResult(
+            status=StateMutationStatus.INVALID_STATE,
+            run=run,
+            attempt=None,
+            dispatch_record=None,
+        )
+    started_event = event_log_store.append_event(
+        transaction, _governed_run_started_event_request(request, run)
+    ).row
+    updated_at = format_utc_timestamp(request.occurred_at)
+    started = start_unstarted_run_row(
+        transaction,
+        session_id=run.session_id,
+        run_id=run.run_id,
+        expected_status=request.expected_status,
+        started_event_id=started_event.event_id,
+        started_event_sequence=started_event.event_sequence,
+        current_attempt_id=request.attempt_id,
+        updated_at=updated_at,
+    )
+    started = _require_run_mutation_updated(
+        started, mutation_name="start governed Run"
+    )
+    attempt_started_event = event_log_store.append_event(
+        transaction, _governed_attempt_started_event_request(request, run)
+    ).row
+    attempt = _governed_attempt_row(
+        request=request,
+        run_id=run.run_id,
+        started_event_id=attempt_started_event.event_id,
+        started_event_sequence=attempt_started_event.event_sequence,
+        created_at=updated_at,
+    )
+    dispatch_record = _governed_dispatch_record_row(
+        request=request,
+        run=run,
+        created_event_id=attempt_started_event.event_id,
+        created_event_sequence=attempt_started_event.event_sequence,
+        created_at=updated_at,
+    )
+    insert_attempt(transaction, attempt)
+    insert_dispatch_record(transaction, dispatch_record)
+    return RunTransitionResult(
+        status=started.status,
+        run=read_run_by_id(transaction, run.run_id),
+        attempt=read_attempt_by_id(transaction, request.attempt_id),
+        dispatch_record=read_dispatch_record_by_attempt_id(
+            transaction, request.attempt_id
+        ),
+    )
+
+
+def fail_unstarted_run_in_transaction(
+    transaction: HostTransaction,
+    event_log_store: EventLogStore,
+    request: FailUnstartedRunInput,
+) -> RunTransitionResult:
+    """将 accepted/queued Run attempt-free 收口为 failed。
+
+    :param transaction: 调用方提供的 Host transaction。
+    :param event_log_store: EventLog append primitive。
+    :param request: failure 输入。
+    :returns: transition 结果。
+    :raises HostDurableError: 输入字段或 SQLite 写入无效时由底层抛出。
+    """
+
+    _validate_fail_unstarted_input(request)
+    run = read_run_by_id(transaction, request.run_id)
+    if run is None:
+        return RunTransitionResult(
+            status=StateMutationStatus.NOT_FOUND,
+            run=None,
+            attempt=None,
+            dispatch_record=None,
+        )
+    if run.status != request.expected_status or run.current_attempt_id is not None:
+        return RunTransitionResult(
+            status=StateMutationStatus.INVALID_STATE,
+            run=run,
+            attempt=None,
+            dispatch_record=None,
+        )
+    failed_event = event_log_store.append_event(
+        transaction, _unstarted_run_failed_event_request(request, run)
+    ).row
+    run_result = terminal_unstarted_run_row(
+        transaction,
+        run_id=run.run_id,
+        expected_status=request.expected_status,
+        terminal_status=RunStatus.FAILED,
+        terminal_event_id=failed_event.event_id,
+        terminal_event_sequence=failed_event.event_sequence,
+        terminal_at=format_utc_timestamp(request.occurred_at),
+    )
+    run_result = _require_run_mutation_updated(
+        run_result, mutation_name="fail unstarted Run"
+    )
+    return RunTransitionResult(
+        status=run_result.status,
+        run=run_result.row,
+        attempt=None,
+        dispatch_record=None,
     )
 
 
@@ -1503,7 +1780,7 @@ def cancel_queued_in_transaction(
             attempt=None,
             dispatch_record=None,
         )
-    if run.status != RunStatus.QUEUED:
+    if run.status not in (RunStatus.ACCEPTED, RunStatus.QUEUED):
         return RunTransitionResult(
             status=StateMutationStatus.INVALID_STATE,
             run=run,
@@ -1523,9 +1800,11 @@ def cancel_queued_in_transaction(
             terminal_attempt_event_id=None,
         ),
     ).row
-    run_result = cancel_queued_run_row(
+    run_result = terminal_unstarted_run_row(
         transaction,
         run_id=request.run_id,
+        expected_status=run.status,
+        terminal_status=RunStatus.CANCELLED,
         terminal_event_id=run_cancelled_event.event_id,
         terminal_event_sequence=run_cancelled_event.event_sequence,
         terminal_at=format_utc_timestamp(request.occurred_at),
@@ -1827,7 +2106,7 @@ def _raise_after_event_append_mutation_failure(
 
 
 def _run_accepted_event_request(
-    request: CreateQueuedRunInput | CreateRunningRunInput,
+    request: CreateAcceptedRunInput | CreateQueuedRunInput | CreateRunningRunInput,
 ) -> EventLogAppendRequest:
     """构造 ``RUN_ACCEPTED`` EventLog append request。
 
@@ -2056,6 +2335,119 @@ def _promotion_attempt_started_event_request(
             "worker_kind": request.worker_kind.value,
             "execution_target": queued.execution_target,
             "owner_host_instance_id": request.owner_host_instance_id,
+        },
+        payload_ref=None,
+        payload_digest=None,
+    )
+
+
+def _governed_run_started_event_request(
+    request: StartGovernedRunInput, run: RunRow
+) -> EventLogAppendRequest:
+    """构造 governance start ``RUN_STARTED`` EventLog append request。
+
+    :param request: governance start 输入。
+    :param run: 被启动的 Run row。
+    :returns: EventLog append request。
+    """
+
+    return EventLogAppendRequest(
+        event_id=request.run_started_event_id,
+        event_class=EventClass.CANONICAL_FACT,
+        session_id=run.session_id,
+        run_id=run.run_id,
+        attempt_id=None,
+        execution_id=None,
+        event_type=_EVENT_TYPE_RUN_STARTED,
+        occurred_at=request.occurred_at,
+        actor=request.actor,
+        source=request.source,
+        client_request_id=None,
+        idempotency_key=None,
+        policy_decision=None,
+        reason={"start_reason": request.start_reason.value},
+        payload_json={
+            "run_id": run.run_id,
+            "start_reason": request.start_reason.value,
+            "accepted_event_id": run.accepted_event_id,
+            "accepted_event_sequence": run.accepted_event_sequence,
+            "attempt_id": request.attempt_id,
+            "dispatch_record_id": request.dispatch_record_id,
+        },
+        payload_ref=None,
+        payload_digest=None,
+    )
+
+
+def _governed_attempt_started_event_request(
+    request: StartGovernedRunInput, run: RunRow
+) -> EventLogAppendRequest:
+    """构造 governance start ``ATTEMPT_STARTED`` EventLog append request。
+
+    :param request: governance start 输入。
+    :param run: 被启动的 Run row。
+    :returns: EventLog append request。
+    """
+
+    return EventLogAppendRequest(
+        event_id=request.attempt_started_event_id,
+        event_class=EventClass.CANONICAL_FACT,
+        session_id=run.session_id,
+        run_id=run.run_id,
+        attempt_id=request.attempt_id,
+        execution_id=request.execution_id,
+        event_type=_EVENT_TYPE_ATTEMPT_STARTED,
+        occurred_at=request.occurred_at,
+        actor=request.actor,
+        source=request.source,
+        client_request_id=None,
+        idempotency_key=None,
+        policy_decision=None,
+        reason=None,
+        payload_json={
+            "attempt_id": request.attempt_id,
+            "execution_id": request.execution_id,
+            "dispatch_record_id": request.dispatch_record_id,
+            "worker_kind": request.worker_kind.value,
+            "execution_target": run.execution_target,
+            "owner_host_instance_id": request.owner_host_instance_id,
+        },
+        payload_ref=None,
+        payload_digest=None,
+    )
+
+
+def _unstarted_run_failed_event_request(
+    request: FailUnstartedRunInput, run: RunRow
+) -> EventLogAppendRequest:
+    """构造 attempt-free ``RUN_FAILED`` EventLog append request。
+
+    :param request: failure 输入。
+    :param run: 被收口的 Run row。
+    :returns: EventLog append request。
+    """
+
+    return EventLogAppendRequest(
+        event_id=request.run_failed_event_id,
+        event_class=EventClass.CANONICAL_FACT,
+        session_id=run.session_id,
+        run_id=run.run_id,
+        attempt_id=None,
+        execution_id=None,
+        event_type=_EVENT_TYPE_RUN_FAILED,
+        occurred_at=request.occurred_at,
+        actor=request.actor,
+        source=request.source,
+        client_request_id=None,
+        idempotency_key=None,
+        policy_decision=None,
+        reason={"reason": request.reason},
+        payload_json={
+            "run_id": run.run_id,
+            "attempt_id": None,
+            "reason": request.reason,
+            "error_code": request.error_code,
+            "message": request.message,
         },
         payload_ref=None,
         payload_digest=None,
@@ -2995,6 +3387,85 @@ def _promotion_dispatch_record_row(
     )
 
 
+def _governed_attempt_row(
+    *,
+    request: StartGovernedRunInput,
+    run_id: str,
+    started_event_id: str,
+    started_event_sequence: int,
+    created_at: str,
+) -> AttemptRow:
+    """构造 governance start 的 STARTING Attempt row。
+
+    :param request: governance start 输入。
+    :param run_id: 被启动的 Run id。
+    :param started_event_id: ATTEMPT_STARTED event id。
+    :param started_event_sequence: ATTEMPT_STARTED event sequence。
+    :param created_at: 创建 timestamp。
+    :returns: Attempt row。
+    """
+
+    return AttemptRow(
+        attempt_id=request.attempt_id,
+        run_id=run_id,
+        execution_id=request.execution_id,
+        status=AttemptStatus.STARTING,
+        started_event_id=started_event_id,
+        started_event_sequence=started_event_sequence,
+        terminal_event_id=None,
+        terminal_event_sequence=None,
+        created_at=created_at,
+        updated_at=created_at,
+        terminal_at=None,
+    )
+
+
+def _governed_dispatch_record_row(
+    *,
+    request: StartGovernedRunInput,
+    run: RunRow,
+    created_event_id: str,
+    created_event_sequence: int,
+    created_at: str,
+) -> DispatchRecordRow:
+    """构造 governance start 的 pending dispatch record row。
+
+    :param request: governance start 输入。
+    :param run: 被启动的 Run row。
+    :param created_event_id: ATTEMPT_STARTED event id。
+    :param created_event_sequence: ATTEMPT_STARTED event sequence。
+    :param created_at: 创建 timestamp。
+    :returns: dispatch record row。
+    """
+
+    return DispatchRecordRow(
+        dispatch_record_id=request.dispatch_record_id,
+        run_id=run.run_id,
+        attempt_id=request.attempt_id,
+        execution_id=request.execution_id,
+        status=DispatchRecordStatus.PENDING,
+        worker_kind=request.worker_kind,
+        execution_target=run.execution_target,
+        owner_host_instance_id=request.owner_host_instance_id,
+        created_event_id=created_event_id,
+        created_event_sequence=created_event_sequence,
+        waiting_for_lane_at=None,
+        lane_name=None,
+        lane_claim_id=None,
+        lane_owner_id=None,
+        lane_acquired_at=None,
+        dispatching_at=None,
+        worker_accepted_at=None,
+        worker_accept_event_id=None,
+        worker_accept_event_sequence=None,
+        cancelled_event_id=None,
+        cancelled_event_sequence=None,
+        created_at=created_at,
+        updated_at=created_at,
+        cancelled_at=None,
+    )
+
+
 def _resume_attempt_row(
     *,
     request: ResumeRunFromWaitingInput,
@@ -3423,6 +3894,30 @@ def _validate_create_queued_input(request: CreateQueuedRunInput) -> None:
     _require_non_empty_text(request.active_run_id, field_name="active_run_id")
 
 
+def _validate_create_accepted_input(request: CreateAcceptedRunInput) -> None:
+    """校验 accepted Run 创建输入。
+
+    :param request: 创建 accepted Run 输入。
+    :returns: ``None``。
+    :raises HostDurableError: 任一字段无效时抛出。
+    """
+
+    _validate_common_create_input(
+        session_id=request.session_id,
+        run_id=request.run_id,
+        client_request_id=request.client_request_id,
+        input_event_id=request.input_event_id,
+        input_event_sequence=request.input_event_sequence,
+        run_accepted_event_id=request.run_accepted_event_id,
+        actor=request.actor,
+        source=request.source,
+        idempotency_key=request.idempotency_key,
+        execution_target=request.execution_target,
+        queue_policy=request.queue_policy,
+        call_context_digest=request.call_context_digest,
+    )
+
+
 def _validate_create_running_input(request: CreateRunningRunInput) -> None:
     """校验 running Run 创建输入。
 
@@ -3461,6 +3956,56 @@ def _validate_create_running_input(request: CreateRunningRunInput) -> None:
     _require_optional_non_empty_text(
         request.owner_host_instance_id, field_name="owner_host_instance_id"
     )
+
+
+def _validate_start_governed_input(request: StartGovernedRunInput) -> None:
+    """校验 governance start 输入。
+
+    :param request: governance start 输入。
+    :returns: ``None``。
+    :raises HostDurableError: 任一字段无效时抛出。
+    """
+
+    _require_non_empty_text(request.run_id, field_name="run_id")
+    if request.expected_status not in (RunStatus.ACCEPTED, RunStatus.QUEUED):
+        raise HostDurableError("expected_status must be accepted or queued")
+    _require_non_empty_text(
+        request.run_started_event_id, field_name="run_started_event_id"
+    )
+    _require_non_empty_text(
+        request.attempt_started_event_id, field_name="attempt_started_event_id"
+    )
+    _require_non_empty_text(request.attempt_id, field_name="attempt_id")
+    _require_non_empty_text(request.execution_id, field_name="execution_id")
+    _require_non_empty_text(request.dispatch_record_id, field_name="dispatch_record_id")
+    _require_non_empty_text(request.actor, field_name="actor")
+    _require_non_empty_text(request.source, field_name="source")
+    if not isinstance(request.start_reason, RunStartReason):
+        raise HostDurableError("start_reason is invalid")
+    if not isinstance(request.worker_kind, WorkerKind):
+        raise HostDurableError("worker_kind is invalid")
+    _require_optional_non_empty_text(
+        request.owner_host_instance_id, field_name="owner_host_instance_id"
+    )
+
+
+def _validate_fail_unstarted_input(request: FailUnstartedRunInput) -> None:
+    """校验 unstarted Run failure 输入。
+
+    :param request: failure 输入。
+    :returns: ``None``。
+    :raises HostDurableError: 任一字段无效时抛出。
+    """
+
+    _require_non_empty_text(request.run_id, field_name="run_id")
+    if request.expected_status not in (RunStatus.ACCEPTED, RunStatus.QUEUED):
+        raise HostDurableError("expected_status must be accepted or queued")
+    _require_non_empty_text(request.run_failed_event_id, field_name="run_failed_event_id")
+    _require_non_empty_text(request.actor, field_name="actor")
+    _require_non_empty_text(request.source, field_name="source")
+    _require_non_empty_text(request.reason, field_name="reason")
+    _require_non_empty_text(request.error_code, field_name="error_code")
+    _require_non_empty_text(request.message, field_name="message")
 
 
 def _validate_common_create_input(

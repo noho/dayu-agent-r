@@ -181,8 +181,8 @@ def _confirmed_subjects(request: CompactionRequest) -> tuple[str, ...]:
     """
 
     if len(request.verified_fact_refs) > 0:
-        return request.verified_fact_refs
-    return (request.current_message_summary.current_user_input_ref,)
+        return tuple(f"subject:{fact_ref}" for fact_ref in request.verified_fact_refs)
+    return (f"subject:{request.current_message_summary.current_user_input_ref}",)
 
 
 def _user_constraints(request: CompactionRequest) -> tuple[str, ...]:

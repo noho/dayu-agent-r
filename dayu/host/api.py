@@ -27,6 +27,7 @@ from dayu.engine.contracts.agent_run import AgentRunRequest
 from dayu.engine.contracts.engine_events import EngineEvent
 from dayu.engine.contracts.runner_spec import RunnerCallOptions, RunnerSpec
 from dayu.host.context_policy import ContextBudgetPolicy
+from dayu.host.compaction import ContextCompactor
 from dayu.host._public_validation import (
     require_non_empty as _require_non_empty,
 )
@@ -267,6 +268,7 @@ class RunStatus(StrEnum):
     尚不写入。``SUCCEEDED``、``FAILED``、``CANCELLED``、``LOST`` 是终态。
     """
 
+    ACCEPTED = "accepted"
     QUEUED = "queued"
     RUNNING = "running"
     WAITING = "waiting"
@@ -702,7 +704,12 @@ class HostLocalExecutionOptions:
     :param agent_policy: Engine Agent policy。
     :param worker_factory: 本地 worker factory。
     :param context_budget_policy: Host Context Governance 的 typed 预算策略；
-        ``None`` 表示 Slice 1 仅暴露装配边界，production orchestration 尚未接入。
+        ``None`` 表示 pre-start governance 直接放行，不触发 proactive compact。
+    :param context_compactor: Host Context Governance 使用的 compactor typed port；
+        仅在预算触发 compact 时需要，生产不得隐式使用 fake compactor。
+    :param compact_artifact_root: compact artifact 写入根目录；未配置且触发
+        compact 时 fail closed。
+    :param compact_artifact_create_parent_dirs: compact artifact 根目录缺失时是否创建。
     :param memory_projection_policy: 本地 dispatch 注入 RunInputBuilder 的
         durable conversation memory policy。
     :param memory_projection_catchup_batch_size: worker 启动前追平 memory
@@ -726,6 +733,9 @@ class HostLocalExecutionOptions:
     agent_policy: AgentPolicy
     worker_factory: LocalEngineWorkerFactory
     context_budget_policy: ContextBudgetPolicy | None = None
+    context_compactor: ContextCompactor | None = None
+    compact_artifact_root: pathlib.Path | None = None
+    compact_artifact_create_parent_dirs: bool = True
     memory_projection_policy: MemoryProjectionPolicy = field(
         default_factory=default_memory_projection_policy
     )
@@ -807,6 +817,17 @@ class HostLocalExecutionOptions:
                 "HostLocalExecutionOptions.context_budget_policy must be "
                 "ContextBudgetPolicy"
             )
+        if self.compact_artifact_root is not None:
+            _require_path(
+                self.compact_artifact_root,
+                field_name="HostLocalExecutionOptions.compact_artifact_root",
+            )
+        _require_bool(
+            self.compact_artifact_create_parent_dirs,
+            field_name=(
+                "HostLocalExecutionOptions.compact_artifact_create_parent_dirs"
+            ),
+        )
         if not isinstance(self.memory_projection_policy, MemoryProjectionPolicy):
             raise TypeError(
                 "HostLocalExecutionOptions.memory_projection_policy must be "
@@ -1849,16 +1870,16 @@ class FollowupSnapshot:
                         "FollowupSnapshot.queued_run_id must equal "
                         "accepted_run_id for queued queue result"
                     )
-            elif self.accepted_run_status == RunStatus.RUNNING:
+            elif self.accepted_run_status in (RunStatus.ACCEPTED, RunStatus.RUNNING):
                 if self.queued_run_id is not None:
                     raise ValueError(
                         "FollowupSnapshot.queued_run_id must be None "
-                        "for running queue result"
+                        "for accepted/running queue result"
                     )
             else:
                 raise ValueError(
                     "FollowupSnapshot.accepted_run_status must be queued "
-                    "or running for queue"
+                    "accepted or running for queue"
                 )
 
 

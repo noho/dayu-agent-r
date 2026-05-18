@@ -49,6 +49,20 @@ from dayu.host.api import (
     LocalWorkerHandle,
     RunStatus,
 )
+from dayu.host.compaction import ContextCompactor
+from dayu.host.context_budget import ContextBudgetDecision
+from dayu.host.context_events import (
+    CONTEXT_COMPACTED,
+    CONTEXT_COMPACTION_FAILED,
+    CONTEXT_COMPACTION_REQUESTED,
+    build_context_compaction_requested_payload,
+)
+from dayu.host.context_policy import (
+    ContextBudgetPolicy,
+    ContextCompactionTriggerSource,
+    default_context_budget_policy,
+)
+from dayu.host.fake_compaction import FakeContextCompactor
 from dayu.host.tooling import (
     HostToolingOptions,
     ToolBundleSourceKind,
@@ -76,8 +90,10 @@ from dayu.host.durable.options import (
 )
 from dayu.host.durable.run_transition import (
     CancelPredispatchStartingInput,
+    CreateAcceptedRunInput,
     CreateRunningRunInput,
     cancel_predispatch_starting_in_transaction,
+    create_accepted_run_in_transaction,
     create_running_run_with_starting_attempt_in_transaction,
 )
 from dayu.host.durable.session_lifecycle import ensure_session
@@ -109,6 +125,11 @@ from dayu.runtime.lane import (
 _NOW = datetime(2026, 5, 15, 1, 2, 3, tzinfo=UTC)
 _CALL_CONTEXT_DIGEST = sha256_digest_json({"context": "dispatch-test"})
 _LANE_NAME = "llm"
+_SOFT_THRESHOLD_PROMPT_CHAR_COUNT = 120
+_SOFT_CONTEXT_WINDOW_SIZE = 110
+_SOFT_RESERVED_OUTPUT_TOKENS = 10
+_SOFT_HARD_THRESHOLD_TOKENS = 80
+_SOFT_SAFETY_MARGIN_RATIO = 0.5
 
 
 @dataclass(frozen=True, slots=True)
@@ -120,6 +141,14 @@ class _SeededRun:
     attempt_id: str
     execution_id: str
     dispatch_record_id: str
+
+
+@dataclass(frozen=True, slots=True)
+class _AcceptedSeededRun:
+    """测试中创建的 pre-start accepted Run。"""
+
+    session_id: str
+    run_id: str
 
 
 @dataclass(slots=True)
@@ -1710,6 +1739,173 @@ async def test_scheduler_closes_default_local_proxy_after_terminal_before_late_e
             await scheduler.close()
 
 
+@pytest.mark.asyncio
+async def test_pre_start_governance_soft_threshold_compacts_before_attempt(
+    tmp_path: Path,
+) -> None:
+    """soft threshold 在 Attempt 创建前触发一次 proactive compact。"""
+
+    with open_host_durable_store(_options(tmp_path)) as store:
+        seeded = _seed_accepted_run(
+            store,
+            run_id="run-soft-compact",
+            display_text=_soft_threshold_prompt(),
+        )
+        assert _attempt_count_for_run(store.transaction_runner, seeded.run_id) == 0
+        scheduler = await _open_scheduler(
+            tmp_path,
+            store,
+            _FakeWorkerFactory(),
+            context_budget_policy=_soft_compact_policy(),
+            context_compactor=FakeContextCompactor(),
+            compact_artifact_root=tmp_path / "compact-artifacts",
+        )
+        try:
+            scheduler.wake_queue_promotion(seeded.session_id)
+            event_types = _event_types_for_run(
+                store.transaction_runner, seeded.run_id
+            )
+
+            assert _attempt_count_for_run(store.transaction_runner, seeded.run_id) == 1
+            assert event_types.index(CONTEXT_COMPACTION_REQUESTED) < event_types.index(
+                CONTEXT_COMPACTED
+            )
+            assert event_types.index(CONTEXT_COMPACTED) < event_types.index(
+                "RUN_STARTED"
+            )
+            assert event_types.index("RUN_STARTED") < event_types.index(
+                "ATTEMPT_STARTED"
+            )
+            assert _run_status(store.transaction_runner, seeded.run_id) == (
+                RunStatus.RUNNING
+            )
+        finally:
+            await scheduler.close()
+
+
+@pytest.mark.asyncio
+async def test_pre_start_governance_compact_failure_is_attempt_free(
+    tmp_path: Path,
+) -> None:
+    """proactive compact 缺少 compactor/artifact store 时 fail closed 且零 Attempt。"""
+
+    with open_host_durable_store(_options(tmp_path)) as store:
+        seeded = _seed_accepted_run(
+            store,
+            run_id="run-compact-failure",
+            display_text=_soft_threshold_prompt(),
+        )
+        scheduler = await _open_scheduler(
+            tmp_path,
+            store,
+            _FakeWorkerFactory(),
+            context_budget_policy=_soft_compact_policy(),
+        )
+        try:
+            scheduler.wake_queue_promotion(seeded.session_id)
+
+            assert _attempt_count_for_run(store.transaction_runner, seeded.run_id) == 0
+            assert _run_status(store.transaction_runner, seeded.run_id) == (
+                RunStatus.FAILED
+            )
+            assert _event_types_for_run(store.transaction_runner, seeded.run_id) == (
+                "USER_INPUT_ACCEPTED",
+                "RUN_ACCEPTED",
+                CONTEXT_COMPACTION_REQUESTED,
+                CONTEXT_COMPACTION_FAILED,
+                "RUN_FAILED",
+            )
+        finally:
+            await scheduler.close()
+
+
+@pytest.mark.asyncio
+async def test_pre_start_governance_proactive_count_limit_blocks_second_compact(
+    tmp_path: Path,
+) -> None:
+    """durable proactive request 计数阻止同一 Run 二次 compact 循环。"""
+
+    with open_host_durable_store(_options(tmp_path)) as store:
+        seeded = _seed_accepted_run(
+            store,
+            run_id="run-compact-limit",
+            display_text=_soft_threshold_prompt(),
+        )
+        _append_proactive_compaction_requested(
+            store.transaction_runner,
+            seeded=seeded,
+            event_id="event-existing-proactive-request",
+        )
+        scheduler = await _open_scheduler(
+            tmp_path,
+            store,
+            _FakeWorkerFactory(),
+            context_budget_policy=_soft_compact_policy(),
+            context_compactor=FakeContextCompactor(),
+            compact_artifact_root=tmp_path / "compact-artifacts",
+        )
+        try:
+            scheduler.wake_queue_promotion(seeded.session_id)
+
+            assert _attempt_count_for_run(store.transaction_runner, seeded.run_id) == 0
+            assert _run_status(store.transaction_runner, seeded.run_id) == (
+                RunStatus.FAILED
+            )
+            assert _event_types_for_run(store.transaction_runner, seeded.run_id).count(
+                CONTEXT_COMPACTION_REQUESTED
+            ) == 1
+            failed = _read_event_by_type(
+                store.transaction_runner, CONTEXT_COMPACTION_FAILED
+            )
+            assert json.loads(_require_text(failed.payload_json))[
+                "failure_reason"
+            ] == "proactive_compact_limit_reached"
+        finally:
+            await scheduler.close()
+
+
+@pytest.mark.asyncio
+async def test_pre_start_governance_corrupted_compact_count_fails_closed(
+    tmp_path: Path,
+) -> None:
+    """committed compact-count fact 损坏时 dispatch 前 fail closed。"""
+
+    with open_host_durable_store(_options(tmp_path)) as store:
+        seeded = _seed_accepted_run(
+            store,
+            run_id="run-corrupted-compact-count",
+            display_text=_soft_threshold_prompt(),
+        )
+        _append_corrupted_compaction_requested(
+            store.transaction_runner,
+            seeded=seeded,
+            event_id="event-corrupted-proactive-request",
+        )
+        scheduler = await _open_scheduler(
+            tmp_path,
+            store,
+            _FakeWorkerFactory(),
+            context_budget_policy=_soft_compact_policy(),
+            context_compactor=FakeContextCompactor(),
+            compact_artifact_root=tmp_path / "compact-artifacts",
+        )
+        try:
+            scheduler.wake_queue_promotion(seeded.session_id)
+
+            assert _attempt_count_for_run(store.transaction_runner, seeded.run_id) == 0
+            assert _run_status(store.transaction_runner, seeded.run_id) == (
+                RunStatus.FAILED
+            )
+            failed = _read_event_by_type(
+                store.transaction_runner, CONTEXT_COMPACTION_FAILED
+            )
+            assert json.loads(_require_text(failed.payload_json))[
+                "failure_reason"
+            ] == "proactive_compact_count_unreadable"
+        finally:
+            await scheduler.close()
+
+
 def _options(tmp_path: Path) -> HostDurableStoreOptions:
     """构造 Host durable store options。
 
@@ -1742,6 +1938,9 @@ async def _open_scheduler(
     agent_policy: AgentPolicy | None = None,
     tooling_options: HostToolingOptions | None = None,
     projection_catchup: ProjectionCatchupPort | None = None,
+    context_budget_policy: ContextBudgetPolicy | None = None,
+    context_compactor: ContextCompactor | None = None,
+    compact_artifact_root: Path | None = None,
 ) -> HostDispatchScheduler:
     """打开测试 scheduler。
 
@@ -1755,6 +1954,9 @@ async def _open_scheduler(
     :param agent_policy: 可选 AgentPolicy；无则使用 no-tool policy。
     :param tooling_options: 可选 Host 工具装配选项。
     :param projection_catchup: 可选 projection catch-up port。
+    :param context_budget_policy: 可选 pre-start context budget policy。
+    :param context_compactor: 可选 context compactor。
+    :param compact_artifact_root: 可选 compact artifact 根目录。
     :returns: scheduler。
     """
 
@@ -1778,6 +1980,9 @@ async def _open_scheduler(
             ),
             worker_factory=factory,
             tooling_options=tooling_options,
+            context_budget_policy=context_budget_policy,
+            context_compactor=context_compactor,
+            compact_artifact_root=compact_artifact_root,
         ),
         host_handle_id="host-test",
         active_registry=active_registry,
@@ -1977,6 +2182,177 @@ def _seed_current_run(
     return seeded
 
 
+def _seed_accepted_run(
+    store: HostDurableStore,
+    *,
+    run_id: str,
+    display_text: str,
+) -> _AcceptedSeededRun:
+    """创建 pre-start accepted Run，不创建 Attempt 或 dispatch。
+
+    :param store: durable store。
+    :param run_id: Run id。
+    :param display_text: 当前用户输入文本。
+    :returns: accepted Run 摘要。
+    """
+
+    session_id = _ensure_session_id(store.transaction_runner)
+    input_event_id = f"event-input-{run_id}"
+    input_event_sequence = _append_user_input(
+        store.transaction_runner,
+        session_id=session_id,
+        run_id=run_id,
+        event_id=input_event_id,
+        display_text=display_text,
+        client_request_id=f"client-{run_id}",
+        idempotency_key=f"idem-input-{run_id}",
+    )
+
+    def _operation(transaction: HostTransaction) -> None:
+        result = create_accepted_run_in_transaction(
+            transaction,
+            EventLogStore(),
+            CreateAcceptedRunInput(
+                session_id=session_id,
+                run_id=run_id,
+                client_request_id=f"client-{run_id}",
+                input_event_id=input_event_id,
+                input_event_sequence=input_event_sequence,
+                run_accepted_event_id=f"event-run-accepted-{run_id}",
+                occurred_at=_NOW,
+                actor="tester",
+                source="pytest",
+                idempotency_key=f"idem-run-{run_id}",
+                execution_target="target-dispatch",
+                queue_policy="queue",
+                call_context_digest=_CALL_CONTEXT_DIGEST,
+            ),
+        )
+        assert result.run is not None
+        assert result.run.status == RunStatus.ACCEPTED
+
+    store.transaction_runner.run_write(_operation)
+    return _AcceptedSeededRun(session_id=session_id, run_id=run_id)
+
+
+def _soft_compact_policy() -> ContextBudgetPolicy:
+    """构造会对测试 prompt 触发 soft compact 的预算策略。
+
+    :returns: context budget policy。
+    """
+
+    return default_context_budget_policy(
+        context_window_size=_SOFT_CONTEXT_WINDOW_SIZE,
+        reserved_output_tokens=_SOFT_RESERVED_OUTPUT_TOKENS,
+        hard_threshold_tokens=_SOFT_HARD_THRESHOLD_TOKENS,
+        safety_margin_ratio=_SOFT_SAFETY_MARGIN_RATIO,
+        minimum_protection_tokens=1,
+        policy_ref="test-soft-compact-policy",
+    )
+
+
+def _soft_threshold_prompt() -> str:
+    """返回触发 soft threshold 且未达 hard threshold 的测试 prompt。
+
+    :returns: 测试 prompt。
+    """
+
+    return "x" * _SOFT_THRESHOLD_PROMPT_CHAR_COUNT
+
+
+def _append_proactive_compaction_requested(
+    transaction_runner: HostTransactionRunner,
+    *,
+    seeded: _AcceptedSeededRun,
+    event_id: str,
+) -> None:
+    """追加一条合法 proactive compaction requested fact。
+
+    :param transaction_runner: transaction runner。
+    :param seeded: accepted Run 摘要。
+    :param event_id: 事件 id。
+    :returns: ``None``。
+    """
+
+    def _operation(transaction: HostTransaction) -> None:
+        EventLogStore().append_event(
+            transaction,
+            EventLogAppendRequest(
+                event_id=event_id,
+                event_class=EventClass.CANONICAL_FACT,
+                session_id=seeded.session_id,
+                run_id=seeded.run_id,
+                attempt_id=None,
+                execution_id=None,
+                event_type=CONTEXT_COMPACTION_REQUESTED,
+                occurred_at=_NOW,
+                actor="tester",
+                source="pytest",
+                client_request_id=None,
+                idempotency_key=None,
+                policy_decision=None,
+                reason=None,
+                payload_json=build_context_compaction_requested_payload(
+                    trigger_source=ContextCompactionTriggerSource.PROACTIVE,
+                    budget_reason=ContextBudgetDecision.COMPACT_SOFT_THRESHOLD.value,
+                    budget_snapshot_ref=_CALL_CONTEXT_DIGEST,
+                    input_snapshot_cursor=1,
+                    estimator_digest=_CALL_CONTEXT_DIGEST,
+                    policy_ref="test-soft-compact-policy",
+                    provider_request_id=None,
+                    provider_error_ref=None,
+                    attempt_id=None,
+                    execution_id=None,
+                ),
+                payload_ref=None,
+                payload_digest=None,
+            ),
+        )
+
+    transaction_runner.run_write(_operation)
+
+
+def _append_corrupted_compaction_requested(
+    transaction_runner: HostTransactionRunner,
+    *,
+    seeded: _AcceptedSeededRun,
+    event_id: str,
+) -> None:
+    """追加一条损坏的 compaction requested fact。
+
+    :param transaction_runner: transaction runner。
+    :param seeded: accepted Run 摘要。
+    :param event_id: 事件 id。
+    :returns: ``None``。
+    """
+
+    def _operation(transaction: HostTransaction) -> None:
+        EventLogStore().append_event(
+            transaction,
+            EventLogAppendRequest(
+                event_id=event_id,
+                event_class=EventClass.CANONICAL_FACT,
+                session_id=seeded.session_id,
+                run_id=seeded.run_id,
+                attempt_id=None,
+                execution_id=None,
+                event_type=CONTEXT_COMPACTION_REQUESTED,
+                occurred_at=_NOW,
+                actor="tester",
+                source="pytest",
+                client_request_id=None,
+                idempotency_key=None,
+                policy_decision=None,
+                reason=None,
+                payload_json={"trigger_source": 7},
+                payload_ref=None,
+                payload_digest=None,
+            ),
+        )
+
+    transaction_runner.run_write(_operation)
+
+
 def _ensure_session_id(transaction_runner: HostTransactionRunner) -> str:
     """确保测试 Session 存在。
 
@@ -2083,6 +2459,63 @@ def _read_rows(
         assert attempt is not None
         assert dispatch_record is not None
         return run, attempt, dispatch_record
+
+    return transaction_runner.run_read(_operation)
+
+
+def _run_status(transaction_runner: HostTransactionRunner, run_id: str) -> RunStatus:
+    """读取 Run 状态。
+
+    :param transaction_runner: transaction runner。
+    :param run_id: Run id。
+    :returns: Run 状态。
+    :raises AssertionError: Run 缺失时抛出。
+    """
+
+    def _operation(transaction: HostTransaction) -> RunStatus:
+        row = read_run_by_id(transaction, run_id)
+        assert row is not None
+        return row.status
+
+    return transaction_runner.run_read(_operation)
+
+
+def _attempt_count_for_run(
+    transaction_runner: HostTransactionRunner, run_id: str
+) -> int:
+    """统计指定 Run 的 Attempt row 数。
+
+    :param transaction_runner: transaction runner。
+    :param run_id: Run id。
+    :returns: Attempt row 数。
+    """
+
+    def _operation(transaction: HostTransaction) -> int:
+        row = transaction.fetchone(
+            "SELECT COUNT(*) AS count FROM host_attempts WHERE run_id = ?",
+            (run_id,),
+        )
+        assert row is not None
+        value = row.get("count")
+        assert isinstance(value, int)
+        return value
+
+    return transaction_runner.run_read(_operation)
+
+
+def _event_types_for_run(
+    transaction_runner: HostTransactionRunner, run_id: str
+) -> tuple[str, ...]:
+    """按 sequence 读取指定 Run 的 EventLog 类型。
+
+    :param transaction_runner: transaction runner。
+    :param run_id: Run id。
+    :returns: event type 元组。
+    """
+
+    def _operation(transaction: HostTransaction) -> tuple[str, ...]:
+        rows = EventLogStore().read_events_after(transaction, 0, limit=200)
+        return tuple(row.event_type for row in rows if row.run_id == run_id)
 
     return transaction_runner.run_read(_operation)
 

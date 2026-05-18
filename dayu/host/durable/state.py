@@ -1197,17 +1197,67 @@ def read_active_run_for_session(
           terminal_at
         FROM {TABLE_HOST_RUNS}
         WHERE session_id = ?
-          AND status IN (?, ?, ?, ?)
+          AND status IN (?, ?, ?, ?, ?)
         ORDER BY accepted_event_sequence ASC, run_id ASC
         LIMIT 1
         """,
         (
             session_id,
+            serialize_run_status(RunStatus.ACCEPTED),
             serialize_run_status(RunStatus.RUNNING),
             serialize_run_status(RunStatus.WAITING),
             serialize_run_status(RunStatus.CANCELLING),
             serialize_run_status(RunStatus.RECOVERING),
         ),
+    )
+    if row is None:
+        return None
+    return run_row_from_host_row(row)
+
+
+def read_accepted_run_for_session(
+    transaction: HostTransaction, session_id: str
+) -> RunRow | None:
+    """读取 Session 下 pre-start accepted Run。
+
+    :param transaction: 调用方提供的 Host transaction。
+    :param session_id: Session id。
+    :returns: 有 accepted Run 时返回 ``RunRow``，否则返回 ``None``。
+    :raises HostDurableError: ``session_id`` 为空或 row 字段无效时抛出。
+    """
+
+    _require_non_empty_text(session_id, field_name="session_id")
+    row = transaction.fetchone(
+        f"""
+        SELECT
+          run_id,
+          session_id,
+          status,
+          client_request_id,
+          input_event_id,
+          input_event_sequence,
+          accepted_event_id,
+          accepted_event_sequence,
+          queued_event_id,
+          queued_event_sequence,
+          started_event_id,
+          started_event_sequence,
+          terminal_event_id,
+          terminal_event_sequence,
+          current_attempt_id,
+          source_run_id,
+          source_run_relation,
+          execution_target,
+          queue_policy,
+          created_at,
+          updated_at,
+          terminal_at
+        FROM {TABLE_HOST_RUNS}
+        WHERE session_id = ? AND status = ?
+        ORDER BY accepted_event_sequence ASC, run_id ASC
+        LIMIT 1
+        """,
+        (session_id, serialize_run_status(RunStatus.ACCEPTED)),
     )
     if row is None:
         return None
@@ -1304,11 +1354,12 @@ def read_non_terminal_runs_for_session(
           terminal_at
         FROM {TABLE_HOST_RUNS}
         WHERE session_id = ?
-          AND status IN (?, ?, ?, ?, ?)
+          AND status IN (?, ?, ?, ?, ?, ?)
         ORDER BY accepted_event_sequence ASC, run_id ASC
         """,
         (
             session_id,
+            serialize_run_status(RunStatus.ACCEPTED),
             serialize_run_status(RunStatus.QUEUED),
             serialize_run_status(RunStatus.RUNNING),
             serialize_run_status(RunStatus.WAITING),
@@ -2230,7 +2281,7 @@ def promote_queued_run_row(
             FROM {TABLE_HOST_RUNS} active_run
             WHERE active_run.session_id = ?
               AND active_run.run_id <> ?
-              AND active_run.status IN (?, ?, ?, ?)
+              AND active_run.status IN (?, ?, ?, ?, ?)
           )
         """,
         (
@@ -2244,6 +2295,7 @@ def promote_queued_run_row(
             serialize_run_status(RunStatus.QUEUED),
             session_id,
             run_id,
+            serialize_run_status(RunStatus.ACCEPTED),
             serialize_run_status(RunStatus.RUNNING),
             serialize_run_status(RunStatus.WAITING),
             serialize_run_status(RunStatus.CANCELLING),
@@ -2255,6 +2307,164 @@ def promote_queued_run_row(
         run_id=run_id,
         rowcount=result.rowcount,
         expected_status=RunStatus.QUEUED,
+        cas_lost_when_expected=True,
+    )
+
+
+def start_unstarted_run_row(
+    transaction: HostTransaction,
+    *,
+    session_id: str,
+    run_id: str,
+    expected_status: RunStatus,
+    started_event_id: str,
+    started_event_sequence: int,
+    current_attempt_id: str,
+    updated_at: str,
+) -> RunMutationResult:
+    """CAS 将 accepted 或 queued Run 推进到 running。
+
+    :param transaction: 调用方提供的 Host transaction。
+    :param session_id: Run 所属 Session id。
+    :param run_id: 目标 Run id。
+    :param expected_status: 期望源状态，只允许 accepted 或 queued。
+    :param started_event_id: ``RUN_STARTED`` 事件 id。
+    :param started_event_sequence: ``RUN_STARTED`` 全局事件序号。
+    :param current_attempt_id: 新建 current Attempt id。
+    :param updated_at: 固定 UTC timestamp 文本。
+    :returns: Run mutation 结果。
+    :raises HostDurableError: 输入字段无效时抛出。
+    """
+
+    if expected_status not in (RunStatus.ACCEPTED, RunStatus.QUEUED):
+        raise HostDurableError("unstarted Run source status is invalid")
+    _validate_run_start_update(
+        session_id=session_id,
+        run_id=run_id,
+        started_event_id=started_event_id,
+        started_event_sequence=started_event_sequence,
+        current_attempt_id=current_attempt_id,
+        updated_at=updated_at,
+    )
+    result = transaction.execute(
+        f"""
+        UPDATE {TABLE_HOST_RUNS}
+        SET
+          status = ?,
+          started_event_id = ?,
+          started_event_sequence = ?,
+          current_attempt_id = ?,
+          updated_at = ?
+        WHERE run_id = ?
+          AND session_id = ?
+          AND status = ?
+          AND started_event_id IS NULL
+          AND started_event_sequence IS NULL
+          AND current_attempt_id IS NULL
+          AND terminal_event_id IS NULL
+          AND terminal_event_sequence IS NULL
+          AND terminal_at IS NULL
+          AND NOT EXISTS (
+            SELECT 1
+            FROM {TABLE_HOST_RUNS} active_run
+            WHERE active_run.session_id = ?
+              AND active_run.run_id <> ?
+              AND active_run.status IN (?, ?, ?, ?, ?)
+          )
+        """,
+        (
+            serialize_run_status(RunStatus.RUNNING),
+            started_event_id,
+            started_event_sequence,
+            current_attempt_id,
+            updated_at,
+            run_id,
+            session_id,
+            serialize_run_status(expected_status),
+            session_id,
+            run_id,
+            serialize_run_status(RunStatus.ACCEPTED),
+            serialize_run_status(RunStatus.RUNNING),
+            serialize_run_status(RunStatus.WAITING),
+            serialize_run_status(RunStatus.CANCELLING),
+            serialize_run_status(RunStatus.RECOVERING),
+        ),
+    )
+    return _run_mutation_result(
+        transaction,
+        run_id=run_id,
+        rowcount=result.rowcount,
+        expected_status=expected_status,
+        cas_lost_when_expected=True,
+    )
+
+
+def terminal_unstarted_run_row(
+    transaction: HostTransaction,
+    *,
+    run_id: str,
+    expected_status: RunStatus,
+    terminal_status: RunStatus,
+    terminal_event_id: str,
+    terminal_event_sequence: int,
+    terminal_at: str,
+) -> RunMutationResult:
+    """CAS 将未创建 Attempt 的 Run 收口到终态。
+
+    :param transaction: 调用方提供的 Host transaction。
+    :param run_id: 目标 Run id。
+    :param expected_status: 期望源状态，只允许 accepted 或 queued。
+    :param terminal_status: 目标终态，只允许 failed 或 cancelled。
+    :param terminal_event_id: terminal 事件 id。
+    :param terminal_event_sequence: terminal 事件全局序号。
+    :param terminal_at: 固定 UTC terminal timestamp 文本。
+    :returns: Run mutation 结果。
+    :raises HostDurableError: 输入字段无效时抛出。
+    """
+
+    if expected_status not in (RunStatus.ACCEPTED, RunStatus.QUEUED):
+        raise HostDurableError("unstarted Run source status is invalid")
+    if terminal_status not in (RunStatus.FAILED, RunStatus.CANCELLED):
+        raise HostDurableError("unstarted Run terminal status is invalid")
+    _validate_run_terminal_update(
+        run_id=run_id,
+        terminal_event_id=terminal_event_id,
+        terminal_event_sequence=terminal_event_sequence,
+        terminal_at=terminal_at,
+    )
+    result = transaction.execute(
+        f"""
+        UPDATE {TABLE_HOST_RUNS}
+        SET
+          status = ?,
+          terminal_event_id = ?,
+          terminal_event_sequence = ?,
+          updated_at = ?,
+          terminal_at = ?
+        WHERE run_id = ?
+          AND status = ?
+          AND started_event_id IS NULL
+          AND started_event_sequence IS NULL
+          AND current_attempt_id IS NULL
+          AND terminal_event_id IS NULL
+          AND terminal_event_sequence IS NULL
+          AND terminal_at IS NULL
+        """,
+        (
+            serialize_run_status(terminal_status),
+            terminal_event_id,
+            terminal_event_sequence,
+            terminal_at,
+            terminal_at,
+            run_id,
+            serialize_run_status(expected_status),
+        ),
+    )
+    return _run_mutation_result(
+        transaction,
+        run_id=run_id,
+        rowcount=result.rowcount,
+        expected_status=expected_status,
         cas_lost_when_expected=True,
     )
 
@@ -2599,7 +2809,7 @@ def resume_waiting_run_row(
             FROM {TABLE_HOST_RUNS} active_run
             WHERE active_run.session_id = ?
               AND active_run.run_id <> ?
-              AND active_run.status IN (?, ?, ?, ?)
+              AND active_run.status IN (?, ?, ?, ?, ?)
           )
         """,
         (
@@ -2614,6 +2824,7 @@ def resume_waiting_run_row(
             suspended_attempt_id,
             session_id,
             run_id,
+            serialize_run_status(RunStatus.ACCEPTED),
             serialize_run_status(RunStatus.RUNNING),
             serialize_run_status(RunStatus.WAITING),
             serialize_run_status(RunStatus.CANCELLING),
@@ -3577,6 +3788,13 @@ def _validate_run_for_insert(run: RunRow) -> None:
             raise HostDurableError("queued Run requires queue event refs")
         if run.current_attempt_id is not None:
             raise HostDurableError("queued Run current_attempt_id must be unset")
+    if run.status == RunStatus.ACCEPTED:
+        if run.queued_event_id is not None or run.queued_event_sequence is not None:
+            raise HostDurableError("accepted Run queue refs must be unset")
+        if run.started_event_id is not None or run.started_event_sequence is not None:
+            raise HostDurableError("accepted Run start refs must be unset")
+        if run.current_attempt_id is not None:
+            raise HostDurableError("accepted Run current_attempt_id must be unset")
     if _is_terminal_run_status(run.status):
         if (
             run.terminal_event_id is None
@@ -4739,12 +4957,13 @@ def _read_active_run_id(
         SELECT run_id
         FROM {TABLE_HOST_RUNS}
         WHERE session_id = ?
-          AND status IN (?, ?, ?, ?)
+          AND status IN (?, ?, ?, ?, ?)
         ORDER BY accepted_event_sequence ASC, run_id ASC
         LIMIT 1
         """,
         (
             session_id,
+            serialize_run_status(RunStatus.ACCEPTED),
             serialize_run_status(RunStatus.RUNNING),
             serialize_run_status(RunStatus.WAITING),
             serialize_run_status(RunStatus.CANCELLING),

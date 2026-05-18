@@ -22,7 +22,7 @@ from dayu.host.api import (
 )
 from dayu.host.durable.errors import HostSchemaMismatchError
 
-HOST_SCHEMA_VERSION = 8
+HOST_SCHEMA_VERSION = 9
 """当前 Host durable SQLite schema version。"""
 
 TABLE_EVENT_LOG = "event_log"
@@ -45,6 +45,7 @@ TABLE_HOST_MEMORY_ITEMS = "host_memory_items"
 TABLE_HOST_MEMORY_DIAGNOSTICS = "host_memory_diagnostics"
 
 INDEX_HOST_RUNS_ONE_ACTIVE_PER_SESSION = "host_runs_one_active_per_session"
+INDEX_HOST_RUNS_ONE_ACCEPTED_PER_SESSION = "host_runs_one_accepted_per_session"
 INDEX_HOST_RUNS_QUEUE_FIFO = "host_runs_queue_fifo"
 INDEX_HOST_RUNS_SESSION_STATUS = "host_runs_session_status"
 INDEX_HOST_WAIT_RECORDS_ONE_ACTIVE_PER_RUN = (
@@ -300,6 +301,7 @@ CREATE TABLE IF NOT EXISTS {TABLE_HOST_RUNS} (
   session_id TEXT NOT NULL,
   status TEXT NOT NULL CHECK (
     status IN (
+      'accepted',
       'queued',
       'running',
       'waiting',
@@ -344,6 +346,15 @@ CREATE TABLE IF NOT EXISTS {TABLE_HOST_RUNS} (
   FOREIGN KEY(terminal_event_id) REFERENCES {TABLE_EVENT_LOG}(event_id),
   FOREIGN KEY(terminal_event_sequence) REFERENCES {TABLE_EVENT_LOG}(event_sequence),
   FOREIGN KEY(source_run_id) REFERENCES {TABLE_HOST_RUNS}(run_id),
+  CHECK (
+    status != 'accepted'
+    OR
+    (queued_event_id IS NULL
+      AND queued_event_sequence IS NULL
+      AND started_event_id IS NULL
+      AND started_event_sequence IS NULL
+      AND current_attempt_id IS NULL)
+  ),
   CHECK (
     status != 'queued'
     OR
@@ -800,7 +811,13 @@ CREATE TABLE IF NOT EXISTS {TABLE_HOST_MEMORY_DIAGNOSTICS} (
 _HOST_RUNS_ONE_ACTIVE_PER_SESSION_INDEX_DDL = f"""
 CREATE UNIQUE INDEX IF NOT EXISTS {INDEX_HOST_RUNS_ONE_ACTIVE_PER_SESSION}
 ON {TABLE_HOST_RUNS}(session_id)
-WHERE status IN ('running', 'waiting', 'cancelling', 'recovering')
+WHERE status IN ('accepted', 'running', 'waiting', 'cancelling', 'recovering')
+"""
+
+_HOST_RUNS_ONE_ACCEPTED_PER_SESSION_INDEX_DDL = f"""
+CREATE UNIQUE INDEX IF NOT EXISTS {INDEX_HOST_RUNS_ONE_ACCEPTED_PER_SESSION}
+ON {TABLE_HOST_RUNS}(session_id)
+WHERE status = 'accepted'
 """
 
 _HOST_RUNS_QUEUE_FIFO_INDEX_DDL = f"""
@@ -893,6 +910,7 @@ PHASE3_STATE_DDL: tuple[str, ...] = (
 
 PHASE3_INDEX_DDL: tuple[str, ...] = (
     _HOST_RUNS_ONE_ACTIVE_PER_SESSION_INDEX_DDL,
+    _HOST_RUNS_ONE_ACCEPTED_PER_SESSION_INDEX_DDL,
     _HOST_RUNS_QUEUE_FIFO_INDEX_DDL,
     _HOST_RUNS_SESSION_STATUS_INDEX_DDL,
     _HOST_WAIT_RECORDS_ONE_ACTIVE_PER_RUN_INDEX_DDL,

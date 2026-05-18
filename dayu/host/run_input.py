@@ -51,6 +51,7 @@ from dayu.host.durable.event_log import (
 )
 from dayu.host.durable.errors import HostDurableError
 from dayu.host.durable.memory import read_latest_memory_snapshot_at_or_before
+from dayu.host.durable.schema import TABLE_EVENT_LOG
 from dayu.host.durable.state import (
     AttemptRow,
     DispatchRecordRow,
@@ -60,7 +61,7 @@ from dayu.host.durable.state import (
     read_dispatch_record_by_attempt_id,
     read_run_by_id,
 )
-from dayu.host.durable.transaction import HostTransaction, HostTransactionRunner
+from dayu.host.durable.transaction import HostRow, HostTransaction, HostTransactionRunner
 from dayu.host.memory import (
     CONVERSATION_MEMORY_CONSUMER_ID,
     ConversationContinuityItem,
@@ -98,7 +99,17 @@ _PAYLOAD_FIELD_SUMMARY_TEXT = "summary_text"
 _PAYLOAD_FIELD_START_REASON = "start_reason"
 _PAYLOAD_FIELD_TOOL_RESULT_EVENT_REF = "tool_result_event_ref"
 _PAYLOAD_FIELD_EVENT_ID = "event_id"
+_PAYLOAD_FIELD_COMPACT_ARTIFACT_REF = "compact_artifact_ref"
+_PAYLOAD_FIELD_COMPACT_ARTIFACT_DIGEST = "compact_artifact_digest"
+_PAYLOAD_FIELD_EPISODE_SUMMARY_CANDIDATE = "episode_summary_candidate"
+_PAYLOAD_FIELD_PRESERVED_FACT_REFS = "preserved_fact_refs"
+_PAYLOAD_FIELD_TOOL_FACT_REFS = "tool_fact_refs"
+_PAYLOAD_FIELD_CANDIDATE_ID = "candidate_id"
+_PAYLOAD_FIELD_GOAL = "goal"
+_PAYLOAD_FIELD_OPEN_QUESTIONS = "open_questions"
+_PAYLOAD_FIELD_USER_CONSTRAINTS = "user_constraints"
 _NO_TOOL_CANCEL_MESSAGE = "tools are disabled for this attempt"
+_COMPACT_SUMMARY_MAX_CHARS = 1200
 _MEMORY_EVENT_TYPES = frozenset(
     (
         _EVENT_TYPE_USER_INPUT_ACCEPTED,
@@ -906,6 +917,93 @@ class NoopCompactArtifactProvider:
         )
 
 
+class DurableCompactArtifactProvider:
+    """基于 EventLog 读取 accepted compact artifact 的 provider。
+
+    :param transaction_runner: Host durable transaction runner。
+    :param max_summary_chars: episode summary 渲染字符上限。
+    """
+
+    def __init__(
+        self,
+        transaction_runner: HostTransactionRunner,
+        *,
+        max_summary_chars: int = _COMPACT_SUMMARY_MAX_CHARS,
+    ) -> None:
+        """初始化 provider。
+
+        :param transaction_runner: Host durable transaction runner。
+        :param max_summary_chars: episode summary 渲染字符上限。
+        :returns: ``None``。
+        :raises ValueError: 上限非正数时抛出。
+        """
+
+        if max_summary_chars <= 0:
+            raise ValueError("max_summary_chars must be positive")
+        self._transaction_runner = transaction_runner
+        self._max_summary_chars = max_summary_chars
+
+    def load_compact_artifact(
+        self, snapshot: AttemptDispatchSnapshot, current_facts: CurrentRunFacts
+    ) -> CompactArtifactView:
+        """读取当前 Attempt cursor 之前 accepted 的 compact artifact。
+
+        :param snapshot: Attempt dispatch snapshot。
+        :param current_facts: 当前 Run facts。
+        :returns: Compact artifact view。
+        :raises HostDurableError: compact payload 损坏时抛出。
+        """
+
+        return self._transaction_runner.run_read(
+            lambda transaction: self._load_compact_artifact_tx(
+                transaction, snapshot, current_facts
+            )
+        )
+
+    def _load_compact_artifact_tx(
+        self,
+        transaction: HostTransaction,
+        snapshot: AttemptDispatchSnapshot,
+        current_facts: CurrentRunFacts,
+    ) -> CompactArtifactView:
+        """在 read transaction 内读取 compacted event。
+
+        :param transaction: Host durable transaction。
+        :param snapshot: Attempt dispatch snapshot。
+        :param current_facts: 当前 Run facts。
+        :returns: Compact artifact view。
+        """
+
+        del snapshot
+        row = _latest_compacted_event_before_attempt(transaction, current_facts)
+        if row is None:
+            return CompactArtifactView(
+                messages=(),
+                compact_artifact_ref=None,
+                compact_artifact_digest=None,
+            )
+        payload = _payload_object(row)
+        artifact_ref = _required_text_field(
+            payload, _PAYLOAD_FIELD_COMPACT_ARTIFACT_REF
+        )
+        artifact_digest = _required_text_field(
+            payload, _PAYLOAD_FIELD_COMPACT_ARTIFACT_DIGEST
+        )
+        message = SystemMessage(
+            role=AgentMessageRole.SYSTEM,
+            content=_compact_artifact_message_content(
+                compacted_event=row,
+                payload=payload,
+                max_summary_chars=self._max_summary_chars,
+            ),
+        )
+        return CompactArtifactView(
+            messages=(message,),
+            compact_artifact_ref=artifact_ref,
+            compact_artifact_digest=artifact_digest,
+        )
+
+
 class NoopToolSchemaSnapshotProvider:
     """Phase 5 no-tool schema snapshot provider。"""
 
@@ -1240,6 +1338,7 @@ def create_no_tool_run_input_builder(
     transaction_runner: HostTransactionRunner,
     policy_snapshot: PolicySnapshot,
     memory_snapshot_provider: MemorySnapshotProvider | None = None,
+    compact_artifact_provider: CompactArtifactProvider | None = None,
     tool_execution_mode: ToolExecutionMode = ToolExecutionMode.NO_TOOL_DISABLED,
 ) -> RunInputBuilder:
     """创建 Phase 5 默认 no-tool RunInputBuilder。
@@ -1247,6 +1346,7 @@ def create_no_tool_run_input_builder(
     :param transaction_runner: Host durable transaction runner。
     :param policy_snapshot: 显式 policy snapshot。
     :param memory_snapshot_provider: 可选 memory snapshot provider；默认 no-op。
+    :param compact_artifact_provider: 可选 compact artifact provider；默认 no-op。
     :param tool_execution_mode: no-tool 工具执行模式，只能是 replay 或 disabled。
     :returns: RunInputBuilder。
     :raises ValueError: 传入 ``TOOL_ENABLED`` 时抛出。
@@ -1264,7 +1364,11 @@ def create_no_tool_run_input_builder(
             if memory_snapshot_provider is None
             else memory_snapshot_provider
         ),
-        compact_artifact_provider=NoopCompactArtifactProvider(),
+        compact_artifact_provider=(
+            NoopCompactArtifactProvider()
+            if compact_artifact_provider is None
+            else compact_artifact_provider
+        ),
         tool_schema_snapshot_provider=NoopToolSchemaSnapshotProvider(),
         tool_executor_provider=NoToolExecutorProvider(),
         scene_parameter_provider=DefaultSceneParameterProvider(),
@@ -1279,6 +1383,7 @@ def create_tool_enabled_run_input_builder(
     policy_snapshot: PolicySnapshot,
     tool_runtime_handle: ToolRuntimeHandle,
     memory_snapshot_provider: MemorySnapshotProvider | None = None,
+    compact_artifact_provider: CompactArtifactProvider | None = None,
 ) -> RunInputBuilder:
     """创建 tool-enabled RunInputBuilder。
 
@@ -1286,6 +1391,7 @@ def create_tool_enabled_run_input_builder(
     :param policy_snapshot: 显式 policy snapshot，必须允许工具调用。
     :param tool_runtime_handle: ToolRuntime handle。
     :param memory_snapshot_provider: 可选 memory snapshot provider；默认 no-op。
+    :param compact_artifact_provider: 可选 compact artifact provider；默认 no-op。
     :returns: RunInputBuilder。
     """
 
@@ -1300,7 +1406,11 @@ def create_tool_enabled_run_input_builder(
             if memory_snapshot_provider is None
             else memory_snapshot_provider
         ),
-        compact_artifact_provider=NoopCompactArtifactProvider(),
+        compact_artifact_provider=(
+            NoopCompactArtifactProvider()
+            if compact_artifact_provider is None
+            else compact_artifact_provider
+        ),
         tool_schema_snapshot_provider=ToolRuntimeSchemaSnapshotProvider(
             handle_provider
         ),
@@ -1796,6 +1906,193 @@ def _memory_projection_event_from_row(row: EventLogRow) -> MemoryProjectionEvent
     )
 
 
+def _latest_compacted_event_before_attempt(
+    transaction: HostTransaction, current_facts: CurrentRunFacts
+) -> EventLogRow | None:
+    """读取当前 Attempt start cursor 前最新 ``CONTEXT_COMPACTED``。
+
+    :param transaction: Host durable transaction。
+    :param current_facts: 当前 Run facts。
+    :returns: 最新 compacted event；不存在时为 ``None``。
+    """
+
+    rows = transaction.fetchall(
+        f"""
+        SELECT event_id
+        FROM {TABLE_EVENT_LOG}
+        WHERE session_id = ?
+          AND run_id = ?
+          AND event_type = ?
+          AND event_class = ?
+          AND event_sequence < ?
+        ORDER BY event_sequence DESC
+        LIMIT 1
+        """,
+        (
+            current_facts.run.session_id,
+            current_facts.run.run_id,
+            CONTEXT_COMPACTED,
+            EventClass.CANONICAL_FACT.value,
+            current_facts.attempt.started_event_sequence,
+        ),
+    )
+    if len(rows) == 0:
+        return None
+    event_id = _required_host_row_text(rows[0], field_name="event_id")
+    event = EventLogStore().read_event_by_id(transaction, event_id)
+    if event is None:
+        raise HostDurableError("CONTEXT_COMPACTED event disappeared during read")
+    return event
+
+
+def _compact_artifact_message_content(
+    *,
+    compacted_event: EventLogRow,
+    payload: Mapping[str, JsonValue],
+    max_summary_chars: int,
+) -> str:
+    """构造 bounded compact artifact SystemMessage 内容。
+
+    :param compacted_event: ``CONTEXT_COMPACTED`` event row。
+    :param payload: compacted payload。
+    :param max_summary_chars: summary 字符上限。
+    :returns: message 内容。
+    """
+
+    artifact_ref = _required_text_field(payload, _PAYLOAD_FIELD_COMPACT_ARTIFACT_REF)
+    artifact_digest = _required_text_field(
+        payload, _PAYLOAD_FIELD_COMPACT_ARTIFACT_DIGEST
+    )
+    summary = _optional_summary_text_from_compacted_payload(
+        payload, max_summary_chars=max_summary_chars
+    )
+    preserved_fact_refs = _preserved_tool_fact_refs_text(payload)
+    lines = [
+        "Accepted compact artifact is available for this run.",
+        f"compact_artifact_ref={artifact_ref}",
+        f"compact_artifact_digest={artifact_digest}",
+        f"compacted_event_id={compacted_event.event_id}",
+        f"compacted_event_sequence={compacted_event.event_sequence}",
+        f"preserved_fact_refs={preserved_fact_refs}",
+    ]
+    if summary is not None:
+        lines.append(f"episode_summary={summary}")
+    return "\n".join(lines)
+
+
+def _optional_summary_text_from_compacted_payload(
+    payload: Mapping[str, JsonValue], *, max_summary_chars: int
+) -> str | None:
+    """从 compacted payload 提取 bounded episode summary。
+
+    :param payload: compacted payload。
+    :param max_summary_chars: 最大字符数。
+    :returns: summary 文本；不存在时为 ``None``。
+    """
+
+    value = payload.get(_PAYLOAD_FIELD_EPISODE_SUMMARY_CANDIDATE)
+    if not isinstance(value, Mapping):
+        return None
+    candidate_id = _optional_mapping_text(value, _PAYLOAD_FIELD_CANDIDATE_ID)
+    goal = _optional_mapping_text(value, _PAYLOAD_FIELD_GOAL)
+    constraints = _optional_text_list(value, _PAYLOAD_FIELD_USER_CONSTRAINTS)
+    questions = _optional_text_list(value, _PAYLOAD_FIELD_OPEN_QUESTIONS)
+    parts = []
+    if candidate_id is not None:
+        parts.append(f"candidate_id={candidate_id}")
+    if goal is not None:
+        parts.append(f"goal={goal}")
+    if len(constraints) > 0:
+        parts.append("user_constraints=" + "; ".join(constraints))
+    if len(questions) > 0:
+        parts.append("open_questions=" + "; ".join(questions))
+    if len(parts) == 0:
+        return None
+    text = " | ".join(parts)
+    if len(text) <= max_summary_chars:
+        return text
+    return text[:max_summary_chars]
+
+
+def _preserved_tool_fact_refs_text(payload: Mapping[str, JsonValue]) -> str:
+    """渲染 preserved tool fact refs。
+
+    :param payload: compacted payload。
+    :returns: 稳定文本。
+    """
+
+    value = payload.get(_PAYLOAD_FIELD_PRESERVED_FACT_REFS)
+    if not isinstance(value, Mapping):
+        return ""
+    return ",".join(_optional_text_list(value, _PAYLOAD_FIELD_TOOL_FACT_REFS))
+
+
+def _required_text_field(payload: Mapping[str, JsonValue], field_name: str) -> str:
+    """读取必填文本字段。
+
+    :param payload: payload 映射。
+    :param field_name: 字段名。
+    :returns: 文本字段值。
+    :raises HostDurableError: 字段缺失或非文本时抛出。
+    """
+
+    value = payload.get(field_name)
+    if not isinstance(value, str) or value.strip() == "":
+        raise HostDurableError(f"payload field {field_name} must be text")
+    return value
+
+
+def _optional_mapping_text(
+    payload: Mapping[str, JsonValue], field_name: str
+) -> str | None:
+    """从 mapping 读取可选文本字段。
+
+    :param payload: payload 映射。
+    :param field_name: 字段名。
+    :returns: 文本或 ``None``。
+    """
+
+    value = payload.get(field_name)
+    if isinstance(value, str) and value.strip() != "":
+        return value
+    return None
+
+
+def _optional_text_list(
+    payload: Mapping[str, JsonValue], field_name: str
+) -> tuple[str, ...]:
+    """从 mapping 读取文本列表。
+
+    :param payload: payload 映射。
+    :param field_name: 字段名。
+    :returns: 文本 tuple；字段非法时返回空 tuple。
+    """
+
+    value = payload.get(field_name)
+    if not isinstance(value, list):
+        return ()
+    result: list[str] = []
+    for item in value:
+        if isinstance(item, str) and item.strip() != "":
+            result.append(item)
+    return tuple(result)
+
+
+def _required_host_row_text(row: HostRow, *, field_name: str) -> str:
+    """读取 HostRow 中必填文本字段。
+
+    :param row: Host row。
+    :param field_name: 字段名。
+    :returns: 文本字段。
+    :raises HostDurableError: 字段缺失或非文本时抛出。
+    """
+
+    value = row.get(field_name)
+    if not isinstance(value, str) or value.strip() == "":
+        raise HostDurableError(f"Host row field {field_name} must be text")
+    return value
+
+
 def _optional_payload_text(
     payload: Mapping[str, JsonValue], *, field_name: str
 ) -> str | None:
@@ -2099,6 +2396,7 @@ __all__ = [
     "CurrentRunFactProvider",
     "CurrentRunFacts",
     "DefaultSceneParameterProvider",
+    "DurableCompactArtifactProvider",
     "DurableCurrentRunFactProvider",
     "DurableMemorySnapshotProvider",
     "DurableSessionContinuityProvider",
