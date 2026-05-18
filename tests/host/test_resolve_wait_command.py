@@ -24,8 +24,6 @@ from dayu.host import (
     HostApiError,
     HostApiErrorCode,
     HostCallContext,
-    HostCommandHandle,
-    HostCommandHandleOptions,
     OperationContext,
     ResolveWaitCancelledOutcome,
     ResolveWaitCompletedOutcome,
@@ -35,10 +33,10 @@ from dayu.host import (
     RunStatus,
     WaitProviderStatusRef,
     WaitResolutionSource,
-    create_host_command_handle,
     resolve_wait,
 )
-from dayu.host.api import EnsureSessionRequest, WaitAdapterKey
+from dayu.host.api import EnsureSessionRequest, HostCommandHandleOptions, WaitAdapterKey
+from dayu.host.command import HostCommandHandle, create_host_command_handle
 from dayu.host.durable.codec import sha256_digest_json
 from dayu.host.durable.event_log import (
     EventClass,

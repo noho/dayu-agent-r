@@ -22,34 +22,34 @@ from dayu.host import (
     HostApiError,
     HostApiErrorCode,
     HostCallContext,
-    HostCommandHandle,
-    HostCommandHandleOptions,
     HostInput,
-    HostLocalExecutionOptions,
     HostStreamCursor,
     LocalEngineWorkerFactory,
     OperationContext,
     PurgeSessionRequest,
     ReplayRunRequest,
     RetryRunRequest,
-    StartRunRequest,
     SubmitFollowupRequest,
     cancel_run,
     cancel_session_runs,
     close_session,
     create_session,
-    create_host_command_handle,
     ensure_session,
     get_run,
     get_session,
     purge_session,
     replay_run,
     retry_run,
-    start_run,
     submit_followup,
 )
 from dayu.engine.contracts.agent_policy import AgentPolicy
 from dayu.engine.contracts.runner_spec import RunnerCallOptions, RunnerSpec
+from dayu.host.api import (
+    HostCommandHandleOptions,
+    HostLocalExecutionOptions,
+    StartRunRequest,
+)
+from dayu.host.command import HostCommandHandle, create_host_command_handle, start_run
 from dayu.host.read_api import stream_run_events
 
 _FORBIDDEN_IMPORT_PREFIXES: tuple[str, ...] = (

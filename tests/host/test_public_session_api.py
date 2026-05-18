@@ -15,17 +15,16 @@ from dayu.host import (
     HostApiError,
     HostApiErrorCode,
     HostCallContext,
-    HostCommandHandle,
-    HostCommandHandleOptions,
     HostMetadataEntry,
     OperationContext,
     SessionStatus,
     close_session,
-    create_host_command_handle,
     create_session,
     ensure_session,
     get_session,
 )
+from dayu.host.api import HostCommandHandleOptions
+from dayu.host.command import HostCommandHandle, create_host_command_handle
 from dayu.host.durable.errors import HostDurableError
 from dayu.host.durable.state import (
     SessionRow,

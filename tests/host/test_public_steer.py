@@ -12,9 +12,9 @@ from dayu.host import (
     HostApiErrorCode,
     RunStatus,
     SubmitFollowupRequest,
-    create_host_command_handle,
     open_host,
 )
+from dayu.host.command import create_host_command_handle
 from tests.host.test_public_retry_replay import (
     _BLOCK,
     _FINAL,

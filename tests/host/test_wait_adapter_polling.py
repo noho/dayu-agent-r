@@ -12,7 +12,6 @@ from dayu.contracts.tool_result import ToolResultSuccess
 from dayu.host import (
     CancelMode,
     CancelRunRequest,
-    HostCommandHandle,
     ResolveWaitCompletedOutcome,
     ResolveWaitLostOutcome,
     ResolveWaitRequest,
@@ -20,10 +19,10 @@ from dayu.host import (
     RunStatus,
     WaitProviderStatusRef,
     cancel_run,
-    create_host_command_handle,
     get_run,
     resolve_wait,
 )
+from dayu.host.command import HostCommandHandle, create_host_command_handle
 from dayu.host.durable.codec import sha256_digest_json
 from dayu.host.durable.schema import TABLE_HOST_WAIT_RECORDS
 from dayu.host.durable.state import WaitRecordRow, WaitRecordStatus

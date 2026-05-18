@@ -33,7 +33,7 @@ UI -> Service -> Host -> Engine
 
 `dayu.contracts` 承载跨层共享协作契约。契约层不得依赖具体业务层或执行层实现。
 
-`dayu.host` 承载 Host 公共 API 类型契约与 command facade。当前已导出 request、snapshot、status、error、context、stream cursor 类型，Host construction 的 `HostToolingOptions` 工具输入边界，以及 `HostLocalExecutionOptions` / local worker protocols 本地执行配置边界，供 UI / Service 按依赖方向向下引用；Host durable store、EventLog 内部实现、dispatch scheduler 实现、ToolRuntime 与 policy provider 不属于当前公共命名空间。
+`dayu.host` 包根承载普通 Service-facing Host facade。当前已导出普通 request、snapshot、status、error、context、stream cursor 类型，Host construction 的 `HostToolingOptions` 工具输入边界，以及 local worker protocols typed construction boundary，供 UI / Service 按依赖方向向下引用；低层 command handle factory、`start_run`、`StartRunRequest`、command-handle construction types、`HostLocalExecutionOptions`、Host durable store、EventLog 内部实现、dispatch scheduler 实现、ToolRuntime 与 policy provider 不属于包根公共命名空间。
 
 财报领域能力属于独立领域边界；财报文档存取必须通过 `dayu.fins.storage` 下的仓储协议与仓储实现完成，不应泄漏到 Engine 或 Host 内部。
 
@@ -48,7 +48,7 @@ implementation、review、fix 与 re-review 的项目级术语真源。包级 RE
 - `ensure_session`：Host 公共接口，表示“返回这个 slot 当前 Session，不存在则创建并绑定”。它按 `(scope, slot_key)` 幂等，不需要 `client_request_id`。
 - `create_session`：Host 公共接口，表示“明确创建一个新 Session”。它按 `client_request_id` 幂等；可选把新 Session 绑定到某个 session slot。
 - `purge_session`：Host 公共接口，表示“彻底清理一个已关闭且全部 Run 已终态的 Session 的 Host 本地数据”。它是 destructive purge，不是 close、cancel、archive、memory forget 或 UI hide；purge 后不再支持恢复、resume、retry、replay、timeline 补读或 final answer 找回。purge 不删除已写入的 append-only audit JSONL；必须保留 purge tombstone，并让 audit 查询能识别源 EventLog facts 已被 purge。
-- `start_run`：Host 公共接口，表示显式创建一个新的独立 Run 目标。它不是聊天界面每次发送普通 prompt 的默认入口。
+- `start_run`：Host 低层 command / diagnostic 接口，表示显式创建一个新的独立 Run 目标。它不是普通 Service-facing 包根入口，也不是聊天界面每次发送普通 prompt 的默认入口。
 - `submit_followup`：Host 公共接口，表示向同一 Session 提交一条会话延续输入。聊天界面的普通 prompt 入口应统一使用 `submit_followup`；`behavior=queue` 由 Host admission 在事务内决定排队或直接启动，`behavior=steer` 必须携带 `target_run_id` / expected active Run precondition。
 - `cancel_run`：Host 公共接口，表示取消指定 Run。它按 `(run_id, client_request_id)` 幂等；terminal 已提交时不能改写 terminal。
 - `cancel_session_runs`：Host 公共接口，表示取消指定 Session 下所有未终态 Run。它按 `(session_id, client_request_id)` 幂等，用于客户端退出、supervisor shutdown 或用户明确停止该 Session 下全部未完成工作；它不关闭 Session、不删除事实、不表达客户端拥有的所有 Session。
@@ -96,7 +96,7 @@ implementation、review、fix 与 re-review 的项目级术语真源。包级 RE
 - `tool trace hot data`：tool trace 的热数据层，使用结构化 JSON projection 保存近期可查询、可展示、可关联的工具调用摘要、策略决策、证据锚点和错误 / 截断 / 等待信息。热数据必须携带 operation context refs / digest。
 - `tool trace cold data`：tool trace 的冷数据层，使用 append-only JSONL 保存归档、批处理、离线审计所需的长诊断明细。JSON / JSONL 都是 EventLog 派生 projection，不是恢复、resume、memory 或 Run 状态迁移真源。冷数据必须携带 operation context refs / digest。
 - `Outbox`：离线 / 外部投递路径的 durable terminal delivery queue。它让离线客户端或外部渠道不必回放中间过程，也能拿到 final answer / terminal notification。Outbox 只表达 terminal delivery intent，不是完整 run timeline、不是 UI read model，也不决定 final answer 是否存在；投递失败不能回滚 Run terminal，也不参与 resume / memory 事实重建。在线 / 已 attach 客户端的阅读路径是 Host event stream、Session timeline、RunSnapshot 或 read model，不是 Outbox。在线阅读路径和 Outbox 离线投递路径必须共享同一个 terminal identity；UI / Service 用 `terminal_event_id` / `event_sequence` / `run_id` 去重，并维护自己的 seen cursor 或 delivery ledger。
-- `command path`：Host 同步治理命令路径，例如 `start_run`、`submit_followup`、`cancel_run`、`cancel_session_runs`、`resolve_wait`、`retry_run`、`replay_run`。它负责校验、事务、EventLog append、状态索引更新、commit 和 after-commit wakeup，是写 Host truth 的路径。
+- `command path`：Host 同步治理命令路径，例如低层 `start_run`，以及普通 facade 中的 `submit_followup`、`cancel_run`、`cancel_session_runs`、`resolve_wait`、`retry_run`、`replay_run`。它负责校验、事务、EventLog append、状态索引更新、commit 和 after-commit wakeup，是写 Host truth 的路径。
 - `background runtime`：Host 已提交事实的追平和投影运行时，例如 Observer / Sink、audit、usage、tool trace、memory projection、outbox projection、stream fanout、wait poller。它按 `event_sequence` checkpoint 消费 EventLog，不 append canonical facts，不更新 Run / Attempt governance state。
 - `WorkerProxy`：Host 到执行环境的适配边界。LocalProxy 与 RemoteProxy 只负责传输、启动、取消控制和事件回传，不拥有 Session / Run / Attempt / EventLog 真源。
 - `EngineWorker`：承载一次 Engine 执行的执行环境能力。EngineWorker 可以位于本机或远端；无论位置如何，它只执行并回传事件 / 结果，不 append EventLog、不关闭 attempt、不更新 Run 状态。

@@ -116,9 +116,12 @@ EXPECTED_COMMAND_EXPORTS: frozenset[str] = frozenset(
 
 ROOT_INTERNAL_API_NAMES: frozenset[str] = frozenset(
     {
+        "HostCommandFacet",
+        "HostCommandHandleOptions",
         "HostEventStream",
         "HostEventView",
         "HostLocalExecutionOptions",
+        "StartRunRequest",
     }
 )
 
@@ -138,11 +141,18 @@ FORBIDDEN_HOST_ROOT_EXPORTS: frozenset[str] = frozenset(
         "HostDurableStoreOptions",
         "HostEventStream",
         "HostEventView",
+        "HostCommandFacet",
+        "HostCommandHandle",
+        "HostCommandHandleOptions",
+        "HostLocalExecutionOptions",
+        "StartRunRequest",
         "ToolRuntimeBuildRequest",
         "ToolRuntimeExecutionScope",
         "ToolRuntimeFactory",
         "ToolRuntimeHandle",
+        "create_host_command_handle",
         "open_host_durable_store",
+        "start_run",
         "stream_run_events",
     }
 )
@@ -150,9 +160,12 @@ FORBIDDEN_HOST_ROOT_EXPORTS: frozenset[str] = frozenset(
 REMOVED_SERVICE_FACING_ALL_EXPORTS: frozenset[str] = frozenset(
     {
         "HostCommandHandle",
+        "HostCommandFacet",
+        "HostCommandHandleOptions",
         "HostEventStream",
         "HostEventView",
         "HostLocalExecutionOptions",
+        "StartRunRequest",
         "create_host_command_handle",
         "start_run",
         "stream_run_events",
@@ -209,3 +222,9 @@ def test_removed_low_level_symbols_are_not_service_facing_all_exports() -> None:
     """低层历史入口不再进入 ``dayu.host.__all__`` 的 Service-facing 边界。"""
 
     assert not (REMOVED_SERVICE_FACING_ALL_EXPORTS & frozenset(host.__all__))
+
+
+def test_removed_low_level_symbols_are_not_package_root_attributes() -> None:
+    """低层历史入口不再作为 ``dayu.host`` 模块属性暴露。"""
+
+    assert not (REMOVED_SERVICE_FACING_ALL_EXPORTS & frozenset(vars(host)))

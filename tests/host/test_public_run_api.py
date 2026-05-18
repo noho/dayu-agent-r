@@ -19,27 +19,23 @@ from dayu.host import (
     HostApiError,
     HostApiErrorCode,
     HostCallContext,
-    HostCommandHandle,
-    HostCommandHandleOptions,
     HostInput,
     OperationContext,
     PurgeSessionRequest,
     ReplayRunRequest,
     RetryRunRequest,
     RunStatus,
-    StartRunRequest,
     SubmitFollowupRequest,
     cancel_run,
-    create_host_command_handle,
     ensure_session,
     get_run,
     purge_session,
     replay_run,
     retry_run,
-    start_run,
     submit_followup,
 )
-from dayu.host.api import EnsureSessionRequest
+from dayu.host.api import EnsureSessionRequest, HostCommandHandleOptions, StartRunRequest
+from dayu.host.command import HostCommandHandle, create_host_command_handle, start_run
 from dayu.host.durable.errors import HostDurableError
 from dayu.host.durable.state import (
     RunRow,
