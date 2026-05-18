@@ -222,9 +222,9 @@ Phase Map 中每个 phase 必须使用统一条目格式。模板如下：
 
 约束：本节只保留当前 gate 结论；phase 过程流水必须归档到 `历史记录`，仍需追踪的风险或后续 owner 必须写入 `Open Questions 与风险追踪` 的 `追踪区`。
 
-当前 work unit：P9.5 Pre-P10 Cross-Repository Hardening PR。
-当前 gate：P9.5 completed。
-下一 gate：用户手工 review / merge decision。
+当前 work unit：Phase 10. Context Governance / Compaction。
+当前 gate：Phase 10 implementation。
+下一 gate：Phase 10 Slice 1 implementation review。
 
 ## Phase Map
 
@@ -1101,7 +1101,8 @@ P9.5 收口清单：
 ### Phase 10. Context Governance / Compaction
 
 目标：
-- 实现 Host proactive context budget governance、compact event、compacted artifact、reactive Engine overflow recovery 与 RunInputBuilder compact provider。
+- 实现 Host proactive context budget governance、Host-owned compactor port、compact event、compact artifact、P9 memory projection 对 accepted compact output 的消费、reactive Engine overflow recovery 与 RunInputBuilder compact provider。
+- P10 完成后，多轮会话主体必须可工作：Host 能在预算压力下生成 accepted episode summary / pinned state patch candidate，经 canonical compact event / artifact 和 P9 memory projection 进入后续 RunInputBuilder memory messages；recent raw turns、older raw turns、episode summaries、pinned state 与 verified facts 必须共同形成可解释的多轮记忆闭环。
 
 对应设计章节：
 - `docs/host/design.md` §25 Context Governance
@@ -1115,21 +1116,26 @@ P9.5 收口清单：
 - Phase 6 ToolRuntime / tool fact accept barrier / run-scoped truncation / `fetch_more` contract 已完成。
 
 进入条件：
-- 确认 conservative estimator、provider-aware configured limits、safety margin 与 compact policy 的第一版默认值。
+- 已确认 conservative estimator、provider-aware configured limits、safety margin 与 compact policy 的第一版默认值。
 
 范围：
-- 允许修改：Context Governance orchestrator、budget estimator、compact artifact store、compact canonical events、RunInputBuilder CompactArtifactProvider、reactive overflow recovery path。
-- 禁止修改：Engine proactive compaction、memory projection direct write、audit / trace projection direct write。
+- 允许修改：Context Governance orchestrator、budget estimator、Host-owned compactor typed port、compaction scene adapter / fake compactor、compact artifact store、compact canonical events、P9 memory projection 对 compact canonical facts 的消费、RunInputBuilder CompactArtifactProvider、reactive overflow recovery path、production composition wiring。
+- 禁止修改：Engine proactive compaction、memory snapshot / memory table direct write、audit / trace projection direct write。
 
 不做：
 - 不实现 provider-specific tokenizer adapter。
 - 不实现长期 memory retrieval。
 - 不做无限 compact retry。
+- 不实现 public memory edit / reset / forget API。
+- 不实现 Phase 11 startup crash recovery、positive orphan proof 或通用 `RECOVERING` recovery scan。
+- 不实现 Phase 13 Audit / Tool Trace / Outbox sinks；P10 只记录可供后续 sinks 消费的 typed refs / diagnostics。
 
 关键设计问题：
-- 必须确认 proactive 与 reactive 两条路径的 transaction / state transition。
-- 必须确认 compacted snapshot 的质量检查、保留事实 refs 与 dropped / summarized ranges。
-- 必须确认 compact failure 的 Run terminal / recoverable policy。
+- 已确认多轮会话主体闭环的数据来源：按模型窗口触发 compaction、Host-owned compactor 输出 episode summary candidate 与 pinned state patch candidate、recent raw turns floor、older raw turns 与 episode summaries 共用 history pool、pinned state 独立于 history pool，并通过 canonical compact event / artifact + P9 memory projection 消费落到当前架构。
+- 已确认 proactive 与 reactive 两条路径的 transaction / state transition。
+- 已确认 compactor output schema：episode summary candidate、pinned state patch candidate、preserved fact refs、dropped / summarized ranges、quality check result 与 budget after compact。
+- 已确认 accepted compact output 作为 canonical fact 被 P9 memory projection 消费，并明确 P10 不直接写 memory snapshot。
+- 已确认 compact failure 的 Run terminal / recoverable policy。
 
 交付物：
 - phase design refinement
@@ -1139,23 +1145,27 @@ P9.5 收口清单：
 - docs update
 
 建议 slice 切分：
-- Slice 1: budget estimator / policy view / proactive trigger。
-- Slice 2: compact artifact and canonical events。
-- Slice 3: reactive Engine overflow -> RECOVERING -> new Attempt path。
-- Slice 4: RunInputBuilder compact provider and failure handling。
+- Slice 1: context budget policy / estimator / usage observation / threshold decisions。
+- Slice 2: compactor typed contracts, fake compactor, quality check and compact artifact store。
+- Slice 3: compact canonical events and P9 memory projection consumption of accepted episode summary / pinned state patch candidate。
+- Slice 4: proactive pre-dispatch Context Governance orchestration and RunInputBuilder compact provider rebuild path。
+- Slice 5: reactive Engine overflow -> validated compact -> `RECOVERING` -> new Attempt path。
+- Slice 6: production composition wiring, multi-turn integration validation and docs sync。
 
 验证要求：
-- unit tests: threshold decisions、compact event payload validation、failure policy。
-- integration tests: proactive compact before dispatch and reactive overflow recovery。
+- unit tests: threshold decisions、compactor output validation、quality check rejection、compact event payload validation、P9 projection materializes accepted episode summary / pinned state patch without direct memory writes、failure policy。
+- integration tests: proactive compact before dispatch produces later Run memory messages with pinned state / episode summary; recent raw turns floor and older raw turns / episode summaries share the history pool; reactive overflow validates attempt / execution id and recovers with a new Attempt; compact failure fails Run without `LOST`。
 - pyright: context governance modules 通过。
 - docs: Host / Engine boundary docs 按触发规则同步。
 
 退出条件：
 - Host 能在 dispatch 前主动 compact，并能把 Engine overflow 当作 reactive fallback 恢复，不让 Engine 管理 Host context budget。
+- 多轮会话主体闭环可验证：用户约束 / 目标、tool-verified facts、recent raw turns、older raw turns 与 accepted episode summaries 能在后续 Run 的 `AgentRunRequest.messages` 中按 P9/P10 policy 稳定出现；episode summary 与 pinned state patch 的来源可追溯到 compact canonical event / artifact；assistant final answer 仍不会自动成为 verified fact。
+- P10 不留下无 owner 的“stable layer / history pool 只有结构没有来源”缺口；若 implementation 发现某项来源必须依赖长期 retrieval、public memory edit/reset、Phase 11 recovery、Phase 13 trace sink 或 Phase 15 retention，必须重新归属到对应后续 phase 并说明不阻塞多轮会话主体闭环的理由。
 
 后续依赖：
-- 后续 phase 可依赖的稳定契约：compact events、compact artifacts、context budget policy view。
-- 需要追踪到后续 phase 的事项：provider-specific tokenizer adapter 是后续能力。
+- 后续 phase 可依赖的稳定契约：compact events、compact artifacts、context budget policy view、accepted episode summary / pinned state patch projection contract。
+- 需要追踪到后续 phase 的事项：provider-specific tokenizer adapter、长期 retrieval、public memory edit / reset / forget API、Audit / Tool Trace sinks 是后续能力。
 
 ### Phase 11. Host Lifecycle / Recovery / Multi-process Hardening
 
@@ -2032,6 +2042,60 @@ P9.5 收口清单：
 - 当前无 PR review blocking fix。
 
 ## 历史记录
+
+### 2026-05-18 Phase 10 implementation-ready plan accepted
+
+Phase 10 Context Governance / Compaction implementation-ready handoff plan 已写入
+`docs/host/phase10-context-governance-plan.md`。Initial plan review artifacts 为
+`docs/reviews/phase10-plan-review-mimo-20260518.md` 与
+`docs/reviews/phase10-plan-review-ds-20260518.md`。AgentMiMo verdict 为 CHANGES_REQUESTED，blocking
+findings B1 / B2 / B3 分别覆盖 `RunStatus.ACCEPTED` cancel path、queued promotion governance bypass 与
+`CONTEXT_COMPACTED` memory projection parsing specificity；AgentDS verdict 为 PASS，但提出 pre-start governance
+wakeup、`ACCEPTED` 与 `ATTACH_ACTIVE` 交互、queued promotion transition 的 high-severity plan clarifications。
+
+Plan fix artifact 为 `docs/reviews/phase10-plan-fix-codex-20260518.md`。Fix 后的 re-review artifacts 为
+`docs/reviews/phase10-plan-rereview-mimo-20260518.md` 与
+`docs/reviews/phase10-plan-rereview-ds-20260518.md`；两份 re-review 均 PASS，remaining blocking / high findings
+为 0。Controller adjudication artifact 为
+`docs/reviews/phase10-plan-review-controller-adjudication-20260518.md`。Controller 接受 DS re-review 的
+non-blocking medium finding 作为 Slice 4 implementation action：实现必须显式解决 concurrent `ACCEPTED`
+Run guard，可选 fresh-schema partial uniqueness guard 或等价 fail-safe；同时 Slice 4 应先定义
+`StartGovernanceCandidate` typed contract，并裁决旧 combined start helper 的生产路径移除方式。
+
+Phase 10 plan gate 已接受，当前 gate 进入 Phase 10 implementation。Plan gate validation：`git diff --check`
+clean。Accepted plan commit 在本条记录提交后由 git commit 记录。
+
+### 2026-05-18 Phase 10 design discussion accepted
+
+Phase 10 Context Governance / Compaction design discussion 已完成。已确认 policy 默认值、`context_window_size` /
+`reserved_output_tokens` 输入来源、usage observation 边界、proactive / reactive compact failure policy、P9 / P10
+单向配合边界，以及多轮会话主体闭环的数据来源。P10 第一版必须包含 Host-owned typed compactor port、episode summary
+candidate、pinned state patch candidate、canonical compact event / artifact、P9 memory projection consumption、
+RunInputBuilder compact provider 与 production composition wiring。当前 gate 进入 Phase 10 implementation-ready handoff plan。
+
+### 2026-05-18 P9.5 merged and Phase 10 opened
+
+P9.5 Draft PR 60 `https://github.com/noho/dayu-agent-r/pull/60` 已合并，merge commit 为 `f131fb8`。
+当前 Host phase 工作入口进入 Phase 10 Context Governance / Compaction design discussion / design refinement。
+Phase 10 必须先确认 conservative estimator、provider-aware configured limits、safety margin、compact policy 默认值、
+proactive / reactive transaction 与 state transition、compact artifact quality check，以及 compact failure policy；
+确认后才允许生成 implementation-ready handoff plan。
+已确认的 Phase 10 discussion decision：`reserved_output_tokens` 由 Service / composition root 作为 Host context policy
+显式 typed input 传入，并与 `context_window_size` 一起由 policy provider 提供；Host 不从 Engine、per-run metadata 或
+extra payload 读取预算参数。Runner usage 只作为 post-call observation / diagnostics / calibration 输入，不替代 pre-dispatch
+estimator。
+补充确认的 policy decision：默认 safety margin 为 20%；soft threshold 为输入预算的 80%；hard threshold 由 policy provider
+显式给出或按输入预算扣除 policy 定义的最小保护余量后计算；每个 Run 的 proactive trigger 与 reactive trigger 第一版各最多
+compact 一次；proactive compact failure 让 Run 在 dispatch 前 `FAILED` 且不创建 Attempt；reactive compact failure 在当前
+Attempt 关闭后让 Run `FAILED`；`LOST` 保留给 Phase 11 recovery owner；usage 第一版只记录 diagnostics / calibration
+observation，不自动动态调参。
+P9 / P10 配合边界：P9 Conversation Memory 只提供 EventLog read model、snapshot cursor、policy digest 与 diagnostics；
+P10 Context Governance 可读取 memory snapshot 做预算和 compact，但不得直接写 memory snapshot，不得让 compact summary
+替代 verified fact / evidence anchor，不得把 memory projection lag 当作 Run recovery。
+补充的 discussion decision：P10 第一版必须包含 Host-owned typed compactor port，允许调用 LLM compaction scene
+生成 episode summary candidate 与 pinned state patch candidate；LLM 只作为候选提案者，Host 做质量检查与
+canonical compact event / artifact accept，P9 memory projection 后续消费已提交 facts 物化 memory view。Phase 10 plan
+不得只实现 budget 裁剪而不定义 stable layer / history pool 的新数据来源。
 
 ### 2026-05-18 P9.5 completed
 

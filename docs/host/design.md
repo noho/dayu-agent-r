@@ -1358,7 +1358,7 @@ canonical event contract 必须转成 typed dataclass / enum / validation tests�
 | `TOOL_AWAITING` | `session_id`、`run_id`、`attempt_id`、`execution_id` | wait_id / await_spec / external_job_id | 与 `RUN_WAITING`、`ATTEMPT_SUSPENDED` 同事务创建 wait record；Run -> `WAITING`；Attempt -> `SUSPENDED` | resume 是 | audit 是 / tool trace 是 |
 | `GUIDANCE_INSERTED` | `session_id`、`run_id` | guidance text / source policy / reason | 不直接改 terminal；影响下一 Attempt messages | 插入 messages 时 resume 消费 | audit yes / Host event stream emit |
 | `CONTEXT_COMPACTION_REQUESTED` | `session_id`、`run_id`；`trigger_source=reactive` 时必须有 `attempt_id`、`execution_id`；`trigger_source=proactive` 时可以没有 | trigger source / budget reason / provider error refs / snapshot refs | 触发 context governance；proactive path 是 pre-dispatch input governance；reactive path 可关闭当前 Attempt 并让 Run -> `RECOVERING` | resume 是；memory projection 按需消费 | audit yes / trace 是 |
-| `CONTEXT_COMPACTED` / `CONTEXT_COMPACTION_FAILED` | `session_id`、`run_id` | compact snapshot refs / preserved fact refs / dropped reason / quality check / failure reason | compacted 后允许创建新 Attempt；failed 后按 policy 失败或保持 recoverable | resume 是；memory projection 消费 compacted snapshot | audit yes / trace 是 |
+| `CONTEXT_COMPACTED` / `CONTEXT_COMPACTION_FAILED` | `session_id`、`run_id` | compact artifact ref / episode summary candidate / pinned state patch candidate / preserved fact refs / dropped reason / quality check / failure reason | compacted 后允许创建新 Attempt；failed 后按 policy 失败或保持 recoverable | resume 是；memory projection 按 policy 消费 accepted compact output | audit yes / trace 是 |
 | `PROVIDER_PROTOCOL_ERROR` | `session_id`、`run_id`、`attempt_id`、`execution_id` | provider / error code / request ref | Attempt failure or retry input | retry 需要时 resume 消费 | audit yes / Host event stream emit |
 
 canonical event 的 required fields 不能被塞进无结构 `metadata`；`metadata` 只能承载不参与状态机、幂等、恢复和审计主链的附加说明。
@@ -2447,6 +2447,35 @@ Context Governance 是 orchestrator，不直接写 memory snapshot、tool trace�
 
 第一版不实现 provider-specific token counting / provider tokenizer adapter。Context Governance 使用 conservative estimator、provider-aware configured limits 和 safety margin 做 proactive 判断；Engine context overflow event 只是 reactive fallback，不是主要 compaction trigger。provider-specific tokenizer adapter 是后续能力。
 
+`context_window_size` 与 `reserved_output_tokens` 是 Host context policy 的显式 typed input，由 Service / composition root 在装配 Host policy provider 时传入。Host 不从 Engine 反查模型窗口，不从 per-run metadata 或 extra payload 中读取预算参数，也不把 provider overflow event 当作预算真源。pre-dispatch 判断必须先为输出预留 `reserved_output_tokens`，再用剩余输入预算、safety margin 与 conservative estimator 决定是否触发 proactive compact。Runner 返回的 usage 只能作为 post-call observation / diagnostics / policy calibration 输入，不能替代下一次 dispatch 前对当前 messages 的估算。
+
+第一版 policy 默认值与阈值语义：
+
+- `context_window_size` 与 `reserved_output_tokens` 必须为正整数，且 `reserved_output_tokens` 必须小于 `context_window_size`。
+- 输入预算先按 `input_budget_tokens = context_window_size - reserved_output_tokens` 计算；输出预留不参与输入层竞争。
+- 默认 safety margin 为 20%，即 proactive compact 的 soft threshold 为 `input_budget_tokens * 0.8`。超过 soft threshold 时，Host 应先尝试 compact，而不是直接 dispatch。
+- hard threshold 由 policy provider 显式给出或按 `input_budget_tokens` 扣除 policy 定义的最小保护余量后计算。估算输入超过 hard threshold 时禁止 dispatch；compact 后仍超过 hard threshold 时 append `CONTEXT_COMPACTION_FAILED` 并按 failure policy 收口。
+- 每个 Run 的 proactive trigger 和 reactive trigger 第一版各最多执行一次 compact；不得循环 compact。
+- 第一版只记录 usage observation 与 estimator calibration diagnostic，不根据 usage 自动动态调整 policy threshold，避免同一配置下的预算行为不可预测。
+
+Context Governance 与 Conversation Memory 的关系必须保持单向。Conversation Memory 是 EventLog read model，向 RunInputBuilder 提供 memory snapshot、snapshot cursor、policy digest 和 diagnostics；Context Governance 可以读取这些输入来做预算、compact 与质量检查，但不能直接写 memory snapshot，不能让 compacted summary 替代 verified fact 或 evidence anchor，也不能把 memory projection lag 当作 Run recovery。`WorkingAssumptionView` 的主动填充可以由 proactive compaction 或后续 retrieval owner 通过 canonical facts / projection policy 接入；P10 不得绕过 P9 memory projection 边界直接写入。
+
+P10 必须补齐 stable layer / history pool 的生成来源，而不是只做预算裁剪。第一版 compactor 是 Host-owned typed port，可以调用 LLM compaction scene，但 LLM 只能提出结构化候选；Host 负责校验、接受并写入 canonical compact event / artifact。compactor 输出至少包含：
+
+- episode summary candidate：阶段标题、目标、已完成动作、confirmed fact refs / summaries、用户约束、open questions、next step、tool finding refs。
+- pinned state patch candidate：`current_goal`、`confirmed_subjects`、`user_constraints`、`open_questions` 的字段级 patch；每个字段必须有三态语义：未出现表示不修改，空值表示显式清空，非空值表示替换为候选值。
+- preservation evidence：每条 summary / patch candidate 对应的输入 event refs、tool fact refs、memory snapshot cursor 或 compact input range。
+- quality check result：是否保留 current user input、accepted tool fact refs、evidence anchors、open questions / assumptions refs，以及 dropped / summarized ranges。
+
+Host 接受 compactor 输出后，`CONTEXT_COMPACTED` payload 必须记录 compact artifact ref、episode summary candidate、pinned state patch candidate、preserved fact refs、dropped / summarized ranges、quality check result 与 budget after compact。是否将 episode summary / pinned patch materialize 到 Conversation Memory，由 P9 memory projection policy 消费已提交 canonical facts 决定；P10 不得直接写 memory snapshot、memory table 或 RunInputBuilder 私有 message 缓存。
+
+stable layer / history pool 的来源按事实等级固定：
+
+- `pinned_state.current_goal` 与 `pinned_state.user_constraints` 可由 `USER_INPUT_ACCEPTED` 的确定性投影初始化，也可由 P10 accepted pinned state patch candidate 后续修正。
+- `pinned_state.confirmed_subjects` 与 `pinned_state.open_questions` 主要来自 P10 accepted pinned state patch candidate、用户显式确认或后续 steer / goal-change owner；不得仅凭未校验 LLM 文本直接写入。
+- `verified_facts` 只来自 `TOOL_RESULT_ACCEPTED`，P10 episode summary 中的 confirmed facts 只能引用或摘要已存在工具事实，不能新建 verified fact。
+- `conversation_continuity` 的 raw turns 来自 `USER_INPUT_ACCEPTED` 与 `RUN_SUCCEEDED`；episode summaries 来自 accepted compact output，并继续只作为 continuity / navigation，不替代 evidence anchors。
+
 ### 25.1 Compact Event 响应路径
 
 context compaction 有两类触发来源：
@@ -2485,8 +2514,10 @@ reactive path 约束：
 - Host 必须先按 `attempt_id + execution_id` 校验 `context_compaction_requested` 是否来自当前 active Attempt。
 - Engine 后续的 recoverable `run_failed(context_compaction_required)` 只能关闭当前 Attempt；它不能让 Engine 自己重试，也不能让旧 Attempt resume。
 - Host 若接受恢复，应把 Run 标为 `RECOVERING`，执行 compact 后创建新 Attempt；若 compact policy 放弃恢复，Run 才进入 `FAILED`。
+- proactive compact failure 在 dispatch 前收口，Run 进入 `FAILED`，不得创建 Attempt，也不得进入 `RECOVERING`。
+- reactive compact failure 发生时当前 Attempt 已按 policy 关闭；Run 进入 `FAILED`。`LOST` 只属于 Phase 11 recovery / positive orphan proof owner，P10 不得用 compact failure 伪造 `LOST`。
 - `CONTEXT_COMPACTION_REQUESTED` payload 至少记录 trigger source、provider / runner error refs、provider request id、budget snapshot refs、input snapshot cursor 和 reason。
-- `CONTEXT_COMPACTED` payload 至少记录 compacted snapshot ref、preserved fact refs、dropped / summarized ranges、evidence anchors retained、quality check result、budget after compact。
+- `CONTEXT_COMPACTED` payload 至少记录 compact artifact ref、episode summary candidate、pinned state patch candidate、preserved fact refs、dropped / summarized ranges、evidence anchors retained、quality check result、budget after compact。
 - `CONTEXT_COMPACTION_FAILED` payload 至少记录 failure reason、policy decision、whether retryable 和 diagnostic refs。
 
 compact 不变量：
@@ -2495,7 +2526,7 @@ compact 不变量：
 - compacted snapshot / summary 是 read model 或 input artifact；是否进入 memory projection 必须由 memory policy 决定。
 - RunInputBuilder 必须从 `USER_INPUT_ACCEPTED`、canonical facts、memory snapshot 和 compacted artifacts 重建完整 messages；不能复用失败 Attempt 的 provider request payload。
 - 新 Attempt 必须有新的 `attempt_id` / `execution_id`；旧 Attempt 不 takeover、不 resume。
-- compact 必须有 policy 上限。compaction 后仍超过 budget threshold 时，Host 必须按 policy 降级输入层或 append `CONTEXT_COMPACTION_FAILED` 并让 Run 进入 `FAILED` / `RECOVERING` / `LOST`；不得无限 compact retry。
+- compact 必须有 policy 上限。compaction 后仍超过 budget threshold 时，Host 必须按 policy 降级输入层或 append `CONTEXT_COMPACTION_FAILED` 并让 Run 进入 `FAILED`，或在 reactive path 中先按策略短暂保持 `RECOVERING` 后失败收口；不得进入 `LOST`，不得无限 compact retry。
 - tool trace / audit 必须能解释哪些内容被保留、压缩、丢弃，以及为什么这样做。
 
 参数默认值由 memory / context policy provider 定义。设计固定治理范围，policy 固定优先级和默认值。
