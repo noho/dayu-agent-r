@@ -49,6 +49,11 @@ from dayu.host.api import (
     SubmitFollowupRequest,
 )
 from dayu.host.context_policy import default_context_budget_policy
+from dayu.host._execution_config_projection import (
+    optional_agent_policy_json as _optional_agent_policy_json,
+    optional_runner_options_json as _optional_runner_options_json,
+    optional_runner_spec_json as _optional_runner_spec_json,
+)
 from dayu.host.durable.codec import sha256_digest_json
 from dayu.host.durable.connection import (
     HostDurableStore,
@@ -495,7 +500,7 @@ def submit_followup(
         behavior=FollowupBehavior.QUEUE,
         accepted_run_id=result.run.run_id,
         accepted_run_status=result.run.status,
-        current_cursor=run_snapshot_from_row(result.run).event_cursor,
+        command_watermark=run_snapshot_from_row(result.run).event_cursor,
         queued_run_id=(
             result.run.run_id if result.run.status == RunStatus.QUEUED else None
         ),
@@ -850,7 +855,15 @@ def _submit_followup_public_semantic_digest(
         {
             "operation": _OPERATION_SUBMIT_FOLLOWUP,
             "session_id": request.session_id,
-            "input_digest": _input_digest(request.input),
+            "prompt_digest": _submit_followup_prompt_digest(request),
+            "tool_names": _tool_names_digest_value(request.tool_names),
+            "runner_spec_digest": _optional_runner_spec_json(request.runner_spec),
+            "runner_options_digest": _optional_runner_options_json(
+                request.runner_options
+            ),
+            "agent_policy_digest": _optional_agent_policy_json(
+                request.agent_policy
+            ),
             "behavior": request.behavior.value,
             "target_run_id": request.target_run_id,
             "call_context_digest": _call_context_digest(request.context),
@@ -914,6 +927,36 @@ def _input_digest(input_value: HostInput) -> str:
             "payload_digest": input_value.payload_digest,
         }
     )
+
+
+def _submit_followup_prompt_digest(request: SubmitFollowupRequest) -> str:
+    """计算 follow-up prompt 字段摘要。
+
+    :param request: submit follow-up 请求。
+    :returns: ``sha256:<hex>`` digest。
+    :raises: 无主动抛出。
+    """
+
+    return sha256_digest_json(
+        {
+            "system_prompt": request.system_prompt,
+            "user_prompt": request.user_prompt,
+        }
+    )
+
+
+def _tool_names_digest_value(tool_names: frozenset[str] | None) -> JsonValue:
+    """把工具选择器投影为 semantic digest 输入。
+
+    :param tool_names: 工具选择器。
+    :returns: JSON digest 输入值。
+    :raises: 无主动抛出。
+    """
+
+    if tool_names is None:
+        return None
+    values: list[JsonValue] = [tool_name for tool_name in sorted(tool_names)]
+    return values
 
 
 def _create_session_public_semantic_digest(

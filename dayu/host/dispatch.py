@@ -12,6 +12,7 @@ from __future__ import annotations
 import asyncio
 import logging
 import os
+from collections.abc import Mapping
 from dataclasses import dataclass
 from datetime import UTC, datetime
 from threading import RLock
@@ -73,6 +74,11 @@ from dayu.host.durable.state import (
     read_run_by_id,
 )
 from dayu.host.durable.transaction import HostTransaction, HostTransactionRunner
+from dayu.host._execution_config_projection import (
+    effective_execution_snapshot_from_json as _effective_execution_snapshot_from_json,
+    required_json_mapping as _required_json_mapping,
+    required_json_text as _required_json_text,
+)
 from dayu.host.engine_ingest import (
     EngineEventCandidate,
     EngineEventIngestor,
@@ -150,6 +156,8 @@ _WORKER_ACCEPT_REASON = "local_worker_accepted"
 _WORKER_STARTUP_TIMEOUT_REASON = "worker_startup_timeout"
 _MEMORY_PROJECTION_REPAIR_REQUIRED_REASON = "memory_projection_repair_required"
 _LOCAL_POLICY_SNAPSHOT_REF = "host-local-no-tool-policy"
+_PAYLOAD_FIELD_EFFECTIVE_EXECUTION_CONFIG = "effective_execution_config"
+_PAYLOAD_FIELD_EFFECTIVE_TOOL_SET = "effective_tool_set"
 _EVENT_ID_ATTEMPT_RUNNING_PREFIX = "event-attempt-running"
 _EVENT_ID_ATTEMPT_FAILED_PREFIX = "event-attempt-failed"
 _EVENT_ID_RUN_FAILED_PREFIX = "event-run-failed"
@@ -234,6 +242,18 @@ class _GovernanceStageResult:
 
     pending_dispatch: PendingDispatchRecord | None
     compact_accepted: _GovernanceCompactAccepted | None
+
+
+@dataclass(frozen=True, slots=True)
+class _EffectiveDispatchDecision:
+    """一次 dispatch 从 durable input event 读取的冻结决策。
+
+    :param policy_snapshot: effective runner / agent policy snapshot。
+    :param selected_business_tool_names: effective 业务工具名集合；``None`` 表示全量。
+    """
+
+    policy_snapshot: PolicySnapshot
+    selected_business_tool_names: frozenset[str] | None
 
 
 @dataclass(frozen=True, slots=True)
@@ -1315,12 +1335,19 @@ class HostDispatchScheduler:
 
         try:
             cancellation_token = _HostCancellationToken()
-            snapshot = self._snapshot_from_dispatch(record, cancellation_token)
+            effective_decision = self._effective_dispatch_decision(record)
+            snapshot = self._snapshot_from_dispatch(
+                record,
+                cancellation_token,
+                policy_snapshot_ref=effective_decision.policy_snapshot.policy_snapshot_ref,
+            )
             self._catch_up_memory_projection_before_worker(record)
-            policy_snapshot = self._local_policy_snapshot()
             request = self._run_input_builder_for_dispatch(
                 snapshot=snapshot,
-                policy_snapshot=policy_snapshot,
+                policy_snapshot=effective_decision.policy_snapshot,
+                selected_business_tool_names=(
+                    effective_decision.selected_business_tool_names
+                ),
             ).build(snapshot)
             worker = self._local_execution.worker_factory.create_worker(snapshot)
             handle = await asyncio.wait_for(
@@ -1395,7 +1422,11 @@ class HostDispatchScheduler:
         return "dispatched"
 
     def _run_input_builder_for_dispatch(
-        self, *, snapshot: AttemptDispatchSnapshot, policy_snapshot: PolicySnapshot
+        self,
+        *,
+        snapshot: AttemptDispatchSnapshot,
+        policy_snapshot: PolicySnapshot,
+        selected_business_tool_names: frozenset[str] | None,
     ) -> RunInputBuilder:
         """按本地执行配置构造当前 dispatch 使用的 RunInputBuilder。
 
@@ -1431,6 +1462,7 @@ class HostDispatchScheduler:
                     policy_snapshot_digest=_policy_snapshot_digest(
                         policy_snapshot
                     ),
+                    selected_business_tool_names=selected_business_tool_names,
                     enable_truncation_manager=(
                         self._local_execution.enable_truncation_manager
                     ),
@@ -1505,10 +1537,36 @@ class HostDispatchScheduler:
 
         return self._transaction_runner.run_read(_operation)
 
-    def _local_policy_snapshot(self) -> PolicySnapshot:
-        """构造本地 dispatch 使用的 policy snapshot。
+    def _effective_dispatch_decision(
+        self, record: PendingDispatchRecord
+    ) -> _EffectiveDispatchDecision:
+        """读取当前 Run 在 admission 冻结的 dispatch 决策。
 
-        :returns: 本地执行 policy snapshot。
+        :param record: pending dispatch 摘要。
+        :returns: effective dispatch 冻结决策。
+        """
+
+        def _operation(transaction: HostTransaction) -> _EffectiveDispatchDecision:
+            run = read_run_by_id(transaction, record.run_id)
+            if run is None:
+                raise RuntimeError("dispatch Run is missing")
+            event = self._event_log_store.read_event_by_id(
+                transaction, run.input_event_id
+            )
+            if event is None:
+                raise RuntimeError("dispatch input event is missing")
+            payload = _payload_object(event)
+            return _effective_dispatch_decision_from_payload(
+                payload,
+                fallback_policy_snapshot=self._local_policy_snapshot(),
+            )
+
+        return self._transaction_runner.run_read(_operation)
+
+    def _local_policy_snapshot(self) -> PolicySnapshot:
+        """构造本地 dispatch 使用的 fallback policy snapshot。
+
+        :returns: 本地执行 fallback policy snapshot。
         """
 
         return PolicySnapshot(
@@ -1519,12 +1577,17 @@ class HostDispatchScheduler:
         )
 
     def _snapshot_from_dispatch(
-        self, record: PendingDispatchRecord, cancellation_token: _HostCancellationToken
+        self,
+        record: PendingDispatchRecord,
+        cancellation_token: _HostCancellationToken,
+        *,
+        policy_snapshot_ref: str,
     ) -> AttemptDispatchSnapshot:
         """从 durable dispatch row 构造 RunInputBuilder snapshot。
 
         :param record: pending dispatch 摘要。
         :param cancellation_token: Host 注入 Engine 的取消 token。
+        :param policy_snapshot_ref: admission 冻结的 policy snapshot ref。
         :returns: Attempt dispatch snapshot。
         """
 
@@ -1536,7 +1599,7 @@ class HostDispatchScheduler:
             execution_id=record.execution_id,
             dispatch_record_id=record.dispatch_record_id,
             execution_target=record.execution_target,
-            policy_snapshot_ref=_LOCAL_POLICY_SNAPSHOT_REF,
+            policy_snapshot_ref=policy_snapshot_ref,
             cancellation_token=token,
         )
 
@@ -2043,6 +2106,84 @@ def _policy_snapshot_digest(policy_snapshot: PolicySnapshot) -> str:
             ),
         }
     )
+
+
+def _effective_dispatch_decision_from_payload(
+    payload: JsonValue,
+    *,
+    fallback_policy_snapshot: PolicySnapshot,
+) -> _EffectiveDispatchDecision:
+    """从 ``USER_INPUT_ACCEPTED`` payload 解析冻结 dispatch 决策。
+
+    :param payload: EventLog payload JSON。
+    :param fallback_policy_snapshot: 旧 start_run / 低层路径使用的 fallback。
+    :returns: effective dispatch 决策。
+    :raises RuntimeError: 冻结 execution config 或 tool set JSON shape 非法时抛出。
+    :raises ValueError: 冻结 provider/agent policy 枚举值或字段语义非法时抛出。
+    """
+
+    if not isinstance(payload, Mapping):
+        return _EffectiveDispatchDecision(
+            policy_snapshot=fallback_policy_snapshot,
+            selected_business_tool_names=None,
+        )
+    execution_value = payload.get(_PAYLOAD_FIELD_EFFECTIVE_EXECUTION_CONFIG)
+    tool_value = payload.get(_PAYLOAD_FIELD_EFFECTIVE_TOOL_SET)
+    policy_snapshot = (
+        fallback_policy_snapshot
+        if execution_value is None
+        else _policy_snapshot_from_effective_execution(execution_value)
+    )
+    selected_tool_names = (
+        None if tool_value is None else _selected_tool_names_from_effective_tool_set(tool_value)
+    )
+    return _EffectiveDispatchDecision(
+        policy_snapshot=policy_snapshot,
+        selected_business_tool_names=selected_tool_names,
+    )
+
+
+def _policy_snapshot_from_effective_execution(value: JsonValue) -> PolicySnapshot:
+    """从冻结 execution JSON 构造 PolicySnapshot。
+
+    :param value: ``effective_execution_config`` JSON。
+    :returns: PolicySnapshot。
+    :raises RuntimeError: JSON shape 非法时抛出。
+    :raises ValueError: 冻结 provider/agent policy 枚举值或字段语义非法时抛出。
+    """
+
+    snapshot = _effective_execution_snapshot_from_json(value)
+    return PolicySnapshot(
+        runner_spec=snapshot.runner_spec,
+        runner_options=snapshot.runner_options,
+        agent_policy=snapshot.agent_policy,
+        policy_snapshot_ref=snapshot.policy_snapshot_ref,
+    )
+
+
+def _selected_tool_names_from_effective_tool_set(
+    value: JsonValue,
+) -> frozenset[str] | None:
+    """从冻结 tool set JSON 读取本次 effective 业务工具名。
+
+    :param value: ``effective_tool_set`` JSON。
+    :returns: ``None`` 表示全量，否则为冻结后的业务工具名集合。
+    :raises RuntimeError: JSON shape 非法时抛出。
+    """
+
+    root = _required_json_mapping(value, field_name="effective_tool_set")
+    selector = _required_json_text(root, field_name="selector")
+    if selector == "all":
+        return None
+    names_value = root.get("effective_business_tool_names")
+    if not isinstance(names_value, list):
+        raise RuntimeError("effective_business_tool_names must be list")
+    names: set[str] = set()
+    for item in names_value:
+        if not isinstance(item, str) or item.strip() == "":
+            raise RuntimeError("effective_business_tool_names entries must be text")
+        names.add(item)
+    return frozenset(names)
 
 
 def _register_dispatch_host_instance(

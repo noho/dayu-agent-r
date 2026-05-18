@@ -414,11 +414,12 @@ def _followup_request(
         context=_context(client_request_id),
         session_id=session_id,
         client_request_id=client_request_id,
-        input=HostInput(
-            display_text="请给出 deterministic answer",
-            payload_ref=None,
-            payload_digest=None,
-        ),
+        system_prompt=None,
+        user_prompt="请给出 deterministic answer",
+        tool_names=None,
+        runner_spec=None,
+        runner_options=None,
+        agent_policy=None,
         behavior=FollowupBehavior.QUEUE,
         target_run_id=None,
     )

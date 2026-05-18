@@ -279,7 +279,12 @@ def _followup_request(
         context=_context(),
         session_id=session_id,
         client_request_id=client_request_id,
-        input=_input(f"follow-{client_request_id}"),
+        system_prompt=None,
+        user_prompt=f"follow-{client_request_id}",
+        tool_names=None,
+        runner_spec=None,
+        runner_options=None,
+        agent_policy=None,
         behavior=behavior,
         target_run_id=target_run_id,
     )

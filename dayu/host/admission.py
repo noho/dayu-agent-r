@@ -18,6 +18,7 @@ from typing import Protocol
 from uuid import uuid4
 
 from dayu.contracts.json_value import JsonValue
+from dayu.contracts.tool_declaration import ToolBundle
 from dayu.host.api import (
     AttemptStatus,
     AuthorizationClaim,
@@ -28,6 +29,7 @@ from dayu.host.api import (
     HostApiErrorCode,
     HostCallContext,
     HostInput,
+    OrdinaryRunExecutionBaseline,
     OperationContext,
     RunStatus,
     SessionSnapshot,
@@ -93,11 +95,22 @@ from dayu.host.durable.state import (
     session_snapshot_from_rows,
 )
 from dayu.host.durable.transaction import HostTransaction, HostTransactionRunner
+from dayu.host._execution_config_projection import (
+    effective_execution_config_json as _effective_execution_config_json,
+    optional_agent_policy_json as _optional_agent_policy_json,
+    optional_runner_options_json as _optional_runner_options_json,
+    optional_runner_spec_json as _optional_runner_spec_json,
+)
 from dayu.host.projection import (
     NoopProjectionCatchupPort,
     ProjectionCatchupPort,
     catch_up_projection_best_effort,
 )
+from dayu.host.tool_runtime_schema_projection import (
+    business_bundle_digest as _business_bundle_digest,
+    tool_schemas_digest as _tool_schemas_digest,
+)
+from dayu.host.tooling import HostToolingOptions
 from dayu.runtime.log_levels import VERBOSE_LOG_LEVEL
 
 _LOGGER = logging.getLogger(__name__)
@@ -117,6 +130,10 @@ _IDEMPOTENCY_RESULT_KIND_RUN = "run"
 _IDEMPOTENCY_RESULT_KIND_SESSION = "session"
 _QUEUE_REASON_ACTIVE_RUN_EXISTS = "active_run_exists"
 _TERMINAL_CLOSEOUT_REASON = "phase3_internal_closeout"
+_TOOL_SNAPSHOT_REF_PREFIX = "tools:"
+_TOOL_SELECTION_ALL = "all"
+_TOOL_SELECTION_NONE = "none"
+_TOOL_SELECTION_SUBSET = "subset"
 
 
 class AdmissionPolicy(StrEnum):
@@ -192,6 +209,18 @@ class SubmitFollowupQueueAdmissionInput:
 
     request: SubmitFollowupRequest
     resolved_execution_target: str
+
+
+@dataclass(frozen=True, slots=True)
+class _ResolvedFollowupEffectiveFacts:
+    """admission 前解析出的 per-run effective 冻结事实。
+
+    :param effective_execution_config: effective runner / agent 配置 JSON。
+    :param effective_tool_set: effective business tool 集合 JSON。
+    """
+
+    effective_execution_config: JsonValue
+    effective_tool_set: JsonValue
 
 
 @dataclass(frozen=True, slots=True)
@@ -423,6 +452,8 @@ class HostAdmissionService:
     id_factory: AdmissionIdFactory
     wakeup_port: AdmissionWakeupPort
     projection_catchup_port: ProjectionCatchupPort
+    ordinary_run_baseline: OrdinaryRunExecutionBaseline | None = None
+    tooling_options: HostToolingOptions | None = None
 
     def start_run(
         self, request: StartRunRequest, *, caller_semantic_digest: str
@@ -478,10 +509,16 @@ class HostAdmissionService:
         _require_sha256_digest(
             caller_semantic_digest, field_name="caller_semantic_digest"
         )
+        effective_facts = _resolve_followup_effective_facts(
+            admission_input.request,
+            baseline=self.ordinary_run_baseline,
+            tooling_options=self.tooling_options,
+        )
         result = self.transaction_runner.run_write(
             _SubmitFollowupQueueOperation(
                 admission_input=admission_input,
                 caller_semantic_digest=caller_semantic_digest,
+                effective_facts=effective_facts,
                 event_log_store=self.event_log_store,
                 idempotency_store=self.idempotency_store,
                 clock=self.clock,
@@ -659,6 +696,8 @@ def create_host_admission_service(
     id_factory: AdmissionIdFactory | None = None,
     wakeup_port: AdmissionWakeupPort | None = None,
     projection_catchup_port: ProjectionCatchupPort | None = None,
+    ordinary_run_baseline: OrdinaryRunExecutionBaseline | None = None,
+    tooling_options: HostToolingOptions | None = None,
 ) -> HostAdmissionService:
     """创建默认依赖装配的内部 admission service。
 
@@ -686,6 +725,8 @@ def create_host_admission_service(
             if projection_catchup_port is not None
             else NoopProjectionCatchupPort()
         ),
+        ordinary_run_baseline=ordinary_run_baseline,
+        tooling_options=tooling_options,
     )
 
 
@@ -845,6 +886,7 @@ class _SubmitFollowupQueueOperation:
 
     admission_input: SubmitFollowupQueueAdmissionInput
     caller_semantic_digest: str
+    effective_facts: _ResolvedFollowupEffectiveFacts
     event_log_store: EventLogStore
     idempotency_store: IdempotencyStore
     clock: AdmissionClock
@@ -875,7 +917,8 @@ class _SubmitFollowupQueueOperation:
         _require_open_session(transaction, request.session_id)
         active = read_active_run_for_session(transaction, request.session_id)
         create_request = _CreateAdmissionRequest.from_followup_queue_input(
-            self.admission_input
+            self.admission_input,
+            effective_facts=self.effective_facts,
         )
         if active is not None:
             return _create_queued_admission_result(
@@ -1710,11 +1753,14 @@ class _CreateAdmissionRequest:
     session_id: str
     client_request_id: str
     input: HostInput
+    system_prompt: str | None
     execution_target: str
     actor: str
     source: str
     call_context_digest: str
     operation_kind: str
+    effective_execution_config: JsonValue | None
+    effective_tool_set: JsonValue | None
 
     @classmethod
     def from_start_request(cls, request: StartRunRequest) -> "_CreateAdmissionRequest":
@@ -1728,16 +1774,22 @@ class _CreateAdmissionRequest:
             session_id=request.session_id,
             client_request_id=request.client_request_id,
             input=request.input,
+            system_prompt=None,
             execution_target=request.execution_target,
             actor=request.context.actor,
             source=request.context.source,
             call_context_digest=_call_context_digest(request.context),
             operation_kind=_OPERATION_START_RUN,
+            effective_execution_config=None,
+            effective_tool_set=None,
         )
 
     @classmethod
     def from_followup_queue_input(
-        cls, admission_input: SubmitFollowupQueueAdmissionInput
+        cls,
+        admission_input: SubmitFollowupQueueAdmissionInput,
+        *,
+        effective_facts: _ResolvedFollowupEffectiveFacts,
     ) -> "_CreateAdmissionRequest":
         """从 follow-up queue input 构造归一化创建输入。
 
@@ -1749,12 +1801,19 @@ class _CreateAdmissionRequest:
         return cls(
             session_id=request.session_id,
             client_request_id=request.client_request_id,
-            input=request.input,
+            input=HostInput(
+                display_text=request.user_prompt,
+                payload_ref=None,
+                payload_digest=None,
+            ),
+            system_prompt=request.system_prompt,
             execution_target=admission_input.resolved_execution_target,
             actor=request.context.actor,
             source=request.context.source,
             call_context_digest=_call_context_digest(request.context),
             operation_kind=_OPERATION_SUBMIT_FOLLOWUP_QUEUE,
+            effective_execution_config=effective_facts.effective_execution_config,
+            effective_tool_set=effective_facts.effective_tool_set,
         )
 
 
@@ -2054,10 +2113,14 @@ def _append_user_input_event(
                 "input_ref": request.input.payload_ref,
                 "input_digest": _input_digest(request.input),
                 "display_text": request.input.display_text,
+                "system_prompt": request.system_prompt,
+                "user_prompt": request.input.display_text,
                 "payload_ref": request.input.payload_ref,
                 "payload_digest": request.input.payload_digest,
                 "operation_kind": request.operation_kind,
                 "call_context_digest": request.call_context_digest,
+                "effective_execution_config": request.effective_execution_config,
+                "effective_tool_set": request.effective_tool_set,
             },
             payload_ref=None,
             payload_digest=None,
@@ -2093,6 +2156,160 @@ def _validate_followup_queue_input(
         raise ValueError("SubmitFollowupRequest.behavior must be queue")
     if admission_input.resolved_execution_target.strip() == "":
         raise ValueError("resolved_execution_target must be non-empty")
+
+
+def _resolve_followup_effective_facts(
+    request: SubmitFollowupRequest,
+    *,
+    baseline: OrdinaryRunExecutionBaseline | None,
+    tooling_options: HostToolingOptions | None,
+) -> _ResolvedFollowupEffectiveFacts:
+    """解析并冻结 follow-up 的 effective execution config 与业务工具集合。
+
+    :param request: submit follow-up 请求。
+    :param baseline: opener ordinary Run baseline；低层 legacy handle 可能为 ``None``。
+    :param tooling_options: opener construction-time 工具选项。
+    :returns: 已解析的 effective facts。
+    :raises HostApiError: 缺少 opener baseline 或工具名未知时抛出。
+    :raises TypeError: RunnerSpec 中包含未知 provider request extension 时抛出。
+    """
+
+    if baseline is None:
+        raise HostApiError(
+            code=HostApiErrorCode.INVALID_STATE,
+            message="submit_followup requires an opener ordinary Run baseline",
+            retryable=False,
+        )
+    runner_spec = (
+        request.runner_spec if request.runner_spec is not None else baseline.runner_spec
+    )
+    runner_options = (
+        request.runner_options
+        if request.runner_options is not None
+        else baseline.runner_options
+    )
+    agent_policy = (
+        request.agent_policy
+        if request.agent_policy is not None
+        else baseline.agent_policy
+    )
+    execution_config = _effective_execution_config_json(
+        runner_spec=runner_spec,
+        runner_options=runner_options,
+        agent_policy=agent_policy,
+        runner_spec_source=_field_source(request.runner_spec is not None),
+        runner_options_source=_field_source(request.runner_options is not None),
+        agent_policy_source=_field_source(request.agent_policy is not None),
+    )
+    tool_set = _effective_tool_set_json(
+        request.tool_names,
+        tooling_options=tooling_options,
+    )
+    return _ResolvedFollowupEffectiveFacts(
+        effective_execution_config=execution_config,
+        effective_tool_set=tool_set,
+    )
+
+
+def _field_source(override_present: bool) -> str:
+    """返回 effective 字段的来源标识。
+
+    :param override_present: 请求是否显式提供 override。
+    :returns: ``request`` 或 ``opener_baseline``。
+    :raises: 无主动抛出。
+    """
+
+    if override_present:
+        return "request"
+    return "opener_baseline"
+
+
+def _effective_tool_set_json(
+    requested_tool_names: frozenset[str] | None,
+    *,
+    tooling_options: HostToolingOptions | None,
+) -> JsonValue:
+    """构造 effective business tool set 冻结 JSON。
+
+    :param requested_tool_names: 请求选择器。
+    :param tooling_options: construction-time 工具选项。
+    :returns: 可写入 EventLog 的 JSON mapping。
+    :raises HostApiError: 请求未知工具名时抛出。
+    :raises ValueError: 工具 bundle schema 字段非法时由底层转换抛出。
+    """
+
+    business_bundle = (
+        ToolBundle(definitions=())
+        if tooling_options is None
+        else tooling_options.business_tool_bundle
+    )
+    known_names = frozenset(
+        definition.name for definition in business_bundle.definitions
+    )
+    if requested_tool_names is None:
+        effective_names = known_names
+        selector = _TOOL_SELECTION_ALL
+    else:
+        unknown = requested_tool_names.difference(known_names)
+        if unknown:
+            raise HostApiError(
+                code=HostApiErrorCode.INVALID_STATE,
+                message=(
+                    "submit_followup tool_names contains unknown business tools: "
+                    + ",".join(sorted(unknown))
+                ),
+                retryable=False,
+            )
+        effective_names = requested_tool_names
+        selector = (
+            _TOOL_SELECTION_NONE
+            if not requested_tool_names
+            else _TOOL_SELECTION_SUBSET
+        )
+    selected_bundle = ToolBundle(
+        definitions=tuple(
+            definition
+            for definition in business_bundle.definitions
+            if definition.name in effective_names
+        )
+    )
+    schema_digest = _tool_schemas_digest(selected_bundle.to_tool_schemas())
+    source_refs_json: list[JsonValue] = []
+    if tooling_options is not None:
+        source_refs_json = [
+            {
+                "source_kind": source_ref.source_kind.value,
+                "source_id": source_ref.source_id,
+                "version_ref": source_ref.version_ref,
+                "content_digest": source_ref.content_digest,
+            }
+            for source_ref in tooling_options.source_refs
+        ]
+    tool_set: JsonValue = {
+        "tool_snapshot_ref": _TOOL_SNAPSHOT_REF_PREFIX + schema_digest,
+        "selector": selector,
+        "requested_business_tool_names": (
+            None
+            if requested_tool_names is None
+            else _sorted_text_json_array(requested_tool_names)
+        ),
+        "effective_business_tool_names": _sorted_text_json_array(effective_names),
+        "business_bundle_digest": _business_bundle_digest(business_bundle),
+        "effective_schema_digest": schema_digest,
+        "source_refs": source_refs_json,
+    }
+    return tool_set
+
+
+def _sorted_text_json_array(values: frozenset[str]) -> list[JsonValue]:
+    """把文本集合稳定投影为 JSON 数组。
+
+    :param values: 文本集合。
+    :returns: 排序后的 JSON 数组。
+    :raises: 无主动抛出。
+    """
+
+    return [value for value in sorted(values)]
 
 
 def _require_open_session(
@@ -2848,12 +3065,28 @@ def _followup_queue_semantic_digest(
     :param request: follow-up request。
     :param caller_semantic_digest: 调用方语义输入摘要。
     :returns: ``sha256:<hex>`` digest。
+    :raises TypeError: RunnerSpec 中包含未知 provider request extension 时抛出。
     """
 
     return sha256_digest_json(
         {
             "operation": _OPERATION_SUBMIT_FOLLOWUP_QUEUE,
-            "input_digest": _input_digest(request.input),
+            "prompt_digest": sha256_digest_json(
+                {
+                    "system_prompt": request.system_prompt,
+                    "user_prompt": request.user_prompt,
+                }
+            ),
+            "tool_names": (
+                None
+                if request.tool_names is None
+                else _sorted_text_json_array(request.tool_names)
+            ),
+            "runner_spec": _optional_runner_spec_json(request.runner_spec),
+            "runner_options": _optional_runner_options_json(
+                request.runner_options
+            ),
+            "agent_policy": _optional_agent_policy_json(request.agent_policy),
             "behavior": FollowupBehavior.QUEUE.value,
             "caller_semantic_digest": caller_semantic_digest,
             "call_context_digest": _call_context_digest(request.context),

@@ -91,6 +91,7 @@ _EVENT_TYPE_RUN_STARTED = "RUN_STARTED"
 _EVENT_TYPE_RUN_SUCCEEDED = "RUN_SUCCEEDED"
 _EVENT_TYPE_TOOL_RESULT_ACCEPTED = "TOOL_RESULT_ACCEPTED"
 _PAYLOAD_FIELD_DISPLAY_TEXT = "display_text"
+_PAYLOAD_FIELD_SYSTEM_PROMPT = "system_prompt"
 _PAYLOAD_FIELD_OPERATION_KIND = "operation_kind"
 _PAYLOAD_FIELD_EXECUTION_TARGET = "execution_target"
 _PAYLOAD_FIELD_FINAL_ANSWER = "final_answer"
@@ -144,6 +145,7 @@ class CurrentRunFacts:
     :param run_accepted_event: 当前 ``RUN_ACCEPTED`` 事件。
     :param run_started_event: 当前 ``RUN_STARTED`` 事件。
     :param user_prompt: 当前用户 prompt 文本。
+    :param system_prompt: 当前 Run 显式 system prompt；无则为 ``None``。
     :param operation_kind: 当前 operation kind。
     """
 
@@ -154,6 +156,7 @@ class CurrentRunFacts:
     run_accepted_event: EventLogRow
     run_started_event: EventLogRow
     user_prompt: str
+    system_prompt: str | None
     operation_kind: str
 
 
@@ -529,6 +532,10 @@ class DurableCurrentRunFactProvider:
             user_prompt=_required_payload_text(
                 payload,
                 field_name=_PAYLOAD_FIELD_DISPLAY_TEXT,
+            ),
+            system_prompt=_optional_payload_text(
+                payload,
+                field_name=_PAYLOAD_FIELD_SYSTEM_PROMPT,
             ),
             operation_kind=_required_payload_text(
                 payload,
@@ -1305,6 +1312,7 @@ class RunInputBuilder:
             tool_executor,
         )
         messages = (
+            *_system_prompt_message(current_facts.system_prompt),
             *self._scene_parameter_provider.build_scene_messages(
                 attempt_snapshot,
                 current_facts,
@@ -2091,6 +2099,20 @@ def _required_host_row_text(row: HostRow, *, field_name: str) -> str:
     if not isinstance(value, str) or value.strip() == "":
         raise HostDurableError(f"Host row field {field_name} must be text")
     return value
+
+
+def _system_prompt_message(system_prompt: str | None) -> tuple[SystemMessage, ...]:
+    """把可选 public system prompt 转为 Engine system message。
+
+    :param system_prompt: admission 冻结的 system prompt。
+    :returns: 空元组或单条 system message。
+    """
+
+    if system_prompt is None:
+        return ()
+    return (
+        SystemMessage(role=AgentMessageRole.SYSTEM, content=system_prompt),
+    )
 
 
 def _optional_payload_text(

@@ -6,7 +6,7 @@
 
 `dayu.host` 包根当前提供普通 Service-facing 的 Host public contract：`open_host(options)` opener、异步 `Host` / `HostHandle` 协议、`OpenHostOptions`、普通 Run / compactor 执行基线、Host-owned typed `HostEvent` 终态视图、生命周期异常 `HostClosedError`、Session / Run request / snapshot 类型，以及 Host construction 的业务工具输入边界。低层同步 command handle、run-level event 补读与本地执行装配仍保留在内部模块路径，普通 Service 不应从包根依赖这些名字。
 
-`open_host(options)` 当前会装配 durable store、共享 `ActiveWorkerRegistry`、本地 `HostDispatchScheduler`、memory projection catch-up、compactor baseline 与 command wakeup port。普通 `submit_followup(queue)` 经 public async handle 接受后会在 commit 后唤醒 scheduler 并进入本地 dispatch；调用方不需要手工持有 scheduler、durable store、registry 或 wakeup port。`host.close()` 与 async context manager 退出只关闭当前 opener runtime，按顺序停止 scheduler、flush memory projection 并关闭 durable store，不写 cancel / failed terminal facts；重复 close 幂等，close 后 public handle 方法返回 `HostClosedError`。Session-level live `watch_session_events(...)` fanout 仍由后续 slice 实现，当前 public handle 只保留 closed-handle 校验与占位。
+`open_host(options)` 当前会装配 durable store、共享 `ActiveWorkerRegistry`、本地 `HostDispatchScheduler`、memory projection catch-up、compactor baseline 与 command wakeup port。普通 `submit_followup(queue)` 经 public async handle 接受后会在 commit 后唤醒 scheduler 并进入本地 dispatch；调用方不需要手工持有 scheduler、durable store、registry 或 wakeup port。`SubmitFollowupRequest` 当前使用 typed prompt / per-run override 字段：`system_prompt`、`user_prompt`、`tool_names`、`runner_spec`、`runner_options`、`agent_policy`；Host 在 admission 写入每次 Run 的 effective execution config 与 effective business tool set，并由 dispatch 读取同一冻结视图。`host.close()` 与 async context manager 退出只关闭当前 opener runtime，按顺序停止 scheduler、flush memory projection 并关闭 durable store，不写 cancel / failed terminal facts；重复 close 幂等，close 后 public handle 方法返回 `HostClosedError`。Session-level live `watch_session_events(...)` fanout 仍由后续 slice 实现，当前 public handle 只保留 closed-handle 校验与占位。
 
 当前包根导出包含以下类型：
 
@@ -46,7 +46,7 @@ public semantic digest 在 facade 边界只使用显式请求字段与 `HostCall
 当前低层 Run command facade：
 
 - `start_run(host, request)`：复用 internal admission，支持无 active Run 时 direct `RUNNING`、有 active Run 时按 `queue_policy` 执行 `queue` / `reject` / `attach_active`。`attach_active` 只记录幂等结果并返回当前 active `RunSnapshot`，不追加 canonical attach fact。
-- `submit_followup(host, session_id, request)`：要求路径参数 `session_id` 等于 `request.session_id`。`behavior=queue` 复用 internal `submit_followup_queue`，active 存在时返回 `accepted_run_status=QUEUED`，无 active 时返回 `accepted_run_status=RUNNING`；`behavior=steer` 返回 `UNSUPPORTED_OPERATION` 且不追加 EventLog。
+- `submit_followup(host, session_id, request)`：要求路径参数 `session_id` 等于 `request.session_id`。`behavior=queue` 复用 internal `submit_followup_queue`，active 存在时返回 `accepted_run_status=QUEUED`，无 active 时先接受为 `ACCEPTED`，再由 scheduler governance gate 启动为 `RUNNING`；幂等重放返回同一 accepted Run 的当前 durable status。`behavior=steer` 返回 `UNSUPPORTED_OPERATION` 且不追加 EventLog。
 - `get_run(host, run_id)`：通过只读 transaction 读取 durable Run row，缺失时返回 `NOT_FOUND`。`current_attempt_id` 来自 Run row；`event_cursor` 是 Run row 中 input、accepted、queued、started、terminal event sequence 的最大非空值。所有从 durable Run row 构造的 public `RunSnapshot` 都使用同一映射：非终态 Run 的 `terminal_result_summary` 为 `None`；终态 Run 当前返回 status-only `TerminalResultSummary(status=..., summary_ref=None, summary_digest=None)`，因为 Phase 4 尚未引入 typed terminal payload decoder，不从 untyped EventLog payload 字符串临时解析 summary refs。`outbox_summary` 在 Phase 4 始终为 `None`。
 - `stream_run_events(host, run_id, cursor, limit=None)`：先校验目标 Run 存在，再按全局 EventLog `event_sequence > cursor.event_sequence` 扫描。`limit=None` 使用 `HOST_EVENT_STREAM_DEFAULT_LIMIT`，`limit <= 0` 或超过 `HOST_EVENT_STREAM_MAX_LIMIT` 返回 `INVALID_STATE`。`limit` 是全局 EventLog row 扫描窗口，也是返回事件上限；扫描后只返回 `row.run_id == run_id` 的 `HostEventView`，并把 EventLog row 的 `event_class` 映射为 public `HostEventClass`，调用方可区分 `canonical_fact`、`preview`、`diagnostic` 与 `projection_signal`。`next_cursor` 是本次扫描到的最大全局 `event_sequence`；没有扫描到 row 时等于输入 cursor。扫描窗口内只有无关 Run 事件时，返回空 `events` 但仍推进 `next_cursor`。
 - `cancel_run(host, run_id, request)`：复用 internal cancel，支持 queued Run cancel、pre-dispatch `RUNNING` / Attempt `STARTING` / dispatch `PENDING` cancel、pre-accept dispatching cancel、active worker cancel 与 `WAITING` Run cancel；active worker cancel 会先把 Run 推进到 `CANCELLING`，再通过 active worker registry best-effort 传播取消。`WAITING` cancel 会标记 active wait records 为 `cancelled` 并把 Run 收口为 `CANCELLED`，不创建 resume Attempt；`RECOVERING` 取消由 Phase 11 负责。
@@ -56,7 +56,7 @@ public semantic digest 在 facade 边界只使用显式请求字段与 `HostCall
 
 `cancel_session_runs` 的幂等 scope 是 `(operation=cancel_session_runs, scope_id=session_id, idempotency_key=request.client_request_id)`。semantic digest 只包含 session id、请求上下文 digest、reason 与 mode，不包含当前 Run 列表；同 key 重放返回当前 `SessionSnapshot`，不会取消首次操作后新接受的 Run。没有 supported non-terminal Run 时只记录 session-scope 幂等结果，不追加 cancel fact。
 
-当前 public `submit_followup(queue)` 暂使用 Host facade 内部默认 execution target 作为 policy resolution output；完整 policy provider / execution target resolution 装配不在当前实现范围。
+当前 public `submit_followup(queue)` 暂使用 Host facade 内部默认 execution target 作为 policy resolution output；完整 policy provider / execution target resolution 装配不在当前实现范围。`tool_names=None` 表示使用 construction-time 全量业务工具，空 `frozenset()` 表示禁用业务工具，非空集合表示只暴露指定业务工具；unknown tool name 在 admission 写入 durable canonical facts 前返回结构化错误。
 
 当前 stable unsupported public facade：
 
@@ -193,8 +193,8 @@ internal admission 当前的 session-scope cancel 支持 queued、pre-dispatch /
 
 - id / name / reason 字段拒绝空字符串或纯空白。
 - `HostStreamCursor.event_sequence` 拒绝负数。
-- `SubmitFollowupRequest` 中 `behavior=steer` 必须携带 `target_run_id`，`behavior=queue` 不得携带 `target_run_id`。
-- `FollowupSnapshot` 使用 `accepted_run_id` / `accepted_run_status` 表达 accepted Run；queue 分支只允许 `QUEUED` 或 `RUNNING`，`QUEUED` 时 `queued_run_id` 必须等于 `accepted_run_id`，`RUNNING` 时 `queued_run_id` 必须为 `None`，queue 分支不得携带 `target_run_id`。
+- `SubmitFollowupRequest` 中 `behavior=steer` 必须携带 `target_run_id`，`behavior=queue` 不得携带 `target_run_id`；`user_prompt` 必填，`system_prompt` 可选，`tool_names` 只接受 `frozenset[str] | None`，per-run `runner_spec` / `runner_options` / `agent_policy` 只接受完整 typed value 或 `None`。
+- `FollowupSnapshot` 使用 `accepted_run_id` / `accepted_run_status` 表达 accepted Run；`command_watermark` 是 command commit 后的 durable read watermark，不是 watch cursor；queue 分支 `QUEUED` 时 `queued_run_id` 必须等于 `accepted_run_id`，非 `QUEUED` 时 `queued_run_id` 必须为 `None`，queue 分支不得携带 `target_run_id`。
 - `CreateSessionRequest.bind_slot=True` 时必须同时提供 `scope` 与 `slot_key`。
 - `CancelRunRequest` 与 `CancelSessionRunsRequest` 当前只接受 `CancelMode.GRACEFUL`。
 - `HostApiErrorCode` 包含 `UNSUPPORTED_OPERATION`；`HostApiError.detail` 只接受 `HostApiErrorDetail` typed union 成员，当前成员为 `SteerConflictDetail`。
@@ -210,7 +210,7 @@ internal admission 当前的 session-scope cancel 支持 queued、pre-dispatch /
 
 `dayu.host` 可以在 LocalProxy 边界沿 `UI -> Service -> Host -> Engine` 方向调用 Engine public entry；Engine 不导入 Host。`dayu.host` 不导入 `dayu.fins`、`dayu.service` 或 `dayu.ui`。Host 公共类型不放入 `dayu.contracts`；`dayu.contracts` 只承载 Host 与 Engine / ToolRuntime 等共同理解的协作契约。
 
-业务工具发现、provider / 配置绑定、包入口扫描和 Service composition 发生在 Host 外部。Host 只接收外部已经形成的业务 `ToolBundle`，不扫描业务工具包，也不导入具体财报工具模块。`business_tool_bundle` 不进入 `StartRunRequest`、`SubmitFollowupRequest`、retry / replay / resolve wait 等 per-run request。
+业务工具发现、provider / 配置绑定、包入口扫描和 Service composition 发生在 Host 外部。Host 只接收外部已经形成的业务 `ToolBundle`，不扫描业务工具包，也不导入具体财报工具模块。`business_tool_bundle` 不进入 `StartRunRequest`、`SubmitFollowupRequest`、retry / replay / resolve wait 等 per-run request；per-run 工具选择只能通过 `SubmitFollowupRequest.tool_names` 表达。
 
 Host 若在后续实现中复用 `dayu.runtime.filelock`，只能把它用于普通文件短临界区互斥。lock marker 文件不是 Host 治理真源，不能用于判断 Run / Attempt owner、worker liveness、EventLog ordering、recovery 或 takeover；这些事实只能来自 Host durable store、EventLog、状态索引和事务。`RuntimeFileLock` 也不承诺 reentrant lock 语义，Host 代码不得依赖同一实例重复 acquire 的第三方行为。
 

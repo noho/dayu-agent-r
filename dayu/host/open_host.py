@@ -393,6 +393,8 @@ class _OpenHostContextManager(AbstractAsyncContextManager[Host]):
                 durable_store.transaction_runner,
                 wakeup_port=scheduler,
                 projection_catchup_port=projection_catchup_port,
+                ordinary_run_baseline=self._options.ordinary_run_baseline,
+                tooling_options=self._options.tooling_options,
             )
             command_handle = HostCommandHandle(
                 host_handle_id=host_handle_id,

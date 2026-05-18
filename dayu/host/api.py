@@ -1853,7 +1853,16 @@ class SubmitFollowupRequest:
     - ``context``：调用上下文。
     - ``session_id``：目标 Session id。
     - ``client_request_id``：客户端操作幂等 id。
-    - ``input``：Host 输入 envelope。
+    - ``system_prompt``：本次 Run 的显式系统提示；无则为 ``None``。
+    - ``user_prompt``：本次 Run 的用户提示。
+    - ``tool_names``：本次 Run 的业务工具选择器；``None`` 表示全量业务工具，
+      空集合表示禁用业务工具，非空集合表示只启用指定子集。
+    - ``runner_spec``：本次 Run 的完整 Runner 规约 override；无则使用 opener
+      baseline。
+    - ``runner_options``：本次 Run 的完整 Runner 调用参数 override；无则使用
+      opener baseline。
+    - ``agent_policy``：本次 Run 的完整 Agent policy override；无则使用
+      opener baseline。
     - ``behavior``：queue 或 steer 行为。
     - ``target_run_id``：steer 目标 Run id；queue 时必须为 ``None``。
     """
@@ -1861,7 +1870,12 @@ class SubmitFollowupRequest:
     context: HostCallContext
     session_id: str
     client_request_id: str
-    input: HostInput
+    system_prompt: str | None
+    user_prompt: str
+    tool_names: frozenset[str] | None
+    runner_spec: RunnerSpec | None
+    runner_options: RunnerCallOptions | None
+    agent_policy: AgentPolicy | None
     behavior: FollowupBehavior
     target_run_id: str | None
 
@@ -1869,7 +1883,8 @@ class SubmitFollowupRequest:
         """校验 follow-up 请求字段与 target_run_id 前置条件。
 
         :returns: 无返回值。
-        :raises ValueError: id 为空、steer 缺目标、queue 携带目标时抛出。
+        :raises TypeError: typed override 或工具选择器类型非法时抛出。
+        :raises ValueError: id / prompt 为空、steer 缺目标、queue 携带目标时抛出。
         """
 
         _require_non_empty(
@@ -1879,6 +1894,28 @@ class SubmitFollowupRequest:
             self.client_request_id,
             field_name="SubmitFollowupRequest.client_request_id",
         )
+        _require_optional_non_empty(
+            self.system_prompt,
+            field_name="SubmitFollowupRequest.system_prompt",
+        )
+        _require_non_empty(
+            self.user_prompt, field_name="SubmitFollowupRequest.user_prompt"
+        )
+        _validate_submit_followup_tool_names(self.tool_names)
+        if self.runner_spec is not None and not isinstance(
+            self.runner_spec, RunnerSpec
+        ):
+            raise TypeError("SubmitFollowupRequest.runner_spec must be RunnerSpec")
+        if self.runner_options is not None and not isinstance(
+            self.runner_options, RunnerCallOptions
+        ):
+            raise TypeError(
+                "SubmitFollowupRequest.runner_options must be RunnerCallOptions"
+            )
+        if self.agent_policy is not None and not isinstance(
+            self.agent_policy, AgentPolicy
+        ):
+            raise TypeError("SubmitFollowupRequest.agent_policy must be AgentPolicy")
         _require_optional_non_empty(
             self.target_run_id,
             field_name="SubmitFollowupRequest.target_run_id",
@@ -1897,6 +1934,29 @@ class SubmitFollowupRequest:
             raise ValueError(
                 "SubmitFollowupRequest.target_run_id must be None for queue"
             )
+
+
+def _validate_submit_followup_tool_names(
+    tool_names: frozenset[str] | None,
+) -> None:
+    """校验 follow-up 业务工具选择器。
+
+    :param tool_names: 请求传入的工具名集合或 ``None``。
+    :returns: ``None``。
+    :raises TypeError: ``tool_names`` 不是 ``frozenset[str] | None`` 时抛出。
+    :raises ValueError: 任一工具名为空时抛出。
+    """
+
+    if tool_names is None:
+        return
+    if not isinstance(tool_names, frozenset):
+        raise TypeError("SubmitFollowupRequest.tool_names must be frozenset[str]")
+    for tool_name in tool_names:
+        if not isinstance(tool_name, str):
+            raise TypeError("SubmitFollowupRequest.tool_names entries must be str")
+        _require_non_empty(
+            tool_name, field_name="SubmitFollowupRequest.tool_names"
+        )
 
 
 @dataclass(frozen=True, slots=True)
@@ -2181,7 +2241,8 @@ class FollowupSnapshot:
     - ``behavior``：Host 采用的 follow-up 行为。
     - ``accepted_run_id``：本次 follow-up 接受后关联的 Run id。
     - ``accepted_run_status``：本次 follow-up 接受后关联 Run 的当前状态。
-    - ``current_cursor``：接受后的当前事件游标。
+    - ``command_watermark``：本次 command commit 后的 durable read watermark；
+      它不是 ``watch_session_events`` 的 watch cursor。
     - ``queued_run_id``：真实处于 queued 状态的 accepted Run id；其它情况为 ``None``。
     - ``target_run_id``：steer 目标 Run id；queue 时为 ``None``。
     """
@@ -2190,7 +2251,7 @@ class FollowupSnapshot:
     behavior: FollowupBehavior
     accepted_run_id: str
     accepted_run_status: RunStatus
-    current_cursor: HostStreamCursor
+    command_watermark: HostStreamCursor
     queued_run_id: str | None
     target_run_id: str | None
 
@@ -2226,16 +2287,15 @@ class FollowupSnapshot:
                         "FollowupSnapshot.queued_run_id must equal "
                         "accepted_run_id for queued queue result"
                     )
-            elif self.accepted_run_status in (RunStatus.ACCEPTED, RunStatus.RUNNING):
+            if self.accepted_run_status != RunStatus.QUEUED:
                 if self.queued_run_id is not None:
                     raise ValueError(
                         "FollowupSnapshot.queued_run_id must be None "
-                        "for accepted/running queue result"
+                        "unless accepted Run is queued"
                     )
-            else:
+            if self.accepted_run_status == RunStatus.RECOVERING:
                 raise ValueError(
-                    "FollowupSnapshot.accepted_run_status must be queued "
-                    "accepted or running for queue"
+                    "FollowupSnapshot.accepted_run_status must not be recovering"
                 )
 
 

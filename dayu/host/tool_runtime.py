@@ -2108,6 +2108,8 @@ class EffectiveToolBundleBuildRequest:
     """EffectiveToolBundleBuilder 的输入。
 
     :param business_tool_bundle: 外部装配好的业务工具集合。
+    :param selected_business_tool_names: 本次 Run 选择的业务工具名；
+        ``None`` 表示使用全部业务工具，空集合表示不启用业务工具。
     :param source_refs: 业务工具来源引用。
     :param framework_tool_policy: framework tool policy view。
     :param policy_snapshot_digest: policy snapshot 摘要；无时为 ``None``。
@@ -2118,6 +2120,7 @@ class EffectiveToolBundleBuildRequest:
     source_refs: tuple[ToolBundleSourceRef, ...]
     framework_tool_policy: FrameworkToolPolicyView
     policy_snapshot_digest: str | None
+    selected_business_tool_names: frozenset[str] | None = None
     enable_truncation_manager: bool = False
 
 
@@ -2151,7 +2154,12 @@ class EffectiveToolBundleBuilder:
             request.business_tool_bundle,
             request.framework_tool_policy,
         )
-        definitions = list(request.business_tool_bundle.definitions)
+        definitions = list(
+            _selected_business_definitions(
+                request.business_tool_bundle,
+                request.selected_business_tool_names,
+            )
+        )
         injected_context = self._inject_framework_definitions(
             request.framework_tool_policy,
             enable_truncation_manager=request.enable_truncation_manager,
@@ -2224,6 +2232,32 @@ class EffectiveToolBundleBuilder:
             definitions=tuple(definitions),
             fetch_more_callable=fetch_more_callable,
         )
+
+
+def _selected_business_definitions(
+    bundle: ToolBundle, selected_tool_names: frozenset[str] | None
+) -> tuple[ToolDefinition, ...]:
+    """按 per-run selector 过滤业务工具声明。
+
+    :param bundle: construction-time 全量业务工具集合。
+    :param selected_tool_names: per-run 业务工具名选择器；``None`` 表示全量。
+    :returns: 本次 Run 有效业务工具声明。
+    :raises ValueError: selector 包含未知业务工具名时抛出。
+    """
+
+    if selected_tool_names is None:
+        return bundle.definitions
+    known_names = frozenset(definition.name for definition in bundle.definitions)
+    unknown = selected_tool_names.difference(known_names)
+    if unknown:
+        raise ValueError(
+            "selected business tool names are unknown: " + ",".join(sorted(unknown))
+        )
+    return tuple(
+        definition
+        for definition in bundle.definitions
+        if definition.name in selected_tool_names
+    )
 
 
 @dataclass(frozen=True, slots=True)

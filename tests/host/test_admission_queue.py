@@ -9,6 +9,8 @@ from pathlib import Path
 
 import pytest
 
+from dayu.engine.contracts.agent_policy import AgentPolicy
+from dayu.engine.contracts.runner_spec import RunnerCallOptions, RunnerSpec
 from dayu.host.admission import (
     AdmissionClock,
     AdmissionIdFactory,
@@ -34,6 +36,7 @@ from dayu.host.api import (
     HostInput,
     HostMetadataEntry,
     OperationContext,
+    OrdinaryRunExecutionBaseline,
     RunStatus,
     StartRunRequest,
     SubmitFollowupRequest,
@@ -1269,6 +1272,42 @@ def _service(
         id_factory=_SequentialIdFactory(label),
         wakeup_port=spy if spy is not None else _WakeupSpy(),
         projection_catchup_port=projection_catchup,
+        ordinary_run_baseline=_ordinary_run_baseline(),
+        tooling_options=None,
+    )
+
+
+def _ordinary_run_baseline() -> OrdinaryRunExecutionBaseline:
+    """构造测试用 ordinary Run 执行基线。
+
+    :returns: OrdinaryRunExecutionBaseline。
+    :raises TypeError: baseline typed 字段类型非法时抛出。
+    :raises ValueError: baseline 字段语义非法时抛出。
+    """
+
+    return OrdinaryRunExecutionBaseline(
+        runner_spec=RunnerSpec(
+            provider="test",
+            model="admission-baseline-model",
+            endpoint="https://example.invalid",
+            api_key_ref="secret:admission-baseline",
+            headers={},
+            supports_tool_calling=False,
+            supports_streaming=False,
+            supports_stream_usage=False,
+            default_timeout_seconds=1.0,
+            max_retries=0,
+            provider_request=None,
+        ),
+        runner_options=RunnerCallOptions(
+            temperature=None, max_tokens=None, top_p=None, stream=False
+        ),
+        agent_policy=AgentPolicy(
+            max_iterations=1,
+            continuation_max_attempts=0,
+            allow_tool_calls=False,
+            tool_execution_timeout_seconds=1.0,
+        ),
     )
 
 
@@ -1497,7 +1536,12 @@ def _followup_request(
         context=_context(),
         session_id=session_id,
         client_request_id=client_request_id,
-        input=HostInput(display_text=display_text, payload_ref=None, payload_digest=None),
+        system_prompt=None,
+        user_prompt=display_text,
+        tool_names=None,
+        runner_spec=None,
+        runner_options=None,
+        agent_policy=None,
         behavior=FollowupBehavior.QUEUE,
         target_run_id=None,
     )

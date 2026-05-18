@@ -1030,7 +1030,12 @@ def _followup_request(
         context=_context(),
         session_id=session_id,
         client_request_id=client_request_id,
-        input=HostInput(display_text=display_text, payload_ref=None, payload_digest=None),
+        system_prompt=None,
+        user_prompt=display_text,
+        tool_names=None,
+        runner_spec=None,
+        runner_options=None,
+        agent_policy=None,
         behavior=FollowupBehavior.QUEUE,
         target_run_id=None,
     )
