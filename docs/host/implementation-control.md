@@ -223,8 +223,8 @@ Phase Map 中每个 phase 必须使用统一条目格式。模板如下：
 约束：本节只保留当前 gate 结论；phase 过程流水必须归档到 `历史记录`，仍需追踪的风险或后续 owner 必须写入 `Open Questions 与风险追踪` 的 `追踪区`。
 
 当前 work unit：Phase 10. Context Governance / Compaction。
-当前 gate：Phase 10 Slice 5 implementation。
-下一 gate：Phase 10 Slice 5 implementation review。
+当前 gate：Phase 10 Slice 6 implementation。
+下一 gate：Phase 10 Slice 6 implementation review。
 
 ## Phase Map
 
@@ -1501,6 +1501,23 @@ P9.5 收口清单：
 - `promote_next_queued_run` legacy helper 当前仍保留 public method 表面。Phase 10 closeout 或后续 Host public API cleanup
   必须复查是否收敛接口面，或让 helper 强制走 governance gate。
 
+#### Phase 10 S5 Reactive Overflow Recovery 残余风险追踪
+
+背景决议：
+
+- Phase 10 S5 已实现 Engine `context_compaction_requested` reactive fallback：Host 校验 Attempt / execution identity，
+  追加 reactive compact canonical facts，关闭旧 Attempt，进入 `RUN_RECOVERING`，compact accepted 后创建新 Attempt /
+  execution / dispatch，compact failure 后从 `RECOVERING` 收口 `FAILED`，不写 `LOST`。
+- S5 code review 没有 blocking / high / medium finding。Controller 接受一个代码组织 residual，不作为 S5 当前阻塞项。
+
+追踪项：
+
+- `EngineEventIngestor._start_reactive_context_recovery` 当前承担 reactive recovery 编排。方法体偏长但职责仍属于
+  EngineEvent ingest owner；Phase 10 Slice 6 或 aggregate review 若继续降低复杂度，可抽取 budget / compact decision
+  module-level helper，但不得改变 EventLog / state machine ordering。
+- `RECOVERING` cancel、startup recovery scan、positive orphan proof 和通用 recovery scan 不属于 P10 S5；Phase 11
+  Host Lifecycle / Recovery / Multi-process Hardening 必须接管。
+
 #### P9.5 Pre-P10 Cross-Repository Hardening PR 归属追踪
 
 背景决议：
@@ -2060,6 +2077,34 @@ P9.5 收口清单：
 - 当前无 PR review blocking fix。
 
 ## 历史记录
+
+### 2026-05-18 Phase 10 S5 Reactive Overflow Recovery accepted
+
+Phase 10 S5 Reactive Engine Overflow Recovery 已完成。Implementation artifact 为
+`docs/reviews/phase10-s5-reactive-overflow-recovery-implementation-20260518.md`。Code review artifacts 为
+`docs/reviews/phase10-s5-code-review-mimo-20260518.md` 与
+`docs/reviews/phase10-s5-code-review-ds-20260518.md`。
+
+Controller 裁决：AgentMiMo review 为 PASS，AgentDS review 为 ACCEPTED_WITH_RESIDUAL。Controller 接受
+MiMo low doc finding 并已修正 implementation artifact 测试计数；DS 的 worker accept -> recovery 覆盖 finding
+裁决为 rejected-with-evidence，因为 scheduler integration 测试实际覆盖 worker accept 后的 Engine event recovery
+路径；DS 的 orchestration method length 接受为 residual 并写入追踪区。Controller adjudication artifact 为
+`docs/reviews/phase10-s5-code-review-controller-adjudication-20260518.md`。
+
+S5 交付：`EngineEventIngestor` 将 Engine `context_compaction_requested` 映射为
+`CONTEXT_COMPACTION_REQUESTED(trigger_source=reactive)`，使用 Host estimator / policy 而不是 Engine
+`budget_state` 作为预算真源；旧 Attempt 关闭为 `ATTEMPT_FAILED`，Run 写入 `RUN_RECOVERING`；compact accepted
+后写 compact artifact / `CONTEXT_COMPACTED`，追平 P9 memory projection，再创建新的 Attempt / execution /
+dispatch record 并写 `RUN_STARTED(start_reason=recovery)`、`ATTEMPT_STARTED`；compact failure、count 上限、
+count 损坏、compactor 缺失、quality rejected 或 compact 后 hard threshold 均从 `RECOVERING` 收口 `FAILED`，
+不写 `LOST`。新增 `EngineIngestResult.stop_worker_stream`，使 recovery accepted 能停止旧 worker stream、释放
+lane / handle，但不清理同 Run duplicate governance registry，也不触发 queued promotion。
+
+Validation：`pytest tests/host/test_engine_ingest_mapping.py tests/host/test_run_attempt_transitions.py
+tests/host/test_dispatch_scheduler.py tests/host/test_phase5_local_execution_integration.py -q` 104 passed；
+`pyright` 0 errors / 0 warnings / 0 informations；`git diff --check` clean。当前 gate 进入 Phase 10 S6
+Production Composition Wiring / Multi-turn Integration Validation / Docs Sync implementation。Accepted slice commit
+在本条记录提交后由 git commit 记录。
 
 ### 2026-05-18 Phase 10 S4 Proactive Context Governance accepted
 

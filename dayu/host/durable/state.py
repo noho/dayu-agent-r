@@ -112,11 +112,12 @@ class WorkerKind(StrEnum):
 
 
 class RunStartReason(StrEnum):
-    """Run 从 queued 或 accepted 状态进入 running 的原因。"""
+    """Run 进入 running 并创建新 Attempt 的原因。"""
 
     INITIAL = "initial"
     QUEUE_PROMOTION = "queue_promotion"
     RESUME = "resume"
+    RECOVERY = "recovery"
 
 
 class WaitRecordStatus(StrEnum):
@@ -2836,6 +2837,219 @@ def resume_waiting_run_row(
         run_id=run_id,
         rowcount=result.rowcount,
         expected_status=RunStatus.WAITING,
+        cas_lost_when_expected=True,
+    )
+
+
+def mark_running_run_recovering_row(
+    transaction: HostTransaction,
+    *,
+    session_id: str,
+    run_id: str,
+    current_attempt_id: str,
+    recovering_event_id: str,
+    recovering_event_sequence: int,
+    updated_at: str,
+) -> RunMutationResult:
+    """CAS 将 running Run 标记为 recovering。
+
+    :param transaction: 调用方提供的 Host transaction。
+    :param session_id: Run 所属 Session id。
+    :param run_id: 目标 Run id。
+    :param current_attempt_id: 期望的 current Attempt id。
+    :param recovering_event_id: ``RUN_RECOVERING`` 事件 id。
+    :param recovering_event_sequence: ``RUN_RECOVERING`` 全局事件序号。
+    :param updated_at: 固定 UTC 更新时间文本。
+    :returns: Run mutation 结果。
+    :raises HostDurableError: 输入字段无效时抛出。
+    """
+
+    _validate_run_start_update(
+        session_id=session_id,
+        run_id=run_id,
+        started_event_id=recovering_event_id,
+        started_event_sequence=recovering_event_sequence,
+        current_attempt_id=current_attempt_id,
+        updated_at=updated_at,
+    )
+    result = transaction.execute(
+        f"""
+        UPDATE {TABLE_HOST_RUNS}
+        SET
+          status = ?,
+          updated_at = ?
+        WHERE run_id = ?
+          AND session_id = ?
+          AND status = ?
+          AND current_attempt_id = ?
+          AND terminal_event_id IS NULL
+          AND terminal_event_sequence IS NULL
+          AND terminal_at IS NULL
+        """,
+        (
+            serialize_run_status(RunStatus.RECOVERING),
+            updated_at,
+            run_id,
+            session_id,
+            serialize_run_status(RunStatus.RUNNING),
+            current_attempt_id,
+        ),
+    )
+    return _run_mutation_result(
+        transaction,
+        run_id=run_id,
+        rowcount=result.rowcount,
+        expected_status=RunStatus.RUNNING,
+        cas_lost_when_expected=True,
+    )
+
+
+def start_recovering_run_row(
+    transaction: HostTransaction,
+    *,
+    session_id: str,
+    run_id: str,
+    source_attempt_id: str,
+    recovered_attempt_id: str,
+    started_event_id: str,
+    started_event_sequence: int,
+    updated_at: str,
+) -> RunMutationResult:
+    """CAS 将 recovering Run 恢复为 running 并切换 current Attempt。
+
+    :param transaction: 调用方提供的 Host transaction。
+    :param session_id: Run 所属 Session id。
+    :param run_id: 目标 Run id。
+    :param source_attempt_id: 期望的旧 Attempt id。
+    :param recovered_attempt_id: 新建 recovery Attempt id。
+    :param started_event_id: ``RUN_STARTED`` recovery 事件 id。
+    :param started_event_sequence: ``RUN_STARTED`` recovery 事件序号。
+    :param updated_at: 固定 UTC 更新时间文本。
+    :returns: Run mutation 结果。
+    :raises HostDurableError: 输入字段无效时抛出。
+    """
+
+    _validate_run_start_update(
+        session_id=session_id,
+        run_id=run_id,
+        started_event_id=started_event_id,
+        started_event_sequence=started_event_sequence,
+        current_attempt_id=recovered_attempt_id,
+        updated_at=updated_at,
+    )
+    _require_non_empty_text(source_attempt_id, field_name="source_attempt_id")
+    result = transaction.execute(
+        f"""
+        UPDATE {TABLE_HOST_RUNS}
+        SET
+          status = ?,
+          started_event_id = ?,
+          started_event_sequence = ?,
+          current_attempt_id = ?,
+          updated_at = ?
+        WHERE run_id = ?
+          AND session_id = ?
+          AND status = ?
+          AND current_attempt_id = ?
+          AND terminal_event_id IS NULL
+          AND terminal_event_sequence IS NULL
+          AND terminal_at IS NULL
+          AND NOT EXISTS (
+            SELECT 1
+            FROM {TABLE_HOST_RUNS} active_run
+            WHERE active_run.session_id = ?
+              AND active_run.run_id <> ?
+              AND active_run.status IN (?, ?, ?, ?, ?)
+          )
+        """,
+        (
+            serialize_run_status(RunStatus.RUNNING),
+            started_event_id,
+            started_event_sequence,
+            recovered_attempt_id,
+            updated_at,
+            run_id,
+            session_id,
+            serialize_run_status(RunStatus.RECOVERING),
+            source_attempt_id,
+            session_id,
+            run_id,
+            serialize_run_status(RunStatus.ACCEPTED),
+            serialize_run_status(RunStatus.RUNNING),
+            serialize_run_status(RunStatus.WAITING),
+            serialize_run_status(RunStatus.CANCELLING),
+            serialize_run_status(RunStatus.RECOVERING),
+        ),
+    )
+    return _run_mutation_result(
+        transaction,
+        run_id=run_id,
+        rowcount=result.rowcount,
+        expected_status=RunStatus.RECOVERING,
+        cas_lost_when_expected=True,
+    )
+
+
+def terminal_recovering_run_row(
+    transaction: HostTransaction,
+    *,
+    run_id: str,
+    current_attempt_id: str,
+    terminal_event_id: str,
+    terminal_event_sequence: int,
+    terminal_at: str,
+) -> RunMutationResult:
+    """CAS 将 recovering Run 失败收口。
+
+    :param transaction: 调用方提供的 Host transaction。
+    :param run_id: 目标 Run id。
+    :param current_attempt_id: 期望的 current Attempt id。
+    :param terminal_event_id: ``RUN_FAILED`` 事件 id。
+    :param terminal_event_sequence: ``RUN_FAILED`` 全局事件序号。
+    :param terminal_at: 固定 UTC terminal timestamp 文本。
+    :returns: Run mutation 结果。
+    :raises HostDurableError: 输入字段无效时抛出。
+    """
+
+    _validate_run_terminal_update(
+        run_id=run_id,
+        terminal_event_id=terminal_event_id,
+        terminal_event_sequence=terminal_event_sequence,
+        terminal_at=terminal_at,
+    )
+    _require_non_empty_text(current_attempt_id, field_name="current_attempt_id")
+    result = transaction.execute(
+        f"""
+        UPDATE {TABLE_HOST_RUNS}
+        SET
+          status = ?,
+          terminal_event_id = ?,
+          terminal_event_sequence = ?,
+          updated_at = ?,
+          terminal_at = ?
+        WHERE run_id = ?
+          AND status = ?
+          AND current_attempt_id = ?
+          AND terminal_event_id IS NULL
+          AND terminal_event_sequence IS NULL
+          AND terminal_at IS NULL
+        """,
+        (
+            serialize_run_status(RunStatus.FAILED),
+            terminal_event_id,
+            terminal_event_sequence,
+            terminal_at,
+            terminal_at,
+            run_id,
+            serialize_run_status(RunStatus.RECOVERING),
+            current_attempt_id,
+        ),
+    )
+    return _run_mutation_result(
+        transaction,
+        run_id=run_id,
+        rowcount=result.rowcount,
+        expected_status=RunStatus.RECOVERING,
         cas_lost_when_expected=True,
     )
 

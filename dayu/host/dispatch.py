@@ -1743,6 +1743,18 @@ class HostDispatchScheduler:
             ingestor = EngineEventIngestor(
                 transaction_runner=self._transaction_runner,
                 wakeup_port=self,
+                context_budget_policy=self._local_execution.context_budget_policy,
+                context_compactor=self._local_execution.context_compactor,
+                compact_artifact_root=self._local_execution.compact_artifact_root,
+                compact_artifact_create_parent_dirs=(
+                    self._local_execution.compact_artifact_create_parent_dirs
+                ),
+                memory_projection_policy=(
+                    self._local_execution.memory_projection_policy
+                ),
+                memory_projection_catchup_batch_size=(
+                    self._local_execution.memory_projection_catchup_batch_size
+                ),
             )
             worker_event_index = 0
             terminal_seen = False
@@ -1800,7 +1812,7 @@ class HostDispatchScheduler:
                 ):
                     if result.events:
                         last_accepted_event_id = result.events[-1].event_id
-                    if result.terminal_closeout:
+                    if result.terminal_closeout or result.stop_worker_stream:
                         terminal_seen = True
                         run_terminal_closed = _ingest_closed_run(result)
                         break

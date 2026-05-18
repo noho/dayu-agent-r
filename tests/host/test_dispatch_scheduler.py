@@ -15,6 +15,7 @@ import pytest
 from dayu.engine.contracts.agent_policy import AgentPolicy
 from dayu.engine.contracts.agent_run import AgentRunRequest
 from dayu.engine.contracts.engine_events import (
+    ContextCompactionRequestedData,
     EngineEvent,
     EngineEventType,
     FinalAnswerData,
@@ -536,6 +537,113 @@ class _FakeWorkerFactory:
         if self._slow:
             return _SlowWorker()
         return _AcceptingWorker(self)
+
+
+class _SnapshotEventHandle(_FakeHandle):
+    """按 dispatch snapshot 生成单个 EngineEvent 的 handle。"""
+
+    def __init__(self, snapshot: AttemptDispatchSnapshot, event: EngineEvent) -> None:
+        """初始化 handle。
+
+        :param snapshot: dispatch snapshot。
+        :param event: 要产出的 EngineEvent。
+        :returns: ``None``。
+        """
+
+        super().__init__(local_worker_id=f"worker-{snapshot.attempt_id}")
+        self._event = event
+
+    async def events(self) -> AsyncIterator[EngineEvent]:
+        """产出单个事件后结束。
+
+        :returns: EngineEvent 异步迭代器。
+        """
+
+        yield self._event
+
+
+class _ReactiveRecoveryWorker:
+    """第一轮产出 reactive overflow，第二轮产出 final answer。"""
+
+    def __init__(self, factory: "_ReactiveRecoveryWorkerFactory") -> None:
+        """初始化 worker。
+
+        :param factory: 所属 factory。
+        :returns: ``None``。
+        """
+
+        self._factory = factory
+
+    async def accept(
+        self, snapshot: AttemptDispatchSnapshot, request: AgentRunRequest
+    ) -> LocalWorkerHandle:
+        """按创建顺序返回 reactive 或 final handle。
+
+        :param snapshot: dispatch snapshot。
+        :param request: Engine request。
+        :returns: scripted handle。
+        """
+
+        self._factory.accepted_snapshots.append(snapshot)
+        self._factory.accepted_requests.append(request)
+        if len(self._factory.accepted_snapshots) == 1:
+            event = EngineEvent(
+                occurred_at=_NOW,
+                session_id=snapshot.session_id,
+                run_id=snapshot.run_id,
+                type=EngineEventType.CONTEXT_COMPACTION_REQUESTED,
+                data=ContextCompactionRequestedData(
+                    iteration_id="iter-reactive",
+                    budget_state=None,
+                    reason="provider_overflow",
+                    provider_request_id="req-reactive",
+                ),
+                metadata=None,
+            )
+        elif self._factory.final_blocks:
+            return _ControlledBlockingHandle()
+        else:
+            event = EngineEvent(
+                occurred_at=_NOW,
+                session_id=snapshot.session_id,
+                run_id=snapshot.run_id,
+                type=EngineEventType.FINAL_ANSWER,
+                data=FinalAnswerData(
+                    content="recovered",
+                    filtered=False,
+                    degraded=False,
+                    finish_reason=FinishReason.STOP,
+                ),
+                metadata=None,
+            )
+        return _SnapshotEventHandle(snapshot, event)
+
+
+class _ReactiveRecoveryWorkerFactory:
+    """测试 reactive recovery dispatch 的 worker factory。"""
+
+    def __init__(self, *, final_blocks: bool = False) -> None:
+        """初始化 factory。
+
+        :param final_blocks: recovery Attempt 是否阻塞不产出 terminal。
+        :returns: ``None``。
+        """
+
+        self.final_blocks = final_blocks
+        self.created = 0
+        self.accepted_snapshots: list[AttemptDispatchSnapshot] = []
+        self.accepted_requests: list[AgentRunRequest] = []
+
+    def create_worker(self, snapshot: AttemptDispatchSnapshot) -> LocalEngineWorker:
+        """创建 scripted worker。
+
+        :param snapshot: dispatch snapshot。
+        :returns: scripted worker。
+        """
+
+        del snapshot
+        self.created += 1
+        return _ReactiveRecoveryWorker(self)
 
 
 class _CountingTool:
@@ -1906,6 +2014,78 @@ async def test_pre_start_governance_corrupted_compact_count_fails_closed(
             await scheduler.close()
 
 
+@pytest.mark.asyncio
+async def test_reactive_overflow_recovers_and_dispatches_new_attempt(
+    tmp_path: Path,
+) -> None:
+    """worker reactive overflow 经 compact 后创建新 Attempt 并完成 dispatch。"""
+
+    with open_host_durable_store(_options(tmp_path)) as store:
+        seeded = _seed_current_run(store)
+        factory = _ReactiveRecoveryWorkerFactory()
+        scheduler = await _open_scheduler(
+            tmp_path,
+            store,
+            factory,
+            context_budget_policy=_soft_compact_policy(),
+            context_compactor=FakeContextCompactor(),
+            compact_artifact_root=tmp_path / "compact-artifacts",
+        )
+        try:
+            scheduler.wake_dispatch(_pending_dispatch(seeded))
+            assert (await scheduler.drain_once()).dispatched == 1
+            await _wait_for_run_status(
+                store.transaction_runner,
+                seeded.run_id,
+                expected_run=RunStatus.SUCCEEDED,
+            )
+            await _wait_for_active_tasks_to_finish(scheduler)
+
+            assert len(factory.accepted_snapshots) == 2
+            assert factory.accepted_snapshots[0].attempt_id == seeded.attempt_id
+            assert factory.accepted_snapshots[1].attempt_id != seeded.attempt_id
+            assert _event_count(store.transaction_runner, CONTEXT_COMPACTED) == 1
+            assert _event_count(store.transaction_runner, "RUN_RECOVERING") == 1
+            assert _attempt_count_for_run(store.transaction_runner, seeded.run_id) == 2
+        finally:
+            await scheduler.close()
+
+
+@pytest.mark.asyncio
+async def test_reactive_recovery_does_not_clear_duplicate_registry(
+    tmp_path: Path,
+) -> None:
+    """reactive recovery accepted 停止旧 worker 但不清理同 Run duplicate registry。"""
+
+    tool = _CountingTool()
+    with open_host_durable_store(_options(tmp_path)) as store:
+        seeded = _seed_current_run(store)
+        factory = _ReactiveRecoveryWorkerFactory(final_blocks=True)
+        scheduler = await _open_scheduler(
+            tmp_path,
+            store,
+            factory,
+            agent_policy=_agent_policy(True),
+            tooling_options=_tooling_options(tool),
+            context_budget_policy=_soft_compact_policy(),
+            context_compactor=FakeContextCompactor(),
+            compact_artifact_root=tmp_path / "compact-artifacts",
+        )
+        try:
+            scheduler.wake_dispatch(_pending_dispatch(seeded))
+            assert (await scheduler.drain_once()).dispatched == 1
+            await _wait_for_accepted_snapshot_count(factory, 2)
+
+            assert factory.accepted_snapshots[0].attempt_id == seeded.attempt_id
+            assert factory.accepted_snapshots[1].attempt_id != seeded.attempt_id
+            assert scheduler._duplicate_governance_registry.active_run_count() == 1
+            assert _run_status(store.transaction_runner, seeded.run_id) == (
+                RunStatus.RUNNING
+            )
+        finally:
+            await scheduler.close()
+
+
 def _options(tmp_path: Path) -> HostDurableStoreOptions:
     """构造 Host durable store options。
 
@@ -2518,6 +2698,75 @@ def _event_types_for_run(
         return tuple(row.event_type for row in rows if row.run_id == run_id)
 
     return transaction_runner.run_read(_operation)
+
+
+def _event_count(transaction_runner: HostTransactionRunner, event_type: str) -> int:
+    """统计指定 event type 数量。
+
+    :param transaction_runner: transaction runner。
+    :param event_type: event type。
+    :returns: 事件数量。
+    """
+
+    def _operation(transaction: HostTransaction) -> int:
+        return sum(
+            1
+            for row in EventLogStore().read_events_after(transaction, 0, limit=200)
+            if row.event_type == event_type
+        )
+
+    return transaction_runner.run_read(_operation)
+
+
+async def _wait_for_run_status(
+    transaction_runner: HostTransactionRunner,
+    run_id: str,
+    *,
+    expected_run: RunStatus,
+) -> RunRow:
+    """等待 Run 到达指定状态。
+
+    :param transaction_runner: transaction runner。
+    :param run_id: Run id。
+    :param expected_run: 期望 Run 状态。
+    :returns: Run row。
+    :raises AssertionError: 超时未达到目标状态时抛出。
+    """
+
+    for _index in range(200):
+        row = transaction_runner.run_read(
+            lambda transaction: read_run_by_id(transaction, run_id)
+        )
+        assert row is not None
+        if row.status == expected_run:
+            return row
+        await asyncio.sleep(0.01)
+    row = transaction_runner.run_read(
+        lambda transaction: read_run_by_id(transaction, run_id)
+    )
+    assert row is not None
+    raise AssertionError(f"run status did not converge: {row.status.value}")
+
+
+async def _wait_for_accepted_snapshot_count(
+    factory: _ReactiveRecoveryWorkerFactory, expected_count: int
+) -> None:
+    """等待 reactive worker factory 接受指定次数。
+
+    :param factory: reactive worker factory。
+    :param expected_count: 期望 accept 次数。
+    :returns: ``None``。
+    :raises AssertionError: 超时未达到次数时抛出。
+    """
+
+    for _index in range(200):
+        if len(factory.accepted_snapshots) >= expected_count:
+            return
+        await asyncio.sleep(0.01)
+    raise AssertionError(
+        "accepted snapshot count did not converge: "
+        f"{len(factory.accepted_snapshots)}"
+    )
 
 
 async def _wait_for_statuses(
