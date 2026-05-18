@@ -385,9 +385,10 @@ async def test_scheduler_awaiting_tool_enters_waiting_and_manual_resolve_resumes
                 queue_policy="queue",
             ),
         )
-        pending = _pending_dispatch_from_started_run(
-            host._transaction_runner(), started.current_attempt_id
-        )
+        stage = scheduler._run_pre_start_governance(session.session_id)
+        assert stage.pending_dispatch is not None
+        pending = stage.pending_dispatch
+        assert pending.run_id == started.run_id
 
         scheduler.wake_dispatch(pending)
         result = await scheduler.drain_once()

@@ -230,8 +230,9 @@ def test_fresh_db_creates_foundation_phase8_and_memory_tables(
             assert set(MEMORY_PROJECTION_TABLES).issubset(
                 _table_names(connection)
             )
-            assert _pragma_int(connection, "PRAGMA user_version") == 8
-            assert HOST_SCHEMA_VERSION == 8
+            assert _pragma_int(connection, "PRAGMA user_version") == (
+                HOST_SCHEMA_VERSION
+            )
             assert _pragma_int(connection, "PRAGMA foreign_keys") == 1
             assert _pragma_text(connection, "PRAGMA journal_mode").lower() == "wal"
             assert _pragma_int(connection, "PRAGMA busy_timeout") == 250

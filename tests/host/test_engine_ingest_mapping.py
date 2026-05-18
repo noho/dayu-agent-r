@@ -227,6 +227,44 @@ def test_final_answer_closes_attempt_and_run_with_phase5_payload(
         assert isinstance(payload["terminal_summary_digest"], str)
 
 
+def test_empty_final_answer_closes_failed_without_run_succeeded(
+    tmp_path: Path,
+) -> None:
+    """空 final_answer 不写入无法 public 投影的 RUN_SUCCEEDED。"""
+
+    with open_host_durable_store(_options(tmp_path)) as store:
+        seeded = _seed_active_run(store.transaction_runner)
+        candidate = _candidate(
+            seeded,
+            worker_event_index=2,
+            data=FinalAnswerData(
+                content="",
+                filtered=False,
+                degraded=True,
+                finish_reason=FinishReason.LENGTH,
+            ),
+            event_type=EngineEventType.FINAL_ANSWER,
+        )
+
+        result = EngineEventIngestor(
+            transaction_runner=store.transaction_runner
+        ).ingest(candidate)
+
+        assert result.status == EngineIngestStatus.ACCEPTED
+        assert [event.event_type for event in result.events] == [
+            "ATTEMPT_FAILED",
+            "RUN_FAILED",
+        ]
+        assert _event_count(store.transaction_runner, "RUN_SUCCEEDED") == 0
+        assert _event_count(store.transaction_runner, "RUN_FAILED") == 1
+        payload = _payload(result.events[0])
+        assert payload["error_code"] == "empty_final_answer"
+        assert payload["recoverable"] is False
+        run_status, attempt_status = _statuses(store.transaction_runner, seeded)
+        assert run_status == RunStatus.FAILED
+        assert attempt_status == AttemptStatus.FAILED
+
+
 def test_run_failed_recoverable_false_closes_failed(tmp_path: Path) -> None:
     """不可恢复 run_failed 直接映射为 FAILED closeout。"""
 

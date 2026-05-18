@@ -25,6 +25,8 @@ from dayu.host import (
     EnsureSessionRequest,
     FollowupBehavior,
     Host,
+    HostApiError,
+    HostApiErrorCode,
     HostCallContext,
     LocalEngineWorker,
     LocalWorkerHandle,
@@ -232,6 +234,80 @@ async def test_retry_failed_run_creates_related_run_public_path(
 
 
 @pytest.mark.asyncio
+async def test_retry_run_replays_same_client_request_id_idempotently(
+    tmp_path: pathlib.Path,
+) -> None:
+    """retry_run 同一 client_request_id 重放返回同一关联 Run。
+
+    :param tmp_path: pytest 临时目录。
+    :returns: ``None``。
+    :raises AssertionError: retry 幂等重放创建重复 Run 时抛出。
+    """
+
+    factory = _SequencedWorkerFactory([_FAILED, _FINAL])
+    async with open_host(_options(tmp_path, factory)) as host:
+        session = await host.ensure_session(_ensure_request("retry-idempotent"))
+        source = await host.submit_followup(
+            session.session_id,
+            _followup_request(session.session_id, "retry-idempotent-source"),
+        )
+        await _wait_for_run_status(host, source.accepted_run_id, RunStatus.FAILED)
+        request = RetryRunRequest(
+            context=_context("retry-idempotent"),
+            client_request_id="retry-idempotent",
+            reason="ordinary_failed_retry",
+        )
+
+        first = await host.retry_run(source.accepted_run_id, request)
+        await _wait_for_run_status(host, first.run_id, RunStatus.SUCCEEDED)
+        second = await host.retry_run(source.accepted_run_id, request)
+
+    assert first.run_id == second.run_id
+    assert len(factory.accepted_requests) == 2
+
+
+@pytest.mark.asyncio
+async def test_retry_run_policy_limit_rejects_second_retry(
+    tmp_path: pathlib.Path,
+) -> None:
+    """同一 FAILED 源 Run 只允许一个 ordinary retry。
+
+    :param tmp_path: pytest 临时目录。
+    :returns: ``None``。
+    :raises AssertionError: 第二个 retry 未被 policy limit 拒绝时抛出。
+    """
+
+    factory = _SequencedWorkerFactory([_FAILED, _FINAL])
+    async with open_host(_options(tmp_path, factory)) as host:
+        session = await host.ensure_session(_ensure_request("retry-limit"))
+        source = await host.submit_followup(
+            session.session_id,
+            _followup_request(session.session_id, "retry-limit-source"),
+        )
+        await _wait_for_run_status(host, source.accepted_run_id, RunStatus.FAILED)
+        await host.retry_run(
+            source.accepted_run_id,
+            RetryRunRequest(
+                context=_context("retry-limit-1"),
+                client_request_id="retry-limit-1",
+                reason="ordinary_failed_retry",
+            ),
+        )
+
+        with pytest.raises(HostApiError) as exc_info:
+            await host.retry_run(
+                source.accepted_run_id,
+                RetryRunRequest(
+                    context=_context("retry-limit-2"),
+                    client_request_id="retry-limit-2",
+                    reason="ordinary_failed_retry",
+                ),
+            )
+
+    assert exc_info.value.code == HostApiErrorCode.INVALID_STATE
+
+
+@pytest.mark.asyncio
 async def test_replay_succeeded_run_no_tool_public_path(
     tmp_path: pathlib.Path,
 ) -> None:
@@ -268,6 +344,89 @@ async def test_replay_succeeded_run_no_tool_public_path(
         assert _event_type_count(tmp_path / "host.sqlite3", "TOOL_RESULT_ACCEPTED") == (
             before_tool_facts
         )
+
+
+@pytest.mark.asyncio
+async def test_replay_run_replays_same_client_request_id_idempotently(
+    tmp_path: pathlib.Path,
+) -> None:
+    """replay_run 同一 client_request_id 重放返回同一关联 Run。
+
+    :param tmp_path: pytest 临时目录。
+    :returns: ``None``。
+    :raises AssertionError: replay 幂等重放创建重复 Run 时抛出。
+    """
+
+    factory = _SequencedWorkerFactory([_FINAL, _FINAL])
+    async with open_host(_options(tmp_path, factory)) as host:
+        session = await host.ensure_session(_ensure_request("replay-idempotent"))
+        source = await host.submit_followup(
+            session.session_id,
+            _followup_request(session.session_id, "replay-idempotent-source"),
+        )
+        await _wait_for_run_status(host, source.accepted_run_id, RunStatus.SUCCEEDED)
+        request = ReplayRunRequest(
+            context=_context("replay-idempotent"),
+            client_request_id="replay-idempotent",
+            reason="schema_repair",
+            repair_instruction="repair output shape",
+        )
+
+        first = await host.replay_run(source.accepted_run_id, request)
+        await _wait_for_run_status(host, first.run_id, RunStatus.SUCCEEDED)
+        second = await host.replay_run(source.accepted_run_id, request)
+
+    assert first.run_id == second.run_id
+    assert len(factory.accepted_requests) == 2
+
+
+@pytest.mark.asyncio
+async def test_retry_and_replay_reject_non_target_source_status(
+    tmp_path: pathlib.Path,
+) -> None:
+    """retry/replay 对非目标源状态返回 public INVALID_STATE。
+
+    :param tmp_path: pytest 临时目录。
+    :returns: ``None``。
+    :raises AssertionError: 非目标状态未被拒绝时抛出。
+    """
+
+    factory = _SequencedWorkerFactory([_FINAL, _FAILED])
+    async with open_host(_options(tmp_path, factory)) as host:
+        session = await host.ensure_session(_ensure_request("relation-reject"))
+        succeeded = await host.submit_followup(
+            session.session_id,
+            _followup_request(session.session_id, "relation-succeeded"),
+        )
+        await _wait_for_run_status(host, succeeded.accepted_run_id, RunStatus.SUCCEEDED)
+        failed = await host.submit_followup(
+            session.session_id,
+            _followup_request(session.session_id, "relation-failed"),
+        )
+        await _wait_for_run_status(host, failed.accepted_run_id, RunStatus.FAILED)
+
+        with pytest.raises(HostApiError) as retry_error:
+            await host.retry_run(
+                succeeded.accepted_run_id,
+                RetryRunRequest(
+                    context=_context("retry-succeeded"),
+                    client_request_id="retry-succeeded",
+                    reason="ordinary_failed_retry",
+                ),
+            )
+        with pytest.raises(HostApiError) as replay_error:
+            await host.replay_run(
+                failed.accepted_run_id,
+                ReplayRunRequest(
+                    context=_context("replay-failed"),
+                    client_request_id="replay-failed",
+                    reason="schema_repair",
+                    repair_instruction="repair output shape",
+                ),
+            )
+
+    assert retry_error.value.code == HostApiErrorCode.INVALID_STATE
+    assert replay_error.value.code == HostApiErrorCode.INVALID_STATE
 
 
 def _options(

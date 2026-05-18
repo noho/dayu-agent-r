@@ -121,7 +121,9 @@ def test_run_start_reason_resume_codec_round_trips() -> None:
     assert {item.name: item.value for item in RunStartReason} == {
         "INITIAL": "initial",
         "QUEUE_PROMOTION": "queue_promotion",
+        "RECOVERY": "recovery",
         "RESUME": "resume",
+        "STEER": "steer",
     }
 
 

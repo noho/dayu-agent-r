@@ -44,10 +44,14 @@ from dayu.host.durable.options import (
 )
 from dayu.host.durable.run_transition import (
     AcceptWorkerRunningInput,
+    StartGovernedRunInput,
     accept_worker_running_in_transaction,
+    start_governed_run_with_starting_attempt_in_transaction,
 )
 from dayu.host.durable.state import (
+    RunStartReason,
     StateMutationStatus,
+    WorkerKind,
     mark_dispatch_waiting_for_lane_row,
     mark_dispatching_after_lane_row,
 )
@@ -316,6 +320,61 @@ def _accept_active_worker(
     transaction_runner.run_write(_operation)
 
 
+def _start_governed_run(
+    transaction_runner: HostTransactionRunner,
+    *,
+    run_id: str,
+    expected_status: RunStatus,
+    id_suffix: str,
+) -> str:
+    """把已接受的 Run 启动为 STARTING Attempt 并返回 Attempt id。
+
+    :param transaction_runner: Host transaction runner。
+    :param run_id: 目标 Run id。
+    :param expected_status: Run 启动前期望状态。
+    :param id_suffix: 测试生成 id 后缀。
+    :returns: 新建 Attempt id。
+    :raises AssertionError: transition 未更新时抛出。
+    """
+
+    attempt_id = f"attempt-{id_suffix}"
+
+    def _operation(transaction: HostTransaction) -> None:
+        """执行 governed start transition。
+
+        :param transaction: Host transaction。
+        :returns: ``None``。
+        """
+
+        started = start_governed_run_with_starting_attempt_in_transaction(
+            transaction,
+            EventLogStore(),
+            StartGovernedRunInput(
+                run_id=run_id,
+                expected_status=expected_status,
+                run_started_event_id=f"event-run-started-{id_suffix}",
+                attempt_started_event_id=f"event-attempt-started-{id_suffix}",
+                attempt_id=attempt_id,
+                execution_id=f"execution-{id_suffix}",
+                dispatch_record_id=f"dispatch-{id_suffix}",
+                occurred_at=_NOW,
+                actor="host.dispatch",
+                source="pytest",
+                start_reason=(
+                    RunStartReason.INITIAL
+                    if expected_status is RunStatus.ACCEPTED
+                    else RunStartReason.QUEUE_PROMOTION
+                ),
+                worker_kind=WorkerKind.LOCAL,
+                owner_host_instance_id=None,
+            ),
+        )
+        assert started.status == StateMutationStatus.UPDATED
+
+    transaction_runner.run_write(_operation)
+    return attempt_id
+
+
 def _mark_run_status(db_path: Path, run_id: str, status: RunStatus) -> None:
     """直接更新 Run status 以构造 deferred non-terminal 状态。
 
@@ -356,7 +415,7 @@ def test_cancel_session_runs_cancels_queued_and_predispatch_subset(
         assert _run_status(options.db_path, active.run_id) == RunStatus.CANCELLED
         assert _run_status(options.db_path, queued_one.run_id) == RunStatus.CANCELLED
         assert _run_status(options.db_path, queued_two.run_id) == RunStatus.CANCELLED
-        assert _run_status(options.db_path, other.run_id) == RunStatus.RUNNING
+        assert _run_status(options.db_path, other.run_id) == RunStatus.ACCEPTED
     finally:
         host.close()
 
@@ -373,18 +432,13 @@ def test_cancel_session_runs_idempotent_replay_does_not_cancel_new_run(
         active = start_run(host, _start_request(session_id, "start-active"))
         request = _cancel_request("cancel-session")
         first = cancel_session_runs(host, session_id, request)
-        new_followup = submit_followup(
-            host, session_id, _followup_request(session_id, "new-run")
-        )
+        new_run = start_run(host, _start_request(session_id, "new-run"))
         replay = cancel_session_runs(host, session_id, request)
 
         assert first.active_run_id is None
         assert _run_status(options.db_path, active.run_id) == RunStatus.CANCELLED
-        assert replay.active_run_id == new_followup.accepted_run_id
-        assert (
-            _run_status(options.db_path, new_followup.accepted_run_id)
-            == RunStatus.RUNNING
-        )
+        assert replay.active_run_id == new_run.run_id
+        assert _run_status(options.db_path, new_run.run_id) == RunStatus.ACCEPTED
     finally:
         host.close()
 
@@ -392,7 +446,7 @@ def test_cancel_session_runs_idempotent_replay_does_not_cancel_new_run(
 def test_cancel_session_runs_unsupported_non_terminal_has_no_partial_mutation(
     tmp_path: Path,
 ) -> None:
-    """存在 WAITING non-terminal 时返回 unsupported 且不部分取消 queued Run。"""
+    """存在 RECOVERING non-terminal 时返回 unsupported 且不部分取消 queued Run。"""
 
     options = _options(tmp_path)
     host = create_host_command_handle(options)
@@ -400,9 +454,9 @@ def test_cancel_session_runs_unsupported_non_terminal_has_no_partial_mutation(
         session_id = _session_id(host, "slot-a")
         active = start_run(host, _start_request(session_id, "start-active"))
         queued = start_run(host, _start_request(session_id, "start-queued"))
-        # 这里仅构造 WAITING 分类测试所需的 deferred 状态，不模拟生产
-        # transition；该用例只验证 unsupported 分类不会产生 partial mutation。
-        _mark_run_status(options.db_path, active.run_id, RunStatus.WAITING)
+        # 这里仅构造 unsupported 分类测试所需的 deferred 状态，不模拟生产
+        # recovery；该用例只验证 unsupported 分类不会产生 partial mutation。
+        _mark_run_status(options.db_path, active.run_id, RunStatus.RECOVERING)
         before_cancel = _event_count(options.db_path)
 
         with pytest.raises(HostApiError) as exc_info:
@@ -412,7 +466,7 @@ def test_cancel_session_runs_unsupported_non_terminal_has_no_partial_mutation(
 
         assert exc_info.value.code == HostApiErrorCode.UNSUPPORTED_OPERATION
         assert _event_count(options.db_path) == before_cancel
-        assert _run_status(options.db_path, active.run_id) == RunStatus.WAITING
+        assert _run_status(options.db_path, active.run_id) == RunStatus.RECOVERING
         assert _run_status(options.db_path, queued.run_id) == RunStatus.QUEUED
     finally:
         host.close()
@@ -428,13 +482,18 @@ def test_cancel_session_runs_cancels_queued_and_active_worker(
     try:
         session_id = _session_id(host, "slot-a")
         active = start_run(host, _start_request(session_id, "start-active"))
-        assert active.current_attempt_id is not None
         queued = start_run(host, _start_request(session_id, "start-queued"))
         with open_host_durable_store(_durable_options(tmp_path)) as store:
+            attempt_id = _start_governed_run(
+                store.transaction_runner,
+                run_id=active.run_id,
+                expected_status=RunStatus.ACCEPTED,
+                id_suffix="active",
+            )
             _accept_active_worker(
                 store.transaction_runner,
                 run_id=active.run_id,
-                attempt_id=active.current_attempt_id,
+                attempt_id=attempt_id,
             )
 
         snapshot = cancel_session_runs(
@@ -460,12 +519,17 @@ def test_cancel_session_runs_active_replay_does_not_append_facts(
     try:
         session_id = _session_id(host, "slot-a")
         active = start_run(host, _start_request(session_id, "start-active"))
-        assert active.current_attempt_id is not None
         with open_host_durable_store(_durable_options(tmp_path)) as store:
+            attempt_id = _start_governed_run(
+                store.transaction_runner,
+                run_id=active.run_id,
+                expected_status=RunStatus.ACCEPTED,
+                id_suffix="active-replay",
+            )
             _accept_active_worker(
                 store.transaction_runner,
                 run_id=active.run_id,
-                attempt_id=active.current_attempt_id,
+                attempt_id=attempt_id,
             )
         request = _cancel_request("cancel-session-active")
 

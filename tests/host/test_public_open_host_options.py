@@ -19,6 +19,7 @@ from dayu.host import (
     HostEvent,
     HostEventKind,
     HostFinalAnswerView,
+    EnsureSessionRequest,
     HostTerminalStatus,
     LocalEngineWorker,
     LocalWorkerHandle,
@@ -332,8 +333,15 @@ def test_open_host_rejects_untyped_options() -> None:
 async def test_open_host_slice1_context_body_is_deferred(
     tmp_path: pathlib.Path,
 ) -> None:
-    """Slice 1 opener 可作为 async context manager 导入但不提前接线 runtime。"""
+    """open_host 可作为 async context manager 打开当前公共 runtime。"""
 
-    with pytest.raises(NotImplementedError, match="later P10.5 slice"):
-        async with open_host(_options(tmp_path)):
-            raise AssertionError("open_host Slice 1 must not yield a runtime handle")
+    async with open_host(_options(tmp_path)) as host:
+        session = await host.ensure_session(
+            EnsureSessionRequest(
+                scope="workspace",
+                slot_key="open-host-options",
+                metadata=(),
+            )
+        )
+        assert session.slot is not None
+        assert session.slot.scope == "workspace"

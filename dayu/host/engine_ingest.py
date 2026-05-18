@@ -165,6 +165,7 @@ _REASON_UNSUPPORTED_RECOVERY_POLICY = "unsupported_recovery_policy"
 _REASON_UNSUPPORTED_WAITING_PATH = "unsupported_waiting_path"
 _REASON_STREAM_ENDED_WITHOUT_TERMINAL = "stream_ended_without_terminal"
 _REASON_WORKER_LOST_BEFORE_TERMINAL = "worker_lost_before_terminal"
+_REASON_EMPTY_FINAL_ANSWER = "empty_final_answer"
 _REASON_STALE_EXECUTION_ID = "stale_execution_id"
 _REASON_TERMINAL_ALREADY_CLOSED = "terminal_already_closed"
 _REASON_WAITING_EVENT_CONFIRMATION = "waiting_event_confirmation"
@@ -2833,6 +2834,18 @@ def _final_answer_plan(data: FinalAnswerData) -> _TerminalPlan:
     :returns: terminal plan。
     """
 
+    if data.content.strip() == "":
+        return _failed_plan(
+            reason=_REASON_EMPTY_FINAL_ANSWER,
+            error_code=_REASON_EMPTY_FINAL_ANSWER,
+            message=(
+                "Engine final_answer contained no displayable content; "
+                f"finish_reason={data.finish_reason.value}"
+            ),
+            provider_request_id=None,
+            recoverable=False,
+            unsupported_later_owner=None,
+        )
     return _TerminalPlan(
         attempt_event_type=_EVENT_TYPE_ATTEMPT_SUCCEEDED,
         run_event_type=_EVENT_TYPE_RUN_SUCCEEDED,

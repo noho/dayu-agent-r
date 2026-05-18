@@ -6,7 +6,15 @@ import pathlib
 
 import pytest
 
-from dayu.host import FollowupBehavior, RunStatus, SubmitFollowupRequest, open_host
+from dayu.host import (
+    FollowupBehavior,
+    HostApiError,
+    HostApiErrorCode,
+    RunStatus,
+    SubmitFollowupRequest,
+    create_host_command_handle,
+    open_host,
+)
 from tests.host.test_public_retry_replay import (
     _BLOCK,
     _FINAL,
@@ -17,6 +25,10 @@ from tests.host.test_public_retry_replay import (
     _options,
     _wait_for_event_type_count,
     _wait_for_run_status,
+)
+from tests.host.test_resolve_wait_command import (
+    _options as _command_options,
+    _seed_waiting_run,
 )
 
 
@@ -62,3 +74,86 @@ async def test_steer_running_run_creates_new_attempt_public_path(
         assert after.current_attempt_id != first_attempt_id
         await _wait_for_run_status(host, first.accepted_run_id, RunStatus.SUCCEEDED)
         assert factory.handles[0].cancel_reasons == ["steered"]
+
+
+@pytest.mark.asyncio
+async def test_steer_waiting_run_creates_new_attempt_public_path(
+    tmp_path: pathlib.Path,
+) -> None:
+    """submit_followup(steer) 支持 WAITING Run public path。
+
+    :param tmp_path: pytest 临时目录。
+    :returns: ``None``。
+    :raises AssertionError: WAITING steer 未创建新 Attempt 或未成功终态时抛出。
+    """
+
+    seed_handle = create_host_command_handle(_command_options(tmp_path))
+    try:
+        seeded = _seed_waiting_run(seed_handle)
+    finally:
+        seed_handle.close()
+
+    factory = _SequencedWorkerFactory([_FINAL])
+    async with open_host(_options(tmp_path, factory)) as host:
+        steered = await host.submit_followup(
+            seeded.session_id,
+            SubmitFollowupRequest(
+                context=_context("steer-waiting"),
+                session_id=seeded.session_id,
+                client_request_id="steer-waiting",
+                system_prompt=None,
+                user_prompt="replace waiting attempt",
+                tool_names=None,
+                runner_spec=None,
+                runner_options=None,
+                agent_policy=None,
+                behavior=FollowupBehavior.STEER,
+                target_run_id=seeded.run_id,
+            ),
+        )
+
+        assert steered.accepted_run_id == seeded.run_id
+        after = await host.get_run(seeded.run_id)
+        assert after.current_attempt_id != seeded.attempt_id
+        await _wait_for_run_status(host, seeded.run_id, RunStatus.SUCCEEDED)
+
+
+@pytest.mark.asyncio
+async def test_steer_terminal_race_rejects_non_active_target(
+    tmp_path: pathlib.Path,
+) -> None:
+    """terminal 已赢得竞争后 steer 返回 public INVALID_STATE。
+
+    :param tmp_path: pytest 临时目录。
+    :returns: ``None``。
+    :raises AssertionError: terminal Run 仍被 steer 接受时抛出。
+    """
+
+    factory = _SequencedWorkerFactory([_FINAL])
+    async with open_host(_options(tmp_path, factory)) as host:
+        session = await host.ensure_session(_ensure_request("steer-terminal"))
+        source = await host.submit_followup(
+            session.session_id,
+            _followup_request(session.session_id, "steer-terminal-source"),
+        )
+        await _wait_for_run_status(host, source.accepted_run_id, RunStatus.SUCCEEDED)
+
+        with pytest.raises(HostApiError) as exc_info:
+            await host.submit_followup(
+                session.session_id,
+                SubmitFollowupRequest(
+                    context=_context("steer-terminal"),
+                    session_id=session.session_id,
+                    client_request_id="steer-terminal",
+                    system_prompt=None,
+                    user_prompt="too late",
+                    tool_names=None,
+                    runner_spec=None,
+                    runner_options=None,
+                    agent_policy=None,
+                    behavior=FollowupBehavior.STEER,
+                    target_run_id=source.accepted_run_id,
+                ),
+            )
+
+    assert exc_info.value.code == HostApiErrorCode.INVALID_STATE

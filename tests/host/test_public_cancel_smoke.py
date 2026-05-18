@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import pathlib
+from dataclasses import replace
 
 import pytest
 
@@ -10,9 +11,11 @@ from dayu.host import (
     CancelMode,
     CancelRunRequest,
     CancelSessionRunsRequest,
+    HostEventKind,
     RunStatus,
     open_host,
 )
+from tests.host.public_smoke_support import next_terminal_for_run
 from tests.host.test_public_retry_replay import (
     _BLOCK,
     _SequencedWorkerFactory,
@@ -71,3 +74,149 @@ async def test_cancel_accepted_queued_and_active_public_path(
         cancelling = await host.get_run(active.accepted_run_id)
         assert cancelling.status in (RunStatus.CANCELLING, RunStatus.CANCELLED)
         assert factory.handles[0].cancel_reasons == ["user_cancel_session"]
+
+
+@pytest.mark.asyncio
+async def test_pre_dispatch_cancel_visible_in_watch(
+    tmp_path: pathlib.Path,
+) -> None:
+    """pre-dispatch queued Run 取消后通过 public watch 可见。
+
+    :param tmp_path: pytest 临时目录。
+    :returns: ``None``。
+    :raises AssertionError: watch 未观察到取消 terminal 时抛出。
+    """
+
+    factory = _SequencedWorkerFactory([_BLOCK])
+    async with open_host(_options(tmp_path, factory)) as host:
+        session = await host.ensure_session(_ensure_request("cancel-watch"))
+        watcher = host.watch_session_events(session.session_id)
+        active = await host.submit_followup(
+            session.session_id,
+            _followup_request(session.session_id, "cancel-watch-active"),
+        )
+        await _wait_for_run_status(host, active.accepted_run_id, RunStatus.RUNNING)
+        queued = await host.submit_followup(
+            session.session_id,
+            _followup_request(session.session_id, "cancel-watch-queued"),
+        )
+
+        cancelled = await host.cancel_run(
+            queued.accepted_run_id,
+            CancelRunRequest(
+                context=_context("cancel-watch-queued"),
+                client_request_id="cancel-watch-queued",
+                reason="pre_dispatch_visible",
+                mode=CancelMode.GRACEFUL,
+            ),
+        )
+        terminal = await next_terminal_for_run(watcher, queued.accepted_run_id)
+
+    assert cancelled.status is RunStatus.CANCELLED
+    assert terminal.kind is HostEventKind.CANCELLED
+    assert terminal.cancel_reason == "pre_dispatch_visible"
+
+
+@pytest.mark.asyncio
+async def test_active_cancel_emits_public_cancel_event(
+    tmp_path: pathlib.Path,
+) -> None:
+    """active cancel 通过 public watch 暴露取消 terminal。
+
+    :param tmp_path: pytest 临时目录。
+    :returns: ``None``。
+    :raises AssertionError: active cancel 未传播到 worker 或 watch 时抛出。
+    """
+
+    factory = _SequencedWorkerFactory([_BLOCK])
+    async with open_host(_options(tmp_path, factory)) as host:
+        session = await host.ensure_session(_ensure_request("active-cancel"))
+        watcher = host.watch_session_events(session.session_id)
+        active = await host.submit_followup(
+            session.session_id,
+            _followup_request(session.session_id, "active-cancel-run"),
+        )
+        await _wait_for_run_status(host, active.accepted_run_id, RunStatus.RUNNING)
+        await _wait_for_handle_count(factory, 1)
+        await host.cancel_run(
+            active.accepted_run_id,
+            CancelRunRequest(
+                context=_context("active-cancel-run"),
+                client_request_id="active-cancel-run",
+                reason="active_cancel_visible",
+                mode=CancelMode.GRACEFUL,
+            ),
+        )
+        terminal = await next_terminal_for_run(watcher, active.accepted_run_id)
+
+    assert terminal.kind is HostEventKind.CANCELLED
+    assert terminal.cancel_reason == "active_cancel_visible"
+
+
+@pytest.mark.asyncio
+async def test_cancel_session_runs_scoped_to_session(
+    tmp_path: pathlib.Path,
+) -> None:
+    """cancel_session_runs 只取消目标 Session 下的非终态 Run。
+
+    :param tmp_path: pytest 临时目录。
+    :returns: ``None``。
+    :raises AssertionError: 其它 Session 的 Run 被错误取消时抛出。
+    """
+
+    factory = _SequencedWorkerFactory([_BLOCK, _BLOCK])
+    options = replace(
+        _options(tmp_path, factory),
+        lane_capacity=2,
+        lane_name="slice5-session-scope",
+    )
+    async with open_host(options) as host:
+        first_session = await host.ensure_session(_ensure_request("scope-first"))
+        second_session = await host.ensure_session(_ensure_request("scope-second"))
+        first_run = await host.submit_followup(
+            first_session.session_id,
+            _followup_request(first_session.session_id, "scope-first-run"),
+        )
+        second_run = await host.submit_followup(
+            second_session.session_id,
+            _followup_request(second_session.session_id, "scope-second-run"),
+        )
+        await _wait_for_run_status(host, first_run.accepted_run_id, RunStatus.RUNNING)
+        await _wait_for_run_status(host, second_run.accepted_run_id, RunStatus.RUNNING)
+        await _wait_for_handle_count(factory, 2)
+
+        await host.cancel_session_runs(
+            first_session.session_id,
+            CancelSessionRunsRequest(
+                context=_context("scope-cancel"),
+                client_request_id="scope-cancel",
+                reason="session_scope_only",
+                mode=CancelMode.GRACEFUL,
+            ),
+        )
+        first_snapshot = await host.get_run(first_run.accepted_run_id)
+        second_snapshot = await host.get_run(second_run.accepted_run_id)
+        assert factory.handles[1].cancel_reasons == []
+
+    assert first_snapshot.status in (RunStatus.CANCELLING, RunStatus.CANCELLED)
+    assert second_snapshot.status is RunStatus.RUNNING
+    assert factory.handles[0].cancel_reasons == ["session_scope_only"]
+
+
+async def _wait_for_handle_count(
+    factory: _SequencedWorkerFactory, expected_count: int
+) -> None:
+    """等待 worker factory 创建指定数量 handle。
+
+    :param factory: sequenced worker factory。
+    :param expected_count: 期望 handle 数量。
+    :returns: ``None``。
+    :raises TimeoutError: 超时未达到数量时抛出。
+    """
+
+    for _ in range(200):
+        if len(factory.handles) >= expected_count:
+            return
+        await factory.accepted_event.wait()
+        factory.accepted_event.clear()
+    raise TimeoutError(f"worker handles did not reach {expected_count}")

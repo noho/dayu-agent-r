@@ -54,6 +54,7 @@ from dayu.host.memory import default_memory_projection_policy
 _WORKER_MODE_FINAL = "final"
 _WORKER_MODE_BLOCKING = "blocking"
 _WORKER_MODE_FAILED = "failed"
+_WORKER_MODE_EMPTY_FINAL = "empty_final"
 
 
 class _ImmediateFinalAnswerHandle:
@@ -215,6 +216,65 @@ class _FailedHandle:
         del reason
 
 
+class _EmptyFinalAnswerHandle:
+    """测试用产出空 final answer 的 worker handle。"""
+
+    def __init__(self, snapshot: AttemptDispatchSnapshot) -> None:
+        """初始化 handle。
+
+        :param snapshot: 当前 dispatch snapshot。
+        :returns: ``None``。
+        """
+
+        self._snapshot = snapshot
+
+    @property
+    def local_worker_id(self) -> str:
+        """返回本地 worker id。
+
+        :returns: 本地 worker id。
+        """
+
+        return "watch-empty-final-answer-worker"
+
+    async def events(self) -> AsyncIterator[EngineEvent]:
+        """产出空 final answer EngineEvent。
+
+        :returns: EngineEvent 异步迭代器。
+        """
+
+        yield EngineEvent(
+            occurred_at=datetime(2026, 5, 18, 1, 2, 5, tzinfo=UTC),
+            session_id=self._snapshot.session_id,
+            run_id=self._snapshot.run_id,
+            type=EngineEventType.FINAL_ANSWER,
+            data=FinalAnswerData(
+                content="",
+                filtered=False,
+                degraded=True,
+                finish_reason=FinishReason.LENGTH,
+            ),
+            metadata=None,
+        )
+
+    async def close(self) -> None:
+        """关闭 handle。
+
+        :returns: ``None``。
+        """
+
+        return None
+
+    def cancel(self, reason: str) -> None:
+        """忽略取消请求。
+
+        :param reason: 取消原因。
+        :returns: ``None``。
+        """
+
+        del reason
+
+
 class _HandleWorker:
     """返回预设 handle 的 worker。"""
 
@@ -271,6 +331,8 @@ class _Factory:
             handle: LocalWorkerHandle = _ImmediateFinalAnswerHandle(snapshot)
         elif self._mode == _WORKER_MODE_FAILED:
             handle = _FailedHandle(snapshot)
+        elif self._mode == _WORKER_MODE_EMPTY_FINAL:
+            handle = _EmptyFinalAnswerHandle(snapshot)
         elif self._mode == _WORKER_MODE_BLOCKING:
             if self._release_event is None:
                 raise RuntimeError("blocking mode requires release_event")
@@ -414,6 +476,29 @@ async def test_failed_and_cancelled_terminal_events_are_typed(
 
         release_event.set()
         await _close_iterator(watcher)
+
+
+@pytest.mark.asyncio
+async def test_empty_final_answer_terminal_projects_as_failed_event(
+    tmp_path: pathlib.Path,
+) -> None:
+    """空 final answer 不会写成 public watch 无法读取的 SUCCEEDED event。"""
+
+    factory = _Factory(_WORKER_MODE_EMPTY_FINAL)
+    async with open_host(_options(tmp_path, factory)) as host:
+        session = await host.ensure_session(_ensure_request("watch-empty-final"))
+        watcher = host.watch_session_events(session.session_id)
+        await host.submit_followup(
+            session.session_id,
+            _followup_request(session.session_id, "followup-empty-final"),
+        )
+        terminal = await _next_terminal(watcher)
+
+    assert terminal.kind is HostEventKind.FAILED
+    assert terminal.terminal_status is HostTerminalStatus.FAILED
+    assert terminal.final_answer is None
+    assert terminal.error_message is not None
+    assert "no displayable content" in terminal.error_message
 
 
 @pytest.mark.asyncio
