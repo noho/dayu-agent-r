@@ -30,6 +30,7 @@ from dayu.host.api import (
     HostLocalExecutionOptions,
     LocalWorkerHandle,
     RunStatus,
+    SourceRunRelation,
 )
 from dayu.host.durable.codec import format_utc_timestamp, sha256_digest_json
 from dayu.host.durable.event_log import (
@@ -96,6 +97,7 @@ from dayu.host.run_input import (
     MemoryProjectionRepairRequired,
     PolicySnapshot,
     RunInputBuilder,
+    ToolExecutionMode,
     create_no_tool_run_input_builder,
     create_tool_enabled_run_input_builder,
 )
@@ -268,6 +270,29 @@ class _ActiveWorkerEntry:
     run_id: str
     handle: LocalWorkerHandle
     cancellation_token: "_HostCancellationToken"
+
+
+@dataclass(frozen=True, slots=True)
+class _IsReplayRunOperation:
+    """读取 Run source relation 以识别 replay 关联 Run。
+
+    :param run_id: 目标 Run id。
+    """
+
+    run_id: str
+
+    def __call__(self, transaction: HostTransaction) -> bool:
+        """执行 replay Run 判定读事务。
+
+        :param transaction: 当前 Host 读事务。
+        :returns: Run source relation 为 replay 时返回 ``True``。
+        :raises RuntimeError: durable Run 缺失时抛出。
+        """
+
+        run = read_run_by_id(transaction, self.run_id)
+        if run is None:
+            raise RuntimeError("dispatch Run is missing")
+        return run.source_run_relation is SourceRunRelation.REPLAY
 
 
 class ActiveWorkerRegistry:
@@ -1450,6 +1475,11 @@ class HostDispatchScheduler:
                 policy_snapshot=policy_snapshot,
                 memory_snapshot_provider=memory_provider,
                 compact_artifact_provider=compact_provider,
+                tool_execution_mode=(
+                    ToolExecutionMode.NO_TOOL_REPLAY
+                    if self._is_replay_run(snapshot.run_id)
+                    else ToolExecutionMode.NO_TOOL_DISABLED
+                ),
             )
         tool_runtime = DefaultToolRuntimeFactory(
             EffectiveToolBundleBuilder()
@@ -1494,6 +1524,16 @@ class HostDispatchScheduler:
             memory_snapshot_provider=memory_provider,
             compact_artifact_provider=compact_provider,
         )
+
+    def _is_replay_run(self, run_id: str) -> bool:
+        """判断当前 Run 是否是 replay 关联 Run。
+
+        :param run_id: 目标 Run id。
+        :returns: Run source relation 为 replay 时返回 ``True``。
+        :raises RuntimeError: durable Run 缺失时抛出。
+        """
+
+        return self._transaction_runner.run_read(_IsReplayRunOperation(run_id=run_id))
 
     def _catch_up_memory_projection_before_worker(
         self, record: PendingDispatchRecord

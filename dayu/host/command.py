@@ -110,6 +110,8 @@ _OPERATION_START_RUN = "start_run"
 _OPERATION_SUBMIT_FOLLOWUP = "submit_followup"
 _OPERATION_CANCEL_RUN = "cancel_run"
 _OPERATION_CANCEL_SESSION_RUNS = "cancel_session_runs"
+_OPERATION_RETRY_RUN = "retry_run"
+_OPERATION_REPLAY_RUN = "replay_run"
 _PUBLIC_FOLLOWUP_DEFAULT_EXECUTION_TARGET = "host-public-followup-default"
 
 
@@ -442,14 +444,11 @@ def submit_followup(
 ) -> FollowupSnapshot:
     """提交同一 Session 的后续输入。
 
-    Phase 4 只实现 ``behavior=queue``；``behavior=steer`` 返回 stable
-    unsupported，不追加 EventLog。
-
     :param host: Host command handle。
     :param session_id: 调用路径中的目标 Session id。
     :param request: follow-up 请求。
     :returns: follow-up 接受结果 snapshot。
-    :raises HostApiError: session id 不一致、steer 未支持或 admission 失败时抛出。
+    :raises HostApiError: session id 不一致、admission 失败或幂等冲突时抛出。
     """
 
     host._raise_if_closed()
@@ -460,11 +459,7 @@ def submit_followup(
             retryable=False,
         )
     if request.behavior == FollowupBehavior.STEER:
-        raise HostApiError(
-            code=HostApiErrorCode.UNSUPPORTED_OPERATION,
-            message="submit_followup steer is deferred beyond Phase 4",
-            retryable=False,
-        )
+        return _submit_followup_steer(host, request)
     _LOGGER.log(
         VERBOSE_LOG_LEVEL,
         "host.command.accepted operation=submit_followup session_id=%s",
@@ -505,6 +500,49 @@ def submit_followup(
             result.run.run_id if result.run.status == RunStatus.QUEUED else None
         ),
         target_run_id=None,
+    )
+
+
+def _submit_followup_steer(
+    host: HostCommandHandle, request: SubmitFollowupRequest
+) -> FollowupSnapshot:
+    """提交 steer follow-up 并返回 public snapshot。
+
+    :param host: Host command handle。
+    :param request: steer follow-up 请求。
+    :returns: follow-up 接受结果 snapshot。
+    :raises HostApiError: admission 失败或 durable 写入失败时抛出。
+    """
+
+    try:
+        result = host._admission_service.submit_followup_steer(
+            request,
+            caller_semantic_digest=_submit_followup_public_semantic_digest(
+                request
+            ),
+        )
+    except HostDurableError as exc:
+        raise _host_api_error_from_durable_error(exc) from exc
+    if result.steered_cancel_target is not None:
+        _propagate_active_cancel_targets(
+            host,
+            (
+                ActiveCancelMessage(
+                    run_id=result.steered_cancel_target.run_id,
+                    attempt_id=result.steered_cancel_target.attempt_id,
+                    execution_id=result.steered_cancel_target.execution_id,
+                    reason=result.steered_cancel_target.reason,
+                ),
+            ),
+        )
+    return FollowupSnapshot(
+        accepted_input_ref=result.input_event_id,
+        behavior=FollowupBehavior.STEER,
+        accepted_run_id=result.run.run_id,
+        accepted_run_status=result.run.status,
+        command_watermark=run_snapshot_from_row(result.run).event_cursor,
+        queued_run_id=None,
+        target_run_id=result.run.run_id,
     )
 
 
@@ -608,37 +646,56 @@ def cancel_session_runs(
 def retry_run(
     host: HostCommandHandle, run_id: str, request: RetryRunRequest
 ) -> RunSnapshot:
-    """稳定拒绝 Phase 4 尚未实现的 retry Run。
+    """重试普通本地 FAILED 源 Run，并返回关联新 Run snapshot。
 
-    本函数不打开 transaction、不追加 EventLog、不写 idempotency record。
-
-    :param host: Host command handle；Phase 4 deferred 路径不读取该 handle。
+    :param host: Host command handle。
     :param run_id: 源 Run id。
     :param request: retry run 请求。
-    :returns: 当前阶段不会返回。
-    :raises HostApiError: 始终以 ``UNSUPPORTED_OPERATION`` 抛出。
+    :returns: 关联新 Run snapshot。
+    :raises HostApiError: handle 已关闭、源 Run 状态非法、幂等冲突或 policy limit
+        命中时抛出。
     """
 
     host._raise_if_closed()
-    _raise_unsupported_operation("retry_run")
+    try:
+        result = host._admission_service.retry_run(
+            run_id,
+            request,
+            caller_semantic_digest=_retry_run_public_semantic_digest(
+                run_id=run_id,
+                request=request,
+            ),
+        )
+    except HostDurableError as exc:
+        raise _host_api_error_from_durable_error(exc) from exc
+    return run_snapshot_from_row(result.run)
 
 
 def replay_run(
     host: HostCommandHandle, run_id: str, request: ReplayRunRequest
 ) -> RunSnapshot:
-    """稳定拒绝 Phase 4 尚未实现的 replay Run。
+    """对 SUCCEEDED 源 Run 创建 no-tool 结构修复 replay Run。
 
-    本函数不打开 transaction、不追加 EventLog、不写 idempotency record。
-
-    :param host: Host command handle；Phase 4 deferred 路径不读取该 handle。
+    :param host: Host command handle。
     :param run_id: 源 Run id。
     :param request: replay run 请求。
-    :returns: 当前阶段不会返回。
-    :raises HostApiError: 始终以 ``UNSUPPORTED_OPERATION`` 抛出。
+    :returns: 关联新 Run snapshot。
+    :raises HostApiError: handle 已关闭、源 Run 状态非法或幂等冲突时抛出。
     """
 
     host._raise_if_closed()
-    _raise_unsupported_operation("replay_run")
+    try:
+        result = host._admission_service.replay_run(
+            run_id,
+            request,
+            caller_semantic_digest=_replay_run_public_semantic_digest(
+                run_id=run_id,
+                request=request,
+            ),
+        )
+    except HostDurableError as exc:
+        raise _host_api_error_from_durable_error(exc) from exc
+    return run_snapshot_from_row(result.run)
 
 
 def resolve_wait(
@@ -908,6 +965,47 @@ def _cancel_session_runs_public_semantic_digest(
             "session_id": session_id,
             "reason": request.reason,
             "mode": request.mode.value,
+            "call_context_digest": _call_context_digest(request.context),
+        }
+    )
+
+
+def _retry_run_public_semantic_digest(
+    *, run_id: str, request: RetryRunRequest
+) -> str:
+    """计算 public retry_run facade semantic digest。
+
+    :param run_id: 源 Run id。
+    :param request: retry run 请求。
+    :returns: ``sha256:<hex>`` digest。
+    """
+
+    return sha256_digest_json(
+        {
+            "operation": _OPERATION_RETRY_RUN,
+            "source_run_id": run_id,
+            "reason": request.reason,
+            "call_context_digest": _call_context_digest(request.context),
+        }
+    )
+
+
+def _replay_run_public_semantic_digest(
+    *, run_id: str, request: ReplayRunRequest
+) -> str:
+    """计算 public replay_run facade semantic digest。
+
+    :param run_id: 源 Run id。
+    :param request: replay run 请求。
+    :returns: ``sha256:<hex>`` digest。
+    """
+
+    return sha256_digest_json(
+        {
+            "operation": _OPERATION_REPLAY_RUN,
+            "source_run_id": run_id,
+            "reason": request.reason,
+            "repair_instruction": request.repair_instruction,
             "call_context_digest": _call_context_digest(request.context),
         }
     )
