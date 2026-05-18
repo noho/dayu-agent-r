@@ -223,8 +223,8 @@ Phase Map 中每个 phase 必须使用统一条目格式。模板如下：
 约束：本节只保留当前 gate 结论；phase 过程流水必须归档到 `历史记录`，仍需追踪的风险或后续 owner 必须写入 `Open Questions 与风险追踪` 的 `追踪区`。
 
 当前 work unit：Phase 10. Context Governance / Compaction。
-当前 gate：Phase 10 aggregate deepreview。
-下一 gate：Phase 10 aggregate deepreview review / fix loop。
+当前 gate：ready-to-open-draft-PR。
+下一 gate：draft PR gate。
 
 ## Phase Map
 
@@ -1539,6 +1539,30 @@ P9.5 收口清单：
   aggregate review 若要求更高保真业务工具 E2E，应作为 Phase 10 aggregate fix item，而不是把 fake compactor 注入
   生产默认路径。
 
+#### Phase 10 Aggregate Deepreview 残余风险追踪
+
+背景决议：
+
+- Phase 10 aggregate deepreview artifacts 为
+  `docs/reviews/phase10-aggregate-deepreview-mimo-20260518.md` 与
+  `docs/reviews/phase10-aggregate-deepreview-ds-20260518.md`。AgentMiMo 与 AgentDS verdict 均为 PASS /
+  ready for draft PR。
+- Controller aggregate adjudication artifact 为
+  `docs/reviews/phase10-aggregate-deepreview-controller-adjudication-20260518.md`。
+
+追踪项：
+
+- DS AG1（LOW）：`EngineEventIngestor._close_attempt_for_context_recovery` DUPLICATE branch 未显式设置
+  `stop_worker_stream=True`；当前 scheduler 使用 `terminal_closeout or stop_worker_stream`，worker stream 仍会停止。
+  Owner: EngineEvent ingest hardening。
+- DS AG2（LOW）：reactive `CONTEXT_COMPACTION_REQUESTED` 当前在 closeout CAS 前追加。同一 SQLite write transaction
+  与前置 identity / terminal precondition 使正常路径安全；后续 defensive ordering cleanup 可将 request append 移到 closeout
+  成功后。Owner: EngineEvent ingest hardening。
+- DS AG3（LOW）：budget 压力下 pinned patch text 会降级为 opaque ref；Host truth 不受影响，但 LLM 可读性较弱。
+  Owner: Phase 13 memory diagnostic / retrieval owner。
+- DS INFO：accepted unique index 与 active unique index 部分重叠、`_cancel_queued` 等 helper 命名偏旧。Owner:
+  schema / admission cleanup owner。
+
 #### P9.5 Pre-P10 Cross-Repository Hardening PR 归属追踪
 
 背景决议：
@@ -2098,6 +2122,27 @@ P9.5 收口清单：
 - 当前无 PR review blocking fix。
 
 ## 历史记录
+
+### 2026-05-18 Phase 10 aggregate deepreview accepted
+
+Phase 10 aggregate deepreview 已完成。Aggregate review artifacts 为
+`docs/reviews/phase10-aggregate-deepreview-mimo-20260518.md` 与
+`docs/reviews/phase10-aggregate-deepreview-ds-20260518.md`。AgentMiMo verdict 为 PASS，明确 Phase 10 已可进入
+`ready-to-open-draft-PR`；AgentDS verdict 为 PASS / Ready for draft PR，提出 3 个 LOW 与若干 INFO / residual。
+
+Controller 裁决：AG1 / AG2 / AG3 均接受为 non-blocking residual，不作为 PR 前 fix。AG1 不影响当前 worker stream
+停止，因为 scheduler 同时检查 `terminal_closeout or stop_worker_stream`；AG2 是同事务 defensive ordering cleanup；
+AG3 是预算压力下的可读性降级，不影响 Host truth。Controller aggregate adjudication artifact 为
+`docs/reviews/phase10-aggregate-deepreview-controller-adjudication-20260518.md`。
+
+Phase 10 达成：Host-owned `ContextBudgetPolicy`、proactive pre-start compaction、reactive overflow recovery、
+canonical compact event / artifact、P9 memory projection consumption、RunInputBuilder compact / memory provider、
+production composition wiring，以及 multi-turn proactive compact -> memory projection -> subsequent Engine request
+aggregate validation。
+
+Validation：S6 后 controller focused validation 为 81 passed + 180 passed；`pyright` 0 errors / 0 warnings /
+0 informations；`git diff --check` clean。AgentMiMo aggregate review 另行复现 261 passed、pyright 0、diff check clean。
+当前 gate 进入 `ready-to-open-draft-PR`。Aggregate review commit 在本条记录提交后由 git commit 记录。
 
 ### 2026-05-18 Phase 10 S6 Production Composition / Multi-turn Integration accepted
 
