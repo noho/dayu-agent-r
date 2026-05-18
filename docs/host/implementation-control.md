@@ -223,8 +223,8 @@ Phase Map 中每个 phase 必须使用统一条目格式。模板如下：
 约束：本节只保留当前 gate 结论；phase 过程流水必须归档到 `历史记录`，仍需追踪的风险或后续 owner 必须写入 `Open Questions 与风险追踪` 的 `追踪区`。
 
 当前 work unit：Phase 10. Context Governance / Compaction。
-当前 gate：ready-to-open-draft-PR。
-下一 gate：draft PR gate。
+当前 gate：draft-PR-pass。
+下一 gate：用户手工 review / merge decision。
 
 ## Phase Map
 
@@ -2122,6 +2122,22 @@ P9.5 收口清单：
 - 当前无 PR review blocking fix。
 
 ## 历史记录
+
+### 2026-05-18 Phase 10 draft PR gate passed
+
+Phase 10 Context Governance / Compaction draft PR gate 已完成。Branch
+`feat/host-phase10-context-governance` 已 push 到 GitHub，draft PR 61 已创建：
+`https://github.com/noho/dayu-agent-r/pull/61`，title 为 `feat(host): add Phase 10 context governance`，head branch 为
+`feat/host-phase10-context-governance`，base branch 为 `main`。PR state 为 open draft；
+`mergeStateStatus=CLEAN`，`mergeable=MERGEABLE`。GitHub checks 当前返回 no checks reported on the branch。
+
+PR review artifacts 为 `docs/reviews/pr-61-review-phase10-mimo-20260518.md` 与
+`docs/reviews/pr-61-review-phase10-ds-20260518.md`；两份 review 均 PASS，0 blocking / high / medium finding。
+Controller PR review adjudication artifact 为 `docs/reviews/pr-61-review-controller-adjudication-20260518.md`。
+Accepted PR review commit 在本条记录提交后由 git commit 记录。PR gate validation 继承 aggregate gate：
+focused pytest 81 passed + 180 passed；`pyright` 0 errors / 0 warnings / 0 informations；`git diff --check`
+clean。当前 gate 为 `draft-PR-pass`。后续 merge、mark ready for review、request reviewers、approve、delete branch 或
+对外 comment 仍需用户额外授权。
 
 ### 2026-05-18 Phase 10 aggregate deepreview accepted
 
