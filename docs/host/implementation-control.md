@@ -2134,10 +2134,10 @@ Phase 10 Context Governance / Compaction draft PR gate 已完成。Branch
 PR review artifacts 为 `docs/reviews/pr-61-review-phase10-mimo-20260518.md` 与
 `docs/reviews/pr-61-review-phase10-ds-20260518.md`；两份 review 均 PASS，0 blocking / high / medium finding。
 Controller PR review adjudication artifact 为 `docs/reviews/pr-61-review-controller-adjudication-20260518.md`。
-Accepted PR review commit 在本条记录提交后由 git commit 记录。PR gate validation 继承 aggregate gate：
-focused pytest 81 passed + 180 passed；`pyright` 0 errors / 0 warnings / 0 informations；`git diff --check`
-clean。当前 gate 为 `draft-PR-pass`。后续 merge、mark ready for review、request reviewers、approve、delete branch 或
-对外 comment 仍需用户额外授权。
+Accepted PR review commit 为 `be03578`。PR body 已补充 PR-level review artifact 链接。PR gate validation 继承
+aggregate gate：focused pytest 81 passed + 180 passed；`pyright` 0 errors / 0 warnings / 0 informations；
+`git diff --check` clean。当前 gate 为 `draft-PR-pass`。后续 merge、mark ready for review、request reviewers、
+approve、delete branch 或对外 comment 仍需用户额外授权。
 
 ### 2026-05-18 Phase 10 aggregate deepreview accepted
 
