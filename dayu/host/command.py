@@ -9,7 +9,7 @@ supervisor，不实现 Engine dispatch、EventLog stream 或 purge。
 from __future__ import annotations
 
 import logging
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from typing import NoReturn
 from uuid import uuid4
 
@@ -35,6 +35,7 @@ from dayu.host.api import (
     HostCallContext,
     HostCommandHandleOptions,
     HostInput,
+    HostLocalExecutionOptions,
     OperationContext,
     PurgeSessionRequest,
     PurgeSessionResult,
@@ -47,6 +48,7 @@ from dayu.host.api import (
     StartRunRequest,
     SubmitFollowupRequest,
 )
+from dayu.host.context_policy import default_context_budget_policy
 from dayu.host.durable.codec import sha256_digest_json
 from dayu.host.durable.connection import (
     HostDurableStore,
@@ -267,6 +269,54 @@ def create_host_command_handle(
     except Exception:
         durable_store.close()
         raise
+
+
+def compose_host_local_execution_options(
+    options: HostCommandHandleOptions,
+) -> HostLocalExecutionOptions | None:
+    """从 command handle options 归一化本地执行配置。
+
+    本函数是 Host composition root 的 typed wiring 边界：Context Governance
+    budget policy 只从 ``HostCommandHandleOptions`` 的显式字段构造，不读取
+    Engine spec、per-run metadata、caller payload 或 provider overflow event。
+
+    :param options: Host command handle options。
+    :returns: 带 typed context budget policy 的本地执行配置；未配置本地执行时为
+        ``None``。
+    """
+
+    if options.local_execution is None:
+        return None
+    return replace(
+        options.local_execution,
+        context_budget_policy=default_context_budget_policy(
+            context_window_size=options.context_window_size,
+            reserved_output_tokens=options.reserved_output_tokens,
+            hard_threshold_tokens=options.context_budget_hard_threshold_tokens,
+            minimum_protection_tokens=_minimum_protection_tokens_from_options(
+                options
+            ),
+        ),
+        compact_artifact_root=options.artifact_root,
+        compact_artifact_create_parent_dirs=options.create_parent_dirs,
+    )
+
+
+def _minimum_protection_tokens_from_options(
+    options: HostCommandHandleOptions,
+) -> int:
+    """返回 command options 指定或默认的 minimum protection tokens。
+
+    :param options: Host command handle options。
+    :returns: minimum protection tokens。
+    """
+
+    if options.context_budget_minimum_protection_tokens is not None:
+        return options.context_budget_minimum_protection_tokens
+    return default_context_budget_policy(
+        context_window_size=options.context_window_size,
+        reserved_output_tokens=options.reserved_output_tokens,
+    ).minimum_protection_tokens
 
 
 def ensure_session(
@@ -1149,6 +1199,7 @@ __all__ = [
     "cancel_run",
     "cancel_session_runs",
     "close_session",
+    "compose_host_local_execution_options",
     "create_host_command_handle",
     "create_session",
     "ensure_session",

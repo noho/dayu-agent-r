@@ -127,6 +127,14 @@ class _RunRefs:
     dispatch_record_id: str
 
 
+@dataclass(frozen=True, slots=True)
+class _AcceptedPublicRun:
+    """public start_run 创建出的 pre-start Run 引用。"""
+
+    session_id: str
+    run_id: str
+
+
 class _NeverCancelledToken:
     """测试用未取消 token。"""
 
@@ -391,7 +399,7 @@ async def test_start_run_fake_worker_final_answer_succeeds(
         mode=_WORKER_MODE_FINAL,
     )
     try:
-        refs = _start_public_run(options.db_path, host, "start-final-answer")
+        accepted = _accept_public_run(host, "start-final-answer")
         with open_host_durable_store(_durable_options(tmp_path)) as store:
             scheduler = await _open_scheduler(
                 tmp_path,
@@ -399,7 +407,8 @@ async def test_start_run_fake_worker_final_answer_succeeds(
                 _SequencedLocalWorkerFactory((handle,)),
             )
             try:
-                scheduler.wake_dispatch(_pending_dispatch(refs))
+                scheduler.wake_queue_promotion(accepted.session_id)
+                refs = _refs(options.db_path, accepted.run_id)
                 drain = await scheduler.drain_once()
                 assert drain.dispatched == 1
                 await _wait_for_run_status(
@@ -427,7 +436,7 @@ async def test_start_run_fake_worker_run_failed_fails(tmp_path: Path) -> None:
         mode=_WORKER_MODE_FAILED,
     )
     try:
-        refs = _start_public_run(options.db_path, host, "start-run-failed")
+        accepted = _accept_public_run(host, "start-run-failed")
         with open_host_durable_store(_durable_options(tmp_path)) as store:
             scheduler = await _open_scheduler(
                 tmp_path,
@@ -435,7 +444,8 @@ async def test_start_run_fake_worker_run_failed_fails(tmp_path: Path) -> None:
                 _SequencedLocalWorkerFactory((handle,)),
             )
             try:
-                scheduler.wake_dispatch(_pending_dispatch(refs))
+                scheduler.wake_queue_promotion(accepted.session_id)
+                refs = _refs(options.db_path, accepted.run_id)
                 assert (await scheduler.drain_once()).dispatched == 1
                 await _wait_for_run_status(
                     options.db_path,
@@ -462,7 +472,7 @@ async def test_start_run_fake_worker_clean_eof_fails(tmp_path: Path) -> None:
         mode=_WORKER_MODE_EOF,
     )
     try:
-        refs = _start_public_run(options.db_path, host, "start-clean-eof")
+        accepted = _accept_public_run(host, "start-clean-eof")
         with open_host_durable_store(_durable_options(tmp_path)) as store:
             scheduler = await _open_scheduler(
                 tmp_path,
@@ -470,7 +480,8 @@ async def test_start_run_fake_worker_clean_eof_fails(tmp_path: Path) -> None:
                 _SequencedLocalWorkerFactory((handle,)),
             )
             try:
-                scheduler.wake_dispatch(_pending_dispatch(refs))
+                scheduler.wake_queue_promotion(accepted.session_id)
+                refs = _refs(options.db_path, accepted.run_id)
                 assert (await scheduler.drain_once()).dispatched == 1
                 await _wait_for_run_status(
                     options.db_path,
@@ -498,7 +509,7 @@ async def test_start_run_fake_worker_crash_loses(tmp_path: Path) -> None:
         mode=_WORKER_MODE_CRASH,
     )
     try:
-        refs = _start_public_run(options.db_path, host, "start-crash")
+        accepted = _accept_public_run(host, "start-crash")
         with open_host_durable_store(_durable_options(tmp_path)) as store:
             scheduler = await _open_scheduler(
                 tmp_path,
@@ -506,7 +517,8 @@ async def test_start_run_fake_worker_crash_loses(tmp_path: Path) -> None:
                 _SequencedLocalWorkerFactory((handle,)),
             )
             try:
-                scheduler.wake_dispatch(_pending_dispatch(refs))
+                scheduler.wake_queue_promotion(accepted.session_id)
+                refs = _refs(options.db_path, accepted.run_id)
                 assert (await scheduler.drain_once()).dispatched == 1
                 await _wait_for_run_status(
                     options.db_path,
@@ -535,7 +547,7 @@ async def test_cancel_active_fake_worker_closes_cancelled(tmp_path: Path) -> Non
         mode=_WORKER_MODE_CANCELLED,
     )
     try:
-        refs = _start_public_run(options.db_path, host, "start-cancel-active")
+        accepted = _accept_public_run(host, "start-cancel-active")
         with open_host_durable_store(_durable_options(tmp_path)) as store:
             scheduler = await _open_scheduler(
                 tmp_path,
@@ -544,7 +556,8 @@ async def test_cancel_active_fake_worker_closes_cancelled(tmp_path: Path) -> Non
                 active_registry=active_registry,
             )
             try:
-                scheduler.wake_dispatch(_pending_dispatch(refs))
+                scheduler.wake_queue_promotion(accepted.session_id)
+                refs = _refs(options.db_path, accepted.run_id)
                 assert (await scheduler.drain_once()).dispatched == 1
                 assert _attempt_status(options.db_path, refs.attempt_id) == (
                     AttemptStatus.RUNNING
@@ -598,7 +611,6 @@ async def test_queue_promotion_after_terminal_and_cancel_wakes_dispatch(
             terminal_host,
             _start_request(terminal_session_id, "start-terminal-queued"),
         )
-        terminal_refs = _refs(terminal_options.db_path, terminal_active.run_id)
         with open_host_durable_store(
             _durable_options(tmp_path / "terminal")
         ) as store:
@@ -610,7 +622,10 @@ async def test_queue_promotion_after_terminal_and_cancel_wakes_dispatch(
                 ),
             )
             try:
-                scheduler.wake_dispatch(_pending_dispatch(terminal_refs))
+                scheduler.wake_queue_promotion(terminal_session_id)
+                terminal_refs = _refs(
+                    terminal_options.db_path, terminal_active.run_id
+                )
                 assert (await scheduler.drain_once()).dispatched == 1
                 await _wait_for_run_status(
                     terminal_options.db_path,
@@ -648,7 +663,6 @@ async def test_queue_promotion_after_terminal_and_cancel_wakes_dispatch(
             cancel_host,
             _start_request(cancel_session_id, "start-cancel-queued"),
         )
-        cancel_refs = _refs(cancel_options.db_path, cancel_active.run_id)
         with open_host_durable_store(_durable_options(tmp_path / "cancel")) as store:
             scheduler = await _open_scheduler(
                 tmp_path / "cancel",
@@ -657,7 +671,8 @@ async def test_queue_promotion_after_terminal_and_cancel_wakes_dispatch(
                 active_registry=active_registry,
             )
             try:
-                scheduler.wake_dispatch(_pending_dispatch(cancel_refs))
+                scheduler.wake_queue_promotion(cancel_session_id)
+                cancel_refs = _refs(cancel_options.db_path, cancel_active.run_id)
                 assert (await scheduler.drain_once()).dispatched == 1
                 cancelling = cancel_run(
                     cancel_host,
@@ -1034,6 +1049,8 @@ def _command_options(tmp_path: Path) -> HostCommandHandleOptions:
         sqlite_write_retry_backoff_multiplier=1.2,
         sqlite_write_retry_max_delay_seconds=0.02,
         payload_inline_threshold_bytes=4096,
+        context_window_size=8192,
+        reserved_output_tokens=1024,
     )
 
 
@@ -1125,20 +1142,20 @@ def _runner_spec() -> RunnerSpec:
     )
 
 
-def _start_public_run(
-    db_path: Path, host: HostCommandHandle, client_request_id: str
-) -> _RunRefs:
-    """通过 public facade 创建 Run 并返回 durable refs。
+def _accept_public_run(
+    host: HostCommandHandle, client_request_id: str
+) -> _AcceptedPublicRun:
+    """通过 public facade 创建 ACCEPTED Run。
 
-    :param db_path: SQLite DB 路径。
     :param host: Host command handle。
     :param client_request_id: start_run 幂等 id。
-    :returns: Run durable refs。
+    :returns: accepted Run 引用。
     """
 
     session_id = _session_id(host)
     snapshot = start_run(host, _start_request(session_id, client_request_id))
-    return _refs(db_path, snapshot.run_id)
+    assert snapshot.status == RunStatus.ACCEPTED
+    return _AcceptedPublicRun(session_id=session_id, run_id=snapshot.run_id)
 
 
 def _session_id(host: HostCommandHandle) -> str:

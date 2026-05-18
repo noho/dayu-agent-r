@@ -55,6 +55,12 @@ from dayu.host.api import (
     WaitAdapterKey,
     WaitResolutionSource,
 )
+from dayu.host.context_events import (
+    CONTEXT_COMPACTED,
+    CONTEXT_COMPACTION_FAILED,
+    CONTEXT_COMPACTION_REQUESTED,
+)
+from dayu.host.context_policy import ContextBudgetPolicy, default_context_budget_policy
 from dayu.host.durable.codec import sha256_digest_json
 from dayu.host.durable.connection import open_host_durable_store
 from dayu.host.durable.event_log import (
@@ -91,6 +97,7 @@ from dayu.host.durable.state import (
     read_run_by_id,
 )
 from dayu.host.durable.transaction import HostTransaction, HostTransactionRunner
+from dayu.host.fake_compaction import FakeContextCompactor
 from dayu.host.wait_adapter import WaitAdapterBinding, WaitExternalJobRefSource
 from dayu.host.waiting import (
     DefaultHostResolveWaitService,
@@ -107,6 +114,7 @@ from dayu.host.engine_ingest import (
 
 _NOW = datetime(2026, 5, 15, 1, 2, 3, tzinfo=UTC)
 _CALL_CONTEXT_DIGEST = sha256_digest_json({"context": "engine-ingest-test"})
+_REACTIVE_POLICY_REF = "test-reactive-policy"
 
 
 @dataclass(frozen=True, slots=True)
@@ -158,15 +166,16 @@ class _WakeupSpy:
         """
 
         self.promoted_session_ids: list[str] = []
+        self.dispatches: list[PendingDispatchRecord] = []
 
     def wake_dispatch(self, record: PendingDispatchRecord) -> None:
-        """忽略 dispatch wakeup。
+        """记录 dispatch wakeup。
 
         :param record: pending dispatch record。
         :returns: ``None``。
         """
 
-        del record
+        self.dispatches.append(record)
 
     def wake_queue_promotion(self, session_id: str) -> None:
         """记录 queue promotion wakeup。
@@ -284,13 +293,14 @@ def test_run_failed_recoverable_true_is_diagnostic_then_failed(tmp_path: Path) -
         assert run_status == RunStatus.FAILED
 
 
-def test_context_compaction_requested_accepts_none_budget_and_fails(
+def test_context_compaction_requested_none_budget_uses_host_estimator_and_recovers(
     tmp_path: Path,
 ) -> None:
-    """context_compaction_requested 允许 budget_state=None 并按 unsupported recovery 失败收口。"""
+    """provider overflow budget_state=None 使用 Host estimator 并进入 recovery。"""
 
     with open_host_durable_store(_options(tmp_path)) as store:
         seeded = _seed_active_run(store.transaction_runner)
+        wakeup = _WakeupSpy()
         candidate = _candidate(
             seeded,
             worker_event_index=4,
@@ -304,14 +314,207 @@ def test_context_compaction_requested_accepts_none_budget_and_fails(
         )
 
         result = EngineEventIngestor(
-            transaction_runner=store.transaction_runner
+            transaction_runner=store.transaction_runner,
+            wakeup_port=wakeup,
+            context_budget_policy=_reactive_policy(),
+            context_compactor=FakeContextCompactor(),
+            compact_artifact_root=tmp_path / "compact-artifacts",
         ).ingest(candidate)
 
-        assert result.events[0].event_class == EventClass.DIAGNOSTIC
-        assert result.events[1].event_type == "ATTEMPT_FAILED"
-        assert _payload(result.events[0])["budget_state_present"] is False
-        run_status, _attempt_status = _statuses(store.transaction_runner, seeded)
+        assert result.terminal_closeout is False
+        assert result.stop_worker_stream is True
+        assert wakeup.promoted_session_ids == []
+        event_types = tuple(event.event_type for event in result.events)
+        assert event_types[:4] == (
+            CONTEXT_COMPACTION_REQUESTED,
+            "ATTEMPT_FAILED",
+            "RUN_RECOVERING",
+            CONTEXT_COMPACTED,
+        )
+        requested_payload = _payload(result.events[0])
+        assert requested_payload["trigger_source"] == "reactive"
+        assert requested_payload["provider_request_id"] is None
+        assert requested_payload["attempt_id"] == seeded.attempt_id
+        assert requested_payload["execution_id"] == seeded.execution_id
+        assert isinstance(requested_payload["estimator_digest"], str)
+        run_status, attempt_status = _statuses(store.transaction_runner, seeded)
+        assert run_status == RunStatus.RUNNING
+        assert attempt_status == AttemptStatus.FAILED
+        assert len(wakeup.dispatches) == 1
+        assert wakeup.dispatches[0].attempt_id != seeded.attempt_id
+        assert wakeup.dispatches[0].execution_id != seeded.execution_id
+
+
+def test_context_compaction_requested_stale_identity_is_rejected(
+    tmp_path: Path,
+) -> None:
+    """attempt_id + execution_id 不匹配时拒绝 reactive compact。"""
+
+    with open_host_durable_store(_options(tmp_path)) as store:
+        seeded = _seed_active_run(store.transaction_runner)
+        wrong_seeded = _SeededRun(
+            session_id=seeded.session_id,
+            run_id=seeded.run_id,
+            attempt_id=seeded.attempt_id,
+            execution_id="execution-other",
+            dispatch_record_id=seeded.dispatch_record_id,
+        )
+
+        result = EngineEventIngestor(
+            transaction_runner=store.transaction_runner,
+            context_budget_policy=_reactive_policy(),
+            context_compactor=FakeContextCompactor(),
+            compact_artifact_root=tmp_path / "compact-artifacts",
+        ).ingest(
+            _candidate(
+                wrong_seeded,
+                worker_event_index=41,
+                data=ContextCompactionRequestedData(
+                    iteration_id="iter-1",
+                    budget_state=None,
+                    reason="provider_overflow",
+                    provider_request_id="req-overflow",
+                ),
+                event_type=EngineEventType.CONTEXT_COMPACTION_REQUESTED,
+            )
+        )
+
+        assert result.status == EngineIngestStatus.REJECTED
+        assert _payload(result.events[0])["reason"] == "stale_execution_id"
+        assert _event_count(store.transaction_runner, CONTEXT_COMPACTION_REQUESTED) == 0
+        run_status, attempt_status = _statuses(store.transaction_runner, seeded)
+        assert run_status == RunStatus.RUNNING
+        assert attempt_status == AttemptStatus.RUNNING
+
+
+def test_reactive_compact_failure_fails_run_without_lost(tmp_path: Path) -> None:
+    """reactive compact failure 在旧 Attempt 关闭后 FAILED 收口，不进入 LOST。"""
+
+    with open_host_durable_store(_options(tmp_path)) as store:
+        seeded = _seed_active_run(store.transaction_runner)
+        result = EngineEventIngestor(
+            transaction_runner=store.transaction_runner,
+            context_budget_policy=_reactive_policy(),
+        ).ingest(
+            _context_compaction_candidate(seeded, worker_event_index=42)
+        )
+
+        assert tuple(event.event_type for event in result.events) == (
+            CONTEXT_COMPACTION_REQUESTED,
+            "ATTEMPT_FAILED",
+            "RUN_RECOVERING",
+            CONTEXT_COMPACTION_FAILED,
+            "RUN_FAILED",
+        )
+        run_status, attempt_status = _statuses(store.transaction_runner, seeded)
         assert run_status == RunStatus.FAILED
+        assert attempt_status == AttemptStatus.FAILED
+        assert _event_count(store.transaction_runner, "RUN_LOST") == 0
+        assert _attempt_count(store.transaction_runner, seeded.run_id) == 1
+
+
+def test_old_attempt_run_failed_after_recovery_is_stale_diagnostic(
+    tmp_path: Path,
+) -> None:
+    """recovery start 后旧 Attempt 的 recoverable run_failed 不创建第二个 Attempt。"""
+
+    with open_host_durable_store(_options(tmp_path)) as store:
+        seeded = _seed_active_run(store.transaction_runner)
+        ingestor = EngineEventIngestor(
+            transaction_runner=store.transaction_runner,
+            context_budget_policy=_reactive_policy(),
+            context_compactor=FakeContextCompactor(),
+            compact_artifact_root=tmp_path / "compact-artifacts",
+        )
+        first = ingestor.ingest(
+            _context_compaction_candidate(seeded, worker_event_index=43)
+        )
+        assert first.status == EngineIngestStatus.ACCEPTED
+
+        stale = ingestor.ingest(
+            _candidate(
+                seeded,
+                worker_event_index=44,
+                data=RunFailedData(
+                    error_code="context_compaction_required",
+                    message="provider closed old attempt",
+                    provider_request_id="req-overflow",
+                    recoverable=True,
+                ),
+                event_type=EngineEventType.RUN_FAILED,
+            )
+        )
+
+        assert stale.status == EngineIngestStatus.REJECTED
+        assert _payload(stale.events[0])["reason"] == "terminal_already_closed"
+        assert _attempt_count(store.transaction_runner, seeded.run_id) == 2
+        current_attempt = _current_attempt_id(store.transaction_runner, seeded.run_id)
+        assert current_attempt != seeded.attempt_id
+        assert _attempt_status(store.transaction_runner, current_attempt) == (
+            AttemptStatus.STARTING
+        )
+
+
+def test_reactive_compact_count_limit_fails_closed_without_second_attempt(
+    tmp_path: Path,
+) -> None:
+    """committed reactive request 数达到上限时失败收口且不创建 recovery Attempt。"""
+
+    with open_host_durable_store(_options(tmp_path)) as store:
+        seeded = _seed_active_run(store.transaction_runner)
+        _append_reactive_requested_fact(
+            store.transaction_runner,
+            seeded=seeded,
+            event_id="event-existing-reactive-request",
+            corrupted=False,
+        )
+
+        result = EngineEventIngestor(
+            transaction_runner=store.transaction_runner,
+            context_budget_policy=_reactive_policy(),
+            context_compactor=FakeContextCompactor(),
+            compact_artifact_root=tmp_path / "compact-artifacts",
+        ).ingest(_context_compaction_candidate(seeded, worker_event_index=45))
+
+        assert CONTEXT_COMPACTION_REQUESTED not in (
+            event.event_type for event in result.events
+        )
+        assert _attempt_count(store.transaction_runner, seeded.run_id) == 1
+        run_status, attempt_status = _statuses(store.transaction_runner, seeded)
+        assert run_status == RunStatus.FAILED
+        assert attempt_status == AttemptStatus.FAILED
+        failed = _latest_event(store.transaction_runner, CONTEXT_COMPACTION_FAILED)
+        assert _payload(failed)["failure_reason"] == "reactive_compact_limit_reached"
+
+
+def test_reactive_compact_corrupt_count_fact_fails_closed(
+    tmp_path: Path,
+) -> None:
+    """reactive compact count fact 损坏时 fail closed 且不创建第二个 Attempt。"""
+
+    with open_host_durable_store(_options(tmp_path)) as store:
+        seeded = _seed_active_run(store.transaction_runner)
+        _append_reactive_requested_fact(
+            store.transaction_runner,
+            seeded=seeded,
+            event_id="event-corrupt-reactive-request",
+            corrupted=True,
+        )
+
+        result = EngineEventIngestor(
+            transaction_runner=store.transaction_runner,
+            context_budget_policy=_reactive_policy(),
+            context_compactor=FakeContextCompactor(),
+            compact_artifact_root=tmp_path / "compact-artifacts",
+        ).ingest(_context_compaction_candidate(seeded, worker_event_index=46))
+
+        assert result.status == EngineIngestStatus.ACCEPTED
+        assert _attempt_count(store.transaction_runner, seeded.run_id) == 1
+        run_status, attempt_status = _statuses(store.transaction_runner, seeded)
+        assert run_status == RunStatus.FAILED
+        assert attempt_status == AttemptStatus.FAILED
+        failed = _latest_event(store.transaction_runner, CONTEXT_COMPACTION_FAILED)
+        assert _payload(failed)["failure_reason"] == "reactive_compact_count_unreadable"
 
 
 def test_run_suspended_only_writes_diagnostic_and_duplicate_is_idempotent(
@@ -644,7 +847,10 @@ def test_usage_reported_is_projection_signal_without_state_change(
 
         assert result.events[0].event_class == EventClass.PROJECTION_SIGNAL
         assert result.events[0].event_type == "USAGE_REPORTED"
-        assert _payload(result.events[0])["total_tokens"] == 30
+        payload = _payload(result.events[0])
+        assert payload["total_tokens"] == 30
+        assert "policy_ref" not in payload
+        assert "estimator_digest" not in payload
         run_status, attempt_status = _statuses(store.transaction_runner, seeded)
         assert run_status == RunStatus.RUNNING
         assert attempt_status == AttemptStatus.RUNNING
@@ -1318,6 +1524,29 @@ def _candidate(
     )
 
 
+def _context_compaction_candidate(
+    seeded: _SeededRun, *, worker_event_index: int
+) -> EngineEventCandidate:
+    """构造 reactive context compaction EngineEvent candidate。
+
+    :param seeded: seeded run。
+    :param worker_event_index: worker event index。
+    :returns: EngineEvent candidate。
+    """
+
+    return _candidate(
+        seeded,
+        worker_event_index=worker_event_index,
+        data=ContextCompactionRequestedData(
+            iteration_id="iter-1",
+            budget_state=None,
+            reason="provider_overflow",
+            provider_request_id="req-overflow",
+        ),
+        event_type=EngineEventType.CONTEXT_COMPACTION_REQUESTED,
+    )
+
+
 def _envelope(seeded: _SeededRun) -> LocalEngineEnvelope:
     """构造测试用 LocalEngineEnvelope。
 
@@ -1335,6 +1564,22 @@ def _envelope(seeded: _SeededRun) -> LocalEngineEnvelope:
         execution_target="target-ingest",
         local_worker_id="local-worker-ingest",
         cancellation_token=_NeverCancelledToken(),
+    )
+
+
+def _reactive_policy() -> ContextBudgetPolicy:
+    """构造测试 reactive context budget policy。
+
+    :returns: Context budget policy。
+    """
+
+    return default_context_budget_policy(
+        context_window_size=100,
+        reserved_output_tokens=10,
+        hard_threshold_tokens=80,
+        safety_margin_ratio=0.5,
+        minimum_protection_tokens=1,
+        policy_ref=_REACTIVE_POLICY_REF,
     )
 
 
@@ -1540,6 +1785,144 @@ def _event_count(transaction_runner: HostTransactionRunner, event_type: str) -> 
         )
 
     return transaction_runner.run_read(_operation)
+
+
+def _attempt_count(transaction_runner: HostTransactionRunner, run_id: str) -> int:
+    """统计 Run 下 Attempt row 数。
+
+    :param transaction_runner: Host transaction runner。
+    :param run_id: Run id。
+    :returns: Attempt 数量。
+    """
+
+    def _operation(transaction: HostTransaction) -> int:
+        row = transaction.fetchone(
+            "SELECT COUNT(*) AS count FROM host_attempts WHERE run_id = ?",
+            (run_id,),
+        )
+        assert row is not None
+        value = row.get("count")
+        assert isinstance(value, int)
+        return value
+
+    return transaction_runner.run_read(_operation)
+
+
+def _current_attempt_id(
+    transaction_runner: HostTransactionRunner, run_id: str
+) -> str:
+    """读取 Run 当前 Attempt id。
+
+    :param transaction_runner: Host transaction runner。
+    :param run_id: Run id。
+    :returns: current Attempt id。
+    """
+
+    def _operation(transaction: HostTransaction) -> str:
+        run = read_run_by_id(transaction, run_id)
+        assert run is not None
+        assert run.current_attempt_id is not None
+        return run.current_attempt_id
+
+    return transaction_runner.run_read(_operation)
+
+
+def _attempt_status(
+    transaction_runner: HostTransactionRunner, attempt_id: str
+) -> AttemptStatus:
+    """读取 Attempt 状态。
+
+    :param transaction_runner: Host transaction runner。
+    :param attempt_id: Attempt id。
+    :returns: Attempt 状态。
+    """
+
+    def _operation(transaction: HostTransaction) -> AttemptStatus:
+        attempt = read_attempt_by_id(transaction, attempt_id)
+        assert attempt is not None
+        return attempt.status
+
+    return transaction_runner.run_read(_operation)
+
+
+def _latest_event(
+    transaction_runner: HostTransactionRunner, event_type: str
+) -> EventLogRow:
+    """读取最近一条指定类型事件。
+
+    :param transaction_runner: Host transaction runner。
+    :param event_type: event type。
+    :returns: EventLog row。
+    """
+
+    def _operation(transaction: HostTransaction) -> EventLogRow:
+        rows = EventLogStore().read_events_after(transaction, 0, limit=200)
+        for row in reversed(rows):
+            if row.event_type == event_type:
+                return row
+        raise AssertionError(f"missing event type {event_type}")
+
+    return transaction_runner.run_read(_operation)
+
+
+def _append_reactive_requested_fact(
+    transaction_runner: HostTransactionRunner,
+    *,
+    seeded: _SeededRun,
+    event_id: str,
+    corrupted: bool,
+) -> None:
+    """追加测试用 reactive compact request fact。
+
+    :param transaction_runner: Host transaction runner。
+    :param seeded: seeded run。
+    :param event_id: event id。
+    :param corrupted: 是否写入损坏 payload。
+    :returns: ``None``。
+    """
+
+    payload: Mapping[str, JsonValue]
+    if corrupted:
+        payload = {"trigger_source": 7}
+    else:
+        payload = {
+            "trigger_source": "reactive",
+            "budget_reason": "provider_overflow",
+            "budget_snapshot_ref": _CALL_CONTEXT_DIGEST,
+            "input_snapshot_cursor": 1,
+            "estimator_digest": _CALL_CONTEXT_DIGEST,
+            "policy_ref": _REACTIVE_POLICY_REF,
+            "provider_request_id": "req-existing",
+            "provider_error_ref": "engine:existing",
+            "attempt_id": seeded.attempt_id,
+            "execution_id": seeded.execution_id,
+        }
+
+    def _operation(transaction: HostTransaction) -> None:
+        EventLogStore().append_event(
+            transaction,
+            EventLogAppendRequest(
+                event_id=event_id,
+                event_class=EventClass.CANONICAL_FACT,
+                session_id=seeded.session_id,
+                run_id=seeded.run_id,
+                attempt_id=seeded.attempt_id,
+                execution_id=seeded.execution_id,
+                event_type=CONTEXT_COMPACTION_REQUESTED,
+                occurred_at=_NOW,
+                actor="tester",
+                source="pytest",
+                client_request_id=None,
+                idempotency_key=None,
+                policy_decision=None,
+                reason=None,
+                payload_json=payload,
+                payload_ref=None,
+                payload_digest=None,
+            ),
+        )
+
+    transaction_runner.run_write(_operation)
 
 
 def _canonical_tool_event_count(transaction_runner: HostTransactionRunner) -> int:

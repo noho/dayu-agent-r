@@ -34,6 +34,8 @@ from dayu.host.durable.codec import format_utc_timestamp, sha256_digest_json
 from dayu.host.durable.event_log import (
     EventClass,
     EventLogAppendRequest,
+    EventLogRow,
+    EventPayloadTextEqualsFilter,
     EventLogStore,
 )
 from dayu.host.durable.errors import HostTransactionRetryExhaustedError
@@ -42,7 +44,11 @@ from dayu.host.durable.liveness import (
     register_current_instance,
 )
 from dayu.host.durable.run_transition import (
+    FailUnstartedRunInput,
+    StartGovernedRunInput,
     TerminalCloseoutInput,
+    fail_unstarted_run_in_transaction,
+    start_governed_run_with_starting_attempt_in_transaction,
     terminal_closeout_in_transaction,
 )
 from dayu.host.durable.state import (
@@ -50,6 +56,7 @@ from dayu.host.durable.state import (
     DispatchRecordRow,
     DispatchRecordStatus,
     RunRow,
+    RunStartReason,
     StateMutationStatus,
     WorkerKind,
     cancel_starting_dispatch_record_row,
@@ -57,9 +64,12 @@ from dayu.host.durable.state import (
     mark_dispatch_waiting_for_lane_row,
     mark_dispatch_worker_accepted_row,
     mark_dispatching_after_lane_row,
+    read_active_run_for_session,
+    read_accepted_run_for_session,
     read_attempt_by_id,
     read_dispatch_record_by_id,
     read_dispatch_record_by_attempt_id,
+    read_earliest_queued_run,
     read_run_by_id,
 )
 from dayu.host.durable.transaction import HostTransaction, HostTransactionRunner
@@ -75,6 +85,7 @@ from dayu.host.projection import (
     catch_up_projection_best_effort,
 )
 from dayu.host.run_input import (
+    DurableCompactArtifactProvider,
     DurableMemorySnapshotProvider,
     MemoryProjectionRepairRequired,
     PolicySnapshot,
@@ -83,6 +94,34 @@ from dayu.host.run_input import (
     create_tool_enabled_run_input_builder,
 )
 from dayu.host.memory_repair import catch_up_conversation_memory_projection
+from dayu.host._event_payload import payload_object as _payload_object
+from dayu.host.compact_artifact import (
+    CompactArtifactStore,
+    CompactArtifactWriteRequest,
+)
+from dayu.host.compaction import (
+    CompactionRequest,
+    CurrentMessageSummary,
+)
+from dayu.host.context_budget import (
+    BudgetEstimate,
+    BudgetEstimateInput,
+    BudgetTextFragment,
+    ContextBudgetDecision,
+    decide_context_budget,
+    estimate_context_budget,
+)
+from dayu.host.context_events import (
+    CONTEXT_COMPACTED,
+    CONTEXT_COMPACTION_FAILED,
+    CONTEXT_COMPACTION_REQUESTED,
+    build_context_compacted_payload,
+    build_context_compaction_failed_payload,
+    build_context_compaction_requested_payload,
+)
+from dayu.host.context_governance import check_compaction_candidate
+from dayu.host.context_policy import ContextCompactionTriggerSource
+from dayu.host.durable.artifact import LocalArtifactStore
 from dayu.host.tool_runtime import (
     DefaultHostToolFactAcceptPort,
     DefaultToolRuntimeFactory,
@@ -114,7 +153,12 @@ _LOCAL_POLICY_SNAPSHOT_REF = "host-local-no-tool-policy"
 _EVENT_ID_ATTEMPT_RUNNING_PREFIX = "event-attempt-running"
 _EVENT_ID_ATTEMPT_FAILED_PREFIX = "event-attempt-failed"
 _EVENT_ID_RUN_FAILED_PREFIX = "event-run-failed"
+_EVENT_ID_CONTEXT_COMPACTION_REQUESTED_PREFIX = "event-context-compact-requested"
+_EVENT_ID_CONTEXT_COMPACTED_PREFIX = "event-context-compacted"
 _LANE_OWNER_PREFIX = "host-dispatch"
+_GOVERNANCE_ACTOR = "host.context_governance"
+_GOVERNANCE_FAILURE_REASON = "pre_dispatch_context_governance"
+_COMPACT_FAILURE_POLICY_DECISION = "compact_failed_before_dispatch"
 _LOG_DRAIN_LOOP_EMPTY_SLEEPING = (
     "dispatch drain loop empty queue; sleeping host_handle_id=%s interval_seconds=%s"
 )
@@ -162,6 +206,34 @@ class ActiveCancelMessage:
     attempt_id: str
     execution_id: str
     reason: str
+
+
+@dataclass(frozen=True, slots=True)
+class _GovernanceCompactAccepted:
+    """pre-start compact accepted 后待启动摘要。
+
+    :param run_id: 目标 Run id。
+    :param session_id: Session id。
+    :param expected_status: compact 前 Run 源状态。
+    :param compacted_event_sequence: ``CONTEXT_COMPACTED`` event sequence。
+    """
+
+    run_id: str
+    session_id: str
+    expected_status: RunStatus
+    compacted_event_sequence: int
+
+
+@dataclass(frozen=True, slots=True)
+class _GovernanceStageResult:
+    """pre-start governance 阶段结果。
+
+    :param pending_dispatch: 已直接启动时的 pending dispatch。
+    :param compact_accepted: compact accepted 但尚未 memory catch-up/start 的摘要。
+    """
+
+    pending_dispatch: PendingDispatchRecord | None
+    compact_accepted: _GovernanceCompactAccepted | None
 
 
 @dataclass(frozen=True, slots=True)
@@ -440,11 +512,538 @@ class HostDispatchScheduler:
         if self._closed:
             raise RuntimeError("HostDispatchScheduler is closed")
         catch_up_projection_best_effort(self._projection_catchup_port)
-        create_host_admission_service(
-            self._transaction_runner,
-            wakeup_port=self,
-            projection_catchup_port=self._projection_catchup_port,
-        ).promote_next_queued_run(session_id)
+        stage = self._run_pre_start_governance(session_id)
+        pending_dispatch = stage.pending_dispatch
+        if stage.compact_accepted is not None:
+            catch_up_conversation_memory_projection(
+                self._transaction_runner,
+                policy=self._local_execution.memory_projection_policy,
+                batch_size=(
+                    self._local_execution.memory_projection_catchup_batch_size
+                ),
+                max_event_sequence=stage.compact_accepted.compacted_event_sequence,
+            )
+            pending_dispatch = self._start_governed_after_compact(
+                stage.compact_accepted
+            )
+        if pending_dispatch is not None:
+            self.wake_dispatch(pending_dispatch)
+
+    def _run_pre_start_governance(self, session_id: str) -> _GovernanceStageResult:
+        """执行一次 pre-start Context Governance。
+
+        :param session_id: 目标 Session id。
+        :returns: governance 阶段结果。
+        """
+
+        def _operation(transaction: HostTransaction) -> _GovernanceStageResult:
+            run = _read_startable_run(transaction, session_id)
+            if run is None:
+                return _GovernanceStageResult(
+                    pending_dispatch=None, compact_accepted=None
+                )
+            policy = self._local_execution.context_budget_policy
+            if policy is None:
+                return _GovernanceStageResult(
+                    pending_dispatch=self._start_governed_in_transaction(
+                        transaction, run
+                    ),
+                    compact_accepted=None,
+                )
+            input_event = self._event_log_store.read_event_by_id(
+                transaction, run.input_event_id
+            )
+            if input_event is None:
+                return _GovernanceStageResult(
+                    pending_dispatch=self._fail_unstarted_in_transaction(
+                        transaction,
+                        run,
+                        reason="input_event_missing",
+                        error_code="context_governance_input_missing",
+                        message="Input event is missing before dispatch",
+                    ),
+                    compact_accepted=None,
+                )
+            display_text = _display_text_from_input_event(input_event)
+            estimate = estimate_context_budget(
+                policy,
+                BudgetEstimateInput(
+                    session_id=run.session_id,
+                    run_id=run.run_id,
+                    message_fragments=(
+                        BudgetTextFragment(
+                            fragment_ref=run.input_event_id,
+                            text=display_text,
+                        ),
+                    ),
+                    current_prompt_ref=run.input_event_id,
+                ),
+            )
+            decision = decide_context_budget(estimate)
+            if decision is ContextBudgetDecision.ALLOW_DISPATCH:
+                return _GovernanceStageResult(
+                    pending_dispatch=self._start_governed_in_transaction(
+                        transaction, run
+                    ),
+                    compact_accepted=None,
+                )
+            if decision is ContextBudgetDecision.BLOCK_HARD_THRESHOLD:
+                self._append_compaction_failed_event(
+                    transaction,
+                    run=run,
+                    estimate=estimate,
+                    decision=decision,
+                    failure_reason="hard_threshold_before_dispatch",
+                )
+                return _GovernanceStageResult(
+                    pending_dispatch=self._fail_unstarted_in_transaction(
+                        transaction,
+                        run,
+                        reason=_GOVERNANCE_FAILURE_REASON,
+                        error_code="context_hard_threshold_before_dispatch",
+                        message="Context estimate exceeds hard threshold before dispatch",
+                    ),
+                    compact_accepted=None,
+                )
+            try:
+                compact_count = self._committed_proactive_compact_count(
+                    transaction, run
+                )
+            except Exception:
+                self._append_compaction_failed_event(
+                    transaction,
+                    run=run,
+                    estimate=estimate,
+                    decision=decision,
+                    failure_reason="proactive_compact_count_unreadable",
+                )
+                return _GovernanceStageResult(
+                    pending_dispatch=self._fail_unstarted_in_transaction(
+                        transaction,
+                        run,
+                        reason=_GOVERNANCE_FAILURE_REASON,
+                        error_code="proactive_compact_count_unreadable",
+                        message="Committed proactive compact facts are unreadable",
+                    ),
+                    compact_accepted=None,
+                )
+            if compact_count >= policy.max_proactive_compactions_per_run:
+                self._append_compaction_failed_event(
+                    transaction,
+                    run=run,
+                    estimate=estimate,
+                    decision=decision,
+                    failure_reason="proactive_compact_limit_reached",
+                )
+                return _GovernanceStageResult(
+                    pending_dispatch=self._fail_unstarted_in_transaction(
+                        transaction,
+                        run,
+                        reason=_GOVERNANCE_FAILURE_REASON,
+                        error_code="proactive_compact_limit_reached",
+                        message="Run already used its proactive compaction budget",
+                    ),
+                    compact_accepted=None,
+                )
+            compacted_sequence = self._compact_before_dispatch(
+                transaction,
+                run=run,
+                display_text=display_text,
+                estimate=estimate,
+                decision=decision,
+            )
+            if compacted_sequence is None:
+                return _GovernanceStageResult(
+                    pending_dispatch=None, compact_accepted=None
+                )
+            return _GovernanceStageResult(
+                pending_dispatch=None,
+                compact_accepted=_GovernanceCompactAccepted(
+                    run_id=run.run_id,
+                    session_id=run.session_id,
+                    expected_status=run.status,
+                    compacted_event_sequence=compacted_sequence,
+                ),
+            )
+
+        return self._transaction_runner.run_write(_operation)
+
+    def _start_governed_after_compact(
+        self, accepted: _GovernanceCompactAccepted
+    ) -> PendingDispatchRecord | None:
+        """compact catch-up 后启动同一个未启动 Run。
+
+        :param accepted: compact accepted 摘要。
+        :returns: pending dispatch 摘要；状态已变化时返回 ``None``。
+        """
+
+        def _operation(transaction: HostTransaction) -> PendingDispatchRecord | None:
+            run = read_run_by_id(transaction, accepted.run_id)
+            if run is None or run.status != accepted.expected_status:
+                return None
+            return self._start_governed_in_transaction(transaction, run)
+
+        return self._transaction_runner.run_write(_operation)
+
+    def _start_governed_in_transaction(
+        self, transaction: HostTransaction, run: RunRow
+    ) -> PendingDispatchRecord | None:
+        """在当前事务内启动 accepted/queued Run。
+
+        :param transaction: 当前 Host transaction。
+        :param run: 待启动 Run。
+        :returns: pending dispatch 摘要；CAS 失败时返回 ``None``。
+        """
+
+        result = start_governed_run_with_starting_attempt_in_transaction(
+            transaction,
+            self._event_log_store,
+            StartGovernedRunInput(
+                run_id=run.run_id,
+                expected_status=run.status,
+                run_started_event_id=_new_event_id("event-run-started"),
+                attempt_started_event_id=_new_event_id("event-attempt-started"),
+                attempt_id=_new_event_id("attempt"),
+                execution_id=_new_event_id("execution"),
+                dispatch_record_id=_new_event_id("dispatch"),
+                occurred_at=datetime.now(UTC),
+                actor=_EVENT_ACTOR,
+                source=_EVENT_SOURCE,
+                start_reason=(
+                    RunStartReason.INITIAL
+                    if run.status is RunStatus.ACCEPTED
+                    else RunStartReason.QUEUE_PROMOTION
+                ),
+                worker_kind=WorkerKind.LOCAL,
+                owner_host_instance_id=None,
+            ),
+        )
+        if result.status != StateMutationStatus.UPDATED:
+            return None
+        if result.dispatch_record is None:
+            return None
+        return PendingDispatchRecord(
+            dispatch_record_id=result.dispatch_record.dispatch_record_id,
+            run_id=result.dispatch_record.run_id,
+            attempt_id=result.dispatch_record.attempt_id,
+            execution_id=result.dispatch_record.execution_id,
+            execution_target=result.dispatch_record.execution_target,
+            worker_kind=result.dispatch_record.worker_kind,
+        )
+
+    def _fail_unstarted_in_transaction(
+        self,
+        transaction: HostTransaction,
+        run: RunRow,
+        *,
+        reason: str,
+        error_code: str,
+        message: str,
+    ) -> None:
+        """在当前事务内 attempt-free 失败收口 Run。
+
+        :param transaction: 当前 Host transaction。
+        :param run: 待收口 Run。
+        :param reason: 失败原因。
+        :param error_code: 错误码。
+        :param message: 失败消息。
+        :returns: ``None``。
+        """
+
+        fail_unstarted_run_in_transaction(
+            transaction,
+            self._event_log_store,
+            FailUnstartedRunInput(
+                run_id=run.run_id,
+                expected_status=run.status,
+                run_failed_event_id=_new_event_id(_EVENT_ID_RUN_FAILED_PREFIX),
+                occurred_at=datetime.now(UTC),
+                actor=_GOVERNANCE_ACTOR,
+                source=_EVENT_SOURCE,
+                reason=reason,
+                error_code=error_code,
+                message=message,
+            ),
+        )
+
+    def _committed_proactive_compact_count(
+        self, transaction: HostTransaction, run: RunRow
+    ) -> int:
+        """读取 durable EventLog 中本 Run proactive compact 请求数。
+
+        :param transaction: 当前 Host transaction。
+        :param run: 目标 Run。
+        :returns: committed proactive request 数。
+        """
+
+        return self._event_log_store.count_committed_events_by_run_and_type(
+            transaction,
+            run_id=run.run_id,
+            event_type=CONTEXT_COMPACTION_REQUESTED,
+            payload_filter=EventPayloadTextEqualsFilter(
+                field_name="trigger_source",
+                expected_value=ContextCompactionTriggerSource.PROACTIVE.value,
+                allowed_values=(
+                    ContextCompactionTriggerSource.PROACTIVE.value,
+                    ContextCompactionTriggerSource.REACTIVE.value,
+                ),
+            ),
+        )
+
+    def _compact_before_dispatch(
+        self,
+        transaction: HostTransaction,
+        *,
+        run: RunRow,
+        display_text: str,
+        estimate: BudgetEstimate,
+        decision: ContextBudgetDecision,
+    ) -> int | None:
+        """在当前事务内执行一次 proactive compact。
+
+        :param transaction: 当前 Host transaction。
+        :param run: 待 compact Run。
+        :param display_text: 当前输入展示文本。
+        :param estimate: compact 前预算估算。
+        :param decision: 触发 compact 的预算决策。
+        :returns: ``CONTEXT_COMPACTED`` sequence；失败路径返回 ``None``。
+        """
+
+        compactor = self._local_execution.context_compactor
+        artifact_root = self._local_execution.compact_artifact_root
+        self._append_compaction_requested_event(
+            transaction,
+            run=run,
+            estimate=estimate,
+            decision=decision,
+        )
+        if compactor is None or artifact_root is None:
+            self._append_compaction_failed_event(
+                transaction,
+                run=run,
+                estimate=estimate,
+                decision=decision,
+                failure_reason="compactor_or_artifact_store_missing",
+            )
+            self._fail_unstarted_in_transaction(
+                transaction,
+                run,
+                reason=_GOVERNANCE_FAILURE_REASON,
+                error_code="context_compactor_missing",
+                message="Context compactor or artifact store is not configured",
+            )
+            return None
+        request = CompactionRequest(
+            trigger_source=ContextCompactionTriggerSource.PROACTIVE,
+            session_id=run.session_id,
+            run_id=run.run_id,
+            attempt_id=None,
+            execution_id=None,
+            input_event_refs=(run.input_event_id,),
+            memory_snapshot_cursor=None,
+            current_message_summary=CurrentMessageSummary(
+                current_user_input_ref=run.input_event_id,
+                summary_text=display_text,
+                source_event_refs=(run.input_event_id,),
+            ),
+            tool_fact_refs=(),
+            verified_fact_refs=(),
+            recent_raw_turn_refs=(run.input_event_id,),
+            older_raw_turn_refs=(),
+            existing_episode_summary_refs=(),
+            budget_before_compact=estimate,
+        )
+        candidate = compactor.compact(request)
+        quality = check_compaction_candidate(request, candidate)
+        if not quality.accepted:
+            self._append_compaction_failed_event(
+                transaction,
+                run=run,
+                estimate=estimate,
+                decision=decision,
+                failure_reason="quality_check_rejected",
+                budget_after_attempted_compact=candidate.budget_after_compact,
+            )
+            self._fail_unstarted_in_transaction(
+                transaction,
+                run,
+                reason=_GOVERNANCE_FAILURE_REASON,
+                error_code="context_compaction_quality_rejected",
+                message="Context compaction candidate failed Host quality check",
+            )
+            return None
+        if candidate.budget_after_compact >= estimate.hard_threshold_tokens:
+            self._append_compaction_failed_event(
+                transaction,
+                run=run,
+                estimate=estimate,
+                decision=decision,
+                failure_reason="hard_threshold_after_compact",
+                budget_after_attempted_compact=candidate.budget_after_compact,
+            )
+            self._fail_unstarted_in_transaction(
+                transaction,
+                run,
+                reason=_GOVERNANCE_FAILURE_REASON,
+                error_code="context_hard_threshold_after_compact",
+                message="Context still exceeds hard threshold after compaction",
+            )
+            return None
+        artifact = CompactArtifactStore(
+            LocalArtifactStore(
+                artifact_root,
+                create_artifact_root=(
+                    self._local_execution.compact_artifact_create_parent_dirs
+                ),
+            )
+        ).write_compact_artifact(
+            transaction,
+            CompactArtifactWriteRequest(
+                compaction_request=request,
+                accepted_candidate=candidate,
+                quality_result=quality,
+                policy_digest=sha256_digest_json(
+                    {
+                        "policy_ref": self._local_execution.context_budget_policy.policy_ref
+                        if self._local_execution.context_budget_policy is not None
+                        else "none"
+                    }
+                ),
+            ),
+        )
+        event = self._event_log_store.append_event(
+            transaction,
+            EventLogAppendRequest(
+                event_id=_new_event_id(_EVENT_ID_CONTEXT_COMPACTED_PREFIX),
+                event_class=EventClass.CANONICAL_FACT,
+                session_id=run.session_id,
+                run_id=run.run_id,
+                attempt_id=None,
+                execution_id=None,
+                event_type=CONTEXT_COMPACTED,
+                occurred_at=datetime.now(UTC),
+                actor=_GOVERNANCE_ACTOR,
+                source=_EVENT_SOURCE,
+                client_request_id=None,
+                idempotency_key=None,
+                policy_decision=None,
+                reason={"decision": decision.value},
+                payload_json=build_context_compacted_payload(
+                    compact_artifact_ref=artifact.payload_descriptor.payload_ref,
+                    compact_artifact_digest=artifact.artifact_ref.artifact_digest,
+                    accepted_candidate=candidate,
+                    quality_check_result=quality,
+                ),
+                payload_ref=None,
+                payload_digest=None,
+            ),
+        ).row
+        return event.event_sequence
+
+    def _append_compaction_requested_event(
+        self,
+        transaction: HostTransaction,
+        *,
+        run: RunRow,
+        estimate: BudgetEstimate,
+        decision: ContextBudgetDecision,
+    ) -> None:
+        """追加 proactive ``CONTEXT_COMPACTION_REQUESTED``。
+
+        :param transaction: 当前 Host transaction。
+        :param run: 目标 Run。
+        :param estimate: budget estimate。
+        :param decision: budget decision。
+        :returns: ``None``。
+        """
+
+        self._event_log_store.append_event(
+            transaction,
+            EventLogAppendRequest(
+                event_id=_new_event_id(_EVENT_ID_CONTEXT_COMPACTION_REQUESTED_PREFIX),
+                event_class=EventClass.CANONICAL_FACT,
+                session_id=run.session_id,
+                run_id=run.run_id,
+                attempt_id=None,
+                execution_id=None,
+                event_type=CONTEXT_COMPACTION_REQUESTED,
+                occurred_at=datetime.now(UTC),
+                actor=_GOVERNANCE_ACTOR,
+                source=_EVENT_SOURCE,
+                client_request_id=None,
+                idempotency_key=None,
+                policy_decision=None,
+                reason={"decision": decision.value},
+                payload_json=build_context_compaction_requested_payload(
+                    trigger_source=ContextCompactionTriggerSource.PROACTIVE,
+                    budget_reason=decision.value,
+                    budget_snapshot_ref=estimate.estimator_digest,
+                    input_snapshot_cursor=run.input_event_sequence,
+                    estimator_digest=estimate.estimator_digest,
+                    policy_ref=self._local_execution.context_budget_policy.policy_ref
+                    if self._local_execution.context_budget_policy is not None
+                    else "none",
+                    provider_request_id=None,
+                    provider_error_ref=None,
+                    attempt_id=None,
+                    execution_id=None,
+                ),
+                payload_ref=None,
+                payload_digest=None,
+            ),
+        )
+
+    def _append_compaction_failed_event(
+        self,
+        transaction: HostTransaction,
+        *,
+        run: RunRow,
+        estimate: BudgetEstimate,
+        decision: ContextBudgetDecision,
+        failure_reason: str,
+        budget_after_attempted_compact: int | None = None,
+    ) -> None:
+        """追加 ``CONTEXT_COMPACTION_FAILED``。
+
+        :param transaction: 当前 Host transaction。
+        :param run: 目标 Run。
+        :param estimate: budget estimate。
+        :param decision: budget decision。
+        :param failure_reason: compact failure reason。
+        :param budget_after_attempted_compact: compact 后预算；未执行时为 ``None``。
+        :returns: ``None``。
+        """
+
+        self._event_log_store.append_event(
+            transaction,
+            EventLogAppendRequest(
+                event_id=_new_event_id("event-context-compaction-failed"),
+                event_class=EventClass.CANONICAL_FACT,
+                session_id=run.session_id,
+                run_id=run.run_id,
+                attempt_id=None,
+                execution_id=None,
+                event_type=CONTEXT_COMPACTION_FAILED,
+                occurred_at=datetime.now(UTC),
+                actor=_GOVERNANCE_ACTOR,
+                source=_EVENT_SOURCE,
+                client_request_id=None,
+                idempotency_key=None,
+                policy_decision=None,
+                reason={"failure_reason": failure_reason},
+                payload_json=build_context_compaction_failed_payload(
+                    failure_reason=failure_reason,
+                    policy_decision=_COMPACT_FAILURE_POLICY_DECISION,
+                    retryable=False,
+                    diagnostic_refs=(estimate.estimator_digest,),
+                    budget_after_attempted_compact=(
+                        budget_after_attempted_compact
+                    ),
+                ),
+                payload_ref=None,
+                payload_digest=None,
+            ),
+        )
 
     async def drain_once(self) -> DispatchDrainResult:
         """同步处理当前队列中的 dispatch wakeup。
@@ -810,6 +1409,7 @@ class HostDispatchScheduler:
             self._transaction_runner,
             self._local_execution.memory_projection_policy,
         )
+        compact_provider = DurableCompactArtifactProvider(self._transaction_runner)
         if (
             tooling_options is None
             or not policy_snapshot.agent_policy.allow_tool_calls
@@ -818,6 +1418,7 @@ class HostDispatchScheduler:
                 transaction_runner=self._transaction_runner,
                 policy_snapshot=policy_snapshot,
                 memory_snapshot_provider=memory_provider,
+                compact_artifact_provider=compact_provider,
             )
         tool_runtime = DefaultToolRuntimeFactory(
             EffectiveToolBundleBuilder()
@@ -859,6 +1460,7 @@ class HostDispatchScheduler:
             policy_snapshot=policy_snapshot,
             tool_runtime_handle=tool_runtime,
             memory_snapshot_provider=memory_provider,
+            compact_artifact_provider=compact_provider,
         )
 
     def _catch_up_memory_projection_before_worker(
@@ -1141,6 +1743,18 @@ class HostDispatchScheduler:
             ingestor = EngineEventIngestor(
                 transaction_runner=self._transaction_runner,
                 wakeup_port=self,
+                context_budget_policy=self._local_execution.context_budget_policy,
+                context_compactor=self._local_execution.context_compactor,
+                compact_artifact_root=self._local_execution.compact_artifact_root,
+                compact_artifact_create_parent_dirs=(
+                    self._local_execution.compact_artifact_create_parent_dirs
+                ),
+                memory_projection_policy=(
+                    self._local_execution.memory_projection_policy
+                ),
+                memory_projection_catchup_batch_size=(
+                    self._local_execution.memory_projection_catchup_batch_size
+                ),
             )
             worker_event_index = 0
             terminal_seen = False
@@ -1198,7 +1812,7 @@ class HostDispatchScheduler:
                 ):
                     if result.events:
                         last_accepted_event_id = result.events[-1].event_id
-                    if result.terminal_closeout:
+                    if result.terminal_closeout or result.stop_worker_stream:
                         terminal_seen = True
                         run_terminal_closed = _ingest_closed_run(result)
                         break
@@ -1260,6 +1874,40 @@ def _is_dispatchable_recheck(
         and dispatch_record.worker_accept_event_id is None
         and dispatch_record.cancelled_event_id is None
     )
+
+
+def _read_startable_run(
+    transaction: HostTransaction, session_id: str
+) -> RunRow | None:
+    """读取当前可进入 pre-start governance 的 Run。
+
+    :param transaction: 当前 Host transaction。
+    :param session_id: Session id。
+    :returns: accepted Run、无 active 时的最早 queued Run，或 ``None``。
+    """
+
+    accepted = read_accepted_run_for_session(transaction, session_id)
+    if accepted is not None:
+        return accepted
+    active = read_active_run_for_session(transaction, session_id)
+    if active is not None:
+        return None
+    return read_earliest_queued_run(transaction, session_id)
+
+
+def _display_text_from_input_event(event: EventLogRow) -> str:
+    """从 ``USER_INPUT_ACCEPTED`` event 读取展示文本。
+
+    :param event: input event row。
+    :returns: 展示文本。
+    :raises RuntimeError: payload 缺失展示文本时抛出。
+    """
+
+    payload = _payload_object(event)
+    value = payload.get("display_text")
+    if not isinstance(value, str) or value.strip() == "":
+        raise RuntimeError("USER_INPUT_ACCEPTED display_text is invalid")
+    return value
 
 
 def _is_worker_acceptable(

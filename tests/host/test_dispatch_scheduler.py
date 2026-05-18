@@ -15,6 +15,7 @@ import pytest
 from dayu.engine.contracts.agent_policy import AgentPolicy
 from dayu.engine.contracts.agent_run import AgentRunRequest
 from dayu.engine.contracts.engine_events import (
+    ContextCompactionRequestedData,
     EngineEvent,
     EngineEventType,
     FinalAnswerData,
@@ -49,6 +50,20 @@ from dayu.host.api import (
     LocalWorkerHandle,
     RunStatus,
 )
+from dayu.host.compaction import ContextCompactor
+from dayu.host.context_budget import ContextBudgetDecision
+from dayu.host.context_events import (
+    CONTEXT_COMPACTED,
+    CONTEXT_COMPACTION_FAILED,
+    CONTEXT_COMPACTION_REQUESTED,
+    build_context_compaction_requested_payload,
+)
+from dayu.host.context_policy import (
+    ContextBudgetPolicy,
+    ContextCompactionTriggerSource,
+    default_context_budget_policy,
+)
+from dayu.host.fake_compaction import FakeContextCompactor
 from dayu.host.tooling import (
     HostToolingOptions,
     ToolBundleSourceKind,
@@ -76,8 +91,10 @@ from dayu.host.durable.options import (
 )
 from dayu.host.durable.run_transition import (
     CancelPredispatchStartingInput,
+    CreateAcceptedRunInput,
     CreateRunningRunInput,
     cancel_predispatch_starting_in_transaction,
+    create_accepted_run_in_transaction,
     create_running_run_with_starting_attempt_in_transaction,
 )
 from dayu.host.durable.session_lifecycle import ensure_session
@@ -109,6 +126,11 @@ from dayu.runtime.lane import (
 _NOW = datetime(2026, 5, 15, 1, 2, 3, tzinfo=UTC)
 _CALL_CONTEXT_DIGEST = sha256_digest_json({"context": "dispatch-test"})
 _LANE_NAME = "llm"
+_SOFT_THRESHOLD_PROMPT_CHAR_COUNT = 120
+_SOFT_CONTEXT_WINDOW_SIZE = 110
+_SOFT_RESERVED_OUTPUT_TOKENS = 10
+_SOFT_HARD_THRESHOLD_TOKENS = 80
+_SOFT_SAFETY_MARGIN_RATIO = 0.5
 
 
 @dataclass(frozen=True, slots=True)
@@ -120,6 +142,14 @@ class _SeededRun:
     attempt_id: str
     execution_id: str
     dispatch_record_id: str
+
+
+@dataclass(frozen=True, slots=True)
+class _AcceptedSeededRun:
+    """测试中创建的 pre-start accepted Run。"""
+
+    session_id: str
+    run_id: str
 
 
 @dataclass(slots=True)
@@ -507,6 +537,180 @@ class _FakeWorkerFactory:
         if self._slow:
             return _SlowWorker()
         return _AcceptingWorker(self)
+
+
+class _SnapshotEventHandle(_FakeHandle):
+    """按 dispatch snapshot 生成单个 EngineEvent 的 handle。"""
+
+    def __init__(self, snapshot: AttemptDispatchSnapshot, event: EngineEvent) -> None:
+        """初始化 handle。
+
+        :param snapshot: dispatch snapshot。
+        :param event: 要产出的 EngineEvent。
+        :returns: ``None``。
+        """
+
+        super().__init__(local_worker_id=f"worker-{snapshot.attempt_id}")
+        self._event = event
+
+    async def events(self) -> AsyncIterator[EngineEvent]:
+        """产出单个事件后结束。
+
+        :returns: EngineEvent 异步迭代器。
+        """
+
+        yield self._event
+
+
+class _ReactiveRecoveryWorker:
+    """第一轮产出 reactive overflow，第二轮产出 final answer。"""
+
+    def __init__(self, factory: "_ReactiveRecoveryWorkerFactory") -> None:
+        """初始化 worker。
+
+        :param factory: 所属 factory。
+        :returns: ``None``。
+        """
+
+        self._factory = factory
+
+    async def accept(
+        self, snapshot: AttemptDispatchSnapshot, request: AgentRunRequest
+    ) -> LocalWorkerHandle:
+        """按创建顺序返回 reactive 或 final handle。
+
+        :param snapshot: dispatch snapshot。
+        :param request: Engine request。
+        :returns: scripted handle。
+        """
+
+        self._factory.accepted_snapshots.append(snapshot)
+        self._factory.accepted_requests.append(request)
+        if len(self._factory.accepted_snapshots) == 1:
+            event = EngineEvent(
+                occurred_at=_NOW,
+                session_id=snapshot.session_id,
+                run_id=snapshot.run_id,
+                type=EngineEventType.CONTEXT_COMPACTION_REQUESTED,
+                data=ContextCompactionRequestedData(
+                    iteration_id="iter-reactive",
+                    budget_state=None,
+                    reason="provider_overflow",
+                    provider_request_id="req-reactive",
+                ),
+                metadata=None,
+            )
+        elif self._factory.final_blocks:
+            return _ControlledBlockingHandle()
+        else:
+            event = EngineEvent(
+                occurred_at=_NOW,
+                session_id=snapshot.session_id,
+                run_id=snapshot.run_id,
+                type=EngineEventType.FINAL_ANSWER,
+                data=FinalAnswerData(
+                    content="recovered",
+                    filtered=False,
+                    degraded=False,
+                    finish_reason=FinishReason.STOP,
+                ),
+                metadata=None,
+            )
+        return _SnapshotEventHandle(snapshot, event)
+
+
+class _ReactiveRecoveryWorkerFactory:
+    """测试 reactive recovery dispatch 的 worker factory。"""
+
+    def __init__(self, *, final_blocks: bool = False) -> None:
+        """初始化 factory。
+
+        :param final_blocks: recovery Attempt 是否阻塞不产出 terminal。
+        :returns: ``None``。
+        """
+
+        self.final_blocks = final_blocks
+        self.created = 0
+        self.accepted_snapshots: list[AttemptDispatchSnapshot] = []
+        self.accepted_requests: list[AgentRunRequest] = []
+
+    def create_worker(self, snapshot: AttemptDispatchSnapshot) -> LocalEngineWorker:
+        """创建 scripted worker。
+
+        :param snapshot: dispatch snapshot。
+        :returns: scripted worker。
+        """
+
+        del snapshot
+        self.created += 1
+        return _ReactiveRecoveryWorker(self)
+
+
+class _FinalAnswerWorker:
+    """接受请求后立即返回 final_answer 的 fake worker。"""
+
+    def __init__(self, factory: "_FinalAnswerWorkerFactory") -> None:
+        """初始化 worker。
+
+        :param factory: 所属 factory。
+        :returns: ``None``。
+        """
+
+        self._factory = factory
+
+    async def accept(
+        self, snapshot: AttemptDispatchSnapshot, request: AgentRunRequest
+    ) -> LocalWorkerHandle:
+        """记录请求并返回 final_answer handle。
+
+        :param snapshot: dispatch snapshot。
+        :param request: Engine request。
+        :returns: scripted final answer handle。
+        """
+
+        self._factory.accepted_snapshots.append(snapshot)
+        self._factory.accepted_requests.append(request)
+        return _SnapshotEventHandle(
+            snapshot,
+            EngineEvent(
+                occurred_at=_NOW,
+                session_id=snapshot.session_id,
+                run_id=snapshot.run_id,
+                type=EngineEventType.FINAL_ANSWER,
+                data=FinalAnswerData(
+                    content=f"final:{snapshot.run_id}",
+                    filtered=False,
+                    degraded=False,
+                    finish_reason=FinishReason.STOP,
+                ),
+                metadata=None,
+            ),
+        )
+
+
+class _FinalAnswerWorkerFactory:
+    """按真实 dispatch 接受顺序记录 Engine request 的 fake factory。"""
+
+    def __init__(self) -> None:
+        """初始化 factory。
+
+        :returns: ``None``。
+        """
+
+        self.created = 0
+        self.accepted_snapshots: list[AttemptDispatchSnapshot] = []
+        self.accepted_requests: list[AgentRunRequest] = []
+
+    def create_worker(self, snapshot: AttemptDispatchSnapshot) -> LocalEngineWorker:
+        """创建 final answer worker。
+
+        :param snapshot: dispatch snapshot。
+        :returns: fake worker。
+        """
+
+        del snapshot
+        self.created += 1
+        return _FinalAnswerWorker(self)
 
 
 class _CountingTool:
@@ -1710,6 +1914,347 @@ async def test_scheduler_closes_default_local_proxy_after_terminal_before_late_e
             await scheduler.close()
 
 
+@pytest.mark.asyncio
+async def test_pre_start_governance_soft_threshold_compacts_before_attempt(
+    tmp_path: Path,
+) -> None:
+    """soft threshold 在 Attempt 创建前触发一次 proactive compact。"""
+
+    with open_host_durable_store(_options(tmp_path)) as store:
+        seeded = _seed_accepted_run(
+            store,
+            run_id="run-soft-compact",
+            display_text=_soft_threshold_prompt(),
+        )
+        assert _attempt_count_for_run(store.transaction_runner, seeded.run_id) == 0
+        scheduler = await _open_scheduler(
+            tmp_path,
+            store,
+            _FakeWorkerFactory(),
+            context_budget_policy=_soft_compact_policy(),
+            context_compactor=FakeContextCompactor(),
+            compact_artifact_root=tmp_path / "compact-artifacts",
+        )
+        try:
+            scheduler.wake_queue_promotion(seeded.session_id)
+            event_types = _event_types_for_run(
+                store.transaction_runner, seeded.run_id
+            )
+
+            assert _attempt_count_for_run(store.transaction_runner, seeded.run_id) == 1
+            assert event_types.index(CONTEXT_COMPACTION_REQUESTED) < event_types.index(
+                CONTEXT_COMPACTED
+            )
+            assert event_types.index(CONTEXT_COMPACTED) < event_types.index(
+                "RUN_STARTED"
+            )
+            assert event_types.index("RUN_STARTED") < event_types.index(
+                "ATTEMPT_STARTED"
+            )
+            assert _run_status(store.transaction_runner, seeded.run_id) == (
+                RunStatus.RUNNING
+            )
+        finally:
+            await scheduler.close()
+
+
+@pytest.mark.asyncio
+async def test_pre_start_governance_compact_failure_is_attempt_free(
+    tmp_path: Path,
+) -> None:
+    """proactive compact 缺少 compactor/artifact store 时 fail closed 且零 Attempt。"""
+
+    with open_host_durable_store(_options(tmp_path)) as store:
+        seeded = _seed_accepted_run(
+            store,
+            run_id="run-compact-failure",
+            display_text=_soft_threshold_prompt(),
+        )
+        scheduler = await _open_scheduler(
+            tmp_path,
+            store,
+            _FakeWorkerFactory(),
+            context_budget_policy=_soft_compact_policy(),
+        )
+        try:
+            scheduler.wake_queue_promotion(seeded.session_id)
+
+            assert _attempt_count_for_run(store.transaction_runner, seeded.run_id) == 0
+            assert _run_status(store.transaction_runner, seeded.run_id) == (
+                RunStatus.FAILED
+            )
+            assert _event_types_for_run(store.transaction_runner, seeded.run_id) == (
+                "USER_INPUT_ACCEPTED",
+                "RUN_ACCEPTED",
+                CONTEXT_COMPACTION_REQUESTED,
+                CONTEXT_COMPACTION_FAILED,
+                "RUN_FAILED",
+            )
+        finally:
+            await scheduler.close()
+
+
+@pytest.mark.asyncio
+async def test_pre_start_governance_proactive_count_limit_blocks_second_compact(
+    tmp_path: Path,
+) -> None:
+    """durable proactive request 计数阻止同一 Run 二次 compact 循环。"""
+
+    with open_host_durable_store(_options(tmp_path)) as store:
+        seeded = _seed_accepted_run(
+            store,
+            run_id="run-compact-limit",
+            display_text=_soft_threshold_prompt(),
+        )
+        _append_proactive_compaction_requested(
+            store.transaction_runner,
+            seeded=seeded,
+            event_id="event-existing-proactive-request",
+        )
+        scheduler = await _open_scheduler(
+            tmp_path,
+            store,
+            _FakeWorkerFactory(),
+            context_budget_policy=_soft_compact_policy(),
+            context_compactor=FakeContextCompactor(),
+            compact_artifact_root=tmp_path / "compact-artifacts",
+        )
+        try:
+            scheduler.wake_queue_promotion(seeded.session_id)
+
+            assert _attempt_count_for_run(store.transaction_runner, seeded.run_id) == 0
+            assert _run_status(store.transaction_runner, seeded.run_id) == (
+                RunStatus.FAILED
+            )
+            assert _event_types_for_run(store.transaction_runner, seeded.run_id).count(
+                CONTEXT_COMPACTION_REQUESTED
+            ) == 1
+            failed = _read_event_by_type(
+                store.transaction_runner, CONTEXT_COMPACTION_FAILED
+            )
+            assert json.loads(_require_text(failed.payload_json))[
+                "failure_reason"
+            ] == "proactive_compact_limit_reached"
+        finally:
+            await scheduler.close()
+
+
+@pytest.mark.asyncio
+async def test_pre_start_governance_corrupted_compact_count_fails_closed(
+    tmp_path: Path,
+) -> None:
+    """committed compact-count fact 损坏时 dispatch 前 fail closed。"""
+
+    with open_host_durable_store(_options(tmp_path)) as store:
+        seeded = _seed_accepted_run(
+            store,
+            run_id="run-corrupted-compact-count",
+            display_text=_soft_threshold_prompt(),
+        )
+        _append_corrupted_compaction_requested(
+            store.transaction_runner,
+            seeded=seeded,
+            event_id="event-corrupted-proactive-request",
+        )
+        scheduler = await _open_scheduler(
+            tmp_path,
+            store,
+            _FakeWorkerFactory(),
+            context_budget_policy=_soft_compact_policy(),
+            context_compactor=FakeContextCompactor(),
+            compact_artifact_root=tmp_path / "compact-artifacts",
+        )
+        try:
+            scheduler.wake_queue_promotion(seeded.session_id)
+
+            assert _attempt_count_for_run(store.transaction_runner, seeded.run_id) == 0
+            assert _run_status(store.transaction_runner, seeded.run_id) == (
+                RunStatus.FAILED
+            )
+            failed = _read_event_by_type(
+                store.transaction_runner, CONTEXT_COMPACTION_FAILED
+            )
+            assert json.loads(_require_text(failed.payload_json))[
+                "failure_reason"
+            ] == "proactive_compact_count_unreadable"
+        finally:
+            await scheduler.close()
+
+
+@pytest.mark.asyncio
+async def test_multi_turn_proactive_compact_feeds_subsequent_run_input(
+    tmp_path: Path,
+) -> None:
+    """多轮 Run 经 proactive compact 后把 compact memory 注入后续 Engine request。"""
+
+    factory = _FinalAnswerWorkerFactory()
+    with open_host_durable_store(_options(tmp_path)) as store:
+        scheduler = await _open_scheduler(
+            tmp_path,
+            store,
+            factory,
+            context_budget_policy=_soft_compact_policy(),
+            context_compactor=FakeContextCompactor(),
+            compact_artifact_root=tmp_path / "compact-artifacts",
+        )
+        try:
+            first = await _dispatch_accepted_final_run(
+                scheduler=scheduler,
+                store=store,
+                factory=factory,
+                run_id="run-multi-turn-1",
+                display_text="first raw turn for memory",
+                expected_request_count=1,
+            )
+            assert first.session_id != ""
+
+            await _dispatch_accepted_final_run(
+                scheduler=scheduler,
+                store=store,
+                factory=factory,
+                run_id="run-multi-turn-2",
+                display_text="follow-up under budget",
+                expected_request_count=2,
+            )
+            second_contents = tuple(
+                _message_text(message)
+                for message in factory.accepted_requests[1].messages
+            )
+            assert "first raw turn for memory" in second_contents
+            assert second_contents[-1] == "follow-up under budget"
+
+            compacted = await _dispatch_accepted_final_run(
+                scheduler=scheduler,
+                store=store,
+                factory=factory,
+                run_id="run-multi-turn-3",
+                display_text=_soft_threshold_prompt(),
+                expected_request_count=3,
+            )
+            event_types = _event_types_for_run(
+                store.transaction_runner, compacted.run_id
+            )
+            compacted_request_contents = tuple(
+                content
+                for content in (
+                    _message_text(message)
+                    for message in factory.accepted_requests[2].messages
+                )
+                if content is not None
+            )
+            assert event_types.index(CONTEXT_COMPACTED) < event_types.index(
+                "RUN_STARTED"
+            )
+            assert _content_index(
+                compacted_request_contents,
+                "Accepted compact artifact is available for this run.",
+            ) < len(compacted_request_contents) - 1
+            assert compacted_request_contents[-1] == _soft_threshold_prompt()
+
+            await _dispatch_accepted_final_run(
+                scheduler=scheduler,
+                store=store,
+                factory=factory,
+                run_id="run-multi-turn-4",
+                display_text="after compact prompt",
+                expected_request_count=4,
+            )
+            after_compact_contents = tuple(
+                content
+                for content in (
+                    _message_text(message)
+                    for message in factory.accepted_requests[3].messages
+                )
+                if content is not None
+            )
+            joined = "\n\n".join(after_compact_contents)
+            goal_index = _content_index(after_compact_contents, "current_goal=")
+            raw_index = after_compact_contents.index("follow-up under budget")
+            episode_index = _content_index(
+                after_compact_contents, "Memory episode summaries:"
+            )
+
+            assert "current_goal=" in joined
+            assert "confirmed_subject=subject:" in joined
+            assert "title=Session " in joined
+            assert goal_index < raw_index < episode_index
+            assert after_compact_contents[-1] == "after compact prompt"
+        finally:
+            await scheduler.close()
+
+
+@pytest.mark.asyncio
+async def test_reactive_overflow_recovers_and_dispatches_new_attempt(
+    tmp_path: Path,
+) -> None:
+    """worker reactive overflow 经 compact 后创建新 Attempt 并完成 dispatch。"""
+
+    with open_host_durable_store(_options(tmp_path)) as store:
+        seeded = _seed_current_run(store)
+        factory = _ReactiveRecoveryWorkerFactory()
+        scheduler = await _open_scheduler(
+            tmp_path,
+            store,
+            factory,
+            context_budget_policy=_soft_compact_policy(),
+            context_compactor=FakeContextCompactor(),
+            compact_artifact_root=tmp_path / "compact-artifacts",
+        )
+        try:
+            scheduler.wake_dispatch(_pending_dispatch(seeded))
+            assert (await scheduler.drain_once()).dispatched == 1
+            await _wait_for_run_status(
+                store.transaction_runner,
+                seeded.run_id,
+                expected_run=RunStatus.SUCCEEDED,
+            )
+            await _wait_for_active_tasks_to_finish(scheduler)
+
+            assert len(factory.accepted_snapshots) == 2
+            assert factory.accepted_snapshots[0].attempt_id == seeded.attempt_id
+            assert factory.accepted_snapshots[1].attempt_id != seeded.attempt_id
+            assert _event_count(store.transaction_runner, CONTEXT_COMPACTED) == 1
+            assert _event_count(store.transaction_runner, "RUN_RECOVERING") == 1
+            assert _attempt_count_for_run(store.transaction_runner, seeded.run_id) == 2
+        finally:
+            await scheduler.close()
+
+
+@pytest.mark.asyncio
+async def test_reactive_recovery_does_not_clear_duplicate_registry(
+    tmp_path: Path,
+) -> None:
+    """reactive recovery accepted 停止旧 worker 但不清理同 Run duplicate registry。"""
+
+    tool = _CountingTool()
+    with open_host_durable_store(_options(tmp_path)) as store:
+        seeded = _seed_current_run(store)
+        factory = _ReactiveRecoveryWorkerFactory(final_blocks=True)
+        scheduler = await _open_scheduler(
+            tmp_path,
+            store,
+            factory,
+            agent_policy=_agent_policy(True),
+            tooling_options=_tooling_options(tool),
+            context_budget_policy=_soft_compact_policy(),
+            context_compactor=FakeContextCompactor(),
+            compact_artifact_root=tmp_path / "compact-artifacts",
+        )
+        try:
+            scheduler.wake_dispatch(_pending_dispatch(seeded))
+            assert (await scheduler.drain_once()).dispatched == 1
+            await _wait_for_accepted_snapshot_count(factory, 2)
+
+            assert factory.accepted_snapshots[0].attempt_id == seeded.attempt_id
+            assert factory.accepted_snapshots[1].attempt_id != seeded.attempt_id
+            assert scheduler._duplicate_governance_registry.active_run_count() == 1
+            assert _run_status(store.transaction_runner, seeded.run_id) == (
+                RunStatus.RUNNING
+            )
+        finally:
+            await scheduler.close()
+
+
 def _options(tmp_path: Path) -> HostDurableStoreOptions:
     """构造 Host durable store options。
 
@@ -1742,6 +2287,9 @@ async def _open_scheduler(
     agent_policy: AgentPolicy | None = None,
     tooling_options: HostToolingOptions | None = None,
     projection_catchup: ProjectionCatchupPort | None = None,
+    context_budget_policy: ContextBudgetPolicy | None = None,
+    context_compactor: ContextCompactor | None = None,
+    compact_artifact_root: Path | None = None,
 ) -> HostDispatchScheduler:
     """打开测试 scheduler。
 
@@ -1755,6 +2303,9 @@ async def _open_scheduler(
     :param agent_policy: 可选 AgentPolicy；无则使用 no-tool policy。
     :param tooling_options: 可选 Host 工具装配选项。
     :param projection_catchup: 可选 projection catch-up port。
+    :param context_budget_policy: 可选 pre-start context budget policy。
+    :param context_compactor: 可选 context compactor。
+    :param compact_artifact_root: 可选 compact artifact 根目录。
     :returns: scheduler。
     """
 
@@ -1778,6 +2329,9 @@ async def _open_scheduler(
             ),
             worker_factory=factory,
             tooling_options=tooling_options,
+            context_budget_policy=context_budget_policy,
+            context_compactor=context_compactor,
+            compact_artifact_root=compact_artifact_root,
         ),
         host_handle_id="host-test",
         active_registry=active_registry,
@@ -1977,6 +2531,177 @@ def _seed_current_run(
     return seeded
 
 
+def _seed_accepted_run(
+    store: HostDurableStore,
+    *,
+    run_id: str,
+    display_text: str,
+) -> _AcceptedSeededRun:
+    """创建 pre-start accepted Run，不创建 Attempt 或 dispatch。
+
+    :param store: durable store。
+    :param run_id: Run id。
+    :param display_text: 当前用户输入文本。
+    :returns: accepted Run 摘要。
+    """
+
+    session_id = _ensure_session_id(store.transaction_runner)
+    input_event_id = f"event-input-{run_id}"
+    input_event_sequence = _append_user_input(
+        store.transaction_runner,
+        session_id=session_id,
+        run_id=run_id,
+        event_id=input_event_id,
+        display_text=display_text,
+        client_request_id=f"client-{run_id}",
+        idempotency_key=f"idem-input-{run_id}",
+    )
+
+    def _operation(transaction: HostTransaction) -> None:
+        result = create_accepted_run_in_transaction(
+            transaction,
+            EventLogStore(),
+            CreateAcceptedRunInput(
+                session_id=session_id,
+                run_id=run_id,
+                client_request_id=f"client-{run_id}",
+                input_event_id=input_event_id,
+                input_event_sequence=input_event_sequence,
+                run_accepted_event_id=f"event-run-accepted-{run_id}",
+                occurred_at=_NOW,
+                actor="tester",
+                source="pytest",
+                idempotency_key=f"idem-run-{run_id}",
+                execution_target="target-dispatch",
+                queue_policy="queue",
+                call_context_digest=_CALL_CONTEXT_DIGEST,
+            ),
+        )
+        assert result.run is not None
+        assert result.run.status == RunStatus.ACCEPTED
+
+    store.transaction_runner.run_write(_operation)
+    return _AcceptedSeededRun(session_id=session_id, run_id=run_id)
+
+
+def _soft_compact_policy() -> ContextBudgetPolicy:
+    """构造会对测试 prompt 触发 soft compact 的预算策略。
+
+    :returns: context budget policy。
+    """
+
+    return default_context_budget_policy(
+        context_window_size=_SOFT_CONTEXT_WINDOW_SIZE,
+        reserved_output_tokens=_SOFT_RESERVED_OUTPUT_TOKENS,
+        hard_threshold_tokens=_SOFT_HARD_THRESHOLD_TOKENS,
+        safety_margin_ratio=_SOFT_SAFETY_MARGIN_RATIO,
+        minimum_protection_tokens=1,
+        policy_ref="test-soft-compact-policy",
+    )
+
+
+def _soft_threshold_prompt() -> str:
+    """返回触发 soft threshold 且未达 hard threshold 的测试 prompt。
+
+    :returns: 测试 prompt。
+    """
+
+    return "x" * _SOFT_THRESHOLD_PROMPT_CHAR_COUNT
+
+
+def _append_proactive_compaction_requested(
+    transaction_runner: HostTransactionRunner,
+    *,
+    seeded: _AcceptedSeededRun,
+    event_id: str,
+) -> None:
+    """追加一条合法 proactive compaction requested fact。
+
+    :param transaction_runner: transaction runner。
+    :param seeded: accepted Run 摘要。
+    :param event_id: 事件 id。
+    :returns: ``None``。
+    """
+
+    def _operation(transaction: HostTransaction) -> None:
+        EventLogStore().append_event(
+            transaction,
+            EventLogAppendRequest(
+                event_id=event_id,
+                event_class=EventClass.CANONICAL_FACT,
+                session_id=seeded.session_id,
+                run_id=seeded.run_id,
+                attempt_id=None,
+                execution_id=None,
+                event_type=CONTEXT_COMPACTION_REQUESTED,
+                occurred_at=_NOW,
+                actor="tester",
+                source="pytest",
+                client_request_id=None,
+                idempotency_key=None,
+                policy_decision=None,
+                reason=None,
+                payload_json=build_context_compaction_requested_payload(
+                    trigger_source=ContextCompactionTriggerSource.PROACTIVE,
+                    budget_reason=ContextBudgetDecision.COMPACT_SOFT_THRESHOLD.value,
+                    budget_snapshot_ref=_CALL_CONTEXT_DIGEST,
+                    input_snapshot_cursor=1,
+                    estimator_digest=_CALL_CONTEXT_DIGEST,
+                    policy_ref="test-soft-compact-policy",
+                    provider_request_id=None,
+                    provider_error_ref=None,
+                    attempt_id=None,
+                    execution_id=None,
+                ),
+                payload_ref=None,
+                payload_digest=None,
+            ),
+        )
+
+    transaction_runner.run_write(_operation)
+
+
+def _append_corrupted_compaction_requested(
+    transaction_runner: HostTransactionRunner,
+    *,
+    seeded: _AcceptedSeededRun,
+    event_id: str,
+) -> None:
+    """追加一条损坏的 compaction requested fact。
+
+    :param transaction_runner: transaction runner。
+    :param seeded: accepted Run 摘要。
+    :param event_id: 事件 id。
+    :returns: ``None``。
+    """
+
+    def _operation(transaction: HostTransaction) -> None:
+        EventLogStore().append_event(
+            transaction,
+            EventLogAppendRequest(
+                event_id=event_id,
+                event_class=EventClass.CANONICAL_FACT,
+                session_id=seeded.session_id,
+                run_id=seeded.run_id,
+                attempt_id=None,
+                execution_id=None,
+                event_type=CONTEXT_COMPACTION_REQUESTED,
+                occurred_at=_NOW,
+                actor="tester",
+                source="pytest",
+                client_request_id=None,
+                idempotency_key=None,
+                policy_decision=None,
+                reason=None,
+                payload_json={"trigger_source": 7},
+                payload_ref=None,
+                payload_digest=None,
+            ),
+        )
+
+    transaction_runner.run_write(_operation)
+
+
 def _ensure_session_id(transaction_runner: HostTransactionRunner) -> str:
     """确保测试 Session 存在。
 
@@ -2085,6 +2810,203 @@ def _read_rows(
         return run, attempt, dispatch_record
 
     return transaction_runner.run_read(_operation)
+
+
+def _run_status(transaction_runner: HostTransactionRunner, run_id: str) -> RunStatus:
+    """读取 Run 状态。
+
+    :param transaction_runner: transaction runner。
+    :param run_id: Run id。
+    :returns: Run 状态。
+    :raises AssertionError: Run 缺失时抛出。
+    """
+
+    def _operation(transaction: HostTransaction) -> RunStatus:
+        row = read_run_by_id(transaction, run_id)
+        assert row is not None
+        return row.status
+
+    return transaction_runner.run_read(_operation)
+
+
+def _attempt_count_for_run(
+    transaction_runner: HostTransactionRunner, run_id: str
+) -> int:
+    """统计指定 Run 的 Attempt row 数。
+
+    :param transaction_runner: transaction runner。
+    :param run_id: Run id。
+    :returns: Attempt row 数。
+    """
+
+    def _operation(transaction: HostTransaction) -> int:
+        row = transaction.fetchone(
+            "SELECT COUNT(*) AS count FROM host_attempts WHERE run_id = ?",
+            (run_id,),
+        )
+        assert row is not None
+        value = row.get("count")
+        assert isinstance(value, int)
+        return value
+
+    return transaction_runner.run_read(_operation)
+
+
+def _event_types_for_run(
+    transaction_runner: HostTransactionRunner, run_id: str
+) -> tuple[str, ...]:
+    """按 sequence 读取指定 Run 的 EventLog 类型。
+
+    :param transaction_runner: transaction runner。
+    :param run_id: Run id。
+    :returns: event type 元组。
+    """
+
+    def _operation(transaction: HostTransaction) -> tuple[str, ...]:
+        rows = EventLogStore().read_events_after(transaction, 0, limit=200)
+        return tuple(row.event_type for row in rows if row.run_id == run_id)
+
+    return transaction_runner.run_read(_operation)
+
+
+def _event_count(transaction_runner: HostTransactionRunner, event_type: str) -> int:
+    """统计指定 event type 数量。
+
+    :param transaction_runner: transaction runner。
+    :param event_type: event type。
+    :returns: 事件数量。
+    """
+
+    def _operation(transaction: HostTransaction) -> int:
+        return sum(
+            1
+            for row in EventLogStore().read_events_after(transaction, 0, limit=200)
+            if row.event_type == event_type
+        )
+
+    return transaction_runner.run_read(_operation)
+
+
+async def _wait_for_run_status(
+    transaction_runner: HostTransactionRunner,
+    run_id: str,
+    *,
+    expected_run: RunStatus,
+) -> RunRow:
+    """等待 Run 到达指定状态。
+
+    :param transaction_runner: transaction runner。
+    :param run_id: Run id。
+    :param expected_run: 期望 Run 状态。
+    :returns: Run row。
+    :raises AssertionError: 超时未达到目标状态时抛出。
+    """
+
+    for _index in range(200):
+        row = transaction_runner.run_read(
+            lambda transaction: read_run_by_id(transaction, run_id)
+        )
+        assert row is not None
+        if row.status == expected_run:
+            return row
+        await asyncio.sleep(0.01)
+    row = transaction_runner.run_read(
+        lambda transaction: read_run_by_id(transaction, run_id)
+    )
+    assert row is not None
+    raise AssertionError(f"run status did not converge: {row.status.value}")
+
+
+async def _dispatch_accepted_final_run(
+    *,
+    scheduler: HostDispatchScheduler,
+    store: HostDurableStore,
+    factory: _FinalAnswerWorkerFactory,
+    run_id: str,
+    display_text: str,
+    expected_request_count: int,
+) -> _AcceptedSeededRun:
+    """创建 accepted Run，经 scheduler gate dispatch，并等待 final_answer 收口。
+
+    :param scheduler: Host dispatch scheduler。
+    :param store: durable store。
+    :param factory: 记录 Engine request 的 final-answer worker factory。
+    :param run_id: 新 Run id。
+    :param display_text: 当前用户输入文本。
+    :param expected_request_count: 期望累计 accept 次数。
+    :returns: accepted Run 摘要。
+    :raises AssertionError: dispatch 或状态收口未在测试时间内完成时抛出。
+    """
+
+    seeded = _seed_accepted_run(
+        store,
+        run_id=run_id,
+        display_text=display_text,
+    )
+    scheduler.wake_queue_promotion(seeded.session_id)
+    await _wait_for_final_request_count(factory, expected_request_count)
+    await _wait_for_run_status(
+        store.transaction_runner,
+        seeded.run_id,
+        expected_run=RunStatus.SUCCEEDED,
+    )
+    return seeded
+
+
+async def _wait_for_final_request_count(
+    factory: _FinalAnswerWorkerFactory, expected_count: int
+) -> None:
+    """等待 final-answer worker factory 接受指定次数。
+
+    :param factory: final-answer worker factory。
+    :param expected_count: 期望累计 accept 次数。
+    :returns: ``None``。
+    :raises AssertionError: 超时未达到次数时抛出。
+    """
+
+    for _index in range(200):
+        if len(factory.accepted_requests) >= expected_count:
+            return
+        await asyncio.sleep(0.01)
+    raise AssertionError(
+        f"worker request count did not converge: {len(factory.accepted_requests)}"
+    )
+
+
+def _content_index(contents: tuple[str, ...], expected_fragment: str) -> int:
+    """返回包含指定片段的 message index。
+
+    :param contents: Engine request message 文本。
+    :param expected_fragment: 需要查找的文本片段。
+    :returns: 第一个匹配 index。
+    :raises AssertionError: 找不到片段时抛出。
+    """
+
+    for index, content in enumerate(contents):
+        if expected_fragment in content:
+            return index
+    raise AssertionError(f"message fragment not found: {expected_fragment}")
+
+
+async def _wait_for_accepted_snapshot_count(
+    factory: _ReactiveRecoveryWorkerFactory, expected_count: int
+) -> None:
+    """等待 reactive worker factory 接受指定次数。
+
+    :param factory: reactive worker factory。
+    :param expected_count: 期望 accept 次数。
+    :returns: ``None``。
+    :raises AssertionError: 超时未达到次数时抛出。
+    """
+
+    for _index in range(200):
+        if len(factory.accepted_snapshots) >= expected_count:
+            return
+        await asyncio.sleep(0.01)
+    raise AssertionError(
+        "accepted snapshot count did not converge: "
+        f"{len(factory.accepted_snapshots)}"
+    )
 
 
 async def _wait_for_statuses(

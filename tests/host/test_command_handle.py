@@ -86,6 +86,8 @@ def _options(tmp_path: Path, host_handle_id: str | None = "host-test") -> HostCo
         sqlite_write_retry_backoff_multiplier=1.2,
         sqlite_write_retry_max_delay_seconds=0.01,
         payload_inline_threshold_bytes=4096,
+        context_window_size=8192,
+        reserved_output_tokens=1024,
     )
 
 
@@ -107,6 +109,8 @@ def _options_without_write_retry(tmp_path: Path) -> HostCommandHandleOptions:
         sqlite_write_retry_backoff_multiplier=1.2,
         sqlite_write_retry_max_delay_seconds=0.001,
         payload_inline_threshold_bytes=4096,
+        context_window_size=8192,
+        reserved_output_tokens=1024,
     )
 
 
@@ -511,6 +515,8 @@ def test_factory_rejects_local_execution_without_hidden_scheduler(
                 payload_inline_threshold_bytes=(
                     options.payload_inline_threshold_bytes
                 ),
+                context_window_size=options.context_window_size,
+                reserved_output_tokens=options.reserved_output_tokens,
                 local_execution=local_options,
             )
         )
@@ -546,6 +552,8 @@ def test_factory_translates_durable_config_error_to_public_error(
                 payload_inline_threshold_bytes=(
                     options.payload_inline_threshold_bytes
                 ),
+                context_window_size=options.context_window_size,
+                reserved_output_tokens=options.reserved_output_tokens,
             )
         )
 

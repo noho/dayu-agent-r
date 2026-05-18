@@ -222,13 +222,15 @@ Phase Map 中每个 phase 必须使用统一条目格式。模板如下：
 
 约束：本节只保留当前 gate 结论；phase 过程流水必须归档到 `历史记录`，仍需追踪的风险或后续 owner 必须写入 `Open Questions 与风险追踪` 的 `追踪区`。
 
-当前 work unit：P9.5 Pre-P10 Cross-Repository Hardening PR。
-当前 gate：P9.5 completed。
-下一 gate：用户手工 review / merge decision。
+当前 work unit：Phase 10.5. Ordinary Local Multi-turn Public Contract Freeze。
+当前 gate：P10.5 handoff implementation-ready plan generation。
+下一 gate：P10.5 plan review。
+
+当前 gate 事实：Phase 10 已完成；P10.5 已插入 Phase Map，用于冻结普通本地多轮会话的 Host public interface / contract。P10.5 目标与任务清单写入 `docs/host/post-p10.md`。initial challenge review artifacts 为 `docs/reviews/post-p10-public-contract-challenge-mimo-20260518.md`、`docs/reviews/post-p10-wiring-smoke-challenge-ds-20260518.md` 与 `docs/reviews/post-p10-codex-challenge-20260518.md`；相关裁决已经写回 `docs/host/post-p10.md`。按 `$init-agents` 已派发三路 P10.5 plan-readiness review：`docs/reviews/post-p10-5-plan-readiness-review-mimo-20260518.md`、`docs/reviews/post-p10-5-plan-readiness-review-ds-20260518.md` 与 `docs/reviews/post-p10-5-plan-readiness-review-codex-20260518.md`；三份结论均为 blocking count = 0。总控裁决：可以进入 P10.5 handoff implementation-ready plan generation，但 plan 必须显式收口三份 review 提出的 non-blocking / clarification checklist，不能直接 implementation。
 
 ## Phase Map
 
-Phase 按依赖关系推进：先实现被其它阶段依赖的公共契约、runtime 基础能力、durable store、EventLog 与状态机，再连接执行路径、工具治理、projection core、memory、context governance、recovery 与 remote。Audit、Tool Trace、Outbox 是独立 projection sinks，后置到核心治理路径稳定之后实现。Phase 0 是 Engine cleanup 前置 work unit，只阻塞 Phase 10 Context Governance，不阻塞 Phase 1-9。每个 phase 开始时仍必须先和用户讨论并细化对应 `docs/host/design.md` 章节，再生成 handoff implementation-ready plan。
+Phase 按依赖关系推进：先实现被其它阶段依赖的公共契约、runtime 基础能力、durable store、EventLog 与状态机，再连接执行路径、工具治理、projection core、memory、context governance、ordinary local multi-turn public contract freeze、recovery 与 remote。Audit、Tool Trace、Outbox 是独立 projection sinks，后置到核心治理路径稳定之后实现。Phase 0 是 Engine cleanup 前置 work unit，只阻塞 Phase 10 Context Governance，不阻塞 Phase 1-9。每个 phase 开始时仍必须先和用户讨论并细化对应 `docs/host/design.md` 章节，再生成 handoff implementation-ready plan。
 
 ### Phase 0. Engine Context Compaction Event 语义前置
 
@@ -526,7 +528,7 @@ Phase 按依赖关系推进：先实现被其它阶段依赖的公共契约、ru
 - 不实现 dispatching / active worker、`WAITING`、`RECOVERING` 的完整 cancel；不得把 Phase 4 queued / pre-dispatch cancel 子集写成最终语义。
 
 关键设计问题：
-- `submit_followup(queue)` 使用 `accepted_run_id` + `accepted_run_status` 表达 accepted follow-up 结果；无 active Run 时可直接返回新 `RUNNING` Run，不能把 running Run 塞进 `queued_run_id`。
+- `submit_followup(queue)` 使用 `accepted_run_id` + `accepted_run_status` 表达 accepted follow-up 结果；P10 后无 active / start-blocking Run 时返回新 `ACCEPTED` Run，不能把 accepted / running Run 塞进 `queued_run_id`。
 - `HostApiErrorCode` 必须包含 `UNSUPPORTED_OPERATION`；`HostApiError.detail` 是受限 typed detail union，至少包含 steer conflict detail，禁止无结构 extra payload / god bag。
 - `submit_followup(steer)` Phase 4 只冻结 public envelope、validation 与 error/detail contract；完整 steer owner 后续 phase。
 - `stream_run_events` 以全局 EventLog cursor 为 truth，固定 public `limit`、默认 / 最大 limit、run 过滤、empty result `next_cursor` 与 `HostEventView` 映射；Phase 4 不引入 projection truth。
@@ -1101,7 +1103,8 @@ P9.5 收口清单：
 ### Phase 10. Context Governance / Compaction
 
 目标：
-- 实现 Host proactive context budget governance、compact event、compacted artifact、reactive Engine overflow recovery 与 RunInputBuilder compact provider。
+- 实现 Host proactive context budget governance、Host-owned compactor port、compact event、compact artifact、P9 memory projection 对 accepted compact output 的消费、reactive Engine overflow recovery 与 RunInputBuilder compact provider。
+- P10 完成后，多轮会话主体必须可工作：Host 能在预算压力下生成 accepted episode summary / pinned state patch candidate，经 canonical compact event / artifact 和 P9 memory projection 进入后续 RunInputBuilder memory messages；recent raw turns、older raw turns、episode summaries、pinned state 与 verified facts 必须共同形成可解释的多轮记忆闭环。
 
 对应设计章节：
 - `docs/host/design.md` §25 Context Governance
@@ -1115,21 +1118,26 @@ P9.5 收口清单：
 - Phase 6 ToolRuntime / tool fact accept barrier / run-scoped truncation / `fetch_more` contract 已完成。
 
 进入条件：
-- 确认 conservative estimator、provider-aware configured limits、safety margin 与 compact policy 的第一版默认值。
+- 已确认 conservative estimator、provider-aware configured limits、safety margin 与 compact policy 的第一版默认值。
 
 范围：
-- 允许修改：Context Governance orchestrator、budget estimator、compact artifact store、compact canonical events、RunInputBuilder CompactArtifactProvider、reactive overflow recovery path。
-- 禁止修改：Engine proactive compaction、memory projection direct write、audit / trace projection direct write。
+- 允许修改：Context Governance orchestrator、budget estimator、Host-owned compactor typed port、compaction scene adapter / fake compactor、compact artifact store、compact canonical events、P9 memory projection 对 compact canonical facts 的消费、RunInputBuilder CompactArtifactProvider、reactive overflow recovery path、production composition wiring。
+- 禁止修改：Engine proactive compaction、memory snapshot / memory table direct write、audit / trace projection direct write。
 
 不做：
 - 不实现 provider-specific tokenizer adapter。
 - 不实现长期 memory retrieval。
 - 不做无限 compact retry。
+- 不实现 public memory edit / reset / forget API。
+- 不实现 Phase 11 startup crash recovery、positive orphan proof 或通用 `RECOVERING` recovery scan。
+- 不实现 Phase 13 Audit / Tool Trace / Outbox sinks；P10 只记录可供后续 sinks 消费的 typed refs / diagnostics。
 
 关键设计问题：
-- 必须确认 proactive 与 reactive 两条路径的 transaction / state transition。
-- 必须确认 compacted snapshot 的质量检查、保留事实 refs 与 dropped / summarized ranges。
-- 必须确认 compact failure 的 Run terminal / recoverable policy。
+- 已确认多轮会话主体闭环的数据来源：按模型窗口触发 compaction、Host-owned compactor 输出 episode summary candidate 与 pinned state patch candidate、recent raw turns floor、older raw turns 与 episode summaries 共用 history pool、pinned state 独立于 history pool，并通过 canonical compact event / artifact + P9 memory projection 消费落到当前架构。
+- 已确认 proactive 与 reactive 两条路径的 transaction / state transition。
+- 已确认 compactor output schema：episode summary candidate、pinned state patch candidate、preserved fact refs、dropped / summarized ranges、quality check result 与 budget after compact。
+- 已确认 accepted compact output 作为 canonical fact 被 P9 memory projection 消费，并明确 P10 不直接写 memory snapshot。
+- 已确认 compact failure 的 Run terminal / recoverable policy。
 
 交付物：
 - phase design refinement
@@ -1139,28 +1147,144 @@ P9.5 收口清单：
 - docs update
 
 建议 slice 切分：
-- Slice 1: budget estimator / policy view / proactive trigger。
-- Slice 2: compact artifact and canonical events。
-- Slice 3: reactive Engine overflow -> RECOVERING -> new Attempt path。
-- Slice 4: RunInputBuilder compact provider and failure handling。
+- Slice 1: context budget policy / estimator / usage observation / threshold decisions。
+- Slice 2: compactor typed contracts, fake compactor, quality check and compact artifact store。
+- Slice 3: compact canonical events and P9 memory projection consumption of accepted episode summary / pinned state patch candidate。
+- Slice 4: proactive pre-dispatch Context Governance orchestration and RunInputBuilder compact provider rebuild path。
+- Slice 5: reactive Engine overflow -> validated compact -> `RECOVERING` -> new Attempt path。
+- Slice 6: production composition wiring, multi-turn integration validation and docs sync。
 
 验证要求：
-- unit tests: threshold decisions、compact event payload validation、failure policy。
-- integration tests: proactive compact before dispatch and reactive overflow recovery。
+- unit tests: threshold decisions、compactor output validation、quality check rejection、compact event payload validation、P9 projection materializes accepted episode summary / pinned state patch without direct memory writes、failure policy。
+- integration tests: proactive compact before dispatch produces later Run memory messages with pinned state / episode summary; recent raw turns floor and older raw turns / episode summaries share the history pool; reactive overflow validates attempt / execution id and recovers with a new Attempt; compact failure fails Run without `LOST`。
 - pyright: context governance modules 通过。
 - docs: Host / Engine boundary docs 按触发规则同步。
 
 退出条件：
 - Host 能在 dispatch 前主动 compact，并能把 Engine overflow 当作 reactive fallback 恢复，不让 Engine 管理 Host context budget。
+- 多轮会话主体闭环可验证：用户约束 / 目标、tool-verified facts、recent raw turns、older raw turns 与 accepted episode summaries 能在后续 Run 的 `AgentRunRequest.messages` 中按 P9/P10 policy 稳定出现；episode summary 与 pinned state patch 的来源可追溯到 compact canonical event / artifact；assistant final answer 仍不会自动成为 verified fact。
+- P10 不留下无 owner 的“stable layer / history pool 只有结构没有来源”缺口；若 implementation 发现某项来源必须依赖长期 retrieval、public memory edit/reset、Phase 11 recovery、Phase 13 trace sink 或 Phase 15 retention，必须重新归属到对应后续 phase 并说明不阻塞多轮会话主体闭环的理由。
 
 后续依赖：
-- 后续 phase 可依赖的稳定契约：compact events、compact artifacts、context budget policy view。
-- 需要追踪到后续 phase 的事项：provider-specific tokenizer adapter 是后续能力。
+- 后续 phase 可依赖的稳定契约：compact events、compact artifacts、context budget policy view、accepted episode summary / pinned state patch projection contract。
+- 需要追踪到后续 phase 的事项：provider-specific tokenizer adapter、长期 retrieval、public memory edit / reset / forget API、Audit / Tool Trace sinks 是后续能力。
+
+### Phase 10.5. Ordinary Local Multi-turn Public Contract Freeze
+
+目标：
+- 冻结普通本地多轮会话的 Host public interface / contract，查漏补缺生产接线和组件，确保后续真实生产系统 Service 调用 Host public interface / contract 即可完成多轮会话闭环。
+- P10.5 自身必须把真实生产系统 Service 将来接入所需的 Host 普通多轮生产接线做实；真实 CLI / web / GUI 在 P11-P15 实施完毕后会通过 Service 使用 P10.5 冻结的 Host public interface / contract 接入，不能等到真实入口接入时再补一条新接线。后续 P11-P15 仅扩展 Host 能力，不改变普通多轮会话的生产接线。
+- Public contract 面向 Codex / Claude Code 类调用方：打开 Host、取得 / 新建 / 读取 Session、提交 prompt、读取 / 订阅 Session 事件、在 HostEventStream 中观察 terminal final answer、关闭 Host；不得要求上层理解 scheduler、runner、tooling、memory catch-up、wakeup 或 `HostLocalRuntime` 装配细节。
+- P10.5 冻结 async-only Host opener / handle；Service-facing 打开入口名称固定为 `open_host(options)`。不提供 Host 层同步 wrapper，不冻结同步 close / cancel / timeout / stream iteration 语义。CLI 或同步上层如需使用 Host，由 Service / CLI adapter 包装 async contract。
+- `open_host(options)` 的 options 只承载打开 Host、驱动 Host -> Engine 本地运行所需的 construction-time 参数；每次 Run 会变化的参数不得塞进 options，必须进入对应 public request。
+- Session acquisition 和 Run interaction 分离：`ensure_session(...)` / `create_session(...)` / `get_session(...)` 只负责取得 `SessionSnapshot`；拿到 `session_id` 后，第一条 prompt 与后续普通 prompt 都统一使用 `submit_followup(queue)`。`start_run(...)` 从 public namespace 移除，Host 内部 admission primitive 固定命名为 `_start_run(...)`。
+- `create_host_command_handle(...)` 降为 Host 内部 / 低层测试 composition primitive，不作为 Service-facing 打开入口；`HostLocalRuntime` 与 `HostLocalExecutionOptions` 改为内部 contract / implementation type；scheduler / wakeup / dispatch control API 不暴露给 Service。
+- Command mutation 与 event observation 分离：`submit_followup(...)`、`submit_followup(steer)`、`retry_run(...)`、`replay_run(...)` 不要求和 event loop 顺序绑定。设计已确定聊天主入口是 session-level live Host event stream；run-level EventLog 补读 / `HostEventView` 改为内部 diagnostic / detail / debug / drill-down 契约，不进入普通 Service-facing public contract。拿到 / attach Session 前发生的 terminal/final answer 通知由 Outbox 路径承接。Service 拿到 `session_id` 后，用客户端保存的 `last_seen_terminal_event_sequence` / `seen_terminal_event_ids` 去 Outbox 读离线 terminal/final answer 增量，同时或随后打开 `watch_session_events(session_id)`，并用 `terminal_event_id` / `event_sequence` / `run_id` 去重。
+- 补齐 `submit_followup(steer)`、`retry_run(...)`、`replay_run(...)` 的本地 public 语义。当前它们只是 stable unsupported envelope；P10.5 后普通 agent session 的控制输入、失败重试和结构修复不应再没有 owner。
+- memory catch-up 与 context overflow compact 属于 P10.5 查漏补缺范围。普通 Service 不能为了完成多轮闭环而手工装配 memory projection、compact artifact store、scheduler pre-start governance 或 dispatch internals；Host public opener / handle 必须提供明确 construction-time contract 来接收 / 配置 compactor、compactor execution baseline、budget policy、artifact root 和 memory catch-up。Compactor 的模型、温度、max tokens、provider 选择或 compact scene policy 是独立于 ordinary Run execution override 的 opener baseline。
+- 明确薄 Service 只是最小 consumer 证明样例，不是 Host 特殊接口类型；P10.5 不得把测试专用或薄 Service 专用入口未经讨论变成 Host contract。
+- 用 smoke 验证 public contract 冻结目标成立：no-tool multi-turn、mock-tool multi-turn、real-runner multi-turn、compact multi-turn 必须走同一 `open_host(options)` / public command / public read path。
+
+对应设计章节：
+- `docs/host/design.md` §10.1 Host Handle / Composition Root
+- `docs/host/design.md` §11 Host 公共接口
+- `docs/host/design.md` §12 Follow-up 与 Steer
+- `docs/host/design.md` §21 Suspend / Resume / Retry / Replay
+- `docs/host/design.md` §17 WorkerProxy / EngineWorker
+- `docs/host/design.md` §18 ToolRuntime
+- `docs/host/design.md` §23 RunInputBuilder
+- `docs/host/design.md` §24 Conversation Memory
+- `docs/host/design.md` §25 Context Governance
+
+前置条件：
+- Phase 10 Context Governance / Compaction draft PR gate 已通过，且普通多轮会话主体能力已经落地到 Host 内部组件。
+- `docs/host/post-p10.md` 已记录 P10.5 目标与任务清单、缺口清单、测试替身约束与 smoke coverage matrix。
+
+进入条件：
+- 已确认 P10.5 不考虑 Recovery，不迁移 `/Users/leo/workspace/dayu-agent` 的 web tools，不要求 Service / CLI / WeChat / GUI 真实入口改造，不要求业务工具发现 / 动态 ScenePrepare。
+- 已确认若 P10.5 发现需要新增、删除或改变 `dayu.host` public API，必须先和用户讨论并更新 `docs/host/post-p10.md` 或 phase plan，不能由 implementation agent 直接改。
+- 已确认真实 runner smoke 可参考 `dayu/config/llm_models.json` 写死 runner 参数，不实现 ConfigLoader；至少覆盖 mimo、ds/deepseek、gemini、qwen 四类配置。API key / 网络不可用时允许对对应 provider 显式 skip 并记录原因，但测试文件和 wiring 必须存在。mock runner smoke 已删除；runner test double 只能作为低层辅助测试，不能计入 P10.5 smoke success signal。mock tool 不得按 expected answer、run id、轮次或测试私有状态凑结果。
+- 三路 plan-readiness review 已完成且 blocking count = 0；P10.5 可以进入 implementation-ready planning。plan 必须把 review 的 non-blocking / clarification 项转成可执行约束：smoke matrix 每项 owner / 测试名 / public-path 断言 / skip 规则、`open_host(options)` typed shape、per-run execution override field-level partial merge 语义、`HostEventStream` 术语收敛，以及 review artifact 到 slice / 测试 / 后续 owner 的映射。
+
+范围：
+- 允许修改：Host opener / public handle 与内部 composition root、public command facade 与 scheduler wakeup 接线、session-level live Host event stream、typed HostEvent terminal final answer view、memory catch-up 与 context overflow compact 的 public opener construction contract、compactor execution baseline 接线、`submit_followup(steer)`、`retry_run(...)`、`replay_run(...)` 本地语义、public Run API 状态语义测试与文档、普通本地多轮 smoke harness、mock tool 测试实现、runner test double 低层辅助测试、compact smoke、真实 runner smoke 的受控配置接线。
+- 禁止修改：Recovery / startup scan / positive orphan proof / `RECOVERING` 通用恢复语义、RemoteProxy、业务工具发现 / 注册 / provider 配置、真实 Service / CLI / WeChat / GUI 接入、web tools 迁移、Engine 主动理解 Host memory / governance。
+
+不做：
+- 不实现 Phase 11 Recovery，不把 projection lag、memory lag 或 failed dispatch 解释成 recovery；`retry_run(...)` 对 `LOST` / `RECOVERING` 的恢复相关行为仍归 Phase 11。
+- 不迁移旧仓库 web tools；核心 smoke 使用 no-tool 或 mock tool。
+- 不实现 ConfigLoader；真实 runner 所需参数可以写死在 P10.5 受控代码或测试配置中。
+- 不实现业务财报工具端到端、动态 ScenePrepare、真实 Service / CLI / WeChat / GUI 接入。
+- 不实现 callback HTTP endpoint、callback auth / replay、wait poller 后台 loop、backoff / in-flight fencing 或 external job physical cancel / revoke；P10.5 只验证 `WAITING` 后由调用方 / tool adapter 通过 Host public `resolve_wait(...)` 提交已取得结果并恢复执行。
+- 不实现 `purge_session(...)` destructive cleanup、purge tombstone、删除矩阵、payload / memory / projection / outbox / tool trace 清理、audit 查询或 retention hardening；这些继续归 Phase 15。P10.5 只要求 `close_session(...)` public contract 可用，并保留 purge public envelope / error boundary。
+- 不实现 Outbox concrete read / drain API 或离线 terminal delivery smoke；P10.5 只冻结 attach / reconnect recipe、terminal identity 与去重要求。Phase 13 必须实现 Outbox read / drain API、OutboxSink terminal delivery queue projection 与离线 terminal 补读 smoke。
+- 不为测试或薄 Service 增加未经讨论的专用 public API。
+- 不定义 `wait_final_answer(...)`、public payload reader、`read_payload(ref)` 或 `get_run_result(...)`；不把 `stream_run_events(...)` / `HostEventView` 放进普通 Service-facing public contract；final answer 主路径只能是 terminal HostEvent。
+
+关键设计问题：
+- 必须确认 `open_host(options)` public handle 的 options shape、生命周期、错误语义，以及它如何内部复用或替代现有 `create_host_command_handle(...)`。关闭语义不得重开讨论，必须按 `docs/host/design.md` 已定的 `close_session` 与 Host graceful shutdown 语义接入。`HostLocalRuntime` / `HostLocalExecutionOptions` 只能作为内部 contract，不得要求业务上层理解。
+- P10.5 已确认 Host opener close shutdown order 是 implementation requirement：先关闭 public gate 并拒绝新 API；停止 scheduler / promotion / background supervisor；关闭 session live watch fanout；取消或关闭当前 handle 持有的 active worker task、lane wait、worker stream consumer task；flush / close projection catch-up 与本地 runtime resources；最后关闭 durable store。全程不得写 `RUN_CANCELLED` / `RUN_FAILED` 或其它 terminal fact 来伪装用户意图。
+- 必须确认 public command accepted / queued / resolve-wait 后如何在 `open_host(options)` 内部唤醒 scheduler，确保 Service 不需要也不能读取内部 dispatch row、调用 scheduler / wakeup / dispatch control API 或调用 `dayu.host.dispatch` 私有入口。
+- 必须按 `docs/host/design.md` 已定 contract 落地并验证 session-level live Host event stream：在线 / 已 attach 客户端通过 `watch_session_events(session_id)` live watch 观察 typed `HostEvent`，支持多客户端打开同一 Session、queue、steer、retry / replay；run-level `stream_run_events(...)` / `HostEventView` 只作为内部 diagnostic / detail / debug / drill-down 契约，不作为聊天主入口，也不进入普通 Service-facing public contract。P13 Audit / Tool Trace / Outbox 不依赖 `HostEventView`，只消费 committed EventLog / typed projection input view。`watch_session_events` 不接收 cursor，不承担离线补读；拿到 / attach Session 前发生的 terminal/final answer 通知由 Outbox 承接。
+- P10.5 已确认多客户端写入策略：同一 Session 不引入 client ownership、session write lock 或 attach token。多个客户端可同时 `watch_session_events(session_id)`，也可同时提交 `submit_followup(queue)` / cancel / retry / replay 等 public command；写入顺序、幂等和冲突处理只能由 Host durable admission transaction、`client_request_id`、Run 状态 precondition、`event_sequence` 与 scheduler governance 决定。P10.5 smoke 必须覆盖多个 watcher 独立观察同一 Session，以及两个不同 `client_request_id` 的 queued prompts 按 durable accepted order 后续执行；相同 `(session_id, client_request_id)` 重放不得重复创建 Run。
+- P10.5 已确认 Outbox 裁剪：只冻结 attach / reconnect recipe、terminal identity 与去重要求；P10.5 不提供 Outbox concrete read / drain API，不把离线 terminal 补读计入 smoke coverage。Phase 13 必须补 concrete Outbox read / drain API、OutboxSink terminal delivery queue projection、terminal item idempotency 与离线 terminal delivery smoke，证明 Outbox drain 与随后 / 并发 live watch attach 不漏投、不重复展示同一 terminal answer。
+- P10.5 已确认 `submit_followup(queue)` request / response contract：第一条 prompt 和后续普通 prompt 使用同一个 `SubmitFollowupRequest` shape，不为首轮增加专用字段；`FollowupSnapshot` 以 `accepted_run_id`、`accepted_run_status` 和 command commit event sequence / durable read watermark 表达 command commit 后 durable 状态；该 watermark 不是 `watch_session_events` 的 cursor。无 active / start-blocking Run 时返回 `ACCEPTED`，有 active / start-blocking Run 时通常返回 `QUEUED`，随后由 scheduler governance 推进到 `RUNNING` / terminal；`queued_run_id` 不进入普通 Service-facing 主 contract。`start_run(...)` 的既有测试、README 和包根导出必须同步调整为内部 `_start_run(...)` 边界。
+- P10.5 已确认 per-run tool selection contract：Host opener / construction options 注入全量业务 `ToolBundle`；`SubmitFollowupRequest.tool_names` 只选择本次 Run 的业务工具名，不携带 raw `ToolBundle`、`ToolDefinition`、callable binding 或 discovery adapter。`None` / 省略表示全部业务工具，空集合表示禁用业务工具，非空集合表示指定子集。Host admission 必须校验工具名并冻结本次 effective tool set。
+- P10.5 已确认 memory catch-up / compactor / compactor execution baseline / budget policy / compact artifact root 的 Host opener construction contract。Compactor 共享 Host runtime / durable / memory / artifact 环境，但不共享每个 ordinary Run 的 `runner_spec` / `runner_options` / `agent_policy` / `tool_names` override；P10.5 必须验证 ordinary Service 只通过 public opener / handle 即可跑通 compact 后的多轮 continuity。P10.5 compact smoke 必须接入真实 compactor adapter；mock / test-double compactor 只能用于低层单元测试或辅助回归，不能作为 compact success signal，也不得绕过 canonical compact event、artifact 写入、memory projection consumption 和下一轮 RunInputBuilder 注入。
+- P10.5 已确认长事务裁剪：`WAITING` / wait record / `resolve_wait(...)` public resume path 纳入 public contract freeze 与 smoke；生产级 callback endpoint、callback auth / replay、poller 后台 loop、backoff / in-flight fencing、external job physical cancel / revoke 不纳入 P10.5。P10.5 必须验证 Run 进入 `WAITING` 后，调用方只通过 Host public `resolve_wait(...)` 提交 poll / callback / manual 已取得结果，Host 内部 wake scheduler / dispatch 并最终通过 `watch_session_events(...)` 产出 terminal HostEvent。
+- P10.5 已确认 Session cleanup 裁剪：只要求 `close_session(...)` public contract 可用并纳入 smoke；`purge_session(...)` destructive cleanup 继续归 Phase 15。P10.5 必须验证 `close_session(...)`、Host opener close 与 cancel 是三个不同动作：`close_session(...)` 只关闭 Session 新输入入口，不停止本地 runtime，不删除事实；Host opener close 只关闭当前 handle 的本地 runtime，不把 Session 改成 `CLOSED`，不写用户 cancel facts；cancel 才表达用户停止 Run 的治理意图。Session closed 后读取 / live watch 既有事实仍可用，新 `submit_followup(...)` 返回明确 invalid-state / typed error。Recommended Service policy 是用户意图为“结束会话并停止当前工作”时，Service 显式先调用 `cancel_session_runs(...)`，确认 cancel 可见后再 `close_session(...)`；Host 不在 `close_session(...)` 内自动 cancel。`purge_session(...)` 在 P10.5 可保持 unsupported / deferred 或 precondition error，但必须有清晰 public envelope / closed-handle guard，不能被当作 archive / close / cancel 使用。
+- P10.5 已确认 HostEventStream typed `HostEvent` terminal contract：普通 Service 通过 `watch_session_events(...)` 观察 terminal HostEvent 并展示 final answer，不直接查询 EventLog / payload 内部表；raw `EngineEvent` 不进入 Service-facing public API，`HostEventView` 改为 Host 内部 run-level diagnostic / detail DTO，不从 `dayu.host` public namespace 导出。P10.5 不定义 `wait_final_answer(...)` public API；final answer 主路径只能是 terminal HostEvent。第一版 terminal final answer view 字段固定为 `content`、`filtered`、`degraded`、`finish_reason` 与 terminal status；超时、取消、错误和 terminal 判断语义随 `watch_session_events(...)` / HostEventStream lifecycle 一并落地。
+- P10.5 已确认 per-run execution override 是 field-level partial merge，不是 all-or-nothing profile。`SubmitFollowupRequest.runner_spec`、`runner_options`、`agent_policy` 各字段省略时使用 `open_host(options)` baseline；字段出现时使用该字段的完整 typed value。plan / implementation 不得接受 patch dict、无结构 policy override、extra payload 或 profile registry lookup。
+- `steer`、`retry`、`replay` 的语义不作为 P10.5 开放设计问题重开；必须按 `docs/host/design.md` 已有定义落地本地语义、状态迁移、terminal race、idempotency 与 smoke。P10.5 的 phase-scope 裁剪只有：Recovery 专属 `LOST` / `RECOVERING` retry / cancel / recovery 处理不进入本 phase，继续归 Phase 11；不新增 `interrupt_*` public API，UI interrupt 文案只能映射到 `cancel_run(...)` 或 `submit_followup(steer)`。
+- P10.5 已确认 smoke 覆盖矩阵：real-runner no-tool multi-turn、mock-tool wiring、real-runner matrix、compact、WAITING resume、steer / retry / replay、cancel、`close_session(...)` public contract。mock runner smoke 已删除；对本轮不覆盖但接受的项必须有 owner 和后续 destination。
+- 若改变 public interface / contract，先和用户讨论并写回 `docs/host/post-p10.md` 或对应 phase plan。
+
+交付物：
+- phase design refinement / P10.5 discussion artifact
+- handoff implementation-ready plan
+- implementation slices
+- tests
+- docs update
+
+建议 slice 切分：
+- Slice 1: async Host opener / public handle、内部 composition root 与 public command -> scheduler wakeup 接线。
+- Slice 2: session-level live Host event stream、typed HostEvent、terminal final answer view、public Run API 状态语义测试与 Host README 同步。
+- Slice 3: 按 `docs/host/design.md` 已有定义实现 `submit_followup(steer)` 本地语义、terminal race、cancel / dispatch 接线与 tests；不新增 interrupt public API。
+- Slice 4: 按 `docs/host/design.md` 已有定义实现 `retry_run(...)` / `replay_run(...)` 本地语义、source Run 关联、retry policy tool fact reuse、no-tool replay policy 与 tests；`LOST` / `RECOVERING` retry 归 Phase 11。
+- Slice 5: real-runner no-tool / mock-tool wiring / cancel smoke，覆盖 `docs/host/post-p10.md` 的 S1 / S2 / S5 coverage matrix 与测试替身约束，并覆盖 steer / retry / replay / cancel smoke；mock runner 不计入 smoke success signal。
+- Slice 6: real-runner matrix smoke，使用硬编码 runner 参数并走同一 runtime / public command / public read path；至少覆盖 mimo、ds/deepseek、gemini、qwen 四类配置，环境不可用时对对应 provider 明确 skip 并记录原因。
+
+Plan 必须额外收口的 readiness review checklist：
+- 建立 S1-S5 与验证要求的统一 coverage table，明确每项 owner slice、测试名 / smoke 名、public-path 断言、skip 条件和后续 owner；不能只写“按 post-p10 覆盖”。
+- 在 Slice 1 中落定 `open_host(options)` 的 typed options shape，不能把 construction-time 依赖留成无结构 dict、service locator 或测试 harness。
+- 在 Slice 1 / Slice 5 / Slice 6 中覆盖 per-run `runner_spec` / `runner_options` / `agent_policy` field-level partial merge 与 effective config freeze；同一 Session 不同 Run 切换模型或参数必须通过 public request 证明。
+- 在 Slice 2 中把 `watch_session_events(session_id) -> AsyncIterator[HostEvent]` 写成唯一普通 Service-facing 事件入口；`HostEventStream` 若保留，只能作为内部实现或类型别名，不能成为新的 public handle。
+- 在 plan 文档中逐条引用三份 plan-readiness review artifact，并说明每个 non-blocking / clarification 的处理位置。
+
+验证要求：
+- unit tests: public contract validation、Host opener lifecycle、per-run tool_names selector validation / effective tool set freeze、session-level live watch lifecycle / fanout / filter semantics、typed HostEvent 与 terminal final answer view、public Run API `ACCEPTED -> scheduler governance -> RUNNING / terminal` 状态语义、steer / retry / replay request validation、idempotency、状态迁移与错误语义。
+- integration tests: real-runner no-tool multi-turn smoke、mock-tool wiring smoke、real-runner matrix smoke、真实 compactor compact smoke、WAITING -> public `resolve_wait(...)` resume smoke、steer / retry / replay local smoke、cancel smoke、`close_session(...)` public contract smoke。
+- smoke 覆盖：必须按 `docs/host/post-p10.md` 的 Smoke Coverage Matrix 标注 covered / not covered but accepted / blocking gap。
+- pyright: 受影响 Host / tests 通过，且不新增或扩散类型错误。
+- docs: `dayu/host/README.md`、`tests/README.md` 及必要的 `docs/host/post-p10.md` / phase plan 同步。
+
+退出条件：
+- 普通 Service 只调用 Host public interface / contract，即可完成普通本地多轮会话闭环：打开 Host、创建 / 取得 / 读取 session、通过 session-level live Host event stream 读取 / 订阅 typed HostEvent、通过 `submit_followup(queue)` 提交第一条与后续普通 prompt、在 terminal HostEvent 中观察 final answer、关闭 Host。
+- `submit_followup(steer)`、`retry_run(...)`、`replay_run(...)` 不再是普通本地语义下的 stable unsupported；它们的本地状态迁移、dispatch 接线、read / event 可见性和 smoke 已覆盖。Recovery-only 状态仍按 Phase 11 owner 处理。
+- real-runner no-tool、mock-tool wiring、real-runner matrix 与 cancel smoke 均使用同一 `open_host(options)` / public command / public read path；不得手工调用 scheduler internals、读取 dispatch row、直接查询 durable 内部表取得 answer / cancel result，或让 runner test double / mock tool 凑 expected answer。mock runner smoke 不进入 P10.5 success signal。
+- P10.5 对普通本地多轮会话 public interface / contract 的冻结结论已写入 `docs/host/post-p10.md` 或 phase closeout；任何未冻结项都有明确 owner 和后续 destination。
+- P10.5 已经把真实生产系统 Service 将来接入所需的 Host 普通多轮生产接线做实；真实 CLI / web / GUI 后续通过 Service 接入时，不需要绕过、替换或重写 P10.5 冻结的 Host public interface / contract。
+- P11 Recovery 可以在不破坏 P10.5 已冻结普通本地多轮 public contract 的前提下继续实施；若 P11 必须改变 public API 或核心契约，必须先回到用户讨论。
+- P11-P15 完成后，真实 CLI / web / GUI 接入不得要求重写 P10.5 已冻结的普通多轮生产接线；这些后续 phase 只能在该 public contract 上扩展 Recovery、ToolsDiscovery / ScenePrepare、Audit / Tool Trace / Outbox、RemoteProxy 与 Retention / Purge 能力。
+
+后续依赖：
+- 后续 phase 可依赖的稳定契约：普通本地多轮 Host public interface / contract、`open_host(options)` / public handle、internal composition root、command -> scheduler 内部接线、session-level live Host event stream、typed HostEvent terminal final answer view、steer / retry / replay 本地语义、no-tool / mock-tool / real-runner smoke coverage baseline。
+- 需要追踪到后续 phase 的事项：Recovery / startup crash recovery / positive orphan proof 归 Phase 11；ToolsDiscovery / ScenePrepare 归 Phase 12；Audit / Tool Trace / Outbox 归 Phase 13；RemoteProxy 归 Phase 14；Retention / Purge production hardening 归 Phase 15。
 
 ### Phase 11. Host Lifecycle / Recovery / Multi-process Hardening
 
 目标：
-- 实现 Host startup recovery scan、positive orphan proof、prompt accepted but answer not returned 的恢复语义、graceful shutdown 与多进程一致性硬化。
+- 实现 Host startup recovery scan、positive orphan proof、prompt accepted but answer not returned 的恢复语义、graceful shutdown 与多进程一致性硬化。P11 明确拥有“未被 LLM 响应的 prompt，崩溃退出重进恢复”：已 durable accepted 的 prompt 或已启动但未 terminal 的 Run，在 Host 重启后必须通过 recovery scan / positive orphan proof / recovery dispatch 继续，或按 policy 给出确定 terminal。
 
 对应设计章节：
 - `docs/host/design.md` §27 Host Lifecycle / Recovery
@@ -1169,6 +1293,8 @@ P9.5 收口清单：
 - `docs/host/design.md` §17 WorkerProxy / EngineWorker
 
 前置条件：
+- Phase 10.5 ordinary local multi-turn public contract freeze 已完成；P11 不得破坏 P10.5 已冻结的普通本地多轮 Host public interface / contract，若 Recovery 必须新增或调整 public API / 核心契约，必须先回到用户讨论。
+- P10.5 不证明 crash recovery，但已经冻结 Service 调用方式；P11 必须在同一 `open_host(...)` / session acquisition / `watch_session_events(...)` / public command contract 上补 recovery，不能要求真实 Service 改走另一套恢复入口。
 - Phase 5 dispatch record / LocalProxy 已完成。
 - Phase 2 host instance liveness foundation 已完成。
 - Phase 3 state transition / admission 已完成。
@@ -1285,7 +1411,7 @@ P9.5 收口清单：
 ### Phase 13. Audit / Tool Trace / Outbox Projections
 
 目标：
-- 在已稳定的 EventLog consumer framework 上实现 LogAuditSink、tool trace hot / cold storage 与 Outbox terminal delivery queue projection。
+- 在已稳定的 EventLog consumer framework 上实现 LogAuditSink、tool trace hot / cold storage、Outbox terminal delivery queue projection，以及 concrete Outbox read / drain API 与离线 terminal delivery smoke。
 
 对应设计章节：
 - `docs/host/design.md` §14 Observer / Sink / Projection
@@ -1312,7 +1438,7 @@ P9.5 收口清单：
 
 关键设计问题：
 - 必须确认 tool trace hot JSON 与 cold JSONL 的最小字段，以及 provider request id / operation context refs 的查询口径。
-- 必须确认 Outbox item identity 与 UI / Service seen cursor 推荐语义。
+- 必须确认 Outbox item identity、UI / Service seen cursor 推荐语义、concrete Outbox read / drain API shape，以及 Outbox drain 与随后 / 并发 session live watch attach 的去重 / 防漏窗口。
 - 必须确认 LogAuditSink 路径注入、append-only JSONL、sink failure 和 purge tombstone 查询语义。
 
 交付物：
@@ -1325,19 +1451,19 @@ P9.5 收口清单：
 建议 slice 切分：
 - Slice 1: LogAuditSink and audit JSONL。
 - Slice 2: tool trace hot JSON / cold JSONL。
-- Slice 3: OutboxSink and terminal delivery queue projection。
+- Slice 3: OutboxSink, terminal delivery queue projection, concrete read / drain API, offline terminal delivery smoke。
 
 验证要求：
-- unit tests: sink checkpoint idempotency、sink retry、audit / trace / outbox projection rebuild。
-- integration tests: terminal EventLog -> audit / tool trace / outbox；sink failure 不影响 Run terminal。
+- unit tests: sink checkpoint idempotency、sink retry、audit / trace / outbox projection rebuild、outbox item idempotency、read / drain cursor and dedupe semantics。
+- integration tests: terminal EventLog -> audit / tool trace / outbox；sink failure 不影响 Run terminal；离线 terminal 补读后再 attach `watch_session_events(...)` 不漏投、不重复展示同一 terminal answer。
 - pyright: projection sink modules 通过。
 - docs: Host README / tool trace analysis docs 按触发规则同步。
 
 退出条件：
-- Audit、Tool Trace、Outbox 均能从 committed EventLog 独立追平；任一 sink 失败只造成 projection lag 或 sink-local error，不影响 Host command path。
+- Audit、Tool Trace、Outbox 均能从 committed EventLog 独立追平；任一 sink 失败只造成 projection lag 或 sink-local error，不影响 Host command path。Service 可通过 concrete Outbox read / drain API 补读离线 terminal/final answer 增量，并用 terminal identity 与 session live watch 去重。
 
 后续依赖：
-- 后续 phase 可依赖的稳定契约：audit JSONL、tool trace hot / cold、outbox terminal delivery queue。
+- 后续 phase 可依赖的稳定契约：audit JSONL、tool trace hot / cold、outbox terminal delivery queue、concrete Outbox read / drain API 与离线 terminal delivery smoke baseline。
 - 需要追踪到后续 phase 的事项：Service / UI channel delivery、外部 audit 系统和长期归档策略不属于本 phase。
 
 ### Phase 14. RemoteProxy / RemoteStub
@@ -1472,6 +1598,86 @@ P9.5 收口清单：
 - 任何 deferred 项都必须有 owner / destination；没有 destination 时不能关闭对应 phase。
 
 ### 追踪区
+
+#### Phase 10 S4 Proactive Context Governance 残余风险追踪
+
+背景决议：
+
+- Phase 10 S4 已实现 accepted pre-start governance gate、proactive compact canonical events / artifact、
+  memory projection catch-up 后 start Attempt，以及 RunInputBuilder durable compact artifact provider。
+- S4 code review 没有 blocking / high / medium finding。Controller 接受 3 个 residual，不作为 S4 当前阻塞项。
+
+追踪项：
+
+- Compactor 调用与 compact artifact 文件写入当前位于 SQLite write transaction 内。真实异步 LLM compactor 接入前，
+  Phase 10 后续 reactive / production compactor owner 必须设计 durable in-progress / fencing，避免移出 transaction 后产生
+  重复 wakeup、cancel 与 compact limit 竞态。
+- Budget estimate 当前只覆盖当前 user input display text。后续 tokenizer / sizing owner 必须覆盖 RunInputBuilder messages、
+  tool schemas、memory snapshot 与 compact artifact refs；provider-specific tokenizer 仍归后续能力。
+- `promote_next_queued_run` legacy helper 当前仍保留 public method 表面。Phase 10 closeout 或后续 Host public API cleanup
+  必须复查是否收敛接口面，或让 helper 强制走 governance gate。
+
+#### Phase 10 S5 Reactive Overflow Recovery 残余风险追踪
+
+背景决议：
+
+- Phase 10 S5 已实现 Engine `context_compaction_requested` reactive fallback：Host 校验 Attempt / execution identity，
+  追加 reactive compact canonical facts，关闭旧 Attempt，进入 `RUN_RECOVERING`，compact accepted 后创建新 Attempt /
+  execution / dispatch，compact failure 后从 `RECOVERING` 收口 `FAILED`，不写 `LOST`。
+- S5 code review 没有 blocking / high / medium finding。Controller 接受一个代码组织 residual，不作为 S5 当前阻塞项。
+
+追踪项：
+
+- `EngineEventIngestor._start_reactive_context_recovery` 当前承担 reactive recovery 编排。方法体偏长但职责仍属于
+  EngineEvent ingest owner；Phase 10 Slice 6 或 aggregate review 若继续降低复杂度，可抽取 budget / compact decision
+  module-level helper，但不得改变 EventLog / state machine ordering。
+- `RECOVERING` cancel、startup recovery scan、positive orphan proof 和通用 recovery scan 不属于 P10 S5；Phase 11
+  Host Lifecycle / Recovery / Multi-process Hardening 必须接管。
+
+#### Phase 10 S6 Production Composition / Multi-turn Integration 残余风险追踪
+
+背景决议：
+
+- Phase 10 S6 已实现 command-level explicit budget input、composition helper、multi-turn proactive compact aggregate
+  integration 与 README 同步。
+- S6 initial review 中 DS F2 / F4 被 controller 接受为当前 slice fix item 并已修复；re-review 中 AgentMiMo 与
+  AgentDS 均 PASS。Controller 接受 F1 / F3 为 residual，不作为 S6 当前阻塞项。
+
+追踪项：
+
+- `compose_host_local_execution_options(...)` 是 Host 层 public composition helper；真实 Service / composition root
+  caller 尚未在 Host 包内实现。后续 production composition owner 必须显式调用该 helper 或等价 typed wiring，
+  不能从 Engine spec、per-run metadata 或 caller payload 读取预算参数。
+- 真实 production LLM compactor adapter 未在 S6 默认注入。production composition owner 必须显式提供
+  `ContextCompactor` 实现；未配置 compactor 时继续 fail closed，不得隐式使用 `FakeContextCompactor`。
+- S6 aggregate multi-turn test 串起 proactive compact -> memory projection -> subsequent Engine request，但完整业务工具
+  verified fact public fake-worker 链路仍由 ToolRuntime accept、memory projection 与 RunInputBuilder 的分层测试覆盖；
+  aggregate review 若要求更高保真业务工具 E2E，应作为 Phase 10 aggregate fix item，而不是把 fake compactor 注入
+  生产默认路径。
+
+#### Phase 10 Aggregate Deepreview 残余风险追踪
+
+背景决议：
+
+- Phase 10 aggregate deepreview artifacts 为
+  `docs/reviews/phase10-aggregate-deepreview-mimo-20260518.md` 与
+  `docs/reviews/phase10-aggregate-deepreview-ds-20260518.md`。AgentMiMo 与 AgentDS verdict 均为 PASS /
+  ready for draft PR。
+- Controller aggregate adjudication artifact 为
+  `docs/reviews/phase10-aggregate-deepreview-controller-adjudication-20260518.md`。
+
+追踪项：
+
+- DS AG1（LOW）：`EngineEventIngestor._close_attempt_for_context_recovery` DUPLICATE branch 未显式设置
+  `stop_worker_stream=True`；当前 scheduler 使用 `terminal_closeout or stop_worker_stream`，worker stream 仍会停止。
+  Owner: EngineEvent ingest hardening。
+- DS AG2（LOW）：reactive `CONTEXT_COMPACTION_REQUESTED` 当前在 closeout CAS 前追加。同一 SQLite write transaction
+  与前置 identity / terminal precondition 使正常路径安全；后续 defensive ordering cleanup 可将 request append 移到 closeout
+  成功后。Owner: EngineEvent ingest hardening。
+- DS AG3（LOW）：budget 压力下 pinned patch text 会降级为 opaque ref；Host truth 不受影响，但 LLM 可读性较弱。
+  Owner: Phase 13 memory diagnostic / retrieval owner。
+- DS INFO：accepted unique index 与 active unique index 部分重叠、`_cancel_queued` 等 helper 命名偏旧。Owner:
+  schema / admission cleanup owner。
 
 #### P9.5 Pre-P10 Cross-Repository Hardening PR 归属追踪
 
@@ -2032,6 +2238,269 @@ P9.5 收口清单：
 - 当前无 PR review blocking fix。
 
 ## 历史记录
+
+### 2026-05-18 Phase 10 draft PR gate passed
+
+Phase 10 Context Governance / Compaction draft PR gate 已完成。Branch
+`feat/host-phase10-context-governance` 已 push 到 GitHub，draft PR 61 已创建：
+`https://github.com/noho/dayu-agent-r/pull/61`，title 为 `feat(host): add Phase 10 context governance`，head branch 为
+`feat/host-phase10-context-governance`，base branch 为 `main`。PR state 为 open draft；
+`mergeStateStatus=CLEAN`，`mergeable=MERGEABLE`。GitHub checks 当前返回 no checks reported on the branch。
+
+PR review artifacts 为 `docs/reviews/pr-61-review-phase10-mimo-20260518.md` 与
+`docs/reviews/pr-61-review-phase10-ds-20260518.md`；两份 review 均 PASS，0 blocking / high / medium finding。
+Controller PR review adjudication artifact 为 `docs/reviews/pr-61-review-controller-adjudication-20260518.md`。
+Accepted PR review commit 为 `be03578`。PR body 已补充 PR-level review artifact 链接。PR gate validation 继承
+aggregate gate：focused pytest 81 passed + 180 passed；`pyright` 0 errors / 0 warnings / 0 informations；
+`git diff --check` clean。当前 gate 为 `draft-PR-pass`。后续 merge、mark ready for review、request reviewers、
+approve、delete branch 或对外 comment 仍需用户额外授权。
+
+### 2026-05-18 Phase 10 aggregate deepreview accepted
+
+Phase 10 aggregate deepreview 已完成。Aggregate review artifacts 为
+`docs/reviews/phase10-aggregate-deepreview-mimo-20260518.md` 与
+`docs/reviews/phase10-aggregate-deepreview-ds-20260518.md`。AgentMiMo verdict 为 PASS，明确 Phase 10 已可进入
+`ready-to-open-draft-PR`；AgentDS verdict 为 PASS / Ready for draft PR，提出 3 个 LOW 与若干 INFO / residual。
+
+Controller 裁决：AG1 / AG2 / AG3 均接受为 non-blocking residual，不作为 PR 前 fix。AG1 不影响当前 worker stream
+停止，因为 scheduler 同时检查 `terminal_closeout or stop_worker_stream`；AG2 是同事务 defensive ordering cleanup；
+AG3 是预算压力下的可读性降级，不影响 Host truth。Controller aggregate adjudication artifact 为
+`docs/reviews/phase10-aggregate-deepreview-controller-adjudication-20260518.md`。
+
+Phase 10 达成：Host-owned `ContextBudgetPolicy`、proactive pre-start compaction、reactive overflow recovery、
+canonical compact event / artifact、P9 memory projection consumption、RunInputBuilder compact / memory provider、
+production composition wiring，以及 multi-turn proactive compact -> memory projection -> subsequent Engine request
+aggregate validation。
+
+Validation：S6 后 controller focused validation 为 81 passed + 180 passed；`pyright` 0 errors / 0 warnings /
+0 informations；`git diff --check` clean。AgentMiMo aggregate review 另行复现 261 passed、pyright 0、diff check clean。
+当前 gate 进入 `ready-to-open-draft-PR`。Aggregate review commit 在本条记录提交后由 git commit 记录。
+
+### 2026-05-18 Phase 10 S6 Production Composition / Multi-turn Integration accepted
+
+Phase 10 S6 Production Composition Wiring / Multi-turn Integration / Docs Sync 已完成。Implementation artifact 为
+`docs/reviews/phase10-s6-production-composition-integration-implementation-20260518.md`。Initial code review artifacts
+为 `docs/reviews/phase10-s6-code-review-mimo-20260518.md` 与
+`docs/reviews/phase10-s6-code-review-ds-20260518.md`。
+
+Controller 裁决：AgentMiMo review 为 PASS；AgentDS review 为 PASS_WITH_RESIDUAL，但提出两个 medium finding。
+Controller 接受 DS F2 / F4 为当前 slice fix item：`HostCommandHandleOptions.context_window_size` 与
+`reserved_output_tokens` 必须是 composition root 显式 typed input，不得有 production 默认值；Phase 10 必须补一个
+multi-turn aggregate integration test 串起 proactive compact、memory projection catch-up 与 subsequent Engine request。
+Controller 接受 DS F1 / F3 为 residual：composition helper 不由同步 command factory 隐式调用，production helper 不默认注入
+fake compactor。Fix artifact 为 `docs/reviews/phase10-s6-review-fix-codex-20260518.md`。
+
+Re-review artifacts 为 `docs/reviews/phase10-s6-code-rereview-mimo-20260518.md` 与
+`docs/reviews/phase10-s6-code-rereview-ds-20260518.md`；两份 re-review 均 PASS，remaining blocking / high /
+medium findings 为 0。Controller adjudication artifact 为
+`docs/reviews/phase10-s6-code-review-controller-adjudication-20260518.md`。
+
+S6 交付：`HostCommandHandleOptions` 新增必填 `context_window_size` 与 `reserved_output_tokens`，可选
+hard threshold / minimum protection tokens；`compose_host_local_execution_options(...)` 从 command options 构造 typed
+`ContextBudgetPolicy` 并注入 compact artifact root，保持 memory projection policy 与 context budget policy 分离；
+新增 multi-turn aggregate integration 覆盖 follow-up under budget raw turn、soft threshold proactive compact、
+`CONTEXT_COMPACTED` pre-start ordering、compact artifact provider 与 subsequent Run memory 注入。
+
+Validation：`pytest tests/host/test_public_contracts.py tests/host/test_phase5_local_execution_integration.py
+tests/host/test_dispatch_scheduler.py -q` 81 passed；`pytest tests/host/test_context_budget.py
+tests/host/test_compaction_contract.py tests/host/test_compact_artifact_store.py tests/host/test_context_compact_events.py
+tests/host/test_memory_projection.py tests/host/test_run_input_builder.py tests/host/test_engine_ingest_mapping.py
+tests/host/test_run_attempt_transitions.py -q` 180 passed；`pyright` 0 errors / 0 warnings / 0 informations；
+`git diff --check` clean。当前 gate 进入 Phase 10 aggregate deepreview。Accepted slice commit 在本条记录提交后由
+git commit 记录。
+
+### 2026-05-18 Phase 10 S5 Reactive Overflow Recovery accepted
+
+Phase 10 S5 Reactive Engine Overflow Recovery 已完成。Implementation artifact 为
+`docs/reviews/phase10-s5-reactive-overflow-recovery-implementation-20260518.md`。Code review artifacts 为
+`docs/reviews/phase10-s5-code-review-mimo-20260518.md` 与
+`docs/reviews/phase10-s5-code-review-ds-20260518.md`。
+
+Controller 裁决：AgentMiMo review 为 PASS，AgentDS review 为 ACCEPTED_WITH_RESIDUAL。Controller 接受
+MiMo low doc finding 并已修正 implementation artifact 测试计数；DS 的 worker accept -> recovery 覆盖 finding
+裁决为 rejected-with-evidence，因为 scheduler integration 测试实际覆盖 worker accept 后的 Engine event recovery
+路径；DS 的 orchestration method length 接受为 residual 并写入追踪区。Controller adjudication artifact 为
+`docs/reviews/phase10-s5-code-review-controller-adjudication-20260518.md`。
+
+S5 交付：`EngineEventIngestor` 将 Engine `context_compaction_requested` 映射为
+`CONTEXT_COMPACTION_REQUESTED(trigger_source=reactive)`，使用 Host estimator / policy 而不是 Engine
+`budget_state` 作为预算真源；旧 Attempt 关闭为 `ATTEMPT_FAILED`，Run 写入 `RUN_RECOVERING`；compact accepted
+后写 compact artifact / `CONTEXT_COMPACTED`，追平 P9 memory projection，再创建新的 Attempt / execution /
+dispatch record 并写 `RUN_STARTED(start_reason=recovery)`、`ATTEMPT_STARTED`；compact failure、count 上限、
+count 损坏、compactor 缺失、quality rejected 或 compact 后 hard threshold 均从 `RECOVERING` 收口 `FAILED`，
+不写 `LOST`。新增 `EngineIngestResult.stop_worker_stream`，使 recovery accepted 能停止旧 worker stream、释放
+lane / handle，但不清理同 Run duplicate governance registry，也不触发 queued promotion。
+
+Validation：`pytest tests/host/test_engine_ingest_mapping.py tests/host/test_run_attempt_transitions.py
+tests/host/test_dispatch_scheduler.py tests/host/test_phase5_local_execution_integration.py -q` 104 passed；
+`pyright` 0 errors / 0 warnings / 0 informations；`git diff --check` clean。当前 gate 进入 Phase 10 S6
+Production Composition Wiring / Multi-turn Integration Validation / Docs Sync implementation。Accepted slice commit
+在本条记录提交后由 git commit 记录。
+
+### 2026-05-18 Phase 10 S4 Proactive Context Governance accepted
+
+Phase 10 S4 Proactive Pre-dispatch Context Governance / RunInputBuilder Compact Provider 已完成。Implementation artifact 为
+`docs/reviews/phase10-s4-proactive-context-governance-implementation-20260518.md`。Code review artifacts 为
+`docs/reviews/phase10-s4-code-review-mimo-20260518.md` 与
+`docs/reviews/phase10-s4-code-review-ds-20260518.md`。
+
+Controller 裁决：AgentMiMo review 为 PASS，AgentDS review 为 ACCEPTED_WITH_RESIDUAL。Controller 接受 3 个
+residual：compactor / artifact write 位于 SQLite write transaction 内、budget estimate 只覆盖当前 prompt、
+`promote_next_queued_run` legacy helper 表面仍存在。上述 residual 已写入追踪区，不阻塞 S4 accepted。
+Controller adjudication artifact 为
+`docs/reviews/phase10-s4-code-review-controller-adjudication-20260518.md`。
+
+S4 交付：新增 `RunStatus.ACCEPTED` 与 schema v9，admission `start_run` 先创建 accepted Run 且不创建 Attempt；
+scheduler `wake_queue_promotion` 成为 production pre-start governance gate；soft threshold 触发 proactive compact，
+hard threshold / compact failure 以 attempt-free `RUN_FAILED` 收口；compact accepted 后先 catch up P9 memory projection，
+再创建 `RUN_STARTED` / `ATTEMPT_STARTED` / dispatch record。RunInputBuilder production path 注入
+`DurableCompactArtifactProvider`，只向 Engine 暴露 compact artifact ref / digest、compacted event refs、preserved fact refs
+与 bounded episode summary。
+
+Validation：`pytest tests/host/test_run_attempt_transitions.py tests/host/test_admission_queue.py
+tests/host/test_dispatch_scheduler.py tests/host/test_phase5_local_execution_integration.py
+tests/host/test_run_input_builder.py -q` 124 passed；`pyright` 0 errors / 0 warnings / 0 informations；
+`git diff --check` clean。当前 gate 进入 Phase 10 S5 Reactive Engine Overflow Recovery implementation。
+Accepted slice commit 在本条记录提交后由 git commit 记录。
+
+### 2026-05-18 Phase 10 S3 Canonical Compact Events accepted
+
+Phase 10 S3 Compact Canonical Events / P9 Memory Projection Consumption 已完成。Implementation artifact 为
+`docs/reviews/phase10-s3-context-events-memory-projection-implementation-20260518.md`。Code review artifacts 为
+`docs/reviews/phase10-s3-code-review-mimo-20260518.md` 与
+`docs/reviews/phase10-s3-code-review-ds-20260518.md`。
+
+Controller 裁决：AgentMiMo review 为 PASS，AgentDS review 为 PASS with accepted medium hardening item。Controller
+接受 DS M1 为当前 slice fix item：`CONTEXT_COMPACTED` validator 必须拒绝非空
+`episode_summary_candidate.proposed_verified_fact_refs`，防止 accepted compact summary 在 canonical payload 层
+携带“新建 verified fact”提议；同时前置补强 replace patch value validator。Fix artifact 为
+`docs/reviews/phase10-s3-code-review-fix-codex-20260518.md`。Re-review artifacts 为
+`docs/reviews/phase10-s3-code-rereview-mimo-20260518.md` 与
+`docs/reviews/phase10-s3-code-rereview-ds-20260518.md`；两份 re-review 均 PASS，remaining blocking / high /
+medium findings 为 0。Controller adjudication artifact 为
+`docs/reviews/phase10-s3-code-review-controller-adjudication-20260518.md`。
+
+S3 交付：新增 `dayu.host.context_events` 作为 `CONTEXT_COMPACTION_REQUESTED`、`CONTEXT_COMPACTED` 与
+`CONTEXT_COMPACTION_FAILED` payload builder / validator 真源；P9 memory projection 改为消费 accepted
+`CONTEXT_COMPACTED`，episode summary 只物化为 assumption continuity item，pinned state patch candidate 按
+missing / clear / replace 三态更新，verified facts 仍只来自 `TOOL_RESULT_ACCEPTED`。Production memory consumer /
+RunInputBuilder inline delta filter 纳入 `CONTEXT_COMPACTED`，不消费 `CONTEXT_COMPACTION_FAILED`。
+
+Validation：`pytest tests/host/test_context_compact_events.py tests/host/test_memory_projection.py
+tests/host/test_run_input_builder.py -q` 79 passed；`pyright` 0 errors / 0 warnings / 0 informations；
+`git diff --check` clean。当前 gate 进入 Phase 10 S4 Proactive Context Governance Orchestration implementation。
+Accepted slice commit 在本条记录提交后由 git commit 记录。
+
+### 2026-05-18 Phase 10 S2 Compaction Contracts accepted
+
+Phase 10 S2 Compactor Contracts / Fake Compactor / Quality Check / Artifact Store 已完成。Implementation
+artifact 为 `docs/reviews/phase10-s2-compaction-contracts-implementation-20260518.md`。Code review artifacts 为
+`docs/reviews/phase10-s2-code-review-mimo-20260518.md` 与
+`docs/reviews/phase10-s2-code-review-ds-20260518.md`。
+
+Controller 裁决：AgentMiMo review 为 PASS，AgentDS review 为 CHANGES_REQUESTED。Controller 接受 DS B1、
+M1、M2 与 residual R2 为当前 slice fix items：`CompactionRequest.__post_init__` 必须先校验
+`CurrentMessageSummary` 类型再访问属性；非法 current-message-summary 类型、`CompactQualityCheckResult`
+accepted/rejected invariant 必须有直测；reactive compaction request 必须携带非空 `attempt_id` 与
+`execution_id`，proactive compact 可省略。Fix artifact 为
+`docs/reviews/phase10-s2-code-review-fix-codex-20260518.md`。Re-review artifacts 为
+`docs/reviews/phase10-s2-code-rereview-mimo-20260518.md` 与
+`docs/reviews/phase10-s2-code-rereview-ds-20260518.md`；两份 re-review 均 PASS，remaining blocking / high
+findings 为 0。Controller adjudication artifact 为
+`docs/reviews/phase10-s2-code-review-controller-adjudication-20260518.md`。
+
+S2 交付：新增 Host typed compactor contract、deterministic fake compactor、quality checker、compact artifact
+store 与 focused tests。Quality checker 拒绝丢失当前用户输入、丢失 accepted tool fact refs、summary 伪造
+verified fact、缺 preservation evidence、evidence anchor 未保留、pinned patch 三态非法或引用未知 evidence。
+Compact artifact store 只写 canonical JSON artifact 与 payload descriptor，不写 EventLog；fake compactor 只允许
+测试 / 本地开发显式注入。README 同步：`dayu/host/README.md` 与 `tests/README.md` 已记录当前实现事实与测试入口。
+
+Validation：`pytest tests/host/test_compaction_contract.py tests/host/test_compact_artifact_store.py -q` 17 passed；
+`pyright` 0 errors / 0 warnings / 0 informations；`git diff --check` clean。当前 gate 进入 Phase 10 S3 Canonical
+Compact Events And P9 Memory Projection Consumption implementation。Accepted slice commit 在本条记录提交后由 git
+commit 记录。
+
+### 2026-05-18 Phase 10 S1 Context Budget Policy accepted
+
+Phase 10 S1 Context Budget Policy / Estimator / Usage Observation 已完成。Implementation artifact 为
+`docs/reviews/phase10-s1-context-budget-implementation-20260518.md`。Code review artifacts 为
+`docs/reviews/phase10-s1-code-review-mimo-20260518.md` 与
+`docs/reviews/phase10-s1-code-review-ds-20260518.md`。
+
+Controller 裁决：两份 initial review 均为 PASS，但接受 DS H1 与 MiMo/DS M1/M3、DS M2 作为当前 slice fix
+items：`dayu.host.durable.event_log` 不得导入 context policy 语义；重复整数 validation helper 必须收敛到
+Host 层共享校验真源；soft threshold ratio 不得与默认 safety margin 形成双真源；EventLog payload filter
+fail-closed 边界必须有测试覆盖。Fix artifact 为
+`docs/reviews/phase10-s1-code-review-fix-codex-20260518.md`。Re-review artifacts 为
+`docs/reviews/phase10-s1-code-rereview-mimo-20260518.md` 与
+`docs/reviews/phase10-s1-code-rereview-ds-20260518.md`；两份 re-review 均 PASS，remaining blocking / high /
+medium findings 为 0。Controller adjudication artifact 为
+`docs/reviews/phase10-s1-code-review-controller-adjudication-20260518.md`。
+
+S1 交付：新增 Host context budget typed policy / static provider、conservative estimator、usage observation
+typed model、`HostLocalExecutionOptions.context_budget_policy` typed 接收点，以及 durable-neutral
+`EventPayloadTextEqualsFilter` + transaction-scoped committed fact count helper。预算真源仍只来自 Host typed policy；
+`USAGE_REPORTED` payload 未扩展，provider overflow `budget_state=None` 不成为 Host budget truth。README 同步：
+`dayu/host/README.md` 已记录当前 Host local execution options context budget policy typed 边界与 EventLog
+committed fact 统计能力。
+
+Validation：`pytest tests/host/test_context_budget.py tests/host/test_public_contracts.py tests/host/test_engine_ingest_mapping.py -q`
+81 passed；`pyright` 0 errors / 0 warnings / 0 informations；`git diff --check` clean。当前 gate 进入 Phase 10
+S2 Compactor Contracts / Fake Compactor / Quality Check / Artifact Store implementation。Accepted slice commit 在本条记录提交后由 git commit 记录。
+
+### 2026-05-18 Phase 10 implementation-ready plan accepted
+
+Phase 10 Context Governance / Compaction implementation-ready handoff plan 已写入
+`docs/host/phase10-context-governance-plan.md`。Initial plan review artifacts 为
+`docs/reviews/phase10-plan-review-mimo-20260518.md` 与
+`docs/reviews/phase10-plan-review-ds-20260518.md`。AgentMiMo verdict 为 CHANGES_REQUESTED，blocking
+findings B1 / B2 / B3 分别覆盖 `RunStatus.ACCEPTED` cancel path、queued promotion governance bypass 与
+`CONTEXT_COMPACTED` memory projection parsing specificity；AgentDS verdict 为 PASS，但提出 pre-start governance
+wakeup、`ACCEPTED` 与 `ATTACH_ACTIVE` 交互、queued promotion transition 的 high-severity plan clarifications。
+
+Plan fix artifact 为 `docs/reviews/phase10-plan-fix-codex-20260518.md`。Fix 后的 re-review artifacts 为
+`docs/reviews/phase10-plan-rereview-mimo-20260518.md` 与
+`docs/reviews/phase10-plan-rereview-ds-20260518.md`；两份 re-review 均 PASS，remaining blocking / high findings
+为 0。Controller adjudication artifact 为
+`docs/reviews/phase10-plan-review-controller-adjudication-20260518.md`。Controller 接受 DS re-review 的
+non-blocking medium finding 作为 Slice 4 implementation action：实现必须显式解决 concurrent `ACCEPTED`
+Run guard，可选 fresh-schema partial uniqueness guard 或等价 fail-safe；同时 Slice 4 应先定义
+`StartGovernanceCandidate` typed contract，并裁决旧 combined start helper 的生产路径移除方式。
+
+Phase 10 plan gate 已接受，当前 gate 进入 Phase 10 implementation。Plan gate validation：`git diff --check`
+clean。Accepted plan commit 在本条记录提交后由 git commit 记录。
+
+### 2026-05-18 Phase 10 design discussion accepted
+
+Phase 10 Context Governance / Compaction design discussion 已完成。已确认 policy 默认值、`context_window_size` /
+`reserved_output_tokens` 输入来源、usage observation 边界、proactive / reactive compact failure policy、P9 / P10
+单向配合边界，以及多轮会话主体闭环的数据来源。P10 第一版必须包含 Host-owned typed compactor port、episode summary
+candidate、pinned state patch candidate、canonical compact event / artifact、P9 memory projection consumption、
+RunInputBuilder compact provider 与 production composition wiring。当前 gate 进入 Phase 10 implementation-ready handoff plan。
+
+### 2026-05-18 P9.5 merged and Phase 10 opened
+
+P9.5 Draft PR 60 `https://github.com/noho/dayu-agent-r/pull/60` 已合并，merge commit 为 `f131fb8`。
+当前 Host phase 工作入口进入 Phase 10 Context Governance / Compaction design discussion / design refinement。
+Phase 10 必须先确认 conservative estimator、provider-aware configured limits、safety margin、compact policy 默认值、
+proactive / reactive transaction 与 state transition、compact artifact quality check，以及 compact failure policy；
+确认后才允许生成 implementation-ready handoff plan。
+已确认的 Phase 10 discussion decision：`reserved_output_tokens` 由 Service / composition root 作为 Host context policy
+显式 typed input 传入，并与 `context_window_size` 一起由 policy provider 提供；Host 不从 Engine、per-run metadata 或
+extra payload 读取预算参数。Runner usage 只作为 post-call observation / diagnostics / calibration 输入，不替代 pre-dispatch
+estimator。
+补充确认的 policy decision：默认 safety margin 为 20%；soft threshold 为输入预算的 80%；hard threshold 由 policy provider
+显式给出或按输入预算扣除 policy 定义的最小保护余量后计算；每个 Run 的 proactive trigger 与 reactive trigger 第一版各最多
+compact 一次；proactive compact failure 让 Run 在 dispatch 前 `FAILED` 且不创建 Attempt；reactive compact failure 在当前
+Attempt 关闭后让 Run `FAILED`；`LOST` 保留给 Phase 11 recovery owner；usage 第一版只记录 diagnostics / calibration
+observation，不自动动态调参。
+P9 / P10 配合边界：P9 Conversation Memory 只提供 EventLog read model、snapshot cursor、policy digest 与 diagnostics；
+P10 Context Governance 可读取 memory snapshot 做预算和 compact，但不得直接写 memory snapshot，不得让 compact summary
+替代 verified fact / evidence anchor，不得把 memory projection lag 当作 Run recovery。
+补充的 discussion decision：P10 第一版必须包含 Host-owned typed compactor port，允许调用 LLM compaction scene
+生成 episode summary candidate 与 pinned state patch candidate；LLM 只作为候选提案者，Host 做质量检查与
+canonical compact event / artifact accept，P9 memory projection 后续消费已提交 facts 物化 memory view。Phase 10 plan
+不得只实现 budget 裁剪而不定义 stable layer / history pool 的新数据来源。
 
 ### 2026-05-18 P9.5 completed
 

@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 import pathlib
-from dataclasses import fields, is_dataclass, replace
+from dataclasses import MISSING, fields, is_dataclass, replace
 from datetime import UTC, datetime, timedelta, timezone
 from enum import StrEnum
 from typing import Protocol, cast
@@ -70,7 +70,9 @@ from dayu.host import (
     WaitProviderStatusRef,
     WaitResolutionSource,
 )
+from dayu.host.command import compose_host_local_execution_options
 from dayu.host.tool_runtime import ToolFactKind
+from dayu.host.context_policy import ContextBudgetPolicy, default_context_budget_policy
 from dayu.host.memory import MemoryProjectionPolicy
 from dayu.engine.contracts.agent_policy import AgentPolicy
 from dayu.engine.contracts.runner_spec import RunnerCallOptions, RunnerSpec
@@ -261,6 +263,8 @@ def _host_command_handle_options() -> HostCommandHandleOptions:
         sqlite_write_retry_backoff_multiplier=2.0,
         sqlite_write_retry_max_delay_seconds=1.0,
         payload_inline_threshold_bytes=4096,
+        context_window_size=8192,
+        reserved_output_tokens=1024,
     )
 
 
@@ -352,6 +356,7 @@ def test_status_and_error_enum_values_are_stable() -> None:
         "CLOSED": "closed",
     }
     assert {item.name: item.value for item in RunStatus} == {
+        "ACCEPTED": "accepted",
         "QUEUED": "queued",
         "RUNNING": "running",
         "WAITING": "waiting",
@@ -572,6 +577,71 @@ def test_host_command_handle_options_accept_valid_shape() -> None:
     assert options.db_path == pathlib.Path("workspace/host.sqlite3")
     assert options.artifact_root == pathlib.Path("workspace/artifacts")
     assert options.create_parent_dirs is True
+    assert options.context_window_size > options.reserved_output_tokens
+    assert options.context_budget_hard_threshold_tokens is None
+    assert options.context_budget_minimum_protection_tokens is None
+
+
+def test_host_command_handle_options_require_explicit_budget_inputs() -> None:
+    """HostCommandHandleOptions 不为 window / reserved budget 提供默认值。"""
+
+    field_map = {
+        field.name: field for field in fields(HostCommandHandleOptions)
+    }
+
+    assert field_map["context_window_size"].default is MISSING
+    assert field_map["reserved_output_tokens"].default is MISSING
+
+
+def test_host_command_handle_options_accept_explicit_context_budget() -> None:
+    """HostCommandHandleOptions 接受显式 context budget typed 输入。"""
+
+    options = replace(
+        _host_command_handle_options(),
+        context_window_size=4096,
+        reserved_output_tokens=512,
+        context_budget_hard_threshold_tokens=3000,
+        context_budget_minimum_protection_tokens=128,
+    )
+
+    assert options.context_window_size == 4096
+    assert options.reserved_output_tokens == 512
+    assert options.context_budget_hard_threshold_tokens == 3000
+    assert options.context_budget_minimum_protection_tokens == 128
+
+
+def test_compose_host_local_execution_options_wires_context_policy() -> None:
+    """command composition 从 public options 构造 Host context policy。"""
+
+    local_execution = _local_execution_options()
+    options = replace(
+        _host_command_handle_options(),
+        local_execution=local_execution,
+        artifact_root=pathlib.Path("workspace/compact-artifacts"),
+        context_window_size=4096,
+        reserved_output_tokens=512,
+        context_budget_hard_threshold_tokens=3000,
+        context_budget_minimum_protection_tokens=128,
+    )
+
+    composed = compose_host_local_execution_options(options)
+
+    assert composed is not None
+    assert composed.context_budget_policy is not None
+    assert composed.context_budget_policy.context_window_size == 4096
+    assert composed.context_budget_policy.reserved_output_tokens == 512
+    assert composed.context_budget_policy.hard_threshold_tokens == 3000
+    assert composed.context_budget_policy.minimum_protection_tokens == 128
+    assert composed.memory_projection_policy is local_execution.memory_projection_policy
+    assert composed.compact_artifact_root == pathlib.Path(
+        "workspace/compact-artifacts"
+    )
+
+
+def test_compose_host_local_execution_options_without_local_execution_is_none() -> None:
+    """command composition 未配置 local execution 时不构造 scheduler 配置。"""
+
+    assert compose_host_local_execution_options(_host_command_handle_options()) is None
 
 
 def test_host_command_handle_options_rejects_empty_handle_id() -> None:
@@ -649,6 +719,42 @@ def test_host_command_handle_options_rejects_invalid_numeric_values() -> None:
             _host_command_handle_options(),
             payload_inline_threshold_bytes=cast(int, True),
         )
+    with pytest.raises(ValueError, match="context_window_size"):
+        replace(_host_command_handle_options(), context_window_size=0)
+    with pytest.raises(TypeError, match="context_window_size"):
+        replace(
+            _host_command_handle_options(),
+            context_window_size=cast(int, True),
+        )
+    with pytest.raises(ValueError, match="reserved_output_tokens"):
+        replace(_host_command_handle_options(), reserved_output_tokens=0)
+    with pytest.raises(TypeError, match="reserved_output_tokens"):
+        replace(
+            _host_command_handle_options(),
+            reserved_output_tokens=cast(int, True),
+        )
+    with pytest.raises(ValueError, match="reserved_output_tokens"):
+        replace(
+            _host_command_handle_options(),
+            context_window_size=1000,
+            reserved_output_tokens=1000,
+            context_budget_minimum_protection_tokens=1,
+        )
+    with pytest.raises(ValueError, match="hard_threshold_tokens"):
+        replace(
+            _host_command_handle_options(),
+            context_window_size=1000,
+            reserved_output_tokens=100,
+            context_budget_hard_threshold_tokens=901,
+            context_budget_minimum_protection_tokens=1,
+        )
+    with pytest.raises(ValueError, match="minimum_protection_tokens"):
+        replace(
+            _host_command_handle_options(),
+            context_window_size=1000,
+            reserved_output_tokens=100,
+            context_budget_minimum_protection_tokens=900,
+        )
 
 
 def test_host_local_execution_options_accept_valid_shape() -> None:
@@ -660,8 +766,19 @@ def test_host_local_execution_options_accept_valid_shape() -> None:
     assert options.runner_spec.provider == "test"
     assert options.runner_options.stream is False
     assert options.agent_policy.allow_tool_calls is False
+    assert options.context_budget_policy is None
     assert options.memory_projection_policy.max_verified_facts > 0
     assert options.memory_projection_catchup_batch_size > 0
+
+    with_budget = replace(
+        options,
+        context_budget_policy=default_context_budget_policy(
+            context_window_size=2048,
+            reserved_output_tokens=512,
+        ),
+    )
+    assert with_budget.context_budget_policy is not None
+    assert with_budget.context_budget_policy.context_window_size == 2048
 
 
 def test_host_local_execution_options_rejects_invalid_typed_fields() -> None:
@@ -687,6 +804,14 @@ def test_host_local_execution_options_rejects_invalid_typed_fields() -> None:
             _local_execution_options(),
             worker_factory=cast(LocalEngineWorkerFactory, None),
         )
+    with pytest.raises(TypeError, match="context_budget_policy"):
+        replace(
+            _local_execution_options(),
+            context_budget_policy=cast(
+                ContextBudgetPolicy,
+                _runner_spec(),
+            ),
+        )
     with pytest.raises(TypeError, match="memory_projection_policy"):
         replace(
             _local_execution_options(),
@@ -694,6 +819,24 @@ def test_host_local_execution_options_rejects_invalid_typed_fields() -> None:
         )
     with pytest.raises(ValueError, match="memory_projection_catchup_batch_size"):
         replace(_local_execution_options(), memory_projection_catchup_batch_size=0)
+
+
+def test_context_budget_inputs_are_not_per_run_fields() -> None:
+    """context budget 输入只存在于 composition options，不在 per-run request。"""
+
+    start_fields = {field.name for field in fields(StartRunRequest)}
+    followup_fields = {field.name for field in fields(SubmitFollowupRequest)}
+    metadata_fields = {field.name for field in fields(HostMetadataEntry)}
+    forbidden = {
+        "context_window_size",
+        "reserved_output_tokens",
+        "context_budget_hard_threshold_tokens",
+        "context_budget_minimum_protection_tokens",
+    }
+
+    assert forbidden.isdisjoint(start_fields)
+    assert forbidden.isdisjoint(followup_fields)
+    assert forbidden.isdisjoint(metadata_fields)
 
 
 def test_operation_context_rejects_empty_optional_text_fields() -> None:

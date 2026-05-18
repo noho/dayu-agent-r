@@ -277,6 +277,92 @@ def _tool_payload(*, summary: str | None) -> dict[str, JsonValue]:
     return payload
 
 
+def _compact_payload(
+    *,
+    summary_text: str,
+    confirmed_fact_refs: tuple[str, ...] = (),
+    pinned_patch: dict[str, JsonValue] | None = None,
+) -> dict[str, JsonValue]:
+    """构造测试用 CONTEXT_COMPACTED payload。
+
+    :param summary_text: episode summary 文本。
+    :param confirmed_fact_refs: summary 引用的既有 tool fact refs。
+    :param pinned_patch: 可选 pinned patch candidate。
+    :returns: compacted canonical payload。
+    """
+
+    patch = pinned_patch if pinned_patch is not None else _missing_pinned_patch()
+    return {
+        "compact_artifact_ref": "compact-artifact:test",
+        "compact_artifact_digest": _DIGEST_A,
+        "episode_summary_candidate": {
+            "candidate_id": "summary-test",
+            "summary_text": summary_text,
+            "episode_title": "episode",
+            "goal": "goal",
+            "completed_actions": [],
+            "confirmed_fact_refs": list(confirmed_fact_refs),
+            "confirmed_fact_summaries": [],
+            "user_constraints": [],
+            "open_questions": [],
+            "next_step": None,
+            "tool_finding_refs": list(confirmed_fact_refs),
+            "source_event_refs": ["event-input"],
+            "evidence_refs": ["evidence-1"],
+            "proposed_verified_fact_refs": [],
+        },
+        "pinned_state_patch_candidate": patch,
+        "preservation_evidence": [
+            {
+                "evidence_id": "evidence-1",
+                "input_event_refs": ["event-input"],
+                "tool_fact_refs": list(confirmed_fact_refs),
+                "memory_snapshot_cursor": None,
+                "compact_input_range": None,
+            }
+        ],
+        "preserved_fact_refs": {
+            "tool_fact_refs": list(confirmed_fact_refs),
+            "verified_fact_refs": list(confirmed_fact_refs),
+        },
+        "dropped_ranges": [],
+        "summarized_ranges": [],
+        "evidence_anchors_retained": True,
+        "quality_check_result": {
+            "accepted": True,
+            "rejection_reasons": [],
+            "current_user_input_retained": True,
+            "accepted_tool_fact_refs_retained": True,
+            "evidence_anchors_retained": True,
+            "open_questions_retained": True,
+            "retained_evidence_refs": ["evidence-1"],
+            "dropped_ranges": [],
+            "summarized_ranges": [],
+        },
+        "budget_after_compact": 128,
+    }
+
+
+def _missing_pinned_patch() -> dict[str, JsonValue]:
+    """构造不修改 pinned state 的 patch candidate。
+
+    :returns: pinned patch JSON。
+    """
+
+    missing_field: dict[str, JsonValue] = {
+        "operation": "missing",
+        "value": None,
+        "evidence_refs": [],
+    }
+    return {
+        "candidate_id": "patch-missing",
+        "current_goal": dict(missing_field),
+        "confirmed_subjects": dict(missing_field),
+        "user_constraints": dict(missing_field),
+        "open_questions": dict(missing_field),
+    }
+
+
 def _append_memory_event(
     transaction: HostTransaction,
     *,
@@ -1214,8 +1300,8 @@ def test_episode_summary_does_not_replace_evidence_anchor() -> None:
             _memory_event(
                 event_sequence=2,
                 event_id="event-episode",
-                event_type="EPISODE_SUMMARY_ACCEPTED",
-                payload={"summary_text": "navigation only"},
+                event_type="CONTEXT_COMPACTED",
+                payload=_compact_payload(summary_text="navigation only"),
                 run_id=None,
                 attempt_id=None,
                 execution_id=None,
@@ -1230,6 +1316,185 @@ def test_episode_summary_does_not_replace_evidence_anchor() -> None:
     assert (
         snapshot.conversation_continuity.items[0].item_kind
         is ConversationContinuityKind.EPISODE_SUMMARY
+    )
+
+
+def test_context_compacted_episode_summary_becomes_assumption_continuity() -> None:
+    """accepted compact summary 只成为 assumption continuity item。"""
+
+    snapshot = _build_snapshot(
+        (
+            _memory_event(
+                event_sequence=1,
+                event_id="event-compact-summary",
+                event_type="CONTEXT_COMPACTED",
+                payload=_compact_payload(summary_text="accepted compact summary"),
+                run_id="run-compact",
+                attempt_id=None,
+                execution_id=None,
+            ),
+        )
+    )
+
+    assert snapshot.verified_facts == ()
+    assert len(snapshot.conversation_continuity.items) == 1
+    item = snapshot.conversation_continuity.items[0]
+    assert item.item_kind is ConversationContinuityKind.EPISODE_SUMMARY
+    assert item.claim_status is MemoryClaimStatus.ASSUMPTION
+    assert item.producer_kind is MemoryProducerKind.HOST_PROJECTION
+    assert item.summary_text == "accepted compact summary"
+
+
+def test_context_compacted_pinned_patch_updates_clears_and_preserves() -> None:
+    """accepted pinned patch 按字段三态更新、清空或保留字段。"""
+
+    first = _build_snapshot(
+        (
+            _memory_event(
+                event_sequence=1,
+                event_id="event-initial-user",
+                event_type="USER_INPUT_ACCEPTED",
+                payload={"display_text": "existing goal"},
+                attempt_id=None,
+                execution_id=None,
+            ),
+            _memory_event(
+                event_sequence=2,
+                event_id="event-compact-patch",
+                event_type="CONTEXT_COMPACTED",
+                payload=_compact_payload(
+                    summary_text="patch summary",
+                    pinned_patch={
+                        "candidate_id": "patch-tristate",
+                        "current_goal": {
+                            "operation": "replace",
+                            "value": "replacement goal",
+                            "evidence_refs": ["evidence-1"],
+                        },
+                        "confirmed_subjects": {
+                            "operation": "replace",
+                            "value": [
+                                {
+                                    "ref_kind": "subject",
+                                    "ref_id": "issuer-a",
+                                }
+                            ],
+                            "evidence_refs": ["evidence-1"],
+                        },
+                        "user_constraints": {
+                            "operation": "clear",
+                            "value": None,
+                            "evidence_refs": ["evidence-1"],
+                        },
+                    },
+                ),
+                run_id="run-compact",
+                attempt_id=None,
+                execution_id=None,
+            ),
+        )
+    )
+
+    assert first.pinned_state.current_goal == "replacement goal"
+    assert first.pinned_state.user_constraints == ()
+    assert first.pinned_state.open_questions == ()
+    assert first.pinned_state.confirmed_subjects == (
+        OpaqueMemoryRef(
+            ref_kind=HostNeutralRefKind.SUBJECT,
+            ref_id="issuer-a",
+            digest=None,
+        ),
+    )
+
+    second = project_conversation_memory_event(
+        previous_snapshot=first,
+        event=_memory_event(
+            event_sequence=3,
+            event_id="event-compact-preserve",
+            event_type="CONTEXT_COMPACTED",
+            payload=_compact_payload(
+                summary_text="preserve summary",
+                pinned_patch={
+                    "candidate_id": "patch-preserve",
+                    "open_questions": {
+                        "operation": "replace",
+                        "value": ["verify margin"],
+                        "evidence_refs": ["evidence-1"],
+                    },
+                },
+            ),
+            run_id="run-compact",
+            attempt_id=None,
+            execution_id=None,
+        ),
+        policy=_policy(),
+        built_at=_NOW,
+        consumer_id=_CONSUMER_ID,
+    )
+
+    assert second.pinned_state.current_goal == "replacement goal"
+    assert second.pinned_state.confirmed_subjects == first.pinned_state.confirmed_subjects
+    assert second.pinned_state.user_constraints == ()
+    assert second.pinned_state.open_questions == ("verify margin",)
+
+
+def test_context_compacted_rejects_free_form_confirmed_subject_patch() -> None:
+    """confirmed_subjects patch 只能使用 Host-neutral opaque refs。"""
+
+    with pytest.raises(ValueError, match="opaque ref text requires kind prefix"):
+        _build_snapshot(
+            (
+                _memory_event(
+                    event_sequence=1,
+                    event_id="event-compact-bad-subject",
+                    event_type="CONTEXT_COMPACTED",
+                    payload=_compact_payload(
+                        summary_text="bad subject",
+                        pinned_patch={
+                            "candidate_id": "patch-bad-subject",
+                            "confirmed_subjects": {
+                                "operation": "replace",
+                                "value": ["Apple Inc."],
+                                "evidence_refs": ["evidence-1"],
+                            },
+                        },
+                    ),
+                ),
+            )
+        )
+
+
+def test_context_compacted_summary_fact_refs_do_not_create_verified_facts() -> None:
+    """summary 可引用已有工具事实，但不能新建 verified fact。"""
+
+    snapshot = _build_snapshot(
+        (
+            _memory_event(
+                event_sequence=1,
+                event_id="event-tool-for-summary",
+                event_type="TOOL_RESULT_ACCEPTED",
+                payload=_tool_payload(summary="tool supplied neutral summary"),
+            ),
+            _memory_event(
+                event_sequence=2,
+                event_id="event-compact-with-fact-ref",
+                event_type="CONTEXT_COMPACTED",
+                payload=_compact_payload(
+                    summary_text="summary cites tool fact",
+                    confirmed_fact_refs=("event-tool-for-summary",),
+                ),
+                run_id="run-compact",
+                attempt_id=None,
+                execution_id=None,
+            ),
+        )
+    )
+
+    assert len(snapshot.verified_facts) == 1
+    assert snapshot.verified_facts[0].provenance.event_id == "event-tool-for-summary"
+    assert len(snapshot.conversation_continuity.items) == 1
+    assert snapshot.conversation_continuity.items[0].summary_text == (
+        "summary cites tool fact"
     )
 
 
@@ -1249,8 +1514,8 @@ def test_history_pool_preserves_recent_floor_and_drops_summaries_first() -> None
             _memory_event(
                 event_sequence=2,
                 event_id="event-episode",
-                event_type="EPISODE_SUMMARY_ACCEPTED",
-                payload={"summary_text": "episode-summary"},
+                event_type="CONTEXT_COMPACTED",
+                payload=_compact_payload(summary_text="episode-summary"),
                 run_id=None,
                 attempt_id=None,
                 execution_id=None,
@@ -1321,8 +1586,8 @@ def test_history_pool_limits_assistant_conclusions_before_episode_summaries() ->
             _memory_event(
                 event_sequence=4,
                 event_id="event-episode-budget",
-                event_type="EPISODE_SUMMARY_ACCEPTED",
-                payload={"summary_text": "zz"},
+                event_type="CONTEXT_COMPACTED",
+                payload=_compact_payload(summary_text="zz"),
                 run_id=None,
                 attempt_id=None,
                 execution_id=None,
@@ -1475,6 +1740,24 @@ def test_projection_consumer_writes_snapshot_with_runner_checkpoint(
                 payload=_tool_payload(summary="durable tool summary"),
             )
         )
+        store.transaction_runner.run_write(
+            lambda transaction: _append_memory_event(
+                transaction,
+                event_id="event-compact-durable",
+                event_type="CONTEXT_COMPACTED",
+                payload=_compact_payload(
+                    summary_text="durable compact summary",
+                    pinned_patch={
+                        "candidate_id": "patch-durable",
+                        "current_goal": {
+                            "operation": "replace",
+                            "value": "durable compact goal",
+                            "evidence_refs": ["evidence-1"],
+                        },
+                    },
+                ),
+            )
+        )
         result = ProjectionRunner(
             store.transaction_runner, (consumer,)
         ).run_once(
@@ -1486,14 +1769,31 @@ def test_projection_consumer_writes_snapshot_with_runner_checkpoint(
         )
         checkpoint = store.transaction_runner.run_read(_ReadCheckpointOperation())
 
-        assert result.events_applied == 2
+        assert result.events_applied == 3
         assert read_back is not None
         assert read_back.snapshot.verified_facts[0].fact_summary == (
             "durable tool summary"
         )
-        assert read_back.snapshot.cursor.checkpoint_event_sequence == 2
+        assert read_back.snapshot.pinned_state.current_goal == "durable compact goal"
+        assert tuple(
+            item.summary_text
+            for item in read_back.snapshot.conversation_continuity.items
+            if item.item_kind is ConversationContinuityKind.EPISODE_SUMMARY
+        ) == ("durable compact summary",)
+        assert read_back.snapshot.cursor.checkpoint_event_sequence == 3
         assert checkpoint is not None
-        assert checkpoint.checkpoint_event_sequence == 2
+        assert checkpoint.checkpoint_event_sequence == 3
+
+
+def test_memory_projection_filter_includes_compacted_but_not_failed() -> None:
+    """生产 memory consumer 消费 compacted，但不消费 compaction failed。"""
+
+    consumer = ConversationMemoryProjectionConsumer(_policy())
+    event_types = consumer.event_filter.class_filters[0].event_types
+
+    assert event_types is not None
+    assert "CONTEXT_COMPACTED" in event_types
+    assert "CONTEXT_COMPACTION_FAILED" not in event_types
 
 
 def test_preview_reasoning_and_display_only_events_do_not_enter_memory(

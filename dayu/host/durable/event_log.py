@@ -9,9 +9,12 @@ EngineEvent ingest、projection、audit、stream fanout、payload descriptor 写
 
 from __future__ import annotations
 
+import json
+from collections.abc import Mapping
 from dataclasses import dataclass
 from datetime import UTC, datetime
 from enum import StrEnum
+from typing import cast
 
 from dayu.contracts.json_value import JsonValue
 from dayu.host.durable._validation import (
@@ -145,6 +148,45 @@ class EventLogRow:
 
 
 @dataclass(frozen=True, slots=True)
+class EventPayloadTextEqualsFilter:
+    """EventLog inline payload 文本字段等值过滤条件。
+
+    该类型只表达 durable-neutral JSON payload 字段过滤，不承载
+    context governance、policy 或 Engine 语义。
+
+    :param field_name: payload JSON 映射中的字段名。
+    :param expected_value: 期望匹配的文本值。
+    :param allowed_values: 字段允许的文本值集合；空 tuple 表示只要求非空文本。
+    """
+
+    field_name: str
+    expected_value: str
+    allowed_values: tuple[str, ...] = ()
+
+    def __post_init__(self) -> None:
+        """校验 payload 过滤条件。
+
+        :returns: ``None``。
+        :raises HostDurableError: 字段名或期望值不是非空文本时抛出。
+        """
+
+        _require_non_empty_text(self.field_name, field_name="payload_filter.field_name")
+        _require_non_empty_text(
+            self.expected_value, field_name="payload_filter.expected_value"
+        )
+        _require_text_tuple(
+            self.allowed_values, field_name="payload_filter.allowed_values"
+        )
+        if (
+            len(self.allowed_values) > 0
+            and self.expected_value not in self.allowed_values
+        ):
+            raise HostDurableError(
+                "payload_filter.expected_value must be present in allowed_values"
+            )
+
+
+@dataclass(frozen=True, slots=True)
 class EventLogAppendResult:
     """EventLog append 结果。
 
@@ -225,6 +267,31 @@ class EventLogStore:
             transaction,
             run_id=run_id,
             event_type=event_type,
+        )
+
+    def count_committed_events_by_run_and_type(
+        self,
+        transaction: HostTransaction,
+        *,
+        run_id: str,
+        event_type: str,
+        payload_filter: EventPayloadTextEqualsFilter | None = None,
+    ) -> int:
+        """统计某个 Run 下已提交 canonical fact 数量。
+
+        :param transaction: 调用方提供的 Host durable transaction。
+        :param run_id: 目标 Run id。
+        :param event_type: 目标 event type。
+        :param payload_filter: 可选 inline payload 文本字段过滤条件。
+        :returns: 匹配的 canonical fact 数量。
+        :raises HostDurableError: 输入非法或 payload 无法验证时抛出。
+        """
+
+        return count_committed_events_by_run_and_type(
+            transaction,
+            run_id=run_id,
+            event_type=event_type,
+            payload_filter=payload_filter,
         )
 
 
@@ -455,6 +522,65 @@ def read_latest_run_event_by_type(
     return _event_log_row_from_host_row(row)
 
 
+def count_committed_events_by_run_and_type(
+    transaction: HostTransaction,
+    *,
+    run_id: str,
+    event_type: str,
+    payload_filter: EventPayloadTextEqualsFilter | None = None,
+) -> int:
+    """统计某个 Run 下已提交 canonical fact 数量。
+
+    该 helper 供 Context Governance 在同一 write transaction 内查询
+    per-run compact 次数。传入 ``payload_filter`` 时会解析并校验每条匹配
+    event 的 inline payload；payload 缺失、损坏、字段缺失或字段值非法会
+    fail-closed 抛出 durable error。过滤条件本身不表达 Host policy 语义。
+
+    :param transaction: 调用方提供的 Host durable transaction。
+    :param run_id: 目标 Run id。
+    :param event_type: 目标 event type。
+    :param payload_filter: 可选 inline payload 文本字段过滤条件。
+    :returns: 匹配的 canonical fact 数量。
+    :raises HostDurableError: 输入非法或 payload 无法验证时抛出。
+    """
+
+    _require_non_empty_text(run_id, field_name="run_id")
+    _require_non_empty_text(event_type, field_name="event_type")
+    if payload_filter is not None and not isinstance(
+        payload_filter, EventPayloadTextEqualsFilter
+    ):
+        raise HostDurableError("payload_filter is invalid")
+    rows = transaction.fetchall(
+        f"""
+        SELECT payload_json
+        FROM {TABLE_EVENT_LOG}
+        WHERE run_id = ?
+          AND event_type = ?
+          AND event_class = ?
+        ORDER BY event_sequence ASC
+        """,
+        (run_id, event_type, EventClass.CANONICAL_FACT.value),
+    )
+    if payload_filter is None:
+        return len(rows)
+    count = 0
+    for row in rows:
+        payload = _payload_mapping_from_text(
+            _require_text(row.get("payload_json"), field_name="payload_json")
+        )
+        value = payload.get(payload_filter.field_name)
+        if not isinstance(value, str) or value.strip() == "":
+            raise HostDurableError("EventLog payload filter field is invalid")
+        if (
+            len(payload_filter.allowed_values) > 0
+            and value not in payload_filter.allowed_values
+        ):
+            raise HostDurableError("EventLog payload filter field is invalid")
+        if value == payload_filter.expected_value:
+            count += 1
+    return count
+
+
 @dataclass(frozen=True, slots=True)
 class _EncodedAppendRequest:
     """EventLog append 前的 canonical 编码结果。
@@ -525,6 +651,38 @@ def _optional_canonical_json(value: JsonValue | None) -> str | None:
     if value is None:
         return None
     return canonical_json_dumps(value)
+
+
+def _payload_mapping_from_text(payload_json: str) -> Mapping[str, JsonValue]:
+    """解析 EventLog inline payload JSON 映射。
+
+    :param payload_json: canonical payload JSON 文本。
+    :returns: JSON 映射。
+    :raises HostDurableError: JSON 非法或不是映射时抛出。
+    """
+
+    try:
+        value = cast(JsonValue, json.loads(payload_json))
+    except json.JSONDecodeError as exc:
+        raise HostDurableError("EventLog payload_json is invalid") from exc
+    if not isinstance(value, Mapping):
+        raise HostDurableError("EventLog payload_json must be a JSON mapping")
+    return cast(Mapping[str, JsonValue], value)
+
+
+def _require_text_tuple(value: tuple[str, ...], *, field_name: str) -> None:
+    """校验文本 tuple 字段。
+
+    :param value: 待校验 tuple。
+    :param field_name: 错误消息字段名。
+    :returns: ``None``。
+    :raises HostDurableError: 字段不是 tuple 或元素不是非空文本时抛出。
+    """
+
+    if not isinstance(value, tuple):
+        raise HostDurableError(f"{field_name} must be tuple")
+    for item in value:
+        _require_non_empty_text(item, field_name=f"{field_name} item")
 
 
 def _validate_append_request(request: EventLogAppendRequest) -> None:

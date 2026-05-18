@@ -26,6 +26,12 @@ from dayu.engine.contracts.agent_policy import AgentPolicy
 from dayu.engine.contracts.agent_run import AgentRunRequest
 from dayu.engine.contracts.engine_events import EngineEvent
 from dayu.engine.contracts.runner_spec import RunnerCallOptions, RunnerSpec
+from dayu.host.context_policy import (
+    ContextBudgetPolicy,
+    DEFAULT_MINIMUM_PROTECTION_TOKENS,
+    default_context_budget_policy,
+)
+from dayu.host.compaction import ContextCompactor
 from dayu.host._public_validation import (
     require_non_empty as _require_non_empty,
 )
@@ -266,6 +272,7 @@ class RunStatus(StrEnum):
     尚不写入。``SUCCEEDED``、``FAILED``、``CANCELLED``、``LOST`` 是终态。
     """
 
+    ACCEPTED = "accepted"
     QUEUED = "queued"
     RUNNING = "running"
     WAITING = "waiting"
@@ -700,6 +707,13 @@ class HostLocalExecutionOptions:
     :param runner_options: Engine Runner 调用参数。
     :param agent_policy: Engine Agent policy。
     :param worker_factory: 本地 worker factory。
+    :param context_budget_policy: Host Context Governance 的 typed 预算策略；
+        ``None`` 表示 pre-start governance 直接放行，不触发 proactive compact。
+    :param context_compactor: Host Context Governance 使用的 compactor typed port；
+        仅在预算触发 compact 时需要，生产不得隐式使用 fake compactor。
+    :param compact_artifact_root: compact artifact 写入根目录；未配置且触发
+        compact 时 fail closed。
+    :param compact_artifact_create_parent_dirs: compact artifact 根目录缺失时是否创建。
     :param memory_projection_policy: 本地 dispatch 注入 RunInputBuilder 的
         durable conversation memory policy。
     :param memory_projection_catchup_batch_size: worker 启动前追平 memory
@@ -722,6 +736,10 @@ class HostLocalExecutionOptions:
     runner_options: RunnerCallOptions
     agent_policy: AgentPolicy
     worker_factory: LocalEngineWorkerFactory
+    context_budget_policy: ContextBudgetPolicy | None = None
+    context_compactor: ContextCompactor | None = None
+    compact_artifact_root: pathlib.Path | None = None
+    compact_artifact_create_parent_dirs: bool = True
     memory_projection_policy: MemoryProjectionPolicy = field(
         default_factory=default_memory_projection_policy
     )
@@ -796,6 +814,24 @@ class HostLocalExecutionOptions:
             raise TypeError(
                 "HostLocalExecutionOptions.worker_factory must be non-None"
             )
+        if self.context_budget_policy is not None and not isinstance(
+            self.context_budget_policy, ContextBudgetPolicy
+        ):
+            raise TypeError(
+                "HostLocalExecutionOptions.context_budget_policy must be "
+                "ContextBudgetPolicy"
+            )
+        if self.compact_artifact_root is not None:
+            _require_path(
+                self.compact_artifact_root,
+                field_name="HostLocalExecutionOptions.compact_artifact_root",
+            )
+        _require_bool(
+            self.compact_artifact_create_parent_dirs,
+            field_name=(
+                "HostLocalExecutionOptions.compact_artifact_create_parent_dirs"
+            ),
+        )
         if not isinstance(self.memory_projection_policy, MemoryProjectionPolicy):
             raise TypeError(
                 "HostLocalExecutionOptions.memory_projection_policy must be "
@@ -1116,6 +1152,10 @@ class HostCommandHandleOptions:
     - ``sqlite_write_retry_backoff_multiplier``：写重试退避倍率。
     - ``sqlite_write_retry_max_delay_seconds``：写重试最大等待秒数。
     - ``payload_inline_threshold_bytes``：payload 内联存储阈值字节数。
+    - ``context_window_size``：Host Context Governance 输入窗口 token 数。
+    - ``reserved_output_tokens``：Host Context Governance 输出预留 token 数。
+    - ``context_budget_hard_threshold_tokens``：可选 hard threshold；``None`` 时按 policy 默认计算。
+    - ``context_budget_minimum_protection_tokens``：可选最小保护 token；``None`` 时按 policy 默认计算。
     - ``local_execution``：本地执行配置；``None`` 保持 no-op dispatch wakeup。
     """
 
@@ -1129,6 +1169,10 @@ class HostCommandHandleOptions:
     sqlite_write_retry_backoff_multiplier: float
     sqlite_write_retry_max_delay_seconds: float
     payload_inline_threshold_bytes: int
+    context_window_size: int
+    reserved_output_tokens: int
+    context_budget_hard_threshold_tokens: int | None = None
+    context_budget_minimum_protection_tokens: int | None = None
     local_execution: HostLocalExecutionOptions | None = None
 
     def __post_init__(self) -> None:
@@ -1193,6 +1237,31 @@ class HostCommandHandleOptions:
                 "HostCommandHandleOptions.payload_inline_threshold_bytes"
             ),
         )
+        _validate_command_context_budget_fields(self)
+
+
+def _validate_command_context_budget_fields(
+    options: HostCommandHandleOptions,
+) -> None:
+    """校验 command handle 上的 context budget typed 输入。
+
+    :param options: Host command handle options。
+    :returns: ``None``。
+    :raises TypeError: 整数字段类型非法时抛出。
+    :raises ValueError: 预算字段非法时抛出。
+    """
+
+    minimum_protection_tokens = (
+        options.context_budget_minimum_protection_tokens
+        if options.context_budget_minimum_protection_tokens is not None
+        else DEFAULT_MINIMUM_PROTECTION_TOKENS
+    )
+    default_context_budget_policy(
+        context_window_size=options.context_window_size,
+        reserved_output_tokens=options.reserved_output_tokens,
+        hard_threshold_tokens=options.context_budget_hard_threshold_tokens,
+        minimum_protection_tokens=minimum_protection_tokens,
+    )
 
 
 @dataclass(frozen=True, slots=True)
@@ -1838,16 +1907,16 @@ class FollowupSnapshot:
                         "FollowupSnapshot.queued_run_id must equal "
                         "accepted_run_id for queued queue result"
                     )
-            elif self.accepted_run_status == RunStatus.RUNNING:
+            elif self.accepted_run_status in (RunStatus.ACCEPTED, RunStatus.RUNNING):
                 if self.queued_run_id is not None:
                     raise ValueError(
                         "FollowupSnapshot.queued_run_id must be None "
-                        "for running queue result"
+                        "for accepted/running queue result"
                     )
             else:
                 raise ValueError(
                     "FollowupSnapshot.accepted_run_status must be queued "
-                    "or running for queue"
+                    "accepted or running for queue"
                 )
 
 

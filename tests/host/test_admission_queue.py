@@ -40,7 +40,7 @@ from dayu.host.api import (
 )
 from dayu.host.durable.codec import sha256_digest_json
 from dayu.host.durable.connection import open_host_durable_store
-from dayu.host.durable.event_log import EventLogStore
+from dayu.host.durable.event_log import EventClass, EventLogAppendRequest, EventLogStore
 from dayu.host.durable.memory import read_latest_memory_snapshot
 from dayu.host.durable.options import (
     HostDurableStoreOptions,
@@ -48,7 +48,9 @@ from dayu.host.durable.options import (
     PayloadStoragePolicy,
 )
 from dayu.host.durable.run_transition import (
+    CreateRunningRunInput,
     TerminalCloseoutInput,
+    create_running_run_with_starting_attempt_in_transaction,
     terminal_closeout_in_transaction,
 )
 from dayu.host.durable.errors import HostDurableError
@@ -58,9 +60,11 @@ from dayu.host.durable.state import (
     DispatchRecordRow,
     DispatchRecordStatus,
     RunRow,
+    RunStartReason,
     read_attempt_by_id,
     read_dispatch_record_by_attempt_id,
     read_run_by_id,
+    WorkerKind,
 )
 from dayu.host.durable.transaction import HostRow, HostTransaction, HostTransactionRunner
 from dayu.host.memory import (
@@ -107,6 +111,15 @@ class _SequentialIdFactory(AdmissionIdFactory):
         next_value = self.counters.get(prefix, 0) + 1
         self.counters[prefix] = next_value
         return f"{prefix}-{self.label}-{next_value}"
+
+
+@dataclass(frozen=True, slots=True)
+class _SeededActiveRun:
+    """测试用已启动 active Run 摘要。"""
+
+    run: RunRow
+    attempt: AttemptRow
+    dispatch_record: DispatchRecordRow
 
 
 @dataclass(slots=True)
@@ -217,10 +230,10 @@ def _options_for_path(
     )
 
 
-def test_start_run_on_open_session_creates_running_attempt_and_dispatch(
+def test_start_run_on_open_session_creates_accepted_run_and_governance_wakeup(
     tmp_path: Path,
 ) -> None:
-    """start_run 在无 active Run 时创建 running Run 与 pending dispatch。"""
+    """start_run 在无 active Run 时创建 accepted Run 并唤醒 governance。"""
 
     with open_host_durable_store(_options(tmp_path)) as store:
         session_id = _ensure_session_id(store.transaction_runner)
@@ -236,14 +249,18 @@ def test_start_run_on_open_session_creates_running_attempt_and_dispatch(
             caller_semantic_digest=_CALLER_DIGEST,
         )
 
-        assert result.run.status == RunStatus.RUNNING
+        assert result.run.status == RunStatus.ACCEPTED
         assert result.run.execution_target == "target-initial"
-        assert result.attempt is not None
-        assert result.attempt.status == AttemptStatus.STARTING
-        assert result.dispatch_record is not None
-        assert result.dispatch_record.status == DispatchRecordStatus.PENDING
-        assert len(spy.dispatches) == 1
-        assert spy.dispatches[0].run_id == result.run.run_id
+        assert result.attempt is None
+        assert result.dispatch_record is None
+        assert result.pending_dispatch is None
+        assert spy.dispatches == []
+        assert spy.promotions == [session_id]
+        assert _count_rows(store.transaction_runner, "host_attempts") == 0
+        assert _event_types_for_run(store.transaction_runner, result.run.run_id) == (
+            "USER_INPUT_ACCEPTED",
+            "RUN_ACCEPTED",
+        )
 
 
 def test_followup_queue_with_active_creates_queued_run_with_supplied_target(
@@ -281,14 +298,21 @@ def test_followup_queue_with_active_creates_queued_run_with_supplied_target(
         assert queued.run.execution_target == "queued-target"
         assert queued.attempt is None
         assert queued.dispatch_record is None
-        assert _count_rows(store.transaction_runner, "host_attempts") == 1
-        assert len(spy.dispatches) == 1
+        assert _count_rows(store.transaction_runner, "host_attempts") == 0
+        assert spy.dispatches == []
+        assert spy.promotions == [session_id]
+        skipped = service.promote_next_queued_run(session_id)
+        assert skipped.skipped is True
+        assert skipped.promoted_run is None
+        assert _read_run(store.transaction_runner, queued.run.run_id).status == (
+            RunStatus.QUEUED
+        )
 
 
-def test_followup_queue_without_active_creates_running_run_with_four_facts(
+def test_followup_queue_without_active_creates_accepted_run(
     tmp_path: Path,
 ) -> None:
-    """无 active Run 时 follow-up queue 直接启动并写四个 canonical facts。"""
+    """无 active Run 时 follow-up queue 创建 accepted Run 并等待 governance。"""
 
     with open_host_durable_store(_options(tmp_path)) as store:
         session_id = _ensure_session_id(store.transaction_runner)
@@ -306,15 +330,13 @@ def test_followup_queue_without_active_creates_running_run_with_four_facts(
             caller_semantic_digest=_CALLER_DIGEST,
         )
 
-        assert result.run.status == RunStatus.RUNNING
+        assert result.run.status == RunStatus.ACCEPTED
         assert result.run.execution_target == "follow-target"
-        assert result.attempt is not None
-        assert result.dispatch_record is not None
+        assert result.attempt is None
+        assert result.dispatch_record is None
         assert _event_types_for_run(store.transaction_runner, result.run.run_id) == (
             "USER_INPUT_ACCEPTED",
             "RUN_ACCEPTED",
-            "RUN_STARTED",
-            "ATTEMPT_STARTED",
         )
 
 
@@ -502,10 +524,10 @@ def test_same_idempotency_key_with_changed_input_digest_conflicts(
         assert _event_count(store.transaction_runner) == before
 
 
-def test_reject_and_attach_active_have_expected_event_and_idempotency_effects(
+def test_reject_and_attach_active_conflict_with_accepted_active(
     tmp_path: Path,
 ) -> None:
-    """reject active 不写 side effect；attach active 只写 null event 幂等记录。"""
+    """accepted active 上 reject / attach_active 都 conflict 且不写 side effect。"""
 
     with open_host_durable_store(_options(tmp_path)) as store:
         session_id = _ensure_session_id(store.transaction_runner)
@@ -527,30 +549,23 @@ def test_reject_and_attach_active_have_expected_event_and_idempotency_effects(
                 caller_semantic_digest=_CALLER_DIGEST,
             )
 
-        attached = service.start_run(
-            _start_request(
-                session_id=session_id,
-                client_request_id="start-attach",
-                queue_policy="attach_active",
-            ),
-            caller_semantic_digest=_CALLER_DIGEST,
-        )
-        record = _idempotency_record(
-            store.transaction_runner,
-            scope_kind="start_run",
-            scope_id=session_id,
-            key="start-attach",
-        )
+        with pytest.raises(HostApiError) as attach_error:
+            service.start_run(
+                _start_request(
+                    session_id=session_id,
+                    client_request_id="start-attach",
+                    queue_policy="attach_active",
+                ),
+                caller_semantic_digest=_CALLER_DIGEST,
+            )
 
         assert reject_error.value.code == HostApiErrorCode.CONFLICT
+        assert attach_error.value.code == HostApiErrorCode.CONFLICT
         assert _event_count(store.transaction_runner) == before_events
-        assert attached.run.run_id == active.run.run_id
-        assert attached.attached_active is True
+        assert active.run.status == RunStatus.ACCEPTED
         assert _count_rows(store.transaction_runner, "idempotency_records") == (
-            before_idempotency + 1
+            before_idempotency
         )
-        assert _text(record, "created_event_id") is None
-        assert record.get("created_event_sequence") is None
 
 
 def test_unknown_queue_policy_raises_value_error_without_transaction(
@@ -585,10 +600,7 @@ def test_promotion_skips_with_active_then_promotes_earliest_queued_run(
         session_id = _ensure_session_id(store.transaction_runner)
         spy = _WakeupSpy()
         service = _service(store.transaction_runner, spy=spy)
-        active = service.start_run(
-            _start_request(session_id=session_id, client_request_id="start-active"),
-            caller_semantic_digest=_CALLER_DIGEST,
-        )
+        active = _seed_active_run(store.transaction_runner, session_id=session_id)
         first_queued = service.submit_followup_queue(
             SubmitFollowupQueueAdmissionInput(
                 request=_followup_request(
@@ -625,7 +637,7 @@ def test_promotion_skips_with_active_then_promotes_earliest_queued_run(
         assert _read_run(store.transaction_runner, second_queued.run.run_id).status == (
             RunStatus.QUEUED
         )
-        assert len(spy.dispatches) == 2
+        assert len(spy.dispatches) == 1
 
 
 def test_cancel_queued_run_is_idempotent_and_creates_no_attempt(
@@ -677,7 +689,7 @@ def test_cancel_queued_run_is_idempotent_and_creates_no_attempt(
         assert second.idempotent_replay is True
         assert second.run.run_id == queued.run.run_id
         assert _event_count(store.transaction_runner) == before_retry
-        assert _count_rows(store.transaction_runner, "host_attempts") == 1
+        assert _count_rows(store.transaction_runner, "host_attempts") == 0
         assert _event_types_for_run(store.transaction_runner, queued.run.run_id) == (
             "USER_INPUT_ACCEPTED",
             "RUN_ACCEPTED",
@@ -697,10 +709,7 @@ def test_cancel_predispatch_starting_promotes_exactly_one_queued_run(
         session_id = _ensure_session_id(store.transaction_runner)
         spy = _WakeupSpy()
         service = _service(store.transaction_runner, spy=spy)
-        active = service.start_run(
-            _start_request(session_id=session_id, client_request_id="start-active"),
-            caller_semantic_digest=_CALLER_DIGEST,
-        )
+        active = _seed_active_run(store.transaction_runner, session_id=session_id)
         first_queued = service.submit_followup_queue(
             SubmitFollowupQueueAdmissionInput(
                 request=_followup_request(
@@ -747,13 +756,16 @@ def test_cancel_predispatch_starting_promotes_exactly_one_queued_run(
         assert active_attempt.status == AttemptStatus.CANCELLED
         assert active_dispatch.status == DispatchRecordStatus.CANCELLED
         assert result.promotion is not None
-        assert result.promotion.promoted_run is not None
-        assert result.promotion.promoted_run.run_id == first_queued.run.run_id
+        assert result.promotion.skipped is True
+        assert result.promotion.promoted_run is None
+        assert _read_run(store.transaction_runner, first_queued.run.run_id).status == (
+            RunStatus.QUEUED
+        )
         assert _read_run(store.transaction_runner, second_queued.run.run_id).status == (
             RunStatus.QUEUED
         )
         assert spy.promotions == [session_id]
-        assert len(spy.dispatches) == 2
+        assert spy.dispatches == []
 
 
 def test_cancel_predispatch_starting_promotion_survives_queue_wakeup_failure(
@@ -765,10 +777,7 @@ def test_cancel_predispatch_starting_promotion_survives_queue_wakeup_failure(
         session_id = _ensure_session_id(store.transaction_runner)
         spy = _ToggleFailingWakeupSpy()
         service = _service(store.transaction_runner, spy=spy)
-        active = service.start_run(
-            _start_request(session_id=session_id, client_request_id="start-active"),
-            caller_semantic_digest=_CALLER_DIGEST,
-        )
+        active = _seed_active_run(store.transaction_runner, session_id=session_id)
         queued = service.submit_followup_queue(
             SubmitFollowupQueueAdmissionInput(
                 request=_followup_request(
@@ -789,10 +798,10 @@ def test_cancel_predispatch_starting_promotion_survives_queue_wakeup_failure(
 
         assert result.run.status == RunStatus.CANCELLED
         assert result.promotion is not None
-        assert result.promotion.promoted_run is not None
-        assert result.promotion.promoted_run.run_id == queued.run.run_id
+        assert result.promotion.skipped is True
+        assert result.promotion.promoted_run is None
         assert _read_run(store.transaction_runner, queued.run.run_id).status == (
-            RunStatus.RUNNING
+            RunStatus.QUEUED
         )
         assert spy.promotions == [session_id]
 
@@ -806,10 +815,7 @@ def test_promote_next_queued_run_returns_result_when_dispatch_wakeup_fails(
         session_id = _ensure_session_id(store.transaction_runner)
         spy = _ToggleFailingWakeupSpy()
         service = _service(store.transaction_runner, spy=spy)
-        active = service.start_run(
-            _start_request(session_id=session_id, client_request_id="start-active"),
-            caller_semantic_digest=_CALLER_DIGEST,
-        )
+        active = _seed_active_run(store.transaction_runner, session_id=session_id)
         queued = service.submit_followup_queue(
             SubmitFollowupQueueAdmissionInput(
                 request=_followup_request(
@@ -830,7 +836,7 @@ def test_promote_next_queued_run_returns_result_when_dispatch_wakeup_fails(
         assert _read_run(store.transaction_runner, queued.run.run_id).status == (
             RunStatus.RUNNING
         )
-        assert len(spy.dispatches) == 2
+        assert len(spy.dispatches) == 1
 
 
 def test_start_run_survives_after_commit_projection_catchup_failure(
@@ -854,8 +860,8 @@ def test_start_run_survives_after_commit_projection_catchup_failure(
             caller_semantic_digest=_CALLER_DIGEST,
         )
 
-        assert result.run.status == RunStatus.RUNNING
-        assert result.pending_dispatch is not None
+        assert result.run.status == RunStatus.ACCEPTED
+        assert result.pending_dispatch is None
         assert projection.calls == 1
 
 
@@ -897,7 +903,7 @@ def test_start_run_concrete_memory_catchup_projects_user_input(
             )
         )
 
-        assert result.run.status == RunStatus.RUNNING
+        assert result.run.status == RunStatus.ACCEPTED
         assert snapshot is not None
         assert snapshot.snapshot.pinned_state.current_goal == "start input"
 
@@ -911,10 +917,7 @@ def test_terminal_closeout_promotes_exactly_one_queued_run_after_commit(
         session_id = _ensure_session_id(store.transaction_runner)
         spy = _WakeupSpy()
         service = _service(store.transaction_runner, spy=spy)
-        active = service.start_run(
-            _start_request(session_id=session_id, client_request_id="start-active"),
-            caller_semantic_digest=_CALLER_DIGEST,
-        )
+        active = _seed_active_run(store.transaction_runner, session_id=session_id)
         assert active.attempt is not None
         first_queued = service.submit_followup_queue(
             SubmitFollowupQueueAdmissionInput(
@@ -950,13 +953,16 @@ def test_terminal_closeout_promotes_exactly_one_queued_run_after_commit(
 
         assert result.run.status == RunStatus.SUCCEEDED
         assert result.attempt.status == AttemptStatus.SUCCEEDED
-        assert result.promotion.promoted_run is not None
-        assert result.promotion.promoted_run.run_id == first_queued.run.run_id
+        assert result.promotion.skipped is True
+        assert result.promotion.promoted_run is None
+        assert _read_run(store.transaction_runner, first_queued.run.run_id).status == (
+            RunStatus.QUEUED
+        )
         assert _read_run(store.transaction_runner, second_queued.run.run_id).status == (
             RunStatus.QUEUED
         )
         assert spy.promotions == [session_id]
-        assert len(spy.dispatches) == 2
+        assert spy.dispatches == []
 
 
 def test_terminal_closeout_survives_after_commit_projection_catchup_failure(
@@ -971,10 +977,7 @@ def test_terminal_closeout_survives_after_commit_projection_catchup_failure(
             store.transaction_runner,
             projection_catchup=projection,
         )
-        active = service.start_run(
-            _start_request(session_id=session_id, client_request_id="start-active"),
-            caller_semantic_digest=_CALLER_DIGEST,
-        )
+        active = _seed_active_run(store.transaction_runner, session_id=session_id)
         assert active.attempt is not None
         queued = service.submit_followup_queue(
             SubmitFollowupQueueAdmissionInput(
@@ -999,9 +1002,12 @@ def test_terminal_closeout_survives_after_commit_projection_catchup_failure(
         )
 
         assert result.run.status == RunStatus.SUCCEEDED
-        assert result.promotion.promoted_run is not None
-        assert result.promotion.promoted_run.run_id == queued.run.run_id
-        assert projection.calls == 3
+        assert result.promotion.skipped is True
+        assert result.promotion.promoted_run is None
+        assert _read_run(store.transaction_runner, queued.run.run_id).status == (
+            RunStatus.QUEUED
+        )
+        assert projection.calls == 2
 
 
 def test_terminal_closeout_promotion_survives_queue_wakeup_failure(
@@ -1013,10 +1019,7 @@ def test_terminal_closeout_promotion_survives_queue_wakeup_failure(
         session_id = _ensure_session_id(store.transaction_runner)
         spy = _ToggleFailingWakeupSpy()
         service = _service(store.transaction_runner, spy=spy)
-        active = service.start_run(
-            _start_request(session_id=session_id, client_request_id="start-active"),
-            caller_semantic_digest=_CALLER_DIGEST,
-        )
+        active = _seed_active_run(store.transaction_runner, session_id=session_id)
         assert active.attempt is not None
         queued = service.submit_followup_queue(
             SubmitFollowupQueueAdmissionInput(
@@ -1042,10 +1045,10 @@ def test_terminal_closeout_promotion_survives_queue_wakeup_failure(
         )
 
         assert result.run.status == RunStatus.SUCCEEDED
-        assert result.promotion.promoted_run is not None
-        assert result.promotion.promoted_run.run_id == queued.run.run_id
+        assert result.promotion.skipped is True
+        assert result.promotion.promoted_run is None
         assert _read_run(store.transaction_runner, queued.run.run_id).status == (
-            RunStatus.RUNNING
+            RunStatus.QUEUED
         )
         assert spy.promotions == [session_id]
 
@@ -1058,10 +1061,7 @@ def test_cancel_terminal_run_returns_current_terminal_without_new_facts(
     with open_host_durable_store(_options(tmp_path)) as store:
         session_id = _ensure_session_id(store.transaction_runner)
         service = _service(store.transaction_runner)
-        active = service.start_run(
-            _start_request(session_id=session_id, client_request_id="start-active"),
-            caller_semantic_digest=_CALLER_DIGEST,
-        )
+        active = _seed_active_run(store.transaction_runner, session_id=session_id)
         assert active.attempt is not None
         service.closeout_attempt_terminal(
             CloseoutAttemptTerminalInput(
@@ -1101,10 +1101,7 @@ def test_cancel_attempt_running_enters_cancelling_with_cancel_facts(
     with open_host_durable_store(_options(tmp_path)) as store:
         session_id = _ensure_session_id(store.transaction_runner)
         service = _service(store.transaction_runner)
-        active = service.start_run(
-            _start_request(session_id=session_id, client_request_id="start-active"),
-            caller_semantic_digest=_CALLER_DIGEST,
-        )
+        active = _seed_active_run(store.transaction_runner, session_id=session_id)
         assert active.attempt is not None
         _force_attempt_status(
             store.transaction_runner,
@@ -1143,10 +1140,7 @@ def test_rollback_before_cancel_commit_does_not_wake_or_promote(
         session_id = _ensure_session_id(store.transaction_runner)
         spy = _WakeupSpy()
         service = _service(store.transaction_runner, spy=spy)
-        active = service.start_run(
-            _start_request(session_id=session_id, client_request_id="start-active"),
-            caller_semantic_digest=_CALLER_DIGEST,
-        )
+        active = _seed_active_run(store.transaction_runner, session_id=session_id)
         queued = service.submit_followup_queue(
             SubmitFollowupQueueAdmissionInput(
                 request=_followup_request(
@@ -1190,7 +1184,7 @@ def test_rollback_before_cancel_commit_does_not_wake_or_promote(
             )
 
         assert spy.promotions == []
-        assert len(spy.dispatches) == 1
+        assert spy.dispatches == []
         assert _read_run(store.transaction_runner, active.run.run_id).status == (
             RunStatus.RUNNING
         )
@@ -1214,10 +1208,7 @@ def test_concurrent_promotion_attempts_promote_at_most_one_run(
     with open_host_durable_store(options) as store:
         session_id = _ensure_session_id(store.transaction_runner)
         service = _service(store.transaction_runner, label="seed")
-        active = service.start_run(
-            _start_request(session_id=session_id, client_request_id="start-active"),
-            caller_semantic_digest=_CALLER_DIGEST,
-        )
+        active = _seed_active_run(store.transaction_runner, session_id=session_id)
         service.submit_followup_queue(
             SubmitFollowupQueueAdmissionInput(
                 request=_followup_request(
@@ -1323,6 +1314,141 @@ def _ensure_session_id(
         ),
     )
     return result.snapshot.session_id
+
+
+def _seed_active_run(
+    transaction_runner: HostTransactionRunner,
+    *,
+    session_id: str,
+    run_id: str = "run-seeded-active",
+    attempt_id: str = "attempt-seeded-active",
+    execution_id: str = "execution-seeded-active",
+    dispatch_record_id: str = "dispatch-seeded-active",
+    input_event_id: str = "event-seeded-input",
+) -> _SeededActiveRun:
+    """用低层 transition 创建 RUNNING + STARTING active Run。
+
+    :param transaction_runner: Host transaction runner。
+    :param session_id: Session id。
+    :param run_id: Run id。
+    :param attempt_id: Attempt id。
+    :param execution_id: execution id。
+    :param dispatch_record_id: dispatch record id。
+    :param input_event_id: input event id。
+    :returns: active Run 摘要。
+    """
+
+    input_sequence = _append_seed_user_input(
+        transaction_runner,
+        session_id=session_id,
+        run_id=run_id,
+        event_id=input_event_id,
+    )
+
+    def operation(transaction: HostTransaction) -> _SeededActiveRun:
+        """写入 active Run。
+
+        :param transaction: Host transaction。
+        :returns: active Run 摘要。
+        """
+
+        transition = create_running_run_with_starting_attempt_in_transaction(
+            transaction,
+            EventLogStore(),
+            CreateRunningRunInput(
+                session_id=session_id,
+                run_id=run_id,
+                client_request_id=f"client-{run_id}",
+                input_event_id=input_event_id,
+                input_event_sequence=input_sequence,
+                run_accepted_event_id=f"event-run-accepted-{run_id}",
+                run_started_event_id=f"event-run-started-{run_id}",
+                attempt_started_event_id=f"event-attempt-started-{run_id}",
+                attempt_id=attempt_id,
+                execution_id=execution_id,
+                dispatch_record_id=dispatch_record_id,
+                occurred_at=_NOW,
+                actor="analyst",
+                source="pytest",
+                idempotency_key=f"idem-{run_id}",
+                execution_target="target-seeded-active",
+                queue_policy="queue",
+                start_reason=RunStartReason.INITIAL,
+                worker_kind=WorkerKind.LOCAL,
+                owner_host_instance_id=None,
+                call_context_digest=_CALLER_DIGEST,
+            ),
+        )
+        assert transition.run is not None
+        assert transition.attempt is not None
+        assert transition.dispatch_record is not None
+        return _SeededActiveRun(
+            run=transition.run,
+            attempt=transition.attempt,
+            dispatch_record=transition.dispatch_record,
+        )
+
+    return transaction_runner.run_write(operation)
+
+
+def _append_seed_user_input(
+    transaction_runner: HostTransactionRunner,
+    *,
+    session_id: str,
+    run_id: str,
+    event_id: str,
+    display_text: str = "seeded active input",
+) -> int:
+    """追加测试 active Run 的 USER_INPUT_ACCEPTED。
+
+    :param transaction_runner: Host transaction runner。
+    :param session_id: Session id。
+    :param run_id: Run id。
+    :param event_id: event id。
+    :param display_text: 输入文本。
+    :returns: event sequence。
+    """
+
+    def operation(transaction: HostTransaction) -> int:
+        """追加输入事件。
+
+        :param transaction: Host transaction。
+        :returns: event sequence。
+        """
+
+        event = EventLogStore().append_event(
+            transaction,
+            EventLogAppendRequest(
+                event_id=event_id,
+                event_class=EventClass.CANONICAL_FACT,
+                session_id=session_id,
+                run_id=run_id,
+                attempt_id=None,
+                execution_id=None,
+                event_type="USER_INPUT_ACCEPTED",
+                occurred_at=_NOW,
+                actor="analyst",
+                source="pytest",
+                client_request_id=f"client-{run_id}",
+                idempotency_key=f"input-{run_id}",
+                policy_decision=None,
+                reason=None,
+                payload_json={
+                    "input_ref": None,
+                    "input_digest": None,
+                    "display_text": display_text,
+                    "payload_ref": None,
+                    "payload_digest": None,
+                    "operation_kind": "start_run",
+                    "call_context_digest": _CALLER_DIGEST,
+                },
+                payload_ref=None,
+                payload_digest=None,
+            ),
+        ).row
+        return event.event_sequence
+
+    return transaction_runner.run_write(operation)
 
 
 def _start_request(

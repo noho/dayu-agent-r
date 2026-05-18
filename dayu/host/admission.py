@@ -57,6 +57,7 @@ from dayu.host.durable.run_transition import (
     CancelPredispatchStartingInput,
     CancelQueuedRunInput,
     CancelWaitingRunInput,
+    CreateAcceptedRunInput,
     CreateQueuedRunInput,
     CreateRunningRunInput,
     PromoteQueuedRunInput,
@@ -66,6 +67,7 @@ from dayu.host.durable.run_transition import (
     cancel_predispatch_starting_in_transaction,
     cancel_queued_in_transaction,
     cancel_waiting_run_in_transaction,
+    create_accepted_run_in_transaction,
     create_queued_run_in_transaction,
     create_running_run_with_starting_attempt_in_transaction,
     promote_queued_run_in_transaction,
@@ -453,6 +455,7 @@ class HostAdmissionService:
         _log_run_admission_result(_OPERATION_START_RUN, result)
         catch_up_projection_best_effort(self.projection_catchup_port)
         _wake_dispatch_if_needed(self.wakeup_port, result.pending_dispatch)
+        _wake_start_governance_if_needed(self.wakeup_port, result.run)
         return result
 
     def submit_followup_queue(
@@ -488,6 +491,7 @@ class HostAdmissionService:
         _log_run_admission_result(_OPERATION_SUBMIT_FOLLOWUP_QUEUE, result)
         catch_up_projection_best_effort(self.projection_catchup_port)
         _wake_dispatch_if_needed(self.wakeup_port, result.pending_dispatch)
+        _wake_start_governance_if_needed(self.wakeup_port, result.run)
         return result
 
     def cancel_run(
@@ -757,7 +761,7 @@ class _StartRunOperation:
                 scope=scope,
                 active=active,
             )
-        return _create_running_admission_result(
+        return _create_accepted_admission_result(
             transaction=transaction,
             event_log_store=self.event_log_store,
             idempotency_store=self.idempotency_store,
@@ -767,7 +771,6 @@ class _StartRunOperation:
             semantic_digest=semantic_digest,
             scope=scope,
             queue_policy=self.policy.value,
-            start_reason=RunStartReason.INITIAL,
         )
 
     def _handle_active_run(
@@ -795,6 +798,12 @@ class _StartRunOperation:
                 retryable=False,
             )
         if self.policy == AdmissionPolicy.ATTACH_ACTIVE:
+            if active.status == RunStatus.ACCEPTED:
+                raise HostApiError(
+                    code=HostApiErrorCode.CONFLICT,
+                    message="Session has an accepted Run but no active Attempt",
+                    retryable=False,
+                )
             self.idempotency_store.record_idempotent_result(
                 transaction,
                 scope,
@@ -881,7 +890,7 @@ class _SubmitFollowupQueueOperation:
                 queue_policy=AdmissionPolicy.QUEUE.value,
                 active_run_id=active.run_id,
             )
-        return _create_running_admission_result(
+        return _create_accepted_admission_result(
             transaction=transaction,
             event_log_store=self.event_log_store,
             idempotency_store=self.idempotency_store,
@@ -891,7 +900,6 @@ class _SubmitFollowupQueueOperation:
             semantic_digest=semantic_digest,
             scope=scope,
             queue_policy=AdmissionPolicy.QUEUE.value,
-            start_reason=RunStartReason.INITIAL,
         )
 
 
@@ -1003,7 +1011,7 @@ class _CancelRunOperation:
                 message="Run not found",
                 retryable=False,
             )
-        if run.status == RunStatus.QUEUED:
+        if run.status in (RunStatus.ACCEPTED, RunStatus.QUEUED):
             return self._cancel_queued(
                 transaction=transaction,
                 semantic_digest=semantic_digest,
@@ -1494,7 +1502,7 @@ class _CancelSessionRunsOperation:
         :raises HostApiError: 低层 transition 失败时抛出。
         """
 
-        if target.run.status == RunStatus.QUEUED:
+        if target.run.status in (RunStatus.ACCEPTED, RunStatus.QUEUED):
             return self._cancel_queued_target(transaction, target.run)
         if target.waiting:
             return self._cancel_waiting_target(transaction, target.run)
@@ -1835,6 +1843,85 @@ def _create_running_admission_result(
         attempt=transition_result.attempt,
         dispatch_record=dispatch_record,
         pending_dispatch=_pending_dispatch_from_row(dispatch_record),
+        created=True,
+        queued=False,
+        attached_active=False,
+        idempotent_replay=False,
+    )
+
+
+def _create_accepted_admission_result(
+    *,
+    transaction: HostTransaction,
+    event_log_store: EventLogStore,
+    idempotency_store: IdempotencyStore,
+    clock: AdmissionClock,
+    id_factory: AdmissionIdFactory,
+    request: _CreateAdmissionRequest,
+    semantic_digest: str,
+    scope: IdempotencyScope,
+    queue_policy: str,
+) -> RunAdmissionResult:
+    """创建 pre-start accepted Run admission 结果。
+
+    :param transaction: 当前 Host transaction。
+    :param event_log_store: EventLog primitive。
+    :param idempotency_store: idempotency primitive。
+    :param clock: admission clock。
+    :param id_factory: admission id factory。
+    :param request: 归一化创建输入。
+    :param semantic_digest: semantic input digest。
+    :param scope: 幂等 scope。
+    :param queue_policy: 持久化 queue policy。
+    :returns: admission 结果。
+    """
+
+    now = clock.now()
+    run_id = id_factory.new_id(_RUN_ID_PREFIX)
+    input_event = _append_user_input_event(
+        transaction=transaction,
+        event_log_store=event_log_store,
+        request=request,
+        run_id=run_id,
+        event_id=id_factory.new_id(_EVENT_ID_PREFIX),
+        occurred_at=now,
+    )
+    transition_result = create_accepted_run_in_transaction(
+        transaction,
+        event_log_store,
+        CreateAcceptedRunInput(
+            session_id=request.session_id,
+            run_id=run_id,
+            client_request_id=request.client_request_id,
+            input_event_id=input_event.event_id,
+            input_event_sequence=input_event.event_sequence,
+            run_accepted_event_id=id_factory.new_id(_EVENT_ID_PREFIX),
+            occurred_at=now,
+            actor=request.actor,
+            source=request.source,
+            idempotency_key=request.client_request_id,
+            execution_target=request.execution_target,
+            queue_policy=queue_policy,
+            call_context_digest=request.call_context_digest,
+        ),
+    )
+    run = _require_transition_run(transition_result.run)
+    idempotency_store.record_idempotent_result(
+        transaction,
+        scope,
+        semantic_digest,
+        IdempotencyResultRef(
+            result_kind=_IDEMPOTENCY_RESULT_KIND_RUN,
+            result_ref=run.run_id,
+            created_event_id=input_event.event_id,
+            created_event_sequence=input_event.event_sequence,
+        ),
+    )
+    return RunAdmissionResult(
+        run=run,
+        attempt=None,
+        dispatch_record=None,
+        pending_dispatch=None,
         created=True,
         queued=False,
         attached_active=False,
@@ -2369,7 +2456,7 @@ def _session_cancel_target_for_run(
     :raises HostApiError: durable row 指针缺失表示内部状态损坏时抛出。
     """
 
-    if run.status == RunStatus.QUEUED:
+    if run.status in (RunStatus.ACCEPTED, RunStatus.QUEUED):
         return _SupportedSessionCancelTarget(
             run=run,
             attempt=None,
@@ -2490,22 +2577,42 @@ def _wake_dispatch_if_needed(
                 raise
 
 
+def _wake_start_governance_if_needed(
+    wakeup_port: AdmissionWakeupPort, run: RunRow
+) -> None:
+    """accepted Run commit 后唤醒 pre-start governance。
+
+    :param wakeup_port: wakeup 端口。
+    :param run: 本次 admission 返回的 Run。
+    :returns: ``None``。
+    """
+
+    if run.status == RunStatus.ACCEPTED:
+        wakeup_port.wake_queue_promotion(run.session_id)
+
+
 def _promote_after_release(
     *, service: HostAdmissionService, session_id: str
 ) -> PromotionResult:
-    """active slot 释放后在新事务中触发一次 queue promotion。
+    """active slot 释放后唤醒 pre-start governance。
 
     :param service: admission service。
     :param session_id: 释放 active slot 的 Session id。
-    :returns: promotion 结果。
+    :returns: skipped promotion 结果，实际启动由 scheduler governance gate 完成。
     """
 
-    promotion = service.promote_next_queued_run(session_id)
     try:
         service.wakeup_port.wake_queue_promotion(session_id)
     except RuntimeError:
         pass
-    return promotion
+    return PromotionResult(
+        promoted_run=None,
+        attempt=None,
+        dispatch_record=None,
+        pending_dispatch=None,
+        skipped=True,
+        skip_reason=PromotionSkipReason.ACTIVE_RUN_EXISTS,
+    )
 
 
 def _require_transition_run(run: RunRow | None) -> RunRow:
