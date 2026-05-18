@@ -711,6 +711,12 @@ class HostLocalExecutionOptions:
         ``None`` 表示 pre-start governance 直接放行，不触发 proactive compact。
     :param context_compactor: Host Context Governance 使用的 compactor typed port；
         仅在预算触发 compact 时需要，生产不得隐式使用 fake compactor。
+    :param compactor_runner_spec: compactor 独立 Runner 规约；无 LLM
+        compactor 时为 ``None``。
+    :param compactor_runner_options: compactor 独立 Runner 调用参数；无 LLM
+        compactor 时为 ``None``。
+    :param compactor_policy_ref: compactor policy 的稳定引用；无独立 policy
+        时为 ``None``。
     :param compact_artifact_root: compact artifact 写入根目录；未配置且触发
         compact 时 fail closed。
     :param compact_artifact_create_parent_dirs: compact artifact 根目录缺失时是否创建。
@@ -738,6 +744,9 @@ class HostLocalExecutionOptions:
     worker_factory: LocalEngineWorkerFactory
     context_budget_policy: ContextBudgetPolicy | None = None
     context_compactor: ContextCompactor | None = None
+    compactor_runner_spec: RunnerSpec | None = None
+    compactor_runner_options: RunnerCallOptions | None = None
+    compactor_policy_ref: str | None = None
     compact_artifact_root: pathlib.Path | None = None
     compact_artifact_create_parent_dirs: bool = True
     memory_projection_policy: MemoryProjectionPolicy = field(
@@ -821,6 +830,24 @@ class HostLocalExecutionOptions:
                 "HostLocalExecutionOptions.context_budget_policy must be "
                 "ContextBudgetPolicy"
             )
+        if self.compactor_runner_spec is not None and not isinstance(
+            self.compactor_runner_spec, RunnerSpec
+        ):
+            raise TypeError(
+                "HostLocalExecutionOptions.compactor_runner_spec must be "
+                "RunnerSpec"
+            )
+        if self.compactor_runner_options is not None and not isinstance(
+            self.compactor_runner_options, RunnerCallOptions
+        ):
+            raise TypeError(
+                "HostLocalExecutionOptions.compactor_runner_options must be "
+                "RunnerCallOptions"
+            )
+        _require_optional_non_empty(
+            self.compactor_policy_ref,
+            field_name="HostLocalExecutionOptions.compactor_policy_ref",
+        )
         if self.compact_artifact_root is not None:
             _require_path(
                 self.compact_artifact_root,

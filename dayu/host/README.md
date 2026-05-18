@@ -6,6 +6,8 @@
 
 `dayu.host` 包根当前提供普通 Service-facing 的 Host public contract：`open_host(options)` opener、异步 `Host` / `HostHandle` 协议、`OpenHostOptions`、普通 Run / compactor 执行基线、Host-owned typed `HostEvent` 终态视图、生命周期异常 `HostClosedError`、Session / Run request / snapshot 类型，以及 Host construction 的业务工具输入边界。低层同步 command handle、run-level event 补读与本地执行装配仍保留在内部模块路径，普通 Service 不应从包根依赖这些名字。
 
+`open_host(options)` 当前会装配 durable store、共享 `ActiveWorkerRegistry`、本地 `HostDispatchScheduler`、memory projection catch-up、compactor baseline 与 command wakeup port。普通 `submit_followup(queue)` 经 public async handle 接受后会在 commit 后唤醒 scheduler 并进入本地 dispatch；调用方不需要手工持有 scheduler、durable store、registry 或 wakeup port。`host.close()` 与 async context manager 退出只关闭当前 opener runtime，按顺序停止 scheduler、flush memory projection 并关闭 durable store，不写 cancel / failed terminal facts；重复 close 幂等，close 后 public handle 方法返回 `HostClosedError`。Session-level live `watch_session_events(...)` fanout 仍由后续 slice 实现，当前 public handle 只保留 closed-handle 校验与占位。
+
 当前包根导出包含以下类型：
 
 - constants：`HOST_EVENT_STREAM_DEFAULT_LIMIT`、`HOST_EVENT_STREAM_MAX_LIMIT`，以及 wait record / wait adapter / wait snapshot / external job / payload ref 的公共长度上限常量。
@@ -23,11 +25,11 @@
 - error：`HostApiError`、`HostApiErrorDetail`、`SteerConflictDetail`。
 - tooling construction options：`ToolBundleSourceKind`、`FrameworkToolName`、`ToolBundleSourceRef`、`FrameworkToolPolicyView`、`HostToolingOptions`、`default_framework_tool_policy_view`。
 
-`dayu.host.api.__all__` 包含 request、snapshot、status、error、context、stream cursor、public opener options、HostEvent typed view 与低层本地执行配置契约类型。Session / Run read facade 位于 `dayu.host.read_api`，Session / Run command facade、Wait command facade 与 deferred facade 位于 `dayu.host.command`；普通 Service-facing 包根导出只保留 P10.5 Slice 1 冻结的入口。Host construction tooling 类型位于 `dayu.host.tooling`，由包根导出，但不进入 `dayu.host.api`。
+`dayu.host.api.__all__` 包含 request、snapshot、status、error、context、stream cursor、public opener options、HostEvent typed view 与低层本地执行配置契约类型。Session / Run read facade 位于 `dayu.host.read_api`，Session / Run command facade、Wait command facade 与 deferred facade 位于 `dayu.host.command`；普通 Service-facing 包根导出保留 P10.5 冻结的 opener / handle 入口。Host construction tooling 类型位于 `dayu.host.tooling`，由包根导出，但不进入 `dayu.host.api`。
 
 ## Low-level Session Command Path
 
-`create_host_command_handle(options, active_registry=None)` 会根据 `HostCommandHandleOptions` 打开 fresh/bootstrap 后的 Host durable SQLite store，并装配内部 no-op admission service 与 active worker cancel registry。`active_registry=None` 会为当前 command handle 创建 fresh registry，不与其它 handle 或 scheduler 共享；需要 active worker cancel 跨 command handle 与 scheduler 传播时，production composition root 必须把同一个 `ActiveWorkerRegistry` 对象同时传给 `create_host_command_handle(..., active_registry=...)` 与 `HostDispatchScheduler.open(..., active_registry=...)`。该同步 factory 当前不消费 `local_execution`，传入非空 `HostCommandHandleOptions.local_execution` 会 fail fast；本地 scheduler 需要由调用方显式 `await HostDispatchScheduler.open(...)` 装配和关闭，避免在同步 command handle 内隐藏 async worker lifecycle。production composition root 必须显式传入 `HostCommandHandleOptions.context_window_size` 与 `reserved_output_tokens`；`compose_host_local_execution_options(options)` 供 production composition root 在打开 scheduler 前把 command options 中的这两个必填值、可选 hard threshold 与 minimum protection tokens 转为 typed `ContextBudgetPolicy`，并把 command artifact root 作为 compact artifact root 注入本地执行配置；它不读取 Engine spec、per-run metadata、caller payload 或 provider overflow budget。该 handle 是低层 command facade 的 opaque handle；关闭 handle 后再次调用低层 facade 会返回 `HostApiError(code=INVALID_STATE, retryable=False)`。
+`create_host_command_handle(options, active_registry=None)` 会根据 `HostCommandHandleOptions` 打开 fresh/bootstrap 后的 Host durable SQLite store，并装配内部 no-op admission service 与 active worker cancel registry。`active_registry=None` 会为当前 command handle 创建 fresh registry，不与其它 handle 或 scheduler 共享；需要普通生产 runtime 时应优先使用 `open_host(options)`，由 opener 在内部共享 registry 并连接 scheduler wakeup。该同步 factory 当前不消费 `local_execution`，传入非空 `HostCommandHandleOptions.local_execution` 会 fail fast；低层测试或诊断路径如需本地 scheduler，仍需显式 `await HostDispatchScheduler.open(...)` 装配和关闭，避免在同步 command handle 内隐藏 async worker lifecycle。`compose_host_local_execution_options(options)` 供低层 composition 在打开 scheduler 前把 command options 中的 context budget 字段转为 typed `ContextBudgetPolicy`，并把 command artifact root 作为 compact artifact root 注入本地执行配置；它不读取 Engine spec、per-run metadata、caller payload 或 provider overflow budget。该 handle 是低层 command facade 的 opaque handle；关闭 handle 后再次调用低层 facade 会返回 `HostApiError(code=INVALID_STATE, retryable=False)`。
 
 当前低层 Session command facade：
 
@@ -197,7 +199,7 @@ internal admission 当前的 session-scope cancel 支持 queued、pre-dispatch /
 - `CancelRunRequest` 与 `CancelSessionRunsRequest` 当前只接受 `CancelMode.GRACEFUL`。
 - `HostApiErrorCode` 包含 `UNSUPPORTED_OPERATION`；`HostApiError.detail` 只接受 `HostApiErrorDetail` typed union 成员，当前成员为 `SteerConflictDetail`。
 - `HostCommandHandleOptions` 校验可选 handle id 非空、路径字段为 `pathlib.Path`、布尔字段为 `bool`、timeout / delay / backoff / payload threshold 为正数、写重试次数非负，并要求调用方显式提供 context window / reserved output，再校验 hard threshold / minimum protection tokens 共同组成合法 ContextBudgetPolicy；`create_host_command_handle` 对非空 `local_execution` fail fast。
-- `HostLocalExecutionOptions` 校验 lane 配置、RunnerSpec、RunnerCallOptions、AgentPolicy、worker factory、可选 context budget policy、可选 `tooling_options` 与 truncation manager 开关；worker factory 是结构协议，运行时不做 `hasattr` / `getattr` 式协议探测，由 pyright 与显式 scheduler 装配点保障。
+- `HostLocalExecutionOptions` 校验 lane 配置、RunnerSpec、RunnerCallOptions、AgentPolicy、worker factory、可选 context budget policy、可选 compactor runner baseline、可选 `tooling_options` 与 truncation manager 开关；worker factory 是结构协议，运行时不做 `hasattr` / `getattr` 式协议探测，由 pyright 与显式 scheduler 装配点保障。
 - `ToolBundleSourceRef.source_id` 拒绝空字符串或纯空白；可选版本引用与内容摘要存在时也必须非空。
 - `HostToolingOptions.source_refs` 必须非空。
 - `FrameworkToolPolicyView.enabled_framework_tools` 必须是 `reserved_framework_tool_names` 子集。
