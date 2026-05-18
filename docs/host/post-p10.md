@@ -526,7 +526,7 @@ P10.5 第二目标：用 smoke 验证第一目标成立。smoke 应证明一个�
 - `AgentCodex`：用户明确授权作为第三 challenge reviewer，`docs/reviews/post-p10-codex-challenge-20260518.md`
 - `AgentGLM`：当前未在 `tmux-cli status` 中发现，未派发。
 
-两份 challenge review 的总控裁决：
+三份 initial challenge review 的总控裁决：
 
 - accepted implementation requirement：缺稳定的 `open_host(options)` composition root；`create_host_command_handle(...)` 若当前仍从普通 public namespace 导出，必须移除或降级到明确 internal / low-level test helper namespace，普通 Service 只使用 `open_host(options)`。这一项不再需要 design 讨论。
 - accepted implementation requirement：public Host handle facade 方法集合已由设计真源决定，不再作为 design open question；P10.5 必须把现有 command/read 能力包成 async handle methods，并禁止 Service 直接依赖 dispatch / durable / scheduler internals。
@@ -544,4 +544,23 @@ P10.5 第二目标：用 smoke 验证第一目标成立。smoke 应证明一个�
 - accepted implementation requirement：compactor execution baseline 已裁决；P10.5 需要在 `open_host(options)` 中以朴素 typed function 参数接收真实 compactor adapter 及其独立执行参数，ordinary Run 的 `runner_spec` / `runner_options` / `agent_policy` / `tool_names` override 不得隐式改变 compactor。compact smoke 必须证明该分离成立，并仍通过 canonical compact event、artifact 写入、memory projection consumption 和下一轮 RunInputBuilder 注入完成闭环。
 - accepted non-blocking / evidence guard：现有 Phase 5 / Phase 10 集成测试只能作为内部 wiring 回归，不能作为 P10.5 public-path smoke coverage 证据。
 
-因此，本文档当前仍是 P10.5 public API / contract decision discussion artifact；是否可以派 planning Agent 生成 implementation-ready handoff plan，以用户下一步确认和总控 gate 状态为准。
+## Plan-readiness Review 结论
+
+按 `$init-agents`，本轮已派发三路 plan-readiness review，审查命题是：基于 `docs/host/design.md`、`docs/host/implementation-control.md` 与本文档进入 P10.5 plan / implementation 后，能否确保后续真实生产系统 Service 只调用 Host public interface / contract 即可完成普通本地多轮会话闭环。
+
+- `AgentMiMo`：`docs/reviews/post-p10-5-plan-readiness-review-mimo-20260518.md`，blocking count = 0。
+- `AgentDS`：`docs/reviews/post-p10-5-plan-readiness-review-ds-20260518.md`，blocking count = 0。
+- `AgentCodex`：`docs/reviews/post-p10-5-plan-readiness-review-codex-20260518.md`，blocking count = 0。
+
+总控裁决：P10.5 可以进入 implementation-ready planning。三份 review 提出的 non-blocking / clarification 不阻塞进入 plan，但必须作为 plan 入口约束显式收口；planning Agent 不得把它们留到 implementation 时自行解释。
+
+P10.5 plan 必须显式收口以下 checklist：
+
+- Smoke matrix naming / owner：plan 必须按本文档 S1-S5 与 `implementation-control.md` 的验证要求建立同一张覆盖表，逐项写明 owner slice、测试名或 smoke 名、public-path 断言、skip 条件和 not-covered owner。S4 compact、WAITING resume、steer / retry / replay、multi-client watch、`close_session(...)` public contract 和 cancel 都必须有明确 owner。
+- `open_host(options)` typed shape：plan 必须把 opener options 落成具体 typed construction contract，列出 durable store / payload / artifact roots、runner / worker factory、全量 `ToolBundle`、ToolRuntime policy、ContextCompactor、compactor execution baseline、context budget policy、memory catch-up、stream fanout / background supervisor 所需端口和运行目录；不得以无结构 dict、service locator、ConfigLoader 或测试 helper 替代。
+- Per-run execution override：plan 必须按设计真源落实 field-level partial merge 语义。`SubmitFollowupRequest.runner_spec`、`runner_options`、`agent_policy` 各字段省略时使用 opener baseline，字段出现时使用该字段的完整 typed value；不得要求三者 all-or-nothing 一起传，也不得接受 patch dict / extra payload。
+- `HostEventStream` 术语：plan 和 README 必须把 Service-facing 事件入口写成 `watch_session_events(session_id) -> AsyncIterator[HostEvent]` 的朴素 async iterator。若代码中保留 `HostEventStream` 名称，只能作为内部实现或类型别名，不得变成 Service 需要理解的 context manager、subscription handle 或第二套 public stream contract。
+- Review / coverage 证据：plan 必须引用三份 plan-readiness review artifact，并说明每个 non-blocking / clarification 如何落到 slice、测试或后续 owner；不得只写“review passed”。
+- Gate 状态同步：`implementation-control.md` 必须记录当前 gate 已从 challenge review 进入 implementation-ready planning；若 plan 过程中发现新的 public contract、状态机、schema、持久化或用户可见行为问题，必须回到用户讨论并写回设计真源 / 总控文档。
+
+因此，本文档不再是阻塞 planning 的 discussion artifact；它是 P10.5 implementation-ready handoff plan 的输入约束。下一步可以派 planning Agent 生成 P10.5 handoff implementation-ready plan，但 plan 必须逐项覆盖上述 checklist。

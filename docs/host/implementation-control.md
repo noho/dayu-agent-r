@@ -223,10 +223,10 @@ Phase Map 中每个 phase 必须使用统一条目格式。模板如下：
 约束：本节只保留当前 gate 结论；phase 过程流水必须归档到 `历史记录`，仍需追踪的风险或后续 owner 必须写入 `Open Questions 与风险追踪` 的 `追踪区`。
 
 当前 work unit：Phase 10.5. Ordinary Local Multi-turn Public Contract Freeze。
-当前 gate：discussion / challenge review。
-下一 gate：P10.5 public API / contract decision discussion。
+当前 gate：P10.5 handoff implementation-ready plan generation。
+下一 gate：P10.5 plan review。
 
-当前 gate 事实：Phase 10 已完成；P10.5 已插入 Phase Map，用于冻结普通本地多轮会话的 Host public interface / contract。P10.5 目标与任务清单写入 `docs/host/post-p10.md`。按 `$init-agents` 已派发 challenge review 给在线 review Agent；`AgentMiMo` artifact 为 `docs/reviews/post-p10-public-contract-challenge-mimo-20260518.md`，`AgentDS` artifact 为 `docs/reviews/post-p10-wiring-smoke-challenge-ds-20260518.md`。用户明确授权 `AgentCodex` 作为第三 challenge reviewer，artifact 为 `docs/reviews/post-p10-codex-challenge-20260518.md`。`AgentGLM` 当前未在 `tmux-cli status` 中发现，未派发。三方裁决结论：`docs/host/post-p10.md` 可以作为 P10.5 public API / contract decision discussion 输入，但还不能直接交给 Agent 写 implementation-ready plan，更不能直接 implementation。
+当前 gate 事实：Phase 10 已完成；P10.5 已插入 Phase Map，用于冻结普通本地多轮会话的 Host public interface / contract。P10.5 目标与任务清单写入 `docs/host/post-p10.md`。initial challenge review artifacts 为 `docs/reviews/post-p10-public-contract-challenge-mimo-20260518.md`、`docs/reviews/post-p10-wiring-smoke-challenge-ds-20260518.md` 与 `docs/reviews/post-p10-codex-challenge-20260518.md`；相关裁决已经写回 `docs/host/post-p10.md`。按 `$init-agents` 已派发三路 P10.5 plan-readiness review：`docs/reviews/post-p10-5-plan-readiness-review-mimo-20260518.md`、`docs/reviews/post-p10-5-plan-readiness-review-ds-20260518.md` 与 `docs/reviews/post-p10-5-plan-readiness-review-codex-20260518.md`；三份结论均为 blocking count = 0。总控裁决：可以进入 P10.5 handoff implementation-ready plan generation，但 plan 必须显式收口三份 review 提出的 non-blocking / clarification checklist，不能直接 implementation。
 
 ## Phase Map
 
@@ -1204,6 +1204,7 @@ P9.5 收口清单：
 - 已确认 P10.5 不考虑 Recovery，不迁移 `/Users/leo/workspace/dayu-agent` 的 web tools，不要求 Service / CLI / WeChat / GUI 真实入口改造，不要求业务工具发现 / 动态 ScenePrepare。
 - 已确认若 P10.5 发现需要新增、删除或改变 `dayu.host` public API，必须先和用户讨论并更新 `docs/host/post-p10.md` 或 phase plan，不能由 implementation agent 直接改。
 - 已确认真实 runner smoke 可参考 `dayu/config/llm_models.json` 写死 runner 参数，不实现 ConfigLoader；至少覆盖 mimo、ds/deepseek、gemini、qwen 四类配置。API key / 网络不可用时允许对对应 provider 显式 skip 并记录原因，但测试文件和 wiring 必须存在。mock runner smoke 已删除；runner test double 只能作为低层辅助测试，不能计入 P10.5 smoke success signal。mock tool 不得按 expected answer、run id、轮次或测试私有状态凑结果。
+- 三路 plan-readiness review 已完成且 blocking count = 0；P10.5 可以进入 implementation-ready planning。plan 必须把 review 的 non-blocking / clarification 项转成可执行约束：smoke matrix 每项 owner / 测试名 / public-path 断言 / skip 规则、`open_host(options)` typed shape、per-run execution override field-level partial merge 语义、`HostEventStream` 术语收敛，以及 review artifact 到 slice / 测试 / 后续 owner 的映射。
 
 范围：
 - 允许修改：Host opener / public handle 与内部 composition root、public command facade 与 scheduler wakeup 接线、session-level live Host event stream、typed HostEvent terminal final answer view、memory catch-up 与 context overflow compact 的 public opener construction contract、compactor execution baseline 接线、`submit_followup(steer)`、`retry_run(...)`、`replay_run(...)` 本地语义、public Run API 状态语义测试与文档、普通本地多轮 smoke harness、mock tool 测试实现、runner test double 低层辅助测试、compact smoke、真实 runner smoke 的受控配置接线。
@@ -1233,6 +1234,7 @@ P9.5 收口清单：
 - P10.5 已确认长事务裁剪：`WAITING` / wait record / `resolve_wait(...)` public resume path 纳入 public contract freeze 与 smoke；生产级 callback endpoint、callback auth / replay、poller 后台 loop、backoff / in-flight fencing、external job physical cancel / revoke 不纳入 P10.5。P10.5 必须验证 Run 进入 `WAITING` 后，调用方只通过 Host public `resolve_wait(...)` 提交 poll / callback / manual 已取得结果，Host 内部 wake scheduler / dispatch 并最终通过 `watch_session_events(...)` 产出 terminal HostEvent。
 - P10.5 已确认 Session cleanup 裁剪：只要求 `close_session(...)` public contract 可用并纳入 smoke；`purge_session(...)` destructive cleanup 继续归 Phase 15。P10.5 必须验证 `close_session(...)`、Host opener close 与 cancel 是三个不同动作：`close_session(...)` 只关闭 Session 新输入入口，不停止本地 runtime，不删除事实；Host opener close 只关闭当前 handle 的本地 runtime，不把 Session 改成 `CLOSED`，不写用户 cancel facts；cancel 才表达用户停止 Run 的治理意图。Session closed 后读取 / live watch 既有事实仍可用，新 `submit_followup(...)` 返回明确 invalid-state / typed error。Recommended Service policy 是用户意图为“结束会话并停止当前工作”时，Service 显式先调用 `cancel_session_runs(...)`，确认 cancel 可见后再 `close_session(...)`；Host 不在 `close_session(...)` 内自动 cancel。`purge_session(...)` 在 P10.5 可保持 unsupported / deferred 或 precondition error，但必须有清晰 public envelope / closed-handle guard，不能被当作 archive / close / cancel 使用。
 - P10.5 已确认 HostEventStream typed `HostEvent` terminal contract：普通 Service 通过 `watch_session_events(...)` 观察 terminal HostEvent 并展示 final answer，不直接查询 EventLog / payload 内部表；raw `EngineEvent` 不进入 Service-facing public API，`HostEventView` 改为 Host 内部 run-level diagnostic / detail DTO，不从 `dayu.host` public namespace 导出。P10.5 不定义 `wait_final_answer(...)` public API；final answer 主路径只能是 terminal HostEvent。第一版 terminal final answer view 字段固定为 `content`、`filtered`、`degraded`、`finish_reason` 与 terminal status；超时、取消、错误和 terminal 判断语义随 `watch_session_events(...)` / HostEventStream lifecycle 一并落地。
+- P10.5 已确认 per-run execution override 是 field-level partial merge，不是 all-or-nothing profile。`SubmitFollowupRequest.runner_spec`、`runner_options`、`agent_policy` 各字段省略时使用 `open_host(options)` baseline；字段出现时使用该字段的完整 typed value。plan / implementation 不得接受 patch dict、无结构 policy override、extra payload 或 profile registry lookup。
 - `steer`、`retry`、`replay` 的语义不作为 P10.5 开放设计问题重开；必须按 `docs/host/design.md` 已有定义落地本地语义、状态迁移、terminal race、idempotency 与 smoke。P10.5 的 phase-scope 裁剪只有：Recovery 专属 `LOST` / `RECOVERING` retry / cancel / recovery 处理不进入本 phase，继续归 Phase 11；不新增 `interrupt_*` public API，UI interrupt 文案只能映射到 `cancel_run(...)` 或 `submit_followup(steer)`。
 - P10.5 已确认 smoke 覆盖矩阵：real-runner no-tool multi-turn、mock-tool wiring、real-runner matrix、compact、WAITING resume、steer / retry / replay、cancel、`close_session(...)` public contract。mock runner smoke 已删除；对本轮不覆盖但接受的项必须有 owner 和后续 destination。
 - 若改变 public interface / contract，先和用户讨论并写回 `docs/host/post-p10.md` 或对应 phase plan。
@@ -1251,6 +1253,13 @@ P9.5 收口清单：
 - Slice 4: 按 `docs/host/design.md` 已有定义实现 `retry_run(...)` / `replay_run(...)` 本地语义、source Run 关联、retry policy tool fact reuse、no-tool replay policy 与 tests；`LOST` / `RECOVERING` retry 归 Phase 11。
 - Slice 5: real-runner no-tool / mock-tool wiring / cancel smoke，覆盖 `docs/host/post-p10.md` 的 S1 / S2 / S5 coverage matrix 与测试替身约束，并覆盖 steer / retry / replay / cancel smoke；mock runner 不计入 smoke success signal。
 - Slice 6: real-runner matrix smoke，使用硬编码 runner 参数并走同一 runtime / public command / public read path；至少覆盖 mimo、ds/deepseek、gemini、qwen 四类配置，环境不可用时对对应 provider 明确 skip 并记录原因。
+
+Plan 必须额外收口的 readiness review checklist：
+- 建立 S1-S5 与验证要求的统一 coverage table，明确每项 owner slice、测试名 / smoke 名、public-path 断言、skip 条件和后续 owner；不能只写“按 post-p10 覆盖”。
+- 在 Slice 1 中落定 `open_host(options)` 的 typed options shape，不能把 construction-time 依赖留成无结构 dict、service locator 或测试 harness。
+- 在 Slice 1 / Slice 5 / Slice 6 中覆盖 per-run `runner_spec` / `runner_options` / `agent_policy` field-level partial merge 与 effective config freeze；同一 Session 不同 Run 切换模型或参数必须通过 public request 证明。
+- 在 Slice 2 中把 `watch_session_events(session_id) -> AsyncIterator[HostEvent]` 写成唯一普通 Service-facing 事件入口；`HostEventStream` 若保留，只能作为内部实现或类型别名，不能成为新的 public handle。
+- 在 plan 文档中逐条引用三份 plan-readiness review artifact，并说明每个 non-blocking / clarification 的处理位置。
 
 验证要求：
 - unit tests: public contract validation、Host opener lifecycle、per-run tool_names selector validation / effective tool set freeze、session-level live watch lifecycle / fanout / filter semantics、typed HostEvent 与 terminal final answer view、public Run API `ACCEPTED -> scheduler governance -> RUNNING / terminal` 状态语义、steer / retry / replay request validation、idempotency、状态迁移与错误语义。
