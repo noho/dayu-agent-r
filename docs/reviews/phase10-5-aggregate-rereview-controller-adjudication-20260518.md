@@ -4,7 +4,7 @@
 
 P10.5 aggregate fix accepted。
 
-AgentMiMo re-review：PASS，blocking findings count = 0。  
+AgentMiMo re-review：PASS，blocking findings count = 0。
 AgentDS re-review：PASS，blocking findings count = 0。
 
 Controller 裁决：AG1-AG4 已完整收口，`dayu.host` 包根不再通过模块属性或 `__all__` 暴露低层 command primitive、command-handle construction types、`HostLocalExecutionOptions` 与 `StartRunRequest`。低层测试已迁移到 `dayu.host.api` / `dayu.host.command`，README 已同步当前 public contract 事实。当前可以进入 accepted aggregate fix commit。

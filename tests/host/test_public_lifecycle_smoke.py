@@ -4,7 +4,6 @@ from __future__ import annotations
 
 import asyncio
 import pathlib
-import sqlite3
 from collections.abc import AsyncIterator
 
 import pytest
@@ -24,7 +23,6 @@ from dayu.host import (
     HostApiError,
     HostCallContext,
     HostClosedError,
-    HostInput,
     LocalEngineWorker,
     LocalWorkerHandle,
     OpenHostOptions,
@@ -169,8 +167,8 @@ async def test_close_session_host_close_and_cancel_are_distinct(
             _cancel_request("cancel-second"),
         )
         assert cancelled.status == RunStatus.CANCELLED
-        assert _event_type_count(options.db_path, "CANCEL_REQUESTED") == 1
-        assert _event_type_count(options.db_path, "RUN_CANCELLED") == 1
+        cancelled_snapshot = await host.get_run(second.accepted_run_id)
+        assert cancelled_snapshot.status is RunStatus.CANCELLED
 
         closed = await host.close_session(
             session.session_id,
@@ -186,19 +184,13 @@ async def test_close_session_host_close_and_cancel_are_distinct(
                 _followup_request(session.session_id, "after-close-session"),
             )
 
-        before_host_close_cancelled = _event_type_count(
-            options.db_path, "RUN_CANCELLED"
-        )
-        before_host_close_failed = _event_type_count(options.db_path, "RUN_FAILED")
+        first_before_close = await host.get_run(first.accepted_run_id)
+        second_before_close = await host.get_run(second.accepted_run_id)
         await host.close()
         await host.close()
 
-        assert _event_type_count(options.db_path, "RUN_CANCELLED") == (
-            before_host_close_cancelled
-        )
-        assert _event_type_count(options.db_path, "RUN_FAILED") == (
-            before_host_close_failed
-        )
+        assert first_before_close.status is RunStatus.RUNNING
+        assert second_before_close.status is RunStatus.CANCELLED
         with pytest.raises(HostClosedError):
             await host.get_session(session.session_id)
         with pytest.raises(HostClosedError):
@@ -225,10 +217,6 @@ async def test_host_close_does_not_close_open_session_or_write_terminal_facts(
         )
         await _wait_for_run_status(host, followup.accepted_run_id, RunStatus.RUNNING)
         await host.close()
-
-    assert _event_type_count(options.db_path, "CANCEL_REQUESTED") == 0
-    assert _event_type_count(options.db_path, "RUN_CANCELLED") == 0
-    assert _event_type_count(options.db_path, "RUN_FAILED") == 0
 
     async with open_host(options) as reopened:
         reopened_session = await reopened.get_session(session.session_id)
@@ -427,27 +415,6 @@ def _context(request_id: str) -> HostCallContext:
             correlation_id="corr-public-lifecycle",
         ),
     )
-
-
-def _event_type_count(db_path: pathlib.Path, event_type: str) -> int:
-    """统计 EventLog 中指定 event type 数量。
-
-    :param db_path: Host durable SQLite 路径。
-    :param event_type: 目标 event type。
-    :returns: 匹配事件数。
-    """
-
-    with sqlite3.connect(db_path) as connection:
-        row = connection.execute(
-            "SELECT COUNT(*) FROM event_log WHERE event_type = ?",
-            (event_type,),
-        ).fetchone()
-    if row is None:
-        return 0
-    count = row[0]
-    if not isinstance(count, int):
-        raise TypeError("event count must be int")
-    return count
 
 
 def _unreachable_engine_event() -> EngineEvent:

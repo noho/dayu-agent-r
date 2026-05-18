@@ -4,7 +4,7 @@
 
 不直接进入 ready-to-open-draft-PR。当前进入 P10.5 aggregate fix。
 
-MiMo aggregate deepreview：PASS，blocking count = 0，提出 2 个 Medium public surface finding。  
+MiMo aggregate deepreview：PASS，blocking count = 0，提出 2 个 Medium public surface finding。
 DS aggregate deepreview：PASS，blocking count = 0，认为可进入 ready-to-open-draft-PR，但同样列出 public surface cleanup findings。
 
 Controller 裁决：P10.5 的第一目标是冻结 ordinary local multi-turn 的 Service-facing public contract。`start_run` / `create_host_command_handle` / command-handle construction types / local execution options 仍从 `dayu.host` 包根可导入或在 `__all__` 中出现，会削弱该目标。即使 reviewers 标记为不阻塞，基于 design_doc 的 public namespace 边界与 plan 明确要求，本项应在 P10.5 aggregate fix 内收口，而不是留到 draft PR 后。

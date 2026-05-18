@@ -10,18 +10,24 @@ from __future__ import annotations
 import asyncio
 import os
 import pathlib
+import sqlite3
 from collections.abc import AsyncIterator, Sequence
 from dataclasses import dataclass
 from datetime import UTC, datetime
 
 import pytest
 
+from dayu.contracts.tool_await import ToolAwaitKind, ToolAwaitSpec
 from dayu.contracts.tool_call import (
     BatchToolExecutionContext,
     ToolCallRequest,
 )
 from dayu.contracts.tool_declaration import ToolBundle, ToolDefinition
-from dayu.contracts.tool_outcome import ToolCompletedOutcome, ToolExecutionOutcome
+from dayu.contracts.tool_outcome import (
+    ToolAwaitingOutcome,
+    ToolCompletedOutcome,
+    ToolExecutionOutcome,
+)
 from dayu.contracts.tool_result import ToolResultSuccess
 from dayu.contracts.tool_schema import (
     ToolFunctionSchema,
@@ -72,13 +78,34 @@ from dayu.host import (
     OpenHostOptions,
     OperationContext,
     OrdinaryRunExecutionBaseline,
+    ResolveWaitCompletedOutcome,
+    ResolveWaitRequest,
+    RunStatus,
     SubmitFollowupRequest,
     ToolBundleSourceKind,
     ToolBundleSourceRef,
+    WaitAdapterKey,
+    WaitResolutionSource,
 )
 from dayu.host.api import AuthorizationClaim
+from dayu.host.durable.connection import open_host_durable_store
+from dayu.host.durable.options import (
+    HostDurableStoreOptions,
+    HostSQLiteStoragePolicy,
+    PayloadStoragePolicy,
+)
+from dayu.host.durable.state import (
+    WaitRecordRow,
+    WaitResumePolicy,
+    read_active_wait_records_for_run,
+)
 from dayu.host.local_proxy import DefaultLocalEngineWorkerFactory
 from dayu.host.memory import default_memory_projection_policy
+from dayu.host.wait_adapter import (
+    WaitAdapterBinding,
+    WaitAdapterRegistry,
+    WaitExternalJobRefSource,
+)
 
 _NOW = datetime(2026, 5, 18, 8, 0, 0, tzinfo=UTC)
 _DEFAULT_TIMEOUT_SECONDS = 45.0
@@ -86,6 +113,8 @@ _DEFAULT_MAX_RETRIES = 0
 _DEFAULT_MAX_TOKENS = 96
 _TOOL_EXECUTION_TIMEOUT_SECONDS = 5.0
 _PROVIDER_TEST_TIMEOUT_SECONDS = 120.0
+_AWAITING_TOOL_NAME = "awaiting_mock_fact"
+_AWAITING_RESUME_TOKEN = "public-smoke-external-job"
 _NETWORK_FAILURE_MARKERS: tuple[str, ...] = (
     "clientconnectorerror",
     "clientconnectionerror",
@@ -164,6 +193,22 @@ class ProviderSmokeCase:
     model: str
     supports_stream_usage: bool
     provider_request: ProviderRequestExtension
+
+
+@dataclass(frozen=True, slots=True)
+class PublicWaitingRun:
+    """public smoke 中由 public opener 生成的 WAITING Run 引用。
+
+    :param session_id: Session id。
+    :param run_id: Run id。
+    :param attempt_id: 进入 WAITING 的 Attempt id。
+    :param wait_id: Host wait record id，供 public ``resolve_wait`` 输入使用。
+    """
+
+    session_id: str
+    run_id: str
+    attempt_id: str
+    wait_id: str
 
 
 class FinalAnswerHandle:
@@ -322,6 +367,64 @@ class ToolCallingWorkerFactory:
 
         del snapshot
         return _ToolCallingWorker(self)
+
+
+class AwaitingThenFinalWorkerFactory:
+    """首个 dispatch 进入 WAITING，后续 dispatch 立即成功的 worker factory。"""
+
+    def __init__(self) -> None:
+        """初始化 worker factory。
+
+        :returns: ``None``。
+        :raises Exception: 不主动抛出异常。
+        """
+
+        self.requests: list[AgentRunRequest] = []
+        self.snapshots: list[AttemptDispatchSnapshot] = []
+        self.accepted = asyncio.Event()
+
+    def create_worker(self, snapshot: AttemptDispatchSnapshot) -> LocalEngineWorker:
+        """创建等待型或成功型 worker。
+
+        :param snapshot: dispatch snapshot。
+        :returns: 测试 worker。
+        :raises Exception: 不主动抛出异常。
+        """
+
+        del snapshot
+        return _AwaitingThenFinalWorker(self)
+
+
+class _AwaitingThenFinalWorker:
+    """按 dispatch 顺序切换 awaiting / final 行为的 worker。"""
+
+    def __init__(self, factory: AwaitingThenFinalWorkerFactory) -> None:
+        """初始化 worker。
+
+        :param factory: 所属 factory。
+        :returns: ``None``。
+        :raises Exception: 不主动抛出异常。
+        """
+
+        self._factory = factory
+
+    async def accept(
+        self, snapshot: AttemptDispatchSnapshot, request: AgentRunRequest
+    ) -> LocalWorkerHandle:
+        """接受 dispatch 并返回对应 handle。
+
+        :param snapshot: dispatch snapshot。
+        :param request: Engine request。
+        :returns: 第一次为 awaiting handle，后续为 final answer handle。
+        :raises Exception: 不主动抛出异常。
+        """
+
+        self._factory.requests.append(request)
+        self._factory.snapshots.append(snapshot)
+        self._factory.accepted.set()
+        if len(self._factory.requests) == 1:
+            return _AgentBackedHandle(snapshot, request, _AwaitingToolRunner())
+        return FinalAnswerHandle(snapshot, f"resolved:{snapshot.run_id}")
 
 
 class _ToolCallingWorker:
@@ -497,6 +600,59 @@ class _ScriptedToolRunner:
             yield event
 
 
+class _AwaitingToolRunner:
+    """第一轮请求等待型工具的 Runner。"""
+
+    def call(
+        self,
+        messages: Sequence[AgentMessage],
+        options: RunnerCallOptions,
+        tools: Sequence[ToolSchema],
+    ) -> AsyncIterator[RunnerEvent]:
+        """返回等待型工具调用脚本。
+
+        :param messages: 当前 Agent messages。
+        :param options: Runner call options。
+        :param tools: 当前暴露的 tool schemas。
+        :returns: RunnerEvent 异步迭代器。
+        :raises Exception: 不主动抛出异常。
+        """
+
+        del messages, options, tools
+        return self._iter_events(_tool_script(_awaiting_tool_call()))
+
+    def is_supports_tool_calling(self) -> bool:
+        """返回支持工具调用。
+
+        :returns: 始终为 ``True``。
+        :raises Exception: 不主动抛出异常。
+        """
+
+        return True
+
+    async def close(self) -> None:
+        """关闭 runner。
+
+        :returns: ``None``。
+        :raises Exception: 不主动抛出异常。
+        """
+
+        return None
+
+    async def _iter_events(
+        self, events: tuple[RunnerEvent, ...]
+    ) -> AsyncIterator[RunnerEvent]:
+        """产出脚本事件。
+
+        :param events: 待产出的事件。
+        :returns: RunnerEvent 异步迭代器。
+        :raises Exception: 不主动抛出异常。
+        """
+
+        for event in events:
+            yield event
+
+
 class MockFactTool:
     """机械返回固定工具事实的 mock business tool。"""
 
@@ -525,6 +681,33 @@ class MockFactTool:
                 },
                 meta=None,
             )
+        )
+
+
+class AwaitingMockTool:
+    """返回 awaiting outcome 的 mock business tool。"""
+
+    async def __call__(
+        self,
+        call: ToolCallRequest,
+        context: BatchToolExecutionContext,
+    ) -> ToolExecutionOutcome:
+        """执行等待型 mock 工具。
+
+        :param call: 工具调用请求。
+        :param context: 批式执行上下文。
+        :returns: awaiting 工具 outcome。
+        :raises Exception: 不主动抛出异常。
+        """
+
+        del call, context
+        return ToolAwaitingOutcome(
+            await_spec=ToolAwaitSpec(
+                await_kind=ToolAwaitKind.EXTERNAL_JOB,
+                deadline=None,
+                resume_token=_AWAITING_RESUME_TOKEN,
+            ),
+            snapshot=None,
         )
 
 
@@ -842,6 +1025,91 @@ async def wait_for_status(
     raise TimeoutError(f"run {run_id} did not reach terminal")
 
 
+async def wait_for_public_waiting_run(
+    host: Host,
+    options: OpenHostOptions,
+    run_id: str,
+) -> PublicWaitingRun:
+    """等待 public opener 产生 WAITING Run 并返回 resolve 所需引用。
+
+    本 helper 先用 public ``get_run`` 观察 WAITING 状态；随后只为测试桥接
+    public ``resolve_wait(wait_id, ...)`` 的输入，从 durable wait record 读取
+    ``wait_id``。该读取集中在 public smoke support，不能作为 smoke
+    correctness assertion；测试结论仍必须断言 public snapshot / HostEvent。
+
+    :param host: public Host handle。
+    :param options: 当前 open_host options。
+    :param run_id: 目标 Run id。
+    :returns: WAITING Run 引用。
+    :raises TimeoutError: 超时未进入 WAITING 或未写入 wait record 时抛出。
+    :raises AssertionError: WAITING snapshot 缺少 current attempt 时抛出。
+    """
+
+    for _ in range(200):
+        snapshot = await host.get_run(run_id)
+        if snapshot.status is RunStatus.WAITING:
+            if snapshot.current_attempt_id is None:
+                raise AssertionError("WAITING run must have current attempt")
+            wait_id = _active_wait_id(options, run_id)
+            if wait_id is not None:
+                return PublicWaitingRun(
+                    session_id=snapshot.session_id,
+                    run_id=snapshot.run_id,
+                    attempt_id=snapshot.current_attempt_id,
+                    wait_id=wait_id,
+                )
+        await asyncio.sleep(0.01)
+    raise TimeoutError(f"run {run_id} did not reach WAITING")
+
+
+async def wait_for_diagnostic_event_type_count(
+    db_path: pathlib.Path, event_type: str, expected_count: int
+) -> None:
+    """等待指定 diagnostic EventLog 类型达到期望数量。
+
+    本 helper 只用于 public smoke 中等待非 public-display 的调度诊断事件，
+    例如 ``ATTEMPT_RUNNING``。它不是 correctness assertion；调用方必须继续
+    用 public ``get_run``、``watch_session_events`` 或 worker observable
+    断言 cancel / steer / retry / replay 等结果。
+
+    :param db_path: Host SQLite 路径。
+    :param event_type: 等待的 EventLog event type。
+    :param expected_count: 期望最小数量。
+    :returns: ``None``。
+    :raises TimeoutError: 超时未达到期望数量时抛出。
+    """
+
+    for _ in range(200):
+        if _diagnostic_event_type_count(db_path, event_type) >= expected_count:
+            return
+        await asyncio.sleep(0.01)
+    raise TimeoutError(f"Event {event_type} did not reach {expected_count}")
+
+
+def completed_wait_request(idempotency_key: str) -> ResolveWaitRequest:
+    """构造 public resolve_wait completed request。
+
+    :param idempotency_key: resolve wait 幂等键。
+    :returns: ResolveWaitRequest。
+    :raises ValueError: 字段非法时由底层抛出。
+    """
+
+    return ResolveWaitRequest(
+        context=host_context(idempotency_key),
+        idempotency_key=idempotency_key,
+        outcome=ResolveWaitCompletedOutcome(
+            result=ToolResultSuccess(
+                ok=True,
+                value={"answer": "public-wait-resolved"},
+                meta=None,
+            ),
+            payload_ref=None,
+        ),
+        source=WaitResolutionSource.MANUAL,
+        observed_at=_NOW,
+    )
+
+
 def skip_if_provider_terminal_failed(
     case: ProviderSmokeCase, event: HostEvent
 ) -> None:
@@ -926,6 +1194,25 @@ def mock_tooling_options() -> HostToolingOptions:
                 source_id="slice6-mock-tool",
             ),
         ),
+    )
+
+
+def awaiting_tooling_options() -> HostToolingOptions:
+    """构造等待型 mock business tool options。
+
+    :returns: HostToolingOptions。
+    :raises ValueError: 工具声明字段非法时由底层抛出。
+    """
+
+    return HostToolingOptions(
+        business_tool_bundle=ToolBundle(definitions=(_awaiting_tool_definition(),)),
+        source_refs=(
+            ToolBundleSourceRef(
+                source_kind=ToolBundleSourceKind.EXPLICIT_PROVIDER,
+                source_id="public-smoke-awaiting-tool",
+            ),
+        ),
+        wait_adapter_registry=_awaiting_wait_adapter_registry(),
     )
 
 
@@ -1035,6 +1322,22 @@ def _tool_call() -> ToolCallRequest:
     )
 
 
+def _awaiting_tool_call() -> ToolCallRequest:
+    """构造等待型 mock tool call。
+
+    :returns: ToolCallRequest。
+    :raises ValueError: 字段非法时由底层抛出。
+    """
+
+    return ToolCallRequest(
+        tool_call_id="public-smoke-awaiting-call-1",
+        name=_AWAITING_TOOL_NAME,
+        arguments={"ticker": "DAYU"},
+        index_in_iteration=0,
+        provider_state=None,
+    )
+
+
 def _mock_tool_definition() -> ToolDefinition:
     """构造 mock tool definition。
 
@@ -1068,6 +1371,119 @@ def _mock_tool_definition() -> ToolDefinition:
         display=None,
         tags=("slice6",),
     )
+
+
+def _awaiting_tool_definition() -> ToolDefinition:
+    """构造等待型 mock tool definition。
+
+    :returns: ToolDefinition。
+    :raises ValueError: 字段非法时由底层抛出。
+    """
+
+    properties = {
+        "ticker": {
+            "type": "string",
+            "description": "ticker symbol",
+        }
+    }
+    return ToolDefinition(
+        name=_AWAITING_TOOL_NAME,
+        schema=ToolSchema(
+            type="function",
+            function=ToolFunctionSchema(
+                name=_AWAITING_TOOL_NAME,
+                description="Return an awaiting mock filing fact.",
+                parameters=ToolParametersSchema(
+                    type="object",
+                    properties=properties,
+                    required=("ticker",),
+                    additional_properties=False,
+                ),
+            ),
+        ),
+        callable=AwaitingMockTool(),
+        truncate=None,
+        display=None,
+        tags=("slice6",),
+    )
+
+
+def _awaiting_wait_adapter_registry() -> WaitAdapterRegistry:
+    """构造等待型 mock tool 的 wait adapter registry。
+
+    :returns: WaitAdapterRegistry。
+    :raises ValueError: binding 字段非法时由底层抛出。
+    """
+
+    return WaitAdapterRegistry(
+        (
+            WaitAdapterBinding(
+                tool_name=_AWAITING_TOOL_NAME,
+                await_kind=ToolAwaitKind.EXTERNAL_JOB,
+                adapter_key=WaitAdapterKey("poll:public-smoke-awaiting-tool"),
+                resume_policy=WaitResumePolicy.POLL,
+                external_job_ref_source=WaitExternalJobRefSource.RESUME_TOKEN,
+            ),
+        )
+    )
+
+
+def _active_wait_id(options: OpenHostOptions, run_id: str) -> str | None:
+    """读取指定 Run 的 active wait id。
+
+    :param options: 当前 open_host options。
+    :param run_id: 目标 Run id。
+    :returns: active wait id；尚未写入时为 ``None``。
+    :raises RuntimeError: 同一 Run 出现多个 active wait record 时抛出。
+    """
+
+    durable_options = HostDurableStoreOptions(
+        db_path=options.db_path,
+        payload_policy=PayloadStoragePolicy(artifact_root=options.artifact_root),
+        sqlite_policy=HostSQLiteStoragePolicy(
+            busy_timeout_seconds=options.sqlite_busy_timeout_seconds,
+            write_busy_retry_count=options.sqlite_write_busy_retry_count,
+            write_retry_initial_delay_seconds=(
+                options.sqlite_write_retry_initial_delay_seconds
+            ),
+            write_retry_backoff_multiplier=(
+                options.sqlite_write_retry_backoff_multiplier
+            ),
+            write_retry_max_delay_seconds=options.sqlite_write_retry_max_delay_seconds,
+        ),
+    )
+    rows: tuple[WaitRecordRow, ...] = ()
+    with open_host_durable_store(durable_options) as store:
+        rows = store.transaction_runner.run_read(
+            lambda transaction: read_active_wait_records_for_run(transaction, run_id)
+        )
+    if len(rows) == 0:
+        return None
+    if len(rows) > 1:
+        raise RuntimeError("public smoke waiting run must have one active wait")
+    return rows[0].wait_id
+
+
+def _diagnostic_event_type_count(db_path: pathlib.Path, event_type: str) -> int:
+    """统计测试同步所需的 diagnostic event type 数量。
+
+    :param db_path: Host SQLite 路径。
+    :param event_type: 目标事件类型。
+    :returns: 匹配事件数量。
+    :raises TypeError: SQLite COUNT 结果类型不符合预期时抛出。
+    """
+
+    with sqlite3.connect(db_path) as connection:
+        row = connection.execute(
+            "SELECT COUNT(*) FROM event_log WHERE event_type = ?",
+            (event_type,),
+        ).fetchone()
+    if row is None:
+        return 0
+    value = row[0]
+    if not isinstance(value, int):
+        raise TypeError("diagnostic event count must be int")
+    return value
 
 
 def _all_provider_missing_reason() -> str:

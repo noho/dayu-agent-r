@@ -15,7 +15,10 @@ from dayu.host import (
     RunStatus,
     open_host,
 )
-from tests.host.public_smoke_support import next_terminal_for_run
+from tests.host.public_smoke_support import (
+    next_terminal_for_run,
+    wait_for_diagnostic_event_type_count,
+)
 from tests.host.test_public_retry_replay import (
     _BLOCK,
     _SequencedWorkerFactory,
@@ -23,7 +26,6 @@ from tests.host.test_public_retry_replay import (
     _ensure_request,
     _followup_request,
     _options,
-    _wait_for_event_type_count,
     _wait_for_run_status,
 )
 
@@ -42,9 +44,10 @@ async def test_cancel_accepted_queued_and_active_public_path(
             _followup_request(session.session_id, "cancel-active"),
         )
         await _wait_for_run_status(host, active.accepted_run_id, RunStatus.RUNNING)
-        await _wait_for_event_type_count(
+        await wait_for_diagnostic_event_type_count(
             tmp_path / "host.sqlite3", "ATTEMPT_RUNNING", 1
         )
+        await _wait_for_handle_count(factory, 1)
         queued = await host.submit_followup(
             session.session_id,
             _followup_request(session.session_id, "cancel-queued"),

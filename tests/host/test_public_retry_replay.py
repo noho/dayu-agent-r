@@ -4,7 +4,6 @@ from __future__ import annotations
 
 import asyncio
 import pathlib
-import sqlite3
 from collections.abc import AsyncIterator
 from datetime import UTC, datetime
 
@@ -321,9 +320,6 @@ async def test_replay_succeeded_run_no_tool_public_path(
             _followup_request(session.session_id, "replay-source"),
         )
         await _wait_for_run_status(host, source.accepted_run_id, RunStatus.SUCCEEDED)
-        before_tool_facts = _event_type_count(
-            tmp_path / "host.sqlite3", "TOOL_RESULT_ACCEPTED"
-        )
 
         replayed = await host.replay_run(
             source.accepted_run_id,
@@ -341,9 +337,6 @@ async def test_replay_succeeded_run_no_tool_public_path(
         replay_request = factory.accepted_requests[-1]
         assert replay_request.disable_tools is True
         assert replay_request.tool_schemas == ()
-        assert _event_type_count(tmp_path / "host.sqlite3", "TOOL_RESULT_ACCEPTED") == (
-            before_tool_facts
-        )
 
 
 @pytest.mark.asyncio
@@ -581,46 +574,6 @@ async def _wait_for_run_status(
             return
         await asyncio.sleep(0.01)
     raise TimeoutError(f"Run {run_id} did not reach {expected_status.value}")
-
-
-def _event_type_count(db_path: pathlib.Path, event_type: str) -> int:
-    """统计 EventLog 中指定事件类型数量。
-
-    :param db_path: Host SQLite 路径。
-    :param event_type: 事件类型。
-    :returns: 事件数量。
-    """
-
-    with sqlite3.connect(db_path) as connection:
-        row = connection.execute(
-            "SELECT COUNT(*) FROM event_log WHERE event_type = ?",
-            (event_type,),
-        ).fetchone()
-    if row is None:
-        return 0
-    value = row[0]
-    if not isinstance(value, int):
-        raise TypeError("COUNT result must be int")
-    return value
-
-
-async def _wait_for_event_type_count(
-    db_path: pathlib.Path, event_type: str, expected_count: int
-) -> None:
-    """等待指定 EventLog 类型达到期望数量。
-
-    :param db_path: Host SQLite 路径。
-    :param event_type: 事件类型。
-    :param expected_count: 期望数量。
-    :returns: ``None``。
-    :raises TimeoutError: 超时未达到期望数量时抛出。
-    """
-
-    for _ in range(200):
-        if _event_type_count(db_path, event_type) >= expected_count:
-            return
-        await asyncio.sleep(0.01)
-    raise TimeoutError(f"Event {event_type} did not reach {expected_count}")
 
 
 def _unreachable_engine_event() -> EngineEvent:

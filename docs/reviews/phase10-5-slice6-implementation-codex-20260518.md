@@ -34,15 +34,15 @@
 
 ## 验证结果
 
-- `source .venv/bin/activate && pytest tests/host/test_public_compact_smoke.py -q -rs`  
+- `source .venv/bin/activate && pytest tests/host/test_public_compact_smoke.py -q -rs`
   结果：`1 passed in 3.69s`
-- `source .venv/bin/activate && pytest tests/host/test_public_open_host_multiturn_smoke.py tests/host/test_public_tool_wiring_smoke.py tests/host/test_public_compact_smoke.py tests/host/test_public_cancel_smoke.py -q`  
+- `source .venv/bin/activate && pytest tests/host/test_public_open_host_multiturn_smoke.py tests/host/test_public_tool_wiring_smoke.py tests/host/test_public_compact_smoke.py tests/host/test_public_cancel_smoke.py -q`
   结果：`11 passed in 21.46s`
-- `source .venv/bin/activate && pytest tests/host/test_public_real_runner_matrix_smoke.py -q -rs`  
+- `source .venv/bin/activate && pytest tests/host/test_public_real_runner_matrix_smoke.py -q -rs`
   结果：`3 passed, 1 skipped in 30.18s`；skipped provider 为 `gemini`，原因是 endpoint 返回 HTTP 429 / `RESOURCE_EXHAUSTED` / `QuotaFailure` / `RetryInfo`，skip reason 包含 `provider=gemini`、endpoint、`provider_quota_or_rate_limit=resource_exhausted` 与原始 provider payload。
-- `source .venv/bin/activate && pytest tests/host -q`  
+- `source .venv/bin/activate && pytest tests/host -q`
   结果：`695 passed, 1 skipped in 40.97s`
-- `source .venv/bin/activate && python -m pyright dayu/host tests/host`  
+- `source .venv/bin/activate && python -m pyright dayu/host tests/host`
   结果：`0 errors, 0 warnings, 0 informations`
 
 Controller 复跑曾观察到真实 runner 返回空 final answer：payload 为 `{"content": "", "degraded": true, "filtered": false, "finish_reason": "length"}`，旧 Host ingest 会写入 `RUN_SUCCEEDED`，但 public `watch_session_events` 读取 `RUN_SUCCEEDED` 时要求 final answer `content` 是非空文本，导致 `HostDurableError` 转为 `HostApiError`。本 follow-up 的 root cause fix 是在 Engine ingest terminal plan 边界拒绝空白 final answer 成功收口，改写为 `RUN_FAILED(error_code=empty_final_answer)`，使 public watch 返回 typed failed terminal event 而不是崩溃。

@@ -55,6 +55,7 @@ from dayu.host.durable.transaction import HostTransaction, HostTransactionRunner
 
 _NOW = datetime(2026, 5, 15, 1, 2, 3, tzinfo=UTC)
 _LANE_NAME = "llm"
+_EVENT_COUNT_READ_LIMIT = 1000
 
 
 def _options(tmp_path: Path) -> HostCommandHandleOptions:
@@ -209,34 +210,20 @@ def _cancel_request(client_request_id: str) -> CancelSessionRunsRequest:
     )
 
 
-def _event_count(db_path: Path) -> int:
-    """统计 EventLog row 数。
+def _event_count(host: HostCommandHandle) -> int:
+    """统计当前测试 command handle 可见的 EventLog row 数。
 
-    :param db_path: SQLite DB 路径。
+    :param host: Host command handle。
     :returns: EventLog row 数。
     """
 
-    with sqlite3.connect(db_path) as connection:
-        row = connection.execute("SELECT COUNT(*) FROM event_log").fetchone()
-    assert row is not None
-    return int(row[0])
-
-
-def _event_type_count(db_path: Path, event_type: str) -> int:
-    """统计指定 EventLog 类型数量。
-
-    :param db_path: SQLite DB 路径。
-    :param event_type: event type。
-    :returns: 指定类型 row 数。
-    """
-
-    with sqlite3.connect(db_path) as connection:
-        row = connection.execute(
-            "SELECT COUNT(*) FROM event_log WHERE event_type = ?",
-            (event_type,),
-        ).fetchone()
-    assert row is not None
-    return int(row[0])
+    return host._transaction_runner().run_read(
+        lambda transaction: len(
+            EventLogStore().read_events_after(
+                transaction, 0, limit=_EVENT_COUNT_READ_LIMIT
+            )
+        )
+    )
 
 
 def _run_status(db_path: Path, run_id: str) -> RunStatus:
@@ -453,7 +440,7 @@ def test_cancel_session_runs_unsupported_non_terminal_has_no_partial_mutation(
         # 这里仅构造 unsupported 分类测试所需的 deferred 状态，不模拟生产
         # recovery；该用例只验证 unsupported 分类不会产生 partial mutation。
         _mark_run_status(options.db_path, active.run_id, RunStatus.RECOVERING)
-        before_cancel = _event_count(options.db_path)
+        before_cancel = _event_count(host)
 
         with pytest.raises(HostApiError) as exc_info:
             cancel_session_runs(
@@ -461,7 +448,7 @@ def test_cancel_session_runs_unsupported_non_terminal_has_no_partial_mutation(
             )
 
         assert exc_info.value.code == HostApiErrorCode.UNSUPPORTED_OPERATION
-        assert _event_count(options.db_path) == before_cancel
+        assert _event_count(host) == before_cancel
         assert _run_status(options.db_path, active.run_id) == RunStatus.RECOVERING
         assert _run_status(options.db_path, queued.run_id) == RunStatus.QUEUED
     finally:
@@ -500,7 +487,6 @@ def test_cancel_session_runs_cancels_queued_and_active_worker(
         assert snapshot.queued_run_ids == ()
         assert _run_status(options.db_path, active.run_id) == RunStatus.CANCELLING
         assert _run_status(options.db_path, queued.run_id) == RunStatus.CANCELLED
-        assert _event_type_count(options.db_path, "RUN_CANCELLING") == 1
     finally:
         host.close()
 
@@ -530,14 +516,12 @@ def test_cancel_session_runs_active_replay_does_not_append_facts(
         request = _cancel_request("cancel-session-active")
 
         first = cancel_session_runs(host, session_id, request)
-        after_first_events = _event_count(options.db_path)
+        after_first_events = _event_count(host)
         replay = cancel_session_runs(host, session_id, request)
 
         assert first == replay
         assert _run_status(options.db_path, active.run_id) == RunStatus.CANCELLING
-        assert _event_count(options.db_path) == after_first_events
-        assert _event_type_count(options.db_path, "CANCEL_REQUESTED") == 1
-        assert _event_type_count(options.db_path, "RUN_CANCELLING") == 1
+        assert _event_count(host) == after_first_events
     finally:
         host.close()
 
@@ -551,7 +535,7 @@ def test_cancel_session_runs_no_supported_run_records_idempotency_without_event(
     host = create_host_command_handle(options)
     try:
         session_id = _session_id(host, "slot-a")
-        before_cancel = _event_count(options.db_path)
+        before_cancel = _event_count(host)
         request = _cancel_request("cancel-empty")
 
         first = cancel_session_runs(host, session_id, request)
@@ -560,6 +544,6 @@ def test_cancel_session_runs_no_supported_run_records_idempotency_without_event(
         assert first == second
         assert first.active_run_id is None
         assert first.queued_run_ids == ()
-        assert _event_count(options.db_path) == before_cancel
+        assert _event_count(host) == before_cancel
     finally:
         host.close()

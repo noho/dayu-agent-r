@@ -14,7 +14,14 @@ from dayu.host import (
     SubmitFollowupRequest,
     open_host,
 )
-from dayu.host.command import create_host_command_handle
+from tests.host.public_smoke_support import (
+    AwaitingThenFinalWorkerFactory,
+    awaiting_tooling_options,
+    deterministic_runner_spec,
+    open_host_options,
+    wait_for_diagnostic_event_type_count,
+    wait_for_public_waiting_run,
+)
 from tests.host.test_public_retry_replay import (
     _BLOCK,
     _FINAL,
@@ -23,12 +30,7 @@ from tests.host.test_public_retry_replay import (
     _ensure_request,
     _followup_request,
     _options,
-    _wait_for_event_type_count,
     _wait_for_run_status,
-)
-from tests.host.test_resolve_wait_command import (
-    _options as _command_options,
-    _seed_waiting_run,
 )
 
 
@@ -46,7 +48,7 @@ async def test_steer_running_run_creates_new_attempt_public_path(
             _followup_request(session.session_id, "steer-source"),
         )
         await _wait_for_run_status(host, first.accepted_run_id, RunStatus.RUNNING)
-        await _wait_for_event_type_count(
+        await wait_for_diagnostic_event_type_count(
             tmp_path / "host.sqlite3", "ATTEMPT_RUNNING", 1
         )
         first_attempt_id = (await host.get_run(first.accepted_run_id)).current_attempt_id
@@ -87,19 +89,29 @@ async def test_steer_waiting_run_creates_new_attempt_public_path(
     :raises AssertionError: WAITING steer 未创建新 Attempt 或未成功终态时抛出。
     """
 
-    seed_handle = create_host_command_handle(_command_options(tmp_path))
-    try:
-        seeded = _seed_waiting_run(seed_handle)
-    finally:
-        seed_handle.close()
+    factory = AwaitingThenFinalWorkerFactory()
+    options = open_host_options(
+        tmp_path,
+        runner_spec=deterministic_runner_spec("steer-waiting-model"),
+        worker_factory=factory,
+        allow_tool_calls=True,
+        tooling_options=awaiting_tooling_options(),
+    )
+    async with open_host(options) as host:
+        session = await host.ensure_session(_ensure_request("steer-waiting"))
+        first = await host.submit_followup(
+            session.session_id,
+            _followup_request(session.session_id, "steer-waiting-source"),
+        )
+        waiting = await wait_for_public_waiting_run(
+            host, options, first.accepted_run_id
+        )
 
-    factory = _SequencedWorkerFactory([_FINAL])
-    async with open_host(_options(tmp_path, factory)) as host:
         steered = await host.submit_followup(
-            seeded.session_id,
+            waiting.session_id,
             SubmitFollowupRequest(
                 context=_context("steer-waiting"),
-                session_id=seeded.session_id,
+                session_id=waiting.session_id,
                 client_request_id="steer-waiting",
                 system_prompt=None,
                 user_prompt="replace waiting attempt",
@@ -108,14 +120,14 @@ async def test_steer_waiting_run_creates_new_attempt_public_path(
                 runner_options=None,
                 agent_policy=None,
                 behavior=FollowupBehavior.STEER,
-                target_run_id=seeded.run_id,
+                target_run_id=waiting.run_id,
             ),
         )
 
-        assert steered.accepted_run_id == seeded.run_id
-        after = await host.get_run(seeded.run_id)
-        assert after.current_attempt_id != seeded.attempt_id
-        await _wait_for_run_status(host, seeded.run_id, RunStatus.SUCCEEDED)
+        assert steered.accepted_run_id == waiting.run_id
+        after = await host.get_run(waiting.run_id)
+        assert after.current_attempt_id != waiting.attempt_id
+        await _wait_for_run_status(host, waiting.run_id, RunStatus.SUCCEEDED)
 
 
 @pytest.mark.asyncio
