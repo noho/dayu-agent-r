@@ -67,7 +67,7 @@ from dayu.engine.contracts import AgentRunRequest, RunnerSpec
 
 - `run_id`：调用方传入的本次 run 标识；Engine 只随事件与工具执行上下文透传，不拥有 run 生命周期。
 - `session_id`：调用方传入的 session 标识；Engine 只随事件与工具执行上下文透传，不拥有 session 生命周期。
-- `messages`：进入本次 run 的 `AgentMessage` 元组；Engine 会在 Runner 调用前执行防御性 inline 内容大小检查，超限时以既有 `context_compaction_required` recoverable failure 收口，要求调用方通过 ref / digest / payload / compact artifact 边界重建有界 messages。
+- `messages`：进入本次 run 的非空 `AgentMessage` 元组；Engine 会在 Runner 调用前执行防御性 inline 内容大小检查，超限时以既有 `context_compaction_required` recoverable failure 收口，要求调用方通过 ref / digest / payload / compact artifact 边界重建有界 messages。
 - `disable_tools`：是否禁用工具调用。
 - `runner_spec`：Runner 规约。
 - `runner_options`：单次 Runner 调用参数。
@@ -165,7 +165,7 @@ Engine 消费的消息类型来自 `AgentMessage` 封闭联合，当前包括：
 
 Engine 公共契约分为 Engine 专属契约与跨层共享契约。Engine 专属契约位于 `dayu.engine.contracts`；工具、JSON 值、取消 token 等共享契约位于 `dayu.contracts`。
 
-- `AgentRunRequest`：单次 run 的输入快照。形状包含 `run_id`、`session_id`、`messages`、`disable_tools`、`runner_spec`、`runner_options`、`agent_policy`、`tool_schemas`、`tool_executor`、`cancellation_token`。
+- `AgentRunRequest`：单次 run 的输入快照。形状包含 `run_id`、`session_id`、非空 `messages`、`disable_tools`、`runner_spec`、`runner_options`、`agent_policy`、`tool_schemas`、`tool_executor`、`cancellation_token`。
 - `AgentPolicy`：Agent loop 策略。形状包含 iteration 预算、续写预算、工具开关、工具握手 timeout、fallback 模式、fallback prompt、continuation prompt 与连续失败工具批次阈值。
 - `RunnerSpec`：Runner 规约。形状包含 provider、model、endpoint、api key 引用、headers、tool calling / streaming 能力、stream usage 能力、默认 timeout、重试次数、provider 请求扩展、SSE idle timeout 与 heartbeat。
 - `RunnerCallOptions`：单次 Runner 调用参数。形状包含 `temperature`、`max_tokens`、`top_p`、`stream`。
@@ -178,7 +178,7 @@ Engine 公共契约分为 Engine 专属契约与跨层共享契约。Engine 专�
 - `tool_schemas`：本次 run 暴露给模型的工具 schema 快照。形状是 `tuple[ToolSchema, ...]`。
 - `tool_executor`：工具执行协议 handle。形状是 `ToolExecutor.execute(BatchToolExecutionRequest) -> BatchToolExecutionOutcome`。
 - `BatchToolExecutionRequest`：批式工具执行请求。形状包含 `calls: tuple[ToolCallRequest, ...]` 与 `context: BatchToolExecutionContext`。
-- `BatchToolExecutionContext`：批式工具执行上下文。形状包含 `run_id`、`session_id`、`iteration_id`、`timeout_seconds`、`cancellation_token`、`correlation_id`。
+- `BatchToolExecutionContext`：批式工具执行上下文。形状包含非空 `run_id`、`session_id`、`iteration_id`、`timeout_seconds`、`cancellation_token`、`correlation_id`。
 - `ToolExecutionOutcome`：单工具执行结果封闭联合。成员包括 `ToolCompletedOutcome`、`ToolFailedOutcome`、`ToolAwaitingOutcome`、`ToolCancelledOutcome`。
 - `BatchToolExecutionOutcome`：批式工具执行结果。形状包含 `records: tuple[BatchToolExecutionRecord, ...]`，构造期要求 record 的 tool call id 非空且不重复；与输入 calls 的完整双射由 Engine 校验。
 - `ToolAwaitingOutcome`：长事务等待结果。形状包含 `await_spec: ToolAwaitSpec` 与 `snapshot: ToolAwaitSnapshot | None`。

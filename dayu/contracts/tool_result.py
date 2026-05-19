@@ -36,6 +36,21 @@ class ToolResultMeta:
     started_at: datetime
     finished_at: datetime
 
+    def __post_init__(self) -> None:
+        """校验工具结果元信息的最小完整性。
+
+        :returns: ``None``。
+        :raises ValueError: ``tool_name`` 为空 / 纯空白，或结束时间早于开始时间时抛出。
+        """
+
+        if self.tool_name.strip() == "":
+            raise ValueError("ToolResultMeta.tool_name must be non-empty")
+        if self.finished_at < self.started_at:
+            raise ValueError(
+                "ToolResultMeta.finished_at must be greater than or equal "
+                "to started_at"
+            )
+
 
 @dataclass(frozen=True, slots=True)
 class ToolResultSuccess:

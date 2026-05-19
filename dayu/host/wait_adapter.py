@@ -323,6 +323,7 @@ class WaitPoller:
         self._resolver = resolver
         self._context = context
         self._clock = clock if clock is not None else _SystemUtcClock()
+        self._abandoned_cancelled_wait_ids: set[str] = set()
 
     def poll_once(self) -> WaitPollOnceResult:
         """执行单轮 poll。
@@ -350,8 +351,11 @@ class WaitPoller:
                 adapter_errors += 1
                 continue
             if record.status is WaitRecordStatus.CANCELLED:
+                if record.wait_id in self._abandoned_cancelled_wait_ids:
+                    continue
                 try:
                     adapter.abandon_wait(record)
+                    self._abandoned_cancelled_wait_ids.add(record.wait_id)
                     abandoned += 1
                 except Exception as exc:
                     _LOGGER.warning(

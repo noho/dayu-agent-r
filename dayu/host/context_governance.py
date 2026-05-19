@@ -44,6 +44,7 @@ def check_compaction_candidate(
     )
     evidence_ids = _evidence_ids(candidate.preservation_evidence)
     evidence_anchors_retained = _evidence_anchors_retained(request, candidate)
+    compact_ranges_from_request = _compact_ranges_from_request(request, candidate)
     patch_valid = _pinned_patch_valid(
         candidate.pinned_state_patch_candidate,
         evidence_ids=evidence_ids,
@@ -62,6 +63,8 @@ def check_compaction_candidate(
         issue_collector.add(CompactQualityIssue.EVIDENCE_ANCHOR_NOT_RETAINED)
     if not patch_valid:
         issue_collector.add(CompactQualityIssue.PINNED_PATCH_TRI_STATE_INVALID)
+    if not compact_ranges_from_request:
+        issue_collector.add(CompactQualityIssue.COMPACT_RANGE_OUTSIDE_REQUEST)
 
     reasons = issue_collector.reasons()
     return CompactQualityCheckResult(
@@ -244,6 +247,26 @@ def _range_refs_from_input(
         input_range.start_input_ref in input_refs
         and input_range.end_input_ref in input_refs
     )
+
+
+def _compact_ranges_from_request(
+    request: CompactionRequest, candidate: CompactionCandidate
+) -> bool:
+    """判断 candidate 声明的 compact ranges 是否来自可摘要输入范围。
+
+    :param request: compaction 请求。
+    :param candidate: compaction candidate。
+    :returns: 所有 dropped / summarized range 均来自 older raw turns 时返回 ``True``。
+    """
+
+    allowed_refs = set(request.older_raw_turn_refs)
+    for input_range in candidate.dropped_ranges + candidate.summarized_ranges:
+        if (
+            input_range.start_input_ref not in allowed_refs
+            or input_range.end_input_ref not in allowed_refs
+        ):
+            return False
+    return True
 
 
 def _retained_input_refs(

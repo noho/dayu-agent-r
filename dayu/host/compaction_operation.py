@@ -102,7 +102,7 @@ async def run_compaction_operation(
                     repairable=repairable,
                     next_policy_decision=next_decision,
                     budget_after_attempted_compact=None,
-                    diagnostic_suffix=exc.__class__.__name__,
+                    diagnostic_suffix=_exception_diagnostic_suffix(exc),
                 )
             )
             if repairable:
@@ -225,6 +225,19 @@ def _quality_suffix(quality: CompactQualityCheckResult) -> str:
     if len(quality.rejection_reasons) == 0:
         return _DIAGNOSTIC_SUFFIX_UNKNOWN
     return "-".join(reason.value for reason in quality.rejection_reasons)
+
+
+def _exception_diagnostic_suffix(exc: Exception) -> str:
+    """构造 proposal exception 诊断后缀。
+
+    :param exc: compactor proposal 抛出的异常。
+    :returns: 包含异常类型与消息的诊断后缀。
+    """
+
+    message = str(exc)
+    if message == "":
+        return exc.__class__.__name__
+    return f"{exc.__class__.__name__}:{message}"
 
 
 __all__ = [

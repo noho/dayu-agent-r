@@ -8,6 +8,7 @@ wait record，并把 Run / Attempt 推进到 ``WAITING`` / ``SUSPENDED``。
 from __future__ import annotations
 
 import logging
+from abc import ABC, abstractmethod
 from collections.abc import Mapping
 from dataclasses import dataclass
 from datetime import UTC, datetime
@@ -364,9 +365,10 @@ class _WaitResolutionPayloadPlan:
     result_json: JsonValue
 
 
-class HostToolAwaitingAcceptPort:
-    """工具 awaiting canonical fact accept barrier 端口协议。"""
+class HostToolAwaitingAcceptPort(ABC):
+    """工具 awaiting canonical fact accept barrier 抽象端口。"""
 
+    @abstractmethod
     def accept_tool_awaiting(
         self, candidate: ToolAwaitingAcceptCandidate
     ) -> ToolAwaitingAcceptResult:

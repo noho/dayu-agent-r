@@ -194,6 +194,7 @@ async def test_run_compaction_operation_fails_after_async_attempt_budget() -> No
     assert len(result.rejected_attempts) == 2
     assert result.rejected_attempts[0].repairable is True
     assert result.rejected_attempts[1].repairable is False
+    assert "proposal failed" in result.rejected_attempts[0].diagnostic_refs[0]
     assert result.failure_reason is not None
 
 

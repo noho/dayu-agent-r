@@ -244,10 +244,10 @@ def test_poll_adapter_lost_result_closes_run(
         host.close()
 
 
-def test_cancelled_poll_wait_is_abandoned_without_resolve(
+def test_cancelled_poll_wait_is_abandoned_once_without_resolve(
     tmp_path: Path,
 ) -> None:
-    """cancelled poll wait 只通知 adapter abandon，不调用 resolve_wait。"""
+    """cancelled poll wait 只通知 adapter abandon 一次，不调用 resolve_wait。"""
 
     host = create_host_command_handle(_options(tmp_path))
     try:
@@ -266,9 +266,11 @@ def test_cancelled_poll_wait_is_abandoned_without_resolve(
         poller = _poller(host, adapter, seeded.wait_id)
 
         result = poller.poll_once()
+        second = poller.poll_once()
 
         wait_record = _read_wait(host._transaction_runner(), seeded.wait_id)
         assert result.abandoned == 1
+        assert second.abandoned == 0
         assert adapter.poll_count == 0
         assert adapter.abandoned == [seeded.wait_id]
         assert wait_record.status is WaitRecordStatus.CANCELLED

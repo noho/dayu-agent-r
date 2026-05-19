@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import logging
 from collections.abc import AsyncIterator, Sequence
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
@@ -508,6 +509,48 @@ async def test_success_run_lifts_runner_events_and_agent_final() -> None:
     assert {event.run_id for event in events} == {"run_phase2"}
     assert runner.close_count == 1
     _assert_single_terminal_at_end(events)
+
+
+@pytest.mark.asyncio
+async def test_finish_reason_mismatch_logs_warning(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """content completed 与 done 的 finish_reason 不一致时必须记录 warning。"""
+
+    runner = _ScriptedRunner(
+        events=(
+            _event(
+                RunnerEventType.RUNNER_CONTENT_COMPLETED,
+                RunnerContentCompletedData(
+                    content="partial",
+                    reasoning_content=None,
+                    finish_reason=FinishReason.STOP,
+                ),
+            ),
+            _event(
+                RunnerEventType.RUNNER_DONE,
+                RunnerDoneData(
+                    finish_reason=FinishReason.LENGTH,
+                    provider_request_id="req-mismatch",
+                ),
+            ),
+        )
+    )
+    caplog.set_level(logging.WARNING, logger="dayu.engine.agent")
+
+    events = await _collect(_AsyncAgent(request=_request(), runner=runner))
+
+    assert any(
+        "engine.agent.finish_reason_mismatch" in record.getMessage()
+        for record in caplog.records
+    )
+    iteration_completed = [
+        event for event in events
+        if event.type is EngineEventType.ITERATION_COMPLETED
+    ]
+    assert len(iteration_completed) == 1
+    assert isinstance(iteration_completed[0].data, IterationCompletedData)
+    assert iteration_completed[0].data.finish_reason is FinishReason.LENGTH
 
 
 @pytest.mark.asyncio
@@ -1348,6 +1391,49 @@ async def test_run_agent_and_wait_maps_suspended(
     assert len(result.awaiting_records) == 1
     assert result.awaiting_records[0].await_spec is await_spec
     assert result.awaiting_records[0].snapshot is snapshot
+
+
+@pytest.mark.asyncio
+async def test_run_agent_and_wait_logs_unknown_terminal_shape(
+    monkeypatch: pytest.MonkeyPatch,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """terminal type 与 data 不匹配时必须记录 warning。"""
+
+    async def fake_messages(
+        request: AgentRunRequest,
+    ) -> AsyncIterator[EngineEvent]:
+        """产出形状不匹配的 terminal event。
+
+        :param request: Agent run 请求。
+        :returns: EngineEvent 异步流。
+        :raises Exception: 不主动抛出异常。
+        """
+
+        yield EngineEvent(
+            occurred_at=_utc_now(),
+            session_id=request.session_id,
+            run_id=request.run_id,
+            type=EngineEventType.FINAL_ANSWER,
+            data=RunFailedData(
+                error_code="bad_terminal_shape",
+                message="bad terminal shape",
+                provider_request_id=None,
+                recoverable=False,
+            ),
+            metadata=None,
+        )
+
+    caplog.set_level(logging.WARNING, logger="dayu.engine.agent")
+    monkeypatch.setattr(agent_module, "run_agent_messages", fake_messages)
+
+    result = await agent_module.run_agent_and_wait(_request())
+
+    assert isinstance(result, EngineRunOutcomeFailed)
+    assert any(
+        "engine.agent.unknown_terminal_shape" in record.getMessage()
+        for record in caplog.records
+    )
 
 
 def _terminal_count(events: Sequence[EngineEvent]) -> int:

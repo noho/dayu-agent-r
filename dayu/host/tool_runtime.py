@@ -2829,7 +2829,7 @@ class ToolRuntimeExecutor:
                 result = self._awaiting_accept_port.accept_tool_awaiting(
                     candidate
                 )
-            except (HostTransactionRetryExhaustedError, TimeoutError):
+            except HostTransactionRetryExhaustedError:
                 last_error_code = _TOOL_RUNTIME_ACCEPT_EXCEPTION_REASON
                 result = ToolAwaitingAcceptTimedOut(
                     attempt_count=attempt_count,
@@ -2935,7 +2935,7 @@ class ToolRuntimeExecutor:
             attempt_count += 1
             try:
                 result = self._accept_port.accept_tool_fact(candidate)
-            except (HostTransactionRetryExhaustedError, TimeoutError):
+            except HostTransactionRetryExhaustedError:
                 last_error_code = _TOOL_RUNTIME_ACCEPT_EXCEPTION_REASON
                 result = ToolFactAcceptTimedOut(
                     attempt_count=attempt_count,

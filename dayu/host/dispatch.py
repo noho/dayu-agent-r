@@ -1551,16 +1551,28 @@ class HostDispatchScheduler:
 
         try:
             while not self._closed:
-                if self._queue.empty():
-                    _LOGGER.debug(
-                        _LOG_DRAIN_LOOP_EMPTY_SLEEPING,
+                try:
+                    if self._queue.empty():
+                        _LOGGER.debug(
+                            _LOG_DRAIN_LOOP_EMPTY_SLEEPING,
+                            self._host_handle_id,
+                            self._local_execution.dispatch_poll_interval_seconds,
+                        )
+                        await asyncio.sleep(
+                            self._local_execution.dispatch_poll_interval_seconds
+                        )
+                    await self.drain_once()
+                except Exception as exc:
+                    _LOGGER.warning(
+                        _LOG_DRAIN_LOOP_UNEXPECTED_EXCEPTION,
                         self._host_handle_id,
-                        self._local_execution.dispatch_poll_interval_seconds,
+                        exc.__class__.__name__,
+                        exc_info=True,
                     )
-                    await asyncio.sleep(
-                        self._local_execution.dispatch_poll_interval_seconds
-                    )
-                await self.drain_once()
+                    if not self._closed:
+                        await asyncio.sleep(
+                            self._local_execution.dispatch_poll_interval_seconds
+                        )
             _LOGGER.debug(_LOG_DRAIN_LOOP_CLOSE_EXIT, self._host_handle_id)
         except asyncio.CancelledError:
             _LOGGER.debug(
@@ -1570,13 +1582,6 @@ class HostDispatchScheduler:
                 self._host_handle_id,
             )
             raise
-        except Exception as exc:
-            _LOGGER.warning(
-                _LOG_DRAIN_LOOP_UNEXPECTED_EXCEPTION,
-                self._host_handle_id,
-                exc.__class__.__name__,
-                exc_info=True,
-            )
 
     async def _promotion_drain_loop(self) -> None:
         """后台处理 queued Run promotion wakeup。
@@ -2922,7 +2927,12 @@ async def _safe_close_worker_handle(handle: LocalWorkerHandle) -> None:
 
     try:
         await handle.close()
-    except Exception:
+    except Exception as exc:
+        _LOGGER.warning(
+            "dispatch.worker_handle.close_failed error_type=%s",
+            exc.__class__.__name__,
+            exc_info=True,
+        )
         return
 
 
@@ -2935,7 +2945,15 @@ async def _safe_release_lane_token(token: LaneClaimToken) -> None:
 
     try:
         await token.release()
-    except Exception:
+    except Exception as exc:
+        _LOGGER.warning(
+            "dispatch.lane_token.release_failed lane_name=%s claim_id=%s "
+            "error_type=%s",
+            token.name,
+            token.claim_id,
+            exc.__class__.__name__,
+            exc_info=True,
+        )
         return
 
 

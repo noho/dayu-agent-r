@@ -1543,7 +1543,7 @@ class _CancelRunOperation:
                 scope=scope,
             )
         if _is_terminal_run_status(run.status):
-            return self._record_terminal_replay(
+            return self._record_terminal_cancel_ack(
                 transaction=transaction,
                 run=run,
                 semantic_digest=semantic_digest,
@@ -1816,7 +1816,7 @@ class _CancelRunOperation:
             released_active_slot=True,
         )
 
-    def _record_terminal_replay(
+    def _record_terminal_cancel_ack(
         self,
         *,
         transaction: HostTransaction,

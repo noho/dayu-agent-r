@@ -16,6 +16,7 @@ from threading import Event
 
 import pytest
 
+import dayu.runtime.lane as lane_module
 from dayu.runtime.lane import (
     LaneAcquireCancelled,
     LaneAcquired,
@@ -30,6 +31,7 @@ from dayu.runtime.lane import (
     RuntimeLaneError,
     SQLiteLaneCoordinatorConfig,
     _ClaimAttempt,
+    _await_task_after_outer_cancellation,
 )
 
 _LANE_NAME = "llm"
@@ -291,6 +293,44 @@ async def test_parent_directory_creation_policy(tmp_path: Path) -> None:
 
 
 @pytest.mark.asyncio
+async def test_parent_directory_creation_oserror_is_config_error(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """创建 SQLite parent directory 的 OSError 必须包装为配置错误。"""
+
+    def raise_permission(
+        self: Path,
+        mode: int = 0o777,
+        parents: bool = False,
+        exist_ok: bool = False,
+    ) -> None:
+        """模拟文件系统拒绝创建目录。
+
+        :param self: 目标路径。
+        :param mode: 目录权限。
+        :param parents: 是否创建父目录。
+        :param exist_ok: 目录存在时是否忽略。
+        :returns: 不返回。
+        :raises PermissionError: 始终抛出。
+        """
+
+        del self, mode, parents, exist_ok
+        raise PermissionError("permission denied")
+
+    monkeypatch.setattr(Path, "mkdir", raise_permission)
+
+    with pytest.raises(RuntimeLaneConfigError) as exc_info:
+        await LaneController.open(
+            [_lane_config()],
+            coordinator=SQLiteLaneCoordinatorConfig(
+                db_path=tmp_path / "missing-parent" / "runtime_lanes.sqlite3",
+            ),
+        )
+    assert isinstance(exc_info.value.__cause__, PermissionError)
+
+
+@pytest.mark.asyncio
 async def test_database_init_sets_wal_and_schema_has_no_host_or_fins_fields(
     tmp_path: Path,
 ) -> None:
@@ -352,6 +392,49 @@ async def test_acquire_refresh_and_release(tmp_path: Path) -> None:
     assert token.released is True
     assert _claim_count(db_path) == 0
     await controller.close(reason="test-done")
+
+
+@pytest.mark.asyncio
+async def test_await_task_after_outer_cancellation_yields_before_retry(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """外层取消后等待 shielded task 时必须先退避，避免紧循环。"""
+
+    original_sleep = asyncio.sleep
+    sleep_delays: list[float] = []
+    complete = asyncio.Event()
+
+    async def fake_sleep(delay: float, result: object | None = None) -> object | None:
+        """记录 sleep 调用并让出事件循环。
+
+        :param delay: sleep 秒数。
+        :param result: sleep 返回值。
+        :returns: ``result``。
+        """
+
+        sleep_delays.append(delay)
+        return await original_sleep(0, result=result)
+
+    async def pending_task() -> str:
+        """等待测试释放后返回结果。
+
+        :returns: 完成标记。
+        """
+
+        await complete.wait()
+        return "done"
+
+    monkeypatch.setattr(lane_module.asyncio, "sleep", fake_sleep)
+    target = asyncio.create_task(pending_task())
+    waiter = asyncio.create_task(_await_task_after_outer_cancellation(target))
+    await original_sleep(0)
+
+    waiter.cancel()
+    await original_sleep(0)
+    complete.set()
+
+    assert await waiter == "done"
+    assert sleep_delays == [lane_module._OUTER_CANCELLATION_SETTLE_SLEEP_SECONDS]
 
 
 @pytest.mark.asyncio
@@ -441,8 +524,9 @@ async def test_refresh_cancel_cleanup_marks_lost_after_claim_lost(
     refresh_task.cancel()
     finish_refresh.set()
 
-    with pytest.raises(asyncio.CancelledError):
+    with pytest.raises(asyncio.CancelledError) as exc_info:
         await refresh_task
+    assert isinstance(exc_info.value.__cause__, RuntimeLaneError)
     assert refresh_finished.is_set()
     assert outcome.token.released is True
     assert _claim_count(db_path) == 0

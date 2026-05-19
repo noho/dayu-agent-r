@@ -9,6 +9,7 @@ timeout、cancellation 与 timeout 同时命中（cancel 优先）、外层
 from __future__ import annotations
 
 import asyncio
+import logging
 from datetime import datetime, timezone
 
 import pytest
@@ -20,6 +21,7 @@ from dayu.runtime.cancellation import (
     await_or_cancel,
     await_or_cancel_or_timeout,
     wait_for_or_cancel,
+    _cancel_task_and_wait,
 )
 
 
@@ -62,6 +64,100 @@ _SLOW_OPERATION_SECONDS: float = 5.0
 _EXPECTED_INT_VALUE: int = 42
 _EXPECTED_TEXT_VALUE: str = "value"
 _CANCEL_REASON: str = "user-stop"
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("interval", (0.0, -0.1))
+async def test_await_or_cancel_rejects_non_positive_poll_interval(
+    interval: float,
+) -> None:
+    """await_or_cancel 必须拒绝非正轮询间隔。"""
+
+    token = _FakeToken()
+
+    async def _target() -> None:
+        """返回空结果，供非法 interval 拒绝路径测试使用。"""
+
+        return None
+
+    with pytest.raises(ValueError, match="poll_interval_seconds"):
+        await await_or_cancel(
+            _target(),
+            token=token,
+            poll_interval_seconds=interval,
+        )
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("interval", (0.0, -0.1))
+async def test_wait_for_or_cancel_rejects_non_positive_poll_interval(
+    interval: float,
+) -> None:
+    """wait_for_or_cancel 必须拒绝非正轮询间隔。"""
+
+    token = _FakeToken()
+    task = asyncio.ensure_future(asyncio.sleep(_SLOW_OPERATION_SECONDS))
+    try:
+        with pytest.raises(ValueError, match="poll_interval_seconds"):
+            await wait_for_or_cancel(
+                task,
+                token=token,
+                timeout_seconds=_FAST_TIMEOUT_SECONDS,
+                poll_interval_seconds=interval,
+            )
+    finally:
+        task.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await task
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("interval", (0.0, -0.1))
+async def test_await_or_cancel_or_timeout_rejects_non_positive_poll_interval(
+    interval: float,
+) -> None:
+    """await_or_cancel_or_timeout 必须拒绝非正轮询间隔。"""
+
+    token = _FakeToken()
+
+    async def _target() -> None:
+        """返回空结果，供非法 interval 拒绝路径测试使用。"""
+
+        return None
+
+    with pytest.raises(ValueError, match="poll_interval_seconds"):
+        await await_or_cancel_or_timeout(
+            _target(),
+            token=token,
+            timeout_seconds=_FAST_TIMEOUT_SECONDS,
+            poll_interval_seconds=interval,
+        )
+
+
+@pytest.mark.asyncio
+async def test_cancel_task_and_wait_logs_non_cancel_exception(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """取消 cleanup 读取到普通异常时必须写 warning 诊断。"""
+
+    async def _raise_after_cancel() -> None:
+        """被取消后模拟 cleanup 编程错误。"""
+
+        try:
+            await asyncio.sleep(_SLOW_OPERATION_SECONDS)
+        except asyncio.CancelledError as exc:
+            raise ValueError("cleanup failed") from exc
+
+    caplog.set_level(logging.WARNING, logger="dayu.runtime.cancellation")
+    task = asyncio.create_task(_raise_after_cancel())
+    await asyncio.sleep(0)
+
+    await _cancel_task_and_wait(task)
+
+    assert any(
+        "runtime.cancellation.cancelled_task_failed" in record.getMessage()
+        for record in caplog.records
+    )
 
 
 @pytest.mark.asyncio

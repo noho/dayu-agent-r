@@ -88,6 +88,16 @@ class AgentRunRequest:
     tool_executor: ToolExecutor
     cancellation_token: CancellationToken
 
+    def __post_init__(self) -> None:
+        """校验 Agent run 请求的入口不变量。
+
+        :returns: ``None``。
+        :raises ValueError: ``messages`` 为空时抛出。
+        """
+
+        if len(self.messages) == 0:
+            raise ValueError("AgentRunRequest.messages must be non-empty")
+
 
 @dataclass(frozen=True, slots=True)
 class EngineRunOutcomeFinalAnswer:

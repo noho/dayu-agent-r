@@ -8,6 +8,7 @@ from typing import cast
 import pytest
 
 from dayu.host.compaction import (
+    CompactInputRange,
     CompactQualityCheckResult,
     CompactQualityIssue,
     CompactionRequest,
@@ -216,6 +217,27 @@ async def test_quality_rejects_summary_pretending_to_create_verified_fact() -> N
 
     assert result.accepted is False
     assert CompactQualityIssue.SUMMARY_PRETENDS_VERIFIED_FACT in (
+        result.rejection_reasons
+    )
+
+
+@pytest.mark.asyncio
+async def test_quality_rejects_compact_range_outside_request() -> None:
+    """Quality check 拒绝不属于 older raw turns 的 compact range 声明。"""
+
+    request = _request()
+    candidate = await FakeContextCompactor().compact(request)
+    invalid_range = CompactInputRange(
+        range_ref="range-outside",
+        start_input_ref="event-current",
+        end_input_ref="event-current",
+    )
+    candidate = replace(candidate, summarized_ranges=(invalid_range,))
+
+    result = check_compaction_candidate(request, candidate)
+
+    assert result.accepted is False
+    assert CompactQualityIssue.COMPACT_RANGE_OUTSIDE_REQUEST in (
         result.rejection_reasons
     )
 

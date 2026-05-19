@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import logging
+
 import pytest
 
 from dayu.engine.contracts.finish_reason import FinishReason
@@ -179,6 +181,38 @@ async def test_bool_index_tool_calls_stay_separate_by_id() -> None:
         ("call-a", "lookup", {"ticker": "AAPL"}),
         ("call-b", "price", {"symbol": "MSFT"}),
     ]
+
+
+@pytest.mark.asyncio
+async def test_unowned_tool_call_delta_is_not_emitted_as_index_zero(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """无法归属的 tool call delta 不得回退成 index=0。"""
+
+    chunks = [
+        (
+            b'data: {"choices":[{"delta":{"tool_calls":'
+            b'[{"function":{"arguments":"{\\"leaked\\":"}}]}}]}\n\n'
+        ),
+        b'data: {"choices":[{"finish_reason":"tool_calls","delta":{}}]}\n\n',
+        b"data: [DONE]\n\n",
+    ]
+    caplog.set_level(
+        logging.WARNING,
+        logger="dayu.engine.runners.openai.sse_parser",
+    )
+
+    events = await parse_sse(chunks)
+
+    deltas = [
+        event for event in events
+        if event.type is RunnerEventType.RUNNER_TOOL_CALL_DELTA
+    ]
+    assert deltas == []
+    assert any(
+        "tool_call_delta_unowned" in record.getMessage()
+        for record in caplog.records
+    )
 
 
 def test_aggregator_rejects_bool_index_and_falls_back_to_id() -> None:

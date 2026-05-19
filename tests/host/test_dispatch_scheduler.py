@@ -76,6 +76,8 @@ from dayu.host.dispatch import (
     ActiveWorkerRegistry,
     DispatchDrainResult,
     HostDispatchScheduler,
+    _safe_close_worker_handle,
+    _safe_release_lane_token,
 )
 from dayu.host.durable.codec import sha256_digest_json
 from dayu.host.durable.connection import HostDurableStore, open_host_durable_store
@@ -957,6 +959,71 @@ class _FailingDrainLoopScheduler(HostDispatchScheduler):
         raise RuntimeError("drain failure")
 
 
+class _FailingCloseWorkerHandle:
+    """关闭时抛错的 worker handle fake。"""
+
+    @property
+    def local_worker_id(self) -> str:
+        """返回 fake worker id。
+
+        :returns: fake worker id。
+        """
+
+        return "worker-close-fails"
+
+    def events(self) -> AsyncIterator[EngineEvent]:
+        """返回空事件流。
+
+        :returns: 空异步迭代器。
+        """
+
+        return _empty_engine_events()
+
+    async def close(self) -> None:
+        """模拟 worker handle close 失败。
+
+        :returns: 不返回。
+        :raises RuntimeError: 始终抛出 close 失败。
+        """
+
+        raise RuntimeError("worker close failed")
+
+    def cancel(self, reason: str) -> None:
+        """忽略取消请求。
+
+        :param reason: 取消原因。
+        :returns: ``None``。
+        """
+
+        del reason
+
+
+class _FailingLaneToken:
+    """释放时抛错的 lane token fake。"""
+
+    name = _LANE_NAME
+    claim_id = "claim-release-fails"
+
+    async def release(self) -> None:
+        """模拟 lane token release 失败。
+
+        :returns: 不返回。
+        :raises RuntimeError: 始终抛出 release 失败。
+        """
+
+        raise RuntimeError("lane release failed")
+
+
+async def _empty_engine_events() -> AsyncIterator[EngineEvent]:
+    """返回空 EngineEvent 异步流。
+
+    :returns: 空异步迭代器。
+    """
+
+    if False:
+        yield _final_answer_event("unused")
+
+
 @pytest.mark.asyncio
 async def test_pending_waiting_dispatching_worker_accept_marks_running(
     tmp_path: Path,
@@ -1002,7 +1069,7 @@ async def test_drain_loop_logs_unexpected_exception(
     tmp_path: Path,
     caplog: pytest.LogCaptureFixture,
 ) -> None:
-    """drain loop 未预期异常退出时必须记录诊断日志。"""
+    """drain loop 未预期异常后必须记录诊断并保持可关闭。"""
 
     caplog.set_level(logging.WARNING, logger="dayu.host.dispatch")
     with open_host_durable_store(_options(tmp_path)) as store:
@@ -1043,7 +1110,9 @@ async def test_drain_loop_logs_unexpected_exception(
             host_handle_id="host-drain-loop-log",
         )
         try:
-            await scheduler._drain_loop()
+            scheduler._drain_task = asyncio.create_task(scheduler._drain_loop())
+            await asyncio.sleep(0.03)
+            assert scheduler._drain_task.done() is False
         finally:
             await scheduler.close()
 
@@ -1051,6 +1120,25 @@ async def test_drain_loop_logs_unexpected_exception(
         "dispatch drain loop stopped unexpectedly" in record.getMessage()
         for record in caplog.records
     )
+
+
+@pytest.mark.asyncio
+async def test_safe_cleanup_helpers_log_failures(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """best-effort cleanup 失败时必须写入 warning 诊断。
+
+    :param caplog: pytest 日志捕获 fixture。
+    :returns: ``None``。
+    """
+
+    caplog.set_level(logging.WARNING, logger="dayu.host.dispatch")
+    await _safe_close_worker_handle(_FailingCloseWorkerHandle())
+    await _safe_release_lane_token(cast(LaneClaimToken, _FailingLaneToken()))
+
+    messages = [record.getMessage() for record in caplog.records]
+    assert any("dispatch.worker_handle.close_failed" in item for item in messages)
+    assert any("dispatch.lane_token.release_failed" in item for item in messages)
 
 
 @pytest.mark.asyncio

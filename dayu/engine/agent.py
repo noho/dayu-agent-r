@@ -1360,6 +1360,21 @@ class _AsyncAgent:
             return None
         if isinstance(data, RunnerDoneData):
             state.done_seen = True
+            if (
+                state.finish_reason is not None
+                and state.finish_reason is not data.finish_reason
+            ):
+                _LOGGER.warning(
+                    "engine.agent.finish_reason_mismatch session_id=%s "
+                    "run_id=%s iteration_id=%s completed_finish_reason=%s "
+                    "done_finish_reason=%s provider_request_id=%s",
+                    self._request.session_id,
+                    self._request.run_id,
+                    iteration_id,
+                    state.finish_reason.value,
+                    data.finish_reason.value,
+                    data.provider_request_id,
+                )
             state.finish_reason = data.finish_reason
             state.provider_request_id = data.provider_request_id
             _LOGGER.debug(
@@ -2586,6 +2601,14 @@ async def run_agent_and_wait(request: AgentRunRequest) -> AgentRunResult:
             accepted_records=data.accepted_records,
             awaiting_records=data.awaiting_records,
         )
+    _LOGGER.warning(
+        "engine.agent.unknown_terminal_shape session_id=%s run_id=%s "
+        "terminal_type=%s data_type=%s",
+        terminal.session_id,
+        terminal.run_id,
+        terminal.type.value,
+        data.__class__.__name__,
+    )
     return EngineRunOutcomeFailed(
         session_id=request.session_id,
         run_id=request.run_id,
