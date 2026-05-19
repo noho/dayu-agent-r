@@ -1711,7 +1711,7 @@ Plan 必须额外收口的 readiness review checklist：
   fallback 只作为非生产兜底、README / Host README 与 public contract 一致。
 - PR-62 deepreview --all F1 proactive compaction fake budget 回归：owner 为当前 PR-62 blocker fix。不阻塞后续
   deferred tracking 的理由是该项不是 deferred risk，必须在本次 gate 内收口。触发条件为修改
-  `FakeContextCompactor`、`estimate_compacted_context_budget`、`run_compaction_operation` hard-threshold recheck 或
+  `tests.host.fake_compaction.FakeContextCompactor`、`estimate_compacted_context_budget`、`run_compaction_operation` hard-threshold recheck 或
   proactive compact policy；后续验证必须覆盖 soft threshold proactive compact 创建 Attempt、hard threshold 后仍拒绝
   candidate，以及 fake compactor 预算保持在 hard threshold 内。
 - oversized truncation cursor data loss：owner 为 ToolRuntime truncation / `fetch_more` cursor lifecycle hardening。
@@ -1815,7 +1815,8 @@ Plan 必须额外收口的 readiness review checklist：
   caller 尚未在 Host 包内实现。后续 production composition owner 必须显式调用该 helper 或等价 typed wiring，
   不能从 Engine spec、per-run metadata 或 caller payload 读取预算参数。
 - 真实 production LLM compactor adapter 未在 S6 默认注入。production composition owner 必须显式提供
-  `ContextCompactor` 实现；未配置 compactor 时继续 fail closed，不得隐式使用 `FakeContextCompactor`。
+  `ContextCompactor` 实现；未配置 compactor 时继续 fail closed，不得导入或隐式使用
+  `tests.host.fake_compaction.FakeContextCompactor`。
 - S6 aggregate multi-turn test 串起 proactive compact -> memory projection -> subsequent Engine request，但完整业务工具
   verified fact public fake-worker 链路仍由 ToolRuntime accept、memory projection 与 RunInputBuilder 的分层测试覆盖；
   aggregate review 若要求更高保真业务工具 E2E，应作为 Phase 10 aggregate fix item，而不是把 fake compactor 注入

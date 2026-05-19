@@ -34,7 +34,7 @@ from dayu.host.durable.options import (
 from dayu.host.durable.payload import PayloadKind, read_payload_descriptor
 from dayu.host.durable.schema import TABLE_PAYLOAD_DESCRIPTORS
 from dayu.host.durable.transaction import HostTransaction
-from dayu.host.fake_compaction import FakeContextCompactor
+from tests.host.fake_compaction import FakeContextCompactor
 
 
 @pytest.mark.asyncio

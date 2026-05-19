@@ -65,7 +65,7 @@ from dayu.host.context_policy import (
     ContextCompactionTriggerSource,
     default_context_budget_policy,
 )
-from dayu.host.fake_compaction import FakeContextCompactor
+from tests.host.fake_compaction import FakeContextCompactor
 from dayu.host.tooling import (
     HostToolingOptions,
     ToolBundleSourceKind,

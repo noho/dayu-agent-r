@@ -15,7 +15,7 @@ from dayu.host.compaction import (
 from dayu.host.compaction_operation import run_compaction_operation
 from dayu.host.context_budget import BudgetEstimate
 from dayu.host.context_policy import ContextCompactionTriggerSource
-from dayu.host.fake_compaction import FakeContextCompactor
+from tests.host.fake_compaction import FakeContextCompactor
 
 _DIGEST = "sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
 

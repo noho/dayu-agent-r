@@ -1,8 +1,7 @@
-"""测试 / 本地开发专用 deterministic context compactor。
+"""Host 测试专用 deterministic context compactor。
 
-本模块存在于 production 包中只是为了让 tests 和本地 composition 可以显式
-注入一个稳定 compactor。生产默认路径不得隐式导入或默认使用
-``FakeContextCompactor``；真实生产装配必须显式提供 ``ContextCompactor``。
+本模块位于 tests 包下，只允许测试显式注入一个稳定 compactor。生产代码
+不得导入 tests helper；真实生产装配必须显式提供 ``ContextCompactor``。
 """
 
 from __future__ import annotations
@@ -223,10 +222,10 @@ def _cap_budget_within_hard_threshold(
 ) -> int:
     """将 fake candidate 预算约束到 Host hard-threshold 可接受区间。
 
-    Fake compactor 是测试 / 本地 deterministic compactor。它复用真实 compactor
-    的保守估算作为语义基础，但不能生成会被 Host hard-threshold recheck 拒绝
-    的 accepted candidate。若输入 hard threshold 非正，非负 candidate 不可能
-    满足 ``budget < hard_threshold``，因此只返回非负下界，避免构造非法负预算。
+    Fake compactor 是测试 deterministic compactor。它复用真实 compactor 的保守
+    估算作为语义基础，但不能生成会被 Host hard-threshold recheck 拒绝的
+    accepted candidate。若输入 hard threshold 非正，非负 candidate 不可能满足
+    ``budget < hard_threshold``，因此只返回非负下界，避免构造非法负预算。
 
     :param estimated_budget_tokens: 原始 compact 后 token 估算。
     :param hard_threshold_tokens: Host hard threshold token 数。

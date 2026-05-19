@@ -188,7 +188,7 @@ Host 现有 `check_compaction_candidate(...)`、artifact store、context events 
 
 - `dayu.host.compaction` 内部 typed boundary；
 - `HostLocalExecutionOptions.context_compactor` 的 low-level test seam；
-- `FakeContextCompactor`、dispatch scheduler 单元测试、engine ingest mapping 单元测试使用的低层 seam。
+- `tests.host.fake_compaction.FakeContextCompactor`、dispatch scheduler 单元测试、engine ingest mapping 单元测试使用的低层 seam。
 
 保留它的唯一理由是让 Host governance 在无网络测试中验证 compact accepted/rejected、EventLog/artifact/memory 边界，而不要求真实 LLM。如果实现中可以通过 Host-owned `LLMContextCompactor` + fake runner / fake runner factory 覆盖这些 deterministic tests，则应优先收窄甚至移除显式 `ContextCompactor` 注入 seam。无论哪种实现，它都不得出现在普通 Service-facing package root / `OpenHostOptions` public contract、manual smoke 的 Service 装配路径或 README 普通用法中。
 
@@ -332,7 +332,7 @@ Compactor LLM 调用失败与 LLM 返回脏数据必须区分。
 8. 在 `dayu/host/context_events.py` 增加 `build_context_compaction_attempt_rejected_payload(...)` 与 `validate_context_compaction_attempt_rejected_payload(...)`，并复用本模块现有 JSON helper 风格。payload 必填字段为 `operation_id`、`attempt_number`、`failure_category`、`repairable`、`runner_attempt_summary_refs`、`diagnostic_refs`、`next_policy_decision`、`budget_after_attempted_compact`；`attempt_number` 为正整数，`runner_attempt_summary_refs` 与 `diagnostic_refs` 为非空文本列表，`budget_after_attempted_compact` 可为非负整数或 `None`。
 9. 更新 `tests/host/test_context_compact_events.py`，覆盖 attempt rejected payload builder 成功路径、缺必填字段、`attempt_number` 为 0 / bool / 非整数、空 diagnostic ref、非法 budget 的失败路径。
 10. HostEvent public observation 使用 §3.6 的保守映射：compact canonical facts 不新增 `HostEventKind`，REQUESTED / COMPACTED / FAILED / ATTEMPT_REJECTED 在 session watch 中只映射为 `HostEventKind.PROGRESS`；Run terminal event 继续由 `RUN_SUCCEEDED` / `RUN_FAILED` / `RUN_CANCELLED` 映射；runner 内部 HTTP retry 不 emit HostEvent。
-11. 低层 tests 继续可用 `FakeContextCompactor` 直接注入 `HostLocalExecutionOptions` 或 `EngineEventIngestor`，但测试命名/README 要说明这是 low-level seam。
+11. 低层 tests 继续可用 `tests.host.fake_compaction.FakeContextCompactor` 直接注入 `HostLocalExecutionOptions` 或 `EngineEventIngestor`，但生产代码不得导入 tests helper，测试命名/README 要说明这是 low-level seam。
 12. 新增/更新 focused tests，覆盖 proactive 与 reactive 路径不会在 write transaction 内执行 fake compactor 的外部调用；可用 instrumented transaction runner / fake compactor 记录调用阶段。
 
 ### Slice 5: smoke 迁移
