@@ -75,7 +75,7 @@ Engine 生产代码零 diff。
 7. 验证 current_attempt_id 未被替换（行 88-89: `current_attempt_id_for_run(tmp_path, accepted.run_id) == accepted.attempt_id`）。
 8. 释放 final answer 后 owner 进程正常退出（行 92-94）。
 
-**判定**: 
+**判定**:
 - `event_type_count` 读自 `event_log` 表（canonical durable EventLog），行号 `recovery_support.py:722` 确认。
 - `attempt_count_for_run` 读自 `host_attempts` 表（durable Attempt），行号 `recovery_support.py:743` 确认。
 - `current_attempt_id_for_run` 读自 `host_runs` 表（durable Run），行号 `recovery_support.py:765` 确认。
