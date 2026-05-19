@@ -496,7 +496,7 @@ class StartupRecoveringLostInput:
 
 @dataclass(frozen=True, slots=True)
 class StartRecoveryRunInput:
-    """reactive compact accepted 后创建 recovery Attempt。
+    """创建 recovery Attempt。
 
     :param run_id: 目标 Run id。
     :param source_attempt_id: 已关闭的旧 Attempt id。
@@ -510,8 +510,10 @@ class StartRecoveryRunInput:
     :param source: 事件 source。
     :param worker_kind: worker 类型。
     :param owner_host_instance_id: owner Host instance id；Phase 10 可为 ``None``。
-    :param context_compacted_event_id: 已接受 compact event id。
-    :param context_compacted_event_sequence: 已接受 compact event sequence。
+    :param context_compacted_event_id: 已接受 compact event id；startup recovery
+        未发生 compact 时为 ``None``。
+    :param context_compacted_event_sequence: 已接受 compact event sequence；
+        startup recovery 未发生 compact 时为 ``None``。
     """
 
     run_id: str
@@ -526,8 +528,8 @@ class StartRecoveryRunInput:
     source: str
     worker_kind: WorkerKind
     owner_host_instance_id: str | None
-    context_compacted_event_id: str
-    context_compacted_event_sequence: int
+    context_compacted_event_id: str | None
+    context_compacted_event_sequence: int | None
 
 
 @dataclass(frozen=True, slots=True)
@@ -3085,6 +3087,19 @@ def _recovery_run_started_event_request(
     :returns: EventLog append request。
     """
 
+    payload: dict[str, JsonValue] = {
+        "run_id": run.run_id,
+        "start_reason": RunStartReason.RECOVERY.value,
+        "source_attempt_id": request.source_attempt_id,
+        "attempt_id": request.attempt_id,
+        "dispatch_record_id": request.dispatch_record_id,
+    }
+    if request.context_compacted_event_id is not None:
+        payload["context_compacted_event_id"] = request.context_compacted_event_id
+    if request.context_compacted_event_sequence is not None:
+        payload["context_compacted_event_sequence"] = (
+            request.context_compacted_event_sequence
+        )
     return EventLogAppendRequest(
         event_id=request.run_started_event_id,
         event_class=EventClass.CANONICAL_FACT,
@@ -3100,17 +3115,7 @@ def _recovery_run_started_event_request(
         idempotency_key=None,
         policy_decision=None,
         reason={"start_reason": RunStartReason.RECOVERY.value},
-        payload_json={
-            "run_id": run.run_id,
-            "start_reason": RunStartReason.RECOVERY.value,
-            "source_attempt_id": request.source_attempt_id,
-            "attempt_id": request.attempt_id,
-            "dispatch_record_id": request.dispatch_record_id,
-            "context_compacted_event_id": request.context_compacted_event_id,
-            "context_compacted_event_sequence": (
-                request.context_compacted_event_sequence
-            ),
-        },
+        payload_json=payload,
         payload_ref=None,
         payload_digest=None,
     )
@@ -5216,13 +5221,22 @@ def _validate_start_recovery_input(request: StartRecoveryRunInput) -> None:
     _require_optional_non_empty_text(
         request.owner_host_instance_id, field_name="owner_host_instance_id"
     )
-    _require_non_empty_text(
+    _require_optional_non_empty_text(
         request.context_compacted_event_id, field_name="context_compacted_event_id"
     )
-    _require_positive_sequence(
-        request.context_compacted_event_sequence,
-        "context_compacted_event_sequence",
-    )
+    if (
+        request.context_compacted_event_id is None
+        and request.context_compacted_event_sequence is not None
+    ) or (
+        request.context_compacted_event_id is not None
+        and request.context_compacted_event_sequence is None
+    ):
+        raise HostDurableError("context compacted event ref must be complete")
+    if request.context_compacted_event_sequence is not None:
+        _require_positive_sequence(
+            request.context_compacted_event_sequence,
+            "context_compacted_event_sequence",
+        )
 
 
 def _validate_fail_recovering_input(request: FailRecoveringRunInput) -> None:

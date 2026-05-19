@@ -601,6 +601,15 @@ class HostDispatchScheduler:
         scheduler._start_host_instance_heartbeat()
         return scheduler
 
+    @property
+    def host_instance_id(self) -> str:
+        """返回当前 scheduler 注册的 Host instance id。
+
+        :returns: 当前 scheduler 自己的 Host instance id。
+        """
+
+        return self._host_instance_identity.host_instance_id
+
     def wake_dispatch(self, record: PendingDispatchRecord) -> None:
         """唤醒 dispatch scheduler。
 

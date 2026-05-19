@@ -2,8 +2,10 @@
 
 本模块负责启动时读取 durable Run/Attempt/dispatch/liveness truth，调用
 只读 orphan proof classifier，并在 positive proof 成立时通过 durable
-transition helper 完成旧 Attempt closeout。它不实现 public API、不创建新的
-recovery Attempt、不直接派发 Engine worker，也不读取 projection/read-model。
+transition helper 完成旧 Attempt closeout。Slice 3 起，本模块还负责为
+可恢复 Run 创建 recovery Attempt、execution 与 pending dispatch record，
+并在事务提交后唤醒 scheduler。它不实现 public API、不直接调用 WorkerProxy，
+也不读取 projection/read-model。
 """
 
 from __future__ import annotations
@@ -13,24 +15,29 @@ from datetime import UTC, datetime, timedelta
 from enum import StrEnum
 from uuid import uuid4
 
+from dayu.host.admission import AdmissionWakeupPort, PendingDispatchRecord
 from dayu.host.api import AttemptStatus, RunStatus
 from dayu.host.durable.event_log import EventLogStore
 from dayu.host.durable.liveness import HostInstanceRow, read_host_instance
 from dayu.host.durable.run_transition import (
+    RunTransitionResult,
+    StartRecoveryRunInput,
     StartupOrphanCloseInput,
     StartupRecoveringLostInput,
     close_startup_orphan_attempt_in_transaction,
     lose_recovering_run_in_transaction,
+    start_recovery_run_with_starting_attempt_in_transaction,
 )
 from dayu.host.durable.state import (
     AttemptRow,
     DispatchRecordRow,
     RunRow,
+    RunStartReason,
     StateMutationStatus,
+    WorkerKind,
     read_attempt_by_id,
     read_dispatch_record_by_attempt_id,
     read_non_terminal_runs,
-    read_run_by_id,
 )
 from dayu.host.durable.transaction import HostTransaction, HostTransactionRunner
 from dayu.host.recovery_process import (
@@ -50,11 +57,17 @@ _RECOVERY_ACTOR = "host_recovery"
 _RECOVERY_SOURCE = "startup_scan"
 _DEFAULT_STALE_AFTER_SECONDS = 30
 _DEFAULT_RECOVERY_DISPATCH_LIMIT = 1
+_ATTEMPT_ID_PREFIX = "attempt-recovery"
+_EXECUTION_ID_PREFIX = "execution-recovery"
+_DISPATCH_RECORD_ID_PREFIX = "dispatch-recovery"
 _REASON_STARTUP_ORPHAN_ATTEMPT_LOST = "startup_orphan_attempt_lost"
 _REASON_CANCEL_IN_FLIGHT_ATTEMPT_LOST = "cancel_in_flight_attempt_lost"
 _REASON_UNRECOVERABLE_FACTS = "startup_recovery_unrecoverable_facts"
 _REASON_RECOVERY_DISPATCH_LIMIT_EXCEEDED = (
     "startup_recovery_dispatch_limit_exceeded"
+)
+_REASON_RECOVERY_DISPATCH_PENDING_FOLLOW_UP = (
+    "startup_recovery_dispatch_pending_follow_up"
 )
 
 
@@ -69,6 +82,7 @@ class StartupRecoveryDecision(StrEnum):
     RUN_RECOVERING = "run_recovering"
     RUN_LOST = "run_lost"
     RECOVERING_READY = "recovering_ready"
+    RECOVERY_DISPATCHED = "recovery_dispatched"
     CAS_LOST = "cas_lost"
     INVALID_STATE = "invalid_state"
     NOT_FOUND = "not_found"
@@ -123,9 +137,11 @@ class StartupRecoveryScanResult:
     """startup recovery scan 汇总。
 
     :param actions: 按扫描顺序记录的每个 Run 分类结果。
+    :param pending_dispatches: 本次 scan 事务提交后唤醒的 pending dispatch 摘要。
     """
 
     actions: tuple[StartupRecoveryAction, ...]
+    pending_dispatches: tuple[PendingDispatchRecord, ...] = ()
 
 
 @dataclass(frozen=True, slots=True)
@@ -135,13 +151,21 @@ class StartupRecoveryScanner:
     :param transaction_runner: Host durable transaction runner。
     :param event_log_store: EventLog primitive。
     :param process_probe: 本机进程证据 probe。
+    :param dispatch_wakeup_port: commit 后唤醒 dispatch 的端口；未提供时只做
+        Slice 2 closeout / classification，不创建 startup recovery dispatch。
+    :param recovery_owner_host_instance_id: 当前 opener 的 Host instance id；
+        创建 recovery dispatch record 时写入 owner 诊断字段。
     """
 
     transaction_runner: HostTransactionRunner
     event_log_store: EventLogStore
     process_probe: ProcessLivenessProbe = StdlibPidLivenessProbe()
+    dispatch_wakeup_port: AdmissionWakeupPort | None = None
+    recovery_owner_host_instance_id: str | None = None
 
-    def scan(self, policy: StartupRecoveryPolicy | None = None) -> StartupRecoveryScanResult:
+    def scan(
+        self, policy: StartupRecoveryPolicy | None = None
+    ) -> StartupRecoveryScanResult:
         """执行 startup recovery scan。
 
         :param policy: 可选 scan 策略；未传时使用默认策略。
@@ -160,23 +184,40 @@ class StartupRecoveryScanner:
             """
 
             actions: list[StartupRecoveryAction] = []
+            pending_dispatches: list[PendingDispatchRecord] = []
             for run in read_non_terminal_runs(transaction):
-                actions.append(self._classify_run(transaction, run, effective_policy))
-            return StartupRecoveryScanResult(actions=tuple(actions))
+                actions.append(
+                    self._classify_run(
+                        transaction,
+                        run,
+                        effective_policy,
+                        pending_dispatches,
+                    )
+                )
+            return StartupRecoveryScanResult(
+                actions=tuple(actions),
+                pending_dispatches=tuple(pending_dispatches),
+            )
 
-        return self.transaction_runner.run_write(operation)
+        result = self.transaction_runner.run_write(operation)
+        if self.dispatch_wakeup_port is not None:
+            for pending_dispatch in result.pending_dispatches:
+                self.dispatch_wakeup_port.wake_dispatch(pending_dispatch)
+        return result
 
     def _classify_run(
         self,
         transaction: HostTransaction,
         run: RunRow,
         policy: StartupRecoveryPolicy,
+        pending_dispatches: list[PendingDispatchRecord],
     ) -> StartupRecoveryAction:
         """分类单个非终态 Run。
 
         :param transaction: Host transaction。
         :param run: 待分类 Run row。
         :param policy: scan 策略。
+        :param pending_dispatches: 本次 scan 已创建的待唤醒 dispatch 摘要集合。
         :returns: 单个 Run 的分类结果。
         """
 
@@ -195,9 +236,13 @@ class StartupRecoveryScanner:
                 "waiting_adapter_observation_unavailable",
             )
         if run.status is RunStatus.RECOVERING:
-            return self._classify_recovering(transaction, run, policy)
+            return self._classify_recovering(
+                transaction, run, policy, pending_dispatches
+            )
         if run.status in (RunStatus.RUNNING, RunStatus.CANCELLING):
-            return self._classify_active_or_cancelling(transaction, run, policy)
+            return self._classify_active_or_cancelling(
+                transaction, run, policy, pending_dispatches
+            )
         return _action(run, StartupRecoveryDecision.INVALID_STATE, "unsupported_status")
 
     def _classify_recovering(
@@ -205,12 +250,14 @@ class StartupRecoveryScanner:
         transaction: HostTransaction,
         run: RunRow,
         policy: StartupRecoveryPolicy,
+        pending_dispatches: list[PendingDispatchRecord],
     ) -> StartupRecoveryAction:
         """分类 recovering Run。
 
         :param transaction: Host transaction。
         :param run: recovering Run row。
         :param policy: scan 策略。
+        :param pending_dispatches: 本次 scan 已创建的待唤醒 dispatch 摘要集合。
         :returns: 分类结果。
         """
 
@@ -218,10 +265,11 @@ class StartupRecoveryScanner:
             transaction, run_id=run.run_id
         )
         if count < policy.recovery_dispatch_limit:
-            return _action(
+            return self._start_recovery_dispatch_or_ready(
+                transaction,
                 run,
-                StartupRecoveryDecision.RECOVERING_READY,
-                "recovery_dispatch_not_implemented_in_slice2",
+                policy,
+                pending_dispatches,
             )
         if run.current_attempt_id is None:
             return _action(
@@ -256,12 +304,14 @@ class StartupRecoveryScanner:
         transaction: HostTransaction,
         run: RunRow,
         policy: StartupRecoveryPolicy,
+        pending_dispatches: list[PendingDispatchRecord],
     ) -> StartupRecoveryAction:
         """分类 running 或 cancelling Run。
 
         :param transaction: Host transaction。
         :param run: running 或 cancelling Run row。
         :param policy: scan 策略。
+        :param pending_dispatches: 本次 scan 已创建的待唤醒 dispatch 摘要集合。
         :returns: 分类结果。
         """
 
@@ -294,6 +344,7 @@ class StartupRecoveryScanner:
             dispatch_record,
             classification,
             policy,
+            pending_dispatches,
         )
 
     def _classify_owner(
@@ -333,6 +384,7 @@ class StartupRecoveryScanner:
         dispatch_record: DispatchRecordRow,
         proof: PositiveOrphanProof,
         policy: StartupRecoveryPolicy,
+        pending_dispatches: list[PendingDispatchRecord],
     ) -> StartupRecoveryAction:
         """对 positive orphan proof 执行 CAS closeout。
 
@@ -342,6 +394,7 @@ class StartupRecoveryScanner:
         :param dispatch_record: 目标 dispatch record row。
         :param proof: positive orphan proof。
         :param policy: scan 策略。
+        :param pending_dispatches: 本次 scan 已创建的待唤醒 dispatch 摘要集合。
         :returns: closeout 分类结果。
         """
 
@@ -382,13 +435,102 @@ class StartupRecoveryScanner:
                 observed_boot_id=proof.observed_boot_id,
             ),
         )
-        return _action_from_mutation(
+        close_action = _action_from_mutation(
             run,
             result.status,
             StartupRecoveryDecision.RUN_RECOVERING
             if recoverable
             else StartupRecoveryDecision.RUN_LOST,
             reason,
+        )
+        if (
+            not recoverable
+            or result.status is not StateMutationStatus.UPDATED
+            or result.run is None
+        ):
+            return close_action
+        if (
+            self.dispatch_wakeup_port is None
+            or self.recovery_owner_host_instance_id is None
+        ):
+            return close_action
+        dispatch_action = self._start_recovery_dispatch_or_ready(
+            transaction,
+            result.run,
+            policy,
+            pending_dispatches,
+        )
+        if dispatch_action.decision is StartupRecoveryDecision.INVALID_STATE:
+            return _action(
+                result.run,
+                StartupRecoveryDecision.RECOVERING_READY,
+                _REASON_RECOVERY_DISPATCH_PENDING_FOLLOW_UP,
+            )
+        return dispatch_action
+
+    def _start_recovery_dispatch_or_ready(
+        self,
+        transaction: HostTransaction,
+        run: RunRow,
+        policy: StartupRecoveryPolicy,
+        pending_dispatches: list[PendingDispatchRecord],
+    ) -> StartupRecoveryAction:
+        """为 RECOVERING Run 创建新 Attempt 与 pending dispatch。
+
+        :param transaction: Host transaction。
+        :param run: recovering Run row。
+        :param policy: scan 策略。
+        :param pending_dispatches: 本次 scan 已创建的待唤醒 dispatch 摘要集合。
+        :returns: startup recovery action。
+        """
+
+        if (
+            self.dispatch_wakeup_port is None
+            or self.recovery_owner_host_instance_id is None
+        ):
+            return _action(
+                run,
+                StartupRecoveryDecision.RECOVERING_READY,
+                "recovery_dispatch_wakeup_unavailable",
+            )
+        if run.current_attempt_id is None:
+            return _action(
+                run,
+                StartupRecoveryDecision.INVALID_STATE,
+                "recovering_run_missing_source_attempt",
+            )
+        result = start_recovery_run_with_starting_attempt_in_transaction(
+            transaction,
+            self.event_log_store,
+            StartRecoveryRunInput(
+                run_id=run.run_id,
+                source_attempt_id=run.current_attempt_id,
+                run_started_event_id=_event_id("run-started-recovery"),
+                attempt_started_event_id=_event_id("attempt-started-recovery"),
+                attempt_id=_new_id(_ATTEMPT_ID_PREFIX),
+                execution_id=_new_id(_EXECUTION_ID_PREFIX),
+                dispatch_record_id=_new_id(_DISPATCH_RECORD_ID_PREFIX),
+                occurred_at=policy.now,
+                actor=_RECOVERY_ACTOR,
+                source=_RECOVERY_SOURCE,
+                worker_kind=WorkerKind.LOCAL,
+                owner_host_instance_id=self.recovery_owner_host_instance_id,
+                context_compacted_event_id=None,
+                context_compacted_event_sequence=None,
+            ),
+        )
+        if (
+            result.status is StateMutationStatus.UPDATED
+            and result.run is not None
+            and result.attempt is not None
+            and result.dispatch_record is not None
+        ):
+            pending_dispatches.append(_pending_dispatch_from_transition(result))
+        return _action_from_mutation(
+            run,
+            result.status,
+            StartupRecoveryDecision.RECOVERY_DISPATCHED,
+            RunStartReason.RECOVERY.value,
         )
 
 
@@ -533,3 +675,35 @@ def _event_id(prefix: str) -> str:
     """
 
     return f"event-{prefix}-{uuid4().hex}"
+
+
+def _new_id(prefix: str) -> str:
+    """生成 Host recovery 内部实体 id。
+
+    :param prefix: id 前缀。
+    :returns: 全局唯一实体 id。
+    """
+
+    return f"{prefix}-{uuid4().hex}"
+
+
+def _pending_dispatch_from_transition(
+    result: RunTransitionResult,
+) -> PendingDispatchRecord:
+    """从 recovery start transition 结果构造 pending dispatch 摘要。
+
+    :param result: 已校验包含 run、attempt 与 dispatch record 的 transition 结果。
+    :returns: pending dispatch 摘要。
+    :raises AssertionError: 调用方未先校验 transition row 完整性时抛出。
+    """
+
+    if result.run is None or result.attempt is None or result.dispatch_record is None:
+        raise AssertionError("transition result rows are required")
+    return PendingDispatchRecord(
+        dispatch_record_id=result.dispatch_record.dispatch_record_id,
+        run_id=result.run.run_id,
+        attempt_id=result.attempt.attempt_id,
+        execution_id=result.attempt.execution_id,
+        execution_target=result.dispatch_record.execution_target,
+        worker_kind=result.dispatch_record.worker_kind,
+    )

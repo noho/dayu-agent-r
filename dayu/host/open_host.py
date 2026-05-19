@@ -57,6 +57,7 @@ from dayu.host.durable.connection import (
     HostDurableStore,
     open_host_durable_store,
 )
+from dayu.host.durable.event_log import EventLogStore
 from dayu.host.memory_repair import catch_up_conversation_memory_projection
 from dayu.host.llm_compaction import LLMContextCompactor
 from dayu.host.projection import ProjectionCatchupPort
@@ -68,6 +69,7 @@ from dayu.host.read_api import (
 from dayu.host.read_api import (
     session_live_event_start_cursor as _session_live_event_start_cursor,
 )
+from dayu.host.recovery import StartupRecoveryScanner
 from dayu.runtime.log_levels import VERBOSE_LOG_LEVEL
 
 _GENERATED_OPEN_HOST_ID_PREFIX = "open-host"
@@ -442,6 +444,7 @@ class _OpenHostContextManager(AbstractAsyncContextManager[Host]):
         durable_store = open_host_durable_store(
             _durable_options_from_command_options(command_options)
         )
+        scheduler: HostDispatchScheduler | None = None
         try:
             active_registry = ActiveWorkerRegistry()
             projection_catchup_port = _MemoryProjectionCatchupPort(
@@ -455,6 +458,12 @@ class _OpenHostContextManager(AbstractAsyncContextManager[Host]):
                 active_registry=active_registry,
                 projection_catchup_port=projection_catchup_port,
             )
+            StartupRecoveryScanner(
+                transaction_runner=durable_store.transaction_runner,
+                event_log_store=EventLogStore(),
+                dispatch_wakeup_port=scheduler,
+                recovery_owner_host_instance_id=scheduler.host_instance_id,
+            ).scan()
             admission_service = create_host_admission_service(
                 durable_store.transaction_runner,
                 wakeup_port=scheduler,
@@ -485,6 +494,8 @@ class _OpenHostContextManager(AbstractAsyncContextManager[Host]):
                 host_handle_id,
                 exc_info=True,
             )
+            if scheduler is not None:
+                await scheduler.close()
             durable_store.close()
             raise
 

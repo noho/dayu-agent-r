@@ -88,6 +88,7 @@ Host 内部职责按语义分层：
 - Host durable store 与内部 command handle。
 - 共享 `ActiveWorkerRegistry`，用于 active worker cancel 传播。
 - `HostDispatchScheduler`，用于 accepted / queued / pending dispatch wakeup。
+- startup recovery scan，用于在 ready 前基于 durable truth 收口 positive orphan 并创建可恢复 Run 的 pending dispatch。
 - admission service，负责 public command 的 durable mutation。
 - memory projection catch-up port，供 dispatch 前与 close 阶段追平 memory projection。
 - Host-owned LLM compactor baseline，供 Context Governance 执行 compact。
@@ -116,7 +117,7 @@ Run 状态：
 - `RUNNING`：Run 已进入 active Attempt lifecycle；当前 Attempt 可以是 `STARTING` 或 `RUNNING`。
 - `WAITING`：Attempt 已因工具等待挂起，Run 等待 Host `resolve_wait` 或 cancel。
 - `CANCELLING`：Host 已接受取消并向 active worker best-effort 传播。
-- `RECOVERING`：Host 治理状态中保留的恢复中状态；当前普通 public path 不让 Engine 拥有恢复控制权。
+- `RECOVERING`：Host 已收口旧 Attempt，正在基于同一 Run 的 canonical facts 创建新的 recovery Attempt。
 - `SUCCEEDED`、`FAILED`、`CANCELLED`、`LOST`：Run 终态。
 
 Attempt 状态：
@@ -177,7 +178,7 @@ submit_followup(queue)
 
 runtime lane 只表达资源容量，不表达 Host ownership、lease、fencing、EventLog ordering 或 recovery proof。worker accept 前后都要依赖 durable recheck 与 Host state transition；worker stream 的 finally 路径负责 active registry 注销、worker handle close 与 lane release。
 
-Dispatch scheduler 打开时会注册当前 Host instance liveness row：`host_instance_id` 使用当前 opener runtime 诊断 id，`process_start_token` 是独立高熵随机值，不从 handle id、pid 或时间派生。后台 heartbeat 只刷新当前 scheduler 自己的 instance row；关闭时 best-effort 标记 `STOPPING` / `STOPPED`，这些状态只服务 lifecycle 诊断和 recovery 输入，不是 lease、fencing 或 takeover proof。`dayu.host.recovery_process` 提供只读 orphan proof classifier：只有 durable owner、stale heartbeat、进程证据与策略时间共同满足 positive proof 时才输出可接管证明；heartbeat stale 单独不构成 proof，classifier 不写数据库、不推进 Run / Attempt 状态。`dayu.host.recovery` 的 startup scanner 读取 durable Run / Attempt / dispatch / liveness truth；`ACCEPTED`、`QUEUED`、`WAITING` 保持原状态，`RUNNING` / `CANCELLING` 只有 positive orphan proof 与 CAS recheck 同时成立才收口旧 Attempt，`RECOVERING` 只按 canonical EventLog recovery dispatch count 判断是否可等待后续 dispatch 或转为 `LOST`。
+Dispatch scheduler 打开时会注册当前 Host instance liveness row：`host_instance_id` 使用当前 opener runtime 诊断 id，`process_start_token` 是独立高熵随机值，不从 handle id、pid 或时间派生。后台 heartbeat 只刷新当前 scheduler 自己的 instance row；关闭时 best-effort 标记 `STOPPING` / `STOPPED`，这些状态只服务 lifecycle 诊断和 recovery 输入，不是 lease、fencing 或 takeover proof。`dayu.host.recovery_process` 提供只读 orphan proof classifier：只有 durable owner、stale heartbeat、进程证据与策略时间共同满足 positive proof 时才输出可接管证明；heartbeat stale 单独不构成 proof，classifier 不写数据库、不推进 Run / Attempt 状态。`dayu.host.recovery` 的 startup scanner 读取 durable Run / Attempt / dispatch / liveness truth；`ACCEPTED`、`QUEUED`、`WAITING` 保持原状态，`RUNNING` / `CANCELLING` 只有 positive orphan proof 与 CAS recheck 同时成立才收口旧 Attempt；可恢复的 `RUNNING` orphan 或既有 `RECOVERING` Run 会在 recovery dispatch count 未超限时创建新的 Attempt / execution / dispatch record 并唤醒 scheduler，超限或不可恢复时转为 `LOST`。
 
 worker startup timeout、worker accept failure、worker stream crash 和未知 terminal 都由 Host closeout 为结构化终态或 diagnostic。worker stream 在 Host 已请求 active cancel 后 clean EOF 时，Host 以 cancel terminal 收口；非取消 clean EOF 仍按 lost closeout 处理。terminal closeout 后会触发同 Session queued Run promotion。
 

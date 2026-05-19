@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import asyncio
 import pathlib
-from collections.abc import AsyncIterator
+from collections.abc import AsyncGenerator, AsyncIterator
 from dataclasses import replace
 from datetime import UTC, datetime
 from typing import cast
@@ -27,7 +27,10 @@ from dayu.host import (
     FollowupBehavior,
     Host,
     HostCallContext,
+    HostEvent,
+    HostEventKind,
     LocalEngineWorker,
+    LocalEngineWorkerFactory,
     LocalWorkerHandle,
     OpenHostOptions,
     OperationContext,
@@ -41,6 +44,13 @@ from dayu.host.api import HostInput
 from dayu.host.api import AuthorizationClaim
 from dayu.host.command import HostCommandHandle
 from dayu.host.dispatch import HostDispatchScheduler
+from dayu.host.durable.connection import open_host_durable_store
+from dayu.host.durable.options import (
+    HostDurableStoreOptions,
+    HostSQLiteStoragePolicy,
+    PayloadStoragePolicy,
+)
+from dayu.host.durable.transaction import HostTransaction
 from dayu.host.memory import default_memory_projection_policy
 from dayu.host.open_host import (
     _PublicHostHandle,
@@ -165,6 +175,131 @@ class _FinalAnswerWorkerFactory:
         return _FinalAnswerWorker(self)
 
 
+class _ControlledFinalAnswerHandle:
+    """测试用受控产出 final answer 的 worker handle。"""
+
+    def __init__(
+        self,
+        snapshot: AttemptDispatchSnapshot,
+        release_event: asyncio.Event,
+    ) -> None:
+        """初始化 handle。
+
+        :param snapshot: 当前 dispatch snapshot。
+        :param release_event: 控制 final answer 产出的事件。
+        :returns: ``None``。
+        """
+
+        self._snapshot = snapshot
+        self._release_event = release_event
+
+    @property
+    def local_worker_id(self) -> str:
+        """返回本地 worker id。
+
+        :returns: 本地 worker id。
+        """
+
+        return "open-host-controlled-worker"
+
+    async def events(self) -> AsyncIterator[EngineEvent]:
+        """等待测试释放后产出 final answer。
+
+        :returns: EngineEvent 异步迭代器。
+        """
+
+        await self._release_event.wait()
+        yield EngineEvent(
+            occurred_at=datetime(2026, 5, 18, 1, 2, 4, tzinfo=UTC),
+            session_id=self._snapshot.session_id,
+            run_id=self._snapshot.run_id,
+            type=EngineEventType.FINAL_ANSWER,
+            data=FinalAnswerData(
+                content=f"recovered:{self._snapshot.run_id}",
+                filtered=False,
+                degraded=False,
+                finish_reason=FinishReason.STOP,
+            ),
+            metadata=None,
+        )
+
+    async def close(self) -> None:
+        """关闭测试 handle。
+
+        :returns: ``None``。
+        """
+
+        return None
+
+    def cancel(self, reason: str) -> None:
+        """记录取消请求。
+
+        :param reason: 取消原因。
+        :returns: ``None``。
+        """
+
+        del reason
+
+
+class _ControlledFinalAnswerWorker:
+    """测试用受控 final answer worker。"""
+
+    def __init__(self, factory: "_ControlledFinalAnswerWorkerFactory") -> None:
+        """初始化 worker。
+
+        :param factory: 所属 factory。
+        :returns: ``None``。
+        """
+
+        self._factory = factory
+
+    async def accept(
+        self,
+        snapshot: AttemptDispatchSnapshot,
+        request: AgentRunRequest,
+    ) -> LocalWorkerHandle:
+        """接受 dispatch 并记录 Engine request。
+
+        :param snapshot: dispatch snapshot。
+        :param request: Engine request。
+        :returns: 受控 final answer handle。
+        """
+
+        self._factory.accepted_snapshots.append(snapshot)
+        self._factory.accepted_requests.append(request)
+        handle = _ControlledFinalAnswerHandle(
+            snapshot,
+            self._factory.release_event,
+        )
+        self._factory.accepted_event.set()
+        return handle
+
+
+class _ControlledFinalAnswerWorkerFactory:
+    """测试用受控 final answer worker factory。"""
+
+    def __init__(self) -> None:
+        """初始化 factory。
+
+        :returns: ``None``。
+        """
+
+        self.accepted_event = asyncio.Event()
+        self.release_event = asyncio.Event()
+        self.accepted_snapshots: list[AttemptDispatchSnapshot] = []
+        self.accepted_requests: list[AgentRunRequest] = []
+
+    def create_worker(self, snapshot: AttemptDispatchSnapshot) -> LocalEngineWorker:
+        """创建测试 worker。
+
+        :param snapshot: dispatch snapshot。
+        :returns: 测试 worker。
+        """
+
+        del snapshot
+        return _ControlledFinalAnswerWorker(self)
+
+
 class _RaisingSchedulerClose:
     """测试用 close 抛错的 scheduler 替身。"""
 
@@ -251,6 +386,47 @@ async def test_submit_followup_queue_auto_wakes_scheduler(
     assert len(factory.accepted_snapshots) == 1
     assert factory.accepted_snapshots[0].run_id == followup.accepted_run_id
     assert factory.accepted_requests[0].disable_tools is True
+
+
+@pytest.mark.asyncio
+async def test_open_host_startup_recovery_dispatches_interrupted_run_and_watch_observes_final(
+    tmp_path: pathlib.Path,
+) -> None:
+    """open_host ready 前恢复 interrupted Run，并通过 watch 观察最终回答。"""
+
+    interrupted_factory = _ControlledFinalAnswerWorkerFactory()
+    options = _options(tmp_path, interrupted_factory)
+    async with open_host(options) as host:
+        session = await host.ensure_session(_ensure_request())
+        followup = await host.submit_followup(
+            session.session_id,
+            _followup_request(session.session_id, "followup-interrupted"),
+        )
+        await asyncio.wait_for(interrupted_factory.accepted_event.wait(), timeout=1)
+        run_id = followup.accepted_run_id
+        session_id = session.session_id
+
+    _mark_current_dispatch_owner_as_stale_running(options, run_id)
+
+    recovery_factory = _ControlledFinalAnswerWorkerFactory()
+    async with open_host(replace(options, worker_factory=recovery_factory)) as host:
+        watcher = host.watch_session_events(session_id)
+        await asyncio.wait_for(recovery_factory.accepted_event.wait(), timeout=1)
+        terminal_task = asyncio.create_task(_next_terminal(watcher))
+        recovery_factory.release_event.set()
+        terminal = await asyncio.wait_for(terminal_task, timeout=1)
+        await _close_iterator(watcher)
+        final_run = await _wait_for_run_status(host, run_id, RunStatus.SUCCEEDED)
+
+    assert terminal.kind is HostEventKind.SUCCEEDED
+    assert terminal.final_answer is not None
+    assert terminal.final_answer.content == f"recovered:{run_id}"
+    assert final_run.status is RunStatus.SUCCEEDED
+    assert len(recovery_factory.accepted_snapshots) == 1
+    assert recovery_factory.accepted_snapshots[0].run_id == run_id
+    assert recovery_factory.accepted_snapshots[0].attempt_id != (
+        interrupted_factory.accepted_snapshots[0].attempt_id
+    )
 
 
 @pytest.mark.asyncio
@@ -347,9 +523,114 @@ async def _wait_for_run_status(
     raise AssertionError(f"run {run_id} did not reach {expected_status.value}")
 
 
+async def _next_terminal(watcher: AsyncIterator[HostEvent]) -> HostEvent:
+    """读取下一个 terminal HostEvent。
+
+    :param watcher: session event watcher。
+    :returns: terminal HostEvent。
+    :raises AssertionError: watcher 提前结束时抛出。
+    """
+
+    async for event in watcher:
+        if event.kind in (
+            HostEventKind.SUCCEEDED,
+            HostEventKind.FAILED,
+            HostEventKind.CANCELLED,
+        ):
+            return event
+    raise AssertionError("watcher ended before terminal event")
+
+
+async def _close_iterator(iterator: AsyncIterator[HostEvent]) -> None:
+    """关闭测试中持有的 async generator iterator。
+
+    :param iterator: HostEvent async iterator。
+    :returns: ``None``。
+    """
+
+    await cast(AsyncGenerator[HostEvent, None], iterator).aclose()
+
+
+def _mark_current_dispatch_owner_as_stale_running(
+    options: OpenHostOptions,
+    run_id: str,
+) -> None:
+    """把当前 dispatch owner liveness 改写成 startup recovery 可证明 orphan。
+
+    :param options: open_host options。
+    :param run_id: 目标 Run id。
+    :returns: ``None``。
+    """
+
+    with open_host_durable_store(_durable_options_from_open_options(options)) as store:
+
+        def operation(transaction: HostTransaction) -> None:
+            """执行 liveness 改写。
+
+            :param transaction: Host transaction。
+            :returns: ``None``。
+            """
+
+            transaction.execute(
+                """
+                UPDATE host_instances
+                SET
+                  pid = ?,
+                  heartbeat_at = ?,
+                  status = ?
+                WHERE host_instance_id = (
+                  SELECT dispatch.owner_host_instance_id
+                  FROM host_runs AS run
+                  JOIN host_attempt_dispatch_records AS dispatch
+                    ON dispatch.attempt_id = run.current_attempt_id
+                  WHERE run.run_id = ?
+                )
+                """,
+                (
+                    999_999,
+                    "2000-01-01T00:00:00.000000Z",
+                    "running",
+                    run_id,
+                ),
+            )
+
+        store.transaction_runner.run_write(operation)
+
+
+def _durable_options_from_open_options(
+    options: OpenHostOptions,
+) -> HostDurableStoreOptions:
+    """从 OpenHostOptions 构造测试 durable store options。
+
+    :param options: public open options。
+    :returns: durable store options。
+    """
+
+    return HostDurableStoreOptions(
+        db_path=options.db_path,
+        payload_policy=PayloadStoragePolicy(
+            artifact_root=options.artifact_root,
+            payload_inline_threshold_bytes=options.payload_inline_threshold_bytes,
+            create_artifact_root=options.create_parent_dirs,
+        ),
+        create_parent_dirs=options.create_parent_dirs,
+        sqlite_policy=HostSQLiteStoragePolicy(
+            busy_timeout_seconds=options.sqlite_busy_timeout_seconds,
+            write_busy_retry_count=options.sqlite_write_busy_retry_count,
+            write_retry_initial_delay_seconds=(
+                options.sqlite_write_retry_initial_delay_seconds
+            ),
+            write_retry_backoff_multiplier=(
+                options.sqlite_write_retry_backoff_multiplier
+            ),
+            write_retry_max_delay_seconds=options.sqlite_write_retry_max_delay_seconds,
+        ),
+    )
+
+
 def _options(
     tmp_path: pathlib.Path,
-    worker_factory: _FinalAnswerWorkerFactory,
+    worker_factory: LocalEngineWorkerFactory,
 ) -> OpenHostOptions:
     """构造测试用 OpenHostOptions。
 
