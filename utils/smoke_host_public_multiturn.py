@@ -491,8 +491,8 @@ def _open_options(
     :raises ValueError: typed options 字段非法时由底层抛出。
     """
 
-    runner_spec = _deepseek_runner_spec(api_key, supports_tool_calling=True)
-    compactor_runner_spec = _deepseek_runner_spec(api_key, supports_tool_calling=False)
+    runner_spec = _deepseek_runner_spec(api_key)
+    compactor_runner_spec = _deepseek_runner_spec(api_key)
     runner_options = RunnerCallOptions(
         temperature=0.0,
         max_tokens=512,
@@ -583,11 +583,10 @@ def _round_client_request_id(smoke_run_id: str, round_index: int) -> str:
     return f"{_SMOKE_CLIENT_REQUEST_PREFIX}-{smoke_run_id}-round-{round_index}"
 
 
-def _deepseek_runner_spec(api_key: str, *, supports_tool_calling: bool) -> RunnerSpec:
+def _deepseek_runner_spec(api_key: str) -> RunnerSpec:
     """构造 DeepSeek RunnerSpec。
 
     :param api_key: DeepSeek API key。
-    :param supports_tool_calling: 是否启用工具调用。
     :returns: RunnerSpec。
     :raises ValueError: RunnerSpec 字段非法时由底层抛出。
     """
@@ -601,7 +600,7 @@ def _deepseek_runner_spec(api_key: str, *, supports_tool_calling: bool) -> Runne
             "Authorization": f"Bearer {api_key}",
             "Content-Type": "application/json",
         },
-        supports_tool_calling=supports_tool_calling,
+        supports_tool_calling=True,
         supports_streaming=True,
         supports_stream_usage=True,
         default_timeout_seconds=_DEFAULT_TIMEOUT_SECONDS,
