@@ -984,6 +984,36 @@ async def test_oversized_tool_message_fails_before_next_runner_call() -> None:
 
 
 @pytest.mark.asyncio
+async def test_oversized_tool_message_fails_before_force_answer_runner_call() -> None:
+    """force-answer fallback 前也必须先执行 inline message size guard。"""
+
+    executor = _RecordingToolExecutor(
+        outcomes={
+            "tc_1": _success(
+                {"content": "x" * _OVERSIZED_INLINE_CONTENT_LENGTH}
+            )
+        }
+    )
+    runner = _ScriptedRunner(
+        scripts=(_tool_script(_tool_call("tc_1")), _final_script("unreachable"))
+    )
+
+    events = await _collect(
+        _AsyncAgent(
+            request=_request(executor=executor, max_iterations=1),
+            runner=runner,
+        )
+    )
+
+    failure = _failed_data(events)
+    assert failure.error_code == "context_compaction_required"
+    assert failure.recoverable is True
+    assert runner.call_count == 1
+    assert runner.close_count == 1
+    assert len(executor.requests) == 1
+
+
+@pytest.mark.asyncio
 async def test_tool_call_iteration_preserves_streamed_content_delta() -> None:
     """tool-call 轮次先产出 content_delta 时，assistant content 必须保留。"""
 
@@ -1622,6 +1652,33 @@ async def test_duplicate_and_executor_exception_paths() -> None:
     assert json.loads(cancelled_tool_message.content)["error"] == (
         _TOOL_EXECUTOR_EXCEPTION_ERROR
     )
+
+
+@pytest.mark.asyncio
+async def test_cancel_before_tool_batch_does_not_register_tool_call_id() -> None:
+    """取消命中工具批执行前时，不应先登记本批 tool_call_id。"""
+
+    token = _Token()
+    executor = _RecordingToolExecutor(outcomes={"tc_1": _success(1)})
+    runner = _ScriptedRunner(
+        scripts=(
+            _tool_script(_tool_call("tc_1")),
+            _final_script("unreachable"),
+        ),
+        token_to_cancel=token,
+        cancel_after_call_indices=frozenset({0}),
+    )
+    agent = _AsyncAgent(
+        request=_request(token=token, executor=executor),
+        runner=runner,
+    )
+
+    events = await _collect(agent)
+
+    assert _terminal(events).type is EngineEventType.RUN_CANCELLED
+    assert agent._executed_tool_call_ids == set()
+    assert len(executor.requests) == 0
+    assert runner.call_count == 1
 
 
 @pytest.mark.asyncio

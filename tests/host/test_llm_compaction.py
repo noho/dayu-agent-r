@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import asyncio
 import inspect
 from collections.abc import Awaitable, Callable
 
@@ -88,7 +89,7 @@ async def test_llm_context_compactor_maps_final_answer_to_candidate(
     assert candidate.preserved_input_event_refs == ("input-1", "input-2")
     assert candidate.preserved_tool_fact_refs == ("tool-fact-1",)
     assert candidate.preserved_verified_fact_refs == ("verified-1",)
-    assert candidate.budget_after_compact == 50
+    assert candidate.budget_after_compact == 8
 
 
 @pytest.mark.asyncio
@@ -126,6 +127,53 @@ async def test_llm_context_compactor_rejects_empty_or_non_final_output(
 
 
 @pytest.mark.asyncio
+async def test_llm_context_compactor_rejects_truncated_final_output(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """compactor final answer 若被 length 截断，必须作为脏 proposal 拒绝。"""
+
+    monkeypatch.setattr(
+        "dayu.host.llm_compaction.run_agent_and_wait",
+        _fake_run_factory(_final("partial summary", finish_reason=FinishReason.LENGTH)),
+    )
+    compactor = LLMContextCompactor(
+        runner_spec=_runner_spec(),
+        runner_options=_runner_options(),
+    )
+
+    with pytest.raises(LLMCompactionProposalError, match="truncated"):
+        await compactor.compact(_request())
+
+
+@pytest.mark.asyncio
+async def test_llm_context_compactor_applies_runner_timeout(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """compactor 单次 runner 调用必须受 RunnerSpec timeout 边界约束。"""
+
+    async def _hanging_run(request: AgentRunRequest) -> AgentRunResult:
+        """模拟不返回的 Engine public runner。
+
+        :param request: Engine run request。
+        :returns: 不会正常返回。
+        :raises TimeoutError: 外层 ``asyncio.wait_for`` 超时时取消本协程。
+        """
+
+        del request
+        await asyncio.sleep(10.0)
+        return _final("unreachable")
+
+    monkeypatch.setattr("dayu.host.llm_compaction.run_agent_and_wait", _hanging_run)
+    compactor = LLMContextCompactor(
+        runner_spec=_runner_spec(default_timeout_seconds=0.01),
+        runner_options=_runner_options(),
+    )
+
+    with pytest.raises(TimeoutError):
+        await compactor.compact(_request())
+
+
+@pytest.mark.asyncio
 async def test_llm_context_compactor_sanitizes_failed_runner_outcome(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -142,7 +190,7 @@ async def test_llm_context_compactor_sanitizes_failed_runner_outcome(
             EngineRunOutcomeFailed(
                 session_id="session-1",
                 run_id="run-1",
-                error_code="server_error",
+                error_code="api_key=error-secret",
                 message=(
                     "http 503 Authorization: Bearer deepsecret "
                     "api_key=plainsecret transient unavailable"
@@ -161,10 +209,11 @@ async def test_llm_context_compactor_sanitizes_failed_runner_outcome(
         await compactor.compact(_request())
 
     message = str(exc_info.value)
-    assert "error_code=server_error" in message
+    assert "error_code=unknown_error" in message
     assert "recoverable=True" in message
     assert "503" in message
     assert "transient unavailable" in message
+    assert "error-secret" not in message
     assert "deepsecret" not in message
     assert "plainsecret" not in message
     assert "provider-request-1" not in message
@@ -275,10 +324,13 @@ def _request() -> CompactionRequest:
     )
 
 
-def _final(content: str) -> EngineRunOutcomeFinalAnswer:
+def _final(
+    content: str, *, finish_reason: FinishReason = FinishReason.STOP
+) -> EngineRunOutcomeFinalAnswer:
     """构造 final answer outcome。
 
     :param content: final answer 文本。
+    :param finish_reason: final answer finish reason。
     :returns: EngineRunOutcomeFinalAnswer。
     """
 
@@ -288,7 +340,7 @@ def _final(content: str) -> EngineRunOutcomeFinalAnswer:
         content=content,
         filtered=False,
         degraded=False,
-        finish_reason=FinishReason.STOP,
+        finish_reason=finish_reason,
     )
 
 

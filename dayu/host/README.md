@@ -224,7 +224,7 @@ ToolRuntime 内部 factory、run-scoped duplicate governance registry、truncati
 - failed：关闭 wait record，并把 Run 收口为 `FAILED`。
 - lost：写入 lost 工具事实，并把 Run 收口为 `LOST`。
 
-late result、terminal Run 上的结果或已取消 wait 的结果不会恢复 Run；这些路径只写入受控 diagnostic 或返回结构化幂等冲突。
+late result、terminal Run 上的结果或已取消 wait 的结果不会恢复 Run；这些路径只写入受控 diagnostic 或返回结构化幂等冲突。Wait poller 对已取消 wait 的 adapter abandon 只保留当前仍可观察且已成功通知的去重记忆；adapter abandon 失败会记录 warning，并在后续 poll 中继续重试。
 
 ## Memory Projection
 
@@ -243,7 +243,7 @@ Context Governance 是 Host 责任。它根据 `ContextBudgetPolicy`、conservat
 - proactive：dispatch Attempt 前执行输入治理，必要时写入 compact request / compacted / failed canonical facts，再创建 Attempt。
 - reactive：Engine 报告 context compaction required 后，由 Host 校验 attempt / execution identity，按 policy 关闭当前 Attempt，执行 bounded compaction operation，并用新的 Attempt 继续。
 
-LLM compactor 只提出 structured candidate；Host 负责质量校验、预算硬阈值校验、artifact 写入、canonical event 写入和状态推进。质量校验会拒绝缺失 evidence anchor、非法 pinned state patch，以及不属于本次 compaction request 可摘要输入范围的 compact range。compact 不改写历史 EventLog facts，不让 summary 替代 evidence anchor，也不直接写 memory snapshot。memory 是否吸收 compacted summary 由 memory projection policy 消费已提交 facts 决定。
+LLM compactor 只提出 structured candidate；Host 负责质量校验、预算硬阈值校验、artifact 写入、canonical event 写入和状态推进。compactor 的 Engine runner 调用受独立 timeout 边界约束；非 final outcome 的错误摘要会先脱敏，`finish_reason=length` 的 final summary 视为截断脏 proposal，不会被接受为 compact 成功。质量校验会拒绝缺失 evidence anchor、非法 pinned state patch，以及不属于本次 compaction request 可摘要输入范围的 compact range。compact 不改写历史 EventLog facts，不让 summary 替代 evidence anchor，也不直接写 memory snapshot。memory 是否吸收 compacted summary 由 memory projection policy 消费已提交 facts 决定。
 
 ## Payload 与 Terminal Continuity
 

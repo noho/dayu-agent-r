@@ -22,7 +22,6 @@ from dayu.host import (
     HostApiError,
     HostApiErrorCode,
     HostCallContext,
-    HostInput,
     HostStreamCursor,
     LocalEngineWorkerFactory,
     OperationContext,
@@ -45,6 +44,7 @@ from dayu.host import (
 from dayu.engine.contracts.agent_policy import AgentPolicy
 from dayu.engine.contracts.runner_spec import RunnerCallOptions, RunnerSpec
 from dayu.host.api import (
+    HostInput,
     HostCommandHandleOptions,
     HostLocalExecutionOptions,
     StartRunRequest,

@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import logging
 from collections.abc import Mapping
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass, field
@@ -887,7 +888,7 @@ def test_cancel_predispatch_starting_promotes_exactly_one_queued_run(
 
 
 def test_cancel_predispatch_starting_promotion_survives_queue_wakeup_failure(
-    tmp_path: Path,
+    tmp_path: Path, caplog: pytest.LogCaptureFixture
 ) -> None:
     """active cancel 后 queue wakeup 失败不掩盖已完成 promotion。"""
 
@@ -908,11 +909,12 @@ def test_cancel_predispatch_starting_promotion_survives_queue_wakeup_failure(
         )
         spy.fail_queue_promotion = True
 
-        result = service.cancel_run(
-            active.run.run_id,
-            _cancel_request("cancel-active-wakeup-fails"),
-            caller_semantic_digest=_CALLER_DIGEST,
-        )
+        with caplog.at_level(logging.WARNING, logger="dayu.host.admission"):
+            result = service.cancel_run(
+                active.run.run_id,
+                _cancel_request("cancel-active-wakeup-fails"),
+                caller_semantic_digest=_CALLER_DIGEST,
+            )
 
         assert result.run.status == RunStatus.CANCELLED
         assert result.promotion is not None
@@ -922,6 +924,8 @@ def test_cancel_predispatch_starting_promotion_survives_queue_wakeup_failure(
             RunStatus.QUEUED
         )
         assert spy.promotions == [session_id]
+        assert "host.admission.queue_promotion_wakeup_failed" in caplog.text
+        assert session_id in caplog.text
 
 
 def test_promote_next_queued_run_returns_result_when_dispatch_wakeup_fails(

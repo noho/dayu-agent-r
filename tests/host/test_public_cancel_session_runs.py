@@ -17,7 +17,6 @@ from dayu.host import (
     HostApiError,
     HostApiErrorCode,
     HostCallContext,
-    HostInput,
     OperationContext,
     RunStatus,
     SubmitFollowupRequest,
@@ -25,6 +24,7 @@ from dayu.host import (
     ensure_session,
     submit_followup,
 )
+from dayu.host.api import HostInput
 from dayu.host.api import EnsureSessionRequest, HostCommandHandleOptions, StartRunRequest
 from dayu.host.command import HostCommandHandle, create_host_command_handle, start_run
 from dayu.host.durable.connection import open_host_durable_store

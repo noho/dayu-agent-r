@@ -183,6 +183,7 @@ class _ScriptedRunner:
     token: _Token | None = None
     raise_on_call: bool = False
     raise_on_close: bool = False
+    raise_cancelled_on_close: bool = False
     block_after_first_event: bool = False
     close_count: int = 0
     call_count: int = 0
@@ -222,11 +223,14 @@ class _ScriptedRunner:
         """记录 close 调用。
 
         :returns: 无返回值。
+        :raises asyncio.CancelledError: 配置 ``raise_cancelled_on_close`` 时抛出。
         :raises RuntimeError: 配置 ``raise_on_close`` 时抛出。
         """
 
         self.close_count += 1
         self.close_completed_at = _utc_now()
+        if self.raise_cancelled_on_close:
+            raise asyncio.CancelledError()
         if self.raise_on_close:
             raise RuntimeError("close failed")
 
@@ -976,6 +980,36 @@ async def test_close_error_does_not_override_terminal() -> None:
     assert _final_event(events).type is EngineEventType.FINAL_ANSWER
     assert runner.close_count == 1
     assert _terminal_count(events) == 1
+
+
+@pytest.mark.asyncio
+async def test_close_cancelled_error_releases_run_slot() -> None:
+    """Runner close 若被取消，也必须释放私有 Agent 运行槽位。"""
+
+    runner = _ScriptedRunner(
+        events=(
+            _event(
+                RunnerEventType.RUNNER_CONTENT_COMPLETED,
+                RunnerContentCompletedData(
+                    content="ok",
+                    reasoning_content=None,
+                    finish_reason=FinishReason.STOP,
+                ),
+            ),
+            _event(
+                RunnerEventType.RUNNER_DONE,
+                RunnerDoneData(finish_reason=FinishReason.STOP, provider_request_id=None),
+            ),
+        ),
+        raise_cancelled_on_close=True,
+    )
+    agent = _AsyncAgent(request=_request(), runner=runner)
+
+    with pytest.raises(asyncio.CancelledError):
+        await _collect(agent)
+
+    assert runner.close_count == 1
+    assert agent._active_run_id is None
 
 
 @pytest.mark.asyncio

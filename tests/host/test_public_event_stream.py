@@ -19,11 +19,11 @@ from dayu.host import (
     HostApiErrorCode,
     HostCallContext,
     HostEventClass,
-    HostInput,
     HostStreamCursor,
     OperationContext,
     ensure_session,
 )
+from dayu.host.api import HostInput
 from dayu.host.api import HostCommandHandleOptions, HostEventView, StartRunRequest
 from dayu.host.command import HostCommandHandle, create_host_command_handle, start_run
 from dayu.host.read_api import stream_run_events

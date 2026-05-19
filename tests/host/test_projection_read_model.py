@@ -16,7 +16,6 @@ from dayu.host import (
     CancelRunRequest,
     FollowupBehavior,
     HostCallContext,
-    HostInput,
     OperationContext,
     OrdinaryRunExecutionBaseline,
     RunStatus,
@@ -25,6 +24,7 @@ from dayu.host import (
     ensure_session,
     submit_followup,
 )
+from dayu.host.api import HostInput
 from dayu.host.admission import create_host_admission_service
 from dayu.host.api import EnsureSessionRequest, HostCommandHandleOptions, StartRunRequest
 from dayu.host.command import HostCommandHandle, create_host_command_handle, start_run

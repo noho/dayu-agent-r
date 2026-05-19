@@ -35,7 +35,6 @@ from dayu.host import (
     AttemptStatus,
     AuthorizationClaim,
     HostCallContext,
-    HostInput,
     LocalEngineWorker,
     LocalEngineWorkerFactory,
     LocalWorkerHandle,
@@ -46,6 +45,7 @@ from dayu.host import (
 )
 from dayu.host.admission import PendingDispatchRecord
 from dayu.host.api import (
+    HostInput,
     AttemptDispatchSnapshot,
     EnsureSessionRequest,
     HostLocalExecutionOptions,

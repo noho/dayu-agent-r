@@ -16,11 +16,11 @@ from dayu.host import (
     AuthorizationClaim,
     EnsureSessionRequest,
     HostCallContext,
-    HostInput,
     OperationContext,
     ensure_session,
 )
 from dayu.host.api import (
+    HostInput,
     AttemptDispatchSnapshot,
     HostCommandHandleOptions,
     StartRunRequest,

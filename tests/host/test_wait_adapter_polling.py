@@ -344,6 +344,39 @@ def test_adapter_non_runtime_exception_isolated_per_wait_record(
         host.close()
 
 
+def test_failed_cancelled_wait_abandon_is_retried_next_poll(
+    tmp_path: Path,
+) -> None:
+    """cancelled wait abandon 失败时不写入已 abandon 记忆，下一轮继续重试。"""
+
+    host = create_host_command_handle(_options(tmp_path))
+    try:
+        seeded = _seed_waiting_run(host)
+        cancel_run(
+            host,
+            seeded.run_id,
+            CancelRunRequest(
+                context=_context("poll-cancel-retry"),
+                client_request_id="poll-cancel-retry",
+                reason="user_cancel",
+                mode=CancelMode.GRACEFUL,
+            ),
+        )
+        adapter = _AbandonValueErrorThenNotReadyAdapter()
+        poller = _poller(host, adapter, seeded.wait_id)
+
+        first = poller.poll_once()
+        second = poller.poll_once()
+
+        assert first.abandoned == 0
+        assert second.abandoned == 0
+        assert first.adapter_errors == 1
+        assert second.adapter_errors == 1
+        assert adapter.abandoned == [seeded.wait_id, seeded.wait_id]
+    finally:
+        host.close()
+
+
 def _poller(
     host: HostCommandHandle, adapter: WaitPollAdapter, wait_id: str
 ) -> WaitPoller:

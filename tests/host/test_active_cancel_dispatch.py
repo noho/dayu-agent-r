@@ -28,7 +28,6 @@ from dayu.host import (
     CancelRunRequest,
     CancelSessionRunsRequest,
     HostCallContext,
-    HostInput,
     LocalEngineWorker,
     LocalEngineWorkerFactory,
     LocalWorkerHandle,
@@ -40,6 +39,7 @@ from dayu.host import (
 )
 from dayu.host.admission import PendingDispatchRecord
 from dayu.host.api import (
+    HostInput,
     AttemptDispatchSnapshot,
     AttemptStatus,
     EnsureSessionRequest,

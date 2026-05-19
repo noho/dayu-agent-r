@@ -27,7 +27,6 @@ from dayu.host import (
     FollowupBehavior,
     Host,
     HostCallContext,
-    HostInput,
     LocalEngineWorker,
     LocalWorkerHandle,
     OpenHostOptions,
@@ -38,6 +37,7 @@ from dayu.host import (
     SubmitFollowupRequest,
     open_host,
 )
+from dayu.host.api import HostInput
 from dayu.host.api import AuthorizationClaim
 from dayu.host.command import HostCommandHandle
 from dayu.host.dispatch import HostDispatchScheduler

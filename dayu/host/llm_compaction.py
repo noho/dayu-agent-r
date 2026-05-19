@@ -8,6 +8,7 @@ repair loop，也不向 Service 暴露 prompt、candidate builder 或 policy sea
 
 from __future__ import annotations
 
+import asyncio
 import re
 from datetime import datetime
 from uuid import uuid4
@@ -26,6 +27,7 @@ from dayu.engine.contracts.agent_run import (
     EngineRunOutcomeFinalAnswer,
     EngineRunOutcomeSuspended,
 )
+from dayu.engine.contracts.finish_reason import FinishReason
 from dayu.engine.contracts.messages import (
     AgentMessageRole,
     SystemMessage,
@@ -56,6 +58,7 @@ _BEARER_SECRET_PATTERN = re.compile(r"(?i)bearer\s+[A-Za-z0-9._~+/=-]+")
 _ASSIGNMENT_SECRET_PATTERN = re.compile(
     r"(?i)((?:api[_-]?key|authorization)\s*[:=]\s*)[^,\s}\]]+"
 )
+_SAFE_ERROR_CODE_PATTERN = re.compile(r"^[a-z][a-z0-9_-]{0,63}$")
 _SYSTEM_PROMPT = (
     "You are a host-owned context compaction component. Summarize the provided "
     "Host context refs into a concise episode summary. Do not claim new "
@@ -161,10 +164,15 @@ class LLMContextCompactor(ContextCompactor):
         if not isinstance(request, CompactionRequest):
             raise TypeError("request must be CompactionRequest")
         outcome = await _run_agent_request(
-            _agent_request(request, self._runner_spec, self._runner_options)
+            _agent_request(request, self._runner_spec, self._runner_options),
+            timeout_seconds=self._runner_spec.default_timeout_seconds,
         )
         if not isinstance(outcome, EngineRunOutcomeFinalAnswer):
             raise LLMCompactionProposalError(_non_final_outcome_message(outcome))
+        if outcome.finish_reason is FinishReason.LENGTH:
+            raise LLMCompactionProposalError(
+                "compactor summary was truncated finish_reason=length"
+            )
         summary = outcome.content.strip()
         if len(summary) < _MIN_SUMMARY_LENGTH:
             raise LLMCompactionProposalError("compactor summary is empty")
@@ -206,15 +214,18 @@ def _agent_request(
     )
 
 
-async def _run_agent_request(request: AgentRunRequest) -> AgentRunResult:
+async def _run_agent_request(
+    request: AgentRunRequest, *, timeout_seconds: float
+) -> AgentRunResult:
     """运行 Engine async public runner。
 
     :param request: Engine AgentRunRequest。
+    :param timeout_seconds: compactor 单次 proposal 的总耗时上限。
     :returns: AgentRunResult。
     :raises BaseException: Engine async 调用抛出的异常会原样透传。
     """
 
-    return await run_agent_and_wait(request)
+    return await asyncio.wait_for(run_agent_and_wait(request), timeout=timeout_seconds)
 
 
 def _non_final_outcome_message(outcome: AgentRunResult) -> str:
@@ -228,7 +239,7 @@ def _non_final_outcome_message(outcome: AgentRunResult) -> str:
     if isinstance(outcome, EngineRunOutcomeFailed):
         return (
             "compactor runner failed "
-            f"error_code={outcome.error_code} "
+            f"error_code={_safe_error_code(outcome.error_code)} "
             f"recoverable={outcome.recoverable} "
             f"message={_safe_outcome_text(outcome.message)}"
         )
@@ -237,6 +248,19 @@ def _non_final_outcome_message(outcome: AgentRunResult) -> str:
     if isinstance(outcome, EngineRunOutcomeSuspended):
         return f"compactor runner suspended reason={_safe_outcome_text(outcome.reason)}"
     return "compactor runner did not return final answer"
+
+
+def _safe_error_code(error_code: str) -> str:
+    """返回可进入异常消息的中性错误码。
+
+    :param error_code: Engine failed outcome 的错误码。
+    :returns: 安全机器码；不符合机器码格式时返回 ``unknown_error``。
+    :raises Exception: 不主动抛出异常。
+    """
+
+    if _SAFE_ERROR_CODE_PATTERN.fullmatch(error_code) is None:
+        return "unknown_error"
+    return error_code
 
 
 def _safe_outcome_text(text: str) -> str:
@@ -359,7 +383,7 @@ def _candidate_from_summary(
         preserved_verified_fact_refs=request.verified_fact_refs,
         dropped_ranges=(),
         summarized_ranges=summarized_ranges,
-        budget_after_compact=_budget_after_compact(request),
+        budget_after_compact=_budget_after_compact(request, summary),
     )
 
 
@@ -439,16 +463,28 @@ def _confirmed_subjects(request: CompactionRequest) -> tuple[str, ...]:
     return (f"subject:{request.current_message_summary.current_user_input_ref}",)
 
 
-def _budget_after_compact(request: CompactionRequest) -> int:
+def _budget_after_compact(request: CompactionRequest, summary: str) -> int:
     """保守估算 compact 后预算。
 
     :param request: Host compaction request。
+    :param summary: compactor 产出的摘要文本。
     :returns: 非负 token 估算。
     """
 
     estimate = request.budget_before_compact
-    half_estimate = max(0, estimate.estimated_input_tokens // 2)
-    return min(half_estimate, estimate.hard_threshold_tokens - 1)
+    summary_tokens = _estimate_summary_tokens(summary)
+    return min(summary_tokens, estimate.hard_threshold_tokens - 1)
+
+
+def _estimate_summary_tokens(summary: str) -> int:
+    """估算摘要文本 token 数。
+
+    :param summary: compact 摘要文本。
+    :returns: 非负 token 估算。
+    :raises Exception: 不主动抛出异常。
+    """
+
+    return max(1, (len(summary) + 3) // 4)
 
 
 __all__ = ["LLMCompactionProposalError", "LLMContextCompactor"]

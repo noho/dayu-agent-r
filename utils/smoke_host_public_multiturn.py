@@ -79,6 +79,9 @@ _HARD_THRESHOLD_TOKENS = 760
 _SAFETY_MARGIN_RATIO = 0.25
 _COMPACTOR_PROVIDER_MAX_RETRIES = 1
 _COMPACTOR_MAX_ATTEMPTS_PER_OPERATION = 2
+_ORDINARY_MAX_TOKENS = 2048
+_ORDINARY_CONTINUATION_MAX_ATTEMPTS = 2
+_COMPACTOR_MAX_TOKENS = 1024
 _PROMPT_PAD_REPEAT = 90
 _FINAL_PREVIEW_CHARS = 500
 _COMPACT_ARTIFACT_PRINT_LIMIT = 10
@@ -295,9 +298,15 @@ def _open_options(
         provider_request=None,
         max_retries=_COMPACTOR_PROVIDER_MAX_RETRIES,
     )
-    runner_options = RunnerCallOptions(
+    ordinary_runner_options = RunnerCallOptions(
         temperature=0.0,
-        max_tokens=512,
+        max_tokens=_ORDINARY_MAX_TOKENS,
+        top_p=None,
+        stream=True,
+    )
+    compactor_runner_options = RunnerCallOptions(
+        temperature=0.0,
+        max_tokens=_COMPACTOR_MAX_TOKENS,
         top_p=None,
         stream=True,
     )
@@ -323,10 +332,10 @@ def _open_options(
             dispatch_poll_interval_seconds=0.05,
             ordinary_run_baseline=OrdinaryRunExecutionBaseline(
                 runner_spec=runner_spec,
-                runner_options=runner_options,
+                runner_options=ordinary_runner_options,
                 agent_policy=AgentPolicy(
                     max_iterations=3,
-                    continuation_max_attempts=0,
+                    continuation_max_attempts=_ORDINARY_CONTINUATION_MAX_ATTEMPTS,
                     allow_tool_calls=True,
                     tool_execution_timeout_seconds=_TOOL_TIMEOUT_SECONDS,
                 ),
@@ -347,7 +356,7 @@ def _open_options(
             ),
             compactor_runner_baseline=CompactorRunnerBaseline(
                 compactor_runner_spec=compactor_runner_spec,
-                compactor_runner_options=runner_options,
+                compactor_runner_options=compactor_runner_options,
                 compact_artifact_root=work_dir / "compact-artifacts",
                 compact_artifact_create_parent_dirs=True,
             ),

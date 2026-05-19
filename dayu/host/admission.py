@@ -4289,8 +4289,13 @@ def _promote_after_release(
 
     try:
         service.wakeup_port.wake_queue_promotion(session_id)
-    except RuntimeError:
-        pass
+    except RuntimeError as exc:
+        _LOGGER.warning(
+            "host.admission.queue_promotion_wakeup_failed "
+            "session_id=%s error_type=%s",
+            session_id,
+            type(exc).__name__,
+        )
     return PromotionResult(
         promoted_run=None,
         attempt=None,
