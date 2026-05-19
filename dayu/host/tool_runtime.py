@@ -2843,7 +2843,7 @@ class ToolRuntimeExecutor:
             if isinstance(result, ToolAwaitingAcceptedAck | ToolAwaitingRejectedAck):
                 return result
             last_error_code = result.last_error_code
-            diagnostics = result.diagnostic_refs
+            diagnostics = tuple(result.diagnostic_refs)
             if attempt_count >= self._retry_policy.max_attempts:
                 break
             if self._retry_policy.backoff_seconds > 0:
@@ -3560,7 +3560,10 @@ def _should_append_governed_event(candidate: ToolFactAcceptCandidate) -> bool:
     return (
         candidate.tool_fact_kind is ToolFactKind.REUSE
         or candidate.policy_decision.kind is not ToolPolicyDecisionKind.ALLOW
-        or candidate.duplicate_decision is not None
+        or (
+            candidate.duplicate_decision is not None
+            and candidate.duplicate_decision is not DuplicateDecisionKind.ALLOW
+        )
     )
 
 

@@ -9,6 +9,7 @@ from pathlib import Path
 from typing import cast
 
 from dayu.contracts.json_value import JsonValue
+from dayu.host.admission import PendingDispatchRecord
 from dayu.host.api import (
     EnsureSessionRequest,
     HostMetadataEntry,
@@ -75,6 +76,37 @@ class _PidMissingProbe:
             observed_boot_id=None,
             probe_error_code=None,
         )
+
+
+class _RecordingWakeup:
+    """记录 startup scan commit 后的 scheduler wakeup。"""
+
+    def __init__(self) -> None:
+        """初始化 wakeup 记录器。
+
+        :returns: ``None``。
+        """
+
+        self.dispatches: list[PendingDispatchRecord] = []
+        self.promoted_sessions: list[str] = []
+
+    def wake_dispatch(self, record: PendingDispatchRecord) -> None:
+        """记录 dispatch wakeup。
+
+        :param record: pending dispatch 摘要。
+        :returns: ``None``。
+        """
+
+        self.dispatches.append(record)
+
+    def wake_queue_promotion(self, session_id: str) -> None:
+        """记录 queue promotion wakeup。
+
+        :param session_id: 目标 Session id。
+        :returns: ``None``。
+        """
+
+        self.promoted_sessions.append(session_id)
 
 
 def _options(tmp_path: Path) -> HostDurableStoreOptions:
@@ -208,17 +240,22 @@ def test_scan_accepted_does_not_mutate_or_create_attempt(tmp_path: Path) -> None
     with open_host_durable_store(_options(tmp_path)) as store:
         _seed_unstarted_run(store.transaction_runner, "run-1", RunStatus.ACCEPTED)
         before = _unstarted_scan_observation(store.transaction_runner, "run-1")
+        wakeup = _RecordingWakeup()
 
         result = StartupRecoveryScanner(
             transaction_runner=store.transaction_runner,
             event_log_store=EventLogStore(),
             process_probe=_PidMissingProbe(),
+            dispatch_wakeup_port=wakeup,
         ).scan(_policy())
 
         after = _unstarted_scan_observation(store.transaction_runner, "run-1")
         assert tuple(action.decision for action in result.actions) == (
             StartupRecoveryDecision.ACCEPTED_WAKE,
         )
+        assert len(result.queue_promotion_sessions) == 1
+        assert wakeup.dispatches == []
+        assert wakeup.promoted_sessions == list(result.queue_promotion_sessions)
         assert after == before
 
 
@@ -228,17 +265,22 @@ def test_scan_queued_does_not_mutate_or_create_attempt(tmp_path: Path) -> None:
     with open_host_durable_store(_options(tmp_path)) as store:
         _seed_unstarted_run(store.transaction_runner, "run-1", RunStatus.QUEUED)
         before = _unstarted_scan_observation(store.transaction_runner, "run-1")
+        wakeup = _RecordingWakeup()
 
         result = StartupRecoveryScanner(
             transaction_runner=store.transaction_runner,
             event_log_store=EventLogStore(),
             process_probe=_PidMissingProbe(),
+            dispatch_wakeup_port=wakeup,
         ).scan(_policy())
 
         after = _unstarted_scan_observation(store.transaction_runner, "run-1")
         assert tuple(action.decision for action in result.actions) == (
             StartupRecoveryDecision.QUEUE_PROMOTION_CHECK,
         )
+        assert len(result.queue_promotion_sessions) == 1
+        assert wakeup.dispatches == []
+        assert wakeup.promoted_sessions == list(result.queue_promotion_sessions)
         assert after == before
 
 

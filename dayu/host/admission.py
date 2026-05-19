@@ -1014,10 +1014,15 @@ class _StartRunOperation:
             )
         if self.policy == AdmissionPolicy.ATTACH_ACTIVE:
             if active.status == RunStatus.ACCEPTED:
-                raise HostApiError(
-                    code=HostApiErrorCode.CONFLICT,
-                    message="Session has an accepted Run but no active Attempt",
-                    retryable=False,
+                return RunAdmissionResult(
+                    run=active,
+                    attempt=None,
+                    dispatch_record=None,
+                    pending_dispatch=None,
+                    created=False,
+                    queued=False,
+                    attached_active=True,
+                    idempotent_replay=False,
                 )
             self.idempotency_store.record_idempotent_result(
                 transaction,

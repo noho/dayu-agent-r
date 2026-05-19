@@ -97,6 +97,44 @@ async def test_sse_provider_error_object_emits_protocol_error() -> None:
     assert done.finish_reason is FinishReason.ERROR
 
 
+def test_non_stream_provider_error_object_emits_protocol_error() -> None:
+    """非流式 200 顶层 provider error object 必须保留 provider 信息。"""
+
+    payload = json.dumps(
+        {
+            "error": {
+                "code": "context_length_exceeded",
+                "message": "too long",
+            }
+        },
+        separators=(",", ":"),
+    ).encode("utf-8")
+
+    events = list(
+        parse_non_stream_response(
+            payload,
+            hook=make_no_thought_hook(),
+            provider_request_id="req_non_stream_provider_error",
+        )
+    )
+
+    assert [event.type for event in events] == [
+        RunnerEventType.PROVIDER_PROTOCOL_ERROR,
+        RunnerEventType.RUNNER_DONE,
+    ]
+    error = events[0].data
+    assert isinstance(error, RunnerProtocolErrorData)
+    assert error.error_code == "non_stream_provider_error"
+    assert error.message == "too long"
+    assert error.provider_request_id == "req_non_stream_provider_error"
+    assert error.raw_payload == {
+        "error": {"code": "context_length_exceeded", "message": "too long"}
+    }
+    done = events[1].data
+    assert isinstance(done, RunnerDoneData)
+    assert done.finish_reason is FinishReason.ERROR
+
+
 @pytest.mark.asyncio
 async def test_sse_missing_choices_without_usage_emits_protocol_error() -> None:
     """既无有效 choices 也无有效 usage 的 SSE object 必须失败收口。"""

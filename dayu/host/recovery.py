@@ -139,10 +139,13 @@ class StartupRecoveryScanResult:
 
     :param actions: 按扫描顺序记录的每个 Run 分类结果。
     :param pending_dispatches: 本次 scan 事务提交后唤醒的 pending dispatch 摘要。
+    :param queue_promotion_sessions: 本次 scan 事务提交后唤醒 queue
+        promotion 的 Session id。
     """
 
     actions: tuple[StartupRecoveryAction, ...]
     pending_dispatches: tuple[PendingDispatchRecord, ...] = ()
+    queue_promotion_sessions: tuple[str, ...] = ()
 
 
 @dataclass(frozen=True, slots=True)
@@ -186,6 +189,8 @@ class StartupRecoveryScanner:
 
             actions: list[StartupRecoveryAction] = []
             pending_dispatches: list[PendingDispatchRecord] = []
+            queue_promotion_sessions: list[str] = []
+            seen_queue_promotion_sessions: set[str] = set()
             for run in read_non_terminal_runs(transaction):
                 actions.append(
                     self._classify_run(
@@ -193,17 +198,22 @@ class StartupRecoveryScanner:
                         run,
                         effective_policy,
                         pending_dispatches,
+                        queue_promotion_sessions,
+                        seen_queue_promotion_sessions,
                     )
                 )
             return StartupRecoveryScanResult(
                 actions=tuple(actions),
                 pending_dispatches=tuple(pending_dispatches),
+                queue_promotion_sessions=tuple(queue_promotion_sessions),
             )
 
         result = self.transaction_runner.run_write(operation)
         if self.dispatch_wakeup_port is not None:
             for pending_dispatch in result.pending_dispatches:
                 self.dispatch_wakeup_port.wake_dispatch(pending_dispatch)
+            for session_id in result.queue_promotion_sessions:
+                self.dispatch_wakeup_port.wake_queue_promotion(session_id)
         return result
 
     def _classify_run(
@@ -212,6 +222,8 @@ class StartupRecoveryScanner:
         run: RunRow,
         policy: StartupRecoveryPolicy,
         pending_dispatches: list[PendingDispatchRecord],
+        queue_promotion_sessions: list[str],
+        seen_queue_promotion_sessions: set[str],
     ) -> StartupRecoveryAction:
         """分类单个非终态 Run。
 
@@ -219,12 +231,26 @@ class StartupRecoveryScanner:
         :param run: 待分类 Run row。
         :param policy: scan 策略。
         :param pending_dispatches: 本次 scan 已创建的待唤醒 dispatch 摘要集合。
+        :param queue_promotion_sessions: 本次 scan 需要在事务提交后唤醒
+            queue promotion 的 Session id 集合。
+        :param seen_queue_promotion_sessions: 已加入
+            ``queue_promotion_sessions`` 的 Session id 集合。
         :returns: 单个 Run 的分类结果。
         """
 
         if run.status is RunStatus.ACCEPTED:
+            _append_unseen_session_id(
+                queue_promotion_sessions,
+                seen_queue_promotion_sessions,
+                run.session_id,
+            )
             return _action(run, StartupRecoveryDecision.ACCEPTED_WAKE, "accepted")
         if run.status is RunStatus.QUEUED:
+            _append_unseen_session_id(
+                queue_promotion_sessions,
+                seen_queue_promotion_sessions,
+                run.session_id,
+            )
             return _action(
                 run,
                 StartupRecoveryDecision.QUEUE_PROMOTION_CHECK,
@@ -666,6 +692,24 @@ def _action_from_mutation(
     if status is StateMutationStatus.NOT_FOUND:
         return _action(run, StartupRecoveryDecision.NOT_FOUND, reason)
     return _action(run, StartupRecoveryDecision.INVALID_STATE, reason)
+
+
+def _append_unseen_session_id(
+    ordered_session_ids: list[str], seen_session_ids: set[str], session_id: str
+) -> None:
+    """按扫描顺序追加尚未出现的 Session id。
+
+    :param ordered_session_ids: 按扫描顺序保存的 Session id 列表。
+    :param seen_session_ids: 已收集的 Session id 集合。
+    :param session_id: 待追加 Session id。
+    :returns: ``None``。
+    :raises Exception: 不主动抛出异常。
+    """
+
+    if session_id in seen_session_ids:
+        return
+    seen_session_ids.add(session_id)
+    ordered_session_ids.append(session_id)
 
 
 def _event_id(prefix: str) -> str:

@@ -280,7 +280,6 @@ async def test_engine_continues_only_after_toolruntime_host_accept(
         tool_events = _tool_events(store.transaction_runner)
         assert [row.event_type for row in tool_events] == [
             "TOOL_CALL_REQUESTED",
-            "TOOL_CALL_GOVERNED",
             "TOOL_RESULT_ACCEPTED",
         ]
         run_status, attempt_status = _run_attempt_status(
@@ -366,15 +365,13 @@ async def test_fetch_more_uses_same_toolruntime_accept_eventlog_path(
         tool_events = _tool_events(store.transaction_runner)
         assert [row.event_type for row in tool_events] == [
             "TOOL_CALL_REQUESTED",
-            "TOOL_CALL_GOVERNED",
             "TOOL_RESULT_ACCEPTED",
             "TOOL_CALL_REQUESTED",
-            "TOOL_CALL_GOVERNED",
             "TOOL_RESULT_ACCEPTED",
         ]
         payloads = [json.loads(row.payload_json) for row in tool_events]
         assert payloads[0]["tool_name"] == "fake_tool"
-        assert payloads[3]["tool_name"] == "fetch_more"
+        assert payloads[2]["tool_name"] == "fetch_more"
 
 
 async def _collect(agent: _AsyncAgent) -> list[EngineEvent]:

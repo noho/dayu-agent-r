@@ -14,7 +14,7 @@
   - ``Retry-After`` 存在 → 使用 header，但 cap 至 120s；
   - 否则首次 4s、随后指数退避，cap 60s。
 - 其它可重试错误（5xx / 408 timeout / 网络）：
-  - ``Retry-After`` 存在 → 使用 header（无额外 cap，按 OLD 行为）；
+  - ``Retry-After`` 存在 → 使用 header，但 cap 至 120s；
   - 否则 ``min(2 ** (attempt - 1), 30s)`` 标准指数退避。
 """
 
@@ -72,7 +72,7 @@ def compute_retry_decision(
         ``None`` 表示无该头。
     :param backoff_cap_seconds: 标准指数退避上限秒数（429 路径使用
         独立的 ``_RATE_LIMIT_BACKOFF_CAP_SECONDS`` / 120s ``Retry-After``
-        cap，本参数对 429 不生效）。
+        cap，本参数对 ``Retry-After`` 不生效）。
     :returns: :class:`_RetryDecision` 决策。
     """
 
@@ -89,7 +89,9 @@ def compute_retry_decision(
             attempt=attempt, retry_after_seconds=retry_after_seconds
         )
     elif retry_after_seconds is not None:
-        sleep_seconds = retry_after_seconds
+        sleep_seconds = min(
+            retry_after_seconds, _RATE_LIMIT_RETRY_AFTER_CAP_SECONDS
+        )
     else:
         sleep_seconds = min(2.0 ** (attempt - 1), backoff_cap_seconds)
     return _RetryDecision(
