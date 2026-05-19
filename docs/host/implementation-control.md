@@ -1394,6 +1394,7 @@ Plan 必须额外收口的 readiness review checklist：
 
 前置条件：
 - Phase 10.5 ordinary local multi-turn public contract freeze 已完成；P11 不得破坏 P10.5 已冻结的普通本地多轮 Host public interface / contract，若 Recovery 必须新增或调整 public API / 核心契约，必须先回到用户讨论。
+- Core Host Public Interface Freeze 已生效：P11 及后续返工不得修改、删除或重定义现有 `open_host(options)`、`OpenHostOptions` 现有字段、`Host` public handle 方法、public request / response dataclass 字段、`watch_session_events(session_id)` live-only 语义、`HostEvent` terminal final answer view，也不得重新公开 `start_run`、`create_host_command_handle`、`stream_run_events` 等低层入口。
 - P10.5 不证明 crash recovery，但已经冻结 Service 调用方式；P11 必须在同一 `open_host(...)` / session acquisition / `watch_session_events(...)` / public command contract 上补 recovery，不能要求真实 Service 改走另一套恢复入口。
 - Phase 5 dispatch record / LocalProxy 已完成。
 - Phase 2 host instance liveness foundation 已完成。
@@ -1458,6 +1459,7 @@ Plan 必须额外收口的 readiness review checklist：
 - Phase 1 Host public typing、`HostToolingOptions`、`ToolBundleSourceRef`、`ToolBundleSourceKind` 与 `FrameworkToolPolicyView` 已完成。
 - Phase 4 Host public API command path 已完成。
 - Phase 6 ToolRuntime / effective ToolBundle / framework tool policy 已完成。
+- Core Host Public Interface Freeze 已生效：P12 只能实现 Host 外部 runtime / Service assembly 能力，不得修改、删除或重定义现有 `dayu.host` public exports、`open_host(options)`、`OpenHostOptions` 现有字段、`Host` public handle 方法、public request / response dataclass 字段或 `watch_session_events(session_id)` live-only 语义。
 
 进入条件：
 - 确认 ToolsDiscovery / ScenePrepare 仍是 Host 外部装配能力，不拥有 Session / Run / Attempt / EventLog truth。
@@ -1473,6 +1475,7 @@ Plan 必须额外收口的 readiness review checklist：
 - 不实现业务财报工具扫描硬编码清单。
 - 不把财报 prompt 文案、业务 scene manifest 内容或 Fins storage 访问逻辑放入 `dayu.runtime`。
 - 不让 per-run request 携带 raw `ToolBundle` 或 callable binding。
+- 不新增 Host public command、Host handle method、Host opener option 或 Host request field；ToolsDiscovery / ScenePrepare 的 typed output 必须通过现有 `HostToolingOptions`、`SubmitFollowupRequest` 显式字段或 Host 外部 Service envelope 承接，不能把装配过程塞入 Host 状态机。
 
 关键设计问题：
 - 必须确认 ToolsDiscovery provider protocol 的最小 typed shape：provider identity、version / digest source refs、`ToolDefinition` collection output、duplicate name handling、reserved framework tool name conflict handling。
@@ -1522,6 +1525,7 @@ Plan 必须额外收口的 readiness review checklist：
 前置条件：
 - Phase 8 Projection Core / Host Event Stream / Minimal Read Model 已完成。
 - Phase 6 ToolRuntime diagnostic refs 已完成。
+- Core Host Public Interface Freeze 已生效：P13 不得修改、删除或重定义现有 `open_host(options)`、`OpenHostOptions` 现有字段、`Host` public handle 方法、public request / response dataclass 字段、`watch_session_events(session_id)` live-only 语义或 `HostEvent` terminal final answer view。
 
 进入条件：
 - 确认 Audit、Tool Trace、Outbox 只是 projection / sink，不参与 Host command path 成功条件，不反向成为恢复、resume、memory 或 Run 状态迁移真源。
@@ -1535,10 +1539,12 @@ Plan 必须额外收口的 readiness review checklist：
 - 不保证 channel delivery exactly-once。
 - 不让 terminal transaction 同步写 outbox 表。
 - 不把 tool trace JSONL 当作恢复、resume、memory 或 Run 状态迁移真源。
+- 不把 Outbox 合并进 `watch_session_events(...)`，不为 live watch 增加 cursor / replay 参数，不把 Outbox 变成完整 timeline / progress / reasoning 补读接口。
 
 关键设计问题：
 - 必须确认 tool trace hot JSON 与 cold JSONL 的最小字段，以及 provider request id / operation context refs 的查询口径。
 - 必须确认 Outbox item identity、UI / Service seen cursor 推荐语义、concrete Outbox read / drain API shape，以及 Outbox drain 与随后 / 并发 session live watch attach 的去重 / 防漏窗口。
+- Outbox read / drain API 是 Core Host Public Interface Freeze 之后唯一已知允许的 additive public extension；必须先经 design / plan gate 明确 shape、幂等、cursor / watermark、dedupe 与 Service ownership，且不得改变既有 Host core public contract。
 - 必须确认 LogAuditSink 路径注入、append-only JSONL、sink failure 和 purge tombstone 查询语义。
 
 交付物：
@@ -1580,6 +1586,7 @@ Plan 必须额外收口的 readiness review checklist：
 - Phase 5 LocalProxy semantic baseline 已完成。
 - Phase 6 ToolRuntime accept barrier 已完成。
 - Phase 11 recovery 与 positive orphan proof 已完成。
+- Core Host Public Interface Freeze 已生效：P14 只能替换 Host 内部 worker transport，不得修改、删除或重定义现有 `open_host(options)`、`OpenHostOptions` 现有字段、`Host` public handle 方法、public request / response dataclass 字段、`watch_session_events(session_id)` live-only 语义或 `HostEvent` terminal final answer view。
 
 进入条件：
 - 确认 remote phase 只定义并实现 transport，不改变 design 的 remote semantic contract。
@@ -1592,6 +1599,7 @@ Plan 必须额外收口的 readiness review checklist：
 - 不实现远端 worker 自治恢复。
 - 不保证 exactly-once 远程物理执行。
 - 不引入远端 lease / fencing owner。
+- 不新增 remote 专用 Host public command、remote 专用 Service-facing handle method 或 remote 专用 `OpenHostOptions` 必填字段；remote provider / endpoint / transport 装配必须通过既有 construction-time baseline、worker factory 或内部 composition contract 承接，若发现确需 public extension 必须先回到用户讨论。
 
 关键设计问题：
 - 必须确认 remote event id / ordering hint / retry / ack 的 typed transport contract。
@@ -1638,11 +1646,13 @@ Plan 必须额外收口的 readiness review checklist：
 
 前置条件：
 - Phase 8 projection core、Phase 11 recovery、Phase 13 Audit / Tool Trace / Outbox、Phase 14 remote 已完成。
+- Core Host Public Interface Freeze 已生效：P15 不得修改、删除或重定义现有 `open_host(options)`、`OpenHostOptions` 现有字段、`Host` public handle 方法、public request / response dataclass 字段、`watch_session_events(session_id)` live-only 语义或 `HostEvent` terminal final answer view。
 
 进入条件：
 - 确认第一版 release / PR 前必须关闭的 residual risk 与可接受 non-goals。
 - 先区分 release-blocking 与 follow-up items；如 projection rebuild tooling、stress / smoke tests 或 docs closeout scope 过大，必须拆出独立 phase 或后续 work unit。
 - 必须复核 Phase 4 已冻结的 `purge_session` public signature / `PurgeSessionResult` / idempotency contract；如需变更，先回到 Public API contract 讨论。
+- 必须复核 P13 additive Outbox read / drain API 是否已独立冻结；P15 只能验证和硬化，不得借 production closeout 重塑 Outbox 或 Host core public surface。
 
 范围：
 - 允许修改：`purge_session` command implementation、purge delete ranges、shared artifact ref check、projection rebuild tooling、audit tombstone query support、stress / smoke tests、README sync。
@@ -1652,6 +1662,7 @@ Plan 必须额外收口的 readiness review checklist：
 - 不实现 archive_session。
 - 不实现长期 retention policy UI。
 - 不把第一版 non-goals 偷偷变成实现目标。
+- 不新增 `archive_session`、长期 memory edit / reset / forget、public payload reader、`wait_final_answer(...)`、`get_run_result(...)` 或其它绕过 terminal `HostEvent` / Outbox terminal item 的 Service-facing捷径。
 
 关键设计问题：
 - 必须确认 purge 对 EventLog / payload / projection / outbox / tool trace hot data / audit JSONL 的最终清理矩阵。
