@@ -48,6 +48,9 @@ from dayu.host.durable.event_log import (
 from dayu.host.durable.errors import HostTransactionRetryExhaustedError
 from dayu.host.durable.liveness import (
     HostInstanceIdentity,
+    heartbeat_current_instance,
+    mark_current_instance_stopped,
+    mark_current_instance_stopping,
     register_current_instance,
 )
 from dayu.host.durable.run_transition import (
@@ -186,6 +189,7 @@ _LANE_OWNER_PREFIX = "host-dispatch"
 _GOVERNANCE_ACTOR = "host.context_governance"
 _GOVERNANCE_FAILURE_REASON = "pre_dispatch_context_governance"
 _COMPACT_FAILURE_POLICY_DECISION = "compact_failed_before_dispatch"
+_HOST_INSTANCE_HEARTBEAT_INTERVAL_SECONDS = 1.0
 _LOG_DRAIN_LOOP_IDLE = (
     "dispatch.drain_loop.idle host_handle_id=%s interval_seconds=%s"
 )
@@ -482,6 +486,7 @@ class HostDispatchScheduler:
         local_execution: HostLocalExecutionOptions,
         lane_controller: LaneController,
         host_handle_id: str,
+        host_instance_identity: HostInstanceIdentity | None = None,
         active_registry: ActiveWorkerRegistry | None = None,
         projection_catchup_port: ProjectionCatchupPort | None = None,
     ) -> None:
@@ -492,6 +497,8 @@ class HostDispatchScheduler:
         :param local_execution: 本地执行配置。
         :param lane_controller: 已打开的 runtime lane controller。
         :param host_handle_id: Host handle 诊断 id。
+        :param host_instance_identity: 当前 scheduler 的 Host instance 身份；
+            不传时创建仅供测试直接构造使用的身份。
         :param active_registry: active worker registry；不传时创建 scheduler 私有 registry。
         :param projection_catchup_port: commit 后 best-effort projection catch-up 端口。
         :returns: ``None``。
@@ -505,6 +512,11 @@ class HostDispatchScheduler:
         self._local_execution = local_execution
         self._lane_controller = lane_controller
         self._host_handle_id = host_handle_id
+        self._host_instance_identity = (
+            host_instance_identity
+            if host_instance_identity is not None
+            else _new_dispatch_host_instance_identity(host_handle_id)
+        )
         self._active_registry = (
             active_registry if active_registry is not None else ActiveWorkerRegistry()
         )
@@ -512,6 +524,7 @@ class HostDispatchScheduler:
         self._queue: asyncio.Queue[PendingDispatchRecord] = asyncio.Queue()
         self._promotion_queue: asyncio.Queue[str] = asyncio.Queue()
         self._closed = False
+        self._heartbeat_task: asyncio.Task[None] | None = None
         self._drain_task: asyncio.Task[None] | None = None
         self._promotion_drain_task: asyncio.Task[None] | None = None
         self._active_tasks: set[asyncio.Task[None]] = set()
@@ -540,6 +553,7 @@ class HostDispatchScheduler:
         :returns: 已打开 scheduler。
         """
 
+        host_identity = _new_dispatch_host_instance_identity(host_handle_id)
         lane_controller = await LaneController.open(
             [
                 LaneConfig(
@@ -560,12 +574,12 @@ class HostDispatchScheduler:
             owner=LaneOwner(
                 owner_id=f"{_LANE_OWNER_PREFIX}-{host_handle_id}",
                 pid=os.getpid(),
-                process_start_token=None,
+                process_start_token=host_identity.process_start_token,
             ),
         )
         _register_dispatch_host_instance(
             transaction_runner=transaction_runner,
-            host_handle_id=host_handle_id,
+            identity=host_identity,
         )
         _LOGGER.info(
             "dispatch.scheduler.opened host_handle_id=%s lane_name=%s "
@@ -574,15 +588,18 @@ class HostDispatchScheduler:
             local_execution.lane_name,
             local_execution.lane_capacity,
         )
-        return cls(
+        scheduler = cls(
             transaction_runner=transaction_runner,
             event_log_store=EventLogStore(),
             local_execution=local_execution,
             lane_controller=lane_controller,
             host_handle_id=host_handle_id,
+            host_instance_identity=host_identity,
             active_registry=active_registry,
             projection_catchup_port=projection_catchup_port,
         )
+        scheduler._start_host_instance_heartbeat()
+        return scheduler
 
     def wake_dispatch(self, record: PendingDispatchRecord) -> None:
         """唤醒 dispatch scheduler。
@@ -1520,6 +1537,7 @@ class HostDispatchScheduler:
         if self._closed:
             return
         self._closed = True
+        self._best_effort_mark_host_instance_stopping("scheduler_close")
         _LOGGER.info(
             "dispatch.scheduler.close_start host_handle_id=%s active_tasks=%s "
             "active_handles=%s",
@@ -1527,6 +1545,10 @@ class HostDispatchScheduler:
             len(self._active_tasks),
             len(self._active_handles),
         )
+        heartbeat_task = self._heartbeat_task
+        if heartbeat_task is not None:
+            heartbeat_task.cancel()
+            await _suppress_task_cancel(heartbeat_task)
         task = self._drain_task
         if task is not None:
             task.cancel()
@@ -1542,10 +1564,131 @@ class HostDispatchScheduler:
             await _suppress_task_cancel(active_task)
         await self._lane_controller.close(reason="scheduler_close")
         self._duplicate_governance_registry.clear_all()
+        self._best_effort_mark_host_instance_stopped("scheduler_close")
         _LOGGER.info(
             "dispatch.scheduler.close_done host_handle_id=%s",
             self._host_handle_id,
         )
+
+    def _start_host_instance_heartbeat(self) -> None:
+        """启动当前 Host instance heartbeat 后台任务。
+
+        :returns: ``None``。
+        :raises Exception: 不主动抛出异常。
+        """
+
+        if self._heartbeat_task is None or self._heartbeat_task.done():
+            self._heartbeat_task = asyncio.create_task(
+                self._host_instance_heartbeat_loop()
+            )
+
+    async def _host_instance_heartbeat_loop(self) -> None:
+        """后台刷新当前 Host instance heartbeat。
+
+        :returns: ``None``。
+        :raises asyncio.CancelledError: scheduler close 时透传取消。
+        """
+
+        try:
+            while not self._closed:
+                await asyncio.sleep(_HOST_INSTANCE_HEARTBEAT_INTERVAL_SECONDS)
+                if self._closed:
+                    break
+                try:
+                    self._refresh_current_host_instance_heartbeat()
+                except HostTransactionRetryExhaustedError as exc:
+                    _LOGGER.warning(
+                        "dispatch.host_instance_heartbeat.refresh_retryable "
+                        "host_handle_id=%s host_instance_id=%s error_type=%s "
+                        "attempts=%s",
+                        self._host_handle_id,
+                        self._host_instance_identity.host_instance_id,
+                        exc.__class__.__name__,
+                        exc.attempts,
+                        exc_info=True,
+                    )
+                except Exception as exc:
+                    _LOGGER.error(
+                        "dispatch.host_instance_heartbeat.fatal_exit "
+                        "host_handle_id=%s host_instance_id=%s error_type=%s",
+                        self._host_handle_id,
+                        self._host_instance_identity.host_instance_id,
+                        exc.__class__.__name__,
+                        exc_info=True,
+                    )
+                    self._best_effort_mark_host_instance_stopping(
+                        "heartbeat_fatal_exit"
+                    )
+                    return
+        except asyncio.CancelledError:
+            _LOGGER.debug(
+                "dispatch.host_instance_heartbeat.cancelled host_handle_id=%s "
+                "host_instance_id=%s",
+                self._host_handle_id,
+                self._host_instance_identity.host_instance_id,
+            )
+            raise
+
+    def _refresh_current_host_instance_heartbeat(self) -> None:
+        """刷新当前 scheduler 自己的 Host instance heartbeat。
+
+        :returns: ``None``。
+        :raises HostTransactionRetryExhaustedError: heartbeat write 重试耗尽时抛出。
+        :raises Exception: durable write 失败时透传。
+        """
+
+        def _operation(transaction: HostTransaction) -> None:
+            heartbeat_current_instance(transaction, self._host_instance_identity)
+
+        self._transaction_runner.run_write(_operation)
+
+    def _best_effort_mark_host_instance_stopping(self, reason: str) -> None:
+        """best-effort 将当前 scheduler 自己的 instance 标记为 stopping。
+
+        :param reason: 诊断原因。
+        :returns: ``None``。
+        :raises Exception: 不主动抛出异常。
+        """
+
+        def _operation(transaction: HostTransaction) -> None:
+            mark_current_instance_stopping(transaction, self._host_instance_identity)
+
+        try:
+            self._transaction_runner.run_write(_operation)
+        except Exception as exc:
+            _LOGGER.warning(
+                "dispatch.host_instance.mark_stopping_failed host_handle_id=%s "
+                "host_instance_id=%s reason=%s error_type=%s",
+                self._host_handle_id,
+                self._host_instance_identity.host_instance_id,
+                reason,
+                exc.__class__.__name__,
+                exc_info=True,
+            )
+
+    def _best_effort_mark_host_instance_stopped(self, reason: str) -> None:
+        """best-effort 将当前 scheduler 自己的 instance 标记为 stopped。
+
+        :param reason: 诊断原因。
+        :returns: ``None``。
+        :raises Exception: 不主动抛出异常。
+        """
+
+        def _operation(transaction: HostTransaction) -> None:
+            mark_current_instance_stopped(transaction, self._host_instance_identity)
+
+        try:
+            self._transaction_runner.run_write(_operation)
+        except Exception as exc:
+            _LOGGER.warning(
+                "dispatch.host_instance.mark_stopped_failed host_handle_id=%s "
+                "host_instance_id=%s reason=%s error_type=%s",
+                self._host_handle_id,
+                self._host_instance_identity.host_instance_id,
+                reason,
+                exc.__class__.__name__,
+                exc_info=True,
+            )
 
     async def _drain_loop(self) -> None:
         """后台 drain 队列。
@@ -2949,26 +3092,40 @@ def _selected_tool_names_from_effective_tool_set(
 def _register_dispatch_host_instance(
     *,
     transaction_runner: HostTransactionRunner,
-    host_handle_id: str,
+    identity: HostInstanceIdentity,
 ) -> None:
     """注册 dispatch owner_host_instance_id 的 FK 诊断 row。
 
     :param transaction_runner: Host durable transaction runner。
-    :param host_handle_id: Host handle 诊断 id。
+    :param identity: 当前 scheduler 的 Host instance 身份。
     :returns: ``None``。
+    :raises Exception: durable write 失败时透传。
     """
-
-    identity = HostInstanceIdentity(
-        host_instance_id=host_handle_id,
-        pid=os.getpid(),
-        process_start_token=f"dispatch-{host_handle_id}",
-        boot_id=None,
-    )
 
     def _operation(transaction: HostTransaction) -> None:
         register_current_instance(transaction, identity)
 
     transaction_runner.run_write(_operation)
+
+
+def _new_dispatch_host_instance_identity(
+    host_handle_id: str,
+) -> HostInstanceIdentity:
+    """创建 dispatch scheduler 的 Host instance 身份。
+
+    :param host_handle_id: Host handle 诊断 id。
+    :returns: HostInstanceIdentity。
+    :raises ValueError: ``host_handle_id`` 为空时抛出。
+    """
+
+    if host_handle_id.strip() == "":
+        raise ValueError("host_handle_id must be non-empty")
+    return HostInstanceIdentity(
+        host_instance_id=host_handle_id,
+        pid=os.getpid(),
+        process_start_token=uuid4().hex,
+        boot_id=None,
+    )
 
 
 def _safe_cancel_worker_handle(handle: LocalWorkerHandle, reason: str) -> None:

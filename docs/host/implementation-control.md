@@ -268,6 +268,12 @@ Phase Map 中每个 phase 必须使用统一条目格式。模板如下：
 
 当前 gate 追加事实（Phase 11 accepted plan）：Phase 11 plan fix artifact 为 `docs/reviews/phase11-plan-fix-codex-20260519.md`，只修改 `docs/host/phase11-host-lifecycle-recovery-plan.md`，结论 `PLAN_FIX_COMPLETE`。Plan re-review artifacts 为 `docs/reviews/phase11-plan-rereview-mimo-20260519.md` 与 `docs/reviews/phase11-plan-rereview-ds-20260519.md`，两份均 PASS，blocking count = 0，确认所有 accepted plan findings 已收口且无新增 blocker。Controller re-review adjudication artifact 为 `docs/reviews/phase11-plan-rereview-controller-adjudication-20260519.md`；总控裁决：接受 Phase 11 implementation-ready plan。当前进入 accepted plan local commit，随后进入 Phase 11 Slice 1 implementation。
 
+当前 gate 追加事实（Phase 11 accepted plan commit）：Accepted plan local commit hash 为 `9223cbf`。当前进入 Phase 11 Slice 1 implementation。
+
+当前 gate 追加事实（Phase 11 Slice 1 implementation）：Phase 11 Slice 1 implementation artifact 为 `docs/reviews/phase11-slice1-implementation-codex-20260519.md`；implementation agent 更新 Host instance lifecycle、process proof / orphan classifier foundation、dispatch heartbeat lifecycle、相关 tests 与 `dayu/host/README.md`。Agent reported focused tests `tests/host/test_host_instance_liveness.py tests/host/test_recovery_orphan_classifier.py` passed with 30 tests, extra regression `tests/host/test_dispatch_scheduler.py::test_scheduler_close_suppresses_handle_close_exception` passed, `pyright dayu/host tests/host` returned 0 errors, and `git diff --check` clean。Controller 本地复跑同一验证通过。当前进入 Phase 11 Slice 1 code review。
+
+当前 gate 追加事实（Phase 11 Slice 1 code review accepted）：Phase 11 Slice 1 code review artifacts 为 `docs/reviews/phase11-slice1-code-review-mimo-20260519.md` 与 `docs/reviews/phase11-slice1-code-review-ds-20260519.md`，两份均 PASS，blocking count = 0。Controller adjudication artifact 为 `docs/reviews/phase11-slice1-code-review-controller-adjudication-20260519.md`；总控裁决：不进入 current fix pass。DS heartbeat catch-all finding rejected-current-fix / accepted as observation，heartbeat interval deferred to Slice 2 stale-threshold policy，timezone guard finding rejected-current-fix。当前进入 accepted Slice 1 local commit。
+
 ## Phase Map
 
 Phase 按依赖关系推进：先实现被其它阶段依赖的公共契约、runtime 基础能力、durable store、EventLog 与状态机，再连接执行路径、工具治理、projection core、memory、context governance、ordinary local multi-turn public contract freeze、recovery 与 remote。Audit、Tool Trace、Outbox 是独立 projection sinks，后置到核心治理路径稳定之后实现。Phase 0 是 Engine cleanup 前置 work unit，只阻塞 Phase 10 Context Governance，不阻塞 Phase 1-9。每个 phase 开始时仍必须先和用户讨论并细化对应 `docs/host/design.md` 章节，再生成 handoff implementation-ready plan。

@@ -7,6 +7,7 @@ from pathlib import Path
 
 import pytest
 
+from dayu.host.dispatch import _new_dispatch_host_instance_identity
 from dayu.host.durable.connection import open_host_durable_store
 from dayu.host.durable.errors import (
     HostInstanceIdentityConflictError,
@@ -194,7 +195,7 @@ def test_register_inserts_running_instance_with_timestamps(
 def test_repeated_register_same_identity_refreshes_heartbeat_and_status(
     tmp_path: Path,
 ) -> None:
-    """同一 identity 重复 register 会幂等刷新 heartbeat 与 running status。"""
+    """RUNNING 同一 identity 重复 register 会幂等刷新 heartbeat。"""
 
     identity = _identity()
     with open_host_durable_store(_options(tmp_path)) as store:
@@ -209,21 +210,6 @@ def test_repeated_register_same_identity_refreshes_heartbeat_and_status(
             return register_current_instance(transaction, identity).created_at
 
         created_at = store.transaction_runner.run_write(first_operation)
-
-        def mark_operation(transaction: HostTransaction) -> HostInstanceStatus | None:
-            """先标记 stopping。
-
-            :param transaction: Host transaction。
-            :returns: 更新后的 status。
-            """
-
-            row = mark_current_instance_stopping(transaction, identity)
-            return None if row is None else row.status
-
-        assert (
-            store.transaction_runner.run_write(mark_operation)
-            is HostInstanceStatus.STOPPING
-        )
 
         def second_operation(
             transaction: HostTransaction,
@@ -243,6 +229,41 @@ def test_repeated_register_same_identity_refreshes_heartbeat_and_status(
         assert refreshed_created_at == created_at
         assert heartbeat_at != ""
         assert status is HostInstanceStatus.RUNNING
+
+
+def test_stopping_instance_register_does_not_revert_to_running(
+    tmp_path: Path,
+) -> None:
+    """STOPPING 不能被 repeated register 回刷为 RUNNING。
+
+    :param tmp_path: pytest 临时目录。
+    :returns: ``None``。
+    :raises AssertionError: 回归断言失败时由 pytest 抛出。
+    """
+
+    identity = _identity()
+    with open_host_durable_store(_options(tmp_path)) as store:
+        store.transaction_runner.run_write(
+            lambda transaction: register_current_instance(transaction, identity)
+        )
+        store.transaction_runner.run_write(
+            lambda transaction: mark_current_instance_stopping(
+                transaction, identity
+            )
+        )
+
+        with pytest.raises(HostInstanceLifecycleConflictError):
+            store.transaction_runner.run_write(
+                lambda transaction: register_current_instance(transaction, identity)
+            )
+
+        row = store.transaction_runner.run_write(
+            lambda transaction: read_host_instance(
+                transaction, identity.host_instance_id
+            )
+        )
+        assert row is not None
+        assert row.status is HostInstanceStatus.STOPPING
 
 
 @pytest.mark.parametrize(
@@ -652,3 +673,20 @@ def test_read_returns_typed_row_and_liveness_is_not_orphan_proof(
             "token-1",
             HostInstanceStatus.RUNNING,
         )
+
+
+def test_dispatch_host_instance_identity_uses_high_entropy_token() -> None:
+    """dispatch Host instance token 独立于 handle id，且不再使用可预测占位。
+
+    :returns: ``None``。
+    :raises AssertionError: token 生成回归时由 pytest 抛出。
+    """
+
+    first = _new_dispatch_host_instance_identity("host-dispatch-token-test")
+    second = _new_dispatch_host_instance_identity("host-dispatch-token-test")
+    assert first.host_instance_id == "host-dispatch-token-test"
+    assert first.process_start_token != "host-dispatch-token-test"
+    assert first.process_start_token != "dispatch-host-dispatch-token-test"
+    assert first.process_start_token != second.process_start_token
+    assert len(first.process_start_token) == 32
+    assert int(first.process_start_token, 16) >= 0
