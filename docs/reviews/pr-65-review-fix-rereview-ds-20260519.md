@@ -21,7 +21,7 @@ Fix requirement: remove the trailing whitespace, branch-level whitespace check m
 
 **Commit `17f9d96` diff (excerpt)**:
 ```diff
--**判定**: 
+-**判定**:
 +**判定**:
 ```
 
