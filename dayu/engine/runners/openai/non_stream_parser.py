@@ -58,6 +58,9 @@ _FINISH_REASON_MAP: dict[str, FinishReason] = {
 }
 
 _LOGGER: logging.Logger = logging.getLogger(__name__)
+_ERROR_FIELD: str = "error"
+_ERROR_MESSAGE_FIELD: str = "message"
+_PROVIDER_ERROR_CODE: str = "non_stream_provider_error"
 
 _NonStreamRunnerEventData: TypeAlias = (
     RunnerContentCompletedData
@@ -210,6 +213,26 @@ def _emit_from_dict(
     :raises Exception: 不主动抛出异常。
     """
 
+    if _ERROR_FIELD in parsed:
+        _LOGGER.warning(
+            "non_stream.protocol_error code=%s", _PROVIDER_ERROR_CODE
+        )
+        yield _make_event(
+            RunnerProtocolErrorData(
+                error_code=_PROVIDER_ERROR_CODE,
+                message=_provider_error_message(parsed[_ERROR_FIELD]),
+                provider_request_id=provider_request_id,
+                raw_payload=dict(parsed),
+            )
+        )
+        yield _make_event(
+            RunnerDoneData(
+                finish_reason=FinishReason.ERROR,
+                provider_request_id=provider_request_id,
+            )
+        )
+        return
+
     choices = parsed.get("choices")
     if not isinstance(choices, list) or not choices:
         yield _make_event(
@@ -329,6 +352,23 @@ def _emit_from_dict(
             provider_request_id=provider_request_id,
         )
     )
+
+
+def _provider_error_message(error_payload: JsonValue) -> str:
+    """从 provider error payload 中提取有界错误摘要。
+
+    :param error_payload: provider 返回的 ``error`` 字段。
+    :returns: 人类可读错误摘要。
+    :raises Exception: 不主动抛出异常。
+    """
+
+    if isinstance(error_payload, str) and error_payload.strip() != "":
+        return error_payload
+    if isinstance(error_payload, dict):
+        message = error_payload.get(_ERROR_MESSAGE_FIELD)
+        if isinstance(message, str) and message.strip() != "":
+            return message
+    return "non-stream provider returned an error object"
 
 
 def _resolve_finish_reason(choice: dict[str, JsonValue]) -> FinishReason:

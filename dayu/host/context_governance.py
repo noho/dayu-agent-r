@@ -451,11 +451,12 @@ def _open_questions_retained(candidate: CompactionCandidate) -> bool:
     :returns: 当前候选未丢失 open questions 时返回 ``True``。
     """
 
-    return (
-        len(candidate.episode_summary_candidate.open_questions) > 0
-        or candidate.pinned_state_patch_candidate.open_questions.operation
-        is not PinnedPatchOperation.MISSING
-    )
+    if len(candidate.episode_summary_candidate.open_questions) > 0:
+        return True
+    patch = candidate.pinned_state_patch_candidate.open_questions
+    if patch.operation is PinnedPatchOperation.REPLACE:
+        return patch.value is not None and len(patch.value) > 0
+    return False
 
 
 __all__ = ["check_compaction_candidate"]

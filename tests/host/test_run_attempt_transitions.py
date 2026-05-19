@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import json
 from dataclasses import dataclass
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from typing import cast
 
@@ -44,10 +44,12 @@ from dayu.host.durable.run_transition import (
     CreateQueuedRunInput,
     CreateRunningRunInput,
     PromoteQueuedRunInput,
+    StartupOrphanCloseInput,
     TerminalCloseoutInput,
     accept_worker_running_in_transaction,
     cancel_predispatch_starting_in_transaction,
     cancel_queued_in_transaction,
+    close_startup_orphan_attempt_in_transaction,
     create_queued_run_in_transaction,
     create_running_run_with_starting_attempt_in_transaction,
     promote_queued_run_in_transaction,
@@ -1539,6 +1541,134 @@ def test_rollback_prevents_partial_event_and_state_persistence(
         assert store.transaction_runner.run_write(verify) == (0, 0)
 
 
+def test_startup_orphan_closeout_marks_attempt_lost_then_run_recovering(
+    tmp_path: Path,
+) -> None:
+    """startup orphan closeout 同事务按序写 ATTEMPT_LOST 与 RUN_RECOVERING。"""
+
+    with open_host_durable_store(_options(tmp_path)) as store:
+        seeded = _seed_running_run(store, tmp_path)
+
+        def operation(transaction: HostTransaction) -> tuple[str, str, tuple[str, ...]]:
+            """执行 startup orphan recoverable closeout。
+
+            :param transaction: Host transaction。
+            :returns: Run 状态、Attempt 状态、事件序列。
+            """
+
+            _mark_dispatching_tx(transaction, seeded.attempt_id)
+            _make_host_instance_stale_tx(transaction)
+            result = close_startup_orphan_attempt_in_transaction(
+                transaction,
+                EventLogStore(),
+                _startup_orphan_input(
+                    expected_run_status=RunStatus.RUNNING,
+                    expected_attempt_status=AttemptStatus.STARTING,
+                    recoverable=True,
+                    reason="startup_orphan_attempt_lost",
+                    owner_heartbeat_at="2026-05-14T01:01:00.000000Z",
+                ),
+            )
+            assert result.run is not None
+            assert result.attempt is not None
+            return (
+                result.run.status.value,
+                result.attempt.status.value,
+                _event_types(transaction),
+            )
+
+        run_status, attempt_status, event_types = store.transaction_runner.run_write(
+            operation
+        )
+        assert run_status == RunStatus.RECOVERING.value
+        assert attempt_status == AttemptStatus.LOST.value
+        assert event_types[-2:] == (
+            _EVENT_TYPE_ATTEMPT_LOST,
+            _EVENT_TYPE_RUN_RECOVERING,
+        )
+
+
+def test_startup_orphan_closeout_cas_rechecks_owner_heartbeat(
+    tmp_path: Path,
+) -> None:
+    """owner heartbeat 不再 stale 时 startup orphan closeout 不写事件或状态。"""
+
+    with open_host_durable_store(_options(tmp_path)) as store:
+        seeded = _seed_running_run(store, tmp_path)
+
+        def operation(transaction: HostTransaction) -> tuple[str, int]:
+            """用最新 heartbeat 验证 CAS recheck 失败。
+
+            :param transaction: Host transaction。
+            :returns: mutation 状态与 ATTEMPT_LOST 事件数。
+            """
+
+            _mark_dispatching_tx(transaction, seeded.attempt_id)
+            result = close_startup_orphan_attempt_in_transaction(
+                transaction,
+                EventLogStore(),
+                _startup_orphan_input(
+                    expected_run_status=RunStatus.RUNNING,
+                    expected_attempt_status=AttemptStatus.STARTING,
+                    recoverable=True,
+                    reason="startup_orphan_attempt_lost",
+                    owner_heartbeat_at="2026-05-14T01:02:03.000000Z",
+                ),
+            )
+            return (
+                result.status.value,
+                _count_events(transaction, _EVENT_TYPE_ATTEMPT_LOST),
+            )
+
+        assert store.transaction_runner.run_write(operation) == (
+            StateMutationStatus.INVALID_STATE.value,
+            0,
+        )
+
+
+def test_startup_orphan_closeout_preserves_fractional_stale_threshold(
+    tmp_path: Path,
+) -> None:
+    """startup orphan CAS 使用与 classifier 一致的亚秒 stale 阈值。"""
+
+    with open_host_durable_store(_options(tmp_path)) as store:
+        seeded = _seed_running_run(store, tmp_path)
+
+        def operation(transaction: HostTransaction) -> tuple[str, int]:
+            """用亚秒边界验证 stale threshold 不被取整。
+
+            :param transaction: Host transaction。
+            :returns: mutation 状态与 ATTEMPT_LOST 事件数。
+            """
+
+            _mark_dispatching_tx(transaction, seeded.attempt_id)
+            _set_host_instance_heartbeat_tx(
+                transaction,
+                "2026-05-14T01:01:32.750000Z",
+            )
+            result = close_startup_orphan_attempt_in_transaction(
+                transaction,
+                EventLogStore(),
+                _startup_orphan_input(
+                    expected_run_status=RunStatus.RUNNING,
+                    expected_attempt_status=AttemptStatus.STARTING,
+                    recoverable=True,
+                    reason="startup_orphan_attempt_lost",
+                    owner_heartbeat_at="2026-05-14T01:01:32.750000Z",
+                    stale_after=timedelta(seconds=30, milliseconds=500),
+                ),
+            )
+            return (
+                result.status.value,
+                _count_events(transaction, _EVENT_TYPE_ATTEMPT_LOST),
+            )
+
+        assert store.transaction_runner.run_write(operation) == (
+            StateMutationStatus.INVALID_STATE.value,
+            0,
+        )
+
+
 def _seed_running_run(
     store: HostDurableStore, tmp_path: Path
 ) -> _SeededRunningRun:
@@ -1869,10 +1999,84 @@ def _ensure_host_instance_tx(transaction: HostTransaction) -> None:
             1,
             "process-start-token",
             None,
-            "2026-05-14T01:02:03Z",
-            "2026-05-14T01:02:03Z",
+            "2026-05-14T01:02:03.000000Z",
+            "2026-05-14T01:02:03.000000Z",
             "running",
         ),
+    )
+
+
+def _make_host_instance_stale_tx(transaction: HostTransaction) -> None:
+    """将测试 Host instance heartbeat 改成 stale。
+
+    :param transaction: Host transaction。
+    :returns: ``None``。
+    """
+
+    _set_host_instance_heartbeat_tx(transaction, "2026-05-14T01:01:00.000000Z")
+
+
+def _set_host_instance_heartbeat_tx(
+    transaction: HostTransaction, heartbeat_at: str
+) -> None:
+    """设置测试 Host instance heartbeat。
+
+    :param transaction: Host transaction。
+    :param heartbeat_at: 目标 heartbeat timestamp。
+    :returns: ``None``。
+    """
+
+    transaction.execute(
+        """
+        UPDATE host_instances
+        SET heartbeat_at = ?
+        WHERE host_instance_id = ?
+        """,
+        (heartbeat_at, "host-instance-1"),
+    )
+
+
+def _startup_orphan_input(
+    *,
+    expected_run_status: RunStatus,
+    expected_attempt_status: AttemptStatus,
+    recoverable: bool,
+    reason: str,
+    owner_heartbeat_at: str,
+    stale_after: timedelta = timedelta(seconds=30),
+) -> StartupOrphanCloseInput:
+    """构造 startup orphan closeout 输入。
+
+    :param expected_run_status: 期望 Run 状态。
+    :param expected_attempt_status: 期望 Attempt 状态。
+    :param recoverable: 是否进入 recovering。
+    :param reason: closeout reason。
+    :param owner_heartbeat_at: classifier 使用的 owner heartbeat timestamp。
+    :param stale_after: classifier 使用的 stale 阈值。
+    :returns: StartupOrphanCloseInput。
+    """
+
+    return StartupOrphanCloseInput(
+        run_id="run-1",
+        expected_run_status=expected_run_status,
+        attempt_id="attempt-run-1",
+        expected_attempt_status=expected_attempt_status,
+        execution_id="execution-run-1",
+        dispatch_record_id="dispatch-run-1",
+        expected_dispatch_status=DispatchRecordStatus.DISPATCHING,
+        owner_host_instance_id="host-instance-1",
+        owner_heartbeat_at=owner_heartbeat_at,
+        stale_after=stale_after,
+        recoverable=recoverable,
+        attempt_lost_event_id="event-attempt-lost-startup",
+        run_close_event_id="event-run-close-startup",
+        occurred_at=_NOW,
+        actor="host_recovery",
+        source="pytest",
+        reason=reason,
+        orphan_proof_reason="owner_pid_missing",
+        observed_process_start_token=None,
+        observed_boot_id=None,
     )
 
 
@@ -1988,6 +2192,8 @@ _EVENT_TYPE_RUN_ACCEPTED = "RUN_ACCEPTED"
 _EVENT_TYPE_RUN_QUEUED = "RUN_QUEUED"
 _EVENT_TYPE_RUN_STARTED = "RUN_STARTED"
 _EVENT_TYPE_ATTEMPT_STARTED = "ATTEMPT_STARTED"
+_EVENT_TYPE_ATTEMPT_LOST = "ATTEMPT_LOST"
+_EVENT_TYPE_RUN_RECOVERING = "RUN_RECOVERING"
 _EVENT_TYPE_ATTEMPT_SUCCEEDED = "ATTEMPT_SUCCEEDED"
 _EVENT_TYPE_RUN_SUCCEEDED = "RUN_SUCCEEDED"
 _EVENT_TYPE_RUN_CANCELLING = "RUN_CANCELLING"

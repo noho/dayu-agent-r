@@ -328,6 +328,30 @@ def test_event_sequence_monotonic_and_reuse_has_canonical_governance_only(
         ]
 
 
+def test_duplicate_allow_does_not_append_governed_event(tmp_path: Path) -> None:
+    """duplicate allow 只是允许继续执行，不写治理事实污染 event stream。"""
+
+    with open_host_durable_store(_options(tmp_path)) as store:
+        seeded = _seed_active_run(store.transaction_runner)
+        accept_port = DefaultHostToolFactAcceptPort(
+            transaction_runner=store.transaction_runner
+        )
+        candidate = replace(
+            _completed_candidate(seeded, tool_call_id="tool-call-allow"),
+            duplicate_key="duplicate-lookup-MSFT",
+            duplicate_decision=DuplicateDecisionKind.ALLOW,
+        )
+
+        result = accept_port.accept_tool_fact(candidate)
+        tool_events = _tool_events(store.transaction_runner)
+
+        assert isinstance(result, ToolFactAcceptedAck)
+        assert [row.event_type for row in tool_events] == [
+            "TOOL_CALL_REQUESTED",
+            "TOOL_RESULT_ACCEPTED",
+        ]
+
+
 def test_failed_cancelled_and_governed_error_are_accepted_as_result_facts(
     tmp_path: Path,
 ) -> None:

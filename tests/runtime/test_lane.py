@@ -1157,3 +1157,80 @@ async def test_concurrent_acquire_keeps_capacity_invariant(
     for outcome in acquired:
         await outcome.token.release()
     await controller.close()
+
+
+@pytest.mark.asyncio
+async def test_close_wakes_pending_acquire_and_rejects_new_claims(
+    tmp_path: Path,
+) -> None:
+    """close 必须唤醒 pending acquire，释放 active claim，并阻止新 claim。"""
+
+    db_path = tmp_path / "runtime_lanes.sqlite3"
+    controller = await LaneController.open(
+        [_lane_config(capacity=1)],
+        coordinator=SQLiteLaneCoordinatorConfig(
+            db_path=db_path,
+            busy_timeout_seconds=1.0,
+            poll_interval_seconds=10.0,
+        ),
+    )
+    first = await controller.acquire(_LANE_NAME, timeout_seconds=0)
+    assert isinstance(first, LaneAcquired)
+
+    waiter = asyncio.create_task(controller.acquire(_LANE_NAME))
+    await asyncio.sleep(_FAST_POLL_SECONDS)
+    await controller.close(reason="close-race")
+    outcome = await asyncio.wait_for(waiter, timeout=_SHORT_TIMEOUT_SECONDS)
+
+    assert isinstance(outcome, LaneAcquireCancelled)
+    assert outcome.reason == "close-race"
+    assert first.token.released is True
+    assert _claim_count(db_path) == 0
+    with pytest.raises(RuntimeLaneClosedError):
+        await controller.acquire(_LANE_NAME, timeout_seconds=0)
+
+
+@pytest.mark.asyncio
+async def test_close_during_slow_acquire_releases_untracked_claim(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """close 与 claim 事务并发时不得泄漏 active claim count。"""
+
+    db_path = tmp_path / "runtime_lanes.sqlite3"
+    controller = await LaneController.open(
+        [_lane_config(capacity=1)],
+        coordinator=_coordinator(db_path),
+    )
+    claim_started = Event()
+    finish_claim = Event()
+    original_try_claim_once_sync = controller._try_claim_once_sync
+
+    def slow_try_claim_once_sync(lane_config: LaneConfig) -> _ClaimAttempt:
+        """阻塞 claim 线程，稳定制造 close/acquire 并发。
+
+        :param lane_config: lane 配置。
+        :returns: claim 尝试结果。
+        """
+
+        claim_started.set()
+        assert finish_claim.wait(_THREAD_EVENT_TIMEOUT_SECONDS) is True
+        return original_try_claim_once_sync(lane_config)
+
+    monkeypatch.setattr(
+        controller,
+        "_try_claim_once_sync",
+        slow_try_claim_once_sync,
+    )
+
+    acquire_task = asyncio.create_task(controller.acquire(_LANE_NAME))
+    await _wait_for_thread_event(claim_started)
+    await controller.close(reason="close-during-claim")
+    finish_claim.set()
+    outcome = await asyncio.wait_for(acquire_task, timeout=1.0)
+
+    assert isinstance(outcome, LaneAcquireCancelled)
+    assert outcome.reason == "close-during-claim"
+    assert _claim_count(db_path) == 0
+    with pytest.raises(RuntimeLaneClosedError):
+        await controller.acquire(_LANE_NAME, timeout_seconds=0)

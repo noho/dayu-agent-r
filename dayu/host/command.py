@@ -552,7 +552,7 @@ def cancel_run(
     """取消单个 Run，并返回最新 Run snapshot。
 
     当前覆盖 queued、pre-dispatch ``STARTING``、pre-accept dispatching、
-    active worker 与 ``WAITING``；``RECOVERING`` 取消由 Phase 11 负责。
+    active worker、``WAITING`` 与 ``RECOVERING``。
 
     :param host: Host command handle。
     :param run_id: 目标 Run id。
@@ -607,7 +607,7 @@ def cancel_session_runs(
     """取消指定 Session 下当前支持子集中的所有非终态 Run。
 
     当前覆盖 queued、pre-dispatch ``STARTING``、pre-accept dispatching、
-    active worker 与 ``WAITING``；``RECOVERING`` 取消由 Phase 11 负责。
+    active worker、``WAITING`` 与 ``RECOVERING``。
 
     :param host: Host command handle。
     :param session_id: 目标 Session id。
@@ -1229,10 +1229,7 @@ class _IsDeferredCancelStateOperation:
         run = read_run_by_id(transaction, self.run_id)
         if run is None:
             return False
-        if run.status in (
-            RunStatus.WAITING,
-            RunStatus.RECOVERING,
-        ):
+        if run.status == RunStatus.WAITING:
             return True
         if run.status not in (RunStatus.RUNNING, RunStatus.CANCELLING):
             return False

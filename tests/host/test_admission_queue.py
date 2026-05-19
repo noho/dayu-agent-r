@@ -643,10 +643,10 @@ def test_same_idempotency_key_with_changed_input_digest_conflicts(
         assert _event_count(store.transaction_runner) == before
 
 
-def test_reject_and_attach_active_conflict_with_accepted_active(
+def test_reject_conflicts_and_attach_active_returns_accepted_active(
     tmp_path: Path,
 ) -> None:
-    """accepted active 上 reject / attach_active 都 conflict 且不写 side effect。"""
+    """accepted active 上 reject conflict，attach_active 返回现有 Run。"""
 
     with open_host_durable_store(_options(tmp_path)) as store:
         session_id = _ensure_session_id(store.transaction_runner)
@@ -668,18 +668,21 @@ def test_reject_and_attach_active_conflict_with_accepted_active(
                 caller_semantic_digest=_CALLER_DIGEST,
             )
 
-        with pytest.raises(HostApiError) as attach_error:
-            service.start_run(
-                _start_request(
-                    session_id=session_id,
-                    client_request_id="start-attach",
-                    queue_policy="attach_active",
-                ),
-                caller_semantic_digest=_CALLER_DIGEST,
-            )
+        attached = service.start_run(
+            _start_request(
+                session_id=session_id,
+                client_request_id="start-attach",
+                queue_policy="attach_active",
+            ),
+            caller_semantic_digest=_CALLER_DIGEST,
+        )
 
         assert reject_error.value.code == HostApiErrorCode.CONFLICT
-        assert attach_error.value.code == HostApiErrorCode.CONFLICT
+        assert attached.run.run_id == active.run.run_id
+        assert attached.run.status == RunStatus.ACCEPTED
+        assert attached.attempt is None
+        assert attached.dispatch_record is None
+        assert attached.attached_active is True
         assert _event_count(store.transaction_runner) == before_events
         assert active.run.status == RunStatus.ACCEPTED
         assert _count_rows(store.transaction_runner, "idempotency_records") == (

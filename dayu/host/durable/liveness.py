@@ -41,7 +41,6 @@ class HostInstanceStatus(StrEnum):
 
 _REGISTER_RUNNING_SOURCE_STATUSES = (
     HostInstanceStatus.RUNNING,
-    HostInstanceStatus.STOPPING,
 )
 _HEARTBEAT_SOURCE_STATUSES = (HostInstanceStatus.RUNNING,)
 _STOPPING_SOURCE_STATUSES = (HostInstanceStatus.RUNNING,)

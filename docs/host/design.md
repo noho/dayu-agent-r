@@ -2737,6 +2737,14 @@ Host startup
 - `RUNNING` / `CANCELLING` 且只能判断 owner heartbeat stale，但无法证明 owner 进程已死：记录 suspect / diagnostic，跳过 recovery。
 - `RECOVERING`：继续按 recovery policy 创建新 Attempt，或因超过上限进入 `LOST`。
 
+Phase 11 第一版 startup recovery policy：
+
+- `ACCEPTED`、`QUEUED` 与 `WAITING` 都不是 orphan Attempt，不得因 Host startup scan 被推进到 `RECOVERING`。
+- `RUNNING` / `CANCELLING` 的旧 Attempt 只有在 positive orphan proof 成立后才能写入 `ATTEMPT_LOST`；随后如果用户输入、payload descriptor、tool fact reuse policy、memory / compact input refs 等必要 canonical facts 足以重建 messages，则 Run 进入 `RECOVERING`，否则进入 `LOST`。
+- `RECOVERING` Run 在未被用户取消且未超过 recovery policy 上限时，创建新的 Attempt 与新的 `execution_id`，并以 `RUN_STARTED(start_reason=recovery)` 重新派发；不得恢复旧 Engine / Agent / Runner / provider request。
+- 第一版每个 Run 最多允许一次 automatic startup recovery dispatch。若再次 startup scan 发现同一 Run 已消耗该上限，必须以结构化 reason 将 Run 收口为 `LOST`，不得无限创建新 Attempt，也不得伪造 `FAILED` 或 successful final answer。
+- owner heartbeat stale 但 positive orphan proof 不成立时，只能追加或投递 suspect diagnostic，不得写 `ATTEMPT_LOST`、`RUN_RECOVERING`、`RUN_LOST`，也不得取消或接管旧 Attempt。
+
 多进程 recovery 不得把“当前进程不可确认控制”当作 orphan proof。一个 Host 进程无法控制另一个 Host 进程持有的 LocalProxy / RemoteProxy channel，并不表示该 Attempt 已丢失。
 
 positive orphan proof 第一版来自本机 Host 进程存活证据，而不是远端 lease。推荐最小机制：
@@ -2752,6 +2760,15 @@ dispatch_record.owner_host_instance_id
 ```
 
 orphan 判定必须同时证明 owner Host instance 已不可能继续治理该 Attempt，例如 pid 已不存在，或 pid 已复用但 process_start_token 不匹配，并且 heartbeat 已过期。`heartbeat_at` 单独不构成 orphan proof；进程卡顿、调试暂停或长时间阻塞不能导致其它 Host 进程误杀 active Attempt。`pid` 单独也不构成 orphan proof；pid 可能复用，必须配合 process_start_token / boot id / create time 等启动指纹。
+
+第一版 positive orphan proof 的最小判定必须同时满足：
+
+- dispatch record 能关联到旧 Attempt、`owner_host_instance_id` 与 durable host instance row。
+- owner heartbeat 已超过 recovery policy 的 stale threshold。
+- 本机进程证据能证明 owner pid 已不存在，或 pid 已复用且 `process_start_token` / `boot_id` / `created_at` 启动指纹与 durable row 不匹配。
+- CAS recheck 时 Run / Attempt / dispatch record 仍与分类输入一致。
+
+任一条件缺失都只能得到 suspect / inconclusive 结论，不得推进 recovery。
 
 只有 positive orphan proof 成立后，才能 CAS `ATTEMPT_LOST` -> `RUN_RECOVERING` -> new Attempt。该机制不是重 lease / fencing：它不授予远端执行 ownership，不允许旧 Attempt takeover，只用于证明原 Host owner 是否已经不可能继续治理该 Attempt。
 

@@ -11,7 +11,7 @@ from __future__ import annotations
 
 from collections.abc import Mapping
 from dataclasses import dataclass
-from datetime import datetime
+from datetime import datetime, timedelta
 from enum import StrEnum
 
 from dayu.contracts.json_value import JsonValue
@@ -22,7 +22,7 @@ from dayu.host.durable._validation import (
     require_optional_sha256_digest as _require_optional_sha256_digest,
     require_sha256_digest as _require_sha256_digest,
 )
-from dayu.host.durable.codec import format_utc_timestamp
+from dayu.host.durable.codec import format_utc_timestamp, parse_utc_timestamp
 from dayu.host.durable.event_log import (
     EventClass,
     EventLogAppendRequest,
@@ -30,6 +30,7 @@ from dayu.host.durable.event_log import (
     EventLogStore,
 )
 from dayu.host.durable.errors import HostDurableError
+from dayu.host.durable.liveness import HostInstanceStatus, read_host_instance
 from dayu.host.durable.state import (
     AttemptMutationResult,
     AttemptRow,
@@ -46,6 +47,7 @@ from dayu.host.durable.state import (
     WorkerKind,
     cancel_cancelling_run_row,
     cancel_active_wait_records_for_run,
+    cancel_recovering_run_row,
     cancel_waiting_run_row,
     cancel_running_attempt_row,
     cancel_starting_dispatch_record_row,
@@ -66,6 +68,7 @@ from dayu.host.durable.state import (
     read_active_run_for_session,
     read_active_wait_records_for_run,
     read_attempt_by_id,
+    read_dispatch_record_by_id,
     read_dispatch_record_by_attempt_id,
     read_earliest_queued_run,
     read_run_by_id,
@@ -74,6 +77,8 @@ from dayu.host.durable.state import (
     start_recovering_run_row,
     start_unstarted_run_row,
     terminal_attempt_row,
+    terminal_orphaned_run_lost_row,
+    terminal_recovering_run_lost_row,
     terminal_recovering_run_row,
     terminal_unstarted_run_row,
     terminal_run_row,
@@ -417,8 +422,82 @@ class ContextRecoveryCloseInput:
 
 
 @dataclass(frozen=True, slots=True)
+class StartupOrphanCloseInput:
+    """startup positive orphan proof 后关闭旧 Attempt 的输入。
+
+    :param run_id: 目标 Run id。
+    :param expected_run_status: CAS 期望 Run 状态，只允许 running 或 cancelling。
+    :param attempt_id: 目标 Attempt id。
+    :param expected_attempt_status: CAS 期望 Attempt 状态，只允许 starting 或 running。
+    :param execution_id: 目标 execution id。
+    :param dispatch_record_id: 目标 dispatch record id。
+    :param expected_dispatch_status: CAS 期望 dispatch record 状态。
+    :param owner_host_instance_id: positive proof 指向的 owner Host instance id。
+    :param owner_heartbeat_at: classifier 使用的 owner heartbeat timestamp。
+    :param stale_after: classifier 使用的 stale 阈值。
+    :param recoverable: ``True`` 时写 ``RUN_RECOVERING``，否则写 ``RUN_LOST``。
+    :param attempt_lost_event_id: 调用方生成的 ``ATTEMPT_LOST`` event id。
+    :param run_close_event_id: 调用方生成的 ``RUN_RECOVERING`` 或 ``RUN_LOST`` event id。
+    :param occurred_at: canonical facts 的发生时间。
+    :param actor: 事件 actor。
+    :param source: 事件 source。
+    :param reason: 结构化 closeout 原因。
+    :param orphan_proof_reason: positive orphan proof 原因。
+    :param observed_process_start_token: 探测到的进程启动指纹；不可用时为 ``None``。
+    :param observed_boot_id: 探测到的 boot id；不可用时为 ``None``。
+    """
+
+    run_id: str
+    expected_run_status: RunStatus
+    attempt_id: str
+    expected_attempt_status: AttemptStatus
+    execution_id: str
+    dispatch_record_id: str
+    expected_dispatch_status: DispatchRecordStatus
+    owner_host_instance_id: str
+    owner_heartbeat_at: str
+    stale_after: timedelta
+    recoverable: bool
+    attempt_lost_event_id: str
+    run_close_event_id: str
+    occurred_at: datetime
+    actor: str
+    source: str
+    reason: str
+    orphan_proof_reason: str
+    observed_process_start_token: str | None
+    observed_boot_id: str | None
+
+
+@dataclass(frozen=True, slots=True)
+class StartupRecoveringLostInput:
+    """startup scan 将 recovering Run 收口为 lost 的输入。
+
+    :param run_id: 目标 Run id。
+    :param source_attempt_id: 当前 source Attempt id。
+    :param run_lost_event_id: 调用方生成的 ``RUN_LOST`` event id。
+    :param occurred_at: canonical fact 的发生时间。
+    :param actor: 事件 actor。
+    :param source: 事件 source。
+    :param reason: 结构化 lost 原因。
+    :param recovery_dispatch_count: 已提交 recovery dispatch 数量。
+    :param recovery_dispatch_limit: startup 自动 recovery dispatch 上限。
+    """
+
+    run_id: str
+    source_attempt_id: str
+    run_lost_event_id: str
+    occurred_at: datetime
+    actor: str
+    source: str
+    reason: str
+    recovery_dispatch_count: int
+    recovery_dispatch_limit: int
+
+
+@dataclass(frozen=True, slots=True)
 class StartRecoveryRunInput:
-    """reactive compact accepted 后创建 recovery Attempt。
+    """创建 recovery Attempt。
 
     :param run_id: 目标 Run id。
     :param source_attempt_id: 已关闭的旧 Attempt id。
@@ -432,8 +511,10 @@ class StartRecoveryRunInput:
     :param source: 事件 source。
     :param worker_kind: worker 类型。
     :param owner_host_instance_id: owner Host instance id；Phase 10 可为 ``None``。
-    :param context_compacted_event_id: 已接受 compact event id。
-    :param context_compacted_event_sequence: 已接受 compact event sequence。
+    :param context_compacted_event_id: 已接受 compact event id；startup recovery
+        未发生 compact 时为 ``None``。
+    :param context_compacted_event_sequence: 已接受 compact event sequence；
+        startup recovery 未发生 compact 时为 ``None``。
     """
 
     run_id: str
@@ -448,8 +529,8 @@ class StartRecoveryRunInput:
     source: str
     worker_kind: WorkerKind
     owner_host_instance_id: str | None
-    context_compacted_event_id: str
-    context_compacted_event_sequence: int
+    context_compacted_event_id: str | None
+    context_compacted_event_sequence: int | None
 
 
 @dataclass(frozen=True, slots=True)
@@ -689,6 +770,40 @@ class CancelActiveAttemptInput:
 @dataclass(frozen=True, slots=True)
 class CancelWaitingRunInput:
     """取消 waiting Run 的输入。
+
+    :param run_id: 目标 Run id。
+    :param cancel_request_event_id: 调用方生成的 ``CANCEL_REQUESTED`` event id。
+    :param run_cancelled_event_id: 调用方生成的 ``RUN_CANCELLED`` event id。
+    :param occurred_at: canonical facts 的发生时间。
+    :param actor: 事件 actor。
+    :param source: 事件 source。
+    :param client_request_id: 客户端幂等请求 id。
+    :param idempotency_key: 幂等 key。
+    :param reason: cancel reason。
+    :param mode: cancel mode。
+    :param call_context_digest: 调用上下文 digest。
+    """
+
+    run_id: str
+    cancel_request_event_id: str
+    run_cancelled_event_id: str
+    occurred_at: datetime
+    actor: str
+    source: str
+    client_request_id: str
+    idempotency_key: str
+    reason: str
+    mode: CancelMode
+    call_context_digest: str
+
+
+@dataclass(frozen=True, slots=True)
+class CancelRecoveringRunInput:
+    """取消 RECOVERING Run 的输入。
+
+    RECOVERING 表示旧 Attempt 已由 recovery 收口，新的 recovery dispatch
+    尚未提交。取消该状态只提交用户取消意图和 Run terminal fact，不修改旧
+    Attempt 或 dispatch record。
 
     :param run_id: 目标 Run id。
     :param cancel_request_event_id: 调用方生成的 ``CANCEL_REQUESTED`` event id。
@@ -1204,6 +1319,168 @@ def close_attempt_for_context_recovery_in_transaction(
         run=run_result.row,
         attempt=attempt_result.row,
         dispatch_record=dispatch_record,
+    )
+
+
+def close_startup_orphan_attempt_in_transaction(
+    transaction: HostTransaction,
+    event_log_store: EventLogStore,
+    request: StartupOrphanCloseInput,
+) -> RunTransitionResult:
+    """根据 startup positive orphan proof 关闭旧 Attempt。
+
+    本 helper 在同一 write transaction 内重新读取 Run、Attempt、dispatch
+    record 与 owner liveness row，确认它们仍与 classifier 输入一致后，按顺序
+    append ``ATTEMPT_LOST`` 与 ``RUN_RECOVERING`` / ``RUN_LOST``，再更新
+    Attempt 与 Run state index。
+
+    :param transaction: 调用方提供的 Host transaction。
+    :param event_log_store: EventLog append primitive。
+    :param request: startup orphan closeout 输入。
+    :returns: transition 结果；前置不满足时返回 ``not_found`` 或
+        ``invalid_state``。
+    :raises HostDurableError: 输入字段或 SQLite 写入无效时由底层抛出。
+    """
+
+    _validate_startup_orphan_close_input(request)
+    run = read_run_by_id(transaction, request.run_id)
+    attempt = read_attempt_by_id(transaction, request.attempt_id)
+    dispatch_record = read_dispatch_record_by_id(
+        transaction, request.dispatch_record_id
+    )
+    invalid = _invalid_startup_orphan_precondition(
+        transaction=transaction,
+        request=request,
+        run=run,
+        attempt=attempt,
+        dispatch_record=dispatch_record,
+    )
+    if invalid is not None:
+        return invalid
+    if run is None or attempt is None or dispatch_record is None:
+        raise HostDurableError("startup orphan precondition narrowing failed")
+
+    attempt_event = event_log_store.append_event(
+        transaction,
+        _startup_orphan_attempt_lost_event_request(
+            request=request,
+            run=run,
+            attempt=attempt,
+            dispatch_record=dispatch_record,
+        ),
+    ).row
+    run_event = event_log_store.append_event(
+        transaction,
+        _startup_orphan_run_close_event_request(
+            request=request,
+            run=run,
+            attempt=attempt,
+            attempt_lost_event_id=attempt_event.event_id,
+        ),
+    ).row
+    close_at = format_utc_timestamp(request.occurred_at)
+    attempt_result = terminal_attempt_row(
+        transaction,
+        attempt_id=attempt.attempt_id,
+        terminal_status=AttemptStatus.LOST,
+        terminal_event_id=attempt_event.event_id,
+        terminal_event_sequence=attempt_event.event_sequence,
+        terminal_at=close_at,
+    )
+    attempt_result = _require_attempt_mutation_updated(
+        attempt_result,
+        mutation_name="startup orphan close Attempt",
+    )
+    if request.recoverable:
+        run_result = mark_running_run_recovering_row(
+            transaction,
+            session_id=run.session_id,
+            run_id=run.run_id,
+            current_attempt_id=attempt.attempt_id,
+            recovering_event_id=run_event.event_id,
+            recovering_event_sequence=run_event.event_sequence,
+            updated_at=close_at,
+        )
+    else:
+        run_result = terminal_orphaned_run_lost_row(
+            transaction,
+            run_id=run.run_id,
+            current_attempt_id=attempt.attempt_id,
+            expected_status=request.expected_run_status,
+            terminal_event_id=run_event.event_id,
+            terminal_event_sequence=run_event.event_sequence,
+            terminal_at=close_at,
+        )
+    run_result = _require_run_mutation_updated(
+        run_result,
+        mutation_name="startup orphan close Run",
+    )
+    return RunTransitionResult(
+        status=run_result.status,
+        run=run_result.row,
+        attempt=attempt_result.row,
+        dispatch_record=dispatch_record,
+    )
+
+
+def lose_recovering_run_in_transaction(
+    transaction: HostTransaction,
+    event_log_store: EventLogStore,
+    request: StartupRecoveringLostInput,
+) -> RunTransitionResult:
+    """将 startup scan 中不可继续 dispatch 的 recovering Run 收口为 lost。
+
+    :param transaction: 调用方提供的 Host transaction。
+    :param event_log_store: EventLog append primitive。
+    :param request: recovering lost 输入。
+    :returns: transition 结果。
+    :raises HostDurableError: 输入字段或 SQLite 写入无效时由底层抛出。
+    """
+
+    _validate_startup_recovering_lost_input(request)
+    run = read_run_by_id(transaction, request.run_id)
+    source_attempt = read_attempt_by_id(transaction, request.source_attempt_id)
+    if run is None:
+        return RunTransitionResult(
+            status=StateMutationStatus.NOT_FOUND,
+            run=None,
+            attempt=source_attempt,
+            dispatch_record=None,
+        )
+    if (
+        source_attempt is None
+        or run.status != RunStatus.RECOVERING
+        or run.current_attempt_id != request.source_attempt_id
+    ):
+        return RunTransitionResult(
+            status=StateMutationStatus.INVALID_STATE,
+            run=run,
+            attempt=source_attempt,
+            dispatch_record=None,
+        )
+    run_lost_event = event_log_store.append_event(
+        transaction, _startup_recovering_run_lost_event_request(request, run)
+    ).row
+    lost_at = format_utc_timestamp(request.occurred_at)
+    run_result = terminal_recovering_run_lost_row(
+        transaction,
+        run_id=run.run_id,
+        current_attempt_id=request.source_attempt_id,
+        terminal_event_id=run_lost_event.event_id,
+        terminal_event_sequence=run_lost_event.event_sequence,
+        terminal_at=lost_at,
+    )
+    run_result = _require_run_mutation_updated(
+        run_result,
+        mutation_name="lose recovering Run",
+    )
+    return RunTransitionResult(
+        status=run_result.status,
+        run=run_result.row,
+        attempt=source_attempt,
+        dispatch_record=read_dispatch_record_by_attempt_id(
+            transaction, request.source_attempt_id
+        ),
     )
 
 
@@ -2075,6 +2352,72 @@ def cancel_waiting_run_in_transaction(
     )
 
 
+def cancel_recovering_run_in_transaction(
+    transaction: HostTransaction,
+    event_log_store: EventLogStore,
+    request: CancelRecoveringRunInput,
+) -> RunTransitionResult:
+    """取消 RECOVERING Run，不修改旧 Attempt 或 dispatch record。
+
+    :param transaction: 调用方提供的 Host transaction。
+    :param event_log_store: EventLog append primitive。
+    :param request: recovering cancel 输入。
+    :returns: transition 结果；前置状态不满足时返回 not_found/invalid_state。
+    :raises HostDurableError: 输入字段或 SQLite 写入无效时由底层抛出。
+    """
+
+    _validate_cancel_recovering_input(request)
+    run = read_run_by_id(transaction, request.run_id)
+    if run is None:
+        return RunTransitionResult(
+            status=StateMutationStatus.NOT_FOUND,
+            run=None,
+            attempt=None,
+            dispatch_record=None,
+        )
+    if run.status != RunStatus.RECOVERING:
+        return RunTransitionResult(
+            status=StateMutationStatus.INVALID_STATE,
+            run=run,
+            attempt=_read_current_attempt_if_present(transaction, run),
+            dispatch_record=_read_current_dispatch_record_if_present(
+                transaction, run
+            ),
+        )
+
+    cancel_request_event = event_log_store.append_event(
+        transaction, _cancel_requested_event_request(request, run)
+    ).row
+    run_cancelled_event = event_log_store.append_event(
+        transaction,
+        _run_cancelled_event_request(
+            request=request,
+            run=run,
+            cancel_request_event_id=cancel_request_event.event_id,
+            terminal_attempt_id=None,
+            terminal_attempt_event_id=None,
+        ),
+    ).row
+    terminal_at = format_utc_timestamp(request.occurred_at)
+    run_result = cancel_recovering_run_row(
+        transaction,
+        run_id=run.run_id,
+        terminal_event_id=run_cancelled_event.event_id,
+        terminal_event_sequence=run_cancelled_event.event_sequence,
+        terminal_at=terminal_at,
+    )
+    run_result = _require_run_mutation_updated(
+        run_result,
+        mutation_name="cancel recovering Run",
+    )
+    return RunTransitionResult(
+        status=run_result.status,
+        run=run_result.row,
+        attempt=_read_current_attempt_if_present(transaction, run),
+        dispatch_record=_read_current_dispatch_record_if_present(transaction, run),
+    )
+
+
 def cancel_queued_in_transaction(
     transaction: HostTransaction,
     event_log_store: EventLogStore,
@@ -2845,6 +3188,19 @@ def _recovery_run_started_event_request(
     :returns: EventLog append request。
     """
 
+    payload: dict[str, JsonValue] = {
+        "run_id": run.run_id,
+        "start_reason": RunStartReason.RECOVERY.value,
+        "source_attempt_id": request.source_attempt_id,
+        "attempt_id": request.attempt_id,
+        "dispatch_record_id": request.dispatch_record_id,
+    }
+    if request.context_compacted_event_id is not None:
+        payload["context_compacted_event_id"] = request.context_compacted_event_id
+    if request.context_compacted_event_sequence is not None:
+        payload["context_compacted_event_sequence"] = (
+            request.context_compacted_event_sequence
+        )
     return EventLogAppendRequest(
         event_id=request.run_started_event_id,
         event_class=EventClass.CANONICAL_FACT,
@@ -2860,16 +3216,138 @@ def _recovery_run_started_event_request(
         idempotency_key=None,
         policy_decision=None,
         reason={"start_reason": RunStartReason.RECOVERY.value},
+        payload_json=payload,
+        payload_ref=None,
+        payload_digest=None,
+    )
+
+
+def _startup_orphan_attempt_lost_event_request(
+    *,
+    request: StartupOrphanCloseInput,
+    run: RunRow,
+    attempt: AttemptRow,
+    dispatch_record: DispatchRecordRow,
+) -> EventLogAppendRequest:
+    """构造 startup orphan ``ATTEMPT_LOST`` EventLog 请求。
+
+    :param request: startup orphan closeout 输入。
+    :param run: 目标 Run row。
+    :param attempt: 目标 Attempt row。
+    :param dispatch_record: 目标 dispatch record row。
+    :returns: EventLog append request。
+    """
+
+    return EventLogAppendRequest(
+        event_id=request.attempt_lost_event_id,
+        event_class=EventClass.CANONICAL_FACT,
+        session_id=run.session_id,
+        run_id=run.run_id,
+        attempt_id=attempt.attempt_id,
+        execution_id=attempt.execution_id,
+        event_type=_EVENT_TYPE_ATTEMPT_LOST,
+        occurred_at=request.occurred_at,
+        actor=request.actor,
+        source=request.source,
+        client_request_id=None,
+        idempotency_key=None,
+        policy_decision=None,
+        reason={"reason": request.reason, "orphan_proof": request.orphan_proof_reason},
         payload_json={
             "run_id": run.run_id,
-            "start_reason": RunStartReason.RECOVERY.value,
+            "attempt_id": attempt.attempt_id,
+            "execution_id": attempt.execution_id,
+            "dispatch_record_id": dispatch_record.dispatch_record_id,
+            "owner_host_instance_id": request.owner_host_instance_id,
+            "owner_heartbeat_at": request.owner_heartbeat_at,
+            "orphan_proof_reason": request.orphan_proof_reason,
+            "observed_process_start_token": request.observed_process_start_token,
+            "observed_boot_id": request.observed_boot_id,
+            "reason": request.reason,
+        },
+        payload_ref=None,
+        payload_digest=None,
+    )
+
+
+def _startup_orphan_run_close_event_request(
+    *,
+    request: StartupOrphanCloseInput,
+    run: RunRow,
+    attempt: AttemptRow,
+    attempt_lost_event_id: str,
+) -> EventLogAppendRequest:
+    """构造 startup orphan Run close EventLog 请求。
+
+    :param request: startup orphan closeout 输入。
+    :param run: 目标 Run row。
+    :param attempt: 目标 Attempt row。
+    :param attempt_lost_event_id: 已写入的 ``ATTEMPT_LOST`` event id。
+    :returns: EventLog append request。
+    """
+
+    event_type = (
+        _EVENT_TYPE_RUN_RECOVERING if request.recoverable else _EVENT_TYPE_RUN_LOST
+    )
+    return EventLogAppendRequest(
+        event_id=request.run_close_event_id,
+        event_class=EventClass.CANONICAL_FACT,
+        session_id=run.session_id,
+        run_id=run.run_id,
+        attempt_id=None,
+        execution_id=None,
+        event_type=event_type,
+        occurred_at=request.occurred_at,
+        actor=request.actor,
+        source=request.source,
+        client_request_id=None,
+        idempotency_key=None,
+        policy_decision=None,
+        reason={"reason": request.reason, "orphan_proof": request.orphan_proof_reason},
+        payload_json={
+            "run_id": run.run_id,
+            "attempt_id": attempt.attempt_id,
+            "attempt_lost_event_id": attempt_lost_event_id,
+            "recoverable": request.recoverable,
+            "reason": request.reason,
+            "orphan_proof_reason": request.orphan_proof_reason,
+        },
+        payload_ref=None,
+        payload_digest=None,
+    )
+
+
+def _startup_recovering_run_lost_event_request(
+    request: StartupRecoveringLostInput, run: RunRow
+) -> EventLogAppendRequest:
+    """构造 startup recovering ``RUN_LOST`` EventLog 请求。
+
+    :param request: recovering lost 输入。
+    :param run: 目标 Run row。
+    :returns: EventLog append request。
+    """
+
+    return EventLogAppendRequest(
+        event_id=request.run_lost_event_id,
+        event_class=EventClass.CANONICAL_FACT,
+        session_id=run.session_id,
+        run_id=run.run_id,
+        attempt_id=None,
+        execution_id=None,
+        event_type=_EVENT_TYPE_RUN_LOST,
+        occurred_at=request.occurred_at,
+        actor=request.actor,
+        source=request.source,
+        client_request_id=None,
+        idempotency_key=None,
+        policy_decision=None,
+        reason={"reason": request.reason},
+        payload_json={
+            "run_id": run.run_id,
             "source_attempt_id": request.source_attempt_id,
-            "attempt_id": request.attempt_id,
-            "dispatch_record_id": request.dispatch_record_id,
-            "context_compacted_event_id": request.context_compacted_event_id,
-            "context_compacted_event_sequence": (
-                request.context_compacted_event_sequence
-            ),
+            "reason": request.reason,
+            "recovery_dispatch_count": request.recovery_dispatch_count,
+            "recovery_dispatch_limit": request.recovery_dispatch_limit,
         },
         payload_ref=None,
         payload_digest=None,
@@ -3241,6 +3719,7 @@ def _cancel_requested_event_request(
         | CancelPredispatchStartingInput
         | CancelActiveAttemptInput
         | CancelWaitingRunInput
+        | CancelRecoveringRunInput
     ),
     run: RunRow,
 ) -> EventLogAppendRequest:
@@ -3370,7 +3849,11 @@ def _attempt_cancelled_event_request(
 
 def _run_cancelled_event_request(
     *,
-    request: CancelQueuedRunInput | CancelPredispatchStartingInput,
+    request: (
+        CancelQueuedRunInput
+        | CancelPredispatchStartingInput
+        | CancelRecoveringRunInput
+    ),
     run: RunRow,
     cancel_request_event_id: str,
     terminal_attempt_id: str | None,
@@ -4200,6 +4683,96 @@ def _invalid_terminal_precondition(
     return None
 
 
+def _invalid_startup_orphan_precondition(
+    *,
+    transaction: HostTransaction,
+    request: StartupOrphanCloseInput,
+    run: RunRow | None,
+    attempt: AttemptRow | None,
+    dispatch_record: DispatchRecordRow | None,
+) -> RunTransitionResult | None:
+    """检查 startup orphan closeout 的完整 CAS 前置。
+
+    :param transaction: 调用方提供的 Host transaction。
+    :param request: startup orphan closeout 输入。
+    :param run: 最新 Run row。
+    :param attempt: 最新 Attempt row。
+    :param dispatch_record: 最新 dispatch record row。
+    :returns: 前置失败时返回 transition 结果，否则返回 ``None``。
+    """
+
+    if run is None:
+        return RunTransitionResult(
+            status=StateMutationStatus.NOT_FOUND,
+            run=None,
+            attempt=attempt,
+            dispatch_record=dispatch_record,
+        )
+    if attempt is None:
+        return RunTransitionResult(
+            status=StateMutationStatus.NOT_FOUND,
+            run=run,
+            attempt=None,
+            dispatch_record=dispatch_record,
+        )
+    if dispatch_record is None:
+        return RunTransitionResult(
+            status=StateMutationStatus.NOT_FOUND,
+            run=run,
+            attempt=attempt,
+            dispatch_record=None,
+        )
+    owner = read_host_instance(transaction, request.owner_host_instance_id)
+    if owner is None:
+        return RunTransitionResult(
+            status=StateMutationStatus.NOT_FOUND,
+            run=run,
+            attempt=attempt,
+            dispatch_record=dispatch_record,
+        )
+    try:
+        heartbeat_at = parse_utc_timestamp(owner.heartbeat_at)
+    except ValueError:
+        return RunTransitionResult(
+            status=StateMutationStatus.INVALID_STATE,
+            run=run,
+            attempt=attempt,
+            dispatch_record=dispatch_record,
+        )
+    heartbeat_stale = request.occurred_at - heartbeat_at > request.stale_after
+    if (
+        run.status != request.expected_run_status
+        or run.current_attempt_id != attempt.attempt_id
+        or run.terminal_event_id is not None
+        or run.terminal_event_sequence is not None
+        or run.terminal_at is not None
+        or attempt.run_id != run.run_id
+        or attempt.status != request.expected_attempt_status
+        or attempt.execution_id != request.execution_id
+        or attempt.terminal_event_id is not None
+        or attempt.terminal_event_sequence is not None
+        or attempt.terminal_at is not None
+        or dispatch_record.dispatch_record_id != request.dispatch_record_id
+        or dispatch_record.run_id != run.run_id
+        or dispatch_record.attempt_id != attempt.attempt_id
+        or dispatch_record.execution_id != attempt.execution_id
+        or dispatch_record.status != request.expected_dispatch_status
+        or dispatch_record.owner_host_instance_id != request.owner_host_instance_id
+        or dispatch_record.cancelled_event_id is not None
+        or dispatch_record.cancelled_event_sequence is not None
+        or owner.status != HostInstanceStatus.RUNNING
+        or owner.heartbeat_at != request.owner_heartbeat_at
+        or not heartbeat_stale
+    ):
+        return RunTransitionResult(
+            status=StateMutationStatus.INVALID_STATE,
+            run=run,
+            attempt=attempt,
+            dispatch_record=dispatch_record,
+        )
+    return None
+
+
 def _invalid_waiting_resolution_precondition(
     *,
     transaction: HostTransaction,
@@ -4431,6 +5004,36 @@ def _read_dispatch_for_attempt(
     return read_dispatch_record_by_attempt_id(transaction, attempt.attempt_id)
 
 
+def _read_current_attempt_if_present(
+    transaction: HostTransaction, run: RunRow
+) -> AttemptRow | None:
+    """读取 Run 当前 Attempt；Run 无当前 Attempt 时返回 ``None``。
+
+    :param transaction: 调用方提供的 Host transaction。
+    :param run: Run row。
+    :returns: current Attempt row 或 ``None``。
+    """
+
+    if run.current_attempt_id is None:
+        return None
+    return read_attempt_by_id(transaction, run.current_attempt_id)
+
+
+def _read_current_dispatch_record_if_present(
+    transaction: HostTransaction, run: RunRow
+) -> DispatchRecordRow | None:
+    """读取 Run 当前 Attempt 对应 dispatch record；缺失时返回 ``None``。
+
+    :param transaction: 调用方提供的 Host transaction。
+    :param run: Run row。
+    :returns: dispatch record row 或 ``None``。
+    """
+
+    if run.current_attempt_id is None:
+        return None
+    return read_dispatch_record_by_attempt_id(transaction, run.current_attempt_id)
+
+
 def _attempt_terminal_event_type(status: AttemptStatus) -> str:
     """把 Attempt 终态映射到具体 canonical event type。
 
@@ -4653,6 +5256,81 @@ def _validate_context_recovery_close_input(
     _require_non_empty_text(request.message, field_name="message")
 
 
+def _validate_startup_orphan_close_input(request: StartupOrphanCloseInput) -> None:
+    """校验 startup orphan close 输入。
+
+    :param request: startup orphan close 输入。
+    :returns: ``None``。
+    :raises HostDurableError: 任一字段无效时抛出。
+    """
+
+    _require_non_empty_text(request.run_id, field_name="run_id")
+    if request.expected_run_status not in (RunStatus.RUNNING, RunStatus.CANCELLING):
+        raise HostDurableError("expected_run_status is invalid")
+    _require_non_empty_text(request.attempt_id, field_name="attempt_id")
+    if request.expected_attempt_status not in (
+        AttemptStatus.STARTING,
+        AttemptStatus.RUNNING,
+    ):
+        raise HostDurableError("expected_attempt_status is invalid")
+    _require_non_empty_text(request.execution_id, field_name="execution_id")
+    _require_non_empty_text(
+        request.dispatch_record_id, field_name="dispatch_record_id"
+    )
+    if not isinstance(request.expected_dispatch_status, DispatchRecordStatus):
+        raise HostDurableError("expected_dispatch_status is invalid")
+    _require_non_empty_text(
+        request.owner_host_instance_id, field_name="owner_host_instance_id"
+    )
+    _require_non_empty_text(request.owner_heartbeat_at, field_name="owner_heartbeat_at")
+    if request.stale_after <= timedelta(0):
+        raise HostDurableError("stale_after must be positive")
+    _require_non_empty_text(
+        request.attempt_lost_event_id, field_name="attempt_lost_event_id"
+    )
+    _require_non_empty_text(request.run_close_event_id, field_name="run_close_event_id")
+    _require_non_empty_text(request.actor, field_name="actor")
+    _require_non_empty_text(request.source, field_name="source")
+    _require_non_empty_text(request.reason, field_name="reason")
+    _require_non_empty_text(
+        request.orphan_proof_reason, field_name="orphan_proof_reason"
+    )
+    _require_optional_non_empty_text(
+        request.observed_process_start_token,
+        field_name="observed_process_start_token",
+    )
+    _require_optional_non_empty_text(
+        request.observed_boot_id,
+        field_name="observed_boot_id",
+    )
+    if request.recoverable and request.expected_run_status != RunStatus.RUNNING:
+        raise HostDurableError("only running orphan Run can become recovering")
+
+
+def _validate_startup_recovering_lost_input(
+    request: StartupRecoveringLostInput,
+) -> None:
+    """校验 startup recovering lost 输入。
+
+    :param request: startup recovering lost 输入。
+    :returns: ``None``。
+    :raises HostDurableError: 任一字段无效时抛出。
+    """
+
+    _require_non_empty_text(request.run_id, field_name="run_id")
+    _require_non_empty_text(
+        request.source_attempt_id, field_name="source_attempt_id"
+    )
+    _require_non_empty_text(request.run_lost_event_id, field_name="run_lost_event_id")
+    _require_non_empty_text(request.actor, field_name="actor")
+    _require_non_empty_text(request.source, field_name="source")
+    _require_non_empty_text(request.reason, field_name="reason")
+    if request.recovery_dispatch_count < 0:
+        raise HostDurableError("recovery_dispatch_count must be non-negative")
+    if request.recovery_dispatch_limit <= 0:
+        raise HostDurableError("recovery_dispatch_limit must be positive")
+
+
 def _validate_start_recovery_input(request: StartRecoveryRunInput) -> None:
     """校验 recovery start 输入。
 
@@ -4679,13 +5357,22 @@ def _validate_start_recovery_input(request: StartRecoveryRunInput) -> None:
     _require_optional_non_empty_text(
         request.owner_host_instance_id, field_name="owner_host_instance_id"
     )
-    _require_non_empty_text(
+    _require_optional_non_empty_text(
         request.context_compacted_event_id, field_name="context_compacted_event_id"
     )
-    _require_positive_sequence(
-        request.context_compacted_event_sequence,
-        "context_compacted_event_sequence",
-    )
+    if (
+        request.context_compacted_event_id is None
+        and request.context_compacted_event_sequence is not None
+    ) or (
+        request.context_compacted_event_id is not None
+        and request.context_compacted_event_sequence is None
+    ):
+        raise HostDurableError("context compacted event ref must be complete")
+    if request.context_compacted_event_sequence is not None:
+        _require_positive_sequence(
+            request.context_compacted_event_sequence,
+            "context_compacted_event_sequence",
+        )
 
 
 def _validate_fail_recovering_input(request: FailRecoveringRunInput) -> None:
@@ -5060,6 +5747,28 @@ def _validate_cancel_waiting_input(request: CancelWaitingRunInput) -> None:
     )
     _require_non_empty_text(
         request.run_cancelled_event_id, field_name="run_cancelled_event_id"
+    )
+
+
+def _validate_cancel_recovering_input(request: CancelRecoveringRunInput) -> None:
+    """校验 recovering cancel 输入。
+
+    :param request: recovering cancel 输入。
+    :returns: ``None``。
+    :raises HostDurableError: 任一字段无效时抛出。
+    """
+
+    _validate_common_cancel_input(
+        run_id=request.run_id,
+        cancel_request_event_id=request.cancel_request_event_id,
+        run_cancelled_event_id=request.run_cancelled_event_id,
+        actor=request.actor,
+        source=request.source,
+        client_request_id=request.client_request_id,
+        idempotency_key=request.idempotency_key,
+        reason=request.reason,
+        mode=request.mode,
+        call_context_digest=request.call_context_digest,
     )
 
 

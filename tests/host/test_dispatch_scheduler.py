@@ -1929,7 +1929,7 @@ async def test_scheduler_close_during_active_events_releases_all_resources(
 
 @pytest.mark.asyncio
 async def test_default_active_registry_is_scheduler_local(tmp_path: Path) -> None:
-    """未显式注入 registry 时，不同 scheduler 不共享默认 registry。"""
+    """未显式注入 registry 时，不同 host scheduler 不共享默认 registry。"""
 
     with open_host_durable_store(_options(tmp_path)) as store:
         first = await _open_scheduler(
@@ -1943,6 +1943,7 @@ async def test_default_active_registry_is_scheduler_local(tmp_path: Path) -> Non
             store,
             _FakeWorkerFactory(),
             lane_db_path=tmp_path / "lane-second.sqlite3",
+            host_handle_id="host-test-second",
         )
         try:
             assert first._active_registry is not second._active_registry
@@ -2817,6 +2818,7 @@ async def _open_scheduler(
     context_budget_policy: ContextBudgetPolicy | None = None,
     context_compactor: ContextCompactor | None = None,
     compact_artifact_root: Path | None = None,
+    host_handle_id: str = "host-test",
 ) -> HostDispatchScheduler:
     """打开测试 scheduler。
 
@@ -2833,6 +2835,7 @@ async def _open_scheduler(
     :param context_budget_policy: 可选 pre-start context budget policy。
     :param context_compactor: 可选 context compactor。
     :param compact_artifact_root: 可选 compact artifact 根目录。
+    :param host_handle_id: scheduler 使用的 Host handle id。
     :returns: scheduler。
     """
 
@@ -2860,7 +2863,7 @@ async def _open_scheduler(
             context_compactor=context_compactor,
             compact_artifact_root=compact_artifact_root,
         ),
-        host_handle_id="host-test",
+        host_handle_id=host_handle_id,
         active_registry=active_registry,
         projection_catchup_port=projection_catchup,
     )

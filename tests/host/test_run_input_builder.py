@@ -73,12 +73,15 @@ from dayu.host.durable.payload import (
 )
 from dayu.host.durable.run_transition import (
     CreateRunningRunInput,
+    StartRecoveryRunInput,
     create_running_run_with_starting_attempt_in_transaction,
+    start_recovery_run_with_starting_attempt_in_transaction,
 )
 from dayu.host.durable.session_lifecycle import ensure_session
 from dayu.host.durable.state import (
     DispatchRecordStatus,
     RunStartReason,
+    StateMutationStatus,
     WorkerKind,
     mark_dispatch_waiting_for_lane_row,
     mark_dispatching_after_lane_row,
@@ -221,6 +224,31 @@ def test_current_user_message_resolves_descriptor_payload(
         assert "descriptor durable prompt" not in input_event.payload_json
         assert isinstance(request.messages[-1], UserMessage)
         assert request.messages[-1].content == "descriptor durable prompt"
+
+
+def test_recovery_attempt_rebuilds_current_prompt_from_same_run_eventlog_descriptor(
+    tmp_path: Path,
+) -> None:
+    """recovery Attempt 仍从同一 Run 的 canonical USER_INPUT descriptor 重建消息。"""
+
+    with open_host_durable_store(_options(tmp_path)) as store:
+        session_id = _ensure_session_id(store.transaction_runner)
+        payload = _user_input_payload("descriptor recovery prompt")
+        old = _seed_current_run_with_descriptor(
+            store,
+            session_id=session_id,
+            payload=payload,
+        )
+        payload["display_text"] = "mutated old attempt snapshot"
+
+        recovery = _start_recovery_attempt(store.transaction_runner, old)
+        request = _build_request(store, recovery)
+
+        assert recovery.run_id == old.run_id
+        assert recovery.attempt_id != old.attempt_id
+        assert recovery.execution_id != old.execution_id
+        assert isinstance(request.messages[-1], UserMessage)
+        assert request.messages[-1].content == "descriptor recovery prompt"
 
 
 def test_build_is_deterministic_for_same_eventlog_and_policy(
@@ -2113,6 +2141,86 @@ def _force_dispatch_snapshot_state(
             )
 
     transaction_runner.run_write(operation)
+
+
+def _start_recovery_attempt(
+    transaction_runner: HostTransactionRunner,
+    old: _SeededRun,
+) -> _SeededRun:
+    """将旧 Attempt 收口为 RECOVERING 后创建 recovery Attempt。
+
+    :param transaction_runner: Host transaction runner。
+    :param old: 旧 Attempt seeded 引用。
+    :returns: 新 recovery Attempt seeded 引用。
+    """
+
+    _force_dispatch_snapshot_state(
+        transaction_runner,
+        old,
+        run_status=RunStatus.RECOVERING,
+        attempt_status=AttemptStatus.LOST,
+        dispatch_status=DispatchRecordStatus.DISPATCHING,
+    )
+
+    def operation(transaction: HostTransaction) -> _SeededRun:
+        """执行 recovery start 并推进 dispatching。
+
+        :param transaction: Host transaction。
+        :returns: 新 recovery Attempt seeded 引用。
+        """
+
+        result = start_recovery_run_with_starting_attempt_in_transaction(
+            transaction,
+            EventLogStore(),
+            StartRecoveryRunInput(
+                run_id=old.run_id,
+                source_attempt_id=old.attempt_id,
+                run_started_event_id="event-run-started-recovery-current",
+                attempt_started_event_id="event-attempt-started-recovery-current",
+                attempt_id="attempt-recovery-current",
+                execution_id="execution-recovery-current",
+                dispatch_record_id="dispatch-recovery-current",
+                occurred_at=_NOW,
+                actor="host_recovery",
+                source="startup_scan",
+                worker_kind=WorkerKind.LOCAL,
+                owner_host_instance_id="host-run-input",
+                context_compacted_event_id=None,
+                context_compacted_event_sequence=None,
+            ),
+        )
+        assert result.status is StateMutationStatus.UPDATED
+        assert result.run is not None
+        assert result.attempt is not None
+        assert result.dispatch_record is not None
+        waiting = mark_dispatch_waiting_for_lane_row(
+            transaction,
+            attempt_id=result.attempt.attempt_id,
+            owner_host_instance_id="host-run-input",
+            lane_name="llm",
+            waiting_for_lane_at="2026-05-15T01:02:05.000000Z",
+        )
+        assert waiting.status is StateMutationStatus.UPDATED
+        dispatching = mark_dispatching_after_lane_row(
+            transaction,
+            attempt_id=result.attempt.attempt_id,
+            owner_host_instance_id="host-run-input",
+            lane_name="llm",
+            lane_claim_id="claim-run-input-recovery",
+            lane_owner_id="owner-run-input-recovery",
+            lane_acquired_at="2026-05-15T01:02:05.000000Z",
+            dispatching_at="2026-05-15T01:02:05.000000Z",
+        )
+        assert dispatching.status is StateMutationStatus.UPDATED
+        return _SeededRun(
+            session_id=old.session_id,
+            run_id=old.run_id,
+            attempt_id=result.attempt.attempt_id,
+            execution_id=result.attempt.execution_id,
+            dispatch_record_id=result.dispatch_record.dispatch_record_id,
+        )
+
+    return transaction_runner.run_write(operation)
 
 
 def _build_request(

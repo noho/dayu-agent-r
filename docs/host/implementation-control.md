@@ -222,9 +222,9 @@ Phase Map 中每个 phase 必须使用统一条目格式。模板如下：
 
 约束：本节只保留当前 gate 结论；phase 过程流水必须归档到 `历史记录`，仍需追踪的风险或后续 owner 必须写入 `Open Questions 与风险追踪` 的 `追踪区`。
 
-当前 work unit：Phase 10.5. Ordinary Local Multi-turn Public Contract Freeze。
-当前 gate：draft-PR-pass。
-下一 gate：Phase 11 design discussion / plan gate。
+当前 work unit：Phase 11. Host Lifecycle / Recovery / Multi-process Hardening。
+当前 gate：Phase 11 / PR 65 post-draft-PR-pass deepreview-all PASS。
+下一 gate：final push / PR status verification。
 
 当前 gate 事实：Phase 10 已完成；P10.5 已插入 Phase Map，用于冻结普通本地多轮会话的 Host public interface / contract。P10.5 目标与任务清单写入 `docs/host/post-p10.md`。initial challenge review artifacts 为 `docs/reviews/post-p10-public-contract-challenge-mimo-20260518.md`、`docs/reviews/post-p10-wiring-smoke-challenge-ds-20260518.md` 与 `docs/reviews/post-p10-codex-challenge-20260518.md`；相关裁决已经写回 `docs/host/post-p10.md`。按 `$init-agents` 已派发三路 P10.5 plan-readiness review：`docs/reviews/post-p10-5-plan-readiness-review-mimo-20260518.md`、`docs/reviews/post-p10-5-plan-readiness-review-ds-20260518.md` 与 `docs/reviews/post-p10-5-plan-readiness-review-codex-20260518.md`；三份结论均为 blocking count = 0。P10.5 handoff implementation-ready plan 已生成：`docs/host/phase10-5-ordinary-local-multiturn-public-contract-plan.md`。P10.5 plan review artifacts 为 `docs/reviews/phase10-5-plan-review-mimo-20260518.md` 与 `docs/reviews/phase10-5-plan-review-ds-20260518.md`，两份均 PASS，blocking count = 0。Controller adjudication artifact 为 `docs/reviews/phase10-5-plan-review-controller-adjudication-20260518.md`；总控裁决：不直接进入 implementation，先接受 DS N1-N5 / C1-C3 与 MiMo F5-F7 为 plan hardening。P10.5 plan fix artifact 为 `docs/reviews/phase10-5-plan-fix-codex-20260518.md`；fix 只修改 `docs/host/phase10-5-ordinary-local-multiturn-public-contract-plan.md`，收口 A1-A5，无新的 blocking question。P10.5 plan re-review artifacts 为 `docs/reviews/phase10-5-plan-rereview-mimo-20260518.md` 与 `docs/reviews/phase10-5-plan-rereview-ds-20260518.md`，两份均 PASS，blocking count = 0；Controller re-review adjudication artifact 为 `docs/reviews/phase10-5-plan-rereview-controller-adjudication-20260518.md`。Accepted plan local commit hash：`f38540b`。P10.5 Slice 1 implementation artifact 为 `docs/reviews/phase10-5-slice1-implementation-codex-20260518.md`；implementation agent reported focused tests `tests/host/test_public_open_host_options.py tests/host/test_package_exports.py` passed and `pyright dayu/host tests/host` returned 0 errors。P10.5 Slice 1 code review artifacts 为 `docs/reviews/phase10-5-slice1-code-review-mimo-20260518.md` 与 `docs/reviews/phase10-5-slice1-code-review-ds-20260518.md`，两份均 PASS，blocking count = 0；Controller adjudication artifact 为 `docs/reviews/phase10-5-slice1-code-review-controller-adjudication-20260518.md`。Accepted Slice 1 local commit hash：`d0e79a6`。用户已授权到达 `ready-to-open-draft-PR` 后进入 draft PR gate 并推进到 draft-PR-pass；该授权不改变当前必须先完成 P10.5 剩余 slices、code review 与 aggregate deepreview 的顺序。P10.5 Slice 2 implementation artifact 为 `docs/reviews/phase10-5-slice2-implementation-codex-20260518.md`；implementation agent reported focused tests `tests/host/test_open_host_runtime.py tests/host/test_public_lifecycle_smoke.py` passed and `pyright dayu/host tests/host` returned 0 errors。P10.5 Slice 2 code review artifacts 为 `docs/reviews/phase10-5-slice2-code-review-mimo-20260518.md` 与 `docs/reviews/phase10-5-slice2-code-review-ds-20260518.md`，两份均 PASS，blocking count = 0。Controller adjudication artifact 为 `docs/reviews/phase10-5-slice2-code-review-controller-adjudication-20260518.md`；总控裁决：接受 DS N1 为当前 Slice 2 lifecycle fix，接受 DS N2 / MiMo N3 为窄契约澄清 fix。P10.5 Slice 2 fix artifact 为 `docs/reviews/phase10-5-slice2-fix-codex-20260518.md`；fix agent reported focused tests `tests/host/test_open_host_runtime.py tests/host/test_public_lifecycle_smoke.py` passed with 5 tests and `pyright dayu/host tests/host` returned 0 errors。P10.5 Slice 2 re-review artifacts 为 `docs/reviews/phase10-5-slice2-rereview-mimo-20260518.md` 与 `docs/reviews/phase10-5-slice2-rereview-ds-20260518.md`，两份均 PASS，blocking count = 0；Controller re-review adjudication artifact 为 `docs/reviews/phase10-5-slice2-rereview-controller-adjudication-20260518.md`。Accepted Slice 2 local commit hash：`79f7b44`。P10.5 Slice 3 implementation artifact 为 `docs/reviews/phase10-5-slice3-implementation-codex-20260518.md`；implementation agent reported focused tests `tests/host/test_submit_followup_public_contract.py tests/host/test_per_run_tool_selection.py tests/host/test_effective_execution_config.py` passed with 9 tests and `pyright dayu/host tests/host` returned 0 errors。P10.5 Slice 3 code review artifacts 为 `docs/reviews/phase10-5-slice3-code-review-mimo-20260518.md` 与 `docs/reviews/phase10-5-slice3-code-review-ds-20260518.md`，两份均 PASS，blocking count = 0；Controller adjudication artifact 为 `docs/reviews/phase10-5-slice3-code-review-controller-adjudication-20260518.md`。总控裁决：接受 runner config JSON 投影重复、agent_policy override 覆盖缺口、baseline=None fail-early 说明为当前 Slice 3 fix。P10.5 Slice 3 fix artifact 为 `docs/reviews/phase10-5-slice3-fix-codex-20260518.md`；fix agent reported focused tests `tests/host/test_submit_followup_public_contract.py tests/host/test_per_run_tool_selection.py tests/host/test_effective_execution_config.py` passed with 11 tests and `pyright dayu/host tests/host` returned 0 errors；controller 本地复跑同一 focused tests 11 passed，`pyright dayu/host tests/host` 0 errors。P10.5 Slice 3 re-review artifacts 为 `docs/reviews/phase10-5-slice3-rereview-mimo-20260518.md` 与 `docs/reviews/phase10-5-slice3-rereview-ds-20260518.md`。Controller re-review adjudication artifact 为 `docs/reviews/phase10-5-slice3-rereview-controller-adjudication-20260518.md`；总控裁决：受影响既有 tests `tests/host/test_admission_queue.py tests/host/test_projection_read_model.py` 当前 17 failed / 19 passed，不能接受进入 slice commit，需 follow-up fix 迁移相关低层测试 helper 到 ordinary baseline 边界。Slice 3 follow-up fix 已更新 `tests/host/test_admission_queue.py`、`tests/host/test_projection_read_model.py` 与 `docs/reviews/phase10-5-slice3-fix-codex-20260518.md`；fix agent reported 47 tests passed and `pyright dayu/host tests/host` 0 errors；controller 本地复跑同一 47-test 集合 passed，`pyright dayu/host tests/host` 0 errors。P10.5 Slice 3 follow-up re-review artifacts 为 `docs/reviews/phase10-5-slice3-followup-rereview-mimo-20260518.md` 与 `docs/reviews/phase10-5-slice3-followup-rereview-ds-20260518.md`，两份均 PASS，blocking count = 0；Controller follow-up re-review adjudication artifact 为 `docs/reviews/phase10-5-slice3-followup-rereview-controller-adjudication-20260518.md`。Accepted Slice 3 local commit hash：`8e6f352`。P10.5 Slice 4 implementation artifact 为 `docs/reviews/phase10-5-slice4-implementation-codex-20260518.md`；implementation agent reported focused tests `tests/host/test_watch_session_events.py tests/host/test_public_host_event.py` passed with 7 tests, extra affected tests `tests/host/test_package_exports.py tests/host/test_public_event_stream.py tests/host/test_public_contracts.py` passed with 62 tests, and `pyright dayu/host tests/host` returned 0 errors；controller 本地复跑同一验证通过。P10.5 Slice 4 code review artifacts 为 `docs/reviews/phase10-5-slice4-code-review-mimo-20260518.md` 与 `docs/reviews/phase10-5-slice4-code-review-ds-20260518.md`，两份均 PASS，blocking count = 0；Controller adjudication artifact 为 `docs/reviews/phase10-5-slice4-code-review-controller-adjudication-20260518.md`。Accepted Slice 4 local commit hash：`73db9f0`。当前进入 P10.5 Slice 5 implementation。
 
@@ -259,6 +259,78 @@ Phase Map 中每个 phase 必须使用统一条目格式。模板如下：
 当前 gate 追加事实（draft-PR-pass）：PR 62 分支已 push 到 `github/feat/host-p10-5-public-contract-freeze`，最新 pushed commit 为 `43e232d`。`gh pr view 62` 显示 draft=true、state=OPEN、mergeStateStatus=CLEAN、statusCheckRollup=[]；`gh pr checks 62 --watch=false` 返回 no checks reported。PR 62 draft PR gate 通过，当前状态为 draft-PR-pass。P10.5 状态保持 completed；下一工作入口为 Phase 11 design discussion / plan gate，除非用户另行要求处理 PR 62 新增外部 review / CI。
 
 当前 gate 追加事实（PR-62 fullrepo accepted-fix）：PR-62 fullrepo accepted-fix 已完成，AgentMiMo re-review PASS，AgentDS 未 BLOCKED，awaiting diagnostic refs follow-up 已修，deferred tracking 已落入本文档追踪区。
+
+当前 gate 追加事实（PR 62 merged / Phase 11 entry）：PR 62 `https://github.com/noho/dayu-agent-r/pull/62` 已 merge，mergedAt 为 `2026-05-19T12:47:46Z`，merge commit 为 `914a698d735ff104e03a286f46f848864eb1a752`。P10.5 PR gate 已 closed；当前进入 Phase 11 design discussion / plan gate。Phase 11 第一入口必须先确认 positive orphan proof 的本机 `pid` / `process_start_token` / heartbeat 判定策略，并讨论 `RUNNING` / `CANCELLING` / `RECOVERING` / `WAITING` / `QUEUED` startup 分类、suspect owner diagnostic path、repeated recovery 上限与 LOST / FAILED 收口 policy。
+
+当前 gate 追加事实（Phase 11 design discussion baseline accepted）：Phase 11 design discussion 已接受第一版 recovery baseline：`heartbeat_at` stale 不能单独证明 orphan；positive orphan proof 必须同时证明 owner heartbeat 超过 stale threshold，并通过本机进程证据证明 owner pid 已不存在，或 pid 已复用且 `process_start_token` / `boot_id` / `created_at` 启动指纹不匹配；`ACCEPTED` / `QUEUED` / `WAITING` startup 原地保留；`RUNNING` / `CANCELLING` 只有 positive orphan proof 成立才写 `ATTEMPT_LOST` 并按 facts 完整性进入 `RECOVERING` 或 `LOST`；`RECOVERING` 在未取消且未超上限时创建新 Attempt / 新 `execution_id`；suspect owner 只记录 diagnostic，不误杀、不接管；第一版每个 Run 最多允许一次 automatic startup recovery dispatch，超限后结构化 `LOST` 收口。该 baseline 已写入 `docs/host/design.md` §27。用户已授权：Phase 11 到达 `ready-to-open-draft-PR` 后可自动进入 draft PR gate 并推进到 `draft-PR-pass`；到达 `draft-PR-pass` 后必须追加 `$deepreview --all` 闭环，fix / re-review 至 PASS 后才允许最终 closeout。
+
+当前 gate 追加事实（Phase 11 plan review）：Phase 11 handoff implementation-ready plan artifact 已生成：`docs/host/phase11-host-lifecycle-recovery-plan.md`，结论 `HANDOFF_READY`，blocking questions count = 0。Plan review artifacts 为 `docs/reviews/phase11-plan-review-mimo-20260519.md` 与 `docs/reviews/phase11-plan-review-ds-20260519.md`，两份均 PASS，blocking count = 0。Controller adjudication artifact 为 `docs/reviews/phase11-plan-review-controller-adjudication-20260519.md`；总控裁决：接受 process_start_token 高熵约束、WAITING diagnostic fallback、heartbeat task failure mode、RECOVERING cancel idempotency scope、recovery count filtered EventLog helper、RunInputBuilder canonical-fact hardening 为当前 plan hardening；MiMo F6 run_transition 顺序冲突 finding rejected as no-action。当前进入 Phase 11 plan fix。
+
+当前 gate 追加事实（Phase 11 accepted plan）：Phase 11 plan fix artifact 为 `docs/reviews/phase11-plan-fix-codex-20260519.md`，只修改 `docs/host/phase11-host-lifecycle-recovery-plan.md`，结论 `PLAN_FIX_COMPLETE`。Plan re-review artifacts 为 `docs/reviews/phase11-plan-rereview-mimo-20260519.md` 与 `docs/reviews/phase11-plan-rereview-ds-20260519.md`，两份均 PASS，blocking count = 0，确认所有 accepted plan findings 已收口且无新增 blocker。Controller re-review adjudication artifact 为 `docs/reviews/phase11-plan-rereview-controller-adjudication-20260519.md`；总控裁决：接受 Phase 11 implementation-ready plan。当前进入 accepted plan local commit，随后进入 Phase 11 Slice 1 implementation。
+
+当前 gate 追加事实（Phase 11 accepted plan commit）：Accepted plan local commit hash 为 `9223cbf`。当前进入 Phase 11 Slice 1 implementation。
+
+当前 gate 追加事实（Phase 11 Slice 1 implementation）：Phase 11 Slice 1 implementation artifact 为 `docs/reviews/phase11-slice1-implementation-codex-20260519.md`；implementation agent 更新 Host instance lifecycle、process proof / orphan classifier foundation、dispatch heartbeat lifecycle、相关 tests 与 `dayu/host/README.md`。Agent reported focused tests `tests/host/test_host_instance_liveness.py tests/host/test_recovery_orphan_classifier.py` passed with 30 tests, extra regression `tests/host/test_dispatch_scheduler.py::test_scheduler_close_suppresses_handle_close_exception` passed, `pyright dayu/host tests/host` returned 0 errors, and `git diff --check` clean。Controller 本地复跑同一验证通过。当前进入 Phase 11 Slice 1 code review。
+
+当前 gate 追加事实（Phase 11 Slice 1 code review accepted）：Phase 11 Slice 1 code review artifacts 为 `docs/reviews/phase11-slice1-code-review-mimo-20260519.md` 与 `docs/reviews/phase11-slice1-code-review-ds-20260519.md`，两份均 PASS，blocking count = 0。Controller adjudication artifact 为 `docs/reviews/phase11-slice1-code-review-controller-adjudication-20260519.md`；总控裁决：不进入 current fix pass。DS heartbeat catch-all finding rejected-current-fix / accepted as observation，heartbeat interval deferred to Slice 2 stale-threshold policy，timezone guard finding rejected-current-fix。当前进入 accepted Slice 1 local commit。
+
+当前 gate 追加事实（Phase 11 Slice 1 accepted）：Accepted Slice 1 local commit hash 为 `235cf7d`。当前进入 Phase 11 Slice 2 implementation。
+
+当前 gate 追加事实（Phase 11 Slice 2 implementation）：Phase 11 Slice 2 implementation artifact 为 `docs/reviews/phase11-slice2-implementation-codex-20260519.md`；implementation agent 更新 startup recovery scanner、positive orphan closeout CAS transition、canonical recovery dispatch count helper、非终态 Run 读取与相关 tests / Host README。Agent reported focused tests `tests/host/test_recovery_scan.py tests/host/test_run_attempt_transitions.py` passed with 38 tests, `pyright dayu/host tests/host` returned 0 errors, and `git diff --check` clean。Controller 本地复跑同一验证通过。当前进入 Phase 11 Slice 2 code review。
+
+当前 gate 追加事实（Phase 11 Slice 2 code review）：Phase 11 Slice 2 code review artifacts 为 `docs/reviews/phase11-slice2-code-review-mimo-20260519.md` 与 `docs/reviews/phase11-slice2-code-review-ds-20260519.md`，两份均 PASS，blocking count = 0。Controller adjudication artifact 为 `docs/reviews/phase11-slice2-code-review-controller-adjudication-20260519.md`；总控裁决：接受 stale threshold `int()` 截断、CANCELLING orphan scanner-level coverage、ACCEPTED / QUEUED classification coverage 为当前 Slice 2 fix；`lose_recovering_run_in_transaction` precondition simplicity rejected-current-fix / track in Slice 3 review。当前进入 Phase 11 Slice 2 fix。
+
+当前 gate 追加事实（Phase 11 Slice 2 accepted）：Phase 11 Slice 2 fix artifact 为 `docs/reviews/phase11-slice2-fix-codex-20260519.md`；fix 将 startup orphan stale threshold 改为 `timedelta` 语义直传，并补 CANCELLING / ACCEPTED / QUEUED scanner-level tests。Plan re-review artifacts 为 `docs/reviews/phase11-slice2-rereview-mimo-20260519.md` 与 `docs/reviews/phase11-slice2-rereview-ds-20260519.md`，两份均 PASS，blocking count = 0；DS artifact 中 fractional threshold delta 笔误已修正且结论不变。Controller re-review adjudication artifact 为 `docs/reviews/phase11-slice2-rereview-controller-adjudication-20260519.md`；总控裁决：接受 Slice 2。当前进入 accepted Slice 2 local commit。
+
+当前 gate 追加事实（Phase 11 Slice 2 accepted commit）：Accepted Slice 2 local commit hash 为 `2e89558`。当前进入 Phase 11 Slice 3 implementation。
+
+当前 gate 追加事实（Phase 11 Slice 3 implementation）：Phase 11 Slice 3 implementation artifact 为 `docs/reviews/phase11-slice3-implementation-codex-20260519.md`；implementation agent 更新 RECOVERING recovery dispatch、`open_host` startup recovery scan hook、scheduler wake integration、startup recovery without reactive compact event、RunInputBuilder recovery tests、old execution rejection tests、public watch recovery integration tests 与 Host / tests README。Agent reported focused tests `tests/host/test_recovery_dispatch.py tests/host/test_run_input_builder.py tests/host/test_open_host_runtime.py` passed with 39 tests, `pyright dayu/host tests/host` returned 0 errors, and `git diff --check` clean。Controller 本地复跑同一验证通过。当前进入 Phase 11 Slice 3 code review。
+
+当前 gate 追加事实（Phase 11 Slice 3 code review）：Phase 11 Slice 3 code review artifacts 为 `docs/reviews/phase11-slice3-code-review-mimo-20260519.md` 与 `docs/reviews/phase11-slice3-code-review-ds-20260519.md`，两份均 PASS，blocking count = 0。Controller adjudication artifact 为 `docs/reviews/phase11-slice3-code-review-controller-adjudication-20260519.md`；总控裁决：接受 `dayu.host.recovery` module docstring stale 与 orphan closeout succeeds but recovery dispatch CAS returns `INVALID_STATE` 为当前 Slice 3 fix；DS `lose_recovering_run_in_transaction` precondition finding accepted as no-action / tracking closed。当前进入 Phase 11 Slice 3 fix。
+
+当前 gate 追加事实（Phase 11 Slice 3 accepted）：Phase 11 Slice 3 fix artifact 为 `docs/reviews/phase11-slice3-fix-codex-20260519.md`；fix 更新 `dayu.host.recovery` module docstring，并让 orphan closeout succeeded / recovery dispatch invalid partial-success path 返回 `RECOVERING_READY`，补对应 focused test。Slice 3 re-review artifacts 为 `docs/reviews/phase11-slice3-rereview-mimo-20260519.md` 与 `docs/reviews/phase11-slice3-rereview-ds-20260519.md`，两份均 PASS，blocking count = 0。Controller re-review adjudication artifact 为 `docs/reviews/phase11-slice3-rereview-controller-adjudication-20260519.md`；总控裁决：接受 Slice 3。当前进入 accepted Slice 3 local commit。
+
+当前 gate 追加事实（Phase 11 Slice 3 accepted commit）：Accepted Slice 3 local commit hash 为 `8e2a1b6`。当前进入 Phase 11 Slice 4 implementation。
+
+当前 gate 追加事实（Phase 11 Slice 4 implementation）：Phase 11 Slice 4 implementation artifact 为 `docs/reviews/phase11-slice4-implementation-codex-20260519.md`；implementation agent 更新 `RECOVERING` cancel durable transition、`cancel_run` / `cancel_session_runs` public path、deferred-cancel classification、相关 public cancel tests 与 Host / tests README。Agent reported focused tests `tests/host/test_public_cancel_session_runs.py tests/host/test_public_cancel_smoke.py tests/host/test_public_lifecycle_smoke.py tests/host/test_watch_session_events.py` passed with 19 tests, `pyright dayu/host tests/host` returned 0 errors, and `git diff --check` clean。Controller 本地复跑同一验证通过。当前进入 Phase 11 Slice 4 code review。
+
+当前 gate 追加事实（Phase 11 Slice 4 code review）：Phase 11 Slice 4 code review artifacts 为 `docs/reviews/phase11-slice4-code-review-mimo-20260519.md` 与 `docs/reviews/phase11-slice4-code-review-ds-20260519.md`，两份均 PASS，blocking count = 0，high count = 0。Controller adjudication artifact 为 `docs/reviews/phase11-slice4-code-review-controller-adjudication-20260519.md`；总控裁决：接受 `cancel_session_runs` unsupported error message stale、`released_active_slot=True` 局部语义澄清、RECOVERING `cancel_run` 幂等 focused test 为当前 Slice 4 fix；focused tests 直接 DB 构造 `RECOVERING` 的差异接受为 current-slice no-action，由 Slice 2 / Slice 3 / Slice 5 覆盖 recovery 创建与 multiprocess race。当前进入 Phase 11 Slice 4 fix。
+
+当前 gate 追加事实（Phase 11 Slice 4 fix）：Phase 11 Slice 4 fix artifact 为 `docs/reviews/phase11-slice4-fix-codex-20260519.md`；fix 更新 `cancel_session_runs` unsupported diagnostic、补 `_cancel_recovering` session active slot / queue promotion 注释，并新增 RECOVERING `cancel_run` 幂等 focused test。Controller 本地复跑：`tests/host/test_public_cancel_session_runs.py tests/host/test_public_cancel_smoke.py tests/host/test_public_lifecycle_smoke.py tests/host/test_watch_session_events.py -q` 20 passed；`python -m pyright dayu/host tests/host` 0 errors；`git diff --check` clean。当前进入 Phase 11 Slice 4 re-review。
+
+当前 gate 追加事实（Phase 11 Slice 4 accepted）：Phase 11 Slice 4 re-review artifacts 为 `docs/reviews/phase11-slice4-rereview-mimo-20260519.md` 与 `docs/reviews/phase11-slice4-rereview-ds-20260519.md`，两份均 PASS，blocking count = 0，确认 S4-F1 / S4-F2 / S4-F3 已收口且无新增 blocker。Controller re-review adjudication artifact 为 `docs/reviews/phase11-slice4-rereview-controller-adjudication-20260519.md`；总控裁决：接受 Slice 4。当前进入 accepted Slice 4 local commit。
+
+当前 gate 追加事实（Phase 11 Slice 4 accepted commit）：Accepted Slice 4 local commit hash 为 `b313df7`。当前进入 Phase 11 Slice 5 implementation。
+
+当前 gate 追加事实（Phase 11 Slice 5 implementation）：Phase 11 Slice 5 implementation artifact 为 `docs/reviews/phase11-slice5-implementation-codex-20260519.md`；implementation agent 新增 recovery multiprocess harness 与 tests、runtime lane close/acquire race tests，并迁移旧 active cancel / dispatch scheduler tests 的 host instance identity 假设以符合 Slice 1 高熵 `process_start_token` 约束；未修改 production Host / Runtime 代码。Controller 本地复跑：3 个 blocker regression tests 3 passed；`tests/host/test_recovery_multiprocess.py tests/host/test_admission_multiprocess.py tests/runtime/test_lane.py -q` 39 passed；`tests/host -q` 794 passed；`python -m pyright dayu/host dayu/runtime tests/host tests/runtime` 0 errors；`git diff --check` clean。当前进入 Phase 11 Slice 5 code review。
+
+当前 gate 追加事实（Phase 11 Slice 5 accepted）：Phase 11 Slice 5 code review artifacts 为 `docs/reviews/phase11-slice5-code-review-mimo-20260519.md` 与 `docs/reviews/phase11-slice5-code-review-ds-20260519.md`，两份均 PASS，blocking count = 0。Controller adjudication artifact 为 `docs/reviews/phase11-slice5-code-review-controller-adjudication-20260519.md`；总控裁决：接受 Slice 5，不进入 current fix pass。当前进入 accepted Slice 5 local commit。
+
+当前 gate 追加事实（Phase 11 Slice 5 accepted commit）：Accepted Slice 5 local commit hash 为 `4d32f66`。Controller 追加 phase acceptance validation：`pytest tests/runtime -q` 107 passed。当前进入 Phase 11 aggregate deepreview / phase acceptance validation。
+
+当前 gate 追加事实（Phase 11 aggregate deepreview）：Aggregate deepreview artifacts 为 `docs/reviews/phase11-aggregate-deepreview-mimo-20260519.md` 与 `docs/reviews/phase11-aggregate-deepreview-ds-20260519.md`。Phase acceptance commands：`pytest tests/host -q` 794 passed，`pytest tests/runtime -q` 107 passed，`pyright dayu/host dayu/runtime tests/host tests/runtime` 0 errors，`git diff --check` clean。两份 verdict 均 PASS，blocking count = 0，high count = 0。Controller adjudication artifact 为 `docs/reviews/phase11-aggregate-deepreview-controller-adjudication-20260519.md`；总控裁决：接受 RECOVERING cancel Run-row CAS helper 下沉到 durable state boundary、heartbeat interval / stale threshold 安全关系注释为当前 aggregate fix；pre-existing Engine import / dispatch god module、runtime lane 已通过无需修、pid reuse platform fingerprinting、WAITING diagnostic-only EventLog 均不进入 current fix。当前进入 Phase 11 aggregate fix。
+
+当前 gate 追加事实（Phase 11 aggregate fix）：Phase 11 aggregate fix artifact 为 `docs/reviews/phase11-aggregate-fix-codex-20260519.md`；fix 将 RECOVERING cancel Run-row CAS helper 下沉到 `dayu.host.durable.state`，`run_transition.py` 改为调用 durable state helper，并在 recovery stale threshold 常量旁补 heartbeat interval 安全关系注释。Controller 本地复跑：`tests/host/test_recovery_scan.py tests/host/test_run_attempt_transitions.py tests/host/test_public_cancel_session_runs.py -q` 50 passed；`tests/host -q` 793 passed / 1 skipped；`tests/runtime -q` 107 passed；`python -m pyright dayu/host dayu/runtime tests/host tests/runtime` 0 errors；`git diff --check` clean。当前进入 Phase 11 aggregate re-review。
+
+当前 gate 追加事实（Phase 11 aggregate accepted）：Phase 11 aggregate re-review artifacts 为 `docs/reviews/phase11-aggregate-rereview-mimo-20260519.md` 与 `docs/reviews/phase11-aggregate-rereview-ds-20260519.md`，两份均 PASS，确认 P11-AGG-F1 / P11-AGG-F2 已收口且无新增 blocker。Controller re-review adjudication artifact 为 `docs/reviews/phase11-aggregate-rereview-controller-adjudication-20260519.md`；总控裁决：接受 Phase 11 aggregate fix。当前进入 accepted aggregate fix commit。
+
+当前 gate 追加事实（Phase 11 ready-to-open-draft-PR）：Phase 11 accepted aggregate fix commit 为 `dd4e757`。Phase 11 design refinement、handoff implementation-ready plan、5 个 implementation slices、slice review / fix / re-review、aggregate deepreview、aggregate fix、aggregate re-review、controller 裁决、README / tests README 同步与 accepted local commits 均已完成并记录 artifact / commit hash。Phase 11 phase 状态为 completed；当前进入 ready-to-open-draft-PR。用户已授权自动进入 draft PR gate 并推进到 draft-PR-pass；draft-PR-pass 后必须追加 `$deepreview --all` 闭环至 PASS。
+
+当前 gate 追加事实（PR 65 draft PR create）：PR 65 `https://github.com/noho/dayu-agent-r/pull/65` 已创建为 draft PR，title 为 `Host Phase 11 lifecycle recovery hardening`，head branch 为 `feat/host-phase-11-recovery`，base branch 为 `main`。`gh pr view` 显示 draft=true、state=OPEN、mergeStateStatus=CLEAN、statusCheckRollup=[]；`gh pr checks 65 --watch=false` 返回 no checks reported。当前进入 PR 65 deepreview。
+
+当前 gate 追加事实（PR 65 deepreview）：PR 65 deepreview artifacts 为 `docs/reviews/pr-65-deepreview-mimo-20260519.md` 与 `docs/reviews/pr-65-deepreview-ds-20260519.md`，两份均 PASS，blocking count = 0。Controller adjudication artifact 为 `docs/reviews/pr-65-deepreview-controller-adjudication-20260519.md`；总控裁决：接受 branch-level `git diff --check main...HEAD` review artifact trailing whitespace 为当前 PR review fix；CI no checks reported、stdlib pid reuse limitation、heartbeat tuning、WAITING diagnostic-only behavior 与 existing dispatch complexity 均不进入 current fix。当前进入 PR 65 review fix。
+
+当前 gate 追加事实（PR 65 review fix accepted）：PR 65 review fix commit 为 `17f9d96`。PR 65 review fix re-review artifacts 为 `docs/reviews/pr-65-review-fix-rereview-mimo-20260519.md` 与 `docs/reviews/pr-65-review-fix-rereview-ds-20260519.md`，两份均 PASS，确认 PR65-F1 已收口且无新增 blocker。Controller re-review adjudication artifact 为 `docs/reviews/pr-65-review-fix-rereview-controller-adjudication-20260519.md`。当前进入 PR 65 final checks / draft-PR-pass。
+
+当前 gate 追加事实（PR 65 draft-PR-pass）：PR 65 latest pushed commit 为 `0f3dd4b`。`git diff --check main...HEAD` clean；`gh pr view 65` 显示 draft=true、state=OPEN、mergeStateStatus=CLEAN、statusCheckRollup=[]；`gh pr checks 65 --watch=false` 返回 no checks reported。PR 65 draft PR gate 通过，当前状态为 draft-PR-pass。按用户授权要求，当前进入 post-draft-PR-pass `$deepreview --all` 闭环，fix / re-review 至 PASS 后才允许最终 closeout。
+
+当前 gate 追加事实（PR 65 post-draft deepreview-all）：PR 65 post-draft `$deepreview --all` artifacts 为 `docs/reviews/pr-65-post-draft-deepreview-all-mimo-20260520.md` 与 `docs/reviews/pr-65-post-draft-deepreview-all-ds-20260519.md`，两份均 PASS，blocking count = 0。Controller adjudication artifact 为 `docs/reviews/pr-65-post-draft-deepreview-all-controller-adjudication-20260519.md`；总控裁决：接受根 README stale Host status / broken links、Host README recovery reading order、`dayu/README.md` absent fins README link 为当前 documentation fix；其它 code organization / extreme hardening findings 不进入 current fix。Documentation fix artifact 为 `docs/reviews/pr-65-post-draft-deepreview-all-fix-controller-20260519.md`；controller validation：broken-link/stale-term search no matches，`git diff --check` clean，`git diff --check main...HEAD` clean，`pyright dayu/ tests/ utils/` 0 errors。当前进入 post-draft deepreview-all re-review。
+
+当前 gate 追加事实（PR 65 post-draft deepreview-all PASS）：PR 65 post-draft `$deepreview --all` re-review artifacts 为 `docs/reviews/pr-65-post-draft-deepreview-all-rereview-mimo-20260519.md` 与 `docs/reviews/pr-65-post-draft-deepreview-all-rereview-ds-20260519.md`，两份均 PASS，确认 PDA-F1 / PDA-F2 / PDA-F3 已收口且无新增 blocker。Controller re-review adjudication artifact 为 `docs/reviews/pr-65-post-draft-deepreview-all-rereview-controller-adjudication-20260519.md`；总控裁决：用户授权要求的 post-draft-PR-pass `$deepreview --all` 闭环已达到 PASS。验证记录：stale / broken term sweep clean，`git diff --check` clean，`git diff --check main...HEAD` clean，`python -m pyright dayu/ tests/ utils/` 0 errors；AgentMiMo 额外报告 `pytest tests/ -x -q` 1325 passed。剩余风险均为 non-blocking：stdlib pid reuse proof limitation、heartbeat tuning、WAITING diagnostic-only behavior、既有 dispatch / code organization cleanup；DS 额外指出的 `README.md` 中 `dayu/web/README.md` 缺失链接已确认存在于 `main`，非 PR 65 引入，另行追踪。当前进入 final push / PR status verification。
+
+当前 gate 追加事实（PR 65 manual post-draft deepreview-all fix / PASS）：用户手工补跑两轮并行 `$deepreview --all`，manual artifacts 为 `docs/reviews/repo-review-20260520-060834.md` 与 `docs/reviews/repo-review-20260520-060858.md`。Controller 裁决 artifact 为 `docs/reviews/pr-65-manual-deepreview-all-controller-adjudication-20260520.md`；fix artifact 为 `docs/reviews/pr-65-manual-deepreview-all-fix-codex-20260520.md`。总控裁决：接受并修复 awaiting timeout diagnostic refs、startup scan 对 `ACCEPTED` / `QUEUED` post-commit queue promotion wake、open questions `CLEAR` retention、duplicate `ALLOW` governed event、non-429 `Retry-After` cap、non-stream provider error object、`ATTACH_ACTIVE` attach accepted Run。Manual re-review artifacts 为 `docs/reviews/pr-65-manual-deepreview-all-rereview-mimo-20260520.md` 与 `docs/reviews/pr-65-manual-deepreview-all-rereview-ds-20260520.md`，两份均 PASS，blocking/high count = 0；full host validation 后追加的 duplicate `ALLOW` integration test expectation 同步已由 AgentMiMo / AgentDS follow-up 确认 PASS 结论不变且无 blocker。最终验证记录：focused 128 passed；`tests/engine/runners/openai -q` 214 passed；`tests/host -q` 795 passed / 1 skipped；`python -m pyright dayu/ tests/ utils/` 0 errors；`git diff --check` clean。Deferred / non-blocking owner：PID reuse identity proof、EventLog physical corruption tolerance、recovery scan batching、dispatcher closeout retry、projection repair filtering 与 structural cleanup 归 Phase 15 production hardening；Audit / tool trace durability 与 terminal delivery observability 归 Phase 13 projection sinks；未新增、删除或重塑 Host public interface。当前进入 accepted manual deepreview fix commit / push。
+
+当前 gate 追加事实（PR 65 manual deepreview accepted commit / push）：accepted manual deepreview fix commit 为 `23d9d30`，已 push 到 `feat/host-phase-11-recovery`。`git diff --check main...HEAD` clean；`gh pr view 65` 显示 draft=true、state=OPEN、mergeStateStatus=CLEAN、statusCheckRollup=[]；`gh pr checks 65 --watch=false` 返回 no checks reported。用户手工补跑的两轮 `deepreview --all` 已完成 controller fix / independent re-review / final validation / push 闭环，当前状态为 draft-PR-pass + manual deepreview-all PASS。
 
 ## Phase Map
 
@@ -1326,13 +1398,14 @@ Plan 必须额外收口的 readiness review checklist：
 
 前置条件：
 - Phase 10.5 ordinary local multi-turn public contract freeze 已完成；P11 不得破坏 P10.5 已冻结的普通本地多轮 Host public interface / contract，若 Recovery 必须新增或调整 public API / 核心契约，必须先回到用户讨论。
+- Core Host Public Interface Freeze 已生效：P11 及后续返工不得修改、删除或重定义现有 `open_host(options)`、`OpenHostOptions` 现有字段、`Host` public handle 方法、public request / response dataclass 字段、`watch_session_events(session_id)` live-only 语义、`HostEvent` terminal final answer view，也不得重新公开 `start_run`、`create_host_command_handle`、`stream_run_events` 等低层入口。
 - P10.5 不证明 crash recovery，但已经冻结 Service 调用方式；P11 必须在同一 `open_host(...)` / session acquisition / `watch_session_events(...)` / public command contract 上补 recovery，不能要求真实 Service 改走另一套恢复入口。
 - Phase 5 dispatch record / LocalProxy 已完成。
 - Phase 2 host instance liveness foundation 已完成。
 - Phase 3 state transition / admission 已完成。
 
 进入条件：
-- 确认 positive orphan proof 的本机 pid / process_start_token / heartbeat 判定实现策略。
+- 已确认 positive orphan proof 的本机 pid / process_start_token / heartbeat 判定实现策略；第一版 baseline 记录在 `docs/host/design.md` §27 与本文档当前状态。
 
 范围：
 - 允许修改：startup recovery scan、host instance heartbeat、orphan classifier、RECOVERING dispatch、shutdown policy、multi-process tests。
@@ -1344,9 +1417,9 @@ Plan 必须额外收口的 readiness review checklist：
 - 不从 projection 或 memory 恢复 Run truth。
 
 关键设计问题：
-- 必须确认 `RUNNING` / `CANCELLING` / `RECOVERING` / `WAITING` / `QUEUED` startup 分类。
-- 必须确认 suspect owner 不被误杀的 diagnostic path。
-- 必须确认 repeated recovery 上限与 LOST / FAILED 收口 policy。
+- 已确认 `RUNNING` / `CANCELLING` / `RECOVERING` / `WAITING` / `QUEUED` startup 分类。
+- 已确认 suspect owner 不被误杀的 diagnostic path。
+- 已确认 repeated recovery 上限与 LOST / FAILED 收口 policy。
 
 交付物：
 - phase design refinement
@@ -1390,6 +1463,7 @@ Plan 必须额外收口的 readiness review checklist：
 - Phase 1 Host public typing、`HostToolingOptions`、`ToolBundleSourceRef`、`ToolBundleSourceKind` 与 `FrameworkToolPolicyView` 已完成。
 - Phase 4 Host public API command path 已完成。
 - Phase 6 ToolRuntime / effective ToolBundle / framework tool policy 已完成。
+- Core Host Public Interface Freeze 已生效：P12 只能实现 Host 外部 runtime / Service assembly 能力，不得修改、删除或重定义现有 `dayu.host` public exports、`open_host(options)`、`OpenHostOptions` 现有字段、`Host` public handle 方法、public request / response dataclass 字段或 `watch_session_events(session_id)` live-only 语义。
 
 进入条件：
 - 确认 ToolsDiscovery / ScenePrepare 仍是 Host 外部装配能力，不拥有 Session / Run / Attempt / EventLog truth。
@@ -1405,6 +1479,7 @@ Plan 必须额外收口的 readiness review checklist：
 - 不实现业务财报工具扫描硬编码清单。
 - 不把财报 prompt 文案、业务 scene manifest 内容或 Fins storage 访问逻辑放入 `dayu.runtime`。
 - 不让 per-run request 携带 raw `ToolBundle` 或 callable binding。
+- 不新增 Host public command、Host handle method、Host opener option 或 Host request field；ToolsDiscovery / ScenePrepare 的 typed output 必须通过现有 `HostToolingOptions`、`SubmitFollowupRequest` 显式字段或 Host 外部 Service envelope 承接，不能把装配过程塞入 Host 状态机。
 
 关键设计问题：
 - 必须确认 ToolsDiscovery provider protocol 的最小 typed shape：provider identity、version / digest source refs、`ToolDefinition` collection output、duplicate name handling、reserved framework tool name conflict handling。
@@ -1454,6 +1529,7 @@ Plan 必须额外收口的 readiness review checklist：
 前置条件：
 - Phase 8 Projection Core / Host Event Stream / Minimal Read Model 已完成。
 - Phase 6 ToolRuntime diagnostic refs 已完成。
+- Core Host Public Interface Freeze 已生效：P13 不得修改、删除或重定义现有 `open_host(options)`、`OpenHostOptions` 现有字段、`Host` public handle 方法、public request / response dataclass 字段、`watch_session_events(session_id)` live-only 语义或 `HostEvent` terminal final answer view。
 
 进入条件：
 - 确认 Audit、Tool Trace、Outbox 只是 projection / sink，不参与 Host command path 成功条件，不反向成为恢复、resume、memory 或 Run 状态迁移真源。
@@ -1467,10 +1543,12 @@ Plan 必须额外收口的 readiness review checklist：
 - 不保证 channel delivery exactly-once。
 - 不让 terminal transaction 同步写 outbox 表。
 - 不把 tool trace JSONL 当作恢复、resume、memory 或 Run 状态迁移真源。
+- 不把 Outbox 合并进 `watch_session_events(...)`，不为 live watch 增加 cursor / replay 参数，不把 Outbox 变成完整 timeline / progress / reasoning 补读接口。
 
 关键设计问题：
 - 必须确认 tool trace hot JSON 与 cold JSONL 的最小字段，以及 provider request id / operation context refs 的查询口径。
 - 必须确认 Outbox item identity、UI / Service seen cursor 推荐语义、concrete Outbox read / drain API shape，以及 Outbox drain 与随后 / 并发 session live watch attach 的去重 / 防漏窗口。
+- Outbox read / drain API 是 Core Host Public Interface Freeze 之后唯一已知允许的 additive public extension；必须先经 design / plan gate 明确 shape、幂等、cursor / watermark、dedupe 与 Service ownership，且不得改变既有 Host core public contract。
 - 必须确认 LogAuditSink 路径注入、append-only JSONL、sink failure 和 purge tombstone 查询语义。
 
 交付物：
@@ -1512,6 +1590,7 @@ Plan 必须额外收口的 readiness review checklist：
 - Phase 5 LocalProxy semantic baseline 已完成。
 - Phase 6 ToolRuntime accept barrier 已完成。
 - Phase 11 recovery 与 positive orphan proof 已完成。
+- Core Host Public Interface Freeze 已生效：P14 只能替换 Host 内部 worker transport，不得修改、删除或重定义现有 `open_host(options)`、`OpenHostOptions` 现有字段、`Host` public handle 方法、public request / response dataclass 字段、`watch_session_events(session_id)` live-only 语义或 `HostEvent` terminal final answer view。
 
 进入条件：
 - 确认 remote phase 只定义并实现 transport，不改变 design 的 remote semantic contract。
@@ -1524,6 +1603,7 @@ Plan 必须额外收口的 readiness review checklist：
 - 不实现远端 worker 自治恢复。
 - 不保证 exactly-once 远程物理执行。
 - 不引入远端 lease / fencing owner。
+- 不新增 remote 专用 Host public command、remote 专用 Service-facing handle method 或 remote 专用 `OpenHostOptions` 必填字段；remote provider / endpoint / transport 装配必须通过既有 construction-time baseline、worker factory 或内部 composition contract 承接，若发现确需 public extension 必须先回到用户讨论。
 
 关键设计问题：
 - 必须确认 remote event id / ordering hint / retry / ack 的 typed transport contract。
@@ -1570,11 +1650,13 @@ Plan 必须额外收口的 readiness review checklist：
 
 前置条件：
 - Phase 8 projection core、Phase 11 recovery、Phase 13 Audit / Tool Trace / Outbox、Phase 14 remote 已完成。
+- Core Host Public Interface Freeze 已生效：P15 不得修改、删除或重定义现有 `open_host(options)`、`OpenHostOptions` 现有字段、`Host` public handle 方法、public request / response dataclass 字段、`watch_session_events(session_id)` live-only 语义或 `HostEvent` terminal final answer view。
 
 进入条件：
 - 确认第一版 release / PR 前必须关闭的 residual risk 与可接受 non-goals。
 - 先区分 release-blocking 与 follow-up items；如 projection rebuild tooling、stress / smoke tests 或 docs closeout scope 过大，必须拆出独立 phase 或后续 work unit。
 - 必须复核 Phase 4 已冻结的 `purge_session` public signature / `PurgeSessionResult` / idempotency contract；如需变更，先回到 Public API contract 讨论。
+- 必须复核 P13 additive Outbox read / drain API 是否已独立冻结；P15 只能验证和硬化，不得借 production closeout 重塑 Outbox 或 Host core public surface。
 
 范围：
 - 允许修改：`purge_session` command implementation、purge delete ranges、shared artifact ref check、projection rebuild tooling、audit tombstone query support、stress / smoke tests、README sync。
@@ -1584,6 +1666,7 @@ Plan 必须额外收口的 readiness review checklist：
 - 不实现 archive_session。
 - 不实现长期 retention policy UI。
 - 不把第一版 non-goals 偷偷变成实现目标。
+- 不新增 `archive_session`、长期 memory edit / reset / forget、public payload reader、`wait_final_answer(...)`、`get_run_result(...)` 或其它绕过 terminal `HostEvent` / Outbox terminal item 的 Service-facing捷径。
 
 关键设计问题：
 - 必须确认 purge 对 EventLog / payload / projection / outbox / tool trace hot data / audit JSONL 的最终清理矩阵。

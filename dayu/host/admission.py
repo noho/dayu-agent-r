@@ -74,6 +74,7 @@ from dayu.host.durable.run_transition import (
     CancelActiveAttemptInput,
     CancelPredispatchStartingInput,
     CancelQueuedRunInput,
+    CancelRecoveringRunInput,
     CancelWaitingRunInput,
     CreateAcceptedRunInput,
     CreateQueuedRunInput,
@@ -84,6 +85,7 @@ from dayu.host.durable.run_transition import (
     TerminalCloseoutInput,
     cancel_predispatch_starting_in_transaction,
     cancel_queued_in_transaction,
+    cancel_recovering_run_in_transaction,
     cancel_waiting_run_in_transaction,
     create_accepted_run_in_transaction,
     create_queued_run_in_transaction,
@@ -1012,10 +1014,15 @@ class _StartRunOperation:
             )
         if self.policy == AdmissionPolicy.ATTACH_ACTIVE:
             if active.status == RunStatus.ACCEPTED:
-                raise HostApiError(
-                    code=HostApiErrorCode.CONFLICT,
-                    message="Session has an accepted Run but no active Attempt",
-                    retryable=False,
+                return RunAdmissionResult(
+                    run=active,
+                    attempt=None,
+                    dispatch_record=None,
+                    pending_dispatch=None,
+                    created=False,
+                    queued=False,
+                    attached_active=True,
+                    idempotent_replay=False,
                 )
             self.idempotency_store.record_idempotent_result(
                 transaction,
@@ -1542,6 +1549,12 @@ class _CancelRunOperation:
                 semantic_digest=semantic_digest,
                 scope=scope,
             )
+        if run.status == RunStatus.RECOVERING:
+            return self._cancel_recovering(
+                transaction=transaction,
+                semantic_digest=semantic_digest,
+                scope=scope,
+            )
         if _is_terminal_run_status(run.status):
             return self._record_terminal_cancel_ack(
                 transaction=transaction,
@@ -1681,6 +1694,70 @@ class _CancelRunOperation:
             promotion=None,
             active_cancel_target=None,
             idempotent_replay=False,
+            released_active_slot=True,
+        )
+
+    def _cancel_recovering(
+        self,
+        *,
+        transaction: HostTransaction,
+        semantic_digest: str,
+        scope: IdempotencyScope,
+    ) -> CancelRunResult:
+        """取消 RECOVERING Run 并记录幂等结果。
+
+        :param transaction: 当前 Host transaction。
+        :param semantic_digest: cancel semantic digest。
+        :param scope: 幂等 scope。
+        :returns: cancel 结果；不产生 active worker 传播目标。
+        :raises HostApiError: 状态变化竞争导致不满足 recovering 前置条件时抛出。
+        """
+
+        now = self.clock.now()
+        cancel_request_event_id = self.id_factory.new_id(_EVENT_ID_PREFIX)
+        transition_result = cancel_recovering_run_in_transaction(
+            transaction,
+            self.event_log_store,
+            CancelRecoveringRunInput(
+                run_id=self.run_id,
+                cancel_request_event_id=cancel_request_event_id,
+                run_cancelled_event_id=self.id_factory.new_id(_EVENT_ID_PREFIX),
+                occurred_at=now,
+                actor=self.request.context.actor,
+                source=self.request.context.source,
+                client_request_id=self.request.client_request_id,
+                idempotency_key=self.request.client_request_id,
+                reason=self.request.reason,
+                mode=self.request.mode,
+                call_context_digest=_call_context_digest(self.request.context),
+            ),
+        )
+        _raise_for_cancel_transition_status(transition_result)
+        run = _require_transition_run(transition_result.run)
+        cancel_request_sequence = _require_event_sequence(
+            transaction,
+            self.event_log_store,
+            cancel_request_event_id,
+        )
+        self.idempotency_store.record_idempotent_result(
+            transaction,
+            scope,
+            semantic_digest,
+            IdempotencyResultRef(
+                result_kind=_IDEMPOTENCY_RESULT_KIND_RUN,
+                result_ref=run.run_id,
+                created_event_id=cancel_request_event_id,
+                created_event_sequence=cancel_request_sequence,
+            ),
+        )
+        return CancelRunResult(
+            run=run,
+            attempt=transition_result.attempt,
+            dispatch_record=transition_result.dispatch_record,
+            promotion=None,
+            active_cancel_target=None,
+            idempotent_replay=False,
+            # 这里释放的是 session active slot / queue promotion 资格，不是 active worker cancel。
             released_active_slot=True,
         )
 
@@ -1864,6 +1941,7 @@ class _SupportedSessionCancelTarget:
     dispatch_record: DispatchRecordRow | None
     active_worker: bool
     waiting: bool
+    recovering: bool
 
 
 @dataclass(frozen=True, slots=True)
@@ -1983,7 +2061,7 @@ class _CancelSessionRunsOperation:
                     code=HostApiErrorCode.UNSUPPORTED_OPERATION,
                     message=(
                         "cancel_session_runs supports only queued, pre-dispatch "
-                        "STARTING, active worker, and WAITING Runs in the "
+                        "STARTING, active worker, WAITING, and RECOVERING Runs in the "
                         "current Host cancel scope"
                     ),
                     retryable=False,
@@ -2006,6 +2084,8 @@ class _CancelSessionRunsOperation:
             return self._cancel_queued_target(transaction, target.run)
         if target.waiting:
             return self._cancel_waiting_target(transaction, target.run)
+        if target.recovering:
+            return self._cancel_recovering_target(transaction, target.run)
         if target.active_worker:
             return self._cancel_active_target(transaction, target.run)
         return self._cancel_predispatch_target(transaction, target.run)
@@ -2127,6 +2207,39 @@ class _CancelSessionRunsOperation:
             transaction,
             self.event_log_store,
             CancelWaitingRunInput(
+                run_id=run.run_id,
+                cancel_request_event_id=cancel_request_event_id,
+                run_cancelled_event_id=self.id_factory.new_id(_EVENT_ID_PREFIX),
+                occurred_at=now,
+                actor=self.request.context.actor,
+                source=self.request.context.source,
+                client_request_id=self.request.client_request_id,
+                idempotency_key=self.request.client_request_id,
+                reason=self.request.reason,
+                mode=self.request.mode,
+                call_context_digest=_call_context_digest(self.request.context),
+            ),
+        )
+        _raise_for_session_cancel_transition_status(result)
+        return cancel_request_event_id
+
+    def _cancel_recovering_target(
+        self, transaction: HostTransaction, run: RunRow
+    ) -> str:
+        """取消一个 RECOVERING Run。
+
+        :param transaction: 当前 Host transaction。
+        :param run: 已校验为 RECOVERING 的 Run。
+        :returns: ``CANCEL_REQUESTED`` event id。
+        :raises HostApiError: transition 失败时抛出。
+        """
+
+        now = self.clock.now()
+        cancel_request_event_id = self.id_factory.new_id(_EVENT_ID_PREFIX)
+        result = cancel_recovering_run_in_transaction(
+            transaction,
+            self.event_log_store,
+            CancelRecoveringRunInput(
                 run_id=run.run_id,
                 cancel_request_event_id=cancel_request_event_id,
                 run_cancelled_event_id=self.id_factory.new_id(_EVENT_ID_PREFIX),
@@ -4149,6 +4262,7 @@ def _session_cancel_target_for_run(
             dispatch_record=None,
             active_worker=False,
             waiting=False,
+            recovering=False,
         )
     if run.status == RunStatus.WAITING:
         if run.current_attempt_id is None:
@@ -4175,9 +4289,27 @@ def _session_cancel_target_for_run(
             dispatch_record=dispatch_record,
             active_worker=False,
             waiting=True,
+            recovering=False,
         )
     if run.status == RunStatus.RECOVERING:
-        return None
+        attempt = (
+            read_attempt_by_id(transaction, run.current_attempt_id)
+            if run.current_attempt_id is not None
+            else None
+        )
+        dispatch_record = (
+            read_dispatch_record_by_attempt_id(transaction, run.current_attempt_id)
+            if run.current_attempt_id is not None
+            else None
+        )
+        return _SupportedSessionCancelTarget(
+            run=run,
+            attempt=attempt,
+            dispatch_record=dispatch_record,
+            active_worker=False,
+            waiting=False,
+            recovering=True,
+        )
     if run.status not in (RunStatus.RUNNING, RunStatus.CANCELLING):
         return None
     if run.current_attempt_id is None:
@@ -4207,6 +4339,7 @@ def _session_cancel_target_for_run(
             dispatch_record=dispatch_record,
             active_worker=False,
             waiting=False,
+            recovering=False,
         )
     if (
         run.status in (RunStatus.RUNNING, RunStatus.CANCELLING)
@@ -4218,6 +4351,7 @@ def _session_cancel_target_for_run(
             dispatch_record=dispatch_record,
             active_worker=True,
             waiting=False,
+            recovering=False,
         )
     return None
 

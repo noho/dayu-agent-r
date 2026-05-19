@@ -399,10 +399,10 @@ def _run_status(db_path: Path, run_id: str) -> RunStatus:
     return RunStatus(str(row[0]))
 
 
-def test_start_run_accepts_and_attach_active_rejects_unstarted_run(
+def test_start_run_accepts_and_attach_active_returns_unstarted_run(
     tmp_path: Path,
 ) -> None:
-    """public start_run 先进入 ACCEPTED，attach_active 不附着未启动 Run。"""
+    """public attach_active 可附着 ACCEPTED active Run 且不写新事件。"""
 
     options = _options(tmp_path)
     host = create_host_command_handle(options)
@@ -411,19 +411,20 @@ def test_start_run_accepts_and_attach_active_rejects_unstarted_run(
         accepted = start_run(host, _start_request(session_id, "start-1"))
         before_attach = _event_count(options.db_path)
 
-        with pytest.raises(HostApiError) as exc_info:
-            start_run(
-                host,
-                _start_request(
-                    session_id,
-                    "attach-1",
-                    queue_policy="attach_active",
-                ),
+        attached = start_run(
+            host,
+            _start_request(
+                session_id,
+                "attach-1",
+                queue_policy="attach_active",
             )
+        )
 
         assert accepted.status == RunStatus.ACCEPTED
         assert accepted.current_attempt_id is None
-        assert exc_info.value.code == HostApiErrorCode.CONFLICT
+        assert attached.run_id == accepted.run_id
+        assert attached.status == RunStatus.ACCEPTED
+        assert attached.current_attempt_id is None
         assert _event_count(options.db_path) == before_attach
     finally:
         host.close()

@@ -3,7 +3,6 @@
 from __future__ import annotations
 
 import asyncio
-import os
 import sqlite3
 from collections.abc import AsyncIterator
 from dataclasses import dataclass
@@ -50,10 +49,6 @@ from dayu.host.api import (
 from dayu.host.command import HostCommandHandle, create_host_command_handle, start_run
 from dayu.host.dispatch import ActiveWorkerRegistry, HostDispatchScheduler
 from dayu.host.durable.connection import HostDurableStore, open_host_durable_store
-from dayu.host.durable.liveness import (
-    HostInstanceIdentity,
-    register_current_instance,
-)
 from dayu.host.durable.options import (
     HostDurableStoreOptions,
     HostSQLiteStoragePolicy,
@@ -808,7 +803,7 @@ def _pending_dispatch(refs: _RunRefs) -> PendingDispatchRecord:
 def _mark_waiting_for_lane(
     transaction_runner: HostTransactionRunner, refs: _RunRefs
 ) -> None:
-    """把 dispatch record 标记为 waiting_for_lane。
+    """复用 scheduler 注册的 owner row 标记 waiting_for_lane。
 
     :param transaction_runner: transaction runner。
     :param refs: durable refs。
@@ -816,7 +811,6 @@ def _mark_waiting_for_lane(
     """
 
     def _operation(transaction: HostTransaction) -> None:
-        _register_test_instance(transaction)
         mark_dispatch_waiting_for_lane_row(
             transaction,
             attempt_id=refs.attempt_id,
@@ -831,7 +825,7 @@ def _mark_waiting_for_lane(
 def _mark_dispatching(
     transaction_runner: HostTransactionRunner, refs: _RunRefs
 ) -> None:
-    """把 dispatch record 标记为 pre-accept dispatching。
+    """复用 scheduler 注册的 owner row 标记 pre-accept dispatching。
 
     :param transaction_runner: transaction runner。
     :param refs: durable refs。
@@ -839,7 +833,6 @@ def _mark_dispatching(
     """
 
     def _operation(transaction: HostTransaction) -> None:
-        _register_test_instance(transaction)
         mark_dispatch_waiting_for_lane_row(
             transaction,
             attempt_id=refs.attempt_id,
@@ -859,24 +852,6 @@ def _mark_dispatching(
         )
 
     transaction_runner.run_write(_operation)
-
-
-def _register_test_instance(transaction: HostTransaction) -> None:
-    """注册测试 dispatch owner host instance。
-
-    :param transaction: 当前 Host transaction。
-    :returns: ``None``。
-    """
-
-    register_current_instance(
-        transaction,
-        HostInstanceIdentity(
-            host_instance_id="host-active-cancel",
-            pid=os.getpid(),
-            process_start_token="dispatch-host-active-cancel",
-            boot_id=None,
-        ),
-    )
 
 
 def _run_status(db_path: Path, run_id: str) -> RunStatus:

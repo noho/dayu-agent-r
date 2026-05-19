@@ -199,6 +199,37 @@ async def test_quality_rejects_pinned_patch_unknown_evidence_ref() -> None:
 
 
 @pytest.mark.asyncio
+async def test_quality_marks_open_questions_lost_when_clear_without_summary_questions() -> None:
+    """CLEAR 且 summary 未保留 open questions 时不得误报 retained。
+
+    :returns: ``None``。
+    """
+
+    request = _request()
+    candidate = await FakeContextCompactor().compact(request)
+    summary = replace(candidate.episode_summary_candidate, open_questions=())
+    pinned_patch = replace(
+        candidate.pinned_state_patch_candidate,
+        open_questions=PinnedStringTupleFieldPatch(
+            operation=PinnedPatchOperation.CLEAR,
+            value=None,
+            evidence_refs=(
+                candidate.pinned_state_patch_candidate.open_questions.evidence_refs
+            ),
+        ),
+    )
+    candidate = replace(
+        candidate,
+        episode_summary_candidate=summary,
+        pinned_state_patch_candidate=pinned_patch,
+    )
+
+    result = check_compaction_candidate(request, candidate)
+
+    assert result.open_questions_retained is False
+
+
+@pytest.mark.asyncio
 async def test_quality_rejects_summary_pretending_to_create_verified_fact() -> None:
     """Quality check 拒绝 episode summary 伪造 verified fact。
 
