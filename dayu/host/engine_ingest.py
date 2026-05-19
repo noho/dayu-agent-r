@@ -824,6 +824,7 @@ class EngineEventIngestor:
             transaction,
             candidate=context.candidate,
             reason="unsupported_engine_event_type",
+            stop_worker_stream=True,
         )
 
     def _validate_durable_context(
@@ -2152,12 +2153,14 @@ class EngineEventIngestor:
         *,
         candidate: EngineEventCandidate,
         reason: str,
+        stop_worker_stream: bool = False,
     ) -> EngineIngestResult:
         """追加 rejected diagnostic。
 
         :param transaction: 当前 Host transaction。
         :param candidate: 被拒绝的 candidate。
         :param reason: 拒绝原因。
+        :param stop_worker_stream: 是否要求 worker stream fail-closed 停止。
         :returns: rejected ingest 结果。
         """
 
@@ -2190,6 +2193,7 @@ class EngineEventIngestor:
             terminal_closeout=False,
             promotion_triggered=False,
             reason=reason,
+            stop_worker_stream=stop_worker_stream,
         )
 
     def _write_terminal_summary(

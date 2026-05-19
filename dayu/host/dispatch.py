@@ -20,6 +20,11 @@ from uuid import uuid4
 
 from dayu.contracts.cancellation import CancellationToken
 from dayu.contracts.json_value import JsonValue
+from dayu.engine.contracts.engine_events import (
+    EngineEvent,
+    EngineEventType,
+    RunCancelledData,
+)
 from dayu.host.admission import (
     PendingDispatchRecord,
     create_host_admission_service,
@@ -2470,24 +2475,38 @@ class HostDispatchScheduler:
                     event = await anext(events)
                 except StopAsyncIteration:
                     if not terminal_seen:
-                        _LOGGER.critical(
-                            "dispatch.worker_events.clean_eof_without_terminal "
-                            "run_id=%s attempt_id=%s execution_id=%s "
-                            "dispatch_record_id=%s local_worker_id=%s "
-                            "last_observed_worker_event_index=%s",
-                            record.run_id,
-                            record.attempt_id,
-                            record.execution_id,
-                            record.dispatch_record_id,
-                            local_worker_id,
-                            worker_event_index,
-                        )
-                        result = ingestor.close_clean_eof(
-                            envelope,
-                            observed_at=datetime.now(UTC),
-                            last_observed_worker_event_index=worker_event_index,
-                        )
-                        run_terminal_closed = _ingest_closed_run(result)
+                        if (
+                            cancellation_token.is_cancelled()
+                            and not self._closed
+                        ):
+                            result = ingestor.ingest(
+                                _cancelled_eof_candidate(
+                                    envelope=envelope,
+                                    worker_event_index=worker_event_index + 1,
+                                    observed_at=datetime.now(UTC),
+                                    cancellation_token=cancellation_token,
+                                )
+                            )
+                            run_terminal_closed = _ingest_closed_run(result)
+                        if not run_terminal_closed:
+                            _LOGGER.critical(
+                                "dispatch.worker_events.clean_eof_without_terminal "
+                                "run_id=%s attempt_id=%s execution_id=%s "
+                                "dispatch_record_id=%s local_worker_id=%s "
+                                "last_observed_worker_event_index=%s",
+                                record.run_id,
+                                record.attempt_id,
+                                record.execution_id,
+                                record.dispatch_record_id,
+                                local_worker_id,
+                                worker_event_index,
+                            )
+                            result = ingestor.close_clean_eof(
+                                envelope,
+                                observed_at=datetime.now(UTC),
+                                last_observed_worker_event_index=worker_event_index,
+                            )
+                            run_terminal_closed = _ingest_closed_run(result)
                     break
                 except asyncio.CancelledError:
                     raise
@@ -2629,6 +2648,49 @@ def _is_dispatchable_recheck(
         and dispatch_record.lane_name is not None
         and dispatch_record.worker_accept_event_id is None
         and dispatch_record.cancelled_event_id is None
+    )
+
+
+def _cancelled_eof_candidate(
+    *,
+    envelope: LocalEngineEnvelope,
+    worker_event_index: int,
+    observed_at: datetime,
+    cancellation_token: _HostCancellationToken,
+) -> EngineEventCandidate:
+    """把 cancel 后的 clean EOF 转为明确 run_cancelled candidate。
+
+    :param envelope: 当前 worker envelope。
+    :param worker_event_index: 合成 EngineEvent 的 worker event 序号。
+    :param observed_at: Host 观察时间。
+    :param cancellation_token: Host 注入 Engine 的取消 token。
+    :returns: 可交给 EngineEventIngestor 的 cancel candidate。
+    :raises Exception: 不主动抛出异常。
+    """
+
+    requested_at = cancellation_token.requested_at()
+    if requested_at is None:
+        requested_at = observed_at
+    reason = cancellation_token.cancel_reason()
+    if reason is None:
+        reason = "host_cancelled"
+    return EngineEventCandidate(
+        envelope=envelope,
+        worker_event_index=worker_event_index,
+        observed_at=observed_at,
+        engine_event=EngineEvent(
+            occurred_at=observed_at,
+            session_id=envelope.session_id,
+            run_id=envelope.run_id,
+            type=EngineEventType.RUN_CANCELLED,
+            data=RunCancelledData(
+                reason=reason,
+                requested_at=requested_at,
+                accepted_at=observed_at,
+                finished_at=observed_at,
+            ),
+            metadata=None,
+        ),
     )
 
 

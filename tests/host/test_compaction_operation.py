@@ -226,7 +226,7 @@ def _request() -> CompactionRequest:
             estimated_input_tokens=100,
             input_budget_tokens=200,
             soft_threshold_tokens=120,
-            hard_threshold_tokens=80,
+            hard_threshold_tokens=140,
             safety_margin_tokens=20,
             estimator_digest=_DIGEST,
             overage_reason=None,

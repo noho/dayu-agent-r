@@ -137,6 +137,17 @@ def test_classify_awaiting() -> None:
     assert _classify(_make_awaiting()) == "awaiting"
 
 
+def test_tool_await_snapshot_rejects_empty_snapshot_id() -> None:
+    """ToolAwaitSnapshot 拒绝空 snapshot_id。"""
+
+    for snapshot_id in ("", " \t\n"):
+        with pytest.raises(ValueError, match="snapshot_id"):
+            ToolAwaitSnapshot(
+                snapshot_id=snapshot_id,
+                captured_at=datetime(2026, 1, 1),
+            )
+
+
 def test_classify_cancelled() -> None:
     """cancelled 分支应返回 ``"cancelled"``。"""
 

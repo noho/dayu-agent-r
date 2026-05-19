@@ -73,7 +73,7 @@ async def test_mock_tool_fact_enters_memory_and_next_run_input(
         message.content if message.content is not None else ""
         for message in second_run_initial_messages
     )
-    assert "event_ref=event-engine-" in joined
+    assert "event_id=event-tool-result-accepted-" in joined
 
 
 @pytest.mark.asyncio

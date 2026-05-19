@@ -1491,6 +1491,7 @@ def test_unsupported_engine_event_shape_is_rejected(tmp_path: Path) -> None:
 
         assert result.status == EngineIngestStatus.REJECTED
         assert _payload(result.events[0])["reason"] == "unsupported_engine_event_type"
+        assert result.stop_worker_stream is True
 
 
 @pytest.mark.parametrize(
@@ -1530,6 +1531,7 @@ def test_preview_event_rejects_missing_or_wrong_data(
         assert result.status == EngineIngestStatus.REJECTED
         assert result.events[0].event_class == EventClass.DIAGNOSTIC
         assert _payload(result.events[0])["reason"] == "unsupported_engine_event_type"
+        assert result.stop_worker_stream is True
         assert _event_count(store.transaction_runner, "CONTENT_DELTA") == 0
 
 

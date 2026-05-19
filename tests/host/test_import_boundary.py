@@ -48,6 +48,7 @@ HOST_ENGINE_CONTRACT_ALLOWED_MODULES: tuple[str, ...] = (
     "api.py",
     "dispatch.py",
     "engine_ingest.py",
+    "llm_compaction.py",
     "local_proxy.py",
     "run_input.py",
 )

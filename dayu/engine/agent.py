@@ -2401,7 +2401,7 @@ class _AsyncAgent:
                 self._request.run_id,
                 type(exc).__name__,
             )
-        else:
+        finally:
             self._closed = True
 
     def _log_iteration_decision(

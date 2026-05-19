@@ -258,6 +258,8 @@ Phase Map 中每个 phase 必须使用统一条目格式。模板如下：
 
 当前 gate 追加事实（draft-PR-pass）：PR 62 分支已 push 到 `github/feat/host-p10-5-public-contract-freeze`，最新 pushed commit 为 `43e232d`。`gh pr view 62` 显示 draft=true、state=OPEN、mergeStateStatus=CLEAN、statusCheckRollup=[]；`gh pr checks 62 --watch=false` 返回 no checks reported。PR 62 draft PR gate 通过，当前状态为 draft-PR-pass。P10.5 状态保持 completed；下一工作入口为 Phase 11 design discussion / plan gate，除非用户另行要求处理 PR 62 新增外部 review / CI。
 
+当前 gate 追加事实（PR-62 fullrepo accepted-fix）：PR-62 fullrepo accepted-fix 已完成，AgentMiMo re-review PASS，AgentDS 未 BLOCKED，awaiting diagnostic refs follow-up 已修，deferred tracking 已落入本文档追踪区。
+
 ## Phase Map
 
 Phase 按依赖关系推进：先实现被其它阶段依赖的公共契约、runtime 基础能力、durable store、EventLog 与状态机，再连接执行路径、工具治理、projection core、memory、context governance、ordinary local multi-turn public contract freeze、recovery 与 remote。Audit、Tool Trace、Outbox 是独立 projection sinks，后置到核心治理路径稳定之后实现。Phase 0 是 Engine cleanup 前置 work unit，只阻塞 Phase 10 Context Governance，不阻塞 Phase 1-9。每个 phase 开始时仍必须先和用户讨论并细化对应 `docs/host/design.md` 章节，再生成 handoff implementation-ready plan。
@@ -1628,6 +1630,85 @@ Plan 必须额外收口的 readiness review checklist：
 - 任何 deferred 项都必须有 owner / destination；没有 destination 时不能关闭对应 phase。
 
 ### 追踪区
+
+#### PR-62 fullrepo review deferred tracking
+
+背景决议：
+
+- 输入 artifacts 为 `docs/reviews/pr-62-fullrepo-review-controller-adjudication-20260519.md`、
+  `docs/reviews/pr-62-fullrepo-accepted-fix-rereview-mimo-20260519.md`、
+  `docs/reviews/pr-62-fullrepo-accepted-fix-rereview-ds-20260519.md`、
+  `docs/reviews/repo-review-20260519-182223.md` 与
+  `docs/reviews/repo-review-20260519-182226.md`。
+- Controller 已完成 PR-62 fullrepo accepted-fix；AgentMiMo re-review verdict 为 PASS，AgentDS 未给出 BLOCKED。
+- 下列项均不阻塞 PR-62：它们属于维护性、observability、测试覆盖、性能或后续 phase 能力完善；PR-62 accepted-fix
+  已收口当前 correctness blockers，且不应在同一 fix gate 中半拆跨 owner 重构。
+
+追踪项：
+
+- runtime lane close/acquire 竞态：`LaneController.close()` / `acquire()` race owner 为 Phase 11 Host Lifecycle /
+  Recovery / Multi-process Hardening 与 runtime lane hardening owner。不阻塞 PR-62 的理由是 lane 属于 `dayu.runtime`
+  容量 primitive，不是 Host durable truth 或本轮 accepted-fix 主路径，当前仍有 TTL cleanup 兜底。触发条件为 Phase 11
+  多进程 hardening、runtime lane 压测、或出现 close 与 acquire 并发导致容量泄漏 / acquire hang 的证据；后续验证必须包含
+  targeted concurrent close/acquire tests、stale claim cleanup 与 active count invariant。
+- durable bootstrap DDL 原子性：owner 为 durable bootstrap / schema hardening work unit。不阻塞 PR-62 的理由是
+  `IF NOT EXISTS` 与 schema version 已提供 fresh DB 幂等恢复，本轮无直接证据显示会破坏当前 durable truth。触发条件为修改
+  bootstrap transaction boundary、schema init 顺序或 fresh DB 初始化流程；后续验证必须覆盖 fresh DB bootstrap、半初始化失败后的
+  retry、schema version 与 DDL visibility。
+- after-commit 多错误聚合：owner 为 durable transaction observability / projection catch-up hardening。不阻塞 PR-62
+  的理由是 after-commit callback 失败不改变已提交 durable truth，当前风险是诊断不足。触发条件为新增多个 after-commit sink /
+  projection callback，或需要排查多个 callback 同时失败；后续验证必须覆盖多 callback 失败时的错误聚合、顺序可观测性与不回滚
+  committed transaction。
+- Host crash recovery E2E：owner 为 Phase 11 Host Lifecycle / Recovery / Multi-process Hardening。不阻塞 PR-62
+  的理由是该项是真实测试缺口，但需要多进程 / 强杀式 harness 与 positive orphan proof 设计，超出 PR-62 accepted-fix 范围。
+  触发条件为 Phase 11 recovery scan、LOST / RECOVERING dispatch、active worker orphan proof 或 startup recovery 实现；
+  后续验证必须包含进程 crash / restart E2E、已 accepted prompt 未返回 answer 的恢复、旧 execution 迟到事件拒绝。
+- watch 轮询性能 / session watch 20ms polling：owner 为 Phase 11 public lifecycle hardening 或后续 production watch
+  scale owner。不阻塞 PR-62 的理由是当前 20ms polling 是性能 / 资源项，没有 correctness 回归证据。触发条件为 watch
+  consumer 数量扩大、SQLite 读负载观测异常、或引入 production push / notification 机制；后续验证必须包含 watch 延迟、
+  CPU / DB read 压力与 close / cancel / terminal 可见性。
+- import boundary helper 重复：owner 为 P9.5 / Phase 11 test hardening 中的 import boundary test cleanup。不阻塞
+  PR-62 的理由是重复位于测试 helper 层，不改变生产 import boundary。触发条件为继续扩展 Engine / Host / runtime
+  boundary 白名单、出现重复断言漂移，或新增 cross-layer boundary tests；后续验证必须保持 import boundary tests
+  可读、单一真源 helper 与反向依赖禁止。
+- runtime log import 副作用：owner 为 runtime 日志清理 work unit。不阻塞 PR-62 的理由是 `dayu.runtime.log`
+  的全局 logging level 注册属于低风险 import side effect，非 Host / Engine correctness blocker。触发条件为 runtime
+  包被更多层默认 import、日志级别注册影响外部 logging policy，或 pyright / import-boundary 要求收紧 runtime side effects；
+  后续验证必须覆盖重复 import 幂等、默认 logging 行为与无跨层依赖。
+- `ToolFactAcceptCandidate` God dataclass：owner 为 ToolRuntime internal structure cleanup，优先归 P9.5 中不依赖
+  P10+ owner 的 God class cleanup；若发现会改变工具治理语义，则重新进入对应 ToolRuntime design gate。不阻塞 PR-62
+  的理由是当前字段虽多但消费者明确，风险是维护性和构造复杂度，不是运行时 correctness blocker。触发条件为新增 accept
+  candidate 字段、修改 duplicate / awaiting / reuse / governed outcome 构造矩阵，或 review 再次发现字段聚合导致错误；
+  后续验证必须覆盖 ordinary result facts、governed outcome、awaiting accept、reuse 与 duplicate matrix。
+- 非 awaiting accept failure outcome `diagnostic_refs` 传播对称缺口：owner 为 ToolRuntime outcome diagnostics
+  hardening / accept failure outcome matrix work unit。不阻塞 PR-62 的理由是 PR-62 correctness blocker 是 awaiting
+  timeout diagnostic ref 丢失，accepted-fix 已覆盖 awaiting timeout path；非 awaiting accept failure outcome 的风险是
+  诊断传播对称性与排障可观测性，当前无证据显示会改变 durable truth、Run 终态或 accepted fact 治理结果。触发条件为修改
+  ordinary accept failure outcome 构造、failure diagnostic refs 来源、`ToolFailedOutcome` hint / diagnostic mapping、
+  duplicate / reuse / governed outcome 失败路径，或 review 发现非 awaiting failure outcome 丢弃已生成诊断 ref；
+  后续验证必须覆盖 awaiting timeout、ordinary accept failure、duplicate / reuse / governed failure 的 diagnostic refs
+  传播矩阵，并断言最终失败 outcome 能保留可关联的 diagnostic ref。
+- compact 失败最终降级路径：owner 为 Phase 10 Context Governance follow-up 与 Phase 11 recovery owner 的 failure
+  matrix。不阻塞 PR-62 的理由是当前 operation 会返回明确 failure reason，dispatch / proactive 路径已有失败事件与
+  fail-unstarted 收口；端到端策略矩阵仍需独立设计。触发条件为修改 proactive / reactive compact failure policy、
+  compactor adapter 生产接入、或 provider overflow recovery 扩展；后续验证必须覆盖 proactive compact failure、
+  reactive compact failure、hard threshold 后仍超预算的用户可见失败路径与 recovery 不误用 `LOST`。
+- executor 普通异常 observability：owner 为 Engine / ToolRuntime observability hardening。不阻塞 PR-62 的理由是
+  `_execute_batch` 当前会把 executor 普通异常转为工具失败 outcome，不破坏 Host 终态一致性；缺口是日志 / trace 诊断。
+  触发条件为工具 executor 异常排障需求、tool trace 落地或异常分类改动；后续验证必须覆盖普通异常的 outcome、
+  diagnostic / log 可关联性、敏感字段不泄漏。
+- service/ui 测试缺失：owner 为后续 Service / UI work unit。不阻塞 PR-62 的理由是当前仓库尚未实现 service/ui
+  Python 层，finding 对当前代码不可执行。触发条件为新增 `dayu.service` / `dayu.ui` 生产入口、Service / UI 调用 Host
+  public contract，或引入 UI offline / outbox 消费路径；后续验证必须包含 Service / UI contract tests 与不绕过 Host
+  public API 的 import boundary tests。
+- 敏感异常 marker 精度：owner 为 diagnostics / redaction policy hardening。不阻塞 PR-62 的理由是当前 marker
+  偏保守，风险是过度脱敏而不是敏感信息漏出或 correctness 破坏。触发条件为新增异常 taxonomy、provider / tool trace
+  对错误字段做结构化展示，或用户需要更精确排障；后续验证必须覆盖敏感字段 redaction、非敏感错误可诊断性与日志 / trace
+  一致性。
+- open_host fallback 常量：owner 为 Host configuration / composition governance work unit。不阻塞 PR-62 的理由是
+  8192 / 1024 fallback 已作为内部兜底说明，生产 composition 应显式传入 policy，本轮不改变 public contract。触发条件为
+  修改 `open_host` options、预算 policy 默认值、或 Service composition root 接入；后续验证必须覆盖显式配置优先、
+  fallback 只作为非生产兜底、README / Host README 与 public contract 一致。
 
 #### Phase 10 S4 Proactive Context Governance 残余风险追踪
 

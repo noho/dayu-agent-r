@@ -19,6 +19,11 @@ from dayu.host.compaction import (
     PinnedTextFieldPatch,
     PreservationEvidence,
 )
+from dayu.host.compaction_budget import estimate_compacted_context_budget
+
+_FAKE_COMPACTION_SYSTEM_PROMPT = (
+    "Deterministic fake context compactor preserving current input and accepted facts."
+)
 
 
 class FakeContextCompactor(ContextCompactor):
@@ -197,12 +202,14 @@ def _budget_after_compact(request: CompactionRequest) -> int:
     """按真实 LLM compactor 语义估算 compact 后预算。
 
     :param request: compaction 请求。
-    :returns: 小于 hard threshold 的 compact 后 token 估算。
+    :returns: compact 后 token 估算。
     """
 
-    half_estimate = request.budget_before_compact.estimated_input_tokens // 2
-    hard_threshold_limit = request.budget_before_compact.hard_threshold_tokens - 1
-    return max(0, min(half_estimate, hard_threshold_limit))
+    return estimate_compacted_context_budget(
+        request,
+        summary=request.current_message_summary.summary_text,
+        system_prompt=_FAKE_COMPACTION_SYSTEM_PROMPT,
+    )
 
 
 __all__ = ["FakeContextCompactor"]

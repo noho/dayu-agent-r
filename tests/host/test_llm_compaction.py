@@ -89,7 +89,26 @@ async def test_llm_context_compactor_maps_final_answer_to_candidate(
     assert candidate.preserved_input_event_refs == ("input-1", "input-2")
     assert candidate.preserved_tool_fact_refs == ("tool-fact-1",)
     assert candidate.preserved_verified_fact_refs == ("verified-1",)
-    assert candidate.budget_after_compact == 8
+    assert candidate.budget_after_compact > 8
+
+
+@pytest.mark.asyncio
+async def test_llm_context_compactor_budget_counts_preserved_context(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """compact 后预算必须覆盖 summary 以外的保留上下文。"""
+
+    monkeypatch.setattr(
+        "dayu.host.llm_compaction.run_agent_and_wait",
+        _fake_run_factory(_final("summary")),
+    )
+
+    candidate = await LLMContextCompactor(
+        runner_spec=_runner_spec(),
+        runner_options=_runner_options(),
+    ).compact(_request())
+
+    assert candidate.budget_after_compact >= 80
 
 
 @pytest.mark.asyncio

@@ -46,6 +46,7 @@ from dayu.host.compaction import (
     PinnedTextFieldPatch,
     PreservationEvidence,
 )
+from dayu.host.compaction_budget import estimate_compacted_context_budget
 
 _COMPACTOR_RUN_ID_PREFIX = "context-compactor"
 _COMPACTOR_MAX_ITERATIONS = 1
@@ -471,20 +472,11 @@ def _budget_after_compact(request: CompactionRequest, summary: str) -> int:
     :returns: 非负 token 估算。
     """
 
-    estimate = request.budget_before_compact
-    summary_tokens = _estimate_summary_tokens(summary)
-    return min(summary_tokens, estimate.hard_threshold_tokens - 1)
-
-
-def _estimate_summary_tokens(summary: str) -> int:
-    """估算摘要文本 token 数。
-
-    :param summary: compact 摘要文本。
-    :returns: 非负 token 估算。
-    :raises Exception: 不主动抛出异常。
-    """
-
-    return max(1, (len(summary) + 3) // 4)
+    return estimate_compacted_context_budget(
+        request,
+        summary=summary,
+        system_prompt=_SYSTEM_PROMPT,
+    )
 
 
 __all__ = ["LLMCompactionProposalError", "LLMContextCompactor"]

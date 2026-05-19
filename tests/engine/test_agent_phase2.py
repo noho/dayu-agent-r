@@ -983,6 +983,19 @@ async def test_close_error_does_not_override_terminal() -> None:
 
 
 @pytest.mark.asyncio
+async def test_close_runner_once_marks_closed_after_close_error() -> None:
+    """Runner close 普通异常后仍按 once 语义禁止重复 close。"""
+
+    runner = _ScriptedRunner(events=(), raise_on_close=True)
+    agent = _AsyncAgent(request=_request(), runner=runner)
+
+    await agent._close_runner_once()
+    await agent._close_runner_once()
+
+    assert runner.close_count == 1
+
+
+@pytest.mark.asyncio
 async def test_close_cancelled_error_releases_run_slot() -> None:
     """Runner close 若被取消，也必须释放私有 Agent 运行槽位。"""
 

@@ -410,6 +410,23 @@ class _SequencedAwaitingAcceptPort(HostToolAwaitingAcceptPort):
         return self._results[index]
 
 
+class _RetryExhaustedAwaitingAcceptPort(HostToolAwaitingAcceptPort):
+    """始终模拟 awaiting accept 事务重试耗尽的 fake port。"""
+
+    def accept_tool_awaiting(
+        self, candidate: ToolAwaitingAcceptCandidate
+    ) -> ToolAwaitingAcceptResult:
+        """抛出 Host 事务重试耗尽异常。
+
+        :param candidate: awaiting candidate。
+        :returns: 不会正常返回。
+        :raises HostTransactionRetryExhaustedError: 始终抛出。
+        """
+
+        del candidate
+        raise HostTransactionRetryExhaustedError("busy", attempts=1)
+
+
 class _TimeoutAwaitingAcceptPort(HostToolAwaitingAcceptPort):
     """始终抛出同步 TimeoutError 的 awaiting accept port。"""
 
@@ -835,7 +852,38 @@ async def test_awaiting_accept_timeout_returns_governed_error() -> None:
     record = outcome.records[0]
     assert isinstance(record.outcome, ToolFailedOutcome)
     assert record.outcome.result.error == "tool_awaiting_accept_timeout"
-    assert record.outcome.result.hint == "accept_ack_lost"
+    assert record.outcome.result.hint is not None
+    assert record.outcome.result.hint.startswith("accept_ack_lost;diagnostic_refs=")
+    assert "tool-diagnostic-" in record.outcome.result.hint
+
+
+@pytest.mark.asyncio
+async def test_awaiting_accept_retry_exhaustion_emits_diagnostic_ref() -> None:
+    """awaiting accept retry 耗尽时最终失败 outcome 携带诊断引用。"""
+
+    callable_ = _AwaitingCallable()
+    accept_port = _SequencedAcceptPort((_accepted_ack_for_call("tool-call-1"),))
+    awaiting_accept_port = _RetryExhaustedAwaitingAcceptPort()
+    diagnostics = InMemoryToolTraceDiagnosticEmitter()
+    executor = _executor(
+        callable_,
+        accept_port,
+        awaiting_accept_port=awaiting_accept_port,
+        wait_adapter_registry=_wait_adapter_registry(),
+        diagnostic_emitter=diagnostics,
+    )
+
+    outcome = await executor.execute(_request(_call("tool-call-1")))
+
+    record = outcome.records[0]
+    assert isinstance(record.outcome, ToolFailedOutcome)
+    assert record.outcome.result.error == "tool_awaiting_accept_timeout"
+    assert (
+        record.outcome.result.hint
+        == "accept_ack_lost;diagnostic_refs=tool-diagnostic-memory-1"
+    )
+    assert len(diagnostics.records) == 1
+    assert diagnostics.records[0].reason_code == "accept_timeout"
 
 
 @pytest.mark.asyncio

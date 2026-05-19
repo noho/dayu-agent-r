@@ -415,7 +415,7 @@ Engine 的取消提交边界是“阻止未来工作，不覆盖已接受事实�
 
 provider 协议错误与 HTTP / 网络错误分层处理。Runner 解析层错误产出 `provider_protocol_error`；HTTP、网络、超时和上下文超限产出 `runner_http_error`。其中上下文长度超限会被 Engine 提升为 `context_compaction_requested`，该事件在 provider overflow 路径中的 `budget_state` 为 `None`，并以可恢复失败候选收口；是否压缩、如何恢复、如何记录 Host budget 不属于 Engine。Engine 不做 proactive threshold compaction、compact / retry、provider-aware tokenizer 或 Host budget policy。
 
-Runner close 是 run-scoped 收尾机制。`run_agent_messages` 在生成器结束或关闭时会触发 `EngineEvent stream` 关闭；Agent 也在终态路径和最终清理中幂等关闭 Runner。普通 Runner close 失败只记录诊断，不改写已经确定的公共终态；close 被 asyncio cancellation 打断时透传取消，但仍释放私有 Agent 运行槽位。
+Runner close 是 run-scoped 收尾机制。`run_agent_messages` 在生成器结束或关闭时会触发 `EngineEvent stream` 关闭；Agent 也在终态路径和最终清理中按 once 语义关闭 Runner，普通 close 失败后不会重复 close 同一 Runner。普通 Runner close 失败只记录诊断，不改写已经确定的公共终态；close 被 asyncio cancellation 打断时透传取消，但仍释放私有 Agent 运行槽位。
 
 `metadata` 是 EngineEvent 的中性 observer / debug hint 边界。契约事实必须进入强类型 data 字段，不得放进 metadata 让调用方解析。
 

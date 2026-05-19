@@ -177,7 +177,7 @@ submit_followup(queue)
 
 runtime lane 只表达资源容量，不表达 Host ownership、lease、fencing、EventLog ordering 或 recovery proof。worker accept 前后都要依赖 durable recheck 与 Host state transition；worker stream 的 finally 路径负责 active registry 注销、worker handle close 与 lane release。
 
-worker startup timeout、worker accept failure、clean EOF without terminal、worker stream crash 和未知 terminal 都由 Host closeout 为结构化终态或 diagnostic。terminal closeout 后会触发同 Session queued Run promotion。
+worker startup timeout、worker accept failure、worker stream crash 和未知 terminal 都由 Host closeout 为结构化终态或 diagnostic。worker stream 在 Host 已请求 active cancel 后 clean EOF 时，Host 以 cancel terminal 收口；非取消 clean EOF 仍按 lost closeout 处理。terminal closeout 后会触发同 Session queued Run promotion。
 
 ## EventLog 与 HostEvent
 
@@ -208,6 +208,7 @@ ToolRuntime 的稳定语义：
 - 工具结果、工具失败、工具取消、工具等待、治理拒绝、重复调用复用与截断结果必须经过 Host accept barrier。
 - accept barrier 校验 run / attempt / execution identity、schema digest、payload descriptor、幂等与 stale execution，接受后写入 canonical tool facts。
 - side-effect 或付费工具必须具备工具级幂等依据；缺失时不调用实际 callable。
+- truncation cursor 是 run-scoped、短生命周期、单次使用的本地补读引用；一次 `fetch_more` 成功后同一 cursor 即失效。
 - `fetch_more` 是 framework tool 预留名，默认保留但不启用；业务工具不得占用预留 framework tool 名。
 
 ToolRuntime 内部 factory、run-scoped duplicate governance registry、truncation manager 和 accept port 不从 `dayu.host` 包根导出。
@@ -243,7 +244,7 @@ Context Governance 是 Host 责任。它根据 `ContextBudgetPolicy`、conservat
 - proactive：dispatch Attempt 前执行输入治理，必要时写入 compact request / compacted / failed canonical facts，再创建 Attempt。
 - reactive：Engine 报告 context compaction required 后，由 Host 校验 attempt / execution identity，按 policy 关闭当前 Attempt，执行 bounded compaction operation，并用新的 Attempt 继续。
 
-LLM compactor 只提出 structured candidate；Host 负责质量校验、预算硬阈值校验、artifact 写入、canonical event 写入和状态推进。compactor 的 Engine runner 调用受独立 timeout 边界约束；非 final outcome 的错误摘要会先脱敏，`finish_reason=length` 的 final summary 视为截断脏 proposal，不会被接受为 compact 成功。质量校验会拒绝缺失 evidence anchor、非法 pinned state patch，以及不属于本次 compaction request 可摘要输入范围的 compact range。compact 不改写历史 EventLog facts，不让 summary 替代 evidence anchor，也不直接写 memory snapshot。memory 是否吸收 compacted summary 由 memory projection policy 消费已提交 facts 决定。
+LLM compactor 只提出 structured candidate；Host 负责质量校验、预算硬阈值校验、artifact 写入、canonical event 写入和状态推进。compact 后预算按统一 Host token 估算常数计算，覆盖 summary、当前输入、保留的 recent refs、tool fact refs、verified refs、已有 summary refs 与系统提示的保守估算，不用 hard threshold 反向截断估算值。compactor 的 Engine runner 调用受独立 timeout 边界约束；非 final outcome 的错误摘要会先脱敏，`finish_reason=length` 的 final summary 视为截断脏 proposal，不会被接受为 compact 成功。质量校验会拒绝缺失 evidence anchor、非法 pinned state patch，以及不属于本次 compaction request 可摘要输入范围的 compact range。compact 不改写历史 EventLog facts，不让 summary 替代 evidence anchor，也不直接写 memory snapshot。memory 是否吸收 compacted summary 由 memory projection policy 消费已提交 facts 决定。
 
 ## Payload 与 Terminal Continuity
 

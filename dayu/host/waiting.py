@@ -299,10 +299,12 @@ class ToolAwaitingAcceptTimedOut:
 
     :param attempt_count: 已尝试次数。
     :param last_error_code: 最后错误码；无则为 ``None``。
+    :param diagnostic_refs: 工具运行时诊断引用 id。
     """
 
     attempt_count: int
     last_error_code: str | None
+    diagnostic_refs: tuple[str, ...] = ()
 
 
 ToolAwaitingAcceptResult = (
@@ -784,17 +786,7 @@ class DefaultHostResolveWaitService:
                 message="resolve wait outcome is invalid",
                 retryable=False,
             )
-        created_event = result.dispatch_record
-        created_event_id = (
-            result.run.started_event_id
-            if created_event is not None
-            else result.run.terminal_event_id
-        )
-        created_event_sequence = (
-            result.run.started_event_sequence
-            if created_event is not None
-            else result.run.terminal_event_sequence
-        )
+        created_event_id, created_event_sequence = _resolve_created_event_ref(result)
         self._idempotency_store.record_idempotent_result(
             transaction,
             scope,
@@ -2023,6 +2015,31 @@ def _wait_record_row(
         updated_at=timestamp,
         terminal_at=None,
     )
+
+
+def _resolve_created_event_ref(result: ResolveWaitResult) -> tuple[str, int]:
+    """返回 resolve wait 幂等记录应引用的创建事件。
+
+    :param result: resolve wait durable 结果。
+    :returns: ``(event_id, event_sequence)``。
+    :raises HostApiError: resume 或 terminal 路径缺失对应事件引用时抛出。
+    """
+
+    if result.dispatch_record is not None:
+        event_id = result.run.started_event_id
+        event_sequence = result.run.started_event_sequence
+        missing_message = "resolve wait resume run is missing started event ref"
+    else:
+        event_id = result.run.terminal_event_id
+        event_sequence = result.run.terminal_event_sequence
+        missing_message = "resolve wait terminal run is missing terminal event ref"
+    if event_id is None or event_sequence is None:
+        raise HostApiError(
+            code=HostApiErrorCode.INTERNAL_ERROR,
+            message=missing_message,
+            retryable=False,
+        )
+    return event_id, event_sequence
 
 
 def _accepted_ack_from_existing(

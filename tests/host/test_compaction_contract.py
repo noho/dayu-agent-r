@@ -43,8 +43,8 @@ async def test_fake_compactor_produces_typed_candidates_and_evidence() -> None:
 
 
 @pytest.mark.asyncio
-async def test_fake_compactor_clamps_budget_below_hard_threshold() -> None:
-    """Fake compactor 的预算估算与真实 LLM compactor hard clamp 对齐。
+async def test_fake_compactor_reports_budget_above_hard_threshold_when_preserved_refs_dominate() -> None:
+    """Fake compactor 不再用 hard threshold 掩盖保留上下文预算。
 
     :returns: ``None``。
     """
@@ -59,7 +59,7 @@ async def test_fake_compactor_clamps_budget_below_hard_threshold() -> None:
 
     candidate = await FakeContextCompactor().compact(request)
 
-    assert candidate.budget_after_compact == budget.hard_threshold_tokens - 1
+    assert candidate.budget_after_compact >= budget.hard_threshold_tokens
 
 
 @pytest.mark.asyncio
