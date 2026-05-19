@@ -294,6 +294,23 @@ class EventLogStore:
             payload_filter=payload_filter,
         )
 
+    def count_recovery_dispatches_for_run(
+        self,
+        transaction: HostTransaction,
+        *,
+        run_id: str,
+    ) -> int:
+        """统计某个 Run 已提交的 recovery dispatch 次数。
+
+        :param transaction: 调用方提供的 Host durable transaction。
+        :param run_id: 目标 Run id。
+        :returns: 该 Run 下 canonical ``RUN_STARTED`` 且 payload
+            ``start_reason`` 为 ``recovery`` 的事件数量。
+        :raises HostDurableError: 输入非法或 payload 无法验证时抛出。
+        """
+
+        return count_recovery_dispatches_for_run(transaction, run_id=run_id)
+
 
 def append_event(
     transaction: HostTransaction, request: EventLogAppendRequest
@@ -579,6 +596,34 @@ def count_committed_events_by_run_and_type(
         if value == payload_filter.expected_value:
             count += 1
     return count
+
+
+def count_recovery_dispatches_for_run(
+    transaction: HostTransaction, *, run_id: str
+) -> int:
+    """统计某个 Run 已提交的 recovery dispatch 次数。
+
+    该 helper 只读取 EventLog canonical facts，按 ``run_id`` 和
+    ``RUN_STARTED`` 精确过滤，并只计入 inline payload 中
+    ``start_reason == "recovery"`` 的事件；不读取 projection/read-model，也不做
+    diagnostic 文本匹配。
+
+    :param transaction: 调用方提供的 Host durable transaction。
+    :param run_id: 目标 Run id。
+    :returns: recovery dispatch 次数。
+    :raises HostDurableError: 输入非法或 payload 无法验证时抛出。
+    """
+
+    return count_committed_events_by_run_and_type(
+        transaction,
+        run_id=run_id,
+        event_type="RUN_STARTED",
+        payload_filter=EventPayloadTextEqualsFilter(
+            field_name="start_reason",
+            expected_value="recovery",
+            allowed_values=("initial", "queue_promotion", "resume", "steer", "recovery"),
+        ),
+    )
 
 
 @dataclass(frozen=True, slots=True)
