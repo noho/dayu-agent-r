@@ -36,7 +36,6 @@ from dayu.host import (
     HostApiErrorCode,
     HostApiErrorDetail,
     HostCallContext,
-    HostInput,
     HostPayloadRef,
     LocalEngineWorkerFactory,
     HostMetadataEntry,
@@ -69,6 +68,7 @@ from dayu.host.api import (
     HostCommandHandleOptions,
     HostEventStream,
     HostEventView,
+    HostInput,
     HostLocalExecutionOptions,
     StartRunRequest,
 )

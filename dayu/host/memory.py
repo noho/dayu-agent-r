@@ -18,6 +18,10 @@ from dayu.host.context_events import (
     validate_context_compacted_payload,
 )
 from dayu.host.durable.codec import sha256_digest_json
+from dayu.host.terminal_summary_payload import (
+    PayloadSummaryTextPolicy,
+    assistant_summary_from_payload,
+)
 
 MemoryPolicyDigest: TypeAlias = str
 """Memory policy canonical JSON digest。"""
@@ -55,7 +59,6 @@ _EVENT_TYPE_TOOL_RESULT_ACCEPTED = "TOOL_RESULT_ACCEPTED"
 _PRODUCER_NAME_HOST_PROJECTION = "host_projection"
 _SNAPSHOT_DIGEST_PENDING = "pending"
 _PAYLOAD_FIELD_DISPLAY_TEXT = "display_text"
-_PAYLOAD_FIELD_FINAL_ANSWER = "final_answer"
 _PAYLOAD_FIELD_SUMMARY_TEXT = "summary_text"
 _PAYLOAD_FIELD_EPISODE_SUMMARY_CANDIDATE = "episode_summary_candidate"
 _PAYLOAD_FIELD_PINNED_STATE_PATCH_CANDIDATE = "pinned_state_patch_candidate"
@@ -1320,7 +1323,10 @@ def _assistant_conclusion_from_projection_event(
     """
 
     payload_ref, payload_digest = _payload_ref_pair_from_event(event)
-    final_answer = _optional_payload_str(event.payload, _PAYLOAD_FIELD_FINAL_ANSWER)
+    final_answer = assistant_summary_from_payload(
+        event.payload,
+        text_policy=PayloadSummaryTextPolicy.LENIENT_NON_EMPTY,
+    )
     summary_text = _bounded_summary_text(
         final_answer,
         max_size_units=policy.max_raw_turn_size_units,

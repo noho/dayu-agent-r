@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import json
 from collections.abc import Mapping
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass, field
@@ -413,6 +414,48 @@ def test_followup_queue_spills_large_user_input_payload(
         assert "long prompt" not in input_event.payload_json
         assert payload["display_text"] == display_text
         assert payload["user_prompt"] == display_text
+        inline_payload = _payload_mapping(input_event)
+        assert "display_text" not in inline_payload
+        assert "user_prompt" not in inline_payload
+        assert "system_prompt" not in inline_payload
+        assert "effective_execution_config" not in inline_payload
+        assert "effective_tool_set" not in inline_payload
+
+
+def test_followup_queue_payload_inline_threshold_boundary(
+    tmp_path: Path,
+) -> None:
+    """payload canonical UTF-8 len 等于阈值时 inline，阈值少一时 descriptor。"""
+
+    display_text = "boundary prompt"
+    baseline_dir = tmp_path / "baseline"
+    inline_dir = tmp_path / "inline"
+    descriptor_dir = tmp_path / "descriptor"
+    baseline_dir.mkdir()
+    inline_dir.mkdir()
+    descriptor_dir.mkdir()
+    payload_size = _accepted_input_payload_size(
+        baseline_dir,
+        client_request_id="follow-boundary",
+        display_text=display_text,
+        payload_inline_threshold_bytes=4096,
+    )
+
+    inline_event = _accepted_input_event(
+        inline_dir,
+        client_request_id="follow-boundary-inline",
+        display_text=display_text,
+        payload_inline_threshold_bytes=payload_size,
+    )
+    descriptor_event = _accepted_input_event(
+        descriptor_dir,
+        client_request_id="follow-boundary-descriptor",
+        display_text=display_text,
+        payload_inline_threshold_bytes=payload_size - 1,
+    )
+
+    assert inline_event.payload_ref is None
+    assert descriptor_event.payload_ref is not None
 
 
 def test_closed_session_rejects_start_and_followup_without_event_side_effects(
@@ -1862,6 +1905,88 @@ def _event_payload_object(
         )
 
     return transaction_runner.run_read(operation)
+
+
+def _payload_mapping(event: EventLogRow) -> Mapping[str, JsonValue]:
+    """解析 EventLog inline payload。
+
+    :param event: EventLog row。
+    :returns: inline payload mapping。
+    :raises AssertionError: inline payload 不是 object 时抛出。
+    """
+
+    value = json.loads(event.payload_json)
+    assert isinstance(value, Mapping)
+    return value
+
+
+def _accepted_input_payload_size(
+    tmp_path: Path,
+    *,
+    client_request_id: str,
+    display_text: str,
+    payload_inline_threshold_bytes: int,
+) -> int:
+    """创建 followup 并返回 USER_INPUT_ACCEPTED inline payload UTF-8 长度。
+
+    :param tmp_path: pytest 临时目录。
+    :param client_request_id: 幂等请求 id。
+    :param display_text: 用户输入展示文本。
+    :param payload_inline_threshold_bytes: payload inline 阈值。
+    :returns: canonical inline payload UTF-8 字节长度。
+    """
+
+    event = _accepted_input_event(
+        tmp_path,
+        client_request_id=client_request_id,
+        display_text=display_text,
+        payload_inline_threshold_bytes=payload_inline_threshold_bytes,
+    )
+    assert event.payload_ref is None
+    return len(event.payload_json.encode("utf-8"))
+
+
+def _accepted_input_event(
+    tmp_path: Path,
+    *,
+    client_request_id: str,
+    display_text: str,
+    payload_inline_threshold_bytes: int,
+) -> EventLogRow:
+    """创建 followup 并返回 USER_INPUT_ACCEPTED event。
+
+    :param tmp_path: pytest 临时目录。
+    :param client_request_id: 幂等请求 id。
+    :param display_text: 用户输入展示文本。
+    :param payload_inline_threshold_bytes: payload inline 阈值。
+    :returns: USER_INPUT_ACCEPTED EventLog row。
+    """
+
+    input_event: EventLogRow | None = None
+    with open_host_durable_store(
+        _options_with_payload_inline_threshold(
+            tmp_path, payload_inline_threshold_bytes
+        )
+    ) as store:
+        session_id = _ensure_session_id(store.transaction_runner)
+        service = _service(store.transaction_runner)
+        result = service.submit_followup_queue(
+            SubmitFollowupQueueAdmissionInput(
+                request=_followup_request(
+                    session_id=session_id,
+                    client_request_id=client_request_id,
+                    display_text=display_text,
+                ),
+                resolved_execution_target="follow-target",
+            ),
+            caller_semantic_digest=_CALLER_DIGEST,
+        )
+        input_event = _read_user_input_event(
+            store.transaction_runner, result.run.input_event_id
+        )
+    if input_event is None:
+        raise AssertionError("input event must exist")
+    return input_event
 
 
 def _event_count(transaction_runner: HostTransactionRunner) -> int:

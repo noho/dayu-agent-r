@@ -30,12 +30,37 @@ def event_payload_object(
         return _json_object(event.payload_json, payload_label=payload_label)
     if event.payload_digest is None:
         raise HostDurableError(f"{payload_label} payload digest is missing")
-    descriptor = read_payload_descriptor(transaction, event.payload_ref)
+    return sqlite_payload_object(
+        transaction,
+        payload_ref=event.payload_ref,
+        payload_digest=event.payload_digest,
+        payload_label=payload_label,
+    )
+
+
+def sqlite_payload_object(
+    transaction: HostTransaction,
+    *,
+    payload_ref: str,
+    payload_digest: str,
+    payload_label: str,
+) -> Mapping[str, JsonValue]:
+    """按 payload descriptor 读取 SQLite JSON object。
+
+    :param transaction: 当前 Host transaction。
+    :param payload_ref: payload descriptor ref。
+    :param payload_digest: 调用方持有的 payload digest。
+    :param payload_label: 错误消息中的 payload 名称。
+    :returns: payload JSON object。
+    :raises HostDurableError: descriptor、digest 或 SQLite payload 非法时抛出。
+    """
+
+    descriptor = read_payload_descriptor(transaction, payload_ref)
     if descriptor is None:
         raise HostDurableError(f"{payload_label} payload descriptor is missing")
     if descriptor.payload_kind is not PayloadKind.SQLITE_PAYLOAD:
         raise HostDurableError(f"{payload_label} payload must be sqlite payload")
-    if descriptor.payload_digest != event.payload_digest:
+    if descriptor.payload_digest != payload_digest:
         raise HostDurableError(f"{payload_label} payload digest mismatch")
     if descriptor.sqlite_payload_id is None:
         raise HostDurableError(f"{payload_label} sqlite payload id is missing")
@@ -73,4 +98,7 @@ def _json_object(payload_json: str, *, payload_label: str) -> Mapping[str, JsonV
     return cast(Mapping[str, JsonValue], value)
 
 
-__all__ = ["event_payload_object"]
+__all__ = [
+    "event_payload_object",
+    "sqlite_payload_object",
+]

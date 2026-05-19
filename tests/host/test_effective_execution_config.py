@@ -41,7 +41,6 @@ from dayu.host import (
 )
 from dayu.host.api import HostCommandHandleOptions
 from dayu.host.command import create_host_command_handle
-from dayu.host._event_payload import payload_object as _payload_object
 from dayu.host._execution_config_projection import (
     required_json_mapping as _required_json_mapping,
 )
@@ -53,6 +52,7 @@ from dayu.host.durable.options import (
     PayloadStoragePolicy,
 )
 from dayu.host.durable.transaction import HostTransaction
+from dayu.host.payload_resolution import event_payload_object
 from dayu.host.memory import default_memory_projection_policy
 
 
@@ -262,6 +262,55 @@ async def test_effective_config_freezes_override_and_idempotent_replay(
 
 
 @pytest.mark.asyncio
+async def test_descriptor_payload_dispatch_uses_per_run_override(
+    tmp_path: pathlib.Path,
+) -> None:
+    """descriptor USER_INPUT_ACCEPTED payload 仍驱动 dispatch effective config。
+
+    :param tmp_path: pytest 临时目录。
+    :returns: ``None``。
+    :raises AssertionError: dispatch 回退 opener baseline 或未走 descriptor 时抛出。
+    """
+
+    factory = _RecordingWorkerFactory()
+    options = _options(tmp_path, factory, payload_inline_threshold_bytes=4096)
+    override_spec = _runner_spec("descriptor-override-model")
+    override_policy = AgentPolicy(
+        max_iterations=9,
+        continuation_max_attempts=1,
+        allow_tool_calls=False,
+        tool_execution_timeout_seconds=2.5,
+    )
+    large_prompt = "descriptor prompt " * 600
+    async with open_host(options) as host:
+        session = await host.ensure_session(_ensure_request())
+        accepted = await host.submit_followup(
+            session.session_id,
+            _followup(
+                session.session_id,
+                client_request_id="client-descriptor-effective",
+                user_prompt=large_prompt,
+                runner_spec=override_spec,
+                agent_policy=override_policy,
+                system_prompt="descriptor system prompt",
+            ),
+        )
+        await asyncio.wait_for(factory.accepted.wait(), timeout=2.0)
+
+    input_event = _read_event(options, accepted.accepted_input_ref)
+    resolved_payload = _read_event_payload(options, accepted.accepted_input_ref)
+    request = factory.requests[0]
+
+    assert input_event.payload_ref is not None
+    assert "descriptor prompt" not in input_event.payload_json
+    assert resolved_payload["user_prompt"] == large_prompt
+    assert request.runner_spec.model == "descriptor-override-model"
+    assert request.agent_policy == override_policy
+    assert request.messages[0].content == "descriptor system prompt"
+    assert request.runner_spec.model != "baseline-model"
+
+
+@pytest.mark.asyncio
 async def test_agent_policy_override_freezes_payload_and_dispatch_snapshot_ref(
     tmp_path: pathlib.Path,
 ) -> None:
@@ -348,6 +397,8 @@ async def test_submit_followup_without_ordinary_baseline_fails_before_dispatch(
 def _followup(
     session_id: str,
     *,
+    client_request_id: str = "client-effective",
+    user_prompt: str = "effective prompt",
     runner_spec: RunnerSpec | None = None,
     runner_options: RunnerCallOptions | None = None,
     agent_policy: AgentPolicy | None = None,
@@ -356,6 +407,8 @@ def _followup(
     """构造 submit follow-up 请求。
 
     :param session_id: Session id。
+    :param client_request_id: 幂等请求 id。
+    :param user_prompt: 用户提示文本。
     :param runner_spec: 可选 RunnerSpec override。
     :param runner_options: 可选 RunnerCallOptions override。
     :param agent_policy: 可选 AgentPolicy override。
@@ -365,11 +418,11 @@ def _followup(
     """
 
     return SubmitFollowupRequest(
-        context=_context("client-effective"),
+        context=_context(client_request_id),
         session_id=session_id,
-        client_request_id="client-effective",
+        client_request_id=client_request_id,
         system_prompt=system_prompt,
-        user_prompt="effective prompt",
+        user_prompt=user_prompt,
         tool_names=None,
         runner_spec=runner_spec,
         runner_options=runner_options,
@@ -382,11 +435,14 @@ def _followup(
 def _options(
     tmp_path: pathlib.Path,
     worker_factory: _RecordingWorkerFactory,
+    *,
+    payload_inline_threshold_bytes: int = 4096,
 ) -> OpenHostOptions:
     """构造 OpenHostOptions。
 
     :param tmp_path: 临时目录。
     :param worker_factory: worker factory。
+    :param payload_inline_threshold_bytes: payload inline 阈值。
     :returns: OpenHostOptions。
     :raises TypeError: options typed 字段类型非法时抛出。
     :raises ValueError: options 字段语义非法时抛出。
@@ -401,7 +457,7 @@ def _options(
         sqlite_write_retry_initial_delay_seconds=0.001,
         sqlite_write_retry_backoff_multiplier=1.2,
         sqlite_write_retry_max_delay_seconds=0.02,
-        payload_inline_threshold_bytes=4096,
+        payload_inline_threshold_bytes=payload_inline_threshold_bytes,
         lane_db_path=tmp_path / "lane.sqlite3",
         lane_name="llm",
         lane_capacity=1,
@@ -486,7 +542,54 @@ def _read_event_payload(
         event = durable_store.transaction_runner.run_read(_ReadEventById(event_id))
     if event is None:
         raise AssertionError("event must exist")
-    return _payload_object(event)
+    return _event_payload_object(options, event)
+
+
+def _read_event(options: OpenHostOptions, event_id: str) -> EventLogRow:
+    """读取指定 EventLog row。
+
+    :param options: 打开 Host 时使用的 options。
+    :param event_id: 目标 EventLog id。
+    :returns: EventLog row。
+    :raises AssertionError: 事件缺失时抛出。
+    """
+
+    event: EventLogRow | None = None
+    with open_host_durable_store(_durable_options(options)) as durable_store:
+        event = durable_store.transaction_runner.run_read(_ReadEventById(event_id))
+    if event is None:
+        raise AssertionError("event must exist")
+    return event
+
+
+def _event_payload_object(
+    options: OpenHostOptions, event: EventLogRow
+) -> Mapping[str, JsonValue]:
+    """按 descriptor-aware 语义读取 EventLog payload。
+
+    :param options: 打开 Host 时使用的 options。
+    :param event: 目标 EventLog row。
+    :returns: payload JSON mapping。
+    """
+
+    payload: Mapping[str, JsonValue] | None = None
+    with open_host_durable_store(_durable_options(options)) as durable_store:
+
+        def _operation(transaction: HostTransaction) -> Mapping[str, JsonValue]:
+            """解析 payload object。
+
+            :param transaction: Host durable transaction。
+            :returns: payload JSON mapping。
+            """
+
+            return event_payload_object(
+                transaction, event, payload_label="USER_INPUT_ACCEPTED"
+            )
+
+        payload = durable_store.transaction_runner.run_read(_operation)
+    if payload is None:
+        raise AssertionError("payload must exist")
+    return payload
 
 
 def _durable_options(options: OpenHostOptions) -> HostDurableStoreOptions:

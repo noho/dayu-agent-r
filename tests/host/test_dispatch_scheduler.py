@@ -6,7 +6,7 @@ import asyncio
 import json
 import logging
 from collections.abc import AsyncIterator, Callable, Mapping
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from datetime import UTC, datetime
 from pathlib import Path
 from typing import cast
@@ -322,6 +322,32 @@ class _RaisingCompactor(ContextCompactor):
 
         del request
         raise RuntimeError("proposal failed")
+
+
+class _QualityRejectOnceCompactor(ContextCompactor):
+    """首次返回 quality rejection，第二次返回 accepted candidate。"""
+
+    def __init__(self) -> None:
+        """初始化 fake compactor 与调用计数。
+
+        :returns: ``None``。
+        """
+
+        self.calls = 0
+        self._fake = FakeContextCompactor()
+
+    async def compact(self, request: CompactionRequest) -> CompactionCandidate:
+        """构造一次可修复 quality rejection。
+
+        :param request: compaction request。
+        :returns: compaction candidate。
+        """
+
+        self.calls += 1
+        candidate = await self._fake.compact(request)
+        if self.calls == 1:
+            return replace(candidate, retained_current_user_input_ref="wrong-input")
+        return candidate
 
 
 class _CloseFailingHandle(_FakeHandle):
@@ -2156,6 +2182,25 @@ async def test_scheduler_close_cancels_tracked_promotion_task(
 
 
 @pytest.mark.asyncio
+async def test_scheduler_wake_methods_fail_after_close_and_close_is_idempotent(
+    tmp_path: Path,
+) -> None:
+    """scheduler close 后 wake 方法稳定失败，重复 close 保持幂等。"""
+
+    with open_host_durable_store(_options(tmp_path)) as store:
+        seeded = _seed_current_run(store)
+        scheduler = await _open_scheduler(tmp_path, store, _FakeWorkerFactory())
+
+        await scheduler.close()
+        await scheduler.close()
+
+        with pytest.raises(RuntimeError, match="HostDispatchScheduler is closed"):
+            scheduler.wake_dispatch(_pending_dispatch(seeded))
+        with pytest.raises(RuntimeError, match="HostDispatchScheduler is closed"):
+            scheduler.wake_queue_promotion(seeded.session_id)
+
+
+@pytest.mark.asyncio
 async def test_proactive_compaction_calls_llm_outside_write_transaction(
     tmp_path: Path,
 ) -> None:
@@ -2211,6 +2256,77 @@ async def test_compaction_stale_result_does_not_write_compacted_event(
             assert _event_count(store.transaction_runner, CONTEXT_COMPACTED) == 0
             assert _run_status(store.transaction_runner, seeded.run_id) == (
                 RunStatus.FAILED
+            )
+            failed = _latest_event_for_run(
+                store.transaction_runner,
+                seeded.run_id,
+                CONTEXT_COMPACTION_FAILED,
+            )
+            assert _event_payload(failed)["failure_reason"] == "stale_compaction_result"
+        finally:
+            await scheduler.close()
+
+
+@pytest.mark.asyncio
+async def test_proactive_compaction_retries_quality_rejection_before_accept(
+    tmp_path: Path,
+) -> None:
+    """proactive compact 首次 quality rejection 后 retry 并写入 accepted fact。"""
+
+    compactor = _QualityRejectOnceCompactor()
+    with open_host_durable_store(_options(tmp_path)) as store:
+        seeded = _seed_accepted_run(
+            store,
+            run_id="run-proactive-quality-retry",
+            display_text=_soft_threshold_prompt(),
+        )
+        scheduler = await _open_scheduler(
+            tmp_path,
+            store,
+            _FakeWorkerFactory(),
+            context_budget_policy=default_context_budget_policy(
+                context_window_size=_SOFT_CONTEXT_WINDOW_SIZE,
+                reserved_output_tokens=_SOFT_RESERVED_OUTPUT_TOKENS,
+                hard_threshold_tokens=_SOFT_HARD_THRESHOLD_TOKENS,
+                safety_margin_ratio=_SOFT_SAFETY_MARGIN_RATIO,
+                minimum_protection_tokens=1,
+                max_compaction_attempts_per_operation=2,
+                policy_ref="test-soft-compact-policy",
+            ),
+            context_compactor=compactor,
+            compact_artifact_root=tmp_path / "compact-artifacts",
+        )
+        try:
+            await scheduler.run_queue_promotion(seeded.session_id)
+            event_types = _event_types_for_run(
+                store.transaction_runner, seeded.run_id
+            )
+
+            assert compactor.calls == 2
+            assert (
+                _event_count(
+                    store.transaction_runner,
+                    CONTEXT_COMPACTION_ATTEMPT_REJECTED,
+                )
+                == 1
+            )
+            assert _event_count(store.transaction_runner, CONTEXT_COMPACTED) == 1
+            assert event_types.index(CONTEXT_COMPACTION_ATTEMPT_REJECTED) < (
+                event_types.index(CONTEXT_COMPACTED)
+            )
+            assert event_types.index(CONTEXT_COMPACTED) < event_types.index(
+                "RUN_STARTED"
+            )
+            assert _run_status(store.transaction_runner, seeded.run_id) == (
+                RunStatus.RUNNING
+            )
+            rejected = _latest_event_for_run(
+                store.transaction_runner,
+                seeded.run_id,
+                CONTEXT_COMPACTION_ATTEMPT_REJECTED,
+            )
+            assert _event_payload(rejected)["failure_category"] == (
+                "quality_check_rejected"
             )
         finally:
             await scheduler.close()

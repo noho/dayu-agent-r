@@ -39,6 +39,7 @@ from dayu.host.api import (
     SessionStatus,
     SourceRunRelation,
     StartRunRequest,
+    SteerConflictDetail,
     SubmitFollowupRequest,
 )
 from dayu.host.durable._validation import (
@@ -3663,20 +3664,54 @@ def _require_steer_target_run(
             code=HostApiErrorCode.INVALID_STATE,
             message="submit_followup steer target is not active",
             retryable=False,
+            detail=_steer_conflict_detail(
+                target_run_id=target_run_id,
+                target=target,
+                active=active,
+            ),
         )
     if target.session_id != request.session_id:
         raise HostApiError(
             code=HostApiErrorCode.INVALID_STATE,
             message="submit_followup steer target session mismatch",
             retryable=False,
+            detail=_steer_conflict_detail(
+                target_run_id=target_run_id,
+                target=target,
+                active=active,
+            ),
         )
     if target.status not in (RunStatus.RUNNING, RunStatus.WAITING):
         raise HostApiError(
             code=HostApiErrorCode.INVALID_STATE,
             message="submit_followup steer target state is invalid",
             retryable=False,
+            detail=_steer_conflict_detail(
+                target_run_id=target_run_id,
+                target=target,
+                active=active,
+            ),
         )
     return target
+
+
+def _steer_conflict_detail(
+    *, target_run_id: str, target: RunRow | None, active: RunRow | None
+) -> SteerConflictDetail:
+    """构造 steer 前置条件冲突详情。
+
+    :param target_run_id: 调用方请求 steer 的目标 Run id。
+    :param target: durable 中读到的目标 Run；缺失时为 ``None``。
+    :param active: 同 Session 当前 active Run；缺失时为 ``None``。
+    :returns: typed steer 冲突详情。
+    """
+
+    return SteerConflictDetail(
+        target_run_id=target_run_id,
+        target_run_status=None if target is None else target.status,
+        current_active_run_id=None if active is None else active.run_id,
+        current_active_run_status=None if active is None else active.status,
+    )
 
 
 def _require_current_attempt_for_steer(

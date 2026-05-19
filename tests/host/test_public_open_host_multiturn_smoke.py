@@ -9,7 +9,7 @@ import pytest
 
 from dayu.engine.contracts.agent_policy import AgentPolicy
 from dayu.engine.contracts.runner_spec import RunnerCallOptions
-from dayu.host import HostEventKind, HostTerminalStatus, RunStatus, open_host
+from dayu.host import Host, HostEventKind, HostTerminalStatus, RunStatus, open_host
 from tests.host.public_smoke_support import (
     FinalAnswerWorkerFactory,
     deterministic_runner_spec,
@@ -120,6 +120,50 @@ async def test_two_watchers_observe_same_terminal_event(
 
 
 @pytest.mark.asyncio
+async def test_deterministic_two_turn_request_contains_prior_final_answer(
+    tmp_path: pathlib.Path,
+) -> None:
+    """两轮 public followup 后第二轮 Engine request 包含第一轮 final_answer。
+
+    :param tmp_path: pytest 临时目录。
+    :returns: ``None``。
+    :raises AssertionError: deterministic worker 未收到连续上下文时抛出。
+    """
+
+    factory = FinalAnswerWorkerFactory()
+    async with open_host(
+        open_host_options(
+            tmp_path,
+            runner_spec=deterministic_runner_spec(),
+            worker_factory=factory,
+            allow_tool_calls=False,
+        )
+    ) as host:
+        session = await host.ensure_session(ensure_request("two-turn-continuity"))
+        first = await host.submit_followup(
+            session.session_id,
+            followup_request(session.session_id, "continuity-first", "first prompt"),
+        )
+        await _wait_for_public_run_status(host, first.accepted_run_id, RunStatus.SUCCEEDED)
+        factory.accepted.clear()
+
+        second = await host.submit_followup(
+            session.session_id,
+            followup_request(session.session_id, "continuity-second", "second prompt"),
+        )
+        await _wait_for_public_run_status(host, second.accepted_run_id, RunStatus.SUCCEEDED)
+
+    second_contents = tuple(
+        message.content for message in factory.requests[1].messages
+    )
+    assert any(
+        content is not None and f"final:1:{first.accepted_run_id}" in content
+        for content in second_contents
+    )
+    assert second_contents[-1] == "second prompt"
+
+
+@pytest.mark.asyncio
 async def test_concurrent_queue_uses_client_request_id_idempotency(
     tmp_path: pathlib.Path,
 ) -> None:
@@ -221,3 +265,23 @@ async def test_submit_followup_field_level_execution_override_freezes_effective_
     )
     assert second_request.runner_spec.model == "override-model"
     assert second_request.runner_options.max_tokens == 96
+
+
+async def _wait_for_public_run_status(
+    host: Host, run_id: str, expected_status: RunStatus
+) -> None:
+    """等待 public Run 到达目标状态。
+
+    :param host: public Host handle。
+    :param run_id: Run id。
+    :param expected_status: 期望状态。
+    :returns: ``None``。
+    :raises TimeoutError: 超时未达到目标状态时抛出。
+    """
+
+    for _index in range(200):
+        snapshot = await host.get_run(run_id)
+        if snapshot.status == expected_status:
+            return
+        await asyncio.sleep(0.01)
+    raise TimeoutError(f"Run {run_id} did not reach {expected_status.value}")

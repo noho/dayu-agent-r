@@ -2149,7 +2149,9 @@ class HostDispatchScheduler:
             )
             if event is None:
                 raise RuntimeError("dispatch input event is missing")
-            payload = _payload_object(event)
+            payload = event_payload_object(
+                transaction, event, payload_label="USER_INPUT_ACCEPTED"
+            )
             return _effective_dispatch_decision_from_payload(
                 payload,
                 fallback_policy_snapshot=self._local_policy_snapshot(),

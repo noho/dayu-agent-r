@@ -307,6 +307,74 @@ async def test_retry_run_policy_limit_rejects_second_retry(
 
 
 @pytest.mark.asyncio
+async def test_retry_and_replay_missing_source_run_return_not_found(
+    tmp_path: pathlib.Path,
+) -> None:
+    """retry_run / replay_run 源 Run 不存在时返回 public NOT_FOUND。"""
+
+    factory = _SequencedWorkerFactory([])
+    async with open_host(_options(tmp_path, factory)) as host:
+        with pytest.raises(HostApiError) as retry_error:
+            await host.retry_run(
+                "missing-run",
+                RetryRunRequest(
+                    context=_context("retry-missing"),
+                    client_request_id="retry-missing",
+                    reason="ordinary_failed_retry",
+                ),
+            )
+        with pytest.raises(HostApiError) as replay_error:
+            await host.replay_run(
+                "missing-run",
+                ReplayRunRequest(
+                    context=_context("replay-missing"),
+                    client_request_id="replay-missing",
+                    reason="schema_repair",
+                    repair_instruction="repair output shape",
+                ),
+            )
+
+    assert retry_error.value.code == HostApiErrorCode.NOT_FOUND
+    assert replay_error.value.code == HostApiErrorCode.NOT_FOUND
+
+
+@pytest.mark.asyncio
+async def test_retry_run_same_client_request_id_different_digest_conflicts(
+    tmp_path: pathlib.Path,
+) -> None:
+    """retry_run 同一 client_request_id 不同语义 digest 返回幂等冲突。"""
+
+    factory = _SequencedWorkerFactory([_FAILED, _FINAL])
+    async with open_host(_options(tmp_path, factory)) as host:
+        session = await host.ensure_session(_ensure_request("retry-digest-conflict"))
+        source = await host.submit_followup(
+            session.session_id,
+            _followup_request(session.session_id, "retry-digest-source"),
+        )
+        await _wait_for_run_status(host, source.accepted_run_id, RunStatus.FAILED)
+        await host.retry_run(
+            source.accepted_run_id,
+            RetryRunRequest(
+                context=_context("retry-digest"),
+                client_request_id="retry-digest",
+                reason="ordinary_failed_retry",
+            ),
+        )
+
+        with pytest.raises(HostApiError) as exc_info:
+            await host.retry_run(
+                source.accepted_run_id,
+                RetryRunRequest(
+                    context=_context("retry-digest"),
+                    client_request_id="retry-digest",
+                    reason="different_retry_reason",
+                ),
+            )
+
+    assert exc_info.value.code == HostApiErrorCode.IDEMPOTENCY_CONFLICT
+
+
+@pytest.mark.asyncio
 async def test_replay_succeeded_run_no_tool_public_path(
     tmp_path: pathlib.Path,
 ) -> None:

@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import sqlite3
 from datetime import UTC, datetime
 from pathlib import Path
 
@@ -12,6 +13,7 @@ from dayu.host.durable.connection import open_host_durable_store
 from dayu.host.durable.event_log import (
     EventClass,
     EventLogAppendRequest,
+    EventLogRow,
     append_event,
 )
 from dayu.host.durable.errors import (
@@ -37,6 +39,7 @@ from dayu.host.durable.schema import (
     TABLE_SQLITE_PAYLOADS,
 )
 from dayu.host.durable.transaction import HostTransaction
+from dayu.host.payload_resolution import event_payload_object
 
 
 def _options(tmp_path: Path) -> HostDurableStoreOptions:
@@ -334,6 +337,89 @@ def test_descriptor_with_missing_sqlite_payload_fk_fails(
             store.transaction_runner.run_write(operation)
 
 
+def test_event_payload_object_raises_when_descriptor_missing(
+    tmp_path: Path,
+) -> None:
+    """EventLog 指向缺失 descriptor 时 fail closed。"""
+
+    event = _event_row(
+        payload_ref="payload-missing-descriptor",
+        payload_digest=sha256_digest_bytes(b"missing-descriptor"),
+    )
+    with open_host_durable_store(_options(tmp_path)) as store:
+
+        def operation(transaction: HostTransaction) -> None:
+            """触发 descriptor 缺失读取。
+
+            :param transaction: Host transaction。
+            :returns: ``None``。
+            """
+
+            event_payload_object(
+                transaction, event, payload_label="USER_INPUT_ACCEPTED"
+            )
+
+        with pytest.raises(
+            HostDurableError, match="USER_INPUT_ACCEPTED payload descriptor is missing"
+        ):
+            store.transaction_runner.run_read(operation)
+
+
+def test_event_payload_object_raises_when_sqlite_payload_row_missing(
+    tmp_path: Path,
+) -> None:
+    """descriptor 存在但 sqlite payload row 缺失时 fail closed。"""
+
+    payload_ref = "payload-missing-sqlite-row"
+    payload_id = "sqlite-missing-row"
+    payload_digest: str | None = None
+    with open_host_durable_store(_options(tmp_path)) as store:
+
+        def write_descriptor(transaction: HostTransaction) -> str:
+            """写入完整 payload row 与 descriptor。
+
+            :param transaction: Host transaction。
+            :returns: descriptor payload digest。
+            """
+
+            descriptor = write_sqlite_payload(
+                transaction,
+                SQLitePayloadWriteRequest(
+                    payload_ref=payload_ref,
+                    payload_id=payload_id,
+                    payload_format=SQLitePayloadFormat.CANONICAL_JSON,
+                    payload_json={"display_text": "full prompt"},
+                    media_type="application/json",
+                ),
+            )
+            return descriptor.payload_digest
+
+        payload_digest = store.transaction_runner.run_write(write_descriptor)
+
+    _delete_sqlite_payload_row_without_fk(tmp_path / "durable.sqlite3", payload_id)
+    if payload_digest is None:
+        raise AssertionError("payload digest must exist")
+    event = _event_row(payload_ref=payload_ref, payload_digest=payload_digest)
+    with open_host_durable_store(_options(tmp_path)) as store:
+
+        def read_missing_payload(transaction: HostTransaction) -> None:
+            """读取已损坏 descriptor 指向的 payload row。
+
+            :param transaction: Host transaction。
+            :returns: ``None``。
+            """
+
+            event_payload_object(
+                transaction, event, payload_label="USER_INPUT_ACCEPTED"
+            )
+
+        with pytest.raises(
+            HostDurableError,
+            match="USER_INPUT_ACCEPTED sqlite payload row is missing",
+        ):
+            store.transaction_runner.run_read(read_missing_payload)
+
+
 def test_payload_digest_mismatch_raises_without_writing_rows(
     tmp_path: Path,
 ) -> None:
@@ -376,6 +462,58 @@ def test_payload_digest_mismatch_raises_without_writing_rows(
             )
 
         assert store.transaction_runner.run_write(count_operation) == (0, 0)
+
+
+def _event_row(*, payload_ref: str, payload_digest: str) -> EventLogRow:
+    """构造引用 payload descriptor 的 EventLog row。
+
+    :param payload_ref: payload descriptor ref。
+    :param payload_digest: payload digest。
+    :returns: EventLogRow。
+    """
+
+    return EventLogRow(
+        event_sequence=1,
+        event_id="event-user-input-payload",
+        event_body_digest=sha256_digest_bytes(b"event-body"),
+        event_class=EventClass.CANONICAL_FACT,
+        session_id="session-1",
+        run_id="run-1",
+        attempt_id=None,
+        execution_id=None,
+        event_type="USER_INPUT_ACCEPTED",
+        occurred_at="2026-05-14T01:02:03.123456Z",
+        actor="pytest",
+        source="pytest",
+        client_request_id=None,
+        idempotency_key=None,
+        policy_decision_json=None,
+        reason_json=None,
+        payload_json='{"payload_ref":null}',
+        payload_ref=payload_ref,
+        payload_digest=payload_digest,
+        appended_at="2026-05-14T01:02:03.123456Z",
+    )
+
+
+def _delete_sqlite_payload_row_without_fk(db_path: Path, payload_id: str) -> None:
+    """绕过 FK 删除 sqlite payload row 以构造损坏 durable 状态。
+
+    :param db_path: SQLite DB 路径。
+    :param payload_id: 待删除 payload row id。
+    :returns: ``None``。
+    """
+
+    connection = sqlite3.connect(db_path)
+    try:
+        connection.execute("PRAGMA foreign_keys = OFF")
+        connection.execute(
+            f"DELETE FROM {TABLE_SQLITE_PAYLOADS} WHERE payload_id = ?",
+            (payload_id,),
+        )
+        connection.commit()
+    finally:
+        connection.close()
 
 
 def test_event_log_can_reference_existing_descriptor_and_digest(

@@ -11,6 +11,7 @@ from dayu.host import (
     HostApiError,
     HostApiErrorCode,
     RunStatus,
+    SteerConflictDetail,
     SubmitFollowupRequest,
     open_host,
 )
@@ -131,6 +132,43 @@ async def test_steer_waiting_run_creates_new_attempt_public_path(
 
 
 @pytest.mark.asyncio
+async def test_steer_replays_same_client_request_id_idempotently(
+    tmp_path: pathlib.Path,
+) -> None:
+    """submit_followup(steer) 同 key 同语义重放返回同一 Run。"""
+
+    factory = _SequencedWorkerFactory([_BLOCK, _FINAL])
+    async with open_host(_options(tmp_path, factory)) as host:
+        session = await host.ensure_session(_ensure_request("steer-idempotent"))
+        first = await host.submit_followup(
+            session.session_id,
+            _followup_request(session.session_id, "steer-idempotent-source"),
+        )
+        await _wait_for_run_status(host, first.accepted_run_id, RunStatus.RUNNING)
+        request = SubmitFollowupRequest(
+            context=_context("steer-idempotent"),
+            session_id=session.session_id,
+            client_request_id="steer-idempotent",
+            system_prompt=None,
+            user_prompt="replace idempotently",
+            tool_names=None,
+            runner_spec=None,
+            runner_options=None,
+            agent_policy=None,
+            behavior=FollowupBehavior.STEER,
+            target_run_id=first.accepted_run_id,
+        )
+
+        steered = await host.submit_followup(session.session_id, request)
+        await _wait_for_run_status(host, first.accepted_run_id, RunStatus.SUCCEEDED)
+        replayed = await host.submit_followup(session.session_id, request)
+
+    assert replayed.accepted_run_id == steered.accepted_run_id
+    assert replayed.accepted_input_ref == steered.accepted_input_ref
+    assert len(factory.accepted_requests) == 2
+
+
+@pytest.mark.asyncio
 async def test_steer_terminal_race_rejects_non_active_target(
     tmp_path: pathlib.Path,
 ) -> None:
@@ -169,3 +207,9 @@ async def test_steer_terminal_race_rejects_non_active_target(
             )
 
     assert exc_info.value.code == HostApiErrorCode.INVALID_STATE
+    detail = exc_info.value.detail
+    assert isinstance(detail, SteerConflictDetail)
+    assert detail.target_run_id == source.accepted_run_id
+    assert detail.target_run_status is RunStatus.SUCCEEDED
+    assert detail.current_active_run_id is None
+    assert detail.current_active_run_status is None
