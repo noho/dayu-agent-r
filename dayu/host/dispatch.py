@@ -91,6 +91,7 @@ from dayu.host.projection import (
     ProjectionCatchupPort,
     catch_up_projection_best_effort,
 )
+from dayu.host.payload_resolution import event_payload_object
 from dayu.host.run_input import (
     DurableCompactArtifactProvider,
     DurableMemorySnapshotProvider,
@@ -732,7 +733,9 @@ class HostDispatchScheduler:
                     ),
                     compact_accepted=None,
                 )
-            display_text = _display_text_from_input_event(input_event)
+            display_text = _display_text_from_input_event(
+                transaction, input_event
+            )
             estimate = estimate_context_budget(
                 policy,
                 BudgetEstimateInput(
@@ -2631,15 +2634,20 @@ def _read_startable_run(
     return read_earliest_queued_run(transaction, session_id)
 
 
-def _display_text_from_input_event(event: EventLogRow) -> str:
+def _display_text_from_input_event(
+    transaction: HostTransaction, event: EventLogRow
+) -> str:
     """从 ``USER_INPUT_ACCEPTED`` event 读取展示文本。
 
+    :param transaction: 当前 Host transaction。
     :param event: input event row。
     :returns: 展示文本。
     :raises RuntimeError: payload 缺失展示文本时抛出。
     """
 
-    payload = _payload_object(event)
+    payload = event_payload_object(
+        transaction, event, payload_label="USER_INPUT_ACCEPTED"
+    )
     value = payload.get("display_text")
     if not isinstance(value, str) or value.strip() == "":
         raise RuntimeError("USER_INPUT_ACCEPTED display_text is invalid")

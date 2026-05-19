@@ -62,6 +62,7 @@ from dayu.host.durable.state import (
     read_run_by_id,
 )
 from dayu.host.durable.transaction import HostRow, HostTransaction, HostTransactionRunner
+from dayu.host.payload_resolution import event_payload_object
 from dayu.host.memory import (
     CONVERSATION_MEMORY_CONSUMER_ID,
     ConversationContinuityItem,
@@ -521,7 +522,11 @@ class DurableCurrentRunFactProvider:
         _validate_current_event_scope(snapshot, user_input_event)
         _validate_current_event_scope(snapshot, run_accepted_event)
         _validate_current_event_scope(snapshot, run_started_event)
-        payload = _payload_object(user_input_event)
+        payload = event_payload_object(
+            transaction,
+            user_input_event,
+            payload_label=_EVENT_TYPE_USER_INPUT_ACCEPTED,
+        )
         return CurrentRunFacts(
             run=run,
             attempt=attempt,

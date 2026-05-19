@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import dayu.host as host
 import dayu.host.api as api
+import dayu.host.read_api as read_api
 
 
 EXPECTED_API_EXPORTS: frozenset[str] = frozenset(
@@ -36,17 +37,10 @@ EXPECTED_API_EXPORTS: frozenset[str] = frozenset(
         "Host",
         "HostCallContext",
         "HostClosedError",
-        "HostCommandFacet",
-        "HostCommandHandleOptions",
         "HostEvent",
         "HostEventClass",
         "HostEventKind",
-        "HostEventStream",
-        "HostEventView",
         "HostFinalAnswerView",
-        "HostHandle",
-        "HostInput",
-        "HostLocalExecutionOptions",
         "HostMetadataEntry",
         "HostPayloadRef",
         "HostStreamCursor",
@@ -75,7 +69,6 @@ EXPECTED_API_EXPORTS: frozenset[str] = frozenset(
         "SessionSnapshot",
         "SessionStatus",
         "SourceRunRelation",
-        "StartRunRequest",
         "SteerConflictDetail",
         "SubmitFollowupRequest",
         "TerminalResultSummary",
@@ -120,6 +113,7 @@ ROOT_INTERNAL_API_NAMES: frozenset[str] = frozenset(
         "HostCommandHandleOptions",
         "HostEventStream",
         "HostEventView",
+        "HostInput",
         "HostLocalExecutionOptions",
         "StartRunRequest",
     }
@@ -165,6 +159,8 @@ REMOVED_SERVICE_FACING_ALL_EXPORTS: frozenset[str] = frozenset(
         "HostCommandHandleOptions",
         "HostEventStream",
         "HostEventView",
+        "HostHandle",
+        "HostInput",
         "HostLocalExecutionOptions",
         "StartRunRequest",
         "create_host_command_handle",
@@ -195,6 +191,12 @@ def test_api_all_stays_request_snapshot_boundary() -> None:
     """``dayu.host.api.__all__`` 只包含 API 与本地执行配置类型。"""
 
     assert frozenset(api.__all__) == EXPECTED_API_EXPORTS
+
+
+def test_read_api_all_keeps_service_facing_read_boundary() -> None:
+    """``dayu.host.read_api.__all__`` 不重新公开 run-level stream。"""
+
+    assert frozenset(read_api.__all__) == frozenset({"get_run", "get_session"})
 
 
 def test_exported_symbols_are_same_objects_as_api_symbols() -> None:

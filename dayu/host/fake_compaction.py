@@ -89,9 +89,7 @@ class FakeContextCompactor(ContextCompactor):
             preserved_verified_fact_refs=request.verified_fact_refs,
             dropped_ranges=(),
             summarized_ranges=summarized_ranges,
-            budget_after_compact=max(
-                0, request.budget_before_compact.estimated_input_tokens // 2
-            ),
+            budget_after_compact=_budget_after_compact(request),
         )
 
 
@@ -193,6 +191,18 @@ def _user_constraints(request: CompactionRequest) -> tuple[str, ...]:
     """
 
     return (f"keep-current-input:{request.current_message_summary.current_user_input_ref}",)
+
+
+def _budget_after_compact(request: CompactionRequest) -> int:
+    """按真实 LLM compactor 语义估算 compact 后预算。
+
+    :param request: compaction 请求。
+    :returns: 小于 hard threshold 的 compact 后 token 估算。
+    """
+
+    half_estimate = request.budget_before_compact.estimated_input_tokens // 2
+    hard_threshold_limit = request.budget_before_compact.hard_threshold_tokens - 1
+    return max(0, min(half_estimate, hard_threshold_limit))
 
 
 __all__ = ["FakeContextCompactor"]

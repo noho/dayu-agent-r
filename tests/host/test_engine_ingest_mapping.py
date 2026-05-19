@@ -187,6 +187,32 @@ class _TransactionReadableCompactor(ContextCompactor):
         return await self._fake.compact(request)
 
 
+class _InputSequenceAdvancingCompactor(ContextCompactor):
+    """测试 compactor，在 proposal 期间推进 Run input sequence。"""
+
+    def __init__(self, transaction_runner: HostTransactionRunner) -> None:
+        """初始化 compactor。
+
+        :param transaction_runner: Host transaction runner。
+        :returns: ``None``。
+        """
+
+        self._transaction_runner = transaction_runner
+        self._fake = FakeContextCompactor()
+        self.calls = 0
+
+    async def compact(self, request: CompactionRequest) -> CompactionCandidate:
+        """推进 durable input sequence 后返回旧 snapshot 的 fake candidate。
+
+        :param request: compaction request。
+        :returns: 基于旧 request 的 fake compaction candidate。
+        """
+
+        self.calls += 1
+        _advance_run_input_sequence(self._transaction_runner, run_id=request.run_id)
+        return await self._fake.compact(request)
+
+
 class _RaisingCompactor(ContextCompactor):
     """测试用失败 compactor。"""
 
@@ -450,6 +476,39 @@ async def test_reactive_compaction_calls_llm_outside_write_transaction(
         assert result.status is EngineIngestStatus.ACCEPTED
         assert compactor.calls == 1
         assert _event_count(store.transaction_runner, CONTEXT_COMPACTED) == 1
+
+
+@pytest.mark.asyncio
+async def test_reactive_compaction_rejects_stale_input_sequence(
+    tmp_path: Path,
+) -> None:
+    """reactive compact 返回后 input sequence 变化时拒绝旧 snapshot 结果。"""
+
+    with open_host_durable_store(_options(tmp_path)) as store:
+        seeded = _seed_active_run(store.transaction_runner)
+        compactor = _InputSequenceAdvancingCompactor(store.transaction_runner)
+        candidate = _context_compaction_candidate(seeded, worker_event_index=43)
+
+        result = await EngineEventIngestor(
+            transaction_runner=store.transaction_runner,
+            context_budget_policy=_reactive_policy(),
+            context_compactor=compactor,
+            compact_artifact_root=tmp_path / "compact-artifacts",
+        ).ingest_async(candidate)
+
+        assert result.status is EngineIngestStatus.ACCEPTED
+        assert result.stop_worker_stream is True
+        assert compactor.calls == 1
+        assert _event_count(store.transaction_runner, CONTEXT_COMPACTED) == 0
+        assert _event_count(store.transaction_runner, CONTEXT_COMPACTION_FAILED) == 1
+        assert _attempt_count(store.transaction_runner, seeded.run_id) == 1
+        run_status, attempt_status = _statuses(store.transaction_runner, seeded)
+        assert run_status is RunStatus.RECOVERING
+        assert attempt_status is AttemptStatus.FAILED
+        stale_failed = _latest_event(
+            store.transaction_runner, CONTEXT_COMPACTION_FAILED
+        )
+        assert _payload(stale_failed)["failure_reason"] == "stale_compaction_result"
 
 
 @pytest.mark.asyncio
@@ -2070,6 +2129,62 @@ def _append_reactive_requested_fact(
                 payload_digest=None,
             ),
         )
+
+    transaction_runner.run_write(_operation)
+
+
+def _advance_run_input_sequence(
+    transaction_runner: HostTransactionRunner, *, run_id: str
+) -> None:
+    """追加新输入事件并推进 Run input sequence。
+
+    :param transaction_runner: Host transaction runner。
+    :param run_id: 目标 Run id。
+    :returns: ``None``。
+    """
+
+    def _operation(transaction: HostTransaction) -> None:
+        run = read_run_by_id(transaction, run_id)
+        assert run is not None
+        input_event = EventLogStore().append_event(
+            transaction,
+            EventLogAppendRequest(
+                event_id=f"event-stale-input-{run_id}",
+                event_class=EventClass.CANONICAL_FACT,
+                session_id=run.session_id,
+                run_id=run.run_id,
+                attempt_id=None,
+                execution_id=None,
+                event_type="USER_INPUT_ACCEPTED",
+                occurred_at=_NOW,
+                actor="tester",
+                source="pytest",
+                client_request_id="client-stale-input",
+                idempotency_key=f"idem-stale-input-{run_id}",
+                policy_decision=None,
+                reason=None,
+                payload_json={"display_text": "new input while compacting"},
+                payload_ref=None,
+                payload_digest=None,
+            ),
+        ).row
+        result = transaction.execute(
+            """
+            UPDATE host_runs
+            SET
+              input_event_id = ?,
+              input_event_sequence = ?,
+              updated_at = ?
+            WHERE run_id = ?
+            """,
+            (
+                input_event.event_id,
+                input_event.event_sequence,
+                "2026-05-15T01:02:04.000000Z",
+                run_id,
+            ),
+        )
+        assert result.rowcount == 1
 
     transaction_runner.run_write(_operation)
 

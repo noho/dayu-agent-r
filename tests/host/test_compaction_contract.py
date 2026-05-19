@@ -42,6 +42,26 @@ async def test_fake_compactor_produces_typed_candidates_and_evidence() -> None:
 
 
 @pytest.mark.asyncio
+async def test_fake_compactor_clamps_budget_below_hard_threshold() -> None:
+    """Fake compactor 的预算估算与真实 LLM compactor hard clamp 对齐。
+
+    :returns: ``None``。
+    """
+
+    request = _request()
+    budget = replace(
+        request.budget_before_compact,
+        estimated_input_tokens=2000,
+        hard_threshold_tokens=950,
+    )
+    request = replace(request, budget_before_compact=budget)
+
+    candidate = await FakeContextCompactor().compact(request)
+
+    assert candidate.budget_after_compact == budget.hard_threshold_tokens - 1
+
+
+@pytest.mark.asyncio
 async def test_quality_rejects_missing_current_user_input() -> None:
     """Quality check 拒绝丢失当前用户输入。
 

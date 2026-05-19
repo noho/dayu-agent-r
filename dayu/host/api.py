@@ -2795,9 +2795,6 @@ class Host(Protocol):
         ...
 
 
-HostHandle: TypeAlias = Host
-
-
 __all__ = [
     "AttemptDispatchSnapshot",
     "AttemptStatus",
@@ -2827,17 +2824,10 @@ __all__ = [
     "HostCallContext",
     "Host",
     "HostClosedError",
-    "HostCommandFacet",
-    "HostCommandHandleOptions",
     "HostEvent",
-    "HostLocalExecutionOptions",
     "HostEventClass",
     "HostEventKind",
-    "HostEventStream",
-    "HostEventView",
     "HostFinalAnswerView",
-    "HostHandle",
-    "HostInput",
     "HostMetadataEntry",
     "HostPayloadRef",
     "HostStreamCursor",
@@ -2866,7 +2856,6 @@ __all__ = [
     "SessionSnapshot",
     "SessionStatus",
     "SourceRunRelation",
-    "StartRunRequest",
     "SteerConflictDetail",
     "SubmitFollowupRequest",
     "TerminalResultSummary",

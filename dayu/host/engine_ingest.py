@@ -144,6 +144,7 @@ from dayu.host._event_payload import (
 from dayu.host.durable.transaction import HostTransaction, HostTransactionRunner
 from dayu.host.memory import MemoryProjectionPolicy, default_memory_projection_policy
 from dayu.host.memory_repair import catch_up_conversation_memory_projection
+from dayu.host.payload_resolution import event_payload_object
 from dayu.runtime.log_levels import VERBOSE_LOG_LEVEL
 
 _LOGGER = logging.getLogger(__name__)
@@ -337,6 +338,7 @@ class _ReactiveCompactPending:
 
     result_prefix: EngineIngestResult
     context: _ValidatedCandidate
+    expected_input_event_sequence: int
     display_text: str
     operation_id: str
     estimate: BudgetEstimate
@@ -1088,7 +1090,7 @@ class EngineEventIngestor:
                 failure_reason="input_event_missing",
                 message="Input event is missing before reactive recovery",
             )
-        display_text = _display_text_from_input_event(input_event)
+        display_text = _display_text_from_input_event(transaction, input_event)
         estimate = estimate_context_budget(
             policy,
             BudgetEstimateInput(
@@ -1151,6 +1153,7 @@ class EngineEventIngestor:
                 stop_worker_stream=True,
             ),
             context=context,
+            expected_input_event_sequence=context.run.input_event_sequence,
             display_text=display_text,
             operation_id=requested.event_id,
             estimate=estimate,
@@ -1417,6 +1420,28 @@ class EngineEventIngestor:
             )
             if latest is None:
                 return pending.result_prefix
+            sequence_stale = (
+                latest.run.input_event_sequence
+                != pending.expected_input_event_sequence
+            )
+            if latest.run.status is RunStatus.RECOVERING and sequence_stale:
+                stale_failed = self._append_reactive_compaction_failed_event(
+                    transaction,
+                    context=latest,
+                    estimate=pending.estimate,
+                    failure_reason="stale_compaction_result",
+                    budget_after_attempted_compact=(
+                        operation_result.budget_after_attempted_compact
+                    ),
+                )
+                return EngineIngestResult(
+                    status=EngineIngestStatus.ACCEPTED,
+                    events=(*pending.result_prefix.events, stale_failed),
+                    terminal_closeout=False,
+                    promotion_triggered=False,
+                    reason=_REASON_CONTEXT_COMPACTION_REQUIRED,
+                    stop_worker_stream=True,
+                )
             if (
                 latest.run.status is not RunStatus.RECOVERING
                 or latest.attempt.terminal_event_id is None
@@ -2882,15 +2907,20 @@ def _latest_rows_for_types(
     return tuple(rows)
 
 
-def _display_text_from_input_event(event: EventLogRow) -> str:
+def _display_text_from_input_event(
+    transaction: HostTransaction, event: EventLogRow
+) -> str:
     """从 ``USER_INPUT_ACCEPTED`` payload 读取展示文本。
 
+    :param transaction: 当前 Host transaction。
     :param event: input EventLog row。
     :returns: 展示文本。
     :raises ValueError: payload 缺少展示文本时抛出。
     """
 
-    payload = _payload_object(event)
+    payload = event_payload_object(
+        transaction, event, payload_label="USER_INPUT_ACCEPTED"
+    )
     return _required_payload_text(payload, field_name="display_text")
 
 

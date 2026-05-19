@@ -676,7 +676,7 @@ class LaneController:
                 )
                 raise cancelled
             token.expires_at = expires_at
-            raise
+            raise cancelled
         except RuntimeLaneClaimLostError:
             self._mark_token_lost(token)
             raise

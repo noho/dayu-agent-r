@@ -1,8 +1,8 @@
 """Host 公共命名空间。
 
 本包当前导出公共类型契约、Host construction 的业务工具输入边界，以及
-Phase 4 已实现的 Session / Run public facade。durable store、EventLog store、
-dispatch、ToolRuntime factory 与 policy provider 均不在当前包根导出范围内。
+Session / Run public facade。durable store、EventLog store、dispatch、
+ToolRuntime factory 与 policy provider 均不在当前包根导出范围内。
 """
 
 from __future__ import annotations
@@ -40,8 +40,6 @@ from dayu.host.api import (
     HostEventClass,
     HostEventKind,
     HostFinalAnswerView,
-    HostHandle,
-    HostInput,
     HostMetadataEntry,
     HostPayloadRef,
     HostStreamCursor,
@@ -135,8 +133,6 @@ __all__ = [
     "HostEventClass",
     "HostEventKind",
     "HostFinalAnswerView",
-    "HostHandle",
-    "HostInput",
     "HostMetadataEntry",
     "HostPayloadRef",
     "HostStreamCursor",

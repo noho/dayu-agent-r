@@ -11,7 +11,7 @@ steer、retry、replay、wait 或 recovery。
 from __future__ import annotations
 
 import logging
-import json
+from collections.abc import Mapping
 from dataclasses import dataclass, replace
 from datetime import UTC, datetime
 from enum import StrEnum
@@ -45,7 +45,11 @@ from dayu.host.durable._validation import (
     require_non_empty_text as _require_non_empty_text,
     require_sha256_digest as _require_sha256_digest,
 )
-from dayu.host.durable.codec import format_utc_timestamp, sha256_digest_json
+from dayu.host.durable.codec import (
+    canonical_json_dumps,
+    format_utc_timestamp,
+    sha256_digest_json,
+)
 from dayu.host.durable.event_log import (
     EventClass,
     EventLogAppendRequest,
@@ -58,6 +62,12 @@ from dayu.host.durable.idempotency import (
     IdempotencyResultRef,
     IdempotencyScope,
     IdempotencyStore,
+)
+from dayu.host.durable.payload import (
+    PayloadDescriptor,
+    PayloadStore,
+    SQLitePayloadFormat,
+    SQLitePayloadWriteRequest,
 )
 from dayu.host.durable.run_transition import (
     CancelActiveAttemptInput,
@@ -119,6 +129,7 @@ from dayu.host.projection import (
     ProjectionCatchupPort,
     catch_up_projection_best_effort,
 )
+from dayu.host.payload_resolution import event_payload_object
 from dayu.host.tool_runtime_schema_projection import (
     business_bundle_digest as _business_bundle_digest,
     tool_schemas_digest as _tool_schemas_digest,
@@ -2889,6 +2900,17 @@ def _append_user_input_event(
     :returns: 已持久化 EventLog row。
     """
 
+    payload = _user_input_payload(request)
+    descriptor = _write_user_input_payload_if_needed(
+        transaction=transaction,
+        payload=payload,
+        event_id=event_id,
+    )
+    event_payload = (
+        payload
+        if descriptor is None
+        else _referenced_user_input_event_payload(request)
+    )
     return event_log_store.append_event(
         transaction,
         EventLogAppendRequest(
@@ -2906,23 +2928,85 @@ def _append_user_input_event(
             idempotency_key=request.client_request_id,
             policy_decision=None,
             reason=None,
-            payload_json={
-                "input_ref": request.input.payload_ref,
-                "input_digest": _input_digest(request.input),
-                "display_text": request.input.display_text,
-                "system_prompt": request.system_prompt,
-                "user_prompt": request.input.display_text,
-                "payload_ref": request.input.payload_ref,
-                "payload_digest": request.input.payload_digest,
-                "operation_kind": request.operation_kind,
-                "call_context_digest": request.call_context_digest,
-                "effective_execution_config": request.effective_execution_config,
-                "effective_tool_set": request.effective_tool_set,
-            },
-            payload_ref=None,
-            payload_digest=None,
+            payload_json=event_payload,
+            payload_ref=None if descriptor is None else descriptor.payload_ref,
+            payload_digest=None if descriptor is None else descriptor.payload_digest,
         ),
     ).row
+
+
+def _user_input_payload(request: _CreateAdmissionRequest) -> Mapping[str, JsonValue]:
+    """构造完整 ``USER_INPUT_ACCEPTED`` payload。
+
+    :param request: 归一化创建输入。
+    :returns: 完整 payload object。
+    """
+
+    return {
+        "input_ref": request.input.payload_ref,
+        "input_digest": _input_digest(request.input),
+        "display_text": request.input.display_text,
+        "system_prompt": request.system_prompt,
+        "user_prompt": request.input.display_text,
+        "payload_ref": request.input.payload_ref,
+        "payload_digest": request.input.payload_digest,
+        "operation_kind": request.operation_kind,
+        "call_context_digest": request.call_context_digest,
+        "effective_execution_config": request.effective_execution_config,
+        "effective_tool_set": request.effective_tool_set,
+    }
+
+
+def _write_user_input_payload_if_needed(
+    *,
+    transaction: HostTransaction,
+    payload: Mapping[str, JsonValue],
+    event_id: str,
+) -> PayloadDescriptor | None:
+    """超出 inline 阈值时把用户输入 payload 写入 SQLite payload 表。
+
+    :param transaction: 当前 Host transaction。
+    :param payload: 完整用户输入 payload。
+    :param event_id: 对应 EventLog event id。
+    :returns: payload descriptor；未超阈值时为 ``None``。
+    :raises HostDurableError: payload 编码或写入失败时抛出。
+    """
+
+    encoded = canonical_json_dumps(payload)
+    if len(encoded.encode("utf-8")) <= transaction.payload_inline_threshold_bytes:
+        return None
+    return PayloadStore().write_sqlite_payload(
+        transaction,
+        SQLitePayloadWriteRequest(
+            payload_ref=f"payload-user-input-{event_id}",
+            payload_id=f"sqlite-payload-user-input-{event_id}",
+            payload_format=SQLitePayloadFormat.CANONICAL_JSON,
+            payload_json=payload,
+            payload_bytes=None,
+            media_type="application/json",
+            metadata={"kind": "user_input_accepted"},
+            expected_digest=None,
+        ),
+    )
+
+
+def _referenced_user_input_event_payload(
+    request: _CreateAdmissionRequest,
+) -> Mapping[str, JsonValue]:
+    """构造引用大 payload 的轻量 EventLog inline payload。
+
+    :param request: 归一化创建输入。
+    :returns: 可内联保存的轻量 payload object。
+    """
+
+    return {
+        "input_ref": request.input.payload_ref,
+        "input_digest": _input_digest(request.input),
+        "payload_ref": request.input.payload_ref,
+        "payload_digest": request.input.payload_digest,
+        "operation_kind": request.operation_kind,
+        "call_context_digest": request.call_context_digest,
+    }
 
 
 def _append_source_relation_requested_event(
@@ -3441,20 +3525,6 @@ def _replay_effective_execution_config(
     )
 
 
-def _payload_json_from_event(event: EventLogRow) -> JsonValue:
-    """解析 EventLog row 的 payload JSON。
-
-    :param event: EventLog row。
-    :returns: payload JSON 值。
-    :raises HostDurableError: payload 不是合法 JSON 时抛出。
-    """
-
-    try:
-        return cast(JsonValue, json.loads(event.payload_json))
-    except json.JSONDecodeError as exc:
-        raise HostDurableError("EventLog payload_json is invalid") from exc
-
-
 def _require_payload_mapping(payload: JsonValue) -> dict[str, JsonValue]:
     """校验 payload 是 JSON object 并复制为 dict。
 
@@ -3664,7 +3734,9 @@ def _source_input_payload(
             message="Source Run input event is missing",
             retryable=False,
         )
-    return _payload_json_from_event(event)
+    return event_payload_object(
+        transaction, event, payload_label="USER_INPUT_ACCEPTED"
+    )
 
 
 def _require_existing_session(
