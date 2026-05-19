@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import pathlib
+import sqlite3
 from dataclasses import replace
 
 import pytest
@@ -157,6 +158,42 @@ async def test_active_cancel_emits_public_cancel_event(
 
 
 @pytest.mark.asyncio
+async def test_recovering_cancel_does_not_propagate_worker_cancel(
+    tmp_path: pathlib.Path,
+) -> None:
+    """public cancel_run 取消 RECOVERING Run 时不触碰 active WorkerProxy。
+
+    :param tmp_path: pytest 临时目录。
+    :returns: ``None``。
+    :raises AssertionError: RECOVERING cancel 错误传播到 worker 时抛出。
+    """
+
+    factory = _SequencedWorkerFactory([_BLOCK])
+    async with open_host(_options(tmp_path, factory)) as host:
+        session = await host.ensure_session(_ensure_request("recovering-cancel"))
+        active = await host.submit_followup(
+            session.session_id,
+            _followup_request(session.session_id, "recovering-cancel-run"),
+        )
+        await _wait_for_run_status(host, active.accepted_run_id, RunStatus.RUNNING)
+        await _wait_for_handle_count(factory, 1)
+        _mark_run_recovering(tmp_path / "host.sqlite3", active.accepted_run_id)
+
+        cancelled = await host.cancel_run(
+            active.accepted_run_id,
+            CancelRunRequest(
+                context=_context("recovering-cancel-run"),
+                client_request_id="recovering-cancel-run",
+                reason="recovering_cancel_visible",
+                mode=CancelMode.GRACEFUL,
+            ),
+        )
+
+        assert cancelled.status is RunStatus.CANCELLED
+        assert factory.handles[0].cancel_reasons == []
+
+
+@pytest.mark.asyncio
 async def test_cancel_session_runs_scoped_to_session(
     tmp_path: pathlib.Path,
 ) -> None:
@@ -204,6 +241,21 @@ async def test_cancel_session_runs_scoped_to_session(
     assert first_snapshot.status in (RunStatus.CANCELLING, RunStatus.CANCELLED)
     assert second_snapshot.status is RunStatus.RUNNING
     assert factory.handles[0].cancel_reasons == ["session_scope_only"]
+
+
+def _mark_run_recovering(db_path: pathlib.Path, run_id: str) -> None:
+    """直接把测试 Run 标记为 RECOVERING。
+
+    :param db_path: Host SQLite DB 路径。
+    :param run_id: 目标 Run id。
+    :returns: ``None``。
+    """
+
+    with sqlite3.connect(db_path) as connection:
+        connection.execute(
+            "UPDATE host_runs SET status = ? WHERE run_id = ?",
+            (RunStatus.RECOVERING.value, run_id),
+        )
 
 
 async def _wait_for_handle_count(

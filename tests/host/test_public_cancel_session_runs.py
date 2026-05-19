@@ -7,22 +7,18 @@ import sqlite3
 from datetime import UTC, datetime
 from pathlib import Path
 
-import pytest
-
 from dayu.host import (
+    AttemptStatus,
     AuthorizationClaim,
     CancelMode,
+    CancelRunRequest,
     CancelSessionRunsRequest,
-    FollowupBehavior,
-    HostApiError,
-    HostApiErrorCode,
     HostCallContext,
     OperationContext,
     RunStatus,
-    SubmitFollowupRequest,
+    cancel_run,
     cancel_session_runs,
     ensure_session,
-    submit_followup,
 )
 from dayu.host.api import HostInput
 from dayu.host.api import EnsureSessionRequest, HostCommandHandleOptions, StartRunRequest
@@ -38,6 +34,7 @@ from dayu.host.durable.options import (
     HostSQLiteStoragePolicy,
     PayloadStoragePolicy,
 )
+from dayu.host.durable.schema import TABLE_EVENT_LOG
 from dayu.host.durable.run_transition import (
     AcceptWorkerRunningInput,
     StartGovernedRunInput,
@@ -56,6 +53,9 @@ from dayu.host.durable.transaction import HostTransaction, HostTransactionRunner
 _NOW = datetime(2026, 5, 15, 1, 2, 3, tzinfo=UTC)
 _LANE_NAME = "llm"
 _EVENT_COUNT_READ_LIMIT = 1000
+_EVENT_TYPE_CANCEL_REQUESTED = "CANCEL_REQUESTED"
+_EVENT_TYPE_RUN_CANCELLED = "RUN_CANCELLED"
+_EVENT_TYPE_ATTEMPT_CANCELLED = "ATTEMPT_CANCELLED"
 
 
 def _options(tmp_path: Path) -> HostCommandHandleOptions:
@@ -170,31 +170,6 @@ def _start_request(session_id: str, client_request_id: str) -> StartRunRequest:
     )
 
 
-def _followup_request(
-    session_id: str, client_request_id: str
-) -> SubmitFollowupRequest:
-    """构造 submit_followup(queue) 请求。
-
-    :param session_id: Session id。
-    :param client_request_id: 幂等请求 id。
-    :returns: submit follow-up 请求。
-    """
-
-    return SubmitFollowupRequest(
-        context=_context(),
-        session_id=session_id,
-        client_request_id=client_request_id,
-        system_prompt=None,
-        user_prompt=f"follow-{client_request_id}",
-        tool_names=None,
-        runner_spec=None,
-        runner_options=None,
-        agent_policy=None,
-        behavior=FollowupBehavior.QUEUE,
-        target_run_id=None,
-    )
-
-
 def _cancel_request(client_request_id: str) -> CancelSessionRunsRequest:
     """构造 cancel_session_runs 请求。
 
@@ -206,6 +181,21 @@ def _cancel_request(client_request_id: str) -> CancelSessionRunsRequest:
         context=_context(),
         client_request_id=client_request_id,
         reason="user_stop_all",
+        mode=CancelMode.GRACEFUL,
+    )
+
+
+def _cancel_run_request(client_request_id: str) -> CancelRunRequest:
+    """构造 cancel_run 请求。
+
+    :param client_request_id: 幂等请求 id。
+    :returns: cancel run 请求。
+    """
+
+    return CancelRunRequest(
+        context=_context(),
+        client_request_id=client_request_id,
+        reason="user_stop_one",
         mode=CancelMode.GRACEFUL,
     )
 
@@ -226,6 +216,27 @@ def _event_count(host: HostCommandHandle) -> int:
     )
 
 
+def _event_types_for_run(db_path: Path, run_id: str) -> tuple[str, ...]:
+    """读取目标 Run 的 canonical event type 列表。
+
+    :param db_path: SQLite DB 路径。
+    :param run_id: Run id。
+    :returns: 该 Run 的 event type 元组。
+    """
+
+    with sqlite3.connect(db_path) as connection:
+        rows = connection.execute(
+            f"""
+            SELECT event_type
+            FROM {TABLE_EVENT_LOG}
+            WHERE run_id = ?
+            ORDER BY event_sequence
+            """,
+            (run_id,),
+        ).fetchall()
+    return tuple(str(row[0]) for row in rows)
+
+
 def _run_status(db_path: Path, run_id: str) -> RunStatus:
     """从 durable Run table 读取当前 Run 状态。
 
@@ -242,6 +253,24 @@ def _run_status(db_path: Path, run_id: str) -> RunStatus:
         ).fetchone()
     assert row is not None
     return RunStatus(str(row[0]))
+
+
+def _attempt_status(db_path: Path, attempt_id: str) -> AttemptStatus:
+    """从 durable Attempt table 读取当前 Attempt 状态。
+
+    :param db_path: SQLite DB 路径。
+    :param attempt_id: Attempt id。
+    :returns: Attempt 当前状态。
+    :raises AssertionError: Attempt 不存在时抛出。
+    """
+
+    with sqlite3.connect(db_path) as connection:
+        row = connection.execute(
+            "SELECT status FROM host_attempts WHERE attempt_id = ?",
+            (attempt_id,),
+        ).fetchone()
+    assert row is not None
+    return AttemptStatus(str(row[0]))
 
 
 def _accept_active_worker(
@@ -426,31 +455,104 @@ def test_cancel_session_runs_idempotent_replay_does_not_cancel_new_run(
         host.close()
 
 
-def test_cancel_session_runs_unsupported_non_terminal_has_no_partial_mutation(
+def test_cancel_run_recovering_appends_no_attempt_terminal(
     tmp_path: Path,
 ) -> None:
-    """存在 RECOVERING non-terminal 时返回 unsupported 且不部分取消 queued Run。"""
+    """cancel_run 取消 RECOVERING Run 时不追加 Attempt terminal fact。"""
 
     options = _options(tmp_path)
     host = create_host_command_handle(options)
     try:
         session_id = _session_id(host, "slot-a")
-        active = start_run(host, _start_request(session_id, "start-active"))
-        queued = start_run(host, _start_request(session_id, "start-queued"))
-        # 这里仅构造 unsupported 分类测试所需的 deferred 状态，不模拟生产
-        # recovery；该用例只验证 unsupported 分类不会产生 partial mutation。
-        _mark_run_status(options.db_path, active.run_id, RunStatus.RECOVERING)
-        before_cancel = _event_count(host)
-
-        with pytest.raises(HostApiError) as exc_info:
-            cancel_session_runs(
-                host, session_id, _cancel_request("cancel-session")
+        run = start_run(host, _start_request(session_id, "start-recovering"))
+        attempt_id = "attempt-not-created"
+        with open_host_durable_store(_durable_options(tmp_path)) as store:
+            attempt_id = _start_governed_run(
+                store.transaction_runner,
+                run_id=run.run_id,
+                expected_status=RunStatus.ACCEPTED,
+                id_suffix="recovering-single",
             )
+        _mark_run_status(options.db_path, run.run_id, RunStatus.RECOVERING)
 
-        assert exc_info.value.code == HostApiErrorCode.UNSUPPORTED_OPERATION
-        assert _event_count(host) == before_cancel
-        assert _run_status(options.db_path, active.run_id) == RunStatus.RECOVERING
-        assert _run_status(options.db_path, queued.run_id) == RunStatus.QUEUED
+        snapshot = cancel_run(
+            host, run.run_id, _cancel_run_request("cancel-recovering")
+        )
+        event_types = _event_types_for_run(options.db_path, run.run_id)
+
+        assert snapshot.status == RunStatus.CANCELLED
+        assert _run_status(options.db_path, run.run_id) == RunStatus.CANCELLED
+        assert _attempt_status(options.db_path, attempt_id) == AttemptStatus.STARTING
+        assert event_types[-2:] == (
+            _EVENT_TYPE_CANCEL_REQUESTED,
+            _EVENT_TYPE_RUN_CANCELLED,
+        )
+        assert _EVENT_TYPE_ATTEMPT_CANCELLED not in event_types
+    finally:
+        host.close()
+
+
+def test_cancel_run_recovering_replay_is_idempotent_per_run_id(
+    tmp_path: Path,
+) -> None:
+    """cancel_run 取消 RECOVERING Run 时按 run_id 隔离幂等重放。"""
+
+    options = _options(tmp_path)
+    host = create_host_command_handle(options)
+    try:
+        session_id = _session_id(host, "slot-a")
+        peer_session_id = _session_id(host, "slot-b")
+        recovering = start_run(
+            host, _start_request(session_id, "start-recovering-idempotent")
+        )
+        peer_recovering = start_run(
+            host, _start_request(peer_session_id, "start-recovering-peer")
+        )
+        _mark_run_status(options.db_path, recovering.run_id, RunStatus.RECOVERING)
+        _mark_run_status(options.db_path, peer_recovering.run_id, RunStatus.RECOVERING)
+        request = _cancel_run_request("cancel-recovering-idempotent")
+
+        first = cancel_run(host, recovering.run_id, request)
+        after_first_events = _event_types_for_run(options.db_path, recovering.run_id)
+        replay = cancel_run(host, recovering.run_id, request)
+        after_replay_events = _event_types_for_run(options.db_path, recovering.run_id)
+        peer = cancel_run(host, peer_recovering.run_id, request)
+        peer_events = _event_types_for_run(options.db_path, peer_recovering.run_id)
+
+        assert first == replay
+        assert first.run_id == recovering.run_id
+        assert replay.run_id == recovering.run_id
+        assert peer.run_id == peer_recovering.run_id
+        assert after_replay_events == after_first_events
+        assert after_replay_events.count(_EVENT_TYPE_CANCEL_REQUESTED) == 1
+        assert after_replay_events.count(_EVENT_TYPE_RUN_CANCELLED) == 1
+        assert peer_events.count(_EVENT_TYPE_CANCEL_REQUESTED) == 1
+        assert peer_events.count(_EVENT_TYPE_RUN_CANCELLED) == 1
+    finally:
+        host.close()
+
+
+def test_cancel_session_runs_includes_recovering_without_fail_closed(
+    tmp_path: Path,
+) -> None:
+    """session-scope cancel 覆盖 RECOVERING 且不会阻断同批 queued Run。"""
+
+    options = _options(tmp_path)
+    host = create_host_command_handle(options)
+    try:
+        session_id = _session_id(host, "slot-a")
+        recovering = start_run(host, _start_request(session_id, "start-active"))
+        queued = start_run(host, _start_request(session_id, "start-queued"))
+        _mark_run_status(options.db_path, recovering.run_id, RunStatus.RECOVERING)
+
+        snapshot = cancel_session_runs(
+            host, session_id, _cancel_request("cancel-session")
+        )
+
+        assert snapshot.active_run_id is None
+        assert snapshot.queued_run_ids == ()
+        assert _run_status(options.db_path, recovering.run_id) == RunStatus.CANCELLED
+        assert _run_status(options.db_path, queued.run_id) == RunStatus.CANCELLED
     finally:
         host.close()
 

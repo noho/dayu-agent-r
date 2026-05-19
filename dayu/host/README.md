@@ -68,8 +68,8 @@ Host 内部职责按语义分层：
 - `get_session(session_id)`：读取 Session snapshot。
 - `get_run(run_id)`：读取 Run snapshot。
 - `submit_followup(session_id, request)`：提交普通 queue 或 steer follow-up。
-- `cancel_run(run_id, request)`：取消单个 Run。
-- `cancel_session_runs(session_id, request)`：取消 Session 下可治理的非终态 Run。
+- `cancel_run(run_id, request)`：取消单个可治理 Run，覆盖未启动、pre-dispatch、active、waiting 与 recovering 状态。
+- `cancel_session_runs(session_id, request)`：取消 Session 下可治理的非终态 Run，覆盖未启动、pre-dispatch、active、waiting 与 recovering 状态。
 - `retry_run(run_id, request)`：基于失败源 Run 创建关联的新 Run。
 - `replay_run(run_id, request)`：基于成功源 Run 创建 no-tool 结构修复 Run。
 - `resolve_wait(wait_id, request)`：接收外部 wait result，并由 Host 恢复或收口 Run。
@@ -117,7 +117,7 @@ Run 状态：
 - `RUNNING`：Run 已进入 active Attempt lifecycle；当前 Attempt 可以是 `STARTING` 或 `RUNNING`。
 - `WAITING`：Attempt 已因工具等待挂起，Run 等待 Host `resolve_wait` 或 cancel。
 - `CANCELLING`：Host 已接受取消并向 active worker best-effort 传播。
-- `RECOVERING`：Host 已收口旧 Attempt，正在基于同一 Run 的 canonical facts 创建新的 recovery Attempt。
+- `RECOVERING`：Host 已收口旧 Attempt，正在基于同一 Run 的 canonical facts 创建新的 recovery Attempt；新 recovery dispatch 提交前可被 cancel 直接收口为 `CANCELLED`，不追加旧 Attempt terminal fact。
 - `SUCCEEDED`、`FAILED`、`CANCELLED`、`LOST`：Run 终态。
 
 Attempt 状态：

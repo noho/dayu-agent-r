@@ -81,7 +81,9 @@ from dayu.host.durable.state import (
     terminal_recovering_run_row,
     terminal_unstarted_run_row,
     terminal_run_row,
+    serialize_run_status,
 )
+from dayu.host.durable.schema import TABLE_HOST_RUNS
 from dayu.host.durable.transaction import HostTransaction
 
 _EVENT_TYPE_RUN_ACCEPTED = "RUN_ACCEPTED"
@@ -769,6 +771,40 @@ class CancelActiveAttemptInput:
 @dataclass(frozen=True, slots=True)
 class CancelWaitingRunInput:
     """取消 waiting Run 的输入。
+
+    :param run_id: 目标 Run id。
+    :param cancel_request_event_id: 调用方生成的 ``CANCEL_REQUESTED`` event id。
+    :param run_cancelled_event_id: 调用方生成的 ``RUN_CANCELLED`` event id。
+    :param occurred_at: canonical facts 的发生时间。
+    :param actor: 事件 actor。
+    :param source: 事件 source。
+    :param client_request_id: 客户端幂等请求 id。
+    :param idempotency_key: 幂等 key。
+    :param reason: cancel reason。
+    :param mode: cancel mode。
+    :param call_context_digest: 调用上下文 digest。
+    """
+
+    run_id: str
+    cancel_request_event_id: str
+    run_cancelled_event_id: str
+    occurred_at: datetime
+    actor: str
+    source: str
+    client_request_id: str
+    idempotency_key: str
+    reason: str
+    mode: CancelMode
+    call_context_digest: str
+
+
+@dataclass(frozen=True, slots=True)
+class CancelRecoveringRunInput:
+    """取消 RECOVERING Run 的输入。
+
+    RECOVERING 表示旧 Attempt 已由 recovery 收口，新的 recovery dispatch
+    尚未提交。取消该状态只提交用户取消意图和 Run terminal fact，不修改旧
+    Attempt 或 dispatch record。
 
     :param run_id: 目标 Run id。
     :param cancel_request_event_id: 调用方生成的 ``CANCEL_REQUESTED`` event id。
@@ -2317,6 +2353,72 @@ def cancel_waiting_run_in_transaction(
     )
 
 
+def cancel_recovering_run_in_transaction(
+    transaction: HostTransaction,
+    event_log_store: EventLogStore,
+    request: CancelRecoveringRunInput,
+) -> RunTransitionResult:
+    """取消 RECOVERING Run，不修改旧 Attempt 或 dispatch record。
+
+    :param transaction: 调用方提供的 Host transaction。
+    :param event_log_store: EventLog append primitive。
+    :param request: recovering cancel 输入。
+    :returns: transition 结果；前置状态不满足时返回 not_found/invalid_state。
+    :raises HostDurableError: 输入字段或 SQLite 写入无效时由底层抛出。
+    """
+
+    _validate_cancel_recovering_input(request)
+    run = read_run_by_id(transaction, request.run_id)
+    if run is None:
+        return RunTransitionResult(
+            status=StateMutationStatus.NOT_FOUND,
+            run=None,
+            attempt=None,
+            dispatch_record=None,
+        )
+    if run.status != RunStatus.RECOVERING:
+        return RunTransitionResult(
+            status=StateMutationStatus.INVALID_STATE,
+            run=run,
+            attempt=_read_current_attempt_if_present(transaction, run),
+            dispatch_record=_read_current_dispatch_record_if_present(
+                transaction, run
+            ),
+        )
+
+    cancel_request_event = event_log_store.append_event(
+        transaction, _cancel_requested_event_request(request, run)
+    ).row
+    run_cancelled_event = event_log_store.append_event(
+        transaction,
+        _run_cancelled_event_request(
+            request=request,
+            run=run,
+            cancel_request_event_id=cancel_request_event.event_id,
+            terminal_attempt_id=None,
+            terminal_attempt_event_id=None,
+        ),
+    ).row
+    terminal_at = format_utc_timestamp(request.occurred_at)
+    run_result = _cancel_recovering_run_row(
+        transaction,
+        run_id=run.run_id,
+        terminal_event_id=run_cancelled_event.event_id,
+        terminal_event_sequence=run_cancelled_event.event_sequence,
+        terminal_at=terminal_at,
+    )
+    run_result = _require_run_mutation_updated(
+        run_result,
+        mutation_name="cancel recovering Run",
+    )
+    return RunTransitionResult(
+        status=run_result.status,
+        run=run_result.row,
+        attempt=_read_current_attempt_if_present(transaction, run),
+        dispatch_record=_read_current_dispatch_record_if_present(transaction, run),
+    )
+
+
 def cancel_queued_in_transaction(
     transaction: HostTransaction,
     event_log_store: EventLogStore,
@@ -2647,6 +2749,64 @@ def _require_dispatch_record_mutation_updated(
             status=result.status,
         )
     return result
+
+
+def _cancel_recovering_run_row(
+    transaction: HostTransaction,
+    *,
+    run_id: str,
+    terminal_event_id: str,
+    terminal_event_sequence: int,
+    terminal_at: str,
+) -> RunMutationResult:
+    """CAS 将 RECOVERING Run 取消收口。
+
+    :param transaction: 调用方提供的 Host transaction。
+    :param run_id: 目标 Run id。
+    :param terminal_event_id: ``RUN_CANCELLED`` event id。
+    :param terminal_event_sequence: ``RUN_CANCELLED`` 全局事件序号。
+    :param terminal_at: 固定 UTC terminal timestamp 文本。
+    :returns: Run mutation 结果。
+    :raises HostDurableError: 输入字段无效时抛出。
+    """
+
+    _require_non_empty_text(run_id, field_name="run_id")
+    _require_non_empty_text(terminal_event_id, field_name="terminal_event_id")
+    _require_positive_sequence(
+        terminal_event_sequence, field_name="terminal_event_sequence"
+    )
+    _require_non_empty_text(terminal_at, field_name="terminal_at")
+    result = transaction.execute(
+        f"""
+        UPDATE {TABLE_HOST_RUNS}
+        SET
+          status = ?,
+          terminal_event_id = ?,
+          terminal_event_sequence = ?,
+          updated_at = ?,
+          terminal_at = ?
+        WHERE run_id = ?
+          AND status = ?
+          AND terminal_event_id IS NULL
+          AND terminal_event_sequence IS NULL
+          AND terminal_at IS NULL
+        """,
+        (
+            serialize_run_status(RunStatus.CANCELLED),
+            terminal_event_id,
+            terminal_event_sequence,
+            terminal_at,
+            terminal_at,
+            run_id,
+            serialize_run_status(RunStatus.RECOVERING),
+        ),
+    )
+    row = read_run_by_id(transaction, run_id)
+    if result.rowcount == 1:
+        return RunMutationResult(status=StateMutationStatus.UPDATED, row=row)
+    if row is None:
+        return RunMutationResult(status=StateMutationStatus.NOT_FOUND, row=None)
+    return RunMutationResult(status=StateMutationStatus.CAS_LOST, row=row)
 
 
 def _raise_after_event_append_mutation_failure(
@@ -3618,6 +3778,7 @@ def _cancel_requested_event_request(
         | CancelPredispatchStartingInput
         | CancelActiveAttemptInput
         | CancelWaitingRunInput
+        | CancelRecoveringRunInput
     ),
     run: RunRow,
 ) -> EventLogAppendRequest:
@@ -3747,7 +3908,11 @@ def _attempt_cancelled_event_request(
 
 def _run_cancelled_event_request(
     *,
-    request: CancelQueuedRunInput | CancelPredispatchStartingInput,
+    request: (
+        CancelQueuedRunInput
+        | CancelPredispatchStartingInput
+        | CancelRecoveringRunInput
+    ),
     run: RunRow,
     cancel_request_event_id: str,
     terminal_attempt_id: str | None,
@@ -4898,6 +5063,36 @@ def _read_dispatch_for_attempt(
     return read_dispatch_record_by_attempt_id(transaction, attempt.attempt_id)
 
 
+def _read_current_attempt_if_present(
+    transaction: HostTransaction, run: RunRow
+) -> AttemptRow | None:
+    """读取 Run 当前 Attempt；Run 无当前 Attempt 时返回 ``None``。
+
+    :param transaction: 调用方提供的 Host transaction。
+    :param run: Run row。
+    :returns: current Attempt row 或 ``None``。
+    """
+
+    if run.current_attempt_id is None:
+        return None
+    return read_attempt_by_id(transaction, run.current_attempt_id)
+
+
+def _read_current_dispatch_record_if_present(
+    transaction: HostTransaction, run: RunRow
+) -> DispatchRecordRow | None:
+    """读取 Run 当前 Attempt 对应 dispatch record；缺失时返回 ``None``。
+
+    :param transaction: 调用方提供的 Host transaction。
+    :param run: Run row。
+    :returns: dispatch record row 或 ``None``。
+    """
+
+    if run.current_attempt_id is None:
+        return None
+    return read_dispatch_record_by_attempt_id(transaction, run.current_attempt_id)
+
+
 def _attempt_terminal_event_type(status: AttemptStatus) -> str:
     """把 Attempt 终态映射到具体 canonical event type。
 
@@ -5611,6 +5806,28 @@ def _validate_cancel_waiting_input(request: CancelWaitingRunInput) -> None:
     )
     _require_non_empty_text(
         request.run_cancelled_event_id, field_name="run_cancelled_event_id"
+    )
+
+
+def _validate_cancel_recovering_input(request: CancelRecoveringRunInput) -> None:
+    """校验 recovering cancel 输入。
+
+    :param request: recovering cancel 输入。
+    :returns: ``None``。
+    :raises HostDurableError: 任一字段无效时抛出。
+    """
+
+    _validate_common_cancel_input(
+        run_id=request.run_id,
+        cancel_request_event_id=request.cancel_request_event_id,
+        run_cancelled_event_id=request.run_cancelled_event_id,
+        actor=request.actor,
+        source=request.source,
+        client_request_id=request.client_request_id,
+        idempotency_key=request.idempotency_key,
+        reason=request.reason,
+        mode=request.mode,
+        call_context_digest=request.call_context_digest,
     )
 
 
