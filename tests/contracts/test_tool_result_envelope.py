@@ -8,10 +8,12 @@
 from __future__ import annotations
 
 import dataclasses
+from datetime import UTC, datetime, timedelta
 
 import pytest
 
 from dayu.contracts.tool_result import (
+    ToolResultMeta,
     ToolResultFailure,
     ToolResultSuccess,
 )
@@ -47,6 +49,24 @@ def test_failure_envelope_rejects_empty_error_or_message() -> None:
     with pytest.raises(ValueError, match="message"):
         ToolResultFailure(
             ok=False, error="E_X", message="  ", hint=None, meta=None
+        )
+
+
+def test_tool_result_meta_rejects_empty_tool_name_and_reversed_time() -> None:
+    """工具结果元信息必须拒绝空工具名与倒序时间。"""
+
+    started_at = datetime(2026, 5, 19, 1, 2, 3, tzinfo=UTC)
+    with pytest.raises(ValueError, match="tool_name"):
+        ToolResultMeta(
+            tool_name=" ",
+            started_at=started_at,
+            finished_at=started_at,
+        )
+    with pytest.raises(ValueError, match="finished_at"):
+        ToolResultMeta(
+            tool_name="lookup",
+            started_at=started_at,
+            finished_at=started_at - timedelta(seconds=1),
         )
 
 

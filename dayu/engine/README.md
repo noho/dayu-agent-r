@@ -67,7 +67,7 @@ from dayu.engine.contracts import AgentRunRequest, RunnerSpec
 
 - `run_id`：调用方传入的本次 run 标识；Engine 只随事件与工具执行上下文透传，不拥有 run 生命周期。
 - `session_id`：调用方传入的 session 标识；Engine 只随事件与工具执行上下文透传，不拥有 session 生命周期。
-- `messages`：进入本次 run 的 `AgentMessage` 元组；Engine 会在 Runner 调用前执行防御性 inline 内容大小检查，超限时以既有 `context_compaction_required` recoverable failure 收口，要求调用方通过 ref / digest / payload / compact artifact 边界重建有界 messages。
+- `messages`：进入本次 run 的非空 `AgentMessage` 元组；Engine 会在 Runner 调用前执行防御性 inline 内容大小检查，超限时以既有 `context_compaction_required` recoverable failure 收口，要求调用方通过 ref / digest / payload / compact artifact 边界重建有界 messages。
 - `disable_tools`：是否禁用工具调用。
 - `runner_spec`：Runner 规约。
 - `runner_options`：单次 Runner 调用参数。
@@ -132,6 +132,8 @@ Engine 消费这些字段完成单次 run；不从配置文件、调用方状态
 
 OpenAI-compatible Runner 会在内部执行 streaming capability：当 `RunnerCallOptions.stream=True` 但 `RunnerSpec.supports_streaming=False` 时，本次请求降级为 `stream=False`，且不写 `stream_options`。`RunnerSpec.supports_stream_usage` 只门控流式请求中是否写入 `stream_options.include_usage=True`；为 `False` 时不写该字段。`stream_idle_timeout_seconds` 与 `stream_idle_heartbeat_seconds` 是 SSE 字节空闲检测配置：heartbeat 只能在 timeout 已启用时设置，二者必须为正数，且 heartbeat 不能大于 timeout。
 
+Engine / Runner 的可观测日志遵循 `dayu/README.md` 的级别语义。Agent 在 `VERBOSE` 记录 run、iteration、tool loop、fallback / continuation 与 terminal 骨架；OpenAI-compatible Runner 在 `VERBOSE` 记录单次 provider call start / done / cancelled 摘要，在 `DEBUG` 记录 HTTP attempt、response status、finish reason、usage、SSE heartbeat 与协议细节，在 `WARN` 记录 provider retry、协议差异和可恢复传输异常。Engine / Runner 日志不输出完整 prompt、provider headers、API key、完整工具结果或大段响应。
+
 ### 消息与工具接口
 
 Engine 消费的消息类型来自 `AgentMessage` 封闭联合，当前包括：
@@ -163,7 +165,7 @@ Engine 消费的消息类型来自 `AgentMessage` 封闭联合，当前包括：
 
 Engine 公共契约分为 Engine 专属契约与跨层共享契约。Engine 专属契约位于 `dayu.engine.contracts`；工具、JSON 值、取消 token 等共享契约位于 `dayu.contracts`。
 
-- `AgentRunRequest`：单次 run 的输入快照。形状包含 `run_id`、`session_id`、`messages`、`disable_tools`、`runner_spec`、`runner_options`、`agent_policy`、`tool_schemas`、`tool_executor`、`cancellation_token`。
+- `AgentRunRequest`：单次 run 的输入快照。形状包含 `run_id`、`session_id`、非空 `messages`、`disable_tools`、`runner_spec`、`runner_options`、`agent_policy`、`tool_schemas`、`tool_executor`、`cancellation_token`。
 - `AgentPolicy`：Agent loop 策略。形状包含 iteration 预算、续写预算、工具开关、工具握手 timeout、fallback 模式、fallback prompt、continuation prompt 与连续失败工具批次阈值。
 - `RunnerSpec`：Runner 规约。形状包含 provider、model、endpoint、api key 引用、headers、tool calling / streaming 能力、stream usage 能力、默认 timeout、重试次数、provider 请求扩展、SSE idle timeout 与 heartbeat。
 - `RunnerCallOptions`：单次 Runner 调用参数。形状包含 `temperature`、`max_tokens`、`top_p`、`stream`。
@@ -176,7 +178,7 @@ Engine 公共契约分为 Engine 专属契约与跨层共享契约。Engine 专�
 - `tool_schemas`：本次 run 暴露给模型的工具 schema 快照。形状是 `tuple[ToolSchema, ...]`。
 - `tool_executor`：工具执行协议 handle。形状是 `ToolExecutor.execute(BatchToolExecutionRequest) -> BatchToolExecutionOutcome`。
 - `BatchToolExecutionRequest`：批式工具执行请求。形状包含 `calls: tuple[ToolCallRequest, ...]` 与 `context: BatchToolExecutionContext`。
-- `BatchToolExecutionContext`：批式工具执行上下文。形状包含 `run_id`、`session_id`、`iteration_id`、`timeout_seconds`、`cancellation_token`、`correlation_id`。
+- `BatchToolExecutionContext`：批式工具执行上下文。形状包含非空 `run_id`、`session_id`、`iteration_id`、`timeout_seconds`、`cancellation_token`、`correlation_id`。
 - `ToolExecutionOutcome`：单工具执行结果封闭联合。成员包括 `ToolCompletedOutcome`、`ToolFailedOutcome`、`ToolAwaitingOutcome`、`ToolCancelledOutcome`。
 - `BatchToolExecutionOutcome`：批式工具执行结果。形状包含 `records: tuple[BatchToolExecutionRecord, ...]`，构造期要求 record 的 tool call id 非空且不重复；与输入 calls 的完整双射由 Engine 校验。
 - `ToolAwaitingOutcome`：长事务等待结果。形状包含 `await_spec: ToolAwaitSpec` 与 `snapshot: ToolAwaitSnapshot | None`。
@@ -277,6 +279,7 @@ run_agent_messages(request)
       -> if fallback_mode is FORCE_ANSWER
           -> observe cancellation_token before fallback Runner call
           -> append fallback_prompt to run-local messages
+          -> run inline message size guard before Runner call
           -> AsyncRunner.call(messages, request.runner_options, tools=())
           -> emit EngineEvent.final_answer if content accepted
           -> emit EngineEvent.run_failed if force-answer is empty or still requests tools
@@ -408,11 +411,11 @@ HTTP 200 response 在 effective stream 为 `True` 且 `Content-Type` 为 `text/e
 
 挂起 / 恢复协议以 `ToolAwaitingOutcome` 为边界。工具开始外部长事务并建议挂起时，ToolExecutor 返回 `await_spec` 与 `snapshot`；Engine 先产出 `tool_awaiting`，再以 `run_suspended` 收口并关闭 Runner。Engine 不等待外部长事务完成，不持久化等待记录，也不恢复旧 Agent/Runner 实例；上层调用者保存 `await_spec` / `snapshot`，等工具终态确定后构造新的 `AgentRunRequest`，把工具终态结果或恢复输入显式交回 Engine。
 
-Engine 的取消提交边界是“阻止未来工作，不覆盖已接受事实”。已经提升的 RunnerEvent 事实、已经接受的普通工具结果、已经返回的 awaiting outcome 和已经接受的 final decision 都会按各自事实保留；取消只在尚未接受 outcome、下一轮 Runner、continuation 或 fallback 之前抢占后续工作。上层调用者把自己的取消命令映射成 run-local token，把长事务映射成 `ToolAwaitingOutcome`，再用新 run 恢复，就能形成“宿主强约束下的 LLM in the loop”。
+Engine 的取消提交边界是“阻止未来工作，不覆盖已接受事实”。已经提升的 RunnerEvent 事实、已经接受的普通工具结果、已经返回的 awaiting outcome 和已经接受的 final decision 都会按各自事实保留；取消只在尚未接受 outcome、下一轮 Runner、continuation、fallback 或工具批执行前抢占后续工作，工具批执行前命中取消时不会先登记本批 tool call id。上层调用者把自己的取消命令映射成 run-local token，把长事务映射成 `ToolAwaitingOutcome`，再用新 run 恢复，就能形成“宿主强约束下的 LLM in the loop”。
 
 provider 协议错误与 HTTP / 网络错误分层处理。Runner 解析层错误产出 `provider_protocol_error`；HTTP、网络、超时和上下文超限产出 `runner_http_error`。其中上下文长度超限会被 Engine 提升为 `context_compaction_requested`，该事件在 provider overflow 路径中的 `budget_state` 为 `None`，并以可恢复失败候选收口；是否压缩、如何恢复、如何记录 Host budget 不属于 Engine。Engine 不做 proactive threshold compaction、compact / retry、provider-aware tokenizer 或 Host budget policy。
 
-Runner close 是 run-scoped 收尾机制。`run_agent_messages` 在生成器结束或关闭时会触发 `EngineEvent stream` 关闭；Agent 也在终态路径和最终清理中幂等关闭 Runner。Runner close 失败只记录诊断，不改写已经确定的公共终态。
+Runner close 是 run-scoped 收尾机制。`run_agent_messages` 在生成器结束或关闭时会触发 `EngineEvent stream` 关闭；Agent 也在终态路径和最终清理中按 once 语义关闭 Runner，普通 close 失败后不会重复 close 同一 Runner。普通 Runner close 失败只记录诊断，不改写已经确定的公共终态；close 被 asyncio cancellation 打断时透传取消，但仍释放私有 Agent 运行槽位。
 
 `metadata` 是 EngineEvent 的中性 observer / debug hint 边界。契约事实必须进入强类型 data 字段，不得放进 metadata 让调用方解析。
 

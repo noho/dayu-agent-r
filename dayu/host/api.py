@@ -1,11 +1,11 @@
-"""Host 公共 API 类型契约。
+"""Host API 类型契约。
 
-本模块定义 Host 后续阶段可依赖的公共 request、snapshot、status、event
-stream、error、context 与本地执行装配类型。它不实现 command path、
-durable store、EventLog 写入、dispatch scheduler、policy provider 或
-Engine 调用路径。`HostLocalExecutionOptions` 为 composition root 本地执行
-装配保留构造期 tooling 输入字段，但 tooling 类型仍由 `dayu.host.tooling`
-直接导出，不进入 `dayu.host.api.__all__`。
+本模块定义 Host 后续阶段可依赖的 request、snapshot、status、typed
+HostEvent、error、context、public opener options 与低层本地执行装配类型。
+它不实现 command path、durable store、EventLog 写入、dispatch scheduler、
+policy provider 或 Engine 调用路径。普通 Service-facing 包根导出由
+``dayu.host.__all__`` 收口；低层测试如需 legacy command / stream 类型，应
+显式导入内部模块路径。
 """
 
 from __future__ import annotations
@@ -711,6 +711,12 @@ class HostLocalExecutionOptions:
         ``None`` 表示 pre-start governance 直接放行，不触发 proactive compact。
     :param context_compactor: Host Context Governance 使用的 compactor typed port；
         仅在预算触发 compact 时需要，生产不得隐式使用 fake compactor。
+    :param compactor_runner_spec: compactor 独立 Runner 规约；无 LLM
+        compactor 时为 ``None``。
+    :param compactor_runner_options: compactor 独立 Runner 调用参数；无 LLM
+        compactor 时为 ``None``。
+    :param compactor_policy_ref: compactor policy 的稳定引用；无独立 policy
+        时为 ``None``。
     :param compact_artifact_root: compact artifact 写入根目录；未配置且触发
         compact 时 fail closed。
     :param compact_artifact_create_parent_dirs: compact artifact 根目录缺失时是否创建。
@@ -738,6 +744,9 @@ class HostLocalExecutionOptions:
     worker_factory: LocalEngineWorkerFactory
     context_budget_policy: ContextBudgetPolicy | None = None
     context_compactor: ContextCompactor | None = None
+    compactor_runner_spec: RunnerSpec | None = None
+    compactor_runner_options: RunnerCallOptions | None = None
+    compactor_policy_ref: str | None = None
     compact_artifact_root: pathlib.Path | None = None
     compact_artifact_create_parent_dirs: bool = True
     memory_projection_policy: MemoryProjectionPolicy = field(
@@ -821,6 +830,24 @@ class HostLocalExecutionOptions:
                 "HostLocalExecutionOptions.context_budget_policy must be "
                 "ContextBudgetPolicy"
             )
+        if self.compactor_runner_spec is not None and not isinstance(
+            self.compactor_runner_spec, RunnerSpec
+        ):
+            raise TypeError(
+                "HostLocalExecutionOptions.compactor_runner_spec must be "
+                "RunnerSpec"
+            )
+        if self.compactor_runner_options is not None and not isinstance(
+            self.compactor_runner_options, RunnerCallOptions
+        ):
+            raise TypeError(
+                "HostLocalExecutionOptions.compactor_runner_options must be "
+                "RunnerCallOptions"
+            )
+        _require_optional_non_empty(
+            self.compactor_policy_ref,
+            field_name="HostLocalExecutionOptions.compactor_policy_ref",
+        )
         if self.compact_artifact_root is not None:
             _require_path(
                 self.compact_artifact_root,
@@ -853,6 +880,276 @@ class HostLocalExecutionOptions:
             raise TypeError(
                 "HostLocalExecutionOptions.enable_truncation_manager must be bool"
             )
+
+
+@dataclass(frozen=True, slots=True)
+class OrdinaryRunExecutionBaseline:
+    """普通 Run 的构造期执行基线。
+
+    :param runner_spec: 普通 Run 默认使用的 Engine Runner 规约。
+    :param runner_options: 普通 Run 默认使用的 Runner 调用参数。
+    :param agent_policy: 普通 Run 默认使用的 Agent 策略。
+    """
+
+    runner_spec: RunnerSpec
+    runner_options: RunnerCallOptions
+    agent_policy: AgentPolicy
+
+    def __post_init__(self) -> None:
+        """校验普通 Run 执行基线。
+
+        :returns: ``None``。
+        :raises TypeError: 任一字段不是对应 typed contract 时抛出。
+        """
+
+        if not isinstance(self.runner_spec, RunnerSpec):
+            raise TypeError(
+                "OrdinaryRunExecutionBaseline.runner_spec must be RunnerSpec"
+            )
+        if not isinstance(self.runner_options, RunnerCallOptions):
+            raise TypeError(
+                "OrdinaryRunExecutionBaseline.runner_options must be "
+                "RunnerCallOptions"
+            )
+        if not isinstance(self.agent_policy, AgentPolicy):
+            raise TypeError(
+                "OrdinaryRunExecutionBaseline.agent_policy must be AgentPolicy"
+            )
+
+
+@dataclass(frozen=True, slots=True)
+class CompactorRunnerBaseline:
+    """Host-owned LLM compactor 的构造期运行配置。
+
+    :param compactor_runner_spec: compactor 独立 Runner 规约。
+    :param compactor_runner_options: compactor 独立 Runner 调用参数。
+    :param compact_artifact_root: compact artifact 写入根目录。
+    :param compact_artifact_create_parent_dirs: artifact 根目录缺失时是否创建。
+    """
+
+    compactor_runner_spec: RunnerSpec
+    compactor_runner_options: RunnerCallOptions
+    compact_artifact_root: pathlib.Path
+    compact_artifact_create_parent_dirs: bool = True
+
+    def __post_init__(self) -> None:
+        """校验 compactor runner 基线。
+
+        :returns: ``None``。
+        :raises TypeError: 路径、布尔或 Runner typed 字段类型非法时抛出。
+        """
+
+        if not isinstance(self.compactor_runner_spec, RunnerSpec):
+            raise TypeError(
+                "CompactorRunnerBaseline.compactor_runner_spec must be "
+                "RunnerSpec"
+            )
+        if not isinstance(self.compactor_runner_options, RunnerCallOptions):
+            raise TypeError(
+                "CompactorRunnerBaseline.compactor_runner_options must be "
+                "RunnerCallOptions"
+            )
+        _require_path(
+            self.compact_artifact_root,
+            field_name="CompactorRunnerBaseline.compact_artifact_root",
+        )
+        _require_bool(
+            self.compact_artifact_create_parent_dirs,
+            field_name=(
+                "CompactorRunnerBaseline."
+                "compact_artifact_create_parent_dirs"
+            ),
+        )
+
+
+@dataclass(frozen=True, slots=True)
+class OpenHostOptions:
+    """``open_host`` 的普通本地多轮构造期选项。
+
+    :param db_path: Host durable SQLite 数据库路径。
+    :param artifact_root: Host artifact 根目录。
+    :param create_parent_dirs: 打开 store / artifact 前是否创建父目录。
+    :param sqlite_busy_timeout_seconds: durable SQLite busy timeout 秒数。
+    :param sqlite_write_busy_retry_count: 写事务 busy 重试次数。
+    :param sqlite_write_retry_initial_delay_seconds: 首次写重试等待秒数。
+    :param sqlite_write_retry_backoff_multiplier: 写重试退避倍率。
+    :param sqlite_write_retry_max_delay_seconds: 写重试最大等待秒数。
+    :param payload_inline_threshold_bytes: payload 内联存储阈值字节数。
+    :param lane_db_path: runtime lane SQLite 数据库路径。
+    :param lane_name: 本地执行 lane 名称。
+    :param lane_capacity: 本地执行 lane 容量。
+    :param lane_default_timeout_seconds: lane acquire 默认 timeout；``None``
+        表示无限等待。
+    :param lane_claim_ttl_seconds: lane claim TTL 秒数。
+    :param lane_heartbeat_interval_seconds: lane heartbeat 秒数。
+    :param worker_startup_timeout_seconds: worker accept timeout 秒数。
+    :param dispatch_poll_interval_seconds: dispatch 后台循环空闲轮询秒数。
+    :param ordinary_run_baseline: 普通 Run 执行基线。
+    :param worker_factory: 本地 worker factory typed port。
+    :param tooling_options: construction-time 工具治理选项；无工具时为
+        ``None``。
+    :param context_budget_policy: Host Context Governance 预算策略；不启用
+        proactive compact 时为 ``None``。
+    :param compactor_runner_baseline: Host-owned LLM compactor 运行配置；未装配
+        compact 能力时为 ``None``。
+    :param memory_projection_policy: dispatch 前 memory projection catch-up
+        使用的 policy。
+    :param memory_projection_catchup_batch_size: memory catch-up 单批最大 row 数。
+    :param enable_truncation_manager: tool-enabled dispatch 是否启用截断治理。
+    """
+
+    db_path: pathlib.Path
+    artifact_root: pathlib.Path
+    create_parent_dirs: bool
+    sqlite_busy_timeout_seconds: float
+    sqlite_write_busy_retry_count: int
+    sqlite_write_retry_initial_delay_seconds: float
+    sqlite_write_retry_backoff_multiplier: float
+    sqlite_write_retry_max_delay_seconds: float
+    payload_inline_threshold_bytes: int
+    lane_db_path: pathlib.Path
+    lane_name: str
+    lane_capacity: int
+    lane_default_timeout_seconds: float | None
+    lane_claim_ttl_seconds: float
+    lane_heartbeat_interval_seconds: float
+    worker_startup_timeout_seconds: float
+    dispatch_poll_interval_seconds: float
+    ordinary_run_baseline: OrdinaryRunExecutionBaseline
+    worker_factory: LocalEngineWorkerFactory
+    tooling_options: _HostToolingOptions | None
+    context_budget_policy: ContextBudgetPolicy | None
+    compactor_runner_baseline: CompactorRunnerBaseline | None
+    memory_projection_policy: MemoryProjectionPolicy
+    memory_projection_catchup_batch_size: int
+    enable_truncation_manager: bool
+
+    def __post_init__(self) -> None:
+        """校验 ``open_host`` 构造期选项。
+
+        :returns: ``None``。
+        :raises TypeError: 路径、布尔、整数或 typed contract 字段类型非法时抛出。
+        :raises ValueError: 文本为空、容量非法、timeout 非法或 lane TTL
+            不大于 heartbeat 时抛出。
+        """
+
+        _require_path(self.db_path, field_name="OpenHostOptions.db_path")
+        _require_path(
+            self.artifact_root, field_name="OpenHostOptions.artifact_root"
+        )
+        _require_bool(
+            self.create_parent_dirs,
+            field_name="OpenHostOptions.create_parent_dirs",
+        )
+        _require_positive_float(
+            self.sqlite_busy_timeout_seconds,
+            field_name="OpenHostOptions.sqlite_busy_timeout_seconds",
+        )
+        _require_non_negative_int(
+            self.sqlite_write_busy_retry_count,
+            field_name="OpenHostOptions.sqlite_write_busy_retry_count",
+        )
+        _require_positive_float(
+            self.sqlite_write_retry_initial_delay_seconds,
+            field_name=(
+                "OpenHostOptions.sqlite_write_retry_initial_delay_seconds"
+            ),
+        )
+        _require_positive_float(
+            self.sqlite_write_retry_backoff_multiplier,
+            field_name="OpenHostOptions.sqlite_write_retry_backoff_multiplier",
+        )
+        _require_positive_float(
+            self.sqlite_write_retry_max_delay_seconds,
+            field_name="OpenHostOptions.sqlite_write_retry_max_delay_seconds",
+        )
+        _require_positive_int(
+            self.payload_inline_threshold_bytes,
+            field_name="OpenHostOptions.payload_inline_threshold_bytes",
+        )
+        _require_path(
+            self.lane_db_path, field_name="OpenHostOptions.lane_db_path"
+        )
+        _require_non_empty(self.lane_name, field_name="OpenHostOptions.lane_name")
+        _require_positive_int(
+            self.lane_capacity, field_name="OpenHostOptions.lane_capacity"
+        )
+        if self.lane_default_timeout_seconds is not None:
+            if (
+                isinstance(self.lane_default_timeout_seconds, bool)
+                or not isinstance(self.lane_default_timeout_seconds, int | float)
+            ):
+                raise TypeError(
+                    "OpenHostOptions.lane_default_timeout_seconds must be float"
+                )
+            if self.lane_default_timeout_seconds < 0:
+                raise ValueError(
+                    "OpenHostOptions.lane_default_timeout_seconds must be "
+                    "non-negative"
+                )
+        _require_positive_float(
+            self.lane_claim_ttl_seconds,
+            field_name="OpenHostOptions.lane_claim_ttl_seconds",
+        )
+        _require_positive_float(
+            self.lane_heartbeat_interval_seconds,
+            field_name="OpenHostOptions.lane_heartbeat_interval_seconds",
+        )
+        if self.lane_claim_ttl_seconds <= self.lane_heartbeat_interval_seconds:
+            raise ValueError(
+                "OpenHostOptions.lane_claim_ttl_seconds must be greater than "
+                "lane_heartbeat_interval_seconds"
+            )
+        _require_positive_float(
+            self.worker_startup_timeout_seconds,
+            field_name="OpenHostOptions.worker_startup_timeout_seconds",
+        )
+        _require_positive_float(
+            self.dispatch_poll_interval_seconds,
+            field_name="OpenHostOptions.dispatch_poll_interval_seconds",
+        )
+        if not isinstance(
+            self.ordinary_run_baseline, OrdinaryRunExecutionBaseline
+        ):
+            raise TypeError(
+                "OpenHostOptions.ordinary_run_baseline must be "
+                "OrdinaryRunExecutionBaseline"
+            )
+        if self.worker_factory is None:
+            raise TypeError("OpenHostOptions.worker_factory must be non-None")
+        if self.tooling_options is not None and not isinstance(
+            self.tooling_options, _HostToolingOptions
+        ):
+            raise TypeError(
+                "OpenHostOptions.tooling_options must be HostToolingOptions"
+            )
+        if self.context_budget_policy is not None and not isinstance(
+            self.context_budget_policy, ContextBudgetPolicy
+        ):
+            raise TypeError(
+                "OpenHostOptions.context_budget_policy must be "
+                "ContextBudgetPolicy"
+            )
+        if self.compactor_runner_baseline is not None and not isinstance(
+            self.compactor_runner_baseline, CompactorRunnerBaseline
+        ):
+            raise TypeError(
+                "OpenHostOptions.compactor_runner_baseline must be "
+                "CompactorRunnerBaseline"
+            )
+        if not isinstance(self.memory_projection_policy, MemoryProjectionPolicy):
+            raise TypeError(
+                "OpenHostOptions.memory_projection_policy must be "
+                "MemoryProjectionPolicy"
+            )
+        _require_positive_int(
+            self.memory_projection_catchup_batch_size,
+            field_name="OpenHostOptions.memory_projection_catchup_batch_size",
+        )
+        _require_bool(
+            self.enable_truncation_manager,
+            field_name="OpenHostOptions.enable_truncation_manager",
+        )
 
 
 class HostApiErrorCode(StrEnum):
@@ -1534,7 +1831,16 @@ class SubmitFollowupRequest:
     - ``context``：调用上下文。
     - ``session_id``：目标 Session id。
     - ``client_request_id``：客户端操作幂等 id。
-    - ``input``：Host 输入 envelope。
+    - ``system_prompt``：本次 Run 的显式系统提示；无则为 ``None``。
+    - ``user_prompt``：本次 Run 的用户提示。
+    - ``tool_names``：本次 Run 的业务工具选择器；``None`` 表示全量业务工具，
+      空集合表示禁用业务工具，非空集合表示只启用指定子集。
+    - ``runner_spec``：本次 Run 的完整 Runner 规约 override；无则使用 opener
+      baseline。
+    - ``runner_options``：本次 Run 的完整 Runner 调用参数 override；无则使用
+      opener baseline。
+    - ``agent_policy``：本次 Run 的完整 Agent policy override；无则使用
+      opener baseline。
     - ``behavior``：queue 或 steer 行为。
     - ``target_run_id``：steer 目标 Run id；queue 时必须为 ``None``。
     """
@@ -1542,7 +1848,12 @@ class SubmitFollowupRequest:
     context: HostCallContext
     session_id: str
     client_request_id: str
-    input: HostInput
+    system_prompt: str | None
+    user_prompt: str
+    tool_names: frozenset[str] | None
+    runner_spec: RunnerSpec | None
+    runner_options: RunnerCallOptions | None
+    agent_policy: AgentPolicy | None
     behavior: FollowupBehavior
     target_run_id: str | None
 
@@ -1550,7 +1861,8 @@ class SubmitFollowupRequest:
         """校验 follow-up 请求字段与 target_run_id 前置条件。
 
         :returns: 无返回值。
-        :raises ValueError: id 为空、steer 缺目标、queue 携带目标时抛出。
+        :raises TypeError: typed override 或工具选择器类型非法时抛出。
+        :raises ValueError: id / prompt 为空、steer 缺目标、queue 携带目标时抛出。
         """
 
         _require_non_empty(
@@ -1560,6 +1872,28 @@ class SubmitFollowupRequest:
             self.client_request_id,
             field_name="SubmitFollowupRequest.client_request_id",
         )
+        _require_optional_non_empty(
+            self.system_prompt,
+            field_name="SubmitFollowupRequest.system_prompt",
+        )
+        _require_non_empty(
+            self.user_prompt, field_name="SubmitFollowupRequest.user_prompt"
+        )
+        _validate_submit_followup_tool_names(self.tool_names)
+        if self.runner_spec is not None and not isinstance(
+            self.runner_spec, RunnerSpec
+        ):
+            raise TypeError("SubmitFollowupRequest.runner_spec must be RunnerSpec")
+        if self.runner_options is not None and not isinstance(
+            self.runner_options, RunnerCallOptions
+        ):
+            raise TypeError(
+                "SubmitFollowupRequest.runner_options must be RunnerCallOptions"
+            )
+        if self.agent_policy is not None and not isinstance(
+            self.agent_policy, AgentPolicy
+        ):
+            raise TypeError("SubmitFollowupRequest.agent_policy must be AgentPolicy")
         _require_optional_non_empty(
             self.target_run_id,
             field_name="SubmitFollowupRequest.target_run_id",
@@ -1578,6 +1912,29 @@ class SubmitFollowupRequest:
             raise ValueError(
                 "SubmitFollowupRequest.target_run_id must be None for queue"
             )
+
+
+def _validate_submit_followup_tool_names(
+    tool_names: frozenset[str] | None,
+) -> None:
+    """校验 follow-up 业务工具选择器。
+
+    :param tool_names: 请求传入的工具名集合或 ``None``。
+    :returns: ``None``。
+    :raises TypeError: ``tool_names`` 不是 ``frozenset[str] | None`` 时抛出。
+    :raises ValueError: 任一工具名为空时抛出。
+    """
+
+    if tool_names is None:
+        return
+    if not isinstance(tool_names, frozenset):
+        raise TypeError("SubmitFollowupRequest.tool_names must be frozenset[str]")
+    for tool_name in tool_names:
+        if not isinstance(tool_name, str):
+            raise TypeError("SubmitFollowupRequest.tool_names entries must be str")
+        _require_non_empty(
+            tool_name, field_name="SubmitFollowupRequest.tool_names"
+        )
 
 
 @dataclass(frozen=True, slots=True)
@@ -1862,7 +2219,8 @@ class FollowupSnapshot:
     - ``behavior``：Host 采用的 follow-up 行为。
     - ``accepted_run_id``：本次 follow-up 接受后关联的 Run id。
     - ``accepted_run_status``：本次 follow-up 接受后关联 Run 的当前状态。
-    - ``current_cursor``：接受后的当前事件游标。
+    - ``command_watermark``：本次 command commit 后的 durable read watermark；
+      它不是 ``watch_session_events`` 的 watch cursor。
     - ``queued_run_id``：真实处于 queued 状态的 accepted Run id；其它情况为 ``None``。
     - ``target_run_id``：steer 目标 Run id；queue 时为 ``None``。
     """
@@ -1871,7 +2229,7 @@ class FollowupSnapshot:
     behavior: FollowupBehavior
     accepted_run_id: str
     accepted_run_status: RunStatus
-    current_cursor: HostStreamCursor
+    command_watermark: HostStreamCursor
     queued_run_id: str | None
     target_run_id: str | None
 
@@ -1907,16 +2265,15 @@ class FollowupSnapshot:
                         "FollowupSnapshot.queued_run_id must equal "
                         "accepted_run_id for queued queue result"
                     )
-            elif self.accepted_run_status in (RunStatus.ACCEPTED, RunStatus.RUNNING):
+            if self.accepted_run_status != RunStatus.QUEUED:
                 if self.queued_run_id is not None:
                     raise ValueError(
                         "FollowupSnapshot.queued_run_id must be None "
-                        "for accepted/running queue result"
+                        "unless accepted Run is queued"
                     )
-            else:
+            if self.accepted_run_status == RunStatus.RECOVERING:
                 raise ValueError(
-                    "FollowupSnapshot.accepted_run_status must be queued "
-                    "accepted or running for queue"
+                    "FollowupSnapshot.accepted_run_status must not be recovering"
                 )
 
 
@@ -2027,6 +2384,183 @@ class HostEventStream:
     next_cursor: HostStreamCursor
 
 
+class HostEventKind(StrEnum):
+    """Service-facing Host event 类型。
+
+    成员：
+
+    - ``PROGRESS``：非终态进度事件。
+    - ``SUCCEEDED``：Run 成功终态事件。
+    - ``FAILED``：Run 失败终态事件。
+    - ``CANCELLED``：Run 取消终态事件。
+    """
+
+    PROGRESS = "progress"
+    SUCCEEDED = "succeeded"
+    FAILED = "failed"
+    CANCELLED = "cancelled"
+
+
+class HostTerminalStatus(StrEnum):
+    """Service-facing terminal Host event 状态。
+
+    成员：
+
+    - ``SUCCEEDED``：Run 成功完成。
+    - ``FAILED``：Run 失败完成。
+    - ``CANCELLED``：Run 被用户治理取消。
+    """
+
+    SUCCEEDED = "succeeded"
+    FAILED = "failed"
+    CANCELLED = "cancelled"
+
+
+@dataclass(frozen=True, slots=True)
+class HostFinalAnswerView:
+    """terminal Host event 中内联的最终回答视图。
+
+    :param content: 最终回答文本。
+    :param filtered: 最终回答是否经过安全或展示过滤。
+    :param degraded: 最终回答是否为降级结果。
+    :param finish_reason: provider / runner 归一化 finish reason；未知时为
+        ``None``。
+    :param terminal_status: 对应 terminal Host event 状态。
+    """
+
+    content: str
+    filtered: bool
+    degraded: bool
+    finish_reason: str | None
+    terminal_status: HostTerminalStatus
+
+    def __post_init__(self) -> None:
+        """校验最终回答视图字段。
+
+        :returns: ``None``。
+        :raises TypeError: 布尔字段类型非法时抛出。
+        :raises ValueError: 可选 finish reason 为空，或 terminal 状态不是
+            ``SUCCEEDED`` 时抛出。
+        """
+
+        if not isinstance(self.content, str):
+            raise TypeError("HostFinalAnswerView.content must be str")
+        _require_bool(
+            self.filtered, field_name="HostFinalAnswerView.filtered"
+        )
+        _require_bool(
+            self.degraded, field_name="HostFinalAnswerView.degraded"
+        )
+        _require_optional_non_empty(
+            self.finish_reason,
+            field_name="HostFinalAnswerView.finish_reason",
+        )
+        if self.terminal_status != HostTerminalStatus.SUCCEEDED:
+            raise ValueError(
+                "HostFinalAnswerView.terminal_status must be succeeded"
+            )
+
+
+@dataclass(frozen=True, slots=True)
+class HostEvent:
+    """Service-facing Host-owned typed event。
+
+    :param event_id: Host event 稳定 id。
+    :param event_sequence: Host durable store 分配的全局单调事件序列。
+    :param session_id: 关联 Session id。
+    :param run_id: 关联 Run id；事件不绑定 Run 时为 ``None``。
+    :param kind: Service-facing event 类型。
+    :param dedupe_key: 调用方去重使用的稳定键。
+    :param terminal_status: terminal event 状态；非终态事件为 ``None``。
+    :param final_answer: 成功终态事件内联的最终回答视图；非成功终态为
+        ``None``。
+    :param error_message: 失败终态的 typed 展示消息；无展示消息时为
+        ``None``。
+    :param cancel_reason: 取消终态的 typed 原因；无展示原因时为 ``None``。
+    """
+
+    event_id: str
+    event_sequence: int
+    session_id: str
+    run_id: str | None
+    kind: HostEventKind
+    dedupe_key: str
+    terminal_status: HostTerminalStatus | None
+    final_answer: HostFinalAnswerView | None
+    error_message: str | None
+    cancel_reason: str | None
+
+    def __post_init__(self) -> None:
+        """校验 Service-facing Host event 字段。
+
+        :returns: ``None``。
+        :raises ValueError: id 为空、序列号非法、kind/status 组合非法或
+            terminal payload 组合非法时抛出。
+        """
+
+        _require_non_empty(self.event_id, field_name="HostEvent.event_id")
+        _require_non_negative(
+            self.event_sequence, field_name="HostEvent.event_sequence"
+        )
+        _require_non_empty(self.session_id, field_name="HostEvent.session_id")
+        _require_optional_non_empty(self.run_id, field_name="HostEvent.run_id")
+        if not isinstance(self.kind, HostEventKind):
+            raise ValueError("HostEvent.kind must be HostEventKind")
+        _require_non_empty(self.dedupe_key, field_name="HostEvent.dedupe_key")
+        _require_optional_non_empty(
+            self.error_message, field_name="HostEvent.error_message"
+        )
+        _require_optional_non_empty(
+            self.cancel_reason, field_name="HostEvent.cancel_reason"
+        )
+        _validate_host_event_terminal_payload(self)
+
+
+def _validate_host_event_terminal_payload(event: HostEvent) -> None:
+    """校验 public Host event 的 terminal payload 组合。
+
+    :param event: 待校验 Host event。
+    :returns: ``None``。
+    :raises ValueError: kind、terminal status 与 payload 组合不一致时抛出。
+    """
+
+    if event.kind == HostEventKind.PROGRESS:
+        if event.terminal_status is not None or event.final_answer is not None:
+            raise ValueError(
+                "HostEvent progress kind must not include terminal payload"
+            )
+        return
+
+    expected_status = _terminal_status_for_event_kind(event.kind)
+    if event.terminal_status != expected_status:
+        raise ValueError("HostEvent.terminal_status does not match kind")
+    if event.kind == HostEventKind.SUCCEEDED:
+        if event.final_answer is None:
+            raise ValueError("HostEvent succeeded kind requires final_answer")
+        return
+    if event.final_answer is not None:
+        raise ValueError(
+            "HostEvent failed or cancelled kind must not include final_answer"
+        )
+
+
+def _terminal_status_for_event_kind(kind: HostEventKind) -> HostTerminalStatus:
+    """返回 terminal event kind 对应的 terminal status。
+
+    :param kind: terminal Host event kind。
+    :returns: 对应 terminal status。
+    :raises ValueError: ``kind`` 不是 terminal kind 时抛出。
+    """
+
+    if kind == HostEventKind.SUCCEEDED:
+        return HostTerminalStatus.SUCCEEDED
+    if kind == HostEventKind.FAILED:
+        return HostTerminalStatus.FAILED
+    if kind == HostEventKind.CANCELLED:
+        return HostTerminalStatus.CANCELLED
+    raise ValueError("HostEventKind.PROGRESS has no terminal status")
+
+
 class HostApiError(Exception):
     """Host API 结构化异常。
 
@@ -2069,6 +2603,198 @@ class HostApiError(Exception):
         super().__init__(message)
 
 
+class HostClosedError(Exception):
+    """Host handle 生命周期已关闭异常。
+
+    :param message: 人类可读错误描述。
+    """
+
+    def __init__(self, message: str = "Host handle is closed") -> None:
+        """构造 Host handle 关闭异常。
+
+        :param message: 人类可读错误描述。
+        :returns: 无返回值。
+        :raises ValueError: ``message`` 为空时抛出。
+        """
+
+        _require_non_empty(message, field_name="HostClosedError.message")
+        super().__init__(message)
+
+
+class Host(Protocol):
+    """普通 Service 使用的异步 Host handle 协议。
+
+    该协议只描述 public async command / read / watch 方法，不暴露 durable
+    store、scheduler、registry、dispatch row、wakeup port 或 ToolRuntime 内部对象。
+    """
+
+    async def ensure_session(
+        self, request: EnsureSessionRequest
+    ) -> SessionSnapshot:
+        """确保 slot 绑定到 Session。
+
+        :param request: ensure session 请求。
+        :returns: Session snapshot。
+        :raises HostClosedError: Host handle 已关闭时抛出。
+        :raises HostApiError: Host durable command 失败时抛出。
+        """
+
+        ...
+
+    async def create_session(
+        self, request: CreateSessionRequest
+    ) -> SessionSnapshot:
+        """显式创建 Session。
+
+        :param request: create session 请求。
+        :returns: Session snapshot。
+        :raises HostClosedError: Host handle 已关闭时抛出。
+        :raises HostApiError: Host durable command 失败时抛出。
+        """
+
+        ...
+
+    async def get_session(self, session_id: str) -> SessionSnapshot:
+        """读取 Session snapshot。
+
+        :param session_id: 目标 Session id。
+        :returns: Session snapshot。
+        :raises HostClosedError: Host handle 已关闭时抛出。
+        :raises HostApiError: Session 不存在或读取失败时抛出。
+        """
+
+        ...
+
+    async def get_run(self, run_id: str) -> RunSnapshot:
+        """读取 Run snapshot。
+
+        :param run_id: 目标 Run id。
+        :returns: Run snapshot。
+        :raises HostClosedError: Host handle 已关闭时抛出。
+        :raises HostApiError: Run 不存在或读取失败时抛出。
+        """
+
+        ...
+
+    async def submit_followup(
+        self, session_id: str, request: SubmitFollowupRequest
+    ) -> FollowupSnapshot:
+        """提交普通 queue / steer follow-up。
+
+        :param session_id: 目标 Session id。
+        :param request: follow-up 请求。
+        :returns: follow-up 接受结果 snapshot。
+        :raises HostClosedError: Host handle 已关闭时抛出。
+        :raises HostApiError: 请求未被 Host 接受时抛出。
+        """
+
+        ...
+
+    async def retry_run(
+        self, run_id: str, request: RetryRunRequest
+    ) -> RunSnapshot:
+        """重试源 Run。
+
+        :param run_id: 源 Run id。
+        :param request: retry 请求。
+        :returns: 新 Run snapshot。
+        :raises HostClosedError: Host handle 已关闭时抛出。
+        :raises HostApiError: retry 前置条件不满足时抛出。
+        """
+
+        ...
+
+    async def replay_run(
+        self, run_id: str, request: ReplayRunRequest
+    ) -> RunSnapshot:
+        """基于源 Run 创建结构化 replay Run。
+
+        :param run_id: 源 Run id。
+        :param request: replay 请求。
+        :returns: 新 Run snapshot。
+        :raises HostClosedError: Host handle 已关闭时抛出。
+        :raises HostApiError: replay 前置条件不满足时抛出。
+        """
+
+        ...
+
+    async def resolve_wait(
+        self, wait_id: str, request: ResolveWaitRequest
+    ) -> RunSnapshot:
+        """接收已取得的 wait result 并恢复治理路径。
+
+        :param wait_id: 待 resolve 的 wait id。
+        :param request: resolve wait 请求。
+        :returns: 最新 Run snapshot。
+        :raises HostClosedError: Host handle 已关闭时抛出。
+        :raises HostApiError: wait 不存在、状态非法或幂等冲突时抛出。
+        """
+
+        ...
+
+    async def cancel_run(
+        self, run_id: str, request: CancelRunRequest
+    ) -> RunSnapshot:
+        """取消单个 Run。
+
+        :param run_id: 目标 Run id。
+        :param request: cancel run 请求。
+        :returns: 最新 Run snapshot。
+        :raises HostClosedError: Host handle 已关闭时抛出。
+        :raises HostApiError: cancel 前置条件不满足时抛出。
+        """
+
+        ...
+
+    async def cancel_session_runs(
+        self, session_id: str, request: CancelSessionRunsRequest
+    ) -> SessionSnapshot:
+        """取消 Session 下全部未终态 Run。
+
+        :param session_id: 目标 Session id。
+        :param request: cancel session runs 请求。
+        :returns: 最新 Session snapshot。
+        :raises HostClosedError: Host handle 已关闭时抛出。
+        :raises HostApiError: cancel 前置条件不满足时抛出。
+        """
+
+        ...
+
+    async def close_session(
+        self, session_id: str, request: CloseSessionRequest
+    ) -> SessionSnapshot:
+        """关闭 Session 的新输入入口。
+
+        :param session_id: 目标 Session id。
+        :param request: close session 请求。
+        :returns: 最新 Session snapshot。
+        :raises HostClosedError: Host handle 已关闭时抛出。
+        :raises HostApiError: close 前置条件不满足时抛出。
+        """
+
+        ...
+
+    def watch_session_events(self, session_id: str) -> AsyncIterator[HostEvent]:
+        """创建 Session live HostEvent 订阅。
+
+        :param session_id: 目标 Session id。
+        :returns: Host-owned typed event async iterator。
+        :raises HostClosedError: Host handle 已关闭时抛出。
+        :raises HostApiError: Session 不存在或不可 watch 时抛出。
+        """
+
+        ...
+
+    async def close(self) -> None:
+        """关闭当前 Host handle lifecycle。
+
+        :returns: ``None``。
+        :raises HostClosedError: 实现选择对重复关闭 fail fast 时可抛出。
+        """
+
+        ...
+
+
 __all__ = [
     "AttemptDispatchSnapshot",
     "AttemptStatus",
@@ -2096,23 +2822,26 @@ __all__ = [
     "HostApiErrorCode",
     "HostApiErrorDetail",
     "HostCallContext",
-    "HostCommandFacet",
-    "HostCommandHandleOptions",
-    "HostLocalExecutionOptions",
+    "Host",
+    "HostClosedError",
+    "HostEvent",
     "HostEventClass",
-    "HostEventStream",
-    "HostEventView",
-    "HostInput",
+    "HostEventKind",
+    "HostFinalAnswerView",
     "HostMetadataEntry",
     "HostPayloadRef",
     "HostStreamCursor",
+    "HostTerminalStatus",
     "LocalEngineWorker",
     "LocalEngineWorkerFactory",
     "LocalWorkerHandle",
     "OperationContext",
+    "OpenHostOptions",
+    "OrdinaryRunExecutionBaseline",
     "OutboxSummary",
     "PurgeSessionRequest",
     "PurgeSessionResult",
+    "CompactorRunnerBaseline",
     "ReplayRunRequest",
     "ResolveWaitCancelledOutcome",
     "ResolveWaitCompletedOutcome",
@@ -2127,7 +2856,6 @@ __all__ = [
     "SessionSnapshot",
     "SessionStatus",
     "SourceRunRelation",
-    "StartRunRequest",
     "SteerConflictDetail",
     "SubmitFollowupRequest",
     "TerminalResultSummary",

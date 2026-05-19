@@ -8,8 +8,9 @@ schema 内的字段值（``type``、``function``）是 OpenAI 风格协议字面
 设计要点：
 
 - ``ToolParametersSchema`` 仅承诺三个稳定字段：``type``、``properties``、
-  ``required``，外加可选的 ``additional_properties``。本 Phase 不实现
-  JSON Schema runtime validator。
+  ``required``，外加可选的 ``additional_properties``。本模块不实现完整
+  JSON Schema runtime validator；调用方仍必须保证 ``required`` 中的字段名
+  都来自 ``properties``，否则该 schema 不是合法的 LLM-facing 参数契约。
 - ``ToolSchema`` / ``ToolFunctionSchema`` 严格遵循 OpenAI Function-call
   格式以利 Runner 直接传递；其它 provider 适配由 Phase 1+ 处理。
 - ``ToolTruncateSpec`` 是 Host ToolRuntime 使用的显式截断声明，不进入

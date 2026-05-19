@@ -439,11 +439,11 @@ class SSEParser:
                         typed_delta, position=position
                     )
                     position += 1
-                    yield _make_event(
-                        self._tool_call_delta_event(
-                            typed_delta, resolved_index=resolved_index
-                        )
+                    event_data = self._tool_call_delta_event(
+                        typed_delta, resolved_index=resolved_index
                     )
+                    if event_data is not None:
+                        yield _make_event(event_data)
         finish_reason = choice.get("finish_reason")
         if isinstance(finish_reason, str):
             mapped = _FINISH_REASON_MAP.get(finish_reason)
@@ -500,21 +500,29 @@ class SSEParser:
         delta: _OpenAIToolCallDelta,
         *,
         resolved_index: int | None,
-    ) -> RunnerToolCallDeltaData:
+    ) -> RunnerToolCallDeltaData | None:
         """把强类型 delta 投影为 RunnerEvent data。
 
         :param delta: 流式 tool call 增量。
         :param resolved_index: :meth:`ToolCallAggregator.feed` 返回的
             归属 index；若 delta 无法归属（既缺 ``index`` 又缺 ``id``）
-            为 ``None``，此时回退用 ``delta.get("index")`` 或 ``0``，
-            与 OLD 行为一致。
+            为 ``None``，此时返回 ``None`` 丢弃该条无法归属的 delta。
+        :returns: 可归属的 tool call delta；无法归属时返回 ``None``。
         """
 
         if resolved_index is not None:
             tool_call_index = resolved_index
         else:
             raw_index = delta.get("index")
-            tool_call_index = raw_index if isinstance(raw_index, int) else 0
+            if _is_tool_call_index(raw_index):
+                tool_call_index = raw_index
+            else:
+                _LOGGER.warning(
+                    "sse.protocol_diagnostic code=tool_call_delta_unowned "
+                    "provider_request_id=%s",
+                    self._provider_request_id,
+                )
+                return None
         delta_id = delta.get("id")
         tool_call_id = delta_id if isinstance(delta_id, str) else None
         function = delta.get("function")
@@ -570,7 +578,7 @@ class SSEParser:
     async def _finalize_success(self) -> AsyncIterator[RunnerEvent]:
         """流自然结束时收口。"""
 
-        if self._terminated and self._finish_reason is FinishReason.ERROR:
+        if self._terminated:
             return
         flush = self._extractor.flush()
         if flush.outside_text:

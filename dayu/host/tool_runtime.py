@@ -178,6 +178,9 @@ _TOOL_RUNTIME_TIMEOUT_REASON = "tool_runtime_timeout"
 _TOOL_RUNTIME_ACCEPT_TIMEOUT_REASON = "accept_timeout"
 _TOOL_RUNTIME_ACCEPT_REJECTED_REASON = "accept_rejected"
 _TOOL_RUNTIME_ACCEPT_EXCEPTION_REASON = "accept_ack_lost"
+_TOOL_RUNTIME_DIAGNOSTIC_REFS_HINT_KEY = "diagnostic_refs"
+_TOOL_RUNTIME_HINT_SECTION_SEPARATOR = ";"
+_TOOL_RUNTIME_DIAGNOSTIC_REF_SEPARATOR = ","
 _TOOL_RUNTIME_DUPLICATE_REUSE_REASON = "duplicate_reuse"
 _TOOL_RUNTIME_DUPLICATE_HINT_REASON = "duplicate_hint"
 _TOOL_RUNTIME_DUPLICATE_REQUIRE_JUSTIFICATION_REASON = (
@@ -1293,7 +1296,9 @@ class TruncationManager:
     """ToolRuntime 本地的 run-scoped 截断能力管理器。
 
     本管理器只保存当前 Run 内短生命周期 cursor，不写 durable cursor 表，
-    不承诺跨进程、跨 restart、跨 recovery 或 replay 可继续补读。
+    不承诺跨进程、跨 restart、跨 recovery 或 replay 可继续补读。所有
+    cursor 都是单次使用；一次 ``fetch_more`` 成功后即失效，不支持分页式
+    多次补读同一个 cursor。
     """
 
     def __init__(
@@ -2108,6 +2113,8 @@ class EffectiveToolBundleBuildRequest:
     """EffectiveToolBundleBuilder 的输入。
 
     :param business_tool_bundle: 外部装配好的业务工具集合。
+    :param selected_business_tool_names: 本次 Run 选择的业务工具名；
+        ``None`` 表示使用全部业务工具，空集合表示不启用业务工具。
     :param source_refs: 业务工具来源引用。
     :param framework_tool_policy: framework tool policy view。
     :param policy_snapshot_digest: policy snapshot 摘要；无时为 ``None``。
@@ -2118,6 +2125,7 @@ class EffectiveToolBundleBuildRequest:
     source_refs: tuple[ToolBundleSourceRef, ...]
     framework_tool_policy: FrameworkToolPolicyView
     policy_snapshot_digest: str | None
+    selected_business_tool_names: frozenset[str] | None = None
     enable_truncation_manager: bool = False
 
 
@@ -2151,7 +2159,12 @@ class EffectiveToolBundleBuilder:
             request.business_tool_bundle,
             request.framework_tool_policy,
         )
-        definitions = list(request.business_tool_bundle.definitions)
+        definitions = list(
+            _selected_business_definitions(
+                request.business_tool_bundle,
+                request.selected_business_tool_names,
+            )
+        )
         injected_context = self._inject_framework_definitions(
             request.framework_tool_policy,
             enable_truncation_manager=request.enable_truncation_manager,
@@ -2224,6 +2237,32 @@ class EffectiveToolBundleBuilder:
             definitions=tuple(definitions),
             fetch_more_callable=fetch_more_callable,
         )
+
+
+def _selected_business_definitions(
+    bundle: ToolBundle, selected_tool_names: frozenset[str] | None
+) -> tuple[ToolDefinition, ...]:
+    """按 per-run selector 过滤业务工具声明。
+
+    :param bundle: construction-time 全量业务工具集合。
+    :param selected_tool_names: per-run 业务工具名选择器；``None`` 表示全量。
+    :returns: 本次 Run 有效业务工具声明。
+    :raises ValueError: selector 包含未知业务工具名时抛出。
+    """
+
+    if selected_tool_names is None:
+        return bundle.definitions
+    known_names = frozenset(definition.name for definition in bundle.definitions)
+    unknown = selected_tool_names.difference(known_names)
+    if unknown:
+        raise ValueError(
+            "selected business tool names are unknown: " + ",".join(sorted(unknown))
+        )
+    return tuple(
+        definition
+        for definition in bundle.definitions
+        if definition.name in selected_tool_names
+    )
 
 
 @dataclass(frozen=True, slots=True)
@@ -2433,15 +2472,13 @@ class ToolRuntimeExecutor:
                 reason_code=_TOOL_RUNTIME_NO_TOOL_REASON,
                 message="tool request context does not match execution scope",
             )
-        duplicate_governed = (
-            policy_decision.kind is ToolPolicyDecisionKind.ALLOW
-            and duplicate_decision.kind is not DuplicateDecisionKind.ALLOW
-        )
         duplicate_refs = self._diagnostic_refs_for_duplicate(duplicate_decision)
+        duplicate_governed = False
         if (
             policy_decision.kind is ToolPolicyDecisionKind.ALLOW
             and duplicate_decision.kind is not DuplicateDecisionKind.ALLOW
         ):
+            duplicate_governed = True
             policy_decision = _policy_decision_from_duplicate(duplicate_decision)
         if policy_decision.kind is ToolPolicyDecisionKind.REUSE:
             return await self._accept_reuse(
@@ -2789,28 +2826,38 @@ class ToolRuntimeExecutor:
             raise RuntimeError("awaiting accept port is required")
         attempt_count = 0
         last_error_code: str | None = None
+        diagnostics: tuple[str, ...] = ()
         while attempt_count < self._retry_policy.max_attempts:
             attempt_count += 1
             try:
                 result = self._awaiting_accept_port.accept_tool_awaiting(
                     candidate
                 )
-            except (HostTransactionRetryExhaustedError, TimeoutError):
+            except HostTransactionRetryExhaustedError:
                 last_error_code = _TOOL_RUNTIME_ACCEPT_EXCEPTION_REASON
                 result = ToolAwaitingAcceptTimedOut(
                     attempt_count=attempt_count,
                     last_error_code=last_error_code,
+                    diagnostic_refs=diagnostics,
                 )
             if isinstance(result, ToolAwaitingAcceptedAck | ToolAwaitingRejectedAck):
                 return result
             last_error_code = result.last_error_code
+            diagnostics = result.diagnostic_refs
             if attempt_count >= self._retry_policy.max_attempts:
                 break
             if self._retry_policy.backoff_seconds > 0:
                 await asyncio.sleep(self._retry_policy.backoff_seconds)
+        timeout_ref = self._diagnostic_emitter.emit(
+            ToolTraceDiagnosticRecord(
+                reason_code=_TOOL_RUNTIME_ACCEPT_TIMEOUT_REASON,
+                message="tool awaiting accept ack was not received after bounded retry",
+            )
+        )
         return ToolAwaitingAcceptTimedOut(
             attempt_count=attempt_count,
             last_error_code=last_error_code,
+            diagnostic_refs=(*diagnostics, timeout_ref.ref_id),
         )
 
     def _diagnostic_refs_for_duplicate(
@@ -2901,7 +2948,7 @@ class ToolRuntimeExecutor:
             attempt_count += 1
             try:
                 result = self._accept_port.accept_tool_fact(candidate)
-            except (HostTransactionRetryExhaustedError, TimeoutError):
+            except HostTransactionRetryExhaustedError:
                 last_error_code = _TOOL_RUNTIME_ACCEPT_EXCEPTION_REASON
                 result = ToolFactAcceptTimedOut(
                     attempt_count=attempt_count,
@@ -5205,6 +5252,25 @@ def _governed_failure_outcome(
     )
 
 
+def _hint_with_diagnostic_refs(
+    *, base_hint: str, diagnostic_refs: tuple[str, ...]
+) -> str:
+    """把诊断引用合并进失败结果的稳定提示字段。
+
+    :param base_hint: 原始失败提示。
+    :param diagnostic_refs: 需要暴露给最终 outcome 的诊断引用。
+    :returns: 合并诊断引用后的提示；无诊断引用时返回原始提示。
+    """
+
+    if len(diagnostic_refs) == 0:
+        return base_hint
+    refs_value = _TOOL_RUNTIME_DIAGNOSTIC_REF_SEPARATOR.join(diagnostic_refs)
+    return (
+        f"{base_hint}{_TOOL_RUNTIME_HINT_SECTION_SEPARATOR}"
+        f"{_TOOL_RUNTIME_DIAGNOSTIC_REFS_HINT_KEY}={refs_value}"
+    )
+
+
 def _accept_failure_outcome(
     result: ToolFactRejectedAck | ToolFactAcceptTimedOut,
 ) -> ToolFailedOutcome:
@@ -5248,7 +5314,10 @@ def _awaiting_accept_failure_outcome(
     return _tool_failed_outcome(
         error=_TOOL_RUNTIME_AWAITING_ACCEPT_TIMEOUT_ERROR,
         message="tool awaiting accept ack timed out",
-        hint=result.last_error_code or _TOOL_RUNTIME_ACCEPT_TIMEOUT_REASON,
+        hint=_hint_with_diagnostic_refs(
+            base_hint=result.last_error_code or _TOOL_RUNTIME_ACCEPT_TIMEOUT_REASON,
+            diagnostic_refs=result.diagnostic_refs,
+        ),
     )
 
 

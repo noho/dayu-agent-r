@@ -57,9 +57,11 @@ from dayu.host.api import (
 )
 from dayu.host.context_events import (
     CONTEXT_COMPACTED,
+    CONTEXT_COMPACTION_ATTEMPT_REJECTED,
     CONTEXT_COMPACTION_FAILED,
     CONTEXT_COMPACTION_REQUESTED,
 )
+from dayu.host.compaction import CompactionCandidate, CompactionRequest, ContextCompactor
 from dayu.host.context_policy import ContextBudgetPolicy, default_context_budget_policy
 from dayu.host.durable.codec import sha256_digest_json
 from dayu.host.durable.connection import open_host_durable_store
@@ -97,7 +99,7 @@ from dayu.host.durable.state import (
     read_run_by_id,
 )
 from dayu.host.durable.transaction import HostTransaction, HostTransactionRunner
-from dayu.host.fake_compaction import FakeContextCompactor
+from tests.host.fake_compaction import FakeContextCompactor
 from dayu.host.wait_adapter import WaitAdapterBinding, WaitExternalJobRefSource
 from dayu.host.waiting import (
     DefaultHostResolveWaitService,
@@ -154,6 +156,75 @@ class _NeverCancelledToken:
         """
 
         return None
+
+
+class _TransactionReadableCompactor(ContextCompactor):
+    """测试 compactor 调用期可开启独立读事务。"""
+
+    def __init__(self, transaction_runner: HostTransactionRunner) -> None:
+        """初始化 compactor。
+
+        :param transaction_runner: Host transaction runner。
+        :returns: ``None``。
+        """
+
+        self._transaction_runner = transaction_runner
+        self.calls = 0
+        self._fake = FakeContextCompactor()
+
+    async def compact(self, request: CompactionRequest) -> CompactionCandidate:
+        """执行 compact 并验证当前不在外层 write transaction 内。
+
+        :param request: compaction request。
+        :returns: fake compaction candidate。
+        """
+
+        self.calls += 1
+        row = self._transaction_runner.run_read(
+            lambda transaction: read_run_by_id(transaction, request.run_id)
+        )
+        assert row is not None
+        return await self._fake.compact(request)
+
+
+class _InputSequenceAdvancingCompactor(ContextCompactor):
+    """测试 compactor，在 proposal 期间推进 Run input sequence。"""
+
+    def __init__(self, transaction_runner: HostTransactionRunner) -> None:
+        """初始化 compactor。
+
+        :param transaction_runner: Host transaction runner。
+        :returns: ``None``。
+        """
+
+        self._transaction_runner = transaction_runner
+        self._fake = FakeContextCompactor()
+        self.calls = 0
+
+    async def compact(self, request: CompactionRequest) -> CompactionCandidate:
+        """推进 durable input sequence 后返回旧 snapshot 的 fake candidate。
+
+        :param request: compaction request。
+        :returns: 基于旧 request 的 fake compaction candidate。
+        """
+
+        self.calls += 1
+        _advance_run_input_sequence(self._transaction_runner, run_id=request.run_id)
+        return await self._fake.compact(request)
+
+
+class _RaisingCompactor(ContextCompactor):
+    """测试用失败 compactor。"""
+
+    async def compact(self, request: CompactionRequest) -> CompactionCandidate:
+        """抛出 proposal 失败。
+
+        :param request: compaction request。
+        :returns: 不返回。
+        :raises RuntimeError: 始终抛出 proposal failure。
+        """
+
+        raise RuntimeError(f"proposal failed for {request.run_id}")
 
 
 class _WakeupSpy:
@@ -227,6 +298,44 @@ def test_final_answer_closes_attempt_and_run_with_phase5_payload(
         assert isinstance(payload["terminal_summary_digest"], str)
 
 
+def test_empty_final_answer_closes_failed_without_run_succeeded(
+    tmp_path: Path,
+) -> None:
+    """空 final_answer 不写入无法 public 投影的 RUN_SUCCEEDED。"""
+
+    with open_host_durable_store(_options(tmp_path)) as store:
+        seeded = _seed_active_run(store.transaction_runner)
+        candidate = _candidate(
+            seeded,
+            worker_event_index=2,
+            data=FinalAnswerData(
+                content="",
+                filtered=False,
+                degraded=True,
+                finish_reason=FinishReason.LENGTH,
+            ),
+            event_type=EngineEventType.FINAL_ANSWER,
+        )
+
+        result = EngineEventIngestor(
+            transaction_runner=store.transaction_runner
+        ).ingest(candidate)
+
+        assert result.status == EngineIngestStatus.ACCEPTED
+        assert [event.event_type for event in result.events] == [
+            "ATTEMPT_FAILED",
+            "RUN_FAILED",
+        ]
+        assert _event_count(store.transaction_runner, "RUN_SUCCEEDED") == 0
+        assert _event_count(store.transaction_runner, "RUN_FAILED") == 1
+        payload = _payload(result.events[0])
+        assert payload["error_code"] == "empty_final_answer"
+        assert payload["recoverable"] is False
+        run_status, attempt_status = _statuses(store.transaction_runner, seeded)
+        assert run_status == RunStatus.FAILED
+        assert attempt_status == AttemptStatus.FAILED
+
+
 def test_run_failed_recoverable_false_closes_failed(tmp_path: Path) -> None:
     """不可恢复 run_failed 直接映射为 FAILED closeout。"""
 
@@ -293,7 +402,8 @@ def test_run_failed_recoverable_true_is_diagnostic_then_failed(tmp_path: Path) -
         assert run_status == RunStatus.FAILED
 
 
-def test_context_compaction_requested_none_budget_uses_host_estimator_and_recovers(
+@pytest.mark.asyncio
+async def test_context_compaction_requested_none_budget_uses_host_estimator_and_recovers(
     tmp_path: Path,
 ) -> None:
     """provider overflow budget_state=None 使用 Host estimator 并进入 recovery。"""
@@ -313,13 +423,13 @@ def test_context_compaction_requested_none_budget_uses_host_estimator_and_recove
             event_type=EngineEventType.CONTEXT_COMPACTION_REQUESTED,
         )
 
-        result = EngineEventIngestor(
+        result = await EngineEventIngestor(
             transaction_runner=store.transaction_runner,
             wakeup_port=wakeup,
             context_budget_policy=_reactive_policy(),
             context_compactor=FakeContextCompactor(),
             compact_artifact_root=tmp_path / "compact-artifacts",
-        ).ingest(candidate)
+        ).ingest_async(candidate)
 
         assert result.terminal_closeout is False
         assert result.stop_worker_stream is True
@@ -343,6 +453,100 @@ def test_context_compaction_requested_none_budget_uses_host_estimator_and_recove
         assert len(wakeup.dispatches) == 1
         assert wakeup.dispatches[0].attempt_id != seeded.attempt_id
         assert wakeup.dispatches[0].execution_id != seeded.execution_id
+
+
+@pytest.mark.asyncio
+async def test_reactive_compaction_calls_llm_outside_write_transaction(
+    tmp_path: Path,
+) -> None:
+    """reactive compactor 外部调用不持有 Host write transaction。"""
+
+    with open_host_durable_store(_options(tmp_path)) as store:
+        seeded = _seed_active_run(store.transaction_runner)
+        compactor = _TransactionReadableCompactor(store.transaction_runner)
+        candidate = _context_compaction_candidate(seeded, worker_event_index=41)
+
+        result = await EngineEventIngestor(
+            transaction_runner=store.transaction_runner,
+            context_budget_policy=_reactive_policy(),
+            context_compactor=compactor,
+            compact_artifact_root=tmp_path / "compact-artifacts",
+        ).ingest_async(candidate)
+
+        assert result.status is EngineIngestStatus.ACCEPTED
+        assert compactor.calls == 1
+        assert _event_count(store.transaction_runner, CONTEXT_COMPACTED) == 1
+
+
+@pytest.mark.asyncio
+async def test_reactive_compaction_rejects_stale_input_sequence(
+    tmp_path: Path,
+) -> None:
+    """reactive compact 返回后 input sequence 变化时拒绝旧 snapshot 结果。"""
+
+    with open_host_durable_store(_options(tmp_path)) as store:
+        seeded = _seed_active_run(store.transaction_runner)
+        compactor = _InputSequenceAdvancingCompactor(store.transaction_runner)
+        candidate = _context_compaction_candidate(seeded, worker_event_index=43)
+
+        result = await EngineEventIngestor(
+            transaction_runner=store.transaction_runner,
+            context_budget_policy=_reactive_policy(),
+            context_compactor=compactor,
+            compact_artifact_root=tmp_path / "compact-artifacts",
+        ).ingest_async(candidate)
+
+        assert result.status is EngineIngestStatus.ACCEPTED
+        assert result.stop_worker_stream is True
+        assert compactor.calls == 1
+        assert _event_count(store.transaction_runner, CONTEXT_COMPACTED) == 0
+        assert _event_count(store.transaction_runner, CONTEXT_COMPACTION_FAILED) == 1
+        assert _attempt_count(store.transaction_runner, seeded.run_id) == 1
+        run_status, attempt_status = _statuses(store.transaction_runner, seeded)
+        assert run_status is RunStatus.RECOVERING
+        assert attempt_status is AttemptStatus.FAILED
+        stale_failed = _latest_event(
+            store.transaction_runner, CONTEXT_COMPACTION_FAILED
+        )
+        assert _payload(stale_failed)["failure_reason"] == "stale_compaction_result"
+
+
+@pytest.mark.asyncio
+async def test_reactive_compaction_attempt_rejected_uses_request_event_operation_id(
+    tmp_path: Path,
+) -> None:
+    """reactive attempt rejected 使用 request fact event id 作为 operation anchor。"""
+
+    with open_host_durable_store(_options(tmp_path)) as store:
+        seeded = _seed_active_run(store.transaction_runner)
+        candidate = _context_compaction_candidate(seeded, worker_event_index=42)
+
+        result = await EngineEventIngestor(
+            transaction_runner=store.transaction_runner,
+            context_budget_policy=default_context_budget_policy(
+                context_window_size=100,
+                reserved_output_tokens=10,
+                hard_threshold_tokens=80,
+                safety_margin_ratio=0.5,
+                minimum_protection_tokens=1,
+                max_compaction_attempts_per_operation=1,
+                policy_ref=_REACTIVE_POLICY_REF,
+            ),
+            context_compactor=_RaisingCompactor(),
+            compact_artifact_root=tmp_path / "compact-artifacts",
+        ).ingest_async(candidate)
+
+        rejected_rows = tuple(
+            event
+            for event in result.events
+            if event.event_type == CONTEXT_COMPACTION_ATTEMPT_REJECTED
+        )
+        assert len(rejected_rows) == 1
+        rejected_payload = _payload(rejected_rows[0])
+        requested_payload = _payload(result.events[0])
+        assert result.events[0].event_type == CONTEXT_COMPACTION_REQUESTED
+        assert rejected_payload["operation_id"] == result.events[0].event_id
+        assert requested_payload["estimator_digest"] != rejected_payload["operation_id"]
 
 
 def test_context_compaction_requested_stale_identity_is_rejected(
@@ -387,15 +591,16 @@ def test_context_compaction_requested_stale_identity_is_rejected(
         assert attempt_status == AttemptStatus.RUNNING
 
 
-def test_reactive_compact_failure_fails_run_without_lost(tmp_path: Path) -> None:
+@pytest.mark.asyncio
+async def test_reactive_compact_failure_fails_run_without_lost(tmp_path: Path) -> None:
     """reactive compact failure 在旧 Attempt 关闭后 FAILED 收口，不进入 LOST。"""
 
     with open_host_durable_store(_options(tmp_path)) as store:
         seeded = _seed_active_run(store.transaction_runner)
-        result = EngineEventIngestor(
+        result = await EngineEventIngestor(
             transaction_runner=store.transaction_runner,
             context_budget_policy=_reactive_policy(),
-        ).ingest(
+        ).ingest_async(
             _context_compaction_candidate(seeded, worker_event_index=42)
         )
 
@@ -413,7 +618,8 @@ def test_reactive_compact_failure_fails_run_without_lost(tmp_path: Path) -> None
         assert _attempt_count(store.transaction_runner, seeded.run_id) == 1
 
 
-def test_old_attempt_run_failed_after_recovery_is_stale_diagnostic(
+@pytest.mark.asyncio
+async def test_old_attempt_run_failed_after_recovery_is_stale_diagnostic(
     tmp_path: Path,
 ) -> None:
     """recovery start 后旧 Attempt 的 recoverable run_failed 不创建第二个 Attempt。"""
@@ -426,7 +632,7 @@ def test_old_attempt_run_failed_after_recovery_is_stale_diagnostic(
             context_compactor=FakeContextCompactor(),
             compact_artifact_root=tmp_path / "compact-artifacts",
         )
-        first = ingestor.ingest(
+        first = await ingestor.ingest_async(
             _context_compaction_candidate(seeded, worker_event_index=43)
         )
         assert first.status == EngineIngestStatus.ACCEPTED
@@ -455,7 +661,8 @@ def test_old_attempt_run_failed_after_recovery_is_stale_diagnostic(
         )
 
 
-def test_reactive_compact_count_limit_fails_closed_without_second_attempt(
+@pytest.mark.asyncio
+async def test_reactive_compact_count_limit_fails_closed_without_second_attempt(
     tmp_path: Path,
 ) -> None:
     """committed reactive request 数达到上限时失败收口且不创建 recovery Attempt。"""
@@ -469,12 +676,12 @@ def test_reactive_compact_count_limit_fails_closed_without_second_attempt(
             corrupted=False,
         )
 
-        result = EngineEventIngestor(
+        result = await EngineEventIngestor(
             transaction_runner=store.transaction_runner,
             context_budget_policy=_reactive_policy(),
             context_compactor=FakeContextCompactor(),
             compact_artifact_root=tmp_path / "compact-artifacts",
-        ).ingest(_context_compaction_candidate(seeded, worker_event_index=45))
+        ).ingest_async(_context_compaction_candidate(seeded, worker_event_index=45))
 
         assert CONTEXT_COMPACTION_REQUESTED not in (
             event.event_type for event in result.events
@@ -487,7 +694,8 @@ def test_reactive_compact_count_limit_fails_closed_without_second_attempt(
         assert _payload(failed)["failure_reason"] == "reactive_compact_limit_reached"
 
 
-def test_reactive_compact_corrupt_count_fact_fails_closed(
+@pytest.mark.asyncio
+async def test_reactive_compact_corrupt_count_fact_fails_closed(
     tmp_path: Path,
 ) -> None:
     """reactive compact count fact 损坏时 fail closed 且不创建第二个 Attempt。"""
@@ -501,12 +709,12 @@ def test_reactive_compact_corrupt_count_fact_fails_closed(
             corrupted=True,
         )
 
-        result = EngineEventIngestor(
+        result = await EngineEventIngestor(
             transaction_runner=store.transaction_runner,
             context_budget_policy=_reactive_policy(),
             context_compactor=FakeContextCompactor(),
             compact_artifact_root=tmp_path / "compact-artifacts",
-        ).ingest(_context_compaction_candidate(seeded, worker_event_index=46))
+        ).ingest_async(_context_compaction_candidate(seeded, worker_event_index=46))
 
         assert result.status == EngineIngestStatus.ACCEPTED
         assert _attempt_count(store.transaction_runner, seeded.run_id) == 1
@@ -1283,6 +1491,7 @@ def test_unsupported_engine_event_shape_is_rejected(tmp_path: Path) -> None:
 
         assert result.status == EngineIngestStatus.REJECTED
         assert _payload(result.events[0])["reason"] == "unsupported_engine_event_type"
+        assert result.stop_worker_stream is True
 
 
 @pytest.mark.parametrize(
@@ -1322,6 +1531,7 @@ def test_preview_event_rejects_missing_or_wrong_data(
         assert result.status == EngineIngestStatus.REJECTED
         assert result.events[0].event_class == EventClass.DIAGNOSTIC
         assert _payload(result.events[0])["reason"] == "unsupported_engine_event_type"
+        assert result.stop_worker_stream is True
         assert _event_count(store.transaction_runner, "CONTENT_DELTA") == 0
 
 
@@ -1921,6 +2131,62 @@ def _append_reactive_requested_fact(
                 payload_digest=None,
             ),
         )
+
+    transaction_runner.run_write(_operation)
+
+
+def _advance_run_input_sequence(
+    transaction_runner: HostTransactionRunner, *, run_id: str
+) -> None:
+    """追加新输入事件并推进 Run input sequence。
+
+    :param transaction_runner: Host transaction runner。
+    :param run_id: 目标 Run id。
+    :returns: ``None``。
+    """
+
+    def _operation(transaction: HostTransaction) -> None:
+        run = read_run_by_id(transaction, run_id)
+        assert run is not None
+        input_event = EventLogStore().append_event(
+            transaction,
+            EventLogAppendRequest(
+                event_id=f"event-stale-input-{run_id}",
+                event_class=EventClass.CANONICAL_FACT,
+                session_id=run.session_id,
+                run_id=run.run_id,
+                attempt_id=None,
+                execution_id=None,
+                event_type="USER_INPUT_ACCEPTED",
+                occurred_at=_NOW,
+                actor="tester",
+                source="pytest",
+                client_request_id="client-stale-input",
+                idempotency_key=f"idem-stale-input-{run_id}",
+                policy_decision=None,
+                reason=None,
+                payload_json={"display_text": "new input while compacting"},
+                payload_ref=None,
+                payload_digest=None,
+            ),
+        ).row
+        result = transaction.execute(
+            """
+            UPDATE host_runs
+            SET
+              input_event_id = ?,
+              input_event_sequence = ?,
+              updated_at = ?
+            WHERE run_id = ?
+            """,
+            (
+                input_event.event_id,
+                input_event.event_sequence,
+                "2026-05-15T01:02:04.000000Z",
+                run_id,
+            ),
+        )
+        assert result.rowcount == 1
 
     transaction_runner.run_write(_operation)
 

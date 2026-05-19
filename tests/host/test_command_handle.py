@@ -22,35 +22,35 @@ from dayu.host import (
     HostApiError,
     HostApiErrorCode,
     HostCallContext,
-    HostCommandHandle,
-    HostCommandHandleOptions,
-    HostInput,
-    HostLocalExecutionOptions,
     HostStreamCursor,
     LocalEngineWorkerFactory,
     OperationContext,
     PurgeSessionRequest,
     ReplayRunRequest,
     RetryRunRequest,
-    StartRunRequest,
     SubmitFollowupRequest,
     cancel_run,
     cancel_session_runs,
     close_session,
     create_session,
-    create_host_command_handle,
     ensure_session,
     get_run,
     get_session,
     purge_session,
     replay_run,
     retry_run,
-    start_run,
-    stream_run_events,
     submit_followup,
 )
 from dayu.engine.contracts.agent_policy import AgentPolicy
 from dayu.engine.contracts.runner_spec import RunnerCallOptions, RunnerSpec
+from dayu.host.api import (
+    HostInput,
+    HostCommandHandleOptions,
+    HostLocalExecutionOptions,
+    StartRunRequest,
+)
+from dayu.host.command import HostCommandHandle, create_host_command_handle, start_run
+from dayu.host.read_api import stream_run_events
 
 _FORBIDDEN_IMPORT_PREFIXES: tuple[str, ...] = (
     "dayu.fins",
@@ -279,7 +279,12 @@ def _followup_request(
         context=_context(),
         session_id=session_id,
         client_request_id=client_request_id,
-        input=_input(f"follow-{client_request_id}"),
+        system_prompt=None,
+        user_prompt=f"follow-{client_request_id}",
+        tool_names=None,
+        runner_spec=None,
+        runner_options=None,
+        agent_policy=None,
         behavior=behavior,
         target_run_id=target_run_id,
     )

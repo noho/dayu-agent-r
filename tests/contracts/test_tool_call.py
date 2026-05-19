@@ -213,6 +213,15 @@ def test_batch_tool_execution_context_rejects_non_positive_and_non_finite() -> N
             _make_valid_context(timeout_seconds=invalid_timeout)
 
 
+def test_batch_tool_execution_context_rejects_blank_ids() -> None:
+    """批式工具执行上下文必须拒绝空 run/session/iteration id。"""
+
+    valid = _make_valid_context()
+    for field_name in ("run_id", "session_id", "iteration_id"):
+        with pytest.raises(ValueError, match=field_name):
+            dataclasses.replace(valid, **{field_name: " "})
+
+
 def test_batch_tool_execution_request_rejects_empty_calls() -> None:
     """``calls`` 为空必须在构造期被拒。"""
 

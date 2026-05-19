@@ -72,5 +72,15 @@ class ToolAwaitSnapshot:
     snapshot_id: str
     captured_at: datetime
 
+    def __post_init__(self) -> None:
+        """校验等待快照引用。
+
+        :returns: ``None``。
+        :raises ValueError: ``snapshot_id`` 为空时抛出。
+        """
+
+        if self.snapshot_id.strip() == "":
+            raise ValueError("ToolAwaitSnapshot.snapshot_id must not be empty")
+
 
 __all__ = ["ToolAwaitKind", "ToolAwaitSpec", "ToolAwaitSnapshot"]

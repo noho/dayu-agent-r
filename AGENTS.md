@@ -23,13 +23,13 @@
 
 ## 架构硬约束
 
-- Dayu 的架构定位是：宿主强约束下的 `LLM in the loop`，不是 `LLM on the loop`。
-- Host 对 Agent / AsyncAgent / AsyncOpenAIRunner 的生命周期、取消、治理是强约束真源。
+- Dayu 的架构定位是：宿主强约束下的 `LLM in the loop`。
+- Host 对 Agent / Runner 的生命周期、取消、治理是强约束真源。
 - 严格遵守分层架构：`UI -> Service -> Host -> Engine`。
-- `dayu.runtime` 是公共运行时基础设施包，不属于 `UI / Service / Host / Engine` 任一业务层。
-- `dayu.runtime` 只能承载层中立、运行期通用、可被多层复用的基础能力，例如日志装配、取消等待 / race helper；不得承载业务语义、财报语义、Host 治理状态或 Engine 协议状态机。
+- `dayu.runtime` 是公共运行时基础设施包，不属于 `UI / Service / Host / Engine` 任一业务层，只能承载层中立、运行期通用、可被多层复用的基础能力。
 - `dayu.runtime` 不得 import `dayu.engine` / `dayu.host` / `dayu.service` / `dayu.ui` / `dayu.fins`；只能依赖标准库与更底层的公共契约。
 - 各层需要公共运行时能力时，必须优先复用或扩展 `dayu.runtime`，禁止在各层自行实现语义不一致的重复 runtime helper。
+- 设计公共契约优先使用直接传参数的朴素接口，使用callback, factory, profile, query 等形式的接口需有充分理由。
 - 禁止反向依赖。
 - 设计下层组件接口时，必须假设上层组件不存在，只考虑上层调用需求，不向上泄漏实现细节。
 - 财报文档存取必须且只能通过 `dayu.fins.storage` 下的仓储协议与仓储实现完成。
@@ -96,9 +96,7 @@
   - `dayu/cli/`、`dayu/render/`、`utils/analyze_tool_trace.py`、项目级使用方式或配置入口变化 -> 更新根目录 `README.md`
   - 涉及分层关系、装配方式、`UI / Service / Host / Agent` 边界变化 -> 更新 `dayu/README.md`
 - 文档写作约束：
-  - 优先写“当前怎么用 / 当前怎么工作”，不要写“未来可能会怎样”。
-  - 不写过程状态，只保留稳定说明。
-  - 不写实现细节。
+  - 不写过程状态，不写未来计划，不写实现细节，只保留稳定说明。
   - 若概念已改名，必须全量清理旧名，禁止新旧术语并存。
 
 ## 目录约束

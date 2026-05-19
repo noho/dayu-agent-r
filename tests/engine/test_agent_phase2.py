@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import logging
 from collections.abc import AsyncIterator, Sequence
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
@@ -182,6 +183,7 @@ class _ScriptedRunner:
     token: _Token | None = None
     raise_on_call: bool = False
     raise_on_close: bool = False
+    raise_cancelled_on_close: bool = False
     block_after_first_event: bool = False
     close_count: int = 0
     call_count: int = 0
@@ -221,11 +223,14 @@ class _ScriptedRunner:
         """记录 close 调用。
 
         :returns: 无返回值。
+        :raises asyncio.CancelledError: 配置 ``raise_cancelled_on_close`` 时抛出。
         :raises RuntimeError: 配置 ``raise_on_close`` 时抛出。
         """
 
         self.close_count += 1
         self.close_completed_at = _utc_now()
+        if self.raise_cancelled_on_close:
+            raise asyncio.CancelledError()
         if self.raise_on_close:
             raise RuntimeError("close failed")
 
@@ -508,6 +513,48 @@ async def test_success_run_lifts_runner_events_and_agent_final() -> None:
     assert {event.run_id for event in events} == {"run_phase2"}
     assert runner.close_count == 1
     _assert_single_terminal_at_end(events)
+
+
+@pytest.mark.asyncio
+async def test_finish_reason_mismatch_logs_warning(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """content completed 与 done 的 finish_reason 不一致时必须记录 warning。"""
+
+    runner = _ScriptedRunner(
+        events=(
+            _event(
+                RunnerEventType.RUNNER_CONTENT_COMPLETED,
+                RunnerContentCompletedData(
+                    content="partial",
+                    reasoning_content=None,
+                    finish_reason=FinishReason.STOP,
+                ),
+            ),
+            _event(
+                RunnerEventType.RUNNER_DONE,
+                RunnerDoneData(
+                    finish_reason=FinishReason.LENGTH,
+                    provider_request_id="req-mismatch",
+                ),
+            ),
+        )
+    )
+    caplog.set_level(logging.WARNING, logger="dayu.engine.agent")
+
+    events = await _collect(_AsyncAgent(request=_request(), runner=runner))
+
+    assert any(
+        "engine.agent.finish_reason_mismatch" in record.getMessage()
+        for record in caplog.records
+    )
+    iteration_completed = [
+        event for event in events
+        if event.type is EngineEventType.ITERATION_COMPLETED
+    ]
+    assert len(iteration_completed) == 1
+    assert isinstance(iteration_completed[0].data, IterationCompletedData)
+    assert iteration_completed[0].data.finish_reason is FinishReason.LENGTH
 
 
 @pytest.mark.asyncio
@@ -936,6 +983,49 @@ async def test_close_error_does_not_override_terminal() -> None:
 
 
 @pytest.mark.asyncio
+async def test_close_runner_once_marks_closed_after_close_error() -> None:
+    """Runner close 普通异常后仍按 once 语义禁止重复 close。"""
+
+    runner = _ScriptedRunner(events=(), raise_on_close=True)
+    agent = _AsyncAgent(request=_request(), runner=runner)
+
+    await agent._close_runner_once()
+    await agent._close_runner_once()
+
+    assert runner.close_count == 1
+
+
+@pytest.mark.asyncio
+async def test_close_cancelled_error_releases_run_slot() -> None:
+    """Runner close 若被取消，也必须释放私有 Agent 运行槽位。"""
+
+    runner = _ScriptedRunner(
+        events=(
+            _event(
+                RunnerEventType.RUNNER_CONTENT_COMPLETED,
+                RunnerContentCompletedData(
+                    content="ok",
+                    reasoning_content=None,
+                    finish_reason=FinishReason.STOP,
+                ),
+            ),
+            _event(
+                RunnerEventType.RUNNER_DONE,
+                RunnerDoneData(finish_reason=FinishReason.STOP, provider_request_id=None),
+            ),
+        ),
+        raise_cancelled_on_close=True,
+    )
+    agent = _AsyncAgent(request=_request(), runner=runner)
+
+    with pytest.raises(asyncio.CancelledError):
+        await _collect(agent)
+
+    assert runner.close_count == 1
+    assert agent._active_run_id is None
+
+
+@pytest.mark.asyncio
 async def test_tool_call_delta_and_completed_fail_closed() -> None:
     """工具观测事件可见，但缺 Done 时仍 fail closed。"""
 
@@ -1348,6 +1438,49 @@ async def test_run_agent_and_wait_maps_suspended(
     assert len(result.awaiting_records) == 1
     assert result.awaiting_records[0].await_spec is await_spec
     assert result.awaiting_records[0].snapshot is snapshot
+
+
+@pytest.mark.asyncio
+async def test_run_agent_and_wait_logs_unknown_terminal_shape(
+    monkeypatch: pytest.MonkeyPatch,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """terminal type 与 data 不匹配时必须记录 warning。"""
+
+    async def fake_messages(
+        request: AgentRunRequest,
+    ) -> AsyncIterator[EngineEvent]:
+        """产出形状不匹配的 terminal event。
+
+        :param request: Agent run 请求。
+        :returns: EngineEvent 异步流。
+        :raises Exception: 不主动抛出异常。
+        """
+
+        yield EngineEvent(
+            occurred_at=_utc_now(),
+            session_id=request.session_id,
+            run_id=request.run_id,
+            type=EngineEventType.FINAL_ANSWER,
+            data=RunFailedData(
+                error_code="bad_terminal_shape",
+                message="bad terminal shape",
+                provider_request_id=None,
+                recoverable=False,
+            ),
+            metadata=None,
+        )
+
+    caplog.set_level(logging.WARNING, logger="dayu.engine.agent")
+    monkeypatch.setattr(agent_module, "run_agent_messages", fake_messages)
+
+    result = await agent_module.run_agent_and_wait(_request())
+
+    assert isinstance(result, EngineRunOutcomeFailed)
+    assert any(
+        "engine.agent.unknown_terminal_shape" in record.getMessage()
+        for record in caplog.records
+    )
 
 
 def _terminal_count(events: Sequence[EngineEvent]) -> int:

@@ -44,9 +44,11 @@ FETCH_MORE_ALLOWED_RELATIVE_FILES: frozenset[str] = frozenset(
 FETCH_MORE_OWNERSHIP_TOKEN: str = "fetch_more"
 ENGINE_FORBIDDEN_PREFIXES: tuple[str, ...] = ("dayu.host",)
 HOST_ENGINE_CONTRACT_ALLOWED_MODULES: tuple[str, ...] = (
+    "_execution_config_projection.py",
     "api.py",
     "dispatch.py",
     "engine_ingest.py",
+    "llm_compaction.py",
     "local_proxy.py",
     "run_input.py",
 )

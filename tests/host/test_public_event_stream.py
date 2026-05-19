@@ -18,19 +18,15 @@ from dayu.host import (
     HostApiError,
     HostApiErrorCode,
     HostCallContext,
-    HostCommandHandle,
-    HostCommandHandleOptions,
     HostEventClass,
-    HostEventView,
-    HostInput,
     HostStreamCursor,
     OperationContext,
-    StartRunRequest,
-    create_host_command_handle,
     ensure_session,
-    start_run,
-    stream_run_events,
 )
+from dayu.host.api import HostInput
+from dayu.host.api import HostCommandHandleOptions, HostEventView, StartRunRequest
+from dayu.host.command import HostCommandHandle, create_host_command_handle, start_run
+from dayu.host.read_api import stream_run_events
 from dayu.host.durable.schema import (
     TABLE_EVENT_LOG,
     TABLE_HOST_PROJECTION_CHECKPOINTS,
@@ -917,7 +913,8 @@ def test_stream_run_events_default_limit_is_scan_window(
         cursor = HostStreamCursor(
             event_sequence=_max_event_sequence(options.db_path)
         )
-        for index in range(26):
+        unrelated_run_count = (HOST_EVENT_STREAM_DEFAULT_LIMIT // 3) + 2
+        for index in range(unrelated_run_count):
             session_id = _session_id(host, f"other-{index}")
             start_run(host, _start_request(session_id, f"other-run-{index}"))
 

@@ -28,24 +28,26 @@ from dayu.host import (
     CancelRunRequest,
     CancelSessionRunsRequest,
     HostCallContext,
-    HostCommandHandle,
-    HostCommandHandleOptions,
-    HostInput,
-    HostLocalExecutionOptions,
     LocalEngineWorker,
     LocalEngineWorkerFactory,
     LocalWorkerHandle,
     OperationContext,
     RunStatus,
-    StartRunRequest,
     cancel_run,
     cancel_session_runs,
-    create_host_command_handle,
     ensure_session,
-    start_run,
 )
 from dayu.host.admission import PendingDispatchRecord
-from dayu.host.api import AttemptDispatchSnapshot, AttemptStatus, EnsureSessionRequest
+from dayu.host.api import (
+    HostInput,
+    AttemptDispatchSnapshot,
+    AttemptStatus,
+    EnsureSessionRequest,
+    HostCommandHandleOptions,
+    HostLocalExecutionOptions,
+    StartRunRequest,
+)
+from dayu.host.command import HostCommandHandle, create_host_command_handle, start_run
 from dayu.host.dispatch import ActiveWorkerRegistry, HostDispatchScheduler
 from dayu.host.durable.connection import HostDurableStore, open_host_durable_store
 from dayu.host.durable.liveness import (
@@ -284,19 +286,21 @@ def test_cancel_run_waiting_for_lane_skips_later_dispatch(tmp_path: Path) -> Non
     handle = _CancelAwareHandle(local_worker_id="worker-wait", terminal="hang")
     try:
         session_id = _session_id(host)
-        snapshot = start_run(host, _start_request(session_id, "start-wait"))
-        refs = _refs(options.db_path, snapshot.run_id)
         with open_host_durable_store(_durable_options(tmp_path)) as store:
-            _mark_waiting_for_lane(store.transaction_runner, refs)
-            cancelled = cancel_run(host, refs.run_id, _cancel_request("cancel-wait"))
-            assert cancelled.status == RunStatus.CANCELLED
-            assert _attempt_status(options.db_path, refs.attempt_id) == (
-                AttemptStatus.CANCELLED
-            )
-
             async def _dispatch_after_cancel() -> None:
                 scheduler = await _open_scheduler(tmp_path, store, handle)
                 try:
+                    start_run(host, _start_request(session_id, "start-wait"))
+                    refs = await _start_governed_refs(scheduler, session_id)
+                    _mark_waiting_for_lane(store.transaction_runner, refs)
+                    cancelled = cancel_run(
+                        host, refs.run_id, _cancel_request("cancel-wait")
+                    )
+                    assert cancelled.status == RunStatus.CANCELLED
+                    assert _attempt_status(options.db_path, refs.attempt_id) == (
+                        AttemptStatus.CANCELLED
+                    )
+
                     scheduler.wake_dispatch(_pending_dispatch(refs))
                     result = await scheduler.drain_once()
                     assert result.processed == 1
@@ -319,11 +323,31 @@ def test_cancel_run_dispatching_pre_accept_stays_cancelled(
     host = create_host_command_handle(options)
     try:
         session_id = _session_id(host)
-        snapshot = start_run(host, _start_request(session_id, "start-dispatching"))
-        refs = _refs(options.db_path, snapshot.run_id)
+        refs: _RunRefs | None = None
         with open_host_durable_store(_durable_options(tmp_path)) as store:
-            _mark_dispatching(store.transaction_runner, refs)
+            async def _prepare_dispatching() -> _RunRefs:
+                scheduler = await _open_scheduler(
+                    tmp_path,
+                    store,
+                    _CancelAwareHandle(
+                        local_worker_id="worker-dispatching",
+                        terminal="hang",
+                    ),
+                )
+                try:
+                    start_run(
+                        host,
+                        _start_request(session_id, "start-dispatching"),
+                    )
+                    refs = await _start_governed_refs(scheduler, session_id)
+                    _mark_dispatching(store.transaction_runner, refs)
+                    return refs
+                finally:
+                    await scheduler.close()
 
+            refs = asyncio.run(_prepare_dispatching())
+
+        assert refs is not None
         cancelled = cancel_run(host, refs.run_id, _cancel_request("cancel-dispatching"))
 
         assert cancelled.status == RunStatus.CANCELLED
@@ -347,13 +371,13 @@ async def test_cancel_run_active_worker_propagates_and_closes_cancelled(
     handle = _CancelAwareHandle(local_worker_id="worker-active", terminal="cancelled")
     try:
         session_id = _session_id(host)
-        snapshot = start_run(host, _start_request(session_id, "start-active"))
-        refs = _refs(options.db_path, snapshot.run_id)
         with open_host_durable_store(_durable_options(tmp_path)) as store:
             scheduler = await _open_scheduler(
                 tmp_path, store, handle, active_registry=active_registry
             )
             try:
+                start_run(host, _start_request(session_id, "start-active"))
+                refs = await _start_governed_refs(scheduler, session_id)
                 scheduler.wake_dispatch(_pending_dispatch(refs))
                 drain = await scheduler.drain_once()
                 assert drain.dispatched == 1
@@ -390,11 +414,11 @@ async def test_late_cancel_does_not_overwrite_terminal(tmp_path: Path) -> None:
     handle = _CancelAwareHandle(local_worker_id="worker-final", terminal="final")
     try:
         session_id = _session_id(host)
-        snapshot = start_run(host, _start_request(session_id, "start-final"))
-        refs = _refs(options.db_path, snapshot.run_id)
         with open_host_durable_store(_durable_options(tmp_path)) as store:
             scheduler = await _open_scheduler(tmp_path, store, handle)
             try:
+                start_run(host, _start_request(session_id, "start-final"))
+                refs = await _start_governed_refs(scheduler, session_id)
                 scheduler.wake_dispatch(_pending_dispatch(refs))
                 drain = await scheduler.drain_once()
                 assert drain.dispatched == 1
@@ -436,7 +460,6 @@ async def test_worker_terminal_promotes_and_dispatches_queued_run(
         session_id = _session_id(host)
         active = start_run(host, _start_request(session_id, "start-terminal-active"))
         queued = start_run(host, _start_request(session_id, "start-terminal-queued"))
-        active_refs = _refs(options.db_path, active.run_id)
         with open_host_durable_store(_durable_options(tmp_path)) as store:
             scheduler = await _open_scheduler(
                 tmp_path,
@@ -446,6 +469,8 @@ async def test_worker_terminal_promotes_and_dispatches_queued_run(
                 lane_timeout_seconds=0.5,
             )
             try:
+                active_refs = await _start_governed_refs(scheduler, session_id)
+                assert active_refs.run_id == active.run_id
                 scheduler.wake_dispatch(_pending_dispatch(active_refs))
                 drain = await scheduler.drain_once()
                 assert drain.dispatched == 1
@@ -481,14 +506,14 @@ async def test_cancel_session_replay_repropagates_active_without_new_facts(
     handle = _CancelAwareHandle(local_worker_id="worker-session", terminal="hang")
     try:
         session_id = _session_id(host)
-        snapshot = start_run(host, _start_request(session_id, "start-session"))
-        refs = _refs(options.db_path, snapshot.run_id)
         request = _cancel_session_request("cancel-session")
         with open_host_durable_store(_durable_options(tmp_path)) as store:
             scheduler = await _open_scheduler(
                 tmp_path, store, handle, active_registry=active_registry
             )
             try:
+                start_run(host, _start_request(session_id, "start-session"))
+                refs = await _start_governed_refs(scheduler, session_id)
                 scheduler.wake_dispatch(_pending_dispatch(refs))
                 drain = await scheduler.drain_once()
                 assert drain.dispatched == 1
@@ -737,6 +762,29 @@ def _refs(db_path: Path, run_id: str) -> _RunRefs:
         attempt_id=str(row[1]),
         execution_id=str(row[2]),
         dispatch_record_id=str(row[3]),
+    )
+
+
+async def _start_governed_refs(
+    scheduler: HostDispatchScheduler, session_id: str
+) -> _RunRefs:
+    """执行一次 pre-start governance 并返回生成的 dispatch refs。
+
+    :param scheduler: Host dispatch scheduler。
+    :param session_id: 目标 Session id。
+    :returns: 本次启动生成的 durable refs。
+    :raises AssertionError: 没有可启动 Run 时抛出。
+    """
+
+    stage = await scheduler._run_pre_start_governance(session_id)
+    assert stage.pending_dispatch is not None
+    pending = stage.pending_dispatch
+    return _RunRefs(
+        session_id=session_id,
+        run_id=pending.run_id,
+        attempt_id=pending.attempt_id,
+        execution_id=pending.execution_id,
+        dispatch_record_id=pending.dispatch_record_id,
     )
 
 

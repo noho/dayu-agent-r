@@ -35,21 +35,24 @@ from dayu.host import (
     AttemptStatus,
     AuthorizationClaim,
     HostCallContext,
-    HostInput,
-    HostLocalExecutionOptions,
     LocalEngineWorker,
     LocalEngineWorkerFactory,
     LocalWorkerHandle,
     OperationContext,
     RunStatus,
-    StartRunRequest,
-    create_host_command_handle,
     ensure_session as ensure_public_session,
     resolve_wait,
-    start_run,
 )
 from dayu.host.admission import PendingDispatchRecord
-from dayu.host.api import AttemptDispatchSnapshot, EnsureSessionRequest, WaitAdapterKey
+from dayu.host.api import (
+    HostInput,
+    AttemptDispatchSnapshot,
+    EnsureSessionRequest,
+    HostLocalExecutionOptions,
+    StartRunRequest,
+    WaitAdapterKey,
+)
+from dayu.host.command import create_host_command_handle, start_run
 from dayu.host.dispatch import HostDispatchScheduler
 from dayu.host.durable.session_lifecycle import ensure_session
 from dayu.host.durable.state import (
@@ -385,9 +388,10 @@ async def test_scheduler_awaiting_tool_enters_waiting_and_manual_resolve_resumes
                 queue_policy="queue",
             ),
         )
-        pending = _pending_dispatch_from_started_run(
-            host._transaction_runner(), started.current_attempt_id
-        )
+        stage = await scheduler._run_pre_start_governance(session.session_id)
+        assert stage.pending_dispatch is not None
+        pending = stage.pending_dispatch
+        assert pending.run_id == started.run_id
 
         scheduler.wake_dispatch(pending)
         result = await scheduler.drain_once()

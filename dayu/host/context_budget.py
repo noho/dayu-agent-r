@@ -27,6 +27,7 @@ from dayu.host._public_validation import require_positive_int as _require_positi
 from dayu.host.context_policy import (
     ContextBudgetPolicy,
     DEFAULT_CONTEXT_SAFETY_MARGIN_RATIO,
+    MIN_CONTEXT_HARD_THRESHOLD_TOKENS,
 )
 from dayu.host.durable.codec import canonical_json_dumps, sha256_digest_json
 
@@ -204,6 +205,11 @@ class BudgetEstimate:
             self.hard_threshold_tokens,
             field_name="BudgetEstimate.hard_threshold_tokens",
         )
+        if self.hard_threshold_tokens < MIN_CONTEXT_HARD_THRESHOLD_TOKENS:
+            raise ValueError(
+                "BudgetEstimate.hard_threshold_tokens must be >= "
+                f"{MIN_CONTEXT_HARD_THRESHOLD_TOKENS}"
+            )
         _require_non_negative_int(
             self.safety_margin_tokens,
             field_name="BudgetEstimate.safety_margin_tokens",

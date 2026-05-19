@@ -225,6 +225,21 @@ def test_minimum_protection_tokens_zero_allows_hard_threshold_at_input_budget() 
     assert estimate.safety_margin_tokens == 0
 
 
+def test_budget_estimate_rejects_non_dispatchable_hard_threshold() -> None:
+    """BudgetEstimate 拒绝 compact 后无法留下正预算的 hard threshold。"""
+
+    with pytest.raises(ValueError, match="hard_threshold_tokens"):
+        BudgetEstimate(
+            estimated_input_tokens=0,
+            input_budget_tokens=2,
+            soft_threshold_tokens=1,
+            hard_threshold_tokens=1,
+            safety_margin_tokens=1,
+            estimator_digest="sha256:" + "1" * 64,
+            overage_reason=None,
+        )
+
+
 def test_safety_margin_ratio_near_one_keeps_positive_soft_threshold() -> None:
     """safety_margin_ratio 接近 1 时 soft threshold 仍保持正数边界。"""
 

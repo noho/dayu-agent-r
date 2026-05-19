@@ -24,8 +24,6 @@ from dayu.host import (
     HostApiError,
     HostApiErrorCode,
     HostCallContext,
-    HostCommandHandle,
-    HostCommandHandleOptions,
     OperationContext,
     ResolveWaitCancelledOutcome,
     ResolveWaitCompletedOutcome,
@@ -35,10 +33,10 @@ from dayu.host import (
     RunStatus,
     WaitProviderStatusRef,
     WaitResolutionSource,
-    create_host_command_handle,
     resolve_wait,
 )
-from dayu.host.api import EnsureSessionRequest, WaitAdapterKey
+from dayu.host.api import EnsureSessionRequest, HostCommandHandleOptions, WaitAdapterKey
+from dayu.host.command import HostCommandHandle, create_host_command_handle
 from dayu.host.durable.codec import sha256_digest_json
 from dayu.host.durable.event_log import (
     EventClass,
@@ -56,8 +54,10 @@ from dayu.host.durable.run_transition import (
 )
 from dayu.host.durable.session_lifecycle import ensure_session
 from dayu.host.durable.state import (
+    DispatchRecordStatus,
     DispatchRecordRow,
     RunStartReason,
+    RunRow,
     WaitRecordRow,
     WaitRecordStatus,
     WaitResumePolicy,
@@ -82,6 +82,8 @@ from dayu.host.waiting import (
     DefaultHostToolAwaitingAcceptPort,
     ToolAwaitingAcceptCandidate,
     ToolAwaitingAcceptedAck,
+    ResolveWaitResult,
+    _resolve_created_event_ref,
 )
 from dayu.runtime.log_levels import VERBOSE_LOG_LEVEL
 
@@ -147,6 +149,21 @@ def test_resolve_wait_completed_resumes_run_and_wakes_dispatch(
         )
     finally:
         host.close()
+
+
+def test_resolve_created_event_ref_fails_closed_for_missing_resume_start() -> None:
+    """resolve wait resume 结果缺 started_event_id 时 fail closed。"""
+
+    result = ResolveWaitResult(
+        run=_run_row(started_event_id=None, started_event_sequence=None),
+        dispatch_record=_dispatch_record_row(),
+        idempotent_replay=False,
+    )
+
+    with pytest.raises(HostApiError) as error_info:
+        _resolve_created_event_ref(result)
+
+    assert error_info.value.code is HostApiErrorCode.INTERNAL_ERROR
 
 
 def test_resolve_wait_survives_projection_catchup_failure(
@@ -446,6 +463,76 @@ class _NeverCancelledToken:
         """
 
         return None
+
+
+def _run_row(
+    *, started_event_id: str | None, started_event_sequence: int | None
+) -> RunRow:
+    """构造 resolve wait helper 测试用 RunRow。
+
+    :param started_event_id: run started event id。
+    :param started_event_sequence: run started event sequence。
+    :returns: RunRow。
+    """
+
+    return RunRow(
+        run_id="run-resolve-helper",
+        session_id="session-resolve-helper",
+        status=RunStatus.RUNNING,
+        client_request_id="client-resolve-helper",
+        input_event_id="event-input-resolve-helper",
+        input_event_sequence=1,
+        accepted_event_id="event-run-accepted-resolve-helper",
+        accepted_event_sequence=2,
+        queued_event_id=None,
+        queued_event_sequence=None,
+        started_event_id=started_event_id,
+        started_event_sequence=started_event_sequence,
+        terminal_event_id=None,
+        terminal_event_sequence=None,
+        current_attempt_id="attempt-resolve-helper",
+        source_run_id=None,
+        source_run_relation=None,
+        execution_target="target-resolve-helper",
+        queue_policy="queue",
+        created_at="2026-05-16T01:02:03.000000Z",
+        updated_at="2026-05-16T01:02:03.000000Z",
+        terminal_at=None,
+    )
+
+
+def _dispatch_record_row() -> DispatchRecordRow:
+    """构造 resolve wait helper 测试用 DispatchRecordRow。
+
+    :returns: DispatchRecordRow。
+    """
+
+    return DispatchRecordRow(
+        dispatch_record_id="dispatch-resolve-helper",
+        run_id="run-resolve-helper",
+        attempt_id="attempt-resolve-helper",
+        execution_id="execution-resolve-helper",
+        status=DispatchRecordStatus.PENDING,
+        worker_kind=WorkerKind.LOCAL,
+        execution_target="target-resolve-helper",
+        owner_host_instance_id=None,
+        created_event_id="event-dispatch-created-resolve-helper",
+        created_event_sequence=3,
+        waiting_for_lane_at=None,
+        lane_name=None,
+        lane_claim_id=None,
+        lane_owner_id=None,
+        lane_acquired_at=None,
+        dispatching_at=None,
+        worker_accepted_at=None,
+        worker_accept_event_id=None,
+        worker_accept_event_sequence=None,
+        cancelled_event_id=None,
+        cancelled_event_sequence=None,
+        created_at="2026-05-16T01:02:03.000000Z",
+        updated_at="2026-05-16T01:02:03.000000Z",
+        cancelled_at=None,
+    )
 
 
 def _options(tmp_path: Path) -> HostCommandHandleOptions:

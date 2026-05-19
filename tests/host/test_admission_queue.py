@@ -2,6 +2,9 @@
 
 from __future__ import annotations
 
+import json
+import logging
+from collections.abc import Mapping
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass, field
 from datetime import UTC, datetime
@@ -9,6 +12,9 @@ from pathlib import Path
 
 import pytest
 
+from dayu.contracts.json_value import JsonValue
+from dayu.engine.contracts.agent_policy import AgentPolicy
+from dayu.engine.contracts.runner_spec import RunnerCallOptions, RunnerSpec
 from dayu.host.admission import (
     AdmissionClock,
     AdmissionIdFactory,
@@ -34,13 +40,19 @@ from dayu.host.api import (
     HostInput,
     HostMetadataEntry,
     OperationContext,
+    OrdinaryRunExecutionBaseline,
     RunStatus,
     StartRunRequest,
     SubmitFollowupRequest,
 )
 from dayu.host.durable.codec import sha256_digest_json
 from dayu.host.durable.connection import open_host_durable_store
-from dayu.host.durable.event_log import EventClass, EventLogAppendRequest, EventLogStore
+from dayu.host.durable.event_log import (
+    EventClass,
+    EventLogAppendRequest,
+    EventLogRow,
+    EventLogStore,
+)
 from dayu.host.durable.memory import read_latest_memory_snapshot
 from dayu.host.durable.options import (
     HostDurableStoreOptions,
@@ -73,6 +85,7 @@ from dayu.host.memory import (
     digest_memory_projection_policy,
 )
 from dayu.host.memory_repair import ConversationMemoryProjectionCatchupPort
+from dayu.host.payload_resolution import event_payload_object
 from dayu.host.projection import ProjectionCatchupPort
 
 _NOW = datetime(2026, 5, 14, 9, 30, 0, tzinfo=UTC)
@@ -230,6 +243,32 @@ def _options_for_path(
     )
 
 
+def _options_with_payload_inline_threshold(
+    tmp_path: Path, payload_inline_threshold_bytes: int
+) -> HostDurableStoreOptions:
+    """构造覆盖 payload inline 阈值的测试 options。
+
+    :param tmp_path: pytest 临时目录。
+    :param payload_inline_threshold_bytes: payload inline 阈值字节数。
+    :returns: Host durable store options。
+    """
+
+    return HostDurableStoreOptions(
+        db_path=tmp_path / "durable.sqlite3",
+        payload_policy=PayloadStoragePolicy(
+            artifact_root=tmp_path / "artifacts",
+            payload_inline_threshold_bytes=payload_inline_threshold_bytes,
+        ),
+        sqlite_policy=HostSQLiteStoragePolicy(
+            busy_timeout_seconds=0.5,
+            write_busy_retry_count=8,
+            write_retry_initial_delay_seconds=0.001,
+            write_retry_backoff_multiplier=1.2,
+            write_retry_max_delay_seconds=0.02,
+        ),
+    )
+
+
 def test_start_run_on_open_session_creates_accepted_run_and_governance_wakeup(
     tmp_path: Path,
 ) -> None:
@@ -338,6 +377,86 @@ def test_followup_queue_without_active_creates_accepted_run(
             "USER_INPUT_ACCEPTED",
             "RUN_ACCEPTED",
         )
+
+
+def test_followup_queue_spills_large_user_input_payload(
+    tmp_path: Path,
+) -> None:
+    """大 ``USER_INPUT_ACCEPTED`` payload 写入 descriptor 并可按真源读取。"""
+
+    display_text = "long prompt " * 600
+    with open_host_durable_store(
+        _options_with_payload_inline_threshold(
+            tmp_path, payload_inline_threshold_bytes=4096
+        )
+    ) as store:
+        session_id = _ensure_session_id(store.transaction_runner)
+        service = _service(store.transaction_runner)
+
+        result = service.submit_followup_queue(
+            SubmitFollowupQueueAdmissionInput(
+                request=_followup_request(
+                    session_id=session_id,
+                    client_request_id="follow-large-payload",
+                    display_text=display_text,
+                ),
+                resolved_execution_target="follow-target",
+            ),
+            caller_semantic_digest=_CALLER_DIGEST,
+        )
+
+        input_event = _read_user_input_event(
+            store.transaction_runner, result.run.input_event_id
+        )
+        payload = _event_payload_object(store.transaction_runner, input_event)
+
+        assert input_event.payload_ref is not None
+        assert input_event.payload_digest is not None
+        assert "long prompt" not in input_event.payload_json
+        assert payload["display_text"] == display_text
+        assert payload["user_prompt"] == display_text
+        inline_payload = _payload_mapping(input_event)
+        assert "display_text" not in inline_payload
+        assert "user_prompt" not in inline_payload
+        assert "system_prompt" not in inline_payload
+        assert "effective_execution_config" not in inline_payload
+        assert "effective_tool_set" not in inline_payload
+
+
+def test_followup_queue_payload_inline_threshold_boundary(
+    tmp_path: Path,
+) -> None:
+    """payload canonical UTF-8 len 等于阈值时 inline，阈值少一时 descriptor。"""
+
+    display_text = "boundary prompt"
+    baseline_dir = tmp_path / "baseline"
+    inline_dir = tmp_path / "inline"
+    descriptor_dir = tmp_path / "descriptor"
+    baseline_dir.mkdir()
+    inline_dir.mkdir()
+    descriptor_dir.mkdir()
+    payload_size = _accepted_input_payload_size(
+        baseline_dir,
+        client_request_id="follow-boundary",
+        display_text=display_text,
+        payload_inline_threshold_bytes=4096,
+    )
+
+    inline_event = _accepted_input_event(
+        inline_dir,
+        client_request_id="follow-boundary-inline",
+        display_text=display_text,
+        payload_inline_threshold_bytes=payload_size,
+    )
+    descriptor_event = _accepted_input_event(
+        descriptor_dir,
+        client_request_id="follow-boundary-descriptor",
+        display_text=display_text,
+        payload_inline_threshold_bytes=payload_size - 1,
+    )
+
+    assert inline_event.payload_ref is None
+    assert descriptor_event.payload_ref is not None
 
 
 def test_closed_session_rejects_start_and_followup_without_event_side_effects(
@@ -769,7 +888,7 @@ def test_cancel_predispatch_starting_promotes_exactly_one_queued_run(
 
 
 def test_cancel_predispatch_starting_promotion_survives_queue_wakeup_failure(
-    tmp_path: Path,
+    tmp_path: Path, caplog: pytest.LogCaptureFixture
 ) -> None:
     """active cancel 后 queue wakeup 失败不掩盖已完成 promotion。"""
 
@@ -790,11 +909,12 @@ def test_cancel_predispatch_starting_promotion_survives_queue_wakeup_failure(
         )
         spy.fail_queue_promotion = True
 
-        result = service.cancel_run(
-            active.run.run_id,
-            _cancel_request("cancel-active-wakeup-fails"),
-            caller_semantic_digest=_CALLER_DIGEST,
-        )
+        with caplog.at_level(logging.WARNING, logger="dayu.host.admission"):
+            result = service.cancel_run(
+                active.run.run_id,
+                _cancel_request("cancel-active-wakeup-fails"),
+                caller_semantic_digest=_CALLER_DIGEST,
+            )
 
         assert result.run.status == RunStatus.CANCELLED
         assert result.promotion is not None
@@ -804,6 +924,8 @@ def test_cancel_predispatch_starting_promotion_survives_queue_wakeup_failure(
             RunStatus.QUEUED
         )
         assert spy.promotions == [session_id]
+        assert "host.admission.queue_promotion_wakeup_failed" in caplog.text
+        assert session_id in caplog.text
 
 
 def test_promote_next_queued_run_returns_result_when_dispatch_wakeup_fails(
@@ -1269,6 +1391,42 @@ def _service(
         id_factory=_SequentialIdFactory(label),
         wakeup_port=spy if spy is not None else _WakeupSpy(),
         projection_catchup_port=projection_catchup,
+        ordinary_run_baseline=_ordinary_run_baseline(),
+        tooling_options=None,
+    )
+
+
+def _ordinary_run_baseline() -> OrdinaryRunExecutionBaseline:
+    """构造测试用 ordinary Run 执行基线。
+
+    :returns: OrdinaryRunExecutionBaseline。
+    :raises TypeError: baseline typed 字段类型非法时抛出。
+    :raises ValueError: baseline 字段语义非法时抛出。
+    """
+
+    return OrdinaryRunExecutionBaseline(
+        runner_spec=RunnerSpec(
+            provider="test",
+            model="admission-baseline-model",
+            endpoint="https://example.invalid",
+            api_key_ref="secret:admission-baseline",
+            headers={},
+            supports_tool_calling=False,
+            supports_streaming=False,
+            supports_stream_usage=False,
+            default_timeout_seconds=1.0,
+            max_retries=0,
+            provider_request=None,
+        ),
+        runner_options=RunnerCallOptions(
+            temperature=None, max_tokens=None, top_p=None, stream=False
+        ),
+        agent_policy=AgentPolicy(
+            max_iterations=1,
+            continuation_max_attempts=0,
+            allow_tool_calls=False,
+            tool_execution_timeout_seconds=1.0,
+        ),
     )
 
 
@@ -1497,7 +1655,12 @@ def _followup_request(
         context=_context(),
         session_id=session_id,
         client_request_id=client_request_id,
-        input=HostInput(display_text=display_text, payload_ref=None, payload_digest=None),
+        system_prompt=None,
+        user_prompt=display_text,
+        tool_names=None,
+        runner_spec=None,
+        runner_options=None,
+        agent_policy=None,
         behavior=FollowupBehavior.QUEUE,
         target_run_id=None,
     )
@@ -1697,6 +1860,137 @@ def _event_types_for_run(
         return tuple(_required_text(row, "event_type") for row in rows)
 
     return transaction_runner.run_write(operation)
+
+
+def _read_user_input_event(
+    transaction_runner: HostTransactionRunner, event_id: str
+) -> EventLogRow:
+    """按 event id 读取 ``USER_INPUT_ACCEPTED`` 事件。
+
+    :param transaction_runner: Host transaction runner。
+    :param event_id: event id。
+    :returns: EventLog row。
+    """
+
+    def operation(transaction: HostTransaction) -> EventLogRow:
+        """读取 EventLog row。
+
+        :param transaction: Host transaction。
+        :returns: EventLog row。
+        """
+
+        row = EventLogStore().read_event_by_id(transaction, event_id)
+        assert row is not None
+        assert row.event_type == "USER_INPUT_ACCEPTED"
+        return row
+
+    return transaction_runner.run_read(operation)
+
+
+def _event_payload_object(
+    transaction_runner: HostTransactionRunner, event: EventLogRow
+) -> Mapping[str, JsonValue]:
+    """读取 EventLog payload object。
+
+    :param transaction_runner: Host transaction runner。
+    :param event: EventLog row。
+    :returns: payload JSON object。
+    """
+
+    def operation(transaction: HostTransaction) -> Mapping[str, JsonValue]:
+        """读取 payload object。
+
+        :param transaction: Host transaction。
+        :returns: payload JSON object。
+        """
+
+        return event_payload_object(
+            transaction, event, payload_label="USER_INPUT_ACCEPTED"
+        )
+
+    return transaction_runner.run_read(operation)
+
+
+def _payload_mapping(event: EventLogRow) -> Mapping[str, JsonValue]:
+    """解析 EventLog inline payload。
+
+    :param event: EventLog row。
+    :returns: inline payload mapping。
+    :raises AssertionError: inline payload 不是 object 时抛出。
+    """
+
+    value = json.loads(event.payload_json)
+    assert isinstance(value, Mapping)
+    return value
+
+
+def _accepted_input_payload_size(
+    tmp_path: Path,
+    *,
+    client_request_id: str,
+    display_text: str,
+    payload_inline_threshold_bytes: int,
+) -> int:
+    """创建 followup 并返回 USER_INPUT_ACCEPTED inline payload UTF-8 长度。
+
+    :param tmp_path: pytest 临时目录。
+    :param client_request_id: 幂等请求 id。
+    :param display_text: 用户输入展示文本。
+    :param payload_inline_threshold_bytes: payload inline 阈值。
+    :returns: canonical inline payload UTF-8 字节长度。
+    """
+
+    event = _accepted_input_event(
+        tmp_path,
+        client_request_id=client_request_id,
+        display_text=display_text,
+        payload_inline_threshold_bytes=payload_inline_threshold_bytes,
+    )
+    assert event.payload_ref is None
+    return len(event.payload_json.encode("utf-8"))
+
+
+def _accepted_input_event(
+    tmp_path: Path,
+    *,
+    client_request_id: str,
+    display_text: str,
+    payload_inline_threshold_bytes: int,
+) -> EventLogRow:
+    """创建 followup 并返回 USER_INPUT_ACCEPTED event。
+
+    :param tmp_path: pytest 临时目录。
+    :param client_request_id: 幂等请求 id。
+    :param display_text: 用户输入展示文本。
+    :param payload_inline_threshold_bytes: payload inline 阈值。
+    :returns: USER_INPUT_ACCEPTED EventLog row。
+    """
+
+    input_event: EventLogRow | None = None
+    with open_host_durable_store(
+        _options_with_payload_inline_threshold(
+            tmp_path, payload_inline_threshold_bytes
+        )
+    ) as store:
+        session_id = _ensure_session_id(store.transaction_runner)
+        service = _service(store.transaction_runner)
+        result = service.submit_followup_queue(
+            SubmitFollowupQueueAdmissionInput(
+                request=_followup_request(
+                    session_id=session_id,
+                    client_request_id=client_request_id,
+                    display_text=display_text,
+                ),
+                resolved_execution_target="follow-target",
+            ),
+            caller_semantic_digest=_CALLER_DIGEST,
+        )
+        input_event = _read_user_input_event(
+            store.transaction_runner, result.run.input_event_id
+        )
+    if input_event is None:
+        raise AssertionError("input event must exist")
+    return input_event
 
 
 def _event_count(transaction_runner: HostTransactionRunner) -> int:

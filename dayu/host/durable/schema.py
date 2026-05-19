@@ -22,7 +22,7 @@ from dayu.host.api import (
 )
 from dayu.host.durable.errors import HostSchemaMismatchError
 
-HOST_SCHEMA_VERSION = 9
+HOST_SCHEMA_VERSION = 10
 """当前 Host durable SQLite schema version。"""
 
 TABLE_EVENT_LOG = "event_log"
@@ -600,7 +600,9 @@ CREATE TABLE IF NOT EXISTS {TABLE_HOST_WAIT_RECORDS} (
       AND snapshot_captured_at IS NULL
       AND snapshot_digest IS NULL)
     OR
-    (snapshot_ref IS NOT NULL AND snapshot_captured_at IS NOT NULL)
+    (snapshot_ref IS NOT NULL
+      AND snapshot_captured_at IS NOT NULL
+      AND snapshot_digest IS NOT NULL)
   ),
   CHECK (
     (status = 'waiting' AND terminal_at IS NULL)

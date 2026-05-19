@@ -66,6 +66,11 @@ from dayu.host.durable.options import (
     HostSQLiteStoragePolicy,
     PayloadStoragePolicy,
 )
+from dayu.host.durable.payload import (
+    PayloadStore,
+    SQLitePayloadFormat,
+    SQLitePayloadWriteRequest,
+)
 from dayu.host.durable.run_transition import (
     CreateRunningRunInput,
     create_running_run_with_starting_attempt_in_transaction,
@@ -192,6 +197,30 @@ def test_current_user_message_comes_from_durable_user_input(
 
         assert isinstance(request.messages[-1], UserMessage)
         assert request.messages[-1].content == "durable prompt"
+
+
+def test_current_user_message_resolves_descriptor_payload(
+    tmp_path: Path,
+) -> None:
+    """RunInputBuilder 跟随 descriptor 读取完整当前用户 prompt。"""
+
+    with open_host_durable_store(_options(tmp_path)) as store:
+        session_id = _ensure_session_id(store.transaction_runner)
+        seeded = _seed_current_run_with_descriptor(
+            store,
+            session_id=session_id,
+            payload=_user_input_payload("descriptor durable prompt"),
+        )
+
+        input_event = _read_event_by_id(
+            store.transaction_runner, "event-current-input"
+        )
+        request = _build_request(store, seeded)
+
+        assert input_event.payload_ref is not None
+        assert "descriptor durable prompt" not in input_event.payload_json
+        assert isinstance(request.messages[-1], UserMessage)
+        assert request.messages[-1].content == "descriptor durable prompt"
 
 
 def test_build_is_deterministic_for_same_eventlog_and_policy(
@@ -1743,6 +1772,131 @@ def _seed_current_run(
             payload=payload,
             event_class=EventClass.CANONICAL_FACT,
         )
+        create_running_run_with_starting_attempt_in_transaction(
+            transaction,
+            EventLogStore(),
+            CreateRunningRunInput(
+                session_id=session_id,
+                run_id="run-current",
+                client_request_id="request-current",
+                input_event_id=input_event.event_id,
+                input_event_sequence=input_event.event_sequence,
+                run_accepted_event_id="event-run-accepted-current",
+                run_started_event_id="event-run-started-current",
+                attempt_started_event_id="event-attempt-started-current",
+                attempt_id="attempt-current",
+                execution_id="execution-current",
+                dispatch_record_id="dispatch-current",
+                occurred_at=_NOW,
+                actor="analyst",
+                source="pytest",
+                idempotency_key="request-current",
+                execution_target="local-default",
+                queue_policy="queue",
+                start_reason=RunStartReason.INITIAL,
+                worker_kind=WorkerKind.LOCAL,
+                owner_host_instance_id=None,
+                call_context_digest=_CALL_CONTEXT_DIGEST,
+            ),
+        )
+        register_current_instance(
+            transaction,
+            HostInstanceIdentity(
+                host_instance_id="host-run-input",
+                pid=1,
+                process_start_token="run-input-test",
+                boot_id=None,
+            ),
+        )
+        mark_dispatch_waiting_for_lane_row(
+            transaction,
+            attempt_id="attempt-current",
+            owner_host_instance_id="host-run-input",
+            lane_name="llm",
+            waiting_for_lane_at="2026-05-15T01:02:03.000000Z",
+        )
+        mark_dispatching_after_lane_row(
+            transaction,
+            attempt_id="attempt-current",
+            owner_host_instance_id="host-run-input",
+            lane_name="llm",
+            lane_claim_id="claim-run-input",
+            lane_owner_id="owner-run-input",
+            lane_acquired_at="2026-05-15T01:02:03.000000Z",
+            dispatching_at="2026-05-15T01:02:03.000000Z",
+        )
+        return _SeededRun(
+            session_id=session_id,
+            run_id="run-current",
+            attempt_id="attempt-current",
+            execution_id="execution-current",
+            dispatch_record_id="dispatch-current",
+        )
+
+    return store.transaction_runner.run_write(operation)
+
+
+def _seed_current_run_with_descriptor(
+    store: HostDurableStore,
+    *,
+    session_id: str,
+    payload: dict[str, JsonValue],
+) -> _SeededRun:
+    """写入 descriptor USER_INPUT_ACCEPTED 的当前 running Run。
+
+    :param store: Host durable store。
+    :param session_id: Session id。
+    :param payload: 完整 USER_INPUT_ACCEPTED payload。
+    :returns: seeded Run 引用。
+    """
+
+    def operation(transaction: HostTransaction) -> _SeededRun:
+        """执行当前 Run 写入。
+
+        :param transaction: Host transaction。
+        :returns: seeded Run 引用。
+        """
+
+        descriptor = PayloadStore().write_sqlite_payload(
+            transaction,
+            SQLitePayloadWriteRequest(
+                payload_ref="payload-current-input",
+                payload_id="sqlite-current-input",
+                payload_format=SQLitePayloadFormat.CANONICAL_JSON,
+                payload_json=payload,
+                media_type="application/json",
+                metadata={"kind": "user_input_accepted"},
+            ),
+        )
+        input_event = EventLogStore().append_event(
+            transaction,
+            EventLogAppendRequest(
+                event_id="event-current-input",
+                event_class=EventClass.CANONICAL_FACT,
+                session_id=session_id,
+                run_id="run-current",
+                attempt_id=None,
+                execution_id=None,
+                event_type="USER_INPUT_ACCEPTED",
+                occurred_at=_NOW,
+                actor="analyst",
+                source="pytest",
+                client_request_id=None,
+                idempotency_key=None,
+                policy_decision=None,
+                reason=None,
+                payload_json={
+                    "input_ref": None,
+                    "input_digest": _INPUT_DIGEST,
+                    "payload_ref": None,
+                    "payload_digest": None,
+                    "operation_kind": "start_run",
+                    "call_context_digest": _CALL_CONTEXT_DIGEST,
+                },
+                payload_ref=descriptor.payload_ref,
+                payload_digest=descriptor.payload_digest,
+            ),
+        ).row
         create_running_run_with_starting_attempt_in_transaction(
             transaction,
             EventLogStore(),

@@ -230,8 +230,9 @@ def test_fresh_db_creates_foundation_phase8_and_memory_tables(
             assert set(MEMORY_PROJECTION_TABLES).issubset(
                 _table_names(connection)
             )
-            assert _pragma_int(connection, "PRAGMA user_version") == 8
-            assert HOST_SCHEMA_VERSION == 8
+            assert _pragma_int(connection, "PRAGMA user_version") == (
+                HOST_SCHEMA_VERSION
+            )
             assert _pragma_int(connection, "PRAGMA foreign_keys") == 1
             assert _pragma_text(connection, "PRAGMA journal_mode").lower() == "wal"
             assert _pragma_int(connection, "PRAGMA busy_timeout") == 250
@@ -266,6 +267,82 @@ def test_schema_mismatch_raises_structured_error(tmp_path: Path) -> None:
             bootstrap_host_durable_store(connection)
     finally:
         connection.close()
+
+
+def test_wait_record_snapshot_columns_are_all_or_none(tmp_path: Path) -> None:
+    """wait snapshot 三元组必须同时存在或同时为空。"""
+
+    options = _options(tmp_path)
+    with open_host_durable_store(options) as store:
+        connection = store.connect()
+        try:
+            connection.execute("PRAGMA foreign_keys=OFF")
+            with pytest.raises(sqlite3.IntegrityError):
+                connection.execute(
+                    f"""
+                    INSERT INTO {TABLE_HOST_WAIT_RECORDS} (
+                      wait_id,
+                      session_id,
+                      run_id,
+                      attempt_id,
+                      execution_id,
+                      tool_call_id,
+                      tool_name,
+                      adapter_key,
+                      await_kind,
+                      resume_policy,
+                      resume_token,
+                      snapshot_ref,
+                      snapshot_captured_at,
+                      snapshot_digest,
+                      external_job_id,
+                      accept_idempotency_key,
+                      resolve_idempotency_key,
+                      resolve_semantic_digest,
+                      deadline_at,
+                      expires_at,
+                      status,
+                      created_event_id,
+                      created_event_sequence,
+                      updated_event_id,
+                      updated_event_sequence,
+                      created_at,
+                      updated_at,
+                      terminal_at
+                    ) VALUES (
+                      'wait-invalid-snapshot',
+                      'session-1',
+                      'run-1',
+                      'attempt-1',
+                      'execution-1',
+                      'tool-call-1',
+                      'lookup',
+                      'adapter',
+                      'external_job',
+                      'poll',
+                      'resume-token',
+                      'snapshot-1',
+                      '2026-05-19T00:00:00.000000Z',
+                      NULL,
+                      NULL,
+                      'accept-key',
+                      NULL,
+                      NULL,
+                      NULL,
+                      NULL,
+                      'waiting',
+                      'event-created',
+                      1,
+                      'event-updated',
+                      2,
+                      '2026-05-19T00:00:00.000000Z',
+                      '2026-05-19T00:00:00.000000Z',
+                      NULL
+                    )
+                    """
+                )
+        finally:
+            connection.close()
 
 
 def test_wal_persists_on_second_independent_connection(tmp_path: Path) -> None:

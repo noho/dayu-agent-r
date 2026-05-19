@@ -11,13 +11,15 @@ steer、retry、replay、wait 或 recovery。
 from __future__ import annotations
 
 import logging
-from dataclasses import dataclass
+from collections.abc import Mapping
+from dataclasses import dataclass, replace
 from datetime import UTC, datetime
 from enum import StrEnum
-from typing import Protocol
+from typing import Protocol, cast
 from uuid import uuid4
 
 from dayu.contracts.json_value import JsonValue
+from dayu.contracts.tool_declaration import ToolBundle
 from dayu.host.api import (
     AttemptStatus,
     AuthorizationClaim,
@@ -28,29 +30,45 @@ from dayu.host.api import (
     HostApiErrorCode,
     HostCallContext,
     HostInput,
+    OrdinaryRunExecutionBaseline,
     OperationContext,
+    ReplayRunRequest,
+    RetryRunRequest,
     RunStatus,
     SessionSnapshot,
     SessionStatus,
+    SourceRunRelation,
     StartRunRequest,
+    SteerConflictDetail,
     SubmitFollowupRequest,
 )
 from dayu.host.durable._validation import (
     require_non_empty_text as _require_non_empty_text,
     require_sha256_digest as _require_sha256_digest,
 )
-from dayu.host.durable.codec import sha256_digest_json
+from dayu.host.durable.codec import (
+    canonical_json_dumps,
+    format_utc_timestamp,
+    sha256_digest_json,
+)
 from dayu.host.durable.event_log import (
     EventClass,
     EventLogAppendRequest,
     EventLogRow,
     EventLogStore,
 )
+from dayu.host.durable.errors import HostDurableError
 from dayu.host.durable.idempotency import (
     IdempotencyRecord,
     IdempotencyResultRef,
     IdempotencyScope,
     IdempotencyStore,
+)
+from dayu.host.durable.payload import (
+    PayloadDescriptor,
+    PayloadStore,
+    SQLitePayloadFormat,
+    SQLitePayloadWriteRequest,
 )
 from dayu.host.durable.run_transition import (
     CancelActiveAttemptInput,
@@ -83,6 +101,10 @@ from dayu.host.durable.state import (
     SessionRow,
     StateMutationStatus,
     WorkerKind,
+    cancel_active_wait_records_for_run,
+    count_runs_by_source_relation,
+    insert_attempt,
+    insert_dispatch_record,
     read_active_run_for_session,
     read_attempt_by_id,
     read_dispatch_record_by_attempt_id,
@@ -91,17 +113,39 @@ from dayu.host.durable.state import (
     read_session_by_id,
     read_session_slot_by_session_id,
     session_snapshot_from_rows,
+    set_new_run_source_relation_row,
+    steer_active_run_row,
+    steer_running_attempt_row,
 )
 from dayu.host.durable.transaction import HostTransaction, HostTransactionRunner
+from dayu.host._execution_config_projection import (
+    effective_execution_config_json as _effective_execution_config_json,
+    effective_execution_snapshot_from_json as _effective_execution_snapshot_from_json,
+    optional_agent_policy_json as _optional_agent_policy_json,
+    optional_runner_options_json as _optional_runner_options_json,
+    optional_runner_spec_json as _optional_runner_spec_json,
+)
 from dayu.host.projection import (
     NoopProjectionCatchupPort,
     ProjectionCatchupPort,
     catch_up_projection_best_effort,
 )
+from dayu.host.payload_resolution import event_payload_object
+from dayu.host.tool_runtime_schema_projection import (
+    business_bundle_digest as _business_bundle_digest,
+    tool_schemas_digest as _tool_schemas_digest,
+)
+from dayu.host.tooling import HostToolingOptions
 from dayu.runtime.log_levels import VERBOSE_LOG_LEVEL
 
 _LOGGER = logging.getLogger(__name__)
 _EVENT_TYPE_USER_INPUT_ACCEPTED = "USER_INPUT_ACCEPTED"
+_EVENT_TYPE_STEER_REQUESTED = "STEER_REQUESTED"
+_EVENT_TYPE_ATTEMPT_STEERED = "ATTEMPT_STEERED"
+_EVENT_TYPE_RUN_STARTED = "RUN_STARTED"
+_EVENT_TYPE_ATTEMPT_STARTED = "ATTEMPT_STARTED"
+_EVENT_TYPE_RETRY_REQUESTED = "RETRY_REQUESTED"
+_EVENT_TYPE_REPLAY_REQUESTED = "REPLAY_REQUESTED"
 _EVENT_SOURCE = "host.admission"
 _INTERNAL_ACTOR = "host"
 _EVENT_ID_PREFIX = "event"
@@ -111,12 +155,20 @@ _EXECUTION_ID_PREFIX = "execution"
 _DISPATCH_RECORD_ID_PREFIX = "dispatch"
 _OPERATION_START_RUN = "start_run"
 _OPERATION_SUBMIT_FOLLOWUP_QUEUE = "submit_followup_queue"
+_OPERATION_SUBMIT_FOLLOWUP_STEER = "submit_followup_steer"
+_OPERATION_RETRY_RUN = "retry_run"
+_OPERATION_REPLAY_RUN = "replay_run"
 _OPERATION_CANCEL_RUN = "cancel_run"
 _OPERATION_CANCEL_SESSION_RUNS = "cancel_session_runs"
 _IDEMPOTENCY_RESULT_KIND_RUN = "run"
 _IDEMPOTENCY_RESULT_KIND_SESSION = "session"
 _QUEUE_REASON_ACTIVE_RUN_EXISTS = "active_run_exists"
 _TERMINAL_CLOSEOUT_REASON = "phase3_internal_closeout"
+_TOOL_SNAPSHOT_REF_PREFIX = "tools:"
+_TOOL_SELECTION_ALL = "all"
+_TOOL_SELECTION_NONE = "none"
+_TOOL_SELECTION_SUBSET = "subset"
+_MAX_ORDINARY_RETRY_RUNS_PER_SOURCE = 1
 
 
 class AdmissionPolicy(StrEnum):
@@ -195,6 +247,18 @@ class SubmitFollowupQueueAdmissionInput:
 
 
 @dataclass(frozen=True, slots=True)
+class _ResolvedFollowupEffectiveFacts:
+    """admission 前解析出的 per-run effective 冻结事实。
+
+    :param effective_execution_config: effective runner / agent 配置 JSON。
+    :param effective_tool_set: effective business tool 集合 JSON。
+    """
+
+    effective_execution_config: JsonValue
+    effective_tool_set: JsonValue
+
+
+@dataclass(frozen=True, slots=True)
 class PendingDispatchRecord:
     """commit 后 dispatch wakeup 使用的 pending dispatch 摘要。
 
@@ -235,6 +299,28 @@ class RunAdmissionResult:
     created: bool
     queued: bool
     attached_active: bool
+    idempotent_replay: bool
+
+
+@dataclass(frozen=True, slots=True)
+class SteerAdmissionResult:
+    """submit_followup(steer) admission 结果。
+
+    :param run: steer 后的目标 Run row。
+    :param attempt: 新建 current Attempt；幂等重放时为当前 Attempt。
+    :param dispatch_record: 新建 dispatch record；幂等重放时为当前 dispatch record。
+    :param pending_dispatch: commit 后需要唤醒 dispatch 的摘要。
+    :param steered_cancel_target: commit 后需要 best-effort 取消的旧 active worker。
+    :param input_event_id: 本次 steer 接受的输入事件 id。
+    :param idempotent_replay: 是否命中既有幂等记录。
+    """
+
+    run: RunRow
+    attempt: AttemptRow | None
+    dispatch_record: DispatchRecordRow | None
+    pending_dispatch: PendingDispatchRecord | None
+    steered_cancel_target: ActiveCancelTarget | None
+    input_event_id: str
     idempotent_replay: bool
 
 
@@ -423,6 +509,8 @@ class HostAdmissionService:
     id_factory: AdmissionIdFactory
     wakeup_port: AdmissionWakeupPort
     projection_catchup_port: ProjectionCatchupPort
+    ordinary_run_baseline: OrdinaryRunExecutionBaseline | None = None
+    tooling_options: HostToolingOptions | None = None
 
     def start_run(
         self, request: StartRunRequest, *, caller_semantic_digest: str
@@ -478,10 +566,16 @@ class HostAdmissionService:
         _require_sha256_digest(
             caller_semantic_digest, field_name="caller_semantic_digest"
         )
+        effective_facts = _resolve_followup_effective_facts(
+            admission_input.request,
+            baseline=self.ordinary_run_baseline,
+            tooling_options=self.tooling_options,
+        )
         result = self.transaction_runner.run_write(
             _SubmitFollowupQueueOperation(
                 admission_input=admission_input,
                 caller_semantic_digest=caller_semantic_digest,
+                effective_facts=effective_facts,
                 event_log_store=self.event_log_store,
                 idempotency_store=self.idempotency_store,
                 clock=self.clock,
@@ -489,6 +583,121 @@ class HostAdmissionService:
             )
         )
         _log_run_admission_result(_OPERATION_SUBMIT_FOLLOWUP_QUEUE, result)
+        catch_up_projection_best_effort(self.projection_catchup_port)
+        _wake_dispatch_if_needed(self.wakeup_port, result.pending_dispatch)
+        _wake_start_governance_if_needed(self.wakeup_port, result.run)
+        return result
+
+    def submit_followup_steer(
+        self,
+        request: SubmitFollowupRequest,
+        *,
+        caller_semantic_digest: str,
+    ) -> SteerAdmissionResult:
+        """接受 ``submit_followup(steer)`` 请求。
+
+        :param request: follow-up steer 请求。
+        :param caller_semantic_digest: 调用方语义输入摘要。
+        :returns: steer admission 结果。
+        :raises ValueError: behavior 非 steer 或 digest 非法时抛出。
+        :raises HostApiError: 目标 Run 非 active RUNNING / WAITING 或幂等冲突时抛出。
+        :raises HostDurableError: durable 写入失败时由底层抛出。
+        """
+
+        if request.behavior != FollowupBehavior.STEER:
+            raise ValueError("SubmitFollowupRequest.behavior must be steer")
+        _require_sha256_digest(
+            caller_semantic_digest, field_name="caller_semantic_digest"
+        )
+        result = self.transaction_runner.run_write(
+            _SubmitFollowupSteerOperation(
+                request=request,
+                caller_semantic_digest=caller_semantic_digest,
+                event_log_store=self.event_log_store,
+                idempotency_store=self.idempotency_store,
+                clock=self.clock,
+                id_factory=self.id_factory,
+                ordinary_run_baseline=self.ordinary_run_baseline,
+                tooling_options=self.tooling_options,
+            )
+        )
+        catch_up_projection_best_effort(self.projection_catchup_port)
+        _wake_dispatch_if_needed(self.wakeup_port, result.pending_dispatch)
+        return result
+
+    def retry_run(
+        self,
+        run_id: str,
+        request: RetryRunRequest,
+        *,
+        caller_semantic_digest: str,
+    ) -> RunAdmissionResult:
+        """接受普通本地 FAILED Run retry 请求。
+
+        :param run_id: 源 Run id。
+        :param request: retry run 请求。
+        :param caller_semantic_digest: 调用方语义输入摘要。
+        :returns: 关联新 Run admission 结果。
+        :raises HostApiError: 源 Run 缺失、非 FAILED、Session closed、幂等冲突或
+            retry policy limit 命中时抛出。
+        :raises HostDurableError: durable 写入失败时由底层抛出。
+        """
+
+        _require_non_empty_text(run_id, field_name="run_id")
+        _require_sha256_digest(
+            caller_semantic_digest, field_name="caller_semantic_digest"
+        )
+        result = self.transaction_runner.run_write(
+            _RetryRunOperation(
+                run_id=run_id,
+                request=request,
+                caller_semantic_digest=caller_semantic_digest,
+                event_log_store=self.event_log_store,
+                idempotency_store=self.idempotency_store,
+                clock=self.clock,
+                id_factory=self.id_factory,
+            )
+        )
+        _log_run_admission_result(_OPERATION_RETRY_RUN, result)
+        catch_up_projection_best_effort(self.projection_catchup_port)
+        _wake_dispatch_if_needed(self.wakeup_port, result.pending_dispatch)
+        _wake_start_governance_if_needed(self.wakeup_port, result.run)
+        return result
+
+    def replay_run(
+        self,
+        run_id: str,
+        request: ReplayRunRequest,
+        *,
+        caller_semantic_digest: str,
+    ) -> RunAdmissionResult:
+        """接受 SUCCEEDED Run 的 no-tool 结构修复 replay 请求。
+
+        :param run_id: 源 Run id。
+        :param request: replay run 请求。
+        :param caller_semantic_digest: 调用方语义输入摘要。
+        :returns: 关联新 Run admission 结果。
+        :raises HostApiError: 源 Run 缺失、非 SUCCEEDED、Session closed 或幂等冲突时抛出。
+        :raises HostDurableError: durable 写入失败时由底层抛出。
+        """
+
+        _require_non_empty_text(run_id, field_name="run_id")
+        _require_sha256_digest(
+            caller_semantic_digest, field_name="caller_semantic_digest"
+        )
+        result = self.transaction_runner.run_write(
+            _ReplayRunOperation(
+                run_id=run_id,
+                request=request,
+                caller_semantic_digest=caller_semantic_digest,
+                event_log_store=self.event_log_store,
+                idempotency_store=self.idempotency_store,
+                clock=self.clock,
+                id_factory=self.id_factory,
+                ordinary_run_baseline=self.ordinary_run_baseline,
+            )
+        )
+        _log_run_admission_result(_OPERATION_REPLAY_RUN, result)
         catch_up_projection_best_effort(self.projection_catchup_port)
         _wake_dispatch_if_needed(self.wakeup_port, result.pending_dispatch)
         _wake_start_governance_if_needed(self.wakeup_port, result.run)
@@ -659,6 +868,8 @@ def create_host_admission_service(
     id_factory: AdmissionIdFactory | None = None,
     wakeup_port: AdmissionWakeupPort | None = None,
     projection_catchup_port: ProjectionCatchupPort | None = None,
+    ordinary_run_baseline: OrdinaryRunExecutionBaseline | None = None,
+    tooling_options: HostToolingOptions | None = None,
 ) -> HostAdmissionService:
     """创建默认依赖装配的内部 admission service。
 
@@ -686,6 +897,8 @@ def create_host_admission_service(
             if projection_catchup_port is not None
             else NoopProjectionCatchupPort()
         ),
+        ordinary_run_baseline=ordinary_run_baseline,
+        tooling_options=tooling_options,
     )
 
 
@@ -845,6 +1058,7 @@ class _SubmitFollowupQueueOperation:
 
     admission_input: SubmitFollowupQueueAdmissionInput
     caller_semantic_digest: str
+    effective_facts: _ResolvedFollowupEffectiveFacts
     event_log_store: EventLogStore
     idempotency_store: IdempotencyStore
     clock: AdmissionClock
@@ -875,7 +1089,8 @@ class _SubmitFollowupQueueOperation:
         _require_open_session(transaction, request.session_id)
         active = read_active_run_for_session(transaction, request.session_id)
         create_request = _CreateAdmissionRequest.from_followup_queue_input(
-            self.admission_input
+            self.admission_input,
+            effective_facts=self.effective_facts,
         )
         if active is not None:
             return _create_queued_admission_result(
@@ -900,6 +1115,291 @@ class _SubmitFollowupQueueOperation:
             semantic_digest=semantic_digest,
             scope=scope,
             queue_policy=AdmissionPolicy.QUEUE.value,
+        )
+
+
+@dataclass(frozen=True, slots=True)
+class _SubmitFollowupSteerOperation:
+    """submit_followup(steer) transaction body。"""
+
+    request: SubmitFollowupRequest
+    caller_semantic_digest: str
+    event_log_store: EventLogStore
+    idempotency_store: IdempotencyStore
+    clock: AdmissionClock
+    id_factory: AdmissionIdFactory
+    ordinary_run_baseline: OrdinaryRunExecutionBaseline | None
+    tooling_options: HostToolingOptions | None
+
+    def __call__(self, transaction: HostTransaction) -> SteerAdmissionResult:
+        """执行 follow-up steer admission transaction。
+
+        :param transaction: 当前 Host transaction。
+        :returns: steer admission 结果。
+        :raises HostApiError: 目标 Run 前置条件或幂等失败时抛出。
+        """
+
+        semantic_digest = _followup_steer_semantic_digest(
+            self.request, caller_semantic_digest=self.caller_semantic_digest
+        )
+        scope = _idempotency_scope(
+            operation=_OPERATION_SUBMIT_FOLLOWUP_STEER,
+            scope_id=self.request.session_id,
+            idempotency_key=self.request.client_request_id,
+        )
+        existing = self.idempotency_store.read_idempotency_record(transaction, scope)
+        if existing is not None:
+            _raise_if_digest_conflict(existing, semantic_digest)
+            return _idempotent_steer_result(transaction, existing)
+        target_run = _require_steer_target_run(transaction, self.request)
+        current_attempt = _require_current_attempt_for_steer(
+            transaction, target_run
+        )
+        now = self.clock.now()
+        effective_facts = _resolve_followup_effective_facts(
+            self.request,
+            baseline=self.ordinary_run_baseline,
+            tooling_options=self.tooling_options,
+        )
+        create_request = _CreateAdmissionRequest.from_followup_steer(
+            self.request,
+            execution_target=target_run.execution_target,
+            effective_facts=effective_facts,
+        )
+        input_event = _append_user_input_event(
+            transaction=transaction,
+            event_log_store=self.event_log_store,
+            request=create_request,
+            run_id=target_run.run_id,
+            event_id=self.id_factory.new_id(_EVENT_ID_PREFIX),
+            occurred_at=now,
+        )
+        steer_event = _append_steer_requested_event(
+            transaction=transaction,
+            event_log_store=self.event_log_store,
+            request=self.request,
+            target_run=target_run,
+            current_attempt=current_attempt,
+            event_id=self.id_factory.new_id(_EVENT_ID_PREFIX),
+            occurred_at=now,
+        )
+        if target_run.status == RunStatus.RUNNING:
+            steered_event = _append_attempt_steered_event(
+                transaction=transaction,
+                event_log_store=self.event_log_store,
+                request=self.request,
+                target_run=target_run,
+                current_attempt=current_attempt,
+                event_id=self.id_factory.new_id(_EVENT_ID_PREFIX),
+                occurred_at=now,
+                steer_event=steer_event,
+            )
+            attempt_result = steer_running_attempt_row(
+                transaction,
+                attempt_id=current_attempt.attempt_id,
+                terminal_event_id=steered_event.event_id,
+                terminal_event_sequence=steered_event.event_sequence,
+                terminal_at=format_utc_timestamp(now),
+            )
+            if attempt_result.status != StateMutationStatus.UPDATED:
+                raise HostApiError(
+                    code=HostApiErrorCode.INVALID_STATE,
+                    message="Run terminal race won before steer",
+                    retryable=False,
+                )
+        else:
+            wait_result = cancel_active_wait_records_for_run(
+                transaction,
+                run_id=target_run.run_id,
+                updated_event_id=steer_event.event_id,
+                updated_event_sequence=steer_event.event_sequence,
+                updated_at=format_utc_timestamp(now),
+                terminal_at=format_utc_timestamp(now),
+            )
+            if wait_result.status != StateMutationStatus.UPDATED:
+                raise HostApiError(
+                    code=HostApiErrorCode.INVALID_STATE,
+                    message="WAITING Run has no active wait to steer",
+                    retryable=False,
+                )
+        return _create_steer_attempt_result(
+            transaction=transaction,
+            event_log_store=self.event_log_store,
+            idempotency_store=self.idempotency_store,
+            id_factory=self.id_factory,
+            request=self.request,
+            semantic_digest=semantic_digest,
+            scope=scope,
+            target_run=target_run,
+            previous_attempt=current_attempt,
+            input_event=input_event,
+            steer_event=steer_event,
+            occurred_at=now,
+        )
+
+
+@dataclass(frozen=True, slots=True)
+class _RetryRunOperation:
+    """retry_run transaction body。"""
+
+    run_id: str
+    request: RetryRunRequest
+    caller_semantic_digest: str
+    event_log_store: EventLogStore
+    idempotency_store: IdempotencyStore
+    clock: AdmissionClock
+    id_factory: AdmissionIdFactory
+
+    def __call__(self, transaction: HostTransaction) -> RunAdmissionResult:
+        """执行 retry_run admission transaction。
+
+        :param transaction: 当前 Host transaction。
+        :returns: 关联新 Run admission 结果。
+        :raises HostApiError: 源 Run 前置条件、幂等或 policy limit 失败时抛出。
+        """
+
+        semantic_digest = _retry_run_semantic_digest(
+            self.run_id,
+            self.request,
+            caller_semantic_digest=self.caller_semantic_digest,
+        )
+        scope = _idempotency_scope(
+            operation=_OPERATION_RETRY_RUN,
+            scope_id=self.run_id,
+            idempotency_key=self.request.client_request_id,
+        )
+        existing = self.idempotency_store.read_idempotency_record(transaction, scope)
+        if existing is not None:
+            _raise_if_digest_conflict(existing, semantic_digest)
+            return _idempotent_run_result(transaction, existing)
+        source_run = _require_source_run_for_relation(
+            transaction,
+            run_id=self.run_id,
+            expected_status=RunStatus.FAILED,
+            operation_name=_OPERATION_RETRY_RUN,
+        )
+        if (
+            count_runs_by_source_relation(
+                transaction,
+                source_run_id=source_run.run_id,
+                source_run_relation=SourceRunRelation.RETRY,
+            )
+            >= _MAX_ORDINARY_RETRY_RUNS_PER_SOURCE
+        ):
+            raise HostApiError(
+                code=HostApiErrorCode.INVALID_STATE,
+                message="retry_run policy limit reached for source Run",
+                retryable=False,
+            )
+        source_input_payload = _source_input_payload(
+            transaction, self.event_log_store, source_run
+        )
+        control_event = _append_source_relation_requested_event(
+            transaction=transaction,
+            event_log_store=self.event_log_store,
+            source_run=source_run,
+            event_id=self.id_factory.new_id(_EVENT_ID_PREFIX),
+            event_type=_EVENT_TYPE_RETRY_REQUESTED,
+            occurred_at=self.clock.now(),
+            actor=self.request.context.actor,
+            source=self.request.context.source,
+            client_request_id=self.request.client_request_id,
+            reason=self.request.reason,
+            repair_instruction=None,
+        )
+        return _create_source_related_admission_result(
+            transaction=transaction,
+            event_log_store=self.event_log_store,
+            idempotency_store=self.idempotency_store,
+            clock=self.clock,
+            id_factory=self.id_factory,
+            request=_CreateAdmissionRequest.from_source_run_retry(
+                source_run=source_run,
+                request=self.request,
+                source_input_payload=source_input_payload,
+            ),
+            semantic_digest=semantic_digest,
+            scope=scope,
+            source_run=source_run,
+            source_relation=SourceRunRelation.RETRY,
+            control_event=control_event,
+        )
+
+
+@dataclass(frozen=True, slots=True)
+class _ReplayRunOperation:
+    """replay_run transaction body。"""
+
+    run_id: str
+    request: ReplayRunRequest
+    caller_semantic_digest: str
+    event_log_store: EventLogStore
+    idempotency_store: IdempotencyStore
+    clock: AdmissionClock
+    id_factory: AdmissionIdFactory
+    ordinary_run_baseline: OrdinaryRunExecutionBaseline | None
+
+    def __call__(self, transaction: HostTransaction) -> RunAdmissionResult:
+        """执行 replay_run admission transaction。
+
+        :param transaction: 当前 Host transaction。
+        :returns: 关联新 Run admission 结果。
+        :raises HostApiError: 源 Run 前置条件或幂等失败时抛出。
+        """
+
+        semantic_digest = _replay_run_semantic_digest(
+            self.run_id,
+            self.request,
+            caller_semantic_digest=self.caller_semantic_digest,
+        )
+        scope = _idempotency_scope(
+            operation=_OPERATION_REPLAY_RUN,
+            scope_id=self.run_id,
+            idempotency_key=self.request.client_request_id,
+        )
+        existing = self.idempotency_store.read_idempotency_record(transaction, scope)
+        if existing is not None:
+            _raise_if_digest_conflict(existing, semantic_digest)
+            return _idempotent_run_result(transaction, existing)
+        source_run = _require_source_run_for_relation(
+            transaction,
+            run_id=self.run_id,
+            expected_status=RunStatus.SUCCEEDED,
+            operation_name=_OPERATION_REPLAY_RUN,
+        )
+        source_input_payload = _source_input_payload(
+            transaction, self.event_log_store, source_run
+        )
+        control_event = _append_source_relation_requested_event(
+            transaction=transaction,
+            event_log_store=self.event_log_store,
+            source_run=source_run,
+            event_id=self.id_factory.new_id(_EVENT_ID_PREFIX),
+            event_type=_EVENT_TYPE_REPLAY_REQUESTED,
+            occurred_at=self.clock.now(),
+            actor=self.request.context.actor,
+            source=self.request.context.source,
+            client_request_id=self.request.client_request_id,
+            reason=self.request.reason,
+            repair_instruction=self.request.repair_instruction,
+        )
+        return _create_source_related_admission_result(
+            transaction=transaction,
+            event_log_store=self.event_log_store,
+            idempotency_store=self.idempotency_store,
+            clock=self.clock,
+            id_factory=self.id_factory,
+            request=_CreateAdmissionRequest.from_source_run_replay(
+                source_run=source_run,
+                request=self.request,
+                source_input_payload=source_input_payload,
+                baseline=self.ordinary_run_baseline,
+            ),
+            semantic_digest=semantic_digest,
+            scope=scope,
+            source_run=source_run,
+            source_relation=SourceRunRelation.REPLAY,
+            control_event=control_event,
         )
 
 
@@ -1043,7 +1543,7 @@ class _CancelRunOperation:
                 scope=scope,
             )
         if _is_terminal_run_status(run.status):
-            return self._record_terminal_replay(
+            return self._record_terminal_cancel_ack(
                 transaction=transaction,
                 run=run,
                 semantic_digest=semantic_digest,
@@ -1316,7 +1816,7 @@ class _CancelRunOperation:
             released_active_slot=True,
         )
 
-    def _record_terminal_replay(
+    def _record_terminal_cancel_ack(
         self,
         *,
         transaction: HostTransaction,
@@ -1710,11 +2210,14 @@ class _CreateAdmissionRequest:
     session_id: str
     client_request_id: str
     input: HostInput
+    system_prompt: str | None
     execution_target: str
     actor: str
     source: str
     call_context_digest: str
     operation_kind: str
+    effective_execution_config: JsonValue | None
+    effective_tool_set: JsonValue | None
 
     @classmethod
     def from_start_request(cls, request: StartRunRequest) -> "_CreateAdmissionRequest":
@@ -1728,16 +2231,22 @@ class _CreateAdmissionRequest:
             session_id=request.session_id,
             client_request_id=request.client_request_id,
             input=request.input,
+            system_prompt=None,
             execution_target=request.execution_target,
             actor=request.context.actor,
             source=request.context.source,
             call_context_digest=_call_context_digest(request.context),
             operation_kind=_OPERATION_START_RUN,
+            effective_execution_config=None,
+            effective_tool_set=None,
         )
 
     @classmethod
     def from_followup_queue_input(
-        cls, admission_input: SubmitFollowupQueueAdmissionInput
+        cls,
+        admission_input: SubmitFollowupQueueAdmissionInput,
+        *,
+        effective_facts: _ResolvedFollowupEffectiveFacts,
     ) -> "_CreateAdmissionRequest":
         """从 follow-up queue input 构造归一化创建输入。
 
@@ -1749,12 +2258,129 @@ class _CreateAdmissionRequest:
         return cls(
             session_id=request.session_id,
             client_request_id=request.client_request_id,
-            input=request.input,
+            input=HostInput(
+                display_text=request.user_prompt,
+                payload_ref=None,
+                payload_digest=None,
+            ),
+            system_prompt=request.system_prompt,
             execution_target=admission_input.resolved_execution_target,
             actor=request.context.actor,
             source=request.context.source,
             call_context_digest=_call_context_digest(request.context),
             operation_kind=_OPERATION_SUBMIT_FOLLOWUP_QUEUE,
+            effective_execution_config=effective_facts.effective_execution_config,
+            effective_tool_set=effective_facts.effective_tool_set,
+        )
+
+    @classmethod
+    def from_followup_steer(
+        cls,
+        request: SubmitFollowupRequest,
+        *,
+        execution_target: str,
+        effective_facts: _ResolvedFollowupEffectiveFacts,
+    ) -> "_CreateAdmissionRequest":
+        """从 follow-up steer request 构造归一化输入。
+
+        :param request: follow-up steer request。
+        :param execution_target: 目标 Run 已冻结执行目标。
+        :param effective_facts: 已解析的 execution / tool 冻结事实。
+        :returns: 归一化创建输入。
+        """
+
+        return cls(
+            session_id=request.session_id,
+            client_request_id=request.client_request_id,
+            input=HostInput(
+                display_text=request.user_prompt,
+                payload_ref=None,
+                payload_digest=None,
+            ),
+            system_prompt=request.system_prompt,
+            execution_target=execution_target,
+            actor=request.context.actor,
+            source=request.context.source,
+            call_context_digest=_call_context_digest(request.context),
+            operation_kind=_OPERATION_SUBMIT_FOLLOWUP_STEER,
+            effective_execution_config=effective_facts.effective_execution_config,
+            effective_tool_set=effective_facts.effective_tool_set,
+        )
+
+    @classmethod
+    def from_source_run_retry(
+        cls,
+        *,
+        source_run: RunRow,
+        request: RetryRunRequest,
+        source_input_payload: JsonValue,
+    ) -> "_CreateAdmissionRequest":
+        """从源 Run 与 retry 请求构造关联新 Run 创建输入。
+
+        :param source_run: 已校验的 FAILED 源 Run。
+        :param request: retry run 请求。
+        :param source_input_payload: 源 Run ``USER_INPUT_ACCEPTED`` payload。
+        :returns: 归一化创建输入。
+        """
+
+        payload = _require_payload_mapping(source_input_payload)
+        return cls(
+            session_id=source_run.session_id,
+            client_request_id=request.client_request_id,
+            input=HostInput(
+                display_text=_required_payload_text(payload, "display_text"),
+                payload_ref=None,
+                payload_digest=None,
+            ),
+            system_prompt=_optional_payload_text(payload, "system_prompt"),
+            execution_target=source_run.execution_target,
+            actor=request.context.actor,
+            source=request.context.source,
+            call_context_digest=_call_context_digest(request.context),
+            operation_kind=_OPERATION_RETRY_RUN,
+            effective_execution_config=payload.get("effective_execution_config"),
+            effective_tool_set=payload.get("effective_tool_set"),
+        )
+
+    @classmethod
+    def from_source_run_replay(
+        cls,
+        *,
+        source_run: RunRow,
+        request: ReplayRunRequest,
+        source_input_payload: JsonValue,
+        baseline: OrdinaryRunExecutionBaseline | None,
+    ) -> "_CreateAdmissionRequest":
+        """从源 Run 与 replay 请求构造 no-tool 结构修复创建输入。
+
+        :param source_run: 已校验的 SUCCEEDED 源 Run。
+        :param request: replay run 请求。
+        :param source_input_payload: 源 Run ``USER_INPUT_ACCEPTED`` payload。
+        :param baseline: opener ordinary Run baseline；源 Run 缺少冻结配置时使用。
+        :returns: 归一化创建输入。
+        :raises HostApiError: 无法取得 replay execution baseline 时抛出。
+        """
+
+        payload = _require_payload_mapping(source_input_payload)
+        return cls(
+            session_id=source_run.session_id,
+            client_request_id=request.client_request_id,
+            input=HostInput(
+                display_text=request.repair_instruction,
+                payload_ref=None,
+                payload_digest=None,
+            ),
+            system_prompt=_optional_payload_text(payload, "system_prompt"),
+            execution_target=source_run.execution_target,
+            actor=request.context.actor,
+            source=request.context.source,
+            call_context_digest=_call_context_digest(request.context),
+            operation_kind=_OPERATION_REPLAY_RUN,
+            effective_execution_config=_replay_effective_execution_config(
+                payload.get("effective_execution_config"),
+                baseline=baseline,
+            ),
+            effective_tool_set=_no_tool_effective_tool_set_json(),
         )
 
 
@@ -2013,6 +2639,248 @@ def _create_queued_admission_result(
     )
 
 
+def _create_source_related_admission_result(
+    *,
+    transaction: HostTransaction,
+    event_log_store: EventLogStore,
+    idempotency_store: IdempotencyStore,
+    clock: AdmissionClock,
+    id_factory: AdmissionIdFactory,
+    request: _CreateAdmissionRequest,
+    semantic_digest: str,
+    scope: IdempotencyScope,
+    source_run: RunRow,
+    source_relation: SourceRunRelation,
+    control_event: EventLogRow,
+) -> RunAdmissionResult:
+    """创建 retry / replay 关联新 Run 并写入源关系。
+
+    :param transaction: 当前 Host transaction。
+    :param event_log_store: EventLog primitive。
+    :param idempotency_store: idempotency primitive。
+    :param clock: admission clock。
+    :param id_factory: admission id factory。
+    :param request: 归一化创建输入。
+    :param semantic_digest: semantic input digest。
+    :param scope: 幂等 scope。
+    :param source_run: 源 Run row。
+    :param source_relation: retry 或 replay 源关系。
+    :param control_event: 已追加的控制请求事件。
+    :returns: admission 结果。
+    :raises HostApiError: 源关系写入 CAS 失败时抛出。
+    """
+
+    active = read_active_run_for_session(transaction, request.session_id)
+    result = (
+        _create_queued_admission_result(
+            transaction=transaction,
+            event_log_store=event_log_store,
+            idempotency_store=idempotency_store,
+            clock=clock,
+            id_factory=id_factory,
+            request=request,
+            semantic_digest=semantic_digest,
+            scope=scope,
+            queue_policy=AdmissionPolicy.QUEUE.value,
+            active_run_id=active.run_id,
+        )
+        if active is not None
+        else _create_accepted_admission_result(
+            transaction=transaction,
+            event_log_store=event_log_store,
+            idempotency_store=idempotency_store,
+            clock=clock,
+            id_factory=id_factory,
+            request=request,
+            semantic_digest=semantic_digest,
+            scope=scope,
+            queue_policy=AdmissionPolicy.QUEUE.value,
+        )
+    )
+    relation_result = set_new_run_source_relation_row(
+        transaction,
+        run_id=result.run.run_id,
+        expected_status=result.run.status,
+        source_run_id=source_run.run_id,
+        source_run_relation=source_relation,
+        updated_at=format_utc_timestamp(clock.now()),
+    )
+    if relation_result.status != StateMutationStatus.UPDATED:
+        raise HostApiError(
+            code=HostApiErrorCode.INTERNAL_ERROR,
+            message="related Run source relation was not recorded",
+            retryable=False,
+        )
+    updated_run = _require_transition_run(relation_result.row)
+    return RunAdmissionResult(
+        run=updated_run,
+        attempt=result.attempt,
+        dispatch_record=result.dispatch_record,
+        pending_dispatch=result.pending_dispatch,
+        created=result.created,
+        queued=result.queued,
+        attached_active=result.attached_active,
+        idempotent_replay=result.idempotent_replay,
+    )
+
+
+def _create_steer_attempt_result(
+    *,
+    transaction: HostTransaction,
+    event_log_store: EventLogStore,
+    idempotency_store: IdempotencyStore,
+    id_factory: AdmissionIdFactory,
+    request: SubmitFollowupRequest,
+    semantic_digest: str,
+    scope: IdempotencyScope,
+    target_run: RunRow,
+    previous_attempt: AttemptRow,
+    input_event: EventLogRow,
+    steer_event: EventLogRow,
+    occurred_at: datetime,
+) -> SteerAdmissionResult:
+    """创建 steer 新 Attempt、切换 Run 并记录幂等结果。
+
+    :param transaction: 当前 Host transaction。
+    :param event_log_store: EventLog primitive。
+    :param idempotency_store: idempotency primitive。
+    :param id_factory: admission id factory。
+    :param request: steer 请求。
+    :param semantic_digest: semantic input digest。
+    :param scope: 幂等 scope。
+    :param target_run: steer 目标 Run。
+    :param previous_attempt: 旧 current Attempt。
+    :param input_event: 新 steer 输入事件。
+    :param steer_event: ``STEER_REQUESTED`` 事件。
+    :param occurred_at: 事件发生时间。
+    :returns: steer admission 结果。
+    :raises HostApiError: Run 切换 CAS 失败时抛出。
+    """
+
+    attempt_id = id_factory.new_id(_ATTEMPT_ID_PREFIX)
+    execution_id = id_factory.new_id(_EXECUTION_ID_PREFIX)
+    dispatch_record_id = id_factory.new_id(_DISPATCH_RECORD_ID_PREFIX)
+    run_started_event = _append_steer_run_started_event(
+        transaction=transaction,
+        event_log_store=event_log_store,
+        request=request,
+        target_run=target_run,
+        attempt_id=attempt_id,
+        dispatch_record_id=dispatch_record_id,
+        event_id=id_factory.new_id(_EVENT_ID_PREFIX),
+        occurred_at=occurred_at,
+        steer_event=steer_event,
+    )
+    attempt_started_event = _append_steer_attempt_started_event(
+        transaction=transaction,
+        event_log_store=event_log_store,
+        request=request,
+        target_run=target_run,
+        attempt_id=attempt_id,
+        execution_id=execution_id,
+        event_id=id_factory.new_id(_EVENT_ID_PREFIX),
+        occurred_at=occurred_at,
+        steer_event=steer_event,
+    )
+    timestamp = format_utc_timestamp(occurred_at)
+    attempt = AttemptRow(
+        attempt_id=attempt_id,
+        run_id=target_run.run_id,
+        execution_id=execution_id,
+        status=AttemptStatus.STARTING,
+        started_event_id=attempt_started_event.event_id,
+        started_event_sequence=attempt_started_event.event_sequence,
+        terminal_event_id=None,
+        terminal_event_sequence=None,
+        created_at=timestamp,
+        updated_at=timestamp,
+        terminal_at=None,
+    )
+    dispatch_record = DispatchRecordRow(
+        dispatch_record_id=dispatch_record_id,
+        run_id=target_run.run_id,
+        attempt_id=attempt_id,
+        execution_id=execution_id,
+        status=DispatchRecordStatus.PENDING,
+        worker_kind=WorkerKind.LOCAL,
+        execution_target=target_run.execution_target,
+        owner_host_instance_id=None,
+        created_event_id=attempt_started_event.event_id,
+        created_event_sequence=attempt_started_event.event_sequence,
+        waiting_for_lane_at=None,
+        lane_name=None,
+        lane_claim_id=None,
+        lane_owner_id=None,
+        lane_acquired_at=None,
+        dispatching_at=None,
+        worker_accepted_at=None,
+        worker_accept_event_id=None,
+        worker_accept_event_sequence=None,
+        cancelled_event_id=None,
+        cancelled_event_sequence=None,
+        created_at=timestamp,
+        updated_at=timestamp,
+        cancelled_at=None,
+    )
+    insert_attempt(transaction, attempt)
+    run_result = steer_active_run_row(
+        transaction,
+        session_id=target_run.session_id,
+        run_id=target_run.run_id,
+        previous_attempt_id=previous_attempt.attempt_id,
+        next_attempt_id=attempt_id,
+        input_event_id=input_event.event_id,
+        input_event_sequence=input_event.event_sequence,
+        started_event_id=run_started_event.event_id,
+        started_event_sequence=run_started_event.event_sequence,
+        updated_at=timestamp,
+    )
+    if run_result.status != StateMutationStatus.UPDATED:
+        raise HostApiError(
+            code=HostApiErrorCode.INVALID_STATE,
+            message="Run terminal race won before steer",
+            retryable=False,
+        )
+    insert_dispatch_record(transaction, dispatch_record)
+    idempotency_store.record_idempotent_result(
+        transaction,
+        scope,
+        semantic_digest,
+        IdempotencyResultRef(
+            result_kind=_IDEMPOTENCY_RESULT_KIND_RUN,
+            result_ref=target_run.run_id,
+            created_event_id=input_event.event_id,
+            created_event_sequence=input_event.event_sequence,
+        ),
+    )
+    updated_run = _require_transition_run(run_result.row)
+    stored_dispatch = _read_current_dispatch_record(transaction, updated_run)
+    if stored_dispatch is None:
+        raise HostApiError(
+            code=HostApiErrorCode.INTERNAL_ERROR,
+            message="Steer Run current dispatch record is missing",
+            retryable=False,
+        )
+    return SteerAdmissionResult(
+        run=updated_run,
+        attempt=_read_current_attempt(transaction, updated_run),
+        dispatch_record=stored_dispatch,
+        pending_dispatch=_pending_dispatch_from_row(stored_dispatch),
+        steered_cancel_target=(
+            ActiveCancelTarget(
+                run_id=target_run.run_id,
+                attempt_id=previous_attempt.attempt_id,
+                execution_id=previous_attempt.execution_id,
+                reason="steered",
+            )
+            if previous_attempt.status == AttemptStatus.RUNNING
+            else None
+        ),
+        input_event_id=input_event.event_id,
+        idempotent_replay=False,
+    )
+
+
 def _append_user_input_event(
     *,
     transaction: HostTransaction,
@@ -2033,6 +2901,17 @@ def _append_user_input_event(
     :returns: 已持久化 EventLog row。
     """
 
+    payload = _user_input_payload(request)
+    descriptor = _write_user_input_payload_if_needed(
+        transaction=transaction,
+        payload=payload,
+        event_id=event_id,
+    )
+    event_payload = (
+        payload
+        if descriptor is None
+        else _referenced_user_input_event_payload(request)
+    )
     return event_log_store.append_event(
         transaction,
         EventLogAppendRequest(
@@ -2050,19 +2929,370 @@ def _append_user_input_event(
             idempotency_key=request.client_request_id,
             policy_decision=None,
             reason=None,
+            payload_json=event_payload,
+            payload_ref=None if descriptor is None else descriptor.payload_ref,
+            payload_digest=None if descriptor is None else descriptor.payload_digest,
+        ),
+    ).row
+
+
+def _user_input_payload(request: _CreateAdmissionRequest) -> Mapping[str, JsonValue]:
+    """构造完整 ``USER_INPUT_ACCEPTED`` payload。
+
+    :param request: 归一化创建输入。
+    :returns: 完整 payload object。
+    """
+
+    return {
+        "input_ref": request.input.payload_ref,
+        "input_digest": _input_digest(request.input),
+        "display_text": request.input.display_text,
+        "system_prompt": request.system_prompt,
+        "user_prompt": request.input.display_text,
+        "payload_ref": request.input.payload_ref,
+        "payload_digest": request.input.payload_digest,
+        "operation_kind": request.operation_kind,
+        "call_context_digest": request.call_context_digest,
+        "effective_execution_config": request.effective_execution_config,
+        "effective_tool_set": request.effective_tool_set,
+    }
+
+
+def _write_user_input_payload_if_needed(
+    *,
+    transaction: HostTransaction,
+    payload: Mapping[str, JsonValue],
+    event_id: str,
+) -> PayloadDescriptor | None:
+    """超出 inline 阈值时把用户输入 payload 写入 SQLite payload 表。
+
+    :param transaction: 当前 Host transaction。
+    :param payload: 完整用户输入 payload。
+    :param event_id: 对应 EventLog event id。
+    :returns: payload descriptor；未超阈值时为 ``None``。
+    :raises HostDurableError: payload 编码或写入失败时抛出。
+    """
+
+    encoded = canonical_json_dumps(payload)
+    if len(encoded.encode("utf-8")) <= transaction.payload_inline_threshold_bytes:
+        return None
+    return PayloadStore().write_sqlite_payload(
+        transaction,
+        SQLitePayloadWriteRequest(
+            payload_ref=f"payload-user-input-{event_id}",
+            payload_id=f"sqlite-payload-user-input-{event_id}",
+            payload_format=SQLitePayloadFormat.CANONICAL_JSON,
+            payload_json=payload,
+            payload_bytes=None,
+            media_type="application/json",
+            metadata={"kind": "user_input_accepted"},
+            expected_digest=None,
+        ),
+    )
+
+
+def _referenced_user_input_event_payload(
+    request: _CreateAdmissionRequest,
+) -> Mapping[str, JsonValue]:
+    """构造引用大 payload 的轻量 EventLog inline payload。
+
+    :param request: 归一化创建输入。
+    :returns: 可内联保存的轻量 payload object。
+    """
+
+    return {
+        "input_ref": request.input.payload_ref,
+        "input_digest": _input_digest(request.input),
+        "payload_ref": request.input.payload_ref,
+        "payload_digest": request.input.payload_digest,
+        "operation_kind": request.operation_kind,
+        "call_context_digest": request.call_context_digest,
+    }
+
+
+def _append_source_relation_requested_event(
+    *,
+    transaction: HostTransaction,
+    event_log_store: EventLogStore,
+    source_run: RunRow,
+    event_id: str,
+    event_type: str,
+    occurred_at: datetime,
+    actor: str,
+    source: str,
+    client_request_id: str,
+    reason: str,
+    repair_instruction: str | None,
+) -> EventLogRow:
+    """追加 retry / replay 控制请求 canonical fact。
+
+    :param transaction: 当前 Host transaction。
+    :param event_log_store: EventLog primitive。
+    :param source_run: 源 Run row。
+    :param event_id: 本次控制事件 id。
+    :param event_type: ``RETRY_REQUESTED`` 或 ``REPLAY_REQUESTED``。
+    :param occurred_at: 事件发生时间。
+    :param actor: 事件 actor。
+    :param source: 事件 source。
+    :param client_request_id: 控制命令幂等 id。
+    :param reason: 控制原因。
+    :param repair_instruction: replay 修复指令；retry 时为 ``None``。
+    :returns: 已持久化 EventLog row。
+    """
+
+    return event_log_store.append_event(
+        transaction,
+        EventLogAppendRequest(
+            event_id=event_id,
+            event_class=EventClass.CANONICAL_FACT,
+            session_id=source_run.session_id,
+            run_id=source_run.run_id,
+            attempt_id=source_run.current_attempt_id,
+            execution_id=None,
+            event_type=event_type,
+            occurred_at=occurred_at,
+            actor=actor,
+            source=source,
+            client_request_id=client_request_id,
+            idempotency_key=client_request_id,
+            policy_decision=None,
+            reason={"reason": reason},
             payload_json={
-                "input_ref": request.input.payload_ref,
-                "input_digest": _input_digest(request.input),
-                "display_text": request.input.display_text,
-                "payload_ref": request.input.payload_ref,
-                "payload_digest": request.input.payload_digest,
-                "operation_kind": request.operation_kind,
-                "call_context_digest": request.call_context_digest,
+                "source_run_id": source_run.run_id,
+                "source_status": source_run.status.value,
+                "reason": reason,
+                "repair_instruction": repair_instruction,
             },
             payload_ref=None,
             payload_digest=None,
         ),
     ).row
+
+
+def _append_steer_requested_event(
+    *,
+    transaction: HostTransaction,
+    event_log_store: EventLogStore,
+    request: SubmitFollowupRequest,
+    target_run: RunRow,
+    current_attempt: AttemptRow,
+    event_id: str,
+    occurred_at: datetime,
+) -> EventLogRow:
+    """追加 ``STEER_REQUESTED`` canonical fact。
+
+    :param transaction: 当前 Host transaction。
+    :param event_log_store: EventLog primitive。
+    :param request: steer 请求。
+    :param target_run: 目标 Run。
+    :param current_attempt: 旧 current Attempt。
+    :param event_id: 事件 id。
+    :param occurred_at: 事件时间。
+    :returns: 已持久化 EventLog row。
+    """
+
+    return event_log_store.append_event(
+        transaction,
+        EventLogAppendRequest(
+            event_id=event_id,
+            event_class=EventClass.CANONICAL_FACT,
+            session_id=target_run.session_id,
+            run_id=target_run.run_id,
+            attempt_id=current_attempt.attempt_id,
+            execution_id=current_attempt.execution_id,
+            event_type=_EVENT_TYPE_STEER_REQUESTED,
+            occurred_at=occurred_at,
+            actor=request.context.actor,
+            source=request.context.source,
+            client_request_id=request.client_request_id,
+            idempotency_key=request.client_request_id,
+            policy_decision=None,
+            reason={"reason": "user_steer"},
+            payload_json={
+                "target_run_id": target_run.run_id,
+                "previous_attempt_id": current_attempt.attempt_id,
+                "user_prompt": request.user_prompt,
+            },
+            payload_ref=None,
+            payload_digest=None,
+        ),
+    ).row
+
+
+def _append_attempt_steered_event(
+    *,
+    transaction: HostTransaction,
+    event_log_store: EventLogStore,
+    request: SubmitFollowupRequest,
+    target_run: RunRow,
+    current_attempt: AttemptRow,
+    event_id: str,
+    occurred_at: datetime,
+    steer_event: EventLogRow,
+) -> EventLogRow:
+    """追加 ``ATTEMPT_STEERED`` canonical fact。
+
+    :param transaction: 当前 Host transaction。
+    :param event_log_store: EventLog primitive。
+    :param request: steer 请求。
+    :param target_run: 目标 Run。
+    :param current_attempt: 被 steer 的 Attempt。
+    :param event_id: 事件 id。
+    :param occurred_at: 事件时间。
+    :param steer_event: ``STEER_REQUESTED`` 事件。
+    :returns: 已持久化 EventLog row。
+    """
+
+    return event_log_store.append_event(
+        transaction,
+        EventLogAppendRequest(
+            event_id=event_id,
+            event_class=EventClass.CANONICAL_FACT,
+            session_id=target_run.session_id,
+            run_id=target_run.run_id,
+            attempt_id=current_attempt.attempt_id,
+            execution_id=current_attempt.execution_id,
+            event_type=_EVENT_TYPE_ATTEMPT_STEERED,
+            occurred_at=occurred_at,
+            actor=request.context.actor,
+            source=request.context.source,
+            client_request_id=request.client_request_id,
+            idempotency_key=request.client_request_id,
+            policy_decision=None,
+            reason={"reason": "user_steer"},
+            payload_json={
+                "run_id": target_run.run_id,
+                "attempt_id": current_attempt.attempt_id,
+                "steer_requested_event_ref": _event_ref_json(steer_event),
+            },
+            payload_ref=None,
+            payload_digest=None,
+        ),
+    ).row
+
+
+def _append_steer_run_started_event(
+    *,
+    transaction: HostTransaction,
+    event_log_store: EventLogStore,
+    request: SubmitFollowupRequest,
+    target_run: RunRow,
+    attempt_id: str,
+    dispatch_record_id: str,
+    event_id: str,
+    occurred_at: datetime,
+    steer_event: EventLogRow,
+) -> EventLogRow:
+    """追加 steer 新 Attempt 的 ``RUN_STARTED`` canonical fact。
+
+    :param transaction: 当前 Host transaction。
+    :param event_log_store: EventLog primitive。
+    :param request: steer 请求。
+    :param target_run: 目标 Run。
+    :param attempt_id: 新 Attempt id。
+    :param dispatch_record_id: 新 dispatch record id。
+    :param event_id: 事件 id。
+    :param occurred_at: 事件时间。
+    :param steer_event: ``STEER_REQUESTED`` 事件。
+    :returns: 已持久化 EventLog row。
+    """
+
+    return event_log_store.append_event(
+        transaction,
+        EventLogAppendRequest(
+            event_id=event_id,
+            event_class=EventClass.CANONICAL_FACT,
+            session_id=target_run.session_id,
+            run_id=target_run.run_id,
+            attempt_id=None,
+            execution_id=None,
+            event_type=_EVENT_TYPE_RUN_STARTED,
+            occurred_at=occurred_at,
+            actor=request.context.actor,
+            source=request.context.source,
+            client_request_id=request.client_request_id,
+            idempotency_key=request.client_request_id,
+            policy_decision=None,
+            reason={"start_reason": RunStartReason.STEER.value},
+            payload_json={
+                "run_id": target_run.run_id,
+                "start_reason": RunStartReason.STEER.value,
+                "accepted_event_id": target_run.accepted_event_id,
+                "accepted_event_sequence": target_run.accepted_event_sequence,
+                "attempt_id": attempt_id,
+                "dispatch_record_id": dispatch_record_id,
+                "steer_requested_event_ref": _event_ref_json(steer_event),
+            },
+            payload_ref=None,
+            payload_digest=None,
+        ),
+    ).row
+
+
+def _append_steer_attempt_started_event(
+    *,
+    transaction: HostTransaction,
+    event_log_store: EventLogStore,
+    request: SubmitFollowupRequest,
+    target_run: RunRow,
+    attempt_id: str,
+    execution_id: str,
+    event_id: str,
+    occurred_at: datetime,
+    steer_event: EventLogRow,
+) -> EventLogRow:
+    """追加 steer 新 Attempt 的 ``ATTEMPT_STARTED`` canonical fact。
+
+    :param transaction: 当前 Host transaction。
+    :param event_log_store: EventLog primitive。
+    :param request: steer 请求。
+    :param target_run: 目标 Run。
+    :param attempt_id: 新 Attempt id。
+    :param execution_id: 新 execution id。
+    :param event_id: 事件 id。
+    :param occurred_at: 事件时间。
+    :param steer_event: ``STEER_REQUESTED`` 事件。
+    :returns: 已持久化 EventLog row。
+    """
+
+    return event_log_store.append_event(
+        transaction,
+        EventLogAppendRequest(
+            event_id=event_id,
+            event_class=EventClass.CANONICAL_FACT,
+            session_id=target_run.session_id,
+            run_id=target_run.run_id,
+            attempt_id=attempt_id,
+            execution_id=execution_id,
+            event_type=_EVENT_TYPE_ATTEMPT_STARTED,
+            occurred_at=occurred_at,
+            actor=request.context.actor,
+            source=request.context.source,
+            client_request_id=request.client_request_id,
+            idempotency_key=request.client_request_id,
+            policy_decision=None,
+            reason={"start_reason": RunStartReason.STEER.value},
+            payload_json={
+                "run_id": target_run.run_id,
+                "attempt_id": attempt_id,
+                "execution_id": execution_id,
+                "start_reason": RunStartReason.STEER.value,
+                "steer_requested_event_ref": _event_ref_json(steer_event),
+            },
+            payload_ref=None,
+            payload_digest=None,
+        ),
+    ).row
+
+
+def _event_ref_json(event: EventLogRow) -> JsonValue:
+    """构造 EventLog ref JSON。
+
+    :param event: EventLog row。
+    :returns: 事件引用 JSON。
+    """
+
+    return {"event_id": event.event_id, "event_sequence": event.event_sequence}
 
 
 def _parse_admission_policy(queue_policy: str) -> AdmissionPolicy:
@@ -2095,6 +3325,265 @@ def _validate_followup_queue_input(
         raise ValueError("resolved_execution_target must be non-empty")
 
 
+def _resolve_followup_effective_facts(
+    request: SubmitFollowupRequest,
+    *,
+    baseline: OrdinaryRunExecutionBaseline | None,
+    tooling_options: HostToolingOptions | None,
+) -> _ResolvedFollowupEffectiveFacts:
+    """解析并冻结 follow-up 的 effective execution config 与业务工具集合。
+
+    :param request: submit follow-up 请求。
+    :param baseline: opener ordinary Run baseline；低层 legacy handle 可能为 ``None``。
+    :param tooling_options: opener construction-time 工具选项。
+    :returns: 已解析的 effective facts。
+    :raises HostApiError: 缺少 opener baseline 或工具名未知时抛出。
+    :raises TypeError: RunnerSpec 中包含未知 provider request extension 时抛出。
+    """
+
+    if baseline is None:
+        raise HostApiError(
+            code=HostApiErrorCode.INVALID_STATE,
+            message="submit_followup requires an opener ordinary Run baseline",
+            retryable=False,
+        )
+    runner_spec = (
+        request.runner_spec if request.runner_spec is not None else baseline.runner_spec
+    )
+    runner_options = (
+        request.runner_options
+        if request.runner_options is not None
+        else baseline.runner_options
+    )
+    agent_policy = (
+        request.agent_policy
+        if request.agent_policy is not None
+        else baseline.agent_policy
+    )
+    execution_config = _effective_execution_config_json(
+        runner_spec=runner_spec,
+        runner_options=runner_options,
+        agent_policy=agent_policy,
+        runner_spec_source=_field_source(request.runner_spec is not None),
+        runner_options_source=_field_source(request.runner_options is not None),
+        agent_policy_source=_field_source(request.agent_policy is not None),
+    )
+    tool_set = _effective_tool_set_json(
+        request.tool_names,
+        tooling_options=tooling_options,
+    )
+    return _ResolvedFollowupEffectiveFacts(
+        effective_execution_config=execution_config,
+        effective_tool_set=tool_set,
+    )
+
+
+def _field_source(override_present: bool) -> str:
+    """返回 effective 字段的来源标识。
+
+    :param override_present: 请求是否显式提供 override。
+    :returns: ``request`` 或 ``opener_baseline``。
+    :raises: 无主动抛出。
+    """
+
+    if override_present:
+        return "request"
+    return "opener_baseline"
+
+
+def _effective_tool_set_json(
+    requested_tool_names: frozenset[str] | None,
+    *,
+    tooling_options: HostToolingOptions | None,
+) -> JsonValue:
+    """构造 effective business tool set 冻结 JSON。
+
+    :param requested_tool_names: 请求选择器。
+    :param tooling_options: construction-time 工具选项。
+    :returns: 可写入 EventLog 的 JSON mapping。
+    :raises HostApiError: 请求未知工具名时抛出。
+    :raises ValueError: 工具 bundle schema 字段非法时由底层转换抛出。
+    """
+
+    business_bundle = (
+        ToolBundle(definitions=())
+        if tooling_options is None
+        else tooling_options.business_tool_bundle
+    )
+    known_names = frozenset(
+        definition.name for definition in business_bundle.definitions
+    )
+    if requested_tool_names is None:
+        effective_names = known_names
+        selector = _TOOL_SELECTION_ALL
+    else:
+        unknown = requested_tool_names.difference(known_names)
+        if unknown:
+            raise HostApiError(
+                code=HostApiErrorCode.INVALID_STATE,
+                message=(
+                    "submit_followup tool_names contains unknown business tools: "
+                    + ",".join(sorted(unknown))
+                ),
+                retryable=False,
+            )
+        effective_names = requested_tool_names
+        selector = (
+            _TOOL_SELECTION_NONE
+            if not requested_tool_names
+            else _TOOL_SELECTION_SUBSET
+        )
+    selected_bundle = ToolBundle(
+        definitions=tuple(
+            definition
+            for definition in business_bundle.definitions
+            if definition.name in effective_names
+        )
+    )
+    schema_digest = _tool_schemas_digest(selected_bundle.to_tool_schemas())
+    source_refs_json: list[JsonValue] = []
+    if tooling_options is not None:
+        source_refs_json = [
+            {
+                "source_kind": source_ref.source_kind.value,
+                "source_id": source_ref.source_id,
+                "version_ref": source_ref.version_ref,
+                "content_digest": source_ref.content_digest,
+            }
+            for source_ref in tooling_options.source_refs
+        ]
+    tool_set: JsonValue = {
+        "tool_snapshot_ref": _TOOL_SNAPSHOT_REF_PREFIX + schema_digest,
+        "selector": selector,
+        "requested_business_tool_names": (
+            None
+            if requested_tool_names is None
+            else _sorted_text_json_array(requested_tool_names)
+        ),
+        "effective_business_tool_names": _sorted_text_json_array(effective_names),
+        "business_bundle_digest": _business_bundle_digest(business_bundle),
+        "effective_schema_digest": schema_digest,
+        "source_refs": source_refs_json,
+    }
+    return tool_set
+
+
+def _no_tool_effective_tool_set_json() -> JsonValue:
+    """构造 replay no-tool 的 effective tool set 冻结 JSON。
+
+    :returns: 表示禁用业务工具的 tool set JSON。
+    """
+
+    empty_bundle = ToolBundle(definitions=())
+    empty_schemas = empty_bundle.to_tool_schemas()
+    return {
+        "tool_snapshot_ref": _TOOL_SNAPSHOT_REF_PREFIX
+        + _tool_schemas_digest(empty_schemas),
+        "selector": _TOOL_SELECTION_NONE,
+        "requested_business_tool_names": [],
+        "effective_business_tool_names": [],
+        "business_bundle_digest": _business_bundle_digest(empty_bundle),
+        "effective_schema_digest": _tool_schemas_digest(empty_schemas),
+        "source_refs": [],
+    }
+
+
+def _replay_effective_execution_config(
+    source_execution_config: JsonValue | None,
+    *,
+    baseline: OrdinaryRunExecutionBaseline | None,
+) -> JsonValue:
+    """构造 replay 使用的 no-tool execution config。
+
+    :param source_execution_config: 源 Run 冻结 execution config。
+    :param baseline: opener ordinary Run baseline；源配置缺失时使用。
+    :returns: replay Run 写入 USER_INPUT_ACCEPTED 的 execution config JSON。
+    :raises HostApiError: 源配置缺失且无 opener baseline 时抛出。
+    """
+
+    if source_execution_config is None:
+        if baseline is None:
+            raise HostApiError(
+                code=HostApiErrorCode.INVALID_STATE,
+                message="replay_run requires source execution config",
+                retryable=False,
+            )
+        runner_spec = baseline.runner_spec
+        runner_options = baseline.runner_options
+        agent_policy = baseline.agent_policy
+    else:
+        snapshot = _effective_execution_snapshot_from_json(source_execution_config)
+        runner_spec = snapshot.runner_spec
+        runner_options = snapshot.runner_options
+        agent_policy = snapshot.agent_policy
+    return _effective_execution_config_json(
+        runner_spec=runner_spec,
+        runner_options=runner_options,
+        agent_policy=replace(agent_policy, allow_tool_calls=False),
+        runner_spec_source="source_run",
+        runner_options_source="source_run",
+        agent_policy_source="replay_no_tool",
+    )
+
+
+def _require_payload_mapping(payload: JsonValue) -> dict[str, JsonValue]:
+    """校验 payload 是 JSON object 并复制为 dict。
+
+    :param payload: payload JSON 值。
+    :returns: 字段映射副本。
+    :raises HostDurableError: payload 不是 object 时抛出。
+    """
+
+    if not isinstance(payload, dict):
+        raise HostDurableError("EventLog payload_json must be object")
+    return payload
+
+
+def _required_payload_text(payload: dict[str, JsonValue], field_name: str) -> str:
+    """读取必填文本 payload 字段。
+
+    :param payload: payload 字段映射。
+    :param field_name: 字段名。
+    :returns: 非空文本。
+    :raises HostDurableError: 字段缺失或不是非空文本时抛出。
+    """
+
+    value = payload.get(field_name)
+    if not isinstance(value, str) or value.strip() == "":
+        raise HostDurableError(f"payload field {field_name} must be text")
+    return value
+
+
+def _optional_payload_text(
+    payload: dict[str, JsonValue], field_name: str
+) -> str | None:
+    """读取可选文本 payload 字段。
+
+    :param payload: payload 字段映射。
+    :param field_name: 字段名。
+    :returns: 文本或 ``None``。
+    :raises HostDurableError: 字段存在但不是非空文本时抛出。
+    """
+
+    value = payload.get(field_name)
+    if value is None:
+        return None
+    if not isinstance(value, str) or value.strip() == "":
+        raise HostDurableError(f"payload field {field_name} must be text")
+    return value
+
+
+def _sorted_text_json_array(values: frozenset[str]) -> list[JsonValue]:
+    """把文本集合稳定投影为 JSON 数组。
+
+    :param values: 文本集合。
+    :returns: 排序后的 JSON 数组。
+    :raises: 无主动抛出。
+    """
+
+    return [value for value in sorted(values)]
+
+
 def _require_open_session(
     transaction: HostTransaction, session_id: str
 ) -> None:
@@ -2113,6 +3602,176 @@ def _require_open_session(
             message="Session is not open",
             retryable=False,
         )
+
+
+def _require_source_run_for_relation(
+    transaction: HostTransaction,
+    *,
+    run_id: str,
+    expected_status: RunStatus,
+    operation_name: str,
+) -> RunRow:
+    """读取并校验 retry / replay 源 Run。
+
+    :param transaction: 当前 Host transaction。
+    :param run_id: 源 Run id。
+    :param expected_status: 操作要求的源 Run 状态。
+    :param operation_name: public operation 名称，用于错误消息。
+    :returns: 已校验源 Run row。
+    :raises HostApiError: 源 Run 缺失、状态不符或所属 Session closed 时抛出。
+    """
+
+    run = read_run_by_id(transaction, run_id)
+    if run is None:
+        raise HostApiError(
+            code=HostApiErrorCode.NOT_FOUND,
+            message="Source Run not found",
+            retryable=False,
+        )
+    _require_open_session(transaction, run.session_id)
+    if run.status != expected_status:
+        raise HostApiError(
+            code=HostApiErrorCode.INVALID_STATE,
+            message=f"{operation_name} source Run state is invalid",
+            retryable=False,
+        )
+    return run
+
+
+def _require_steer_target_run(
+    transaction: HostTransaction, request: SubmitFollowupRequest
+) -> RunRow:
+    """读取并校验 steer 目标 Run。
+
+    :param transaction: 当前 Host transaction。
+    :param request: steer 请求。
+    :returns: 已校验目标 Run。
+    :raises HostApiError: 目标 Run 缺失、非当前 active 或状态非法时抛出。
+    """
+
+    target_run_id = request.target_run_id
+    if target_run_id is None:
+        raise HostApiError(
+            code=HostApiErrorCode.INVALID_STATE,
+            message="submit_followup steer requires target Run",
+            retryable=False,
+        )
+    _require_open_session(transaction, request.session_id)
+    target = read_run_by_id(transaction, target_run_id)
+    active = read_active_run_for_session(transaction, request.session_id)
+    if target is None or active is None or active.run_id != target_run_id:
+        raise HostApiError(
+            code=HostApiErrorCode.INVALID_STATE,
+            message="submit_followup steer target is not active",
+            retryable=False,
+            detail=_steer_conflict_detail(
+                target_run_id=target_run_id,
+                target=target,
+                active=active,
+            ),
+        )
+    if target.session_id != request.session_id:
+        raise HostApiError(
+            code=HostApiErrorCode.INVALID_STATE,
+            message="submit_followup steer target session mismatch",
+            retryable=False,
+            detail=_steer_conflict_detail(
+                target_run_id=target_run_id,
+                target=target,
+                active=active,
+            ),
+        )
+    if target.status not in (RunStatus.RUNNING, RunStatus.WAITING):
+        raise HostApiError(
+            code=HostApiErrorCode.INVALID_STATE,
+            message="submit_followup steer target state is invalid",
+            retryable=False,
+            detail=_steer_conflict_detail(
+                target_run_id=target_run_id,
+                target=target,
+                active=active,
+            ),
+        )
+    return target
+
+
+def _steer_conflict_detail(
+    *, target_run_id: str, target: RunRow | None, active: RunRow | None
+) -> SteerConflictDetail:
+    """构造 steer 前置条件冲突详情。
+
+    :param target_run_id: 调用方请求 steer 的目标 Run id。
+    :param target: durable 中读到的目标 Run；缺失时为 ``None``。
+    :param active: 同 Session 当前 active Run；缺失时为 ``None``。
+    :returns: typed steer 冲突详情。
+    """
+
+    return SteerConflictDetail(
+        target_run_id=target_run_id,
+        target_run_status=None if target is None else target.status,
+        current_active_run_id=None if active is None else active.run_id,
+        current_active_run_status=None if active is None else active.status,
+    )
+
+
+def _require_current_attempt_for_steer(
+    transaction: HostTransaction, run: RunRow
+) -> AttemptRow:
+    """读取并校验 steer 目标 Run 当前 Attempt。
+
+    :param transaction: 当前 Host transaction。
+    :param run: steer 目标 Run。
+    :returns: 当前 Attempt。
+    :raises HostApiError: Attempt 缺失或状态不符合 Run 状态时抛出。
+    """
+
+    attempt = _read_current_attempt(transaction, run)
+    if attempt is None:
+        raise HostApiError(
+            code=HostApiErrorCode.INTERNAL_ERROR,
+            message="Steer target Run has no current Attempt",
+            retryable=False,
+        )
+    if run.status == RunStatus.RUNNING and attempt.status != AttemptStatus.RUNNING:
+        raise HostApiError(
+            code=HostApiErrorCode.INVALID_STATE,
+            message="RUNNING steer target Attempt is not running",
+            retryable=False,
+        )
+    if run.status == RunStatus.WAITING and attempt.status != AttemptStatus.SUSPENDED:
+        raise HostApiError(
+            code=HostApiErrorCode.INVALID_STATE,
+            message="WAITING steer target Attempt is not suspended",
+            retryable=False,
+        )
+    return attempt
+
+
+def _source_input_payload(
+    transaction: HostTransaction,
+    event_log_store: EventLogStore,
+    source_run: RunRow,
+) -> JsonValue:
+    """读取源 Run 的 USER_INPUT_ACCEPTED payload。
+
+    :param transaction: 当前 Host transaction。
+    :param event_log_store: EventLog primitive。
+    :param source_run: 源 Run row。
+    :returns: 源输入 payload JSON。
+    :raises HostApiError: 源输入事件缺失或类型不匹配时抛出。
+    :raises HostDurableError: payload JSON 解析失败时抛出。
+    """
+
+    event = event_log_store.read_event_by_id(transaction, source_run.input_event_id)
+    if event is None or event.event_type != _EVENT_TYPE_USER_INPUT_ACCEPTED:
+        raise HostApiError(
+            code=HostApiErrorCode.INTERNAL_ERROR,
+            message="Source Run input event is missing",
+            retryable=False,
+        )
+    return event_payload_object(
+        transaction, event, payload_label="USER_INPUT_ACCEPTED"
+    )
 
 
 def _require_existing_session(
@@ -2207,6 +3866,33 @@ def _idempotent_run_result(
         created=False,
         queued=run.status == RunStatus.QUEUED,
         attached_active=record.created_event_id is None,
+        idempotent_replay=True,
+    )
+
+
+def _idempotent_steer_result(
+    transaction: HostTransaction, record: IdempotencyRecord
+) -> SteerAdmissionResult:
+    """从幂等记录恢复 steer 结果。
+
+    :param transaction: 当前 Host transaction。
+    :param record: 已持久化幂等记录。
+    :returns: steer 结果；不会再次传播旧 Attempt cancel。
+    :raises HostApiError: 结果类型错误或 Run 缺失时抛出。
+    """
+
+    run_result = _idempotent_run_result(transaction, record)
+    return SteerAdmissionResult(
+        run=run_result.run,
+        attempt=run_result.attempt,
+        dispatch_record=run_result.dispatch_record,
+        pending_dispatch=None,
+        steered_cancel_target=None,
+        input_event_id=(
+            record.created_event_id
+            if record.created_event_id is not None
+            else run_result.run.input_event_id
+        ),
         idempotent_replay=True,
     )
 
@@ -2603,8 +4289,13 @@ def _promote_after_release(
 
     try:
         service.wakeup_port.wake_queue_promotion(session_id)
-    except RuntimeError:
-        pass
+    except RuntimeError as exc:
+        _LOGGER.warning(
+            "host.admission.queue_promotion_wakeup_failed "
+            "session_id=%s error_type=%s",
+            session_id,
+            type(exc).__name__,
+        )
     return PromotionResult(
         promoted_run=None,
         attempt=None,
@@ -2848,13 +4539,117 @@ def _followup_queue_semantic_digest(
     :param request: follow-up request。
     :param caller_semantic_digest: 调用方语义输入摘要。
     :returns: ``sha256:<hex>`` digest。
+    :raises TypeError: RunnerSpec 中包含未知 provider request extension 时抛出。
     """
 
     return sha256_digest_json(
         {
             "operation": _OPERATION_SUBMIT_FOLLOWUP_QUEUE,
-            "input_digest": _input_digest(request.input),
+            "prompt_digest": sha256_digest_json(
+                {
+                    "system_prompt": request.system_prompt,
+                    "user_prompt": request.user_prompt,
+                }
+            ),
+            "tool_names": (
+                None
+                if request.tool_names is None
+                else _sorted_text_json_array(request.tool_names)
+            ),
+            "runner_spec": _optional_runner_spec_json(request.runner_spec),
+            "runner_options": _optional_runner_options_json(
+                request.runner_options
+            ),
+            "agent_policy": _optional_agent_policy_json(request.agent_policy),
             "behavior": FollowupBehavior.QUEUE.value,
+            "caller_semantic_digest": caller_semantic_digest,
+            "call_context_digest": _call_context_digest(request.context),
+        }
+    )
+
+
+def _followup_steer_semantic_digest(
+    request: SubmitFollowupRequest, *, caller_semantic_digest: str
+) -> str:
+    """计算 submit_followup_steer semantic digest。
+
+    :param request: follow-up steer request。
+    :param caller_semantic_digest: 调用方语义输入摘要。
+    :returns: ``sha256:<hex>`` digest。
+    """
+
+    return sha256_digest_json(
+        {
+            "operation": _OPERATION_SUBMIT_FOLLOWUP_STEER,
+            "prompt_digest": sha256_digest_json(
+                {
+                    "system_prompt": request.system_prompt,
+                    "user_prompt": request.user_prompt,
+                }
+            ),
+            "tool_names": (
+                None
+                if request.tool_names is None
+                else _sorted_text_json_array(request.tool_names)
+            ),
+            "runner_spec": _optional_runner_spec_json(request.runner_spec),
+            "runner_options": _optional_runner_options_json(
+                request.runner_options
+            ),
+            "agent_policy": _optional_agent_policy_json(request.agent_policy),
+            "behavior": FollowupBehavior.STEER.value,
+            "target_run_id": request.target_run_id,
+            "caller_semantic_digest": caller_semantic_digest,
+            "call_context_digest": _call_context_digest(request.context),
+        }
+    )
+
+
+def _retry_run_semantic_digest(
+    run_id: str,
+    request: RetryRunRequest,
+    *,
+    caller_semantic_digest: str,
+) -> str:
+    """计算 retry_run semantic digest。
+
+    :param run_id: 源 Run id。
+    :param request: retry 请求。
+    :param caller_semantic_digest: 调用方语义输入摘要。
+    :returns: ``sha256:<hex>`` digest。
+    """
+
+    return sha256_digest_json(
+        {
+            "operation": _OPERATION_RETRY_RUN,
+            "source_run_id": run_id,
+            "reason": request.reason,
+            "caller_semantic_digest": caller_semantic_digest,
+            "call_context_digest": _call_context_digest(request.context),
+        }
+    )
+
+
+def _replay_run_semantic_digest(
+    run_id: str,
+    request: ReplayRunRequest,
+    *,
+    caller_semantic_digest: str,
+) -> str:
+    """计算 replay_run semantic digest。
+
+    :param run_id: 源 Run id。
+    :param request: replay 请求。
+    :param caller_semantic_digest: 调用方语义输入摘要。
+    :returns: ``sha256:<hex>`` digest。
+    """
+
+    return sha256_digest_json(
+        {
+            "operation": _OPERATION_REPLAY_RUN,
+            "source_run_id": run_id,
+            "reason": request.reason,
+            "repair_instruction": request.repair_instruction,
             "caller_semantic_digest": caller_semantic_digest,
             "call_context_digest": _call_context_digest(request.context),
         }

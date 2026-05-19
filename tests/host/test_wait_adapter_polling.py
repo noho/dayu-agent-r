@@ -12,7 +12,6 @@ from dayu.contracts.tool_result import ToolResultSuccess
 from dayu.host import (
     CancelMode,
     CancelRunRequest,
-    HostCommandHandle,
     ResolveWaitCompletedOutcome,
     ResolveWaitLostOutcome,
     ResolveWaitRequest,
@@ -20,10 +19,10 @@ from dayu.host import (
     RunStatus,
     WaitProviderStatusRef,
     cancel_run,
-    create_host_command_handle,
     get_run,
     resolve_wait,
 )
+from dayu.host.command import HostCommandHandle, create_host_command_handle
 from dayu.host.durable.codec import sha256_digest_json
 from dayu.host.durable.schema import TABLE_HOST_WAIT_RECORDS
 from dayu.host.durable.state import WaitRecordRow, WaitRecordStatus
@@ -245,10 +244,10 @@ def test_poll_adapter_lost_result_closes_run(
         host.close()
 
 
-def test_cancelled_poll_wait_is_abandoned_without_resolve(
+def test_cancelled_poll_wait_is_abandoned_once_without_resolve(
     tmp_path: Path,
 ) -> None:
-    """cancelled poll wait 只通知 adapter abandon，不调用 resolve_wait。"""
+    """cancelled poll wait 只通知 adapter abandon 一次，不调用 resolve_wait。"""
 
     host = create_host_command_handle(_options(tmp_path))
     try:
@@ -267,9 +266,11 @@ def test_cancelled_poll_wait_is_abandoned_without_resolve(
         poller = _poller(host, adapter, seeded.wait_id)
 
         result = poller.poll_once()
+        second = poller.poll_once()
 
         wait_record = _read_wait(host._transaction_runner(), seeded.wait_id)
         assert result.abandoned == 1
+        assert second.abandoned == 0
         assert adapter.poll_count == 0
         assert adapter.abandoned == [seeded.wait_id]
         assert wait_record.status is WaitRecordStatus.CANCELLED
@@ -339,6 +340,39 @@ def test_adapter_non_runtime_exception_isolated_per_wait_record(
         assert adapter.abandoned == [seeded.wait_id]
         assert adapter.polled == [followup_wait_id]
         assert "wait adapter abandon failed; continuing" in caplog.text
+    finally:
+        host.close()
+
+
+def test_failed_cancelled_wait_abandon_is_retried_next_poll(
+    tmp_path: Path,
+) -> None:
+    """cancelled wait abandon 失败时不写入已 abandon 记忆，下一轮继续重试。"""
+
+    host = create_host_command_handle(_options(tmp_path))
+    try:
+        seeded = _seed_waiting_run(host)
+        cancel_run(
+            host,
+            seeded.run_id,
+            CancelRunRequest(
+                context=_context("poll-cancel-retry"),
+                client_request_id="poll-cancel-retry",
+                reason="user_cancel",
+                mode=CancelMode.GRACEFUL,
+            ),
+        )
+        adapter = _AbandonValueErrorThenNotReadyAdapter()
+        poller = _poller(host, adapter, seeded.wait_id)
+
+        first = poller.poll_once()
+        second = poller.poll_once()
+
+        assert first.abandoned == 0
+        assert second.abandoned == 0
+        assert first.adapter_errors == 1
+        assert second.adapter_errors == 1
+        assert adapter.abandoned == [seeded.wait_id, seeded.wait_id]
     finally:
         host.close()
 

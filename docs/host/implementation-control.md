@@ -223,10 +223,42 @@ Phase Map 中每个 phase 必须使用统一条目格式。模板如下：
 约束：本节只保留当前 gate 结论；phase 过程流水必须归档到 `历史记录`，仍需追踪的风险或后续 owner 必须写入 `Open Questions 与风险追踪` 的 `追踪区`。
 
 当前 work unit：Phase 10.5. Ordinary Local Multi-turn Public Contract Freeze。
-当前 gate：P10.5 handoff implementation-ready plan generation。
-下一 gate：P10.5 plan review。
+当前 gate：draft-PR-pass。
+下一 gate：Phase 11 design discussion / plan gate。
 
-当前 gate 事实：Phase 10 已完成；P10.5 已插入 Phase Map，用于冻结普通本地多轮会话的 Host public interface / contract。P10.5 目标与任务清单写入 `docs/host/post-p10.md`。initial challenge review artifacts 为 `docs/reviews/post-p10-public-contract-challenge-mimo-20260518.md`、`docs/reviews/post-p10-wiring-smoke-challenge-ds-20260518.md` 与 `docs/reviews/post-p10-codex-challenge-20260518.md`；相关裁决已经写回 `docs/host/post-p10.md`。按 `$init-agents` 已派发三路 P10.5 plan-readiness review：`docs/reviews/post-p10-5-plan-readiness-review-mimo-20260518.md`、`docs/reviews/post-p10-5-plan-readiness-review-ds-20260518.md` 与 `docs/reviews/post-p10-5-plan-readiness-review-codex-20260518.md`；三份结论均为 blocking count = 0。总控裁决：可以进入 P10.5 handoff implementation-ready plan generation，但 plan 必须显式收口三份 review 提出的 non-blocking / clarification checklist，不能直接 implementation。
+当前 gate 事实：Phase 10 已完成；P10.5 已插入 Phase Map，用于冻结普通本地多轮会话的 Host public interface / contract。P10.5 目标与任务清单写入 `docs/host/post-p10.md`。initial challenge review artifacts 为 `docs/reviews/post-p10-public-contract-challenge-mimo-20260518.md`、`docs/reviews/post-p10-wiring-smoke-challenge-ds-20260518.md` 与 `docs/reviews/post-p10-codex-challenge-20260518.md`；相关裁决已经写回 `docs/host/post-p10.md`。按 `$init-agents` 已派发三路 P10.5 plan-readiness review：`docs/reviews/post-p10-5-plan-readiness-review-mimo-20260518.md`、`docs/reviews/post-p10-5-plan-readiness-review-ds-20260518.md` 与 `docs/reviews/post-p10-5-plan-readiness-review-codex-20260518.md`；三份结论均为 blocking count = 0。P10.5 handoff implementation-ready plan 已生成：`docs/host/phase10-5-ordinary-local-multiturn-public-contract-plan.md`。P10.5 plan review artifacts 为 `docs/reviews/phase10-5-plan-review-mimo-20260518.md` 与 `docs/reviews/phase10-5-plan-review-ds-20260518.md`，两份均 PASS，blocking count = 0。Controller adjudication artifact 为 `docs/reviews/phase10-5-plan-review-controller-adjudication-20260518.md`；总控裁决：不直接进入 implementation，先接受 DS N1-N5 / C1-C3 与 MiMo F5-F7 为 plan hardening。P10.5 plan fix artifact 为 `docs/reviews/phase10-5-plan-fix-codex-20260518.md`；fix 只修改 `docs/host/phase10-5-ordinary-local-multiturn-public-contract-plan.md`，收口 A1-A5，无新的 blocking question。P10.5 plan re-review artifacts 为 `docs/reviews/phase10-5-plan-rereview-mimo-20260518.md` 与 `docs/reviews/phase10-5-plan-rereview-ds-20260518.md`，两份均 PASS，blocking count = 0；Controller re-review adjudication artifact 为 `docs/reviews/phase10-5-plan-rereview-controller-adjudication-20260518.md`。Accepted plan local commit hash：`f38540b`。P10.5 Slice 1 implementation artifact 为 `docs/reviews/phase10-5-slice1-implementation-codex-20260518.md`；implementation agent reported focused tests `tests/host/test_public_open_host_options.py tests/host/test_package_exports.py` passed and `pyright dayu/host tests/host` returned 0 errors。P10.5 Slice 1 code review artifacts 为 `docs/reviews/phase10-5-slice1-code-review-mimo-20260518.md` 与 `docs/reviews/phase10-5-slice1-code-review-ds-20260518.md`，两份均 PASS，blocking count = 0；Controller adjudication artifact 为 `docs/reviews/phase10-5-slice1-code-review-controller-adjudication-20260518.md`。Accepted Slice 1 local commit hash：`d0e79a6`。用户已授权到达 `ready-to-open-draft-PR` 后进入 draft PR gate 并推进到 draft-PR-pass；该授权不改变当前必须先完成 P10.5 剩余 slices、code review 与 aggregate deepreview 的顺序。P10.5 Slice 2 implementation artifact 为 `docs/reviews/phase10-5-slice2-implementation-codex-20260518.md`；implementation agent reported focused tests `tests/host/test_open_host_runtime.py tests/host/test_public_lifecycle_smoke.py` passed and `pyright dayu/host tests/host` returned 0 errors。P10.5 Slice 2 code review artifacts 为 `docs/reviews/phase10-5-slice2-code-review-mimo-20260518.md` 与 `docs/reviews/phase10-5-slice2-code-review-ds-20260518.md`，两份均 PASS，blocking count = 0。Controller adjudication artifact 为 `docs/reviews/phase10-5-slice2-code-review-controller-adjudication-20260518.md`；总控裁决：接受 DS N1 为当前 Slice 2 lifecycle fix，接受 DS N2 / MiMo N3 为窄契约澄清 fix。P10.5 Slice 2 fix artifact 为 `docs/reviews/phase10-5-slice2-fix-codex-20260518.md`；fix agent reported focused tests `tests/host/test_open_host_runtime.py tests/host/test_public_lifecycle_smoke.py` passed with 5 tests and `pyright dayu/host tests/host` returned 0 errors。P10.5 Slice 2 re-review artifacts 为 `docs/reviews/phase10-5-slice2-rereview-mimo-20260518.md` 与 `docs/reviews/phase10-5-slice2-rereview-ds-20260518.md`，两份均 PASS，blocking count = 0；Controller re-review adjudication artifact 为 `docs/reviews/phase10-5-slice2-rereview-controller-adjudication-20260518.md`。Accepted Slice 2 local commit hash：`79f7b44`。P10.5 Slice 3 implementation artifact 为 `docs/reviews/phase10-5-slice3-implementation-codex-20260518.md`；implementation agent reported focused tests `tests/host/test_submit_followup_public_contract.py tests/host/test_per_run_tool_selection.py tests/host/test_effective_execution_config.py` passed with 9 tests and `pyright dayu/host tests/host` returned 0 errors。P10.5 Slice 3 code review artifacts 为 `docs/reviews/phase10-5-slice3-code-review-mimo-20260518.md` 与 `docs/reviews/phase10-5-slice3-code-review-ds-20260518.md`，两份均 PASS，blocking count = 0；Controller adjudication artifact 为 `docs/reviews/phase10-5-slice3-code-review-controller-adjudication-20260518.md`。总控裁决：接受 runner config JSON 投影重复、agent_policy override 覆盖缺口、baseline=None fail-early 说明为当前 Slice 3 fix。P10.5 Slice 3 fix artifact 为 `docs/reviews/phase10-5-slice3-fix-codex-20260518.md`；fix agent reported focused tests `tests/host/test_submit_followup_public_contract.py tests/host/test_per_run_tool_selection.py tests/host/test_effective_execution_config.py` passed with 11 tests and `pyright dayu/host tests/host` returned 0 errors；controller 本地复跑同一 focused tests 11 passed，`pyright dayu/host tests/host` 0 errors。P10.5 Slice 3 re-review artifacts 为 `docs/reviews/phase10-5-slice3-rereview-mimo-20260518.md` 与 `docs/reviews/phase10-5-slice3-rereview-ds-20260518.md`。Controller re-review adjudication artifact 为 `docs/reviews/phase10-5-slice3-rereview-controller-adjudication-20260518.md`；总控裁决：受影响既有 tests `tests/host/test_admission_queue.py tests/host/test_projection_read_model.py` 当前 17 failed / 19 passed，不能接受进入 slice commit，需 follow-up fix 迁移相关低层测试 helper 到 ordinary baseline 边界。Slice 3 follow-up fix 已更新 `tests/host/test_admission_queue.py`、`tests/host/test_projection_read_model.py` 与 `docs/reviews/phase10-5-slice3-fix-codex-20260518.md`；fix agent reported 47 tests passed and `pyright dayu/host tests/host` 0 errors；controller 本地复跑同一 47-test 集合 passed，`pyright dayu/host tests/host` 0 errors。P10.5 Slice 3 follow-up re-review artifacts 为 `docs/reviews/phase10-5-slice3-followup-rereview-mimo-20260518.md` 与 `docs/reviews/phase10-5-slice3-followup-rereview-ds-20260518.md`，两份均 PASS，blocking count = 0；Controller follow-up re-review adjudication artifact 为 `docs/reviews/phase10-5-slice3-followup-rereview-controller-adjudication-20260518.md`。Accepted Slice 3 local commit hash：`8e6f352`。P10.5 Slice 4 implementation artifact 为 `docs/reviews/phase10-5-slice4-implementation-codex-20260518.md`；implementation agent reported focused tests `tests/host/test_watch_session_events.py tests/host/test_public_host_event.py` passed with 7 tests, extra affected tests `tests/host/test_package_exports.py tests/host/test_public_event_stream.py tests/host/test_public_contracts.py` passed with 62 tests, and `pyright dayu/host tests/host` returned 0 errors；controller 本地复跑同一验证通过。P10.5 Slice 4 code review artifacts 为 `docs/reviews/phase10-5-slice4-code-review-mimo-20260518.md` 与 `docs/reviews/phase10-5-slice4-code-review-ds-20260518.md`，两份均 PASS，blocking count = 0；Controller adjudication artifact 为 `docs/reviews/phase10-5-slice4-code-review-controller-adjudication-20260518.md`。Accepted Slice 4 local commit hash：`73db9f0`。当前进入 P10.5 Slice 5 implementation。
+
+当前 gate 追加事实：P10.5 Slice 5 implementation artifact 为 `docs/reviews/phase10-5-slice5-implementation-codex-20260518.md`；implementation agent reported focused tests `tests/host/test_public_steer.py tests/host/test_public_retry_replay.py tests/host/test_public_resolve_wait_resume.py tests/host/test_public_cancel_smoke.py` passed with 5 tests and `pyright dayu/host tests/host` returned 0 errors；controller 本地复跑同一验证通过。P10.5 Slice 5 code review artifacts 为 `docs/reviews/phase10-5-slice5-code-review-mimo-20260518.md` 与 `docs/reviews/phase10-5-slice5-code-review-ds-20260518.md`，两份均 PASS，blocking count = 0。Controller adjudication：接受 PASS；MiMo F1-F3 与 DS N1-N7 接受为 Slice 6 coverage / aggregate validation follow-up，F4 确认接受。Accepted Slice 5 local commit hash：`7282463`。当前进入 P10.5 Slice 6 implementation。
+
+当前 gate 追加事实（Slice 6 implementation）：P10.5 Slice 6 implementation artifact 为 `docs/reviews/phase10-5-slice6-implementation-codex-20260518.md`；implementation agent reported target smoke `tests/host/test_public_open_host_multiturn_smoke.py tests/host/test_public_tool_wiring_smoke.py tests/host/test_public_compact_smoke.py tests/host/test_public_cancel_smoke.py` passed with 11 tests, real runner matrix passed with 3 passed / 1 skipped（Gemini provider quota / rate limit）, `tests/host -q` passed with 695 passed / 1 skipped, and `pyright dayu/host tests/host` returned 0 errors。Controller 本地复跑同一验证通过，`git diff --check` clean。当前进入 P10.5 Slice 6 code review。
+
+当前 gate 追加事实（Slice 6 code review）：P10.5 Slice 6 code review artifacts 为 `docs/reviews/phase10-5-slice6-code-review-mimo-20260518.md` 与 `docs/reviews/phase10-5-slice6-code-review-ds-20260518.md`，两份均 PASS，blocking count = 0。Controller adjudication artifact 为 `docs/reviews/phase10-5-slice6-code-review-controller-adjudication-20260518.md`；总控裁决：接受 DS H1 为当前 Slice 6 fix，要求 real compactor smoke 对 compactor provider 临时不可用 / quota / rate-limit 做精确 skip；其它维护类 findings deferred 到 aggregate review / Phase 11 test hardening。当前进入 P10.5 Slice 6 fix。
+
+当前 gate 追加事实（Slice 6 fix）：P10.5 Slice 6 fix artifact 为 `docs/reviews/phase10-5-slice6-fix-codex-20260518.md`；fix agent 更新 compactor smoke provider exception 精确 skip、tests README 与 implementation artifact。Controller 本地复跑：`tests/host/test_public_compact_smoke.py -q -rs` 1 passed；target smoke 11 passed；real runner matrix 3 passed / 1 skipped（Gemini quota / rate-limit）；`tests/host -q` 695 passed / 1 skipped；`pyright dayu/host tests/host` 0 errors；`git diff --check` clean。当前进入 P10.5 Slice 6 re-review。
+
+当前 gate 追加事实（Slice 6 accepted）：P10.5 Slice 6 re-review artifacts 为 `docs/reviews/phase10-5-slice6-rereview-mimo-20260518.md` 与 `docs/reviews/phase10-5-slice6-rereview-ds-20260518.md`，两份均 PASS，确认 CF1 fixed 且无 new blocker。Controller re-review adjudication artifact 为 `docs/reviews/phase10-5-slice6-rereview-controller-adjudication-20260518.md`。Accepted Slice 6 local commit hash：`91b41fc`。当前进入 P10.5 aggregate deepreview。
+
+当前 gate 追加事实（aggregate deepreview）：P10.5 aggregate deepreview artifacts 为 `docs/reviews/phase10-5-aggregate-deepreview-mimo-20260518.md` 与 `docs/reviews/phase10-5-aggregate-deepreview-ds-20260518.md`，两份均 PASS，blocking count = 0，并独立复跑 `tests/host -q`、`pyright dayu/host tests/host` 与 `git diff --check`。Controller aggregate adjudication artifact 为 `docs/reviews/phase10-5-aggregate-deepreview-controller-adjudication-20260518.md`；总控裁决：接受 public surface cleanup 为 P10.5 aggregate fix，收口 `dayu.host` 包根仍暴露低层 command primitive、command-handle construction types、local execution options 与 `StartRunRequest` 的问题。当前进入 P10.5 aggregate fix。
+
+当前 gate 追加事实（aggregate fix）：P10.5 aggregate fix artifact 为 `docs/reviews/phase10-5-aggregate-fix-codex-20260518.md`；fix 从 `dayu.host` 包根模块属性与 `__all__` 移除 `start_run`、`create_host_command_handle`、`HostCommandHandle`、`HostCommandFacet`、`HostCommandHandleOptions`、`HostLocalExecutionOptions` 与 `StartRunRequest`，低层测试 import 已迁移到 `dayu.host.api` / `dayu.host.command`，package export tests 增加 root module attribute 禁露检查，`dayu/README.md` 与 `dayu/host/README.md` 已同步当前 public contract 事实。Controller 本地复跑：`pytest tests/host/test_package_exports.py -q` 8 passed；`pytest tests/host -q` 696 passed / 1 skipped；`python -m pyright dayu/host tests/host` 0 errors；`git diff --check` clean。当前进入 P10.5 aggregate re-review。
+
+当前 gate 追加事实（aggregate re-review）：P10.5 aggregate re-review artifacts 为 `docs/reviews/phase10-5-aggregate-rereview-mimo-20260518.md` 与 `docs/reviews/phase10-5-aggregate-rereview-ds-20260518.md`，两份均 PASS，blocking findings count = 0，确认 AG1-AG4 已完整收口且无新增 blocker。Controller aggregate re-review adjudication artifact 为 `docs/reviews/phase10-5-aggregate-rereview-controller-adjudication-20260518.md`。MiMo 复跑中一个外部 provider smoke 因 `finish_reason=length` 失败，裁决为 provider 环境 residual；controller 与 DS 均已复跑 `tests/host -q` 通过，不阻塞本 gate。当前进入 P10.5 accepted aggregate fix commit。
+
+当前 gate 追加事实（ready-to-open-draft-PR）：P10.5 accepted aggregate fix commit 为 `41696be`。P10.5 design refinement、plan、6 个 implementation slices、slice review / fix / re-review、aggregate deepreview、aggregate fix、aggregate re-review、controller 裁决、README 同步与 accepted local commits 均已完成并记录 artifact / commit hash。P10.5 phase 状态为 completed；当前进入 ready-to-open-draft-PR。剩余风险均有 owner：Recovery / startup crash recovery / positive orphan proof 归 Phase 11；ToolsDiscovery / ScenePrepare 归 Phase 12；Audit / Tool Trace / Outbox 与离线 terminal delivery 归 Phase 13；RemoteProxy 归 Phase 14；Retention / Purge production hardening 归 Phase 15；跨测试模块私有 helper、scheduler 私有方法测试依赖与其它不改变 P10.5 public contract 的测试 hardening 归 Phase 11 test hardening；provider / compactor quota、rate-limit 或外部模型 `finish_reason=length` 属环境 residual，不改变 Host public contract。
+
+当前 gate 追加事实（draft PR create）：PR 62 `https://github.com/noho/dayu-agent-r/pull/62` 已创建为 draft PR，title 为 `Host P10.5 ordinary local multi-turn public contract freeze`，head branch 为 `feat/host-p10-5-public-contract-freeze`，base branch 为 `main`。`gh pr view` 显示 draft=true、state=OPEN、mergeStateStatus=CLEAN；`gh pr checks 62 --watch=false` 返回当前分支 no checks reported。当前进入 PR 62 deepreview。
+
+当前 gate 追加事实（PR deepreview）：PR 62 deepreview artifacts 为 `docs/reviews/pr-62-deepreview-mimo-20260518.md` 与 `docs/reviews/pr-62-deepreview-ds-20260519.md`。两份均 PASS，blocking = 0，high = 0；AgentMiMo 提出 3 个 medium，AgentDS 提出 2 个 medium / 2 个 low。Controller adjudication artifact 为 `docs/reviews/pr-62-deepreview-controller-adjudication-20260518.md`。总控裁决：接受 public smoke 直接 SQLite `event_log` 查询、WAITING smoke 通过 `create_host_command_handle` seed、branch-level `git diff --check main...HEAD` review artifact trailing whitespace 为当前 PR review fix；watch iterator close silent end defer 到 Phase 11 / later public lifecycle hardening；`DefaultLocalEngineWorkerFactory` 包根导出需求 rejected-current-fix / needs design discussion；intentional dataclass breaking changes accepted-as-non-issue。当前进入 PR 62 review fix。
+
+当前 gate 追加事实（PR review fix）：PR 62 review fix artifact 为 `docs/reviews/pr-62-review-fix-codex-20260519.md`；fix 删除 public smoke 文件中的重复 direct SQLite `event_log` correctness assertion，WAITING smoke 改为 `open_host(options)` + awaiting mock tool + public command 生成 `WAITING` Run，`create_host_command_handle` 不再作为 `test_public_steer.py` / `test_public_resolve_wait_resume.py` 前置 seed，review artifacts trailing whitespace 已清理。Controller 本地复跑：PR fix focused tests 22 passed；`pytest tests/host/test_package_exports.py -q` 8 passed；`pytest tests/host -q` 696 passed / 1 skipped；`python -m pyright dayu/host tests/host` 0 errors；`git diff --check` clean；`git diff --check main` clean。`git diff --check main...HEAD` 需等 accepted fix commit 后复跑。当前进入 PR 62 review fix re-review。
+
+当前 gate 追加事实（PR review fix re-review）：PR 62 review fix re-review artifacts 为 `docs/reviews/pr-62-review-fix-rereview-mimo-20260519.md` 与 `docs/reviews/pr-62-review-fix-rereview-ds-20260519.md`，两份均 PASS，blocking findings count = 0。Controller re-review adjudication artifact 为 `docs/reviews/pr-62-review-fix-rereview-controller-adjudication-20260519.md`。总控裁决：PR62-F1 / F2 / F3 已收口；`wait_for_public_waiting_run(...)` 的 wait id bridge 与 `wait_for_diagnostic_event_type_count(...)` 的 diagnostic event sync 均限定在 `tests/host/public_smoke_support.py`，不作为 correctness assertion。当前进入 PR 62 accepted PR review fix commit。
+
+当前 gate 追加事实（PR review fix accepted）：PR 62 accepted PR review fix commit 为 `e0702db`。提交后复跑 `git diff --check main...HEAD` clean，确认 branch-level whitespace check 已收口。当前进入 PR 62 follow-up push and final checks。
+
+当前 gate 追加事实（draft-PR-pass）：PR 62 分支已 push 到 `github/feat/host-p10-5-public-contract-freeze`，最新 pushed commit 为 `43e232d`。`gh pr view 62` 显示 draft=true、state=OPEN、mergeStateStatus=CLEAN、statusCheckRollup=[]；`gh pr checks 62 --watch=false` 返回 no checks reported。PR 62 draft PR gate 通过，当前状态为 draft-PR-pass。P10.5 状态保持 completed；下一工作入口为 Phase 11 design discussion / plan gate，除非用户另行要求处理 PR 62 新增外部 review / CI。
+
+当前 gate 追加事实（PR-62 fullrepo accepted-fix）：PR-62 fullrepo accepted-fix 已完成，AgentMiMo re-review PASS，AgentDS 未 BLOCKED，awaiting diagnostic refs follow-up 已修，deferred tracking 已落入本文档追踪区。
 
 ## Phase Map
 
@@ -1599,6 +1631,140 @@ Plan 必须额外收口的 readiness review checklist：
 
 ### 追踪区
 
+#### PR-62 fullrepo review deferred tracking
+
+背景决议：
+
+- 输入 artifacts 为 `docs/reviews/pr-62-fullrepo-review-controller-adjudication-20260519.md`、
+  `docs/reviews/pr-62-fullrepo-accepted-fix-rereview-mimo-20260519.md`、
+  `docs/reviews/pr-62-fullrepo-accepted-fix-rereview-ds-20260519.md`、
+  `docs/reviews/repo-review-20260519-182223.md` 与
+  `docs/reviews/repo-review-20260519-182226.md`。
+- Controller 已完成 PR-62 fullrepo accepted-fix；AgentMiMo re-review verdict 为 PASS，AgentDS 未给出 BLOCKED。
+- 下列项均不阻塞 PR-62：它们属于维护性、observability、测试覆盖、性能或后续 phase 能力完善；PR-62 accepted-fix
+  已收口当前 correctness blockers，且不应在同一 fix gate 中半拆跨 owner 重构。
+
+追踪项：
+
+- runtime lane close/acquire 竞态：`LaneController.close()` / `acquire()` race owner 为 Phase 11 Host Lifecycle /
+  Recovery / Multi-process Hardening 与 runtime lane hardening owner。不阻塞 PR-62 的理由是 lane 属于 `dayu.runtime`
+  容量 primitive，不是 Host durable truth 或本轮 accepted-fix 主路径，当前仍有 TTL cleanup 兜底。触发条件为 Phase 11
+  多进程 hardening、runtime lane 压测、或出现 close 与 acquire 并发导致容量泄漏 / acquire hang 的证据；后续验证必须包含
+  targeted concurrent close/acquire tests、stale claim cleanup 与 active count invariant。
+- durable bootstrap DDL 原子性：owner 为 durable bootstrap / schema hardening work unit。不阻塞 PR-62 的理由是
+  `IF NOT EXISTS` 与 schema version 已提供 fresh DB 幂等恢复，本轮无直接证据显示会破坏当前 durable truth。触发条件为修改
+  bootstrap transaction boundary、schema init 顺序或 fresh DB 初始化流程；后续验证必须覆盖 fresh DB bootstrap、半初始化失败后的
+  retry、schema version 与 DDL visibility。
+- after-commit 多错误聚合：owner 为 durable transaction observability / projection catch-up hardening。不阻塞 PR-62
+  的理由是 after-commit callback 失败不改变已提交 durable truth，当前风险是诊断不足。触发条件为新增多个 after-commit sink /
+  projection callback，或需要排查多个 callback 同时失败；后续验证必须覆盖多 callback 失败时的错误聚合、顺序可观测性与不回滚
+  committed transaction。
+- Host crash recovery E2E：owner 为 Phase 11 Host Lifecycle / Recovery / Multi-process Hardening。不阻塞 PR-62
+  的理由是该项是真实测试缺口，但需要多进程 / 强杀式 harness 与 positive orphan proof 设计，超出 PR-62 accepted-fix 范围。
+  触发条件为 Phase 11 recovery scan、LOST / RECOVERING dispatch、active worker orphan proof 或 startup recovery 实现；
+  后续验证必须包含进程 crash / restart E2E、已 accepted prompt 未返回 answer 的恢复、旧 execution 迟到事件拒绝。
+- watch 轮询性能 / session watch 20ms polling：owner 为 Phase 11 public lifecycle hardening 或后续 production watch
+  scale owner。不阻塞 PR-62 的理由是当前 20ms polling 是性能 / 资源项，没有 correctness 回归证据。触发条件为 watch
+  consumer 数量扩大、SQLite 读负载观测异常、或引入 production push / notification 机制；后续验证必须包含 watch 延迟、
+  CPU / DB read 压力与 close / cancel / terminal 可见性。
+- import boundary helper 重复：owner 为 P9.5 / Phase 11 test hardening 中的 import boundary test cleanup。不阻塞
+  PR-62 的理由是重复位于测试 helper 层，不改变生产 import boundary。触发条件为继续扩展 Engine / Host / runtime
+  boundary 白名单、出现重复断言漂移，或新增 cross-layer boundary tests；后续验证必须保持 import boundary tests
+  可读、单一真源 helper 与反向依赖禁止。
+- runtime log import 副作用：owner 为 runtime 日志清理 work unit。不阻塞 PR-62 的理由是 `dayu.runtime.log`
+  的全局 logging level 注册属于低风险 import side effect，非 Host / Engine correctness blocker。触发条件为 runtime
+  包被更多层默认 import、日志级别注册影响外部 logging policy，或 pyright / import-boundary 要求收紧 runtime side effects；
+  后续验证必须覆盖重复 import 幂等、默认 logging 行为与无跨层依赖。
+- `ToolFactAcceptCandidate` God dataclass：owner 为 ToolRuntime internal structure cleanup，优先归 P9.5 中不依赖
+  P10+ owner 的 God class cleanup；若发现会改变工具治理语义，则重新进入对应 ToolRuntime design gate。不阻塞 PR-62
+  的理由是当前字段虽多但消费者明确，风险是维护性和构造复杂度，不是运行时 correctness blocker。触发条件为新增 accept
+  candidate 字段、修改 duplicate / awaiting / reuse / governed outcome 构造矩阵，或 review 再次发现字段聚合导致错误；
+  后续验证必须覆盖 ordinary result facts、governed outcome、awaiting accept、reuse 与 duplicate matrix。
+- 非 awaiting accept failure outcome `diagnostic_refs` 传播对称缺口：owner 为 ToolRuntime outcome diagnostics
+  hardening / accept failure outcome matrix work unit。不阻塞 PR-62 的理由是 PR-62 correctness blocker 是 awaiting
+  timeout diagnostic ref 丢失，accepted-fix 已覆盖 awaiting timeout path；非 awaiting accept failure outcome 的风险是
+  诊断传播对称性与排障可观测性，当前无证据显示会改变 durable truth、Run 终态或 accepted fact 治理结果。触发条件为修改
+  ordinary accept failure outcome 构造、failure diagnostic refs 来源、`ToolFailedOutcome` hint / diagnostic mapping、
+  duplicate / reuse / governed outcome 失败路径，或 review 发现非 awaiting failure outcome 丢弃已生成诊断 ref；
+  后续验证必须覆盖 awaiting timeout、ordinary accept failure、duplicate / reuse / governed failure 的 diagnostic refs
+  传播矩阵，并断言最终失败 outcome 能保留可关联的 diagnostic ref。
+- compact 失败最终降级路径：owner 为 Phase 10 Context Governance follow-up 与 Phase 11 recovery owner 的 failure
+  matrix。不阻塞 PR-62 的理由是当前 operation 会返回明确 failure reason，dispatch / proactive 路径已有失败事件与
+  fail-unstarted 收口；端到端策略矩阵仍需独立设计。触发条件为修改 proactive / reactive compact failure policy、
+  compactor adapter 生产接入、或 provider overflow recovery 扩展；后续验证必须覆盖 proactive compact failure、
+  reactive compact failure、hard threshold 后仍超预算的用户可见失败路径与 recovery 不误用 `LOST`。
+- executor 普通异常 observability：owner 为 Engine / ToolRuntime observability hardening。不阻塞 PR-62 的理由是
+  `_execute_batch` 当前会把 executor 普通异常转为工具失败 outcome，不破坏 Host 终态一致性；缺口是日志 / trace 诊断。
+  触发条件为工具 executor 异常排障需求、tool trace 落地或异常分类改动；后续验证必须覆盖普通异常的 outcome、
+  diagnostic / log 可关联性、敏感字段不泄漏。
+- service/ui 测试缺失：owner 为后续 Service / UI work unit。不阻塞 PR-62 的理由是当前仓库尚未实现 service/ui
+  Python 层，finding 对当前代码不可执行。触发条件为新增 `dayu.service` / `dayu.ui` 生产入口、Service / UI 调用 Host
+  public contract，或引入 UI offline / outbox 消费路径；后续验证必须包含 Service / UI contract tests 与不绕过 Host
+  public API 的 import boundary tests。
+- 敏感异常 marker 精度：owner 为 diagnostics / redaction policy hardening。不阻塞 PR-62 的理由是当前 marker
+  偏保守，风险是过度脱敏而不是敏感信息漏出或 correctness 破坏。触发条件为新增异常 taxonomy、provider / tool trace
+  对错误字段做结构化展示，或用户需要更精确排障；后续验证必须覆盖敏感字段 redaction、非敏感错误可诊断性与日志 / trace
+  一致性。
+- open_host fallback 常量：owner 为 Host configuration / composition governance work unit。不阻塞 PR-62 的理由是
+  8192 / 1024 fallback 已作为内部兜底说明，生产 composition 应显式传入 policy，本轮不改变 public contract。触发条件为
+  修改 `open_host` options、预算 policy 默认值、或 Service composition root 接入；后续验证必须覆盖显式配置优先、
+  fallback 只作为非生产兜底、README / Host README 与 public contract 一致。
+- PR-62 deepreview --all F1 proactive compaction fake budget 回归：owner 为当前 PR-62 blocker fix。不阻塞后续
+  deferred tracking 的理由是该项不是 deferred risk，必须在本次 gate 内收口。触发条件为修改
+  `tests.host.fake_compaction.FakeContextCompactor`、`estimate_compacted_context_budget`、`run_compaction_operation` hard-threshold recheck 或
+  proactive compact policy；后续验证必须覆盖 soft threshold proactive compact 创建 Attempt、hard threshold 后仍拒绝
+  candidate，以及 fake compactor 预算保持在 hard threshold 内。
+- oversized truncation cursor data loss：owner 为 ToolRuntime truncation / `fetch_more` cursor lifecycle hardening。
+  不阻塞 PR-62 blocker fix 的理由是本次只收口 proactive compaction 测试回归，truncation cursor 生命周期需要单独验证
+  TTL、内存占用和 oversized visible portion 行为。触发条件为修改 `TruncationManager.apply_truncation`、`fetch_more`
+  cursor missing / expired guard、或工具大结果截断策略；后续验证必须覆盖 truncation 后 inline 仍超限时 cursor 不丢失、
+  `fetch_more` 可恢复后续分段、TTL 到期清理和 run-scoped `scope_token` 边界。
+- OpenAI tool call aggregator index fragmentation：owner 为 Engine OpenAI runner parser hardening。不阻塞 PR-62
+  blocker fix 的理由是触发条件依赖 provider 在同一 tool call 上混合 id-only 与 index-only delta，标准路径当前未见回归。
+  触发条件为修改 `ToolCallAggregator._resolve_index`、provider delta normalize 或 streaming tool call parser；后续验证必须
+  覆盖已有 `delta_id` mapping 时优先复用既有 index、provider index / synthetic index 冲突、finalize 后参数完整性。
+- duplicate governance check-then-act race：owner 为 ToolRuntime duplicate governance concurrency hardening。不阻塞
+  PR-62 blocker fix 的理由是该项要求调整 `find + record` 原子性和并发测试，影响面独立于 proactive compaction。触发条件为
+  修改 duplicate policy、`ToolRuntimeExecutor._execute_one` 并发 batch 执行或 side-effect 工具治理；后续验证必须覆盖同一
+  Run 内同工具同 normalized arguments 并发调用只执行一次，第二个调用复用或按 policy 阻断，且不引入死锁。
+- durable layer dependency cleanup：owner 为 Host durable layering cleanup work unit。不阻塞 PR-62 blocker fix 的理由是
+  `dayu.host.durable.memory` 与 durable 多文件依赖 `dayu.host.api` 属架构边界清理，需要拆分 row primitive、public type
+  owner 与 import boundary tests，不能夹带进 compaction 回归修复。触发条件为修改 durable memory projection bootstrap、
+  durable state/read model 类型 import、或新增 durable 基础设施模块；后续验证必须覆盖 durable 层不反向依赖上层业务模块、
+  public status/type 下沉或独立化后的 import boundary、memory projection 行为不变。
+- waiting iteration_id / digest 语义缺口：owner 为 Phase 7 waiting / resolve_wait durable contract hardening。不阻塞
+  PR-62 blocker fix 的理由是该项涉及 `WaitRecordRow` 持久化字段与 `TOOL_RESULT_ACCEPTED` payload 语义迁移，需独立
+  schema / contract gate。触发条件为修改 awaiting accept candidate、wait record schema、`resolve_wait` payload 构造或
+  tool trace digest 消费；后续验证必须覆盖 Engine iteration id 不被 wait id 冒充、schema / tool identity /
+  normalized arguments digest 不退化为同一个 outcome digest、旧语义不进入新的 canonical facts。
+- idempotent replay error type：owner 为 waiting accept barrier error taxonomy hardening。不阻塞 PR-62 blocker fix
+  的理由是触发路径要求 idempotency replay 发现 EventLog rows 缺失，当前没有证据影响 proactive compaction。触发条件为修改
+  `_accepted_ack_from_existing`、idempotency replay、wait accepted ack 或 EventLog repair；后续验证必须覆盖缺失 rows 时
+  抛出 Host durable taxonomy 内错误、调用方得到有界 Host API / accept barrier envelope，而不是裸 `RuntimeError`。
+- `cancel_session_runs` RECOVERING 阻塞：owner 为 Phase 11 recovery / session-scope cancel semantics。不阻塞
+  PR-62 blocker fix 的理由是 RECOVERING cancel 本来归 Phase 11，当前 fix 不改变 recovery 状态机。触发条件为实现
+  RECOVERING dispatch / positive orphan proof、修改 session-scope cancel 目标枚举、或 close / cancel 组合语义；后续验证
+  必须覆盖 Session 中 RECOVERING 与可取消 Run 并存时的行为，是跳过 RECOVERING、返回 structured partial result，还是
+  文档明确 fail-closed。
+- context governance 模块命名 / helper 重复清理：owner 为 Phase 10 context governance maintenance hardening。不阻塞
+  PR-62 blocker fix 的理由是命名与 `_string_list_json`、`_require_optional_non_empty`、`_budget_after_compact` 重复均为
+  可维护性问题，本次只修 fake compactor root cause。触发条件为继续扩展 compaction quality checker、compact artifact /
+  context event JSON helper 或 compactor budget helper；后续验证必须覆盖模块职责命名与实际边界一致，公共 helper 下沉后不产生
+  反向依赖或兼容 re-export。
+- close-session active Run observability 与 terminal CAS null-check 一致性：owner 为 Host public lifecycle /
+  durable state machine maintenance。不阻塞 PR-62 blocker fix 的理由是 close 不取消 active Run 是当前设计事实，CAS 终态约束
+  由 status 与 schema CHECK 兜底，当前 findings 是 observability / 一致性 hardening。触发条件为修改 `close_session` result、
+  session lifecycle diagnostic、terminal mutation SQL 或 terminal schema CHECK；后续验证必须覆盖 close 时 active Run
+  可观测性、terminal mutation NULL guard 一致性和并发 CAS 不破坏终态唯一性。
+- contracts validation gaps：owner 为 contracts strict validation hardening。不阻塞 PR-62 blocker fix 的理由是 review
+  未发现当前生产路径传入非法值，补校验可能暴露调用方 bug，应独立补 contract tests。触发条件为修改
+  `dayu/contracts/tool_call.py`、`tool_outcome.py`、`tool_schema.py`、`tool_await.py` 或跨进程序列化边界；后续验证必须覆盖
+  `correlation_id`、非空 batch records、cancel meta、truncate TTL、await deadline / captured_at timezone 等非法输入。
+- README stale references：owner 为 docs correctness cleanup。不阻塞 PR-62 blocker fix 的理由是当前 blocker 是测试回归，
+  README 残留“Host 层正在重写中”与 `docs/host/interface-discussion-notes.md` 断链属于稳定文档校准，应由 docs gate
+  按 README 职责范围统一清理。触发条件为进入 PR-62 docs follow-up、修改根 README / `dayu/README.md` 导航或 Host public
+  contract 文档；后续验证必须覆盖旧术语清理、断链替换为 `docs/host/discussion-note.md` 或真实路径，以及总览文档不越界。
+
 #### Phase 10 S4 Proactive Context Governance 残余风险追踪
 
 背景决议：
@@ -1649,7 +1815,8 @@ Plan 必须额外收口的 readiness review checklist：
   caller 尚未在 Host 包内实现。后续 production composition owner 必须显式调用该 helper 或等价 typed wiring，
   不能从 Engine spec、per-run metadata 或 caller payload 读取预算参数。
 - 真实 production LLM compactor adapter 未在 S6 默认注入。production composition owner 必须显式提供
-  `ContextCompactor` 实现；未配置 compactor 时继续 fail closed，不得隐式使用 `FakeContextCompactor`。
+  `ContextCompactor` 实现；未配置 compactor 时继续 fail closed，不得导入或隐式使用
+  `tests.host.fake_compaction.FakeContextCompactor`。
 - S6 aggregate multi-turn test 串起 proactive compact -> memory projection -> subsequent Engine request，但完整业务工具
   verified fact public fake-worker 链路仍由 ToolRuntime accept、memory projection 与 RunInputBuilder 的分层测试覆盖；
   aggregate review 若要求更高保真业务工具 E2E，应作为 Phase 10 aggregate fix item，而不是把 fake compactor 注入

@@ -944,9 +944,29 @@ dayu-cli process --ticker AAPL --ci --document-id fil_001 --document-id fil_002
 - `dayu-cli write --summary --ticker AAPL` 的摘要输出
 - 需要排查问题时，再看对应的 `*_audit.json`
 
-## 5. Engine provider smoke
+## 5. 手工 smoke
 
-当前 `utils/` 只保留 Engine provider smoke 脚本，用于人工验证 OpenAI-compatible provider 的基础 Agent 主链路。它不属于生产入口，也不读取 Host 配置。
+### 5.1 Host public 多轮闭环 smoke
+
+`utils/smoke_host_public_multiturn.py` 用于人工观察真实生产系统 Service 只通过 Host public interface / contract 完成多轮会话闭环的过程。脚本写死 DeepSeek：ordinary runner 与 Host-owned compactor runner 都使用 `DEEPSEEK_API_KEY`；构造期通过 `OpenHostOptions` 注入本地 worker factory、mock business tool、memory policy 与 `CompactorRunnerBaseline`，不传入 Host runtime liveness identity，也不注入低层 compactor port。打开后脚本只调用 public Host handle。脚本把 Dayu 日志默认打开到 `VERBOSE`，便于观察 Host command、dispatch、EngineEvent ingest、ToolRuntime、memory catch-up 与 context compact 主路径。
+
+```bash
+source .venv/bin/activate
+python utils/smoke_host_public_multiturn.py
+```
+
+常用调试模式：
+
+```bash
+source .venv/bin/activate
+python utils/smoke_host_public_multiturn.py --log-level DEBUG
+```
+
+该脚本不是 pytest，不断言模型固定回答。它会打印 Session / Run / terminal HostEvent 摘要、final answer 预览、mock tool 调用次数、compact artifact 路径，并保留运行目录 `workspace/tmp/host_public_multiturn_smoke/latest` 供人工排查。脚本不输出 API key、headers、完整 prompt 或 provider payload。
+
+### 5.2 Engine provider smoke
+
+`utils/smoke_async_agent_providers.py` 用于人工验证 OpenAI-compatible provider 的基础 Agent 主链路。它不属于生产入口，也不读取 Host 配置。
 
 ```bash
 source .venv/bin/activate

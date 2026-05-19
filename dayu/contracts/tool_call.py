@@ -123,9 +123,18 @@ class BatchToolExecutionContext:
         """校验批级运行期上下文。
 
         :returns: 无返回值。
-        :raises ValueError: ``timeout_seconds`` 不为 ``None`` 且不是有限正数时抛出。
+        :raises ValueError: ``run_id``、``session_id``、``iteration_id`` 为空 /
+            纯空白，或 ``timeout_seconds`` 不为 ``None`` 且不是有限正数时抛出。
         """
 
+        if self.run_id.strip() == "":
+            raise ValueError("BatchToolExecutionContext.run_id must be non-empty")
+        if self.session_id.strip() == "":
+            raise ValueError("BatchToolExecutionContext.session_id must be non-empty")
+        if self.iteration_id.strip() == "":
+            raise ValueError(
+                "BatchToolExecutionContext.iteration_id must be non-empty"
+            )
         if self.timeout_seconds is not None and (
             not math.isfinite(self.timeout_seconds) or self.timeout_seconds <= 0
         ):

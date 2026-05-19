@@ -27,6 +27,7 @@ _DEFAULT_CLAIM_TTL_SECONDS: Final[float] = 30.0
 _DEFAULT_HEARTBEAT_INTERVAL_SECONDS: Final[float] = 10.0
 _DEFAULT_BUSY_TIMEOUT_SECONDS: Final[float] = 5.0
 _DEFAULT_POLL_INTERVAL_SECONDS: Final[float] = 0.05
+_OUTER_CANCELLATION_SETTLE_SLEEP_SECONDS: Final[float] = 0.01
 _SQLITE_MILLISECONDS_PER_SECOND: Final[int] = 1000
 _CLAIM_ID_BYTES: Final[int] = 16
 _OWNER_ID_BYTES: Final[int] = 8
@@ -40,6 +41,9 @@ _LOG_UNTRACKED_RELEASE_FAILED: Final[str] = (
 _LOG_UNTRACKED_RELEASE_FAILED_AFTER_CANCEL: Final[str] = (
     "runtime lane untracked claim release failed after outer cancellation; "
     "claim will rely on TTL cleanup"
+)
+_LOG_REFRESH_FAILED_AFTER_CANCEL: Final[str] = (
+    "runtime lane refresh failed after outer cancellation"
 )
 _CLOSE_REASON_HEARTBEAT_ERROR: Final[str] = "lane heartbeat error"
 _LOGGER = logging.getLogger(__name__)
@@ -566,8 +570,8 @@ class LaneController:
         except asyncio.CancelledError as cancelled:
             try:
                 claim = await _await_task_after_outer_cancellation(claim_task)
-            except RuntimeLaneError:
-                raise cancelled
+            except RuntimeLaneError as exc:
+                raise cancelled from exc
             if claim.acquired and claim.claim_id is not None:
                 try:
                     await self._release_untracked_claim(
@@ -575,8 +579,8 @@ class LaneController:
                         claim.claim_id,
                         failure_message=_LOG_UNTRACKED_RELEASE_FAILED_AFTER_CANCEL,
                     )
-                except RuntimeLaneError:
-                    raise cancelled
+                except RuntimeLaneError as exc:
+                    raise cancelled from exc
             raise
 
     def _try_claim_once_sync(self, lane_config: LaneConfig) -> _ClaimAttempt:
@@ -657,6 +661,23 @@ class LaneController:
         )
         try:
             expires_at = await asyncio.shield(refresh_task)
+        except asyncio.CancelledError as cancelled:
+            try:
+                expires_at = await _await_task_after_outer_cancellation(refresh_task)
+            except RuntimeLaneClaimLostError as exc:
+                self._mark_token_lost(token)
+                raise cancelled from exc
+            except RuntimeLaneError as exc:
+                _LOGGER.exception(
+                    _LOG_REFRESH_FAILED_AFTER_CANCEL,
+                    extra={
+                        "lane_name": token.name,
+                        "claim_id": token.claim_id,
+                    },
+                )
+                raise cancelled from exc
+            token.expires_at = expires_at
+            raise cancelled
         except RuntimeLaneClaimLostError:
             self._mark_token_lost(token)
             raise
@@ -991,6 +1012,7 @@ async def _await_task_after_outer_cancellation(
         except asyncio.CancelledError:
             if task.done():
                 return task.result()
+            await asyncio.sleep(_OUTER_CANCELLATION_SETTLE_SLEEP_SECONDS)
             continue
 
 
@@ -1045,7 +1067,12 @@ def _prepare_database_parent(config: SQLiteLaneCoordinatorConfig) -> None:
         return
     if not config.create_parent_dirs:
         raise RuntimeLaneConfigError("SQLite lane db_path parent 不存在")
-    parent.mkdir(parents=True, exist_ok=True)
+    try:
+        parent.mkdir(parents=True, exist_ok=True)
+    except OSError as exc:
+        raise RuntimeLaneConfigError(
+            "SQLite lane db_path parent 创建失败"
+        ) from exc
 
 
 def _prepare_and_initialize_database(config: SQLiteLaneCoordinatorConfig) -> None:

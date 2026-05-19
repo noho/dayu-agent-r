@@ -19,27 +19,23 @@ from dayu.host import (
     HostApiError,
     HostApiErrorCode,
     HostCallContext,
-    HostCommandHandle,
-    HostCommandHandleOptions,
-    HostInput,
     OperationContext,
     PurgeSessionRequest,
     ReplayRunRequest,
     RetryRunRequest,
     RunStatus,
-    StartRunRequest,
     SubmitFollowupRequest,
     cancel_run,
-    create_host_command_handle,
     ensure_session,
     get_run,
     purge_session,
     replay_run,
     retry_run,
-    start_run,
     submit_followup,
 )
-from dayu.host.api import EnsureSessionRequest
+from dayu.host.api import HostInput
+from dayu.host.api import EnsureSessionRequest, HostCommandHandleOptions, StartRunRequest
+from dayu.host.command import HostCommandHandle, create_host_command_handle, start_run
 from dayu.host.durable.errors import HostDurableError
 from dayu.host.durable.state import (
     RunRow,
@@ -278,7 +274,12 @@ def _followup_request(
         context=_context(),
         session_id=session_id,
         client_request_id=client_request_id,
-        input=_input(f"follow-{client_request_id}"),
+        system_prompt=None,
+        user_prompt=f"follow-{client_request_id}",
+        tool_names=None,
+        runner_spec=None,
+        runner_options=None,
+        agent_policy=None,
         behavior=behavior,
         target_run_id=target_run_id,
     )
@@ -398,28 +399,31 @@ def _run_status(db_path: Path, run_id: str) -> RunStatus:
     return RunStatus(str(row[0]))
 
 
-def test_start_run_direct_running_and_attach_active(tmp_path: Path) -> None:
-    """public start_run 支持 direct running 与 attach_active。"""
+def test_start_run_accepts_and_attach_active_rejects_unstarted_run(
+    tmp_path: Path,
+) -> None:
+    """public start_run 先进入 ACCEPTED，attach_active 不附着未启动 Run。"""
 
     options = _options(tmp_path)
     host = create_host_command_handle(options)
     try:
         session_id = _session_id(host)
-        running = start_run(host, _start_request(session_id, "start-1"))
+        accepted = start_run(host, _start_request(session_id, "start-1"))
         before_attach = _event_count(options.db_path)
-        attached = start_run(
-            host,
-            _start_request(
-                session_id,
-                "attach-1",
-                queue_policy="attach_active",
-            ),
-        )
 
-        assert running.status == RunStatus.RUNNING
-        assert running.current_attempt_id is not None
-        assert attached.run_id == running.run_id
-        assert attached.status == RunStatus.RUNNING
+        with pytest.raises(HostApiError) as exc_info:
+            start_run(
+                host,
+                _start_request(
+                    session_id,
+                    "attach-1",
+                    queue_policy="attach_active",
+                ),
+            )
+
+        assert accepted.status == RunStatus.ACCEPTED
+        assert accepted.current_attempt_id is None
+        assert exc_info.value.code == HostApiErrorCode.CONFLICT
         assert _event_count(options.db_path) == before_attach
     finally:
         host.close()
@@ -439,16 +443,16 @@ def test_get_run_missing_returns_not_found(tmp_path: Path) -> None:
         host.close()
 
 
-def test_get_run_returns_durable_status_attempt_and_cursor(
+def test_get_run_returns_durable_status_and_cursor(
     tmp_path: Path,
 ) -> None:
-    """get_run 返回 queued、running、cancelled Run 的 durable truth。"""
+    """get_run 返回 accepted、queued、cancelled Run 的 durable truth。"""
 
     options = _options(tmp_path)
     host = create_host_command_handle(options)
     try:
         session_id = _session_id(host)
-        running = start_run(host, _start_request(session_id, "start-running"))
+        accepted = start_run(host, _start_request(session_id, "start-accepted"))
         queued = start_run(
             host,
             _start_request(session_id, "start-queued", queue_policy="queue"),
@@ -461,13 +465,13 @@ def test_get_run_returns_durable_status_attempt_and_cursor(
             host, queued.run_id, _cancel_request("cancel-queued")
         )
 
-        running_read = get_run(host, running.run_id)
+        accepted_read = get_run(host, accepted.run_id)
         cancelled_read = get_run(host, cancelled.run_id)
 
-        assert running_read.status == RunStatus.RUNNING
-        assert running_read.current_attempt_id == running.current_attempt_id
-        assert running_read.event_cursor.event_sequence == _known_run_event_cursor(
-            options.db_path, running.run_id
+        assert accepted_read.status == RunStatus.ACCEPTED
+        assert accepted_read.current_attempt_id is None
+        assert accepted_read.event_cursor.event_sequence == _known_run_event_cursor(
+            options.db_path, accepted.run_id
         )
         assert queued_read.status == RunStatus.QUEUED
         assert queued_read.current_attempt_id is None
@@ -541,41 +545,31 @@ def test_start_run_same_key_different_digest_conflicts(tmp_path: Path) -> None:
         host.close()
 
 
-def test_submit_followup_queue_active_and_no_active(tmp_path: Path) -> None:
-    """submit_followup(queue) 在 active 存在时排队，无 active 时直接 running。"""
+def test_submit_followup_queue_requires_opener_baseline(tmp_path: Path) -> None:
+    """低层 command handle 无 opener baseline 时 submit_followup fail closed。"""
 
-    host = _open_handle(tmp_path)
+    options = _options(tmp_path)
+    host = create_host_command_handle(options)
     try:
         session_id = _session_id(host)
         start_run(host, _start_request(session_id, "start-1"))
+        before_followup = _event_count(options.db_path)
 
-        queued = submit_followup(
-            host, session_id, _followup_request(session_id, "follow-queued")
-        )
-        assert queued.accepted_run_status == RunStatus.QUEUED
-        assert queued.queued_run_id == queued.accepted_run_id
+        with pytest.raises(HostApiError) as exc_info:
+            submit_followup(
+                host, session_id, _followup_request(session_id, "follow-queued")
+            )
 
-        other_session_id = ensure_session(
-            host,
-            EnsureSessionRequest(
-                scope="workspace", slot_key="slot-b", metadata=()
-            ),
-        ).session_id
-        direct = submit_followup(
-            host,
-            other_session_id,
-            _followup_request(other_session_id, "follow-direct"),
-        )
-        assert direct.accepted_run_status == RunStatus.RUNNING
-        assert direct.queued_run_id is None
+        assert exc_info.value.code == HostApiErrorCode.INVALID_STATE
+        assert _event_count(options.db_path) == before_followup
     finally:
         host.close()
 
 
-def test_submit_followup_steer_is_unsupported_without_event_append(
+def test_submit_followup_steer_rejects_unstarted_target_without_event_append(
     tmp_path: Path,
 ) -> None:
-    """submit_followup(steer) 返回 unsupported，且不追加 EventLog。"""
+    """submit_followup(steer) 对未启动 target 返回 invalid state 且不追加 EventLog。"""
 
     options = _options(tmp_path)
     host = create_host_command_handle(options)
@@ -595,7 +589,7 @@ def test_submit_followup_steer_is_unsupported_without_event_append(
                     target_run_id=active.run_id,
                 ),
             )
-        assert exc_info.value.code == HostApiErrorCode.UNSUPPORTED_OPERATION
+        assert exc_info.value.code == HostApiErrorCode.INVALID_STATE
         assert exc_info.value.retryable is False
         assert _event_count(options.db_path) == before_steer
     finally:
@@ -707,10 +701,10 @@ def test_public_cancel_and_promotion_race_preserves_run_invariants(
     assert latest_queued_status == RunStatus.CANCELLED
 
 
-def test_deferred_public_functions_are_stable_unsupported_without_writes(
+def test_retry_replay_reject_non_terminal_and_purge_remains_unsupported(
     tmp_path: Path,
 ) -> None:
-    """retry/replay/purge_session 返回 unsupported 且不写事实。"""
+    """retry/replay 对非目标源状态 fail closed；purge_session 仍 unsupported。"""
 
     options = _options(tmp_path)
     host = create_host_command_handle(options)
@@ -752,8 +746,14 @@ def test_deferred_public_functions_are_stable_unsupported_without_writes(
                 ),
             )
 
+        for exc_info in (retry_exc, replay_exc):
+            assert exc_info.value.code == HostApiErrorCode.INVALID_STATE
+            assert exc_info.value.retryable is False
+            assert exc_info.value.detail is None
+        assert purge_exc.value.code == HostApiErrorCode.UNSUPPORTED_OPERATION
+        assert purge_exc.value.retryable is False
+        assert purge_exc.value.detail is None
         for exc_info in (retry_exc, replay_exc, purge_exc):
-            assert exc_info.value.code == HostApiErrorCode.UNSUPPORTED_OPERATION
             assert exc_info.value.retryable is False
             assert exc_info.value.detail is None
         assert _event_count(options.db_path) == before_events

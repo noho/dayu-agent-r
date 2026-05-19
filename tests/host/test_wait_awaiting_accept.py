@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import inspect
 from dataclasses import replace
 from datetime import UTC, datetime
 from pathlib import Path
@@ -55,6 +56,7 @@ from dayu.host.wait_adapter import (
 )
 from dayu.host.waiting import (
     DefaultHostToolAwaitingAcceptPort,
+    HostToolAwaitingAcceptPort,
     ToolAwaitingAcceptCandidate,
     ToolAwaitingAcceptedAck,
     ToolAwaitingRejectedAck,
@@ -62,6 +64,12 @@ from dayu.host.waiting import (
 
 _NOW = datetime(2026, 5, 16, 1, 2, 3, tzinfo=UTC)
 _CALL_CONTEXT_DIGEST = sha256_digest_json({"context": "awaiting-accept-test"})
+
+
+def test_awaiting_accept_port_is_abstract() -> None:
+    """awaiting accept port 必须是抽象端口，不能直接实例化。"""
+
+    assert inspect.isabstract(HostToolAwaitingAcceptPort)
 
 
 def test_awaiting_accept_creates_wait_record_and_waiting_state(

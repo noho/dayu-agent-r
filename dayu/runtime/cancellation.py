@@ -35,15 +35,16 @@ timeout、外层 cancel），不留泄漏。
 from __future__ import annotations
 
 import asyncio
+import logging
 import time
 from collections.abc import Awaitable
-from contextlib import suppress
 from dataclasses import dataclass
 from typing import Final, Generic, TypeAlias, TypeVar
 
 from dayu.contracts.cancellation import CancellationToken
 
 _DEFAULT_POLL_INTERVAL_SECONDS: Final[float] = 0.05
+_LOGGER = logging.getLogger(__name__)
 
 T = TypeVar("T")
 
@@ -112,6 +113,7 @@ async def await_or_cancel(
         target task 已被取消并收口。
     """
 
+    _validate_poll_interval(poll_interval_seconds, awaitable=awaitable)
     if token.is_cancelled():
         if asyncio.iscoroutine(awaitable):
             awaitable.close()
@@ -175,6 +177,7 @@ async def wait_for_or_cancel(
         helper 直接传播给调用方。
     """
 
+    _validate_poll_interval(poll_interval_seconds, awaitable=None)
     started_at = time.monotonic()
     if token.is_cancelled():
         return WaitCancelled(reason=token.cancel_reason())
@@ -233,6 +236,7 @@ async def await_or_cancel_or_timeout(
         ``awaitable`` 自身抛出 ``asyncio.CancelledError`` 时透传。
     """
 
+    _validate_poll_interval(poll_interval_seconds, awaitable=awaitable)
     if token.is_cancelled():
         if asyncio.iscoroutine(awaitable):
             awaitable.close()
@@ -271,6 +275,26 @@ async def await_or_cancel_or_timeout(
             await _cancel_task_and_wait(cancel_watcher)
 
 
+def _validate_poll_interval(
+    poll_interval_seconds: float,
+    *,
+    awaitable: Awaitable[T] | None,
+) -> None:
+    """校验取消轮询间隔并在拒绝 coroutine 时关闭它。
+
+    :param poll_interval_seconds: 轮询间隔秒数。
+    :param awaitable: 当前 helper 拥有的 awaitable；无 awaitable 时为 ``None``。
+    :returns: ``None``。
+    :raises ValueError: 轮询间隔小于或等于零时抛出。
+    """
+
+    if poll_interval_seconds > 0:
+        return
+    if awaitable is not None and asyncio.iscoroutine(awaitable):
+        awaitable.close()
+    raise ValueError("poll_interval_seconds must be positive")
+
+
 async def _poll_cancellation(
     token: CancellationToken, *, interval_seconds: float
 ) -> None:
@@ -294,17 +318,33 @@ async def _cancel_task_and_wait(
     """取消并等待任务收口。
 
     :param task: 需要取消的任务（任意结果类型）。
-    :returns: 无返回值；吞掉 ``asyncio.CancelledError`` 与任务自身异常。
+    :returns: 无返回值；吞掉 ``asyncio.CancelledError``，普通异常写入 warning。
     """
 
     if task.done():
         # 已完成的 task 仍读一次结果以避免 "Task exception was never retrieved"
-        with suppress(asyncio.CancelledError, Exception):
+        try:
             task.result()
+        except asyncio.CancelledError:
+            return
+        except Exception as exc:
+            _LOGGER.warning(
+                "runtime.cancellation.cancelled_task_failed error_type=%s",
+                exc.__class__.__name__,
+                exc_info=True,
+            )
         return
     task.cancel()
-    with suppress(asyncio.CancelledError, Exception):
+    try:
         await task
+    except asyncio.CancelledError:
+        return
+    except Exception as exc:
+        _LOGGER.warning(
+            "runtime.cancellation.cancelled_task_failed error_type=%s",
+            exc.__class__.__name__,
+            exc_info=True,
+        )
 
 
 __all__ = [

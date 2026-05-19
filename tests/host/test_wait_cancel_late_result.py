@@ -18,9 +18,9 @@ from dayu.host import (
     RunStatus,
     cancel_run,
     cancel_session_runs,
-    create_host_command_handle,
     resolve_wait,
 )
+from dayu.host.command import create_host_command_handle
 from dayu.host.admission import create_host_admission_service
 from dayu.host.durable.event_log import EventLogRow
 from dayu.host.durable.state import WaitRecordStatus

@@ -121,7 +121,7 @@ Required typed contracts:
 - `PinnedStatePatchCandidate`：字段级三态 patch，覆盖 `current_goal`、`confirmed_subjects`、`user_constraints`、`open_questions`。未出现表示不修改，空值表示显式清空，非空值表示替换。
 - `PreservationEvidence`：为每条 summary / patch candidate 关联 input event refs、tool fact refs、memory cursor 或 compact input range。
 - `CompactQualityCheckResult`：记录 current user input、accepted tool fact refs、evidence anchors、open questions / assumptions refs 是否保留，以及 dropped / summarized ranges。
-- `FakeContextCompactor`：测试用 deterministic compactor，不能导入测试模块，放在 production 或 test helper 需遵守 import boundary。推荐 production 放 `dayu/host/fake_compaction.py` 仅用于 tests / local composition 明确注入。
+- `FakeContextCompactor`：测试用 deterministic compactor，位于 `tests/host/fake_compaction.py`，只能由测试显式注入；生产代码不得导入 tests helper。
 
 Quality check:
 
@@ -261,7 +261,7 @@ Stop condition:
 Allowed files / modules:
 
 - `dayu/host/compaction.py`
-- `dayu/host/fake_compaction.py`
+- `tests/host/fake_compaction.py`
 - `dayu/host/context_governance.py`
 - `dayu/host/compact_artifact.py`
 - `dayu/host/durable/artifact.py`
@@ -512,8 +512,8 @@ Exact changes:
   - `HostLocalExecutionOptions` receives the already typed `ContextBudgetPolicy` and exposes it to pre-start governance, reactive governance and RunInputBuilder compact provider construction.
   - No per-run request metadata, caller payload, Engine runner spec or provider overflow event may override these values.
 - Local execution wiring must keep memory projection policy and context policy separate. Memory policy controls memory view; context policy controls budget / compact decisions.
-- Add deterministic fake compactor wiring for tests and optional local developer configuration if existing test patterns require it.
-- If `FakeContextCompactor` is placed under `dayu/host/fake_compaction.py`，the module docstring must state it is only for tests/local development and production paths must use explicit composition injection; no default production path may import it implicitly.
+- Add deterministic fake compactor wiring under `tests/host/fake_compaction.py` for tests that need stable low-level compaction injection.
+- Production code must not import `tests.host.fake_compaction.FakeContextCompactor`; production paths must use explicit composition injection of a real `ContextCompactor`.
 - Update docs only after tests:
   - `dayu/host/README.md` because Host state machine, RunInputBuilder provider, Engine ingest recovery and local execution composition change.
   - `dayu/README.md` only if the UI / Service / Host / Engine boundary description needs context policy provider wording.

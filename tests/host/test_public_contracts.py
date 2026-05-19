@@ -36,15 +36,10 @@ from dayu.host import (
     HostApiErrorCode,
     HostApiErrorDetail,
     HostCallContext,
-    HostEventStream,
-    HostEventView,
-    HostInput,
-    HostLocalExecutionOptions,
     HostPayloadRef,
     LocalEngineWorkerFactory,
     HostMetadataEntry,
     HostStreamCursor,
-    HostCommandHandleOptions,
     OperationContext,
     OutboxSummary,
     PurgeSessionRequest,
@@ -62,13 +57,20 @@ from dayu.host import (
     SessionSnapshot,
     SessionStatus,
     SourceRunRelation,
-    StartRunRequest,
     SteerConflictDetail,
     SubmitFollowupRequest,
     TerminalResultSummary,
     WaitAdapterKey,
     WaitProviderStatusRef,
     WaitResolutionSource,
+)
+from dayu.host.api import (
+    HostCommandHandleOptions,
+    HostEventStream,
+    HostEventView,
+    HostInput,
+    HostLocalExecutionOptions,
+    StartRunRequest,
 )
 from dayu.host.command import compose_host_local_execution_options
 from dayu.host.tool_runtime import ToolFactKind
@@ -872,7 +874,12 @@ def test_empty_id_validation_failure_path() -> None:
             context=_call_context(),
             session_id=" ",
             client_request_id="client-1",
-            input=_host_input(),
+            system_prompt=None,
+            user_prompt="prompt",
+            tool_names=None,
+            runner_spec=None,
+            runner_options=None,
+            agent_policy=None,
             behavior=FollowupBehavior.QUEUE,
             target_run_id=None,
         )
@@ -927,7 +934,7 @@ def test_followup_snapshot_queue_accepts_queued_run_shape() -> None:
         behavior=FollowupBehavior.QUEUE,
         accepted_run_id="run-1",
         accepted_run_status=RunStatus.QUEUED,
-        current_cursor=HostStreamCursor(event_sequence=1),
+        command_watermark=HostStreamCursor(event_sequence=1),
         queued_run_id="run-1",
         target_run_id=None,
     )
@@ -945,7 +952,7 @@ def test_followup_snapshot_queue_accepts_running_run_shape() -> None:
         behavior=FollowupBehavior.QUEUE,
         accepted_run_id="run-1",
         accepted_run_status=RunStatus.RUNNING,
-        current_cursor=HostStreamCursor(event_sequence=1),
+        command_watermark=HostStreamCursor(event_sequence=1),
         queued_run_id=None,
         target_run_id=None,
     )
@@ -963,7 +970,7 @@ def test_followup_snapshot_steer_does_not_require_queued_run_id() -> None:
         behavior=FollowupBehavior.STEER,
         accepted_run_id="run-1",
         accepted_run_status=RunStatus.RUNNING,
-        current_cursor=HostStreamCursor(event_sequence=1),
+        command_watermark=HostStreamCursor(event_sequence=1),
         queued_run_id=None,
         target_run_id="run-1",
     )
@@ -981,7 +988,7 @@ def test_followup_snapshot_queue_rejects_target_run_id() -> None:
             behavior=FollowupBehavior.QUEUE,
             accepted_run_id="run-1",
             accepted_run_status=RunStatus.QUEUED,
-            current_cursor=HostStreamCursor(event_sequence=0),
+            command_watermark=HostStreamCursor(event_sequence=0),
             queued_run_id="run-1",
             target_run_id="run-1",
         )
@@ -996,7 +1003,7 @@ def test_followup_snapshot_queue_rejects_missing_queued_run_id() -> None:
             behavior=FollowupBehavior.QUEUE,
             accepted_run_id="run-1",
             accepted_run_status=RunStatus.QUEUED,
-            current_cursor=HostStreamCursor(event_sequence=0),
+            command_watermark=HostStreamCursor(event_sequence=0),
             queued_run_id=None,
             target_run_id=None,
         )
@@ -1011,22 +1018,22 @@ def test_followup_snapshot_queue_rejects_running_queued_run_id() -> None:
             behavior=FollowupBehavior.QUEUE,
             accepted_run_id="run-1",
             accepted_run_status=RunStatus.RUNNING,
-            current_cursor=HostStreamCursor(event_sequence=0),
+            command_watermark=HostStreamCursor(event_sequence=0),
             queued_run_id="run-1",
             target_run_id=None,
         )
 
 
-def test_followup_snapshot_queue_rejects_unsupported_status() -> None:
-    """queue follow-up snapshot 只允许 accepted Run 处于 QUEUED 或 RUNNING。"""
+def test_followup_snapshot_queue_rejects_recovering_status() -> None:
+    """queue follow-up snapshot 不把 Slice 3 外 recovery 状态作为接受结果。"""
 
     with pytest.raises(ValueError, match="accepted_run_status"):
         FollowupSnapshot(
             accepted_input_ref="input-1",
             behavior=FollowupBehavior.QUEUE,
             accepted_run_id="run-1",
-            accepted_run_status=RunStatus.CANCELLED,
-            current_cursor=HostStreamCursor(event_sequence=0),
+            accepted_run_status=RunStatus.RECOVERING,
+            command_watermark=HostStreamCursor(event_sequence=0),
             queued_run_id=None,
             target_run_id=None,
         )
@@ -1040,7 +1047,12 @@ def test_steer_requires_target_run_id() -> None:
             context=_call_context(),
             session_id="session-1",
             client_request_id="client-1",
-            input=_host_input(),
+            system_prompt=None,
+            user_prompt="prompt",
+            tool_names=None,
+            runner_spec=None,
+            runner_options=None,
+            agent_policy=None,
             behavior=FollowupBehavior.STEER,
             target_run_id=None,
         )
@@ -1054,7 +1066,12 @@ def test_queue_rejects_target_run_id() -> None:
             context=_call_context(),
             session_id="session-1",
             client_request_id="client-1",
-            input=_host_input(),
+            system_prompt=None,
+            user_prompt="prompt",
+            tool_names=None,
+            runner_spec=None,
+            runner_options=None,
+            agent_policy=None,
             behavior=FollowupBehavior.QUEUE,
             target_run_id="run-1",
         )

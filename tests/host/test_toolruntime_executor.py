@@ -310,6 +310,23 @@ class _RetryExhaustedAcceptPort(HostToolFactAcceptPort):
         )
 
 
+class _TimeoutAcceptPort(HostToolFactAcceptPort):
+    """始终抛出同步 TimeoutError 的 accept port。"""
+
+    def accept_tool_fact(
+        self, candidate: ToolFactAcceptCandidate
+    ) -> ToolFactAcceptResult:
+        """模拟同步 accept port 抛出 TimeoutError。
+
+        :param candidate: 工具事实候选。
+        :returns: 不会正常返回。
+        :raises TimeoutError: 始终抛出。
+        """
+
+        del candidate
+        raise TimeoutError("sync timeout should not be caught")
+
+
 class _AwaitingAcceptPort(HostToolAwaitingAcceptPort):
     """记录 awaiting candidate 并返回 accepted ack 的 fake port。"""
 
@@ -391,6 +408,40 @@ class _SequencedAwaitingAcceptPort(HostToolAwaitingAcceptPort):
         if index >= len(self._results):
             return _AwaitingAcceptPort().accept_tool_awaiting(candidate)
         return self._results[index]
+
+
+class _RetryExhaustedAwaitingAcceptPort(HostToolAwaitingAcceptPort):
+    """始终模拟 awaiting accept 事务重试耗尽的 fake port。"""
+
+    def accept_tool_awaiting(
+        self, candidate: ToolAwaitingAcceptCandidate
+    ) -> ToolAwaitingAcceptResult:
+        """抛出 Host 事务重试耗尽异常。
+
+        :param candidate: awaiting candidate。
+        :returns: 不会正常返回。
+        :raises HostTransactionRetryExhaustedError: 始终抛出。
+        """
+
+        del candidate
+        raise HostTransactionRetryExhaustedError("busy", attempts=1)
+
+
+class _TimeoutAwaitingAcceptPort(HostToolAwaitingAcceptPort):
+    """始终抛出同步 TimeoutError 的 awaiting accept port。"""
+
+    def accept_tool_awaiting(
+        self, candidate: ToolAwaitingAcceptCandidate
+    ) -> ToolAwaitingAcceptResult:
+        """模拟同步 awaiting accept port 抛出 TimeoutError。
+
+        :param candidate: awaiting candidate。
+        :returns: 不会正常返回。
+        :raises TimeoutError: 始终抛出。
+        """
+
+        del candidate
+        raise TimeoutError("sync awaiting timeout should not be caught")
 
 
 @pytest.mark.asyncio
@@ -616,6 +667,17 @@ async def test_accept_retry_exhausted_returns_governed_timeout() -> None:
 
 
 @pytest.mark.asyncio
+async def test_sync_timeout_error_from_accept_port_is_not_caught() -> None:
+    """同步 accept port 的 TimeoutError 不应被误分类为 retry timeout。"""
+
+    callable_ = _CountingCallable({"secret": "timeout-error"})
+    executor = _executor(callable_, _TimeoutAcceptPort())
+
+    with pytest.raises(TimeoutError, match="sync timeout"):
+        await executor.execute(_request(_call("tool-call-1")))
+
+
+@pytest.mark.asyncio
 async def test_side_effect_tool_missing_idempotency_key_never_calls_callable() -> None:
     """side-effect 工具缺少必需幂等 key 时不得调用 callable。"""
 
@@ -790,7 +852,55 @@ async def test_awaiting_accept_timeout_returns_governed_error() -> None:
     record = outcome.records[0]
     assert isinstance(record.outcome, ToolFailedOutcome)
     assert record.outcome.result.error == "tool_awaiting_accept_timeout"
-    assert record.outcome.result.hint == "accept_ack_lost"
+    assert record.outcome.result.hint is not None
+    assert record.outcome.result.hint.startswith("accept_ack_lost;diagnostic_refs=")
+    assert "tool-diagnostic-" in record.outcome.result.hint
+
+
+@pytest.mark.asyncio
+async def test_awaiting_accept_retry_exhaustion_emits_diagnostic_ref() -> None:
+    """awaiting accept retry 耗尽时最终失败 outcome 携带诊断引用。"""
+
+    callable_ = _AwaitingCallable()
+    accept_port = _SequencedAcceptPort((_accepted_ack_for_call("tool-call-1"),))
+    awaiting_accept_port = _RetryExhaustedAwaitingAcceptPort()
+    diagnostics = InMemoryToolTraceDiagnosticEmitter()
+    executor = _executor(
+        callable_,
+        accept_port,
+        awaiting_accept_port=awaiting_accept_port,
+        wait_adapter_registry=_wait_adapter_registry(),
+        diagnostic_emitter=diagnostics,
+    )
+
+    outcome = await executor.execute(_request(_call("tool-call-1")))
+
+    record = outcome.records[0]
+    assert isinstance(record.outcome, ToolFailedOutcome)
+    assert record.outcome.result.error == "tool_awaiting_accept_timeout"
+    assert (
+        record.outcome.result.hint
+        == "accept_ack_lost;diagnostic_refs=tool-diagnostic-memory-1"
+    )
+    assert len(diagnostics.records) == 1
+    assert diagnostics.records[0].reason_code == "accept_timeout"
+
+
+@pytest.mark.asyncio
+async def test_sync_timeout_error_from_awaiting_accept_port_is_not_caught() -> None:
+    """同步 awaiting accept port 的 TimeoutError 不应被误分类为 retry timeout。"""
+
+    callable_ = _AwaitingCallable()
+    accept_port = _SequencedAcceptPort((_accepted_ack_for_call("tool-call-1"),))
+    executor = _executor(
+        callable_,
+        accept_port,
+        awaiting_accept_port=_TimeoutAwaitingAcceptPort(),
+        wait_adapter_registry=_wait_adapter_registry(),
+    )
+
+    with pytest.raises(TimeoutError, match="sync awaiting timeout"):
+        await executor.execute(_request(_call("tool-call-1")))
 
 
 @pytest.mark.asyncio

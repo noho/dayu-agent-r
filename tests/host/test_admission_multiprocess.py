@@ -7,14 +7,18 @@ admission / transition helper 在多个独立进程各自打开 SQLite connectio
 
 from __future__ import annotations
 
+import os
 import time
 from dataclasses import dataclass
 from datetime import UTC, datetime
 from multiprocessing import Process
 from pathlib import Path
 
+from dayu.engine.contracts.agent_policy import AgentPolicy
+from dayu.engine.contracts.runner_spec import RunnerCallOptions, RunnerSpec
 from dayu.host.admission import (
     CloseoutAttemptTerminalInput,
+    HostAdmissionService,
     SubmitFollowupQueueAdmissionInput,
     create_host_admission_service,
 )
@@ -29,6 +33,7 @@ from dayu.host.api import (
     HostCallContext,
     HostInput,
     HostMetadataEntry,
+    OrdinaryRunExecutionBaseline,
     OperationContext,
     RunStatus,
     StartRunRequest,
@@ -37,17 +42,25 @@ from dayu.host.api import (
 from dayu.host.durable.codec import sha256_digest_json
 from dayu.host.durable.connection import open_host_durable_store
 from dayu.host.durable.event_log import EventLogStore
+from dayu.host.durable.liveness import (
+    HostInstanceIdentity,
+    register_current_instance,
+)
 from dayu.host.durable.options import (
     HostDurableStoreOptions,
     HostSQLiteStoragePolicy,
     PayloadStoragePolicy,
 )
 from dayu.host.durable.run_transition import (
+    AcceptWorkerRunningInput,
     CancelQueuedRunInput,
     PromoteQueuedRunInput,
+    StartGovernedRunInput,
     TerminalCloseoutInput,
+    accept_worker_running_in_transaction,
     cancel_queued_in_transaction,
     promote_queued_run_in_transaction,
+    start_governed_run_with_starting_attempt_in_transaction,
     terminal_closeout_in_transaction,
 )
 from dayu.host.durable.schema import (
@@ -58,7 +71,14 @@ from dayu.host.durable.schema import (
     TABLE_HOST_SESSIONS,
 )
 from dayu.host.durable.session_lifecycle import ensure_session
-from dayu.host.durable.state import WorkerKind, read_run_by_id
+from dayu.host.durable.state import (
+    RunStartReason,
+    StateMutationStatus,
+    WorkerKind,
+    mark_dispatch_waiting_for_lane_row,
+    mark_dispatching_after_lane_row,
+    read_run_by_id,
+)
 from dayu.host.durable.transaction import HostRow, HostTransaction, HostTransactionRunner
 
 _PROCESS_COUNT = 4
@@ -189,7 +209,7 @@ def test_multiprocess_same_session_admission_keeps_one_active_run(
             """读取 admission 后的 Run / Attempt 计数。
 
             :param transaction: Host transaction。
-            :returns: total Run、running Run、queued Run、Attempt row 数。
+            :returns: total Run、accepted Run、queued Run、Attempt row 数。
             """
 
             return (
@@ -198,7 +218,7 @@ def test_multiprocess_same_session_admission_keeps_one_active_run(
                     transaction,
                     TABLE_HOST_RUNS,
                     "WHERE session_id = ? AND status = ?",
-                    (session_id, RunStatus.RUNNING.value),
+                    (session_id, RunStatus.ACCEPTED.value),
                 ),
                 _count_rows(
                     transaction,
@@ -209,13 +229,13 @@ def test_multiprocess_same_session_admission_keeps_one_active_run(
                 _count_rows(transaction, TABLE_HOST_ATTEMPTS),
             )
 
-        total_runs, running_runs, queued_runs, attempt_count = (
+        total_runs, accepted_runs, queued_runs, attempt_count = (
             store.transaction_runner.run_write(operation)
         )
         assert total_runs == _PROCESS_COUNT
-        assert running_runs == 1
+        assert accepted_runs == 1
         assert queued_runs == _PROCESS_COUNT - 1
-        assert attempt_count == 1
+        assert attempt_count == 0
         _assert_event_sequences_global_unique_and_increasing(store.transaction_runner)
 
 
@@ -340,7 +360,7 @@ def test_multiprocess_queued_followups_promote_by_accepted_sequence(
         assert len(queued_before) == _PROCESS_COUNT
         first_queued = queued_before[0]
 
-        service = create_host_admission_service(store.transaction_runner)
+        service = _admission_service(store.transaction_runner)
         result = service.closeout_attempt_terminal(
             CloseoutAttemptTerminalInput(
                 run_id=active_run_id,
@@ -352,8 +372,12 @@ def test_multiprocess_queued_followups_promote_by_accepted_sequence(
             )
         )
 
-        assert result.promotion.promoted_run is not None
-        assert result.promotion.promoted_run.run_id == first_queued.run_id
+        promotion = result.promotion
+        if promotion.promoted_run is None:
+            promotion = service.promote_next_queued_run(session_id)
+
+        assert promotion.promoted_run is not None
+        assert promotion.promoted_run.run_id == first_queued.run_id
         assert _read_run_status(store.transaction_runner, first_queued.run_id) == (
             RunStatus.RUNNING.value
         )
@@ -477,6 +501,56 @@ def _options(db_path: Path, artifact_root: Path) -> HostDurableStoreOptions:
     )
 
 
+def _admission_service(
+    transaction_runner: HostTransactionRunner,
+) -> HostAdmissionService:
+    """构造带 ordinary baseline 的 admission service。
+
+    :param transaction_runner: Host transaction runner。
+    :returns: Host admission service。
+    """
+
+    return create_host_admission_service(
+        transaction_runner,
+        ordinary_run_baseline=_ordinary_run_baseline(),
+    )
+
+
+def _ordinary_run_baseline() -> OrdinaryRunExecutionBaseline:
+    """构造多进程 follow-up 测试用 ordinary Run 执行基线。
+
+    :returns: OrdinaryRunExecutionBaseline。
+    """
+
+    return OrdinaryRunExecutionBaseline(
+        runner_spec=RunnerSpec(
+            provider="test",
+            model="multiprocess-baseline",
+            endpoint="https://example.invalid",
+            api_key_ref="secret:multiprocess",
+            headers={},
+            supports_tool_calling=False,
+            supports_streaming=False,
+            supports_stream_usage=False,
+            default_timeout_seconds=1.0,
+            max_retries=0,
+            provider_request=None,
+        ),
+        runner_options=RunnerCallOptions(
+            temperature=None,
+            max_tokens=None,
+            top_p=None,
+            stream=False,
+        ),
+        agent_policy=AgentPolicy(
+            max_iterations=1,
+            continuation_max_attempts=0,
+            allow_tool_calls=False,
+            tool_execution_timeout_seconds=1.0,
+        ),
+    )
+
+
 def _bootstrap_store(db_path: Path, artifact_root: Path) -> None:
     """初始化测试 DB schema。
 
@@ -534,7 +608,7 @@ def _seed_active_run_tuple(
     session_id = ""
     with open_host_durable_store(_options(db_path, artifact_root)) as store:
         session_id = _ensure_session_id(store.transaction_runner)
-        service = create_host_admission_service(store.transaction_runner)
+        service = _admission_service(store.transaction_runner)
         active = service.start_run(
             _start_request(
                 session_id=session_id,
@@ -543,9 +617,13 @@ def _seed_active_run_tuple(
             ),
             caller_semantic_digest=_CALLER_DIGEST,
         )
-        assert active.attempt is not None
         active_run_id = active.run.run_id
-        active_attempt_id = active.attempt.attempt_id
+        active_attempt_id = _start_governed_active(
+            store.transaction_runner,
+            run_id=active_run_id,
+            expected_status=RunStatus.ACCEPTED,
+            id_suffix="active",
+        )
     assert active_run_id != ""
     assert active_attempt_id != ""
     assert session_id != ""
@@ -566,7 +644,7 @@ def _seed_single_eligible_queued_run(
     session_id = ""
     with open_host_durable_store(_options(db_path, artifact_root)) as store:
         session_id = _ensure_session_id(store.transaction_runner)
-        service = create_host_admission_service(store.transaction_runner)
+        service = _admission_service(store.transaction_runner)
         active = service.start_run(
             _start_request(
                 session_id=session_id,
@@ -586,8 +664,12 @@ def _seed_single_eligible_queued_run(
             ),
             caller_semantic_digest=_CALLER_DIGEST,
         )
-        assert active.attempt is not None
-        active_attempt_id = active.attempt.attempt_id
+        active_attempt_id = _start_governed_active(
+            store.transaction_runner,
+            run_id=active.run.run_id,
+            expected_status=RunStatus.ACCEPTED,
+            id_suffix="race-active",
+        )
 
         def closeout(transaction: HostTransaction) -> None:
             """只释放 active slot，不执行 admission 层自动 promotion。
@@ -620,6 +702,104 @@ def _seed_single_eligible_queued_run(
     assert queued_run_id != ""
     assert session_id != ""
     return queued_run_id, session_id
+
+
+def _start_governed_active(
+    transaction_runner: HostTransactionRunner,
+    *,
+    run_id: str,
+    expected_status: RunStatus,
+    id_suffix: str,
+) -> str:
+    """把 accepted/queued Run 启动为 active Attempt。
+
+    :param transaction_runner: Host transaction runner。
+    :param run_id: 目标 Run id。
+    :param expected_status: 启动前期望 Run 状态。
+    :param id_suffix: 测试 id 后缀。
+    :returns: 新建 Attempt id。
+    :raises AssertionError: transition 未创建 Attempt 时抛出。
+    """
+
+    attempt_id = f"attempt-{id_suffix}"
+
+    def operation(transaction: HostTransaction) -> str:
+        """执行 governed start transition。
+
+        :param transaction: Host transaction。
+        :returns: 新建 Attempt id。
+        """
+
+        result = start_governed_run_with_starting_attempt_in_transaction(
+            transaction,
+            EventLogStore(),
+            StartGovernedRunInput(
+                run_id=run_id,
+                expected_status=expected_status,
+                run_started_event_id=f"event-run-started-{id_suffix}",
+                attempt_started_event_id=f"event-attempt-started-{id_suffix}",
+                attempt_id=attempt_id,
+                execution_id=f"execution-{id_suffix}",
+                dispatch_record_id=f"dispatch-{id_suffix}",
+                occurred_at=_NOW,
+                actor="host.dispatch",
+                source="multiprocess-test",
+                start_reason=(
+                    RunStartReason.INITIAL
+                    if expected_status is RunStatus.ACCEPTED
+                    else RunStartReason.QUEUE_PROMOTION
+                ),
+                worker_kind=WorkerKind.LOCAL,
+                owner_host_instance_id=None,
+            ),
+        )
+        assert result.attempt is not None
+        register_current_instance(
+            transaction,
+            HostInstanceIdentity(
+                host_instance_id="host-admission-multiprocess",
+                pid=os.getpid(),
+                process_start_token="admission-multiprocess-test",
+                boot_id=None,
+            ),
+        )
+        waiting = mark_dispatch_waiting_for_lane_row(
+            transaction,
+            attempt_id=attempt_id,
+            owner_host_instance_id="host-admission-multiprocess",
+            lane_name="llm",
+            waiting_for_lane_at="2026-05-14T10:00:00.000000Z",
+        )
+        assert waiting.status == StateMutationStatus.UPDATED
+        dispatching = mark_dispatching_after_lane_row(
+            transaction,
+            attempt_id=attempt_id,
+            owner_host_instance_id="host-admission-multiprocess",
+            lane_name="llm",
+            lane_claim_id=f"claim-{id_suffix}",
+            lane_owner_id="owner-admission-multiprocess",
+            lane_acquired_at="2026-05-14T10:00:00.000000Z",
+            dispatching_at="2026-05-14T10:00:00.000000Z",
+        )
+        assert dispatching.status == StateMutationStatus.UPDATED
+        accepted = accept_worker_running_in_transaction(
+            transaction,
+            EventLogStore(),
+            AcceptWorkerRunningInput(
+                run_id=run_id,
+                attempt_id=attempt_id,
+                attempt_running_event_id=f"event-attempt-running-{id_suffix}",
+                occurred_at=_NOW,
+                actor="host.dispatch",
+                source="multiprocess-test",
+                worker_accept_reason="local_worker_accepted",
+                local_worker_id=f"local-worker-{id_suffix}",
+            ),
+        )
+        assert accepted.status == StateMutationStatus.UPDATED
+        return result.attempt.attempt_id
+
+    return transaction_runner.run_write(operation)
 
 
 def _run_processes(processes: tuple[Process, ...], start_gate: Path) -> None:
@@ -705,7 +885,7 @@ def _mixed_admission_worker(
     with open_host_durable_store(
         _options(Path(db_path_text), Path(artifact_root_text))
     ) as store:
-        service = create_host_admission_service(store.transaction_runner)
+        service = _admission_service(store.transaction_runner)
         if worker_index % 2 == 0:
             result = service.start_run(
                 _start_request(
@@ -764,7 +944,7 @@ def _duplicate_followup_worker(
     with open_host_durable_store(
         _options(Path(db_path_text), Path(artifact_root_text))
     ) as store:
-        service = create_host_admission_service(store.transaction_runner)
+        service = _admission_service(store.transaction_runner)
         try:
             result = service.submit_followup_queue(
                 SubmitFollowupQueueAdmissionInput(
@@ -818,7 +998,7 @@ def _unique_followup_worker(
     with open_host_durable_store(
         _options(Path(db_path_text), Path(artifact_root_text))
     ) as store:
-        service = create_host_admission_service(store.transaction_runner)
+        service = _admission_service(store.transaction_runner)
         result = service.submit_followup_queue(
             SubmitFollowupQueueAdmissionInput(
                 request=_followup_request(
@@ -1030,7 +1210,12 @@ def _followup_request(
         context=_context(),
         session_id=session_id,
         client_request_id=client_request_id,
-        input=HostInput(display_text=display_text, payload_ref=None, payload_digest=None),
+        system_prompt=None,
+        user_prompt=display_text,
+        tool_names=None,
+        runner_spec=None,
+        runner_options=None,
+        agent_policy=None,
         behavior=FollowupBehavior.QUEUE,
         target_run_id=None,
     )

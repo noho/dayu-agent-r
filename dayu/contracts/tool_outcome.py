@@ -48,7 +48,7 @@ TOOL_CANCELLED_REASON_HOST_CANCELLED: Final[ToolCancelledReason] = "host_cancell
 TOOL_CANCELLED_REASON_TIMEOUT: Final[ToolCancelledReason] = "timeout"
 """工具级取消原因常量：工具自身超时取消。"""
 
-ALLOWED_TOOL_CANCELLED_REASONS: frozenset[str] = frozenset(
+ALLOWED_TOOL_CANCELLED_REASONS: frozenset[ToolCancelledReason] = frozenset(
     {
         TOOL_CANCELLED_REASON_APPROVAL_DENIED,
         TOOL_CANCELLED_REASON_HOST_CANCELLED,

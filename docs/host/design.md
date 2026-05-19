@@ -757,7 +757,7 @@ command path 不直接运行慢 projection、outbox projection、tool trace 写�
 
 - Host 运行参数可以有默认值，但默认值只能在 Host composition root 构造时应用。
 - 所有影响持久化、执行、恢复、投影、工具治理或外部通信的运行参数，都必须有显式接口可由调用方传入；不得只能通过模块级全局变量、隐式单例、环境变量或硬编码路径取得。
-- EventLog / durable store 所在数据库、payload / artifact 目录、projection / outbox 存储位置、worker target、policy provider、clock、id generator、truncation / context budget policy、ContextCompactor、compact artifact root、memory catch-up port 都属于可注入运行参数。
+- EventLog / durable store 所在数据库、payload / artifact 目录、projection / outbox 存储位置、worker target、policy provider、clock、id generator、truncation / context budget policy、compactor runner / storage config、compact artifact root、memory catch-up port 都属于可注入运行参数。
 - 外部业务 `ToolBundle` 是 Host construction / composition root 的显式输入参数。Host handle 必须记录 tool bundle digest、schema digest 和 source refs，用于 Attempt snapshot、audit 和 diagnostic 解释。
 - Host 公共操作函数不接收零散全局配置；它们接收已构造好的 Host handle。Host handle 的构造函数或工厂函数必须暴露 typed options / request，用于传入上述运行参数。
 - 默认参数必须能被显式传入值完全覆盖；覆盖后的值必须进入 Host snapshot / diagnostic / audit 所需的可解释 refs，便于排查不同入口或进程使用的运行配置。
@@ -858,15 +858,15 @@ P10.5 的 Host opener close shutdown order 是 implementation requirement，不�
 
 P10.5 冻结的是后续真实生产系统 Service 使用的普通多轮生产接线，不是 smoke 专用接线。P10.5 自身必须把真实生产系统 Service 将来接入所需的 Host 普通多轮生产接线做实；真实 CLI / web / GUI 在 P11-P15 实施完毕后会通过 Service 使用这里冻结的 Host public interface / contract 接入，不能等到真实入口接入时再补一条新接线。后续 phase 可以扩展 Recovery、ToolsDiscovery / ScenePrepare、Audit / Tool Trace / Outbox、RemoteProxy 与 Retention / Purge 能力，但不得要求真实入口绕过、替换或重写普通多轮会话的 Host 生产接线。
 
-`open_host(options)` 的 options 只承载打开 Host、驱动 Host -> Engine 本地运行所需的 construction-time 参数。Host public API 保持朴素接口形式：内部运行真正需要外部提供的 durable store / payload / artifact roots、runner / worker factory、全量 business `ToolBundle`、ToolRuntime policy、ContextCompactor、context budget policy、memory catch-up、stream fanout / background supervisor 所需端口和运行目录等依赖，由调用方通过 typed function 参数显式传入；Host 不在 P10.5 引入 ConfigLoader、全局配置系统或 service locator。scheduler、wakeup、active worker registry、dispatch control 等 Host 内部接线由 `open_host` composition root 自行创建或连接，不作为 Service-facing 参数暴露。每次 Run 会变化的参数不得塞进 `open_host` options；它们必须进入对应 public request，例如普通 prompt / per-run tool selection / run-local instruction 进入 `SubmitFollowupRequest`，retry / replay 控制参数进入各自 request，后续若新增 per-run profile / target 也必须作为明确 request contract 讨论和冻结。
+`open_host(options)` 的 options 只承载打开 Host、驱动 Host -> Engine 本地运行所需的 construction-time 参数。Host public API 保持朴素接口形式：内部运行真正需要外部提供的 durable store / payload / artifact roots、runner / worker factory、全量 business `ToolBundle`、ToolRuntime policy、compactor runner / storage config、context budget policy、memory catch-up、stream fanout / background supervisor 所需端口和运行目录等依赖，由调用方通过 typed function 参数显式传入；Host 不在 P10.5 引入 ConfigLoader、全局配置系统或 service locator。scheduler、wakeup、active worker registry、dispatch control 等 Host 内部接线由 `open_host` composition root 自行创建或连接，不作为 Service-facing 参数暴露。每次 Run 会变化的参数不得塞进 `open_host` options；它们必须进入对应 public request，例如普通 prompt / per-run tool selection / run-local instruction 进入 `SubmitFollowupRequest`，retry / replay 控制参数进入各自 request，后续若新增 per-run profile / target 也必须作为明确 request contract 讨论和冻结。
 
 一个 `open_host(options)` 表达一个 Host runtime environment 与默认 ordinary Run execution baseline。durable store、scheduler / worker wiring、memory / artifact roots、全量 business `ToolBundle`、Host policy 基线与默认 `RunnerSpec` / `RunnerCallOptions` / `AgentPolicy` 都属于 construction-time baseline。真实生产系统在同一个 Session 的不同 Run 中切换模型是正常需求；P10.5 不通过 `profile_id` / registry lookup 表达这件事，而是允许 `SubmitFollowupRequest` 直接携带可选 typed override 对象：`runner_spec?: RunnerSpec`、`runner_options?: RunnerCallOptions`、`agent_policy?: AgentPolicy`。字段省略时使用 `open_host(options)` 的默认 ordinary Run baseline；字段出现时使用该 Run 显式传入的 typed value。override 是按字段 partial merge，不是 all-or-nothing profile：例如只传 `runner_options` 时，`RunnerSpec` 与 `AgentPolicy` 仍取 opener baseline；只传 `runner_spec` 时，runner call options 与 agent policy 仍取 opener baseline。每个出现的 override 对象本身必须是完整 typed value，不能是 patch dict、增量字段包或 extra payload。Host 不接收 raw provider client、API key 明文、callable、无结构 dict override、extra payload 或 `policy_overrides`。`RunnerSpec.api_key_ref` 仍只是 secret 引用名，不是 secret 本体。Host admission / dispatch 必须校验并冻结每个 Run 的 effective runner spec / runner options / agent policy 到 Run / Attempt 可解释 snapshot 或 source refs，保证 retry / replay / recovery 能解释当时使用的执行配置。普通每 Run 其它可变项第一版包括显式 `system_prompt`、`user_prompt`、`tool_names` 以及必要的 `client_request_id`、actor / source refs 等 request metadata。后续若新增更细粒度 per-run override，也必须作为 typed request field 讨论并冻结。
 
-LLM compactor 与 ordinary Run 共享同一个 Host runtime environment、durable store、memory / artifact roots、budget governance 与 canonical event / artifact 接线，但不共享每个 Run 的 execution override。compactor 的模型、温度、max tokens、provider 选择、compact scene policy 或等价执行参数，必须作为 `open_host(options)` 的独立 typed construction-time baseline 显式传入，例如 `context_compactor`、`compactor_runner_spec`、`compactor_runner_options`、`compactor_policy`、context budget policy 与 compact artifact root。`SubmitFollowupRequest.runner_spec` / `runner_options` / `agent_policy`、`tool_names`、`system_prompt` 不影响 compactor；compactor 不创建用户可见 Run，不产出 final answer，不使用 business ToolRuntime。后续如需 per-session 或 per-run compact override，必须作为单独 typed public contract 讨论，不能借用 ordinary Run override、metadata 或 extra payload。
+LLM compactor 与 ordinary Run 共享同一个 Host runtime environment、durable store、memory / artifact roots、budget governance 与 canonical event / artifact 接线，但不共享每个 Run 的 execution override。Service / `open_host(options)` 只能提供 compactor runner / storage 配置，例如 `compactor_runner_spec`、`compactor_runner_options`、context budget policy 与 compact artifact root；不能提供 `ContextCompactor` 实例、compact prompt、policy ref、candidate builder、quality check、artifact writer 或 repair callback。当前只有一套 Host compactor policy，因此 compactor policy id / version 是 Host 内部常量或 typed policy snapshot ref，只用于 EventLog / artifact / diagnostic 审计，不进入 Service-facing opener contract。Host 在 opener composition root 内部构造 Host-owned LLM compactor，并把它接入 Context Governance internal seam。`SubmitFollowupRequest.runner_spec` / `runner_options` / `agent_policy`、`tool_names`、`system_prompt` 不影响 compactor；compactor 不创建用户可见 Run，不产出 final answer，不使用 business ToolRuntime。后续如需多套 compactor policy，必须先作为 Host-recognized typed policy profile 重新设计 public contract，不能先暴露 raw string `policy_ref`，也不能借用 ordinary Run override、metadata 或 extra payload。
 
 Scheduler wakeup ownership 已由本设计冻结，不是 P10.5 待讨论 public contract。`submit_followup(queue)`、`retry_run(...)`、`replay_run(...)`、`resolve_wait(...)`、terminal closeout 与 cancel 释放 active slot 等命令提交后，需要唤醒 scheduler / promotion / dispatch 的地方，都必须通过 Host 内部 after-commit wakeup port 或等价 background supervisor 接线完成。Service 不得调用 scheduler wakeup、读取 dispatch row 或控制 dispatch。P10.5 的责任是把 production `open_host(options)` 中的 command facade、after-commit wakeup port、background supervisor、scheduler 与 shared active worker registry 接到同一 composition root 上，并用 public-path smoke 证明命令 commit 后无需 Service 额外唤醒即可推进执行。
 
-P10.5 冻结的普通本地多轮会话 contract 必须包含 memory catch-up 与 context overflow compact 的 public opener 接线。普通 Service 不得为了完成多轮闭环而直接装配或调用 memory projection、compact artifact store、scheduler pre-start governance、dispatch scheduler 或 RunInputBuilder 内部接口。Host opener / handle 的 typed construction options 必须能接收或配置 ContextCompactor、compactor execution baseline、context budget policy、compact artifact root 与 memory catch-up；Host 内部负责在 accepted / queued Run dispatch 前完成必要 catch-up、compact artifact 写入、canonical compact event 追加、memory projection consumption 与 subsequent RunInputBuilder 注入。P10.5 compact smoke 必须接入真实 compactor adapter；mock / test-double compactor 只能作为低层测试或显式本地辅助回归，不能作为普通本地多轮闭环的 compact success signal，也不得成为 production opener 的隐式默认值。
+P10.5 冻结的普通本地多轮会话 contract 必须包含 memory catch-up 与 context overflow compact 的 public opener 接线。普通 Service 不得为了完成多轮闭环而直接装配或调用 memory projection、compact artifact store、scheduler pre-start governance、dispatch scheduler、RunInputBuilder 内部接口或 `ContextCompactor.compact(...)`。Host opener / handle 的 typed construction options 必须能接收或配置 compactor runner baseline、context budget policy、compact artifact root 与 memory catch-up；Host 内部负责构造 Host-owned compactor，在 accepted / queued Run dispatch 前完成必要 catch-up、compact artifact 写入、canonical compact event 追加、memory projection consumption 与 subsequent RunInputBuilder 注入。P10.5 compact smoke 必须接入真实 Host-owned compactor runner 配置；mock / test-double compactor 只能作为低层测试或显式本地辅助回归，不能作为普通本地多轮闭环的 compact success signal，也不得成为 production opener 的隐式默认值。
 
 P10.5 的普通 Service dialing 形态固定为 async Host handle + session-level async event iterator。Service 仍必须保存 Outbox attach / reconnect 所需的 terminal watermark / seen ids，但 P10.5 不实现 Outbox read / drain API；离线 terminal 补读归 Phase 13。以下伪代码表达 P10.5 public contract 形状：
 
@@ -2549,7 +2549,7 @@ memory snapshot 缺失或滞后的处理：
 
 ## 25. Context Governance
 
-Context governance 是 Host 责任。Engine 不做 Host-side compact retry。
+Context governance 是 Host 责任。Engine 不做 Host-side compact retry，也不理解 Host compaction attempt state machine。
 
 Host 负责：
 
@@ -2559,6 +2559,7 @@ Host 负责：
 - LLM episode summary compaction。
 - pinned_state patch。
 - compact 后保真检查。
+- compaction semantic repair / retry 编排。
 - failure closeout。
 - context overflow retry。
 - compact event。
@@ -2575,8 +2576,9 @@ Context Governance 是 orchestrator，不直接写 memory snapshot、tool trace�
 - `context_window_size` 与 `reserved_output_tokens` 必须为正整数，且 `reserved_output_tokens` 必须小于 `context_window_size`。
 - 输入预算先按 `input_budget_tokens = context_window_size - reserved_output_tokens` 计算；输出预留不参与输入层竞争。
 - 默认 safety margin 为 20%，即 proactive compact 的 soft threshold 为 `input_budget_tokens * 0.8`。超过 soft threshold 时，Host 应先尝试 compact，而不是直接 dispatch。
-- hard threshold 由 policy provider 显式给出或按 `input_budget_tokens` 扣除 policy 定义的最小保护余量后计算。估算输入超过 hard threshold 时禁止 dispatch；compact 后仍超过 hard threshold 时 append `CONTEXT_COMPACTION_FAILED` 并按 failure policy 收口。
-- 每个 Run 的 proactive trigger 和 reactive trigger 第一版各最多执行一次 compact；不得循环 compact。
+- hard threshold 由 policy provider 显式给出或按 `input_budget_tokens` 扣除 policy 定义的最小保护余量后计算。估算输入超过 hard threshold 时禁止 dispatch；compact operation 的 bounded repair attempts 全部耗尽后仍超过 hard threshold 时 append `CONTEXT_COMPACTION_FAILED` 并按 failure policy 收口。
+- 每个 Run 的 proactive trigger 和 reactive trigger 第一版各最多启动一个 compaction operation；一个 operation 内可以包含 Host-owned bounded semantic repair attempts，但不得启动无界 compact loop。
+- `max_compaction_attempts_per_operation` 由 Host context budget policy 显式给出，含第一次 proposal attempt 与后续 semantic repair attempts，必须为正整数。它只控制 Host governance 的脏输出 / candidate reject 修复预算，不控制 Engine provider / transport retry，也不允许 Service 提供 prompt、candidate builder 或 repair callback。
 - 第一版只记录 usage observation 与 estimator calibration diagnostic，不根据 usage 自动动态调整 policy threshold，避免同一配置下的预算行为不可预测。
 
 Context Governance 与 Conversation Memory 的关系必须保持单向。Conversation Memory 是 EventLog read model，向 RunInputBuilder 提供 memory snapshot、snapshot cursor、policy digest 和 diagnostics；Context Governance 可以读取这些输入来做预算、compact 与质量检查，但不能直接写 memory snapshot，不能让 compacted summary 替代 verified fact 或 evidence anchor，也不能把 memory projection lag 当作 Run recovery。`WorkingAssumptionView` 的主动填充可以由 proactive compaction 或后续 retrieval owner 通过 canonical facts / projection policy 接入；P10 不得绕过 P9 memory projection 边界直接写入。
@@ -2589,6 +2591,29 @@ P10 必须补齐 stable layer / history pool 的生成来源，而不是只做�
 - quality check result：是否保留 current user input、accepted tool fact refs、evidence anchors、open questions / assumptions refs，以及 dropped / summarized ranges。
 
 Host 接受 compactor 输出后，`CONTEXT_COMPACTED` payload 必须记录 compact artifact ref、episode summary candidate、pinned state patch candidate、preserved fact refs、dropped / summarized ranges、quality check result 与 budget after compact。是否将 episode summary / pinned patch materialize 到 Conversation Memory，由 P9 memory projection policy 消费已提交 canonical facts 决定；P10 不得直接写 memory snapshot、memory table 或 RunInputBuilder 私有 message 缓存。
+
+Compactor 与 retry / repair 的 owner 边界固定为：
+
+- Runner/provider 层负责低层 transport retry：network、timeout、HTTP 429、HTTP 5xx、stream idle timeout 等由 Engine Runner 按 `RunnerSpec.max_retries`、`Retry-After` 与退避策略在一次 compactor proposal 调用内处理。该层 retry 不拥有 Host governance，不 append EventLog，不 emit HostEvent，只通过 RunnerEvent / log / attempt summary 进入 Host diagnostic。
+- `LLMContextCompactor` 是 Host-owned 单次 proposal executor。它把 immutable `CompactionRequest` 与 Host-owned prompt/scene 映射为一次 LLM proposal，并返回 candidate 或 typed failure；它不决定是否重试、不更新 Run / Attempt、不写 EventLog、不写 artifact、不做 memory projection。
+- Host Context Governance 拥有 semantic repair / retry：非 final answer、空 summary、解析失败、candidate shape 非法、缺 preservation evidence、quality check reject、compact 后仍超过 hard threshold 等，都由 Host compaction operation 决定是否发起 bounded repair attempt。repair attempt 必须复用同一个 immutable compaction request、同一套 Host-owned scene、同一 durable operation id，并在每次外部 LLM call 前后 recheck Run / Attempt / Session / cursor state。
+- stale / cancelled / session closed / execution replaced / cursor mismatch 不是可 repair 错误；Host 必须丢弃 stale proposal，不写 `CONTEXT_COMPACTED`。
+- retry budget 耗尽后只允许写一个最终 `CONTEXT_COMPACTION_FAILED`，不能让 Service replay，不能让 Engine retry Host governance，也不能无限 compact。
+
+Compaction operation 的 durable 语义固定为：
+
+```text
+CONTEXT_COMPACTION_REQUESTED(operation_id, trigger_source, budget snapshot, input cursor)
+  -> attempt 1: LLM proposal outside write transaction
+  -> Host quality / budget gate
+  -> optional CONTEXT_COMPACTION_ATTEMPT_REJECTED(attempt_no, category, diagnostic refs)
+  -> optional bounded repair attempt N
+  -> CONTEXT_COMPACTED or CONTEXT_COMPACTION_FAILED
+```
+
+`CONTEXT_COMPACTION_ATTEMPT_REJECTED` 是 Host governance diagnostic canonical fact，用于回答尝试次数、失败类别、是否 exhaust budget 和最终接受的是哪次 attempt。EventLog 不能包含 API key、headers、完整 raw prompt 或完整 provider payload；大 payload、raw candidate、provider error body 或 repair prompt 如需保留，必须写 artifact / diagnostic ref 并做敏感信息过滤。
+
+HostEvent 暴露粒度必须比 EventLog 克制：`CONTEXT_COMPACTION_REQUESTED`、最终 `CONTEXT_COMPACTED`、最终 `CONTEXT_COMPACTION_FAILED` 应作为 Service-facing HostEvent 可观察；Host-level repair attempt rejected / retry scheduled 可以作为 typed diagnostic/progress HostEvent 暴露，但不得把每一次 Engine runner HTTP retry 变成 public HostEvent。低层 provider retry 只进入 runner log / aggregated diagnostics。
 
 stable layer / history pool 的来源按事实等级固定：
 
@@ -2609,7 +2634,7 @@ compact 是 Host governance，不是 Engine retry。proactive 与 reactive 使�
 ```text
 proactive trigger before dispatch
   -> append CONTEXT_COMPACTION_REQUESTED(trigger_source=proactive)
-  -> Host ContextGovernance compacts inputs / memory / evidence summaries
+  -> Host ContextGovernance runs bounded compaction operation outside write transaction
   -> append CONTEXT_COMPACTED or CONTEXT_COMPACTION_FAILED
   -> RunInputBuilder rebuilds complete AgentRunRequest.messages
   -> append RUN_STARTED / ATTEMPT_STARTED
@@ -2620,7 +2645,7 @@ reactive trigger from EngineEvent.context_compaction_requested
   -> append CONTEXT_COMPACTION_REQUESTED(trigger_source=reactive)
   -> close current Attempt according to policy
   -> Run -> RECOVERING when policy allows recovery
-  -> Host ContextGovernance compacts inputs / memory / evidence summaries
+  -> Host ContextGovernance runs bounded compaction operation outside write transaction
   -> append CONTEXT_COMPACTED or CONTEXT_COMPACTION_FAILED
   -> append RUN_STARTED(start_reason=recovery)
   -> create new Attempt with new execution_id
@@ -2637,9 +2662,10 @@ reactive path 约束：
 - Host 若接受恢复，应把 Run 标为 `RECOVERING`，执行 compact 后创建新 Attempt；若 compact policy 放弃恢复，Run 才进入 `FAILED`。
 - proactive compact failure 在 dispatch 前收口，Run 进入 `FAILED`，不得创建 Attempt，也不得进入 `RECOVERING`。
 - reactive compact failure 发生时当前 Attempt 已按 policy 关闭；Run 进入 `FAILED`。`LOST` 只属于 Phase 11 recovery / positive orphan proof owner，P10 不得用 compact failure 伪造 `LOST`。
-- `CONTEXT_COMPACTION_REQUESTED` payload 至少记录 trigger source、provider / runner error refs、provider request id、budget snapshot refs、input snapshot cursor 和 reason。
-- `CONTEXT_COMPACTED` payload 至少记录 compact artifact ref、episode summary candidate、pinned state patch candidate、preserved fact refs、dropped / summarized ranges、evidence anchors retained、quality check result、budget after compact。
-- `CONTEXT_COMPACTION_FAILED` payload 至少记录 failure reason、policy decision、whether retryable 和 diagnostic refs。
+- `CONTEXT_COMPACTION_REQUESTED` payload 至少记录 operation id、trigger source、provider / runner error refs、provider request id、budget snapshot refs、input snapshot cursor、retry / repair budget snapshot 和 reason。
+- `CONTEXT_COMPACTION_ATTEMPT_REJECTED` payload 至少记录 operation id、attempt number、failure category、whether repairable、runner attempt summary refs、quality / parse / budget diagnostic refs 和 next policy decision。
+- `CONTEXT_COMPACTED` payload 至少记录 operation id、accepted attempt number、compact artifact ref、episode summary candidate、pinned state patch candidate、preserved fact refs、dropped / summarized ranges、evidence anchors retained、quality check result、budget after compact。
+- `CONTEXT_COMPACTION_FAILED` payload 至少记录 operation id、failure reason、policy decision、whether retryable、attempt count、retry / repair budget exhausted 标记和 diagnostic refs。
 
 compact 不变量：
 
@@ -2647,7 +2673,7 @@ compact 不变量：
 - compacted snapshot / summary 是 read model 或 input artifact；是否进入 memory projection 必须由 memory policy 决定。
 - RunInputBuilder 必须从 `USER_INPUT_ACCEPTED`、canonical facts、memory snapshot 和 compacted artifacts 重建完整 messages；不能复用失败 Attempt 的 provider request payload。
 - 新 Attempt 必须有新的 `attempt_id` / `execution_id`；旧 Attempt 不 takeover、不 resume。
-- compact 必须有 policy 上限。compaction 后仍超过 budget threshold 时，Host 必须按 policy 降级输入层或 append `CONTEXT_COMPACTION_FAILED` 并让 Run 进入 `FAILED`，或在 reactive path 中先按策略短暂保持 `RECOVERING` 后失败收口；不得进入 `LOST`，不得无限 compact retry。
+- compact 必须有 policy 上限。operation 内 bounded repair attempts 后仍超过 budget threshold 时，Host 必须按 policy 降级输入层或 append `CONTEXT_COMPACTION_FAILED` 并让 Run 进入 `FAILED`，或在 reactive path 中先按策略短暂保持 `RECOVERING` 后失败收口；不得进入 `LOST`，不得无限 compact retry。
 - tool trace / audit 必须能解释哪些内容被保留、压缩、丢弃，以及为什么这样做。
 
 参数默认值由 memory / context policy provider 定义。设计固定治理范围，policy 固定优先级和默认值。

@@ -62,6 +62,14 @@ from dayu.host.durable.state import (
     read_run_by_id,
 )
 from dayu.host.durable.transaction import HostRow, HostTransaction, HostTransactionRunner
+from dayu.host.payload_resolution import (
+    event_payload_object,
+    sqlite_payload_object,
+)
+from dayu.host.terminal_summary_payload import (
+    PayloadSummaryTextPolicy,
+    assistant_summary_from_payload,
+)
 from dayu.host.memory import (
     CONVERSATION_MEMORY_CONSUMER_ID,
     ConversationContinuityItem,
@@ -91,11 +99,12 @@ _EVENT_TYPE_RUN_STARTED = "RUN_STARTED"
 _EVENT_TYPE_RUN_SUCCEEDED = "RUN_SUCCEEDED"
 _EVENT_TYPE_TOOL_RESULT_ACCEPTED = "TOOL_RESULT_ACCEPTED"
 _PAYLOAD_FIELD_DISPLAY_TEXT = "display_text"
+_PAYLOAD_FIELD_SYSTEM_PROMPT = "system_prompt"
 _PAYLOAD_FIELD_OPERATION_KIND = "operation_kind"
 _PAYLOAD_FIELD_EXECUTION_TARGET = "execution_target"
-_PAYLOAD_FIELD_FINAL_ANSWER = "final_answer"
 _PAYLOAD_FIELD_CONTENT = "content"
-_PAYLOAD_FIELD_SUMMARY_TEXT = "summary_text"
+_PAYLOAD_FIELD_TERMINAL_SUMMARY_REF = "terminal_summary_ref"
+_PAYLOAD_FIELD_TERMINAL_SUMMARY_DIGEST = "terminal_summary_digest"
 _PAYLOAD_FIELD_START_REASON = "start_reason"
 _PAYLOAD_FIELD_TOOL_RESULT_EVENT_REF = "tool_result_event_ref"
 _PAYLOAD_FIELD_EVENT_ID = "event_id"
@@ -144,6 +153,7 @@ class CurrentRunFacts:
     :param run_accepted_event: 当前 ``RUN_ACCEPTED`` 事件。
     :param run_started_event: 当前 ``RUN_STARTED`` 事件。
     :param user_prompt: 当前用户 prompt 文本。
+    :param system_prompt: 当前 Run 显式 system prompt；无则为 ``None``。
     :param operation_kind: 当前 operation kind。
     """
 
@@ -154,6 +164,7 @@ class CurrentRunFacts:
     run_accepted_event: EventLogRow
     run_started_event: EventLogRow
     user_prompt: str
+    system_prompt: str | None
     operation_kind: str
 
 
@@ -518,7 +529,11 @@ class DurableCurrentRunFactProvider:
         _validate_current_event_scope(snapshot, user_input_event)
         _validate_current_event_scope(snapshot, run_accepted_event)
         _validate_current_event_scope(snapshot, run_started_event)
-        payload = _payload_object(user_input_event)
+        payload = event_payload_object(
+            transaction,
+            user_input_event,
+            payload_label=_EVENT_TYPE_USER_INPUT_ACCEPTED,
+        )
         return CurrentRunFacts(
             run=run,
             attempt=attempt,
@@ -529,6 +544,10 @@ class DurableCurrentRunFactProvider:
             user_prompt=_required_payload_text(
                 payload,
                 field_name=_PAYLOAD_FIELD_DISPLAY_TEXT,
+            ),
+            system_prompt=_optional_payload_text(
+                payload,
+                field_name=_PAYLOAD_FIELD_SYSTEM_PROMPT,
             ),
             operation_kind=_required_payload_text(
                 payload,
@@ -848,7 +867,7 @@ class DurableMemorySnapshotProvider:
             if _is_memory_projection_row(row, session_id=snapshot.session_id):
                 repaired = project_conversation_memory_event(
                     previous_snapshot=repaired,
-                    event=_memory_projection_event_from_row(row),
+                    event=_memory_projection_event_from_row(transaction, row),
                     policy=self._policy,
                     built_at=row.occurred_at,
                     consumer_id=self._consumer_id,
@@ -1305,6 +1324,7 @@ class RunInputBuilder:
             tool_executor,
         )
         messages = (
+            *_system_prompt_message(current_facts.system_prompt),
             *self._scene_parameter_provider.build_scene_messages(
                 attempt_snapshot,
                 current_facts,
@@ -1882,14 +1902,18 @@ def _is_memory_projection_row(row: EventLogRow, *, session_id: str) -> bool:
     )
 
 
-def _memory_projection_event_from_row(row: EventLogRow) -> MemoryProjectionEvent:
+def _memory_projection_event_from_row(
+    transaction: HostTransaction, row: EventLogRow
+) -> MemoryProjectionEvent:
     """把 EventLog row 转换为 memory projection event。
 
+    :param transaction: Host transaction。
     :param row: EventLog row。
     :returns: memory projection event。
     :raises HostDurableError: payload 不是 JSON object 时抛出。
     """
 
+    payload = _payload_with_terminal_summary(transaction, row)
     return MemoryProjectionEvent(
         event_sequence=row.event_sequence,
         event_id=row.event_id,
@@ -1902,8 +1926,55 @@ def _memory_projection_event_from_row(row: EventLogRow) -> MemoryProjectionEvent
         occurred_at=row.occurred_at,
         payload_ref=row.payload_ref,
         payload_digest=row.payload_digest,
-        payload=_payload_object(row),
+        payload=payload,
     )
+
+
+def _payload_with_terminal_summary(
+    transaction: HostTransaction, row: EventLogRow
+) -> Mapping[str, JsonValue]:
+    """必要时把 terminal summary 摘要合并进 RUN_SUCCEEDED payload。
+
+    :param transaction: Host transaction。
+    :param row: EventLog row。
+    :returns: memory projection 消费的 payload。
+    :raises HostDurableError: terminal summary descriptor 损坏时抛出。
+    """
+
+    payload = _payload_object(row)
+    if row.event_type != _EVENT_TYPE_RUN_SUCCEEDED:
+        return payload
+    if (
+        assistant_summary_from_payload(
+            payload,
+            text_policy=PayloadSummaryTextPolicy.STRICT_NON_EMPTY,
+        )
+        is not None
+    ):
+        return payload
+    terminal_summary_ref = _optional_payload_text(
+        payload, field_name=_PAYLOAD_FIELD_TERMINAL_SUMMARY_REF
+    )
+    terminal_summary_digest = _optional_payload_text(
+        payload, field_name=_PAYLOAD_FIELD_TERMINAL_SUMMARY_DIGEST
+    )
+    if terminal_summary_ref is None or terminal_summary_digest is None:
+        return payload
+    terminal_summary = sqlite_payload_object(
+        transaction,
+        payload_ref=terminal_summary_ref,
+        payload_digest=terminal_summary_digest,
+        payload_label="terminal summary",
+    )
+    summary = assistant_summary_from_payload(
+        terminal_summary,
+        text_policy=PayloadSummaryTextPolicy.STRICT_NON_EMPTY,
+    )
+    if summary is None:
+        return payload
+    merged: dict[str, JsonValue] = dict(payload)
+    merged[_PAYLOAD_FIELD_CONTENT] = summary
+    return merged
 
 
 def _latest_compacted_event_before_attempt(
@@ -2093,6 +2164,20 @@ def _required_host_row_text(row: HostRow, *, field_name: str) -> str:
     return value
 
 
+def _system_prompt_message(system_prompt: str | None) -> tuple[SystemMessage, ...]:
+    """把可选 public system prompt 转为 Engine system message。
+
+    :param system_prompt: admission 冻结的 system prompt。
+    :returns: 空元组或单条 system message。
+    """
+
+    if system_prompt is None:
+        return ()
+    return (
+        SystemMessage(role=AgentMessageRole.SYSTEM, content=system_prompt),
+    )
+
+
 def _optional_payload_text(
     payload: Mapping[str, JsonValue], *, field_name: str
 ) -> str | None:
@@ -2151,7 +2236,10 @@ def _continuity_message_from_event(event: EventLogRow) -> AgentMessage | None:
             ),
         )
     if event.event_type == _EVENT_TYPE_RUN_SUCCEEDED:
-        summary = _assistant_summary_from_payload(_payload_object(event))
+        summary = assistant_summary_from_payload(
+            _payload_object(event),
+            text_policy=PayloadSummaryTextPolicy.STRICT_NON_EMPTY,
+        )
         if summary is None:
             return None
         return AssistantMessage(
@@ -2280,27 +2368,6 @@ def _successful_run_message_pair(
     if user_message is None or assistant_message is None:
         return None
     return (user_message, assistant_message)
-
-
-def _assistant_summary_from_payload(
-    payload: Mapping[str, JsonValue]
-) -> str | None:
-    """从 RUN_SUCCEEDED payload 中读取可投影的 assistant 摘要。
-
-    :param payload: RUN_SUCCEEDED payload 映射。
-    :returns: assistant 摘要；缺失时返回 ``None``。
-    :raises HostDurableError: 字段存在但类型非法时抛出。
-    """
-
-    for field_name in (
-        _PAYLOAD_FIELD_FINAL_ANSWER,
-        _PAYLOAD_FIELD_CONTENT,
-        _PAYLOAD_FIELD_SUMMARY_TEXT,
-    ):
-        value = _optional_payload_text(payload, field_name=field_name)
-        if value is not None:
-            return value
-    return None
 
 
 def _validate_tool_mode_snapshot(

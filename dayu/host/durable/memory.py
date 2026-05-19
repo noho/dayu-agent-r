@@ -9,6 +9,7 @@ Attempt / wait / dispatch 等治理真源。
 from __future__ import annotations
 
 import json
+from collections.abc import Mapping
 from dataclasses import dataclass
 from typing import cast
 
@@ -55,6 +56,13 @@ from dayu.host.memory import (
     memory_diagnostic_to_json_value,
     project_conversation_memory_event,
 )
+from dayu.host.payload_resolution import (
+    sqlite_payload_object,
+)
+from dayu.host.terminal_summary_payload import (
+    PayloadSummaryTextPolicy,
+    assistant_summary_from_payload,
+)
 from dayu.host.projection import (
     ProjectionApplyResult,
     ProjectionApplyStatus,
@@ -71,6 +79,9 @@ _ITEM_KIND_WORKING_ASSUMPTION = "working_assumption"
 _EVENT_TYPE_USER_INPUT_ACCEPTED = "USER_INPUT_ACCEPTED"
 _EVENT_TYPE_RUN_SUCCEEDED = "RUN_SUCCEEDED"
 _EVENT_TYPE_TOOL_RESULT_ACCEPTED = "TOOL_RESULT_ACCEPTED"
+_PAYLOAD_FIELD_CONTENT = "content"
+_PAYLOAD_FIELD_TERMINAL_SUMMARY_REF = "terminal_summary_ref"
+_PAYLOAD_FIELD_TERMINAL_SUMMARY_DIGEST = "terminal_summary_digest"
 _EVENT_TYPE_FILTER = (
     _EVENT_TYPE_USER_INPUT_ACCEPTED,
     _EVENT_TYPE_RUN_SUCCEEDED,
@@ -159,7 +170,7 @@ class ConversationMemoryProjectionConsumer:
             return ProjectionApplyResult(ProjectionApplyStatus.DUPLICATE)
         snapshot = project_conversation_memory_event(
             previous_snapshot=previous_snapshot,
-            event=_memory_projection_event_from_view(event),
+            event=_memory_projection_event_from_view(transaction, event),
             policy=self._policy,
             built_at=event.occurred_at,
             consumer_id=self._consumer_id.value,
@@ -169,14 +180,17 @@ class ConversationMemoryProjectionConsumer:
 
 
 def _memory_projection_event_from_view(
+    transaction: HostTransaction,
     event: ProjectionEventView,
 ) -> MemoryProjectionEvent:
     """把 projection runner event view 转换为 memory projection event。
 
+    :param transaction: Host transaction。
     :param event: projection runner event view。
     :returns: memory projection event。
     """
 
+    payload = _payload_with_terminal_summary(transaction, event)
     return MemoryProjectionEvent(
         event_sequence=event.event_sequence,
         event_id=event.event_id,
@@ -189,8 +203,71 @@ def _memory_projection_event_from_view(
         occurred_at=event.occurred_at,
         payload_ref=event.payload_ref,
         payload_digest=event.payload_digest,
-        payload=event.payload,
+        payload=payload,
     )
+
+
+def _payload_with_terminal_summary(
+    transaction: HostTransaction, event: ProjectionEventView
+) -> Mapping[str, JsonValue]:
+    """必要时把 terminal summary 摘要合并进 RUN_SUCCEEDED payload。
+
+    :param transaction: Host transaction。
+    :param event: projection runner event view。
+    :returns: memory projection 消费的 payload。
+    :raises HostDurableError: terminal summary descriptor 损坏时抛出。
+    """
+
+    if event.event_type != _EVENT_TYPE_RUN_SUCCEEDED:
+        return event.payload
+    if (
+        assistant_summary_from_payload(
+            event.payload,
+            text_policy=PayloadSummaryTextPolicy.STRICT_ALLOW_EMPTY,
+        )
+        is not None
+    ):
+        return event.payload
+    terminal_summary_ref = _optional_str(
+        event.payload, _PAYLOAD_FIELD_TERMINAL_SUMMARY_REF
+    )
+    terminal_summary_digest = _optional_str(
+        event.payload, _PAYLOAD_FIELD_TERMINAL_SUMMARY_DIGEST
+    )
+    if terminal_summary_ref is None or terminal_summary_digest is None:
+        return event.payload
+    terminal_summary = sqlite_payload_object(
+        transaction,
+        payload_ref=terminal_summary_ref,
+        payload_digest=terminal_summary_digest,
+        payload_label="terminal summary",
+    )
+    summary = assistant_summary_from_payload(
+        terminal_summary,
+        text_policy=PayloadSummaryTextPolicy.STRICT_ALLOW_EMPTY,
+    )
+    if summary is None:
+        return event.payload
+    merged: dict[str, JsonValue] = dict(event.payload)
+    merged[_PAYLOAD_FIELD_CONTENT] = summary
+    return merged
+
+
+def _optional_str(payload: Mapping[str, JsonValue], field_name: str) -> str | None:
+    """读取可选字符串字段。
+
+    :param payload: JSON payload mapping。
+    :param field_name: 字段名。
+    :returns: 字段缺失或为 ``None`` 时返回 ``None``。
+    :raises HostDurableError: 字段存在但不是字符串时抛出。
+    """
+
+    value = payload.get(field_name)
+    if value is None:
+        return None
+    if not isinstance(value, str):
+        raise HostDurableError(f"{field_name} must be string")
+    return value
 
 
 @dataclass(frozen=True, slots=True)

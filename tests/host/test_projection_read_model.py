@@ -8,31 +8,38 @@ from pathlib import Path
 import pytest
 
 from dayu.contracts.json_value import JsonValue
+from dayu.engine.contracts.agent_policy import AgentPolicy
+from dayu.engine.contracts.runner_spec import RunnerCallOptions, RunnerSpec
 from dayu.host import (
     AuthorizationClaim,
     CancelMode,
     CancelRunRequest,
     FollowupBehavior,
     HostCallContext,
-    HostCommandHandle,
-    HostCommandHandleOptions,
-    HostInput,
     OperationContext,
+    OrdinaryRunExecutionBaseline,
     RunStatus,
-    StartRunRequest,
     SubmitFollowupRequest,
     cancel_run,
-    create_host_command_handle,
     ensure_session,
-    start_run,
     submit_followup,
 )
-from dayu.host.api import EnsureSessionRequest
+from dayu.host.api import HostInput
+from dayu.host.admission import create_host_admission_service
+from dayu.host.api import EnsureSessionRequest, HostCommandHandleOptions, StartRunRequest
+from dayu.host.command import HostCommandHandle, create_host_command_handle, start_run
+from dayu.host.dispatch import ActiveWorkerRegistry
+from dayu.host.durable.connection import open_host_durable_store
 from dayu.host.durable.event_log import (
     EventClass,
     EventLogAppendRequest,
     EventLogRow,
     append_event,
+)
+from dayu.host.durable.options import (
+    HostDurableStoreOptions,
+    HostSQLiteStoragePolicy,
+    PayloadStoragePolicy,
 )
 from dayu.host.durable.projection import (
     read_projection_checkpoint,
@@ -88,6 +95,89 @@ def _options(tmp_path: Path) -> HostCommandHandleOptions:
         payload_inline_threshold_bytes=4096,
         context_window_size=8192,
         reserved_output_tokens=1024,
+    )
+
+
+def _host_with_ordinary_baseline(tmp_path: Path) -> HostCommandHandle:
+    """构造带 ordinary baseline 的测试 command handle。
+
+    :param tmp_path: pytest 临时目录。
+    :returns: Host command handle。
+    :raises HostDurableError: durable store 初始化失败时抛出。
+    :raises TypeError: baseline typed 字段类型非法时抛出。
+    :raises ValueError: baseline 字段语义非法时抛出。
+    """
+
+    options = _options(tmp_path)
+    durable_store = open_host_durable_store(
+        HostDurableStoreOptions(
+            db_path=options.db_path,
+            payload_policy=PayloadStoragePolicy(
+                artifact_root=options.artifact_root,
+                payload_inline_threshold_bytes=options.payload_inline_threshold_bytes,
+                create_artifact_root=options.create_parent_dirs,
+            ),
+            create_parent_dirs=options.create_parent_dirs,
+            sqlite_policy=HostSQLiteStoragePolicy(
+                busy_timeout_seconds=options.sqlite_busy_timeout_seconds,
+                write_busy_retry_count=options.sqlite_write_busy_retry_count,
+                write_retry_initial_delay_seconds=(
+                    options.sqlite_write_retry_initial_delay_seconds
+                ),
+                write_retry_backoff_multiplier=(
+                    options.sqlite_write_retry_backoff_multiplier
+                ),
+                write_retry_max_delay_seconds=options.sqlite_write_retry_max_delay_seconds,
+            ),
+        )
+    )
+    try:
+        return HostCommandHandle(
+            host_handle_id="host-projection-read-model",
+            durable_store=durable_store,
+            admission_service=create_host_admission_service(
+                durable_store.transaction_runner,
+                ordinary_run_baseline=_ordinary_run_baseline(),
+                tooling_options=None,
+            ),
+            active_registry=ActiveWorkerRegistry(),
+        )
+    except Exception:
+        durable_store.close()
+        raise
+
+
+def _ordinary_run_baseline() -> OrdinaryRunExecutionBaseline:
+    """构造测试用 ordinary Run 执行基线。
+
+    :returns: OrdinaryRunExecutionBaseline。
+    :raises TypeError: baseline typed 字段类型非法时抛出。
+    :raises ValueError: baseline 字段语义非法时抛出。
+    """
+
+    return OrdinaryRunExecutionBaseline(
+        runner_spec=RunnerSpec(
+            provider="test",
+            model="projection-baseline-model",
+            endpoint="https://example.invalid",
+            api_key_ref="secret:projection-baseline",
+            headers={},
+            supports_tool_calling=False,
+            supports_streaming=False,
+            supports_stream_usage=False,
+            default_timeout_seconds=1.0,
+            max_retries=0,
+            provider_request=None,
+        ),
+        runner_options=RunnerCallOptions(
+            temperature=None, max_tokens=None, top_p=None, stream=False
+        ),
+        agent_policy=AgentPolicy(
+            max_iterations=1,
+            continuation_max_attempts=0,
+            allow_tool_calls=False,
+            tool_execution_timeout_seconds=1.0,
+        ),
     )
 
 
@@ -170,7 +260,12 @@ def _followup_request(
         context=_context(request_id=f"trace-{client_request_id}"),
         session_id=session_id,
         client_request_id=client_request_id,
-        input=_input(display_text),
+        system_prompt=None,
+        user_prompt=display_text,
+        tool_names=None,
+        runner_spec=None,
+        runner_options=None,
+        agent_policy=None,
         behavior=FollowupBehavior.QUEUE,
         target_run_id=None,
     )
@@ -671,7 +766,7 @@ def test_user_input_timeline_preserves_repeated_text_and_null_fallback(
 ) -> None:
     """重复输入保留独立 timeline rows；缺少 display_text 时写入 NULL 并保留引用。"""
 
-    host = create_host_command_handle(_options(tmp_path))
+    host = _host_with_ordinary_baseline(tmp_path)
     try:
         session_id = _session_id(host)
         active = start_run(
@@ -753,7 +848,7 @@ def test_cancelled_input_and_later_input_remain_separate_items(
 ) -> None:
     """取消 Run 的输入与后续新输入保持两条独立 timeline rows。"""
 
-    host = create_host_command_handle(_options(tmp_path))
+    host = _host_with_ordinary_baseline(tmp_path)
     try:
         session_id = _session_id(host)
         start_run(host, _start_request(session_id, "start-active"))

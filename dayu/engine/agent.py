@@ -16,7 +16,6 @@ from __future__ import annotations
 import asyncio
 import json
 import logging
-import threading
 from collections.abc import AsyncGenerator, AsyncIterator, Mapping, Sequence
 from dataclasses import dataclass
 from datetime import datetime, timezone
@@ -650,7 +649,6 @@ class _AsyncAgent:
         self._request: AgentRunRequest = request
         self._runner: AsyncRunner = runner
         self._active_run_id: str | None = None
-        self._run_guard_lock: threading.Lock = threading.Lock()
         self._terminal_seen: bool = False
         self._closed: bool = False
         self._last_iteration_state: _IterationState | None = None
@@ -838,6 +836,8 @@ class _AsyncAgent:
                         decision
                     )
                     return
+                if not isinstance(decision, _ToolCallsDecision):
+                    assert_never(decision)
 
                 continuation_active = False
                 _LOGGER.log(
@@ -928,8 +928,10 @@ class _AsyncAgent:
                         yield event
                     return
         finally:
-            await self._close_runner_once()
-            self._release_run_slot()
+            try:
+                await self._close_runner_once()
+            finally:
+                self._release_run_slot()
 
     def _handle_final_decision(
         self,
@@ -1067,14 +1069,13 @@ class _AsyncAgent:
         :raises RuntimeError: 当前实例已有运行中的 run 时抛出。
         """
 
-        with self._run_guard_lock:
-            if self._active_run_id is not None:
-                raise RuntimeError(
-                    "AsyncAgent instance does not support concurrent runs: "
-                    f"active_run_id={self._active_run_id}, "
-                    f"incoming_run_id={self._request.run_id}"
-                )
-            self._active_run_id = self._request.run_id
+        if self._active_run_id is not None:
+            raise RuntimeError(
+                "AsyncAgent instance does not support concurrent runs: "
+                f"active_run_id={self._active_run_id}, "
+                f"incoming_run_id={self._request.run_id}"
+            )
+        self._active_run_id = self._request.run_id
 
     def _release_run_slot(self) -> None:
         """释放运行槽位。
@@ -1083,9 +1084,8 @@ class _AsyncAgent:
         :raises Exception: 不主动抛出异常。
         """
 
-        with self._run_guard_lock:
-            if self._active_run_id == self._request.run_id:
-                self._active_run_id = None
+        if self._active_run_id == self._request.run_id:
+            self._active_run_id = None
 
     async def _run_runner_iteration(
         self,
@@ -1105,6 +1105,12 @@ class _AsyncAgent:
         :raises asyncio.CancelledError: 外层 task 被取消时透传。
         """
 
+        message_size_failure = _message_inline_size_failure(messages)
+        if message_size_failure is not None:
+            yield await self._make_failed_or_cancelled_terminal_with_close(
+                message_size_failure
+            )
+            return
         self._last_iteration_state = _IterationState(
             content_chunks=[],
             reasoning_chunks=[],
@@ -1360,6 +1366,21 @@ class _AsyncAgent:
             return None
         if isinstance(data, RunnerDoneData):
             state.done_seen = True
+            if (
+                state.finish_reason is not None
+                and state.finish_reason is not data.finish_reason
+            ):
+                _LOGGER.warning(
+                    "engine.agent.finish_reason_mismatch session_id=%s "
+                    "run_id=%s iteration_id=%s completed_finish_reason=%s "
+                    "done_finish_reason=%s provider_request_id=%s",
+                    self._request.session_id,
+                    self._request.run_id,
+                    iteration_id,
+                    state.finish_reason.value,
+                    data.finish_reason.value,
+                    data.provider_request_id,
+                )
             state.finish_reason = data.finish_reason
             state.provider_request_id = data.provider_request_id
             _LOGGER.debug(
@@ -1561,12 +1582,11 @@ class _AsyncAgent:
                 )
                 return
             seen_in_batch.add(call.tool_call_id)
-        for call in decision.tool_calls:
-            self._executed_tool_call_ids.add(call.tool_call_id)
-
         if self._is_cancelled():
             yield await self._make_cancelled_terminal_with_close()
             return
+        for call in decision.tool_calls:
+            self._executed_tool_call_ids.add(call.tool_call_id)
 
         yield self._make_event(
             event_type=EngineEventType.TOOL_CALLS_BATCH_READY,
@@ -2361,20 +2381,28 @@ class _AsyncAgent:
         """幂等关闭 Runner。
 
         :returns: 无返回值。
-        :raises Exception: 不主动抛出异常；close 失败只记录 warning。
+        :raises asyncio.CancelledError: close 被外层 task 取消时透传。
+        :raises Exception: 不主动抛出普通异常；close 失败只记录 warning。
         """
 
         if self._closed:
             return
-        self._closed = True
         try:
             await self._runner.close()
+        except asyncio.CancelledError:
+            _LOGGER.warning(
+                "agent.runner_close_cancelled run_id=%s",
+                self._request.run_id,
+            )
+            raise
         except Exception as exc:
             _LOGGER.warning(
                 "agent.runner_close_failed run_id=%s exc_type=%s",
                 self._request.run_id,
                 type(exc).__name__,
             )
+        finally:
+            self._closed = True
 
     def _log_iteration_decision(
         self,
@@ -2586,6 +2614,14 @@ async def run_agent_and_wait(request: AgentRunRequest) -> AgentRunResult:
             accepted_records=data.accepted_records,
             awaiting_records=data.awaiting_records,
         )
+    _LOGGER.warning(
+        "engine.agent.unknown_terminal_shape session_id=%s run_id=%s "
+        "terminal_type=%s data_type=%s",
+        terminal.session_id,
+        terminal.run_id,
+        terminal.type.value,
+        data.__class__.__name__,
+    )
     return EngineRunOutcomeFailed(
         session_id=request.session_id,
         run_id=request.run_id,

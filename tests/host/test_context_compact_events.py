@@ -3,10 +3,13 @@
 from __future__ import annotations
 
 from collections.abc import Mapping
+from datetime import UTC, datetime
+from pathlib import Path
 
 import pytest
 
 from dayu.contracts.json_value import JsonValue
+from dayu.host.api import HostEventKind
 from dayu.host.compaction import (
     CompactInputRange,
     CompactQualityIssue,
@@ -21,14 +24,26 @@ from dayu.host.compaction import (
 )
 from dayu.host.context_budget import ContextBudgetDecision
 from dayu.host.context_events import (
+    CONTEXT_COMPACTION_ATTEMPT_REJECTED,
+    build_context_compaction_attempt_rejected_payload,
     build_context_compacted_payload,
     build_context_compaction_failed_payload,
     build_context_compaction_requested_payload,
+    validate_context_compaction_attempt_rejected_payload,
     validate_context_compacted_payload,
     validate_context_compaction_failed_payload,
     validate_context_compaction_requested_payload,
 )
 from dayu.host.context_policy import ContextCompactionTriggerSource
+from dayu.host.durable.codec import format_utc_timestamp
+from dayu.host.durable.event_log import EventClass, EventLogRow
+from dayu.host.durable.connection import open_host_durable_store
+from dayu.host.durable.options import (
+    HostDurableStoreOptions,
+    PayloadStoragePolicy,
+)
+from dayu.host.durable.transaction import HostTransaction
+from dayu.host.read_api import _host_event_from_row
 
 _DIGEST_A = "sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
 _DIGEST_B = "sha256:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"
@@ -244,6 +259,155 @@ def test_failed_payload_rejects_missing_required_fields() -> None:
 
     with pytest.raises(ValueError, match="failure_reason is required"):
         validate_context_compaction_failed_payload({})
+
+
+def test_attempt_rejected_payload_builder_and_validator() -> None:
+    """attempt rejected payload 输出 operation / attempt / diagnostics。"""
+
+    payload = build_context_compaction_attempt_rejected_payload(
+        operation_id="operation-1",
+        attempt_number=1,
+        failure_category="quality_check_rejected",
+        repairable=True,
+        runner_attempt_summary_refs=("runner-attempt:1",),
+        diagnostic_refs=("diagnostic:1",),
+        next_policy_decision="retry_semantic_repair",
+        budget_after_attempted_compact=128,
+    )
+
+    validate_context_compaction_attempt_rejected_payload(payload)
+    assert CONTEXT_COMPACTION_ATTEMPT_REJECTED == (
+        "CONTEXT_COMPACTION_ATTEMPT_REJECTED"
+    )
+    assert payload["attempt_number"] == 1
+
+
+def test_attempt_rejected_payload_rejects_missing_required_fields() -> None:
+    """attempt rejected validator 拒绝缺少必填字段的 payload。"""
+
+    with pytest.raises(ValueError, match="operation_id is required"):
+        validate_context_compaction_attempt_rejected_payload({})
+
+
+@pytest.mark.parametrize("attempt_number", [0, True, "bad"])
+def test_attempt_rejected_payload_requires_positive_attempt_number(
+    attempt_number: JsonValue,
+) -> None:
+    """attempt_number 必须是正整数且不是 bool。"""
+
+    payload = dict(_valid_attempt_rejected_payload())
+    payload["attempt_number"] = attempt_number
+
+    with pytest.raises(ValueError, match="attempt_number"):
+        validate_context_compaction_attempt_rejected_payload(payload)
+
+
+@pytest.mark.parametrize(
+    "field_name",
+    ["runner_attempt_summary_refs", "diagnostic_refs"],
+)
+def test_attempt_rejected_payload_requires_non_empty_ref_lists(
+    field_name: str,
+) -> None:
+    """runner attempt summary refs 与 diagnostic refs 都必须非空。"""
+
+    payload = dict(_valid_attempt_rejected_payload())
+    payload[field_name] = []
+
+    with pytest.raises(ValueError, match=field_name):
+        validate_context_compaction_attempt_rejected_payload(payload)
+
+
+def test_attempt_rejected_payload_rejects_invalid_budget() -> None:
+    """budget_after_attempted_compact 必须为非负整数或 None。"""
+
+    payload = dict(_valid_attempt_rejected_payload())
+    payload["budget_after_attempted_compact"] = -1
+
+    with pytest.raises(ValueError, match="budget_after_attempted_compact"):
+        validate_context_compaction_attempt_rejected_payload(payload)
+
+
+def test_attempt_rejected_projects_to_progress_host_event(tmp_path: Path) -> None:
+    """attempt rejected canonical fact 投影为 public progress HostEvent。"""
+
+    with open_host_durable_store(_durable_options(tmp_path)) as store:
+
+        def _operation(transaction: HostTransaction) -> HostEventKind:
+            """执行 HostEvent 投影。
+
+            :param transaction: 当前 Host read transaction。
+            :returns: public HostEvent kind。
+            """
+
+            row = _attempt_rejected_row()
+            return _host_event_from_row(transaction, row).kind
+
+        assert store.transaction_runner.run_read(_operation) is HostEventKind.PROGRESS
+
+
+def _valid_attempt_rejected_payload() -> Mapping[str, JsonValue]:
+    """构造有效 attempt rejected payload。
+
+    :returns: payload mapping。
+    """
+
+    return build_context_compaction_attempt_rejected_payload(
+        operation_id="operation-1",
+        attempt_number=1,
+        failure_category="quality_check_rejected",
+        repairable=False,
+        runner_attempt_summary_refs=("runner-attempt:1",),
+        diagnostic_refs=("diagnostic:1",),
+        next_policy_decision="fail_compaction",
+        budget_after_attempted_compact=None,
+    )
+
+
+def _attempt_rejected_row() -> EventLogRow:
+    """构造 attempt rejected EventLog row。
+
+    :returns: EventLog row。
+    """
+
+    timestamp = format_utc_timestamp(datetime.now(UTC))
+    return EventLogRow(
+        event_sequence=1,
+        event_id="event-context-compaction-attempt-rejected-test",
+        event_body_digest=_DIGEST_A,
+        event_class=EventClass.CANONICAL_FACT,
+        session_id="session-1",
+        run_id="run-1",
+        attempt_id=None,
+        execution_id=None,
+        event_type=CONTEXT_COMPACTION_ATTEMPT_REJECTED,
+        occurred_at=timestamp,
+        actor="test",
+        source="pytest",
+        client_request_id=None,
+        idempotency_key=None,
+        policy_decision_json=None,
+        reason_json=None,
+        payload_json="{}",
+        payload_ref=None,
+        payload_digest=None,
+        appended_at=timestamp,
+    )
+
+
+def _durable_options(tmp_path: Path) -> HostDurableStoreOptions:
+    """构造 Host durable store 选项。
+
+    :param tmp_path: pytest 临时目录。
+    :returns: Host durable store options。
+    """
+
+    return HostDurableStoreOptions(
+        db_path=tmp_path / "host.sqlite3",
+        payload_policy=PayloadStoragePolicy(
+            artifact_root=tmp_path / "artifacts",
+        ),
+    )
 
 
 def _valid_compacted_payload() -> dict[str, JsonValue]:

@@ -41,6 +41,7 @@ class CompactQualityIssue(StrEnum):
     EVIDENCE_ANCHOR_NOT_RETAINED = "evidence_anchor_not_retained"
     PINNED_PATCH_TRI_STATE_INVALID = "pinned_patch_tri_state_invalid"
     PINNED_PATCH_EVIDENCE_REF_MISSING = "pinned_patch_evidence_ref_missing"
+    COMPACT_RANGE_OUTSIDE_REQUEST = "compact_range_outside_request"
 
 
 def _empty_string_tuple() -> tuple[str, ...]:
@@ -874,7 +875,7 @@ class ContextCompactor(Protocol):
     必须由 quality checker 通过后才可写 compact artifact / canonical event。
     """
 
-    def compact(self, request: CompactionRequest) -> CompactionCandidate:
+    async def compact(self, request: CompactionRequest) -> CompactionCandidate:
         """生成 compaction candidate。
 
         :param request: Host 构造的 compaction 请求。

@@ -117,6 +117,7 @@ class RunStartReason(StrEnum):
     INITIAL = "initial"
     QUEUE_PROMOTION = "queue_promotion"
     RESUME = "resume"
+    STEER = "steer"
     RECOVERY = "recovery"
 
 
@@ -1371,6 +1372,40 @@ def read_non_terminal_runs_for_session(
     return tuple(run_row_from_host_row(row) for row in rows)
 
 
+def count_runs_by_source_relation(
+    transaction: HostTransaction,
+    *,
+    source_run_id: str,
+    source_run_relation: SourceRunRelation,
+) -> int:
+    """统计指定源 Run 已创建的关联 Run 数。
+
+    :param transaction: 调用方提供的 Host transaction。
+    :param source_run_id: 源 Run id。
+    :param source_run_relation: 源关系类型。
+    :returns: 已存在的关联 Run 数。
+    :raises HostDurableError: 输入字段或查询结果非法时抛出。
+    """
+
+    _require_non_empty_text(source_run_id, field_name="source_run_id")
+    if not isinstance(source_run_relation, SourceRunRelation):
+        raise HostDurableError("source_run_relation is invalid")
+    row = transaction.fetchone(
+        f"""
+        SELECT COUNT(*) AS related_count
+        FROM {TABLE_HOST_RUNS}
+        WHERE source_run_id = ? AND source_run_relation = ?
+        """,
+        (
+            source_run_id,
+            _optional_source_run_relation_text(source_run_relation),
+        ),
+    )
+    if row is None:
+        return 0
+    return _require_int(row.get("related_count"), field_name="related_count")
+
+
 def read_attempt_by_id(
     transaction: HostTransaction, attempt_id: str
 ) -> AttemptRow | None:
@@ -1817,6 +1852,67 @@ def insert_run(transaction: HostTransaction, run: RunRow) -> None:
             run.updated_at,
             run.terminal_at,
         ),
+    )
+
+
+def set_new_run_source_relation_row(
+    transaction: HostTransaction,
+    *,
+    run_id: str,
+    expected_status: RunStatus,
+    source_run_id: str,
+    source_run_relation: SourceRunRelation,
+    updated_at: str,
+) -> RunMutationResult:
+    """CAS 为新建 Run 写入 retry / replay 源 Run 关系。
+
+    :param transaction: 调用方提供的 Host transaction。
+    :param run_id: 新建关联 Run id。
+    :param expected_status: 新建 Run 当前期望状态，只允许 accepted 或 queued。
+    :param source_run_id: 源 Run id。
+    :param source_run_relation: 源关系类型。
+    :param updated_at: 固定 UTC 更新时间文本。
+    :returns: Run mutation 结果。
+    :raises HostDurableError: 输入字段无效时抛出。
+    """
+
+    _require_non_empty_text(run_id, field_name="run_id")
+    if expected_status not in (RunStatus.ACCEPTED, RunStatus.QUEUED):
+        raise HostDurableError("source relation target status is invalid")
+    _require_non_empty_text(source_run_id, field_name="source_run_id")
+    if not isinstance(source_run_relation, SourceRunRelation):
+        raise HostDurableError("source_run_relation is invalid")
+    _require_non_empty_text(updated_at, field_name="updated_at")
+    result = transaction.execute(
+        f"""
+        UPDATE {TABLE_HOST_RUNS}
+        SET
+          source_run_id = ?,
+          source_run_relation = ?,
+          updated_at = ?
+        WHERE run_id = ?
+          AND status = ?
+          AND source_run_id IS NULL
+          AND source_run_relation IS NULL
+          AND current_attempt_id IS NULL
+          AND terminal_event_id IS NULL
+          AND terminal_event_sequence IS NULL
+          AND terminal_at IS NULL
+        """,
+        (
+            source_run_id,
+            _optional_source_run_relation_text(source_run_relation),
+            updated_at,
+            run_id,
+            serialize_run_status(expected_status),
+        ),
+    )
+    return _run_mutation_result(
+        transaction,
+        run_id=run_id,
+        rowcount=result.rowcount,
+        expected_status=expected_status,
+        cas_lost_when_expected=True,
     )
 
 
@@ -2838,6 +2934,142 @@ def resume_waiting_run_row(
         rowcount=result.rowcount,
         expected_status=RunStatus.WAITING,
         cas_lost_when_expected=True,
+    )
+
+
+def steer_active_run_row(
+    transaction: HostTransaction,
+    *,
+    session_id: str,
+    run_id: str,
+    previous_attempt_id: str,
+    next_attempt_id: str,
+    input_event_id: str,
+    input_event_sequence: int,
+    started_event_id: str,
+    started_event_sequence: int,
+    updated_at: str,
+) -> RunMutationResult:
+    """CAS 将 active Run 切换到 steer 创建的新 Attempt。
+
+    :param transaction: 调用方提供的 Host transaction。
+    :param session_id: Run 所属 Session id。
+    :param run_id: 目标 Run id。
+    :param previous_attempt_id: 期望的旧 current Attempt id。
+    :param next_attempt_id: 新建 steer Attempt id。
+    :param input_event_id: steer 输入事件 id。
+    :param input_event_sequence: steer 输入事件序号。
+    :param started_event_id: ``RUN_STARTED`` steer 事件 id。
+    :param started_event_sequence: ``RUN_STARTED`` steer 事件序号。
+    :param updated_at: 固定 UTC 更新时间文本。
+    :returns: Run mutation 结果。
+    :raises HostDurableError: 输入字段无效时抛出。
+    """
+
+    _validate_run_start_update(
+        session_id=session_id,
+        run_id=run_id,
+        started_event_id=started_event_id,
+        started_event_sequence=started_event_sequence,
+        current_attempt_id=next_attempt_id,
+        updated_at=updated_at,
+    )
+    _require_non_empty_text(
+        previous_attempt_id, field_name="previous_attempt_id"
+    )
+    _require_non_empty_text(input_event_id, field_name="input_event_id")
+    _require_positive_sequence(input_event_sequence, "input_event_sequence")
+    result = transaction.execute(
+        f"""
+        UPDATE {TABLE_HOST_RUNS}
+        SET
+          status = ?,
+          input_event_id = ?,
+          input_event_sequence = ?,
+          started_event_id = ?,
+          started_event_sequence = ?,
+          current_attempt_id = ?,
+          updated_at = ?
+        WHERE run_id = ?
+          AND session_id = ?
+          AND status IN (?, ?)
+          AND current_attempt_id = ?
+          AND terminal_event_id IS NULL
+          AND terminal_event_sequence IS NULL
+          AND terminal_at IS NULL
+        """,
+        (
+            serialize_run_status(RunStatus.RUNNING),
+            input_event_id,
+            input_event_sequence,
+            started_event_id,
+            started_event_sequence,
+            next_attempt_id,
+            updated_at,
+            run_id,
+            session_id,
+            serialize_run_status(RunStatus.RUNNING),
+            serialize_run_status(RunStatus.WAITING),
+            previous_attempt_id,
+        ),
+    )
+    return _run_mutation_result_for_active(
+        transaction,
+        run_id=run_id,
+        rowcount=result.rowcount,
+    )
+
+
+def steer_running_attempt_row(
+    transaction: HostTransaction,
+    *,
+    attempt_id: str,
+    terminal_event_id: str,
+    terminal_event_sequence: int,
+    terminal_at: str,
+) -> AttemptMutationResult:
+    """CAS 将 RUNNING Attempt 标记为 STEERED。
+
+    :param transaction: 调用方提供的 Host transaction。
+    :param attempt_id: 目标 Attempt id。
+    :param terminal_event_id: ``ATTEMPT_STEERED`` 事件 id。
+    :param terminal_event_sequence: ``ATTEMPT_STEERED`` 事件序号。
+    :param terminal_at: 固定 UTC 终态时间文本。
+    :returns: Attempt mutation 结果。
+    :raises HostDurableError: 输入字段无效时抛出。
+    """
+
+    _validate_attempt_terminal_update(
+        attempt_id=attempt_id,
+        terminal_event_id=terminal_event_id,
+        terminal_event_sequence=terminal_event_sequence,
+        terminal_at=terminal_at,
+    )
+    result = transaction.execute(
+        f"""
+        UPDATE {TABLE_HOST_ATTEMPTS}
+        SET
+          status = ?,
+          terminal_event_id = ?,
+          terminal_event_sequence = ?,
+          updated_at = ?,
+          terminal_at = ?
+        WHERE attempt_id = ? AND status = ?
+        """,
+        (
+            serialize_attempt_status(AttemptStatus.STEERED),
+            terminal_event_id,
+            terminal_event_sequence,
+            terminal_at,
+            terminal_at,
+            attempt_id,
+            serialize_attempt_status(AttemptStatus.RUNNING),
+        ),
+    )
+    return _attempt_mutation_result_for_active(
+        transaction,
+        attempt_id=attempt_id,
+        rowcount=result.rowcount,
     )
 
 

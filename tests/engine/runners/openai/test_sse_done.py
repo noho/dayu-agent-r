@@ -9,8 +9,12 @@ from dayu.engine.contracts.runner_events import (
     RunnerDoneData,
     RunnerEventType,
 )
+from dayu.engine.runners.openai.sse_parser import SSEParser
 
-from tests.engine.runners.openai._sse_helpers import parse_sse
+from tests.engine.runners.openai._sse_helpers import (
+    make_no_thought_hook,
+    parse_sse,
+)
 
 
 @pytest.mark.asyncio
@@ -58,3 +62,15 @@ async def test_done_finish_reason_content_filter() -> None:
     assert len(done) == 1
     assert isinstance(done[0].data, RunnerDoneData)
     assert done[0].data.finish_reason is FinishReason.CONTENT_FILTER
+
+
+@pytest.mark.asyncio
+async def test_finalize_success_noops_when_already_terminated_without_finish_reason() -> None:
+    """parser 已终止时不应再次 emit 成功 Done，即使 finish_reason 为空。"""
+
+    parser = SSEParser(hook=make_no_thought_hook(), provider_request_id=None)
+    parser._terminated = True
+
+    events = [event async for event in parser._finalize_success()]
+
+    assert events == []
