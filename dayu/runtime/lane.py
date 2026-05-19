@@ -41,6 +41,9 @@ _LOG_UNTRACKED_RELEASE_FAILED_AFTER_CANCEL: Final[str] = (
     "runtime lane untracked claim release failed after outer cancellation; "
     "claim will rely on TTL cleanup"
 )
+_LOG_REFRESH_FAILED_AFTER_CANCEL: Final[str] = (
+    "runtime lane refresh failed after outer cancellation"
+)
 _CLOSE_REASON_HEARTBEAT_ERROR: Final[str] = "lane heartbeat error"
 _LOGGER = logging.getLogger(__name__)
 _TaskResult = TypeVar("_TaskResult")
@@ -657,6 +660,23 @@ class LaneController:
         )
         try:
             expires_at = await asyncio.shield(refresh_task)
+        except asyncio.CancelledError as cancelled:
+            try:
+                expires_at = await _await_task_after_outer_cancellation(refresh_task)
+            except RuntimeLaneClaimLostError:
+                self._mark_token_lost(token)
+                raise cancelled
+            except RuntimeLaneError:
+                _LOGGER.exception(
+                    _LOG_REFRESH_FAILED_AFTER_CANCEL,
+                    extra={
+                        "lane_name": token.name,
+                        "claim_id": token.claim_id,
+                    },
+                )
+                raise cancelled
+            token.expires_at = expires_at
+            raise
         except RuntimeLaneClaimLostError:
             self._mark_token_lost(token)
             raise

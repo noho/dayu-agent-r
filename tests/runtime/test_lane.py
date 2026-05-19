@@ -10,7 +10,7 @@ from __future__ import annotations
 import asyncio
 import logging
 import sqlite3
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from threading import Event
 
@@ -43,7 +43,9 @@ _SLOW_OPERATION_SECONDS = 5.0
 _CANCEL_REASON = "user-stop"
 _THREAD_EVENT_TIMEOUT_SECONDS = 1.0
 _UNTRACKED_RELEASE_FAILED_LOG_FRAGMENT = "untracked claim release failed"
+_REFRESH_FAILED_LOG_FRAGMENT = "runtime lane refresh failed after outer cancellation"
 _RELEASE_FAILED_MESSAGE = "release failed"
+_REFRESH_FAILED_MESSAGE = "refresh failed"
 _CLOSE_RELEASE_FAILED_MESSAGE = "release failed during close"
 _MISSING_CLAIM_ID = "claim-missing"
 
@@ -349,6 +351,153 @@ async def test_acquire_refresh_and_release(tmp_path: Path) -> None:
     await token.release()
     assert token.released is True
     assert _claim_count(db_path) == 0
+    await controller.close(reason="test-done")
+
+
+@pytest.mark.asyncio
+async def test_refresh_waits_for_shielded_success_after_outer_cancel(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """refresh 被外层取消时必须等待底层成功结果并更新 token 状态。"""
+
+    db_path = tmp_path / "runtime_lanes.sqlite3"
+    controller = await LaneController.open(
+        [_lane_config()], coordinator=_coordinator(db_path)
+    )
+    outcome = await controller.acquire(_LANE_NAME, timeout_seconds=0)
+    assert isinstance(outcome, LaneAcquired)
+    refresh_started = Event()
+    finish_refresh = Event()
+    refresh_finished = Event()
+    new_expires_at = outcome.token.expires_at + timedelta(seconds=10)
+
+    def slow_successful_refresh(token: LaneClaimToken) -> datetime:
+        """阻塞同步 refresh，让测试能稳定取消外层 task。
+
+        :param token: 待刷新的 token，本测试只校验其 claim id。
+        :returns: 新的 token 过期时间。
+        """
+
+        assert token.claim_id == outcome.token.claim_id
+        refresh_started.set()
+        assert finish_refresh.wait(_THREAD_EVENT_TIMEOUT_SECONDS) is True
+        refresh_finished.set()
+        return new_expires_at
+
+    monkeypatch.setattr(controller, "_refresh_token_sync", slow_successful_refresh)
+
+    refresh_task = asyncio.create_task(outcome.token.refresh())
+    await _wait_for_thread_event(refresh_started)
+    refresh_task.cancel()
+    refresh_task.cancel()
+    finish_refresh.set()
+
+    with pytest.raises(asyncio.CancelledError):
+        await refresh_task
+    assert refresh_finished.is_set()
+    assert outcome.token.expires_at == new_expires_at
+    assert outcome.token.released is False
+
+    await outcome.token.release()
+    await controller.close(reason="test-done")
+
+
+@pytest.mark.asyncio
+async def test_refresh_cancel_cleanup_marks_lost_after_claim_lost(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """refresh 取消清理中发现 claim lost 时必须标记 token 丢失。"""
+
+    db_path = tmp_path / "runtime_lanes.sqlite3"
+    controller = await LaneController.open(
+        [_lane_config()], coordinator=_coordinator(db_path)
+    )
+    outcome = await controller.acquire(_LANE_NAME, timeout_seconds=0)
+    assert isinstance(outcome, LaneAcquired)
+    refresh_started = Event()
+    finish_refresh = Event()
+    refresh_finished = Event()
+
+    def slow_lost_refresh(token: LaneClaimToken) -> datetime:
+        """阻塞同步 refresh，并模拟 claim row 已丢失。
+
+        :param token: 待刷新的 token。
+        :returns: 不返回。
+        :raises RuntimeLaneClaimLostError: 始终抛出 claim lost。
+        """
+
+        refresh_started.set()
+        assert finish_refresh.wait(_THREAD_EVENT_TIMEOUT_SECONDS) is True
+        _delete_claim(db_path, token.claim_id)
+        refresh_finished.set()
+        raise RuntimeLaneClaimLostError("lane claim lost during refresh")
+
+    monkeypatch.setattr(controller, "_refresh_token_sync", slow_lost_refresh)
+
+    refresh_task = asyncio.create_task(outcome.token.refresh())
+    await _wait_for_thread_event(refresh_started)
+    refresh_task.cancel()
+    finish_refresh.set()
+
+    with pytest.raises(asyncio.CancelledError):
+        await refresh_task
+    assert refresh_finished.is_set()
+    assert outcome.token.released is True
+    assert _claim_count(db_path) == 0
+
+    await controller.close(reason="test-done")
+
+
+@pytest.mark.asyncio
+async def test_refresh_cancel_cleanup_logs_runtime_error_and_preserves_cancel(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """refresh 取消清理中遇到 runtime error 时必须收口异常并保留取消。"""
+
+    db_path = tmp_path / "runtime_lanes.sqlite3"
+    controller = await LaneController.open(
+        [_lane_config()], coordinator=_coordinator(db_path)
+    )
+    outcome = await controller.acquire(_LANE_NAME, timeout_seconds=0)
+    assert isinstance(outcome, LaneAcquired)
+    refresh_started = Event()
+    finish_refresh = Event()
+    refresh_finished = Event()
+
+    def slow_failed_refresh(token: LaneClaimToken) -> datetime:
+        """阻塞同步 refresh，并模拟底层 runtime lane 错误。
+
+        :param token: 待刷新的 token，本测试不使用。
+        :returns: 不返回。
+        :raises RuntimeLaneError: 始终抛出 refresh 失败。
+        """
+
+        del token
+        refresh_started.set()
+        assert finish_refresh.wait(_THREAD_EVENT_TIMEOUT_SECONDS) is True
+        refresh_finished.set()
+        raise RuntimeLaneError(_REFRESH_FAILED_MESSAGE)
+
+    monkeypatch.setattr(controller, "_refresh_token_sync", slow_failed_refresh)
+    caplog.set_level(logging.ERROR, logger="dayu.runtime.lane")
+
+    refresh_task = asyncio.create_task(outcome.token.refresh())
+    await _wait_for_thread_event(refresh_started)
+    refresh_task.cancel()
+    finish_refresh.set()
+
+    with pytest.raises(asyncio.CancelledError):
+        await refresh_task
+    assert refresh_finished.is_set()
+    assert outcome.token.released is False
+    assert _claim_count(db_path) == 1
+    assert _REFRESH_FAILED_LOG_FRAGMENT in caplog.text
+
+    await outcome.token.release()
     await controller.close(reason="test-done")
 
 
