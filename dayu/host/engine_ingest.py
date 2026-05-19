@@ -1695,6 +1695,18 @@ class EngineEventIngestor:
         :returns: closeout 结果。
         """
 
+        _LOGGER.log(
+            VERBOSE_LOG_LEVEL,
+            "host.engine_ingest.lifecycle_closeout.accepted session_id=%s "
+            "run_id=%s attempt_id=%s execution_id=%s event_index=%s "
+            "reason=%s",
+            envelope.session_id,
+            envelope.run_id,
+            envelope.attempt_id,
+            envelope.execution_id,
+            event_index,
+            plan.reason,
+        )
         event = EngineEvent(
             occurred_at=observed_at,
             session_id=envelope.session_id,
@@ -1736,10 +1748,28 @@ class EngineEventIngestor:
             return self._close_terminal(transaction, context, plan)
 
         result = self._transaction_runner.run_write(_operation)
-        return self._with_terminal_promotion_retry(
+        promoted = self._with_terminal_promotion_retry(
             result,
             session_id=envelope.session_id,
         )
+        _LOGGER.log(
+            VERBOSE_LOG_LEVEL,
+            "host.engine_ingest.lifecycle_closeout.committed session_id=%s "
+            "run_id=%s attempt_id=%s execution_id=%s event_index=%s "
+            "ingest_status=%s event_count=%s terminal_closeout=%s "
+            "promotion_triggered=%s reason=%s",
+            envelope.session_id,
+            envelope.run_id,
+            envelope.attempt_id,
+            envelope.execution_id,
+            event_index,
+            promoted.status.value,
+            len(promoted.events),
+            promoted.terminal_closeout,
+            promoted.promotion_triggered,
+            promoted.reason,
+        )
+        return promoted
 
     def _with_terminal_promotion_retry(
         self, result: EngineIngestResult, *, session_id: str

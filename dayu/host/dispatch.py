@@ -711,6 +711,18 @@ class HostDispatchScheduler:
                     compact_accepted=None,
                 )
             if decision is ContextBudgetDecision.BLOCK_HARD_THRESHOLD:
+                _LOGGER.error(
+                    "dispatch.governance.failed session_id=%s run_id=%s "
+                    "failure_reason=%s decision=%s estimated_input_tokens=%s "
+                    "hard_threshold_tokens=%s policy_ref=%s",
+                    run.session_id,
+                    run.run_id,
+                    "hard_threshold_before_dispatch",
+                    decision.value,
+                    estimate.estimated_input_tokens,
+                    estimate.hard_threshold_tokens,
+                    policy.policy_ref,
+                )
                 self._append_compaction_failed_event(
                     transaction,
                     run=run,
@@ -758,6 +770,18 @@ class HostDispatchScheduler:
                     compact_accepted=None,
                 )
             if compact_count >= policy.max_proactive_compactions_per_run:
+                _LOGGER.error(
+                    "dispatch.governance.failed session_id=%s run_id=%s "
+                    "failure_reason=%s decision=%s compact_count=%s "
+                    "max_compact_count=%s policy_ref=%s",
+                    run.session_id,
+                    run.run_id,
+                    "proactive_compact_limit_reached",
+                    decision.value,
+                    compact_count,
+                    policy.max_proactive_compactions_per_run,
+                    policy.policy_ref,
+                )
                 self._append_compaction_failed_event(
                     transaction,
                     run=run,
@@ -973,6 +997,16 @@ class HostDispatchScheduler:
 
         compactor = self._local_execution.context_compactor
         artifact_root = self._local_execution.compact_artifact_root
+        _LOGGER.log(
+            VERBOSE_LOG_LEVEL,
+            "dispatch.compact.start session_id=%s run_id=%s decision=%s "
+            "estimated_input_tokens=%s hard_threshold_tokens=%s",
+            run.session_id,
+            run.run_id,
+            decision.value,
+            estimate.estimated_input_tokens,
+            estimate.hard_threshold_tokens,
+        )
         self._append_compaction_requested_event(
             transaction,
             run=run,
@@ -980,6 +1014,17 @@ class HostDispatchScheduler:
             decision=decision,
         )
         if compactor is None or artifact_root is None:
+            _LOGGER.error(
+                "dispatch.compact.failed session_id=%s run_id=%s "
+                "failure_reason=%s decision=%s compactor_present=%s "
+                "artifact_root_present=%s",
+                run.session_id,
+                run.run_id,
+                "compactor_or_artifact_store_missing",
+                decision.value,
+                compactor is not None,
+                artifact_root is not None,
+            )
             self._append_compaction_failed_event(
                 transaction,
                 run=run,
@@ -1018,6 +1063,17 @@ class HostDispatchScheduler:
         candidate = compactor.compact(request)
         quality = check_compaction_candidate(request, candidate)
         if not quality.accepted:
+            _LOGGER.error(
+                "dispatch.compact.failed session_id=%s run_id=%s "
+                "failure_reason=%s decision=%s budget_after_compact=%s "
+                "rejection_reasons=%s",
+                run.session_id,
+                run.run_id,
+                "quality_check_rejected",
+                decision.value,
+                candidate.budget_after_compact,
+                tuple(reason.value for reason in quality.rejection_reasons),
+            )
             self._append_compaction_failed_event(
                 transaction,
                 run=run,
@@ -1035,6 +1091,17 @@ class HostDispatchScheduler:
             )
             return None
         if candidate.budget_after_compact >= estimate.hard_threshold_tokens:
+            _LOGGER.error(
+                "dispatch.compact.failed session_id=%s run_id=%s "
+                "failure_reason=%s decision=%s budget_after_compact=%s "
+                "hard_threshold_tokens=%s",
+                run.session_id,
+                run.run_id,
+                "hard_threshold_after_compact",
+                decision.value,
+                candidate.budget_after_compact,
+                estimate.hard_threshold_tokens,
+            )
             self._append_compaction_failed_event(
                 transaction,
                 run=run,
@@ -1320,6 +1387,17 @@ class HostDispatchScheduler:
             timeout_seconds=self._local_execution.lane_default_timeout_seconds,
         )
         if isinstance(acquire, LaneAcquireTimedOut):
+            _LOGGER.warning(
+                "dispatch.lane_acquire.timed_out run_id=%s attempt_id=%s "
+                "execution_id=%s dispatch_record_id=%s lane_name=%s "
+                "timeout_seconds=%s",
+                record.run_id,
+                record.attempt_id,
+                record.execution_id,
+                record.dispatch_record_id,
+                self._local_execution.lane_name,
+                self._local_execution.lane_default_timeout_seconds,
+            )
             self._safe_closeout_worker_startup_timeout(
                 record, reason=_WORKER_STARTUP_TIMEOUT_REASON
             )
@@ -1327,6 +1405,15 @@ class HostDispatchScheduler:
         if isinstance(acquire, LaneAcquireCancelled):
             if self._closed:
                 return "skipped"
+            _LOGGER.warning(
+                "dispatch.lane_acquire.cancelled run_id=%s attempt_id=%s "
+                "execution_id=%s dispatch_record_id=%s lane_name=%s",
+                record.run_id,
+                record.attempt_id,
+                record.execution_id,
+                record.dispatch_record_id,
+                self._local_execution.lane_name,
+            )
             self._safe_closeout_worker_startup_timeout(
                 record, reason=_WORKER_STARTUP_TIMEOUT_REASON
             )
@@ -1587,6 +1674,15 @@ class HostDispatchScheduler:
             return "timed_out"
         except TimeoutError as exc:
             try:
+                _LOGGER.warning(
+                    "dispatch.worker_accept.timed_out run_id=%s attempt_id=%s "
+                    "execution_id=%s dispatch_record_id=%s timeout_seconds=%s",
+                    record.run_id,
+                    record.attempt_id,
+                    record.execution_id,
+                    record.dispatch_record_id,
+                    self._local_execution.worker_startup_timeout_seconds,
+                )
                 self._safe_closeout_worker_startup_timeout(
                     record,
                     reason=_WORKER_STARTUP_TIMEOUT_REASON,
@@ -1597,6 +1693,16 @@ class HostDispatchScheduler:
             return "timed_out"
         except Exception as exc:
             try:
+                _LOGGER.error(
+                    "dispatch.worker_accept.failed run_id=%s attempt_id=%s "
+                    "execution_id=%s dispatch_record_id=%s error_type=%s",
+                    record.run_id,
+                    record.attempt_id,
+                    record.execution_id,
+                    record.dispatch_record_id,
+                    exc.__class__.__name__,
+                    exc_info=True,
+                )
                 self._safe_closeout_worker_startup_timeout(
                     record,
                     reason=_WORKER_STARTUP_TIMEOUT_REASON,
@@ -1982,6 +2088,15 @@ class HostDispatchScheduler:
             )
 
         self._transaction_runner.run_write(_operation)
+        _LOGGER.log(
+            VERBOSE_LOG_LEVEL,
+            "dispatch.worker_startup.closeout_committed run_id=%s "
+            "attempt_id=%s execution_id=%s reason=%s",
+            record.run_id,
+            record.attempt_id,
+            record.execution_id,
+            reason,
+        )
         self._duplicate_governance_registry.clear_run(record.run_id)
 
     def _safe_closeout_worker_startup_timeout(
@@ -2087,6 +2202,18 @@ class HostDispatchScheduler:
                     event = await anext(events)
                 except StopAsyncIteration:
                     if not terminal_seen:
+                        _LOGGER.critical(
+                            "dispatch.worker_events.clean_eof_without_terminal "
+                            "run_id=%s attempt_id=%s execution_id=%s "
+                            "dispatch_record_id=%s local_worker_id=%s "
+                            "last_observed_worker_event_index=%s",
+                            record.run_id,
+                            record.attempt_id,
+                            record.execution_id,
+                            record.dispatch_record_id,
+                            local_worker_id,
+                            worker_event_index,
+                        )
                         result = ingestor.close_clean_eof(
                             envelope,
                             observed_at=datetime.now(UTC),
@@ -2097,6 +2224,18 @@ class HostDispatchScheduler:
                 except asyncio.CancelledError:
                     raise
                 except Exception as exc:
+                    _LOGGER.error(
+                        "dispatch.worker_events.stream_error run_id=%s "
+                        "attempt_id=%s execution_id=%s dispatch_record_id=%s "
+                        "local_worker_id=%s error_type=%s",
+                        record.run_id,
+                        record.attempt_id,
+                        record.execution_id,
+                        record.dispatch_record_id,
+                        local_worker_id,
+                        exc.__class__.__name__,
+                        exc_info=True,
+                    )
                     result = ingestor.close_worker_lost(
                         envelope,
                         observed_at=datetime.now(UTC),
@@ -2118,6 +2257,21 @@ class HostDispatchScheduler:
                         )
                     )
                 except Exception as exc:
+                    _LOGGER.error(
+                        "dispatch.worker_events.ingest_exception run_id=%s "
+                        "attempt_id=%s execution_id=%s dispatch_record_id=%s "
+                        "local_worker_id=%s worker_event_index=%s "
+                        "engine_event_type=%s error_type=%s",
+                        record.run_id,
+                        record.attempt_id,
+                        record.execution_id,
+                        record.dispatch_record_id,
+                        local_worker_id,
+                        worker_event_index,
+                        event.type.value,
+                        exc.__class__.__name__,
+                        exc_info=True,
+                    )
                     result = ingestor.close_worker_lost(
                         envelope,
                         observed_at=datetime.now(UTC),
