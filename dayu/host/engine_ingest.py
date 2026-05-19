@@ -148,6 +148,12 @@ from dayu.host.payload_resolution import event_payload_object
 from dayu.runtime.log_levels import VERBOSE_LOG_LEVEL
 
 _LOGGER = logging.getLogger(__name__)
+_DELTA_ENGINE_EVENT_TYPES = frozenset(
+    {
+        EngineEventType.CONTENT_DELTA,
+        EngineEventType.REASONING_DELTA,
+    }
+)
 _EVENT_SOURCE = "host.engine_ingest"
 _EVENT_ACTOR = "host.engine_ingest"
 _EVENT_ID_PREFIX = "event-engine-"
@@ -539,7 +545,7 @@ class EngineEventIngestor:
 
         _validate_candidate_shape(candidate)
         _LOGGER.log(
-            VERBOSE_LOG_LEVEL,
+            _engine_ingest_log_level(candidate.engine_event.type),
             (
                 "host.engine_ingest.accepted session_id=%s run_id=%s "
                 "attempt_id=%s execution_id=%s worker_event_index=%s "
@@ -597,7 +603,7 @@ class EngineEventIngestor:
             session_id=promotion_triggered_session_id,
         )
         _LOGGER.log(
-            VERBOSE_LOG_LEVEL,
+            _engine_ingest_log_level(candidate.engine_event.type),
             (
                 "host.engine_ingest.committed session_id=%s run_id=%s "
                 "attempt_id=%s execution_id=%s worker_event_index=%s "
@@ -2282,6 +2288,18 @@ def _validate_candidate_shape(candidate: EngineEventCandidate) -> None:
         raise ValueError("EngineEvent session_id/run_id must match envelope")
     if candidate.engine_event.occurred_at.tzinfo is None:
         raise ValueError("EngineEvent.occurred_at must be timezone-aware")
+
+
+def _engine_ingest_log_level(engine_event_type: EngineEventType) -> int:
+    """根据 Engine event 类型选择 ingest 诊断日志级别。
+
+    :param engine_event_type: 待记录的 Engine event 类型。
+    :returns: stdlib logging level 数值。
+    """
+
+    if engine_event_type in _DELTA_ENGINE_EVENT_TYPES:
+        return logging.DEBUG
+    return VERBOSE_LOG_LEVEL
 
 
 def _validate_observed_at(observed_at: datetime) -> None:

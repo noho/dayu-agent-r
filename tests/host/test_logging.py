@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import logging
 from datetime import datetime
 from pathlib import Path
 
@@ -10,6 +11,7 @@ import pytest
 from dayu.contracts.cancellation import CancellationToken
 from dayu.engine.contracts.agent_policy import AgentPolicy
 from dayu.engine.contracts.agent_run import AgentRunRequest
+from dayu.engine.contracts.engine_events import EngineEventType
 from dayu.engine.contracts.messages import AgentMessageRole, SystemMessage
 from dayu.engine.contracts.runner_spec import RunnerCallOptions, RunnerSpec
 from dayu.host import (
@@ -32,6 +34,7 @@ from dayu.host.durable.options import (
     HostSQLiteStoragePolicy,
     PayloadStoragePolicy,
 )
+from dayu.host.engine_ingest import _engine_ingest_log_level
 from dayu.host.local_proxy import DefaultLocalEngineWorker
 from dayu.host.memory import default_memory_projection_policy
 from dayu.host.memory_repair import catch_up_conversation_memory_projection
@@ -170,6 +173,22 @@ def test_memory_catchup_logs_cursors_and_counts(
     assert "consumer_id=host.memory.session.v1" in caplog.text
     assert "events_scanned=0" in caplog.text
     assert "finished_cursor=0" in caplog.text
+
+
+def test_engine_ingest_delta_events_use_debug_log_level() -> None:
+    """逐 token delta ingest 日志使用 DEBUG，非 delta 保持 VERBOSE 骨架。
+
+    :returns: ``None``。
+    :raises AssertionError: 日志级别选择不符合语义时抛出。
+    """
+
+    assert _engine_ingest_log_level(EngineEventType.CONTENT_DELTA) == logging.DEBUG
+    assert _engine_ingest_log_level(EngineEventType.REASONING_DELTA) == logging.DEBUG
+    assert (
+        _engine_ingest_log_level(EngineEventType.ITERATION_STARTED)
+        == VERBOSE_LOG_LEVEL
+    )
+    assert _engine_ingest_log_level(EngineEventType.FINAL_ANSWER) == VERBOSE_LOG_LEVEL
 
 
 def _command_options(tmp_path: Path) -> HostCommandHandleOptions:
