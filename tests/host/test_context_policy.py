@@ -48,6 +48,26 @@ def test_context_budget_policy_validates_compaction_attempt_budget() -> None:
         replace(policy, max_compaction_attempts_per_operation=cast(int, "bad"))
 
 
+def test_context_budget_policy_rejects_non_dispatchable_hard_threshold() -> None:
+    """hard threshold 必须给 compact 后正预算留下空间。"""
+
+    policy = default_context_budget_policy(
+        context_window_size=1000,
+        reserved_output_tokens=100,
+        hard_threshold_tokens=2,
+    )
+    assert policy.hard_threshold_tokens == 2
+
+    with pytest.raises(ValueError, match="hard_threshold_tokens"):
+        replace(policy, hard_threshold_tokens=1)
+    with pytest.raises(ValueError, match="hard_threshold_tokens"):
+        default_context_budget_policy(
+            context_window_size=3,
+            reserved_output_tokens=1,
+            minimum_protection_tokens=1,
+        )
+
+
 def test_context_budget_policy_direct_constructor_requires_attempt_budget() -> None:
     """直接构造 ContextBudgetPolicy 时 attempt budget 是显式 typed 字段。"""
 

@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import inspect
 from collections.abc import Awaitable, Callable
 
 import pytest
@@ -18,12 +19,23 @@ from dayu.host.compaction import CompactionRequest
 from dayu.host.context_budget import BudgetEstimate
 from dayu.host.context_policy import ContextCompactionTriggerSource
 from dayu.host.compaction import CurrentMessageSummary
+import dayu.host.llm_compaction as llm_compaction_module
 from dayu.host.llm_compaction import (
     LLMCompactionProposalError,
     LLMContextCompactor,
 )
 
 _DIGEST = "sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+
+
+def test_llm_context_compactor_does_not_use_thread_bridge() -> None:
+    """LLM compactor 不再使用线程桥、join timeout 或嵌套 asyncio.run。"""
+
+    source = inspect.getsource(llm_compaction_module)
+
+    assert "threading" not in source
+    assert "thread.join(" not in source
+    assert "asyncio.run" not in source
 
 
 @pytest.mark.asyncio
@@ -42,7 +54,7 @@ async def test_llm_context_compactor_builds_tool_disabled_request(
     runner_spec = _runner_spec(max_retries=3)
     runner_options = _runner_options()
 
-    LLMContextCompactor(
+    await LLMContextCompactor(
         runner_spec=runner_spec,
         runner_options=runner_options,
     ).compact(_request())
@@ -66,7 +78,7 @@ async def test_llm_context_compactor_maps_final_answer_to_candidate(
         _fake_run_factory(_final("keep the current user request")),
     )
 
-    candidate = LLMContextCompactor(
+    candidate = await LLMContextCompactor(
         runner_spec=_runner_spec(),
         runner_options=_runner_options(),
     ).compact(_request())
@@ -94,7 +106,7 @@ async def test_llm_context_compactor_rejects_empty_or_non_final_output(
         runner_options=_runner_options(),
     )
     with pytest.raises(LLMCompactionProposalError, match="summary is empty"):
-        compactor.compact(_request())
+        await compactor.compact(_request())
 
     monkeypatch.setattr(
         "dayu.host.llm_compaction.run_agent_and_wait",
@@ -110,7 +122,7 @@ async def test_llm_context_compactor_rejects_empty_or_non_final_output(
         ),
     )
     with pytest.raises(LLMCompactionProposalError, match="runner failed"):
-        compactor.compact(_request())
+        await compactor.compact(_request())
 
 
 @pytest.mark.asyncio
@@ -146,7 +158,7 @@ async def test_llm_context_compactor_sanitizes_failed_runner_outcome(
     )
 
     with pytest.raises(LLMCompactionProposalError) as exc_info:
-        compactor.compact(_request())
+        await compactor.compact(_request())
 
     message = str(exc_info.value)
     assert "error_code=server_error" in message
@@ -169,7 +181,7 @@ async def test_llm_context_compactor_preserves_host_owned_refs_and_evidence(
         _fake_run_factory(_final("summary")),
     )
 
-    candidate = LLMContextCompactor(
+    candidate = await LLMContextCompactor(
         runner_spec=_runner_spec(),
         runner_options=_runner_options(),
     ).compact(_request())
@@ -205,7 +217,7 @@ async def test_llm_context_compactor_uses_runner_retry_policy_without_owning_sem
     )
 
     with pytest.raises(RuntimeError, match="runner failed"):
-        compactor.compact(_request())
+        await compactor.compact(_request())
 
     assert len(calls) == 1
     assert calls[0].runner_spec.max_retries == 5
@@ -280,10 +292,13 @@ def _final(content: str) -> EngineRunOutcomeFinalAnswer:
     )
 
 
-def _runner_spec(max_retries: int = 0) -> RunnerSpec:
+def _runner_spec(
+    max_retries: int = 0, default_timeout_seconds: float = 1.0
+) -> RunnerSpec:
     """构造 RunnerSpec。
 
     :param max_retries: runner retry 上限。
+    :param default_timeout_seconds: runner 单次默认超时秒数。
     :returns: RunnerSpec。
     """
 
@@ -296,7 +311,7 @@ def _runner_spec(max_retries: int = 0) -> RunnerSpec:
         supports_tool_calling=False,
         supports_streaming=False,
         supports_stream_usage=False,
-        default_timeout_seconds=1.0,
+        default_timeout_seconds=default_timeout_seconds,
         max_retries=max_retries,
         provider_request=None,
     )

@@ -8,10 +8,7 @@ repair loop，也不向 Service 暴露 prompt、candidate builder 或 policy sea
 
 from __future__ import annotations
 
-import asyncio
 import re
-import threading
-from dataclasses import dataclass
 from datetime import datetime
 from uuid import uuid4
 
@@ -72,18 +69,6 @@ class LLMCompactionProposalError(RuntimeError):
 
     :param message: 中性失败描述。
     """
-
-
-@dataclass(slots=True)
-class _ThreadRunState:
-    """跨线程运行 async Engine 调用的最小状态。
-
-    :param result: Engine run 终态；线程完成前为 ``None``。
-    :param error: Engine 调用抛出的异常；无异常时为 ``None``。
-    """
-
-    result: AgentRunResult | None = None
-    error: BaseException | None = None
 
 
 class _NeverCancelledToken(CancellationToken):
@@ -163,7 +148,7 @@ class LLMContextCompactor(ContextCompactor):
         self._runner_spec = runner_spec
         self._runner_options = runner_options
 
-    def compact(self, request: CompactionRequest) -> CompactionCandidate:
+    async def compact(self, request: CompactionRequest) -> CompactionCandidate:
         """执行一次 LLM compaction proposal。
 
         :param request: Host 构造的 immutable compaction request。
@@ -175,7 +160,7 @@ class LLMContextCompactor(ContextCompactor):
 
         if not isinstance(request, CompactionRequest):
             raise TypeError("request must be CompactionRequest")
-        outcome = _run_agent_request_sync(
+        outcome = await _run_agent_request(
             _agent_request(request, self._runner_spec, self._runner_options)
         )
         if not isinstance(outcome, EngineRunOutcomeFinalAnswer):
@@ -221,32 +206,15 @@ def _agent_request(
     )
 
 
-def _run_agent_request_sync(request: AgentRunRequest) -> AgentRunResult:
-    """同步运行 Engine async public runner。
+async def _run_agent_request(request: AgentRunRequest) -> AgentRunResult:
+    """运行 Engine async public runner。
 
     :param request: Engine AgentRunRequest。
     :returns: AgentRunResult。
     :raises BaseException: Engine async 调用抛出的异常会原样透传。
     """
 
-    try:
-        asyncio.get_running_loop()
-    except RuntimeError:
-        return asyncio.run(run_agent_and_wait(request))
-    state = _ThreadRunState()
-    thread = threading.Thread(
-        target=_run_agent_request_in_thread,
-        args=(request, state),
-        name="dayu-host-llm-compactor",
-        daemon=True,
-    )
-    thread.start()
-    thread.join()
-    if state.error is not None:
-        raise state.error
-    if state.result is None:
-        raise LLMCompactionProposalError("compactor runner thread returned no result")
-    return state.result
+    return await run_agent_and_wait(request)
 
 
 def _non_final_outcome_message(outcome: AgentRunResult) -> str:
@@ -288,22 +256,6 @@ def _safe_outcome_text(text: str) -> str:
     if len(redacted) <= _MAX_SAFE_OUTCOME_MESSAGE_CHARS:
         return redacted
     return redacted[:_MAX_SAFE_OUTCOME_MESSAGE_CHARS] + _TRUNCATED_SUFFIX
-
-
-def _run_agent_request_in_thread(
-    request: AgentRunRequest, state: _ThreadRunState
-) -> None:
-    """在线程中运行 Engine async runner。
-
-    :param request: Engine AgentRunRequest。
-    :param state: 跨线程结果容器。
-    :returns: ``None``。
-    """
-
-    try:
-        state.result = asyncio.run(run_agent_and_wait(request))
-    except BaseException as exc:
-        state.error = exc
 
 
 def _user_prompt(request: CompactionRequest) -> str:

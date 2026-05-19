@@ -24,6 +24,7 @@ DEFAULT_MAX_PROACTIVE_COMPACTIONS_PER_RUN = 1
 DEFAULT_MAX_REACTIVE_COMPACTIONS_PER_RUN = 1
 DEFAULT_MAX_COMPACTION_ATTEMPTS_PER_OPERATION = 1
 DEFAULT_CONTEXT_BUDGET_POLICY_REF = "host-context-budget-policy:default"
+MIN_CONTEXT_HARD_THRESHOLD_TOKENS = 2
 
 
 class ContextCompactionTriggerSource(StrEnum):
@@ -107,10 +108,25 @@ class ContextBudgetPolicy:
                 self.hard_threshold_tokens,
                 field_name="ContextBudgetPolicy.hard_threshold_tokens",
             )
+            if self.hard_threshold_tokens < MIN_CONTEXT_HARD_THRESHOLD_TOKENS:
+                raise ValueError(
+                    "ContextBudgetPolicy.hard_threshold_tokens must be >= "
+                    f"{MIN_CONTEXT_HARD_THRESHOLD_TOKENS}"
+                )
             if self.hard_threshold_tokens > input_budget_tokens:
                 raise ValueError(
                     "ContextBudgetPolicy.hard_threshold_tokens must not exceed "
                     "input budget"
+                )
+        else:
+            computed_hard_threshold_tokens = (
+                input_budget_tokens - self.minimum_protection_tokens
+            )
+            if computed_hard_threshold_tokens < MIN_CONTEXT_HARD_THRESHOLD_TOKENS:
+                raise ValueError(
+                    "ContextBudgetPolicy.minimum_protection_tokens must leave "
+                    "hard_threshold_tokens >= "
+                    f"{MIN_CONTEXT_HARD_THRESHOLD_TOKENS}"
                 )
         _require_positive_int(
             self.max_proactive_compactions_per_run,
@@ -246,6 +262,7 @@ __all__ = [
     "DEFAULT_MAX_PROACTIVE_COMPACTIONS_PER_RUN",
     "DEFAULT_MAX_REACTIVE_COMPACTIONS_PER_RUN",
     "DEFAULT_MINIMUM_PROTECTION_TOKENS",
+    "MIN_CONTEXT_HARD_THRESHOLD_TOKENS",
     "StaticContextBudgetProvider",
     "default_context_budget_policy",
 ]

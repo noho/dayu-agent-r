@@ -22,14 +22,15 @@ from dayu.host.context_policy import ContextCompactionTriggerSource
 from dayu.host.fake_compaction import FakeContextCompactor
 
 
-def test_fake_compactor_produces_typed_candidates_and_evidence() -> None:
+@pytest.mark.asyncio
+async def test_fake_compactor_produces_typed_candidates_and_evidence() -> None:
     """Fake compactor 产生 summary、pinned patch 与 preservation evidence。
 
     :returns: ``None``。
     """
 
     request = _request()
-    candidate = FakeContextCompactor().compact(request)
+    candidate = await FakeContextCompactor().compact(request)
     result = check_compaction_candidate(request, candidate)
 
     assert candidate.episode_summary_candidate.candidate_id == "fake-summary:run-1"
@@ -40,7 +41,8 @@ def test_fake_compactor_produces_typed_candidates_and_evidence() -> None:
     assert result.accepted is True
 
 
-def test_quality_rejects_missing_current_user_input() -> None:
+@pytest.mark.asyncio
+async def test_quality_rejects_missing_current_user_input() -> None:
     """Quality check 拒绝丢失当前用户输入。
 
     :returns: ``None``。
@@ -48,7 +50,7 @@ def test_quality_rejects_missing_current_user_input() -> None:
 
     request = _request()
     candidate = replace(
-        FakeContextCompactor().compact(request),
+        await FakeContextCompactor().compact(request),
         retained_current_user_input_ref=None,
     )
 
@@ -58,7 +60,8 @@ def test_quality_rejects_missing_current_user_input() -> None:
     assert CompactQualityIssue.CURRENT_USER_INPUT_MISSING in result.rejection_reasons
 
 
-def test_quality_rejects_missing_tool_fact_refs() -> None:
+@pytest.mark.asyncio
+async def test_quality_rejects_missing_tool_fact_refs() -> None:
     """Quality check 拒绝丢失 accepted tool fact refs。
 
     :returns: ``None``。
@@ -66,7 +69,7 @@ def test_quality_rejects_missing_tool_fact_refs() -> None:
 
     request = _request()
     candidate = replace(
-        FakeContextCompactor().compact(request),
+        await FakeContextCompactor().compact(request),
         preserved_tool_fact_refs=("tool-fact-1",),
     )
 
@@ -76,7 +79,8 @@ def test_quality_rejects_missing_tool_fact_refs() -> None:
     assert CompactQualityIssue.TOOL_FACT_REFS_MISSING in result.rejection_reasons
 
 
-def test_quality_rejects_missing_preservation_evidence() -> None:
+@pytest.mark.asyncio
+async def test_quality_rejects_missing_preservation_evidence() -> None:
     """Quality check 拒绝缺失 preservation evidence。
 
     :returns: ``None``。
@@ -84,7 +88,7 @@ def test_quality_rejects_missing_preservation_evidence() -> None:
 
     request = _request()
     candidate = replace(
-        FakeContextCompactor().compact(request),
+        await FakeContextCompactor().compact(request),
         preservation_evidence=(),
     )
 
@@ -96,14 +100,15 @@ def test_quality_rejects_missing_preservation_evidence() -> None:
     )
 
 
-def test_quality_rejects_missing_evidence_anchor_retention() -> None:
+@pytest.mark.asyncio
+async def test_quality_rejects_missing_evidence_anchor_retention() -> None:
     """Quality check 拒绝 evidence 未保留当前输入 anchor。
 
     :returns: ``None``。
     """
 
     request = _request()
-    candidate = FakeContextCompactor().compact(request)
+    candidate = await FakeContextCompactor().compact(request)
     evidence = replace(
         candidate.preservation_evidence[0],
         input_event_refs=("event-old",),
@@ -118,14 +123,15 @@ def test_quality_rejects_missing_evidence_anchor_retention() -> None:
     )
 
 
-def test_quality_rejects_invalid_pinned_patch_tri_state() -> None:
+@pytest.mark.asyncio
+async def test_quality_rejects_invalid_pinned_patch_tri_state() -> None:
     """Quality check 拒绝非法 pinned patch 三态。
 
     :returns: ``None``。
     """
 
     request = _request()
-    candidate = FakeContextCompactor().compact(request)
+    candidate = await FakeContextCompactor().compact(request)
     invalid_patch = replace(
         candidate.pinned_state_patch_candidate,
         current_goal=PinnedTextFieldPatch(
@@ -144,14 +150,15 @@ def test_quality_rejects_invalid_pinned_patch_tri_state() -> None:
     )
 
 
-def test_quality_rejects_pinned_patch_unknown_evidence_ref() -> None:
+@pytest.mark.asyncio
+async def test_quality_rejects_pinned_patch_unknown_evidence_ref() -> None:
     """Quality check 拒绝 patch 引用不存在的 input evidence。
 
     :returns: ``None``。
     """
 
     request = _request()
-    candidate = FakeContextCompactor().compact(request)
+    candidate = await FakeContextCompactor().compact(request)
     invalid_patch = replace(
         candidate.pinned_state_patch_candidate,
         open_questions=PinnedStringTupleFieldPatch(
@@ -170,14 +177,15 @@ def test_quality_rejects_pinned_patch_unknown_evidence_ref() -> None:
     )
 
 
-def test_quality_rejects_summary_pretending_to_create_verified_fact() -> None:
+@pytest.mark.asyncio
+async def test_quality_rejects_summary_pretending_to_create_verified_fact() -> None:
     """Quality check 拒绝 episode summary 伪造 verified fact。
 
     :returns: ``None``。
     """
 
     request = _request()
-    candidate = FakeContextCompactor().compact(request)
+    candidate = await FakeContextCompactor().compact(request)
     invalid_summary = replace(
         candidate.episode_summary_candidate,
         proposed_verified_fact_refs=("summary-made-fact",),

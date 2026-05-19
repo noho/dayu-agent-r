@@ -28,7 +28,7 @@ class FakeContextCompactor(ContextCompactor):
     状态，不应作为生产默认 compactor。
     """
 
-    def compact(self, request: CompactionRequest) -> CompactionCandidate:
+    async def compact(self, request: CompactionRequest) -> CompactionCandidate:
         """生成 deterministic compaction candidate。
 
         :param request: Host 构造的 compaction 请求。

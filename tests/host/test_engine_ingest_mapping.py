@@ -172,7 +172,7 @@ class _TransactionReadableCompactor(ContextCompactor):
         self.calls = 0
         self._fake = FakeContextCompactor()
 
-    def compact(self, request: CompactionRequest) -> CompactionCandidate:
+    async def compact(self, request: CompactionRequest) -> CompactionCandidate:
         """执行 compact 并验证当前不在外层 write transaction 内。
 
         :param request: compaction request。
@@ -184,13 +184,13 @@ class _TransactionReadableCompactor(ContextCompactor):
             lambda transaction: read_run_by_id(transaction, request.run_id)
         )
         assert row is not None
-        return self._fake.compact(request)
+        return await self._fake.compact(request)
 
 
 class _RaisingCompactor(ContextCompactor):
     """测试用失败 compactor。"""
 
-    def compact(self, request: CompactionRequest) -> CompactionCandidate:
+    async def compact(self, request: CompactionRequest) -> CompactionCandidate:
         """抛出 proposal 失败。
 
         :param request: compaction request。
@@ -376,7 +376,8 @@ def test_run_failed_recoverable_true_is_diagnostic_then_failed(tmp_path: Path) -
         assert run_status == RunStatus.FAILED
 
 
-def test_context_compaction_requested_none_budget_uses_host_estimator_and_recovers(
+@pytest.mark.asyncio
+async def test_context_compaction_requested_none_budget_uses_host_estimator_and_recovers(
     tmp_path: Path,
 ) -> None:
     """provider overflow budget_state=None 使用 Host estimator 并进入 recovery。"""
@@ -396,13 +397,13 @@ def test_context_compaction_requested_none_budget_uses_host_estimator_and_recove
             event_type=EngineEventType.CONTEXT_COMPACTION_REQUESTED,
         )
 
-        result = EngineEventIngestor(
+        result = await EngineEventIngestor(
             transaction_runner=store.transaction_runner,
             wakeup_port=wakeup,
             context_budget_policy=_reactive_policy(),
             context_compactor=FakeContextCompactor(),
             compact_artifact_root=tmp_path / "compact-artifacts",
-        ).ingest(candidate)
+        ).ingest_async(candidate)
 
         assert result.terminal_closeout is False
         assert result.stop_worker_stream is True
@@ -428,7 +429,8 @@ def test_context_compaction_requested_none_budget_uses_host_estimator_and_recove
         assert wakeup.dispatches[0].execution_id != seeded.execution_id
 
 
-def test_reactive_compaction_calls_llm_outside_write_transaction(
+@pytest.mark.asyncio
+async def test_reactive_compaction_calls_llm_outside_write_transaction(
     tmp_path: Path,
 ) -> None:
     """reactive compactor 外部调用不持有 Host write transaction。"""
@@ -438,19 +440,20 @@ def test_reactive_compaction_calls_llm_outside_write_transaction(
         compactor = _TransactionReadableCompactor(store.transaction_runner)
         candidate = _context_compaction_candidate(seeded, worker_event_index=41)
 
-        result = EngineEventIngestor(
+        result = await EngineEventIngestor(
             transaction_runner=store.transaction_runner,
             context_budget_policy=_reactive_policy(),
             context_compactor=compactor,
             compact_artifact_root=tmp_path / "compact-artifacts",
-        ).ingest(candidate)
+        ).ingest_async(candidate)
 
         assert result.status is EngineIngestStatus.ACCEPTED
         assert compactor.calls == 1
         assert _event_count(store.transaction_runner, CONTEXT_COMPACTED) == 1
 
 
-def test_reactive_compaction_attempt_rejected_uses_request_event_operation_id(
+@pytest.mark.asyncio
+async def test_reactive_compaction_attempt_rejected_uses_request_event_operation_id(
     tmp_path: Path,
 ) -> None:
     """reactive attempt rejected 使用 request fact event id 作为 operation anchor。"""
@@ -459,7 +462,7 @@ def test_reactive_compaction_attempt_rejected_uses_request_event_operation_id(
         seeded = _seed_active_run(store.transaction_runner)
         candidate = _context_compaction_candidate(seeded, worker_event_index=42)
 
-        result = EngineEventIngestor(
+        result = await EngineEventIngestor(
             transaction_runner=store.transaction_runner,
             context_budget_policy=default_context_budget_policy(
                 context_window_size=100,
@@ -472,7 +475,7 @@ def test_reactive_compaction_attempt_rejected_uses_request_event_operation_id(
             ),
             context_compactor=_RaisingCompactor(),
             compact_artifact_root=tmp_path / "compact-artifacts",
-        ).ingest(candidate)
+        ).ingest_async(candidate)
 
         rejected_rows = tuple(
             event
@@ -529,15 +532,16 @@ def test_context_compaction_requested_stale_identity_is_rejected(
         assert attempt_status == AttemptStatus.RUNNING
 
 
-def test_reactive_compact_failure_fails_run_without_lost(tmp_path: Path) -> None:
+@pytest.mark.asyncio
+async def test_reactive_compact_failure_fails_run_without_lost(tmp_path: Path) -> None:
     """reactive compact failure 在旧 Attempt 关闭后 FAILED 收口，不进入 LOST。"""
 
     with open_host_durable_store(_options(tmp_path)) as store:
         seeded = _seed_active_run(store.transaction_runner)
-        result = EngineEventIngestor(
+        result = await EngineEventIngestor(
             transaction_runner=store.transaction_runner,
             context_budget_policy=_reactive_policy(),
-        ).ingest(
+        ).ingest_async(
             _context_compaction_candidate(seeded, worker_event_index=42)
         )
 
@@ -555,7 +559,8 @@ def test_reactive_compact_failure_fails_run_without_lost(tmp_path: Path) -> None
         assert _attempt_count(store.transaction_runner, seeded.run_id) == 1
 
 
-def test_old_attempt_run_failed_after_recovery_is_stale_diagnostic(
+@pytest.mark.asyncio
+async def test_old_attempt_run_failed_after_recovery_is_stale_diagnostic(
     tmp_path: Path,
 ) -> None:
     """recovery start 后旧 Attempt 的 recoverable run_failed 不创建第二个 Attempt。"""
@@ -568,7 +573,7 @@ def test_old_attempt_run_failed_after_recovery_is_stale_diagnostic(
             context_compactor=FakeContextCompactor(),
             compact_artifact_root=tmp_path / "compact-artifacts",
         )
-        first = ingestor.ingest(
+        first = await ingestor.ingest_async(
             _context_compaction_candidate(seeded, worker_event_index=43)
         )
         assert first.status == EngineIngestStatus.ACCEPTED
@@ -597,7 +602,8 @@ def test_old_attempt_run_failed_after_recovery_is_stale_diagnostic(
         )
 
 
-def test_reactive_compact_count_limit_fails_closed_without_second_attempt(
+@pytest.mark.asyncio
+async def test_reactive_compact_count_limit_fails_closed_without_second_attempt(
     tmp_path: Path,
 ) -> None:
     """committed reactive request 数达到上限时失败收口且不创建 recovery Attempt。"""
@@ -611,12 +617,12 @@ def test_reactive_compact_count_limit_fails_closed_without_second_attempt(
             corrupted=False,
         )
 
-        result = EngineEventIngestor(
+        result = await EngineEventIngestor(
             transaction_runner=store.transaction_runner,
             context_budget_policy=_reactive_policy(),
             context_compactor=FakeContextCompactor(),
             compact_artifact_root=tmp_path / "compact-artifacts",
-        ).ingest(_context_compaction_candidate(seeded, worker_event_index=45))
+        ).ingest_async(_context_compaction_candidate(seeded, worker_event_index=45))
 
         assert CONTEXT_COMPACTION_REQUESTED not in (
             event.event_type for event in result.events
@@ -629,7 +635,8 @@ def test_reactive_compact_count_limit_fails_closed_without_second_attempt(
         assert _payload(failed)["failure_reason"] == "reactive_compact_limit_reached"
 
 
-def test_reactive_compact_corrupt_count_fact_fails_closed(
+@pytest.mark.asyncio
+async def test_reactive_compact_corrupt_count_fact_fails_closed(
     tmp_path: Path,
 ) -> None:
     """reactive compact count fact 损坏时 fail closed 且不创建第二个 Attempt。"""
@@ -643,12 +650,12 @@ def test_reactive_compact_corrupt_count_fact_fails_closed(
             corrupted=True,
         )
 
-        result = EngineEventIngestor(
+        result = await EngineEventIngestor(
             transaction_runner=store.transaction_runner,
             context_budget_policy=_reactive_policy(),
             context_compactor=FakeContextCompactor(),
             compact_artifact_root=tmp_path / "compact-artifacts",
-        ).ingest(_context_compaction_candidate(seeded, worker_event_index=46))
+        ).ingest_async(_context_compaction_candidate(seeded, worker_event_index=46))
 
         assert result.status == EngineIngestStatus.ACCEPTED
         assert _attempt_count(store.transaction_runner, seeded.run_id) == 1

@@ -484,12 +484,55 @@ class EngineEventIngestor:
         )
 
     def ingest(self, candidate: EngineEventCandidate) -> EngineIngestResult:
-        """接收一个 EngineEvent candidate 并写入 Host durable facts。
+        """同步接收一个不需要 reactive compaction 的 EngineEvent candidate。
+
+        :param candidate: 待 ingest 的 EngineEvent candidate。
+        :returns: ingest 结果。
+        :raises ValueError: candidate envelope、时间戳或 event index 非法时抛出。
+        :raises RuntimeError: candidate 触发 reactive compaction 时抛出。
+        :raises HostDurableError: durable 写入或状态 CAS 失败时抛出。
+        """
+
+        result = self._ingest_before_reactive_compaction(candidate)
+        if isinstance(result, _ReactiveCompactPending):
+            raise RuntimeError("reactive context compaction requires ingest_async")
+        if isinstance(result, _ReactiveRecoveryAccepted):
+            result = self._complete_reactive_recovery_after_compact(result)
+        return self._finish_ingest(
+            result,
+            candidate=candidate,
+            promotion_triggered_session_id=candidate.envelope.session_id,
+        )
+
+    async def ingest_async(
+        self, candidate: EngineEventCandidate
+    ) -> EngineIngestResult:
+        """接收一个可执行 reactive compaction 的 EngineEvent candidate。
 
         :param candidate: 待 ingest 的 EngineEvent candidate。
         :returns: ingest 结果。
         :raises ValueError: candidate envelope、时间戳或 event index 非法时抛出。
         :raises HostDurableError: durable 写入或状态 CAS 失败时抛出。
+        """
+
+        result = self._ingest_before_reactive_compaction(candidate)
+        if isinstance(result, _ReactiveCompactPending):
+            result = await self._execute_reactive_compaction(result)
+        if isinstance(result, _ReactiveRecoveryAccepted):
+            result = self._complete_reactive_recovery_after_compact(result)
+        return self._finish_ingest(
+            result,
+            candidate=candidate,
+            promotion_triggered_session_id=candidate.envelope.session_id,
+        )
+
+    def _ingest_before_reactive_compaction(
+        self, candidate: EngineEventCandidate
+    ) -> EngineIngestResult | _ReactiveRecoveryAccepted | _ReactiveCompactPending:
+        """执行 reactive compaction 前的同步 ingest 事务。
+
+        :param candidate: 待 ingest 的 EngineEvent candidate。
+        :returns: ingest 结果、reactive recovery 摘要或待 compact 摘要。
         """
 
         _validate_candidate_shape(candidate)
@@ -530,14 +573,26 @@ class EngineEventIngestor:
                 )
             return self._ingest_validated(transaction, context)
 
-        result = self._transaction_runner.run_write(_operation)
-        if isinstance(result, _ReactiveCompactPending):
-            result = self._execute_reactive_compaction(result)
-        if isinstance(result, _ReactiveRecoveryAccepted):
-            result = self._complete_reactive_recovery_after_compact(result)
+        return self._transaction_runner.run_write(_operation)
+
+    def _finish_ingest(
+        self,
+        result: EngineIngestResult,
+        *,
+        candidate: EngineEventCandidate,
+        promotion_triggered_session_id: str,
+    ) -> EngineIngestResult:
+        """完成 ingest 后的 promotion 与日志记录。
+
+        :param result: 已完成 reactive recovery 处理的 ingest 结果。
+        :param candidate: 原始 Engine event candidate。
+        :param promotion_triggered_session_id: terminal promotion 的 Session id。
+        :returns: 最终 ingest 结果。
+        """
+
         promoted = self._with_terminal_promotion_retry(
             result,
-            session_id=candidate.envelope.session_id,
+            session_id=promotion_triggered_session_id,
         )
         _LOGGER.log(
             VERBOSE_LOG_LEVEL,
@@ -1322,7 +1377,7 @@ class EngineEventIngestor:
             ),
         ).row
 
-    def _execute_reactive_compaction(
+    async def _execute_reactive_compaction(
         self, pending: _ReactiveCompactPending
     ) -> EngineIngestResult | _ReactiveRecoveryAccepted:
         """在事务外执行 reactive compact，并在新事务内写入结果。
@@ -1348,7 +1403,7 @@ class EngineEventIngestor:
                 if self._context_budget_policy is not None
                 else 1
             )
-            operation_result = run_compaction_operation(
+            operation_result = await run_compaction_operation(
                 request=request,
                 compactor=compactor,
                 max_attempts=attempts,

@@ -291,7 +291,7 @@ def test_cancel_run_waiting_for_lane_skips_later_dispatch(tmp_path: Path) -> Non
                 scheduler = await _open_scheduler(tmp_path, store, handle)
                 try:
                     start_run(host, _start_request(session_id, "start-wait"))
-                    refs = _start_governed_refs(scheduler, session_id)
+                    refs = await _start_governed_refs(scheduler, session_id)
                     _mark_waiting_for_lane(store.transaction_runner, refs)
                     cancelled = cancel_run(
                         host, refs.run_id, _cancel_request("cancel-wait")
@@ -339,7 +339,7 @@ def test_cancel_run_dispatching_pre_accept_stays_cancelled(
                         host,
                         _start_request(session_id, "start-dispatching"),
                     )
-                    refs = _start_governed_refs(scheduler, session_id)
+                    refs = await _start_governed_refs(scheduler, session_id)
                     _mark_dispatching(store.transaction_runner, refs)
                     return refs
                 finally:
@@ -377,7 +377,7 @@ async def test_cancel_run_active_worker_propagates_and_closes_cancelled(
             )
             try:
                 start_run(host, _start_request(session_id, "start-active"))
-                refs = _start_governed_refs(scheduler, session_id)
+                refs = await _start_governed_refs(scheduler, session_id)
                 scheduler.wake_dispatch(_pending_dispatch(refs))
                 drain = await scheduler.drain_once()
                 assert drain.dispatched == 1
@@ -418,7 +418,7 @@ async def test_late_cancel_does_not_overwrite_terminal(tmp_path: Path) -> None:
             scheduler = await _open_scheduler(tmp_path, store, handle)
             try:
                 start_run(host, _start_request(session_id, "start-final"))
-                refs = _start_governed_refs(scheduler, session_id)
+                refs = await _start_governed_refs(scheduler, session_id)
                 scheduler.wake_dispatch(_pending_dispatch(refs))
                 drain = await scheduler.drain_once()
                 assert drain.dispatched == 1
@@ -469,7 +469,7 @@ async def test_worker_terminal_promotes_and_dispatches_queued_run(
                 lane_timeout_seconds=0.5,
             )
             try:
-                active_refs = _start_governed_refs(scheduler, session_id)
+                active_refs = await _start_governed_refs(scheduler, session_id)
                 assert active_refs.run_id == active.run_id
                 scheduler.wake_dispatch(_pending_dispatch(active_refs))
                 drain = await scheduler.drain_once()
@@ -513,7 +513,7 @@ async def test_cancel_session_replay_repropagates_active_without_new_facts(
             )
             try:
                 start_run(host, _start_request(session_id, "start-session"))
-                refs = _start_governed_refs(scheduler, session_id)
+                refs = await _start_governed_refs(scheduler, session_id)
                 scheduler.wake_dispatch(_pending_dispatch(refs))
                 drain = await scheduler.drain_once()
                 assert drain.dispatched == 1
@@ -765,7 +765,7 @@ def _refs(db_path: Path, run_id: str) -> _RunRefs:
     )
 
 
-def _start_governed_refs(
+async def _start_governed_refs(
     scheduler: HostDispatchScheduler, session_id: str
 ) -> _RunRefs:
     """执行一次 pre-start governance 并返回生成的 dispatch refs。
@@ -776,7 +776,7 @@ def _start_governed_refs(
     :raises AssertionError: 没有可启动 Run 时抛出。
     """
 
-    stage = scheduler._run_pre_start_governance(session_id)
+    stage = await scheduler._run_pre_start_governance(session_id)
     assert stage.pending_dispatch is not None
     pending = stage.pending_dispatch
     return _RunRefs(

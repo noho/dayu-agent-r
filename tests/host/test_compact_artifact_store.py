@@ -37,13 +37,14 @@ from dayu.host.durable.transaction import HostTransaction
 from dayu.host.fake_compaction import FakeContextCompactor
 
 
-def test_compact_artifact_store_writes_deterministic_descriptor_with_digest(
+@pytest.mark.asyncio
+async def test_compact_artifact_store_writes_deterministic_descriptor_with_digest(
     tmp_path: Path,
 ) -> None:
     """Artifact store 写 deterministic descriptor 与 digest。"""
 
     options = _options(tmp_path)
-    write_request = _write_request()
+    write_request = await _write_request()
     expected_bytes = canonical_json_dumps(compact_artifact_json(write_request)).encode(
         "utf-8"
     )
@@ -84,10 +85,11 @@ def test_compact_artifact_store_writes_deterministic_descriptor_with_digest(
         )
 
 
-def test_compact_artifact_content_contains_required_canonical_fields() -> None:
+@pytest.mark.asyncio
+async def test_compact_artifact_content_contains_required_canonical_fields() -> None:
     """Artifact content 包含 Slice 2 要求字段。"""
 
-    write_request = _write_request()
+    write_request = await _write_request()
     artifact_json = compact_artifact_json(write_request)
 
     assert isinstance(artifact_json, dict)
@@ -104,14 +106,15 @@ def test_compact_artifact_content_contains_required_canonical_fields() -> None:
     assert artifact_json["policy_digest"] == write_request.policy_digest
 
 
-def test_compact_artifact_store_rejects_corrupted_expected_digest(
+@pytest.mark.asyncio
+async def test_compact_artifact_store_rejects_corrupted_expected_digest(
     tmp_path: Path,
 ) -> None:
     """Artifact expected digest 损坏时拒绝写 descriptor。"""
 
     options = _options(tmp_path)
     wrong_digest = sha256_digest_bytes(b"wrong")
-    write_request = _write_request(expected_artifact_digest=wrong_digest)
+    write_request = await _write_request(expected_artifact_digest=wrong_digest)
 
     with open_host_durable_store(options) as durable_store:
 
@@ -148,10 +151,11 @@ def test_compact_artifact_store_rejects_corrupted_expected_digest(
         assert durable_store.transaction_runner.run_read(count_descriptors) == 0
 
 
-def test_compact_artifact_write_request_rejects_unaccepted_quality_result() -> None:
+@pytest.mark.asyncio
+async def test_compact_artifact_write_request_rejects_unaccepted_quality_result() -> None:
     """Artifact 写入请求拒绝未通过 quality check 的候选。"""
 
-    request, candidate, quality_result = _candidate_bundle()
+    request, candidate, quality_result = await _candidate_bundle()
     rejected_quality = CompactQualityCheckResult(
         accepted=False,
         rejection_reasons=(CompactQualityIssue.CURRENT_USER_INPUT_MISSING,),
@@ -180,11 +184,12 @@ def test_compact_artifact_write_request_rejects_unaccepted_quality_result() -> N
         )
 
 
-def test_compact_artifact_descriptor_can_be_read_back(tmp_path: Path) -> None:
+@pytest.mark.asyncio
+async def test_compact_artifact_descriptor_can_be_read_back(tmp_path: Path) -> None:
     """写入后的 artifact descriptor 可通过 PayloadStore helper 读回。"""
 
     options = _options(tmp_path)
-    write_request = _write_request(payload_ref="compact-artifact:test-ref")
+    write_request = await _write_request(payload_ref="compact-artifact:test-ref")
 
     with open_host_durable_store(options) as durable_store:
 
@@ -228,7 +233,7 @@ def _options(tmp_path: Path) -> HostDurableStoreOptions:
     )
 
 
-def _write_request(
+async def _write_request(
     *,
     payload_ref: str | None = None,
     expected_artifact_digest: str | None = None,
@@ -240,7 +245,7 @@ def _write_request(
     :returns: compact artifact 写入请求。
     """
 
-    request, candidate, quality_result = _candidate_bundle()
+    request, candidate, quality_result = await _candidate_bundle()
     return CompactArtifactWriteRequest(
         compaction_request=request,
         accepted_candidate=candidate,
@@ -251,7 +256,7 @@ def _write_request(
     )
 
 
-def _candidate_bundle() -> tuple[
+async def _candidate_bundle() -> tuple[
     CompactionRequest, CompactionCandidate, CompactQualityCheckResult
 ]:
     """构造已通过 quality check 的 candidate bundle。
@@ -260,7 +265,7 @@ def _candidate_bundle() -> tuple[
     """
 
     request = _request()
-    candidate = FakeContextCompactor().compact(request)
+    candidate = await FakeContextCompactor().compact(request)
     quality_result = check_compaction_candidate(request, candidate)
     assert quality_result.accepted is True
     return request, candidate, quality_result

@@ -504,8 +504,10 @@ class HostDispatchScheduler:
         )
         self._projection_catchup_port = projection_catchup_port
         self._queue: asyncio.Queue[PendingDispatchRecord] = asyncio.Queue()
+        self._promotion_queue: asyncio.Queue[str] = asyncio.Queue()
         self._closed = False
         self._drain_task: asyncio.Task[None] | None = None
+        self._promotion_drain_task: asyncio.Task[None] | None = None
         self._active_tasks: set[asyncio.Task[None]] = set()
         self._active_handles: set[LocalWorkerHandle] = set()
         self._duplicate_governance_registry = (
@@ -610,13 +612,38 @@ class HostDispatchScheduler:
 
         if self._closed:
             raise RuntimeError("HostDispatchScheduler is closed")
+        self._promotion_queue.put_nowait(session_id)
+        _LOGGER.log(
+            VERBOSE_LOG_LEVEL,
+            "dispatch.queue_promotion.wake session_id=%s queue_size=%s",
+            session_id,
+            self._promotion_queue.qsize(),
+        )
+        if (
+            self._promotion_drain_task is None
+            or self._promotion_drain_task.done()
+        ):
+            self._promotion_drain_task = asyncio.create_task(
+                self._promotion_drain_loop()
+            )
+
+    async def run_queue_promotion(self, session_id: str) -> None:
+        """执行同 Session queued Run promotion。
+
+        :param session_id: 目标 Session id。
+        :returns: ``None``。
+        :raises RuntimeError: scheduler 已关闭时抛出。
+        """
+
+        if self._closed:
+            raise RuntimeError("HostDispatchScheduler is closed")
         _LOGGER.log(
             VERBOSE_LOG_LEVEL,
             "dispatch.queue_promotion.start session_id=%s",
             session_id,
         )
         catch_up_projection_best_effort(self._projection_catchup_port)
-        stage = self._run_pre_start_governance(session_id)
+        stage = await self._run_pre_start_governance(session_id)
         pending_dispatch = stage.pending_dispatch
         if stage.compact_accepted is not None:
             _LOGGER.log(
@@ -649,7 +676,9 @@ class HostDispatchScheduler:
         if pending_dispatch is not None:
             self.wake_dispatch(pending_dispatch)
 
-    def _run_pre_start_governance(self, session_id: str) -> _GovernanceStageResult:
+    async def _run_pre_start_governance(
+        self, session_id: str
+    ) -> _GovernanceStageResult:
         """执行一次 pre-start Context Governance。
 
         :param session_id: 目标 Session id。
@@ -855,7 +884,9 @@ class HostDispatchScheduler:
         stage = self._transaction_runner.run_write(_operation)
         if stage.compact_pending is None:
             return stage
-        compacted_sequence = self._execute_proactive_compaction(stage.compact_pending)
+        compacted_sequence = await self._execute_proactive_compaction(
+            stage.compact_pending
+        )
         if compacted_sequence is None:
             return _GovernanceStageResult(
                 pending_dispatch=None, compact_accepted=None
@@ -879,7 +910,7 @@ class HostDispatchScheduler:
             ),
         )
 
-    def _execute_proactive_compaction(
+    async def _execute_proactive_compaction(
         self, pending: _GovernanceCompactPending
     ) -> int | None:
         """在事务外执行 proactive compact，并在新事务内写入结果。
@@ -897,7 +928,7 @@ class HostDispatchScheduler:
             if self._local_execution.context_budget_policy is not None
             else 1
         )
-        result = run_compaction_operation(
+        result = await run_compaction_operation(
             request=pending.request,
             compactor=compactor,
             max_attempts=attempts,
@@ -1492,6 +1523,10 @@ class HostDispatchScheduler:
         if task is not None:
             task.cancel()
             await _suppress_task_cancel(task)
+        promotion_task = self._promotion_drain_task
+        if promotion_task is not None:
+            promotion_task.cancel()
+            await _suppress_task_cancel(promotion_task)
         for handle in tuple(self._active_handles):
             _safe_cancel_worker_handle(handle, "scheduler_close")
         for active_task in tuple(self._active_tasks):
@@ -1539,6 +1574,51 @@ class HostDispatchScheduler:
                 exc.__class__.__name__,
                 exc_info=True,
             )
+
+    async def _promotion_drain_loop(self) -> None:
+        """后台处理 queued Run promotion wakeup。
+
+        :returns: ``None``。
+        :raises asyncio.CancelledError: scheduler close 时透传取消。
+        """
+
+        try:
+            while not self._closed:
+                session_id = await self._promotion_queue.get()
+                try:
+                    await self.run_queue_promotion(session_id)
+                except RuntimeError as exc:
+                    if self._closed:
+                        _LOGGER.debug(
+                            "dispatch.queue_promotion.cancelled_for_close "
+                            "host_handle_id=%s session_id=%s",
+                            self._host_handle_id,
+                            session_id,
+                        )
+                    else:
+                        _LOGGER.warning(
+                            "dispatch.queue_promotion.runtime_error "
+                            "host_handle_id=%s session_id=%s error_type=%s",
+                            self._host_handle_id,
+                            session_id,
+                            exc.__class__.__name__,
+                            exc_info=True,
+                        )
+                except Exception as exc:
+                    _LOGGER.warning(
+                        "dispatch.queue_promotion.unexpected_exception "
+                        "host_handle_id=%s session_id=%s error_type=%s",
+                        self._host_handle_id,
+                        session_id,
+                        exc.__class__.__name__,
+                        exc_info=True,
+                    )
+        except asyncio.CancelledError:
+            _LOGGER.debug(
+                "dispatch.queue_promotion.cancelled host_handle_id=%s",
+                self._host_handle_id,
+            )
+            raise
 
     async def _dispatch_one(self, record: PendingDispatchRecord) -> str:
         """处理一个 dispatch wakeup。
@@ -2416,7 +2496,7 @@ class HostDispatchScheduler:
                     break
                 worker_event_index += 1
                 try:
-                    result = ingestor.ingest(
+                    result = await ingestor.ingest_async(
                         EngineEventCandidate(
                             envelope=envelope,
                             worker_event_index=worker_event_index,

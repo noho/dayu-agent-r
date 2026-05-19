@@ -68,7 +68,7 @@ class CompactionOperationResult:
     budget_after_attempted_compact: int | None
 
 
-def run_compaction_operation(
+async def run_compaction_operation(
     *,
     request: CompactionRequest,
     compactor: ContextCompactor,
@@ -92,7 +92,7 @@ def run_compaction_operation(
             else _NEXT_DECISION_FAIL_COMPACTION
         )
         try:
-            candidate = compactor.compact(request)
+            candidate = await compactor.compact(request)
         except Exception as exc:
             rejected.append(
                 _attempt_rejected(

@@ -405,7 +405,7 @@ async def test_start_run_fake_worker_final_answer_succeeds(
                 _SequencedLocalWorkerFactory((handle,)),
             )
             try:
-                scheduler.wake_queue_promotion(accepted.session_id)
+                await scheduler.run_queue_promotion(accepted.session_id)
                 refs = _refs(options.db_path, accepted.run_id)
                 drain = await scheduler.drain_once()
                 assert drain.dispatched == 1
@@ -442,7 +442,7 @@ async def test_start_run_fake_worker_run_failed_fails(tmp_path: Path) -> None:
                 _SequencedLocalWorkerFactory((handle,)),
             )
             try:
-                scheduler.wake_queue_promotion(accepted.session_id)
+                await scheduler.run_queue_promotion(accepted.session_id)
                 refs = _refs(options.db_path, accepted.run_id)
                 assert (await scheduler.drain_once()).dispatched == 1
                 await _wait_for_run_status(
@@ -478,7 +478,7 @@ async def test_start_run_fake_worker_clean_eof_fails(tmp_path: Path) -> None:
                 _SequencedLocalWorkerFactory((handle,)),
             )
             try:
-                scheduler.wake_queue_promotion(accepted.session_id)
+                await scheduler.run_queue_promotion(accepted.session_id)
                 refs = _refs(options.db_path, accepted.run_id)
                 assert (await scheduler.drain_once()).dispatched == 1
                 await _wait_for_run_status(
@@ -515,7 +515,7 @@ async def test_start_run_fake_worker_crash_loses(tmp_path: Path) -> None:
                 _SequencedLocalWorkerFactory((handle,)),
             )
             try:
-                scheduler.wake_queue_promotion(accepted.session_id)
+                await scheduler.run_queue_promotion(accepted.session_id)
                 refs = _refs(options.db_path, accepted.run_id)
                 assert (await scheduler.drain_once()).dispatched == 1
                 await _wait_for_run_status(
@@ -554,7 +554,7 @@ async def test_cancel_active_fake_worker_closes_cancelled(tmp_path: Path) -> Non
                 active_registry=active_registry,
             )
             try:
-                scheduler.wake_queue_promotion(accepted.session_id)
+                await scheduler.run_queue_promotion(accepted.session_id)
                 refs = _refs(options.db_path, accepted.run_id)
                 assert (await scheduler.drain_once()).dispatched == 1
                 assert _attempt_status(options.db_path, refs.attempt_id) == (
@@ -620,7 +620,7 @@ async def test_queue_promotion_after_terminal_and_cancel_wakes_dispatch(
                 ),
             )
             try:
-                scheduler.wake_queue_promotion(terminal_session_id)
+                await scheduler.run_queue_promotion(terminal_session_id)
                 terminal_refs = _refs(
                     terminal_options.db_path, terminal_active.run_id
                 )
@@ -669,7 +669,7 @@ async def test_queue_promotion_after_terminal_and_cancel_wakes_dispatch(
                 active_registry=active_registry,
             )
             try:
-                scheduler.wake_queue_promotion(cancel_session_id)
+                await scheduler.run_queue_promotion(cancel_session_id)
                 cancel_refs = _refs(cancel_options.db_path, cancel_active.run_id)
                 assert (await scheduler.drain_once()).dispatched == 1
                 cancelling = cancel_run(

@@ -874,7 +874,7 @@ class ContextCompactor(Protocol):
     必须由 quality checker 通过后才可写 compact artifact / canonical event。
     """
 
-    def compact(self, request: CompactionRequest) -> CompactionCandidate:
+    async def compact(self, request: CompactionRequest) -> CompactionCandidate:
         """生成 compaction candidate。
 
         :param request: Host 构造的 compaction 请求。
