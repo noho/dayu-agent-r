@@ -181,8 +181,8 @@ _LANE_OWNER_PREFIX = "host-dispatch"
 _GOVERNANCE_ACTOR = "host.context_governance"
 _GOVERNANCE_FAILURE_REASON = "pre_dispatch_context_governance"
 _COMPACT_FAILURE_POLICY_DECISION = "compact_failed_before_dispatch"
-_LOG_DRAIN_LOOP_EMPTY_SLEEPING = (
-    "dispatch drain loop empty queue; sleeping host_handle_id=%s interval_seconds=%s"
+_LOG_DRAIN_LOOP_IDLE = (
+    "dispatch.drain_loop.idle host_handle_id=%s interval_seconds=%s"
 )
 _LOG_DRAIN_LOOP_CLOSE_EXIT = "dispatch drain loop exiting after close host_handle_id=%s"
 _LOG_DRAIN_LOOP_CANCELLED_FOR_CLOSE = (
@@ -1549,19 +1549,29 @@ class HostDispatchScheduler:
         :raises asyncio.CancelledError: scheduler close 时透传取消。
         """
 
+        idle_sleep_logged = False
         try:
             while not self._closed:
                 try:
                     if self._queue.empty():
-                        _LOGGER.debug(
-                            _LOG_DRAIN_LOOP_EMPTY_SLEEPING,
-                            self._host_handle_id,
-                            self._local_execution.dispatch_poll_interval_seconds,
-                        )
+                        if not idle_sleep_logged:
+                            _LOGGER.debug(
+                                _LOG_DRAIN_LOOP_IDLE,
+                                self._host_handle_id,
+                                (
+                                    self._local_execution
+                                    .dispatch_poll_interval_seconds
+                                ),
+                            )
+                            idle_sleep_logged = True
                         await asyncio.sleep(
                             self._local_execution.dispatch_poll_interval_seconds
                         )
-                    await self.drain_once()
+                    else:
+                        idle_sleep_logged = False
+                    result = await self.drain_once()
+                    if result.processed > 0:
+                        idle_sleep_logged = False
                 except Exception as exc:
                     _LOGGER.warning(
                         _LOG_DRAIN_LOOP_UNEXPECTED_EXCEPTION,

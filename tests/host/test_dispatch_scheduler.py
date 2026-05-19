@@ -894,14 +894,17 @@ class _EnqueueOnSecondEmptyQueue(asyncio.Queue[PendingDispatchRecord]):
 class _ObservedEmptyQueue(asyncio.Queue[PendingDispatchRecord]):
     """记录 empty 检查的测试队列。"""
 
-    def __init__(self) -> None:
+    def __init__(self, *, target_empty_checks: int = 1) -> None:
         """初始化测试队列。
 
+        :param target_empty_checks: 触发 ``empty_checked`` 的 empty 检查次数。
         :returns: ``None``。
         """
 
         super().__init__()
         self.empty_checked = asyncio.Event()
+        self.empty_call_count = 0
+        self._target_empty_checks = target_empty_checks
 
     def empty(self) -> bool:
         """记录 empty 检查并返回真实队列状态。
@@ -909,7 +912,9 @@ class _ObservedEmptyQueue(asyncio.Queue[PendingDispatchRecord]):
         :returns: 当前队列是否为空。
         """
 
-        self.empty_checked.set()
+        self.empty_call_count += 1
+        if self.empty_call_count >= self._target_empty_checks:
+            self.empty_checked.set()
         return super().empty()
 
 
@@ -1142,11 +1147,11 @@ async def test_safe_cleanup_helpers_log_failures(
 
 
 @pytest.mark.asyncio
-async def test_drain_loop_logs_empty_sleep_and_close(
+async def test_drain_loop_logs_idle_once_per_idle_streak_and_close(
     tmp_path: Path,
     caplog: pytest.LogCaptureFixture,
 ) -> None:
-    """drain loop 空队列睡眠和 close 取消路径写入 debug 诊断。
+    """drain loop 空闲态和 close 取消路径写入有界 debug 诊断。
 
     :param tmp_path: pytest 临时目录。
     :param caplog: pytest 日志捕获 fixture。
@@ -1155,9 +1160,9 @@ async def test_drain_loop_logs_empty_sleep_and_close(
 
     caplog.set_level(logging.DEBUG, logger="dayu.host.dispatch")
     factory = _FakeWorkerFactory()
+    observed_queue = _ObservedEmptyQueue(target_empty_checks=3)
     with open_host_durable_store(_options(tmp_path)) as store:
         scheduler = await _open_scheduler(tmp_path, store, factory)
-        observed_queue = _ObservedEmptyQueue()
         scheduler._queue = observed_queue
         scheduler._drain_task = asyncio.create_task(scheduler._drain_loop())
         try:
@@ -1165,10 +1170,16 @@ async def test_drain_loop_logs_empty_sleep_and_close(
         finally:
             await scheduler.close()
 
-    assert any(
-        "dispatch drain loop empty queue; sleeping" in record.getMessage()
+    idle_messages = [
+        record.getMessage()
         for record in caplog.records
-    )
+        if "dispatch.drain_loop.idle" in record.getMessage()
+    ]
+    assert idle_messages == [
+        "dispatch.drain_loop.idle "
+        "host_handle_id=host-test interval_seconds=0.01"
+    ]
+    assert observed_queue.empty_call_count >= 3
     assert any(
         "dispatch drain loop cancelled during close" in record.getMessage()
         for record in caplog.records
