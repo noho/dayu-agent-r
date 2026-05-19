@@ -60,7 +60,7 @@ EXPECTED_API_EXPORTS: frozenset[str] = frozenset(
         "OutboxSummary",
         "PurgeSessionRequest",
         "PurgeSessionResult",
-        "CompactorExecutionBaseline",
+        "CompactorRunnerBaseline",
         "ReplayRunRequest",
         "ResolveWaitCancelledOutcome",
         "ResolveWaitCompletedOutcome",
@@ -159,6 +159,7 @@ FORBIDDEN_HOST_ROOT_EXPORTS: frozenset[str] = frozenset(
 
 REMOVED_SERVICE_FACING_ALL_EXPORTS: frozenset[str] = frozenset(
     {
+        "CompactorExecutionBaseline",
         "HostCommandHandle",
         "HostCommandFacet",
         "HostCommandHandleOptions",
@@ -187,6 +188,7 @@ def test_host_root_does_not_export_internal_services() -> None:
 
     package_symbols = vars(host)
     assert not (FORBIDDEN_HOST_ROOT_EXPORTS & frozenset(package_symbols))
+    assert "CompactorExecutionBaseline" not in package_symbols
 
 
 def test_api_all_stays_request_snapshot_boundary() -> None:

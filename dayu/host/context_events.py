@@ -31,6 +31,9 @@ CONTEXT_COMPACTED = "CONTEXT_COMPACTED"
 CONTEXT_COMPACTION_FAILED = "CONTEXT_COMPACTION_FAILED"
 """Context compaction failed canonical event type。"""
 
+CONTEXT_COMPACTION_ATTEMPT_REJECTED = "CONTEXT_COMPACTION_ATTEMPT_REJECTED"
+"""Context compaction semantic attempt rejected canonical event type。"""
+
 _FIELD_TRIGGER_SOURCE = "trigger_source"
 _FIELD_BUDGET_REASON = "budget_reason"
 _FIELD_BUDGET_SNAPSHOT_REF = "budget_snapshot_ref"
@@ -53,6 +56,12 @@ _FIELD_EVIDENCE_ANCHORS_RETAINED = "evidence_anchors_retained"
 _FIELD_QUALITY_CHECK_RESULT = "quality_check_result"
 _FIELD_BUDGET_AFTER_COMPACT = "budget_after_compact"
 _FIELD_FAILURE_REASON = "failure_reason"
+_FIELD_OPERATION_ID = "operation_id"
+_FIELD_ATTEMPT_NUMBER = "attempt_number"
+_FIELD_FAILURE_CATEGORY = "failure_category"
+_FIELD_REPAIRABLE = "repairable"
+_FIELD_RUNNER_ATTEMPT_SUMMARY_REFS = "runner_attempt_summary_refs"
+_FIELD_NEXT_POLICY_DECISION = "next_policy_decision"
 _FIELD_POLICY_DECISION = "policy_decision"
 _FIELD_RETRYABLE = "retryable"
 _FIELD_DIAGNOSTIC_REFS = "diagnostic_refs"
@@ -104,6 +113,16 @@ _FAILED_REQUIRED_FIELDS = (
     _FIELD_POLICY_DECISION,
     _FIELD_RETRYABLE,
     _FIELD_DIAGNOSTIC_REFS,
+    _FIELD_BUDGET_AFTER_ATTEMPTED_COMPACT,
+)
+_ATTEMPT_REJECTED_REQUIRED_FIELDS = (
+    _FIELD_OPERATION_ID,
+    _FIELD_ATTEMPT_NUMBER,
+    _FIELD_FAILURE_CATEGORY,
+    _FIELD_REPAIRABLE,
+    _FIELD_RUNNER_ATTEMPT_SUMMARY_REFS,
+    _FIELD_DIAGNOSTIC_REFS,
+    _FIELD_NEXT_POLICY_DECISION,
     _FIELD_BUDGET_AFTER_ATTEMPTED_COMPACT,
 )
 _PATCH_ALLOWED_FIELDS = frozenset(
@@ -337,6 +356,73 @@ def validate_context_compaction_failed_payload(payload: Mapping[str, JsonValue])
     _optional_non_negative_int(payload, _FIELD_BUDGET_AFTER_ATTEMPTED_COMPACT)
 
 
+def build_context_compaction_attempt_rejected_payload(
+    *,
+    operation_id: str,
+    attempt_number: int,
+    failure_category: str,
+    repairable: bool,
+    runner_attempt_summary_refs: tuple[str, ...],
+    diagnostic_refs: tuple[str, ...],
+    next_policy_decision: str,
+    budget_after_attempted_compact: int | None,
+) -> Mapping[str, JsonValue]:
+    """构造 ``CONTEXT_COMPACTION_ATTEMPT_REJECTED`` payload。
+
+    :param operation_id: compaction operation id。
+    :param attempt_number: operation 内 proposal attempt 序号，从 1 开始。
+    :param failure_category: 失败类别。
+    :param repairable: 当前失败是否可进入下一次 semantic repair attempt。
+    :param runner_attempt_summary_refs: runner attempt 摘要 ref 列表。
+    :param diagnostic_refs: quality / parse / budget 诊断 ref 列表。
+    :param next_policy_decision: 下一步 Host policy decision。
+    :param budget_after_attempted_compact: 本次 attempt 后预算；未知时为
+        ``None``。
+    :returns: 可写入 EventLog 的 JSON payload。
+    :raises ValueError: payload 字段非法时抛出。
+    """
+
+    payload: Mapping[str, JsonValue] = {
+        _FIELD_OPERATION_ID: operation_id,
+        _FIELD_ATTEMPT_NUMBER: attempt_number,
+        _FIELD_FAILURE_CATEGORY: failure_category,
+        _FIELD_REPAIRABLE: repairable,
+        _FIELD_RUNNER_ATTEMPT_SUMMARY_REFS: _string_list_json(
+            runner_attempt_summary_refs
+        ),
+        _FIELD_DIAGNOSTIC_REFS: _string_list_json(diagnostic_refs),
+        _FIELD_NEXT_POLICY_DECISION: next_policy_decision,
+        _FIELD_BUDGET_AFTER_ATTEMPTED_COMPACT: budget_after_attempted_compact,
+    }
+    validate_context_compaction_attempt_rejected_payload(payload)
+    return payload
+
+
+def validate_context_compaction_attempt_rejected_payload(
+    payload: Mapping[str, JsonValue],
+) -> None:
+    """校验 ``CONTEXT_COMPACTION_ATTEMPT_REJECTED`` payload。
+
+    :param payload: 待校验 JSON payload。
+    :returns: ``None``。
+    :raises ValueError: payload 缺少必填字段或字段非法时抛出。
+    """
+
+    _require_fields(payload, _ATTEMPT_REJECTED_REQUIRED_FIELDS)
+    _required_text(payload, _FIELD_OPERATION_ID)
+    _required_positive_int(payload, _FIELD_ATTEMPT_NUMBER)
+    _required_text(payload, _FIELD_FAILURE_CATEGORY)
+    _required_bool(payload, _FIELD_REPAIRABLE)
+    runner_refs = _required_text_list(payload, _FIELD_RUNNER_ATTEMPT_SUMMARY_REFS)
+    if len(runner_refs) == 0:
+        raise ValueError("runner_attempt_summary_refs must be non-empty")
+    diagnostic_refs = _required_text_list(payload, _FIELD_DIAGNOSTIC_REFS)
+    if len(diagnostic_refs) == 0:
+        raise ValueError("diagnostic_refs must be non-empty")
+    _required_text(payload, _FIELD_NEXT_POLICY_DECISION)
+    _optional_non_negative_int(payload, _FIELD_BUDGET_AFTER_ATTEMPTED_COMPACT)
+
+
 def _range_list_json(values: tuple[CompactInputRange, ...]) -> list[JsonValue]:
     """把 compact range tuple 转换为 JSON 数组。
 
@@ -454,6 +540,25 @@ def _required_non_negative_int(
         raise ValueError(f"{field_name} must be int")
     if value < 0:
         raise ValueError(f"{field_name} must be non-negative")
+    return value
+
+
+def _required_positive_int(
+    payload: Mapping[str, JsonValue], field_name: str
+) -> int:
+    """读取必填正整数字段。
+
+    :param payload: JSON payload。
+    :param field_name: 字段名。
+    :returns: 正整数。
+    :raises ValueError: 字段缺失、类型非法或非正时抛出。
+    """
+
+    value = payload.get(field_name)
+    if isinstance(value, bool) or not isinstance(value, int):
+        raise ValueError(f"{field_name} must be int")
+    if value <= 0:
+        raise ValueError(f"{field_name} must be positive")
     return value
 
 
@@ -797,11 +902,14 @@ def _require_non_empty_text_value(value: JsonValue, field_name: str) -> str:
 
 __all__ = [
     "CONTEXT_COMPACTED",
+    "CONTEXT_COMPACTION_ATTEMPT_REJECTED",
     "CONTEXT_COMPACTION_FAILED",
     "CONTEXT_COMPACTION_REQUESTED",
+    "build_context_compaction_attempt_rejected_payload",
     "build_context_compacted_payload",
     "build_context_compaction_failed_payload",
     "build_context_compaction_requested_payload",
+    "validate_context_compaction_attempt_rejected_payload",
     "validate_context_compacted_payload",
     "validate_context_compaction_failed_payload",
     "validate_context_compaction_requested_payload",

@@ -15,7 +15,7 @@ from dayu.engine.contracts.engine_events import EngineEvent
 from dayu.engine.contracts.runner_spec import RunnerCallOptions, RunnerSpec
 from dayu.host import (
     AttemptDispatchSnapshot,
-    CompactorExecutionBaseline,
+    CompactorRunnerBaseline,
     HostEvent,
     HostEventKind,
     HostFinalAnswerView,
@@ -220,7 +220,7 @@ def _options(tmp_path: pathlib.Path) -> OpenHostOptions:
         worker_factory=_WorkerFactory(),
         tooling_options=None,
         context_budget_policy=None,
-        compactor_baseline=None,
+        compactor_runner_baseline=None,
         memory_projection_policy=default_memory_projection_policy(),
         memory_projection_catchup_batch_size=128,
         enable_truncation_manager=True,
@@ -232,7 +232,7 @@ def test_open_host_option_types_are_frozen_slots_dataclasses() -> None:
 
     for dataclass_type in (
         cast(_FrozenSlotsDataclassClass, OrdinaryRunExecutionBaseline),
-        cast(_FrozenSlotsDataclassClass, CompactorExecutionBaseline),
+        cast(_FrozenSlotsDataclassClass, CompactorRunnerBaseline),
         cast(_FrozenSlotsDataclassClass, OpenHostOptions),
         cast(_FrozenSlotsDataclassClass, HostFinalAnswerView),
         cast(_FrozenSlotsDataclassClass, HostEvent),
@@ -263,23 +263,26 @@ def test_open_host_options_validate_lane_and_baseline(
         )
 
 
-def test_compactor_baseline_validates_typed_fields(
+def test_compactor_runner_baseline_validates_typed_fields(
     tmp_path: pathlib.Path,
 ) -> None:
-    """CompactorExecutionBaseline 拒绝空 policy ref 与错误 Runner 类型。"""
+    """CompactorRunnerBaseline 拒绝错误 Runner、路径与 bool 类型。"""
 
-    baseline = CompactorExecutionBaseline(
-        context_compactor=None,
-        compactor_runner_spec=None,
-        compactor_runner_options=None,
-        compactor_policy_ref=None,
+    baseline = CompactorRunnerBaseline(
+        compactor_runner_spec=_runner_spec(),
+        compactor_runner_options=_runner_options(),
         compact_artifact_root=tmp_path / "compact",
     )
     assert baseline.compact_artifact_create_parent_dirs
-    with pytest.raises(ValueError, match="compactor_policy_ref"):
-        replace(baseline, compactor_policy_ref="")
     with pytest.raises(TypeError, match="compactor_runner_spec"):
         replace(baseline, compactor_runner_spec=cast(RunnerSpec, "bad"))
+    with pytest.raises(TypeError, match="compact_artifact_root"):
+        replace(baseline, compact_artifact_root=cast(pathlib.Path, "bad"))
+    with pytest.raises(TypeError, match="compact_artifact_create_parent_dirs"):
+        replace(baseline, compact_artifact_create_parent_dirs=cast(bool, 1))
+    assert "compactor_policy_ref" not in {
+        field.name for field in fields(CompactorRunnerBaseline)
+    }
 
 
 def test_host_event_terminal_final_answer_contract() -> None:

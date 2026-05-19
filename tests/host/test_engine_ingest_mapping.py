@@ -57,9 +57,11 @@ from dayu.host.api import (
 )
 from dayu.host.context_events import (
     CONTEXT_COMPACTED,
+    CONTEXT_COMPACTION_ATTEMPT_REJECTED,
     CONTEXT_COMPACTION_FAILED,
     CONTEXT_COMPACTION_REQUESTED,
 )
+from dayu.host.compaction import CompactionCandidate, CompactionRequest, ContextCompactor
 from dayu.host.context_policy import ContextBudgetPolicy, default_context_budget_policy
 from dayu.host.durable.codec import sha256_digest_json
 from dayu.host.durable.connection import open_host_durable_store
@@ -154,6 +156,49 @@ class _NeverCancelledToken:
         """
 
         return None
+
+
+class _TransactionReadableCompactor(ContextCompactor):
+    """测试 compactor 调用期可开启独立读事务。"""
+
+    def __init__(self, transaction_runner: HostTransactionRunner) -> None:
+        """初始化 compactor。
+
+        :param transaction_runner: Host transaction runner。
+        :returns: ``None``。
+        """
+
+        self._transaction_runner = transaction_runner
+        self.calls = 0
+        self._fake = FakeContextCompactor()
+
+    def compact(self, request: CompactionRequest) -> CompactionCandidate:
+        """执行 compact 并验证当前不在外层 write transaction 内。
+
+        :param request: compaction request。
+        :returns: fake compaction candidate。
+        """
+
+        self.calls += 1
+        row = self._transaction_runner.run_read(
+            lambda transaction: read_run_by_id(transaction, request.run_id)
+        )
+        assert row is not None
+        return self._fake.compact(request)
+
+
+class _RaisingCompactor(ContextCompactor):
+    """测试用失败 compactor。"""
+
+    def compact(self, request: CompactionRequest) -> CompactionCandidate:
+        """抛出 proposal 失败。
+
+        :param request: compaction request。
+        :returns: 不返回。
+        :raises RuntimeError: 始终抛出 proposal failure。
+        """
+
+        raise RuntimeError(f"proposal failed for {request.run_id}")
 
 
 class _WakeupSpy:
@@ -381,6 +426,65 @@ def test_context_compaction_requested_none_budget_uses_host_estimator_and_recove
         assert len(wakeup.dispatches) == 1
         assert wakeup.dispatches[0].attempt_id != seeded.attempt_id
         assert wakeup.dispatches[0].execution_id != seeded.execution_id
+
+
+def test_reactive_compaction_calls_llm_outside_write_transaction(
+    tmp_path: Path,
+) -> None:
+    """reactive compactor 外部调用不持有 Host write transaction。"""
+
+    with open_host_durable_store(_options(tmp_path)) as store:
+        seeded = _seed_active_run(store.transaction_runner)
+        compactor = _TransactionReadableCompactor(store.transaction_runner)
+        candidate = _context_compaction_candidate(seeded, worker_event_index=41)
+
+        result = EngineEventIngestor(
+            transaction_runner=store.transaction_runner,
+            context_budget_policy=_reactive_policy(),
+            context_compactor=compactor,
+            compact_artifact_root=tmp_path / "compact-artifacts",
+        ).ingest(candidate)
+
+        assert result.status is EngineIngestStatus.ACCEPTED
+        assert compactor.calls == 1
+        assert _event_count(store.transaction_runner, CONTEXT_COMPACTED) == 1
+
+
+def test_reactive_compaction_attempt_rejected_uses_request_event_operation_id(
+    tmp_path: Path,
+) -> None:
+    """reactive attempt rejected 使用 request fact event id 作为 operation anchor。"""
+
+    with open_host_durable_store(_options(tmp_path)) as store:
+        seeded = _seed_active_run(store.transaction_runner)
+        candidate = _context_compaction_candidate(seeded, worker_event_index=42)
+
+        result = EngineEventIngestor(
+            transaction_runner=store.transaction_runner,
+            context_budget_policy=default_context_budget_policy(
+                context_window_size=100,
+                reserved_output_tokens=10,
+                hard_threshold_tokens=80,
+                safety_margin_ratio=0.5,
+                minimum_protection_tokens=1,
+                max_compaction_attempts_per_operation=1,
+                policy_ref=_REACTIVE_POLICY_REF,
+            ),
+            context_compactor=_RaisingCompactor(),
+            compact_artifact_root=tmp_path / "compact-artifacts",
+        ).ingest(candidate)
+
+        rejected_rows = tuple(
+            event
+            for event in result.events
+            if event.event_type == CONTEXT_COMPACTION_ATTEMPT_REJECTED
+        )
+        assert len(rejected_rows) == 1
+        rejected_payload = _payload(rejected_rows[0])
+        requested_payload = _payload(result.events[0])
+        assert result.events[0].event_type == CONTEXT_COMPACTION_REQUESTED
+        assert rejected_payload["operation_id"] == result.events[0].event_id
+        assert requested_payload["estimator_digest"] != rejected_payload["operation_id"]
 
 
 def test_context_compaction_requested_stale_identity_is_rejected(

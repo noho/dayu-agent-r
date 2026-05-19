@@ -22,6 +22,7 @@ DEFAULT_CONTEXT_SAFETY_MARGIN_RATIO = 0.2
 DEFAULT_MINIMUM_PROTECTION_TOKENS = 256
 DEFAULT_MAX_PROACTIVE_COMPACTIONS_PER_RUN = 1
 DEFAULT_MAX_REACTIVE_COMPACTIONS_PER_RUN = 1
+DEFAULT_MAX_COMPACTION_ATTEMPTS_PER_OPERATION = 1
 DEFAULT_CONTEXT_BUDGET_POLICY_REF = "host-context-budget-policy:default"
 
 
@@ -49,6 +50,8 @@ class ContextBudgetPolicy:
     :param minimum_protection_tokens: 未显式给出 hard threshold 时保留的最小保护 token 数。
     :param max_proactive_compactions_per_run: 单个 Run 允许的 proactive compact 次数。
     :param max_reactive_compactions_per_run: 单个 Run 允许的 reactive compact 次数。
+    :param max_compaction_attempts_per_operation: 单次 compaction operation 内
+        Host semantic proposal attempt 上限，包含首次 proposal 与后续 repair attempt。
     :param policy_ref: policy snapshot / composition ref。
     """
 
@@ -59,6 +62,7 @@ class ContextBudgetPolicy:
     minimum_protection_tokens: int
     max_proactive_compactions_per_run: int
     max_reactive_compactions_per_run: int
+    max_compaction_attempts_per_operation: int
     policy_ref: str
 
     def __post_init__(self) -> None:
@@ -115,6 +119,12 @@ class ContextBudgetPolicy:
         _require_positive_int(
             self.max_reactive_compactions_per_run,
             field_name="ContextBudgetPolicy.max_reactive_compactions_per_run",
+        )
+        _require_positive_int(
+            self.max_compaction_attempts_per_operation,
+            field_name=(
+                "ContextBudgetPolicy.max_compaction_attempts_per_operation"
+            ),
         )
         _require_non_empty(
             self.policy_ref, field_name="ContextBudgetPolicy.policy_ref"
@@ -174,6 +184,9 @@ def default_context_budget_policy(
         DEFAULT_MAX_PROACTIVE_COMPACTIONS_PER_RUN
     ),
     max_reactive_compactions_per_run: int = DEFAULT_MAX_REACTIVE_COMPACTIONS_PER_RUN,
+    max_compaction_attempts_per_operation: int = (
+        DEFAULT_MAX_COMPACTION_ATTEMPTS_PER_OPERATION
+    ),
 ) -> ContextBudgetPolicy:
     """构造默认 context budget policy。
 
@@ -185,6 +198,8 @@ def default_context_budget_policy(
     :param minimum_protection_tokens: 未显式给出 hard threshold 时的最小保护 token 数。
     :param max_proactive_compactions_per_run: 单个 Run 允许的 proactive compact 次数。
     :param max_reactive_compactions_per_run: 单个 Run 允许的 reactive compact 次数。
+    :param max_compaction_attempts_per_operation: 单次 compaction operation 内
+        Host semantic proposal attempt 上限，包含首次 proposal 与后续 repair attempt。
     :returns: 已校验的 ContextBudgetPolicy。
     :raises TypeError: 字段类型非法时抛出。
     :raises ValueError: 字段值非法时抛出。
@@ -198,6 +213,9 @@ def default_context_budget_policy(
         minimum_protection_tokens=minimum_protection_tokens,
         max_proactive_compactions_per_run=max_proactive_compactions_per_run,
         max_reactive_compactions_per_run=max_reactive_compactions_per_run,
+        max_compaction_attempts_per_operation=(
+            max_compaction_attempts_per_operation
+        ),
         policy_ref=policy_ref,
     )
 
@@ -224,6 +242,7 @@ __all__ = [
     "ContextCompactionTriggerSource",
     "DEFAULT_CONTEXT_BUDGET_POLICY_REF",
     "DEFAULT_CONTEXT_SAFETY_MARGIN_RATIO",
+    "DEFAULT_MAX_COMPACTION_ATTEMPTS_PER_OPERATION",
     "DEFAULT_MAX_PROACTIVE_COMPACTIONS_PER_RUN",
     "DEFAULT_MAX_REACTIVE_COMPACTIONS_PER_RUN",
     "DEFAULT_MINIMUM_PROTECTION_TOKENS",

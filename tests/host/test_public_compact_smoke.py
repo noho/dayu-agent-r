@@ -21,7 +21,7 @@ from dayu.engine import AgentPolicy, AgentRunRequest, EngineRunOutcomeFinalAnswe
 from dayu.engine import run_agent_and_wait
 from dayu.engine.contracts.messages import AgentMessageRole, SystemMessage, UserMessage
 from dayu.engine.contracts.runner_spec import RunnerCallOptions, RunnerSpec
-from dayu.host import CompactorExecutionBaseline, HostEventKind, open_host
+from dayu.host import CompactorRunnerBaseline, HostEventKind, open_host
 from dayu.host.compaction import (
     CompactInputRange,
     CompactionCandidate,
@@ -260,7 +260,6 @@ async def test_real_compactor_public_opener_compacts_and_preserves_continuity(
         top_p=None,
         stream=True,
     )
-    compactor = _RealLLMContextCompactor(compactor_runner_spec, runner_options)
     worker_factory = FinalAnswerWorkerFactory()
     base_options = open_host_options(
         tmp_path,
@@ -286,11 +285,9 @@ async def test_real_compactor_public_opener_compacts_and_preserves_continuity(
             minimum_protection_tokens=1,
             policy_ref="slice6-real-compact-policy",
         ),
-        compactor_baseline=CompactorExecutionBaseline(
-            context_compactor=compactor,
+        compactor_runner_baseline=CompactorRunnerBaseline(
             compactor_runner_spec=compactor_runner_spec,
             compactor_runner_options=runner_options,
-            compactor_policy_ref="slice6-real-llm-compactor",
             compact_artifact_root=tmp_path / "compact-artifacts",
             compact_artifact_create_parent_dirs=True,
         ),
@@ -328,8 +325,6 @@ async def test_real_compactor_public_opener_compacts_and_preserves_continuity(
         raise
 
     skip_if_provider_terminal_failed(case, second_terminal)
-    assert compactor.call_count >= 1
-    assert compactor.last_summary is not None
     assert first_terminal.kind is HostEventKind.SUCCEEDED
     assert second_terminal.kind is HostEventKind.SUCCEEDED
     assert second_terminal.final_answer is not None

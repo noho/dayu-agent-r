@@ -880,7 +880,7 @@ def open_host_options(
         worker_factory=resolved_worker_factory,
         tooling_options=tooling_options,
         context_budget_policy=None,
-        compactor_baseline=None,
+        compactor_runner_baseline=None,
         memory_projection_policy=default_memory_projection_policy(),
         memory_projection_catchup_batch_size=128,
         enable_truncation_manager=True,

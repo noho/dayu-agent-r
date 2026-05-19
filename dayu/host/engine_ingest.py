@@ -57,9 +57,16 @@ from dayu.host.admission import (
 from dayu.host.api import AttemptStatus, RunStatus
 from dayu.host.compact_artifact import CompactArtifactStore, CompactArtifactWriteRequest
 from dayu.host.compaction import (
+    CompactQualityCheckResult,
+    CompactionCandidate,
     CompactionRequest,
     ContextCompactor,
     CurrentMessageSummary,
+)
+from dayu.host.compaction_operation import (
+    CompactionAttemptRejected,
+    CompactionOperationResult,
+    run_compaction_operation,
 )
 from dayu.host.context_budget import (
     BudgetEstimate,
@@ -71,13 +78,14 @@ from dayu.host.context_budget import (
 )
 from dayu.host.context_events import (
     CONTEXT_COMPACTED,
+    CONTEXT_COMPACTION_ATTEMPT_REJECTED,
     CONTEXT_COMPACTION_FAILED,
     CONTEXT_COMPACTION_REQUESTED,
+    build_context_compaction_attempt_rejected_payload,
     build_context_compacted_payload,
     build_context_compaction_failed_payload,
     build_context_compaction_requested_payload,
 )
-from dayu.host.context_governance import check_compaction_candidate
 from dayu.host.context_policy import (
     ContextBudgetPolicy,
     ContextCompactionTriggerSource,
@@ -324,6 +332,18 @@ class _ReactiveRecoveryAccepted:
 
 
 @dataclass(frozen=True, slots=True)
+class _ReactiveCompactPending:
+    """已写入 request/closeout、待事务外执行的 reactive compact。"""
+
+    result_prefix: EngineIngestResult
+    context: _ValidatedCandidate
+    display_text: str
+    operation_id: str
+    estimate: BudgetEstimate
+    decision: ContextBudgetDecision
+
+
+@dataclass(frozen=True, slots=True)
 class _ReactiveRecoveryStarted:
     """reactive recovery start 后的 dispatch 摘要。"""
 
@@ -490,7 +510,7 @@ class EngineEventIngestor:
 
         def _operation(
             transaction: HostTransaction,
-        ) -> EngineIngestResult | _ReactiveRecoveryAccepted:
+        ) -> EngineIngestResult | _ReactiveRecoveryAccepted | _ReactiveCompactPending:
             context = self._validate_durable_context(transaction, candidate)
             if context is None:
                 return self._append_rejected_diagnostic(
@@ -511,6 +531,8 @@ class EngineEventIngestor:
             return self._ingest_validated(transaction, context)
 
         result = self._transaction_runner.run_write(_operation)
+        if isinstance(result, _ReactiveCompactPending):
+            result = self._execute_reactive_compaction(result)
         if isinstance(result, _ReactiveRecoveryAccepted):
             result = self._complete_reactive_recovery_after_compact(result)
         promoted = self._with_terminal_promotion_retry(
@@ -645,7 +667,7 @@ class EngineEventIngestor:
 
     def _ingest_validated(
         self, transaction: HostTransaction, context: _ValidatedCandidate
-    ) -> EngineIngestResult | _ReactiveRecoveryAccepted:
+    ) -> EngineIngestResult | _ReactiveRecoveryAccepted | _ReactiveCompactPending:
         """处理已通过 durable 校验的 candidate。
 
         :param transaction: 当前 Host transaction。
@@ -981,7 +1003,7 @@ class EngineEventIngestor:
         transaction: HostTransaction,
         context: _ValidatedCandidate,
         data: ContextCompactionRequestedData,
-    ) -> EngineIngestResult | _ReactiveRecoveryAccepted:
+    ) -> EngineIngestResult | _ReactiveCompactPending:
         """处理 Engine reactive context compaction 请求。
 
         :param transaction: 当前 Host transaction。
@@ -1064,42 +1086,20 @@ class EngineEventIngestor:
         )
         if closeout.status is not EngineIngestStatus.ACCEPTED:
             return closeout
-        compacted = self._compact_reactive_recovery(
-            transaction,
-            context=context,
-            display_text=display_text,
-            estimate=estimate,
-            decision=decision,
-        )
-        if compacted is None:
-            rows = (requested, *closeout.events)
-            failed_rows = _latest_rows_for_types(
-                self._event_log_store,
-                transaction,
-                context.run.run_id,
-                (CONTEXT_COMPACTION_FAILED, _EVENT_TYPE_RUN_FAILED),
-            )
-            return EngineIngestResult(
+        return _ReactiveCompactPending(
+            result_prefix=EngineIngestResult(
                 status=EngineIngestStatus.ACCEPTED,
-                events=rows + failed_rows,
-                terminal_closeout=True,
-                promotion_triggered=False,
-                reason=_REASON_CONTEXT_COMPACTION_REQUIRED,
-            )
-        return _ReactiveRecoveryAccepted(
-            result=EngineIngestResult(
-                status=EngineIngestStatus.ACCEPTED,
-                events=(requested, *closeout.events, compacted),
+                events=(requested, *closeout.events),
                 terminal_closeout=False,
                 promotion_triggered=False,
                 reason=_REASON_CONTEXT_COMPACTION_REQUIRED,
                 stop_worker_stream=True,
             ),
-            run_id=context.run.run_id,
-            session_id=context.run.session_id,
-            source_attempt_id=context.attempt.attempt_id,
-            compacted_event_id=compacted.event_id,
-            compacted_event_sequence=compacted.event_sequence,
+            context=context,
+            display_text=display_text,
+            operation_id=requested.event_id,
+            estimate=estimate,
+            decision=decision,
         )
 
     def _fail_reactive_recovery_without_request(
@@ -1322,100 +1322,152 @@ class EngineEventIngestor:
             ),
         ).row
 
-    def _compact_reactive_recovery(
+    def _execute_reactive_compaction(
+        self, pending: _ReactiveCompactPending
+    ) -> EngineIngestResult | _ReactiveRecoveryAccepted:
+        """在事务外执行 reactive compact，并在新事务内写入结果。
+
+        :param pending: 已写 request/closeout fact 的 reactive compact。
+        :returns: ingest result 或 accepted recovery 摘要。
+        """
+
+        request = _reactive_compaction_request(pending)
+        compactor = self._context_compactor
+        artifact_root = self._compact_artifact_root
+        if compactor is None or artifact_root is None:
+            operation_result = CompactionOperationResult(
+                accepted_candidate=None,
+                quality_result=None,
+                rejected_attempts=(),
+                failure_reason="compactor_or_artifact_store_missing",
+                budget_after_attempted_compact=None,
+            )
+        else:
+            attempts = (
+                self._context_budget_policy.max_compaction_attempts_per_operation
+                if self._context_budget_policy is not None
+                else 1
+            )
+            operation_result = run_compaction_operation(
+                request=request,
+                compactor=compactor,
+                max_attempts=attempts,
+            )
+
+        def _operation(
+            transaction: HostTransaction,
+        ) -> EngineIngestResult | _ReactiveRecoveryAccepted:
+            latest = self._validate_durable_context(
+                transaction, pending.context.candidate
+            )
+            if latest is None:
+                return pending.result_prefix
+            if (
+                latest.run.status is not RunStatus.RECOVERING
+                or latest.attempt.terminal_event_id is None
+            ):
+                return pending.result_prefix
+            attempt_rows: list[EventLogRow] = []
+            for rejected in operation_result.rejected_attempts:
+                attempt_rows.append(
+                    self._append_reactive_compaction_attempt_rejected_event(
+                        transaction,
+                        context=latest,
+                        operation_id=pending.operation_id,
+                        rejected=rejected,
+                    )
+                )
+            if (
+                operation_result.accepted_candidate is None
+                or operation_result.quality_result is None
+                or operation_result.failure_reason is not None
+            ):
+                failed = self._append_reactive_compaction_failed_event(
+                    transaction,
+                    context=latest,
+                    estimate=pending.estimate,
+                    failure_reason=(
+                        operation_result.failure_reason or "compaction_failed"
+                    ),
+                    budget_after_attempted_compact=(
+                        operation_result.budget_after_attempted_compact
+                    ),
+                )
+                fail_result = self._fail_recovering_run(
+                    transaction,
+                    context=latest,
+                    failed_event=failed,
+                    error_code="context_compaction_failed",
+                    message="Context compaction failed during reactive recovery",
+                )
+                return EngineIngestResult(
+                    status=EngineIngestStatus.ACCEPTED,
+                    events=(
+                        *pending.result_prefix.events,
+                        *tuple(attempt_rows),
+                        failed,
+                        *fail_result.events,
+                    ),
+                    terminal_closeout=True,
+                    promotion_triggered=False,
+                    reason=_REASON_CONTEXT_COMPACTION_REQUIRED,
+                )
+            compacted = self._append_reactive_compacted_event(
+                transaction,
+                context=latest,
+                request=request,
+                decision=pending.decision,
+                candidate=operation_result.accepted_candidate,
+                quality=operation_result.quality_result,
+            )
+            return _ReactiveRecoveryAccepted(
+                result=EngineIngestResult(
+                    status=EngineIngestStatus.ACCEPTED,
+                    events=(
+                        *pending.result_prefix.events,
+                        *tuple(attempt_rows),
+                        compacted,
+                    ),
+                    terminal_closeout=False,
+                    promotion_triggered=False,
+                    reason=_REASON_CONTEXT_COMPACTION_REQUIRED,
+                    stop_worker_stream=True,
+                ),
+                run_id=latest.run.run_id,
+                session_id=latest.run.session_id,
+                source_attempt_id=latest.attempt.attempt_id,
+                compacted_event_id=compacted.event_id,
+                compacted_event_sequence=compacted.event_sequence,
+            )
+
+        return self._transaction_runner.run_write(_operation)
+
+    def _append_reactive_compacted_event(
         self,
         transaction: HostTransaction,
         *,
         context: _ValidatedCandidate,
-        display_text: str,
-        estimate: BudgetEstimate,
+        request: CompactionRequest,
         decision: ContextBudgetDecision,
-    ) -> EventLogRow | None:
-        """执行 reactive compact 并写 accepted/failed compact fact。
+        candidate: CompactionCandidate,
+        quality: CompactQualityCheckResult,
+    ) -> EventLogRow:
+        """写入 reactive accepted compact artifact 与 fact。
 
         :param transaction: 当前 Host transaction。
         :param context: 已校验 candidate 上下文。
-        :param display_text: 当前输入展示文本。
-        :param estimate: compact 前预算估算。
+        :param request: Host compaction request。
         :param decision: compact 前预算决策。
-        :returns: accepted ``CONTEXT_COMPACTED`` row；失败时为 ``None``。
+        :param candidate: accepted compaction candidate。
+        :param quality: accepted quality result。
+        :returns: ``CONTEXT_COMPACTED`` row。
         """
 
-        compactor = self._context_compactor
-        artifact_root = self._compact_artifact_root
-        if compactor is None or artifact_root is None:
-            failed = self._append_reactive_compaction_failed_event(
-                transaction,
-                context=context,
-                estimate=estimate,
-                failure_reason="compactor_or_artifact_store_missing",
-                budget_after_attempted_compact=None,
-            )
-            self._fail_recovering_run(
-                transaction,
-                context=context,
-                failed_event=failed,
-                error_code="context_compactor_missing",
-                message="Context compactor or artifact store is not configured",
-            )
-            return None
-        request = CompactionRequest(
-            trigger_source=ContextCompactionTriggerSource.REACTIVE,
-            session_id=context.run.session_id,
-            run_id=context.run.run_id,
-            attempt_id=context.attempt.attempt_id,
-            execution_id=context.attempt.execution_id,
-            input_event_refs=(context.run.input_event_id,),
-            memory_snapshot_cursor=None,
-            current_message_summary=CurrentMessageSummary(
-                current_user_input_ref=context.run.input_event_id,
-                summary_text=display_text,
-                source_event_refs=(context.run.input_event_id,),
-            ),
-            tool_fact_refs=(),
-            verified_fact_refs=(),
-            recent_raw_turn_refs=(context.run.input_event_id,),
-            older_raw_turn_refs=(),
-            existing_episode_summary_refs=(),
-            budget_before_compact=estimate,
-        )
-        candidate = compactor.compact(request)
-        quality = check_compaction_candidate(request, candidate)
-        if not quality.accepted:
-            failed = self._append_reactive_compaction_failed_event(
-                transaction,
-                context=context,
-                estimate=estimate,
-                failure_reason="quality_check_rejected",
-                budget_after_attempted_compact=candidate.budget_after_compact,
-            )
-            self._fail_recovering_run(
-                transaction,
-                context=context,
-                failed_event=failed,
-                error_code="context_compaction_quality_rejected",
-                message="Context compaction candidate failed Host quality check",
-            )
-            return None
-        if candidate.budget_after_compact >= estimate.hard_threshold_tokens:
-            failed = self._append_reactive_compaction_failed_event(
-                transaction,
-                context=context,
-                estimate=estimate,
-                failure_reason="hard_threshold_after_compact",
-                budget_after_attempted_compact=candidate.budget_after_compact,
-            )
-            self._fail_recovering_run(
-                transaction,
-                context=context,
-                failed_event=failed,
-                error_code="context_hard_threshold_after_compact",
-                message="Context still exceeds hard threshold after compaction",
-            )
-            return None
+        if self._compact_artifact_root is None:
+            raise RuntimeError("compact artifact root is missing")
         artifact = CompactArtifactStore(
             LocalArtifactStore(
-                artifact_root,
+                self._compact_artifact_root,
                 create_artifact_root=self._compact_artifact_create_parent_dirs,
             )
         ).write_compact_artifact(
@@ -1518,6 +1570,64 @@ class EngineEventIngestor:
                     retryable=False,
                     diagnostic_refs=diagnostic_refs,
                     budget_after_attempted_compact=budget_after_attempted_compact,
+                ),
+                payload_ref=None,
+                payload_digest=None,
+            ),
+        ).row
+
+    def _append_reactive_compaction_attempt_rejected_event(
+        self,
+        transaction: HostTransaction,
+        *,
+        context: _ValidatedCandidate,
+        operation_id: str,
+        rejected: CompactionAttemptRejected,
+    ) -> EventLogRow:
+        """追加 reactive ``CONTEXT_COMPACTION_ATTEMPT_REJECTED`` fact。
+
+        :param transaction: 当前 Host transaction。
+        :param context: 已校验 candidate 上下文。
+        :param operation_id: 对应 request fact 的 stable event id。
+        :param rejected: attempt reject 摘要。
+        :returns: EventLog row。
+        """
+
+        return self._event_log_store.append_event(
+            transaction,
+            EventLogAppendRequest(
+                event_id=_event_id(
+                    context.candidate,
+                    EventClass.CANONICAL_FACT,
+                    CONTEXT_COMPACTION_ATTEMPT_REJECTED,
+                    20 + rejected.attempt_number,
+                ),
+                event_class=EventClass.CANONICAL_FACT,
+                session_id=context.run.session_id,
+                run_id=context.run.run_id,
+                attempt_id=context.attempt.attempt_id,
+                execution_id=context.attempt.execution_id,
+                event_type=CONTEXT_COMPACTION_ATTEMPT_REJECTED,
+                occurred_at=context.candidate.observed_at,
+                actor=_EVENT_ACTOR,
+                source=_EVENT_SOURCE,
+                client_request_id=None,
+                idempotency_key=None,
+                policy_decision=None,
+                reason={"failure_category": rejected.failure_category},
+                payload_json=build_context_compaction_attempt_rejected_payload(
+                    operation_id=operation_id,
+                    attempt_number=rejected.attempt_number,
+                    failure_category=rejected.failure_category,
+                    repairable=rejected.repairable,
+                    runner_attempt_summary_refs=(
+                        rejected.runner_attempt_summary_refs
+                    ),
+                    diagnostic_refs=rejected.diagnostic_refs,
+                    next_policy_decision=rejected.next_policy_decision,
+                    budget_after_attempted_compact=(
+                        rejected.budget_after_attempted_compact
+                    ),
                 ),
                 payload_ref=None,
                 payload_digest=None,
@@ -2594,6 +2704,38 @@ def _event_id(
         }
     ).removeprefix("sha256:")
     return f"{_EVENT_ID_PREFIX}{digest}"
+
+
+def _reactive_compaction_request(
+    pending: _ReactiveCompactPending,
+) -> CompactionRequest:
+    """构造 reactive Host compaction request。
+
+    :param pending: reactive compact pending 摘要。
+    :returns: CompactionRequest。
+    """
+
+    context = pending.context
+    return CompactionRequest(
+        trigger_source=ContextCompactionTriggerSource.REACTIVE,
+        session_id=context.run.session_id,
+        run_id=context.run.run_id,
+        attempt_id=context.attempt.attempt_id,
+        execution_id=context.attempt.execution_id,
+        input_event_refs=(context.run.input_event_id,),
+        memory_snapshot_cursor=None,
+        current_message_summary=CurrentMessageSummary(
+            current_user_input_ref=context.run.input_event_id,
+            summary_text=pending.display_text,
+            source_event_refs=(context.run.input_event_id,),
+        ),
+        tool_fact_refs=(),
+        verified_fact_refs=(),
+        recent_raw_turn_refs=(context.run.input_event_id,),
+        older_raw_turn_refs=(),
+        existing_episode_summary_refs=(),
+        budget_before_compact=pending.estimate,
+    )
 
 
 def _event_request(

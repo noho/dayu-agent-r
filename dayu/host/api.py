@@ -918,62 +918,45 @@ class OrdinaryRunExecutionBaseline:
 
 
 @dataclass(frozen=True, slots=True)
-class CompactorExecutionBaseline:
-    """Context compactor 的独立构造期执行基线。
+class CompactorRunnerBaseline:
+    """Host-owned LLM compactor 的构造期运行配置。
 
-    :param context_compactor: 可选 compactor typed port；为 ``None`` 时表示
-        construction 未提供 compact 能力，后续 runtime 必须 fail closed。
-    :param compactor_runner_spec: compactor 独立 Runner 规约；无 LLM
-        compactor 时为 ``None``。
-    :param compactor_runner_options: compactor 独立 Runner 调用参数；无 LLM
-        compactor 时为 ``None``。
-    :param compactor_policy_ref: compactor policy 的稳定引用；无独立 policy
-        时为 ``None``。
+    :param compactor_runner_spec: compactor 独立 Runner 规约。
+    :param compactor_runner_options: compactor 独立 Runner 调用参数。
     :param compact_artifact_root: compact artifact 写入根目录。
     :param compact_artifact_create_parent_dirs: artifact 根目录缺失时是否创建。
     """
 
-    context_compactor: ContextCompactor | None
-    compactor_runner_spec: RunnerSpec | None
-    compactor_runner_options: RunnerCallOptions | None
-    compactor_policy_ref: str | None
+    compactor_runner_spec: RunnerSpec
+    compactor_runner_options: RunnerCallOptions
     compact_artifact_root: pathlib.Path
     compact_artifact_create_parent_dirs: bool = True
 
     def __post_init__(self) -> None:
-        """校验 compactor 执行基线。
+        """校验 compactor runner 基线。
 
         :returns: ``None``。
         :raises TypeError: 路径、布尔或 Runner typed 字段类型非法时抛出。
-        :raises ValueError: 可选 policy 引用存在但为空时抛出。
         """
 
-        if self.compactor_runner_spec is not None and not isinstance(
-            self.compactor_runner_spec, RunnerSpec
-        ):
+        if not isinstance(self.compactor_runner_spec, RunnerSpec):
             raise TypeError(
-                "CompactorExecutionBaseline.compactor_runner_spec must be "
+                "CompactorRunnerBaseline.compactor_runner_spec must be "
                 "RunnerSpec"
             )
-        if self.compactor_runner_options is not None and not isinstance(
-            self.compactor_runner_options, RunnerCallOptions
-        ):
+        if not isinstance(self.compactor_runner_options, RunnerCallOptions):
             raise TypeError(
-                "CompactorExecutionBaseline.compactor_runner_options must be "
+                "CompactorRunnerBaseline.compactor_runner_options must be "
                 "RunnerCallOptions"
             )
-        _require_optional_non_empty(
-            self.compactor_policy_ref,
-            field_name="CompactorExecutionBaseline.compactor_policy_ref",
-        )
         _require_path(
             self.compact_artifact_root,
-            field_name="CompactorExecutionBaseline.compact_artifact_root",
+            field_name="CompactorRunnerBaseline.compact_artifact_root",
         )
         _require_bool(
             self.compact_artifact_create_parent_dirs,
             field_name=(
-                "CompactorExecutionBaseline."
+                "CompactorRunnerBaseline."
                 "compact_artifact_create_parent_dirs"
             ),
         )
@@ -1007,8 +990,8 @@ class OpenHostOptions:
         ``None``。
     :param context_budget_policy: Host Context Governance 预算策略；不启用
         proactive compact 时为 ``None``。
-    :param compactor_baseline: compactor 独立执行基线；未装配 compact 能力时
-        为 ``None``。
+    :param compactor_runner_baseline: Host-owned LLM compactor 运行配置；未装配
+        compact 能力时为 ``None``。
     :param memory_projection_policy: dispatch 前 memory projection catch-up
         使用的 policy。
     :param memory_projection_catchup_batch_size: memory catch-up 单批最大 row 数。
@@ -1036,7 +1019,7 @@ class OpenHostOptions:
     worker_factory: LocalEngineWorkerFactory
     tooling_options: _HostToolingOptions | None
     context_budget_policy: ContextBudgetPolicy | None
-    compactor_baseline: CompactorExecutionBaseline | None
+    compactor_runner_baseline: CompactorRunnerBaseline | None
     memory_projection_policy: MemoryProjectionPolicy
     memory_projection_catchup_batch_size: int
     enable_truncation_manager: bool
@@ -1147,12 +1130,12 @@ class OpenHostOptions:
                 "OpenHostOptions.context_budget_policy must be "
                 "ContextBudgetPolicy"
             )
-        if self.compactor_baseline is not None and not isinstance(
-            self.compactor_baseline, CompactorExecutionBaseline
+        if self.compactor_runner_baseline is not None and not isinstance(
+            self.compactor_runner_baseline, CompactorRunnerBaseline
         ):
             raise TypeError(
-                "OpenHostOptions.compactor_baseline must be "
-                "CompactorExecutionBaseline"
+                "OpenHostOptions.compactor_runner_baseline must be "
+                "CompactorRunnerBaseline"
             )
         if not isinstance(self.memory_projection_policy, MemoryProjectionPolicy):
             raise TypeError(
@@ -2868,7 +2851,7 @@ __all__ = [
     "OutboxSummary",
     "PurgeSessionRequest",
     "PurgeSessionResult",
-    "CompactorExecutionBaseline",
+    "CompactorRunnerBaseline",
     "ReplayRunRequest",
     "ResolveWaitCancelledOutcome",
     "ResolveWaitCompletedOutcome",

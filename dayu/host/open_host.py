@@ -58,6 +58,7 @@ from dayu.host.durable.connection import (
     open_host_durable_store,
 )
 from dayu.host.memory_repair import catch_up_conversation_memory_projection
+from dayu.host.llm_compaction import LLMContextCompactor
 from dayu.host.projection import ProjectionCatchupPort
 from dayu.host.read_api import get_run as _get_run
 from dayu.host.read_api import get_session as _get_session
@@ -605,7 +606,15 @@ def _local_execution_options_from_open_host_options(
     :returns: 内部 ``HostLocalExecutionOptions``。
     """
 
-    compactor_baseline = options.compactor_baseline
+    compactor_runner_baseline = options.compactor_runner_baseline
+    context_compactor = (
+        LLMContextCompactor(
+            runner_spec=compactor_runner_baseline.compactor_runner_spec,
+            runner_options=compactor_runner_baseline.compactor_runner_options,
+        )
+        if compactor_runner_baseline is not None
+        else None
+    )
     return HostLocalExecutionOptions(
         lane_db_path=options.lane_db_path,
         lane_name=options.lane_name,
@@ -620,34 +629,26 @@ def _local_execution_options_from_open_host_options(
         agent_policy=options.ordinary_run_baseline.agent_policy,
         worker_factory=options.worker_factory,
         context_budget_policy=options.context_budget_policy,
-        context_compactor=(
-            compactor_baseline.context_compactor
-            if compactor_baseline is not None
-            else None
-        ),
+        context_compactor=context_compactor,
         compactor_runner_spec=(
-            compactor_baseline.compactor_runner_spec
-            if compactor_baseline is not None
+            compactor_runner_baseline.compactor_runner_spec
+            if compactor_runner_baseline is not None
             else None
         ),
         compactor_runner_options=(
-            compactor_baseline.compactor_runner_options
-            if compactor_baseline is not None
+            compactor_runner_baseline.compactor_runner_options
+            if compactor_runner_baseline is not None
             else None
         ),
-        compactor_policy_ref=(
-            compactor_baseline.compactor_policy_ref
-            if compactor_baseline is not None
-            else None
-        ),
+        compactor_policy_ref=None,
         compact_artifact_root=(
-            compactor_baseline.compact_artifact_root
-            if compactor_baseline is not None
+            compactor_runner_baseline.compact_artifact_root
+            if compactor_runner_baseline is not None
             else None
         ),
         compact_artifact_create_parent_dirs=(
-            compactor_baseline.compact_artifact_create_parent_dirs
-            if compactor_baseline is not None
+            compactor_runner_baseline.compact_artifact_create_parent_dirs
+            if compactor_runner_baseline is not None
             else options.create_parent_dirs
         ),
         memory_projection_policy=options.memory_projection_policy,

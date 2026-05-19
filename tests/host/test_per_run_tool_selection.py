@@ -330,7 +330,7 @@ def _options(
             source_refs=(_source_ref(),),
         ),
         context_budget_policy=None,
-        compactor_baseline=None,
+        compactor_runner_baseline=None,
         memory_projection_policy=default_memory_projection_policy(),
         memory_projection_catchup_batch_size=128,
         enable_truncation_manager=True,

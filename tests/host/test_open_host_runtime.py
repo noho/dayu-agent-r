@@ -5,6 +5,7 @@ from __future__ import annotations
 import asyncio
 import pathlib
 from collections.abc import AsyncIterator
+from dataclasses import replace
 from datetime import UTC, datetime
 from typing import cast
 
@@ -21,6 +22,7 @@ from dayu.engine.contracts.finish_reason import FinishReason
 from dayu.engine.contracts.runner_spec import RunnerCallOptions, RunnerSpec
 from dayu.host import (
     AttemptDispatchSnapshot,
+    CompactorRunnerBaseline,
     EnsureSessionRequest,
     FollowupBehavior,
     Host,
@@ -44,6 +46,7 @@ from dayu.host.open_host import (
     _PublicHostHandle,
     _local_execution_options_from_open_host_options,
 )
+from dayu.host.llm_compaction import LLMContextCompactor
 from dayu.host.projection import ProjectionCatchupPort
 
 _SCHEDULER_CLOSE_FAILURE_MESSAGE = "scheduler close failed after cleanup"
@@ -273,7 +276,7 @@ async def test_public_host_close_closes_command_handle_when_scheduler_close_rais
     assert command_handle.close_count == 1
 
 
-def test_compactor_baseline_none_maps_to_fail_closed_no_capability(
+def test_compactor_runner_baseline_none_maps_to_fail_closed_no_capability(
     tmp_path: pathlib.Path,
 ) -> None:
     """未提供 compactor baseline 时本地执行配置不安装 fake compact 能力。"""
@@ -287,6 +290,39 @@ def test_compactor_baseline_none_maps_to_fail_closed_no_capability(
     assert local_execution.compactor_runner_options is None
     assert local_execution.compactor_policy_ref is None
     assert local_execution.compact_artifact_root is None
+
+
+def test_compactor_runner_baseline_maps_to_host_owned_compactor(
+    tmp_path: pathlib.Path,
+) -> None:
+    """public runner baseline 在 opener 内部构造 Host-owned LLM compactor。"""
+
+    runner_spec = _runner_spec()
+    runner_options = RunnerCallOptions(
+        temperature=0.1,
+        max_tokens=128,
+        top_p=None,
+        stream=False,
+    )
+    options = _options(tmp_path, _FinalAnswerWorkerFactory())
+    local_execution = _local_execution_options_from_open_host_options(
+        replace(
+            options,
+            compactor_runner_baseline=CompactorRunnerBaseline(
+                compactor_runner_spec=runner_spec,
+                compactor_runner_options=runner_options,
+                compact_artifact_root=tmp_path / "compact-artifacts",
+                compact_artifact_create_parent_dirs=False,
+            ),
+        )
+    )
+
+    assert isinstance(local_execution.context_compactor, LLMContextCompactor)
+    assert local_execution.compactor_runner_spec is runner_spec
+    assert local_execution.compactor_runner_options is runner_options
+    assert local_execution.compactor_policy_ref is None
+    assert local_execution.compact_artifact_root == tmp_path / "compact-artifacts"
+    assert local_execution.compact_artifact_create_parent_dirs is False
 
 
 async def _wait_for_run_status(
@@ -358,7 +394,7 @@ def _options(
         worker_factory=worker_factory,
         tooling_options=None,
         context_budget_policy=None,
-        compactor_baseline=None,
+        compactor_runner_baseline=None,
         memory_projection_policy=default_memory_projection_policy(),
         memory_projection_catchup_batch_size=128,
         enable_truncation_manager=True,

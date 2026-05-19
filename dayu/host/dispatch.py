@@ -108,8 +108,14 @@ from dayu.host.compact_artifact import (
     CompactArtifactWriteRequest,
 )
 from dayu.host.compaction import (
+    CompactQualityCheckResult,
+    CompactionCandidate,
     CompactionRequest,
     CurrentMessageSummary,
+)
+from dayu.host.compaction_operation import (
+    CompactionAttemptRejected,
+    run_compaction_operation,
 )
 from dayu.host.context_budget import (
     BudgetEstimate,
@@ -121,13 +127,14 @@ from dayu.host.context_budget import (
 )
 from dayu.host.context_events import (
     CONTEXT_COMPACTED,
+    CONTEXT_COMPACTION_ATTEMPT_REJECTED,
     CONTEXT_COMPACTION_FAILED,
     CONTEXT_COMPACTION_REQUESTED,
+    build_context_compaction_attempt_rejected_payload,
     build_context_compacted_payload,
     build_context_compaction_failed_payload,
     build_context_compaction_requested_payload,
 )
-from dayu.host.context_governance import check_compaction_candidate
 from dayu.host.context_policy import ContextCompactionTriggerSource
 from dayu.host.durable.artifact import LocalArtifactStore
 from dayu.host.tool_runtime import (
@@ -166,6 +173,9 @@ _EVENT_ID_ATTEMPT_FAILED_PREFIX = "event-attempt-failed"
 _EVENT_ID_RUN_FAILED_PREFIX = "event-run-failed"
 _EVENT_ID_CONTEXT_COMPACTION_REQUESTED_PREFIX = "event-context-compact-requested"
 _EVENT_ID_CONTEXT_COMPACTED_PREFIX = "event-context-compacted"
+_EVENT_ID_CONTEXT_COMPACTION_ATTEMPT_REJECTED_PREFIX = (
+    "event-context-compaction-attempt-rejected"
+)
 _LANE_OWNER_PREFIX = "host-dispatch"
 _GOVERNANCE_ACTOR = "host.context_governance"
 _GOVERNANCE_FAILURE_REASON = "pre_dispatch_context_governance"
@@ -236,15 +246,41 @@ class _GovernanceCompactAccepted:
 
 
 @dataclass(frozen=True, slots=True)
+class _GovernanceCompactPending:
+    """已写入 request fact、待事务外执行的 proactive compact。
+
+    :param run_id: 目标 Run id。
+    :param session_id: Session id。
+    :param expected_status: compact request 写入时 Run 状态。
+    :param expected_input_event_sequence: compact request 对应输入 cursor。
+    :param request: Host-owned compaction request。
+    :param operation_id: 对应 ``CONTEXT_COMPACTION_REQUESTED`` event id。
+    :param estimate: compact 前预算估算。
+    :param decision: 预算决策。
+    """
+
+    run_id: str
+    session_id: str
+    expected_status: RunStatus
+    expected_input_event_sequence: int
+    request: CompactionRequest
+    operation_id: str
+    estimate: BudgetEstimate
+    decision: ContextBudgetDecision
+
+
+@dataclass(frozen=True, slots=True)
 class _GovernanceStageResult:
     """pre-start governance 阶段结果。
 
     :param pending_dispatch: 已直接启动时的 pending dispatch。
     :param compact_accepted: compact accepted 但尚未 memory catch-up/start 的摘要。
+    :param compact_pending: 已写 request fact、待事务外执行的 compact。
     """
 
     pending_dispatch: PendingDispatchRecord | None
     compact_accepted: _GovernanceCompactAccepted | None
+    compact_pending: _GovernanceCompactPending | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -799,33 +835,131 @@ class HostDispatchScheduler:
                     ),
                     compact_accepted=None,
                 )
-            compacted_sequence = self._compact_before_dispatch(
+            compact_pending = self._prepare_compact_before_dispatch(
                 transaction,
                 run=run,
                 display_text=display_text,
                 estimate=estimate,
                 decision=decision,
             )
-            if compacted_sequence is None:
+            if compact_pending is None:
                 return _GovernanceStageResult(
                     pending_dispatch=None, compact_accepted=None
                 )
-            _LOGGER.log(
-                VERBOSE_LOG_LEVEL,
-                "dispatch.governance.compact_accepted session_id=%s run_id=%s "
-                "compacted_event_sequence=%s",
-                run.session_id,
-                run.run_id,
-                compacted_sequence,
-            )
             return _GovernanceStageResult(
                 pending_dispatch=None,
-                compact_accepted=_GovernanceCompactAccepted(
-                    run_id=run.run_id,
-                    session_id=run.session_id,
-                    expected_status=run.status,
-                    compacted_event_sequence=compacted_sequence,
-                ),
+                compact_accepted=None,
+                compact_pending=compact_pending,
+            )
+
+        stage = self._transaction_runner.run_write(_operation)
+        if stage.compact_pending is None:
+            return stage
+        compacted_sequence = self._execute_proactive_compaction(stage.compact_pending)
+        if compacted_sequence is None:
+            return _GovernanceStageResult(
+                pending_dispatch=None, compact_accepted=None
+            )
+        pending = stage.compact_pending
+        _LOGGER.log(
+            VERBOSE_LOG_LEVEL,
+            "dispatch.governance.compact_accepted session_id=%s run_id=%s "
+            "compacted_event_sequence=%s",
+            pending.session_id,
+            pending.run_id,
+            compacted_sequence,
+        )
+        return _GovernanceStageResult(
+            pending_dispatch=None,
+            compact_accepted=_GovernanceCompactAccepted(
+                run_id=pending.run_id,
+                session_id=pending.session_id,
+                expected_status=pending.expected_status,
+                compacted_event_sequence=compacted_sequence,
+            ),
+        )
+
+    def _execute_proactive_compaction(
+        self, pending: _GovernanceCompactPending
+    ) -> int | None:
+        """在事务外执行 proactive compact，并在新事务内写入结果。
+
+        :param pending: 已写 request fact 的 compact 摘要。
+        :returns: accepted ``CONTEXT_COMPACTED`` sequence；失败或 stale 时为
+            ``None``。
+        """
+
+        compactor = self._local_execution.context_compactor
+        if compactor is None:
+            return None
+        attempts = (
+            self._local_execution.context_budget_policy.max_compaction_attempts_per_operation
+            if self._local_execution.context_budget_policy is not None
+            else 1
+        )
+        result = run_compaction_operation(
+            request=pending.request,
+            compactor=compactor,
+            max_attempts=attempts,
+        )
+
+        def _operation(transaction: HostTransaction) -> int | None:
+            run = read_run_by_id(transaction, pending.run_id)
+            if (
+                run is None
+                or run.status != pending.expected_status
+                or run.input_event_sequence != pending.expected_input_event_sequence
+            ):
+                if run is not None:
+                    self._append_compaction_failed_event(
+                        transaction,
+                        run=run,
+                        estimate=pending.estimate,
+                        decision=pending.decision,
+                        failure_reason="stale_compaction_result",
+                        budget_after_attempted_compact=(
+                            result.budget_after_attempted_compact
+                        ),
+                    )
+                return None
+            for rejected in result.rejected_attempts:
+                self._append_compaction_attempt_rejected_event(
+                    transaction,
+                    run=run,
+                    operation_id=pending.operation_id,
+                    rejected=rejected,
+                )
+            if (
+                result.accepted_candidate is None
+                or result.quality_result is None
+                or result.failure_reason is not None
+            ):
+                self._append_compaction_failed_event(
+                    transaction,
+                    run=run,
+                    estimate=pending.estimate,
+                    decision=pending.decision,
+                    failure_reason=result.failure_reason or "compaction_failed",
+                    budget_after_attempted_compact=(
+                        result.budget_after_attempted_compact
+                    ),
+                )
+                self._fail_unstarted_in_transaction(
+                    transaction,
+                    run,
+                    reason=_GOVERNANCE_FAILURE_REASON,
+                    error_code="context_compaction_failed",
+                    message="Context compaction failed before dispatch",
+                )
+                return None
+            return self._append_compacted_event(
+                transaction,
+                run=run,
+                estimate=pending.estimate,
+                decision=pending.decision,
+                request=pending.request,
+                candidate=result.accepted_candidate,
+                quality=result.quality_result,
             )
 
         return self._transaction_runner.run_write(_operation)
@@ -976,7 +1110,7 @@ class HostDispatchScheduler:
             ),
         )
 
-    def _compact_before_dispatch(
+    def _prepare_compact_before_dispatch(
         self,
         transaction: HostTransaction,
         *,
@@ -984,15 +1118,15 @@ class HostDispatchScheduler:
         display_text: str,
         estimate: BudgetEstimate,
         decision: ContextBudgetDecision,
-    ) -> int | None:
-        """在当前事务内执行一次 proactive compact。
+    ) -> _GovernanceCompactPending | None:
+        """在当前事务内写入 proactive compact request 并冻结请求。
 
         :param transaction: 当前 Host transaction。
         :param run: 待 compact Run。
         :param display_text: 当前输入展示文本。
         :param estimate: compact 前预算估算。
         :param decision: 触发 compact 的预算决策。
-        :returns: ``CONTEXT_COMPACTED`` sequence；失败路径返回 ``None``。
+        :returns: 待事务外执行的 compact；失败路径返回 ``None``。
         """
 
         compactor = self._local_execution.context_compactor
@@ -1007,7 +1141,7 @@ class HostDispatchScheduler:
             estimate.estimated_input_tokens,
             estimate.hard_threshold_tokens,
         )
-        self._append_compaction_requested_event(
+        requested = self._append_compaction_requested_event(
             transaction,
             run=run,
             estimate=estimate,
@@ -1060,64 +1194,43 @@ class HostDispatchScheduler:
             existing_episode_summary_refs=(),
             budget_before_compact=estimate,
         )
-        candidate = compactor.compact(request)
-        quality = check_compaction_candidate(request, candidate)
-        if not quality.accepted:
-            _LOGGER.error(
-                "dispatch.compact.failed session_id=%s run_id=%s "
-                "failure_reason=%s decision=%s budget_after_compact=%s "
-                "rejection_reasons=%s",
-                run.session_id,
-                run.run_id,
-                "quality_check_rejected",
-                decision.value,
-                candidate.budget_after_compact,
-                tuple(reason.value for reason in quality.rejection_reasons),
-            )
-            self._append_compaction_failed_event(
-                transaction,
-                run=run,
-                estimate=estimate,
-                decision=decision,
-                failure_reason="quality_check_rejected",
-                budget_after_attempted_compact=candidate.budget_after_compact,
-            )
-            self._fail_unstarted_in_transaction(
-                transaction,
-                run,
-                reason=_GOVERNANCE_FAILURE_REASON,
-                error_code="context_compaction_quality_rejected",
-                message="Context compaction candidate failed Host quality check",
-            )
-            return None
-        if candidate.budget_after_compact >= estimate.hard_threshold_tokens:
-            _LOGGER.error(
-                "dispatch.compact.failed session_id=%s run_id=%s "
-                "failure_reason=%s decision=%s budget_after_compact=%s "
-                "hard_threshold_tokens=%s",
-                run.session_id,
-                run.run_id,
-                "hard_threshold_after_compact",
-                decision.value,
-                candidate.budget_after_compact,
-                estimate.hard_threshold_tokens,
-            )
-            self._append_compaction_failed_event(
-                transaction,
-                run=run,
-                estimate=estimate,
-                decision=decision,
-                failure_reason="hard_threshold_after_compact",
-                budget_after_attempted_compact=candidate.budget_after_compact,
-            )
-            self._fail_unstarted_in_transaction(
-                transaction,
-                run,
-                reason=_GOVERNANCE_FAILURE_REASON,
-                error_code="context_hard_threshold_after_compact",
-                message="Context still exceeds hard threshold after compaction",
-            )
-            return None
+        return _GovernanceCompactPending(
+            run_id=run.run_id,
+            session_id=run.session_id,
+            expected_status=run.status,
+            expected_input_event_sequence=run.input_event_sequence,
+            request=request,
+            operation_id=requested.event_id,
+            estimate=estimate,
+            decision=decision,
+        )
+
+    def _append_compacted_event(
+        self,
+        transaction: HostTransaction,
+        *,
+        run: RunRow,
+        estimate: BudgetEstimate,
+        decision: ContextBudgetDecision,
+        request: CompactionRequest,
+        candidate: CompactionCandidate,
+        quality: CompactQualityCheckResult,
+    ) -> int:
+        """写入 accepted compact artifact 与 ``CONTEXT_COMPACTED`` fact。
+
+        :param transaction: 当前 Host transaction。
+        :param run: 目标 Run。
+        :param estimate: compact 前预算估算。
+        :param decision: 触发 compact 的预算决策。
+        :param request: Host compaction request。
+        :param candidate: accepted compaction candidate。
+        :param quality: accepted quality check 结果。
+        :returns: ``CONTEXT_COMPACTED`` event sequence。
+        """
+
+        artifact_root = self._local_execution.compact_artifact_root
+        if artifact_root is None:
+            raise RuntimeError("compact artifact root is missing")
         artifact = CompactArtifactStore(
             LocalArtifactStore(
                 artifact_root,
@@ -1176,17 +1289,17 @@ class HostDispatchScheduler:
         run: RunRow,
         estimate: BudgetEstimate,
         decision: ContextBudgetDecision,
-    ) -> None:
+    ) -> EventLogRow:
         """追加 proactive ``CONTEXT_COMPACTION_REQUESTED``。
 
         :param transaction: 当前 Host transaction。
         :param run: 目标 Run。
         :param estimate: budget estimate。
         :param decision: budget decision。
-        :returns: ``None``。
+        :returns: 已写入的 request EventLog row。
         """
 
-        self._event_log_store.append_event(
+        return self._event_log_store.append_event(
             transaction,
             EventLogAppendRequest(
                 event_id=_new_event_id(_EVENT_ID_CONTEXT_COMPACTION_REQUESTED_PREFIX),
@@ -1220,7 +1333,7 @@ class HostDispatchScheduler:
                 payload_ref=None,
                 payload_digest=None,
             ),
-        )
+        ).row
 
     def _append_compaction_failed_event(
         self,
@@ -1267,6 +1380,61 @@ class HostDispatchScheduler:
                     diagnostic_refs=(estimate.estimator_digest,),
                     budget_after_attempted_compact=(
                         budget_after_attempted_compact
+                    ),
+                ),
+                payload_ref=None,
+                payload_digest=None,
+            ),
+        )
+
+    def _append_compaction_attempt_rejected_event(
+        self,
+        transaction: HostTransaction,
+        *,
+        run: RunRow,
+        operation_id: str,
+        rejected: CompactionAttemptRejected,
+    ) -> None:
+        """追加 proactive ``CONTEXT_COMPACTION_ATTEMPT_REJECTED``。
+
+        :param transaction: 当前 Host transaction。
+        :param run: 目标 Run。
+        :param operation_id: 对应 request fact 的 stable event id。
+        :param rejected: attempt reject 摘要。
+        :returns: ``None``。
+        """
+
+        self._event_log_store.append_event(
+            transaction,
+            EventLogAppendRequest(
+                event_id=_new_event_id(
+                    _EVENT_ID_CONTEXT_COMPACTION_ATTEMPT_REJECTED_PREFIX
+                ),
+                event_class=EventClass.CANONICAL_FACT,
+                session_id=run.session_id,
+                run_id=run.run_id,
+                attempt_id=None,
+                execution_id=None,
+                event_type=CONTEXT_COMPACTION_ATTEMPT_REJECTED,
+                occurred_at=datetime.now(UTC),
+                actor=_GOVERNANCE_ACTOR,
+                source=_EVENT_SOURCE,
+                client_request_id=None,
+                idempotency_key=None,
+                policy_decision=None,
+                reason={"failure_category": rejected.failure_category},
+                payload_json=build_context_compaction_attempt_rejected_payload(
+                    operation_id=operation_id,
+                    attempt_number=rejected.attempt_number,
+                    failure_category=rejected.failure_category,
+                    repairable=rejected.repairable,
+                    runner_attempt_summary_refs=(
+                        rejected.runner_attempt_summary_refs
+                    ),
+                    diagnostic_refs=rejected.diagnostic_refs,
+                    next_policy_decision=rejected.next_policy_decision,
+                    budget_after_attempted_compact=(
+                        rejected.budget_after_attempted_compact
                     ),
                 ),
                 payload_ref=None,
