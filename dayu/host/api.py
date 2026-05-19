@@ -983,7 +983,6 @@ class CompactorExecutionBaseline:
 class OpenHostOptions:
     """``open_host`` 的普通本地多轮构造期选项。
 
-    :param host_handle_id: 可选 Host handle 诊断 id。
     :param db_path: Host durable SQLite 数据库路径。
     :param artifact_root: Host artifact 根目录。
     :param create_parent_dirs: 打开 store / artifact 前是否创建父目录。
@@ -1016,7 +1015,6 @@ class OpenHostOptions:
     :param enable_truncation_manager: tool-enabled dispatch 是否启用截断治理。
     """
 
-    host_handle_id: str | None
     db_path: pathlib.Path
     artifact_root: pathlib.Path
     create_parent_dirs: bool
@@ -1052,9 +1050,6 @@ class OpenHostOptions:
             不大于 heartbeat 时抛出。
         """
 
-        _require_optional_non_empty(
-            self.host_handle_id, field_name="OpenHostOptions.host_handle_id"
-        )
         _require_path(self.db_path, field_name="OpenHostOptions.db_path")
         _require_path(
             self.artifact_root, field_name="OpenHostOptions.artifact_root"

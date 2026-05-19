@@ -948,7 +948,7 @@ dayu-cli process --ticker AAPL --ci --document-id fil_001 --document-id fil_002
 
 ### 5.1 Host public 多轮闭环 smoke
 
-`utils/smoke_host_public_multiturn.py` 用于人工观察真实生产系统 Service 只通过 Host public interface / contract 完成多轮会话闭环的过程。脚本写死 DeepSeek：ordinary runner 与 compactor 都使用 `DEEPSEEK_API_KEY`；构造期通过 `OpenHostOptions` 注入本地 worker factory、mock business tool、memory policy 与 compactor baseline，打开后只调用 public Host handle。脚本把 Dayu 日志默认打开到 `VERBOSE`，便于观察 Host command、dispatch、EngineEvent ingest、ToolRuntime、memory catch-up 与 context compact 主路径。
+`utils/smoke_host_public_multiturn.py` 用于人工观察真实生产系统 Service 只通过 Host public interface / contract 完成多轮会话闭环的过程。脚本写死 DeepSeek：ordinary runner 与 compactor 都使用 `DEEPSEEK_API_KEY`；构造期通过 `OpenHostOptions` 注入本地 worker factory、mock business tool、memory policy 与 compactor baseline，不传入 Host runtime liveness identity，打开后只调用 public Host handle。脚本把 Dayu 日志默认打开到 `VERBOSE`，便于观察 Host command、dispatch、EngineEvent ingest、ToolRuntime、memory catch-up 与 context compact 主路径。
 
 ```bash
 source .venv/bin/activate

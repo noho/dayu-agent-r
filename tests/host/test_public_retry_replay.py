@@ -433,7 +433,6 @@ def _options(
     """
 
     return OpenHostOptions(
-        host_handle_id="slice5-public",
         db_path=tmp_path / "host.sqlite3",
         artifact_root=tmp_path / "artifacts",
         create_parent_dirs=True,

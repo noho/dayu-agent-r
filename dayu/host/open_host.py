@@ -426,11 +426,14 @@ class _OpenHostContextManager(AbstractAsyncContextManager[Host]):
         :raises HostDurableError: durable store 打开失败时由底层抛出。
         """
 
-        command_options = _command_options_from_open_host_options(self._options)
+        host_handle_id = _new_open_host_handle_id()
+        command_options = _command_options_from_open_host_options(
+            self._options,
+            host_handle_id=host_handle_id,
+        )
         local_execution = _local_execution_options_from_open_host_options(
             self._options
         )
-        host_handle_id = _host_handle_id_from_options(command_options)
         _LOGGER.info(
             "host.open.start host_handle_id=%s",
             host_handle_id,
@@ -517,10 +520,13 @@ def open_host(options: OpenHostOptions) -> AbstractAsyncContextManager[Host]:
 
 def _command_options_from_open_host_options(
     options: OpenHostOptions,
+    *,
+    host_handle_id: str,
 ) -> HostCommandHandleOptions:
     """从 public opener options 构造内部 command handle options。
 
     :param options: public opener options。
+    :param host_handle_id: opener 内部生成的 Host runtime 诊断 id。
     :returns: 内部 ``HostCommandHandleOptions``。
     """
 
@@ -529,7 +535,7 @@ def _command_options_from_open_host_options(
         options
     )
     return HostCommandHandleOptions(
-        host_handle_id=options.host_handle_id,
+        host_handle_id=host_handle_id,
         db_path=options.db_path,
         artifact_root=options.artifact_root,
         create_parent_dirs=options.create_parent_dirs,
@@ -653,15 +659,12 @@ def _local_execution_options_from_open_host_options(
     )
 
 
-def _host_handle_id_from_options(options: HostCommandHandleOptions) -> str:
-    """返回 opener runtime 使用的 Host handle id。
+def _new_open_host_handle_id() -> str:
+    """生成 opener runtime 使用的 Host handle id。
 
-    :param options: 内部 command options。
-    :returns: 调用方显式提供的 handle id，或本 opener 生成的生命周期稳定 id。
+    :returns: 本 opener 生命周期唯一的 Host runtime 诊断 id。
     """
 
-    if options.host_handle_id is not None:
-        return options.host_handle_id
     return f"{_GENERATED_OPEN_HOST_ID_PREFIX}-{uuid4().hex}"
 
 

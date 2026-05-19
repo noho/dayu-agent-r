@@ -199,7 +199,6 @@ def _options(tmp_path: pathlib.Path) -> OpenHostOptions:
     """
 
     return OpenHostOptions(
-        host_handle_id="host-1",
         db_path=tmp_path / "host.sqlite3",
         artifact_root=tmp_path / "artifacts",
         create_parent_dirs=True,

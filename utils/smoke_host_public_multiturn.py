@@ -20,6 +20,7 @@ import threading
 from collections.abc import AsyncIterator, Mapping, Sequence
 from dataclasses import dataclass, replace
 from datetime import UTC, datetime
+from uuid import uuid4
 
 from dayu.contracts.tool_call import (
     BatchToolExecutionContext,
@@ -88,6 +89,7 @@ _DEEPSEEK_ENDPOINT = "https://api.deepseek.com/chat/completions"
 _DEEPSEEK_MODEL = "deepseek-v4-flash"
 _SMOKE_TOOL_NAME = "record_smoke_fact"
 _SMOKE_MARKER = "DAYU_MEMORY_ALPHA"
+_SMOKE_CLIENT_REQUEST_PREFIX = "manual-smoke"
 _DEFAULT_TIMEOUT_SECONDS = 90.0
 _COMPACTOR_TIMEOUT_SECONDS = 120.0
 _TOOL_TIMEOUT_SECONDS = 8.0
@@ -413,9 +415,11 @@ async def run_smoke(args: SmokeArgs, env: Mapping[str, str]) -> int:
 
     args.work_dir.mkdir(parents=True, exist_ok=True)
     options, compactor, smoke_tool = _open_options(args.work_dir, api_key.strip())
+    smoke_run_id = _new_smoke_run_id()
 
     print("SMOKE START Host public multi-turn DeepSeek")
     print(f"SMOKE WORK_DIR {args.work_dir}")
+    print(f"SMOKE RUN_ID {smoke_run_id}")
     print("SMOKE CONTRACT open_host -> ensure_session -> submit_followup -> watch")
     print("SMOKE LOG_LEVEL", args.log_level.name)
 
@@ -429,7 +433,7 @@ async def run_smoke(args: SmokeArgs, env: Mapping[str, str]) -> int:
             watcher=watcher,
             session_id=session.session_id,
             label="round1-tool-fact",
-            client_request_id="manual-smoke-round-1",
+            client_request_id=_round_client_request_id(smoke_run_id, 1),
             prompt=(
                 "请调用工具 record_smoke_fact 记录 smoke fact。"
                 "工具完成后，用一句话说明你已经收到工具事实。"
@@ -443,7 +447,7 @@ async def run_smoke(args: SmokeArgs, env: Mapping[str, str]) -> int:
             watcher=watcher,
             session_id=session.session_id,
             label="round2-memory-and-compact",
-            client_request_id="manual-smoke-round-2",
+            client_request_id=_round_client_request_id(smoke_run_id, 2),
             prompt=_memory_compact_prompt(),
             tool_names=frozenset(),
         )
@@ -454,7 +458,7 @@ async def run_smoke(args: SmokeArgs, env: Mapping[str, str]) -> int:
             watcher=watcher,
             session_id=session.session_id,
             label="round3-after-compact-continuity",
-            client_request_id="manual-smoke-round-3",
+            client_request_id=_round_client_request_id(smoke_run_id, 3),
             prompt=(
                 "继续同一个会话。请根据你可见的历史、memory 或 compact "
                 f"摘要，说明是否仍能看到标记 {_SMOKE_MARKER}。"
@@ -502,7 +506,6 @@ def _open_options(
     smoke_tool = SmokeFactTool()
     return (
         OpenHostOptions(
-            host_handle_id="manual-host-public-multiturn-smoke",
             db_path=work_dir / "host.sqlite3",
             artifact_root=work_dir / "artifacts",
             create_parent_dirs=True,
@@ -556,6 +559,28 @@ def _open_options(
         compactor,
         smoke_tool,
     )
+
+
+def _new_smoke_run_id() -> str:
+    """生成本次手工 smoke 的调用方请求批次 id。
+
+    :returns: 用于 stdout 和 client request id 的唯一短 id。
+    :raises Exception: 不主动抛出异常。
+    """
+
+    return uuid4().hex[:12]
+
+
+def _round_client_request_id(smoke_run_id: str, round_index: int) -> str:
+    """构造每轮 Host command 的幂等请求 id。
+
+    :param smoke_run_id: 本次手工 smoke 批次 id。
+    :param round_index: 轮次序号。
+    :returns: 本轮 ``client_request_id``。
+    :raises Exception: 不主动抛出异常。
+    """
+
+    return f"{_SMOKE_CLIENT_REQUEST_PREFIX}-{smoke_run_id}-round-{round_index}"
 
 
 def _deepseek_runner_spec(api_key: str, *, supports_tool_calling: bool) -> RunnerSpec:
