@@ -123,6 +123,5 @@ Host-owned LLM compaction 通过 `OpenHostOptions` 的预算治理配置与 `Com
 2. `dayu.engine/README.md` 与 `dayu.engine` 包根：理解 Engine public contract、函数式入口、AgentRunRequest / EngineEvent / RunnerEvent 的关系。
 3. `docs/host/design.md` 与 `dayu.host/README.md`：理解 Host 稳定设计、Session / Run / Attempt / EventLog、admission、dispatch、ToolRuntime、memory / context governance。
 4. `dayu.host` 包根与 `dayu.host.open_host`：理解 public handle、`OpenHostOptions`、普通 command facade 和本地执行装配。
-5. `dayu.fins/README.md` 与 `dayu.fins.storage`：理解财报领域能力和文档仓储边界。
-6. `dayu.runtime`：理解日志、取消、lane、filelock 等层中立运行期能力。
-7. `tests/README.md` 与对应测试目录：用测试确认边界约束、公共入口和关键状态机行为。
+5. `dayu.runtime`：理解日志、取消、lane、filelock 等层中立运行期能力。
+6. `tests/README.md` 与对应测试目录：用测试确认边界约束、公共入口和关键状态机行为。

@@ -2,7 +2,7 @@
 
 `大愚 Agent` 是每个投资者的助理分析师。  
 - `大愚 Agent` 是一个面向买方财报分析场景的 Agent 系统，但它不是简单的功能组合，`大愚 Agent` 让AI读财报的方式从丢给它整份财报“大海捞针”变成“按图索骥”，让数据有置信度，让投资结论、投资报告可审计、可追踪。  
-- `大愚 Agent` 的 Host 层正在重写中；当前主线保留 Engine、公共契约、运行时基础设施与配置真源。
+- `大愚 Agent` 的 Host 层提供 Session / Run / Attempt / EventLog、admission、dispatch、tool governance、memory / context governance 与 recovery 治理能力。
 
 当前你可以用它完成四类工作：
 - 财报数据管线：美股 / A 股 / 港股财报下载，美股 / A 股 / 港股财报上传。
@@ -16,7 +16,7 @@
 如果你要参与开发，而不是只使用系统：
 - Engine 手册：[dayu/engine/README.md](dayu/engine/README.md)
 - 配置手册：[dayu/config/README.md](dayu/config/README.md)
-- Host 重写保留设计材料：[docs/host/design.md](docs/host/design.md)、[docs/host/interface-discussion-notes.md](docs/host/interface-discussion-notes.md)
+- Host 设计材料：[docs/host/design.md](docs/host/design.md)、[docs/host/discussion-note.md](docs/host/discussion-note.md)
 
 ## 0. 如果你想参与项目
 - 定性分析模板 读起来机械感还很强，还没写出差异化：
@@ -33,7 +33,7 @@
   - 优化 Fins 里的港股/A股/美股财报信息提取。
   - Anthropic 原生 API 支持。
   - Durable memory / Retrieval layer（ Memory只实现了working memory 和 episode summary ）。
-  - FMP 工具（调研工作已做，见 [docs/fmp_integration_research.md](docs/fmp_integration_research.md) ）尚未实现。
+  - FMP 工具尚未实现。
   - 更多LLM 工具。
 
 ## 1. 五分钟快速开始
@@ -1166,7 +1166,7 @@ dayu-render workspace/draft/AAPL/AAPL_qual_report.md report.html
 - 用户手册（当前文档）：[README.md](README.md)
 - Engine 包开发手册：[dayu/engine/README.md](dayu/engine/README.md)
 - 配置说明手册：[dayu/config/README.md](dayu/config/README.md)
-- Host 重写设计材料：[docs/host/design.md](docs/host/design.md)、[docs/host/interface-discussion-notes.md](docs/host/interface-discussion-notes.md)
+- Host 设计材料：[docs/host/design.md](docs/host/design.md)、[docs/host/discussion-note.md](docs/host/discussion-note.md)
 
 ## 10. 开源与许可证
 

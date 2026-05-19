@@ -266,6 +266,7 @@ terminal summary continuity 的稳定语义是：RunInputBuilder 和 memory proj
 - run-level `stream_run_events`。
 - durable store、transaction runner、schema、state row codec、payload table helper。
 - dispatch scheduler、ToolRuntime factory、projection runner、memory repair runner。
+- recovery scanner、orphan proof classifier、Host instance liveness helper 与 startup recovery diagnostic。
 - `HostLocalExecutionOptions`、low-level local execution composition helper 与 run input provider internals。
 
 普通 Service 通过 `open_host(options)` 与异步 `Host` handle 使用 Host。需要诊断 EventLog 或 run-level stream 时，应在内部工具或测试边界显式导入对应模块，不应把这些路径提升为业务 public API。
@@ -289,4 +290,5 @@ terminal summary continuity 的稳定语义是：RunInputBuilder 和 memory proj
 5. `dayu.host.run_input`：理解 durable facts、memory snapshot、compact artifact 与 ToolRuntime handle 如何构造 `AgentRunRequest`。
 6. `dayu.host.tool_runtime` 与 `dayu.host.waiting`：理解工具执行治理、accept barrier、等待与截断。
 7. `dayu.host.memory`、`dayu.host.memory_repair` 与 `dayu.host.compaction_operation`：理解 memory projection 和 context compaction 的 Host-owned 边界。
-8. `dayu.host.durable`：理解 EventLog、payload descriptor、state transition、transaction 和 schema foundation。
+8. `dayu.host.recovery_process` 与 `dayu.host.recovery`：理解 positive orphan proof、startup recovery scan、RECOVERING dispatch 与 recovery truth source。
+9. `dayu.host.durable`：理解 EventLog、payload descriptor、state transition、transaction 和 schema foundation。
