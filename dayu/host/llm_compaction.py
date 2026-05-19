@@ -9,6 +9,7 @@ repair loop，也不向 Service 暴露 prompt、candidate builder 或 policy sea
 from __future__ import annotations
 
 import asyncio
+import re
 import threading
 from dataclasses import dataclass
 from datetime import datetime
@@ -23,7 +24,10 @@ from dayu.engine.contracts.agent_policy import AgentPolicy
 from dayu.engine.contracts.agent_run import (
     AgentRunRequest,
     AgentRunResult,
+    EngineRunOutcomeCancelled,
+    EngineRunOutcomeFailed,
     EngineRunOutcomeFinalAnswer,
+    EngineRunOutcomeSuspended,
 )
 from dayu.engine.contracts.messages import (
     AgentMessageRole,
@@ -48,6 +52,13 @@ _COMPACTOR_RUN_ID_PREFIX = "context-compactor"
 _COMPACTOR_MAX_ITERATIONS = 1
 _COMPACTOR_TOOL_TIMEOUT_SECONDS = 1.0
 _MIN_SUMMARY_LENGTH = 1
+_MAX_SAFE_OUTCOME_MESSAGE_CHARS = 240
+_TRUNCATED_SUFFIX = "..."
+_REDACTED_SECRET = "<redacted>"
+_BEARER_SECRET_PATTERN = re.compile(r"(?i)bearer\s+[A-Za-z0-9._~+/=-]+")
+_ASSIGNMENT_SECRET_PATTERN = re.compile(
+    r"(?i)((?:api[_-]?key|authorization)\s*[:=]\s*)[^,\s}\]]+"
+)
 _SYSTEM_PROMPT = (
     "You are a host-owned context compaction component. Summarize the provided "
     "Host context refs into a concise episode summary. Do not claim new "
@@ -164,9 +175,11 @@ class LLMContextCompactor(ContextCompactor):
 
         if not isinstance(request, CompactionRequest):
             raise TypeError("request must be CompactionRequest")
-        outcome = _run_agent_request_sync(_agent_request(request, self._runner_spec, self._runner_options))
+        outcome = _run_agent_request_sync(
+            _agent_request(request, self._runner_spec, self._runner_options)
+        )
         if not isinstance(outcome, EngineRunOutcomeFinalAnswer):
-            raise LLMCompactionProposalError("compactor runner did not return final answer")
+            raise LLMCompactionProposalError(_non_final_outcome_message(outcome))
         summary = outcome.content.strip()
         if len(summary) < _MIN_SUMMARY_LENGTH:
             raise LLMCompactionProposalError("compactor summary is empty")
@@ -234,6 +247,47 @@ def _run_agent_request_sync(request: AgentRunRequest) -> AgentRunResult:
     if state.result is None:
         raise LLMCompactionProposalError("compactor runner thread returned no result")
     return state.result
+
+
+def _non_final_outcome_message(outcome: AgentRunResult) -> str:
+    """构造非 final outcome 的脱敏 proposal 失败描述。
+
+    :param outcome: Engine public runner 返回的非 final outcome。
+    :returns: 不含密钥、headers 与完整 provider payload 的中性错误描述。
+    :raises Exception: 不主动抛出异常。
+    """
+
+    if isinstance(outcome, EngineRunOutcomeFailed):
+        return (
+            "compactor runner failed "
+            f"error_code={outcome.error_code} "
+            f"recoverable={outcome.recoverable} "
+            f"message={_safe_outcome_text(outcome.message)}"
+        )
+    if isinstance(outcome, EngineRunOutcomeCancelled):
+        return "compactor runner was cancelled"
+    if isinstance(outcome, EngineRunOutcomeSuspended):
+        return f"compactor runner suspended reason={_safe_outcome_text(outcome.reason)}"
+    return "compactor runner did not return final answer"
+
+
+def _safe_outcome_text(text: str) -> str:
+    """脱敏并截断 provider / runner 错误摘要。
+
+    :param text: 原始错误摘要。
+    :returns: 可进入异常消息的短文本。
+    :raises Exception: 不主动抛出异常。
+    """
+
+    redacted = _BEARER_SECRET_PATTERN.sub(
+        f"Bearer {_REDACTED_SECRET}", text
+    )
+    redacted = _ASSIGNMENT_SECRET_PATTERN.sub(
+        rf"\1{_REDACTED_SECRET}", redacted
+    )
+    if len(redacted) <= _MAX_SAFE_OUTCOME_MESSAGE_CHARS:
+        return redacted
+    return redacted[:_MAX_SAFE_OUTCOME_MESSAGE_CHARS] + _TRUNCATED_SUFFIX
 
 
 def _run_agent_request_in_thread(

@@ -1,39 +1,18 @@
-"""P10.5 Slice 6 public real-compactor smoke。"""
+"""P10.5 Slice 5 public real-compactor smoke。"""
 
 from __future__ import annotations
 
-import asyncio
+import json
 import pathlib
-import threading
+from collections.abc import Mapping
 from dataclasses import replace
-from datetime import datetime
+from typing import cast
 
 import pytest
 
-from dayu.contracts.tool_call import BatchToolExecutionRequest
-from dayu.contracts.tool_outcome import (
-    BatchToolExecutionOutcome,
-    BatchToolExecutionRecord,
-    ToolFailedOutcome,
-)
-from dayu.contracts.tool_result import ToolResultFailure
-from dayu.engine import AgentPolicy, AgentRunRequest, EngineRunOutcomeFinalAnswer
-from dayu.engine import run_agent_and_wait
-from dayu.engine.contracts.messages import AgentMessageRole, SystemMessage, UserMessage
+from dayu.contracts.json_value import JsonValue
 from dayu.engine.contracts.runner_spec import RunnerCallOptions, RunnerSpec
 from dayu.host import CompactorRunnerBaseline, HostEventKind, open_host
-from dayu.host.compaction import (
-    CompactInputRange,
-    CompactionCandidate,
-    CompactionRequest,
-    ContextCompactor,
-    EpisodeSummaryCandidate,
-    PinnedPatchOperation,
-    PinnedStatePatchCandidate,
-    PinnedStringTupleFieldPatch,
-    PinnedTextFieldPatch,
-    PreservationEvidence,
-)
 from dayu.host.context_policy import default_context_budget_policy
 from tests.host.public_smoke_support import (
     PROVIDER_CASES,
@@ -53,190 +32,14 @@ _SOFT_RESERVED_OUTPUT_TOKENS = 10
 _SOFT_HARD_THRESHOLD_TOKENS = 95
 _SOFT_SAFETY_MARGIN_RATIO = 0.2
 _SOFT_THRESHOLD_PROMPT_CHAR_COUNT = 220
-_COMPACTOR_TIMEOUT_SECONDS = 90.0
-
-
-class _NeverCancelledToken:
-    """测试用未取消 token。"""
-
-    def is_cancelled(self) -> bool:
-        """返回是否取消。
-
-        :returns: 始终为 ``False``。
-        :raises Exception: 不主动抛出异常。
-        """
-
-        return False
-
-    def cancel_reason(self) -> str | None:
-        """返回取消原因。
-
-        :returns: 始终为 ``None``。
-        :raises Exception: 不主动抛出异常。
-        """
-
-        return None
-
-    def requested_at(self) -> datetime | None:
-        """返回取消请求时间。
-
-        :returns: 始终为 ``None``。
-        :raises Exception: 不主动抛出异常。
-        """
-
-        return None
-
-
-class _RejectingToolExecutor:
-    """compactor LLM 不应调用工具的 executor。"""
-
-    async def execute(
-        self, request: BatchToolExecutionRequest
-    ) -> BatchToolExecutionOutcome:
-        """返回工具误调用失败结果。
-
-        :param request: 批式工具请求。
-        :returns: 与输入 calls 对应的失败 outcome。
-        :raises Exception: 不主动抛出异常。
-        """
-
-        return BatchToolExecutionOutcome(
-            records=tuple(
-                BatchToolExecutionRecord(
-                    tool_call_id=call.tool_call_id,
-                    outcome=ToolFailedOutcome(
-                        result=ToolResultFailure(
-                            ok=False,
-                            error="compact_tool_call_forbidden",
-                            message="compactor smoke does not expose tools",
-                            hint=None,
-                            meta=None,
-                        )
-                    ),
-                )
-                for call in request.calls
-            )
-        )
-
-
-class _RealLLMContextCompactor(ContextCompactor):
-    """显式真实 LLM compactor adapter。
-
-    :param runner_spec: compactor 独立 RunnerSpec。
-    :param runner_options: compactor RunnerCallOptions。
-    """
-
-    def __init__(
-        self, runner_spec: RunnerSpec, runner_options: RunnerCallOptions
-    ) -> None:
-        """初始化 adapter。
-
-        :param runner_spec: compactor 独立 RunnerSpec。
-        :param runner_options: compactor RunnerCallOptions。
-        :returns: ``None``。
-        :raises Exception: 不主动抛出异常。
-        """
-
-        self._runner_spec = runner_spec
-        self._runner_options = runner_options
-        self.call_count = 0
-        self.last_summary: str | None = None
-
-    def compact(self, request: CompactionRequest) -> CompactionCandidate:
-        """调用真实 LLM 生成摘要，再映射为 Host typed candidate。
-
-        :param request: Host compaction request。
-        :returns: compaction candidate。
-        :raises RuntimeError: compactor LLM 失败或超时时抛出。
-        """
-
-        self.call_count += 1
-        summary = self._run_llm_summary(request)
-        self.last_summary = summary
-        return _candidate_from_summary(request, summary)
-
-    def _run_llm_summary(self, request: CompactionRequest) -> str:
-        """在线程中执行异步 Engine runner 并返回摘要。
-
-        :param request: Host compaction request。
-        :returns: LLM 摘要文本。
-        :raises RuntimeError: LLM 执行失败或超时时抛出。
-        """
-
-        result_box: list[str] = []
-        error_box: list[BaseException] = []
-
-        def target() -> None:
-            """线程入口。
-
-            :returns: ``None``。
-            :raises Exception: 线程内异常记录到 ``error_box``。
-            """
-
-            try:
-                result_box.append(
-                    asyncio.run(self._run_llm_summary_async(request))
-                )
-            except BaseException as exc:
-                error_box.append(exc)
-
-        thread = threading.Thread(target=target, name="slice6-real-compactor")
-        thread.start()
-        thread.join(timeout=_COMPACTOR_TIMEOUT_SECONDS)
-        if thread.is_alive():
-            raise RuntimeError("compactor LLM timed out")
-        if error_box:
-            raise RuntimeError(f"compactor LLM failed: {error_box[0]}")
-        if not result_box:
-            raise RuntimeError("compactor LLM returned no summary")
-        return result_box[0]
-
-    async def _run_llm_summary_async(self, request: CompactionRequest) -> str:
-        """异步调用真实 Engine runner 生成摘要。
-
-        :param request: Host compaction request。
-        :returns: LLM 摘要文本。
-        :raises RuntimeError: LLM 未返回 final answer 时抛出。
-        """
-
-        outcome = await run_agent_and_wait(
-            AgentRunRequest(
-                run_id=f"compact-{request.run_id}",
-                session_id=request.session_id,
-                messages=(
-                    SystemMessage(
-                        role=AgentMessageRole.SYSTEM,
-                        content=(
-                            "你是上下文压缩器。只输出一段不超过 30 字的中文摘要。"
-                        ),
-                    ),
-                    UserMessage(
-                        role=AgentMessageRole.USER,
-                        content=(
-                            "当前输入摘要："
-                            f"{request.current_message_summary.summary_text}"
-                        ),
-                    ),
-                ),
-                disable_tools=True,
-                runner_spec=self._runner_spec,
-                runner_options=self._runner_options,
-                agent_policy=AgentPolicy(
-                    max_iterations=1,
-                    continuation_max_attempts=0,
-                    allow_tool_calls=False,
-                    tool_execution_timeout_seconds=5.0,
-                ),
-                tool_schemas=(),
-                tool_executor=_RejectingToolExecutor(),
-                cancellation_token=_NeverCancelledToken(),
-            )
-        )
-        if not isinstance(outcome, EngineRunOutcomeFinalAnswer):
-            raise RuntimeError("compactor LLM did not return final answer")
-        if outcome.content.strip() == "":
-            raise RuntimeError("compactor LLM returned empty summary")
-        return outcome.content.strip()
+_COMPACTOR_PROVIDER_MAX_RETRIES = 1
+_COMPACTOR_MAX_ATTEMPTS_PER_OPERATION = 2
+_COMPACT_ARTIFACT_KIND_FIELD = "artifact_kind"
+_COMPACT_ARTIFACT_KIND = "context_compaction"
+_ACCEPTED_CANDIDATE_FIELD = "accepted_candidate"
+_CANDIDATE_ID_FIELD = "candidate_id"
+_INPUT_SNAPSHOT_REFS_FIELD = "input_snapshot_refs"
+_CURRENT_USER_INPUT_REF_FIELD = "current_user_input_ref"
 
 
 @pytest.mark.asyncio
@@ -253,13 +56,19 @@ async def test_real_compactor_public_opener_compacts_and_preserves_continuity(
     case = PROVIDER_CASES[1]
     api_key = api_key_or_skip(case)
     runner_spec = runner_spec_for_case(case, api_key)
-    compactor_runner_spec = replace(runner_spec, provider_request=None)
+    compactor_runner_spec = replace(
+        runner_spec,
+        provider_request=None,
+        max_retries=_COMPACTOR_PROVIDER_MAX_RETRIES,
+    )
     runner_options = RunnerCallOptions(
         temperature=0.0,
         max_tokens=512,
         top_p=None,
         stream=True,
     )
+    compact_artifact_root = tmp_path / "compact-artifacts"
+    artifact_files_before = _compact_artifact_files(compact_artifact_root)
     worker_factory = FinalAnswerWorkerFactory()
     base_options = open_host_options(
         tmp_path,
@@ -283,12 +92,15 @@ async def test_real_compactor_public_opener_compacts_and_preserves_continuity(
             hard_threshold_tokens=_SOFT_HARD_THRESHOLD_TOKENS,
             safety_margin_ratio=_SOFT_SAFETY_MARGIN_RATIO,
             minimum_protection_tokens=1,
-            policy_ref="slice6-real-compact-policy",
+            max_compaction_attempts_per_operation=(
+                _COMPACTOR_MAX_ATTEMPTS_PER_OPERATION
+            ),
+            policy_ref="slice5-real-compact-policy",
         ),
         compactor_runner_baseline=CompactorRunnerBaseline(
             compactor_runner_spec=compactor_runner_spec,
             compactor_runner_options=runner_options,
-            compact_artifact_root=tmp_path / "compact-artifacts",
+            compact_artifact_root=compact_artifact_root,
             compact_artifact_create_parent_dirs=True,
         ),
     )
@@ -327,145 +139,87 @@ async def test_real_compactor_public_opener_compacts_and_preserves_continuity(
     skip_if_provider_terminal_failed(case, second_terminal)
     assert first_terminal.kind is HostEventKind.SUCCEEDED
     assert second_terminal.kind is HostEventKind.SUCCEEDED
+    assert first_terminal.session_id == session.session_id
+    assert second_terminal.session_id == session.session_id
+    assert first_terminal.run_id == compacted.accepted_run_id
+    assert second_terminal.run_id == followup.accepted_run_id
     assert second_terminal.final_answer is not None
     assert second_terminal.final_answer.content.strip() != ""
-
-
-def _candidate_from_summary(
-    request: CompactionRequest, summary: str
-) -> CompactionCandidate:
-    """把真实 LLM 摘要映射为 Host 可校验 candidate。
-
-    :param request: compaction request。
-    :param summary: LLM 生成的摘要文本。
-    :returns: CompactionCandidate。
-    :raises ValueError: candidate 字段非法时由底层抛出。
-    """
-
-    evidence = _preservation_evidence(request)
-    evidence_refs = tuple(item.evidence_id for item in evidence)
-    return CompactionCandidate(
-        candidate_id=f"real-compact:{request.run_id}",
-        episode_summary_candidate=EpisodeSummaryCandidate(
-            candidate_id=f"real-summary:{request.run_id}",
-            episode_title="Real compactor smoke summary",
-            goal=summary,
-            completed_actions=("real LLM summary produced",),
-            confirmed_fact_refs=request.verified_fact_refs,
-            confirmed_fact_summaries=_confirmed_fact_summaries(request),
-            user_constraints=("preserve current input",),
-            open_questions=("continue-current-run",),
-            next_step="continue after compact",
-            tool_finding_refs=request.tool_fact_refs,
-            source_event_refs=request.input_event_refs,
-            evidence_refs=evidence_refs,
-        ),
-        pinned_state_patch_candidate=PinnedStatePatchCandidate(
-            candidate_id=f"real-pinned:{request.run_id}",
-            current_goal=PinnedTextFieldPatch(
-                operation=PinnedPatchOperation.REPLACE,
-                value=summary,
-                evidence_refs=evidence_refs,
-            ),
-            confirmed_subjects=PinnedStringTupleFieldPatch(
-                operation=PinnedPatchOperation.REPLACE,
-                value=(
-                    "subject:"
-                    f"{request.current_message_summary.current_user_input_ref}",
-                ),
-                evidence_refs=evidence_refs,
-            ),
-            user_constraints=PinnedStringTupleFieldPatch(
-                operation=PinnedPatchOperation.REPLACE,
-                value=("preserve-current-input",),
-                evidence_refs=evidence_refs,
-            ),
-            open_questions=PinnedStringTupleFieldPatch(
-                operation=PinnedPatchOperation.REPLACE,
-                value=("continue-current-run",),
-                evidence_refs=evidence_refs,
-            ),
-        ),
-        preservation_evidence=evidence,
-        retained_current_user_input_ref=(
-            request.current_message_summary.current_user_input_ref
-        ),
-        preserved_input_event_refs=request.input_event_refs,
-        preserved_tool_fact_refs=request.tool_fact_refs,
-        preserved_verified_fact_refs=request.verified_fact_refs,
-        dropped_ranges=(),
-        summarized_ranges=_summarized_ranges(request),
-        budget_after_compact=max(
-            0, request.budget_before_compact.estimated_input_tokens // 2
-        ),
+    artifact_files_after = _compact_artifact_files(compact_artifact_root)
+    new_artifacts = tuple(
+        path for path in artifact_files_after if path not in artifact_files_before
     )
-
-
-def _preservation_evidence(
-    request: CompactionRequest,
-) -> tuple[PreservationEvidence, ...]:
-    """构造 preservation evidence。
-
-    :param request: compaction request。
-    :returns: preservation evidence tuple。
-    :raises ValueError: evidence 字段非法时由底层抛出。
-    """
-
-    return (
-        PreservationEvidence(
-            evidence_id=f"real-evidence:{request.run_id}",
-            input_event_refs=request.input_event_refs,
-            tool_fact_refs=request.tool_fact_refs,
-            memory_snapshot_cursor=request.memory_snapshot_cursor,
-            compact_input_range=_range_for_request(request),
-        ),
+    assert len(new_artifacts) > 0
+    artifact = _compact_artifact_for_run(new_artifacts, compacted.accepted_run_id)
+    input_snapshot = _required_mapping(
+        artifact[_INPUT_SNAPSHOT_REFS_FIELD],
+        field_name=_INPUT_SNAPSHOT_REFS_FIELD,
     )
+    current_user_input_ref = input_snapshot[_CURRENT_USER_INPUT_REF_FIELD]
+    assert isinstance(current_user_input_ref, str)
+    assert current_user_input_ref.strip() != ""
 
 
-def _range_for_request(request: CompactionRequest) -> CompactInputRange | None:
-    """根据输入 refs 构造 compact range。
+def _compact_artifact_files(root: pathlib.Path) -> tuple[pathlib.Path, ...]:
+    """返回 compact artifact 根目录下的已发布文件。
 
-    :param request: compaction request。
-    :returns: compact range；无输入时为 ``None``。
-    :raises ValueError: range 字段非法时由底层抛出。
-    """
-
-    if len(request.input_event_refs) == 0:
-        return None
-    return CompactInputRange(
-        range_ref=f"real-range:{request.run_id}:inputs",
-        start_input_ref=request.input_event_refs[0],
-        end_input_ref=request.input_event_refs[-1],
-    )
-
-
-def _summarized_ranges(request: CompactionRequest) -> tuple[CompactInputRange, ...]:
-    """构造 summarized ranges。
-
-    :param request: compaction request。
-    :returns: summarized ranges。
-    :raises ValueError: range 字段非法时由底层抛出。
-    """
-
-    if len(request.older_raw_turn_refs) == 0:
-        return ()
-    return (
-        CompactInputRange(
-            range_ref=f"real-range:{request.run_id}:older",
-            start_input_ref=request.older_raw_turn_refs[0],
-            end_input_ref=request.older_raw_turn_refs[-1],
-        ),
-    )
-
-
-def _confirmed_fact_summaries(request: CompactionRequest) -> tuple[str, ...]:
-    """构造 confirmed fact summaries。
-
-    :param request: compaction request。
-    :returns: fact summaries。
+    :param root: compact artifact 根目录。
+    :returns: 按路径排序的文件 tuple。
     :raises Exception: 不主动抛出异常。
     """
 
-    if len(request.verified_fact_refs) == 0:
-        return ("no verified facts in compact input",)
-    return tuple(f"verified:{fact_ref}" for fact_ref in request.verified_fact_refs)
+    if not root.exists():
+        return ()
+    return tuple(sorted(path for path in root.rglob("*") if path.is_file()))
+
+
+def _compact_artifact_for_run(
+    paths: tuple[pathlib.Path, ...], run_id: str
+) -> Mapping[str, JsonValue]:
+    """从 artifact 文件集合中找出匹配指定 Run 的 compact artifact。
+
+    :param paths: 候选 artifact 文件路径。
+    :param run_id: 本次 compact 关联的 Host Run id。
+    :returns: artifact JSON object。
+    :raises AssertionError: 没有找到匹配 artifact 时抛出。
+    """
+
+    expected_candidate_id = f"llm-compact:{run_id}"
+    for path in paths:
+        artifact = _required_mapping(_read_json(path), field_name=str(path))
+        if artifact.get(_COMPACT_ARTIFACT_KIND_FIELD) != _COMPACT_ARTIFACT_KIND:
+            continue
+        candidate = _required_mapping(
+            artifact[_ACCEPTED_CANDIDATE_FIELD],
+            field_name=_ACCEPTED_CANDIDATE_FIELD,
+        )
+        if candidate.get(_CANDIDATE_ID_FIELD) == expected_candidate_id:
+            return artifact
+    raise AssertionError(f"compact artifact for run {run_id} was not found")
+
+
+def _read_json(path: pathlib.Path) -> JsonValue:
+    """读取 JSON artifact。
+
+    :param path: artifact 文件路径。
+    :returns: JSON 值。
+    :raises OSError: 文件读取失败时抛出。
+    :raises json.JSONDecodeError: JSON 解析失败时抛出。
+    """
+
+    return cast(JsonValue, json.loads(path.read_text(encoding="utf-8")))
+
+
+def _required_mapping(
+    value: JsonValue, *, field_name: str
+) -> Mapping[str, JsonValue]:
+    """校验 JSON 值为 object。
+
+    :param value: 待校验 JSON 值。
+    :param field_name: 错误字段名。
+    :returns: JSON object。
+    :raises AssertionError: 值不是 object 时抛出。
+    """
+
+    assert isinstance(value, Mapping), f"{field_name} must be JSON object"
+    return value

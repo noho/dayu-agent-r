@@ -109,8 +109,53 @@ async def test_llm_context_compactor_rejects_empty_or_non_final_output(
             )
         ),
     )
-    with pytest.raises(LLMCompactionProposalError, match="did not return final"):
+    with pytest.raises(LLMCompactionProposalError, match="runner failed"):
         compactor.compact(_request())
+
+
+@pytest.mark.asyncio
+async def test_llm_context_compactor_sanitizes_failed_runner_outcome(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """runner failed outcome 的错误摘要不泄漏敏感字段。
+
+    :param monkeypatch: pytest monkeypatch fixture。
+    :returns: ``None``。
+    :raises AssertionError: 错误摘要缺少诊断或泄漏敏感字段时抛出。
+    """
+
+    monkeypatch.setattr(
+        "dayu.host.llm_compaction.run_agent_and_wait",
+        _fake_run_factory(
+            EngineRunOutcomeFailed(
+                session_id="session-1",
+                run_id="run-1",
+                error_code="server_error",
+                message=(
+                    "http 503 Authorization: Bearer deepsecret "
+                    "api_key=plainsecret transient unavailable"
+                ),
+                provider_request_id="provider-request-1",
+                recoverable=True,
+            )
+        ),
+    )
+    compactor = LLMContextCompactor(
+        runner_spec=_runner_spec(),
+        runner_options=_runner_options(),
+    )
+
+    with pytest.raises(LLMCompactionProposalError) as exc_info:
+        compactor.compact(_request())
+
+    message = str(exc_info.value)
+    assert "error_code=server_error" in message
+    assert "recoverable=True" in message
+    assert "503" in message
+    assert "transient unavailable" in message
+    assert "deepsecret" not in message
+    assert "plainsecret" not in message
+    assert "provider-request-1" not in message
 
 
 @pytest.mark.asyncio

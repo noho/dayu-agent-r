@@ -16,41 +16,33 @@ import asyncio
 import os
 import pathlib
 import sys
-import threading
 from collections.abc import AsyncIterator, Mapping, Sequence
 from dataclasses import dataclass, replace
-from datetime import UTC, datetime
 from uuid import uuid4
 
 from dayu.contracts.tool_call import (
     BatchToolExecutionContext,
-    BatchToolExecutionRequest,
     ToolCallRequest,
 )
 from dayu.contracts.tool_declaration import ToolBundle, ToolDefinition
 from dayu.contracts.tool_outcome import (
-    BatchToolExecutionOutcome,
-    BatchToolExecutionRecord,
     ToolCompletedOutcome,
     ToolExecutionOutcome,
-    ToolFailedOutcome,
 )
-from dayu.contracts.tool_result import ToolResultFailure, ToolResultSuccess
+from dayu.contracts.tool_result import ToolResultSuccess
 from dayu.contracts.tool_schema import (
     ToolFunctionSchema,
     ToolParametersSchema,
     ToolSchema,
 )
-from dayu.engine import AgentPolicy, AgentRunRequest, EngineRunOutcomeFinalAnswer
-from dayu.engine import run_agent_and_wait
-from dayu.engine.contracts.messages import AgentMessageRole, SystemMessage, UserMessage
+from dayu.engine import AgentPolicy
 from dayu.engine.contracts.runner_spec import (
     DeepSeekThinkingExtension,
     RunnerCallOptions,
     RunnerSpec,
 )
 from dayu.host import (
-    CompactorExecutionBaseline,
+    CompactorRunnerBaseline,
     EnsureSessionRequest,
     FollowupBehavior,
     Host,
@@ -67,18 +59,6 @@ from dayu.host import (
     open_host,
 )
 from dayu.host.api import AuthorizationClaim
-from dayu.host.compaction import (
-    CompactInputRange,
-    CompactionCandidate,
-    CompactionRequest,
-    ContextCompactor,
-    EpisodeSummaryCandidate,
-    PinnedPatchOperation,
-    PinnedStatePatchCandidate,
-    PinnedStringTupleFieldPatch,
-    PinnedTextFieldPatch,
-    PreservationEvidence,
-)
 from dayu.host.context_policy import default_context_budget_policy
 from dayu.host.local_proxy import DefaultLocalEngineWorkerFactory
 from dayu.host.memory import default_memory_projection_policy
@@ -91,15 +71,17 @@ _SMOKE_TOOL_NAME = "record_smoke_fact"
 _SMOKE_MARKER = "DAYU_MEMORY_ALPHA"
 _SMOKE_CLIENT_REQUEST_PREFIX = "manual-smoke"
 _DEFAULT_TIMEOUT_SECONDS = 90.0
-_COMPACTOR_TIMEOUT_SECONDS = 120.0
 _TOOL_TIMEOUT_SECONDS = 8.0
 _LANE_CAPACITY = 1
 _CONTEXT_WINDOW_SIZE = 900
 _RESERVED_OUTPUT_TOKENS = 120
 _HARD_THRESHOLD_TOKENS = 760
 _SAFETY_MARGIN_RATIO = 0.25
+_COMPACTOR_PROVIDER_MAX_RETRIES = 1
+_COMPACTOR_MAX_ATTEMPTS_PER_OPERATION = 2
 _PROMPT_PAD_REPEAT = 90
 _FINAL_PREVIEW_CHARS = 500
+_COMPACT_ARTIFACT_PRINT_LIMIT = 10
 
 
 @dataclass(frozen=True, slots=True)
@@ -128,190 +110,6 @@ class RoundResult:
     label: str
     run_id: str
     event: HostEvent
-
-
-class _NeverCancelledToken:
-    """人工 smoke compactor 使用的未取消 token。"""
-
-    def is_cancelled(self) -> bool:
-        """返回是否已取消。
-
-        :returns: 始终为 ``False``。
-        :raises Exception: 不主动抛出异常。
-        """
-
-        return False
-
-    def cancel_reason(self) -> str | None:
-        """返回取消原因。
-
-        :returns: 始终为 ``None``。
-        :raises Exception: 不主动抛出异常。
-        """
-
-        return None
-
-    def requested_at(self) -> datetime | None:
-        """返回取消请求时间。
-
-        :returns: 始终为 ``None``。
-        :raises Exception: 不主动抛出异常。
-        """
-
-        return None
-
-
-class _CompactorRejectingToolExecutor:
-    """compactor LLM 不应调用工具的 executor。"""
-
-    async def execute(
-        self, request: BatchToolExecutionRequest
-    ) -> BatchToolExecutionOutcome:
-        """返回工具误调用失败结果。
-
-        :param request: 批式工具请求。
-        :returns: 与输入 calls 对应的失败 outcome。
-        :raises Exception: 不主动抛出异常。
-        """
-
-        return BatchToolExecutionOutcome(
-            records=tuple(
-                BatchToolExecutionRecord(
-                    tool_call_id=call.tool_call_id,
-                    outcome=ToolFailedOutcome(
-                        result=ToolResultFailure(
-                            ok=False,
-                            error="compact_tool_call_forbidden",
-                            message="manual smoke compactor does not expose tools",
-                            hint=None,
-                            meta=None,
-                        )
-                    ),
-                )
-                for call in request.calls
-            )
-        )
-
-
-class DeepSeekContextCompactor(ContextCompactor):
-    """调用 DeepSeek 的 Host context compactor adapter。
-
-    :param runner_spec: compactor RunnerSpec。
-    :param runner_options: compactor RunnerCallOptions。
-    """
-
-    def __init__(
-        self, runner_spec: RunnerSpec, runner_options: RunnerCallOptions
-    ) -> None:
-        """初始化 compactor。
-
-        :param runner_spec: compactor RunnerSpec。
-        :param runner_options: compactor RunnerCallOptions。
-        :returns: ``None``。
-        :raises Exception: 不主动抛出异常。
-        """
-
-        self._runner_spec = runner_spec
-        self._runner_options = runner_options
-        self.call_count = 0
-        self.last_summary: str | None = None
-
-    def compact(self, request: CompactionRequest) -> CompactionCandidate:
-        """调用 DeepSeek 生成摘要并映射为 Host typed candidate。
-
-        :param request: Host compaction request。
-        :returns: compaction candidate。
-        :raises RuntimeError: DeepSeek compactor 未返回摘要或执行失败时抛出。
-        """
-
-        self.call_count += 1
-        summary = self._run_summary(request)
-        self.last_summary = summary
-        return _candidate_from_summary(request, summary)
-
-    def _run_summary(self, request: CompactionRequest) -> str:
-        """在线程中执行异步 compactor runner。
-
-        :param request: Host compaction request。
-        :returns: DeepSeek 摘要文本。
-        :raises RuntimeError: 线程超时、执行失败或未返回摘要时抛出。
-        """
-
-        result_box: list[str] = []
-        error_box: list[BaseException] = []
-
-        def target() -> None:
-            """线程入口。
-
-            :returns: ``None``。
-            :raises Exception: 线程内异常会被记录到 ``error_box``。
-            """
-
-            try:
-                result_box.append(asyncio.run(self._run_summary_async(request)))
-            except BaseException as exc:
-                error_box.append(exc)
-
-        thread = threading.Thread(target=target, name="host-public-smoke-compactor")
-        thread.start()
-        thread.join(timeout=_COMPACTOR_TIMEOUT_SECONDS)
-        if thread.is_alive():
-            raise RuntimeError("DeepSeek compactor timed out")
-        if error_box:
-            raise RuntimeError(f"DeepSeek compactor failed: {error_box[0]}")
-        if not result_box:
-            raise RuntimeError("DeepSeek compactor returned no summary")
-        return result_box[0]
-
-    async def _run_summary_async(self, request: CompactionRequest) -> str:
-        """异步调用 DeepSeek 生成 compact 摘要。
-
-        :param request: Host compaction request。
-        :returns: 摘要文本。
-        :raises RuntimeError: 未返回 final answer 或内容为空时抛出。
-        """
-
-        outcome = await run_agent_and_wait(
-            AgentRunRequest(
-                run_id=f"manual-compact-{request.run_id}",
-                session_id=request.session_id,
-                messages=(
-                    SystemMessage(
-                        role=AgentMessageRole.SYSTEM,
-                        content=(
-                            "你是 Dayu Host 手工 smoke 的上下文压缩器。"
-                            "只输出一段不超过 40 字的中文摘要，保留用户目标、"
-                            "工具事实标记和后续动作。"
-                        ),
-                    ),
-                    UserMessage(
-                        role=AgentMessageRole.USER,
-                        content=(
-                            "当前输入摘要："
-                            f"{request.current_message_summary.summary_text}"
-                        ),
-                    ),
-                ),
-                disable_tools=True,
-                runner_spec=self._runner_spec,
-                runner_options=self._runner_options,
-                agent_policy=AgentPolicy(
-                    max_iterations=1,
-                    continuation_max_attempts=0,
-                    allow_tool_calls=False,
-                    tool_execution_timeout_seconds=_TOOL_TIMEOUT_SECONDS,
-                ),
-                tool_schemas=(),
-                tool_executor=_CompactorRejectingToolExecutor(),
-                cancellation_token=_NeverCancelledToken(),
-            )
-        )
-        if not isinstance(outcome, EngineRunOutcomeFinalAnswer):
-            raise RuntimeError("DeepSeek compactor did not return final answer")
-        content = outcome.content.strip()
-        if content == "":
-            raise RuntimeError("DeepSeek compactor returned empty summary")
-        return content
 
 
 class SmokeFactTool:
@@ -414,7 +212,7 @@ async def run_smoke(args: SmokeArgs, env: Mapping[str, str]) -> int:
         return 2
 
     args.work_dir.mkdir(parents=True, exist_ok=True)
-    options, compactor, smoke_tool = _open_options(args.work_dir, api_key.strip())
+    options, smoke_tool = _open_options(args.work_dir, api_key.strip())
     smoke_run_id = _new_smoke_run_id()
 
     print("SMOKE START Host public multi-turn DeepSeek")
@@ -471,7 +269,7 @@ async def run_smoke(args: SmokeArgs, env: Mapping[str, str]) -> int:
         print(f"SMOKE SESSION_STATUS {final_session.status.value}")
 
     _print_tool_summary(smoke_tool)
-    _print_compact_summary(args.work_dir, compactor)
+    _print_compact_summary(args.work_dir)
     print("SMOKE PASS public Host handle completed three-turn closure")
     if args.keep_workspace:
         print("SMOKE WORKSPACE_KEPT true")
@@ -482,26 +280,26 @@ async def run_smoke(args: SmokeArgs, env: Mapping[str, str]) -> int:
 
 def _open_options(
     work_dir: pathlib.Path, api_key: str
-) -> tuple[OpenHostOptions, DeepSeekContextCompactor, SmokeFactTool]:
-    """构造 open_host options 与 compactor。
+) -> tuple[OpenHostOptions, SmokeFactTool]:
+    """构造 open_host options。
 
     :param work_dir: 运行目录。
     :param api_key: DeepSeek API key。
-    :returns: OpenHostOptions、compactor 与 smoke tool。
+    :returns: OpenHostOptions 与 smoke tool。
     :raises ValueError: typed options 字段非法时由底层抛出。
     """
 
     runner_spec = _deepseek_runner_spec(api_key)
-    compactor_runner_spec = _deepseek_runner_spec(api_key)
+    compactor_runner_spec = replace(
+        _deepseek_runner_spec(api_key),
+        provider_request=None,
+        max_retries=_COMPACTOR_PROVIDER_MAX_RETRIES,
+    )
     runner_options = RunnerCallOptions(
         temperature=0.0,
         max_tokens=512,
         top_p=None,
         stream=True,
-    )
-    compactor = DeepSeekContextCompactor(
-        compactor_runner_spec,
-        runner_options,
     )
     smoke_tool = SmokeFactTool()
     return (
@@ -542,13 +340,14 @@ def _open_options(
                 safety_margin_ratio=_SAFETY_MARGIN_RATIO,
                 minimum_protection_tokens=1,
                 max_proactive_compactions_per_run=1,
+                max_compaction_attempts_per_operation=(
+                    _COMPACTOR_MAX_ATTEMPTS_PER_OPERATION
+                ),
                 policy_ref="manual-host-public-smoke-policy",
             ),
-            compactor_baseline=CompactorExecutionBaseline(
-                context_compactor=compactor,
+            compactor_runner_baseline=CompactorRunnerBaseline(
                 compactor_runner_spec=compactor_runner_spec,
                 compactor_runner_options=runner_options,
-                compactor_policy_ref="manual-host-public-smoke-deepseek-compactor",
                 compact_artifact_root=work_dir / "compact-artifacts",
                 compact_artifact_create_parent_dirs=True,
             ),
@@ -556,7 +355,6 @@ def _open_options(
             memory_projection_catchup_batch_size=128,
             enable_truncation_manager=True,
         ),
-        compactor,
         smoke_tool,
     )
 
@@ -869,11 +667,10 @@ def _print_tool_summary(smoke_tool: SmokeFactTool) -> None:
         )
 
 
-def _print_compact_summary(work_dir: pathlib.Path, compactor: DeepSeekContextCompactor) -> None:
+def _print_compact_summary(work_dir: pathlib.Path) -> None:
     """打印 compact 观测摘要。
 
     :param work_dir: smoke 运行目录。
-    :param compactor: DeepSeek compactor。
     :returns: ``None``。
     :raises Exception: 不主动抛出异常。
     """
@@ -882,152 +679,10 @@ def _print_compact_summary(work_dir: pathlib.Path, compactor: DeepSeekContextCom
     artifacts = tuple(
         path for path in compact_root.rglob("*") if path.is_file()
     ) if compact_root.exists() else ()
-    print(f"SMOKE COMPACT_CALL_COUNT {compactor.call_count}")
-    print(f"SMOKE COMPACT_LAST_SUMMARY {compactor.last_summary!r}")
     print(f"SMOKE COMPACT_ARTIFACT_ROOT {compact_root}")
     print(f"SMOKE COMPACT_ARTIFACT_FILE_COUNT {len(artifacts)}")
-    for path in artifacts[:10]:
+    for path in artifacts[:_COMPACT_ARTIFACT_PRINT_LIMIT]:
         print(f"SMOKE COMPACT_ARTIFACT {path}")
-
-
-def _candidate_from_summary(
-    request: CompactionRequest, summary: str
-) -> CompactionCandidate:
-    """把 DeepSeek 摘要映射为 Host 可校验 compaction candidate。
-
-    :param request: compaction request。
-    :param summary: DeepSeek 摘要。
-    :returns: CompactionCandidate。
-    :raises ValueError: candidate 字段非法时由底层抛出。
-    """
-
-    evidence = _preservation_evidence(request)
-    evidence_refs = tuple(item.evidence_id for item in evidence)
-    return CompactionCandidate(
-        candidate_id=f"manual-compact:{request.run_id}",
-        episode_summary_candidate=EpisodeSummaryCandidate(
-            candidate_id=f"manual-summary:{request.run_id}",
-            episode_title="Manual Host public smoke summary",
-            goal=summary,
-            completed_actions=("DeepSeek compactor produced summary",),
-            confirmed_fact_refs=request.verified_fact_refs,
-            confirmed_fact_summaries=_confirmed_fact_summaries(request),
-            user_constraints=("preserve manual smoke continuity",),
-            open_questions=("observe next public run",),
-            next_step="continue manual public smoke",
-            tool_finding_refs=request.tool_fact_refs,
-            source_event_refs=request.input_event_refs,
-            evidence_refs=evidence_refs,
-        ),
-        pinned_state_patch_candidate=PinnedStatePatchCandidate(
-            candidate_id=f"manual-pinned:{request.run_id}",
-            current_goal=PinnedTextFieldPatch(
-                operation=PinnedPatchOperation.REPLACE,
-                value=summary,
-                evidence_refs=evidence_refs,
-            ),
-            confirmed_subjects=PinnedStringTupleFieldPatch(
-                operation=PinnedPatchOperation.REPLACE,
-                value=(
-                    "subject:"
-                    f"{request.current_message_summary.current_user_input_ref}",
-                ),
-                evidence_refs=evidence_refs,
-            ),
-            user_constraints=PinnedStringTupleFieldPatch(
-                operation=PinnedPatchOperation.REPLACE,
-                value=("manual-smoke-continuity",),
-                evidence_refs=evidence_refs,
-            ),
-            open_questions=PinnedStringTupleFieldPatch(
-                operation=PinnedPatchOperation.REPLACE,
-                value=("observe-next-run",),
-                evidence_refs=evidence_refs,
-            ),
-        ),
-        preservation_evidence=evidence,
-        retained_current_user_input_ref=(
-            request.current_message_summary.current_user_input_ref
-        ),
-        preserved_input_event_refs=request.input_event_refs,
-        preserved_tool_fact_refs=request.tool_fact_refs,
-        preserved_verified_fact_refs=request.verified_fact_refs,
-        dropped_ranges=(),
-        summarized_ranges=_summarized_ranges(request),
-        budget_after_compact=max(
-            0, request.budget_before_compact.estimated_input_tokens // 2
-        ),
-    )
-
-
-def _preservation_evidence(
-    request: CompactionRequest,
-) -> tuple[PreservationEvidence, ...]:
-    """构造 preservation evidence。
-
-    :param request: compaction request。
-    :returns: preservation evidence。
-    :raises ValueError: evidence 字段非法时由底层抛出。
-    """
-
-    return (
-        PreservationEvidence(
-            evidence_id=f"manual-evidence:{request.run_id}",
-            input_event_refs=request.input_event_refs,
-            tool_fact_refs=request.tool_fact_refs,
-            memory_snapshot_cursor=request.memory_snapshot_cursor,
-            compact_input_range=_range_for_request(request),
-        ),
-    )
-
-
-def _range_for_request(request: CompactionRequest) -> CompactInputRange | None:
-    """构造 compact input range。
-
-    :param request: compaction request。
-    :returns: compact range；无输入事件时为 ``None``。
-    :raises ValueError: range 字段非法时由底层抛出。
-    """
-
-    if len(request.input_event_refs) == 0:
-        return None
-    return CompactInputRange(
-        range_ref=f"manual-range:{request.run_id}:inputs",
-        start_input_ref=request.input_event_refs[0],
-        end_input_ref=request.input_event_refs[-1],
-    )
-
-
-def _summarized_ranges(request: CompactionRequest) -> tuple[CompactInputRange, ...]:
-    """构造 summarized ranges。
-
-    :param request: compaction request。
-    :returns: summarized ranges。
-    :raises ValueError: range 字段非法时由底层抛出。
-    """
-
-    if len(request.older_raw_turn_refs) == 0:
-        return ()
-    return (
-        CompactInputRange(
-            range_ref=f"manual-range:{request.run_id}:older",
-            start_input_ref=request.older_raw_turn_refs[0],
-            end_input_ref=request.older_raw_turn_refs[-1],
-        ),
-    )
-
-
-def _confirmed_fact_summaries(request: CompactionRequest) -> tuple[str, ...]:
-    """构造 confirmed fact summaries。
-
-    :param request: compaction request。
-    :returns: fact summaries。
-    :raises Exception: 不主动抛出异常。
-    """
-
-    if len(request.verified_fact_refs) == 0:
-        return ("manual smoke has no verified facts in compact input",)
-    return tuple(f"verified:{fact_ref}" for fact_ref in request.verified_fact_refs)
 
 
 def main(argv: Sequence[str] | None = None) -> int:
