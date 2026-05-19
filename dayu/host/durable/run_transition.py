@@ -47,6 +47,7 @@ from dayu.host.durable.state import (
     WorkerKind,
     cancel_cancelling_run_row,
     cancel_active_wait_records_for_run,
+    cancel_recovering_run_row,
     cancel_waiting_run_row,
     cancel_running_attempt_row,
     cancel_starting_dispatch_record_row,
@@ -81,9 +82,7 @@ from dayu.host.durable.state import (
     terminal_recovering_run_row,
     terminal_unstarted_run_row,
     terminal_run_row,
-    serialize_run_status,
 )
-from dayu.host.durable.schema import TABLE_HOST_RUNS
 from dayu.host.durable.transaction import HostTransaction
 
 _EVENT_TYPE_RUN_ACCEPTED = "RUN_ACCEPTED"
@@ -2400,7 +2399,7 @@ def cancel_recovering_run_in_transaction(
         ),
     ).row
     terminal_at = format_utc_timestamp(request.occurred_at)
-    run_result = _cancel_recovering_run_row(
+    run_result = cancel_recovering_run_row(
         transaction,
         run_id=run.run_id,
         terminal_event_id=run_cancelled_event.event_id,
@@ -2749,64 +2748,6 @@ def _require_dispatch_record_mutation_updated(
             status=result.status,
         )
     return result
-
-
-def _cancel_recovering_run_row(
-    transaction: HostTransaction,
-    *,
-    run_id: str,
-    terminal_event_id: str,
-    terminal_event_sequence: int,
-    terminal_at: str,
-) -> RunMutationResult:
-    """CAS 将 RECOVERING Run 取消收口。
-
-    :param transaction: 调用方提供的 Host transaction。
-    :param run_id: 目标 Run id。
-    :param terminal_event_id: ``RUN_CANCELLED`` event id。
-    :param terminal_event_sequence: ``RUN_CANCELLED`` 全局事件序号。
-    :param terminal_at: 固定 UTC terminal timestamp 文本。
-    :returns: Run mutation 结果。
-    :raises HostDurableError: 输入字段无效时抛出。
-    """
-
-    _require_non_empty_text(run_id, field_name="run_id")
-    _require_non_empty_text(terminal_event_id, field_name="terminal_event_id")
-    _require_positive_sequence(
-        terminal_event_sequence, field_name="terminal_event_sequence"
-    )
-    _require_non_empty_text(terminal_at, field_name="terminal_at")
-    result = transaction.execute(
-        f"""
-        UPDATE {TABLE_HOST_RUNS}
-        SET
-          status = ?,
-          terminal_event_id = ?,
-          terminal_event_sequence = ?,
-          updated_at = ?,
-          terminal_at = ?
-        WHERE run_id = ?
-          AND status = ?
-          AND terminal_event_id IS NULL
-          AND terminal_event_sequence IS NULL
-          AND terminal_at IS NULL
-        """,
-        (
-            serialize_run_status(RunStatus.CANCELLED),
-            terminal_event_id,
-            terminal_event_sequence,
-            terminal_at,
-            terminal_at,
-            run_id,
-            serialize_run_status(RunStatus.RECOVERING),
-        ),
-    )
-    row = read_run_by_id(transaction, run_id)
-    if result.rowcount == 1:
-        return RunMutationResult(status=StateMutationStatus.UPDATED, row=row)
-    if row is None:
-        return RunMutationResult(status=StateMutationStatus.NOT_FOUND, row=None)
-    return RunMutationResult(status=StateMutationStatus.CAS_LOST, row=row)
 
 
 def _raise_after_event_append_mutation_failure(

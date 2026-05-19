@@ -55,6 +55,7 @@ from dayu.host.recovery_process import (
 
 _RECOVERY_ACTOR = "host_recovery"
 _RECOVERY_SOURCE = "startup_scan"
+# heartbeat 周期必须显著小于 stale 阈值，避免破坏 positive orphan proof。
 _DEFAULT_STALE_AFTER_SECONDS = 30
 _DEFAULT_RECOVERY_DISPATCH_LIMIT = 1
 _ATTEMPT_ID_PREFIX = "attempt-recovery"

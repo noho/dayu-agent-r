@@ -3336,6 +3336,64 @@ def terminal_recovering_run_row(
     )
 
 
+def cancel_recovering_run_row(
+    transaction: HostTransaction,
+    *,
+    run_id: str,
+    terminal_event_id: str,
+    terminal_event_sequence: int,
+    terminal_at: str,
+) -> RunMutationResult:
+    """CAS 将 recovering Run 取消收口。
+
+    :param transaction: 调用方提供的 Host transaction。
+    :param run_id: 目标 Run id。
+    :param terminal_event_id: ``RUN_CANCELLED`` 事件 id。
+    :param terminal_event_sequence: ``RUN_CANCELLED`` 全局事件序号。
+    :param terminal_at: 固定 UTC terminal timestamp 文本。
+    :returns: Run mutation 结果，区分 updated/cas_lost/not_found。
+    :raises HostDurableError: 输入字段无效时抛出。
+    """
+
+    _validate_run_terminal_update(
+        run_id=run_id,
+        terminal_event_id=terminal_event_id,
+        terminal_event_sequence=terminal_event_sequence,
+        terminal_at=terminal_at,
+    )
+    result = transaction.execute(
+        f"""
+        UPDATE {TABLE_HOST_RUNS}
+        SET
+          status = ?,
+          terminal_event_id = ?,
+          terminal_event_sequence = ?,
+          updated_at = ?,
+          terminal_at = ?
+        WHERE run_id = ?
+          AND status = ?
+          AND terminal_event_id IS NULL
+          AND terminal_event_sequence IS NULL
+          AND terminal_at IS NULL
+        """,
+        (
+            serialize_run_status(RunStatus.CANCELLED),
+            terminal_event_id,
+            terminal_event_sequence,
+            terminal_at,
+            terminal_at,
+            run_id,
+            serialize_run_status(RunStatus.RECOVERING),
+        ),
+    )
+    row = read_run_by_id(transaction, run_id)
+    if result.rowcount == 1:
+        return RunMutationResult(status=StateMutationStatus.UPDATED, row=row)
+    if row is None:
+        return RunMutationResult(status=StateMutationStatus.NOT_FOUND, row=None)
+    return RunMutationResult(status=StateMutationStatus.CAS_LOST, row=row)
+
+
 def cancel_waiting_run_row(
     transaction: HostTransaction,
     *,
