@@ -1709,6 +1709,61 @@ Plan 必须额外收口的 readiness review checklist：
   8192 / 1024 fallback 已作为内部兜底说明，生产 composition 应显式传入 policy，本轮不改变 public contract。触发条件为
   修改 `open_host` options、预算 policy 默认值、或 Service composition root 接入；后续验证必须覆盖显式配置优先、
   fallback 只作为非生产兜底、README / Host README 与 public contract 一致。
+- PR-62 deepreview --all F1 proactive compaction fake budget 回归：owner 为当前 PR-62 blocker fix。不阻塞后续
+  deferred tracking 的理由是该项不是 deferred risk，必须在本次 gate 内收口。触发条件为修改
+  `FakeContextCompactor`、`estimate_compacted_context_budget`、`run_compaction_operation` hard-threshold recheck 或
+  proactive compact policy；后续验证必须覆盖 soft threshold proactive compact 创建 Attempt、hard threshold 后仍拒绝
+  candidate，以及 fake compactor 预算保持在 hard threshold 内。
+- oversized truncation cursor data loss：owner 为 ToolRuntime truncation / `fetch_more` cursor lifecycle hardening。
+  不阻塞 PR-62 blocker fix 的理由是本次只收口 proactive compaction 测试回归，truncation cursor 生命周期需要单独验证
+  TTL、内存占用和 oversized visible portion 行为。触发条件为修改 `TruncationManager.apply_truncation`、`fetch_more`
+  cursor missing / expired guard、或工具大结果截断策略；后续验证必须覆盖 truncation 后 inline 仍超限时 cursor 不丢失、
+  `fetch_more` 可恢复后续分段、TTL 到期清理和 run-scoped `scope_token` 边界。
+- OpenAI tool call aggregator index fragmentation：owner 为 Engine OpenAI runner parser hardening。不阻塞 PR-62
+  blocker fix 的理由是触发条件依赖 provider 在同一 tool call 上混合 id-only 与 index-only delta，标准路径当前未见回归。
+  触发条件为修改 `ToolCallAggregator._resolve_index`、provider delta normalize 或 streaming tool call parser；后续验证必须
+  覆盖已有 `delta_id` mapping 时优先复用既有 index、provider index / synthetic index 冲突、finalize 后参数完整性。
+- duplicate governance check-then-act race：owner 为 ToolRuntime duplicate governance concurrency hardening。不阻塞
+  PR-62 blocker fix 的理由是该项要求调整 `find + record` 原子性和并发测试，影响面独立于 proactive compaction。触发条件为
+  修改 duplicate policy、`ToolRuntimeExecutor._execute_one` 并发 batch 执行或 side-effect 工具治理；后续验证必须覆盖同一
+  Run 内同工具同 normalized arguments 并发调用只执行一次，第二个调用复用或按 policy 阻断，且不引入死锁。
+- durable layer dependency cleanup：owner 为 Host durable layering cleanup work unit。不阻塞 PR-62 blocker fix 的理由是
+  `dayu.host.durable.memory` 与 durable 多文件依赖 `dayu.host.api` 属架构边界清理，需要拆分 row primitive、public type
+  owner 与 import boundary tests，不能夹带进 compaction 回归修复。触发条件为修改 durable memory projection bootstrap、
+  durable state/read model 类型 import、或新增 durable 基础设施模块；后续验证必须覆盖 durable 层不反向依赖上层业务模块、
+  public status/type 下沉或独立化后的 import boundary、memory projection 行为不变。
+- waiting iteration_id / digest 语义缺口：owner 为 Phase 7 waiting / resolve_wait durable contract hardening。不阻塞
+  PR-62 blocker fix 的理由是该项涉及 `WaitRecordRow` 持久化字段与 `TOOL_RESULT_ACCEPTED` payload 语义迁移，需独立
+  schema / contract gate。触发条件为修改 awaiting accept candidate、wait record schema、`resolve_wait` payload 构造或
+  tool trace digest 消费；后续验证必须覆盖 Engine iteration id 不被 wait id 冒充、schema / tool identity /
+  normalized arguments digest 不退化为同一个 outcome digest、旧语义不进入新的 canonical facts。
+- idempotent replay error type：owner 为 waiting accept barrier error taxonomy hardening。不阻塞 PR-62 blocker fix
+  的理由是触发路径要求 idempotency replay 发现 EventLog rows 缺失，当前没有证据影响 proactive compaction。触发条件为修改
+  `_accepted_ack_from_existing`、idempotency replay、wait accepted ack 或 EventLog repair；后续验证必须覆盖缺失 rows 时
+  抛出 Host durable taxonomy 内错误、调用方得到有界 Host API / accept barrier envelope，而不是裸 `RuntimeError`。
+- `cancel_session_runs` RECOVERING 阻塞：owner 为 Phase 11 recovery / session-scope cancel semantics。不阻塞
+  PR-62 blocker fix 的理由是 RECOVERING cancel 本来归 Phase 11，当前 fix 不改变 recovery 状态机。触发条件为实现
+  RECOVERING dispatch / positive orphan proof、修改 session-scope cancel 目标枚举、或 close / cancel 组合语义；后续验证
+  必须覆盖 Session 中 RECOVERING 与可取消 Run 并存时的行为，是跳过 RECOVERING、返回 structured partial result，还是
+  文档明确 fail-closed。
+- context governance 模块命名 / helper 重复清理：owner 为 Phase 10 context governance maintenance hardening。不阻塞
+  PR-62 blocker fix 的理由是命名与 `_string_list_json`、`_require_optional_non_empty`、`_budget_after_compact` 重复均为
+  可维护性问题，本次只修 fake compactor root cause。触发条件为继续扩展 compaction quality checker、compact artifact /
+  context event JSON helper 或 compactor budget helper；后续验证必须覆盖模块职责命名与实际边界一致，公共 helper 下沉后不产生
+  反向依赖或兼容 re-export。
+- close-session active Run observability 与 terminal CAS null-check 一致性：owner 为 Host public lifecycle /
+  durable state machine maintenance。不阻塞 PR-62 blocker fix 的理由是 close 不取消 active Run 是当前设计事实，CAS 终态约束
+  由 status 与 schema CHECK 兜底，当前 findings 是 observability / 一致性 hardening。触发条件为修改 `close_session` result、
+  session lifecycle diagnostic、terminal mutation SQL 或 terminal schema CHECK；后续验证必须覆盖 close 时 active Run
+  可观测性、terminal mutation NULL guard 一致性和并发 CAS 不破坏终态唯一性。
+- contracts validation gaps：owner 为 contracts strict validation hardening。不阻塞 PR-62 blocker fix 的理由是 review
+  未发现当前生产路径传入非法值，补校验可能暴露调用方 bug，应独立补 contract tests。触发条件为修改
+  `dayu/contracts/tool_call.py`、`tool_outcome.py`、`tool_schema.py`、`tool_await.py` 或跨进程序列化边界；后续验证必须覆盖
+  `correlation_id`、非空 batch records、cancel meta、truncate TTL、await deadline / captured_at timezone 等非法输入。
+- README stale references：owner 为 docs correctness cleanup。不阻塞 PR-62 blocker fix 的理由是当前 blocker 是测试回归，
+  README 残留“Host 层正在重写中”与 `docs/host/interface-discussion-notes.md` 断链属于稳定文档校准，应由 docs gate
+  按 README 职责范围统一清理。触发条件为进入 PR-62 docs follow-up、修改根 README / `dayu/README.md` 导航或 Host public
+  contract 文档；后续验证必须覆盖旧术语清理、断链替换为 `docs/host/discussion-note.md` 或真实路径，以及总览文档不越界。
 
 #### Phase 10 S4 Proactive Context Governance 残余风险追踪
 

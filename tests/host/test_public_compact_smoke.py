@@ -27,11 +27,12 @@ from tests.host.public_smoke_support import (
     skip_if_provider_terminal_failed,
 )
 
-_SOFT_CONTEXT_WINDOW_SIZE = 110
+_SOFT_CONTEXT_WINDOW_SIZE = 360
 _SOFT_RESERVED_OUTPUT_TOKENS = 10
-_SOFT_HARD_THRESHOLD_TOKENS = 95
-_SOFT_SAFETY_MARGIN_RATIO = 0.2
-_SOFT_THRESHOLD_PROMPT_CHAR_COUNT = 220
+_SOFT_HARD_THRESHOLD_TOKENS = 300
+_SOFT_SAFETY_MARGIN_RATIO = 0.8
+_SOFT_THRESHOLD_PROMPT_REPEAT_COUNT = 7
+_SOFT_THRESHOLD_PROMPT_SENTENCE = "请保留标记 DAYU_COMPACT_OK，并继续等待下一步。"
 _COMPACTOR_PROVIDER_MAX_RETRIES = 1
 _COMPACTOR_MAX_ATTEMPTS_PER_OPERATION = 2
 _COMPACT_ARTIFACT_KIND_FIELD = "artifact_kind"
@@ -114,7 +115,7 @@ async def test_real_compactor_public_opener_compacts_and_preserves_continuity(
                 followup_request(
                     session.session_id,
                     "compact-first",
-                    "x" * _SOFT_THRESHOLD_PROMPT_CHAR_COUNT,
+                    _soft_threshold_prompt(),
                 ),
             )
             first_terminal = await next_terminal_for_run(
@@ -158,6 +159,15 @@ async def test_real_compactor_public_opener_compacts_and_preserves_continuity(
     current_user_input_ref = input_snapshot[_CURRENT_USER_INPUT_REF_FIELD]
     assert isinstance(current_user_input_ref, str)
     assert current_user_input_ref.strip() != ""
+
+
+def _soft_threshold_prompt() -> str:
+    """返回语义可压缩且会触发 soft threshold 的真实 compactor smoke prompt。
+
+    :returns: 测试 prompt。
+    """
+
+    return _SOFT_THRESHOLD_PROMPT_SENTENCE * _SOFT_THRESHOLD_PROMPT_REPEAT_COUNT
 
 
 def _compact_artifact_files(root: pathlib.Path) -> tuple[pathlib.Path, ...]:

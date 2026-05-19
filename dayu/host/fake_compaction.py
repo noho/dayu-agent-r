@@ -24,6 +24,8 @@ from dayu.host.compaction_budget import estimate_compacted_context_budget
 _FAKE_COMPACTION_SYSTEM_PROMPT = (
     "Deterministic fake context compactor preserving current input and accepted facts."
 )
+_HARD_THRESHOLD_ACCEPTANCE_MARGIN_TOKENS = 1
+_MIN_COMPACTED_CONTEXT_BUDGET_TOKENS = 0
 
 
 class FakeContextCompactor(ContextCompactor):
@@ -199,17 +201,46 @@ def _user_constraints(request: CompactionRequest) -> tuple[str, ...]:
 
 
 def _budget_after_compact(request: CompactionRequest) -> int:
-    """按真实 LLM compactor 语义估算 compact 后预算。
+    """按真实 LLM compactor 语义估算 compact 后预算并约束在 hard threshold 内。
 
     :param request: compaction 请求。
     :returns: compact 后 token 估算。
     """
 
-    return estimate_compacted_context_budget(
+    estimated_budget = estimate_compacted_context_budget(
         request,
         summary=request.current_message_summary.summary_text,
         system_prompt=_FAKE_COMPACTION_SYSTEM_PROMPT,
     )
+    return _cap_budget_within_hard_threshold(
+        estimated_budget,
+        hard_threshold_tokens=request.budget_before_compact.hard_threshold_tokens,
+    )
+
+
+def _cap_budget_within_hard_threshold(
+    estimated_budget_tokens: int, *, hard_threshold_tokens: int
+) -> int:
+    """将 fake candidate 预算约束到 Host hard-threshold 可接受区间。
+
+    Fake compactor 是测试 / 本地 deterministic compactor。它复用真实 compactor
+    的保守估算作为语义基础，但不能生成会被 Host hard-threshold recheck 拒绝
+    的 accepted candidate。若输入 hard threshold 非正，非负 candidate 不可能
+    满足 ``budget < hard_threshold``，因此只返回非负下界，避免构造非法负预算。
+
+    :param estimated_budget_tokens: 原始 compact 后 token 估算。
+    :param hard_threshold_tokens: Host hard threshold token 数。
+    :returns: 非负且在可表达时小于 hard threshold 的 token 估算。
+    """
+
+    if hard_threshold_tokens <= _MIN_COMPACTED_CONTEXT_BUDGET_TOKENS:
+        return _MIN_COMPACTED_CONTEXT_BUDGET_TOKENS
+    accepted_budget_ceiling = (
+        hard_threshold_tokens - _HARD_THRESHOLD_ACCEPTANCE_MARGIN_TOKENS
+    )
+    if accepted_budget_ceiling < _MIN_COMPACTED_CONTEXT_BUDGET_TOKENS:
+        return _MIN_COMPACTED_CONTEXT_BUDGET_TOKENS
+    return min(estimated_budget_tokens, accepted_budget_ceiling)
 
 
 __all__ = ["FakeContextCompactor"]
