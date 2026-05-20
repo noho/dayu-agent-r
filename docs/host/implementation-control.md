@@ -222,9 +222,9 @@ Phase Map 中每个 phase 必须使用统一条目格式。模板如下：
 
 约束：本节只保留当前 gate 结论；phase 过程流水必须归档到 `历史记录`，仍需追踪的风险或后续 owner 必须写入 `Open Questions 与风险追踪` 的 `追踪区`。
 
-当前 work unit：Phase 11. Host Lifecycle / Recovery / Multi-process Hardening（completed）。
-当前 gate：PR 65 merged / Phase 11 final closeout PASS。
-下一 gate：Phase 12 design discussion / plan gate，除非用户另行要求处理 PR 65 merge 后外部反馈。
+当前 work unit：Phase 12. ToolsDiscovery / ScenePrepare / ConfigLoader runtime assembly。
+当前 gate：accepted plan local commit。
+下一 gate：Phase 12 implementation gate。
 
 当前 gate 事实：Phase 10 已完成；P10.5 已插入 Phase Map，用于冻结普通本地多轮会话的 Host public interface / contract。P10.5 目标与任务清单写入 `docs/host/post-p10.md`。initial challenge review artifacts 为 `docs/reviews/post-p10-public-contract-challenge-mimo-20260518.md`、`docs/reviews/post-p10-wiring-smoke-challenge-ds-20260518.md` 与 `docs/reviews/post-p10-codex-challenge-20260518.md`；相关裁决已经写回 `docs/host/post-p10.md`。按 `$init-agents` 已派发三路 P10.5 plan-readiness review：`docs/reviews/post-p10-5-plan-readiness-review-mimo-20260518.md`、`docs/reviews/post-p10-5-plan-readiness-review-ds-20260518.md` 与 `docs/reviews/post-p10-5-plan-readiness-review-codex-20260518.md`；三份结论均为 blocking count = 0。P10.5 handoff implementation-ready plan 已生成：`docs/host/phase10-5-ordinary-local-multiturn-public-contract-plan.md`。P10.5 plan review artifacts 为 `docs/reviews/phase10-5-plan-review-mimo-20260518.md` 与 `docs/reviews/phase10-5-plan-review-ds-20260518.md`，两份均 PASS，blocking count = 0。Controller adjudication artifact 为 `docs/reviews/phase10-5-plan-review-controller-adjudication-20260518.md`；总控裁决：不直接进入 implementation，先接受 DS N1-N5 / C1-C3 与 MiMo F5-F7 为 plan hardening。P10.5 plan fix artifact 为 `docs/reviews/phase10-5-plan-fix-codex-20260518.md`；fix 只修改 `docs/host/phase10-5-ordinary-local-multiturn-public-contract-plan.md`，收口 A1-A5，无新的 blocking question。P10.5 plan re-review artifacts 为 `docs/reviews/phase10-5-plan-rereview-mimo-20260518.md` 与 `docs/reviews/phase10-5-plan-rereview-ds-20260518.md`，两份均 PASS，blocking count = 0；Controller re-review adjudication artifact 为 `docs/reviews/phase10-5-plan-rereview-controller-adjudication-20260518.md`。Accepted plan local commit hash：`f38540b`。P10.5 Slice 1 implementation artifact 为 `docs/reviews/phase10-5-slice1-implementation-codex-20260518.md`；implementation agent reported focused tests `tests/host/test_public_open_host_options.py tests/host/test_package_exports.py` passed and `pyright dayu/host tests/host` returned 0 errors。P10.5 Slice 1 code review artifacts 为 `docs/reviews/phase10-5-slice1-code-review-mimo-20260518.md` 与 `docs/reviews/phase10-5-slice1-code-review-ds-20260518.md`，两份均 PASS，blocking count = 0；Controller adjudication artifact 为 `docs/reviews/phase10-5-slice1-code-review-controller-adjudication-20260518.md`。Accepted Slice 1 local commit hash：`d0e79a6`。用户已授权到达 `ready-to-open-draft-PR` 后进入 draft PR gate 并推进到 draft-PR-pass；该授权不改变当前必须先完成 P10.5 剩余 slices、code review 与 aggregate deepreview 的顺序。P10.5 Slice 2 implementation artifact 为 `docs/reviews/phase10-5-slice2-implementation-codex-20260518.md`；implementation agent reported focused tests `tests/host/test_open_host_runtime.py tests/host/test_public_lifecycle_smoke.py` passed and `pyright dayu/host tests/host` returned 0 errors。P10.5 Slice 2 code review artifacts 为 `docs/reviews/phase10-5-slice2-code-review-mimo-20260518.md` 与 `docs/reviews/phase10-5-slice2-code-review-ds-20260518.md`，两份均 PASS，blocking count = 0。Controller adjudication artifact 为 `docs/reviews/phase10-5-slice2-code-review-controller-adjudication-20260518.md`；总控裁决：接受 DS N1 为当前 Slice 2 lifecycle fix，接受 DS N2 / MiMo N3 为窄契约澄清 fix。P10.5 Slice 2 fix artifact 为 `docs/reviews/phase10-5-slice2-fix-codex-20260518.md`；fix agent reported focused tests `tests/host/test_open_host_runtime.py tests/host/test_public_lifecycle_smoke.py` passed with 5 tests and `pyright dayu/host tests/host` returned 0 errors。P10.5 Slice 2 re-review artifacts 为 `docs/reviews/phase10-5-slice2-rereview-mimo-20260518.md` 与 `docs/reviews/phase10-5-slice2-rereview-ds-20260518.md`，两份均 PASS，blocking count = 0；Controller re-review adjudication artifact 为 `docs/reviews/phase10-5-slice2-rereview-controller-adjudication-20260518.md`。Accepted Slice 2 local commit hash：`79f7b44`。P10.5 Slice 3 implementation artifact 为 `docs/reviews/phase10-5-slice3-implementation-codex-20260518.md`；implementation agent reported focused tests `tests/host/test_submit_followup_public_contract.py tests/host/test_per_run_tool_selection.py tests/host/test_effective_execution_config.py` passed with 9 tests and `pyright dayu/host tests/host` returned 0 errors。P10.5 Slice 3 code review artifacts 为 `docs/reviews/phase10-5-slice3-code-review-mimo-20260518.md` 与 `docs/reviews/phase10-5-slice3-code-review-ds-20260518.md`，两份均 PASS，blocking count = 0；Controller adjudication artifact 为 `docs/reviews/phase10-5-slice3-code-review-controller-adjudication-20260518.md`。总控裁决：接受 runner config JSON 投影重复、agent_policy override 覆盖缺口、baseline=None fail-early 说明为当前 Slice 3 fix。P10.5 Slice 3 fix artifact 为 `docs/reviews/phase10-5-slice3-fix-codex-20260518.md`；fix agent reported focused tests `tests/host/test_submit_followup_public_contract.py tests/host/test_per_run_tool_selection.py tests/host/test_effective_execution_config.py` passed with 11 tests and `pyright dayu/host tests/host` returned 0 errors；controller 本地复跑同一 focused tests 11 passed，`pyright dayu/host tests/host` 0 errors。P10.5 Slice 3 re-review artifacts 为 `docs/reviews/phase10-5-slice3-rereview-mimo-20260518.md` 与 `docs/reviews/phase10-5-slice3-rereview-ds-20260518.md`。Controller re-review adjudication artifact 为 `docs/reviews/phase10-5-slice3-rereview-controller-adjudication-20260518.md`；总控裁决：受影响既有 tests `tests/host/test_admission_queue.py tests/host/test_projection_read_model.py` 当前 17 failed / 19 passed，不能接受进入 slice commit，需 follow-up fix 迁移相关低层测试 helper 到 ordinary baseline 边界。Slice 3 follow-up fix 已更新 `tests/host/test_admission_queue.py`、`tests/host/test_projection_read_model.py` 与 `docs/reviews/phase10-5-slice3-fix-codex-20260518.md`；fix agent reported 47 tests passed and `pyright dayu/host tests/host` 0 errors；controller 本地复跑同一 47-test 集合 passed，`pyright dayu/host tests/host` 0 errors。P10.5 Slice 3 follow-up re-review artifacts 为 `docs/reviews/phase10-5-slice3-followup-rereview-mimo-20260518.md` 与 `docs/reviews/phase10-5-slice3-followup-rereview-ds-20260518.md`，两份均 PASS，blocking count = 0；Controller follow-up re-review adjudication artifact 为 `docs/reviews/phase10-5-slice3-followup-rereview-controller-adjudication-20260518.md`。Accepted Slice 3 local commit hash：`8e6f352`。P10.5 Slice 4 implementation artifact 为 `docs/reviews/phase10-5-slice4-implementation-codex-20260518.md`；implementation agent reported focused tests `tests/host/test_watch_session_events.py tests/host/test_public_host_event.py` passed with 7 tests, extra affected tests `tests/host/test_package_exports.py tests/host/test_public_event_stream.py tests/host/test_public_contracts.py` passed with 62 tests, and `pyright dayu/host tests/host` returned 0 errors；controller 本地复跑同一验证通过。P10.5 Slice 4 code review artifacts 为 `docs/reviews/phase10-5-slice4-code-review-mimo-20260518.md` 与 `docs/reviews/phase10-5-slice4-code-review-ds-20260518.md`，两份均 PASS，blocking count = 0；Controller adjudication artifact 为 `docs/reviews/phase10-5-slice4-code-review-controller-adjudication-20260518.md`。Accepted Slice 4 local commit hash：`73db9f0`。当前进入 P10.5 Slice 5 implementation。
 
@@ -333,6 +333,14 @@ Phase Map 中每个 phase 必须使用统一条目格式。模板如下：
 当前 gate 追加事实（PR 65 manual deepreview accepted commit / push）：accepted manual deepreview fix commit 为 `23d9d30`，已 push 到 `feat/host-phase-11-recovery`。`git diff --check main...HEAD` clean；`gh pr view 65` 显示 draft=true、state=OPEN、mergeStateStatus=CLEAN、statusCheckRollup=[]；`gh pr checks 65 --watch=false` 返回 no checks reported。用户手工补跑的两轮 `deepreview --all` 已完成 controller fix / independent re-review / final validation / push 闭环，当前状态为 draft-PR-pass + manual deepreview-all PASS。
 
 当前 gate 追加事实（PR 65 merged / Phase 11 final closeout）：Controller verification 显示本地当前分支为 `main`，工作区干净，最新提交为 PR 65 merge commit `37093c4`。`gh pr view 65` 显示 `state=MERGED`、`isDraft=false`、`headRefName=feat/host-phase-11-recovery`、`baseRefName=main`、`statusCheckRollup=[]`。PR 65 已合并，Phase 11 final closeout PASS；下一入口为 Phase 12 design discussion / plan gate。
+
+当前 gate 追加事实（Phase 12 plan artifact）：Phase 12 design discussion 已收口，blocking open questions count = 0。设计真源 `docs/host/design.md` 已记录 ToolsDiscovery、ScenePrepare、ConfigLoader、runtime assembly override、ConfigLoader 新 schema、legacy config 删除、tool selection names / tags 与旧项目 scene asset 迁移边界。Phase 12 handoff implementation-ready plan artifact 已生成：`docs/host/phase12-runtime-assembly-plan.md`，当前进入 Phase 12 plan review。
+
+当前 gate 追加事实（Phase 12 plan review）：Phase 12 plan review artifacts 为 `docs/reviews/phase12-plan-review-mimo-20260520.md` 与 `docs/reviews/phase12-plan-review-ds-20260520.md`。AgentMiMo verdict 为 BLOCKED，blocking count = 3；AgentDS verdict 为 PASS，blocking count = 0，但指出 source ref 重定位需在 implementation 前指定默认方案。Controller adjudication artifact 为 `docs/reviews/phase12-plan-review-controller-adjudication-20260520.md`；总控裁决：接受 source ref canonical owner 迁入 `dayu.contracts`、`execution_profiles.json` schema plan-level shape、`context_slots` typing / rendering mechanism 为当前 plan fix。当前进入 Phase 12 plan fix。
+
+当前 gate 追加事实（Phase 12 plan fix）：Phase 12 plan fix artifact 为 `docs/reviews/phase12-plan-fix-codex-20260520.md`；fix 更新 `docs/host/phase12-runtime-assembly-plan.md`，明确 `ToolBundleSourceKind` / `ToolBundleSourceRef` canonical owner 迁入 `dayu.contracts`、Host public exports 保留同一 canonical type 不作为 compatibility wrapper、`execution_profiles.json` concrete sketch / typed view shape、scene hints override mapping、string-only `context_slots` 与 `{{slot_name}}` deterministic rendering 规则，并补 SHA-256 canonical digest 与 fragment resolved-path containment hardening notes。当前进入 Phase 12 plan re-review。
+
+当前 gate 追加事实（Phase 12 plan re-review accepted）：Phase 12 plan re-review artifacts 为 `docs/reviews/phase12-plan-rereview-mimo-20260520.md` 与 `docs/reviews/phase12-plan-rereview-ds-20260520.md`，两份均 PASS，blocking findings count = 0。Controller re-review adjudication artifact 为 `docs/reviews/phase12-plan-rereview-controller-adjudication-20260520.md`。总控裁决：P12-PLAN-F1 / F2 / F3 已修复，无新增 blocking finding；当前进入 Phase 12 accepted plan local commit。
 
 ## Phase Map
 
@@ -1452,7 +1460,7 @@ Plan 必须额外收口的 readiness review checklist：
 ### Phase 12. ToolsDiscovery / ScenePrepare
 
 目标：
-- 实现独立于 Host 的工具发现 / 注册与场景准备 runtime assembly 边界，让业务工具集合与 scene inputs 能在 Host construction / Service request envelope 前被 typed 组装，不让 Host import 具体业务工具、扫描业务包或拼接财报场景 prompt。
+- 实现独立于 Host 的工具发现 / 注册、场景准备与配置加载 runtime assembly 边界，让业务工具集合、scene inputs 与 execution config 能在 Host construction / Service request envelope 前被 typed 组装，不让 Host import 具体业务工具、扫描业务包、读取应用配置文件或拼接财报场景 prompt。
 
 对应设计章节：
 - `docs/host/design.md` §3 dayu.runtime
@@ -1473,19 +1481,25 @@ Plan 必须额外收口的 readiness review checklist：
 - 确认是否需要把 ToolsDiscovery / ScenePrepare 放入 `dayu.runtime`；若放入，只能依赖标准库与 `dayu.contracts`，不得 import `dayu.host` / `dayu.engine` / `dayu.service` / `dayu.ui` / `dayu.fins` 或具体业务工具包。
 
 范围：
-- 允许修改：ToolsDiscovery typed provider protocol、tool provider aggregation、`ToolBundle` validation / source refs assembly、ScenePrepare typed manifest assembly helper、scene input typed output、import boundary tests、相关 README。
-- 禁止修改：Host durable state machine、Host command path、Engine execution path、ToolRuntime accept barrier、具体业务财报工具实现、财报仓储实现。
+- 允许修改：ToolsDiscovery typed provider protocol、tool provider aggregation、`ToolBundle` validation / source refs assembly、ScenePrepare typed manifest assembly helper、scene input typed output、ConfigLoader typed config loading / validation、旧项目 scene manifest 与其引用的 prompt fragment assets 按新 schema 迁移到当前项目配置资产目录、import boundary tests、相关 README。
+- 禁止修改：Host durable state machine、Host command path、Host 公开接口、Engine execution path、ToolRuntime accept barrier、具体业务财报工具实现、财报仓储实现。
 
 不做：
 - 不实现 Audit / Tool Trace / Outbox projection；该能力在 Phase 13。
 - 不实现业务财报工具扫描硬编码清单。
-- 不把财报 prompt 文案、业务 scene manifest 内容或 Fins storage 访问逻辑放入 `dayu.runtime`。
+- 不把财报 prompt 文案、prompt fragment 内容、task prompts、业务 prompt 模板或 Fins storage 访问逻辑放入 `dayu.runtime`；旧项目迁移范围只包含 scene manifest 以及这些 manifest 直接引用的 prompt fragment assets，并且只能作为当前项目配置资产进入 `dayu/config/prompts` 或等价配置目录。
+- 不让 ConfigLoader import Host、Engine、Service、UI、Fins 或具体业务工具包；ConfigLoader 只负责原样读取 / overlay / 校验 typed config，不构造 Host、不创建 provider client、不解释或保护 provider secret。
 - 不让 per-run request 携带 raw `ToolBundle` 或 callable binding。
-- 不新增 Host public command、Host handle method、Host opener option 或 Host request field；ToolsDiscovery / ScenePrepare 的 typed output 必须通过现有 `HostToolingOptions`、`SubmitFollowupRequest` 显式字段或 Host 外部 Service envelope 承接，不能把装配过程塞入 Host 状态机。
+- 不把 `open_host(options)` 的 construction-time inputs 伪装成 per-run override；durable store / artifact roots、SQLite / lane 参数、worker factory、ordinary baseline、`HostToolingOptions`、context budget、compactor baseline、memory projection 与 truncation manager 开关只能在 Host 外部装配时确定。
+- 不新增、不删除、不重命名、不重塑 Host public command、Host handle method、Host opener option、Host request / response dataclass field 或 `dayu.host` public exports；ToolsDiscovery / ScenePrepare / ConfigLoader 的 typed output 必须通过现有 `HostToolingOptions`、`SubmitFollowupRequest` 显式字段或 Host 外部 Service envelope 承接，不能把装配过程塞入 Host 状态机。
 
 关键设计问题：
 - 必须确认 ToolsDiscovery provider protocol 的最小 typed shape：provider identity、version / digest source refs、`ToolDefinition` collection output、duplicate name handling、reserved framework tool name conflict handling。
 - 必须确认 ScenePrepare 的 typed scene input output shape，以及它如何进入 Service / Host request envelope 而不变成 Host 状态机语义。
+- 必须按新 schema 重塑 ConfigLoader，不沿用旧 `llm_models.json` / `run.json` 的混合职责；配置视图拆分为 `models.json`、`execution_profiles.json`、`host_runtime.json` 与 `tool_discovery.json`，并支持包内默认配置 + workspace 覆盖配置的 typed loading / validation；新 schema 落地后必须删除旧 `dayu/config/llm_models.json` 与 `dayu/config/run.json`，不保留兼容读取路径。
+- 必须实现 ConfigLoader overlay 规则：顶层 map 按 id 合并，同 id 记录由 workspace 整条替换，不做隐式 deep merge；需要复用时用单继承 `extends`，继承解析后得到完整 typed record；ConfigLoader 不解析 env、不替换 secret、不脱敏，只原样读取配置值。
+- 必须确认 `tool_selection` 第一版只支持 `mode=all|none|select`，其中 `select` 只支持 `tool_names` 与 `tool_tags_any` 并集选择；未知 tool name 报错，tag 无匹配默认报错，只有显式 `allow_empty=true` 时允许空选择。
+- 必须确认 runtime assembly override 边界：override 合并由 Service / composition root 执行，优先级为未来 UI 显式输入 > scene manifest hints > ConfigLoader typed config view > 代码默认值；当前允许的 per-run override 仅为 `SubmitFollowupRequest.system_prompt`、`tool_names`、`runner_spec`、`runner_options` 与 `agent_policy`，其中 runner / agent override 必须映射为完整 typed value。
 - 必须确认 ToolsDiscovery / ScenePrepare 的 import boundary tests，防止 runtime import 具体业务工具、Fins、Host、Engine、Service 或 UI。
 - 必须确认 source refs / digest 与 Phase 1 `HostToolingOptions`、Attempt snapshot refs 和 audit / diagnostic refs 的衔接方式。
 
@@ -1499,18 +1513,27 @@ Plan 必须额外收口的 readiness review checklist：
 建议 slice 切分：
 - Slice 1: ToolsDiscovery provider protocol and ToolBundle aggregation。
 - Slice 2: ToolBundle source refs / digest assembly and reserved framework tool name validation。
-- Slice 3: ScenePrepare typed manifest assembly helper and scene input output。
-- Slice 4: import boundary tests and README sync。
+- Slice 3: ConfigLoader typed config loading / validation, new config asset migration, removal of legacy `llm_models.json` / `run.json`, and execution config mapping boundary。
+- Slice 4: ScenePrepare typed manifest assembly helper and scene input output。
+- Slice 5: migrate legacy `dayu-agent` scene manifest and referenced prompt fragment assets into current config assets using the new ScenePrepare schema。
+- Slice 6: import boundary tests and README sync。
 
 验证要求：
 - unit tests: provider aggregation、duplicate tool names、reserved framework tool conflicts、source refs / digest stability、scene manifest assembly、invalid manifest errors。
-- import boundary tests: runtime assembly modules 不 import `dayu.host` / `dayu.engine` / `dayu.service` / `dayu.ui` / `dayu.fins` 或具体业务工具包。
-- integration tests: 可使用 fake providers / fake scene manifests；不依赖真实财报工具扫描或财报 prompt 文案。
+- unit tests: ConfigLoader 能加载 / 校验 `models.json`、`execution_profiles.json`、`host_runtime.json` 与 `tool_discovery.json` 的 typed config，覆盖 workspace 整条替换、单继承 `extends`、非法 deep partial、非法缺字段与非法 secret / env 原样值类型。
+- unit tests: ScenePrepare / Service mapping helper 能把 `mode=all|none|select` 的 `tool_selection` 映射为 `SubmitFollowupRequest.tool_names` 语义；覆盖 explicit names、tag-based selection、names + tags 并集、未知 name、tag 无匹配和 `allow_empty=true`。
+- import boundary tests: runtime assembly modules 与 ConfigLoader 不 import `dayu.host` / `dayu.engine` / `dayu.service` / `dayu.ui` / `dayu.fins` 或具体业务工具包。
+- integration tests: 可使用 fake providers / fake scene manifests；迁移后的真实 scene assets 必须能被 ScenePrepare 新 schema parser 校验 / assembly，但不得要求真实财报工具扫描、Fins storage 或外部模型调用。
 - pyright: runtime assembly / affected contracts 通过。
 - docs: `dayu/README.md` 与受影响包 README 按职责同步。
 
 退出条件：
 - 外部装配方可以通过 typed provider / manifest assembly 得到业务 `ToolBundle`、`ToolBundleSourceRef` 与 typed scene inputs，并把它们交给 Host construction / request envelope，而无需 Host import 业务工具或拼 scene prompt。
+- Service 可以通过 ConfigLoader 加载 `models.json`、`execution_profiles.json`、`host_runtime.json` 与 `tool_discovery.json` 的 typed config，并将 ScenePrepare 输出的 `model_hints` / `runtime_hints` 显式映射为 `RunnerSpec`、`RunnerCallOptions`、`AgentPolicy` 或其它现有 typed input；映射失败必须在调用 Host 前失败。
+- 旧 `dayu/config/llm_models.json` 与 `dayu/config/run.json` 已删除；P12 不提供旧配置文件兼容读取、兼容测试或兼容 wrapper。
+- Scene manifest 的 `tool_selection` 只通过 names / tags 选择 construction-time `ToolBundle` 子集，不替换 bundle，不引入 raw callable binding，并能稳定映射为 `SubmitFollowupRequest.tool_names`。
+- Service 可以在 Host 外部按未来 UI 显式输入 > scene manifest hints > ConfigLoader typed config view > 代码默认值的顺序完成 assembly override，并且只通过现有 `SubmitFollowupRequest` per-run override 字段或 `open_host(options)` construction-time typed inputs 调用 Host。
+- 旧项目 `dayu-agent` 的 scene manifest 与其直接引用的 prompt fragment assets 已按新 schema 迁移到当前项目配置资产目录；迁移结果通过新 ScenePrepare parser / assembly 测试，且 task prompts、contract files、workflow 产物与业务内容不进入 `dayu.runtime`。
 - Runtime assembly 边界不持有 Host truth，不参与 Run / Attempt lifecycle，不决定 EventLog / ToolRuntime accept barrier。
 
 后续依赖：
