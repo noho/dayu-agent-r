@@ -22,6 +22,8 @@
 - :func:`tool` / :class:`ToolDisplayInfo` / :class:`ToolDefinition` /
   :class:`ToolBundle` 最小工具声明契约；definition / bundle 只能投影为
   ``ToolSchema`` 后进入 Engine。
+- :class:`ToolBundleSourceKind` / :class:`ToolBundleSourceRef` 工具 bundle
+  来源引用契约。
 
 本包内部模块允许相互 import；**禁止** import :mod:`dayu.engine` 或上层
 任何包。
@@ -78,6 +80,7 @@ from dayu.contracts.tool_schema import (
     ToolTruncateSpec,
     ToolTruncationStrategy,
 )
+from dayu.contracts.tool_source import ToolBundleSourceKind, ToolBundleSourceRef
 
 __all__ = [
     "ALLOWED_TOOL_CANCELLED_REASONS",
@@ -96,6 +99,8 @@ __all__ = [
     "ToolAwaitSpec",
     "ToolAwaitingOutcome",
     "ToolBundle",
+    "ToolBundleSourceKind",
+    "ToolBundleSourceRef",
     "ToolCallProviderState",
     "ToolCallRequest",
     "ToolCallable",

@@ -9,6 +9,12 @@ from typing import Protocol, cast
 import pytest
 
 from dayu.contracts.json_value import JsonValue
+from dayu.contracts import (
+    ToolBundleSourceKind as ContractToolBundleSourceKind,
+)
+from dayu.contracts import (
+    ToolBundleSourceRef as ContractToolBundleSourceRef,
+)
 from dayu.contracts.tool_call import (
     BatchToolExecutionContext,
     ToolCallRequest,
@@ -136,6 +142,13 @@ def test_tooling_enums_are_str_enum_with_stable_values() -> None:
     assert FrameworkToolName.FETCH_MORE.value == "fetch_more"
 
 
+def test_host_source_ref_exports_are_canonical_contracts() -> None:
+    """Host 包根导出的 source ref 类型必须直接来自 ``dayu.contracts``。"""
+
+    assert ToolBundleSourceKind is ContractToolBundleSourceKind
+    assert ToolBundleSourceRef is ContractToolBundleSourceRef
+
+
 def test_default_framework_tool_policy_view_reserves_fetch_more_only() -> None:
     """默认 policy view 预留 ``fetch_more``，但默认不启用 framework tool。"""
 
@@ -143,9 +156,7 @@ def test_default_framework_tool_policy_view_reserves_fetch_more_only() -> None:
     second = default_framework_tool_policy_view()
 
     assert first is not second
-    assert first.reserved_framework_tool_names == frozenset(
-        {FrameworkToolName.FETCH_MORE}
-    )
+    assert first.reserved_framework_tool_names == frozenset({FrameworkToolName.FETCH_MORE})
     assert first.enabled_framework_tools == frozenset()
     assert first.reserved_framework_tool_names is not second.reserved_framework_tool_names
     assert first.enabled_framework_tools is not second.enabled_framework_tools
@@ -212,9 +223,7 @@ def test_host_tooling_options_rejects_reserved_framework_tool_name() -> None:
 
     with pytest.raises(ValueError, match="fetch_more"):
         HostToolingOptions(
-            business_tool_bundle=ToolBundle(
-                definitions=(_definition(FrameworkToolName.FETCH_MORE.value),)
-            ),
+            business_tool_bundle=ToolBundle(definitions=(_definition(FrameworkToolName.FETCH_MORE.value),)),
             source_refs=(_source_ref(),),
         )
 
@@ -227,9 +236,7 @@ def test_host_tooling_options_accepts_normal_business_bundle() -> None:
         source_refs=(_source_ref(),),
     )
 
-    assert options.business_tool_bundle.to_tool_schemas()[0].function.name == (
-        "lookup_filing"
-    )
+    assert options.business_tool_bundle.to_tool_schemas()[0].function.name == ("lookup_filing")
     assert options.source_refs == (_source_ref(),)
     assert options.framework_tool_policy == default_framework_tool_policy_view()
     assert cast(tuple[str, ...], options.__slots__) != ()

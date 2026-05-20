@@ -34,13 +34,13 @@ UI -> Service -> Host -> Engine
 
 依赖只能沿 `UI -> Service -> Host -> Engine` 向下发生。Engine 不读取 Host durable store，不管理 Session / Run / Attempt；Host 不承载财报业务语义，不直接管理财报原文仓储规则；Service 不绕过 Host 直接控制 Engine。
 
-`dayu.runtime` 是层中立运行期基础设施包，不属于上述任一业务层。它只能承载日志、取消等待、cross-process lane、同步 filelock wrapper 等通用运行期能力，不持有 Host truth、业务语义或 Engine 协议状态机。
+`dayu.runtime` 是层中立运行期基础设施包，不属于上述任一业务层。它只能承载日志、取消等待、cross-process lane、同步 filelock wrapper、工具发现装配等通用运行期能力，不持有 Host truth、业务语义或 Engine 协议状态机。
 
 ## 稳定边界
 
 ### `dayu.contracts`
 
-`dayu.contracts` 承载跨层共享协作契约，例如 JSON 值、取消观察 token、工具声明、工具调用请求、工具执行结果、工具等待结果和 `ToolExecutor` 协议。它不得依赖 `dayu.engine` 或上层业务包。
+`dayu.contracts` 承载跨层共享协作契约，例如 JSON 值、取消观察 token、工具声明、工具来源引用、工具调用请求、工具执行结果、工具等待结果和 `ToolExecutor` 协议。它不得依赖 `dayu.engine` 或上层业务包。
 
 公共契约只表达层间协作对象，不承载 UI 展示语义、Service 业务流程、Host 治理状态机、Engine 内部执行状态或财报领域存储规则。若一个类型只被某一层理解，应留在该层内部。
 
@@ -70,6 +70,7 @@ Host-owned LLM compaction 通过 `OpenHostOptions` 的预算治理配置与 `Com
 - 协作式取消等待 / race helper。
 - `lane`：cross-process named semaphore / capacity guard，只表达 runtime capacity claim，不表达 Host admission、lease、fencing、Attempt owner、EventLog ordering 或 recovery proof。
 - `filelock`：第三方 `FileLock` 的同步 wrapper，只用于普通文件访问互斥，不替代 SQLite transaction、EventLog 顺序或 Host 状态机。
+- `tools_discovery`：按显式 import path 或 package entry point 解析 provider callable，聚合 provider 输出为业务 `ToolBundle`、provider report 与 source refs；不扫描业务包，不持有 Host / Service 上下文。
 
 ### `dayu.fins`
 
@@ -110,7 +111,7 @@ Host-owned LLM compaction 通过 `OpenHostOptions` 的预算治理配置与 `Com
 ## 扩展入口
 
 - 新 UI / CLI / Web / GUI 入口：通过 Service 解析身份、场景和调用上下文，再调用 `dayu.host` public handle；不要直接控制 Engine。
-- 新业务工具：用 `@tool(...)` 同源声明 schema、展示信息、截断声明和 callable，组装为 `ToolBundle`，通过 `HostToolingOptions` 传入 Host construction。
+- 新业务工具：用 `@tool(...)` 同源声明 schema、展示信息、截断声明和 callable，经 `dayu.runtime.tools_discovery` 或外部 composition root 组装为 `ToolBundle`，通过 `HostToolingOptions` 传入 Host construction。
 - 新财报数据能力：在 `dayu.fins.storage` 仓储协议与实现内扩展文档存取；工具或 Service 通过仓储协议访问，不旁路读取文件或数据库。
 - 新本地执行能力：实现 `LocalEngineWorkerFactory` / `LocalEngineWorker`，并通过 `OpenHostOptions` 装配到 Host。
 - 新上下文压缩能力：通过 Host 的预算治理配置和 `CompactorRunnerBaseline` 装配 Host-owned LLM compaction；不要把 compaction 生命周期放到 Service 或 UI。
