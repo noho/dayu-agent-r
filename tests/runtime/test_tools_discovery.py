@@ -217,7 +217,10 @@ def test_fake_provider_callable_aggregation_success() -> None:
         "lookup_filing",
         "quote_metric",
     )
-    assert result.source_refs == (_source_ref("alpha"),)
+    assert result.source_refs[0].source_kind == ToolBundleSourceKind.EXPLICIT_PROVIDER
+    assert result.source_refs[0].source_id == "alpha"
+    assert result.source_refs[0].content_digest is not None
+    assert result.source_refs[0].content_digest.startswith("sha256:")
 
 
 def test_import_path_resolution_to_callable() -> None:
@@ -429,4 +432,7 @@ def test_empty_provider_with_allow_empty_succeeds() -> None:
 
     assert result.tool_bundle.definitions == ()
     assert result.provider_reports[0].tool_names == ()
-    assert result.source_refs == (_source_ref("empty"),)
+    assert result.source_refs[0].source_kind == ToolBundleSourceKind.EXPLICIT_PROVIDER
+    assert result.source_refs[0].source_id == "empty"
+    assert result.source_refs[0].content_digest is not None
+    assert result.source_refs[0].content_digest.startswith("sha256:")

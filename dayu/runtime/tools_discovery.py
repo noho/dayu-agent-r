@@ -8,8 +8,10 @@ Engine / Service / UI / Fins / 具体业务工具包，也不把 provider callab
 
 from __future__ import annotations
 
+import hashlib
 import importlib
 import importlib.metadata as importlib_metadata
+import json
 from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass, field
 from types import ModuleType
@@ -24,6 +26,8 @@ from dayu.contracts import (
 
 _IMPORT_PATH_SEPARATOR = ":"
 _ATTRIBUTE_PATH_SEPARATOR = "."
+_CONTENT_DIGEST_PREFIX = "sha256:"
+_RESERVED_FRAMEWORK_TOOL_NAMES: frozenset[str] = frozenset({"fetch_more"})
 
 
 class ToolsDiscoveryError(ValueError):
@@ -238,18 +242,23 @@ class ToolsDiscovery:
                 spec=binding.spec,
                 output=output,
             )
+            _validate_reserved_tool_names(output.definitions)
+            normalized_source_refs = _normalize_source_refs_with_digest(
+                source_refs=output.source_refs,
+                content_digest=_tool_definitions_digest(output.definitions),
+            )
             tool_names = tuple(definition.name for definition in output.definitions)
             reports.append(
                 ToolsDiscoveryProviderReport(
                     provider_id=provider_id,
                     spec_id=binding.spec.spec_id,
                     version_ref=output.version_ref,
-                    source_refs=output.source_refs,
+                    source_refs=normalized_source_refs,
                     tool_names=tool_names,
                 )
             )
             definitions.extend(output.definitions)
-            source_refs.extend(output.source_refs)
+            source_refs.extend(normalized_source_refs)
         _validate_unique_tool_names(tuple(definitions))
         return ToolsDiscoveryResult(
             tool_bundle=ToolBundle(definitions=tuple(definitions)),
@@ -378,6 +387,192 @@ def _require_callable(candidate: _ProviderCandidate, *, source: str) -> ToolsDis
     return cast(ToolsDiscoveryProviderCallable, candidate)
 
 
+def _tool_definitions_digest(definitions: tuple[ToolDefinition, ...]) -> str:
+    """计算 provider 工具声明内容摘要。
+
+    摘要只覆盖工具声明内容：工具名、LLM-facing schema、截断声明、标签与
+    展示 metadata。它不包含 callable 引用、模块路径对象身份、权限、lease、
+    fencing、Host truth 或 owner 信息；仅用于解释、诊断、trace、audit 与
+    后续 snapshot refs。
+
+    :param definitions: provider 按声明顺序返回的工具定义。
+    :returns: ``sha256:<hex>`` 形式的稳定内容摘要。
+    :raises TypeError: 声明中的 JSON 值无法规范化时抛出。
+    :raises ValueError: 声明中的浮点数不是合法 JSON number 时抛出。
+    """
+
+    tools: list[JsonValue] = [
+        _tool_definition_json_value(definition) for definition in definitions
+    ]
+    payload: dict[str, JsonValue] = {"tools": tools}
+    return _canonical_json_digest(payload)
+
+
+def _normalize_source_refs_with_digest(
+    *,
+    source_refs: tuple[ToolBundleSourceRef, ...],
+    content_digest: str,
+) -> tuple[ToolBundleSourceRef, ...]:
+    """把 provider 来源引用规范化为统一计算的内容摘要。
+
+    provider 可以返回已有 ``content_digest``，但 discovery 是声明摘要真源，
+    因此这里总是以本次 provider 声明内容重新计算的摘要替换。
+
+    :param source_refs: provider 返回的来源引用。
+    :param content_digest: discovery 计算出的 provider 声明摘要。
+    :returns: 保留来源类别、来源标识与版本引用的新来源引用元组。
+    :raises ValueError: 来源引用字段非法时由 ``ToolBundleSourceRef`` 抛出。
+    """
+
+    return tuple(
+        ToolBundleSourceRef(
+            source_kind=source_ref.source_kind,
+            source_id=source_ref.source_id,
+            version_ref=source_ref.version_ref,
+            content_digest=content_digest,
+        )
+        for source_ref in source_refs
+    )
+
+
+def _tool_definition_json_value(definition: ToolDefinition) -> JsonValue:
+    """把工具声明投影为用于 digest 的 JSON 值。
+
+    :param definition: 工具定义。
+    :returns: 不包含 callable 的工具声明 JSON 投影。
+    :raises Exception: 不主动抛出异常。
+    """
+
+    value: dict[str, JsonValue] = {
+        "name": definition.name,
+        "schema": _tool_schema_json_value(definition),
+        "truncate": _tool_truncate_json_value(definition),
+        "tags": list(definition.tags),
+        "display": (
+            definition.display.name
+            if definition.display is not None
+            else None
+        ),
+    }
+    return value
+
+
+def _tool_schema_json_value(definition: ToolDefinition) -> JsonValue:
+    """把 LLM-facing schema 投影为用于 digest 的 JSON 值。
+
+    :param definition: 工具定义。
+    :returns: schema JSON 投影。
+    :raises Exception: 不主动抛出异常。
+    """
+
+    schema = definition.schema
+    function = schema.function
+    parameters = function.parameters
+    value: dict[str, JsonValue] = {
+        "type": schema.type,
+        "function": {
+            "name": function.name,
+            "description": function.description,
+            "parameters": {
+                "type": parameters.type,
+                "properties": _normalize_json_value(parameters.properties),
+                "required": list(parameters.required),
+                "additional_properties": parameters.additional_properties,
+            },
+        },
+    }
+    return value
+
+
+def _tool_truncate_json_value(definition: ToolDefinition) -> JsonValue:
+    """把截断声明投影为用于 digest 的 JSON 值。
+
+    :param definition: 工具定义。
+    :returns: 截断声明 JSON 投影；未声明截断时为 ``None``。
+    :raises Exception: 不主动抛出异常。
+    """
+
+    truncate = definition.truncate
+    if truncate is None:
+        return None
+    value: dict[str, JsonValue] = {
+        "enabled": truncate.enabled,
+        "strategy": (
+            truncate.strategy.value
+            if truncate.strategy is not None
+            else None
+        ),
+        "limits": _int_mapping_json_value(truncate.limits),
+        "target_field": truncate.target_field,
+        "field_path": (
+            list(truncate.field_path)
+            if truncate.field_path is not None
+            else None
+        ),
+        "ttl_seconds": truncate.ttl_seconds,
+    }
+    return value
+
+
+def _int_mapping_json_value(values: Mapping[str, int]) -> JsonValue:
+    """把整数映射投影为 JSON object。
+
+    :param values: 字符串到整数的映射。
+    :returns: JSON object 投影。
+    :raises Exception: 不主动抛出异常。
+    """
+
+    result: dict[str, JsonValue] = {}
+    for key, value in values.items():
+        result[key] = value
+    return result
+
+
+def _canonical_json_digest(value: JsonValue) -> str:
+    """对 JSON 值计算 canonical SHA-256 摘要。
+
+    本 helper 只依赖 stdlib ``json`` 与 ``hashlib``，不复用 Host durable
+    codec，避免 runtime 反向依赖 Host。
+
+    :param value: 待摘要的 JSON 值。
+    :returns: ``sha256:<hex>`` 形式的摘要。
+    :raises TypeError: JSON 值中包含无法序列化的值时抛出。
+    :raises ValueError: JSON 值中包含 NaN 或无穷浮点数时抛出。
+    """
+
+    normalized = _normalize_json_value(value)
+    payload = json.dumps(
+        normalized,
+        sort_keys=True,
+        separators=(",", ":"),
+        ensure_ascii=False,
+        allow_nan=False,
+    ).encode("utf-8")
+    return _CONTENT_DIGEST_PREFIX + hashlib.sha256(payload).hexdigest()
+
+
+def _normalize_json_value(value: JsonValue) -> JsonValue:
+    """把 ``JsonValue`` 递归转换为 stdlib ``json`` 可稳定处理的结构。
+
+    :param value: 待规范化的 JSON 值。
+    :returns: 只包含 JSON 基本类型、``list`` 与 ``dict`` 的值。
+    :raises TypeError: 输入不是合法 ``JsonValue`` 形态时抛出。
+    """
+
+    if value is None or isinstance(value, (bool, int, float, str)):
+        return value
+    if isinstance(value, list):
+        return [_normalize_json_value(item) for item in value]
+    if isinstance(value, Mapping):
+        result: dict[str, JsonValue] = {}
+        for key, item in value.items():
+            if not isinstance(key, str):
+                raise TypeError("JsonValue object key must be str")
+            result[key] = _normalize_json_value(item)
+        return result
+    raise TypeError("JsonValue contains unsupported value")
+
+
 def _validate_provider_output(
     *,
     spec: ToolsDiscoveryProviderSpec,
@@ -415,6 +610,25 @@ def _validate_unique_tool_names(definitions: tuple[ToolDefinition, ...]) -> None
         if definition.name in names:
             raise ToolsDiscoveryError(f"duplicate tool name: {definition.name}")
         names.add(definition.name)
+
+
+def _validate_reserved_tool_names(definitions: tuple[ToolDefinition, ...]) -> None:
+    """校验业务工具未占用 framework 预留名称。
+
+    ``ToolsDiscovery`` 只做 runtime assembly 阶段的业务工具声明校验，不注入
+    framework tool，也不改变 ToolRuntime accept barrier。
+
+    :param definitions: provider 返回的工具定义。
+    :returns: 无返回值。
+    :raises ToolsDiscoveryError: 业务工具名占用 framework 预留名称时抛出。
+    """
+
+    for definition in definitions:
+        if definition.name in _RESERVED_FRAMEWORK_TOOL_NAMES:
+            raise ToolsDiscoveryError(
+                "business tool name is reserved for framework tool:"
+                f" {definition.name}"
+            )
 
 
 def _require_provider_identity(provider_id: str) -> str:
