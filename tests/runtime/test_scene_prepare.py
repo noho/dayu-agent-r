@@ -1,0 +1,592 @@
+"""``dayu.runtime.scene_prepare`` scene 装配测试。"""
+
+from __future__ import annotations
+
+import json
+from collections.abc import Mapping
+from pathlib import Path
+from typing import cast
+
+import pytest
+
+from dayu.contracts import JsonValue
+from dayu.runtime.scene_prepare import (
+    PreparedSceneInputs,
+    ScenePrepareError,
+    ScenePrepareRequest,
+    SceneSourceKind,
+    SceneToolCatalog,
+    SceneToolInfo,
+    prepare_scene,
+)
+
+
+def _write_json(path: Path, value: JsonValue) -> None:
+    """写入 JSON fixture。
+
+    :param path: 目标路径。
+    :param value: JSON 值。
+    :returns: ``None``。
+    :raises OSError: 文件写入失败时抛出。
+    """
+
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(json.dumps(value, ensure_ascii=False, indent=2), encoding="utf-8")
+
+
+def _write_text(path: Path, value: str) -> None:
+    """写入文本 fixture。
+
+    :param path: 目标路径。
+    :param value: 文本内容。
+    :returns: ``None``。
+    :raises OSError: 文件写入失败时抛出。
+    """
+
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(value, encoding="utf-8")
+
+
+def _fragment(
+    fragment_id: str,
+    path: str,
+    order: int,
+    *,
+    required: bool = True,
+) -> dict[str, JsonValue]:
+    """构造 fragment manifest 记录。
+
+    :param fragment_id: fragment id。
+    :param path: 相对 prompt asset root 的路径。
+    :param order: 拼接顺序。
+    :param required: 是否必需。
+    :returns: fragment JSON object。
+    """
+
+    return {
+        "id": fragment_id,
+        "path": path,
+        "order": order,
+        "required": required,
+    }
+
+
+def _slot(name: str, *, required: bool = True) -> dict[str, JsonValue]:
+    """构造 context slot manifest 记录。
+
+    :param name: slot 名称。
+    :param required: 是否必需。
+    :returns: context slot JSON object。
+    """
+
+    return {
+        "name": name,
+        "value_type": "string",
+        "required": required,
+    }
+
+
+def _manifest(
+    scene_id: str,
+    *,
+    extends: list[JsonValue] | None = None,
+    model_is_null: bool = False,
+    model: JsonValue | None = None,
+    runtime: JsonValue | None = None,
+    conversation: JsonValue | None = None,
+    tool_selection: JsonValue | None = None,
+    fragments: list[JsonValue] | None = None,
+    context_slots: list[JsonValue] | None = None,
+    capability_tags: list[JsonValue] | None = None,
+) -> dict[str, JsonValue]:
+    """构造完整 scene manifest JSON object。
+
+    :param scene_id: scene id。
+    :param extends: 父 scene id 数组。
+    :param model_is_null: 是否显式写入 JSON null 的 model 字段。
+    :param model: model hint 字段。
+    :param runtime: runtime hint 字段。
+    :param conversation: conversation hint 字段。
+    :param tool_selection: tool selection 字段。
+    :param fragments: fragments 字段。
+    :param context_slots: context slots 字段。
+    :param capability_tags: capability tags 字段。
+    :returns: manifest JSON object。
+    """
+
+    return {
+        "schema_version": 1,
+        "scene": scene_id,
+        "version": "v1",
+        "description": f"{scene_id} test scene",
+        "capability_tags": [] if capability_tags is None else capability_tags,
+        "extends": [] if extends is None else extends,
+        "model": (
+            None
+            if model_is_null
+            else {"default_name": "analyst-model"} if model is None else model
+        ),
+        "runtime": (
+            {
+                "runner_hint_id": "analytical",
+                "agent_hint_id": "default-agent",
+            }
+            if runtime is None
+            else runtime
+        ),
+        "conversation": {"mode": "ordinary"} if conversation is None else conversation,
+        "tool_selection": (
+            {"mode": "all", "tool_names": [], "tool_tags_any": [], "allow_empty": False}
+            if tool_selection is None
+            else tool_selection
+        ),
+        "defaults": {"missing_required_fragment": "fail_closed"},
+        "fragments": [] if fragments is None else fragments,
+        "context_slots": [] if context_slots is None else context_slots,
+    }
+
+
+def _request(
+    tmp_path: Path,
+    scene_id: str,
+    *,
+    context_slot_values: Mapping[str, str] | None = None,
+    tools: tuple[SceneToolInfo, ...] = (),
+) -> ScenePrepareRequest:
+    """构造 ScenePrepareRequest。
+
+    :param tmp_path: pytest 临时目录。
+    :param scene_id: scene id。
+    :param context_slot_values: context slot values。
+    :param tools: 可用工具目录。
+    :returns: ScenePrepare 请求。
+    """
+
+    return ScenePrepareRequest(
+        scene_id=scene_id,
+        scene_manifest_root=tmp_path / "manifests",
+        prompt_asset_root=tmp_path / "prompts",
+        context_slot_values={} if context_slot_values is None else context_slot_values,
+        available_tools=SceneToolCatalog(tools=tools),
+    )
+
+
+def _prepare_single_scene(tmp_path: Path) -> PreparedSceneInputs:
+    """准备单 scene 成功装配 fixture。
+
+    :param tmp_path: pytest 临时目录。
+    :returns: 装配结果。
+    """
+
+    _write_text(
+        tmp_path / "prompts" / "base.md",
+        "你是{{company}}财报分析员。",
+    )
+    _write_text(
+        tmp_path / "prompts" / "detail.md",
+        "分析{{company}}在{{fiscal_year}}年的收入。",
+    )
+    _write_json(
+        tmp_path / "manifests" / "earnings.json",
+        _manifest(
+            "earnings",
+            fragments=[
+                _fragment("base", "base.md", 10),
+                _fragment("detail", "detail.md", 20),
+            ],
+            context_slots=[
+                _slot("company"),
+                _slot("fiscal_year"),
+            ],
+            capability_tags=["earnings", "analysis"],
+        ),
+    )
+    return prepare_scene(
+        _request(
+            tmp_path,
+            "earnings",
+            context_slot_values={
+                "company": "Dayu Corp",
+                "fiscal_year": "2026",
+            },
+        )
+    )
+
+
+def test_single_scene_assembly_outputs_stable_refs_and_digest(tmp_path: Path) -> None:
+    """单 scene 装配输出稳定 system messages、fragment refs、source refs 与 digest。"""
+
+    result = _prepare_single_scene(tmp_path)
+    repeated = prepare_scene(
+        _request(
+            tmp_path,
+            "earnings",
+            context_slot_values={
+                "company": "Dayu Corp",
+                "fiscal_year": "2026",
+            },
+        )
+    )
+
+    assert result.system_messages == (
+        "你是Dayu Corp财报分析员。",
+        "分析Dayu Corp在2026年的收入。",
+    )
+    assert tuple(ref.fragment_id for ref in result.fragment_refs) == ("base", "detail")
+    assert tuple(ref.relative_path for ref in result.fragment_refs) == (
+        "base.md",
+        "detail.md",
+    )
+    assert tuple(ref.source_kind for ref in result.source_refs) == (
+        SceneSourceKind.MANIFEST,
+        SceneSourceKind.FRAGMENT,
+        SceneSourceKind.FRAGMENT,
+        SceneSourceKind.ASSEMBLY_INPUT,
+    )
+    assert result.content_digest == repeated.content_digest
+    assert result.content_digest.startswith("sha256:")
+    assert result.capability_tags == ("earnings", "analysis")
+
+
+def test_required_context_slot_missing_fails_fast(tmp_path: Path) -> None:
+    """required context slot 缺失必须失败。"""
+
+    _prepare_single_scene(tmp_path)
+
+    with pytest.raises(ScenePrepareError, match="required context slot missing"):
+        prepare_scene(
+            _request(
+                tmp_path,
+                "earnings",
+                context_slot_values={"company": "Dayu Corp"},
+            )
+        )
+
+
+def test_unknown_placeholder_fails_fast(tmp_path: Path) -> None:
+    """fragment 出现未声明 placeholder 必须失败。"""
+
+    _write_text(tmp_path / "prompts" / "base.md", "未知{{unknown_slot}}")
+    _write_json(
+        tmp_path / "manifests" / "unknown.json",
+        _manifest(
+            "unknown",
+            fragments=[_fragment("base", "base.md", 1)],
+            context_slots=[_slot("company")],
+        ),
+    )
+
+    with pytest.raises(ScenePrepareError, match="unknown placeholder"):
+        prepare_scene(
+            _request(
+                tmp_path,
+                "unknown",
+                context_slot_values={"company": "Dayu Corp"},
+            )
+        )
+
+
+def test_non_string_context_slot_value_fails_fast(tmp_path: Path) -> None:
+    """外部错误传入非字符串 slot value 时必须失败。"""
+
+    _prepare_single_scene(tmp_path)
+    bad_values = cast(Mapping[str, str], {"company": "Dayu Corp", "fiscal_year": 2026})
+
+    with pytest.raises(ScenePrepareError, match="must be string"):
+        prepare_scene(
+            _request(
+                tmp_path,
+                "earnings",
+                context_slot_values=bad_values,
+            )
+        )
+
+
+def test_unresolved_placeholder_fails_fast(tmp_path: Path) -> None:
+    """渲染后残留未解析 placeholder 必须失败。"""
+
+    _write_text(tmp_path / "prompts" / "base.md", "残留{{ company")
+    _write_json(
+        tmp_path / "manifests" / "broken.json",
+        _manifest(
+            "broken",
+            fragments=[_fragment("base", "base.md", 1)],
+            context_slots=[_slot("company")],
+        ),
+    )
+
+    with pytest.raises(ScenePrepareError, match="unresolved placeholder"):
+        prepare_scene(
+            _request(
+                tmp_path,
+                "broken",
+                context_slot_values={"company": "Dayu Corp"},
+            )
+        )
+
+
+def test_single_inheritance_merges_parent_first_and_child_overrides(
+    tmp_path: Path,
+) -> None:
+    """单继承应父优先继承 slots，子追加 fragments，并覆盖 runtime/conversation/tool。"""
+
+    _write_text(tmp_path / "prompts" / "parent.md", "公司：{{company}}")
+    _write_text(tmp_path / "prompts" / "child.md", "日期：{{filing_date}}")
+    _write_json(
+        tmp_path / "manifests" / "base_scene.json",
+        _manifest(
+            "base_scene",
+            fragments=[_fragment("parent", "parent.md", 10)],
+            context_slots=[_slot("company")],
+            tool_selection={"mode": "all", "tool_names": [], "tool_tags_any": []},
+            capability_tags=["base"],
+        ),
+    )
+    _write_json(
+        tmp_path / "manifests" / "child_scene.json",
+        _manifest(
+            "child_scene",
+            extends=["base_scene"],
+            model={"default_name": "child-model"},
+            runtime={"runner_hint_id": "fast", "agent_hint_id": "strict"},
+            conversation={"mode": "followup"},
+            tool_selection={
+                "mode": "select",
+                "tool_names": ["quote_metric"],
+                "tool_tags_any": [],
+            },
+            fragments=[_fragment("child", "child.md", 20)],
+            context_slots=[_slot("company"), _slot("filing_date")],
+            capability_tags=["child"],
+        ),
+    )
+
+    result = prepare_scene(
+        _request(
+            tmp_path,
+            "child_scene",
+            context_slot_values={
+                "company": "Dayu Corp",
+                "filing_date": "2026-05-21",
+            },
+            tools=(SceneToolInfo(name="quote_metric"),),
+        )
+    )
+
+    assert result.system_messages == ("公司：Dayu Corp", "日期：2026-05-21")
+    assert tuple(ref.fragment_id for ref in result.fragment_refs) == (
+        "parent",
+        "child",
+    )
+    assert result.model_hints.default_name == "child-model"
+    assert result.runtime_hints.runner_hint_id == "fast"
+    assert result.runtime_hints.agent_hint_id == "strict"
+    assert result.conversation_hint.mode == "followup"
+    assert result.tool_selection.tool_names == frozenset({"quote_metric"})
+    assert result.capability_tags == ("base", "child")
+
+    with pytest.raises(ScenePrepareError, match="required context slot missing: company"):
+        prepare_scene(
+            _request(
+                tmp_path,
+                "child_scene",
+                context_slot_values={},
+                tools=(SceneToolInfo(name="quote_metric"),),
+            )
+        )
+
+
+def test_child_scene_must_explicitly_declare_model(tmp_path: Path) -> None:
+    """concrete 子 scene 不能从父 scene 隐式继承 model。"""
+
+    _write_text(tmp_path / "prompts" / "parent.md", "父")
+    _write_text(tmp_path / "prompts" / "child.md", "子")
+    _write_json(
+        tmp_path / "manifests" / "base_scene.json",
+        _manifest(
+            "base_scene",
+            fragments=[_fragment("parent", "parent.md", 10)],
+        ),
+    )
+    _write_json(
+        tmp_path / "manifests" / "child_scene.json",
+        _manifest(
+            "child_scene",
+            extends=["base_scene"],
+            model_is_null=True,
+            fragments=[_fragment("child", "child.md", 20)],
+        ),
+    )
+
+    with pytest.raises(ScenePrepareError, match="must declare model"):
+        prepare_scene(_request(tmp_path, "child_scene"))
+
+
+def test_multiple_inheritance_fails(tmp_path: Path) -> None:
+    """extends 多父项必须失败。"""
+
+    _write_json(
+        tmp_path / "manifests" / "child.json",
+        _manifest("child", extends=["left", "right"]),
+    )
+
+    with pytest.raises(ScenePrepareError, match="allows only one parent"):
+        prepare_scene(_request(tmp_path, "child"))
+
+
+def test_manifest_file_scene_id_mismatch_fails(tmp_path: Path) -> None:
+    """manifest 文件名和内部 scene id 不一致必须失败。"""
+
+    _write_json(
+        tmp_path / "manifests" / "requested.json",
+        _manifest("declared"),
+    )
+
+    with pytest.raises(ScenePrepareError, match="declares different scene"):
+        prepare_scene(_request(tmp_path, "requested"))
+
+
+def test_cycle_inheritance_fails(tmp_path: Path) -> None:
+    """scene 继承循环必须失败。"""
+
+    _write_json(
+        tmp_path / "manifests" / "a.json",
+        _manifest("a", extends=["b"]),
+    )
+    _write_json(
+        tmp_path / "manifests" / "b.json",
+        _manifest("b", extends=["a"]),
+    )
+
+    with pytest.raises(ScenePrepareError, match="cycle"):
+        prepare_scene(_request(tmp_path, "a"))
+
+
+def test_duplicate_fragment_id_and_order_fail(tmp_path: Path) -> None:
+    """fragment id 与 order 重复都必须失败。"""
+
+    _write_json(
+        tmp_path / "manifests" / "dup_id.json",
+        _manifest(
+            "dup_id",
+            fragments=[
+                _fragment("same", "a.md", 1),
+                _fragment("same", "b.md", 2),
+            ],
+        ),
+    )
+    with pytest.raises(ScenePrepareError, match="duplicate fragment id"):
+        prepare_scene(_request(tmp_path, "dup_id"))
+
+    _write_json(
+        tmp_path / "manifests" / "dup_order.json",
+        _manifest(
+            "dup_order",
+            fragments=[
+                _fragment("a", "a.md", 1),
+                _fragment("b", "b.md", 1),
+            ],
+        ),
+    )
+    with pytest.raises(ScenePrepareError, match="duplicate fragment order"):
+        prepare_scene(_request(tmp_path, "dup_order"))
+
+
+def test_fragment_path_escape_prompt_asset_root_fails(tmp_path: Path) -> None:
+    """fragment 路径解析后逃逸 prompt_asset_root 必须失败。"""
+
+    _write_json(
+        tmp_path / "manifests" / "escape.json",
+        _manifest(
+            "escape",
+            fragments=[_fragment("escape", "../outside.md", 1)],
+        ),
+    )
+
+    with pytest.raises(ScenePrepareError, match="escapes root"):
+        prepare_scene(_request(tmp_path, "escape"))
+
+
+def test_fragment_symlink_escape_prompt_asset_root_fails(tmp_path: Path) -> None:
+    """fragment 路径指向逃逸 root 的符号链接时必须失败。"""
+
+    outside_root = tmp_path / "outside"
+    _write_text(outside_root / "secret.md", "外部 fragment")
+    prompt_root = tmp_path / "prompts"
+    prompt_root.mkdir(parents=True, exist_ok=True)
+    (prompt_root / "linked.md").symlink_to(outside_root / "secret.md")
+    _write_json(
+        tmp_path / "manifests" / "symlink_escape.json",
+        _manifest(
+            "symlink_escape",
+            fragments=[_fragment("linked", "linked.md", 1)],
+        ),
+    )
+
+    with pytest.raises(ScenePrepareError, match="escapes root"):
+        prepare_scene(_request(tmp_path, "symlink_escape"))
+
+
+def test_required_fragment_missing_fails_closed(tmp_path: Path) -> None:
+    """required fragment 缺失时必须按 fail-closed 失败。"""
+
+    _write_json(
+        tmp_path / "manifests" / "missing_fragment.json",
+        _manifest(
+            "missing_fragment",
+            fragments=[_fragment("missing", "missing.md", 1)],
+        ),
+    )
+
+    with pytest.raises(ScenePrepareError, match="required fragment missing"):
+        prepare_scene(_request(tmp_path, "missing_fragment"))
+
+
+def test_optional_missing_fragment_is_skipped(tmp_path: Path) -> None:
+    """optional fragment 缺失时应跳过且不进入 messages 与 fragment refs。"""
+
+    _write_text(tmp_path / "prompts" / "base.md", "基础提示")
+    _write_json(
+        tmp_path / "manifests" / "optional_missing.json",
+        _manifest(
+            "optional_missing",
+            fragments=[
+                _fragment("base", "base.md", 1),
+                _fragment("optional_note", "optional_note.md", 2, required=False),
+            ],
+        ),
+    )
+
+    result = prepare_scene(_request(tmp_path, "optional_missing"))
+
+    assert result.system_messages == ("基础提示",)
+    assert tuple(ref.fragment_id for ref in result.fragment_refs) == ("base",)
+
+
+def test_inherited_duplicate_context_slot_keeps_parent_required_flag(
+    tmp_path: Path,
+) -> None:
+    """父子重复声明同名 slot 时必须保留父声明的 required 语义。"""
+
+    _write_text(tmp_path / "prompts" / "parent.md", "父提示")
+    _write_text(tmp_path / "prompts" / "child.md", "子提示")
+    _write_json(
+        tmp_path / "manifests" / "parent_required.json",
+        _manifest(
+            "parent_required",
+            fragments=[_fragment("parent", "parent.md", 1)],
+            context_slots=[_slot("company", required=True)],
+        ),
+    )
+    _write_json(
+        tmp_path / "manifests" / "child_optional.json",
+        _manifest(
+            "child_optional",
+            extends=["parent_required"],
+            fragments=[_fragment("child", "child.md", 2)],
+            context_slots=[_slot("company", required=False)],
+        ),
+    )
+
+    with pytest.raises(ScenePrepareError, match="required context slot missing: company"):
+        prepare_scene(_request(tmp_path, "child_optional"))
