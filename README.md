@@ -201,7 +201,7 @@ API Key 申请地址：
 - 本地 Ollama 模型和自定义 OpenAI 兼容 API 在 `init` 时会写入对应模型配置；Ollama 的 `write_chapter` 并发 lane 默认设为 2。
 - `--reset` 确认后会删除 `workspace/.dayu/`、`workspace/config/`、`workspace/assets/`，再按首次初始化流程重建；它比 `--overwrite` 更彻底，会一并清空运行时状态。
 - 联网搜索默认可走 `auto`，若配置了 Tavily / Serper，会优先使用对应 provider。
-- 若运行环境需要访问 `localhost`、私网 IP 或内网域名，可在 `workspace/config/run.json` 的 `web_tools_config.allow_private_network_url` 中显式打开内网访问开关。
+- 若运行环境需要访问 `localhost`、私网 IP 或内网域名，应在对应工具 provider 的配置中显式打开内网访问开关；当前 runtime config 不再读取旧 `run.json`。
 - 修改默认模型请参考 [8. 模型配置](#model-config)。
 
 工作区最重要的目录：
@@ -1003,19 +1003,22 @@ dayu-render workspace/draft/AAPL/AAPL_qual_report.md report.html
 
 ## 7. 配置文件从哪里改
 
-大多数用户只需要关注这三个位置：
+大多数用户只需要关注这几个位置：
 
 | 文件/目录 | 用途 |
 |-----------|------|
-| `workspace/config/llm_models.json` | 模型配置、API Key 占位符 |
-| `workspace/config/run.json` | Agent 行为、工具超时、budget 与 limits |
-| `workspace/config/prompts/` | prompt 资产 |
+| `workspace/config/models.json` | 模型目录、provider endpoint、API key 引用与模型能力 |
+| `workspace/config/execution_profiles.json` | Runner 调用参数、Agent policy、context budget、memory projection 与 truncation 基线 |
+| `workspace/config/host_runtime.json` | Host opener 部署默认值、store/artifact roots、SQLite、lane 与 prompt/scene asset roots |
+| `workspace/config/tool_discovery.json` | ToolsDiscovery provider specs |
+| `workspace/config/prompts/` | prompt fragments 与 scene manifests |
 
 建议修改方式：
-- 想换模型：改 `llm_models.json`
-- 想新增自定义模型：先在 `workspace/config/llm_models.json` 里添加模型配置；再把该模型加入对应 scene manifest 的 `workspace/config/prompts/manifests/*.json -> model.allowed_names`，必要时改 `model.default_name`
-- 想调 Agent 行为：改 `run.json` 中的运行参数、工具超时与工具 limits
-- 想改系统提示词和任务提示词：改 `prompts/`
+- 想新增或替换模型：改 `models.json`
+- 想调 Runner 参数或 Agent 行为：改 `execution_profiles.json`
+- 想调 Host store、lane 或 prompt/scene asset 根目录：改 `host_runtime.json`
+- 想配置工具发现来源：改 `tool_discovery.json`
+- 想改系统提示词和场景资产：改 `prompts/`
 
 配置说明请看：
 - [dayu/config/README.md](dayu/config/README.md)
@@ -1029,122 +1032,86 @@ dayu-render workspace/draft/AAPL/AAPL_qual_report.md report.html
 
 最常用的两个位置是：
 
-- `workspace/config/llm_models.json`：定义“有哪些模型可以用”
-- `workspace/config/prompts/manifests/*.json`：定义“每个场景默认用哪个模型”
+- `workspace/config/models.json`：定义“有哪些模型可以用”
+- `workspace/config/execution_profiles.json`：定义默认 execution profile 和 Runner / Agent 参数
+- `workspace/config/prompts/manifests/*.json`：定义场景的模型与 runtime hints
 
 ### 8.1 怎么修改默认模型
 
-每个场景都有自己的默认模型，配置在对应 scene manifest 里。
-
-最常改的几个文件：
-
-- `workspace/config/prompts/manifests/prompt.json`
-- `workspace/config/prompts/manifests/interactive.json`
-- `workspace/config/prompts/manifests/prompt_mt.json`
-- `workspace/config/prompts/manifests/write.json`
-- `workspace/config/prompts/manifests/audit.json`
-- `workspace/config/prompts/manifests/confirm.json`
-
-你主要看这一段：
+默认执行基线在 `execution_profiles.json` 的 `profiles.<id>.ordinary.model_id` 中选择模型；scene manifest 可以用 `model.default_name` 覆盖该基线。scene manifest 的稳定形态以 `dayu.runtime.scene_prepare` 当前 schema 为准，例如：
 
 ```json
 "model": {
-  "default_name": "mimo-v2.5-pro",
-  "allowed_names": [
-    "mimo-v2.5-pro",
-    "mimo-v2.5-pro",
-    "deepseek-v4-flash"
-  ],
-  "temperature_profile": "write"
+  "default_name": "deepseek-chat",
+  "temperature_profile": "analytical"
 }
 ```
 
-改默认模型时，通常只需要两步：
-
-1. 把 `default_name` 改成你想用的模型名
-2. 确认这个模型名已经出现在 `allowed_names` 里
-
-例如：
-
-- 想把 `write` 默认模型从 `mimo-v2.5-pro` 改成 `gpt-5.4`，就改 `workspace/config/prompts/manifests/write.json`
-- 想把 `interactive` 默认模型改成 `qwen-plus-thinking`，就改 `workspace/config/prompts/manifests/interactive.json`
-- 想把 `audit` / `confirm` 默认模型换掉，就分别改 `audit.json` 和 `confirm.json`
-
 一个简单理解：
 
-- `default_name`：这个场景默认会用谁
-- `allowed_names`：这个场景允许切换到哪些模型
-- `temperature_profile`：这个场景默认使用哪组温度参数，一般不用改
+- `models.json` 定义模型能力和 provider 请求基础参数。
+- `execution_profiles.json` 定义默认 profile、Runner options profile 和 Agent policy profile。
+- scene manifest 只表达场景 hint；Service / composition root 负责把 hint 和 ConfigLoader 输出映射为完整 typed execution inputs。
 
 ### 8.2 怎么添加新模型
 
-如果现有模型不够用，你可以自己往 `workspace/config/llm_models.json` 里加一个新条目。
+如果现有模型不够用，你可以自己往 `workspace/config/models.json` 里加一个新条目。
 
 最简单的做法是：
 
 1. 先复制一个最接近的现有模型配置
 2. 改模型名、接口地址、鉴权头和能力参数
-3. 再把这个模型名加入对应 scene manifest 的 `allowed_names`
-4. 如果希望它成为默认模型，再修改 `default_name`
+3. 如果希望它成为默认模型，再修改 `execution_profiles.json` 的 ordinary model id 或对应 scene manifest 的 `model.default_name`
 
 例如，你可以复制一段现有配置，改成这样：
 
 ```json
-"my-model": {
-  "runner_type": "openai_compatible",
-  "name": "my-model",
-  "endpoint_url": "https://api.example.com/v1/chat/completions",
-  "model": "my-model",
-  "headers": {
-    "Authorization": "Bearer {{MY_API_KEY}}",
-    "Content-Type": "application/json"
-  },
-  "timeout": 3600,
-  "supports_stream": true,
-  "supports_tool_calling": true,
-  "max_context_tokens": 128000,
-  "runtime_hints": {
-    "temperature_profiles": {
-      "write": {
-        "temperature": 0.8
+{
+  "models": {
+    "my-model": {
+      "model_id": "my-model",
+      "runner_kind": "openai_compatible",
+      "provider": "example",
+      "model": "my-model",
+      "endpoint": "https://api.example.com/v1/chat/completions",
+      "api_key_ref": "MY_API_KEY",
+      "headers": {
+        "Authorization": "Bearer ${MY_API_KEY}",
+        "Content-Type": "application/json"
       },
-      "audit": {
-        "temperature": 0.2
-      }
+      "supports_tool_calling": true,
+      "supports_stream": true,
+      "supports_stream_usage": true,
+      "default_timeout_seconds": 3600.0,
+      "max_retries": 2,
+      "sse_idle_timeout_seconds": 120.0,
+      "sse_heartbeat_seconds": 10.0,
+      "provider_request_extension": null,
+      "context_window_tokens": 128000
     }
   }
 }
 ```
 
-加完之后，再去对应 scene manifest，例如 `workspace/config/prompts/manifests/write.json`，把 `"my-model"` 加进 `allowed_names`。如果你想让它直接成为默认模型，再把 `default_name` 改成 `"my-model"`。
+ConfigLoader 不解析 `${MY_API_KEY}`，也不替换 secret；这些字符串会原样进入 typed config view。
 
 ### 8.3 模型参数怎么理解
 
 对最终用户来说，下面这些参数最重要：
 
-- `name`：配置名。你在 `--model-name`、`default_name`、`allowed_names` 里写的就是它。
-- `endpoint_url`：模型服务地址。
+- `model_id`：配置名。你在 `--model-name`、execution profile 或 scene hint 里写的就是它。
+- `endpoint`：模型服务地址。
 - `model`：真正发给服务商的模型标识。
-- `headers`：鉴权和请求头，通常在这里放 API Key 占位符。
-- `timeout`：单次请求超时时间，单位秒。
+- `api_key_ref`：API key 引用名。
+- `headers`：鉴权和请求头，按配置原样保留。
+- `default_timeout_seconds`：单次请求默认超时时间，单位秒。
 - `supports_stream`：是否支持流式输出。
 - `supports_tool_calling`：是否支持工具调用。用于 `prompt`、`interactive`、`write` 的模型通常需要支持。
-- `max_context_tokens`：模型可用上下文上限。
+- `supports_stream_usage`：流式输出是否支持 usage。
+- `context_window_tokens`：模型可用上下文上限。
+- `provider_request_extension`：provider 私有扩展，按 JSON 原样保留。
 
-`runtime_hints.temperature_profiles` 里最常看到的是 `temperature`：
-
-- `temperature` 越低，输出通常越稳、更保守
-- `temperature` 越高，输出通常越发散、更有变化
-
-通常可以这样理解：
-
-- `write`：正文写作时的参数
-- `overview`：第 0 章概览时的参数
-- `audit`：审计场景的参数
-- `decision`：第 10 章研究决策场景的参数
-- `prompt`：单轮问答场景的参数
-- `interactive`：交互对话场景的参数
-- `infer`：公司类型与关键约束判断场景的参数
+temperature、max tokens、top-p 和 stream 属于 `execution_profiles.json` 的 `runner_options_profiles`，不属于 `models.json`。
 
 如果你只是新增一个模型，最稳的办法不是从零设计全部参数，而是复制一个相近模型，再按你的服务商要求做最小改动。
 
@@ -1153,8 +1120,8 @@ dayu-render workspace/draft/AAPL/AAPL_qual_report.md report.html
 如果你准备调整模型配置，建议按这个顺序来：
 
 1. 先临时用 `--model-name` 试跑
-2. 满意后再改 scene manifest 的 `default_name`
-3. 如果现有模型都不合适，再去 `llm_models.json` 新增模型
+2. 满意后再改 execution profile 或 scene manifest 的默认模型 hint
+3. 如果现有模型都不合适，再去 `models.json` 新增模型
 
 这样做的好处是：
 

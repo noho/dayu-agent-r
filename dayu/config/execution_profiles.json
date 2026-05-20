@@ -1,0 +1,84 @@
+{
+  "default_profile_id": "ordinary",
+  "profiles": {
+    "ordinary": {
+      "extends": null,
+      "profile_id": "ordinary",
+      "ordinary": {
+        "model_id": "deepseek-chat",
+        "runner_options_profile_id": "analytical",
+        "agent_policy_profile_id": "default-agent"
+      },
+      "compactor": {
+        "model_id": "deepseek-chat",
+        "runner_options_profile_id": "compact",
+        "artifact_root": "workspace/.dayu/artifacts/compaction"
+      },
+      "context_budget": {
+        "max_context_tokens": 64000,
+        "reserved_response_tokens": 4096,
+        "compaction_trigger_tokens": 56000
+      },
+      "memory_projection": {
+        "enabled": true,
+        "stable_layer_max_items": 200,
+        "history_pool_max_items": 1200
+      },
+      "truncation": {
+        "enabled": true,
+        "default_max_chars": 12000,
+        "fetch_more_tool_name": "fetch_more"
+      }
+    }
+  },
+  "runner_options_profiles": {
+    "analytical": {
+      "extends": null,
+      "temperature": 0.2,
+      "max_tokens": 4096,
+      "top_p": 0.9,
+      "stream": true
+    },
+    "compact": {
+      "extends": null,
+      "temperature": 0.0,
+      "max_tokens": 2048,
+      "top_p": 1.0,
+      "stream": false
+    }
+  },
+  "agent_policy_profiles": {
+    "default-agent": {
+      "extends": null,
+      "max_iterations": 24,
+      "continuation_attempts": 2,
+      "tool_execution_timeout_seconds": 120.0,
+      "fallback_mode": "finalize",
+      "fallback_prompt": "请基于已获得证据给出可审计结论。",
+      "continuation_prompt": "继续完成当前财报分析任务。",
+      "consecutive_failed_tool_batches": 2
+    }
+  },
+  "runner_hints": {
+    "low_latency": {
+      "extends": null,
+      "model_id": "deepseek-chat",
+      "runner_options_profile_id": "analytical",
+      "max_tokens": 2048,
+      "stream": true
+    },
+    "reasoning": {
+      "extends": null,
+      "model_id": "deepseek-reasoner",
+      "temperature": 0.1
+    }
+  },
+  "agent_hints": {
+    "strict": {
+      "extends": null,
+      "agent_policy_profile_id": "default-agent",
+      "max_iterations": 12,
+      "tool_execution_timeout_seconds": 60.0
+    }
+  }
+}

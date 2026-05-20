@@ -101,6 +101,13 @@ def test_runtime_import_boundary_scan_covers_filelock_module() -> None:
     assert "filelock.py" in scanned_names
 
 
+def test_runtime_import_boundary_scan_covers_config_loader_module() -> None:
+    """runtime import 边界扫描必须覆盖 ``config_loader.py``。"""
+
+    scanned_names = {file_path.name for file_path in _iter_python_files()}
+    assert "config_loader.py" in scanned_names
+
+
 def test_runtime_does_not_import_phase0_forbidden_modules() -> None:
     """Phase 0 暂时禁止的运行期模块不得被 ``dayu.runtime`` 导入。"""
 

@@ -34,7 +34,7 @@ UI -> Service -> Host -> Engine
 
 依赖只能沿 `UI -> Service -> Host -> Engine` 向下发生。Engine 不读取 Host durable store，不管理 Session / Run / Attempt；Host 不承载财报业务语义，不直接管理财报原文仓储规则；Service 不绕过 Host 直接控制 Engine。
 
-`dayu.runtime` 是层中立运行期基础设施包，不属于上述任一业务层。它只能承载日志、取消等待、cross-process lane、同步 filelock wrapper、工具发现装配等通用运行期能力，不持有 Host truth、业务语义或 Engine 协议状态机。
+`dayu.runtime` 是层中立运行期基础设施包，不属于上述任一业务层。它只能承载日志、取消等待、cross-process lane、同步 filelock wrapper、工具发现装配、配置加载等通用运行期能力，不持有 Host truth、业务语义或 Engine 协议状态机。
 
 ## 稳定边界
 
@@ -71,6 +71,7 @@ Host-owned LLM compaction 通过 `OpenHostOptions` 的预算治理配置与 `Com
 - `lane`：cross-process named semaphore / capacity guard，只表达 runtime capacity claim，不表达 Host admission、lease、fencing、Attempt owner、EventLog ordering 或 recovery proof。
 - `filelock`：第三方 `FileLock` 的同步 wrapper，只用于普通文件访问互斥，不替代 SQLite transaction、EventLog 顺序或 Host 状态机。
 - `tools_discovery`：按显式 import path 或 package entry point 解析 provider callable，聚合 provider 输出为业务 `ToolBundle`、provider report 与 source refs；不扫描业务包，不持有 Host / Service 上下文。
+- `config_loader`：读取包内默认配置和调用方显式传入的 workspace 覆盖目录，输出 `models`、`execution_profiles`、`host_runtime` 与 `tool_discovery` 四类 typed config view；不构造 Host，不创建 provider client，不解释 scene manifest，不解析 secret。
 
 ### `dayu.fins`
 

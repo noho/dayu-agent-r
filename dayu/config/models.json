@@ -1,0 +1,38 @@
+{
+  "models": {
+    "deepseek-chat": {
+      "extends": null,
+      "model_id": "deepseek-chat",
+      "runner_kind": "openai_compatible",
+      "provider": "deepseek",
+      "model": "deepseek-chat",
+      "endpoint": "https://api.deepseek.com/chat/completions",
+      "api_key_ref": "DEEPSEEK_API_KEY",
+      "headers": {
+        "Authorization": "Bearer ${DEEPSEEK_API_KEY}",
+        "Content-Type": "application/json"
+      },
+      "supports_tool_calling": true,
+      "supports_stream": true,
+      "supports_stream_usage": true,
+      "default_timeout_seconds": 3600.0,
+      "max_retries": 2,
+      "sse_idle_timeout_seconds": 120.0,
+      "sse_heartbeat_seconds": 10.0,
+      "provider_request_extension": {
+        "type": "deepseek_thinking",
+        "enabled": false
+      },
+      "context_window_tokens": 128000
+    },
+    "deepseek-reasoner": {
+      "extends": "deepseek-chat",
+      "model_id": "deepseek-reasoner",
+      "model": "deepseek-reasoner",
+      "provider_request_extension": {
+        "type": "deepseek_thinking",
+        "enabled": true
+      }
+    }
+  }
+}
