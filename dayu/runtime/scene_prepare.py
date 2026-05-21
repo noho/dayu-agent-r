@@ -19,6 +19,7 @@ from pathlib import Path
 from typing import Final, TypeAlias, TypeVar, cast
 
 from dayu.contracts import JsonValue, ToolBundle
+from dayu.runtime._digest import canonical_json_digest
 
 _SCHEMA_VERSION: Final[int] = 1
 _SCENE_FILE_SUFFIX: Final[str] = ".json"
@@ -1056,7 +1057,7 @@ def _build_source_refs(
                 source_kind=SceneSourceKind.MANIFEST,
                 source_id=manifest.relative_manifest_path,
                 version_ref=manifest.version,
-                content_digest=_canonical_json_digest(manifest.raw),
+                content_digest=canonical_json_digest(manifest.raw),
             )
         )
     for fragment, content in fragment_contents:
@@ -1119,7 +1120,7 @@ def _prepared_scene_digest(
             else _text_sequence_json(tuple(sorted(tool_selection.tool_names)))
         ),
     }
-    return _canonical_json_digest(payload)
+    return canonical_json_digest(payload)
 
 
 def _assembly_input_digest(request: ScenePrepareRequest) -> str:
@@ -1134,7 +1135,7 @@ def _assembly_input_digest(request: ScenePrepareRequest) -> str:
         "context_slot_values": _sorted_text_mapping_json(request.context_slot_values),
         "available_tools": _tool_catalog_json(request.available_tools),
     }
-    return _canonical_json_digest(payload)
+    return canonical_json_digest(payload)
 
 
 def _tool_catalog_json(catalog: SceneToolCatalog) -> JsonValue:
@@ -1186,25 +1187,6 @@ def _sorted_text_mapping_json(values: Mapping[str, str]) -> JsonValue:
     return result
 
 
-def _canonical_json_digest(value: JsonValue) -> str:
-    """计算 JSON 值的稳定摘要。
-
-    :param value: JSON 值。
-    :returns: ``sha256:<hex>`` 摘要。
-    :raises TypeError: 输入不是合法 JSON 形态时抛出。
-    """
-
-    normalized = _normalize_json_value(value)
-    payload = json.dumps(
-        normalized,
-        ensure_ascii=False,
-        sort_keys=True,
-        separators=(",", ":"),
-        allow_nan=False,
-    )
-    return _text_digest(payload)
-
-
 def _text_digest(value: str) -> str:
     """计算文本 SHA-256 摘要。
 
@@ -1213,28 +1195,6 @@ def _text_digest(value: str) -> str:
     """
 
     return _DIGEST_PREFIX + hashlib.sha256(value.encode("utf-8")).hexdigest()
-
-
-def _normalize_json_value(value: JsonValue) -> JsonValue:
-    """把 ``JsonValue`` 递归转换为稳定 JSON 结构。
-
-    :param value: JSON 值。
-    :returns: 规范化 JSON 值。
-    :raises TypeError: 输入不是合法 JSON 形态时抛出。
-    """
-
-    if value is None or isinstance(value, (str, int, float, bool)):
-        return value
-    if isinstance(value, list):
-        return [_normalize_json_value(item) for item in value]
-    if isinstance(value, Mapping):
-        result: dict[str, JsonValue] = {}
-        for key in sorted(value.keys()):
-            if not isinstance(key, str):
-                raise TypeError("JsonValue object key must be str")
-            result[key] = _normalize_json_value(value[key])
-        return result
-    raise TypeError("JsonValue contains unsupported value")
 
 
 def _resolve_contained_path(*, root: Path, relative_path: str, context: str) -> Path:

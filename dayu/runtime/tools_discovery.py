@@ -8,10 +8,8 @@ Engine / Service / UI / Fins / 具体业务工具包，也不把 provider callab
 
 from __future__ import annotations
 
-import hashlib
 import importlib
 import importlib.metadata as importlib_metadata
-import json
 from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass, field
 from types import ModuleType
@@ -23,10 +21,10 @@ from dayu.contracts import (
     ToolBundleSourceRef,
     ToolDefinition,
 )
+from dayu.runtime._digest import canonical_json_digest, normalize_json_value
 
 _IMPORT_PATH_SEPARATOR = ":"
 _ATTRIBUTE_PATH_SEPARATOR = "."
-_CONTENT_DIGEST_PREFIX = "sha256:"
 _RESERVED_FRAMEWORK_TOOL_NAMES: frozenset[str] = frozenset({"fetch_more"})
 
 
@@ -405,7 +403,7 @@ def _tool_definitions_digest(definitions: tuple[ToolDefinition, ...]) -> str:
         _tool_definition_json_value(definition) for definition in definitions
     ]
     payload: dict[str, JsonValue] = {"tools": tools}
-    return _canonical_json_digest(payload)
+    return canonical_json_digest(payload)
 
 
 def _normalize_source_refs_with_digest(
@@ -475,7 +473,7 @@ def _tool_schema_json_value(definition: ToolDefinition) -> JsonValue:
             "description": function.description,
             "parameters": {
                 "type": parameters.type,
-                "properties": _normalize_json_value(parameters.properties),
+                "properties": normalize_json_value(parameters.properties),
                 "required": list(parameters.required),
                 "additional_properties": parameters.additional_properties,
             },
@@ -526,51 +524,6 @@ def _int_mapping_json_value(values: Mapping[str, int]) -> JsonValue:
     for key, value in values.items():
         result[key] = value
     return result
-
-
-def _canonical_json_digest(value: JsonValue) -> str:
-    """对 JSON 值计算 canonical SHA-256 摘要。
-
-    本 helper 只依赖 stdlib ``json`` 与 ``hashlib``，不复用 Host durable
-    codec，避免 runtime 反向依赖 Host。
-
-    :param value: 待摘要的 JSON 值。
-    :returns: ``sha256:<hex>`` 形式的摘要。
-    :raises TypeError: JSON 值中包含无法序列化的值时抛出。
-    :raises ValueError: JSON 值中包含 NaN 或无穷浮点数时抛出。
-    """
-
-    normalized = _normalize_json_value(value)
-    payload = json.dumps(
-        normalized,
-        sort_keys=True,
-        separators=(",", ":"),
-        ensure_ascii=False,
-        allow_nan=False,
-    ).encode("utf-8")
-    return _CONTENT_DIGEST_PREFIX + hashlib.sha256(payload).hexdigest()
-
-
-def _normalize_json_value(value: JsonValue) -> JsonValue:
-    """把 ``JsonValue`` 递归转换为 stdlib ``json`` 可稳定处理的结构。
-
-    :param value: 待规范化的 JSON 值。
-    :returns: 只包含 JSON 基本类型、``list`` 与 ``dict`` 的值。
-    :raises TypeError: 输入不是合法 ``JsonValue`` 形态时抛出。
-    """
-
-    if value is None or isinstance(value, (bool, int, float, str)):
-        return value
-    if isinstance(value, list):
-        return [_normalize_json_value(item) for item in value]
-    if isinstance(value, Mapping):
-        result: dict[str, JsonValue] = {}
-        for key, item in value.items():
-            if not isinstance(key, str):
-                raise TypeError("JsonValue object key must be str")
-            result[key] = _normalize_json_value(item)
-        return result
-    raise TypeError("JsonValue contains unsupported value")
 
 
 def _validate_provider_output(
