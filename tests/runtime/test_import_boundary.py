@@ -115,6 +115,13 @@ def test_runtime_import_boundary_scan_covers_scene_prepare_module() -> None:
     assert "scene_prepare.py" in scanned_names
 
 
+def test_runtime_import_boundary_scan_covers_tools_discovery_module() -> None:
+    """runtime import 边界扫描必须覆盖 ``tools_discovery.py``。"""
+
+    scanned_names = {file_path.name for file_path in _iter_python_files()}
+    assert "tools_discovery.py" in scanned_names
+
+
 def test_runtime_does_not_import_phase0_forbidden_modules() -> None:
     """Phase 0 暂时禁止的运行期模块不得被 ``dayu.runtime`` 导入。"""
 

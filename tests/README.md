@@ -67,7 +67,8 @@ pytest tests/engine/test_smoke_async_agent_providers.py -q
 
 运行时基础设施测试，覆盖 `dayu.runtime` 的层中立边界、取消 helper 与日志装配：
 
-- import boundary：阻止 runtime 反向依赖 Engine、Host、Service、UI、Fins 或引入运行期 HTTP 客户端。
+- import boundary：阻止 runtime 反向依赖 Engine、Host、Service、UI、Fins 或引入运行期 HTTP 客户端，并显式确认
+  `config_loader.py`、`scene_prepare.py` 与 `tools_discovery.py` 被边界扫描覆盖。
 - cancellation：覆盖取消等待 helper 的完成、取消与异常传播语义。
 - lane：覆盖 cross-process named semaphore / capacity guard 的配置校验、独立 SQLite runtime lane DB schema、acquire /
   heartbeat / release、timeout、协作式 cancellation、`Task.cancel()` 透传、controller close、跨进程 capacity invariant、
@@ -78,13 +79,16 @@ pytest tests/engine/test_smoke_async_agent_providers.py -q
 - logging：验证 `dayu.runtime.log` 的 logger 装配、CLI 风格级别解析、`VERBOSE` / `CRITICAL` 级别契约，并验证 `dayu.runtime.log_levels` 只提供公共日志级别常量、不注册 stdlib logging level。
 - config loader：覆盖 `models.json`、`execution_profiles.json`、`host_runtime.json`、`tool_discovery.json` 的 typed view 加载、workspace 同 id 整条替换、单继承、错误路径和旧配置文件不读取。
 - scene prepare：覆盖单 scene 装配、fragment refs / source refs / digest、required context slot、未知 / 非字符串 / 未解析 placeholder、单继承、concrete scene 显式 model、fragment id / order 冲突、fragment path containment、missing required fragment fail-closed，以及 `all` / `none` / `select` 工具选择的 names、tags、并集、未知工具和空匹配语义。
+- scene asset migration：覆盖迁移后的真实 scene manifest 可被 `ScenePrepare` 装配，直接 fragment 引用可加载，并确认未迁移
+  tasks、contract 文件、workflow 产物与未引用模板。
 
 ### `tests/contracts/`
 
 公共协作契约测试，覆盖 `dayu.contracts` 的稳定边界：
 
 - package exports：锁定包根 `__all__` 白名单，阻止未承诺符号泄漏。
-- import boundary：阻止公共契约层反向依赖 Engine、Host、runtime implementation、Service、UI、Fins 或运行期 HTTP 客户端。
+- import boundary：阻止公共契约层反向依赖 Engine、Host、runtime implementation、Service、UI、Fins 或运行期 HTTP 客户端，
+  并显式确认公共 source ref 契约模块被边界扫描覆盖。
 - weak typing guard：通过 AST 扫描阻止 `Any`、`object`、无类型签名与裸容器注解进入公共契约源码。
 - ToolExecutionOutcome / ToolResult / ToolCall 等契约测试：覆盖工具调用 provider state、工具结果信封、工具执行 outcome 封闭联合与穷尽匹配。
 - tool declaration：覆盖最小 `@tool(..., truncate=ToolTruncateSpec(...))` 声明能力，确认 `ToolDefinition` / `ToolBundle` 只投影 `ToolSchema` 给 Engine。
