@@ -24,7 +24,7 @@ from dayu.host.context_budget import (
 from dayu.host.context_policy import (
     ContextBudgetPolicy,
     ContextCompactionTriggerSource,
-    DEFAULT_CONTEXT_SAFETY_MARGIN_RATIO,
+    DEFAULT_SOFT_THRESHOLD_CONTEXT_RATIO,
     StaticContextBudgetProvider,
     default_context_budget_policy,
 )
@@ -50,12 +50,9 @@ _TRIGGER_SOURCE_VALUES = tuple(source.value for source in ContextCompactionTrigg
 
 
 def test_default_policy_computes_budget_thresholds_and_digest() -> None:
-    """默认 policy 基于显式窗口和输出预留计算预算阈值。"""
+    """默认 policy 基于显式窗口和 ratio 计算预算阈值。"""
 
-    policy = default_context_budget_policy(
-        context_window_size=2048,
-        reserved_output_tokens=512,
-    )
+    policy = default_context_budget_policy(context_window_size=2048)
     estimate = estimate_context_budget(
         policy,
         BudgetEstimateInput(
@@ -67,24 +64,19 @@ def test_default_policy_computes_budget_thresholds_and_digest() -> None:
         ),
     )
 
-    assert estimate.input_budget_tokens == 1536
-    assert estimate.soft_threshold_tokens == 1228
-    assert estimate.hard_threshold_tokens == 1280
-    assert estimate.safety_margin_tokens == 308
+    assert estimate.input_budget_tokens == 2048
+    assert estimate.soft_threshold_tokens == 1638
+    assert estimate.hard_threshold_tokens == 1843
+    assert estimate.safety_margin_tokens == 410
     assert estimate.estimator_digest.startswith("sha256:")
-    assert DEFAULT_INPUT_SOFT_THRESHOLD_RATIO == (
-        1.0 - DEFAULT_CONTEXT_SAFETY_MARGIN_RATIO
-    )
+    assert DEFAULT_INPUT_SOFT_THRESHOLD_RATIO == DEFAULT_SOFT_THRESHOLD_CONTEXT_RATIO
     assert decide_context_budget(estimate) == ContextBudgetDecision.ALLOW_DISPATCH
 
 
 def test_static_context_budget_provider_returns_configured_policy() -> None:
     """静态 provider 返回装配时传入的 typed policy。"""
 
-    policy = default_context_budget_policy(
-        context_window_size=2048,
-        reserved_output_tokens=512,
-    )
+    policy = default_context_budget_policy(context_window_size=2048)
     provider = StaticContextBudgetProvider(policy=policy)
 
     assert provider.context_budget_policy() is policy
@@ -100,27 +92,29 @@ def test_static_context_budget_provider_rejects_invalid_policy() -> None:
 
 
 @pytest.mark.parametrize(
-    ("context_window_size", "reserved_output_tokens", "error"),
+    ("context_window_size", "soft_ratio", "hard_ratio", "error"),
     (
-        (0, 128, ValueError),
-        (-1, 128, ValueError),
-        (1024, 0, ValueError),
-        (1024, -1, ValueError),
-        (1024, 1024, ValueError),
-        (1024, 2048, ValueError),
+        (0, 0.8, 0.9, ValueError),
+        (-1, 0.8, 0.9, ValueError),
+        (1024, 0.0, 0.9, ValueError),
+        (1024, -0.1, 0.9, ValueError),
+        (1024, 0.9, 0.9, ValueError),
+        (1024, 0.95, 0.9, ValueError),
     ),
 )
-def test_invalid_policy_rejects_bad_window_or_reserved_tokens(
+def test_invalid_policy_rejects_bad_window_or_threshold_ratios(
     context_window_size: int,
-    reserved_output_tokens: int,
+    soft_ratio: float,
+    hard_ratio: float,
     error: type[Exception],
 ) -> None:
-    """无效窗口或输出预留在 policy 构造期失败。"""
+    """无效窗口或阈值 ratio 在 policy 构造期失败。"""
 
     with pytest.raises(error):
         default_context_budget_policy(
             context_window_size=context_window_size,
-            reserved_output_tokens=reserved_output_tokens,
+            soft_threshold_context_ratio=soft_ratio,
+            hard_threshold_context_ratio=hard_ratio,
         )
 
 
@@ -129,8 +123,8 @@ def test_soft_threshold_requests_compaction() -> None:
 
     policy = default_context_budget_policy(
         context_window_size=1500,
-        reserved_output_tokens=500,
-        hard_threshold_tokens=900,
+        soft_threshold_context_ratio=0.8,
+        hard_threshold_context_ratio=0.9,
     )
     estimate = estimate_context_budget(
         policy,
@@ -138,13 +132,13 @@ def test_soft_threshold_requests_compaction() -> None:
             session_id="session-budget",
             run_id="run-budget",
             message_fragments=(
-                BudgetTextFragment(fragment_ref="message:soft", text="x" * 2400),
+                BudgetTextFragment(fragment_ref="message:soft", text="x" * 3600),
             ),
         ),
     )
 
-    assert estimate.soft_threshold_tokens == 800
-    assert estimate.hard_threshold_tokens == 900
+    assert estimate.soft_threshold_tokens == 1200
+    assert estimate.hard_threshold_tokens == 1350
     assert estimate.overage_reason == ContextBudgetOverageReason.SOFT_THRESHOLD
     assert decide_context_budget(estimate) == (
         ContextBudgetDecision.COMPACT_SOFT_THRESHOLD
@@ -156,8 +150,8 @@ def test_hard_threshold_blocks_dispatch() -> None:
 
     policy = default_context_budget_policy(
         context_window_size=1500,
-        reserved_output_tokens=500,
-        hard_threshold_tokens=900,
+        soft_threshold_context_ratio=0.8,
+        hard_threshold_context_ratio=0.9,
     )
     estimate = estimate_context_budget(
         policy,
@@ -165,7 +159,7 @@ def test_hard_threshold_blocks_dispatch() -> None:
             session_id="session-budget",
             run_id="run-budget",
             message_fragments=(
-                BudgetTextFragment(fragment_ref="message:hard", text="x" * 2700),
+                BudgetTextFragment(fragment_ref="message:hard", text="x" * 4050),
             ),
         ),
     )
@@ -174,13 +168,13 @@ def test_hard_threshold_blocks_dispatch() -> None:
     assert decide_context_budget(estimate) == ContextBudgetDecision.BLOCK_HARD_THRESHOLD
 
 
-def test_explicit_hard_threshold_overrides_minimum_protection() -> None:
-    """显式 hard threshold 优先于默认最小保护量计算。"""
+def test_hard_threshold_ratio_derives_threshold() -> None:
+    """hard threshold ratio 直接从 context window 派生阈值。"""
 
     policy = default_context_budget_policy(
         context_window_size=2048,
-        reserved_output_tokens=512,
-        hard_threshold_tokens=1400,
+        soft_threshold_context_ratio=0.5,
+        hard_threshold_context_ratio=0.75,
     )
     estimate = estimate_context_budget(
         policy,
@@ -197,18 +191,17 @@ def test_explicit_hard_threshold_overrides_minimum_protection() -> None:
         ),
     )
 
-    assert estimate.input_budget_tokens == 1536
-    assert estimate.hard_threshold_tokens == 1400
+    assert estimate.input_budget_tokens == 2048
+    assert estimate.hard_threshold_tokens == 1536
 
 
-def test_minimum_protection_tokens_zero_allows_hard_threshold_at_input_budget() -> None:
-    """minimum_protection_tokens=0 是显式非负策略，允许 hard threshold 等于输入预算。"""
+def test_hard_threshold_ratio_one_allows_threshold_at_context_window() -> None:
+    """hard_threshold_context_ratio=1 允许 hard threshold 等于 context window。"""
 
     policy = default_context_budget_policy(
         context_window_size=1000,
-        reserved_output_tokens=200,
-        safety_margin_ratio=0.0,
-        minimum_protection_tokens=0,
+        soft_threshold_context_ratio=0.8,
+        hard_threshold_context_ratio=1.0,
     )
     estimate = estimate_context_budget(
         policy,
@@ -219,10 +212,10 @@ def test_minimum_protection_tokens_zero_allows_hard_threshold_at_input_budget() 
         ),
     )
 
-    assert estimate.input_budget_tokens == 800
+    assert estimate.input_budget_tokens == 1000
     assert estimate.soft_threshold_tokens == 800
-    assert estimate.hard_threshold_tokens == 800
-    assert estimate.safety_margin_tokens == 0
+    assert estimate.hard_threshold_tokens == 1000
+    assert estimate.safety_margin_tokens == 200
 
 
 def test_budget_estimate_rejects_non_dispatchable_hard_threshold() -> None:
@@ -240,14 +233,13 @@ def test_budget_estimate_rejects_non_dispatchable_hard_threshold() -> None:
         )
 
 
-def test_safety_margin_ratio_near_one_keeps_positive_soft_threshold() -> None:
-    """safety_margin_ratio 接近 1 时 soft threshold 仍保持正数边界。"""
+def test_small_soft_threshold_ratio_keeps_positive_soft_threshold() -> None:
+    """soft ratio 很小时 soft threshold 仍保持正数边界。"""
 
     policy = default_context_budget_policy(
         context_window_size=260,
-        reserved_output_tokens=4,
-        safety_margin_ratio=0.999,
-        minimum_protection_tokens=1,
+        soft_threshold_context_ratio=0.001,
+        hard_threshold_context_ratio=0.5,
     )
     estimate = estimate_context_budget(
         policy,
@@ -258,17 +250,14 @@ def test_safety_margin_ratio_near_one_keeps_positive_soft_threshold() -> None:
         ),
     )
 
-    assert estimate.input_budget_tokens == 256
+    assert estimate.input_budget_tokens == 260
     assert estimate.soft_threshold_tokens == 1
 
 
 def test_tool_schema_estimation_adds_schema_overhead() -> None:
     """工具 schema 片段估算包含 schema 专用 overhead。"""
 
-    policy = default_context_budget_policy(
-        context_window_size=2048,
-        reserved_output_tokens=512,
-    )
+    policy = default_context_budget_policy(context_window_size=2048)
     estimate = estimate_context_budget(
         policy,
         BudgetEstimateInput(

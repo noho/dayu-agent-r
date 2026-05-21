@@ -13,7 +13,7 @@ import pytest
 from dayu.contracts.json_value import JsonValue
 from dayu.engine.contracts.runner_spec import RunnerCallOptions, RunnerSpec
 from dayu.host import CompactorRunnerBaseline, HostEventKind, open_host
-from dayu.host.context_policy import default_context_budget_policy
+from dayu.host.context_policy import context_budget_policy_from_threshold_tokens
 from tests.host.public_smoke_support import (
     PROVIDER_CASES,
     FinalAnswerWorkerFactory,
@@ -87,12 +87,13 @@ async def test_real_compactor_public_opener_compacts_and_preserves_continuity(
     )
     options = replace(
         base_options,
-        context_budget_policy=default_context_budget_policy(
+        context_budget_policy=context_budget_policy_from_threshold_tokens(
             context_window_size=_SOFT_CONTEXT_WINDOW_SIZE,
-            reserved_output_tokens=_SOFT_RESERVED_OUTPUT_TOKENS,
+            soft_threshold_tokens=int(
+                (_SOFT_CONTEXT_WINDOW_SIZE - _SOFT_RESERVED_OUTPUT_TOKENS)
+                * (1 - _SOFT_SAFETY_MARGIN_RATIO)
+            ),
             hard_threshold_tokens=_SOFT_HARD_THRESHOLD_TOKENS,
-            safety_margin_ratio=_SOFT_SAFETY_MARGIN_RATIO,
-            minimum_protection_tokens=1,
             max_compaction_attempts_per_operation=(
                 _COMPACTOR_MAX_ATTEMPTS_PER_OPERATION
             ),

@@ -112,13 +112,20 @@ def _policy() -> MemoryProjectionPolicy:
     """
 
     return MemoryProjectionPolicy(
+        context_window_size=8192,
         max_pinned_items=8,
         max_verified_facts=16,
         max_working_assumptions=8,
         recent_raw_turns_floor=2,
-        max_raw_turn_size_units=1024,
-        history_pool_size_units=4096,
-        stable_layer_size_units=2048,
+        raw_turn_context_ratio=0.125,
+        raw_turn_size_floor=1024,
+        raw_turn_size_cap=1024,
+        history_pool_context_ratio=0.5,
+        history_pool_size_floor=4096,
+        history_pool_size_cap=4096,
+        stable_layer_context_ratio=0.25,
+        stable_layer_size_floor=2048,
+        stable_layer_size_cap=2048,
         max_lag_events_for_inline_delta=4,
         max_delta_repair_events=16,
     )
@@ -131,13 +138,20 @@ def _low_history_policy() -> MemoryProjectionPolicy:
     """
 
     return MemoryProjectionPolicy(
+        context_window_size=8192,
         max_pinned_items=8,
         max_verified_facts=16,
         max_working_assumptions=8,
         recent_raw_turns_floor=2,
-        max_raw_turn_size_units=1024,
-        history_pool_size_units=3,
-        stable_layer_size_units=2048,
+        raw_turn_context_ratio=0.125,
+        raw_turn_size_floor=1024,
+        raw_turn_size_cap=1024,
+        history_pool_context_ratio=0.5,
+        history_pool_size_floor=3,
+        history_pool_size_cap=3,
+        stable_layer_context_ratio=0.25,
+        stable_layer_size_floor=2048,
+        stable_layer_size_cap=2048,
         max_lag_events_for_inline_delta=4,
         max_delta_repair_events=16,
     )
@@ -150,13 +164,20 @@ def _assistant_budget_policy() -> MemoryProjectionPolicy:
     """
 
     return MemoryProjectionPolicy(
+        context_window_size=8192,
         max_pinned_items=8,
         max_verified_facts=16,
         max_working_assumptions=8,
         recent_raw_turns_floor=1,
-        max_raw_turn_size_units=1024,
-        history_pool_size_units=4,
-        stable_layer_size_units=2048,
+        raw_turn_context_ratio=0.125,
+        raw_turn_size_floor=1024,
+        raw_turn_size_cap=1024,
+        history_pool_context_ratio=0.5,
+        history_pool_size_floor=4,
+        history_pool_size_cap=4,
+        stable_layer_context_ratio=0.25,
+        stable_layer_size_floor=2048,
+        stable_layer_size_cap=2048,
         max_lag_events_for_inline_delta=4,
         max_delta_repair_events=16,
     )
@@ -169,13 +190,20 @@ def _zero_recent_floor_policy() -> MemoryProjectionPolicy:
     """
 
     return MemoryProjectionPolicy(
+        context_window_size=8192,
         max_pinned_items=8,
         max_verified_facts=16,
         max_working_assumptions=8,
         recent_raw_turns_floor=0,
-        max_raw_turn_size_units=1024,
-        history_pool_size_units=2,
-        stable_layer_size_units=2048,
+        raw_turn_context_ratio=0.125,
+        raw_turn_size_floor=1024,
+        raw_turn_size_cap=1024,
+        history_pool_context_ratio=0.5,
+        history_pool_size_floor=2,
+        history_pool_size_cap=2,
+        stable_layer_context_ratio=0.25,
+        stable_layer_size_floor=2048,
+        stable_layer_size_cap=2048,
         max_lag_events_for_inline_delta=4,
         max_delta_repair_events=16,
     )

@@ -62,7 +62,10 @@ from dayu.host.context_events import (
     CONTEXT_COMPACTION_REQUESTED,
 )
 from dayu.host.compaction import CompactionCandidate, CompactionRequest, ContextCompactor
-from dayu.host.context_policy import ContextBudgetPolicy, default_context_budget_policy
+from dayu.host.context_policy import (
+    ContextBudgetPolicy,
+    context_budget_policy_from_threshold_tokens,
+)
 from dayu.host.durable.codec import sha256_digest_json
 from dayu.host.durable.connection import open_host_durable_store
 from dayu.host.durable.event_log import (
@@ -523,12 +526,10 @@ async def test_reactive_compaction_attempt_rejected_uses_request_event_operation
 
         result = await EngineEventIngestor(
             transaction_runner=store.transaction_runner,
-            context_budget_policy=default_context_budget_policy(
+            context_budget_policy=context_budget_policy_from_threshold_tokens(
                 context_window_size=100,
-                reserved_output_tokens=10,
+                soft_threshold_tokens=45,
                 hard_threshold_tokens=80,
-                safety_margin_ratio=0.5,
-                minimum_protection_tokens=1,
                 max_compaction_attempts_per_operation=1,
                 policy_ref=_REACTIVE_POLICY_REF,
             ),
@@ -1783,12 +1784,10 @@ def _reactive_policy() -> ContextBudgetPolicy:
     :returns: Context budget policy。
     """
 
-    return default_context_budget_policy(
+    return context_budget_policy_from_threshold_tokens(
         context_window_size=100,
-        reserved_output_tokens=10,
+        soft_threshold_tokens=45,
         hard_threshold_tokens=80,
-        safety_margin_ratio=0.5,
-        minimum_protection_tokens=1,
         policy_ref=_REACTIVE_POLICY_REF,
     )
 

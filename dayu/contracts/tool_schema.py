@@ -100,8 +100,9 @@ class ToolTruncateSpec:
     """工具结果截断显式声明。
 
     P2 只把该声明作为 Host ToolRuntime 的显式触发条件；无声明或未启用
-    由 ToolRuntime 解释为不截断。启用截断时，策略与对应 limit 在构造期
-    校验，避免非法状态泄漏到不同 ToolRuntime adapter。
+    由 ToolRuntime 解释为不截断。启用截断时，声明可以省略策略对应
+    limit 与 TTL，由 runtime-neutral assembly helper 按 policy default 补齐
+    effective spec；声明内已给出的 limit 仍在构造期校验。
     ``strategy=ToolTruncationStrategy.BINARY_BYTES`` 时，截断结果与补读结果的
     ``value`` 都是 base64 ASCII 字符串，``unit="bytes"`` 与 value summary
     表示原始字节大小。
@@ -112,9 +113,9 @@ class ToolTruncateSpec:
     :param target_field: wrapper dict 的顶层目标字段。
     :param field_path: wrapper dict 的嵌套目标路径。
     :param ttl_seconds: cursor 生存秒数；``None`` 表示使用 Host 默认值。
-    :raises TypeError: ``strategy`` 不是 ``ToolTruncationStrategy`` 或
-        ``limits`` 值不是整数时抛出。
-    :raises ValueError: ``enabled`` / ``strategy`` / ``limits`` 组合不一致时抛出。
+    :raises TypeError: ``strategy`` 不是 ``ToolTruncationStrategy``、``limits``
+        值不是整数或 ``ttl_seconds`` 类型非法时抛出。
+    :raises ValueError: ``enabled`` / ``strategy`` / ``limits`` / target 组合不一致时抛出。
     """
 
     enabled: bool
@@ -128,14 +129,35 @@ class ToolTruncateSpec:
         """校验截断声明字段组合。
 
         :returns: ``None``。
-        :raises TypeError: ``strategy`` 不是枚举或 ``limits`` 值不是整数时抛出。
-        :raises ValueError: ``enabled`` / ``strategy`` / ``limits`` 组合不一致时抛出。
+        :raises TypeError: ``strategy`` 不是枚举、``limits`` 值不是整数或
+            ``ttl_seconds`` 类型非法时抛出。
+        :raises ValueError: ``enabled`` / ``strategy`` / ``limits`` / target
+            组合不一致时抛出。
         """
 
         if self.strategy is not None and not isinstance(
             self.strategy, ToolTruncationStrategy
         ):
             raise TypeError("ToolTruncateSpec.strategy must be ToolTruncationStrategy")
+        if self.target_field is not None and self.field_path is not None:
+            raise ValueError(
+                "ToolTruncateSpec must not define both target_field and field_path"
+            )
+        if self.target_field is not None and self.target_field.strip() == "":
+            raise ValueError("ToolTruncateSpec.target_field must be non-empty")
+        if self.field_path is not None:
+            if len(self.field_path) < 1:
+                raise ValueError("ToolTruncateSpec.field_path must be non-empty")
+            for item in self.field_path:
+                if item.strip() == "":
+                    raise ValueError("ToolTruncateSpec.field_path items must be non-empty")
+        if self.ttl_seconds is not None:
+            if isinstance(self.ttl_seconds, bool) or not isinstance(
+                self.ttl_seconds, int
+            ):
+                raise TypeError("ToolTruncateSpec.ttl_seconds must be int")
+            if self.ttl_seconds < 0:
+                raise ValueError("ToolTruncateSpec.ttl_seconds must be non-negative")
         if not self.enabled:
             if self.strategy is not None:
                 raise ValueError("disabled ToolTruncateSpec must not define strategy")
@@ -145,15 +167,30 @@ class ToolTruncateSpec:
         if self.strategy is None:
             raise ValueError("enabled ToolTruncateSpec requires strategy")
         expected_limit_key = _TRUNCATE_LIMIT_KEYS_BY_STRATEGY[self.strategy]
-        if set(self.limits.keys()) != {expected_limit_key}:
+        if not set(self.limits.keys()).issubset({expected_limit_key}):
             raise ValueError(
                 "enabled ToolTruncateSpec limits must match truncation strategy"
             )
-        limit = self.limits[expected_limit_key]
+        limit = self.limits.get(expected_limit_key)
+        if limit is None:
+            return
         if isinstance(limit, bool) or not isinstance(limit, int):
             raise TypeError("ToolTruncateSpec limits must contain integer values")
         if limit < 1:
             raise ValueError("ToolTruncateSpec limits must be positive")
+
+
+def truncate_limit_key_for_strategy(strategy: ToolTruncationStrategy) -> str:
+    """返回截断策略对应的 limit key。
+
+    :param strategy: 截断策略。
+    :returns: 该策略在 ``ToolTruncateSpec.limits`` 中使用的 limit key。
+    :raises TypeError: ``strategy`` 不是 ``ToolTruncationStrategy`` 时抛出。
+    """
+
+    if not isinstance(strategy, ToolTruncationStrategy):
+        raise TypeError("strategy must be ToolTruncationStrategy")
+    return _TRUNCATE_LIMIT_KEYS_BY_STRATEGY[strategy]
 
 
 __all__ = [
@@ -162,4 +199,5 @@ __all__ = [
     "ToolParametersSchema",
     "ToolTruncateSpec",
     "ToolTruncationStrategy",
+    "truncate_limit_key_for_strategy",
 ]

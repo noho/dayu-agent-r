@@ -104,6 +104,7 @@ from dayu.runtime.cancellation import (
     await_or_cancel,
     await_or_cancel_or_timeout,
 )
+from dayu.runtime.tool_truncation import effective_tool_truncate_spec
 from dayu.host.tooling import (
     FrameworkToolName,
     FrameworkToolPolicyView,
@@ -208,6 +209,16 @@ _TRUNCATION_CURSOR_USED_REASON = "cursor_already_used"
 _TRUNCATION_REMAINDER_DIGEST_REASON = "remainder_digest_mismatch"
 _TRUNCATION_INVALID_REQUEST_REASON = "invalid_fetch_more_request"
 _DEFAULT_TRUNCATION_TTL_SECONDS = 600
+_DEFAULT_TEXT_CHARS_TRUNCATION_LIMIT = 4096
+_DEFAULT_TEXT_LINES_TRUNCATION_LIMIT = 200
+_DEFAULT_LIST_ITEMS_TRUNCATION_LIMIT = 100
+_DEFAULT_BINARY_BYTES_TRUNCATION_LIMIT = 4096
+_DEFAULT_TRUNCATION_LIMITS_BY_STRATEGY: Mapping[ToolTruncationStrategy, int] = {
+    ToolTruncationStrategy.TEXT_CHARS: _DEFAULT_TEXT_CHARS_TRUNCATION_LIMIT,
+    ToolTruncationStrategy.TEXT_LINES: _DEFAULT_TEXT_LINES_TRUNCATION_LIMIT,
+    ToolTruncationStrategy.LIST_ITEMS: _DEFAULT_LIST_ITEMS_TRUNCATION_LIMIT,
+    ToolTruncationStrategy.BINARY_BYTES: _DEFAULT_BINARY_BYTES_TRUNCATION_LIMIT,
+}
 _TRUNCATION_EXPIRED_CLEANUP_LIMIT = 64
 _TRUNCATION_EXPIRED_CLEANUP_SCAN_LIMIT = 256
 _MIN_TRUNCATION_LIMIT = 1
@@ -2176,7 +2187,13 @@ class EffectiveToolBundleBuilder:
             definition.to_tool_schema() for definition in definitions
         )
         truncate_specs = {
-            definition.name: definition.truncate
+            definition.name: effective_tool_truncate_spec(
+                definition.truncate,
+                default_limits_by_strategy=(
+                    _DEFAULT_TRUNCATION_LIMITS_BY_STRATEGY
+                ),
+                default_ttl_seconds=_DEFAULT_TRUNCATION_TTL_SECONDS,
+            )
             for definition in definitions
             if definition.truncate is not None
         }

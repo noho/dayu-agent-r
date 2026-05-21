@@ -222,9 +222,9 @@ Phase Map 中每个 phase 必须使用统一条目格式。模板如下：
 
 约束：本节只保留当前 gate 结论；phase 过程流水必须归档到 `历史记录`，仍需追踪的风险或后续 owner 必须写入 `Open Questions 与风险追踪` 的 `追踪区`。
 
-当前 work unit：Phase 12. ToolsDiscovery / ScenePrepare / ConfigLoader runtime assembly。
-当前 gate：draft-PR-pass。
-下一 gate：等待用户 merge PR 67 或处理外部 review / CI。
+当前 work unit：Phase 12.1 runtime assembly schema / public contract correction follow-up。
+当前 gate：Slice 1 accepted local commit。
+下一 gate：Slice 2 implementation。
 
 当前 gate 事实：Phase 10 已完成；P10.5 已插入 Phase Map，用于冻结普通本地多轮会话的 Host public interface / contract。P10.5 目标与任务清单写入 `docs/host/post-p10.md`。initial challenge review artifacts 为 `docs/reviews/post-p10-public-contract-challenge-mimo-20260518.md`、`docs/reviews/post-p10-wiring-smoke-challenge-ds-20260518.md` 与 `docs/reviews/post-p10-codex-challenge-20260518.md`；相关裁决已经写回 `docs/host/post-p10.md`。按 `$init-agents` 已派发三路 P10.5 plan-readiness review：`docs/reviews/post-p10-5-plan-readiness-review-mimo-20260518.md`、`docs/reviews/post-p10-5-plan-readiness-review-ds-20260518.md` 与 `docs/reviews/post-p10-5-plan-readiness-review-codex-20260518.md`；三份结论均为 blocking count = 0。P10.5 handoff implementation-ready plan 已生成：`docs/host/phase10-5-ordinary-local-multiturn-public-contract-plan.md`。P10.5 plan review artifacts 为 `docs/reviews/phase10-5-plan-review-mimo-20260518.md` 与 `docs/reviews/phase10-5-plan-review-ds-20260518.md`，两份均 PASS，blocking count = 0。Controller adjudication artifact 为 `docs/reviews/phase10-5-plan-review-controller-adjudication-20260518.md`；总控裁决：不直接进入 implementation，先接受 DS N1-N5 / C1-C3 与 MiMo F5-F7 为 plan hardening。P10.5 plan fix artifact 为 `docs/reviews/phase10-5-plan-fix-codex-20260518.md`；fix 只修改 `docs/host/phase10-5-ordinary-local-multiturn-public-contract-plan.md`，收口 A1-A5，无新的 blocking question。P10.5 plan re-review artifacts 为 `docs/reviews/phase10-5-plan-rereview-mimo-20260518.md` 与 `docs/reviews/phase10-5-plan-rereview-ds-20260518.md`，两份均 PASS，blocking count = 0；Controller re-review adjudication artifact 为 `docs/reviews/phase10-5-plan-rereview-controller-adjudication-20260518.md`。Accepted plan local commit hash：`f38540b`。P10.5 Slice 1 implementation artifact 为 `docs/reviews/phase10-5-slice1-implementation-codex-20260518.md`；implementation agent reported focused tests `tests/host/test_public_open_host_options.py tests/host/test_package_exports.py` passed and `pyright dayu/host tests/host` returned 0 errors。P10.5 Slice 1 code review artifacts 为 `docs/reviews/phase10-5-slice1-code-review-mimo-20260518.md` 与 `docs/reviews/phase10-5-slice1-code-review-ds-20260518.md`，两份均 PASS，blocking count = 0；Controller adjudication artifact 为 `docs/reviews/phase10-5-slice1-code-review-controller-adjudication-20260518.md`。Accepted Slice 1 local commit hash：`d0e79a6`。用户已授权到达 `ready-to-open-draft-PR` 后进入 draft PR gate 并推进到 draft-PR-pass；该授权不改变当前必须先完成 P10.5 剩余 slices、code review 与 aggregate deepreview 的顺序。P10.5 Slice 2 implementation artifact 为 `docs/reviews/phase10-5-slice2-implementation-codex-20260518.md`；implementation agent reported focused tests `tests/host/test_open_host_runtime.py tests/host/test_public_lifecycle_smoke.py` passed and `pyright dayu/host tests/host` returned 0 errors。P10.5 Slice 2 code review artifacts 为 `docs/reviews/phase10-5-slice2-code-review-mimo-20260518.md` 与 `docs/reviews/phase10-5-slice2-code-review-ds-20260518.md`，两份均 PASS，blocking count = 0。Controller adjudication artifact 为 `docs/reviews/phase10-5-slice2-code-review-controller-adjudication-20260518.md`；总控裁决：接受 DS N1 为当前 Slice 2 lifecycle fix，接受 DS N2 / MiMo N3 为窄契约澄清 fix。P10.5 Slice 2 fix artifact 为 `docs/reviews/phase10-5-slice2-fix-codex-20260518.md`；fix agent reported focused tests `tests/host/test_open_host_runtime.py tests/host/test_public_lifecycle_smoke.py` passed with 5 tests and `pyright dayu/host tests/host` returned 0 errors。P10.5 Slice 2 re-review artifacts 为 `docs/reviews/phase10-5-slice2-rereview-mimo-20260518.md` 与 `docs/reviews/phase10-5-slice2-rereview-ds-20260518.md`，两份均 PASS，blocking count = 0；Controller re-review adjudication artifact 为 `docs/reviews/phase10-5-slice2-rereview-controller-adjudication-20260518.md`。Accepted Slice 2 local commit hash：`79f7b44`。P10.5 Slice 3 implementation artifact 为 `docs/reviews/phase10-5-slice3-implementation-codex-20260518.md`；implementation agent reported focused tests `tests/host/test_submit_followup_public_contract.py tests/host/test_per_run_tool_selection.py tests/host/test_effective_execution_config.py` passed with 9 tests and `pyright dayu/host tests/host` returned 0 errors。P10.5 Slice 3 code review artifacts 为 `docs/reviews/phase10-5-slice3-code-review-mimo-20260518.md` 与 `docs/reviews/phase10-5-slice3-code-review-ds-20260518.md`，两份均 PASS，blocking count = 0；Controller adjudication artifact 为 `docs/reviews/phase10-5-slice3-code-review-controller-adjudication-20260518.md`。总控裁决：接受 runner config JSON 投影重复、agent_policy override 覆盖缺口、baseline=None fail-early 说明为当前 Slice 3 fix。P10.5 Slice 3 fix artifact 为 `docs/reviews/phase10-5-slice3-fix-codex-20260518.md`；fix agent reported focused tests `tests/host/test_submit_followup_public_contract.py tests/host/test_per_run_tool_selection.py tests/host/test_effective_execution_config.py` passed with 11 tests and `pyright dayu/host tests/host` returned 0 errors；controller 本地复跑同一 focused tests 11 passed，`pyright dayu/host tests/host` 0 errors。P10.5 Slice 3 re-review artifacts 为 `docs/reviews/phase10-5-slice3-rereview-mimo-20260518.md` 与 `docs/reviews/phase10-5-slice3-rereview-ds-20260518.md`。Controller re-review adjudication artifact 为 `docs/reviews/phase10-5-slice3-rereview-controller-adjudication-20260518.md`；总控裁决：受影响既有 tests `tests/host/test_admission_queue.py tests/host/test_projection_read_model.py` 当前 17 failed / 19 passed，不能接受进入 slice commit，需 follow-up fix 迁移相关低层测试 helper 到 ordinary baseline 边界。Slice 3 follow-up fix 已更新 `tests/host/test_admission_queue.py`、`tests/host/test_projection_read_model.py` 与 `docs/reviews/phase10-5-slice3-fix-codex-20260518.md`；fix agent reported 47 tests passed and `pyright dayu/host tests/host` 0 errors；controller 本地复跑同一 47-test 集合 passed，`pyright dayu/host tests/host` 0 errors。P10.5 Slice 3 follow-up re-review artifacts 为 `docs/reviews/phase10-5-slice3-followup-rereview-mimo-20260518.md` 与 `docs/reviews/phase10-5-slice3-followup-rereview-ds-20260518.md`，两份均 PASS，blocking count = 0；Controller follow-up re-review adjudication artifact 为 `docs/reviews/phase10-5-slice3-followup-rereview-controller-adjudication-20260518.md`。Accepted Slice 3 local commit hash：`8e6f352`。P10.5 Slice 4 implementation artifact 为 `docs/reviews/phase10-5-slice4-implementation-codex-20260518.md`；implementation agent reported focused tests `tests/host/test_watch_session_events.py tests/host/test_public_host_event.py` passed with 7 tests, extra affected tests `tests/host/test_package_exports.py tests/host/test_public_event_stream.py tests/host/test_public_contracts.py` passed with 62 tests, and `pyright dayu/host tests/host` returned 0 errors；controller 本地复跑同一验证通过。P10.5 Slice 4 code review artifacts 为 `docs/reviews/phase10-5-slice4-code-review-mimo-20260518.md` 与 `docs/reviews/phase10-5-slice4-code-review-ds-20260518.md`，两份均 PASS，blocking count = 0；Controller adjudication artifact 为 `docs/reviews/phase10-5-slice4-code-review-controller-adjudication-20260518.md`。Accepted Slice 4 local commit hash：`73db9f0`。当前进入 P10.5 Slice 5 implementation。
 
@@ -431,6 +431,22 @@ Phase Map 中每个 phase 必须使用统一条目格式。模板如下：
 当前 gate 追加事实（PR 67 review fix accepted）：PR 67 accepted PR review fix commit 为 `024f61f`。提交后复跑 `git diff --check main...HEAD` clean，确认 branch-level whitespace check 已收口。当前进入 PR 67 follow-up push and final checks。
 
 当前 gate 追加事实（PR 67 draft-PR-pass）：PR 67 review-fix push 已到达 `5e8d492`，并已推送到 `github/docs/phase12-design-discussion`。`gh pr view 67` 显示 draft=true、state=OPEN、mergeStateStatus=CLEAN、statusCheckRollup=[]；`gh pr checks 67 --watch=false` 返回 no checks reported。PR 67 draft PR gate 通过，当前状态为 draft-PR-pass。Phase 12 状态保持 completed；下一工作入口为用户 merge PR 67 后进入 Phase 13 design discussion / plan gate，除非用户另行要求处理 PR 67 新增外部 review / CI。
+
+当前 gate 追加事实（Phase 12.1 follow-up design refinement）：用户报告 PR 67 已 merge，并要求先处理 runtime assembly follow-up patch，再继续后续 phase。Phase 12.1 讨论裁决已记录在 `docs/host/runtime-assembly-followup-discussion.md`，但该文件不是设计真源。Controller 裁决：先把稳定裁决写回 `docs/host/design.md` 与本文档，作为 Phase 12.1 design refinement / control update；随后按 `$init-agents` 路由派发 handoff implementation-ready plan。用户已再次授权：Phase 12.1 到达 `ready-to-open-draft-PR` 后可自动进入 draft PR gate 并推进到 `draft-PR-pass`。
+
+当前 gate 追加事实（Phase 12.1 design/control update complete）：Controller 已将 Phase 12.1 稳定裁决写回 `docs/host/design.md` 与本文档。当前进入 handoff implementation-ready plan gate；planning 属于 specialist work，必须按 `$init-agents` 路由派发给合适 Agent，controller 不直接产出 implementation-ready plan。
+
+当前 gate 追加事实（Phase 12.1 plan artifact）：Phase 12.1 handoff implementation-ready plan artifact 已由 AgentCodex 生成：`docs/host/phase12-1-runtime-assembly-correction-plan.md`。AgentCodex reported `git diff --check docs/host/phase12-1-runtime-assembly-correction-plan.md` clean，未修改 source/config/schema/tests/runtime 行为。Controller 初读未发现 blocking open question；当前进入 Phase 12.1 plan review，按 `$init-agents` 路由派发两个独立 review Agent。
+
+当前 gate 追加事实（Phase 12.1 plan review accepted）：Phase 12.1 plan review artifacts 为 `docs/reviews/phase12-1-plan-review-mimo-20260521.md` 与 `docs/reviews/phase12-1-plan-review-ds-20260521.md`，两份均 PASS，blocking findings count = 0。Controller adjudication artifact 为 `docs/reviews/phase12-1-plan-review-controller-adjudication-20260521.md`。总控裁决：plan accepted，可进入 implementation；接受 Slice 1 wide file-surface call-site audit、effective `ToolTruncateSpec` default-fill helper 收敛到 `dayu.runtime`、smoke-private helper future extraction targets、旧模型迁移 source preflight、ConfigLoader `extends` validation hardening 为 implementation constraints。当前进入 Phase 12.1 Slice 1 implementation。
+
+当前 gate 追加事实（Phase 12.1 Slice 1 implementation）：Phase 12.1 Slice 1 implementation artifact 为 `docs/reviews/phase12-1-slice1-implementation-codex-20260521.md`。AgentCodex migrated `ContextBudgetPolicy` to ratio-first typed shape, `MemoryProjectionPolicy` to context-window ratio/floor/cap shape, relaxed `ToolTruncateSpec` declaration limit / ttl requirements, added runtime-neutral effective truncation helper `dayu.runtime.tool_truncation`, updated affected Host wiring and tests, and synced `dayu/host/README.md` / `dayu/README.md` where triggered. Controller local rerun: `pytest tests/host/test_context_policy.py tests/host/test_context_budget.py tests/host/test_memory_projection.py tests/host/test_toolruntime_truncation_fetch_more.py -q` 75 passed；`pytest tests/host/test_public_open_host_options.py tests/host/test_phase6_toolruntime_integration.py -q` 8 passed；`python -m pyright dayu/host dayu/contracts tests/host` 0 errors；`git diff --check` clean。当前进入 Slice 1 code review。
+
+当前 gate 追加事实（Phase 12.1 Slice 1 code review）：Phase 12.1 Slice 1 code review artifacts 为 `docs/reviews/phase12-1-slice1-code-review-mimo-20260521.md` 与 `docs/reviews/phase12-1-slice1-code-review-ds-20260521.md`。MiMo verdict 为 Conditional PASS，DS verdict 为 PASS with Findings。Controller adjudication artifact 为 `docs/reviews/phase12-1-slice1-code-review-controller-adjudication-20260521.md`。总控裁决：接受 MiMo F-1 / DS F1 为当前 fix，修复 `_command_context_budget_fields_from_open_host_options` 忽略显式 `ContextBudgetPolicy` 的问题；接受 MiMo F-2 为同一窄 fix 的内部 shape cleanup；拒绝 DS F2 为当前 slice public contract 扩展；defer DS F3 到 Slice 2 / Slice 4 truncation policy assembly。当前进入 Slice 1 fix。
+
+当前 gate 追加事实（Phase 12.1 Slice 1 fix）：Slice 1 fix addendum 已追加到 `docs/reviews/phase12-1-slice1-implementation-codex-20260521.md`；fix 更新 `dayu/host/open_host.py`，让显式 `OpenHostOptions.context_budget_policy` 的 `context_window_size` 进入内部 command option 映射，并移除 `_CommandContextBudgetFields` 旧内部字段；新增 `tests/host/test_open_host_runtime.py::test_command_options_reflect_explicit_context_budget_policy`。Controller 本地复跑：focused test 1 passed；Slice 1 policy/truncation tests 75 passed；public open host / phase6 integration tests 8 passed；`python -m pyright dayu/host dayu/contracts tests/host` 0 errors；`git diff --check` clean。当前进入 Slice 1 re-review。
+
+当前 gate 追加事实（Phase 12.1 Slice 1 re-review accepted）：Phase 12.1 Slice 1 re-review artifacts 为 `docs/reviews/phase12-1-slice1-rereview-mimo-20260521.md` 与 `docs/reviews/phase12-1-slice1-rereview-ds-20260521.md`，两份均 PASS，确认 MiMo F-1 / DS F1 与 MiMo F-2 已收口且无新增 blocker。Controller re-review adjudication artifact 为 `docs/reviews/phase12-1-slice1-rereview-controller-adjudication-20260521.md`。总控裁决：Slice 1 fix accepted；DS F2 保持 rejected-current-slice，DS F3 保持 deferred 到 Slice 2 / Slice 4。当前进入 Slice 1 accepted local commit bookkeeping。
 
 ## Phase Map
 
@@ -1633,6 +1649,97 @@ Plan 必须额外收口的 readiness review checklist：
 - 后续 phase 可依赖的稳定契约：business `ToolBundle` discovery boundary、scene input assembly boundary、source refs / digest assembly。
 - 需要追踪到后续 phase 的事项：具体财报工具 provider、财报 scene manifest 内容、财报 prompt 文案仍属于 Service / Fins / 配置 work unit，不属于 runtime assembly phase。
 
+### Phase 12.1. Runtime Assembly Schema / Public Contract Correction Follow-up
+
+状态：
+- design refinement in progress。进入 implementation 前必须完成本条目更新、handoff implementation-ready plan、plan review 与用户确认；implementation / fix / review 必须按 `$init-agents` 路由派发，不由 controller 直接执行。
+
+目标：
+- 纠正 Phase 12 runtime assembly 在真实 Service-like smoke 装配验证中暴露出的 schema / public contract mismatch，使 ConfigLoader、ScenePrepare、ToolsDiscovery 与 adapter/helper 能在不写脚本业务默认值的前提下装配 `open_host(options)` 与 per-run typed input。
+- 保持 Host command / handle / opener 字段和 public request / response 方法不变；只在必要处修正 Host public policy dataclass、ToolTruncateSpec declaration/effective boundary 与 runtime config / scene schema。
+
+对应设计章节：
+- `docs/host/design.md` §3 dayu.runtime
+- `docs/host/design.md` §10.1 Host Handle / Composition Root
+- `docs/host/design.md` §11 Host 公共接口
+- `docs/host/design.md` §18.1 ToolBundle Input / Runtime Tool View
+- `docs/host/design.md` §24 Context Governance
+- `docs/host/design.md` §25 Memory Projection
+
+前置条件：
+- Phase 12 已完成并达到 draft-PR-pass，用户报告 PR 67 已 merge。
+- `docs/host/runtime-assembly-followup-discussion.md` 中的稳定裁决已写回 `docs/host/design.md`；该讨论稿不作为 implementation agent 的设计真源。
+- 当前工作区中既有 `README.md`、`utils/smoke_host_public_multiturn.py` 等未提交改动必须在 plan 中先识别来源和归属；不得盲目基于半成品实现继续堆叠。
+
+进入条件：
+- `docs/host/design.md` 不再保留已废弃 scene/config 语义，例如 `conversation` 字段、泛化 `runtime` block、`model.default_name`、`model.temperature_profile`、`runner_options_profiles`、`runner_hints`、`agent_hints`、旧 `context_budget` / `memory_projection` / `truncation` schema。
+- 本条目明确允许修改的 public contract 范围和禁止修改的 Host public surface。
+- handoff plan 必须逐项对照 Host public contracts，确认 config / scene 是否足以装配 `open_host(options)` 与 per-run typed input。
+
+范围：
+- 允许修改：`dayu.runtime` location resolver、ConfigLoader schema / typed view / validation、default config assets、ScenePrepare schema / typed output、scene manifest assets、prompt fragment assets、ToolsDiscovery integration points、Host public `ContextBudgetPolicy` / `MemoryProjectionPolicy` typed shape、`ToolTruncateSpec` declaration/effective semantics、Engine provider extension adapter/helper、runtime assembly adapter/helper、`utils/smoke_host_public_multiturn.py`、相关 tests 与 README。
+- 禁止修改：Host durable state machine、Host command path、Host handle method、`open_host(options)` 字段名、public request / response dataclass 字段名、`dayu.host` public exports、Engine execution loop 行为边界、ToolRuntime accept barrier、具体财报业务工具实现、Fins storage。
+
+不做：
+- 不实现真实 Service / CLI / Web / GUI workflow 接入。
+- 不实现 Skill workflow orchestration、artifact store、parser/replay/retry/stop policy。
+- 不保留旧 schema 兼容读取、兼容 wrapper 或兼容测试。
+- 不让 ConfigLoader / ScenePrepare / ToolsDiscovery import Host、Engine、Service、UI、Fins 或具体业务工具包。
+- 不让 scene manifest 表达 workflow stage graph、conversation lifecycle、Host runtime deployment、lane、SQLite、artifact root、memory / context policy 或 worker backend。
+
+关键设计问题：
+- Config catalog record id 必须由 map key 提供，record 内不得重复 id；`extends` 引用 map key。
+- override 必须是 typed allowlist，优先级为 UI / Run override > scene typed override > execution profile baseline > code default；未知 override fail fast。
+- runtime location resolver 位于 `dayu.runtime`，负责 workspace config / package default 路径选择；ConfigLoader / ScenePrepare 不内置 fallback。
+- `runtime_lanes.json` 独立于 `host_runtime.json`；`host_runtime.json` 只保留 `host_execution_lane_name` 与 `worker_backend` 等 Host runtime profile 字段。
+- `execution_profiles.json` 使用 `default_execution_profile_id`、`execution_profiles`、`run_baseline`、`compactor_baseline`、`context_budget_policy`、`memory_projection_policy`、`tool_truncation_policy` 与 `agent_policy_profiles`。
+- `models.json.models[*].runtime_hints.runner_option_hints` 是 RunnerCallOptions hint 真源；execution profile 只保存 semantic `runner_option_hint_id`。
+- Host public `ContextBudgetPolicy` 与 `MemoryProjectionPolicy` 改为 `context_window_size` + ratio/floor/cap 模型；`context_window_size` 由 Service 从 effective model config 读取后直接放入 typed policy。
+- `ToolTruncateSpec` 支持声明态缺省 limit / ttl，由 assembly 根据 `tool_truncation_policy` 补齐 effective spec；`fetch_more` 名称不在 config 中配置。
+- `AgentPolicy` profile 一比一对齐 Engine / Host public fields；`fallback_mode` 使用 `force_answer` / `raise_error`，`fallback_prompt` 使用已裁决中文文本。
+- Scene manifest 删除 `conversation` 字段和泛化 `runtime` block；`model.default_name` 改为 `model.default_model_id`，`model.temperature_profile` 改为 `model.runner_option_hint_id`；scene-level AgentPolicy override 使用顶层 typed `agent_policy` block。
+- 旧项目模型目录必须全量迁移到新 `models.json`，provider extension DSL 由 Engine 侧 helper 映射为 Engine typed provider request extension。
+- 最终验证 smoke 必须新增并默认使用 dedicated ordinary scene `smoke_host_public_multiturn`，不写 special case，不用脚本业务默认值遮住 schema / contract 缺口。
+
+交付物：
+- updated `docs/host/design.md`
+- updated `docs/host/implementation-control.md`
+- handoff implementation-ready plan
+- plan review / fix / re-review artifacts
+- implementation slices
+- focused tests、integration smoke、pyright
+- README sync
+
+建议 slice 切分：
+- Slice 1: Host public policy contracts and tool truncate declaration/effective boundary。
+- Slice 2: Config schema correction, runtime location resolver, default config asset migration, full model catalog migration, legacy config deletion。
+- Slice 3: ScenePrepare schema correction and scene asset migration, including `agent_policy`, `model.default_model_id`, `model.runner_option_hint_id`, removal of `conversation` / `runtime` / `prompt_mt`。
+- Slice 4: Runtime assembly adapter/helper and Engine provider extension helper, keeping `dayu.runtime` import boundary clean。
+- Slice 5: Rewrite `utils/smoke_host_public_multiturn.py` as Service-like final validation using dedicated smoke scene, ConfigLoader, ScenePrepare and ToolsDiscovery。
+- Slice 6: README sync, import boundary tests, aggregate validation hardening。
+
+验证要求：
+- unit tests: ConfigLoader new schema validation, map-key ids, single `extends`, workspace whole-record overlay, runtime lanes, worker backend, fallback prompt/mode, agent policy fields, runner option hint resolution prerequisites。
+- unit tests: ScenePrepare new manifest schema, no `conversation`, no raw `runtime` block, `model.default_model_id`, `model.runner_option_hint_id`, top-level `agent_policy` allowlist, names/tags tool selection, dedicated smoke scene assembly。
+- unit tests: Host public `ContextBudgetPolicy` and `MemoryProjectionPolicy` ratio/floor/cap validation and threshold/budget derivation; `ToolTruncateSpec` declaration/effective default filling。
+- unit tests: Engine provider extension DSL helper maps supported provider extensions and fails closed on unknown extensions。
+- integration / smoke: `utils/smoke_host_public_multiturn.py` runtime path does not write business defaults, uses dedicated smoke scene, emits assembly diagnostics, and fails fast on missing config / contract mapping。
+- import boundary tests: `dayu.runtime` modules do not import Host、Engine、Service、UI、Fins 或具体业务工具包。
+- pyright: affected packages and tests pass with no new or expanded errors。
+- docs: `dayu/config/README.md`、`dayu/host/README.md`、`dayu/engine/README.md`、root `README.md`、`tests/README.md` 按触发规则同步。
+
+退出条件：
+- Service-like assembly can derive `OpenHostOptions` and per-run `SubmitFollowupRequest` typed inputs from ConfigLoader、ScenePrepare、ToolsDiscovery、explicit CLI/UI override and stable code defaults only。
+- `utils/smoke_host_public_multiturn.py` rewritten final validation path runs through dedicated smoke scene and reports assembly diagnostics instead of hiding schema / contract gaps。
+- Old config files and old scene schema fields are removed without compatibility readers.
+- Host public command / handle / opener field surface remains unchanged; accepted public contract changes are limited to policy dataclass / truncate spec typed shape.
+- Aggregate deepreview from at least two review Agents PASS; control_doc records all residual risks with owners.
+- User authorization applies: once `ready-to-open-draft-PR` is reached, controller may automatically enter draft PR gate and proceed to `draft-PR-pass`.
+
+后续依赖：
+- 后续 Service / UI / workflow integration can rely on runtime assembly helpers and smoke diagnostics as the production assembly reference.
+- Real financial tool provider, financial scene content and workflow orchestration remain separate Service / Fins / UI work units.
+
 ### Phase 13. Audit / Tool Trace / Outbox Projections
 
 目标：
@@ -1843,7 +1950,7 @@ Plan 必须额外收口的 readiness review checklist：
 追踪项：
 
 - 真实 Service assembly / workflow wire-up：owner 为后续 Service / UI / workflow integration work unit。P12 只交付 Host 外部 runtime assembly primitives，不实现真实 Service workflow、Skill workflow、artifact/parser/retry/replay/stop policy。触发条件为真实 CLI / Web / GUI 接入 ScenePrepare + ConfigLoader + ToolsDiscovery 并映射到 `open_host(options)` / `SubmitFollowupRequest`；后续验证必须覆盖真实 Service 在 Host 外部完成 override 优先级合并、runner / agent typed mapping、tool bundle 子集选择与 prompt 注入。
-- 模型 allow-list、temperature profile 与旧 runtime budget mapping：owner 为后续 Service / execution profile owner。P12 保留 scene `model.temperature_profile` typed hint，但不把旧 `allowed_names` 或 raw runtime patch dict 塞入 scene manifest。触发条件为 Service 需要 enforce model allow-list、temperature profile 或旧 `max_iterations` / `tool_timeout_seconds` 预算；后续设计必须通过 ConfigLoader typed profile 与 Service mapping 显式实现，不得回退为 manifest raw patch。
+- 模型 allow-list 与旧 runtime budget mapping：owner 为后续 Service / execution profile owner。P12.1 将旧 scene `model.temperature_profile` 收口为 `model.runner_option_hint_id`，不把旧 `allowed_names` 或 raw runtime patch dict 塞入 scene manifest。触发条件为 Service 需要 enforce model allow-list 或旧 `max_iterations` / `tool_timeout_seconds` 预算；后续设计必须通过 ConfigLoader typed profile 与 Service mapping 显式实现，不得回退为 manifest raw patch。
 - `ToolBundleSourceRef` dedicated behavioral tests：owner 为 contracts test hardening owner。当前 contracts export whitelist、import boundary 与 pyright 已覆盖 source ref contract；后续若 source ref validation 继续扩展，应补 source id / optional blank string 等 dedicated behavioral tests。
 - Runtime README hardening：owner 为 docs hardening owner。当前项目 README 触发规则已由 `dayu/README.md`、`dayu/config/README.md` 与 `tests/README.md` 覆盖 P12 稳定事实；若 runtime 包继续扩展为独立公共开发入口，可新增 `dayu/runtime/README.md` 并定义其职责。
 - Scene asset drift guard：owner 为 scene asset / config test hardening owner。当前迁移测试直接遍历真实 `dayu/config/prompts/manifests/*.json`，满足 P12 迁移验收；后续新增 / 删除 scene asset 时，应同步测试期望或加入 manifest enumeration drift assertion。

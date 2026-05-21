@@ -90,14 +90,10 @@ class _CommandContextBudgetFields:
 
     :param context_window_size: command handle 必填 context window token 数。
     :param reserved_output_tokens: command handle 必填输出预留 token 数。
-    :param hard_threshold_tokens: 可选 hard threshold token 数。
-    :param minimum_protection_tokens: 可选最小保护 token 数。
     """
 
     context_window_size: int
     reserved_output_tokens: int
-    hard_threshold_tokens: int | None
-    minimum_protection_tokens: int | None
 
 
 @dataclass(slots=True)
@@ -565,12 +561,8 @@ def _command_options_from_open_host_options(
         payload_inline_threshold_bytes=options.payload_inline_threshold_bytes,
         context_window_size=context_budget_fields.context_window_size,
         reserved_output_tokens=context_budget_fields.reserved_output_tokens,
-        context_budget_hard_threshold_tokens=(
-            context_budget_fields.hard_threshold_tokens
-        ),
-        context_budget_minimum_protection_tokens=(
-            context_budget_fields.minimum_protection_tokens
-        ),
+        context_budget_hard_threshold_tokens=None,
+        context_budget_minimum_protection_tokens=None,
         local_execution=local_execution,
     )
 
@@ -597,14 +589,30 @@ def _command_context_budget_fields_from_open_host_options(
             reserved_output_tokens=(
                 _INTERNAL_COMMAND_FALLBACK_RESERVED_OUTPUT_TOKENS
             ),
-            hard_threshold_tokens=None,
-            minimum_protection_tokens=None,
         )
     return _CommandContextBudgetFields(
         context_window_size=context_policy.context_window_size,
-        reserved_output_tokens=context_policy.reserved_output_tokens,
-        hard_threshold_tokens=context_policy.hard_threshold_tokens,
-        minimum_protection_tokens=context_policy.minimum_protection_tokens,
+        reserved_output_tokens=_internal_reserved_output_tokens_for_policy(
+            context_policy.context_window_size
+        ),
+    )
+
+
+def _internal_reserved_output_tokens_for_policy(context_window_size: int) -> int:
+    """为内部 command options 派生合法输出预留占位值。
+
+    显式 ``OpenHostOptions.context_budget_policy`` 已作为
+    ``HostLocalExecutionOptions.context_budget_policy`` 传入 scheduler；这里的
+    reserved output 只满足内部 command options 的既有必填 validation，不作为
+    ratio-first policy 真源。
+
+    :param context_window_size: 显式 policy 的 context window token 数。
+    :returns: 小于 context window 的正整数输出预留。
+    """
+
+    return min(
+        _INTERNAL_COMMAND_FALLBACK_RESERVED_OUTPUT_TOKENS,
+        context_window_size - 1,
     )
 
 

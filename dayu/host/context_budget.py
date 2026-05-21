@@ -26,12 +26,12 @@ from dayu.host._public_validation import (
 from dayu.host._public_validation import require_positive_int as _require_positive_int
 from dayu.host.context_policy import (
     ContextBudgetPolicy,
-    DEFAULT_CONTEXT_SAFETY_MARGIN_RATIO,
+    DEFAULT_SOFT_THRESHOLD_CONTEXT_RATIO,
     MIN_CONTEXT_HARD_THRESHOLD_TOKENS,
 )
 from dayu.host.durable.codec import canonical_json_dumps, sha256_digest_json
 
-DEFAULT_INPUT_SOFT_THRESHOLD_RATIO = 1.0 - DEFAULT_CONTEXT_SAFETY_MARGIN_RATIO
+DEFAULT_INPUT_SOFT_THRESHOLD_RATIO = DEFAULT_SOFT_THRESHOLD_CONTEXT_RATIO
 DEFAULT_ESTIMATOR_CHARS_PER_TOKEN = 3
 DEFAULT_ESTIMATOR_JSON_BYTES_PER_TOKEN = 3
 DEFAULT_ESTIMATOR_MESSAGE_OVERHEAD_TOKENS = 12
@@ -165,7 +165,7 @@ class BudgetEstimate:
     """Context budget 估算结果。
 
     :param estimated_input_tokens: 保守估算的输入 token 数。
-    :param input_budget_tokens: ``context_window_size - reserved_output_tokens``。
+    :param input_budget_tokens: Host policy 的 ``context_window_size``。
     :param soft_threshold_tokens: soft threshold token 数。
     :param hard_threshold_tokens: hard threshold token 数。
     :param safety_margin_tokens: soft threshold 上方预留的安全余量 token 数。
@@ -315,9 +315,9 @@ def estimate_context_budget(
         for fragment in estimate_input.tool_schema_fragments
     )
     estimated_input_tokens = message_tokens + json_tokens + tool_schema_tokens
-    input_budget_tokens = policy.context_window_size - policy.reserved_output_tokens
-    soft_threshold_tokens = _soft_threshold_tokens(policy, input_budget_tokens)
-    hard_threshold_tokens = _hard_threshold_tokens(policy, input_budget_tokens)
+    input_budget_tokens = policy.context_window_size
+    soft_threshold_tokens = _soft_threshold_tokens(policy)
+    hard_threshold_tokens = _hard_threshold_tokens(policy)
     overage_reason = _overage_reason(
         estimated_input_tokens=estimated_input_tokens,
         soft_threshold_tokens=soft_threshold_tokens,
@@ -359,33 +359,27 @@ def decide_context_budget(estimate: BudgetEstimate) -> ContextBudgetDecision:
     return ContextBudgetDecision.ALLOW_DISPATCH
 
 
-def _soft_threshold_tokens(
-    policy: ContextBudgetPolicy, input_budget_tokens: int
-) -> int:
+def _soft_threshold_tokens(policy: ContextBudgetPolicy) -> int:
     """计算 soft threshold。
 
     :param policy: Host context budget policy。
-    :param input_budget_tokens: 输入预算 token 数。
     :returns: soft threshold token 数。
     """
 
-    ratio = 1 - policy.safety_margin_ratio
-    return max(_MIN_SOFT_THRESHOLD_TOKENS, floor(input_budget_tokens * ratio))
+    return max(
+        _MIN_SOFT_THRESHOLD_TOKENS,
+        floor(policy.context_window_size * policy.soft_threshold_context_ratio),
+    )
 
 
-def _hard_threshold_tokens(
-    policy: ContextBudgetPolicy, input_budget_tokens: int
-) -> int:
+def _hard_threshold_tokens(policy: ContextBudgetPolicy) -> int:
     """计算 hard threshold。
 
     :param policy: Host context budget policy。
-    :param input_budget_tokens: 输入预算 token 数。
     :returns: hard threshold token 数。
     """
 
-    if policy.hard_threshold_tokens is not None:
-        return policy.hard_threshold_tokens
-    return input_budget_tokens - policy.minimum_protection_tokens
+    return floor(policy.context_window_size * policy.hard_threshold_context_ratio)
 
 
 def _overage_reason(
@@ -455,10 +449,8 @@ def _estimator_digest(
         "policy": {
             "policy_ref": policy.policy_ref,
             "context_window_size": policy.context_window_size,
-            "reserved_output_tokens": policy.reserved_output_tokens,
-            "safety_margin_ratio": policy.safety_margin_ratio,
-            "hard_threshold_tokens": policy.hard_threshold_tokens,
-            "minimum_protection_tokens": policy.minimum_protection_tokens,
+            "soft_threshold_context_ratio": policy.soft_threshold_context_ratio,
+            "hard_threshold_context_ratio": policy.hard_threshold_context_ratio,
         },
         "input": {
             "session_id": estimate_input.session_id,
@@ -478,9 +470,6 @@ def _estimator_digest(
             "current_prompt_ref": estimate_input.current_prompt_ref,
         },
         "constants": {
-            "default_context_safety_margin_ratio": (
-                DEFAULT_CONTEXT_SAFETY_MARGIN_RATIO
-            ),
             "default_input_soft_threshold_ratio": (
                 DEFAULT_INPUT_SOFT_THRESHOLD_RATIO
             ),

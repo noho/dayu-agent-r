@@ -47,8 +47,8 @@ from dayu.host.api import (
     SessionSnapshot,
     StartRunRequest,
     SubmitFollowupRequest,
+    _context_budget_policy_from_command_options,
 )
-from dayu.host.context_policy import default_context_budget_policy
 from dayu.host._execution_config_projection import (
     optional_agent_policy_json as _optional_agent_policy_json,
     optional_runner_options_json as _optional_runner_options_json,
@@ -294,36 +294,17 @@ def compose_host_local_execution_options(
 
     if options.local_execution is None:
         return None
+    context_budget_policy = (
+        options.local_execution.context_budget_policy
+        if options.local_execution.context_budget_policy is not None
+        else _context_budget_policy_from_command_options(options)
+    )
     return replace(
         options.local_execution,
-        context_budget_policy=default_context_budget_policy(
-            context_window_size=options.context_window_size,
-            reserved_output_tokens=options.reserved_output_tokens,
-            hard_threshold_tokens=options.context_budget_hard_threshold_tokens,
-            minimum_protection_tokens=_minimum_protection_tokens_from_options(
-                options
-            ),
-        ),
+        context_budget_policy=context_budget_policy,
         compact_artifact_root=options.artifact_root,
         compact_artifact_create_parent_dirs=options.create_parent_dirs,
     )
-
-
-def _minimum_protection_tokens_from_options(
-    options: HostCommandHandleOptions,
-) -> int:
-    """返回 command options 指定或默认的 minimum protection tokens。
-
-    :param options: Host command handle options。
-    :returns: minimum protection tokens。
-    """
-
-    if options.context_budget_minimum_protection_tokens is not None:
-        return options.context_budget_minimum_protection_tokens
-    return default_context_budget_policy(
-        context_window_size=options.context_window_size,
-        reserved_output_tokens=options.reserved_output_tokens,
-    ).minimum_protection_tokens
 
 
 def ensure_session(
