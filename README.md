@@ -948,11 +948,26 @@ dayu-cli process --ticker AAPL --ci --document-id fil_001 --document-id fil_002
 
 ### 5.1 Host public 多轮闭环 smoke
 
-`utils/smoke_host_public_multiturn.py` 用于人工观察真实生产系统 Service 只通过 Host public interface / contract 完成多轮会话闭环的过程。脚本写死 DeepSeek：ordinary runner 与 Host-owned compactor runner 都使用 `DEEPSEEK_API_KEY`；构造期通过 `OpenHostOptions` 注入本地 worker factory、mock business tool、memory policy 与 `CompactorRunnerBaseline`，不传入 Host runtime liveness identity，也不注入低层 compactor port。打开后脚本只调用 public Host handle。脚本把 Dayu 日志默认打开到 `VERBOSE`，便于观察 Host command、dispatch、EngineEvent ingest、ToolRuntime、memory catch-up 与 context compact 主路径。
+`utils/smoke_host_public_multiturn.py` 用于人工观察真实生产式 runtime assembly 是否能只通过 Host public interface / contract 完成多轮会话闭环。脚本默认使用 runtime location resolver 解析 `workspace/config` overlay、prompt asset root 与 scene manifest root，再通过 `ConfigLoader`、`ToolsDiscovery`、`ScenePrepare`、Engine provider extension helper 和 smoke-local composition adapter 映射为 `open_host(options)` 与每轮 `submit_followup` typed input。打开后脚本只调用 public Host handle。脚本把 Dayu 日志默认打开到 `VERBOSE`，便于观察 Host command、dispatch、EngineEvent ingest、ToolRuntime、memory catch-up 与 context compact 主路径。
 
 ```bash
 source .venv/bin/activate
 python utils/smoke_host_public_multiturn.py
+```
+
+默认 scene 是 `smoke_host_public_multiturn`，会在已发现的业务工具 bundle 内按 tag 选择工具。若 `workspace/config/tool_discovery.json` 没有启用能提供匹配工具的 provider，脚本会在调用 Host 前 fail fast，不会在脚本内补一个 raw `ToolBundle`。
+
+可显式覆盖 workspace、scene、execution profile、Host runtime、模型和 runner option hint：
+
+```bash
+source .venv/bin/activate
+python utils/smoke_host_public_multiturn.py \
+  --workspace-root /path/to/workspace \
+  --scene-id smoke_host_public_multiturn \
+  --execution-profile-id standard \
+  --host-runtime-id local \
+  --model-id deepseek-v4-flash \
+  --runner-option-hint-id interactive
 ```
 
 常用调试模式：
@@ -962,7 +977,7 @@ source .venv/bin/activate
 python utils/smoke_host_public_multiturn.py --log-level DEBUG
 ```
 
-该脚本不是 pytest，不断言模型固定回答。它会打印 Session / Run / terminal HostEvent 摘要、final answer 预览、mock tool 调用次数、compact artifact 路径，并保留运行目录 `workspace/tmp/host_public_multiturn_smoke/latest` 供人工排查。脚本不输出 API key、headers、完整 prompt 或 provider payload。
+该脚本不是 pytest，不断言模型固定回答。它会在调用 Host 前打印 assembly diagnostics，包括 config overlay、prompt root、scene manifest root、Host runtime id、execution profile id、model id、runner option hint id、lane name、tool provider report、tool selection、policy refs、provider extension DSL 映射状态和建议后续提取的 adapter/helper 名称。运行后会打印 Session / Run / terminal HostEvent 摘要、final answer 预览、compact artifact 路径；脚本不输出 API key、headers、完整 prompt 或 provider payload。
 
 ### 5.2 Engine provider smoke
 
