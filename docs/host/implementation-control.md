@@ -408,6 +408,10 @@ Phase Map 中每个 phase 必须使用统一条目格式。模板如下：
 
 当前 gate 追加事实（Phase 12 Slice 6 accepted）：Accepted Slice 6 local commit hash 为 `ba58d8a`。当前进入 Phase 12 aggregate deepreview / phase acceptance validation。
 
+当前 gate 追加事实（Phase 12 aggregate controller validation finding）：Controller phase acceptance validation 发现 `tests/contracts/test_package_exports.py::test_contracts_all_matches_expected_set` 失败，`dayu.contracts.__all__` 额外包含 `ToolBundleSourceKind` / `ToolBundleSourceRef`；Controller finding artifact 为 `docs/reviews/phase12-aggregate-controller-validation-finding-20260521.md`。总控裁决：Phase 12 Slice 1 将 source ref canonical owner 下移到 `dayu.contracts` 是设计接受的 production export，当前问题是 contracts package export whitelist test 未同步，接受为 aggregate fix。当前进入 Phase 12 aggregate fix。
+
+当前 gate 追加事实（Phase 12 aggregate fix）：Phase 12 aggregate fix artifact 为 `docs/reviews/phase12-aggregate-fix-codex-20260521.md`；fix 将 `ToolBundleSourceKind` / `ToolBundleSourceRef` 加入 `tests/contracts/test_package_exports.py` 的 `EXPECTED_EXPORTS`，不修改 production exports。Controller 本地复跑：`pytest tests/contracts tests/engine/test_config_models.py tests/host/test_tooling_options.py tests/host/test_package_exports.py -q` 69 passed；`pytest tests/runtime -q` 174 passed；`python -m pyright dayu/contracts dayu/runtime dayu/host tests/contracts tests/runtime tests/host tests/engine/test_config_models.py` 0 errors；`git diff --check` clean。当前进入 Phase 12 aggregate deepreview / phase acceptance validation。
+
 ## Phase Map
 
 Phase 按依赖关系推进：先实现被其它阶段依赖的公共契约、runtime 基础能力、durable store、EventLog 与状态机，再连接执行路径、工具治理、projection core、memory、context governance、ordinary local multi-turn public contract freeze、recovery 与 remote。Audit、Tool Trace、Outbox 是独立 projection sinks，后置到核心治理路径稳定之后实现。Phase 0 是 Engine cleanup 前置 work unit，只阻塞 Phase 10 Context Governance，不阻塞 Phase 1-9。每个 phase 开始时仍必须先和用户讨论并细化对应 `docs/host/design.md` 章节，再生成 handoff implementation-ready plan。
