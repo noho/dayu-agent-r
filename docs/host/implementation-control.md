@@ -223,8 +223,8 @@ Phase Map 中每个 phase 必须使用统一条目格式。模板如下：
 约束：本节只保留当前 gate 结论；phase 过程流水必须归档到 `历史记录`，仍需追踪的风险或后续 owner 必须写入 `Open Questions 与风险追踪` 的 `追踪区`。
 
 当前 work unit：Phase 12.1 runtime assembly schema / public contract correction follow-up。
-当前 gate：Slice 2 accepted local commit。
-下一 gate：Slice 3 implementation。
+当前 gate：Slice 3 implementation。
+下一 gate：Slice 3 code review。
 
 当前 gate 追加事实（Phase 12.1 Slice 2 implementation）：Phase 12.1 Slice 2 implementation artifact 为 `docs/reviews/phase12-1-slice2-implementation-codex-20260521.md`；implementation agent 更新 `dayu.runtime.config_loader` 新 schema typed view、runtime location resolver、默认 `models.json` / `execution_profiles.json` / `host_runtime.json` / `runtime_lanes.json` / `tool_discovery.json` 配置、全量旧模型迁移、runtime / engine config tests 与 README。Controller 本地复跑：`pytest tests/runtime/test_config_loader.py tests/runtime/test_runtime_location.py tests/runtime/test_import_boundary.py tests/runtime/test_weak_typing_guard.py -q` 35 passed；`pytest tests/engine/test_config_models.py -q` 4 passed；`python -m pyright dayu/runtime tests/runtime tests/engine/test_config_models.py` 0 errors；`git diff --check` clean。当前进入 Phase 12.1 Slice 2 code review。
 
