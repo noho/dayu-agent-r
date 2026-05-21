@@ -88,13 +88,13 @@ Expected file-level diff summary before coding:
 
 ## Validation
 
-- `source .venv/bin/activate && pytest tests/host/test_context_policy.py tests/host/test_context_budget.py tests/host/test_memory_projection.py tests/host/test_toolruntime_truncation_fetch_more.py -q`  
+- `source .venv/bin/activate && pytest tests/host/test_context_policy.py tests/host/test_context_budget.py tests/host/test_memory_projection.py tests/host/test_toolruntime_truncation_fetch_more.py -q`
   Result: passed, `75 passed`.
-- `source .venv/bin/activate && pytest tests/host/test_public_open_host_options.py tests/host/test_phase6_toolruntime_integration.py -q`  
+- `source .venv/bin/activate && pytest tests/host/test_public_open_host_options.py tests/host/test_phase6_toolruntime_integration.py -q`
   Result: passed, `8 passed`.
-- `source .venv/bin/activate && python -m pyright dayu/host dayu/contracts tests/host`  
+- `source .venv/bin/activate && python -m pyright dayu/host dayu/contracts tests/host`
   Result: passed, `0 errors, 0 warnings, 0 informations`.
-- `git diff --check`  
+- `git diff --check`
   Result: passed.
 
 ## Residual Risks
@@ -132,15 +132,15 @@ Slice 1 implementation complete. No commits, pushes, PRs, or additional gates we
 
 ### Fix Validation
 
-- `source .venv/bin/activate && pytest tests/host/test_open_host_runtime.py::test_command_options_reflect_explicit_context_budget_policy -q`  
+- `source .venv/bin/activate && pytest tests/host/test_open_host_runtime.py::test_command_options_reflect_explicit_context_budget_policy -q`
   Result: passed, `1 passed`.
-- `source .venv/bin/activate && pytest tests/host/test_context_policy.py tests/host/test_context_budget.py tests/host/test_memory_projection.py tests/host/test_toolruntime_truncation_fetch_more.py -q`  
+- `source .venv/bin/activate && pytest tests/host/test_context_policy.py tests/host/test_context_budget.py tests/host/test_memory_projection.py tests/host/test_toolruntime_truncation_fetch_more.py -q`
   Result: passed, `75 passed`.
-- `source .venv/bin/activate && pytest tests/host/test_public_open_host_options.py tests/host/test_phase6_toolruntime_integration.py -q`  
+- `source .venv/bin/activate && pytest tests/host/test_public_open_host_options.py tests/host/test_phase6_toolruntime_integration.py -q`
   Result: passed, `8 passed`.
-- `source .venv/bin/activate && python -m pyright dayu/host dayu/contracts tests/host`  
+- `source .venv/bin/activate && python -m pyright dayu/host dayu/contracts tests/host`
   Result: passed, `0 errors, 0 warnings, 0 informations`.
-- `git diff --check`  
+- `git diff --check`
   Result: passed.
 
 ### Residual Risk Classification
