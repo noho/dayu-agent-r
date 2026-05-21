@@ -248,6 +248,61 @@ def test_single_scene_assembly_outputs_stable_refs_and_digest(tmp_path: Path) ->
     assert result.capability_tags == ("earnings", "analysis")
 
 
+def test_model_temperature_profile_is_preserved(tmp_path: Path) -> None:
+    """manifest model.temperature_profile 应保留为 typed model hint。"""
+
+    _write_json(
+        tmp_path / "manifests" / "profiled.json",
+        _manifest(
+            "profiled",
+            model={
+                "default_name": "analyst-model",
+                "temperature_profile": "low-variance",
+            },
+        ),
+    )
+
+    result = prepare_scene(_request(tmp_path, "profiled"))
+
+    assert result.model_hints.default_name == "analyst-model"
+    assert result.model_hints.temperature_profile_id == "low-variance"
+
+
+def test_content_digest_changes_when_temperature_profile_changes(
+    tmp_path: Path,
+) -> None:
+    """只修改 model.temperature_profile 时 content digest 必须变化。"""
+
+    manifest_path = tmp_path / "manifests" / "digest_profile.json"
+    _write_json(
+        manifest_path,
+        _manifest(
+            "digest_profile",
+            model={
+                "default_name": "analyst-model",
+                "temperature_profile": "analytical",
+            },
+        ),
+    )
+    first = prepare_scene(_request(tmp_path, "digest_profile"))
+
+    _write_json(
+        manifest_path,
+        _manifest(
+            "digest_profile",
+            model={
+                "default_name": "analyst-model",
+                "temperature_profile": "creative",
+            },
+        ),
+    )
+    second = prepare_scene(_request(tmp_path, "digest_profile"))
+
+    assert first.model_hints.temperature_profile_id == "analytical"
+    assert second.model_hints.temperature_profile_id == "creative"
+    assert first.content_digest != second.content_digest
+
+
 def test_required_context_slot_missing_fails_fast(tmp_path: Path) -> None:
     """required context slot 缺失必须失败。"""
 

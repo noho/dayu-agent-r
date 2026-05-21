@@ -176,9 +176,12 @@ class SceneModelHints:
 
     :param default_name: scene 建议的模型配置名，由 Service 映射为完整
         Runner 输入。
+    :param temperature_profile_id: scene 建议的 runner options profile id，由
+        Service 映射为完整 RunnerCallOptions。
     """
 
     default_name: str
+    temperature_profile_id: str | None
 
     def __post_init__(self) -> None:
         """校验模型 hint。
@@ -188,6 +191,11 @@ class SceneModelHints:
         """
 
         _require_non_empty_text(self.default_name, field_name="SceneModelHints.default_name")
+        if self.temperature_profile_id is not None:
+            _require_non_empty_text(
+                self.temperature_profile_id,
+                field_name="SceneModelHints.temperature_profile_id",
+            )
 
 
 @dataclass(frozen=True, slots=True)
@@ -687,7 +695,16 @@ def _parse_model_hints(value: JsonValue | None, *, context: str) -> SceneModelHi
         return None
     record = _require_json_object(value, context=f"{context}.model")
     return SceneModelHints(
-        default_name=_require_str_field(record, field_name="default_name", context=f"{context}.model")
+        default_name=_require_str_field(
+            record,
+            field_name="default_name",
+            context=f"{context}.model",
+        ),
+        temperature_profile_id=_optional_str_field(
+            record,
+            field_name="temperature_profile",
+            context=f"{context}.model",
+        ),
     )
 
 

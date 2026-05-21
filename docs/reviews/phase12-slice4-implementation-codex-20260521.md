@@ -97,3 +97,41 @@ Slice 4 implementation 已完成，未进入 code review、commit、push、PR �
 
 - DS finding 2 duplicate fragment order 错误消息增强按 controller 裁决 deferred，本次未处理。
 - 旧 `dayu-agent` scene asset migration 仍归 Slice 5，本次未处理。
+
+## Follow-up fix addendum
+
+### Gate
+
+- Current gate: Phase 12 Slice 4 follow-up fix
+- Source finding: `docs/reviews/phase12-slice4-followup-controller-finding-20260521.md`
+- Fix scope: `SceneModelHints` 保留 `model.temperature_profile`，不启动完整 workflow，不 commit、不 push、不进入下一 gate。
+
+### Fix 内容
+
+- `dayu.runtime.scene_prepare.SceneModelHints` 新增 `temperature_profile_id: str | None`。
+- `_parse_model_hints` 从 manifest `model.temperature_profile` 读取可选非空字符串，并保留到 `PreparedSceneInputs.model_hints`。
+- `ScenePrepare` 仍只输出 typed hint；未把 temperature profile 映射为 `RunnerCallOptions`，该映射仍由 Service / composition root 负责。
+- 未恢复 `allowed_names` 到 runtime output，未修改 Host public interface。
+- 新增 focused tests：
+  - manifest 带 `model.temperature_profile` 时，`result.model_hints.temperature_profile_id` 可读到对应值。
+  - 只修改 `model.temperature_profile` 时，`content_digest` 发生变化；当前 digest 覆盖 raw manifest，该测试固定此行为。
+
+### Fix 验证结果
+
+- `source .venv/bin/activate && pytest tests/runtime/test_scene_prepare.py tests/runtime/test_scene_tool_selection.py -q`
+  - 26 passed
+- `source .venv/bin/activate && pytest tests/runtime/test_import_boundary.py tests/runtime/test_weak_typing_guard.py -q`
+  - 8 passed
+- `source .venv/bin/activate && python -m pyright dayu/runtime tests/runtime`
+  - 0 errors, 0 warnings, 0 informations
+- `git diff --check`
+  - clean
+
+### 文档同步
+
+- `dayu/config/README.md` 补充 scene manifest `model.default_name` 与可选 `model.temperature_profile` 的稳定职责，明确二者只由 Service / composition root 映射为完整执行输入。
+
+### 残余风险
+
+- 旧 `dayu-agent` scene asset migration 仍归 Slice 5，本次未处理。
+- Service 将 `model_hints.temperature_profile_id` 映射到 execution profile 的 `runner_options_profile_id` 不属于本 follow-up fix。
