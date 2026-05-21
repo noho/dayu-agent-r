@@ -1,0 +1,75 @@
+{
+  "schema_version": 1,
+  "scene": "prompt_mt",
+  "version": "v1",
+  "description": "多轮财报分析场景",
+  "capability_tags": [
+    "prompt_mt"
+  ],
+  "extends": [],
+  "model": {
+    "default_name": "mimo-v2.5-pro-thinking-plan",
+    "temperature_profile": "prompt"
+  },
+  "runtime": {},
+  "conversation": {
+    "mode": "interactive"
+  },
+  "tool_selection": {
+    "mode": "select",
+    "tool_names": [],
+    "tool_tags_any": [
+      "web",
+      "fins",
+      "ingestion"
+    ],
+    "allow_empty": false
+  },
+  "defaults": {
+    "missing_required_fragment": "fail_closed"
+  },
+  "fragments": [
+    {
+      "id": "base_agents",
+      "path": "base/agents.md",
+      "order": 100,
+      "required": true
+    },
+    {
+      "id": "base_soul",
+      "path": "base/soul.md",
+      "order": 200,
+      "required": true
+    },
+    {
+      "id": "base_fact_rules",
+      "path": "base/fact_rules.md",
+      "order": 300,
+      "required": true
+    },
+    {
+      "id": "base_tools",
+      "path": "base/tools.md",
+      "order": 400,
+      "required": true
+    },
+    {
+      "id": "prompt_mt_scene",
+      "path": "scenes/prompt_mt.md",
+      "order": 500,
+      "required": true
+    }
+  ],
+  "context_slots": [
+    {
+      "name": "fins_default_subject",
+      "value_type": "string",
+      "required": true
+    },
+    {
+      "name": "base_user",
+      "value_type": "string",
+      "required": true
+    }
+  ]
+}

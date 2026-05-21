@@ -26,6 +26,10 @@ dayu/config/
 ├── execution_profiles.json
 ├── host_runtime.json
 ├── models.json
+├── prompts/
+│   ├── base/
+│   ├── manifests/
+│   └── scenes/
 └── tool_discovery.json
 ```
 
@@ -110,7 +114,15 @@ provider 字段：
 
 ## prompts 目录职责
 
-`workspace/config/prompts/` 与包内 prompt asset 目录用于放置 prompt fragments 和 scene manifests。Scene manifest 由 `dayu.runtime.scene_prepare` 解释；ConfigLoader 不读取、拼接或渲染 scene manifest。
+`workspace/config/prompts/` 与包内 `dayu/config/prompts/` 用于放置 prompt fragments 和 scene manifests。包内默认资产按目录分为：
+
+| 路径 | 职责 |
+|---|---|
+| `prompts/manifests/*.json` | ScenePrepare schema v1 scene manifest |
+| `prompts/base/*.md` | 多个 scene 复用的基础 prompt fragment |
+| `prompts/scenes/*.md` | 单个 scene 的场景 prompt fragment |
+
+Scene manifest 由 `dayu.runtime.scene_prepare` 解释；ConfigLoader 不读取、拼接或渲染 scene manifest。`prompts/tasks/`、contract 文件、workflow 产物和未被 scene manifest 直接引用的模板不属于当前包内默认资产范围。
 
 Scene manifest 第一版是单 Run 场景装配输入，必含 `schema_version`、`scene`、`version`、`description`、`capability_tags`、`extends`、`model`、`runtime`、`conversation`、`tool_selection`、`defaults`、`fragments` 与 `context_slots`。`model.default_name` 表达模型配置 hint，`model.temperature_profile` 表达可选 runner options profile hint；二者都只由 Service / composition root 映射为完整执行输入。调用方显式传入 manifest root、prompt asset root、typed context slot values 与可用工具目录；ScenePrepare 只读取 manifest 直接引用的 fragments，执行确定性的 `{{slot_name}}` 文本替换，并输出 system messages、工具选择结果、model / runtime / conversation hints、fragment refs、source refs 与 content digest。
 
