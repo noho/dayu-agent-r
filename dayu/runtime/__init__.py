@@ -4,7 +4,7 @@
 可被 :mod:`dayu.engine` / ``dayu.host`` / ``dayu.service`` / ``dayu.ui`` /
 ``dayu.fins`` 复用的基础能力（日志装配、协作式取消等待 / race helper、
   cross-process lane、同步 filelock wrapper、层中立工具发现装配、层中立配置加载、
-  层中立 scene manifest 装配、层中立工具截断声明补齐）。
+  层中立 runtime 位置解析、层中立 scene manifest 装配、层中立工具截断声明补齐）。
 
 硬约束（架构）：
 
@@ -22,7 +22,8 @@
 本包不导出业务语义、不持有 Host 治理状态、不持有 Engine 协议状态机。
 当前包含 ``dayu.runtime.lane``、``dayu.runtime.filelock``、
 ``dayu.runtime.tools_discovery``、``dayu.runtime.config_loader`` 与
-``dayu.runtime.scene_prepare``、``dayu.runtime.tool_truncation`` 等层中立
+``dayu.runtime.location``、``dayu.runtime.scene_prepare``、
+``dayu.runtime.tool_truncation`` 等层中立
 runtime 能力；包根不 re-export
 这些模块符号。
 """

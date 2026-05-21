@@ -9,7 +9,7 @@ scene manifest，不读取财报仓储，也不 import 业务层。
 from __future__ import annotations
 
 import json
-from collections.abc import Mapping
+from collections.abc import Container, Mapping
 from dataclasses import dataclass
 from enum import StrEnum
 from pathlib import Path
@@ -20,6 +20,7 @@ from dayu.contracts import JsonValue, ToolBundleSourceKind
 _MODELS_FILE: Final[str] = "models.json"
 _EXECUTION_PROFILES_FILE: Final[str] = "execution_profiles.json"
 _HOST_RUNTIME_FILE: Final[str] = "host_runtime.json"
+_RUNTIME_LANES_FILE: Final[str] = "runtime_lanes.json"
 _TOOL_DISCOVERY_FILE: Final[str] = "tool_discovery.json"
 _LEGACY_CONFIG_FILES: Final[frozenset[str]] = frozenset(
     {"llm_models.json", "run.json"}
@@ -28,12 +29,29 @@ _CONFIG_FILE_NAMES: Final[tuple[str, ...]] = (
     _MODELS_FILE,
     _EXECUTION_PROFILES_FILE,
     _HOST_RUNTIME_FILE,
+    _RUNTIME_LANES_FILE,
     _TOOL_DISCOVERY_FILE,
 )
 _EXTENDS_FIELD: Final[str] = "extends"
 _IMPORT_PATH_FIELD: Final[str] = "import_path"
 _ENTRY_POINT_FIELD: Final[str] = "entry_point"
 _CONFIG_ROOT: Final[Path] = Path(__file__).resolve().parents[1] / "config"
+_DEFAULT_FALLBACK_PROMPT: Final[str] = (
+    "请基于已获得的信息直接回答问题。信息不足时必须说明不确定性，不得编造。"
+)
+_FORBIDDEN_RECORD_ID_FIELDS: Final[frozenset[str]] = frozenset(
+    {
+        "runtime_id",
+        "host_runtime_id",
+        "model_id",
+        "profile_id",
+        "execution_profile_id",
+        "provider_id",
+    }
+)
+_AGENT_FALLBACK_MODES: Final[frozenset[str]] = frozenset(
+    {"force_answer", "raise_error"}
+)
 _TOOL_DISCOVERY_SOURCE_KINDS: Final[frozenset[ToolBundleSourceKind]] = frozenset(
     {
         ToolBundleSourceKind.EXPLICIT_PROVIDER,
@@ -73,10 +91,37 @@ class RunnerKind(StrEnum):
 
 
 @dataclass(frozen=True, slots=True)
+class RunnerOptionHintConfig:
+    """模型内 semantic RunnerCallOptions hint。
+
+    :param temperature: Runner 调用 temperature。
+    :param max_tokens: Runner 调用最大输出 token 数。
+    :param top_p: Runner 调用 top-p。
+    :param stream: 是否请求流式输出。
+    """
+
+    temperature: float
+    max_tokens: int
+    top_p: float
+    stream: bool
+
+
+@dataclass(frozen=True, slots=True)
+class ModelRuntimeHintsConfig:
+    """模型运行期 hints。
+
+    :param runner_option_hints: 按 semantic hint id 索引的 RunnerCallOptions
+        配置片段。
+    """
+
+    runner_option_hints: Mapping[str, RunnerOptionHintConfig]
+
+
+@dataclass(frozen=True, slots=True)
 class ModelConfig:
     """模型目录中的单个模型配置。
 
-    :param model_id: 模型配置稳定标识。
+    :param model_id: 模型配置稳定标识，由 map key 注入。
     :param runner_kind: Runner 类别。
     :param provider: provider 标识。
     :param model: provider 模型名。
@@ -92,6 +137,7 @@ class ModelConfig:
     :param sse_heartbeat_seconds: SSE 空闲诊断 heartbeat 秒数。
     :param provider_request_extension: provider 私有请求扩展，按 JSON 原样保留。
     :param context_window_tokens: 模型上下文窗口 token 数。
+    :param runtime_hints: 模型内运行期 hints。
     """
 
     model_id: str
@@ -110,6 +156,7 @@ class ModelConfig:
     sse_heartbeat_seconds: float
     provider_request_extension: JsonValue
     context_window_tokens: int
+    runtime_hints: ModelRuntimeHintsConfig
 
 
 @dataclass(frozen=True, slots=True)
@@ -123,30 +170,28 @@ class ModelsConfig:
 
 
 @dataclass(frozen=True, slots=True)
-class OrdinaryExecutionConfig:
-    """普通 Run 执行基线配置。
+class ExecutionBaselineConfig:
+    """普通或 compactor 执行基线。
 
-    :param model_id: 默认普通 Run 模型 id。
-    :param runner_options_profile_id: Runner options profile id。
-    :param agent_policy_profile_id: Agent policy profile id。
+    :param model_id: 默认模型 id。
+    :param runner_option_hint_id: 模型内 semantic runner option hint id。
     """
 
     model_id: str
-    runner_options_profile_id: str
-    agent_policy_profile_id: str
+    runner_option_hint_id: str
 
 
 @dataclass(frozen=True, slots=True)
-class CompactorExecutionConfig:
-    """Host-owned compactor 执行基线配置。
+class CompactorBaselineConfig:
+    """Host-owned compactor 执行基线。
 
     :param model_id: compactor 模型 id。
-    :param runner_options_profile_id: compactor runner options profile id。
+    :param runner_option_hint_id: compactor runner option hint id。
     :param artifact_root: compact artifact 根目录。
     """
 
     model_id: str
-    runner_options_profile_id: str
+    runner_option_hint_id: str
     artifact_root: str
 
 
@@ -154,164 +199,194 @@ class CompactorExecutionConfig:
 class ContextBudgetConfig:
     """上下文预算配置。
 
-    :param max_context_tokens: 最大上下文 token 数。
-    :param reserved_response_tokens: 预留响应 token 数。
-    :param compaction_trigger_tokens: 触发 compaction 的 token 阈值。
+    :param context_window_size: composition root 注入前的默认上下文窗口。
+    :param soft_threshold_context_ratio: soft threshold 占上下文比例。
+    :param hard_threshold_context_ratio: hard threshold 占上下文比例。
+    :param max_proactive_compactions_per_run: 单个 Run proactive compact 上限。
+    :param max_reactive_compactions_per_run: 单个 Run reactive compact 上限。
+    :param max_compaction_attempts_per_operation: 单次 compact operation 尝试上限。
+    :param policy_ref: policy snapshot / composition ref。
     """
 
-    max_context_tokens: int
-    reserved_response_tokens: int
-    compaction_trigger_tokens: int
+    context_window_size: int
+    soft_threshold_context_ratio: float
+    hard_threshold_context_ratio: float
+    max_proactive_compactions_per_run: int
+    max_reactive_compactions_per_run: int
+    max_compaction_attempts_per_operation: int
+    policy_ref: str
 
 
 @dataclass(frozen=True, slots=True)
 class MemoryProjectionConfig:
     """Conversation memory projection 配置。
 
-    :param enabled: 是否启用 memory projection。
-    :param stable_layer_max_items: stable layer 最大条目数。
-    :param history_pool_max_items: history pool 最大条目数。
+    :param context_window_size: composition root 注入前的默认上下文窗口。
+    :param max_pinned_items: pinned state 最大条目数。
+    :param max_verified_facts: verified facts 最大条目数。
+    :param max_working_assumptions: working assumptions 最大条目数。
+    :param recent_raw_turns_floor: recent raw turns 保底条数。
+    :param raw_turn_context_ratio: 单条 raw turn 尺寸比例。
+    :param raw_turn_size_floor: 单条 raw turn 尺寸下限。
+    :param raw_turn_size_cap: 单条 raw turn 尺寸上限。
+    :param history_pool_context_ratio: history pool 尺寸比例。
+    :param history_pool_size_floor: history pool 尺寸下限。
+    :param history_pool_size_cap: history pool 尺寸上限。
+    :param stable_layer_context_ratio: stable layer 尺寸比例。
+    :param stable_layer_size_floor: stable layer 尺寸下限。
+    :param stable_layer_size_cap: stable layer 尺寸上限。
+    :param max_lag_events_for_inline_delta: inline delta 最大滞后事件数。
+    :param max_delta_repair_events: repair delta 最大事件数。
     """
 
-    enabled: bool
-    stable_layer_max_items: int
-    history_pool_max_items: int
+    context_window_size: int
+    max_pinned_items: int
+    max_verified_facts: int
+    max_working_assumptions: int
+    recent_raw_turns_floor: int
+    raw_turn_context_ratio: float
+    raw_turn_size_floor: int
+    raw_turn_size_cap: int
+    history_pool_context_ratio: float
+    history_pool_size_floor: int
+    history_pool_size_cap: int
+    stable_layer_context_ratio: float
+    stable_layer_size_floor: int
+    stable_layer_size_cap: int
+    max_lag_events_for_inline_delta: int
+    max_delta_repair_events: int
 
 
 @dataclass(frozen=True, slots=True)
-class TruncationConfig:
+class TextCharsLimitConfig:
+    """文本字符截断默认 limit。
+
+    :param max_chars: 最大字符数。
+    """
+
+    max_chars: int
+
+
+@dataclass(frozen=True, slots=True)
+class TextLinesLimitConfig:
+    """文本行截断默认 limit。
+
+    :param max_lines: 最大行数。
+    """
+
+    max_lines: int
+
+
+@dataclass(frozen=True, slots=True)
+class ListItemsLimitConfig:
+    """列表条目截断默认 limit。
+
+    :param max_items: 最大条目数。
+    """
+
+    max_items: int
+
+
+@dataclass(frozen=True, slots=True)
+class BinaryBytesLimitConfig:
+    """二进制字节截断默认 limit。
+
+    :param max_bytes: 最大字节数。
+    """
+
+    max_bytes: int
+
+
+@dataclass(frozen=True, slots=True)
+class ToolTruncationDefaultLimitsConfig:
+    """工具截断默认 limits。
+
+    :param text_chars: 文本字符 limit。
+    :param text_lines: 文本行 limit。
+    :param list_items: 列表条目 limit。
+    :param binary_bytes: 二进制字节 limit。
+    """
+
+    text_chars: TextCharsLimitConfig
+    text_lines: TextLinesLimitConfig
+    list_items: ListItemsLimitConfig
+    binary_bytes: BinaryBytesLimitConfig
+
+
+@dataclass(frozen=True, slots=True)
+class ToolTruncationPolicyConfig:
     """工具截断治理配置。
 
     :param enabled: 是否启用截断治理。
-    :param default_max_chars: 默认最大字符数。
-    :param fetch_more_tool_name: fetch-more framework 工具名。
+    :param default_cursor_ttl_seconds: 默认 fetch-more cursor TTL 秒数。
+    :param default_limits: 各截断策略默认 limit。
     """
 
     enabled: bool
-    default_max_chars: int
-    fetch_more_tool_name: str
+    default_cursor_ttl_seconds: float
+    default_limits: ToolTruncationDefaultLimitsConfig
 
 
 @dataclass(frozen=True, slots=True)
 class ExecutionProfileConfig:
     """单个 execution profile 的完整配置。
 
-    :param profile_id: execution profile 稳定标识。
-    :param ordinary: 普通 Run 执行基线。
-    :param compactor: compactor 执行基线。
-    :param context_budget: 上下文预算基线。
-    :param memory_projection: memory projection 基线。
-    :param truncation: 截断治理基线。
+    :param execution_profile_id: execution profile 稳定标识，由 map key 注入。
+    :param run_baseline: 普通 Run 执行基线。
+    :param compactor_baseline: compactor 执行基线。
+    :param context_budget_policy: 上下文预算基线。
+    :param memory_projection_policy: memory projection 基线。
+    :param tool_truncation_policy: 截断治理基线。
+    :param agent_policy_profile_id: Agent policy profile id。
     """
 
-    profile_id: str
-    ordinary: OrdinaryExecutionConfig
-    compactor: CompactorExecutionConfig
-    context_budget: ContextBudgetConfig
-    memory_projection: MemoryProjectionConfig
-    truncation: TruncationConfig
-
-
-@dataclass(frozen=True, slots=True)
-class RunnerOptionsProfileConfig:
-    """Runner 调用参数 profile。
-
-    :param temperature: temperature 参数。
-    :param max_tokens: 最大输出 token 数。
-    :param top_p: top-p 参数。
-    :param stream: 是否使用流式输出。
-    """
-
-    temperature: float
-    max_tokens: int
-    top_p: float
-    stream: bool
+    execution_profile_id: str
+    run_baseline: ExecutionBaselineConfig
+    compactor_baseline: CompactorBaselineConfig
+    context_budget_policy: ContextBudgetConfig
+    memory_projection_policy: MemoryProjectionConfig
+    tool_truncation_policy: ToolTruncationPolicyConfig
+    agent_policy_profile_id: str
 
 
 @dataclass(frozen=True, slots=True)
 class AgentPolicyProfileConfig:
     """Agent policy profile。
 
+    :param agent_policy_profile_id: Agent policy profile 稳定标识，由 map key 注入。
     :param max_iterations: 最大 agent loop 迭代数。
-    :param continuation_attempts: 长输出 continuation 次数。
+    :param continuation_max_attempts: 长输出 continuation 次数。
+    :param allow_tool_calls: 是否允许工具调用。
     :param tool_execution_timeout_seconds: 工具执行等待超时秒数。
-    :param fallback_mode: fallback 模式。
+    :param fallback_mode: fallback 模式，只允许 ``force_answer`` / ``raise_error``。
     :param fallback_prompt: fallback prompt。
     :param continuation_prompt: continuation prompt。
-    :param consecutive_failed_tool_batches: 连续失败工具批次阈值。
+    :param max_consecutive_failed_tool_batches: 连续失败工具批次阈值。
     """
 
+    agent_policy_profile_id: str
     max_iterations: int
-    continuation_attempts: int
+    continuation_max_attempts: int
+    allow_tool_calls: bool
     tool_execution_timeout_seconds: float
     fallback_mode: str
     fallback_prompt: str
     continuation_prompt: str
-    consecutive_failed_tool_batches: int
-
-
-@dataclass(frozen=True, slots=True)
-class RunnerHintConfig:
-    """scene runtime runner hint 可覆盖字段。
-
-    :param model_id: 可选模型 id 覆盖。
-    :param runner_options_profile_id: 可选 runner options profile 覆盖。
-    :param temperature: 可选 temperature 覆盖。
-    :param max_tokens: 可选最大输出 token 覆盖。
-    :param top_p: 可选 top-p 覆盖。
-    :param stream: 可选流式输出覆盖。
-    """
-
-    model_id: str | None
-    runner_options_profile_id: str | None
-    temperature: float | None
-    max_tokens: int | None
-    top_p: float | None
-    stream: bool | None
-
-
-@dataclass(frozen=True, slots=True)
-class AgentHintConfig:
-    """scene runtime agent hint 可覆盖字段。
-
-    :param agent_policy_profile_id: 可选 agent policy profile 覆盖。
-    :param max_iterations: 可选最大迭代数覆盖。
-    :param continuation_attempts: 可选 continuation 次数覆盖。
-    :param tool_execution_timeout_seconds: 可选工具超时覆盖。
-    :param fallback_mode: 可选 fallback 模式覆盖。
-    :param fallback_prompt: 可选 fallback prompt 覆盖。
-    :param continuation_prompt: 可选 continuation prompt 覆盖。
-    :param consecutive_failed_tool_batches: 可选连续失败工具批次阈值覆盖。
-    """
-
-    agent_policy_profile_id: str | None
-    max_iterations: int | None
-    continuation_attempts: int | None
-    tool_execution_timeout_seconds: float | None
-    fallback_mode: str | None
-    fallback_prompt: str | None
-    continuation_prompt: str | None
-    consecutive_failed_tool_batches: int | None
+    max_consecutive_failed_tool_batches: int
 
 
 @dataclass(frozen=True, slots=True)
 class ExecutionProfilesConfig:
     """执行 profiles 配置视图。
 
-    :param default_profile_id: 默认 execution profile id。
-    :param profiles: 完整 execution profiles。
-    :param runner_options_profiles: Runner options profiles。
+    :param default_execution_profile_id: 默认 execution profile id。
+    :param execution_profiles: 完整 execution profiles。
     :param agent_policy_profiles: Agent policy profiles。
-    :param runner_hints: runner hints 可覆盖字段集合。
-    :param agent_hints: agent hints 可覆盖字段集合。
     """
 
-    default_profile_id: str
-    profiles: Mapping[str, ExecutionProfileConfig]
-    runner_options_profiles: Mapping[str, RunnerOptionsProfileConfig]
+    default_execution_profile_id: str
+    execution_profiles: Mapping[str, ExecutionProfileConfig]
     agent_policy_profiles: Mapping[str, AgentPolicyProfileConfig]
-    runner_hints: Mapping[str, RunnerHintConfig]
-    agent_hints: Mapping[str, AgentHintConfig]
 
 
 @dataclass(frozen=True, slots=True)
@@ -327,73 +402,85 @@ class SQLiteRuntimeConfig:
 
 
 @dataclass(frozen=True, slots=True)
-class LaneCapacityConfig:
-    """单个 runtime lane 容量配置。
-
-    :param capacity: lane 容量。
-    :param claim_ttl_seconds: claim TTL 秒数。
-    :param heartbeat_interval_seconds: heartbeat 间隔秒数。
-    """
-
-    capacity: int
-    claim_ttl_seconds: float
-    heartbeat_interval_seconds: float
-
-
-@dataclass(frozen=True, slots=True)
-class LaneRuntimeConfig:
-    """Host opener runtime lane 默认配置。
-
-    :param db_path: runtime lane SQLite DB 路径。
-    :param default_lane_name: 默认 lane 名。
-    :param lanes: 按 lane 名索引的容量配置。
-    """
-
-    db_path: str
-    default_lane_name: str
-    lanes: Mapping[str, LaneCapacityConfig]
-
-
-@dataclass(frozen=True, slots=True)
 class HostRuntimeProfileConfig:
     """Host opener 部署默认值配置。
 
-    :param runtime_id: runtime profile 稳定标识。
+    :param host_runtime_id: Host runtime profile 稳定标识，由 map key 注入。
     :param store_root: Host durable store 根目录。
     :param artifact_root: Host artifact 根目录。
     :param sqlite: SQLite 默认配置。
-    :param lane: runtime lane 默认配置。
-    :param worker_factory_kind: worker factory 类别。
+    :param host_execution_lane_name: Host 执行 lane 名。
+    :param worker_backend: worker backend 名。
     :param dispatch_poll_interval_seconds: dispatch 轮询间隔秒数。
     :param memory_projection_catch_up_batch_size: memory catch-up 批次大小。
     :param truncation_manager_enabled: 是否启用 truncation manager。
-    :param prompt_asset_root: prompt asset 根目录。
-    :param scene_manifest_root: scene manifest 根目录。
     """
 
-    runtime_id: str
+    host_runtime_id: str
     store_root: str
     artifact_root: str
     sqlite: SQLiteRuntimeConfig
-    lane: LaneRuntimeConfig
-    worker_factory_kind: str
+    host_execution_lane_name: str
+    worker_backend: str
     dispatch_poll_interval_seconds: float
     memory_projection_catch_up_batch_size: int
     truncation_manager_enabled: bool
-    prompt_asset_root: str
-    scene_manifest_root: str
 
 
 @dataclass(frozen=True, slots=True)
 class HostRuntimeConfig:
     """Host runtime 配置视图。
 
-    :param default_runtime_id: 默认 Host runtime profile id。
+    :param default_host_runtime_id: 默认 Host runtime profile id。
     :param runtimes: 按 id 索引的 Host runtime profiles。
     """
 
-    default_runtime_id: str
+    default_host_runtime_id: str
     runtimes: Mapping[str, HostRuntimeProfileConfig]
+
+
+@dataclass(frozen=True, slots=True)
+class RuntimeLaneCoordinatorConfig:
+    """Runtime lane coordinator 配置。
+
+    :param db_path: 独立 runtime lane SQLite DB 路径。
+    :param busy_timeout_seconds: coordinator SQLite busy timeout 秒数。
+    :param poll_interval_seconds: acquire 轮询间隔秒数。
+    """
+
+    db_path: str
+    busy_timeout_seconds: float
+    poll_interval_seconds: float
+
+
+@dataclass(frozen=True, slots=True)
+class RuntimeLaneConfig:
+    """单个 runtime lane 容量配置。
+
+    :param lane_name: lane 名，由 map key 注入。
+    :param capacity: lane 容量。
+    :param default_timeout_seconds: 默认等待超时秒数；``None`` 表示不设超时。
+    :param claim_ttl_seconds: claim TTL 秒数。
+    :param heartbeat_interval_seconds: heartbeat 间隔秒数。
+    """
+
+    lane_name: str
+    capacity: int
+    default_timeout_seconds: float | None
+    claim_ttl_seconds: float
+    heartbeat_interval_seconds: float
+
+
+@dataclass(frozen=True, slots=True)
+class RuntimeLanesConfig:
+    """Runtime lanes 配置视图。
+
+    :param coordinator: runtime lane coordinator 配置。
+    :param lanes: 按 lane 名索引的容量配置。
+    """
+
+    coordinator: RuntimeLaneCoordinatorConfig
+    lanes: Mapping[str, RuntimeLaneConfig]
 
 
 @dataclass(frozen=True, slots=True)
@@ -412,10 +499,9 @@ class ToolDiscoveryEntryPointConfig:
 class ToolDiscoveryProviderConfig:
     """工具发现 provider spec 配置视图。
 
-    :param provider_id: provider spec 稳定标识。
-    :param import_path: 显式 ``module:attribute`` import path；与
-        ``entry_point`` 二选一。
-    :param entry_point: package entry point；与 ``import_path`` 二选一。
+    :param provider_id: provider spec 稳定标识，由 map key 注入。
+    :param import_path: 显式 ``module:attribute`` import path。
+    :param entry_point: package entry point。
     :param source_kind: 来源类别。
     :param source_id: 来源标识。
     :param enabled: 是否启用 provider。
@@ -443,17 +529,19 @@ class ToolDiscoveryConfig:
 
 @dataclass(frozen=True, slots=True)
 class RuntimeConfig:
-    """四类 runtime assembly 配置总视图。
+    """五类 runtime assembly 配置总视图。
 
     :param models: 模型目录配置。
     :param execution_profiles: execution profiles 配置。
     :param host_runtime: Host runtime 配置。
+    :param runtime_lanes: runtime lanes 配置。
     :param tool_discovery: 工具发现配置。
     """
 
     models: ModelsConfig
     execution_profiles: ExecutionProfilesConfig
     host_runtime: HostRuntimeConfig
+    runtime_lanes: RuntimeLanesConfig
     tool_discovery: ToolDiscoveryConfig
 
 
@@ -474,11 +562,11 @@ class ConfigLoader:
         )
 
     def load(self, workspace_config_dir: Path | None = None) -> RuntimeConfig:
-        """加载四类配置并返回总视图。
+        """加载五类配置并返回总视图。
 
         :param workspace_config_dir: 调用方显式提供的 workspace 覆盖配置目录；
             ``None`` 表示只读取包内默认配置。
-        :returns: 四类 runtime assembly typed config view。
+        :returns: 五类 runtime assembly typed config view。
         :raises ConfigLoadError: 配置文件缺失、JSON shape、继承或字段校验失败
             时抛出。
         """
@@ -488,6 +576,9 @@ class ConfigLoader:
             workspace_config_dir=workspace_config_dir
         )
         host_runtime = self.load_host_runtime(workspace_config_dir=workspace_config_dir)
+        runtime_lanes = self.load_runtime_lanes(
+            workspace_config_dir=workspace_config_dir
+        )
         tool_discovery = self.load_tool_discovery(
             workspace_config_dir=workspace_config_dir
         )
@@ -495,10 +586,15 @@ class ConfigLoader:
             execution_profiles=execution_profiles,
             models=models,
         )
+        _validate_host_runtime_lane_references(
+            host_runtime=host_runtime,
+            runtime_lanes=runtime_lanes,
+        )
         return RuntimeConfig(
             models=models,
             execution_profiles=execution_profiles,
             host_runtime=host_runtime,
+            runtime_lanes=runtime_lanes,
             tool_discovery=tool_discovery,
         )
 
@@ -515,6 +611,11 @@ class ConfigLoader:
             workspace_config_dir=workspace_config_dir,
             file_name=_MODELS_FILE,
             map_fields=frozenset({"models"}),
+        )
+        _require_exact_fields(
+            root,
+            allowed=frozenset({"models"}),
+            context=_MODELS_FILE,
         )
         records = _resolve_record_map(
             _require_mapping_field(root, field_name="models", context=_MODELS_FILE),
@@ -545,48 +646,40 @@ class ConfigLoader:
             workspace_config_dir=workspace_config_dir,
             file_name=_EXECUTION_PROFILES_FILE,
             map_fields=frozenset(
-                {
-                    "profiles",
-                    "runner_options_profiles",
-                    "agent_policy_profiles",
-                    "runner_hints",
-                    "agent_hints",
-                }
+                {"execution_profiles", "agent_policy_profiles"}
             ),
         )
-        profiles = _parse_execution_profile_map(root)
-        runner_options_profiles = _parse_runner_options_profile_map(root)
-        agent_policy_profiles = _parse_agent_policy_profile_map(root)
-        runner_hints = _parse_runner_hint_map(root)
-        agent_hints = _parse_agent_hint_map(root)
-        default_profile_id = _require_str_field(
+        _require_exact_fields(
             root,
-            field_name="default_profile_id",
+            allowed=frozenset(
+                {
+                    "default_execution_profile_id",
+                    "execution_profiles",
+                    "agent_policy_profiles",
+                }
+            ),
+            context=_EXECUTION_PROFILES_FILE,
+        )
+        execution_profiles = _parse_execution_profile_map(root)
+        agent_policy_profiles = _parse_agent_policy_profile_map(root)
+        default_execution_profile_id = _require_str_field(
+            root,
+            field_name="default_execution_profile_id",
             context=_EXECUTION_PROFILES_FILE,
         )
         _require_mapping_contains(
-            profiles,
-            key=default_profile_id,
-            context="execution_profiles.default_profile_id",
+            execution_profiles,
+            key=default_execution_profile_id,
+            context="execution_profiles.default_execution_profile_id",
         )
         _validate_execution_profile_references(
-            profiles=profiles,
-            runner_options_profiles=runner_options_profiles,
-            agent_policy_profiles=agent_policy_profiles,
-        )
-        _validate_hint_references(
-            runner_hints=runner_hints,
-            agent_hints=agent_hints,
-            runner_options_profiles=runner_options_profiles,
+            execution_profiles=execution_profiles,
             agent_policy_profiles=agent_policy_profiles,
         )
         return ExecutionProfilesConfig(
-            default_profile_id=default_profile_id,
-            profiles=profiles,
-            runner_options_profiles=runner_options_profiles,
+            default_execution_profile_id=default_execution_profile_id,
+            execution_profiles=execution_profiles,
             agent_policy_profiles=agent_policy_profiles,
-            runner_hints=runner_hints,
-            agent_hints=agent_hints,
         )
 
     def load_host_runtime(
@@ -605,6 +698,11 @@ class ConfigLoader:
             file_name=_HOST_RUNTIME_FILE,
             map_fields=frozenset({"runtimes"}),
         )
+        _require_exact_fields(
+            root,
+            allowed=frozenset({"default_host_runtime_id", "runtimes"}),
+            context=_HOST_RUNTIME_FILE,
+        )
         records = _resolve_record_map(
             _require_mapping_field(root, field_name="runtimes", context=_HOST_RUNTIME_FILE),
             context="host_runtime.runtimes",
@@ -615,19 +713,54 @@ class ConfigLoader:
                 record_id=runtime_id,
                 record=record,
             )
-        default_runtime_id = _require_str_field(
+        default_host_runtime_id = _require_str_field(
             root,
-            field_name="default_runtime_id",
+            field_name="default_host_runtime_id",
             context=_HOST_RUNTIME_FILE,
         )
         _require_mapping_contains(
             runtimes,
-            key=default_runtime_id,
-            context="host_runtime.default_runtime_id",
+            key=default_host_runtime_id,
+            context="host_runtime.default_host_runtime_id",
         )
         return HostRuntimeConfig(
-            default_runtime_id=default_runtime_id,
+            default_host_runtime_id=default_host_runtime_id,
             runtimes=runtimes,
+        )
+
+    def load_runtime_lanes(
+        self, workspace_config_dir: Path | None = None
+    ) -> RuntimeLanesConfig:
+        """加载 runtime lanes 配置。
+
+        :param workspace_config_dir: 调用方显式提供的 workspace 覆盖配置目录。
+        :returns: runtime lanes typed config view。
+        :raises ConfigLoadError: 配置文件缺失、继承或字段校验失败时抛出。
+        """
+
+        root = _load_layered_config_file(
+            package_config_dir=self._package_config_dir,
+            workspace_config_dir=workspace_config_dir,
+            file_name=_RUNTIME_LANES_FILE,
+            map_fields=frozenset({"lanes"}),
+        )
+        _require_exact_fields(
+            root,
+            allowed=frozenset({"coordinator", "lanes"}),
+            context=_RUNTIME_LANES_FILE,
+        )
+        lanes = _parse_runtime_lane_map(root)
+        if not lanes:
+            raise ConfigFieldError("runtime_lanes.json lanes must not be empty")
+        return RuntimeLanesConfig(
+            coordinator=_parse_runtime_lane_coordinator(
+                _require_mapping_field(
+                    root,
+                    field_name="coordinator",
+                    context=_RUNTIME_LANES_FILE,
+                )
+            ),
+            lanes=lanes,
         )
 
     def load_tool_discovery(
@@ -646,6 +779,11 @@ class ConfigLoader:
             file_name=_TOOL_DISCOVERY_FILE,
             map_fields=frozenset({"providers"}),
         )
+        _require_exact_fields(
+            root,
+            allowed=frozenset({"providers"}),
+            context=_TOOL_DISCOVERY_FILE,
+        )
         records = _resolve_record_map(
             _require_mapping_field(root, field_name="providers", context=_TOOL_DISCOVERY_FILE),
             context="tool_discovery.providers",
@@ -663,7 +801,7 @@ def load_runtime_config(workspace_config_dir: Path | None = None) -> RuntimeConf
     """使用默认加载器加载 runtime assembly 配置。
 
     :param workspace_config_dir: 调用方显式提供的 workspace 覆盖配置目录。
-    :returns: 四类 runtime assembly typed config view。
+    :returns: 五类 runtime assembly typed config view。
     :raises ConfigLoadError: 配置文件缺失、JSON shape、继承或字段校验失败
         时抛出。
     """
@@ -679,6 +817,26 @@ def legacy_config_file_names() -> frozenset[str]:
     """
 
     return _LEGACY_CONFIG_FILES
+
+
+def config_file_names() -> tuple[str, ...]:
+    """返回当前 ConfigLoader 读取的配置文件名。
+
+    :returns: 当前配置文件名元组。
+    :raises Exception: 不主动抛出异常。
+    """
+
+    return _CONFIG_FILE_NAMES
+
+
+def default_fallback_prompt() -> str:
+    """返回默认 Agent fallback prompt 文本。
+
+    :returns: 默认 fallback prompt。
+    :raises Exception: 不主动抛出异常。
+    """
+
+    return _DEFAULT_FALLBACK_PROMPT
 
 
 def _load_layered_config_file(
@@ -775,7 +933,7 @@ def _resolve_record_map(records: JsonObject, *, context: str) -> Mapping[str, Js
     :param context: 错误消息上下文。
     :returns: 继承解析后的记录 map。
     :raises ConfigShapeError: 记录不是 JSON object 时抛出。
-    :raises ConfigExtendsError: 继承循环、多继承或父项缺失时抛出。
+    :raises ConfigExtendsError: 继承循环、自引用、多继承或父项缺失时抛出。
     """
 
     resolved: dict[str, JsonObject] = {}
@@ -808,7 +966,7 @@ def _resolve_record(
     :param context: 错误消息上下文。
     :returns: 解析后的记录。
     :raises ConfigShapeError: 记录 shape 非法时抛出。
-    :raises ConfigExtendsError: 继承循环、多继承或父项缺失时抛出。
+    :raises ConfigExtendsError: 继承循环、自引用、多继承或父项缺失时抛出。
     """
 
     if record_id in resolved:
@@ -827,6 +985,8 @@ def _resolve_record(
             key: item for key, item in record.items() if key != _EXTENDS_FIELD
         }
     else:
+        if parent_id == record_id:
+            raise ConfigExtendsError(f"{context}.{record_id} extends self")
         if parent_id not in records:
             raise ConfigExtendsError(
                 f"{context}.{record_id} extends missing parent: {parent_id}"
@@ -874,14 +1034,15 @@ def _parse_model_config(*, record_id: str, record: JsonObject) -> ModelConfig:
     :param record_id: 模型记录 id。
     :param record: 继承解析后的模型记录。
     :returns: 模型 typed config。
-    :raises ConfigFieldError: 字段缺失、非法类型或 id 不一致时抛出。
+    :raises ConfigFieldError: 字段缺失、非法类型或出现重复 id 字段时抛出。
     """
 
+    context = f"models.{record_id}"
+    _require_no_forbidden_id_fields(record, context=context)
     _require_exact_fields(
         record,
         allowed=frozenset(
             {
-                "model_id",
                 "runner_kind",
                 "provider",
                 "model",
@@ -897,32 +1058,35 @@ def _parse_model_config(*, record_id: str, record: JsonObject) -> ModelConfig:
                 "sse_heartbeat_seconds",
                 "provider_request_extension",
                 "context_window_tokens",
+                "runtime_hints",
             }
         ),
-        context=f"models.{record_id}",
+        context=context,
     )
-    model_id = _require_str_field(record, field_name="model_id", context=f"models.{record_id}")
-    _require_id_match(record_id=record_id, embedded_id=model_id, context="models")
     return ModelConfig(
-        model_id=model_id,
+        model_id=record_id,
         runner_kind=_parse_runner_kind(
-            _require_str_field(record, field_name="runner_kind", context=f"models.{record_id}"),
-            context=f"models.{record_id}.runner_kind",
+            _require_str_field(record, field_name="runner_kind", context=context),
+            context=f"{context}.runner_kind",
         ),
-        provider=_require_str_field(record, field_name="provider", context=f"models.{record_id}"),
-        model=_require_str_field(record, field_name="model", context=f"models.{record_id}"),
-        endpoint=_require_str_field(record, field_name="endpoint", context=f"models.{record_id}"),
-        api_key_ref=_optional_str_field(record, field_name="api_key_ref", context=f"models.{record_id}"),
-        headers=_require_str_mapping_field(record, field_name="headers", context=f"models.{record_id}"),
-        supports_tool_calling=_require_bool_field(record, field_name="supports_tool_calling", context=f"models.{record_id}"),
-        supports_stream=_require_bool_field(record, field_name="supports_stream", context=f"models.{record_id}"),
-        supports_stream_usage=_require_bool_field(record, field_name="supports_stream_usage", context=f"models.{record_id}"),
-        default_timeout_seconds=_require_positive_float_field(record, field_name="default_timeout_seconds", context=f"models.{record_id}"),
-        max_retries=_require_non_negative_int_field(record, field_name="max_retries", context=f"models.{record_id}"),
-        sse_idle_timeout_seconds=_require_positive_float_field(record, field_name="sse_idle_timeout_seconds", context=f"models.{record_id}"),
-        sse_heartbeat_seconds=_require_positive_float_field(record, field_name="sse_heartbeat_seconds", context=f"models.{record_id}"),
-        provider_request_extension=_require_field(record, field_name="provider_request_extension", context=f"models.{record_id}"),
-        context_window_tokens=_require_positive_int_field(record, field_name="context_window_tokens", context=f"models.{record_id}"),
+        provider=_require_str_field(record, field_name="provider", context=context),
+        model=_require_str_field(record, field_name="model", context=context),
+        endpoint=_require_str_field(record, field_name="endpoint", context=context),
+        api_key_ref=_optional_str_field(record, field_name="api_key_ref", context=context),
+        headers=_require_str_mapping_field(record, field_name="headers", context=context),
+        supports_tool_calling=_require_bool_field(record, field_name="supports_tool_calling", context=context),
+        supports_stream=_require_bool_field(record, field_name="supports_stream", context=context),
+        supports_stream_usage=_require_bool_field(record, field_name="supports_stream_usage", context=context),
+        default_timeout_seconds=_require_positive_float_field(record, field_name="default_timeout_seconds", context=context),
+        max_retries=_require_non_negative_int_field(record, field_name="max_retries", context=context),
+        sse_idle_timeout_seconds=_require_positive_float_field(record, field_name="sse_idle_timeout_seconds", context=context),
+        sse_heartbeat_seconds=_require_positive_float_field(record, field_name="sse_heartbeat_seconds", context=context),
+        provider_request_extension=_require_field(record, field_name="provider_request_extension", context=context),
+        context_window_tokens=_require_positive_int_field(record, field_name="context_window_tokens", context=context),
+        runtime_hints=_parse_model_runtime_hints(
+            _require_mapping_field(record, field_name="runtime_hints", context=context),
+            context=f"{context}.runtime_hints",
+        ),
     )
 
 
@@ -941,6 +1105,66 @@ def _parse_runner_kind(value: str, *, context: str) -> RunnerKind:
         raise ConfigFieldError(f"{context} has unsupported runner kind: {value}") from exc
 
 
+def _parse_model_runtime_hints(
+    record: JsonObject, *, context: str
+) -> ModelRuntimeHintsConfig:
+    """解析模型 runtime hints。
+
+    :param record: runtime_hints JSON object。
+    :param context: 错误消息上下文。
+    :returns: 模型 runtime hints typed config。
+    :raises ConfigFieldError: 字段缺失或非法类型时抛出。
+    """
+
+    _require_exact_fields(
+        record,
+        allowed=frozenset({"runner_option_hints"}),
+        context=context,
+    )
+    raw_hints = _require_mapping_field(
+        record,
+        field_name="runner_option_hints",
+        context=context,
+    )
+    hints: dict[str, RunnerOptionHintConfig] = {}
+    for hint_id, hint_value in raw_hints.items():
+        hint_record = _require_json_object(
+            hint_value,
+            context=f"{context}.runner_option_hints.{hint_id}",
+        )
+        hints[hint_id] = _parse_runner_option_hint(
+            hint_record,
+            context=f"{context}.runner_option_hints.{hint_id}",
+        )
+    if not hints:
+        raise ConfigFieldError(f"{context}.runner_option_hints must not be empty")
+    return ModelRuntimeHintsConfig(runner_option_hints=hints)
+
+
+def _parse_runner_option_hint(
+    record: JsonObject, *, context: str
+) -> RunnerOptionHintConfig:
+    """解析单个 RunnerCallOptions hint。
+
+    :param record: hint JSON object。
+    :param context: 错误消息上下文。
+    :returns: RunnerCallOptions hint typed config。
+    :raises ConfigFieldError: 字段缺失或非法类型时抛出。
+    """
+
+    _require_exact_fields(
+        record,
+        allowed=frozenset({"temperature", "max_tokens", "top_p", "stream"}),
+        context=context,
+    )
+    return RunnerOptionHintConfig(
+        temperature=_require_float_field(record, field_name="temperature", context=context),
+        max_tokens=_require_positive_int_field(record, field_name="max_tokens", context=context),
+        top_p=_require_float_field(record, field_name="top_p", context=context),
+        stream=_require_bool_field(record, field_name="stream", context=context),
+    )
+
+
 def _parse_execution_profile_map(root: JsonObject) -> Mapping[str, ExecutionProfileConfig]:
     """解析 execution profile map。
 
@@ -950,8 +1174,12 @@ def _parse_execution_profile_map(root: JsonObject) -> Mapping[str, ExecutionProf
     """
 
     records = _resolve_record_map(
-        _require_mapping_field(root, field_name="profiles", context=_EXECUTION_PROFILES_FILE),
-        context="execution_profiles.profiles",
+        _require_mapping_field(
+            root,
+            field_name="execution_profiles",
+            context=_EXECUTION_PROFILES_FILE,
+        ),
+        context="execution_profiles.execution_profiles",
     )
     profiles: dict[str, ExecutionProfileConfig] = {}
     for profile_id, record in records.items():
@@ -960,7 +1188,7 @@ def _parse_execution_profile_map(root: JsonObject) -> Mapping[str, ExecutionProf
             record=record,
         )
     if not profiles:
-        raise ConfigFieldError("execution_profiles profiles must not be empty")
+        raise ConfigFieldError("execution_profiles execution_profiles must not be empty")
     return profiles
 
 
@@ -972,104 +1200,104 @@ def _parse_execution_profile(
     :param record_id: profile id。
     :param record: 继承解析后的 profile 记录。
     :returns: execution profile typed config。
-    :raises ConfigFieldError: 字段缺失、非法类型或 id 不一致时抛出。
+    :raises ConfigFieldError: 字段缺失、非法类型或出现重复 id 字段时抛出。
     """
 
+    context = f"execution_profiles.execution_profiles.{record_id}"
+    _require_no_forbidden_id_fields(record, context=context)
     _require_exact_fields(
         record,
         allowed=frozenset(
             {
-                "profile_id",
-                "ordinary",
-                "compactor",
-                "context_budget",
-                "memory_projection",
-                "truncation",
+                "run_baseline",
+                "compactor_baseline",
+                "context_budget_policy",
+                "memory_projection_policy",
+                "tool_truncation_policy",
+                "agent_policy_profile_id",
             }
         ),
-        context=f"execution_profiles.profiles.{record_id}",
-    )
-    profile_id = _require_str_field(
-        record,
-        field_name="profile_id",
-        context=f"execution_profiles.profiles.{record_id}",
-    )
-    _require_id_match(
-        record_id=record_id,
-        embedded_id=profile_id,
-        context="execution_profiles.profiles",
+        context=context,
     )
     return ExecutionProfileConfig(
-        profile_id=profile_id,
-        ordinary=_parse_ordinary_execution(
+        execution_profile_id=record_id,
+        run_baseline=_parse_execution_baseline(
             _require_mapping_field(
                 record,
-                field_name="ordinary",
-                context=f"execution_profiles.profiles.{record_id}",
+                field_name="run_baseline",
+                context=context,
             ),
-            context=f"execution_profiles.profiles.{record_id}.ordinary",
+            context=f"{context}.run_baseline",
         ),
-        compactor=_parse_compactor_execution(
+        compactor_baseline=_parse_compactor_baseline(
             _require_mapping_field(
                 record,
-                field_name="compactor",
-                context=f"execution_profiles.profiles.{record_id}",
+                field_name="compactor_baseline",
+                context=context,
             ),
-            context=f"execution_profiles.profiles.{record_id}.compactor",
+            context=f"{context}.compactor_baseline",
         ),
-        context_budget=_parse_context_budget(
+        context_budget_policy=_parse_context_budget(
             _require_mapping_field(
                 record,
-                field_name="context_budget",
-                context=f"execution_profiles.profiles.{record_id}",
+                field_name="context_budget_policy",
+                context=context,
             ),
-            context=f"execution_profiles.profiles.{record_id}.context_budget",
+            context=f"{context}.context_budget_policy",
         ),
-        memory_projection=_parse_memory_projection(
+        memory_projection_policy=_parse_memory_projection(
             _require_mapping_field(
                 record,
-                field_name="memory_projection",
-                context=f"execution_profiles.profiles.{record_id}",
+                field_name="memory_projection_policy",
+                context=context,
             ),
-            context=f"execution_profiles.profiles.{record_id}.memory_projection",
+            context=f"{context}.memory_projection_policy",
         ),
-        truncation=_parse_truncation(
+        tool_truncation_policy=_parse_tool_truncation_policy(
             _require_mapping_field(
                 record,
-                field_name="truncation",
-                context=f"execution_profiles.profiles.{record_id}",
+                field_name="tool_truncation_policy",
+                context=context,
             ),
-            context=f"execution_profiles.profiles.{record_id}.truncation",
+            context=f"{context}.tool_truncation_policy",
+        ),
+        agent_policy_profile_id=_require_str_field(
+            record,
+            field_name="agent_policy_profile_id",
+            context=context,
         ),
     )
 
 
-def _parse_ordinary_execution(
+def _parse_execution_baseline(
     record: JsonObject, *, context: str
-) -> OrdinaryExecutionConfig:
+) -> ExecutionBaselineConfig:
     """解析普通 Run 执行基线。
 
-    :param record: ordinary 记录。
+    :param record: baseline 记录。
     :param context: 错误消息上下文。
-    :returns: ordinary typed config。
+    :returns: execution baseline typed config。
     :raises ConfigFieldError: 字段缺失或非法类型时抛出。
     """
 
     _require_exact_fields(
         record,
-        allowed=frozenset({"model_id", "runner_options_profile_id", "agent_policy_profile_id"}),
+        allowed=frozenset({"model_id", "runner_option_hint_id"}),
         context=context,
     )
-    return OrdinaryExecutionConfig(
+    return ExecutionBaselineConfig(
         model_id=_require_str_field(record, field_name="model_id", context=context),
-        runner_options_profile_id=_require_str_field(record, field_name="runner_options_profile_id", context=context),
-        agent_policy_profile_id=_require_str_field(record, field_name="agent_policy_profile_id", context=context),
+        runner_option_hint_id=_require_str_field(
+            record,
+            field_name="runner_option_hint_id",
+            context=context,
+        ),
     )
 
 
-def _parse_compactor_execution(
+def _parse_compactor_baseline(
     record: JsonObject, *, context: str
-) -> CompactorExecutionConfig:
+) -> CompactorBaselineConfig:
     """解析 compactor 执行基线。
 
     :param record: compactor 记录。
@@ -1080,12 +1308,16 @@ def _parse_compactor_execution(
 
     _require_exact_fields(
         record,
-        allowed=frozenset({"model_id", "runner_options_profile_id", "artifact_root"}),
+        allowed=frozenset({"model_id", "runner_option_hint_id", "artifact_root"}),
         context=context,
     )
-    return CompactorExecutionConfig(
+    return CompactorBaselineConfig(
         model_id=_require_str_field(record, field_name="model_id", context=context),
-        runner_options_profile_id=_require_str_field(record, field_name="runner_options_profile_id", context=context),
+        runner_option_hint_id=_require_str_field(
+            record,
+            field_name="runner_option_hint_id",
+            context=context,
+        ),
         artifact_root=_require_str_field(record, field_name="artifact_root", context=context),
     )
 
@@ -1102,14 +1334,26 @@ def _parse_context_budget(record: JsonObject, *, context: str) -> ContextBudgetC
     _require_exact_fields(
         record,
         allowed=frozenset(
-            {"max_context_tokens", "reserved_response_tokens", "compaction_trigger_tokens"}
+            {
+                "context_window_size",
+                "soft_threshold_context_ratio",
+                "hard_threshold_context_ratio",
+                "max_proactive_compactions_per_run",
+                "max_reactive_compactions_per_run",
+                "max_compaction_attempts_per_operation",
+                "policy_ref",
+            }
         ),
         context=context,
     )
     return ContextBudgetConfig(
-        max_context_tokens=_require_positive_int_field(record, field_name="max_context_tokens", context=context),
-        reserved_response_tokens=_require_positive_int_field(record, field_name="reserved_response_tokens", context=context),
-        compaction_trigger_tokens=_require_positive_int_field(record, field_name="compaction_trigger_tokens", context=context),
+        context_window_size=_require_positive_int_field(record, field_name="context_window_size", context=context),
+        soft_threshold_context_ratio=_require_float_field(record, field_name="soft_threshold_context_ratio", context=context),
+        hard_threshold_context_ratio=_require_float_field(record, field_name="hard_threshold_context_ratio", context=context),
+        max_proactive_compactions_per_run=_require_positive_int_field(record, field_name="max_proactive_compactions_per_run", context=context),
+        max_reactive_compactions_per_run=_require_positive_int_field(record, field_name="max_reactive_compactions_per_run", context=context),
+        max_compaction_attempts_per_operation=_require_positive_int_field(record, field_name="max_compaction_attempts_per_operation", context=context),
+        policy_ref=_require_str_field(record, field_name="policy_ref", context=context),
     )
 
 
@@ -1127,86 +1371,114 @@ def _parse_memory_projection(
     _require_exact_fields(
         record,
         allowed=frozenset(
-            {"enabled", "stable_layer_max_items", "history_pool_max_items"}
+            {
+                "context_window_size",
+                "max_pinned_items",
+                "max_verified_facts",
+                "max_working_assumptions",
+                "recent_raw_turns_floor",
+                "raw_turn_context_ratio",
+                "raw_turn_size_floor",
+                "raw_turn_size_cap",
+                "history_pool_context_ratio",
+                "history_pool_size_floor",
+                "history_pool_size_cap",
+                "stable_layer_context_ratio",
+                "stable_layer_size_floor",
+                "stable_layer_size_cap",
+                "max_lag_events_for_inline_delta",
+                "max_delta_repair_events",
+            }
         ),
         context=context,
     )
     return MemoryProjectionConfig(
-        enabled=_require_bool_field(record, field_name="enabled", context=context),
-        stable_layer_max_items=_require_positive_int_field(record, field_name="stable_layer_max_items", context=context),
-        history_pool_max_items=_require_positive_int_field(record, field_name="history_pool_max_items", context=context),
+        context_window_size=_require_positive_int_field(record, field_name="context_window_size", context=context),
+        max_pinned_items=_require_positive_int_field(record, field_name="max_pinned_items", context=context),
+        max_verified_facts=_require_positive_int_field(record, field_name="max_verified_facts", context=context),
+        max_working_assumptions=_require_positive_int_field(record, field_name="max_working_assumptions", context=context),
+        recent_raw_turns_floor=_require_non_negative_int_field(record, field_name="recent_raw_turns_floor", context=context),
+        raw_turn_context_ratio=_require_float_field(record, field_name="raw_turn_context_ratio", context=context),
+        raw_turn_size_floor=_require_positive_int_field(record, field_name="raw_turn_size_floor", context=context),
+        raw_turn_size_cap=_require_positive_int_field(record, field_name="raw_turn_size_cap", context=context),
+        history_pool_context_ratio=_require_float_field(record, field_name="history_pool_context_ratio", context=context),
+        history_pool_size_floor=_require_positive_int_field(record, field_name="history_pool_size_floor", context=context),
+        history_pool_size_cap=_require_positive_int_field(record, field_name="history_pool_size_cap", context=context),
+        stable_layer_context_ratio=_require_float_field(record, field_name="stable_layer_context_ratio", context=context),
+        stable_layer_size_floor=_require_positive_int_field(record, field_name="stable_layer_size_floor", context=context),
+        stable_layer_size_cap=_require_positive_int_field(record, field_name="stable_layer_size_cap", context=context),
+        max_lag_events_for_inline_delta=_require_non_negative_int_field(record, field_name="max_lag_events_for_inline_delta", context=context),
+        max_delta_repair_events=_require_non_negative_int_field(record, field_name="max_delta_repair_events", context=context),
     )
 
 
-def _parse_truncation(record: JsonObject, *, context: str) -> TruncationConfig:
-    """解析 truncation 配置。
-
-    :param record: truncation 记录。
-    :param context: 错误消息上下文。
-    :returns: truncation typed config。
-    :raises ConfigFieldError: 字段缺失或非法类型时抛出。
-    """
-
-    _require_exact_fields(
-        record,
-        allowed=frozenset({"enabled", "default_max_chars", "fetch_more_tool_name"}),
-        context=context,
-    )
-    return TruncationConfig(
-        enabled=_require_bool_field(record, field_name="enabled", context=context),
-        default_max_chars=_require_positive_int_field(record, field_name="default_max_chars", context=context),
-        fetch_more_tool_name=_require_str_field(record, field_name="fetch_more_tool_name", context=context),
-    )
-
-
-def _parse_runner_options_profile_map(
-    root: JsonObject,
-) -> Mapping[str, RunnerOptionsProfileConfig]:
-    """解析 runner options profiles。
-
-    :param root: execution_profiles.json 顶层 object。
-    :returns: runner options profile map。
-    :raises ConfigLoadError: 记录继承或字段校验失败时抛出。
-    """
-
-    records = _resolve_record_map(
-        _require_mapping_field(
-            root,
-            field_name="runner_options_profiles",
-            context=_EXECUTION_PROFILES_FILE,
-        ),
-        context="execution_profiles.runner_options_profiles",
-    )
-    profiles: dict[str, RunnerOptionsProfileConfig] = {}
-    for profile_id, record in records.items():
-        profiles[profile_id] = _parse_runner_options_profile(
-            record,
-            context=f"execution_profiles.runner_options_profiles.{profile_id}",
-        )
-    return profiles
-
-
-def _parse_runner_options_profile(
+def _parse_tool_truncation_policy(
     record: JsonObject, *, context: str
-) -> RunnerOptionsProfileConfig:
-    """解析单个 runner options profile。
+) -> ToolTruncationPolicyConfig:
+    """解析 tool truncation policy。
 
-    :param record: runner options profile 记录。
+    :param record: truncation policy 记录。
     :param context: 错误消息上下文。
-    :returns: runner options profile typed config。
+    :returns: truncation policy typed config。
     :raises ConfigFieldError: 字段缺失或非法类型时抛出。
     """
 
     _require_exact_fields(
         record,
-        allowed=frozenset({"temperature", "max_tokens", "top_p", "stream"}),
+        allowed=frozenset({"enabled", "default_cursor_ttl_seconds", "default_limits"}),
         context=context,
     )
-    return RunnerOptionsProfileConfig(
-        temperature=_require_float_field(record, field_name="temperature", context=context),
-        max_tokens=_require_positive_int_field(record, field_name="max_tokens", context=context),
-        top_p=_require_float_field(record, field_name="top_p", context=context),
-        stream=_require_bool_field(record, field_name="stream", context=context),
+    return ToolTruncationPolicyConfig(
+        enabled=_require_bool_field(record, field_name="enabled", context=context),
+        default_cursor_ttl_seconds=_require_positive_float_field(
+            record,
+            field_name="default_cursor_ttl_seconds",
+            context=context,
+        ),
+        default_limits=_parse_tool_truncation_limits(
+            _require_mapping_field(record, field_name="default_limits", context=context),
+            context=f"{context}.default_limits",
+        ),
+    )
+
+
+def _parse_tool_truncation_limits(
+    record: JsonObject, *, context: str
+) -> ToolTruncationDefaultLimitsConfig:
+    """解析工具截断默认 limits。
+
+    :param record: default_limits JSON object。
+    :param context: 错误消息上下文。
+    :returns: truncation limits typed config。
+    :raises ConfigFieldError: 字段缺失或非法类型时抛出。
+    """
+
+    _require_exact_fields(
+        record,
+        allowed=frozenset({"text_chars", "text_lines", "list_items", "binary_bytes"}),
+        context=context,
+    )
+    text_chars = _require_mapping_field(record, field_name="text_chars", context=context)
+    text_lines = _require_mapping_field(record, field_name="text_lines", context=context)
+    list_items = _require_mapping_field(record, field_name="list_items", context=context)
+    binary_bytes = _require_mapping_field(record, field_name="binary_bytes", context=context)
+    _require_exact_fields(text_chars, allowed=frozenset({"max_chars"}), context=f"{context}.text_chars")
+    _require_exact_fields(text_lines, allowed=frozenset({"max_lines"}), context=f"{context}.text_lines")
+    _require_exact_fields(list_items, allowed=frozenset({"max_items"}), context=f"{context}.list_items")
+    _require_exact_fields(binary_bytes, allowed=frozenset({"max_bytes"}), context=f"{context}.binary_bytes")
+    return ToolTruncationDefaultLimitsConfig(
+        text_chars=TextCharsLimitConfig(
+            max_chars=_require_positive_int_field(text_chars, field_name="max_chars", context=f"{context}.text_chars")
+        ),
+        text_lines=TextLinesLimitConfig(
+            max_lines=_require_positive_int_field(text_lines, field_name="max_lines", context=f"{context}.text_lines")
+        ),
+        list_items=ListItemsLimitConfig(
+            max_items=_require_positive_int_field(list_items, field_name="max_items", context=f"{context}.list_items")
+        ),
+        binary_bytes=BinaryBytesLimitConfig(
+            max_bytes=_require_positive_int_field(binary_bytes, field_name="max_bytes", context=f"{context}.binary_bytes")
+        ),
     )
 
 
@@ -1231,158 +1503,54 @@ def _parse_agent_policy_profile_map(
     profiles: dict[str, AgentPolicyProfileConfig] = {}
     for profile_id, record in records.items():
         profiles[profile_id] = _parse_agent_policy_profile(
-            record,
-            context=f"execution_profiles.agent_policy_profiles.{profile_id}",
+            record_id=profile_id,
+            record=record,
         )
     return profiles
 
 
 def _parse_agent_policy_profile(
-    record: JsonObject, *, context: str
+    *, record_id: str, record: JsonObject
 ) -> AgentPolicyProfileConfig:
     """解析单个 agent policy profile。
 
+    :param record_id: agent policy profile id。
     :param record: agent policy profile 记录。
-    :param context: 错误消息上下文。
     :returns: agent policy profile typed config。
-    :raises ConfigFieldError: 字段缺失或非法类型时抛出。
+    :raises ConfigFieldError: 字段缺失、非法类型或 fallback mode 非法时抛出。
     """
 
+    context = f"execution_profiles.agent_policy_profiles.{record_id}"
+    _require_no_forbidden_id_fields(record, context=context)
     _require_exact_fields(
         record,
         allowed=frozenset(
             {
                 "max_iterations",
-                "continuation_attempts",
+                "continuation_max_attempts",
+                "allow_tool_calls",
                 "tool_execution_timeout_seconds",
                 "fallback_mode",
                 "fallback_prompt",
                 "continuation_prompt",
-                "consecutive_failed_tool_batches",
+                "max_consecutive_failed_tool_batches",
             }
         ),
         context=context,
     )
+    fallback_mode = _require_str_field(record, field_name="fallback_mode", context=context)
+    if fallback_mode not in _AGENT_FALLBACK_MODES:
+        raise ConfigFieldError(f"{context}.fallback_mode has unsupported value: {fallback_mode}")
     return AgentPolicyProfileConfig(
+        agent_policy_profile_id=record_id,
         max_iterations=_require_positive_int_field(record, field_name="max_iterations", context=context),
-        continuation_attempts=_require_non_negative_int_field(record, field_name="continuation_attempts", context=context),
+        continuation_max_attempts=_require_non_negative_int_field(record, field_name="continuation_max_attempts", context=context),
+        allow_tool_calls=_require_bool_field(record, field_name="allow_tool_calls", context=context),
         tool_execution_timeout_seconds=_require_positive_float_field(record, field_name="tool_execution_timeout_seconds", context=context),
-        fallback_mode=_require_str_field(record, field_name="fallback_mode", context=context),
+        fallback_mode=fallback_mode,
         fallback_prompt=_require_str_field(record, field_name="fallback_prompt", context=context),
         continuation_prompt=_require_str_field(record, field_name="continuation_prompt", context=context),
-        consecutive_failed_tool_batches=_require_positive_int_field(record, field_name="consecutive_failed_tool_batches", context=context),
-    )
-
-
-def _parse_runner_hint_map(root: JsonObject) -> Mapping[str, RunnerHintConfig]:
-    """解析 runner hints。
-
-    :param root: execution_profiles.json 顶层 object。
-    :returns: runner hint map。
-    :raises ConfigLoadError: 记录继承或字段校验失败时抛出。
-    """
-
-    records = _resolve_record_map(
-        _require_mapping_field(root, field_name="runner_hints", context=_EXECUTION_PROFILES_FILE),
-        context="execution_profiles.runner_hints",
-    )
-    hints: dict[str, RunnerHintConfig] = {}
-    for hint_id, record in records.items():
-        hints[hint_id] = _parse_runner_hint(
-            record,
-            context=f"execution_profiles.runner_hints.{hint_id}",
-        )
-    return hints
-
-
-def _parse_runner_hint(record: JsonObject, *, context: str) -> RunnerHintConfig:
-    """解析单个 runner hint。
-
-    :param record: runner hint 记录。
-    :param context: 错误消息上下文。
-    :returns: runner hint typed config。
-    :raises ConfigFieldError: 字段类型非法或包含未知字段时抛出。
-    """
-
-    _require_no_unknown_fields(
-        record,
-        allowed=frozenset(
-            {
-                "model_id",
-                "runner_options_profile_id",
-                "temperature",
-                "max_tokens",
-                "top_p",
-                "stream",
-            }
-        ),
-        context=context,
-    )
-    return RunnerHintConfig(
-        model_id=_optional_str_field(record, field_name="model_id", context=context),
-        runner_options_profile_id=_optional_str_field(record, field_name="runner_options_profile_id", context=context),
-        temperature=_optional_float_field(record, field_name="temperature", context=context),
-        max_tokens=_optional_positive_int_field(record, field_name="max_tokens", context=context),
-        top_p=_optional_float_field(record, field_name="top_p", context=context),
-        stream=_optional_bool_field(record, field_name="stream", context=context),
-    )
-
-
-def _parse_agent_hint_map(root: JsonObject) -> Mapping[str, AgentHintConfig]:
-    """解析 agent hints。
-
-    :param root: execution_profiles.json 顶层 object。
-    :returns: agent hint map。
-    :raises ConfigLoadError: 记录继承或字段校验失败时抛出。
-    """
-
-    records = _resolve_record_map(
-        _require_mapping_field(root, field_name="agent_hints", context=_EXECUTION_PROFILES_FILE),
-        context="execution_profiles.agent_hints",
-    )
-    hints: dict[str, AgentHintConfig] = {}
-    for hint_id, record in records.items():
-        hints[hint_id] = _parse_agent_hint(
-            record,
-            context=f"execution_profiles.agent_hints.{hint_id}",
-        )
-    return hints
-
-
-def _parse_agent_hint(record: JsonObject, *, context: str) -> AgentHintConfig:
-    """解析单个 agent hint。
-
-    :param record: agent hint 记录。
-    :param context: 错误消息上下文。
-    :returns: agent hint typed config。
-    :raises ConfigFieldError: 字段类型非法或包含未知字段时抛出。
-    """
-
-    _require_no_unknown_fields(
-        record,
-        allowed=frozenset(
-            {
-                "agent_policy_profile_id",
-                "max_iterations",
-                "continuation_attempts",
-                "tool_execution_timeout_seconds",
-                "fallback_mode",
-                "fallback_prompt",
-                "continuation_prompt",
-                "consecutive_failed_tool_batches",
-            }
-        ),
-        context=context,
-    )
-    return AgentHintConfig(
-        agent_policy_profile_id=_optional_str_field(record, field_name="agent_policy_profile_id", context=context),
-        max_iterations=_optional_positive_int_field(record, field_name="max_iterations", context=context),
-        continuation_attempts=_optional_non_negative_int_field(record, field_name="continuation_attempts", context=context),
-        tool_execution_timeout_seconds=_optional_positive_float_field(record, field_name="tool_execution_timeout_seconds", context=context),
-        fallback_mode=_optional_str_field(record, field_name="fallback_mode", context=context),
-        fallback_prompt=_optional_str_field(record, field_name="fallback_prompt", context=context),
-        continuation_prompt=_optional_str_field(record, field_name="continuation_prompt", context=context),
-        consecutive_failed_tool_batches=_optional_positive_int_field(record, field_name="consecutive_failed_tool_batches", context=context),
+        max_consecutive_failed_tool_batches=_require_positive_int_field(record, field_name="max_consecutive_failed_tool_batches", context=context),
     )
 
 
@@ -1394,56 +1562,44 @@ def _parse_host_runtime_profile(
     :param record_id: runtime profile id。
     :param record: 继承解析后的 runtime profile 记录。
     :returns: Host runtime profile typed config。
-    :raises ConfigFieldError: 字段缺失、非法类型或 id 不一致时抛出。
+    :raises ConfigFieldError: 字段缺失、非法类型或出现重复 id 字段时抛出。
     """
 
+    context = f"host_runtime.runtimes.{record_id}"
+    _require_no_forbidden_id_fields(record, context=context)
     _require_exact_fields(
         record,
         allowed=frozenset(
             {
-                "runtime_id",
                 "store_root",
                 "artifact_root",
                 "sqlite",
-                "lane",
-                "worker_factory_kind",
+                "host_execution_lane_name",
+                "worker_backend",
                 "dispatch_poll_interval_seconds",
                 "memory_projection_catch_up_batch_size",
                 "truncation_manager_enabled",
-                "prompt_asset_root",
-                "scene_manifest_root",
             }
         ),
-        context=f"host_runtime.runtimes.{record_id}",
-    )
-    runtime_id = _require_str_field(
-        record,
-        field_name="runtime_id",
-        context=f"host_runtime.runtimes.{record_id}",
-    )
-    _require_id_match(
-        record_id=record_id,
-        embedded_id=runtime_id,
-        context="host_runtime.runtimes",
+        context=context,
     )
     return HostRuntimeProfileConfig(
-        runtime_id=runtime_id,
-        store_root=_require_str_field(record, field_name="store_root", context=f"host_runtime.runtimes.{record_id}"),
-        artifact_root=_require_str_field(record, field_name="artifact_root", context=f"host_runtime.runtimes.{record_id}"),
+        host_runtime_id=record_id,
+        store_root=_require_str_field(record, field_name="store_root", context=context),
+        artifact_root=_require_str_field(record, field_name="artifact_root", context=context),
         sqlite=_parse_sqlite_runtime(
-            _require_mapping_field(record, field_name="sqlite", context=f"host_runtime.runtimes.{record_id}"),
-            context=f"host_runtime.runtimes.{record_id}.sqlite",
+            _require_mapping_field(record, field_name="sqlite", context=context),
+            context=f"{context}.sqlite",
         ),
-        lane=_parse_lane_runtime(
-            _require_mapping_field(record, field_name="lane", context=f"host_runtime.runtimes.{record_id}"),
-            context=f"host_runtime.runtimes.{record_id}.lane",
+        host_execution_lane_name=_require_str_field(
+            record,
+            field_name="host_execution_lane_name",
+            context=context,
         ),
-        worker_factory_kind=_require_str_field(record, field_name="worker_factory_kind", context=f"host_runtime.runtimes.{record_id}"),
-        dispatch_poll_interval_seconds=_require_positive_float_field(record, field_name="dispatch_poll_interval_seconds", context=f"host_runtime.runtimes.{record_id}"),
-        memory_projection_catch_up_batch_size=_require_positive_int_field(record, field_name="memory_projection_catch_up_batch_size", context=f"host_runtime.runtimes.{record_id}"),
-        truncation_manager_enabled=_require_bool_field(record, field_name="truncation_manager_enabled", context=f"host_runtime.runtimes.{record_id}"),
-        prompt_asset_root=_require_str_field(record, field_name="prompt_asset_root", context=f"host_runtime.runtimes.{record_id}"),
-        scene_manifest_root=_require_str_field(record, field_name="scene_manifest_root", context=f"host_runtime.runtimes.{record_id}"),
+        worker_backend=_require_str_field(record, field_name="worker_backend", context=context),
+        dispatch_poll_interval_seconds=_require_positive_float_field(record, field_name="dispatch_poll_interval_seconds", context=context),
+        memory_projection_catch_up_batch_size=_require_positive_int_field(record, field_name="memory_projection_catch_up_batch_size", context=context),
+        truncation_manager_enabled=_require_bool_field(record, field_name="truncation_manager_enabled", context=context),
     )
 
 
@@ -1469,56 +1625,70 @@ def _parse_sqlite_runtime(
     )
 
 
-def _parse_lane_runtime(record: JsonObject, *, context: str) -> LaneRuntimeConfig:
-    """解析 runtime lane 配置。
+def _parse_runtime_lane_coordinator(
+    record: JsonObject,
+) -> RuntimeLaneCoordinatorConfig:
+    """解析 runtime lane coordinator 配置。
 
-    :param record: lane 配置记录。
-    :param context: 错误消息上下文。
-    :returns: lane runtime typed config。
+    :param record: coordinator JSON object。
+    :returns: runtime lane coordinator typed config。
     :raises ConfigFieldError: 字段缺失或非法类型时抛出。
     """
 
+    context = "runtime_lanes.coordinator"
     _require_exact_fields(
         record,
-        allowed=frozenset({"db_path", "default_lane_name", "lanes"}),
+        allowed=frozenset({"db_path", "busy_timeout_seconds", "poll_interval_seconds"}),
         context=context,
     )
-    lanes_root = _require_mapping_field(record, field_name="lanes", context=context)
-    lanes: dict[str, LaneCapacityConfig] = {}
-    for lane_name, value in lanes_root.items():
-        lane_record = _require_json_object(value, context=f"{context}.lanes.{lane_name}")
-        lanes[lane_name] = _parse_lane_capacity(
-            lane_record,
-            context=f"{context}.lanes.{lane_name}",
-        )
-    default_lane_name = _require_str_field(
-        record,
-        field_name="default_lane_name",
-        context=context,
-    )
-    _require_mapping_contains(lanes, key=default_lane_name, context=f"{context}.default_lane_name")
-    return LaneRuntimeConfig(
+    return RuntimeLaneCoordinatorConfig(
         db_path=_require_str_field(record, field_name="db_path", context=context),
-        default_lane_name=default_lane_name,
-        lanes=lanes,
+        busy_timeout_seconds=_require_positive_float_field(record, field_name="busy_timeout_seconds", context=context),
+        poll_interval_seconds=_require_positive_float_field(record, field_name="poll_interval_seconds", context=context),
     )
 
 
-def _parse_lane_capacity(
-    record: JsonObject, *, context: str
-) -> LaneCapacityConfig:
-    """解析单个 lane 容量配置。
+def _parse_runtime_lane_map(root: JsonObject) -> Mapping[str, RuntimeLaneConfig]:
+    """解析 runtime lane map。
 
-    :param record: lane 容量记录。
-    :param context: 错误消息上下文。
-    :returns: lane 容量 typed config。
-    :raises ConfigFieldError: 字段缺失或非法类型时抛出。
+    :param root: runtime_lanes.json 顶层 object。
+    :returns: runtime lane map。
+    :raises ConfigLoadError: 记录继承或字段校验失败时抛出。
     """
 
+    records = _resolve_record_map(
+        _require_mapping_field(root, field_name="lanes", context=_RUNTIME_LANES_FILE),
+        context="runtime_lanes.lanes",
+    )
+    lanes: dict[str, RuntimeLaneConfig] = {}
+    for lane_name, record in records.items():
+        lanes[lane_name] = _parse_runtime_lane(
+            record_id=lane_name,
+            record=record,
+        )
+    return lanes
+
+
+def _parse_runtime_lane(*, record_id: str, record: JsonObject) -> RuntimeLaneConfig:
+    """解析单个 runtime lane。
+
+    :param record_id: lane 名。
+    :param record: lane JSON object。
+    :returns: runtime lane typed config。
+    :raises ConfigFieldError: 字段缺失、非法类型或 TTL 非法时抛出。
+    """
+
+    context = f"runtime_lanes.lanes.{record_id}"
+    _require_no_forbidden_id_fields(record, context=context)
     _require_exact_fields(
         record,
         allowed=frozenset(
-            {"capacity", "claim_ttl_seconds", "heartbeat_interval_seconds"}
+            {
+                "capacity",
+                "default_timeout_seconds",
+                "claim_ttl_seconds",
+                "heartbeat_interval_seconds",
+            }
         ),
         context=context,
     )
@@ -1533,9 +1703,13 @@ def _parse_lane_capacity(
         context=context,
     )
     if claim_ttl_seconds <= heartbeat_interval_seconds:
-        raise ConfigFieldError(f"{context}.claim_ttl_seconds must be greater than heartbeat_interval_seconds")
-    return LaneCapacityConfig(
+        raise ConfigFieldError(
+            f"{context}.claim_ttl_seconds must be greater than heartbeat_interval_seconds"
+        )
+    return RuntimeLaneConfig(
+        lane_name=record_id,
         capacity=_require_positive_int_field(record, field_name="capacity", context=context),
+        default_timeout_seconds=_optional_positive_float_field(record, field_name="default_timeout_seconds", context=context),
         claim_ttl_seconds=claim_ttl_seconds,
         heartbeat_interval_seconds=heartbeat_interval_seconds,
     )
@@ -1549,14 +1723,15 @@ def _parse_tool_discovery_provider(
     :param record_id: provider id。
     :param record: 继承解析后的 provider 记录。
     :returns: 工具发现 provider typed config。
-    :raises ConfigFieldError: 字段缺失、非法类型或 id 不一致时抛出。
+    :raises ConfigFieldError: 字段缺失、非法类型或出现重复 id 字段时抛出。
     """
 
+    context = f"tool_discovery.providers.{record_id}"
+    _require_no_forbidden_id_fields(record, context=context)
     _require_exact_fields(
         record,
         allowed=frozenset(
             {
-                "provider_id",
                 "import_path",
                 "entry_point",
                 "source_kind",
@@ -1565,27 +1740,17 @@ def _parse_tool_discovery_provider(
                 "allow_empty",
             }
         ),
-        context=f"tool_discovery.providers.{record_id}",
-    )
-    provider_id = _require_str_field(
-        record,
-        field_name="provider_id",
-        context=f"tool_discovery.providers.{record_id}",
-    )
-    _require_id_match(
-        record_id=record_id,
-        embedded_id=provider_id,
-        context="tool_discovery.providers",
+        context=context,
     )
     import_path = _optional_str_field(
         record,
         field_name=_IMPORT_PATH_FIELD,
-        context=f"tool_discovery.providers.{record_id}",
+        context=context,
     )
     entry_point = _optional_entry_point(
         record,
         field_name=_ENTRY_POINT_FIELD,
-        context=f"tool_discovery.providers.{record_id}",
+        context=context,
     )
     if (import_path is None) == (entry_point is None):
         raise ConfigFieldError(
@@ -1595,18 +1760,18 @@ def _parse_tool_discovery_provider(
         _require_str_field(
             record,
             field_name="source_kind",
-            context=f"tool_discovery.providers.{record_id}",
+            context=context,
         ),
-        context=f"tool_discovery.providers.{record_id}.source_kind",
+        context=f"{context}.source_kind",
     )
     return ToolDiscoveryProviderConfig(
-        provider_id=provider_id,
+        provider_id=record_id,
         import_path=import_path,
         entry_point=entry_point,
         source_kind=source_kind,
-        source_id=_require_str_field(record, field_name="source_id", context=f"tool_discovery.providers.{record_id}"),
-        enabled=_require_bool_field(record, field_name="enabled", context=f"tool_discovery.providers.{record_id}"),
-        allow_empty=_require_bool_field(record, field_name="allow_empty", context=f"tool_discovery.providers.{record_id}"),
+        source_id=_require_str_field(record, field_name="source_id", context=context),
+        enabled=_require_bool_field(record, field_name="enabled", context=context),
+        allow_empty=_require_bool_field(record, field_name="allow_empty", context=context),
     )
 
 
@@ -1658,68 +1823,23 @@ def _parse_tool_bundle_source_kind(
 
 def _validate_execution_profile_references(
     *,
-    profiles: Mapping[str, ExecutionProfileConfig],
-    runner_options_profiles: Mapping[str, RunnerOptionsProfileConfig],
+    execution_profiles: Mapping[str, ExecutionProfileConfig],
     agent_policy_profiles: Mapping[str, AgentPolicyProfileConfig],
 ) -> None:
     """校验 execution profile 内部引用。
 
-    :param profiles: execution profiles。
-    :param runner_options_profiles: runner options profiles。
+    :param execution_profiles: execution profiles。
     :param agent_policy_profiles: agent policy profiles。
     :returns: 无返回值。
     :raises ConfigFieldError: 引用不存在时抛出。
     """
 
-    for profile_id, profile in profiles.items():
-        _require_mapping_contains(
-            runner_options_profiles,
-            key=profile.ordinary.runner_options_profile_id,
-            context=f"execution_profiles.profiles.{profile_id}.ordinary.runner_options_profile_id",
-        )
-        _require_mapping_contains(
-            runner_options_profiles,
-            key=profile.compactor.runner_options_profile_id,
-            context=f"execution_profiles.profiles.{profile_id}.compactor.runner_options_profile_id",
-        )
+    for profile_id, profile in execution_profiles.items():
         _require_mapping_contains(
             agent_policy_profiles,
-            key=profile.ordinary.agent_policy_profile_id,
-            context=f"execution_profiles.profiles.{profile_id}.ordinary.agent_policy_profile_id",
+            key=profile.agent_policy_profile_id,
+            context=f"execution_profiles.execution_profiles.{profile_id}.agent_policy_profile_id",
         )
-
-
-def _validate_hint_references(
-    *,
-    runner_hints: Mapping[str, RunnerHintConfig],
-    agent_hints: Mapping[str, AgentHintConfig],
-    runner_options_profiles: Mapping[str, RunnerOptionsProfileConfig],
-    agent_policy_profiles: Mapping[str, AgentPolicyProfileConfig],
-) -> None:
-    """校验 hints 中显式 profile 引用。
-
-    :param runner_hints: runner hints。
-    :param agent_hints: agent hints。
-    :param runner_options_profiles: runner options profiles。
-    :param agent_policy_profiles: agent policy profiles。
-    :returns: 无返回值。
-    :raises ConfigFieldError: 引用不存在时抛出。
-    """
-
-    for hint_id, hint in runner_hints.items():
-        if hint.runner_options_profile_id is not None:
-            _require_mapping_contains(
-                runner_options_profiles,
-                key=hint.runner_options_profile_id,
-                context=f"execution_profiles.runner_hints.{hint_id}.runner_options_profile_id",
-            )
-    for hint_id, hint in agent_hints.items():
-        if hint.agent_policy_profile_id is not None:
-            _require_mapping_contains(
-                agent_policy_profiles,
-                key=hint.agent_policy_profile_id,
-                context=f"execution_profiles.agent_hints.{hint_id}.agent_policy_profile_id",
-            )
 
 
 def _validate_execution_model_references(
@@ -1727,32 +1847,73 @@ def _validate_execution_model_references(
     execution_profiles: ExecutionProfilesConfig,
     models: ModelsConfig,
 ) -> None:
-    """校验 execution config 中的 model id 引用。
+    """校验 execution config 中的 model id 与 hint id 引用。
 
     :param execution_profiles: execution profiles typed config。
     :param models: 模型目录 typed config。
     :returns: 无返回值。
-    :raises ConfigFieldError: 模型引用不存在时抛出。
+    :raises ConfigFieldError: 模型或 hint 引用不存在时抛出。
     """
 
-    for profile_id, profile in execution_profiles.profiles.items():
-        _require_mapping_contains(
-            models.models,
-            key=profile.ordinary.model_id,
-            context=f"execution_profiles.profiles.{profile_id}.ordinary.model_id",
+    for profile_id, profile in execution_profiles.execution_profiles.items():
+        _validate_baseline_model_reference(
+            baseline=profile.run_baseline,
+            models=models,
+            context=f"execution_profiles.execution_profiles.{profile_id}.run_baseline",
         )
-        _require_mapping_contains(
-            models.models,
-            key=profile.compactor.model_id,
-            context=f"execution_profiles.profiles.{profile_id}.compactor.model_id",
+        compactor_as_baseline = ExecutionBaselineConfig(
+            model_id=profile.compactor_baseline.model_id,
+            runner_option_hint_id=profile.compactor_baseline.runner_option_hint_id,
         )
-    for hint_id, hint in execution_profiles.runner_hints.items():
-        if hint.model_id is not None:
-            _require_mapping_contains(
-                models.models,
-                key=hint.model_id,
-                context=f"execution_profiles.runner_hints.{hint_id}.model_id",
-            )
+        _validate_baseline_model_reference(
+            baseline=compactor_as_baseline,
+            models=models,
+            context=f"execution_profiles.execution_profiles.{profile_id}.compactor_baseline",
+        )
+
+
+def _validate_baseline_model_reference(
+    *, baseline: ExecutionBaselineConfig, models: ModelsConfig, context: str
+) -> None:
+    """校验单个 baseline 的模型与 runner option hint 引用。
+
+    :param baseline: 待校验 baseline。
+    :param models: 模型目录 typed config。
+    :param context: 错误消息上下文。
+    :returns: 无返回值。
+    :raises ConfigFieldError: 模型或 hint 引用不存在时抛出。
+    """
+
+    _require_mapping_contains(
+        models.models,
+        key=baseline.model_id,
+        context=f"{context}.model_id",
+    )
+    model = models.models[baseline.model_id]
+    _require_mapping_contains(
+        model.runtime_hints.runner_option_hints,
+        key=baseline.runner_option_hint_id,
+        context=f"{context}.runner_option_hint_id",
+    )
+
+
+def _validate_host_runtime_lane_references(
+    *, host_runtime: HostRuntimeConfig, runtime_lanes: RuntimeLanesConfig
+) -> None:
+    """校验 Host runtime 引用的 lane 已存在。
+
+    :param host_runtime: Host runtime typed config。
+    :param runtime_lanes: runtime lanes typed config。
+    :returns: 无返回值。
+    :raises ConfigFieldError: lane 引用不存在时抛出。
+    """
+
+    for runtime_id, runtime in host_runtime.runtimes.items():
+        _require_mapping_contains(
+            runtime_lanes.lanes,
+            key=runtime.host_execution_lane_name,
+            context=f"host_runtime.runtimes.{runtime_id}.host_execution_lane_name",
+        )
 
 
 def _require_exact_fields(
@@ -1776,54 +1937,31 @@ def _require_exact_fields(
         raise ConfigFieldError(f"{context} has unknown fields: {sorted(unknown)}")
 
 
-def _require_no_unknown_fields(
-    record: JsonObject, *, allowed: frozenset[str], context: str
-) -> None:
-    """校验记录不包含未知字段。
+def _require_no_forbidden_id_fields(record: JsonObject, *, context: str) -> None:
+    """校验 catalog record 内不重复存储 id 字段。
 
     :param record: 待校验 JSON object。
-    :param allowed: 允许字段集合。
     :param context: 错误消息上下文。
     :returns: 无返回值。
-    :raises ConfigFieldError: 包含未知字段时抛出。
+    :raises ConfigFieldError: 出现重复 id 字段时抛出。
     """
 
-    unknown = frozenset(record.keys()) - allowed
-    if unknown:
-        raise ConfigFieldError(f"{context} has unknown fields: {sorted(unknown)}")
-
-
-def _require_id_match(*, record_id: str, embedded_id: str, context: str) -> None:
-    """校验 map key 与记录内 id 同源。
-
-    :param record_id: map key id。
-    :param embedded_id: 记录内部 id。
-    :param context: 错误消息上下文。
-    :returns: 无返回值。
-    :raises ConfigFieldError: 二者不一致时抛出。
-    """
-
-    if record_id != embedded_id:
+    forbidden = frozenset(record.keys()) & _FORBIDDEN_RECORD_ID_FIELDS
+    if forbidden:
         raise ConfigFieldError(
-            f"{context}.{record_id} id field must match map key: {embedded_id}"
+            f"{context} must not contain embedded id fields: {sorted(forbidden)}"
         )
 
 
 def _require_mapping_contains(
-    values: Mapping[str, JsonValue]
-    | Mapping[str, ModelConfig]
-    | Mapping[str, ExecutionProfileConfig]
-    | Mapping[str, RunnerOptionsProfileConfig]
-    | Mapping[str, AgentPolicyProfileConfig]
-    | Mapping[str, HostRuntimeProfileConfig]
-    | Mapping[str, LaneCapacityConfig],
+    values: Container[str],
     *,
     key: str,
     context: str,
 ) -> None:
-    """校验映射中存在指定 key。
+    """校验容器中存在指定 key。
 
-    :param values: 待校验映射。
+    :param values: 待校验容器。
     :param key: 必须存在的 key。
     :param context: 错误消息上下文。
     :returns: 无返回值。
@@ -1900,46 +2038,45 @@ def _require_str_mapping_field(
     raw = _require_mapping_field(record, field_name=field_name, context=context)
     result: dict[str, str] = {}
     for key, value in raw.items():
-        if not isinstance(value, str) or not value.strip():
-            raise ConfigFieldError(f"{context}.{field_name}.{key} must be non-empty string")
+        if not isinstance(value, str):
+            raise ConfigFieldError(f"{context}.{field_name}.{key} must be a string")
         result[key] = value
     return result
 
 
 def _require_str_field(record: JsonObject, *, field_name: str, context: str) -> str:
-    """读取必填非空字符串字段。
+    """读取必填字符串字段。
 
     :param record: JSON object。
     :param field_name: 字段名。
     :param context: 错误消息上下文。
-    :returns: 字段字符串。
-    :raises ConfigFieldError: 字段缺失或类型非法时抛出。
+    :returns: 字符串字段值。
+    :raises ConfigFieldError: 字段缺失、不是字符串或为空时抛出。
     """
 
     value = _require_field(record, field_name=field_name, context=context)
-    if not isinstance(value, str) or not value.strip():
-        raise ConfigFieldError(f"{context}.{field_name} must be non-empty string")
+    if not isinstance(value, str):
+        raise ConfigFieldError(f"{context}.{field_name} must be a string")
+    if not value.strip():
+        raise ConfigFieldError(f"{context}.{field_name} must be non-empty")
     return value
 
 
 def _optional_str_field(
     record: JsonObject, *, field_name: str, context: str
 ) -> str | None:
-    """读取可选非空字符串字段。
+    """读取可选字符串字段。
 
     :param record: JSON object。
     :param field_name: 字段名。
     :param context: 错误消息上下文。
-    :returns: 字段字符串；未配置或 ``null`` 时返回 ``None``。
-    :raises ConfigFieldError: 字段存在但类型非法时抛出。
+    :returns: 字符串字段值；缺失或 ``null`` 时返回 ``None``。
+    :raises ConfigFieldError: 字段存在但不是字符串或为空时抛出。
     """
 
     if field_name not in record or record[field_name] is None:
         return None
-    value = record[field_name]
-    if not isinstance(value, str) or not value.strip():
-        raise ConfigFieldError(f"{context}.{field_name} must be non-empty string or null")
-    return value
+    return _require_str_field(record, field_name=field_name, context=context)
 
 
 def _require_bool_field(record: JsonObject, *, field_name: str, context: str) -> bool:
@@ -1948,141 +2085,31 @@ def _require_bool_field(record: JsonObject, *, field_name: str, context: str) ->
     :param record: JSON object。
     :param field_name: 字段名。
     :param context: 错误消息上下文。
-    :returns: bool 值。
-    :raises ConfigFieldError: 字段缺失或类型非法时抛出。
+    :returns: bool 字段值。
+    :raises ConfigFieldError: 字段缺失或不是 bool 时抛出。
     """
 
     value = _require_field(record, field_name=field_name, context=context)
     if not isinstance(value, bool):
-        raise ConfigFieldError(f"{context}.{field_name} must be bool")
+        raise ConfigFieldError(f"{context}.{field_name} must be a boolean")
     return value
 
 
-def _optional_bool_field(
+def _require_float_field(
     record: JsonObject, *, field_name: str, context: str
-) -> bool | None:
-    """读取可选 bool 字段。
+) -> float:
+    """读取必填数值字段并转为 float。
 
     :param record: JSON object。
     :param field_name: 字段名。
     :param context: 错误消息上下文。
-    :returns: bool 值；未配置或 ``null`` 时返回 ``None``。
-    :raises ConfigFieldError: 字段存在但类型非法时抛出。
-    """
-
-    if field_name not in record or record[field_name] is None:
-        return None
-    value = record[field_name]
-    if not isinstance(value, bool):
-        raise ConfigFieldError(f"{context}.{field_name} must be bool or null")
-    return value
-
-
-def _require_int_field(record: JsonObject, *, field_name: str, context: str) -> int:
-    """读取必填整数字段。
-
-    :param record: JSON object。
-    :param field_name: 字段名。
-    :param context: 错误消息上下文。
-    :returns: 整数值。
-    :raises ConfigFieldError: 字段缺失或类型非法时抛出。
-    """
-
-    value = _require_field(record, field_name=field_name, context=context)
-    if isinstance(value, bool) or not isinstance(value, int):
-        raise ConfigFieldError(f"{context}.{field_name} must be integer")
-    return value
-
-
-def _require_positive_int_field(
-    record: JsonObject, *, field_name: str, context: str
-) -> int:
-    """读取必填正整数字段。
-
-    :param record: JSON object。
-    :param field_name: 字段名。
-    :param context: 错误消息上下文。
-    :returns: 正整数值。
-    :raises ConfigFieldError: 字段缺失、类型非法或非正时抛出。
-    """
-
-    value = _require_int_field(record, field_name=field_name, context=context)
-    if value <= 0:
-        raise ConfigFieldError(f"{context}.{field_name} must be positive integer")
-    return value
-
-
-def _require_non_negative_int_field(
-    record: JsonObject, *, field_name: str, context: str
-) -> int:
-    """读取必填非负整数字段。
-
-    :param record: JSON object。
-    :param field_name: 字段名。
-    :param context: 错误消息上下文。
-    :returns: 非负整数值。
-    :raises ConfigFieldError: 字段缺失、类型非法或为负时抛出。
-    """
-
-    value = _require_int_field(record, field_name=field_name, context=context)
-    if value < 0:
-        raise ConfigFieldError(f"{context}.{field_name} must be non-negative integer")
-    return value
-
-
-def _optional_positive_int_field(
-    record: JsonObject, *, field_name: str, context: str
-) -> int | None:
-    """读取可选正整数字段。
-
-    :param record: JSON object。
-    :param field_name: 字段名。
-    :param context: 错误消息上下文。
-    :returns: 正整数值；未配置或 ``null`` 时返回 ``None``。
-    :raises ConfigFieldError: 字段存在但类型非法或非正时抛出。
-    """
-
-    if field_name not in record or record[field_name] is None:
-        return None
-    value = _require_int_field(record, field_name=field_name, context=context)
-    if value <= 0:
-        raise ConfigFieldError(f"{context}.{field_name} must be positive integer or null")
-    return value
-
-
-def _optional_non_negative_int_field(
-    record: JsonObject, *, field_name: str, context: str
-) -> int | None:
-    """读取可选非负整数字段。
-
-    :param record: JSON object。
-    :param field_name: 字段名。
-    :param context: 错误消息上下文。
-    :returns: 非负整数值；未配置或 ``null`` 时返回 ``None``。
-    :raises ConfigFieldError: 字段存在但类型非法或为负时抛出。
-    """
-
-    if field_name not in record or record[field_name] is None:
-        return None
-    value = _require_int_field(record, field_name=field_name, context=context)
-    if value < 0:
-        raise ConfigFieldError(f"{context}.{field_name} must be non-negative integer or null")
-    return value
-
-
-def _require_float_field(record: JsonObject, *, field_name: str, context: str) -> float:
-    """读取必填数值字段。
-
-    :param record: JSON object。
-    :param field_name: 字段名。
-    :param context: 错误消息上下文。
-    :returns: 浮点值。
-    :raises ConfigFieldError: 字段缺失或类型非法时抛出。
+    :returns: float 字段值。
+    :raises ConfigFieldError: 字段缺失、bool 或非数值时抛出。
     """
 
     value = _require_field(record, field_name=field_name, context=context)
     if isinstance(value, bool) or not isinstance(value, (int, float)):
-        raise ConfigFieldError(f"{context}.{field_name} must be number")
+        raise ConfigFieldError(f"{context}.{field_name} must be a number")
     return float(value)
 
 
@@ -2094,31 +2121,14 @@ def _require_positive_float_field(
     :param record: JSON object。
     :param field_name: 字段名。
     :param context: 错误消息上下文。
-    :returns: 正浮点值。
-    :raises ConfigFieldError: 字段缺失、类型非法或非正时抛出。
+    :returns: 正 float 字段值。
+    :raises ConfigFieldError: 字段非正数时抛出。
     """
 
     value = _require_float_field(record, field_name=field_name, context=context)
-    if value <= 0.0:
-        raise ConfigFieldError(f"{context}.{field_name} must be positive number")
+    if value <= 0:
+        raise ConfigFieldError(f"{context}.{field_name} must be > 0")
     return value
-
-
-def _optional_float_field(
-    record: JsonObject, *, field_name: str, context: str
-) -> float | None:
-    """读取可选数值字段。
-
-    :param record: JSON object。
-    :param field_name: 字段名。
-    :param context: 错误消息上下文。
-    :returns: 浮点值；未配置或 ``null`` 时返回 ``None``。
-    :raises ConfigFieldError: 字段存在但类型非法时抛出。
-    """
-
-    if field_name not in record or record[field_name] is None:
-        return None
-    return _require_float_field(record, field_name=field_name, context=context)
 
 
 def _optional_positive_float_field(
@@ -2129,48 +2139,62 @@ def _optional_positive_float_field(
     :param record: JSON object。
     :param field_name: 字段名。
     :param context: 错误消息上下文。
-    :returns: 正浮点值；未配置或 ``null`` 时返回 ``None``。
-    :raises ConfigFieldError: 字段存在但类型非法或非正时抛出。
+    :returns: 正 float 字段值；缺失或 ``null`` 时返回 ``None``。
+    :raises ConfigFieldError: 字段存在但非正数时抛出。
     """
 
     if field_name not in record or record[field_name] is None:
         return None
-    value = _require_float_field(record, field_name=field_name, context=context)
-    if value <= 0.0:
-        raise ConfigFieldError(f"{context}.{field_name} must be positive number or null")
+    return _require_positive_float_field(record, field_name=field_name, context=context)
+
+
+def _require_positive_int_field(
+    record: JsonObject, *, field_name: str, context: str
+) -> int:
+    """读取必填正整数字段。
+
+    :param record: JSON object。
+    :param field_name: 字段名。
+    :param context: 错误消息上下文。
+    :returns: 正整数字段值。
+    :raises ConfigFieldError: 字段缺失、不是整数或非正时抛出。
+    """
+
+    value = _require_int_field(record, field_name=field_name, context=context)
+    if value <= 0:
+        raise ConfigFieldError(f"{context}.{field_name} must be > 0")
     return value
 
 
-__all__ = [
-    "AgentHintConfig",
-    "AgentPolicyProfileConfig",
-    "CompactorExecutionConfig",
-    "ConfigExtendsError",
-    "ConfigFieldError",
-    "ConfigFileNotFoundError",
-    "ConfigLoadError",
-    "ConfigLoader",
-    "ConfigShapeError",
-    "ContextBudgetConfig",
-    "ExecutionProfileConfig",
-    "ExecutionProfilesConfig",
-    "HostRuntimeConfig",
-    "HostRuntimeProfileConfig",
-    "LaneCapacityConfig",
-    "LaneRuntimeConfig",
-    "MemoryProjectionConfig",
-    "ModelConfig",
-    "ModelsConfig",
-    "OrdinaryExecutionConfig",
-    "RunnerHintConfig",
-    "RunnerKind",
-    "RunnerOptionsProfileConfig",
-    "RuntimeConfig",
-    "SQLiteRuntimeConfig",
-    "ToolDiscoveryConfig",
-    "ToolDiscoveryEntryPointConfig",
-    "ToolDiscoveryProviderConfig",
-    "TruncationConfig",
-    "legacy_config_file_names",
-    "load_runtime_config",
-]
+def _require_non_negative_int_field(
+    record: JsonObject, *, field_name: str, context: str
+) -> int:
+    """读取必填非负整数字段。
+
+    :param record: JSON object。
+    :param field_name: 字段名。
+    :param context: 错误消息上下文。
+    :returns: 非负整数字段值。
+    :raises ConfigFieldError: 字段缺失、不是整数或为负时抛出。
+    """
+
+    value = _require_int_field(record, field_name=field_name, context=context)
+    if value < 0:
+        raise ConfigFieldError(f"{context}.{field_name} must be >= 0")
+    return value
+
+
+def _require_int_field(record: JsonObject, *, field_name: str, context: str) -> int:
+    """读取必填整数字段。
+
+    :param record: JSON object。
+    :param field_name: 字段名。
+    :param context: 错误消息上下文。
+    :returns: 整数字段值。
+    :raises ConfigFieldError: 字段缺失、bool 或非整数时抛出。
+    """
+
+    value = _require_field(record, field_name=field_name, context=context)
+    if isinstance(value, bool) or not isinstance(value, int):
+        raise ConfigFieldError(f"{context}.{field_name} must be an integer")
+    return value

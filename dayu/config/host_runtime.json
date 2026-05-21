@@ -1,32 +1,18 @@
 {
-  "default_runtime_id": "local",
+  "default_host_runtime_id": "local",
   "runtimes": {
     "local": {
-      "extends": null,
-      "runtime_id": "local",
       "store_root": "workspace/.dayu/host",
       "artifact_root": "workspace/.dayu/artifacts",
       "sqlite": {
         "path": "workspace/.dayu/host/dayu_host.sqlite3",
         "busy_timeout_seconds": 5.0
       },
-      "lane": {
-        "db_path": "workspace/.dayu/runtime/runtime_lanes.sqlite3",
-        "default_lane_name": "llm_api",
-        "lanes": {
-          "llm_api": {
-            "capacity": 4,
-            "claim_ttl_seconds": 30.0,
-            "heartbeat_interval_seconds": 5.0
-          }
-        }
-      },
-      "worker_factory_kind": "local",
+      "host_execution_lane_name": "llm_api",
+      "worker_backend": "local",
       "dispatch_poll_interval_seconds": 0.2,
       "memory_projection_catch_up_batch_size": 100,
-      "truncation_manager_enabled": true,
-      "prompt_asset_root": "workspace/config/prompts",
-      "scene_manifest_root": "workspace/config/prompts/manifests"
+      "truncation_manager_enabled": true
     }
   }
 }

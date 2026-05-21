@@ -1,0 +1,15 @@
+{
+  "coordinator": {
+    "db_path": "workspace/.dayu/runtime/runtime_lanes.sqlite3",
+    "busy_timeout_seconds": 5.0,
+    "poll_interval_seconds": 0.05
+  },
+  "lanes": {
+    "llm_api": {
+      "capacity": 4,
+      "default_timeout_seconds": null,
+      "claim_ttl_seconds": 30.0,
+      "heartbeat_interval_seconds": 5.0
+    }
+  }
+}

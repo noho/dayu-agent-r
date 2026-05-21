@@ -1,84 +1,74 @@
 {
-  "default_profile_id": "ordinary",
-  "profiles": {
-    "ordinary": {
-      "extends": null,
-      "profile_id": "ordinary",
-      "ordinary": {
-        "model_id": "deepseek-chat",
-        "runner_options_profile_id": "analytical",
-        "agent_policy_profile_id": "default-agent"
+  "default_execution_profile_id": "standard",
+  "execution_profiles": {
+    "standard": {
+      "run_baseline": {
+        "model_id": "deepseek-v4-flash",
+        "runner_option_hint_id": "interactive"
       },
-      "compactor": {
-        "model_id": "deepseek-chat",
-        "runner_options_profile_id": "compact",
+      "compactor_baseline": {
+        "model_id": "deepseek-v4-flash",
+        "runner_option_hint_id": "conversation_compaction",
         "artifact_root": "workspace/.dayu/artifacts/compaction"
       },
-      "context_budget": {
-        "max_context_tokens": 64000,
-        "reserved_response_tokens": 4096,
-        "compaction_trigger_tokens": 56000
+      "context_budget_policy": {
+        "context_window_size": 1048576,
+        "soft_threshold_context_ratio": 0.65,
+        "hard_threshold_context_ratio": 0.82,
+        "max_proactive_compactions_per_run": 2,
+        "max_reactive_compactions_per_run": 2,
+        "max_compaction_attempts_per_operation": 3,
+        "policy_ref": "standard"
       },
-      "memory_projection": {
-        "enabled": true,
-        "stable_layer_max_items": 200,
-        "history_pool_max_items": 1200
+      "memory_projection_policy": {
+        "context_window_size": 1048576,
+        "max_pinned_items": 32,
+        "max_verified_facts": 256,
+        "max_working_assumptions": 128,
+        "recent_raw_turns_floor": 4,
+        "raw_turn_context_ratio": 0.02,
+        "raw_turn_size_floor": 1024,
+        "raw_turn_size_cap": 8192,
+        "history_pool_context_ratio": 0.18,
+        "history_pool_size_floor": 8192,
+        "history_pool_size_cap": 131072,
+        "stable_layer_context_ratio": 0.12,
+        "stable_layer_size_floor": 4096,
+        "stable_layer_size_cap": 65536,
+        "max_lag_events_for_inline_delta": 32,
+        "max_delta_repair_events": 128
       },
-      "truncation": {
+      "tool_truncation_policy": {
         "enabled": true,
-        "default_max_chars": 12000,
-        "fetch_more_tool_name": "fetch_more"
-      }
-    }
-  },
-  "runner_options_profiles": {
-    "analytical": {
-      "extends": null,
-      "temperature": 0.2,
-      "max_tokens": 4096,
-      "top_p": 0.9,
-      "stream": true
-    },
-    "compact": {
-      "extends": null,
-      "temperature": 0.0,
-      "max_tokens": 2048,
-      "top_p": 1.0,
-      "stream": false
+        "default_cursor_ttl_seconds": 3600.0,
+        "default_limits": {
+          "text_chars": {
+            "max_chars": 12000
+          },
+          "text_lines": {
+            "max_lines": 400
+          },
+          "list_items": {
+            "max_items": 200
+          },
+          "binary_bytes": {
+            "max_bytes": 1048576
+          }
+        }
+      },
+      "agent_policy_profile_id": "standard-agent"
     }
   },
   "agent_policy_profiles": {
-    "default-agent": {
-      "extends": null,
+    "standard-agent": {
       "max_iterations": 24,
-      "continuation_attempts": 2,
+      "continuation_max_attempts": 2,
+      "allow_tool_calls": true,
       "tool_execution_timeout_seconds": 120.0,
-      "fallback_mode": "finalize",
-      "fallback_prompt": "请基于已获得证据给出可审计结论。",
+      "fallback_mode": "force_answer",
+      "fallback_prompt": "请基于已获得的信息直接回答问题。信息不足时必须说明不确定性，不得编造。",
       "continuation_prompt": "继续完成当前财报分析任务。",
-      "consecutive_failed_tool_batches": 2
-    }
-  },
-  "runner_hints": {
-    "low_latency": {
-      "extends": null,
-      "model_id": "deepseek-chat",
-      "runner_options_profile_id": "analytical",
-      "max_tokens": 2048,
-      "stream": true
-    },
-    "reasoning": {
-      "extends": null,
-      "model_id": "deepseek-reasoner",
-      "temperature": 0.1
-    }
-  },
-  "agent_hints": {
-    "strict": {
-      "extends": null,
-      "agent_policy_profile_id": "default-agent",
-      "max_iterations": 12,
-      "tool_execution_timeout_seconds": 60.0
+      "max_consecutive_failed_tool_batches": 2
     }
   }
 }

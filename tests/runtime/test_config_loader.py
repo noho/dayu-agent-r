@@ -14,6 +14,8 @@ from dayu.runtime.config_loader import (
     ConfigLoader,
     ConfigShapeError,
     RuntimeConfig,
+    config_file_names,
+    default_fallback_prompt,
     legacy_config_file_names,
     load_runtime_config,
 )
@@ -35,10 +37,32 @@ def _write_json(path: Path, value: JsonValue) -> None:
     )
 
 
-def _base_model_record(model_id: str, *, endpoint: str) -> dict[str, JsonValue]:
+def _runner_option_hints() -> dict[str, JsonValue]:
+    """构造完整 runner option hints fixture。
+
+    :returns: runner option hints JSON object。
+    :raises Exception: 不主动抛出异常。
+    """
+
+    return {
+        "interactive": {
+            "temperature": 0.2,
+            "max_tokens": 100,
+            "top_p": 0.9,
+            "stream": True,
+        },
+        "conversation_compaction": {
+            "temperature": 0.0,
+            "max_tokens": 50,
+            "top_p": 1.0,
+            "stream": False,
+        },
+    }
+
+
+def _base_model_record(*, endpoint: str) -> dict[str, JsonValue]:
     """构造完整模型配置记录。
 
-    :param model_id: 模型 id。
     :param endpoint: endpoint URL。
     :returns: 模型配置 JSON object。
     :raises Exception: 不主动抛出异常。
@@ -46,10 +70,9 @@ def _base_model_record(model_id: str, *, endpoint: str) -> dict[str, JsonValue]:
 
     return {
         "extends": None,
-        "model_id": model_id,
         "runner_kind": "openai_compatible",
         "provider": "test-provider",
-        "model": model_id,
+        "model": "base-model",
         "endpoint": endpoint,
         "api_key_ref": "RAW_API_KEY_REF",
         "headers": {
@@ -68,6 +91,88 @@ def _base_model_record(model_id: str, *, endpoint: str) -> dict[str, JsonValue]:
             "nested": {"keep": ["as", "json"]},
         },
         "context_window_tokens": 1000,
+        "runtime_hints": {
+            "runner_option_hints": _runner_option_hints(),
+        },
+    }
+
+
+def _execution_profile_record() -> dict[str, JsonValue]:
+    """构造完整 execution profile fixture。
+
+    :returns: execution profile JSON object。
+    :raises Exception: 不主动抛出异常。
+    """
+
+    return {
+        "extends": None,
+        "run_baseline": {
+            "model_id": "base-model",
+            "runner_option_hint_id": "interactive",
+        },
+        "compactor_baseline": {
+            "model_id": "base-model",
+            "runner_option_hint_id": "conversation_compaction",
+            "artifact_root": "artifacts/compact",
+        },
+        "context_budget_policy": {
+            "context_window_size": 1000,
+            "soft_threshold_context_ratio": 0.6,
+            "hard_threshold_context_ratio": 0.8,
+            "max_proactive_compactions_per_run": 1,
+            "max_reactive_compactions_per_run": 1,
+            "max_compaction_attempts_per_operation": 2,
+            "policy_ref": "test",
+        },
+        "memory_projection_policy": {
+            "context_window_size": 1000,
+            "max_pinned_items": 2,
+            "max_verified_facts": 3,
+            "max_working_assumptions": 4,
+            "recent_raw_turns_floor": 1,
+            "raw_turn_context_ratio": 0.1,
+            "raw_turn_size_floor": 10,
+            "raw_turn_size_cap": 100,
+            "history_pool_context_ratio": 0.2,
+            "history_pool_size_floor": 20,
+            "history_pool_size_cap": 200,
+            "stable_layer_context_ratio": 0.3,
+            "stable_layer_size_floor": 30,
+            "stable_layer_size_cap": 300,
+            "max_lag_events_for_inline_delta": 5,
+            "max_delta_repair_events": 6,
+        },
+        "tool_truncation_policy": {
+            "enabled": True,
+            "default_cursor_ttl_seconds": 60.0,
+            "default_limits": {
+                "text_chars": {"max_chars": 100},
+                "text_lines": {"max_lines": 10},
+                "list_items": {"max_items": 8},
+                "binary_bytes": {"max_bytes": 1024},
+            },
+        },
+        "agent_policy_profile_id": "default-agent",
+    }
+
+
+def _agent_policy_profile_record() -> dict[str, JsonValue]:
+    """构造完整 agent policy profile fixture。
+
+    :returns: agent policy profile JSON object。
+    :raises Exception: 不主动抛出异常。
+    """
+
+    return {
+        "extends": None,
+        "max_iterations": 3,
+        "continuation_max_attempts": 1,
+        "allow_tool_calls": True,
+        "tool_execution_timeout_seconds": 30.0,
+        "fallback_mode": "force_answer",
+        "fallback_prompt": default_fallback_prompt(),
+        "continuation_prompt": "continue",
+        "max_consecutive_failed_tool_batches": 2,
     }
 
 
@@ -84,14 +189,16 @@ def _minimal_package_config(root: Path) -> None:
         {
             "models": {
                 "base-model": _base_model_record(
-                    "base-model",
-                    endpoint="https://package.example/chat",
+                    endpoint="https://package.example/chat"
                 ),
                 "derived-model": {
                     "extends": "base-model",
-                    "model_id": "derived-model",
                     "model": "derived-model",
                     "endpoint": "https://derived.example/chat",
+                },
+                "final-model": {
+                    "extends": "derived-model",
+                    "endpoint": "https://final.example/chat",
                 },
             }
         },
@@ -99,111 +206,52 @@ def _minimal_package_config(root: Path) -> None:
     _write_json(
         root / "execution_profiles.json",
         {
-            "default_profile_id": "ordinary",
-            "profiles": {
-                "ordinary": {
-                    "extends": None,
-                    "profile_id": "ordinary",
-                    "ordinary": {
-                        "model_id": "base-model",
-                        "runner_options_profile_id": "analytical",
-                        "agent_policy_profile_id": "default-agent",
-                    },
-                    "compactor": {
-                        "model_id": "base-model",
-                        "runner_options_profile_id": "compact",
-                        "artifact_root": "artifacts/compact",
-                    },
-                    "context_budget": {
-                        "max_context_tokens": 1000,
-                        "reserved_response_tokens": 100,
-                        "compaction_trigger_tokens": 800,
-                    },
-                    "memory_projection": {
-                        "enabled": True,
-                        "stable_layer_max_items": 10,
-                        "history_pool_max_items": 20,
-                    },
-                    "truncation": {
-                        "enabled": True,
-                        "default_max_chars": 100,
-                        "fetch_more_tool_name": "fetch_more",
-                    },
-                }
-            },
-            "runner_options_profiles": {
-                "analytical": {
-                    "extends": None,
-                    "temperature": 0.2,
-                    "max_tokens": 100,
-                    "top_p": 0.9,
-                    "stream": True,
-                },
-                "compact": {
-                    "extends": "analytical",
-                    "temperature": 0.0,
-                    "stream": False,
-                },
+            "default_execution_profile_id": "standard",
+            "execution_profiles": {
+                "standard": _execution_profile_record(),
             },
             "agent_policy_profiles": {
-                "default-agent": {
-                    "extends": None,
-                    "max_iterations": 3,
-                    "continuation_attempts": 1,
-                    "tool_execution_timeout_seconds": 30.0,
-                    "fallback_mode": "finalize",
-                    "fallback_prompt": "fallback",
-                    "continuation_prompt": "continue",
-                    "consecutive_failed_tool_batches": 2,
-                }
-            },
-            "runner_hints": {
-                "fast": {
-                    "extends": None,
-                    "model_id": "derived-model",
-                    "max_tokens": 50,
-                }
-            },
-            "agent_hints": {
-                "strict": {
-                    "extends": None,
-                    "agent_policy_profile_id": "default-agent",
-                    "max_iterations": 2,
-                }
+                "default-agent": _agent_policy_profile_record(),
             },
         },
     )
     _write_json(
         root / "host_runtime.json",
         {
-            "default_runtime_id": "local",
+            "default_host_runtime_id": "local",
             "runtimes": {
                 "local": {
                     "extends": None,
-                    "runtime_id": "local",
                     "store_root": "workspace/.dayu/host",
                     "artifact_root": "workspace/.dayu/artifacts",
                     "sqlite": {
                         "path": "workspace/.dayu/host/dayu.sqlite3",
                         "busy_timeout_seconds": 5.0,
                     },
-                    "lane": {
-                        "db_path": "workspace/.dayu/runtime/lane.sqlite3",
-                        "default_lane_name": "llm_api",
-                        "lanes": {
-                            "llm_api": {
-                                "capacity": 1,
-                                "claim_ttl_seconds": 10.0,
-                                "heartbeat_interval_seconds": 2.0,
-                            }
-                        },
-                    },
-                    "worker_factory_kind": "local",
+                    "host_execution_lane_name": "llm_api",
+                    "worker_backend": "local",
                     "dispatch_poll_interval_seconds": 0.1,
                     "memory_projection_catch_up_batch_size": 10,
                     "truncation_manager_enabled": True,
-                    "prompt_asset_root": "workspace/config/prompts",
-                    "scene_manifest_root": "workspace/config/prompts/manifests",
+                }
+            },
+        },
+    )
+    _write_json(
+        root / "runtime_lanes.json",
+        {
+            "coordinator": {
+                "db_path": "workspace/.dayu/runtime/lane.sqlite3",
+                "busy_timeout_seconds": 5.0,
+                "poll_interval_seconds": 0.05,
+            },
+            "lanes": {
+                "llm_api": {
+                    "extends": None,
+                    "capacity": 1,
+                    "default_timeout_seconds": None,
+                    "claim_ttl_seconds": 10.0,
+                    "heartbeat_interval_seconds": 2.0,
                 }
             },
         },
@@ -214,7 +262,6 @@ def _minimal_package_config(root: Path) -> None:
             "providers": {
                 "tools": {
                     "extends": None,
-                    "provider_id": "tools",
                     "import_path": "tests.fake_tools:provider",
                     "entry_point": None,
                     "source_kind": "explicit_provider",
@@ -228,13 +275,21 @@ def _minimal_package_config(root: Path) -> None:
 
 
 def test_default_runtime_config_files_load_as_typed_views() -> None:
-    """四个包内默认新配置文件必须都能加载成 typed view。"""
+    """五个包内默认新配置文件必须都能加载成 typed view。"""
 
     config = load_runtime_config()
 
-    assert config.models.models["deepseek-chat"].model_id == "deepseek-chat"
-    assert config.execution_profiles.default_profile_id == "ordinary"
-    assert config.host_runtime.default_runtime_id == "local"
+    assert "runtime_lanes.json" in config_file_names()
+    assert config.models.models["deepseek-v4-flash"].model_id == "deepseek-v4-flash"
+    assert (
+        config.models.models["deepseek-v4-flash"]
+        .runtime_hints.runner_option_hints["interactive"]
+        .max_tokens
+        == 4096
+    )
+    assert config.execution_profiles.default_execution_profile_id == "standard"
+    assert config.host_runtime.default_host_runtime_id == "local"
+    assert config.runtime_lanes.lanes["llm_api"].capacity == 4
     provider = config.tool_discovery.providers["financial-tools"]
     assert provider.source_kind == ToolBundleSourceKind.EXPLICIT_PROVIDER
     assert provider.import_path == "dayu.fins.tools:discover_tools"
@@ -248,10 +303,7 @@ def test_workspace_record_replaces_package_record_without_deep_merge(
     package_root = tmp_path / "package"
     workspace_root = tmp_path / "workspace"
     _minimal_package_config(package_root)
-    replacement = _base_model_record(
-        "base-model",
-        endpoint="https://workspace.example/chat",
-    )
+    replacement = _base_model_record(endpoint="https://workspace.example/chat")
     replacement["headers"] = {"Authorization": "Bearer workspace"}
     _write_json(workspace_root / "models.json", {"models": {"base-model": replacement}})
 
@@ -266,19 +318,19 @@ def test_workspace_record_replaces_package_record_without_deep_merge(
     assert config.models.models["derived-model"].endpoint == "https://derived.example/chat"
 
 
-def test_single_extends_resolves_to_complete_typed_record(tmp_path: Path) -> None:
-    """单继承记录必须解析为完整 typed record。"""
+def test_single_extends_chain_resolves_to_complete_typed_record(tmp_path: Path) -> None:
+    """合法 A -> B -> C 单继承链必须解析为完整 typed record。"""
 
     package_root = tmp_path / "package"
     _minimal_package_config(package_root)
 
     config = ConfigLoader(package_config_dir=package_root).load()
 
-    derived = config.models.models["derived-model"]
-    assert derived.provider == "test-provider"
-    assert derived.endpoint == "https://derived.example/chat"
-    compact = config.execution_profiles.runner_options_profiles["compact"]
-    assert compact.max_tokens == 100
+    final = config.models.models["final-model"]
+    assert final.provider == "test-provider"
+    assert final.model == "derived-model"
+    assert final.endpoint == "https://final.example/chat"
+    compact = final.runtime_hints.runner_option_hints["conversation_compaction"]
     assert compact.stream is False
 
 
@@ -289,15 +341,21 @@ def test_extends_cycle_fails_fast(tmp_path: Path) -> None:
     _minimal_package_config(package_root)
     _write_json(
         package_root / "models.json",
-        {
-            "models": {
-                "a": {"extends": "b", "model_id": "a"},
-                "b": {"extends": "a", "model_id": "b"},
-            }
-        },
+        {"models": {"a": {"extends": "b"}, "b": {"extends": "a"}}},
     )
 
     with pytest.raises(ConfigExtendsError, match="cycle"):
+        ConfigLoader(package_config_dir=package_root).load_models()
+
+
+def test_self_extends_fails_fast(tmp_path: Path) -> None:
+    """自引用继承必须 fail fast。"""
+
+    package_root = tmp_path / "package"
+    _minimal_package_config(package_root)
+    _write_json(package_root / "models.json", {"models": {"a": {"extends": "a"}}})
+
+    with pytest.raises(ConfigExtendsError, match="extends self"):
         ConfigLoader(package_config_dir=package_root).load_models()
 
 
@@ -311,12 +369,10 @@ def test_multiple_extends_fails_fast(tmp_path: Path) -> None:
         {
             "models": {
                 "base-model": _base_model_record(
-                    "base-model",
-                    endpoint="https://package.example/chat",
+                    endpoint="https://package.example/chat"
                 ),
                 "derived-model": {
                     "extends": ["base-model", "other-model"],
-                    "model_id": "derived-model",
                 },
             }
         },
@@ -333,14 +389,7 @@ def test_missing_extends_parent_fails_fast(tmp_path: Path) -> None:
     _minimal_package_config(package_root)
     _write_json(
         package_root / "models.json",
-        {
-            "models": {
-                "derived-model": {
-                    "extends": "missing-model",
-                    "model_id": "derived-model",
-                },
-            }
-        },
+        {"models": {"derived-model": {"extends": "missing-model"}}},
     )
 
     with pytest.raises(ConfigExtendsError, match="missing parent"):
@@ -361,12 +410,10 @@ def test_invalid_extends_type_fails_fast(
         {
             "models": {
                 "base-model": _base_model_record(
-                    "base-model",
-                    endpoint="https://package.example/chat",
+                    endpoint="https://package.example/chat"
                 ),
                 "derived-model": {
                     "extends": extends_value,
-                    "model_id": "derived-model",
                 },
             }
         },
@@ -379,20 +426,22 @@ def test_invalid_extends_type_fails_fast(
 def test_workspace_non_map_top_level_field_overrides_package_default(
     tmp_path: Path,
 ) -> None:
-    """workspace 必须能覆盖 default_profile_id 这类非 map 顶层字段。"""
+    """workspace 必须能覆盖 default_execution_profile_id 这类非 map 顶层字段。"""
 
     package_root = tmp_path / "package"
     workspace_root = tmp_path / "workspace"
     _minimal_package_config(package_root)
+    workspace_profile = _execution_profile_record()
+    workspace_profile["run_baseline"] = {
+        "model_id": "derived-model",
+        "runner_option_hint_id": "interactive",
+    }
     _write_json(
         workspace_root / "execution_profiles.json",
         {
-            "default_profile_id": "workspace-profile",
-            "profiles": {
-                "workspace-profile": {
-                    "extends": "ordinary",
-                    "profile_id": "workspace-profile",
-                }
+            "default_execution_profile_id": "workspace-profile",
+            "execution_profiles": {
+                "workspace-profile": workspace_profile,
             },
         },
     )
@@ -401,8 +450,11 @@ def test_workspace_non_map_top_level_field_overrides_package_default(
         workspace_config_dir=workspace_root
     )
 
-    assert config.default_profile_id == "workspace-profile"
-    assert config.profiles["workspace-profile"].ordinary.model_id == "base-model"
+    assert config.default_execution_profile_id == "workspace-profile"
+    assert (
+        config.execution_profiles["workspace-profile"].run_baseline.model_id
+        == "derived-model"
+    )
 
 
 def test_workspace_partial_record_does_not_deep_merge_and_fails(
@@ -418,7 +470,6 @@ def test_workspace_partial_record_does_not_deep_merge_and_fails(
         {
             "models": {
                 "base-model": {
-                    "model_id": "base-model",
                     "headers": {"Authorization": "Bearer partial"},
                 }
             }
@@ -465,6 +516,125 @@ def test_legacy_files_do_not_exist_and_are_not_read(tmp_path: Path) -> None:
         assert not (Path("dayu/config") / file_name).exists()
 
 
+def test_embedded_catalog_id_fields_fail_fast(tmp_path: Path) -> None:
+    """catalog record 内重复 id 字段必须 fail fast。"""
+
+    package_root = tmp_path / "package"
+    _minimal_package_config(package_root)
+    bad_model = _base_model_record(endpoint="https://package.example/chat")
+    bad_model["model_id"] = "base-model"
+    _write_json(package_root / "models.json", {"models": {"base-model": bad_model}})
+
+    with pytest.raises(ConfigFieldError, match="embedded id fields"):
+        ConfigLoader(package_config_dir=package_root).load_models()
+
+
+def test_old_execution_profile_fields_fail_fast(tmp_path: Path) -> None:
+    """旧 runner_options_profiles / runner_hints / agent_hints schema 必须失败。"""
+
+    package_root = tmp_path / "package"
+    _minimal_package_config(package_root)
+    _write_json(
+        package_root / "execution_profiles.json",
+        {
+            "default_execution_profile_id": "standard",
+            "execution_profiles": {
+                "standard": _execution_profile_record(),
+            },
+            "agent_policy_profiles": {
+                "default-agent": _agent_policy_profile_record(),
+            },
+            "runner_options_profiles": {},
+            "runner_hints": {},
+            "agent_hints": {},
+        },
+    )
+
+    with pytest.raises(ConfigFieldError, match="unknown fields"):
+        ConfigLoader(package_config_dir=package_root).load_execution_profiles()
+
+
+def test_agent_fallback_mode_is_closed_enum(tmp_path: Path) -> None:
+    """fallback_mode 只允许 force_answer / raise_error。"""
+
+    package_root = tmp_path / "package"
+    _minimal_package_config(package_root)
+    bad_agent = _agent_policy_profile_record()
+    bad_agent["fallback_mode"] = "finalize"
+    _write_json(
+        package_root / "execution_profiles.json",
+        {
+            "default_execution_profile_id": "standard",
+            "execution_profiles": {"standard": _execution_profile_record()},
+            "agent_policy_profiles": {"default-agent": bad_agent},
+        },
+    )
+
+    with pytest.raises(ConfigFieldError, match="unsupported value"):
+        ConfigLoader(package_config_dir=package_root).load_execution_profiles()
+
+
+def test_host_runtime_lane_reference_must_exist(tmp_path: Path) -> None:
+    """host_runtime.host_execution_lane_name 必须引用 runtime_lanes 已有 lane。"""
+
+    package_root = tmp_path / "package"
+    _minimal_package_config(package_root)
+    _write_json(
+        package_root / "host_runtime.json",
+        {
+            "default_host_runtime_id": "local",
+            "runtimes": {
+                "local": {
+                    "store_root": "workspace/.dayu/host",
+                    "artifact_root": "workspace/.dayu/artifacts",
+                    "sqlite": {
+                        "path": "workspace/.dayu/host/dayu.sqlite3",
+                        "busy_timeout_seconds": 5.0,
+                    },
+                    "host_execution_lane_name": "missing_lane",
+                    "worker_backend": "local",
+                    "dispatch_poll_interval_seconds": 0.1,
+                    "memory_projection_catch_up_batch_size": 10,
+                    "truncation_manager_enabled": True,
+                }
+            },
+        },
+    )
+
+    with pytest.raises(ConfigFieldError, match="unknown id"):
+        ConfigLoader(package_config_dir=package_root).load()
+
+
+def test_runtime_lane_capacity_claim_ttl_must_exceed_heartbeat(
+    tmp_path: Path,
+) -> None:
+    """lane claim_ttl_seconds 必须大于 heartbeat_interval_seconds。"""
+
+    package_root = tmp_path / "package"
+    _minimal_package_config(package_root)
+    _write_json(
+        package_root / "runtime_lanes.json",
+        {
+            "coordinator": {
+                "db_path": "workspace/.dayu/runtime/lane.sqlite3",
+                "busy_timeout_seconds": 5.0,
+                "poll_interval_seconds": 0.05,
+            },
+            "lanes": {
+                "llm_api": {
+                    "capacity": 1,
+                    "default_timeout_seconds": None,
+                    "claim_ttl_seconds": 2.0,
+                    "heartbeat_interval_seconds": 2.0,
+                }
+            },
+        },
+    )
+
+    with pytest.raises(ConfigFieldError, match="greater than heartbeat"):
+        ConfigLoader(package_config_dir=package_root).load_runtime_lanes()
+
+
 def test_tool_discovery_entry_point_requires_import_path_xor_entry_point(
     tmp_path: Path,
 ) -> None:
@@ -477,8 +647,6 @@ def test_tool_discovery_entry_point_requires_import_path_xor_entry_point(
         {
             "providers": {
                 "bad": {
-                    "extends": None,
-                    "provider_id": "bad",
                     "import_path": "tests.fake_tools:provider",
                     "entry_point": {"group": "dayu.tools", "name": "bad"},
                     "source_kind": "explicit_provider",
@@ -492,51 +660,6 @@ def test_tool_discovery_entry_point_requires_import_path_xor_entry_point(
 
     with pytest.raises(ConfigFieldError, match="exactly one"):
         ConfigLoader(package_config_dir=package_root).load_tool_discovery()
-
-
-def test_lane_capacity_claim_ttl_must_exceed_heartbeat(tmp_path: Path) -> None:
-    """lane claim_ttl_seconds 必须大于 heartbeat_interval_seconds。"""
-
-    package_root = tmp_path / "package"
-    _minimal_package_config(package_root)
-    _write_json(
-        package_root / "host_runtime.json",
-        {
-            "default_runtime_id": "local",
-            "runtimes": {
-                "local": {
-                    "extends": None,
-                    "runtime_id": "local",
-                    "store_root": "workspace/.dayu/host",
-                    "artifact_root": "workspace/.dayu/artifacts",
-                    "sqlite": {
-                        "path": "workspace/.dayu/host/dayu.sqlite3",
-                        "busy_timeout_seconds": 5.0,
-                    },
-                    "lane": {
-                        "db_path": "workspace/.dayu/runtime/lane.sqlite3",
-                        "default_lane_name": "llm_api",
-                        "lanes": {
-                            "llm_api": {
-                                "capacity": 1,
-                                "claim_ttl_seconds": 2.0,
-                                "heartbeat_interval_seconds": 2.0,
-                            }
-                        },
-                    },
-                    "worker_factory_kind": "local",
-                    "dispatch_poll_interval_seconds": 0.1,
-                    "memory_projection_catch_up_batch_size": 10,
-                    "truncation_manager_enabled": True,
-                    "prompt_asset_root": "workspace/config/prompts",
-                    "scene_manifest_root": "workspace/config/prompts/manifests",
-                }
-            },
-        },
-    )
-
-    with pytest.raises(ConfigFieldError, match="greater than heartbeat"):
-        ConfigLoader(package_config_dir=package_root).load_host_runtime()
 
 
 def test_json_shape_error_is_structured(tmp_path: Path) -> None:

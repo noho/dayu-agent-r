@@ -23,7 +23,56 @@ def test_default_models_keep_provider_extension_raw() -> None:
 
     config = load_runtime_config()
 
-    assert config.models.models["deepseek-chat"].provider_request_extension == {
+    assert config.models.models["deepseek-v4-flash"].provider_request_extension == {
         "type": "deepseek_thinking",
         "enabled": False,
     }
+
+
+def test_default_models_catalog_contains_migrated_legacy_records() -> None:
+    """默认模型目录必须包含旧 llm_models.json 的全量模型 id。"""
+
+    config = load_runtime_config()
+    expected_model_ids = {
+        "deepseek-v4-flash",
+        "deepseek-v4-flash-thinking",
+        "deepseek-v4-pro",
+        "deepseek-v4-pro-thinking",
+        "gpt-5.4",
+        "gpt-5.4-thinking",
+        "claude-sonnet-4-6",
+        "claude-sonnet-4-6-thinking",
+        "gemini-2.5-flash",
+        "gemini-2.5-flash-thinking",
+        "gemini-2.5-pro",
+        "gemini-2.5-pro-thinking",
+        "gemini-2.5-flash-lite",
+        "gemini-2.5-flash-lite-thinking",
+        "gemini-3.1-pro-preview",
+        "gemini-3.1-pro-preview-thinking",
+        "gemini-3.1-flash-lite-preview",
+        "gemini-3.1-flash-lite-preview-thinking",
+        "mimo-v2.5-pro",
+        "mimo-v2.5-pro-thinking",
+        "mimo-v2.5-pro-plan",
+        "mimo-v2.5-pro-thinking-plan",
+        "mimo-v2.5-pro-plan-sg",
+        "mimo-v2.5-pro-thinking-plan-sg",
+        "qwen-plus",
+        "qwen-plus-thinking",
+        "ollama",
+    }
+
+    assert set(config.models.models) == expected_model_ids
+
+
+def test_default_models_expose_runner_option_hints() -> None:
+    """迁移后的模型目录必须把 temperature profiles 转为 runner option hints。"""
+
+    config = load_runtime_config()
+    model = config.models.models["qwen-plus"]
+    hint = model.runtime_hints.runner_option_hints["conversation_compaction"]
+
+    assert hint.temperature == 0.1
+    assert hint.max_tokens == 2048
+    assert hint.stream is False
