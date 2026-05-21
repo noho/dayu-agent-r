@@ -201,7 +201,7 @@ API Key 申请地址：
 - 本地 Ollama 模型和自定义 OpenAI 兼容 API 在 `init` 时会写入对应模型配置；Ollama 的 `write_chapter` 并发 lane 默认设为 2。
 - `--reset` 确认后会删除 `workspace/.dayu/`、`workspace/config/`、`workspace/assets/`，再按首次初始化流程重建；它比 `--overwrite` 更彻底，会一并清空运行时状态。
 - 联网搜索默认可走 `auto`，若配置了 Tavily / Serper，会优先使用对应 provider。
-- 若运行环境需要访问 `localhost`、私网 IP 或内网域名，应在对应工具 provider 的配置中显式打开内网访问开关；当前 runtime config 不再读取旧 `run.json`。
+- 若运行环境需要访问 `localhost`、私网 IP 或内网域名，应在对应工具 provider 的配置中显式打开内网访问开关。
 - 修改默认模型请参考 [8. 模型配置](#model-config)。
 
 工作区最重要的目录：
@@ -285,7 +285,7 @@ dayu-cli <subcommand> [参数]
 | `--quiet` | 全部主命令 | 把日志级别设为 `ERROR` |
 | `--model-name` | `prompt` `interactive` `write` | 指定模型配置名称 |
 | `--temperature` | `prompt` `interactive` `write` | 覆盖模型 temperature |
-| `--label` | `prompt` `interactive` | 把当前对话绑定到可恢复 label；`prompt` 会进入 labeled multi-turn，对应 scene 为 `prompt_mt` |
+| `--label` | `prompt` `interactive` | 把当前对话绑定到可恢复 label |
 | `--new-session` | `interactive` | 不续接上一次 interactive 多轮会话，改为从头开始一个新会话 |
 | `--web-provider` | `prompt` `interactive` `write` | 指定联网检索 provider，如 `auto`、`tavily`、`serper`、`duckduckgo` |
 | `--thinking` / `--no-thinking` | `prompt` `interactive` | 控制是否在终端回显模型思考过程 |
@@ -499,7 +499,7 @@ dayu-cli upload_material \
 |------|------|
 | `prompt` | 必填，单次执行的问题文本 |
 | `--ticker` | 可选，指定研究对象 |
-| `--label` | 可选，把本次提问绑定到可恢复 conversation；首次创建时 scene 为 `prompt_mt` |
+| `--label` | 可选，把本次提问绑定到可恢复 conversation |
 | `--model-name` | 可选，指定模型配置 |
 | `--temperature` | 可选，覆盖模型 temperature |
 | `--thinking` / `--no-thinking` | 可选，控制是否回显模型思考过程 |
@@ -566,10 +566,10 @@ dayu-cli interactive --verbose
 - `interactive` 默认每次进入都会续接同一个多轮会话，适合连续追问。
 - `interactive` 会把当前会话绑定保存在 `<workspace>/.dayu/interactive/state.json`，重新启动时默认续接上一次会话历史。
 - 如果你想从头开始一轮新的对话，显式传 `--new-session`；它会丢弃本地保存的旧会话绑定，改为新开一个会话。
-- 如果你想显式复用某条长期对话，使用 `--label`。同一个 label 可在 `prompt --label` 与 `interactive --label` 之间互通；第一次通过 `prompt --label` 创建的会话底层 scene 为 `prompt_mt`，第一次通过 `interactive --label` 创建的会话底层 scene 为 `interactive`，之后恢复时沿用首次创建时的 scene。
+- 如果你想显式复用某条长期对话，使用 `--label`。同一个 label 可在 `prompt --label` 与 `interactive --label` 之间互通；之后恢复时沿用首次创建时的会话绑定。
 - 带 `--label` 的 CLI 启动时，会明确提示当前是“新创建标签”还是“恢复标签”；`prompt --label` 在回答末尾还会再次打印标签提示框，方便你后续继续复用同一个 label。
 - 同一个 label 在任意时刻只能被一个 CLI 进程占用：`interactive --label` 会在整个 REPL 生命周期内持有该 label，直到双 `Ctrl+D` 完整退出；`prompt --label` 会在本轮返回最终回答前持有该 label。若命中占用中的 label，CLI 会提示你等待当前对话结束后重试，或改用新的 `--label`。
-- 如果你在 workspace 本地覆写了 `prompt_mt` 或其他带 label 会命中的 scene manifest，必须保留 `conversation.enabled=true`；否则 CLI 会直接拒绝执行该 labeled conversation。
+- 如果你在 workspace 本地覆写了带 label 会命中的 scene manifest，必须使用当前 `ScenePrepare` 支持的 scene-only schema。
 - 默认不回显模型思考过程；如需在终端查看，显式传 `--thinking`。
 
 ### 3.5 微信对话 daemon：
@@ -1024,14 +1024,16 @@ dayu-render workspace/draft/AAPL/AAPL_qual_report.md report.html
 |-----------|------|
 | `workspace/config/models.json` | 模型目录、provider endpoint、API key 引用与模型能力 |
 | `workspace/config/execution_profiles.json` | Runner 调用参数、Agent policy、context budget、memory projection 与 truncation 基线 |
-| `workspace/config/host_runtime.json` | Host opener 部署默认值、store/artifact roots、SQLite、lane 与 prompt/scene asset roots |
+| `workspace/config/host_runtime.json` | Host opener 部署默认值、store/artifact roots、SQLite、Host execution lane 引用与 worker backend |
+| `workspace/config/runtime_lanes.json` | runtime lane coordinator 与 lane catalog |
 | `workspace/config/tool_discovery.json` | ToolsDiscovery provider specs |
 | `workspace/config/prompts/` | prompt fragments 与 scene manifests |
 
 建议修改方式：
 - 想新增或替换模型：改 `models.json`
 - 想调 Runner 参数或 Agent 行为：改 `execution_profiles.json`
-- 想调 Host store、lane 或 prompt/scene asset 根目录：改 `host_runtime.json`
+- 想调 Host store、SQLite、worker backend 或 Host execution lane 引用：改 `host_runtime.json`
+- 想调 runtime lane coordinator 或 lane capacity：改 `runtime_lanes.json`
 - 想配置工具发现来源：改 `tool_discovery.json`
 - 想改系统提示词和场景资产：改 `prompts/`
 
@@ -1053,19 +1055,19 @@ dayu-render workspace/draft/AAPL/AAPL_qual_report.md report.html
 
 ### 8.1 怎么修改默认模型
 
-默认执行基线在 `execution_profiles.json` 的 `profiles.<id>.ordinary.model_id` 中选择模型；scene manifest 可以用 `model.default_name` 覆盖该基线。scene manifest 的稳定形态以 `dayu.runtime.scene_prepare` 当前 schema 为准，例如：
+默认执行基线在 `execution_profiles.json` 的 `execution_profiles.<id>.run_baseline.model_id` 中选择模型；scene manifest 可以用 `model.default_model_id` 覆盖该基线。scene manifest 的稳定形态以 `dayu.runtime.scene_prepare` 当前 schema 为准，例如：
 
 ```json
 "model": {
-  "default_name": "deepseek-chat",
-  "temperature_profile": "analytical"
+  "default_model_id": "deepseek-v4-flash",
+  "runner_option_hint_id": "interactive"
 }
 ```
 
 一个简单理解：
 
 - `models.json` 定义模型能力和 provider 请求基础参数。
-- `execution_profiles.json` 定义默认 profile、Runner options profile 和 Agent policy profile。
+- `execution_profiles.json` 定义 execution baseline、Agent policy、context budget、memory projection 与 truncation policy。
 - scene manifest 只表达场景 hint；Service / composition root 负责把 hint 和 ConfigLoader 输出映射为完整 typed execution inputs。
 
 ### 8.2 怎么添加新模型
@@ -1076,7 +1078,7 @@ dayu-render workspace/draft/AAPL/AAPL_qual_report.md report.html
 
 1. 先复制一个最接近的现有模型配置
 2. 改模型名、接口地址、鉴权头和能力参数
-3. 如果希望它成为默认模型，再修改 `execution_profiles.json` 的 ordinary model id 或对应 scene manifest 的 `model.default_name`
+3. 如果希望它成为默认模型，再修改 `execution_profiles.json` 的 `run_baseline.model_id` 或对应 scene manifest 的 `model.default_model_id`
 
 例如，你可以复制一段现有配置，改成这样：
 
@@ -1084,7 +1086,6 @@ dayu-render workspace/draft/AAPL/AAPL_qual_report.md report.html
 {
   "models": {
     "my-model": {
-      "model_id": "my-model",
       "runner_kind": "openai_compatible",
       "provider": "example",
       "model": "my-model",
@@ -1102,7 +1103,23 @@ dayu-render workspace/draft/AAPL/AAPL_qual_report.md report.html
       "sse_idle_timeout_seconds": 120.0,
       "sse_heartbeat_seconds": 10.0,
       "provider_request_extension": null,
-      "context_window_tokens": 128000
+      "context_window_tokens": 128000,
+      "runtime_hints": {
+        "runner_option_hints": {
+          "interactive": {
+            "temperature": 0.7,
+            "max_tokens": 4096,
+            "top_p": 1.0,
+            "stream": true
+          },
+          "conversation_compaction": {
+            "temperature": 0.2,
+            "max_tokens": 2048,
+            "top_p": 1.0,
+            "stream": false
+          }
+        }
+      }
     }
   }
 }
@@ -1114,7 +1131,7 @@ ConfigLoader 不解析 `${MY_API_KEY}`，也不替换 secret；这些字符串�
 
 对最终用户来说，下面这些参数最重要：
 
-- `model_id`：配置名。你在 `--model-name`、execution profile 或 scene hint 里写的就是它。
+- 模型 id：`models` map key 就是配置名；record 内不重复写 id。你在 `--model-name`、execution profile 或 scene hint 里写的就是它。
 - `endpoint`：模型服务地址。
 - `model`：真正发给服务商的模型标识。
 - `api_key_ref`：API key 引用名。
@@ -1124,9 +1141,10 @@ ConfigLoader 不解析 `${MY_API_KEY}`，也不替换 secret；这些字符串�
 - `supports_tool_calling`：是否支持工具调用。用于 `prompt`、`interactive`、`write` 的模型通常需要支持。
 - `supports_stream_usage`：流式输出是否支持 usage。
 - `context_window_tokens`：模型可用上下文上限。
-- `provider_request_extension`：provider 私有扩展，按 JSON 原样保留。
+- `provider_request_extension`：provider 私有扩展，按 JSON 原样保留，并由 Engine provider extension helper 映射为 typed contract。
+- `runtime_hints.runner_option_hints`：按语义档位保存 `RunnerCallOptions` 片段，例如 `interactive` 和 `conversation_compaction`。
 
-temperature、max tokens、top-p 和 stream 属于 `execution_profiles.json` 的 `runner_options_profiles`，不属于 `models.json`。
+temperature、max tokens、top-p 和 stream 属于 `models.json` 中 effective model 的 `runtime_hints.runner_option_hints`。`execution_profiles.json` 只保存默认 `model_id` 与 `runner_option_hint_id`。
 
 如果你只是新增一个模型，最稳的办法不是从零设计全部参数，而是复制一个相近模型，再按你的服务商要求做最小改动。
 

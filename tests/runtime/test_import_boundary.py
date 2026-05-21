@@ -136,6 +136,13 @@ def test_runtime_import_boundary_scan_covers_assembly_module() -> None:
     assert "assembly.py" in scanned_names
 
 
+def test_runtime_import_boundary_scan_covers_tool_truncation_module() -> None:
+    """runtime import 边界扫描必须覆盖 ``tool_truncation.py``。"""
+
+    scanned_names = {file_path.name for file_path in _iter_python_files()}
+    assert "tool_truncation.py" in scanned_names
+
+
 def test_runtime_does_not_import_phase0_forbidden_modules() -> None:
     """Phase 0 暂时禁止的运行期模块不得被 ``dayu.runtime`` 导入。"""
 
