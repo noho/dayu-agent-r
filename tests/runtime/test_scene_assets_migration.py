@@ -22,6 +22,25 @@ _LEGACY_CONDITIONAL_MARKERS: Final[tuple[str, ...]] = (
     "<when_tool",
     "</when_tool>",
 )
+_ALLOWED_MANIFEST_FIELDS: Final[frozenset[str]] = frozenset(
+    {
+        "schema_version",
+        "scene",
+        "version",
+        "description",
+        "capability_tags",
+        "extends",
+        "model",
+        "agent_policy",
+        "tool_selection",
+        "defaults",
+        "fragments",
+        "context_slots",
+    }
+)
+_ALLOWED_MODEL_FIELDS: Final[frozenset[str]] = frozenset(
+    {"default_model_id", "runner_option_hint_id"}
+)
 
 
 def _repo_root() -> Path:
@@ -188,6 +207,37 @@ def test_all_migrated_scene_assets_prepare_successfully() -> None:
         assert result.system_messages
         assert result.fragment_refs
         assert result.capability_tags == (scene,)
+
+
+def test_migrated_scene_manifest_schema_excludes_legacy_fields() -> None:
+    """迁移后 manifest 只能使用 scene-only 顶层字段和新 model hint 字段。"""
+
+    paths = tuple(_iter_manifest_paths())
+    assert paths
+    for path in paths:
+        manifest = _load_manifest(path)
+        assert not (frozenset(manifest) - _ALLOWED_MANIFEST_FIELDS)
+        assert "conversation" not in manifest
+        assert "runtime" not in manifest
+        model = manifest.get("model")
+        if model is not None:
+            assert isinstance(model, Mapping)
+            assert not (frozenset(model) - _ALLOWED_MODEL_FIELDS)
+            assert "default_name" not in model
+            assert "temperature_profile" not in model
+            assert "default_model_id" in model
+
+
+def test_prompt_mt_scene_asset_is_removed_and_smoke_scene_is_ordinary_asset() -> None:
+    """prompt_mt 不再作为 scene；smoke_host_public_multiturn 必须是普通资产。"""
+
+    manifest_root = _manifest_root()
+    prompt_root = _prompt_asset_root()
+
+    assert not (manifest_root / "prompt_mt.json").exists()
+    assert not (prompt_root / "scenes" / "prompt_mt.md").exists()
+    assert (manifest_root / "smoke_host_public_multiturn.json").exists()
+    assert (prompt_root / "scenes" / "smoke_host_public_multiturn.md").exists()
 
 
 def test_required_context_slots_are_consumed_by_migrated_fragments() -> None:

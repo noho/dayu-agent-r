@@ -79,7 +79,7 @@ pytest tests/engine/test_smoke_async_agent_providers.py -q
 - logging：验证 `dayu.runtime.log` 的 logger 装配、CLI 风格级别解析、`VERBOSE` / `CRITICAL` 级别契约，并验证 `dayu.runtime.log_levels` 只提供公共日志级别常量、不注册 stdlib logging level。
 - config loader：覆盖 `models.json`、`execution_profiles.json`、`host_runtime.json`、`runtime_lanes.json`、`tool_discovery.json` 的 typed view 加载、workspace 同 id 整条替换、合法单继承链、missing / self / circular / multi / invalid `extends` 错误路径、catalog record 内重复 id 字段 fail fast、旧 execution profile 字段 fail fast、host runtime lane 引用校验和旧配置文件不读取。
 - runtime location：覆盖 `workspace/config` 存在与不存在时的 `config_overlay_dir`，workspace prompt assets 优先级，以及包内 prompt / manifest 默认资产缺失时 fail fast。
-- scene prepare：覆盖单 scene 装配、fragment refs / source refs / digest、required context slot、未知 / 非字符串 / 未解析 placeholder、单继承、concrete scene 显式 model、fragment id / order 冲突、fragment path containment、missing required fragment fail-closed，以及 `all` / `none` / `select` 工具选择的 names、tags、并集、未知工具和空匹配语义。
+- scene prepare：覆盖单 scene 装配、fragment refs / source refs / digest、required context slot、未知 / 非字符串 / 未解析 placeholder、单继承、可选或继承的 model hints、旧 `conversation` / 泛化 `runtime` / 旧 model 字段 fail fast、typed agent policy override、fragment id / order 冲突、fragment path containment、missing required fragment fail-closed，以及 `all` / `none` / `select` 工具选择的 names、tags、并集、未知工具和空匹配语义。
 - scene asset migration：覆盖迁移后的真实 scene manifest 可被 `ScenePrepare` 装配，直接 fragment 引用可加载，并确认未迁移
   tasks、contract 文件、workflow 产物与未引用模板。
 

@@ -45,12 +45,7 @@ def _manifest(scene_id: str, tool_selection: JsonValue) -> dict[str, JsonValue]:
         "description": f"{scene_id} tool selection",
         "capability_tags": ["tool-selection"],
         "extends": [],
-        "model": {"default_name": "analyst-model"},
-        "runtime": {
-            "runner_hint_id": "analytical",
-            "agent_hint_id": "default-agent",
-        },
-        "conversation": {"mode": "ordinary"},
+        "model": {"default_model_id": "analyst-model"},
         "tool_selection": tool_selection,
         "defaults": {"missing_required_fragment": "fail_closed"},
         "fragments": [],

@@ -147,7 +147,9 @@ provider 字段：
 
 Scene manifest 由 `dayu.runtime.scene_prepare` 解释；ConfigLoader 不读取、拼接或渲染 scene manifest。`prompts/tasks/`、contract 文件、workflow 产物和未被 scene manifest 直接引用的模板不属于当前包内默认资产范围。
 
-Scene manifest 第一版是单 Run 场景装配输入。调用方显式传入 manifest root、prompt asset root、typed context slot values 与可用工具目录；ScenePrepare 只读取 manifest 直接引用的 fragments，执行确定性的文本替换，并输出 system messages、工具选择结果、model hints、fragment refs、source refs 与 content digest。
+Scene manifest 第一版是单 Run 场景装配输入。允许的顶层字段固定为 `schema_version`、`scene`、`version`、`description`、`capability_tags`、`extends`、`model`、`agent_policy`、`tool_selection`、`defaults`、`fragments` 与 `context_slots`。调用方显式传入 manifest root、prompt asset root、typed context slot values 与可用工具目录；ScenePrepare 只读取 manifest 直接引用的 fragments，执行确定性的文本替换，并输出 system messages、工具选择结果、model hints、typed agent policy override、fragment refs、source refs 与 content digest。
+
+`model` 只使用 `default_model_id` 与 `runner_option_hint_id`。`agent_policy` 是可选 typed override block，只允许覆盖 `max_iterations`、`continuation_max_attempts`、`allow_tool_calls`、`tool_execution_timeout_seconds`、`fallback_mode`、`fallback_prompt`、`continuation_prompt` 与 `max_consecutive_failed_tool_batches`。旧 `conversation`、泛化 `runtime`、`model.default_name`、`model.temperature_profile` 与 `prompt_mt` scene 均不属于当前 schema。
 
 Scene manifest 不表达 workflow step graph、next scene、artifact store、parser、retry / replay / stop policy、failure classification 或 checkpoint / resume。多 Run 财报流程属于 Service workflow 或后续 typed skill orchestration，不属于 prompt asset schema。
 

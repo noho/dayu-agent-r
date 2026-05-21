@@ -73,7 +73,7 @@ Host-owned LLM compaction 通过 `OpenHostOptions` 的预算治理配置与 `Com
 - `tools_discovery`：按显式 import path 或 package entry point 解析 provider callable，聚合 provider 输出为业务 `ToolBundle`、provider report 与 source refs；不扫描业务包，不持有 Host / Service 上下文。
 - `config_loader`：读取包内默认配置和调用方显式传入的 workspace 覆盖目录，输出 `models`、`execution_profiles`、`host_runtime`、`runtime_lanes` 与 `tool_discovery` 五类 typed config view；不构造 Host，不创建 provider client，不解释 scene manifest，不解析 secret。
 - `location`：根据项目根目录与包内配置根目录解析 `workspace/config` 覆盖目录、prompt asset root 与 scene manifest root；ConfigLoader 和 ScenePrepare 不内置 workspace fallback。
-- `scene_prepare`：读取调用方显式传入的 scene manifest root 与 prompt asset root，校验 manifest、加载直接引用的 prompt fragments，用 typed context slot values 渲染 system messages，并输出工具选择、model / runtime / conversation hints、fragment refs、source refs 与 content digest；不读取 ConfigLoader，不做工具发现，不表达 workflow。
+- `scene_prepare`：读取调用方显式传入的 scene manifest root 与 prompt asset root，校验 scene-only manifest、加载直接引用的 prompt fragments，用 typed context slot values 渲染 system messages，并输出工具选择、model hints、typed agent policy override、fragment refs、source refs 与 content digest；不读取 ConfigLoader，不做工具发现，不表达 workflow、conversation lifecycle 或 Host runtime 部署。
 - `tool_truncation`：把允许缺省 limit / TTL 的 `ToolTruncateSpec` declaration 按调用方提供的 policy defaults 补齐为 effective spec；不导入 Host 或 Engine。
 
 ### `dayu.fins`

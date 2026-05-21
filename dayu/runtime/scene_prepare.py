@@ -11,6 +11,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import math
 import re
 from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
@@ -30,6 +31,52 @@ _SCENE_ID_PATTERN: Final[re.Pattern[str]] = re.compile(r"^[A-Za-z][A-Za-z0-9_.-]
 _CONTEXT_SLOT_PATTERN: Final[re.Pattern[str]] = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*$")
 _PLACEHOLDER_PATTERN: Final[re.Pattern[str]] = re.compile(r"{{\s*([A-Za-z_][A-Za-z0-9_]*)\s*}}")
 _UNRESOLVED_PLACEHOLDER_PATTERN: Final[re.Pattern[str]] = re.compile(r"{{[^{}]*}}")
+_ALLOWED_MANIFEST_FIELDS: Final[frozenset[str]] = frozenset(
+    {
+        "schema_version",
+        "scene",
+        "version",
+        "description",
+        "capability_tags",
+        "extends",
+        "model",
+        "agent_policy",
+        "tool_selection",
+        "defaults",
+        "fragments",
+        "context_slots",
+    }
+)
+_ALLOWED_MODEL_FIELDS: Final[frozenset[str]] = frozenset(
+    {"default_model_id", "runner_option_hint_id"}
+)
+_ALLOWED_AGENT_POLICY_FIELDS: Final[frozenset[str]] = frozenset(
+    {
+        "max_iterations",
+        "continuation_max_attempts",
+        "allow_tool_calls",
+        "tool_execution_timeout_seconds",
+        "fallback_mode",
+        "fallback_prompt",
+        "continuation_prompt",
+        "max_consecutive_failed_tool_batches",
+    }
+)
+_ALLOWED_TOOL_SELECTION_FIELDS: Final[frozenset[str]] = frozenset(
+    {"mode", "tool_names", "tool_tags_any", "allow_empty"}
+)
+_ALLOWED_DEFAULTS_FIELDS: Final[frozenset[str]] = frozenset(
+    {"missing_required_fragment"}
+)
+_ALLOWED_FRAGMENT_FIELDS: Final[frozenset[str]] = frozenset(
+    {"id", "path", "order", "required"}
+)
+_ALLOWED_CONTEXT_SLOT_FIELDS: Final[frozenset[str]] = frozenset(
+    {"name", "value_type", "required"}
+)
+_AGENT_FALLBACK_MODES: Final[frozenset[str]] = frozenset(
+    {"force_answer", "raise_error"}
+)
 
 JsonObject: TypeAlias = Mapping[str, JsonValue]
 """scene manifest JSON object 的只读映射类型。"""
@@ -56,6 +103,13 @@ class SceneToolSelectionMode(StrEnum):
     ALL = "all"
     NONE = "none"
     SELECT = "select"
+
+
+class SceneAgentFallbackMode(StrEnum):
+    """scene agent policy override 支持的 fallback 模式。"""
+
+    FORCE_ANSWER = "force_answer"
+    RAISE_ERROR = "raise_error"
 
 
 @dataclass(frozen=True, slots=True)
@@ -175,59 +229,58 @@ class ScenePrepareRequest:
 class SceneModelHints:
     """scene 模型选择 hint。
 
-    :param default_name: scene 建议的模型配置名，由 Service 映射为完整
+    :param default_model_id: scene 建议的模型配置 id，由 Service 映射为完整
         Runner 输入。
-    :param temperature_profile_id: scene 建议的 runner options profile id，由
+    :param runner_option_hint_id: scene 建议的 runner options hint id，由
         Service 映射为完整 RunnerCallOptions。
     """
 
-    default_name: str
-    temperature_profile_id: str | None
+    default_model_id: str
+    runner_option_hint_id: str | None
 
     def __post_init__(self) -> None:
         """校验模型 hint。
 
         :returns: ``None``。
-        :raises ValueError: ``default_name`` 为空时抛出。
+        :raises ValueError: ``default_model_id`` 为空时抛出。
         """
 
-        _require_non_empty_text(self.default_name, field_name="SceneModelHints.default_name")
-        if self.temperature_profile_id is not None:
+        _require_non_empty_text(
+            self.default_model_id,
+            field_name="SceneModelHints.default_model_id",
+        )
+        if self.runner_option_hint_id is not None:
             _require_non_empty_text(
-                self.temperature_profile_id,
-                field_name="SceneModelHints.temperature_profile_id",
+                self.runner_option_hint_id,
+                field_name="SceneModelHints.runner_option_hint_id",
             )
 
 
 @dataclass(frozen=True, slots=True)
-class SceneRuntimeHints:
-    """scene 运行期 hint。
+class SceneAgentPolicyOverride:
+    """scene 层 AgentPolicy typed override。
 
-    :param runner_hint_id: 可选 runner hint id。
-    :param agent_hint_id: 可选 agent hint id。
+    所有字段均为可选字段，调用方负责将其与 execution profile baseline
+    合成为完整 Host / Engine ``AgentPolicy`` typed input。
+
+    :param max_iterations: 单次 Agent run 内最大 LLM 迭代次数。
+    :param continuation_max_attempts: 同一迭代内 continuation 最大尝试次数。
+    :param allow_tool_calls: 是否允许工具调用。
+    :param tool_execution_timeout_seconds: 工具执行握手超时秒数。
+    :param fallback_mode: 工具轮次耗尽或失败批次阈值命中后的收口模式。
+    :param fallback_prompt: force-answer 时追加给 Runner 的用户消息。
+    :param continuation_prompt: finish_reason=length 续写提示。
+    :param max_consecutive_failed_tool_batches: 连续全失败工具批次阈值。
     """
 
-    runner_hint_id: str | None
-    agent_hint_id: str | None
-
-
-@dataclass(frozen=True, slots=True)
-class SceneConversationHint:
-    """scene 会话模式 hint。
-
-    :param mode: 会话模式标识，由 Service 解释。
-    """
-
-    mode: str
-
-    def __post_init__(self) -> None:
-        """校验会话模式非空。
-
-        :returns: ``None``。
-        :raises ValueError: ``mode`` 为空时抛出。
-        """
-
-        _require_non_empty_text(self.mode, field_name="SceneConversationHint.mode")
+    max_iterations: int | None = None
+    continuation_max_attempts: int | None = None
+    allow_tool_calls: bool | None = None
+    tool_execution_timeout_seconds: float | None = None
+    fallback_mode: SceneAgentFallbackMode | None = None
+    fallback_prompt: str | None = None
+    continuation_prompt: str | None = None
+    max_consecutive_failed_tool_batches: int | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -312,9 +365,8 @@ class PreparedSceneInputs:
 
     :param system_messages: 已完成 context slot 渲染的系统消息片段。
     :param tool_selection: 工具选择结果。
-    :param model_hints: 模型 hint。
-    :param runtime_hints: 运行期 hint。
-    :param conversation_hint: 会话 hint。
+    :param model_hints: 可选模型 hint。
+    :param agent_policy_override: 可选 AgentPolicy typed override。
     :param fragment_refs: 参与装配的 prompt fragment 引用。
     :param source_refs: manifest、fragment 与 assembly input 来源引用。
     :param content_digest: 本次 scene 装配内容摘要。
@@ -323,9 +375,8 @@ class PreparedSceneInputs:
 
     system_messages: tuple[str, ...]
     tool_selection: SceneToolSelectionResult
-    model_hints: SceneModelHints
-    runtime_hints: SceneRuntimeHints
-    conversation_hint: SceneConversationHint
+    model_hints: SceneModelHints | None
+    agent_policy_override: SceneAgentPolicyOverride | None
     fragment_refs: tuple[SceneFragmentRef, ...]
     source_refs: tuple[SceneSourceRef, ...]
     content_digest: str
@@ -368,8 +419,7 @@ class _SceneManifest:
     capability_tags: tuple[str, ...]
     extends: tuple[str, ...]
     model_hints: SceneModelHints | None
-    runtime_hints: SceneRuntimeHints | None
-    conversation_hint: SceneConversationHint | None
+    agent_policy_override: SceneAgentPolicyOverride | None
     tool_selection: SceneToolSelection | None
     defaults: _SceneDefaults
     fragments: tuple[_ManifestFragment, ...]
@@ -388,9 +438,8 @@ class _ResolvedScene:
     version: str
     description: str
     capability_tags: tuple[str, ...]
-    model_hints: SceneModelHints
-    runtime_hints: SceneRuntimeHints
-    conversation_hint: SceneConversationHint
+    model_hints: SceneModelHints | None
+    agent_policy_override: SceneAgentPolicyOverride | None
     tool_selection: SceneToolSelection
     defaults: _SceneDefaults
     fragments: tuple[_ManifestFragment, ...]
@@ -460,8 +509,7 @@ class ScenePrepare:
             system_messages=rendered_messages,
             tool_selection=tool_selection,
             model_hints=resolved.model_hints,
-            runtime_hints=resolved.runtime_hints,
-            conversation_hint=resolved.conversation_hint,
+            agent_policy_override=resolved.agent_policy_override,
             fragment_refs=fragment_refs,
             source_refs=source_refs,
             content_digest=content_digest,
@@ -521,18 +569,13 @@ def _resolved_from_manifest(
     :raises ScenePrepareError: 必需 hint 缺失或 fragment 冲突时抛出。
     """
 
-    model_hints = manifest.model_hints
-    if model_hints is None:
-        raise ScenePrepareError(f"concrete scene {manifest.scene_id} must declare model")
-    runtime_hints = _resolve_optional_child_value(
-        child=manifest.runtime_hints,
-        parent=None if parent is None else parent.runtime_hints,
-        field_name=f"scene {manifest.scene_id} runtime",
+    model_hints = _resolve_optional_inherited_value(
+        child=manifest.model_hints,
+        parent=None if parent is None else parent.model_hints,
     )
-    conversation_hint = _resolve_optional_child_value(
-        child=manifest.conversation_hint,
-        parent=None if parent is None else parent.conversation_hint,
-        field_name=f"scene {manifest.scene_id} conversation",
+    agent_policy_override = _resolve_optional_inherited_value(
+        child=manifest.agent_policy_override,
+        parent=None if parent is None else parent.agent_policy_override,
     )
     tool_selection = _resolve_optional_child_value(
         child=manifest.tool_selection,
@@ -560,8 +603,7 @@ def _resolved_from_manifest(
         description=manifest.description,
         capability_tags=_append_unique(parent_capability_tags, manifest.capability_tags),
         model_hints=model_hints,
-        runtime_hints=runtime_hints,
-        conversation_hint=conversation_hint,
+        agent_policy_override=agent_policy_override,
         tool_selection=tool_selection,
         defaults=manifest.defaults,
         fragments=tuple(sorted(fragments, key=lambda fragment: fragment.order)),
@@ -589,6 +631,21 @@ def _resolve_optional_child_value(
     if parent is not None:
         return parent
     raise ScenePrepareError(f"{field_name} must be declared")
+
+
+def _resolve_optional_inherited_value(
+    *, child: _ResolvedValueT | None, parent: _ResolvedValueT | None
+) -> _ResolvedValueT | None:
+    """解析可继承但整体可缺省的字段。
+
+    :param child: 子 manifest 显式值。
+    :param parent: 父 scene 已解析值。
+    :returns: 子值优先，其次父值；两者均缺省时返回 ``None``。
+    """
+
+    if child is not None:
+        return child
+    return parent
 
 
 def _load_manifest(*, scene_id: str, manifest_root: Path) -> _SceneManifest:
@@ -637,6 +694,7 @@ def _parse_manifest(
     :raises ScenePrepareError: 任一字段缺失或非法时抛出。
     """
 
+    _require_exact_fields(raw, allowed=_ALLOWED_MANIFEST_FIELDS, context=relative_manifest_path)
     schema_version = _require_int_field(raw, field_name="schema_version", context=relative_manifest_path)
     if schema_version != _SCHEMA_VERSION:
         raise ScenePrepareError(f"{relative_manifest_path}.schema_version must be 1")
@@ -652,8 +710,7 @@ def _parse_manifest(
         capability_tags=_parse_text_tuple(raw, field_name="capability_tags", context=relative_manifest_path),
         extends=extends,
         model_hints=_parse_model_hints(_optional_field(raw, "model"), context=relative_manifest_path),
-        runtime_hints=_parse_runtime_hints(_optional_field(raw, "runtime"), context=relative_manifest_path),
-        conversation_hint=_parse_conversation_hint(_optional_field(raw, "conversation"), context=relative_manifest_path),
+        agent_policy_override=_parse_agent_policy_override(_optional_field(raw, "agent_policy"), context=relative_manifest_path),
         tool_selection=_parse_tool_selection(_optional_field(raw, "tool_selection"), context=relative_manifest_path),
         defaults=_parse_defaults(_require_mapping_field(raw, field_name="defaults", context=relative_manifest_path), context=relative_manifest_path),
         fragments=_parse_fragments(_require_sequence_field(raw, field_name="fragments", context=relative_manifest_path), context=relative_manifest_path),
@@ -695,54 +752,84 @@ def _parse_model_hints(value: JsonValue | None, *, context: str) -> SceneModelHi
     if value is None:
         return None
     record = _require_json_object(value, context=f"{context}.model")
+    _require_exact_fields(
+        record,
+        allowed=_ALLOWED_MODEL_FIELDS,
+        context=f"{context}.model",
+    )
     return SceneModelHints(
-        default_name=_require_str_field(
+        default_model_id=_require_str_field(
             record,
-            field_name="default_name",
+            field_name="default_model_id",
             context=f"{context}.model",
         ),
-        temperature_profile_id=_optional_str_field(
+        runner_option_hint_id=_optional_str_field(
             record,
-            field_name="temperature_profile",
+            field_name="runner_option_hint_id",
             context=f"{context}.model",
         ),
     )
 
 
-def _parse_runtime_hints(value: JsonValue | None, *, context: str) -> SceneRuntimeHints | None:
-    """解析 ``runtime`` hint。
-
-    :param value: ``runtime`` 字段值。
-    :param context: 错误消息上下文。
-    :returns: runtime hint；``None`` 表示继承父值。
-    :raises ScenePrepareError: 字段类型非法时抛出。
-    """
-
-    if value is None:
-        return None
-    record = _require_json_object(value, context=f"{context}.runtime")
-    return SceneRuntimeHints(
-        runner_hint_id=_optional_str_field(record, field_name="runner_hint_id", context=f"{context}.runtime"),
-        agent_hint_id=_optional_str_field(record, field_name="agent_hint_id", context=f"{context}.runtime"),
-    )
-
-
-def _parse_conversation_hint(
+def _parse_agent_policy_override(
     value: JsonValue | None, *, context: str
-) -> SceneConversationHint | None:
-    """解析 ``conversation`` hint。
+) -> SceneAgentPolicyOverride | None:
+    """解析 ``agent_policy`` typed override。
 
-    :param value: ``conversation`` 字段值。
+    :param value: ``agent_policy`` 字段值。
     :param context: 错误消息上下文。
-    :returns: conversation hint；``None`` 表示继承父值。
-    :raises ScenePrepareError: 字段类型或内容非法时抛出。
+    :returns: AgentPolicy override；``None`` 表示当前 manifest 未声明。
+    :raises ScenePrepareError: 字段未知、类型非法或取值越界时抛出。
     """
 
     if value is None:
         return None
-    record = _require_json_object(value, context=f"{context}.conversation")
-    return SceneConversationHint(
-        mode=_require_str_field(record, field_name="mode", context=f"{context}.conversation")
+    record = _require_json_object(value, context=f"{context}.agent_policy")
+    _require_exact_fields(
+        record,
+        allowed=_ALLOWED_AGENT_POLICY_FIELDS,
+        context=f"{context}.agent_policy",
+    )
+    return SceneAgentPolicyOverride(
+        max_iterations=_optional_positive_int_field(
+            record,
+            field_name="max_iterations",
+            context=f"{context}.agent_policy",
+        ),
+        continuation_max_attempts=_optional_non_negative_int_field(
+            record,
+            field_name="continuation_max_attempts",
+            context=f"{context}.agent_policy",
+        ),
+        allow_tool_calls=_optional_bool_field_or_none(
+            record,
+            field_name="allow_tool_calls",
+            context=f"{context}.agent_policy",
+        ),
+        tool_execution_timeout_seconds=_optional_positive_float_field(
+            record,
+            field_name="tool_execution_timeout_seconds",
+            context=f"{context}.agent_policy",
+        ),
+        fallback_mode=_parse_optional_fallback_mode(
+            record,
+            context=f"{context}.agent_policy",
+        ),
+        fallback_prompt=_optional_str_field(
+            record,
+            field_name="fallback_prompt",
+            context=f"{context}.agent_policy",
+        ),
+        continuation_prompt=_optional_str_field(
+            record,
+            field_name="continuation_prompt",
+            context=f"{context}.agent_policy",
+        ),
+        max_consecutive_failed_tool_batches=_optional_positive_int_field(
+            record,
+            field_name="max_consecutive_failed_tool_batches",
+            context=f"{context}.agent_policy",
+        ),
     )
 
 
@@ -760,6 +847,11 @@ def _parse_tool_selection(
     if value is None:
         return None
     record = _require_json_object(value, context=f"{context}.tool_selection")
+    _require_exact_fields(
+        record,
+        allowed=_ALLOWED_TOOL_SELECTION_FIELDS,
+        context=f"{context}.tool_selection",
+    )
     mode_text = _require_str_field(record, field_name="mode", context=f"{context}.tool_selection")
     try:
         mode = SceneToolSelectionMode(mode_text)
@@ -799,6 +891,11 @@ def _parse_defaults(record: JsonObject, *, context: str) -> _SceneDefaults:
     :raises ScenePrepareError: 缺失或非法 policy 时抛出。
     """
 
+    _require_exact_fields(
+        record,
+        allowed=_ALLOWED_DEFAULTS_FIELDS,
+        context=f"{context}.defaults",
+    )
     policy = _require_str_field(
         record,
         field_name="missing_required_fragment",
@@ -825,6 +922,11 @@ def _parse_fragments(
     fragments: list[_ManifestFragment] = []
     for index, value in enumerate(values):
         record = _require_json_object(value, context=f"{context}.fragments[{index}]")
+        _require_exact_fields(
+            record,
+            allowed=_ALLOWED_FRAGMENT_FIELDS,
+            context=f"{context}.fragments[{index}]",
+        )
         fragment = _ManifestFragment(
             fragment_id=_require_str_field(record, field_name="id", context=f"{context}.fragments[{index}]"),
             relative_path=_require_str_field(record, field_name="path", context=f"{context}.fragments[{index}]"),
@@ -864,6 +966,11 @@ def _parse_context_slots(
     seen: set[str] = set()
     for index, value in enumerate(values):
         record = _require_json_object(value, context=f"{context}.context_slots[{index}]")
+        _require_exact_fields(
+            record,
+            allowed=_ALLOWED_CONTEXT_SLOT_FIELDS,
+            context=f"{context}.context_slots[{index}]",
+        )
         name = _require_str_field(record, field_name="name", context=f"{context}.context_slots[{index}]")
         _require_context_slot_name(name, field_name=f"{context}.context_slots[{index}].name")
         if name in seen:
@@ -1155,6 +1262,45 @@ def _tool_catalog_json(catalog: SceneToolCatalog) -> JsonValue:
     return tools
 
 
+def _require_exact_fields(
+    record: JsonObject, *, allowed: frozenset[str], context: str
+) -> None:
+    """校验 JSON object 只包含允许字段。
+
+    :param record: JSON object。
+    :param allowed: 允许出现的字段名集合。
+    :param context: 错误消息上下文。
+    :returns: ``None``。
+    :raises ScenePrepareError: 出现未知字段时抛出。
+    """
+
+    unknown = frozenset(record) - allowed
+    if unknown:
+        raise ScenePrepareError(
+            f"{context} contains unsupported fields: "
+            + ", ".join(sorted(unknown))
+        )
+
+
+def _parse_optional_fallback_mode(
+    record: JsonObject, *, context: str
+) -> SceneAgentFallbackMode | None:
+    """解析可选 fallback mode。
+
+    :param record: agent policy override JSON object。
+    :param context: 错误消息上下文。
+    :returns: fallback mode 枚举；字段缺省时返回 ``None``。
+    :raises ScenePrepareError: 字段类型或枚举值非法时抛出。
+    """
+
+    mode = _optional_str_field(record, field_name="fallback_mode", context=context)
+    if mode is None:
+        return None
+    if mode not in _AGENT_FALLBACK_MODES:
+        raise ScenePrepareError(f"{context}.fallback_mode is unsupported: {mode}")
+    return SceneAgentFallbackMode(mode)
+
+
 def _text_sequence_json(values: tuple[str, ...]) -> JsonValue:
     """把字符串元组投影为 JSON array。
 
@@ -1433,6 +1579,109 @@ def _optional_bool_field(
     return value
 
 
+def _optional_bool_field_or_none(
+    record: JsonObject, *, field_name: str, context: str
+) -> bool | None:
+    """读取可选 bool 字段，缺省时返回 ``None``。
+
+    :param record: JSON object。
+    :param field_name: 字段名。
+    :param context: 错误消息上下文。
+    :returns: bool 字段值或 ``None``。
+    :raises ScenePrepareError: 字段存在但非 bool 时抛出。
+    """
+
+    if field_name not in record or record[field_name] is None:
+        return None
+    value = record[field_name]
+    if not isinstance(value, bool):
+        raise ScenePrepareError(f"{context}.{field_name} must be boolean")
+    return value
+
+
+def _optional_positive_int_field(
+    record: JsonObject, *, field_name: str, context: str
+) -> int | None:
+    """读取可选正整数字段。
+
+    :param record: JSON object。
+    :param field_name: 字段名。
+    :param context: 错误消息上下文。
+    :returns: 正整数或 ``None``。
+    :raises ScenePrepareError: 字段存在但不是正整数时抛出。
+    """
+
+    value = _optional_int_field(record, field_name=field_name, context=context)
+    if value is None:
+        return None
+    if value < 1:
+        raise ScenePrepareError(f"{context}.{field_name} must be >= 1")
+    return value
+
+
+def _optional_non_negative_int_field(
+    record: JsonObject, *, field_name: str, context: str
+) -> int | None:
+    """读取可选非负整数字段。
+
+    :param record: JSON object。
+    :param field_name: 字段名。
+    :param context: 错误消息上下文。
+    :returns: 非负整数或 ``None``。
+    :raises ScenePrepareError: 字段存在但不是非负整数时抛出。
+    """
+
+    value = _optional_int_field(record, field_name=field_name, context=context)
+    if value is None:
+        return None
+    if value < 0:
+        raise ScenePrepareError(f"{context}.{field_name} must be >= 0")
+    return value
+
+
+def _optional_int_field(
+    record: JsonObject, *, field_name: str, context: str
+) -> int | None:
+    """读取可选整数字段。
+
+    :param record: JSON object。
+    :param field_name: 字段名。
+    :param context: 错误消息上下文。
+    :returns: 整数或 ``None``。
+    :raises ScenePrepareError: 字段存在但非整数时抛出。
+    """
+
+    if field_name not in record or record[field_name] is None:
+        return None
+    value = record[field_name]
+    if not isinstance(value, int) or isinstance(value, bool):
+        raise ScenePrepareError(f"{context}.{field_name} must be integer")
+    return value
+
+
+def _optional_positive_float_field(
+    record: JsonObject, *, field_name: str, context: str
+) -> float | None:
+    """读取可选有限正数字段。
+
+    :param record: JSON object。
+    :param field_name: 字段名。
+    :param context: 错误消息上下文。
+    :returns: 有限正数或 ``None``。
+    :raises ScenePrepareError: 字段存在但不是有限正数时抛出。
+    """
+
+    if field_name not in record or record[field_name] is None:
+        return None
+    value = record[field_name]
+    if isinstance(value, bool) or not isinstance(value, (int, float)):
+        raise ScenePrepareError(f"{context}.{field_name} must be number")
+    numeric_value = float(value)
+    if not math.isfinite(numeric_value) or numeric_value <= 0:
+        raise ScenePrepareError(f"{context}.{field_name} must be finite and > 0")
+    return numeric_value
+
+
 def _parse_text_tuple(
     record: JsonObject, *, field_name: str, context: str
 ) -> tuple[str, ...]:
@@ -1494,12 +1743,12 @@ def _require_scene_id(value: str, *, field_name: str) -> str:
     :param value: scene id。
     :param field_name: 错误消息字段名。
     :returns: scene id。
-    :raises ValueError: scene id 为空或含路径字符时抛出。
+    :raises ScenePrepareError: scene id 为空或含路径字符时抛出。
     """
 
     text = _require_non_empty_text(value, field_name=field_name)
     if _SCENE_ID_PATTERN.fullmatch(text) is None:
-        raise ValueError(f"{field_name} must be ASCII scene identifier")
+        raise ScenePrepareError(f"{field_name} must be ASCII scene identifier")
     return text
 
 
@@ -1535,12 +1784,12 @@ def _require_non_empty_text(value: str, *, field_name: str) -> str:
 
 __all__ = [
     "PreparedSceneInputs",
-    "SceneConversationHint",
+    "SceneAgentFallbackMode",
+    "SceneAgentPolicyOverride",
     "SceneModelHints",
     "ScenePrepare",
     "ScenePrepareError",
     "ScenePrepareRequest",
-    "SceneRuntimeHints",
     "SceneSourceKind",
     "SceneSourceRef",
     "SceneToolCatalog",

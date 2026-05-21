@@ -92,8 +92,7 @@ def _manifest(
     extends: list[JsonValue] | None = None,
     model_is_null: bool = False,
     model: JsonValue | None = None,
-    runtime: JsonValue | None = None,
-    conversation: JsonValue | None = None,
+    agent_policy: JsonValue | None = None,
     tool_selection: JsonValue | None = None,
     fragments: list[JsonValue] | None = None,
     context_slots: list[JsonValue] | None = None,
@@ -105,8 +104,7 @@ def _manifest(
     :param extends: 父 scene id 数组。
     :param model_is_null: 是否显式写入 JSON null 的 model 字段。
     :param model: model hint 字段。
-    :param runtime: runtime hint 字段。
-    :param conversation: conversation hint 字段。
+    :param agent_policy: agent policy override 字段。
     :param tool_selection: tool selection 字段。
     :param fragments: fragments 字段。
     :param context_slots: context slots 字段。
@@ -124,17 +122,9 @@ def _manifest(
         "model": (
             None
             if model_is_null
-            else {"default_name": "analyst-model"} if model is None else model
+            else {"default_model_id": "analyst-model"} if model is None else model
         ),
-        "runtime": (
-            {
-                "runner_hint_id": "analytical",
-                "agent_hint_id": "default-agent",
-            }
-            if runtime is None
-            else runtime
-        ),
-        "conversation": {"mode": "ordinary"} if conversation is None else conversation,
+        "agent_policy": agent_policy,
         "tool_selection": (
             {"mode": "all", "tool_names": [], "tool_tags_any": [], "allow_empty": False}
             if tool_selection is None
@@ -248,30 +238,31 @@ def test_single_scene_assembly_outputs_stable_refs_and_digest(tmp_path: Path) ->
     assert result.capability_tags == ("earnings", "analysis")
 
 
-def test_model_temperature_profile_is_preserved(tmp_path: Path) -> None:
-    """manifest model.temperature_profile 应保留为 typed model hint。"""
+def test_model_runner_option_hint_id_is_preserved(tmp_path: Path) -> None:
+    """manifest model.runner_option_hint_id 应保留为 typed model hint。"""
 
     _write_json(
         tmp_path / "manifests" / "profiled.json",
         _manifest(
             "profiled",
             model={
-                "default_name": "analyst-model",
-                "temperature_profile": "low-variance",
+                "default_model_id": "analyst-model",
+                "runner_option_hint_id": "low-variance",
             },
         ),
     )
 
     result = prepare_scene(_request(tmp_path, "profiled"))
 
-    assert result.model_hints.default_name == "analyst-model"
-    assert result.model_hints.temperature_profile_id == "low-variance"
+    assert result.model_hints is not None
+    assert result.model_hints.default_model_id == "analyst-model"
+    assert result.model_hints.runner_option_hint_id == "low-variance"
 
 
-def test_content_digest_changes_when_temperature_profile_changes(
+def test_content_digest_changes_when_runner_option_hint_id_changes(
     tmp_path: Path,
 ) -> None:
-    """只修改 model.temperature_profile 时 content digest 必须变化。"""
+    """只修改 model.runner_option_hint_id 时 content digest 必须变化。"""
 
     manifest_path = tmp_path / "manifests" / "digest_profile.json"
     _write_json(
@@ -279,8 +270,8 @@ def test_content_digest_changes_when_temperature_profile_changes(
         _manifest(
             "digest_profile",
             model={
-                "default_name": "analyst-model",
-                "temperature_profile": "analytical",
+                "default_model_id": "analyst-model",
+                "runner_option_hint_id": "analytical",
             },
         ),
     )
@@ -291,15 +282,17 @@ def test_content_digest_changes_when_temperature_profile_changes(
         _manifest(
             "digest_profile",
             model={
-                "default_name": "analyst-model",
-                "temperature_profile": "creative",
+                "default_model_id": "analyst-model",
+                "runner_option_hint_id": "creative",
             },
         ),
     )
     second = prepare_scene(_request(tmp_path, "digest_profile"))
 
-    assert first.model_hints.temperature_profile_id == "analytical"
-    assert second.model_hints.temperature_profile_id == "creative"
+    assert first.model_hints is not None
+    assert second.model_hints is not None
+    assert first.model_hints.runner_option_hint_id == "analytical"
+    assert second.model_hints.runner_option_hint_id == "creative"
     assert first.content_digest != second.content_digest
 
 
@@ -383,7 +376,7 @@ def test_unresolved_placeholder_fails_fast(tmp_path: Path) -> None:
 def test_single_inheritance_merges_parent_first_and_child_overrides(
     tmp_path: Path,
 ) -> None:
-    """单继承应父优先继承 slots，子追加 fragments，并覆盖 runtime/conversation/tool。"""
+    """单继承应父优先继承 slots，子追加 fragments，并覆盖 typed scene 字段。"""
 
     _write_text(tmp_path / "prompts" / "parent.md", "公司：{{company}}")
     _write_text(tmp_path / "prompts" / "child.md", "日期：{{filing_date}}")
@@ -402,9 +395,11 @@ def test_single_inheritance_merges_parent_first_and_child_overrides(
         _manifest(
             "child_scene",
             extends=["base_scene"],
-            model={"default_name": "child-model"},
-            runtime={"runner_hint_id": "fast", "agent_hint_id": "strict"},
-            conversation={"mode": "followup"},
+            model={"default_model_id": "child-model"},
+            agent_policy={
+                "max_iterations": 4,
+                "fallback_mode": "raise_error",
+            },
             tool_selection={
                 "mode": "select",
                 "tool_names": ["quote_metric"],
@@ -433,10 +428,11 @@ def test_single_inheritance_merges_parent_first_and_child_overrides(
         "parent",
         "child",
     )
-    assert result.model_hints.default_name == "child-model"
-    assert result.runtime_hints.runner_hint_id == "fast"
-    assert result.runtime_hints.agent_hint_id == "strict"
-    assert result.conversation_hint.mode == "followup"
+    assert result.model_hints is not None
+    assert result.model_hints.default_model_id == "child-model"
+    assert result.agent_policy_override is not None
+    assert result.agent_policy_override.max_iterations == 4
+    assert result.agent_policy_override.fallback_mode == "raise_error"
     assert result.tool_selection.tool_names == frozenset({"quote_metric"})
     assert result.capability_tags == ("base", "child")
 
@@ -451,8 +447,8 @@ def test_single_inheritance_merges_parent_first_and_child_overrides(
         )
 
 
-def test_child_scene_must_explicitly_declare_model(tmp_path: Path) -> None:
-    """concrete 子 scene 不能从父 scene 隐式继承 model。"""
+def test_child_scene_inherits_parent_model_when_omitted(tmp_path: Path) -> None:
+    """子 scene 未显式声明 model 时应继承父 scene model。"""
 
     _write_text(tmp_path / "prompts" / "parent.md", "父")
     _write_text(tmp_path / "prompts" / "child.md", "子")
@@ -473,8 +469,166 @@ def test_child_scene_must_explicitly_declare_model(tmp_path: Path) -> None:
         ),
     )
 
-    with pytest.raises(ScenePrepareError, match="must declare model"):
-        prepare_scene(_request(tmp_path, "child_scene"))
+    result = prepare_scene(_request(tmp_path, "child_scene"))
+
+    assert result.model_hints is not None
+    assert result.model_hints.default_model_id == "analyst-model"
+
+
+def test_scene_without_model_outputs_no_model_hints(tmp_path: Path) -> None:
+    """scene 未声明 model 时应输出空 model hints，由调用方映射 execution baseline。"""
+
+    _write_json(
+        tmp_path / "manifests" / "baseline_model.json",
+        _manifest("baseline_model", model_is_null=True),
+    )
+
+    result = prepare_scene(_request(tmp_path, "baseline_model"))
+
+    assert result.model_hints is None
+
+
+def test_legacy_conversation_and_runtime_fields_fail_fast(tmp_path: Path) -> None:
+    """旧 conversation 与 runtime 字段出现时必须按未知顶层字段失败。"""
+
+    manifest = _manifest("legacy")
+    manifest["conversation"] = {"mode": "ordinary"}
+    manifest["runtime"] = {"runner_hint_id": "fast"}
+    _write_json(tmp_path / "manifests" / "legacy.json", manifest)
+
+    with pytest.raises(ScenePrepareError, match="unsupported fields"):
+        prepare_scene(_request(tmp_path, "legacy"))
+
+
+def test_legacy_model_field_names_fail_fast(tmp_path: Path) -> None:
+    """旧 model.default_name 与 model.temperature_profile 字段必须失败。"""
+
+    _write_json(
+        tmp_path / "manifests" / "legacy_model.json",
+        _manifest(
+            "legacy_model",
+            model={
+                "default_name": "analyst-model",
+                "temperature_profile": "audit",
+            },
+        ),
+    )
+
+    with pytest.raises(ScenePrepareError, match="unsupported fields"):
+        prepare_scene(_request(tmp_path, "legacy_model"))
+
+
+def test_agent_policy_override_outputs_typed_view(tmp_path: Path) -> None:
+    """agent_policy override 应输出白名单内 typed view。"""
+
+    _write_json(
+        tmp_path / "manifests" / "agent_policy_scene.json",
+        _manifest(
+            "agent_policy_scene",
+            agent_policy={
+                "max_iterations": 6,
+                "continuation_max_attempts": 1,
+                "allow_tool_calls": False,
+                "tool_execution_timeout_seconds": 12.5,
+                "fallback_mode": "raise_error",
+                "fallback_prompt": "请停止工具调用并直接回答。",
+                "continuation_prompt": "继续完成上一段回答。",
+                "max_consecutive_failed_tool_batches": 3,
+            },
+        ),
+    )
+
+    result = prepare_scene(_request(tmp_path, "agent_policy_scene"))
+
+    assert result.agent_policy_override is not None
+    override = result.agent_policy_override
+    assert override.max_iterations == 6
+    assert override.continuation_max_attempts == 1
+    assert override.allow_tool_calls is False
+    assert override.tool_execution_timeout_seconds == 12.5
+    assert override.fallback_mode == "raise_error"
+    assert override.fallback_prompt == "请停止工具调用并直接回答。"
+    assert override.continuation_prompt == "继续完成上一段回答。"
+    assert override.max_consecutive_failed_tool_batches == 3
+
+
+def test_agent_policy_unknown_field_fails_fast(tmp_path: Path) -> None:
+    """agent_policy 出现白名单外字段必须失败。"""
+
+    _write_json(
+        tmp_path / "manifests" / "bad_agent_policy.json",
+        _manifest(
+            "bad_agent_policy",
+            agent_policy={
+                "allow_tool_calls": True,
+                "worker_backend": "local",
+            },
+        ),
+    )
+
+    with pytest.raises(ScenePrepareError, match="unsupported fields"):
+        prepare_scene(_request(tmp_path, "bad_agent_policy"))
+
+
+def test_agent_policy_fallback_mode_is_closed_enum(tmp_path: Path) -> None:
+    """agent_policy fallback_mode 只允许 force_answer / raise_error。"""
+
+    _write_json(
+        tmp_path / "manifests" / "bad_fallback.json",
+        _manifest(
+            "bad_fallback",
+            agent_policy={"fallback_mode": "finalize"},
+        ),
+    )
+
+    with pytest.raises(ScenePrepareError, match="fallback_mode is unsupported"):
+        prepare_scene(_request(tmp_path, "bad_fallback"))
+
+
+def test_request_scene_id_invalid_format_raises_scene_prepare_error(
+    tmp_path: Path,
+) -> None:
+    """request scene id 格式非法时必须抛 ScenePrepareError。"""
+
+    with pytest.raises(
+        ScenePrepareError,
+        match="ScenePrepareRequest.scene_id must be ASCII scene identifier",
+    ):
+        _request(tmp_path, "bad/scene")
+
+
+def test_manifest_scene_id_invalid_format_raises_scene_prepare_error(
+    tmp_path: Path,
+) -> None:
+    """manifest scene 字段格式非法时必须抛 ScenePrepareError。"""
+
+    _write_json(
+        tmp_path / "manifests" / "bad_manifest.json",
+        _manifest("bad/scene"),
+    )
+
+    with pytest.raises(
+        ScenePrepareError,
+        match=r"bad_manifest\.json\.scene must be ASCII scene identifier",
+    ):
+        prepare_scene(_request(tmp_path, "bad_manifest"))
+
+
+def test_extends_parent_id_invalid_format_raises_scene_prepare_error(
+    tmp_path: Path,
+) -> None:
+    """extends parent id 格式非法时必须抛 ScenePrepareError。"""
+
+    _write_json(
+        tmp_path / "manifests" / "child.json",
+        _manifest("child", extends=["bad/parent"]),
+    )
+
+    with pytest.raises(
+        ScenePrepareError,
+        match=r"child\.json\.extends\[0\] must be ASCII scene identifier",
+    ):
+        prepare_scene(_request(tmp_path, "child"))
 
 
 def test_multiple_inheritance_fails(tmp_path: Path) -> None:
