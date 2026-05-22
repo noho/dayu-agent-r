@@ -15,12 +15,24 @@ from dayu.host.compaction import (
     CompactInputRange,
     CompactQualityCheckResult,
     CompactionCandidate,
+    EvidenceBackedFactCandidate,
+    EvidenceBackedFactKind,
+    MAX_EVIDENCE_BACKED_FACT_ATTRIBUTES_JSON_CHARS,
+    MAX_EVIDENCE_BACKED_FACT_CLAIM_TEXT_CHARS,
+    MAX_EVIDENCE_BACKED_FACT_CANDIDATES,
+    MAX_EVIDENCE_REFS_PER_FACT,
+    MAX_MINIMUM_PRESERVE_ITEM_CANDIDATES,
+    MAX_MINIMUM_PRESERVE_ITEM_LABEL_CHARS,
+    MAX_MINIMUM_PRESERVE_ITEM_TEXT_CHARS,
+    MAX_SOURCE_REFS_PER_MINIMUM_PRESERVE_ITEM,
+    MinimumPreserveItemCandidate,
+    MinimumPreserveReason,
     PinnedPatchOperation,
     PreservationEvidence,
 )
 from dayu.host.context_budget import ContextBudgetDecision
 from dayu.host.context_policy import ContextCompactionTriggerSource
-from dayu.host.durable.codec import is_sha256_digest
+from dayu.host.durable.codec import canonical_json_dumps, is_sha256_digest
 
 CONTEXT_COMPACTION_REQUESTED = "CONTEXT_COMPACTION_REQUESTED"
 """Context compaction requested canonical event type。"""
@@ -49,6 +61,8 @@ _FIELD_COMPACT_ARTIFACT_DIGEST = "compact_artifact_digest"
 _FIELD_EPISODE_SUMMARY_CANDIDATE = "episode_summary_candidate"
 _FIELD_PINNED_STATE_PATCH_CANDIDATE = "pinned_state_patch_candidate"
 _FIELD_PRESERVATION_EVIDENCE = "preservation_evidence"
+_FIELD_EVIDENCE_BACKED_FACT_CANDIDATES = "evidence_backed_fact_candidates"
+_FIELD_MINIMUM_PRESERVE_ITEM_CANDIDATES = "minimum_preserve_item_candidates"
 _FIELD_PRESERVED_FACT_REFS = "preserved_fact_refs"
 _FIELD_DROPPED_RANGES = "dropped_ranges"
 _FIELD_SUMMARIZED_RANGES = "summarized_ranges"
@@ -68,20 +82,39 @@ _FIELD_DIAGNOSTIC_REFS = "diagnostic_refs"
 _FIELD_BUDGET_AFTER_ATTEMPTED_COMPACT = "budget_after_attempted_compact"
 _FIELD_EVIDENCE_REFS = "evidence_refs"
 _FIELD_EVIDENCE_ID = "evidence_id"
+_FIELD_ACCEPTED_EVIDENCE_REFS = "accepted_evidence_refs"
+_FIELD_EVIDENCE_BACKED_FACT_REFS = "evidence_backed_fact_refs"
 _FIELD_CANDIDATE_ID = "candidate_id"
+_FIELD_ITEM_ID = "item_id"
+_FIELD_CLAIM_TEXT = "claim_text"
+_FIELD_EVIDENCE_KIND = "evidence_kind"
+_FIELD_ATTRIBUTES = "attributes"
+_FIELD_LABEL = "label"
+_FIELD_TEXT = "text"
+_FIELD_SOURCE_REFS = "source_refs"
+_FIELD_PRESERVE_REASON = "preserve_reason"
 _FIELD_CURRENT_GOAL = "current_goal"
 _FIELD_USER_CONSTRAINTS = "user_constraints"
 _FIELD_OPEN_QUESTIONS = "open_questions"
-_FIELD_PROPOSED_VERIFIED_FACT_REFS = "proposed_verified_fact_refs"
+_FIELD_PROPOSED_EVIDENCE_BACKED_FACT_REFS = "proposed_evidence_backed_fact_refs"
+_FIELD_OLD_PROPOSED_VERIFIED_FACT_REFS = "proposed_verified_fact_refs"
+_FIELD_OLD_TOOL_FACT_REFS = "tool_fact_refs"
+_FIELD_OLD_VERIFIED_FACT_REFS = "verified_fact_refs"
+_FIELD_OLD_ACCEPTED_TOOL_FACT_REFS_RETAINED = "accepted_tool_fact_refs_retained"
+_FIELD_OLD_RETAINED_EVIDENCE_REFS = "retained_evidence_refs"
 _FIELD_OPERATION = "operation"
 _FIELD_VALUE = "value"
 _FIELD_CONFIRMED_SUBJECTS = "confirmed_subjects"
 _FIELD_ACCEPTED = "accepted"
 _FIELD_REJECTION_REASONS = "rejection_reasons"
 _FIELD_CURRENT_USER_INPUT_RETAINED = "current_user_input_retained"
-_FIELD_ACCEPTED_TOOL_FACT_REFS_RETAINED = "accepted_tool_fact_refs_retained"
+_FIELD_ACCEPTED_EVIDENCE_REFS_RETAINED = "accepted_evidence_refs_retained"
+_FIELD_EVIDENCE_BACKED_FACT_CANDIDATES_ACCEPTED = (
+    "evidence_backed_fact_candidates_accepted"
+)
+_FIELD_MINIMUM_PRESERVE_ITEMS_ACCEPTED = "minimum_preserve_items_accepted"
 _FIELD_OPEN_QUESTIONS_RETAINED = "open_questions_retained"
-_FIELD_RETAINED_EVIDENCE_REFS = "retained_evidence_refs"
+_FIELD_RETAINED_ACCEPTED_EVIDENCE_REFS = "retained_accepted_evidence_refs"
 
 _REQUESTED_REQUIRED_FIELDS = (
     _FIELD_TRIGGER_SOURCE,
@@ -101,6 +134,8 @@ _COMPACTED_REQUIRED_FIELDS = (
     _FIELD_EPISODE_SUMMARY_CANDIDATE,
     _FIELD_PINNED_STATE_PATCH_CANDIDATE,
     _FIELD_PRESERVATION_EVIDENCE,
+    _FIELD_EVIDENCE_BACKED_FACT_CANDIDATES,
+    _FIELD_MINIMUM_PRESERVE_ITEM_CANDIDATES,
     _FIELD_PRESERVED_FACT_REFS,
     _FIELD_DROPPED_RANGES,
     _FIELD_SUMMARIZED_RANGES,
@@ -246,12 +281,20 @@ def build_context_compacted_payload(
         _FIELD_PRESERVATION_EVIDENCE: _evidence_list_json(
             accepted_candidate.preservation_evidence
         ),
+        _FIELD_EVIDENCE_BACKED_FACT_CANDIDATES: _fact_candidate_list_json(
+            accepted_candidate.evidence_backed_fact_candidates
+        ),
+        _FIELD_MINIMUM_PRESERVE_ITEM_CANDIDATES: (
+            _minimum_preserve_candidate_list_json(
+                accepted_candidate.minimum_preserve_item_candidates
+            )
+        ),
         _FIELD_PRESERVED_FACT_REFS: {
-            "tool_fact_refs": _string_list_json(
-                accepted_candidate.preserved_tool_fact_refs
+            _FIELD_ACCEPTED_EVIDENCE_REFS: _string_list_json(
+                accepted_candidate.preserved_accepted_evidence_refs
             ),
-            "verified_fact_refs": _string_list_json(
-                accepted_candidate.preserved_verified_fact_refs
+            _FIELD_EVIDENCE_BACKED_FACT_REFS: _string_list_json(
+                accepted_candidate.preserved_evidence_backed_fact_refs
             ),
         },
         _FIELD_DROPPED_RANGES: _range_list_json(accepted_candidate.dropped_ranges),
@@ -289,18 +332,33 @@ def validate_context_compacted_payload(payload: Mapping[str, JsonValue]) -> None
         raise ValueError("episode summary candidate requires preservation evidence")
     if not set(summary_evidence_refs).issubset(evidence_ids):
         raise ValueError("episode summary evidence refs must exist")
+    if _FIELD_OLD_PROPOSED_VERIFIED_FACT_REFS in summary:
+        raise ValueError("old proposed verified fact refs field is not supported")
     proposed_fact_refs = _optional_text_list(
-        summary, _FIELD_PROPOSED_VERIFIED_FACT_REFS
+        summary, _FIELD_PROPOSED_EVIDENCE_BACKED_FACT_REFS
     )
     if len(proposed_fact_refs) > 0:
-        raise ValueError("compact summary must not propose verified facts")
+        raise ValueError("compact summary must not propose evidence-backed facts")
     _validate_patch_evidence(patch, evidence_ids=evidence_ids)
     _validate_confirmed_subject_patch(patch)
-    _required_mapping(payload, _FIELD_PRESERVED_FACT_REFS)
+    preserved_fact_refs = _required_mapping(payload, _FIELD_PRESERVED_FACT_REFS)
+    _reject_old_preserved_fact_ref_fields(preserved_fact_refs)
+    accepted_evidence_refs = _required_text_list(
+        preserved_fact_refs, _FIELD_ACCEPTED_EVIDENCE_REFS
+    )
+    _required_text_list(preserved_fact_refs, _FIELD_EVIDENCE_BACKED_FACT_REFS)
+    _validate_fact_candidates(
+        payload,
+        accepted_evidence_refs=set(accepted_evidence_refs),
+    )
+    _validate_minimum_preserve_items(payload)
     _required_list(payload, _FIELD_DROPPED_RANGES)
     _required_list(payload, _FIELD_SUMMARIZED_RANGES)
     _required_bool(payload, _FIELD_EVIDENCE_ANCHORS_RETAINED)
-    _validate_quality_check_result(payload, evidence_ids=evidence_ids)
+    _validate_quality_check_result(
+        payload,
+        accepted_evidence_refs=set(accepted_evidence_refs),
+    )
     _required_non_negative_int(payload, _FIELD_BUDGET_AFTER_COMPACT)
 
 
@@ -440,6 +498,36 @@ def _evidence_list_json(values: tuple[PreservationEvidence, ...]) -> list[JsonVa
     """把 preservation evidence tuple 转换为 JSON 数组。
 
     :param values: preservation evidence tuple。
+    :returns: JSON 数组。
+    """
+
+    result: list[JsonValue] = []
+    for value in values:
+        result.append(value.to_json())
+    return result
+
+
+def _fact_candidate_list_json(
+    values: tuple[EvidenceBackedFactCandidate, ...],
+) -> list[JsonValue]:
+    """把 evidence-backed fact candidate tuple 转换为 JSON 数组。
+
+    :param values: candidate tuple。
+    :returns: JSON 数组。
+    """
+
+    result: list[JsonValue] = []
+    for value in values:
+        result.append(value.to_json())
+    return result
+
+
+def _minimum_preserve_candidate_list_json(
+    values: tuple[MinimumPreserveItemCandidate, ...],
+) -> list[JsonValue]:
+    """把 minimum preserve item candidate tuple 转换为 JSON 数组。
+
+    :param values: candidate tuple。
     :returns: JSON 数组。
     """
 
@@ -807,6 +895,85 @@ def _validate_confirmed_subject_item(item: JsonValue) -> None:
         raise ValueError("confirmed_subjects items must be opaque refs")
 
 
+def _validate_fact_candidates(
+    payload: Mapping[str, JsonValue], *, accepted_evidence_refs: set[str]
+) -> None:
+    """校验 evidence-backed fact candidates JSON 结构。
+
+    :param payload: compacted payload。
+    :param accepted_evidence_refs: 已保留 accepted evidence refs。
+    :returns: ``None``。
+    :raises ValueError: candidates 数量、文本或 refs 非法时抛出。
+    """
+
+    candidates = _required_mapping_list(
+        payload, _FIELD_EVIDENCE_BACKED_FACT_CANDIDATES
+    )
+    if len(candidates) > MAX_EVIDENCE_BACKED_FACT_CANDIDATES:
+        raise ValueError("evidence_backed_fact_candidates exceeds maximum count")
+    for candidate in candidates:
+        _required_text(candidate, _FIELD_CANDIDATE_ID)
+        claim_text = _required_text(candidate, _FIELD_CLAIM_TEXT)
+        if len(claim_text) > MAX_EVIDENCE_BACKED_FACT_CLAIM_TEXT_CHARS:
+            raise ValueError("claim_text exceeds maximum length")
+        EvidenceBackedFactKind(_required_text(candidate, _FIELD_EVIDENCE_KIND))
+        refs = _required_text_list(candidate, _FIELD_EVIDENCE_REFS)
+        if len(refs) == 0:
+            raise ValueError("evidence-backed fact requires evidence_refs")
+        if len(refs) > MAX_EVIDENCE_REFS_PER_FACT:
+            raise ValueError("evidence_refs exceeds maximum count")
+        if not set(refs).issubset(accepted_evidence_refs):
+            raise ValueError("evidence-backed fact refs must be accepted evidence")
+        attributes = _required_mapping(candidate, _FIELD_ATTRIBUTES)
+        attributes_json = canonical_json_dumps(attributes)
+        if len(attributes_json) > MAX_EVIDENCE_BACKED_FACT_ATTRIBUTES_JSON_CHARS:
+            raise ValueError("attributes exceeds maximum length")
+
+
+def _reject_old_preserved_fact_ref_fields(
+    preserved_fact_refs: Mapping[str, JsonValue],
+) -> None:
+    """拒绝旧 compact preserved fact refs 字段。
+
+    :param preserved_fact_refs: compacted preserved_fact_refs JSON object。
+    :returns: ``None``。
+    :raises ValueError: 存在旧字段时抛出。
+    """
+
+    for field_name in (_FIELD_OLD_TOOL_FACT_REFS, _FIELD_OLD_VERIFIED_FACT_REFS):
+        if field_name in preserved_fact_refs:
+            raise ValueError("old preserved fact refs field is not supported")
+
+
+def _validate_minimum_preserve_items(payload: Mapping[str, JsonValue]) -> None:
+    """校验 minimum preserve item candidates JSON 结构。
+
+    :param payload: compacted payload。
+    :returns: ``None``。
+    :raises ValueError: candidates 数量、文本或 refs 非法时抛出。
+    """
+
+    candidates = _required_mapping_list(
+        payload, _FIELD_MINIMUM_PRESERVE_ITEM_CANDIDATES
+    )
+    if len(candidates) > MAX_MINIMUM_PRESERVE_ITEM_CANDIDATES:
+        raise ValueError("minimum_preserve_item_candidates exceeds maximum count")
+    for candidate in candidates:
+        _required_text(candidate, _FIELD_ITEM_ID)
+        label = _required_text(candidate, _FIELD_LABEL)
+        if len(label) > MAX_MINIMUM_PRESERVE_ITEM_LABEL_CHARS:
+            raise ValueError("minimum preserve label exceeds maximum length")
+        text = _required_text(candidate, _FIELD_TEXT)
+        if len(text) > MAX_MINIMUM_PRESERVE_ITEM_TEXT_CHARS:
+            raise ValueError("minimum preserve text exceeds maximum length")
+        refs = _required_text_list(candidate, _FIELD_SOURCE_REFS)
+        if len(refs) == 0:
+            raise ValueError("minimum preserve source_refs must be non-empty")
+        if len(refs) > MAX_SOURCE_REFS_PER_MINIMUM_PRESERVE_ITEM:
+            raise ValueError("minimum preserve source_refs exceeds maximum count")
+        MinimumPreserveReason(_required_text(candidate, _FIELD_PRESERVE_REASON))
+
+
 def _validate_opaque_ref_text(value: str) -> None:
     """校验 ``kind:ref_id`` 形式的 Host-neutral opaque ref 文本。
 
@@ -855,17 +1022,18 @@ def _allowed_opaque_ref_kinds() -> set[str]:
 
 
 def _validate_quality_check_result(
-    payload: Mapping[str, JsonValue], *, evidence_ids: set[str]
+    payload: Mapping[str, JsonValue], *, accepted_evidence_refs: set[str]
 ) -> None:
     """校验 ``CONTEXT_COMPACTED`` 只承载 accepted quality result。
 
     :param payload: compacted payload。
-    :param evidence_ids: preservation evidence id 集合。
+    :param accepted_evidence_refs: accepted evidence refs 集合。
     :returns: ``None``。
     :raises ValueError: quality result 非 accepted 或 retained evidence 非法时抛出。
     """
 
     result = _required_mapping(payload, _FIELD_QUALITY_CHECK_RESULT)
+    _reject_old_quality_result_fields(result)
     accepted = _required_bool(result, _FIELD_ACCEPTED)
     if not accepted:
         raise ValueError("context compacted requires accepted quality result")
@@ -873,17 +1041,37 @@ def _validate_quality_check_result(
         raise ValueError("accepted quality result must not include rejection reasons")
     for field_name in (
         _FIELD_CURRENT_USER_INPUT_RETAINED,
-        _FIELD_ACCEPTED_TOOL_FACT_REFS_RETAINED,
+        _FIELD_ACCEPTED_EVIDENCE_REFS_RETAINED,
+        _FIELD_EVIDENCE_BACKED_FACT_CANDIDATES_ACCEPTED,
+        _FIELD_MINIMUM_PRESERVE_ITEMS_ACCEPTED,
         _FIELD_EVIDENCE_ANCHORS_RETAINED,
         _FIELD_OPEN_QUESTIONS_RETAINED,
     ):
         if not _required_bool(result, field_name):
             raise ValueError(f"{field_name} must be true for accepted compact")
-    retained_refs = _required_text_list(result, _FIELD_RETAINED_EVIDENCE_REFS)
-    if not set(retained_refs).issubset(evidence_ids):
-        raise ValueError("retained evidence refs must exist")
+    retained_refs = _required_text_list(
+        result, _FIELD_RETAINED_ACCEPTED_EVIDENCE_REFS
+    )
+    if not set(retained_refs).issubset(accepted_evidence_refs):
+        raise ValueError("retained accepted evidence refs must exist")
     _required_list(result, _FIELD_DROPPED_RANGES)
     _required_list(result, _FIELD_SUMMARIZED_RANGES)
+
+
+def _reject_old_quality_result_fields(result: Mapping[str, JsonValue]) -> None:
+    """拒绝旧 compact quality result 字段。
+
+    :param result: quality_check_result JSON object。
+    :returns: ``None``。
+    :raises ValueError: 存在旧字段时抛出。
+    """
+
+    for field_name in (
+        _FIELD_OLD_ACCEPTED_TOOL_FACT_REFS_RETAINED,
+        _FIELD_OLD_RETAINED_EVIDENCE_REFS,
+    ):
+        if field_name in result:
+            raise ValueError("old quality result field is not supported")
 
 
 def _require_non_empty_text_value(value: JsonValue, field_name: str) -> str:

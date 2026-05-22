@@ -7,6 +7,7 @@ boundary，不调用 LLM、不写 EventLog、不更新 memory projection。
 
 from __future__ import annotations
 
+from collections.abc import Mapping
 from dataclasses import dataclass, field
 from enum import StrEnum
 from typing import Protocol
@@ -20,7 +21,35 @@ from dayu.host._public_validation import (
 )
 from dayu.host.context_budget import BudgetEstimate
 from dayu.host.context_policy import ContextCompactionTriggerSource
-from dayu.host.durable.codec import sha256_digest_json
+from dayu.host.durable.codec import canonical_json_dumps, sha256_digest_json
+from dayu.host.evidence import (
+    AcceptedEvidenceEnvelope,
+    accepted_evidence_envelope_to_json_value,
+)
+
+MAX_EVIDENCE_BACKED_FACT_CANDIDATES = 64
+"""单个 compact candidate 允许输出的 evidence-backed fact candidate 上限。"""
+
+MAX_MINIMUM_PRESERVE_ITEM_CANDIDATES = 32
+"""单个 compact candidate 允许输出的 minimum preserve item candidate 上限。"""
+
+MAX_EVIDENCE_BACKED_FACT_CLAIM_TEXT_CHARS = 2000
+"""Evidence-backed fact claim_text 字符数上限。"""
+
+MAX_MINIMUM_PRESERVE_ITEM_TEXT_CHARS = 1200
+"""Minimum preserve item text 字符数上限。"""
+
+MAX_MINIMUM_PRESERVE_ITEM_LABEL_CHARS = 120
+"""Minimum preserve item label 字符数上限。"""
+
+MAX_EVIDENCE_BACKED_FACT_ATTRIBUTES_JSON_CHARS = 4096
+"""Evidence-backed fact attributes canonical JSON 字符数上限。"""
+
+MAX_EVIDENCE_REFS_PER_FACT = 16
+"""单个 evidence-backed fact candidate 允许引用的 accepted evidence refs 上限。"""
+
+MAX_SOURCE_REFS_PER_MINIMUM_PRESERVE_ITEM = 16
+"""单个 minimum preserve item candidate 允许引用的 source refs 上限。"""
 
 
 class PinnedPatchOperation(StrEnum):
@@ -35,13 +64,39 @@ class CompactQualityIssue(StrEnum):
     """Compact quality check 拒绝原因。"""
 
     CURRENT_USER_INPUT_MISSING = "current_user_input_missing"
-    TOOL_FACT_REFS_MISSING = "tool_fact_refs_missing"
-    SUMMARY_PRETENDS_VERIFIED_FACT = "summary_pretends_verified_fact"
+    ACCEPTED_EVIDENCE_REFS_MISSING = "accepted_evidence_refs_missing"
+    SUMMARY_PRETENDS_EVIDENCE_BACKED_FACT = "summary_pretends_evidence_backed_fact"
     PRESERVATION_EVIDENCE_MISSING = "preservation_evidence_missing"
     EVIDENCE_ANCHOR_NOT_RETAINED = "evidence_anchor_not_retained"
     PINNED_PATCH_TRI_STATE_INVALID = "pinned_patch_tri_state_invalid"
     PINNED_PATCH_EVIDENCE_REF_MISSING = "pinned_patch_evidence_ref_missing"
     COMPACT_RANGE_OUTSIDE_REQUEST = "compact_range_outside_request"
+    EVIDENCE_BACKED_FACT_CANDIDATE_INVALID = (
+        "evidence_backed_fact_candidate_invalid"
+    )
+    ACCEPTED_EVIDENCE_FACT_CANDIDATE_MISSING = (
+        "accepted_evidence_fact_candidate_missing"
+    )
+    MINIMUM_PRESERVE_ITEM_CANDIDATE_INVALID = (
+        "minimum_preserve_item_candidate_invalid"
+    )
+
+
+class EvidenceBackedFactKind(StrEnum):
+    """Evidence-backed fact candidate 的 Host-neutral 类型。"""
+
+    OBSERVED_VALUE = "observed_value"
+    QUOTED_STATEMENT = "quoted_statement"
+    TABLE_VALUE = "table_value"
+    DERIVED_FROM_EVIDENCE = "derived_from_evidence"
+
+
+class MinimumPreserveReason(StrEnum):
+    """Minimum preserve item 的保留原因。"""
+
+    NEEDED_FOR_RECENT_REFERENCE = "needed_for_recent_reference"
+    NEEDED_FOR_ORDERED_ITEM_REFERENCE = "needed_for_ordered_item_reference"
+    NEEDED_FOR_LOCAL_FOLLOWUP = "needed_for_local_followup"
 
 
 def _empty_string_tuple() -> tuple[str, ...]:
@@ -156,8 +211,8 @@ class CompactionRequest:
     :param input_event_refs: compact 输入 event refs。
     :param memory_snapshot_cursor: memory snapshot cursor；无 snapshot 时为 ``None``。
     :param current_message_summary: 当前用户输入摘要。
-    :param tool_fact_refs: accepted tool fact refs。
-    :param verified_fact_refs: 已验证事实 refs。
+    :param accepted_evidence_envelopes: compact 输入范围内已接受的 evidence 信封。
+    :param evidence_backed_fact_refs: 已存在 evidence-backed fact refs。
     :param recent_raw_turn_refs: 必须保留的近期 raw turn refs。
     :param older_raw_turn_refs: 可摘要的较旧 raw turn refs。
     :param existing_episode_summary_refs: 已存在 episode summary refs。
@@ -172,8 +227,8 @@ class CompactionRequest:
     input_event_refs: tuple[str, ...]
     memory_snapshot_cursor: int | None
     current_message_summary: CurrentMessageSummary
-    tool_fact_refs: tuple[str, ...]
-    verified_fact_refs: tuple[str, ...]
+    accepted_evidence_envelopes: tuple[AcceptedEvidenceEnvelope, ...]
+    evidence_backed_fact_refs: tuple[str, ...]
     recent_raw_turn_refs: tuple[str, ...]
     older_raw_turn_refs: tuple[str, ...]
     existing_episode_summary_refs: tuple[str, ...]
@@ -225,11 +280,17 @@ class CompactionRequest:
                 self.memory_snapshot_cursor,
                 field_name="CompactionRequest.memory_snapshot_cursor",
             )
-        _require_string_tuple(
-            self.tool_fact_refs, field_name="CompactionRequest.tool_fact_refs"
+        _require_accepted_evidence_envelope_tuple(
+            self.accepted_evidence_envelopes,
+            field_name="CompactionRequest.accepted_evidence_envelopes",
+        )
+        _require_unique_string_tuple(
+            self.accepted_evidence_refs,
+            field_name="CompactionRequest.accepted_evidence_refs",
         )
         _require_string_tuple(
-            self.verified_fact_refs, field_name="CompactionRequest.verified_fact_refs"
+            self.evidence_backed_fact_refs,
+            field_name="CompactionRequest.evidence_backed_fact_refs",
         )
         _require_string_tuple(
             self.recent_raw_turn_refs,
@@ -271,8 +332,16 @@ class CompactionRequest:
             "input_event_refs": _string_list_json(self.input_event_refs),
             "memory_snapshot_cursor": self.memory_snapshot_cursor,
             "current_message_summary": self.current_message_summary.to_json(),
-            "tool_fact_refs": _string_list_json(self.tool_fact_refs),
-            "verified_fact_refs": _string_list_json(self.verified_fact_refs),
+            "accepted_evidence_envelopes": [
+                accepted_evidence_envelope_to_json_value(envelope)
+                for envelope in self.accepted_evidence_envelopes
+            ],
+            "accepted_evidence_refs": _string_list_json(
+                self.accepted_evidence_refs
+            ),
+            "evidence_backed_fact_refs": _string_list_json(
+                self.evidence_backed_fact_refs
+            ),
             "recent_raw_turn_refs": _string_list_json(self.recent_raw_turn_refs),
             "older_raw_turn_refs": _string_list_json(self.older_raw_turn_refs),
             "existing_episode_summary_refs": _string_list_json(
@@ -283,6 +352,17 @@ class CompactionRequest:
             ),
         }
 
+    @property
+    def accepted_evidence_refs(self) -> tuple[str, ...]:
+        """返回请求内 accepted evidence envelope 的稳定 evidence ids。
+
+        :returns: accepted evidence id tuple。
+        """
+
+        return tuple(
+            envelope.evidence_id for envelope in self.accepted_evidence_envelopes
+        )
+
 
 @dataclass(frozen=True, slots=True)
 class EpisodeSummaryCandidate:
@@ -292,7 +372,7 @@ class EpisodeSummaryCandidate:
     :param episode_title: episode 标题。
     :param goal: 用户目标摘要。
     :param completed_actions: 已完成动作摘要。
-    :param confirmed_fact_refs: 输入中已有 confirmed / verified fact refs。
+    :param confirmed_fact_refs: 输入中已有 confirmed / evidence-backed fact refs。
     :param confirmed_fact_summaries: confirmed facts 的可读摘要。
     :param user_constraints: 用户约束摘要。
     :param open_questions: 未决问题。
@@ -300,7 +380,7 @@ class EpisodeSummaryCandidate:
     :param tool_finding_refs: 工具发现 refs。
     :param source_event_refs: summary 覆盖的输入 event refs。
     :param evidence_refs: preservation evidence refs。
-    :param proposed_verified_fact_refs: compactor 试图新建的 verified fact refs；正常应为空。
+    :param proposed_evidence_backed_fact_refs: compactor 试图新建的 stable fact refs；正常应为空。
     """
 
     candidate_id: str
@@ -315,7 +395,7 @@ class EpisodeSummaryCandidate:
     tool_finding_refs: tuple[str, ...]
     source_event_refs: tuple[str, ...]
     evidence_refs: tuple[str, ...]
-    proposed_verified_fact_refs: tuple[str, ...] = field(
+    proposed_evidence_backed_fact_refs: tuple[str, ...] = field(
         default_factory=_empty_string_tuple
     )
 
@@ -371,8 +451,10 @@ class EpisodeSummaryCandidate:
             field_name="EpisodeSummaryCandidate.evidence_refs",
         )
         _require_string_tuple(
-            self.proposed_verified_fact_refs,
-            field_name="EpisodeSummaryCandidate.proposed_verified_fact_refs",
+            self.proposed_evidence_backed_fact_refs,
+            field_name=(
+                "EpisodeSummaryCandidate.proposed_evidence_backed_fact_refs"
+            ),
         )
 
     def to_json(self) -> JsonValue:
@@ -396,8 +478,8 @@ class EpisodeSummaryCandidate:
             "tool_finding_refs": _string_list_json(self.tool_finding_refs),
             "source_event_refs": _string_list_json(self.source_event_refs),
             "evidence_refs": _string_list_json(self.evidence_refs),
-            "proposed_verified_fact_refs": _string_list_json(
-                self.proposed_verified_fact_refs
+            "proposed_evidence_backed_fact_refs": _string_list_json(
+                self.proposed_evidence_backed_fact_refs
             ),
         }
 
@@ -581,14 +663,14 @@ class PreservationEvidence:
 
     :param evidence_id: evidence id。
     :param input_event_refs: evidence 覆盖的输入 event refs。
-    :param tool_fact_refs: evidence 覆盖的 tool fact refs。
+    :param accepted_evidence_refs: evidence 覆盖的 accepted evidence refs。
     :param memory_snapshot_cursor: evidence 对应 memory cursor；无时为 ``None``。
     :param compact_input_range: evidence 对应 compact 输入范围；无时为 ``None``。
     """
 
     evidence_id: str
     input_event_refs: tuple[str, ...]
-    tool_fact_refs: tuple[str, ...]
+    accepted_evidence_refs: tuple[str, ...]
     memory_snapshot_cursor: int | None
     compact_input_range: CompactInputRange | None
 
@@ -607,7 +689,8 @@ class PreservationEvidence:
             self.input_event_refs, field_name="PreservationEvidence.input_event_refs"
         )
         _require_string_tuple(
-            self.tool_fact_refs, field_name="PreservationEvidence.tool_fact_refs"
+            self.accepted_evidence_refs,
+            field_name="PreservationEvidence.accepted_evidence_refs",
         )
         if self.memory_snapshot_cursor is not None:
             _require_non_negative_int(
@@ -630,13 +713,150 @@ class PreservationEvidence:
         return {
             "evidence_id": self.evidence_id,
             "input_event_refs": _string_list_json(self.input_event_refs),
-            "tool_fact_refs": _string_list_json(self.tool_fact_refs),
+            "accepted_evidence_refs": _string_list_json(
+                self.accepted_evidence_refs
+            ),
             "memory_snapshot_cursor": self.memory_snapshot_cursor,
             "compact_input_range": (
                 None
                 if self.compact_input_range is None
                 else self.compact_input_range.to_json()
             ),
+        }
+
+
+@dataclass(frozen=True, slots=True)
+class EvidenceBackedFactCandidate:
+    """Compactor 输出的 evidence-backed fact 候选。
+
+    :param candidate_id: candidate-local id，只用于诊断与去重。
+    :param claim_text: 可进入 memory 的事实声明文本。
+    :param evidence_kind: 事实声明类型。
+    :param evidence_refs: 支撑该声明的 accepted evidence ids。
+    :param attributes: Host 不解释的 JSON attributes。
+    """
+
+    candidate_id: str
+    claim_text: str
+    evidence_kind: EvidenceBackedFactKind
+    evidence_refs: tuple[str, ...]
+    attributes: Mapping[str, JsonValue]
+
+    def __post_init__(self) -> None:
+        """校验 evidence-backed fact candidate 基础边界。
+
+        :returns: ``None``。
+        :raises TypeError: 字段类型非法时抛出。
+        :raises ValueError: 字段值非法时抛出。
+        """
+
+        _require_non_empty(
+            self.candidate_id,
+            field_name="EvidenceBackedFactCandidate.candidate_id",
+        )
+        _require_bounded_non_empty_text(
+            self.claim_text,
+            field_name="EvidenceBackedFactCandidate.claim_text",
+            max_chars=MAX_EVIDENCE_BACKED_FACT_CLAIM_TEXT_CHARS,
+        )
+        if not isinstance(self.evidence_kind, EvidenceBackedFactKind):
+            raise TypeError(
+                "EvidenceBackedFactCandidate.evidence_kind must be "
+                "EvidenceBackedFactKind"
+            )
+        _require_bounded_string_tuple(
+            self.evidence_refs,
+            field_name="EvidenceBackedFactCandidate.evidence_refs",
+            max_items=MAX_EVIDENCE_REFS_PER_FACT,
+            require_non_empty=True,
+        )
+        _require_json_mapping(
+            self.attributes,
+            field_name="EvidenceBackedFactCandidate.attributes",
+        )
+        attributes_json = canonical_json_dumps(self.attributes)
+        if len(attributes_json) > MAX_EVIDENCE_BACKED_FACT_ATTRIBUTES_JSON_CHARS:
+            raise ValueError(
+                "EvidenceBackedFactCandidate.attributes exceeds maximum size"
+            )
+
+    def to_json(self) -> JsonValue:
+        """转换为 canonical JSON 兼容值。
+
+        :returns: JSON object。
+        """
+
+        return {
+            "candidate_id": self.candidate_id,
+            "claim_text": self.claim_text,
+            "evidence_kind": self.evidence_kind.value,
+            "evidence_refs": _string_list_json(self.evidence_refs),
+            "attributes": self.attributes,
+        }
+
+
+@dataclass(frozen=True, slots=True)
+class MinimumPreserveItemCandidate:
+    """Compactor 输出的最小连续性保留候选。
+
+    :param item_id: item-local id，只用于诊断与去重。
+    :param label: 短标签。
+    :param text: 需要保留的连续性文本。
+    :param source_refs: compact 输入范围内的来源 event refs。
+    :param preserve_reason: 保留原因。
+    """
+
+    item_id: str
+    label: str
+    text: str
+    source_refs: tuple[str, ...]
+    preserve_reason: MinimumPreserveReason
+
+    def __post_init__(self) -> None:
+        """校验 minimum preserve item candidate 基础边界。
+
+        :returns: ``None``。
+        :raises TypeError: 字段类型非法时抛出。
+        :raises ValueError: 字段值非法时抛出。
+        """
+
+        _require_non_empty(
+            self.item_id, field_name="MinimumPreserveItemCandidate.item_id"
+        )
+        _require_bounded_non_empty_text(
+            self.label,
+            field_name="MinimumPreserveItemCandidate.label",
+            max_chars=MAX_MINIMUM_PRESERVE_ITEM_LABEL_CHARS,
+        )
+        _require_bounded_non_empty_text(
+            self.text,
+            field_name="MinimumPreserveItemCandidate.text",
+            max_chars=MAX_MINIMUM_PRESERVE_ITEM_TEXT_CHARS,
+        )
+        _require_bounded_string_tuple(
+            self.source_refs,
+            field_name="MinimumPreserveItemCandidate.source_refs",
+            max_items=MAX_SOURCE_REFS_PER_MINIMUM_PRESERVE_ITEM,
+            require_non_empty=True,
+        )
+        if not isinstance(self.preserve_reason, MinimumPreserveReason):
+            raise TypeError(
+                "MinimumPreserveItemCandidate.preserve_reason must be "
+                "MinimumPreserveReason"
+            )
+
+    def to_json(self) -> JsonValue:
+        """转换为 canonical JSON 兼容值。
+
+        :returns: JSON object。
+        """
+
+        return {
+            "item_id": self.item_id,
+            "label": self.label,
+            "text": self.text,
+            "source_refs": _string_list_json(self.source_refs),
+            "preserve_reason": self.preserve_reason.value,
         }
 
 
@@ -648,10 +868,12 @@ class CompactionCandidate:
     :param episode_summary_candidate: episode summary 候选。
     :param pinned_state_patch_candidate: pinned state patch 候选。
     :param preservation_evidence: preservation evidence 集合。
+    :param evidence_backed_fact_candidates: evidence-backed fact 候选集合。
+    :param minimum_preserve_item_candidates: minimum preserve item 候选集合。
     :param retained_current_user_input_ref: 被保留的当前用户输入 ref。
     :param preserved_input_event_refs: 被保留的输入 event refs。
-    :param preserved_tool_fact_refs: 被保留的 accepted tool fact refs。
-    :param preserved_verified_fact_refs: 被保留的 verified fact refs。
+    :param preserved_accepted_evidence_refs: 被保留的 accepted evidence refs。
+    :param preserved_evidence_backed_fact_refs: 被保留的 evidence-backed fact refs。
     :param dropped_ranges: 被丢弃的输入范围。
     :param summarized_ranges: 被摘要的输入范围。
     :param budget_after_compact: compact 后预算 token 估算。
@@ -661,10 +883,12 @@ class CompactionCandidate:
     episode_summary_candidate: EpisodeSummaryCandidate
     pinned_state_patch_candidate: PinnedStatePatchCandidate
     preservation_evidence: tuple[PreservationEvidence, ...]
+    evidence_backed_fact_candidates: tuple[EvidenceBackedFactCandidate, ...]
+    minimum_preserve_item_candidates: tuple[MinimumPreserveItemCandidate, ...]
     retained_current_user_input_ref: str | None
     preserved_input_event_refs: tuple[str, ...]
-    preserved_tool_fact_refs: tuple[str, ...]
-    preserved_verified_fact_refs: tuple[str, ...]
+    preserved_accepted_evidence_refs: tuple[str, ...]
+    preserved_evidence_backed_fact_refs: tuple[str, ...]
     dropped_ranges: tuple[CompactInputRange, ...]
     summarized_ranges: tuple[CompactInputRange, ...]
     budget_after_compact: int
@@ -694,6 +918,14 @@ class CompactionCandidate:
             self.preservation_evidence,
             field_name="CompactionCandidate.preservation_evidence",
         )
+        _require_fact_candidate_tuple(
+            self.evidence_backed_fact_candidates,
+            field_name="CompactionCandidate.evidence_backed_fact_candidates",
+        )
+        _require_minimum_preserve_candidate_tuple(
+            self.minimum_preserve_item_candidates,
+            field_name="CompactionCandidate.minimum_preserve_item_candidates",
+        )
         _require_optional_non_empty(
             self.retained_current_user_input_ref,
             field_name="CompactionCandidate.retained_current_user_input_ref",
@@ -703,12 +935,12 @@ class CompactionCandidate:
             field_name="CompactionCandidate.preserved_input_event_refs",
         )
         _require_string_tuple(
-            self.preserved_tool_fact_refs,
-            field_name="CompactionCandidate.preserved_tool_fact_refs",
+            self.preserved_accepted_evidence_refs,
+            field_name="CompactionCandidate.preserved_accepted_evidence_refs",
         )
         _require_string_tuple(
-            self.preserved_verified_fact_refs,
-            field_name="CompactionCandidate.preserved_verified_fact_refs",
+            self.preserved_evidence_backed_fact_refs,
+            field_name="CompactionCandidate.preserved_evidence_backed_fact_refs",
         )
         _require_range_tuple(
             self.dropped_ranges, field_name="CompactionCandidate.dropped_ranges"
@@ -744,15 +976,23 @@ class CompactionCandidate:
             "preservation_evidence": _evidence_list_json(
                 self.preservation_evidence
             ),
+            "evidence_backed_fact_candidates": _fact_candidate_list_json(
+                self.evidence_backed_fact_candidates
+            ),
+            "minimum_preserve_item_candidates": (
+                _minimum_preserve_candidate_list_json(
+                    self.minimum_preserve_item_candidates
+                )
+            ),
             "retained_current_user_input_ref": self.retained_current_user_input_ref,
             "preserved_input_event_refs": _string_list_json(
                 self.preserved_input_event_refs
             ),
-            "preserved_tool_fact_refs": _string_list_json(
-                self.preserved_tool_fact_refs
+            "preserved_accepted_evidence_refs": _string_list_json(
+                self.preserved_accepted_evidence_refs
             ),
-            "preserved_verified_fact_refs": _string_list_json(
-                self.preserved_verified_fact_refs
+            "preserved_evidence_backed_fact_refs": _string_list_json(
+                self.preserved_evidence_backed_fact_refs
             ),
             "dropped_ranges": _range_list_json(self.dropped_ranges),
             "summarized_ranges": _range_list_json(self.summarized_ranges),
@@ -767,10 +1007,12 @@ class CompactQualityCheckResult:
     :param accepted: 候选是否通过 quality check。
     :param rejection_reasons: 拒绝原因集合。
     :param current_user_input_retained: 当前用户输入是否保留。
-    :param accepted_tool_fact_refs_retained: accepted tool fact refs 是否全部保留。
+    :param accepted_evidence_refs_retained: accepted evidence refs 是否全部保留。
+    :param evidence_backed_fact_candidates_accepted: fact candidates 是否通过。
+    :param minimum_preserve_items_accepted: minimum preserve candidates 是否通过。
     :param evidence_anchors_retained: evidence anchors 是否保留。
     :param open_questions_retained: open questions / assumptions 是否保留。
-    :param retained_evidence_refs: 被接受的 evidence refs。
+    :param retained_accepted_evidence_refs: 被接受的 accepted evidence refs。
     :param dropped_ranges: 被丢弃的输入范围。
     :param summarized_ranges: 被摘要的输入范围。
     """
@@ -778,10 +1020,12 @@ class CompactQualityCheckResult:
     accepted: bool
     rejection_reasons: tuple[CompactQualityIssue, ...]
     current_user_input_retained: bool
-    accepted_tool_fact_refs_retained: bool
+    accepted_evidence_refs_retained: bool
+    evidence_backed_fact_candidates_accepted: bool
+    minimum_preserve_items_accepted: bool
     evidence_anchors_retained: bool
     open_questions_retained: bool
-    retained_evidence_refs: tuple[str, ...]
+    retained_accepted_evidence_refs: tuple[str, ...]
     dropped_ranges: tuple[CompactInputRange, ...]
     summarized_ranges: tuple[CompactInputRange, ...]
 
@@ -804,8 +1048,19 @@ class CompactQualityCheckResult:
             field_name="CompactQualityCheckResult.current_user_input_retained",
         )
         _require_bool(
-            self.accepted_tool_fact_refs_retained,
-            field_name="CompactQualityCheckResult.accepted_tool_fact_refs_retained",
+            self.accepted_evidence_refs_retained,
+            field_name="CompactQualityCheckResult.accepted_evidence_refs_retained",
+        )
+        _require_bool(
+            self.evidence_backed_fact_candidates_accepted,
+            field_name=(
+                "CompactQualityCheckResult."
+                "evidence_backed_fact_candidates_accepted"
+            ),
+        )
+        _require_bool(
+            self.minimum_preserve_items_accepted,
+            field_name="CompactQualityCheckResult.minimum_preserve_items_accepted",
         )
         _require_bool(
             self.evidence_anchors_retained,
@@ -816,8 +1071,8 @@ class CompactQualityCheckResult:
             field_name="CompactQualityCheckResult.open_questions_retained",
         )
         _require_string_tuple(
-            self.retained_evidence_refs,
-            field_name="CompactQualityCheckResult.retained_evidence_refs",
+            self.retained_accepted_evidence_refs,
+            field_name="CompactQualityCheckResult.retained_accepted_evidence_refs",
         )
         _require_range_tuple(
             self.dropped_ranges,
@@ -846,12 +1101,20 @@ class CompactQualityCheckResult:
                 _enum_value for _enum_value in self._rejection_reason_values()
             ],
             "current_user_input_retained": self.current_user_input_retained,
-            "accepted_tool_fact_refs_retained": (
-                self.accepted_tool_fact_refs_retained
+            "accepted_evidence_refs_retained": (
+                self.accepted_evidence_refs_retained
+            ),
+            "evidence_backed_fact_candidates_accepted": (
+                self.evidence_backed_fact_candidates_accepted
+            ),
+            "minimum_preserve_items_accepted": (
+                self.minimum_preserve_items_accepted
             ),
             "evidence_anchors_retained": self.evidence_anchors_retained,
             "open_questions_retained": self.open_questions_retained,
-            "retained_evidence_refs": _string_list_json(self.retained_evidence_refs),
+            "retained_accepted_evidence_refs": _string_list_json(
+                self.retained_accepted_evidence_refs
+            ),
             "dropped_ranges": _range_list_json(self.dropped_ranges),
             "summarized_ranges": _range_list_json(self.summarized_ranges),
         }
@@ -917,6 +1180,105 @@ def _require_string_tuple(value: tuple[str, ...], *, field_name: str) -> None:
         _require_non_empty(item, field_name=field_name)
 
 
+def _require_unique_string_tuple(
+    value: tuple[str, ...], *, field_name: str
+) -> None:
+    """校验字符串 tuple 且元素不重复。
+
+    :param value: 待校验 tuple。
+    :param field_name: 错误字段名。
+    :returns: ``None``。
+    :raises TypeError: 字段或元素类型非法时抛出。
+    :raises ValueError: 元素为空或重复时抛出。
+    """
+
+    _require_string_tuple(value, field_name=field_name)
+    if len(set(value)) != len(value):
+        raise ValueError(f"{field_name} items must be unique")
+
+
+def _require_bounded_string_tuple(
+    value: tuple[str, ...],
+    *,
+    field_name: str,
+    max_items: int,
+    require_non_empty: bool,
+) -> None:
+    """校验字符串 tuple 数量边界。
+
+    :param value: 待校验 tuple。
+    :param field_name: 错误字段名。
+    :param max_items: 最大元素数量。
+    :param require_non_empty: 是否要求至少一个元素。
+    :returns: ``None``。
+    :raises TypeError: 字段或元素类型非法时抛出。
+    :raises ValueError: 元素为空、数量非法或重复时抛出。
+    """
+
+    _require_unique_string_tuple(value, field_name=field_name)
+    if require_non_empty and len(value) == 0:
+        raise ValueError(f"{field_name} must be non-empty")
+    if len(value) > max_items:
+        raise ValueError(f"{field_name} exceeds maximum item count")
+
+
+def _require_bounded_non_empty_text(
+    value: str, *, field_name: str, max_chars: int
+) -> None:
+    """校验有界非空文本。
+
+    :param value: 待校验文本。
+    :param field_name: 错误字段名。
+    :param max_chars: 最大字符数。
+    :returns: ``None``。
+    :raises TypeError: 文本类型非法时抛出。
+    :raises ValueError: 文本为空或超长时抛出。
+    """
+
+    if not isinstance(value, str):
+        raise TypeError(f"{field_name} must be str")
+    if value.strip() == "":
+        raise ValueError(f"{field_name} must be non-empty")
+    if len(value) > max_chars:
+        raise ValueError(f"{field_name} exceeds maximum length")
+
+
+def _require_json_mapping(
+    value: Mapping[str, JsonValue], *, field_name: str
+) -> None:
+    """校验 JSON object mapping。
+
+    :param value: 待校验 JSON object。
+    :param field_name: 错误字段名。
+    :returns: ``None``。
+    :raises TypeError: value 或 key 类型非法时抛出。
+    """
+
+    if not isinstance(value, Mapping):
+        raise TypeError(f"{field_name} must be mapping")
+    for key in value:
+        if not isinstance(key, str):
+            raise TypeError(f"{field_name} keys must be str")
+
+
+def _require_accepted_evidence_envelope_tuple(
+    value: tuple[AcceptedEvidenceEnvelope, ...], *, field_name: str
+) -> None:
+    """校验 accepted evidence envelope tuple。
+
+    :param value: 待校验 tuple。
+    :param field_name: 错误字段名。
+    :returns: ``None``。
+    :raises TypeError: 字段或元素类型非法时抛出。
+    """
+
+    if not isinstance(value, tuple):
+        raise TypeError(f"{field_name} must be tuple")
+    for item in value:
+        if not isinstance(item, AcceptedEvidenceEnvelope):
+            raise TypeError(f"{field_name} items must be AcceptedEvidenceEnvelope")
+
+
 def _require_tuple_patch_field(
     value: PinnedStringTupleFieldPatch, *, field_name: str
 ) -> None:
@@ -948,6 +1310,52 @@ def _require_evidence_tuple(
     for item in value:
         if not isinstance(item, PreservationEvidence):
             raise TypeError(f"{field_name} items must be PreservationEvidence")
+
+
+def _require_fact_candidate_tuple(
+    value: tuple[EvidenceBackedFactCandidate, ...], *, field_name: str
+) -> None:
+    """校验 evidence-backed fact candidate tuple。
+
+    :param value: 待校验 tuple。
+    :param field_name: 错误字段名。
+    :returns: ``None``。
+    :raises TypeError: 字段或元素类型非法时抛出。
+    :raises ValueError: 数量超过上限时抛出。
+    """
+
+    if not isinstance(value, tuple):
+        raise TypeError(f"{field_name} must be tuple")
+    if len(value) > MAX_EVIDENCE_BACKED_FACT_CANDIDATES:
+        raise ValueError(f"{field_name} exceeds maximum item count")
+    for item in value:
+        if not isinstance(item, EvidenceBackedFactCandidate):
+            raise TypeError(
+                f"{field_name} items must be EvidenceBackedFactCandidate"
+            )
+
+
+def _require_minimum_preserve_candidate_tuple(
+    value: tuple[MinimumPreserveItemCandidate, ...], *, field_name: str
+) -> None:
+    """校验 minimum preserve item candidate tuple。
+
+    :param value: 待校验 tuple。
+    :param field_name: 错误字段名。
+    :returns: ``None``。
+    :raises TypeError: 字段或元素类型非法时抛出。
+    :raises ValueError: 数量超过上限时抛出。
+    """
+
+    if not isinstance(value, tuple):
+        raise TypeError(f"{field_name} must be tuple")
+    if len(value) > MAX_MINIMUM_PRESERVE_ITEM_CANDIDATES:
+        raise ValueError(f"{field_name} exceeds maximum item count")
+    for item in value:
+        if not isinstance(item, MinimumPreserveItemCandidate):
+            raise TypeError(
+                f"{field_name} items must be MinimumPreserveItemCandidate"
+            )
 
 
 def _require_range_tuple(
@@ -1038,6 +1446,36 @@ def _evidence_list_json(values: tuple[PreservationEvidence, ...]) -> list[JsonVa
     return result
 
 
+def _fact_candidate_list_json(
+    values: tuple[EvidenceBackedFactCandidate, ...],
+) -> list[JsonValue]:
+    """把 evidence-backed fact candidate tuple 转换为 JSON 数组。
+
+    :param values: candidate tuple。
+    :returns: JSON 数组。
+    """
+
+    result: list[JsonValue] = []
+    for value in values:
+        result.append(value.to_json())
+    return result
+
+
+def _minimum_preserve_candidate_list_json(
+    values: tuple[MinimumPreserveItemCandidate, ...],
+) -> list[JsonValue]:
+    """把 minimum preserve item candidate tuple 转换为 JSON 数组。
+
+    :param values: candidate tuple。
+    :returns: JSON 数组。
+    """
+
+    result: list[JsonValue] = []
+    for value in values:
+        result.append(value.to_json())
+    return result
+
+
 def _budget_estimate_json(estimate: BudgetEstimate) -> JsonValue:
     """把 budget estimate 转换为 JSON object。
 
@@ -1067,6 +1505,18 @@ __all__ = [
     "ContextCompactor",
     "CurrentMessageSummary",
     "EpisodeSummaryCandidate",
+    "EvidenceBackedFactCandidate",
+    "EvidenceBackedFactKind",
+    "MAX_EVIDENCE_BACKED_FACT_ATTRIBUTES_JSON_CHARS",
+    "MAX_EVIDENCE_BACKED_FACT_CANDIDATES",
+    "MAX_EVIDENCE_BACKED_FACT_CLAIM_TEXT_CHARS",
+    "MAX_EVIDENCE_REFS_PER_FACT",
+    "MAX_MINIMUM_PRESERVE_ITEM_CANDIDATES",
+    "MAX_MINIMUM_PRESERVE_ITEM_LABEL_CHARS",
+    "MAX_MINIMUM_PRESERVE_ITEM_TEXT_CHARS",
+    "MAX_SOURCE_REFS_PER_MINIMUM_PRESERVE_ITEM",
+    "MinimumPreserveItemCandidate",
+    "MinimumPreserveReason",
     "PinnedPatchOperation",
     "PinnedStatePatchCandidate",
     "PinnedStringTupleFieldPatch",

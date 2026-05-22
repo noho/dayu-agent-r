@@ -15,6 +15,11 @@ from dayu.host.compaction import (
 from dayu.host.compaction_operation import run_compaction_operation
 from dayu.host.context_budget import BudgetEstimate
 from dayu.host.context_policy import ContextCompactionTriggerSource
+from dayu.host.evidence import (
+    AcceptedEvidenceEnvelope,
+    AcceptedEvidenceResultRef,
+    AcceptedEvidenceToolQuery,
+)
 from tests.host.fake_compaction import FakeContextCompactor
 
 _DIGEST = "sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
@@ -217,8 +222,8 @@ def _request() -> CompactionRequest:
             summary_text="current user text",
             source_event_refs=("input-1",),
         ),
-        tool_fact_refs=("tool-fact-1",),
-        verified_fact_refs=("verified-1",),
+        accepted_evidence_envelopes=(_accepted_evidence_envelope(),),
+        evidence_backed_fact_refs=("fact-existing-1",),
         recent_raw_turn_refs=("input-1",),
         older_raw_turn_refs=("input-2",),
         existing_episode_summary_refs=("summary-1",),
@@ -231,4 +236,31 @@ def _request() -> CompactionRequest:
             estimator_digest=_DIGEST,
             overage_reason=None,
         ),
+    )
+
+
+def _accepted_evidence_envelope() -> AcceptedEvidenceEnvelope:
+    """构造测试用 accepted evidence envelope。
+
+    :returns: accepted evidence envelope。
+    """
+
+    return AcceptedEvidenceEnvelope(
+        evidence_id="evidence:accepted-operation",
+        producer_event_ref="event-tool-result-operation",
+        tool_name="fins.search",
+        tool_call_id="tool-call-operation",
+        tool_query=AcceptedEvidenceToolQuery(
+            tool_call_requested_event_ref="event-tool-call-operation",
+            normalized_arguments_digest=_DIGEST,
+            semantic_input_digest=_DIGEST,
+        ),
+        result_ref=AcceptedEvidenceResultRef(
+            payload_ref="payload:operation",
+            payload_digest=_DIGEST,
+            outcome_digest=_DIGEST,
+            truncation_applied=False,
+        ),
+        source_refs=(),
+        locator_refs=(),
     )

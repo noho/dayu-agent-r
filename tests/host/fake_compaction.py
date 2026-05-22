@@ -12,17 +12,21 @@ from dayu.host.compaction import (
     CompactionRequest,
     ContextCompactor,
     EpisodeSummaryCandidate,
+    EvidenceBackedFactCandidate,
+    EvidenceBackedFactKind,
+    MinimumPreserveItemCandidate,
+    MinimumPreserveReason,
     PinnedPatchOperation,
     PinnedStatePatchCandidate,
     PinnedStringTupleFieldPatch,
     PinnedTextFieldPatch,
     PreservationEvidence,
 )
-from dayu.host.compaction_budget import estimate_compacted_context_budget
 
 _FAKE_COMPACTION_SYSTEM_PROMPT = (
     "Deterministic fake context compactor preserving current input and accepted facts."
 )
+_FAKE_SUMMARY_TOKEN_ESTIMATE = 120
 _HARD_THRESHOLD_ACCEPTANCE_MARGIN_TOKENS = 1
 _MIN_COMPACTED_CONTEXT_BUDGET_TOKENS = 0
 
@@ -54,12 +58,12 @@ class FakeContextCompactor(ContextCompactor):
                 episode_title=f"Session {request.session_id} compact summary",
                 goal=request.current_message_summary.summary_text,
                 completed_actions=_completed_actions(request),
-                confirmed_fact_refs=request.verified_fact_refs,
+                confirmed_fact_refs=request.evidence_backed_fact_refs,
                 confirmed_fact_summaries=_confirmed_fact_summaries(request),
                 user_constraints=_user_constraints(request),
                 open_questions=("continue-current-run",),
                 next_step="preserve current input and accepted tool facts",
-                tool_finding_refs=request.tool_fact_refs,
+                tool_finding_refs=request.accepted_evidence_refs,
                 source_event_refs=request.input_event_refs,
                 evidence_refs=evidence_refs,
             ),
@@ -87,12 +91,14 @@ class FakeContextCompactor(ContextCompactor):
                 ),
             ),
             preservation_evidence=evidence,
+            evidence_backed_fact_candidates=_fact_candidates(request),
+            minimum_preserve_item_candidates=_minimum_preserve_items(request),
             retained_current_user_input_ref=(
                 request.current_message_summary.current_user_input_ref
             ),
             preserved_input_event_refs=request.input_event_refs,
-            preserved_tool_fact_refs=request.tool_fact_refs,
-            preserved_verified_fact_refs=request.verified_fact_refs,
+            preserved_accepted_evidence_refs=request.accepted_evidence_refs,
+            preserved_evidence_backed_fact_refs=request.evidence_backed_fact_refs,
             dropped_ranges=(),
             summarized_ranges=summarized_ranges,
             budget_after_compact=_budget_after_compact(request),
@@ -112,7 +118,7 @@ def _preservation_evidence(
         PreservationEvidence(
             evidence_id=f"fake-evidence:{request.run_id}:primary",
             input_event_refs=request.input_event_refs,
-            tool_fact_refs=request.tool_fact_refs,
+            accepted_evidence_refs=request.accepted_evidence_refs,
             memory_snapshot_cursor=request.memory_snapshot_cursor,
             compact_input_range=_range_for_request(request),
         ),
@@ -172,9 +178,12 @@ def _confirmed_fact_summaries(request: CompactionRequest) -> tuple[str, ...]:
     :returns: confirmed fact summaries。
     """
 
-    if len(request.verified_fact_refs) == 0:
-        return ("no verified facts in input",)
-    return tuple(f"verified:{fact_ref}" for fact_ref in request.verified_fact_refs)
+    if len(request.evidence_backed_fact_refs) == 0:
+        return ("no evidence-backed facts in input",)
+    return tuple(
+        f"evidence-backed:{fact_ref}"
+        for fact_ref in request.evidence_backed_fact_refs
+    )
 
 
 def _confirmed_subjects(request: CompactionRequest) -> tuple[str, ...]:
@@ -184,9 +193,52 @@ def _confirmed_subjects(request: CompactionRequest) -> tuple[str, ...]:
     :returns: confirmed subjects。
     """
 
-    if len(request.verified_fact_refs) > 0:
-        return tuple(f"subject:{fact_ref}" for fact_ref in request.verified_fact_refs)
+    if len(request.evidence_backed_fact_refs) > 0:
+        return tuple(
+            f"subject:{fact_ref}" for fact_ref in request.evidence_backed_fact_refs
+        )
     return (f"subject:{request.current_message_summary.current_user_input_ref}",)
+
+
+def _fact_candidates(
+    request: CompactionRequest,
+) -> tuple[EvidenceBackedFactCandidate, ...]:
+    """根据 accepted evidence 构造 deterministic fact candidates。
+
+    :param request: compaction 请求。
+    :returns: fact candidate tuple。
+    """
+
+    return tuple(
+        EvidenceBackedFactCandidate(
+            candidate_id=f"fake-fact:{request.run_id}:{index}",
+            claim_text=f"Accepted evidence retained: {evidence_ref}",
+            evidence_kind=EvidenceBackedFactKind.OBSERVED_VALUE,
+            evidence_refs=(evidence_ref,),
+            attributes={},
+        )
+        for index, evidence_ref in enumerate(request.accepted_evidence_refs)
+    )
+
+
+def _minimum_preserve_items(
+    request: CompactionRequest,
+) -> tuple[MinimumPreserveItemCandidate, ...]:
+    """根据当前输入构造 deterministic minimum preserve item。
+
+    :param request: compaction 请求。
+    :returns: minimum preserve item candidate tuple。
+    """
+
+    return (
+        MinimumPreserveItemCandidate(
+            item_id=f"fake-preserve:{request.run_id}:current-input",
+            label="current input",
+            text=request.current_message_summary.summary_text,
+            source_refs=(request.current_message_summary.current_user_input_ref,),
+            preserve_reason=MinimumPreserveReason.NEEDED_FOR_RECENT_REFERENCE,
+        ),
+    )
 
 
 def _user_constraints(request: CompactionRequest) -> tuple[str, ...]:
@@ -206,10 +258,12 @@ def _budget_after_compact(request: CompactionRequest) -> int:
     :returns: compact 后 token 估算。
     """
 
-    estimated_budget = estimate_compacted_context_budget(
-        request,
-        summary=request.current_message_summary.summary_text,
-        system_prompt=_FAKE_COMPACTION_SYSTEM_PROMPT,
+    estimated_budget = (
+        request.budget_before_compact.estimated_input_tokens
+        + _FAKE_SUMMARY_TOKEN_ESTIMATE
+        + len(request.accepted_evidence_refs)
+        + len(request.evidence_backed_fact_refs)
+        + len(_FAKE_COMPACTION_SYSTEM_PROMPT)
     )
     return _cap_budget_within_hard_threshold(
         estimated_budget,

@@ -242,11 +242,11 @@ Conversation Memory 是 Session-level read model，不是 Host governance truth�
 
 RunInputBuilder 读取 memory snapshot 时必须带着 snapshot cursor 与 policy digest；snapshot 缺失、损坏或滞后超过策略阈值时，Host 进入 projection repair path。memory projection lag 不触发 Run 状态迁移，也不把 Run 推入 `RECOVERING`。
 
-Memory 的边界是 Host-neutral：它不导入 Engine / Fins / Service / UI，不表达财报业务字段，不让 assistant final answer 自动成为 evidence-backed fact。只有工具事实和明确 provenance 能支撑 evidence-backed fact。
+Memory 的边界是 Host-neutral：它不导入 Engine / Fins / Service / UI，不表达财报业务字段，不让 assistant final answer 自动成为 evidence-backed fact。只有 accepted evidence envelope 与明确 provenance 能支撑 evidence-backed fact；accepted evidence 没有通过 compact accept barrier 的 fact candidate 时只记录诊断，不合成 fallback fact。
 
 ## Context Compaction
 
-Context Governance 是 Host 责任。它根据 `ContextBudgetPolicy`、conservative estimator、memory snapshot、tool facts、当前用户输入和 compact artifact refs 进行上下文预算治理。
+Context Governance 是 Host 责任。它根据 `ContextBudgetPolicy`、conservative estimator、memory snapshot、accepted evidence envelopes、当前用户输入和 compact artifact refs 进行上下文预算治理。
 
 Runner usage 进入 Host 后只写 `USAGE_REPORTED` projection signal，并附带 Session / Run / Attempt / execution、policy ref、estimator digest、估算输入 token 与 observation digest 等诊断字段。usage 是 post-call observation，只用于后续估算校准、diagnostic 和后续治理参考；缺少 policy、input event 或估算失败时 projection 仍提交为 `estimate_unavailable`，不改变当前 Run / Attempt 状态，也不回改当前 dispatch decision。
 
@@ -255,7 +255,7 @@ Runner usage 进入 Host 后只写 `USAGE_REPORTED` projection signal，并附�
 - proactive：dispatch Attempt 前执行输入治理，必要时写入 compact request / compacted / failed canonical facts，再创建 Attempt。
 - reactive：Engine 报告 context compaction required 后，由 Host 校验 attempt / execution identity，按 policy 关闭当前 Attempt，执行 bounded compaction operation，并用新的 Attempt 继续。
 
-LLM compactor 只提出 structured candidate；Host 负责质量校验、预算硬阈值校验、artifact 写入、canonical event 写入和状态推进。compact 后预算按统一 Host token 估算常数计算，覆盖 summary、当前输入、保留的 recent refs、tool fact refs、verified refs、已有 summary refs 与系统提示的保守估算，不用 hard threshold 反向截断估算值。compactor 的 Engine runner 调用受独立 timeout 边界约束；非 final outcome 的错误摘要会先脱敏，`finish_reason=length` 的 final summary 视为截断脏 proposal，不会被接受为 compact 成功。质量校验会拒绝缺失 evidence anchor、非法 pinned state patch，以及不属于本次 compaction request 可摘要输入范围的 compact range。compact 不改写历史 EventLog facts，不让 summary 替代 evidence anchor，也不直接写 memory snapshot。memory 是否吸收 compacted summary 由 memory projection policy 消费已提交 facts 决定。
+LLM compactor 只提出 structured candidate；Host 负责质量校验、预算硬阈值校验、artifact 写入、canonical event 写入和状态推进。compact 后预算按统一 Host token 估算常数计算，覆盖 summary、当前输入、保留的 recent refs、accepted evidence refs、evidence-backed fact refs、已有 summary refs 与系统提示的保守估算，不用 hard threshold 反向截断估算值。compactor 的 Engine runner 调用受独立 timeout 边界约束；非 final outcome 的错误摘要会先脱敏，`finish_reason=length` 的 final summary 视为截断脏 proposal，不会被接受为 compact 成功。质量校验会拒绝缺失 evidence anchor、非法 pinned state patch、不属于本次 compaction request 可摘要输入范围的 compact range、越权 evidence-backed fact candidate，以及 source refs 不在 compact 输入内的 minimum preserve item。compact 不改写历史 EventLog facts，不让 summary 替代 evidence anchor，也不直接写 memory snapshot。memory 是否吸收 compacted summary、fact candidate 或 minimum preserve item 由 memory projection policy 消费已提交 facts 决定。
 
 ## Payload 与 Terminal Continuity
 

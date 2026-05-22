@@ -17,6 +17,8 @@ from dayu.host.compaction import (
     CompactQualityCheckResult,
     CompactionCandidate,
     CompactionRequest,
+    EvidenceBackedFactCandidate,
+    MinimumPreserveItemCandidate,
 )
 from dayu.host.durable.artifact import LocalArtifactRef, LocalArtifactStore
 from dayu.host.durable.codec import (
@@ -26,10 +28,11 @@ from dayu.host.durable.codec import (
 from dayu.host.durable.errors import HostDurableError
 from dayu.host.durable.payload import PayloadDescriptor, PayloadStore
 from dayu.host.durable.transaction import HostTransaction
+from dayu.host.evidence import accepted_evidence_envelope_to_json_value
 
 _COMPACT_ARTIFACT_MEDIA_TYPE = "application/vnd.dayu.context-compact+json"
 _COMPACT_ARTIFACT_KIND = "context_compaction"
-_COMPACT_ARTIFACT_SCHEMA_VERSION = 1
+_COMPACT_ARTIFACT_SCHEMA_VERSION = 2
 _COMPACT_ARTIFACT_REF_PREFIX = "compact-artifact:"
 _SHA256_PREFIX = "sha256:"
 
@@ -195,12 +198,22 @@ def compact_artifact_json(request: CompactArtifactWriteRequest) -> JsonValue:
         "budget_before_compact": _budget_before_json(compaction_request),
         "budget_after_compact": candidate.budget_after_compact,
         "input_snapshot_refs": _input_snapshot_refs_json(compaction_request),
+        "evidence_backed_fact_candidates": _fact_candidate_list_json(
+            candidate.evidence_backed_fact_candidates
+        ),
+        "minimum_preserve_item_candidates": (
+            _minimum_preserve_candidate_list_json(
+                candidate.minimum_preserve_item_candidates
+            )
+        ),
         "dropped_ranges": _range_list_json(candidate.dropped_ranges),
         "summarized_ranges": _range_list_json(candidate.summarized_ranges),
         "preserved_fact_refs": {
-            "tool_fact_refs": _string_list_json(candidate.preserved_tool_fact_refs),
-            "verified_fact_refs": _string_list_json(
-                candidate.preserved_verified_fact_refs
+            "accepted_evidence_refs": _string_list_json(
+                candidate.preserved_accepted_evidence_refs
+            ),
+            "evidence_backed_fact_refs": _string_list_json(
+                candidate.preserved_evidence_backed_fact_refs
             ),
         },
         "policy_digest": request.policy_digest,
@@ -282,8 +295,14 @@ def _input_snapshot_refs_json(request: CompactionRequest) -> JsonValue:
         "current_user_input_ref": (
             request.current_message_summary.current_user_input_ref
         ),
-        "tool_fact_refs": _string_list_json(request.tool_fact_refs),
-        "verified_fact_refs": _string_list_json(request.verified_fact_refs),
+        "accepted_evidence_refs": _string_list_json(request.accepted_evidence_refs),
+        "accepted_evidence_envelopes": [
+            accepted_evidence_envelope_to_json_value(envelope)
+            for envelope in request.accepted_evidence_envelopes
+        ],
+        "evidence_backed_fact_refs": _string_list_json(
+            request.evidence_backed_fact_refs
+        ),
         "recent_raw_turn_refs": _string_list_json(request.recent_raw_turn_refs),
         "older_raw_turn_refs": _string_list_json(request.older_raw_turn_refs),
         "existing_episode_summary_refs": _string_list_json(
@@ -296,6 +315,36 @@ def _range_list_json(values: tuple[CompactInputRange, ...]) -> list[JsonValue]:
     """把 compact range tuple 转换为 JSON 数组。
 
     :param values: compact range tuple。
+    :returns: JSON 数组。
+    """
+
+    result: list[JsonValue] = []
+    for value in values:
+        result.append(value.to_json())
+    return result
+
+
+def _fact_candidate_list_json(
+    values: tuple[EvidenceBackedFactCandidate, ...],
+) -> list[JsonValue]:
+    """把 fact candidate tuple 转换为 JSON 数组。
+
+    :param values: candidate tuple。
+    :returns: JSON 数组。
+    """
+
+    result: list[JsonValue] = []
+    for value in values:
+        result.append(value.to_json())
+    return result
+
+
+def _minimum_preserve_candidate_list_json(
+    values: tuple[MinimumPreserveItemCandidate, ...],
+) -> list[JsonValue]:
+    """把 minimum preserve item candidate tuple 转换为 JSON 数组。
+
+    :param values: candidate tuple。
     :returns: JSON 数组。
     """
 

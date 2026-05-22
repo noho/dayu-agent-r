@@ -13,6 +13,8 @@ from dayu.host.compaction import (
     CompactQualityIssue,
     CompactionCandidate,
     CompactionRequest,
+    EvidenceBackedFactCandidate,
+    MinimumPreserveItemCandidate,
     PinnedPatchOperation,
     PinnedStatePatchCandidate,
     PinnedStringTupleFieldPatch,
@@ -39,12 +41,22 @@ def check_compaction_candidate(
 
     issue_collector = _QualityIssueCollector()
     current_user_input_retained = _current_user_input_retained(request, candidate)
-    accepted_tool_fact_refs_retained = _accepted_tool_fact_refs_retained(
+    accepted_evidence_refs_retained = _accepted_evidence_refs_retained(
         request, candidate
     )
     evidence_ids = _evidence_ids(candidate.preservation_evidence)
+    accepted_evidence_ids = set(request.accepted_evidence_refs)
     evidence_anchors_retained = _evidence_anchors_retained(request, candidate)
     compact_ranges_from_request = _compact_ranges_from_request(request, candidate)
+    fact_candidates_accepted = _fact_candidates_accepted(
+        request=request,
+        candidate=candidate,
+        accepted_evidence_ids=accepted_evidence_ids,
+    )
+    minimum_preserve_items_accepted = _minimum_preserve_items_accepted(
+        request=request,
+        candidate=candidate,
+    )
     patch_valid = _pinned_patch_valid(
         candidate.pinned_state_patch_candidate,
         evidence_ids=evidence_ids,
@@ -53,10 +65,12 @@ def check_compaction_candidate(
 
     if not current_user_input_retained:
         issue_collector.add(CompactQualityIssue.CURRENT_USER_INPUT_MISSING)
-    if not accepted_tool_fact_refs_retained:
-        issue_collector.add(CompactQualityIssue.TOOL_FACT_REFS_MISSING)
-    if _summary_pretends_verified_fact(request, candidate):
-        issue_collector.add(CompactQualityIssue.SUMMARY_PRETENDS_VERIFIED_FACT)
+    if not accepted_evidence_refs_retained:
+        issue_collector.add(CompactQualityIssue.ACCEPTED_EVIDENCE_REFS_MISSING)
+    if _summary_pretends_evidence_backed_fact(request, candidate):
+        issue_collector.add(
+            CompactQualityIssue.SUMMARY_PRETENDS_EVIDENCE_BACKED_FACT
+        )
     if len(candidate.preservation_evidence) == 0:
         issue_collector.add(CompactQualityIssue.PRESERVATION_EVIDENCE_MISSING)
     if not evidence_anchors_retained:
@@ -65,16 +79,39 @@ def check_compaction_candidate(
         issue_collector.add(CompactQualityIssue.PINNED_PATCH_TRI_STATE_INVALID)
     if not compact_ranges_from_request:
         issue_collector.add(CompactQualityIssue.COMPACT_RANGE_OUTSIDE_REQUEST)
+    if not fact_candidates_accepted:
+        issue_collector.add(
+            CompactQualityIssue.EVIDENCE_BACKED_FACT_CANDIDATE_INVALID
+        )
+    if (
+        len(accepted_evidence_ids) > 0
+        and _retained_accepted_evidence_with_no_fact_candidate(
+            request=request,
+            candidate=candidate,
+            accepted_evidence_ids=accepted_evidence_ids,
+        )
+    ):
+        issue_collector.add(
+            CompactQualityIssue.ACCEPTED_EVIDENCE_FACT_CANDIDATE_MISSING
+        )
+    if not minimum_preserve_items_accepted:
+        issue_collector.add(
+            CompactQualityIssue.MINIMUM_PRESERVE_ITEM_CANDIDATE_INVALID
+        )
 
     reasons = issue_collector.reasons()
     return CompactQualityCheckResult(
         accepted=len(reasons) == 0,
         rejection_reasons=reasons,
         current_user_input_retained=current_user_input_retained,
-        accepted_tool_fact_refs_retained=accepted_tool_fact_refs_retained,
+        accepted_evidence_refs_retained=accepted_evidence_refs_retained,
+        evidence_backed_fact_candidates_accepted=fact_candidates_accepted,
+        minimum_preserve_items_accepted=minimum_preserve_items_accepted,
         evidence_anchors_retained=evidence_anchors_retained,
         open_questions_retained=_open_questions_retained(candidate),
-        retained_evidence_refs=tuple(sorted(evidence_ids)),
+        retained_accepted_evidence_refs=tuple(
+            sorted(set(candidate.preserved_accepted_evidence_refs))
+        ),
         dropped_ranges=candidate.dropped_ranges,
         summarized_ranges=candidate.summarized_ranges,
     )
@@ -127,37 +164,39 @@ def _current_user_input_retained(
     )
 
 
-def _accepted_tool_fact_refs_retained(
+def _accepted_evidence_refs_retained(
     request: CompactionRequest, candidate: CompactionCandidate
 ) -> bool:
-    """判断 accepted tool fact refs 是否全部保留。
+    """判断 accepted evidence refs 是否全部保留。
 
     :param request: compaction 请求。
     :param candidate: compaction candidate。
     :returns: 全部保留时返回 ``True``。
     """
 
-    return set(request.tool_fact_refs).issubset(set(candidate.preserved_tool_fact_refs))
+    return set(request.accepted_evidence_refs).issubset(
+        set(candidate.preserved_accepted_evidence_refs)
+    )
 
 
-def _summary_pretends_verified_fact(
+def _summary_pretends_evidence_backed_fact(
     request: CompactionRequest, candidate: CompactionCandidate
 ) -> bool:
-    """判断 summary 是否试图创建 verified fact。
+    """判断 summary 是否试图创建 evidence-backed fact。
 
     :param request: compaction 请求。
     :param candidate: compaction candidate。
-    :returns: 存在越权 verified fact 时返回 ``True``。
+    :returns: 存在越权 evidence-backed fact 时返回 ``True``。
     """
 
     summary = candidate.episode_summary_candidate
-    if len(summary.proposed_verified_fact_refs) > 0:
+    if len(summary.proposed_evidence_backed_fact_refs) > 0:
         return True
-    if not set(candidate.preserved_verified_fact_refs).issubset(
-        set(request.verified_fact_refs)
+    if not set(candidate.preserved_evidence_backed_fact_refs).issubset(
+        set(request.evidence_backed_fact_refs)
     ):
         return True
-    allowed_fact_refs = set(request.tool_fact_refs).union(set(request.verified_fact_refs))
+    allowed_fact_refs = set(request.evidence_backed_fact_refs)
     return not set(summary.confirmed_fact_refs).issubset(allowed_fact_refs)
 
 
@@ -192,7 +231,7 @@ def _evidence_anchors_retained(
     retained_tool_refs = _retained_tool_refs(candidate.preservation_evidence)
     if current_ref not in retained_input_refs:
         return False
-    if not set(request.tool_fact_refs).issubset(retained_tool_refs):
+    if not set(request.accepted_evidence_refs).issubset(retained_tool_refs):
         return False
     for evidence in candidate.preservation_evidence:
         if not _single_evidence_anchor_valid(request, evidence):
@@ -212,7 +251,7 @@ def _single_evidence_anchor_valid(
 
     has_anchor = (
         len(evidence.input_event_refs) > 0
-        or len(evidence.tool_fact_refs) > 0
+        or len(evidence.accepted_evidence_refs) > 0
         or evidence.memory_snapshot_cursor is not None
         or evidence.compact_input_range is not None
     )
@@ -220,7 +259,9 @@ def _single_evidence_anchor_valid(
         return False
     if not set(evidence.input_event_refs).issubset(set(request.input_event_refs)):
         return False
-    if not set(evidence.tool_fact_refs).issubset(set(request.tool_fact_refs)):
+    if not set(evidence.accepted_evidence_refs).issubset(
+        set(request.accepted_evidence_refs)
+    ):
         return False
     if evidence.memory_snapshot_cursor is not None:
         if request.memory_snapshot_cursor is None:
@@ -287,16 +328,121 @@ def _retained_input_refs(
 def _retained_tool_refs(
     evidence_items: tuple[PreservationEvidence, ...]
 ) -> set[str]:
-    """汇总 evidence 保留的 tool fact refs。
+    """汇总 evidence 保留的 accepted evidence refs。
 
     :param evidence_items: preservation evidence tuple。
-    :returns: tool fact refs 集合。
+    :returns: accepted evidence refs 集合。
     """
 
     retained: set[str] = set()
     for evidence in evidence_items:
-        retained.update(evidence.tool_fact_refs)
+        retained.update(evidence.accepted_evidence_refs)
     return retained
+
+
+def _fact_candidates_accepted(
+    *,
+    request: CompactionRequest,
+    candidate: CompactionCandidate,
+    accepted_evidence_ids: set[str],
+) -> bool:
+    """判断 evidence-backed fact candidates 是否满足 Host accept barrier。
+
+    :param request: compaction 请求。
+    :param candidate: compaction candidate。
+    :param accepted_evidence_ids: 请求内 accepted evidence ids。
+    :returns: candidates 合法时返回 ``True``。
+    """
+
+    del request
+    for fact_candidate in candidate.evidence_backed_fact_candidates:
+        if not _single_fact_candidate_accepted(
+            fact_candidate, accepted_evidence_ids=accepted_evidence_ids
+        ):
+            return False
+    return True
+
+
+def _single_fact_candidate_accepted(
+    candidate: EvidenceBackedFactCandidate, *, accepted_evidence_ids: set[str]
+) -> bool:
+    """判断单个 fact candidate 的 evidence refs 是否只指向 accepted evidence。
+
+    :param candidate: fact candidate。
+    :param accepted_evidence_ids: 请求内 accepted evidence ids。
+    :returns: refs 合法时返回 ``True``。
+    """
+
+    return (
+        len(candidate.claim_text.strip()) > 0
+        and len(candidate.evidence_refs) > 0
+        and set(candidate.evidence_refs).issubset(accepted_evidence_ids)
+    )
+
+
+def _retained_accepted_evidence_with_no_fact_candidate(
+    *,
+    request: CompactionRequest,
+    candidate: CompactionCandidate,
+    accepted_evidence_ids: set[str],
+) -> bool:
+    """判断是否存在已保留 accepted evidence 没有任何有效 fact candidate。
+
+    该分支只产生 rejection diagnostic / repair outcome，不构造 fallback fact。
+
+    :param request: compaction 请求。
+    :param candidate: compaction candidate。
+    :param accepted_evidence_ids: 请求内 accepted evidence ids。
+    :returns: 存在缺失时返回 ``True``。
+    """
+
+    del request
+    covered: set[str] = set()
+    for fact_candidate in candidate.evidence_backed_fact_candidates:
+        if _single_fact_candidate_accepted(
+            fact_candidate, accepted_evidence_ids=accepted_evidence_ids
+        ):
+            covered.update(fact_candidate.evidence_refs)
+    retained = set(candidate.preserved_accepted_evidence_refs).intersection(
+        accepted_evidence_ids
+    )
+    return not retained.issubset(covered)
+
+
+def _minimum_preserve_items_accepted(
+    *, request: CompactionRequest, candidate: CompactionCandidate
+) -> bool:
+    """判断 minimum preserve item candidates 是否满足 Host accept barrier。
+
+    :param request: compaction 请求。
+    :param candidate: compaction candidate。
+    :returns: candidates 合法时返回 ``True``。
+    """
+
+    allowed_source_refs = set(request.input_event_refs)
+    for item in candidate.minimum_preserve_item_candidates:
+        if not _single_minimum_preserve_item_accepted(
+            item, allowed_source_refs=allowed_source_refs
+        ):
+            return False
+    return True
+
+
+def _single_minimum_preserve_item_accepted(
+    item: MinimumPreserveItemCandidate, *, allowed_source_refs: set[str]
+) -> bool:
+    """判断单个 minimum preserve item candidate 的 source refs 是否来自输入。
+
+    :param item: minimum preserve item candidate。
+    :param allowed_source_refs: compact input event refs。
+    :returns: item 合法时返回 ``True``。
+    """
+
+    return (
+        item.text.strip() != ""
+        and len(item.source_refs) > 0
+        and set(item.source_refs).issubset(allowed_source_refs)
+    )
 
 
 def _pinned_patch_valid(

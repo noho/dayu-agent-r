@@ -13,6 +13,12 @@ from dayu.host.compaction import (
     CompactQualityIssue,
     CompactionRequest,
     CurrentMessageSummary,
+    EvidenceBackedFactCandidate,
+    EvidenceBackedFactKind,
+    MAX_EVIDENCE_BACKED_FACT_CLAIM_TEXT_CHARS,
+    MAX_MINIMUM_PRESERVE_ITEM_TEXT_CHARS,
+    MinimumPreserveItemCandidate,
+    MinimumPreserveReason,
     PinnedPatchOperation,
     PinnedStringTupleFieldPatch,
     PinnedTextFieldPatch,
@@ -20,6 +26,11 @@ from dayu.host.compaction import (
 from dayu.host.context_budget import BudgetEstimate
 from dayu.host.context_governance import check_compaction_candidate
 from dayu.host.context_policy import ContextCompactionTriggerSource
+from dayu.host.evidence import (
+    AcceptedEvidenceEnvelope,
+    AcceptedEvidenceResultRef,
+    AcceptedEvidenceToolQuery,
+)
 from tests.host.fake_compaction import FakeContextCompactor
 
 
@@ -82,8 +93,8 @@ async def test_quality_rejects_missing_current_user_input() -> None:
 
 
 @pytest.mark.asyncio
-async def test_quality_rejects_missing_tool_fact_refs() -> None:
-    """Quality check 拒绝丢失 accepted tool fact refs。
+async def test_quality_rejects_missing_accepted_evidence_refs() -> None:
+    """Quality check 拒绝丢失 accepted evidence refs。
 
     :returns: ``None``。
     """
@@ -91,13 +102,15 @@ async def test_quality_rejects_missing_tool_fact_refs() -> None:
     request = _request()
     candidate = replace(
         await FakeContextCompactor().compact(request),
-        preserved_tool_fact_refs=("tool-fact-1",),
+        preserved_accepted_evidence_refs=("evidence:accepted-1",),
     )
 
     result = check_compaction_candidate(request, candidate)
 
     assert result.accepted is False
-    assert CompactQualityIssue.TOOL_FACT_REFS_MISSING in result.rejection_reasons
+    assert CompactQualityIssue.ACCEPTED_EVIDENCE_REFS_MISSING in (
+        result.rejection_reasons
+    )
 
 
 @pytest.mark.asyncio
@@ -230,8 +243,8 @@ async def test_quality_marks_open_questions_lost_when_clear_without_summary_ques
 
 
 @pytest.mark.asyncio
-async def test_quality_rejects_summary_pretending_to_create_verified_fact() -> None:
-    """Quality check 拒绝 episode summary 伪造 verified fact。
+async def test_quality_rejects_summary_pretending_to_create_evidence_backed_fact() -> None:
+    """Quality check 拒绝 episode summary 伪造 evidence-backed fact。
 
     :returns: ``None``。
     """
@@ -240,14 +253,168 @@ async def test_quality_rejects_summary_pretending_to_create_verified_fact() -> N
     candidate = await FakeContextCompactor().compact(request)
     invalid_summary = replace(
         candidate.episode_summary_candidate,
-        proposed_verified_fact_refs=("summary-made-fact",),
+        proposed_evidence_backed_fact_refs=("summary-made-fact",),
     )
     candidate = replace(candidate, episode_summary_candidate=invalid_summary)
 
     result = check_compaction_candidate(request, candidate)
 
     assert result.accepted is False
-    assert CompactQualityIssue.SUMMARY_PRETENDS_VERIFIED_FACT in (
+    assert CompactQualityIssue.SUMMARY_PRETENDS_EVIDENCE_BACKED_FACT in (
+        result.rejection_reasons
+    )
+
+
+@pytest.mark.asyncio
+async def test_quality_rejects_summary_confirmed_fact_ref_to_accepted_evidence() -> None:
+    """Summary confirmed_fact_refs 不能把 accepted evidence id 当 stable fact ref。
+
+    :returns: ``None``。
+    """
+
+    request = _request()
+    candidate = await FakeContextCompactor().compact(request)
+    invalid_summary = replace(
+        candidate.episode_summary_candidate,
+        confirmed_fact_refs=("evidence:accepted-1",),
+    )
+    candidate = replace(candidate, episode_summary_candidate=invalid_summary)
+
+    result = check_compaction_candidate(request, candidate)
+
+    assert result.accepted is False
+    assert CompactQualityIssue.SUMMARY_PRETENDS_EVIDENCE_BACKED_FACT in (
+        result.rejection_reasons
+    )
+
+
+@pytest.mark.asyncio
+async def test_quality_rejects_fact_candidate_referencing_non_evidence_ref() -> None:
+    """Fact candidate 不能引用 user / assistant / summary 等非 evidence refs。
+
+    :returns: ``None``。
+    """
+
+    request = _request()
+    candidate = await FakeContextCompactor().compact(request)
+    invalid_fact = replace(
+        candidate.evidence_backed_fact_candidates[0],
+        evidence_refs=("event-current",),
+    )
+    candidate = replace(candidate, evidence_backed_fact_candidates=(invalid_fact,))
+
+    result = check_compaction_candidate(request, candidate)
+
+    assert result.accepted is False
+    assert CompactQualityIssue.EVIDENCE_BACKED_FACT_CANDIDATE_INVALID in (
+        result.rejection_reasons
+    )
+
+
+@pytest.mark.asyncio
+async def test_quality_rejects_missing_fact_candidate_for_accepted_evidence() -> None:
+    """Accepted evidence 没有有效 fact candidate 时只产生诊断拒绝。
+
+    :returns: ``None``。
+    """
+
+    request = _request()
+    candidate = replace(
+        await FakeContextCompactor().compact(request),
+        evidence_backed_fact_candidates=(),
+    )
+
+    result = check_compaction_candidate(request, candidate)
+
+    assert result.accepted is False
+    assert CompactQualityIssue.ACCEPTED_EVIDENCE_FACT_CANDIDATE_MISSING in (
+        result.rejection_reasons
+    )
+
+
+def test_fact_candidate_rejects_empty_claim_text() -> None:
+    """Fact candidate 拒绝空 claim_text。
+
+    :returns: ``None``。
+    """
+
+    with pytest.raises(ValueError, match="claim_text"):
+        EvidenceBackedFactCandidate(
+            candidate_id="fact-1",
+            claim_text=" ",
+            evidence_kind=EvidenceBackedFactKind.OBSERVED_VALUE,
+            evidence_refs=("evidence:accepted-1",),
+            attributes={},
+        )
+
+
+def test_fact_candidate_rejects_overlong_claim_text() -> None:
+    """Fact candidate 拒绝过长 claim_text。
+
+    :returns: ``None``。
+    """
+
+    with pytest.raises(ValueError, match="claim_text"):
+        EvidenceBackedFactCandidate(
+            candidate_id="fact-1",
+            claim_text="x" * (MAX_EVIDENCE_BACKED_FACT_CLAIM_TEXT_CHARS + 1),
+            evidence_kind=EvidenceBackedFactKind.OBSERVED_VALUE,
+            evidence_refs=("evidence:accepted-1",),
+            attributes={},
+        )
+
+
+def test_fact_candidate_rejects_missing_evidence_refs() -> None:
+    """Fact candidate 拒绝空 evidence_refs。
+
+    :returns: ``None``。
+    """
+
+    with pytest.raises(ValueError, match="evidence_refs"):
+        EvidenceBackedFactCandidate(
+            candidate_id="fact-1",
+            claim_text="Revenue was reported.",
+            evidence_kind=EvidenceBackedFactKind.OBSERVED_VALUE,
+            evidence_refs=(),
+            attributes={},
+        )
+
+
+def test_minimum_preserve_item_rejects_overlong_text() -> None:
+    """Minimum preserve item 拒绝过长 text。
+
+    :returns: ``None``。
+    """
+
+    with pytest.raises(ValueError, match="text"):
+        MinimumPreserveItemCandidate(
+            item_id="preserve-1",
+            label="current input",
+            text="x" * (MAX_MINIMUM_PRESERVE_ITEM_TEXT_CHARS + 1),
+            source_refs=("event-current",),
+            preserve_reason=MinimumPreserveReason.NEEDED_FOR_RECENT_REFERENCE,
+        )
+
+
+@pytest.mark.asyncio
+async def test_quality_rejects_minimum_preserve_source_outside_compact_input() -> None:
+    """Minimum preserve item source_refs 必须来自 compact input。
+
+    :returns: ``None``。
+    """
+
+    request = _request()
+    candidate = await FakeContextCompactor().compact(request)
+    invalid_item = replace(
+        candidate.minimum_preserve_item_candidates[0],
+        source_refs=("evidence:accepted-1",),
+    )
+    candidate = replace(candidate, minimum_preserve_item_candidates=(invalid_item,))
+
+    result = check_compaction_candidate(request, candidate)
+
+    assert result.accepted is False
+    assert CompactQualityIssue.MINIMUM_PRESERVE_ITEM_CANDIDATE_INVALID in (
         result.rejection_reasons
     )
 
@@ -331,10 +498,12 @@ def test_compact_quality_result_rejects_accepted_with_rejection_reasons() -> Non
             accepted=True,
             rejection_reasons=(CompactQualityIssue.CURRENT_USER_INPUT_MISSING,),
             current_user_input_retained=True,
-            accepted_tool_fact_refs_retained=True,
+            accepted_evidence_refs_retained=True,
+            evidence_backed_fact_candidates_accepted=True,
+            minimum_preserve_items_accepted=True,
             evidence_anchors_retained=True,
             open_questions_retained=True,
-            retained_evidence_refs=(),
+            retained_accepted_evidence_refs=(),
             dropped_ranges=(),
             summarized_ranges=(),
         )
@@ -351,10 +520,12 @@ def test_compact_quality_result_rejects_rejected_without_rejection_reasons() -> 
             accepted=False,
             rejection_reasons=(),
             current_user_input_retained=False,
-            accepted_tool_fact_refs_retained=True,
+            accepted_evidence_refs_retained=True,
+            evidence_backed_fact_candidates_accepted=True,
+            minimum_preserve_items_accepted=True,
             evidence_anchors_retained=True,
             open_questions_retained=True,
-            retained_evidence_refs=(),
+            retained_accepted_evidence_refs=(),
             dropped_ranges=(),
             summarized_ranges=(),
         )
@@ -395,8 +566,11 @@ def _request(
         input_event_refs=("event-old", "event-current"),
         memory_snapshot_cursor=7,
         current_message_summary=resolved_current_message_summary,
-        tool_fact_refs=("tool-fact-1", "tool-fact-2"),
-        verified_fact_refs=("tool-fact-1",),
+        accepted_evidence_envelopes=(
+            _accepted_evidence_envelope("accepted-1"),
+            _accepted_evidence_envelope("accepted-2"),
+        ),
+        evidence_backed_fact_refs=("fact-existing-1",),
         recent_raw_turn_refs=("event-current",),
         older_raw_turn_refs=("event-old",),
         existing_episode_summary_refs=("summary-prev",),
@@ -409,4 +583,40 @@ def _request(
             estimator_digest="estimate-digest",
             overage_reason=None,
         ),
+    )
+
+
+def _accepted_evidence_envelope(suffix: str) -> AcceptedEvidenceEnvelope:
+    """构造测试用 accepted evidence envelope。
+
+    :param suffix: evidence 与 producer ref 后缀。
+    :returns: accepted evidence envelope。
+    """
+
+    return AcceptedEvidenceEnvelope(
+        evidence_id=f"evidence:{suffix}",
+        producer_event_ref=f"event-tool-result-{suffix}",
+        tool_name="fins.search",
+        tool_call_id=f"tool-call-{suffix}",
+        tool_query=AcceptedEvidenceToolQuery(
+            tool_call_requested_event_ref=f"event-tool-call-{suffix}",
+            normalized_arguments_digest=(
+                "sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+            ),
+            semantic_input_digest=(
+                "sha256:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"
+            ),
+        ),
+        result_ref=AcceptedEvidenceResultRef(
+            payload_ref=f"payload:{suffix}",
+            payload_digest=(
+                "sha256:cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc"
+            ),
+            outcome_digest=(
+                "sha256:dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd"
+            ),
+            truncation_applied=False,
+        ),
+        source_refs=(),
+        locator_refs=(),
     )

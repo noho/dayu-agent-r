@@ -1629,6 +1629,15 @@ Plan 必须额外收口的 readiness review checklist：
   `pytest tests/host/test_toolruntime_accept_barrier.py tests/host/test_memory_projection.py` PASS (47 passed)；targeted pyright
   PASS (0 errors)。Deferred finding S2-D1：compact summary fact-ref test coverage 因 direct tool-result fact projection 被关闭而弱化，
   必须在 Slice 5 `Memory Projection Materialization` 恢复覆盖。
+  Slice 3 `Compaction Structured Candidate Contract And Accept Barrier` implementation / code review / targeted repair / re-review
+  已 PASS；review artifacts 为 `docs/reviews/phase12-5-slice3-code-review-mimo-20260522.md`、
+  `docs/reviews/phase12-5-slice3-code-review-ds-20260522.md`、
+  `docs/reviews/phase12-5-slice3-code-rereview-mimo-20260522.md`、
+  `docs/reviews/phase12-5-slice3-code-rereview-ds-20260522.md`、
+  `docs/reviews/phase12-5-slice3-code-rereview-controller-adjudication-20260522.md`。Slice 3 validation:
+  `pytest tests/host/test_compaction_contract.py tests/host/test_context_compact_events.py tests/host/test_compaction_operation.py`
+  PASS (52 passed)；targeted pyright PASS (0 errors)。Deferred findings：candidate JSON helper duplication 由 Slice 7 /
+  aggregate polish 处理；compact artifact v1 read-path fail-closed guard 由 Slice 5 `Memory Projection Materialization` 处理。
 
 目标：
 - 从买方财报分析 Agent 的第一性原理优化 Conversation Memory，使同一 session 内已由工具确认的关键财务事实能跨轮、
