@@ -44,7 +44,7 @@ CONVERSATION_MEMORY_CONSUMER_ID = "host.memory.session.v1"
 """Conversation memory projection consumer 稳定 id。"""
 
 DEFAULT_MEMORY_MAX_PINNED_ITEMS = 8
-DEFAULT_MEMORY_MAX_VERIFIED_FACTS = 16
+DEFAULT_MEMORY_MAX_EVIDENCE_BACKED_FACTS = 16
 DEFAULT_MEMORY_MAX_WORKING_ASSUMPTIONS = 8
 DEFAULT_MEMORY_RECENT_RAW_TURNS_FLOOR = 2
 DEFAULT_MEMORY_CONTEXT_WINDOW_SIZE = 8192
@@ -125,7 +125,7 @@ class _MemoryItemWithId(Protocol):
 class MemoryClaimStatus(StrEnum):
     """Host 中立 memory claim 状态枚举。"""
 
-    TOOL_VERIFIED = "tool_verified"
+    EVIDENCE_BACKED = "evidence_backed"
     ASSUMPTION = "assumption"
     CANDIDATE = "candidate"
     CONFLICTED = "conflicted"
@@ -159,7 +159,7 @@ class MemoryIncludedReason(StrEnum):
     """Memory item 被纳入 snapshot 的中立原因。"""
 
     PINNED_STATE = "pinned_state"
-    TOOL_VERIFIED_FACT = "tool_verified_fact"
+    EVIDENCE_BACKED_FACT = "evidence_backed_fact"
     WORKING_ASSUMPTION = "working_assumption"
     RECENT_RAW_TURN = "recent_raw_turn"
     EPISODE_SUMMARY = "episode_summary"
@@ -366,12 +366,12 @@ class PinnedStateView:
 
 
 @dataclass(frozen=True, slots=True)
-class VerifiedFactView:
-    """Tool verified fact memory view。
+class EvidenceBackedFactView:
+    """Tool evidence-backed fact memory view。
 
     :param item_id: item 稳定 id。
     :param fact_summary: 工具事实的中立摘要。
-    :param claim_status: claim 状态，必须为 ``TOOL_VERIFIED``。
+    :param claim_status: claim 状态，必须为 ``EVIDENCE_BACKED``。
     :param provenance: 来源 provenance，producer 必须为 ``TOOL``。
     :param evidence_anchor: 可选证据 anchor opaque ref。
     :param subject_refs: 相关主体 opaque refs。
@@ -391,7 +391,7 @@ class VerifiedFactView:
     size_units: MemorySizeUnits
 
     def __post_init__(self) -> None:
-        """校验 verified fact 的 producer 与状态。
+        """校验 evidence-backed fact 的 producer 与状态。
 
         :returns: ``None``。
         :raises ValueError: id / summary 为空、claim status 非工具确认或 provenance 非 TOOL 时抛出。
@@ -399,10 +399,10 @@ class VerifiedFactView:
 
         _require_non_empty(self.item_id, "item_id")
         _require_non_empty(self.fact_summary, "fact_summary")
-        if self.claim_status is not MemoryClaimStatus.TOOL_VERIFIED:
-            raise ValueError("verified fact claim_status must be TOOL_VERIFIED")
+        if self.claim_status is not MemoryClaimStatus.EVIDENCE_BACKED:
+            raise ValueError("evidence-backed fact claim_status must be EVIDENCE_BACKED")
         if self.provenance.producer_kind is not MemoryProducerKind.TOOL:
-            raise ValueError("verified fact provenance producer must be TOOL")
+            raise ValueError("evidence-backed fact provenance producer must be TOOL")
         _validate_reason_pair(self.included_reason, self.excluded_reason)
 
 
@@ -601,7 +601,7 @@ class MemoryProjectionPolicy:
 
     :param context_window_size: Service / composition root 显式传入的上下文窗口 token 数。
     :param max_pinned_items: pinned state 最大条目数。
-    :param max_verified_facts: verified facts 最大条目数。
+    :param max_evidence_backed_facts: evidence-backed facts 最大条目数。
     :param max_working_assumptions: working assumptions 最大条目数。
     :param recent_raw_turns_floor: recent raw turns 保底条数。
     :param raw_turn_context_ratio: 单条 raw turn 尺寸占上下文窗口比例。
@@ -619,7 +619,7 @@ class MemoryProjectionPolicy:
 
     context_window_size: int
     max_pinned_items: int
-    max_verified_facts: int
+    max_evidence_backed_facts: int
     max_working_assumptions: int
     recent_raw_turns_floor: int
     raw_turn_context_ratio: float
@@ -643,7 +643,7 @@ class MemoryProjectionPolicy:
 
         _require_positive(self.context_window_size, "context_window_size")
         _require_positive(self.max_pinned_items, "max_pinned_items")
-        _require_positive(self.max_verified_facts, "max_verified_facts")
+        _require_positive(self.max_evidence_backed_facts, "max_evidence_backed_facts")
         _require_positive(
             self.max_working_assumptions, "max_working_assumptions"
         )
@@ -737,7 +737,7 @@ def default_memory_projection_policy(
     return MemoryProjectionPolicy(
         context_window_size=context_window_size,
         max_pinned_items=DEFAULT_MEMORY_MAX_PINNED_ITEMS,
-        max_verified_facts=DEFAULT_MEMORY_MAX_VERIFIED_FACTS,
+        max_evidence_backed_facts=DEFAULT_MEMORY_MAX_EVIDENCE_BACKED_FACTS,
         max_working_assumptions=DEFAULT_MEMORY_MAX_WORKING_ASSUMPTIONS,
         recent_raw_turns_floor=DEFAULT_MEMORY_RECENT_RAW_TURNS_FLOOR,
         raw_turn_context_ratio=DEFAULT_MEMORY_RAW_TURN_CONTEXT_RATIO,
@@ -765,7 +765,7 @@ class ConversationMemorySnapshot:
     :param cursor: snapshot 覆盖的 EventLog cursor。
     :param policy_digest: projection policy digest。
     :param pinned_state: pinned state view。
-    :param verified_facts: tool verified facts。
+    :param evidence_backed_facts: tool evidence-backed facts。
     :param working_assumptions: working assumptions。
     :param conversation_continuity: conversation continuity view。
     :param diagnostics: memory diagnostics。
@@ -779,7 +779,7 @@ class ConversationMemorySnapshot:
     cursor: MemorySnapshotCursor
     policy_digest: MemoryPolicyDigest
     pinned_state: PinnedStateView
-    verified_facts: tuple[VerifiedFactView, ...]
+    evidence_backed_facts: tuple[EvidenceBackedFactView, ...]
     working_assumptions: tuple[WorkingAssumptionView, ...]
     conversation_continuity: ConversationContinuityView
     diagnostics: tuple[MemoryDiagnostic, ...]
@@ -920,7 +920,7 @@ def memory_snapshot_with_cursor_and_diagnostics(
         cursor=cursor,
         policy_digest=snapshot.policy_digest,
         pinned_state=snapshot.pinned_state,
-        verified_facts=snapshot.verified_facts,
+        evidence_backed_facts=snapshot.evidence_backed_facts,
         working_assumptions=snapshot.working_assumptions,
         conversation_continuity=snapshot.conversation_continuity,
         diagnostics=_dedupe_diagnostics(snapshot.diagnostics + diagnostics),
@@ -933,7 +933,7 @@ def memory_snapshot_with_cursor_and_diagnostics(
         cursor=snapshot_without_digest.cursor,
         policy_digest=snapshot_without_digest.policy_digest,
         pinned_state=snapshot_without_digest.pinned_state,
-        verified_facts=snapshot_without_digest.verified_facts,
+        evidence_backed_facts=snapshot_without_digest.evidence_backed_facts,
         working_assumptions=snapshot_without_digest.working_assumptions,
         conversation_continuity=snapshot_without_digest.conversation_continuity,
         diagnostics=snapshot_without_digest.diagnostics,
@@ -1030,7 +1030,7 @@ def build_empty_conversation_memory_snapshot(
             user_constraints=(),
             open_questions=(),
         ),
-        verified_facts=(),
+        evidence_backed_facts=(),
         working_assumptions=(),
         conversation_continuity=ConversationContinuityView(items=()),
         diagnostics=(),
@@ -1044,7 +1044,7 @@ def build_empty_conversation_memory_snapshot(
         cursor=cursor,
         policy_digest=policy_digest,
         pinned_state=snapshot_without_digest.pinned_state,
-        verified_facts=(),
+        evidence_backed_facts=(),
         working_assumptions=(),
         conversation_continuity=snapshot_without_digest.conversation_continuity,
         diagnostics=(),
@@ -1138,16 +1138,16 @@ def project_conversation_memory_event(
         built_at=built_at,
     )
     pinned_state = base.pinned_state
-    verified_facts = base.verified_facts
+    evidence_backed_facts = base.evidence_backed_facts
     working_assumptions = base.working_assumptions
     continuity_items = base.conversation_continuity.items
     diagnostics = base.diagnostics
 
     if event.event_type == _EVENT_TYPE_TOOL_RESULT_ACCEPTED:
-        fact, fact_diagnostics = _verified_fact_from_projection_event(
+        fact, fact_diagnostics = _evidence_backed_fact_from_projection_event(
             event, policy_digest=policy_digest
         )
-        verified_facts = _replace_item_by_id(verified_facts, fact)
+        evidence_backed_facts = _replace_item_by_id(evidence_backed_facts, fact)
         diagnostics = diagnostics + fact_diagnostics
     elif event.event_type == _EVENT_TYPE_USER_INPUT_ACCEPTED:
         pinned_state = _pinned_state_with_user_input(
@@ -1162,7 +1162,7 @@ def project_conversation_memory_event(
         continuity_items = _replace_item_by_id(continuity_items, item)
     elif event.event_type == _EVENT_TYPE_CONTEXT_COMPACTED:
         validate_context_compacted_payload(event.payload)
-        _validate_compact_summary_fact_refs(event, base.verified_facts)
+        _validate_compact_summary_fact_refs(event, base.evidence_backed_facts)
         item = _compact_episode_summary_from_projection_event(event, policy=policy)
         continuity_items = _replace_item_by_id(continuity_items, item)
         pinned_state = _apply_pinned_state_patch_candidate(
@@ -1179,8 +1179,8 @@ def project_conversation_memory_event(
         )
 
     limited_pinned_state = _limit_pinned_state(pinned_state, policy)
-    limited_verified_facts, fact_budget_diagnostics = _limit_verified_facts(
-        verified_facts,
+    limited_evidence_backed_facts, fact_budget_diagnostics = _limit_evidence_backed_facts(
+        evidence_backed_facts,
         policy=policy,
         policy_digest=policy_digest,
     )
@@ -1210,7 +1210,7 @@ def project_conversation_memory_event(
         cursor=cursor,
         policy_digest=policy_digest,
         pinned_state=limited_pinned_state,
-        verified_facts=limited_verified_facts,
+        evidence_backed_facts=limited_evidence_backed_facts,
         working_assumptions=limited_assumptions,
         conversation_continuity=ConversationContinuityView(
             items=limited_continuity
@@ -1230,7 +1230,7 @@ def project_conversation_memory_event(
         cursor=snapshot_without_digest.cursor,
         policy_digest=snapshot_without_digest.policy_digest,
         pinned_state=snapshot_without_digest.pinned_state,
-        verified_facts=snapshot_without_digest.verified_facts,
+        evidence_backed_facts=snapshot_without_digest.evidence_backed_facts,
         working_assumptions=snapshot_without_digest.working_assumptions,
         conversation_continuity=snapshot_without_digest.conversation_continuity,
         diagnostics=snapshot_without_digest.diagnostics,
@@ -1309,14 +1309,14 @@ def _empty_or_valid_previous_snapshot(
     return previous_snapshot
 
 
-def _verified_fact_from_projection_event(
+def _evidence_backed_fact_from_projection_event(
     event: MemoryProjectionEvent, *, policy_digest: MemoryPolicyDigest
-) -> tuple[VerifiedFactView, tuple[MemoryDiagnostic, ...]]:
-    """从 ``TOOL_RESULT_ACCEPTED`` event 提取 verified fact。
+) -> tuple[EvidenceBackedFactView, tuple[MemoryDiagnostic, ...]]:
+    """从 ``TOOL_RESULT_ACCEPTED`` event 提取 evidence-backed fact。
 
     :param event: TOOL_RESULT_ACCEPTED projection event。
     :param policy_digest: 当前 policy digest。
-    :returns: verified fact 及可能的 fallback diagnostic。
+    :returns: evidence-backed fact 及可能的 fallback diagnostic。
     """
 
     tool_name = _optional_payload_str(event.payload, _PAYLOAD_FIELD_TOOL_NAME)
@@ -1336,7 +1336,7 @@ def _verified_fact_from_projection_event(
             payload_digest=payload_digest,
             digest_ref=digest_ref,
         )
-        item_id = _item_id(event, "verified_fact")
+        item_id = _item_id(event, "evidence_backed_fact")
         diagnostics = (
             MemoryDiagnostic(
                 diagnostic_id=_diagnostic_id(
@@ -1365,14 +1365,14 @@ def _verified_fact_from_projection_event(
         digest_ref=digest_ref,
         source_refs=_tool_source_refs(event, payload_ref=payload_ref),
     )
-    fact = VerifiedFactView(
-        item_id=_item_id(event, "verified_fact"),
+    fact = EvidenceBackedFactView(
+        item_id=_item_id(event, "evidence_backed_fact"),
         fact_summary=fact_summary,
-        claim_status=MemoryClaimStatus.TOOL_VERIFIED,
+        claim_status=MemoryClaimStatus.EVIDENCE_BACKED,
         provenance=provenance,
         evidence_anchor=_payload_evidence_anchor(payload_ref, payload_digest),
         subject_refs=(),
-        included_reason=MemoryIncludedReason.TOOL_VERIFIED_FACT,
+        included_reason=MemoryIncludedReason.EVIDENCE_BACKED_FACT,
         excluded_reason=None,
         size_units=estimate_memory_size_units(fact_summary),
     )
@@ -1789,12 +1789,12 @@ def _opaque_ref_from_text(value: str) -> OpaqueMemoryRef:
 
 def _validate_compact_summary_fact_refs(
     event: MemoryProjectionEvent,
-    verified_facts: tuple[VerifiedFactView, ...],
+    evidence_backed_facts: tuple[EvidenceBackedFactView, ...],
 ) -> None:
     """校验 summary confirmed fact refs 只引用已有工具事实。
 
     :param event: CONTEXT_COMPACTED projection event。
-    :param verified_facts: 当前 snapshot 中已有 tool verified facts。
+    :param evidence_backed_facts: 当前 snapshot 中已有 tool evidence-backed facts。
     :returns: ``None``。
     :raises ValueError: summary 引用了未知 fact ref 时抛出。
     """
@@ -1804,22 +1804,22 @@ def _validate_compact_summary_fact_refs(
         _PAYLOAD_FIELD_EPISODE_SUMMARY_CANDIDATE,
     )
     refs = _optional_text_tuple(summary, _PAYLOAD_FIELD_CONFIRMED_FACT_REFS)
-    allowed_refs = _existing_tool_fact_refs(verified_facts)
+    allowed_refs = _existing_tool_fact_refs(evidence_backed_facts)
     if not set(refs).issubset(allowed_refs):
         raise ValueError("compact summary confirmed_fact_refs must reference tool facts")
 
 
 def _existing_tool_fact_refs(
-    verified_facts: tuple[VerifiedFactView, ...],
+    evidence_backed_facts: tuple[EvidenceBackedFactView, ...],
 ) -> set[str]:
-    """汇总已有 tool verified fact refs。
+    """汇总已有 tool evidence-backed fact refs。
 
-    :param verified_facts: 当前 snapshot 的 verified facts。
+    :param evidence_backed_facts: 当前 snapshot 的 evidence-backed facts。
     :returns: 可被 compact summary 引用的 ref 集合。
     """
 
     refs: set[str] = set()
-    for fact in verified_facts:
+    for fact in evidence_backed_facts:
         refs.add(fact.item_id)
         refs.add(fact.provenance.event_id)
         if fact.provenance.tool_result_ref is not None:
@@ -1885,29 +1885,29 @@ def _limit_pinned_state(
     )
 
 
-def _limit_verified_facts(
-    items: tuple[VerifiedFactView, ...],
+def _limit_evidence_backed_facts(
+    items: tuple[EvidenceBackedFactView, ...],
     *,
     policy: MemoryProjectionPolicy,
     policy_digest: MemoryPolicyDigest,
-) -> tuple[tuple[VerifiedFactView, ...], tuple[MemoryDiagnostic, ...]]:
-    """按 policy 限制 verified facts 数量。
+) -> tuple[tuple[EvidenceBackedFactView, ...], tuple[MemoryDiagnostic, ...]]:
+    """按 policy 限制 evidence-backed facts 数量。
 
-    :param items: 原始 verified facts。
+    :param items: 原始 evidence-backed facts。
     :param policy: memory projection policy。
     :param policy_digest: memory policy digest。
     :returns: 限制后的 facts 与 budget diagnostics。
     """
 
-    if len(items) <= policy.max_verified_facts:
+    if len(items) <= policy.max_evidence_backed_facts:
         return items, ()
-    kept = items[-policy.max_verified_facts :]
+    kept = items[-policy.max_evidence_backed_facts :]
     return kept, (
         _budget_diagnostic(
             event_sequence=items[0].provenance.event_sequence,
             item_id=items[0].item_id,
             policy_digest=policy_digest,
-            message="verified facts limited by memory policy",
+            message="evidence-backed facts limited by memory policy",
         ),
     )
 
@@ -2632,7 +2632,7 @@ def memory_projection_policy_to_json_value(
         "max_delta_repair_events": policy.max_delta_repair_events,
         "max_lag_events_for_inline_delta": policy.max_lag_events_for_inline_delta,
         "max_pinned_items": policy.max_pinned_items,
-        "max_verified_facts": policy.max_verified_facts,
+        "max_evidence_backed_facts": policy.max_evidence_backed_facts,
         "max_working_assumptions": policy.max_working_assumptions,
         "raw_turn_context_ratio": policy.raw_turn_context_ratio,
         "raw_turn_size_cap": policy.raw_turn_size_cap,
@@ -2668,8 +2668,8 @@ def conversation_memory_snapshot_to_json_value(
         "session_id": snapshot.session_id,
         "snapshot_digest": snapshot.snapshot_digest,
         "snapshot_id": snapshot.snapshot_id,
-        "verified_facts": [
-            _verified_fact_to_json_value(item) for item in snapshot.verified_facts
+        "evidence_backed_facts": [
+            _evidence_backed_fact_to_json_value(item) for item in snapshot.evidence_backed_facts
         ],
         "working_assumptions": [
             _working_assumption_to_json_value(item)
@@ -2715,9 +2715,9 @@ def conversation_memory_snapshot_from_json_value(
         pinned_state=_pinned_state_from_json_value(
             _required_value(mapping, "pinned_state")
         ),
-        verified_facts=tuple(
-            _verified_fact_from_json_value(item)
-            for item in _required_list(mapping, "verified_facts")
+        evidence_backed_facts=tuple(
+            _evidence_backed_fact_from_json_value(item)
+            for item in _required_list(mapping, "evidence_backed_facts")
         ),
         working_assumptions=tuple(
             _working_assumption_from_json_value(item)
@@ -2777,8 +2777,8 @@ def _snapshot_digest_json_value(snapshot: ConversationMemorySnapshot) -> JsonVal
         "pinned_state": _pinned_state_to_json_value(snapshot.pinned_state),
         "policy_digest": snapshot.policy_digest,
         "session_id": snapshot.session_id,
-        "verified_facts": [
-            _verified_fact_to_json_value(item) for item in snapshot.verified_facts
+        "evidence_backed_facts": [
+            _evidence_backed_fact_to_json_value(item) for item in snapshot.evidence_backed_facts
         ],
         "working_assumptions": [
             _working_assumption_to_json_value(item)
@@ -2880,10 +2880,10 @@ def _pinned_state_from_json_value(value: JsonValue) -> PinnedStateView:
     )
 
 
-def _verified_fact_to_json_value(item: VerifiedFactView) -> JsonValue:
-    """把 verified fact 转换为 JSON 值。
+def _evidence_backed_fact_to_json_value(item: EvidenceBackedFactView) -> JsonValue:
+    """把 evidence-backed fact 转换为 JSON 值。
 
-    :param item: verified fact。
+    :param item: evidence-backed fact。
     :returns: JSON 值。
     """
 
@@ -2906,16 +2906,16 @@ def _verified_fact_to_json_value(item: VerifiedFactView) -> JsonValue:
     }
 
 
-def _verified_fact_from_json_value(value: JsonValue) -> VerifiedFactView:
-    """从 JSON 值恢复 verified fact。
+def _evidence_backed_fact_from_json_value(value: JsonValue) -> EvidenceBackedFactView:
+    """从 JSON 值恢复 evidence-backed fact。
 
     :param value: JSON 值。
-    :returns: verified fact。
+    :returns: evidence-backed fact。
     """
 
-    mapping = _as_mapping(value, "verified_fact")
+    mapping = _as_mapping(value, "evidence_backed_fact")
     evidence_value = _required_value(mapping, "evidence_anchor")
-    return VerifiedFactView(
+    return EvidenceBackedFactView(
         item_id=_required_str(mapping, "item_id"),
         fact_summary=_required_str(mapping, "fact_summary"),
         claim_status=MemoryClaimStatus(_required_str(mapping, "claim_status")),

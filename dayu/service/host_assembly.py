@@ -19,11 +19,10 @@ from dayu.contracts.tool_declaration import ToolDefinition
 from dayu.engine import AgentFallbackMode, AgentPolicy
 from dayu.engine.contracts.runner_spec import RunnerCallOptions, RunnerSpec
 from dayu.engine.provider_extensions import provider_request_extension_from_json
-from dayu.host import (
+from dayu.host.api import (
     CompactorRunnerBaseline,
     FollowupBehavior,
     HostCallContext,
-    HostToolingOptions,
     OpenHostOptions,
     OrdinaryRunExecutionBaseline,
     SubmitFollowupRequest,
@@ -31,6 +30,7 @@ from dayu.host import (
 from dayu.host.context_policy import default_context_budget_policy
 from dayu.host.local_proxy import DefaultLocalEngineWorkerFactory
 from dayu.host.memory import MemoryProjectionPolicy
+from dayu.host.tooling import HostToolingOptions
 from dayu.runtime.assembly import (
     AgentPolicyDefaults,
     ExecutionProfileCompatibilityDiagnostic,
@@ -850,7 +850,7 @@ def _memory_projection_policy_from_config(
     return MemoryProjectionPolicy(
         context_window_size=context_window_size,
         max_pinned_items=policy.max_pinned_items,
-        max_verified_facts=policy.max_verified_facts,
+        max_evidence_backed_facts=policy.max_evidence_backed_facts,
         max_working_assumptions=policy.max_working_assumptions,
         recent_raw_turns_floor=policy.recent_raw_turns_floor,
         raw_turn_context_ratio=policy.raw_turn_context_ratio,

@@ -82,7 +82,7 @@ from dayu.host.memory import (
     MemoryRepairRequest,
     MemorySnapshotCursor,
     OpaqueMemoryRef,
-    VerifiedFactView,
+    EvidenceBackedFactView,
     WorkingAssumptionView,
     build_inline_delta_repair_diagnostic,
     build_memory_budget_diagnostic,
@@ -1613,9 +1613,14 @@ def _memory_stable_blocks(
     subjects = _memory_subject_message(snapshot)
     if subjects is not None:
         blocks.append(_MemoryStableBlock(block_id="stable:subjects", message=subjects))
-    facts = _memory_verified_fact_message(snapshot.verified_facts)
+    facts = _memory_evidence_backed_fact_message(snapshot.evidence_backed_facts)
     if facts is not None:
-        blocks.append(_MemoryStableBlock(block_id="stable:verified_facts", message=facts))
+        blocks.append(
+            _MemoryStableBlock(
+                block_id="stable:evidence_backed_facts",
+                message=facts,
+            )
+        )
     assumptions = _memory_question_and_assumption_message(snapshot)
     if assumptions is not None:
         blocks.append(
@@ -1712,18 +1717,18 @@ def _memory_subject_message(
     )
 
 
-def _memory_verified_fact_message(
-    facts: tuple[VerifiedFactView, ...],
+def _memory_evidence_backed_fact_message(
+    facts: tuple[EvidenceBackedFactView, ...],
 ) -> SystemMessage | None:
-    """渲染 tool-verified facts memory block。
+    """渲染 evidence-backed facts memory block。
 
-    :param facts: verified fact 元组。
+    :param facts: evidence-backed fact 元组。
     :returns: system message；无内容时返回 ``None``。
     """
 
     if not facts:
         return None
-    lines = ["Memory tool-verified facts:"]
+    lines = ["Memory evidence-backed facts:"]
     for fact in facts:
         lines.append(
             "fact="

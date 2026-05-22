@@ -127,7 +127,7 @@ def _execution_profile_record() -> dict[str, JsonValue]:
         },
         "memory_projection_policy": {
             "max_pinned_items": 2,
-            "max_verified_facts": 3,
+            "max_evidence_backed_facts": 3,
             "max_working_assumptions": 4,
             "recent_raw_turns_floor": 1,
             "raw_turn_context_ratio": 0.1,
@@ -294,6 +294,10 @@ def test_default_runtime_config_files_load_as_typed_views() -> None:
     standard_256k = config.execution_profiles.execution_profiles["standard-256k"]
     assert standard_256k.context_window_class == "256k"
     assert standard_256k.min_context_window_tokens == 262144
+    assert (
+        standard_256k.memory_projection_policy.max_evidence_backed_facts
+        == 256
+    )
     assert standard_256k.agent_policy.max_iterations == 24
     assert standard_256k.agent_policy.fallback_prompt == default_fallback_prompt()
     assert (
@@ -569,6 +573,28 @@ def test_old_execution_profile_fields_fail_fast(tmp_path: Path) -> None:
     )
 
     with pytest.raises(ConfigFieldError, match="unknown fields"):
+        ConfigLoader(package_config_dir=package_root).load_execution_profiles()
+
+
+def test_old_max_verified_facts_key_fails_fast(tmp_path: Path) -> None:
+    """旧 max_verified_facts 配置 key 必须作为未知字段失败。"""
+
+    package_root = tmp_path / "package"
+    _minimal_package_config(package_root)
+    profile = _execution_profile_record()
+    memory_projection = profile["memory_projection_policy"]
+    assert isinstance(memory_projection, dict)
+    max_facts = memory_projection.pop("max_evidence_backed_facts")
+    memory_projection["max_verified_facts"] = max_facts
+    _write_json(
+        package_root / "execution_profiles.json",
+        {
+            "default_execution_profile_id": "standard-256k",
+            "execution_profiles": {"standard-256k": profile},
+        },
+    )
+
+    with pytest.raises(ConfigFieldError, match="max_evidence_backed_facts"):
         ConfigLoader(package_config_dir=package_root).load_execution_profiles()
 
 

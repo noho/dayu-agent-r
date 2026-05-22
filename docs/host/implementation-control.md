@@ -1613,6 +1613,15 @@ Plan 必须额外收口的 readiness review checklist：
   `docs/reviews/phase12-5-plan-rereview-mimo-20260522.md`、
   `docs/reviews/phase12-5-plan-rereview-ds-20260522.md`、
   `docs/reviews/phase12-5-plan-rereview-controller-adjudication-20260522.md`。Accepted plan local commit 为 `793f2c8`。
+  Slice 1 `Contract Rename And Config Schema` implementation / code review / fix / re-review 已 PASS；review artifacts 为
+  `docs/reviews/phase12-5-slice1-code-review-mimo-20260522.md`、
+  `docs/reviews/phase12-5-slice1-code-review-ds-20260522.md`、
+  `docs/reviews/phase12-5-slice1-code-review-controller-adjudication-20260522.md`、
+  `docs/reviews/phase12-5-slice1-code-rereview-mimo-20260522.md`、
+  `docs/reviews/phase12-5-slice1-code-rereview-ds-20260522.md`、
+  `docs/reviews/phase12-5-slice1-code-rereview-controller-adjudication-20260522.md`。Slice 1 validation:
+  `pytest tests/runtime/test_config_loader.py tests/service/test_host_assembly.py tests/host/test_run_input_builder.py` PASS
+  (74 passed)；targeted pyright PASS (0 errors)。
 
 目标：
 - 从买方财报分析 Agent 的第一性原理优化 Conversation Memory，使同一 session 内已由工具确认的关键财务事实能跨轮、

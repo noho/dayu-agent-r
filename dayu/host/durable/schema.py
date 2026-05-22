@@ -736,9 +736,9 @@ CREATE TABLE IF NOT EXISTS {TABLE_HOST_MEMORY_ITEMS} (
   item_id TEXT PRIMARY KEY,
   snapshot_id TEXT NOT NULL,
   session_id TEXT NOT NULL,
-  item_kind TEXT NOT NULL CHECK (
+    item_kind TEXT NOT NULL CHECK (
     item_kind IN (
-      'verified_fact',
+      'evidence_backed_fact',
       'working_assumption',
       'raw_user_turn',
       'raw_assistant_turn',
@@ -748,7 +748,7 @@ CREATE TABLE IF NOT EXISTS {TABLE_HOST_MEMORY_ITEMS} (
   ),
   claim_status TEXT NOT NULL CHECK (
     claim_status IN (
-      'tool_verified',
+      'evidence_backed',
       'assumption',
       'candidate',
       'conflicted',

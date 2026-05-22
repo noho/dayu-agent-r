@@ -46,7 +46,7 @@ from dayu.host.memory import (
     MemoryProjectionEvent,
     MemoryProducerKind,
     MemoryProjectionPolicy,
-    VerifiedFactView,
+    EvidenceBackedFactView,
     WorkingAssumptionView,
     calculate_memory_snapshot_digest,
     conversation_memory_snapshot_from_json_value,
@@ -74,7 +74,7 @@ from dayu.host.projection import (
 from dayu.host.durable.event_log import EventClass
 
 _ZERO_CURSOR_SEQUENCE = 0
-_ITEM_KIND_VERIFIED_FACT = "verified_fact"
+_ITEM_KIND_EVIDENCE_BACKED_FACT = "evidence_backed_fact"
 _ITEM_KIND_WORKING_ASSUMPTION = "working_assumption"
 _EVENT_TYPE_USER_INPUT_ACCEPTED = "USER_INPUT_ACCEPTED"
 _EVENT_TYPE_RUN_SUCCEEDED = "RUN_SUCCEEDED"
@@ -643,8 +643,8 @@ def _replace_memory_items(
         f"DELETE FROM {TABLE_HOST_MEMORY_ITEMS} WHERE snapshot_id = ?",
         (snapshot.snapshot_id,),
     )
-    for item in snapshot.verified_facts:
-        _insert_verified_fact_item(transaction, snapshot, item)
+    for item in snapshot.evidence_backed_facts:
+        _insert_evidence_backed_fact_item(transaction, snapshot, item)
     for item in snapshot.working_assumptions:
         _insert_working_assumption_item(transaction, snapshot, item)
     for item in snapshot.conversation_continuity.items:
@@ -679,16 +679,16 @@ def _replace_snapshot_diagnostics(
         )
 
 
-def _insert_verified_fact_item(
+def _insert_evidence_backed_fact_item(
     transaction: HostTransaction,
     snapshot: ConversationMemorySnapshot,
-    item: VerifiedFactView,
+    item: EvidenceBackedFactView,
 ) -> None:
-    """插入 verified fact item row。
+    """插入 evidence-backed fact item row。
 
     :param transaction: 调用方提供的 Host durable transaction。
     :param snapshot: typed memory snapshot。
-    :param item: verified fact item。
+    :param item: evidence-backed fact item。
     :returns: ``None``。
     """
 
@@ -696,28 +696,28 @@ def _insert_verified_fact_item(
         transaction,
         snapshot=snapshot,
         item_id=item.item_id,
-        item_kind=_ITEM_KIND_VERIFIED_FACT,
+        item_kind=_ITEM_KIND_EVIDENCE_BACKED_FACT,
         claim_status=item.claim_status,
         event_id=item.provenance.event_id,
         event_sequence=item.provenance.event_sequence,
         producer_kind=item.provenance.producer_kind,
         producer_name=item.provenance.producer_name,
         payload_ref=item.provenance.payload_ref,
-        payload_digest=_payload_digest_for_verified_fact(item),
-        item_json=canonical_json_dumps(_verified_fact_item_json_value(item)),
+        payload_digest=_payload_digest_for_evidence_backed_fact(item),
+        item_json=canonical_json_dumps(_evidence_backed_fact_item_json_value(item)),
         included_reason=item.included_reason,
         excluded_reason=item.excluded_reason,
     )
 
 
-def _payload_digest_for_verified_fact(item: VerifiedFactView) -> str | None:
-    """返回 verified fact item row 的 payload digest 列值。
+def _payload_digest_for_evidence_backed_fact(item: EvidenceBackedFactView) -> str | None:
+    """返回 evidence-backed fact item row 的 payload digest 列值。
 
     item row 的 ``payload_ref`` / ``payload_digest`` 列只表示 payload
     descriptor 成对索引；工具 outcome digest 等非 payload digest 保留在
     item JSON 的 provenance 中，不能写入该列破坏 schema CHECK。
 
-    :param item: verified fact item。
+    :param item: evidence-backed fact item。
     :returns: payload ref 存在时返回 payload digest 列值，否则返回 ``None``。
     """
 
@@ -1000,10 +1000,10 @@ def _validate_snapshot_digest(snapshot: ConversationMemorySnapshot) -> None:
         raise HostDurableError("memory snapshot digest mismatch")
 
 
-def _verified_fact_item_json_value(item: VerifiedFactView) -> JsonValue:
-    """生成 verified fact item table JSON。
+def _evidence_backed_fact_item_json_value(item: EvidenceBackedFactView) -> JsonValue:
+    """生成 evidence-backed fact item table JSON。
 
-    :param item: verified fact item。
+    :param item: evidence-backed fact item。
     :returns: JSON 值。
     """
 

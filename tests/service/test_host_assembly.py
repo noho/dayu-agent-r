@@ -10,8 +10,12 @@ import pytest
 
 from dayu.contracts import JsonValue
 from dayu.engine import AgentFallbackMode
-from dayu.host import FollowupBehavior, HostCallContext, OperationContext
-from dayu.host.api import AuthorizationClaim
+from dayu.host.api import (
+    AuthorizationClaim,
+    FollowupBehavior,
+    HostCallContext,
+    OperationContext,
+)
 from dayu.runtime.config_loader import ConfigLoader
 from dayu.runtime.location import resolve_runtime_locations
 from dayu.runtime.assembly import RuntimeAssemblySelectionError
@@ -95,6 +99,7 @@ def test_compose_open_host_options_uses_runtime_tuning_from_config(
     assert result.options.payload_inline_threshold_bytes == 2048
     assert result.options.worker_startup_timeout_seconds == 4.5
     assert result.options.enable_truncation_manager is True
+    assert result.options.memory_projection_policy.max_evidence_backed_facts == 256
     assert result.options.ordinary_run_baseline.runner_spec.headers[
         "Authorization"
     ] == f"Bearer {_API_KEY}"
@@ -479,7 +484,7 @@ def _write_execution_profile_overlay(
                     },
                     "memory_projection_policy": {
                         "max_pinned_items": 32,
-                        "max_verified_facts": 256,
+                        "max_evidence_backed_facts": 256,
                         "max_working_assumptions": 128,
                         "recent_raw_turns_floor": 4,
                         "raw_turn_context_ratio": 0.02,

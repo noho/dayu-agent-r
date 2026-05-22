@@ -225,7 +225,7 @@ class MemoryProjectionConfig:
     """Conversation memory projection 配置。
 
     :param max_pinned_items: pinned state 最大条目数。
-    :param max_verified_facts: verified facts 最大条目数。
+    :param max_evidence_backed_facts: evidence-backed facts 最大条目数。
     :param max_working_assumptions: working assumptions 最大条目数。
     :param recent_raw_turns_floor: recent raw turns 保底条数。
     :param raw_turn_context_ratio: 单条 raw turn 尺寸比例。
@@ -242,7 +242,7 @@ class MemoryProjectionConfig:
     """
 
     max_pinned_items: int
-    max_verified_facts: int
+    max_evidence_backed_facts: int
     max_working_assumptions: int
     recent_raw_turns_floor: int
     raw_turn_context_ratio: float
@@ -1444,7 +1444,7 @@ def _parse_memory_projection(
         allowed=frozenset(
             {
                 "max_pinned_items",
-                "max_verified_facts",
+                "max_evidence_backed_facts",
                 "max_working_assumptions",
                 "recent_raw_turns_floor",
                 "raw_turn_context_ratio",
@@ -1464,7 +1464,7 @@ def _parse_memory_projection(
     )
     return MemoryProjectionConfig(
         max_pinned_items=_require_positive_int_field(record, field_name="max_pinned_items", context=context),
-        max_verified_facts=_require_positive_int_field(record, field_name="max_verified_facts", context=context),
+        max_evidence_backed_facts=_require_positive_int_field(record, field_name="max_evidence_backed_facts", context=context),
         max_working_assumptions=_require_positive_int_field(record, field_name="max_working_assumptions", context=context),
         recent_raw_turns_floor=_require_non_negative_int_field(record, field_name="recent_raw_turns_floor", context=context),
         raw_turn_context_ratio=_require_float_field(record, field_name="raw_turn_context_ratio", context=context),

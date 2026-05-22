@@ -16,7 +16,7 @@ Dayu 是生产级买方财报分析 Agent，核心范式是“宿主强约束下
 - durable facts 可恢复，EventLog 与同事务状态索引是 Host 治理事实真源。
 - 同一 Session 内执行并发受 Host admission 约束，远端执行环境不拥有 Host 状态。
 - Engine 只执行单次 `AgentRunRequest`，不持有 Session / Run 生命周期，也不恢复旧 Agent、Runner 或 EngineWorker。
-- 工具事实必须经过 Host / ToolRuntime 治理与 accept barrier；assistant final answer 不自动成为 verified fact。
+- 工具事实必须经过 Host / ToolRuntime 治理与 accept barrier；assistant final answer 不自动成为 evidence-backed fact。
 - 财报文档存取只通过 `dayu.fins.storage` 下的仓储协议与仓储实现完成。
 
 ## 整体架构

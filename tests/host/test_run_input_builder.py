@@ -119,7 +119,7 @@ from dayu.host.memory import (
     MemorySnapshotCursor,
     OpaqueMemoryRef,
     PinnedStateView,
-    VerifiedFactView,
+    EvidenceBackedFactView,
     WorkingAssumptionView,
     build_conversation_memory_snapshot_from_events,
     calculate_memory_snapshot_digest,
@@ -506,7 +506,7 @@ def test_durable_memory_provider_uses_covered_snapshot(tmp_path: Path) -> None:
         assert contents[0] == _expected_system_content()
         assert contents[1].startswith("Memory user goals and constraints:")
         assert contents[2].startswith("Memory confirmed subjects and methodology:")
-        assert contents[3].startswith("Memory tool-verified facts:")
+        assert contents[3].startswith("Memory evidence-backed facts:")
         assert contents[4].startswith("Memory open questions and working assumptions:")
         assert contents[5] == "recent raw user"
         assert contents[6] == "recent assistant conclusion"
@@ -545,14 +545,14 @@ def test_memory_provider_applies_stable_layer_budget(tmp_path: Path) -> None:
         contents = tuple(_message_content(message) for message in request.messages)
 
         assert all(
-            not content.startswith("Memory tool-verified facts:")
+            not content.startswith("Memory evidence-backed facts:")
             for content in contents
         )
         assert "recent raw user" in contents
         assert contents[-1] == "current prompt"
         assert any(
             diagnostic.reason is MemoryDiagnosticReason.BUDGET_LIMIT_REACHED
-            and diagnostic.item_id == "stable:verified_facts"
+            and diagnostic.item_id == "stable:evidence_backed_facts"
             for diagnostic in memory_view.diagnostics
         )
 
@@ -682,7 +682,7 @@ def test_inline_delta_applies_stable_layer_budget(tmp_path: Path) -> None:
         )
         assert any(
             diagnostic.reason is MemoryDiagnosticReason.BUDGET_LIMIT_REACHED
-            and diagnostic.item_id == "stable:verified_facts"
+            and diagnostic.item_id == "stable:evidence_backed_facts"
             for diagnostic in memory_view.diagnostics
         )
 
@@ -1107,7 +1107,7 @@ def _memory_policy(
     return MemoryProjectionPolicy(
         context_window_size=8192,
         max_pinned_items=8,
-        max_verified_facts=16,
+        max_evidence_backed_facts=16,
         max_working_assumptions=8,
         recent_raw_turns_floor=2,
         raw_turn_context_ratio=0.125,
@@ -1220,11 +1220,11 @@ def _rich_memory_snapshot(
             user_constraints=("use reported currency",),
             open_questions=("what changed in margin?",),
         ),
-        verified_facts=(
-            VerifiedFactView(
+        evidence_backed_facts=(
+            EvidenceBackedFactView(
                 item_id="memory-item:verified:test",
                 fact_summary="tool verified revenue increased",
-                claim_status=MemoryClaimStatus.TOOL_VERIFIED,
+                claim_status=MemoryClaimStatus.EVIDENCE_BACKED,
                 provenance=MemoryProvenanceRef(
                     producer_kind=MemoryProducerKind.TOOL,
                     producer_name="filing.lookup",
@@ -1240,7 +1240,7 @@ def _rich_memory_snapshot(
                 ),
                 evidence_anchor=None,
                 subject_refs=(),
-                included_reason=MemoryIncludedReason.TOOL_VERIFIED_FACT,
+                included_reason=MemoryIncludedReason.EVIDENCE_BACKED_FACT,
                 excluded_reason=None,
                 size_units=MemorySizeUnits(31),
             ),
@@ -1319,7 +1319,7 @@ def _rich_memory_snapshot(
         cursor=snapshot_without_digest.cursor,
         policy_digest=snapshot_without_digest.policy_digest,
         pinned_state=snapshot_without_digest.pinned_state,
-        verified_facts=snapshot_without_digest.verified_facts,
+        evidence_backed_facts=snapshot_without_digest.evidence_backed_facts,
         working_assumptions=snapshot_without_digest.working_assumptions,
         conversation_continuity=snapshot_without_digest.conversation_continuity,
         diagnostics=snapshot_without_digest.diagnostics,
@@ -1358,7 +1358,7 @@ def _current_input_memory_snapshot(
             user_constraints=(current_prompt,),
             open_questions=(),
         ),
-        verified_facts=(),
+        evidence_backed_facts=(),
         working_assumptions=(),
         conversation_continuity=ConversationContinuityView(
             items=(
@@ -1389,7 +1389,7 @@ def _current_input_memory_snapshot(
         cursor=snapshot_without_digest.cursor,
         policy_digest=snapshot_without_digest.policy_digest,
         pinned_state=snapshot_without_digest.pinned_state,
-        verified_facts=snapshot_without_digest.verified_facts,
+        evidence_backed_facts=snapshot_without_digest.evidence_backed_facts,
         working_assumptions=snapshot_without_digest.working_assumptions,
         conversation_continuity=snapshot_without_digest.conversation_continuity,
         diagnostics=snapshot_without_digest.diagnostics,

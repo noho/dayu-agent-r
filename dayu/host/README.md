@@ -236,13 +236,13 @@ late result、terminal Run 上的结果或已取消 wait 的结果不会恢复 R
 
 ## Memory Projection
 
-Conversation Memory 是 Session-level read model，不是 Host governance truth。它只消费 committed canonical EventLog facts，维护 stable layer、history pool、verified fact、working assumption、recent raw turn、episode summary 和 projection cursor。
+Conversation Memory 是 Session-level read model，不是 Host governance truth。它只消费 committed canonical EventLog facts，维护 stable layer、history pool、evidence-backed fact、working assumption、recent raw turn、episode summary 和 projection cursor。
 
 `MemoryProjectionPolicy` 使用 `context_window_size` 加 ratio / floor / cap 模型派生 stable layer、history pool 与 raw turn 的内部 size units；调用方只表达策略比例和上下限，Host memory projection 内部负责计算 effective size units。
 
 RunInputBuilder 读取 memory snapshot 时必须带着 snapshot cursor 与 policy digest；snapshot 缺失、损坏或滞后超过策略阈值时，Host 进入 projection repair path。memory projection lag 不触发 Run 状态迁移，也不把 Run 推入 `RECOVERING`。
 
-Memory 的边界是 Host-neutral：它不导入 Engine / Fins / Service / UI，不表达财报业务字段，不让 assistant final answer 自动成为 verified fact。只有工具事实和明确 provenance 能支撑 verified fact。
+Memory 的边界是 Host-neutral：它不导入 Engine / Fins / Service / UI，不表达财报业务字段，不让 assistant final answer 自动成为 evidence-backed fact。只有工具事实和明确 provenance 能支撑 evidence-backed fact。
 
 ## Context Compaction
 
