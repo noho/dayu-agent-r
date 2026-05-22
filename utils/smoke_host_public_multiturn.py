@@ -701,7 +701,6 @@ def _print_assembly_diagnostics(
     print(
         "SMOKE ASSEMBLY policy_refs="
         f"context_budget:{diagnostics.context_budget_policy_ref},"
-        f"agent_policy_profile:{diagnostics.agent_policy_profile_id},"
         f"tool_truncation:{diagnostics.tool_truncation_policy}"
     )
     print(

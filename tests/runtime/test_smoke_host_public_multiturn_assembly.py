@@ -17,6 +17,7 @@ from dayu.runtime.tools_discovery import (
 from utils.smoke_host_public_multiturn import (
     SmokeArgs,
     _find_smoke_tool,
+    _print_assembly_diagnostics,
     _prepare_runtime_assembly,
     discover_smoke_tools,
 )
@@ -88,6 +89,31 @@ def test_runtime_assembly_uses_workspace_tool_discovery_and_typed_overrides(
     assert options.ordinary_run_baseline.runner_spec.headers["Authorization"] == (
         f"Bearer {_API_KEY}"
     )
+
+
+def test_assembly_diagnostics_output_uses_current_agent_policy_sources(
+    tmp_path: pathlib.Path,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    """assembly diagnostics 输出不再引用旧 agent policy profile 字段。
+
+    :param tmp_path: pytest 临时 workspace root。
+    :param capsys: pytest stdout 捕获 fixture。
+    :returns: ``None``。
+    :raises AssertionError: 输出仍包含旧 profile 标签或缺少当前来源摘要时抛出。
+    """
+
+    _write_smoke_tool_discovery_overlay(tmp_path)
+    assembly = _prepare_runtime_assembly(
+        _args(tmp_path),
+        env={"DEEPSEEK_API_KEY": _API_KEY},
+    )
+
+    _print_assembly_diagnostics(assembly.diagnostics)
+
+    output = capsys.readouterr().out
+    assert "agent_policy_profile" not in output
+    assert "SMOKE ASSEMBLY agent_policy_sources=" in output
 
 
 def test_find_smoke_tool_only_inspects_passed_tool_bundle() -> None:

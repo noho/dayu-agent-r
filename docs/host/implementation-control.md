@@ -564,6 +564,8 @@ Phase Map 中每个 phase 必须使用统一条目格式。模板如下：
 
 当前 gate 追加事实（Phase 12.3 Slice 4 accepted）：Accepted Slice 4 local commit hash 为 `7c32cfc`。Phase 12.3 implementation slices 已全部完成，aggregate validation / review 已 PASS。当前进入 `ready-to-open-draft-PR`；用户已授权自动进入 draft PR gate 并推进到 `draft-PR-pass`。
 
+当前 gate 追加事实（Phase 12.3 post-push pyright fix accepted）：用户报告 `utils/smoke_host_public_multiturn.py` 仍访问已删除的 `ServiceOpenHostAssemblyDiagnostics.agent_policy_profile_id`。Fix artifact 为 `docs/reviews/phase12-3-post-push-pyright-fix-codex-20260522.md`；review artifacts 为 `docs/reviews/phase12-3-post-push-pyright-fix-mimo-20260522.md` 与 `docs/reviews/phase12-3-post-push-pyright-fix-review-ds-20260522.md`，两份均 PASS，blocking finding count = 0。Controller adjudication artifact 为 `docs/reviews/phase12-3-post-push-pyright-fix-controller-adjudication-20260522.md`；Controller 本地复跑 `python -m pyright utils/smoke_host_public_multiturn.py` 0 errors，`pytest tests/runtime/test_smoke_host_public_multiturn_assembly.py -q` 4 passed，`git diff --check` clean。当前进入 accepted post-push pyright fix commit。
+
 ## Phase Map
 
 Phase 按依赖关系推进：先实现被其它阶段依赖的公共契约、runtime 基础能力、durable store、EventLog 与状态机，再连接执行路径、工具治理、projection core、memory、context governance、ordinary local multi-turn public contract freeze、recovery 与 remote。Audit、Tool Trace、Outbox 是独立 projection sinks，后置到核心治理路径稳定之后实现。Phase 0 是 Engine cleanup 前置 work unit，只阻塞 Phase 10 Context Governance，不阻塞 Phase 1-9。每个 phase 开始时仍必须先和用户讨论并细化对应 `docs/host/design.md` 章节，再生成 handoff implementation-ready plan。
