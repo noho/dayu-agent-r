@@ -1647,6 +1647,15 @@ Plan 必须额外收口的 readiness review checklist：
   `pytest tests/host/test_llm_compaction.py` PASS (14 passed)；targeted pyright PASS (0 errors)；`compaction_budget.py`
   stale helper 已删除且无导入 / 调用残留。Deferred findings：empty candidate list 与 invalid enum 的 LLM 层专项测试暂缓，底层
   constructor / contract 行为已由 Slice 3 覆盖。
+  Slice 5 `Memory Projection Materialization` implementation / code review / targeted repair / re-review 已 PASS；review artifacts
+  为 `docs/reviews/phase12-5-slice5-code-review-mimo-20260522.md`、
+  `docs/reviews/phase12-5-slice5-code-review-ds-20260522.md`、
+  `docs/reviews/phase12-5-slice5-code-rereview-mimo-20260522.md`、
+  `docs/reviews/phase12-5-slice5-code-rereview-ds-20260522.md`、
+  `docs/reviews/phase12-5-slice5-code-rereview-controller-adjudication-20260522.md`。Slice 5 validation:
+  `pytest tests/host/test_memory_projection.py` PASS (47 passed)；targeted pyright PASS (0 errors)。Deferred findings：
+  durable snapshot read path 的额外 item-kind SQL validation query 暂留为防御性 residual；future schema relaxations 必须继续保持
+  `validate_context_compacted_payload` 与 typed constructor validation 对齐。
 
 目标：
 - 从买方财报分析 Agent 的第一性原理优化 Conversation Memory，使同一 session 内已由工具确认的关键财务事实能跨轮、

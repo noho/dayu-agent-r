@@ -13,6 +13,12 @@ from enum import StrEnum
 from typing import Protocol, TypeAlias, TypeVar
 
 from dayu.contracts.json_value import JsonValue
+from dayu.host.compaction import (
+    EvidenceBackedFactCandidate,
+    EvidenceBackedFactKind,
+    MinimumPreserveItemCandidate,
+    MinimumPreserveReason,
+)
 from dayu.host.context_events import (
     CONTEXT_COMPACTED as _EVENT_TYPE_CONTEXT_COMPACTED,
     validate_context_compacted_payload,
@@ -69,6 +75,13 @@ _PAYLOAD_FIELD_DISPLAY_TEXT = "display_text"
 _PAYLOAD_FIELD_SUMMARY_TEXT = "summary_text"
 _PAYLOAD_FIELD_EPISODE_SUMMARY_CANDIDATE = "episode_summary_candidate"
 _PAYLOAD_FIELD_PINNED_STATE_PATCH_CANDIDATE = "pinned_state_patch_candidate"
+_PAYLOAD_FIELD_EVIDENCE_BACKED_FACT_CANDIDATES = (
+    "evidence_backed_fact_candidates"
+)
+_PAYLOAD_FIELD_MINIMUM_PRESERVE_ITEM_CANDIDATES = (
+    "minimum_preserve_item_candidates"
+)
+_PAYLOAD_FIELD_COMPACT_ARTIFACT_REF = "compact_artifact_ref"
 _PAYLOAD_FIELD_EPISODE_TITLE = "episode_title"
 _PAYLOAD_FIELD_TITLE = "title"
 _PAYLOAD_FIELD_GOAL = "goal"
@@ -84,29 +97,26 @@ _PAYLOAD_FIELD_VALUE = "value"
 _PAYLOAD_FIELD_REF_KIND = "ref_kind"
 _PAYLOAD_FIELD_REF_ID = "ref_id"
 _PAYLOAD_FIELD_DIGEST = "digest"
-_PAYLOAD_FIELD_FACT_SUMMARY = "fact_summary"
-_PAYLOAD_FIELD_RESULT_SUMMARY = "result_summary"
 _PAYLOAD_FIELD_SUMMARY = "summary"
-_PAYLOAD_FIELD_RESULT = "result"
-_PAYLOAD_FIELD_TOOL_NAME = "tool_name"
-_PAYLOAD_FIELD_TOOL_CALL_ID = "tool_call_id"
-_PAYLOAD_FIELD_TOOL_IDENTITY_DIGEST = "tool_identity_digest"
-_PAYLOAD_FIELD_OUTCOME_DIGEST = "outcome_digest"
-_PAYLOAD_FIELD_TOOL_CALL_REQUESTED_EVENT_REF = "tool_call_requested_event_ref"
 _PAYLOAD_FIELD_PAYLOAD_REF = "payload_ref"
 _PAYLOAD_FIELD_PAYLOAD_DIGEST = "payload_digest"
-_PAYLOAD_FIELD_SOURCE_REFS = "source_refs"
-_PAYLOAD_FIELD_EVENT_ID = "event_id"
 _PAYLOAD_FIELD_RUN_ID = "run_id"
 _PAYLOAD_FIELD_ATTEMPT_ID = "attempt_id"
 _PAYLOAD_FIELD_EXECUTION_ID = "execution_id"
-_PAYLOAD_REF_PREFIX = "payload:"
-_TOOL_CALL_REF_PREFIX = "tool_call:"
+_PAYLOAD_FIELD_CANDIDATE_ID = "candidate_id"
+_PAYLOAD_FIELD_CLAIM_TEXT = "claim_text"
+_PAYLOAD_FIELD_EVIDENCE_KIND = "evidence_kind"
+_PAYLOAD_FIELD_EVIDENCE_REFS = "evidence_refs"
+_PAYLOAD_FIELD_ATTRIBUTES = "attributes"
+_PAYLOAD_FIELD_ITEM_ID = "item_id"
+_PAYLOAD_FIELD_LABEL = "label"
+_PAYLOAD_FIELD_TEXT = "text"
+_PAYLOAD_FIELD_SOURCE_REFS = "source_refs"
+_PAYLOAD_FIELD_PRESERVE_REASON = "preserve_reason"
 _EVENT_REF_PREFIX = "event:"
 _SNAPSHOT_ID_DIGEST_PREFIX = "memory-snapshot-"
 _ITEM_ID_PREFIX = "memory-item"
 _DIAGNOSTIC_ID_PREFIX = "memory-diagnostic"
-_UNKNOWN_TOOL_PRODUCER_NAME = "unknown_tool"
 
 
 class _MemoryItemWithId(Protocol):
@@ -160,6 +170,7 @@ class MemoryIncludedReason(StrEnum):
 
     PINNED_STATE = "pinned_state"
     EVIDENCE_BACKED_FACT = "evidence_backed_fact"
+    MINIMUM_PRESERVE_ITEM = "minimum_preserve_item"
     WORKING_ASSUMPTION = "working_assumption"
     RECENT_RAW_TURN = "recent_raw_turn"
     EPISODE_SUMMARY = "episode_summary"
@@ -182,12 +193,15 @@ class ConversationContinuityKind(StrEnum):
     RAW_ASSISTANT_TURN = "raw_assistant_turn"
     ASSISTANT_CONCLUSION = "assistant_conclusion"
     EPISODE_SUMMARY = "episode_summary"
+    MINIMUM_PRESERVE_ITEM = "minimum_preserve_item"
 
 
 class MemoryDiagnosticReason(StrEnum):
     """Memory diagnostic 的结构化原因。"""
 
-    MISSING_FACT_SUMMARY_FALLBACK = "missing_fact_summary_fallback"
+    EVIDENCE_BACKED_FACT_CANDIDATE_INVALID = (
+        "evidence_backed_fact_candidate_invalid"
+    )
     INLINE_DELTA_REPAIR_INCLUDED = "inline_delta_repair_included"
     SNAPSHOT_MISSING = "snapshot_missing"
     SNAPSHOT_DAMAGED = "snapshot_damaged"
@@ -367,42 +381,58 @@ class PinnedStateView:
 
 @dataclass(frozen=True, slots=True)
 class EvidenceBackedFactView:
-    """Tool evidence-backed fact memory view。
+    """Evidence-backed fact memory view。
 
     :param item_id: item 稳定 id。
-    :param fact_summary: 工具事实的中立摘要。
-    :param claim_status: claim 状态，必须为 ``EVIDENCE_BACKED``。
-    :param provenance: 来源 provenance，producer 必须为 ``TOOL``。
-    :param evidence_anchor: 可选证据 anchor opaque ref。
-    :param subject_refs: 相关主体 opaque refs。
+    :param claim_text: 绑定 accepted evidence 的事实声明文本。
+    :param evidence_kind: 事实声明的 Host-neutral 类型。
+    :param evidence_refs: 支撑该声明的 accepted evidence refs。
+    :param attributes: Host 不解释的 JSON attributes。
+    :param provenance: 来源 provenance，必须指向 accepted ``CONTEXT_COMPACTED``。
+    :param extraction_operation_ref: Host 可信 extraction operation ref。
+    :param compact_artifact_ref: 可选 compact artifact ref。
+    :param candidate_id: candidate-local 诊断 id，不是权威 provenance。
     :param included_reason: 可选纳入原因。
     :param excluded_reason: 可选排除原因。
     :param size_units: 统一尺寸单位。
     """
 
     item_id: str
-    fact_summary: str
-    claim_status: MemoryClaimStatus
+    claim_text: str
+    evidence_kind: EvidenceBackedFactKind
+    evidence_refs: tuple[str, ...]
+    attributes: Mapping[str, JsonValue]
     provenance: MemoryProvenanceRef
-    evidence_anchor: OpaqueMemoryRef | None
-    subject_refs: tuple[OpaqueMemoryRef, ...]
+    extraction_operation_ref: str
+    compact_artifact_ref: str | None
+    candidate_id: str
     included_reason: MemoryIncludedReason | None
     excluded_reason: MemoryExcludedReason | None
     size_units: MemorySizeUnits
 
     def __post_init__(self) -> None:
-        """校验 evidence-backed fact 的 producer 与状态。
+        """校验 evidence-backed fact 的 compact provenance 与证据引用。
 
         :returns: ``None``。
-        :raises ValueError: id / summary 为空、claim status 非工具确认或 provenance 非 TOOL 时抛出。
+        :raises ValueError: id / claim / refs / provenance 非法时抛出。
         """
 
         _require_non_empty(self.item_id, "item_id")
-        _require_non_empty(self.fact_summary, "fact_summary")
-        if self.claim_status is not MemoryClaimStatus.EVIDENCE_BACKED:
-            raise ValueError("evidence-backed fact claim_status must be EVIDENCE_BACKED")
-        if self.provenance.producer_kind is not MemoryProducerKind.TOOL:
-            raise ValueError("evidence-backed fact provenance producer must be TOOL")
+        _require_non_empty(self.claim_text, "claim_text")
+        if not isinstance(self.evidence_kind, EvidenceBackedFactKind):
+            raise ValueError("evidence_kind must be EvidenceBackedFactKind")
+        if len(self.evidence_refs) == 0:
+            raise ValueError("evidence_refs must be non-empty")
+        _require_non_empty_items(self.evidence_refs, "evidence_refs")
+        if not isinstance(self.attributes, Mapping):
+            raise ValueError("attributes must be JSON mapping")
+        if self.provenance.producer_kind is not MemoryProducerKind.HOST_PROJECTION:
+            raise ValueError(
+                "evidence-backed fact provenance producer must be HOST_PROJECTION"
+            )
+        _require_non_empty(self.extraction_operation_ref, "extraction_operation_ref")
+        _require_optional_non_empty(self.compact_artifact_ref, "compact_artifact_ref")
+        _require_non_empty(self.candidate_id, "candidate_id")
         _validate_reason_pair(self.included_reason, self.excluded_reason)
 
 
@@ -467,6 +497,9 @@ class ConversationContinuityItem:
     :param event_sequence: 来源 EventLog sequence。
     :param run_id: 可选 run id。
     :param summary_text: 可选连续性摘要。
+    :param label: 可选短标签。
+    :param source_refs: continuity 来源 refs。
+    :param preserve_reason: minimum preserve 保留原因。
     :param payload_ref: 可选 payload descriptor ref。
     :param payload_digest: 可选 payload digest。
     :param included_reason: 可选纳入原因。
@@ -482,6 +515,9 @@ class ConversationContinuityItem:
     event_sequence: int
     run_id: str | None
     summary_text: str | None
+    label: str | None
+    source_refs: tuple[str, ...]
+    preserve_reason: MinimumPreserveReason | None
     payload_ref: HostPayloadRef | None
     payload_digest: str | None
     included_reason: MemoryIncludedReason | None
@@ -505,6 +541,13 @@ class ConversationContinuityItem:
         _require_non_empty(self.event_id, "event_id")
         _require_optional_non_empty(self.run_id, "run_id")
         _require_optional_non_empty(self.summary_text, "summary_text")
+        _require_optional_non_empty(self.label, "label")
+        _require_non_empty_items(self.source_refs, "source_refs")
+        if (
+            self.preserve_reason is not None
+            and not isinstance(self.preserve_reason, MinimumPreserveReason)
+        ):
+            raise ValueError("preserve_reason must be MinimumPreserveReason")
         _require_optional_non_empty(self.payload_ref, "payload_ref")
         _require_optional_non_empty(self.payload_digest, "payload_digest")
         if self.event_sequence <= _MIN_SEQUENCE:
@@ -1160,10 +1203,34 @@ def project_conversation_memory_event(
         item = _assistant_conclusion_from_projection_event(event, policy=policy)
         continuity_items = _replace_item_by_id(continuity_items, item)
     elif event.event_type == _EVENT_TYPE_CONTEXT_COMPACTED:
-        validate_context_compacted_payload(event.payload)
-        _validate_compact_summary_fact_refs(event, base.evidence_backed_facts)
+        candidate_diagnostics, fact_candidates_valid = (
+            _validate_compacted_payload_for_memory_projection(
+                event,
+                policy_digest=policy_digest,
+            )
+        )
+        diagnostics = diagnostics + candidate_diagnostics
+        materialized_facts: tuple[EvidenceBackedFactView, ...] = ()
+        if fact_candidates_valid:
+            materialized_facts = _evidence_backed_facts_from_compacted_event(event)
+            for fact in materialized_facts:
+                evidence_backed_facts = _replace_item_by_id(
+                    evidence_backed_facts, fact
+                )
+        _validate_compact_summary_fact_refs(
+            event,
+            base.evidence_backed_facts,
+            materialized_facts,
+        )
         item = _compact_episode_summary_from_projection_event(event, policy=policy)
         continuity_items = _replace_item_by_id(continuity_items, item)
+        for preserve_item in _minimum_preserve_items_from_compacted_event(
+            event,
+            policy=policy,
+        ):
+            continuity_items = _replace_item_by_id(
+                continuity_items, preserve_item
+            )
         pinned_state = _apply_pinned_state_patch_candidate(
             pinned_state,
             event,
@@ -1308,74 +1375,200 @@ def _empty_or_valid_previous_snapshot(
     return previous_snapshot
 
 
-def _evidence_backed_fact_from_projection_event(
+def _validate_compacted_payload_for_memory_projection(
     event: MemoryProjectionEvent, *, policy_digest: MemoryPolicyDigest
-) -> tuple[EvidenceBackedFactView, tuple[MemoryDiagnostic, ...]]:
-    """从 ``TOOL_RESULT_ACCEPTED`` event 提取 evidence-backed fact。
+) -> tuple[tuple[MemoryDiagnostic, ...], bool]:
+    """校验 compact payload，并把 fact candidate 局部错误降级为 diagnostic。
 
-    :param event: TOOL_RESULT_ACCEPTED projection event。
+    :param event: CONTEXT_COMPACTED projection event。
     :param policy_digest: 当前 policy digest。
-    :returns: evidence-backed fact 及可能的 fallback diagnostic。
+    :returns: diagnostic tuple 与 fact candidate 是否可物化。
+    :raises ValueError: 非 fact candidate 字段不满足 accepted compact payload contract 时抛出。
     """
 
-    tool_name = _optional_payload_str(event.payload, _PAYLOAD_FIELD_TOOL_NAME)
-    if tool_name is None:
-        tool_name = _UNKNOWN_TOOL_PRODUCER_NAME
-    fact_summary = _tool_fact_summary(event.payload)
-    diagnostics: tuple[MemoryDiagnostic, ...] = ()
-    payload_ref, payload_digest = _payload_ref_pair_from_event(event)
-    digest_ref = _tool_fact_digest_ref(event, payload_digest=payload_digest)
-    if fact_summary is None:
-        fact_summary = _neutral_tool_fact_fallback(
-            tool_name=tool_name,
-            outcome_digest=_optional_payload_str(
-                event.payload, _PAYLOAD_FIELD_OUTCOME_DIGEST
-            ),
-            payload_ref=payload_ref,
-            payload_digest=payload_digest,
-            digest_ref=digest_ref,
-        )
-        item_id = _item_id(event, "evidence_backed_fact")
-        diagnostics = (
-            MemoryDiagnostic(
-                diagnostic_id=_diagnostic_id(
-                    MemoryDiagnosticReason.MISSING_FACT_SUMMARY_FALLBACK,
+    try:
+        validate_context_compacted_payload(event.payload)
+        return (), True
+    except ValueError as exc:
+        patched_payload = dict(event.payload)
+        patched_payload[_PAYLOAD_FIELD_EVIDENCE_BACKED_FACT_CANDIDATES] = []
+        try:
+            validate_context_compacted_payload(patched_payload)
+        except ValueError as non_fact_exc:
+            raise non_fact_exc from exc
+        item_id = _item_id(event, "evidence_backed_fact_candidates")
+        return (
+            (
+                MemoryDiagnostic(
+                    diagnostic_id=_diagnostic_id(
+                        MemoryDiagnosticReason.EVIDENCE_BACKED_FACT_CANDIDATE_INVALID,
+                        event_sequence=event.event_sequence,
+                        item_id=item_id,
+                    ),
+                    reason=(
+                        MemoryDiagnosticReason.EVIDENCE_BACKED_FACT_CANDIDATE_INVALID
+                    ),
+                    message=(
+                        "evidence-backed fact candidates invalid; "
+                        f"no facts materialized: {exc}"
+                    ),
                     event_sequence=event.event_sequence,
                     item_id=item_id,
+                    policy_digest=policy_digest,
+                    recorded_at=None,
                 ),
-                reason=MemoryDiagnosticReason.MISSING_FACT_SUMMARY_FALLBACK,
-                message="tool result fact summary missing; neutral fallback used",
-                event_sequence=event.event_sequence,
-                item_id=item_id,
-                policy_digest=policy_digest,
-                recorded_at=None,
             ),
+            False,
         )
+
+
+def _evidence_backed_facts_from_compacted_event(
+    event: MemoryProjectionEvent,
+) -> tuple[EvidenceBackedFactView, ...]:
+    """从 accepted ``CONTEXT_COMPACTED`` fact candidates 物化 stable facts。
+
+    :param event: CONTEXT_COMPACTED projection event。
+    :returns: evidence-backed facts。
+    :raises ValueError: candidate JSON 结构非法时抛出。
+    """
+
+    payload_ref, payload_digest = _payload_ref_pair_from_event(event)
     provenance = MemoryProvenanceRef(
-        producer_kind=MemoryProducerKind.TOOL,
-        producer_name=tool_name,
+        producer_kind=MemoryProducerKind.HOST_PROJECTION,
+        producer_name=_PRODUCER_NAME_HOST_PROJECTION,
         event_id=event.event_id,
         event_sequence=event.event_sequence,
-        run_id=_event_or_payload_str(event, _PAYLOAD_FIELD_RUN_ID),
-        attempt_id=_event_or_payload_str(event, _PAYLOAD_FIELD_ATTEMPT_ID),
-        execution_id=_event_or_payload_str(event, _PAYLOAD_FIELD_EXECUTION_ID),
-        tool_result_ref=event.event_id,
+        run_id=event.run_id,
+        attempt_id=event.attempt_id,
+        execution_id=event.execution_id,
+        tool_result_ref=None,
         payload_ref=payload_ref,
-        digest_ref=digest_ref,
-        source_refs=_tool_source_refs(event, payload_ref=payload_ref),
+        digest_ref=_compact_event_digest_ref(event, payload_digest=payload_digest),
+        source_refs=(),
     )
-    fact = EvidenceBackedFactView(
-        item_id=_item_id(event, "evidence_backed_fact"),
-        fact_summary=fact_summary,
-        claim_status=MemoryClaimStatus.EVIDENCE_BACKED,
-        provenance=provenance,
-        evidence_anchor=_payload_evidence_anchor(payload_ref, payload_digest),
-        subject_refs=(),
-        included_reason=MemoryIncludedReason.EVIDENCE_BACKED_FACT,
-        excluded_reason=None,
-        size_units=estimate_memory_size_units(fact_summary),
+    compact_artifact_ref = _optional_payload_str(
+        event.payload,
+        _PAYLOAD_FIELD_COMPACT_ARTIFACT_REF,
     )
-    return fact, diagnostics
+    facts: list[EvidenceBackedFactView] = []
+    for candidate in _required_mapping_list(
+        event.payload,
+        _PAYLOAD_FIELD_EVIDENCE_BACKED_FACT_CANDIDATES,
+    ):
+        fact_candidate = EvidenceBackedFactCandidate(
+            candidate_id=_required_str(candidate, _PAYLOAD_FIELD_CANDIDATE_ID),
+            claim_text=_required_str(candidate, _PAYLOAD_FIELD_CLAIM_TEXT),
+            evidence_kind=EvidenceBackedFactKind(
+                _required_str(candidate, _PAYLOAD_FIELD_EVIDENCE_KIND)
+            ),
+            evidence_refs=tuple(
+                _as_str(item, _PAYLOAD_FIELD_EVIDENCE_REFS)
+                for item in _required_list(
+                    candidate,
+                    _PAYLOAD_FIELD_EVIDENCE_REFS,
+                )
+            ),
+            attributes=_as_mapping(
+                _required_value(candidate, _PAYLOAD_FIELD_ATTRIBUTES),
+                _PAYLOAD_FIELD_ATTRIBUTES,
+            ),
+        )
+        facts.append(
+            EvidenceBackedFactView(
+                item_id=_item_id(
+                    event,
+                    f"evidence_backed_fact:{fact_candidate.candidate_id}",
+                ),
+                claim_text=fact_candidate.claim_text,
+                evidence_kind=fact_candidate.evidence_kind,
+                evidence_refs=fact_candidate.evidence_refs,
+                attributes=fact_candidate.attributes,
+                provenance=provenance,
+                extraction_operation_ref=f"{_EVENT_REF_PREFIX}{event.event_id}",
+                compact_artifact_ref=compact_artifact_ref,
+                candidate_id=fact_candidate.candidate_id,
+                included_reason=MemoryIncludedReason.EVIDENCE_BACKED_FACT,
+                excluded_reason=None,
+                size_units=estimate_memory_size_units(fact_candidate.claim_text),
+            )
+        )
+    return tuple(facts)
+
+
+def _minimum_preserve_items_from_compacted_event(
+    event: MemoryProjectionEvent, *, policy: MemoryProjectionPolicy
+) -> tuple[ConversationContinuityItem, ...]:
+    """从 accepted ``CONTEXT_COMPACTED`` minimum preserve candidates 物化 continuity。
+
+    :param event: CONTEXT_COMPACTED projection event。
+    :param policy: memory projection policy。
+    :returns: minimum preserve continuity items。
+    :raises ValueError: candidate JSON 结构非法时抛出。
+    """
+
+    items: list[ConversationContinuityItem] = []
+    for candidate in _required_mapping_list(
+        event.payload,
+        _PAYLOAD_FIELD_MINIMUM_PRESERVE_ITEM_CANDIDATES,
+    ):
+        preserve_candidate = MinimumPreserveItemCandidate(
+            item_id=_required_str(candidate, _PAYLOAD_FIELD_ITEM_ID),
+            label=_required_str(candidate, _PAYLOAD_FIELD_LABEL),
+            text=_required_str(candidate, _PAYLOAD_FIELD_TEXT),
+            source_refs=tuple(
+                _as_str(item, _PAYLOAD_FIELD_SOURCE_REFS)
+                for item in _required_list(candidate, _PAYLOAD_FIELD_SOURCE_REFS)
+            ),
+            preserve_reason=MinimumPreserveReason(
+                _required_str(candidate, _PAYLOAD_FIELD_PRESERVE_REASON)
+            ),
+        )
+        text = _bounded_patch_text(
+            preserve_candidate.text,
+            event=event,
+            policy=policy,
+        )
+        items.append(
+            ConversationContinuityItem(
+                item_id=_item_id(
+                    event,
+                    f"minimum_preserve_item:{preserve_candidate.item_id}",
+                ),
+                item_kind=ConversationContinuityKind.MINIMUM_PRESERVE_ITEM,
+                producer_kind=MemoryProducerKind.HOST_PROJECTION,
+                claim_status=MemoryClaimStatus.ASSUMPTION,
+                event_id=event.event_id,
+                event_sequence=event.event_sequence,
+                run_id=event.run_id,
+                summary_text=text,
+                label=preserve_candidate.label,
+                source_refs=preserve_candidate.source_refs,
+                preserve_reason=preserve_candidate.preserve_reason,
+                payload_ref=None,
+                payload_digest=None,
+                included_reason=MemoryIncludedReason.MINIMUM_PRESERVE_ITEM,
+                excluded_reason=None,
+                size_units=estimate_memory_size_units(text),
+            )
+        )
+    return tuple(items)
+
+
+def _compact_event_digest_ref(
+    event: MemoryProjectionEvent, *, payload_digest: str | None
+) -> MemoryDigestRef:
+    """选择 compact extraction provenance digest ref。
+
+    :param event: CONTEXT_COMPACTED projection event。
+    :param payload_digest: 已解析 payload digest。
+    :returns: 非空 digest ref。
+    """
+
+    if event.payload_digest is not None:
+        return event.payload_digest
+    if payload_digest is not None:
+        return payload_digest
+    return sha256_digest_json(event.payload)
 
 
 def _raw_user_turn_from_projection_event(
@@ -1397,6 +1590,9 @@ def _raw_user_turn_from_projection_event(
         event_sequence=event.event_sequence,
         run_id=event.run_id,
         summary_text=summary_text,
+        label=None,
+        source_refs=(),
+        preserve_reason=None,
         payload_ref=None,
         payload_digest=None,
         included_reason=MemoryIncludedReason.RECENT_RAW_TURN,
@@ -1439,6 +1635,9 @@ def _assistant_conclusion_from_projection_event(
         event_sequence=event.event_sequence,
         run_id=event.run_id,
         summary_text=summary_text,
+        label=None,
+        source_refs=(),
+        preserve_reason=None,
         payload_ref=payload_ref,
         payload_digest=payload_digest,
         included_reason=MemoryIncludedReason.RECENT_RAW_TURN,
@@ -1477,6 +1676,9 @@ def _compact_episode_summary_from_projection_event(
         event_sequence=event.event_sequence,
         run_id=event.run_id,
         summary_text=summary_text,
+        label=None,
+        source_refs=(),
+        preserve_reason=None,
         payload_ref=None,
         payload_digest=None,
         included_reason=MemoryIncludedReason.EPISODE_SUMMARY,
@@ -1789,11 +1991,13 @@ def _opaque_ref_from_text(value: str) -> OpaqueMemoryRef:
 def _validate_compact_summary_fact_refs(
     event: MemoryProjectionEvent,
     evidence_backed_facts: tuple[EvidenceBackedFactView, ...],
+    materialized_facts: tuple[EvidenceBackedFactView, ...],
 ) -> None:
-    """校验 summary confirmed fact refs 只引用已有工具事实。
+    """校验 summary confirmed fact refs 只引用已物化 evidence-backed facts。
 
     :param event: CONTEXT_COMPACTED projection event。
-    :param evidence_backed_facts: 当前 snapshot 中已有 tool evidence-backed facts。
+    :param evidence_backed_facts: 当前 snapshot 中已有 evidence-backed facts。
+    :param materialized_facts: 当前 compact event 新物化的 evidence-backed facts。
     :returns: ``None``。
     :raises ValueError: summary 引用了未知 fact ref 时抛出。
     """
@@ -1803,15 +2007,19 @@ def _validate_compact_summary_fact_refs(
         _PAYLOAD_FIELD_EPISODE_SUMMARY_CANDIDATE,
     )
     refs = _optional_text_tuple(summary, _PAYLOAD_FIELD_CONFIRMED_FACT_REFS)
-    allowed_refs = _existing_tool_fact_refs(evidence_backed_facts)
+    allowed_refs = _existing_evidence_backed_fact_refs(
+        evidence_backed_facts + materialized_facts
+    )
     if not set(refs).issubset(allowed_refs):
-        raise ValueError("compact summary confirmed_fact_refs must reference tool facts")
+        raise ValueError(
+            "compact summary confirmed_fact_refs must reference evidence-backed facts"
+        )
 
 
-def _existing_tool_fact_refs(
+def _existing_evidence_backed_fact_refs(
     evidence_backed_facts: tuple[EvidenceBackedFactView, ...],
 ) -> set[str]:
-    """汇总已有 tool evidence-backed fact refs。
+    """汇总已有 evidence-backed fact refs。
 
     :param evidence_backed_facts: 当前 snapshot 的 evidence-backed facts。
     :returns: 可被 compact summary 引用的 ref 集合。
@@ -1820,9 +2028,10 @@ def _existing_tool_fact_refs(
     refs: set[str] = set()
     for fact in evidence_backed_facts:
         refs.add(fact.item_id)
+        refs.add(fact.candidate_id)
         refs.add(fact.provenance.event_id)
-        if fact.provenance.tool_result_ref is not None:
-            refs.add(fact.provenance.tool_result_ref)
+        for evidence_ref in fact.evidence_refs:
+            refs.add(evidence_ref)
         if fact.provenance.payload_ref is not None:
             refs.add(fact.provenance.payload_ref)
     return refs
@@ -2040,172 +2249,6 @@ def _dedupe_diagnostics(
     return tuple(result)
 
 
-def _tool_fact_summary(payload: Mapping[str, JsonValue]) -> str | None:
-    """按安全字段优先级读取工具事实摘要。
-
-    :param payload: TOOL_RESULT_ACCEPTED payload。
-    :returns: 摘要文本或 ``None``。
-    """
-
-    for field_name in (
-        _PAYLOAD_FIELD_FACT_SUMMARY,
-        _PAYLOAD_FIELD_SUMMARY_TEXT,
-        _PAYLOAD_FIELD_RESULT_SUMMARY,
-        _PAYLOAD_FIELD_DISPLAY_TEXT,
-        _PAYLOAD_FIELD_SUMMARY,
-    ):
-        value = _optional_payload_str(payload, field_name)
-        if value is not None:
-            return value
-    result = _optional_payload_mapping(payload, _PAYLOAD_FIELD_RESULT)
-    if result is None:
-        return None
-    for field_name in (
-        _PAYLOAD_FIELD_FACT_SUMMARY,
-        _PAYLOAD_FIELD_SUMMARY_TEXT,
-        _PAYLOAD_FIELD_RESULT_SUMMARY,
-        _PAYLOAD_FIELD_DISPLAY_TEXT,
-        _PAYLOAD_FIELD_SUMMARY,
-    ):
-        value = _optional_payload_str(result, field_name)
-        if value is not None:
-            return value
-    return None
-
-
-def _tool_fact_digest_ref(
-    event: MemoryProjectionEvent, *, payload_digest: str | None
-) -> MemoryDigestRef:
-    """选择工具事实 digest ref。
-
-    :param event: TOOL_RESULT_ACCEPTED projection event。
-    :param payload_digest: 已解析 payload digest。
-    :returns: 非空 digest ref。
-    """
-
-    for candidate in (
-        event.payload_digest,
-        payload_digest,
-        _optional_payload_str(event.payload, _PAYLOAD_FIELD_PAYLOAD_DIGEST),
-        _optional_payload_str(event.payload, _PAYLOAD_FIELD_OUTCOME_DIGEST),
-    ):
-        if candidate is not None:
-            return candidate
-    return sha256_digest_json(event.payload)
-
-
-def _neutral_tool_fact_fallback(
-    *,
-    tool_name: str,
-    outcome_digest: str | None,
-    payload_ref: str | None,
-    payload_digest: str | None,
-    digest_ref: str,
-) -> str:
-    """构造不含业务结论的工具事实 fallback 摘要。
-
-    :param tool_name: 工具名。
-    :param outcome_digest: 可选 outcome digest。
-    :param payload_ref: 可选 payload ref。
-    :param payload_digest: 可选 payload digest。
-    :param digest_ref: 最终 digest ref。
-    :returns: 中立 fallback 摘要。
-    """
-
-    parts = [f"tool_name={tool_name}"]
-    if outcome_digest is not None:
-        parts.append(f"outcome_digest={outcome_digest}")
-    if payload_ref is not None:
-        parts.append(f"payload_ref={payload_ref}")
-    if payload_digest is not None:
-        parts.append(f"payload_digest={payload_digest}")
-    parts.append(f"digest_ref={digest_ref}")
-    return "; ".join(parts)
-
-
-def _tool_source_refs(
-    event: MemoryProjectionEvent, *, payload_ref: str | None
-) -> tuple[OpaqueMemoryRef, ...]:
-    """从工具 payload 提取 Host 中立 source refs。
-
-    :param event: TOOL_RESULT_ACCEPTED projection event。
-    :param payload_ref: 已解析 payload ref。
-    :returns: opaque source refs。
-    """
-
-    refs: list[OpaqueMemoryRef] = []
-    for ref in _explicit_source_refs(event.payload):
-        refs.append(ref)
-    tool_call_id = _optional_payload_str(event.payload, _PAYLOAD_FIELD_TOOL_CALL_ID)
-    if tool_call_id is not None:
-        refs.append(
-            OpaqueMemoryRef(
-                ref_kind=HostNeutralRefKind.EXTERNAL,
-                ref_id=f"{_TOOL_CALL_REF_PREFIX}{tool_call_id}",
-                digest=_optional_payload_str(
-                    event.payload, _PAYLOAD_FIELD_TOOL_IDENTITY_DIGEST
-                ),
-            )
-        )
-    requested_ref = _optional_payload_mapping(
-        event.payload, _PAYLOAD_FIELD_TOOL_CALL_REQUESTED_EVENT_REF
-    )
-    requested_event_id = (
-        None
-        if requested_ref is None
-        else _optional_payload_str(requested_ref, _PAYLOAD_FIELD_EVENT_ID)
-    )
-    if requested_event_id is not None:
-        refs.append(
-            OpaqueMemoryRef(
-                ref_kind=HostNeutralRefKind.SOURCE,
-                ref_id=f"{_EVENT_REF_PREFIX}{requested_event_id}",
-            )
-        )
-    if payload_ref is not None:
-        refs.append(
-            OpaqueMemoryRef(
-                ref_kind=HostNeutralRefKind.PAYLOAD,
-                ref_id=f"{_PAYLOAD_REF_PREFIX}{payload_ref}",
-                digest=_payload_ref_pair_from_event(event)[1],
-            )
-        )
-    return tuple(refs)
-
-
-def _explicit_source_refs(
-    payload: Mapping[str, JsonValue],
-) -> tuple[OpaqueMemoryRef, ...]:
-    """读取 payload 中显式携带的 opaque source refs。
-
-    :param payload: JSON payload。
-    :returns: 可识别的 opaque refs。
-    """
-
-    value = payload.get(_PAYLOAD_FIELD_SOURCE_REFS)
-    if not isinstance(value, list):
-        return ()
-    refs: list[OpaqueMemoryRef] = []
-    for item in value:
-        if not isinstance(item, Mapping):
-            continue
-        ref_kind_text = _optional_payload_str(item, _PAYLOAD_FIELD_REF_KIND)
-        ref_id = _optional_payload_str(item, _PAYLOAD_FIELD_REF_ID)
-        if ref_kind_text is None or ref_id is None:
-            continue
-        try:
-            refs.append(
-                OpaqueMemoryRef(
-                    ref_kind=HostNeutralRefKind(ref_kind_text),
-                    ref_id=ref_id,
-                    digest=_optional_payload_str(item, _PAYLOAD_FIELD_DIGEST),
-                )
-            )
-        except ValueError:
-            continue
-    return tuple(refs)
-
-
 def _unsupported_event_type_diagnostic(
     event: MemoryProjectionEvent, *, policy_digest: MemoryPolicyDigest
 ) -> MemoryDiagnostic:
@@ -2232,25 +2275,6 @@ def _unsupported_event_type_diagnostic(
         item_id=item_id,
         policy_digest=policy_digest,
         recorded_at=None,
-    )
-
-
-def _payload_evidence_anchor(
-    payload_ref: str | None, payload_digest: str | None
-) -> OpaqueMemoryRef | None:
-    """把 payload ref 映射为可选 evidence anchor。
-
-    :param payload_ref: payload ref。
-    :param payload_digest: payload digest。
-    :returns: evidence opaque ref 或 ``None``。
-    """
-
-    if payload_ref is None:
-        return None
-    return OpaqueMemoryRef(
-        ref_kind=HostNeutralRefKind.EVIDENCE,
-        ref_id=f"{_PAYLOAD_REF_PREFIX}{payload_ref}",
-        digest=payload_digest,
     )
 
 
@@ -2488,6 +2512,9 @@ def _mark_continuity_item_included(
         event_sequence=item.event_sequence,
         run_id=item.run_id,
         summary_text=item.summary_text,
+        label=item.label,
+        source_refs=item.source_refs,
+        preserve_reason=item.preserve_reason,
         payload_ref=item.payload_ref,
         payload_digest=item.payload_digest,
         included_reason=reason,
@@ -2706,6 +2733,8 @@ def conversation_memory_snapshot_from_json_value(
     """
 
     mapping = _as_mapping(value, "snapshot")
+    if "verified_facts" in mapping:
+        raise ValueError("old verified_facts snapshot key is not supported")
     return ConversationMemorySnapshot(
         snapshot_id=_required_str(mapping, "snapshot_id"),
         session_id=_required_str(mapping, "session_id"),
@@ -2887,21 +2916,18 @@ def _evidence_backed_fact_to_json_value(item: EvidenceBackedFactView) -> JsonVal
     """
 
     return {
-        "claim_status": item.claim_status.value,
-        "evidence_anchor": (
-            None
-            if item.evidence_anchor is None
-            else _opaque_ref_to_json_value(item.evidence_anchor)
-        ),
+        "attributes": item.attributes,
+        "candidate_id": item.candidate_id,
+        "claim_text": item.claim_text,
+        "compact_artifact_ref": item.compact_artifact_ref,
+        "evidence_kind": item.evidence_kind.value,
+        "evidence_refs": list(item.evidence_refs),
         "excluded_reason": _enum_value_or_none(item.excluded_reason),
-        "fact_summary": item.fact_summary,
+        "extraction_operation_ref": item.extraction_operation_ref,
         "included_reason": _enum_value_or_none(item.included_reason),
         "item_id": item.item_id,
         "provenance": _provenance_to_json_value(item.provenance),
         "size_units": item.size_units.units,
-        "subject_refs": [
-            _opaque_ref_to_json_value(ref) for ref in item.subject_refs
-        ],
     }
 
 
@@ -2913,21 +2939,24 @@ def _evidence_backed_fact_from_json_value(value: JsonValue) -> EvidenceBackedFac
     """
 
     mapping = _as_mapping(value, "evidence_backed_fact")
-    evidence_value = _required_value(mapping, "evidence_anchor")
+    if "fact_summary" in mapping or "evidence_anchor" in mapping:
+        raise ValueError("old evidence-backed fact JSON shape is not supported")
     return EvidenceBackedFactView(
         item_id=_required_str(mapping, "item_id"),
-        fact_summary=_required_str(mapping, "fact_summary"),
-        claim_status=MemoryClaimStatus(_required_str(mapping, "claim_status")),
+        claim_text=_required_str(mapping, "claim_text"),
+        evidence_kind=EvidenceBackedFactKind(_required_str(mapping, "evidence_kind")),
+        evidence_refs=tuple(
+            _as_str(item, "evidence_refs item")
+            for item in _required_list(mapping, "evidence_refs")
+        ),
+        attributes=_as_mapping(
+            _required_value(mapping, "attributes"),
+            "attributes",
+        ),
         provenance=_provenance_from_json_value(_required_value(mapping, "provenance")),
-        evidence_anchor=(
-            None
-            if evidence_value is None
-            else _opaque_ref_from_json_value(evidence_value)
-        ),
-        subject_refs=tuple(
-            _opaque_ref_from_json_value(item)
-            for item in _required_list(mapping, "subject_refs")
-        ),
+        extraction_operation_ref=_required_str(mapping, "extraction_operation_ref"),
+        compact_artifact_ref=_optional_str(mapping, "compact_artifact_ref"),
+        candidate_id=_required_str(mapping, "candidate_id"),
         included_reason=_optional_included_reason(mapping, "included_reason"),
         excluded_reason=_optional_excluded_reason(mapping, "excluded_reason"),
         size_units=MemorySizeUnits(units=_required_int(mapping, "size_units")),
@@ -3025,11 +3054,14 @@ def _continuity_item_to_json_value(item: ConversationContinuityItem) -> JsonValu
         "included_reason": _enum_value_or_none(item.included_reason),
         "item_id": item.item_id,
         "item_kind": item.item_kind.value,
+        "label": item.label,
         "payload_digest": item.payload_digest,
         "payload_ref": item.payload_ref,
         "producer_kind": item.producer_kind.value,
+        "preserve_reason": _enum_value_or_none(item.preserve_reason),
         "run_id": item.run_id,
         "size_units": item.size_units.units,
+        "source_refs": list(item.source_refs),
         "summary_text": item.summary_text,
     }
 
@@ -3051,6 +3083,15 @@ def _continuity_item_from_json_value(value: JsonValue) -> ConversationContinuity
         event_sequence=_required_int(mapping, "event_sequence"),
         run_id=_optional_str(mapping, "run_id"),
         summary_text=_optional_str(mapping, "summary_text"),
+        label=_optional_str(mapping, "label"),
+        source_refs=tuple(
+            _as_str(item, "source_refs item")
+            for item in _required_list(mapping, "source_refs")
+        ),
+        preserve_reason=_optional_minimum_preserve_reason(
+            mapping,
+            "preserve_reason",
+        ),
         payload_ref=_optional_str(mapping, "payload_ref"),
         payload_digest=_optional_str(mapping, "payload_digest"),
         included_reason=_optional_included_reason(mapping, "included_reason"),
@@ -3168,6 +3209,22 @@ def _optional_excluded_reason(
     if value is None:
         return None
     return MemoryExcludedReason(value)
+
+
+def _optional_minimum_preserve_reason(
+    mapping: Mapping[str, JsonValue], field_name: str
+) -> MinimumPreserveReason | None:
+    """读取 optional minimum preserve reason。
+
+    :param mapping: JSON mapping。
+    :param field_name: 字段名。
+    :returns: minimum preserve reason 或 ``None``。
+    """
+
+    value = _optional_str(mapping, field_name)
+    if value is None:
+        return None
+    return MinimumPreserveReason(value)
 
 
 def _enum_value_or_none(value: StrEnum | None) -> str | None:
@@ -3452,3 +3509,20 @@ def _required_list(
     if isinstance(value, list):
         return value
     raise ValueError(f"{field_name} must be list")
+
+
+def _required_mapping_list(
+    mapping: Mapping[str, JsonValue], field_name: str
+) -> tuple[Mapping[str, JsonValue], ...]:
+    """读取必填 JSON object array 字段。
+
+    :param mapping: JSON mapping。
+    :param field_name: 字段名。
+    :returns: JSON object tuple。
+    :raises ValueError: 字段缺失、非数组或元素非 object 时抛出。
+    """
+
+    result: list[Mapping[str, JsonValue]] = []
+    for index, item in enumerate(_required_list(mapping, field_name)):
+        result.append(_as_mapping(item, f"{field_name}[{index}]"))
+    return tuple(result)

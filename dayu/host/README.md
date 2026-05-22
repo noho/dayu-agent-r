@@ -236,13 +236,13 @@ late result、terminal Run 上的结果或已取消 wait 的结果不会恢复 R
 
 ## Memory Projection
 
-Conversation Memory 是 Session-level read model，不是 Host governance truth。它只消费 committed canonical EventLog facts，维护 stable layer、history pool、evidence-backed fact、working assumption、recent raw turn、episode summary 和 projection cursor。
+Conversation Memory 是 Session-level read model，不是 Host governance truth。它只消费 committed canonical EventLog facts，维护 stable layer、history pool、evidence-backed facts、working assumptions、recent raw turns、episode summaries、minimum preserve continuity 和 projection cursor。
 
 `MemoryProjectionPolicy` 使用 `context_window_size` 加 ratio / floor / cap 模型派生 stable layer、history pool 与 raw turn 的内部 size units；调用方只表达策略比例和上下限，Host memory projection 内部负责计算 effective size units。
 
 RunInputBuilder 读取 memory snapshot 时必须带着 snapshot cursor 与 policy digest；snapshot 缺失、损坏或滞后超过策略阈值时，Host 进入 projection repair path。memory projection lag 不触发 Run 状态迁移，也不把 Run 推入 `RECOVERING`。
 
-Memory 的边界是 Host-neutral：它不导入 Engine / Fins / Service / UI，不表达财报业务字段，不让 assistant final answer 自动成为 evidence-backed fact。只有 accepted evidence envelope 与明确 provenance 能支撑 evidence-backed fact；accepted evidence 没有通过 compact accept barrier 的 fact candidate 时只记录诊断，不合成 fallback fact。
+Memory 的边界是 Host-neutral：它不导入 Engine / Fins / Service / UI，不表达财报业务字段，不让 assistant final answer、用户输入、working assumption 或 episode summary 自动成为 evidence-backed fact。`TOOL_RESULT_ACCEPTED` 只提供 accepted evidence 可用性；stable evidence-backed facts 只从 accepted `CONTEXT_COMPACTED.evidence_backed_fact_candidates` 物化，并使用该 `CONTEXT_COMPACTED` event 的 id / sequence 作为 provenance。accepted evidence 没有通过 compact accept barrier 的 fact candidate 时只记录诊断，不合成 fallback fact；minimum preserve candidates 只进入 continuity。
 
 ## Context Compaction
 

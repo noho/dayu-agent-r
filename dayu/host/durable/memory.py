@@ -38,6 +38,7 @@ from dayu.host.context_events import CONTEXT_COMPACTED
 from dayu.host.memory import (
     CONVERSATION_MEMORY_CONSUMER_ID,
     ConversationContinuityItem,
+    ConversationContinuityKind,
     ConversationMemorySnapshot,
     MemoryClaimStatus,
     MemoryDiagnostic,
@@ -75,6 +76,7 @@ from dayu.host.durable.event_log import EventClass
 
 _ZERO_CURSOR_SEQUENCE = 0
 _ITEM_KIND_EVIDENCE_BACKED_FACT = "evidence_backed_fact"
+_ITEM_KIND_OLD_VERIFIED_FACT = "verified_fact"
 _ITEM_KIND_WORKING_ASSUMPTION = "working_assumption"
 _EVENT_TYPE_USER_INPUT_ACCEPTED = "USER_INPUT_ACCEPTED"
 _EVENT_TYPE_RUN_SUCCEEDED = "RUN_SUCCEEDED"
@@ -320,7 +322,7 @@ def read_memory_snapshot(
     )
     if row is None:
         return None
-    return _snapshot_row_from_host_row(row)
+    return _snapshot_row_from_host_row(transaction, row)
 
 
 def read_latest_memory_snapshot(
@@ -357,7 +359,7 @@ def read_latest_memory_snapshot(
     )
     if row is None:
         return None
-    return _snapshot_row_from_host_row(row)
+    return _snapshot_row_from_host_row(transaction, row)
 
 
 def read_latest_memory_snapshot_at_or_before(
@@ -404,7 +406,7 @@ def read_latest_memory_snapshot_at_or_before(
     )
     if row is None:
         return None
-    return _snapshot_row_from_host_row(row)
+    return _snapshot_row_from_host_row(transaction, row)
 
 
 def write_memory_snapshot(
@@ -697,7 +699,7 @@ def _insert_evidence_backed_fact_item(
         snapshot=snapshot,
         item_id=item.item_id,
         item_kind=_ITEM_KIND_EVIDENCE_BACKED_FACT,
-        claim_status=item.claim_status,
+        claim_status=MemoryClaimStatus.EVIDENCE_BACKED,
         event_id=item.provenance.event_id,
         event_sequence=item.provenance.event_sequence,
         producer_kind=item.provenance.producer_kind,
@@ -723,8 +725,6 @@ def _payload_digest_for_evidence_backed_fact(item: EvidenceBackedFactView) -> st
 
     if item.provenance.payload_ref is None:
         return None
-    if item.evidence_anchor is not None and item.evidence_anchor.digest is not None:
-        return item.evidence_anchor.digest
     return item.provenance.digest_ref
 
 
@@ -919,9 +919,12 @@ def _insert_memory_diagnostic(
     )
 
 
-def _snapshot_row_from_host_row(row: HostRow) -> MemorySnapshotRow:
+def _snapshot_row_from_host_row(
+    transaction: HostTransaction, row: HostRow
+) -> MemorySnapshotRow:
     """把 durable row 转换为 typed snapshot row。
 
+    :param transaction: Host durable transaction。
     :param row: Host durable row。
     :returns: typed snapshot row。
     :raises HostDurableError: JSON 无法解析或 digest 不匹配时抛出。
@@ -931,7 +934,42 @@ def _snapshot_row_from_host_row(row: HostRow) -> MemorySnapshotRow:
     updated_at = _require_text(row.get("updated_at"), field_name="updated_at")
     snapshot = _snapshot_from_json_text(snapshot_json)
     _validate_snapshot_digest(snapshot)
+    _validate_snapshot_item_kinds(transaction, snapshot.snapshot_id)
     return MemorySnapshotRow(snapshot=snapshot, updated_at=updated_at)
+
+
+def _validate_snapshot_item_kinds(
+    transaction: HostTransaction, snapshot_id: str
+) -> None:
+    """校验 snapshot item rows 没有旧 kind 或未知 kind。
+
+    :param transaction: Host durable transaction。
+    :param snapshot_id: snapshot id。
+    :returns: ``None``。
+    :raises HostDurableError: 存在旧 ``verified_fact`` 或未知 item kind 时抛出。
+    """
+
+    allowed_kinds = {
+        _ITEM_KIND_EVIDENCE_BACKED_FACT,
+        _ITEM_KIND_WORKING_ASSUMPTION,
+        *(kind.value for kind in ConversationContinuityKind),
+    }
+    rows = transaction.fetchall(
+        f"""
+        SELECT item_kind
+        FROM {TABLE_HOST_MEMORY_ITEMS}
+        WHERE snapshot_id = ?
+        """,
+        (snapshot_id,),
+    )
+    for row in rows:
+        item_kind = _require_text(row.get("item_kind"), field_name="item_kind")
+        if item_kind == _ITEM_KIND_OLD_VERIFIED_FACT:
+            raise HostDurableError(
+                "old durable memory item kind verified_fact is not supported"
+            )
+        if item_kind not in allowed_kinds:
+            raise HostDurableError(f"unsupported durable memory item kind: {item_kind}")
 
 
 def _diagnostic_row_from_host_row(row: HostRow) -> MemoryDiagnosticRow:
@@ -1008,7 +1046,8 @@ def _evidence_backed_fact_item_json_value(item: EvidenceBackedFactView) -> JsonV
     """
 
     return {
-        "fact_summary": item.fact_summary,
+        "claim_text": item.claim_text,
+        "evidence_refs": list(item.evidence_refs),
         "item_id": item.item_id,
         "size_units": item.size_units.units,
     }
@@ -1038,6 +1077,11 @@ def _continuity_item_json_value(item: ConversationContinuityItem) -> JsonValue:
     return {
         "item_id": item.item_id,
         "item_kind": item.item_kind.value,
+        "label": item.label,
+        "preserve_reason": (
+            None if item.preserve_reason is None else item.preserve_reason.value
+        ),
         "size_units": item.size_units.units,
+        "source_refs": list(item.source_refs),
         "summary_text": item.summary_text,
     }

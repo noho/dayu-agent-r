@@ -743,7 +743,8 @@ CREATE TABLE IF NOT EXISTS {TABLE_HOST_MEMORY_ITEMS} (
       'raw_user_turn',
       'raw_assistant_turn',
       'assistant_conclusion',
-      'episode_summary'
+      'episode_summary',
+      'minimum_preserve_item'
     )
   ),
   claim_status TEXT NOT NULL CHECK (
@@ -787,7 +788,7 @@ CREATE TABLE IF NOT EXISTS {TABLE_HOST_MEMORY_DIAGNOSTICS} (
   snapshot_id TEXT NULL,
   reason TEXT NOT NULL CHECK (
     reason IN (
-      'missing_fact_summary_fallback',
+      'evidence_backed_fact_candidate_invalid',
       'inline_delta_repair_included',
       'snapshot_missing',
       'snapshot_damaged',
