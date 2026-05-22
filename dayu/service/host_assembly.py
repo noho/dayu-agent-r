@@ -466,7 +466,9 @@ def _compose_options(
         memory_projection_catchup_batch_size=(
             host_runtime.memory_projection_catch_up_batch_size
         ),
-        enable_truncation_manager=host_runtime.truncation_manager_enabled,
+        enable_truncation_manager=(
+            execution_profile.tool_truncation_policy.enabled
+        ),
     )
 
 

@@ -12,7 +12,6 @@
         "artifact_root": "workspace/.dayu/artifacts/compaction"
       },
       "context_budget_policy": {
-        "context_window_size": 1048576,
         "soft_threshold_context_ratio": 0.65,
         "hard_threshold_context_ratio": 0.82,
         "max_proactive_compactions_per_run": 2,
@@ -21,7 +20,6 @@
         "policy_ref": "standard"
       },
       "memory_projection_policy": {
-        "context_window_size": 1048576,
         "max_pinned_items": 32,
         "max_verified_facts": 256,
         "max_working_assumptions": 128,
@@ -67,7 +65,7 @@
       "tool_execution_timeout_seconds": 120.0,
       "fallback_mode": "force_answer",
       "fallback_prompt": "请基于已获得的信息直接回答问题。信息不足时必须说明不确定性，不得编造。",
-      "continuation_prompt": "继续完成当前财报分析任务。",
+      "continuation_prompt": "请从上一条回复被截断的位置继续输出，保持原有语言、格式和结构，不要重复已经输出的内容。",
       "max_consecutive_failed_tool_batches": 2
     }
   }

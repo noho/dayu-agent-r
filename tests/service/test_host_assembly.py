@@ -92,6 +92,7 @@ def test_compose_open_host_options_uses_runtime_tuning_from_config(
     assert result.options.sqlite_write_retry_max_delay_seconds == 0.03
     assert result.options.payload_inline_threshold_bytes == 2048
     assert result.options.worker_startup_timeout_seconds == 4.5
+    assert result.options.enable_truncation_manager is True
     assert result.options.ordinary_run_baseline.runner_spec.headers[
         "Authorization"
     ] == f"Bearer {_API_KEY}"
@@ -170,6 +171,62 @@ def test_agent_fallback_mode_from_config_uses_engine_enum_values() -> None:
         _agent_fallback_mode_from_config("unsupported")
 
 
+def test_truncation_manager_enabled_is_derived_from_execution_profile(
+    tmp_path: Path,
+) -> None:
+    """截断 manager 开关必须由 execution profile 的 tool policy 派生。
+
+    :param tmp_path: pytest 临时 workspace root。
+    :returns: ``None``。
+    :raises AssertionError: helper 仍从 host runtime 或其它来源读取开关时抛出。
+    """
+
+    _write_tool_discovery_overlay(tmp_path)
+    _write_execution_profile_overlay(tmp_path, truncation_enabled=False)
+    locations = resolve_runtime_locations(
+        project_root=tmp_path,
+        package_config_root=_PACKAGE_CONFIG_ROOT,
+    )
+    config = ConfigLoader(package_config_dir=_PACKAGE_CONFIG_ROOT).load(
+        workspace_config_dir=locations.config_overlay_dir
+    )
+    discovered_tools = discover_service_tools(config)
+    scene_inputs = prepare_scene(
+        ScenePrepareRequest(
+            scene_id=_SCENE_ID,
+            scene_manifest_root=locations.scene_manifest_root,
+            prompt_asset_root=locations.prompt_asset_root,
+            context_slot_values={
+                "fins_default_subject": "测试财报主体",
+                "base_user": "service-assembly-test",
+            },
+            available_tools=SceneToolCatalog.from_tool_bundle(
+                discovered_tools.tool_bundle
+            ),
+        )
+    )
+
+    result = compose_open_host_options(
+        ServiceOpenHostAssemblyRequest(
+            workspace_root=tmp_path,
+            config=config,
+            locations=locations,
+            scene_inputs=scene_inputs,
+            discovered_tools=discovered_tools,
+            overrides=ServiceAssemblyOverrides(
+                host_runtime_id="local",
+                execution_profile_id="standard",
+                model_id=_MODEL_ID,
+                runner_option_hint_id=_RUNNER_HINT_ID,
+            ),
+            env={"DEEPSEEK_API_KEY": _API_KEY},
+        )
+    )
+
+    assert result.options.enable_truncation_manager is False
+    assert result.diagnostics.tool_truncation_policy.startswith("enabled=False")
+
+
 def _write_tool_discovery_overlay(workspace_root: Path) -> None:
     """写入启用 smoke provider 的 workspace tool discovery overlay。
 
@@ -227,7 +284,92 @@ def _write_host_runtime_overlay(workspace_root: Path) -> None:
                     "payload_inline_threshold_bytes": 2048,
                     "worker_startup_timeout_seconds": 4.5,
                     "memory_projection_catch_up_batch_size": 100,
-                    "truncation_manager_enabled": True,
+                }
+            },
+        },
+    )
+
+
+def _write_execution_profile_overlay(
+    workspace_root: Path, *, truncation_enabled: bool
+) -> None:
+    """写入覆盖截断策略开关的 workspace execution profile 配置。
+
+    :param workspace_root: pytest 临时 workspace root。
+    :param truncation_enabled: tool truncation policy 是否启用。
+    :returns: ``None``。
+    :raises OSError: 目录或文件写入失败时抛出。
+    """
+
+    _write_json(
+        workspace_root / "workspace" / "config" / "execution_profiles.json",
+        {
+            "default_execution_profile_id": "standard",
+            "execution_profiles": {
+                "standard": {
+                    "run_baseline": {
+                        "model_id": "deepseek-v4-flash",
+                        "runner_option_hint_id": "interactive",
+                    },
+                    "compactor_baseline": {
+                        "model_id": "deepseek-v4-flash",
+                        "runner_option_hint_id": "conversation_compaction",
+                        "artifact_root": "workspace/.dayu/artifacts/compaction",
+                    },
+                    "context_budget_policy": {
+                        "soft_threshold_context_ratio": 0.65,
+                        "hard_threshold_context_ratio": 0.82,
+                        "max_proactive_compactions_per_run": 2,
+                        "max_reactive_compactions_per_run": 2,
+                        "max_compaction_attempts_per_operation": 3,
+                        "policy_ref": "standard",
+                    },
+                    "memory_projection_policy": {
+                        "max_pinned_items": 32,
+                        "max_verified_facts": 256,
+                        "max_working_assumptions": 128,
+                        "recent_raw_turns_floor": 4,
+                        "raw_turn_context_ratio": 0.02,
+                        "raw_turn_size_floor": 1024,
+                        "raw_turn_size_cap": 8192,
+                        "history_pool_context_ratio": 0.18,
+                        "history_pool_size_floor": 8192,
+                        "history_pool_size_cap": 131072,
+                        "stable_layer_context_ratio": 0.12,
+                        "stable_layer_size_floor": 4096,
+                        "stable_layer_size_cap": 65536,
+                        "max_lag_events_for_inline_delta": 32,
+                        "max_delta_repair_events": 128,
+                    },
+                    "tool_truncation_policy": {
+                        "enabled": truncation_enabled,
+                        "default_cursor_ttl_seconds": 3600.0,
+                        "default_limits": {
+                            "text_chars": {"max_chars": 12000},
+                            "text_lines": {"max_lines": 400},
+                            "list_items": {"max_items": 200},
+                            "binary_bytes": {"max_bytes": 1048576},
+                        },
+                    },
+                    "agent_policy_profile_id": "standard-agent",
+                }
+            },
+            "agent_policy_profiles": {
+                "standard-agent": {
+                    "max_iterations": 24,
+                    "continuation_max_attempts": 2,
+                    "allow_tool_calls": True,
+                    "tool_execution_timeout_seconds": 120.0,
+                    "fallback_mode": "force_answer",
+                    "fallback_prompt": (
+                        "请基于已获得的信息直接回答问题。"
+                        "信息不足时必须说明不确定性，不得编造。"
+                    ),
+                    "continuation_prompt": (
+                        "请从上一条回复被截断的位置继续输出，"
+                        "保持原有语言、格式和结构，不要重复已经输出的内容。"
+                    ),
+                    "max_consecutive_failed_tool_batches": 2,
                 }
             },
         },

@@ -15,10 +15,9 @@
       "host_execution_lane_name": "llm_api",
       "worker_backend": "local",
       "dispatch_poll_interval_seconds": 0.2,
-      "payload_inline_threshold_bytes": 4096,
+      "payload_inline_threshold_bytes": 65535,
       "worker_startup_timeout_seconds": 10.0,
-      "memory_projection_catch_up_batch_size": 100,
-      "truncation_manager_enabled": true
+      "memory_projection_catch_up_batch_size": 100
     }
   }
 }

@@ -82,8 +82,8 @@ dayu/config/
 
 - `run_baseline`：普通 Run 默认 `model_id` 与 `runner_option_hint_id`。
 - `compactor_baseline`：compactor 默认 `model_id`、`runner_option_hint_id` 与 `artifact_root`。
-- `context_budget_policy`：对齐 Host public `ContextBudgetPolicy` 的 ratio-first 配置。
-- `memory_projection_policy`：对齐 Host public `MemoryProjectionPolicy` 的 ratio / floor / cap 配置。
+- `context_budget_policy`：对齐 Host public `ContextBudgetPolicy` 的 ratio-first 配置；上下文窗口来自 effective model 的 `context_window_tokens`。
+- `memory_projection_policy`：对齐 Host public `MemoryProjectionPolicy` 的 ratio / floor / cap 配置；上下文窗口来自 effective model 的 `context_window_tokens`。
 - `tool_truncation_policy`：只配置默认截断治理参数和默认 limits，不配置 per-tool strategy / target。
 - `agent_policy_profile_id`：引用 `agent_policy_profiles`。
 
@@ -102,10 +102,9 @@ dayu/config/
 - `host_execution_lane_name`：引用 `runtime_lanes.json` 中已存在的 lane。
 - `worker_backend`，当前默认配置为 `local`。
 - `dispatch_poll_interval_seconds`。
-- `payload_inline_threshold_bytes`。
+- `payload_inline_threshold_bytes`，包内默认值为 `65535` bytes。
 - `worker_startup_timeout_seconds`。
 - `memory_projection_catch_up_batch_size`。
-- `truncation_manager_enabled`。
 
 这些配置都是 `open_host(options)` construction-time assembly inputs 的来源，不是单个 Run 的 override。prompt asset root 与 scene manifest root 不在 `host_runtime.json` 中配置，由 runtime location resolver 解析。
 

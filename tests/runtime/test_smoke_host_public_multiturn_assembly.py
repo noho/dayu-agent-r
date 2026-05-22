@@ -78,7 +78,7 @@ def test_runtime_assembly_uses_workspace_tool_discovery_and_typed_overrides(
     options = assembly.options
     assert options.lane_name == "llm_api"
     assert options.sqlite_write_busy_retry_count == 8
-    assert options.payload_inline_threshold_bytes == 4096
+    assert options.payload_inline_threshold_bytes == 65535
     assert options.worker_startup_timeout_seconds == 10.0
     assert options.tooling_options is not None
     assert tuple(

@@ -199,7 +199,6 @@ class CompactorBaselineConfig:
 class ContextBudgetConfig:
     """上下文预算配置。
 
-    :param context_window_size: composition root 注入前的默认上下文窗口。
     :param soft_threshold_context_ratio: soft threshold 占上下文比例。
     :param hard_threshold_context_ratio: hard threshold 占上下文比例。
     :param max_proactive_compactions_per_run: 单个 Run proactive compact 上限。
@@ -208,7 +207,6 @@ class ContextBudgetConfig:
     :param policy_ref: policy snapshot / composition ref。
     """
 
-    context_window_size: int
     soft_threshold_context_ratio: float
     hard_threshold_context_ratio: float
     max_proactive_compactions_per_run: int
@@ -221,7 +219,6 @@ class ContextBudgetConfig:
 class MemoryProjectionConfig:
     """Conversation memory projection 配置。
 
-    :param context_window_size: composition root 注入前的默认上下文窗口。
     :param max_pinned_items: pinned state 最大条目数。
     :param max_verified_facts: verified facts 最大条目数。
     :param max_working_assumptions: working assumptions 最大条目数。
@@ -239,7 +236,6 @@ class MemoryProjectionConfig:
     :param max_delta_repair_events: repair delta 最大事件数。
     """
 
-    context_window_size: int
     max_pinned_items: int
     max_verified_facts: int
     max_working_assumptions: int
@@ -423,7 +419,6 @@ class HostRuntimeProfileConfig:
     :param payload_inline_threshold_bytes: payload 内联存储阈值字节数。
     :param worker_startup_timeout_seconds: worker accept timeout 秒数。
     :param memory_projection_catch_up_batch_size: memory catch-up 批次大小。
-    :param truncation_manager_enabled: 是否启用 truncation manager。
     """
 
     host_runtime_id: str
@@ -436,7 +431,6 @@ class HostRuntimeProfileConfig:
     payload_inline_threshold_bytes: int
     worker_startup_timeout_seconds: float
     memory_projection_catch_up_batch_size: int
-    truncation_manager_enabled: bool
 
 
 @dataclass(frozen=True, slots=True)
@@ -1351,7 +1345,6 @@ def _parse_context_budget(record: JsonObject, *, context: str) -> ContextBudgetC
         record,
         allowed=frozenset(
             {
-                "context_window_size",
                 "soft_threshold_context_ratio",
                 "hard_threshold_context_ratio",
                 "max_proactive_compactions_per_run",
@@ -1363,7 +1356,6 @@ def _parse_context_budget(record: JsonObject, *, context: str) -> ContextBudgetC
         context=context,
     )
     return ContextBudgetConfig(
-        context_window_size=_require_positive_int_field(record, field_name="context_window_size", context=context),
         soft_threshold_context_ratio=_require_float_field(record, field_name="soft_threshold_context_ratio", context=context),
         hard_threshold_context_ratio=_require_float_field(record, field_name="hard_threshold_context_ratio", context=context),
         max_proactive_compactions_per_run=_require_positive_int_field(record, field_name="max_proactive_compactions_per_run", context=context),
@@ -1388,7 +1380,6 @@ def _parse_memory_projection(
         record,
         allowed=frozenset(
             {
-                "context_window_size",
                 "max_pinned_items",
                 "max_verified_facts",
                 "max_working_assumptions",
@@ -1409,7 +1400,6 @@ def _parse_memory_projection(
         context=context,
     )
     return MemoryProjectionConfig(
-        context_window_size=_require_positive_int_field(record, field_name="context_window_size", context=context),
         max_pinned_items=_require_positive_int_field(record, field_name="max_pinned_items", context=context),
         max_verified_facts=_require_positive_int_field(record, field_name="max_verified_facts", context=context),
         max_working_assumptions=_require_positive_int_field(record, field_name="max_working_assumptions", context=context),
@@ -1600,7 +1590,6 @@ def _parse_host_runtime_profile(
                 "payload_inline_threshold_bytes",
                 "worker_startup_timeout_seconds",
                 "memory_projection_catch_up_batch_size",
-                "truncation_manager_enabled",
             }
         ),
         context=context,
@@ -1623,7 +1612,6 @@ def _parse_host_runtime_profile(
         payload_inline_threshold_bytes=_require_positive_int_field(record, field_name="payload_inline_threshold_bytes", context=context),
         worker_startup_timeout_seconds=_require_positive_float_field(record, field_name="worker_startup_timeout_seconds", context=context),
         memory_projection_catch_up_batch_size=_require_positive_int_field(record, field_name="memory_projection_catch_up_batch_size", context=context),
-        truncation_manager_enabled=_require_bool_field(record, field_name="truncation_manager_enabled", context=context),
     )
 
 

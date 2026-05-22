@@ -116,7 +116,6 @@ def _execution_profile_record() -> dict[str, JsonValue]:
             "artifact_root": "artifacts/compact",
         },
         "context_budget_policy": {
-            "context_window_size": 1000,
             "soft_threshold_context_ratio": 0.6,
             "hard_threshold_context_ratio": 0.8,
             "max_proactive_compactions_per_run": 1,
@@ -125,7 +124,6 @@ def _execution_profile_record() -> dict[str, JsonValue]:
             "policy_ref": "test",
         },
         "memory_projection_policy": {
-            "context_window_size": 1000,
             "max_pinned_items": 2,
             "max_verified_facts": 3,
             "max_working_assumptions": 4,
@@ -238,7 +236,6 @@ def _minimal_package_config(root: Path) -> None:
                     "payload_inline_threshold_bytes": 4096,
                     "worker_startup_timeout_seconds": 10.0,
                     "memory_projection_catch_up_batch_size": 10,
-                    "truncation_manager_enabled": True,
                 }
             },
         },
@@ -298,7 +295,7 @@ def test_default_runtime_config_files_load_as_typed_views() -> None:
     host_runtime = config.host_runtime.runtimes["local"]
     assert host_runtime.sqlite.write_busy_retry_count == 8
     assert host_runtime.sqlite.write_retry_initial_delay_seconds == 0.005
-    assert host_runtime.payload_inline_threshold_bytes == 4096
+    assert host_runtime.payload_inline_threshold_bytes == 65535
     assert host_runtime.worker_startup_timeout_seconds == 10.0
     assert config.runtime_lanes.lanes["llm_api"].capacity == 4
     provider = config.tool_discovery.providers["financial-tools"]
@@ -565,6 +562,37 @@ def test_old_execution_profile_fields_fail_fast(tmp_path: Path) -> None:
         ConfigLoader(package_config_dir=package_root).load_execution_profiles()
 
 
+def test_execution_profile_must_not_embed_context_window_size(
+    tmp_path: Path,
+) -> None:
+    """execution profile 不得重复配置模型上下文窗口。"""
+
+    package_root = tmp_path / "package"
+    _minimal_package_config(package_root)
+    profile = _execution_profile_record()
+    context_budget = profile["context_budget_policy"]
+    assert isinstance(context_budget, dict)
+    context_budget["context_window_size"] = 1000
+    memory_projection = profile["memory_projection_policy"]
+    assert isinstance(memory_projection, dict)
+    memory_projection["context_window_size"] = 1000
+    _write_json(
+        package_root / "execution_profiles.json",
+        {
+            "default_execution_profile_id": "standard",
+            "execution_profiles": {
+                "standard": profile,
+            },
+            "agent_policy_profiles": {
+                "default-agent": _agent_policy_profile_record(),
+            },
+        },
+    )
+
+    with pytest.raises(ConfigFieldError, match="unknown fields"):
+        ConfigLoader(package_config_dir=package_root).load_execution_profiles()
+
+
 def test_agent_policy_profiles_must_not_be_empty(tmp_path: Path) -> None:
     """execution_profiles.agent_policy_profiles 为空必须在配置加载期失败。"""
 
@@ -689,7 +717,6 @@ def test_host_runtime_lane_reference_must_exist(tmp_path: Path) -> None:
                     "payload_inline_threshold_bytes": 4096,
                     "worker_startup_timeout_seconds": 10.0,
                     "memory_projection_catch_up_batch_size": 10,
-                    "truncation_manager_enabled": True,
                 }
             },
         },

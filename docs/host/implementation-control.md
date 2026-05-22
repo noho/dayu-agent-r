@@ -1810,6 +1810,84 @@ Plan 必须额外收口的 readiness review checklist：
 - 后续 Service / UI / workflow integration can rely on runtime assembly helpers and smoke diagnostics as the production assembly reference.
 - Real financial tool provider, financial scene content and workflow orchestration remain separate Service / Fins / UI work units.
 
+### Phase 12.3. Config Schema / Usage Governance Follow-up
+
+状态：
+- design refinement ready。稳定讨论记录在 `docs/host/config-schema-followup-discussion.md`；进入 implementation 前必须先把稳定裁决写回 `docs/host/design.md`，并按 `$init-agents` 路由派发 handoff implementation-ready plan、plan review、implementation、code review 与 re-review。
+
+目标：
+- 收口 P12.1 / P12.2 后继续暴露的 config schema 与 usage governance 小闭环，使默认配置更朴素、Service assembly 更薄、Context Governance 能消费 Engine 已上报的 usage observation。
+- 保持 `dayu.runtime` import boundary；ConfigLoader 仍只读取 / 校验配置，不 import Host / Engine / Service / UI / Fins。
+- 不把 usage 采集做成 config override；usage 是 provider capability 驱动的观测信号，不是 scene / Service 业务风格参数。
+
+对应设计章节：
+- `docs/host/design.md` §3 dayu.runtime
+- `docs/host/design.md` §10.1 Host Handle / Composition Root
+- `docs/host/design.md` §11 Host 公共接口
+- `docs/host/design.md` §24 Context Governance
+
+前置条件：
+- Phase 12.1 runtime assembly schema / public contract correction 已完成。
+- Phase 12.2 service assembly helper follow-up 已完成并 accepted local commit。
+- `docs/host/config-schema-followup-discussion.md` 中 4 项裁决已收口：AgentPolicy 直接嵌入 execution profile、删除默认 `max_tokens`、usage post-call observation 消费、execution profile 按场景显式分档。
+
+范围：
+- 允许修改：`docs/host/design.md`、本文档、`dayu/config/*.json`、`dayu/config/README.md`、`dayu/runtime/config_loader.py`、`dayu/runtime/assembly.py`、`dayu/service/host_assembly.py`、Host Context Governance usage observation 消费相关模块、Engine / Host usage tests、Service assembly tests、runtime config tests、README。
+- 禁止修改：Host durable state machine、Host command / handle public method、`open_host(options)` 字段名、`SubmitFollowupRequest` public 字段名、Engine Agent loop 状态机、Runner usage event contract、ToolRuntime accept barrier、具体财报业务工具与 Fins storage。
+
+不做：
+- 不实现真实 Service / CLI / Web / GUI workflow 接入。
+- 不让 ConfigLoader 解析 secret、创建 provider client 或 import Engine provider extension typed union。
+- 不引入 `usage_enabled` / `collect_usage` / `include_usage` 这类 config override。
+- 不引入独立 `supports_usage` 字段；流式 usage capability 继续由 `models.json.supports_stream_usage` 表达，非流式响应如果 provider 返回 `usage`，Engine 默认读取。
+- 不用 post-call usage 回头修改当前已经完成的 dispatch decision。
+
+关键设计问题：
+- `execution_profiles.json` 删除顶层 `agent_policy_profiles` catalog，删除 `execution_profiles[*].agent_policy_profile_id`，每个 execution profile 直接内嵌完整 `agent_policy` block。
+- `models.json.runtime_hints.runner_option_hints` 删除默认 `max_tokens`；ConfigLoader runner option hint schema 与 Service assembly 默认 RunnerCallOptions 装配路径同步删除该来源。
+- `RunnerCallOptions.max_tokens` 若 public contract 暂保留，只能作为明确 per-run / provider adapter override，不得来自默认 config。
+- OpenAI-compatible payload 不应把默认通用 config 字段等同为 Chat Completions `max_tokens`；后续如确需限制输出，应按具体 provider API 字段单独设计。
+- Engine 继续只负责如实上报 usage；Runner usage -> Engine `usage_reported` 现有事件链保持。
+- Host ingest 继续 durable 化 `usage_reported`，并补齐后续消费所需的 attempt / execution context、估算 digest、policy ref 等关联信息。
+- Context Governance 主动消费 usage，但 usage 是 post-call observation，只用于估算器校准、diagnostic 与后续 Run / 后续 compaction 治理参考。
+- 当前 Run admission 仍由 pre-dispatch estimator、provider context overflow 与 reactive compaction 负责；usage 缺失、provider 不支持 usage 或 usage 字段格式异常都不得导致 Run 失败。
+- `execution_profiles.json` 支持按场景显式分档，例如 `standard-256k`、`standard-1m`、`wechat-256k`、`wechat-1m`；Service 显式选择 profile，helper 只做兼容性校验和 diagnostic，不根据 `models.context_window_tokens` 隐式切换 profile。
+
+交付物：
+- updated `docs/host/design.md`
+- updated `docs/host/implementation-control.md`
+- handoff implementation-ready plan
+- plan review / fix / re-review artifacts
+- implementation slices
+- focused tests、pyright、README sync
+
+建议 slice 切分：
+- Slice 1: Config schema cleanup，内嵌 `agent_policy`、删除默认 `max_tokens`、更新 ConfigLoader typed schema / default config / README / Service assembly。
+- Slice 2: Host Context Governance usage observation consumer，补 durable usage association、post-call diagnostic / calibration path 与 focused Host tests。
+- Slice 3: Execution profile scene/window class split 与 assembly compatibility diagnostics，确保 Service helper 显式选择 profile、不自动切换。
+- Slice 4: Aggregate validation、runtime / service / host tests、pyright、README sync 与 deepreview。
+
+验证要求：
+- unit tests: ConfigLoader 拒绝旧 `agent_policy_profiles` / `agent_policy_profile_id` 与 runner option hint `max_tokens`，默认配置可加载。
+- unit tests: Service assembly 从 execution profile 内嵌 `agent_policy` 生成完整 Engine `AgentPolicy`，默认 RunnerCallOptions 不携带 `max_tokens`。
+- unit tests: Engine usage 上报链保持不变；stream usage 只由 `supports_stream_usage` + `stream=True` 触发 `stream_options.include_usage=true`。
+- unit tests: Host ingest / Context Governance 能把 usage 作为 post-call observation 消费，且不改变当前已完成的 dispatch decision。
+- unit tests: execution profile compatibility diagnostic 覆盖 profile window class / min context window 与 effective model context window 不匹配场景。
+- pyright: affected runtime / service / host / engine tests pass with no new or expanded errors。
+- docs: `dayu/config/README.md`、`dayu/host/README.md`、`dayu/engine/README.md`、root `README.md`、`tests/README.md` 按触发规则同步。
+
+退出条件：
+- 默认 config 不再含 `agent_policy_profiles` / `agent_policy_profile_id` / runner option hint `max_tokens`。
+- ConfigLoader、Service assembly helper 与 smoke-like tests 均只依赖新 schema，不保留旧 schema 兼容读取。
+- usage 采集无 config override；`supports_stream_usage` 能完整表达流式 usage 请求 capability。
+- Host Context Governance 已能消费 durable usage observation 作为后续治理参考，且不回改当前 dispatch decision。
+- Aggregate deepreview from at least two review Agents PASS；control_doc records residual risks with owners.
+- User authorization applies: once `ready-to-open-draft-PR` is reached, controller may automatically enter draft PR gate and proceed to `draft-PR-pass`.
+
+后续依赖：
+- 真实 Service / UI / workflow integration 继续负责根据业务场景显式选择 execution profile。
+- 更细 provider-specific 输出 token 限制若未来需要，必须作为独立 provider adapter / public contract 设计，不回到默认 config `max_tokens`。
+
 ### Phase 13. Audit / Tool Trace / Outbox Projections
 
 目标：
