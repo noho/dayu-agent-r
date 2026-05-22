@@ -148,13 +148,24 @@ LLM extractor 必须返回 Host 定义的结构化 JSON candidate，而不是 pl
     }
   ],
   "working_assumption_candidates": [],
+  "minimum_preserve_item_candidates": [
+    {
+      "item_id": "factor-2",
+      "label": "第二个因素",
+      "text": "第二个因素的最小可追问上下文。",
+      "source_refs": ["event:user-input:1", "event:assistant-answer:1"],
+      "preserve_reason": "needed_for_recent_reference"
+    }
+  ],
   "continuity_notes": []
 }
 ```
 
 该 JSON 是 Host contract，不是 provider 自由格式。未知字段、缺必填字段、字段类型不匹配、`evidence_refs` 为空或引用不存在的
-accepted evidence，都必须 fail fast 或进入 bounded repair / diagnostic，不能静默降级为 fact。provider 支持 structured output
-时应优先使用；不支持时也必须要求纯 JSON，并由 Host 严格解析、校验和拒绝非法 candidate。
+accepted evidence，都必须 fail fast 或进入 bounded repair / diagnostic，不能静默降级为 fact。缺少可接受
+`evidence_backed_fact` candidate 时，Host 只能记录 diagnostic / repair outcome 并保留 accepted evidence refs，不得合成 neutral
+fallback fact。provider 支持 structured output 时应优先使用；不支持时也必须要求纯 JSON，并由 Host 严格解析、校验和拒绝非法
+candidate。
 
 Host accept barrier 只校验通用 contract：
 
@@ -163,6 +174,8 @@ Host accept barrier 只校验通用 contract：
 - `evidence_refs` 非空，且每个 ref 都指向本次 compact input 或已提交 EventLog 中的 accepted evidence envelope。
 - candidate 不能引用 assistant final answer、episode summary、user input 或 working assumption 作为 evidence。
 - `attributes` 是可选 opaque key-value，用于渲染和后续计算辅助；Host 不理解其业务含义。
+- `minimum_preserve_item_candidates` 只作为 continuity items 接受，Host 校验 item text 非空且长度受限、source refs 指向 compact input、
+  preserve reason 属于允许枚举、item 数量受 policy 限制；它们不能产生 `evidence_backed_fact`。
 
 Host 不校验 evidence 的业务形状，不解析 locator，不证明 excerpt 是否逐字覆盖 claim，不理解 metric / subject / period。证据来源细节由
 accepted evidence envelope / artifact 承载；如果 UI / audit 需要展示证据细节，再通过 evidence id 回查对应 tool query、tool result、
@@ -174,7 +187,7 @@ Memory Extraction Operation 不应设计成每个 `TOOL_RESULT_ACCEPTED` 后立�
 - compact 前不阻塞普通 Run 做 extraction；短链路追问继续依赖 recent raw turns / older raw turns / 已有 memory。
 - `TOOL_RESULT_ACCEPTED` 后记录 accepted evidence / artifact / refs，供后续 compact 使用，不要求同步 LLM extraction。
 - 正常 compact 时，复用同一次 LLM structured JSON 调用，同时生成 episode summary candidate、pinned state patch candidate、
-  `evidence_backed_fact_candidates` 与 preservation / diagnostic 信息；正常路径不额外增加第二次 LLM 调用。
+  `evidence_backed_fact_candidates`、minimum preserve item candidates 与 preservation / diagnostic 信息；正常路径不额外增加第二次 LLM 调用。
 - bounded repair 只有在 JSON parse、schema、evidence refs、quality check 或 preservation decision 失败时才触发；repair 属于失败修复路径，
   不是正常路径固定成本。
 - 每次 compact 只把其覆盖范围内的历史 raw evidence 转化为 stable facts / continuity summary；compact 后新产生的 user input、
@@ -188,6 +201,10 @@ Memory Extraction Operation 不应设计成每个 `TOOL_RESULT_ACCEPTED` 后立�
 `pinned_state_patch_candidate` 可以来自用户目标、约束、当前任务语境和 evidence；`evidence_backed_fact_candidates` 只能来自 accepted
 tool evidence，并且每条必须带 `claim_text`、`evidence_refs` 和 evidence kind。
 
+Minimum preserve 是同一 structured compact output 中的 continuity 机制。它保护“第二个因素”“这个数”“刚才那部分”等指代解析所需的
+最小上下文，不保留整段长 user input，也不承担事实真源职责。对用户粘贴长文本并要求提炼三个因素的场景，compact 后应保留有序
+extracted items 中能解析“第二个因素”的 bounded item；后续 RunInputBuilder 注入该 continuity item，而不是依赖完整原文仍在。
+
 Host 的职责不是解释这些字段，而是：
 
 - 持久化 source claim 与 provenance。
@@ -198,17 +215,18 @@ Host 的职责不是解释这些字段，而是：
 - 保证 LLM extractor 调用发生在 Host governance operation 内，输出只作为 candidate，经 accept barrier 后才进入 EventLog /
   Conversation Memory projection。
 
-## 待裁决问题
+## 已裁决问题
 
-1. 是否将 `verified_facts` 全量改名为 `evidence_backed_facts`，并把定义冻结为“可复用 claim 绑定到 accepted evidence”。
-2. Tool result contract 是否只要求提供可审计 evidence envelope，而不要求 tool provider 直接生成最终 memory fact。
-3. 是否新增 Host-governed Memory Extraction Operation，使用 LLM extractor 生成 typed JSON candidate，并允许与 pinned state patch
-   在同一轮 LLM 调用中生成。
-4. Extraction 运行时机是否采用 compaction-gated extraction：compact 前不阻塞普通 Run；`TOOL_RESULT_ACCEPTED` 后只记录 evidence
-   / artifact / refs；正常 compact 的同一次 structured JSON 调用额外生成 `evidence_backed_fact_candidates`；repair 只在质量失败时触发。
-5. LLM extractor JSON schema、parse failure、schema failure、evidence ref mismatch、bounded repair 与 diagnostic 语义如何冻结。
-6. `recent_raw_turns_floor` 是否需要改名或重新定义，避免被误解为完整 raw tool transcript 保底。
-7. RunInputBuilder 渲染 `evidence_backed_facts` 时，是否必须包含 `claim_text` 与 `evidence_refs`，而不能只有 digest / ref；source / locator 细节通过 evidence id 回查 accepted evidence envelope。
+1. 旧 `verified_facts` 全量改名 / 迁移为 `evidence_backed_facts` 或等价 typed view，并把定义冻结为“可复用 claim 绑定到 accepted evidence”。
+2. Tool result contract 只要求提供可审计 accepted evidence envelope，不要求 tool provider 直接生成最终 memory fact。
+3. Host-governed Memory Extraction Operation 使用 LLM extractor 生成 typed JSON candidate，并允许与 pinned state patch 在同一轮 LLM 调用中生成。
+4. Extraction 运行时机采用 compaction-gated extraction：compact 前不阻塞普通 Run；`TOOL_RESULT_ACCEPTED` 后只记录 evidence /
+   artifact / refs；正常 compact 的同一次 structured JSON 调用额外生成 `evidence_backed_fact_candidates`；repair 只在质量失败时触发。
+5. LLM extractor JSON schema、parse failure、schema failure、evidence ref mismatch、minimum preserve item validation、bounded repair 与 diagnostic
+   语义由 Host accept barrier 冻结；无可接受 fact candidate 时只记录 diagnostic / repair outcome，不合成 neutral fallback fact。
+6. `recent_raw_turns_floor` 保留命名并重新定义为最近 raw turns 的最低保留数量；它服务交互连续性，不表达完整 raw tool transcript 保底。
+7. RunInputBuilder 渲染 `evidence_backed_facts` 时必须包含 `claim_text` 与 `evidence_refs`，不能只有 digest / ref；source / locator
+   细节通过 evidence id 回查 accepted evidence envelope。
 
 ## 旧项目测试 Prompt 反推的最低验收语义
 
@@ -255,7 +273,7 @@ Host 的职责不是解释这些字段，而是：
 
 - 单轮 user input 很长时，Context Governance / Memory 必须保住当前追问所需的最小上下文。
 - “第二个因素”这类指代不能因为预算裁剪或 compaction 丢失。
-- assistant 可降级为摘要，但当前追问依赖的 user text / extracted items 必须保真。
+- assistant 可降级为摘要，但当前追问依赖的 extracted items 必须以 bounded continuity item 保真；不要求保留完整长 user input。
 
 ### compaction 后 confirmed facts 不漂移
 

@@ -94,7 +94,7 @@ execution profile 选择是 Service / composition root 的显式业务决策，�
 
 usage 是 provider capability 驱动的治理观测信号，不是 scene / Service 业务风格参数。流式 OpenAI-compatible 请求在 `RunnerCallOptions.stream=True` 且 `RunnerSpec.supports_stream_usage=True` 时默认请求 `stream_options.include_usage=true`；非流式响应如果 provider 返回 `usage`，Engine 默认读取并上报。Config 不提供 `usage_enabled`、`collect_usage`、`include_usage` 这类 override，也不引入独立 `supports_usage` 字段。Engine 只负责如实上报 usage，不理解 Host budget；Host ingest 负责 durable 化 `usage_reported` 并保留 attempt / execution context、估算 digest、policy ref 等后续消费所需关联信息。Context Governance 可主动消费 usage，但 usage 是 post-call observation，只用于估算器校准、diagnostic 与后续 Run / 后续 compaction 治理参考；不得回头修改当前已经完成的 dispatch decision。usage 缺失、provider 不支持 usage 或 usage 字段格式异常都不得导致 Run 失败。
 
-`memory_projection_policy` 对齐 Host public `MemoryProjectionPolicy`，采用 ratio / floor / cap 自适应预算模型。Service / composition root 从 effective model config 读取 `context_window_tokens`，作为 `MemoryProjectionPolicy.context_window_size` 直接传入 typed policy。policy 至少包含 `context_window_size`、`max_pinned_items`、`max_verified_facts`、`max_working_assumptions`、`recent_raw_turns_floor`、stable layer ratio/floor/cap、history pool ratio/floor/cap、raw turn ratio/floor/cap、`max_lag_events_for_inline_delta` 与 `max_delta_repair_events`。policy 存在即表示装配 stateful memory projection；不再使用 `enabled` 字段表达单轮 / 多轮语义。
+`memory_projection_policy` 对齐 Host public `MemoryProjectionPolicy`，采用 ratio / floor / cap 自适应预算模型。Service / composition root 从 effective model config 读取 `context_window_tokens`，作为 `MemoryProjectionPolicy.context_window_size` 直接传入 typed policy。policy 至少包含 `context_window_size`、`max_pinned_items`、`max_evidence_backed_facts`、`max_working_assumptions`、`recent_raw_turns_floor`、stable layer ratio/floor/cap、history pool ratio/floor/cap、raw turn ratio/floor/cap、`max_lag_events_for_inline_delta` 与 `max_delta_repair_events`。policy 存在即表示装配 stateful memory projection；不再使用 `enabled` 字段表达单轮 / 多轮语义。
 
 `tool_truncation_policy` 只配置默认治理参数，不配置 per-tool strategy / target。它至少包含 `enabled`、`default_cursor_ttl_seconds` 与 `default_limits`，其中 `default_limits` 覆盖 `text_chars.max_chars`、`text_lines.max_lines`、`list_items.max_items` 与 `binary_bytes.max_bytes`。工具声明负责提供 `ToolTruncateSpec.strategy`、`target_field` / `field_path` 与是否启用截断；如果工具声明启用截断但未提供 limit 或 ttl，Service / composition root 用 policy default 补齐成 effective truncate spec。`fetch_more` 名称由 `FrameworkToolName.FETCH_MORE` 固定，不作为配置项。
 
@@ -2559,11 +2559,20 @@ ref / digest 与 opaque source / locator descriptor。Host 只校验 `evidence_r
 working assumption 当作 evidence。Host 不校验 evidence 的业务形状，不解析 locator，不证明 excerpt 逐字覆盖 claim，也不理解
 metric / subject / period 的业务含义。
 
+当 compact 输入中存在 accepted evidence，但 LLM extractor 无法形成可接受的 `evidence_backed_fact` candidate 时，Host 不得合成
+neutral fallback fact。正确行为是保留 accepted evidence envelope / artifact refs，记录 projection diagnostic、candidate reject
+reason 或 bounded repair 结果；episode summary 与 minimum preserve 仍可保留导航和连续性，但不能以 fallback fact 形式进入 stable facts。
+
 `working_assumptions` 承载用户说法、assistant 推断、早期弱信号和待验证候选。它们不能冒充 `evidence_backed_facts`；后续若被用于关键归因，
 必须由当前 Run 召回并验证对应工具事实后，才能形成 evidence-backed claim。
 
-`conversation_continuity` 承载最近 raw turns、assistant conclusion 与 episode summaries，只服务追问连续性。episode summary
+`conversation_continuity` 承载最近 raw turns、assistant conclusion、minimum preserve items 与 episode summaries，只服务追问连续性。episode summary
 只能做导航，不能替代 evidence anchor、source ref、chunk ref、fingerprint 或 claim status。
+
+`minimum_preserve_items` 是 compact structured output 中的 bounded continuity item，用于保护当前或下一轮追问所需的最小指代解析上下文。
+例如用户粘贴长文本并要求提炼三个因素后，下一轮追问“第二个因素”时，minimum preserve 应保留有序 extracted items 中能解析
+“第二个因素”的 item，而不是保留整段长 user input。minimum preserve 不属于事实真源，不产生 `evidence_backed_fact`；它只进入
+conversation continuity / navigation。
 
 RunInputBuilder 注入 memory 的顺序必须体现财报分析优先级：
 
@@ -2582,6 +2591,7 @@ RunInputBuilder 注入 memory 的顺序必须体现财报分析优先级：
 - `final_answer` 是 assistant role 产出的最终回答，只能作为 raw turn / assistant conclusion 参与连续性。
 - `final_answer` 绝不能自动升级为 `evidence_backed_fact`。
 - `evidence_backed_fact` 只接受 accepted tool evidence refs。
+- 缺少可接受的 `evidence_backed_fact` candidate 时只能记录 diagnostic / repair outcome，不得生成 neutral fallback fact。
 - 用户输入进入 pinned state、约束或待验证候选，不直接成为 `evidence_backed_fact`。
 - memory projection 只消费 canonical facts。
 - preview / reasoning / display-only facts 不进入 memory。
@@ -2601,6 +2611,11 @@ RunInputBuilder 注入 memory 的顺序必须体现财报分析优先级：
   stale / conflict / missing-evidence reason。P9 不创建独立 RunInputBuildTrace 子系统。
 - recent raw turns floor 是下限保底，不是 history 上限；预算允许时可以注入更多 older raw turns。older raw turns 与 episode summaries
   共享单一 history pool，超预算时先降级 episode summaries / older raw turns，最后才降级 recent raw turns。
+- `recent_raw_turns_floor` 保留现有命名，语义是最近 raw turns 的最低保留数量，用于代词指代、局部追问、刚发生的用户输入 /
+  assistant conclusion / tool result 展示等交互连续性。它不是 financial fact retention 机制，不保证完整 raw tool transcript
+  跨 compact 可见；compact 覆盖范围内的历史事实稳定性由 `evidence_backed_facts` 承担。
+- minimum preserve items 只保留指代解析所需的最小 extracted context，不保留整段长输入。Host 只校验 item text 非空且长度受限、
+  source refs 指向 compact input、item 数量受 policy 限制、preserve reason 属于允许枚举；Host 不解释 item 业务含义。
 - P9 只实现 session-level memory projection 与 provider 边界；长期 retrieval index、业务 signal ledger、signal-to-outcome
   verification 与 public memory edit / reset / forget API 均不进入第一版。
 
@@ -2655,15 +2670,18 @@ P10 必须补齐 stable layer / history pool 的生成来源，而不是只做�
 - evidence-backed fact candidates：基于 compact 输入中的 accepted evidence envelope 生成的 `claim_text`、`evidence_kind`、
   `evidence_refs` 与可选 opaque attributes。它们与 episode summary / pinned state patch 可由同一次 structured JSON proposal
   产生，正常 compact 路径不得因此固定增加第二次 LLM 调用。
+- minimum preserve item candidates：当前追问或下一轮短链路追问中，理解代词、序号、局部承接所需的最小 continuity items。每条至少
+  包含 item id、label、text、source refs 与 preserve reason；它们可与 episode summary / pinned state patch / evidence-backed fact
+  candidates 由同一次 structured JSON proposal 产生。
 - preservation evidence：每条 summary / patch candidate 对应的输入 event refs、tool fact refs、memory snapshot cursor 或 compact input range。
 - quality check result：是否保留 current user input、accepted tool fact refs、evidence anchors、open questions / assumptions refs，以及 dropped / summarized ranges。
 
-Host 接受 compactor 输出后，`CONTEXT_COMPACTED` payload 必须记录 compact artifact ref、episode summary candidate、pinned state patch candidate、evidence-backed fact candidates、preserved fact refs、dropped / summarized ranges、quality check result 与 budget after compact。是否将 episode summary / pinned patch / evidence-backed fact candidates materialize 到 Conversation Memory，由 memory projection policy 消费已提交 canonical facts 决定；Context Governance 不得直接写 memory snapshot、memory table 或 RunInputBuilder 私有 message 缓存。
+Host 接受 compactor 输出后，`CONTEXT_COMPACTED` payload 必须记录 compact artifact ref、episode summary candidate、pinned state patch candidate、evidence-backed fact candidates、minimum preserve item candidates、preserved fact refs、dropped / summarized ranges、quality check result 与 budget after compact。是否将 episode summary / pinned patch / evidence-backed fact candidates / minimum preserve item candidates materialize 到 Conversation Memory，由 memory projection policy 消费已提交 canonical facts 决定；Context Governance 不得直接写 memory snapshot、memory table 或 RunInputBuilder 私有 message 缓存。
 
 Compactor 与 retry / repair 的 owner 边界固定为：
 
 - Runner/provider 层负责低层 transport retry：network、timeout、HTTP 429、HTTP 5xx、stream idle timeout 等由 Engine Runner 按 `RunnerSpec.max_retries`、`Retry-After` 与退避策略在一次 compactor proposal 调用内处理。该层 retry 不拥有 Host governance，不 append EventLog，不 emit HostEvent，只通过 RunnerEvent / log / attempt summary 进入 Host diagnostic。
-- `LLMContextCompactor` 是 Host-owned 单次 proposal executor。它把 immutable `CompactionRequest` 与 Host-owned prompt/scene 映射为一次 structured JSON LLM proposal，并返回 episode summary、pinned state patch、evidence-backed fact candidates、preservation / diagnostic candidate 或 typed failure；它不决定是否重试、不更新 Run / Attempt、不写 EventLog、不写 artifact、不做 memory projection。
+- `LLMContextCompactor` 是 Host-owned 单次 proposal executor。它把 immutable `CompactionRequest` 与 Host-owned prompt/scene 映射为一次 structured JSON LLM proposal，并返回 episode summary、pinned state patch、evidence-backed fact candidates、minimum preserve item candidates、preservation / diagnostic candidate 或 typed failure；它不决定是否重试、不更新 Run / Attempt、不写 EventLog、不写 artifact、不做 memory projection。
 - Host Context Governance 拥有 semantic repair / retry：非 final answer、空 summary、解析失败、candidate shape 非法、缺 preservation evidence、quality check reject、compact 后仍超过 hard threshold 等，都由 Host compaction operation 决定是否发起 bounded repair attempt。repair attempt 必须复用同一个 immutable compaction request、同一套 Host-owned scene、同一 durable operation id，并在每次外部 LLM call 前后 recheck Run / Attempt / Session / cursor state。
 - stale / cancelled / session closed / execution replaced / cursor mismatch 不是可 repair 错误；Host 必须丢弃 stale proposal，不写 `CONTEXT_COMPACTED`。
 - retry budget 耗尽后只允许写一个最终 `CONTEXT_COMPACTION_FAILED`，不能让 Service replay，不能让 Engine retry Host governance，也不能无限 compact。
@@ -2689,7 +2707,7 @@ stable layer / history pool 的来源按事实等级固定：
 - `pinned_state.confirmed_subjects` 与 `pinned_state.open_questions` 主要来自 P10 accepted pinned state patch candidate、用户显式确认或后续 steer / goal-change owner；不得仅凭未校验 LLM 文本直接写入。
 - `evidence_backed_facts` 只来自 accepted evidence refs。compact 前不阻塞普通 Run 做 extraction；compact 时复用同一次 structured JSON proposal 生成 `evidence_backed_fact_candidates`。本次 compact 覆盖范围内的历史 evidence-backed claims 在 compact 后通过 accepted `evidence_backed_facts` 进入 stable memory，不再依赖 compact 前 raw turns 或 episode summary 复原；compact 后新产生的 user input、assistant answer、tool result 继续作为新的 raw turns / accepted evidence 进入后续 memory pipeline。
 - P10 episode summary 中的 confirmed facts 只能引用或摘要已存在 facts / evidence refs，不能新建 `evidence_backed_fact`，也不能替代 `evidence_backed_fact`。
-- `conversation_continuity` 的 raw turns 来自 `USER_INPUT_ACCEPTED` 与 `RUN_SUCCEEDED`；episode summaries 来自 accepted compact output，并继续只作为 continuity / navigation，不替代 evidence anchors。
+- `conversation_continuity` 的 raw turns 来自 `USER_INPUT_ACCEPTED` 与 `RUN_SUCCEEDED`；episode summaries 与 minimum preserve items 来自 accepted compact output，并继续只作为 continuity / navigation，不替代 evidence anchors 或 `evidence_backed_facts`。
 
 ### 25.1 Compact Event 响应路径
 

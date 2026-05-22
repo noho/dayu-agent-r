@@ -852,17 +852,17 @@ Phase 按依赖关系推进：先实现被其它阶段依赖的公共契约、ru
 
 不做：
 - 不实现跨多年长期记忆。
-- 不把 final_answer 自动升级为 verified fact。
+- 不把 final_answer 自动升级为 evidence-backed fact。
 - 不让 memory projection 写 EventLog。
 
 关键设计问题：
-- 已确认 memory view 分为 `pinned_state`、`verified_facts`、`working_assumptions`、`conversation_continuity` 四类；不得把
+- 已确认 memory view 分为 `pinned_state`、`evidence_backed_facts`、`working_assumptions`、`conversation_continuity` 四类；不得把
   tool-verified fact、assistant conclusion、用户说法和 episode summary 混成无结构字符串列表。
-- 已确认 verified fact 只接受工具事实，并必须保留 fact summary、producer / tool name、`event_id` / `event_sequence`、
+- 已确认 evidence-backed fact 只接受工具事实，并必须保留 fact summary、producer / tool name、`event_id` / `event_sequence`、
   tool result ref、digest / source ref，以及可选 evidence anchor / opaque subject refs。
 - 已确认 RunInputBuilder memory 注入顺序为：用户目标与约束、已确认主体和口径、tool-verified facts、open questions /
   working assumptions、recent raw turns、episode summaries。
-- 已确认预算策略必须克制：pinned / verified facts 不参与 history pool 竞争但有结构化尺寸上限与诊断；recent raw turns floor
+- 已确认预算策略必须克制：pinned / evidence-backed facts 不参与 history pool 竞争但有结构化尺寸上限与诊断；recent raw turns floor
   是下限不是上限；older raw turns 与 episode summaries 共用单一 history pool；超预算时先降级 summary / older raw turns。
 - 已确认 projection lag 必须显式可观测：小 delta 可由 EventLog 补齐并记录 diagnostic；缺失、损坏或超阈值进入 projection repair /
   context governance path；不得触发 Run recovery。
@@ -1603,8 +1603,8 @@ Plan 必须额外收口的 readiness review checklist：
 
 状态：
 - design discussion / design write-back in progress。`evidence_backed_facts`、accepted evidence envelope 与 compaction-gated
-  extraction 稳定裁决已写回 `docs/host/design.md`；进入 implementation 前仍必须完成剩余 Conversation Memory 设计裁决、
-  handoff implementation-ready plan、plan review 与用户确认。
+  extraction、recent_raw_turns_floor、minimum preserve 与 no-fallback-facts 稳定裁决已写回 `docs/host/design.md`；进入
+  implementation 前仍必须完成 handoff implementation-ready plan、plan review 与用户确认。
 
 目标：
 - 从买方财报分析 Agent 的第一性原理优化 Conversation Memory，使同一 session 内已由工具确认的关键财务事实能跨轮、
@@ -1622,15 +1622,15 @@ Plan 必须额外收口的 readiness review checklist：
 前置条件：
 - Phase 12 runtime assembly / config governance 已完成并 merge。
 - `docs/host/conversation-memory-first-principles-discussion.md` 已记录第一性原理讨论、旧项目测试 prompt 反推的最低验收语义
-  与待裁决问题；该讨论稿不是设计真源。
+  与已裁决问题；该讨论稿不是设计真源。
 - P12.5 design discussion 必须先裁决 evidence_backed_fact contract、recent raw turns 语义、minimum preserve 与
   compact summary / evidence_backed_fact 的边界，再进入 plan gate。
 
 进入条件：
 - `docs/host/design.md` 已写入 P12.5 稳定裁决，不保留讨论痕迹。
-- 明确 Host 是否需要将 `VerifiedFactView` 迁移为 `EvidenceBackedFactView` 或等价 typed view，并扩展 projection payload contract / RunInputBuilder memory rendering。
+- 明确 Host 将旧 `VerifiedFactView` 迁移为 `EvidenceBackedFactView` 或等价 typed view，并扩展 projection payload contract / RunInputBuilder memory rendering。
 - 明确 ToolRuntime / tool result accept path 如何记录 accepted evidence envelope；tool provider 不负责直接生成 memory facts，Host 不理解 evidence locator 语义。
-- 明确 P12.5 是否需要新增 smoke / integration 测试覆盖财报事实跨轮复用。
+- 明确 P12.5 需要新增 smoke / integration 测试覆盖财报事实跨轮复用、post-compaction fact reuse 与 minimum preserve。
 
 范围：
 - 允许修改：`docs/host/design.md`、本文档、Host Conversation Memory typed contracts、memory projection、RunInputBuilder
@@ -1647,13 +1647,13 @@ Plan 必须额外收口的 readiness review checklist：
 - 不让 assistant final answer 自动升级为 `evidence_backed_fact`。
 - 不让 Host 解释“收入”“毛利”“净息差”等财报业务语义；Host 只保存业务中立 structured fact、opaque refs 与 provenance。
 
-关键设计问题：
-- 是否将 `verified_facts` 改名 / 迁移为 `evidence_backed_facts`，定义为 `claim_text + accepted evidence_refs`，而不是 Host 理解 source / locator。
-- Tool result accept path 如何形成 accepted evidence envelope；tool provider 不直接决定最终 memory facts。
-- 缺少可投影 `evidence_backed_fact` 时，Memory projection 是只生成 diagnostic，还是继续生成 neutral fallback fact。
-- `recent_raw_turns_floor` 是否需要改名或重新定义，避免被误解为完整 raw tool transcript 保底。
-- RunInputBuilder 渲染 `evidence_backed_facts` 时，是否必须包含 `claim_text` 与 `evidence_refs`，而不能只有 digest / ref。
-- minimum preserve 在单轮极长 user input、assistant extracted items 与 compaction 后追问中的 owner 与验收边界。
+关键设计裁决：
+- 旧 `verified_facts` 改名 / 迁移为 `evidence_backed_facts` 或等价 typed view；定义冻结为 `claim_text + accepted evidence_refs`，而不是 Host 理解 source / locator。
+- Tool result accept path 形成 accepted evidence envelope；tool provider 不直接决定最终 memory facts。
+- 缺少可投影 `evidence_backed_fact` 时，只能生成 diagnostic / repair outcome 并保留 accepted evidence refs，不得继续生成 neutral fallback fact。
+- `recent_raw_turns_floor` 已裁决保留名称；语义是最近 raw turns 的最低保留数量，用于交互连续性，不承担 financial fact retention 或跨 compact 完整 tool transcript 保真。
+- RunInputBuilder 渲染 `evidence_backed_facts` 时必须包含 `claim_text` 与 `evidence_refs`，不能只有 digest / ref。
+- minimum preserve 已裁决为 compact structured output 中的 bounded continuity item，用于保护指代解析；不保留整段长 user input，不承担事实真源职责。
 
 交付物：
 - updated `docs/host/design.md`
@@ -1666,7 +1666,7 @@ Plan 必须额外收口的 readiness review checklist：
 建议 slice 切分：
 - Slice 1: design write-back and public memory contract plan，冻结 evidence_backed_facts / recent continuity / minimum preserve 语义。
 - Slice 2: memory projection contract and evidence_backed_fact rendering，确保 compact 覆盖范围内的历史工具证据 claim 跨 compaction 稳定可见且带 evidence refs / diagnostic。
-- Slice 3: recent continuity and minimum preserve hardening，覆盖代词追问与极长输入后追问。
+- Slice 3: recent continuity and minimum preserve hardening，覆盖代词追问、极长输入后追问与 compact 后 minimum preserve item 注入。
 - Slice 4: compaction preservation and smoke validation，覆盖 confirmed facts 跨 compaction 不漂移。
 - Slice 5: aggregate validation、README sync、deepreview 与 residual tracking。
 
@@ -1674,8 +1674,10 @@ Plan 必须额外收口的 readiness review checklist：
 - unit tests: accepted evidence envelope 能被 `evidence_backed_fact_candidates` 引用，Host accept barrier 只校验 `claim_text + evidence_refs` 通用 contract，不解析 source / locator。
 - unit tests: RunInputBuilder memory block 渲染 `evidence_backed_facts` 时包含 `claim_text` 与 `evidence_refs`，不能只有 digest / ref。
 - unit tests: recent continuity 保底覆盖最近追问指代，但不被当作 `evidence_backed_fact` 真源。
+- unit tests: minimum preserve item candidate 只作为 continuity item materialize，Host 校验 item text / source refs / reason / 数量上限，且不生成 `evidence_backed_fact`。
 - integration tests: no-compaction 短链路中，Run 1 查收入 / 毛利后 Run 2 问毛利率，后续 Run 能基于 recent raw turns / available context 稳定回答。
 - integration tests: post-compaction 中，同一 session 先查收入 / 毛利，触发 compact 后同一次 structured compact proposal 生成 `evidence_backed_fact_candidates`，后续 Run 能基于 `evidence_backed_facts` 稳定回答毛利率。
+- integration tests: 长 user input 提炼三个因素并触发 compact 后，下一轮追问“第二个因素”能基于 minimum preserve item 正确解析，不依赖完整原文保留。
 - integration tests: compaction 后 confirmed facts 不漂移；episode summary 只能引用 `evidence_backed_facts` / evidence refs，不能替代 facts。
 - pyright: affected host / tests pass with no new or expanded errors。
 - docs: `dayu/host/README.md`、`dayu/README.md`、`tests/README.md` 按触发规则同步。
@@ -1685,7 +1687,7 @@ Plan 必须额外收口的 readiness review checklist：
   Continuity。
 - compact 覆盖范围内的历史工具证据 claim 可通过 `claim_text + accepted evidence_refs` contract 进入 stable `evidence_backed_facts`，跨 compaction 稳定可见。
 - recent raw turns 只承担交互连续性保底，不承担财务事实保真。
-- minimum preserve 对长 user input 后追问有可验证路径。
+- minimum preserve 对长 user input 后追问有可验证路径：compact output 产出 bounded continuity item，后续 RunInputBuilder 注入该 item 以解析指代。
 - Aggregate deepreview from at least two review Agents PASS；control_doc records residual risks with owners.
 
 后续依赖：
@@ -1897,10 +1899,11 @@ Plan 必须额外收口的 readiness review checklist：
 
 Owner / destination：Phase 12.5 design discussion / plan gate。
 
-- evidence_backed_fact contract：已裁决 `verified_facts` 应迁移为 `evidence_backed_facts` 或等价 typed view；最小 contract 是 `claim_text + accepted evidence_refs`，Host 不理解 source / locator 语义。
+- evidence_backed_fact contract：已裁决旧 `verified_facts` 应迁移为 `evidence_backed_facts` 或等价 typed view；最小 contract 是 `claim_text + accepted evidence_refs`，Host 不理解 source / locator 语义。
 - accepted evidence envelope：已裁决 tool provider 不直接生成最终 memory facts；ToolRuntime / tool result accept path 负责记录 accepted evidence envelope，至少保证每个 accepted tool result 有稳定 evidence id。
-- recent raw turns 语义：裁决 `recent_raw_turns_floor` 是否改名或重新定义；其职责应聚焦交互连续性，而非财务事实保真。
-- minimum preserve：裁决单轮极长 user input 后追问的最小保留语义、降级顺序与测试验收。
+- recent raw turns 语义：已裁决保留 `recent_raw_turns_floor` 名称；其职责是最近 raw turns 的最低保留数量，聚焦交互连续性，而非财务事实保真。
+- minimum preserve：已裁决为 compact structured output 中的 bounded continuity item；保护指代解析，不保留整段长输入，不承担事实真源职责。
+- no fallback facts：已裁决缺少可接受 `evidence_backed_fact` candidate 时只记录 diagnostic / repair outcome，不合成 neutral fallback fact。
 - compaction 后 confirmed facts 不漂移：已裁决 compact 同一次 structured JSON proposal 生成 episode summary candidate、pinned state patch candidate 与 `evidence_backed_fact_candidates`；episode summary 不得替代事实真源。
 - 财报工具接入后续：P12.5 可冻结 accepted evidence envelope contract；真实财报工具保证 tool result accept path 可形成 evidence envelope 的迁移 owner 为后续 Fins / tool provider work unit，除非用户明确扩大 P12.5 scope。
 
@@ -2820,8 +2823,8 @@ P9 implementation。Accepted plan commit 为 `469baaa`。
 
 Controller 按 `$phaseflow` 启动 P9。总控文档识别当前状态为 P8 completed / draft-PR-pass，下一 work unit 为 Phase 9
 `Conversation Memory / Session Memory Projection`。用户确认 P9 phase discussion 裁决：P9 是“财报分析工作台状态投影”，
-不是聊天记录压缩器；memory view 分为 `pinned_state`、`verified_facts`、`working_assumptions`、
-`conversation_continuity`；verified facts 只接受工具事实并保留 evidence / provenance refs；RunInputBuilder 注入顺序按财报分析优先级固定；
+不是聊天记录压缩器；memory view 分为 `pinned_state`、`evidence_backed_facts`、`working_assumptions`、
+`conversation_continuity`；evidence-backed facts 只接受工具事实并保留 evidence / provenance refs；RunInputBuilder 注入顺序按财报分析优先级固定；
 预算策略保持克制；projection lag 必须显式可观测且不得触发 Run recovery；P9 不实现 LLM compaction 写 truth；测试重点围绕反幻觉与
 EventLog 可重建。用户同时确认参考 issue 39 的未来长期证据召回目标，但 P9 只预留 Host 中立 evidence anchor / claim status /
 provenance / trace included-excluded 边界，不实现长期 retrieval、业务 signal ledger 或 signal-to-outcome verification。`docs/host/design.md`
