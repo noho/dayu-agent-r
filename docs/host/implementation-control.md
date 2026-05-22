@@ -1612,7 +1612,7 @@ Plan 必须额外收口的 readiness review checklist：
   `docs/reviews/phase12-5-plan-review-controller-adjudication-20260522.md`；plan re-review artifacts 为
   `docs/reviews/phase12-5-plan-rereview-mimo-20260522.md`、
   `docs/reviews/phase12-5-plan-rereview-ds-20260522.md`、
-  `docs/reviews/phase12-5-plan-rereview-controller-adjudication-20260522.md`。
+  `docs/reviews/phase12-5-plan-rereview-controller-adjudication-20260522.md`。Accepted plan local commit 为 `793f2c8`。
 
 目标：
 - 从买方财报分析 Agent 的第一性原理优化 Conversation Memory，使同一 session 内已由工具确认的关键财务事实能跨轮、
