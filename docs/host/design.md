@@ -20,7 +20,7 @@ Host 设计必须优先保证：
 - 远端执行环境不能拥有 Host 状态。
 - 工具执行受 Host / ToolRuntime 治理，包括截断、等待、幂等与语义级重复调用治理。
 - 工具事实、证据锚点和审计链可追溯。
-- assistant final answer 不自动成为 verified fact。
+- assistant final answer 不自动成为 `evidence_backed_fact`。
 
 ## 2. 分层边界
 
@@ -2335,7 +2335,7 @@ Replay：
 - 事实内容脏、幻觉、业务归因错误、证据不足、证据冲突不属于 replay 场景；这些情况必须通过新分析 / follow-up / retry / evidence retrieval / 新工具事实解决。
 - Replay 通过函数式 `replay(run)` 语义触发；公共 API 为 `replay_run(host, run_id, request)`，语义是输入源 Run、返回关联的新 Run。
 - Replay 必须有 `client_request_id` / idempotency key 和 replay reason。
-- Replay 不重开原 `SUCCEEDED` Run；旧 final answer 保留为历史 assistant conclusion / rejected candidate，不是 verified fact。
+- Replay 不重开原 `SUCCEEDED` Run；旧 final answer 保留为历史 assistant conclusion / rejected candidate，不是 `evidence_backed_fact`。
 - Replay 创建关联的新 Run，新 Run 再创建自己的 Attempt 和 `execution_id`。
 - Replay 通过 EventLog 重建 messages，复用源 Run accepted tool facts / tool messages / evidence anchors。
 - Replay 是 no-tool `AgentRunRequest.messages` 结构修复调用，不重新执行工具，不新增工具事实。主防线在 RunInputBuilder：replay Attempt 构造 `AgentRunRequest` 时不暴露 tool schemas，模型不应获得可调用工具。ToolRuntime 的 replay policy 拒绝只是 defense-in-depth。
@@ -2472,7 +2472,7 @@ Service / caller 可以提供 system messages 或场景装配参数，但不能�
 messages 构造顺序必须稳定：
 
 1. Host / Service 提供的 system 与场景约束。
-2. session memory stable layer：pinned state、tool-verified facts、open questions、assumptions。
+2. session memory stable layer：pinned state、evidence-backed facts、open questions、assumptions。
 3. 当前 `USER_INPUT_ACCEPTED` 与当前 Run 需要的 canonical facts，按 `event_sequence` 顺序投影为对模型有语义的 messages。
 4. replay / retry / steer / resume guidance。
 5. 当前 attempt 的工具 schema snapshot 与运行 policy。
@@ -2484,10 +2484,10 @@ RunInputBuilder 的输出必须能由输入 fact refs、memory snapshot cursor�
 应进入 messages 的典型事实：
 
 - `USER_INPUT_ACCEPTED`、steer input、resume input、follow-up input。
-- assistant final answer / assistant conclusion，作为对话连续性，不是 verified fact。
+- assistant final answer / assistant conclusion，作为对话连续性，不是 `evidence_backed_fact`。
 - accepted tool result、tool terminal result、evidence anchor / ref / digest。
 - tool awaiting resolved 后的 terminal / result fact。
-- Host memory block：pinned state、tool-verified facts、open questions、assumptions。
+- Host memory block：pinned state、evidence-backed facts、open questions、assumptions。
 - `GUIDANCE_INSERTED`，如果影响后续 iteration。
 - 必要的 cancel / resume / steer 说明，如果它影响当前继续目标。
 
@@ -2528,7 +2528,7 @@ Conversation Memory 不是聊天记录压缩器，而是财报分析工作台状
 Conversation Memory
   -> stable layer
       -> pinned_state
-      -> verified_facts
+      -> evidence_backed_facts
       -> working_assumptions
       -> open_questions
       -> evidence anchors / tool facts / provenance
@@ -2546,12 +2546,20 @@ Conversation Memory
 - `user_constraints`
 - `open_questions`
 
-`verified_facts` 只来自工具事实。每条 verified fact 必须能解释其证据来源，至少保留 fact summary、producer / tool name、
-`event_id` / `event_sequence`、tool result ref、digest / source ref，以及可选的 evidence anchor / entity / subject /
-period / metric / section opaque refs。Host 只保存中立 ref 与 provenance，不保存财报业务原文，不理解 company /
-business-line / technology release 等业务语义。
+`evidence_backed_facts` 只来自 accepted tool evidence。它不表示 Host 证明世界事实为真，而表示一个自包含 claim 绑定到了
+已接受 evidence，因此不是 assistant 幻想、episode summary 或 user claim。每条 `evidence_backed_fact` 至少包含
+`claim_text`、`evidence_kind`、`evidence_refs`、producer / extraction operation ref、`event_id` / `event_sequence` 与可选
+opaque attributes。`evidence_refs` 指向 accepted evidence envelope；第一版每个 accepted tool result 至少形成一个稳定
+`evidence_id`，多个 facts 可以引用同一个 `evidence_id`。更细粒度 item-level evidence id 可后续扩展，但不得要求 Host
+理解 URL、年报章节、chunk、span、row、cell 或其它 locator。
 
-`working_assumptions` 承载用户说法、assistant 推断、早期弱信号和待验证候选。它们不能冒充 verified facts；后续若被用于关键归因，
+Accepted evidence envelope 至少记录 evidence id、producer event ref、tool name、tool query、bounded tool result / payload
+ref / digest 与 opaque source / locator descriptor。Host 只校验 `evidence_refs` 指向已接受 evidence、`claim_text` 非空且
+长度受限、`evidence_kind` 属于允许枚举，以及 candidate 不把 assistant final answer、episode summary、user input 或
+working assumption 当作 evidence。Host 不校验 evidence 的业务形状，不解析 locator，不证明 excerpt 逐字覆盖 claim，也不理解
+metric / subject / period 的业务含义。
+
+`working_assumptions` 承载用户说法、assistant 推断、早期弱信号和待验证候选。它们不能冒充 `evidence_backed_facts`；后续若被用于关键归因，
 必须由当前 Run 召回并验证对应工具事实后，才能形成 evidence-backed claim。
 
 `conversation_continuity` 承载最近 raw turns、assistant conclusion 与 episode summaries，只服务追问连续性。episode summary
@@ -2561,24 +2569,29 @@ RunInputBuilder 注入 memory 的顺序必须体现财报分析优先级：
 
 1. 用户目标与约束。
 2. 已确认主体和口径。
-3. tool-verified facts。
+3. evidence-backed facts。
 4. open questions / working assumptions。
 5. recent raw turns。
 6. episode summaries。
 
 不变量：
 
-- `pinned_state` 与 tool-verified stable facts 全量注入，不参与 history pool 竞争。
-- `pinned_state` 与 verified facts 虽不参与 history pool 竞争，但必须有结构化尺寸上限、降级诊断和 trace 记录；不得无限扩大 memory
+- `pinned_state` 与 evidence-backed stable facts 全量注入，不参与 history pool 竞争。
+- `pinned_state` 与 `evidence_backed_facts` 虽不参与 history pool 竞争，但必须有结构化尺寸上限、降级诊断和 trace 记录；不得无限扩大 memory
   挤占财报材料、工具结果、章节上下文和当前问题的预算。
 - `final_answer` 是 assistant role 产出的最终回答，只能作为 raw turn / assistant conclusion 参与连续性。
-- `final_answer` 绝不能自动升级为 verified fact。
-- verified fact 只接受工具事实。
-- 用户输入进入 pinned state、约束或待验证候选，不直接成为 verified fact。
+- `final_answer` 绝不能自动升级为 `evidence_backed_fact`。
+- `evidence_backed_fact` 只接受 accepted tool evidence refs。
+- 用户输入进入 pinned state、约束或待验证候选，不直接成为 `evidence_backed_fact`。
 - memory projection 只消费 canonical facts。
 - preview / reasoning / display-only facts 不进入 memory。
 - LLM 产出的 pinned patch、episode summary 或 conclusion 默认只能成为 candidate / assumption / continuity view；它们不能直接写入
-  Host truth，也不能直接产生 verified fact。proactive compaction 编排属于 Context Governance。
+  Host truth，也不能直接产生 `evidence_backed_fact`。proactive compaction 编排属于 Context Governance。
+- RunInputBuilder 渲染 `evidence_backed_facts` 时必须包含 `claim_text` 与 `evidence_refs`，不能只渲染 digest / ref。source /
+  locator 细节通过 evidence id 回查 accepted evidence envelope，不要求进入 memory block。
+- 第一版 `evidence_backed_facts` 采用 compaction-gated extraction：compact 前不阻塞普通 Run 做 extraction；短链路追问继续依赖
+  recent raw turns / older raw turns / 已有 memory。`TOOL_RESULT_ACCEPTED` 后记录 accepted evidence / artifact / refs，供后续
+  compact 使用，不要求同步 LLM extraction。
 - memory snapshot 是 read model，可重建、可修复，不是事实真源。
 - 第一版 memory snapshot 与 projection checkpoint 使用同一 SQLite durable store transaction 提交；checkpoint 不得先于 snapshot 落库。
 - 跨存储 atomic commit marker 不进入第一版默认实现，只作为后续 memory storage split 能力。
@@ -2609,6 +2622,7 @@ Host 负责：
 - compact 触发。
 - LLM episode summary compaction。
 - pinned_state patch。
+- evidence-backed fact candidate extraction。
 - compact 后保真检查。
 - compaction semantic repair / retry 编排。
 - failure closeout。
@@ -2632,21 +2646,24 @@ Context Governance 是 orchestrator，不直接写 memory snapshot、tool trace�
 - `max_compaction_attempts_per_operation` 由 Host context budget policy 显式给出，含第一次 proposal attempt 与后续 semantic repair attempts，必须为正整数。它只控制 Host governance 的脏输出 / candidate reject 修复预算，不控制 Engine provider / transport retry，也不允许 Service 提供 prompt、candidate builder 或 repair callback。
 - 第一版只记录 usage observation 与 estimator calibration diagnostic，不根据 usage 自动动态调整 policy threshold，避免同一配置下的预算行为不可预测。
 
-Context Governance 与 Conversation Memory 的关系必须保持单向。Conversation Memory 是 EventLog read model，向 RunInputBuilder 提供 memory snapshot、snapshot cursor、policy digest 和 diagnostics；Context Governance 可以读取这些输入来做预算、compact 与质量检查，但不能直接写 memory snapshot，不能让 compacted summary 替代 verified fact 或 evidence anchor，也不能把 memory projection lag 当作 Run recovery。`WorkingAssumptionView` 的主动填充可以由 proactive compaction 或后续 retrieval owner 通过 canonical facts / projection policy 接入；P10 不得绕过 P9 memory projection 边界直接写入。
+Context Governance 与 Conversation Memory 的关系必须保持单向。Conversation Memory 是 EventLog read model，向 RunInputBuilder 提供 memory snapshot、snapshot cursor、policy digest 和 diagnostics；Context Governance 可以读取这些输入来做预算、compact 与质量检查，但不能直接写 memory snapshot，不能让 compacted summary 替代 `evidence_backed_fact` 或 evidence anchor，也不能把 memory projection lag 当作 Run recovery。`WorkingAssumptionView` 的主动填充可以由 proactive compaction 或后续 retrieval owner 通过 canonical facts / projection policy 接入；P10 不得绕过 P9 memory projection 边界直接写入。
 
 P10 必须补齐 stable layer / history pool 的生成来源，而不是只做预算裁剪。第一版 compactor 是 Host-owned typed port，可以调用 LLM compaction scene，但 LLM 只能提出结构化候选；Host 负责校验、接受并写入 canonical compact event / artifact。compactor 输出至少包含：
 
 - episode summary candidate：阶段标题、目标、已完成动作、confirmed fact refs / summaries、用户约束、open questions、next step、tool finding refs。
 - pinned state patch candidate：`current_goal`、`confirmed_subjects`、`user_constraints`、`open_questions` 的字段级 patch；每个字段必须有三态语义：未出现表示不修改，空值表示显式清空，非空值表示替换为候选值。
+- evidence-backed fact candidates：基于 compact 输入中的 accepted evidence envelope 生成的 `claim_text`、`evidence_kind`、
+  `evidence_refs` 与可选 opaque attributes。它们与 episode summary / pinned state patch 可由同一次 structured JSON proposal
+  产生，正常 compact 路径不得因此固定增加第二次 LLM 调用。
 - preservation evidence：每条 summary / patch candidate 对应的输入 event refs、tool fact refs、memory snapshot cursor 或 compact input range。
 - quality check result：是否保留 current user input、accepted tool fact refs、evidence anchors、open questions / assumptions refs，以及 dropped / summarized ranges。
 
-Host 接受 compactor 输出后，`CONTEXT_COMPACTED` payload 必须记录 compact artifact ref、episode summary candidate、pinned state patch candidate、preserved fact refs、dropped / summarized ranges、quality check result 与 budget after compact。是否将 episode summary / pinned patch materialize 到 Conversation Memory，由 P9 memory projection policy 消费已提交 canonical facts 决定；P10 不得直接写 memory snapshot、memory table 或 RunInputBuilder 私有 message 缓存。
+Host 接受 compactor 输出后，`CONTEXT_COMPACTED` payload 必须记录 compact artifact ref、episode summary candidate、pinned state patch candidate、evidence-backed fact candidates、preserved fact refs、dropped / summarized ranges、quality check result 与 budget after compact。是否将 episode summary / pinned patch / evidence-backed fact candidates materialize 到 Conversation Memory，由 memory projection policy 消费已提交 canonical facts 决定；Context Governance 不得直接写 memory snapshot、memory table 或 RunInputBuilder 私有 message 缓存。
 
 Compactor 与 retry / repair 的 owner 边界固定为：
 
 - Runner/provider 层负责低层 transport retry：network、timeout、HTTP 429、HTTP 5xx、stream idle timeout 等由 Engine Runner 按 `RunnerSpec.max_retries`、`Retry-After` 与退避策略在一次 compactor proposal 调用内处理。该层 retry 不拥有 Host governance，不 append EventLog，不 emit HostEvent，只通过 RunnerEvent / log / attempt summary 进入 Host diagnostic。
-- `LLMContextCompactor` 是 Host-owned 单次 proposal executor。它把 immutable `CompactionRequest` 与 Host-owned prompt/scene 映射为一次 LLM proposal，并返回 candidate 或 typed failure；它不决定是否重试、不更新 Run / Attempt、不写 EventLog、不写 artifact、不做 memory projection。
+- `LLMContextCompactor` 是 Host-owned 单次 proposal executor。它把 immutable `CompactionRequest` 与 Host-owned prompt/scene 映射为一次 structured JSON LLM proposal，并返回 episode summary、pinned state patch、evidence-backed fact candidates、preservation / diagnostic candidate 或 typed failure；它不决定是否重试、不更新 Run / Attempt、不写 EventLog、不写 artifact、不做 memory projection。
 - Host Context Governance 拥有 semantic repair / retry：非 final answer、空 summary、解析失败、candidate shape 非法、缺 preservation evidence、quality check reject、compact 后仍超过 hard threshold 等，都由 Host compaction operation 决定是否发起 bounded repair attempt。repair attempt 必须复用同一个 immutable compaction request、同一套 Host-owned scene、同一 durable operation id，并在每次外部 LLM call 前后 recheck Run / Attempt / Session / cursor state。
 - stale / cancelled / session closed / execution replaced / cursor mismatch 不是可 repair 错误；Host 必须丢弃 stale proposal，不写 `CONTEXT_COMPACTED`。
 - retry budget 耗尽后只允许写一个最终 `CONTEXT_COMPACTION_FAILED`，不能让 Service replay，不能让 Engine retry Host governance，也不能无限 compact。
@@ -2670,7 +2687,8 @@ stable layer / history pool 的来源按事实等级固定：
 
 - `pinned_state.current_goal` 与 `pinned_state.user_constraints` 可由 `USER_INPUT_ACCEPTED` 的确定性投影初始化，也可由 P10 accepted pinned state patch candidate 后续修正。
 - `pinned_state.confirmed_subjects` 与 `pinned_state.open_questions` 主要来自 P10 accepted pinned state patch candidate、用户显式确认或后续 steer / goal-change owner；不得仅凭未校验 LLM 文本直接写入。
-- `verified_facts` 只来自 `TOOL_RESULT_ACCEPTED`，P10 episode summary 中的 confirmed facts 只能引用或摘要已存在工具事实，不能新建 verified fact。
+- `evidence_backed_facts` 只来自 accepted evidence refs。compact 前不阻塞普通 Run 做 extraction；compact 时复用同一次 structured JSON proposal 生成 `evidence_backed_fact_candidates`。本次 compact 覆盖范围内的历史 evidence-backed claims 在 compact 后通过 accepted `evidence_backed_facts` 进入 stable memory，不再依赖 compact 前 raw turns 或 episode summary 复原；compact 后新产生的 user input、assistant answer、tool result 继续作为新的 raw turns / accepted evidence 进入后续 memory pipeline。
+- P10 episode summary 中的 confirmed facts 只能引用或摘要已存在 facts / evidence refs，不能新建 `evidence_backed_fact`，也不能替代 `evidence_backed_fact`。
 - `conversation_continuity` 的 raw turns 来自 `USER_INPUT_ACCEPTED` 与 `RUN_SUCCEEDED`；episode summaries 来自 accepted compact output，并继续只作为 continuity / navigation，不替代 evidence anchors。
 
 ### 25.1 Compact Event 响应路径

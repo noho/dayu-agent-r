@@ -4,7 +4,7 @@
 
 ## 问题背景
 
-在 smoke 中，模型对 `DAYU_MEMORY_ALPHA` 的回答不稳定：有时认为能看到，有时说明只在用户目标或 episode summary 中看到，tool-verified facts 中没有明文。这暴露出一个更重要的问题：
+在 smoke 中，模型对 `DAYU_MEMORY_ALPHA` 的回答不稳定：有时认为能看到，有时说明只在用户目标或 episode summary 中看到，`evidence_backed_facts` 中没有明文。这暴露出一个更重要的问题：
 
 如果第一轮用户询问“茅台 2024 年收入、毛利”，工具返回了收入和毛利；第二、三轮继续其它问题；第四轮用户再问“毛利率”，Agent 是否一定能从 Memory 中稳定拿回第一轮工具确认的收入和毛利？
 
@@ -17,31 +17,31 @@
 下一轮分析为了正确工作，至少需要稳定拿回四类状态：
 
 1. 任务状态：当前研究对象、期间、口径、用户目标、约束和未完成问题。
-2. 已验证事实：工具确认过的财务指标、表格行列、引用位置、计算口径、单位、期间、来源和证据链。
+2. 证据支撑事实：绑定到 accepted evidence 的可复用 claim，包括财务指标、表格行列、引用位置、计算口径、单位、期间、来源和证据链。
 3. 分析产物：已经形成但不等同于原始事实的结论、假设、比较、推理链和待验证判断。
 4. 交互连续性：用户刚刚怎么问、Agent 刚刚怎么答，用来理解“它”“刚才那个”“继续算”等省略语。
 
-其中，买方财报分析最核心的是 evidence-backed facts。第四轮问毛利率时，Agent 不应依赖 raw turns、assistant final answer、episode summary 或模型自身记忆，而应稳定读到第一轮工具确认的收入和毛利。
+其中，买方财报分析最核心的是 `evidence_backed_facts`。第四轮问毛利率时，Agent 不应依赖 raw turns、assistant final answer、episode summary 或模型自身记忆，而应稳定读到第一轮工具证据支撑的收入和毛利 claim。
 
 ## 当前设计的风险
 
 `docs/host/design.md` 中的 Conversation Memory 方向基本正确：
 
-- `assistant final_answer` 不能自动升级为 verified fact。
-- `verified_facts` 只能来自工具事实。
+- `assistant final_answer` 不能自动升级为 `evidence_backed_fact`。
+- `evidence_backed_facts` 只能来自已接受工具证据。
 - Memory 是 EventLog read model，不是事实真源。
 - `episode summary` 只能做导航，不能替代 evidence anchor。
 - stable layer 优先于 history pool。
 
-但当前设计还不是财报 Agent 的最优设计，主要缺口是：没有强制工具返回的关键业务事实以 Memory 可投影、可渲染、可计算、可追溯的形式进入 verified facts。
+但当前设计还不是财报 Agent 的最优设计，主要缺口是：没有明确 `evidence_backed_fact` 的定义和生成边界，导致实现可能无法把关键业务 claim 以 Memory 可投影、可渲染、可计算、可追溯的形式进入 stable layer。
 
-“工具结果即事实”这个表述过粗。不是所有 tool result payload 都应该完整变成 fact，但工具返回的关键财务指标必须能稳定投影成 verified facts。否则实现很容易退化为只保留：
+“工具结果即事实”这个表述过粗。更准确的定义应是：`evidence_backed_fact` 表示“一个可复用 claim 绑定到了 accepted evidence”。不是所有 tool result payload 都应该完整变成 fact；tool provider 也不应承担判断长文档中哪些内容进入 Memory 的职责。否则实现很容易退化为只保留：
 
 ```text
 tool_name=...; outcome_digest=...; payload_ref=...; digest_ref=...
 ```
 
-这对审计有价值，但对第四轮计算毛利率没有直接帮助，因为模型拿不到收入和毛利明文。
+这对审计有价值，但对第四轮计算毛利率没有直接帮助，因为模型拿不到“来源在某处说了收入和毛利是多少”的可复用 claim 明文。
 
 ## recent raw turns 的边界
 
@@ -49,7 +49,7 @@ tool_name=...; outcome_digest=...; payload_ref=...; digest_ref=...
 
 但从财报 Agent 最优设计看，recent raw turns 不应该承担财务事实保真职责。它只应该服务交互连续性，例如理解省略语、追问对象和刚才回答的上下文。
 
-关键财务事实必须进入 stable verified facts，而不是依赖：
+关键财务事实必须进入 stable `evidence_backed_facts`，而不是依赖：
 
 - 最近 raw turns 是否还在；
 - assistant final answer 是否写全；
@@ -71,56 +71,144 @@ Financial Research Memory
   -> Interaction Continuity
 ```
 
-Host 仍然不应理解财报业务语义，例如“收入”“毛利”“毛利率”。但 Host 应支持业务中立的 structured verified fact 容器，让财报工具把可复用事实交给 Memory。
+Host 仍然不应理解财报业务语义，例如“收入”“毛利”“毛利率”。但 Host 应支持业务中立的 structured `evidence_backed_fact` 容器，让 Conversation Memory 能把已接受工具证据绑定到可复用 claim。
 
-工具返回的可复用财务事实应能表达为类似结构：
+`evidence_backed_fact` 的核心不是“Host 证明了世界事实为真”，也不是“Host 理解证据来源长什么样”，而是“这个 claim 绑定到了某个已接受 evidence，因此不是模型幻想”。Web tool 正常返回 URL 内容、Fins tool 的 `read_section` 正常返回年报章节、表格工具返回 row / cell、数据库工具返回 record，这些来源形状都属于 tool / provider 私有语义。Host 只需要知道它们已经形成 accepted evidence envelope，不需要理解 URL、章节、chunk、span、row、cell 或其它 locator。
+
+建议生成路径：
+
+```text
+accepted tool result / evidence artifact
+  -> accepted evidence envelope（evidence_id + opaque descriptor / artifact refs）
+  -> Host-governed Memory Extraction Operation
+  -> Host accept barrier 校验 claim_text + accepted evidence_refs
+  -> evidence_backed_facts projection
+  -> RunInputBuilder 渲染可读 claim 与 evidence refs
+```
+
+其中，Memory Extraction Operation 是 Host-governed LLM extractor。它可以参考 pinned_state patch / compact 的做法，由 LLM
+在 Host governance 下基于 tool query + bounded tool result / artifact 摘要生成候选 claim；LLM 只生成 candidate，不能直接写
+memory，不能绕过 evidence refs，也不能从 assistant final answer、episode summary 或无锚点文本中生成
+`evidence_backed_fact`。
+
+LLM extractor 必须返回 Host 定义的结构化 JSON candidate，而不是 plain summary。当前 compactor 如果只让 LLM 返回一段文本，再由
+代码塞进 pinned state patch，表达力不足；P12.5 应把该机制升级为 typed candidate 输出。一个 extraction candidate JSON
+可表达为类似结构：
 
 ```json
 {
-  "memory_facts": [
+  "pinned_state_patch_candidate": {
+    "current_goal": {
+      "operation": "replace",
+      "value": "分析贵州茅台 2024 年收入、毛利与毛利率。",
+      "evidence_refs": ["event:user-input:1"]
+    },
+    "confirmed_subjects": {
+      "operation": "replace",
+      "value": ["贵州茅台", "2024"],
+      "evidence_refs": ["event:user-input:1", "event:tool-result:2"]
+    },
+    "user_constraints": {
+      "operation": "missing",
+      "value": null,
+      "evidence_refs": []
+    },
+    "open_questions": {
+      "operation": "replace",
+      "value": ["计算 2024 年毛利率。"],
+      "evidence_refs": ["event:user-input:3"]
+    }
+  },
+  "evidence_backed_fact_candidates": [
     {
-      "subject": "贵州茅台",
-      "period": "2024",
-      "metric": "revenue",
-      "label": "营业收入",
-      "value": "174000000000",
-      "unit": "CNY",
-      "scale": "yuan",
-      "methodology": "annual_report_consolidated_income_statement",
-      "source_ref": "opaque-source-ref",
-      "evidence_ref": "opaque-evidence-ref"
+      "claim_text": "贵州茅台 2024 年营业收入为 1740 亿元。",
+      "evidence_kind": "observed_value",
+      "evidence_refs": ["evidence:event-2:item-1"],
+      "attributes": {
+        "subject": "贵州茅台",
+        "period": "2024",
+        "metric": "revenue",
+        "value": "174000000000",
+        "unit": "CNY",
+        "scale": "yuan"
+      }
     },
     {
-      "subject": "贵州茅台",
-      "period": "2024",
-      "metric": "gross_profit",
-      "label": "毛利",
-      "value": "158000000000",
-      "unit": "CNY",
-      "scale": "yuan",
-      "methodology": "annual_report_consolidated_income_statement",
-      "source_ref": "opaque-source-ref",
-      "evidence_ref": "opaque-evidence-ref"
+      "claim_text": "贵州茅台 2024 年毛利为 1580 亿元。",
+      "evidence_kind": "observed_value",
+      "evidence_refs": ["evidence:event-2:item-2"],
+      "attributes": {
+        "subject": "贵州茅台",
+        "period": "2024",
+        "metric": "gross_profit",
+        "value": "158000000000",
+        "unit": "CNY",
+        "scale": "yuan"
+      }
     }
-  ]
+  ],
+  "working_assumption_candidates": [],
+  "continuity_notes": []
 }
 ```
 
+该 JSON 是 Host contract，不是 provider 自由格式。未知字段、缺必填字段、字段类型不匹配、`evidence_refs` 为空或引用不存在的
+accepted evidence，都必须 fail fast 或进入 bounded repair / diagnostic，不能静默降级为 fact。provider 支持 structured output
+时应优先使用；不支持时也必须要求纯 JSON，并由 Host 严格解析、校验和拒绝非法 candidate。
+
+Host accept barrier 只校验通用 contract：
+
+- `claim_text` 非空、长度受限。
+- `evidence_kind` 是允许枚举。
+- `evidence_refs` 非空，且每个 ref 都指向本次 compact input 或已提交 EventLog 中的 accepted evidence envelope。
+- candidate 不能引用 assistant final answer、episode summary、user input 或 working assumption 作为 evidence。
+- `attributes` 是可选 opaque key-value，用于渲染和后续计算辅助；Host 不理解其业务含义。
+
+Host 不校验 evidence 的业务形状，不解析 locator，不证明 excerpt 是否逐字覆盖 claim，不理解 metric / subject / period。证据来源细节由
+accepted evidence envelope / artifact 承载；如果 UI / audit 需要展示证据细节，再通过 evidence id 回查对应 tool query、tool result、
+payload ref、source descriptor 或 provider 私有 locator。
+
+Memory Extraction Operation 不应设计成每个 `TOOL_RESULT_ACCEPTED` 后立刻同步执行的 eager extraction；这会让普通工具路径背负
+不必要的 LLM 调用成本，也会阻塞正常 Run。P12.5 第一版采用 compaction-gated extraction：
+
+- compact 前不阻塞普通 Run 做 extraction；短链路追问继续依赖 recent raw turns / older raw turns / 已有 memory。
+- `TOOL_RESULT_ACCEPTED` 后记录 accepted evidence / artifact / refs，供后续 compact 使用，不要求同步 LLM extraction。
+- 正常 compact 时，复用同一次 LLM structured JSON 调用，同时生成 episode summary candidate、pinned state patch candidate、
+  `evidence_backed_fact_candidates` 与 preservation / diagnostic 信息；正常路径不额外增加第二次 LLM 调用。
+- bounded repair 只有在 JSON parse、schema、evidence refs、quality check 或 preservation decision 失败时才触发；repair 属于失败修复路径，
+  不是正常路径固定成本。
+- 每次 compact 只把其覆盖范围内的历史 raw evidence 转化为 stable facts / continuity summary；compact 后新产生的 user input、
+  assistant answer、tool result 继续作为新的 raw turns / accepted evidence 进入 memory pipeline，并在后续 compact 中按同一规则处理。
+
+因此，compact 前 raw turns 继续承担短链路追问连续性；compact 时“顺手”抽取 `evidence_backed_fact_candidates`；compact 后，
+本次 compact 覆盖范围内的历史 evidence-backed claims 不再依赖 compact 前 raw turns 或 episode summary 复原，而是通过 accepted
+`evidence_backed_facts` 进入 stable memory。`evidence_backed_facts` 不是 raw turns 的别名，也不是 episode summary 的派生事实。
+
+这意味着 pinned state patch 和 `evidence_backed_fact_candidates` 可以在同一轮 LLM 调用中生成，因为它们共享任务语境；但二者的接受规则不同。
+`pinned_state_patch_candidate` 可以来自用户目标、约束、当前任务语境和 evidence；`evidence_backed_fact_candidates` 只能来自 accepted
+tool evidence，并且每条必须带 `claim_text`、`evidence_refs` 和 evidence kind。
+
 Host 的职责不是解释这些字段，而是：
 
-- 持久化 fact 与 provenance。
-- 保留 event / tool / digest / source ref。
-- 在预算内稳定注入 verified facts。
+- 持久化 source claim 与 provenance。
+- 保留 event / tool / digest / evidence refs。
+- 在预算内稳定注入 `evidence_backed_facts`。
 - 对被排除或降级的 fact 产生日志、diagnostic 和 trace。
-- 确保 compact summary、assistant conclusion 和 user claim 不能冒充 verified fact。
+- 确保 compact summary、assistant conclusion 和 user claim 不能冒充 `evidence_backed_fact`。
+- 保证 LLM extractor 调用发生在 Host governance operation 内，输出只作为 candidate，经 accept barrier 后才进入 EventLog /
+  Conversation Memory projection。
 
 ## 待裁决问题
 
-1. 是否将 `verified_facts` 从单一 `fact_summary` 文本扩展为业务中立 structured fact 容器。
-2. Tool result contract 是否要求可复用业务事实必须通过 `memory_facts` 或等价字段显式提供。
-3. 缺少可投影 fact 时，Memory projection 应该只生成 diagnostic，还是继续生成 neutral fallback verified fact。
-4. `recent_raw_turns_floor` 是否需要改名或重新定义，避免被误解为完整 raw tool transcript 保底。
-5. RunInputBuilder 渲染 verified facts 时，是否必须包含可计算事实文本或结构化字段，而不能只有 digest / ref。
+1. 是否将 `verified_facts` 全量改名为 `evidence_backed_facts`，并把定义冻结为“可复用 claim 绑定到 accepted evidence”。
+2. Tool result contract 是否只要求提供可审计 evidence envelope，而不要求 tool provider 直接生成最终 memory fact。
+3. 是否新增 Host-governed Memory Extraction Operation，使用 LLM extractor 生成 typed JSON candidate，并允许与 pinned state patch
+   在同一轮 LLM 调用中生成。
+4. Extraction 运行时机是否采用 compaction-gated extraction：compact 前不阻塞普通 Run；`TOOL_RESULT_ACCEPTED` 后只记录 evidence
+   / artifact / refs；正常 compact 的同一次 structured JSON 调用额外生成 `evidence_backed_fact_candidates`；repair 只在质量失败时触发。
+5. LLM extractor JSON schema、parse failure、schema failure、evidence ref mismatch、bounded repair 与 diagnostic 语义如何冻结。
+6. `recent_raw_turns_floor` 是否需要改名或重新定义，避免被误解为完整 raw tool transcript 保底。
+7. RunInputBuilder 渲染 `evidence_backed_facts` 时，是否必须包含 `claim_text` 与 `evidence_refs`，而不能只有 digest / ref；source / locator 细节通过 evidence id 回查 accepted evidence envelope。
 
 ## 旧项目测试 Prompt 反推的最低验收语义
 
@@ -181,8 +269,8 @@ Host 的职责不是解释这些字段，而是：
 
 - 工具确认过的关键财务事实必须跨 compaction 稳定保留。
 - 第 12 / 13 轮不能因为 compact summary 改写、遗漏或模型再生成而数值漂移。
-- 最佳设计中，事实真源应是 tool-verified facts；episode summary 只做导航和 fact ref 引用，不应替代 verified fact。
-- 后续轮次可以基于 Memory 中的 verified facts 回答，无需重复调用工具，除非用户要求重新验证或 fact 已被 policy 明确排除。
+- 最佳设计中，事实真源应是 `evidence_backed_facts`；episode summary 只做导航和 fact ref 引用，不应替代 `evidence_backed_fact`。
+- 后续轮次可以基于 Memory 中的 `evidence_backed_facts` 回答，无需重复调用工具，除非用户要求重新验证或 fact 已被 policy 明确排除。
 
 ### 长会话稳定性
 
@@ -195,25 +283,25 @@ Host 的职责不是解释这些字段，而是：
 最低要求：
 
 - `pinned_state` 中主体、期间、用户约束不能漂移或重复污染。
-- verified facts 随会话增长必须有预算策略和诊断，不能静默丢失关键事实。
+- `evidence_backed_facts` 随会话增长必须有预算策略和诊断，不能静默丢失关键事实。
 - episode 数量增长后，history pool 可裁剪，但 stable facts 和口径约束必须优先保留。
 
 ## 验收结论
 
-Conversation Memory 至少应满足上述测试 prompt 的语义。旧项目中“episode_summary.confirmed_facts”可作为测试目标描述，但在 dayu-agent-r 的最佳设计中，confirmed facts 不应由 episode summary 承载事实真源；episode summary 应引用或导航到 tool-verified facts。
+Conversation Memory 至少应满足上述测试 prompt 的语义。旧项目中“episode_summary.confirmed_facts”可作为测试目标描述，但在 dayu-agent-r 的最佳设计中，confirmed facts 不应由 episode summary 承载事实真源；episode summary 应引用或导航到 `evidence_backed_facts`。
 
 因此，后续设计裁决应保证：
 
 - pinned_state 单调演进，不漂移。
 - 最近 raw turns 真正保底，用于代词和追问连续性。
 - 长 user input 有 minimum preserve 语义。
-- 工具确认过的财务事实进入 stable verified facts。
+- 工具证据支撑的财务 claim 进入 stable `evidence_backed_facts`。
 - compaction 不能让 confirmed facts 退化成普通摘要。
 - 被裁剪、降级、无法注入的 memory item 必须可诊断。
 - 同一 session 内，后续轮次必须能稳定复用已验证事实，除非用户明确要求重新验证。
 
 ## 暂定结论
 
-当前 Conversation Memory 设计不是错误方向，但不是财报 Agent 的最优设计。最优设计必须以 evidence-backed financial facts 为中心，而不是以 raw turns / summaries 为中心。
+当前 Conversation Memory 设计不是错误方向，但不是财报 Agent 的最优设计。最优设计必须以 `evidence_backed_facts` 为中心，而不是以 raw turns / summaries 为中心。
 
-`DAYU_MEMORY_ALPHA` smoke 暴露的问题有效：如果 tool result 中的关键事实没有明确 Memory projection contract，就不能保证跨轮稳定可见。后续设计应补强 verified facts contract，并让 smoke 用财报事实风格的 memory facts 验证跨 run 可见性。
+`DAYU_MEMORY_ALPHA` smoke 暴露的问题有效：如果 accepted evidence 中的关键 claim 没有明确 Memory extraction / projection contract，就不能保证跨轮稳定可见。后续设计应补强 `evidence_backed_facts` contract，并让 smoke 用财报事实风格的 source claim 验证跨 run 可见性。
