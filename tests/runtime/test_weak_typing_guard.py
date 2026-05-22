@@ -10,6 +10,16 @@ import dayu.runtime as runtime
 _BARE_BUILTIN_GENERICS: frozenset[str] = frozenset(
     {"dict", "list", "tuple", "set", "frozenset"}
 )
+_PHASE12_RUNTIME_HELPERS: frozenset[str] = frozenset(
+    {
+        "assembly.py",
+        "config_loader.py",
+        "location.py",
+        "scene_prepare.py",
+        "tool_truncation.py",
+        "tools_discovery.py",
+    }
+)
 
 
 def _runtime_root() -> Path:
@@ -198,3 +208,11 @@ def test_runtime_disallows_weak_typing() -> None:
             elif isinstance(node, ast.ClassDef):
                 violations.extend(_check_class_field_annotations(node, file=rel))
     assert not violations, "weak typing violations:\n" + "\n".join(violations)
+
+
+def test_runtime_weak_typing_scan_covers_phase12_helpers() -> None:
+    """弱类型守卫必须覆盖 Phase 12 runtime public/helper 模块。"""
+
+    scanned_names = {file_path.name for file_path in _iter_runtime_files()}
+    missing = sorted(_PHASE12_RUNTIME_HELPERS - scanned_names)
+    assert not missing, f"runtime weak typing scan missed files: {missing}"

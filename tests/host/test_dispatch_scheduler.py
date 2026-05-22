@@ -63,7 +63,7 @@ from dayu.host.context_events import (
 from dayu.host.context_policy import (
     ContextBudgetPolicy,
     ContextCompactionTriggerSource,
-    default_context_budget_policy,
+    context_budget_policy_from_threshold_tokens,
 )
 from tests.host.fake_compaction import FakeContextCompactor
 from dayu.host.tooling import (
@@ -2384,14 +2384,8 @@ async def test_proactive_compaction_retries_quality_rejection_before_accept(
             tmp_path,
             store,
             _FakeWorkerFactory(),
-            context_budget_policy=default_context_budget_policy(
-                context_window_size=_SOFT_CONTEXT_WINDOW_SIZE,
-                reserved_output_tokens=_SOFT_RESERVED_OUTPUT_TOKENS,
-                hard_threshold_tokens=_SOFT_HARD_THRESHOLD_TOKENS,
-                safety_margin_ratio=_SOFT_SAFETY_MARGIN_RATIO,
-                minimum_protection_tokens=1,
+            context_budget_policy=_soft_compact_policy(
                 max_compaction_attempts_per_operation=2,
-                policy_ref="test-soft-compact-policy",
             ),
             context_compactor=compactor,
             compact_artifact_root=tmp_path / "compact-artifacts",
@@ -2448,14 +2442,8 @@ async def test_compaction_repair_attempt_rejection_is_recorded_in_eventlog(
             tmp_path,
             store,
             _FakeWorkerFactory(),
-            context_budget_policy=default_context_budget_policy(
-                context_window_size=_SOFT_CONTEXT_WINDOW_SIZE,
-                reserved_output_tokens=_SOFT_RESERVED_OUTPUT_TOKENS,
-                hard_threshold_tokens=_SOFT_HARD_THRESHOLD_TOKENS,
-                safety_margin_ratio=_SOFT_SAFETY_MARGIN_RATIO,
-                minimum_protection_tokens=1,
+            context_budget_policy=_soft_compact_policy(
                 max_compaction_attempts_per_operation=2,
-                policy_ref="test-soft-compact-policy",
             ),
             context_compactor=_RaisingCompactor(),
             compact_artifact_root=tmp_path / "compact-artifacts",
@@ -3114,18 +3102,24 @@ def _seed_accepted_run(
     return _AcceptedSeededRun(session_id=session_id, run_id=run_id)
 
 
-def _soft_compact_policy() -> ContextBudgetPolicy:
+def _soft_compact_policy(
+    *, max_compaction_attempts_per_operation: int = 1
+) -> ContextBudgetPolicy:
     """构造会对测试 prompt 触发 soft compact 的预算策略。
 
     :returns: context budget policy。
     """
 
-    return default_context_budget_policy(
+    return context_budget_policy_from_threshold_tokens(
         context_window_size=_SOFT_CONTEXT_WINDOW_SIZE,
-        reserved_output_tokens=_SOFT_RESERVED_OUTPUT_TOKENS,
+        soft_threshold_tokens=int(
+            (_SOFT_CONTEXT_WINDOW_SIZE - _SOFT_RESERVED_OUTPUT_TOKENS)
+            * (1 - _SOFT_SAFETY_MARGIN_RATIO)
+        ),
         hard_threshold_tokens=_SOFT_HARD_THRESHOLD_TOKENS,
-        safety_margin_ratio=_SOFT_SAFETY_MARGIN_RATIO,
-        minimum_protection_tokens=1,
+        max_compaction_attempts_per_operation=(
+            max_compaction_attempts_per_operation
+        ),
         policy_ref="test-soft-compact-policy",
     )
 

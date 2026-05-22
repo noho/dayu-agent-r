@@ -1105,13 +1105,20 @@ def _memory_policy(
     """
 
     return MemoryProjectionPolicy(
+        context_window_size=8192,
         max_pinned_items=8,
         max_verified_facts=16,
         max_working_assumptions=8,
         recent_raw_turns_floor=2,
-        max_raw_turn_size_units=1024,
-        history_pool_size_units=history_pool_size_units,
-        stable_layer_size_units=stable_layer_size_units,
+        raw_turn_context_ratio=0.125,
+        raw_turn_size_floor=1024,
+        raw_turn_size_cap=1024,
+        history_pool_context_ratio=0.5,
+        history_pool_size_floor=history_pool_size_units,
+        history_pool_size_cap=history_pool_size_units,
+        stable_layer_context_ratio=0.25,
+        stable_layer_size_floor=stable_layer_size_units,
+        stable_layer_size_cap=stable_layer_size_units,
         max_lag_events_for_inline_delta=max_lag_events_for_inline_delta,
         max_delta_repair_events=16,
     )

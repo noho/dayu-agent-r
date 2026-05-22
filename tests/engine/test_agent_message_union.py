@@ -17,9 +17,6 @@ from dayu.engine.contracts.messages import (
     ToolMessage,
     UserMessage,
 )
-from dayu.engine.agent import _message_inline_size_failure
-
-_OVERSIZED_INLINE_CONTENT_LENGTH: int = 70000
 
 _CONCRETE_AGENT_MESSAGE_TYPES = (
     SystemMessage,
@@ -78,46 +75,3 @@ def test_assistant_tool_call_field_set() -> None:
 
     fields = {f.name for f in dataclasses.fields(AssistantToolCall)}
     assert fields == {"id", "name", "arguments", "provider_state"}
-
-
-def test_oversized_engine_message_content_requires_context_boundary() -> None:
-    """Engine 防御性拒绝超大 inline message，避免直接送入 Runner。"""
-
-    failure = _message_inline_size_failure(
-        (
-            UserMessage(
-                role=AgentMessageRole.USER,
-                content="x" * _OVERSIZED_INLINE_CONTENT_LENGTH,
-            ),
-        )
-    )
-
-    assert failure is not None
-    assert failure.error_code == "context_compaction_required"
-    assert failure.recoverable is True
-
-
-def test_oversized_assistant_tool_call_arguments_require_context_boundary() -> None:
-    """Assistant tool call arguments 也是回送 Runner 的 inline message 边界。"""
-
-    failure = _message_inline_size_failure(
-        (
-            AssistantMessage(
-                role=AgentMessageRole.ASSISTANT,
-                content=None,
-                reasoning_content=None,
-                tool_calls=(
-                    AssistantToolCall(
-                        id="tool-call-1",
-                        name="lookup",
-                        arguments={"query": "x" * _OVERSIZED_INLINE_CONTENT_LENGTH},
-                        provider_state=None,
-                    ),
-                ),
-            ),
-        )
-    )
-
-    assert failure is not None
-    assert failure.error_code == "context_compaction_required"
-    assert failure.recoverable is True

@@ -1,0 +1,55 @@
+{
+  "schema_version": 1,
+  "scene": "infer",
+  "version": "v1",
+  "description": "公司业务类型与关键约束判断场景",
+  "capability_tags": [
+    "infer"
+  ],
+  "extends": [],
+  "model": {
+    "default_model_id": "mimo-v2.5-pro-thinking-plan",
+    "runner_option_hint_id": "infer"
+  },
+  "agent_policy": {
+    "max_iterations": 12
+  },
+  "tool_selection": {
+    "mode": "select",
+    "tool_names": [],
+    "tool_tags_any": [
+      "fins"
+    ],
+    "allow_empty": false
+  },
+  "defaults": {
+    "missing_required_fragment": "fail_closed"
+  },
+  "fragments": [
+    {
+      "id": "base_agents",
+      "path": "base/agents.md",
+      "order": 100,
+      "required": true
+    },
+    {
+      "id": "base_tools",
+      "path": "base/tools.md",
+      "order": 400,
+      "required": true
+    },
+    {
+      "id": "infer_scene",
+      "path": "scenes/infer.md",
+      "order": 500,
+      "required": true
+    }
+  ],
+  "context_slots": [
+    {
+      "name": "fins_default_subject",
+      "value_type": "string",
+      "required": true
+    }
+  ]
+}

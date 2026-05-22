@@ -47,9 +47,16 @@ DEFAULT_MEMORY_MAX_PINNED_ITEMS = 8
 DEFAULT_MEMORY_MAX_VERIFIED_FACTS = 16
 DEFAULT_MEMORY_MAX_WORKING_ASSUMPTIONS = 8
 DEFAULT_MEMORY_RECENT_RAW_TURNS_FLOOR = 2
-DEFAULT_MEMORY_MAX_RAW_TURN_SIZE_UNITS = 1024
-DEFAULT_MEMORY_HISTORY_POOL_SIZE_UNITS = 4096
-DEFAULT_MEMORY_STABLE_LAYER_SIZE_UNITS = 2048
+DEFAULT_MEMORY_CONTEXT_WINDOW_SIZE = 8192
+DEFAULT_MEMORY_RAW_TURN_CONTEXT_RATIO = 0.125
+DEFAULT_MEMORY_RAW_TURN_SIZE_FLOOR = 256
+DEFAULT_MEMORY_RAW_TURN_SIZE_CAP = 1024
+DEFAULT_MEMORY_HISTORY_POOL_CONTEXT_RATIO = 0.5
+DEFAULT_MEMORY_HISTORY_POOL_SIZE_FLOOR = 1024
+DEFAULT_MEMORY_HISTORY_POOL_SIZE_CAP = 4096
+DEFAULT_MEMORY_STABLE_LAYER_CONTEXT_RATIO = 0.25
+DEFAULT_MEMORY_STABLE_LAYER_SIZE_FLOOR = 512
+DEFAULT_MEMORY_STABLE_LAYER_SIZE_CAP = 2048
 DEFAULT_MEMORY_MAX_LAG_EVENTS_FOR_INLINE_DELTA = 16
 DEFAULT_MEMORY_MAX_DELTA_REPAIR_EVENTS = 32
 
@@ -592,24 +599,38 @@ class MemoryRepairRequest:
 class MemoryProjectionPolicy:
     """Memory projection policy。
 
+    :param context_window_size: Service / composition root 显式传入的上下文窗口 token 数。
     :param max_pinned_items: pinned state 最大条目数。
     :param max_verified_facts: verified facts 最大条目数。
     :param max_working_assumptions: working assumptions 最大条目数。
     :param recent_raw_turns_floor: recent raw turns 保底条数。
-    :param max_raw_turn_size_units: 单条 raw turn 最大尺寸单位。
-    :param history_pool_size_units: history pool 总尺寸单位。
-    :param stable_layer_size_units: stable layer 总尺寸单位。
+    :param raw_turn_context_ratio: 单条 raw turn 尺寸占上下文窗口比例。
+    :param raw_turn_size_floor: 单条 raw turn 尺寸下限。
+    :param raw_turn_size_cap: 单条 raw turn 尺寸上限。
+    :param history_pool_context_ratio: history pool 尺寸占上下文窗口比例。
+    :param history_pool_size_floor: history pool 尺寸下限。
+    :param history_pool_size_cap: history pool 尺寸上限。
+    :param stable_layer_context_ratio: stable layer 尺寸占上下文窗口比例。
+    :param stable_layer_size_floor: stable layer 尺寸下限。
+    :param stable_layer_size_cap: stable layer 尺寸上限。
     :param max_lag_events_for_inline_delta: inline delta 允许的最大滞后事件数。
     :param max_delta_repair_events: repair delta 最大事件数。
     """
 
+    context_window_size: int
     max_pinned_items: int
     max_verified_facts: int
     max_working_assumptions: int
     recent_raw_turns_floor: int
-    max_raw_turn_size_units: int
-    history_pool_size_units: int
-    stable_layer_size_units: int
+    raw_turn_context_ratio: float
+    raw_turn_size_floor: int
+    raw_turn_size_cap: int
+    history_pool_context_ratio: float
+    history_pool_size_floor: int
+    history_pool_size_cap: int
+    stable_layer_context_ratio: float
+    stable_layer_size_floor: int
+    stable_layer_size_cap: int
     max_lag_events_for_inline_delta: int
     max_delta_repair_events: int
 
@@ -620,6 +641,7 @@ class MemoryProjectionPolicy:
         :raises ValueError: 任一 limit 小于允许下限时抛出。
         """
 
+        _require_positive(self.context_window_size, "context_window_size")
         _require_positive(self.max_pinned_items, "max_pinned_items")
         _require_positive(self.max_verified_facts, "max_verified_facts")
         _require_positive(
@@ -628,33 +650,105 @@ class MemoryProjectionPolicy:
         _require_non_negative(
             self.recent_raw_turns_floor, "recent_raw_turns_floor"
         )
-        _require_positive(
-            self.max_raw_turn_size_units, "max_raw_turn_size_units"
+        _require_ratio(self.raw_turn_context_ratio, "raw_turn_context_ratio")
+        _require_floor_cap(
+            floor_value=self.raw_turn_size_floor,
+            cap_value=self.raw_turn_size_cap,
+            floor_field_name="raw_turn_size_floor",
+            cap_field_name="raw_turn_size_cap",
         )
-        _require_positive(self.history_pool_size_units, "history_pool_size_units")
-        _require_positive(self.stable_layer_size_units, "stable_layer_size_units")
+        _require_ratio(
+            self.history_pool_context_ratio, "history_pool_context_ratio"
+        )
+        _require_floor_cap(
+            floor_value=self.history_pool_size_floor,
+            cap_value=self.history_pool_size_cap,
+            floor_field_name="history_pool_size_floor",
+            cap_field_name="history_pool_size_cap",
+        )
+        _require_ratio(
+            self.stable_layer_context_ratio, "stable_layer_context_ratio"
+        )
+        _require_floor_cap(
+            floor_value=self.stable_layer_size_floor,
+            cap_value=self.stable_layer_size_cap,
+            floor_field_name="stable_layer_size_floor",
+            cap_field_name="stable_layer_size_cap",
+        )
         _require_non_negative(
             self.max_lag_events_for_inline_delta,
             "max_lag_events_for_inline_delta",
         )
         _require_non_negative(self.max_delta_repair_events, "max_delta_repair_events")
 
+    @property
+    def max_raw_turn_size_units(self) -> int:
+        """返回 Host 内部派生的单条 raw turn 最大尺寸单位。
 
-def default_memory_projection_policy() -> MemoryProjectionPolicy:
+        :returns: ratio / floor / cap 派生后的尺寸单位。
+        """
+
+        return _effective_size_units(
+            context_window_size=self.context_window_size,
+            ratio=self.raw_turn_context_ratio,
+            floor_value=self.raw_turn_size_floor,
+            cap_value=self.raw_turn_size_cap,
+        )
+
+    @property
+    def history_pool_size_units(self) -> int:
+        """返回 Host 内部派生的 history pool 尺寸单位。
+
+        :returns: ratio / floor / cap 派生后的尺寸单位。
+        """
+
+        return _effective_size_units(
+            context_window_size=self.context_window_size,
+            ratio=self.history_pool_context_ratio,
+            floor_value=self.history_pool_size_floor,
+            cap_value=self.history_pool_size_cap,
+        )
+
+    @property
+    def stable_layer_size_units(self) -> int:
+        """返回 Host 内部派生的 stable layer 尺寸单位。
+
+        :returns: ratio / floor / cap 派生后的尺寸单位。
+        """
+
+        return _effective_size_units(
+            context_window_size=self.context_window_size,
+            ratio=self.stable_layer_context_ratio,
+            floor_value=self.stable_layer_size_floor,
+            cap_value=self.stable_layer_size_cap,
+        )
+
+
+def default_memory_projection_policy(
+    *, context_window_size: int = DEFAULT_MEMORY_CONTEXT_WINDOW_SIZE
+) -> MemoryProjectionPolicy:
     """构造 Host 本地执行默认 conversation memory projection policy。
 
+    :param context_window_size: Service / composition root 显式传入的上下文窗口 token 数。
     :returns: 默认 memory projection policy。
     :raises ValueError: 默认常量非法时抛出。
     """
 
     return MemoryProjectionPolicy(
+        context_window_size=context_window_size,
         max_pinned_items=DEFAULT_MEMORY_MAX_PINNED_ITEMS,
         max_verified_facts=DEFAULT_MEMORY_MAX_VERIFIED_FACTS,
         max_working_assumptions=DEFAULT_MEMORY_MAX_WORKING_ASSUMPTIONS,
         recent_raw_turns_floor=DEFAULT_MEMORY_RECENT_RAW_TURNS_FLOOR,
-        max_raw_turn_size_units=DEFAULT_MEMORY_MAX_RAW_TURN_SIZE_UNITS,
-        history_pool_size_units=DEFAULT_MEMORY_HISTORY_POOL_SIZE_UNITS,
-        stable_layer_size_units=DEFAULT_MEMORY_STABLE_LAYER_SIZE_UNITS,
+        raw_turn_context_ratio=DEFAULT_MEMORY_RAW_TURN_CONTEXT_RATIO,
+        raw_turn_size_floor=DEFAULT_MEMORY_RAW_TURN_SIZE_FLOOR,
+        raw_turn_size_cap=DEFAULT_MEMORY_RAW_TURN_SIZE_CAP,
+        history_pool_context_ratio=DEFAULT_MEMORY_HISTORY_POOL_CONTEXT_RATIO,
+        history_pool_size_floor=DEFAULT_MEMORY_HISTORY_POOL_SIZE_FLOOR,
+        history_pool_size_cap=DEFAULT_MEMORY_HISTORY_POOL_SIZE_CAP,
+        stable_layer_context_ratio=DEFAULT_MEMORY_STABLE_LAYER_CONTEXT_RATIO,
+        stable_layer_size_floor=DEFAULT_MEMORY_STABLE_LAYER_SIZE_FLOOR,
+        stable_layer_size_cap=DEFAULT_MEMORY_STABLE_LAYER_SIZE_CAP,
         max_lag_events_for_inline_delta=(
             DEFAULT_MEMORY_MAX_LAG_EVENTS_FOR_INLINE_DELTA
         ),
@@ -2531,15 +2625,22 @@ def memory_projection_policy_to_json_value(
     """
 
     return {
-        "history_pool_size_units": policy.history_pool_size_units,
+        "context_window_size": policy.context_window_size,
+        "history_pool_context_ratio": policy.history_pool_context_ratio,
+        "history_pool_size_cap": policy.history_pool_size_cap,
+        "history_pool_size_floor": policy.history_pool_size_floor,
         "max_delta_repair_events": policy.max_delta_repair_events,
         "max_lag_events_for_inline_delta": policy.max_lag_events_for_inline_delta,
         "max_pinned_items": policy.max_pinned_items,
-        "max_raw_turn_size_units": policy.max_raw_turn_size_units,
         "max_verified_facts": policy.max_verified_facts,
         "max_working_assumptions": policy.max_working_assumptions,
+        "raw_turn_context_ratio": policy.raw_turn_context_ratio,
+        "raw_turn_size_cap": policy.raw_turn_size_cap,
+        "raw_turn_size_floor": policy.raw_turn_size_floor,
         "recent_raw_turns_floor": policy.recent_raw_turns_floor,
-        "stable_layer_size_units": policy.stable_layer_size_units,
+        "stable_layer_context_ratio": policy.stable_layer_context_ratio,
+        "stable_layer_size_cap": policy.stable_layer_size_cap,
+        "stable_layer_size_floor": policy.stable_layer_size_floor,
     }
 
 
@@ -3143,9 +3244,12 @@ def _require_positive(value: int, field_name: str) -> None:
     :param value: 整数值。
     :param field_name: 字段名。
     :returns: ``None``。
+    :raises TypeError: 值不是整数或为 bool 时抛出。
     :raises ValueError: 值小于 ``1`` 时抛出。
     """
 
+    if isinstance(value, bool) or not isinstance(value, int):
+        raise TypeError(f"{field_name} must be int")
     if value < _MIN_POSITIVE_LIMIT:
         raise ValueError(f"{field_name} must be positive")
 
@@ -3156,11 +3260,74 @@ def _require_non_negative(value: int, field_name: str) -> None:
     :param value: 整数值。
     :param field_name: 字段名。
     :returns: ``None``。
+    :raises TypeError: 值不是整数或为 bool 时抛出。
     :raises ValueError: 值小于 ``0`` 时抛出。
     """
 
+    if isinstance(value, bool) or not isinstance(value, int):
+        raise TypeError(f"{field_name} must be int")
     if value < _MIN_SEQUENCE:
         raise ValueError(f"{field_name} must be non-negative")
+
+
+def _require_ratio(value: float, field_name: str) -> None:
+    """校验 ratio/floor/cap 模型比例位于 ``(0, 1]``。
+
+    :param value: 比例值。
+    :param field_name: 字段名。
+    :returns: ``None``。
+    :raises TypeError: 值不是数值或为 bool 时抛出。
+    :raises ValueError: 值不在允许范围时抛出。
+    """
+
+    if isinstance(value, bool) or not isinstance(value, int | float):
+        raise TypeError(f"{field_name} must be float")
+    if value <= 0 or value > 1:
+        raise ValueError(f"{field_name} must be in (0, 1]")
+
+
+def _require_floor_cap(
+    *,
+    floor_value: int,
+    cap_value: int,
+    floor_field_name: str,
+    cap_field_name: str,
+) -> None:
+    """校验尺寸下限与上限组合。
+
+    :param floor_value: 尺寸下限。
+    :param cap_value: 尺寸上限。
+    :param floor_field_name: 下限字段名。
+    :param cap_field_name: 上限字段名。
+    :returns: ``None``。
+    :raises TypeError: 字段类型非法时抛出。
+    :raises ValueError: 下限或上限非法时抛出。
+    """
+
+    _require_positive(floor_value, floor_field_name)
+    _require_positive(cap_value, cap_field_name)
+    if floor_value > cap_value:
+        raise ValueError(f"{floor_field_name} must be <= {cap_field_name}")
+
+
+def _effective_size_units(
+    *,
+    context_window_size: int,
+    ratio: float,
+    floor_value: int,
+    cap_value: int,
+) -> int:
+    """按 context window ratio / floor / cap 派生尺寸单位。
+
+    :param context_window_size: 上下文窗口 token 数。
+    :param ratio: 尺寸比例。
+    :param floor_value: 尺寸下限。
+    :param cap_value: 尺寸上限。
+    :returns: 派生后的尺寸单位。
+    """
+
+    ratio_units = int(context_window_size * ratio)
+    return min(cap_value, max(floor_value, ratio_units))
 
 
 def _as_mapping(value: JsonValue, field_name: str) -> Mapping[str, JsonValue]:

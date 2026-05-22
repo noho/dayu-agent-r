@@ -1,0 +1,64 @@
+{
+  "schema_version": 1,
+  "scene": "overview",
+  "version": "v1",
+  "description": "第0章封面页场景",
+  "capability_tags": [
+    "overview"
+  ],
+  "extends": [],
+  "model": {
+    "default_model_id": "mimo-v2.5-pro-plan",
+    "runner_option_hint_id": "overview"
+  },
+  "agent_policy": {
+    "max_iterations": 12
+  },
+  "tool_selection": {
+    "mode": "none",
+    "tool_names": [],
+    "tool_tags_any": [],
+    "allow_empty": false
+  },
+  "defaults": {
+    "missing_required_fragment": "fail_closed"
+  },
+  "fragments": [
+    {
+      "id": "base_agents",
+      "path": "base/agents.md",
+      "order": 100,
+      "required": true
+    },
+    {
+      "id": "base_soul",
+      "path": "base/soul.md",
+      "order": 200,
+      "required": true
+    },
+    {
+      "id": "base_fact_rules",
+      "path": "base/fact_rules.md",
+      "order": 300,
+      "required": true
+    },
+    {
+      "id": "overview_scene",
+      "path": "scenes/overview.md",
+      "order": 400,
+      "required": true
+    }
+  ],
+  "context_slots": [
+    {
+      "name": "fins_default_subject",
+      "value_type": "string",
+      "required": true
+    },
+    {
+      "name": "base_user",
+      "value_type": "string",
+      "required": true
+    }
+  ]
+}

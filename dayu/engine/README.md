@@ -67,7 +67,7 @@ from dayu.engine.contracts import AgentRunRequest, RunnerSpec
 
 - `run_id`：调用方传入的本次 run 标识；Engine 只随事件与工具执行上下文透传，不拥有 run 生命周期。
 - `session_id`：调用方传入的 session 标识；Engine 只随事件与工具执行上下文透传，不拥有 session 生命周期。
-- `messages`：进入本次 run 的非空 `AgentMessage` 元组；Engine 会在 Runner 调用前执行防御性 inline 内容大小检查，超限时以既有 `context_compaction_required` recoverable failure 收口，要求调用方通过 ref / digest / payload / compact artifact 边界重建有界 messages。
+- `messages`：进入本次 run 的非空 `AgentMessage` 元组；Engine 不使用自定义 byte 阈值拒绝 message，context 是否可处理由模型窗口、Runner / provider error path 与 Host Context Governance 收口。
 - `disable_tools`：是否禁用工具调用。
 - `runner_spec`：Runner 规约。
 - `runner_options`：单次 Runner 调用参数。
@@ -129,6 +129,8 @@ Engine 消费这些字段完成单次 run；不从配置文件、调用方状态
 `RunnerCallOptions` 描述单次调用参数，字段包括 `temperature`、`max_tokens`、`top_p`、`stream`。
 
 `RunnerSpec.provider_request` 是 `ProviderRequestExtension | None`，当前封闭联合成员包括 `OpenAIReasoningExtension`、`AnthropicThinkingExtension`、`DeepSeekThinkingExtension`、`MimoThinkingExtension`、`GeminiThinkingExtension`、`QwenThinkingExtension`。显式调用参数只进入 `RunnerCallOptions`，不放进 provider 扩展。
+
+`dayu.engine.provider_extensions.provider_request_extension_from_json(value)` 是配置 DSL 到 `ProviderRequestExtension` 的 Engine 边界 helper。它支持 `openai_reasoning`、`anthropic_thinking`、`deepseek_thinking`、`mimo_thinking`、`gemini_thinking`、`qwen_thinking` 六类 DSL；未知 `type`、未知字段、非法枚举值或契约拒绝的字段组合都会以 `ProviderExtensionConfigError` fail closed。该 helper 不在包根 re-export，调用方应显式从子模块导入。
 
 OpenAI-compatible Runner 会在内部执行 streaming capability：当 `RunnerCallOptions.stream=True` 但 `RunnerSpec.supports_streaming=False` 时，本次请求降级为 `stream=False`，且不写 `stream_options`。`RunnerSpec.supports_stream_usage` 只门控流式请求中是否写入 `stream_options.include_usage=True`；为 `False` 时不写该字段。`stream_idle_timeout_seconds` 与 `stream_idle_heartbeat_seconds` 是 SSE 字节空闲检测配置：heartbeat 只能在 timeout 已启用时设置，二者必须为正数，且 heartbeat 不能大于 timeout。
 
@@ -227,7 +229,6 @@ run_agent_messages(request)
       -> Agent.run_messages
       -> observe cancellation_token before work
       -> validate agent_policy.max_iterations >= 1
-      -> validate messages inline size before Runner calls
       -> emit EngineEvent.iteration_started
       -> run ordinary iterations within agent_policy.max_iterations
       -> compute effective tools from disable_tools / AgentPolicy / Runner capability
@@ -279,7 +280,6 @@ run_agent_messages(request)
       -> if fallback_mode is FORCE_ANSWER
           -> observe cancellation_token before fallback Runner call
           -> append fallback_prompt to run-local messages
-          -> run inline message size guard before Runner call
           -> AsyncRunner.call(messages, request.runner_options, tools=())
           -> emit EngineEvent.final_answer if content accepted
           -> emit EngineEvent.run_failed if force-answer is empty or still requests tools

@@ -27,6 +27,8 @@ EXPECTED_EXPORTS: frozenset[str] = frozenset(
         "ToolAwaitSpec",
         "ToolAwaitingOutcome",
         "ToolBundle",
+        "ToolBundleSourceKind",
+        "ToolBundleSourceRef",
         "ToolCallProviderState",
         "ToolCallRequest",
         "ToolCallable",

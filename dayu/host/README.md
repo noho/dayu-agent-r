@@ -81,7 +81,9 @@ Host 内部职责按语义分层：
 
 ## Opener 与 Options
 
-`OpenHostOptions` 是普通本地多轮 Host 的 construction boundary。它显式接收 Host durable SQLite 路径、artifact root、payload inline threshold、SQLite busy / retry policy、runtime lane 配置、本地 worker factory、ordinary run execution baseline、业务工具选项、context budget policy、compactor baseline、memory projection policy 和 truncation manager 开关。
+`OpenHostOptions` 是普通本地多轮 Host 的 construction boundary。它显式接收 Host durable SQLite 路径、artifact root、durable payload inline threshold、SQLite busy / retry policy、runtime lane 配置、本地 worker factory、ordinary run execution baseline、业务工具选项、context budget policy、compactor baseline、memory projection policy 和 truncation manager 开关。
+
+`ContextBudgetPolicy` 是 ratio-first typed policy：调用方显式传入 `context_window_size`、`soft_threshold_context_ratio`、`hard_threshold_context_ratio`、compaction 次数上限与 `policy_ref`，Host 内部按 `context_window_size * ratio` 派生 soft / hard threshold token 数。`OpenHostOptions` 的字段名保持 public surface freeze；Host policy 本身不暴露输出预留、safety margin、显式 hard threshold token 或 minimum protection token 字段。
 
 `open_host(options)` 进入时会装配：
 
@@ -211,6 +213,8 @@ ToolRuntime 的稳定语义：
 - 工具结果、工具失败、工具取消、工具等待、治理拒绝、重复调用复用与截断结果必须经过 Host accept barrier。
 - accept barrier 校验 run / attempt / execution identity、schema digest、payload descriptor、幂等与 stale execution，接受后写入 canonical tool facts。
 - side-effect 或付费工具必须具备工具级幂等依据；缺失时不调用实际 callable。
+- `ToolTruncateSpec` 是 declaration/effective 分离契约：工具声明允许启用截断但省略策略 limit 或 TTL，层中立 runtime helper 按 policy defaults 补齐 effective spec 后交给 ToolRuntime 消费。
+- ToolRuntime 只在显式 truncation spec 或 truncation manager 存在时改写 LLM 可见工具结果；durable payload inline threshold 不作为 LLM inline result 限制。
 - truncation cursor 是 run-scoped、短生命周期、单次使用的本地补读引用；一次 `fetch_more` 成功后同一 cursor 即失效。
 - `fetch_more` 是 framework tool 预留名，默认保留但不启用；业务工具不得占用预留 framework tool 名。
 
@@ -234,6 +238,8 @@ late result、terminal Run 上的结果或已取消 wait 的结果不会恢复 R
 
 Conversation Memory 是 Session-level read model，不是 Host governance truth。它只消费 committed canonical EventLog facts，维护 stable layer、history pool、verified fact、working assumption、recent raw turn、episode summary 和 projection cursor。
 
+`MemoryProjectionPolicy` 使用 `context_window_size` 加 ratio / floor / cap 模型派生 stable layer、history pool 与 raw turn 的内部 size units；调用方只表达策略比例和上下限，Host memory projection 内部负责计算 effective size units。
+
 RunInputBuilder 读取 memory snapshot 时必须带着 snapshot cursor 与 policy digest；snapshot 缺失、损坏或滞后超过策略阈值时，Host 进入 projection repair path。memory projection lag 不触发 Run 状态迁移，也不把 Run 推入 `RECOVERING`。
 
 Memory 的边界是 Host-neutral：它不导入 Engine / Fins / Service / UI，不表达财报业务字段，不让 assistant final answer 自动成为 verified fact。只有工具事实和明确 provenance 能支撑 verified fact。
@@ -241,6 +247,8 @@ Memory 的边界是 Host-neutral：它不导入 Engine / Fins / Service / UI，�
 ## Context Compaction
 
 Context Governance 是 Host 责任。它根据 `ContextBudgetPolicy`、conservative estimator、memory snapshot、tool facts、当前用户输入和 compact artifact refs 进行上下文预算治理。
+
+Runner usage 进入 Host 后只写 `USAGE_REPORTED` projection signal，并附带 Session / Run / Attempt / execution、policy ref、estimator digest、估算输入 token 与 observation digest 等诊断字段。usage 是 post-call observation，只用于后续估算校准、diagnostic 和后续治理参考；缺少 policy、input event 或估算失败时 projection 仍提交为 `estimate_unavailable`，不改变当前 Run / Attempt 状态，也不回改当前 dispatch decision。
 
 当前已实现两类 compaction 路径：
 

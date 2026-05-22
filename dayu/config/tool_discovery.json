@@ -1,0 +1,12 @@
+{
+  "providers": {
+    "financial-tools": {
+      "import_path": "dayu.fins.tools:discover_tools",
+      "entry_point": null,
+      "source_kind": "explicit_provider",
+      "source_id": "dayu.fins.tools",
+      "enabled": false,
+      "allow_empty": true
+    }
+  }
+}

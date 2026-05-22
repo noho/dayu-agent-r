@@ -48,9 +48,13 @@ class ToolAwaitSpec:
     def __post_init__(self) -> None:
         """校验等待恢复 token 的基础边界。
 
+        :returns: ``None``。
+        :raises TypeError: ``await_kind`` 类型非法时抛出。
         :raises ValueError: ``resume_token`` 为空或超过长度上限时抛出。
         """
 
+        if not isinstance(self.await_kind, ToolAwaitKind):
+            raise TypeError("ToolAwaitSpec.await_kind must be ToolAwaitKind")
         if self.resume_token.strip() == "":
             raise ValueError("ToolAwaitSpec.resume_token must not be empty")
         if len(self.resume_token) > _MAX_RESUME_TOKEN_LENGTH:

@@ -1,0 +1,58 @@
+{
+  "schema_version": 1,
+  "scene": "audit",
+  "version": "v1",
+  "description": "审计场景",
+  "capability_tags": [
+    "audit"
+  ],
+  "extends": [],
+  "model": {
+    "default_model_id": "mimo-v2.5-pro-thinking-plan",
+    "runner_option_hint_id": "audit"
+  },
+  "agent_policy": {
+    "max_iterations": 16
+  },
+  "tool_selection": {
+    "mode": "none",
+    "tool_names": [],
+    "tool_tags_any": [],
+    "allow_empty": false
+  },
+  "defaults": {
+    "missing_required_fragment": "fail_closed"
+  },
+  "fragments": [
+    {
+      "id": "base_agents",
+      "path": "base/agents.md",
+      "order": 100,
+      "required": true
+    },
+    {
+      "id": "base_fact_rules",
+      "path": "base/fact_rules.md",
+      "order": 200,
+      "required": true
+    },
+    {
+      "id": "audit_scene",
+      "path": "scenes/audit.md",
+      "order": 300,
+      "required": true
+    }
+  ],
+  "context_slots": [
+    {
+      "name": "fins_default_subject",
+      "value_type": "string",
+      "required": true
+    },
+    {
+      "name": "base_user",
+      "value_type": "string",
+      "required": true
+    }
+  ]
+}

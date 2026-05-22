@@ -109,9 +109,60 @@ def test_non_stream_bool_usage_logs_warning_and_omits_usage(
     done = events[-1].data
     assert isinstance(done, RunnerDoneData)
     assert done.finish_reason is FinishReason.STOP
+    assert RunnerEventType.RUNNER_USAGE_RECORDED not in {
+        event.type for event in events
+    }
     assert any(
         "usage_field_malformed" in record.getMessage()
         and "prompt_tokens_type=bool" in record.getMessage()
+        for record in caplog.records
+    )
+
+
+def test_non_stream_negative_usage_logs_warning_and_omits_usage(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """usage token 计数必须非负，负数按 malformed usage 处理。"""
+
+    caplog.set_level(
+        logging.WARNING, logger="dayu.engine.runners.openai.non_stream_parser"
+    )
+    payload = json.dumps(
+        {
+            "choices": [
+                {
+                    "finish_reason": "stop",
+                    "message": {"role": "assistant", "content": "answer"},
+                }
+            ],
+            "usage": {
+                "prompt_tokens": -1,
+                "completion_tokens": 2,
+                "total_tokens": 1,
+            },
+        }
+    ).encode("utf-8")
+
+    events = list(
+        parse_non_stream_response(
+            payload, hook=make_no_thought_hook(), provider_request_id=None
+        )
+    )
+
+    assert [event.type for event in events] == [
+        RunnerEventType.RUNNER_CONTENT_COMPLETED,
+        RunnerEventType.RUNNER_DONE,
+    ]
+    assert "usage_field_malformed" in caplog.text
+    done = events[-1].data
+    assert isinstance(done, RunnerDoneData)
+    assert done.finish_reason is FinishReason.STOP
+    assert RunnerEventType.RUNNER_USAGE_RECORDED not in {
+        event.type for event in events
+    }
+    assert any(
+        "usage_field_malformed" in record.getMessage()
+        and "prompt_tokens_type=int" in record.getMessage()
         for record in caplog.records
     )
 

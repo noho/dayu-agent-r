@@ -51,9 +51,11 @@ from dayu.host.durable.options import (
     PayloadStoragePolicy,
 )
 from dayu.host.durable.transaction import HostTransaction
+from dayu.host.context_policy import default_context_budget_policy
 from dayu.host.memory import default_memory_projection_policy
 from dayu.host.open_host import (
     _PublicHostHandle,
+    _command_options_from_open_host_options,
     _local_execution_options_from_open_host_options,
 )
 from dayu.host.llm_compaction import LLMContextCompactor
@@ -499,6 +501,28 @@ def test_compactor_runner_baseline_maps_to_host_owned_compactor(
     assert local_execution.compactor_policy_ref is None
     assert local_execution.compact_artifact_root == tmp_path / "compact-artifacts"
     assert local_execution.compact_artifact_create_parent_dirs is False
+
+
+def test_command_options_reflect_explicit_context_budget_policy(
+    tmp_path: pathlib.Path,
+) -> None:
+    """显式 opener context budget policy 必须传入内部 command option 映射。"""
+
+    policy = default_context_budget_policy(context_window_size=16384)
+    options = replace(
+        _options(tmp_path, _FinalAnswerWorkerFactory()),
+        context_budget_policy=policy,
+    )
+
+    command_options = _command_options_from_open_host_options(
+        options,
+        host_handle_id="host-command-policy-test",
+    )
+
+    assert command_options.context_window_size == policy.context_window_size
+    assert 0 < command_options.reserved_output_tokens < policy.context_window_size
+    assert command_options.local_execution is not None
+    assert command_options.local_execution.context_budget_policy is policy
 
 
 async def _wait_for_run_status(

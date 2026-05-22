@@ -1,0 +1,32 @@
+{
+  "schema_version": 1,
+  "scene": "conversation_compaction",
+  "version": "v1",
+  "description": "多轮会话阶段摘要压缩场景",
+  "capability_tags": [
+    "conversation_compaction"
+  ],
+  "extends": [],
+  "model": {
+    "default_model_id": "mimo-v2.5-pro-thinking-plan",
+    "runner_option_hint_id": "conversation_compaction"
+  },
+  "tool_selection": {
+    "mode": "none",
+    "tool_names": [],
+    "tool_tags_any": [],
+    "allow_empty": false
+  },
+  "defaults": {
+    "missing_required_fragment": "fail_closed"
+  },
+  "fragments": [
+    {
+      "id": "conversation_compaction_scene",
+      "path": "scenes/conversation_compaction.md",
+      "order": 100,
+      "required": true
+    }
+  ],
+  "context_slots": []
+}

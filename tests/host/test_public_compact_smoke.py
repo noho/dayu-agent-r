@@ -13,7 +13,7 @@ import pytest
 from dayu.contracts.json_value import JsonValue
 from dayu.engine.contracts.runner_spec import RunnerCallOptions, RunnerSpec
 from dayu.host import CompactorRunnerBaseline, HostEventKind, open_host
-from dayu.host.context_policy import default_context_budget_policy
+from dayu.host.context_policy import context_budget_policy_from_threshold_tokens
 from tests.host.public_smoke_support import (
     PROVIDER_CASES,
     FinalAnswerWorkerFactory,
@@ -27,10 +27,9 @@ from tests.host.public_smoke_support import (
     skip_if_provider_terminal_failed,
 )
 
-_SOFT_CONTEXT_WINDOW_SIZE = 360
-_SOFT_RESERVED_OUTPUT_TOKENS = 10
+_SOFT_CONTEXT_WINDOW_SIZE = 2400
 _SOFT_HARD_THRESHOLD_TOKENS = 300
-_SOFT_SAFETY_MARGIN_RATIO = 0.8
+_SOFT_THRESHOLD_TOKENS = 70
 _SOFT_THRESHOLD_PROMPT_REPEAT_COUNT = 7
 _SOFT_THRESHOLD_PROMPT_SENTENCE = "请保留标记 DAYU_COMPACT_OK，并继续等待下一步。"
 _COMPACTOR_PROVIDER_MAX_RETRIES = 1
@@ -87,12 +86,10 @@ async def test_real_compactor_public_opener_compacts_and_preserves_continuity(
     )
     options = replace(
         base_options,
-        context_budget_policy=default_context_budget_policy(
+        context_budget_policy=context_budget_policy_from_threshold_tokens(
             context_window_size=_SOFT_CONTEXT_WINDOW_SIZE,
-            reserved_output_tokens=_SOFT_RESERVED_OUTPUT_TOKENS,
+            soft_threshold_tokens=_SOFT_THRESHOLD_TOKENS,
             hard_threshold_tokens=_SOFT_HARD_THRESHOLD_TOKENS,
-            safety_margin_ratio=_SOFT_SAFETY_MARGIN_RATIO,
-            minimum_protection_tokens=1,
             max_compaction_attempts_per_operation=(
                 _COMPACTOR_MAX_ATTEMPTS_PER_OPERATION
             ),

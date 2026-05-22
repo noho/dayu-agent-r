@@ -1,9 +1,9 @@
 """Host context budget policy typed contract。
 
 本模块只定义 Host Context Governance 需要的预算策略输入与 provider
-边界。预算窗口与输出预留 token 必须由 Service / composition root 显式
-装配进 Host policy；本模块不读取 Engine spec、metadata、extra payload
-或 provider overflow 诊断信息。
+边界。预算窗口必须由 Service / composition root 显式装配进 Host policy；
+soft / hard 阈值由 Host 按 context window ratio 派生。本模块不读取
+Engine spec、metadata、extra payload 或 provider overflow 诊断信息。
 """
 
 from __future__ import annotations
@@ -13,13 +13,10 @@ from enum import StrEnum
 from typing import Protocol
 
 from dayu.host._public_validation import require_non_empty as _require_non_empty
-from dayu.host._public_validation import (
-    require_non_negative_int as _require_non_negative_int,
-)
 from dayu.host._public_validation import require_positive_int as _require_positive_int
 
-DEFAULT_CONTEXT_SAFETY_MARGIN_RATIO = 0.2
-DEFAULT_MINIMUM_PROTECTION_TOKENS = 256
+DEFAULT_SOFT_THRESHOLD_CONTEXT_RATIO = 0.8
+DEFAULT_HARD_THRESHOLD_CONTEXT_RATIO = 0.9
 DEFAULT_MAX_PROACTIVE_COMPACTIONS_PER_RUN = 1
 DEFAULT_MAX_REACTIVE_COMPACTIONS_PER_RUN = 1
 DEFAULT_MAX_COMPACTION_ATTEMPTS_PER_OPERATION = 1
@@ -45,10 +42,8 @@ class ContextBudgetPolicy:
     """Host context budget policy。
 
     :param context_window_size: Service / composition root 显式传入的上下文窗口 token 数。
-    :param reserved_output_tokens: Service / composition root 显式传入的输出预留 token 数。
-    :param safety_margin_ratio: 输入预算安全余量比例。
-    :param hard_threshold_tokens: 显式 hard threshold；``None`` 时由输入预算扣除最小保护量得到。
-    :param minimum_protection_tokens: 未显式给出 hard threshold 时保留的最小保护 token 数。
+    :param soft_threshold_context_ratio: soft threshold 占上下文窗口比例。
+    :param hard_threshold_context_ratio: hard threshold 占上下文窗口比例。
     :param max_proactive_compactions_per_run: 单个 Run 允许的 proactive compact 次数。
     :param max_reactive_compactions_per_run: 单个 Run 允许的 reactive compact 次数。
     :param max_compaction_attempts_per_operation: 单次 compaction operation 内
@@ -57,10 +52,8 @@ class ContextBudgetPolicy:
     """
 
     context_window_size: int
-    reserved_output_tokens: int
-    safety_margin_ratio: float
-    hard_threshold_tokens: int | None
-    minimum_protection_tokens: int
+    soft_threshold_context_ratio: float
+    hard_threshold_context_ratio: float
     max_proactive_compactions_per_run: int
     max_reactive_compactions_per_run: int
     max_compaction_attempts_per_operation: int
@@ -78,56 +71,31 @@ class ContextBudgetPolicy:
             self.context_window_size,
             field_name="ContextBudgetPolicy.context_window_size",
         )
-        _require_positive_int(
-            self.reserved_output_tokens,
-            field_name="ContextBudgetPolicy.reserved_output_tokens",
+        _require_threshold_ratio(
+            self.soft_threshold_context_ratio,
+            field_name="ContextBudgetPolicy.soft_threshold_context_ratio",
         )
-        if self.reserved_output_tokens >= self.context_window_size:
+        _require_threshold_ratio(
+            self.hard_threshold_context_ratio,
+            field_name="ContextBudgetPolicy.hard_threshold_context_ratio",
+        )
+        soft_threshold_tokens = _threshold_tokens(
+            self.context_window_size, self.soft_threshold_context_ratio
+        )
+        hard_threshold_tokens = _threshold_tokens(
+            self.context_window_size, self.hard_threshold_context_ratio
+        )
+        if hard_threshold_tokens < MIN_CONTEXT_HARD_THRESHOLD_TOKENS:
             raise ValueError(
-                "ContextBudgetPolicy.reserved_output_tokens must be smaller "
-                "than context_window_size"
+                "ContextBudgetPolicy.hard_threshold_context_ratio must leave "
+                "hard_threshold_tokens >= "
+                f"{MIN_CONTEXT_HARD_THRESHOLD_TOKENS}"
             )
-        _require_ratio(
-            self.safety_margin_ratio,
-            field_name="ContextBudgetPolicy.safety_margin_ratio",
-        )
-        _require_non_negative_int(
-            self.minimum_protection_tokens,
-            field_name="ContextBudgetPolicy.minimum_protection_tokens",
-        )
-        input_budget_tokens = (
-            self.context_window_size - self.reserved_output_tokens
-        )
-        if self.minimum_protection_tokens >= input_budget_tokens:
+        if soft_threshold_tokens >= hard_threshold_tokens:
             raise ValueError(
-                "ContextBudgetPolicy.minimum_protection_tokens must be smaller "
-                "than input budget"
+                "ContextBudgetPolicy.soft_threshold_context_ratio must derive "
+                "a threshold smaller than hard_threshold_context_ratio"
             )
-        if self.hard_threshold_tokens is not None:
-            _require_positive_int(
-                self.hard_threshold_tokens,
-                field_name="ContextBudgetPolicy.hard_threshold_tokens",
-            )
-            if self.hard_threshold_tokens < MIN_CONTEXT_HARD_THRESHOLD_TOKENS:
-                raise ValueError(
-                    "ContextBudgetPolicy.hard_threshold_tokens must be >= "
-                    f"{MIN_CONTEXT_HARD_THRESHOLD_TOKENS}"
-                )
-            if self.hard_threshold_tokens > input_budget_tokens:
-                raise ValueError(
-                    "ContextBudgetPolicy.hard_threshold_tokens must not exceed "
-                    "input budget"
-                )
-        else:
-            computed_hard_threshold_tokens = (
-                input_budget_tokens - self.minimum_protection_tokens
-            )
-            if computed_hard_threshold_tokens < MIN_CONTEXT_HARD_THRESHOLD_TOKENS:
-                raise ValueError(
-                    "ContextBudgetPolicy.minimum_protection_tokens must leave "
-                    "hard_threshold_tokens >= "
-                    f"{MIN_CONTEXT_HARD_THRESHOLD_TOKENS}"
-                )
         _require_positive_int(
             self.max_proactive_compactions_per_run,
             field_name="ContextBudgetPolicy.max_proactive_compactions_per_run",
@@ -191,11 +159,9 @@ class StaticContextBudgetProvider:
 def default_context_budget_policy(
     *,
     context_window_size: int,
-    reserved_output_tokens: int,
     policy_ref: str = DEFAULT_CONTEXT_BUDGET_POLICY_REF,
-    hard_threshold_tokens: int | None = None,
-    safety_margin_ratio: float = DEFAULT_CONTEXT_SAFETY_MARGIN_RATIO,
-    minimum_protection_tokens: int = DEFAULT_MINIMUM_PROTECTION_TOKENS,
+    soft_threshold_context_ratio: float = DEFAULT_SOFT_THRESHOLD_CONTEXT_RATIO,
+    hard_threshold_context_ratio: float = DEFAULT_HARD_THRESHOLD_CONTEXT_RATIO,
     max_proactive_compactions_per_run: int = (
         DEFAULT_MAX_PROACTIVE_COMPACTIONS_PER_RUN
     ),
@@ -207,11 +173,9 @@ def default_context_budget_policy(
     """构造默认 context budget policy。
 
     :param context_window_size: Service / composition root 显式传入的上下文窗口 token 数。
-    :param reserved_output_tokens: Service / composition root 显式传入的输出预留 token 数。
     :param policy_ref: policy snapshot / composition ref。
-    :param hard_threshold_tokens: 显式 hard threshold；``None`` 时由预算函数计算。
-    :param safety_margin_ratio: 输入预算安全余量比例，默认 20%。
-    :param minimum_protection_tokens: 未显式给出 hard threshold 时的最小保护 token 数。
+    :param soft_threshold_context_ratio: soft threshold 占上下文窗口比例。
+    :param hard_threshold_context_ratio: hard threshold 占上下文窗口比例。
     :param max_proactive_compactions_per_run: 单个 Run 允许的 proactive compact 次数。
     :param max_reactive_compactions_per_run: 单个 Run 允许的 reactive compact 次数。
     :param max_compaction_attempts_per_operation: 单次 compaction operation 内
@@ -223,10 +187,8 @@ def default_context_budget_policy(
 
     return ContextBudgetPolicy(
         context_window_size=context_window_size,
-        reserved_output_tokens=reserved_output_tokens,
-        safety_margin_ratio=safety_margin_ratio,
-        hard_threshold_tokens=hard_threshold_tokens,
-        minimum_protection_tokens=minimum_protection_tokens,
+        soft_threshold_context_ratio=soft_threshold_context_ratio,
+        hard_threshold_context_ratio=hard_threshold_context_ratio,
         max_proactive_compactions_per_run=max_proactive_compactions_per_run,
         max_reactive_compactions_per_run=max_reactive_compactions_per_run,
         max_compaction_attempts_per_operation=(
@@ -236,8 +198,84 @@ def default_context_budget_policy(
     )
 
 
-def _require_ratio(value: float, *, field_name: str) -> None:
-    """校验比例值位于 ``[0, 1)``。
+def context_budget_policy_from_threshold_tokens(
+    *,
+    context_window_size: int,
+    soft_threshold_tokens: int,
+    hard_threshold_tokens: int,
+    policy_ref: str = DEFAULT_CONTEXT_BUDGET_POLICY_REF,
+    max_proactive_compactions_per_run: int = (
+        DEFAULT_MAX_PROACTIVE_COMPACTIONS_PER_RUN
+    ),
+    max_reactive_compactions_per_run: int = DEFAULT_MAX_REACTIVE_COMPACTIONS_PER_RUN,
+    max_compaction_attempts_per_operation: int = (
+        DEFAULT_MAX_COMPACTION_ATTEMPTS_PER_OPERATION
+    ),
+) -> ContextBudgetPolicy:
+    """用已计算的阈值 token 构造 ratio-first policy。
+
+    该 helper 只服务于已有 Host opener / command option 字段到 ratio-first
+    policy 的边界映射；生成的 public policy 仍只携带 ratio typed shape。
+
+    :param context_window_size: 上下文窗口 token 数。
+    :param soft_threshold_tokens: 已计算的 soft threshold token 数。
+    :param hard_threshold_tokens: 已计算的 hard threshold token 数。
+    :param policy_ref: policy snapshot / composition ref。
+    :param max_proactive_compactions_per_run: 单个 Run 允许的 proactive compact 次数。
+    :param max_reactive_compactions_per_run: 单个 Run 允许的 reactive compact 次数。
+    :param max_compaction_attempts_per_operation: 单次 compaction operation 内 proposal 上限。
+    :returns: 已校验的 ContextBudgetPolicy。
+    :raises TypeError: 字段类型非法时抛出。
+    :raises ValueError: 阈值非法时抛出。
+    """
+
+    _require_positive_int(
+        context_window_size,
+        field_name="ContextBudgetPolicy.context_window_size",
+    )
+    _require_positive_int(
+        soft_threshold_tokens,
+        field_name="soft_threshold_tokens",
+    )
+    _require_positive_int(
+        hard_threshold_tokens,
+        field_name="hard_threshold_tokens",
+    )
+    if hard_threshold_tokens < MIN_CONTEXT_HARD_THRESHOLD_TOKENS:
+        raise ValueError(
+            "hard_threshold_tokens must be >= "
+            f"{MIN_CONTEXT_HARD_THRESHOLD_TOKENS}"
+        )
+    if soft_threshold_tokens >= hard_threshold_tokens:
+        raise ValueError("soft_threshold_tokens must be smaller than hard_threshold_tokens")
+    if hard_threshold_tokens > context_window_size:
+        raise ValueError("hard_threshold_tokens must not exceed context_window_size")
+    return ContextBudgetPolicy(
+        context_window_size=context_window_size,
+        soft_threshold_context_ratio=soft_threshold_tokens / context_window_size,
+        hard_threshold_context_ratio=hard_threshold_tokens / context_window_size,
+        max_proactive_compactions_per_run=max_proactive_compactions_per_run,
+        max_reactive_compactions_per_run=max_reactive_compactions_per_run,
+        max_compaction_attempts_per_operation=(
+            max_compaction_attempts_per_operation
+        ),
+        policy_ref=policy_ref,
+    )
+
+
+def _threshold_tokens(context_window_size: int, ratio: float) -> int:
+    """按上下文窗口比例派生阈值 token 数。
+
+    :param context_window_size: 上下文窗口 token 数。
+    :param ratio: 阈值比例。
+    :returns: floor 后的阈值 token 数，最小为 1。
+    """
+
+    return max(1, int(context_window_size * ratio))
+
+
+def _require_threshold_ratio(value: float, *, field_name: str) -> None:
+    """校验阈值比例值位于 ``(0, 1]``。
 
     :param value: 待校验比例。
     :param field_name: 错误消息字段名。
@@ -248,8 +286,8 @@ def _require_ratio(value: float, *, field_name: str) -> None:
 
     if isinstance(value, bool) or not isinstance(value, int | float):
         raise TypeError(f"{field_name} must be float")
-    if value < 0 or value >= 1:
-        raise ValueError(f"{field_name} must be in [0, 1)")
+    if value <= 0 or value > 1:
+        raise ValueError(f"{field_name} must be in (0, 1]")
 
 
 __all__ = [
@@ -257,12 +295,13 @@ __all__ = [
     "ContextBudgetProvider",
     "ContextCompactionTriggerSource",
     "DEFAULT_CONTEXT_BUDGET_POLICY_REF",
-    "DEFAULT_CONTEXT_SAFETY_MARGIN_RATIO",
+    "DEFAULT_HARD_THRESHOLD_CONTEXT_RATIO",
     "DEFAULT_MAX_COMPACTION_ATTEMPTS_PER_OPERATION",
     "DEFAULT_MAX_PROACTIVE_COMPACTIONS_PER_RUN",
     "DEFAULT_MAX_REACTIVE_COMPACTIONS_PER_RUN",
-    "DEFAULT_MINIMUM_PROTECTION_TOKENS",
+    "DEFAULT_SOFT_THRESHOLD_CONTEXT_RATIO",
     "MIN_CONTEXT_HARD_THRESHOLD_TOKENS",
     "StaticContextBudgetProvider",
+    "context_budget_policy_from_threshold_tokens",
     "default_context_budget_policy",
 ]

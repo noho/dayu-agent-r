@@ -28,8 +28,8 @@ from dayu.engine.contracts.engine_events import EngineEvent
 from dayu.engine.contracts.runner_spec import RunnerCallOptions, RunnerSpec
 from dayu.host.context_policy import (
     ContextBudgetPolicy,
-    DEFAULT_MINIMUM_PROTECTION_TOKENS,
-    default_context_budget_policy,
+    DEFAULT_SOFT_THRESHOLD_CONTEXT_RATIO,
+    context_budget_policy_from_threshold_tokens,
 )
 from dayu.host.compaction import ContextCompactor
 from dayu.host._public_validation import (
@@ -43,6 +43,8 @@ from dayu.host.memory import (
     default_memory_projection_policy,
 )
 from dayu.host.tooling import HostToolingOptions as _HostToolingOptions
+
+_DEFAULT_COMMAND_MINIMUM_PROTECTION_TOKENS = 256
 
 
 HOST_EVENT_STREAM_DEFAULT_LIMIT = 100
@@ -1548,17 +1550,94 @@ def _validate_command_context_budget_fields(
     :raises ValueError: 预算字段非法时抛出。
     """
 
+    _context_budget_policy_from_command_options(options)
+
+
+def _context_budget_policy_from_command_options(
+    options: HostCommandHandleOptions,
+) -> ContextBudgetPolicy:
+    """把既有 command options 映射为 ratio-first context budget policy。
+
+    :param options: Host command handle options。
+    :returns: ratio-first context budget policy。
+    :raises TypeError: 整数字段类型非法时抛出。
+    :raises ValueError: 预算字段非法时抛出。
+    """
+
+    _require_positive_int(
+        options.context_window_size,
+        field_name="HostCommandHandleOptions.context_window_size",
+    )
+    _require_positive_int(
+        options.reserved_output_tokens,
+        field_name="HostCommandHandleOptions.reserved_output_tokens",
+    )
+    if options.reserved_output_tokens >= options.context_window_size:
+        raise ValueError(
+            "HostCommandHandleOptions.reserved_output_tokens must be smaller "
+            "than context_window_size"
+        )
+    input_budget_tokens = options.context_window_size - options.reserved_output_tokens
+    soft_threshold_tokens = max(
+        1, int(input_budget_tokens * DEFAULT_SOFT_THRESHOLD_CONTEXT_RATIO)
+    )
+    hard_threshold_tokens = _command_hard_threshold_tokens(
+        options=options,
+        input_budget_tokens=input_budget_tokens,
+    )
+    return context_budget_policy_from_threshold_tokens(
+        context_window_size=options.context_window_size,
+        soft_threshold_tokens=soft_threshold_tokens,
+        hard_threshold_tokens=hard_threshold_tokens,
+    )
+
+
+def _command_hard_threshold_tokens(
+    *,
+    options: HostCommandHandleOptions,
+    input_budget_tokens: int,
+) -> int:
+    """返回 command options 派生的 hard threshold token 数。
+
+    :param options: Host command handle options。
+    :param input_budget_tokens: 输出预留后的输入预算 token 数。
+    :returns: hard threshold token 数。
+    :raises TypeError: 字段类型非法时抛出。
+    :raises ValueError: 字段值非法时抛出。
+    """
+
+    if options.context_budget_hard_threshold_tokens is not None:
+        _require_positive_int(
+            options.context_budget_hard_threshold_tokens,
+            field_name=(
+                "HostCommandHandleOptions."
+                "context_budget_hard_threshold_tokens"
+            ),
+        )
+        if options.context_budget_hard_threshold_tokens > input_budget_tokens:
+            raise ValueError(
+                "HostCommandHandleOptions.context_budget_hard_threshold_tokens "
+                "must not exceed input budget"
+            )
+        return options.context_budget_hard_threshold_tokens
     minimum_protection_tokens = (
         options.context_budget_minimum_protection_tokens
         if options.context_budget_minimum_protection_tokens is not None
-        else DEFAULT_MINIMUM_PROTECTION_TOKENS
+        else _DEFAULT_COMMAND_MINIMUM_PROTECTION_TOKENS
     )
-    default_context_budget_policy(
-        context_window_size=options.context_window_size,
-        reserved_output_tokens=options.reserved_output_tokens,
-        hard_threshold_tokens=options.context_budget_hard_threshold_tokens,
-        minimum_protection_tokens=minimum_protection_tokens,
+    _require_non_negative_int(
+        minimum_protection_tokens,
+        field_name=(
+            "HostCommandHandleOptions."
+            "context_budget_minimum_protection_tokens"
+        ),
     )
+    if minimum_protection_tokens >= input_budget_tokens:
+        raise ValueError(
+            "HostCommandHandleOptions.context_budget_minimum_protection_tokens "
+            "must be smaller than input budget"
+        )
+    return input_budget_tokens - minimum_protection_tokens
 
 
 @dataclass(frozen=True, slots=True)

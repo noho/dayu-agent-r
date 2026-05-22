@@ -39,7 +39,7 @@ HOST_BUSINESS_TOOL_SCAN_FORBIDDEN_PREFIXES: tuple[str, ...] = (
     "pkgutil",
 )
 FETCH_MORE_ALLOWED_RELATIVE_FILES: frozenset[str] = frozenset(
-    {"host/tool_runtime.py", "host/tooling.py"}
+    {"host/tool_runtime.py", "host/tooling.py", "runtime/tools_discovery.py"}
 )
 FETCH_MORE_OWNERSHIP_TOKEN: str = "fetch_more"
 ENGINE_FORBIDDEN_PREFIXES: tuple[str, ...] = ("dayu.host",)

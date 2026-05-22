@@ -35,11 +35,11 @@ def _is_token_count(value: JsonValue | None) -> TypeGuard[int]:
     """判断 JSON 值是否为合法 token 计数。
 
     :param value: provider usage 字段中的单个值。
-    :returns: 非 ``bool`` 的 ``int`` 返回 ``True``；其它返回 ``False``。
+    :returns: 非 ``bool`` 且非负的 ``int`` 返回 ``True``；其它返回 ``False``。
     :raises Exception: 不主动抛出异常。
     """
 
-    return isinstance(value, int) and not isinstance(value, bool)
+    return isinstance(value, int) and not isinstance(value, bool) and value >= 0
 
 
 def coerce_usage(usage: Mapping[str, JsonValue]) -> UsageTokenCounts | None:

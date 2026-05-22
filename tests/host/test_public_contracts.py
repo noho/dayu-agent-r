@@ -631,9 +631,9 @@ def test_compose_host_local_execution_options_wires_context_policy() -> None:
     assert composed is not None
     assert composed.context_budget_policy is not None
     assert composed.context_budget_policy.context_window_size == 4096
-    assert composed.context_budget_policy.reserved_output_tokens == 512
-    assert composed.context_budget_policy.hard_threshold_tokens == 3000
-    assert composed.context_budget_policy.minimum_protection_tokens == 128
+    assert composed.context_budget_policy.hard_threshold_context_ratio == (
+        3000 / 4096
+    )
     assert composed.memory_projection_policy is local_execution.memory_projection_policy
     assert composed.compact_artifact_root == pathlib.Path(
         "workspace/compact-artifacts"
@@ -776,7 +776,6 @@ def test_host_local_execution_options_accept_valid_shape() -> None:
         options,
         context_budget_policy=default_context_budget_policy(
             context_window_size=2048,
-            reserved_output_tokens=512,
         ),
     )
     assert with_budget.context_budget_policy is not None

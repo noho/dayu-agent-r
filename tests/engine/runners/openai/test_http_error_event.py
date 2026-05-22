@@ -30,7 +30,10 @@ from dayu.engine.contracts.runner_events import (
     RunnerHTTPErrorCode,
     RunnerHTTPErrorData,
 )
-from dayu.engine.runners.openai.runner import AsyncOpenAIRunner
+from dayu.engine.runners.openai.runner import (
+    _HTTP_ERROR_BODY_MAX_BYTES,
+    AsyncOpenAIRunner,
+)
 
 from tests.engine.runners.openai._factories import make_options, make_spec
 from tests.engine.runners.openai._fakes import (
@@ -475,6 +478,54 @@ async def test_http_json_object_error_body_preserved_as_raw_payload() -> None:
     assert events[-2].data.raw_payload == payload
     assert isinstance(events[-1].data, RunnerDoneData)
     assert events[-1].data.provider_request_id == "req_header"
+    await runner.close()
+
+
+@pytest.mark.asyncio
+async def test_http_unicode_decode_error_body_keeps_replacement_text() -> None:
+    """HTTP 错误体 UTF-8 解码失败时仍保留 replacement 诊断文本。"""
+
+    runner = _make_runner(max_retries=0)
+    session = FakeSession()
+    session.enqueue_response(
+        _http_response_with_headers(
+            400,
+            headers={"x-request-id": "req_bad_utf8"},
+            body=b"\xffbad",
+        )
+    )
+    _install_session(runner, session)
+
+    events = await _run(runner)
+
+    assert isinstance(events[-2].data, RunnerHTTPErrorData)
+    assert events[-2].data.message == "\ufffdbad"
+    assert events[-2].data.raw_payload is None
+    assert events[-2].data.provider_request_id == "req_bad_utf8"
+    await runner.close()
+
+
+@pytest.mark.asyncio
+async def test_http_error_body_is_capped_before_decode() -> None:
+    """HTTP 错误体读取必须在解码前按 byte 上限截断。"""
+
+    runner = _make_runner(max_retries=0)
+    session = FakeSession()
+    body = b"x" * (_HTTP_ERROR_BODY_MAX_BYTES + 1024)
+    session.enqueue_response(
+        _http_response_with_headers(
+            400,
+            headers={"x-request-id": "req_large_error"},
+            body=body,
+        )
+    )
+    _install_session(runner, session)
+
+    events = await _run(runner)
+
+    assert isinstance(events[-2].data, RunnerHTTPErrorData)
+    assert events[-2].data.message == "x" * _HTTP_ERROR_BODY_MAX_BYTES
+    assert events[-2].data.raw_payload is None
     await runner.close()
 
 

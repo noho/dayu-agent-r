@@ -1,0 +1,1040 @@
+{
+  "models": {
+    "deepseek-v4-flash": {
+      "runner_kind": "openai_compatible",
+      "provider": "deepseek",
+      "model": "deepseek-v4-flash",
+      "endpoint": "https://api.deepseek.com/chat/completions",
+      "api_key_ref": "DEEPSEEK_API_KEY",
+      "headers": {
+        "Authorization": "Bearer {{DEEPSEEK_API_KEY}}",
+        "Content-Type": "application/json"
+      },
+      "supports_tool_calling": true,
+      "supports_stream": true,
+      "supports_stream_usage": true,
+      "default_timeout_seconds": 3600.0,
+      "max_retries": 3,
+      "sse_idle_timeout_seconds": 120.0,
+      "sse_heartbeat_seconds": 10.0,
+      "provider_request_extension": {
+        "type": "deepseek_thinking",
+        "enabled": false
+      },
+      "context_window_tokens": 1048576,
+      "runtime_hints": {
+        "runner_option_hints": {
+          "write": {
+            "temperature": 1.3,
+            "top_p": 1.0,
+            "stream": true
+          },
+          "overview": {
+            "temperature": 1.0,
+            "top_p": 1.0,
+            "stream": true
+          },
+          "audit": {
+            "temperature": 0.8,
+            "top_p": 1.0,
+            "stream": true
+          },
+          "decision": {
+            "temperature": 1.0,
+            "top_p": 1.0,
+            "stream": true
+          },
+          "interactive": {
+            "temperature": 1.3,
+            "top_p": 1.0,
+            "stream": true
+          },
+          "prompt": {
+            "temperature": 1.3,
+            "top_p": 1.0,
+            "stream": true
+          },
+          "infer": {
+            "temperature": 0.5,
+            "top_p": 1.0,
+            "stream": true
+          },
+          "conversation_compaction": {
+            "temperature": 0.4,
+            "top_p": 1.0,
+            "stream": false
+          }
+        }
+      }
+    },
+    "deepseek-v4-flash-thinking": {
+      "extends": "deepseek-v4-flash",
+      "provider_request_extension": {
+        "type": "deepseek_thinking",
+        "enabled": true
+      }
+    },
+    "deepseek-v4-pro": {
+      "runner_kind": "openai_compatible",
+      "provider": "deepseek",
+      "model": "deepseek-v4-pro",
+      "endpoint": "https://api.deepseek.com/chat/completions",
+      "api_key_ref": "DEEPSEEK_API_KEY",
+      "headers": {
+        "Authorization": "Bearer {{DEEPSEEK_API_KEY}}",
+        "Content-Type": "application/json"
+      },
+      "supports_tool_calling": true,
+      "supports_stream": true,
+      "supports_stream_usage": true,
+      "default_timeout_seconds": 3600.0,
+      "max_retries": 3,
+      "sse_idle_timeout_seconds": 120.0,
+      "sse_heartbeat_seconds": 10.0,
+      "provider_request_extension": {
+        "type": "deepseek_thinking",
+        "enabled": false
+      },
+      "context_window_tokens": 1048576,
+      "runtime_hints": {
+        "runner_option_hints": {
+          "write": {
+            "temperature": 1.3,
+            "top_p": 1.0,
+            "stream": true
+          },
+          "overview": {
+            "temperature": 1.0,
+            "top_p": 1.0,
+            "stream": true
+          },
+          "audit": {
+            "temperature": 0.8,
+            "top_p": 1.0,
+            "stream": true
+          },
+          "decision": {
+            "temperature": 1.0,
+            "top_p": 1.0,
+            "stream": true
+          },
+          "interactive": {
+            "temperature": 1.3,
+            "top_p": 1.0,
+            "stream": true
+          },
+          "prompt": {
+            "temperature": 1.3,
+            "top_p": 1.0,
+            "stream": true
+          },
+          "infer": {
+            "temperature": 0.5,
+            "top_p": 1.0,
+            "stream": true
+          },
+          "conversation_compaction": {
+            "temperature": 0.4,
+            "top_p": 1.0,
+            "stream": false
+          }
+        }
+      }
+    },
+    "deepseek-v4-pro-thinking": {
+      "extends": "deepseek-v4-pro",
+      "provider_request_extension": {
+        "type": "deepseek_thinking",
+        "enabled": true
+      }
+    },
+    "gpt-5.4": {
+      "runner_kind": "openai_compatible",
+      "provider": "openai",
+      "model": "gpt-5.4",
+      "endpoint": "https://api.openai.com/v1/chat/completions",
+      "api_key_ref": "OPENAI_API_KEY",
+      "headers": {
+        "Authorization": "Bearer {{OPENAI_API_KEY}}",
+        "Content-Type": "application/json"
+      },
+      "supports_tool_calling": true,
+      "supports_stream": true,
+      "supports_stream_usage": true,
+      "default_timeout_seconds": 3600.0,
+      "max_retries": 3,
+      "sse_idle_timeout_seconds": 120.0,
+      "sse_heartbeat_seconds": 10.0,
+      "provider_request_extension": {
+        "type": "openai_reasoning",
+        "reasoning_effort": "none"
+      },
+      "context_window_tokens": 1050000,
+      "runtime_hints": {
+        "runner_option_hints": {
+          "write": {
+            "temperature": 0.8,
+            "top_p": 1.0,
+            "stream": true
+          },
+          "overview": {
+            "temperature": 0.2,
+            "top_p": 1.0,
+            "stream": true
+          },
+          "audit": {
+            "temperature": 0.2,
+            "top_p": 1.0,
+            "stream": true
+          },
+          "decision": {
+            "temperature": 0.6,
+            "top_p": 1.0,
+            "stream": true
+          },
+          "interactive": {
+            "temperature": 0.6,
+            "top_p": 1.0,
+            "stream": true
+          },
+          "prompt": {
+            "temperature": 0.6,
+            "top_p": 1.0,
+            "stream": true
+          },
+          "infer": {
+            "temperature": 0.2,
+            "top_p": 1.0,
+            "stream": true
+          },
+          "conversation_compaction": {
+            "temperature": 0.2,
+            "top_p": 1.0,
+            "stream": false
+          }
+        }
+      }
+    },
+    "gpt-5.4-thinking": {
+      "extends": "gpt-5.4",
+      "provider_request_extension": {
+        "type": "openai_reasoning",
+        "reasoning_effort": "high"
+      }
+    },
+    "claude-sonnet-4-6": {
+      "runner_kind": "openai_compatible",
+      "provider": "anthropic",
+      "model": "claude-sonnet-4-6",
+      "endpoint": "https://api.anthropic.com/v1/chat/completions",
+      "api_key_ref": "ANTHROPIC_API_KEY",
+      "headers": {
+        "Authorization": "Bearer {{ANTHROPIC_API_KEY}}",
+        "Content-Type": "application/json"
+      },
+      "supports_tool_calling": true,
+      "supports_stream": true,
+      "supports_stream_usage": false,
+      "default_timeout_seconds": 3600.0,
+      "max_retries": 3,
+      "sse_idle_timeout_seconds": 120.0,
+      "sse_heartbeat_seconds": 10.0,
+      "provider_request_extension": {
+        "type": "anthropic_thinking",
+        "enabled": false
+      },
+      "context_window_tokens": 1000000,
+      "runtime_hints": {
+        "runner_option_hints": {
+          "write": {
+            "temperature": 0.9,
+            "top_p": 1.0,
+            "stream": true
+          },
+          "overview": {
+            "temperature": 0.2,
+            "top_p": 1.0,
+            "stream": true
+          },
+          "audit": {
+            "temperature": 0.2,
+            "top_p": 1.0,
+            "stream": true
+          },
+          "decision": {
+            "temperature": 0.6,
+            "top_p": 1.0,
+            "stream": true
+          },
+          "interactive": {
+            "temperature": 0.6,
+            "top_p": 1.0,
+            "stream": true
+          },
+          "prompt": {
+            "temperature": 0.6,
+            "top_p": 1.0,
+            "stream": true
+          },
+          "infer": {
+            "temperature": 0.2,
+            "top_p": 1.0,
+            "stream": true
+          },
+          "conversation_compaction": {
+            "temperature": 0.2,
+            "top_p": 1.0,
+            "stream": false
+          }
+        }
+      }
+    },
+    "claude-sonnet-4-6-thinking": {
+      "extends": "claude-sonnet-4-6",
+      "headers": {
+        "Authorization": "Bearer {{ANTHROPIC_API_KEY}}",
+        "Content-Type": "application/json",
+        "anthropic-beta": "interleaved-thinking-2025-05-14"
+      },
+      "provider_request_extension": {
+        "type": "anthropic_thinking",
+        "enabled": true,
+        "budget_tokens": 8000
+      }
+    },
+    "gemini-2.5-flash": {
+      "runner_kind": "openai_compatible",
+      "provider": "gemini",
+      "model": "gemini-2.5-flash",
+      "endpoint": "https://generativelanguage.googleapis.com/v1beta/openai/chat/completions",
+      "api_key_ref": "GEMINI_API_KEY",
+      "headers": {
+        "Authorization": "Bearer {{GEMINI_API_KEY}}",
+        "Content-Type": "application/json"
+      },
+      "supports_tool_calling": true,
+      "supports_stream": true,
+      "supports_stream_usage": false,
+      "default_timeout_seconds": 3600.0,
+      "max_retries": 3,
+      "sse_idle_timeout_seconds": 120.0,
+      "sse_heartbeat_seconds": 10.0,
+      "provider_request_extension": {
+        "type": "gemini_thinking",
+        "thinking_budget": 0
+      },
+      "context_window_tokens": 1048576,
+      "runtime_hints": {
+        "runner_option_hints": {
+          "write": {
+            "temperature": 1.0,
+            "top_p": 1.0,
+            "stream": true
+          },
+          "overview": {
+            "temperature": 0.4,
+            "top_p": 1.0,
+            "stream": true
+          },
+          "audit": {
+            "temperature": 0.1,
+            "top_p": 1.0,
+            "stream": true
+          },
+          "decision": {
+            "temperature": 0.2,
+            "top_p": 1.0,
+            "stream": true
+          },
+          "interactive": {
+            "temperature": 0.7,
+            "top_p": 1.0,
+            "stream": true
+          },
+          "prompt": {
+            "temperature": 0.6,
+            "top_p": 1.0,
+            "stream": true
+          },
+          "infer": {
+            "temperature": 0.1,
+            "top_p": 1.0,
+            "stream": true
+          },
+          "conversation_compaction": {
+            "temperature": 0.3,
+            "top_p": 1.0,
+            "stream": false
+          }
+        }
+      }
+    },
+    "gemini-2.5-flash-thinking": {
+      "extends": "gemini-2.5-flash",
+      "provider_request_extension": {
+        "type": "gemini_thinking",
+        "thinking_budget": -1,
+        "include_thoughts": true
+      }
+    },
+    "gemini-2.5-pro": {
+      "runner_kind": "openai_compatible",
+      "provider": "gemini",
+      "model": "gemini-2.5-pro",
+      "endpoint": "https://generativelanguage.googleapis.com/v1beta/openai/chat/completions",
+      "api_key_ref": "GEMINI_API_KEY",
+      "headers": {
+        "Authorization": "Bearer {{GEMINI_API_KEY}}",
+        "Content-Type": "application/json"
+      },
+      "supports_tool_calling": true,
+      "supports_stream": true,
+      "supports_stream_usage": false,
+      "default_timeout_seconds": 3600.0,
+      "max_retries": 3,
+      "sse_idle_timeout_seconds": 120.0,
+      "sse_heartbeat_seconds": 10.0,
+      "provider_request_extension": {
+        "type": "gemini_thinking",
+        "thinking_budget": 0
+      },
+      "context_window_tokens": 1048576,
+      "runtime_hints": {
+        "runner_option_hints": {
+          "write": {
+            "temperature": 1.0,
+            "top_p": 1.0,
+            "stream": true
+          },
+          "overview": {
+            "temperature": 0.4,
+            "top_p": 1.0,
+            "stream": true
+          },
+          "audit": {
+            "temperature": 0.1,
+            "top_p": 1.0,
+            "stream": true
+          },
+          "decision": {
+            "temperature": 0.2,
+            "top_p": 1.0,
+            "stream": true
+          },
+          "interactive": {
+            "temperature": 0.7,
+            "top_p": 1.0,
+            "stream": true
+          },
+          "prompt": {
+            "temperature": 0.6,
+            "top_p": 1.0,
+            "stream": true
+          },
+          "infer": {
+            "temperature": 0.1,
+            "top_p": 1.0,
+            "stream": true
+          },
+          "conversation_compaction": {
+            "temperature": 0.3,
+            "top_p": 1.0,
+            "stream": false
+          }
+        }
+      }
+    },
+    "gemini-2.5-pro-thinking": {
+      "extends": "gemini-2.5-pro",
+      "provider_request_extension": {
+        "type": "gemini_thinking",
+        "thinking_budget": -1,
+        "include_thoughts": true
+      }
+    },
+    "gemini-2.5-flash-lite": {
+      "runner_kind": "openai_compatible",
+      "provider": "gemini",
+      "model": "gemini-2.5-flash-lite",
+      "endpoint": "https://generativelanguage.googleapis.com/v1beta/openai/chat/completions",
+      "api_key_ref": "GEMINI_API_KEY",
+      "headers": {
+        "Authorization": "Bearer {{GEMINI_API_KEY}}",
+        "Content-Type": "application/json"
+      },
+      "supports_tool_calling": true,
+      "supports_stream": true,
+      "supports_stream_usage": false,
+      "default_timeout_seconds": 3600.0,
+      "max_retries": 3,
+      "sse_idle_timeout_seconds": 120.0,
+      "sse_heartbeat_seconds": 10.0,
+      "provider_request_extension": {
+        "type": "gemini_thinking",
+        "thinking_budget": 0
+      },
+      "context_window_tokens": 1048576,
+      "runtime_hints": {
+        "runner_option_hints": {
+          "write": {
+            "temperature": 1.0,
+            "top_p": 1.0,
+            "stream": true
+          },
+          "overview": {
+            "temperature": 0.4,
+            "top_p": 1.0,
+            "stream": true
+          },
+          "audit": {
+            "temperature": 0.1,
+            "top_p": 1.0,
+            "stream": true
+          },
+          "decision": {
+            "temperature": 0.2,
+            "top_p": 1.0,
+            "stream": true
+          },
+          "interactive": {
+            "temperature": 0.7,
+            "top_p": 1.0,
+            "stream": true
+          },
+          "prompt": {
+            "temperature": 0.6,
+            "top_p": 1.0,
+            "stream": true
+          },
+          "infer": {
+            "temperature": 0.1,
+            "top_p": 1.0,
+            "stream": true
+          },
+          "conversation_compaction": {
+            "temperature": 0.3,
+            "top_p": 1.0,
+            "stream": false
+          }
+        }
+      }
+    },
+    "gemini-2.5-flash-lite-thinking": {
+      "extends": "gemini-2.5-flash-lite",
+      "provider_request_extension": {
+        "type": "gemini_thinking",
+        "thinking_budget": -1,
+        "include_thoughts": true
+      }
+    },
+    "gemini-3.1-pro-preview": {
+      "runner_kind": "openai_compatible",
+      "provider": "gemini",
+      "model": "gemini-3.1-pro-preview",
+      "endpoint": "https://generativelanguage.googleapis.com/v1beta/openai/chat/completions",
+      "api_key_ref": "GEMINI_API_KEY",
+      "headers": {
+        "Authorization": "Bearer {{GEMINI_API_KEY}}",
+        "Content-Type": "application/json"
+      },
+      "supports_tool_calling": true,
+      "supports_stream": true,
+      "supports_stream_usage": false,
+      "default_timeout_seconds": 3600.0,
+      "max_retries": 3,
+      "sse_idle_timeout_seconds": 120.0,
+      "sse_heartbeat_seconds": 10.0,
+      "provider_request_extension": {
+        "type": "gemini_thinking",
+        "thinking_budget": 0
+      },
+      "context_window_tokens": 1048576,
+      "runtime_hints": {
+        "runner_option_hints": {
+          "write": {
+            "temperature": 1.0,
+            "top_p": 1.0,
+            "stream": true
+          },
+          "overview": {
+            "temperature": 0.4,
+            "top_p": 1.0,
+            "stream": true
+          },
+          "audit": {
+            "temperature": 0.1,
+            "top_p": 1.0,
+            "stream": true
+          },
+          "decision": {
+            "temperature": 0.2,
+            "top_p": 1.0,
+            "stream": true
+          },
+          "interactive": {
+            "temperature": 0.7,
+            "top_p": 1.0,
+            "stream": true
+          },
+          "prompt": {
+            "temperature": 0.6,
+            "top_p": 1.0,
+            "stream": true
+          },
+          "infer": {
+            "temperature": 0.1,
+            "top_p": 1.0,
+            "stream": true
+          },
+          "conversation_compaction": {
+            "temperature": 0.3,
+            "top_p": 1.0,
+            "stream": false
+          }
+        }
+      }
+    },
+    "gemini-3.1-pro-preview-thinking": {
+      "extends": "gemini-3.1-pro-preview",
+      "provider_request_extension": {
+        "type": "gemini_thinking",
+        "thinking_budget": -1,
+        "include_thoughts": true
+      }
+    },
+    "gemini-3.1-flash-lite-preview": {
+      "runner_kind": "openai_compatible",
+      "provider": "gemini",
+      "model": "gemini-3.1-flash-lite-preview",
+      "endpoint": "https://generativelanguage.googleapis.com/v1beta/openai/chat/completions",
+      "api_key_ref": "GEMINI_API_KEY",
+      "headers": {
+        "Authorization": "Bearer {{GEMINI_API_KEY}}",
+        "Content-Type": "application/json"
+      },
+      "supports_tool_calling": true,
+      "supports_stream": true,
+      "supports_stream_usage": false,
+      "default_timeout_seconds": 3600.0,
+      "max_retries": 3,
+      "sse_idle_timeout_seconds": 120.0,
+      "sse_heartbeat_seconds": 10.0,
+      "provider_request_extension": {
+        "type": "gemini_thinking",
+        "thinking_budget": 0
+      },
+      "context_window_tokens": 1048576,
+      "runtime_hints": {
+        "runner_option_hints": {
+          "write": {
+            "temperature": 1.0,
+            "top_p": 1.0,
+            "stream": true
+          },
+          "overview": {
+            "temperature": 0.4,
+            "top_p": 1.0,
+            "stream": true
+          },
+          "audit": {
+            "temperature": 0.1,
+            "top_p": 1.0,
+            "stream": true
+          },
+          "decision": {
+            "temperature": 0.2,
+            "top_p": 1.0,
+            "stream": true
+          },
+          "interactive": {
+            "temperature": 0.7,
+            "top_p": 1.0,
+            "stream": true
+          },
+          "prompt": {
+            "temperature": 0.6,
+            "top_p": 1.0,
+            "stream": true
+          },
+          "infer": {
+            "temperature": 0.1,
+            "top_p": 1.0,
+            "stream": true
+          },
+          "conversation_compaction": {
+            "temperature": 0.3,
+            "top_p": 1.0,
+            "stream": false
+          }
+        }
+      }
+    },
+    "gemini-3.1-flash-lite-preview-thinking": {
+      "extends": "gemini-3.1-flash-lite-preview",
+      "provider_request_extension": {
+        "type": "gemini_thinking",
+        "thinking_budget": -1,
+        "include_thoughts": true
+      }
+    },
+    "mimo-v2.5-pro": {
+      "runner_kind": "openai_compatible",
+      "provider": "mimo",
+      "model": "mimo-v2.5-pro",
+      "endpoint": "https://api.xiaomimimo.com/v1/chat/completions",
+      "api_key_ref": "MIMO_API_KEY",
+      "headers": {
+        "Authorization": "Bearer {{MIMO_API_KEY}}",
+        "Content-Type": "application/json"
+      },
+      "supports_tool_calling": true,
+      "supports_stream": true,
+      "supports_stream_usage": false,
+      "default_timeout_seconds": 3600.0,
+      "max_retries": 3,
+      "sse_idle_timeout_seconds": 120.0,
+      "sse_heartbeat_seconds": 10.0,
+      "provider_request_extension": {
+        "type": "mimo_thinking",
+        "enabled": false
+      },
+      "context_window_tokens": 1048576,
+      "runtime_hints": {
+        "runner_option_hints": {
+          "write": {
+            "temperature": 0.8,
+            "top_p": 1.0,
+            "stream": true
+          },
+          "overview": {
+            "temperature": 0.3,
+            "top_p": 1.0,
+            "stream": true
+          },
+          "audit": {
+            "temperature": 0.4,
+            "top_p": 1.0,
+            "stream": true
+          },
+          "decision": {
+            "temperature": 0.6,
+            "top_p": 1.0,
+            "stream": true
+          },
+          "interactive": {
+            "temperature": 0.8,
+            "top_p": 1.0,
+            "stream": true
+          },
+          "prompt": {
+            "temperature": 0.8,
+            "top_p": 1.0,
+            "stream": true
+          },
+          "infer": {
+            "temperature": 0.3,
+            "top_p": 1.0,
+            "stream": true
+          },
+          "conversation_compaction": {
+            "temperature": 0.3,
+            "top_p": 1.0,
+            "stream": false
+          }
+        }
+      }
+    },
+    "mimo-v2.5-pro-thinking": {
+      "extends": "mimo-v2.5-pro",
+      "provider_request_extension": {
+        "type": "mimo_thinking",
+        "enabled": true
+      }
+    },
+    "mimo-v2.5-pro-plan": {
+      "runner_kind": "openai_compatible",
+      "provider": "mimo",
+      "model": "mimo-v2.5-pro",
+      "endpoint": "https://token-plan-cn.xiaomimimo.com/v1/chat/completions",
+      "api_key_ref": "MIMO_PLAN_API_KEY",
+      "headers": {
+        "Authorization": "Bearer {{MIMO_PLAN_API_KEY}}",
+        "Content-Type": "application/json"
+      },
+      "supports_tool_calling": true,
+      "supports_stream": true,
+      "supports_stream_usage": false,
+      "default_timeout_seconds": 3600.0,
+      "max_retries": 3,
+      "sse_idle_timeout_seconds": 120.0,
+      "sse_heartbeat_seconds": 10.0,
+      "provider_request_extension": {
+        "type": "mimo_thinking",
+        "enabled": false
+      },
+      "context_window_tokens": 1048576,
+      "runtime_hints": {
+        "runner_option_hints": {
+          "write": {
+            "temperature": 0.8,
+            "top_p": 1.0,
+            "stream": true
+          },
+          "overview": {
+            "temperature": 0.3,
+            "top_p": 1.0,
+            "stream": true
+          },
+          "audit": {
+            "temperature": 0.4,
+            "top_p": 1.0,
+            "stream": true
+          },
+          "decision": {
+            "temperature": 0.6,
+            "top_p": 1.0,
+            "stream": true
+          },
+          "interactive": {
+            "temperature": 0.8,
+            "top_p": 1.0,
+            "stream": true
+          },
+          "prompt": {
+            "temperature": 0.8,
+            "top_p": 1.0,
+            "stream": true
+          },
+          "infer": {
+            "temperature": 0.3,
+            "top_p": 1.0,
+            "stream": true
+          },
+          "conversation_compaction": {
+            "temperature": 0.3,
+            "top_p": 1.0,
+            "stream": false
+          }
+        }
+      }
+    },
+    "mimo-v2.5-pro-thinking-plan": {
+      "extends": "mimo-v2.5-pro-plan",
+      "provider_request_extension": {
+        "type": "mimo_thinking",
+        "enabled": true
+      }
+    },
+    "mimo-v2.5-pro-plan-sg": {
+      "runner_kind": "openai_compatible",
+      "provider": "mimo",
+      "model": "mimo-v2.5-pro",
+      "endpoint": "https://token-plan-sgp.xiaomimimo.com/v1/chat/completions",
+      "api_key_ref": "MIMO_PLAN_SG_API_KEY",
+      "headers": {
+        "Authorization": "Bearer {{MIMO_PLAN_SG_API_KEY}}",
+        "Content-Type": "application/json"
+      },
+      "supports_tool_calling": true,
+      "supports_stream": true,
+      "supports_stream_usage": false,
+      "default_timeout_seconds": 3600.0,
+      "max_retries": 3,
+      "sse_idle_timeout_seconds": 120.0,
+      "sse_heartbeat_seconds": 10.0,
+      "provider_request_extension": {
+        "type": "mimo_thinking",
+        "enabled": false
+      },
+      "context_window_tokens": 1048576,
+      "runtime_hints": {
+        "runner_option_hints": {
+          "write": {
+            "temperature": 0.8,
+            "top_p": 1.0,
+            "stream": true
+          },
+          "overview": {
+            "temperature": 0.3,
+            "top_p": 1.0,
+            "stream": true
+          },
+          "audit": {
+            "temperature": 0.4,
+            "top_p": 1.0,
+            "stream": true
+          },
+          "decision": {
+            "temperature": 0.6,
+            "top_p": 1.0,
+            "stream": true
+          },
+          "interactive": {
+            "temperature": 0.8,
+            "top_p": 1.0,
+            "stream": true
+          },
+          "prompt": {
+            "temperature": 0.8,
+            "top_p": 1.0,
+            "stream": true
+          },
+          "infer": {
+            "temperature": 0.3,
+            "top_p": 1.0,
+            "stream": true
+          },
+          "conversation_compaction": {
+            "temperature": 0.3,
+            "top_p": 1.0,
+            "stream": false
+          }
+        }
+      }
+    },
+    "mimo-v2.5-pro-thinking-plan-sg": {
+      "extends": "mimo-v2.5-pro-plan-sg",
+      "provider_request_extension": {
+        "type": "mimo_thinking",
+        "enabled": true
+      }
+    },
+    "qwen-plus": {
+      "runner_kind": "openai_compatible",
+      "provider": "qwen",
+      "model": "qwen3.6-plus",
+      "endpoint": "https://dashscope.aliyuncs.com/compatible-mode/v1/chat/completions",
+      "api_key_ref": "QWEN_API_KEY",
+      "headers": {
+        "Authorization": "Bearer {{QWEN_API_KEY}}",
+        "Content-Type": "application/json"
+      },
+      "supports_tool_calling": true,
+      "supports_stream": true,
+      "supports_stream_usage": true,
+      "default_timeout_seconds": 3600.0,
+      "max_retries": 3,
+      "sse_idle_timeout_seconds": 120.0,
+      "sse_heartbeat_seconds": 10.0,
+      "provider_request_extension": {
+        "type": "qwen_thinking",
+        "enable_thinking": false
+      },
+      "context_window_tokens": 1000000,
+      "runtime_hints": {
+        "runner_option_hints": {
+          "write": {
+            "temperature": 0.6,
+            "top_p": 1.0,
+            "stream": true
+          },
+          "overview": {
+            "temperature": 0.1,
+            "top_p": 1.0,
+            "stream": true
+          },
+          "audit": {
+            "temperature": 0.2,
+            "top_p": 1.0,
+            "stream": true
+          },
+          "decision": {
+            "temperature": 0.3,
+            "top_p": 1.0,
+            "stream": true
+          },
+          "interactive": {
+            "temperature": 0.6,
+            "top_p": 1.0,
+            "stream": true
+          },
+          "prompt": {
+            "temperature": 0.6,
+            "top_p": 1.0,
+            "stream": true
+          },
+          "infer": {
+            "temperature": 0.1,
+            "top_p": 1.0,
+            "stream": true
+          },
+          "conversation_compaction": {
+            "temperature": 0.1,
+            "top_p": 1.0,
+            "stream": false
+          }
+        }
+      }
+    },
+    "qwen-plus-thinking": {
+      "extends": "qwen-plus",
+      "provider_request_extension": {
+        "type": "qwen_thinking",
+        "enable_thinking": true
+      }
+    },
+    "ollama": {
+      "runner_kind": "openai_compatible",
+      "provider": "ollama",
+      "model": "YOUR_MODEL_HERE",
+      "endpoint": "http://localhost:11434/v1/chat/completions",
+      "api_key_ref": null,
+      "headers": {
+        "Content-Type": "application/json"
+      },
+      "supports_tool_calling": true,
+      "supports_stream": true,
+      "supports_stream_usage": true,
+      "default_timeout_seconds": 3600.0,
+      "max_retries": 3,
+      "sse_idle_timeout_seconds": 120.0,
+      "sse_heartbeat_seconds": 10.0,
+      "provider_request_extension": null,
+      "context_window_tokens": 262144,
+      "runtime_hints": {
+        "runner_option_hints": {
+          "write": {
+            "temperature": 0.6,
+            "top_p": 1.0,
+            "stream": true
+          },
+          "overview": {
+            "temperature": 0.1,
+            "top_p": 1.0,
+            "stream": true
+          },
+          "audit": {
+            "temperature": 0.2,
+            "top_p": 1.0,
+            "stream": true
+          },
+          "decision": {
+            "temperature": 0.3,
+            "top_p": 1.0,
+            "stream": true
+          },
+          "interactive": {
+            "temperature": 0.2,
+            "top_p": 1.0,
+            "stream": true
+          },
+          "prompt": {
+            "temperature": 0.2,
+            "top_p": 1.0,
+            "stream": true
+          },
+          "infer": {
+            "temperature": 0.1,
+            "top_p": 1.0,
+            "stream": true
+          },
+          "conversation_compaction": {
+            "temperature": 0.1,
+            "top_p": 1.0,
+            "stream": false
+          }
+        }
+      }
+    }
+  }
+}

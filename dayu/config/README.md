@@ -1,133 +1,210 @@
 # Dayu 配置说明
 
-本手册只说明当前 `dayu/config/` 中已经存在的默认配置，以及它们与
-`workspace/config/` 的覆盖关系。Engine 与领域能力的内部机制不在这里展开。
+本手册只说明当前 `dayu/config/` 的默认配置、`workspace/config/` 覆盖关系与 prompts 目录职责。Engine、Host、Service 和财报领域能力的内部机制不在这里展开。
 
 ## 配置层级
 
-Dayu 配置分两层：
+Dayu runtime assembly 配置分两层：
 
 1. 包内默认配置：`dayu/config/`
 2. 工作区覆盖配置：`workspace/config/`
 
-读取规则是：优先使用 `workspace/config/*`，缺失时回退到
-`dayu/config/*`。因此日常运行不应直接修改包内默认配置，项目级模型、
-超时、API key 占位符和运行参数应放在 `workspace/config/`。
+`dayu.runtime.location.resolve_runtime_locations` 负责把项目根目录解析为 runtime assembly 位置：`workspace/config` 存在时输出 `config_overlay_dir`，不存在时输出 `None`；prompt assets 与 scene manifests 优先使用 workspace 中已存在的对应目录，否则使用包内默认资产。`ConfigLoader` 只接收调用方显式传入的配置目录，不猜测 workspace 路径。
 
-当前 `dayu.config` 不提供公共 Python loader，也不提供
-`llm_models.json -> RunnerSpec` 的统一模型配置 adapter。模型字段、
-`provider_request` 等业务 schema 由各调用入口在自身边界内解释。
+`dayu.runtime.config_loader.ConfigLoader` 默认加载包内配置；调用方可以显式传入 workspace 配置目录。ConfigLoader 不解析环境变量，不替换 secret，不脱敏，也不 import Host、Engine、Service、UI、Fins 或具体业务工具包。
+
+覆盖规则按配置文件类型分别执行：
+
+- 顶层 map 按稳定 id 合并。
+- workspace 中与包内同 id 的记录会整条替换包内记录。
+- 不做隐式 deep merge；复用配置只能用显式 `extends`。
+- `extends` 只允许单继承；循环、自引用、多父项、父项缺失、缺字段和非法类型都会加载失败。
+- catalog record id 只来自顶层 map key；record 内不得重复写 `model_id`、`provider_id`、`runtime_id`、`host_runtime_id`、`profile_id` 或 `execution_profile_id`。
 
 ## 当前文件
 
 ```text
 dayu/config/
 ├── README.md
-├── llm_models.json
-└── run.json
+├── execution_profiles.json
+├── host_runtime.json
+├── models.json
+├── runtime_lanes.json
+├── prompts/
+│   ├── base/
+│   ├── manifests/
+│   └── scenes/
+└── tool_discovery.json
 ```
 
-`llm_models.json` 定义默认模型入口和 provider 请求扩展；`run.json`
-定义运行时默认参数与工具限额。
+旧 `llm_models.json` 和 `run.json` 已删除，不再提供兼容读取路径。
 
-## llm_models.json
+## models.json
 
-顶层每个非 `_` 开头的键是一套模型配置。当前默认配置只声明
-OpenAI-compatible runner 形态。
+`models.json` 是模型目录，只表达 provider / model 能力和请求基础参数。顶层字段为 `models`，每条记录的 key 是模型配置稳定 id。
 
 常用字段：
 
 | 字段 | 含义 |
 |---|---|
-| `runner_type` | Runner 类型，当前默认配置使用 `openai_compatible` |
-| `name` | 配置名称 |
-| `endpoint_url` | Chat completions endpoint |
-| `model` | Provider 模型 ID |
-| `headers` | HTTP header 模板，支持 `{{ENV_VAR}}` 占位符 |
-| `provider_request` | Provider 私有请求扩展，配置 schema 与 Engine contract 对齐 |
-| `timeout` | 单次模型请求默认超时秒数 |
-| `stream_idle_timeout` | SSE 字节流空闲 hard timeout 秒数 |
-| `stream_idle_heartbeat_sec` | SSE 空闲诊断日志间隔秒数 |
-| `supports_stream` | 是否支持流式输出 |
+| `runner_kind` | Runner 类别，当前默认配置使用 `openai_compatible` |
+| `provider` | provider 标识 |
+| `model` | provider 模型名 |
+| `endpoint` | provider endpoint |
+| `api_key_ref` | API key 引用，按字符串原样保留 |
+| `headers` | 请求 headers，按配置原样保留 |
 | `supports_tool_calling` | 是否支持工具调用 |
-| `supports_stream_usage` | 流式请求时是否发送 `stream_options.include_usage=true` |
-| `max_context_tokens` | 模型最大上下文窗口；Phase 5 context budget 使用 |
-| `description` | 面向配置阅读者的模型说明 |
-| `runtime_hints.temperature_profiles` | 不同 scene / 任务类别的温度建议 |
+| `supports_stream` | 是否支持流式输出 |
+| `supports_stream_usage` | 是否支持流式 usage |
+| `default_timeout_seconds` | 默认请求超时秒数 |
+| `max_retries` | 默认最大重试次数；包内默认模型使用 `3` |
+| `sse_idle_timeout_seconds` | SSE 空闲超时秒数 |
+| `sse_heartbeat_seconds` | SSE 空闲诊断 heartbeat 秒数 |
+| `provider_request_extension` | provider 私有请求扩展 JSON DSL，按原样保留 |
+| `context_window_tokens` | 模型上下文窗口 token 数 |
+| `runtime_hints.runner_option_hints` | 模型内 semantic RunnerCallOptions hints |
 
-禁止在默认配置中使用开放 `extra_payloads` 弱类型配置袋。Provider 私有参数
-必须放入 `provider_request`，其配置 schema 与 Engine contract 对齐。
-当前 `dayu.config` 不负责构造 `RunnerSpec.provider_request`；具体解析由消费方
-在自身边界内完成。`utils/` 下的人工 smoke 脚本遵循脚本内固定
-`ProviderCase` 的范式，不作为配置 adapter。
+`runtime_hints.runner_option_hints` 的每个 hint 都是默认 RunnerCallOptions 配置片段，只包含 `temperature`、`top_p` 与 `stream`。默认配置不提供输出 token cap；`RunnerCallOptions.max_tokens` 只保留给显式 per-run 或 provider adapter override 使用。execution profile 只引用 `model_id` 和 semantic `runner_option_hint_id`，不保存 provider-specific 调用参数。
 
-### provider_request
+模型记录可以使用 `extends` 继承基础模型；子记录按顶层字段覆盖父记录。thinking 变体通常继承对应基础模型，只覆盖 `provider_request_extension`，需要 provider beta header 等差异时也可以同时覆盖完整 `headers` object。
 
-当前支持的 `provider_request.type`：
+## execution_profiles.json
 
-| type | 对应 Engine contract | 字段 |
-|---|---|---|
-| `openai_reasoning` | `OpenAIReasoningExtension` | `reasoning_effort` |
-| `anthropic_thinking` | `AnthropicThinkingExtension` | `enabled`、`budget_tokens` |
-| `deepseek_thinking` | `DeepSeekThinkingExtension` | `enabled`、`reasoning_effort` |
-| `mimo_thinking` | `MimoThinkingExtension` | `enabled` |
-| `gemini_thinking` | `GeminiThinkingExtension` | `thinking_budget`、`include_thoughts`、`thinking_level` |
-| `qwen_thinking` | `QwenThinkingExtension` | `enable_thinking`、`thinking_budget` |
+`execution_profiles.json` 表达 Service / composition root 生成完整执行输入所需的 execution baseline 与治理策略选择。顶层字段包括：
 
-字段缺省表示“不传给 provider”。只有 provider 文档明确把 `0` 定义为
-显式关闭或显式预算值时，才应在配置中写 `0`。
+| 字段 | 含义 |
+|---|---|
+| `default_execution_profile_id` | 默认 execution profile id，默认值为 `standard-256k` |
+| `execution_profiles` | 普通 Run、compactor、context budget、memory projection、truncation 与 agent policy 的完整基线 |
 
-示例：
+单个 execution profile 包含：
+
+- `context_window_class`：profile 面向的上下文窗口分档，当前只允许 `256k` 与 `1m`。
+- `min_context_window_tokens`：profile 要求的最小模型上下文窗口 token 数，`256k` 为 `262144`，`1m` 为 `1000000`。
+- `run_baseline`：普通 Run 默认 `model_id` 与 `runner_option_hint_id`。
+- `compactor_baseline`：compactor 默认 `model_id`、`runner_option_hint_id` 与 `artifact_root`。
+- `context_budget_policy`：对齐 Host public `ContextBudgetPolicy` 的 ratio-first 配置；上下文窗口来自 effective model 的 `context_window_tokens`。
+- `memory_projection_policy`：对齐 Host public `MemoryProjectionPolicy` 的 ratio / floor / cap 配置；上下文窗口来自 effective model 的 `context_window_tokens`。
+- `tool_truncation_policy`：只配置默认截断治理参数和默认 limits，不配置 per-tool strategy / target。
+- `agent_policy`：内嵌 Agent loop、continuation、工具超时、fallback 等 policy。
+
+`agent_policy` 使用 `continuation_max_attempts`、`allow_tool_calls`、`max_consecutive_failed_tool_batches` 等当前 AgentPolicy 字段。`fallback_mode` 只允许 `force_answer` 与 `raise_error`；默认 fallback prompt 文本为“请基于已获得的信息直接回答问题。信息不足时必须说明不确定性，不得编造。”
+
+包内默认 profile 按场景与上下文窗口显式分档为 `standard-256k`、`standard-1m`、`wechat-256k` 与 `wechat-1m`。Service / composition root 只能通过显式 override 或 `default_execution_profile_id` 选择 profile；runtime assembly helper 只校验 profile 的 `min_context_window_tokens` 与 effective model 的 `context_window_tokens`，不会按模型窗口自动切换到其它 profile。`256k` profile 搭配 `1m` 模型允许装配，但诊断会标记为保守策略；`1m` profile 搭配低于 `1000000` token 的模型会在调用 Host 前失败。
+
+配置只接受上述内嵌 `agent_policy` 与 baseline 结构；历史 catalog、间接引用或全局 runner/agent hint 结构出现在配置中都会加载失败。
+
+## host_runtime.json
+
+`host_runtime.json` 表达 Host opener 的部署默认值。顶层字段为 `default_host_runtime_id` 和 `runtimes`。
+
+每条 runtime 记录覆盖：
+
+- Host durable store 与 artifact roots。
+- SQLite path、busy timeout 与写事务 busy retry 策略。
+- `host_execution_lane_name`：引用 `runtime_lanes.json` 中已存在的 lane。
+- `worker_backend`，当前默认配置为 `local`。
+- `dispatch_poll_interval_seconds`。
+- `payload_inline_threshold_bytes`，包内默认值为 `65535` bytes。
+- `worker_startup_timeout_seconds`。
+- `memory_projection_catch_up_batch_size`。
+
+这些配置都是 `open_host(options)` construction-time assembly inputs 的来源，不是单个 Run 的 override。prompt asset root 与 scene manifest root 不在 `host_runtime.json` 中配置，由 runtime location resolver 解析。
+
+## runtime_lanes.json
+
+`runtime_lanes.json` 表达层中立 runtime lane coordinator 与 lane catalog。顶层字段包括：
+
+| 字段 | 含义 |
+|---|---|
+| `coordinator.db_path` | 独立 runtime lane SQLite DB 路径 |
+| `coordinator.busy_timeout_seconds` | coordinator SQLite busy timeout |
+| `coordinator.poll_interval_seconds` | acquire 轮询间隔 |
+| `lanes` | 按 lane 名索引的容量配置 |
+
+单个 lane 包含 `capacity`、`default_timeout_seconds`、`claim_ttl_seconds` 与 `heartbeat_interval_seconds`。`claim_ttl_seconds` 必须大于 `heartbeat_interval_seconds`。
+
+## tool_discovery.json
+
+`tool_discovery.json` 只表达 ToolsDiscovery provider specs。ConfigLoader 只读出 typed provider specs，不 import provider，也不做工具发现。
+
+provider 字段：
+
+| 字段 | 含义 |
+|---|---|
+| `import_path` | 显式 `module:attribute` provider callable |
+| `entry_point` | package entry point provider callable |
+| `source_kind` | 来源类别，使用工具来源公共契约值 |
+| `source_id` | 来源标识 |
+| `enabled` | 是否启用 provider |
+| `allow_empty` | 是否允许 provider 返回空工具集合 |
+
+`import_path` 与 `entry_point` 必须二选一。provider id 来自 `providers` map key，不在 record 内重复配置。
+
+## prompts 目录职责
+
+`workspace/config/prompts/` 与包内 `dayu/config/prompts/` 用于放置 prompt fragments 和 scene manifests。包内默认资产按目录分为：
+
+| 路径 | 职责 |
+|---|---|
+| `prompts/manifests/*.json` | ScenePrepare schema v1 scene manifest |
+| `prompts/base/*.md` | 多个 scene 复用的基础 prompt fragment |
+| `prompts/scenes/*.md` | 单个 scene 的场景 prompt fragment |
+
+Scene manifest 由 `dayu.runtime.scene_prepare` 解释；ConfigLoader 不读取、拼接或渲染 scene manifest。`prompts/tasks/`、contract 文件、workflow 产物和未被 scene manifest 直接引用的模板不属于当前包内默认资产范围。
+
+Scene manifest 第一版是单 Run 场景装配输入。允许的顶层字段固定为 `schema_version`、`scene`、`version`、`description`、`capability_tags`、`extends`、`model`、`agent_policy`、`tool_selection`、`defaults`、`fragments` 与 `context_slots`。调用方显式传入 manifest root、prompt asset root、typed context slot values 与可用工具目录；ScenePrepare 只读取 manifest 直接引用的 fragments，执行确定性的文本替换，并输出 system messages、已拼接的 system prompt、工具选择结果、model hints、typed agent policy override、fragment refs、source refs 与 content digest。
+
+`model` 只使用 `default_model_id` 与 `runner_option_hint_id`。`agent_policy` 是可选 typed override block，只允许覆盖 `max_iterations`、`continuation_max_attempts`、`allow_tool_calls`、`tool_execution_timeout_seconds`、`fallback_mode`、`fallback_prompt`、`continuation_prompt` 与 `max_consecutive_failed_tool_batches`。旧 `conversation`、泛化 `runtime`、`model.default_name`、`model.temperature_profile` 与 `prompt_mt` scene 均不属于当前 schema。
+
+Scene manifest 不表达 workflow step graph、next scene、artifact store、parser、retry / replay / stop policy、failure classification 或 checkpoint / resume。多 Run 财报流程属于 Service workflow 或后续 typed skill orchestration，不属于 prompt asset schema。
+
+## 最小 workspace 覆盖示例
+
+只覆盖一个模型时，workspace 文件应提供该模型的完整记录，且 record 内不重复写 `model_id`：
 
 ```json
 {
-  "gpt-5.4-thinking": {
-    "runner_type": "openai_compatible",
-    "name": "gpt-5.4-thinking",
-    "endpoint_url": "https://api.openai.com/v1/chat/completions",
-    "model": "gpt-5.4",
-    "headers": {
-      "Authorization": "Bearer {{OPENAI_API_KEY}}",
-      "Content-Type": "application/json"
-    },
-    "provider_request": {
-      "type": "openai_reasoning",
-      "reasoning_effort": "high"
-    },
-    "timeout": 3600,
-    "stream_idle_timeout": 120.0,
-    "stream_idle_heartbeat_sec": 10.0,
-    "supports_stream": true,
-    "supports_tool_calling": true,
-    "supports_stream_usage": true,
-    "max_context_tokens": 1050000
+  "models": {
+    "deepseek-v4-flash": {
+      "runner_kind": "openai_compatible",
+      "provider": "deepseek",
+      "model": "deepseek-v4-flash",
+      "endpoint": "https://api.deepseek.com/chat/completions",
+      "api_key_ref": "DEEPSEEK_API_KEY",
+      "headers": {
+        "Authorization": "Bearer {{DEEPSEEK_API_KEY}}",
+        "Content-Type": "application/json"
+      },
+      "supports_tool_calling": true,
+      "supports_stream": true,
+      "supports_stream_usage": true,
+      "default_timeout_seconds": 3600.0,
+      "max_retries": 3,
+      "sse_idle_timeout_seconds": 120.0,
+      "sse_heartbeat_seconds": 10.0,
+      "provider_request_extension": {
+        "type": "deepseek_thinking",
+        "enabled": false
+      },
+      "context_window_tokens": 1048576,
+      "runtime_hints": {
+        "runner_option_hints": {
+          "interactive": {
+            "temperature": 1.3,
+            "top_p": 1.0,
+            "stream": true
+          },
+          "conversation_compaction": {
+            "temperature": 0.4,
+            "top_p": 1.0,
+            "stream": false
+          }
+        }
+      }
+    }
   }
 }
 ```
 
-## run.json
-
-`run.json` 提供运行时默认值。当前主要分区：
-
-| 分区 | 含义 |
-|---|---|
-| `runner_running_config` | Runner 诊断、SSE 调试和工具超时默认值 |
-| `agent_running_config` | Agent 最大迭代、fallback、重复工具调用、continuation / compaction 参数 |
-| `doc_tool_limits` | 文档工具默认读取和列表限制 |
-| `fins_tool_limits` | 财报工具默认读取和列表限制 |
-| `web_tools_config` | Web 工具 provider、超时、抓取和浏览器配置 |
-
-这些配置属于默认值；具体项目应在 `workspace/config/run.json` 中覆盖。
-
-## API Key
-
-默认模型配置只写环境变量占位符，不保存密钥明文。例如：
-
-```json
-"headers": {
-  "Authorization": "Bearer {{DEEPSEEK_API_KEY}}",
-  "Content-Type": "application/json"
-}
-```
-
-运行前在 shell 或部署环境中设置对应环境变量。
+如果只想复用包内记录并改少量字段，应新增一个 id 并用 `extends` 显式继承；不要指望 workspace partial record 与包内同 id 记录 deep merge。

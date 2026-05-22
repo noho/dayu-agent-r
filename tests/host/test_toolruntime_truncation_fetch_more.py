@@ -53,6 +53,7 @@ from dayu.host.tooling import (
     ToolBundleSourceKind,
     ToolBundleSourceRef,
 )
+from dayu.runtime.tool_truncation import effective_tool_truncate_spec
 
 _SESSION_ID = "session-truncation"
 _RUN_ID = "run-truncation"
@@ -60,6 +61,8 @@ _ATTEMPT_ID = "attempt-truncation"
 _EXECUTION_ID = "execution-truncation"
 _ITERATION_ID = "iteration-truncation"
 _POLICY_DIGEST = "sha256:4444444444444444444444444444444444444444444444444444444444444444"
+_DEFAULT_TEXT_CHARS_LIMIT = 8
+_DEFAULT_TTL_SECONDS = 30
 
 
 class _NeverCancelledToken:
@@ -144,6 +147,44 @@ class _AcceptingPort(HostToolFactAcceptPort):
 
         self.candidates.append(candidate)
         return _accepted_ack(candidate)
+
+
+def test_truncate_declaration_allows_missing_limit_and_ttl() -> None:
+    """截断声明允许省略策略 limit 与 TTL，由 effective helper 补齐。"""
+
+    declaration = ToolTruncateSpec(
+        enabled=True,
+        strategy=ToolTruncationStrategy.TEXT_CHARS,
+        limits={},
+        target_field=None,
+        field_path=None,
+        ttl_seconds=None,
+    )
+
+    effective = effective_tool_truncate_spec(
+        declaration,
+        default_limits_by_strategy={
+            ToolTruncationStrategy.TEXT_CHARS: _DEFAULT_TEXT_CHARS_LIMIT,
+        },
+        default_ttl_seconds=_DEFAULT_TTL_SECONDS,
+    )
+
+    assert effective.limits == {"max_chars": _DEFAULT_TEXT_CHARS_LIMIT}
+    assert effective.ttl_seconds == _DEFAULT_TTL_SECONDS
+
+
+def test_truncate_declaration_rejects_ambiguous_target() -> None:
+    """截断声明不能同时设置 target_field 与 field_path。"""
+
+    with pytest.raises(ValueError, match="target_field and field_path"):
+        ToolTruncateSpec(
+            enabled=True,
+            strategy=ToolTruncationStrategy.TEXT_CHARS,
+            limits={},
+            target_field="value",
+            field_path=("payload",),
+            ttl_seconds=None,
+        )
 
 
 @pytest.mark.asyncio

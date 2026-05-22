@@ -341,6 +341,33 @@ def test_busy_locked_retries_are_finite_and_do_not_run_after_commit(
         assert callback_events == []
 
 
+def test_read_busy_locked_retries_are_finite(tmp_path: Path) -> None:
+    """read transaction body busy / locked 只有限重试并保留最终结果。"""
+
+    options = _options(tmp_path, retry_count=2)
+    with open_host_durable_store(options) as store:
+        attempts: list[int] = []
+
+        def operation(transaction: HostTransaction) -> str:
+            """前两次模拟 SQLite busy，第三次返回结果。
+
+            :param transaction: Host transaction。
+            :returns: read transaction 结果。
+            :raises sqlite3.OperationalError: 前两次调用抛出 synthetic busy。
+            """
+
+            del transaction
+            attempts.append(len(attempts) + 1)
+            if len(attempts) < 3:
+                error = sqlite3.OperationalError("synthetic read busy")
+                setattr(error, "sqlite_errorcode", sqlite3.SQLITE_BUSY)
+                raise error
+            return "read-ok"
+
+        assert store.transaction_runner.run_read(operation) == "read-ok"
+        assert attempts == [1, 2, 3]
+
+
 @pytest.mark.parametrize(
     "sqlite_errorcode",
     (

@@ -13,7 +13,7 @@ from __future__ import annotations
 
 import dataclasses
 from datetime import datetime
-from typing import Final
+from typing import Final, cast
 
 import pytest
 
@@ -24,6 +24,7 @@ from dayu.contracts.tool_call import (
     ToolCallProviderState,
     ToolCallRequest,
 )
+from dayu.contracts.tool_await import ToolAwaitKind, ToolAwaitSpec
 
 
 class _StaticCancellationToken:
@@ -172,6 +173,17 @@ def test_provider_state_union_currently_only_gemini() -> None:
 
     state: ToolCallProviderState = GeminiToolCallState(thought_signature="s")
     assert isinstance(state, GeminiToolCallState)
+
+
+def test_tool_await_spec_requires_enum_await_kind() -> None:
+    """ToolAwaitSpec.await_kind 必须是枚举成员，不能用裸字符串绕过契约。"""
+
+    with pytest.raises(TypeError, match="await_kind"):
+        ToolAwaitSpec(
+            await_kind=cast(ToolAwaitKind, "external_job"),
+            deadline=None,
+            resume_token="resume",
+        )
 
 
 def _make_valid_context(

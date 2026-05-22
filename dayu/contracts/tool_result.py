@@ -40,11 +40,19 @@ class ToolResultMeta:
         """校验工具结果元信息的最小完整性。
 
         :returns: ``None``。
-        :raises ValueError: ``tool_name`` 为空 / 纯空白，或结束时间早于开始时间时抛出。
+        :raises ValueError: ``tool_name`` 为空 / 纯空白、时间 timezone
+            awareness 不一致，或结束时间早于开始时间时抛出。
         """
 
         if self.tool_name.strip() == "":
             raise ValueError("ToolResultMeta.tool_name must be non-empty")
+        if _datetime_awareness(self.started_at) != _datetime_awareness(
+            self.finished_at
+        ):
+            raise ValueError(
+                "ToolResultMeta.started_at and finished_at must both be "
+                "timezone-aware or both be naive"
+            )
         if self.finished_at < self.started_at:
             raise ValueError(
                 "ToolResultMeta.finished_at must be greater than or equal "
@@ -87,17 +95,31 @@ class ToolResultFailure:
         """校验失败结果的最小完整性。
 
         :returns: ``None``。
-        :raises ValueError: ``error`` 或 ``message`` 为空 / 纯空白时抛出。
+        :raises ValueError: ``error``、``message`` 或已提供的 ``hint`` 为空 /
+            纯空白时抛出。
         """
 
         if self.error.strip() == "":
             raise ValueError("ToolResultFailure.error must be non-empty")
         if self.message.strip() == "":
             raise ValueError("ToolResultFailure.message must be non-empty")
+        if self.hint is not None and self.hint.strip() == "":
+            raise ValueError("ToolResultFailure.hint must be non-empty")
 
 
 ToolResultEnvelope: TypeAlias = ToolResultSuccess | ToolResultFailure
 """工具结果信封封闭联合。"""
+
+
+def _datetime_awareness(value: datetime) -> bool:
+    """判断 datetime 是否为 timezone-aware。
+
+    :param value: 待检查时间。
+    :returns: aware 返回 ``True``，naive 返回 ``False``。
+    :raises Exception: 不主动抛出异常。
+    """
+
+    return value.tzinfo is not None and value.utcoffset() is not None
 
 __all__ = [
     "ToolResultMeta",

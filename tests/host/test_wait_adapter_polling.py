@@ -82,6 +82,31 @@ class _PublicCommandResolver:
         return resolve_wait(self._host, wait_id, request)
 
 
+class _FailingResolveResolver:
+    """测试用始终抛出 resolve_wait 异常的 resolver。"""
+
+    def __init__(self) -> None:
+        """初始化调用记录。
+
+        :returns: ``None``。
+        """
+
+        self.calls: list[str] = []
+
+    def resolve_wait(self, wait_id: str, request: ResolveWaitRequest) -> RunSnapshot:
+        """记录调用并模拟 resolve_wait 失败。
+
+        :param wait_id: wait id。
+        :param request: resolve wait request。
+        :returns: 永不返回。
+        :raises RuntimeError: 始终抛出，用于验证 poller 异常隔离。
+        """
+
+        del request
+        self.calls.append(wait_id)
+        raise RuntimeError("resolve wait failed")
+
+
 class _SequenceAdapter:
     """按预置序列返回 poll 结果的 adapter。"""
 
@@ -340,6 +365,60 @@ def test_adapter_non_runtime_exception_isolated_per_wait_record(
         assert adapter.abandoned == [seeded.wait_id]
         assert adapter.polled == [followup_wait_id]
         assert "wait adapter abandon failed; continuing" in caplog.text
+    finally:
+        host.close()
+
+
+def test_resolve_wait_exception_isolated_per_wait_record(
+    tmp_path: Path, caplog: pytest.LogCaptureFixture
+) -> None:
+    """resolve_wait 普通异常只影响单条 wait record，后续记录继续处理。"""
+
+    host = create_host_command_handle(_options(tmp_path))
+    try:
+        seeded = _seed_waiting_run(host)
+        adapter = _SequenceAdapter(
+            (
+                WaitPollReady(
+                    ResolveWaitCompletedOutcome(
+                        result=ToolResultSuccess(
+                            ok=True, value={"ready": True}, meta=None
+                        ),
+                        payload_ref=None,
+                    )
+                ),
+            )
+        )
+        resolver = _FailingResolveResolver()
+        poller = WaitPoller(
+            transaction_runner=host._transaction_runner(),
+            adapter_registry=WaitPollAdapterRegistry(
+                (
+                    WaitPollAdapterRegistration(
+                        adapter_key=_read_wait(
+                            host._transaction_runner(), seeded.wait_id
+                        ).adapter_key,
+                        adapter=adapter,
+                    ),
+                )
+            ),
+            resolver=resolver,
+            context=_context("poller-resolve-failure"),
+            clock=_FixedClock(),
+        )
+
+        with caplog.at_level(logging.WARNING, logger="dayu.host.wait_adapter"):
+            result = poller.poll_once()
+
+        first_wait = _read_wait(host._transaction_runner(), seeded.wait_id)
+        assert result.observed == 1
+        assert result.adapter_errors == 1
+        assert result.not_ready == 0
+        assert result.resolved == 0
+        assert first_wait.status is WaitRecordStatus.WAITING
+        assert resolver.calls == [seeded.wait_id]
+        assert "wait poll resolve failed; continuing" in caplog.text
+        assert seeded.wait_id in caplog.text
     finally:
         host.close()
 

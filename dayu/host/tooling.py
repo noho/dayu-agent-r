@@ -12,69 +12,17 @@ from dataclasses import dataclass, field
 from enum import StrEnum
 from typing import TYPE_CHECKING
 
+from dayu.contracts import ToolBundleSourceKind, ToolBundleSourceRef
 from dayu.contracts.tool_declaration import ToolBundle
-from dayu.host._public_validation import (
-    require_non_empty as _require_non_empty,
-)
-from dayu.host._public_validation import (
-    require_optional_non_empty as _require_optional_non_empty,
-)
 
 if TYPE_CHECKING:
     from dayu.host.wait_adapter import WaitAdapterRegistry
-
-
-class ToolBundleSourceKind(StrEnum):
-    """业务工具 bundle 来源类别。
-
-    枚举值只描述 Host construction 输入的可解释来源，不携带 provider、
-    callable 或具体业务模块对象。
-    """
-
-    EXPLICIT_PROVIDER = "explicit_provider"
-    CONFIG_BINDING = "config_binding"
-    PACKAGE_ENTRYPOINT = "package_entrypoint"
-    SERVICE_COMPOSITION = "service_composition"
 
 
 class FrameworkToolName(StrEnum):
     """Host / ToolRuntime 预留的 framework tool 名称。"""
 
     FETCH_MORE = "fetch_more"
-
-
-@dataclass(frozen=True, slots=True)
-class ToolBundleSourceRef:
-    """业务 ``ToolBundle`` 的来源引用。
-
-    :param source_kind: 来源类别。
-    :param source_id: 来源标识，例如 provider id、配置绑定名或入口点名。
-    :param version_ref: 可选版本引用；无版本时为 ``None``。
-    :param content_digest: 可选内容摘要；无摘要时为 ``None``。
-    """
-
-    source_kind: ToolBundleSourceKind
-    source_id: str
-    version_ref: str | None = None
-    content_digest: str | None = None
-
-    def __post_init__(self) -> None:
-        """校验来源引用的最小完整性。
-
-        :returns: 无返回值。
-        :raises ValueError: ``source_id`` 为空，或可选字符串存在但为空时抛出。
-        """
-
-        _require_non_empty(
-            self.source_id, field_name="ToolBundleSourceRef.source_id"
-        )
-        _require_optional_non_empty(
-            self.version_ref, field_name="ToolBundleSourceRef.version_ref"
-        )
-        _require_optional_non_empty(
-            self.content_digest,
-            field_name="ToolBundleSourceRef.content_digest",
-        )
 
 
 @dataclass(frozen=True, slots=True)
@@ -96,12 +44,9 @@ class FrameworkToolPolicyView:
         :raises ValueError: 启用集合不是预留集合子集时抛出。
         """
 
-        if not self.enabled_framework_tools.issubset(
-            self.reserved_framework_tool_names
-        ):
+        if not self.enabled_framework_tools.issubset(self.reserved_framework_tool_names):
             raise ValueError(
-                "FrameworkToolPolicyView.enabled_framework_tools must be a"
-                " subset of reserved_framework_tool_names"
+                "FrameworkToolPolicyView.enabled_framework_tools must be a" " subset of reserved_framework_tool_names"
             )
 
 
@@ -134,9 +79,7 @@ class HostToolingOptions:
 
     business_tool_bundle: ToolBundle
     source_refs: tuple[ToolBundleSourceRef, ...]
-    framework_tool_policy: FrameworkToolPolicyView = field(
-        default_factory=default_framework_tool_policy_view
-    )
+    framework_tool_policy: FrameworkToolPolicyView = field(default_factory=default_framework_tool_policy_view)
     wait_adapter_registry: WaitAdapterRegistry | None = None
 
     def __post_init__(self) -> None:
@@ -150,8 +93,7 @@ class HostToolingOptions:
         if not self.source_refs:
             raise ValueError("HostToolingOptions.source_refs must be non-empty")
         reserved_names = frozenset(
-            tool_name.value
-            for tool_name in self.framework_tool_policy.reserved_framework_tool_names
+            tool_name.value for tool_name in self.framework_tool_policy.reserved_framework_tool_names
         )
         for definition in self.business_tool_bundle.definitions:
             if definition.name in reserved_names:

@@ -105,3 +105,10 @@ def test_contracts_does_not_import_upper_layers() -> None:
             if _matches_prefix(module, CONTRACTS_PERMANENT_FORBIDDEN_PREFIXES):
                 violations.append((str(file_path), module))
     assert not violations, f"reverse-dependency imports: {violations}"
+
+
+def test_contracts_import_boundary_scan_covers_tool_source_module() -> None:
+    """contracts import 边界扫描必须覆盖公共 source ref 契约模块。"""
+
+    scanned_names = {file_path.name for file_path in _iter_python_files()}
+    assert "tool_source.py" in scanned_names
