@@ -12,6 +12,7 @@
     "runner_option_hint_id": "interactive"
   },
   "agent_policy": {
+    "max_iterations": 20,
     "allow_tool_calls": true
   },
   "tool_selection": {

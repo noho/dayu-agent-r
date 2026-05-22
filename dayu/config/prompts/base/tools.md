@@ -24,6 +24,19 @@
   - `next_action` 缺失或为 `null` 时，不得调用 `fetch_more`。
   - 成功续读后继续检查新返回的 `next_action`。
 
+<when_tag doc>
+## 文件工具指引
+
+### 工作流
+- 路径 A：`list_files` → `get_file_sections` → `read_file_section`。
+- 路径 B：`search_files` → `read_file_section` 或 `read_file`。
+
+### 决策规则
+- 大文件先看 `get_file_sections`，避免整文件 `read_file`。
+- 含 `ref` 的章节优先走 `read_file_section`。
+</when_tag>
+
+<when_tag fins>
 ## 财报工具指引
 
 ### 工作流
@@ -49,12 +62,23 @@
 - 禁止猜测或自造`document_id`、`ref`、`table_ref`：
   - `ref`、`table_ref` 都是 **document-local**：只在产生它们的那个 `document_id` 内有效。
   - 一旦 `document_id` 变化，先前在旧文档拿到的所有 `ref` / `table_ref` 一律作废，禁止跨文档复用。
+</when_tag>
+
+<when_tag ingestion>
 ## 数据摄取工具指引
 
 - `start_*` 后按 `next_step.action` 决定轮询或结束。
 - 除非用户明确要求，不要主动取消任务。
+</when_tag>
 
+<when_tag web>
 ## 联网工具指引
 
 - 先 `search_web`，再 `fetch_web_page` 精读。
 - 同一主题连续 2 次无新增信息即停止。
+</when_tag>
+
+<when_tool get_current_time>
+## get_current_time
+- 仅在需要实时时间时使用；不要用它推断文件内容或外部事实。
+</when_tool>

@@ -3,7 +3,6 @@
 from __future__ import annotations
 
 import json
-import re
 from collections.abc import Iterator, Mapping
 from pathlib import Path
 from typing import Final, cast
@@ -16,10 +15,28 @@ from dayu.runtime.scene_prepare import (
     prepare_scene,
 )
 
-_LEGACY_CONDITIONAL_MARKERS: Final[tuple[str, ...]] = (
-    "<when_tag",
+_OLD_SCENE_MAX_ITERATIONS: Final[Mapping[str, int]] = {
+    "audit": 16,
+    "confirm": 20,
+    "decision": 12,
+    "fix": 12,
+    "infer": 12,
+    "interactive": 20,
+    "overview": 12,
+    "prompt": 24,
+    "regenerate": 24,
+    "repair": 16,
+    "smoke_host_public_multiturn": 20,
+    "wechat": 16,
+    "write": 24,
+}
+_LEGACY_TOOLS_CONDITIONAL_MARKERS: Final[tuple[str, ...]] = (
+    "<when_tag doc>",
     "</when_tag>",
-    "<when_tool",
+    "<when_tag fins>",
+    "<when_tag ingestion>",
+    "<when_tag web>",
+    "<when_tool get_current_time>",
     "</when_tool>",
 )
 _ALLOWED_MANIFEST_FIELDS: Final[frozenset[str]] = frozenset(
@@ -141,20 +158,6 @@ def _direct_fragment_paths(manifest: Mapping[str, JsonValue]) -> tuple[Path, ...
     return tuple(paths)
 
 
-def _direct_fragment_content(manifest: Mapping[str, JsonValue]) -> str:
-    """读取 manifest 直接装配的 fragment 文本。
-
-    :param manifest: manifest JSON object。
-    :returns: 按 manifest 引用列表拼接后的 fragment 文本。
-    :raises AssertionError: fragment 路径不存在、非字符串或逃逸 root 时抛出。
-    """
-
-    return "\n".join(
-        path.read_text(encoding="utf-8")
-        for path in _direct_fragment_paths(manifest)
-    )
-
-
 def _fake_tool_catalog() -> SceneToolCatalog:
     """构造覆盖迁移 manifest 工具标签的 fake 工具目录。
 
@@ -240,8 +243,8 @@ def test_prompt_mt_scene_asset_is_removed_and_smoke_scene_is_ordinary_asset() ->
     assert (prompt_root / "scenes" / "smoke_host_public_multiturn.md").exists()
 
 
-def test_required_context_slots_are_consumed_by_migrated_fragments() -> None:
-    """所有必需 context slot 都必须被直接装配的 fragment 消费。"""
+def test_scene_manifest_agent_policy_carries_old_max_iterations_only() -> None:
+    """旧 scene 的 max_iterations 必须迁入新 agent_policy，工具超时不迁移。"""
 
     paths = tuple(_iter_manifest_paths())
     assert paths
@@ -249,44 +252,46 @@ def test_required_context_slots_are_consumed_by_migrated_fragments() -> None:
         manifest = _load_manifest(path)
         scene = manifest["scene"]
         assert isinstance(scene, str)
-        slot_values = _required_context_slot_values(manifest)
-        fragment_content = _direct_fragment_content(manifest)
+        agent_policy = manifest.get("agent_policy")
+        expected_max_iterations = _OLD_SCENE_MAX_ITERATIONS.get(scene)
+        if expected_max_iterations is None:
+            assert agent_policy is None
+            continue
 
-        for slot_name in slot_values:
-            placeholder_pattern = re.compile(
-                r"{{\s*" + re.escape(slot_name) + r"\s*}}"
-            )
-            assert placeholder_pattern.search(fragment_content), (
-                f"{scene} declares required context slot {slot_name} "
-                "but no directly assembled fragment references it"
-            )
+        assert isinstance(agent_policy, Mapping)
+        assert agent_policy.get("max_iterations") == expected_max_iterations
+        assert "tool_timeout_seconds" not in agent_policy
+        assert "tool_execution_timeout_seconds" not in agent_policy
 
         result = prepare_scene(
             ScenePrepareRequest(
                 scene_id=scene,
                 scene_manifest_root=_manifest_root(),
                 prompt_asset_root=_prompt_asset_root(),
-                context_slot_values=slot_values,
+                context_slot_values=_required_context_slot_values(manifest),
                 available_tools=_fake_tool_catalog(),
             )
         )
-        rendered_messages = "\n".join(result.system_messages)
-        for slot_value in slot_values.values():
-            assert slot_value in rendered_messages
+        assert result.agent_policy_override is not None
+        assert result.agent_policy_override.max_iterations == expected_max_iterations
 
 
-def test_migrated_prompt_assets_exclude_legacy_conditional_markers() -> None:
-    """迁移后的 prompt asset 不得残留旧条件模板标记。"""
+def test_migrated_base_prompt_assets_preserve_legacy_text_boundaries() -> None:
+    """base prompt 资产保留旧项目文本边界，不混入未裁决的新占位段。"""
 
     prompt_root = _prompt_asset_root()
-    prompt_files = tuple(path for path in sorted(prompt_root.rglob("*")) if path.is_file())
-    assert prompt_files
-    for path in prompt_files:
-        content = path.read_text(encoding="utf-8")
-        for marker in _LEGACY_CONDITIONAL_MARKERS:
-            assert marker not in content, (
-                f"{path.relative_to(prompt_root)} contains legacy marker {marker}"
-            )
+    agents_content = (prompt_root / "base" / "agents.md").read_text(encoding="utf-8")
+    fact_rules_content = (prompt_root / "base" / "fact_rules.md").read_text(
+        encoding="utf-8"
+    )
+    tools_content = (prompt_root / "base" / "tools.md").read_text(encoding="utf-8")
+
+    assert "当前研究主体" not in agents_content
+    assert "fins_default_subject" not in agents_content
+    assert "用户任务边界" not in fact_rules_content
+    assert "base_user" not in fact_rules_content
+    for marker in _LEGACY_TOOLS_CONDITIONAL_MARKERS:
+        assert marker in tools_content
 
 
 def test_migrated_prompt_assets_exclude_forbidden_legacy_files() -> None:

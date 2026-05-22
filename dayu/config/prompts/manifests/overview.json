@@ -11,6 +11,9 @@
     "default_model_id": "mimo-v2.5-pro-plan",
     "runner_option_hint_id": "overview"
   },
+  "agent_policy": {
+    "max_iterations": 12
+  },
   "tool_selection": {
     "mode": "none",
     "tool_names": [],

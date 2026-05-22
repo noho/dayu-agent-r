@@ -57,14 +57,16 @@ dayu/config/
 | `supports_stream` | 是否支持流式输出 |
 | `supports_stream_usage` | 是否支持流式 usage |
 | `default_timeout_seconds` | 默认请求超时秒数 |
-| `max_retries` | 默认最大重试次数 |
+| `max_retries` | 默认最大重试次数；包内默认模型使用 `3` |
 | `sse_idle_timeout_seconds` | SSE 空闲超时秒数 |
 | `sse_heartbeat_seconds` | SSE 空闲诊断 heartbeat 秒数 |
 | `provider_request_extension` | provider 私有请求扩展 JSON DSL，按原样保留 |
 | `context_window_tokens` | 模型上下文窗口 token 数 |
 | `runtime_hints.runner_option_hints` | 模型内 semantic RunnerCallOptions hints |
 
-`runtime_hints.runner_option_hints` 的每个 hint 都是完整 RunnerCallOptions 配置片段，包含 `temperature`、`max_tokens`、`top_p` 与 `stream`。execution profile 只引用 `model_id` 和 semantic `runner_option_hint_id`，不保存 provider-specific 调用参数。
+`runtime_hints.runner_option_hints` 的每个 hint 都是完整 RunnerCallOptions 配置片段，包含 `temperature`、`max_tokens`、`top_p` 与 `stream`。`max_tokens` 是 Runner 单次调用的最大输出 token 数，会进入 Engine provider payload；execution profile 只引用 `model_id` 和 semantic `runner_option_hint_id`，不保存 provider-specific 调用参数。
+
+模型记录可以使用 `extends` 继承基础模型；子记录按顶层字段覆盖父记录。thinking 变体通常继承对应基础模型，只覆盖 `provider_request_extension`，需要 provider beta header 等差异时也可以同时覆盖完整 `headers` object。
 
 ## execution_profiles.json
 
@@ -176,7 +178,7 @@ Scene manifest 不表达 workflow step graph、next scene、artifact store、par
       "supports_stream": true,
       "supports_stream_usage": true,
       "default_timeout_seconds": 3600.0,
-      "max_retries": 2,
+      "max_retries": 3,
       "sse_idle_timeout_seconds": 120.0,
       "sse_heartbeat_seconds": 10.0,
       "provider_request_extension": {

@@ -14,7 +14,7 @@
       "supports_stream": true,
       "supports_stream_usage": true,
       "default_timeout_seconds": 3600.0,
-      "max_retries": 2,
+      "max_retries": 3,
       "sse_idle_timeout_seconds": 120.0,
       "sse_heartbeat_seconds": 10.0,
       "provider_request_extension": {
@@ -76,78 +76,10 @@
       }
     },
     "deepseek-v4-flash-thinking": {
-      "runner_kind": "openai_compatible",
-      "provider": "deepseek",
-      "model": "deepseek-v4-flash",
-      "endpoint": "https://api.deepseek.com/chat/completions",
-      "api_key_ref": "DEEPSEEK_API_KEY",
-      "headers": {
-        "Authorization": "Bearer {{DEEPSEEK_API_KEY}}",
-        "Content-Type": "application/json"
-      },
-      "supports_tool_calling": true,
-      "supports_stream": true,
-      "supports_stream_usage": true,
-      "default_timeout_seconds": 3600.0,
-      "max_retries": 2,
-      "sse_idle_timeout_seconds": 120.0,
-      "sse_heartbeat_seconds": 10.0,
+      "extends": "deepseek-v4-flash",
       "provider_request_extension": {
         "type": "deepseek_thinking",
         "enabled": true
-      },
-      "context_window_tokens": 1048576,
-      "runtime_hints": {
-        "runner_option_hints": {
-          "write": {
-            "temperature": 1.3,
-            "max_tokens": 4096,
-            "top_p": 1.0,
-            "stream": true
-          },
-          "overview": {
-            "temperature": 1.0,
-            "max_tokens": 4096,
-            "top_p": 1.0,
-            "stream": true
-          },
-          "audit": {
-            "temperature": 0.8,
-            "max_tokens": 4096,
-            "top_p": 1.0,
-            "stream": true
-          },
-          "decision": {
-            "temperature": 1.0,
-            "max_tokens": 4096,
-            "top_p": 1.0,
-            "stream": true
-          },
-          "interactive": {
-            "temperature": 1.3,
-            "max_tokens": 4096,
-            "top_p": 1.0,
-            "stream": true
-          },
-          "prompt": {
-            "temperature": 1.3,
-            "max_tokens": 4096,
-            "top_p": 1.0,
-            "stream": true
-          },
-          "infer": {
-            "temperature": 0.5,
-            "max_tokens": 4096,
-            "top_p": 1.0,
-            "stream": true
-          },
-          "conversation_compaction": {
-            "temperature": 0.4,
-            "max_tokens": 2048,
-            "top_p": 1.0,
-            "stream": false
-          }
-        }
       }
     },
     "deepseek-v4-pro": {
@@ -164,7 +96,7 @@
       "supports_stream": true,
       "supports_stream_usage": true,
       "default_timeout_seconds": 3600.0,
-      "max_retries": 2,
+      "max_retries": 3,
       "sse_idle_timeout_seconds": 120.0,
       "sse_heartbeat_seconds": 10.0,
       "provider_request_extension": {
@@ -226,78 +158,10 @@
       }
     },
     "deepseek-v4-pro-thinking": {
-      "runner_kind": "openai_compatible",
-      "provider": "deepseek",
-      "model": "deepseek-v4-pro",
-      "endpoint": "https://api.deepseek.com/chat/completions",
-      "api_key_ref": "DEEPSEEK_API_KEY",
-      "headers": {
-        "Authorization": "Bearer {{DEEPSEEK_API_KEY}}",
-        "Content-Type": "application/json"
-      },
-      "supports_tool_calling": true,
-      "supports_stream": true,
-      "supports_stream_usage": true,
-      "default_timeout_seconds": 3600.0,
-      "max_retries": 2,
-      "sse_idle_timeout_seconds": 120.0,
-      "sse_heartbeat_seconds": 10.0,
+      "extends": "deepseek-v4-pro",
       "provider_request_extension": {
         "type": "deepseek_thinking",
         "enabled": true
-      },
-      "context_window_tokens": 1048576,
-      "runtime_hints": {
-        "runner_option_hints": {
-          "write": {
-            "temperature": 1.3,
-            "max_tokens": 4096,
-            "top_p": 1.0,
-            "stream": true
-          },
-          "overview": {
-            "temperature": 1.0,
-            "max_tokens": 4096,
-            "top_p": 1.0,
-            "stream": true
-          },
-          "audit": {
-            "temperature": 0.8,
-            "max_tokens": 4096,
-            "top_p": 1.0,
-            "stream": true
-          },
-          "decision": {
-            "temperature": 1.0,
-            "max_tokens": 4096,
-            "top_p": 1.0,
-            "stream": true
-          },
-          "interactive": {
-            "temperature": 1.3,
-            "max_tokens": 4096,
-            "top_p": 1.0,
-            "stream": true
-          },
-          "prompt": {
-            "temperature": 1.3,
-            "max_tokens": 4096,
-            "top_p": 1.0,
-            "stream": true
-          },
-          "infer": {
-            "temperature": 0.5,
-            "max_tokens": 4096,
-            "top_p": 1.0,
-            "stream": true
-          },
-          "conversation_compaction": {
-            "temperature": 0.4,
-            "max_tokens": 2048,
-            "top_p": 1.0,
-            "stream": false
-          }
-        }
       }
     },
     "gpt-5.4": {
@@ -314,7 +178,7 @@
       "supports_stream": true,
       "supports_stream_usage": true,
       "default_timeout_seconds": 3600.0,
-      "max_retries": 2,
+      "max_retries": 3,
       "sse_idle_timeout_seconds": 120.0,
       "sse_heartbeat_seconds": 10.0,
       "provider_request_extension": {
@@ -376,78 +240,10 @@
       }
     },
     "gpt-5.4-thinking": {
-      "runner_kind": "openai_compatible",
-      "provider": "openai",
-      "model": "gpt-5.4",
-      "endpoint": "https://api.openai.com/v1/chat/completions",
-      "api_key_ref": "OPENAI_API_KEY",
-      "headers": {
-        "Authorization": "Bearer {{OPENAI_API_KEY}}",
-        "Content-Type": "application/json"
-      },
-      "supports_tool_calling": true,
-      "supports_stream": true,
-      "supports_stream_usage": true,
-      "default_timeout_seconds": 3600.0,
-      "max_retries": 2,
-      "sse_idle_timeout_seconds": 120.0,
-      "sse_heartbeat_seconds": 10.0,
+      "extends": "gpt-5.4",
       "provider_request_extension": {
         "type": "openai_reasoning",
         "reasoning_effort": "high"
-      },
-      "context_window_tokens": 1050000,
-      "runtime_hints": {
-        "runner_option_hints": {
-          "write": {
-            "temperature": 0.8,
-            "max_tokens": 4096,
-            "top_p": 1.0,
-            "stream": true
-          },
-          "overview": {
-            "temperature": 0.2,
-            "max_tokens": 4096,
-            "top_p": 1.0,
-            "stream": true
-          },
-          "audit": {
-            "temperature": 0.2,
-            "max_tokens": 4096,
-            "top_p": 1.0,
-            "stream": true
-          },
-          "decision": {
-            "temperature": 0.6,
-            "max_tokens": 4096,
-            "top_p": 1.0,
-            "stream": true
-          },
-          "interactive": {
-            "temperature": 0.6,
-            "max_tokens": 4096,
-            "top_p": 1.0,
-            "stream": true
-          },
-          "prompt": {
-            "temperature": 0.6,
-            "max_tokens": 4096,
-            "top_p": 1.0,
-            "stream": true
-          },
-          "infer": {
-            "temperature": 0.2,
-            "max_tokens": 4096,
-            "top_p": 1.0,
-            "stream": true
-          },
-          "conversation_compaction": {
-            "temperature": 0.2,
-            "max_tokens": 2048,
-            "top_p": 1.0,
-            "stream": false
-          }
-        }
       }
     },
     "claude-sonnet-4-6": {
@@ -464,7 +260,7 @@
       "supports_stream": true,
       "supports_stream_usage": false,
       "default_timeout_seconds": 3600.0,
-      "max_retries": 2,
+      "max_retries": 3,
       "sse_idle_timeout_seconds": 120.0,
       "sse_heartbeat_seconds": 10.0,
       "provider_request_extension": {
@@ -526,80 +322,16 @@
       }
     },
     "claude-sonnet-4-6-thinking": {
-      "runner_kind": "openai_compatible",
-      "provider": "anthropic",
-      "model": "claude-sonnet-4-6",
-      "endpoint": "https://api.anthropic.com/v1/chat/completions",
-      "api_key_ref": "ANTHROPIC_API_KEY",
+      "extends": "claude-sonnet-4-6",
       "headers": {
         "Authorization": "Bearer {{ANTHROPIC_API_KEY}}",
         "Content-Type": "application/json",
         "anthropic-beta": "interleaved-thinking-2025-05-14"
       },
-      "supports_tool_calling": true,
-      "supports_stream": true,
-      "supports_stream_usage": false,
-      "default_timeout_seconds": 3600.0,
-      "max_retries": 2,
-      "sse_idle_timeout_seconds": 120.0,
-      "sse_heartbeat_seconds": 10.0,
       "provider_request_extension": {
         "type": "anthropic_thinking",
         "enabled": true,
         "budget_tokens": 8000
-      },
-      "context_window_tokens": 1000000,
-      "runtime_hints": {
-        "runner_option_hints": {
-          "write": {
-            "temperature": 0.9,
-            "max_tokens": 4096,
-            "top_p": 1.0,
-            "stream": true
-          },
-          "overview": {
-            "temperature": 0.2,
-            "max_tokens": 4096,
-            "top_p": 1.0,
-            "stream": true
-          },
-          "audit": {
-            "temperature": 0.2,
-            "max_tokens": 4096,
-            "top_p": 1.0,
-            "stream": true
-          },
-          "decision": {
-            "temperature": 0.6,
-            "max_tokens": 4096,
-            "top_p": 1.0,
-            "stream": true
-          },
-          "interactive": {
-            "temperature": 0.6,
-            "max_tokens": 4096,
-            "top_p": 1.0,
-            "stream": true
-          },
-          "prompt": {
-            "temperature": 0.6,
-            "max_tokens": 4096,
-            "top_p": 1.0,
-            "stream": true
-          },
-          "infer": {
-            "temperature": 0.2,
-            "max_tokens": 4096,
-            "top_p": 1.0,
-            "stream": true
-          },
-          "conversation_compaction": {
-            "temperature": 0.2,
-            "max_tokens": 2048,
-            "top_p": 1.0,
-            "stream": false
-          }
-        }
       }
     },
     "gemini-2.5-flash": {
@@ -616,7 +348,7 @@
       "supports_stream": true,
       "supports_stream_usage": false,
       "default_timeout_seconds": 3600.0,
-      "max_retries": 2,
+      "max_retries": 3,
       "sse_idle_timeout_seconds": 120.0,
       "sse_heartbeat_seconds": 10.0,
       "provider_request_extension": {
@@ -678,79 +410,11 @@
       }
     },
     "gemini-2.5-flash-thinking": {
-      "runner_kind": "openai_compatible",
-      "provider": "gemini",
-      "model": "gemini-2.5-flash",
-      "endpoint": "https://generativelanguage.googleapis.com/v1beta/openai/chat/completions",
-      "api_key_ref": "GEMINI_API_KEY",
-      "headers": {
-        "Authorization": "Bearer {{GEMINI_API_KEY}}",
-        "Content-Type": "application/json"
-      },
-      "supports_tool_calling": true,
-      "supports_stream": true,
-      "supports_stream_usage": false,
-      "default_timeout_seconds": 3600.0,
-      "max_retries": 2,
-      "sse_idle_timeout_seconds": 120.0,
-      "sse_heartbeat_seconds": 10.0,
+      "extends": "gemini-2.5-flash",
       "provider_request_extension": {
         "type": "gemini_thinking",
         "thinking_budget": -1,
         "include_thoughts": true
-      },
-      "context_window_tokens": 1048576,
-      "runtime_hints": {
-        "runner_option_hints": {
-          "write": {
-            "temperature": 1.0,
-            "max_tokens": 4096,
-            "top_p": 1.0,
-            "stream": true
-          },
-          "overview": {
-            "temperature": 0.4,
-            "max_tokens": 4096,
-            "top_p": 1.0,
-            "stream": true
-          },
-          "audit": {
-            "temperature": 0.1,
-            "max_tokens": 4096,
-            "top_p": 1.0,
-            "stream": true
-          },
-          "decision": {
-            "temperature": 0.2,
-            "max_tokens": 4096,
-            "top_p": 1.0,
-            "stream": true
-          },
-          "interactive": {
-            "temperature": 0.7,
-            "max_tokens": 4096,
-            "top_p": 1.0,
-            "stream": true
-          },
-          "prompt": {
-            "temperature": 0.6,
-            "max_tokens": 4096,
-            "top_p": 1.0,
-            "stream": true
-          },
-          "infer": {
-            "temperature": 0.1,
-            "max_tokens": 4096,
-            "top_p": 1.0,
-            "stream": true
-          },
-          "conversation_compaction": {
-            "temperature": 0.3,
-            "max_tokens": 2048,
-            "top_p": 1.0,
-            "stream": false
-          }
-        }
       }
     },
     "gemini-2.5-pro": {
@@ -767,7 +431,7 @@
       "supports_stream": true,
       "supports_stream_usage": false,
       "default_timeout_seconds": 3600.0,
-      "max_retries": 2,
+      "max_retries": 3,
       "sse_idle_timeout_seconds": 120.0,
       "sse_heartbeat_seconds": 10.0,
       "provider_request_extension": {
@@ -829,79 +493,11 @@
       }
     },
     "gemini-2.5-pro-thinking": {
-      "runner_kind": "openai_compatible",
-      "provider": "gemini",
-      "model": "gemini-2.5-pro",
-      "endpoint": "https://generativelanguage.googleapis.com/v1beta/openai/chat/completions",
-      "api_key_ref": "GEMINI_API_KEY",
-      "headers": {
-        "Authorization": "Bearer {{GEMINI_API_KEY}}",
-        "Content-Type": "application/json"
-      },
-      "supports_tool_calling": true,
-      "supports_stream": true,
-      "supports_stream_usage": false,
-      "default_timeout_seconds": 3600.0,
-      "max_retries": 2,
-      "sse_idle_timeout_seconds": 120.0,
-      "sse_heartbeat_seconds": 10.0,
+      "extends": "gemini-2.5-pro",
       "provider_request_extension": {
         "type": "gemini_thinking",
         "thinking_budget": -1,
         "include_thoughts": true
-      },
-      "context_window_tokens": 1048576,
-      "runtime_hints": {
-        "runner_option_hints": {
-          "write": {
-            "temperature": 1.0,
-            "max_tokens": 4096,
-            "top_p": 1.0,
-            "stream": true
-          },
-          "overview": {
-            "temperature": 0.4,
-            "max_tokens": 4096,
-            "top_p": 1.0,
-            "stream": true
-          },
-          "audit": {
-            "temperature": 0.1,
-            "max_tokens": 4096,
-            "top_p": 1.0,
-            "stream": true
-          },
-          "decision": {
-            "temperature": 0.2,
-            "max_tokens": 4096,
-            "top_p": 1.0,
-            "stream": true
-          },
-          "interactive": {
-            "temperature": 0.7,
-            "max_tokens": 4096,
-            "top_p": 1.0,
-            "stream": true
-          },
-          "prompt": {
-            "temperature": 0.6,
-            "max_tokens": 4096,
-            "top_p": 1.0,
-            "stream": true
-          },
-          "infer": {
-            "temperature": 0.1,
-            "max_tokens": 4096,
-            "top_p": 1.0,
-            "stream": true
-          },
-          "conversation_compaction": {
-            "temperature": 0.3,
-            "max_tokens": 2048,
-            "top_p": 1.0,
-            "stream": false
-          }
-        }
       }
     },
     "gemini-2.5-flash-lite": {
@@ -918,7 +514,7 @@
       "supports_stream": true,
       "supports_stream_usage": false,
       "default_timeout_seconds": 3600.0,
-      "max_retries": 2,
+      "max_retries": 3,
       "sse_idle_timeout_seconds": 120.0,
       "sse_heartbeat_seconds": 10.0,
       "provider_request_extension": {
@@ -980,79 +576,11 @@
       }
     },
     "gemini-2.5-flash-lite-thinking": {
-      "runner_kind": "openai_compatible",
-      "provider": "gemini",
-      "model": "gemini-2.5-flash-lite",
-      "endpoint": "https://generativelanguage.googleapis.com/v1beta/openai/chat/completions",
-      "api_key_ref": "GEMINI_API_KEY",
-      "headers": {
-        "Authorization": "Bearer {{GEMINI_API_KEY}}",
-        "Content-Type": "application/json"
-      },
-      "supports_tool_calling": true,
-      "supports_stream": true,
-      "supports_stream_usage": false,
-      "default_timeout_seconds": 3600.0,
-      "max_retries": 2,
-      "sse_idle_timeout_seconds": 120.0,
-      "sse_heartbeat_seconds": 10.0,
+      "extends": "gemini-2.5-flash-lite",
       "provider_request_extension": {
         "type": "gemini_thinking",
         "thinking_budget": -1,
         "include_thoughts": true
-      },
-      "context_window_tokens": 1048576,
-      "runtime_hints": {
-        "runner_option_hints": {
-          "write": {
-            "temperature": 1.0,
-            "max_tokens": 4096,
-            "top_p": 1.0,
-            "stream": true
-          },
-          "overview": {
-            "temperature": 0.4,
-            "max_tokens": 4096,
-            "top_p": 1.0,
-            "stream": true
-          },
-          "audit": {
-            "temperature": 0.1,
-            "max_tokens": 4096,
-            "top_p": 1.0,
-            "stream": true
-          },
-          "decision": {
-            "temperature": 0.2,
-            "max_tokens": 4096,
-            "top_p": 1.0,
-            "stream": true
-          },
-          "interactive": {
-            "temperature": 0.7,
-            "max_tokens": 4096,
-            "top_p": 1.0,
-            "stream": true
-          },
-          "prompt": {
-            "temperature": 0.6,
-            "max_tokens": 4096,
-            "top_p": 1.0,
-            "stream": true
-          },
-          "infer": {
-            "temperature": 0.1,
-            "max_tokens": 4096,
-            "top_p": 1.0,
-            "stream": true
-          },
-          "conversation_compaction": {
-            "temperature": 0.3,
-            "max_tokens": 2048,
-            "top_p": 1.0,
-            "stream": false
-          }
-        }
       }
     },
     "gemini-3.1-pro-preview": {
@@ -1069,7 +597,7 @@
       "supports_stream": true,
       "supports_stream_usage": false,
       "default_timeout_seconds": 3600.0,
-      "max_retries": 2,
+      "max_retries": 3,
       "sse_idle_timeout_seconds": 120.0,
       "sse_heartbeat_seconds": 10.0,
       "provider_request_extension": {
@@ -1131,79 +659,11 @@
       }
     },
     "gemini-3.1-pro-preview-thinking": {
-      "runner_kind": "openai_compatible",
-      "provider": "gemini",
-      "model": "gemini-3.1-pro-preview",
-      "endpoint": "https://generativelanguage.googleapis.com/v1beta/openai/chat/completions",
-      "api_key_ref": "GEMINI_API_KEY",
-      "headers": {
-        "Authorization": "Bearer {{GEMINI_API_KEY}}",
-        "Content-Type": "application/json"
-      },
-      "supports_tool_calling": true,
-      "supports_stream": true,
-      "supports_stream_usage": false,
-      "default_timeout_seconds": 3600.0,
-      "max_retries": 2,
-      "sse_idle_timeout_seconds": 120.0,
-      "sse_heartbeat_seconds": 10.0,
+      "extends": "gemini-3.1-pro-preview",
       "provider_request_extension": {
         "type": "gemini_thinking",
         "thinking_budget": -1,
         "include_thoughts": true
-      },
-      "context_window_tokens": 1048576,
-      "runtime_hints": {
-        "runner_option_hints": {
-          "write": {
-            "temperature": 1.0,
-            "max_tokens": 4096,
-            "top_p": 1.0,
-            "stream": true
-          },
-          "overview": {
-            "temperature": 0.4,
-            "max_tokens": 4096,
-            "top_p": 1.0,
-            "stream": true
-          },
-          "audit": {
-            "temperature": 0.1,
-            "max_tokens": 4096,
-            "top_p": 1.0,
-            "stream": true
-          },
-          "decision": {
-            "temperature": 0.2,
-            "max_tokens": 4096,
-            "top_p": 1.0,
-            "stream": true
-          },
-          "interactive": {
-            "temperature": 0.7,
-            "max_tokens": 4096,
-            "top_p": 1.0,
-            "stream": true
-          },
-          "prompt": {
-            "temperature": 0.6,
-            "max_tokens": 4096,
-            "top_p": 1.0,
-            "stream": true
-          },
-          "infer": {
-            "temperature": 0.1,
-            "max_tokens": 4096,
-            "top_p": 1.0,
-            "stream": true
-          },
-          "conversation_compaction": {
-            "temperature": 0.3,
-            "max_tokens": 2048,
-            "top_p": 1.0,
-            "stream": false
-          }
-        }
       }
     },
     "gemini-3.1-flash-lite-preview": {
@@ -1220,7 +680,7 @@
       "supports_stream": true,
       "supports_stream_usage": false,
       "default_timeout_seconds": 3600.0,
-      "max_retries": 2,
+      "max_retries": 3,
       "sse_idle_timeout_seconds": 120.0,
       "sse_heartbeat_seconds": 10.0,
       "provider_request_extension": {
@@ -1282,79 +742,11 @@
       }
     },
     "gemini-3.1-flash-lite-preview-thinking": {
-      "runner_kind": "openai_compatible",
-      "provider": "gemini",
-      "model": "gemini-3.1-flash-lite-preview",
-      "endpoint": "https://generativelanguage.googleapis.com/v1beta/openai/chat/completions",
-      "api_key_ref": "GEMINI_API_KEY",
-      "headers": {
-        "Authorization": "Bearer {{GEMINI_API_KEY}}",
-        "Content-Type": "application/json"
-      },
-      "supports_tool_calling": true,
-      "supports_stream": true,
-      "supports_stream_usage": false,
-      "default_timeout_seconds": 3600.0,
-      "max_retries": 2,
-      "sse_idle_timeout_seconds": 120.0,
-      "sse_heartbeat_seconds": 10.0,
+      "extends": "gemini-3.1-flash-lite-preview",
       "provider_request_extension": {
         "type": "gemini_thinking",
         "thinking_budget": -1,
         "include_thoughts": true
-      },
-      "context_window_tokens": 1048576,
-      "runtime_hints": {
-        "runner_option_hints": {
-          "write": {
-            "temperature": 1.0,
-            "max_tokens": 4096,
-            "top_p": 1.0,
-            "stream": true
-          },
-          "overview": {
-            "temperature": 0.4,
-            "max_tokens": 4096,
-            "top_p": 1.0,
-            "stream": true
-          },
-          "audit": {
-            "temperature": 0.1,
-            "max_tokens": 4096,
-            "top_p": 1.0,
-            "stream": true
-          },
-          "decision": {
-            "temperature": 0.2,
-            "max_tokens": 4096,
-            "top_p": 1.0,
-            "stream": true
-          },
-          "interactive": {
-            "temperature": 0.7,
-            "max_tokens": 4096,
-            "top_p": 1.0,
-            "stream": true
-          },
-          "prompt": {
-            "temperature": 0.6,
-            "max_tokens": 4096,
-            "top_p": 1.0,
-            "stream": true
-          },
-          "infer": {
-            "temperature": 0.1,
-            "max_tokens": 4096,
-            "top_p": 1.0,
-            "stream": true
-          },
-          "conversation_compaction": {
-            "temperature": 0.3,
-            "max_tokens": 2048,
-            "top_p": 1.0,
-            "stream": false
-          }
-        }
       }
     },
     "mimo-v2.5-pro": {
@@ -1371,7 +763,7 @@
       "supports_stream": true,
       "supports_stream_usage": false,
       "default_timeout_seconds": 3600.0,
-      "max_retries": 2,
+      "max_retries": 3,
       "sse_idle_timeout_seconds": 120.0,
       "sse_heartbeat_seconds": 10.0,
       "provider_request_extension": {
@@ -1433,78 +825,10 @@
       }
     },
     "mimo-v2.5-pro-thinking": {
-      "runner_kind": "openai_compatible",
-      "provider": "mimo",
-      "model": "mimo-v2.5-pro",
-      "endpoint": "https://api.xiaomimimo.com/v1/chat/completions",
-      "api_key_ref": "MIMO_API_KEY",
-      "headers": {
-        "Authorization": "Bearer {{MIMO_API_KEY}}",
-        "Content-Type": "application/json"
-      },
-      "supports_tool_calling": true,
-      "supports_stream": true,
-      "supports_stream_usage": false,
-      "default_timeout_seconds": 3600.0,
-      "max_retries": 2,
-      "sse_idle_timeout_seconds": 120.0,
-      "sse_heartbeat_seconds": 10.0,
+      "extends": "mimo-v2.5-pro",
       "provider_request_extension": {
         "type": "mimo_thinking",
         "enabled": true
-      },
-      "context_window_tokens": 1048576,
-      "runtime_hints": {
-        "runner_option_hints": {
-          "write": {
-            "temperature": 0.8,
-            "max_tokens": 4096,
-            "top_p": 1.0,
-            "stream": true
-          },
-          "overview": {
-            "temperature": 0.3,
-            "max_tokens": 4096,
-            "top_p": 1.0,
-            "stream": true
-          },
-          "audit": {
-            "temperature": 0.4,
-            "max_tokens": 4096,
-            "top_p": 1.0,
-            "stream": true
-          },
-          "decision": {
-            "temperature": 0.6,
-            "max_tokens": 4096,
-            "top_p": 1.0,
-            "stream": true
-          },
-          "interactive": {
-            "temperature": 0.8,
-            "max_tokens": 4096,
-            "top_p": 1.0,
-            "stream": true
-          },
-          "prompt": {
-            "temperature": 0.8,
-            "max_tokens": 4096,
-            "top_p": 1.0,
-            "stream": true
-          },
-          "infer": {
-            "temperature": 0.3,
-            "max_tokens": 4096,
-            "top_p": 1.0,
-            "stream": true
-          },
-          "conversation_compaction": {
-            "temperature": 0.3,
-            "max_tokens": 2048,
-            "top_p": 1.0,
-            "stream": false
-          }
-        }
       }
     },
     "mimo-v2.5-pro-plan": {
@@ -1521,7 +845,7 @@
       "supports_stream": true,
       "supports_stream_usage": false,
       "default_timeout_seconds": 3600.0,
-      "max_retries": 2,
+      "max_retries": 3,
       "sse_idle_timeout_seconds": 120.0,
       "sse_heartbeat_seconds": 10.0,
       "provider_request_extension": {
@@ -1583,78 +907,10 @@
       }
     },
     "mimo-v2.5-pro-thinking-plan": {
-      "runner_kind": "openai_compatible",
-      "provider": "mimo",
-      "model": "mimo-v2.5-pro",
-      "endpoint": "https://token-plan-cn.xiaomimimo.com/v1/chat/completions",
-      "api_key_ref": "MIMO_PLAN_API_KEY",
-      "headers": {
-        "Authorization": "Bearer {{MIMO_PLAN_API_KEY}}",
-        "Content-Type": "application/json"
-      },
-      "supports_tool_calling": true,
-      "supports_stream": true,
-      "supports_stream_usage": false,
-      "default_timeout_seconds": 3600.0,
-      "max_retries": 2,
-      "sse_idle_timeout_seconds": 120.0,
-      "sse_heartbeat_seconds": 10.0,
+      "extends": "mimo-v2.5-pro-plan",
       "provider_request_extension": {
         "type": "mimo_thinking",
         "enabled": true
-      },
-      "context_window_tokens": 1048576,
-      "runtime_hints": {
-        "runner_option_hints": {
-          "write": {
-            "temperature": 0.8,
-            "max_tokens": 4096,
-            "top_p": 1.0,
-            "stream": true
-          },
-          "overview": {
-            "temperature": 0.3,
-            "max_tokens": 4096,
-            "top_p": 1.0,
-            "stream": true
-          },
-          "audit": {
-            "temperature": 0.4,
-            "max_tokens": 4096,
-            "top_p": 1.0,
-            "stream": true
-          },
-          "decision": {
-            "temperature": 0.6,
-            "max_tokens": 4096,
-            "top_p": 1.0,
-            "stream": true
-          },
-          "interactive": {
-            "temperature": 0.8,
-            "max_tokens": 4096,
-            "top_p": 1.0,
-            "stream": true
-          },
-          "prompt": {
-            "temperature": 0.8,
-            "max_tokens": 4096,
-            "top_p": 1.0,
-            "stream": true
-          },
-          "infer": {
-            "temperature": 0.3,
-            "max_tokens": 4096,
-            "top_p": 1.0,
-            "stream": true
-          },
-          "conversation_compaction": {
-            "temperature": 0.3,
-            "max_tokens": 2048,
-            "top_p": 1.0,
-            "stream": false
-          }
-        }
       }
     },
     "mimo-v2.5-pro-plan-sg": {
@@ -1671,7 +927,7 @@
       "supports_stream": true,
       "supports_stream_usage": false,
       "default_timeout_seconds": 3600.0,
-      "max_retries": 2,
+      "max_retries": 3,
       "sse_idle_timeout_seconds": 120.0,
       "sse_heartbeat_seconds": 10.0,
       "provider_request_extension": {
@@ -1733,78 +989,10 @@
       }
     },
     "mimo-v2.5-pro-thinking-plan-sg": {
-      "runner_kind": "openai_compatible",
-      "provider": "mimo",
-      "model": "mimo-v2.5-pro",
-      "endpoint": "https://token-plan-sgp.xiaomimimo.com/v1/chat/completions",
-      "api_key_ref": "MIMO_PLAN_SG_API_KEY",
-      "headers": {
-        "Authorization": "Bearer {{MIMO_PLAN_SG_API_KEY}}",
-        "Content-Type": "application/json"
-      },
-      "supports_tool_calling": true,
-      "supports_stream": true,
-      "supports_stream_usage": false,
-      "default_timeout_seconds": 3600.0,
-      "max_retries": 2,
-      "sse_idle_timeout_seconds": 120.0,
-      "sse_heartbeat_seconds": 10.0,
+      "extends": "mimo-v2.5-pro-plan-sg",
       "provider_request_extension": {
         "type": "mimo_thinking",
         "enabled": true
-      },
-      "context_window_tokens": 1048576,
-      "runtime_hints": {
-        "runner_option_hints": {
-          "write": {
-            "temperature": 0.8,
-            "max_tokens": 4096,
-            "top_p": 1.0,
-            "stream": true
-          },
-          "overview": {
-            "temperature": 0.3,
-            "max_tokens": 4096,
-            "top_p": 1.0,
-            "stream": true
-          },
-          "audit": {
-            "temperature": 0.4,
-            "max_tokens": 4096,
-            "top_p": 1.0,
-            "stream": true
-          },
-          "decision": {
-            "temperature": 0.6,
-            "max_tokens": 4096,
-            "top_p": 1.0,
-            "stream": true
-          },
-          "interactive": {
-            "temperature": 0.8,
-            "max_tokens": 4096,
-            "top_p": 1.0,
-            "stream": true
-          },
-          "prompt": {
-            "temperature": 0.8,
-            "max_tokens": 4096,
-            "top_p": 1.0,
-            "stream": true
-          },
-          "infer": {
-            "temperature": 0.3,
-            "max_tokens": 4096,
-            "top_p": 1.0,
-            "stream": true
-          },
-          "conversation_compaction": {
-            "temperature": 0.3,
-            "max_tokens": 2048,
-            "top_p": 1.0,
-            "stream": false
-          }
-        }
       }
     },
     "qwen-plus": {
@@ -1821,7 +1009,7 @@
       "supports_stream": true,
       "supports_stream_usage": true,
       "default_timeout_seconds": 3600.0,
-      "max_retries": 2,
+      "max_retries": 3,
       "sse_idle_timeout_seconds": 120.0,
       "sse_heartbeat_seconds": 10.0,
       "provider_request_extension": {
@@ -1883,78 +1071,10 @@
       }
     },
     "qwen-plus-thinking": {
-      "runner_kind": "openai_compatible",
-      "provider": "qwen",
-      "model": "qwen3.6-plus",
-      "endpoint": "https://dashscope.aliyuncs.com/compatible-mode/v1/chat/completions",
-      "api_key_ref": "QWEN_API_KEY",
-      "headers": {
-        "Authorization": "Bearer {{QWEN_API_KEY}}",
-        "Content-Type": "application/json"
-      },
-      "supports_tool_calling": true,
-      "supports_stream": true,
-      "supports_stream_usage": true,
-      "default_timeout_seconds": 3600.0,
-      "max_retries": 2,
-      "sse_idle_timeout_seconds": 120.0,
-      "sse_heartbeat_seconds": 10.0,
+      "extends": "qwen-plus",
       "provider_request_extension": {
         "type": "qwen_thinking",
         "enable_thinking": true
-      },
-      "context_window_tokens": 1000000,
-      "runtime_hints": {
-        "runner_option_hints": {
-          "write": {
-            "temperature": 0.6,
-            "max_tokens": 4096,
-            "top_p": 1.0,
-            "stream": true
-          },
-          "overview": {
-            "temperature": 0.1,
-            "max_tokens": 4096,
-            "top_p": 1.0,
-            "stream": true
-          },
-          "audit": {
-            "temperature": 0.2,
-            "max_tokens": 4096,
-            "top_p": 1.0,
-            "stream": true
-          },
-          "decision": {
-            "temperature": 0.3,
-            "max_tokens": 4096,
-            "top_p": 1.0,
-            "stream": true
-          },
-          "interactive": {
-            "temperature": 0.6,
-            "max_tokens": 4096,
-            "top_p": 1.0,
-            "stream": true
-          },
-          "prompt": {
-            "temperature": 0.6,
-            "max_tokens": 4096,
-            "top_p": 1.0,
-            "stream": true
-          },
-          "infer": {
-            "temperature": 0.1,
-            "max_tokens": 4096,
-            "top_p": 1.0,
-            "stream": true
-          },
-          "conversation_compaction": {
-            "temperature": 0.1,
-            "max_tokens": 2048,
-            "top_p": 1.0,
-            "stream": false
-          }
-        }
       }
     },
     "ollama": {
@@ -1970,7 +1090,7 @@
       "supports_stream": true,
       "supports_stream_usage": true,
       "default_timeout_seconds": 3600.0,
-      "max_retries": 2,
+      "max_retries": 3,
       "sse_idle_timeout_seconds": 120.0,
       "sse_heartbeat_seconds": 10.0,
       "provider_request_extension": null,

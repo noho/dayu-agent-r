@@ -14,6 +14,3 @@
   - 最后三个非空白字符必须是 ```。
   - 代码块外不得有任何字符。
   - 代码块内严禁输出任何系统/模型内部引用标记或元数据（例如 contentReference、oaicite、turnX、filecite、index= 等）。
-
-## 当前研究主体
-- 默认研究主体：{{fins_default_subject}}。
