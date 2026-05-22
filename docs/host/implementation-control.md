@@ -222,9 +222,9 @@ Phase Map 中每个 phase 必须使用统一条目格式。模板如下：
 
 约束：本节只保留当前 gate 结论；phase 过程流水必须归档到 `历史记录`，仍需追踪的风险或后续 owner 必须写入 `Open Questions 与风险追踪` 的 `追踪区`。
 
-当前 work unit：Full-repo review accepted fix after Phase 12.2。
-当前 gate：accepted-local-PASS。
-下一 gate：推送到 PR 67 分支；随后等待 PR 67 后续 review / CI 或进入后续 phase。
+当前 work unit：Phase 12.3 Config Schema / Usage Governance Follow-up。
+当前 gate：ready-to-open-draft-PR。
+下一 gate：用户已授权自动进入 draft PR gate：推送当前分支并创建或更新 draft PR，随后推进到 `draft-PR-pass`。
 
 当前 gate 追加事实（Phase 12.1 Slice 2 implementation）：Phase 12.1 Slice 2 implementation artifact 为 `docs/reviews/phase12-1-slice2-implementation-codex-20260521.md`；implementation agent 更新 `dayu.runtime.config_loader` 新 schema typed view、runtime location resolver、默认 `models.json` / `execution_profiles.json` / `host_runtime.json` / `runtime_lanes.json` / `tool_discovery.json` 配置、全量旧模型迁移、runtime / engine config tests 与 README。Controller 本地复跑：`pytest tests/runtime/test_config_loader.py tests/runtime/test_runtime_location.py tests/runtime/test_import_boundary.py tests/runtime/test_weak_typing_guard.py -q` 35 passed；`pytest tests/engine/test_config_models.py -q` 4 passed；`python -m pyright dayu/runtime tests/runtime tests/engine/test_config_models.py` 0 errors；`git diff --check` clean。当前进入 Phase 12.1 Slice 2 code review。
 
@@ -561,6 +561,8 @@ Phase Map 中每个 phase 必须使用统一条目格式。模板如下：
 当前 gate 追加事实（Phase 12.3 Slice 4 fix）：P12.3-S4-F1 已修复，fix addendum 已追加到 `docs/reviews/phase12-3-slice4-implementation-codex-20260522.md`；根 `README.md` 已明确 runner option hints 只保存 temperature / `top_p` / stream，`max_tokens` 仅用于显式 per-run 或 provider adapter override。当前进入 Phase 12.3 Slice 4 re-review。
 
 当前 gate 追加事实（Phase 12.3 Slice 4 re-review accepted）：Phase 12.3 Slice 4 re-review artifacts 为 `docs/reviews/phase12-3-slice4-rereview-mimo-20260522.md` 与 `docs/reviews/phase12-3-slice4-rereview-ds-20260522.md`，两份均 PASS，确认 P12.3-S4-F1 已收口且无新增 blocker。Controller re-review adjudication artifact 为 `docs/reviews/phase12-3-slice4-rereview-controller-adjudication-20260522.md`；总控裁决：接受 Slice 4。当前进入 Phase 12.3 Slice 4 accepted local commit。
+
+当前 gate 追加事实（Phase 12.3 Slice 4 accepted）：Accepted Slice 4 local commit hash 为 `7c32cfc`。Phase 12.3 implementation slices 已全部完成，aggregate validation / review 已 PASS。当前进入 `ready-to-open-draft-PR`；用户已授权自动进入 draft PR gate 并推进到 `draft-PR-pass`。
 
 ## Phase Map
 
@@ -1857,7 +1859,7 @@ Plan 必须额外收口的 readiness review checklist：
 ### Phase 12.3. Config Schema / Usage Governance Follow-up
 
 状态：
-- design refinement ready。稳定讨论记录在 `docs/host/config-schema-followup-discussion.md`；进入 implementation 前必须先把稳定裁决写回 `docs/host/design.md`，并按 `$init-agents` 路由派发 handoff implementation-ready plan、plan review、implementation、code review 与 re-review。
+- completed；当前已进入 `ready-to-open-draft-PR`。Plan、implementation slices、review / re-review、aggregate validation 与总控裁决均已完成；accepted Slice 4 local commit hash 为 `7c32cfc`。
 
 目标：
 - 收口 P12.1 / P12.2 后继续暴露的 config schema 与 usage governance 小闭环，使默认配置更朴素、Service assembly 更薄、Context Governance 能消费 Engine 已上报的 usage observation。
