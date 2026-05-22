@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import asyncio
 import inspect
+import json
 from collections.abc import Awaitable, Callable
 
 import pytest
@@ -16,10 +17,19 @@ from dayu.engine.contracts.agent_run import (
 )
 from dayu.engine.contracts.finish_reason import FinishReason
 from dayu.engine.contracts.runner_spec import RunnerCallOptions, RunnerSpec
-from dayu.host.compaction import CompactionRequest
+from dayu.host.compaction import (
+    CompactionRequest,
+    CurrentMessageSummary,
+    MAX_EVIDENCE_BACKED_FACT_CLAIM_TEXT_CHARS,
+    MAX_MINIMUM_PRESERVE_ITEM_TEXT_CHARS,
+)
 from dayu.host.context_budget import BudgetEstimate
 from dayu.host.context_policy import ContextCompactionTriggerSource
-from dayu.host.compaction import CurrentMessageSummary
+from dayu.host.evidence import (
+    AcceptedEvidenceEnvelope,
+    AcceptedEvidenceResultRef,
+    AcceptedEvidenceToolQuery,
+)
 import dayu.host.llm_compaction as llm_compaction_module
 from dayu.host.llm_compaction import (
     LLMCompactionProposalError,
@@ -49,7 +59,7 @@ async def test_llm_context_compactor_builds_tool_disabled_request(
 
     async def _fake_run(request: AgentRunRequest) -> AgentRunResult:
         seen.append(request)
-        return _final("summary")
+        return _final(_proposal_json())
 
     monkeypatch.setattr("dayu.host.llm_compaction.run_agent_and_wait", _fake_run)
     runner_spec = _runner_spec(max_retries=3)
@@ -72,11 +82,11 @@ async def test_llm_context_compactor_builds_tool_disabled_request(
 async def test_llm_context_compactor_maps_final_answer_to_candidate(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """LLM final answer 的文本只作为 summary，refs 由 Host 构造。"""
+    """LLM strict JSON final answer 映射为完整 structured candidate。"""
 
     monkeypatch.setattr(
         "dayu.host.llm_compaction.run_agent_and_wait",
-        _fake_run_factory(_final("keep the current user request")),
+        _fake_run_factory(_final(_proposal_json())),
     )
 
     candidate = await LLMContextCompactor(
@@ -85,10 +95,24 @@ async def test_llm_context_compactor_maps_final_answer_to_candidate(
     ).compact(_request())
 
     assert candidate.episode_summary_candidate.goal == "keep the current user request"
+    assert candidate.pinned_state_patch_candidate.current_goal.value == (
+        "keep the current user request"
+    )
+    assert len(candidate.evidence_backed_fact_candidates) == 1
+    assert candidate.evidence_backed_fact_candidates[0].claim_text == (
+        "Accepted evidence shows revenue growth."
+    )
+    assert candidate.evidence_backed_fact_candidates[0].evidence_refs == (
+        "evidence:accepted-1",
+    )
+    assert len(candidate.minimum_preserve_item_candidates) == 1
+    assert candidate.minimum_preserve_item_candidates[0].text == (
+        "Current user asked to keep the financial analysis context."
+    )
     assert candidate.retained_current_user_input_ref == "input-1"
     assert candidate.preserved_input_event_refs == ("input-1", "input-2")
-    assert candidate.preserved_tool_fact_refs == ("tool-fact-1",)
-    assert candidate.preserved_verified_fact_refs == ("verified-1",)
+    assert candidate.preserved_accepted_evidence_refs == ("evidence:accepted-1",)
+    assert candidate.preserved_evidence_backed_fact_refs == ("fact-1",)
     assert candidate.budget_after_compact > 8
 
 
@@ -100,7 +124,7 @@ async def test_llm_context_compactor_budget_counts_preserved_context(
 
     monkeypatch.setattr(
         "dayu.host.llm_compaction.run_agent_and_wait",
-        _fake_run_factory(_final("summary")),
+        _fake_run_factory(_final(_proposal_json())),
     )
 
     candidate = await LLMContextCompactor(
@@ -112,10 +136,52 @@ async def test_llm_context_compactor_budget_counts_preserved_context(
 
 
 @pytest.mark.asyncio
-async def test_llm_context_compactor_rejects_empty_or_non_final_output(
+async def test_llm_context_compactor_budget_counts_structured_output_text(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """空 final answer 或非 final outcome 不会被映射为 candidate。"""
+    """预算估算必须随 fact 与 minimum preserve 文本增长。"""
+
+    compactor = LLMContextCompactor(
+        runner_spec=_runner_spec(),
+        runner_options=_runner_options(),
+    )
+    monkeypatch.setattr(
+        "dayu.host.llm_compaction.run_agent_and_wait",
+        _fake_run_factory(
+            _final(
+                _proposal_json(
+                    claim_text="short fact",
+                    minimum_preserve_text="short preserve",
+                )
+            )
+        ),
+    )
+    short_candidate = await compactor.compact(_request())
+
+    monkeypatch.setattr(
+        "dayu.host.llm_compaction.run_agent_and_wait",
+        _fake_run_factory(
+            _final(
+                _proposal_json(
+                    claim_text="material fact " * 120,
+                    minimum_preserve_text="continuity item " * 70,
+                )
+            )
+        ),
+    )
+    long_candidate = await compactor.compact(_request())
+
+    assert long_candidate.episode_summary_candidate.goal == (
+        short_candidate.episode_summary_candidate.goal
+    )
+    assert long_candidate.budget_after_compact > short_candidate.budget_after_compact
+
+
+@pytest.mark.asyncio
+async def test_llm_context_compactor_rejects_empty_plain_text_or_non_final_output(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """空、纯文本 final answer 或非 final outcome 不会被映射为 candidate。"""
 
     monkeypatch.setattr(
         "dayu.host.llm_compaction.run_agent_and_wait",
@@ -125,7 +191,14 @@ async def test_llm_context_compactor_rejects_empty_or_non_final_output(
         runner_spec=_runner_spec(),
         runner_options=_runner_options(),
     )
-    with pytest.raises(LLMCompactionProposalError, match="summary is empty"):
+    with pytest.raises(LLMCompactionProposalError, match="proposal is empty"):
+        await compactor.compact(_request())
+
+    monkeypatch.setattr(
+        "dayu.host.llm_compaction.run_agent_and_wait",
+        _fake_run_factory(_final("plain text summary")),
+    )
+    with pytest.raises(LLMCompactionProposalError, match="not valid JSON"):
         await compactor.compact(_request())
 
     monkeypatch.setattr(
@@ -142,6 +215,96 @@ async def test_llm_context_compactor_rejects_empty_or_non_final_output(
         ),
     )
     with pytest.raises(LLMCompactionProposalError, match="runner failed"):
+        await compactor.compact(_request())
+
+
+@pytest.mark.asyncio
+async def test_llm_context_compactor_rejects_malformed_and_schema_invalid_json(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """坏 JSON 与 schema-invalid JSON 必须拒绝。"""
+
+    compactor = LLMContextCompactor(
+        runner_spec=_runner_spec(),
+        runner_options=_runner_options(),
+    )
+    monkeypatch.setattr(
+        "dayu.host.llm_compaction.run_agent_and_wait",
+        _fake_run_factory(_final('{"episode_summary_candidate": ')),
+    )
+    with pytest.raises(LLMCompactionProposalError, match="not valid JSON"):
+        await compactor.compact(_request())
+
+    monkeypatch.setattr(
+        "dayu.host.llm_compaction.run_agent_and_wait",
+        _fake_run_factory(
+            _final(json.dumps({"episode_summary_candidate": {}}, sort_keys=True))
+        ),
+    )
+    with pytest.raises(LLMCompactionProposalError, match="missing required key"):
+        await compactor.compact(_request())
+
+
+@pytest.mark.asyncio
+async def test_llm_context_compactor_rejects_overlong_structured_text(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """claim_text 与 minimum preserve text 上限复用 shared constants。"""
+
+    compactor = LLMContextCompactor(
+        runner_spec=_runner_spec(),
+        runner_options=_runner_options(),
+    )
+    monkeypatch.setattr(
+        "dayu.host.llm_compaction.run_agent_and_wait",
+        _fake_run_factory(
+            _final(
+                _proposal_json(
+                    claim_text="x"
+                    * (MAX_EVIDENCE_BACKED_FACT_CLAIM_TEXT_CHARS + 1)
+                )
+            )
+        ),
+    )
+    with pytest.raises(LLMCompactionProposalError, match="claim_text"):
+        await compactor.compact(_request())
+
+    monkeypatch.setattr(
+        "dayu.host.llm_compaction.run_agent_and_wait",
+        _fake_run_factory(
+            _final(
+                _proposal_json(
+                    minimum_preserve_text="x"
+                    * (MAX_MINIMUM_PRESERVE_ITEM_TEXT_CHARS + 1)
+                )
+            )
+        ),
+    )
+    with pytest.raises(
+        LLMCompactionProposalError,
+        match="MinimumPreserveItemCandidate.text",
+    ):
+        await compactor.compact(_request())
+
+
+@pytest.mark.asyncio
+async def test_llm_context_compactor_rejects_non_accepted_evidence_refs(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """fact candidate evidence_refs 只能引用 request.accepted_evidence_refs。"""
+
+    monkeypatch.setattr(
+        "dayu.host.llm_compaction.run_agent_and_wait",
+        _fake_run_factory(
+            _final(_proposal_json(fact_evidence_refs=("evidence:not-accepted",)))
+        ),
+    )
+    compactor = LLMContextCompactor(
+        runner_spec=_runner_spec(),
+        runner_options=_runner_options(),
+    )
+
+    with pytest.raises(LLMCompactionProposalError, match="unknown ref"):
         await compactor.compact(_request())
 
 
@@ -246,7 +409,7 @@ async def test_llm_context_compactor_preserves_host_owned_refs_and_evidence(
 
     monkeypatch.setattr(
         "dayu.host.llm_compaction.run_agent_and_wait",
-        _fake_run_factory(_final("summary")),
+        _fake_run_factory(_final(_proposal_json())),
     )
 
     candidate = await LLMContextCompactor(
@@ -256,7 +419,7 @@ async def test_llm_context_compactor_preserves_host_owned_refs_and_evidence(
 
     evidence = candidate.preservation_evidence[0]
     assert evidence.input_event_refs == ("input-1", "input-2")
-    assert evidence.tool_fact_refs == ("tool-fact-1",)
+    assert evidence.accepted_evidence_refs == ("evidence:accepted-1",)
     assert candidate.episode_summary_candidate.evidence_refs == (
         evidence.evidence_id,
     )
@@ -326,8 +489,8 @@ def _request() -> CompactionRequest:
             summary_text="current user text",
             source_event_refs=("input-1",),
         ),
-        tool_fact_refs=("tool-fact-1",),
-        verified_fact_refs=("verified-1",),
+        accepted_evidence_envelopes=(_accepted_evidence_envelope(),),
+        evidence_backed_fact_refs=("fact-1",),
         recent_raw_turn_refs=("input-1",),
         older_raw_turn_refs=("input-2",),
         existing_episode_summary_refs=("summary-1",),
@@ -340,6 +503,115 @@ def _request() -> CompactionRequest:
             estimator_digest=_DIGEST,
             overage_reason=None,
         ),
+    )
+
+
+def _proposal_json(
+    *,
+    claim_text: str = "Accepted evidence shows revenue growth.",
+    minimum_preserve_text: str = (
+        "Current user asked to keep the financial analysis context."
+    ),
+    fact_evidence_refs: tuple[str, ...] = ("evidence:accepted-1",),
+) -> str:
+    """构造 LLM structured JSON proposal。
+
+    :param claim_text: fact candidate claim_text。
+    :param minimum_preserve_text: minimum preserve item text。
+    :param fact_evidence_refs: fact candidate evidence refs。
+    :returns: JSON 文本。
+    """
+
+    return json.dumps(
+        {
+            "episode_summary_candidate": {
+                "episode_title": "Context compact summary",
+                "goal": "keep the current user request",
+                "completed_actions": ["reviewed current financial context"],
+                "confirmed_fact_refs": ["fact-1"],
+                "confirmed_fact_summaries": ["fact-1 remains relevant"],
+                "user_constraints": ["keep-current-input:input-1"],
+                "open_questions": ["continue-current-run"],
+                "next_step": "continue with the current user input",
+                "tool_finding_refs": ["evidence:accepted-1"],
+            },
+            "pinned_state_patch_candidate": {
+                "current_goal": {
+                    "operation": "replace",
+                    "value": "keep the current user request",
+                },
+                "confirmed_subjects": {
+                    "operation": "replace",
+                    "value": ["subject:fact-1"],
+                },
+                "user_constraints": {
+                    "operation": "replace",
+                    "value": ["keep-current-input:input-1"],
+                },
+                "open_questions": {
+                    "operation": "replace",
+                    "value": ["continue-current-run"],
+                },
+            },
+            "evidence_backed_fact_candidates": [
+                {
+                    "candidate_id": "fact-candidate-1",
+                    "claim_text": claim_text,
+                    "evidence_kind": "observed_value",
+                    "evidence_refs": list(fact_evidence_refs),
+                    "attributes": {},
+                }
+            ],
+            "minimum_preserve_item_candidates": [
+                {
+                    "item_id": "preserve-current-input",
+                    "label": "current input",
+                    "text": minimum_preserve_text,
+                    "source_refs": ["input-1"],
+                    "preserve_reason": "needed_for_recent_reference",
+                }
+            ],
+            "retained_current_user_input_ref": "input-1",
+            "preserved_input_event_refs": ["input-1", "input-2"],
+            "preserved_accepted_evidence_refs": ["evidence:accepted-1"],
+            "preserved_evidence_backed_fact_refs": ["fact-1"],
+            "dropped_ranges": [],
+            "summarized_ranges": [
+                {
+                    "range_ref": "range-older-raw-turns",
+                    "start_input_ref": "input-2",
+                    "end_input_ref": "input-2",
+                }
+            ],
+        },
+        sort_keys=True,
+    )
+
+
+def _accepted_evidence_envelope() -> AcceptedEvidenceEnvelope:
+    """构造测试用 accepted evidence envelope。
+
+    :returns: accepted evidence envelope。
+    """
+
+    return AcceptedEvidenceEnvelope(
+        evidence_id="evidence:accepted-1",
+        producer_event_ref="event-tool-result-1",
+        tool_name="fins.search",
+        tool_call_id="tool-call-1",
+        tool_query=AcceptedEvidenceToolQuery(
+            tool_call_requested_event_ref="event-tool-call-1",
+            normalized_arguments_digest=_DIGEST,
+            semantic_input_digest=_DIGEST,
+        ),
+        result_ref=AcceptedEvidenceResultRef(
+            payload_ref="payload:1",
+            payload_digest=_DIGEST,
+            outcome_digest=_DIGEST,
+            truncation_applied=False,
+        ),
+        source_refs=(),
+        locator_refs=(),
     )
 
 

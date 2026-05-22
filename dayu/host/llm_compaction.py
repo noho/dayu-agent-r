@@ -1,19 +1,26 @@
 """Host-owned LLM context compactor。
 
 本模块把 Host ``CompactionRequest`` 映射为一次禁用工具的 Engine public
-runner 调用，并把 LLM final answer 的摘要文本转换为 Host-owned
-``CompactionCandidate``。它不写 EventLog、不写 artifact、不做 semantic
-repair loop，也不向 Service 暴露 prompt、candidate builder 或 policy seam。
+runner 调用，并把 LLM final answer 的 strict JSON proposal 转换为
+Host-owned ``CompactionCandidate``。它不写 EventLog、不写 artifact、不做
+semantic repair loop，也不向 Service 暴露 prompt、candidate builder 或
+policy seam。
 """
 
 from __future__ import annotations
 
 import asyncio
+import json
 import re
+from collections.abc import Mapping
 from datetime import datetime
+from json import JSONDecodeError
+from math import ceil
+from typing import cast
 from uuid import uuid4
 
 from dayu.contracts.cancellation import CancellationToken
+from dayu.contracts.json_value import JsonValue
 from dayu.contracts.tool_call import BatchToolExecutionRequest
 from dayu.contracts.tool_executor import ToolExecutor
 from dayu.contracts.tool_outcome import BatchToolExecutionOutcome
@@ -40,18 +47,24 @@ from dayu.host.compaction import (
     CompactionRequest,
     ContextCompactor,
     EpisodeSummaryCandidate,
+    EvidenceBackedFactCandidate,
+    EvidenceBackedFactKind,
+    MAX_EVIDENCE_BACKED_FACT_CANDIDATES,
+    MAX_MINIMUM_PRESERVE_ITEM_CANDIDATES,
+    MinimumPreserveItemCandidate,
+    MinimumPreserveReason,
     PinnedPatchOperation,
     PinnedStatePatchCandidate,
     PinnedStringTupleFieldPatch,
     PinnedTextFieldPatch,
     PreservationEvidence,
 )
-from dayu.host.compaction_budget import estimate_compacted_context_budget
+from dayu.host.context_budget import DEFAULT_ESTIMATOR_CHARS_PER_TOKEN
 
 _COMPACTOR_RUN_ID_PREFIX = "context-compactor"
 _COMPACTOR_MAX_ITERATIONS = 1
 _COMPACTOR_TOOL_TIMEOUT_SECONDS = 1.0
-_MIN_SUMMARY_LENGTH = 1
+_MIN_PROPOSAL_LENGTH = 1
 _MAX_SAFE_OUTCOME_MESSAGE_CHARS = 240
 _TRUNCATED_SUFFIX = "..."
 _REDACTED_SECRET = "<redacted>"
@@ -61,10 +74,31 @@ _ASSIGNMENT_SECRET_PATTERN = re.compile(
 )
 _SAFE_ERROR_CODE_PATTERN = re.compile(r"^[a-z][a-z0-9_-]{0,63}$")
 _SYSTEM_PROMPT = (
-    "You are a host-owned context compaction component. Summarize the provided "
-    "Host context refs into a concise episode summary. Do not claim new "
-    "verified facts, do not invent evidence refs, do not request tools, and "
-    "return only the summary text."
+    "You are a host-owned context compaction component. Return exactly one "
+    "strict JSON object as the final answer. Do not wrap it in Markdown. Do "
+    "not request tools. The JSON object must contain episode_summary_candidate, "
+    "pinned_state_patch_candidate, evidence_backed_fact_candidates, "
+    "minimum_preserve_item_candidates, retained_current_user_input_ref, "
+    "preserved_input_event_refs, preserved_accepted_evidence_refs, "
+    "preserved_evidence_backed_fact_refs, dropped_ranges, and "
+    "summarized_ranges. Evidence-backed fact evidence_refs may only reference "
+    "accepted_evidence_refs from the request."
+)
+_POST_COMPACT_SYSTEM_PROMPT_ESTIMATE = (
+    "Host post-compact run context includes compact summary, pinned state, "
+    "current input, preserved refs, evidence-backed facts, and continuity items."
+)
+_REQUIRED_PROPOSAL_KEYS = (
+    "episode_summary_candidate",
+    "pinned_state_patch_candidate",
+    "evidence_backed_fact_candidates",
+    "minimum_preserve_item_candidates",
+    "retained_current_user_input_ref",
+    "preserved_input_event_refs",
+    "preserved_accepted_evidence_refs",
+    "preserved_evidence_backed_fact_refs",
+    "dropped_ranges",
+    "summarized_ranges",
 )
 
 
@@ -158,7 +192,7 @@ class LLMContextCompactor(ContextCompactor):
         :param request: Host 构造的 immutable compaction request。
         :returns: Host-owned candidate。
         :raises TypeError: request 类型非法时抛出。
-        :raises LLMCompactionProposalError: LLM 没有返回可用 final summary 时抛出。
+        :raises LLMCompactionProposalError: LLM 没有返回可用 structured proposal 时抛出。
         :raises Exception: Engine runner / provider 调用失败时透传。
         """
 
@@ -172,12 +206,9 @@ class LLMContextCompactor(ContextCompactor):
             raise LLMCompactionProposalError(_non_final_outcome_message(outcome))
         if outcome.finish_reason is FinishReason.LENGTH:
             raise LLMCompactionProposalError(
-                "compactor summary was truncated finish_reason=length"
+                "compactor proposal was truncated finish_reason=length"
             )
-        summary = outcome.content.strip()
-        if len(summary) < _MIN_SUMMARY_LENGTH:
-            raise LLMCompactionProposalError("compactor summary is empty")
-        return _candidate_from_summary(request, summary)
+        return _candidate_from_final_answer(request, outcome.content)
 
 
 def _agent_request(
@@ -297,12 +328,43 @@ def _user_prompt(request: CompactionRequest) -> str:
         f"current_user_input_ref: {request.current_message_summary.current_user_input_ref}",
         f"current_user_input_summary: {request.current_message_summary.summary_text}",
         f"input_event_refs: {_refs_text(request.input_event_refs)}",
-        f"tool_fact_refs: {_refs_text(request.tool_fact_refs)}",
-        f"verified_fact_refs: {_refs_text(request.verified_fact_refs)}",
+        f"accepted_evidence_refs: {_refs_text(request.accepted_evidence_refs)}",
+        f"evidence_backed_fact_refs: {_refs_text(request.evidence_backed_fact_refs)}",
         f"recent_raw_turn_refs: {_refs_text(request.recent_raw_turn_refs)}",
         f"older_raw_turn_refs: {_refs_text(request.older_raw_turn_refs)}",
         f"existing_episode_summary_refs: {_refs_text(request.existing_episode_summary_refs)}",
-        "Return a concise summary in plain text only.",
+        "Return strict JSON only. Required object schema:",
+        "{",
+        '  "episode_summary_candidate": {',
+        '    "episode_title": "non-empty text",',
+        '    "goal": "non-empty text",',
+        '    "completed_actions": ["text"],',
+        '    "confirmed_fact_refs": ["existing evidence_backed_fact_ref"],',
+        '    "confirmed_fact_summaries": ["text"],',
+        '    "user_constraints": ["text"],',
+        '    "open_questions": ["text"],',
+        '    "next_step": "text or null",',
+        '    "tool_finding_refs": ["accepted evidence ref"]',
+        "  },",
+        '  "pinned_state_patch_candidate": {',
+        '    "current_goal": {"operation": "missing|clear|replace", "value": "text or null"},',
+        '    "confirmed_subjects": {"operation": "missing|clear|replace", "value": ["text"] or null},',
+        '    "user_constraints": {"operation": "missing|clear|replace", "value": ["text"] or null},',
+        '    "open_questions": {"operation": "missing|clear|replace", "value": ["text"] or null}',
+        "  },",
+        '  "evidence_backed_fact_candidates": [',
+        '    {"candidate_id": "local id", "claim_text": "bounded text", "evidence_kind": "observed_value|quoted_statement|table_value|derived_from_evidence", "evidence_refs": ["accepted evidence ref"], "attributes": {}}',
+        "  ],",
+        '  "minimum_preserve_item_candidates": [',
+        '    {"item_id": "local id", "label": "short text", "text": "bounded text", "source_refs": ["input event ref"], "preserve_reason": "needed_for_recent_reference|needed_for_ordered_item_reference|needed_for_local_followup"}',
+        "  ],",
+        f'  "retained_current_user_input_ref": "{request.current_message_summary.current_user_input_ref}",',
+        '  "preserved_input_event_refs": ["input event refs"],',
+        '  "preserved_accepted_evidence_refs": ["accepted evidence refs"],',
+        '  "preserved_evidence_backed_fact_refs": ["evidence-backed fact refs"],',
+        '  "dropped_ranges": [],',
+        '  "summarized_ranges": [{"range_ref": "local id", "start_input_ref": "input ref", "end_input_ref": "input ref"}]',
+        "}",
     ]
     return "\n".join(lines)
 
@@ -319,73 +381,588 @@ def _refs_text(refs: tuple[str, ...]) -> str:
     return ", ".join(refs)
 
 
-def _candidate_from_summary(
-    request: CompactionRequest, summary: str
+def _candidate_from_final_answer(
+    request: CompactionRequest, final_answer: str
 ) -> CompactionCandidate:
-    """把 LLM summary 映射为 Host-owned candidate。
+    """把 LLM strict JSON final answer 映射为 Host-owned candidate。
 
     :param request: Host compaction request。
-    :param summary: LLM 返回的摘要文本。
+    :param final_answer: LLM 返回的 strict JSON 文本。
     :returns: CompactionCandidate。
+    :raises LLMCompactionProposalError: JSON 解析、schema 或值校验失败时抛出。
     """
 
+    proposal = _parse_proposal(final_answer)
     evidence = _preservation_evidence(request)
     evidence_refs = tuple(item.evidence_id for item in evidence)
-    summarized_ranges = _summarized_ranges(request)
-    return CompactionCandidate(
-        candidate_id=f"llm-compact:{request.run_id}",
-        episode_summary_candidate=EpisodeSummaryCandidate(
-            candidate_id=f"llm-summary:{request.run_id}",
-            episode_title="Context compact summary",
-            goal=summary,
-            completed_actions=(summary,),
-            confirmed_fact_refs=request.verified_fact_refs,
-            confirmed_fact_summaries=_confirmed_fact_summaries(request),
-            user_constraints=(
-                f"keep-current-input:{request.current_message_summary.current_user_input_ref}",
+    try:
+        episode = _episode_summary_candidate(request, proposal, evidence_refs)
+        pinned_patch = _pinned_state_patch_candidate(
+            proposal, evidence_refs, run_id=request.run_id
+        )
+        fact_candidates = _evidence_backed_fact_candidates(request, proposal)
+        preserve_items = _minimum_preserve_item_candidates(request, proposal)
+        retained_current_input = _retained_current_user_input_ref(request, proposal)
+        preserved_input_refs = _bounded_known_refs(
+            _required_string_tuple(proposal, "preserved_input_event_refs"),
+            allowed_refs=request.input_event_refs,
+            field_name="preserved_input_event_refs",
+        )
+        preserved_evidence_refs = _bounded_known_refs(
+            _required_string_tuple(proposal, "preserved_accepted_evidence_refs"),
+            allowed_refs=request.accepted_evidence_refs,
+            field_name="preserved_accepted_evidence_refs",
+        )
+        preserved_fact_refs = _bounded_known_refs(
+            _required_string_tuple(proposal, "preserved_evidence_backed_fact_refs"),
+            allowed_refs=request.evidence_backed_fact_refs,
+            field_name="preserved_evidence_backed_fact_refs",
+        )
+        dropped_ranges = _range_tuple(
+            proposal,
+            "dropped_ranges",
+            allowed_refs=request.input_event_refs,
+        )
+        summarized_ranges = _range_tuple(
+            proposal,
+            "summarized_ranges",
+            allowed_refs=request.input_event_refs,
+        )
+        return CompactionCandidate(
+            candidate_id=f"llm-compact:{request.run_id}",
+            episode_summary_candidate=episode,
+            pinned_state_patch_candidate=pinned_patch,
+            preservation_evidence=evidence,
+            evidence_backed_fact_candidates=fact_candidates,
+            minimum_preserve_item_candidates=preserve_items,
+            retained_current_user_input_ref=retained_current_input,
+            preserved_input_event_refs=preserved_input_refs,
+            preserved_accepted_evidence_refs=preserved_evidence_refs,
+            preserved_evidence_backed_fact_refs=preserved_fact_refs,
+            dropped_ranges=dropped_ranges,
+            summarized_ranges=summarized_ranges,
+            budget_after_compact=_budget_after_compact(
+                request,
+                episode,
+                pinned_patch,
+                fact_candidates,
+                preserve_items,
             ),
-            open_questions=("continue-current-run",),
-            next_step="continue with the current user input",
-            tool_finding_refs=request.tool_fact_refs,
-            source_event_refs=request.input_event_refs,
-            evidence_refs=evidence_refs,
+        )
+    except (KeyError, TypeError, ValueError) as exc:
+        raise LLMCompactionProposalError(
+            f"compactor proposal schema invalid: {exc}"
+        ) from exc
+
+
+def _parse_proposal(final_answer: str) -> Mapping[str, JsonValue]:
+    """解析 LLM strict JSON proposal。
+
+    :param final_answer: LLM final answer 原文。
+    :returns: top-level JSON object。
+    :raises LLMCompactionProposalError: 空文本、非 JSON 或缺少必需字段时抛出。
+    """
+
+    raw = final_answer.strip()
+    if len(raw) < _MIN_PROPOSAL_LENGTH:
+        raise LLMCompactionProposalError("compactor proposal is empty")
+    try:
+        parsed = json.loads(raw)
+    except JSONDecodeError as exc:
+        raise LLMCompactionProposalError(
+            f"compactor proposal is not valid JSON: {exc.msg}"
+        ) from exc
+    if not isinstance(parsed, Mapping):
+        raise LLMCompactionProposalError(
+            "compactor proposal top-level value must be object"
+        )
+    proposal = cast(Mapping[str, JsonValue], parsed)
+    for key in _REQUIRED_PROPOSAL_KEYS:
+        if key not in proposal:
+            raise LLMCompactionProposalError(
+                f"compactor proposal missing required key: {key}"
+            )
+    return proposal
+
+
+def _episode_summary_candidate(
+    request: CompactionRequest,
+    proposal: Mapping[str, JsonValue],
+    evidence_refs: tuple[str, ...],
+) -> EpisodeSummaryCandidate:
+    """从 proposal 构造 episode summary candidate。
+
+    :param request: Host compaction request。
+    :param proposal: 已解析 proposal。
+    :param evidence_refs: Host-owned preservation evidence refs。
+    :returns: episode summary candidate。
+    """
+
+    data = _required_mapping(proposal, "episode_summary_candidate")
+    tool_finding_refs = _bounded_known_refs(
+        _optional_string_tuple(data, "tool_finding_refs"),
+        allowed_refs=request.accepted_evidence_refs,
+        field_name="episode_summary_candidate.tool_finding_refs",
+    )
+    confirmed_fact_refs = _bounded_known_refs(
+        _optional_string_tuple(data, "confirmed_fact_refs"),
+        allowed_refs=request.evidence_backed_fact_refs,
+        field_name="episode_summary_candidate.confirmed_fact_refs",
+    )
+    return EpisodeSummaryCandidate(
+        candidate_id=f"llm-summary:{request.run_id}",
+        episode_title=_required_string(data, "episode_title"),
+        goal=_required_string(data, "goal"),
+        completed_actions=_optional_string_tuple(data, "completed_actions"),
+        confirmed_fact_refs=confirmed_fact_refs,
+        confirmed_fact_summaries=_optional_string_tuple(
+            data, "confirmed_fact_summaries"
         ),
-        pinned_state_patch_candidate=PinnedStatePatchCandidate(
-            candidate_id=f"llm-pinned-patch:{request.run_id}",
-            current_goal=PinnedTextFieldPatch(
-                operation=PinnedPatchOperation.REPLACE,
-                value=summary,
-                evidence_refs=evidence_refs,
-            ),
-            confirmed_subjects=PinnedStringTupleFieldPatch(
-                operation=PinnedPatchOperation.REPLACE,
-                value=_confirmed_subjects(request),
-                evidence_refs=evidence_refs,
-            ),
-            user_constraints=PinnedStringTupleFieldPatch(
-                operation=PinnedPatchOperation.REPLACE,
-                value=(
-                    f"keep-current-input:{request.current_message_summary.current_user_input_ref}",
+        user_constraints=_optional_string_tuple(data, "user_constraints"),
+        open_questions=_optional_string_tuple(data, "open_questions"),
+        next_step=_optional_string_or_none(data, "next_step"),
+        tool_finding_refs=tool_finding_refs,
+        source_event_refs=request.input_event_refs,
+        evidence_refs=evidence_refs,
+    )
+
+
+def _pinned_state_patch_candidate(
+    proposal: Mapping[str, JsonValue],
+    evidence_refs: tuple[str, ...],
+    *,
+    run_id: str,
+) -> PinnedStatePatchCandidate:
+    """从 proposal 构造 pinned state patch candidate。
+
+    :param proposal: 已解析 proposal。
+    :param evidence_refs: Host-owned preservation evidence refs。
+    :param run_id: Host run id，用于生成 Host-owned candidate id。
+    :returns: pinned state patch candidate。
+    """
+
+    data = _required_mapping(proposal, "pinned_state_patch_candidate")
+    return PinnedStatePatchCandidate(
+        candidate_id=f"llm-pinned-patch:{run_id}",
+        current_goal=_text_patch(data, "current_goal", evidence_refs),
+        confirmed_subjects=_string_tuple_patch(
+            data, "confirmed_subjects", evidence_refs
+        ),
+        user_constraints=_string_tuple_patch(
+            data, "user_constraints", evidence_refs
+        ),
+        open_questions=_string_tuple_patch(data, "open_questions", evidence_refs),
+    )
+
+
+def _evidence_backed_fact_candidates(
+    request: CompactionRequest, proposal: Mapping[str, JsonValue]
+) -> tuple[EvidenceBackedFactCandidate, ...]:
+    """从 proposal 构造 evidence-backed fact candidates。
+
+    :param request: Host compaction request。
+    :param proposal: 已解析 proposal。
+    :returns: fact candidate tuple。
+    :raises ValueError: evidence_refs 不在 request accepted evidence refs 内时抛出。
+    """
+
+    values = _required_sequence(
+        proposal,
+        "evidence_backed_fact_candidates",
+        max_items=MAX_EVIDENCE_BACKED_FACT_CANDIDATES,
+    )
+    candidates: list[EvidenceBackedFactCandidate] = []
+    for index, item in enumerate(values):
+        data = _json_mapping(item, f"evidence_backed_fact_candidates[{index}]")
+        evidence_refs = _bounded_known_refs(
+            _required_string_tuple(data, "evidence_refs"),
+            allowed_refs=request.accepted_evidence_refs,
+            field_name=f"evidence_backed_fact_candidates[{index}].evidence_refs",
+        )
+        candidates.append(
+            EvidenceBackedFactCandidate(
+                candidate_id=_required_string(data, "candidate_id"),
+                claim_text=_required_string(data, "claim_text"),
+                evidence_kind=EvidenceBackedFactKind(
+                    _required_string(data, "evidence_kind")
                 ),
                 evidence_refs=evidence_refs,
-            ),
-            open_questions=PinnedStringTupleFieldPatch(
-                operation=PinnedPatchOperation.REPLACE,
-                value=("continue-current-run",),
-                evidence_refs=evidence_refs,
-            ),
-        ),
-        preservation_evidence=evidence,
-        retained_current_user_input_ref=(
-            request.current_message_summary.current_user_input_ref
-        ),
-        preserved_input_event_refs=request.input_event_refs,
-        preserved_tool_fact_refs=request.tool_fact_refs,
-        preserved_verified_fact_refs=request.verified_fact_refs,
-        dropped_ranges=(),
-        summarized_ranges=summarized_ranges,
-        budget_after_compact=_budget_after_compact(request, summary),
+                attributes=_required_mapping(data, "attributes"),
+            )
+        )
+    return tuple(candidates)
+
+
+def _minimum_preserve_item_candidates(
+    request: CompactionRequest, proposal: Mapping[str, JsonValue]
+) -> tuple[MinimumPreserveItemCandidate, ...]:
+    """从 proposal 构造 minimum preserve item candidates。
+
+    :param request: Host compaction request。
+    :param proposal: 已解析 proposal。
+    :returns: minimum preserve item candidate tuple。
+    """
+
+    values = _required_sequence(
+        proposal,
+        "minimum_preserve_item_candidates",
+        max_items=MAX_MINIMUM_PRESERVE_ITEM_CANDIDATES,
     )
+    candidates: list[MinimumPreserveItemCandidate] = []
+    for index, item in enumerate(values):
+        data = _json_mapping(item, f"minimum_preserve_item_candidates[{index}]")
+        source_refs = _bounded_known_refs(
+            _required_string_tuple(data, "source_refs"),
+            allowed_refs=request.input_event_refs,
+            field_name=f"minimum_preserve_item_candidates[{index}].source_refs",
+        )
+        candidates.append(
+            MinimumPreserveItemCandidate(
+                item_id=_required_string(data, "item_id"),
+                label=_required_string(data, "label"),
+                text=_required_string(data, "text"),
+                source_refs=source_refs,
+                preserve_reason=MinimumPreserveReason(
+                    _required_string(data, "preserve_reason")
+                ),
+            )
+        )
+    return tuple(candidates)
+
+
+def _retained_current_user_input_ref(
+    request: CompactionRequest, proposal: Mapping[str, JsonValue]
+) -> str | None:
+    """读取并校验 retained current user input ref。
+
+    :param request: Host compaction request。
+    :param proposal: 已解析 proposal。
+    :returns: retained current user input ref；JSON null 时为 ``None``。
+    :raises ValueError: ref 不属于当前用户输入时抛出。
+    """
+
+    value = proposal["retained_current_user_input_ref"]
+    if value is None:
+        return None
+    if not isinstance(value, str):
+        raise TypeError("retained_current_user_input_ref must be string or null")
+    if value != request.current_message_summary.current_user_input_ref:
+        raise ValueError(
+            "retained_current_user_input_ref must match request current input"
+        )
+    return value
+
+
+def _text_patch(
+    source: Mapping[str, JsonValue],
+    key: str,
+    evidence_refs: tuple[str, ...],
+) -> PinnedTextFieldPatch:
+    """解析 pinned 文本 patch。
+
+    :param source: JSON object。
+    :param key: patch 字段名。
+    :param evidence_refs: Host-owned evidence refs。
+    :returns: 文本 patch。
+    """
+
+    data = _required_mapping(source, key)
+    operation = PinnedPatchOperation(_required_string(data, "operation"))
+    value = _optional_string_or_none(data, "value")
+    _validate_patch_value(operation, value, field_name=key)
+    return PinnedTextFieldPatch(
+        operation=operation,
+        value=value,
+        evidence_refs=_evidence_refs_for_patch(operation, evidence_refs),
+    )
+
+
+def _string_tuple_patch(
+    source: Mapping[str, JsonValue],
+    key: str,
+    evidence_refs: tuple[str, ...],
+) -> PinnedStringTupleFieldPatch:
+    """解析 pinned 字符串 tuple patch。
+
+    :param source: JSON object。
+    :param key: patch 字段名。
+    :param evidence_refs: Host-owned evidence refs。
+    :returns: 字符串 tuple patch。
+    """
+
+    data = _required_mapping(source, key)
+    operation = PinnedPatchOperation(_required_string(data, "operation"))
+    value = _optional_string_tuple_or_none(data, "value")
+    _validate_patch_value(operation, value, field_name=key)
+    return PinnedStringTupleFieldPatch(
+        operation=operation,
+        value=value,
+        evidence_refs=_evidence_refs_for_patch(operation, evidence_refs),
+    )
+
+
+def _validate_patch_value(
+    operation: PinnedPatchOperation,
+    value: str | tuple[str, ...] | None,
+    *,
+    field_name: str,
+) -> None:
+    """校验 pinned patch 三态 value 约束。
+
+    :param operation: patch 操作。
+    :param value: patch 值。
+    :param field_name: 错误字段名。
+    :returns: ``None``。
+    :raises ValueError: operation 与 value 不匹配时抛出。
+    """
+
+    if operation is PinnedPatchOperation.REPLACE:
+        if value is None:
+            raise ValueError(f"{field_name}.value is required for replace")
+        return
+    if value is not None:
+        raise ValueError(f"{field_name}.value must be null unless replace")
+
+
+def _evidence_refs_for_patch(
+    operation: PinnedPatchOperation, evidence_refs: tuple[str, ...]
+) -> tuple[str, ...]:
+    """根据 patch 操作返回 Host-owned evidence refs。
+
+    :param operation: patch 操作。
+    :param evidence_refs: Host-owned preservation evidence refs。
+    :returns: clear / replace 操作使用 evidence refs，missing 使用空 tuple。
+    """
+
+    if operation is PinnedPatchOperation.MISSING:
+        return ()
+    return evidence_refs
+
+
+def _range_tuple(
+    proposal: Mapping[str, JsonValue],
+    key: str,
+    *,
+    allowed_refs: tuple[str, ...],
+) -> tuple[CompactInputRange, ...]:
+    """解析 compact input range tuple。
+
+    :param proposal: 已解析 proposal。
+    :param key: range 字段名。
+    :param allowed_refs: 允许引用的输入 event refs。
+    :returns: compact input range tuple。
+    :raises ValueError: range endpoint 不在 request 输入 refs 内时抛出。
+    """
+
+    values = _required_sequence(proposal, key, max_items=len(allowed_refs))
+    ranges: list[CompactInputRange] = []
+    for index, item in enumerate(values):
+        data = _json_mapping(item, f"{key}[{index}]")
+        start_ref = _required_string(data, "start_input_ref")
+        end_ref = _required_string(data, "end_input_ref")
+        _bounded_known_refs(
+            (start_ref, end_ref),
+            allowed_refs=allowed_refs,
+            field_name=f"{key}[{index}]",
+        )
+        ranges.append(
+            CompactInputRange(
+                range_ref=_required_string(data, "range_ref"),
+                start_input_ref=start_ref,
+                end_input_ref=end_ref,
+            )
+        )
+    return tuple(ranges)
+
+
+def _required_mapping(
+    source: Mapping[str, JsonValue], key: str
+) -> Mapping[str, JsonValue]:
+    """读取必需 JSON object 字段。
+
+    :param source: JSON object。
+    :param key: 字段名。
+    :returns: JSON object 字段值。
+    :raises KeyError: 字段缺失时抛出。
+    :raises TypeError: 字段不是 object 时抛出。
+    """
+
+    if key not in source:
+        raise KeyError(f"{key} is required")
+    return _json_mapping(source[key], key)
+
+
+def _json_mapping(value: JsonValue, field_name: str) -> Mapping[str, JsonValue]:
+    """校验 JSON 值为 object。
+
+    :param value: JSON 值。
+    :param field_name: 错误字段名。
+    :returns: JSON object。
+    :raises TypeError: 值不是 object 时抛出。
+    """
+
+    if not isinstance(value, Mapping):
+        raise TypeError(f"{field_name} must be object")
+    return value
+
+
+def _required_sequence(
+    source: Mapping[str, JsonValue],
+    key: str,
+    *,
+    max_items: int,
+) -> tuple[JsonValue, ...]:
+    """读取必需 JSON array 字段。
+
+    :param source: JSON object。
+    :param key: 字段名。
+    :param max_items: 数组元素上限。
+    :returns: JSON 值 tuple。
+    :raises KeyError: 字段缺失时抛出。
+    :raises TypeError: 字段不是 array 时抛出。
+    :raises ValueError: 数组超过上限时抛出。
+    """
+
+    if key not in source:
+        raise KeyError(f"{key} is required")
+    value = source[key]
+    if not isinstance(value, list):
+        raise TypeError(f"{key} must be array")
+    if len(value) > max_items:
+        raise ValueError(f"{key} exceeds maximum item count")
+    return tuple(value)
+
+
+def _required_string(source: Mapping[str, JsonValue], key: str) -> str:
+    """读取必需字符串字段。
+
+    :param source: JSON object。
+    :param key: 字段名。
+    :returns: 字符串值。
+    :raises KeyError: 字段缺失时抛出。
+    :raises TypeError: 字段不是字符串时抛出。
+    """
+
+    if key not in source:
+        raise KeyError(f"{key} is required")
+    value = source[key]
+    if not isinstance(value, str):
+        raise TypeError(f"{key} must be string")
+    return value
+
+
+def _optional_string_or_none(
+    source: Mapping[str, JsonValue], key: str
+) -> str | None:
+    """读取可选字符串或 null 字段。
+
+    :param source: JSON object。
+    :param key: 字段名。
+    :returns: 字符串、``None`` 或缺省时的 ``None``。
+    :raises TypeError: 字段既不是字符串也不是 null 时抛出。
+    """
+
+    if key not in source:
+        return None
+    value = source[key]
+    if value is None:
+        return None
+    if not isinstance(value, str):
+        raise TypeError(f"{key} must be string or null")
+    return value
+
+
+def _optional_string_tuple(
+    source: Mapping[str, JsonValue], key: str
+) -> tuple[str, ...]:
+    """读取可选字符串数组字段。
+
+    :param source: JSON object。
+    :param key: 字段名。
+    :returns: 字符串 tuple；缺省时为空 tuple。
+    :raises TypeError: 字段不是字符串数组时抛出。
+    """
+
+    if key not in source:
+        return ()
+    return _string_tuple(source[key], key)
+
+
+def _required_string_tuple(
+    source: Mapping[str, JsonValue], key: str
+) -> tuple[str, ...]:
+    """读取必需字符串数组字段。
+
+    :param source: JSON object。
+    :param key: 字段名。
+    :returns: 字符串 tuple。
+    :raises KeyError: 字段缺失时抛出。
+    :raises TypeError: 字段不是字符串数组时抛出。
+    """
+
+    if key not in source:
+        raise KeyError(f"{key} is required")
+    return _string_tuple(source[key], key)
+
+
+def _optional_string_tuple_or_none(
+    source: Mapping[str, JsonValue], key: str
+) -> tuple[str, ...] | None:
+    """读取字符串数组或 null 字段。
+
+    :param source: JSON object。
+    :param key: 字段名。
+    :returns: 字符串 tuple、``None`` 或缺省时的 ``None``。
+    :raises TypeError: 字段既不是字符串数组也不是 null 时抛出。
+    """
+
+    if key not in source:
+        return None
+    value = source[key]
+    if value is None:
+        return None
+    return _string_tuple(value, key)
+
+
+def _string_tuple(value: JsonValue, field_name: str) -> tuple[str, ...]:
+    """校验 JSON 值为字符串数组。
+
+    :param value: JSON 值。
+    :param field_name: 错误字段名。
+    :returns: 字符串 tuple。
+    :raises TypeError: 值不是字符串数组时抛出。
+    """
+
+    if not isinstance(value, list):
+        raise TypeError(f"{field_name} must be array")
+    strings: list[str] = []
+    for index, item in enumerate(value):
+        if not isinstance(item, str):
+            raise TypeError(f"{field_name}[{index}] must be string")
+        strings.append(item)
+    return tuple(strings)
+
+
+def _bounded_known_refs(
+    refs: tuple[str, ...],
+    *,
+    allowed_refs: tuple[str, ...],
+    field_name: str,
+) -> tuple[str, ...]:
+    """校验 refs 只引用 Host request 中已知 refs。
+
+    :param refs: 待校验 refs。
+    :param allowed_refs: 允许引用的 refs。
+    :param field_name: 错误字段名。
+    :returns: 原 refs。
+    :raises ValueError: 出现未知 ref 时抛出。
+    """
+
+    allowed = frozenset(allowed_refs)
+    for ref in refs:
+        if ref not in allowed:
+            raise ValueError(f"{field_name} contains unknown ref: {ref}")
+    return refs
 
 
 def _preservation_evidence(
@@ -401,7 +978,7 @@ def _preservation_evidence(
         PreservationEvidence(
             evidence_id=f"llm-evidence:{request.run_id}:primary",
             input_event_refs=request.input_event_refs,
-            tool_fact_refs=request.tool_fact_refs,
+            accepted_evidence_refs=request.accepted_evidence_refs,
             memory_snapshot_cursor=request.memory_snapshot_cursor,
             compact_input_range=_input_range(request),
         ),
@@ -424,59 +1001,181 @@ def _input_range(request: CompactionRequest) -> CompactInputRange | None:
     )
 
 
-def _summarized_ranges(request: CompactionRequest) -> tuple[CompactInputRange, ...]:
-    """构造 summarized ranges。
-
-    :param request: Host compaction request。
-    :returns: summarized range tuple。
-    """
-
-    if len(request.older_raw_turn_refs) == 0:
-        return ()
-    return (
-        CompactInputRange(
-            range_ref=f"llm-range:{request.run_id}:older-raw-turns",
-            start_input_ref=request.older_raw_turn_refs[0],
-            end_input_ref=request.older_raw_turn_refs[-1],
-        ),
-    )
-
-
-def _confirmed_fact_summaries(request: CompactionRequest) -> tuple[str, ...]:
-    """构造 confirmed fact summaries。
-
-    :param request: Host compaction request。
-    :returns: confirmed fact summary tuple。
-    """
-
-    return tuple(f"verified:{fact_ref}" for fact_ref in request.verified_fact_refs)
-
-
-def _confirmed_subjects(request: CompactionRequest) -> tuple[str, ...]:
-    """构造 pinned confirmed subjects。
-
-    :param request: Host compaction request。
-    :returns: opaque subject refs。
-    """
-
-    if len(request.verified_fact_refs) > 0:
-        return tuple(f"subject:{fact_ref}" for fact_ref in request.verified_fact_refs)
-    return (f"subject:{request.current_message_summary.current_user_input_ref}",)
-
-
-def _budget_after_compact(request: CompactionRequest, summary: str) -> int:
+def _budget_after_compact(
+    request: CompactionRequest,
+    episode: EpisodeSummaryCandidate,
+    pinned_patch: PinnedStatePatchCandidate,
+    fact_candidates: tuple[EvidenceBackedFactCandidate, ...],
+    preserve_items: tuple[MinimumPreserveItemCandidate, ...],
+) -> int:
     """保守估算 compact 后预算。
 
     :param request: Host compaction request。
-    :param summary: compactor 产出的摘要文本。
+    :param episode: compactor 产出的 episode summary candidate。
+    :param pinned_patch: compactor 产出的 pinned state patch candidate。
+    :param fact_candidates: compactor 产出的 fact candidate 集合。
+    :param preserve_items: compactor 产出的 minimum preserve item 集合。
     :returns: 非负 token 估算。
     """
 
-    return estimate_compacted_context_budget(
-        request,
-        summary=summary,
-        system_prompt=_SYSTEM_PROMPT,
+    structured_output_tokens = sum(
+        _estimate_text_tokens(fragment)
+        for fragment in _structured_output_texts(
+            episode,
+            pinned_patch,
+            fact_candidates,
+            preserve_items,
+        )
     )
+    preserved_tokens = _estimate_preserved_context_tokens(request)
+    return structured_output_tokens + preserved_tokens
+
+
+def _structured_output_texts(
+    episode: EpisodeSummaryCandidate,
+    pinned_patch: PinnedStatePatchCandidate,
+    fact_candidates: tuple[EvidenceBackedFactCandidate, ...],
+    preserve_items: tuple[MinimumPreserveItemCandidate, ...],
+) -> tuple[str, ...]:
+    """收集 structured proposal 中会被保留或物化的 Host-neutral 文本。
+
+    :param episode: episode summary candidate。
+    :param pinned_patch: pinned state patch candidate。
+    :param fact_candidates: fact candidate 集合。
+    :param preserve_items: minimum preserve item 集合。
+    :returns: 待估算 token 的文本片段 tuple。
+    """
+
+    fragments: list[str] = [
+        episode.episode_title,
+        episode.goal,
+        *episode.completed_actions,
+        *episode.confirmed_fact_summaries,
+        *episode.user_constraints,
+        *episode.open_questions,
+        *_optional_text(episode.next_step),
+        *_pinned_patch_texts(pinned_patch),
+    ]
+    for fact_candidate in fact_candidates:
+        fragments.append(fact_candidate.claim_text)
+    for preserve_item in preserve_items:
+        fragments.append(preserve_item.label)
+        fragments.append(preserve_item.text)
+    return tuple(fragments)
+
+
+def _pinned_patch_texts(pinned_patch: PinnedStatePatchCandidate) -> tuple[str, ...]:
+    """收集 pinned patch replace 值中的文本。
+
+    :param pinned_patch: pinned state patch candidate。
+    :returns: pinned patch 文本片段 tuple。
+    """
+
+    fragments: list[str] = []
+    fragments.extend(_optional_text(pinned_patch.current_goal.value))
+    fragments.extend(_optional_string_tuple_texts(pinned_patch.confirmed_subjects.value))
+    fragments.extend(_optional_string_tuple_texts(pinned_patch.user_constraints.value))
+    fragments.extend(_optional_string_tuple_texts(pinned_patch.open_questions.value))
+    return tuple(fragments)
+
+
+def _optional_text(value: str | None) -> tuple[str, ...]:
+    """把可选文本转换为 token 估算片段。
+
+    :param value: 可选文本。
+    :returns: 文本存在时返回单元素 tuple，否则返回空 tuple。
+    """
+
+    if value is None:
+        return ()
+    return (value,)
+
+
+def _optional_string_tuple_texts(value: tuple[str, ...] | None) -> tuple[str, ...]:
+    """把可选字符串 tuple 转换为 token 估算片段。
+
+    :param value: 可选字符串 tuple。
+    :returns: 字符串 tuple；值为 ``None`` 时返回空 tuple。
+    """
+
+    if value is None:
+        return ()
+    return value
+
+
+def _estimate_preserved_context_tokens(request: CompactionRequest) -> int:
+    """估算 compact 后仍保留的 Host-neutral context token。
+
+    该估算只依赖 Slice 3 冻结后的 ``CompactionRequest`` 字段，基于保留
+    引用占比、当前输入和 post-compact 系统提示保守估算 compact 后预算。
+
+    :param request: Host compaction request。
+    :returns: 保留上下文的保守 token 估算。
+    """
+
+    typed_fragment_tokens = sum(
+        _estimate_text_tokens(fragment)
+        for fragment in (
+            _POST_COMPACT_SYSTEM_PROMPT_ESTIMATE,
+            request.current_message_summary.summary_text,
+            request.current_message_summary.current_user_input_ref,
+            *_preserved_ref_texts(request),
+        )
+    )
+    return max(
+        typed_fragment_tokens,
+        _estimate_preserved_share_from_budget(request),
+    )
+
+
+def _preserved_ref_texts(request: CompactionRequest) -> tuple[str, ...]:
+    """返回 compact 后必须保留的引用文本集合。
+
+    :param request: Host compaction request。
+    :returns: 去重后的 ref tuple。
+    """
+
+    preserved_refs = {
+        request.current_message_summary.current_user_input_ref,
+        *request.recent_raw_turn_refs,
+        *request.accepted_evidence_refs,
+        *request.evidence_backed_fact_refs,
+        *request.existing_episode_summary_refs,
+    }
+    return tuple(sorted(preserved_refs))
+
+
+def _estimate_preserved_share_from_budget(request: CompactionRequest) -> int:
+    """按保留引用占比从 compact 前预算中估算保留 token。
+
+    :param request: Host compaction request。
+    :returns: 保留部分 token 估算。
+    """
+
+    source_refs = {
+        *request.input_event_refs,
+        *request.accepted_evidence_refs,
+        *request.evidence_backed_fact_refs,
+        *request.existing_episode_summary_refs,
+    }
+    preserved_refs = set(_preserved_ref_texts(request))
+    if len(source_refs) == 0:
+        return 0
+    retained_count = len(preserved_refs.intersection(source_refs))
+    if retained_count == 0:
+        return 0
+    estimated_tokens = request.budget_before_compact.estimated_input_tokens
+    return ceil(estimated_tokens * retained_count / len(source_refs))
+
+
+def _estimate_text_tokens(text: str) -> int:
+    """按 Host context budget 统一字符/token 常数估算文本。
+
+    :param text: 文本内容。
+    :returns: 至少为 1 的 token 估算。
+    """
+
+    return max(1, ceil(len(text) / DEFAULT_ESTIMATOR_CHARS_PER_TOKEN))
 
 
 __all__ = ["LLMCompactionProposalError", "LLMContextCompactor"]
