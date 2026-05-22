@@ -150,6 +150,10 @@ from dayu.host.durable.transaction import HostTransaction, HostTransactionRunner
 from dayu.host.memory import MemoryProjectionPolicy, default_memory_projection_policy
 from dayu.host.memory_repair import catch_up_conversation_memory_projection
 from dayu.host.payload_resolution import event_payload_object
+from dayu.host.compaction_evidence import (
+    CompactionRequestEvidenceInputs,
+    collect_compaction_request_evidence_inputs,
+)
 from dayu.runtime.log_levels import VERBOSE_LOG_LEVEL
 
 _LOGGER = logging.getLogger(__name__)
@@ -353,6 +357,7 @@ class _ReactiveCompactPending:
     context: _ValidatedCandidate
     expected_input_event_sequence: int
     display_text: str
+    evidence_inputs: CompactionRequestEvidenceInputs
     operation_id: str
     estimate: BudgetEstimate
     decision: ContextBudgetDecision
@@ -1157,6 +1162,13 @@ class EngineEventIngestor:
         )
         if closeout.status is not EngineIngestStatus.ACCEPTED:
             return closeout
+        evidence_inputs = collect_compaction_request_evidence_inputs(
+            transaction,
+            self._event_log_store,
+            session_id=context.run.session_id,
+            start_event_sequence=1,
+            end_event_sequence=context.run.input_event_sequence,
+        )
         return _ReactiveCompactPending(
             result_prefix=EngineIngestResult(
                 status=EngineIngestStatus.ACCEPTED,
@@ -1169,6 +1181,7 @@ class EngineEventIngestor:
             context=context,
             expected_input_event_sequence=context.run.input_event_sequence,
             display_text=display_text,
+            evidence_inputs=evidence_inputs,
             operation_id=requested.event_id,
             estimate=estimate,
             decision=decision,
@@ -2978,8 +2991,8 @@ def _reactive_compaction_request(
             summary_text=pending.display_text,
             source_event_refs=(context.run.input_event_id,),
         ),
-        tool_fact_refs=(),
-        verified_fact_refs=(),
+        accepted_evidence_envelopes=pending.evidence_inputs.accepted_evidence_envelopes,
+        evidence_backed_fact_refs=pending.evidence_inputs.evidence_backed_fact_refs,
         recent_raw_turn_refs=(context.run.input_event_id,),
         older_raw_turn_refs=(),
         existing_episode_summary_refs=(),

@@ -1656,6 +1656,16 @@ Plan 必须额外收口的 readiness review checklist：
   `pytest tests/host/test_memory_projection.py` PASS (47 passed)；targeted pyright PASS (0 errors)。Deferred findings：
   durable snapshot read path 的额外 item-kind SQL validation query 暂留为防御性 residual；future schema relaxations 必须继续保持
   `validate_context_compacted_payload` 与 typed constructor validation 对齐。
+  Slice 6 `RunInputBuilder Rendering And Compaction Request Wiring` implementation / code review / targeted repair / re-review
+  已 PASS；review artifacts 为 `docs/reviews/phase12-5-slice6-code-review-mimo-20260522.md`、
+  `docs/reviews/phase12-5-slice6-code-review-ds-20260522.md`、
+  `docs/reviews/phase12-5-slice6-code-rereview-mimo-20260522.md`、
+  `docs/reviews/phase12-5-slice6-code-rereview-ds-20260522.md`、
+  `docs/reviews/phase12-5-slice6-code-rereview-controller-adjudication-20260522.md`。Slice 6 validation:
+  `pytest tests/host/test_run_input_builder.py tests/host/test_compaction_operation.py` PASS (48 passed)；targeted pyright PASS
+  (0 errors)。Deferred findings：bounded EventLog read 目前以 `start_event_sequence=1` 作为 session 起点保守读取并按 session
+  过滤，Slice 7 / aggregate review 需决定是否派生 session min sequence；no-compaction / post-compaction follow-up 端到端 smoke 仍归
+  Slice 7。
 
 目标：
 - 从买方财报分析 Agent 的第一性原理优化 Conversation Memory，使同一 session 内已由工具确认的关键财务事实能跨轮、

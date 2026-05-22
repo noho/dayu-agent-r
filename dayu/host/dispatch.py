@@ -145,6 +145,9 @@ from dayu.host.context_events import (
     build_context_compaction_requested_payload,
 )
 from dayu.host.context_policy import ContextCompactionTriggerSource
+from dayu.host.compaction_evidence import (
+    collect_compaction_request_evidence_inputs,
+)
 from dayu.host.durable.artifact import LocalArtifactStore
 from dayu.host.tool_runtime import (
     DefaultHostToolFactAcceptPort,
@@ -1239,6 +1242,13 @@ class HostDispatchScheduler:
                 message="Context compactor or artifact store is not configured",
             )
             return None
+        evidence_inputs = collect_compaction_request_evidence_inputs(
+            transaction,
+            self._event_log_store,
+            session_id=run.session_id,
+            start_event_sequence=1,
+            end_event_sequence=run.input_event_sequence,
+        )
         request = CompactionRequest(
             trigger_source=ContextCompactionTriggerSource.PROACTIVE,
             session_id=run.session_id,
@@ -1252,8 +1262,8 @@ class HostDispatchScheduler:
                 summary_text=display_text,
                 source_event_refs=(run.input_event_id,),
             ),
-            tool_fact_refs=(),
-            verified_fact_refs=(),
+            accepted_evidence_envelopes=evidence_inputs.accepted_evidence_envelopes,
+            evidence_backed_fact_refs=evidence_inputs.evidence_backed_fact_refs,
             recent_raw_turn_refs=(run.input_event_id,),
             older_raw_turn_refs=(),
             existing_episode_summary_refs=(),

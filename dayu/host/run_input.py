@@ -112,7 +112,8 @@ _PAYLOAD_FIELD_COMPACT_ARTIFACT_REF = "compact_artifact_ref"
 _PAYLOAD_FIELD_COMPACT_ARTIFACT_DIGEST = "compact_artifact_digest"
 _PAYLOAD_FIELD_EPISODE_SUMMARY_CANDIDATE = "episode_summary_candidate"
 _PAYLOAD_FIELD_PRESERVED_FACT_REFS = "preserved_fact_refs"
-_PAYLOAD_FIELD_TOOL_FACT_REFS = "tool_fact_refs"
+_PAYLOAD_FIELD_ACCEPTED_EVIDENCE_REFS = "accepted_evidence_refs"
+_PAYLOAD_FIELD_EVIDENCE_BACKED_FACT_REFS = "evidence_backed_fact_refs"
 _PAYLOAD_FIELD_CANDIDATE_ID = "candidate_id"
 _PAYLOAD_FIELD_GOAL = "goal"
 _PAYLOAD_FIELD_OPEN_QUESTIONS = "open_questions"
@@ -1565,7 +1566,7 @@ def _memory_messages(
     render_scope: _CurrentMemoryRenderScope,
     policy: MemoryProjectionPolicy,
 ) -> _RenderedMemoryMessages:
-    """按 P9 固定顺序渲染 memory messages。
+    """按稳定优先级渲染 memory messages。
 
     :param snapshot: memory snapshot。
     :param render_scope: 当前 Run memory 渲染排除范围。
@@ -1585,6 +1586,11 @@ def _memory_messages(
             snapshot.conversation_continuity.items, render_scope
         )
     )
+    minimum_preserve = _memory_minimum_preserve_message(
+        snapshot.conversation_continuity.items, render_scope
+    )
+    if minimum_preserve is not None:
+        messages.append(minimum_preserve)
     episode = _memory_episode_summary_message(
         snapshot.conversation_continuity.items, render_scope
     )
@@ -1732,11 +1738,12 @@ def _memory_evidence_backed_fact_message(
     for fact in facts:
         lines.append(
             "fact="
-            f"{fact.fact_summary}; "
-            f"tool={fact.provenance.producer_name}; "
+            f"claim_text={fact.claim_text}; "
+            f"evidence_refs={','.join(fact.evidence_refs)}; "
+            f"evidence_kind={fact.evidence_kind.value}; "
+            f"extraction_operation_ref={fact.extraction_operation_ref}; "
             f"event_id={fact.provenance.event_id}; "
-            f"event_sequence={fact.provenance.event_sequence}; "
-            f"digest_ref={fact.provenance.digest_ref}"
+            f"event_sequence={fact.provenance.event_sequence}"
         )
     return SystemMessage(
         role=AgentMessageRole.SYSTEM,
@@ -1784,7 +1791,11 @@ def _memory_raw_turn_messages(
 
     messages: list[AgentMessage] = []
     for item in items:
-        if item.item_kind is ConversationContinuityKind.EPISODE_SUMMARY:
+        if item.item_kind not in (
+            ConversationContinuityKind.RAW_USER_TURN,
+            ConversationContinuityKind.RAW_ASSISTANT_TURN,
+            ConversationContinuityKind.ASSISTANT_CONCLUSION,
+        ):
             continue
         if _is_current_run_user_input_memory_item(item, render_scope):
             continue
@@ -1803,6 +1814,40 @@ def _memory_raw_turn_messages(
                 )
             )
     return tuple(messages)
+
+
+def _memory_minimum_preserve_message(
+    items: tuple[ConversationContinuityItem, ...],
+    render_scope: _CurrentMemoryRenderScope,
+) -> SystemMessage | None:
+    """渲染 minimum preserve continuity block。
+
+    :param items: continuity items。
+    :param render_scope: 当前 Run memory 渲染排除范围。
+    :returns: system message；无 minimum preserve item 时返回 ``None``。
+    """
+
+    preserve_items = tuple(
+        item
+        for item in items
+        if item.item_kind is ConversationContinuityKind.MINIMUM_PRESERVE_ITEM
+        and not _is_current_run_user_input_memory_item(item, render_scope)
+    )
+    if not preserve_items:
+        return None
+    lines = ["Memory minimum preserve continuity:"]
+    for item in preserve_items:
+        lines.append(
+            "continuity_item="
+            f"label={item.label}; "
+            f"text={_continuity_item_text(item)}; "
+            f"source_refs={','.join(item.source_refs)}; "
+            f"preserve_reason={_preserve_reason_text(item)}"
+        )
+    return SystemMessage(
+        role=AgentMessageRole.SYSTEM,
+        content="\n".join(lines),
+    )
 
 
 def _memory_episode_summary_message(
@@ -1845,6 +1890,18 @@ def _continuity_item_text(item: ConversationContinuityItem) -> str:
     if item.payload_ref is not None and item.payload_digest is not None:
         return f"payload_ref={item.payload_ref}; payload_digest={item.payload_digest}"
     return f"event_ref={item.event_id}"
+
+
+def _preserve_reason_text(item: ConversationContinuityItem) -> str:
+    """读取 minimum preserve reason 的可渲染文本。
+
+    :param item: continuity item。
+    :returns: preserve reason 文本。
+    """
+
+    if item.preserve_reason is None:
+        return "unspecified"
+    return item.preserve_reason.value
 
 
 def _is_current_run_user_input_memory_item(
@@ -2042,7 +2099,7 @@ def _compact_artifact_message_content(
     summary = _optional_summary_text_from_compacted_payload(
         payload, max_summary_chars=max_summary_chars
     )
-    preserved_fact_refs = _preserved_tool_fact_refs_text(payload)
+    preserved_fact_refs = _preserved_fact_refs_text(payload)
     lines = [
         "Accepted compact artifact is available for this run.",
         f"compact_artifact_ref={artifact_ref}",
@@ -2090,8 +2147,8 @@ def _optional_summary_text_from_compacted_payload(
     return text[:max_summary_chars]
 
 
-def _preserved_tool_fact_refs_text(payload: Mapping[str, JsonValue]) -> str:
-    """渲染 preserved tool fact refs。
+def _preserved_fact_refs_text(payload: Mapping[str, JsonValue]) -> str:
+    """渲染 preserved accepted evidence 与 evidence-backed fact refs。
 
     :param payload: compacted payload。
     :returns: 稳定文本。
@@ -2100,7 +2157,17 @@ def _preserved_tool_fact_refs_text(payload: Mapping[str, JsonValue]) -> str:
     value = payload.get(_PAYLOAD_FIELD_PRESERVED_FACT_REFS)
     if not isinstance(value, Mapping):
         return ""
-    return ",".join(_optional_text_list(value, _PAYLOAD_FIELD_TOOL_FACT_REFS))
+    accepted_evidence_refs = _optional_text_list(
+        value, _PAYLOAD_FIELD_ACCEPTED_EVIDENCE_REFS
+    )
+    evidence_backed_fact_refs = _optional_text_list(
+        value, _PAYLOAD_FIELD_EVIDENCE_BACKED_FACT_REFS
+    )
+    parts = [
+        f"accepted_evidence_refs={','.join(accepted_evidence_refs)}",
+        f"evidence_backed_fact_refs={','.join(evidence_backed_fact_refs)}",
+    ]
+    return "; ".join(parts)
 
 
 def _required_text_field(payload: Mapping[str, JsonValue], field_name: str) -> str:

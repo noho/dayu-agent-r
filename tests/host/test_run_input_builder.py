@@ -88,6 +88,7 @@ from dayu.host.durable.state import (
 )
 from dayu.host.durable.errors import HostDurableError
 from dayu.host.durable.transaction import HostRow, HostTransaction, HostTransactionRunner
+from dayu.host.compaction import EvidenceBackedFactKind, MinimumPreserveReason
 from dayu.host.memory_repair import catch_up_conversation_memory_projection
 from dayu.host.run_input import (
     DurableCurrentRunFactProvider,
@@ -507,10 +508,26 @@ def test_durable_memory_provider_uses_covered_snapshot(tmp_path: Path) -> None:
         assert contents[1].startswith("Memory user goals and constraints:")
         assert contents[2].startswith("Memory confirmed subjects and methodology:")
         assert contents[3].startswith("Memory evidence-backed facts:")
+        assert "claim_text=Revenue increased year over year" in contents[3]
+        assert "evidence_refs=evidence:memory-tool" in contents[3]
+        assert "evidence_kind=observed_value" in contents[3]
+        assert "extraction_operation_ref=event:event-memory-episode" in contents[3]
+        assert "event_id=event-memory-episode" in contents[3]
+        assert "event_sequence=5" in contents[3]
+        assert "digest_ref=" not in contents[3]
+        assert "fact_summary=" not in contents[3]
         assert contents[4].startswith("Memory open questions and working assumptions:")
         assert contents[5] == "recent raw user"
         assert contents[6] == "recent assistant conclusion"
-        assert contents[7].startswith("Memory episode summaries:")
+        assert contents[7].startswith("Memory minimum preserve continuity:")
+        assert "label=factor-2" in contents[7]
+        assert "text=second factor: margin mix" in contents[7]
+        assert "source_refs=event-memory-raw-user" in contents[7]
+        assert (
+            "preserve_reason=needed_for_ordered_item_reference"
+            in contents[7]
+        )
+        assert contents[8].startswith("Memory episode summaries:")
         assert contents[-1] == "current prompt"
         assert all("inline delta" not in content for content in contents)
         assert all(
@@ -1222,24 +1239,27 @@ def _rich_memory_snapshot(
         ),
         evidence_backed_facts=(
             EvidenceBackedFactView(
-                item_id="memory-item:verified:test",
-                fact_summary="tool verified revenue increased",
-                claim_status=MemoryClaimStatus.EVIDENCE_BACKED,
+                item_id="memory-item:evidence-backed:test",
+                claim_text="Revenue increased year over year",
+                evidence_kind=EvidenceBackedFactKind.OBSERVED_VALUE,
+                evidence_refs=("evidence:memory-tool",),
+                attributes={},
                 provenance=MemoryProvenanceRef(
-                    producer_kind=MemoryProducerKind.TOOL,
-                    producer_name="filing.lookup",
-                    event_id="event-memory-tool",
-                    event_sequence=1,
+                    producer_kind=MemoryProducerKind.HOST_PROJECTION,
+                    producer_name="conversation_memory",
+                    event_id="event-memory-episode",
+                    event_sequence=5,
                     run_id="run-memory",
-                    attempt_id="attempt-memory",
-                    execution_id="execution-memory",
+                    attempt_id=None,
+                    execution_id=None,
                     tool_result_ref="event-memory-tool",
-                    payload_ref="payload-memory-tool",
+                    payload_ref="compact-artifact:test",
                     digest_ref=_DIGEST_A,
                     source_refs=(),
                 ),
-                evidence_anchor=None,
-                subject_refs=(),
+                extraction_operation_ref="event:event-memory-episode",
+                compact_artifact_ref="compact-artifact:test",
+                candidate_id="fact-memory-revenue",
                 included_reason=MemoryIncludedReason.EVIDENCE_BACKED_FACT,
                 excluded_reason=None,
                 size_units=MemorySizeUnits(31),
@@ -1271,6 +1291,9 @@ def _rich_memory_snapshot(
                     event_sequence=3,
                     run_id="run-memory",
                     summary_text="recent raw user",
+                    label=None,
+                    source_refs=(),
+                    preserve_reason=None,
                     payload_ref=None,
                     payload_digest=None,
                     included_reason=MemoryIncludedReason.RECENT_RAW_TURN,
@@ -1286,11 +1309,34 @@ def _rich_memory_snapshot(
                     event_sequence=4,
                     run_id="run-memory",
                     summary_text="recent assistant conclusion",
+                    label=None,
+                    source_refs=(),
+                    preserve_reason=None,
                     payload_ref=None,
                     payload_digest=None,
                     included_reason=MemoryIncludedReason.RECENT_RAW_TURN,
                     excluded_reason=None,
                     size_units=MemorySizeUnits(27),
+                ),
+                ConversationContinuityItem(
+                    item_id="memory-item:minimum-preserve:test",
+                    item_kind=ConversationContinuityKind.MINIMUM_PRESERVE_ITEM,
+                    producer_kind=MemoryProducerKind.HOST_PROJECTION,
+                    claim_status=MemoryClaimStatus.ASSUMPTION,
+                    event_id="event-memory-episode",
+                    event_sequence=5,
+                    run_id="run-memory",
+                    summary_text="second factor: margin mix",
+                    label="factor-2",
+                    source_refs=("event-memory-raw-user",),
+                    preserve_reason=(
+                        MinimumPreserveReason.NEEDED_FOR_ORDERED_ITEM_REFERENCE
+                    ),
+                    payload_ref=None,
+                    payload_digest=None,
+                    included_reason=MemoryIncludedReason.MINIMUM_PRESERVE_ITEM,
+                    excluded_reason=None,
+                    size_units=MemorySizeUnits(25),
                 ),
                 ConversationContinuityItem(
                     item_id="memory-item:episode:test",
@@ -1301,6 +1347,9 @@ def _rich_memory_snapshot(
                     event_sequence=5,
                     run_id=None,
                     summary_text="episode navigation only",
+                    label=None,
+                    source_refs=(),
+                    preserve_reason=None,
                     payload_ref=None,
                     payload_digest=None,
                     included_reason=MemoryIncludedReason.EPISODE_SUMMARY,
@@ -1371,6 +1420,9 @@ def _current_input_memory_snapshot(
                     event_sequence=current_input.event_sequence,
                     run_id=current_input.run_id,
                     summary_text=current_prompt,
+                    label=None,
+                    source_refs=(),
+                    preserve_reason=None,
                     payload_ref=None,
                     payload_digest=None,
                     included_reason=MemoryIncludedReason.RECENT_RAW_TURN,
@@ -2761,19 +2813,41 @@ def _compact_payload(
             "tool_finding_refs": [],
             "source_event_refs": ["event-memory-raw-user"],
             "evidence_refs": ["evidence-1"],
-            "proposed_verified_fact_refs": [],
+            "proposed_evidence_backed_fact_refs": [],
         },
         "pinned_state_patch_candidate": pinned_patch,
+        "evidence_backed_fact_candidates": [
+            {
+                "candidate_id": "fact-memory-revenue",
+                "claim_text": "Revenue increased year over year",
+                "evidence_kind": "observed_value",
+                "evidence_refs": ["evidence:memory-tool"],
+                "attributes": {},
+            }
+        ],
+        "minimum_preserve_item_candidates": [
+            {
+                "item_id": "preserve-factor-2",
+                "label": "factor-2",
+                "text": "second factor: margin mix",
+                "source_refs": ["event-memory-raw-user"],
+                "preserve_reason": "needed_for_ordered_item_reference",
+            }
+        ],
         "preservation_evidence": [
             {
                 "evidence_id": "evidence-1",
                 "input_event_refs": ["event-memory-raw-user"],
-                "tool_fact_refs": [],
+                "accepted_evidence_refs": ["evidence:memory-tool"],
+                "evidence_backed_fact_refs": [],
                 "memory_snapshot_cursor": None,
                 "compact_input_range": None,
             }
         ],
-        "preserved_fact_refs": {"tool_fact_refs": [], "verified_fact_refs": []},
+        "preserved_fact_refs": {
+            "accepted_evidence_refs": ["evidence:memory-tool"],
+            "evidence_backed_fact_refs": [],
+        },
         "dropped_ranges": [],
         "summarized_ranges": [],
         "evidence_anchors_retained": True,
@@ -2781,10 +2855,12 @@ def _compact_payload(
             "accepted": True,
             "rejection_reasons": [],
             "current_user_input_retained": True,
-            "accepted_tool_fact_refs_retained": True,
+            "accepted_evidence_refs_retained": True,
+            "evidence_backed_fact_candidates_accepted": True,
+            "minimum_preserve_items_accepted": True,
             "evidence_anchors_retained": True,
             "open_questions_retained": True,
-            "retained_evidence_refs": ["evidence-1"],
+            "retained_accepted_evidence_refs": ["evidence:memory-tool"],
             "dropped_ranges": [],
             "summarized_ranges": [],
         },
