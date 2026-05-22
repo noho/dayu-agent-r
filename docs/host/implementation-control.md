@@ -223,8 +223,8 @@ Phase Map 中每个 phase 必须使用统一条目格式。模板如下：
 约束：本节只保留当前 gate 结论；phase 过程流水必须归档到 `历史记录`，仍需追踪的风险或后续 owner 必须写入 `Open Questions 与风险追踪` 的 `追踪区`。
 
 当前 work unit：Phase 12.3 Config Schema / Usage Governance Follow-up。
-当前 gate：ready-to-open-draft-PR。
-下一 gate：用户已授权自动进入 draft PR gate：推送当前分支并创建或更新 draft PR，随后推进到 `draft-PR-pass`。
+当前 gate：draft-PR-pass。
+下一 gate：等待用户额外授权 merge、mark ready for review、request reviewers、delete branch、对外 comment 或进入后续 phase。
 
 当前 gate 追加事实（Phase 12.1 Slice 2 implementation）：Phase 12.1 Slice 2 implementation artifact 为 `docs/reviews/phase12-1-slice2-implementation-codex-20260521.md`；implementation agent 更新 `dayu.runtime.config_loader` 新 schema typed view、runtime location resolver、默认 `models.json` / `execution_profiles.json` / `host_runtime.json` / `runtime_lanes.json` / `tool_discovery.json` 配置、全量旧模型迁移、runtime / engine config tests 与 README。Controller 本地复跑：`pytest tests/runtime/test_config_loader.py tests/runtime/test_runtime_location.py tests/runtime/test_import_boundary.py tests/runtime/test_weak_typing_guard.py -q` 35 passed；`pytest tests/engine/test_config_models.py -q` 4 passed；`python -m pyright dayu/runtime tests/runtime tests/engine/test_config_models.py` 0 errors；`git diff --check` clean。当前进入 Phase 12.1 Slice 2 code review。
 
@@ -567,6 +567,8 @@ Phase Map 中每个 phase 必须使用统一条目格式。模板如下：
 当前 gate 追加事实（Phase 12.3 post-push pyright fix accepted）：用户报告 `utils/smoke_host_public_multiturn.py` 仍访问已删除的 `ServiceOpenHostAssemblyDiagnostics.agent_policy_profile_id`。Fix artifact 为 `docs/reviews/phase12-3-post-push-pyright-fix-codex-20260522.md`；review artifacts 为 `docs/reviews/phase12-3-post-push-pyright-fix-mimo-20260522.md` 与 `docs/reviews/phase12-3-post-push-pyright-fix-review-ds-20260522.md`，两份均 PASS，blocking finding count = 0。Controller adjudication artifact 为 `docs/reviews/phase12-3-post-push-pyright-fix-controller-adjudication-20260522.md`；Controller 本地复跑 `python -m pyright utils/smoke_host_public_multiturn.py` 0 errors，`pytest tests/runtime/test_smoke_host_public_multiturn_assembly.py -q` 4 passed，`git diff --check` clean。当前进入 accepted post-push pyright fix commit。
 
 当前 gate 追加事实（PR 67 Phase 12.3 post-push review accepted）：PR 67 当前为 `https://github.com/noho/dayu-agent-r/pull/67`，draft=true，state=OPEN，mergeStateStatus=CLEAN，headRefOid=`a3d36e8475a48640ae59d301ba8f06f2e000a782`；`gh pr checks 67 --watch=false` reported no checks。Post-push review artifacts 为 `docs/reviews/pr-67-phase12-3-post-push-review-mimo-20260522.md` 与 `docs/reviews/pr-67-phase12-3-post-push-review-ds-20260522.md`，两份均 PASS，blocking finding count = 0。Controller adjudication artifact 为 `docs/reviews/pr-67-phase12-3-post-push-review-controller-adjudication-20260522.md`；总控裁决：无需 PR review fix，MiMo P3 文档格式 / 历史记录观测不阻塞。当前进入 PR 67 accepted post-push review record commit。
+
+当前 gate 追加事实（PR 67 draft-PR-pass）：PR 67 title 已更新为 `Phase 12 runtime assembly and config governance`。PR 67 post-push review record commit 为 `ad2f205`，已推送到 `github/docs/phase12-design-discussion`；`gh pr view 67` 显示 draft=true、state=OPEN、mergeStateStatus=CLEAN、headRefOid=`ad2f205f30d14a29c7c0be05f12854400f4d936c`、statusCheckRollup=[]；`gh pr checks 67 --watch=false` 返回 no checks reported。PR 67 draft PR gate 通过，当前状态为 `draft-PR-pass`。后续 merge、mark ready for review、request reviewers、delete branch、对外 comment 或外部 issue 仍需用户额外授权。
 
 ## Phase Map
 
