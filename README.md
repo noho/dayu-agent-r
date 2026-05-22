@@ -964,7 +964,7 @@ source .venv/bin/activate
 python utils/smoke_host_public_multiturn.py \
   --workspace-root /path/to/workspace \
   --scene-id smoke_host_public_multiturn \
-  --execution-profile-id standard \
+  --execution-profile-id standard-256k \
   --host-runtime-id local \
   --model-id deepseek-v4-flash \
   --runner-option-hint-id interactive
@@ -1108,13 +1108,11 @@ dayu-render workspace/draft/AAPL/AAPL_qual_report.md report.html
         "runner_option_hints": {
           "interactive": {
             "temperature": 0.7,
-            "max_tokens": 4096,
             "top_p": 1.0,
             "stream": true
           },
           "conversation_compaction": {
             "temperature": 0.2,
-            "max_tokens": 2048,
             "top_p": 1.0,
             "stream": false
           }
@@ -1144,7 +1142,7 @@ ConfigLoader 不解析 `${MY_API_KEY}`，也不替换 secret；这些字符串�
 - `provider_request_extension`：provider 私有扩展，按 JSON 原样保留，并由 Engine provider extension helper 映射为 typed contract。
 - `runtime_hints.runner_option_hints`：按语义档位保存 `RunnerCallOptions` 片段，例如 `interactive` 和 `conversation_compaction`。
 
-temperature、max tokens、top-p 和 stream 属于 `models.json` 中 effective model 的 `runtime_hints.runner_option_hints`。`execution_profiles.json` 只保存默认 `model_id` 与 `runner_option_hint_id`。
+Runner option hints 按语义档位保存 temperature、`top_p` 和 stream。`max_tokens` 不在默认模型 hint 中配置，只保留给显式 per-run 或 provider adapter override。`execution_profiles.json` 只保存默认 `model_id` 与 `runner_option_hint_id`。
 
 如果你只是新增一个模型，最稳的办法不是从零设计全部参数，而是复制一个相近模型，再按你的服务商要求做最小改动。
 

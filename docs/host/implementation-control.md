@@ -554,6 +554,14 @@ Phase Map 中每个 phase 必须使用统一条目格式。模板如下：
 
 当前 gate 追加事实（Phase 12.3 Slice 3 accepted）：Accepted Slice 3 local commit hash 为 `342f8ec`。当前进入 Phase 12.3 Slice 4 aggregate validation / residual sweep。
 
+当前 gate 追加事实（Phase 12.3 Slice 4 implementation）：Phase 12.3 Slice 4 implementation artifact 为 `docs/reviews/phase12-3-slice4-implementation-codex-20260522.md`；implementation agent 完成 aggregate validation、旧字段扫描、JSON smoke、focused tests、affected pyright、README sync 与 residual risk 分类，并仅更新根 `README.md` 与 `dayu/config/README.md`。AgentCodex reported：runtime/service/smoke focused tests 56 passed；Host ingest / context budget focused tests 62 passed；Engine config / OpenAI usage tests 15 passed；runtime / engine / host import boundary and weak typing tests 34 passed；`python -m pyright dayu/runtime dayu/service dayu/host dayu/engine tests/runtime tests/service tests/host tests/engine` 0 errors；`git diff --check` clean。当前进入 Phase 12.3 Slice 4 aggregate code review。
+
+当前 gate 追加事实（Phase 12.3 Slice 4 aggregate code review）：Phase 12.3 Slice 4 code review artifacts 为 `docs/reviews/phase12-3-slice4-code-review-mimo-20260522.md` 与 `docs/reviews/phase12-3-slice4-code-review-ds-20260522.md`。MiMo PASS；DS BLOCKED on README.md stale sentence saying `max tokens` belongs to runner option hints. Controller adjudication artifact 为 `docs/reviews/phase12-3-slice4-code-review-controller-adjudication-20260522.md`；总控裁决：接受 P12.3-S4-F1 为当前窄 fix。当前进入 Phase 12.3 Slice 4 fix。
+
+当前 gate 追加事实（Phase 12.3 Slice 4 fix）：P12.3-S4-F1 已修复，fix addendum 已追加到 `docs/reviews/phase12-3-slice4-implementation-codex-20260522.md`；根 `README.md` 已明确 runner option hints 只保存 temperature / `top_p` / stream，`max_tokens` 仅用于显式 per-run 或 provider adapter override。当前进入 Phase 12.3 Slice 4 re-review。
+
+当前 gate 追加事实（Phase 12.3 Slice 4 re-review accepted）：Phase 12.3 Slice 4 re-review artifacts 为 `docs/reviews/phase12-3-slice4-rereview-mimo-20260522.md` 与 `docs/reviews/phase12-3-slice4-rereview-ds-20260522.md`，两份均 PASS，确认 P12.3-S4-F1 已收口且无新增 blocker。Controller re-review adjudication artifact 为 `docs/reviews/phase12-3-slice4-rereview-controller-adjudication-20260522.md`；总控裁决：接受 Slice 4。当前进入 Phase 12.3 Slice 4 accepted local commit。
+
 ## Phase Map
 
 Phase 按依赖关系推进：先实现被其它阶段依赖的公共契约、runtime 基础能力、durable store、EventLog 与状态机，再连接执行路径、工具治理、projection core、memory、context governance、ordinary local multi-turn public contract freeze、recovery 与 remote。Audit、Tool Trace、Outbox 是独立 projection sinks，后置到核心治理路径稳定之后实现。Phase 0 是 Engine cleanup 前置 work unit，只阻塞 Phase 10 Context Governance，不阻塞 Phase 1-9。每个 phase 开始时仍必须先和用户讨论并细化对应 `docs/host/design.md` 章节，再生成 handoff implementation-ready plan。

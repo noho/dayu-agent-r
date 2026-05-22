@@ -92,7 +92,7 @@ dayu/config/
 
 包内默认 profile 按场景与上下文窗口显式分档为 `standard-256k`、`standard-1m`、`wechat-256k` 与 `wechat-1m`。Service / composition root 只能通过显式 override 或 `default_execution_profile_id` 选择 profile；runtime assembly helper 只校验 profile 的 `min_context_window_tokens` 与 effective model 的 `context_window_tokens`，不会按模型窗口自动切换到其它 profile。`256k` profile 搭配 `1m` 模型允许装配，但诊断会标记为保守策略；`1m` profile 搭配低于 `1000000` token 的模型会在调用 Host 前失败。
 
-已删除旧 `agent_policy_profiles`、`agent_policy_profile_id`、`runner_options_profiles`、`runner_hints` 与 `agent_hints` schema；这些字段出现在配置中会加载失败。
+配置只接受上述内嵌 `agent_policy` 与 baseline 结构；历史 catalog、间接引用或全局 runner/agent hint 结构出现在配置中都会加载失败。
 
 ## host_runtime.json
 
