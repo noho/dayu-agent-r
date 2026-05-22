@@ -164,7 +164,7 @@ class SSEParser:
         self._terminated: bool = False
         self._tool_calls_seen: bool = False
         self._utf8_decoder: codecs.IncrementalDecoder = (
-            codecs.getincrementaldecoder("utf-8")(errors="strict")
+            codecs.getincrementaldecoder("utf-8-sig")(errors="strict")
         )
 
     async def parse(
@@ -182,7 +182,9 @@ class SSEParser:
             try:
                 text = self._utf8_decoder.decode(chunk, final=False)
             except UnicodeDecodeError:
-                async for event in self._handle_invalid_utf8(chunk):
+                async for event in self._handle_invalid_utf8(
+                    chunk, final_decode=False
+                ):
                     yield event
                 return
             self._line_carry += text
@@ -201,7 +203,9 @@ class SSEParser:
         try:
             tail = self._utf8_decoder.decode(b"", final=True)
         except UnicodeDecodeError:
-            async for event in self._handle_invalid_utf8(b""):
+            async for event in self._handle_invalid_utf8(
+                b"", final_decode=True
+            ):
                 yield event
             return
         if tail:
@@ -221,20 +225,32 @@ class SSEParser:
             yield event
 
     async def _handle_invalid_utf8(
-        self, chunk: bytes
+        self, chunk: bytes, *, final_decode: bool
     ) -> AsyncIterator[RunnerEvent]:
-        """非法 UTF-8 chunk → 协议错误 + Done(ERROR) 收口。"""
+        """非法 UTF-8 chunk → 协议错误 + Done(ERROR) 收口。
 
+        :param chunk: 触发解码失败的当前字节片段；final flush 失败时为空。
+        :param final_decode: 是否发生在流尾 flush 阶段。
+        :returns: 协议错误与 Done(ERROR) 事件。
+        """
+
+        error_code = "truncated_utf8_tail" if final_decode else "invalid_utf8"
+        message = (
+            "SSE stream ended with an incomplete UTF-8 sequence"
+            if final_decode
+            else "failed to decode SSE chunk as UTF-8"
+        )
         _LOGGER.warning(
-            "sse.protocol_error code=invalid_utf8 chunk_len=%d",
+            "sse.protocol_error code=%s chunk_len=%d",
+            error_code,
             len(chunk),
         )
         encoded = base64.b64encode(chunk).decode("ascii")
-        raw_payload: JsonValue = {"chunk_base64": encoded}
+        raw_payload: JsonValue = {"chunk_base64": encoded, "final_decode": final_decode}
         yield _make_event(
             RunnerProtocolErrorData(
-                error_code="invalid_utf8",
-                message="failed to decode SSE chunk as UTF-8",
+                error_code=error_code,
+                message=message,
                 provider_request_id=self._provider_request_id,
                 raw_payload=raw_payload,
                 partial_tool_calls=self._aggregator.partial_summaries(),

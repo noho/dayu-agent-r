@@ -491,8 +491,26 @@ class _OpenHostContextManager(AbstractAsyncContextManager[Host]):
                 exc_info=True,
             )
             if scheduler is not None:
-                await scheduler.close()
-            durable_store.close()
+                try:
+                    await scheduler.close()
+                except Exception as cleanup_exc:
+                    _LOGGER.error(
+                        "host.open.cleanup_scheduler_failed host_handle_id=%s "
+                        "error_type=%s",
+                        host_handle_id,
+                        cleanup_exc.__class__.__name__,
+                        exc_info=True,
+                    )
+            try:
+                durable_store.close()
+            except Exception as cleanup_exc:
+                _LOGGER.error(
+                    "host.open.cleanup_durable_store_failed host_handle_id=%s "
+                    "error_type=%s",
+                    host_handle_id,
+                    cleanup_exc.__class__.__name__,
+                    exc_info=True,
+                )
             raise
 
     async def __aexit__(

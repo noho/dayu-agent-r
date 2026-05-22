@@ -50,6 +50,10 @@ def test_failure_envelope_rejects_empty_error_or_message() -> None:
         ToolResultFailure(
             ok=False, error="E_X", message="  ", hint=None, meta=None
         )
+    with pytest.raises(ValueError, match="hint"):
+        ToolResultFailure(
+            ok=False, error="E_X", message="x", hint=" \n", meta=None
+        )
 
 
 def test_tool_result_meta_rejects_empty_tool_name_and_reversed_time() -> None:
@@ -67,6 +71,20 @@ def test_tool_result_meta_rejects_empty_tool_name_and_reversed_time() -> None:
             tool_name="lookup",
             started_at=started_at,
             finished_at=started_at - timedelta(seconds=1),
+        )
+
+
+def test_tool_result_meta_rejects_mixed_naive_and_aware_times() -> None:
+    """工具结果元信息不得混合 naive 与 aware datetime。"""
+
+    aware = datetime(2026, 5, 19, 1, 2, 3, tzinfo=UTC)
+    naive = datetime(2026, 5, 19, 1, 2, 3)
+
+    with pytest.raises(ValueError, match="timezone-aware"):
+        ToolResultMeta(
+            tool_name="lookup",
+            started_at=aware,
+            finished_at=naive,
         )
 
 

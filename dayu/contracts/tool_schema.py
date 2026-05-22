@@ -51,6 +51,20 @@ class ToolParametersSchema:
     required: tuple[str, ...]
     additional_properties: bool | None
 
+    def __post_init__(self) -> None:
+        """校验工具参数 schema 的最小结构一致性。
+
+        :returns: ``None``。
+        :raises ValueError: ``required`` 中字段不属于 ``properties`` 时抛出。
+        """
+
+        property_names = set(self.properties.keys())
+        for field_name in self.required:
+            if field_name not in property_names:
+                raise ValueError(
+                    "ToolParametersSchema.required fields must exist in properties"
+                )
+
 
 @dataclass(frozen=True, slots=True)
 class ToolFunctionSchema:

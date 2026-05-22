@@ -6,7 +6,23 @@ from typing import cast
 
 import pytest
 
-from dayu.contracts.tool_schema import ToolTruncateSpec, ToolTruncationStrategy
+from dayu.contracts.tool_schema import (
+    ToolParametersSchema,
+    ToolTruncateSpec,
+    ToolTruncationStrategy,
+)
+
+
+def test_tool_parameters_schema_requires_fields_inside_properties() -> None:
+    """required 字段必须属于 properties，避免发布非法 LLM schema。"""
+
+    with pytest.raises(ValueError, match="required"):
+        ToolParametersSchema(
+            type="object",
+            properties={"known": {"type": "string"}},
+            required=("missing",),
+            additional_properties=False,
+        )
 
 
 def test_enabled_truncate_spec_requires_enum_strategy_and_matching_limit() -> None:

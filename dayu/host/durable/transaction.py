@@ -298,31 +298,50 @@ class HostTransactionRunner:
 
         :param operation: transaction body。
         :returns: ``operation`` 的返回值。
+        :raises HostTransactionRetryExhaustedError: busy / locked 重试耗尽时抛出。
         :raises HostDurableError: SQLite read transaction 失败时抛出结构化错误。
         :raises Exception: operation 抛出的非 durable 错误会在 rollback 后透传。
         """
 
-        try:
-            self._connection.execute("BEGIN")
-            result = operation(
-                HostTransaction(
-                    self._connection,
-                    payload_inline_threshold_bytes=(
-                        self._payload_inline_threshold_bytes
-                    ),
+        attempt = 0
+        max_attempts = self._sqlite_policy.write_busy_retry_count + 1
+        delay_seconds = self._sqlite_policy.write_retry_initial_delay_seconds
+        while True:
+            attempt += 1
+            try:
+                self._connection.execute("BEGIN")
+                result = operation(
+                    HostTransaction(
+                        self._connection,
+                        payload_inline_threshold_bytes=(
+                            self._payload_inline_threshold_bytes
+                        ),
+                    )
                 )
-            )
-            self._connection.execute("COMMIT")
-        except sqlite3.Error as exc:
-            _rollback(self._connection)
-            raise _classify_sqlite_error(exc) from exc
-        except HostDurableError:
-            _rollback(self._connection)
-            raise
-        except Exception:
-            _rollback(self._connection)
-            raise
-        return result
+                self._connection.execute("COMMIT")
+            except sqlite3.Error as exc:
+                _rollback(self._connection)
+                if _is_busy_or_locked(exc):
+                    if attempt >= max_attempts:
+                        raise HostTransactionRetryExhaustedError(
+                            "Host durable read transaction busy retry exhausted",
+                            attempts=attempt,
+                        ) from exc
+                    time.sleep(delay_seconds)
+                    delay_seconds = min(
+                        delay_seconds
+                        * self._sqlite_policy.write_retry_backoff_multiplier,
+                        self._sqlite_policy.write_retry_max_delay_seconds,
+                    )
+                    continue
+                raise _classify_sqlite_error(exc) from exc
+            except HostDurableError:
+                _rollback(self._connection)
+                raise
+            except Exception:
+                _rollback(self._connection)
+                raise
+            return result
 
 
 def configure_connection_pragmas(

@@ -978,7 +978,7 @@ source .venv/bin/activate
 python utils/smoke_host_public_multiturn.py --log-level DEBUG
 ```
 
-该脚本不是 pytest，不断言模型固定回答。它会在调用 Host 前打印 assembly diagnostics，包括 config overlay、prompt root、scene manifest root、Host runtime id、execution profile id、model id、runner option hint id、lane name、tool provider report、tool selection、policy refs、compact pressure 摘要和 provider extension DSL 映射状态。运行后会打印 Session / Run / terminal HostEvent 摘要、final answer 预览、compact artifact 路径；脚本不输出 API key、headers、完整 prompt 或 provider payload。
+该脚本不是 pytest，不断言模型固定回答。它会在调用 Host 前打印 assembly diagnostics，包括 config overlay、prompt root、scene manifest root、Host runtime id、execution profile id、model id、runner option hint id、lane name、tool provider report、tool selection、policy refs、compact pressure 摘要和 provider extension DSL 映射状态。运行后会打印 Session / Run / terminal HostEvent 摘要、final answer 预览、compact artifact 路径；terminal failed 时只打印错误码、短消息、reason、诊断引用等失败摘要。脚本不输出 API key、headers、完整 prompt 或 provider payload。
 
 ### 5.2 Engine provider smoke
 

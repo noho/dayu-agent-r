@@ -45,6 +45,38 @@ def _sse_json_chunk(payload_json: str) -> bytes:
 
 
 @pytest.mark.asyncio
+async def test_sse_accepts_utf8_bom_before_first_data_line() -> None:
+    """SSE parser 必须接受流开头 UTF-8 BOM。"""
+
+    payload_json = json.dumps(
+        {"choices": [{"finish_reason": "stop", "delta": {"content": "ok"}}]},
+        separators=(",", ":"),
+    )
+    events = await parse_sse(
+        [b"\xef\xbb\xbf" + _sse_json_chunk(payload_json), b"data: [DONE]\n\n"],
+        provider_request_id="req_bom",
+    )
+
+    assert events[0].type is RunnerEventType.RUNNER_CONTENT_DELTA
+    assert events[-1].type is RunnerEventType.RUNNER_DONE
+
+
+@pytest.mark.asyncio
+async def test_sse_incomplete_utf8_tail_reports_truncated_tail() -> None:
+    """流尾残缺 UTF-8 要给出比普通 chunk 解码失败更准确的诊断。"""
+
+    events = await parse_sse([b"data: \xe4"], provider_request_id="req_tail")
+
+    assert [event.type for event in events] == [
+        RunnerEventType.PROVIDER_PROTOCOL_ERROR,
+        RunnerEventType.RUNNER_DONE,
+    ]
+    error = events[0].data
+    assert isinstance(error, RunnerProtocolErrorData)
+    assert error.error_code == "truncated_utf8_tail"
+
+
+@pytest.mark.asyncio
 async def test_sse_invalid_json_emits_protocol_error() -> None:
     """SSE ``data:`` 行非合法 JSON → 立即 Done(ERROR)，不再处理后续 chunk。"""
 

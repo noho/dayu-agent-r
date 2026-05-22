@@ -462,17 +462,15 @@ async def test_fake_tool_result_returns_only_after_accepted_ack() -> None:
 
 
 @pytest.mark.asyncio
-async def test_oversized_tool_result_returns_governed_diagnostic_outcome() -> None:
-    """超大工具结果不进入 Engine inline message，而是转为治理诊断 outcome。"""
+async def test_oversized_tool_result_returns_completed_outcome_without_default_governance() -> None:
+    """无显式截断时超大工具结果原样返回给 Engine。"""
 
     oversized_value = {"content": "x" * 70000}
     callable_ = _CountingCallable(oversized_value)
     accept_port = _SequencedAcceptPort((_accepted_ack_for_call("tool-call-1"),))
-    diagnostics = InMemoryToolTraceDiagnosticEmitter()
     executor = _executor(
         callable_,
         accept_port,
-        diagnostic_emitter=diagnostics,
     )
 
     outcome = await executor.execute(_request(_call("tool-call-1")))
@@ -481,22 +479,14 @@ async def test_oversized_tool_result_returns_governed_diagnostic_outcome() -> No
     assert callable_.call_count == 1
     assert len(accept_port.candidates) == 1
     candidate = accept_port.candidates[0]
-    assert candidate.tool_fact_kind is ToolFactKind.GOVERNED_ERROR
-    assert candidate.policy_decision.reason_code == (
-        "tool_result_inline_size_limit_exceeded"
-    )
-    assert candidate.policy_decision.message is not None
-    assert oversized_value["content"] not in candidate.policy_decision.message
-    assert diagnostics.records[0].reason_code == (
-        "tool_result_inline_size_limit_exceeded"
-    )
-    assert isinstance(record.outcome, ToolFailedOutcome)
-    assert record.outcome.result.error == "tool_call_governed"
-    assert oversized_value["content"] not in record.outcome.result.message
+    assert candidate.tool_fact_kind is ToolFactKind.COMPLETED
+    assert candidate.policy_decision.kind is ToolPolicyDecisionKind.ALLOW
+    assert isinstance(record.outcome, ToolCompletedOutcome)
+    assert record.outcome.result.value == oversized_value
 
 
-def test_fetch_more_rejects_oversized_inline_continuation() -> None:
-    """fetch_more 不允许无上限返回超大 inline continuation。"""
+def test_fetch_more_returns_oversized_continuation_without_default_inline_limit() -> None:
+    """fetch_more 不再复用 durable payload inline 阈值拒绝 continuation。"""
 
     spec = ToolTruncateSpec(
         enabled=True,
@@ -542,13 +532,12 @@ def test_fetch_more_rejects_oversized_inline_continuation() -> None:
         _request(_call("tool-call-1")).context,
     )
 
-    assert isinstance(fetched, ToolFailedOutcome)
-    assert fetched.result.error == "truncation_error"
-    assert fetched.result.hint == "tool_result_inline_size_limit_exceeded"
+    assert isinstance(fetched, ToolCompletedOutcome)
+    assert fetched.result.value == "x" * (_OVERSIZED_INLINE_TEXT_LENGTH - 1)
 
 
-def test_truncation_discards_cursor_when_inline_result_still_too_large() -> None:
-    """截断后 inline outcome 仍超限时清理已创建 cursor。"""
+def test_truncation_keeps_cursor_when_visible_result_is_large_by_explicit_spec() -> None:
+    """显式截断 spec 的大可见结果不再被默认 inline 阈值二次拒绝。"""
 
     spec = ToolTruncateSpec(
         enabled=True,
@@ -578,9 +567,9 @@ def test_truncation_discards_cursor_when_inline_result_still_too_large() -> None
         spec,
     )
 
-    assert isinstance(applied.outcome, ToolFailedOutcome)
-    assert applied.cursor_hint is None
-    assert manager._cursors == {}
+    assert isinstance(applied.outcome, ToolCompletedOutcome)
+    assert applied.cursor_hint is not None
+    assert applied.cursor_hint in manager._cursors
 
 
 @pytest.mark.asyncio

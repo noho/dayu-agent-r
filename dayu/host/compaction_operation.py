@@ -7,6 +7,8 @@
 
 from __future__ import annotations
 
+import logging
+import re
 from dataclasses import dataclass
 
 from dayu.host.compaction import (
@@ -25,6 +27,15 @@ _NEXT_DECISION_RETRY_REPAIR = "retry_semantic_repair"
 _NEXT_DECISION_FAIL_COMPACTION = "fail_compaction"
 _DIAGNOSTIC_SUFFIX_UNKNOWN = "unknown"
 _DIAGNOSTIC_SUFFIX_HARD_THRESHOLD = "hard_threshold"
+_MAX_SAFE_EXCEPTION_MESSAGE_CHARS = 240
+_TRUNCATED_SUFFIX = "..."
+_REDACTED_SECRET = "<redacted>"
+_BEARER_SECRET_PATTERN = re.compile(r"(?i)bearer\s+[A-Za-z0-9._~+/=-]+")
+_ASSIGNMENT_SECRET_PATTERN = re.compile(
+    r"(?i)((?:api[_-]?key|authorization|token|secret)\s*[:=]\s*)[^,\s}\]]+"
+)
+_ERROR_CODE_PATTERN = re.compile(r"\berror_code=([A-Za-z0-9_-]+)")
+_LOGGER = logging.getLogger(__name__)
 
 
 @dataclass(frozen=True, slots=True)
@@ -94,16 +105,20 @@ async def run_compaction_operation(
         try:
             candidate = await compactor.compact(request)
         except Exception as exc:
-            rejected.append(
-                _attempt_rejected(
-                    request=request,
-                    attempt_number=attempt_number,
-                    failure_category=_FAILURE_PROPOSAL_FAILED,
-                    repairable=repairable,
-                    next_policy_decision=next_decision,
-                    budget_after_attempted_compact=None,
-                    diagnostic_suffix=_exception_diagnostic_suffix(exc),
-                )
+            rejected_attempt = _attempt_rejected(
+                request=request,
+                attempt_number=attempt_number,
+                failure_category=_FAILURE_PROPOSAL_FAILED,
+                repairable=repairable,
+                next_policy_decision=next_decision,
+                budget_after_attempted_compact=None,
+                diagnostic_suffix=_exception_diagnostic_suffix(exc),
+            )
+            rejected.append(rejected_attempt)
+            _log_rejected_attempt(
+                request=request,
+                rejected=rejected_attempt,
+                exception=exc,
             )
             if repairable:
                 continue
@@ -117,16 +132,20 @@ async def run_compaction_operation(
         quality = check_compaction_candidate(request, candidate)
         last_budget = candidate.budget_after_compact
         if not quality.accepted:
-            rejected.append(
-                _attempt_rejected(
-                    request=request,
-                    attempt_number=attempt_number,
-                    failure_category=_FAILURE_QUALITY_CHECK_REJECTED,
-                    repairable=repairable,
-                    next_policy_decision=next_decision,
-                    budget_after_attempted_compact=candidate.budget_after_compact,
-                    diagnostic_suffix=_quality_suffix(quality),
-                )
+            rejected_attempt = _attempt_rejected(
+                request=request,
+                attempt_number=attempt_number,
+                failure_category=_FAILURE_QUALITY_CHECK_REJECTED,
+                repairable=repairable,
+                next_policy_decision=next_decision,
+                budget_after_attempted_compact=candidate.budget_after_compact,
+                diagnostic_suffix=_quality_suffix(quality),
+            )
+            rejected.append(rejected_attempt)
+            _log_rejected_attempt(
+                request=request,
+                rejected=rejected_attempt,
+                exception=None,
             )
             if repairable:
                 continue
@@ -141,16 +160,20 @@ async def run_compaction_operation(
             candidate.budget_after_compact
             >= request.budget_before_compact.hard_threshold_tokens
         ):
-            rejected.append(
-                _attempt_rejected(
-                    request=request,
-                    attempt_number=attempt_number,
-                    failure_category=_FAILURE_HARD_THRESHOLD_AFTER_COMPACT,
-                    repairable=repairable,
-                    next_policy_decision=next_decision,
-                    budget_after_attempted_compact=candidate.budget_after_compact,
-                    diagnostic_suffix=_DIAGNOSTIC_SUFFIX_HARD_THRESHOLD,
-                )
+            rejected_attempt = _attempt_rejected(
+                request=request,
+                attempt_number=attempt_number,
+                failure_category=_FAILURE_HARD_THRESHOLD_AFTER_COMPACT,
+                repairable=repairable,
+                next_policy_decision=next_decision,
+                budget_after_attempted_compact=candidate.budget_after_compact,
+                diagnostic_suffix=_DIAGNOSTIC_SUFFIX_HARD_THRESHOLD,
+            )
+            rejected.append(rejected_attempt)
+            _log_rejected_attempt(
+                request=request,
+                rejected=rejected_attempt,
+                exception=None,
             )
             if repairable:
                 continue
@@ -238,6 +261,88 @@ def _exception_diagnostic_suffix(exc: Exception) -> str:
     if message == "":
         return exc.__class__.__name__
     return f"{exc.__class__.__name__}:{message}"
+
+
+def _log_rejected_attempt(
+    *,
+    request: CompactionRequest,
+    rejected: CompactionAttemptRejected,
+    exception: Exception | None,
+) -> None:
+    """记录 compaction attempt 拒绝摘要。
+
+    :param request: Host compaction request。
+    :param rejected: attempt reject 摘要。
+    :param exception: proposal 异常；非异常类拒绝时为 ``None``。
+    :returns: ``None``。
+    :raises Exception: 不主动抛出异常。
+    """
+
+    log_message = (
+        "host.compaction_operation.attempt_rejected "
+        "session_id=%s run_id=%s trigger_source=%s attempt_number=%s "
+        "failure_category=%s repairable=%s error_code=%s message=%s "
+        "diagnostic_refs=%s next_policy_decision=%s "
+        "budget_after_attempted_compact=%s"
+    )
+    args = (
+        request.session_id,
+        request.run_id,
+        request.trigger_source.value,
+        rejected.attempt_number,
+        rejected.failure_category,
+        rejected.repairable,
+        _exception_error_code(exception),
+        _safe_exception_message(exception),
+        ",".join(rejected.diagnostic_refs),
+        rejected.next_policy_decision,
+        rejected.budget_after_attempted_compact,
+    )
+    if rejected.repairable:
+        _LOGGER.warning(log_message, *args)
+    else:
+        _LOGGER.error(log_message, *args)
+
+
+def _exception_error_code(exc: Exception | None) -> str:
+    """从 proposal 异常中提取可诊断错误码。
+
+    :param exc: proposal 异常；无异常时为 ``None``。
+    :returns: 机器可读错误码。
+    :raises Exception: 不主动抛出异常。
+    """
+
+    if exc is None:
+        return "none"
+    match = _ERROR_CODE_PATTERN.search(str(exc))
+    if match is not None:
+        return match.group(1)
+    return exc.__class__.__name__
+
+
+def _safe_exception_message(exc: Exception | None) -> str:
+    """构造脱敏 proposal 异常摘要。
+
+    :param exc: proposal 异常；无异常时为 ``None``。
+    :returns: 可进入日志的有界短文本。
+    :raises Exception: 不主动抛出异常。
+    """
+
+    if exc is None:
+        return "none"
+    message = str(exc)
+    if message.strip() == "":
+        return exc.__class__.__name__
+    redacted = _BEARER_SECRET_PATTERN.sub(
+        f"Bearer {_REDACTED_SECRET}", message
+    )
+    redacted = _ASSIGNMENT_SECRET_PATTERN.sub(
+        rf"\1{_REDACTED_SECRET}", redacted
+    )
+    if len(redacted) <= _MAX_SAFE_EXCEPTION_MESSAGE_CHARS:
+        return redacted
+    body_length = _MAX_SAFE_EXCEPTION_MESSAGE_CHARS - len(_TRUNCATED_SUFFIX)
+    return redacted[:body_length] + _TRUNCATED_SUFFIX
 
 
 __all__ = [

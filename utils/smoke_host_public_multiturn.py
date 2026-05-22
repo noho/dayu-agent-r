@@ -701,6 +701,15 @@ async def _run_round(
     )
     event = await _next_terminal_for_run(watcher, accepted.accepted_run_id)
     if event.kind is not HostEventKind.SUCCEEDED:
+        print(
+            "SMOKE ROUND_FAILED "
+            + await _terminal_failure_summary(
+                host=host,
+                event=event,
+                run_id=accepted.accepted_run_id,
+                label=label,
+            )
+        )
         raise RuntimeError(
             f"round {label} terminal kind is {event.kind.value}; "
             f"run_id={accepted.accepted_run_id}"
@@ -708,6 +717,65 @@ async def _run_round(
     if event.final_answer is None or event.final_answer.content.strip() == "":
         raise RuntimeError(f"round {label} returned empty final answer")
     return RoundResult(label=label, run_id=accepted.accepted_run_id, event=event)
+
+
+async def _terminal_failure_summary(
+    *,
+    host: Host,
+    event: HostEvent,
+    run_id: str,
+    label: str,
+) -> str:
+    """构造 terminal failed 的脱敏短摘要。
+
+    :param host: public Host handle。
+    :param event: terminal HostEvent。
+    :param run_id: 目标 Run id。
+    :param label: smoke 轮次标签。
+    :returns: 可直接打印的一行短摘要。
+    :raises Exception: public ``get_run`` 失败时向上抛出。
+    """
+
+    snapshot = await host.get_run(run_id)
+    terminal_summary = snapshot.terminal_result_summary
+    summary_ref = (
+        terminal_summary.summary_ref
+        if terminal_summary is not None
+        else None
+    )
+    summary_digest = (
+        terminal_summary.summary_digest
+        if terminal_summary is not None
+        else None
+    )
+    message = _safe_summary_text(event.error_message)
+    return (
+        f"label={label} run_id={run_id} kind={event.kind.value} "
+        f"terminal_status={event.terminal_status.value if event.terminal_status is not None else 'unknown'} "
+        f"event_id={event.event_id} event_sequence={event.event_sequence} "
+        f"message={message!r} terminal_summary_ref={summary_ref!r} "
+        f"terminal_summary_digest={summary_digest!r}"
+    )
+
+
+def _safe_summary_text(text: str | None) -> str:
+    """脱敏并截断 smoke 失败摘要文本。
+
+    :param text: Host public error message。
+    :returns: 安全短文本。
+    :raises Exception: 不主动抛出异常。
+    """
+
+    if text is None or text.strip() == "":
+        return "none"
+    secret_markers = ("api_key", "apikey", "authorization", "bearer ", "token", "secret")
+    lowered = text.lower()
+    if any(marker in lowered for marker in secret_markers):
+        return "<redacted>"
+    max_length = 240
+    if len(text) <= max_length:
+        return text
+    return text[:max_length] + "..."
 
 
 async def _next_terminal_for_run(

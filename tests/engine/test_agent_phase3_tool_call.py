@@ -959,8 +959,8 @@ async def test_completed_tool_call_injects_messages_and_reaches_final() -> None:
 
 
 @pytest.mark.asyncio
-async def test_oversized_tool_message_fails_before_next_runner_call() -> None:
-    """工具结果注入 messages 后，下一轮 Runner 调用前必须被 inline guard 拦截。"""
+async def test_oversized_tool_message_is_passed_to_next_runner_call() -> None:
+    """工具结果注入 messages 后由 Runner/provider 边界处理容量。"""
 
     executor = _RecordingToolExecutor(
         outcomes={
@@ -975,17 +975,19 @@ async def test_oversized_tool_message_fails_before_next_runner_call() -> None:
 
     events = await _collect(_AsyncAgent(request=_request(executor=executor), runner=runner))
 
-    failure = _failed_data(events)
-    assert failure.error_code == "context_compaction_required"
-    assert failure.recoverable is True
-    assert runner.call_count == 1
+    terminal = _terminal(events)
+    assert terminal.type is EngineEventType.FINAL_ANSWER
+    second_messages = runner.messages_seen[1]
+    assert isinstance(second_messages[-1], ToolMessage)
+    assert "x" * _OVERSIZED_INLINE_CONTENT_LENGTH in second_messages[-1].content
+    assert runner.call_count == 2
     assert runner.close_count == 1
     assert len(executor.requests) == 1
 
 
 @pytest.mark.asyncio
-async def test_oversized_tool_message_fails_before_force_answer_runner_call() -> None:
-    """force-answer fallback 前也必须先执行 inline message size guard。"""
+async def test_oversized_tool_message_is_passed_to_force_answer_runner_call() -> None:
+    """force-answer fallback 不再执行 Engine 私有 inline byte 阈值。"""
 
     executor = _RecordingToolExecutor(
         outcomes={
@@ -1005,10 +1007,13 @@ async def test_oversized_tool_message_fails_before_force_answer_runner_call() ->
         )
     )
 
-    failure = _failed_data(events)
-    assert failure.error_code == "context_compaction_required"
-    assert failure.recoverable is True
-    assert runner.call_count == 1
+    terminal = _terminal(events)
+    assert terminal.type is EngineEventType.FINAL_ANSWER
+    second_messages = runner.messages_seen[1]
+    assert isinstance(second_messages[-2], ToolMessage)
+    assert "x" * _OVERSIZED_INLINE_CONTENT_LENGTH in second_messages[-2].content
+    assert isinstance(second_messages[-1], UserMessage)
+    assert runner.call_count == 2
     assert runner.close_count == 1
     assert len(executor.requests) == 1
 

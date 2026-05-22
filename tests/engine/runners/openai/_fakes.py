@@ -62,6 +62,34 @@ class FakeContent:
             return b""
         return self.chunks.popleft()
 
+    async def read(self, size: int = -1) -> bytes:
+        """最多读取指定字节数。
+
+        :param size: 最大读取字节数；负数表示读取剩余全部。
+        :returns: 读取到的字节串；耗尽时返回 ``b""``。
+        """
+
+        if not self.chunks:
+            return b""
+        if size < 0:
+            chunks = tuple(self.chunks)
+            self.chunks.clear()
+            return b"".join(chunks)
+        if size == 0:
+            return b""
+        collected: list[bytes] = []
+        remaining = size
+        while self.chunks and remaining > 0:
+            chunk = self.chunks.popleft()
+            if len(chunk) <= remaining:
+                collected.append(chunk)
+                remaining -= len(chunk)
+                continue
+            collected.append(chunk[:remaining])
+            self.chunks.appendleft(chunk[remaining:])
+            remaining = 0
+        return b"".join(collected)
+
 
 class FakeResponse:
     """模拟 ``aiohttp.ClientResponse`` 的最小子集。

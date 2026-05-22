@@ -394,7 +394,18 @@ class WaitPoller:
                 source=WaitResolutionSource.POLL,
                 observed_at=self._clock.now(),
             )
-            self._resolver.resolve_wait(record.wait_id, request)
+            try:
+                self._resolver.resolve_wait(record.wait_id, request)
+            except Exception as exc:
+                _LOGGER.warning(
+                    "wait poll resolve failed; continuing wait_id=%s "
+                    "adapter_key=%s error_type=%s",
+                    record.wait_id,
+                    record.adapter_key.value,
+                    exc.__class__.__name__,
+                )
+                adapter_errors += 1
+                continue
             if isinstance(poll_result, WaitPollLost):
                 lost += 1
             else:

@@ -65,9 +65,6 @@ from dayu.host.durable.errors import (
     HostPayloadReferenceError,
     HostTransactionRetryExhaustedError,
 )
-from dayu.host.durable.options import (
-    _DEFAULT_PAYLOAD_INLINE_THRESHOLD_BYTES as _DEFAULT_INLINE_TOOL_RESULT_MAX_BYTES,
-)
 from dayu.host.durable.event_log import (
     EventClass,
     EventLogAppendRequest,
@@ -158,7 +155,7 @@ _MIN_ACCEPT_RETRY_ATTEMPTS = 1
 _MIN_ACCEPT_BACKOFF_SECONDS = 0.0
 _DEFAULT_ACCEPT_RETRY_ATTEMPTS = 2
 _DEFAULT_ACCEPT_BACKOFF_SECONDS = 0.0
-_MAX_LLM_INLINE_TOOL_RESULT_BYTES = _DEFAULT_INLINE_TOOL_RESULT_MAX_BYTES
+_TOOL_RESULT_SIZE_LOG_THRESHOLD_BYTES = 65536
 _TOOL_RUNTIME_GOVERNED_ERROR = "host_tool_governed_error"
 _TOOL_RUNTIME_POLICY_BLOCKED_ERROR = "tool_call_governed"
 _TOOL_RUNTIME_ACCEPT_REJECTED_ERROR = "tool_accept_rejected"
@@ -172,7 +169,6 @@ _TOOL_RUNTIME_IDEMPOTENCY_REASON = "tool_idempotency_key_required"
 _TOOL_RUNTIME_UNSUPPORTED_AWAITING_REASON = "unsupported_awaiting"
 _TOOL_RUNTIME_AWAITING_BINDING_REASON = "awaiting_adapter_not_configured"
 _TOOL_RUNTIME_AWAITING_EXTERNAL_JOB_REASON = "awaiting_external_job_missing"
-_TOOL_RUNTIME_RESULT_TOO_LARGE_REASON = "tool_result_inline_size_limit_exceeded"
 _TOOL_RUNTIME_AWAITING_BATCH_SUSPENDED_REASON = "run_suspended_by_tool_awaiting"
 _TOOL_RUNTIME_CANCELLED_REASON = "tool_runtime_cancelled"
 _TOOL_RUNTIME_TIMEOUT_REASON = "tool_runtime_timeout"
@@ -1407,19 +1403,6 @@ class TruncationManager:
                 meta=outcome.result.meta,
             )
         )
-        if (
-            _tool_outcome_inline_size_bytes(truncated_outcome)
-            > _MAX_LLM_INLINE_TOOL_RESULT_BYTES
-        ):
-            self._cursors.pop(cursor.cursor_id, None)
-            return TruncationAppliedOutcome(
-                outcome=_truncation_failure(
-                    _TOOL_RUNTIME_RESULT_TOO_LARGE_REASON,
-                    "truncated tool result exceeded LLM inline size limit",
-                ),
-                cursor_hint=None,
-                fact=None,
-            )
         fact = ToolTruncationFact(
             applied=True,
             strategy=strategy.value,
@@ -1468,15 +1451,6 @@ class TruncationManager:
         fetched_outcome = ToolCompletedOutcome(
             result=ToolResultSuccess(ok=True, value=fetched, meta=None)
         )
-        if (
-            _tool_outcome_inline_size_bytes(fetched_outcome)
-            > _MAX_LLM_INLINE_TOOL_RESULT_BYTES
-        ):
-            self._cleanup_expired_cursors(datetime.now(UTC))
-            return _truncation_failure(
-                _TOOL_RUNTIME_RESULT_TOO_LARGE_REASON,
-                "fetch_more result exceeded LLM inline size limit",
-            )
         if cursor.single_use:
             self._cursors.pop(cursor.cursor_id, None)
         self._cleanup_expired_cursors(datetime.now(UTC))
@@ -2538,8 +2512,11 @@ class ToolRuntimeExecutor:
             self._effective_bundle.truncate_specs_by_name.get(call.name),
         )
         accepted_outcome = truncation.outcome
-        bounded_result = self._govern_inline_tool_result(
-            accepted_outcome, policy_decision
+        bounded_result = self._observe_llm_inline_tool_result(
+            call=call,
+            outcome=accepted_outcome,
+            policy_decision=policy_decision,
+            truncation_fact=truncation.fact,
         )
         accepted_outcome = bounded_result.outcome
         policy_decision = bounded_result.policy_decision
@@ -2577,42 +2554,59 @@ class ToolRuntimeExecutor:
             outcome=governed,
         )
 
-    def _govern_inline_tool_result(
+    def _observe_llm_inline_tool_result(
         self,
+        *,
+        call: ToolCallRequest,
         outcome: ToolExecutionOutcome,
         policy_decision: ToolPolicyDecision,
+        truncation_fact: ToolTruncationFact | None,
     ) -> "_InlineToolResultGovernance":
-        """对将返回给 Engine 的工具结果执行 inline 大小治理。
+        """记录 LLM-facing 工具结果大小摘要，不执行默认 inline 治理。
 
-        :param outcome: 截断后准备进入 accept barrier 的工具 outcome。
+        :param call: 当前工具调用。
+        :param outcome: 准备进入 accept barrier 并返回给 Engine 的工具 outcome。
         :param policy_decision: 当前工具治理决策。
-        :returns: 治理后的 outcome、policy decision 与诊断引用。
+        :param truncation_fact: 显式截断产生的事实；未截断时为 ``None``。
+        :returns: 原样 outcome、policy decision 与空诊断引用。
         """
 
-        if _tool_outcome_inline_size_bytes(outcome) <= _MAX_LLM_INLINE_TOOL_RESULT_BYTES:
-            return _InlineToolResultGovernance(
-                outcome=outcome,
-                policy_decision=policy_decision,
-                diagnostic_refs=(),
+        size_bytes = _tool_outcome_inline_size_bytes(outcome)
+        if truncation_fact is not None and truncation_fact.applied:
+            _LOGGER.debug(
+                "host.tool_runtime.truncation_applied session_id=%s "
+                "run_id=%s attempt_id=%s tool_name=%s tool_call_id=%s "
+                "strategy=%s outcome_size_bytes=%s cursor_hint_present=%s",
+                self._execution_scope.session_id,
+                self._execution_scope.run_id,
+                self._execution_scope.attempt_id,
+                call.name,
+                call.tool_call_id,
+                truncation_fact.strategy,
+                size_bytes,
+                truncation_fact.cursor_hint is not None,
             )
-        diagnostic_ref = self._diagnostic_emitter.emit(
-            ToolTraceDiagnosticRecord(
-                reason_code=_TOOL_RUNTIME_RESULT_TOO_LARGE_REASON,
-                message=(
-                    "tool result exceeded LLM inline size limit; use "
-                    "truncation, fetch_more limits, payload ref, or artifact ref"
-                ),
+        elif (
+            isinstance(outcome, ToolCompletedOutcome)
+            and size_bytes > _TOOL_RESULT_SIZE_LOG_THRESHOLD_BYTES
+        ):
+            _LOGGER.log(
+                VERBOSE_LOG_LEVEL,
+                "host.tool_runtime.large_tool_result_passthrough session_id=%s "
+                "run_id=%s attempt_id=%s tool_name=%s tool_call_id=%s "
+                "outcome_size_bytes=%s truncate_spec_present=%s",
+                self._execution_scope.session_id,
+                self._execution_scope.run_id,
+                self._execution_scope.attempt_id,
+                call.name,
+                call.tool_call_id,
+                size_bytes,
+                call.name in self._effective_bundle.truncate_specs_by_name,
             )
-        )
-        governed_decision = ToolPolicyDecision(
-            kind=ToolPolicyDecisionKind.GOVERNED_ERROR,
-            reason_code=_TOOL_RUNTIME_RESULT_TOO_LARGE_REASON,
-            message="tool result exceeded LLM inline size limit",
-        )
         return _InlineToolResultGovernance(
-            outcome=_governed_failure_outcome(governed_decision),
-            policy_decision=governed_decision,
-            diagnostic_refs=(diagnostic_ref,),
+            outcome=outcome,
+            policy_decision=policy_decision,
+            diagnostic_refs=(),
         )
 
     async def _dispatch_tool_call_with_bounds(

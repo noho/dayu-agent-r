@@ -21,6 +21,7 @@ from utils.smoke_host_public_multiturn import (
     _ensure_request,
     _print_assembly_diagnostics,
     _prepare_runtime_assembly,
+    _safe_summary_text,
     _threshold_tokens,
     _tool_pressure_estimated_tokens,
     discover_smoke_tools,
@@ -200,6 +201,14 @@ def test_find_smoke_tool_only_inspects_passed_tool_bundle() -> None:
 
     assert _find_smoke_tool(discovered_bundle) is not None
     assert _find_smoke_tool(ToolBundle(definitions=())) is None
+
+
+def test_smoke_failure_summary_redacts_sensitive_message() -> None:
+    """smoke 失败摘要不得打印 provider header 或 key 类敏感文本。"""
+
+    assert _safe_summary_text("Authorization: Bearer sk-test") == "<redacted>"
+    long_text = "x" * 260
+    assert _safe_summary_text(long_text).endswith("...")
 
 
 def _args(workspace_root: pathlib.Path, *, reuse_session: bool = False) -> SmokeArgs:

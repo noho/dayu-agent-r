@@ -895,6 +895,14 @@ class LaneController:
                         self._mark_token_lost(token)
                         continue
                     except RuntimeLaneError as exc:
+                        _LOGGER.error(
+                            "runtime_lane.heartbeat_failed lane_name=%s "
+                            "claim_id=%s error_type=%s",
+                            token.name,
+                            token.claim_id,
+                            exc.__class__.__name__,
+                            exc_info=True,
+                        )
                         self._record_heartbeat_error(exc)
                         return
         except asyncio.CancelledError:

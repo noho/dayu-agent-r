@@ -44,9 +44,14 @@ class ToolBundleSourceRef:
         """校验来源引用的最小完整性。
 
         :returns: 无返回值。
+        :raises TypeError: ``source_kind`` 类型非法时抛出。
         :raises ValueError: ``source_id`` 为空，或可选字符串存在但为空时抛出。
         """
 
+        if not isinstance(self.source_kind, ToolBundleSourceKind):
+            raise TypeError(
+                "ToolBundleSourceRef.source_kind must be ToolBundleSourceKind"
+            )
         _require_non_empty_text(self.source_id, field_name="ToolBundleSourceRef.source_id")
         _require_optional_non_empty_text(self.version_ref, field_name="ToolBundleSourceRef.version_ref")
         _require_optional_non_empty_text(

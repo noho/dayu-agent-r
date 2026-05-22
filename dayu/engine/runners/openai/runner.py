@@ -83,6 +83,8 @@ _LOGGER: logging.Logger = logging.getLogger(__name__)
 _SSE_CONTENT_TYPE_FRAGMENT: str = "text/event-stream"
 _JSON_CONTENT_TYPE_FRAGMENT: str = "json"
 _PROVIDER_REQUEST_ID_HEADER_NAMES: tuple[str, ...] = ("x-request-id",)
+# HTTP error body 只用于诊断与 JSON 错误对象解析，必须显式有界读取。
+_HTTP_ERROR_BODY_MAX_BYTES: int = 65_536
 
 _AwaitableResult = TypeVar("_AwaitableResult")
 
@@ -875,12 +877,7 @@ class AsyncOpenAIRunner:
         :raises Exception: 不主动抛出异常。
         """
 
-        try:
-            message_text = await await_or_cancel(
-                response.text(), token=self._token
-            )
-        except (aiohttp.ClientError, asyncio.TimeoutError, UnicodeDecodeError):
-            return _HTTPErrorBody(message_text="", raw_payload=None)
+        message_text = await self._safe_read_error_body_bytes(response)
         try:
             decoded: JsonValue = json.loads(message_text)
         except json.JSONDecodeError:
@@ -891,6 +888,31 @@ class AsyncOpenAIRunner:
                 raw_payload=decoded,
             )
         return _HTTPErrorBody(message_text=message_text, raw_payload=None)
+
+    async def _safe_read_error_body_bytes(
+        self, response: aiohttp.ClientResponse
+    ) -> str:
+        """显式有界读取错误响应体并保留可诊断文本。
+
+        :param response: HTTP 错误响应。
+        :returns: 用 UTF-8 replacement decode 得到的有界文本；读取失败时为空。
+        :raises _RunnerInterrupted: cancellation token 命中时由 await 适配器抛出。
+        """
+
+        chunks: list[bytes] = []
+        remaining = _HTTP_ERROR_BODY_MAX_BYTES
+        try:
+            while remaining > 0:
+                chunk = await await_or_cancel(
+                    response.content.read(remaining), token=self._token
+                )
+                if not chunk:
+                    break
+                chunks.append(chunk)
+                remaining -= len(chunk)
+        except (aiohttp.ClientError, asyncio.TimeoutError):
+            return ""
+        return b"".join(chunks).decode("utf-8", errors="replace")
 
     def _make_http_error_event(
         self,
