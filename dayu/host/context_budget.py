@@ -36,6 +36,8 @@ DEFAULT_ESTIMATOR_CHARS_PER_TOKEN = 3
 DEFAULT_ESTIMATOR_JSON_BYTES_PER_TOKEN = 3
 DEFAULT_ESTIMATOR_MESSAGE_OVERHEAD_TOKENS = 12
 DEFAULT_ESTIMATOR_TOOL_SCHEMA_OVERHEAD_TOKENS = 16
+USAGE_OBSERVATION_STATUS_OBSERVED = "observed"
+USAGE_OBSERVATION_STATUS_ESTIMATE_UNAVAILABLE = "estimate_unavailable"
 _MIN_SOFT_THRESHOLD_TOKENS = 1
 
 
@@ -229,6 +231,7 @@ class UsageObservation:
     :param run_id: Run id。
     :param attempt_id: Attempt id。
     :param execution_id: execution id。
+    :param iteration_id: Engine iteration id。
     :param prompt_tokens: provider 报告的 prompt token 数。
     :param completion_tokens: provider 报告的 completion token 数。
     :param total_tokens: provider 报告的 total token 数。
@@ -242,6 +245,7 @@ class UsageObservation:
     run_id: str
     attempt_id: str
     execution_id: str
+    iteration_id: str
     prompt_tokens: int
     completion_tokens: int
     total_tokens: int
@@ -262,6 +266,7 @@ class UsageObservation:
         _require_non_empty(self.run_id, field_name="UsageObservation.run_id")
         _require_non_empty(self.attempt_id, field_name="UsageObservation.attempt_id")
         _require_non_empty(self.execution_id, field_name="UsageObservation.execution_id")
+        _require_non_empty(self.iteration_id, field_name="UsageObservation.iteration_id")
         _require_non_negative_int(
             self.prompt_tokens, field_name="UsageObservation.prompt_tokens"
         )
@@ -282,6 +287,107 @@ class UsageObservation:
         )
         _require_non_empty(self.policy_ref, field_name="UsageObservation.policy_ref")
         _require_utc_datetime(self.observed_at, field_name="UsageObservation.observed_at")
+
+
+@dataclass(frozen=True, slots=True)
+class UsageObservationDiagnostic:
+    """Runner usage observation 的诊断与校准数据。
+
+    :param observation_digest: usage observation 与估算关联的稳定 digest。
+    :param estimator_digest: 对应估算 digest；估算不可用时为 ``None``。
+    :param policy_ref: 对应 Host context budget policy ref。
+    :param estimated_input_tokens: 对应估算输入 token 数；估算不可用时为 ``None``。
+    :param prompt_token_delta: provider prompt token 与估算输入 token 的差值；
+        估算不可用时为 ``None``。
+    :param status: observation 诊断状态。
+    """
+
+    observation_digest: str
+    estimator_digest: str | None
+    policy_ref: str
+    estimated_input_tokens: int | None
+    prompt_token_delta: int | None
+    status: str
+
+    def __post_init__(self) -> None:
+        """校验 usage observation diagnostic。
+
+        :returns: ``None``。
+        :raises TypeError: token 字段类型非法时抛出。
+        :raises ValueError: 字符串为空或 token 为负数时抛出。
+        """
+
+        _require_non_empty(
+            self.observation_digest,
+            field_name="UsageObservationDiagnostic.observation_digest",
+        )
+        _require_optional_non_empty(
+            self.estimator_digest,
+            field_name="UsageObservationDiagnostic.estimator_digest",
+        )
+        _require_non_empty(
+            self.policy_ref,
+            field_name="UsageObservationDiagnostic.policy_ref",
+        )
+        if self.estimated_input_tokens is not None:
+            _require_non_negative_int(
+                self.estimated_input_tokens,
+                field_name="UsageObservationDiagnostic.estimated_input_tokens",
+            )
+        if self.prompt_token_delta is not None:
+            _require_int(
+                self.prompt_token_delta,
+                field_name="UsageObservationDiagnostic.prompt_token_delta",
+            )
+        _require_non_empty(self.status, field_name="UsageObservationDiagnostic.status")
+
+
+def build_usage_observation_diagnostic(
+    observation: UsageObservation,
+    *,
+    estimated_input_tokens: int | None,
+    status: str,
+) -> UsageObservationDiagnostic:
+    """根据 usage observation 生成 post-call 诊断与校准数据。
+
+    本函数只计算诊断数据，不调用 ``decide_context_budget``，不返回
+    ``ContextBudgetDecision``，也不修改传入的估算或 observation。
+
+    :param observation: Host internal usage observation。
+    :param estimated_input_tokens: 对应估算输入 token 数；估算不可用时为
+        ``None``。
+    :param status: observation 诊断状态。
+    :returns: usage observation diagnostic。
+    :raises TypeError: 输入类型或 token 字段非法时抛出。
+    :raises ValueError: 字符串为空、token 为负数或 digest 计算失败时抛出。
+    """
+
+    if not isinstance(observation, UsageObservation):
+        raise TypeError("observation must be UsageObservation")
+    if estimated_input_tokens is not None:
+        _require_non_negative_int(
+            estimated_input_tokens,
+            field_name="estimated_input_tokens",
+        )
+    _require_non_empty(status, field_name="status")
+    prompt_token_delta = (
+        observation.prompt_tokens - estimated_input_tokens
+        if estimated_input_tokens is not None
+        else None
+    )
+    return UsageObservationDiagnostic(
+        observation_digest=_usage_observation_digest(
+            observation=observation,
+            estimated_input_tokens=estimated_input_tokens,
+            prompt_token_delta=prompt_token_delta,
+            status=status,
+        ),
+        estimator_digest=observation.estimator_digest,
+        policy_ref=observation.policy_ref,
+        estimated_input_tokens=estimated_input_tokens,
+        prompt_token_delta=prompt_token_delta,
+        status=status,
+    )
 
 
 def estimate_context_budget(
@@ -490,6 +596,59 @@ def _estimator_digest(
     return sha256_digest_json(payload)
 
 
+def _usage_observation_digest(
+    *,
+    observation: UsageObservation,
+    estimated_input_tokens: int | None,
+    prompt_token_delta: int | None,
+    status: str,
+) -> str:
+    """计算 usage observation diagnostic digest。
+
+    :param observation: usage observation。
+    :param estimated_input_tokens: 对应估算输入 token 数。
+    :param prompt_token_delta: provider prompt token 与估算输入 token 差值。
+    :param status: observation 诊断状态。
+    :returns: sha256 digest。
+    """
+
+    payload: JsonValue = {
+        "observation": {
+            "session_id": observation.session_id,
+            "run_id": observation.run_id,
+            "attempt_id": observation.attempt_id,
+            "execution_id": observation.execution_id,
+            "iteration_id": observation.iteration_id,
+            "prompt_tokens": observation.prompt_tokens,
+            "completion_tokens": observation.completion_tokens,
+            "total_tokens": observation.total_tokens,
+            "provider_request_id": observation.provider_request_id,
+            "observed_at": observation.observed_at.isoformat(),
+        },
+        "diagnostic": {
+            "estimator_digest": observation.estimator_digest,
+            "policy_ref": observation.policy_ref,
+            "estimated_input_tokens": estimated_input_tokens,
+            "prompt_token_delta": prompt_token_delta,
+            "status": status,
+        },
+    }
+    return sha256_digest_json(payload)
+
+
+def _require_int(value: int, *, field_name: str) -> None:
+    """校验严格整数，允许负数。
+
+    :param value: 待校验值。
+    :param field_name: 错误消息字段名。
+    :returns: ``None``。
+    :raises TypeError: ``value`` 不是严格整数时抛出。
+    """
+
+    if isinstance(value, bool) or not isinstance(value, int):
+        raise TypeError(f"{field_name} must be int")
+
+
 def _require_tuple_items(
     value: tuple[BudgetTextFragment, ...] | tuple[BudgetJsonFragment, ...],
     item_type: type[BudgetTextFragment] | type[BudgetJsonFragment],
@@ -541,6 +700,10 @@ __all__ = [
     "DEFAULT_ESTIMATOR_TOOL_SCHEMA_OVERHEAD_TOKENS",
     "DEFAULT_INPUT_SOFT_THRESHOLD_RATIO",
     "UsageObservation",
+    "UsageObservationDiagnostic",
+    "USAGE_OBSERVATION_STATUS_ESTIMATE_UNAVAILABLE",
+    "USAGE_OBSERVATION_STATUS_OBSERVED",
+    "build_usage_observation_diagnostic",
     "decide_context_budget",
     "estimate_context_budget",
 ]

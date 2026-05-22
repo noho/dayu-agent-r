@@ -247,6 +247,8 @@ Memory 的边界是 Host-neutral：它不导入 Engine / Fins / Service / UI，�
 
 Context Governance 是 Host 责任。它根据 `ContextBudgetPolicy`、conservative estimator、memory snapshot、tool facts、当前用户输入和 compact artifact refs 进行上下文预算治理。
 
+Runner usage 进入 Host 后只写 `USAGE_REPORTED` projection signal，并附带 Session / Run / Attempt / execution、policy ref、estimator digest、估算输入 token 与 observation digest 等诊断字段。usage 是 post-call observation，只用于后续估算校准、diagnostic 和后续治理参考；缺少 policy、input event 或估算失败时 projection 仍提交为 `estimate_unavailable`，不改变当前 Run / Attempt 状态，也不回改当前 dispatch decision。
+
 当前已实现两类 compaction 路径：
 
 - proactive：dispatch Attempt 前执行输入治理，必要时写入 compact request / compacted / failed canonical facts，再创建 Attempt。

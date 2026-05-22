@@ -73,6 +73,11 @@ from dayu.host.context_budget import (
     BudgetEstimateInput,
     BudgetTextFragment,
     ContextBudgetDecision,
+    UsageObservation,
+    UsageObservationDiagnostic,
+    USAGE_OBSERVATION_STATUS_ESTIMATE_UNAVAILABLE,
+    USAGE_OBSERVATION_STATUS_OBSERVED,
+    build_usage_observation_diagnostic,
     decide_context_budget,
     estimate_context_budget,
 )
@@ -196,6 +201,8 @@ _RECOVERY_FAILURE_POLICY_DECISION = "reactive_compact_failed"
 _OWNER_PHASE7 = "phase7"
 _OWNER_PHASE10 = "phase10"
 _DEFAULT_MEMORY_PROJECTION_CATCHUP_BATCH_SIZE = 100
+_NO_CONTEXT_BUDGET_POLICY_REF = "none"
+_USAGE_OBSERVATION_STATUS_USAGE_INVALID = "usage_invalid"
 
 
 class EngineIngestStatus(StrEnum):
@@ -2032,6 +2039,11 @@ class EngineEventIngestor:
         """
 
         candidate = context.candidate
+        diagnostic = self._usage_observation_diagnostic(
+            transaction,
+            context=context,
+            data=data,
+        )
         return self._event_log_store.append_event(
             transaction,
             _event_request(
@@ -2045,16 +2057,151 @@ class EngineEventIngestor:
                 event_class=EventClass.PROJECTION_SIGNAL,
                 event_type="USAGE_REPORTED",
                 payload={
+                    "session_id": context.run.session_id,
+                    "run_id": context.run.run_id,
                     "attempt_id": context.attempt.attempt_id,
                     "execution_id": context.attempt.execution_id,
                     "iteration_id": data.iteration_id,
                     "prompt_tokens": data.prompt_tokens,
                     "completion_tokens": data.completion_tokens,
                     "total_tokens": data.total_tokens,
+                    "provider_request_id": None,
+                    "policy_ref": diagnostic.policy_ref,
+                    "estimator_digest": diagnostic.estimator_digest,
+                    "estimated_input_tokens": diagnostic.estimated_input_tokens,
+                    "usage_observation_status": diagnostic.status,
+                    "usage_observation_digest": diagnostic.observation_digest,
+                    "prompt_token_delta": diagnostic.prompt_token_delta,
                 },
                 reason=None,
             ),
         ).row
+
+    def _usage_observation_diagnostic(
+        self,
+        transaction: HostTransaction,
+        *,
+        context: _ValidatedCandidate,
+        data: UsageReportedData,
+    ) -> UsageObservationDiagnostic:
+        """构造 usage observation diagnostic，失败时降级为估算不可用。
+
+        :param transaction: 当前 Host transaction。
+        :param context: 已校验 candidate 上下文。
+        :param data: usage_reported data。
+        :returns: usage observation diagnostic。
+        """
+
+        estimate = self._estimate_usage_observation_input(transaction, context)
+        policy_ref = (
+            self._context_budget_policy.policy_ref
+            if self._context_budget_policy is not None
+            else _NO_CONTEXT_BUDGET_POLICY_REF
+        )
+        estimator_digest = estimate.estimator_digest if estimate is not None else None
+        estimated_input_tokens = (
+            estimate.estimated_input_tokens if estimate is not None else None
+        )
+        status = (
+            USAGE_OBSERVATION_STATUS_OBSERVED
+            if estimate is not None
+            else USAGE_OBSERVATION_STATUS_ESTIMATE_UNAVAILABLE
+        )
+        try:
+            observation = UsageObservation(
+                session_id=context.run.session_id,
+                run_id=context.run.run_id,
+                attempt_id=context.attempt.attempt_id,
+                execution_id=context.attempt.execution_id,
+                iteration_id=data.iteration_id,
+                prompt_tokens=data.prompt_tokens,
+                completion_tokens=data.completion_tokens,
+                total_tokens=data.total_tokens,
+                provider_request_id=None,
+                estimator_digest=estimator_digest,
+                policy_ref=policy_ref,
+                observed_at=context.candidate.observed_at,
+            )
+            return build_usage_observation_diagnostic(
+                observation,
+                estimated_input_tokens=estimated_input_tokens,
+                status=status,
+            )
+        except (TypeError, ValueError):
+            _LOGGER.debug(
+                (
+                    "host.engine_ingest.usage_observation_invalid "
+                    "session_id=%s run_id=%s attempt_id=%s execution_id=%s"
+                ),
+                context.run.session_id,
+                context.run.run_id,
+                context.attempt.attempt_id,
+                context.attempt.execution_id,
+                exc_info=True,
+            )
+            return UsageObservationDiagnostic(
+                observation_digest=_invalid_usage_observation_digest(
+                    context=context,
+                    data=data,
+                    estimated_input_tokens=estimated_input_tokens,
+                    policy_ref=policy_ref,
+                    estimator_digest=estimator_digest,
+                ),
+                estimator_digest=estimator_digest,
+                policy_ref=policy_ref,
+                estimated_input_tokens=estimated_input_tokens,
+                prompt_token_delta=None,
+                status=_USAGE_OBSERVATION_STATUS_USAGE_INVALID,
+            )
+
+    def _estimate_usage_observation_input(
+        self, transaction: HostTransaction, context: _ValidatedCandidate
+    ) -> BudgetEstimate | None:
+        """为 usage observation 尝试重建当前 Run 输入估算。
+
+        :param transaction: 当前 Host transaction。
+        :param context: 已校验 candidate 上下文。
+        :returns: 估算结果；policy、input event 或 payload 不可用时返回
+            ``None``。
+        """
+
+        policy = self._context_budget_policy
+        if policy is None:
+            return None
+        input_event = self._event_log_store.read_event_by_id(
+            transaction, context.run.input_event_id
+        )
+        if input_event is None:
+            return None
+        try:
+            display_text = _display_text_from_input_event(transaction, input_event)
+            return estimate_context_budget(
+                policy,
+                BudgetEstimateInput(
+                    session_id=context.run.session_id,
+                    run_id=context.run.run_id,
+                    message_fragments=(
+                        BudgetTextFragment(
+                            fragment_ref=context.run.input_event_id,
+                            text=display_text,
+                        ),
+                    ),
+                    current_prompt_ref=context.run.input_event_id,
+                ),
+            )
+        except (HostDurableError, TypeError, ValueError):
+            _LOGGER.debug(
+                (
+                    "host.engine_ingest.usage_observation_estimate_unavailable "
+                    "session_id=%s run_id=%s attempt_id=%s execution_id=%s"
+                ),
+                context.run.session_id,
+                context.run.run_id,
+                context.attempt.attempt_id,
+                context.attempt.execution_id,
+                exc_info=True,
+            )
+            return None
 
     def _append_provider_protocol_error(
         self,
@@ -2937,13 +3084,55 @@ def _display_text_from_input_event(
     :param transaction: 当前 Host transaction。
     :param event: input EventLog row。
     :returns: 展示文本。
-    :raises ValueError: payload 缺少展示文本时抛出。
+    :raises HostDurableError: payload 缺少展示文本或无法解析时抛出。
     """
 
     payload = event_payload_object(
         transaction, event, payload_label="USER_INPUT_ACCEPTED"
     )
     return _required_payload_text(payload, field_name="display_text")
+
+
+def _invalid_usage_observation_digest(
+    *,
+    context: _ValidatedCandidate,
+    data: UsageReportedData,
+    estimated_input_tokens: int | None,
+    policy_ref: str,
+    estimator_digest: str | None,
+) -> str:
+    """计算 invalid usage observation diagnostic digest。
+
+    :param context: 已校验 candidate 上下文。
+    :param data: usage_reported data。
+    :param estimated_input_tokens: 对应估算输入 token 数。
+    :param policy_ref: 对应 policy ref。
+    :param estimator_digest: 对应估算 digest。
+    :returns: sha256 digest。
+    """
+
+    payload: JsonValue = {
+        "observation": {
+            "session_id": context.run.session_id,
+            "run_id": context.run.run_id,
+            "attempt_id": context.attempt.attempt_id,
+            "execution_id": context.attempt.execution_id,
+            "iteration_id": data.iteration_id,
+            "prompt_tokens": data.prompt_tokens,
+            "completion_tokens": data.completion_tokens,
+            "total_tokens": data.total_tokens,
+            "provider_request_id": None,
+            "observed_at": context.candidate.observed_at.isoformat(),
+        },
+        "diagnostic": {
+            "estimator_digest": estimator_digest,
+            "policy_ref": policy_ref,
+            "estimated_input_tokens": estimated_input_tokens,
+            "prompt_token_delta": None,
+            "status": _USAGE_OBSERVATION_STATUS_USAGE_INVALID,
+        },
+    }
+    return sha256_digest_json(payload)
 
 
 def _new_id(prefix: str) -> str:

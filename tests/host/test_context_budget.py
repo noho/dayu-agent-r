@@ -18,6 +18,9 @@ from dayu.host.context_budget import (
     DEFAULT_ESTIMATOR_TOOL_SCHEMA_OVERHEAD_TOKENS,
     DEFAULT_INPUT_SOFT_THRESHOLD_RATIO,
     UsageObservation,
+    USAGE_OBSERVATION_STATUS_ESTIMATE_UNAVAILABLE,
+    USAGE_OBSERVATION_STATUS_OBSERVED,
+    build_usage_observation_diagnostic,
     decide_context_budget,
     estimate_context_budget,
 )
@@ -292,6 +295,7 @@ def test_usage_observation_does_not_adjust_threshold_decision() -> None:
         run_id="run-budget",
         attempt_id="attempt-budget",
         execution_id="execution-budget",
+        iteration_id="iter-budget",
         prompt_tokens=950,
         completion_tokens=20,
         total_tokens=970,
@@ -305,6 +309,102 @@ def test_usage_observation_does_not_adjust_threshold_decision() -> None:
     assert decide_context_budget(estimate) == (
         ContextBudgetDecision.COMPACT_SOFT_THRESHOLD
     )
+
+
+def test_usage_observation_diagnostic_reports_prompt_delta() -> None:
+    """usage observation diagnostic 只报告估算校准差值。"""
+
+    estimate = BudgetEstimate(
+        estimated_input_tokens=810,
+        input_budget_tokens=1000,
+        soft_threshold_tokens=800,
+        hard_threshold_tokens=900,
+        safety_margin_tokens=200,
+        estimator_digest="sha256:" + "1" * 64,
+        overage_reason=ContextBudgetOverageReason.SOFT_THRESHOLD,
+    )
+    observation = UsageObservation(
+        session_id="session-budget",
+        run_id="run-budget",
+        attempt_id="attempt-budget",
+        execution_id="execution-budget",
+        iteration_id="iter-budget",
+        prompt_tokens=950,
+        completion_tokens=20,
+        total_tokens=970,
+        provider_request_id="provider-1",
+        estimator_digest=estimate.estimator_digest,
+        policy_ref="policy-1",
+        observed_at=_NOW,
+    )
+
+    diagnostic = build_usage_observation_diagnostic(
+        observation,
+        estimated_input_tokens=estimate.estimated_input_tokens,
+        status=USAGE_OBSERVATION_STATUS_OBSERVED,
+    )
+    next_iteration_observation = UsageObservation(
+        session_id="session-budget",
+        run_id="run-budget",
+        attempt_id="attempt-budget",
+        execution_id="execution-budget",
+        iteration_id="iter-budget-next",
+        prompt_tokens=950,
+        completion_tokens=20,
+        total_tokens=970,
+        provider_request_id="provider-1",
+        estimator_digest=estimate.estimator_digest,
+        policy_ref="policy-1",
+        observed_at=_NOW,
+    )
+    next_iteration_diagnostic = build_usage_observation_diagnostic(
+        next_iteration_observation,
+        estimated_input_tokens=estimate.estimated_input_tokens,
+        status=USAGE_OBSERVATION_STATUS_OBSERVED,
+    )
+
+    assert diagnostic.observation_digest.startswith("sha256:")
+    assert next_iteration_diagnostic.observation_digest != diagnostic.observation_digest
+    assert diagnostic.estimator_digest == estimate.estimator_digest
+    assert diagnostic.policy_ref == "policy-1"
+    assert diagnostic.estimated_input_tokens == 810
+    assert diagnostic.prompt_token_delta == 140
+    assert diagnostic.status == USAGE_OBSERVATION_STATUS_OBSERVED
+    assert decide_context_budget(estimate) == (
+        ContextBudgetDecision.COMPACT_SOFT_THRESHOLD
+    )
+
+
+def test_usage_observation_diagnostic_missing_estimate_has_no_delta() -> None:
+    """缺少估算时 usage observation diagnostic 不报告 token 差值。"""
+
+    observation = UsageObservation(
+        session_id="session-budget",
+        run_id="run-budget",
+        attempt_id="attempt-budget",
+        execution_id="execution-budget",
+        iteration_id="iter-budget",
+        prompt_tokens=950,
+        completion_tokens=20,
+        total_tokens=970,
+        provider_request_id=None,
+        estimator_digest=None,
+        policy_ref="none",
+        observed_at=_NOW,
+    )
+
+    diagnostic = build_usage_observation_diagnostic(
+        observation,
+        estimated_input_tokens=None,
+        status=USAGE_OBSERVATION_STATUS_ESTIMATE_UNAVAILABLE,
+    )
+
+    assert diagnostic.observation_digest.startswith("sha256:")
+    assert diagnostic.estimator_digest is None
+    assert diagnostic.policy_ref == "none"
+    assert diagnostic.estimated_input_tokens is None
+    assert diagnostic.prompt_token_delta is None
+    assert diagnostic.status == USAGE_OBSERVATION_STATUS_ESTIMATE_UNAVAILABLE
 
 
 def test_count_committed_context_compaction_events_by_trigger_source(

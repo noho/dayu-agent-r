@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import sqlite3
 from collections.abc import Mapping
 from dataclasses import dataclass
 from datetime import UTC, datetime
@@ -89,6 +90,7 @@ from dayu.host.durable.run_transition import (
     accept_worker_running_in_transaction,
     create_running_run_with_starting_attempt_in_transaction,
 )
+from dayu.host.durable.schema import TABLE_EVENT_LOG
 from dayu.host.durable.session_lifecycle import ensure_session
 from dayu.host.durable.state import (
     DispatchRecordStatus,
@@ -1051,15 +1053,182 @@ def test_usage_reported_is_projection_signal_without_state_change(
         )
 
         result = EngineEventIngestor(
-            transaction_runner=store.transaction_runner
+            transaction_runner=store.transaction_runner,
+            context_budget_policy=_reactive_policy(),
         ).ingest(candidate)
 
         assert result.events[0].event_class == EventClass.PROJECTION_SIGNAL
         assert result.events[0].event_type == "USAGE_REPORTED"
         payload = _payload(result.events[0])
+        assert payload["session_id"] == seeded.session_id
+        assert payload["run_id"] == seeded.run_id
+        assert payload["attempt_id"] == seeded.attempt_id
+        assert payload["execution_id"] == seeded.execution_id
+        assert payload["iteration_id"] == "iter-usage"
+        assert payload["prompt_tokens"] == 10
+        assert payload["completion_tokens"] == 20
         assert payload["total_tokens"] == 30
-        assert "policy_ref" not in payload
-        assert "estimator_digest" not in payload
+        assert payload["provider_request_id"] is None
+        assert payload["policy_ref"] == _REACTIVE_POLICY_REF
+        assert isinstance(payload["estimator_digest"], str)
+        assert payload["estimated_input_tokens"] == 14
+        assert payload["usage_observation_status"] == "observed"
+        assert isinstance(payload["usage_observation_digest"], str)
+        assert payload["prompt_token_delta"] == -4
+        run_status, attempt_status = _statuses(store.transaction_runner, seeded)
+        assert run_status == RunStatus.RUNNING
+        assert attempt_status == AttemptStatus.RUNNING
+
+
+def test_usage_reported_without_policy_keeps_projection_non_failing(
+    tmp_path: Path,
+) -> None:
+    """未配置 context budget policy 时 usage projection 仍成功。"""
+
+    with open_host_durable_store(_options(tmp_path)) as store:
+        seeded = _seed_active_run(store.transaction_runner)
+        candidate = _candidate(
+            seeded,
+            worker_event_index=7,
+            data=UsageReportedData(
+                iteration_id="iter-usage",
+                prompt_tokens=10,
+                completion_tokens=20,
+                total_tokens=30,
+            ),
+            event_type=EngineEventType.USAGE_REPORTED,
+        )
+
+        result = EngineEventIngestor(
+            transaction_runner=store.transaction_runner
+        ).ingest(candidate)
+
+        assert result.status == EngineIngestStatus.ACCEPTED
+        payload = _payload(result.events[0])
+        assert payload["policy_ref"] == "none"
+        assert payload["estimator_digest"] is None
+        assert payload["estimated_input_tokens"] is None
+        assert payload["usage_observation_status"] == "estimate_unavailable"
+        assert payload["provider_request_id"] is None
+        run_status, attempt_status = _statuses(store.transaction_runner, seeded)
+        assert run_status == RunStatus.RUNNING
+        assert attempt_status == AttemptStatus.RUNNING
+
+
+def test_usage_reported_missing_input_event_keeps_projection_non_failing(
+    tmp_path: Path,
+) -> None:
+    """input event 缺失时 usage projection 降级为 estimate_unavailable。"""
+
+    with open_host_durable_store(_options(tmp_path)) as store:
+        seeded = _seed_active_run(store.transaction_runner)
+        connection = store.connect()
+        try:
+            _delete_input_event(connection, event_id="event-input-ingest")
+        finally:
+            connection.close()
+        candidate = _candidate(
+            seeded,
+            worker_event_index=7,
+            data=UsageReportedData(
+                iteration_id="iter-usage",
+                prompt_tokens=10,
+                completion_tokens=20,
+                total_tokens=30,
+            ),
+            event_type=EngineEventType.USAGE_REPORTED,
+        )
+
+        result = EngineEventIngestor(
+            transaction_runner=store.transaction_runner,
+            context_budget_policy=_reactive_policy(),
+        ).ingest(candidate)
+
+        assert result.status == EngineIngestStatus.ACCEPTED
+        payload = _payload(result.events[0])
+        assert payload["policy_ref"] == _REACTIVE_POLICY_REF
+        assert payload["estimator_digest"] is None
+        assert payload["estimated_input_tokens"] is None
+        assert payload["usage_observation_status"] == "estimate_unavailable"
+        run_status, attempt_status = _statuses(store.transaction_runner, seeded)
+        assert run_status == RunStatus.RUNNING
+        assert attempt_status == AttemptStatus.RUNNING
+
+
+def test_usage_reported_unreadable_input_event_keeps_projection_non_failing(
+    tmp_path: Path,
+) -> None:
+    """input event payload 不可读时 usage projection 降级为 estimate_unavailable。"""
+
+    with open_host_durable_store(_options(tmp_path)) as store:
+        seeded = _seed_active_run(store.transaction_runner)
+        _replace_inline_payload_json(
+            store.transaction_runner,
+            event_id="event-input-ingest",
+            payload_json='{"display_text":7}',
+        )
+        candidate = _candidate(
+            seeded,
+            worker_event_index=7,
+            data=UsageReportedData(
+                iteration_id="iter-usage",
+                prompt_tokens=10,
+                completion_tokens=20,
+                total_tokens=30,
+            ),
+            event_type=EngineEventType.USAGE_REPORTED,
+        )
+
+        result = EngineEventIngestor(
+            transaction_runner=store.transaction_runner,
+            context_budget_policy=_reactive_policy(),
+        ).ingest(candidate)
+
+        assert result.status == EngineIngestStatus.ACCEPTED
+        payload = _payload(result.events[0])
+        assert payload["policy_ref"] == _REACTIVE_POLICY_REF
+        assert payload["estimator_digest"] is None
+        assert payload["estimated_input_tokens"] is None
+        assert payload["usage_observation_status"] == "estimate_unavailable"
+        assert payload["provider_request_id"] is None
+        run_status, attempt_status = _statuses(store.transaction_runner, seeded)
+        assert run_status == RunStatus.RUNNING
+        assert attempt_status == AttemptStatus.RUNNING
+
+
+def test_usage_reported_invalid_tokens_keeps_projection_non_failing(
+    tmp_path: Path,
+) -> None:
+    """usage token 异常时 projection 仍提交且不改变 Run / Attempt 状态。"""
+
+    with open_host_durable_store(_options(tmp_path)) as store:
+        seeded = _seed_active_run(store.transaction_runner)
+        candidate = _candidate(
+            seeded,
+            worker_event_index=7,
+            data=UsageReportedData(
+                iteration_id="iter-usage",
+                prompt_tokens=-1,
+                completion_tokens=20,
+                total_tokens=19,
+            ),
+            event_type=EngineEventType.USAGE_REPORTED,
+        )
+
+        result = EngineEventIngestor(
+            transaction_runner=store.transaction_runner,
+            context_budget_policy=_reactive_policy(),
+        ).ingest(candidate)
+
+        assert result.status == EngineIngestStatus.ACCEPTED
+        payload = _payload(result.events[0])
+        assert payload["prompt_tokens"] == -1
+        assert payload["policy_ref"] == _REACTIVE_POLICY_REF
+        assert isinstance(payload["estimator_digest"], str)
+        assert payload["estimated_input_tokens"] == 14
+        assert payload["usage_observation_status"] == "usage_invalid"
+        assert isinstance(payload["usage_observation_digest"], str)
+        assert payload["prompt_token_delta"] is None
         run_status, attempt_status = _statuses(store.transaction_runner, seeded)
         assert run_status == RunStatus.RUNNING
         assert attempt_status == AttemptStatus.RUNNING
@@ -2129,6 +2298,46 @@ def _append_reactive_requested_fact(
                 payload_ref=None,
                 payload_digest=None,
             ),
+        )
+
+    transaction_runner.run_write(_operation)
+
+
+def _delete_input_event(connection: sqlite3.Connection, *, event_id: str) -> None:
+    """删除测试 input event，模拟 durable run 指向缺失输入事件。
+
+    :param connection: 独立 SQLite connection。
+    :param event_id: input event id。
+    :returns: ``None``。
+    """
+
+    connection.execute("PRAGMA foreign_keys = OFF")
+    connection.execute(f"DELETE FROM {TABLE_EVENT_LOG} WHERE event_id = ?", (event_id,))
+    connection.commit()
+
+
+def _replace_inline_payload_json(
+    transaction_runner: HostTransactionRunner,
+    *,
+    event_id: str,
+    payload_json: str,
+) -> None:
+    """替换测试事件 inline payload，模拟 payload 不可读。
+
+    :param transaction_runner: Host transaction runner。
+    :param event_id: event id。
+    :param payload_json: 新 payload JSON 文本。
+    :returns: ``None``。
+    """
+
+    def _operation(transaction: HostTransaction) -> None:
+        transaction.execute(
+            f"""
+            UPDATE {TABLE_EVENT_LOG}
+            SET payload_json = ?
+            WHERE event_id = ?
+            """,
+            (payload_json, event_id),
         )
 
     transaction_runner.run_write(_operation)
