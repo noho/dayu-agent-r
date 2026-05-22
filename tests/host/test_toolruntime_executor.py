@@ -33,6 +33,7 @@ from dayu.contracts.tool_schema import (
 )
 from dayu.host.api import WaitAdapterKey
 from dayu.host.durable.state import WaitResumePolicy
+from dayu.host.evidence import MAX_ACCEPTED_EVIDENCE_RESULT_PREVIEW_CHARS
 from dayu.host.tool_runtime import (
     DefaultToolRuntimeFactory,
     EffectiveToolBundleBuildRequest,
@@ -481,6 +482,10 @@ async def test_oversized_tool_result_returns_completed_outcome_without_default_g
     candidate = accept_port.candidates[0]
     assert candidate.tool_fact_kind is ToolFactKind.COMPLETED
     assert candidate.policy_decision.kind is ToolPolicyDecisionKind.ALLOW
+    assert candidate.result_preview is not None
+    assert len(candidate.result_preview) <= MAX_ACCEPTED_EVIDENCE_RESULT_PREVIEW_CHARS
+    assert '"kind":"completed"' in candidate.result_preview
+    assert '"content":"' in candidate.result_preview
     assert isinstance(record.outcome, ToolCompletedOutcome)
     assert record.outcome.result.value == oversized_value
 
@@ -1222,6 +1227,7 @@ def _accepted_ack_for_call(tool_call_id: str) -> ToolFactAcceptedAck:
         payload_digest=sha256_digest_json({"payload": tool_call_id}),
         payload_ref=None,
         truncation=None,
+        result_preview=f"accepted outcome preview {tool_call_id}",
         duplicate_key=None,
         duplicate_decision=None,
         reuse_prior_event_refs=(),

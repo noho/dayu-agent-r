@@ -71,6 +71,12 @@ async def test_fact_candidates_can_reference_accepted_evidence_envelopes() -> No
     assert tuple(
         fact.evidence_refs for fact in candidate.evidence_backed_fact_candidates
     ) == (("evidence:accepted-1",), ("evidence:accepted-2",))
+    assert tuple(
+        fact.claim_text for fact in candidate.evidence_backed_fact_candidates
+    ) == (
+        "Accepted evidence preview: accepted evidence preview accepted-1",
+        "Accepted evidence preview: accepted evidence preview accepted-2",
+    )
 
 
 @pytest.mark.asyncio
@@ -636,6 +642,7 @@ def _accepted_evidence_envelope(suffix: str) -> AcceptedEvidenceEnvelope:
                 "sha256:dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd"
             ),
             truncation_applied=False,
+            result_preview=f"accepted evidence preview {suffix}",
         ),
         source_refs=(),
         locator_refs=(),

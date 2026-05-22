@@ -195,6 +195,7 @@ def test_tool_result_accepted_payload_carries_accepted_evidence_envelope(
         assert envelope.result_ref.payload_digest == candidate.payload_digest
         assert envelope.result_ref.outcome_digest == candidate.outcome_digest
         assert envelope.result_ref.truncation_applied is False
+        assert envelope.result_ref.result_preview == candidate.result_preview
         assert envelope.source_refs == ()
         assert envelope.locator_refs == ()
 
@@ -660,6 +661,7 @@ def _completed_candidate(
         payload_digest=sha256_digest_json({"payload": tool_call_id}),
         payload_ref=None,
         truncation=None,
+        result_preview=f"lookup result preview {tool_call_id}",
         duplicate_key=None,
         duplicate_decision=None,
         reuse_prior_event_refs=(),
@@ -702,6 +704,7 @@ def _reuse_candidate(
         payload_digest=None,
         payload_ref=None,
         truncation=None,
+        result_preview=None,
         duplicate_key="duplicate-lookup-MSFT",
         duplicate_decision=DuplicateDecisionKind.REUSE,
         reuse_prior_event_refs=(prior_ref,),
@@ -749,6 +752,7 @@ def _fact_kind_candidate(
         payload_digest=None,
         payload_ref=None,
         truncation=None,
+        result_preview=f"lookup result preview {tool_call_id}",
         duplicate_key=None,
         duplicate_decision=None,
         reuse_prior_event_refs=(),

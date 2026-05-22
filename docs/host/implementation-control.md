@@ -224,10 +224,10 @@ Phase Map 中每个 phase 必须使用统一条目格式。模板如下：
 
 当前 work unit：Phase 12.5 Conversation Memory Optimization。
 当前状态：P12 已完成；PR 67 已 draft-PR-pass 并由用户 merge。
-当前 gate：Phase 12.5 design discussion / design write-back。
-下一步：以 `docs/host/design.md` §24 Conversation Memory 与 §25 Context Governance 为设计真源，完成剩余 recent continuity / minimum preserve 裁决后，再按 `$phaseflow` / `$init-agents` 进入 implementation-ready plan、plan review、implementation、review 与 PASS 闭环。
+当前 gate：P12.5 aggregate re-review PASS；ready-to-open-draft-PR。
+下一步：提交 aggregate repair / re-review 控制文档后，按用户授权自动进入 draft PR gate，push 分支、创建 draft PR、执行 PR review / fix / re-review，直到 draft-PR-pass。
 
-当前 gate 结论：P12.5 的目标是优化 Conversation Memory，使其满足买方财报分析 Agent 对 pinned_state、evidence_backed_facts、recent raw turn continuity、minimum preserve、compaction 后事实不漂移和长会话稳定性的最低验收语义。讨论稿为 `docs/host/conversation-memory-first-principles-discussion.md`；该讨论稿不是设计真源，稳定裁决已写回 `docs/host/design.md`，后续 plan gate 必须以设计真源为准。
+当前 gate 结论：P12.5 implementation Slice 1-7、aggregate deepreview、targeted repair 与 aggregate re-review 均已 PASS。`evidence_backed_facts` 现在基于 accepted evidence envelope 的 bounded `result_preview` 进入 LLM compact extraction；ToolRuntime accepted result 不直接物化 stable fact；accepted `CONTEXT_COMPACTED.evidence_backed_fact_candidates` 才进入 memory projection；dispatch memory projection lag 走 rebuild / retry，不触发 Run / Attempt 终态迁移。剩余风险为 `_NeverCancelledToken` compaction cancellation hardening、复杂工具结果 preview 质量与大 session rebuild performance，均不阻塞 draft PR。
 
 ## Phase Map
 
@@ -1676,6 +1676,19 @@ Plan 必须额外收口的 readiness review checklist：
   docs / review artifacts。Residual risks：public-path no-compaction continuity smoke 尚未新增；`compaction_evidence.py`
   使用 session-filtered `start_event_sequence=1` 保守读取；candidate JSON helper duplication 暂不阻塞。Owner：aggregate
   deepreview 决定是否在 draft PR 前补强，否则转后续 public smoke / performance hardening / cleanup work unit。
+  Aggregate deepreview 初审：MiMo PASS with findings，artifact 为
+  `docs/reviews/phase12-5-aggregate-deepreview-mimo-20260523.md`；DS NOT ready，artifact 为
+  `docs/reviews/phase12-5-aggregate-deepreview-ds-20260522.md`，阻断项为 LLM compactor 未接收 evidence 内容、projection lag
+  误杀 Run、FakeCompactor false positive、catch-up failure 静默忽略与 `EvidenceBackedFactView.claim_text` 长度防线缺失。
+  Targeted aggregate repair 已完成：accepted evidence envelope 增加 bounded `result_preview`；ToolRuntime 从 accepted outcome
+  派生 preview；LLM compaction prompt 展开 envelope / preview；FakeContextCompactor 消费 envelope；dispatch 对 catch-up
+  failure 与 `SNAPSHOT_LAG_OVER_THRESHOLD` 执行 rebuild / retry 且不 terminal closeout；`EvidenceBackedFactView` 增加
+  claim_text 长度校验；`docs/host/design.md`、`dayu/host/README.md`、`tests/README.md` 已同步。Aggregate re-review PASS；
+  artifacts 为 `docs/reviews/phase12-5-aggregate-rereview-mimo-20260523.md`、
+  `docs/reviews/phase12-5-aggregate-rereview-ds-20260523.md`、
+  `docs/reviews/phase12-5-aggregate-rereview-controller-adjudication-20260523.md`。Aggregate repair validation:
+  `pytest tests/host/test_toolruntime_accept_barrier.py tests/host/test_llm_compaction.py tests/host/test_compaction_contract.py tests/host/test_compaction_operation.py tests/host/test_memory_projection.py tests/host/test_run_input_builder.py tests/host/test_dispatch_scheduler.py tests/host/test_compact_artifact_store.py tests/host/test_toolruntime_executor.py tests/service/test_host_assembly.py tests/runtime/test_config_loader.py`
+  PASS (260 passed)；full pyright PASS (0 errors)；`git diff --check` PASS。P12.5 exit condition satisfied；ready-to-open-draft-PR。
 
 目标：
 - 从买方财报分析 Agent 的第一性原理优化 Conversation Memory，使同一 session 内已由工具确认的关键财务事实能跨轮、

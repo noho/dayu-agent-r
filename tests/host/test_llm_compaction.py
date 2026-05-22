@@ -79,6 +79,42 @@ async def test_llm_context_compactor_builds_tool_disabled_request(
 
 
 @pytest.mark.asyncio
+async def test_llm_context_compactor_prompt_contains_accepted_evidence_preview(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """LLM compactor prompt 携带 accepted evidence envelope 的结果预览。"""
+
+    seen: list[AgentRunRequest] = []
+
+    async def _fake_run(request: AgentRunRequest) -> AgentRunResult:
+        seen.append(request)
+        return _final(_proposal_json())
+
+    monkeypatch.setattr("dayu.host.llm_compaction.run_agent_and_wait", _fake_run)
+
+    await LLMContextCompactor(
+        runner_spec=_runner_spec(),
+        runner_options=_runner_options(),
+    ).compact(_request())
+
+    assert len(seen) == 1
+    user_message = seen[0].messages[1]
+    prompt = user_message.content
+    assert prompt is not None
+    assert "accepted_evidence_envelopes:" in prompt
+    assert "- evidence_id: evidence:accepted-1" in prompt
+    assert "tool_name: fins.search" in prompt
+    assert "tool_call_id: tool-call-1" in prompt
+    assert "normalized_arguments_digest:" in prompt
+    assert "semantic_input_digest:" in prompt
+    assert "payload_ref: payload:1" in prompt
+    assert "outcome_digest:" in prompt
+    assert "source_refs: none" in prompt
+    assert "locator_refs: none" in prompt
+    assert "Revenue grew 12% year over year." in prompt
+
+
+@pytest.mark.asyncio
 async def test_llm_context_compactor_maps_final_answer_to_candidate(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -609,6 +645,10 @@ def _accepted_evidence_envelope() -> AcceptedEvidenceEnvelope:
             payload_digest=_DIGEST,
             outcome_digest=_DIGEST,
             truncation_applied=False,
+            result_preview=(
+                '{"status":"completed","value":{"metric":"revenue",'
+                '"value":"Revenue grew 12% year over year."}}'
+            ),
         ),
         source_refs=(),
         locator_refs=(),

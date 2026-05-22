@@ -94,6 +94,7 @@ from dayu.host.evidence import (
     AcceptedEvidenceEnvelope,
     AcceptedEvidenceResultRef,
     AcceptedEvidenceToolQuery,
+    MAX_ACCEPTED_EVIDENCE_RESULT_PREVIEW_CHARS,
     accepted_evidence_envelope_to_json_value,
     derive_accepted_evidence_id,
 )
@@ -217,6 +218,7 @@ _DEFAULT_TEXT_CHARS_TRUNCATION_LIMIT = 4096
 _DEFAULT_TEXT_LINES_TRUNCATION_LIMIT = 200
 _DEFAULT_LIST_ITEMS_TRUNCATION_LIMIT = 100
 _DEFAULT_BINARY_BYTES_TRUNCATION_LIMIT = 4096
+_TRUNCATED_PREVIEW_SUFFIX = "...[truncated]"
 _DEFAULT_TRUNCATION_LIMITS_BY_STRATEGY: Mapping[ToolTruncationStrategy, int] = {
     ToolTruncationStrategy.TEXT_CHARS: _DEFAULT_TEXT_CHARS_TRUNCATION_LIMIT,
     ToolTruncationStrategy.TEXT_LINES: _DEFAULT_TEXT_LINES_TRUNCATION_LIMIT,
@@ -387,6 +389,7 @@ class ToolFactAcceptCandidate:
     :param payload_digest: result payload digest；无 result payload 时为 ``None``。
     :param payload_ref: result payload descriptor 引用。
     :param truncation: 截断事实；无截断时为 ``None``。
+    :param result_preview: 从 accepted outcome 派生的有界结果预览。
     :param duplicate_key: run-local duplicate key。
     :param duplicate_decision: duplicate governance 决策。
     :param reuse_prior_event_refs: reuse 指向的既有 accepted event refs。
@@ -412,6 +415,7 @@ class ToolFactAcceptCandidate:
     payload_digest: str | None
     payload_ref: HostPayloadRef | None
     truncation: ToolTruncationFact | None
+    result_preview: str | None
     duplicate_key: str | None
     duplicate_decision: DuplicateDecisionKind | None
     reuse_prior_event_refs: tuple[HostEventRef, ...]
@@ -3571,6 +3575,7 @@ def _accepted_evidence_envelope(
                 if candidate.truncation is not None
                 else False
             ),
+            result_preview=candidate.result_preview,
         ),
         source_refs=(),
         locator_refs=(),
@@ -3934,6 +3939,11 @@ def _validate_common_candidate_fields(candidate: ToolFactAcceptCandidate) -> Non
     _require_optional_non_empty_text(
         candidate.tool_idempotency_key, field_name="tool_idempotency_key"
     )
+    _require_optional_bounded_non_empty_text(
+        candidate.result_preview,
+        field_name="result_preview",
+        max_chars=MAX_ACCEPTED_EVIDENCE_RESULT_PREVIEW_CHARS,
+    )
     if not isinstance(candidate.policy_decision, ToolPolicyDecision):
         raise ValueError("policy_decision must be ToolPolicyDecision")
     _validate_policy_decision_fields(candidate.policy_decision)
@@ -4109,6 +4119,25 @@ def _require_optional_non_empty_text(
 
     if value is not None and value.strip() == "":
         raise ValueError(f"{field_name} must be non-empty when provided")
+
+
+def _require_optional_bounded_non_empty_text(
+    value: str | None, *, field_name: str, max_chars: int
+) -> None:
+    """校验 optional 文本不为空白且不超过长度上限。
+
+    :param value: 待校验文本；无值时为 ``None``。
+    :param field_name: 字段名。
+    :param max_chars: 最大允许字符数。
+    :returns: ``None``。
+    :raises ValueError: 文本为空白或超过上限时抛出。
+    """
+
+    if value is None:
+        return
+    _require_optional_non_empty_text(value, field_name=field_name)
+    if len(value) > max_chars:
+        raise ValueError(f"{field_name} exceeds maximum length")
 
 
 def _require_sha256_digest(value: str | None, *, field_name: str) -> None:
@@ -4756,6 +4785,7 @@ def _tool_fact_accept_candidate(
         payload_digest=payload_digest,
         payload_ref=None,
         truncation=truncation_fact,
+        result_preview=_accepted_tool_outcome_preview(outcome),
         duplicate_key=duplicate_decision.duplicate_key,
         duplicate_decision=duplicate_decision.kind,
         reuse_prior_event_refs=(
@@ -4844,6 +4874,7 @@ def _tool_fact_reuse_accept_candidate(
         payload_digest=None,
         payload_ref=None,
         truncation=None,
+        result_preview=None,
         duplicate_key=duplicate_decision.duplicate_key,
         duplicate_decision=duplicate_decision.kind,
         reuse_prior_event_refs=duplicate_decision.prior_event_refs,
@@ -4989,6 +5020,23 @@ def _tool_outcome_digest(outcome: ToolExecutionOutcome) -> str:
     """
 
     return sha256_digest_json(_tool_outcome_json(outcome))
+
+
+def _accepted_tool_outcome_preview(outcome: ToolExecutionOutcome) -> str:
+    """从 accepted 工具 outcome 派生可进入证据信封的有界预览。
+
+    :param outcome: 已被 Host accept 的工具 outcome。
+    :returns: canonical JSON 预览文本。
+    """
+
+    preview = canonical_json_dumps(_tool_outcome_json(outcome))
+    if len(preview) <= MAX_ACCEPTED_EVIDENCE_RESULT_PREVIEW_CHARS:
+        return preview
+    visible_chars = (
+        MAX_ACCEPTED_EVIDENCE_RESULT_PREVIEW_CHARS
+        - len(_TRUNCATED_PREVIEW_SUFFIX)
+    )
+    return preview[:visible_chars] + _TRUNCATED_PREVIEW_SUFFIX
 
 
 def _tool_outcome_inline_size_bytes(outcome: ToolExecutionOutcome) -> int:

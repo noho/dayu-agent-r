@@ -60,6 +60,7 @@ from dayu.host.compaction import (
     PreservationEvidence,
 )
 from dayu.host.context_budget import DEFAULT_ESTIMATOR_CHARS_PER_TOKEN
+from dayu.host.evidence import AcceptedEvidenceEnvelope, OpaqueEvidenceRef
 
 _COMPACTOR_RUN_ID_PREFIX = "context-compactor"
 _COMPACTOR_MAX_ITERATIONS = 1
@@ -333,40 +334,102 @@ def _user_prompt(request: CompactionRequest) -> str:
         f"recent_raw_turn_refs: {_refs_text(request.recent_raw_turn_refs)}",
         f"older_raw_turn_refs: {_refs_text(request.older_raw_turn_refs)}",
         f"existing_episode_summary_refs: {_refs_text(request.existing_episode_summary_refs)}",
-        "Return strict JSON only. Required object schema:",
-        "{",
-        '  "episode_summary_candidate": {',
-        '    "episode_title": "non-empty text",',
-        '    "goal": "non-empty text",',
-        '    "completed_actions": ["text"],',
-        '    "confirmed_fact_refs": ["existing evidence_backed_fact_ref"],',
-        '    "confirmed_fact_summaries": ["text"],',
-        '    "user_constraints": ["text"],',
-        '    "open_questions": ["text"],',
-        '    "next_step": "text or null",',
-        '    "tool_finding_refs": ["accepted evidence ref"]',
-        "  },",
-        '  "pinned_state_patch_candidate": {',
-        '    "current_goal": {"operation": "missing|clear|replace", "value": "text or null"},',
-        '    "confirmed_subjects": {"operation": "missing|clear|replace", "value": ["text"] or null},',
-        '    "user_constraints": {"operation": "missing|clear|replace", "value": ["text"] or null},',
-        '    "open_questions": {"operation": "missing|clear|replace", "value": ["text"] or null}',
-        "  },",
-        '  "evidence_backed_fact_candidates": [',
-        '    {"candidate_id": "local id", "claim_text": "bounded text", "evidence_kind": "observed_value|quoted_statement|table_value|derived_from_evidence", "evidence_refs": ["accepted evidence ref"], "attributes": {}}',
-        "  ],",
-        '  "minimum_preserve_item_candidates": [',
-        '    {"item_id": "local id", "label": "short text", "text": "bounded text", "source_refs": ["input event ref"], "preserve_reason": "needed_for_recent_reference|needed_for_ordered_item_reference|needed_for_local_followup"}',
-        "  ],",
-        f'  "retained_current_user_input_ref": "{request.current_message_summary.current_user_input_ref}",',
-        '  "preserved_input_event_refs": ["input event refs"],',
-        '  "preserved_accepted_evidence_refs": ["accepted evidence refs"],',
-        '  "preserved_evidence_backed_fact_refs": ["evidence-backed fact refs"],',
-        '  "dropped_ranges": [],',
-        '  "summarized_ranges": [{"range_ref": "local id", "start_input_ref": "input ref", "end_input_ref": "input ref"}]',
-        "}",
     ]
+    lines.extend(_accepted_evidence_envelope_lines(request.accepted_evidence_envelopes))
+    lines.extend(
+        [
+            "Return strict JSON only. Required object schema:",
+            "{",
+            '  "episode_summary_candidate": {',
+            '    "episode_title": "non-empty text",',
+            '    "goal": "non-empty text",',
+            '    "completed_actions": ["text"],',
+            '    "confirmed_fact_refs": ["existing evidence_backed_fact_ref"],',
+            '    "confirmed_fact_summaries": ["text"],',
+            '    "user_constraints": ["text"],',
+            '    "open_questions": ["text"],',
+            '    "next_step": "text or null",',
+            '    "tool_finding_refs": ["accepted evidence ref"]',
+            "  },",
+            '  "pinned_state_patch_candidate": {',
+            '    "current_goal": {"operation": "missing|clear|replace", "value": "text or null"},',
+            '    "confirmed_subjects": {"operation": "missing|clear|replace", "value": ["text"] or null},',
+            '    "user_constraints": {"operation": "missing|clear|replace", "value": ["text"] or null},',
+            '    "open_questions": {"operation": "missing|clear|replace", "value": ["text"] or null}',
+            "  },",
+            '  "evidence_backed_fact_candidates": [',
+            '    {"candidate_id": "local id", "claim_text": "bounded text", "evidence_kind": "observed_value|quoted_statement|table_value|derived_from_evidence", "evidence_refs": ["accepted evidence ref"], "attributes": {}}',
+            "  ],",
+            '  "minimum_preserve_item_candidates": [',
+            '    {"item_id": "local id", "label": "short text", "text": "bounded text", "source_refs": ["input event ref"], "preserve_reason": "needed_for_recent_reference|needed_for_ordered_item_reference|needed_for_local_followup"}',
+            "  ],",
+            f'  "retained_current_user_input_ref": "{request.current_message_summary.current_user_input_ref}",',
+            '  "preserved_input_event_refs": ["input event refs"],',
+            '  "preserved_accepted_evidence_refs": ["accepted evidence refs"],',
+            '  "preserved_evidence_backed_fact_refs": ["evidence-backed fact refs"],',
+            '  "dropped_ranges": [],',
+            '  "summarized_ranges": [{"range_ref": "local id", "start_input_ref": "input ref", "end_input_ref": "input ref"}]',
+            "}",
+        ]
+    )
     return "\n".join(lines)
+
+
+def _accepted_evidence_envelope_lines(
+    envelopes: tuple[AcceptedEvidenceEnvelope, ...],
+) -> list[str]:
+    """格式化 accepted evidence envelopes 供 LLM 读取真实 evidence 内容。
+
+    :param envelopes: Host accepted evidence 信封。
+    :returns: prompt 行列表。
+    """
+
+    if len(envelopes) == 0:
+        return ["accepted_evidence_envelopes: none"]
+    lines = ["accepted_evidence_envelopes:"]
+    for envelope in envelopes:
+        result_ref = envelope.result_ref
+        tool_query = envelope.tool_query
+        lines.extend(
+            [
+                f"- evidence_id: {envelope.evidence_id}",
+                f"  tool_name: {envelope.tool_name}",
+                f"  tool_call_id: {envelope.tool_call_id}",
+                "  query:",
+                (
+                    "    tool_call_requested_event_ref: "
+                    f"{tool_query.tool_call_requested_event_ref or 'none'}"
+                ),
+                (
+                    "    normalized_arguments_digest: "
+                    f"{tool_query.normalized_arguments_digest}"
+                ),
+                f"    semantic_input_digest: {tool_query.semantic_input_digest}",
+                "  result_ref:",
+                f"    payload_ref: {result_ref.payload_ref or 'none'}",
+                f"    payload_digest: {result_ref.payload_digest or 'none'}",
+                f"    outcome_digest: {result_ref.outcome_digest or 'none'}",
+                f"    truncation_applied: {result_ref.truncation_applied}",
+                f"    result_preview: {result_ref.result_preview or 'none'}",
+                f"  source_refs: {_opaque_refs_text(envelope.source_refs)}",
+                f"  locator_refs: {_opaque_refs_text(envelope.locator_refs)}",
+            ]
+        )
+    return lines
+
+
+def _opaque_refs_text(refs: tuple[OpaqueEvidenceRef, ...]) -> str:
+    """格式化 Host opaque evidence refs。
+
+    :param refs: opaque refs。
+    :returns: 可读文本；为空时返回 ``none``。
+    """
+
+    if len(refs) == 0:
+        return "none"
+    return "; ".join(
+        f"{ref.ref_kind}:{ref.ref_id}:digest={ref.digest or 'none'}" for ref in refs
+    )
 
 
 def _refs_text(refs: tuple[str, ...]) -> str:

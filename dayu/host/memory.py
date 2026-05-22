@@ -16,6 +16,7 @@ from dayu.contracts.json_value import JsonValue
 from dayu.host.compaction import (
     EvidenceBackedFactCandidate,
     EvidenceBackedFactKind,
+    MAX_EVIDENCE_BACKED_FACT_CLAIM_TEXT_CHARS,
     MinimumPreserveItemCandidate,
     MinimumPreserveReason,
 )
@@ -419,6 +420,8 @@ class EvidenceBackedFactView:
 
         _require_non_empty(self.item_id, "item_id")
         _require_non_empty(self.claim_text, "claim_text")
+        if len(self.claim_text) > MAX_EVIDENCE_BACKED_FACT_CLAIM_TEXT_CHARS:
+            raise ValueError("claim_text exceeds maximum length")
         if not isinstance(self.evidence_kind, EvidenceBackedFactKind):
             raise ValueError("evidence_kind must be EvidenceBackedFactKind")
         if len(self.evidence_refs) == 0:

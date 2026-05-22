@@ -20,6 +20,7 @@ from uuid import uuid4
 
 from dayu.contracts.cancellation import CancellationToken
 from dayu.contracts.json_value import JsonValue
+from dayu.engine.contracts.agent_run import AgentRunRequest
 from dayu.engine.contracts.engine_events import (
     EngineEvent,
     EngineEventType,
@@ -110,7 +111,11 @@ from dayu.host.run_input import (
     create_no_tool_run_input_builder,
     create_tool_enabled_run_input_builder,
 )
-from dayu.host.memory_repair import catch_up_conversation_memory_projection
+from dayu.host.memory import MemoryRepairReason
+from dayu.host.memory_repair import (
+    catch_up_conversation_memory_projection,
+    rebuild_conversation_memory_projection,
+)
 from dayu.host._event_payload import payload_object as _payload_object
 from dayu.host.compact_artifact import (
     CompactArtifactStore,
@@ -2063,13 +2068,14 @@ class HostDispatchScheduler:
                 policy_snapshot_ref=effective_decision.policy_snapshot.policy_snapshot_ref,
             )
             self._catch_up_memory_projection_before_worker(record)
-            request = self._run_input_builder_for_dispatch(
+            request = self._build_run_input_with_lag_repair(
+                record=record,
                 snapshot=snapshot,
                 policy_snapshot=effective_decision.policy_snapshot,
                 selected_business_tool_names=(
                     effective_decision.selected_business_tool_names
                 ),
-            ).build(snapshot)
+            )
             worker = self._local_execution.worker_factory.create_worker(snapshot)
             _LOGGER.log(
                 VERBOSE_LOG_LEVEL,
@@ -2088,6 +2094,21 @@ class HostDispatchScheduler:
                 timeout=self._local_execution.worker_startup_timeout_seconds,
             )
         except MemoryProjectionRepairRequired as exc:
+            if (
+                exc.repair_request.reason
+                is MemoryRepairReason.SNAPSHOT_LAG_OVER_THRESHOLD
+            ):
+                _LOGGER.warning(
+                    "dispatch memory projection lag repair still required; "
+                    "skipping without terminal closeout run_id=%s "
+                    "attempt_id=%s execution_id=%s reason=%s",
+                    record.run_id,
+                    record.attempt_id,
+                    record.execution_id,
+                    exc.repair_request.reason.value,
+                )
+                await _safe_release_lane_token(token)
+                return "skipped"
             try:
                 _LOGGER.warning(
                     "dispatch memory projection repair required; closing run "
@@ -2181,6 +2202,59 @@ class HostDispatchScheduler:
         self._active_tasks.add(task)
         task.add_done_callback(self._active_tasks.discard)
         return "dispatched"
+
+    def _build_run_input_with_lag_repair(
+        self,
+        *,
+        record: PendingDispatchRecord,
+        snapshot: AttemptDispatchSnapshot,
+        policy_snapshot: PolicySnapshot,
+        selected_business_tool_names: frozenset[str] | None,
+    ) -> AgentRunRequest:
+        """构造 Engine request，并对大滞后 memory snapshot 执行一次重建重试。
+
+        :param record: pending dispatch 摘要。
+        :param snapshot: 当前 Attempt dispatch snapshot。
+        :param policy_snapshot: admission 冻结的 policy snapshot。
+        :param selected_business_tool_names: admission 冻结的业务工具名集合。
+        :returns: Engine run request。
+        :raises MemoryProjectionRepairRequired: 非 lag repair 或重建后仍需 repair 时抛出。
+        """
+
+        builder = self._run_input_builder_for_dispatch(
+            snapshot=snapshot,
+            policy_snapshot=policy_snapshot,
+            selected_business_tool_names=selected_business_tool_names,
+        )
+        try:
+            return builder.build(snapshot)
+        except MemoryProjectionRepairRequired as exc:
+            if (
+                exc.repair_request.reason
+                is not MemoryRepairReason.SNAPSHOT_LAG_OVER_THRESHOLD
+            ):
+                raise
+            _LOGGER.warning(
+                "dispatch.memory_projection.lag_rebuild_retry run_id=%s "
+                "attempt_id=%s execution_id=%s required_event_sequence=%s",
+                record.run_id,
+                record.attempt_id,
+                record.execution_id,
+                exc.repair_request.required_event_sequence,
+            )
+            rebuild_conversation_memory_projection(
+                self._transaction_runner,
+                policy=self._local_execution.memory_projection_policy,
+                batch_size=(
+                    self._local_execution.memory_projection_catchup_batch_size
+                ),
+            )
+            retry_builder = self._run_input_builder_for_dispatch(
+                snapshot=snapshot,
+                policy_snapshot=policy_snapshot,
+                selected_business_tool_names=selected_business_tool_names,
+            )
+            return retry_builder.build(snapshot)
 
     def _run_input_builder_for_dispatch(
         self,
@@ -2281,7 +2355,7 @@ class HostDispatchScheduler:
         :raises HostDurableError: projection runner 或 durable 操作失败时抛出。
         """
 
-        catch_up_conversation_memory_projection(
+        result = catch_up_conversation_memory_projection(
             self._transaction_runner,
             policy=self._local_execution.memory_projection_policy,
             batch_size=(
@@ -2289,6 +2363,23 @@ class HostDispatchScheduler:
             ),
             max_event_sequence=(
                 self._required_memory_event_sequence_for_dispatch(record)
+            ),
+        )
+        if result.failures == 0:
+            return
+        _LOGGER.warning(
+            "dispatch.memory_projection.catch_up_failed_rebuild "
+            "run_id=%s attempt_id=%s execution_id=%s failures=%s",
+            record.run_id,
+            record.attempt_id,
+            record.execution_id,
+            result.failures,
+        )
+        rebuild_conversation_memory_projection(
+            self._transaction_runner,
+            policy=self._local_execution.memory_projection_policy,
+            batch_size=(
+                self._local_execution.memory_projection_catchup_batch_size
             ),
         )
 

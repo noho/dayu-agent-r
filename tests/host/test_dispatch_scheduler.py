@@ -23,7 +23,7 @@ from dayu.engine.contracts.engine_events import (
     RunFailedData,
 )
 from dayu.engine.contracts.finish_reason import FinishReason
-from dayu.engine.contracts.messages import AgentMessage
+from dayu.engine.contracts.messages import AgentMessage, AgentMessageRole, UserMessage
 from dayu.engine.contracts.runner_spec import RunnerCallOptions, RunnerSpec
 from dayu.contracts.json_value import JsonValue
 from dayu.contracts.tool_call import (
@@ -78,6 +78,19 @@ from dayu.host.dispatch import (
     HostDispatchScheduler,
     _safe_close_worker_handle,
     _safe_release_lane_token,
+)
+from dayu.host.memory import (
+    CONVERSATION_MEMORY_CONSUMER_ID,
+    MemoryRepairReason,
+    MemoryRepairRequest,
+    MemorySnapshotCursor,
+    default_memory_projection_policy,
+    digest_memory_projection_policy,
+)
+from dayu.host.run_input import (
+    MemoryProjectionRepairRequired,
+    NoToolExecutor,
+    PolicySnapshot,
 )
 from dayu.host.durable.codec import sha256_digest_json
 from dayu.host.durable.connection import HostDurableStore, open_host_durable_store
@@ -658,6 +671,63 @@ class _FakeWorkerFactory:
         return _AcceptingWorker(self)
 
 
+class _LagRepairRunInputBuilder:
+    """首次 build 抛出大滞后 repair，第二次返回最小 Engine request。"""
+
+    def __init__(self) -> None:
+        """初始化调用计数。
+
+        :returns: ``None``。
+        """
+
+        self.calls = 0
+
+    def build(self, snapshot: AttemptDispatchSnapshot) -> AgentRunRequest:
+        """构造测试 Engine request，首次模拟 snapshot 大滞后。
+
+        :param snapshot: dispatch snapshot。
+        :returns: 最小 no-tool Engine request。
+        :raises MemoryProjectionRepairRequired: 首次调用时抛出 lag repair。
+        """
+
+        self.calls += 1
+        if self.calls == 1:
+            policy = default_memory_projection_policy()
+            raise MemoryProjectionRepairRequired(
+                MemoryRepairRequest(
+                    session_id=snapshot.session_id,
+                    reason=MemoryRepairReason.SNAPSHOT_LAG_OVER_THRESHOLD,
+                    required_event_sequence=20,
+                    observed_cursor=MemorySnapshotCursor(
+                        consumer_id=CONVERSATION_MEMORY_CONSUMER_ID,
+                        checkpoint_event_sequence=0,
+                        checkpoint_event_id=None,
+                        session_id=snapshot.session_id,
+                    ),
+                    policy_digest=digest_memory_projection_policy(policy),
+                )
+            )
+        return AgentRunRequest(
+            run_id=snapshot.run_id,
+            session_id=snapshot.session_id,
+            messages=(
+                UserMessage(role=AgentMessageRole.USER, content="dispatch after lag"),
+            ),
+            disable_tools=True,
+            runner_spec=_runner_spec(),
+            runner_options=RunnerCallOptions(
+                temperature=None,
+                max_tokens=None,
+                top_p=None,
+                stream=False,
+            ),
+            agent_policy=_agent_policy(False),
+            tool_schemas=(),
+            tool_executor=NoToolExecutor(),
+            cancellation_token=snapshot.cancellation_token,
+        )
+
+
 class _SnapshotEventHandle(_FakeHandle):
     """按 dispatch snapshot 生成单个 EngineEvent 的 handle。"""
 
@@ -1065,6 +1135,69 @@ async def test_pending_waiting_dispatching_worker_accept_marks_running(
                 == seeded.dispatch_record_id
             )
             assert factory.accepted_requests[0].disable_tools is True
+        finally:
+            await scheduler.close()
+
+
+@pytest.mark.asyncio
+async def test_dispatch_lag_repair_rebuild_retry_does_not_fail_run(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """SNAPSHOT_LAG_OVER_THRESHOLD 触发 rebuild retry，不关闭 Run。"""
+
+    factory = _FakeWorkerFactory(accepted_handle=_ControlledBlockingHandle())
+    builder = _LagRepairRunInputBuilder()
+    with open_host_durable_store(_options(tmp_path)) as store:
+        seeded = _seed_current_run(store)
+        scheduler = await _open_scheduler(tmp_path, store, factory)
+
+        def _noop_catch_up(record: PendingDispatchRecord) -> None:
+            """跳过 dispatch 预构建 catch-up，让 builder 暴露 lag repair。
+
+            :param record: pending dispatch 摘要。
+            :returns: ``None``。
+            """
+
+            del record
+
+        def _fake_builder_for_dispatch(
+            *,
+            snapshot: AttemptDispatchSnapshot,
+            policy_snapshot: PolicySnapshot,
+            selected_business_tool_names: frozenset[str] | None,
+        ) -> _LagRepairRunInputBuilder:
+            """返回会先抛 lag repair 的测试 builder。
+
+            :param snapshot: dispatch snapshot。
+            :param policy_snapshot: 冻结 policy snapshot。
+            :param selected_business_tool_names: 冻结业务工具名。
+            :returns: 测试 builder。
+            """
+
+            del snapshot, policy_snapshot, selected_business_tool_names
+            return builder
+
+        monkeypatch.setattr(
+            scheduler,
+            "_catch_up_memory_projection_before_worker",
+            _noop_catch_up,
+        )
+        monkeypatch.setattr(
+            scheduler,
+            "_run_input_builder_for_dispatch",
+            _fake_builder_for_dispatch,
+        )
+        try:
+            scheduler.wake_dispatch(_pending_dispatch(seeded))
+            result = await scheduler.drain_once()
+
+            assert result.dispatched == 1
+            assert builder.calls == 2
+            assert factory.created == 1
+            assert _run_status(store.transaction_runner, seeded.run_id) == (
+                RunStatus.RUNNING
+            )
+            assert _event_count(store.transaction_runner, "RUN_FAILED") == 0
         finally:
             await scheduler.close()
 

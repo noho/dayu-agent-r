@@ -22,6 +22,7 @@ from dayu.host.compaction import (
     PinnedTextFieldPatch,
     PreservationEvidence,
 )
+from dayu.host.evidence import AcceptedEvidenceEnvelope
 
 _FAKE_COMPACTION_SYSTEM_PROMPT = (
     "Deterministic fake context compactor preserving current input and accepted facts."
@@ -203,7 +204,7 @@ def _confirmed_subjects(request: CompactionRequest) -> tuple[str, ...]:
 def _fact_candidates(
     request: CompactionRequest,
 ) -> tuple[EvidenceBackedFactCandidate, ...]:
-    """根据 accepted evidence 构造 deterministic fact candidates。
+    """根据 accepted evidence envelope 内容构造 deterministic fact candidates。
 
     :param request: compaction 请求。
     :returns: fact candidate tuple。
@@ -212,13 +213,26 @@ def _fact_candidates(
     return tuple(
         EvidenceBackedFactCandidate(
             candidate_id=f"fake-fact:{request.run_id}:{index}",
-            claim_text=f"Accepted evidence retained: {evidence_ref}",
+            claim_text=_fact_claim_from_envelope(envelope),
             evidence_kind=EvidenceBackedFactKind.OBSERVED_VALUE,
-            evidence_refs=(evidence_ref,),
+            evidence_refs=(envelope.evidence_id,),
             attributes={},
         )
-        for index, evidence_ref in enumerate(request.accepted_evidence_refs)
+        for index, envelope in enumerate(request.accepted_evidence_envelopes)
     )
+
+
+def _fact_claim_from_envelope(envelope: AcceptedEvidenceEnvelope) -> str:
+    """从 accepted evidence envelope 预览派生 fake fact claim。
+
+    :param envelope: accepted evidence envelope。
+    :returns: deterministic claim 文本。
+    """
+
+    result_preview = envelope.result_ref.result_preview
+    if result_preview is None:
+        return f"Accepted evidence has no preview: {envelope.evidence_id}"
+    return f"Accepted evidence preview: {result_preview}"
 
 
 def _minimum_preserve_items(

@@ -954,6 +954,21 @@ def test_typed_contracts_reject_invalid_ids_cursor_and_evidence_fact() -> None:
             excluded_reason=None,
             size_units=MemorySizeUnits(units=7),
         )
+    with pytest.raises(ValueError, match="claim_text"):
+        EvidenceBackedFactView(
+            item_id="fact-1",
+            claim_text="x" * (MAX_EVIDENCE_BACKED_FACT_CLAIM_TEXT_CHARS + 1),
+            evidence_kind=EvidenceBackedFactKind.OBSERVED_VALUE,
+            evidence_refs=("evidence-1",),
+            attributes={},
+            provenance=_tool_provenance(),
+            extraction_operation_ref="event:event-1",
+            compact_artifact_ref=None,
+            candidate_id="candidate-1",
+            included_reason=MemoryIncludedReason.EVIDENCE_BACKED_FACT,
+            excluded_reason=None,
+            size_units=MemorySizeUnits(units=7),
+        )
 
 
 def test_pinned_state_open_questions_are_not_duplicated() -> None:

@@ -347,6 +347,7 @@ def _accepted_evidence_envelope(suffix: str) -> AcceptedEvidenceEnvelope:
                 "sha256:dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd"
             ),
             truncation_applied=False,
+            result_preview=f"accepted evidence preview {suffix}",
         ),
         source_refs=(),
         locator_refs=(),
