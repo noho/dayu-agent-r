@@ -1602,9 +1602,17 @@ Plan 必须额外收口的 readiness review checklist：
 ### Phase 12.5. Conversation Memory Optimization
 
 状态：
-- design discussion / design write-back in progress。`evidence_backed_facts`、accepted evidence envelope 与 compaction-gated
-  extraction、recent_raw_turns_floor、minimum preserve 与 no-fallback-facts 稳定裁决已写回 `docs/host/design.md`；进入
-  implementation 前仍必须完成 handoff implementation-ready plan、plan review 与用户确认。
+- implementation-ready plan accepted；准备进入 implementation Slice 1 handoff。`evidence_backed_facts`、accepted evidence envelope 与
+  compaction-gated extraction、recent_raw_turns_floor、minimum preserve 与 no-fallback-facts 稳定裁决已写回
+  `docs/host/design.md`。Accepted design checkpoint 为 `9cfca70`。Planning handoff artifact 为
+  `docs/reviews/phase12-5-plan-handoff-controller-20260522.md`。Accepted plan artifact 为
+  `docs/reviews/phase12-5-implementation-ready-plan-20260522.md`；plan review artifacts 为
+  `docs/reviews/phase12-5-plan-review-mimo-20260522.md`、
+  `docs/reviews/phase12-5-plan-review-ds-20260522.md`、
+  `docs/reviews/phase12-5-plan-review-controller-adjudication-20260522.md`；plan re-review artifacts 为
+  `docs/reviews/phase12-5-plan-rereview-mimo-20260522.md`、
+  `docs/reviews/phase12-5-plan-rereview-ds-20260522.md`、
+  `docs/reviews/phase12-5-plan-rereview-controller-adjudication-20260522.md`。
 
 目标：
 - 从买方财报分析 Agent 的第一性原理优化 Conversation Memory，使同一 session 内已由工具确认的关键财务事实能跨轮、
@@ -1664,11 +1672,13 @@ Plan 必须额外收口的 readiness review checklist：
 - focused tests、integration smoke、pyright、README sync
 
 建议 slice 切分：
-- Slice 1: design write-back and public memory contract plan，冻结 evidence_backed_facts / recent continuity / minimum preserve 语义。
-- Slice 2: memory projection contract and evidence_backed_fact rendering，确保 compact 覆盖范围内的历史工具证据 claim 跨 compaction 稳定可见且带 evidence refs / diagnostic。
-- Slice 3: recent continuity and minimum preserve hardening，覆盖代词追问、极长输入后追问与 compact 后 minimum preserve item 注入。
-- Slice 4: compaction preservation and smoke validation，覆盖 confirmed facts 跨 compaction 不漂移。
-- Slice 5: aggregate validation、README sync、deepreview 与 residual tracking。
+- Slice 1: Contract Rename And Config Schema。
+- Slice 2: Accepted Evidence Envelope In Tool Accept Path。
+- Slice 3: Compaction Structured Candidate Contract And Accept Barrier。
+- Slice 4: LLM Compactor Structured JSON Rewrite。
+- Slice 5: Memory Projection Materialization。
+- Slice 6: RunInputBuilder Rendering And Compaction Request Wiring。
+- Slice 7: Integration Smoke, README Sync, Aggregate Validation。
 
 验证要求：
 - unit tests: accepted evidence envelope 能被 `evidence_backed_fact_candidates` 引用，Host accept barrier 只校验 `claim_text + evidence_refs` 通用 contract，不解析 source / locator。
