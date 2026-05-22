@@ -224,10 +224,10 @@ Phase Map 中每个 phase 必须使用统一条目格式。模板如下：
 
 当前 work unit：Phase 12.5 Conversation Memory Optimization。
 当前状态：P12 已完成；PR 67 已 draft-PR-pass 并由用户 merge。
-当前 gate：P12.5 aggregate re-review PASS；ready-to-open-draft-PR。
-下一步：提交 aggregate repair / re-review 控制文档后，按用户授权自动进入 draft PR gate，push 分支、创建 draft PR、执行 PR review / fix / re-review，直到 draft-PR-pass。
+当前 gate：P12.5 draft PR gate PASS；draft-PR-pass。
+下一步：等待用户对 PR 68 的后续指令；若需要将 draft PR 标记 ready for review 或处理 GitHub review / CI，再按 `$phaseflow` / `$init-agents` 继续。
 
-当前 gate 结论：P12.5 implementation Slice 1-7、aggregate deepreview、targeted repair 与 aggregate re-review 均已 PASS。`evidence_backed_facts` 现在基于 accepted evidence envelope 的 bounded `result_preview` 进入 LLM compact extraction；ToolRuntime accepted result 不直接物化 stable fact；accepted `CONTEXT_COMPACTED.evidence_backed_fact_candidates` 才进入 memory projection；dispatch memory projection lag 走 rebuild / retry，不触发 Run / Attempt 终态迁移。剩余风险为 `_NeverCancelledToken` compaction cancellation hardening、复杂工具结果 preview 质量与大 session rebuild performance，均不阻塞 draft PR。
+当前 gate 结论：P12.5 implementation Slice 1-7、aggregate deepreview、targeted repair、aggregate re-review 与 PR 68 draft review 均已 PASS。`evidence_backed_facts` 现在基于 accepted evidence envelope 的 bounded `result_preview` 进入 LLM compact extraction；ToolRuntime accepted result 不直接物化 stable fact；accepted `CONTEXT_COMPACTED.evidence_backed_fact_candidates` 才进入 memory projection；dispatch memory projection lag 走 rebuild / retry，不触发 Run / Attempt 终态迁移。剩余风险为 `_NeverCancelledToken` compaction cancellation hardening、compactor prompt aggregate envelope budget、复杂工具结果 preview 质量与大 session rebuild performance，均不阻塞 draft PR。
 
 ## Phase Map
 
@@ -1689,6 +1689,13 @@ Plan 必须额外收口的 readiness review checklist：
   `docs/reviews/phase12-5-aggregate-rereview-controller-adjudication-20260523.md`。Aggregate repair validation:
   `pytest tests/host/test_toolruntime_accept_barrier.py tests/host/test_llm_compaction.py tests/host/test_compaction_contract.py tests/host/test_compaction_operation.py tests/host/test_memory_projection.py tests/host/test_run_input_builder.py tests/host/test_dispatch_scheduler.py tests/host/test_compact_artifact_store.py tests/host/test_toolruntime_executor.py tests/service/test_host_assembly.py tests/runtime/test_config_loader.py`
   PASS (260 passed)；full pyright PASS (0 errors)；`git diff --check` PASS。P12.5 exit condition satisfied；ready-to-open-draft-PR。
+  Draft PR gate：PR 68 (`https://github.com/noho/dayu-agent-r/pull/68`) 已创建为 draft，branch 已 push 到
+  `origin/feat/phase-12-5-conversation-memory-optimize`，GitHub reported mergeable，status checks reported none。PR review artifacts
+  为 `docs/reviews/pr-68-review-20260523-024713.md`、
+  `docs/reviews/pr-68-review-ds-20260523.md`、
+  `docs/reviews/pr-68-review-controller-adjudication-20260523.md`。PR-level review PASS；DS 中等严重度 finding
+  `compactor prompt accepted evidence envelopes aggregate token guard` 裁决为 prompt-budget hardening residual，因为每个
+  `result_preview` 已有硬上限且 evidence-content correctness blocker 已关闭。P12.5 draft PR gate PASS；draft-PR-pass。
 
 目标：
 - 从买方财报分析 Agent 的第一性原理优化 Conversation Memory，使同一 session 内已由工具确认的关键财务事实能跨轮、
