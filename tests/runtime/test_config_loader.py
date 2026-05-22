@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+from dataclasses import fields
 from pathlib import Path
 
 import pytest
@@ -13,6 +14,7 @@ from dayu.runtime.config_loader import (
     ConfigFieldError,
     ConfigLoader,
     ConfigShapeError,
+    RunnerOptionHintConfig,
     RuntimeConfig,
     config_file_names,
     default_fallback_prompt,
@@ -47,13 +49,11 @@ def _runner_option_hints() -> dict[str, JsonValue]:
     return {
         "interactive": {
             "temperature": 0.2,
-            "max_tokens": 100,
             "top_p": 0.9,
             "stream": True,
         },
         "conversation_compaction": {
             "temperature": 0.0,
-            "max_tokens": 50,
             "top_p": 1.0,
             "stream": False,
         },
@@ -150,19 +150,18 @@ def _execution_profile_record() -> dict[str, JsonValue]:
                 "binary_bytes": {"max_bytes": 1024},
             },
         },
-        "agent_policy_profile_id": "default-agent",
+        "agent_policy": _agent_policy_record(),
     }
 
 
-def _agent_policy_profile_record() -> dict[str, JsonValue]:
-    """构造完整 agent policy profile fixture。
+def _agent_policy_record() -> dict[str, JsonValue]:
+    """构造完整 Agent policy fixture。
 
-    :returns: agent policy profile JSON object。
+    :returns: Agent policy JSON object。
     :raises Exception: 不主动抛出异常。
     """
 
     return {
-        "extends": None,
         "max_iterations": 3,
         "continuation_max_attempts": 1,
         "allow_tool_calls": True,
@@ -207,9 +206,6 @@ def _minimal_package_config(root: Path) -> None:
             "default_execution_profile_id": "standard",
             "execution_profiles": {
                 "standard": _execution_profile_record(),
-            },
-            "agent_policy_profiles": {
-                "default-agent": _agent_policy_profile_record(),
             },
         },
     )
@@ -284,13 +280,14 @@ def test_default_runtime_config_files_load_as_typed_views() -> None:
 
     assert "runtime_lanes.json" in config_file_names()
     assert config.models.models["deepseek-v4-flash"].model_id == "deepseek-v4-flash"
-    assert (
-        config.models.models["deepseek-v4-flash"]
-        .runtime_hints.runner_option_hints["interactive"]
-        .max_tokens
-        == 4096
-    )
+    assert "max_tokens" not in {field.name for field in fields(RunnerOptionHintConfig)}
     assert config.execution_profiles.default_execution_profile_id == "standard"
+    assert (
+        config.execution_profiles.execution_profiles[
+            "standard"
+        ].agent_policy.max_iterations
+        == 24
+    )
     assert config.host_runtime.default_host_runtime_id == "local"
     host_runtime = config.host_runtime.runtimes["local"]
     assert host_runtime.sqlite.write_busy_retry_count == 8
@@ -549,12 +546,47 @@ def test_old_execution_profile_fields_fail_fast(tmp_path: Path) -> None:
             "execution_profiles": {
                 "standard": _execution_profile_record(),
             },
-            "agent_policy_profiles": {
-                "default-agent": _agent_policy_profile_record(),
-            },
             "runner_options_profiles": {},
             "runner_hints": {},
             "agent_hints": {},
+        },
+    )
+
+    with pytest.raises(ConfigFieldError, match="unknown fields"):
+        ConfigLoader(package_config_dir=package_root).load_execution_profiles()
+
+
+def test_old_runner_hint_max_tokens_fails_fast(tmp_path: Path) -> None:
+    """旧 runner option hint max_tokens 字段必须作为未知字段失败。"""
+
+    package_root = tmp_path / "package"
+    _minimal_package_config(package_root)
+    model = _base_model_record(endpoint="https://package.example/chat")
+    runtime_hints = model["runtime_hints"]
+    assert isinstance(runtime_hints, dict)
+    runner_option_hints = runtime_hints["runner_option_hints"]
+    assert isinstance(runner_option_hints, dict)
+    interactive = runner_option_hints["interactive"]
+    assert isinstance(interactive, dict)
+    interactive["max_tokens"] = 100
+    _write_json(package_root / "models.json", {"models": {"base-model": model}})
+
+    with pytest.raises(ConfigFieldError, match="unknown fields"):
+        ConfigLoader(package_config_dir=package_root).load_models()
+
+
+def test_old_agent_policy_profile_id_fails_fast(tmp_path: Path) -> None:
+    """旧 execution profile agent_policy_profile_id 字段必须失败。"""
+
+    package_root = tmp_path / "package"
+    _minimal_package_config(package_root)
+    profile = _execution_profile_record()
+    profile["agent_policy_profile_id"] = "default-agent"
+    _write_json(
+        package_root / "execution_profiles.json",
+        {
+            "default_execution_profile_id": "standard",
+            "execution_profiles": {"standard": profile},
         },
     )
 
@@ -583,9 +615,6 @@ def test_execution_profile_must_not_embed_context_window_size(
             "execution_profiles": {
                 "standard": profile,
             },
-            "agent_policy_profiles": {
-                "default-agent": _agent_policy_profile_record(),
-            },
         },
     )
 
@@ -593,8 +622,8 @@ def test_execution_profile_must_not_embed_context_window_size(
         ConfigLoader(package_config_dir=package_root).load_execution_profiles()
 
 
-def test_agent_policy_profiles_must_not_be_empty(tmp_path: Path) -> None:
-    """execution_profiles.agent_policy_profiles 为空必须在配置加载期失败。"""
+def test_old_agent_policy_profiles_catalog_fails_fast(tmp_path: Path) -> None:
+    """旧顶层 agent_policy_profiles catalog 必须 fail fast。"""
 
     package_root = tmp_path / "package"
     _minimal_package_config(package_root)
@@ -605,14 +634,58 @@ def test_agent_policy_profiles_must_not_be_empty(tmp_path: Path) -> None:
             "execution_profiles": {
                 "standard": _execution_profile_record(),
             },
-            "agent_policy_profiles": {},
+            "agent_policy_profiles": {
+                "default-agent": _agent_policy_record(),
+            },
         },
     )
 
     with pytest.raises(
         ConfigFieldError,
-        match="agent_policy_profiles must not be empty",
+        match="unknown fields",
     ):
+        ConfigLoader(package_config_dir=package_root).load_execution_profiles()
+
+
+def test_agent_policy_missing_field_fails_fast(tmp_path: Path) -> None:
+    """内嵌 agent_policy 缺少必填字段必须失败。"""
+
+    package_root = tmp_path / "package"
+    _minimal_package_config(package_root)
+    profile = _execution_profile_record()
+    agent_policy = profile["agent_policy"]
+    assert isinstance(agent_policy, dict)
+    agent_policy.pop("continuation_prompt")
+    _write_json(
+        package_root / "execution_profiles.json",
+        {
+            "default_execution_profile_id": "standard",
+            "execution_profiles": {"standard": profile},
+        },
+    )
+
+    with pytest.raises(ConfigFieldError, match="missing required fields"):
+        ConfigLoader(package_config_dir=package_root).load_execution_profiles()
+
+
+def test_agent_policy_field_type_fails_fast(tmp_path: Path) -> None:
+    """内嵌 agent_policy 字段类型非法必须失败。"""
+
+    package_root = tmp_path / "package"
+    _minimal_package_config(package_root)
+    profile = _execution_profile_record()
+    agent_policy = profile["agent_policy"]
+    assert isinstance(agent_policy, dict)
+    agent_policy["allow_tool_calls"] = "yes"
+    _write_json(
+        package_root / "execution_profiles.json",
+        {
+            "default_execution_profile_id": "standard",
+            "execution_profiles": {"standard": profile},
+        },
+    )
+
+    with pytest.raises(ConfigFieldError, match="must be a boolean"):
         ConfigLoader(package_config_dir=package_root).load_execution_profiles()
 
 
@@ -675,14 +748,15 @@ def test_agent_fallback_mode_is_closed_enum(tmp_path: Path) -> None:
 
     package_root = tmp_path / "package"
     _minimal_package_config(package_root)
-    bad_agent = _agent_policy_profile_record()
+    profile = _execution_profile_record()
+    bad_agent = profile["agent_policy"]
+    assert isinstance(bad_agent, dict)
     bad_agent["fallback_mode"] = "finalize"
     _write_json(
         package_root / "execution_profiles.json",
         {
             "default_execution_profile_id": "standard",
-            "execution_profiles": {"standard": _execution_profile_record()},
-            "agent_policy_profiles": {"default-agent": bad_agent},
+            "execution_profiles": {"standard": profile},
         },
     )
 

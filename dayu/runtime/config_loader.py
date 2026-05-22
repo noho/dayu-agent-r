@@ -95,13 +95,11 @@ class RunnerOptionHintConfig:
     """模型内 semantic RunnerCallOptions hint。
 
     :param temperature: Runner 调用 temperature。
-    :param max_tokens: Runner 调用最大输出 token 数。
     :param top_p: Runner 调用 top-p。
     :param stream: 是否请求流式输出。
     """
 
     temperature: float
-    max_tokens: int
     top_p: float
     stream: bool
 
@@ -333,7 +331,7 @@ class ExecutionProfileConfig:
     :param context_budget_policy: 上下文预算基线。
     :param memory_projection_policy: memory projection 基线。
     :param tool_truncation_policy: 截断治理基线。
-    :param agent_policy_profile_id: Agent policy profile id。
+    :param agent_policy: 内嵌 Agent policy 基线。
     """
 
     execution_profile_id: str
@@ -342,14 +340,13 @@ class ExecutionProfileConfig:
     context_budget_policy: ContextBudgetConfig
     memory_projection_policy: MemoryProjectionConfig
     tool_truncation_policy: ToolTruncationPolicyConfig
-    agent_policy_profile_id: str
+    agent_policy: AgentPolicyConfig
 
 
 @dataclass(frozen=True, slots=True)
-class AgentPolicyProfileConfig:
-    """Agent policy profile。
+class AgentPolicyConfig:
+    """Execution profile 内嵌 Agent policy 配置。
 
-    :param agent_policy_profile_id: Agent policy profile 稳定标识，由 map key 注入。
     :param max_iterations: 最大 agent loop 迭代数。
     :param continuation_max_attempts: 长输出 continuation 次数。
     :param allow_tool_calls: 是否允许工具调用。
@@ -360,7 +357,6 @@ class AgentPolicyProfileConfig:
     :param max_consecutive_failed_tool_batches: 连续失败工具批次阈值。
     """
 
-    agent_policy_profile_id: str
     max_iterations: int
     continuation_max_attempts: int
     allow_tool_calls: bool
@@ -377,12 +373,10 @@ class ExecutionProfilesConfig:
 
     :param default_execution_profile_id: 默认 execution profile id。
     :param execution_profiles: 完整 execution profiles。
-    :param agent_policy_profiles: Agent policy profiles。
     """
 
     default_execution_profile_id: str
     execution_profiles: Mapping[str, ExecutionProfileConfig]
-    agent_policy_profiles: Mapping[str, AgentPolicyProfileConfig]
 
 
 @dataclass(frozen=True, slots=True)
@@ -651,9 +645,7 @@ class ConfigLoader:
             package_config_dir=self._package_config_dir,
             workspace_config_dir=workspace_config_dir,
             file_name=_EXECUTION_PROFILES_FILE,
-            map_fields=frozenset(
-                {"execution_profiles", "agent_policy_profiles"}
-            ),
+            map_fields=frozenset({"execution_profiles"}),
         )
         _require_exact_fields(
             root,
@@ -661,13 +653,11 @@ class ConfigLoader:
                 {
                     "default_execution_profile_id",
                     "execution_profiles",
-                    "agent_policy_profiles",
                 }
             ),
             context=_EXECUTION_PROFILES_FILE,
         )
         execution_profiles = _parse_execution_profile_map(root)
-        agent_policy_profiles = _parse_agent_policy_profile_map(root)
         default_execution_profile_id = _require_str_field(
             root,
             field_name="default_execution_profile_id",
@@ -678,14 +668,9 @@ class ConfigLoader:
             key=default_execution_profile_id,
             context="execution_profiles.default_execution_profile_id",
         )
-        _validate_execution_profile_references(
-            execution_profiles=execution_profiles,
-            agent_policy_profiles=agent_policy_profiles,
-        )
         return ExecutionProfilesConfig(
             default_execution_profile_id=default_execution_profile_id,
             execution_profiles=execution_profiles,
-            agent_policy_profiles=agent_policy_profiles,
         )
 
     def load_host_runtime(
@@ -1164,12 +1149,11 @@ def _parse_runner_option_hint(
 
     _require_exact_fields(
         record,
-        allowed=frozenset({"temperature", "max_tokens", "top_p", "stream"}),
+        allowed=frozenset({"temperature", "top_p", "stream"}),
         context=context,
     )
     return RunnerOptionHintConfig(
         temperature=_require_float_field(record, field_name="temperature", context=context),
-        max_tokens=_require_positive_int_field(record, field_name="max_tokens", context=context),
         top_p=_require_float_field(record, field_name="top_p", context=context),
         stream=_require_bool_field(record, field_name="stream", context=context),
     )
@@ -1224,7 +1208,7 @@ def _parse_execution_profile(
                 "context_budget_policy",
                 "memory_projection_policy",
                 "tool_truncation_policy",
-                "agent_policy_profile_id",
+                "agent_policy",
             }
         ),
         context=context,
@@ -1271,10 +1255,13 @@ def _parse_execution_profile(
             ),
             context=f"{context}.tool_truncation_policy",
         ),
-        agent_policy_profile_id=_require_str_field(
-            record,
-            field_name="agent_policy_profile_id",
-            context=context,
+        agent_policy=_parse_agent_policy(
+            _require_mapping_field(
+                record,
+                field_name="agent_policy",
+                context=context,
+            ),
+            context=f"{context}.agent_policy",
         ),
     )
 
@@ -1488,50 +1475,17 @@ def _parse_tool_truncation_limits(
     )
 
 
-def _parse_agent_policy_profile_map(
-    root: JsonObject,
-) -> Mapping[str, AgentPolicyProfileConfig]:
-    """解析 agent policy profiles。
+def _parse_agent_policy(
+    record: JsonObject, *, context: str
+) -> AgentPolicyConfig:
+    """解析 execution profile 内嵌 Agent policy。
 
-    :param root: execution_profiles.json 顶层 object。
-    :returns: agent policy profile map。
-    :raises ConfigLoadError: 记录继承或字段校验失败时抛出。
-    """
-
-    records = _resolve_record_map(
-        _require_mapping_field(
-            root,
-            field_name="agent_policy_profiles",
-            context=_EXECUTION_PROFILES_FILE,
-        ),
-        context="execution_profiles.agent_policy_profiles",
-    )
-    profiles: dict[str, AgentPolicyProfileConfig] = {}
-    for profile_id, record in records.items():
-        profiles[profile_id] = _parse_agent_policy_profile(
-            record_id=profile_id,
-            record=record,
-        )
-    if not profiles:
-        raise ConfigFieldError(
-            "execution_profiles agent_policy_profiles must not be empty"
-        )
-    return profiles
-
-
-def _parse_agent_policy_profile(
-    *, record_id: str, record: JsonObject
-) -> AgentPolicyProfileConfig:
-    """解析单个 agent policy profile。
-
-    :param record_id: agent policy profile id。
-    :param record: agent policy profile 记录。
-    :returns: agent policy profile typed config。
+    :param record: agent policy JSON object。
+    :param context: 错误消息上下文。
+    :returns: Agent policy typed config。
     :raises ConfigFieldError: 字段缺失、非法类型或 fallback mode 非法时抛出。
     """
 
-    context = f"execution_profiles.agent_policy_profiles.{record_id}"
-    _require_no_forbidden_id_fields(record, context=context)
     _require_exact_fields(
         record,
         allowed=frozenset(
@@ -1551,8 +1505,7 @@ def _parse_agent_policy_profile(
     fallback_mode = _require_str_field(record, field_name="fallback_mode", context=context)
     if fallback_mode not in _AGENT_FALLBACK_MODES:
         raise ConfigFieldError(f"{context}.fallback_mode has unsupported value: {fallback_mode}")
-    return AgentPolicyProfileConfig(
-        agent_policy_profile_id=record_id,
+    return AgentPolicyConfig(
         max_iterations=_require_positive_int_field(record, field_name="max_iterations", context=context),
         continuation_max_attempts=_require_non_negative_int_field(record, field_name="continuation_max_attempts", context=context),
         allow_tool_calls=_require_bool_field(record, field_name="allow_tool_calls", context=context),
@@ -1844,27 +1797,6 @@ def _parse_tool_bundle_source_kind(
     if source_kind not in _TOOL_DISCOVERY_SOURCE_KINDS:
         raise ConfigFieldError(f"{context} is not valid for tool discovery provider")
     return source_kind
-
-
-def _validate_execution_profile_references(
-    *,
-    execution_profiles: Mapping[str, ExecutionProfileConfig],
-    agent_policy_profiles: Mapping[str, AgentPolicyProfileConfig],
-) -> None:
-    """校验 execution profile 内部引用。
-
-    :param execution_profiles: execution profiles。
-    :param agent_policy_profiles: agent policy profiles。
-    :returns: 无返回值。
-    :raises ConfigFieldError: 引用不存在时抛出。
-    """
-
-    for profile_id, profile in execution_profiles.items():
-        _require_mapping_contains(
-            agent_policy_profiles,
-            key=profile.agent_policy_profile_id,
-            context=f"execution_profiles.execution_profiles.{profile_id}.agent_policy_profile_id",
-        )
 
 
 def _validate_execution_model_references(

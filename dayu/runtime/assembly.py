@@ -20,7 +20,7 @@ from dayu.contracts.tool_schema import (
     ToolTruncationStrategy,
 )
 from dayu.runtime.config_loader import (
-    AgentPolicyProfileConfig,
+    AgentPolicyConfig,
     ExecutionBaselineConfig,
     ModelConfig,
     ModelsConfig,
@@ -406,7 +406,7 @@ def parse_agent_policy_override_config(
 def merge_agent_policy_config(
     *,
     code_default: AgentPolicyDefaults,
-    execution_profile: AgentPolicyProfileConfig | None,
+    execution_profile: AgentPolicyConfig | None,
     scene_override: SceneAgentPolicyOverride | None,
     run_override: AgentPolicyOverrideConfig | None,
 ) -> MergedAgentPolicyConfig:

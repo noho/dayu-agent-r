@@ -43,7 +43,7 @@ from dayu.runtime.assembly import (
     tool_truncation_policy_defaults,
 )
 from dayu.runtime.config_loader import (
-    AgentPolicyProfileConfig,
+    AgentPolicyConfig,
     ExecutionBaselineConfig,
     ExecutionProfileConfig,
     HostRuntimeProfileConfig,
@@ -140,7 +140,6 @@ class ServiceOpenHostAssemblyDiagnostics:
     :param tool_provider_reports: 工具 provider 报告行。
     :param tool_selection: scene 工具选择摘要。
     :param context_budget_policy_ref: context budget policy ref。
-    :param agent_policy_profile_id: agent policy profile id。
     :param agent_policy_sources: Agent policy 字段来源摘要。
     :param tool_truncation_policy: tool truncation policy 摘要。
     :param ordinary_provider_extension_status: 普通 Runner provider extension 映射状态。
@@ -162,7 +161,6 @@ class ServiceOpenHostAssemblyDiagnostics:
     tool_provider_reports: tuple[str, ...]
     tool_selection: str
     context_budget_policy_ref: str
-    agent_policy_profile_id: str
     agent_policy_sources: tuple[str, ...]
     tool_truncation_policy: str
     ordinary_provider_extension_status: str
@@ -270,12 +268,11 @@ def compose_open_host_options(
         run_override=None,
         code_default=None,
     )
-    agent_profile = config.execution_profiles.agent_policy_profiles[
-        execution_profile.agent_policy_profile_id
-    ]
     agent_policy_config = merge_agent_policy_config(
-        code_default=_agent_policy_defaults_from_profile(agent_profile),
-        execution_profile=agent_profile,
+        code_default=_agent_policy_defaults_from_config(
+            execution_profile.agent_policy
+        ),
+        execution_profile=execution_profile.agent_policy,
         scene_override=request.scene_inputs.agent_policy_override,
         run_override=None,
     )
@@ -658,7 +655,6 @@ def _assembly_diagnostics(
         tool_provider_reports=tool_provider_reports,
         tool_selection=_format_tool_selection(scene_inputs),
         context_budget_policy_ref=execution_profile.context_budget_policy.policy_ref,
-        agent_policy_profile_id=execution_profile.agent_policy_profile_id,
         agent_policy_sources=tuple(
             f"{field_name}:{source}"
             for field_name, source in sorted(
@@ -754,18 +750,18 @@ def _runner_options_from_hint(
 
     return RunnerCallOptions(
         temperature=hint.temperature,
-        max_tokens=hint.max_tokens,
+        max_tokens=None,
         top_p=hint.top_p,
         stream=hint.stream,
     )
 
 
-def _agent_policy_defaults_from_profile(
-    profile: AgentPolicyProfileConfig,
+def _agent_policy_defaults_from_config(
+    profile: AgentPolicyConfig,
 ) -> AgentPolicyDefaults:
-    """从 execution profile 投影 runtime helper 所需 code default。
+    """从内嵌 Agent policy 配置投影 runtime helper 所需 code default。
 
-    :param profile: agent policy profile；调用方传入 ConfigLoader typed profile。
+    :param profile: ConfigLoader 输出的内嵌 Agent policy 配置。
     :returns: 与 profile 同值的默认字段集。
     :raises Exception: 不主动抛出异常。
     """

@@ -4,7 +4,11 @@ from __future__ import annotations
 
 from dataclasses import fields
 
-from dayu.runtime.config_loader import ModelConfig, load_runtime_config
+from dayu.runtime.config_loader import (
+    ModelConfig,
+    RunnerOptionHintConfig,
+    load_runtime_config,
+)
 
 
 def test_default_models_do_not_use_extra_payloads_bag() -> None:
@@ -66,13 +70,13 @@ def test_default_models_catalog_contains_migrated_legacy_records() -> None:
     assert set(config.models.models) == expected_model_ids
 
 
-def test_default_models_expose_runner_option_hints() -> None:
-    """迁移后的模型目录必须把 temperature profiles 转为 runner option hints。"""
+def test_default_models_expose_runner_option_hints_without_output_cap() -> None:
+    """默认模型目录不得通过 runner option hint 配置输出 token cap。"""
 
     config = load_runtime_config()
     model = config.models.models["qwen-plus"]
     hint = model.runtime_hints.runner_option_hints["conversation_compaction"]
 
     assert hint.temperature == 0.1
-    assert hint.max_tokens == 2048
     assert hint.stream is False
+    assert "max_tokens" not in {field.name for field in fields(RunnerOptionHintConfig)}

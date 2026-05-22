@@ -141,7 +141,7 @@ def test_merge_agent_policy_config_uses_typed_allowlist_precedence() -> None:
     """Agent policy 合并遵守 run > scene > profile > default 优先级。"""
 
     config = load_runtime_config()
-    profile = config.execution_profiles.agent_policy_profiles["standard-agent"]
+    profile = config.execution_profiles.execution_profiles["standard"].agent_policy
     run_override = parse_agent_policy_override_config(
         {
             "allow_tool_calls": False,
@@ -176,7 +176,7 @@ def test_merge_agent_policy_config_field_sources_is_runtime_immutable() -> None:
     """合并诊断来源不得通过返回对象被调用方原地修改。"""
 
     config = load_runtime_config()
-    profile = config.execution_profiles.agent_policy_profiles["standard-agent"]
+    profile = config.execution_profiles.execution_profiles["standard"].agent_policy
 
     merged = merge_agent_policy_config(
         code_default=_agent_policy_defaults(),
@@ -227,7 +227,7 @@ def test_runtime_assembly_helpers_do_not_construct_host_or_engine_objects() -> N
     """runtime assembly helper 返回值不得是 Host / Engine typed object。"""
 
     config = load_runtime_config()
-    profile = config.execution_profiles.agent_policy_profiles["standard-agent"]
+    profile = config.execution_profiles.execution_profiles["standard"].agent_policy
     selection = select_runner_option_hint(
         models=config.models,
         execution_baseline=config.execution_profiles.execution_profiles[

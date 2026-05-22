@@ -528,6 +528,10 @@ Phase Map 中每个 phase 必须使用统一条目格式。模板如下：
 
 当前 gate 追加事实（Phase 12.3 accepted plan commit）：Accepted Phase 12.3 plan local commit hash 为 `3ecbfad`。当前进入 Phase 12.3 Slice 1 implementation。
 
+当前 gate 追加事实（Phase 12.3 Slice 1 implementation）：Phase 12.3 Slice 1 implementation artifact 为 `docs/reviews/phase12-3-slice1-implementation-codex-20260522.md`；implementation agent 完成 Config Schema Cleanup，删除默认 config runner option hint `max_tokens` 来源，`execution_profiles.json` 改为内嵌 `agent_policy`，ConfigLoader / runtime assembly / Service assembly / focused tests / config README 已同步。AgentCodex reported：`pytest tests/runtime/test_config_loader.py tests/runtime/test_assembly_helpers.py tests/service/test_host_assembly.py tests/engine/test_config_models.py -q` 46 passed；`pytest tests/runtime/test_import_boundary.py tests/runtime/test_weak_typing_guard.py -q` 13 passed；`python -m pyright dayu/runtime dayu/service tests/runtime tests/service tests/engine/test_config_models.py` 0 errors；`git diff --check` clean。当前进入 Phase 12.3 Slice 1 code review。
+
+当前 gate 追加事实（Phase 12.3 Slice 1 code review accepted）：Phase 12.3 Slice 1 code review artifacts 为 `docs/reviews/phase12-3-slice1-code-review-mimo-20260522.md` 与 `docs/reviews/phase12-3-slice1-code-review-ds-20260522.md`，两份均 PASS，blocking finding count = 0。Controller adjudication artifact 为 `docs/reviews/phase12-3-slice1-code-review-controller-adjudication-20260522.md`；总控裁决：接受 Slice 1，不进入 fix pass。当前进入 Phase 12.3 Slice 1 accepted local commit。
+
 ## Phase Map
 
 Phase 按依赖关系推进：先实现被其它阶段依赖的公共契约、runtime 基础能力、durable store、EventLog 与状态机，再连接执行路径、工具治理、projection core、memory、context governance、ordinary local multi-turn public contract freeze、recovery 与 remote。Audit、Tool Trace、Outbox 是独立 projection sinks，后置到核心治理路径稳定之后实现。Phase 0 是 Engine cleanup 前置 work unit，只阻塞 Phase 10 Context Governance，不阻塞 Phase 1-9。每个 phase 开始时仍必须先和用户讨论并细化对应 `docs/host/design.md` 章节，再生成 handoff implementation-ready plan。

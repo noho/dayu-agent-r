@@ -96,6 +96,12 @@ def test_compose_open_host_options_uses_runtime_tuning_from_config(
     assert result.options.ordinary_run_baseline.runner_spec.headers[
         "Authorization"
     ] == f"Bearer {_API_KEY}"
+    assert result.options.ordinary_run_baseline.runner_options.max_tokens is None
+    compactor_baseline = result.options.compactor_runner_baseline
+    assert compactor_baseline is not None
+    assert compactor_baseline.compactor_runner_options.max_tokens is None
+    assert result.options.ordinary_run_baseline.agent_policy.max_iterations == 20
+    assert result.options.ordinary_run_baseline.agent_policy.continuation_max_attempts == 2
     assert result.diagnostics.model_source == "run_override"
     assert result.diagnostics.tool_selection == (
         "mode=select,tools=record_smoke_fact"
@@ -351,25 +357,22 @@ def _write_execution_profile_overlay(
                             "binary_bytes": {"max_bytes": 1048576},
                         },
                     },
-                    "agent_policy_profile_id": "standard-agent",
-                }
-            },
-            "agent_policy_profiles": {
-                "standard-agent": {
-                    "max_iterations": 24,
-                    "continuation_max_attempts": 2,
-                    "allow_tool_calls": True,
-                    "tool_execution_timeout_seconds": 120.0,
-                    "fallback_mode": "force_answer",
-                    "fallback_prompt": (
-                        "请基于已获得的信息直接回答问题。"
-                        "信息不足时必须说明不确定性，不得编造。"
-                    ),
-                    "continuation_prompt": (
-                        "请从上一条回复被截断的位置继续输出，"
-                        "保持原有语言、格式和结构，不要重复已经输出的内容。"
-                    ),
-                    "max_consecutive_failed_tool_batches": 2,
+                    "agent_policy": {
+                        "max_iterations": 24,
+                        "continuation_max_attempts": 2,
+                        "allow_tool_calls": True,
+                        "tool_execution_timeout_seconds": 120.0,
+                        "fallback_mode": "force_answer",
+                        "fallback_prompt": (
+                            "请基于已获得的信息直接回答问题。"
+                            "信息不足时必须说明不确定性，不得编造。"
+                        ),
+                        "continuation_prompt": (
+                            "请从上一条回复被截断的位置继续输出，"
+                            "保持原有语言、格式和结构，不要重复已经输出的内容。"
+                        ),
+                        "max_consecutive_failed_tool_batches": 2,
+                    },
                 }
             },
         },

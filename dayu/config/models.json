@@ -26,49 +26,41 @@
         "runner_option_hints": {
           "write": {
             "temperature": 1.3,
-            "max_tokens": 4096,
             "top_p": 1.0,
             "stream": true
           },
           "overview": {
             "temperature": 1.0,
-            "max_tokens": 4096,
             "top_p": 1.0,
             "stream": true
           },
           "audit": {
             "temperature": 0.8,
-            "max_tokens": 4096,
             "top_p": 1.0,
             "stream": true
           },
           "decision": {
             "temperature": 1.0,
-            "max_tokens": 4096,
             "top_p": 1.0,
             "stream": true
           },
           "interactive": {
             "temperature": 1.3,
-            "max_tokens": 4096,
             "top_p": 1.0,
             "stream": true
           },
           "prompt": {
             "temperature": 1.3,
-            "max_tokens": 4096,
             "top_p": 1.0,
             "stream": true
           },
           "infer": {
             "temperature": 0.5,
-            "max_tokens": 4096,
             "top_p": 1.0,
             "stream": true
           },
           "conversation_compaction": {
             "temperature": 0.4,
-            "max_tokens": 2048,
             "top_p": 1.0,
             "stream": false
           }
@@ -108,49 +100,41 @@
         "runner_option_hints": {
           "write": {
             "temperature": 1.3,
-            "max_tokens": 4096,
             "top_p": 1.0,
             "stream": true
           },
           "overview": {
             "temperature": 1.0,
-            "max_tokens": 4096,
             "top_p": 1.0,
             "stream": true
           },
           "audit": {
             "temperature": 0.8,
-            "max_tokens": 4096,
             "top_p": 1.0,
             "stream": true
           },
           "decision": {
             "temperature": 1.0,
-            "max_tokens": 4096,
             "top_p": 1.0,
             "stream": true
           },
           "interactive": {
             "temperature": 1.3,
-            "max_tokens": 4096,
             "top_p": 1.0,
             "stream": true
           },
           "prompt": {
             "temperature": 1.3,
-            "max_tokens": 4096,
             "top_p": 1.0,
             "stream": true
           },
           "infer": {
             "temperature": 0.5,
-            "max_tokens": 4096,
             "top_p": 1.0,
             "stream": true
           },
           "conversation_compaction": {
             "temperature": 0.4,
-            "max_tokens": 2048,
             "top_p": 1.0,
             "stream": false
           }
@@ -190,49 +174,41 @@
         "runner_option_hints": {
           "write": {
             "temperature": 0.8,
-            "max_tokens": 4096,
             "top_p": 1.0,
             "stream": true
           },
           "overview": {
             "temperature": 0.2,
-            "max_tokens": 4096,
             "top_p": 1.0,
             "stream": true
           },
           "audit": {
             "temperature": 0.2,
-            "max_tokens": 4096,
             "top_p": 1.0,
             "stream": true
           },
           "decision": {
             "temperature": 0.6,
-            "max_tokens": 4096,
             "top_p": 1.0,
             "stream": true
           },
           "interactive": {
             "temperature": 0.6,
-            "max_tokens": 4096,
             "top_p": 1.0,
             "stream": true
           },
           "prompt": {
             "temperature": 0.6,
-            "max_tokens": 4096,
             "top_p": 1.0,
             "stream": true
           },
           "infer": {
             "temperature": 0.2,
-            "max_tokens": 4096,
             "top_p": 1.0,
             "stream": true
           },
           "conversation_compaction": {
             "temperature": 0.2,
-            "max_tokens": 2048,
             "top_p": 1.0,
             "stream": false
           }
@@ -272,49 +248,41 @@
         "runner_option_hints": {
           "write": {
             "temperature": 0.9,
-            "max_tokens": 4096,
             "top_p": 1.0,
             "stream": true
           },
           "overview": {
             "temperature": 0.2,
-            "max_tokens": 4096,
             "top_p": 1.0,
             "stream": true
           },
           "audit": {
             "temperature": 0.2,
-            "max_tokens": 4096,
             "top_p": 1.0,
             "stream": true
           },
           "decision": {
             "temperature": 0.6,
-            "max_tokens": 4096,
             "top_p": 1.0,
             "stream": true
           },
           "interactive": {
             "temperature": 0.6,
-            "max_tokens": 4096,
             "top_p": 1.0,
             "stream": true
           },
           "prompt": {
             "temperature": 0.6,
-            "max_tokens": 4096,
             "top_p": 1.0,
             "stream": true
           },
           "infer": {
             "temperature": 0.2,
-            "max_tokens": 4096,
             "top_p": 1.0,
             "stream": true
           },
           "conversation_compaction": {
             "temperature": 0.2,
-            "max_tokens": 2048,
             "top_p": 1.0,
             "stream": false
           }
@@ -360,49 +328,41 @@
         "runner_option_hints": {
           "write": {
             "temperature": 1.0,
-            "max_tokens": 4096,
             "top_p": 1.0,
             "stream": true
           },
           "overview": {
             "temperature": 0.4,
-            "max_tokens": 4096,
             "top_p": 1.0,
             "stream": true
           },
           "audit": {
             "temperature": 0.1,
-            "max_tokens": 4096,
             "top_p": 1.0,
             "stream": true
           },
           "decision": {
             "temperature": 0.2,
-            "max_tokens": 4096,
             "top_p": 1.0,
             "stream": true
           },
           "interactive": {
             "temperature": 0.7,
-            "max_tokens": 4096,
             "top_p": 1.0,
             "stream": true
           },
           "prompt": {
             "temperature": 0.6,
-            "max_tokens": 4096,
             "top_p": 1.0,
             "stream": true
           },
           "infer": {
             "temperature": 0.1,
-            "max_tokens": 4096,
             "top_p": 1.0,
             "stream": true
           },
           "conversation_compaction": {
             "temperature": 0.3,
-            "max_tokens": 2048,
             "top_p": 1.0,
             "stream": false
           }
@@ -443,49 +403,41 @@
         "runner_option_hints": {
           "write": {
             "temperature": 1.0,
-            "max_tokens": 4096,
             "top_p": 1.0,
             "stream": true
           },
           "overview": {
             "temperature": 0.4,
-            "max_tokens": 4096,
             "top_p": 1.0,
             "stream": true
           },
           "audit": {
             "temperature": 0.1,
-            "max_tokens": 4096,
             "top_p": 1.0,
             "stream": true
           },
           "decision": {
             "temperature": 0.2,
-            "max_tokens": 4096,
             "top_p": 1.0,
             "stream": true
           },
           "interactive": {
             "temperature": 0.7,
-            "max_tokens": 4096,
             "top_p": 1.0,
             "stream": true
           },
           "prompt": {
             "temperature": 0.6,
-            "max_tokens": 4096,
             "top_p": 1.0,
             "stream": true
           },
           "infer": {
             "temperature": 0.1,
-            "max_tokens": 4096,
             "top_p": 1.0,
             "stream": true
           },
           "conversation_compaction": {
             "temperature": 0.3,
-            "max_tokens": 2048,
             "top_p": 1.0,
             "stream": false
           }
@@ -526,49 +478,41 @@
         "runner_option_hints": {
           "write": {
             "temperature": 1.0,
-            "max_tokens": 4096,
             "top_p": 1.0,
             "stream": true
           },
           "overview": {
             "temperature": 0.4,
-            "max_tokens": 4096,
             "top_p": 1.0,
             "stream": true
           },
           "audit": {
             "temperature": 0.1,
-            "max_tokens": 4096,
             "top_p": 1.0,
             "stream": true
           },
           "decision": {
             "temperature": 0.2,
-            "max_tokens": 4096,
             "top_p": 1.0,
             "stream": true
           },
           "interactive": {
             "temperature": 0.7,
-            "max_tokens": 4096,
             "top_p": 1.0,
             "stream": true
           },
           "prompt": {
             "temperature": 0.6,
-            "max_tokens": 4096,
             "top_p": 1.0,
             "stream": true
           },
           "infer": {
             "temperature": 0.1,
-            "max_tokens": 4096,
             "top_p": 1.0,
             "stream": true
           },
           "conversation_compaction": {
             "temperature": 0.3,
-            "max_tokens": 2048,
             "top_p": 1.0,
             "stream": false
           }
@@ -609,49 +553,41 @@
         "runner_option_hints": {
           "write": {
             "temperature": 1.0,
-            "max_tokens": 4096,
             "top_p": 1.0,
             "stream": true
           },
           "overview": {
             "temperature": 0.4,
-            "max_tokens": 4096,
             "top_p": 1.0,
             "stream": true
           },
           "audit": {
             "temperature": 0.1,
-            "max_tokens": 4096,
             "top_p": 1.0,
             "stream": true
           },
           "decision": {
             "temperature": 0.2,
-            "max_tokens": 4096,
             "top_p": 1.0,
             "stream": true
           },
           "interactive": {
             "temperature": 0.7,
-            "max_tokens": 4096,
             "top_p": 1.0,
             "stream": true
           },
           "prompt": {
             "temperature": 0.6,
-            "max_tokens": 4096,
             "top_p": 1.0,
             "stream": true
           },
           "infer": {
             "temperature": 0.1,
-            "max_tokens": 4096,
             "top_p": 1.0,
             "stream": true
           },
           "conversation_compaction": {
             "temperature": 0.3,
-            "max_tokens": 2048,
             "top_p": 1.0,
             "stream": false
           }
@@ -692,49 +628,41 @@
         "runner_option_hints": {
           "write": {
             "temperature": 1.0,
-            "max_tokens": 4096,
             "top_p": 1.0,
             "stream": true
           },
           "overview": {
             "temperature": 0.4,
-            "max_tokens": 4096,
             "top_p": 1.0,
             "stream": true
           },
           "audit": {
             "temperature": 0.1,
-            "max_tokens": 4096,
             "top_p": 1.0,
             "stream": true
           },
           "decision": {
             "temperature": 0.2,
-            "max_tokens": 4096,
             "top_p": 1.0,
             "stream": true
           },
           "interactive": {
             "temperature": 0.7,
-            "max_tokens": 4096,
             "top_p": 1.0,
             "stream": true
           },
           "prompt": {
             "temperature": 0.6,
-            "max_tokens": 4096,
             "top_p": 1.0,
             "stream": true
           },
           "infer": {
             "temperature": 0.1,
-            "max_tokens": 4096,
             "top_p": 1.0,
             "stream": true
           },
           "conversation_compaction": {
             "temperature": 0.3,
-            "max_tokens": 2048,
             "top_p": 1.0,
             "stream": false
           }
@@ -775,49 +703,41 @@
         "runner_option_hints": {
           "write": {
             "temperature": 0.8,
-            "max_tokens": 4096,
             "top_p": 1.0,
             "stream": true
           },
           "overview": {
             "temperature": 0.3,
-            "max_tokens": 4096,
             "top_p": 1.0,
             "stream": true
           },
           "audit": {
             "temperature": 0.4,
-            "max_tokens": 4096,
             "top_p": 1.0,
             "stream": true
           },
           "decision": {
             "temperature": 0.6,
-            "max_tokens": 4096,
             "top_p": 1.0,
             "stream": true
           },
           "interactive": {
             "temperature": 0.8,
-            "max_tokens": 4096,
             "top_p": 1.0,
             "stream": true
           },
           "prompt": {
             "temperature": 0.8,
-            "max_tokens": 4096,
             "top_p": 1.0,
             "stream": true
           },
           "infer": {
             "temperature": 0.3,
-            "max_tokens": 4096,
             "top_p": 1.0,
             "stream": true
           },
           "conversation_compaction": {
             "temperature": 0.3,
-            "max_tokens": 2048,
             "top_p": 1.0,
             "stream": false
           }
@@ -857,49 +777,41 @@
         "runner_option_hints": {
           "write": {
             "temperature": 0.8,
-            "max_tokens": 4096,
             "top_p": 1.0,
             "stream": true
           },
           "overview": {
             "temperature": 0.3,
-            "max_tokens": 4096,
             "top_p": 1.0,
             "stream": true
           },
           "audit": {
             "temperature": 0.4,
-            "max_tokens": 4096,
             "top_p": 1.0,
             "stream": true
           },
           "decision": {
             "temperature": 0.6,
-            "max_tokens": 4096,
             "top_p": 1.0,
             "stream": true
           },
           "interactive": {
             "temperature": 0.8,
-            "max_tokens": 4096,
             "top_p": 1.0,
             "stream": true
           },
           "prompt": {
             "temperature": 0.8,
-            "max_tokens": 4096,
             "top_p": 1.0,
             "stream": true
           },
           "infer": {
             "temperature": 0.3,
-            "max_tokens": 4096,
             "top_p": 1.0,
             "stream": true
           },
           "conversation_compaction": {
             "temperature": 0.3,
-            "max_tokens": 2048,
             "top_p": 1.0,
             "stream": false
           }
@@ -939,49 +851,41 @@
         "runner_option_hints": {
           "write": {
             "temperature": 0.8,
-            "max_tokens": 4096,
             "top_p": 1.0,
             "stream": true
           },
           "overview": {
             "temperature": 0.3,
-            "max_tokens": 4096,
             "top_p": 1.0,
             "stream": true
           },
           "audit": {
             "temperature": 0.4,
-            "max_tokens": 4096,
             "top_p": 1.0,
             "stream": true
           },
           "decision": {
             "temperature": 0.6,
-            "max_tokens": 4096,
             "top_p": 1.0,
             "stream": true
           },
           "interactive": {
             "temperature": 0.8,
-            "max_tokens": 4096,
             "top_p": 1.0,
             "stream": true
           },
           "prompt": {
             "temperature": 0.8,
-            "max_tokens": 4096,
             "top_p": 1.0,
             "stream": true
           },
           "infer": {
             "temperature": 0.3,
-            "max_tokens": 4096,
             "top_p": 1.0,
             "stream": true
           },
           "conversation_compaction": {
             "temperature": 0.3,
-            "max_tokens": 2048,
             "top_p": 1.0,
             "stream": false
           }
@@ -1021,49 +925,41 @@
         "runner_option_hints": {
           "write": {
             "temperature": 0.6,
-            "max_tokens": 4096,
             "top_p": 1.0,
             "stream": true
           },
           "overview": {
             "temperature": 0.1,
-            "max_tokens": 4096,
             "top_p": 1.0,
             "stream": true
           },
           "audit": {
             "temperature": 0.2,
-            "max_tokens": 4096,
             "top_p": 1.0,
             "stream": true
           },
           "decision": {
             "temperature": 0.3,
-            "max_tokens": 4096,
             "top_p": 1.0,
             "stream": true
           },
           "interactive": {
             "temperature": 0.6,
-            "max_tokens": 4096,
             "top_p": 1.0,
             "stream": true
           },
           "prompt": {
             "temperature": 0.6,
-            "max_tokens": 4096,
             "top_p": 1.0,
             "stream": true
           },
           "infer": {
             "temperature": 0.1,
-            "max_tokens": 4096,
             "top_p": 1.0,
             "stream": true
           },
           "conversation_compaction": {
             "temperature": 0.1,
-            "max_tokens": 2048,
             "top_p": 1.0,
             "stream": false
           }
@@ -1099,49 +995,41 @@
         "runner_option_hints": {
           "write": {
             "temperature": 0.6,
-            "max_tokens": 4096,
             "top_p": 1.0,
             "stream": true
           },
           "overview": {
             "temperature": 0.1,
-            "max_tokens": 4096,
             "top_p": 1.0,
             "stream": true
           },
           "audit": {
             "temperature": 0.2,
-            "max_tokens": 4096,
             "top_p": 1.0,
             "stream": true
           },
           "decision": {
             "temperature": 0.3,
-            "max_tokens": 4096,
             "top_p": 1.0,
             "stream": true
           },
           "interactive": {
             "temperature": 0.2,
-            "max_tokens": 4096,
             "top_p": 1.0,
             "stream": true
           },
           "prompt": {
             "temperature": 0.2,
-            "max_tokens": 4096,
             "top_p": 1.0,
             "stream": true
           },
           "infer": {
             "temperature": 0.1,
-            "max_tokens": 4096,
             "top_p": 1.0,
             "stream": true
           },
           "conversation_compaction": {
             "temperature": 0.1,
-            "max_tokens": 2048,
             "top_p": 1.0,
             "stream": false
           }

@@ -64,7 +64,7 @@ dayu/config/
 | `context_window_tokens` | 模型上下文窗口 token 数 |
 | `runtime_hints.runner_option_hints` | 模型内 semantic RunnerCallOptions hints |
 
-`runtime_hints.runner_option_hints` 的每个 hint 都是完整 RunnerCallOptions 配置片段，包含 `temperature`、`max_tokens`、`top_p` 与 `stream`。`max_tokens` 是 Runner 单次调用的最大输出 token 数，会进入 Engine provider payload；execution profile 只引用 `model_id` 和 semantic `runner_option_hint_id`，不保存 provider-specific 调用参数。
+`runtime_hints.runner_option_hints` 的每个 hint 都是默认 RunnerCallOptions 配置片段，只包含 `temperature`、`top_p` 与 `stream`。默认配置不提供输出 token cap；`RunnerCallOptions.max_tokens` 只保留给显式 per-run 或 provider adapter override 使用。execution profile 只引用 `model_id` 和 semantic `runner_option_hint_id`，不保存 provider-specific 调用参数。
 
 模型记录可以使用 `extends` 继承基础模型；子记录按顶层字段覆盖父记录。thinking 变体通常继承对应基础模型，只覆盖 `provider_request_extension`，需要 provider beta header 等差异时也可以同时覆盖完整 `headers` object。
 
@@ -75,8 +75,7 @@ dayu/config/
 | 字段 | 含义 |
 |---|---|
 | `default_execution_profile_id` | 默认 execution profile id，默认值为 `standard` |
-| `execution_profiles` | 普通 Run、compactor、context budget、memory projection、truncation 的完整基线 |
-| `agent_policy_profiles` | Agent loop、continuation、工具超时、fallback 等 policy profile |
+| `execution_profiles` | 普通 Run、compactor、context budget、memory projection、truncation 与 agent policy 的完整基线 |
 
 单个 execution profile 包含：
 
@@ -85,11 +84,11 @@ dayu/config/
 - `context_budget_policy`：对齐 Host public `ContextBudgetPolicy` 的 ratio-first 配置；上下文窗口来自 effective model 的 `context_window_tokens`。
 - `memory_projection_policy`：对齐 Host public `MemoryProjectionPolicy` 的 ratio / floor / cap 配置；上下文窗口来自 effective model 的 `context_window_tokens`。
 - `tool_truncation_policy`：只配置默认截断治理参数和默认 limits，不配置 per-tool strategy / target。
-- `agent_policy_profile_id`：引用 `agent_policy_profiles`。
+- `agent_policy`：内嵌 Agent loop、continuation、工具超时、fallback 等 policy。
 
-`agent_policy_profiles` 使用 `continuation_max_attempts`、`allow_tool_calls`、`max_consecutive_failed_tool_batches` 等当前 AgentPolicy 字段。`fallback_mode` 只允许 `force_answer` 与 `raise_error`；默认 fallback prompt 文本为“请基于已获得的信息直接回答问题。信息不足时必须说明不确定性，不得编造。”
+`agent_policy` 使用 `continuation_max_attempts`、`allow_tool_calls`、`max_consecutive_failed_tool_batches` 等当前 AgentPolicy 字段。`fallback_mode` 只允许 `force_answer` 与 `raise_error`；默认 fallback prompt 文本为“请基于已获得的信息直接回答问题。信息不足时必须说明不确定性，不得编造。”
 
-已删除旧 `runner_options_profiles`、`runner_hints` 与 `agent_hints` schema；这些字段出现在配置中会加载失败。
+已删除旧 `agent_policy_profiles`、`agent_policy_profile_id`、`runner_options_profiles`、`runner_hints` 与 `agent_hints` schema；这些字段出现在配置中会加载失败。
 
 ## host_runtime.json
 
@@ -189,13 +188,11 @@ Scene manifest 不表达 workflow step graph、next scene、artifact store、par
         "runner_option_hints": {
           "interactive": {
             "temperature": 1.3,
-            "max_tokens": 4096,
             "top_p": 1.0,
             "stream": true
           },
           "conversation_compaction": {
             "temperature": 0.4,
-            "max_tokens": 2048,
             "top_p": 1.0,
             "stream": false
           }
