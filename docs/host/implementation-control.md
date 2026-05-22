@@ -222,9 +222,9 @@ Phase Map 中每个 phase 必须使用统一条目格式。模板如下：
 
 约束：本节只保留当前 gate 结论；phase 过程流水必须归档到 `历史记录`，仍需追踪的风险或后续 owner 必须写入 `Open Questions 与风险追踪` 的 `追踪区`。
 
-当前 work unit：Phase 12.1 runtime assembly schema / public contract correction follow-up。
-当前 gate：draft-PR-pass。
-下一 gate：等待用户 merge PR 67 或提出后续 phase / PR review / CI 工作。
+当前 work unit：Phase 12.2 service assembly helper follow-up。
+当前 gate：accepted-local-PASS。
+下一 gate：等待用户确认是否继续推送到 PR 67 分支或进入后续 phase。
 
 当前 gate 追加事实（Phase 12.1 Slice 2 implementation）：Phase 12.1 Slice 2 implementation artifact 为 `docs/reviews/phase12-1-slice2-implementation-codex-20260521.md`；implementation agent 更新 `dayu.runtime.config_loader` 新 schema typed view、runtime location resolver、默认 `models.json` / `execution_profiles.json` / `host_runtime.json` / `runtime_lanes.json` / `tool_discovery.json` 配置、全量旧模型迁移、runtime / engine config tests 与 README。Controller 本地复跑：`pytest tests/runtime/test_config_loader.py tests/runtime/test_runtime_location.py tests/runtime/test_import_boundary.py tests/runtime/test_weak_typing_guard.py -q` 35 passed；`pytest tests/engine/test_config_models.py -q` 4 passed；`python -m pyright dayu/runtime tests/runtime tests/engine/test_config_models.py` 0 errors；`git diff --check` clean。当前进入 Phase 12.1 Slice 2 code review。
 
@@ -499,6 +499,16 @@ Phase Map 中每个 phase 必须使用统一条目格式。模板如下：
 当前 gate 追加事实（Phase 12.1 Slice 1 re-review accepted）：Phase 12.1 Slice 1 re-review artifacts 为 `docs/reviews/phase12-1-slice1-rereview-mimo-20260521.md` 与 `docs/reviews/phase12-1-slice1-rereview-ds-20260521.md`，两份均 PASS，确认 MiMo F-1 / DS F1 与 MiMo F-2 已收口且无新增 blocker。Controller re-review adjudication artifact 为 `docs/reviews/phase12-1-slice1-rereview-controller-adjudication-20260521.md`。总控裁决：Slice 1 fix accepted；DS F2 保持 rejected-current-slice，DS F3 保持 deferred 到 Slice 2 / Slice 4。当前进入 Slice 1 accepted local commit bookkeeping。
 
 当前 gate 追加事实（Phase 12.1 Slice 1 accepted）：Accepted Slice 1 local commit hash 为 `9974a2d`。提交未包含 pre-existing out-of-scope dirty files `README.md` 与 `utils/smoke_host_public_multiturn.py`；它们仍留待对应 slice /后续审计。当前进入 Slice 2 implementation。
+
+当前 gate 追加事实（Phase 12.2 service assembly implementation）：Phase 12.2 plan artifact 为 `docs/reviews/phase12-2-service-assembly-plan-codex-20260522.md`；implementation artifact 为 `docs/reviews/phase12-2-service-assembly-implementation-codex-20260522.md`。AgentCodex 新增 `dayu.service.host_assembly` 正式 Service assembly helper，补 `host_runtime.json` Host construction tuning 字段，更新 `ConfigLoader` typed schema，`ScenePrepare` 输出 `system_prompt`，并将 `utils/smoke_host_public_multiturn.py` 改为通过 runtime location resolver、ConfigLoader、ToolsDiscovery、ScenePrepare 与 Service helper 装配 public `open_host(options)` / per-run request。Controller 本地复跑：`pytest tests/runtime -q` 208 passed；`pytest tests/engine/test_config_models.py tests/engine/test_provider_extension_config_adapter.py -q` 11 passed；`pytest tests/service -q` 2 passed；`pytest tests/host/test_public_open_host_multiturn_smoke.py tests/host/test_public_tool_wiring_smoke.py tests/host/test_public_compact_smoke.py -q` 8 passed；`python utils/smoke_host_public_multiturn.py --help` exit 0；`python -m pyright dayu/contracts dayu/runtime dayu/engine dayu/host dayu/service tests/runtime tests/engine tests/host tests/service utils/smoke_host_public_multiturn.py` 0 errors；`git diff --check` clean。当前进入 Phase 12.2 code review。
+
+当前 gate 追加事实（Phase 12.2 code review）：Phase 12.2 code review artifacts 为 `docs/reviews/phase12-2-service-assembly-code-review-mimo-20260522.md` 与 `docs/reviews/phase12-2-service-assembly-code-review-ds-20260522.md`。MiMo verdict 为 PASS，blocking finding count = 0；DS verdict 为 PASS_WITH_FINDINGS，blocking finding count = 0。Controller 裁决：接受 DS Finding 1 `_agent_fallback_mode_from_config` 手工 fallback enum 映射为当前窄 fix；DS Finding 2 根 README 死链为本轮前既存 out-of-scope / deferred，不在本轮修复。当前进入 Phase 12.2 fix。
+
+当前 gate 追加事实（Phase 12.2 fix）：DS Finding 1 已由 AgentCodex 修复，fix addendum 已追加到 `docs/reviews/phase12-2-service-assembly-implementation-codex-20260522.md`；`_agent_fallback_mode_from_config` 改为 `AgentFallbackMode(value)`，并补 `tests/service/test_host_assembly.py` focused fallback mode 测试。Controller 本地复跑：`pytest tests/service -q` 3 passed；`python -m pyright dayu/service tests/service` 0 errors；`git diff --check` clean。当前进入 Phase 12.2 re-review。
+
+当前 gate 追加事实（Phase 12.2 re-review accepted）：Phase 12.2 re-review artifacts 为 `docs/reviews/phase12-2-service-assembly-rereview-mimo-20260522.md` 与 `docs/reviews/phase12-2-service-assembly-rereview-ds-20260522.md`，两份均 PASS，确认 DS Finding 1 已收口且无新增 blocker。Controller adjudication artifact 为 `docs/reviews/phase12-2-service-assembly-rereview-controller-adjudication-20260522.md`。Controller final validation：`pytest tests/runtime -q` 208 passed；`pytest tests/engine/test_config_models.py tests/engine/test_provider_extension_config_adapter.py -q` 11 passed；`pytest tests/service -q` 3 passed；`pytest tests/host/test_public_open_host_multiturn_smoke.py tests/host/test_public_tool_wiring_smoke.py tests/host/test_public_compact_smoke.py -q` 8 passed；`python utils/smoke_host_public_multiturn.py --help` exit 0；`python -m pyright dayu/contracts dayu/runtime dayu/engine dayu/host dayu/service tests/runtime tests/engine tests/host tests/service utils/smoke_host_public_multiturn.py` 0 errors；`git diff --check` clean。Phase 12.2 service assembly helper follow-up 达到 local-PASS；剩余 non-blocking item 为本轮前既存根 README dead-link cleanup，deferred 到后续 docs cleanup owner。
+
+当前 gate 追加事实（Phase 12.2 accepted local commit）：Accepted Phase 12.2 local commit hash 为 `8ec547c`。提交未包含用户要求保持不动的两个 pre-existing full-repo review artifacts：`docs/reviews/repo-review-20260522-070034.md` 与 `docs/reviews/repo-review-20260522-070045.md`。当前 gate 为 accepted-local-PASS。
 
 ## Phase Map
 

@@ -222,6 +222,9 @@ def test_single_scene_assembly_outputs_stable_refs_and_digest(tmp_path: Path) ->
         "你是Dayu Corp财报分析员。",
         "分析Dayu Corp在2026年的收入。",
     )
+    assert result.system_prompt == (
+        "你是Dayu Corp财报分析员。\n\n分析Dayu Corp在2026年的收入。"
+    )
     assert tuple(ref.fragment_id for ref in result.fragment_refs) == ("base", "detail")
     assert tuple(ref.relative_path for ref in result.fragment_refs) == (
         "base.md",

@@ -227,10 +227,16 @@ def _minimal_package_config(root: Path) -> None:
                     "sqlite": {
                         "path": "workspace/.dayu/host/dayu.sqlite3",
                         "busy_timeout_seconds": 5.0,
+                        "write_busy_retry_count": 8,
+                        "write_retry_initial_delay_seconds": 0.005,
+                        "write_retry_backoff_multiplier": 1.5,
+                        "write_retry_max_delay_seconds": 0.05,
                     },
                     "host_execution_lane_name": "llm_api",
                     "worker_backend": "local",
                     "dispatch_poll_interval_seconds": 0.1,
+                    "payload_inline_threshold_bytes": 4096,
+                    "worker_startup_timeout_seconds": 10.0,
                     "memory_projection_catch_up_batch_size": 10,
                     "truncation_manager_enabled": True,
                 }
@@ -289,6 +295,11 @@ def test_default_runtime_config_files_load_as_typed_views() -> None:
     )
     assert config.execution_profiles.default_execution_profile_id == "standard"
     assert config.host_runtime.default_host_runtime_id == "local"
+    host_runtime = config.host_runtime.runtimes["local"]
+    assert host_runtime.sqlite.write_busy_retry_count == 8
+    assert host_runtime.sqlite.write_retry_initial_delay_seconds == 0.005
+    assert host_runtime.payload_inline_threshold_bytes == 4096
+    assert host_runtime.worker_startup_timeout_seconds == 10.0
     assert config.runtime_lanes.lanes["llm_api"].capacity == 4
     provider = config.tool_discovery.providers["financial-tools"]
     assert provider.source_kind == ToolBundleSourceKind.EXPLICIT_PROVIDER
@@ -590,10 +601,16 @@ def test_host_runtime_lane_reference_must_exist(tmp_path: Path) -> None:
                     "sqlite": {
                         "path": "workspace/.dayu/host/dayu.sqlite3",
                         "busy_timeout_seconds": 5.0,
+                        "write_busy_retry_count": 8,
+                        "write_retry_initial_delay_seconds": 0.005,
+                        "write_retry_backoff_multiplier": 1.5,
+                        "write_retry_max_delay_seconds": 0.05,
                     },
                     "host_execution_lane_name": "missing_lane",
                     "worker_backend": "local",
                     "dispatch_poll_interval_seconds": 0.1,
+                    "payload_inline_threshold_bytes": 4096,
+                    "worker_startup_timeout_seconds": 10.0,
                     "memory_projection_catch_up_batch_size": 10,
                     "truncation_manager_enabled": True,
                 }

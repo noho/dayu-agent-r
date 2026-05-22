@@ -364,6 +364,7 @@ class PreparedSceneInputs:
     """ScenePrepare 装配输出。
 
     :param system_messages: 已完成 context slot 渲染的系统消息片段。
+    :param system_prompt: 已完成 context slot 渲染并用空行连接的系统提示词。
     :param tool_selection: 工具选择结果。
     :param model_hints: 可选模型 hint。
     :param agent_policy_override: 可选 AgentPolicy typed override。
@@ -374,6 +375,7 @@ class PreparedSceneInputs:
     """
 
     system_messages: tuple[str, ...]
+    system_prompt: str
     tool_selection: SceneToolSelectionResult
     model_hints: SceneModelHints | None
     agent_policy_override: SceneAgentPolicyOverride | None
@@ -507,6 +509,7 @@ class ScenePrepare:
         )
         return PreparedSceneInputs(
             system_messages=rendered_messages,
+            system_prompt="\n\n".join(rendered_messages),
             tool_selection=tool_selection,
             model_hints=resolved.model_hints,
             agent_policy_override=resolved.agent_policy_override,

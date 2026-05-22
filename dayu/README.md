@@ -60,6 +60,12 @@ Host 是 Session / Run / Attempt / EventLog / admission / cancel / resume / retr
 
 Host-owned LLM compaction 通过 `OpenHostOptions` 的预算治理配置与 `CompactorRunnerBaseline` 装配。业务侧传入 compactor 运行基线；Host 在自己的 Context Governance 边界内构造 compaction request、校验 candidate，并写入 compact artifact 与 canonical event。
 
+### `dayu.service`
+
+`dayu.service` 承载 Host 外部的 Service composition helper。当前 `host_assembly` helper 从 runtime typed config、runtime locations、工具发现结果、prepared scene、显式 override 与 env/secret mapping 组合 `OpenHostOptions` 与 `SubmitFollowupRequest`。
+
+Service 可以依赖 Host / Engine public contracts，但不得让 `dayu.runtime` 反向依赖 Service，不得绕过 Host public handle 写 Host truth，也不得把 raw config fragment、profile id 或 patch dict 传入 Host。
+
 ### `dayu.runtime`
 
 `dayu.runtime` 可被多层复用，但不得 import `dayu.engine` / `dayu.host` / `dayu.service` / `dayu.ui` / `dayu.fins`。各层需要公共运行时能力时，应优先复用或扩展 `dayu.runtime`，避免自行实现语义不一致的 helper。
@@ -73,7 +79,7 @@ Host-owned LLM compaction 通过 `OpenHostOptions` 的预算治理配置与 `Com
 - `tools_discovery`：按显式 import path 或 package entry point 解析 provider callable，聚合 provider 输出为业务 `ToolBundle`、provider report 与 source refs；不扫描业务包，不持有 Host / Service 上下文。
 - `config_loader`：读取包内默认配置和调用方显式传入的 workspace 覆盖目录，输出 `models`、`execution_profiles`、`host_runtime`、`runtime_lanes` 与 `tool_discovery` 五类 typed config view；不构造 Host，不创建 provider client，不解释 scene manifest，不解析 secret。
 - `location`：根据项目根目录与包内配置根目录解析 `workspace/config` 覆盖目录、prompt asset root 与 scene manifest root；ConfigLoader 和 ScenePrepare 不内置 workspace fallback。
-- `scene_prepare`：读取调用方显式传入的 scene manifest root 与 prompt asset root，校验 scene-only manifest、加载直接引用的 prompt fragments，用 typed context slot values 渲染 system messages，并输出工具选择、model hints、typed agent policy override、fragment refs、source refs 与 content digest；不读取 ConfigLoader，不做工具发现，不表达 workflow、conversation lifecycle 或 Host runtime 部署。
+- `scene_prepare`：读取调用方显式传入的 scene manifest root 与 prompt asset root，校验 scene-only manifest、加载直接引用的 prompt fragments，用 typed context slot values 渲染 system messages，并输出已拼接的 system prompt、工具选择、model hints、typed agent policy override、fragment refs、source refs 与 content digest；不读取 ConfigLoader，不做工具发现，不表达 workflow、conversation lifecycle 或 Host runtime 部署。
 - `assembly`：提供 runtime-neutral 的 catalog selection、typed allowlist override merge、Agent policy 字段来源诊断与工具截断 policy defaults 投影；不构造 Host / Engine typed object。
 - `tool_truncation`：把允许缺省 limit / TTL 的 `ToolTruncateSpec` declaration 按调用方提供的 policy defaults 补齐为 effective spec；不导入 Host 或 Engine。
 
@@ -117,7 +123,7 @@ Host-owned LLM compaction 通过 `OpenHostOptions` 的预算治理配置与 `Com
 
 - 新 UI / CLI / Web / GUI 入口：通过 Service 解析身份、场景和调用上下文，再调用 `dayu.host` public handle；不要直接控制 Engine。
 - 新业务工具：用 `@tool(...)` 同源声明 schema、展示信息、截断声明和 callable，经 `dayu.runtime.tools_discovery` 或外部 composition root 组装为 `ToolBundle`，通过 `HostToolingOptions` 传入 Host construction。
-- 新 scene manifest：通过 `dayu.runtime.scene_prepare` 在 Host 外部装配成 typed scene inputs，再由 Service / composition root 显式映射到 Host construction-time inputs 与 per-run request inputs。
+- 新 scene manifest：通过 `dayu.runtime.scene_prepare` 在 Host 外部装配成 typed scene inputs，再由 `dayu.service.host_assembly` 或等价 Service composition root 显式映射到 Host construction-time inputs 与 per-run request inputs。
 - 新 provider request extension DSL：在 `dayu.engine.provider_extensions` 中映射到 Engine `ProviderRequestExtension` 封闭联合；不要把 Engine contract 解析 helper 放进 `dayu.runtime`。
 - 新财报数据能力：在 `dayu.fins.storage` 仓储协议与实现内扩展文档存取；工具或 Service 通过仓储协议访问，不旁路读取文件或数据库。
 - 新本地执行能力：实现 `LocalEngineWorkerFactory` / `LocalEngineWorker`，并通过 `OpenHostOptions` 装配到 Host。
@@ -132,4 +138,5 @@ Host-owned LLM compaction 通过 `OpenHostOptions` 的预算治理配置与 `Com
 3. `docs/host/design.md` 与 `dayu.host/README.md`：理解 Host 稳定设计、Session / Run / Attempt / EventLog、admission、dispatch、ToolRuntime、memory / context governance。
 4. `dayu.host` 包根与 `dayu.host.open_host`：理解 public handle、`OpenHostOptions`、普通 command facade 和本地执行装配。
 5. `dayu.runtime`：理解日志、取消、lane、filelock 等层中立运行期能力。
-6. `tests/README.md` 与对应测试目录：用测试确认边界约束、公共入口和关键状态机行为。
+6. `dayu.service/README.md` 与 `dayu.service.host_assembly`：理解 Host 外部 runtime assembly 如何生成 Host public typed inputs。
+7. `tests/README.md` 与对应测试目录：用测试确认边界约束、公共入口和关键状态机行为。

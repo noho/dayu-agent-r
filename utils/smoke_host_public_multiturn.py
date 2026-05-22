@@ -15,10 +15,9 @@ import argparse
 import asyncio
 import os
 import pathlib
-import re
 import sys
 from collections.abc import AsyncIterator, Mapping, Sequence
-from dataclasses import dataclass, replace
+from dataclasses import dataclass
 from typing import Final
 from uuid import uuid4
 
@@ -43,53 +42,22 @@ from dayu.contracts.tool_schema import (
     ToolParametersSchema,
     ToolSchema,
 )
-from dayu.engine import AgentFallbackMode, AgentPolicy
-from dayu.engine.contracts.runner_spec import RunnerCallOptions, RunnerSpec
-from dayu.engine.provider_extensions import provider_request_extension_from_json
 from dayu.host import (
-    CompactorRunnerBaseline,
     EnsureSessionRequest,
     FollowupBehavior,
     Host,
     HostCallContext,
     HostEvent,
     HostEventKind,
-    HostToolingOptions,
     OpenHostOptions,
     OperationContext,
-    OrdinaryRunExecutionBaseline,
-    SubmitFollowupRequest,
     open_host,
 )
 from dayu.host.api import AuthorizationClaim
-from dayu.host.context_policy import default_context_budget_policy
-from dayu.host.local_proxy import DefaultLocalEngineWorkerFactory
-from dayu.host.memory import MemoryProjectionPolicy
-from dayu.runtime.assembly import (
-    AgentPolicyDefaults,
-    MergedAgentPolicyConfig,
-    ModelRunnerHintOverride,
-    RuntimeAssemblySelectionError,
-    RunnerOptionHintSelection,
-    effective_tool_truncate_spec_from_policy,
-    merge_agent_policy_config,
-    parse_model_runner_hint_override,
-    select_runner_option_hint,
-    tool_truncation_policy_defaults,
-)
 from dayu.runtime.config_loader import (
-    AgentPolicyProfileConfig,
     ConfigLoader,
-    ExecutionBaselineConfig,
-    ExecutionProfileConfig,
-    HostRuntimeProfileConfig,
-    ModelConfig,
-    RuntimeConfig,
-    RuntimeLaneConfig,
-    RunnerOptionHintConfig,
-    ToolDiscoveryProviderConfig,
 )
-from dayu.runtime.location import RuntimeLocations, resolve_runtime_locations
+from dayu.runtime.location import resolve_runtime_locations
 from dayu.runtime.log import LogLevel, configure
 from dayu.runtime.scene_prepare import (
     PreparedSceneInputs,
@@ -97,10 +65,15 @@ from dayu.runtime.scene_prepare import (
     SceneToolCatalog,
     prepare_scene,
 )
+from dayu.service.host_assembly import (
+    ServiceAssemblyOverrides,
+    ServiceOpenHostAssemblyDiagnostics,
+    ServiceOpenHostAssemblyRequest,
+    compose_open_host_options,
+    compose_submit_followup_request,
+    discover_service_tools,
+)
 from dayu.runtime.tools_discovery import (
-    PackageEntryPointProvider,
-    PythonImportPathProvider,
-    ToolsDiscovery,
     ToolsDiscoveryProviderOutput,
     ToolsDiscoveryProviderSpec,
 )
@@ -116,23 +89,6 @@ _SMOKE_CLIENT_REQUEST_PREFIX: Final[str] = "runtime-assembly-smoke"
 _FINAL_PREVIEW_CHARS: Final[int] = 500
 _PROMPT_PAD_REPEAT: Final[int] = 90
 _COMPACT_ARTIFACT_PRINT_LIMIT: Final[int] = 10
-_WORKER_STARTUP_TIMEOUT_SECONDS: Final[float] = 10.0
-_SQLITE_WRITE_BUSY_RETRY_COUNT: Final[int] = 8
-_SQLITE_WRITE_RETRY_INITIAL_DELAY_SECONDS: Final[float] = 0.005
-_SQLITE_WRITE_RETRY_BACKOFF_MULTIPLIER: Final[float] = 1.5
-_SQLITE_WRITE_RETRY_MAX_DELAY_SECONDS: Final[float] = 0.05
-_PAYLOAD_INLINE_THRESHOLD_BYTES: Final[int] = 4096
-_ENV_PLACEHOLDER_PATTERN: Final[re.Pattern[str]] = re.compile(
-    r"\{\{([A-Za-z_][A-Za-z0-9_]*)\}\}"
-)
-_WORKER_BACKEND_LOCAL: Final[str] = "local"
-_HELPER_COMPOSE_OPEN_HOST_OPTIONS: Final[str] = "compose_open_host_options"
-_HELPER_COMPOSE_SUBMIT_FOLLOWUP_REQUEST: Final[str] = (
-    "compose_submit_followup_request"
-)
-_HELPER_PROVIDER_EXTENSION_FROM_CONFIG: Final[str] = (
-    "provider_extension_from_config"
-)
 
 
 @dataclass(frozen=True, slots=True)
@@ -178,92 +134,6 @@ class RoundResult:
 
 
 @dataclass(frozen=True, slots=True)
-class AssemblyDiagnostics:
-    """Host 调用前输出的 runtime assembly 诊断。
-
-    :param config_overlay_dir: workspace config overlay 目录。
-    :param prompt_asset_root: prompt asset 根目录。
-    :param scene_manifest_root: scene manifest 根目录。
-    :param host_runtime_id: Host runtime id。
-    :param execution_profile_id: execution profile id。
-    :param model_id: 普通 Run 模型 id。
-    :param model_source: 模型 id 来源层。
-    :param runner_option_hint_id: 普通 Run runner option hint id。
-    :param runner_option_hint_source: runner option hint 来源层。
-    :param compactor_model_id: compactor 模型 id。
-    :param compactor_runner_option_hint_id: compactor runner option hint id。
-    :param lane_name: runtime lane 名。
-    :param tool_provider_reports: 工具 provider 报告行。
-    :param tool_selection: scene 工具选择摘要。
-    :param context_budget_policy_ref: context budget policy ref。
-    :param agent_policy_profile_id: agent policy profile id。
-    :param agent_policy_sources: Agent policy 字段来源摘要。
-    :param tool_truncation_policy: tool truncation policy 摘要。
-    :param ordinary_provider_extension_status: 普通 Runner provider extension 映射状态。
-    :param compactor_provider_extension_status: compactor provider extension 映射状态。
-    :param suggested_helper_names: 建议后续提取的 helper 名称。
-    """
-
-    config_overlay_dir: pathlib.Path | None
-    prompt_asset_root: pathlib.Path
-    scene_manifest_root: pathlib.Path
-    host_runtime_id: str
-    execution_profile_id: str
-    model_id: str
-    model_source: str
-    runner_option_hint_id: str
-    runner_option_hint_source: str
-    compactor_model_id: str
-    compactor_runner_option_hint_id: str
-    lane_name: str
-    tool_provider_reports: tuple[str, ...]
-    tool_selection: str
-    context_budget_policy_ref: str
-    agent_policy_profile_id: str
-    agent_policy_sources: tuple[str, ...]
-    tool_truncation_policy: str
-    ordinary_provider_extension_status: str
-    compactor_provider_extension_status: str
-    suggested_helper_names: tuple[str, ...]
-
-
-@dataclass(frozen=True, slots=True)
-class RuntimeAssemblyPrepared:
-    """调用 Host 前的 Service-like assembly 中间结果。
-
-    :param config: runtime config typed view。
-    :param locations: runtime 位置解析结果。
-    :param host_runtime: 选中的 Host runtime profile。
-    :param execution_profile: 选中的 execution profile。
-    :param lane: 选中的 runtime lane。
-    :param ordinary_selection: 普通 Run 模型与 runner hint 选择。
-    :param compactor_selection: compactor 模型与 runner hint 选择。
-    :param agent_policy_config: 合并后的 AgentPolicy 字段集。
-    :param tool_bundle: 已发现并应用截断默认值的业务工具 bundle。
-    :param tool_source_refs: 工具发现来源引用。
-    :param scene_inputs: ScenePrepare 输出。
-    :param diagnostics: 调用 Host 前的装配诊断。
-    :param smoke_tool: 当前发现 bundle 中的 smoke fact 工具；没有时为 ``None``。
-    :param workspace_root: workspace / 项目根目录。
-    """
-
-    config: RuntimeConfig
-    locations: RuntimeLocations
-    host_runtime: HostRuntimeProfileConfig
-    execution_profile: ExecutionProfileConfig
-    lane: RuntimeLaneConfig
-    ordinary_selection: RunnerOptionHintSelection
-    compactor_selection: RunnerOptionHintSelection
-    agent_policy_config: MergedAgentPolicyConfig
-    tool_bundle: ToolBundle
-    tool_source_refs: tuple[ToolBundleSourceRef, ...]
-    scene_inputs: PreparedSceneInputs
-    diagnostics: AssemblyDiagnostics
-    smoke_tool: "SmokeFactTool | None"
-    workspace_root: pathlib.Path
-
-
-@dataclass(frozen=True, slots=True)
 class RuntimeAssemblyResult:
     """完整 runtime assembly 结果。
 
@@ -275,7 +145,7 @@ class RuntimeAssemblyResult:
 
     options: OpenHostOptions
     scene_inputs: PreparedSceneInputs
-    diagnostics: AssemblyDiagnostics
+    diagnostics: ServiceOpenHostAssemblyDiagnostics
     smoke_tool: "SmokeFactTool | None"
 
 
@@ -446,15 +316,8 @@ async def run_smoke(args: SmokeArgs, env: Mapping[str, str]) -> int:
     :raises Exception: Host public path 或 provider 调用失败时向上抛出。
     """
 
-    prepared = _prepare_runtime_assembly(args)
-    _print_assembly_diagnostics(prepared.diagnostics)
-    options = _compose_open_host_options(prepared=prepared, env=env)
-    assembly = RuntimeAssemblyResult(
-        options=options,
-        scene_inputs=prepared.scene_inputs,
-        diagnostics=prepared.diagnostics,
-        smoke_tool=prepared.smoke_tool,
-    )
+    assembly = _prepare_runtime_assembly(args, env=env)
+    _print_assembly_diagnostics(assembly.diagnostics)
     smoke_run_id = _new_smoke_run_id()
 
     print("SMOKE START Host public multi-turn runtime assembly")
@@ -474,7 +337,7 @@ async def run_smoke(args: SmokeArgs, env: Mapping[str, str]) -> int:
             session_id=session.session_id,
             label="round1-tool-fact",
             client_request_id=_round_client_request_id(smoke_run_id, 1),
-            system_prompt=_system_prompt(assembly.scene_inputs),
+            scene_inputs=assembly.scene_inputs,
             prompt=(
                 "请调用工具 record_smoke_fact 记录 smoke fact。"
                 "工具完成后，用一句话说明你已经收到工具事实。"
@@ -489,7 +352,7 @@ async def run_smoke(args: SmokeArgs, env: Mapping[str, str]) -> int:
             session_id=session.session_id,
             label="round2-memory-and-compact",
             client_request_id=_round_client_request_id(smoke_run_id, 2),
-            system_prompt=_system_prompt(assembly.scene_inputs),
+            scene_inputs=assembly.scene_inputs,
             prompt=_memory_compact_prompt(),
             tool_names=frozenset(),
         )
@@ -501,7 +364,7 @@ async def run_smoke(args: SmokeArgs, env: Mapping[str, str]) -> int:
             session_id=session.session_id,
             label="round3-after-compact-continuity",
             client_request_id=_round_client_request_id(smoke_run_id, 3),
-            system_prompt=_system_prompt(assembly.scene_inputs),
+            scene_inputs=assembly.scene_inputs,
             prompt=(
                 "继续同一个会话。请根据你可见的历史、memory 或 compact "
                 f"摘要，说明是否仍能看到标记 {_SMOKE_MARKER}。"
@@ -523,11 +386,14 @@ async def run_smoke(args: SmokeArgs, env: Mapping[str, str]) -> int:
     return 0
 
 
-def _prepare_runtime_assembly(args: SmokeArgs) -> RuntimeAssemblyPrepared:
+def _prepare_runtime_assembly(
+    args: SmokeArgs, *, env: Mapping[str, str]
+) -> RuntimeAssemblyResult:
     """执行 Host 调用前的 runtime/config/tools/scene typed assembly。
 
     :param args: smoke 参数。
-    :returns: Host options 组合前的 assembly 中间结果。
+    :param env: 环境变量映射。
+    :returns: 完整 runtime assembly 结果。
     :raises ValueError: 配置、工具发现、scene 或 override 无法映射时抛出。
     """
 
@@ -538,22 +404,7 @@ def _prepare_runtime_assembly(args: SmokeArgs) -> RuntimeAssemblyPrepared:
     config = ConfigLoader(package_config_dir=_PACKAGE_CONFIG_ROOT).load(
         workspace_config_dir=locations.config_overlay_dir
     )
-    host_runtime_id = _select_host_runtime_id(config, args.host_runtime_id)
-    execution_profile_id = _select_execution_profile_id(
-        config, args.execution_profile_id
-    )
-    host_runtime = config.host_runtime.runtimes[host_runtime_id]
-    execution_profile = config.execution_profiles.execution_profiles[
-        execution_profile_id
-    ]
-    lane = config.runtime_lanes.lanes[host_runtime.host_execution_lane_name]
-    discovery_result = ToolsDiscovery().discover(
-        _tool_discovery_specs(tuple(config.tool_discovery.providers.values()))
-    )
-    effective_tool_bundle = _tool_bundle_with_effective_truncation(
-        tool_bundle=discovery_result.tool_bundle,
-        execution_profile=execution_profile,
-    )
+    discovered_tools = discover_service_tools(config)
     scene_inputs = prepare_scene(
         ScenePrepareRequest(
             scene_id=args.scene_id,
@@ -564,670 +415,32 @@ def _prepare_runtime_assembly(args: SmokeArgs) -> RuntimeAssemblyPrepared:
                 "base_user": args.base_user,
             },
             available_tools=SceneToolCatalog.from_tool_bundle(
-                effective_tool_bundle
+                discovered_tools.tool_bundle
             ),
         )
     )
-    run_override = _model_runner_override_from_args(args)
-    ordinary_selection = select_runner_option_hint(
-        models=config.models,
-        execution_baseline=execution_profile.run_baseline,
-        scene_model_hints=scene_inputs.model_hints,
-        run_override=run_override,
-        code_default=None,
-    )
-    compactor_selection = select_runner_option_hint(
-        models=config.models,
-        execution_baseline=ExecutionBaselineConfig(
-            model_id=execution_profile.compactor_baseline.model_id,
-            runner_option_hint_id=(
-                execution_profile.compactor_baseline.runner_option_hint_id
+    assembly = compose_open_host_options(
+        ServiceOpenHostAssemblyRequest(
+            workspace_root=args.workspace_root,
+            config=config,
+            locations=locations,
+            scene_inputs=scene_inputs,
+            discovered_tools=discovered_tools,
+            overrides=ServiceAssemblyOverrides(
+                host_runtime_id=args.host_runtime_id,
+                execution_profile_id=args.execution_profile_id,
+                model_id=args.model_id,
+                runner_option_hint_id=args.runner_option_hint_id,
             ),
-        ),
-        scene_model_hints=None,
-        run_override=None,
-        code_default=None,
-    )
-    agent_profile = config.execution_profiles.agent_policy_profiles[
-        execution_profile.agent_policy_profile_id
-    ]
-    agent_policy_config = merge_agent_policy_config(
-        code_default=_agent_policy_defaults_from_profile(agent_profile),
-        execution_profile=agent_profile,
-        scene_override=scene_inputs.agent_policy_override,
-        run_override=None,
-    )
-    diagnostics = _assembly_diagnostics(
-        locations=locations,
-        host_runtime_id=host_runtime_id,
-        execution_profile_id=execution_profile_id,
-        execution_profile=execution_profile,
-        lane=lane,
-        ordinary_selection=ordinary_selection,
-        compactor_selection=compactor_selection,
-        agent_policy_config=agent_policy_config,
-        tool_provider_reports=tuple(
-            _format_provider_report(report.provider_id, report.spec_id, report.version_ref, report.tool_names)
-            for report in discovery_result.provider_reports
-        ),
-        scene_inputs=scene_inputs,
-    )
-    return RuntimeAssemblyPrepared(
-        config=config,
-        locations=locations,
-        host_runtime=host_runtime,
-        execution_profile=execution_profile,
-        lane=lane,
-        ordinary_selection=ordinary_selection,
-        compactor_selection=compactor_selection,
-        agent_policy_config=agent_policy_config,
-        tool_bundle=effective_tool_bundle,
-        tool_source_refs=discovery_result.source_refs,
-        scene_inputs=scene_inputs,
-        diagnostics=diagnostics,
-        smoke_tool=_find_smoke_tool(effective_tool_bundle),
-        workspace_root=args.workspace_root,
-    )
-
-
-def _compose_open_host_options(
-    *, prepared: RuntimeAssemblyPrepared, env: Mapping[str, str]
-) -> OpenHostOptions:
-    """把 assembly 中间结果映射为 public ``OpenHostOptions``。
-
-    :param prepared: runtime assembly 中间结果。
-    :param env: 环境变量映射。
-    :returns: Host public opener options。
-    :raises ValueError: worker backend、secret 或 provider extension 映射失败时抛出。
-    """
-
-    if prepared.host_runtime.worker_backend != _WORKER_BACKEND_LOCAL:
-        raise ValueError(
-            "unsupported host worker_backend: "
-            f"{prepared.host_runtime.worker_backend}"
-        )
-    return OpenHostOptions(
-        db_path=_resolve_project_path(
-            prepared.workspace_root,
-            prepared.host_runtime.sqlite.path,
-        ),
-        artifact_root=_resolve_project_path(
-            prepared.workspace_root,
-            prepared.host_runtime.artifact_root,
-        ),
-        create_parent_dirs=True,
-        sqlite_busy_timeout_seconds=prepared.host_runtime.sqlite.busy_timeout_seconds,
-        sqlite_write_busy_retry_count=_SQLITE_WRITE_BUSY_RETRY_COUNT,
-        sqlite_write_retry_initial_delay_seconds=(
-            _SQLITE_WRITE_RETRY_INITIAL_DELAY_SECONDS
-        ),
-        sqlite_write_retry_backoff_multiplier=(
-            _SQLITE_WRITE_RETRY_BACKOFF_MULTIPLIER
-        ),
-        sqlite_write_retry_max_delay_seconds=(
-            _SQLITE_WRITE_RETRY_MAX_DELAY_SECONDS
-        ),
-        payload_inline_threshold_bytes=_PAYLOAD_INLINE_THRESHOLD_BYTES,
-        lane_db_path=_resolve_project_path(
-            prepared.workspace_root,
-            prepared.config.runtime_lanes.coordinator.db_path,
-        ),
-        lane_name=prepared.lane.lane_name,
-        lane_capacity=prepared.lane.capacity,
-        lane_default_timeout_seconds=prepared.lane.default_timeout_seconds,
-        lane_claim_ttl_seconds=prepared.lane.claim_ttl_seconds,
-        lane_heartbeat_interval_seconds=prepared.lane.heartbeat_interval_seconds,
-        worker_startup_timeout_seconds=_WORKER_STARTUP_TIMEOUT_SECONDS,
-        dispatch_poll_interval_seconds=(
-            prepared.host_runtime.dispatch_poll_interval_seconds
-        ),
-        ordinary_run_baseline=OrdinaryRunExecutionBaseline(
-            runner_spec=_runner_spec_from_model(
-                model=prepared.ordinary_selection.model,
-                env=env,
-            ),
-            runner_options=_runner_options_from_hint(
-                prepared.ordinary_selection.runner_option_hint
-            ),
-            agent_policy=_agent_policy_from_merged(
-                prepared.agent_policy_config
-            ),
-        ),
-        worker_factory=DefaultLocalEngineWorkerFactory(),
-        tooling_options=_tooling_options_from_discovery(
-            tool_bundle=prepared.tool_bundle,
-            source_refs=prepared.tool_source_refs,
-        ),
-        context_budget_policy=default_context_budget_policy(
-            context_window_size=(
-                prepared.ordinary_selection.model.context_window_tokens
-            ),
-            soft_threshold_context_ratio=(
-                prepared.execution_profile.context_budget_policy
-                .soft_threshold_context_ratio
-            ),
-            hard_threshold_context_ratio=(
-                prepared.execution_profile.context_budget_policy
-                .hard_threshold_context_ratio
-            ),
-            max_proactive_compactions_per_run=(
-                prepared.execution_profile.context_budget_policy
-                .max_proactive_compactions_per_run
-            ),
-            max_reactive_compactions_per_run=(
-                prepared.execution_profile.context_budget_policy
-                .max_reactive_compactions_per_run
-            ),
-            max_compaction_attempts_per_operation=(
-                prepared.execution_profile.context_budget_policy
-                .max_compaction_attempts_per_operation
-            ),
-            policy_ref=(
-                prepared.execution_profile.context_budget_policy.policy_ref
-            ),
-        ),
-        compactor_runner_baseline=CompactorRunnerBaseline(
-            compactor_runner_spec=_runner_spec_from_model(
-                model=prepared.compactor_selection.model,
-                env=env,
-            ),
-            compactor_runner_options=_runner_options_from_hint(
-                prepared.compactor_selection.runner_option_hint
-            ),
-            compact_artifact_root=_resolve_project_path(
-                prepared.workspace_root,
-                prepared.execution_profile.compactor_baseline.artifact_root,
-            ),
-            compact_artifact_create_parent_dirs=True,
-        ),
-        memory_projection_policy=_memory_projection_policy_from_config(
-            execution_profile=prepared.execution_profile,
-            context_window_size=(
-                prepared.ordinary_selection.model.context_window_tokens
-            ),
-        ),
-        memory_projection_catchup_batch_size=(
-            prepared.host_runtime.memory_projection_catch_up_batch_size
-        ),
-        enable_truncation_manager=(
-            prepared.host_runtime.truncation_manager_enabled
-        ),
-    )
-
-
-def _compose_submit_followup_request(
-    *,
-    session_id: str,
-    client_request_id: str,
-    system_prompt: str,
-    prompt: str,
-    tool_names: frozenset[str] | None,
-) -> SubmitFollowupRequest:
-    """把当前 Run 输入映射为 public ``SubmitFollowupRequest``。
-
-    :param session_id: Session id。
-    :param client_request_id: 幂等请求 id。
-    :param system_prompt: ``ScenePrepare`` 已装配的系统消息。
-    :param prompt: 调用方本轮用户输入。
-    :param tool_names: 本轮工具选择；``None`` 表示全量，空集合表示禁用。
-    :returns: SubmitFollowupRequest。
-    :raises ValueError: 请求字段非法时由底层抛出。
-    """
-
-    return SubmitFollowupRequest(
-        context=_host_context(client_request_id),
-        session_id=session_id,
-        client_request_id=client_request_id,
-        system_prompt=system_prompt,
-        user_prompt=prompt,
-        tool_names=tool_names,
-        runner_spec=None,
-        runner_options=None,
-        agent_policy=None,
-        behavior=FollowupBehavior.QUEUE,
-        target_run_id=None,
-    )
-
-
-def _select_host_runtime_id(
-    config: RuntimeConfig, explicit_runtime_id: str | None
-) -> str:
-    """选择 Host runtime id。
-
-    :param config: runtime config 总视图。
-    :param explicit_runtime_id: CLI 显式 Host runtime id。
-    :returns: 已存在的 Host runtime id。
-    :raises RuntimeAssemblySelectionError: id 不存在时抛出。
-    """
-
-    runtime_id = (
-        explicit_runtime_id
-        if explicit_runtime_id is not None
-        else config.host_runtime.default_host_runtime_id
-    )
-    if runtime_id not in config.host_runtime.runtimes:
-        raise RuntimeAssemblySelectionError(f"host runtime not found: {runtime_id}")
-    return runtime_id
-
-
-def _select_execution_profile_id(
-    config: RuntimeConfig, explicit_profile_id: str | None
-) -> str:
-    """选择 execution profile id。
-
-    :param config: runtime config 总视图。
-    :param explicit_profile_id: CLI 显式 execution profile id。
-    :returns: 已存在的 execution profile id。
-    :raises RuntimeAssemblySelectionError: id 不存在时抛出。
-    """
-
-    profile_id = (
-        explicit_profile_id
-        if explicit_profile_id is not None
-        else config.execution_profiles.default_execution_profile_id
-    )
-    if profile_id not in config.execution_profiles.execution_profiles:
-        raise RuntimeAssemblySelectionError(
-            f"execution profile not found: {profile_id}"
-        )
-    return profile_id
-
-
-def _model_runner_override_from_args(
-    args: SmokeArgs,
-) -> ModelRunnerHintOverride | None:
-    """把 CLI 模型 / hint 参数解析为 typed allowlist override。
-
-    :param args: smoke 参数。
-    :returns: typed model runner override；未提供时为 ``None``。
-    :raises RuntimeAssemblyFieldError: 字段类型或白名单非法时由 helper 抛出。
-    """
-
-    fields: dict[str, JsonValue] = {}
-    if args.model_id is not None:
-        fields["model_id"] = args.model_id
-    if args.runner_option_hint_id is not None:
-        fields["runner_option_hint_id"] = args.runner_option_hint_id
-    if not fields:
-        return None
-    return parse_model_runner_hint_override(fields, source_name="cli_run_override")
-
-
-def _tool_discovery_specs(
-    provider_configs: Sequence[ToolDiscoveryProviderConfig],
-) -> tuple[ToolsDiscoveryProviderSpec, ...]:
-    """把 ConfigLoader provider view 映射为 ToolsDiscovery specs。
-
-    :param provider_configs: 配置中的 provider specs。
-    :returns: ToolsDiscovery 可消费的 provider specs。
-    :raises ValueError: provider 同时缺少 import path 与 entry point 时抛出。
-    """
-
-    specs: list[ToolsDiscoveryProviderSpec] = []
-    for provider_config in provider_configs:
-        if provider_config.import_path is not None:
-            location = PythonImportPathProvider(provider_config.import_path)
-        elif provider_config.entry_point is not None:
-            location = PackageEntryPointProvider(
-                group=provider_config.entry_point.group,
-                name=provider_config.entry_point.name,
-            )
-        else:
-            raise ValueError(
-                "tool discovery provider must declare import_path or entry_point: "
-                f"{provider_config.provider_id}"
-            )
-        specs.append(
-            ToolsDiscoveryProviderSpec(
-                spec_id=provider_config.provider_id,
-                location=location,
-                enabled=provider_config.enabled,
-                allow_empty=provider_config.allow_empty,
-                config={},
-            )
-        )
-    return tuple(specs)
-
-
-def _tool_bundle_with_effective_truncation(
-    *,
-    tool_bundle: ToolBundle,
-    execution_profile: ExecutionProfileConfig,
-) -> ToolBundle:
-    """按 tool truncation policy 补齐工具声明的 effective truncate spec。
-
-    :param tool_bundle: ToolsDiscovery 输出的业务工具 bundle。
-    :param execution_profile: 当前 execution profile。
-    :returns: 补齐截断默认值后的业务工具 bundle。
-    :raises ValueError: 截断声明与 policy 默认值组合非法时抛出。
-    """
-
-    if not execution_profile.tool_truncation_policy.enabled:
-        return tool_bundle
-    definitions: list[ToolDefinition] = []
-    for definition in tool_bundle.definitions:
-        if definition.truncate is None:
-            definitions.append(definition)
-            continue
-        definitions.append(
-            replace(
-                definition,
-                truncate=effective_tool_truncate_spec_from_policy(
-                    definition.truncate,
-                    policy=execution_profile.tool_truncation_policy,
-                ),
-            )
-        )
-    return ToolBundle(definitions=tuple(definitions))
-
-
-def _assembly_diagnostics(
-    *,
-    locations: RuntimeLocations,
-    host_runtime_id: str,
-    execution_profile_id: str,
-    execution_profile: ExecutionProfileConfig,
-    lane: RuntimeLaneConfig,
-    ordinary_selection: RunnerOptionHintSelection,
-    compactor_selection: RunnerOptionHintSelection,
-    agent_policy_config: MergedAgentPolicyConfig,
-    tool_provider_reports: tuple[str, ...],
-    scene_inputs: PreparedSceneInputs,
-) -> AssemblyDiagnostics:
-    """构造调用 Host 前的装配诊断。
-
-    :param locations: runtime 位置解析结果。
-    :param host_runtime_id: Host runtime id。
-    :param execution_profile_id: execution profile id。
-    :param execution_profile: execution profile 配置。
-    :param lane: runtime lane 配置。
-    :param ordinary_selection: 普通 Run 模型选择结果。
-    :param compactor_selection: compactor 模型选择结果。
-    :param agent_policy_config: 合并后的 AgentPolicy 字段集。
-    :param tool_provider_reports: 工具 provider 报告行。
-    :param scene_inputs: ScenePrepare 输出。
-    :returns: assembly diagnostics。
-    :raises ProviderExtensionConfigError: provider extension DSL 非法时由 helper 抛出。
-    """
-
-    truncation_defaults = tool_truncation_policy_defaults(
-        execution_profile.tool_truncation_policy
-    )
-    return AssemblyDiagnostics(
-        config_overlay_dir=locations.config_overlay_dir,
-        prompt_asset_root=locations.prompt_asset_root,
-        scene_manifest_root=locations.scene_manifest_root,
-        host_runtime_id=host_runtime_id,
-        execution_profile_id=execution_profile_id,
-        model_id=ordinary_selection.model_id,
-        model_source=ordinary_selection.diagnostic.selected_model_source,
-        runner_option_hint_id=ordinary_selection.runner_option_hint_id,
-        runner_option_hint_source=(
-            ordinary_selection.diagnostic.selected_runner_option_hint_source
-        ),
-        compactor_model_id=compactor_selection.model_id,
-        compactor_runner_option_hint_id=(
-            compactor_selection.runner_option_hint_id
-        ),
-        lane_name=lane.lane_name,
-        tool_provider_reports=tool_provider_reports,
-        tool_selection=_format_tool_selection(scene_inputs),
-        context_budget_policy_ref=(
-            execution_profile.context_budget_policy.policy_ref
-        ),
-        agent_policy_profile_id=execution_profile.agent_policy_profile_id,
-        agent_policy_sources=tuple(
-            f"{field_name}:{source}"
-            for field_name, source in sorted(
-                agent_policy_config.field_sources.items()
-            )
-        ),
-        tool_truncation_policy=(
-            "enabled="
-            f"{truncation_defaults.enabled},ttl={truncation_defaults.default_ttl_seconds}"
-        ),
-        ordinary_provider_extension_status=_provider_extension_status(
-            ordinary_selection.model
-        ),
-        compactor_provider_extension_status=_provider_extension_status(
-            compactor_selection.model
-        ),
-        suggested_helper_names=(
-            _HELPER_COMPOSE_OPEN_HOST_OPTIONS,
-            _HELPER_COMPOSE_SUBMIT_FOLLOWUP_REQUEST,
-            _HELPER_PROVIDER_EXTENSION_FROM_CONFIG,
-        ),
-    )
-
-
-def _runner_spec_from_model(
-    *, model: ModelConfig, env: Mapping[str, str]
-) -> RunnerSpec:
-    """把 ModelConfig 映射为 Engine RunnerSpec。
-
-    :param model: 模型配置。
-    :param env: 环境变量映射。
-    :returns: RunnerSpec。
-    :raises ValueError: API key 引用缺失或环境变量缺失时抛出。
-    """
-
-    if model.api_key_ref is None:
-        raise ValueError(f"model {model.model_id} must declare api_key_ref")
-    return RunnerSpec(
-        provider=model.provider,
-        model=model.model,
-        endpoint=model.endpoint,
-        api_key_ref=model.api_key_ref,
-        headers=_render_headers(
-            model.headers,
-            api_key_ref=model.api_key_ref,
             env=env,
-        ),
-        supports_tool_calling=model.supports_tool_calling,
-        supports_streaming=model.supports_stream,
-        supports_stream_usage=model.supports_stream_usage,
-        default_timeout_seconds=model.default_timeout_seconds,
-        max_retries=model.max_retries,
-        provider_request=provider_request_extension_from_json(
-            model.provider_request_extension
-        ),
-        stream_idle_timeout_seconds=model.sse_idle_timeout_seconds,
-        stream_idle_heartbeat_seconds=model.sse_heartbeat_seconds,
+        )
     )
-
-
-def _render_headers(
-    headers: Mapping[str, str], *, api_key_ref: str, env: Mapping[str, str]
-) -> dict[str, str]:
-    """渲染 provider headers 中的环境变量占位符。
-
-    :param headers: 配置 headers。
-    :param api_key_ref: API key 环境变量名。
-    :param env: 环境变量映射。
-    :returns: 渲染后的 headers。
-    :raises ValueError: API key 缺失或 header 存在未解析占位符时抛出。
-    """
-
-    api_key = env.get(api_key_ref)
-    if api_key is None or api_key.strip() == "":
-        raise ValueError(f"missing env {api_key_ref}")
-    rendered: dict[str, str] = {}
-    for name, value in headers.items():
-        rendered_value = value.replace(f"{{{{{api_key_ref}}}}}", api_key.strip())
-        unresolved = _ENV_PLACEHOLDER_PATTERN.search(rendered_value)
-        if unresolved is not None:
-            raise ValueError(
-                "header contains unresolved env placeholder: "
-                f"{name} -> {unresolved.group(1)}"
-            )
-        rendered[name] = rendered_value
-    return rendered
-
-
-def _runner_options_from_hint(
-    hint: RunnerOptionHintConfig,
-) -> RunnerCallOptions:
-    """把 runtime runner option hint 映射为 RunnerCallOptions。
-
-    :param hint: 选中的 runner option hint。
-    :returns: RunnerCallOptions。
-    :raises ValueError: 字段非法时由底层抛出。
-    """
-
-    return RunnerCallOptions(
-        temperature=hint.temperature,
-        max_tokens=hint.max_tokens,
-        top_p=hint.top_p,
-        stream=hint.stream,
+    return RuntimeAssemblyResult(
+        options=assembly.options,
+        scene_inputs=scene_inputs,
+        diagnostics=assembly.diagnostics,
+        smoke_tool=_find_smoke_tool(assembly.effective_tool_bundle),
     )
-
-
-def _agent_policy_defaults_from_profile(
-    profile: AgentPolicyProfileConfig,
-) -> AgentPolicyDefaults:
-    """从 execution profile 投影 runtime helper 所需 code default。
-
-    :param profile: agent policy profile；调用方传入 ConfigLoader typed profile。
-    :returns: 与 profile 同值的默认字段集。
-    :raises Exception: 不主动抛出异常。
-    """
-
-    return AgentPolicyDefaults(
-        max_iterations=profile.max_iterations,
-        continuation_max_attempts=profile.continuation_max_attempts,
-        allow_tool_calls=profile.allow_tool_calls,
-        tool_execution_timeout_seconds=profile.tool_execution_timeout_seconds,
-        fallback_mode=profile.fallback_mode,
-        fallback_prompt=profile.fallback_prompt,
-        continuation_prompt=profile.continuation_prompt,
-        max_consecutive_failed_tool_batches=(
-            profile.max_consecutive_failed_tool_batches
-        ),
-    )
-
-
-def _agent_policy_from_merged(config: MergedAgentPolicyConfig) -> AgentPolicy:
-    """把 runtime-neutral merged AgentPolicy 字段映射为 Engine AgentPolicy。
-
-    :param config: 合并后的 AgentPolicy 字段集。
-    :returns: Engine AgentPolicy。
-    :raises ValueError: fallback mode 非法时抛出。
-    """
-
-    return AgentPolicy(
-        max_iterations=config.max_iterations,
-        continuation_max_attempts=config.continuation_max_attempts,
-        allow_tool_calls=config.allow_tool_calls,
-        tool_execution_timeout_seconds=config.tool_execution_timeout_seconds,
-        fallback_mode=_agent_fallback_mode_from_config(config.fallback_mode),
-        fallback_prompt=config.fallback_prompt,
-        continuation_prompt=config.continuation_prompt,
-        max_consecutive_failed_tool_batches=(
-            config.max_consecutive_failed_tool_batches
-        ),
-    )
-
-
-def _agent_fallback_mode_from_config(value: str) -> AgentFallbackMode:
-    """把 runtime config fallback mode 映射为 Engine AgentFallbackMode。
-
-    :param value: runtime config fallback mode。
-    :returns: Engine AgentFallbackMode。
-    :raises ValueError: fallback mode 不受支持时抛出。
-    """
-
-    if value == "force_answer":
-        return AgentFallbackMode.FORCE_ANSWER
-    if value == "raise_error":
-        return AgentFallbackMode.RAISE_ERROR
-    raise ValueError(f"unsupported fallback_mode: {value}")
-
-
-def _memory_projection_policy_from_config(
-    *, execution_profile: ExecutionProfileConfig, context_window_size: int
-) -> MemoryProjectionPolicy:
-    """把 runtime memory projection config 映射为 Host policy。
-
-    :param execution_profile: 当前 execution profile。
-    :param context_window_size: effective model context window。
-    :returns: Host MemoryProjectionPolicy。
-    :raises ValueError: 字段非法时由底层抛出。
-    """
-
-    policy = execution_profile.memory_projection_policy
-    return MemoryProjectionPolicy(
-        context_window_size=context_window_size,
-        max_pinned_items=policy.max_pinned_items,
-        max_verified_facts=policy.max_verified_facts,
-        max_working_assumptions=policy.max_working_assumptions,
-        recent_raw_turns_floor=policy.recent_raw_turns_floor,
-        raw_turn_context_ratio=policy.raw_turn_context_ratio,
-        raw_turn_size_floor=policy.raw_turn_size_floor,
-        raw_turn_size_cap=policy.raw_turn_size_cap,
-        history_pool_context_ratio=policy.history_pool_context_ratio,
-        history_pool_size_floor=policy.history_pool_size_floor,
-        history_pool_size_cap=policy.history_pool_size_cap,
-        stable_layer_context_ratio=policy.stable_layer_context_ratio,
-        stable_layer_size_floor=policy.stable_layer_size_floor,
-        stable_layer_size_cap=policy.stable_layer_size_cap,
-        max_lag_events_for_inline_delta=policy.max_lag_events_for_inline_delta,
-        max_delta_repair_events=policy.max_delta_repair_events,
-    )
-
-
-def _tooling_options_from_discovery(
-    *, tool_bundle: ToolBundle, source_refs: tuple[ToolBundleSourceRef, ...]
-) -> HostToolingOptions | None:
-    """把 ToolsDiscovery 输出映射为 HostToolingOptions。
-
-    :param tool_bundle: 已发现业务工具 bundle。
-    :param source_refs: 工具来源引用。
-    :returns: HostToolingOptions；没有工具时返回 ``None``。
-    :raises ValueError: source refs 缺失但工具非空时抛出。
-    """
-
-    if not tool_bundle.definitions:
-        return None
-    if not source_refs:
-        raise ValueError("discovered tools must have source refs")
-    return HostToolingOptions(
-        business_tool_bundle=tool_bundle,
-        source_refs=source_refs,
-        wait_adapter_registry=None,
-    )
-
-
-def _resolve_project_path(
-    workspace_root: pathlib.Path, configured_path: str
-) -> pathlib.Path:
-    """把配置路径解析为 workspace-root 相对路径或绝对路径。
-
-    :param workspace_root: workspace / 项目根目录。
-    :param configured_path: 配置中的路径字符串。
-    :returns: 解析后的路径。
-    :raises Exception: 不主动抛出异常。
-    """
-
-    path = pathlib.Path(configured_path)
-    if path.is_absolute():
-        return path
-    return workspace_root / path
-
-
-def _provider_extension_status(model: ModelConfig) -> str:
-    """返回 provider extension DSL 映射诊断。
-
-    :param model: 模型配置。
-    :returns: provider extension 映射状态。
-    :raises ProviderExtensionConfigError: provider extension DSL 非法时由 helper 抛出。
-    """
-
-    extension = provider_request_extension_from_json(
-        model.provider_request_extension
-    )
-    if extension is None:
-        return f"model={model.model_id}:none"
-    return f"model={model.model_id}:ok:{type(extension).__name__}"
 
 
 def _find_smoke_tool(tool_bundle: ToolBundle) -> SmokeFactTool | None:
@@ -1330,7 +543,7 @@ async def _run_round(
     session_id: str,
     label: str,
     client_request_id: str,
-    system_prompt: str,
+    scene_inputs: PreparedSceneInputs,
     prompt: str,
     tool_names: frozenset[str] | None,
 ) -> RoundResult:
@@ -1341,7 +554,7 @@ async def _run_round(
     :param session_id: Session id。
     :param label: 轮次标签。
     :param client_request_id: 幂等请求 id。
-    :param system_prompt: 本轮系统提示词。
+    :param scene_inputs: ScenePrepare 输出。
     :param prompt: 用户 prompt。
     :param tool_names: 本轮工具选择。
     :returns: RoundResult。
@@ -1351,12 +564,15 @@ async def _run_round(
     print(f"SMOKE ROUND_START label={label}")
     accepted = await host.submit_followup(
         session_id,
-        _compose_submit_followup_request(
+        compose_submit_followup_request(
+            context=_host_context(client_request_id),
             session_id=session_id,
             client_request_id=client_request_id,
-            system_prompt=system_prompt,
-            prompt=prompt,
+            scene_inputs=scene_inputs,
+            user_prompt=prompt,
             tool_names=tool_names,
+            behavior=FollowupBehavior.QUEUE,
+            target_run_id=None,
         ),
     )
     event = await _next_terminal_for_run(watcher, accepted.accepted_run_id)
@@ -1418,19 +634,6 @@ def _round_client_request_id(smoke_run_id: str, round_index: int) -> str:
     return f"{_SMOKE_CLIENT_REQUEST_PREFIX}-{smoke_run_id}-round-{round_index}"
 
 
-def _system_prompt(scene_inputs: PreparedSceneInputs) -> str:
-    """返回 ``ScenePrepare`` 已装配的系统提示词。
-
-    :param scene_inputs: ScenePrepare 输出。
-    :returns: 系统提示词。
-    :raises ValueError: scene 未提供 system messages 时抛出。
-    """
-
-    if not scene_inputs.system_messages:
-        raise ValueError("prepared scene must provide system messages")
-    return "\n\n".join(scene_inputs.system_messages)
-
-
 def _memory_compact_prompt() -> str:
     """构造触发 memory / compact 的第二轮 prompt。
 
@@ -1449,7 +652,9 @@ def _memory_compact_prompt() -> str:
     )
 
 
-def _print_assembly_diagnostics(diagnostics: AssemblyDiagnostics) -> None:
+def _print_assembly_diagnostics(
+    diagnostics: ServiceOpenHostAssemblyDiagnostics,
+) -> None:
     """打印 Host 调用前 assembly diagnostics。
 
     :param diagnostics: assembly diagnostics。
@@ -1507,10 +712,6 @@ def _print_assembly_diagnostics(diagnostics: AssemblyDiagnostics) -> None:
         "SMOKE ASSEMBLY provider_extension_status="
         f"ordinary:{diagnostics.ordinary_provider_extension_status},"
         f"compactor:{diagnostics.compactor_provider_extension_status}"
-    )
-    print(
-        "SMOKE ASSEMBLY suggested_helpers="
-        f"{','.join(diagnostics.suggested_helper_names)}"
     )
 
 

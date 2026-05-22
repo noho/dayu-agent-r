@@ -16,7 +16,6 @@ from dayu.runtime.tools_discovery import (
 )
 from utils.smoke_host_public_multiturn import (
     SmokeArgs,
-    _compose_open_host_options,
     _find_smoke_tool,
     _prepare_runtime_assembly,
     discover_smoke_tools,
@@ -39,7 +38,7 @@ def test_runtime_assembly_fails_before_host_when_tools_not_discovered(
     """
 
     with pytest.raises(ScenePrepareError, match="tool_tags_any matched no tools"):
-        _prepare_runtime_assembly(_args(tmp_path))
+        _prepare_runtime_assembly(_args(tmp_path), env={"DEEPSEEK_API_KEY": _API_KEY})
 
 
 def test_runtime_assembly_uses_workspace_tool_discovery_and_typed_overrides(
@@ -53,35 +52,34 @@ def test_runtime_assembly_uses_workspace_tool_discovery_and_typed_overrides(
     """
 
     _write_smoke_tool_discovery_overlay(tmp_path)
-    prepared = _prepare_runtime_assembly(_args(tmp_path))
-    options = _compose_open_host_options(
-        prepared=prepared,
+    assembly = _prepare_runtime_assembly(
+        _args(tmp_path),
         env={"DEEPSEEK_API_KEY": _API_KEY},
     )
 
-    assert prepared.locations.config_overlay_dir == tmp_path / "workspace" / "config"
-    assert prepared.diagnostics.host_runtime_id == "local"
-    assert prepared.diagnostics.execution_profile_id == "standard"
-    assert prepared.diagnostics.model_id == _MODEL_ID
-    assert prepared.diagnostics.model_source == "run_override"
-    assert prepared.diagnostics.runner_option_hint_id == _RUNNER_HINT_ID
-    assert prepared.diagnostics.runner_option_hint_source == "run_override"
-    assert prepared.scene_inputs.tool_selection.tool_names == frozenset(
+    assert assembly.diagnostics.config_overlay_dir == tmp_path / "workspace" / "config"
+    assert assembly.diagnostics.host_runtime_id == "local"
+    assert assembly.diagnostics.execution_profile_id == "standard"
+    assert assembly.diagnostics.model_id == _MODEL_ID
+    assert assembly.diagnostics.model_source == "run_override"
+    assert assembly.diagnostics.runner_option_hint_id == _RUNNER_HINT_ID
+    assert assembly.diagnostics.runner_option_hint_source == "run_override"
+    assert assembly.scene_inputs.tool_selection.tool_names == frozenset(
         {"record_smoke_fact"}
     )
-    assert prepared.diagnostics.tool_provider_reports == (
+    assert assembly.diagnostics.tool_provider_reports == (
         "provider=host-public-multiturn-smoke,"
         "spec=financial-tools,version=v1,tools=record_smoke_fact",
     )
-    assert prepared.diagnostics.ordinary_provider_extension_status.endswith(
+    assert assembly.diagnostics.ordinary_provider_extension_status.endswith(
         "ok:DeepSeekThinkingExtension"
     )
-    assert prepared.diagnostics.suggested_helper_names == (
-        "compose_open_host_options",
-        "compose_submit_followup_request",
-        "provider_extension_from_config",
-    )
+    assert assembly.scene_inputs.system_prompt.strip() != ""
+    options = assembly.options
     assert options.lane_name == "llm_api"
+    assert options.sqlite_write_busy_retry_count == 8
+    assert options.payload_inline_threshold_bytes == 4096
+    assert options.worker_startup_timeout_seconds == 10.0
     assert options.tooling_options is not None
     assert tuple(
         definition.name

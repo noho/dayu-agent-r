@@ -6,11 +6,17 @@
       "artifact_root": "workspace/.dayu/artifacts",
       "sqlite": {
         "path": "workspace/.dayu/host/dayu_host.sqlite3",
-        "busy_timeout_seconds": 5.0
+        "busy_timeout_seconds": 5.0,
+        "write_busy_retry_count": 8,
+        "write_retry_initial_delay_seconds": 0.005,
+        "write_retry_backoff_multiplier": 1.5,
+        "write_retry_max_delay_seconds": 0.05
       },
       "host_execution_lane_name": "llm_api",
       "worker_backend": "local",
       "dispatch_poll_interval_seconds": 0.2,
+      "payload_inline_threshold_bytes": 4096,
+      "worker_startup_timeout_seconds": 10.0,
       "memory_projection_catch_up_batch_size": 100,
       "truncation_manager_enabled": true
     }

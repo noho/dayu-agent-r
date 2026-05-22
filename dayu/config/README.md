@@ -96,10 +96,12 @@ dayu/config/
 每条 runtime 记录覆盖：
 
 - Host durable store 与 artifact roots。
-- SQLite path 与 busy timeout。
+- SQLite path、busy timeout 与写事务 busy retry 策略。
 - `host_execution_lane_name`：引用 `runtime_lanes.json` 中已存在的 lane。
 - `worker_backend`，当前默认配置为 `local`。
 - `dispatch_poll_interval_seconds`。
+- `payload_inline_threshold_bytes`。
+- `worker_startup_timeout_seconds`。
 - `memory_projection_catch_up_batch_size`。
 - `truncation_manager_enabled`。
 
@@ -147,7 +149,7 @@ provider 字段：
 
 Scene manifest 由 `dayu.runtime.scene_prepare` 解释；ConfigLoader 不读取、拼接或渲染 scene manifest。`prompts/tasks/`、contract 文件、workflow 产物和未被 scene manifest 直接引用的模板不属于当前包内默认资产范围。
 
-Scene manifest 第一版是单 Run 场景装配输入。允许的顶层字段固定为 `schema_version`、`scene`、`version`、`description`、`capability_tags`、`extends`、`model`、`agent_policy`、`tool_selection`、`defaults`、`fragments` 与 `context_slots`。调用方显式传入 manifest root、prompt asset root、typed context slot values 与可用工具目录；ScenePrepare 只读取 manifest 直接引用的 fragments，执行确定性的文本替换，并输出 system messages、工具选择结果、model hints、typed agent policy override、fragment refs、source refs 与 content digest。
+Scene manifest 第一版是单 Run 场景装配输入。允许的顶层字段固定为 `schema_version`、`scene`、`version`、`description`、`capability_tags`、`extends`、`model`、`agent_policy`、`tool_selection`、`defaults`、`fragments` 与 `context_slots`。调用方显式传入 manifest root、prompt asset root、typed context slot values 与可用工具目录；ScenePrepare 只读取 manifest 直接引用的 fragments，执行确定性的文本替换，并输出 system messages、已拼接的 system prompt、工具选择结果、model hints、typed agent policy override、fragment refs、source refs 与 content digest。
 
 `model` 只使用 `default_model_id` 与 `runner_option_hint_id`。`agent_policy` 是可选 typed override block，只允许覆盖 `max_iterations`、`continuation_max_attempts`、`allow_tool_calls`、`tool_execution_timeout_seconds`、`fallback_mode`、`fallback_prompt`、`continuation_prompt` 与 `max_consecutive_failed_tool_batches`。旧 `conversation`、泛化 `runtime`、`model.default_name`、`model.temperature_profile` 与 `prompt_mt` scene 均不属于当前 schema。
 

@@ -948,7 +948,7 @@ dayu-cli process --ticker AAPL --ci --document-id fil_001 --document-id fil_002
 
 ### 5.1 Host public 多轮闭环 smoke
 
-`utils/smoke_host_public_multiturn.py` 用于人工观察真实生产式 runtime assembly 是否能只通过 Host public interface / contract 完成多轮会话闭环。脚本默认使用 runtime location resolver 解析 `workspace/config` overlay、prompt asset root 与 scene manifest root，再通过 `ConfigLoader`、`ToolsDiscovery`、`ScenePrepare`、Engine provider extension helper 和 smoke-local composition adapter 映射为 `open_host(options)` 与每轮 `submit_followup` typed input。打开后脚本只调用 public Host handle。脚本把 Dayu 日志默认打开到 `VERBOSE`，便于观察 Host command、dispatch、EngineEvent ingest、ToolRuntime、memory catch-up 与 context compact 主路径。
+`utils/smoke_host_public_multiturn.py` 用于人工观察真实生产式 runtime assembly 是否能只通过 Host public interface / contract 完成多轮会话闭环。脚本默认使用 runtime location resolver 解析 `workspace/config` overlay、prompt asset root 与 scene manifest root，再通过 `ConfigLoader`、`ToolsDiscovery`、`ScenePrepare` 和 `dayu.service.host_assembly` 映射为 `open_host(options)` 与每轮 `submit_followup` typed input。打开后脚本只调用 public Host handle。脚本把 Dayu 日志默认打开到 `VERBOSE`，便于观察 Host command、dispatch、EngineEvent ingest、ToolRuntime、memory catch-up 与 context compact 主路径。
 
 ```bash
 source .venv/bin/activate
@@ -977,7 +977,7 @@ source .venv/bin/activate
 python utils/smoke_host_public_multiturn.py --log-level DEBUG
 ```
 
-该脚本不是 pytest，不断言模型固定回答。它会在调用 Host 前打印 assembly diagnostics，包括 config overlay、prompt root、scene manifest root、Host runtime id、execution profile id、model id、runner option hint id、lane name、tool provider report、tool selection、policy refs、provider extension DSL 映射状态和建议后续提取的 adapter/helper 名称。运行后会打印 Session / Run / terminal HostEvent 摘要、final answer 预览、compact artifact 路径；脚本不输出 API key、headers、完整 prompt 或 provider payload。
+该脚本不是 pytest，不断言模型固定回答。它会在调用 Host 前打印 assembly diagnostics，包括 config overlay、prompt root、scene manifest root、Host runtime id、execution profile id、model id、runner option hint id、lane name、tool provider report、tool selection、policy refs 和 provider extension DSL 映射状态。运行后会打印 Session / Run / terminal HostEvent 摘要、final answer 预览、compact artifact 路径；脚本不输出 API key、headers、完整 prompt 或 provider payload。
 
 ### 5.2 Engine provider smoke
 
@@ -1024,7 +1024,7 @@ dayu-render workspace/draft/AAPL/AAPL_qual_report.md report.html
 |-----------|------|
 | `workspace/config/models.json` | 模型目录、provider endpoint、API key 引用与模型能力 |
 | `workspace/config/execution_profiles.json` | Runner 调用参数、Agent policy、context budget、memory projection 与 truncation 基线 |
-| `workspace/config/host_runtime.json` | Host opener 部署默认值、store/artifact roots、SQLite、Host execution lane 引用与 worker backend |
+| `workspace/config/host_runtime.json` | Host opener 部署默认值、store/artifact roots、SQLite/write retry、payload inline threshold、worker startup timeout、Host execution lane 引用与 worker backend |
 | `workspace/config/runtime_lanes.json` | runtime lane coordinator 与 lane catalog |
 | `workspace/config/tool_discovery.json` | ToolsDiscovery provider specs |
 | `workspace/config/prompts/` | prompt fragments 与 scene manifests |
@@ -1032,7 +1032,7 @@ dayu-render workspace/draft/AAPL/AAPL_qual_report.md report.html
 建议修改方式：
 - 想新增或替换模型：改 `models.json`
 - 想调 Runner 参数或 Agent 行为：改 `execution_profiles.json`
-- 想调 Host store、SQLite、worker backend 或 Host execution lane 引用：改 `host_runtime.json`
+- 想调 Host store、SQLite/write retry、payload inline threshold、worker startup timeout、worker backend 或 Host execution lane 引用：改 `host_runtime.json`
 - 想调 runtime lane coordinator 或 lane capacity：改 `runtime_lanes.json`
 - 想配置工具发现来源：改 `tool_discovery.json`
 - 想改系统提示词和场景资产：改 `prompts/`

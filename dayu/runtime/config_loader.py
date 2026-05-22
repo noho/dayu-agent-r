@@ -395,10 +395,18 @@ class SQLiteRuntimeConfig:
 
     :param path: SQLite 数据库路径。
     :param busy_timeout_seconds: SQLite busy timeout 秒数。
+    :param write_busy_retry_count: ``BEGIN IMMEDIATE`` busy / locked 额外重试次数。
+    :param write_retry_initial_delay_seconds: 首次写重试等待秒数。
+    :param write_retry_backoff_multiplier: 写重试退避倍率。
+    :param write_retry_max_delay_seconds: 写重试最大等待秒数。
     """
 
     path: str
     busy_timeout_seconds: float
+    write_busy_retry_count: int
+    write_retry_initial_delay_seconds: float
+    write_retry_backoff_multiplier: float
+    write_retry_max_delay_seconds: float
 
 
 @dataclass(frozen=True, slots=True)
@@ -412,6 +420,8 @@ class HostRuntimeProfileConfig:
     :param host_execution_lane_name: Host 执行 lane 名。
     :param worker_backend: worker backend 名。
     :param dispatch_poll_interval_seconds: dispatch 轮询间隔秒数。
+    :param payload_inline_threshold_bytes: payload 内联存储阈值字节数。
+    :param worker_startup_timeout_seconds: worker accept timeout 秒数。
     :param memory_projection_catch_up_batch_size: memory catch-up 批次大小。
     :param truncation_manager_enabled: 是否启用 truncation manager。
     """
@@ -423,6 +433,8 @@ class HostRuntimeProfileConfig:
     host_execution_lane_name: str
     worker_backend: str
     dispatch_poll_interval_seconds: float
+    payload_inline_threshold_bytes: int
+    worker_startup_timeout_seconds: float
     memory_projection_catch_up_batch_size: int
     truncation_manager_enabled: bool
 
@@ -1577,6 +1589,8 @@ def _parse_host_runtime_profile(
                 "host_execution_lane_name",
                 "worker_backend",
                 "dispatch_poll_interval_seconds",
+                "payload_inline_threshold_bytes",
+                "worker_startup_timeout_seconds",
                 "memory_projection_catch_up_batch_size",
                 "truncation_manager_enabled",
             }
@@ -1598,6 +1612,8 @@ def _parse_host_runtime_profile(
         ),
         worker_backend=_require_str_field(record, field_name="worker_backend", context=context),
         dispatch_poll_interval_seconds=_require_positive_float_field(record, field_name="dispatch_poll_interval_seconds", context=context),
+        payload_inline_threshold_bytes=_require_positive_int_field(record, field_name="payload_inline_threshold_bytes", context=context),
+        worker_startup_timeout_seconds=_require_positive_float_field(record, field_name="worker_startup_timeout_seconds", context=context),
         memory_projection_catch_up_batch_size=_require_positive_int_field(record, field_name="memory_projection_catch_up_batch_size", context=context),
         truncation_manager_enabled=_require_bool_field(record, field_name="truncation_manager_enabled", context=context),
     )
@@ -1616,12 +1632,25 @@ def _parse_sqlite_runtime(
 
     _require_exact_fields(
         record,
-        allowed=frozenset({"path", "busy_timeout_seconds"}),
+        allowed=frozenset(
+            {
+                "path",
+                "busy_timeout_seconds",
+                "write_busy_retry_count",
+                "write_retry_initial_delay_seconds",
+                "write_retry_backoff_multiplier",
+                "write_retry_max_delay_seconds",
+            }
+        ),
         context=context,
     )
     return SQLiteRuntimeConfig(
         path=_require_str_field(record, field_name="path", context=context),
         busy_timeout_seconds=_require_positive_float_field(record, field_name="busy_timeout_seconds", context=context),
+        write_busy_retry_count=_require_non_negative_int_field(record, field_name="write_busy_retry_count", context=context),
+        write_retry_initial_delay_seconds=_require_positive_float_field(record, field_name="write_retry_initial_delay_seconds", context=context),
+        write_retry_backoff_multiplier=_require_positive_float_field(record, field_name="write_retry_backoff_multiplier", context=context),
+        write_retry_max_delay_seconds=_require_positive_float_field(record, field_name="write_retry_max_delay_seconds", context=context),
     )
 
 
