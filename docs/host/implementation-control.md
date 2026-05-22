@@ -223,8 +223,8 @@ Phase Map 中每个 phase 必须使用统一条目格式。模板如下：
 约束：本节只保留当前 gate 结论；phase 过程流水必须归档到 `历史记录`，仍需追踪的风险或后续 owner 必须写入 `Open Questions 与风险追踪` 的 `追踪区`。
 
 当前 work unit：Full-repo review accepted fix after Phase 12.2。
-当前 gate：local-PASS。
-下一 gate：accepted local commit bookkeeping；随后推送到 PR 67 分支。
+当前 gate：accepted-local-PASS。
+下一 gate：推送到 PR 67 分支；随后等待 PR 67 后续 review / CI 或进入后续 phase。
 
 当前 gate 追加事实（Phase 12.1 Slice 2 implementation）：Phase 12.1 Slice 2 implementation artifact 为 `docs/reviews/phase12-1-slice2-implementation-codex-20260521.md`；implementation agent 更新 `dayu.runtime.config_loader` 新 schema typed view、runtime location resolver、默认 `models.json` / `execution_profiles.json` / `host_runtime.json` / `runtime_lanes.json` / `tool_discovery.json` 配置、全量旧模型迁移、runtime / engine config tests 与 README。Controller 本地复跑：`pytest tests/runtime/test_config_loader.py tests/runtime/test_runtime_location.py tests/runtime/test_import_boundary.py tests/runtime/test_weak_typing_guard.py -q` 35 passed；`pytest tests/engine/test_config_models.py -q` 4 passed；`python -m pyright dayu/runtime tests/runtime tests/engine/test_config_models.py` 0 errors；`git diff --check` clean。当前进入 Phase 12.1 Slice 2 code review。
 
@@ -515,6 +515,8 @@ Phase Map 中每个 phase 必须使用统一条目格式。模板如下：
 当前 gate 追加事实（full-repo review fix）：Fix artifact 为 `docs/reviews/repo-review-20260522-fix-codex.md`；AgentCodex 已完成 A1-A6 scoped fix，未修改 Engine、durable broad structure、README dead links、PR 或 remote。Controller 本地复跑：`pytest tests/contracts/test_tool_schema.py tests/host/test_import_boundary.py tests/runtime/test_assembly_helpers.py tests/runtime/test_config_loader.py -q` 56 passed；`pytest tests/runtime -q` 213 passed；`pytest tests/contracts tests/host/test_import_boundary.py -q` 64 passed；`python -m pyright dayu/contracts dayu/runtime dayu/host tests/contracts tests/runtime tests/host` 0 errors；`git diff --check` clean。当前进入 full-repo review fix re-review。
 
 当前 gate 追加事实（full-repo review fix re-review accepted）：Re-review artifacts 为 `docs/reviews/repo-review-20260522-fix-rereview-mimo.md` 与 `docs/reviews/repo-review-20260522-fix-rereview-ds.md`，两份均 PASS，blocking finding count = 0，确认 A1-A6 已收口且无新增 blocker。Controller final adjudication artifact 为 `docs/reviews/repo-review-20260522-fix-rereview-controller-adjudication.md`。当前 gate 为 local-PASS；进入 accepted local commit bookkeeping。
+
+当前 gate 追加事实（full-repo review accepted fix commit）：Accepted full-repo review fix commit hash 为 `cbb3302`。当前 gate 为 accepted-local-PASS。
 
 ## Phase Map
 
