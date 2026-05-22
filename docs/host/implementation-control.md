@@ -518,6 +518,14 @@ Phase Map 中每个 phase 必须使用统一条目格式。模板如下：
 
 当前 gate 追加事实（full-repo review accepted fix commit）：Accepted full-repo review fix commit hash 为 `cbb3302`。当前 gate 为 accepted-local-PASS。
 
+当前 gate 追加事实（Phase 12.3 plan artifact）：Phase 12.3 implementation-ready plan artifact 已由 AgentCodex 生成：`docs/host/phase12-3-config-usage-governance-plan.md`。AgentCodex reported `git diff --check -- docs/host/phase12-3-config-usage-governance-plan.md` clean，未修改 source/config/tests。Controller 初读发现 usage `provider_request_id` 关联存在潜在 contract 边界风险，已进入 plan review gate。
+
+当前 gate 追加事实（Phase 12.3 plan review）：Phase 12.3 plan review artifacts 为 `docs/reviews/phase12-3-plan-review-mimo-20260522.md` 与 `docs/reviews/phase12-3-plan-review-ds-20260522.md`。MiMo verdict 为 PASS_WITH_FINDINGS，blocking finding count = 0；DS verdict 为 PASS_WITH_FINDINGS，blocking finding count = 1。Controller adjudication artifact 为 `docs/reviews/phase12-3-plan-review-controller-adjudication-20260522.md`；总控裁决：接受 DS B1 为 blocking plan defect，但拒绝在 P12.3 扩展 Engine `RunnerUsageRecordedData` / `UsageReportedData` contract，要求改为 provider request id optional / unavailable-by-default 的 Host usage observation association。当前进入 Phase 12.3 plan fix。
+
+当前 gate 追加事实（Phase 12.3 plan fix）：Phase 12.3 plan fix 已由 AgentCodex 完成，`docs/host/phase12-3-config-usage-governance-plan.md` 已移除对 `UsageReportedData.provider_request_id` / `RunnerUsageRecordedData.provider_request_id` 的要求，改为 provider request id 可选且不可用时为 `None`，并要求 missing provider request id 不影响 usage projection 或 Run / Attempt 状态。AgentCodex reported `git diff --check -- docs/host/phase12-3-config-usage-governance-plan.md docs/reviews/phase12-3-plan-review-controller-adjudication-20260522.md` clean。当前进入 Phase 12.3 plan re-review。
+
+当前 gate 追加事实（Phase 12.3 plan re-review accepted）：Phase 12.3 plan re-review artifacts 为 `docs/reviews/phase12-3-plan-rereview-mimo-20260522.md` 与 `docs/reviews/phase12-3-plan-rereview-ds-20260522.md`，两份均 PASS，确认 P12.3-PLAN-B1 已收口且无新增 blocker。Controller re-review adjudication artifact 为 `docs/reviews/phase12-3-plan-rereview-controller-adjudication-20260522.md`。Phase 12.3 plan accepted；当前进入 accepted plan local commit bookkeeping，随后按 `$init-agents` 路由派发 Slice 1 implementation。
+
 ## Phase Map
 
 Phase 按依赖关系推进：先实现被其它阶段依赖的公共契约、runtime 基础能力、durable store、EventLog 与状态机，再连接执行路径、工具治理、projection core、memory、context governance、ordinary local multi-turn public contract freeze、recovery 与 remote。Audit、Tool Trace、Outbox 是独立 projection sinks，后置到核心治理路径稳定之后实现。Phase 0 是 Engine cleanup 前置 work unit，只阻塞 Phase 10 Context Governance，不阻塞 Phase 1-9。每个 phase 开始时仍必须先和用户讨论并细化对应 `docs/host/design.md` 章节，再生成 handoff implementation-ready plan。
