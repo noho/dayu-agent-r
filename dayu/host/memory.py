@@ -1144,11 +1144,10 @@ def project_conversation_memory_event(
     diagnostics = base.diagnostics
 
     if event.event_type == _EVENT_TYPE_TOOL_RESULT_ACCEPTED:
-        fact, fact_diagnostics = _evidence_backed_fact_from_projection_event(
-            event, policy_digest=policy_digest
-        )
-        evidence_backed_facts = _replace_item_by_id(evidence_backed_facts, fact)
-        diagnostics = diagnostics + fact_diagnostics
+        # Accepted tool results only carry accepted evidence envelopes. Final
+        # evidence-backed facts are materialized by compacted context output in
+        # a later slice, not directly from raw tool result acceptance.
+        pass
     elif event.event_type == _EVENT_TYPE_USER_INPUT_ACCEPTED:
         pinned_state = _pinned_state_with_user_input(
             pinned_state,

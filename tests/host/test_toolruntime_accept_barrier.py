@@ -42,6 +42,7 @@ from dayu.host.durable.state import (
     mark_dispatching_after_lane_row,
 )
 from dayu.host.durable.transaction import HostTransaction, HostTransactionRunner
+from dayu.host.evidence import accepted_evidence_envelope_from_json_value
 from dayu.host.memory import (
     CONVERSATION_MEMORY_CONSUMER_ID,
     default_memory_projection_policy,
@@ -154,6 +155,59 @@ def test_tool_fact_accept_survives_projection_catchup_failure(
         assert all(record.levelname == "WARNING" for record in caplog.records)
 
 
+def test_tool_result_accepted_payload_carries_accepted_evidence_envelope(
+    tmp_path: Path,
+) -> None:
+    """新 accepted result payload 携带稳定 accepted evidence envelope。"""
+
+    with open_host_durable_store(_options(tmp_path)) as store:
+        seeded = _seed_active_run(store.transaction_runner)
+        candidate = _completed_candidate(seeded, tool_call_id="tool-call-evidence")
+        accept_port = DefaultHostToolFactAcceptPort(
+            transaction_runner=store.transaction_runner
+        )
+
+        result = accept_port.accept_tool_fact(candidate)
+        result_rows = _tool_result_events(store.transaction_runner)
+
+        assert isinstance(result, ToolFactAcceptedAck)
+        assert result.tool_result_event_ref is not None
+        assert len(result_rows) == 1
+        payload = payload_object(result_rows[0])
+        envelope_json = payload["accepted_evidence_envelope"]
+        envelope = accepted_evidence_envelope_from_json_value(envelope_json)
+        assert envelope.evidence_id == (
+            f"evidence:{result.tool_result_event_ref.event_id}"
+        )
+        assert envelope.producer_event_ref == result.tool_result_event_ref.event_id
+        assert envelope.tool_name == "lookup"
+        assert envelope.tool_call_id == "tool-call-evidence"
+        assert envelope.tool_query.tool_call_requested_event_ref == (
+            result.tool_call_requested_event_ref.event_id
+        )
+        assert envelope.tool_query.normalized_arguments_digest == (
+            candidate.normalized_arguments_digest
+        )
+        assert envelope.tool_query.semantic_input_digest == (
+            candidate.semantic_input_digest
+        )
+        assert envelope.result_ref.payload_ref is None
+        assert envelope.result_ref.payload_digest == candidate.payload_digest
+        assert envelope.result_ref.outcome_digest == candidate.outcome_digest
+        assert envelope.result_ref.truncation_applied is False
+        assert envelope.source_refs == ()
+        assert envelope.locator_refs == ()
+
+
+def test_accepted_evidence_envelope_codec_rejects_partial_object() -> None:
+    """accepted evidence envelope JSON codec 拒绝不完整对象。"""
+
+    with pytest.raises(ValueError, match="unexpected JSON fields"):
+        accepted_evidence_envelope_from_json_value(
+            {"evidence_id": "evidence:event-tool-result"}
+        )
+
+
 def test_tool_fact_accept_logs_ids_without_tool_payload(
     tmp_path: Path, caplog: pytest.LogCaptureFixture
 ) -> None:
@@ -187,14 +241,14 @@ def test_tool_fact_accept_logs_ids_without_tool_payload(
         assert "{\"payload\":" not in caplog.text
 
 
-def test_tool_fact_accept_concrete_memory_catchup_projects_verified_fact(
+def test_tool_fact_accept_concrete_memory_catchup_does_not_project_fact(
     tmp_path: Path,
 ) -> None:
-    """TOOL_RESULT_ACCEPTED commit 后 concrete catch-up 会写入 verified fact。
+    """TOOL_RESULT_ACCEPTED commit 后 concrete catch-up 不直接写入 fact。
 
     :param tmp_path: pytest 临时目录。
     :returns: ``None``。
-    :raises AssertionError: accepted 工具事实未被 memory catch-up 投影时抛出。
+    :raises AssertionError: accepted 工具事实被 memory catch-up 直接投影时抛出。
     """
 
     policy = default_memory_projection_policy()
@@ -224,8 +278,8 @@ def test_tool_fact_accept_concrete_memory_catchup_projects_verified_fact(
         assert isinstance(result, ToolFactAcceptedAck)
         assert result.tool_result_event_ref is not None
         assert snapshot is not None
-        assert len(snapshot.snapshot.verified_facts) == 1
-        assert snapshot.snapshot.verified_facts[0].provenance.event_id == (
+        assert snapshot.snapshot.evidence_backed_facts == ()
+        assert snapshot.snapshot.cursor.checkpoint_event_id == (
             result.tool_result_event_ref.event_id
         )
 

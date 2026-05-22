@@ -1622,6 +1622,13 @@ Plan 必须额外收口的 readiness review checklist：
   `docs/reviews/phase12-5-slice1-code-rereview-controller-adjudication-20260522.md`。Slice 1 validation:
   `pytest tests/runtime/test_config_loader.py tests/service/test_host_assembly.py tests/host/test_run_input_builder.py` PASS
   (74 passed)；targeted pyright PASS (0 errors)。
+  Slice 2 `Accepted Evidence Envelope In Tool Accept Path` implementation / code review PASS；review artifacts 为
+  `docs/reviews/phase12-5-slice2-code-review-mimo-20260522.md`、
+  `docs/reviews/phase12-5-slice2-code-review-ds-20260522.md`、
+  `docs/reviews/phase12-5-slice2-code-review-controller-adjudication-20260522.md`。Slice 2 validation:
+  `pytest tests/host/test_toolruntime_accept_barrier.py tests/host/test_memory_projection.py` PASS (47 passed)；targeted pyright
+  PASS (0 errors)。Deferred finding S2-D1：compact summary fact-ref test coverage 因 direct tool-result fact projection 被关闭而弱化，
+  必须在 Slice 5 `Memory Projection Materialization` 恢复覆盖。
 
 目标：
 - 从买方财报分析 Agent 的第一性原理优化 Conversation Memory，使同一 session 内已由工具确认的关键财务事实能跨轮、

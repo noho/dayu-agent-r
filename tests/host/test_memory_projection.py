@@ -61,7 +61,7 @@ from dayu.host.memory import (
     MemorySnapshotCursor,
     OpaqueMemoryRef,
     PinnedStateView,
-    VerifiedFactView,
+    EvidenceBackedFactView,
     WorkingAssumptionView,
     build_empty_conversation_memory_snapshot,
     build_conversation_memory_snapshot_from_events,
@@ -114,7 +114,7 @@ def _policy() -> MemoryProjectionPolicy:
     return MemoryProjectionPolicy(
         context_window_size=8192,
         max_pinned_items=8,
-        max_verified_facts=16,
+        max_evidence_backed_facts=16,
         max_working_assumptions=8,
         recent_raw_turns_floor=2,
         raw_turn_context_ratio=0.125,
@@ -140,7 +140,7 @@ def _low_history_policy() -> MemoryProjectionPolicy:
     return MemoryProjectionPolicy(
         context_window_size=8192,
         max_pinned_items=8,
-        max_verified_facts=16,
+        max_evidence_backed_facts=16,
         max_working_assumptions=8,
         recent_raw_turns_floor=2,
         raw_turn_context_ratio=0.125,
@@ -166,7 +166,7 @@ def _assistant_budget_policy() -> MemoryProjectionPolicy:
     return MemoryProjectionPolicy(
         context_window_size=8192,
         max_pinned_items=8,
-        max_verified_facts=16,
+        max_evidence_backed_facts=16,
         max_working_assumptions=8,
         recent_raw_turns_floor=1,
         raw_turn_context_ratio=0.125,
@@ -192,7 +192,7 @@ def _zero_recent_floor_policy() -> MemoryProjectionPolicy:
     return MemoryProjectionPolicy(
         context_window_size=8192,
         max_pinned_items=8,
-        max_verified_facts=16,
+        max_evidence_backed_facts=16,
         max_working_assumptions=8,
         recent_raw_turns_floor=0,
         raw_turn_context_ratio=0.125,
@@ -756,7 +756,7 @@ def test_empty_event_log_snapshot_can_be_created_and_read(
 
         assert written.snapshot.snapshot_id == "snapshot-empty"
         assert read_back is not None
-        assert read_back.snapshot.verified_facts == ()
+        assert read_back.snapshot.evidence_backed_facts == ()
         assert read_back.snapshot.working_assumptions == ()
         assert read_back.snapshot.conversation_continuity.items == ()
         assert read_back.snapshot.cursor.checkpoint_event_sequence == 0
@@ -780,8 +780,8 @@ def test_snapshot_and_checkpoint_rollback_together(tmp_path: Path) -> None:
         assert checkpoint is None
 
 
-def test_typed_contracts_reject_invalid_ids_cursor_and_verified_fact() -> None:
-    """typed contracts 拒绝空 id、非法 cursor 与非 TOOL verified fact。"""
+def test_typed_contracts_reject_invalid_ids_cursor_and_evidence_fact() -> None:
+    """typed contracts 拒绝空 id、非法 cursor 与非法 evidence-backed fact。"""
 
     with pytest.raises(ValueError):
         OpaqueMemoryRef(ref_kind=HostNeutralRefKind.SUBJECT, ref_id="")
@@ -800,26 +800,26 @@ def test_typed_contracts_reject_invalid_ids_cursor_and_verified_fact() -> None:
             session_id=_SESSION_ID,
         )
     with pytest.raises(ValueError):
-        VerifiedFactView(
+        EvidenceBackedFactView(
             item_id="fact-1",
             fact_summary="summary",
             claim_status=MemoryClaimStatus.ASSUMPTION,
             provenance=_tool_provenance(),
             evidence_anchor=None,
             subject_refs=(),
-            included_reason=MemoryIncludedReason.TOOL_VERIFIED_FACT,
+            included_reason=MemoryIncludedReason.EVIDENCE_BACKED_FACT,
             excluded_reason=None,
             size_units=MemorySizeUnits(units=7),
         )
     with pytest.raises(ValueError):
-        VerifiedFactView(
+        EvidenceBackedFactView(
             item_id="fact-1",
             fact_summary="summary",
-            claim_status=MemoryClaimStatus.TOOL_VERIFIED,
+            claim_status=MemoryClaimStatus.EVIDENCE_BACKED,
             provenance=_user_provenance(),
             evidence_anchor=None,
             subject_refs=(),
-            included_reason=MemoryIncludedReason.TOOL_VERIFIED_FACT,
+            included_reason=MemoryIncludedReason.EVIDENCE_BACKED_FACT,
             excluded_reason=None,
             size_units=MemorySizeUnits(units=7),
         )
@@ -878,7 +878,7 @@ def test_memory_contracts_do_not_expose_business_specific_fields() -> None:
             OpaqueMemoryRef,
             MemoryProvenanceRef,
             PinnedStateView,
-            VerifiedFactView,
+            EvidenceBackedFactView,
             WorkingAssumptionView,
             ConversationContinuityItem,
             MemoryDiagnostic,
@@ -951,7 +951,7 @@ def test_snapshot_digest_ignores_nondeterministic_diagnostic_fields() -> None:
             user_constraints=("constraint",),
             open_questions=("question",),
         ),
-        verified_facts=(),
+        evidence_backed_facts=(),
         working_assumptions=(),
         conversation_continuity=ConversationContinuityView(items=()),
         diagnostics=(
@@ -974,7 +974,7 @@ def test_snapshot_digest_ignores_nondeterministic_diagnostic_fields() -> None:
         cursor=first.cursor,
         policy_digest=policy_digest,
         pinned_state=first.pinned_state,
-        verified_facts=(),
+        evidence_backed_facts=(),
         working_assumptions=(),
         conversation_continuity=first.conversation_continuity,
         diagnostics=(
@@ -1038,8 +1038,8 @@ def test_p9_contracts_do_not_synthesize_conflict_stale_or_superseded() -> None:
             )
 
 
-def test_final_answer_enters_continuity_not_verified_fact() -> None:
-    """RUN_SUCCEEDED final_answer 只进入 continuity，不进入 verified facts。"""
+def test_final_answer_enters_continuity_not_evidence_fact() -> None:
+    """RUN_SUCCEEDED final_answer 只进入 continuity，不进入 evidence-backed facts。"""
 
     snapshot = _build_snapshot(
         (
@@ -1055,7 +1055,7 @@ def test_final_answer_enters_continuity_not_verified_fact() -> None:
         )
     )
 
-    assert snapshot.verified_facts == ()
+    assert snapshot.evidence_backed_facts == ()
     assert len(snapshot.conversation_continuity.items) == 1
     item = snapshot.conversation_continuity.items[0]
     assert item.item_kind is ConversationContinuityKind.ASSISTANT_CONCLUSION
@@ -1064,8 +1064,8 @@ def test_final_answer_enters_continuity_not_verified_fact() -> None:
     assert item.summary_text == "assistant conclusion"
 
 
-def test_user_input_never_enters_verified_facts() -> None:
-    """USER_INPUT_ACCEPTED 可进入 pinned / continuity，但不得成为 verified fact。"""
+def test_user_input_never_enters_evidence_backed_facts() -> None:
+    """USER_INPUT_ACCEPTED 可进入 pinned / continuity，但不得成为 evidence fact。"""
 
     snapshot = _build_snapshot(
         (
@@ -1081,7 +1081,7 @@ def test_user_input_never_enters_verified_facts() -> None:
         )
     )
 
-    assert snapshot.verified_facts == ()
+    assert snapshot.evidence_backed_facts == ()
     assert snapshot.pinned_state.user_constraints == ("use fiscal year 2025",)
     assert len(snapshot.conversation_continuity.items) == 1
     assert (
@@ -1170,8 +1170,8 @@ def test_current_goal_preserved_when_projecting_later_user_delta() -> None:
     )
 
 
-def test_tool_result_accepted_produces_verified_fact_with_refs() -> None:
-    """TOOL_RESULT_ACCEPTED 生成带 producer 与 provenance refs 的 verified fact。"""
+def test_tool_result_accepted_does_not_project_evidence_backed_fact() -> None:
+    """TOOL_RESULT_ACCEPTED 只推进 cursor，不直接生成 evidence-backed fact。"""
 
     snapshot = _build_snapshot(
         (
@@ -1187,31 +1187,13 @@ def test_tool_result_accepted_produces_verified_fact_with_refs() -> None:
         )
     )
 
-    assert len(snapshot.verified_facts) == 1
-    fact = snapshot.verified_facts[0]
-    assert fact.fact_summary == "tool supplied neutral summary"
-    assert fact.claim_status is MemoryClaimStatus.TOOL_VERIFIED
-    assert fact.provenance.producer_kind is MemoryProducerKind.TOOL
-    assert fact.provenance.producer_name == "filing.lookup"
-    assert fact.provenance.event_id == "event-tool-result"
-    assert fact.provenance.event_sequence == 2
-    assert fact.provenance.run_id == "run-1"
-    assert fact.provenance.attempt_id == "attempt-1"
-    assert fact.provenance.execution_id == "execution-1"
-    assert fact.provenance.tool_result_ref == "event-tool-result"
-    assert fact.provenance.payload_ref == "payload-tool-1"
-    assert fact.provenance.digest_ref == _DIGEST_B
-    assert fact.evidence_anchor is not None
-    assert fact.evidence_anchor.ref_id == "payload:payload-tool-1"
-    assert any(
-        ref.ref_kind is HostNeutralRefKind.PAYLOAD
-        and ref.ref_id == "payload:payload-tool-1"
-        for ref in fact.provenance.source_refs
-    )
+    assert snapshot.evidence_backed_facts == ()
+    assert snapshot.diagnostics == ()
+    assert snapshot.cursor.checkpoint_event_id == "event-tool-result"
 
 
-def test_missing_tool_fact_summary_uses_neutral_fallback_diagnostic() -> None:
-    """缺失工具 fact summary 时使用中立 fallback 并记录 diagnostic。"""
+def test_missing_tool_fact_summary_does_not_use_neutral_fallback() -> None:
+    """缺失工具 fact summary 时不生成 fallback fact 或 diagnostic。"""
 
     snapshot = _build_snapshot(
         (
@@ -1224,19 +1206,12 @@ def test_missing_tool_fact_summary_uses_neutral_fallback_diagnostic() -> None:
         )
     )
 
-    assert len(snapshot.verified_facts) == 1
-    fact = snapshot.verified_facts[0]
-    assert "tool_name=filing.lookup" in fact.fact_summary
-    assert "payload_ref=payload-tool-1" in fact.fact_summary
-    assert all(term not in fact.fact_summary for term in _FORBIDDEN_BUSINESS_TERMS)
-    assert tuple(diagnostic.reason for diagnostic in snapshot.diagnostics) == (
-        MemoryDiagnosticReason.MISSING_FACT_SUMMARY_FALLBACK,
-    )
-    assert snapshot.diagnostics[0].item_id == fact.item_id
+    assert snapshot.evidence_backed_facts == ()
+    assert snapshot.diagnostics == ()
 
 
-def test_missing_tool_name_uses_unknown_tool_producer() -> None:
-    """缺失 tool_name 时 TOOL producer 使用中立 unknown tool 名称。"""
+def test_missing_tool_name_does_not_project_unknown_tool_producer() -> None:
+    """缺失 tool_name 时也不从 TOOL_RESULT_ACCEPTED 生成 producer fact。"""
 
     payload = _tool_payload(summary=None)
     del payload["tool_name"]
@@ -1251,14 +1226,12 @@ def test_missing_tool_name_uses_unknown_tool_producer() -> None:
         )
     )
 
-    fact = snapshot.verified_facts[0]
-    assert fact.provenance.producer_kind is MemoryProducerKind.TOOL
-    assert fact.provenance.producer_name == "unknown_tool"
-    assert "tool_name=unknown_tool" in fact.fact_summary
+    assert snapshot.evidence_backed_facts == ()
+    assert snapshot.diagnostics == ()
 
 
-def test_invalid_source_refs_are_skipped_without_dropping_fact() -> None:
-    """Malformed source_refs 不应导致 TOOL_RESULT_ACCEPTED 投影失败。"""
+def test_invalid_source_refs_do_not_create_tool_result_fact() -> None:
+    """Malformed source_refs 不应导致 TOOL_RESULT_ACCEPTED 生成 fact。"""
 
     payload = _tool_payload(summary="summary with malformed refs")
     payload["source_refs"] = [
@@ -1276,10 +1249,8 @@ def test_invalid_source_refs_are_skipped_without_dropping_fact() -> None:
         )
     )
 
-    fact = snapshot.verified_facts[0]
-    assert fact.fact_summary == "summary with malformed refs"
-    assert any(ref.ref_id == "good-ref" for ref in fact.provenance.source_refs)
-    assert all(ref.ref_id != "bad-ref" for ref in fact.provenance.source_refs)
+    assert snapshot.evidence_backed_facts == ()
+    assert snapshot.diagnostics == ()
 
 
 def test_projection_ignores_reserved_claim_status_from_payload() -> None:
@@ -1300,7 +1271,7 @@ def test_projection_ignores_reserved_claim_status_from_payload() -> None:
 
     statuses = {
         item.claim_status
-        for item in snapshot.verified_facts
+        for item in snapshot.evidence_backed_facts
     } | {
         item.claim_status
         for item in snapshot.working_assumptions
@@ -1311,11 +1282,11 @@ def test_projection_ignores_reserved_claim_status_from_payload() -> None:
     assert MemoryClaimStatus.CONFLICTED not in statuses
     assert MemoryClaimStatus.STALE not in statuses
     assert MemoryClaimStatus.SUPERSEDED not in statuses
-    assert statuses == {MemoryClaimStatus.TOOL_VERIFIED}
+    assert statuses == set()
 
 
 def test_episode_summary_does_not_replace_evidence_anchor() -> None:
-    """Episode summary 只是 continuity navigation，不替代工具 evidence anchor。"""
+    """Episode summary 只是 continuity navigation，不从 tool result 补 fact。"""
 
     snapshot = _build_snapshot(
         (
@@ -1337,9 +1308,7 @@ def test_episode_summary_does_not_replace_evidence_anchor() -> None:
         )
     )
 
-    assert len(snapshot.verified_facts) == 1
-    assert snapshot.verified_facts[0].evidence_anchor is not None
-    assert snapshot.verified_facts[0].evidence_anchor.ref_id == "payload:payload-tool-1"
+    assert snapshot.evidence_backed_facts == ()
     assert len(snapshot.conversation_continuity.items) == 1
     assert (
         snapshot.conversation_continuity.items[0].item_kind
@@ -1364,7 +1333,7 @@ def test_context_compacted_episode_summary_becomes_assumption_continuity() -> No
         )
     )
 
-    assert snapshot.verified_facts == ()
+    assert snapshot.evidence_backed_facts == ()
     assert len(snapshot.conversation_continuity.items) == 1
     item = snapshot.conversation_continuity.items[0]
     assert item.item_kind is ConversationContinuityKind.EPISODE_SUMMARY
@@ -1492,8 +1461,8 @@ def test_context_compacted_rejects_free_form_confirmed_subject_patch() -> None:
         )
 
 
-def test_context_compacted_summary_fact_refs_do_not_create_verified_facts() -> None:
-    """summary 可引用已有工具事实，但不能新建 verified fact。"""
+def test_context_compacted_summary_fact_refs_do_not_create_evidence_backed_facts() -> None:
+    """summary fact refs 不会让 TOOL_RESULT_ACCEPTED 直接生成 fact。"""
 
     snapshot = _build_snapshot(
         (
@@ -1509,7 +1478,6 @@ def test_context_compacted_summary_fact_refs_do_not_create_verified_facts() -> N
                 event_type="CONTEXT_COMPACTED",
                 payload=_compact_payload(
                     summary_text="summary cites tool fact",
-                    confirmed_fact_refs=("event-tool-for-summary",),
                 ),
                 run_id="run-compact",
                 attempt_id=None,
@@ -1518,8 +1486,7 @@ def test_context_compacted_summary_fact_refs_do_not_create_verified_facts() -> N
         )
     )
 
-    assert len(snapshot.verified_facts) == 1
-    assert snapshot.verified_facts[0].provenance.event_id == "event-tool-for-summary"
+    assert snapshot.evidence_backed_facts == ()
     assert len(snapshot.conversation_continuity.items) == 1
     assert snapshot.conversation_continuity.items[0].summary_text == (
         "summary cites tool fact"
@@ -1695,7 +1662,7 @@ def test_unknown_event_type_records_diagnostic_and_advances_cursor() -> None:
     )
 
     assert snapshot.cursor.checkpoint_event_sequence == 7
-    assert snapshot.verified_facts == ()
+    assert snapshot.evidence_backed_facts == ()
     assert snapshot.conversation_continuity.items == ()
     assert len(snapshot.diagnostics) == 1
     assert (
@@ -1709,7 +1676,7 @@ def test_unknown_event_type_records_diagnostic_and_advances_cursor() -> None:
 
 
 def test_snapshot_rebuild_preserves_provenance_and_digest_is_deterministic() -> None:
-    """固定 events 与 policy rebuild 后 provenance 不丢且 digest 稳定。"""
+    """固定 events 与 policy rebuild 后 digest 稳定且不投影 tool result fact。"""
 
     events = (
         _memory_event(
@@ -1738,8 +1705,8 @@ def test_snapshot_rebuild_preserves_provenance_and_digest_is_deterministic() -> 
     )
 
     assert first.snapshot_digest == second.snapshot_digest
-    assert first.verified_facts[0].provenance == second.verified_facts[0].provenance
-    assert first.verified_facts[0].provenance.payload_ref == "payload-tool-1"
+    assert first.evidence_backed_facts == ()
+    assert second.evidence_backed_facts == ()
     assert first.cursor.checkpoint_event_sequence == 2
     assert second.cursor.checkpoint_event_sequence == 2
 
@@ -1799,9 +1766,7 @@ def test_projection_consumer_writes_snapshot_with_runner_checkpoint(
 
         assert result.events_applied == 3
         assert read_back is not None
-        assert read_back.snapshot.verified_facts[0].fact_summary == (
-            "durable tool summary"
-        )
+        assert read_back.snapshot.evidence_backed_facts == ()
         assert read_back.snapshot.pinned_state.current_goal == "durable compact goal"
         assert tuple(
             item.summary_text
@@ -1885,7 +1850,7 @@ def test_preview_reasoning_and_display_only_events_do_not_enter_memory(
         assert result.events_matched == 1
         assert read_back is not None
         assert read_back.snapshot.pinned_state.current_goal == "canonical user fact"
-        assert read_back.snapshot.verified_facts == ()
+        assert read_back.snapshot.evidence_backed_facts == ()
         assert tuple(
             item.summary_text
             for item in read_back.snapshot.conversation_continuity.items
@@ -2061,13 +2026,7 @@ def test_rebuild_conversation_memory_projection_is_stable_and_does_not_append_ev
         assert first_snapshot.snapshot.snapshot_digest == (
             second_snapshot.snapshot.snapshot_digest
         )
-        assert first_snapshot.snapshot.verified_facts[0].provenance.event_id == (
-            "event-tool-rebuild-service"
-        )
-        assert first_snapshot.snapshot.verified_facts[0].provenance.event_sequence == 1
-        assert first_snapshot.snapshot.verified_facts[0].provenance.payload_ref == (
-            "payload-tool-1"
-        )
+        assert first_snapshot.snapshot.evidence_backed_facts == ()
         assert before_count == after_count
         assert checkpoint is not None
         assert checkpoint.checkpoint_event_sequence == (

@@ -90,6 +90,13 @@ from dayu.host.durable.state import (
     read_run_by_id,
 )
 from dayu.host.durable.transaction import HostTransaction, HostTransactionRunner
+from dayu.host.evidence import (
+    AcceptedEvidenceEnvelope,
+    AcceptedEvidenceResultRef,
+    AcceptedEvidenceToolQuery,
+    accepted_evidence_envelope_to_json_value,
+    derive_accepted_evidence_id,
+)
 from dayu.host.projection import (
     ProjectionCatchupPort,
     catch_up_projection_best_effort,
@@ -149,6 +156,7 @@ _EVENT_ID_TOOL_RESULT_ACCEPTED_PREFIX = "event-tool-result-accepted-"
 _EVENT_TYPE_TOOL_CALL_REQUESTED = "TOOL_CALL_REQUESTED"
 _EVENT_TYPE_TOOL_CALL_GOVERNED = "TOOL_CALL_GOVERNED"
 _EVENT_TYPE_TOOL_RESULT_ACCEPTED = "TOOL_RESULT_ACCEPTED"
+_PAYLOAD_FIELD_ACCEPTED_EVIDENCE_ENVELOPE = "accepted_evidence_envelope"
 _TOOL_ACCEPT_EVENT_ACTOR = "host.tool_runtime"
 _TOOL_ACCEPT_EVENT_SOURCE = "host.tool_runtime.accept"
 _MIN_ACCEPT_RETRY_ATTEMPTS = 1
@@ -3462,6 +3470,11 @@ def _append_tool_result_if_needed(
     payload_digest = (
         candidate.payload_ref.payload_digest if candidate.payload_ref else None
     )
+    accepted_evidence_envelope = _accepted_evidence_envelope(
+        candidate=candidate,
+        result_event_id=event_id,
+        requested=requested,
+    )
     return event_log_store.append_event(
         transaction,
         _tool_event_request(
@@ -3509,11 +3522,59 @@ def _append_tool_result_if_needed(
                 ),
                 "accept_idempotency_key": candidate.accept_idempotency_key,
                 "semantic_input_digest": candidate.semantic_input_digest,
+                _PAYLOAD_FIELD_ACCEPTED_EVIDENCE_ENVELOPE: (
+                    accepted_evidence_envelope_to_json_value(
+                        accepted_evidence_envelope
+                    )
+                ),
             },
             payload_ref=payload_ref,
             payload_digest=payload_digest,
         ),
     ).row
+
+
+def _accepted_evidence_envelope(
+    *,
+    candidate: ToolFactAcceptCandidate,
+    result_event_id: str,
+    requested: EventLogRow,
+) -> AcceptedEvidenceEnvelope:
+    """构造 accepted tool result 的 Host 中立证据信封。
+
+    :param candidate: 工具事实候选。
+    :param result_event_id: 即将写入的 ``TOOL_RESULT_ACCEPTED`` event id。
+    :param requested: 已写入的 ``TOOL_CALL_REQUESTED`` row。
+    :returns: accepted evidence envelope。
+    """
+
+    return AcceptedEvidenceEnvelope(
+        evidence_id=derive_accepted_evidence_id(result_event_id),
+        producer_event_ref=result_event_id,
+        tool_name=candidate.tool_name,
+        tool_call_id=candidate.tool_call_id,
+        tool_query=AcceptedEvidenceToolQuery(
+            tool_call_requested_event_ref=requested.event_id,
+            normalized_arguments_digest=candidate.normalized_arguments_digest,
+            semantic_input_digest=candidate.semantic_input_digest,
+        ),
+        result_ref=AcceptedEvidenceResultRef(
+            payload_ref=(
+                candidate.payload_ref.payload_ref
+                if candidate.payload_ref is not None
+                else None
+            ),
+            payload_digest=candidate.payload_digest,
+            outcome_digest=candidate.outcome_digest,
+            truncation_applied=(
+                candidate.truncation.applied
+                if candidate.truncation is not None
+                else False
+            ),
+        ),
+        source_refs=(),
+        locator_refs=(),
+    )
 
 
 def _tool_event_request(
