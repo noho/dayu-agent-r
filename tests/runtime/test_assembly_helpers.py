@@ -2,6 +2,9 @@
 
 from __future__ import annotations
 
+from collections.abc import MutableMapping
+from typing import cast
+
 import pytest
 
 from dayu.contracts.tool_schema import ToolTruncateSpec, ToolTruncationStrategy
@@ -167,6 +170,25 @@ def test_merge_agent_policy_config_uses_typed_allowlist_precedence() -> None:
     assert merged.field_sources["max_iterations"] == "scene_override"
     assert merged.field_sources["allow_tool_calls"] == "run_override"
     assert merged.field_sources["continuation_prompt"] == "execution_profile"
+
+
+def test_merge_agent_policy_config_field_sources_is_runtime_immutable() -> None:
+    """合并诊断来源不得通过返回对象被调用方原地修改。"""
+
+    config = load_runtime_config()
+    profile = config.execution_profiles.agent_policy_profiles["standard-agent"]
+
+    merged = merge_agent_policy_config(
+        code_default=_agent_policy_defaults(),
+        execution_profile=profile,
+        scene_override=None,
+        run_override=None,
+    )
+
+    with pytest.raises(TypeError):
+        cast(MutableMapping[str, str], merged.field_sources)["max_iterations"] = (
+            "mutated"
+        )
 
 
 def test_tool_truncation_policy_defaults_fill_declaration_without_target_drift() -> None:

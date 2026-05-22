@@ -11,6 +11,7 @@ from __future__ import annotations
 import math
 from collections.abc import Mapping
 from dataclasses import dataclass
+from types import MappingProxyType
 from typing import Final, Generic, TypeVar
 
 from dayu.contracts import JsonValue
@@ -541,20 +542,22 @@ def merge_agent_policy_config(
         max_consecutive_failed_tool_batches=(
             max_consecutive_failed_tool_batches.value
         ),
-        field_sources={
-            _FIELD_MAX_ITERATIONS: max_iterations.source,
-            _FIELD_CONTINUATION_MAX_ATTEMPTS: continuation_max_attempts.source,
-            _FIELD_ALLOW_TOOL_CALLS: allow_tool_calls.source,
-            _FIELD_TOOL_EXECUTION_TIMEOUT_SECONDS: (
-                tool_execution_timeout_seconds.source
-            ),
-            _FIELD_FALLBACK_MODE: fallback_mode.source,
-            _FIELD_FALLBACK_PROMPT: fallback_prompt.source,
-            _FIELD_CONTINUATION_PROMPT: continuation_prompt.source,
-            _FIELD_MAX_CONSECUTIVE_FAILED_TOOL_BATCHES: (
-                max_consecutive_failed_tool_batches.source
-            ),
-        },
+        field_sources=MappingProxyType(
+            {
+                _FIELD_MAX_ITERATIONS: max_iterations.source,
+                _FIELD_CONTINUATION_MAX_ATTEMPTS: continuation_max_attempts.source,
+                _FIELD_ALLOW_TOOL_CALLS: allow_tool_calls.source,
+                _FIELD_TOOL_EXECUTION_TIMEOUT_SECONDS: (
+                    tool_execution_timeout_seconds.source
+                ),
+                _FIELD_FALLBACK_MODE: fallback_mode.source,
+                _FIELD_FALLBACK_PROMPT: fallback_prompt.source,
+                _FIELD_CONTINUATION_PROMPT: continuation_prompt.source,
+                _FIELD_MAX_CONSECUTIVE_FAILED_TOOL_BATCHES: (
+                    max_consecutive_failed_tool_batches.source
+                ),
+            }
+        ),
     )
 
 

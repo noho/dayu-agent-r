@@ -565,6 +565,83 @@ def test_old_execution_profile_fields_fail_fast(tmp_path: Path) -> None:
         ConfigLoader(package_config_dir=package_root).load_execution_profiles()
 
 
+def test_agent_policy_profiles_must_not_be_empty(tmp_path: Path) -> None:
+    """execution_profiles.agent_policy_profiles 为空必须在配置加载期失败。"""
+
+    package_root = tmp_path / "package"
+    _minimal_package_config(package_root)
+    _write_json(
+        package_root / "execution_profiles.json",
+        {
+            "default_execution_profile_id": "standard",
+            "execution_profiles": {
+                "standard": _execution_profile_record(),
+            },
+            "agent_policy_profiles": {},
+        },
+    )
+
+    with pytest.raises(
+        ConfigFieldError,
+        match="agent_policy_profiles must not be empty",
+    ):
+        ConfigLoader(package_config_dir=package_root).load_execution_profiles()
+
+
+def test_host_runtime_catalog_must_not_be_empty(tmp_path: Path) -> None:
+    """host_runtime.runtimes 为空必须在配置加载期失败。"""
+
+    package_root = tmp_path / "package"
+    _minimal_package_config(package_root)
+    _write_json(
+        package_root / "host_runtime.json",
+        {
+            "default_host_runtime_id": "local",
+            "runtimes": {},
+        },
+    )
+
+    with pytest.raises(ConfigFieldError, match="runtimes must not be empty"):
+        ConfigLoader(package_config_dir=package_root).load_host_runtime()
+
+
+def test_runtime_lanes_catalog_must_not_be_empty(tmp_path: Path) -> None:
+    """runtime_lanes.lanes 为空必须在配置加载期失败。"""
+
+    package_root = tmp_path / "package"
+    _minimal_package_config(package_root)
+    _write_json(
+        package_root / "runtime_lanes.json",
+        {
+            "coordinator": {
+                "db_path": "workspace/.dayu/runtime/lane.sqlite3",
+                "busy_timeout_seconds": 5.0,
+                "poll_interval_seconds": 0.05,
+            },
+            "lanes": {},
+        },
+    )
+
+    with pytest.raises(ConfigFieldError, match="lanes must not be empty"):
+        ConfigLoader(package_config_dir=package_root).load_runtime_lanes()
+
+
+def test_tool_discovery_providers_must_not_be_empty(tmp_path: Path) -> None:
+    """tool_discovery.providers 为空必须在配置加载期失败。"""
+
+    package_root = tmp_path / "package"
+    _minimal_package_config(package_root)
+    _write_json(
+        package_root / "tool_discovery.json",
+        {
+            "providers": {},
+        },
+    )
+
+    with pytest.raises(ConfigFieldError, match="providers must not be empty"):
+        ConfigLoader(package_config_dir=package_root).load_tool_discovery()
+
+
 def test_agent_fallback_mode_is_closed_enum(tmp_path: Path) -> None:
     """fallback_mode 只允许 force_answer / raise_error。"""
 

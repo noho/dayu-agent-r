@@ -158,7 +158,7 @@ class _PublicHostHandle:
         self._host_handle_id = host_handle_id
         self._scheduler = scheduler
         self._projection_catchup_port = projection_catchup_port
-        self._closed = False
+        self._closed: bool = False
 
     async def ensure_session(
         self, request: EnsureSessionRequest

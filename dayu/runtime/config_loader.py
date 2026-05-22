@@ -725,6 +725,8 @@ class ConfigLoader:
                 record_id=runtime_id,
                 record=record,
             )
+        if not runtimes:
+            raise ConfigFieldError("host_runtime runtimes must not be empty")
         default_host_runtime_id = _require_str_field(
             root,
             field_name="default_host_runtime_id",
@@ -806,6 +808,8 @@ class ConfigLoader:
                 record_id=provider_id,
                 record=record,
             )
+        if not providers:
+            raise ConfigFieldError("tool_discovery providers must not be empty")
         return ToolDiscoveryConfig(providers=providers)
 
 
@@ -1517,6 +1521,10 @@ def _parse_agent_policy_profile_map(
         profiles[profile_id] = _parse_agent_policy_profile(
             record_id=profile_id,
             record=record,
+        )
+    if not profiles:
+        raise ConfigFieldError(
+            "execution_profiles agent_policy_profiles must not be empty"
         )
     return profiles
 

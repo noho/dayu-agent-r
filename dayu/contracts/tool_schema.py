@@ -163,6 +163,12 @@ class ToolTruncateSpec:
                 raise ValueError("disabled ToolTruncateSpec must not define strategy")
             if self.limits:
                 raise ValueError("disabled ToolTruncateSpec must not define limits")
+            if self.target_field is not None:
+                raise ValueError("disabled ToolTruncateSpec must not define target_field")
+            if self.field_path is not None:
+                raise ValueError("disabled ToolTruncateSpec must not define field_path")
+            if self.ttl_seconds is not None:
+                raise ValueError("disabled ToolTruncateSpec must not define ttl_seconds")
             return
         if self.strategy is None:
             raise ValueError("enabled ToolTruncateSpec requires strategy")
