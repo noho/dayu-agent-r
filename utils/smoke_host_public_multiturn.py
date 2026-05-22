@@ -2,9 +2,10 @@
 
 本脚本用于人工观察真实生产式装配路径是否能把 runtime location、
 ``ConfigLoader``、``ToolsDiscovery``、``ScenePrepare``、Engine provider
-extension helper 与 Host public ``open_host(options)`` 串起来。脚本不再保留
-manual / 硬编码装配模式；配置、scene、工具发现或 provider extension 映射
-缺口必须在调用 Host 前暴露。
+extension helper 与 Host public ``open_host(options)`` 串起来。脚本只为该
+smoke 场景内置一个 ``manual-smoke`` mock tool provider；真实财报工具仍必须
+通过配置显式发现。配置、scene 或 provider extension 映射缺口必须在调用
+Host 前暴露。
 
 脚本不会输出 API key、headers、完整 prompt 或完整 provider payload。
 """
@@ -18,8 +19,13 @@ import pathlib
 import sys
 from collections.abc import AsyncIterator, Mapping, Sequence
 from dataclasses import dataclass
+from math import floor
 from typing import Final
 from uuid import uuid4
+
+_PROJECT_ROOT: Final[pathlib.Path] = pathlib.Path(__file__).resolve().parents[1]
+if str(_PROJECT_ROOT) not in sys.path:
+    sys.path.insert(0, str(_PROJECT_ROOT))
 
 from dayu.contracts import (
     JsonValue,
@@ -54,8 +60,10 @@ from dayu.host import (
     open_host,
 )
 from dayu.host.api import AuthorizationClaim
+from dayu.host.context_budget import DEFAULT_ESTIMATOR_CHARS_PER_TOKEN
 from dayu.runtime.config_loader import (
     ConfigLoader,
+    RuntimeConfig,
 )
 from dayu.runtime.location import resolve_runtime_locations
 from dayu.runtime.log import LogLevel, configure
@@ -67,6 +75,7 @@ from dayu.runtime.scene_prepare import (
 )
 from dayu.service.host_assembly import (
     ServiceAssemblyOverrides,
+    ServiceDiscoveredTools,
     ServiceOpenHostAssemblyDiagnostics,
     ServiceOpenHostAssemblyRequest,
     compose_open_host_options,
@@ -74,21 +83,35 @@ from dayu.service.host_assembly import (
     discover_service_tools,
 )
 from dayu.runtime.tools_discovery import (
+    PythonImportPathProvider,
+    ToolsDiscovery,
+    ToolsDiscoveryProviderBinding,
+    ToolsDiscoveryResult,
     ToolsDiscoveryProviderOutput,
     ToolsDiscoveryProviderSpec,
 )
 
-_PROJECT_ROOT: Final[pathlib.Path] = pathlib.Path(__file__).resolve().parents[1]
 _PACKAGE_CONFIG_ROOT: Final[pathlib.Path] = _PROJECT_ROOT / "dayu" / "config"
 _DEFAULT_SCENE_ID: Final[str] = "smoke_host_public_multiturn"
 _DEFAULT_SUBJECT: Final[str] = "Dayu Host public runtime assembly smoke"
 _DEFAULT_USER: Final[str] = "manual-smoke-operator"
 _SMOKE_TOOL_NAME: Final[str] = "record_smoke_fact"
+_SMOKE_TOOL_TAG: Final[str] = "manual-smoke"
+_SMOKE_PROVIDER_SPEC_ID: Final[str] = "host-public-multiturn-smoke"
+_SMOKE_PROVIDER_DISPLAY_IMPORT_PATH: Final[str] = "__main__:discover_smoke_tools"
 _SMOKE_MARKER: Final[str] = "DAYU_MEMORY_ALPHA"
 _SMOKE_CLIENT_REQUEST_PREFIX: Final[str] = "runtime-assembly-smoke"
+_SMOKE_STABLE_SLOT_KEY: Final[str] = "runtime-assembly-host-public-multiturn-smoke"
 _FINAL_PREVIEW_CHARS: Final[int] = 500
-_PROMPT_PAD_REPEAT: Final[int] = 90
+_COMPACT_PRESSURE_TARGET_EXTRA_TOKENS: Final[int] = 16_384
+_COMPACT_PRESSURE_HARD_MARGIN_TOKENS: Final[int] = 24_576
+_COMPACT_PRESSURE_BASE_RESERVE_TOKENS: Final[int] = 8_192
+_COMPACT_PRESSURE_MIN_PROMPT_TOKENS: Final[int] = 1_024
+_COMPACT_PRESSURE_LARGE_WINDOW_TOKENS: Final[int] = 1_000_000
+_SMOKE_TOOL_PRESSURE_CHARS: Final[int] = 120_000
+_SMOKE_PRESSURE_LINE_CHARS: Final[int] = 120
 _COMPACT_ARTIFACT_PRINT_LIMIT: Final[int] = 10
+_TERMINAL_WAIT_TIMEOUT_SECONDS: Final[float] = 600.0
 
 
 @dataclass(frozen=True, slots=True)
@@ -104,6 +127,7 @@ class SmokeArgs:
     :param fins_default_subject: scene context slot 的研究主体。
     :param base_user: scene context slot 的用户标识。
     :param log_level: Dayu 日志级别。
+    :param reuse_session: 是否复用稳定 slot key；默认每次使用 fresh slot。
     :param keep_workspace: 是否在输出中显式标记保留 workspace。
     """
 
@@ -116,6 +140,7 @@ class SmokeArgs:
     fins_default_subject: str
     base_user: str
     log_level: LogLevel
+    reuse_session: bool
     keep_workspace: bool
 
 
@@ -185,6 +210,7 @@ class SmokeFactTool:
                     "marker": _SMOKE_MARKER,
                     "fact": "runtime-assembly-smoke-tool-fact",
                     "note": "This fact should be visible to later Host runs.",
+                    "pressure_blob": _tool_pressure_blob(),
                 },
                 meta=None,
             )
@@ -197,9 +223,9 @@ def discover_smoke_tools(
     """ToolsDiscovery provider callable，用于提供 smoke mock tool。
 
     该函数仅在 workspace ``tool_discovery.json`` 显式启用 provider spec，且
-    该 spec 的 import path 指向
-    ``utils.smoke_host_public_multiturn:discover_smoke_tools`` 时由
-    ``ToolsDiscovery`` 调用。
+    该 spec 的 import path 指向本模块 ``discover_smoke_tools`` 时由
+    ``ToolsDiscovery`` 调用。该 provider 只服务本 smoke 脚本，不代表真实
+    财报工具发现配置。
 
     :param spec: 工具发现 provider spec。
     :returns: smoke provider 输出。
@@ -278,6 +304,14 @@ def parse_args(argv: Sequence[str]) -> SmokeArgs:
         help="Dayu 日志级别，默认 VERBOSE。",
     )
     parser.add_argument(
+        "--reuse-session",
+        action="store_true",
+        help=(
+            "复用稳定 durable slot key；默认每次 smoke 使用 fresh slot，避免"
+            "多次人工运行互相污染。"
+        ),
+    )
+    parser.add_argument(
         "--keep-workspace",
         action="store_true",
         help="输出中标记保留 workspace；脚本不会删除 Host/runtime artifacts。",
@@ -292,6 +326,7 @@ def parse_args(argv: Sequence[str]) -> SmokeArgs:
     fins_default_subject: str = namespace.fins_default_subject
     base_user: str = namespace.base_user
     log_level_text: str = namespace.log_level
+    reuse_session: bool = namespace.reuse_session
     keep_workspace: bool = namespace.keep_workspace
     return SmokeArgs(
         workspace_root=pathlib.Path(workspace_root_text).resolve(),
@@ -303,6 +338,7 @@ def parse_args(argv: Sequence[str]) -> SmokeArgs:
         fins_default_subject=fins_default_subject,
         base_user=base_user,
         log_level=LogLevel[log_level_text],
+        reuse_session=reuse_session,
         keep_workspace=keep_workspace,
     )
 
@@ -325,9 +361,10 @@ async def run_smoke(args: SmokeArgs, env: Mapping[str, str]) -> int:
     print(f"SMOKE RUN_ID {smoke_run_id}")
     print("SMOKE CONTRACT open_host -> ensure_session -> submit_followup -> watch")
     print("SMOKE LOG_LEVEL", args.log_level.name)
+    _print_compact_pressure_plan(assembly.options)
 
     async with open_host(assembly.options) as host:
-        session = await host.ensure_session(_ensure_request())
+        session = await host.ensure_session(_ensure_request(args, smoke_run_id))
         watcher = host.watch_session_events(session.session_id)
         print(f"SMOKE SESSION session_id={session.session_id}")
 
@@ -353,7 +390,7 @@ async def run_smoke(args: SmokeArgs, env: Mapping[str, str]) -> int:
             label="round2-memory-and-compact",
             client_request_id=_round_client_request_id(smoke_run_id, 2),
             scene_inputs=assembly.scene_inputs,
-            prompt=_memory_compact_prompt(),
+            prompt=_memory_compact_prompt(assembly.options),
             tool_names=frozenset(),
         )
         _print_round(second)
@@ -404,7 +441,7 @@ def _prepare_runtime_assembly(
     config = ConfigLoader(package_config_dir=_PACKAGE_CONFIG_ROOT).load(
         workspace_config_dir=locations.config_overlay_dir
     )
-    discovered_tools = discover_service_tools(config)
+    discovered_tools = _discover_smoke_service_tools(config)
     scene_inputs = prepare_scene(
         ScenePrepareRequest(
             scene_id=args.scene_id,
@@ -441,6 +478,86 @@ def _prepare_runtime_assembly(
         diagnostics=assembly.diagnostics,
         smoke_tool=_find_smoke_tool(assembly.effective_tool_bundle),
     )
+
+
+def _discover_smoke_service_tools(config: RuntimeConfig) -> ServiceDiscoveredTools:
+    """发现 Service 工具并确保 smoke mock tool 可用。
+
+    :param config: ``ConfigLoader`` 输出的 runtime typed config。
+    :returns: 包含 smoke mock tool 的 Service 工具发现结果。
+    :raises ValueError: 已发现同名非 smoke 工具时抛出。
+    :raises Exception: 工具发现 provider 失败时向上抛出。
+    """
+
+    discovered = discover_service_tools(config)
+    existing_smoke_tool = _find_smoke_tool(discovered.tool_bundle)
+    if existing_smoke_tool is not None:
+        return discovered
+    if _has_tool_name(discovered.tool_bundle, _SMOKE_TOOL_NAME):
+        raise ValueError(
+            "discovered tool bundle already contains non-smoke tool:"
+            f" {_SMOKE_TOOL_NAME}"
+        )
+
+    smoke_result = _discover_builtin_smoke_tools()
+    return ServiceDiscoveredTools(
+        tool_bundle=ToolBundle(
+            definitions=(
+                *discovered.tool_bundle.definitions,
+                *smoke_result.tool_bundle.definitions,
+            )
+        ),
+        source_refs=(
+            *discovered.source_refs,
+            *smoke_result.source_refs,
+        ),
+        provider_reports=(
+            *discovered.provider_reports,
+            *(
+                _format_provider_report(
+                    report.provider_id,
+                    report.spec_id,
+                    report.version_ref,
+                    report.tool_names,
+                )
+                for report in smoke_result.provider_reports
+            ),
+        ),
+    )
+
+
+def _discover_builtin_smoke_tools() -> ToolsDiscoveryResult:
+    """通过 ToolsDiscovery 调用内置 smoke provider。
+
+    :returns: 内置 smoke provider 的工具发现结果。
+    :raises Exception: provider 解析或工具定义校验失败时向上抛出。
+    """
+
+    return ToolsDiscovery().discover_from_bindings(
+        (
+            ToolsDiscoveryProviderBinding(
+                spec=ToolsDiscoveryProviderSpec(
+                    spec_id=_SMOKE_PROVIDER_SPEC_ID,
+                    location=PythonImportPathProvider(
+                        import_path=_SMOKE_PROVIDER_DISPLAY_IMPORT_PATH
+                    ),
+                ),
+                provider=discover_smoke_tools,
+            ),
+        )
+    )
+
+
+def _has_tool_name(tool_bundle: ToolBundle, tool_name: str) -> bool:
+    """检查工具 bundle 是否包含指定工具名。
+
+    :param tool_bundle: 待检查的工具 bundle。
+    :param tool_name: 工具名。
+    :returns: 存在同名工具时返回 ``True``。
+    :raises Exception: 不主动抛出异常。
+    """
+
+    return any(definition.name == tool_name for definition in tool_bundle.definitions)
 
 
 def _find_smoke_tool(tool_bundle: ToolBundle) -> SmokeFactTool | None:
@@ -491,20 +608,27 @@ def _smoke_tool_definition(smoke_tool: SmokeFactTool) -> ToolDefinition:
         callable=smoke_tool,
         truncate=None,
         display=None,
-        tags=("manual-smoke", "fins"),
+        tags=(_SMOKE_TOOL_TAG,),
     )
 
 
-def _ensure_request() -> EnsureSessionRequest:
+def _ensure_request(args: SmokeArgs, smoke_run_id: str) -> EnsureSessionRequest:
     """构造 ensure session 请求。
 
+    :param args: smoke 参数。
+    :param smoke_run_id: 本次 smoke 批次 id。
     :returns: EnsureSessionRequest。
     :raises ValueError: 字段非法时由底层抛出。
     """
 
+    slot_key = (
+        _SMOKE_STABLE_SLOT_KEY
+        if args.reuse_session
+        else f"{_SMOKE_STABLE_SLOT_KEY}-{smoke_run_id}"
+    )
     return EnsureSessionRequest(
         scope="workspace",
-        slot_key="runtime-assembly-host-public-multiturn-smoke",
+        slot_key=slot_key,
         metadata=(),
     )
 
@@ -609,7 +733,7 @@ async def _next_terminal_for_run(
                 return event
         raise RuntimeError("HostEvent iterator ended before terminal event")
 
-    return await asyncio.wait_for(read(), timeout=180.0)
+    return await asyncio.wait_for(read(), timeout=_TERMINAL_WAIT_TIMEOUT_SECONDS)
 
 
 def _new_smoke_run_id() -> str:
@@ -634,21 +758,171 @@ def _round_client_request_id(smoke_run_id: str, round_index: int) -> str:
     return f"{_SMOKE_CLIENT_REQUEST_PREFIX}-{smoke_run_id}-round-{round_index}"
 
 
-def _memory_compact_prompt() -> str:
+def _memory_compact_prompt(options: OpenHostOptions) -> str:
     """构造触发 memory / compact 的第二轮 prompt。
 
+    :param options: 本次 smoke 使用的 Host opener options。
     :returns: prompt 文本。
     :raises Exception: 不主动抛出异常。
     """
 
-    padding = " ".join(
-        f"DAYU_CONTEXT_PAD_{index:03d}" for index in range(_PROMPT_PAD_REPEAT)
-    )
+    padding = _compact_pressure_padding(options)
     return (
         f"上一轮如果工具事实已进入 memory，请观察是否能看到标记 {_SMOKE_MARKER}。"
         "请用两句话回答：第一句说明你看到的上一轮事实，第二句说明这是第二轮。"
         "下面是为了触发 Host proactive compact 的人工长上下文："
         f"{padding}"
+    )
+
+
+def _compact_pressure_padding(options: OpenHostOptions) -> str:
+    """构造预算压力 padding，使估算值落在 soft / hard threshold 之间。
+
+    :param options: 本次 smoke 使用的 Host opener options。
+    :returns: 用于第二轮 prompt 的 padding。
+    :raises RuntimeError: smoke 未启用 context budget policy 时抛出。
+    """
+
+    policy = options.context_budget_policy
+    if policy is None:
+        raise RuntimeError("smoke compact pressure requires context budget policy")
+    soft_threshold_tokens = _threshold_tokens(
+        policy.context_window_size,
+        policy.soft_threshold_context_ratio,
+    )
+    hard_threshold_tokens = _threshold_tokens(
+        policy.context_window_size,
+        policy.hard_threshold_context_ratio,
+    )
+    target_tokens = min(
+        soft_threshold_tokens + _COMPACT_PRESSURE_TARGET_EXTRA_TOKENS,
+        hard_threshold_tokens - _COMPACT_PRESSURE_HARD_MARGIN_TOKENS,
+    )
+    pressure_reserve_tokens = _compact_pressure_reserve_tokens(
+        context_window_size=policy.context_window_size
+    )
+    prompt_tokens = max(
+        _COMPACT_PRESSURE_MIN_PROMPT_TOKENS,
+        target_tokens - pressure_reserve_tokens,
+    )
+    return _repeat_to_chars(
+        token="DAYU_CONTEXT_PAD",
+        target_chars=prompt_tokens * DEFAULT_ESTIMATOR_CHARS_PER_TOKEN,
+    )
+
+
+def _threshold_tokens(context_window_size: int, ratio: float) -> int:
+    """按 Host context budget ratio 计算阈值 token 数。
+
+    :param context_window_size: 当前模型上下文窗口 token 数。
+    :param ratio: 阈值比例。
+    :returns: 阈值 token 数。
+    :raises Exception: 不主动抛出异常。
+    """
+
+    return floor(context_window_size * ratio)
+
+
+def _compact_pressure_reserve_tokens(*, context_window_size: int) -> int:
+    """计算 compact pressure prompt 之外预留的估算 token。
+
+    1M 模型有足够 soft / hard 区间，prompt 本身应越过 soft threshold；
+    较小上下文窗口则给工具返回和系统上下文预留更多空间，避免越过 hard。
+
+    :param context_window_size: 当前模型上下文窗口 token 数。
+    :returns: prompt 外预留 token 数。
+    :raises Exception: 不主动抛出异常。
+    """
+
+    if context_window_size >= _COMPACT_PRESSURE_LARGE_WINDOW_TOKENS:
+        return _COMPACT_PRESSURE_BASE_RESERVE_TOKENS
+    return _COMPACT_PRESSURE_BASE_RESERVE_TOKENS + _tool_pressure_estimated_tokens()
+
+
+def _tool_pressure_blob() -> str:
+    """构造 smoke tool 的大返回片段。
+
+    :returns: 大工具返回文本。
+    :raises Exception: 不主动抛出异常。
+    """
+
+    return _repeat_to_chars(
+        token=f"{_SMOKE_MARKER}_TOOL_PRESSURE",
+        target_chars=_SMOKE_TOOL_PRESSURE_CHARS,
+    )
+
+
+def _tool_pressure_estimated_tokens() -> int:
+    """估算 smoke tool 大返回片段贡献的 token 数。
+
+    :returns: 估算 token 数。
+    :raises Exception: 不主动抛出异常。
+    """
+
+    return _estimate_chars_as_tokens(_SMOKE_TOOL_PRESSURE_CHARS)
+
+
+def _estimate_chars_as_tokens(char_count: int) -> int:
+    """按 Host conservative estimator 估算字符量对应的 token 数。
+
+    :param char_count: 字符数量。
+    :returns: 估算 token 数。
+    :raises Exception: 不主动抛出异常。
+    """
+
+    return (
+        char_count + DEFAULT_ESTIMATOR_CHARS_PER_TOKEN - 1
+    ) // DEFAULT_ESTIMATOR_CHARS_PER_TOKEN
+
+
+def _repeat_to_chars(*, token: str, target_chars: int) -> str:
+    """把稳定 token 重复到目标字符量。
+
+    :param token: 重复使用的短文本。
+    :param target_chars: 目标字符数。
+    :returns: 至少达到目标字符数的文本。
+    :raises Exception: 不主动抛出异常。
+    """
+
+    line = f"{token} " * max(1, _SMOKE_PRESSURE_LINE_CHARS // len(token))
+    repeat_count = max(1, target_chars // len(line) + 1)
+    return (line * repeat_count)[:target_chars]
+
+
+def _print_compact_pressure_plan(options: OpenHostOptions) -> None:
+    """打印 compact pressure 摘要，不输出完整 pressure prompt。
+
+    :param options: 本次 smoke 使用的 Host opener options。
+    :returns: ``None``。
+    :raises Exception: 不主动抛出异常。
+    """
+
+    policy = options.context_budget_policy
+    if policy is None:
+        print("SMOKE COMPACT_PRESSURE disabled")
+        return
+    soft_threshold_tokens = _threshold_tokens(
+        policy.context_window_size,
+        policy.soft_threshold_context_ratio,
+    )
+    hard_threshold_tokens = _threshold_tokens(
+        policy.context_window_size,
+        policy.hard_threshold_context_ratio,
+    )
+    prompt_chars = len(_compact_pressure_padding(options))
+    estimated_prompt_tokens = _estimate_chars_as_tokens(prompt_chars)
+    estimated_total_pressure_tokens = (
+        estimated_prompt_tokens + _tool_pressure_estimated_tokens()
+    )
+    print(
+        "SMOKE COMPACT_PRESSURE "
+        f"context_window_tokens={policy.context_window_size} "
+        f"soft_threshold_tokens={soft_threshold_tokens} "
+        f"hard_threshold_tokens={hard_threshold_tokens} "
+        f"tool_pressure_chars={_SMOKE_TOOL_PRESSURE_CHARS} "
+        f"prompt_pressure_chars={prompt_chars} "
+        f"estimated_prompt_tokens={estimated_prompt_tokens} "
+        f"estimated_total_pressure_tokens={estimated_total_pressure_tokens}"
     )
 
 

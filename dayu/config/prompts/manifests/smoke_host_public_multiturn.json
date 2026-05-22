@@ -19,9 +19,7 @@
     "mode": "select",
     "tool_names": [],
     "tool_tags_any": [
-      "web",
-      "fins",
-      "ingestion"
+      "manual-smoke"
     ],
     "allow_empty": false
   },

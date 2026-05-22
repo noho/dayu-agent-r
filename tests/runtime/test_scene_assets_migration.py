@@ -169,6 +169,10 @@ def _fake_tool_catalog() -> SceneToolCatalog:
             SceneToolInfo(name="fake_fins_lookup", tags=frozenset({"fins"})),
             SceneToolInfo(name="fake_web_search", tags=frozenset({"web"})),
             SceneToolInfo(name="fake_ingestion", tags=frozenset({"ingestion"})),
+            SceneToolInfo(
+                name="fake_smoke_fact",
+                tags=frozenset({"manual-smoke"}),
+            ),
         )
     )
 

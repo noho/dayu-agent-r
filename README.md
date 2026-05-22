@@ -948,14 +948,14 @@ dayu-cli process --ticker AAPL --ci --document-id fil_001 --document-id fil_002
 
 ### 5.1 Host public 多轮闭环 smoke
 
-`utils/smoke_host_public_multiturn.py` 用于人工观察真实生产式 runtime assembly 是否能只通过 Host public interface / contract 完成多轮会话闭环。脚本默认使用 runtime location resolver 解析 `workspace/config` overlay、prompt asset root 与 scene manifest root，再通过 `ConfigLoader`、`ToolsDiscovery`、`ScenePrepare` 和 `dayu.service.host_assembly` 映射为 `open_host(options)` 与每轮 `submit_followup` typed input。打开后脚本只调用 public Host handle。脚本把 Dayu 日志默认打开到 `VERBOSE`，便于观察 Host command、dispatch、EngineEvent ingest、ToolRuntime、memory catch-up 与 context compact 主路径。
+`utils/smoke_host_public_multiturn.py` 用于人工观察真实生产式 runtime assembly 是否能只通过 Host public interface / contract 完成多轮会话闭环。脚本默认使用 runtime location resolver 解析 `workspace/config` overlay、prompt asset root 与 scene manifest root，再通过 `ConfigLoader`、`ToolsDiscovery`、`ScenePrepare` 和 `dayu.service.host_assembly` 映射为 `open_host(options)` 与每轮 `submit_followup` typed input。打开后脚本只调用 public Host handle。脚本把 Dayu 日志默认打开到 `VERBOSE`，便于观察 Host command、dispatch、EngineEvent ingest、ToolRuntime、memory catch-up 与 context compact 主路径。默认每次运行使用 fresh session slot；需要复用同一个 durable session 时显式加 `--reuse-session`。
 
 ```bash
 source .venv/bin/activate
 python utils/smoke_host_public_multiturn.py
 ```
 
-默认 scene 是 `smoke_host_public_multiturn`，会在已发现的业务工具 bundle 内按 tag 选择工具。若 `workspace/config/tool_discovery.json` 没有启用能提供匹配工具的 provider，脚本会在调用 Host 前 fail fast，不会在脚本内补一个 raw `ToolBundle`。
+默认 scene 是 `smoke_host_public_multiturn`，只选择 `manual-smoke` tag。脚本会通过 `ToolsDiscovery` 调用内置 smoke provider，提供 `record_smoke_fact` mock tool；真实财报工具仍只通过 `workspace/config/tool_discovery.json` 或包内配置显式发现，不会被 smoke 默认打开。为覆盖 1M context window 下的 proactive compact，mock tool 会返回较大的 smoke fact，第二轮 prompt 会按当前 `ContextBudgetPolicy` 自动生成 pressure padding，使预算估算落在 soft threshold 之上、hard threshold 之下；stdout 只打印 pressure 摘要，不打印完整 prompt。
 
 可显式覆盖 workspace、scene、execution profile、Host runtime、模型和 runner option hint：
 
@@ -967,7 +967,8 @@ python utils/smoke_host_public_multiturn.py \
   --execution-profile-id standard-256k \
   --host-runtime-id local \
   --model-id deepseek-v4-flash \
-  --runner-option-hint-id interactive
+  --runner-option-hint-id interactive \
+  --reuse-session
 ```
 
 常用调试模式：
@@ -977,7 +978,7 @@ source .venv/bin/activate
 python utils/smoke_host_public_multiturn.py --log-level DEBUG
 ```
 
-该脚本不是 pytest，不断言模型固定回答。它会在调用 Host 前打印 assembly diagnostics，包括 config overlay、prompt root、scene manifest root、Host runtime id、execution profile id、model id、runner option hint id、lane name、tool provider report、tool selection、policy refs 和 provider extension DSL 映射状态。运行后会打印 Session / Run / terminal HostEvent 摘要、final answer 预览、compact artifact 路径；脚本不输出 API key、headers、完整 prompt 或 provider payload。
+该脚本不是 pytest，不断言模型固定回答。它会在调用 Host 前打印 assembly diagnostics，包括 config overlay、prompt root、scene manifest root、Host runtime id、execution profile id、model id、runner option hint id、lane name、tool provider report、tool selection、policy refs、compact pressure 摘要和 provider extension DSL 映射状态。运行后会打印 Session / Run / terminal HostEvent 摘要、final answer 预览、compact artifact 路径；脚本不输出 API key、headers、完整 prompt 或 provider payload。
 
 ### 5.2 Engine provider smoke
 

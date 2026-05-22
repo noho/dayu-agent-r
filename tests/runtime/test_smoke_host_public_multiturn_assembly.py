@@ -9,16 +9,20 @@ import pytest
 
 from dayu.contracts import ToolBundle
 from dayu.runtime.log import LogLevel
-from dayu.runtime.scene_prepare import ScenePrepareError
 from dayu.runtime.tools_discovery import (
     PythonImportPathProvider,
     ToolsDiscoveryProviderSpec,
 )
 from utils.smoke_host_public_multiturn import (
     SmokeArgs,
+    _compact_pressure_padding,
+    _estimate_chars_as_tokens,
     _find_smoke_tool,
+    _ensure_request,
     _print_assembly_diagnostics,
     _prepare_runtime_assembly,
+    _threshold_tokens,
+    _tool_pressure_estimated_tokens,
     discover_smoke_tools,
 )
 
@@ -28,18 +32,29 @@ _RUNNER_HINT_ID = "interactive"
 _API_KEY = "test-provider-key"
 
 
-def test_runtime_assembly_fails_before_host_when_tools_not_discovered(
+def test_runtime_assembly_adds_builtin_smoke_tool_without_workspace_overlay(
     tmp_path: pathlib.Path,
 ) -> None:
-    """默认 disabled tool provider 不会被 smoke 用脚本内 ToolBundle 掩盖。
+    """默认直接运行 smoke 时会通过内置 provider 提供 mock tool。
 
     :param tmp_path: pytest 临时 workspace root。
     :returns: ``None``。
-    :raises AssertionError: 未在 Host 调用前暴露缺失工具时抛出。
+    :raises AssertionError: 未发现内置 smoke tool 或仍依赖真实财报工具时抛出。
     """
 
-    with pytest.raises(ScenePrepareError, match="tool_tags_any matched no tools"):
-        _prepare_runtime_assembly(_args(tmp_path), env={"DEEPSEEK_API_KEY": _API_KEY})
+    assembly = _prepare_runtime_assembly(
+        _args(tmp_path),
+        env={"DEEPSEEK_API_KEY": _API_KEY},
+    )
+
+    assert assembly.scene_inputs.tool_selection.tool_names == frozenset(
+        {"record_smoke_fact"}
+    )
+    assert assembly.diagnostics.tool_provider_reports == (
+        "provider=host-public-multiturn-smoke,"
+        "spec=host-public-multiturn-smoke,version=v1,tools=record_smoke_fact",
+    )
+    assert assembly.smoke_tool is not None
 
 
 def test_runtime_assembly_uses_workspace_tool_discovery_and_typed_overrides(
@@ -116,6 +131,54 @@ def test_assembly_diagnostics_output_uses_current_agent_policy_sources(
     assert "SMOKE ASSEMBLY agent_policy_sources=" in output
 
 
+def test_smoke_uses_fresh_session_slot_by_default(tmp_path: pathlib.Path) -> None:
+    """默认 ensure session slot 带 smoke run id，避免多次手工运行互相污染。
+
+    :param tmp_path: pytest 临时 workspace root。
+    :returns: ``None``。
+    :raises AssertionError: 默认 slot key 没有 run id 或复用开关失效时抛出。
+    """
+
+    fresh = _ensure_request(_args(tmp_path), "runabc")
+    reused = _ensure_request(_args(tmp_path, reuse_session=True), "runabc")
+
+    assert fresh.slot_key.endswith("-runabc")
+    assert reused.slot_key == "runtime-assembly-host-public-multiturn-smoke"
+
+
+def test_compact_pressure_prompt_targets_soft_before_hard(
+    tmp_path: pathlib.Path,
+) -> None:
+    """compact pressure prompt 根据装配出的 policy 落在 soft / hard 之间。
+
+    :param tmp_path: pytest 临时 workspace root。
+    :returns: ``None``。
+    :raises AssertionError: pressure 过小不能触发 compact 或过大越过 hard 时抛出。
+    """
+
+    assembly = _prepare_runtime_assembly(
+        _args(tmp_path),
+        env={"DEEPSEEK_API_KEY": _API_KEY},
+    )
+    policy = assembly.options.context_budget_policy
+    assert policy is not None
+    prompt_tokens = _estimate_chars_as_tokens(
+        len(_compact_pressure_padding(assembly.options))
+    )
+    expected_pressure_tokens = prompt_tokens + _tool_pressure_estimated_tokens()
+    soft_threshold_tokens = _threshold_tokens(
+        policy.context_window_size,
+        policy.soft_threshold_context_ratio,
+    )
+    hard_threshold_tokens = _threshold_tokens(
+        policy.context_window_size,
+        policy.hard_threshold_context_ratio,
+    )
+
+    assert expected_pressure_tokens >= soft_threshold_tokens
+    assert expected_pressure_tokens < hard_threshold_tokens
+
+
 def test_find_smoke_tool_only_inspects_passed_tool_bundle() -> None:
     """smoke tool 查找只读取传入 bundle，不使用 provider 历史状态回退。
 
@@ -139,10 +202,11 @@ def test_find_smoke_tool_only_inspects_passed_tool_bundle() -> None:
     assert _find_smoke_tool(ToolBundle(definitions=())) is None
 
 
-def _args(workspace_root: pathlib.Path) -> SmokeArgs:
+def _args(workspace_root: pathlib.Path, *, reuse_session: bool = False) -> SmokeArgs:
     """构造测试用 smoke 参数。
 
     :param workspace_root: pytest 临时 workspace root。
+    :param reuse_session: 是否复用稳定 durable slot。
     :returns: smoke 参数。
     :raises Exception: 不主动抛出异常。
     """
@@ -157,6 +221,7 @@ def _args(workspace_root: pathlib.Path) -> SmokeArgs:
         fins_default_subject="测试财报主体",
         base_user="runtime-assembly-test",
         log_level=LogLevel.CRITICAL,
+        reuse_session=reuse_session,
         keep_workspace=False,
     )
 
