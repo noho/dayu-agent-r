@@ -106,6 +106,8 @@ def _execution_profile_record() -> dict[str, JsonValue]:
 
     return {
         "extends": None,
+        "context_window_class": "256k",
+        "min_context_window_tokens": 262144,
         "run_baseline": {
             "model_id": "base-model",
             "runner_option_hint_id": "interactive",
@@ -203,9 +205,9 @@ def _minimal_package_config(root: Path) -> None:
     _write_json(
         root / "execution_profiles.json",
         {
-            "default_execution_profile_id": "standard",
+            "default_execution_profile_id": "standard-256k",
             "execution_profiles": {
-                "standard": _execution_profile_record(),
+                "standard-256k": _execution_profile_record(),
             },
         },
     )
@@ -281,13 +283,27 @@ def test_default_runtime_config_files_load_as_typed_views() -> None:
     assert "runtime_lanes.json" in config_file_names()
     assert config.models.models["deepseek-v4-flash"].model_id == "deepseek-v4-flash"
     assert "max_tokens" not in {field.name for field in fields(RunnerOptionHintConfig)}
-    assert config.execution_profiles.default_execution_profile_id == "standard"
+    assert config.execution_profiles.default_execution_profile_id == "standard-256k"
+    profile_ids = set(config.execution_profiles.execution_profiles)
+    assert {
+        "standard-256k",
+        "standard-1m",
+        "wechat-256k",
+        "wechat-1m",
+    }.issubset(profile_ids)
+    standard_256k = config.execution_profiles.execution_profiles["standard-256k"]
+    assert standard_256k.context_window_class == "256k"
+    assert standard_256k.min_context_window_tokens == 262144
+    assert standard_256k.agent_policy.max_iterations == 24
+    assert standard_256k.agent_policy.fallback_prompt == default_fallback_prompt()
     assert (
-        config.execution_profiles.execution_profiles[
-            "standard"
-        ].agent_policy.max_iterations
-        == 24
+        config.execution_profiles.execution_profiles["standard-1m"]
+        .min_context_window_tokens
+        == 1000000
     )
+    for profile in config.execution_profiles.execution_profiles.values():
+        assert profile.agent_policy.continuation_prompt
+        assert profile.agent_policy.max_consecutive_failed_tool_batches == 2
     assert config.host_runtime.default_host_runtime_id == "local"
     host_runtime = config.host_runtime.runtimes["local"]
     assert host_runtime.sqlite.write_busy_retry_count == 8
@@ -542,9 +558,9 @@ def test_old_execution_profile_fields_fail_fast(tmp_path: Path) -> None:
     _write_json(
         package_root / "execution_profiles.json",
         {
-            "default_execution_profile_id": "standard",
+            "default_execution_profile_id": "standard-256k",
             "execution_profiles": {
-                "standard": _execution_profile_record(),
+                "standard-256k": _execution_profile_record(),
             },
             "runner_options_profiles": {},
             "runner_hints": {},
@@ -585,12 +601,84 @@ def test_old_agent_policy_profile_id_fails_fast(tmp_path: Path) -> None:
     _write_json(
         package_root / "execution_profiles.json",
         {
-            "default_execution_profile_id": "standard",
-            "execution_profiles": {"standard": profile},
+            "default_execution_profile_id": "standard-256k",
+            "execution_profiles": {"standard-256k": profile},
         },
     )
 
     with pytest.raises(ConfigFieldError, match="unknown fields"):
+        ConfigLoader(package_config_dir=package_root).load_execution_profiles()
+
+
+def test_execution_profile_context_window_class_is_closed_enum(
+    tmp_path: Path,
+) -> None:
+    """execution profile context_window_class 只允许 256k / 1m。"""
+
+    package_root = tmp_path / "package"
+    _minimal_package_config(package_root)
+    profile = _execution_profile_record()
+    profile["context_window_class"] = "512k"
+    _write_json(
+        package_root / "execution_profiles.json",
+        {
+            "default_execution_profile_id": "standard-256k",
+            "execution_profiles": {"standard-256k": profile},
+        },
+    )
+
+    with pytest.raises(ConfigFieldError, match="unsupported value"):
+        ConfigLoader(package_config_dir=package_root).load_execution_profiles()
+
+
+@pytest.mark.parametrize("min_tokens", [0, -1])
+def test_execution_profile_min_context_window_tokens_must_be_positive(
+    tmp_path: Path,
+    min_tokens: int,
+) -> None:
+    """execution profile min_context_window_tokens 必须是正整数。"""
+
+    package_root = tmp_path / "package"
+    _minimal_package_config(package_root)
+    profile = _execution_profile_record()
+    profile["min_context_window_tokens"] = min_tokens
+    _write_json(
+        package_root / "execution_profiles.json",
+        {
+            "default_execution_profile_id": "standard-256k",
+            "execution_profiles": {"standard-256k": profile},
+        },
+    )
+
+    with pytest.raises(ConfigFieldError, match="must be > 0"):
+        ConfigLoader(package_config_dir=package_root).load_execution_profiles()
+
+
+@pytest.mark.parametrize(
+    ("context_window_class", "min_tokens"),
+    [("1m", 262144), ("256k", 1000000)],
+)
+def test_execution_profile_context_window_pair_must_be_consistent(
+    tmp_path: Path,
+    context_window_class: str,
+    min_tokens: int,
+) -> None:
+    """上下文窗口分档与最小 token 数必须同源一致。"""
+
+    package_root = tmp_path / "package"
+    _minimal_package_config(package_root)
+    profile = _execution_profile_record()
+    profile["context_window_class"] = context_window_class
+    profile["min_context_window_tokens"] = min_tokens
+    _write_json(
+        package_root / "execution_profiles.json",
+        {
+            "default_execution_profile_id": "standard-256k",
+            "execution_profiles": {"standard-256k": profile},
+        },
+    )
+
+    with pytest.raises(ConfigFieldError, match="min_context_window_tokens must be"):
         ConfigLoader(package_config_dir=package_root).load_execution_profiles()
 
 
@@ -611,9 +699,9 @@ def test_execution_profile_must_not_embed_context_window_size(
     _write_json(
         package_root / "execution_profiles.json",
         {
-            "default_execution_profile_id": "standard",
+            "default_execution_profile_id": "standard-256k",
             "execution_profiles": {
-                "standard": profile,
+                "standard-256k": profile,
             },
         },
     )
@@ -630,9 +718,9 @@ def test_old_agent_policy_profiles_catalog_fails_fast(tmp_path: Path) -> None:
     _write_json(
         package_root / "execution_profiles.json",
         {
-            "default_execution_profile_id": "standard",
+            "default_execution_profile_id": "standard-256k",
             "execution_profiles": {
-                "standard": _execution_profile_record(),
+                "standard-256k": _execution_profile_record(),
             },
             "agent_policy_profiles": {
                 "default-agent": _agent_policy_record(),
@@ -659,8 +747,8 @@ def test_agent_policy_missing_field_fails_fast(tmp_path: Path) -> None:
     _write_json(
         package_root / "execution_profiles.json",
         {
-            "default_execution_profile_id": "standard",
-            "execution_profiles": {"standard": profile},
+            "default_execution_profile_id": "standard-256k",
+            "execution_profiles": {"standard-256k": profile},
         },
     )
 
@@ -680,8 +768,8 @@ def test_agent_policy_field_type_fails_fast(tmp_path: Path) -> None:
     _write_json(
         package_root / "execution_profiles.json",
         {
-            "default_execution_profile_id": "standard",
-            "execution_profiles": {"standard": profile},
+            "default_execution_profile_id": "standard-256k",
+            "execution_profiles": {"standard-256k": profile},
         },
     )
 
@@ -755,8 +843,8 @@ def test_agent_fallback_mode_is_closed_enum(tmp_path: Path) -> None:
     _write_json(
         package_root / "execution_profiles.json",
         {
-            "default_execution_profile_id": "standard",
-            "execution_profiles": {"standard": profile},
+            "default_execution_profile_id": "standard-256k",
+            "execution_profiles": {"standard-256k": profile},
         },
     )
 

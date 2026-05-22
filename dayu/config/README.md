@@ -74,11 +74,13 @@ dayu/config/
 
 | 字段 | 含义 |
 |---|---|
-| `default_execution_profile_id` | 默认 execution profile id，默认值为 `standard` |
+| `default_execution_profile_id` | 默认 execution profile id，默认值为 `standard-256k` |
 | `execution_profiles` | 普通 Run、compactor、context budget、memory projection、truncation 与 agent policy 的完整基线 |
 
 单个 execution profile 包含：
 
+- `context_window_class`：profile 面向的上下文窗口分档，当前只允许 `256k` 与 `1m`。
+- `min_context_window_tokens`：profile 要求的最小模型上下文窗口 token 数，`256k` 为 `262144`，`1m` 为 `1000000`。
 - `run_baseline`：普通 Run 默认 `model_id` 与 `runner_option_hint_id`。
 - `compactor_baseline`：compactor 默认 `model_id`、`runner_option_hint_id` 与 `artifact_root`。
 - `context_budget_policy`：对齐 Host public `ContextBudgetPolicy` 的 ratio-first 配置；上下文窗口来自 effective model 的 `context_window_tokens`。
@@ -87,6 +89,8 @@ dayu/config/
 - `agent_policy`：内嵌 Agent loop、continuation、工具超时、fallback 等 policy。
 
 `agent_policy` 使用 `continuation_max_attempts`、`allow_tool_calls`、`max_consecutive_failed_tool_batches` 等当前 AgentPolicy 字段。`fallback_mode` 只允许 `force_answer` 与 `raise_error`；默认 fallback prompt 文本为“请基于已获得的信息直接回答问题。信息不足时必须说明不确定性，不得编造。”
+
+包内默认 profile 按场景与上下文窗口显式分档为 `standard-256k`、`standard-1m`、`wechat-256k` 与 `wechat-1m`。Service / composition root 只能通过显式 override 或 `default_execution_profile_id` 选择 profile；runtime assembly helper 只校验 profile 的 `min_context_window_tokens` 与 effective model 的 `context_window_tokens`，不会按模型窗口自动切换到其它 profile。`256k` profile 搭配 `1m` 模型允许装配，但诊断会标记为保守策略；`1m` profile 搭配低于 `1000000` token 的模型会在调用 Host 前失败。
 
 已删除旧 `agent_policy_profiles`、`agent_policy_profile_id`、`runner_options_profiles`、`runner_hints` 与 `agent_hints` schema；这些字段出现在配置中会加载失败。
 

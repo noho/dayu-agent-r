@@ -22,6 +22,7 @@ from dayu.contracts.tool_schema import (
 from dayu.runtime.config_loader import (
     AgentPolicyConfig,
     ExecutionBaselineConfig,
+    ExecutionProfileConfig,
     ModelConfig,
     ModelsConfig,
     RunnerOptionHintConfig,
@@ -70,6 +71,10 @@ _MODEL_HINT_OVERRIDE_FIELDS: Final[frozenset[str]] = frozenset(
 _FALLBACK_MODES: Final[frozenset[str]] = frozenset(
     mode.value for mode in SceneAgentFallbackMode
 )
+_CONTEXT_WINDOW_CLASS_256K: Final[str] = "256k"
+_CONTEXT_WINDOW_1M_MIN_TOKENS: Final[int] = 1_000_000
+_PROFILE_COMPATIBILITY_COMPATIBLE: Final[str] = "compatible"
+_PROFILE_COMPATIBILITY_CONSERVATIVE: Final[str] = "conservative"
 
 _ValueT = TypeVar("_ValueT")
 
@@ -130,6 +135,27 @@ class RunnerOptionHintSelection:
     model: ModelConfig
     runner_option_hint: RunnerOptionHintConfig
     diagnostic: RuntimeSelectionDiagnostic
+
+
+@dataclass(frozen=True, slots=True)
+class ExecutionProfileCompatibilityDiagnostic:
+    """execution profile 与模型上下文窗口的兼容性诊断。
+
+    :param profile_id: 被校验的 execution profile id。
+    :param context_window_class: profile 声明的上下文窗口分档。
+    :param min_context_window_tokens: profile 要求的最小上下文窗口 token 数。
+    :param selected_model_id: 被校验的模型 id。
+    :param model_context_window_tokens: 模型声明的上下文窗口 token 数。
+    :param status: 兼容状态；``compatible`` 表示分档匹配，``conservative``
+        表示 profile 可运行但相对模型窗口偏保守。
+    """
+
+    profile_id: str
+    context_window_class: str
+    min_context_window_tokens: int
+    selected_model_id: str
+    model_context_window_tokens: int
+    status: str
 
 
 @dataclass(frozen=True, slots=True)
@@ -333,6 +359,42 @@ def select_runner_option_hint(
             selected_model_source=model_selection.source,
             selected_runner_option_hint_id=hint_selection.value,
             selected_runner_option_hint_source=hint_selection.source,
+        ),
+    )
+
+
+def validate_execution_profile_context_window(
+    *, profile: ExecutionProfileConfig, model: ModelConfig
+) -> ExecutionProfileCompatibilityDiagnostic:
+    """校验 execution profile 与模型上下文窗口是否兼容。
+
+    该 helper 只做 fail-fast 校验和诊断，不读取默认 profile catalog，不返回
+    替代 profile id，也不会根据模型窗口自动切换 profile。
+
+    :param profile: Service 显式选择后的 execution profile。
+    :param model: Service 显式选择后的 effective model。
+    :returns: 兼容性诊断。
+    :raises RuntimeAssemblySelectionError: 模型上下文窗口小于 profile 最低要求时
+        抛出。
+    """
+
+    if model.context_window_tokens < profile.min_context_window_tokens:
+        raise RuntimeAssemblySelectionError(
+            "execution profile requires larger context window: "
+            f"profile={profile.execution_profile_id}, "
+            f"profile_min_context_window_tokens={profile.min_context_window_tokens}, "
+            f"model={model.model_id}, "
+            f"model_context_window_tokens={model.context_window_tokens}"
+        )
+    return ExecutionProfileCompatibilityDiagnostic(
+        profile_id=profile.execution_profile_id,
+        context_window_class=profile.context_window_class,
+        min_context_window_tokens=profile.min_context_window_tokens,
+        selected_model_id=model.model_id,
+        model_context_window_tokens=model.context_window_tokens,
+        status=_profile_context_window_status(
+            profile_class=profile.context_window_class,
+            model_context_window_tokens=model.context_window_tokens,
         ),
     )
 
@@ -559,6 +621,25 @@ def merge_agent_policy_config(
             }
         ),
     )
+
+
+def _profile_context_window_status(
+    *, profile_class: str, model_context_window_tokens: int
+) -> str:
+    """计算 profile 与模型窗口的兼容状态。
+
+    :param profile_class: profile 上下文窗口分档。
+    :param model_context_window_tokens: 模型上下文窗口 token 数。
+    :returns: 兼容状态字符串。
+    :raises Exception: 不主动抛出异常。
+    """
+
+    if (
+        profile_class == _CONTEXT_WINDOW_CLASS_256K
+        and model_context_window_tokens >= _CONTEXT_WINDOW_1M_MIN_TOKENS
+    ):
+        return _PROFILE_COMPATIBILITY_CONSERVATIVE
+    return _PROFILE_COMPATIBILITY_COMPATIBLE
 
 
 def tool_truncation_policy_defaults(
@@ -869,6 +950,7 @@ def _ttl_seconds_as_int(value: float) -> int:
 __all__ = [
     "AgentPolicyDefaults",
     "AgentPolicyOverrideConfig",
+    "ExecutionProfileCompatibilityDiagnostic",
     "MergedAgentPolicyConfig",
     "ModelRunnerHintOverride",
     "RunnerOptionHintSelection",
@@ -883,4 +965,5 @@ __all__ = [
     "parse_model_runner_hint_override",
     "select_runner_option_hint",
     "tool_truncation_policy_defaults",
+    "validate_execution_profile_context_window",
 ]

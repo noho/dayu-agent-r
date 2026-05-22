@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from collections.abc import MutableMapping
+from dataclasses import fields
 from typing import cast
 
 import pytest
@@ -18,6 +19,7 @@ from dayu.runtime.assembly import (
     parse_model_runner_hint_override,
     select_runner_option_hint,
     tool_truncation_policy_defaults,
+    validate_execution_profile_context_window,
 )
 from dayu.runtime.config_loader import ExecutionBaselineConfig, load_runtime_config
 from dayu.runtime.scene_prepare import (
@@ -49,7 +51,9 @@ def test_select_runner_option_hint_uses_field_level_precedence() -> None:
     """模型与 runner option hint selection 按字段应用四层优先级。"""
 
     config = load_runtime_config()
-    baseline = config.execution_profiles.execution_profiles["standard"].run_baseline
+    baseline = (
+        config.execution_profiles.execution_profiles["standard-256k"].run_baseline
+    )
     override = parse_model_runner_hint_override(
         {"runner_option_hint_id": "audit"},
         source_name="run_override",
@@ -141,7 +145,9 @@ def test_merge_agent_policy_config_uses_typed_allowlist_precedence() -> None:
     """Agent policy 合并遵守 run > scene > profile > default 优先级。"""
 
     config = load_runtime_config()
-    profile = config.execution_profiles.execution_profiles["standard"].agent_policy
+    profile = (
+        config.execution_profiles.execution_profiles["standard-256k"].agent_policy
+    )
     run_override = parse_agent_policy_override_config(
         {
             "allow_tool_calls": False,
@@ -176,7 +182,9 @@ def test_merge_agent_policy_config_field_sources_is_runtime_immutable() -> None:
     """合并诊断来源不得通过返回对象被调用方原地修改。"""
 
     config = load_runtime_config()
-    profile = config.execution_profiles.execution_profiles["standard"].agent_policy
+    profile = (
+        config.execution_profiles.execution_profiles["standard-256k"].agent_policy
+    )
 
     merged = merge_agent_policy_config(
         code_default=_agent_policy_defaults(),
@@ -196,7 +204,7 @@ def test_tool_truncation_policy_defaults_fill_declaration_without_target_drift()
 
     config = load_runtime_config()
     policy = (
-        config.execution_profiles.execution_profiles["standard"]
+        config.execution_profiles.execution_profiles["standard-256k"]
         .tool_truncation_policy
     )
     declaration = ToolTruncateSpec(
@@ -227,11 +235,13 @@ def test_runtime_assembly_helpers_do_not_construct_host_or_engine_objects() -> N
     """runtime assembly helper 返回值不得是 Host / Engine typed object。"""
 
     config = load_runtime_config()
-    profile = config.execution_profiles.execution_profiles["standard"].agent_policy
+    profile = (
+        config.execution_profiles.execution_profiles["standard-256k"].agent_policy
+    )
     selection = select_runner_option_hint(
         models=config.models,
         execution_baseline=config.execution_profiles.execution_profiles[
-            "standard"
+            "standard-256k"
         ].run_baseline,
         scene_model_hints=None,
         run_override=None,
@@ -256,3 +266,71 @@ def test_runtime_assembly_helpers_do_not_construct_host_or_engine_objects() -> N
         module.startswith("dayu.engine") or module.startswith("dayu.host")
         for module in returned_modules
     )
+
+
+def test_execution_profile_256k_and_256k_model_is_compatible() -> None:
+    """256k profile 搭配 256k 模型时诊断为 compatible。"""
+
+    config = load_runtime_config()
+    profile = config.execution_profiles.execution_profiles["standard-256k"]
+    model = config.models.models["ollama"]
+
+    diagnostic = validate_execution_profile_context_window(
+        profile=profile,
+        model=model,
+    )
+
+    assert diagnostic.profile_id == "standard-256k"
+    assert diagnostic.selected_model_id == "ollama"
+    assert diagnostic.status == "compatible"
+
+
+def test_execution_profile_1m_and_256k_model_fails_fast() -> None:
+    """1m profile 搭配 256k 模型必须 fail fast。"""
+
+    config = load_runtime_config()
+    profile = config.execution_profiles.execution_profiles["standard-1m"]
+    model = config.models.models["ollama"]
+
+    with pytest.raises(RuntimeAssemblySelectionError, match="larger context window"):
+        validate_execution_profile_context_window(
+            profile=profile,
+            model=model,
+        )
+
+
+def test_execution_profile_256k_and_1m_model_is_conservative() -> None:
+    """256k profile 搭配 1m 模型允许运行，但诊断为 conservative。"""
+
+    config = load_runtime_config()
+    profile = config.execution_profiles.execution_profiles["standard-256k"]
+    model = config.models.models["deepseek-v4-flash"]
+
+    diagnostic = validate_execution_profile_context_window(
+        profile=profile,
+        model=model,
+    )
+
+    assert diagnostic.profile_id == "standard-256k"
+    assert diagnostic.selected_model_id == "deepseek-v4-flash"
+    assert diagnostic.model_context_window_tokens >= 1000000
+    assert diagnostic.status == "conservative"
+
+
+def test_execution_profile_compatibility_helper_does_not_rewrite_selection() -> None:
+    """compatibility helper 不改输入 profile，也不返回替代 profile id。"""
+
+    config = load_runtime_config()
+    profile = config.execution_profiles.execution_profiles["standard-256k"]
+    model = config.models.models["deepseek-v4-flash"]
+
+    diagnostic = validate_execution_profile_context_window(
+        profile=profile,
+        model=model,
+    )
+
+    assert profile.execution_profile_id == "standard-256k"
+    assert diagnostic.profile_id == profile.execution_profile_id
+    assert "alternative_profile_id" not in {
+        field.name for field in fields(diagnostic)
+    }

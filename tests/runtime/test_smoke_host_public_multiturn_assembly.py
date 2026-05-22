@@ -59,7 +59,7 @@ def test_runtime_assembly_uses_workspace_tool_discovery_and_typed_overrides(
 
     assert assembly.diagnostics.config_overlay_dir == tmp_path / "workspace" / "config"
     assert assembly.diagnostics.host_runtime_id == "local"
-    assert assembly.diagnostics.execution_profile_id == "standard"
+    assert assembly.diagnostics.execution_profile_id == "standard-256k"
     assert assembly.diagnostics.model_id == _MODEL_ID
     assert assembly.diagnostics.model_source == "run_override"
     assert assembly.diagnostics.runner_option_hint_id == _RUNNER_HINT_ID
@@ -124,7 +124,7 @@ def _args(workspace_root: pathlib.Path) -> SmokeArgs:
     return SmokeArgs(
         workspace_root=workspace_root,
         scene_id=_SCENE_ID,
-        execution_profile_id="standard",
+        execution_profile_id="standard-256k",
         host_runtime_id="local",
         model_id=_MODEL_ID,
         runner_option_hint_id=_RUNNER_HINT_ID,

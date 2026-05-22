@@ -33,6 +33,7 @@ from dayu.host.local_proxy import DefaultLocalEngineWorkerFactory
 from dayu.host.memory import MemoryProjectionPolicy
 from dayu.runtime.assembly import (
     AgentPolicyDefaults,
+    ExecutionProfileCompatibilityDiagnostic,
     MergedAgentPolicyConfig,
     ModelRunnerHintOverride,
     RuntimeAssemblySelectionError,
@@ -41,6 +42,7 @@ from dayu.runtime.assembly import (
     merge_agent_policy_config,
     select_runner_option_hint,
     tool_truncation_policy_defaults,
+    validate_execution_profile_context_window,
 )
 from dayu.runtime.config_loader import (
     AgentPolicyConfig,
@@ -144,6 +146,8 @@ class ServiceOpenHostAssemblyDiagnostics:
     :param tool_truncation_policy: tool truncation policy 摘要。
     :param ordinary_provider_extension_status: 普通 Runner provider extension 映射状态。
     :param compactor_provider_extension_status: compactor provider extension 映射状态。
+    :param ordinary_profile_compatibility: 普通 Run profile / model 兼容诊断。
+    :param compactor_profile_compatibility: compactor profile / model 兼容诊断。
     """
 
     config_overlay_dir: pathlib.Path | None
@@ -165,6 +169,8 @@ class ServiceOpenHostAssemblyDiagnostics:
     tool_truncation_policy: str
     ordinary_provider_extension_status: str
     compactor_provider_extension_status: str
+    ordinary_profile_compatibility: ExecutionProfileCompatibilityDiagnostic
+    compactor_profile_compatibility: ExecutionProfileCompatibilityDiagnostic
 
 
 @dataclass(frozen=True, slots=True)
@@ -268,6 +274,14 @@ def compose_open_host_options(
         run_override=None,
         code_default=None,
     )
+    ordinary_profile_compatibility = validate_execution_profile_context_window(
+        profile=execution_profile,
+        model=ordinary_selection.model,
+    )
+    compactor_profile_compatibility = validate_execution_profile_context_window(
+        profile=execution_profile,
+        model=compactor_selection.model,
+    )
     agent_policy_config = merge_agent_policy_config(
         code_default=_agent_policy_defaults_from_config(
             execution_profile.agent_policy
@@ -294,6 +308,8 @@ def compose_open_host_options(
         lane=lane,
         ordinary_selection=ordinary_selection,
         compactor_selection=compactor_selection,
+        ordinary_profile_compatibility=ordinary_profile_compatibility,
+        compactor_profile_compatibility=compactor_profile_compatibility,
         agent_policy_config=agent_policy_config,
         tool_provider_reports=request.discovered_tools.provider_reports,
         scene_inputs=request.scene_inputs,
@@ -614,6 +630,8 @@ def _assembly_diagnostics(
     lane: RuntimeLaneConfig,
     ordinary_selection: RunnerOptionHintSelection,
     compactor_selection: RunnerOptionHintSelection,
+    ordinary_profile_compatibility: ExecutionProfileCompatibilityDiagnostic,
+    compactor_profile_compatibility: ExecutionProfileCompatibilityDiagnostic,
     agent_policy_config: MergedAgentPolicyConfig,
     tool_provider_reports: tuple[str, ...],
     scene_inputs: PreparedSceneInputs,
@@ -627,6 +645,8 @@ def _assembly_diagnostics(
     :param lane: runtime lane 配置。
     :param ordinary_selection: 普通 Run 模型选择结果。
     :param compactor_selection: compactor 模型选择结果。
+    :param ordinary_profile_compatibility: 普通 Run profile / model 兼容诊断。
+    :param compactor_profile_compatibility: compactor profile / model 兼容诊断。
     :param agent_policy_config: 合并后的 AgentPolicy 字段集。
     :param tool_provider_reports: 工具 provider 报告行。
     :param scene_inputs: ScenePrepare 输出。
@@ -671,6 +691,8 @@ def _assembly_diagnostics(
         compactor_provider_extension_status=_provider_extension_status(
             compactor_selection.model
         ),
+        ordinary_profile_compatibility=ordinary_profile_compatibility,
+        compactor_profile_compatibility=compactor_profile_compatibility,
     )
 
 

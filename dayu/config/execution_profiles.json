@@ -1,7 +1,9 @@
 {
-  "default_execution_profile_id": "standard",
+  "default_execution_profile_id": "standard-256k",
   "execution_profiles": {
-    "standard": {
+    "standard-256k": {
+      "context_window_class": "256k",
+      "min_context_window_tokens": 262144,
       "run_baseline": {
         "model_id": "deepseek-v4-flash",
         "runner_option_hint_id": "interactive"
@@ -17,7 +19,205 @@
         "max_proactive_compactions_per_run": 2,
         "max_reactive_compactions_per_run": 2,
         "max_compaction_attempts_per_operation": 3,
-        "policy_ref": "standard"
+        "policy_ref": "standard-256k"
+      },
+      "memory_projection_policy": {
+        "max_pinned_items": 32,
+        "max_verified_facts": 256,
+        "max_working_assumptions": 128,
+        "recent_raw_turns_floor": 4,
+        "raw_turn_context_ratio": 0.02,
+        "raw_turn_size_floor": 1024,
+        "raw_turn_size_cap": 8192,
+        "history_pool_context_ratio": 0.18,
+        "history_pool_size_floor": 8192,
+        "history_pool_size_cap": 131072,
+        "stable_layer_context_ratio": 0.12,
+        "stable_layer_size_floor": 4096,
+        "stable_layer_size_cap": 65536,
+        "max_lag_events_for_inline_delta": 32,
+        "max_delta_repair_events": 128
+      },
+      "tool_truncation_policy": {
+        "enabled": true,
+        "default_cursor_ttl_seconds": 3600.0,
+        "default_limits": {
+          "text_chars": {
+            "max_chars": 12000
+          },
+          "text_lines": {
+            "max_lines": 400
+          },
+          "list_items": {
+            "max_items": 200
+          },
+          "binary_bytes": {
+            "max_bytes": 1048576
+          }
+        }
+      },
+      "agent_policy": {
+        "max_iterations": 24,
+        "continuation_max_attempts": 2,
+        "allow_tool_calls": true,
+        "tool_execution_timeout_seconds": 120.0,
+        "fallback_mode": "force_answer",
+        "fallback_prompt": "请基于已获得的信息直接回答问题。信息不足时必须说明不确定性，不得编造。",
+        "continuation_prompt": "请从上一条回复被截断的位置继续输出，保持原有语言、格式和结构，不要重复已经输出的内容。",
+        "max_consecutive_failed_tool_batches": 2
+      }
+    },
+    "standard-1m": {
+      "context_window_class": "1m",
+      "min_context_window_tokens": 1000000,
+      "run_baseline": {
+        "model_id": "deepseek-v4-flash",
+        "runner_option_hint_id": "interactive"
+      },
+      "compactor_baseline": {
+        "model_id": "deepseek-v4-flash",
+        "runner_option_hint_id": "conversation_compaction",
+        "artifact_root": "workspace/.dayu/artifacts/compaction"
+      },
+      "context_budget_policy": {
+        "soft_threshold_context_ratio": 0.65,
+        "hard_threshold_context_ratio": 0.82,
+        "max_proactive_compactions_per_run": 2,
+        "max_reactive_compactions_per_run": 2,
+        "max_compaction_attempts_per_operation": 3,
+        "policy_ref": "standard-1m"
+      },
+      "memory_projection_policy": {
+        "max_pinned_items": 32,
+        "max_verified_facts": 256,
+        "max_working_assumptions": 128,
+        "recent_raw_turns_floor": 4,
+        "raw_turn_context_ratio": 0.02,
+        "raw_turn_size_floor": 1024,
+        "raw_turn_size_cap": 8192,
+        "history_pool_context_ratio": 0.18,
+        "history_pool_size_floor": 8192,
+        "history_pool_size_cap": 131072,
+        "stable_layer_context_ratio": 0.12,
+        "stable_layer_size_floor": 4096,
+        "stable_layer_size_cap": 65536,
+        "max_lag_events_for_inline_delta": 32,
+        "max_delta_repair_events": 128
+      },
+      "tool_truncation_policy": {
+        "enabled": true,
+        "default_cursor_ttl_seconds": 3600.0,
+        "default_limits": {
+          "text_chars": {
+            "max_chars": 12000
+          },
+          "text_lines": {
+            "max_lines": 400
+          },
+          "list_items": {
+            "max_items": 200
+          },
+          "binary_bytes": {
+            "max_bytes": 1048576
+          }
+        }
+      },
+      "agent_policy": {
+        "max_iterations": 24,
+        "continuation_max_attempts": 2,
+        "allow_tool_calls": true,
+        "tool_execution_timeout_seconds": 120.0,
+        "fallback_mode": "force_answer",
+        "fallback_prompt": "请基于已获得的信息直接回答问题。信息不足时必须说明不确定性，不得编造。",
+        "continuation_prompt": "请从上一条回复被截断的位置继续输出，保持原有语言、格式和结构，不要重复已经输出的内容。",
+        "max_consecutive_failed_tool_batches": 2
+      }
+    },
+    "wechat-256k": {
+      "context_window_class": "256k",
+      "min_context_window_tokens": 262144,
+      "run_baseline": {
+        "model_id": "deepseek-v4-flash",
+        "runner_option_hint_id": "interactive"
+      },
+      "compactor_baseline": {
+        "model_id": "deepseek-v4-flash",
+        "runner_option_hint_id": "conversation_compaction",
+        "artifact_root": "workspace/.dayu/artifacts/compaction"
+      },
+      "context_budget_policy": {
+        "soft_threshold_context_ratio": 0.65,
+        "hard_threshold_context_ratio": 0.82,
+        "max_proactive_compactions_per_run": 2,
+        "max_reactive_compactions_per_run": 2,
+        "max_compaction_attempts_per_operation": 3,
+        "policy_ref": "wechat-256k"
+      },
+      "memory_projection_policy": {
+        "max_pinned_items": 32,
+        "max_verified_facts": 256,
+        "max_working_assumptions": 128,
+        "recent_raw_turns_floor": 4,
+        "raw_turn_context_ratio": 0.02,
+        "raw_turn_size_floor": 1024,
+        "raw_turn_size_cap": 8192,
+        "history_pool_context_ratio": 0.18,
+        "history_pool_size_floor": 8192,
+        "history_pool_size_cap": 131072,
+        "stable_layer_context_ratio": 0.12,
+        "stable_layer_size_floor": 4096,
+        "stable_layer_size_cap": 65536,
+        "max_lag_events_for_inline_delta": 32,
+        "max_delta_repair_events": 128
+      },
+      "tool_truncation_policy": {
+        "enabled": true,
+        "default_cursor_ttl_seconds": 3600.0,
+        "default_limits": {
+          "text_chars": {
+            "max_chars": 12000
+          },
+          "text_lines": {
+            "max_lines": 400
+          },
+          "list_items": {
+            "max_items": 200
+          },
+          "binary_bytes": {
+            "max_bytes": 1048576
+          }
+        }
+      },
+      "agent_policy": {
+        "max_iterations": 24,
+        "continuation_max_attempts": 2,
+        "allow_tool_calls": true,
+        "tool_execution_timeout_seconds": 120.0,
+        "fallback_mode": "force_answer",
+        "fallback_prompt": "请基于已获得的信息直接回答问题。信息不足时必须说明不确定性，不得编造。",
+        "continuation_prompt": "请从上一条回复被截断的位置继续输出，保持原有语言、格式和结构，不要重复已经输出的内容。",
+        "max_consecutive_failed_tool_batches": 2
+      }
+    },
+    "wechat-1m": {
+      "context_window_class": "1m",
+      "min_context_window_tokens": 1000000,
+      "run_baseline": {
+        "model_id": "deepseek-v4-flash",
+        "runner_option_hint_id": "interactive"
+      },
+      "compactor_baseline": {
+        "model_id": "deepseek-v4-flash",
+        "runner_option_hint_id": "conversation_compaction",
+        "artifact_root": "workspace/.dayu/artifacts/compaction"
+      },
+      "context_budget_policy": {
+        "soft_threshold_context_ratio": 0.65,
+        "hard_threshold_context_ratio": 0.82,
+        "max_proactive_compactions_per_run": 2,
+        "max_reactive_compactions_per_run": 2,
+        "max_compaction_attempts_per_operation": 3,
+        "policy_ref": "wechat-1m"
       },
       "memory_projection_policy": {
         "max_pinned_items": 32,

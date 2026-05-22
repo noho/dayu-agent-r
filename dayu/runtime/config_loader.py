@@ -52,6 +52,13 @@ _FORBIDDEN_RECORD_ID_FIELDS: Final[frozenset[str]] = frozenset(
 _AGENT_FALLBACK_MODES: Final[frozenset[str]] = frozenset(
     {"force_answer", "raise_error"}
 )
+_EXECUTION_PROFILE_CONTEXT_WINDOW_CLASSES: Final[frozenset[str]] = frozenset(
+    {"256k", "1m"}
+)
+_EXECUTION_PROFILE_MIN_CONTEXT_WINDOW_TOKENS_BY_CLASS: Final[Mapping[str, int]] = {
+    "256k": 262_144,
+    "1m": 1_000_000,
+}
 _TOOL_DISCOVERY_SOURCE_KINDS: Final[frozenset[ToolBundleSourceKind]] = frozenset(
     {
         ToolBundleSourceKind.EXPLICIT_PROVIDER,
@@ -326,6 +333,8 @@ class ExecutionProfileConfig:
     """单个 execution profile 的完整配置。
 
     :param execution_profile_id: execution profile 稳定标识，由 map key 注入。
+    :param context_window_class: profile 面向的上下文窗口分档。
+    :param min_context_window_tokens: profile 要求的最小模型上下文窗口 token 数。
     :param run_baseline: 普通 Run 执行基线。
     :param compactor_baseline: compactor 执行基线。
     :param context_budget_policy: 上下文预算基线。
@@ -335,6 +344,8 @@ class ExecutionProfileConfig:
     """
 
     execution_profile_id: str
+    context_window_class: str
+    min_context_window_tokens: int
     run_baseline: ExecutionBaselineConfig
     compactor_baseline: CompactorBaselineConfig
     context_budget_policy: ContextBudgetConfig
@@ -1203,6 +1214,8 @@ def _parse_execution_profile(
         record,
         allowed=frozenset(
             {
+                "context_window_class",
+                "min_context_window_tokens",
                 "run_baseline",
                 "compactor_baseline",
                 "context_budget_policy",
@@ -1213,8 +1226,28 @@ def _parse_execution_profile(
         ),
         context=context,
     )
+    context_window_class = _parse_execution_profile_context_window_class(
+        _require_str_field(
+            record,
+            field_name="context_window_class",
+            context=context,
+        ),
+        context=f"{context}.context_window_class",
+    )
+    min_context_window_tokens = _require_positive_int_field(
+        record,
+        field_name="min_context_window_tokens",
+        context=context,
+    )
+    _validate_execution_profile_context_window_pair(
+        context_window_class=context_window_class,
+        min_context_window_tokens=min_context_window_tokens,
+        context=context,
+    )
     return ExecutionProfileConfig(
         execution_profile_id=record_id,
+        context_window_class=context_window_class,
+        min_context_window_tokens=min_context_window_tokens,
         run_baseline=_parse_execution_baseline(
             _require_mapping_field(
                 record,
@@ -1264,6 +1297,49 @@ def _parse_execution_profile(
             context=f"{context}.agent_policy",
         ),
     )
+
+
+def _parse_execution_profile_context_window_class(
+    value: str, *, context: str
+) -> str:
+    """解析 execution profile 上下文窗口分档。
+
+    :param value: 配置中的上下文窗口分档。
+    :param context: 错误消息上下文。
+    :returns: 合法上下文窗口分档。
+    :raises ConfigFieldError: 分档值不在允许集合内时抛出。
+    """
+
+    if value not in _EXECUTION_PROFILE_CONTEXT_WINDOW_CLASSES:
+        raise ConfigFieldError(
+            f"{context} has unsupported value: {value}"
+        )
+    return value
+
+
+def _validate_execution_profile_context_window_pair(
+    *,
+    context_window_class: str,
+    min_context_window_tokens: int,
+    context: str,
+) -> None:
+    """校验 execution profile 窗口分档与最小 token 数一致。
+
+    :param context_window_class: 已解析的上下文窗口分档。
+    :param min_context_window_tokens: 已解析的最小上下文窗口 token 数。
+    :param context: 错误消息上下文。
+    :returns: ``None``。
+    :raises ConfigFieldError: 分档与最小 token 数不一致时抛出。
+    """
+
+    expected_tokens = _EXECUTION_PROFILE_MIN_CONTEXT_WINDOW_TOKENS_BY_CLASS[
+        context_window_class
+    ]
+    if min_context_window_tokens != expected_tokens:
+        raise ConfigFieldError(
+            f"{context}.min_context_window_tokens must be {expected_tokens} "
+            f"when context_window_class is {context_window_class}"
+        )
 
 
 def _parse_execution_baseline(
