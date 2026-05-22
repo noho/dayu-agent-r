@@ -552,6 +552,8 @@ Phase Map 中每个 phase 必须使用统一条目格式。模板如下：
 
 当前 gate 追加事实（Phase 12.3 Slice 3 re-review accepted）：Phase 12.3 Slice 3 re-review artifacts 为 `docs/reviews/phase12-3-slice3-rereview-mimo-20260522.md` 与 `docs/reviews/phase12-3-slice3-rereview-ds-20260522.md`，两份均 PASS，确认 P12.3-S3-F1 / F2 / F3 已收口且无新增 blocker。Controller re-review adjudication artifact 为 `docs/reviews/phase12-3-slice3-rereview-controller-adjudication-20260522.md`；总控裁决：接受 Slice 3。当前进入 Phase 12.3 Slice 3 accepted local commit。
 
+当前 gate 追加事实（Phase 12.3 Slice 3 accepted）：Accepted Slice 3 local commit hash 为 `342f8ec`。当前进入 Phase 12.3 Slice 4 aggregate validation / residual sweep。
+
 ## Phase Map
 
 Phase 按依赖关系推进：先实现被其它阶段依赖的公共契约、runtime 基础能力、durable store、EventLog 与状态机，再连接执行路径、工具治理、projection core、memory、context governance、ordinary local multi-turn public contract freeze、recovery 与 remote。Audit、Tool Trace、Outbox 是独立 projection sinks，后置到核心治理路径稳定之后实现。Phase 0 是 Engine cleanup 前置 work unit，只阻塞 Phase 10 Context Governance，不阻塞 Phase 1-9。每个 phase 开始时仍必须先和用户讨论并细化对应 `docs/host/design.md` 章节，再生成 handoff implementation-ready plan。
