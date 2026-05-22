@@ -34,6 +34,11 @@ from dayu.host.durable.options import (
 from dayu.host.durable.payload import PayloadKind, read_payload_descriptor
 from dayu.host.durable.schema import TABLE_PAYLOAD_DESCRIPTORS
 from dayu.host.durable.transaction import HostTransaction
+from dayu.host.evidence import (
+    AcceptedEvidenceEnvelope,
+    AcceptedEvidenceResultRef,
+    AcceptedEvidenceToolQuery,
+)
 from tests.host.fake_compaction import FakeContextCompactor
 
 
@@ -160,10 +165,12 @@ async def test_compact_artifact_write_request_rejects_unaccepted_quality_result(
         accepted=False,
         rejection_reasons=(CompactQualityIssue.CURRENT_USER_INPUT_MISSING,),
         current_user_input_retained=False,
-        accepted_tool_fact_refs_retained=True,
+        accepted_evidence_refs_retained=True,
+        evidence_backed_fact_candidates_accepted=True,
+        minimum_preserve_items_accepted=True,
         evidence_anchors_retained=True,
         open_questions_retained=True,
-        retained_evidence_refs=(),
+        retained_accepted_evidence_refs=(),
         dropped_ranges=(),
         summarized_ranges=(),
     )
@@ -290,8 +297,11 @@ def _request() -> CompactionRequest:
             summary_text="分析 A 公司 2025 年年报",
             source_event_refs=("event-current",),
         ),
-        tool_fact_refs=("tool-fact-1", "tool-fact-2"),
-        verified_fact_refs=("tool-fact-1",),
+        accepted_evidence_envelopes=(
+            _accepted_evidence_envelope("accepted-1"),
+            _accepted_evidence_envelope("accepted-2"),
+        ),
+        evidence_backed_fact_refs=("fact-existing-1",),
         recent_raw_turn_refs=("event-current",),
         older_raw_turn_refs=("event-old",),
         existing_episode_summary_refs=("summary-prev",),
@@ -304,4 +314,40 @@ def _request() -> CompactionRequest:
             estimator_digest="estimate-digest",
             overage_reason=None,
         ),
+    )
+
+
+def _accepted_evidence_envelope(suffix: str) -> AcceptedEvidenceEnvelope:
+    """构造 compact artifact 测试用 accepted evidence envelope。
+
+    :param suffix: evidence 与 producer ref 后缀。
+    :returns: accepted evidence envelope。
+    """
+
+    return AcceptedEvidenceEnvelope(
+        evidence_id=f"evidence:{suffix}",
+        producer_event_ref=f"event-tool-result-{suffix}",
+        tool_name="fins.search",
+        tool_call_id=f"tool-call-{suffix}",
+        tool_query=AcceptedEvidenceToolQuery(
+            tool_call_requested_event_ref=f"event-tool-call-{suffix}",
+            normalized_arguments_digest=(
+                "sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+            ),
+            semantic_input_digest=(
+                "sha256:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"
+            ),
+        ),
+        result_ref=AcceptedEvidenceResultRef(
+            payload_ref=f"payload:{suffix}",
+            payload_digest=(
+                "sha256:cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc"
+            ),
+            outcome_digest=(
+                "sha256:dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd"
+            ),
+            truncation_applied=False,
+        ),
+        source_refs=(),
+        locator_refs=(),
     )

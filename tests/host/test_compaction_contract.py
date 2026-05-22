@@ -54,6 +54,26 @@ async def test_fake_compactor_produces_typed_candidates_and_evidence() -> None:
 
 
 @pytest.mark.asyncio
+async def test_fact_candidates_can_reference_accepted_evidence_envelopes() -> None:
+    """Fact candidates 可以引用 request 中的 accepted evidence envelope。
+
+    :returns: ``None``。
+    """
+
+    request = _request()
+    candidate = await FakeContextCompactor().compact(request)
+    result = check_compaction_candidate(request, candidate)
+
+    assert result.accepted is True
+    assert tuple(
+        envelope.evidence_id for envelope in request.accepted_evidence_envelopes
+    ) == request.accepted_evidence_refs
+    assert tuple(
+        fact.evidence_refs for fact in candidate.evidence_backed_fact_candidates
+    ) == (("evidence:accepted-1",), ("evidence:accepted-2",))
+
+
+@pytest.mark.asyncio
 async def test_fake_compactor_caps_budget_below_hard_threshold_when_preserved_refs_dominate() -> None:
     """Fake compactor 保持 accepted candidate 位于 hard threshold 内。
 

@@ -1539,6 +1539,58 @@ def test_context_compacted_summary_can_reference_same_event_materialized_fact() 
     )
 
 
+def test_compaction_confirmed_facts_do_not_drift_or_create_summary_fact() -> None:
+    """summary 引用 facts / evidence 时不得改写 facts 或自行建 fact。"""
+
+    snapshot = _build_snapshot(
+        (
+            _memory_event(
+                event_sequence=1,
+                event_id="event-compact-gross-margin-facts",
+                event_type="CONTEXT_COMPACTED",
+                payload=_compact_payload(
+                    summary_text=(
+                        "summary references revenue and gross profit facts"
+                    ),
+                    confirmed_fact_refs=("fact-revenue", "fact-gross-profit"),
+                    fact_candidates=[
+                        _fact_candidate(
+                            candidate_id="fact-revenue",
+                            claim_text="Revenue was 100.",
+                        ),
+                        _fact_candidate(
+                            candidate_id="fact-gross-profit",
+                            claim_text="Gross profit was 40.",
+                        ),
+                    ],
+                ),
+                run_id="run-compact",
+                attempt_id=None,
+                execution_id=None,
+            ),
+        )
+    )
+
+    assert tuple(fact.candidate_id for fact in snapshot.evidence_backed_facts) == (
+        "fact-revenue",
+        "fact-gross-profit",
+    )
+    assert tuple(fact.claim_text for fact in snapshot.evidence_backed_facts) == (
+        "Revenue was 100.",
+        "Gross profit was 40.",
+    )
+    assert tuple(fact.evidence_refs for fact in snapshot.evidence_backed_facts) == (
+        ("evidence-1",),
+        ("evidence-1",),
+    )
+    assert len(snapshot.evidence_backed_facts) == 2
+    assert len(snapshot.conversation_continuity.items) == 1
+    summary = snapshot.conversation_continuity.items[0]
+    assert summary.item_kind is ConversationContinuityKind.EPISODE_SUMMARY
+    assert summary.claim_status is MemoryClaimStatus.ASSUMPTION
+    assert summary.summary_text == "summary references revenue and gross profit facts"
+
+
 def test_evidence_backed_fact_budget_keeps_latest_facts_and_records_diagnostic() -> None:
     """max_evidence_backed_facts 保留最新 facts 并记录 budget diagnostic。"""
 

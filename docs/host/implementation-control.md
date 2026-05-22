@@ -1666,6 +1666,16 @@ Plan 必须额外收口的 readiness review checklist：
   (0 errors)。Deferred findings：bounded EventLog read 目前以 `start_event_sequence=1` 作为 session 起点保守读取并按 session
   过滤，Slice 7 / aggregate review 需决定是否派生 session min sequence；no-compaction / post-compaction follow-up 端到端 smoke 仍归
   Slice 7。
+  Slice 7 `Integration Smoke, README Sync, Aggregate Validation` implementation / code review PASS；review artifacts 为
+  `docs/reviews/phase12-5-slice7-code-review-mimo-20260522.md`、
+  `docs/reviews/phase12-5-slice7-code-review-ds-20260522.md`、
+  `docs/reviews/phase12-5-slice7-code-review-controller-adjudication-20260522.md`。Slice 7 validation:
+  `pytest tests/host/test_compact_artifact_store.py tests/host/test_toolruntime_accept_barrier.py tests/host/test_compaction_contract.py tests/host/test_context_compact_events.py tests/host/test_compaction_operation.py tests/host/test_llm_compaction.py tests/host/test_memory_projection.py tests/host/test_run_input_builder.py tests/service/test_host_assembly.py tests/runtime/test_config_loader.py`
+  PASS (221 passed)；full pyright PASS (0 errors)。旧 `verified_*` / `tool_fact_refs` 扫描结论：active production path
+  无旧 public contract 使用，剩余命中均为 fail-closed guard、fail-closed tests、当前 `preserved_fact_refs` payload 容器名或历史
+  docs / review artifacts。Residual risks：public-path no-compaction continuity smoke 尚未新增；`compaction_evidence.py`
+  使用 session-filtered `start_event_sequence=1` 保守读取；candidate JSON helper duplication 暂不阻塞。Owner：aggregate
+  deepreview 决定是否在 draft PR 前补强，否则转后续 public smoke / performance hardening / cleanup work unit。
 
 目标：
 - 从买方财报分析 Agent 的第一性原理优化 Conversation Memory，使同一 session 内已由工具确认的关键财务事实能跨轮、
