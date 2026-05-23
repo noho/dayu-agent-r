@@ -9,7 +9,7 @@ from collections.abc import AsyncIterator, Callable, Mapping
 from dataclasses import dataclass, replace
 from datetime import UTC, datetime
 from pathlib import Path
-from typing import cast
+from typing import TypeVar, cast
 
 import pytest
 
@@ -77,6 +77,7 @@ from dayu.host.dispatch import (
     ActiveWorkerRegistry,
     DispatchDrainResult,
     HostDispatchScheduler,
+    _DurableRunCancellationToken,
     _safe_close_worker_handle,
     _safe_release_lane_token,
 )
@@ -131,7 +132,11 @@ from dayu.host.durable.state import (
     read_dispatch_record_by_attempt_id,
     read_run_by_id,
 )
-from dayu.host.durable.transaction import HostTransaction, HostTransactionRunner
+from dayu.host.durable.transaction import (
+    HostReadTransactionOperation,
+    HostTransaction,
+    HostTransactionRunner,
+)
 from dayu.host.local_proxy import DefaultLocalEngineWorkerFactory
 from dayu.host.projection import ProjectionCatchupPort
 from dayu.runtime.lane import (
@@ -151,6 +156,31 @@ _SOFT_CONTEXT_WINDOW_SIZE = 110
 _SOFT_RESERVED_OUTPUT_TOKENS = 10
 _SOFT_HARD_THRESHOLD_TOKENS = 80
 _SOFT_SAFETY_MARGIN_RATIO = 0.5
+_T = TypeVar("_T")
+
+
+class _RetryExhaustedReadRunner(HostTransactionRunner):
+    """测试用 read transaction runner，始终模拟 durable 不可读。"""
+
+    def __init__(self) -> None:
+        """跳过真实 SQLite runner 初始化。
+
+        :returns: ``None``。
+        """
+
+    def run_read(self, operation: HostReadTransactionOperation[_T]) -> _T:
+        """模拟 read transaction busy 重试耗尽。
+
+        :param operation: Host read transaction operation。
+        :returns: 不会返回。
+        :raises HostTransactionRetryExhaustedError: 始终抛出。
+        """
+
+        del operation
+        raise HostTransactionRetryExhaustedError(
+            "Host durable read transaction busy retry exhausted",
+            attempts=3,
+        )
 
 
 @dataclass(frozen=True, slots=True)
@@ -1745,6 +1775,21 @@ async def test_worker_startup_closeout_error_still_releases_lane(
             assert "original_error_type=RuntimeError" in caplog.text
         finally:
             await scheduler.close()
+
+
+@pytest.mark.asyncio
+async def test_durable_run_cancellation_token_fails_closed_on_retry_exhausted() -> None:
+    """durable read 重试耗尽时，compaction 取消 token 必须 fail closed。"""
+
+    token = _DurableRunCancellationToken(
+        transaction_runner=_RetryExhaustedReadRunner(),
+        run_id="run-durable-unavailable",
+        expected_status=RunStatus.ACCEPTED,
+        expected_input_event_sequence=1,
+    )
+
+    assert token.is_cancelled() is True
+    assert token.cancel_reason() == "durable_unavailable"
 
 
 @pytest.mark.asyncio

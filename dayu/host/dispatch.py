@@ -200,6 +200,7 @@ _COMPACT_FAILURE_POLICY_DECISION = "compact_failed_before_dispatch"
 _COMPACTION_CANCEL_REASON_RUN_MISSING = "run_missing"
 _COMPACTION_CANCEL_REASON_INPUT_CHANGED = "run_input_event_sequence_changed"
 _COMPACTION_CANCEL_REASON_STATUS_PREFIX = "run_status_changed"
+_COMPACTION_CANCEL_REASON_DURABLE_UNAVAILABLE = "durable_unavailable"
 _HOST_INSTANCE_HEARTBEAT_INTERVAL_SECONDS = 1.0
 _LOG_DRAIN_LOOP_IDLE = (
     "dispatch.drain_loop.idle host_handle_id=%s interval_seconds=%s"
@@ -550,7 +551,8 @@ class _DurableRunCancellationToken(CancellationToken):
     def is_cancelled(self) -> bool:
         """返回 proactive compaction 是否已失效。
 
-        :returns: durable Run 已离开原 request 前置条件时返回 ``True``。
+        :returns: durable Run 已离开原 request 前置条件，或 durable 状态不可读时
+            返回 ``True``。
         """
 
         return self.cancel_reason() is not None
@@ -558,7 +560,8 @@ class _DurableRunCancellationToken(CancellationToken):
     def cancel_reason(self) -> str | None:
         """读取 durable Run 状态并返回取消原因。
 
-        :returns: 取消原因；Run 仍满足 request 前置条件时为 ``None``。
+        :returns: 取消原因；Run 仍满足 request 前置条件时为 ``None``。durable
+            状态不可读时 fail-closed 返回 ``durable_unavailable``。
         """
 
         try:
@@ -572,7 +575,7 @@ class _DurableRunCancellationToken(CancellationToken):
                 )
             )
         except HostTransactionRetryExhaustedError:
-            return None
+            return _COMPACTION_CANCEL_REASON_DURABLE_UNAVAILABLE
 
     def requested_at(self) -> datetime | None:
         """返回取消请求时间。

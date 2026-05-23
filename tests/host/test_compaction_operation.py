@@ -98,6 +98,59 @@ class _AlwaysFailingCompactor(ContextCompactor):
         raise RuntimeError("proposal failed")
 
 
+class _SensitiveFailingCompactor(ContextCompactor):
+    """始终抛出带敏感字段的 proposal 异常。"""
+
+    async def compact(
+        self, request: CompactionRequest, cancellation_token: CancellationToken
+    ) -> CompactionCandidate:
+        """模拟 provider 错误消息携带 secret。
+
+        :param request: compaction request。
+        :param cancellation_token: Host 注入的取消 token。
+        :returns: 不会返回。
+        :raises RuntimeError: 始终抛出带敏感字段的 proposal failure。
+        """
+
+        del request
+        del cancellation_token
+        raise RuntimeError(
+            "provider failed Bearer secret-token "
+            "api_key=plain-secret token=token-secret secret=raw-secret"
+        )
+
+
+class _CancelAfterFailureCompactor(ContextCompactor):
+    """首次失败后请求取消的 compactor。"""
+
+    def __init__(self, token: StubCancellationToken) -> None:
+        """初始化可控 token 与调用计数。
+
+        :param token: 测试用可控 cancellation token。
+        :returns: ``None``。
+        """
+
+        self.calls = 0
+        self._token = token
+
+    async def compact(
+        self, request: CompactionRequest, cancellation_token: CancellationToken
+    ) -> CompactionCandidate:
+        """首次 proposal 失败并在重试前请求取消。
+
+        :param request: compaction request。
+        :param cancellation_token: Host 注入的取消 token。
+        :returns: 不会返回。
+        :raises RuntimeError: 首次调用时模拟 proposal failure。
+        """
+
+        del request
+        del cancellation_token
+        self.calls += 1
+        self._token.request_cancel("test_cancelled")
+        raise RuntimeError("proposal failed before cancellation")
+
+
 class _QualityRejectOnceCompactor(ContextCompactor):
     """首次返回 quality reject candidate，第二次返回 accepted candidate。"""
 
@@ -266,6 +319,50 @@ async def test_run_compaction_operation_fails_after_async_attempt_budget() -> No
     assert result.rejected_attempts[1].repairable is False
     assert "proposal failed" in result.rejected_attempts[0].diagnostic_refs[0]
     assert result.failure_reason is not None
+
+
+@pytest.mark.asyncio
+async def test_run_compaction_operation_stops_before_retry_when_cancelled() -> None:
+    """首次失败后 token 被取消时，不发起第二次 compactor 调用。"""
+
+    token = StubCancellationToken()
+    compactor = _CancelAfterFailureCompactor(token)
+
+    result = await run_compaction_operation(
+        request=_request(),
+        compactor=compactor,
+        max_attempts=2,
+        cancellation_token=token,
+    )
+
+    assert compactor.calls == 1
+    assert result.accepted_candidate is None
+    assert result.quality_result is None
+    assert result.failure_reason == "cancellation_requested"
+    assert len(result.rejected_attempts) == 2
+    assert result.rejected_attempts[1].attempt_number == 2
+    assert result.rejected_attempts[1].failure_category == "cancellation_requested"
+    assert result.rejected_attempts[1].repairable is False
+    assert "test_cancelled" in result.rejected_attempts[1].diagnostic_refs[0]
+
+
+@pytest.mark.asyncio
+async def test_run_compaction_operation_redacts_exception_diagnostic_refs() -> None:
+    """proposal 异常诊断 ref 不能持久化 Bearer token 或 secret 赋值。"""
+
+    result = await run_compaction_operation(
+        request=_request(),
+        compactor=_SensitiveFailingCompactor(),
+        max_attempts=1,
+        cancellation_token=StubCancellationToken(),
+    )
+
+    diagnostic_ref = result.rejected_attempts[0].diagnostic_refs[0]
+    assert "secret-token" not in diagnostic_ref
+    assert "plain-secret" not in diagnostic_ref
+    assert "token-secret" not in diagnostic_ref
+    assert "raw-secret" not in diagnostic_ref
+    assert "<redacted>" in diagnostic_ref
 
 
 def test_compaction_request_evidence_inputs_are_bounded_for_proactive_and_reactive(

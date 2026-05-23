@@ -26,9 +26,11 @@ _FAILURE_PROPOSAL_FAILED = "proposal_failed"
 _FAILURE_QUALITY_CHECK_REJECTED = "quality_check_rejected"
 _FAILURE_HARD_THRESHOLD_AFTER_COMPACT = "hard_threshold_after_compact"
 _FAILURE_MAX_ATTEMPTS_EXHAUSTED = "max_compaction_attempts_exhausted"
+_FAILURE_CANCELLATION_REQUESTED = "cancellation_requested"
 _NEXT_DECISION_RETRY_REPAIR = "retry_semantic_repair"
 _NEXT_DECISION_FAIL_COMPACTION = "fail_compaction"
 _DIAGNOSTIC_SUFFIX_UNKNOWN = "unknown"
+_DIAGNOSTIC_SUFFIX_CANCELLED = "cancelled"
 _DIAGNOSTIC_SUFFIX_HARD_THRESHOLD = "hard_threshold"
 _MAX_SAFE_EXCEPTION_MESSAGE_CHARS = 240
 _TRUNCATED_SUFFIX = "..."
@@ -101,6 +103,29 @@ async def run_compaction_operation(
     rejected: list[CompactionAttemptRejected] = []
     last_budget: int | None = None
     for attempt_number in range(1, max_attempts + 1):
+        if cancellation_token.is_cancelled():
+            rejected_attempt = _attempt_rejected(
+                request=request,
+                attempt_number=attempt_number,
+                failure_category=_FAILURE_CANCELLATION_REQUESTED,
+                repairable=False,
+                next_policy_decision=_NEXT_DECISION_FAIL_COMPACTION,
+                budget_after_attempted_compact=last_budget,
+                diagnostic_suffix=_cancellation_suffix(cancellation_token),
+            )
+            rejected.append(rejected_attempt)
+            _log_rejected_attempt(
+                request=request,
+                rejected=rejected_attempt,
+                exception=None,
+            )
+            return CompactionOperationResult(
+                accepted_candidate=None,
+                quality_result=None,
+                rejected_attempts=tuple(rejected),
+                failure_reason=_FAILURE_CANCELLATION_REQUESTED,
+                budget_after_attempted_compact=last_budget,
+            )
         repairable = attempt_number < max_attempts
         next_decision = (
             _NEXT_DECISION_RETRY_REPAIR
@@ -276,10 +301,24 @@ def _exception_diagnostic_suffix(exc: Exception) -> str:
     :returns: 包含异常类型与消息的诊断后缀。
     """
 
-    message = str(exc)
-    if message == "":
+    message = _safe_exception_message(exc)
+    if message == exc.__class__.__name__:
         return exc.__class__.__name__
     return f"{exc.__class__.__name__}:{message}"
+
+
+def _cancellation_suffix(cancellation_token: CancellationToken) -> str:
+    """构造取消拒绝诊断后缀。
+
+    :param cancellation_token: Host 注入 compactor 的真实取消 token。
+    :returns: 取消原因；token 未提供原因时返回中性取消后缀。
+    :raises Exception: 不主动抛出异常。
+    """
+
+    reason = cancellation_token.cancel_reason()
+    if reason is None or reason.strip() == "":
+        return _DIAGNOSTIC_SUFFIX_CANCELLED
+    return reason
 
 
 def _log_rejected_attempt(

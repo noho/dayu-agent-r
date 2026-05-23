@@ -5,9 +5,7 @@
 取消状态；治理真源（取消触发、reason 设置、accept/finish 时间戳）由
 Host 拥有，本 Phase 不实现。
 
-取消的**公共终态**通过结构化事件与 outcome 表达：
-:class:`dayu.engine.contracts.engine_events.RunCancelledData` 与
-:class:`dayu.engine.contracts.agent_run.EngineRunOutcomeCancelled`。
+取消的**公共终态**由上层 Engine 的结构化事件与 run outcome 表达。
 Engine 不把任何取消异常作为公共 contract——内部协作式控制流若需要
 异常语义，由实现 Phase 在 Engine 内部私有模块定义，不作为 Host 可
 依赖的接口。
