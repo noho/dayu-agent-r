@@ -1376,6 +1376,7 @@ class HostDispatchScheduler:
                 source_event_refs=(run.input_event_id,),
             ),
             accepted_evidence_envelopes=evidence_inputs.accepted_evidence_envelopes,
+            compact_raw_context_items=evidence_inputs.compact_raw_context_items,
             evidence_backed_fact_refs=evidence_inputs.evidence_backed_fact_refs,
             recent_raw_turn_refs=(run.input_event_id,),
             older_raw_turn_refs=(),

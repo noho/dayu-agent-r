@@ -2995,6 +2995,7 @@ def _reactive_compaction_request(
             source_event_refs=(context.run.input_event_id,),
         ),
         accepted_evidence_envelopes=pending.evidence_inputs.accepted_evidence_envelopes,
+        compact_raw_context_items=pending.evidence_inputs.compact_raw_context_items,
         evidence_backed_fact_refs=pending.evidence_inputs.evidence_backed_fact_refs,
         recent_raw_turn_refs=(context.run.input_event_id,),
         older_raw_turn_refs=(),

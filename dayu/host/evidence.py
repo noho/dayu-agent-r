@@ -24,7 +24,6 @@ _FIELD_PAYLOAD_REF = "payload_ref"
 _FIELD_PRODUCER_EVENT_REF = "producer_event_ref"
 _FIELD_REF_ID = "ref_id"
 _FIELD_REF_KIND = "ref_kind"
-_FIELD_RESULT_PREVIEW = "result_preview"
 _FIELD_RESULT_REF = "result_ref"
 _FIELD_SEMANTIC_INPUT_DIGEST = "semantic_input_digest"
 _FIELD_SOURCE_REFS = "source_refs"
@@ -58,12 +57,9 @@ _RESULT_REF_FIELDS = frozenset(
         _FIELD_PAYLOAD_DIGEST,
         _FIELD_OUTCOME_DIGEST,
         _FIELD_TRUNCATION_APPLIED,
-        _FIELD_RESULT_PREVIEW,
     }
 )
 _OPAQUE_REF_FIELDS = frozenset({_FIELD_REF_KIND, _FIELD_REF_ID, _FIELD_DIGEST})
-MAX_ACCEPTED_EVIDENCE_RESULT_PREVIEW_CHARS = 1200
-"""Accepted evidence result_preview 字符数上限。"""
 
 
 @dataclass(frozen=True, slots=True)
@@ -128,14 +124,12 @@ class AcceptedEvidenceResultRef:
     :param payload_digest: 可选工具结果 payload digest。
     :param outcome_digest: 可选工具 outcome digest。
     :param truncation_applied: 工具结果是否被 Host 截断。
-    :param result_preview: Host 从 accepted outcome 派生的有界内容预览。
     """
 
     payload_ref: str | None
     payload_digest: str | None
     outcome_digest: str | None
     truncation_applied: bool
-    result_preview: str | None
 
     def __post_init__(self) -> None:
         """校验工具结果引用。
@@ -149,11 +143,6 @@ class AcceptedEvidenceResultRef:
         _require_optional_sha256_digest(self.outcome_digest, "outcome_digest")
         if not isinstance(self.truncation_applied, bool):
             raise ValueError("truncation_applied must be bool")
-        _require_optional_bounded_non_empty_text(
-            self.result_preview,
-            "result_preview",
-            max_chars=MAX_ACCEPTED_EVIDENCE_RESULT_PREVIEW_CHARS,
-        )
 
 
 @dataclass(frozen=True, slots=True)
@@ -246,7 +235,6 @@ def accepted_evidence_envelope_to_json_value(
             _FIELD_PAYLOAD_DIGEST: envelope.result_ref.payload_digest,
             _FIELD_OUTCOME_DIGEST: envelope.result_ref.outcome_digest,
             _FIELD_TRUNCATION_APPLIED: envelope.result_ref.truncation_applied,
-            _FIELD_RESULT_PREVIEW: envelope.result_ref.result_preview,
         },
         _FIELD_SOURCE_REFS: [
             _opaque_evidence_ref_to_json_value(ref)
@@ -302,7 +290,6 @@ def accepted_evidence_envelope_from_json_value(
             truncation_applied=_required_bool(
                 result_ref_mapping, _FIELD_TRUNCATION_APPLIED
             ),
-            result_preview=_optional_str(result_ref_mapping, _FIELD_RESULT_PREVIEW),
         ),
         source_refs=tuple(
             _opaque_evidence_ref_from_json_value(item)
@@ -489,25 +476,6 @@ def _require_optional_non_empty_text(
         _require_non_empty_text(value, field_name)
 
 
-def _require_optional_bounded_non_empty_text(
-    value: str | None, field_name: str, *, max_chars: int
-) -> None:
-    """校验可选文本非空且不超过长度上限。
-
-    :param value: 文本或 ``None``。
-    :param field_name: 字段名。
-    :param max_chars: 最大允许字符数。
-    :returns: ``None``。
-    :raises ValueError: 文本为空、类型错误或超过上限时抛出。
-    """
-
-    if value is None:
-        return
-    _require_non_empty_text(value, field_name)
-    if len(value) > max_chars:
-        raise ValueError(f"{field_name} exceeds maximum length")
-
-
 def _require_sha256_digest(value: str, field_name: str) -> None:
     """校验必填 sha256 digest。
 
@@ -540,7 +508,6 @@ __all__ = [
     "AcceptedEvidenceEnvelope",
     "AcceptedEvidenceResultRef",
     "AcceptedEvidenceToolQuery",
-    "MAX_ACCEPTED_EVIDENCE_RESULT_PREVIEW_CHARS",
     "OpaqueEvidenceRef",
     "accepted_evidence_envelope_from_json_value",
     "accepted_evidence_envelope_to_json_value",

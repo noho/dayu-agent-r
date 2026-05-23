@@ -42,6 +42,7 @@ from dayu.engine.contracts.messages import (
 from dayu.engine.contracts.runner_spec import RunnerCallOptions, RunnerSpec
 from dayu.host.compaction import (
     CompactInputRange,
+    CompactRawContextItem,
     CompactionCandidate,
     CompactionRequest,
     ContextCompactor,
@@ -317,6 +318,7 @@ def _user_prompt(request: CompactionRequest) -> str:
         f"existing_episode_summary_refs: {_refs_text(request.existing_episode_summary_refs)}",
     ]
     lines.extend(_accepted_evidence_envelope_lines(request.accepted_evidence_envelopes))
+    lines.extend(_compact_raw_context_lines(request.compact_raw_context_items))
     lines.extend(
         [
             "Return strict JSON only. Required object schema:",
@@ -359,7 +361,7 @@ def _user_prompt(request: CompactionRequest) -> str:
 def _accepted_evidence_envelope_lines(
     envelopes: tuple[AcceptedEvidenceEnvelope, ...],
 ) -> list[str]:
-    """格式化 accepted evidence envelopes 供 LLM 读取真实 evidence 内容。
+    """格式化 accepted evidence envelopes metadata。
 
     :param envelopes: Host accepted evidence 信封。
     :returns: prompt 行列表。
@@ -391,12 +393,47 @@ def _accepted_evidence_envelope_lines(
                 f"    payload_digest: {result_ref.payload_digest or 'none'}",
                 f"    outcome_digest: {result_ref.outcome_digest or 'none'}",
                 f"    truncation_applied: {result_ref.truncation_applied}",
-                f"    result_preview: {result_ref.result_preview or 'none'}",
                 f"  source_refs: {_opaque_refs_text(envelope.source_refs)}",
                 f"  locator_refs: {_opaque_refs_text(envelope.locator_refs)}",
             ]
         )
     return lines
+
+
+def _compact_raw_context_lines(items: tuple[CompactRawContextItem, ...]) -> list[str]:
+    """格式化 compact range raw transcript 供 LLM 抽取事实。
+
+    :param items: compact raw context items。
+    :returns: prompt 行列表。
+    """
+
+    if len(items) == 0:
+        return ["compact_raw_context: none"]
+    lines = ["compact_raw_context:"]
+    for item in items:
+        lines.extend(
+            [
+                f"- event_ref: {item.event_ref}",
+                f"  content_kind: {item.content_kind.value}",
+                (
+                    "  accepted_evidence_refs: "
+                    f"{_refs_text(item.accepted_evidence_refs)}"
+                ),
+                "  content:",
+                *_indented_content_lines(item.content_text),
+            ]
+        )
+    return lines
+
+
+def _indented_content_lines(content: str) -> list[str]:
+    """把 raw context 内容缩进为 prompt block。
+
+    :param content: raw context 内容。
+    :returns: 已缩进行列表。
+    """
+
+    return [f"    {line}" for line in content.splitlines()]
 
 
 def _opaque_refs_text(refs: tuple[OpaqueEvidenceRef, ...]) -> str:

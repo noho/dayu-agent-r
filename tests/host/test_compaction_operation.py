@@ -11,6 +11,8 @@ import pytest
 from dayu.contracts.cancellation import CancellationToken
 from dayu.contracts.json_value import JsonValue
 from dayu.host.compaction import (
+    CompactRawContextItem,
+    CompactRawContextKind,
     CompactionCandidate,
     CompactionRequest,
     ContextCompactor,
@@ -246,7 +248,7 @@ async def test_run_compaction_operation_fails_after_async_attempt_budget() -> No
 def test_compaction_request_evidence_inputs_are_bounded_for_proactive_and_reactive(
     tmp_path: Path,
 ) -> None:
-    """共享 helper 只读取 compact input range 内证据。"""
+    """共享 helper 只读取 compact input range 内证据与 raw 内容。"""
 
     session_id = "session-evidence-range"
     outside_session_id = "session-outside"
@@ -274,7 +276,8 @@ def test_compaction_request_evidence_inputs_are_bounded_for_proactive_and_reacti
                                     inside_event_id
                                 )
                             )
-                        )
+                        ),
+                        "raw_tool_outcome": _raw_tool_outcome(inside_event_id),
                     },
                 ),
             )
@@ -301,7 +304,8 @@ def test_compaction_request_evidence_inputs_are_bounded_for_proactive_and_reacti
                                     outside_event_id
                                 )
                             )
-                        )
+                        ),
+                        "raw_tool_outcome": _raw_tool_outcome(outside_event_id),
                     },
                 ),
             )
@@ -319,7 +323,8 @@ def test_compaction_request_evidence_inputs_are_bounded_for_proactive_and_reacti
                                     other_session_event_id
                                 )
                             )
-                        )
+                        ),
+                        "raw_tool_outcome": _raw_tool_outcome(other_session_event_id),
                     },
                 ),
             )
@@ -327,11 +332,13 @@ def test_compaction_request_evidence_inputs_are_bounded_for_proactive_and_reacti
 
         end_event_sequence = store.transaction_runner.run_write(append_rows)
 
-        def read_inputs(transaction: HostTransaction) -> tuple[str, ...]:
-            """读取共享 helper 输出的 evidence ids。
+        def read_inputs(
+            transaction: HostTransaction,
+        ) -> tuple[tuple[str, ...], tuple[tuple[str, str, tuple[str, ...]], ...]]:
+            """读取共享 helper 输出的 evidence ids 与 raw context。
 
             :param transaction: Host transaction。
-            :returns: evidence id tuple。
+            :returns: evidence id tuple 与 raw context 摘要。
             """
 
             inputs = collect_compaction_request_evidence_inputs(
@@ -341,13 +348,35 @@ def test_compaction_request_evidence_inputs_are_bounded_for_proactive_and_reacti
                 start_event_sequence=1,
                 end_event_sequence=end_event_sequence,
             )
-            return tuple(
-                envelope.evidence_id
-                for envelope in inputs.accepted_evidence_envelopes
+            return (
+                tuple(
+                    envelope.evidence_id
+                    for envelope in inputs.accepted_evidence_envelopes
+                ),
+                tuple(
+                    (
+                        item.event_ref,
+                        item.content_text,
+                        item.accepted_evidence_refs,
+                    )
+                    for item in inputs.compact_raw_context_items
+                ),
             )
 
         assert store.transaction_runner.run_read(read_inputs) == (
-            "evidence:event-tool-result-inside",
+            ("evidence:event-tool-result-inside",),
+            (
+                (
+                    "event-tool-result-inside",
+                    (
+                        '{"kind":"completed","result":{"meta":null,"ok":true,'
+                        '"value":{"content":"raw content event-tool-result-inside",'
+                        '"event_id":"event-tool-result-inside"}}}'
+                    ),
+                    ("evidence:event-tool-result-inside",),
+                ),
+                ("event-current-input", "current input", ()),
+            ),
         )
 
 
@@ -427,6 +456,37 @@ def test_compaction_request_evidence_inputs_reject_malformed_envelope(
             )
 
 
+def test_compaction_request_evidence_inputs_reject_missing_raw_tool_outcome(
+    tmp_path: Path,
+) -> None:
+    """accepted evidence 对应 raw 工具结果缺失时 fail closed。"""
+
+    session_id = "session-missing-raw-tool-outcome"
+    with open_host_durable_store(_options(tmp_path)) as store:
+        event_log = EventLogStore()
+        event_id = "event-tool-result-missing-raw"
+        end_event_sequence = _append_event_and_return_sequence(
+            store,
+            event_log,
+            event_id=event_id,
+            session_id=session_id,
+            event_type="TOOL_RESULT_ACCEPTED",
+            payload={
+                "accepted_evidence_envelope": accepted_evidence_envelope_to_json_value(
+                    _accepted_evidence_envelope_for_event(event_id)
+                )
+            },
+        )
+
+        with pytest.raises(HostDurableError, match="raw_tool_outcome"):
+            _collect_evidence_ids(
+                store,
+                event_log,
+                session_id=session_id,
+                end_event_sequence=end_event_sequence,
+            )
+
+
 def test_compaction_request_evidence_inputs_reject_envelope_producer_mismatch(
     tmp_path: Path,
 ) -> None:
@@ -444,7 +504,8 @@ def test_compaction_request_evidence_inputs_reject_envelope_producer_mismatch(
             payload={
                 "accepted_evidence_envelope": accepted_evidence_envelope_to_json_value(
                     _accepted_evidence_envelope_for_event("event-tool-result-other")
-                )
+                ),
+                "raw_tool_outcome": _raw_tool_outcome("event-tool-result-mismatch"),
             },
         )
 
@@ -548,7 +609,8 @@ def test_compaction_request_evidence_inputs_deduplicate_accepted_evidence_ids(
                                     first_event_id
                                 )
                             )
-                        )
+                        ),
+                        "raw_tool_outcome": _raw_tool_outcome(first_event_id),
                     },
                 ),
             )
@@ -567,7 +629,6 @@ def test_compaction_request_evidence_inputs_deduplicate_accepted_evidence_ids(
                     payload_digest=_DIGEST,
                     outcome_digest=_DIGEST,
                     truncation_applied=False,
-                    result_preview="duplicate accepted evidence preview",
                 ),
                 source_refs=(),
                 locator_refs=(),
@@ -583,7 +644,8 @@ def test_compaction_request_evidence_inputs_deduplicate_accepted_evidence_ids(
                             accepted_evidence_envelope_to_json_value(
                                 duplicate_envelope
                             )
-                        )
+                        ),
+                        "raw_tool_outcome": _raw_tool_outcome(second_event_id),
                     },
                 ),
             ).row.event_sequence
@@ -596,6 +658,60 @@ def test_compaction_request_evidence_inputs_deduplicate_accepted_evidence_ids(
             session_id=session_id,
             end_event_sequence=end_event_sequence,
         ) == ("evidence:event-tool-result-duplicate-first",)
+
+
+def test_compaction_request_evidence_inputs_collect_run_succeeded_raw_context(
+    tmp_path: Path,
+) -> None:
+    """RUN_SUCCEEDED assistant conclusion 进入 compact raw context。"""
+
+    session_id = "session-run-succeeded-raw-context"
+    with open_host_durable_store(_options(tmp_path)) as store:
+        event_log = EventLogStore()
+        event_id = "event-run-succeeded-summary"
+        end_event_sequence = _append_event_and_return_sequence(
+            store,
+            event_log,
+            event_id=event_id,
+            session_id=session_id,
+            event_type="RUN_SUCCEEDED",
+            payload={"final_answer": "本轮回答中的稳定结论摘要"},
+        )
+
+        def read_raw_context(
+            transaction: HostTransaction,
+        ) -> tuple[tuple[str, CompactRawContextKind, str, tuple[str, ...]], ...]:
+            """读取共享 helper 输出的 raw context 摘要。
+
+            :param transaction: Host transaction。
+            :returns: raw context 摘要 tuple。
+            """
+
+            inputs = collect_compaction_request_evidence_inputs(
+                transaction,
+                event_log,
+                session_id=session_id,
+                start_event_sequence=1,
+                end_event_sequence=end_event_sequence,
+            )
+            return tuple(
+                (
+                    item.event_ref,
+                    item.content_kind,
+                    item.content_text,
+                    item.accepted_evidence_refs,
+                )
+                for item in inputs.compact_raw_context_items
+            )
+
+        assert store.transaction_runner.run_read(read_raw_context) == (
+            (
+                event_id,
+                CompactRawContextKind.ASSISTANT_CONCLUSION,
+                "本轮回答中的稳定结论摘要",
+                (),
+            ),
+        )
 
 
 def test_compaction_request_evidence_inputs_use_stable_derived_fact_refs(
@@ -657,6 +773,14 @@ def _request() -> CompactionRequest:
             source_event_refs=("input-1",),
         ),
         accepted_evidence_envelopes=(_accepted_evidence_envelope(),),
+        compact_raw_context_items=(
+            CompactRawContextItem(
+                event_ref="event-tool-result-operation",
+                content_kind=CompactRawContextKind.ACCEPTED_TOOL_RESULT,
+                content_text="operation accepted evidence raw content",
+                accepted_evidence_refs=("evidence:accepted-operation",),
+            ),
+        ),
         evidence_backed_fact_refs=("fact-existing-1",),
         recent_raw_turn_refs=("input-1",),
         older_raw_turn_refs=("input-2",),
@@ -694,7 +818,6 @@ def _accepted_evidence_envelope() -> AcceptedEvidenceEnvelope:
             payload_digest=_DIGEST,
             outcome_digest=_DIGEST,
             truncation_applied=False,
-            result_preview="operation accepted evidence preview",
         ),
         source_refs=(),
         locator_refs=(),
@@ -725,11 +848,27 @@ def _accepted_evidence_envelope_for_event(
             payload_digest=_DIGEST,
             outcome_digest=_DIGEST,
             truncation_applied=False,
-            result_preview=f"accepted evidence preview for {event_id}",
         ),
         source_refs=(),
         locator_refs=(),
     )
+
+
+def _raw_tool_outcome(event_id: str) -> JsonValue:
+    """构造测试用 raw tool outcome。
+
+    :param event_id: 工具结果事件 id。
+    :returns: raw tool outcome JSON。
+    """
+
+    return {
+        "kind": "completed",
+        "result": {
+            "ok": True,
+            "value": {"event_id": event_id, "content": f"raw content {event_id}"},
+            "meta": None,
+        },
+    }
 
 
 def _append_event_and_return_sequence(

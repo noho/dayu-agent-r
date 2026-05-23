@@ -18,6 +18,8 @@ from dayu.engine.contracts.agent_run import (
 from dayu.engine.contracts.finish_reason import FinishReason
 from dayu.engine.contracts.runner_spec import RunnerCallOptions, RunnerSpec
 from dayu.host.compaction import (
+    CompactRawContextItem,
+    CompactRawContextKind,
     CompactionRequest,
     CurrentMessageSummary,
     MAX_EVIDENCE_BACKED_FACT_CLAIM_TEXT_CHARS,
@@ -82,10 +84,10 @@ async def test_llm_context_compactor_builds_tool_disabled_request(
 
 
 @pytest.mark.asyncio
-async def test_llm_context_compactor_prompt_contains_accepted_evidence_preview(
+async def test_llm_context_compactor_prompt_contains_raw_evidence_content(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """LLM compactor prompt 携带 accepted evidence envelope 的结果预览。"""
+    """LLM compactor prompt 使用 raw context 作为 evidence 内容。"""
 
     seen: list[AgentRunRequest] = []
 
@@ -114,7 +116,72 @@ async def test_llm_context_compactor_prompt_contains_accepted_evidence_preview(
     assert "outcome_digest:" in prompt
     assert "source_refs: none" in prompt
     assert "locator_refs: none" in prompt
+    assert "compact_raw_context:" in prompt
+    assert "content_kind: accepted_tool_result" in prompt
+    assert "accepted_evidence_refs: evidence:accepted-1" in prompt
     assert "Revenue grew 12% year over year." in prompt
+
+
+@pytest.mark.asyncio
+async def test_llm_context_compactor_prompt_keeps_long_raw_evidence_content(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """长 raw evidence 内容的末尾仍进入 compactor prompt。"""
+
+    long_prefix = "A" * 1300
+    tail_marker = "MD&A section says backlog conversion improved in Q4."
+    raw_content = f"{long_prefix}{tail_marker}"
+    seen: list[AgentRunRequest] = []
+
+    async def _fake_run(request: AgentRunRequest) -> AgentRunResult:
+        seen.append(request)
+        return _final(_proposal_json())
+
+    monkeypatch.setattr("dayu.host.llm_compaction.run_agent_and_wait", _fake_run)
+
+    await LLMContextCompactor(
+        runner_spec=_runner_spec(),
+        runner_options=_runner_options(),
+    ).compact(_request(raw_tool_content=raw_content), StubCancellationToken())
+
+    assert len(seen) == 1
+    prompt = seen[0].messages[1].content
+    assert prompt is not None
+    assert tail_marker in prompt
+
+
+@pytest.mark.asyncio
+async def test_llm_context_compactor_prompt_marks_raw_evidence_with_evidence_id(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """raw evidence 内容旁边标注 Host-minted evidence_id 供 LLM 引用。"""
+
+    seen: list[AgentRunRequest] = []
+
+    async def _fake_run(request: AgentRunRequest) -> AgentRunResult:
+        seen.append(request)
+        return _final(_proposal_json())
+
+    monkeypatch.setattr("dayu.host.llm_compaction.run_agent_and_wait", _fake_run)
+
+    await LLMContextCompactor(
+        runner_spec=_runner_spec(),
+        runner_options=_runner_options(),
+    ).compact(_request(), StubCancellationToken())
+
+    assert len(seen) == 1
+    prompt = seen[0].messages[1].content
+    assert prompt is not None
+    raw_context_index = prompt.index("compact_raw_context:")
+    evidence_ref_index = prompt.index(
+        "accepted_evidence_refs: evidence:accepted-1",
+        raw_context_index,
+    )
+    raw_content_index = prompt.index(
+        "Revenue grew 12% year over year.",
+        raw_context_index,
+    )
+    assert raw_context_index < evidence_ref_index < raw_content_index
 
 
 @pytest.mark.asyncio
@@ -509,9 +576,13 @@ def _fake_run_factory(
     return _fake_run
 
 
-def _request() -> CompactionRequest:
+def _request(
+    *,
+    raw_tool_content: str = "Revenue grew 12% year over year.",
+) -> CompactionRequest:
     """构造 compaction request。
 
+    :param raw_tool_content: accepted 工具结果 raw 内容。
     :returns: CompactionRequest。
     """
 
@@ -529,6 +600,14 @@ def _request() -> CompactionRequest:
             source_event_refs=("input-1",),
         ),
         accepted_evidence_envelopes=(_accepted_evidence_envelope(),),
+        compact_raw_context_items=(
+            CompactRawContextItem(
+                event_ref="event-tool-result-1",
+                content_kind=CompactRawContextKind.ACCEPTED_TOOL_RESULT,
+                content_text=raw_tool_content,
+                accepted_evidence_refs=("evidence:accepted-1",),
+            ),
+        ),
         evidence_backed_fact_refs=("fact-1",),
         recent_raw_turn_refs=("input-1",),
         older_raw_turn_refs=("input-2",),
@@ -648,10 +727,6 @@ def _accepted_evidence_envelope() -> AcceptedEvidenceEnvelope:
             payload_digest=_DIGEST,
             outcome_digest=_DIGEST,
             truncation_applied=False,
-            result_preview=(
-                '{"status":"completed","value":{"metric":"revenue",'
-                '"value":"Revenue grew 12% year over year."}}'
-            ),
         ),
         source_refs=(),
         locator_refs=(),

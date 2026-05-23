@@ -224,10 +224,10 @@ Phase Map 中每个 phase 必须使用统一条目格式。模板如下：
 
 当前 work unit：Phase 12.5 Conversation Memory Optimization。
 当前状态：P12 已完成；PR 67 已 draft-PR-pass 并由用户 merge。
-当前 gate：P12.5 draft PR gate PASS；draft-PR-pass。
-下一步：等待用户对 PR 68 的后续指令；若需要将 draft PR 标记 ready for review 或处理 GitHub review / CI，再按 `$phaseflow` / `$init-agents` 继续。
+当前 gate：P12.5 PR 68 post-draft raw evidence compaction fix accepted；draft-PR-pass。
+下一步：commit / push 当前 accepted fix 到 PR 68 分支；除 CI / review feedback 外，P12.5 无新的 blocking work。
 
-当前 gate 结论：P12.5 implementation Slice 1-7、aggregate deepreview、targeted repair、aggregate re-review、PR 68 draft review 与 post-draft cancellation hardening fix 均已 PASS。`evidence_backed_facts` 现在基于 accepted evidence envelope 的 bounded `result_preview` 进入 LLM compact extraction；ToolRuntime accepted result 不直接物化 stable fact；accepted `CONTEXT_COMPACTED.evidence_backed_fact_candidates` 才进入 memory projection；dispatch memory projection lag 走 rebuild / retry，不触发 Run / Attempt 终态迁移。生产代码不再允许 compactor 自行构造不可取消 token，compaction LLM call 必须接收 Host lifecycle cancellation token。剩余风险为 compactor prompt aggregate envelope budget、复杂工具结果 preview 质量与大 session rebuild performance。
+当前 gate 结论：P12.5 implementation Slice 1-7、aggregate deepreview、targeted repair、aggregate re-review、PR 68 draft review、post-draft cancellation hardening fix 与 post-draft raw evidence compaction fix 均已 PASS。用户指出 bounded `result_preview` 作为 evidence-backed fact extraction primary input 会丢失长章节 evidence 内容，controller 裁决该问题影响 P12.5 success signal，不能作为 residual 留存。最终设计裁决：删除 `result_preview` 概念；`evidence_backed_facts` 必须基于 compact range raw tool result / raw transcript 生成 claim，Host-minted `evidence_id` 只作为标注到 raw evidence 旁边的 provenance anchor。ToolRuntime accepted result 不直接物化 stable fact；accepted `CONTEXT_COMPACTED.evidence_backed_fact_candidates` 才进入 memory projection；dispatch memory projection lag 走 rebuild / retry，不触发 Run / Attempt 终态迁移。生产代码不再允许 compactor 自行构造不可取消 token，compaction LLM call 必须接收 Host lifecycle cancellation token。剩余风险为 raw evidence aggregate prompt budget 与大 session rebuild performance。
 
 ## Phase Map
 
@@ -1680,8 +1680,8 @@ Plan 必须额外收口的 readiness review checklist：
   `docs/reviews/phase12-5-aggregate-deepreview-mimo-20260523.md`；DS NOT ready，artifact 为
   `docs/reviews/phase12-5-aggregate-deepreview-ds-20260522.md`，阻断项为 LLM compactor 未接收 evidence 内容、projection lag
   误杀 Run、FakeCompactor false positive、catch-up failure 静默忽略与 `EvidenceBackedFactView.claim_text` 长度防线缺失。
-  Targeted aggregate repair 已完成：accepted evidence envelope 增加 bounded `result_preview`；ToolRuntime 从 accepted outcome
-  派生 preview；LLM compaction prompt 展开 envelope / preview；FakeContextCompactor 消费 envelope；dispatch 对 catch-up
+  Targeted aggregate repair 已完成（该证据输入方案后续已被 post-draft raw evidence compaction fix 取代）；
+  dispatch 对 catch-up
   failure 与 `SNAPSHOT_LAG_OVER_THRESHOLD` 执行 rebuild / retry 且不 terminal closeout；`EvidenceBackedFactView` 增加
   claim_text 长度校验；`docs/host/design.md`、`dayu/host/README.md`、`tests/README.md` 已同步。Aggregate re-review PASS；
   artifacts 为 `docs/reviews/phase12-5-aggregate-rereview-mimo-20260523.md`、
@@ -1694,13 +1694,28 @@ Plan 必须额外收口的 readiness review checklist：
   为 `docs/reviews/pr-68-review-20260523-024713.md`、
   `docs/reviews/pr-68-review-ds-20260523.md`、
   `docs/reviews/pr-68-review-controller-adjudication-20260523.md`。PR-level review PASS；DS 中等严重度 finding
-  `compactor prompt accepted evidence envelopes aggregate token guard` 裁决为 prompt-budget hardening residual，因为每个
-  `result_preview` 已有硬上限且 evidence-content correctness blocker 已关闭。P12.5 draft PR gate PASS；draft-PR-pass。
+  `compactor prompt accepted evidence envelopes aggregate token guard` 后续并入 raw evidence prompt budget residual。
+  P12.5 draft PR gate PASS；draft-PR-pass。
   Post-draft cancellation hardening：用户指出 compaction LLM call 不能接 `_NeverCancelledToken`，controller 裁决该动机成立。
   当前 PR fix 删除生产 `_NeverCancelledToken`，把 `CancellationToken` 显式贯穿 `ContextCompactor.compact(...)` 与
   `run_compaction_operation(...)`；proactive compaction 使用 durable Run 状态观察 token，reactive compaction 复用 Engine envelope
   token。Validation：`pytest tests/host/test_llm_compaction.py tests/host/test_compaction_contract.py tests/host/test_compaction_operation.py tests/host/test_compact_artifact_store.py tests/host/test_dispatch_scheduler.py tests/host/test_engine_ingest_mapping.py tests/host/test_toolruntime_executor.py tests/host/test_toolruntime_diagnostics.py tests/host/test_toolruntime_truncation_fetch_more.py tests/host/test_toolruntime_duplicate_governance.py tests/host/test_phase5_local_execution_integration.py tests/host/test_phase6_toolruntime_integration.py tests/host/test_phase7_waiting_integration.py tests/host/test_local_proxy_engine_ingest.py tests/host/test_recovery_dispatch.py tests/host/test_run_input_builder.py tests/host/test_resolve_wait_command.py tests/host/test_logging.py -q` PASS
   (273 passed)；`python -m pyright dayu tests` PASS (0 errors)；`git diff --check` PASS。PR 68 回到 draft-PR-pass。
+  Post-draft raw evidence compaction fix：用户指出 `result_preview` 作为 extraction primary input 会丢失“管理层讨论与分析”
+  等长章节内容，controller 裁决该问题成立。设计真源已改为：Host 在 `TOOL_RESULT_ACCEPTED` 生成 canonical `evidence_id`；
+  compactor input 必须使用 compact range raw tool result / raw transcript 作为事实抽取材料，并把 evidence id 标注到对应 raw 内容旁边；
+  `result_preview` 概念必须删除。Implementation fix 已删除 active `result_preview` contract，新增 `CompactRawContextItem`
+  / `compact_raw_context_items`，ToolRuntime 在 `TOOL_RESULT_ACCEPTED` 写入完整 `raw_tool_outcome`，compaction evidence helper
+  从 compact input range 收集 tool result / user input / assistant conclusion raw context，LLM compactor prompt 使用
+  `compact_raw_context` 与 Host-minted evidence refs。Review artifacts 为
+  `docs/reviews/pr-68-postdraft-raw-evidence-review-mimo-20260523.md`、
+  `docs/reviews/pr-68-postdraft-raw-evidence-review-ds-20260523.md`、
+  `docs/reviews/pr-68-postdraft-raw-evidence-controller-adjudication-20260523.md`。MiMo PASS no findings；DS PASS，F3
+  / F4 覆盖缺口已在本 gate 补测试，F1 raw evidence aggregate prompt budget 作为 production hardening residual，F2 多 evidence
+  id item-level 标注与 F5 EventLog 顺序显式化均不阻塞当前 V1。Validation：
+  `pytest tests/host/test_compaction_operation.py -q` PASS (18 passed)；
+  `pytest tests/host/test_llm_compaction.py tests/host/test_compaction_contract.py tests/host/test_compaction_operation.py tests/host/test_compact_artifact_store.py tests/host/test_toolruntime_accept_barrier.py tests/host/test_toolruntime_executor.py tests/host/test_dispatch_scheduler.py tests/host/test_engine_ingest_mapping.py tests/host/test_memory_projection.py tests/host/test_run_input_builder.py -q`
+  PASS (262 passed)；`pyright dayu tests` PASS (0 errors)；`git diff --check` PASS。当前 gate 回到 draft-PR-pass。
 
 目标：
 - 从买方财报分析 Agent 的第一性原理优化 Conversation Memory，使同一 session 内已由工具确认的关键财务事实能跨轮、
@@ -2045,6 +2060,7 @@ Owner / destination：Phase 15 Retention / Purge / Production Hardening，或在
 - `purge_session` destructive cleanup、audit tombstone、payload / memory / projection / outbox / tool trace 清理、projection rebuild tooling 与 retention matrix。
 - startup / recovery / crash E2E 压测、watch 轮询性能、SQLite 多进程写入压力、schema bootstrap / DDL 原子性、after-commit 多错误聚合、projection catch-up 批处理与 heavy sink runner。
 - Context Governance production hardening：真实异步 / production LLM compactor adapter、provider-specific tokenizer / sizing、compact failure 用户可见策略矩阵、proactive / reactive compact failure E2E。
+- Context Governance raw evidence prompt hardening：compact raw context aggregate token / prompt budget guard，避免大量完整工具结果在一次 compaction proposal prompt 中超过 provider context window。
 - runtime lane production hardening：close/acquire race、stale claim cleanup 压测、heartbeat / TTL 配置校验、runtime log import side effect。
 - contracts strict validation、redaction / sensitive error taxonomy、README/docs correctness cleanup。
 

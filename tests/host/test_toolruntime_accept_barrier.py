@@ -8,6 +8,7 @@ from pathlib import Path
 
 import pytest
 
+from dayu.contracts.json_value import JsonValue
 from dayu.host.api import EnsureSessionRequest
 from dayu.host._event_payload import payload_object
 from dayu.host.durable.codec import sha256_digest_json
@@ -195,9 +196,9 @@ def test_tool_result_accepted_payload_carries_accepted_evidence_envelope(
         assert envelope.result_ref.payload_digest == candidate.payload_digest
         assert envelope.result_ref.outcome_digest == candidate.outcome_digest
         assert envelope.result_ref.truncation_applied is False
-        assert envelope.result_ref.result_preview == candidate.result_preview
         assert envelope.source_refs == ()
         assert envelope.locator_refs == ()
+        assert payload["raw_tool_outcome"] == candidate.raw_tool_outcome
 
 
 def test_accepted_evidence_envelope_codec_rejects_partial_object() -> None:
@@ -661,7 +662,7 @@ def _completed_candidate(
         payload_digest=sha256_digest_json({"payload": tool_call_id}),
         payload_ref=None,
         truncation=None,
-        result_preview=f"lookup result preview {tool_call_id}",
+        raw_tool_outcome=_raw_tool_outcome(tool_call_id),
         duplicate_key=None,
         duplicate_decision=None,
         reuse_prior_event_refs=(),
@@ -704,7 +705,7 @@ def _reuse_candidate(
         payload_digest=None,
         payload_ref=None,
         truncation=None,
-        result_preview=None,
+        raw_tool_outcome=None,
         duplicate_key="duplicate-lookup-MSFT",
         duplicate_decision=DuplicateDecisionKind.REUSE,
         reuse_prior_event_refs=(prior_ref,),
@@ -752,7 +753,7 @@ def _fact_kind_candidate(
         payload_digest=None,
         payload_ref=None,
         truncation=None,
-        result_preview=f"lookup result preview {tool_call_id}",
+        raw_tool_outcome=_raw_tool_outcome(tool_call_id),
         duplicate_key=None,
         duplicate_decision=None,
         reuse_prior_event_refs=(),
@@ -766,6 +767,23 @@ def _fact_kind_candidate(
         accept_idempotency_key=f"accept-{tool_call_id}",
         semantic_input_digest=sha256_digest_json({"semantic": tool_call_id}),
     )
+
+
+def _raw_tool_outcome(tool_call_id: str) -> JsonValue:
+    """构造测试用 raw tool outcome。
+
+    :param tool_call_id: 工具调用 id。
+    :returns: raw outcome JSON。
+    """
+
+    return {
+        "kind": "completed",
+        "result": {
+            "ok": True,
+            "value": {"tool_call_id": tool_call_id},
+            "meta": None,
+        },
+    }
 
 
 def _tool_events(transaction_runner: HostTransactionRunner) -> tuple[EventLogRow, ...]:

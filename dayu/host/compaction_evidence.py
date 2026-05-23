@@ -12,7 +12,9 @@ from collections.abc import Mapping
 from dataclasses import dataclass
 
 from dayu.contracts.json_value import JsonValue
+from dayu.host.compaction import CompactRawContextItem, CompactRawContextKind
 from dayu.host.context_events import CONTEXT_COMPACTED
+from dayu.host.durable.codec import canonical_json_dumps
 from dayu.host.durable.errors import HostDurableError
 from dayu.host.durable.event_log import EventClass, EventLogRow, EventLogStore
 from dayu.host.durable.transaction import HostTransaction
@@ -21,13 +23,21 @@ from dayu.host.evidence import (
     accepted_evidence_envelope_from_json_value,
 )
 from dayu.host.payload_resolution import event_payload_object
+from dayu.host.terminal_summary_payload import (
+    PayloadSummaryTextPolicy,
+    assistant_summary_from_payload,
+)
 
 _EVENT_TYPE_TOOL_RESULT_ACCEPTED = "TOOL_RESULT_ACCEPTED"
+_EVENT_TYPE_USER_INPUT_ACCEPTED = "USER_INPUT_ACCEPTED"
+_EVENT_TYPE_RUN_SUCCEEDED = "RUN_SUCCEEDED"
 _PAYLOAD_FIELD_ACCEPTED_EVIDENCE_ENVELOPE = "accepted_evidence_envelope"
 _PAYLOAD_FIELD_EVIDENCE_BACKED_FACT_CANDIDATES = "evidence_backed_fact_candidates"
 _PAYLOAD_FIELD_PRESERVED_FACT_REFS = "preserved_fact_refs"
 _PAYLOAD_FIELD_EVIDENCE_BACKED_FACT_REFS = "evidence_backed_fact_refs"
 _PAYLOAD_FIELD_CANDIDATE_ID = "candidate_id"
+_PAYLOAD_FIELD_DISPLAY_TEXT = "display_text"
+_PAYLOAD_FIELD_RAW_TOOL_OUTCOME = "raw_tool_outcome"
 _MEMORY_ITEM_EVIDENCE_BACKED_FACT_PREFIX = "memory-item:evidence_backed_fact"
 
 
@@ -36,10 +46,12 @@ class CompactionRequestEvidenceInputs:
     """Compaction request 的 evidence 输入视图。
 
     :param accepted_evidence_envelopes: compact input range 内 accepted evidence 信封。
+    :param compact_raw_context_items: compact input range 内 raw transcript 内容。
     :param evidence_backed_fact_refs: compact input range 内既有 stable fact refs。
     """
 
     accepted_evidence_envelopes: tuple[AcceptedEvidenceEnvelope, ...]
+    compact_raw_context_items: tuple[CompactRawContextItem, ...]
     evidence_backed_fact_refs: tuple[str, ...]
 
 
@@ -72,6 +84,7 @@ def collect_compaction_request_evidence_inputs(
         limit=end_event_sequence - start_event_sequence + 1,
     )
     accepted_evidence: list[AcceptedEvidenceEnvelope] = []
+    raw_context_items: list[CompactRawContextItem] = []
     evidence_backed_fact_refs: list[str] = []
     for row in rows:
         if row.event_sequence > end_event_sequence:
@@ -81,15 +94,22 @@ def collect_compaction_request_evidence_inputs(
         if row.event_class is not EventClass.CANONICAL_FACT:
             continue
         if row.event_type == _EVENT_TYPE_TOOL_RESULT_ACCEPTED:
-            accepted_evidence.extend(
-                _accepted_evidence_envelope_from_event(transaction, row)
+            envelopes = _accepted_evidence_envelope_from_event(transaction, row)
+            accepted_evidence.extend(envelopes)
+            raw_context_items.extend(
+                _tool_result_raw_context_items(transaction, row, envelopes)
             )
         elif row.event_type == CONTEXT_COMPACTED:
             evidence_backed_fact_refs.extend(
                 _evidence_backed_fact_refs_from_compacted_event(transaction, row)
             )
+        elif row.event_type == _EVENT_TYPE_USER_INPUT_ACCEPTED:
+            raw_context_items.extend(_user_input_raw_context_items(transaction, row))
+        elif row.event_type == _EVENT_TYPE_RUN_SUCCEEDED:
+            raw_context_items.extend(_assistant_raw_context_items(transaction, row))
     return CompactionRequestEvidenceInputs(
         accepted_evidence_envelopes=_deduplicate_accepted_evidence(accepted_evidence),
+        compact_raw_context_items=tuple(raw_context_items),
         evidence_backed_fact_refs=_deduplicate_texts(evidence_backed_fact_refs),
     )
 
@@ -120,6 +140,103 @@ def _accepted_evidence_envelope_from_event(
     if envelope.producer_event_ref != row.event_id:
         raise HostDurableError("accepted evidence producer_event_ref mismatch")
     return (envelope,)
+
+
+def _tool_result_raw_context_items(
+    transaction: HostTransaction,
+    row: EventLogRow,
+    envelopes: tuple[AcceptedEvidenceEnvelope, ...],
+) -> tuple[CompactRawContextItem, ...]:
+    """读取 ``TOOL_RESULT_ACCEPTED`` raw 工具结果上下文。
+
+    :param transaction: 当前 Host transaction。
+    :param row: TOOL_RESULT_ACCEPTED EventLog row。
+    :param envelopes: 该事件携带的 accepted evidence envelopes。
+    :returns: raw context item tuple；无 evidence envelope 时为空。
+    :raises HostDurableError: raw 工具结果缺失或结构非法时抛出。
+    """
+
+    if len(envelopes) == 0:
+        return ()
+    payload = event_payload_object(
+        transaction,
+        row,
+        payload_label=_EVENT_TYPE_TOOL_RESULT_ACCEPTED,
+    )
+    raw_outcome = payload.get(_PAYLOAD_FIELD_RAW_TOOL_OUTCOME)
+    if raw_outcome is None:
+        raise HostDurableError("TOOL_RESULT_ACCEPTED raw_tool_outcome is missing")
+    return (
+        CompactRawContextItem(
+            event_ref=row.event_id,
+            content_kind=CompactRawContextKind.ACCEPTED_TOOL_RESULT,
+            content_text=canonical_json_dumps(raw_outcome),
+            accepted_evidence_refs=tuple(
+                envelope.evidence_id for envelope in envelopes
+            ),
+        ),
+    )
+
+
+def _user_input_raw_context_items(
+    transaction: HostTransaction, row: EventLogRow
+) -> tuple[CompactRawContextItem, ...]:
+    """读取 ``USER_INPUT_ACCEPTED`` raw 用户输入上下文。
+
+    :param transaction: 当前 Host transaction。
+    :param row: USER_INPUT_ACCEPTED EventLog row。
+    :returns: raw context item tuple。
+    :raises HostDurableError: display_text 缺失或非法时抛出。
+    """
+
+    payload = event_payload_object(
+        transaction,
+        row,
+        payload_label=_EVENT_TYPE_USER_INPUT_ACCEPTED,
+    )
+    display_text = payload.get(_PAYLOAD_FIELD_DISPLAY_TEXT)
+    if not isinstance(display_text, str) or display_text.strip() == "":
+        raise HostDurableError("USER_INPUT_ACCEPTED display_text is invalid")
+    return (
+        CompactRawContextItem(
+            event_ref=row.event_id,
+            content_kind=CompactRawContextKind.USER_INPUT,
+            content_text=display_text,
+            accepted_evidence_refs=(),
+        ),
+    )
+
+
+def _assistant_raw_context_items(
+    transaction: HostTransaction, row: EventLogRow
+) -> tuple[CompactRawContextItem, ...]:
+    """读取 ``RUN_SUCCEEDED`` assistant conclusion raw 上下文。
+
+    :param transaction: 当前 Host transaction。
+    :param row: RUN_SUCCEEDED EventLog row。
+    :returns: raw context item tuple；无可显示摘要时为空。
+    :raises HostDurableError: strict 文本字段非法时抛出。
+    """
+
+    payload = event_payload_object(
+        transaction,
+        row,
+        payload_label=_EVENT_TYPE_RUN_SUCCEEDED,
+    )
+    summary = assistant_summary_from_payload(
+        payload,
+        text_policy=PayloadSummaryTextPolicy.STRICT_NON_EMPTY,
+    )
+    if summary is None:
+        return ()
+    return (
+        CompactRawContextItem(
+            event_ref=row.event_id,
+            content_kind=CompactRawContextKind.ASSISTANT_CONCLUSION,
+            content_text=summary,
+            accepted_evidence_refs=(),
+        ),
+    )
 
 
 def _evidence_backed_fact_refs_from_compacted_event(

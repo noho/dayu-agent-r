@@ -94,7 +94,6 @@ from dayu.host.evidence import (
     AcceptedEvidenceEnvelope,
     AcceptedEvidenceResultRef,
     AcceptedEvidenceToolQuery,
-    MAX_ACCEPTED_EVIDENCE_RESULT_PREVIEW_CHARS,
     accepted_evidence_envelope_to_json_value,
     derive_accepted_evidence_id,
 )
@@ -158,6 +157,7 @@ _EVENT_TYPE_TOOL_CALL_REQUESTED = "TOOL_CALL_REQUESTED"
 _EVENT_TYPE_TOOL_CALL_GOVERNED = "TOOL_CALL_GOVERNED"
 _EVENT_TYPE_TOOL_RESULT_ACCEPTED = "TOOL_RESULT_ACCEPTED"
 _PAYLOAD_FIELD_ACCEPTED_EVIDENCE_ENVELOPE = "accepted_evidence_envelope"
+_PAYLOAD_FIELD_RAW_TOOL_OUTCOME = "raw_tool_outcome"
 _TOOL_ACCEPT_EVENT_ACTOR = "host.tool_runtime"
 _TOOL_ACCEPT_EVENT_SOURCE = "host.tool_runtime.accept"
 _MIN_ACCEPT_RETRY_ATTEMPTS = 1
@@ -218,7 +218,6 @@ _DEFAULT_TEXT_CHARS_TRUNCATION_LIMIT = 4096
 _DEFAULT_TEXT_LINES_TRUNCATION_LIMIT = 200
 _DEFAULT_LIST_ITEMS_TRUNCATION_LIMIT = 100
 _DEFAULT_BINARY_BYTES_TRUNCATION_LIMIT = 4096
-_TRUNCATED_PREVIEW_SUFFIX = "...[truncated]"
 _DEFAULT_TRUNCATION_LIMITS_BY_STRATEGY: Mapping[ToolTruncationStrategy, int] = {
     ToolTruncationStrategy.TEXT_CHARS: _DEFAULT_TEXT_CHARS_TRUNCATION_LIMIT,
     ToolTruncationStrategy.TEXT_LINES: _DEFAULT_TEXT_LINES_TRUNCATION_LIMIT,
@@ -389,7 +388,7 @@ class ToolFactAcceptCandidate:
     :param payload_digest: result payload digest；无 result payload 时为 ``None``。
     :param payload_ref: result payload descriptor 引用。
     :param truncation: 截断事实；无截断时为 ``None``。
-    :param result_preview: 从 accepted outcome 派生的有界结果预览。
+    :param raw_tool_outcome: Host accepted 后写入 raw transcript 的工具 outcome。
     :param duplicate_key: run-local duplicate key。
     :param duplicate_decision: duplicate governance 决策。
     :param reuse_prior_event_refs: reuse 指向的既有 accepted event refs。
@@ -415,7 +414,7 @@ class ToolFactAcceptCandidate:
     payload_digest: str | None
     payload_ref: HostPayloadRef | None
     truncation: ToolTruncationFact | None
-    result_preview: str | None
+    raw_tool_outcome: JsonValue | None
     duplicate_key: str | None
     duplicate_decision: DuplicateDecisionKind | None
     reuse_prior_event_refs: tuple[HostEventRef, ...]
@@ -436,16 +435,19 @@ class ToolFactAcceptCandidate:
         _validate_duplicate_fields(self)
         if self.tool_fact_kind is ToolFactKind.COMPLETED:
             _validate_result_fact_policy(self)
+            _require_raw_tool_outcome(self)
             _require_sha256_digest(self.outcome_digest, field_name="outcome_digest")
             _require_sha256_digest(self.payload_digest, field_name="payload_digest")
         elif self.tool_fact_kind in (ToolFactKind.FAILED, ToolFactKind.CANCELLED):
             _validate_result_fact_policy(self)
+            _require_raw_tool_outcome(self)
             _require_sha256_digest(self.outcome_digest, field_name="outcome_digest")
             if self.reuse_prior_event_refs:
                 raise ValueError(
                     f"{self.tool_fact_kind.value} must not carry prior reuse refs"
                 )
         elif self.tool_fact_kind is ToolFactKind.GOVERNED_ERROR:
+            _require_raw_tool_outcome(self)
             _require_sha256_digest(self.outcome_digest, field_name="outcome_digest")
             _validate_governed_error_candidate(self)
         elif self.tool_fact_kind is ToolFactKind.REUSE:
@@ -3526,6 +3528,7 @@ def _append_tool_result_if_needed(
                 ),
                 "accept_idempotency_key": candidate.accept_idempotency_key,
                 "semantic_input_digest": candidate.semantic_input_digest,
+                _PAYLOAD_FIELD_RAW_TOOL_OUTCOME: candidate.raw_tool_outcome,
                 _PAYLOAD_FIELD_ACCEPTED_EVIDENCE_ENVELOPE: (
                     accepted_evidence_envelope_to_json_value(
                         accepted_evidence_envelope
@@ -3575,7 +3578,6 @@ def _accepted_evidence_envelope(
                 if candidate.truncation is not None
                 else False
             ),
-            result_preview=candidate.result_preview,
         ),
         source_refs=(),
         locator_refs=(),
@@ -3939,11 +3941,6 @@ def _validate_common_candidate_fields(candidate: ToolFactAcceptCandidate) -> Non
     _require_optional_non_empty_text(
         candidate.tool_idempotency_key, field_name="tool_idempotency_key"
     )
-    _require_optional_bounded_non_empty_text(
-        candidate.result_preview,
-        field_name="result_preview",
-        max_chars=MAX_ACCEPTED_EVIDENCE_RESULT_PREVIEW_CHARS,
-    )
     if not isinstance(candidate.policy_decision, ToolPolicyDecision):
         raise ValueError("policy_decision must be ToolPolicyDecision")
     _validate_policy_decision_fields(candidate.policy_decision)
@@ -4091,6 +4088,20 @@ def _validate_reuse_candidate(candidate: ToolFactAcceptCandidate) -> None:
         raise ValueError("reuse requires prior event refs")
     if candidate.payload_ref is not None or candidate.payload_digest is not None:
         raise ValueError("reuse must not carry new result payload")
+    if candidate.raw_tool_outcome is not None:
+        raise ValueError("reuse must not carry raw_tool_outcome")
+
+
+def _require_raw_tool_outcome(candidate: ToolFactAcceptCandidate) -> None:
+    """校验非 reuse 工具事实携带 raw 工具 outcome。
+
+    :param candidate: 工具事实候选。
+    :returns: ``None``。
+    :raises ValueError: raw 工具 outcome 缺失时抛出。
+    """
+
+    if candidate.raw_tool_outcome is None:
+        raise ValueError(f"{candidate.tool_fact_kind.value} requires raw_tool_outcome")
 
 
 def _require_non_empty_text(value: str, *, field_name: str) -> None:
@@ -4119,25 +4130,6 @@ def _require_optional_non_empty_text(
 
     if value is not None and value.strip() == "":
         raise ValueError(f"{field_name} must be non-empty when provided")
-
-
-def _require_optional_bounded_non_empty_text(
-    value: str | None, *, field_name: str, max_chars: int
-) -> None:
-    """校验 optional 文本不为空白且不超过长度上限。
-
-    :param value: 待校验文本；无值时为 ``None``。
-    :param field_name: 字段名。
-    :param max_chars: 最大允许字符数。
-    :returns: ``None``。
-    :raises ValueError: 文本为空白或超过上限时抛出。
-    """
-
-    if value is None:
-        return
-    _require_optional_non_empty_text(value, field_name=field_name)
-    if len(value) > max_chars:
-        raise ValueError(f"{field_name} exceeds maximum length")
 
 
 def _require_sha256_digest(value: str | None, *, field_name: str) -> None:
@@ -4785,7 +4777,7 @@ def _tool_fact_accept_candidate(
         payload_digest=payload_digest,
         payload_ref=None,
         truncation=truncation_fact,
-        result_preview=_accepted_tool_outcome_preview(outcome),
+        raw_tool_outcome=_tool_outcome_json(outcome),
         duplicate_key=duplicate_decision.duplicate_key,
         duplicate_decision=duplicate_decision.kind,
         reuse_prior_event_refs=(
@@ -4874,7 +4866,7 @@ def _tool_fact_reuse_accept_candidate(
         payload_digest=None,
         payload_ref=None,
         truncation=None,
-        result_preview=None,
+        raw_tool_outcome=None,
         duplicate_key=duplicate_decision.duplicate_key,
         duplicate_decision=duplicate_decision.kind,
         reuse_prior_event_refs=duplicate_decision.prior_event_refs,
@@ -5020,23 +5012,6 @@ def _tool_outcome_digest(outcome: ToolExecutionOutcome) -> str:
     """
 
     return sha256_digest_json(_tool_outcome_json(outcome))
-
-
-def _accepted_tool_outcome_preview(outcome: ToolExecutionOutcome) -> str:
-    """从 accepted 工具 outcome 派生可进入证据信封的有界预览。
-
-    :param outcome: 已被 Host accept 的工具 outcome。
-    :returns: canonical JSON 预览文本。
-    """
-
-    preview = canonical_json_dumps(_tool_outcome_json(outcome))
-    if len(preview) <= MAX_ACCEPTED_EVIDENCE_RESULT_PREVIEW_CHARS:
-        return preview
-    visible_chars = (
-        MAX_ACCEPTED_EVIDENCE_RESULT_PREVIEW_CHARS
-        - len(_TRUNCATED_PREVIEW_SUFFIX)
-    )
-    return preview[:visible_chars] + _TRUNCATED_PREVIEW_SUFFIX
 
 
 def _tool_outcome_inline_size_bytes(outcome: ToolExecutionOutcome) -> int:

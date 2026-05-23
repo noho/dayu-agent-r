@@ -11,6 +11,8 @@ from dayu.host.compaction import (
     CompactInputRange,
     CompactQualityCheckResult,
     CompactQualityIssue,
+    CompactRawContextItem,
+    CompactRawContextKind,
     CompactionRequest,
     CurrentMessageSummary,
     EvidenceBackedFactCandidate,
@@ -88,8 +90,8 @@ async def test_fact_candidates_can_reference_accepted_evidence_envelopes() -> No
     assert tuple(
         fact.claim_text for fact in candidate.evidence_backed_fact_candidates
     ) == (
-        "Accepted evidence preview: accepted evidence preview accepted-1",
-        "Accepted evidence preview: accepted evidence preview accepted-2",
+        "Accepted evidence raw content: accepted evidence raw content accepted-1",
+        "Accepted evidence raw content: accepted evidence raw content accepted-2",
     )
 
 
@@ -610,6 +612,20 @@ def _request(
             _accepted_evidence_envelope("accepted-1"),
             _accepted_evidence_envelope("accepted-2"),
         ),
+        compact_raw_context_items=(
+            CompactRawContextItem(
+                event_ref="event-tool-result-accepted-1",
+                content_kind=CompactRawContextKind.ACCEPTED_TOOL_RESULT,
+                content_text="accepted evidence raw content accepted-1",
+                accepted_evidence_refs=("evidence:accepted-1",),
+            ),
+            CompactRawContextItem(
+                event_ref="event-tool-result-accepted-2",
+                content_kind=CompactRawContextKind.ACCEPTED_TOOL_RESULT,
+                content_text="accepted evidence raw content accepted-2",
+                accepted_evidence_refs=("evidence:accepted-2",),
+            ),
+        ),
         evidence_backed_fact_refs=("fact-existing-1",),
         recent_raw_turn_refs=("event-current",),
         older_raw_turn_refs=("event-old",),
@@ -656,7 +672,6 @@ def _accepted_evidence_envelope(suffix: str) -> AcceptedEvidenceEnvelope:
                 "sha256:dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd"
             ),
             truncation_applied=False,
-            result_preview=f"accepted evidence preview {suffix}",
         ),
         source_refs=(),
         locator_refs=(),

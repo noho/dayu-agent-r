@@ -15,6 +15,8 @@ from dayu.host.compact_artifact import (
 from dayu.host.compaction import (
     CompactQualityIssue,
     CompactQualityCheckResult,
+    CompactRawContextItem,
+    CompactRawContextKind,
     CompactionCandidate,
     CompactionRequest,
     CurrentMessageSummary,
@@ -302,6 +304,20 @@ def _request() -> CompactionRequest:
             _accepted_evidence_envelope("accepted-1"),
             _accepted_evidence_envelope("accepted-2"),
         ),
+        compact_raw_context_items=(
+            CompactRawContextItem(
+                event_ref="event-tool-result-accepted-1",
+                content_kind=CompactRawContextKind.ACCEPTED_TOOL_RESULT,
+                content_text="accepted evidence raw content accepted-1",
+                accepted_evidence_refs=("evidence:accepted-1",),
+            ),
+            CompactRawContextItem(
+                event_ref="event-tool-result-accepted-2",
+                content_kind=CompactRawContextKind.ACCEPTED_TOOL_RESULT,
+                content_text="accepted evidence raw content accepted-2",
+                accepted_evidence_refs=("evidence:accepted-2",),
+            ),
+        ),
         evidence_backed_fact_refs=("fact-existing-1",),
         recent_raw_turn_refs=("event-current",),
         older_raw_turn_refs=("event-old",),
@@ -348,7 +364,6 @@ def _accepted_evidence_envelope(suffix: str) -> AcceptedEvidenceEnvelope:
                 "sha256:dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd"
             ),
             truncation_applied=False,
-            result_preview=f"accepted evidence preview {suffix}",
         ),
         source_refs=(),
         locator_refs=(),

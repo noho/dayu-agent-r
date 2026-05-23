@@ -300,6 +300,9 @@ def _input_snapshot_refs_json(request: CompactionRequest) -> JsonValue:
             accepted_evidence_envelope_to_json_value(envelope)
             for envelope in request.accepted_evidence_envelopes
         ],
+        "compact_raw_context_items": [
+            item.to_json() for item in request.compact_raw_context_items
+        ],
         "evidence_backed_fact_refs": _string_list_json(
             request.evidence_backed_fact_refs
         ),

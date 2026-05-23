@@ -2553,10 +2553,13 @@ opaque attributes。`evidence_refs` 指向 accepted evidence envelope；第一�
 `evidence_id`，多个 facts 可以引用同一个 `evidence_id`。更细粒度 item-level evidence id 可后续扩展，但不得要求 Host
 理解 URL、年报章节、chunk、span、row、cell 或其它 locator。
 
-Accepted evidence envelope 至少记录 evidence id、producer event ref、tool name、tool query、bounded `result_preview`、
-payload ref / digest、outcome digest 与 opaque source / locator descriptor。`result_preview` 是 Host 从 accepted tool
-outcome 派生的有界 canonical preview，用于让 LLM extractor 看到证据内容；它不是业务 schema，不能要求 Host 理解财报 locator
-或 metric 语义。Host 只校验 `evidence_refs` 指向已接受 evidence、`claim_text` 非空且
+Accepted evidence envelope 至少记录 evidence id、producer event ref、tool name、tool query、
+payload ref / digest、outcome digest 与 opaque source / locator descriptor；不记录、派生或暴露有界结果预览字段。
+`evidence_id` 由 Host 在
+`TOOL_RESULT_ACCEPTED` accept barrier 通过时生成；LLM 不生成 canonical evidence id，tool provider 也不承担 memory fact
+生成职责。Accepted evidence envelope 是 provenance anchor，不是 evidence 内容的 lossy 容器；LLM extractor 生成
+`claim_text` 时必须读取 compact input 中原本进入会话上下文的 raw tool result / raw transcript，并引用 Host 标注到该 raw
+内容旁边的 `evidence_id`。Host 只校验 `evidence_refs` 指向已接受 evidence、`claim_text` 非空且
 长度受限、`evidence_kind` 属于允许枚举，以及 candidate 不把 assistant final answer、episode summary、user input 或
 working assumption 当作 evidence。Host 不校验 evidence 的业务形状，不解析 locator，不证明 excerpt 逐字覆盖 claim，也不理解
 metric / subject / period 的业务含义。
@@ -2670,9 +2673,11 @@ P10 必须补齐 stable layer / history pool 的生成来源，而不是只做�
 
 - episode summary candidate：阶段标题、目标、已完成动作、confirmed fact refs / summaries、用户约束、open questions、next step、tool finding refs。
 - pinned state patch candidate：`current_goal`、`confirmed_subjects`、`user_constraints`、`open_questions` 的字段级 patch；每个字段必须有三态语义：未出现表示不修改，空值表示显式清空，非空值表示替换为候选值。
-- evidence-backed fact candidates：基于 compact 输入中的 accepted evidence envelope 及其 bounded `result_preview` 生成的
-  `claim_text`、`evidence_kind`、`evidence_refs` 与可选 opaque attributes。它们与 episode summary / pinned state patch 可由同一次 structured JSON proposal
-  产生，正常 compact 路径不得因此固定增加第二次 LLM 调用。
+- evidence-backed fact candidates：基于 compact 输入中的 raw tool result / raw transcript 生成 `claim_text`、
+  `evidence_kind`、`evidence_refs` 与可选 opaque attributes。Host 必须把 accepted evidence envelope 的 `evidence_id`
+  标注回对应 raw tool result 内容旁边，使 LLM 只负责引用 Host 已给出的 evidence id；不得让 LLM 从 tool query 自行生成 canonical
+  evidence id，也不得让 lossy preview 替代原始 evidence 内容。它们与 episode summary / pinned state patch 可由同一次 structured JSON
+  proposal 产生，正常 compact 路径不得因此固定增加第二次 LLM 调用。
 - minimum preserve item candidates：当前追问或下一轮短链路追问中，理解代词、序号、局部承接所需的最小 continuity items。每条至少
   包含 item id、label、text、source refs 与 preserve reason；它们可与 episode summary / pinned state patch / evidence-backed fact
   candidates 由同一次 structured JSON proposal 产生。

@@ -92,6 +92,14 @@ class EvidenceBackedFactKind(StrEnum):
     DERIVED_FROM_EVIDENCE = "derived_from_evidence"
 
 
+class CompactRawContextKind(StrEnum):
+    """Compact raw context item 的 Host-neutral 类型。"""
+
+    USER_INPUT = "user_input"
+    ASSISTANT_CONCLUSION = "assistant_conclusion"
+    ACCEPTED_TOOL_RESULT = "accepted_tool_result"
+
+
 class MinimumPreserveReason(StrEnum):
     """Minimum preserve item 的保留原因。"""
 
@@ -201,6 +209,58 @@ class CompactInputRange:
 
 
 @dataclass(frozen=True, slots=True)
+class CompactRawContextItem:
+    """Compact 输入范围内的 raw transcript 内容。
+
+    :param event_ref: raw 内容来源 EventLog event id。
+    :param content_kind: raw 内容类型。
+    :param content_text: 进入短期上下文或工具结果 transcript 的原始文本。
+    :param accepted_evidence_refs: 该 raw 内容旁边标注的 Host-minted evidence ids。
+    """
+
+    event_ref: str
+    content_kind: CompactRawContextKind
+    content_text: str
+    accepted_evidence_refs: tuple[str, ...]
+
+    def __post_init__(self) -> None:
+        """校验 raw context item 字段。
+
+        :returns: ``None``。
+        :raises TypeError: 字段类型非法时抛出。
+        :raises ValueError: 文本字段为空时抛出。
+        """
+
+        _require_non_empty(
+            self.event_ref, field_name="CompactRawContextItem.event_ref"
+        )
+        if not isinstance(self.content_kind, CompactRawContextKind):
+            raise TypeError("CompactRawContextItem.content_kind is invalid")
+        _require_non_empty(
+            self.content_text, field_name="CompactRawContextItem.content_text"
+        )
+        _require_string_tuple(
+            self.accepted_evidence_refs,
+            field_name="CompactRawContextItem.accepted_evidence_refs",
+        )
+
+    def to_json(self) -> JsonValue:
+        """转换为 canonical JSON 兼容值。
+
+        :returns: JSON object。
+        """
+
+        return {
+            "event_ref": self.event_ref,
+            "content_kind": self.content_kind.value,
+            "content_text": self.content_text,
+            "accepted_evidence_refs": _string_list_json(
+                self.accepted_evidence_refs
+            ),
+        }
+
+
+@dataclass(frozen=True, slots=True)
 class CompactionRequest:
     """Context compaction 请求。
 
@@ -213,6 +273,7 @@ class CompactionRequest:
     :param memory_snapshot_cursor: memory snapshot cursor；无 snapshot 时为 ``None``。
     :param current_message_summary: 当前用户输入摘要。
     :param accepted_evidence_envelopes: compact 输入范围内已接受的 evidence 信封。
+    :param compact_raw_context_items: compact 输入范围内可供 LLM 读取的 raw 内容。
     :param evidence_backed_fact_refs: 已存在 evidence-backed fact refs。
     :param recent_raw_turn_refs: 必须保留的近期 raw turn refs。
     :param older_raw_turn_refs: 可摘要的较旧 raw turn refs。
@@ -229,6 +290,7 @@ class CompactionRequest:
     memory_snapshot_cursor: int | None
     current_message_summary: CurrentMessageSummary
     accepted_evidence_envelopes: tuple[AcceptedEvidenceEnvelope, ...]
+    compact_raw_context_items: tuple[CompactRawContextItem, ...]
     evidence_backed_fact_refs: tuple[str, ...]
     recent_raw_turn_refs: tuple[str, ...]
     older_raw_turn_refs: tuple[str, ...]
@@ -285,6 +347,10 @@ class CompactionRequest:
             self.accepted_evidence_envelopes,
             field_name="CompactionRequest.accepted_evidence_envelopes",
         )
+        _require_compact_raw_context_item_tuple(
+            self.compact_raw_context_items,
+            field_name="CompactionRequest.compact_raw_context_items",
+        )
         _require_unique_string_tuple(
             self.accepted_evidence_refs,
             field_name="CompactionRequest.accepted_evidence_refs",
@@ -336,6 +402,9 @@ class CompactionRequest:
             "accepted_evidence_envelopes": [
                 accepted_evidence_envelope_to_json_value(envelope)
                 for envelope in self.accepted_evidence_envelopes
+            ],
+            "compact_raw_context_items": [
+                item.to_json() for item in self.compact_raw_context_items
             ],
             "accepted_evidence_refs": _string_list_json(
                 self.accepted_evidence_refs
@@ -1283,6 +1352,24 @@ def _require_accepted_evidence_envelope_tuple(
             raise TypeError(f"{field_name} items must be AcceptedEvidenceEnvelope")
 
 
+def _require_compact_raw_context_item_tuple(
+    value: tuple[CompactRawContextItem, ...], *, field_name: str
+) -> None:
+    """校验 compact raw context item tuple。
+
+    :param value: 待校验 tuple。
+    :param field_name: 错误字段名。
+    :returns: ``None``。
+    :raises TypeError: 字段或元素类型非法时抛出。
+    """
+
+    if not isinstance(value, tuple):
+        raise TypeError(f"{field_name} must be tuple")
+    for item in value:
+        if not isinstance(item, CompactRawContextItem):
+            raise TypeError(f"{field_name} items must be CompactRawContextItem")
+
+
 def _require_tuple_patch_field(
     value: PinnedStringTupleFieldPatch, *, field_name: str
 ) -> None:
@@ -1504,6 +1591,8 @@ __all__ = [
     "CompactInputRange",
     "CompactQualityCheckResult",
     "CompactQualityIssue",
+    "CompactRawContextItem",
+    "CompactRawContextKind",
     "CompactionCandidate",
     "CompactionRequest",
     "ContextCompactor",
