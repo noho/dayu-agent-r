@@ -204,7 +204,7 @@ async def test_run_compaction_operation_retries_quality_rejection() -> None:
 
 @pytest.mark.asyncio
 async def test_run_compaction_operation_retries_hard_threshold_after_compact() -> None:
-    """hard_threshold_after_compact 后 retry，并接受第二次 candidate。"""
+    """proactive hard_threshold_after_compact 后 retry，并接受第二次 candidate。"""
 
     compactor = _HardThresholdOnceCompactor()
     result = await run_compaction_operation(
@@ -222,6 +222,29 @@ async def test_run_compaction_operation_retries_hard_threshold_after_compact() -
         == "hard_threshold_after_compact"
     )
     assert result.rejected_attempts[0].repairable is True
+    assert result.failure_reason is None
+
+
+@pytest.mark.asyncio
+async def test_run_compaction_operation_accepts_reactive_budget_estimate_overflow() -> None:
+    """reactive compact 不用 compact 后估算值阻断 recovery dispatch。
+
+    :returns: ``None``。
+    :raises AssertionError: reactive path 仍按估算 hard threshold reject 时抛出。
+    """
+
+    compactor = _HardThresholdOnceCompactor()
+    result = await run_compaction_operation(
+        request=_request(trigger_source=ContextCompactionTriggerSource.REACTIVE),
+        compactor=compactor,
+        max_attempts=2,
+        cancellation_token=StubCancellationToken(),
+    )
+
+    assert compactor.calls == 1
+    assert result.accepted_candidate is not None
+    assert result.quality_result is not None
+    assert len(result.rejected_attempts) == 0
     assert result.failure_reason is None
 
 
@@ -753,18 +776,25 @@ def test_compaction_request_evidence_inputs_use_stable_derived_fact_refs(
         )
 
 
-def _request() -> CompactionRequest:
+def _request(
+    *,
+    trigger_source: ContextCompactionTriggerSource = (
+        ContextCompactionTriggerSource.PROACTIVE
+    ),
+) -> CompactionRequest:
     """构造标准 compaction request。
 
+    :param trigger_source: compaction 触发来源。
     :returns: compaction request。
     """
 
+    is_reactive = trigger_source is ContextCompactionTriggerSource.REACTIVE
     return CompactionRequest(
-        trigger_source=ContextCompactionTriggerSource.PROACTIVE,
+        trigger_source=trigger_source,
         session_id="session-operation",
         run_id="run-operation",
-        attempt_id=None,
-        execution_id=None,
+        attempt_id="attempt-operation" if is_reactive else None,
+        execution_id="execution-operation" if is_reactive else None,
         input_event_refs=("input-1", "input-2"),
         memory_snapshot_cursor=7,
         current_message_summary=CurrentMessageSummary(

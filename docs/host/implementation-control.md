@@ -224,10 +224,10 @@ Phase Map 中每个 phase 必须使用统一条目格式。模板如下：
 
 当前 work unit：Phase 12.5 Conversation Memory Optimization。
 当前状态：P12 已完成；PR 67 已 draft-PR-pass 并由用户 merge。
-当前 gate：P12.5 PR 68 post-draft compactor AgentPolicy / user prompt template ownership fix accepted and pushed；draft-PR-pass。
+当前 gate：P12.5 PR 68 post-draft reactive compaction budget hardening fix accepted and pushed；draft-PR-pass。
 下一步：除 CI / review feedback 外，P12.5 无新的 blocking work；PR 68 后续 merge、mark ready for review、request reviewers、approve、delete branch 或对外 comment 仍需用户额外授权。
 
-当前 gate 结论：P12.5 implementation Slice 1-7、aggregate deepreview、targeted repair、aggregate re-review、PR 68 draft review、post-draft cancellation hardening fix、post-draft raw evidence compaction fix、post-draft compactor scene prompt fix、post-draft compactor baseline scene id fix 与 post-draft compactor AgentPolicy / user prompt template ownership fix 均已 PASS。用户指出 bounded `result_preview` 作为 evidence-backed fact extraction primary input 会丢失长章节 evidence 内容，controller 裁决该问题影响 P12.5 success signal，不能作为 residual 留存。最终设计裁决：删除 `result_preview` 概念；`evidence_backed_facts` 必须基于 compact range raw tool result / raw transcript 生成 claim，Host-minted `evidence_id` 只作为标注到 raw evidence 旁边的 provenance anchor。ToolRuntime accepted result 不直接物化 stable fact；accepted `CONTEXT_COMPACTED.evidence_backed_fact_candidates` 才进入 memory projection；dispatch memory projection lag 走 rebuild / retry，不触发 Run / Attempt 终态迁移。生产代码不再允许 compactor 自行构造不可取消 token，compaction LLM call 必须接收 Host lifecycle cancellation token。Compactor system prompt 与 AgentPolicy 由 Service assembly 按 `execution_profiles.json.compactor_baseline.scene_id` 装配，compactor user prompt template 由 Service assembly 按 `execution_profiles.json.compactor_baseline.user_prompt_template_path` 读取，三者均以 typed `CompactorRunnerBaseline` 传入 Host；compactor 温度、top_p 与 stream 继续由 `execution_profiles.json.compactor_baseline.runner_option_hint_id` 指向 `models.json.runtime_hints.runner_option_hints.conversation_compaction`。最新 re-review artifacts 为 `docs/reviews/pr-68-postdraft-compactor-policy-template-rereview-mimo-20260523.md` 与 `docs/reviews/pr-68-postdraft-compactor-policy-template-rereview-ds-20260523.md`，两者均 PASS 且无 blocking findings。Controller validation：affected pytest 364 passed；`pyright dayu tests` 0 errors；`git diff --check` passed。剩余风险为 raw evidence aggregate prompt budget 与大 session rebuild performance。
+当前 gate 结论：P12.5 implementation Slice 1-7、aggregate deepreview、targeted repair、aggregate re-review、PR 68 draft review、post-draft cancellation hardening fix、post-draft raw evidence compaction fix、post-draft compactor scene prompt fix、post-draft compactor baseline scene id fix、post-draft compactor AgentPolicy / user prompt template ownership fix 与 post-draft reactive compaction budget hardening fix 均已 PASS。用户指出 bounded `result_preview` 作为 evidence-backed fact extraction primary input 会丢失长章节 evidence 内容，controller 裁决该问题影响 P12.5 success signal，不能作为 residual 留存。最终设计裁决：删除 `result_preview` 概念；`evidence_backed_facts` 必须基于 compact range raw tool result / raw transcript 生成 claim，Host-minted `evidence_id` 只作为标注到 raw evidence 旁边的 provenance anchor。ToolRuntime accepted result 不直接物化 stable fact；accepted `CONTEXT_COMPACTED.evidence_backed_fact_candidates` 才进入 memory projection；dispatch memory projection lag 走 rebuild / retry，不触发 Run / Attempt 终态迁移。生产代码不再允许 compactor 自行构造不可取消 token，compaction LLM call 必须接收 Host lifecycle cancellation token。Compactor system prompt 与 AgentPolicy 由 Service assembly 按 `execution_profiles.json.compactor_baseline.scene_id` 装配，compactor user prompt template 由 Service assembly 按 `execution_profiles.json.compactor_baseline.user_prompt_template_path` 读取，三者均以 typed `CompactorRunnerBaseline` 传入 Host；compactor 温度、top_p 与 stream 继续由 `execution_profiles.json.compactor_baseline.runner_option_hint_id` 指向 `models.json.runtime_hints.runner_option_hints.conversation_compaction`。Reactive compaction 不引入 raw evidence aggregate prompt budget guard，不让不准 token 估算阻断 reactive recovery；reactive path 通过真实 recovery dispatch / Engine overflow 闭环最多执行 `max_reactive_compactions_per_run` 次 compact，默认上限为 2，超过上限后 fail closed。最新 re-review artifacts 为 `docs/reviews/pr-68-postdraft-reactive-compaction-budget-rereview-mimo-20260523.md` 与 `docs/reviews/pr-68-postdraft-reactive-compaction-budget-rereview-ds-20260523.md`，两者均 PASS 且无 blocking findings。Controller validation：affected pytest 177 passed；`pyright dayu tests` 0 errors；`git diff --check` passed。剩余风险为大 session rebuild performance。
 
 ## Phase Map
 
@@ -1711,7 +1711,8 @@ Plan 必须额外收口的 readiness review checklist：
   `docs/reviews/pr-68-postdraft-raw-evidence-review-mimo-20260523.md`、
   `docs/reviews/pr-68-postdraft-raw-evidence-review-ds-20260523.md`、
   `docs/reviews/pr-68-postdraft-raw-evidence-controller-adjudication-20260523.md`。MiMo PASS no findings；DS PASS，F3
-  / F4 覆盖缺口已在本 gate 补测试，F1 raw evidence aggregate prompt budget 作为 production hardening residual，F2 多 evidence
+  / F4 覆盖缺口已在本 gate 补测试，F1 raw evidence aggregate prompt budget 后续裁决为不引入 prompt budget guard，
+  改由 reactive recovery dispatch / Engine overflow 闭环和 `max_reactive_compactions_per_run` 上限治理；F2 多 evidence
   id item-level 标注与 F5 EventLog 顺序显式化均不阻塞当前 V1。Validation：
   `pytest tests/host/test_compaction_operation.py -q` PASS (18 passed)；
   `pytest tests/host/test_llm_compaction.py tests/host/test_compaction_contract.py tests/host/test_compaction_operation.py tests/host/test_compact_artifact_store.py tests/host/test_toolruntime_accept_barrier.py tests/host/test_toolruntime_executor.py tests/host/test_dispatch_scheduler.py tests/host/test_engine_ingest_mapping.py tests/host/test_memory_projection.py tests/host/test_run_input_builder.py -q`
@@ -2087,7 +2088,7 @@ Owner / destination：Phase 15 Retention / Purge / Production Hardening，或在
 - `purge_session` destructive cleanup、audit tombstone、payload / memory / projection / outbox / tool trace 清理、projection rebuild tooling 与 retention matrix。
 - startup / recovery / crash E2E 压测、watch 轮询性能、SQLite 多进程写入压力、schema bootstrap / DDL 原子性、after-commit 多错误聚合、projection catch-up 批处理与 heavy sink runner。
 - Context Governance production hardening：真实异步 / production LLM compactor adapter、provider-specific tokenizer / sizing、compact failure 用户可见策略矩阵、proactive / reactive compact failure E2E。
-- Context Governance raw evidence prompt hardening：compact raw context aggregate token / prompt budget guard，覆盖 scene prompt、request envelope 与大量完整工具结果在一次 compaction proposal prompt 中超过 provider context window 的风险；soft threshold proactive compact 风险较低，Engine / provider overflow reactive compact 风险较高。
+- Context Governance reactive overflow hardening：不引入 raw evidence aggregate prompt budget guard，不让不准 token 估算阻断 reactive recovery；reactive path 通过真实 recovery dispatch / Engine overflow 闭环最多执行 `max_reactive_compactions_per_run` 次 compact，默认上限为 2，超过上限后 fail closed。
 - runtime lane production hardening：close/acquire race、stale claim cleanup 压测、heartbeat / TTL 配置校验、runtime log import side effect。
 - contracts strict validation、redaction / sensitive error taxonomy、README/docs correctness cleanup。
 
@@ -2409,10 +2410,11 @@ proactive / reactive transaction 与 state transition、compact artifact quality
 extra payload 读取预算参数。Runner usage 只作为 post-call observation / diagnostics / calibration 输入，不替代 pre-dispatch
 estimator。
 补充确认的 policy decision：默认 safety margin 为 20%；soft threshold 为输入预算的 80%；hard threshold 由 policy provider
-显式给出或按输入预算扣除 policy 定义的最小保护余量后计算；每个 Run 的 proactive trigger 与 reactive trigger 第一版各最多
-compact 一次；proactive compact failure 让 Run 在 dispatch 前 `FAILED` 且不创建 Attempt；reactive compact failure 在当前
-Attempt 关闭后让 Run `FAILED`；`LOST` 保留给 Phase 11 recovery owner；usage 第一版只记录 diagnostics / calibration
-observation，不自动动态调参。
+显式给出或按输入预算扣除 policy 定义的最小保护余量后计算；每个 Run 的 proactive trigger 第一版最多 compact 一次；
+reactive trigger 每次 Engine overflow 最多启动一个 compact operation，但同一 Run 可在 `max_reactive_compactions_per_run`
+范围内多次 reactive compact，默认上限为 2；proactive compact failure 让 Run 在 dispatch 前 `FAILED` 且不创建 Attempt；
+reactive compact failure 或 reactive 次数耗尽在当前 Attempt 关闭后让 Run `FAILED`；`LOST` 保留给 Phase 11 recovery owner；
+usage 第一版只记录 diagnostics / calibration observation，不自动动态调参。
 P9 / P10 配合边界：P9 Conversation Memory 只提供 EventLog read model、snapshot cursor、policy digest 与 diagnostics；
 P10 Context Governance 可读取 memory snapshot 做预算和 compact，但不得直接写 memory snapshot，不得让 compact summary
 替代 verified fact / evidence anchor，不得把 memory projection lag 当作 Run recovery。

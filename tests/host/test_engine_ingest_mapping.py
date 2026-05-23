@@ -652,7 +652,47 @@ async def test_old_attempt_run_failed_after_recovery_is_stale_diagnostic(
 async def test_reactive_compact_count_limit_fails_closed_without_second_attempt(
     tmp_path: Path,
 ) -> None:
-    """committed reactive request 数达到上限时失败收口且不创建 recovery Attempt。"""
+    """配置为一次 reactive 时，已有 request 会触发失败收口。"""
+
+    with open_host_durable_store(_options(tmp_path)) as store:
+        seeded = _seed_active_run(store.transaction_runner)
+        _append_reactive_requested_fact(
+            store.transaction_runner,
+            seeded=seeded,
+            event_id="event-existing-reactive-request",
+            corrupted=False,
+        )
+
+        result = await EngineEventIngestor(
+            transaction_runner=store.transaction_runner,
+            context_budget_policy=_reactive_policy(
+                max_reactive_compactions_per_run=1
+            ),
+            context_compactor=FakeContextCompactor(),
+            compact_artifact_root=tmp_path / "compact-artifacts",
+        ).ingest_async(_context_compaction_candidate(seeded, worker_event_index=45))
+
+        assert CONTEXT_COMPACTION_REQUESTED not in (
+            event.event_type for event in result.events
+        )
+        assert _attempt_count(store.transaction_runner, seeded.run_id) == 1
+        run_status, attempt_status = _statuses(store.transaction_runner, seeded)
+        assert run_status == RunStatus.FAILED
+        assert attempt_status == AttemptStatus.FAILED
+        failed = _latest_event(store.transaction_runner, CONTEXT_COMPACTION_FAILED)
+        assert _payload(failed)["failure_reason"] == "reactive_compact_limit_reached"
+
+
+@pytest.mark.asyncio
+async def test_reactive_compact_count_allows_second_operation(
+    tmp_path: Path,
+) -> None:
+    """默认两次 reactive 上限允许第二条 compact request。
+
+    :param tmp_path: pytest 临时目录。
+    :returns: ``None``。
+    :raises AssertionError: 第二次 reactive compact 被错误阻断时抛出。
+    """
 
     with open_host_durable_store(_options(tmp_path)) as store:
         seeded = _seed_active_run(store.transaction_runner)
@@ -670,15 +710,16 @@ async def test_reactive_compact_count_limit_fails_closed_without_second_attempt(
             compact_artifact_root=tmp_path / "compact-artifacts",
         ).ingest_async(_context_compaction_candidate(seeded, worker_event_index=45))
 
-        assert CONTEXT_COMPACTION_REQUESTED not in (
-            event.event_type for event in result.events
+        assert result.status == EngineIngestStatus.ACCEPTED
+        assert _attempt_count(store.transaction_runner, seeded.run_id) == 2
+        assert (
+            _event_count(store.transaction_runner, CONTEXT_COMPACTION_REQUESTED)
+            == 2
         )
-        assert _attempt_count(store.transaction_runner, seeded.run_id) == 1
+        assert _event_count(store.transaction_runner, CONTEXT_COMPACTED) == 1
         run_status, attempt_status = _statuses(store.transaction_runner, seeded)
-        assert run_status == RunStatus.FAILED
+        assert run_status == RunStatus.RUNNING
         assert attempt_status == AttemptStatus.FAILED
-        failed = _latest_event(store.transaction_runner, CONTEXT_COMPACTION_FAILED)
-        assert _payload(failed)["failure_reason"] == "reactive_compact_limit_reached"
 
 
 @pytest.mark.asyncio
@@ -1931,9 +1972,12 @@ def _envelope(seeded: _SeededRun) -> LocalEngineEnvelope:
     )
 
 
-def _reactive_policy() -> ContextBudgetPolicy:
+def _reactive_policy(
+    *, max_reactive_compactions_per_run: int = 2
+) -> ContextBudgetPolicy:
     """构造测试 reactive context budget policy。
 
+    :param max_reactive_compactions_per_run: 单个 Run reactive compact 上限。
     :returns: Context budget policy。
     """
 
@@ -1941,6 +1985,7 @@ def _reactive_policy() -> ContextBudgetPolicy:
         context_window_size=100,
         soft_threshold_tokens=45,
         hard_threshold_tokens=80,
+        max_reactive_compactions_per_run=max_reactive_compactions_per_run,
         policy_ref=_REACTIVE_POLICY_REF,
     )
 
