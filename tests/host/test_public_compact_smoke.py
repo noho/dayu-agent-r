@@ -49,7 +49,7 @@ _CURRENT_USER_INPUT_REF_FIELD = "current_user_input_ref"
 _PACKAGE_CONFIG_ROOT = (
     pathlib.Path(__file__).resolve().parents[2] / "dayu" / "config"
 )
-_COMPACTOR_SCENE_ID = "conversation_compaction"
+_COMPACTOR_PROFILE_ID = "standard-256k"
 
 
 @pytest.mark.asyncio
@@ -182,15 +182,21 @@ def _soft_threshold_prompt() -> str:
 
 
 def _compactor_prompts() -> tuple[str, str]:
-    """通过真实 ``conversation_compaction`` scene 装配 compactor 双 prompt。
+    """通过默认 compactor baseline 指向的 scene 装配 compactor 双 prompt。
 
     :returns: system prompt 与 user prompt template。
     :raises AssertionError: scene fragment 数量不符合 compactor 约定时抛出。
     """
 
+    config = ConfigLoader(package_config_dir=_PACKAGE_CONFIG_ROOT).load(
+        workspace_config_dir=None
+    )
+    compactor_baseline = config.execution_profiles.execution_profiles[
+        _COMPACTOR_PROFILE_ID
+    ].compactor_baseline
     scene = prepare_scene(
         ScenePrepareRequest(
-            scene_id=_COMPACTOR_SCENE_ID,
+            scene_id=compactor_baseline.scene_id,
             scene_manifest_root=_PACKAGE_CONFIG_ROOT / "prompts" / "manifests",
             prompt_asset_root=_PACKAGE_CONFIG_ROOT / "prompts",
             context_slot_values={},
@@ -213,9 +219,12 @@ def _compactor_runner_options(model_id: str) -> RunnerCallOptions:
     config = ConfigLoader(package_config_dir=_PACKAGE_CONFIG_ROOT).load(
         workspace_config_dir=None
     )
+    compactor_baseline = config.execution_profiles.execution_profiles[
+        _COMPACTOR_PROFILE_ID
+    ].compactor_baseline
     hint = config.models.models[
         model_id
-    ].runtime_hints.runner_option_hints[_COMPACTOR_SCENE_ID]
+    ].runtime_hints.runner_option_hints[compactor_baseline.runner_option_hint_id]
     return RunnerCallOptions(
         temperature=hint.temperature,
         max_tokens=None,

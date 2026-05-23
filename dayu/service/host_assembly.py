@@ -73,7 +73,6 @@ _ENV_PLACEHOLDER_PATTERN: Final[re.Pattern[str]] = re.compile(
     r"\{\{([A-Za-z_][A-Za-z0-9_]*)\}\}"
 )
 _WORKER_BACKEND_LOCAL: Final[str] = "local"
-_COMPACTOR_SCENE_ID: Final[str] = "conversation_compaction"
 _COMPACTOR_PROMPT_FRAGMENT_COUNT: Final[int] = 2
 
 
@@ -274,7 +273,10 @@ def compose_open_host_options(
         tool_bundle=request.discovered_tools.tool_bundle,
         execution_profile=execution_profile,
     )
-    compactor_scene_inputs = _prepare_compactor_scene_inputs(request)
+    compactor_scene_inputs = _prepare_compactor_scene_inputs(
+        request,
+        execution_profile=execution_profile,
+    )
     compactor_prompts = _compactor_prompts_from_scene_inputs(compactor_scene_inputs)
     ordinary_selection = select_runner_option_hint(
         models=config.models,
@@ -513,17 +515,20 @@ def _compose_options(
 
 def _prepare_compactor_scene_inputs(
     request: ServiceOpenHostAssemblyRequest,
+    *,
+    execution_profile: ExecutionProfileConfig,
 ) -> PreparedSceneInputs:
-    """装配 Host-owned compactor 使用的 conversation compaction scene。
+    """装配 Host-owned compactor 使用的 configured compactor scene。
 
     :param request: Service open_host assembly 请求。
+    :param execution_profile: 选中的 execution profile。
     :returns: compactor scene 装配输出。
     :raises ScenePrepareError: compactor scene asset 违反 scene contract 时抛出。
     """
 
     return prepare_scene(
         ScenePrepareRequest(
-            scene_id=_COMPACTOR_SCENE_ID,
+            scene_id=execution_profile.compactor_baseline.scene_id,
             scene_manifest_root=request.locations.scene_manifest_root,
             prompt_asset_root=request.locations.prompt_asset_root,
             context_slot_values={},
@@ -539,14 +544,14 @@ def _compactor_prompts_from_scene_inputs(
 ) -> _CompactorScenePrompts:
     """从 compactor scene ordered fragments 中读取 system / user prompt。
 
-    :param scene_inputs: ``conversation_compaction`` scene 装配输出。
+    :param scene_inputs: compactor scene 装配输出。
     :returns: compactor 双 prompt。
     :raises ValueError: compactor scene 未提供恰好两个 prompt fragments 时抛出。
     """
 
     if len(scene_inputs.system_messages) != _COMPACTOR_PROMPT_FRAGMENT_COUNT:
         raise ValueError(
-            "conversation_compaction scene must provide exactly two prompt fragments"
+            "compactor scene must provide exactly two prompt fragments"
         )
     system_prompt, user_prompt_template = scene_inputs.system_messages
     return _CompactorScenePrompts(

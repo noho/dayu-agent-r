@@ -58,7 +58,7 @@ Runner 实现类不属于 `dayu.engine` 包根公共 API。Engine 只接收 `too
 
 Host 是 Session / Run / Attempt / EventLog / admission / cancel / resume / retry / replay / memory / context governance / tool governance 的治理真源。Projection、timeline、audit、usage、tool trace、outbox 与 memory snapshot 都是已提交 EventLog 的派生视图，不能反向成为恢复或状态迁移真源。
 
-Host-owned LLM compaction 通过 `OpenHostOptions` 的预算治理配置与 `CompactorRunnerBaseline` 装配。Service / composition root 从 `conversation_compaction` scene asset 装配 compactor system prompt 与 user prompt template 后传入 Host；Host 在自己的 Context Governance 边界内构造 compaction request、替换 template 中的 request 数据块、校验 candidate，并写入 compact artifact 与 canonical event。
+Host-owned LLM compaction 通过 `OpenHostOptions` 的预算治理配置与 `CompactorRunnerBaseline` 装配。Service / composition root 按 execution profile 的 `compactor_baseline.scene_id` 装配 compactor system prompt 与 user prompt template 后传入 Host；Host 在自己的 Context Governance 边界内构造 compaction request、替换 template 中的 request 数据块、校验 candidate，并写入 compact artifact 与 canonical event。
 
 ### `dayu.service`
 

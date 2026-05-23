@@ -114,6 +114,7 @@ def _execution_profile_record() -> dict[str, JsonValue]:
         },
         "compactor_baseline": {
             "model_id": "base-model",
+            "scene_id": "conversation_compaction",
             "runner_option_hint_id": "conversation_compaction",
             "artifact_root": "artifacts/compact",
         },
@@ -294,6 +295,7 @@ def test_default_runtime_config_files_load_as_typed_views() -> None:
     standard_256k = config.execution_profiles.execution_profiles["standard-256k"]
     assert standard_256k.context_window_class == "256k"
     assert standard_256k.min_context_window_tokens == 262144
+    assert standard_256k.compactor_baseline.scene_id == "conversation_compaction"
     assert (
         standard_256k.memory_projection_policy.max_evidence_backed_facts
         == 256
@@ -733,6 +735,32 @@ def test_execution_profile_must_not_embed_context_window_size(
     )
 
     with pytest.raises(ConfigFieldError, match="unknown fields"):
+        ConfigLoader(package_config_dir=package_root).load_execution_profiles()
+
+
+def test_compactor_baseline_requires_scene_id(tmp_path: Path) -> None:
+    """compactor_baseline 必须显式声明 compactor scene id。
+
+    :param tmp_path: pytest 临时目录。
+    :returns: ``None``。
+    :raises AssertionError: 缺少 scene_id 未失败时抛出。
+    """
+
+    package_root = tmp_path / "package"
+    _minimal_package_config(package_root)
+    profile = _execution_profile_record()
+    compactor_baseline = profile["compactor_baseline"]
+    assert isinstance(compactor_baseline, dict)
+    compactor_baseline.pop("scene_id")
+    _write_json(
+        package_root / "execution_profiles.json",
+        {
+            "default_execution_profile_id": "standard-256k",
+            "execution_profiles": {"standard-256k": profile},
+        },
+    )
+
+    with pytest.raises(ConfigFieldError, match="scene_id"):
         ConfigLoader(package_config_dir=package_root).load_execution_profiles()
 
 

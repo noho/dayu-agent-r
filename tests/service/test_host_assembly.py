@@ -17,7 +17,7 @@ from dayu.host.api import (
     OperationContext,
 )
 from dayu.runtime.config_loader import ConfigLoader
-from dayu.runtime.location import resolve_runtime_locations
+from dayu.runtime.location import RuntimeLocations, resolve_runtime_locations
 from dayu.runtime.assembly import RuntimeAssemblySelectionError
 from dayu.runtime.scene_prepare import (
     PreparedSceneInputs,
@@ -39,6 +39,7 @@ from dayu.service.host_assembly import (
 
 _PACKAGE_CONFIG_ROOT = Path(__file__).resolve().parents[2] / "dayu" / "config"
 _SCENE_ID = "smoke_host_public_multiturn"
+_CUSTOM_COMPACTOR_SCENE_ID = "custom_compactor_scene"
 _MODEL_ID = "deepseek-v4-flash"
 _RUNNER_HINT_ID = "interactive"
 _API_KEY = "test-provider-key"
@@ -138,6 +139,85 @@ def test_compose_open_host_options_uses_runtime_tuning_from_config(
     )
 
 
+def test_compose_open_host_options_reads_compactor_scene_id_from_profile(
+    tmp_path: Path,
+) -> None:
+    """Service helper 必须从 compactor_baseline 读取 compactor scene id。
+
+    :param tmp_path: pytest 临时 workspace root。
+    :returns: ``None``。
+    :raises AssertionError: helper 仍使用硬编码 compactor scene 时抛出。
+    """
+
+    _write_tool_discovery_overlay(tmp_path)
+    locations = resolve_runtime_locations(
+        project_root=tmp_path,
+        package_config_root=_PACKAGE_CONFIG_ROOT,
+    )
+    config = ConfigLoader(package_config_dir=_PACKAGE_CONFIG_ROOT).load(
+        workspace_config_dir=locations.config_overlay_dir
+    )
+    discovered_tools = discover_service_tools(config)
+    scene_inputs = prepare_scene(
+        ScenePrepareRequest(
+            scene_id=_SCENE_ID,
+            scene_manifest_root=locations.scene_manifest_root,
+            prompt_asset_root=locations.prompt_asset_root,
+            context_slot_values={
+                "fins_default_subject": "测试财报主体",
+                "base_user": "service-assembly-test",
+            },
+            available_tools=SceneToolCatalog.from_tool_bundle(
+                discovered_tools.tool_bundle
+            ),
+        )
+    )
+    custom_locations = _custom_compactor_scene_locations(tmp_path)
+    profile = config.execution_profiles.execution_profiles["standard-256k"]
+    custom_profile = replace(
+        profile,
+        compactor_baseline=replace(
+            profile.compactor_baseline,
+            scene_id=_CUSTOM_COMPACTOR_SCENE_ID,
+        ),
+    )
+    custom_profiles = dict(config.execution_profiles.execution_profiles)
+    custom_profiles["standard-256k"] = custom_profile
+    custom_config = replace(
+        config,
+        execution_profiles=replace(
+            config.execution_profiles,
+            execution_profiles=custom_profiles,
+        ),
+    )
+
+    result = compose_open_host_options(
+        ServiceOpenHostAssemblyRequest(
+            workspace_root=tmp_path,
+            config=custom_config,
+            locations=custom_locations,
+            scene_inputs=scene_inputs,
+            discovered_tools=discovered_tools,
+            overrides=ServiceAssemblyOverrides(
+                host_runtime_id="local",
+                execution_profile_id="standard-256k",
+                model_id=_MODEL_ID,
+                runner_option_hint_id=_RUNNER_HINT_ID,
+            ),
+            env={"DEEPSEEK_API_KEY": _API_KEY},
+        )
+    )
+
+    compactor_baseline = result.options.compactor_runner_baseline
+    assert compactor_baseline is not None
+    assert compactor_baseline.compactor_system_prompt == (
+        "custom compactor system prompt"
+    )
+    assert compactor_baseline.compactor_user_prompt_template == (
+        "custom compactor user prompt <<compaction_request>>"
+    )
+
+
 def test_compose_submit_followup_request_uses_prepared_system_prompt(
     tmp_path: Path,
 ) -> None:
@@ -209,7 +289,7 @@ def test_compactor_prompt_scene_requires_two_fragments() -> None:
         capability_tags=(),
     )
 
-    with pytest.raises(ValueError, match="exactly two prompt fragments"):
+    with pytest.raises(ValueError, match="compactor scene"):
         _compactor_prompts_from_scene_inputs(scene_inputs)
 
 
@@ -510,6 +590,7 @@ def _write_execution_profile_overlay(
                     },
                     "compactor_baseline": {
                         "model_id": model_id,
+                        "scene_id": "conversation_compaction",
                         "runner_option_hint_id": "conversation_compaction",
                         "artifact_root": "workspace/.dayu/artifacts/compaction",
                     },
@@ -567,6 +648,72 @@ def _write_execution_profile_overlay(
                 }
             },
         },
+    )
+
+
+def _custom_compactor_scene_locations(workspace_root: Path) -> RuntimeLocations:
+    """写入只包含自定义 compactor scene 的 prompt 根目录。
+
+    :param workspace_root: pytest 临时 workspace root。
+    :returns: 指向自定义 prompt 根目录的 RuntimeLocations。
+    :raises OSError: 测试 prompt 文件写入失败时抛出。
+    """
+
+    prompt_root = workspace_root / "custom-prompts"
+    manifest_root = prompt_root / "manifests"
+    scene_root = prompt_root / "scenes"
+    _write_json(
+        manifest_root / f"{_CUSTOM_COMPACTOR_SCENE_ID}.json",
+        {
+            "schema_version": 1,
+            "scene": _CUSTOM_COMPACTOR_SCENE_ID,
+            "version": "v1",
+            "description": "自定义 compactor scene",
+            "capability_tags": ["conversation_compaction"],
+            "extends": [],
+            "model": {
+                "default_model_id": _MODEL_ID,
+                "runner_option_hint_id": "conversation_compaction",
+            },
+            "tool_selection": {
+                "mode": "none",
+                "tool_names": [],
+                "tool_tags_any": [],
+                "allow_empty": False,
+            },
+            "defaults": {
+                "missing_required_fragment": "fail_closed",
+            },
+            "fragments": [
+                {
+                    "id": "custom_compactor_system",
+                    "path": "scenes/custom_compactor_system.md",
+                    "order": 100,
+                    "required": True,
+                },
+                {
+                    "id": "custom_compactor_user",
+                    "path": "scenes/custom_compactor_user.md",
+                    "order": 200,
+                    "required": True,
+                },
+            ],
+            "context_slots": [],
+        },
+    )
+    scene_root.mkdir(parents=True, exist_ok=True)
+    (scene_root / "custom_compactor_system.md").write_text(
+        "custom compactor system prompt",
+        encoding="utf-8",
+    )
+    (scene_root / "custom_compactor_user.md").write_text(
+        "custom compactor user prompt <<compaction_request>>",
+        encoding="utf-8",
+    )
+    return RuntimeLocations(
+        config_overlay_dir=None,
+        prompt_asset_root=prompt_root,
+        scene_manifest_root=manifest_root,
     )
 
 

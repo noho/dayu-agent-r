@@ -191,11 +191,13 @@ class CompactorBaselineConfig:
     """Host-owned compactor 执行基线。
 
     :param model_id: compactor 模型 id。
+    :param scene_id: compactor scene id。
     :param runner_option_hint_id: compactor runner option hint id。
     :param artifact_root: compact artifact 根目录。
     """
 
     model_id: str
+    scene_id: str
     runner_option_hint_id: str
     artifact_root: str
 
@@ -1381,11 +1383,14 @@ def _parse_compactor_baseline(
 
     _require_exact_fields(
         record,
-        allowed=frozenset({"model_id", "runner_option_hint_id", "artifact_root"}),
+        allowed=frozenset(
+            {"model_id", "scene_id", "runner_option_hint_id", "artifact_root"}
+        ),
         context=context,
     )
     return CompactorBaselineConfig(
         model_id=_require_str_field(record, field_name="model_id", context=context),
+        scene_id=_require_str_field(record, field_name="scene_id", context=context),
         runner_option_hint_id=_require_str_field(
             record,
             field_name="runner_option_hint_id",
