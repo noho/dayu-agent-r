@@ -32,6 +32,7 @@ from dayu.service.host_assembly import (
     ServiceOpenHostAssemblyRequest,
     _agent_fallback_mode_from_config,
     _compactor_prompts_from_scene_inputs,
+    _resolve_project_path,
     compose_open_host_options,
     compose_submit_followup_request,
     discover_service_tools,
@@ -538,6 +539,21 @@ def test_default_profile_does_not_auto_switch_for_1m_model(
         result.diagnostics.compactor_profile_compatibility.selected_model_id
         == "deepseek-v4-flash"
     )
+
+
+def test_resolve_project_path_rejects_relative_escape(tmp_path: Path) -> None:
+    """Service project path 相对配置不得逃逸 workspace root。"""
+
+    with pytest.raises(ValueError, match="escapes workspace root"):
+        _resolve_project_path(tmp_path, "../outside.sqlite3")
+
+
+def test_resolve_project_path_keeps_absolute_path(tmp_path: Path) -> None:
+    """Service project path 绝对路径保持原有语义。"""
+
+    absolute_path = tmp_path.parent / "outside.sqlite3"
+
+    assert _resolve_project_path(tmp_path, str(absolute_path)) == absolute_path
 
 
 def _write_tool_discovery_overlay(workspace_root: Path) -> None:

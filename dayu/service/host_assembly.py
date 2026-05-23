@@ -1101,13 +1101,19 @@ def _resolve_project_path(
     :param workspace_root: workspace / 项目根目录。
     :param configured_path: 配置中的路径字符串。
     :returns: 解析后的路径。
-    :raises Exception: 不主动抛出异常。
+    :raises ValueError: 相对路径逃逸 workspace root 时抛出。
     """
 
     path = pathlib.Path(configured_path)
     if path.is_absolute():
         return path
-    return workspace_root / path
+    resolved_root = workspace_root.resolve()
+    resolved_path = (resolved_root / path).resolve()
+    try:
+        resolved_path.relative_to(resolved_root)
+    except ValueError as exc:
+        raise ValueError("configured project path escapes workspace root") from exc
+    return resolved_path
 
 
 def _provider_extension_status(model: ModelConfig) -> str:

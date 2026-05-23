@@ -814,6 +814,17 @@ def test_exception_diagnostic_message_marks_truncation() -> None:
     )
 
 
+def test_exception_diagnostic_message_redacts_api_key_with_space() -> None:
+    """异常诊断消息必须识别 ``api key`` 空格写法。"""
+
+    message = agent_module._exception_diagnostic_message(
+        RuntimeError("provider rejected api key sk-secret-value")
+    )
+
+    assert message == "RuntimeError: exception message redacted"
+    assert "sk-secret-value" not in message
+
+
 @pytest.mark.asyncio
 async def test_cancelled_before_run_closes_then_emits_cancelled() -> None:
     """入口已取消时不调用 Runner，但先 close 再产出 run_cancelled。"""

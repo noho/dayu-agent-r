@@ -398,6 +398,7 @@ class SSEParser:
             )
             return
         if isinstance(choices, list) and choices:
+            handled_choice = False
             for index, choice in enumerate(choices):
                 if not isinstance(choice, dict):
                     _LOGGER.warning(
@@ -407,8 +408,32 @@ class SSEParser:
                         type(choice).__name__,
                     )
                     continue
+                handled_choice = True
                 async for event in self._handle_choice(choice):
                     yield event
+            if not handled_choice and not has_valid_usage:
+                _LOGGER.warning(
+                    "sse.protocol_error code=%s choices_type=list "
+                    "valid_choice_count=0",
+                    _MISSING_CHOICES_CODE,
+                )
+                self._terminated = True
+                yield _make_event(
+                    RunnerProtocolErrorData(
+                        error_code=_MISSING_CHOICES_CODE,
+                        message="SSE data line choices must contain an object choice",
+                        provider_request_id=self._provider_request_id,
+                        raw_payload=dict(parsed),
+                        partial_tool_calls=self._aggregator.partial_summaries(),
+                    )
+                )
+                yield _make_event(
+                    RunnerDoneData(
+                        finish_reason=FinishReason.ERROR,
+                        provider_request_id=self._provider_request_id,
+                    )
+                )
+                return
         if usage is not None and isinstance(usage, dict):
             async for event in self._handle_usage(usage):
                 yield event

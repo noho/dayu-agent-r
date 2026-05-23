@@ -8,6 +8,7 @@ from pathlib import Path
 import dayu.service as service
 
 SERVICE_FORBIDDEN_PREFIXES: tuple[str, ...] = (
+    "dayu.config",
     "dayu.ui",
     "dayu.fins",
 )
@@ -66,8 +67,8 @@ def _matches_prefix(module: str, prefixes: tuple[str, ...]) -> bool:
     return any(module == prefix or module.startswith(prefix + ".") for prefix in prefixes)
 
 
-def test_service_does_not_import_ui_or_fins_layers() -> None:
-    """Service 层不得反向依赖 UI，也不得直接绕过 Host 调用 Fins。"""
+def test_service_does_not_import_forbidden_layers() -> None:
+    """Service 层不得反向依赖 UI、直接调用 Fins 或读取 config 包。"""
 
     violations: list[tuple[str, str]] = []
     for file_path in _iter_python_files():
@@ -77,4 +78,3 @@ def test_service_does_not_import_ui_or_fins_layers() -> None:
                 violations.append((str(file_path), module))
 
     assert not violations, f"service import boundary violations: {violations}"
-

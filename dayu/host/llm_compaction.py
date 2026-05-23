@@ -69,7 +69,7 @@ _TRUNCATED_SUFFIX = "..."
 _REDACTED_SECRET = "<redacted>"
 _BEARER_SECRET_PATTERN = re.compile(r"(?i)bearer\s+[A-Za-z0-9._~+/=-]+")
 _ASSIGNMENT_SECRET_PATTERN = re.compile(
-    r"(?i)((?:api[_-]?key|authorization)\s*[:=]\s*)[^,\s}\]]+"
+    r"(?i)((?:api[_-]?key|authorization|secret|token)\s*[:=]\s*)[^,\s}\]]+"
 )
 _SAFE_ERROR_CODE_PATTERN = re.compile(r"^[a-z][a-z0-9_-]{0,63}$")
 _COMPACTION_REQUEST_PLACEHOLDER = "<<compaction_request>>"

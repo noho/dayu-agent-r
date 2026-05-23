@@ -68,7 +68,7 @@ from dayu.host.context_policy import (
     ContextBudgetPolicy,
     context_budget_policy_from_threshold_tokens,
 )
-from dayu.host.durable.codec import sha256_digest_json
+from dayu.host.durable.codec import format_utc_timestamp, sha256_digest_json
 from dayu.host.durable.connection import open_host_durable_store
 from dayu.host.durable.event_log import (
     EventClass,
@@ -94,15 +94,21 @@ from dayu.host.durable.run_transition import (
 from dayu.host.durable.schema import TABLE_EVENT_LOG
 from dayu.host.durable.session_lifecycle import ensure_session
 from dayu.host.durable.state import (
+    AttemptRow,
+    DispatchRecordRow,
     DispatchRecordStatus,
     RunStartReason,
     WaitResumePolicy,
     WorkerKind,
+    insert_attempt,
+    insert_dispatch_record,
     mark_dispatch_waiting_for_lane_row,
     mark_dispatching_after_lane_row,
     read_attempt_by_id,
     read_dispatch_record_by_attempt_id,
     read_run_by_id,
+    steer_active_run_row,
+    steer_running_attempt_row,
 )
 from dayu.host.durable.transaction import HostTransaction, HostTransactionRunner
 from tests.host.fake_cancellation import StubCancellationToken
@@ -639,13 +645,47 @@ async def test_old_attempt_run_failed_after_recovery_is_stale_diagnostic(
         )
 
         assert stale.status == EngineIngestStatus.REJECTED
-        assert _payload(stale.events[0])["reason"] == "terminal_already_closed"
+        assert _payload(stale.events[0])["reason"] == "stale_execution_id"
         assert _attempt_count(store.transaction_runner, seeded.run_id) == 2
         current_attempt = _current_attempt_id(store.transaction_runner, seeded.run_id)
         assert current_attempt != seeded.attempt_id
         assert _attempt_status(store.transaction_runner, current_attempt) == (
             AttemptStatus.STARTING
         )
+
+
+def test_old_steered_attempt_event_is_rejected_and_current_attempt_accepts(
+    tmp_path: Path,
+) -> None:
+    """steer 后旧 Attempt 的 EngineEvent 不得污染当前 Run EventLog。"""
+
+    with open_host_durable_store(_options(tmp_path)) as store:
+        seeded = _seed_active_run(store.transaction_runner)
+        current = _steer_to_new_running_attempt(store.transaction_runner, seeded)
+        ingestor = EngineEventIngestor(transaction_runner=store.transaction_runner)
+
+        stale = ingestor.ingest(
+            _candidate(
+                seeded,
+                worker_event_index=51,
+                data=ContentDeltaData(iteration_id="iter-stale", delta="old"),
+                event_type=EngineEventType.CONTENT_DELTA,
+            )
+        )
+        accepted = ingestor.ingest(
+            _candidate(
+                current,
+                worker_event_index=1,
+                data=ContentDeltaData(iteration_id="iter-current", delta="new"),
+                event_type=EngineEventType.CONTENT_DELTA,
+            )
+        )
+
+        assert stale.status == EngineIngestStatus.REJECTED
+        assert _payload(stale.events[0])["reason"] == "stale_execution_id"
+        assert accepted.status == EngineIngestStatus.ACCEPTED
+        assert accepted.events[0].attempt_id == current.attempt_id
+        assert _payload(accepted.events[0])["delta"] == "new"
 
 
 @pytest.mark.asyncio
@@ -1053,8 +1093,8 @@ def test_old_attempt_late_waiting_confirmation_is_rejected_after_resolve(
         ).ingest(candidate)
 
         assert result.status == EngineIngestStatus.REJECTED
-        assert result.reason == "terminal_already_closed"
-        assert _payload(result.events[0])["reason"] == "terminal_already_closed"
+        assert result.reason == "stale_execution_id"
+        assert _payload(result.events[0])["reason"] == "stale_execution_id"
         assert _canonical_tool_event_count(store.transaction_runner) == 2
 
 
@@ -1886,6 +1926,183 @@ def _seed_active_run(transaction_runner: HostTransactionRunner) -> _SeededRun:
 
     transaction_runner.run_write(_operation)
     return seeded
+
+
+def _steer_to_new_running_attempt(
+    transaction_runner: HostTransactionRunner, seeded: _SeededRun
+) -> _SeededRun:
+    """把 seeded active Run 切换为 steer 后的新 running Attempt。
+
+    :param transaction_runner: Host transaction runner。
+    :param seeded: 原 active Run 摘要。
+    :returns: steer 后的新 current Attempt 摘要。
+    """
+
+    current = _SeededRun(
+        session_id=seeded.session_id,
+        run_id=seeded.run_id,
+        attempt_id="attempt-ingest-steered-current",
+        execution_id="execution-ingest-steered-current",
+        dispatch_record_id="dispatch-ingest-steered-current",
+    )
+
+    def _event(
+        transaction: HostTransaction,
+        *,
+        event_id: str,
+        event_type: str,
+        attempt_id: str | None,
+        execution_id: str | None,
+        payload_json: JsonValue,
+    ) -> EventLogRow:
+        """追加 steer 测试 setup 事件。
+
+        :param transaction: Host transaction。
+        :param event_id: 事件 id。
+        :param event_type: 事件类型。
+        :param attempt_id: Attempt id。
+        :param execution_id: execution id。
+        :param payload_json: JSON payload。
+        :returns: 新写入的 EventLog row。
+        """
+
+        return EventLogStore().append_event(
+            transaction,
+            EventLogAppendRequest(
+                event_id=event_id,
+                event_class=EventClass.CANONICAL_FACT,
+                session_id=seeded.session_id,
+                run_id=seeded.run_id,
+                attempt_id=attempt_id,
+                execution_id=execution_id,
+                event_type=event_type,
+                occurred_at=_NOW,
+                actor="tester",
+                source="pytest",
+                client_request_id="client-ingest-steer",
+                idempotency_key=f"idem-{event_id}",
+                policy_decision=None,
+                reason=None,
+                payload_json=payload_json,
+                payload_ref=None,
+                payload_digest=None,
+            ),
+        ).row
+
+    def _operation(transaction: HostTransaction) -> None:
+        timestamp = format_utc_timestamp(_NOW)
+        input_event = _event(
+            transaction,
+            event_id="event-input-ingest-steer",
+            event_type="USER_INPUT_ACCEPTED",
+            attempt_id=None,
+            execution_id=None,
+            payload_json={"display_text": "steer"},
+        )
+        steered_event = _event(
+            transaction,
+            event_id="event-attempt-steered-ingest",
+            event_type="ATTEMPT_STEERED",
+            attempt_id=seeded.attempt_id,
+            execution_id=seeded.execution_id,
+            payload_json={"reason": "steered"},
+        )
+        run_started_event = _event(
+            transaction,
+            event_id="event-run-started-ingest-steer",
+            event_type="RUN_STARTED",
+            attempt_id=None,
+            execution_id=None,
+            payload_json={"reason": "steer"},
+        )
+        attempt_started_event = _event(
+            transaction,
+            event_id="event-attempt-started-ingest-steer",
+            event_type="ATTEMPT_STARTED",
+            attempt_id=current.attempt_id,
+            execution_id=current.execution_id,
+            payload_json={"reason": "steer"},
+        )
+        steer_running_attempt_row(
+            transaction,
+            attempt_id=seeded.attempt_id,
+            terminal_event_id=steered_event.event_id,
+            terminal_event_sequence=steered_event.event_sequence,
+            terminal_at=timestamp,
+        )
+        insert_attempt(
+            transaction,
+            AttemptRow(
+                attempt_id=current.attempt_id,
+                run_id=current.run_id,
+                execution_id=current.execution_id,
+                status=AttemptStatus.STARTING,
+                started_event_id=attempt_started_event.event_id,
+                started_event_sequence=attempt_started_event.event_sequence,
+                terminal_event_id=None,
+                terminal_event_sequence=None,
+                created_at=timestamp,
+                updated_at=timestamp,
+                terminal_at=None,
+            ),
+        )
+        insert_dispatch_record(
+            transaction,
+            DispatchRecordRow(
+                dispatch_record_id=current.dispatch_record_id,
+                run_id=current.run_id,
+                attempt_id=current.attempt_id,
+                execution_id=current.execution_id,
+                status=DispatchRecordStatus.DISPATCHING,
+                worker_kind=WorkerKind.LOCAL,
+                execution_target="target-ingest",
+                owner_host_instance_id="host-test",
+                created_event_id=attempt_started_event.event_id,
+                created_event_sequence=attempt_started_event.event_sequence,
+                waiting_for_lane_at=timestamp,
+                lane_name="llm",
+                lane_claim_id="claim-test-steer",
+                lane_owner_id="owner-test-steer",
+                lane_acquired_at=timestamp,
+                dispatching_at=timestamp,
+                worker_accepted_at=None,
+                worker_accept_event_id=None,
+                worker_accept_event_sequence=None,
+                cancelled_event_id=None,
+                cancelled_event_sequence=None,
+                created_at=timestamp,
+                updated_at=timestamp,
+                cancelled_at=None,
+            ),
+        )
+        steer_active_run_row(
+            transaction,
+            session_id=seeded.session_id,
+            run_id=seeded.run_id,
+            previous_attempt_id=seeded.attempt_id,
+            next_attempt_id=current.attempt_id,
+            input_event_id=input_event.event_id,
+            input_event_sequence=input_event.event_sequence,
+            started_event_id=run_started_event.event_id,
+            started_event_sequence=run_started_event.event_sequence,
+            updated_at=timestamp,
+        )
+        accept_worker_running_in_transaction(
+            transaction,
+            EventLogStore(),
+            AcceptWorkerRunningInput(
+                run_id=current.run_id,
+                attempt_id=current.attempt_id,
+                attempt_running_event_id="event-attempt-running-ingest-steer",
+                occurred_at=_NOW,
+                actor="tester",
+                source="pytest",
+                worker_accept_reason="accepted",
+            ),
+        )
+
+    transaction_runner.run_write(_operation)
+    return current
 
 
 def _candidate(

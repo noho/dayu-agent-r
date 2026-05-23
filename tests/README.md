@@ -91,6 +91,7 @@ pytest tests/engine/test_smoke_async_agent_providers.py -q
 Service composition 测试，覆盖 `dayu.service` 在 Host 外部把 runtime typed config、locations、工具发现、prepared scene、显式 override 与 env/secret mapping 映射为 Host public typed inputs：
 
 - host assembly：覆盖 `host_runtime.json` 的 SQLite write retry、payload inline threshold、worker startup timeout 等 construction tuning 被映射进 `OpenHostOptions`，provider secret 占位符在 Service helper 中解析，per-run helper 直接使用 `PreparedSceneInputs.system_prompt` 生成 `SubmitFollowupRequest`。
+- import boundary / weak typing guard：阻止 Service 导入 Config、UI、Fins 等越界层，并通过 AST 扫描禁止 `Any`、`object`、无类型签名与裸容器注解进入 Service 源码。
 
 ### `tests/contracts/`
 
@@ -168,7 +169,7 @@ OpenAI-compatible Runner 的 provider 协议测试，覆盖从 payload 构建、
 
 ## 类型与弱类型守护
 
-测试必须配合 `pyright` 使用。公共契约和 Engine 契约的测试已经通过 AST 扫描守护弱类型边界，新增契约时应保持同等严格度。
+测试必须配合 `pyright` 使用。公共契约、Runtime、Host、Service 和 Engine 的测试已经通过 AST 扫描守护弱类型边界，新增契约时应保持同等严格度。
 
 - 禁止通过测试 helper 引入 `Any` / `object` / 裸 `dict` 的公共契约逃逸。
 - 如果测试需要构造 JSON，应使用当前项目已有 `JsonValue` 类型或局部私有 helper，不得把弱类型 JSON 袋扩散到生产接口。

@@ -537,7 +537,8 @@ async def test_llm_context_compactor_sanitizes_failed_runner_outcome(
                 error_code="api_key=error-secret",
                 message=(
                     "http 503 Authorization: Bearer deepsecret "
-                    "api_key=plainsecret transient unavailable"
+                    "api_key=plainsecret token=tokensecret "
+                    "secret=secretvalue transient unavailable"
                 ),
                 provider_request_id="provider-request-1",
                 recoverable=True,
@@ -560,6 +561,8 @@ async def test_llm_context_compactor_sanitizes_failed_runner_outcome(
     assert "error-secret" not in message
     assert "deepsecret" not in message
     assert "plainsecret" not in message
+    assert "tokensecret" not in message
+    assert "secretvalue" not in message
     assert "provider-request-1" not in message
 
 

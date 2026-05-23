@@ -320,7 +320,7 @@ def test_schema_mapping_with_non_string_key_is_rejected() -> None:
                 parameters=ToolParametersSchema(
                     type="object",
                     properties=malformed_properties,
-                    required=("company_id",),
+                    required=(),
                     additional_properties=False,
                 ),
             ),

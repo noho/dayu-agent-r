@@ -178,6 +178,7 @@ _EXCEPTION_MESSAGE_REDACTED: str = "exception message redacted"
 _EXCEPTION_MESSAGE_MAX_LENGTH: int = 240
 _EXCEPTION_MESSAGE_TRUNCATED_SUFFIX: str = "... [truncated]"
 _SENSITIVE_EXCEPTION_MARKERS: tuple[str, ...] = (
+    "api key",
     "api_key",
     "apikey",
     "authorization",

@@ -568,6 +568,29 @@ async def test_sse_non_object_choice_logs_diagnostic(
 
 
 @pytest.mark.asyncio
+async def test_sse_all_non_object_choices_end_with_protocol_error() -> None:
+    """SSE ``choices`` 全部不是 object 时必须协议错误收口。"""
+
+    events = await parse_sse(
+        [
+            _sse_json_chunk('{"choices":["bad-choice",1]}'),
+            b"data: [DONE]\n\n",
+        ]
+    )
+
+    errors = [
+        event.data
+        for event in events
+        if event.type is RunnerEventType.PROVIDER_PROTOCOL_ERROR
+    ]
+    assert len(errors) == 1
+    assert isinstance(errors[0], RunnerProtocolErrorData)
+    assert errors[0].error_code == "sse_missing_choices"
+    done = [event for event in events if event.type is RunnerEventType.RUNNER_DONE]
+    assert len(done) == 1
+
+
+@pytest.mark.asyncio
 async def test_sse_tool_call_missing_id_emits_missing_id_error() -> None:
     """tool_call 始终缺失 ``id`` → fatal 错误 + Done(ERROR)，无 ToolCallsCompleted。"""
 

@@ -860,6 +860,7 @@ class EngineEventIngestor:
         if (
             run.session_id != envelope.session_id
             or run.run_id != envelope.run_id
+            or run.current_attempt_id != envelope.attempt_id
             or attempt.run_id != envelope.run_id
             or attempt.execution_id != envelope.execution_id
             or dispatch_record.dispatch_record_id != envelope.dispatch_record_id
