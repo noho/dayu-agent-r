@@ -15,6 +15,7 @@ from dayu.engine.contracts.agent_run import (
     EngineRunOutcomeFailed,
     EngineRunOutcomeFinalAnswer,
 )
+from dayu.engine.contracts.agent_policy import AgentPolicy
 from dayu.engine.contracts.finish_reason import FinishReason
 from dayu.engine.contracts.runner_spec import RunnerCallOptions, RunnerSpec
 from dayu.host.compaction import (
@@ -44,6 +45,12 @@ _TEST_SYSTEM_PROMPT = "test compactor system prompt"
 _TEST_USER_PROMPT_TEMPLATE = (
     "test compactor user prompt\n\n<<compaction_request>>\n\nreturn strict json"
 )
+_TEST_AGENT_POLICY = AgentPolicy(
+    max_iterations=1,
+    continuation_max_attempts=0,
+    allow_tool_calls=False,
+    tool_execution_timeout_seconds=1.0,
+)
 
 
 def test_llm_context_compactor_does_not_use_thread_bridge() -> None:
@@ -71,18 +78,20 @@ def _llm_compactor(
     return LLMContextCompactor(
         runner_spec=runner_spec,
         runner_options=runner_options,
+        agent_policy=_TEST_AGENT_POLICY,
         system_prompt=_TEST_SYSTEM_PROMPT,
         user_prompt_template=_TEST_USER_PROMPT_TEMPLATE,
     )
 
 
 def test_llm_context_compactor_requires_scene_prompt_template() -> None:
-    """LLM compactor 要求调用方传入 scene 装配的双 prompt。"""
+    """LLM compactor 要求调用方传入 scene / baseline 装配的 prompt。"""
 
     with pytest.raises(ValueError, match="system_prompt"):
         LLMContextCompactor(
             runner_spec=_runner_spec(),
             runner_options=_runner_options(),
+            agent_policy=_TEST_AGENT_POLICY,
             system_prompt="",
             user_prompt_template=_TEST_USER_PROMPT_TEMPLATE,
         )
@@ -90,6 +99,7 @@ def test_llm_context_compactor_requires_scene_prompt_template() -> None:
         LLMContextCompactor(
             runner_spec=_runner_spec(),
             runner_options=_runner_options(),
+            agent_policy=_TEST_AGENT_POLICY,
             system_prompt=_TEST_SYSTEM_PROMPT,
             user_prompt_template="missing placeholder",
         )
@@ -120,13 +130,13 @@ async def test_llm_context_compactor_builds_tool_disabled_request(
     assert len(seen) == 1
     assert seen[0].runner_spec is runner_spec
     assert seen[0].runner_options is runner_options
+    assert seen[0].agent_policy is _TEST_AGENT_POLICY
     assert seen[0].cancellation_token is cancellation_token
     assert seen[0].messages[0].content == _TEST_SYSTEM_PROMPT
     assert seen[0].messages[1].content is not None
     assert seen[0].messages[1].content.startswith("test compactor user prompt")
     assert seen[0].disable_tools is True
     assert seen[0].tool_schemas == ()
-    assert seen[0].agent_policy.allow_tool_calls is False
 
 
 @pytest.mark.asyncio

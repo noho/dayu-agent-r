@@ -11,6 +11,7 @@ from typing import cast
 import pytest
 
 from dayu.contracts.json_value import JsonValue
+from dayu.engine.contracts.agent_policy import AgentFallbackMode, AgentPolicy
 from dayu.engine.contracts.runner_spec import RunnerCallOptions, RunnerSpec
 from dayu.host import CompactorRunnerBaseline, HostEventKind, open_host
 from dayu.host.context_policy import context_budget_policy_from_threshold_tokens
@@ -95,7 +96,11 @@ async def test_real_compactor_public_opener_compacts_and_preserves_continuity(
             runner_options=runner_options,
         ),
     )
-    compactor_system_prompt, compactor_user_prompt_template = _compactor_prompts()
+    (
+        compactor_system_prompt,
+        compactor_user_prompt_template,
+        compactor_agent_policy,
+    ) = _compactor_baseline_inputs()
     options = replace(
         base_options,
         context_budget_policy=context_budget_policy_from_threshold_tokens(
@@ -110,6 +115,7 @@ async def test_real_compactor_public_opener_compacts_and_preserves_continuity(
         compactor_runner_baseline=CompactorRunnerBaseline(
             compactor_runner_spec=compactor_runner_spec,
             compactor_runner_options=compactor_runner_options,
+            compactor_agent_policy=compactor_agent_policy,
             compactor_system_prompt=compactor_system_prompt,
             compactor_user_prompt_template=compactor_user_prompt_template,
             compact_artifact_root=compact_artifact_root,
@@ -181,11 +187,12 @@ def _soft_threshold_prompt() -> str:
     return _SOFT_THRESHOLD_PROMPT_SENTENCE * _SOFT_THRESHOLD_PROMPT_REPEAT_COUNT
 
 
-def _compactor_prompts() -> tuple[str, str]:
-    """通过默认 compactor baseline 指向的 scene 装配 compactor 双 prompt。
+def _compactor_baseline_inputs() -> tuple[str, str, AgentPolicy]:
+    """通过默认 compactor baseline 装配 compactor prompt 与 AgentPolicy。
 
-    :returns: system prompt 与 user prompt template。
-    :raises AssertionError: scene fragment 数量不符合 compactor 约定时抛出。
+    :returns: system prompt、user prompt template 与 AgentPolicy。
+    :raises AssertionError: scene 或 prompt asset 不符合 compactor 约定时抛出。
+    :raises OSError: user prompt template 读取失败时抛出。
     """
 
     config = ConfigLoader(package_config_dir=_PACKAGE_CONFIG_ROOT).load(
@@ -203,8 +210,39 @@ def _compactor_prompts() -> tuple[str, str]:
             available_tools=SceneToolCatalog(tools=()),
         )
     )
-    assert len(scene.system_messages) == 2
-    return scene.system_messages
+    assert len(scene.system_messages) == 1
+    user_prompt_template = (
+        _PACKAGE_CONFIG_ROOT
+        / "prompts"
+        / compactor_baseline.user_prompt_template_path
+    ).read_text(encoding="utf-8")
+    assert "<<compaction_request>>" in user_prompt_template
+    override = scene.agent_policy_override
+    assert override is not None
+    assert override.max_iterations is not None
+    assert override.continuation_max_attempts is not None
+    assert override.allow_tool_calls is not None
+    assert override.tool_execution_timeout_seconds is not None
+    assert override.fallback_mode is not None
+    assert override.fallback_prompt is not None
+    assert override.continuation_prompt is not None
+    assert override.max_consecutive_failed_tool_batches is not None
+    return (
+        scene.system_messages[0],
+        user_prompt_template,
+        AgentPolicy(
+            max_iterations=override.max_iterations,
+            continuation_max_attempts=override.continuation_max_attempts,
+            allow_tool_calls=override.allow_tool_calls,
+            tool_execution_timeout_seconds=override.tool_execution_timeout_seconds,
+            fallback_mode=AgentFallbackMode(override.fallback_mode.value),
+            fallback_prompt=override.fallback_prompt,
+            continuation_prompt=override.continuation_prompt,
+            max_consecutive_failed_tool_batches=(
+                override.max_consecutive_failed_tool_batches
+            ),
+        ),
+    )
 
 
 def _compactor_runner_options(model_id: str) -> RunnerCallOptions:

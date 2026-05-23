@@ -271,6 +271,7 @@ def test_compactor_runner_baseline_validates_typed_fields(
     baseline = CompactorRunnerBaseline(
         compactor_runner_spec=_runner_spec(),
         compactor_runner_options=_runner_options(),
+        compactor_agent_policy=_agent_policy(),
         compactor_system_prompt="test compactor system prompt",
         compactor_user_prompt_template=(
             "test compactor user prompt <<compaction_request>>"
@@ -280,6 +281,8 @@ def test_compactor_runner_baseline_validates_typed_fields(
     assert baseline.compact_artifact_create_parent_dirs
     with pytest.raises(TypeError, match="compactor_runner_spec"):
         replace(baseline, compactor_runner_spec=cast(RunnerSpec, "bad"))
+    with pytest.raises(TypeError, match="compactor_agent_policy"):
+        replace(baseline, compactor_agent_policy=cast(AgentPolicy, "bad"))
     with pytest.raises(TypeError, match="compact_artifact_root"):
         replace(baseline, compact_artifact_root=cast(pathlib.Path, "bad"))
     with pytest.raises(TypeError, match="compact_artifact_create_parent_dirs"):

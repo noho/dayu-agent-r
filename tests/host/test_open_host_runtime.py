@@ -489,6 +489,12 @@ def test_compactor_runner_baseline_maps_to_host_owned_compactor(
             compactor_runner_baseline=CompactorRunnerBaseline(
                 compactor_runner_spec=runner_spec,
                 compactor_runner_options=runner_options,
+                compactor_agent_policy=AgentPolicy(
+                    max_iterations=1,
+                    continuation_max_attempts=0,
+                    allow_tool_calls=False,
+                    tool_execution_timeout_seconds=1.0,
+                ),
                 compactor_system_prompt="test compactor system prompt",
                 compactor_user_prompt_template=(
                     "test compactor user prompt <<compaction_request>>"

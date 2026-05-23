@@ -12,6 +12,7 @@
         "model_id": "deepseek-v4-flash",
         "scene_id": "conversation_compaction",
         "runner_option_hint_id": "conversation_compaction",
+        "user_prompt_template_path": "scenes/conversation_compaction_user.md",
         "artifact_root": "workspace/.dayu/artifacts/compaction"
       },
       "context_budget_policy": {
@@ -79,6 +80,7 @@
         "model_id": "deepseek-v4-flash",
         "scene_id": "conversation_compaction",
         "runner_option_hint_id": "conversation_compaction",
+        "user_prompt_template_path": "scenes/conversation_compaction_user.md",
         "artifact_root": "workspace/.dayu/artifacts/compaction"
       },
       "context_budget_policy": {
@@ -146,6 +148,7 @@
         "model_id": "deepseek-v4-flash",
         "scene_id": "conversation_compaction",
         "runner_option_hint_id": "conversation_compaction",
+        "user_prompt_template_path": "scenes/conversation_compaction_user.md",
         "artifact_root": "workspace/.dayu/artifacts/compaction"
       },
       "context_budget_policy": {
@@ -213,6 +216,7 @@
         "model_id": "deepseek-v4-flash",
         "scene_id": "conversation_compaction",
         "runner_option_hint_id": "conversation_compaction",
+        "user_prompt_template_path": "scenes/conversation_compaction_user.md",
         "artifact_root": "workspace/.dayu/artifacts/compaction"
       },
       "context_budget_policy": {

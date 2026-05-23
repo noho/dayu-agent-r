@@ -9,7 +9,7 @@ from pathlib import Path
 import pytest
 
 from dayu.contracts import JsonValue
-from dayu.engine import AgentFallbackMode
+from dayu.engine import AgentFallbackMode, AgentPolicy
 from dayu.host.api import (
     AuthorizationClaim,
     FollowupBehavior,
@@ -115,6 +115,19 @@ def test_compose_open_host_options_uses_runtime_tuning_from_config(
     assert compactor_baseline.compactor_runner_options.max_tokens is None
     assert compactor_baseline.compactor_runner_options.top_p == 1.0
     assert compactor_baseline.compactor_runner_options.stream is False
+    assert compactor_baseline.compactor_agent_policy == AgentPolicy(
+        max_iterations=1,
+        continuation_max_attempts=0,
+        allow_tool_calls=False,
+        tool_execution_timeout_seconds=1.0,
+        fallback_mode=AgentFallbackMode.RAISE_ERROR,
+        fallback_prompt="Compactor is not allowed to fallback-answer.",
+        continuation_prompt=(
+            "Continue the strict JSON object without repeating content "
+            "already emitted."
+        ),
+        max_consecutive_failed_tool_batches=1,
+    )
     assert "Host-owned context compaction" in (
         compactor_baseline.compactor_system_prompt
     )
@@ -179,6 +192,7 @@ def test_compose_open_host_options_reads_compactor_scene_id_from_profile(
         compactor_baseline=replace(
             profile.compactor_baseline,
             scene_id=_CUSTOM_COMPACTOR_SCENE_ID,
+            user_prompt_template_path="scenes/custom_compactor_user.md",
         ),
     )
     custom_profiles = dict(config.execution_profiles.execution_profiles)
@@ -216,6 +230,8 @@ def test_compose_open_host_options_reads_compactor_scene_id_from_profile(
     assert compactor_baseline.compactor_user_prompt_template == (
         "custom compactor user prompt <<compaction_request>>"
     )
+    assert compactor_baseline.compactor_agent_policy.max_iterations == 1
+    assert compactor_baseline.compactor_agent_policy.allow_tool_calls is False
 
 
 def test_compose_submit_followup_request_uses_prepared_system_prompt(
@@ -267,16 +283,16 @@ def test_compose_submit_followup_request_uses_prepared_system_prompt(
     assert request.tool_names == frozenset({"record_smoke_fact"})
 
 
-def test_compactor_prompt_scene_requires_two_fragments() -> None:
-    """Compactor scene prompt 必须显式拆成 system / user template 两段。
+def test_compactor_prompt_scene_requires_one_system_fragment() -> None:
+    """Compactor scene prompt 必须只提供 system prompt fragment。
 
     :returns: ``None``。
     :raises AssertionError: helper 未 fail-fast 时抛出。
     """
 
     scene_inputs = PreparedSceneInputs(
-        system_messages=("only-system",),
-        system_prompt="only-system",
+        system_messages=("system", "extra"),
+        system_prompt="system\n\nextra",
         tool_selection=SceneToolSelectionResult(
             mode=SceneToolSelectionMode.NONE,
             tool_names=frozenset(),
@@ -289,8 +305,40 @@ def test_compactor_prompt_scene_requires_two_fragments() -> None:
         capability_tags=(),
     )
 
-    with pytest.raises(ValueError, match="compactor scene"):
-        _compactor_prompts_from_scene_inputs(scene_inputs)
+    with pytest.raises(ValueError, match="one system prompt"):
+        _compactor_prompts_from_scene_inputs(
+            scene_inputs,
+            user_prompt_template="user <<compaction_request>>",
+        )
+
+
+def test_compactor_prompt_scene_requires_agent_policy() -> None:
+    """Compactor scene 必须声明完整 AgentPolicy。
+
+    :returns: ``None``。
+    :raises AssertionError: helper 未 fail-fast 时抛出。
+    """
+
+    scene_inputs = PreparedSceneInputs(
+        system_messages=("system",),
+        system_prompt="system",
+        tool_selection=SceneToolSelectionResult(
+            mode=SceneToolSelectionMode.NONE,
+            tool_names=frozenset(),
+        ),
+        model_hints=None,
+        agent_policy_override=None,
+        fragment_refs=(),
+        source_refs=(),
+        content_digest="sha256:test",
+        capability_tags=(),
+    )
+
+    with pytest.raises(ValueError, match="agent_policy"):
+        _compactor_prompts_from_scene_inputs(
+            scene_inputs,
+            user_prompt_template="user <<compaction_request>>",
+        )
 
 
 def test_agent_fallback_mode_from_config_uses_engine_enum_values() -> None:
@@ -592,6 +640,9 @@ def _write_execution_profile_overlay(
                         "model_id": model_id,
                         "scene_id": "conversation_compaction",
                         "runner_option_hint_id": "conversation_compaction",
+                        "user_prompt_template_path": (
+                            "scenes/conversation_compaction_user.md"
+                        ),
                         "artifact_root": "workspace/.dayu/artifacts/compaction",
                     },
                     "context_budget_policy": {
@@ -675,6 +726,19 @@ def _custom_compactor_scene_locations(workspace_root: Path) -> RuntimeLocations:
                 "default_model_id": _MODEL_ID,
                 "runner_option_hint_id": "conversation_compaction",
             },
+            "agent_policy": {
+                "max_iterations": 1,
+                "continuation_max_attempts": 0,
+                "allow_tool_calls": False,
+                "tool_execution_timeout_seconds": 1.0,
+                "fallback_mode": "raise_error",
+                "fallback_prompt": "Compactor is not allowed to fallback-answer.",
+                "continuation_prompt": (
+                    "Continue the strict JSON object without repeating content "
+                    "already emitted."
+                ),
+                "max_consecutive_failed_tool_batches": 1,
+            },
             "tool_selection": {
                 "mode": "none",
                 "tool_names": [],
@@ -689,12 +753,6 @@ def _custom_compactor_scene_locations(workspace_root: Path) -> RuntimeLocations:
                     "id": "custom_compactor_system",
                     "path": "scenes/custom_compactor_system.md",
                     "order": 100,
-                    "required": True,
-                },
-                {
-                    "id": "custom_compactor_user",
-                    "path": "scenes/custom_compactor_user.md",
-                    "order": 200,
                     "required": True,
                 },
             ],

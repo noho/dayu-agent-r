@@ -15,7 +15,7 @@
 | `dayu.host.open_host` | `_SESSION_WATCH_POLL_INTERVAL_SECONDS = 0.05` | public watch 无事件时轮询间隔 | 否 | Host watch option |
 | `dayu.host.open_host` | command context fallback `context_window_size=8192`、`reserved_output_tokens=1024` | 未传 context policy 时构造 command options fallback | 是，来自 Host opener 边界 fallback | 继续归属 Host option，建议显式配置化 |
 | `dayu.host.context_policy` | soft ratio `0.8`、hard ratio `0.9`、compact 次数默认 `1` | `default_context_budget_policy` helper 的默认 policy | 是，构造 Host context budget policy 时使用 | Host context budget policy |
-| `dayu.host.llm_compaction` | `_COMPACTOR_MAX_ITERATIONS = 1`、`_COMPACTOR_TOOL_TIMEOUT_SECONDS = 1.0` | Host-owned compactor Engine request 的 AgentPolicy 默认 | 否 | Compactor Run spec / Agent policy profile |
+| `dayu.config.prompts.manifests.conversation_compaction` | `agent_policy.max_iterations = 1`、`agent_policy.tool_execution_timeout_seconds = 1.0` | Host-owned compactor Engine request 的 AgentPolicy 默认 | 是，经 Service 装配为 `CompactorRunnerBaseline.compactor_agent_policy` | Compactor scene `agent_policy` |
 | `dayu.host.llm_compaction` | `_MAX_SAFE_OUTCOME_MESSAGE_CHARS = 240` | compactor proposal 失败消息日志/异常摘要截断 | 否 | Host diagnostic/log policy |
 | `dayu.host.compaction_operation` | `_MAX_SAFE_EXCEPTION_MESSAGE_CHARS = 240` | compaction attempt 失败日志摘要截断 | 否 | Host diagnostic/log policy |
 | `dayu.host.compaction_operation` | next decision 字符串 `retry_semantic_repair` / `fail_compaction` | compaction attempt reject payload | 否 | Host context governance policy enum |
@@ -25,4 +25,3 @@
 | `dayu.runtime.lane` | claim TTL `30.0`、heartbeat `10.0`、busy timeout `5.0`、poll interval `0.05` | runtime lane 默认配置 | 否，`LaneConfig` / `SQLiteLaneCoordinatorConfig` 可覆盖 | Runtime lane config |
 | `dayu.engine.agent` | `_EXCEPTION_MESSAGE_MAX_LENGTH = 240` | runner/provider exception 进入 Engine failed 事件前脱敏截断 | 否 | Engine diagnostic/log policy |
 | `dayu.engine.agent` | fallback prompt 由 `AgentPolicy` 提供，测试 helper 默认 `"请直接回答。"` | force-answer fallback | 是 | Agent policy |
-

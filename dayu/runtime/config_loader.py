@@ -193,12 +193,15 @@ class CompactorBaselineConfig:
     :param model_id: compactor 模型 id。
     :param scene_id: compactor scene id。
     :param runner_option_hint_id: compactor runner option hint id。
+    :param user_prompt_template_path: compactor user prompt template 相对
+        prompt asset root 的路径。
     :param artifact_root: compact artifact 根目录。
     """
 
     model_id: str
     scene_id: str
     runner_option_hint_id: str
+    user_prompt_template_path: str
     artifact_root: str
 
 
@@ -1384,7 +1387,13 @@ def _parse_compactor_baseline(
     _require_exact_fields(
         record,
         allowed=frozenset(
-            {"model_id", "scene_id", "runner_option_hint_id", "artifact_root"}
+            {
+                "model_id",
+                "scene_id",
+                "runner_option_hint_id",
+                "user_prompt_template_path",
+                "artifact_root",
+            }
         ),
         context=context,
     )
@@ -1394,6 +1403,11 @@ def _parse_compactor_baseline(
         runner_option_hint_id=_require_str_field(
             record,
             field_name="runner_option_hint_id",
+            context=context,
+        ),
+        user_prompt_template_path=_require_str_field(
+            record,
+            field_name="user_prompt_template_path",
             context=context,
         ),
         artifact_root=_require_str_field(record, field_name="artifact_root", context=context),

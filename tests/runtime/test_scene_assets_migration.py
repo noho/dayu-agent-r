@@ -30,6 +30,9 @@ _OLD_SCENE_MAX_ITERATIONS: Final[Mapping[str, int]] = {
     "wechat": 16,
     "write": 24,
 }
+_COMPACTOR_POLICY_SCENES: Final[frozenset[str]] = frozenset(
+    {"conversation_compaction"}
+)
 _LEGACY_TOOLS_CONDITIONAL_MARKERS: Final[tuple[str, ...]] = (
     "<when_tag doc>",
     "</when_tag>",
@@ -248,7 +251,7 @@ def test_prompt_mt_scene_asset_is_removed_and_smoke_scene_is_ordinary_asset() ->
 
 
 def test_scene_manifest_agent_policy_carries_old_max_iterations_only() -> None:
-    """旧 scene 的 max_iterations 必须迁入新 agent_policy，工具超时不迁移。"""
+    """旧 scene 只迁移 max_iterations，compactor scene 可声明完整 policy。"""
 
     paths = tuple(_iter_manifest_paths())
     assert paths
@@ -259,6 +262,12 @@ def test_scene_manifest_agent_policy_carries_old_max_iterations_only() -> None:
         agent_policy = manifest.get("agent_policy")
         expected_max_iterations = _OLD_SCENE_MAX_ITERATIONS.get(scene)
         if expected_max_iterations is None:
+            if scene in _COMPACTOR_POLICY_SCENES:
+                assert isinstance(agent_policy, Mapping)
+                assert agent_policy.get("max_iterations") == 1
+                assert agent_policy.get("allow_tool_calls") is False
+                assert agent_policy.get("fallback_mode") == "raise_error"
+                continue
             assert agent_policy is None
             continue
 

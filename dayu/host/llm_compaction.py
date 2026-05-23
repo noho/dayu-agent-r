@@ -63,8 +63,6 @@ from dayu.host.context_budget import DEFAULT_ESTIMATOR_CHARS_PER_TOKEN
 from dayu.host.evidence import AcceptedEvidenceEnvelope, OpaqueEvidenceRef
 
 _COMPACTOR_RUN_ID_PREFIX = "context-compactor"
-_COMPACTOR_MAX_ITERATIONS = 1
-_COMPACTOR_TOOL_TIMEOUT_SECONDS = 1.0
 _MIN_PROPOSAL_LENGTH = 1
 _MAX_SAFE_OUTCOME_MESSAGE_CHARS = 240
 _TRUNCATED_SUFFIX = "..."
@@ -126,9 +124,11 @@ class LLMContextCompactor(ContextCompactor):
 
     :param runner_spec: compactor 独立 Runner 规约。
     :param runner_options: compactor 独立 Runner 调用参数。
+    :param agent_policy: compactor 独立 Agent policy。
     :param system_prompt: Service 从 compactor scene 装配的 system prompt。
-    :param user_prompt_template: Service 从 compactor scene 装配的 user prompt
-        template；必须包含 ``<<compaction_request>>`` 占位符。
+    :param user_prompt_template: Service 从 compactor baseline prompt asset
+        装配的 user prompt template；必须包含
+        ``<<compaction_request>>`` 占位符。
     """
 
     def __init__(
@@ -136,6 +136,7 @@ class LLMContextCompactor(ContextCompactor):
         *,
         runner_spec: RunnerSpec,
         runner_options: RunnerCallOptions,
+        agent_policy: AgentPolicy,
         system_prompt: str,
         user_prompt_template: str,
     ) -> None:
@@ -143,6 +144,7 @@ class LLMContextCompactor(ContextCompactor):
 
         :param runner_spec: compactor 独立 Runner 规约。
         :param runner_options: compactor 独立 Runner 调用参数。
+        :param agent_policy: compactor 独立 Agent policy。
         :param system_prompt: compactor system prompt。
         :param user_prompt_template: compactor user prompt template。
         :returns: ``None``。
@@ -154,6 +156,8 @@ class LLMContextCompactor(ContextCompactor):
             raise TypeError("runner_spec must be RunnerSpec")
         if not isinstance(runner_options, RunnerCallOptions):
             raise TypeError("runner_options must be RunnerCallOptions")
+        if not isinstance(agent_policy, AgentPolicy):
+            raise TypeError("agent_policy must be AgentPolicy")
         if not isinstance(system_prompt, str):
             raise TypeError("system_prompt must be str")
         if system_prompt.strip() == "":
@@ -169,6 +173,7 @@ class LLMContextCompactor(ContextCompactor):
             )
         self._runner_spec = runner_spec
         self._runner_options = runner_options
+        self._agent_policy = agent_policy
         self._system_prompt = system_prompt
         self._user_prompt_template = user_prompt_template
 
@@ -192,6 +197,7 @@ class LLMContextCompactor(ContextCompactor):
                 request,
                 self._runner_spec,
                 self._runner_options,
+                self._agent_policy,
                 self._system_prompt,
                 self._user_prompt_template,
                 cancellation_token,
@@ -211,6 +217,7 @@ def _agent_request(
     request: CompactionRequest,
     runner_spec: RunnerSpec,
     runner_options: RunnerCallOptions,
+    agent_policy: AgentPolicy,
     system_prompt: str,
     user_prompt_template: str,
     cancellation_token: CancellationToken,
@@ -220,6 +227,7 @@ def _agent_request(
     :param request: Host compaction request。
     :param runner_spec: compactor Runner 规约。
     :param runner_options: compactor Runner 调用参数。
+    :param agent_policy: compactor Agent policy。
     :param system_prompt: compactor system prompt。
     :param user_prompt_template: compactor user prompt template。
     :param cancellation_token: Host 注入 Engine 的真实取消 token。
@@ -239,12 +247,7 @@ def _agent_request(
         disable_tools=True,
         runner_spec=runner_spec,
         runner_options=runner_options,
-        agent_policy=AgentPolicy(
-            max_iterations=_COMPACTOR_MAX_ITERATIONS,
-            continuation_max_attempts=0,
-            allow_tool_calls=False,
-            tool_execution_timeout_seconds=_COMPACTOR_TOOL_TIMEOUT_SECONDS,
-        ),
+        agent_policy=agent_policy,
         tool_schemas=(),
         tool_executor=_RejectingToolExecutor(),
         cancellation_token=cancellation_token,
@@ -320,10 +323,11 @@ def _safe_outcome_text(text: str) -> str:
 
 
 def _user_prompt(request: CompactionRequest, template: str) -> str:
-    """用 scene template 构造 Host-owned compactor user prompt。
+    """用 baseline template 构造 Host-owned compactor user prompt。
 
     :param request: Host compaction request。
-    :param template: Service 从 scene 装配的 user prompt template。
+    :param template: Service 从 compactor baseline prompt asset 读取的 user
+        prompt template。
     :returns: 用户消息文本。
     """
 
