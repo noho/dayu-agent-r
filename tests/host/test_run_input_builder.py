@@ -158,7 +158,7 @@ class _SeededRun:
     dispatch_record_id: str
 
 
-class _NeverCancelledToken:
+class _OpenCancellationToken:
     """测试用未取消 token。"""
 
     def is_cancelled(self) -> bool:
@@ -2614,7 +2614,7 @@ def _token() -> CancellationToken:
     :returns: 未取消 token。
     """
 
-    return _NeverCancelledToken()
+    return _OpenCancellationToken()
 
 
 def _policy_snapshot(*, allow_tool_calls: bool = False) -> PolicySnapshot:

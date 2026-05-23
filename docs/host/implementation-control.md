@@ -227,7 +227,7 @@ Phase Map 中每个 phase 必须使用统一条目格式。模板如下：
 当前 gate：P12.5 draft PR gate PASS；draft-PR-pass。
 下一步：等待用户对 PR 68 的后续指令；若需要将 draft PR 标记 ready for review 或处理 GitHub review / CI，再按 `$phaseflow` / `$init-agents` 继续。
 
-当前 gate 结论：P12.5 implementation Slice 1-7、aggregate deepreview、targeted repair、aggregate re-review 与 PR 68 draft review 均已 PASS。`evidence_backed_facts` 现在基于 accepted evidence envelope 的 bounded `result_preview` 进入 LLM compact extraction；ToolRuntime accepted result 不直接物化 stable fact；accepted `CONTEXT_COMPACTED.evidence_backed_fact_candidates` 才进入 memory projection；dispatch memory projection lag 走 rebuild / retry，不触发 Run / Attempt 终态迁移。剩余风险为 `_NeverCancelledToken` compaction cancellation hardening、compactor prompt aggregate envelope budget、复杂工具结果 preview 质量与大 session rebuild performance，均不阻塞 draft PR。
+当前 gate 结论：P12.5 implementation Slice 1-7、aggregate deepreview、targeted repair、aggregate re-review、PR 68 draft review 与 post-draft cancellation hardening fix 均已 PASS。`evidence_backed_facts` 现在基于 accepted evidence envelope 的 bounded `result_preview` 进入 LLM compact extraction；ToolRuntime accepted result 不直接物化 stable fact；accepted `CONTEXT_COMPACTED.evidence_backed_fact_candidates` 才进入 memory projection；dispatch memory projection lag 走 rebuild / retry，不触发 Run / Attempt 终态迁移。生产代码不再允许 compactor 自行构造不可取消 token，compaction LLM call 必须接收 Host lifecycle cancellation token。剩余风险为 compactor prompt aggregate envelope budget、复杂工具结果 preview 质量与大 session rebuild performance。
 
 ## Phase Map
 
@@ -1696,6 +1696,11 @@ Plan 必须额外收口的 readiness review checklist：
   `docs/reviews/pr-68-review-controller-adjudication-20260523.md`。PR-level review PASS；DS 中等严重度 finding
   `compactor prompt accepted evidence envelopes aggregate token guard` 裁决为 prompt-budget hardening residual，因为每个
   `result_preview` 已有硬上限且 evidence-content correctness blocker 已关闭。P12.5 draft PR gate PASS；draft-PR-pass。
+  Post-draft cancellation hardening：用户指出 compaction LLM call 不能接 `_NeverCancelledToken`，controller 裁决该动机成立。
+  当前 PR fix 删除生产 `_NeverCancelledToken`，把 `CancellationToken` 显式贯穿 `ContextCompactor.compact(...)` 与
+  `run_compaction_operation(...)`；proactive compaction 使用 durable Run 状态观察 token，reactive compaction 复用 Engine envelope
+  token。Validation：`pytest tests/host/test_llm_compaction.py tests/host/test_compaction_contract.py tests/host/test_compaction_operation.py tests/host/test_compact_artifact_store.py tests/host/test_dispatch_scheduler.py tests/host/test_engine_ingest_mapping.py tests/host/test_toolruntime_executor.py tests/host/test_toolruntime_diagnostics.py tests/host/test_toolruntime_truncation_fetch_more.py tests/host/test_toolruntime_duplicate_governance.py tests/host/test_phase5_local_execution_integration.py tests/host/test_phase6_toolruntime_integration.py tests/host/test_phase7_waiting_integration.py tests/host/test_local_proxy_engine_ingest.py tests/host/test_recovery_dispatch.py tests/host/test_run_input_builder.py tests/host/test_resolve_wait_command.py tests/host/test_logging.py -q` PASS
+  (273 passed)；`python -m pyright dayu tests` PASS (0 errors)；`git diff --check` PASS。PR 68 回到 draft-PR-pass。
 
 目标：
 - 从买方财报分析 Agent 的第一性原理优化 Conversation Memory，使同一 session 内已由工具确认的关键财务事实能跨轮、

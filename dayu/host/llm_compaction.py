@@ -13,7 +13,6 @@ import asyncio
 import json
 import re
 from collections.abc import Mapping
-from datetime import datetime
 from json import JSONDecodeError
 from math import ceil
 from typing import cast
@@ -110,34 +109,6 @@ class LLMCompactionProposalError(RuntimeError):
     """
 
 
-class _NeverCancelledToken(CancellationToken):
-    """compactor proposal 使用的不可取消 token。"""
-
-    def is_cancelled(self) -> bool:
-        """返回取消状态。
-
-        :returns: 始终返回 ``False``。
-        """
-
-        return False
-
-    def cancel_reason(self) -> str | None:
-        """返回取消原因。
-
-        :returns: 始终返回 ``None``。
-        """
-
-        return None
-
-    def requested_at(self) -> datetime | None:
-        """返回取消请求时间。
-
-        :returns: 始终返回 ``None``。
-        """
-
-        return None
-
-
 class _RejectingToolExecutor(ToolExecutor):
     """禁用工具 compactor 的 rejecting executor。
 
@@ -187,10 +158,13 @@ class LLMContextCompactor(ContextCompactor):
         self._runner_spec = runner_spec
         self._runner_options = runner_options
 
-    async def compact(self, request: CompactionRequest) -> CompactionCandidate:
+    async def compact(
+        self, request: CompactionRequest, cancellation_token: CancellationToken
+    ) -> CompactionCandidate:
         """执行一次 LLM compaction proposal。
 
         :param request: Host 构造的 immutable compaction request。
+        :param cancellation_token: Host run lifecycle 注入的真实取消 token。
         :returns: Host-owned candidate。
         :raises TypeError: request 类型非法时抛出。
         :raises LLMCompactionProposalError: LLM 没有返回可用 structured proposal 时抛出。
@@ -200,7 +174,12 @@ class LLMContextCompactor(ContextCompactor):
         if not isinstance(request, CompactionRequest):
             raise TypeError("request must be CompactionRequest")
         outcome = await _run_agent_request(
-            _agent_request(request, self._runner_spec, self._runner_options),
+            _agent_request(
+                request,
+                self._runner_spec,
+                self._runner_options,
+                cancellation_token,
+            ),
             timeout_seconds=self._runner_spec.default_timeout_seconds,
         )
         if not isinstance(outcome, EngineRunOutcomeFinalAnswer):
@@ -216,12 +195,14 @@ def _agent_request(
     request: CompactionRequest,
     runner_spec: RunnerSpec,
     runner_options: RunnerCallOptions,
+    cancellation_token: CancellationToken,
 ) -> AgentRunRequest:
     """构造禁用工具的 Engine public run request。
 
     :param request: Host compaction request。
     :param runner_spec: compactor Runner 规约。
     :param runner_options: compactor Runner 调用参数。
+    :param cancellation_token: Host 注入 Engine 的真实取消 token。
     :returns: Engine AgentRunRequest。
     """
 
@@ -243,7 +224,7 @@ def _agent_request(
         ),
         tool_schemas=(),
         tool_executor=_RejectingToolExecutor(),
-        cancellation_token=_NeverCancelledToken(),
+        cancellation_token=cancellation_token,
     )
 
 

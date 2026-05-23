@@ -13,6 +13,7 @@ from typing import cast
 
 import pytest
 
+from dayu.contracts.cancellation import CancellationToken
 from dayu.engine.contracts.agent_policy import AgentPolicy
 from dayu.engine.contracts.agent_run import AgentRunRequest
 from dayu.engine.contracts.engine_events import (
@@ -266,10 +267,13 @@ class _TransactionReadableCompactor(ContextCompactor):
         self.calls = 0
         self._fake = FakeContextCompactor()
 
-    async def compact(self, request: CompactionRequest) -> CompactionCandidate:
+    async def compact(
+        self, request: CompactionRequest, cancellation_token: CancellationToken
+    ) -> CompactionCandidate:
         """执行 compact 并验证当前不在外层 write transaction 内。
 
         :param request: compaction request。
+        :param cancellation_token: Host 注入的取消 token。
         :returns: fake compaction candidate。
         """
 
@@ -278,7 +282,7 @@ class _TransactionReadableCompactor(ContextCompactor):
             lambda transaction: read_run_by_id(transaction, request.run_id)
         )
         assert row is not None
-        return await self._fake.compact(request)
+        return await self._fake.compact(request, cancellation_token)
 
 
 class _StaleMutatingCompactor(ContextCompactor):
@@ -294,10 +298,13 @@ class _StaleMutatingCompactor(ContextCompactor):
         self._transaction_runner = transaction_runner
         self._fake = FakeContextCompactor()
 
-    async def compact(self, request: CompactionRequest) -> CompactionCandidate:
+    async def compact(
+        self, request: CompactionRequest, cancellation_token: CancellationToken
+    ) -> CompactionCandidate:
         """先把源 Run 失败收口，再返回 candidate。
 
         :param request: compaction request。
+        :param cancellation_token: Host 注入的取消 token。
         :returns: fake compaction candidate。
         """
 
@@ -321,21 +328,25 @@ class _StaleMutatingCompactor(ContextCompactor):
             )
 
         self._transaction_runner.run_write(_operation)
-        return await self._fake.compact(request)
+        return await self._fake.compact(request, cancellation_token)
 
 
 class _RaisingCompactor(ContextCompactor):
     """测试用始终失败 compactor。"""
 
-    async def compact(self, request: CompactionRequest) -> CompactionCandidate:
+    async def compact(
+        self, request: CompactionRequest, cancellation_token: CancellationToken
+    ) -> CompactionCandidate:
         """模拟 proposal failure。
 
         :param request: compaction request。
+        :param cancellation_token: Host 注入的取消 token。
         :returns: 不会返回。
         :raises RuntimeError: 始终抛出测试错误。
         """
 
         del request
+        del cancellation_token
         raise RuntimeError("proposal failed")
 
 
@@ -351,15 +362,18 @@ class _QualityRejectOnceCompactor(ContextCompactor):
         self.calls = 0
         self._fake = FakeContextCompactor()
 
-    async def compact(self, request: CompactionRequest) -> CompactionCandidate:
+    async def compact(
+        self, request: CompactionRequest, cancellation_token: CancellationToken
+    ) -> CompactionCandidate:
         """构造一次可修复 quality rejection。
 
         :param request: compaction request。
+        :param cancellation_token: Host 注入的取消 token。
         :returns: compaction candidate。
         """
 
         self.calls += 1
-        candidate = await self._fake.compact(request)
+        candidate = await self._fake.compact(request, cancellation_token)
         if self.calls == 1:
             return replace(candidate, retained_current_user_input_ref="wrong-input")
         return candidate

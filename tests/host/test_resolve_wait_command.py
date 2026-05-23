@@ -439,7 +439,7 @@ class _SeededWaitingRun:
         self.wait_id = wait_id
 
 
-class _NeverCancelledToken:
+class _OpenCancellationToken:
     """测试用未取消 token。"""
 
     def is_cancelled(self) -> bool:
@@ -987,7 +987,7 @@ def _token() -> CancellationToken:
     :returns: 未取消 token。
     """
 
-    return _NeverCancelledToken()
+    return _OpenCancellationToken()
 
 
 def _policy_snapshot() -> PolicySnapshot:

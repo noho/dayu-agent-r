@@ -31,6 +31,7 @@ from dayu.host.evidence import (
     AcceptedEvidenceResultRef,
     AcceptedEvidenceToolQuery,
 )
+from tests.host.fake_cancellation import StubCancellationToken
 from tests.host.fake_compaction import FakeContextCompactor
 
 
@@ -42,7 +43,7 @@ async def test_fake_compactor_produces_typed_candidates_and_evidence() -> None:
     """
 
     request = _request()
-    candidate = await FakeContextCompactor().compact(request)
+    candidate = await FakeContextCompactor().compact(request, StubCancellationToken())
     result = check_compaction_candidate(request, candidate)
 
     assert candidate.episode_summary_candidate.candidate_id == "fake-summary:run-1"
@@ -54,6 +55,19 @@ async def test_fake_compactor_produces_typed_candidates_and_evidence() -> None:
 
 
 @pytest.mark.asyncio
+async def test_fake_compactor_observes_cancellation_token() -> None:
+    """Fake compactor 观察测试 cancellation token，避免测试吞掉取消语义。
+
+    :returns: ``None``。
+    """
+
+    with pytest.raises(RuntimeError, match="compaction cancelled"):
+        await FakeContextCompactor().compact(
+            _request(), StubCancellationToken("cancelled-by-test")
+        )
+
+
+@pytest.mark.asyncio
 async def test_fact_candidates_can_reference_accepted_evidence_envelopes() -> None:
     """Fact candidates 可以引用 request 中的 accepted evidence envelope。
 
@@ -61,7 +75,7 @@ async def test_fact_candidates_can_reference_accepted_evidence_envelopes() -> No
     """
 
     request = _request()
-    candidate = await FakeContextCompactor().compact(request)
+    candidate = await FakeContextCompactor().compact(request, StubCancellationToken())
     result = check_compaction_candidate(request, candidate)
 
     assert result.accepted is True
@@ -94,7 +108,7 @@ async def test_fake_compactor_caps_budget_below_hard_threshold_when_preserved_re
     )
     request = replace(request, budget_before_compact=budget)
 
-    candidate = await FakeContextCompactor().compact(request)
+    candidate = await FakeContextCompactor().compact(request, StubCancellationToken())
 
     assert candidate.budget_after_compact == budget.hard_threshold_tokens - 1
 
@@ -108,7 +122,7 @@ async def test_quality_rejects_missing_current_user_input() -> None:
 
     request = _request()
     candidate = replace(
-        await FakeContextCompactor().compact(request),
+        await FakeContextCompactor().compact(request, StubCancellationToken()),
         retained_current_user_input_ref=None,
     )
 
@@ -127,7 +141,7 @@ async def test_quality_rejects_missing_accepted_evidence_refs() -> None:
 
     request = _request()
     candidate = replace(
-        await FakeContextCompactor().compact(request),
+        await FakeContextCompactor().compact(request, StubCancellationToken()),
         preserved_accepted_evidence_refs=("evidence:accepted-1",),
     )
 
@@ -148,7 +162,7 @@ async def test_quality_rejects_missing_preservation_evidence() -> None:
 
     request = _request()
     candidate = replace(
-        await FakeContextCompactor().compact(request),
+        await FakeContextCompactor().compact(request, StubCancellationToken()),
         preservation_evidence=(),
     )
 
@@ -168,7 +182,7 @@ async def test_quality_rejects_missing_evidence_anchor_retention() -> None:
     """
 
     request = _request()
-    candidate = await FakeContextCompactor().compact(request)
+    candidate = await FakeContextCompactor().compact(request, StubCancellationToken())
     evidence = replace(
         candidate.preservation_evidence[0],
         input_event_refs=("event-old",),
@@ -191,7 +205,7 @@ async def test_quality_rejects_invalid_pinned_patch_tri_state() -> None:
     """
 
     request = _request()
-    candidate = await FakeContextCompactor().compact(request)
+    candidate = await FakeContextCompactor().compact(request, StubCancellationToken())
     invalid_patch = replace(
         candidate.pinned_state_patch_candidate,
         current_goal=PinnedTextFieldPatch(
@@ -218,7 +232,7 @@ async def test_quality_rejects_pinned_patch_unknown_evidence_ref() -> None:
     """
 
     request = _request()
-    candidate = await FakeContextCompactor().compact(request)
+    candidate = await FakeContextCompactor().compact(request, StubCancellationToken())
     invalid_patch = replace(
         candidate.pinned_state_patch_candidate,
         open_questions=PinnedStringTupleFieldPatch(
@@ -245,7 +259,7 @@ async def test_quality_marks_open_questions_lost_when_clear_without_summary_ques
     """
 
     request = _request()
-    candidate = await FakeContextCompactor().compact(request)
+    candidate = await FakeContextCompactor().compact(request, StubCancellationToken())
     summary = replace(candidate.episode_summary_candidate, open_questions=())
     pinned_patch = replace(
         candidate.pinned_state_patch_candidate,
@@ -276,7 +290,7 @@ async def test_quality_rejects_summary_pretending_to_create_evidence_backed_fact
     """
 
     request = _request()
-    candidate = await FakeContextCompactor().compact(request)
+    candidate = await FakeContextCompactor().compact(request, StubCancellationToken())
     invalid_summary = replace(
         candidate.episode_summary_candidate,
         proposed_evidence_backed_fact_refs=("summary-made-fact",),
@@ -299,7 +313,7 @@ async def test_quality_rejects_summary_confirmed_fact_ref_to_accepted_evidence()
     """
 
     request = _request()
-    candidate = await FakeContextCompactor().compact(request)
+    candidate = await FakeContextCompactor().compact(request, StubCancellationToken())
     invalid_summary = replace(
         candidate.episode_summary_candidate,
         confirmed_fact_refs=("evidence:accepted-1",),
@@ -322,7 +336,7 @@ async def test_quality_rejects_fact_candidate_referencing_non_evidence_ref() -> 
     """
 
     request = _request()
-    candidate = await FakeContextCompactor().compact(request)
+    candidate = await FakeContextCompactor().compact(request, StubCancellationToken())
     invalid_fact = replace(
         candidate.evidence_backed_fact_candidates[0],
         evidence_refs=("event-current",),
@@ -346,7 +360,7 @@ async def test_quality_rejects_missing_fact_candidate_for_accepted_evidence() ->
 
     request = _request()
     candidate = replace(
-        await FakeContextCompactor().compact(request),
+        await FakeContextCompactor().compact(request, StubCancellationToken()),
         evidence_backed_fact_candidates=(),
     )
 
@@ -430,7 +444,7 @@ async def test_quality_rejects_minimum_preserve_source_outside_compact_input() -
     """
 
     request = _request()
-    candidate = await FakeContextCompactor().compact(request)
+    candidate = await FakeContextCompactor().compact(request, StubCancellationToken())
     invalid_item = replace(
         candidate.minimum_preserve_item_candidates[0],
         source_refs=("evidence:accepted-1",),
@@ -450,7 +464,7 @@ async def test_quality_rejects_compact_range_outside_request() -> None:
     """Quality check 拒绝不属于 older raw turns 的 compact range 声明。"""
 
     request = _request()
-    candidate = await FakeContextCompactor().compact(request)
+    candidate = await FakeContextCompactor().compact(request, StubCancellationToken())
     invalid_range = CompactInputRange(
         range_ref="range-outside",
         start_input_ref="event-current",

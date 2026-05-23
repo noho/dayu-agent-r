@@ -11,6 +11,7 @@ import logging
 import re
 from dataclasses import dataclass
 
+from dayu.contracts.cancellation import CancellationToken
 from dayu.host.compaction import (
     CompactQualityCheckResult,
     CompactionCandidate,
@@ -84,12 +85,14 @@ async def run_compaction_operation(
     request: CompactionRequest,
     compactor: ContextCompactor,
     max_attempts: int,
+    cancellation_token: CancellationToken,
 ) -> CompactionOperationResult:
     """在事务外执行 Host semantic compaction operation。
 
     :param request: Host compaction request。
     :param compactor: Host internal compactor seam。
     :param max_attempts: proposal attempt 上限。
+    :param cancellation_token: Host 注入 compactor 的真实取消 token。
     :returns: compaction operation 结果。
     """
 
@@ -103,7 +106,7 @@ async def run_compaction_operation(
             else _NEXT_DECISION_FAIL_COMPACTION
         )
         try:
-            candidate = await compactor.compact(request)
+            candidate = await compactor.compact(request, cancellation_token)
         except Exception as exc:
             rejected_attempt = _attempt_rejected(
                 request=request,

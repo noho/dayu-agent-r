@@ -125,7 +125,7 @@ class _RecordingWakeup:
         self.promoted_sessions.append(session_id)
 
 
-class _NeverCancelledToken:
+class _OpenCancellationToken:
     """测试用未取消 token。"""
 
     def is_cancelled(self) -> bool:
@@ -494,7 +494,7 @@ def _old_final_answer_candidate(old: _SeededRun) -> EngineEventCandidate:
     :returns: Engine event candidate。
     """
 
-    token: CancellationToken = _NeverCancelledToken()
+    token: CancellationToken = _OpenCancellationToken()
     return EngineEventCandidate(
         envelope=LocalEngineEnvelope(
             session_id=old.session_id,

@@ -6,6 +6,7 @@
 
 from __future__ import annotations
 
+from dayu.contracts.cancellation import CancellationToken
 from dayu.host.compaction import (
     CompactInputRange,
     CompactionCandidate,
@@ -39,16 +40,22 @@ class FakeContextCompactor(ContextCompactor):
     状态，不应作为生产默认 compactor。
     """
 
-    async def compact(self, request: CompactionRequest) -> CompactionCandidate:
+    async def compact(
+        self, request: CompactionRequest, cancellation_token: CancellationToken
+    ) -> CompactionCandidate:
         """生成 deterministic compaction candidate。
 
         :param request: Host 构造的 compaction 请求。
+        :param cancellation_token: Host 注入的取消 token。
         :returns: deterministic compaction candidate。
         :raises TypeError: ``request`` 类型非法时抛出。
+        :raises RuntimeError: token 已取消时抛出。
         """
 
         if not isinstance(request, CompactionRequest):
             raise TypeError("request must be CompactionRequest")
+        if cancellation_token.is_cancelled():
+            raise RuntimeError("compaction cancelled")
         evidence = _preservation_evidence(request)
         evidence_refs = tuple(evidence_item.evidence_id for evidence_item in evidence)
         summarized_ranges = _summarized_ranges(request)

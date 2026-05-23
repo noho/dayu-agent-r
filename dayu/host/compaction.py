@@ -12,6 +12,7 @@ from dataclasses import dataclass, field
 from enum import StrEnum
 from typing import Protocol
 
+from dayu.contracts.cancellation import CancellationToken
 from dayu.contracts.json_value import JsonValue
 from dayu.host._public_validation import (
     require_non_empty as _require_non_empty,
@@ -1138,10 +1139,13 @@ class ContextCompactor(Protocol):
     必须由 quality checker 通过后才可写 compact artifact / canonical event。
     """
 
-    async def compact(self, request: CompactionRequest) -> CompactionCandidate:
+    async def compact(
+        self, request: CompactionRequest, cancellation_token: CancellationToken
+    ) -> CompactionCandidate:
         """生成 compaction candidate。
 
         :param request: Host 构造的 compaction 请求。
+        :param cancellation_token: Host 注入的真实取消 token。
         :returns: compaction candidate。
         :raises RuntimeError: compactor 后端失败时可抛出运行时错误。
         """

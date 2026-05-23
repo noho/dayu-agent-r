@@ -35,6 +35,7 @@ from dayu.host.llm_compaction import (
     LLMCompactionProposalError,
     LLMContextCompactor,
 )
+from tests.host.fake_cancellation import StubCancellationToken
 
 _DIGEST = "sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
 
@@ -64,15 +65,17 @@ async def test_llm_context_compactor_builds_tool_disabled_request(
     monkeypatch.setattr("dayu.host.llm_compaction.run_agent_and_wait", _fake_run)
     runner_spec = _runner_spec(max_retries=3)
     runner_options = _runner_options()
+    cancellation_token = StubCancellationToken()
 
     await LLMContextCompactor(
         runner_spec=runner_spec,
         runner_options=runner_options,
-    ).compact(_request())
+    ).compact(_request(), cancellation_token)
 
     assert len(seen) == 1
     assert seen[0].runner_spec is runner_spec
     assert seen[0].runner_options is runner_options
+    assert seen[0].cancellation_token is cancellation_token
     assert seen[0].disable_tools is True
     assert seen[0].tool_schemas == ()
     assert seen[0].agent_policy.allow_tool_calls is False
@@ -95,7 +98,7 @@ async def test_llm_context_compactor_prompt_contains_accepted_evidence_preview(
     await LLMContextCompactor(
         runner_spec=_runner_spec(),
         runner_options=_runner_options(),
-    ).compact(_request())
+    ).compact(_request(), StubCancellationToken())
 
     assert len(seen) == 1
     user_message = seen[0].messages[1]
@@ -128,7 +131,7 @@ async def test_llm_context_compactor_maps_final_answer_to_candidate(
     candidate = await LLMContextCompactor(
         runner_spec=_runner_spec(),
         runner_options=_runner_options(),
-    ).compact(_request())
+    ).compact(_request(), StubCancellationToken())
 
     assert candidate.episode_summary_candidate.goal == "keep the current user request"
     assert candidate.pinned_state_patch_candidate.current_goal.value == (
@@ -166,7 +169,7 @@ async def test_llm_context_compactor_budget_counts_preserved_context(
     candidate = await LLMContextCompactor(
         runner_spec=_runner_spec(),
         runner_options=_runner_options(),
-    ).compact(_request())
+    ).compact(_request(), StubCancellationToken())
 
     assert candidate.budget_after_compact >= 80
 
@@ -192,7 +195,7 @@ async def test_llm_context_compactor_budget_counts_structured_output_text(
             )
         ),
     )
-    short_candidate = await compactor.compact(_request())
+    short_candidate = await compactor.compact(_request(), StubCancellationToken())
 
     monkeypatch.setattr(
         "dayu.host.llm_compaction.run_agent_and_wait",
@@ -205,7 +208,7 @@ async def test_llm_context_compactor_budget_counts_structured_output_text(
             )
         ),
     )
-    long_candidate = await compactor.compact(_request())
+    long_candidate = await compactor.compact(_request(), StubCancellationToken())
 
     assert long_candidate.episode_summary_candidate.goal == (
         short_candidate.episode_summary_candidate.goal
@@ -228,14 +231,14 @@ async def test_llm_context_compactor_rejects_empty_plain_text_or_non_final_outpu
         runner_options=_runner_options(),
     )
     with pytest.raises(LLMCompactionProposalError, match="proposal is empty"):
-        await compactor.compact(_request())
+        await compactor.compact(_request(), StubCancellationToken())
 
     monkeypatch.setattr(
         "dayu.host.llm_compaction.run_agent_and_wait",
         _fake_run_factory(_final("plain text summary")),
     )
     with pytest.raises(LLMCompactionProposalError, match="not valid JSON"):
-        await compactor.compact(_request())
+        await compactor.compact(_request(), StubCancellationToken())
 
     monkeypatch.setattr(
         "dayu.host.llm_compaction.run_agent_and_wait",
@@ -251,7 +254,7 @@ async def test_llm_context_compactor_rejects_empty_plain_text_or_non_final_outpu
         ),
     )
     with pytest.raises(LLMCompactionProposalError, match="runner failed"):
-        await compactor.compact(_request())
+        await compactor.compact(_request(), StubCancellationToken())
 
 
 @pytest.mark.asyncio
@@ -269,7 +272,7 @@ async def test_llm_context_compactor_rejects_malformed_and_schema_invalid_json(
         _fake_run_factory(_final('{"episode_summary_candidate": ')),
     )
     with pytest.raises(LLMCompactionProposalError, match="not valid JSON"):
-        await compactor.compact(_request())
+        await compactor.compact(_request(), StubCancellationToken())
 
     monkeypatch.setattr(
         "dayu.host.llm_compaction.run_agent_and_wait",
@@ -278,7 +281,7 @@ async def test_llm_context_compactor_rejects_malformed_and_schema_invalid_json(
         ),
     )
     with pytest.raises(LLMCompactionProposalError, match="missing required key"):
-        await compactor.compact(_request())
+        await compactor.compact(_request(), StubCancellationToken())
 
 
 @pytest.mark.asyncio
@@ -303,7 +306,7 @@ async def test_llm_context_compactor_rejects_overlong_structured_text(
         ),
     )
     with pytest.raises(LLMCompactionProposalError, match="claim_text"):
-        await compactor.compact(_request())
+        await compactor.compact(_request(), StubCancellationToken())
 
     monkeypatch.setattr(
         "dayu.host.llm_compaction.run_agent_and_wait",
@@ -320,7 +323,7 @@ async def test_llm_context_compactor_rejects_overlong_structured_text(
         LLMCompactionProposalError,
         match="MinimumPreserveItemCandidate.text",
     ):
-        await compactor.compact(_request())
+        await compactor.compact(_request(), StubCancellationToken())
 
 
 @pytest.mark.asyncio
@@ -341,7 +344,7 @@ async def test_llm_context_compactor_rejects_non_accepted_evidence_refs(
     )
 
     with pytest.raises(LLMCompactionProposalError, match="unknown ref"):
-        await compactor.compact(_request())
+        await compactor.compact(_request(), StubCancellationToken())
 
 
 @pytest.mark.asyncio
@@ -360,7 +363,7 @@ async def test_llm_context_compactor_rejects_truncated_final_output(
     )
 
     with pytest.raises(LLMCompactionProposalError, match="truncated"):
-        await compactor.compact(_request())
+        await compactor.compact(_request(), StubCancellationToken())
 
 
 @pytest.mark.asyncio
@@ -388,7 +391,7 @@ async def test_llm_context_compactor_applies_runner_timeout(
     )
 
     with pytest.raises(TimeoutError):
-        await compactor.compact(_request())
+        await compactor.compact(_request(), StubCancellationToken())
 
 
 @pytest.mark.asyncio
@@ -424,7 +427,7 @@ async def test_llm_context_compactor_sanitizes_failed_runner_outcome(
     )
 
     with pytest.raises(LLMCompactionProposalError) as exc_info:
-        await compactor.compact(_request())
+        await compactor.compact(_request(), StubCancellationToken())
 
     message = str(exc_info.value)
     assert "error_code=unknown_error" in message
@@ -451,7 +454,7 @@ async def test_llm_context_compactor_preserves_host_owned_refs_and_evidence(
     candidate = await LLMContextCompactor(
         runner_spec=_runner_spec(),
         runner_options=_runner_options(),
-    ).compact(_request())
+    ).compact(_request(), StubCancellationToken())
 
     evidence = candidate.preservation_evidence[0]
     assert evidence.input_event_refs == ("input-1", "input-2")
@@ -484,7 +487,7 @@ async def test_llm_context_compactor_uses_runner_retry_policy_without_owning_sem
     )
 
     with pytest.raises(RuntimeError, match="runner failed"):
-        await compactor.compact(_request())
+        await compactor.compact(_request(), StubCancellationToken())
 
     assert len(calls) == 1
     assert calls[0].runner_spec.max_retries == 5

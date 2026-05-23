@@ -197,6 +197,9 @@ _LANE_OWNER_PREFIX = "host-dispatch"
 _GOVERNANCE_ACTOR = "host.context_governance"
 _GOVERNANCE_FAILURE_REASON = "pre_dispatch_context_governance"
 _COMPACT_FAILURE_POLICY_DECISION = "compact_failed_before_dispatch"
+_COMPACTION_CANCEL_REASON_RUN_MISSING = "run_missing"
+_COMPACTION_CANCEL_REASON_INPUT_CHANGED = "run_input_event_sequence_changed"
+_COMPACTION_CANCEL_REASON_STATUS_PREFIX = "run_status_changed"
 _HOST_INSTANCE_HEARTBEAT_INTERVAL_SECONDS = 1.0
 _LOG_DRAIN_LOOP_IDLE = (
     "dispatch.drain_loop.idle host_handle_id=%s interval_seconds=%s"
@@ -481,6 +484,105 @@ class _HostCancellationToken(CancellationToken):
             if self._reason is None:
                 self._reason = reason
                 self._requested_at = datetime.now(UTC)
+
+
+@dataclass(frozen=True, slots=True)
+class _ReadCompactionCancelReasonOperation:
+    """读取 proactive compaction 是否已失效的 durable operation。
+
+    :param run_id: 目标 Run id。
+    :param expected_status: compaction request 写入时的 Run 状态。
+    :param expected_input_event_sequence: compaction request 对应输入 cursor。
+    """
+
+    run_id: str
+    expected_status: RunStatus
+    expected_input_event_sequence: int
+
+    def __call__(self, transaction: HostTransaction) -> str | None:
+        """读取 durable Run 并派生取消原因。
+
+        :param transaction: Host durable read transaction。
+        :returns: 取消原因；Run 仍满足 request 前置条件时为 ``None``。
+        """
+
+        run = read_run_by_id(transaction, self.run_id)
+        if run is None:
+            return _COMPACTION_CANCEL_REASON_RUN_MISSING
+        if run.input_event_sequence != self.expected_input_event_sequence:
+            return _COMPACTION_CANCEL_REASON_INPUT_CHANGED
+        if run.status != self.expected_status:
+            return f"{_COMPACTION_CANCEL_REASON_STATUS_PREFIX}:{run.status.value}"
+        return None
+
+
+class _DurableRunCancellationToken(CancellationToken):
+    """通过 durable Run 状态观察 proactive compaction 是否应取消。
+
+    proactive compaction 发生在 worker 启动前，尚没有 active worker registry
+    可以接收 cancel。因此此 token 直接读取 Host durable Run 真源：只要 Run
+    缺失、输入 cursor 改变或状态离开 request 写入时的期望状态，就让 Engine
+    看到取消信号。
+    """
+
+    def __init__(
+        self,
+        *,
+        transaction_runner: HostTransactionRunner,
+        run_id: str,
+        expected_status: RunStatus,
+        expected_input_event_sequence: int,
+    ) -> None:
+        """初始化 durable Run 观察 token。
+
+        :param transaction_runner: Host durable transaction runner。
+        :param run_id: 目标 Run id。
+        :param expected_status: compaction request 写入时的 Run 状态。
+        :param expected_input_event_sequence: compaction request 对应输入 cursor。
+        :returns: ``None``。
+        """
+
+        self._transaction_runner = transaction_runner
+        self._run_id = run_id
+        self._expected_status = expected_status
+        self._expected_input_event_sequence = expected_input_event_sequence
+
+    def is_cancelled(self) -> bool:
+        """返回 proactive compaction 是否已失效。
+
+        :returns: durable Run 已离开原 request 前置条件时返回 ``True``。
+        """
+
+        return self.cancel_reason() is not None
+
+    def cancel_reason(self) -> str | None:
+        """读取 durable Run 状态并返回取消原因。
+
+        :returns: 取消原因；Run 仍满足 request 前置条件时为 ``None``。
+        """
+
+        try:
+            return self._transaction_runner.run_read(
+                _ReadCompactionCancelReasonOperation(
+                    run_id=self._run_id,
+                    expected_status=self._expected_status,
+                    expected_input_event_sequence=(
+                        self._expected_input_event_sequence
+                    ),
+                )
+            )
+        except HostTransactionRetryExhaustedError:
+            return None
+
+    def requested_at(self) -> datetime | None:
+        """返回取消请求时间。
+
+        durable 状态观察不到原始取消请求时间，因此这里不合成时间。
+
+        :returns: 始终返回 ``None``。
+        """
+
+        return None
 
 
 class HostDispatchScheduler:
@@ -974,6 +1076,12 @@ class HostDispatchScheduler:
             request=pending.request,
             compactor=compactor,
             max_attempts=attempts,
+            cancellation_token=_DurableRunCancellationToken(
+                transaction_runner=self._transaction_runner,
+                run_id=pending.run_id,
+                expected_status=pending.expected_status,
+                expected_input_event_sequence=pending.expected_input_event_sequence,
+            ),
         )
 
         def _operation(transaction: HostTransaction) -> int | None:

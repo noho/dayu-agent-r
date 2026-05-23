@@ -133,7 +133,7 @@ class _AcceptedPublicRun:
     run_id: str
 
 
-class _NeverCancelledToken:
+class _OpenCancellationToken:
     """测试用未取消 token。"""
 
     def is_cancelled(self) -> bool:
@@ -993,7 +993,7 @@ def _envelope(seeded: _SeededRun) -> LocalEngineEnvelope:
         worker_kind=WorkerKind.LOCAL,
         execution_target="target-phase5-local",
         local_worker_id="local-worker-phase5",
-        cancellation_token=_NeverCancelledToken(),
+        cancellation_token=_OpenCancellationToken(),
     )
 
 

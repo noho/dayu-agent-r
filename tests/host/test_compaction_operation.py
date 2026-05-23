@@ -8,6 +8,7 @@ from pathlib import Path
 
 import pytest
 
+from dayu.contracts.cancellation import CancellationToken
 from dayu.contracts.json_value import JsonValue
 from dayu.host.compaction import (
     CompactionCandidate,
@@ -40,6 +41,7 @@ from dayu.host.evidence import (
     accepted_evidence_envelope_to_json_value,
 )
 from dayu.host.durable.transaction import HostTransaction
+from tests.host.fake_cancellation import StubCancellationToken
 from tests.host.fake_compaction import FakeContextCompactor
 
 _DIGEST = "sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
@@ -58,10 +60,13 @@ class _FailOnceCompactor(ContextCompactor):
         self.calls = 0
         self._fake = FakeContextCompactor()
 
-    async def compact(self, request: CompactionRequest) -> CompactionCandidate:
+    async def compact(
+        self, request: CompactionRequest, cancellation_token: CancellationToken
+    ) -> CompactionCandidate:
         """执行可重试 proposal。
 
         :param request: compaction request。
+        :param cancellation_token: Host 注入的取消 token。
         :returns: fake compaction candidate。
         :raises RuntimeError: 首次调用时模拟 proposal failure。
         """
@@ -69,21 +74,25 @@ class _FailOnceCompactor(ContextCompactor):
         self.calls += 1
         if self.calls == 1:
             raise RuntimeError("proposal failed once")
-        return await self._fake.compact(request)
+        return await self._fake.compact(request, cancellation_token)
 
 
 class _AlwaysFailingCompactor(ContextCompactor):
     """始终 proposal 失败的 compactor。"""
 
-    async def compact(self, request: CompactionRequest) -> CompactionCandidate:
+    async def compact(
+        self, request: CompactionRequest, cancellation_token: CancellationToken
+    ) -> CompactionCandidate:
         """模拟 proposal failure。
 
         :param request: compaction request。
+        :param cancellation_token: Host 注入的取消 token。
         :returns: 不会返回。
         :raises RuntimeError: 始终抛出 proposal failure。
         """
 
         del request
+        del cancellation_token
         raise RuntimeError("proposal failed")
 
 
@@ -99,15 +108,18 @@ class _QualityRejectOnceCompactor(ContextCompactor):
         self.calls = 0
         self._fake = FakeContextCompactor()
 
-    async def compact(self, request: CompactionRequest) -> CompactionCandidate:
+    async def compact(
+        self, request: CompactionRequest, cancellation_token: CancellationToken
+    ) -> CompactionCandidate:
         """返回可修复 quality rejection 后的成功 candidate。
 
         :param request: compaction request。
+        :param cancellation_token: Host 注入的取消 token。
         :returns: compaction candidate。
         """
 
         self.calls += 1
-        candidate = await self._fake.compact(request)
+        candidate = await self._fake.compact(request, cancellation_token)
         if self.calls == 1:
             return replace(candidate, retained_current_user_input_ref="wrong-input")
         return candidate
@@ -125,15 +137,18 @@ class _HardThresholdOnceCompactor(ContextCompactor):
         self.calls = 0
         self._fake = FakeContextCompactor()
 
-    async def compact(self, request: CompactionRequest) -> CompactionCandidate:
+    async def compact(
+        self, request: CompactionRequest, cancellation_token: CancellationToken
+    ) -> CompactionCandidate:
         """返回 hard-threshold rejection 后的成功 candidate。
 
         :param request: compaction request。
+        :param cancellation_token: Host 注入的取消 token。
         :returns: compaction candidate。
         """
 
         self.calls += 1
-        candidate = await self._fake.compact(request)
+        candidate = await self._fake.compact(request, cancellation_token)
         if self.calls == 1:
             return replace(
                 candidate,
@@ -153,6 +168,7 @@ async def test_run_compaction_operation_retries_async_proposal_failure() -> None
         request=_request(),
         compactor=compactor,
         max_attempts=2,
+        cancellation_token=StubCancellationToken(),
     )
 
     assert compactor.calls == 2
@@ -173,6 +189,7 @@ async def test_run_compaction_operation_retries_quality_rejection() -> None:
         request=_request(),
         compactor=compactor,
         max_attempts=2,
+        cancellation_token=StubCancellationToken(),
     )
 
     assert compactor.calls == 2
@@ -192,6 +209,7 @@ async def test_run_compaction_operation_retries_hard_threshold_after_compact() -
         request=_request(),
         compactor=compactor,
         max_attempts=2,
+        cancellation_token=StubCancellationToken(),
     )
 
     assert compactor.calls == 2
@@ -213,6 +231,7 @@ async def test_run_compaction_operation_fails_after_async_attempt_budget() -> No
         request=_request(),
         compactor=_AlwaysFailingCompactor(),
         max_attempts=2,
+        cancellation_token=StubCancellationToken(),
     )
 
     assert result.accepted_candidate is None

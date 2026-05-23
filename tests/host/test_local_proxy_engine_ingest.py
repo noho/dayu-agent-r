@@ -25,7 +25,7 @@ from dayu.host.api import AttemptDispatchSnapshot
 from dayu.host.local_proxy import DefaultLocalEngineWorkerFactory
 
 
-class _NeverCancelledToken:
+class _OpenCancellationToken:
     """测试用未取消 token。"""
 
     def is_cancelled(self) -> bool:
@@ -284,7 +284,7 @@ def _snapshot() -> AttemptDispatchSnapshot:
     :returns: Attempt dispatch snapshot。
     """
 
-    token: CancellationToken = _NeverCancelledToken()
+    token: CancellationToken = _OpenCancellationToken()
     return AttemptDispatchSnapshot(
         session_id="session-local",
         run_id="run-local",
@@ -303,7 +303,7 @@ def _request() -> AgentRunRequest:
     :returns: AgentRunRequest。
     """
 
-    token: CancellationToken = _NeverCancelledToken()
+    token: CancellationToken = _OpenCancellationToken()
     return AgentRunRequest(
         run_id="run-local",
         session_id="session-local",

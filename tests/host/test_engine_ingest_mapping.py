@@ -12,6 +12,7 @@ from typing import cast
 
 import pytest
 
+from dayu.contracts.cancellation import CancellationToken
 from dayu.contracts.json_value import JsonValue
 from dayu.contracts.tool_await import ToolAwaitKind, ToolAwaitSpec
 from dayu.contracts.tool_call import ToolCallRequest
@@ -104,6 +105,7 @@ from dayu.host.durable.state import (
     read_run_by_id,
 )
 from dayu.host.durable.transaction import HostTransaction, HostTransactionRunner
+from tests.host.fake_cancellation import StubCancellationToken
 from tests.host.fake_compaction import FakeContextCompactor
 from dayu.host.wait_adapter import WaitAdapterBinding, WaitExternalJobRefSource
 from dayu.host.waiting import (
@@ -135,34 +137,6 @@ class _SeededRun:
     dispatch_record_id: str
 
 
-class _NeverCancelledToken:
-    """测试用未取消 token。"""
-
-    def is_cancelled(self) -> bool:
-        """返回取消状态。
-
-        :returns: 始终为 ``False``。
-        """
-
-        return False
-
-    def cancel_reason(self) -> str | None:
-        """返回取消原因。
-
-        :returns: 始终为 ``None``。
-        """
-
-        return None
-
-    def requested_at(self) -> datetime | None:
-        """返回取消请求时间。
-
-        :returns: 始终为 ``None``。
-        """
-
-        return None
-
-
 class _TransactionReadableCompactor(ContextCompactor):
     """测试 compactor 调用期可开启独立读事务。"""
 
@@ -177,10 +151,13 @@ class _TransactionReadableCompactor(ContextCompactor):
         self.calls = 0
         self._fake = FakeContextCompactor()
 
-    async def compact(self, request: CompactionRequest) -> CompactionCandidate:
+    async def compact(
+        self, request: CompactionRequest, cancellation_token: CancellationToken
+    ) -> CompactionCandidate:
         """执行 compact 并验证当前不在外层 write transaction 内。
 
         :param request: compaction request。
+        :param cancellation_token: Host 注入的取消 token。
         :returns: fake compaction candidate。
         """
 
@@ -189,7 +166,7 @@ class _TransactionReadableCompactor(ContextCompactor):
             lambda transaction: read_run_by_id(transaction, request.run_id)
         )
         assert row is not None
-        return await self._fake.compact(request)
+        return await self._fake.compact(request, cancellation_token)
 
 
 class _InputSequenceAdvancingCompactor(ContextCompactor):
@@ -206,29 +183,36 @@ class _InputSequenceAdvancingCompactor(ContextCompactor):
         self._fake = FakeContextCompactor()
         self.calls = 0
 
-    async def compact(self, request: CompactionRequest) -> CompactionCandidate:
+    async def compact(
+        self, request: CompactionRequest, cancellation_token: CancellationToken
+    ) -> CompactionCandidate:
         """推进 durable input sequence 后返回旧 snapshot 的 fake candidate。
 
         :param request: compaction request。
+        :param cancellation_token: Host 注入的取消 token。
         :returns: 基于旧 request 的 fake compaction candidate。
         """
 
         self.calls += 1
         _advance_run_input_sequence(self._transaction_runner, run_id=request.run_id)
-        return await self._fake.compact(request)
+        return await self._fake.compact(request, cancellation_token)
 
 
 class _RaisingCompactor(ContextCompactor):
     """测试用失败 compactor。"""
 
-    async def compact(self, request: CompactionRequest) -> CompactionCandidate:
+    async def compact(
+        self, request: CompactionRequest, cancellation_token: CancellationToken
+    ) -> CompactionCandidate:
         """抛出 proposal 失败。
 
         :param request: compaction request。
+        :param cancellation_token: Host 注入的取消 token。
         :returns: 不返回。
         :raises RuntimeError: 始终抛出 proposal failure。
         """
 
+        del cancellation_token
         raise RuntimeError(f"proposal failed for {request.run_id}")
 
 
@@ -1889,7 +1873,7 @@ def _candidate(
             worker_kind=WorkerKind.LOCAL,
             execution_target="target-ingest",
             local_worker_id="local-worker-ingest",
-            cancellation_token=_NeverCancelledToken(),
+            cancellation_token=StubCancellationToken(),
         ),
         worker_event_index=worker_event_index,
         engine_event=EngineEvent(
@@ -1943,7 +1927,7 @@ def _envelope(seeded: _SeededRun) -> LocalEngineEnvelope:
         worker_kind=WorkerKind.LOCAL,
         execution_target="target-ingest",
         local_worker_id="local-worker-ingest",
-        cancellation_token=_NeverCancelledToken(),
+        cancellation_token=StubCancellationToken(),
     )
 
 

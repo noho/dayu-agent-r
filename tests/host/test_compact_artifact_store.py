@@ -39,6 +39,7 @@ from dayu.host.evidence import (
     AcceptedEvidenceResultRef,
     AcceptedEvidenceToolQuery,
 )
+from tests.host.fake_cancellation import StubCancellationToken
 from tests.host.fake_compaction import FakeContextCompactor
 
 
@@ -272,7 +273,7 @@ async def _candidate_bundle() -> tuple[
     """
 
     request = _request()
-    candidate = await FakeContextCompactor().compact(request)
+    candidate = await FakeContextCompactor().compact(request, StubCancellationToken())
     quality_result = check_compaction_candidate(request, candidate)
     assert quality_result.accepted is True
     return request, candidate, quality_result

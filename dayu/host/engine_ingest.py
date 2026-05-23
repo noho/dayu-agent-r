@@ -1437,6 +1437,9 @@ class EngineEventIngestor:
                 request=request,
                 compactor=compactor,
                 max_attempts=attempts,
+                cancellation_token=(
+                    pending.context.candidate.envelope.cancellation_token
+                ),
             )
 
         def _operation(

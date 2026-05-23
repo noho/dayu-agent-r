@@ -103,7 +103,7 @@ _RESUME_TOKEN = "external-job-phase7-integration"
 _TOOL_NAME = "awaiting_tool"
 
 
-class _NeverCancelledToken:
+class _OpenCancellationToken:
     """测试用未取消 token。"""
 
     def is_cancelled(self) -> bool:
@@ -485,7 +485,7 @@ def _awaiting_tool_request(seeded: _SeededWaitingRun) -> BatchToolExecutionReque
             session_id=seeded.session_id,
             iteration_id=_ITERATION_ID,
             timeout_seconds=10.0,
-            cancellation_token=_NeverCancelledToken(),
+            cancellation_token=_OpenCancellationToken(),
             correlation_id="phase7-waiting-integration",
         ),
     )

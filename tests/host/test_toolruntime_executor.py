@@ -93,7 +93,7 @@ _OVERSIZED_INLINE_TEXT_LENGTH = 70010
 _OVERSIZED_TRUNCATED_TEXT_LIMIT = 70000
 
 
-class _NeverCancelledToken:
+class _OpenCancellationToken:
     """测试用未取消 token。"""
 
     def is_cancelled(self) -> bool:
@@ -1086,7 +1086,7 @@ def _request(
             cancellation_token=(
                 cancellation_token
                 if cancellation_token is not None
-                else _NeverCancelledToken()
+                else _OpenCancellationToken()
             ),
             correlation_id="correlation-toolruntime",
         ),

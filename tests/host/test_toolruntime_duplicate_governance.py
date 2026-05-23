@@ -59,7 +59,7 @@ _ITERATION_ID = "iteration-duplicate"
 _POLICY_DIGEST = "sha256:5555555555555555555555555555555555555555555555555555555555555555"
 
 
-class _NeverCancelledToken:
+class _OpenCancellationToken:
     """测试用未取消 token。"""
 
     def is_cancelled(self) -> bool:
@@ -711,7 +711,7 @@ def _request(
             session_id=_SESSION_ID,
             iteration_id=_ITERATION_ID,
             timeout_seconds=10.0,
-            cancellation_token=_NeverCancelledToken(),
+            cancellation_token=_OpenCancellationToken(),
             correlation_id="correlation-duplicate",
         ),
     )
