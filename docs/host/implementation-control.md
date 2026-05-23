@@ -224,8 +224,8 @@ Phase Map 中每个 phase 必须使用统一条目格式。模板如下：
 
 当前 work unit：Phase 12.5 Conversation Memory Optimization。
 当前状态：P12 已完成；PR 67 已 draft-PR-pass 并由用户 merge。
-当前 gate：P12.5 PR 68 post-draft compactor scene prompt fix accepted；draft-PR-pass。
-下一步：commit / push 当前 accepted fix 到 PR 68 分支；除 CI / review feedback 外，P12.5 无新的 blocking work。
+当前 gate：P12.5 PR 68 post-draft compactor scene prompt fix accepted and pushed；draft-PR-pass。
+下一步：除 CI / review feedback 外，P12.5 无新的 blocking work；PR 68 后续 merge、mark ready for review、request reviewers、approve、delete branch 或对外 comment 仍需用户额外授权。
 
 当前 gate 结论：P12.5 implementation Slice 1-7、aggregate deepreview、targeted repair、aggregate re-review、PR 68 draft review、post-draft cancellation hardening fix、post-draft raw evidence compaction fix 与 post-draft compactor scene prompt fix 均已 PASS。用户指出 bounded `result_preview` 作为 evidence-backed fact extraction primary input 会丢失长章节 evidence 内容，controller 裁决该问题影响 P12.5 success signal，不能作为 residual 留存。最终设计裁决：删除 `result_preview` 概念；`evidence_backed_facts` 必须基于 compact range raw tool result / raw transcript 生成 claim，Host-minted `evidence_id` 只作为标注到 raw evidence 旁边的 provenance anchor。ToolRuntime accepted result 不直接物化 stable fact；accepted `CONTEXT_COMPACTED.evidence_backed_fact_candidates` 才进入 memory projection；dispatch memory projection lag 走 rebuild / retry，不触发 Run / Attempt 终态迁移。生产代码不再允许 compactor 自行构造不可取消 token，compaction LLM call 必须接收 Host lifecycle cancellation token。Compactor system prompt / user prompt template 由 Service assembly 从 `conversation_compaction` scene 装配后以 typed `CompactorRunnerBaseline` 传入 Host；compactor 温度、top_p 与 stream 继续由 `execution_profiles.json.compactor_baseline.runner_option_hint_id` 指向 `models.json.runtime_hints.runner_option_hints.conversation_compaction`。剩余风险为 raw evidence aggregate prompt budget 与大 session rebuild performance。
 
@@ -1730,7 +1730,8 @@ Plan 必须额外收口的 readiness review checklist：
   `pytest tests/host/test_compaction_contract.py tests/host/test_llm_compaction.py tests/service/test_host_assembly.py -q`
   PASS (49 passed)；`pytest tests/host/test_public_compact_smoke.py -q` PASS (1 passed)；
   `pytest tests/host/test_llm_compaction.py tests/host/test_compaction_contract.py tests/host/test_compaction_operation.py tests/host/test_compact_artifact_store.py tests/host/test_toolruntime_accept_barrier.py tests/host/test_toolruntime_executor.py tests/host/test_dispatch_scheduler.py tests/host/test_engine_ingest_mapping.py tests/host/test_memory_projection.py tests/host/test_run_input_builder.py tests/service/test_host_assembly.py tests/runtime/test_scene_assets_migration.py tests/host/test_open_host_runtime.py tests/host/test_public_open_host_options.py tests/runtime/test_config_loader.py tests/runtime/test_scene_prepare.py tests/runtime/test_scene_tool_selection.py -q`
-  PASS (359 passed)；`pyright dayu tests` PASS (0 errors)。当前 gate 回到 draft-PR-pass。
+  PASS (359 passed)；`pyright dayu tests` PASS (0 errors)；`git diff --check` PASS。Accepted fix commit 为 `1a3017f`，
+  已 push 到 PR 68 branch；GitHub 当前 reported no checks。当前 gate 回到 draft-PR-pass。
 
 目标：
 - 从买方财报分析 Agent 的第一性原理优化 Conversation Memory，使同一 session 内已由工具确认的关键财务事实能跨轮、
