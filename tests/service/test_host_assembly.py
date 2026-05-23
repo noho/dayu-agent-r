@@ -8,7 +8,20 @@ from pathlib import Path
 
 import pytest
 
-from dayu.contracts import JsonValue
+from dayu.contracts import (
+    BatchToolExecutionContext,
+    JsonValue,
+    TOOL_CANCELLED_REASON_HOST_CANCELLED,
+    ToolBundle,
+    ToolBundleSourceKind,
+    ToolCallRequest,
+    ToolCancelledOutcome,
+    ToolDefinition,
+    ToolExecutionOutcome,
+    ToolFunctionSchema,
+    ToolParametersSchema,
+    ToolSchema,
+)
 from dayu.engine import AgentFallbackMode, AgentPolicy
 from dayu.host.api import (
     AuthorizationClaim,
@@ -17,10 +30,16 @@ from dayu.host.api import (
     OperationContext,
 )
 from dayu.runtime.config_loader import ConfigLoader
+from dayu.runtime.config_loader import (
+    ToolDiscoveryEntryPointConfig,
+    ToolDiscoveryProviderConfig,
+)
 from dayu.runtime.location import RuntimeLocations, resolve_runtime_locations
 from dayu.runtime.assembly import RuntimeAssemblySelectionError
 from dayu.runtime.scene_prepare import (
     PreparedSceneInputs,
+    SceneAgentFallbackMode,
+    SceneAgentPolicyOverride,
     ScenePrepareRequest,
     SceneToolCatalog,
     SceneToolSelectionMode,
@@ -31,8 +50,13 @@ from dayu.service.host_assembly import (
     ServiceAssemblyOverrides,
     ServiceOpenHostAssemblyRequest,
     _agent_fallback_mode_from_config,
+    _compactor_agent_policy_from_scene_inputs,
     _compactor_prompts_from_scene_inputs,
+    _render_headers,
+    _resolve_prompt_asset_path,
     _resolve_project_path,
+    _tool_discovery_specs,
+    _tooling_options_from_discovery,
     compose_open_host_options,
     compose_submit_followup_request,
     discover_service_tools,
@@ -44,6 +68,25 @@ _CUSTOM_COMPACTOR_SCENE_ID = "custom_compactor_scene"
 _MODEL_ID = "deepseek-v4-flash"
 _RUNNER_HINT_ID = "interactive"
 _API_KEY = "test-provider-key"
+
+
+def _complete_compactor_agent_policy_override() -> SceneAgentPolicyOverride:
+    """构造完整 compactor scene AgentPolicy override。
+
+    :returns: 完整的 scene agent policy override。
+    :raises Exception: 不主动抛出异常。
+    """
+
+    return SceneAgentPolicyOverride(
+        max_iterations=1,
+        continuation_max_attempts=0,
+        allow_tool_calls=False,
+        tool_execution_timeout_seconds=1.0,
+        fallback_mode=SceneAgentFallbackMode.RAISE_ERROR,
+        fallback_prompt="Compactor is not allowed to fallback-answer.",
+        continuation_prompt="Continue strict JSON.",
+        max_consecutive_failed_tool_batches=1,
+    )
 
 
 def test_compose_open_host_options_uses_runtime_tuning_from_config(
@@ -342,6 +385,47 @@ def test_compactor_prompt_scene_requires_agent_policy() -> None:
         )
 
 
+@pytest.mark.parametrize(
+    ("override", "message"),
+    (
+        (
+            replace(_complete_compactor_agent_policy_override(), max_iterations=None),
+            "max_iterations",
+        ),
+        (
+            replace(
+                _complete_compactor_agent_policy_override(),
+                fallback_mode=None,
+            ),
+            "fallback_mode",
+        ),
+        (
+            replace(
+                _complete_compactor_agent_policy_override(),
+                max_consecutive_failed_tool_batches=None,
+            ),
+            "max_consecutive_failed_tool_batches",
+        ),
+    ),
+)
+def test_compactor_agent_policy_requires_selected_fields(
+    override: SceneAgentPolicyOverride,
+    message: str,
+) -> None:
+    """Compactor scene AgentPolicy 缺必填字段时必须 fail-fast。
+
+    :param override: 被测 scene agent policy override。
+    :param message: 预期错误消息片段。
+    :returns: ``None``。
+    :raises AssertionError: helper 未拒绝缺失必填字段时抛出。
+    """
+
+    scene_inputs = _compactor_scene_inputs(agent_policy_override=override)
+
+    with pytest.raises(ValueError, match=message):
+        _compactor_agent_policy_from_scene_inputs(scene_inputs)
+
+
 def test_agent_fallback_mode_from_config_uses_engine_enum_values() -> None:
     """fallback mode 映射复用 Engine enum 原生值校验。
 
@@ -360,6 +444,145 @@ def test_agent_fallback_mode_from_config_uses_engine_enum_values() -> None:
     )
     with pytest.raises(ValueError):
         _agent_fallback_mode_from_config("unsupported")
+
+
+@pytest.mark.parametrize("env", ({}, {"DEEPSEEK_API_KEY": "   "}))
+def test_render_headers_requires_api_key_env(env: dict[str, str]) -> None:
+    """Header 渲染必须拒绝缺失或空白 API key。
+
+    :param env: 测试用 env 映射。
+    :returns: ``None``。
+    :raises AssertionError: 缺失或空白 secret 未 fail-fast 时抛出。
+    """
+
+    with pytest.raises(ValueError, match="missing env DEEPSEEK_API_KEY"):
+        _render_headers(
+            {"Authorization": "Bearer {{DEEPSEEK_API_KEY}}"},
+            api_key_ref="DEEPSEEK_API_KEY",
+            env=env,
+        )
+
+
+def test_render_headers_rejects_unresolved_placeholder() -> None:
+    """Header 渲染必须拒绝未解析 env 占位符。
+
+    :returns: ``None``。
+    :raises AssertionError: 未解析占位符未 fail-fast 时抛出。
+    """
+
+    with pytest.raises(ValueError, match="unresolved env placeholder"):
+        _render_headers(
+            {"Authorization": "Bearer {{DEEPSEEK_API_KEY}} {{OTHER_KEY}}"},
+            api_key_ref="DEEPSEEK_API_KEY",
+            env={"DEEPSEEK_API_KEY": _API_KEY},
+        )
+
+
+@pytest.mark.parametrize(
+    ("configured_path", "message"),
+    (
+        ("", "must not be empty"),
+        ("/tmp/dayu-prompt.md", "must be relative"),
+        ("../outside.md", "escapes prompt asset root"),
+    ),
+)
+def test_resolve_prompt_asset_path_rejects_invalid_paths(
+    tmp_path: Path,
+    configured_path: str,
+    message: str,
+) -> None:
+    """Prompt asset path 必须是非空且不逃逸根目录的相对路径。
+
+    :param tmp_path: pytest 临时目录。
+    :param configured_path: 被测配置路径。
+    :param message: 预期错误消息片段。
+    :returns: ``None``。
+    :raises AssertionError: 非法路径未 fail-fast 时抛出。
+    """
+
+    with pytest.raises(ValueError, match=message):
+        _resolve_prompt_asset_path(
+            tmp_path,
+            configured_path,
+            field_name="test.prompt_path",
+        )
+
+
+def test_tooling_options_from_discovery_empty_bundle_returns_none() -> None:
+    """空工具 bundle 不装配 HostToolingOptions。
+
+    :returns: ``None``。
+    :raises AssertionError: 空 bundle 返回非空 tooling options 时抛出。
+    """
+
+    result = _tooling_options_from_discovery(
+        tool_bundle=ToolBundle(definitions=()),
+        source_refs=(),
+    )
+
+    assert result is None
+
+
+def test_tooling_options_from_discovery_requires_source_refs() -> None:
+    """非空工具 bundle 必须携带 source refs。
+
+    :returns: ``None``。
+    :raises AssertionError: 缺少 source refs 未 fail-fast 时抛出。
+    """
+
+    with pytest.raises(ValueError, match="source refs"):
+        _tooling_options_from_discovery(
+            tool_bundle=ToolBundle(definitions=(_tool_definition("lookup_fact"),)),
+            source_refs=(),
+        )
+
+
+def test_tool_discovery_specs_requires_provider_location() -> None:
+    """工具发现 provider 必须声明 import_path 或 entry_point。
+
+    :returns: ``None``。
+    :raises AssertionError: 缺少 provider 解析位置未 fail-fast 时抛出。
+    """
+
+    provider = ToolDiscoveryProviderConfig(
+        provider_id="missing-location",
+        import_path=None,
+        entry_point=None,
+        source_kind=ToolBundleSourceKind.CONFIG_BINDING,
+        source_id="missing-location",
+        enabled=True,
+        allow_empty=False,
+    )
+
+    with pytest.raises(ValueError, match="import_path or entry_point"):
+        _tool_discovery_specs((provider,))
+
+
+def test_tool_discovery_specs_uses_entry_point_location() -> None:
+    """工具发现 provider 可以使用 entry point 位置。
+
+    :returns: ``None``。
+    :raises AssertionError: entry point 未映射为 discovery spec 时抛出。
+    """
+
+    provider = ToolDiscoveryProviderConfig(
+        provider_id="entry-provider",
+        import_path=None,
+        entry_point=ToolDiscoveryEntryPointConfig(
+            group="dayu.test_tools",
+            name="provider",
+        ),
+        source_kind=ToolBundleSourceKind.PACKAGE_ENTRYPOINT,
+        source_id="dayu.test_tools:provider",
+        enabled=True,
+        allow_empty=False,
+    )
+
+    specs = _tool_discovery_specs((provider,))
+
+    assert len(specs) == 1
+    assert specs[0].spec_id == "entry-provider"
+    assert specs[0].enabled is True
 
 
 def test_truncation_manager_enabled_is_derived_from_execution_profile(
@@ -815,6 +1038,85 @@ def _host_context(request_id: str) -> HostCallContext:
             scenario="phase12_2_service_assembly",
             correlation_id=None,
         ),
+    )
+
+
+def _compactor_scene_inputs(
+    *, agent_policy_override: SceneAgentPolicyOverride | None
+) -> PreparedSceneInputs:
+    """构造测试用 compactor scene inputs。
+
+    :param agent_policy_override: compactor scene agent policy override。
+    :returns: PreparedSceneInputs。
+    :raises ValueError: 字段非法时由底层 dataclass 抛出。
+    """
+
+    return PreparedSceneInputs(
+        system_messages=("system",),
+        system_prompt="system",
+        tool_selection=SceneToolSelectionResult(
+            mode=SceneToolSelectionMode.NONE,
+            tool_names=frozenset(),
+        ),
+        model_hints=None,
+        agent_policy_override=agent_policy_override,
+        fragment_refs=(),
+        source_refs=(),
+        content_digest="sha256:test",
+        capability_tags=(),
+    )
+
+
+async def _noop_tool(
+    call: ToolCallRequest,
+    context: BatchToolExecutionContext,
+) -> ToolExecutionOutcome:
+    """测试用空工具 callable。
+
+    :param call: 工具调用请求。
+    :param context: 批式工具执行上下文。
+    :returns: 取消 outcome。
+    :raises Exception: 不主动抛出异常。
+    """
+
+    del call
+    del context
+    return ToolCancelledOutcome(
+        reason=TOOL_CANCELLED_REASON_HOST_CANCELLED,
+        message="tool disabled in service assembly test",
+        hint=None,
+        meta=None,
+    )
+
+
+def _tool_definition(name: str) -> ToolDefinition:
+    """构造测试用工具定义。
+
+    :param name: 工具名。
+    :returns: 工具定义。
+    :raises ValueError: 工具声明名称与 schema 名称不一致时抛出。
+    """
+
+    properties: dict[str, JsonValue] = {}
+    return ToolDefinition(
+        name=name,
+        schema=ToolSchema(
+            type="function",
+            function=ToolFunctionSchema(
+                name=name,
+                description=f"{name} test tool",
+                parameters=ToolParametersSchema(
+                    type="object",
+                    properties=properties,
+                    required=(),
+                    additional_properties=False,
+                ),
+            ),
+        ),
+        callable=_noop_tool,
+        truncate=None,
+        display=None,
+        tags=(),
     )
 
 

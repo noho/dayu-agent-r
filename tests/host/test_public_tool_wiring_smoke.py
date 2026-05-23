@@ -22,14 +22,15 @@ from tests.host.public_smoke_support import (
 
 
 @pytest.mark.asyncio
-async def test_mock_tool_fact_enters_memory_and_next_run_input(
+async def test_mock_tool_result_feeds_same_run_and_later_run_continuity(
     tmp_path: pathlib.Path,
 ) -> None:
-    """mock 工具事实经 Host accept barrier 进入后续 RunInputBuilder 输入。
+    """mock 工具结果经 Host accept barrier 进入同轮 continuation。
 
     :param tmp_path: pytest 临时目录。
     :returns: ``None``。
-    :raises AssertionError: 工具事实未出现在 continuation 或后续 Run input 时抛出。
+    :raises AssertionError: 工具结果未进入同轮 continuation，或后续 Run 未保留
+        对话连续性时抛出。
     """
 
     factory = ToolCallingWorkerFactory()
@@ -73,7 +74,9 @@ async def test_mock_tool_fact_enters_memory_and_next_run_input(
         message.content if message.content is not None else ""
         for message in second_run_initial_messages
     )
-    assert "event_id=event-tool-result-accepted-" in joined
+    assert "tool fact accepted" in joined
+    assert "调用 lookup_mock_fact 查询 DAYU。" in joined
+    assert "event_id=event-tool-result-accepted-" not in joined
 
 
 @pytest.mark.asyncio

@@ -224,10 +224,10 @@ Phase Map 中每个 phase 必须使用统一条目格式。模板如下：
 
 当前 work unit：Phase 12.5 Conversation Memory Optimization。
 当前状态：P12 已完成；PR 67 已 draft-PR-pass 并由用户 merge。
-当前 gate：P12.5 PR 68 post-draft manual full-repo review repair accepted and pushed；draft-PR-pass。
+当前 gate：P12.5 PR 68 post-draft second manual full-repo review repair accepted；draft-PR-pass。
 下一步：除 CI / review feedback 外，P12.5 无新的 blocking work；PR 68 后续 merge、mark ready for review、request reviewers、approve、delete branch 或对外 comment 仍需用户额外授权。
 
-当前 gate 结论：P12.5 implementation Slice 1-7、aggregate deepreview、targeted repair、aggregate re-review、PR 68 draft review、post-draft cancellation hardening fix、post-draft raw evidence compaction fix、post-draft compactor scene prompt fix、post-draft compactor baseline scene id fix、post-draft compactor AgentPolicy / user prompt template ownership fix、post-draft reactive compaction budget hardening fix 与 post-draft manual full-repo review repair 均已 PASS。用户指出 bounded `result_preview` 作为 evidence-backed fact extraction primary input 会丢失长章节 evidence 内容，controller 裁决该问题影响 P12.5 success signal，不能作为 residual 留存。最终设计裁决：删除 `result_preview` 概念；`evidence_backed_facts` 必须基于 compact range raw tool result / raw transcript 生成 claim，Host-minted `evidence_id` 只作为标注到 raw evidence 旁边的 provenance anchor。ToolRuntime accepted result 不直接物化 stable fact；accepted `CONTEXT_COMPACTED.evidence_backed_fact_candidates` 才进入 memory projection；dispatch memory projection lag 走 rebuild / retry，不触发 Run / Attempt 终态迁移。生产代码不再允许 compactor 自行构造不可取消 token，compaction LLM call 必须接收 Host lifecycle cancellation token。Compactor system prompt 与 AgentPolicy 由 Service assembly 按 `execution_profiles.json.compactor_baseline.scene_id` 装配，compactor user prompt template 由 Service assembly 按 `execution_profiles.json.compactor_baseline.user_prompt_template_path` 读取，三者均以 typed `CompactorRunnerBaseline` 传入 Host；compactor 温度、top_p 与 stream 继续由 `execution_profiles.json.compactor_baseline.runner_option_hint_id` 指向 `models.json.runtime_hints.runner_option_hints.conversation_compaction`。Reactive compaction 不引入 raw evidence aggregate prompt budget guard，不让不准 token 估算阻断 reactive recovery；reactive path 通过真实 recovery dispatch / Engine overflow 闭环最多执行 `max_reactive_compactions_per_run` 次 compact，默认上限为 2，超过上限后 fail closed。Manual full-repo review artifacts 为 `docs/reviews/repo-review-20260523-193249.md` 与 `docs/reviews/repo-review-20260523-193334.md`；repair artifact 为 `docs/reviews/pr-68-manual-fullrepo-fix-codex-20260523.md`；controller adjudication artifact 为 `docs/reviews/pr-68-manual-fullrepo-fix-controller-adjudication-20260523.md`；latest re-review artifacts 为 `docs/reviews/pr-68-manual-fullrepo-fix-rereview-mimo-20260523.md` 与 `docs/reviews/pr-68-manual-fullrepo-fix-rereview-ds-20260523.md`，两者均 PASS 且无 blocking findings。Accepted manual full-repo repair commit 为 `d2443c0`。Controller validation：affected pytest 146 passed；`pyright dayu tests` 0 errors；`git diff --check` passed。剩余风险为大 session rebuild performance，以及 manual full-repo review 中已转交后续 owner 的 durable layering / production hardening items。
+当前 gate 结论：P12.5 implementation Slice 1-7、aggregate deepreview、targeted repair、aggregate re-review、PR 68 draft review、post-draft cancellation hardening fix、post-draft raw evidence compaction fix、post-draft compactor scene prompt fix、post-draft compactor baseline scene id fix、post-draft compactor AgentPolicy / user prompt template ownership fix、post-draft reactive compaction budget hardening fix、post-draft manual full-repo review repair 与 post-draft second manual full-repo review repair 均已 PASS。用户指出 bounded `result_preview` 作为 evidence-backed fact extraction primary input 会丢失长章节 evidence 内容，controller 裁决该问题影响 P12.5 success signal，不能作为 residual 留存。最终设计裁决：删除 `result_preview` 概念；`evidence_backed_facts` 必须基于 compact range raw tool result / raw transcript 生成 claim，Host-minted `evidence_id` 只作为标注到 raw evidence 旁边的 provenance anchor。ToolRuntime accepted result 不直接物化 stable fact；accepted `CONTEXT_COMPACTED.evidence_backed_fact_candidates` 才进入 memory projection；dispatch memory projection lag 走 rebuild / retry，不触发 Run / Attempt 终态迁移。生产代码不再允许 compactor 自行构造不可取消 token，compaction LLM call 必须接收 Host lifecycle cancellation token。Compactor system prompt 与 AgentPolicy 由 Service assembly 按 `execution_profiles.json.compactor_baseline.scene_id` 装配，compactor user prompt template 由 Service assembly 按 `execution_profiles.json.compactor_baseline.user_prompt_template_path` 读取，三者均以 typed `CompactorRunnerBaseline` 传入 Host；compactor 温度、top_p 与 stream 继续由 `execution_profiles.json.compactor_baseline.runner_option_hint_id` 指向 `models.json.runtime_hints.runner_option_hints.conversation_compaction`。Reactive compaction 不引入 raw evidence aggregate prompt budget guard，不让不准 token 估算阻断 reactive recovery；reactive path 通过真实 recovery dispatch / Engine overflow 闭环最多执行 `max_reactive_compactions_per_run` 次 compact，默认上限为 2，超过上限后 fail closed。Latest manual full-repo review artifacts 为 `docs/reviews/repo-review-20260523-211835.md` 与 `docs/reviews/repo-review-20260523-211917.md`；repair artifact 为 `docs/reviews/pr-68-second-manual-fullrepo-fix-codex-20260523.md`；controller adjudication artifact 为 `docs/reviews/pr-68-second-manual-fullrepo-fix-controller-adjudication-20260523.md`；latest re-review artifacts 为 `docs/reviews/pr-68-second-manual-fullrepo-fix-rereview-mimo-20260523.md` 与 `docs/reviews/pr-68-second-manual-fullrepo-fix-rereview-ds-20260523.md`，两者均 PASS 且无 blocking findings。Controller validation：affected pytest 36 passed；`pyright dayu tests` 0 errors；`git diff --check` passed。剩余风险为大 session rebuild performance，以及 manual full-repo reviews 中已转交后续 owner 的 dispatch / recovery、durable layering、memory semantics 与 production hardening items。
 
 ## Phase Map
 
@@ -2087,8 +2087,9 @@ Owner / destination：Phase 15 Retention / Purge / Production Hardening，或在
 
 - `purge_session` destructive cleanup、audit tombstone、payload / memory / projection / outbox / tool trace 清理、projection rebuild tooling 与 retention matrix。
 - startup / recovery / crash E2E 压测、watch 轮询性能、SQLite 多进程写入压力、schema bootstrap / DDL 原子性、after-commit 多错误聚合、projection catch-up 批处理与 heavy sink runner。
-- durable production hardening：幂等写入 / EventLog append 并发唯一键冲突分类、WAL checkpoint 策略、rollback failure diagnostic、read/write busy retry 策略拆分与关键 durable CAS / state / liveness direct unit tests。
-- Context Governance production hardening：真实异步 / production LLM compactor adapter、provider-specific tokenizer / sizing、compact failure 用户可见策略矩阵、proactive / reactive compact failure E2E。
+- dispatch / recovery production hardening：dispatch 创建到 worker accept 之间的 owner_host_instance_id / liveness proof、promotion deferred result 语义、startup timeout closeout diagnostic 字段与 recovery orphan proof 覆盖。
+- durable production hardening：幂等写入 / EventLog append 并发唯一键冲突分类、`ensure_session` 幂等语义、projection checkpoint CAS、memory snapshot CAS、WAL checkpoint 策略、rollback failure diagnostic、read/write busy retry 策略拆分与关键 durable CAS / state / liveness direct unit tests。
+- Context Governance production hardening：真实异步 / production LLM compactor adapter、provider-specific tokenizer / sizing、compact failure 用户可见策略矩阵、proactive / reactive compact failure E2E、post-compact budget estimate 与 compaction semantic repair retry 默认策略。
 - Context Governance reactive overflow hardening：不引入 raw evidence aggregate prompt budget guard，不让不准 token 估算阻断 reactive recovery；reactive path 通过真实 recovery dispatch / Engine overflow 闭环最多执行 `max_reactive_compactions_per_run` 次 compact，默认上限为 2，超过上限后 fail closed。
 - runtime lane production hardening：close/acquire race、stale claim cleanup 压测、heartbeat / TTL 配置校验、runtime log import side effect。
 - contracts strict validation、redaction / sensitive error taxonomy、README/docs correctness cleanup。
@@ -2115,6 +2116,7 @@ Owner / destination：后续 wait adapter / Phase 7 follow-up / Phase 15 product
 Owner / destination：后续 Engine runner / provider abstraction hardening work unit。
 
 - OpenAI streaming tool call aggregator index fragmentation、provider delta normalization、partial delta retry taxonomy、stream idle heartbeat / timeout validation 与 non-stream / stream error object consistency。
+- runner event contract cleanup：`PartialToolCallSummary` export 路径收敛与其它非行为性 re-export 清理。
 - Provider-specific state neutralization，例如 Gemini provider state 合约是否需要统一为 provider-neutral tagged structure。
 - Engine runner injection / provider abstraction cleanup 不得让 Engine 理解 Host memory、governance 或 durable state。
 
@@ -2125,6 +2127,15 @@ Owner / destination：后续 Host durable layering cleanup work unit；若触及
 - durable layer dependency cleanup：拆分 row primitive、public type owner 与 import boundary tests，确保 durable 层不反向依赖上层业务模块。
 - durable bootstrap、schema CHECK hardening、terminal CAS null-check 一致性、session lifecycle observability 与 close-session active Run 可观测性。
 - import boundary helper consolidation：保持 Engine / Host / runtime / contracts 边界测试可读、单一 helper 真源与反向依赖禁止。
+- validation / JSON / redaction helper cleanup：在不改变业务语义的前提下收敛 `_require_non_empty_text`、Host JSON serialization helper、secret redaction helper 与 token estimate helper 的重复实现。
+
+#### Conversation Memory / Compaction hardening tracking
+
+Owner / destination：后续 Conversation Memory / Context Governance hardening work unit；若改变 P12.5 stable contract，先回到 design gate。
+
+- `working_assumptions` 生产者语义：若保留该 snapshot 字段，必须明确由哪些 compact / user / diagnostic event 生成；若不保留，需通过 schema gate 删除。
+- fact-candidate-only validation failure：`CONTEXT_COMPACTED` 中 fact candidates 非法但其它 compact output 合法时，是否 partial materialize、fail compact 或写审计 diagnostic，需独立语义裁决。
+- raw assistant continuity：`RAW_ASSISTANT_TURN` 与 `ASSISTANT_CONCLUSION` 的职责、floor 保护和后续 Run continuity 语义需要统一。
 
 ## 历史记录
 
