@@ -22,9 +22,15 @@
   },
   "fragments": [
     {
-      "id": "conversation_compaction_scene",
+      "id": "conversation_compaction_system",
       "path": "scenes/conversation_compaction.md",
       "order": 100,
+      "required": true
+    },
+    {
+      "id": "conversation_compaction_user",
+      "path": "scenes/conversation_compaction_user.md",
+      "order": 200,
       "required": true
     }
   ],

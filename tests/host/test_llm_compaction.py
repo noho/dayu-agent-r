@@ -40,6 +40,10 @@ from dayu.host.llm_compaction import (
 from tests.host.fake_cancellation import StubCancellationToken
 
 _DIGEST = "sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+_TEST_SYSTEM_PROMPT = "test compactor system prompt"
+_TEST_USER_PROMPT_TEMPLATE = (
+    "test compactor user prompt\n\n<<compaction_request>>\n\nreturn strict json"
+)
 
 
 def test_llm_context_compactor_does_not_use_thread_bridge() -> None:
@@ -50,6 +54,45 @@ def test_llm_context_compactor_does_not_use_thread_bridge() -> None:
     assert "threading" not in source
     assert "thread.join(" not in source
     assert "asyncio.run" not in source
+
+
+def _llm_compactor(
+    *,
+    runner_spec: RunnerSpec,
+    runner_options: RunnerCallOptions,
+) -> LLMContextCompactor:
+    """构造测试用 LLM compactor。
+
+    :param runner_spec: compactor runner spec。
+    :param runner_options: compactor runner options。
+    :returns: 测试 compactor。
+    """
+
+    return LLMContextCompactor(
+        runner_spec=runner_spec,
+        runner_options=runner_options,
+        system_prompt=_TEST_SYSTEM_PROMPT,
+        user_prompt_template=_TEST_USER_PROMPT_TEMPLATE,
+    )
+
+
+def test_llm_context_compactor_requires_scene_prompt_template() -> None:
+    """LLM compactor 要求调用方传入 scene 装配的双 prompt。"""
+
+    with pytest.raises(ValueError, match="system_prompt"):
+        LLMContextCompactor(
+            runner_spec=_runner_spec(),
+            runner_options=_runner_options(),
+            system_prompt="",
+            user_prompt_template=_TEST_USER_PROMPT_TEMPLATE,
+        )
+    with pytest.raises(ValueError, match="compaction_request"):
+        LLMContextCompactor(
+            runner_spec=_runner_spec(),
+            runner_options=_runner_options(),
+            system_prompt=_TEST_SYSTEM_PROMPT,
+            user_prompt_template="missing placeholder",
+        )
 
 
 @pytest.mark.asyncio
@@ -69,7 +112,7 @@ async def test_llm_context_compactor_builds_tool_disabled_request(
     runner_options = _runner_options()
     cancellation_token = StubCancellationToken()
 
-    await LLMContextCompactor(
+    await _llm_compactor(
         runner_spec=runner_spec,
         runner_options=runner_options,
     ).compact(_request(), cancellation_token)
@@ -78,6 +121,9 @@ async def test_llm_context_compactor_builds_tool_disabled_request(
     assert seen[0].runner_spec is runner_spec
     assert seen[0].runner_options is runner_options
     assert seen[0].cancellation_token is cancellation_token
+    assert seen[0].messages[0].content == _TEST_SYSTEM_PROMPT
+    assert seen[0].messages[1].content is not None
+    assert seen[0].messages[1].content.startswith("test compactor user prompt")
     assert seen[0].disable_tools is True
     assert seen[0].tool_schemas == ()
     assert seen[0].agent_policy.allow_tool_calls is False
@@ -97,7 +143,7 @@ async def test_llm_context_compactor_prompt_contains_raw_evidence_content(
 
     monkeypatch.setattr("dayu.host.llm_compaction.run_agent_and_wait", _fake_run)
 
-    await LLMContextCompactor(
+    await _llm_compactor(
         runner_spec=_runner_spec(),
         runner_options=_runner_options(),
     ).compact(_request(), StubCancellationToken())
@@ -139,7 +185,7 @@ async def test_llm_context_compactor_prompt_keeps_long_raw_evidence_content(
 
     monkeypatch.setattr("dayu.host.llm_compaction.run_agent_and_wait", _fake_run)
 
-    await LLMContextCompactor(
+    await _llm_compactor(
         runner_spec=_runner_spec(),
         runner_options=_runner_options(),
     ).compact(_request(raw_tool_content=raw_content), StubCancellationToken())
@@ -164,7 +210,7 @@ async def test_llm_context_compactor_prompt_marks_raw_evidence_with_evidence_id(
 
     monkeypatch.setattr("dayu.host.llm_compaction.run_agent_and_wait", _fake_run)
 
-    await LLMContextCompactor(
+    await _llm_compactor(
         runner_spec=_runner_spec(),
         runner_options=_runner_options(),
     ).compact(_request(), StubCancellationToken())
@@ -195,7 +241,7 @@ async def test_llm_context_compactor_maps_final_answer_to_candidate(
         _fake_run_factory(_final(_proposal_json())),
     )
 
-    candidate = await LLMContextCompactor(
+    candidate = await _llm_compactor(
         runner_spec=_runner_spec(),
         runner_options=_runner_options(),
     ).compact(_request(), StubCancellationToken())
@@ -233,7 +279,7 @@ async def test_llm_context_compactor_budget_counts_preserved_context(
         _fake_run_factory(_final(_proposal_json())),
     )
 
-    candidate = await LLMContextCompactor(
+    candidate = await _llm_compactor(
         runner_spec=_runner_spec(),
         runner_options=_runner_options(),
     ).compact(_request(), StubCancellationToken())
@@ -247,7 +293,7 @@ async def test_llm_context_compactor_budget_counts_structured_output_text(
 ) -> None:
     """预算估算必须随 fact 与 minimum preserve 文本增长。"""
 
-    compactor = LLMContextCompactor(
+    compactor = _llm_compactor(
         runner_spec=_runner_spec(),
         runner_options=_runner_options(),
     )
@@ -293,7 +339,7 @@ async def test_llm_context_compactor_rejects_empty_plain_text_or_non_final_outpu
         "dayu.host.llm_compaction.run_agent_and_wait",
         _fake_run_factory(_final("   ")),
     )
-    compactor = LLMContextCompactor(
+    compactor = _llm_compactor(
         runner_spec=_runner_spec(),
         runner_options=_runner_options(),
     )
@@ -330,7 +376,7 @@ async def test_llm_context_compactor_rejects_malformed_and_schema_invalid_json(
 ) -> None:
     """坏 JSON 与 schema-invalid JSON 必须拒绝。"""
 
-    compactor = LLMContextCompactor(
+    compactor = _llm_compactor(
         runner_spec=_runner_spec(),
         runner_options=_runner_options(),
     )
@@ -357,7 +403,7 @@ async def test_llm_context_compactor_rejects_overlong_structured_text(
 ) -> None:
     """claim_text 与 minimum preserve text 上限复用 shared constants。"""
 
-    compactor = LLMContextCompactor(
+    compactor = _llm_compactor(
         runner_spec=_runner_spec(),
         runner_options=_runner_options(),
     )
@@ -405,7 +451,7 @@ async def test_llm_context_compactor_rejects_non_accepted_evidence_refs(
             _final(_proposal_json(fact_evidence_refs=("evidence:not-accepted",)))
         ),
     )
-    compactor = LLMContextCompactor(
+    compactor = _llm_compactor(
         runner_spec=_runner_spec(),
         runner_options=_runner_options(),
     )
@@ -424,7 +470,7 @@ async def test_llm_context_compactor_rejects_truncated_final_output(
         "dayu.host.llm_compaction.run_agent_and_wait",
         _fake_run_factory(_final("partial summary", finish_reason=FinishReason.LENGTH)),
     )
-    compactor = LLMContextCompactor(
+    compactor = _llm_compactor(
         runner_spec=_runner_spec(),
         runner_options=_runner_options(),
     )
@@ -452,7 +498,7 @@ async def test_llm_context_compactor_applies_runner_timeout(
         return _final("unreachable")
 
     monkeypatch.setattr("dayu.host.llm_compaction.run_agent_and_wait", _hanging_run)
-    compactor = LLMContextCompactor(
+    compactor = _llm_compactor(
         runner_spec=_runner_spec(default_timeout_seconds=0.01),
         runner_options=_runner_options(),
     )
@@ -488,7 +534,7 @@ async def test_llm_context_compactor_sanitizes_failed_runner_outcome(
             )
         ),
     )
-    compactor = LLMContextCompactor(
+    compactor = _llm_compactor(
         runner_spec=_runner_spec(),
         runner_options=_runner_options(),
     )
@@ -518,7 +564,7 @@ async def test_llm_context_compactor_preserves_host_owned_refs_and_evidence(
         _fake_run_factory(_final(_proposal_json())),
     )
 
-    candidate = await LLMContextCompactor(
+    candidate = await _llm_compactor(
         runner_spec=_runner_spec(),
         runner_options=_runner_options(),
     ).compact(_request(), StubCancellationToken())
@@ -548,7 +594,7 @@ async def test_llm_context_compactor_uses_runner_retry_policy_without_owning_sem
 
     monkeypatch.setattr("dayu.host.llm_compaction.run_agent_and_wait", _raising_run)
     runner_spec = _runner_spec(max_retries=5)
-    compactor = LLMContextCompactor(
+    compactor = _llm_compactor(
         runner_spec=runner_spec,
         runner_options=_runner_options(),
     )

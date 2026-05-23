@@ -81,6 +81,7 @@ class CompactQualityIssue(StrEnum):
     MINIMUM_PRESERVE_ITEM_CANDIDATE_INVALID = (
         "minimum_preserve_item_candidate_invalid"
     )
+    OPEN_QUESTIONS_MISSING = "open_questions_missing"
 
 
 class EvidenceBackedFactKind(StrEnum):

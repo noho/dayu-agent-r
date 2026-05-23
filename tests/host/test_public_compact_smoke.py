@@ -14,6 +14,12 @@ from dayu.contracts.json_value import JsonValue
 from dayu.engine.contracts.runner_spec import RunnerCallOptions, RunnerSpec
 from dayu.host import CompactorRunnerBaseline, HostEventKind, open_host
 from dayu.host.context_policy import context_budget_policy_from_threshold_tokens
+from dayu.runtime.config_loader import ConfigLoader
+from dayu.runtime.scene_prepare import (
+    ScenePrepareRequest,
+    SceneToolCatalog,
+    prepare_scene,
+)
 from tests.host.public_smoke_support import (
     PROVIDER_CASES,
     FinalAnswerWorkerFactory,
@@ -40,6 +46,10 @@ _ACCEPTED_CANDIDATE_FIELD = "accepted_candidate"
 _CANDIDATE_ID_FIELD = "candidate_id"
 _INPUT_SNAPSHOT_REFS_FIELD = "input_snapshot_refs"
 _CURRENT_USER_INPUT_REF_FIELD = "current_user_input_ref"
+_PACKAGE_CONFIG_ROOT = (
+    pathlib.Path(__file__).resolve().parents[2] / "dayu" / "config"
+)
+_COMPACTOR_SCENE_ID = "conversation_compaction"
 
 
 @pytest.mark.asyncio
@@ -67,6 +77,7 @@ async def test_real_compactor_public_opener_compacts_and_preserves_continuity(
         top_p=None,
         stream=True,
     )
+    compactor_runner_options = _compactor_runner_options(case.model)
     compact_artifact_root = tmp_path / "compact-artifacts"
     artifact_files_before = _compact_artifact_files(compact_artifact_root)
     worker_factory = FinalAnswerWorkerFactory()
@@ -84,6 +95,7 @@ async def test_real_compactor_public_opener_compacts_and_preserves_continuity(
             runner_options=runner_options,
         ),
     )
+    compactor_system_prompt, compactor_user_prompt_template = _compactor_prompts()
     options = replace(
         base_options,
         context_budget_policy=context_budget_policy_from_threshold_tokens(
@@ -97,7 +109,9 @@ async def test_real_compactor_public_opener_compacts_and_preserves_continuity(
         ),
         compactor_runner_baseline=CompactorRunnerBaseline(
             compactor_runner_spec=compactor_runner_spec,
-            compactor_runner_options=runner_options,
+            compactor_runner_options=compactor_runner_options,
+            compactor_system_prompt=compactor_system_prompt,
+            compactor_user_prompt_template=compactor_user_prompt_template,
             compact_artifact_root=compact_artifact_root,
             compact_artifact_create_parent_dirs=True,
         ),
@@ -165,6 +179,49 @@ def _soft_threshold_prompt() -> str:
     """
 
     return _SOFT_THRESHOLD_PROMPT_SENTENCE * _SOFT_THRESHOLD_PROMPT_REPEAT_COUNT
+
+
+def _compactor_prompts() -> tuple[str, str]:
+    """通过真实 ``conversation_compaction`` scene 装配 compactor 双 prompt。
+
+    :returns: system prompt 与 user prompt template。
+    :raises AssertionError: scene fragment 数量不符合 compactor 约定时抛出。
+    """
+
+    scene = prepare_scene(
+        ScenePrepareRequest(
+            scene_id=_COMPACTOR_SCENE_ID,
+            scene_manifest_root=_PACKAGE_CONFIG_ROOT / "prompts" / "manifests",
+            prompt_asset_root=_PACKAGE_CONFIG_ROOT / "prompts",
+            context_slot_values={},
+            available_tools=SceneToolCatalog(tools=()),
+        )
+    )
+    assert len(scene.system_messages) == 2
+    return scene.system_messages
+
+
+def _compactor_runner_options(model_id: str) -> RunnerCallOptions:
+    """从默认模型配置读取 compactor runner option hint。
+
+    :param model_id: provider smoke case 使用的模型 id。
+    :returns: ``conversation_compaction`` hint 映射出的 RunnerCallOptions。
+    :raises KeyError: 默认配置缺少模型或 compactor hint 时抛出。
+    :raises ValueError: RunnerCallOptions 字段非法时由底层抛出。
+    """
+
+    config = ConfigLoader(package_config_dir=_PACKAGE_CONFIG_ROOT).load(
+        workspace_config_dir=None
+    )
+    hint = config.models.models[
+        model_id
+    ].runtime_hints.runner_option_hints[_COMPACTOR_SCENE_ID]
+    return RunnerCallOptions(
+        temperature=hint.temperature,
+        max_tokens=None,
+        top_p=hint.top_p,
+        stream=hint.stream,
+    )
 
 
 def _compact_artifact_files(root: pathlib.Path) -> tuple[pathlib.Path, ...]:

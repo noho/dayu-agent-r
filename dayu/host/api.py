@@ -925,12 +925,18 @@ class CompactorRunnerBaseline:
 
     :param compactor_runner_spec: compactor 独立 Runner 规约。
     :param compactor_runner_options: compactor 独立 Runner 调用参数。
+    :param compactor_system_prompt: Service 从 compactor scene 装配的
+        system prompt。
+    :param compactor_user_prompt_template: Service 从 compactor scene 装配的
+        user prompt template。
     :param compact_artifact_root: compact artifact 写入根目录。
     :param compact_artifact_create_parent_dirs: artifact 根目录缺失时是否创建。
     """
 
     compactor_runner_spec: RunnerSpec
     compactor_runner_options: RunnerCallOptions
+    compactor_system_prompt: str
+    compactor_user_prompt_template: str
     compact_artifact_root: pathlib.Path
     compact_artifact_create_parent_dirs: bool = True
 
@@ -951,6 +957,14 @@ class CompactorRunnerBaseline:
                 "CompactorRunnerBaseline.compactor_runner_options must be "
                 "RunnerCallOptions"
             )
+        _require_non_empty(
+            self.compactor_system_prompt,
+            field_name="CompactorRunnerBaseline.compactor_system_prompt",
+        )
+        _require_non_empty(
+            self.compactor_user_prompt_template,
+            field_name="CompactorRunnerBaseline.compactor_user_prompt_template",
+        )
         _require_path(
             self.compact_artifact_root,
             field_name="CompactorRunnerBaseline.compact_artifact_root",

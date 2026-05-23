@@ -57,6 +57,7 @@ def check_compaction_candidate(
         request=request,
         candidate=candidate,
     )
+    open_questions_retained = _open_questions_retained(candidate)
     patch_valid = _pinned_patch_valid(
         candidate.pinned_state_patch_candidate,
         evidence_ids=evidence_ids,
@@ -98,6 +99,8 @@ def check_compaction_candidate(
         issue_collector.add(
             CompactQualityIssue.MINIMUM_PRESERVE_ITEM_CANDIDATE_INVALID
         )
+    if not open_questions_retained:
+        issue_collector.add(CompactQualityIssue.OPEN_QUESTIONS_MISSING)
 
     reasons = issue_collector.reasons()
     return CompactQualityCheckResult(
@@ -108,7 +111,7 @@ def check_compaction_candidate(
         evidence_backed_fact_candidates_accepted=fact_candidates_accepted,
         minimum_preserve_items_accepted=minimum_preserve_items_accepted,
         evidence_anchors_retained=evidence_anchors_retained,
-        open_questions_retained=_open_questions_retained(candidate),
+        open_questions_retained=open_questions_retained,
         retained_accepted_evidence_refs=tuple(
             sorted(set(candidate.preserved_accepted_evidence_refs))
         ),

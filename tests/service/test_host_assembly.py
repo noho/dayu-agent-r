@@ -20,14 +20,18 @@ from dayu.runtime.config_loader import ConfigLoader
 from dayu.runtime.location import resolve_runtime_locations
 from dayu.runtime.assembly import RuntimeAssemblySelectionError
 from dayu.runtime.scene_prepare import (
+    PreparedSceneInputs,
     ScenePrepareRequest,
     SceneToolCatalog,
+    SceneToolSelectionMode,
+    SceneToolSelectionResult,
     prepare_scene,
 )
 from dayu.service.host_assembly import (
     ServiceAssemblyOverrides,
     ServiceOpenHostAssemblyRequest,
     _agent_fallback_mode_from_config,
+    _compactor_prompts_from_scene_inputs,
     compose_open_host_options,
     compose_submit_followup_request,
     discover_service_tools,
@@ -106,7 +110,16 @@ def test_compose_open_host_options_uses_runtime_tuning_from_config(
     assert result.options.ordinary_run_baseline.runner_options.max_tokens is None
     compactor_baseline = result.options.compactor_runner_baseline
     assert compactor_baseline is not None
+    assert compactor_baseline.compactor_runner_options.temperature == 0.4
     assert compactor_baseline.compactor_runner_options.max_tokens is None
+    assert compactor_baseline.compactor_runner_options.top_p == 1.0
+    assert compactor_baseline.compactor_runner_options.stream is False
+    assert "Host-owned context compaction" in (
+        compactor_baseline.compactor_system_prompt
+    )
+    assert "<<compaction_request>>" in (
+        compactor_baseline.compactor_user_prompt_template
+    )
     assert result.options.ordinary_run_baseline.agent_policy.max_iterations == 20
     assert result.options.ordinary_run_baseline.agent_policy.continuation_max_attempts == 2
     assert result.diagnostics.model_source == "run_override"
@@ -172,6 +185,32 @@ def test_compose_submit_followup_request_uses_prepared_system_prompt(
 
     assert request.system_prompt == scene_inputs.system_prompt
     assert request.tool_names == frozenset({"record_smoke_fact"})
+
+
+def test_compactor_prompt_scene_requires_two_fragments() -> None:
+    """Compactor scene prompt 必须显式拆成 system / user template 两段。
+
+    :returns: ``None``。
+    :raises AssertionError: helper 未 fail-fast 时抛出。
+    """
+
+    scene_inputs = PreparedSceneInputs(
+        system_messages=("only-system",),
+        system_prompt="only-system",
+        tool_selection=SceneToolSelectionResult(
+            mode=SceneToolSelectionMode.NONE,
+            tool_names=frozenset(),
+        ),
+        model_hints=None,
+        agent_policy_override=None,
+        fragment_refs=(),
+        source_refs=(),
+        content_digest="sha256:test",
+        capability_tags=(),
+    )
+
+    with pytest.raises(ValueError, match="exactly two prompt fragments"):
+        _compactor_prompts_from_scene_inputs(scene_inputs)
 
 
 def test_agent_fallback_mode_from_config_uses_engine_enum_values() -> None:

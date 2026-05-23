@@ -56,7 +56,12 @@ from dayu.runtime.config_loader import (
     ToolDiscoveryProviderConfig,
 )
 from dayu.runtime.location import RuntimeLocations
-from dayu.runtime.scene_prepare import PreparedSceneInputs
+from dayu.runtime.scene_prepare import (
+    PreparedSceneInputs,
+    ScenePrepareRequest,
+    SceneToolCatalog,
+    prepare_scene,
+)
 from dayu.runtime.tools_discovery import (
     PackageEntryPointProvider,
     PythonImportPathProvider,
@@ -68,6 +73,8 @@ _ENV_PLACEHOLDER_PATTERN: Final[re.Pattern[str]] = re.compile(
     r"\{\{([A-Za-z_][A-Za-z0-9_]*)\}\}"
 )
 _WORKER_BACKEND_LOCAL: Final[str] = "local"
+_COMPACTOR_SCENE_ID: Final[str] = "conversation_compaction"
+_COMPACTOR_PROMPT_FRAGMENT_COUNT: Final[int] = 2
 
 
 @dataclass(frozen=True, slots=True)
@@ -199,6 +206,18 @@ class ServiceOpenHostAssemblyResult:
     effective_tool_bundle: ToolBundle
 
 
+@dataclass(frozen=True, slots=True)
+class _CompactorScenePrompts:
+    """Compactor scene 装配后的双 prompt。
+
+    :param system_prompt: compactor system prompt。
+    :param user_prompt_template: compactor user prompt template。
+    """
+
+    system_prompt: str
+    user_prompt_template: str
+
+
 def discover_service_tools(config: RuntimeConfig) -> ServiceDiscoveredTools:
     """按 runtime config 执行工具发现。
 
@@ -255,6 +274,8 @@ def compose_open_host_options(
         tool_bundle=request.discovered_tools.tool_bundle,
         execution_profile=execution_profile,
     )
+    compactor_scene_inputs = _prepare_compactor_scene_inputs(request)
+    compactor_prompts = _compactor_prompts_from_scene_inputs(compactor_scene_inputs)
     ordinary_selection = select_runner_option_hint(
         models=config.models,
         execution_baseline=execution_profile.run_baseline,
@@ -299,6 +320,7 @@ def compose_open_host_options(
         compactor_selection=compactor_selection,
         agent_policy_config=agent_policy_config,
         effective_tool_bundle=effective_tool_bundle,
+        compactor_prompts=compactor_prompts,
     )
     diagnostics = _assembly_diagnostics(
         locations=request.locations,
@@ -377,6 +399,7 @@ def _compose_options(
     compactor_selection: RunnerOptionHintSelection,
     agent_policy_config: MergedAgentPolicyConfig,
     effective_tool_bundle: ToolBundle,
+    compactor_prompts: _CompactorScenePrompts,
 ) -> OpenHostOptions:
     """组合 ``OpenHostOptions``。
 
@@ -388,6 +411,7 @@ def _compose_options(
     :param compactor_selection: compactor runner 选择。
     :param agent_policy_config: 合并后的 AgentPolicy 配置。
     :param effective_tool_bundle: 已补齐截断默认值的工具 bundle。
+    :param compactor_prompts: compactor scene 装配后的 system / user prompt。
     :returns: Host public opener options。
     :raises ValueError: worker backend 或 secret 映射失败时抛出。
     """
@@ -466,6 +490,8 @@ def _compose_options(
             compactor_runner_options=_runner_options_from_hint(
                 compactor_selection.runner_option_hint
             ),
+            compactor_system_prompt=compactor_prompts.system_prompt,
+            compactor_user_prompt_template=compactor_prompts.user_prompt_template,
             compact_artifact_root=_resolve_project_path(
                 request.workspace_root,
                 execution_profile.compactor_baseline.artifact_root,
@@ -482,6 +508,50 @@ def _compose_options(
         enable_truncation_manager=(
             execution_profile.tool_truncation_policy.enabled
         ),
+    )
+
+
+def _prepare_compactor_scene_inputs(
+    request: ServiceOpenHostAssemblyRequest,
+) -> PreparedSceneInputs:
+    """装配 Host-owned compactor 使用的 conversation compaction scene。
+
+    :param request: Service open_host assembly 请求。
+    :returns: compactor scene 装配输出。
+    :raises ScenePrepareError: compactor scene asset 违反 scene contract 时抛出。
+    """
+
+    return prepare_scene(
+        ScenePrepareRequest(
+            scene_id=_COMPACTOR_SCENE_ID,
+            scene_manifest_root=request.locations.scene_manifest_root,
+            prompt_asset_root=request.locations.prompt_asset_root,
+            context_slot_values={},
+            available_tools=SceneToolCatalog.from_tool_bundle(
+                request.discovered_tools.tool_bundle
+            ),
+        )
+    )
+
+
+def _compactor_prompts_from_scene_inputs(
+    scene_inputs: PreparedSceneInputs,
+) -> _CompactorScenePrompts:
+    """从 compactor scene ordered fragments 中读取 system / user prompt。
+
+    :param scene_inputs: ``conversation_compaction`` scene 装配输出。
+    :returns: compactor 双 prompt。
+    :raises ValueError: compactor scene 未提供恰好两个 prompt fragments 时抛出。
+    """
+
+    if len(scene_inputs.system_messages) != _COMPACTOR_PROMPT_FRAGMENT_COUNT:
+        raise ValueError(
+            "conversation_compaction scene must provide exactly two prompt fragments"
+        )
+    system_prompt, user_prompt_template = scene_inputs.system_messages
+    return _CompactorScenePrompts(
+        system_prompt=system_prompt,
+        user_prompt_template=user_prompt_template,
     )
 
 

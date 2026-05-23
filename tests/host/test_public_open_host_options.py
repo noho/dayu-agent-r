@@ -271,6 +271,10 @@ def test_compactor_runner_baseline_validates_typed_fields(
     baseline = CompactorRunnerBaseline(
         compactor_runner_spec=_runner_spec(),
         compactor_runner_options=_runner_options(),
+        compactor_system_prompt="test compactor system prompt",
+        compactor_user_prompt_template=(
+            "test compactor user prompt <<compaction_request>>"
+        ),
         compact_artifact_root=tmp_path / "compact",
     )
     assert baseline.compact_artifact_create_parent_dirs
@@ -280,6 +284,10 @@ def test_compactor_runner_baseline_validates_typed_fields(
         replace(baseline, compact_artifact_root=cast(pathlib.Path, "bad"))
     with pytest.raises(TypeError, match="compact_artifact_create_parent_dirs"):
         replace(baseline, compact_artifact_create_parent_dirs=cast(bool, 1))
+    with pytest.raises(ValueError, match="compactor_system_prompt"):
+        replace(baseline, compactor_system_prompt="")
+    with pytest.raises(ValueError, match="compactor_user_prompt_template"):
+        replace(baseline, compactor_user_prompt_template="")
     assert "compactor_policy_ref" not in {
         field.name for field in fields(CompactorRunnerBaseline)
     }

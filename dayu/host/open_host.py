@@ -648,6 +648,10 @@ def _local_execution_options_from_open_host_options(
         LLMContextCompactor(
             runner_spec=compactor_runner_baseline.compactor_runner_spec,
             runner_options=compactor_runner_baseline.compactor_runner_options,
+            system_prompt=compactor_runner_baseline.compactor_system_prompt,
+            user_prompt_template=(
+                compactor_runner_baseline.compactor_user_prompt_template
+            ),
         )
         if compactor_runner_baseline is not None
         else None

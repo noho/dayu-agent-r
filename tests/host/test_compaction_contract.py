@@ -282,6 +282,8 @@ async def test_quality_marks_open_questions_lost_when_clear_without_summary_ques
     result = check_compaction_candidate(request, candidate)
 
     assert result.open_questions_retained is False
+    assert result.accepted is False
+    assert CompactQualityIssue.OPEN_QUESTIONS_MISSING in result.rejection_reasons
 
 
 @pytest.mark.asyncio

@@ -74,17 +74,7 @@ _ASSIGNMENT_SECRET_PATTERN = re.compile(
     r"(?i)((?:api[_-]?key|authorization)\s*[:=]\s*)[^,\s}\]]+"
 )
 _SAFE_ERROR_CODE_PATTERN = re.compile(r"^[a-z][a-z0-9_-]{0,63}$")
-_SYSTEM_PROMPT = (
-    "You are a host-owned context compaction component. Return exactly one "
-    "strict JSON object as the final answer. Do not wrap it in Markdown. Do "
-    "not request tools. The JSON object must contain episode_summary_candidate, "
-    "pinned_state_patch_candidate, evidence_backed_fact_candidates, "
-    "minimum_preserve_item_candidates, retained_current_user_input_ref, "
-    "preserved_input_event_refs, preserved_accepted_evidence_refs, "
-    "preserved_evidence_backed_fact_refs, dropped_ranges, and "
-    "summarized_ranges. Evidence-backed fact evidence_refs may only reference "
-    "accepted_evidence_refs from the request."
-)
+_COMPACTION_REQUEST_PLACEHOLDER = "<<compaction_request>>"
 _POST_COMPACT_SYSTEM_PROMPT_ESTIMATE = (
     "Host post-compact run context includes compact summary, pinned state, "
     "current input, preserved refs, evidence-backed facts, and continuity items."
@@ -136,6 +126,9 @@ class LLMContextCompactor(ContextCompactor):
 
     :param runner_spec: compactor 独立 Runner 规约。
     :param runner_options: compactor 独立 Runner 调用参数。
+    :param system_prompt: Service 从 compactor scene 装配的 system prompt。
+    :param user_prompt_template: Service 从 compactor scene 装配的 user prompt
+        template；必须包含 ``<<compaction_request>>`` 占位符。
     """
 
     def __init__(
@@ -143,21 +136,41 @@ class LLMContextCompactor(ContextCompactor):
         *,
         runner_spec: RunnerSpec,
         runner_options: RunnerCallOptions,
+        system_prompt: str,
+        user_prompt_template: str,
     ) -> None:
         """初始化 Host-owned compactor。
 
         :param runner_spec: compactor 独立 Runner 规约。
         :param runner_options: compactor 独立 Runner 调用参数。
+        :param system_prompt: compactor system prompt。
+        :param user_prompt_template: compactor user prompt template。
         :returns: ``None``。
-        :raises TypeError: runner 参数类型非法时抛出。
+        :raises TypeError: runner 或 prompt 参数类型非法时抛出。
+        :raises ValueError: prompt 为空或 template 缺少占位符时抛出。
         """
 
         if not isinstance(runner_spec, RunnerSpec):
             raise TypeError("runner_spec must be RunnerSpec")
         if not isinstance(runner_options, RunnerCallOptions):
             raise TypeError("runner_options must be RunnerCallOptions")
+        if not isinstance(system_prompt, str):
+            raise TypeError("system_prompt must be str")
+        if system_prompt.strip() == "":
+            raise ValueError("system_prompt must be non-empty")
+        if not isinstance(user_prompt_template, str):
+            raise TypeError("user_prompt_template must be str")
+        if user_prompt_template.strip() == "":
+            raise ValueError("user_prompt_template must be non-empty")
+        if user_prompt_template.count(_COMPACTION_REQUEST_PLACEHOLDER) != 1:
+            raise ValueError(
+                "user_prompt_template must contain exactly one "
+                "<<compaction_request>> placeholder"
+            )
         self._runner_spec = runner_spec
         self._runner_options = runner_options
+        self._system_prompt = system_prompt
+        self._user_prompt_template = user_prompt_template
 
     async def compact(
         self, request: CompactionRequest, cancellation_token: CancellationToken
@@ -179,6 +192,8 @@ class LLMContextCompactor(ContextCompactor):
                 request,
                 self._runner_spec,
                 self._runner_options,
+                self._system_prompt,
+                self._user_prompt_template,
                 cancellation_token,
             ),
             timeout_seconds=self._runner_spec.default_timeout_seconds,
@@ -196,6 +211,8 @@ def _agent_request(
     request: CompactionRequest,
     runner_spec: RunnerSpec,
     runner_options: RunnerCallOptions,
+    system_prompt: str,
+    user_prompt_template: str,
     cancellation_token: CancellationToken,
 ) -> AgentRunRequest:
     """构造禁用工具的 Engine public run request。
@@ -203,6 +220,8 @@ def _agent_request(
     :param request: Host compaction request。
     :param runner_spec: compactor Runner 规约。
     :param runner_options: compactor Runner 调用参数。
+    :param system_prompt: compactor system prompt。
+    :param user_prompt_template: compactor user prompt template。
     :param cancellation_token: Host 注入 Engine 的真实取消 token。
     :returns: Engine AgentRunRequest。
     """
@@ -211,8 +230,11 @@ def _agent_request(
         run_id=f"{_COMPACTOR_RUN_ID_PREFIX}-{request.run_id}-{uuid4().hex}",
         session_id=request.session_id,
         messages=(
-            SystemMessage(role=AgentMessageRole.SYSTEM, content=_SYSTEM_PROMPT),
-            UserMessage(role=AgentMessageRole.USER, content=_user_prompt(request)),
+            SystemMessage(role=AgentMessageRole.SYSTEM, content=system_prompt),
+            UserMessage(
+                role=AgentMessageRole.USER,
+                content=_user_prompt(request, user_prompt_template),
+            ),
         ),
         disable_tools=True,
         runner_spec=runner_spec,
@@ -297,11 +319,28 @@ def _safe_outcome_text(text: str) -> str:
     return redacted[:_MAX_SAFE_OUTCOME_MESSAGE_CHARS] + _TRUNCATED_SUFFIX
 
 
-def _user_prompt(request: CompactionRequest) -> str:
-    """构造 Host-owned compactor user prompt。
+def _user_prompt(request: CompactionRequest, template: str) -> str:
+    """用 scene template 构造 Host-owned compactor user prompt。
 
     :param request: Host compaction request。
+    :param template: Service 从 scene 装配的 user prompt template。
     :returns: 用户消息文本。
+    """
+
+    return template.replace(
+        _COMPACTION_REQUEST_PLACEHOLDER,
+        _compaction_request_prompt_block(request),
+    )
+
+
+def _compaction_request_prompt_block(request: CompactionRequest) -> str:
+    """构造 compactor request 数据块。
+
+    该函数只渲染 Host typed request 数据，不承载任务指令或输出 schema；
+    任务指令与 schema 由 compactor scene prompt template 提供。
+
+    :param request: Host compaction request。
+    :returns: compaction request prompt 数据块。
     """
 
     lines = [
@@ -319,42 +358,6 @@ def _user_prompt(request: CompactionRequest) -> str:
     ]
     lines.extend(_accepted_evidence_envelope_lines(request.accepted_evidence_envelopes))
     lines.extend(_compact_raw_context_lines(request.compact_raw_context_items))
-    lines.extend(
-        [
-            "Return strict JSON only. Required object schema:",
-            "{",
-            '  "episode_summary_candidate": {',
-            '    "episode_title": "non-empty text",',
-            '    "goal": "non-empty text",',
-            '    "completed_actions": ["text"],',
-            '    "confirmed_fact_refs": ["existing evidence_backed_fact_ref"],',
-            '    "confirmed_fact_summaries": ["text"],',
-            '    "user_constraints": ["text"],',
-            '    "open_questions": ["text"],',
-            '    "next_step": "text or null",',
-            '    "tool_finding_refs": ["accepted evidence ref"]',
-            "  },",
-            '  "pinned_state_patch_candidate": {',
-            '    "current_goal": {"operation": "missing|clear|replace", "value": "text or null"},',
-            '    "confirmed_subjects": {"operation": "missing|clear|replace", "value": ["text"] or null},',
-            '    "user_constraints": {"operation": "missing|clear|replace", "value": ["text"] or null},',
-            '    "open_questions": {"operation": "missing|clear|replace", "value": ["text"] or null}',
-            "  },",
-            '  "evidence_backed_fact_candidates": [',
-            '    {"candidate_id": "local id", "claim_text": "bounded text", "evidence_kind": "observed_value|quoted_statement|table_value|derived_from_evidence", "evidence_refs": ["accepted evidence ref"], "attributes": {}}',
-            "  ],",
-            '  "minimum_preserve_item_candidates": [',
-            '    {"item_id": "local id", "label": "short text", "text": "bounded text", "source_refs": ["input event ref"], "preserve_reason": "needed_for_recent_reference|needed_for_ordered_item_reference|needed_for_local_followup"}',
-            "  ],",
-            f'  "retained_current_user_input_ref": "{request.current_message_summary.current_user_input_ref}",',
-            '  "preserved_input_event_refs": ["input event refs"],',
-            '  "preserved_accepted_evidence_refs": ["accepted evidence refs"],',
-            '  "preserved_evidence_backed_fact_refs": ["evidence-backed fact refs"],',
-            '  "dropped_ranges": [],',
-            '  "summarized_ranges": [{"range_ref": "local id", "start_input_ref": "input ref", "end_input_ref": "input ref"}]',
-            "}",
-        ]
-    )
     return "\n".join(lines)
 
 

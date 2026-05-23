@@ -58,7 +58,7 @@ Runner 实现类不属于 `dayu.engine` 包根公共 API。Engine 只接收 `too
 
 Host 是 Session / Run / Attempt / EventLog / admission / cancel / resume / retry / replay / memory / context governance / tool governance 的治理真源。Projection、timeline、audit、usage、tool trace、outbox 与 memory snapshot 都是已提交 EventLog 的派生视图，不能反向成为恢复或状态迁移真源。
 
-Host-owned LLM compaction 通过 `OpenHostOptions` 的预算治理配置与 `CompactorRunnerBaseline` 装配。业务侧传入 compactor 运行基线；Host 在自己的 Context Governance 边界内构造 compaction request、校验 candidate，并写入 compact artifact 与 canonical event。
+Host-owned LLM compaction 通过 `OpenHostOptions` 的预算治理配置与 `CompactorRunnerBaseline` 装配。Service / composition root 从 `conversation_compaction` scene asset 装配 compactor system prompt 与 user prompt template 后传入 Host；Host 在自己的 Context Governance 边界内构造 compaction request、替换 template 中的 request 数据块、校验 candidate，并写入 compact artifact 与 canonical event。
 
 ### `dayu.service`
 
@@ -127,7 +127,7 @@ Service 可以依赖 Host / Engine public contracts，但不得让 `dayu.runtime
 - 新 provider request extension DSL：在 `dayu.engine.provider_extensions` 中映射到 Engine `ProviderRequestExtension` 封闭联合；不要把 Engine contract 解析 helper 放进 `dayu.runtime`。
 - 新财报数据能力：在 `dayu.fins.storage` 仓储协议与实现内扩展文档存取；工具或 Service 通过仓储协议访问，不旁路读取文件或数据库。
 - 新本地执行能力：实现 `LocalEngineWorkerFactory` / `LocalEngineWorker`，并通过 `OpenHostOptions` 装配到 Host。
-- 新上下文压缩能力：通过 Host 的预算治理配置和 `CompactorRunnerBaseline` 装配 Host-owned LLM compaction；不要把 compaction 生命周期放到 Service 或 UI。
+- 新上下文压缩能力：通过 Host 的预算治理配置和 `CompactorRunnerBaseline` 装配 Host-owned LLM compaction；compactor prompt 由 Service 从 scene asset 装配后传入，compaction 生命周期仍属于 Host，不放到 Service 或 UI。
 - 新运行期通用能力：优先放入 `dayu.runtime`，并保持层中立 import 边界。
 - 新 projection / sink / trace 能力：消费 committed EventLog 与 checkpoint，不写 Host canonical facts，不改变 Run / Attempt 治理状态。
 
