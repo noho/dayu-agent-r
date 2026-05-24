@@ -222,10 +222,10 @@ Phase Map 中每个 phase 必须使用统一条目格式。模板如下：
 
 约束：本节只保留当前 gate 结论；phase 过程流水必须归档到 `历史记录`，仍需追踪的风险或后续 owner 必须写入 `Open Questions 与风险追踪` 的 `追踪区`。
 
-当前 work unit：Phase 12.5 Conversation Memory Optimization。
-当前状态：P12 已完成；PR 67 已 draft-PR-pass 并由用户 merge。
-当前 gate：P12.5 PR 68 post-draft third manual full-repo review repair accepted；draft-PR-pass。
-下一步：除 CI / review feedback 外，P12.5 无新的 blocking work；PR 68 后续 merge、mark ready for review、request reviewers、approve、delete branch 或对外 comment 仍需用户额外授权。
+当前 work unit：Phase 12.6 Conversation Memory Redesign From First-Principles Discussion。
+当前状态：P12 已完成；PR 67 已 draft-PR-pass 并由用户 merge；P12.5 PR 68 post-draft third manual full-repo review repair accepted，draft-PR-pass。
+当前 gate：P12.6 plan re-review PASS；准备创建 accepted plan commit 并进入 implementation Slice 1。以 `docs/host/conversation-memory-compact-io-first-principles-discussion.md` 为讨论输入，稳定裁决已写回 `docs/host/design.md`；controller artifacts 为 `docs/reviews/p12-6-design-refinement-controller-20260524.md`、`docs/reviews/p12-6-design-review-controller-adjudication-20260524.md` 与 `docs/reviews/p12-6-plan-review-controller-adjudication-20260524.md`；design review artifacts 为 `docs/reviews/p12-6-design-review-mimo-20260524.md`、`docs/reviews/p12-6-design-review-ds-20260524.md`、`docs/reviews/p12-6-design-rereview-mimo-20260524.md` 与 `docs/reviews/p12-6-design-rereview-ds-20260524.md`，两路 re-review 均 PASS；plan artifact 为 `docs/host/p12-6-conversation-memory-redesign-implementation-plan.md`；plan review artifacts 为 `docs/reviews/p12-6-plan-review-mimo-20260524.md` 与 `docs/reviews/p12-6-plan-review-ds-20260524.md`；plan fix artifact 为 `docs/reviews/p12-6-plan-fix-codex-20260524.md`；plan re-review artifacts 为 `docs/reviews/p12-6-plan-rereview-mimo-20260524.md` 与 `docs/reviews/p12-6-plan-rereview-ds-20260524.md`，两路均 PASS。
+下一步：创建 accepted plan commit；随后按 `$init-agents` 路由 `AgentCodex` 执行 implementation Slice 1。PR 68 后续 merge、mark ready for review、request reviewers、approve、delete branch 或对外 comment 仍需用户额外授权。
 
 当前 gate 结论：P12.5 implementation Slice 1-7、aggregate deepreview、targeted repair、aggregate re-review、PR 68 draft review、post-draft cancellation hardening fix、post-draft raw evidence compaction fix、post-draft compactor scene prompt fix、post-draft compactor baseline scene id fix、post-draft compactor AgentPolicy / user prompt template ownership fix、post-draft reactive compaction budget hardening fix、post-draft manual full-repo review repair、post-draft second manual full-repo review repair 与 post-draft third manual full-repo review repair 均已 PASS。用户指出 bounded `result_preview` 作为 evidence-backed fact extraction primary input 会丢失长章节 evidence 内容，controller 裁决该问题影响 P12.5 success signal，不能作为 residual 留存。最终设计裁决：删除 `result_preview` 概念；`evidence_backed_facts` 必须基于 compact range raw tool result / raw transcript 生成 claim，Host-minted `evidence_id` 只作为标注到 raw evidence 旁边的 provenance anchor。ToolRuntime accepted result 不直接物化 stable fact；accepted `CONTEXT_COMPACTED.evidence_backed_fact_candidates` 才进入 memory projection；dispatch memory projection lag 走 rebuild / retry，不触发 Run / Attempt 终态迁移。生产代码不再允许 compactor 自行构造不可取消 token，compaction LLM call 必须接收 Host lifecycle cancellation token。Compactor system prompt 与 AgentPolicy 由 Service assembly 按 `execution_profiles.json.compactor_baseline.scene_id` 装配，compactor user prompt template 由 Service assembly 按 `execution_profiles.json.compactor_baseline.user_prompt_template_path` 读取，三者均以 typed `CompactorRunnerBaseline` 传入 Host；compactor 温度、top_p 与 stream 继续由 `execution_profiles.json.compactor_baseline.runner_option_hint_id` 指向 `models.json.runtime_hints.runner_option_hints.conversation_compaction`。Reactive compaction 不引入 raw evidence aggregate prompt budget guard，不让不准 token 估算阻断 reactive recovery；reactive path 通过真实 recovery dispatch / Engine overflow 闭环最多执行 `max_reactive_compactions_per_run` 次 compact，默认上限为 2，超过上限后 fail closed。Latest manual full-repo review artifacts 为 `docs/reviews/repo-review-20260523-215141.md` 与 `docs/reviews/repo-review-20260523-215152.md`；repair artifact 为 `docs/reviews/pr-68-third-manual-fullrepo-fix-codex-20260523.md`；controller adjudication artifact 为 `docs/reviews/pr-68-third-manual-fullrepo-fix-controller-adjudication-20260523.md`；latest re-review artifacts 为 `docs/reviews/pr-68-third-manual-fullrepo-fix-rereview-mimo-20260523.md` 与 `docs/reviews/pr-68-third-manual-fullrepo-fix-rereview-ds-20260523.md`，两者均 PASS 且无 blocking findings。Controller validation：affected pytest 103 passed；`pyright dayu tests` 0 errors；`git diff --check` passed。剩余风险为大 session rebuild performance，以及 manual full-repo reviews 中已转交后续 owner 的 dispatch / recovery、durable layering、memory semantics、Engine runner / provider、ToolRuntime 与 production hardening items。
 
@@ -1834,6 +1834,138 @@ Plan 必须额外收口的 readiness review checklist：
 后续依赖：
 - 真实财报工具需要保证 tool result accept path 可形成 accepted evidence envelope；该接入归后续 Fins / tool provider work unit。
 - long-term retrieval、cross-session research memory、public memory edit / reset / forget API 仍归后续独立 phase。
+
+### Phase 12.6. Conversation Memory Redesign From First-Principles Discussion
+
+状态：
+- design discussion entry。P12.6 从 `docs/host/conversation-memory-compact-io-first-principles-discussion.md` 开始重新设计
+  Conversation Memory。该讨论稿只作为 phase discussion 输入，不作为 implementation agent 的设计真源；进入 plan gate 前必须把稳定裁决写回
+  `docs/host/design.md`。
+
+目标：
+- 以买方财报分析 Agent 的第一性原理重新设计 Conversation Memory，使 memory / compaction I/O 边界回到可解释、可审计、
+  可长期稳定的结构，而不是在 P12.5 既有实现上继续局部补丁。
+- 继承旧 `dayu-agent` Conversation Memory 已验证的稳定骨架：`pinned_state` materialized current state、recent raw turns
+  floor、older prefix compaction、独立 compaction JSON payload、bounded episode rendering，以及避免 current user / raw turn /
+  tool result 重复进入 compactor prompt。
+- 在上述骨架上补齐 P12.5 需要但旧实现没有的通用 `evidence_backed_facts`：LLM-facing evidence block 使用可读 query /
+  result / source locator 与 prompt-local evidence label；Host 内部把 label 映射回 EventLog canonical provenance。
+- 修复当前 P12.5 smoke 暴露出的根因：compactor input 不得从 Session 起点 dump EventLog，不得把 Host provenance key 作为
+  LLM 主要语义输入，不得重复渲染当前长输入或 raw evidence。
+
+对应设计章节：
+- `docs/host/design.md` §24 Conversation Memory
+- `docs/host/design.md` §25 Context Governance
+- `docs/host/design.md` §18 ToolRuntime / TruncationManager
+- `docs/host/design.md` §20 RunInputBuilder
+- `docs/host/design.md` §23 RunInputBuilder
+
+前置条件：
+- P12.5 已达到 draft-PR-pass，且已确认 bounded `result_preview` / EventLog range dump / Host provenance key 渲染等方向不足以作为最终
+  Conversation Memory 设计。
+- `docs/host/conversation-memory-compact-io-first-principles-discussion.md` 已记录当前第一性原理讨论、两轮 compact I/O 推演、
+  旧 `dayu-agent` memory baseline 对照、long-session structured memory bloat 风险与 provisional JSON 输出草案。
+- 旧 `dayu-agent` 的 `dayu/host/conversation_memory.py` 与 `docs/conversation_memory_test.md` 作为行为 baseline 参考；不得直接
+  当成当前仓库实现方案照搬。
+
+进入条件：
+- P12.6 design discussion 必须先裁决 Conversation Memory 的最终结构、compact material pack schema、stable layer / history pool
+  ownership、fact extraction / evidence provenance 边界、proactive / reactive compaction I/O、long-session consolidation /
+  retention 策略。
+- 若 discussion 改变 P12.5 已写入 `docs/host/design.md` 的结构或术语，必须先更新 `docs/host/design.md`，再进入
+  handoff implementation-ready plan。
+- 必须明确哪些 P12.5 代码作为可复用实现，哪些必须重写或删除；不得默认沿用当前实现路径。
+
+范围：
+- 允许修改：`docs/host/design.md`、本文档、Conversation Memory typed contracts、memory projection、compact material builder、
+  compaction request / response contract、LLM compactor prompt / JSON schema、Context Governance compaction orchestration、
+  RunInputBuilder memory rendering、ToolRuntime accepted tool result evidence projection、focused Host tests、public memory /
+  compact smoke、相关 README。
+- 禁止修改：Engine Agent loop、Runner provider contract、ConfigLoader / ScenePrepare schema、真实财报工具实现、Fins storage、
+  Service / UI workflow、Host command / handle public method、`open_host(options)` 字段名、`SubmitFollowupRequest` public 字段名。
+
+不做：
+- 不实现 long-term cross-session retrieval、投资研究知识库、向量索引、公共 memory edit / reset / forget API。
+- 不让 episode summary、assistant final answer 或 raw recent turns 自动升级为 `evidence_backed_fact`。
+- 不把 Host internal `event_id`、payload ref、digest、cursor、policy、artifact descriptor 当作 LLM 的主要语义输入。
+- 不把完整 EventLog range 或 Host ledger wrapper 塞进 compactor prompt。
+- 不让 tool provider 生成 memory facts；tool provider / ToolRuntime 只产生 accepted tool result，fact extraction 由 Host-governed
+  LLM compactor / extractor 完成。
+- 不依赖不准 token 估算作为 reactive recovery 成败证明；reactive compact 必须通过 bounded pass + recovery dispatch / provider
+  overflow 闭环 fail closed。
+
+关键设计问题：
+- 必须确定新的 Conversation Memory 树：`pinned_state`、`evidence_backed_facts`、`working_assumptions`、`open_questions`、
+  conversation continuity、recent raw turns floor、older raw turns、episode summaries 的 ownership、rendering 与 retention。
+- 必须决定旧 `confirmed_facts` 与新 `evidence_backed_facts` 的关系：旧字段只能作为前身 / summary view，不能替代
+  evidence-backed stable facts。
+- 必须确定 compact material pack 的输入边界：普通 compaction run messages 只能是 compactor system prompt + user material pack；
+  material pack 必须由去重后的 stable input、history input、accepted tool evidence blocks 与 current input anchor 组成。
+- 必须确定 accepted evidence 最小语义：canonical truth 是 `TOOL_RESULT_ACCEPTED`；LLM 看到的是 prompt-local evidence block；
+  Host accept barrier 只校验 candidate 引用了存在的 prompt-local evidence labels，并映射回 canonical provenance。
+- 必须确定 proactive compact 的安全条件：在 `soft_threshold_context_ratio` 触发时，compactor input 不得显著大于 ordinary
+  run input material，不允许通过重复 current input / raw evidence 造成 provider 超窗。
+- 必须确定 reactive compact 的分段语义：provider overflow 后冻结 ordinary input material list，优先压缩 older prefix，
+  保留 recent raw turns 与 current input anchor；必要时多 pass，超过 policy 上限 fail closed。
+- 必须确定长会话 structured memory 不可 append-only：`pinned_state` 是 materialized current state；assumptions / open
+  questions 需要 merge / resolve / expire；episode summaries 需要 rollup；`evidence_backed_facts` 需要 bounded working set。
+- 必须确定 P12.6 smoke success signal：至少覆盖 no-compaction recent raw turns continuity、post-compaction evidence-backed fact
+  reuse、长 user input minimum preserve、长章节 tool result extraction 不依赖 preview、长期多次 compact 后 memory bounded。
+
+交付物：
+- updated `docs/host/design.md`
+- updated `docs/host/implementation-control.md`
+- handoff implementation-ready plan
+- plan review / fix / re-review artifacts
+- implementation slices
+- focused tests、integration smoke、pyright、README sync
+
+建议 slice 切分：
+- Slice 1: Design Truth Rewrite And Contract Pruning，删除 / 替换 P12.5 中不符合讨论稿裁决的概念与契约。
+- Slice 2: Compact Material Pack Builder，按 stable / history / evidence / current input anchor 生成去重 JSON payload。
+- Slice 3: LLM Compactor JSON Schema And Accept Barrier，产出 episode summary、pinned patch、evidence-backed fact candidates、
+  working assumption / open question candidates 与 minimum preserve items。
+- Slice 4: Memory Projection Redesign，物化 materialized pinned state、bounded evidence-backed facts working set、bounded
+  assumptions / open questions、episode summary rollup 与 recent continuity。
+- Slice 5: Context Governance Proactive / Reactive Compaction Wiring，修复主动 compact duplication，落地 reactive segmented
+  compact / recovery dispatch fail-closed。
+- Slice 6: RunInputBuilder Rendering And Public Smoke，验证 compact 前后 continuity / facts / minimum preserve / long-session boundedness。
+- Slice 7: README Sync, Aggregate Validation And Deepreview。
+
+验证要求：
+- unit tests: compact material pack 不包含 EventLog ledger wrapper，不重复 current input，不重复同一 raw tool result，且 prompt-local
+  evidence labels 可映射到 canonical `TOOL_RESULT_ACCEPTED` refs。
+- unit tests: LLM compactor accept barrier 拒绝无 evidence refs 的 `evidence_backed_fact_candidates`，拒绝引用不存在 label，
+  拒绝 episode summary 冒充 evidence-backed fact。
+- unit tests: memory projection 不向 LLM 渲染 pinned patch log，不 append-only 渲染 assumptions / open questions /
+  evidence-backed facts / episode summaries，working set 受 policy 约束。
+- integration tests: Run 1 工具返回收入 / 毛利，Run 2 问毛利率；未 compact 时靠 recent raw turns / available context 成功。
+- integration tests: 两轮完成后触发 compact，后续 Run 能基于 `evidence_backed_facts` 稳定复用已确认财务事实，不重新依赖旧 raw turns。
+- integration tests: 长 user input compact 后，下一轮“第二个因素”可通过 minimum preserve item 正确解析，不保留完整原文。
+- integration tests: 长章节 tool result 进入 compact material pack 时不使用 `result_preview`，fact extraction 基于 raw accepted evidence block。
+- integration tests: reactive provider overflow path 能通过分段 compact / recovery dispatch 收敛；超过 `max_reactive_compactions_per_run`
+  后 fail closed。
+- smoke: `utils/smoke_host_public_multiturn.py` 或 P12.6 专用 smoke 覆盖 proactive compact 不因重复 prompt 超窗失败。
+- pyright: affected host / tests pass with no new or expanded errors。
+- docs: `dayu/host/README.md`、`dayu/README.md`、`dayu/config/README.md`、`tests/README.md` 按触发规则同步。
+
+退出条件：
+- `docs/host/design.md` 已完成 Conversation Memory / Context Governance 相关章节重写，并与讨论稿稳定裁决一致。
+- Compactor input / output 边界不再依赖 EventLog range dump、Host ledger wrapper、`result_preview` 或 Host provenance key 作为
+  LLM 语义输入。
+- Conversation Memory 能在 compact 前、compact 后、长 user input、长 tool result 与长会话多次 compact 场景下保持 bounded、
+  evidence-backed、可审计且可解释。
+- P12.6 smoke / integration tests 覆盖成功信号，affected tests、full pyright 与 `git diff --check` PASS。
+- Aggregate deepreview from at least two review Agents PASS；control_doc records residual risks with owners。
+- User authorization applies: once `ready-to-open-draft-PR` is reached, controller may automatically enter draft PR gate and proceed to
+  `draft-PR-pass`。
+
+后续依赖：
+- 真实财报工具需要保证 tool result accept path 提供足够可读 raw evidence / source locator；具体财报工具质量归后续 Fins /
+  tool provider work unit。
+- long-term retrieval、cross-session research memory、public memory edit / reset / forget API 仍归后续独立 phase。
+- 大 session rebuild performance 可作为 P12.6 后续 hardening owner 或另立 production hardening work unit，但不得阻塞 P12.6
+  的 compact I/O 与 memory semantics 正确性。
 
 ### Phase 13. Audit / Tool Trace / Outbox Projections
 
