@@ -147,10 +147,10 @@ async def test_llm_context_compactor_builds_tool_disabled_request(
 
 
 @pytest.mark.asyncio
-async def test_llm_context_compactor_prompt_contains_raw_evidence_content(
+async def test_prompt_renders_material_pack_without_ledger_dump(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """LLM compactor prompt 只渲染 material pack 内容。"""
+    """Prompt 只渲染四个 material pack section 且不倾倒账本字段。"""
 
     seen: list[AgentRunRequest] = []
 
@@ -169,13 +169,65 @@ async def test_llm_context_compactor_prompt_contains_raw_evidence_content(
     user_message = seen[0].messages[1]
     prompt = user_message.content
     assert prompt is not None
-    assert "material_pack:" in prompt
+    assert '"stable_input":' in prompt
+    assert '"history_input":' in prompt
+    assert '"evidence_input":' in prompt
+    assert '"current_input_anchor":' in prompt
+    assert "material_pack:" not in prompt
+    assert "trigger_source:" not in prompt
     assert '"label": "E1"' in prompt
     assert '"tool_name": "fins.search"' in prompt
+    assert "accepted_evidence_envelopes:" not in prompt
+    assert "compact_raw_context:" not in prompt
+    assert "input_event_refs:" not in prompt
+    assert "payload_digest" not in prompt
     assert "payload_ref" not in prompt
+    assert "payload:accepted-1" not in prompt
+    assert "event-tool-result-1" not in prompt
+    assert "event-tool-call-1" not in prompt
+    assert "memory_snapshot_cursor" not in prompt
+    assert "policy_snapshot" not in prompt
     assert "outcome_digest" not in prompt
     assert "canonical_source_refs" not in prompt
     assert "Revenue grew 12% year over year." in prompt
+
+
+@pytest.mark.asyncio
+async def test_prompt_does_not_render_accepted_evidence_envelope_metadata(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Prompt 不暴露 accepted evidence envelope 的内部 metadata。"""
+
+    seen: list[AgentRunRequest] = []
+
+    async def _fake_run(request: AgentRunRequest) -> AgentRunResult:
+        seen.append(request)
+        return _final(_proposal_json())
+
+    monkeypatch.setattr("dayu.host.llm_compaction.run_agent_and_wait", _fake_run)
+
+    await _llm_compactor(
+        runner_spec=_runner_spec(),
+        runner_options=_runner_options(),
+    ).compact(_request(), StubCancellationToken())
+
+    assert len(seen) == 1
+    prompt = seen[0].messages[1].content
+    assert prompt is not None
+    envelope = _accepted_evidence_envelope()
+    assert envelope.producer_event_ref not in prompt
+    assert envelope.tool_call_id not in prompt
+    assert envelope.tool_query.normalized_arguments_digest not in prompt
+    assert envelope.tool_query.semantic_input_digest not in prompt
+    payload_ref = envelope.result_ref.payload_ref
+    payload_digest = envelope.result_ref.payload_digest
+    outcome_digest = envelope.result_ref.outcome_digest
+    assert payload_ref is not None
+    assert payload_digest is not None
+    assert outcome_digest is not None
+    assert payload_ref not in prompt
+    assert payload_digest not in prompt
+    assert outcome_digest not in prompt
 
 
 @pytest.mark.asyncio
@@ -228,7 +280,7 @@ async def test_llm_context_compactor_prompt_marks_raw_evidence_with_evidence_id(
     assert len(seen) == 1
     prompt = seen[0].messages[1].content
     assert prompt is not None
-    material_index = prompt.index("material_pack:")
+    material_index = prompt.index('"evidence_input"')
     evidence_ref_index = prompt.index('"label": "E1"', material_index)
     raw_content_index = prompt.index(
         "Revenue grew 12% year over year.",
@@ -238,10 +290,10 @@ async def test_llm_context_compactor_prompt_marks_raw_evidence_with_evidence_id(
 
 
 @pytest.mark.asyncio
-async def test_llm_context_compactor_maps_final_answer_to_candidate(
+async def test_parser_maps_prompt_local_evidence_label_to_canonical_ref(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """LLM strict JSON final answer 映射为完整 structured candidate。"""
+    """Parser 先把 prompt-local evidence label 映射为 canonical ref。"""
 
     monkeypatch.setattr(
         "dayu.host.llm_compaction.run_agent_and_wait",
@@ -262,6 +314,9 @@ async def test_llm_context_compactor_maps_final_answer_to_candidate(
         "Canonical evidence shows revenue growth."
     )
     assert candidate.evidence_backed_fact_candidates[0].evidence_refs == (
+        "evidence:accepted-1",
+    )
+    assert candidate.episode_summary_candidate.tool_finding_refs == (
         "evidence:accepted-1",
     )
     assert len(candidate.minimum_preserve_item_candidates) == 1
@@ -468,6 +523,77 @@ async def test_llm_context_compactor_rejects_non_canonical_evidence_refs(
 
 
 @pytest.mark.asyncio
+async def test_parser_rejects_unknown_or_cross_section_labels(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Parser 对未知 label 与跨 section label fail closed。"""
+
+    compactor = _llm_compactor(
+        runner_spec=_runner_spec(),
+        runner_options=_runner_options(),
+    )
+    monkeypatch.setattr(
+        "dayu.host.llm_compaction.run_agent_and_wait",
+        _fake_run_factory(
+            _final(_proposal_json(preserved_material_labels=("C1", "missing-label")))
+        ),
+    )
+    with pytest.raises(LLMCompactionProposalError, match="unknown label"):
+        await compactor.compact(_request(), StubCancellationToken())
+
+    monkeypatch.setattr(
+        "dayu.host.llm_compaction.run_agent_and_wait",
+        _fake_run_factory(_final(_proposal_json(fact_evidence_refs=("H1",)))),
+    )
+    with pytest.raises(LLMCompactionProposalError, match="section mismatch"):
+        await compactor.compact(_request(), StubCancellationToken())
+
+
+@pytest.mark.asyncio
+async def test_fact_candidate_without_evidence_label_rejected(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Fact candidate 缺少 evidence label 时 parser 必须拒绝。"""
+
+    monkeypatch.setattr(
+        "dayu.host.llm_compaction.run_agent_and_wait",
+        _fake_run_factory(_final(_proposal_json(fact_evidence_refs=()))),
+    )
+    compactor = _llm_compactor(
+        runner_spec=_runner_spec(),
+        runner_options=_runner_options(),
+    )
+
+    with pytest.raises(LLMCompactionProposalError, match="evidence label"):
+        await compactor.compact(_request(), StubCancellationToken())
+
+
+@pytest.mark.asyncio
+async def test_minimum_preserve_source_refs_must_be_material_labels(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Minimum preserve source refs 必须是当前 material pack labels。"""
+
+    monkeypatch.setattr(
+        "dayu.host.llm_compaction.run_agent_and_wait",
+        _fake_run_factory(
+            _final(
+                _proposal_json(
+                    minimum_preserve_source_labels=("payload:accepted-1",)
+                )
+            )
+        ),
+    )
+    compactor = _llm_compactor(
+        runner_spec=_runner_spec(),
+        runner_options=_runner_options(),
+    )
+
+    with pytest.raises(LLMCompactionProposalError, match="unknown label"):
+        await compactor.compact(_request(), StubCancellationToken())
+
+
+@pytest.mark.asyncio
 async def test_llm_context_compactor_rejects_empty_canonical_source_refs(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -622,7 +748,6 @@ async def test_llm_context_compactor_preserves_host_owned_refs_and_evidence(
     assert evidence.material_source_refs == (
         "input-1",
         "input-2",
-        "evidence:accepted-1",
     )
     assert evidence.canonical_evidence_refs == ("evidence:accepted-1",)
     assert candidate.episode_summary_candidate.evidence_refs == (
@@ -754,14 +879,20 @@ def _proposal_json(
         "Current user asked to keep the financial analysis context."
     ),
     fact_evidence_refs: tuple[str, ...] = ("E1",),
+    minimum_preserve_source_labels: tuple[str, ...] = ("C1",),
     preserved_material_labels: tuple[str, ...] = ("C1", "H1"),
+    preservation_material_labels: tuple[str, ...] = ("C1", "H1"),
+    preservation_evidence_labels: tuple[str, ...] = ("E1",),
 ) -> str:
     """构造 LLM structured JSON proposal。
 
     :param claim_text: fact candidate claim_text。
     :param minimum_preserve_text: minimum preserve item text。
     :param fact_evidence_refs: fact candidate evidence refs。
+    :param minimum_preserve_source_labels: minimum preserve source labels。
     :param preserved_material_labels: preserved material labels。
+    :param preservation_material_labels: preservation evidence material labels。
+    :param preservation_evidence_labels: preservation evidence labels。
     :returns: JSON 文本。
     """
 
@@ -810,8 +941,19 @@ def _proposal_json(
                     "item_id": "preserve-current-input",
                     "label": "current input",
                     "text": minimum_preserve_text,
-                    "source_labels": ["C1"],
+                    "source_labels": list(minimum_preserve_source_labels),
                     "preserve_reason": "needed_for_recent_reference",
+                }
+            ],
+            "preservation_evidence": [
+                {
+                    "material_labels": list(preservation_material_labels),
+                    "evidence_labels": list(preservation_evidence_labels),
+                    "compact_range": {
+                        "range_ref": "range-older-raw-turns",
+                        "start_material_label": "H1",
+                        "end_material_label": "H1",
+                    },
                 }
             ],
             "retained_current_input_label": "C1",

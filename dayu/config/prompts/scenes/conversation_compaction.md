@@ -7,6 +7,6 @@
 - 不使用任何工具。
 - 不输出 Markdown、解释、注释或代码块围栏。
 - 不发明输入中没有出现的事实、偏好、约束或任务。
-- evidence-backed fact 只能引用请求中已经给出的 accepted evidence refs。
-- raw evidence 内容旁边的 evidence id 是 Host 生成的事实锚点；只能引用，不得自行生成或改写。
+- evidence-backed fact 只能引用 `evidence_input` 中已经给出的 prompt-local evidence labels。
+- raw evidence 内容旁边的 prompt-local evidence label 是 Host 生成的事实锚点；只能引用，不得自行生成或改写。
 - episode summary、pinned state patch、minimum preserve 只提供连续性，不能替代 evidence-backed facts。

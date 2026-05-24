@@ -40,6 +40,7 @@ from dayu.engine.contracts.messages import (
     UserMessage,
 )
 from dayu.engine.contracts.runner_spec import RunnerCallOptions, RunnerSpec
+from dayu.host.compact_material import validate_material_label
 from dayu.host.compaction import (
     CompactInputRange,
     CompactMaterialSection,
@@ -57,6 +58,7 @@ from dayu.host.compaction import (
     PinnedStatePatchCandidate,
     PinnedStringTupleFieldPatch,
     PinnedTextFieldPatch,
+    PromptLocalProvenanceEntry,
     PreservationEvidence,
 )
 from dayu.host.context_budget import DEFAULT_ESTIMATOR_CHARS_PER_TOKEN
@@ -81,12 +83,19 @@ _REQUIRED_PROPOSAL_KEYS = (
     "pinned_state_patch_candidate",
     "evidence_backed_fact_candidates",
     "minimum_preserve_item_candidates",
+    "preservation_evidence",
     "retained_current_input_label",
     "preserved_material_labels",
     "preserved_evidence_labels",
     "preserved_evidence_backed_fact_refs",
     "dropped_ranges",
     "summarized_ranges",
+)
+_MATERIAL_LABEL_SECTIONS = (
+    CompactMaterialSection.STABLE_INPUT,
+    CompactMaterialSection.HISTORY_INPUT,
+    CompactMaterialSection.EVIDENCE_INPUT,
+    CompactMaterialSection.CURRENT_INPUT_ANCHOR,
 )
 
 
@@ -339,47 +348,20 @@ def _user_prompt(request: CompactionRequest, template: str) -> str:
 def _compaction_request_prompt_block(request: CompactionRequest) -> str:
     """构造 compactor request 数据块。
 
-    该函数只渲染 Host typed request 数据，不承载任务指令或输出 schema；
-    任务指令与 schema 由 compactor scene prompt template 提供。
+    该函数只渲染 material pack 的四个 LLM-facing section，不读取
+    EventLog、accepted evidence envelope 或 Host ledger helper；任务指令与
+    schema 由 compactor scene prompt template 提供。
 
     :param request: Host compaction request。
     :returns: compaction request prompt 数据块。
     """
 
-    material_json = json.dumps(
+    return json.dumps(
         request.llm_material_json(),
         ensure_ascii=False,
+        indent=2,
         sort_keys=True,
     )
-    return "\n".join(
-        [
-            f"trigger_source: {request.trigger_source.value}",
-            "material_pack:",
-            *_indented_content_lines(material_json),
-        ]
-    )
-
-
-def _indented_content_lines(content: str) -> list[str]:
-    """把 raw context 内容缩进为 prompt block。
-
-    :param content: raw context 内容。
-    :returns: 已缩进行列表。
-    """
-
-    return [f"    {line}" for line in content.splitlines()]
-
-
-def _refs_text(refs: tuple[str, ...]) -> str:
-    """格式化 ref tuple。
-
-    :param refs: Host opaque refs。
-    :returns: 逗号分隔文本；为空时返回 ``none``。
-    """
-
-    if len(refs) == 0:
-        return "none"
-    return ", ".join(refs)
 
 
 def _candidate_from_final_answer(
@@ -394,9 +376,9 @@ def _candidate_from_final_answer(
     """
 
     proposal = _parse_proposal(final_answer)
-    evidence = _preservation_evidence(request)
-    evidence_refs = tuple(item.evidence_id for item in evidence)
     try:
+        evidence = _preservation_evidence(request, proposal)
+        evidence_refs = tuple(item.evidence_id for item in evidence)
         episode = _episode_summary_candidate(request, proposal, evidence_refs)
         pinned_patch = _pinned_state_patch_candidate(
             proposal, evidence_refs, run_id=request.run_id
@@ -583,6 +565,7 @@ def _evidence_backed_fact_candidates(
             request,
             _required_string_tuple(data, "evidence_labels"),
             field_name=f"evidence_backed_fact_candidates[{index}].evidence_refs",
+            require_non_empty=True,
         )
         candidates.append(
             EvidenceBackedFactCandidate(
@@ -795,14 +778,17 @@ def _canonical_refs_for_labels(
     :param labels: prompt-local labels。
     :param field_name: 错误字段名。
     :returns: canonical source refs。
-    :raises ValueError: label 未知时抛出。
+    :raises ValueError: label 未知、格式非法或 section 不匹配时抛出。
     """
 
     refs: list[str] = []
     for label in labels:
-        entry = request.material_pack.provenance_map.get(label)
-        if entry is None:
-            raise ValueError(f"{field_name} contains unknown label: {label}")
+        entry = _provenance_entry_for_label(
+            request,
+            label,
+            allowed_sections=_MATERIAL_LABEL_SECTIONS,
+            field_name=field_name,
+        )
         if len(entry.canonical_source_refs) == 0:
             raise ValueError(f"{field_name} label has no canonical source refs: {label}")
         refs.extend(entry.canonical_source_refs)
@@ -814,27 +800,58 @@ def _canonical_evidence_refs_for_labels(
     labels: tuple[str, ...],
     *,
     field_name: str,
+    require_non_empty: bool = False,
 ) -> tuple[str, ...]:
     """把 prompt-local evidence labels 映射为 canonical canonical evidence refs。
 
     :param request: Host compaction request。
     :param labels: prompt-local evidence labels。
     :param field_name: 错误字段名。
+    :param require_non_empty: 是否要求至少一个 evidence label。
     :returns: canonical canonical evidence refs。
-    :raises ValueError: label 未知或不是 evidence label 时抛出。
+    :raises ValueError: label 未知、格式非法或不是 evidence label 时抛出。
     """
 
+    if require_non_empty and len(labels) == 0:
+        raise ValueError(f"{field_name} must reference at least one evidence label")
     refs: list[str] = []
     for label in labels:
-        entry = request.material_pack.provenance_map.get(label)
-        if entry is None:
-            raise ValueError(f"{field_name} contains unknown label: {label}")
-        if entry.section is not CompactMaterialSection.EVIDENCE_INPUT:
-            raise ValueError(f"{field_name} contains non-evidence label: {label}")
+        entry = _provenance_entry_for_label(
+            request,
+            label,
+            allowed_sections=(CompactMaterialSection.EVIDENCE_INPUT,),
+            field_name=field_name,
+        )
         if entry.accepted_evidence_id is None:
             raise ValueError(f"{field_name} evidence label has no canonical ref")
         refs.append(entry.accepted_evidence_id)
     return tuple(dict.fromkeys(refs))
+
+
+def _provenance_entry_for_label(
+    request: CompactionRequest,
+    label: str,
+    *,
+    allowed_sections: tuple[CompactMaterialSection, ...],
+    field_name: str,
+) -> PromptLocalProvenanceEntry:
+    """读取并校验 prompt-local label 对应 provenance entry。
+
+    :param request: Host compaction request。
+    :param label: prompt-local label。
+    :param allowed_sections: 允许引用的 material section 集合。
+    :param field_name: 错误字段名。
+    :returns: provenance entry。
+    :raises ValueError: label 未知、格式非法或 section 不匹配时抛出。
+    """
+
+    entry = request.material_pack.provenance_map.get(label)
+    if entry is None:
+        raise ValueError(f"{field_name} contains unknown label: {label}")
+    if entry.section not in allowed_sections:
+        raise ValueError(f"{field_name} label section mismatch: {label}")
+    validate_material_label(label, entry.section)
+    return entry
 
 
 def _required_mapping(
@@ -1029,37 +1046,88 @@ def _bounded_known_refs(
 
 def _preservation_evidence(
     request: CompactionRequest,
+    proposal: Mapping[str, JsonValue],
 ) -> tuple[PreservationEvidence, ...]:
-    """构造 Host-owned preservation evidence。
+    """从 proposal 构造 Host-owned preservation evidence。
+
+    LLM 只能输出 prompt-local labels；本函数先把 labels 映射为 canonical
+    refs，再生成 Host-owned evidence id。
 
     :param request: Host compaction request。
+    :param proposal: 已解析 proposal。
     :returns: preservation evidence tuple。
+    :raises TypeError: preservation evidence shape 非法时抛出。
+    :raises ValueError: label 未知或 section 不匹配时抛出。
     """
 
-    return (
-        PreservationEvidence(
-            evidence_id=f"llm-evidence:{request.run_id}:primary",
-            material_source_refs=request.material_source_refs,
-            canonical_evidence_refs=request.canonical_evidence_refs,
-            memory_snapshot_cursor=request.memory_snapshot_cursor,
-            compact_input_range=_input_range(request),
-        ),
+    values = _required_sequence(
+        proposal,
+        "preservation_evidence",
+        max_items=max(1, len(request.material_pack.all_labels)),
     )
+    evidence_items: list[PreservationEvidence] = []
+    for index, item in enumerate(values):
+        data = _json_mapping(item, f"preservation_evidence[{index}]")
+        evidence_items.append(
+            PreservationEvidence(
+                evidence_id=f"llm-evidence:{request.run_id}:{index + 1}",
+                material_source_refs=_canonical_refs_for_labels(
+                    request,
+                    _required_string_tuple(data, "material_labels"),
+                    field_name=f"preservation_evidence[{index}].material_labels",
+                ),
+                canonical_evidence_refs=_canonical_evidence_refs_for_labels(
+                    request,
+                    _optional_string_tuple(data, "evidence_labels"),
+                    field_name=f"preservation_evidence[{index}].evidence_labels",
+                ),
+                memory_snapshot_cursor=None,
+                compact_input_range=_optional_input_range(
+                    request,
+                    data,
+                    "compact_range",
+                    field_name=f"preservation_evidence[{index}].compact_range",
+                ),
+            )
+        )
+    return tuple(evidence_items)
 
 
-def _input_range(request: CompactionRequest) -> CompactInputRange | None:
-    """根据 request 输入 refs 构造 compact range。
+def _optional_input_range(
+    request: CompactionRequest,
+    source: Mapping[str, JsonValue],
+    key: str,
+    *,
+    field_name: str,
+) -> CompactInputRange | None:
+    """读取可选 prompt-local compact range。
 
     :param request: Host compaction request。
-    :returns: compact input range；无输入时为 ``None``。
+    :param source: JSON object。
+    :param key: range 字段名。
+    :param field_name: 错误字段名。
+    :returns: compact input range；字段缺省或为 ``null`` 时返回 ``None``。
+    :raises TypeError: range shape 非法时抛出。
+    :raises ValueError: range label 未知或 section 不匹配时抛出。
     """
 
-    if len(request.material_source_refs) == 0:
+    if key not in source or source[key] is None:
         return None
+    data = _json_mapping(source[key], field_name)
+    start_refs = _canonical_refs_for_labels(
+        request,
+        (_required_string(data, "start_material_label"),),
+        field_name=f"{field_name}.start_material_label",
+    )
+    end_refs = _canonical_refs_for_labels(
+        request,
+        (_required_string(data, "end_material_label"),),
+        field_name=f"{field_name}.end_material_label",
+    )
     return CompactInputRange(
-        range_ref=f"llm-range:{request.run_id}:input",
-        start_input_ref=request.material_source_refs[0],
-        end_input_ref=request.material_source_refs[-1],
+        range_ref=_required_string(data, "range_ref"),
+        start_input_ref=start_refs[0],
+        end_input_ref=end_refs[0],
     )
 
 

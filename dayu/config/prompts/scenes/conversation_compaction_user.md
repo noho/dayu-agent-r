@@ -43,6 +43,17 @@
       "preserve_reason": "needed_for_recent_reference|needed_for_ordered_item_reference|needed_for_local_followup"
     }
   ],
+  "preservation_evidence": [
+    {
+      "material_labels": ["C1", "H1"],
+      "evidence_labels": ["E1"],
+      "compact_range": {
+        "range_ref": "local range id",
+        "start_material_label": "H1",
+        "end_material_label": "H1"
+      }
+    }
+  ],
   "retained_current_input_label": "C1",
   "preserved_material_labels": ["C1", "H1"],
   "preserved_evidence_labels": ["E1"],
@@ -57,6 +68,8 @@
 - `evidence_backed_fact_candidates[*].evidence_labels` 只能引用请求里的 `E*` labels。
 - `preserved_evidence_labels` 必须包含所有被 fact candidate 引用的 evidence labels。
 - `preserved_material_labels` 只能引用请求里的 material labels，且必须包含 `C1`。
+- `preservation_evidence[*].material_labels` 只能引用请求里的 material labels；`preservation_evidence[*].evidence_labels` 只能引用请求里的 `E*` labels。
+- `preservation_evidence[*].compact_range` 可为 `null`；非空时只能用请求里的 material labels 作为边界。
 - `dropped_ranges` 和 `summarized_ranges` 默认输出空数组；除非能逐字复制请求里的 material labels 作为 range 边界，否则不要生成 range。
 - 必须保留 open questions / working assumptions：`episode_summary_candidate.open_questions` 必须非空，或 `pinned_state_patch_candidate.open_questions` 使用 `replace` 且 `value` 非空。
 - 如果输入没有显式疑问，但当前 Run 仍需要连续推进，open questions / working assumptions 应保留为“继续处理当前用户输入”这类短连续性项。

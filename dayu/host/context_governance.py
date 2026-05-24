@@ -1,6 +1,6 @@
 """Host context governance quality checker。
 
-本模块只实现 Phase 10 Slice 2 的 compaction candidate quality check。它不
+本模块实现 Host compaction candidate quality check。它不
 append canonical compact events，不写 memory projection，也不执行 proactive /
 reactive orchestration。
 """
@@ -194,6 +194,11 @@ def _summary_pretends_evidence_backed_fact(
 
     summary = candidate.episode_summary_candidate
     if len(summary.proposed_evidence_backed_fact_refs) > 0:
+        return True
+    evidence_labels = set(request.material_pack.evidence_labels)
+    if len(evidence_labels.intersection(summary.confirmed_fact_refs)) > 0:
+        return True
+    if len(evidence_labels.intersection(summary.proposed_evidence_backed_fact_refs)) > 0:
         return True
     if not set(candidate.preserved_evidence_backed_fact_refs).issubset(
         set(request.evidence_backed_fact_refs)

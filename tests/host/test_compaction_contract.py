@@ -341,6 +341,29 @@ async def test_quality_rejects_summary_confirmed_fact_ref_to_accepted_evidence()
 
 
 @pytest.mark.asyncio
+async def test_quality_rejects_summary_confirmed_fact_ref_to_evidence_label() -> None:
+    """Summary confirmed_fact_refs 不能把 prompt-local evidence label 当 fact ref。
+
+    :returns: ``None``。
+    """
+
+    request = _request()
+    candidate = await FakeContextCompactor().compact(request, StubCancellationToken())
+    invalid_summary = replace(
+        candidate.episode_summary_candidate,
+        confirmed_fact_refs=("E1",),
+    )
+    candidate = replace(candidate, episode_summary_candidate=invalid_summary)
+
+    result = check_compaction_candidate(request, candidate)
+
+    assert result.accepted is False
+    assert CompactQualityIssue.SUMMARY_PRETENDS_EVIDENCE_BACKED_FACT in (
+        result.rejection_reasons
+    )
+
+
+@pytest.mark.asyncio
 async def test_quality_rejects_fact_candidate_referencing_non_evidence_ref() -> None:
     """Fact candidate 不能引用 user / assistant / summary 等非 evidence refs。
 
