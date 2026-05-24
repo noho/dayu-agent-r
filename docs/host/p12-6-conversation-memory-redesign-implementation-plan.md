@@ -1,11 +1,12 @@
 # Phase 12.6 Conversation Memory Redesign 实施计划
 
-状态：HANDOFF_READY  
+状态：PLAN_FIX_READY
 阻塞问题：0  
-当前 gate：P12.6 handoff implementation-ready plan  
+当前 gate：P12.6 Slice 1 plan-fix ready for re-review
 规划角色：role-scoped planning specialist  
 计划真源：`docs/host/implementation-control.md` 当前状态与 Phase 12.6、`docs/host/design.md` §1 / §24 / §25  
 review 真源：`docs/reviews/p12-6-design-refinement-controller-20260524.md`、`docs/reviews/p12-6-design-review-controller-adjudication-20260524.md`、`docs/reviews/p12-6-design-rereview-mimo-20260524.md`、`docs/reviews/p12-6-design-rereview-ds-20260524.md`  
+plan-fix 真源：`docs/reviews/p12-6-slice1-stop-controller-adjudication-20260524.md` 的 accepted finding S1-PF1
 讨论输入：`docs/host/conversation-memory-compact-io-first-principles-discussion.md` 仅作为背景输入，不替代 `docs/host/design.md`。
 
 ## 1. 目标与动机判断
@@ -37,6 +38,7 @@ P12.6 的动机成立，且严重性没有被高估。根因不是 token 阈值�
 - 两份 re-review 均 PASS，但残余观察要求 planning 固定确定性 segment rule、single evidence block 超预算处理和 V1 bounded working set 策略。
 - 当前代码证据：`dayu/host/dispatch.py` 与 `dayu/host/engine_ingest.py` 构造 `CompactionRequest` 时仍从 `start_event_sequence=1` 读取 bounded range，实际是 Session 起点 range。
 - 当前代码证据：`dayu/host/llm_compaction.py` 的 prompt block 会渲染 `input_event_refs`、`accepted_evidence_envelopes`、payload digest、event refs、policy-like refs 和 `compact_raw_context`，未形成 §25 要求的 material pack section ownership。
+- 当前 plan-fix 证据：`docs/reviews/p12-6-slice1-stop-controller-adjudication-20260524.md` 已裁决 Slice 1 停止有效；旧 `CompactionRequest` 字段的直接生产构造 / 消费点包括 `dayu/host/llm_compaction.py`、`dayu/host/context_governance.py`、`dayu/host/dispatch.py`、`dayu/host/engine_ingest.py`、`dayu/host/compaction_evidence.py`。删除旧字段的首个实现切片必须把这些文件纳入同一个 compile-safe ownership boundary，不能用 deprecated alias、compat wrapper、old-field default 或 test-only compatibility 过渡。
 
 ## 3. 范围
 
@@ -324,10 +326,10 @@ Prompt asset：
 实施必须按以下依赖图推进；除明确标注可并行的路径外，不得跳过依赖 slice 直接落地后续 slice。
 
 ```text
-Slice 1 Material Pack 契约
+Slice 1 Material Pack 契约删除边界 / Direct Consumers Migration
   -> Slice 2 Segment Selection / Material Pack Builder
-      -> Slice 3 Raw Evidence Reader / Prompt-local Evidence Map
-          -> Slice 4 LLM Prompt / Parser / Accept Barrier
+      -> Slice 3 Raw Evidence Reader / Prompt-local Evidence Map Hardening
+          -> Slice 4 LLM JSON Schema / Parser / Accept Barrier Hardening
               -> Slice 5 Context Governance Proactive / Reactive Wiring
   -> Slice 6 Memory Projection Consolidation / RunInputBuilder Rendering
 
@@ -336,24 +338,33 @@ Slice 7 Public Smoke / README Sync / Final Verification depends on Slice 1-6.
 
 依赖说明：
 
-- Slice 2 依赖 Slice 1 的 `CompactMaterialPack`、`CompactSegmentSelection`、`PromptLocalProvenanceEntry` 与 `CompactionRequest` 新形状。
-- Slice 3 依赖 Slice 2 的 selected evidence material block 与 prompt-local label helper，并产出 `PromptLocalEvidenceMap` evidence-only view。
-- Slice 4 依赖 Slice 1-3 的 material pack、provenance map、evidence map 与 label parse / validate helper。
-- Slice 5 依赖 Slice 1-4 的 request shape、builder、raw evidence path、parser 和 quality gate。
+- Slice 1 是删除旧 `CompactionRequest` 字段的最小 compile-safe boundary，必须在同一 accepted checkpoint 内迁移所有当前直接生产构造 / 消费点：`dayu/host/llm_compaction.py`、`dayu/host/context_governance.py`、`dayu/host/dispatch.py`、`dayu/host/engine_ingest.py`、`dayu/host/compaction_evidence.py`，以及原 Slice 1 已授权的 contract / event / artifact / tests。Slice 1 完成后，生产代码和 Slice 1 测试中不得再引用 `CurrentMessageSummary`、`CompactRawContextItem`、`input_event_refs`、`accepted_evidence_envelopes`、`compact_raw_context_items` 作为 `CompactionRequest` 字段。
+- Slice 2 依赖 Slice 1 的 `CompactMaterialPack`、`CompactSegmentSelection`、`PromptLocalProvenanceEntry`、prompt-local label helper 与 compile-safe direct consumer migration；Slice 2 负责把 Slice 1 的初始 material construction 收敛为完整 deterministic segment selection / builder。
+- Slice 3 依赖 Slice 2 的 selected evidence material block 与 prompt-local label helper，并强化 digest-checked raw evidence path、large evidence chunking 与 `PromptLocalEvidenceMap` evidence-only view；不得恢复 accepted envelope preview 或 old raw context carrier。
+- Slice 4 依赖 Slice 1-3 的 material pack、provenance map、evidence map 与 label parse / validate helper；Slice 4 只做 schema / parser / accept barrier 深化，不再承担旧 request 字段删除。
+- Slice 5 依赖 Slice 1-4 的 request shape、builder、raw evidence path、parser 和 quality gate；Slice 5 只做 proactive / reactive governance 接线与 multi-pass durable 语义，不再承担 `dispatch.py` / `engine_ingest.py` 的旧字段构造迁移。
 - Slice 6 只依赖 Slice 1-2 的 contracts / material block view，可在 Slice 3-5 之后实施以降低 review 分叉。
 - Slice 7 只能在前六个 slice 验证通过后执行。
 
-### Slice 1. Material Pack 契约与旧契约清理
+### Slice 1. Material Pack 契约删除边界与 Direct Consumers Migration
 
-目标：建立 material-pack-oriented typed contracts，删除旧 LLM-facing ledger / envelope prompt 契约。
+目标：建立 material-pack-oriented typed contracts，并在同一 compile-safe checkpoint 内删除旧 LLM-facing ledger / envelope prompt 契约及其所有当前直接生产构造 / 消费点。
 
-依赖：无。Slice 1 是后续所有 slice 的 contract root。
+依赖：无。Slice 1 是后续所有 slice 的 contract root，也是删除旧 `CompactionRequest` 字段的唯一首个实现边界。若实施者发现删除旧字段需要修改本 slice 未列出的生产直接消费者，必须停下报告 Controller；不得通过 deprecated alias、compat wrapper、old-field default、test-only compatibility 或派生旧属性继续推进。
 
 允许修改文件：
 
 - `dayu/host/compaction.py`
+- `dayu/host/compact_material.py` 或 `dayu/host/compaction_material.py`（新增，承载 label helper、初始 material pack construction 与 one-section guard；Slice 2 在同一 owner 内补齐完整 deterministic builder）
+- `dayu/host/compaction_evidence.py`
+- `dayu/host/llm_compaction.py`
+- `dayu/host/context_governance.py`
+- `dayu/host/dispatch.py`
+- `dayu/host/engine_ingest.py`
+- `dayu/host/compaction_operation.py`（仅限消除旧 request shape 传递与 fake / operation fixture 的 compile break）
 - `dayu/host/context_events.py`
 - `dayu/host/compact_artifact.py`
+- `dayu/config/prompts/scenes/conversation_compaction_user.md`（仅限把旧 request refs 文案改为 prompt-local material labels；不得改 ConfigLoader / ScenePrepare schema）
 - `tests/host/test_compaction_contract.py`
 - `tests/host/test_llm_compaction.py`
 - `tests/host/test_compaction_operation.py`
@@ -368,21 +379,33 @@ Slice 7 Public Smoke / README Sync / Final Verification depends on Slice 1-6.
 具体修改：
 
 - 新增 §6.1 中列出的 dataclass / enum / type alias。
+- 删除 `CompactionRequest` 上的旧字段：`input_event_refs`、`current_message_summary`、`accepted_evidence_envelopes`、`compact_raw_context_items`。删除 `CurrentMessageSummary` 与 `CompactRawContextItem` 作为 public / exported Host compaction contract 的使用；若部分同名私有迁移对象看似必要，必须改名并证明不进入 request / prompt / tests compatibility boundary。
 - `CompactionRequest.to_json()` 保留 internal artifact 需要的 canonical refs，但 JSON 中必须区分 `material_pack` 与 `provenance_map`。
 - `CompactionRequest.llm_material_json()` 或等价 helper 只返回 LLM-facing material pack，不含 EventLog ids、payload refs、digests、cursor、accepted envelope metadata。
+- 新增或迁入 prompt-local label helper，所有 direct consumers 只能通过 helper 构造 / 校验 `S*`、`H*`、`E*`、`C1` labels；parser、prompt renderer、tests 不得手写另一套 label 规则。
+- 新增 Slice 1 初始 material pack construction：从当前已可获得的 run input / accepted evidence / current input 信息构造 `stable_input`、`history_input`、`evidence_input`、`current_input_anchor` 的 typed empty-or-bounded sections。该 construction 只为完成旧 request 删除和直接消费者迁移，不得引入 public API，也不得读取或渲染 Session 起点 EventLog ledger wrapper；完整 deterministic segment selection、already-represented 判断和 snapshot cursor repair 在 Slice 2 落地。
+- `dayu/host/compaction_evidence.py` 从返回 `accepted_evidence_envelopes` + `compact_raw_context_items` 的旧 request helper，迁移为 evidence / history material collector：输出 prompt-local material blocks 与 internal provenance entries。Slice 1 不允许从 accepted envelope 读取或生成 `result_preview`，也不允许把 payload ref、digest、event id、cursor 作为 LLM semantic text。
+- `dayu/host/dispatch.py` 和 `dayu/host/engine_ingest.py` 必须在本 slice 改为构造新 `CompactionRequest(material_pack=..., segment_selection=...)`；不得继续传入或保存旧字段，也不得通过 pending record / fixture 暗藏旧字段。
+- `dayu/host/llm_compaction.py` 必须在本 slice 改为渲染 material pack sections，并把 parser / repair / preservation evidence 中对 request old refs 的校验改为 prompt-local label -> canonical provenance map 校验；不得继续渲染 `accepted_evidence_envelopes:`、`compact_raw_context:`、`input_event_refs:`、`current_user_input_ref:` 或 raw Host provenance key。
+- `dayu/host/context_governance.py` 必须在本 slice 改为使用 material labels 与 provenance map 做 preservation / fact / source validation；不得读取 `request.current_message_summary` 或 `request.input_event_refs`。
+- `dayu/config/prompts/scenes/conversation_compaction_user.md` 必须在本 slice 把输出 schema 文案从 `input_event_refs` / `accepted_evidence_refs` 改为 prompt-local `material_labels` / `evidence_labels`。这只是 prompt asset 同步，不修改 ConfigLoader / ScenePrepare schema。
 - `CompactionCandidate` 可继续承载 canonical refs，但新增 parser-side label mapping 注释和 docstring，说明 LLM 不直接生成 canonical refs。
 - `build_context_compacted_payload(...)` 增加 accepted evidence label mapping refs 或 material pack digest refs；不把 raw material pack 全量塞入 EventLog payload。
 - `CompactArtifactWriteRequest` artifact 写入同时保存 material pack digest、segment selection digest、transient pass diagnostics refs。
 - 删除旧 old-key validator 分支中仅服务兼容的字段接受逻辑；测试改为 fail closed。
-- Slice 1 必须同步迁移所有现有直接构造或断言旧 `CompactionRequest` 字段的测试引用，包括 `input_event_refs`、`accepted_evidence_envelopes`、`compact_raw_context_items`、旧 `CurrentMessageSummary` prompt section、旧 `CompactRawContextItem` 混合载体与旧 result preview / tool fact refs。不得保留 deprecated alias、compat wrapper、old-field default 或 test-only 兼容路径。
+- Slice 1 必须同步迁移所有现有直接构造或断言旧 `CompactionRequest` 字段的测试引用，包括 `input_event_refs`、`accepted_evidence_envelopes`、`compact_raw_context_items`、旧 `CurrentMessageSummary` prompt section、旧 `CompactRawContextItem` 混合载体、旧 prompt asset refs 与旧 result preview / tool fact refs。不得保留 deprecated alias、compat wrapper、old-field default 或 test-only 兼容路径。
 - 已知需要在 Slice 1 一并迁移的现有测试边界包括 contract、LLM prompt/parser、compaction operation、dispatch scheduler、engine ingest mapping、compact artifact store、context compact event、memory projection、run input builder 与 fake compactor。若实施时 `rg` 发现同一旧字段还存在于 §7 主清单内其他测试文件，必须在 Slice 1 同步迁移；若出现在 §7 外文件，立即停下报告 Controller。
 
 测试：
 
 - `test_compaction_request_llm_material_excludes_host_provenance_keys`：断言 LLM material JSON / prompt block 不含 `event_id`、`payload_ref`、`payload_digest`、`outcome_digest`、`input_event_refs`、`accepted_evidence_envelopes`。
 - `test_compaction_request_material_pack_has_one_section_per_block`：同一 canonical source key 进入两个 section 时构造失败。
+- `test_slice1_direct_consumers_construct_only_material_pack_request`：覆盖 `dispatch.py` / `engine_ingest.py` 的 request construction path，断言生成的新 request 只含 `material_pack` 与 `segment_selection`，不含 old fields。
+- `test_context_governance_validates_prompt_local_labels_not_input_event_refs`：覆盖 quality / preservation validation，不再读取 old request refs。
+- `test_llm_prompt_asset_uses_material_labels_not_input_event_refs`：断言 prompt asset 不要求 `input_event_refs`、`accepted_evidence_refs` 或 `preserved_input_event_refs`。
 - `test_context_compacted_payload_records_mapping_refs_not_raw_prompt`：EventLog payload 只记录 mapping / artifact refs，不记录完整 prompt。
 - `test_old_result_preview_or_old_tool_fact_keys_fail_closed`：旧 `result_preview`、`accepted_tool_fact_refs`、`verified_fact_refs` 不被兼容接受。
+- `test_no_old_compaction_request_fields_remain_in_slice1_boundary`：用 focused contract / import assertions 覆盖 `CompactionRequest`、fake compactor 与 direct production consumers，防止旧字段通过 alias / default / derived property 回流。
 
 验证：
 
@@ -390,18 +413,23 @@ Slice 7 Public Smoke / README Sync / Final Verification depends on Slice 1-6.
 source .venv/bin/activate
 pytest tests/host/test_compaction_contract.py tests/host/test_context_compact_events.py tests/host/test_compact_artifact_store.py -q
 pytest tests/host/test_llm_compaction.py tests/host/test_compaction_operation.py tests/host/test_dispatch_scheduler.py tests/host/test_engine_ingest_mapping.py tests/host/test_memory_projection.py tests/host/test_run_input_builder.py -q
-python -m pyright dayu/host/compaction.py dayu/host/context_events.py dayu/host/compact_artifact.py tests/host/test_compaction_contract.py tests/host/test_context_compact_events.py tests/host/test_compact_artifact_store.py tests/host/test_llm_compaction.py tests/host/test_compaction_operation.py tests/host/test_dispatch_scheduler.py tests/host/test_engine_ingest_mapping.py tests/host/test_memory_projection.py tests/host/test_run_input_builder.py tests/host/fake_compaction.py
+python -m pyright dayu/host/compaction.py dayu/host/compact_material.py dayu/host/compaction_evidence.py dayu/host/llm_compaction.py dayu/host/context_governance.py dayu/host/dispatch.py dayu/host/engine_ingest.py dayu/host/compaction_operation.py dayu/host/context_events.py dayu/host/compact_artifact.py tests/host/test_compaction_contract.py tests/host/test_context_compact_events.py tests/host/test_compact_artifact_store.py tests/host/test_llm_compaction.py tests/host/test_compaction_operation.py tests/host/test_dispatch_scheduler.py tests/host/test_engine_ingest_mapping.py tests/host/test_memory_projection.py tests/host/test_run_input_builder.py tests/host/fake_compaction.py
+rg -n "accepted_evidence_envelopes|compact_raw_context_items|current_message_summary|CurrentMessageSummary|CompactRawContextItem|compact_raw_context|accepted_evidence_refs|preserved_input_event_refs" dayu/host/compaction.py dayu/host/compact_material.py dayu/host/compaction_evidence.py dayu/host/llm_compaction.py dayu/host/context_governance.py dayu/host/dispatch.py dayu/host/engine_ingest.py dayu/host/compaction_operation.py dayu/config/prompts/scenes/conversation_compaction_user.md
 ```
+
+`rg` 命令必须返回 no matches；若实现选择 `dayu/host/compaction_material.py` 作为 owner，则上述 `dayu/host/compact_material.py` 路径统一替换为实际文件名。
 
 停止条件：
 
 - 需要修改 Host public API / `OpenHostOptions` / `SubmitFollowupRequest`。
 - 需要兼容旧 request shape。
 - 需要把 untyped JSON bag 作为 contract 主体。
+- 发现 §7 外生产文件仍直接构造 / 消费旧 `CompactionRequest` 字段。
+- 为了让 Slice 1 编译通过而需要恢复 EventLog ledger dump、`result_preview`、Host provenance key 作为 LLM semantic input，或需要新增 public API。
 
 ### Slice 2. 确定性 Segment Selection 与 Material Pack Builder
 
-目标：实现 compact material list、deterministic segment selection、one-to-one section mapping、snapshot cursor validation entrypoint。
+目标：把 Slice 1 的初始 material construction 收敛为完整 compact material list、deterministic segment selection、one-to-one section mapping、snapshot cursor validation entrypoint。
 
 依赖：Slice 1 的 material-pack-oriented typed contracts、`PromptLocalProvenanceEntry`、`CompactionRequest` 新形状与旧字段测试迁移完成。
 
@@ -451,9 +479,9 @@ python -m pyright dayu/host/compact_material.py dayu/host/run_input.py dayu/host
 - segment selection cannot be deterministic without new public policy fields.
 - current input anchor 需要在 dispatch 前调用 LLM summarization。
 
-### Slice 3. Raw Evidence Reader 与 Prompt-local Label Mapping
+### Slice 3. Raw Evidence Reader 与 Prompt-local Label Mapping Hardening
 
-目标：让 evidence input 读取 digest-checked raw evidence，并用 prompt-local labels 映射 canonical provenance。
+目标：在 Slice 1 已删除旧 request carrier 的基础上，补齐 digest-checked raw evidence reader、large evidence chunking 和 evidence-only prompt-local provenance view。
 
 依赖：Slice 1 的 `PromptLocalEvidenceMap` / `provenance_map` contract，Slice 2 的 selected evidence material block、label helper 与 material pack builder。
 
@@ -469,7 +497,7 @@ python -m pyright dayu/host/compact_material.py dayu/host/run_input.py dayu/host
 
 具体修改：
 
-- 将 `collect_compaction_request_evidence_inputs(...)` 改为按 selected evidence block refs 读取，而不是 `start_event_sequence=1` 到 current input。
+- 将 Slice 1 的初始 evidence material collector 收敛为按 selected evidence block refs 读取，而不是 `start_event_sequence=1` 到 current input。
 - raw evidence text 必须来自 `TOOL_RESULT_ACCEPTED` canonical fact 引用的 payload / descriptor，并校验 digest。
 - accepted evidence envelope 只用于建立 canonical mapping 和 readable query / source locator metadata，不再作为 result content 或 LLM semantic body。
 - 不读取、不生成、不回退 `result_preview`。
@@ -498,9 +526,9 @@ python -m pyright dayu/host/compaction_evidence.py dayu/host/evidence.py dayu/ho
 - implementation 需要在 Host 内解析财报业务 locator semantics。
 - descriptor path lacks enough data to reconstruct raw accepted evidence; report Controller for design/storage裁决。
 
-### Slice 4. LLM Compactor Prompt、JSON Schema 与 Accept Barrier
+### Slice 4. LLM Compactor JSON Schema 与 Accept Barrier Hardening
 
-目标：LLM prompt 只渲染 material pack；parser 把 prompt-local labels 映射为 canonical candidate refs；quality gate 拒绝越权输出。
+目标：在 Slice 1 已迁移 prompt renderer / direct parser references 的基础上，完整收紧 LLM JSON schema、parser label mapping 与 quality gate 越权拒绝规则。
 
 依赖：Slice 1 的 request / candidate contract，Slice 2 的 material pack builder，Slice 3 的 raw evidence path、`PromptLocalEvidenceMap` 与 label parse / validate helper。
 
@@ -516,8 +544,8 @@ python -m pyright dayu/host/compaction_evidence.py dayu/host/evidence.py dayu/ho
 
 具体修改：
 
-- `_compaction_request_prompt_block(...)` 改为渲染四个 material pack sections。
-- prompt 中不得出现 `accepted_evidence_envelopes:`、`compact_raw_context:`、`input_event_refs:`、payload digest、event id、cursor、policy snapshot 等 Host ledger字段。
+- `_compaction_request_prompt_block(...)` 必须保持只渲染四个 material pack sections；若 Slice 2 / 3 新增 block kind 或 chunk label，prompt renderer 只能消费 material pack typed view，不得读取 EventLog / envelope helper。
+- prompt 中继续不得出现 `accepted_evidence_envelopes:`、`compact_raw_context:`、`input_event_refs:`、payload digest、event id、cursor、policy snapshot 等 Host ledger字段。
 - JSON schema 要求 LLM 输出 `episode_summary_candidate`、`pinned_state_patch_candidate`、`evidence_backed_fact_candidates`、`minimum_preserve_item_candidates`、`preservation_evidence`，其中 refs 使用 prompt-local labels。
 - parser 映射 labels 到 canonical refs 后再构造 `CompactionCandidate`。
 - quality checker 新增或调整检查：fact candidate 必须引用 evidence labels；minimum preserve source refs 必须引用 material labels；episode summary 不得把 evidence label 直接升级成 fact ref。
@@ -547,7 +575,7 @@ python -m pyright dayu/host/llm_compaction.py dayu/host/context_governance.py da
 
 ### Slice 5. Proactive / Reactive Context Governance 接线
 
-目标：dispatch 与 engine ingest 使用 material pack request；reactive multi-pass single-operation durable semantics 落地。
+目标：在 dispatch / engine ingest 已使用 material pack request 的前提下，完成 proactive / reactive governance 接线与 reactive multi-pass single-operation durable semantics。
 
 依赖：Slice 1-4 全部完成；特别依赖 builder output、evidence map、prompt parser canonical mapping 与 quality gate。
 
@@ -566,9 +594,9 @@ python -m pyright dayu/host/llm_compaction.py dayu/host/context_governance.py da
 
 具体修改：
 
-- Proactive `_maybe_start_compaction...` 不再调用 Session 起点 range collector；改为从 RunInputBuilder ordinary material list 生成 selected segment 和 material pack。
+- Proactive `_maybe_start_compaction...` 保持 Slice 1 的新 request shape，并从 Slice 2 builder 提供的 RunInputBuilder ordinary material list 生成 selected segment 和 material pack；不得恢复 Session 起点 range collector。
 - Reactive `_start_reactive_context_recovery(...)` 冻结 overflow ordinary input material list；pending record 保存冻结 list digest / refs。
-- `_reactive_compaction_request(...)` 使用冻结 material list 和 selected segment 构造 request。
+- `_reactive_compaction_request(...)` 使用冻结 material list 和 selected segment 构造 request；不得恢复 old-field pending record 或 old request constructor。
 - `run_compaction_operation(...)` 支持 pass queue：单 pass 复用现有语义；multi-pass 依次调用 compactor，所有 pass 成功后 merge candidate。
 - attempt budget 是 operation 总 LLM proposal 上限，不是每 pass 重置。
 - proactive compact 后估算仍可作为 hard threshold gate；reactive compact 后不以估算阻断 recovery dispatch。
