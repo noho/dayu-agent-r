@@ -24,7 +24,9 @@ from dayu.host.compaction import (
     ContextCompactor,
 )
 from dayu.host.compaction_evidence import (
+    SelectedEvidenceBlockRef,
     collect_compaction_request_evidence_inputs,
+    collect_selected_compaction_request_evidence_inputs,
 )
 from dayu.host.compaction_operation import run_compaction_operation
 from dayu.host.context_budget import BudgetEstimate
@@ -40,6 +42,11 @@ from dayu.host.durable.options import (
     HostDurableStoreOptions,
     HostSQLiteStoragePolicy,
     PayloadStoragePolicy,
+)
+from dayu.host.durable.payload import (
+    PayloadStore,
+    SQLitePayloadFormat,
+    SQLitePayloadWriteRequest,
 )
 from dayu.host.evidence import (
     AcceptedEvidenceEnvelope,
@@ -501,6 +508,206 @@ def test_compaction_request_evidence_inputs_are_bounded_for_proactive_and_reacti
                         ("evidence:event-tool-result-inside",),
                     ),
                 ),
+            )
+
+
+def test_evidence_input_reads_raw_tool_result_descriptor_not_envelope_preview(
+    tmp_path: Path,
+) -> None:
+    """Selected evidence reader 从 descriptor 读取 raw payload，不读 envelope preview。"""
+
+    session_id = "session-selected-descriptor"
+    event_id = "event-tool-result-descriptor"
+    with open_host_durable_store(_options(tmp_path)) as store:
+        event_log = EventLogStore()
+
+        def append_row(transaction: HostTransaction) -> None:
+            """写入 descriptor payload 与 selected TOOL_RESULT_ACCEPTED。
+
+            :param transaction: Host transaction。
+            :returns: ``None``。
+            """
+
+            payload = {
+                "accepted_evidence_envelope": accepted_evidence_envelope_to_json_value(
+                    _accepted_evidence_envelope_for_event_with_payload_ref(
+                        event_id,
+                        payload_ref="payload-selected-descriptor",
+                        payload_digest=None,
+                    )
+                ),
+                "raw_tool_outcome": _raw_tool_outcome(event_id),
+            }
+            descriptor = PayloadStore().write_sqlite_payload(
+                transaction,
+                SQLitePayloadWriteRequest(
+                    payload_ref="payload-selected-descriptor",
+                    payload_id="sqlite-payload-selected-descriptor",
+                    payload_format=SQLitePayloadFormat.CANONICAL_JSON,
+                    payload_json=payload,
+                ),
+            )
+            event_log.append_event(
+                transaction,
+                _event_request_with_payload_ref(
+                    event_id=event_id,
+                    session_id=session_id,
+                    event_type="TOOL_RESULT_ACCEPTED",
+                    payload_ref=descriptor.payload_ref,
+                    payload_digest=descriptor.payload_digest,
+                ),
+            )
+
+        store.transaction_runner.run_write(append_row)
+
+        def read_inputs(transaction: HostTransaction) -> tuple[str, str, tuple[str, ...]]:
+            """读取 selected evidence material。
+
+            :param transaction: Host transaction。
+            :returns: raw text、query text 与 payload refs。
+            """
+
+            inputs = collect_selected_compaction_request_evidence_inputs(
+                transaction,
+                event_log,
+                session_id=session_id,
+                selected_evidence_block_refs=(
+                    SelectedEvidenceBlockRef(
+                        block_id="selected-evidence-1",
+                        tool_result_event_ref=event_id,
+                    ),
+                ),
+            )
+            material = inputs.evidence_materials[0]
+            return (
+                material.raw_result_text,
+                material.readable_query_text,
+                material.payload_refs,
+            )
+
+        assert store.transaction_runner.run_read(read_inputs) == (
+            (
+                '{"kind":"completed","result":{"meta":null,"ok":true,'
+                '"value":{"content":"raw content event-tool-result-descriptor",'
+                '"event_id":"event-tool-result-descriptor"}}}'
+            ),
+            "tool_call_id=tool-call:event-tool-result-descriptor",
+            ("payload-selected-descriptor",),
+        )
+
+
+def test_missing_or_digest_mismatch_raw_evidence_fails_closed(
+    tmp_path: Path,
+) -> None:
+    """Selected evidence 缺 raw payload 或 envelope digest 不匹配时 fail closed。"""
+
+    session_id = "session-selected-digest-mismatch"
+    missing_raw_event_id = "event-tool-result-missing-raw-selected"
+    mismatch_event_id = "event-tool-result-digest-mismatch"
+    with open_host_durable_store(_options(tmp_path)) as store:
+        event_log = EventLogStore()
+
+        def append_rows(transaction: HostTransaction) -> None:
+            """写入缺 raw 与 digest mismatch 的 selected events。
+
+            :param transaction: Host transaction。
+            :returns: ``None``。
+            """
+
+            event_log.append_event(
+                transaction,
+                _event_request(
+                    event_id=missing_raw_event_id,
+                    session_id=session_id,
+                    event_type="TOOL_RESULT_ACCEPTED",
+                    payload={
+                        "accepted_evidence_envelope": (
+                            accepted_evidence_envelope_to_json_value(
+                                _accepted_evidence_envelope_for_event(
+                                    missing_raw_event_id
+                                )
+                            )
+                        )
+                    },
+                ),
+            )
+            descriptor = PayloadStore().write_sqlite_payload(
+                transaction,
+                SQLitePayloadWriteRequest(
+                    payload_ref="payload-digest-mismatch",
+                    payload_id="sqlite-payload-digest-mismatch",
+                    payload_format=SQLitePayloadFormat.CANONICAL_JSON,
+                    payload_json={
+                        "accepted_evidence_envelope": (
+                            accepted_evidence_envelope_to_json_value(
+                                _accepted_evidence_envelope_for_event_with_payload_ref(
+                                    mismatch_event_id,
+                                    payload_ref="payload-digest-mismatch",
+                                    payload_digest=_DIGEST,
+                                )
+                            )
+                        ),
+                        "raw_tool_outcome": _raw_tool_outcome(mismatch_event_id),
+                    },
+                ),
+            )
+            event_log.append_event(
+                transaction,
+                _event_request_with_payload_ref(
+                    event_id=mismatch_event_id,
+                    session_id=session_id,
+                    event_type="TOOL_RESULT_ACCEPTED",
+                    payload_ref=descriptor.payload_ref,
+                    payload_digest=descriptor.payload_digest,
+                ),
+            )
+
+        store.transaction_runner.run_write(append_rows)
+
+        with pytest.raises(HostDurableError, match="raw_tool_outcome"):
+            _collect_selected_evidence_ids(
+                store,
+                event_log,
+                session_id=session_id,
+                event_id=missing_raw_event_id,
+            )
+        with pytest.raises(HostDurableError, match="payload digest mismatch"):
+            _collect_selected_evidence_ids(
+                store,
+                event_log,
+                session_id=session_id,
+                event_id=mismatch_event_id,
+            )
+
+
+def test_no_result_preview_field_is_read_or_rendered(tmp_path: Path) -> None:
+    """旧 result_preview 字段出现时不读取、不渲染、不回退。"""
+
+    session_id = "session-result-preview-rejected"
+    event_id = "event-tool-result-preview"
+    with open_host_durable_store(_options(tmp_path)) as store:
+        event_log = EventLogStore()
+        _append_event_and_return_sequence(
+            store,
+            event_log,
+            event_id=event_id,
+            session_id=session_id,
+            event_type="TOOL_RESULT_ACCEPTED",
+            payload={
+                "accepted_evidence_envelope": accepted_evidence_envelope_to_json_value(
+                    _accepted_evidence_envelope_for_event(event_id)
+                ),
+                "raw_tool_outcome": _raw_tool_outcome(event_id),
+                "result_preview": "legacy preview must not be used",
+            },
+        )
+
+        with pytest.raises(HostDurableError, match="result_preview"):
+            _collect_selected_evidence_ids(
+                store,
+                event_log,
+                session_id=session_id,
+                event_id=event_id,
             )
 
 
@@ -1010,6 +1217,41 @@ def _accepted_evidence_envelope_for_event(
     )
 
 
+def _accepted_evidence_envelope_for_event_with_payload_ref(
+    event_id: str,
+    *,
+    payload_ref: str,
+    payload_digest: str | None,
+) -> AcceptedEvidenceEnvelope:
+    """构造带 payload descriptor ref 的 canonical evidence envelope。
+
+    :param event_id: TOOL_RESULT_ACCEPTED event id。
+    :param payload_ref: payload descriptor ref。
+    :param payload_digest: payload digest；未知时为 ``None``。
+    :returns: canonical evidence envelope。
+    """
+
+    return AcceptedEvidenceEnvelope(
+        evidence_id=f"evidence:{event_id}",
+        producer_event_ref=event_id,
+        tool_name="fins.search",
+        tool_call_id=f"tool-call:{event_id}",
+        tool_query=AcceptedEvidenceToolQuery(
+            tool_call_requested_event_ref=None,
+            normalized_arguments_digest=_DIGEST,
+            semantic_input_digest=_DIGEST,
+        ),
+        result_ref=AcceptedEvidenceResultRef(
+            payload_ref=payload_ref,
+            payload_digest=payload_digest,
+            outcome_digest=_DIGEST,
+            truncation_applied=False,
+        ),
+        source_refs=(),
+        locator_refs=(),
+    )
+
+
 def _raw_tool_outcome(event_id: str) -> JsonValue:
     """构造测试用 raw tool outcome。
 
@@ -1065,6 +1307,47 @@ def _append_event_and_return_sequence(
         ).row.event_sequence
 
     return store.transaction_runner.run_write(append_row)
+
+
+def _collect_selected_evidence_ids(
+    store: HostDurableStore,
+    event_log: EventLogStore,
+    *,
+    session_id: str,
+    event_id: str,
+) -> tuple[str, ...]:
+    """读取 selected helper 输出的 canonical evidence ids。
+
+    :param store: Host durable store。
+    :param event_log: EventLog store。
+    :param session_id: Session id。
+    :param event_id: selected TOOL_RESULT_ACCEPTED event id。
+    :returns: evidence id tuple。
+    """
+
+    def read_inputs(transaction: HostTransaction) -> tuple[str, ...]:
+        """在 transaction 内读取 selected evidence ids。
+
+        :param transaction: Host transaction。
+        :returns: evidence id tuple。
+        """
+
+        inputs = collect_selected_compaction_request_evidence_inputs(
+            transaction,
+            event_log,
+            session_id=session_id,
+            selected_evidence_block_refs=(
+                SelectedEvidenceBlockRef(
+                    block_id=f"selected:{event_id}",
+                    tool_result_event_ref=event_id,
+                ),
+            ),
+        )
+        return tuple(
+            material.accepted_evidence_id for material in inputs.evidence_materials
+        )
+
+    return store.transaction_runner.run_read(read_inputs)
 
 
 def _collect_evidence_ids(
@@ -1193,4 +1476,43 @@ def _event_request(
         payload_json=payload,
         payload_ref=None,
         payload_digest=None,
+    )
+
+
+def _event_request_with_payload_ref(
+    *,
+    event_id: str,
+    session_id: str,
+    event_type: str,
+    payload_ref: str,
+    payload_digest: str,
+) -> EventLogAppendRequest:
+    """构造带 payload descriptor ref 的测试 EventLog append request。
+
+    :param event_id: event id。
+    :param session_id: Session id。
+    :param event_type: event type。
+    :param payload_ref: payload descriptor ref。
+    :param payload_digest: payload digest。
+    :returns: EventLog append request。
+    """
+
+    return EventLogAppendRequest(
+        event_id=event_id,
+        event_class=EventClass.CANONICAL_FACT,
+        session_id=session_id,
+        run_id="run-compaction-operation-test",
+        attempt_id=None,
+        execution_id=None,
+        event_type=event_type,
+        occurred_at=_NOW,
+        actor="pytest",
+        source="test_compaction_operation",
+        client_request_id=None,
+        idempotency_key=None,
+        policy_decision=None,
+        reason=None,
+        payload_json={"payload_ref": payload_ref},
+        payload_ref=payload_ref,
+        payload_digest=payload_digest,
     )

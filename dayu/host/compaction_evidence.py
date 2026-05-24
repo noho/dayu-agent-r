@@ -24,6 +24,7 @@ from dayu.host.evidence import (
     accepted_evidence_envelope_from_json_value,
 )
 from dayu.host.payload_resolution import event_payload_object
+from dayu.host.payload_resolution import event_payload_object_for_result_ref
 from dayu.host.terminal_summary_payload import (
     PayloadSummaryTextPolicy,
     assistant_summary_from_payload,
@@ -37,10 +38,36 @@ _PAYLOAD_FIELD_PRESERVED_FACT_REFS = "preserved_fact_refs"
 _PAYLOAD_FIELD_EVIDENCE_BACKED_FACT_REFS = "evidence_backed_fact_refs"
 _PAYLOAD_FIELD_CANDIDATE_ID = "candidate_id"
 _PAYLOAD_FIELD_RAW_TOOL_OUTCOME = "raw_tool_outcome"
+_PAYLOAD_FIELD_RESULT_PREVIEW = "result_preview"
 _MEMORY_ITEM_EVIDENCE_BACKED_FACT_PREFIX = "memory-item:evidence_backed_fact"
-_READABLE_QUERY_TEXT = "accepted tool query"
-_READABLE_SOURCE_TEXT = "accepted tool evidence"
 _PAYLOAD_REF_PREFIX = "payload"
+_LOCATOR_REF_SEPARATOR = ", "
+_READABLE_SOURCE_EMPTY = "accepted tool evidence"
+
+
+@dataclass(frozen=True, slots=True)
+class SelectedEvidenceBlockRef:
+    """Selected compact evidence block 到 canonical tool result 的引用。
+
+    :param block_id: compact material selection 中的稳定 block id。
+    :param tool_result_event_ref: 对应 ``TOOL_RESULT_ACCEPTED`` event id。
+    """
+
+    block_id: str
+    tool_result_event_ref: str
+
+    def __post_init__(self) -> None:
+        """校验 selected evidence block ref。
+
+        :returns: ``None``。
+        :raises ValueError: 字段为空时抛出。
+        """
+
+        _require_non_empty_text(self.block_id, "SelectedEvidenceBlockRef.block_id")
+        _require_non_empty_text(
+            self.tool_result_event_ref,
+            "SelectedEvidenceBlockRef.tool_result_event_ref",
+        )
 
 
 @dataclass(frozen=True, slots=True)
@@ -55,6 +82,71 @@ class CompactionRequestEvidenceInputs:
     history_materials: tuple[InitialHistoryMaterial, ...]
     evidence_materials: tuple[InitialEvidenceMaterial, ...]
     evidence_backed_fact_refs: tuple[str, ...]
+
+
+def collect_selected_compaction_request_evidence_inputs(
+    transaction: HostTransaction,
+    event_log_store: EventLogStore,
+    *,
+    session_id: str,
+    selected_evidence_block_refs: tuple[SelectedEvidenceBlockRef, ...],
+    selected_history_event_refs: tuple[str, ...] = (),
+    selected_fact_event_refs: tuple[str, ...] = (),
+) -> CompactionRequestEvidenceInputs:
+    """按 selected material refs 构造 compaction evidence 输入。
+
+    :param transaction: 当前 Host transaction。
+    :param event_log_store: EventLog store。
+    :param session_id: 目标 Session id。
+    :param selected_evidence_block_refs: selected evidence block refs。
+    :param selected_history_event_refs: selected history event refs。
+    :param selected_fact_event_refs: selected compacted fact event refs。
+    :returns: compaction request material 输入。
+    :raises HostDurableError: refs 指向的事件缺失、跨 Session、类型错误、
+        payload 缺失、descriptor digest mismatch 或 raw evidence 不可读时抛出。
+    """
+
+    _require_selected_evidence_block_refs(selected_evidence_block_refs)
+    _require_string_tuple(selected_history_event_refs, "selected_history_event_refs")
+    _require_string_tuple(selected_fact_event_refs, "selected_fact_event_refs")
+    evidence_materials: list[InitialEvidenceMaterial] = []
+    for block_ref in selected_evidence_block_refs:
+        row = _required_event_row(
+            transaction,
+            event_log_store,
+            event_id=block_ref.tool_result_event_ref,
+            session_id=session_id,
+            expected_event_type=_EVENT_TYPE_TOOL_RESULT_ACCEPTED,
+        )
+        envelopes = _accepted_evidence_envelope_from_event(transaction, row)
+        evidence_materials.extend(
+            _tool_result_evidence_materials(transaction, row, envelopes)
+        )
+    history_materials: list[InitialHistoryMaterial] = []
+    for event_ref in selected_history_event_refs:
+        row = _required_event_row(
+            transaction,
+            event_log_store,
+            event_id=event_ref,
+            session_id=session_id,
+            expected_event_type=_EVENT_TYPE_RUN_SUCCEEDED,
+        )
+        history_materials.extend(_assistant_history_materials(transaction, row))
+    fact_refs: list[str] = []
+    for event_ref in selected_fact_event_refs:
+        row = _required_event_row(
+            transaction,
+            event_log_store,
+            event_id=event_ref,
+            session_id=session_id,
+            expected_event_type=CONTEXT_COMPACTED,
+        )
+        fact_refs.extend(_evidence_backed_fact_refs_from_compacted_event(transaction, row))
+    return CompactionRequestEvidenceInputs(
+        history_materials=tuple(history_materials),
+        evidence_materials=_deduplicate_evidence_materials(evidence_materials),
+        evidence_backed_fact_refs=_deduplicate_texts(fact_refs),
+    )
 
 
 def collect_compaction_request_evidence_inputs(
@@ -157,11 +249,8 @@ def _tool_result_evidence_materials(
 
     if len(envelopes) == 0:
         return ()
-    payload = event_payload_object(
-        transaction,
-        row,
-        payload_label=_EVENT_TYPE_TOOL_RESULT_ACCEPTED,
-    )
+    payload = _accepted_tool_result_payload(transaction, row, envelopes[0])
+    _reject_result_preview(payload)
     raw_outcome = payload.get(_PAYLOAD_FIELD_RAW_TOOL_OUTCOME)
     if raw_outcome is None:
         raise HostDurableError("TOOL_RESULT_ACCEPTED raw_tool_outcome is missing")
@@ -177,13 +266,74 @@ def _tool_result_evidence_materials(
                     envelope.tool_query.tool_call_requested_event_ref or row.event_id
                 ),
                 readable_tool_name=envelope.tool_name,
-                readable_query_text=_READABLE_QUERY_TEXT,
+                readable_query_text=_readable_query_text(envelope),
                 raw_result_text=raw_text,
-                readable_source_text=_READABLE_SOURCE_TEXT,
+                readable_source_text=_readable_source_text(envelope),
                 payload_refs=_payload_refs(row),
+                source_locator_refs=envelope.locator_refs,
             )
         )
     return tuple(materials)
+
+
+def _accepted_tool_result_payload(
+    transaction: HostTransaction,
+    row: EventLogRow,
+    envelope: AcceptedEvidenceEnvelope,
+) -> Mapping[str, JsonValue]:
+    """按 accepted envelope result ref 读取工具结果 payload。
+
+    :param transaction: 当前 Host transaction。
+    :param row: TOOL_RESULT_ACCEPTED EventLog row。
+    :param envelope: accepted evidence envelope。
+    :returns: digest-checked payload object。
+    :raises HostDurableError: payload ref / digest mismatch 或 payload 非 object 时抛出。
+    """
+
+    return event_payload_object_for_result_ref(
+        transaction,
+        row,
+        expected_payload_ref=envelope.result_ref.payload_ref,
+        expected_payload_digest=envelope.result_ref.payload_digest,
+        payload_label=_EVENT_TYPE_TOOL_RESULT_ACCEPTED,
+    )
+
+
+def _reject_result_preview(payload: Mapping[str, JsonValue]) -> None:
+    """拒绝旧 ``result_preview`` evidence content 字段。
+
+    :param payload: TOOL_RESULT_ACCEPTED payload。
+    :returns: ``None``。
+    :raises HostDurableError: payload 中出现 result_preview 时抛出。
+    """
+
+    if _PAYLOAD_FIELD_RESULT_PREVIEW in payload:
+        raise HostDurableError("TOOL_RESULT_ACCEPTED result_preview is not allowed")
+
+
+def _readable_query_text(envelope: AcceptedEvidenceEnvelope) -> str:
+    """从 envelope metadata 构造可读 query 描述。
+
+    :param envelope: accepted evidence envelope。
+    :returns: 不含 result content 的可读 query metadata。
+    """
+
+    return f"tool_call_id={envelope.tool_call_id}"
+
+
+def _readable_source_text(envelope: AcceptedEvidenceEnvelope) -> str:
+    """从 opaque source / locator refs 构造可读 source 描述。
+
+    :param envelope: accepted evidence envelope。
+    :returns: 不含 result content 的可读 source / locator metadata。
+    """
+
+    refs: list[str] = []
+    for ref in (*envelope.source_refs, *envelope.locator_refs):
+        refs.append(f"{ref.ref_kind}:{ref.ref_id}")
+    if len(refs) == 0:
+        return _READABLE_SOURCE_EMPTY
+    return _LOCATOR_REF_SEPARATOR.join(refs)
 
 
 def _assistant_history_materials(
@@ -284,7 +434,41 @@ def _payload_refs(row: EventLogRow) -> tuple[str, ...]:
     :returns: payload ref tuple。
     """
 
+    if row.payload_ref is not None:
+        return (row.payload_ref,)
     return (f"{_PAYLOAD_REF_PREFIX}:{row.event_id}",)
+
+
+def _required_event_row(
+    transaction: HostTransaction,
+    event_log_store: EventLogStore,
+    *,
+    event_id: str,
+    session_id: str,
+    expected_event_type: str,
+) -> EventLogRow:
+    """读取并校验 selected ref 指向的 EventLog row。
+
+    :param transaction: 当前 Host transaction。
+    :param event_log_store: EventLog store。
+    :param event_id: selected event id。
+    :param session_id: 目标 Session id。
+    :param expected_event_type: 期望 event type。
+    :returns: EventLog row。
+    :raises HostDurableError: 事件缺失、跨 Session、非 canonical fact 或类型不匹配时抛出。
+    """
+
+    _require_non_empty_text(event_id, "event_id")
+    row = event_log_store.read_event_by_id(transaction, event_id)
+    if row is None:
+        raise HostDurableError("selected evidence event is missing")
+    if row.session_id != session_id:
+        raise HostDurableError("selected evidence event session mismatch")
+    if row.event_class is not EventClass.CANONICAL_FACT:
+        raise HostDurableError("selected evidence event is not canonical fact")
+    if row.event_type != expected_event_type:
+        raise HostDurableError("selected evidence event type mismatch")
+    return row
 
 
 def _deduplicate_texts(values: list[str]) -> tuple[str, ...]:
@@ -341,7 +525,60 @@ def _required_text_list(
     return tuple(refs)
 
 
+def _require_selected_evidence_block_refs(
+    value: tuple[SelectedEvidenceBlockRef, ...],
+) -> None:
+    """校验 selected evidence block refs tuple。
+
+    :param value: 待校验 refs。
+    :returns: ``None``。
+    :raises TypeError: 字段或元素类型非法时抛出。
+    """
+
+    if not isinstance(value, tuple):
+        raise TypeError("selected_evidence_block_refs must be tuple")
+    for item in value:
+        if not isinstance(item, SelectedEvidenceBlockRef):
+            raise TypeError(
+                "selected_evidence_block_refs items must be SelectedEvidenceBlockRef"
+            )
+
+
+def _require_string_tuple(value: tuple[str, ...], field_name: str) -> None:
+    """校验字符串 tuple。
+
+    :param value: 待校验 tuple。
+    :param field_name: 字段名。
+    :returns: ``None``。
+    :raises TypeError: 字段或元素类型非法时抛出。
+    :raises ValueError: 字符串为空时抛出。
+    """
+
+    if not isinstance(value, tuple):
+        raise TypeError(f"{field_name} must be tuple")
+    for item in value:
+        _require_non_empty_text(item, field_name)
+
+
+def _require_non_empty_text(value: str, field_name: str) -> None:
+    """校验非空字符串。
+
+    :param value: 待校验字符串。
+    :param field_name: 字段名。
+    :returns: ``None``。
+    :raises TypeError: 字段类型非法时抛出。
+    :raises ValueError: 字符串为空时抛出。
+    """
+
+    if not isinstance(value, str):
+        raise TypeError(f"{field_name} must be str")
+    if value.strip() == "":
+        raise ValueError(f"{field_name} must be non-empty")
+
+
 __all__ = [
     "CompactionRequestEvidenceInputs",
+    "SelectedEvidenceBlockRef",
     "collect_compaction_request_evidence_inputs",
+    "collect_selected_compaction_request_evidence_inputs",
 ]

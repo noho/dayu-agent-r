@@ -199,6 +199,7 @@ def test_tool_result_accepted_payload_carries_accepted_evidence_envelope(
         assert envelope.source_refs == ()
         assert envelope.locator_refs == ()
         assert payload["raw_tool_outcome"] == candidate.raw_tool_outcome
+        assert "result_preview" not in payload
 
 
 def test_accepted_evidence_envelope_codec_rejects_partial_object() -> None:

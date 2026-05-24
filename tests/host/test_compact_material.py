@@ -7,10 +7,12 @@ import pytest
 from dayu.host.compact_material import (
     CompactMemorySnapshotRepairRequired,
     DuplicateMaterialSectionOwnerError,
+    EVIDENCE_BLOCK_CHUNK_TEXT_MAX_CHARS,
     InlineDeltaRepairMaterialView,
     RunInputMaterialBlock,
     build_compact_material_pack,
     check_compact_memory_snapshot_cursor,
+    prompt_local_evidence_map,
     run_input_material_block,
     select_compact_segment,
 )
@@ -284,6 +286,82 @@ def test_snapshot_lag_failure_does_not_request_run_recovery() -> None:
     assert exc_info.value.requests_run_recovery is False
 
 
+def test_evidence_labels_are_prompt_local_and_map_to_canonical_evidence() -> None:
+    """Prompt-local evidence labels 必须映射到 canonical accepted evidence。"""
+
+    evidence = _evidence_block(
+        "evidence-map",
+        event_sequence=3,
+        text="digest checked raw evidence",
+        payload_refs=("payload:evidence-map",),
+    )
+    selection = select_compact_segment(
+        trigger_source=CompactSegmentTrigger.PROACTIVE,
+        input_cursor=3,
+        memory_snapshot_cursor=3,
+        policy_digest=_POLICY_DIGEST,
+        material_blocks=(evidence,),
+    )
+
+    pack = build_compact_material_pack(
+        selected_segment=selection,
+        material_blocks=(evidence,),
+        memory_snapshot=None,
+        inline_delta_repair_view=None,
+        current_input_ref="event-current",
+        current_input_text="current input",
+    )
+    evidence_map = prompt_local_evidence_map(pack)
+
+    assert pack.evidence_labels == ("E1",)
+    assert tuple(evidence_map) == ("E1",)
+    assert evidence_map["E1"].accepted_evidence_id == "evidence:evidence-map"
+    assert evidence_map["E1"].tool_result_event_ref == "tool-result:evidence-map"
+    assert evidence_map["E1"].tool_call_event_ref == "tool-call:evidence-map"
+    assert evidence_map["E1"].payload_refs == ("payload:evidence-map",)
+
+
+def test_single_large_evidence_block_is_chunked_under_same_provenance() -> None:
+    """单个超大 evidence block 拆成 E1.1/E1.2 并保留同一 canonical provenance。"""
+
+    large_text = "A" * (EVIDENCE_BLOCK_CHUNK_TEXT_MAX_CHARS + 7)
+    evidence = _evidence_block(
+        "evidence-large",
+        event_sequence=3,
+        text=large_text,
+        payload_refs=("payload:evidence-large",),
+    )
+    selection = select_compact_segment(
+        trigger_source=CompactSegmentTrigger.REACTIVE,
+        input_cursor=3,
+        memory_snapshot_cursor=3,
+        policy_digest=_POLICY_DIGEST,
+        material_blocks=(evidence,),
+    )
+
+    pack = build_compact_material_pack(
+        selected_segment=selection,
+        material_blocks=(evidence,),
+        memory_snapshot=None,
+        inline_delta_repair_view=None,
+        current_input_ref="event-current",
+        current_input_text="current input",
+    )
+    evidence_map = prompt_local_evidence_map(pack)
+
+    assert pack.evidence_labels == ("E1.1", "E1.2")
+    assert tuple(block.raw_result_text for block in pack.evidence_input) == (
+        "A" * EVIDENCE_BLOCK_CHUNK_TEXT_MAX_CHARS,
+        "A" * 7,
+    )
+    assert evidence_map["E1.1"].accepted_evidence_id == "evidence:evidence-large"
+    assert evidence_map["E1.2"].accepted_evidence_id == "evidence:evidence-large"
+    assert evidence_map["E1.1"].chunk_parent_label == "E1"
+    assert evidence_map["E1.2"].chunk_parent_label == "E1"
+    assert evidence_map["E1.1"].chunk_ordinal == 1
+    assert evidence_map["E1.2"].chunk_ordinal == 2
+
+
 def _history_block(
     block_id: str,
     *,
@@ -312,13 +390,18 @@ def _history_block(
 
 
 def _evidence_block(
-    block_id: str, *, event_sequence: int, text: str
+    block_id: str,
+    *,
+    event_sequence: int,
+    text: str,
+    payload_refs: tuple[str, ...] = ("payload:test",),
 ) -> RunInputMaterialBlock:
     """构造 evidence material block。
 
     :param block_id: block id。
     :param event_sequence: event sequence。
     :param text: raw evidence 文本。
+    :param payload_refs: payload / artifact refs。
     :returns: RunInputMaterialBlock。
     """
 
@@ -332,6 +415,7 @@ def _evidence_block(
         accepted_evidence_id=f"evidence:{block_id}",
         tool_result_event_ref=f"tool-result:{block_id}",
         tool_call_event_ref=f"tool-call:{block_id}",
+        payload_refs=payload_refs,
         readable_tool_name="read_tool",
         readable_query_text="query",
         readable_source_text="source",

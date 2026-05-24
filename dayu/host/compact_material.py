@@ -20,10 +20,12 @@ from dayu.host.compaction import (
     CompactSegmentSelection,
     CompactSegmentTrigger,
     CurrentInputAnchor,
+    PromptLocalEvidenceMap,
     PromptLocalMaterialLabel,
     PromptLocalProvenanceEntry,
 )
 from dayu.host.durable.codec import sha256_digest_json
+from dayu.host.evidence import OpaqueEvidenceRef
 from dayu.host.memory import (
     ConversationMemorySnapshot,
     MemoryDiagnostic,
@@ -48,6 +50,9 @@ _INITIAL_REASON_EVIDENCE = "slice1_evidence_material"
 _INITIAL_REASON_STABLE = "slice1_stable_material"
 CURRENT_INPUT_ANCHOR_TEXT_MAX_CHARS = 1200
 """Current input anchor 允许直接暴露给 LLM 的最大字符数。"""
+
+EVIDENCE_BLOCK_CHUNK_TEXT_MAX_CHARS = 4096
+"""单个 evidence block 直接暴露给 LLM 前的确定性 chunk 字符上限。"""
 
 _CURRENT_INPUT_TRUNCATED_MARKER = "\n[truncated_current_input_anchor]"
 _NO_EVENT_SEQUENCE = 0
@@ -304,6 +309,8 @@ class InitialEvidenceMaterial:
     :param raw_result_text: raw evidence 文本。
     :param readable_source_text: LLM 可读来源文本。
     :param payload_refs: payload / artifact refs。
+    :param artifact_refs: artifact refs。
+    :param source_locator_refs: source locator refs。
     """
 
     canonical_source_ref: str
@@ -315,6 +322,19 @@ class InitialEvidenceMaterial:
     raw_result_text: str
     readable_source_text: str
     payload_refs: tuple[str, ...]
+    artifact_refs: tuple[str, ...] = ()
+    source_locator_refs: tuple[OpaqueEvidenceRef, ...] = ()
+
+
+@dataclass(frozen=True, slots=True)
+class _EvidenceChunk:
+    """Evidence material 的确定性 chunk 描述。"""
+
+    label: PromptLocalMaterialLabel
+    parent_label: PromptLocalMaterialLabel | None
+    chunk_ordinal: int | None
+    text: str
+    content_digest: str
 
 
 def material_label(
@@ -628,6 +648,42 @@ def build_compact_material_pack(
     )
 
 
+def prompt_local_evidence_map(
+    material_pack: CompactMaterialPack,
+) -> PromptLocalEvidenceMap:
+    """返回并校验 evidence-only prompt-local provenance view。
+
+    :param material_pack: compact material pack。
+    :returns: evidence label 到 canonical provenance entry 的只读 typed view。
+    :raises TypeError: material_pack 类型非法时抛出。
+    :raises ValueError: evidence entry 缺少 canonical evidence / tool / payload
+        或 artifact provenance 时抛出。
+    """
+
+    if not isinstance(material_pack, CompactMaterialPack):
+        raise TypeError("material_pack must be CompactMaterialPack")
+    evidence_map = material_pack.evidence_map()
+    for label, entry in evidence_map.items():
+        validate_material_label(label, CompactMaterialSection.EVIDENCE_INPUT)
+        if entry.section is not CompactMaterialSection.EVIDENCE_INPUT:
+            raise ValueError("evidence map contains non-evidence entry")
+        _require_non_empty_text(
+            entry.accepted_evidence_id,
+            "PromptLocalEvidenceMap.accepted_evidence_id",
+        )
+        _require_non_empty_text(
+            entry.tool_result_event_ref,
+            "PromptLocalEvidenceMap.tool_result_event_ref",
+        )
+        _require_non_empty_text(
+            entry.tool_call_event_ref,
+            "PromptLocalEvidenceMap.tool_call_event_ref",
+        )
+        if len(entry.payload_refs) == 0 and len(entry.artifact_refs) == 0:
+            raise ValueError("PromptLocalEvidenceMap requires payload or artifact refs")
+    return evidence_map
+
+
 def check_compact_memory_snapshot_cursor(
     *,
     session_id: str,
@@ -841,21 +897,19 @@ def _evidence_blocks(
 
     blocks: list[CompactEvidenceBlock] = []
     for index, material in enumerate(materials, start=_FIRST_ORDINAL):
-        blocks.append(
-            CompactEvidenceBlock(
-                evidence_label=material_label(
-                    CompactMaterialSection.EVIDENCE_INPUT,
-                    index,
-                ),
-                readable_tool_name=material.readable_tool_name,
-                readable_query_text=material.readable_query_text,
-                raw_result_text=material.raw_result_text,
-                readable_source_text=material.readable_source_text,
-                size_units=len(material.raw_result_text),
-                canonical_source_refs=(material.canonical_source_ref,),
-                content_digest=_text_digest(material.raw_result_text),
+        for chunk in _evidence_chunks(index, material.raw_result_text):
+            blocks.append(
+                CompactEvidenceBlock(
+                    evidence_label=chunk.label,
+                    readable_tool_name=material.readable_tool_name,
+                    readable_query_text=material.readable_query_text,
+                    raw_result_text=chunk.text,
+                    readable_source_text=material.readable_source_text,
+                    size_units=len(chunk.text),
+                    canonical_source_refs=(material.canonical_source_ref,),
+                    content_digest=chunk.content_digest,
+                )
             )
-        )
     return tuple(blocks)
 
 
@@ -926,23 +980,27 @@ def _evidence_provenance(
     """
 
     entries: list[PromptLocalProvenanceEntry] = []
-    for block, material in zip(blocks, materials, strict=True):
-        entries.append(
-            PromptLocalProvenanceEntry(
-                label=block.evidence_label,
-                section=CompactMaterialSection.EVIDENCE_INPUT,
-                kind=CompactMaterialBlockKind.ACCEPTED_TOOL_EVIDENCE,
-                canonical_source_refs=block.canonical_source_refs,
-                source_event_refs=(material.tool_result_event_ref,),
-                content_digest=block.content_digest,
-                accepted_evidence_id=material.accepted_evidence_id,
-                tool_result_event_ref=material.tool_result_event_ref,
-                tool_call_event_ref=material.tool_call_event_ref,
-                payload_refs=material.payload_refs,
-                artifact_refs=(),
-                source_locator_refs=(),
+    del blocks
+    for index, material in enumerate(materials, start=_FIRST_ORDINAL):
+        for chunk in _evidence_chunks(index, material.raw_result_text):
+            entries.append(
+                PromptLocalProvenanceEntry(
+                    label=chunk.label,
+                    section=CompactMaterialSection.EVIDENCE_INPUT,
+                    kind=CompactMaterialBlockKind.ACCEPTED_TOOL_EVIDENCE,
+                    canonical_source_refs=(material.canonical_source_ref,),
+                    source_event_refs=(material.tool_result_event_ref,),
+                    content_digest=chunk.content_digest,
+                    accepted_evidence_id=material.accepted_evidence_id,
+                    tool_result_event_ref=material.tool_result_event_ref,
+                    tool_call_event_ref=material.tool_call_event_ref,
+                    payload_refs=material.payload_refs,
+                    artifact_refs=material.artifact_refs,
+                    source_locator_refs=material.source_locator_refs,
+                    chunk_parent_label=chunk.parent_label,
+                    chunk_ordinal=chunk.chunk_ordinal,
+                )
             )
-        )
     return tuple(entries)
 
 
@@ -1450,27 +1508,28 @@ def _pack_evidence_blocks(
         block for block in blocks if block.section is CompactMaterialSection.EVIDENCE_INPUT
     )
     for index, block in enumerate(evidence_blocks, start=_FIRST_ORDINAL):
-        result.append(
-            CompactEvidenceBlock(
-                evidence_label=material_label(block.section, index),
-                readable_tool_name=_required_text(
-                    block.readable_tool_name,
-                    "RunInputMaterialBlock.readable_tool_name",
-                ),
-                readable_query_text=_required_text(
-                    block.readable_query_text,
-                    "RunInputMaterialBlock.readable_query_text",
-                ),
-                raw_result_text=block.text,
-                readable_source_text=_required_text(
-                    block.readable_source_text,
-                    "RunInputMaterialBlock.readable_source_text",
-                ),
-                size_units=block.size_units,
-                canonical_source_refs=block.canonical_source_refs,
-                content_digest=block.content_digest,
+        for chunk in _evidence_chunks(index, block.text):
+            result.append(
+                CompactEvidenceBlock(
+                    evidence_label=chunk.label,
+                    readable_tool_name=_required_text(
+                        block.readable_tool_name,
+                        "RunInputMaterialBlock.readable_tool_name",
+                    ),
+                    readable_query_text=_required_text(
+                        block.readable_query_text,
+                        "RunInputMaterialBlock.readable_query_text",
+                    ),
+                    raw_result_text=chunk.text,
+                    readable_source_text=_required_text(
+                        block.readable_source_text,
+                        "RunInputMaterialBlock.readable_source_text",
+                    ),
+                    size_units=len(chunk.text),
+                    canonical_source_refs=block.canonical_source_refs,
+                    content_digest=chunk.content_digest,
+                )
             )
-        )
     return tuple(result)
 
 
@@ -1519,38 +1578,87 @@ def _provenance_from_evidence_blocks(
         if block.section is CompactMaterialSection.EVIDENCE_INPUT
     )
     entries: list[PromptLocalProvenanceEntry] = []
-    for block, source in zip(evidence_blocks, source_blocks, strict=True):
-        entries.append(
-            PromptLocalProvenanceEntry(
-                label=block.evidence_label,
-                section=CompactMaterialSection.EVIDENCE_INPUT,
-                kind=CompactMaterialBlockKind.ACCEPTED_TOOL_EVIDENCE,
-                canonical_source_refs=block.canonical_source_refs,
-                source_event_refs=(
-                    _required_text(
+    del evidence_blocks
+    for index, source in enumerate(source_blocks, start=_FIRST_ORDINAL):
+        for chunk in _evidence_chunks(index, source.text):
+            entries.append(
+                PromptLocalProvenanceEntry(
+                    label=chunk.label,
+                    section=CompactMaterialSection.EVIDENCE_INPUT,
+                    kind=CompactMaterialBlockKind.ACCEPTED_TOOL_EVIDENCE,
+                    canonical_source_refs=source.canonical_source_refs,
+                    source_event_refs=(
+                        _required_text(
+                            source.tool_result_event_ref,
+                            "RunInputMaterialBlock.tool_result_event_ref",
+                        ),
+                    ),
+                    content_digest=chunk.content_digest,
+                    accepted_evidence_id=_required_text(
+                        source.accepted_evidence_id,
+                        "RunInputMaterialBlock.accepted_evidence_id",
+                    ),
+                    tool_result_event_ref=_required_text(
                         source.tool_result_event_ref,
                         "RunInputMaterialBlock.tool_result_event_ref",
                     ),
+                    tool_call_event_ref=_required_text(
+                        source.tool_call_event_ref,
+                        "RunInputMaterialBlock.tool_call_event_ref",
+                    ),
+                    payload_refs=source.payload_refs,
+                    artifact_refs=(),
+                    source_locator_refs=(),
+                    chunk_parent_label=chunk.parent_label,
+                    chunk_ordinal=chunk.chunk_ordinal,
+                )
+            )
+    return tuple(entries)
+
+
+def _evidence_chunks(evidence_ordinal: int, text: str) -> tuple[_EvidenceChunk, ...]:
+    """把单个 evidence text 拆成确定性 prompt-local chunks。
+
+    :param evidence_ordinal: evidence section 内 ordinal。
+    :param text: digest-checked raw evidence text。
+    :returns: evidence chunk tuple；未超限时返回单个非 chunk label。
+    :raises ValueError: text 为空或 ordinal 非法时抛出。
+    """
+
+    _require_non_empty_text(text, "evidence_text")
+    if evidence_ordinal < _FIRST_ORDINAL:
+        raise ValueError("evidence_ordinal must be positive")
+    if len(text) <= EVIDENCE_BLOCK_CHUNK_TEXT_MAX_CHARS:
+        return (
+            _EvidenceChunk(
+                label=material_label(
+                    CompactMaterialSection.EVIDENCE_INPUT,
+                    evidence_ordinal,
                 ),
-                content_digest=block.content_digest,
-                accepted_evidence_id=_required_text(
-                    source.accepted_evidence_id,
-                    "RunInputMaterialBlock.accepted_evidence_id",
-                ),
-                tool_result_event_ref=_required_text(
-                    source.tool_result_event_ref,
-                    "RunInputMaterialBlock.tool_result_event_ref",
-                ),
-                tool_call_event_ref=_required_text(
-                    source.tool_call_event_ref,
-                    "RunInputMaterialBlock.tool_call_event_ref",
-                ),
-                payload_refs=source.payload_refs,
-                artifact_refs=(),
-                source_locator_refs=(),
+                parent_label=None,
+                chunk_ordinal=None,
+                text=text,
+                content_digest=_text_digest(text),
+            ),
+        )
+    chunks: list[_EvidenceChunk] = []
+    parent_label = material_label(CompactMaterialSection.EVIDENCE_INPUT, evidence_ordinal)
+    start = 0
+    chunk_ordinal = _FIRST_ORDINAL
+    while start < len(text):
+        chunk_text = text[start : start + EVIDENCE_BLOCK_CHUNK_TEXT_MAX_CHARS]
+        chunks.append(
+            _EvidenceChunk(
+                label=evidence_chunk_label(evidence_ordinal, chunk_ordinal),
+                parent_label=parent_label,
+                chunk_ordinal=chunk_ordinal,
+                text=chunk_text,
+                content_digest=_text_digest(chunk_text),
             )
         )
-    return tuple(entries)
+        start += EVIDENCE_BLOCK_CHUNK_TEXT_MAX_CHARS
+        chunk_ordinal += 1
+    return tuple(chunks)
 
 
 def _raise_on_duplicate_section_owner(
@@ -1715,6 +1823,7 @@ def _required_text(value: str | None, field_name: str) -> str:
 
 __all__ = [
     "CURRENT_INPUT_ANCHOR_TEXT_MAX_CHARS",
+    "EVIDENCE_BLOCK_CHUNK_TEXT_MAX_CHARS",
     "CompactMaterialBuildError",
     "CompactMemorySnapshotRepairRequired",
     "DuplicateMaterialSectionOwnerError",
@@ -1732,6 +1841,7 @@ __all__ = [
     "initial_segment_selection",
     "material_label",
     "normalized_material_text",
+    "prompt_local_evidence_map",
     "run_input_material_block",
     "select_compact_segment",
     "validate_material_label",
