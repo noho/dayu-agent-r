@@ -22,6 +22,12 @@ from dayu.host.compaction import (
     CompactionCandidate,
     CompactionRequest,
     ContextCompactor,
+    EpisodeSummaryCandidate,
+    PinnedPatchOperation,
+    PinnedStatePatchCandidate,
+    PinnedStringTupleFieldPatch,
+    PinnedTextFieldPatch,
+    PreservationEvidence,
 )
 from dayu.host.compaction_evidence import (
     SelectedEvidenceBlockRef,
@@ -226,6 +232,137 @@ class _HardThresholdOnceCompactor(ContextCompactor):
         return candidate
 
 
+class _RecordingCompactor(ContextCompactor):
+    """记录 multi-pass request 并返回 fake candidate。"""
+
+    def __init__(self) -> None:
+        """初始化 recorder。
+
+        :returns: ``None``。
+        """
+
+        self.requests: list[CompactionRequest] = []
+        self._fake = FakeContextCompactor()
+
+    async def compact(
+        self, request: CompactionRequest, cancellation_token: CancellationToken
+    ) -> CompactionCandidate:
+        """记录 request 并返回 fake candidate。
+
+        :param request: compaction request。
+        :param cancellation_token: Host 注入的取消 token。
+        :returns: fake compaction candidate。
+        """
+
+        self.requests.append(request)
+        return await self._fake.compact(request, cancellation_token)
+
+
+class _SecondPassFailingCompactor(ContextCompactor):
+    """第一 pass 成功，第二 pass proposal 失败。"""
+
+    def __init__(self) -> None:
+        """初始化调用计数。
+
+        :returns: ``None``。
+        """
+
+        self.calls = 0
+        self._fake = FakeContextCompactor()
+
+    async def compact(
+        self, request: CompactionRequest, cancellation_token: CancellationToken
+    ) -> CompactionCandidate:
+        """第二次调用抛出 proposal failure。
+
+        :param request: compaction request。
+        :param cancellation_token: Host 注入的取消 token。
+        :returns: fake compaction candidate。
+        :raises RuntimeError: 第二次调用时抛出。
+        """
+
+        self.calls += 1
+        if self.calls == 2:
+            raise RuntimeError("second pass failed")
+        return await self._fake.compact(request, cancellation_token)
+
+
+class _DistinctPassCompactor(ContextCompactor):
+    """每个 pass 返回不同 summary / patch 的 deterministic compactor。"""
+
+    def __init__(self) -> None:
+        """初始化 fake compactor 与调用计数。
+
+        :returns: ``None``。
+        """
+
+        self.calls = 0
+        self._fake = FakeContextCompactor()
+
+    async def compact(
+        self, request: CompactionRequest, cancellation_token: CancellationToken
+    ) -> CompactionCandidate:
+        """返回带 pass 差异的 accepted candidate。
+
+        :param request: compaction request。
+        :param cancellation_token: Host 注入的取消 token。
+        :returns: compaction candidate。
+        """
+
+        self.calls += 1
+        candidate = await self._fake.compact(request, cancellation_token)
+        evidence = PreservationEvidence(
+            evidence_id=f"pass-evidence:{self.calls}",
+            material_source_refs=request.material_source_refs,
+            canonical_evidence_refs=request.canonical_evidence_refs,
+            memory_snapshot_cursor=request.memory_snapshot_cursor,
+            compact_input_range=None,
+        )
+        evidence_refs = (evidence.evidence_id,)
+        return replace(
+            candidate,
+            candidate_id=f"pass-candidate:{self.calls}",
+            episode_summary_candidate=EpisodeSummaryCandidate(
+                candidate_id=f"pass-summary:{self.calls}",
+                episode_title=f"Pass {self.calls} summary",
+                goal=f"goal from pass {self.calls}",
+                completed_actions=(f"action from pass {self.calls}",),
+                confirmed_fact_refs=request.evidence_backed_fact_refs,
+                confirmed_fact_summaries=(f"fact summary {self.calls}",),
+                user_constraints=(f"constraint from pass {self.calls}",),
+                open_questions=(f"question from pass {self.calls}",),
+                next_step=f"next step from pass {self.calls}",
+                tool_finding_refs=request.canonical_evidence_refs,
+                source_event_refs=request.material_source_refs,
+                evidence_refs=evidence_refs,
+            ),
+            pinned_state_patch_candidate=PinnedStatePatchCandidate(
+                candidate_id=f"pass-patch:{self.calls}",
+                current_goal=PinnedTextFieldPatch(
+                    operation=PinnedPatchOperation.REPLACE,
+                    value=f"current goal from pass {self.calls}",
+                    evidence_refs=evidence_refs,
+                ),
+                confirmed_subjects=PinnedStringTupleFieldPatch(
+                    operation=PinnedPatchOperation.REPLACE,
+                    value=(f"subject from pass {self.calls}",),
+                    evidence_refs=evidence_refs,
+                ),
+                user_constraints=PinnedStringTupleFieldPatch(
+                    operation=PinnedPatchOperation.REPLACE,
+                    value=(f"constraint from pass {self.calls}",),
+                    evidence_refs=evidence_refs,
+                ),
+                open_questions=PinnedStringTupleFieldPatch(
+                    operation=PinnedPatchOperation.REPLACE,
+                    value=(f"question from pass {self.calls}",),
+                    evidence_refs=evidence_refs,
+                ),
+            ),
+            preservation_evidence=(evidence,),
+        )
+
+
 @pytest.mark.asyncio
 async def test_run_compaction_operation_retries_async_proposal_failure() -> None:
     """operation await async compactor，并保留 proposal failure 后 retry 行为。"""
@@ -375,6 +512,125 @@ async def test_run_compaction_operation_redacts_exception_diagnostic_refs() -> N
     assert "token-secret" not in diagnostic_ref
     assert "raw-secret" not in diagnostic_ref
     assert "<redacted>" in diagnostic_ref
+
+
+@pytest.mark.asyncio
+async def test_reactive_multi_pass_commits_single_merged_context_compacted() -> None:
+    """reactive multi-pass 全部成功后只返回一个 merged accepted candidate。"""
+
+    request = _request(trigger_source=ContextCompactionTriggerSource.REACTIVE)
+    compactor = _RecordingCompactor()
+
+    result = await run_compaction_operation(
+        request=request,
+        compactor=compactor,
+        max_attempts=2,
+        cancellation_token=StubCancellationToken(),
+        pass_queue=(request, request),
+    )
+
+    assert len(compactor.requests) == 2
+    assert result.accepted_candidate is not None
+    assert result.accepted_candidate.candidate_id.startswith("merged:")
+    assert result.accepted_candidate.preserved_material_source_refs == (
+        request.material_source_refs
+    )
+    assert result.failure_reason is None
+
+
+@pytest.mark.asyncio
+async def test_reactive_multi_pass_merges_distinct_summary_and_patch() -> None:
+    """reactive multi-pass merge 不丢弃前序 pass 的 summary / tuple patch。"""
+
+    request = _request(trigger_source=ContextCompactionTriggerSource.REACTIVE)
+    compactor = _DistinctPassCompactor()
+
+    result = await run_compaction_operation(
+        request=request,
+        compactor=compactor,
+        max_attempts=2,
+        cancellation_token=StubCancellationToken(),
+        pass_queue=(request, request),
+    )
+
+    assert result.accepted_candidate is not None
+    summary = result.accepted_candidate.episode_summary_candidate
+    assert summary.goal == "goal from pass 1\n\ngoal from pass 2"
+    assert summary.completed_actions == (
+        "action from pass 1",
+        "action from pass 2",
+    )
+    assert summary.user_constraints == (
+        "constraint from pass 1",
+        "constraint from pass 2",
+    )
+    assert summary.open_questions == (
+        "question from pass 1",
+        "question from pass 2",
+    )
+    assert summary.next_step == "next step from pass 1\n\nnext step from pass 2"
+    assert summary.evidence_refs == ("pass-evidence:1", "pass-evidence:2")
+    patch = result.accepted_candidate.pinned_state_patch_candidate
+    assert patch.current_goal.value == "current goal from pass 2"
+    assert patch.current_goal.evidence_refs == ("pass-evidence:2",)
+    assert patch.confirmed_subjects.value == (
+        "subject from pass 1",
+        "subject from pass 2",
+    )
+    assert patch.user_constraints.value == (
+        "constraint from pass 1",
+        "constraint from pass 2",
+    )
+    assert patch.open_questions.value == (
+        "question from pass 1",
+        "question from pass 2",
+    )
+    assert patch.open_questions.evidence_refs == (
+        "pass-evidence:1",
+        "pass-evidence:2",
+    )
+
+
+@pytest.mark.asyncio
+async def test_reactive_multi_pass_intermediate_failure_commits_single_failed_event() -> None:
+    """reactive multi-pass 中间 pass 失败时 operation 整体失败且无 partial candidate。"""
+
+    request = _request(trigger_source=ContextCompactionTriggerSource.REACTIVE)
+    compactor = _SecondPassFailingCompactor()
+
+    result = await run_compaction_operation(
+        request=request,
+        compactor=compactor,
+        max_attempts=2,
+        cancellation_token=StubCancellationToken(),
+        pass_queue=(request, request),
+    )
+
+    assert compactor.calls == 2
+    assert result.accepted_candidate is None
+    assert result.failure_reason == "proposal_failed"
+    assert len(result.rejected_attempts) == 1
+    assert result.rejected_attempts[0].attempt_number == 2
+
+
+@pytest.mark.asyncio
+async def test_reactive_passes_share_operation_attempt_budget() -> None:
+    """operation attempt budget 是所有 reactive passes 共享的总 proposal 上限。"""
+
+    request = _request(trigger_source=ContextCompactionTriggerSource.REACTIVE)
+    compactor = _RecordingCompactor()
+
+    result = await run_compaction_operation(
+        request=request,
+        compactor=compactor,
+        max_attempts=1,
+        cancellation_token=StubCancellationToken(),
+        pass_queue=(request, request),
+    )
+
+    assert len(compactor.requests) == 1
+    assert result.accepted_candidate is None
+    assert result.failure_reason == "max_compaction_attempts_exhausted"
 
 
 def test_compaction_request_evidence_inputs_are_bounded_for_proactive_and_reactive(

@@ -409,6 +409,32 @@ class _QualityRejectOnceCompactor(ContextCompactor):
         return candidate
 
 
+class _RequestCapturingCompactor(ContextCompactor):
+    """记录 proactive compaction request 的测试 compactor。"""
+
+    def __init__(self) -> None:
+        """初始化 request recorder。
+
+        :returns: ``None``。
+        """
+
+        self.requests: list[CompactionRequest] = []
+        self._fake = FakeContextCompactor()
+
+    async def compact(
+        self, request: CompactionRequest, cancellation_token: CancellationToken
+    ) -> CompactionCandidate:
+        """记录 request 并返回 fake candidate。
+
+        :param request: compaction request。
+        :param cancellation_token: Host 注入的取消 token。
+        :returns: fake compaction candidate。
+        """
+
+        self.requests.append(request)
+        return await self._fake.compact(request, cancellation_token)
+
+
 class _CloseFailingHandle(_FakeHandle):
     """关闭时抛异常的 fake handle。"""
 
@@ -1242,6 +1268,66 @@ async def test_dispatch_lag_repair_rebuild_retry_does_not_fail_run(
                 RunStatus.RUNNING
             )
             assert _event_count(store.transaction_runner, "RUN_FAILED") == 0
+        finally:
+            await scheduler.close()
+
+
+@pytest.mark.asyncio
+async def test_memory_lag_pre_dispatch_failure_does_not_enter_recovering(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """pre-dispatch memory lag repair 不得把 Run 推入 RECOVERING。"""
+
+    factory = _FakeWorkerFactory(accepted_handle=_ControlledBlockingHandle())
+    builder = _LagRepairRunInputBuilder()
+    with open_host_durable_store(_options(tmp_path)) as store:
+        seeded = _seed_current_run(store)
+        scheduler = await _open_scheduler(tmp_path, store, factory)
+
+        def _noop_catch_up(record: PendingDispatchRecord) -> None:
+            """跳过 catch-up 以触发 builder lag repair 分支。
+
+            :param record: pending dispatch 摘要。
+            :returns: ``None``。
+            """
+
+            del record
+
+        def _fake_builder_for_dispatch(
+            *,
+            snapshot: AttemptDispatchSnapshot,
+            policy_snapshot: PolicySnapshot,
+            selected_business_tool_names: frozenset[str] | None,
+        ) -> _LagRepairRunInputBuilder:
+            """返回测试 builder。
+
+            :param snapshot: dispatch snapshot。
+            :param policy_snapshot: policy snapshot。
+            :param selected_business_tool_names: 业务工具名集合。
+            :returns: 测试 builder。
+            """
+
+            del snapshot, policy_snapshot, selected_business_tool_names
+            return builder
+
+        monkeypatch.setattr(
+            scheduler,
+            "_catch_up_memory_projection_before_worker",
+            _noop_catch_up,
+        )
+        monkeypatch.setattr(
+            scheduler,
+            "_run_input_builder_for_dispatch",
+            _fake_builder_for_dispatch,
+        )
+        try:
+            scheduler.wake_dispatch(_pending_dispatch(seeded))
+            await scheduler.drain_once()
+
+            assert _event_count(store.transaction_runner, "RUN_RECOVERING") == 0
+            assert _run_status(store.transaction_runner, seeded.run_id) == (
+                RunStatus.RUNNING
+            )
         finally:
             await scheduler.close()
 
@@ -2363,6 +2449,75 @@ async def test_pre_start_governance_soft_threshold_compacts_before_attempt(
             assert _run_status(store.transaction_runner, seeded.run_id) == (
                 RunStatus.RUNNING
             )
+        finally:
+            await scheduler.close()
+
+
+@pytest.mark.asyncio
+async def test_proactive_compaction_uses_selected_material_not_session_start_range(
+    tmp_path: Path,
+) -> None:
+    """proactive request 使用 selected ordinary material，不从 Session 起点扫描。"""
+
+    compactor = _RequestCapturingCompactor()
+    with open_host_durable_store(_options(tmp_path)) as store:
+        seeded = _seed_accepted_run(
+            store,
+            run_id="run-proactive-selected-material",
+            display_text=_soft_threshold_prompt(),
+        )
+        scheduler = await _open_scheduler(
+            tmp_path,
+            store,
+            _FakeWorkerFactory(),
+            context_budget_policy=_soft_compact_policy(),
+            context_compactor=compactor,
+            compact_artifact_root=tmp_path / "compact-artifacts",
+        )
+        try:
+            await scheduler.run_queue_promotion(seeded.session_id)
+
+            assert len(compactor.requests) == 1
+            request = compactor.requests[0]
+            assert request.segment_selection.input_cursor == (
+                _run_input_sequence(store.transaction_runner, seeded.run_id)
+            )
+            assert request.material_source_refs == (
+                f"event-input-{seeded.run_id}",
+            )
+            assert request.segment_selection.selected_block_ids == ()
+        finally:
+            await scheduler.close()
+
+
+@pytest.mark.asyncio
+async def test_proactive_material_pack_not_larger_than_ordinary_material_for_same_view(
+    tmp_path: Path,
+) -> None:
+    """proactive material pack 与 ordinary material 使用同一去重视图。"""
+
+    compactor = _RequestCapturingCompactor()
+    with open_host_durable_store(_options(tmp_path)) as store:
+        seeded = _seed_accepted_run(
+            store,
+            run_id="run-proactive-material-size",
+            display_text=_soft_threshold_prompt(),
+        )
+        scheduler = await _open_scheduler(
+            tmp_path,
+            store,
+            _FakeWorkerFactory(),
+            context_budget_policy=_soft_compact_policy(),
+            context_compactor=compactor,
+            compact_artifact_root=tmp_path / "compact-artifacts",
+        )
+        try:
+            await scheduler.run_queue_promotion(seeded.session_id)
+
+            request = compactor.requests[0]
+            ordinary_chars = len(_soft_threshold_prompt())
+            pack_chars = len(str(request.llm_material_json()))
+            assert pack_chars <= ordinary_chars + 512
         finally:
             await scheduler.close()
 
@@ -3541,6 +3696,25 @@ def _run_status(transaction_runner: HostTransactionRunner, run_id: str) -> RunSt
         row = read_run_by_id(transaction, run_id)
         assert row is not None
         return row.status
+
+    return transaction_runner.run_read(_operation)
+
+
+def _run_input_sequence(
+    transaction_runner: HostTransactionRunner, run_id: str
+) -> int:
+    """读取 Run input event sequence。
+
+    :param transaction_runner: transaction runner。
+    :param run_id: Run id。
+    :returns: Run input event sequence。
+    :raises AssertionError: Run 缺失时抛出。
+    """
+
+    def _operation(transaction: HostTransaction) -> int:
+        row = read_run_by_id(transaction, run_id)
+        assert row is not None
+        return row.input_event_sequence
 
     return transaction_runner.run_read(_operation)
 

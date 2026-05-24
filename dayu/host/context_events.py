@@ -56,6 +56,8 @@ _FIELD_PROVIDER_REQUEST_ID = "provider_request_id"
 _FIELD_PROVIDER_ERROR_REF = "provider_error_ref"
 _FIELD_ATTEMPT_ID = "attempt_id"
 _FIELD_EXECUTION_ID = "execution_id"
+_FIELD_FROZEN_MATERIAL_LIST_DIGEST = "frozen_material_list_digest"
+_FIELD_FROZEN_MATERIAL_REFS = "frozen_material_refs"
 _FIELD_COMPACT_ARTIFACT_REF = "compact_artifact_ref"
 _FIELD_COMPACT_ARTIFACT_DIGEST = "compact_artifact_digest"
 _FIELD_EPISODE_SUMMARY_CANDIDATE = "episode_summary_candidate"
@@ -183,6 +185,8 @@ def build_context_compaction_requested_payload(
     provider_error_ref: str | None,
     attempt_id: str | None,
     execution_id: str | None,
+    frozen_material_list_digest: str | None = None,
+    frozen_material_refs: tuple[str, ...] = (),
 ) -> Mapping[str, JsonValue]:
     """构造 ``CONTEXT_COMPACTION_REQUESTED`` payload。
 
@@ -196,6 +200,8 @@ def build_context_compaction_requested_payload(
     :param provider_error_ref: provider error ref；没有时为 ``None``。
     :param attempt_id: reactive compact 对应 Attempt id。
     :param execution_id: reactive compact 对应 execution id。
+    :param frozen_material_list_digest: reactive overflow material list digest。
+    :param frozen_material_refs: reactive overflow material source refs。
     :returns: 可写入 EventLog 的 JSON payload。
     :raises TypeError: 字段类型非法时抛出。
     :raises ValueError: 字段值非法时抛出。
@@ -214,6 +220,8 @@ def build_context_compaction_requested_payload(
         _FIELD_PROVIDER_ERROR_REF: provider_error_ref,
         _FIELD_ATTEMPT_ID: attempt_id,
         _FIELD_EXECUTION_ID: execution_id,
+        _FIELD_FROZEN_MATERIAL_LIST_DIGEST: frozen_material_list_digest,
+        _FIELD_FROZEN_MATERIAL_REFS: _string_list_json(frozen_material_refs),
     }
     validate_context_compaction_requested_payload(payload)
     return payload
@@ -240,6 +248,10 @@ def validate_context_compaction_requested_payload(
     _required_text(payload, _FIELD_POLICY_REF)
     _optional_text(payload, _FIELD_PROVIDER_REQUEST_ID)
     _optional_text(payload, _FIELD_PROVIDER_ERROR_REF)
+    frozen_digest = _optional_text(payload, _FIELD_FROZEN_MATERIAL_LIST_DIGEST)
+    if frozen_digest is not None and not is_sha256_digest(frozen_digest):
+        raise ValueError("frozen_material_list_digest must be sha256 digest")
+    _optional_text_list(payload, _FIELD_FROZEN_MATERIAL_REFS)
     attempt_id = _optional_text(payload, _FIELD_ATTEMPT_ID)
     execution_id = _optional_text(payload, _FIELD_EXECUTION_ID)
     if trigger_source is ContextCompactionTriggerSource.REACTIVE:

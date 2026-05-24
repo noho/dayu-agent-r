@@ -247,6 +247,26 @@ class RunInputMaterialBlock:
             )
 
 
+def selected_material_source_refs(
+    *,
+    material_blocks: tuple[RunInputMaterialBlock, ...],
+    selected_block_ids: tuple[str, ...],
+) -> tuple[str, ...]:
+    """返回 selected material blocks 覆盖的 canonical source refs。
+
+    :param material_blocks: ordinary / frozen material blocks。
+    :param selected_block_ids: segment selection 选中的 block ids。
+    :returns: 去重后的 canonical source refs。
+    """
+
+    selected = frozenset(selected_block_ids)
+    refs: list[str] = []
+    for block in material_blocks:
+        if block.block_id in selected:
+            refs.extend(block.canonical_source_refs)
+    return tuple(dict.fromkeys(refs))
+
+
 @dataclass(frozen=True, slots=True)
 class InlineDeltaRepairMaterialView:
     """Material pack build 可消费的 inline delta repair view。
@@ -1844,5 +1864,6 @@ __all__ = [
     "prompt_local_evidence_map",
     "run_input_material_block",
     "select_compact_segment",
+    "selected_material_source_refs",
     "validate_material_label",
 ]

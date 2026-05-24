@@ -122,11 +122,16 @@ from dayu.host.compact_artifact import (
     CompactArtifactWriteRequest,
 )
 from dayu.host.compact_material import (
-    build_initial_material_pack,
-    initial_segment_selection,
+    RunInputMaterialBlock,
+    build_compact_material_pack,
+    run_input_material_block,
+    select_compact_segment,
+    selected_material_source_refs,
 )
 from dayu.host.compaction import (
     CompactQualityCheckResult,
+    CompactMaterialBlockKind,
+    CompactMaterialSection,
     CompactSegmentTrigger,
     CompactionCandidate,
     CompactionRequest,
@@ -154,9 +159,6 @@ from dayu.host.context_events import (
     build_context_compaction_requested_payload,
 )
 from dayu.host.context_policy import ContextCompactionTriggerSource
-from dayu.host.compaction_evidence import (
-    collect_compaction_request_evidence_inputs,
-)
 from dayu.host.durable.artifact import LocalArtifactStore
 from dayu.host.tool_runtime import (
     DefaultHostToolFactAcceptPort,
@@ -1362,23 +1364,21 @@ class HostDispatchScheduler:
                 message="Context compactor or artifact store is not configured",
             )
             return None
-        evidence_inputs = collect_compaction_request_evidence_inputs(
-            transaction,
-            self._event_log_store,
-            session_id=run.session_id,
-            start_event_sequence=1,
-            end_event_sequence=run.input_event_sequence,
-        )
-        material_pack = build_initial_material_pack(
-            current_input_ref=run.input_event_id,
-            current_input_text=display_text,
-            history_materials=evidence_inputs.history_materials,
-            evidence_materials=evidence_inputs.evidence_materials,
-        )
-        segment_selection = initial_segment_selection(
+        material_blocks = _proactive_material_blocks(run=run, display_text=display_text)
+        segment_selection = select_compact_segment(
             trigger_source=CompactSegmentTrigger.PROACTIVE,
             input_cursor=run.input_event_sequence,
-            material_pack=material_pack,
+            memory_snapshot_cursor=None,
+            policy_digest=estimate.estimator_digest,
+            material_blocks=material_blocks,
+        )
+        material_pack = build_compact_material_pack(
+            selected_segment=segment_selection,
+            material_blocks=material_blocks,
+            memory_snapshot=None,
+            inline_delta_repair_view=None,
+            current_input_ref=run.input_event_id,
+            current_input_text=display_text,
         )
         request = CompactionRequest(
             trigger_source=ContextCompactionTriggerSource.PROACTIVE,
@@ -1389,9 +1389,12 @@ class HostDispatchScheduler:
             memory_snapshot_cursor=None,
             material_pack=material_pack,
             segment_selection=segment_selection,
-            evidence_backed_fact_refs=evidence_inputs.evidence_backed_fact_refs,
+            evidence_backed_fact_refs=(),
             recent_raw_turn_refs=(run.input_event_id,),
-            older_raw_turn_refs=(),
+            older_raw_turn_refs=selected_material_source_refs(
+                material_blocks=material_blocks,
+                selected_block_ids=segment_selection.selected_block_ids,
+            ),
             existing_episode_summary_refs=(),
             budget_before_compact=estimate,
         )
@@ -3218,6 +3221,33 @@ def _new_event_id(prefix: str) -> str:
     """
 
     return f"{prefix}-{uuid4().hex}"
+
+
+def _proactive_material_blocks(
+    *, run: RunRow, display_text: str
+) -> tuple[RunInputMaterialBlock, ...]:
+    """构造 proactive pre-dispatch 的 ordinary material block view。
+
+    proactive 发生在 ``RUN_STARTED`` / ``ATTEMPT_STARTED`` 之前，尚不能通过
+    AttemptDispatchSnapshot 调用完整 RunInputBuilder。本 helper 只使用当前
+    accepted Run 已冻结的 input anchor 构造同源 material block，避免恢复从
+    Session 起点扫描 EventLog 的旧 range collector。
+
+    :param run: 待 dispatch Run。
+    :param display_text: 当前输入展示文本。
+    :returns: ordinary material blocks。
+    """
+
+    return (
+        run_input_material_block(
+            block_id=f"current:{run.input_event_id}",
+            section=CompactMaterialSection.CURRENT_INPUT_ANCHOR,
+            kind=CompactMaterialBlockKind.CURRENT_INPUT_ANCHOR,
+            text=display_text,
+            canonical_source_refs=(run.input_event_id,),
+            event_sequence=run.input_event_sequence,
+        ),
+    )
 
 
 def _policy_snapshot_digest(policy_snapshot: PolicySnapshot) -> str:

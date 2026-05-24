@@ -441,6 +441,8 @@ async def test_context_compaction_requested_none_budget_uses_host_estimator_and_
         assert requested_payload["provider_request_id"] is None
         assert requested_payload["attempt_id"] == seeded.attempt_id
         assert requested_payload["execution_id"] == seeded.execution_id
+        assert requested_payload["frozen_material_refs"] == ["event-input-ingest"]
+        assert isinstance(requested_payload["frozen_material_list_digest"], str)
         assert isinstance(requested_payload["estimator_digest"], str)
         run_status, attempt_status = _statuses(store.transaction_runner, seeded)
         assert run_status == RunStatus.RUNNING
@@ -448,6 +450,28 @@ async def test_context_compaction_requested_none_budget_uses_host_estimator_and_
         assert len(wakeup.dispatches) == 1
         assert wakeup.dispatches[0].attempt_id != seeded.attempt_id
         assert wakeup.dispatches[0].execution_id != seeded.execution_id
+
+
+@pytest.mark.asyncio
+async def test_reactive_freezes_overflow_material_list_before_compaction(
+    tmp_path: Path,
+) -> None:
+    """reactive pending record 保存冻结 ordinary material digest 与 refs。"""
+
+    with open_host_durable_store(_options(tmp_path)) as store:
+        seeded = _seed_active_run(store.transaction_runner)
+        result = await EngineEventIngestor(
+            transaction_runner=store.transaction_runner,
+            context_budget_policy=_reactive_policy(),
+            context_compactor=FakeContextCompactor(),
+            compact_artifact_root=tmp_path / "compact-artifacts",
+        ).ingest_async(_context_compaction_candidate(seeded, worker_event_index=47))
+
+        requested = result.events[0]
+        payload = _payload(requested)
+        assert requested.event_type == CONTEXT_COMPACTION_REQUESTED
+        assert payload["frozen_material_refs"] == ["event-input-ingest"]
+        assert payload["frozen_material_list_digest"] != payload["estimator_digest"]
 
 
 @pytest.mark.asyncio
@@ -721,6 +745,36 @@ async def test_reactive_compact_count_limit_fails_closed_without_second_attempt(
         assert attempt_status == AttemptStatus.FAILED
         failed = _latest_event(store.transaction_runner, CONTEXT_COMPACTION_FAILED)
         assert _payload(failed)["failure_reason"] == "reactive_compact_limit_reached"
+
+
+@pytest.mark.asyncio
+async def test_reactive_repeated_overflow_respects_max_reactive_compactions_per_run(
+    tmp_path: Path,
+) -> None:
+    """重复 overflow 达到 reactive 上限后 fail closed 且不无限 retry。"""
+
+    with open_host_durable_store(_options(tmp_path)) as store:
+        seeded = _seed_active_run(store.transaction_runner)
+        _append_reactive_requested_fact(
+            store.transaction_runner,
+            seeded=seeded,
+            event_id="event-existing-reactive-request-repeat",
+            corrupted=False,
+        )
+
+        result = await EngineEventIngestor(
+            transaction_runner=store.transaction_runner,
+            context_budget_policy=_reactive_policy(
+                max_reactive_compactions_per_run=1
+            ),
+            context_compactor=FakeContextCompactor(),
+            compact_artifact_root=tmp_path / "compact-artifacts",
+        ).ingest_async(_context_compaction_candidate(seeded, worker_event_index=48))
+
+        assert result.terminal_closeout is True
+        assert _event_count(store.transaction_runner, CONTEXT_COMPACTED) == 0
+        assert _event_count(store.transaction_runner, "RUN_FAILED") == 1
+        assert _event_count(store.transaction_runner, "RUN_LOST") == 0
 
 
 @pytest.mark.asyncio
