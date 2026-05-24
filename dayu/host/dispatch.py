@@ -47,6 +47,7 @@ from dayu.host.durable.event_log import (
     EventLogStore,
 )
 from dayu.host.durable.errors import HostTransactionRetryExhaustedError
+from dayu.host.durable.memory import read_latest_memory_snapshot_at_or_before
 from dayu.host.durable.liveness import (
     HostInstanceIdentity,
     heartbeat_current_instance,
@@ -62,6 +63,7 @@ from dayu.host.durable.run_transition import (
     start_governed_run_with_starting_attempt_in_transaction,
     terminal_closeout_in_transaction,
 )
+from dayu.host.durable.schema import TABLE_EVENT_LOG
 from dayu.host.durable.state import (
     AttemptRow,
     DispatchRecordRow,
@@ -83,7 +85,7 @@ from dayu.host.durable.state import (
     read_earliest_queued_run,
     read_run_by_id,
 )
-from dayu.host.durable.transaction import HostTransaction, HostTransactionRunner
+from dayu.host.durable.transaction import HostRow, HostTransaction, HostTransactionRunner
 from dayu.host._execution_config_projection import (
     effective_execution_snapshot_from_json as _effective_execution_snapshot_from_json,
     required_json_mapping as _required_json_mapping,
@@ -108,10 +110,15 @@ from dayu.host.run_input import (
     PolicySnapshot,
     RunInputBuilder,
     ToolExecutionMode,
+    build_accepted_tool_evidence_material_blocks,
     create_no_tool_run_input_builder,
     create_tool_enabled_run_input_builder,
 )
-from dayu.host.memory import MemoryRepairReason
+from dayu.host.memory import (
+    CONVERSATION_MEMORY_CONSUMER_ID,
+    MemoryRepairReason,
+    digest_memory_projection_policy,
+)
 from dayu.host.memory_repair import (
     catch_up_conversation_memory_projection,
     rebuild_conversation_memory_projection,
@@ -121,6 +128,7 @@ from dayu.host.compact_artifact import (
     CompactArtifactStore,
     CompactArtifactWriteRequest,
 )
+from dayu.host.compact_payload import preserved_canonical_evidence_refs
 from dayu.host.compact_material import (
     RunInputMaterialBlock,
     build_compact_material_pack,
@@ -1364,7 +1372,20 @@ class HostDispatchScheduler:
                 message="Context compactor or artifact store is not configured",
             )
             return None
-        material_blocks = _proactive_material_blocks(run=run, display_text=display_text)
+        material_blocks = _proactive_material_blocks(
+            transaction,
+            self._event_log_store,
+            run=run,
+            display_text=display_text,
+            represented_evidence_refs=_proactive_represented_evidence_refs(
+                transaction,
+                self._event_log_store,
+                run=run,
+                policy_digest=digest_memory_projection_policy(
+                    self._local_execution.memory_projection_policy
+                ),
+            ),
+        )
         segment_selection = select_compact_segment(
             trigger_source=CompactSegmentTrigger.PROACTIVE,
             input_cursor=run.input_event_sequence,
@@ -3224,30 +3245,148 @@ def _new_event_id(prefix: str) -> str:
 
 
 def _proactive_material_blocks(
-    *, run: RunRow, display_text: str
+    transaction: HostTransaction,
+    event_log_store: EventLogStore,
+    *,
+    run: RunRow,
+    display_text: str,
+    represented_evidence_refs: tuple[str, ...],
 ) -> tuple[RunInputMaterialBlock, ...]:
     """构造 proactive pre-dispatch 的 ordinary material block view。
 
     proactive 发生在 ``RUN_STARTED`` / ``ATTEMPT_STARTED`` 之前，尚不能通过
-    AttemptDispatchSnapshot 调用完整 RunInputBuilder。本 helper 只使用当前
-    accepted Run 已冻结的 input anchor 构造同源 material block，避免恢复从
-    Session 起点扫描 EventLog 的旧 range collector。
+    AttemptDispatchSnapshot 调用完整 RunInputBuilder。本 helper 使用当前
+    accepted Run 已冻结的 input anchor，并补入当前输入 cursor 之前 bounded
+    accepted tool evidence material，避免恢复从 Session 起点扫描 EventLog 的
+    旧 range collector。
 
+    :param transaction: Host transaction。
+    :param event_log_store: EventLog store。
     :param run: 待 dispatch Run。
     :param display_text: 当前输入展示文本。
+    :param represented_evidence_refs: 已被 stable fact / compact artifact 表示的
+        accepted evidence refs。
     :returns: ordinary material blocks。
     """
 
     return (
-        run_input_material_block(
-            block_id=f"current:{run.input_event_id}",
-            section=CompactMaterialSection.CURRENT_INPUT_ANCHOR,
-            kind=CompactMaterialBlockKind.CURRENT_INPUT_ANCHOR,
-            text=display_text,
-            canonical_source_refs=(run.input_event_id,),
-            event_sequence=run.input_event_sequence,
+        *build_accepted_tool_evidence_material_blocks(
+            transaction,
+            event_log_store,
+            session_id=run.session_id,
+            before_event_sequence=run.input_event_sequence,
+            represented_evidence_refs=represented_evidence_refs,
+        ),
+        _current_input_material_block(run=run, display_text=display_text),
+    )
+
+
+def _current_input_material_block(
+    *, run: RunRow, display_text: str
+) -> RunInputMaterialBlock:
+    """构造 proactive current input anchor material block。
+
+    :param run: 当前 Run。
+    :param display_text: 当前输入展示文本。
+    :returns: current input material block。
+    """
+
+    return run_input_material_block(
+        block_id=f"current:{run.input_event_id}",
+        section=CompactMaterialSection.CURRENT_INPUT_ANCHOR,
+        kind=CompactMaterialBlockKind.CURRENT_INPUT_ANCHOR,
+        text=display_text,
+        canonical_source_refs=(run.input_event_id,),
+        event_sequence=run.input_event_sequence,
+    )
+
+
+def _proactive_represented_evidence_refs(
+    transaction: HostTransaction,
+    event_log_store: EventLogStore,
+    *,
+    run: RunRow,
+    policy_digest: str,
+) -> tuple[str, ...]:
+    """读取 proactive material 中应排除的已表示 accepted evidence refs。
+
+    :param transaction: Host transaction。
+    :param event_log_store: EventLog store。
+    :param run: 待 dispatch Run。
+    :param policy_digest: memory projection policy digest。
+    :returns: 去重后的 canonical evidence refs。
+    """
+
+    refs: list[str] = []
+    snapshot_row = read_latest_memory_snapshot_at_or_before(
+        transaction,
+        session_id=run.session_id,
+        consumer_id=CONVERSATION_MEMORY_CONSUMER_ID,
+        policy_digest=policy_digest,
+        max_checkpoint_event_sequence=run.input_event_sequence,
+    )
+    if snapshot_row is not None:
+        for fact in snapshot_row.snapshot.evidence_backed_facts:
+            refs.extend(fact.evidence_refs)
+    compacted = _latest_session_compacted_event_before_input(
+        transaction, event_log_store, run=run
+    )
+    if compacted is not None:
+        refs.extend(preserved_canonical_evidence_refs(_payload_object(compacted)))
+    return tuple(dict.fromkeys(refs))
+
+
+def _latest_session_compacted_event_before_input(
+    transaction: HostTransaction, event_log_store: EventLogStore, *, run: RunRow
+) -> EventLogRow | None:
+    """读取当前输入前最新 Session-level compacted event。
+
+    :param transaction: Host transaction。
+    :param event_log_store: EventLog store。
+    :param run: 待 dispatch Run。
+    :returns: 最新 CONTEXT_COMPACTED event；不存在时返回 ``None``。
+    """
+
+    rows = transaction.fetchall(
+        f"""
+        SELECT event_id
+        FROM {TABLE_EVENT_LOG}
+        WHERE session_id = ?
+          AND event_type = ?
+          AND event_class = ?
+          AND event_sequence < ?
+        ORDER BY event_sequence DESC
+        LIMIT 1
+        """,
+        (
+            run.session_id,
+            CONTEXT_COMPACTED,
+            EventClass.CANONICAL_FACT.value,
+            run.input_event_sequence,
         ),
     )
+    if len(rows) == 0:
+        return None
+    event_id = _required_row_text(rows[0], "event_id")
+    event = event_log_store.read_event_by_id(transaction, event_id)
+    if event is None:
+        return None
+    return event
+
+
+def _required_row_text(row: HostRow, field_name: str) -> str:
+    """读取 HostRow 中的必填文本字段。
+
+    :param row: Host row。
+    :param field_name: 字段名。
+    :returns: 文本字段值。
+    :raises ValueError: 字段缺失或不是非空文本时抛出。
+    """
+
+    value = row.get(field_name)
+    if not isinstance(value, str) or value.strip() == "":
+        raise ValueError(f"row field {field_name} must be non-empty text")
+    return value
 
 
 def _policy_snapshot_digest(policy_snapshot: PolicySnapshot) -> str:

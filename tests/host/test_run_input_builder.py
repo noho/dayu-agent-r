@@ -94,6 +94,7 @@ from dayu.host.compaction import (
     EvidenceBackedFactKind,
     MinimumPreserveReason,
 )
+from dayu.host.compact_payload import preserved_fact_refs_summary
 from dayu.host.memory_repair import catch_up_conversation_memory_projection
 from dayu.host.run_input import (
     DurableCurrentRunFactProvider,
@@ -103,7 +104,6 @@ from dayu.host.run_input import (
     NoToolExecutor,
     PolicySnapshot,
     ToolExecutionMode,
-    _preserved_fact_refs_text,
     create_no_tool_run_input_builder,
     create_tool_enabled_run_input_builder,
 )
@@ -1112,7 +1112,7 @@ def test_compact_artifact_preserved_fact_refs_reads_canonical_evidence_key() -> 
         }
     }
 
-    assert _preserved_fact_refs_text(payload) == (
+    assert preserved_fact_refs_summary(payload) == (
         "canonical_evidence_refs=evidence:memory-tool; "
         "evidence_backed_fact_refs=fact:memory-revenue"
     )
