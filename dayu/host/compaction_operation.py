@@ -341,8 +341,18 @@ def _merge_pass_candidates(
         minimum_preserve_item_candidates=_dedupe_minimum_preserve_items(candidates),
         retained_current_user_input_ref=request.current_input_ref,
         preserved_material_source_refs=request.material_source_refs,
-        preserved_canonical_evidence_refs=request.canonical_evidence_refs,
-        preserved_evidence_backed_fact_refs=request.evidence_backed_fact_refs,
+        preserved_canonical_evidence_refs=_dedupe_strings(
+            tuple(
+                candidate.preserved_canonical_evidence_refs
+                for candidate in candidates
+            )
+        ),
+        preserved_evidence_backed_fact_refs=_dedupe_strings(
+            tuple(
+                candidate.preserved_evidence_backed_fact_refs
+                for candidate in candidates
+            )
+        ),
         dropped_ranges=_dedupe_ranges(
             tuple(item for candidate in candidates for item in candidate.dropped_ranges)
         ),

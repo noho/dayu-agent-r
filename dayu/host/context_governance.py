@@ -9,6 +9,7 @@ from __future__ import annotations
 
 from dayu.host.compaction import (
     CompactInputRange,
+    CompactMaterialBlockKind,
     CompactQualityCheckResult,
     CompactQualityIssue,
     CompactionCandidate,
@@ -57,7 +58,7 @@ def check_compaction_candidate(
         request=request,
         candidate=candidate,
     )
-    open_questions_retained = _open_questions_retained(candidate)
+    open_questions_retained = _open_questions_retained(request, candidate)
     patch_valid = _pinned_patch_valid(
         candidate.pinned_state_patch_candidate,
         evidence_ids=evidence_ids,
@@ -613,18 +614,42 @@ def _refs_non_empty_and_known(refs: tuple[str, ...], known_refs: set[str]) -> bo
     return len(refs) > 0 and set(refs).issubset(known_refs)
 
 
-def _open_questions_retained(candidate: CompactionCandidate) -> bool:
+def _open_questions_retained(
+    request: CompactionRequest, candidate: CompactionCandidate
+) -> bool:
     """判断 open questions / assumptions 是否仍可追踪。
 
+    :param request: compaction 请求。
     :param candidate: compaction candidate。
-    :returns: 当前候选未丢失 open questions 时返回 ``True``。
+    :returns: 当前候选未丢失或已证据化清空 open questions 时返回 ``True``。
     """
 
+    if not _original_open_questions_present(request):
+        return True
     if len(candidate.episode_summary_candidate.open_questions) > 0:
         return True
     patch = candidate.pinned_state_patch_candidate.open_questions
+    if patch.operation is PinnedPatchOperation.CLEAR:
+        return True
     if patch.operation is PinnedPatchOperation.REPLACE:
         return patch.value is not None and len(patch.value) > 0
+    return False
+
+
+def _original_open_questions_present(request: CompactionRequest) -> bool:
+    """判断 compact 输入是否包含原始 open question / working assumption。
+
+    :param request: compaction 请求。
+    :returns: 输入 material 内存在未决问题或工作假设时返回 ``True``。
+    """
+
+    tracked_kinds = {
+        CompactMaterialBlockKind.OPEN_QUESTION,
+        CompactMaterialBlockKind.WORKING_ASSUMPTION,
+    }
+    for block in request.material_pack.stable_input + request.material_pack.history_input:
+        if block.kind in tracked_kinds:
+            return True
     return False
 
 

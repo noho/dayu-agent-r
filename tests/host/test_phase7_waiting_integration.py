@@ -78,10 +78,9 @@ from dayu.host.tool_runtime import (
 )
 from dayu.host.tooling import (
     HostToolingOptions,
-    ToolBundleSourceKind,
-    ToolBundleSourceRef,
     default_framework_tool_policy_view,
 )
+from dayu.contracts.tool_source import ToolBundleSourceKind, ToolBundleSourceRef
 from dayu.host.wait_adapter import (
     WaitAdapterBinding,
     WaitAdapterRegistry,

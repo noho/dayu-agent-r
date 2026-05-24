@@ -69,9 +69,8 @@ from dayu.host.context_policy import (
 from tests.host.fake_compaction import FakeContextCompactor
 from dayu.host.tooling import (
     HostToolingOptions,
-    ToolBundleSourceKind,
-    ToolBundleSourceRef,
 )
+from dayu.contracts.tool_source import ToolBundleSourceKind, ToolBundleSourceRef
 from dayu.host.dispatch import (
     ActiveCancelMessage,
     ActiveWorkerRegistry,

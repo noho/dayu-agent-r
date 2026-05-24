@@ -257,6 +257,37 @@ class _RecordingCompactor(ContextCompactor):
         return await self._fake.compact(request, cancellation_token)
 
 
+class _NoPreservedFactPassCompactor(ContextCompactor):
+    """返回不声明 preserved fact refs 的 multi-pass compactor。"""
+
+    def __init__(self) -> None:
+        """初始化 fake compactor 与调用计数。
+
+        :returns: ``None``。
+        """
+
+        self.calls = 0
+        self._fake = FakeContextCompactor()
+
+    async def compact(
+        self, request: CompactionRequest, cancellation_token: CancellationToken
+    ) -> CompactionCandidate:
+        """返回已通过质量闸门但未声明 preserved fact refs 的候选。
+
+        :param request: compaction request。
+        :param cancellation_token: Host 注入的取消 token。
+        :returns: compaction candidate。
+        """
+
+        self.calls += 1
+        candidate = await self._fake.compact(request, cancellation_token)
+        return replace(
+            candidate,
+            candidate_id=f"no-preserved-fact-pass:{self.calls}",
+            preserved_evidence_backed_fact_refs=(),
+        )
+
+
 class _SecondPassFailingCompactor(ContextCompactor):
     """第一 pass 成功，第二 pass proposal 失败。"""
 
@@ -534,6 +565,29 @@ async def test_reactive_multi_pass_commits_single_merged_context_compacted() -> 
     assert result.accepted_candidate.preserved_material_source_refs == (
         request.material_source_refs
     )
+    assert result.failure_reason is None
+
+
+@pytest.mark.asyncio
+async def test_reactive_multi_pass_merges_only_candidate_preserved_refs() -> None:
+    """multi-pass merge 只声明各 pass candidate 实际 preserved refs。"""
+
+    request = _request(trigger_source=ContextCompactionTriggerSource.REACTIVE)
+    compactor = _NoPreservedFactPassCompactor()
+
+    result = await run_compaction_operation(
+        request=request,
+        compactor=compactor,
+        max_attempts=2,
+        cancellation_token=StubCancellationToken(),
+        pass_queue=(request, request),
+    )
+
+    assert result.accepted_candidate is not None
+    assert result.accepted_candidate.preserved_canonical_evidence_refs == (
+        request.canonical_evidence_refs
+    )
+    assert result.accepted_candidate.preserved_evidence_backed_fact_refs == ()
     assert result.failure_reason is None
 
 

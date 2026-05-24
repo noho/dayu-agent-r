@@ -12,8 +12,8 @@ from dataclasses import dataclass, field
 from enum import StrEnum
 from typing import TYPE_CHECKING
 
-from dayu.contracts import ToolBundleSourceKind, ToolBundleSourceRef
 from dayu.contracts.tool_declaration import ToolBundle
+from dayu.contracts.tool_source import ToolBundleSourceRef
 
 if TYPE_CHECKING:
     from dayu.host.wait_adapter import WaitAdapterRegistry
@@ -107,7 +107,5 @@ __all__ = [
     "FrameworkToolName",
     "FrameworkToolPolicyView",
     "HostToolingOptions",
-    "ToolBundleSourceKind",
-    "ToolBundleSourceRef",
     "default_framework_tool_policy_view",
 ]

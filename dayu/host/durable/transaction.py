@@ -8,6 +8,7 @@ payload、idempotency、liveness 或 command path 业务语义。
 
 from __future__ import annotations
 
+import logging
 import sqlite3
 import time
 from collections.abc import Mapping
@@ -29,6 +30,7 @@ _SQLITE_CONSTRAINT_FOREIGNKEY = sqlite3.SQLITE_CONSTRAINT_FOREIGNKEY
 _SQLITE_CONSTRAINT_CHECK = sqlite3.SQLITE_CONSTRAINT_CHECK
 _SQLITE_EXTENDED_RESULT_CODE_MASK = 0xFF
 _SQLITE_MILLISECONDS_PER_SECOND = 1000
+_LOGGER = logging.getLogger(__name__)
 
 T = TypeVar("T")
 T_co = TypeVar("T_co", covariant=True)
@@ -394,6 +396,13 @@ def _run_after_commit(callbacks: tuple[AfterCommitCallback, ...]) -> None:
             if first_error is None:
                 first_error = exc
                 first_error_index = index
+                continue
+            _LOGGER.exception(
+                "Host durable after-commit callback secondary failure "
+                "callback_index=%s first_callback_index=%s",
+                index,
+                first_error_index,
+            )
     if first_error is not None:
         raise HostAfterCommitError(
             "Host durable after-commit callback failed",

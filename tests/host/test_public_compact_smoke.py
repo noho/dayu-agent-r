@@ -36,10 +36,9 @@ from dayu.host import (
     HostToolingOptions,
     LocalEngineWorkerFactory,
     OpenHostOptions,
-    ToolBundleSourceKind,
-    ToolBundleSourceRef,
     open_host,
 )
+from dayu.contracts.tool_source import ToolBundleSourceKind, ToolBundleSourceRef
 from dayu.host.context_policy import context_budget_policy_from_threshold_tokens
 from dayu.runtime.config_loader import ConfigLoader
 from dayu.runtime.scene_prepare import (

@@ -59,7 +59,7 @@ Host 内部职责按语义分层：
 - wait request / outcome：`ResolveWaitRequest`、`ResolveWaitCompletedOutcome`、`ResolveWaitFailedOutcome`、`ResolveWaitCancelledOutcome`、`ResolveWaitLostOutcome`、`ResolveWaitOutcome`、`WaitResolutionSource`、`WaitAdapterKey`、`WaitProviderStatusRef`。
 - event / read view：`HostEvent`、`HostEventClass`、`HostEventKind`、`HostTerminalStatus`、`HostFinalAnswerView`、`HostStreamCursor`、`TerminalResultSummary`、`OutboxSummary`、`HostPayloadRef`。
 - error / context：`HostApiError`、`HostApiErrorCode`、`HostApiErrorDetail`、`SteerConflictDetail`、`HostCallContext`、`OperationContext`、`AuthorizationClaim`、`HostMetadataEntry`。
-- tooling construction：`HostToolingOptions`、`ToolBundleSourceKind`、`ToolBundleSourceRef`、`FrameworkToolName`、`FrameworkToolPolicyView`、`default_framework_tool_policy_view`。
+- tooling construction：`HostToolingOptions`、`FrameworkToolName`、`FrameworkToolPolicyView`、`default_framework_tool_policy_view`；工具来源引用类型由 `dayu.contracts.tool_source` 提供。
 
 `Host` handle 提供的普通 public 方法是：
 

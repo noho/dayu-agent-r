@@ -53,6 +53,7 @@ from dayu.contracts.tool_schema import (
     ToolTruncateSpec,
     ToolTruncationStrategy,
 )
+from dayu.contracts.tool_source import ToolBundleSourceRef
 from dayu.host.api import AttemptStatus, HostPayloadRef, RunStatus
 from dayu.host.durable.codec import (
     canonical_json_dumps,
@@ -113,7 +114,6 @@ from dayu.runtime.tool_truncation import effective_tool_truncate_spec
 from dayu.host.tooling import (
     FrameworkToolName,
     FrameworkToolPolicyView,
-    ToolBundleSourceRef,
 )
 from dayu.host.tool_runtime_schema_projection import (
     business_bundle_digest as _business_bundle_digest,

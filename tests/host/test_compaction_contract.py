@@ -15,8 +15,10 @@ from dayu.host.compact_material import (
 )
 from dayu.host.compaction import (
     CompactInputRange,
+    CompactMaterialBlock,
     CompactMaterialBlockKind,
     CompactMaterialPack,
+    CompactMaterialSection,
     CompactQualityCheckResult,
     CompactQualityIssue,
     CompactSegmentTrigger,
@@ -30,6 +32,7 @@ from dayu.host.compaction import (
     PinnedPatchOperation,
     PinnedStringTupleFieldPatch,
     PinnedTextFieldPatch,
+    PromptLocalProvenanceEntry,
 )
 from dayu.host.context_budget import BudgetEstimate
 from dayu.host.context_governance import check_compaction_candidate
@@ -262,8 +265,8 @@ async def test_quality_rejects_pinned_patch_unknown_evidence_ref() -> None:
 
 
 @pytest.mark.asyncio
-async def test_quality_marks_open_questions_lost_when_clear_without_summary_questions() -> None:
-    """CLEAR 且 summary 未保留 open questions 时不得误报 retained。
+async def test_quality_accepts_clear_when_request_has_no_original_open_questions() -> None:
+    """输入没有原始 open questions 时，证据化 CLEAR 不要求候选保留问题。
 
     :returns: ``None``。
     """
@@ -289,9 +292,67 @@ async def test_quality_marks_open_questions_lost_when_clear_without_summary_ques
 
     result = check_compaction_candidate(request, candidate)
 
+    assert result.open_questions_retained is True
+    assert result.accepted is True
+    assert CompactQualityIssue.OPEN_QUESTIONS_MISSING not in result.rejection_reasons
+
+
+@pytest.mark.asyncio
+async def test_quality_rejects_original_open_questions_without_retention_or_clear() -> None:
+    """输入有原始 open questions 时，候选必须保留或证据化清空。"""
+
+    request = _request(material_pack=_material_pack_with_open_question())
+    candidate = await FakeContextCompactor().compact(request, StubCancellationToken())
+    summary = replace(candidate.episode_summary_candidate, open_questions=())
+    pinned_patch = replace(
+        candidate.pinned_state_patch_candidate,
+        open_questions=PinnedStringTupleFieldPatch(
+            operation=PinnedPatchOperation.MISSING,
+            value=None,
+            evidence_refs=(),
+        ),
+    )
+    candidate = replace(
+        candidate,
+        episode_summary_candidate=summary,
+        pinned_state_patch_candidate=pinned_patch,
+    )
+
+    result = check_compaction_candidate(request, candidate)
+
     assert result.open_questions_retained is False
     assert result.accepted is False
     assert CompactQualityIssue.OPEN_QUESTIONS_MISSING in result.rejection_reasons
+
+
+@pytest.mark.asyncio
+async def test_quality_accepts_evidence_supported_clear_for_original_open_questions() -> None:
+    """输入有原始 open questions 时，证据化 CLEAR 表示已解决。"""
+
+    request = _request(material_pack=_material_pack_with_open_question())
+    candidate = await FakeContextCompactor().compact(request, StubCancellationToken())
+    summary = replace(candidate.episode_summary_candidate, open_questions=())
+    pinned_patch = replace(
+        candidate.pinned_state_patch_candidate,
+        open_questions=PinnedStringTupleFieldPatch(
+            operation=PinnedPatchOperation.CLEAR,
+            value=None,
+            evidence_refs=(
+                candidate.pinned_state_patch_candidate.open_questions.evidence_refs
+            ),
+        ),
+    )
+    candidate = replace(
+        candidate,
+        episode_summary_candidate=summary,
+        pinned_state_patch_candidate=pinned_patch,
+    )
+
+    result = check_compaction_candidate(request, candidate)
+
+    assert result.open_questions_retained is True
+    assert result.accepted is True
+    assert CompactQualityIssue.OPEN_QUESTIONS_MISSING not in result.rejection_reasons
 
 
 @pytest.mark.asyncio
@@ -354,6 +415,28 @@ async def test_quality_rejects_summary_confirmed_fact_ref_to_evidence_label() ->
         confirmed_fact_refs=("E1",),
     )
     candidate = replace(candidate, episode_summary_candidate=invalid_summary)
+
+    result = check_compaction_candidate(request, candidate)
+
+    assert result.accepted is False
+    assert CompactQualityIssue.SUMMARY_PRETENDS_EVIDENCE_BACKED_FACT in (
+        result.rejection_reasons
+    )
+
+
+@pytest.mark.asyncio
+async def test_quality_rejects_preserved_fact_ref_outside_request_subset() -> None:
+    """preserved evidence-backed fact refs 必须是请求 fact refs 子集。"""
+
+    request = _request()
+    candidate = await FakeContextCompactor().compact(request, StubCancellationToken())
+    candidate = replace(
+        candidate,
+        preserved_evidence_backed_fact_refs=(
+            "fact-existing-1",
+            "fact-outside-request",
+        ),
+    )
 
     result = check_compaction_candidate(request, candidate)
 
@@ -736,6 +819,45 @@ def _material_pack_without_evidence() -> CompactMaterialPack:
             ),
         ),
         evidence_materials=(),
+    )
+
+
+def _material_pack_with_open_question() -> CompactMaterialPack:
+    """构造包含原始 open question 的 material pack。
+
+    :returns: compact material pack。
+    """
+
+    material_pack = _material_pack()
+    block = CompactMaterialBlock(
+        block_label="stable-open-question-1",
+        section=CompactMaterialSection.STABLE_INPUT,
+        kind=CompactMaterialBlockKind.OPEN_QUESTION,
+        text="仍需确认分部收入口径",
+        size_units=12,
+        source_labels=(),
+        canonical_source_refs=("memory-open-question-1",),
+        content_digest="digest-open-question-1",
+    )
+    provenance_map = dict(material_pack.provenance_map)
+    provenance_map[block.block_label] = PromptLocalProvenanceEntry(
+        label=block.block_label,
+        section=CompactMaterialSection.STABLE_INPUT,
+        kind=CompactMaterialBlockKind.OPEN_QUESTION,
+        canonical_source_refs=block.canonical_source_refs,
+        source_event_refs=("event-open-question-1",),
+        content_digest=block.content_digest,
+        accepted_evidence_id=None,
+        tool_result_event_ref=None,
+        tool_call_event_ref=None,
+        payload_refs=(),
+        artifact_refs=(),
+        source_locator_refs=(),
+    )
+    return replace(
+        material_pack,
+        stable_input=(block, *material_pack.stable_input),
+        provenance_map=provenance_map,
     )
 
 

@@ -46,10 +46,9 @@ from dayu.host.tool_runtime import (
     ToolRuntimePolicyView,
 )
 from dayu.host.tooling import (
-    ToolBundleSourceKind,
-    ToolBundleSourceRef,
     default_framework_tool_policy_view,
 )
+from dayu.contracts.tool_source import ToolBundleSourceKind, ToolBundleSourceRef
 
 _SESSION_ID = "session-duplicate"
 _RUN_ID = "run-duplicate"

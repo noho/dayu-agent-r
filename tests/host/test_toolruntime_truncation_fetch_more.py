@@ -50,9 +50,8 @@ from dayu.host.tool_runtime import (
 from dayu.host.tooling import (
     FrameworkToolName,
     FrameworkToolPolicyView,
-    ToolBundleSourceKind,
-    ToolBundleSourceRef,
 )
+from dayu.contracts.tool_source import ToolBundleSourceKind, ToolBundleSourceRef
 from dayu.runtime.tool_truncation import effective_tool_truncate_spec
 
 _SESSION_ID = "session-truncation"

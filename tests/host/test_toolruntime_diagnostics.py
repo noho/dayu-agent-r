@@ -52,10 +52,9 @@ from dayu.host.tool_runtime import (
     ToolTraceDiagnosticRecord,
 )
 from dayu.host.tooling import (
-    ToolBundleSourceKind,
-    ToolBundleSourceRef,
     default_framework_tool_policy_view,
 )
+from dayu.contracts.tool_source import ToolBundleSourceKind, ToolBundleSourceRef
 
 _SESSION_ID = "session-diagnostics"
 _RUN_ID = "run-diagnostics"

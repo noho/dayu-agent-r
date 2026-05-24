@@ -9,12 +9,6 @@ from typing import Protocol, cast
 import pytest
 
 from dayu.contracts.json_value import JsonValue
-from dayu.contracts import (
-    ToolBundleSourceKind as ContractToolBundleSourceKind,
-)
-from dayu.contracts import (
-    ToolBundleSourceRef as ContractToolBundleSourceRef,
-)
 from dayu.contracts.tool_call import (
     BatchToolExecutionContext,
     ToolCallRequest,
@@ -30,12 +24,11 @@ from dayu.contracts.tool_schema import (
     ToolParametersSchema,
     ToolSchema,
 )
+from dayu.contracts.tool_source import ToolBundleSourceKind, ToolBundleSourceRef
 from dayu.host import (
     FrameworkToolName,
     FrameworkToolPolicyView,
     HostToolingOptions,
-    ToolBundleSourceKind,
-    ToolBundleSourceRef,
     default_framework_tool_policy_view,
 )
 
@@ -128,25 +121,11 @@ def _source_ref() -> ToolBundleSourceRef:
     )
 
 
-def test_tooling_enums_are_str_enum_with_stable_values() -> None:
-    """tooling 枚举必须使用 ``StrEnum`` 并保持设计真源取值。"""
+def test_framework_tool_name_is_str_enum_with_stable_values() -> None:
+    """framework tooling 枚举必须使用 ``StrEnum`` 并保持设计真源取值。"""
 
-    assert issubclass(ToolBundleSourceKind, StrEnum)
     assert issubclass(FrameworkToolName, StrEnum)
-    assert {item.name: item.value for item in ToolBundleSourceKind} == {
-        "EXPLICIT_PROVIDER": "explicit_provider",
-        "CONFIG_BINDING": "config_binding",
-        "PACKAGE_ENTRYPOINT": "package_entrypoint",
-        "SERVICE_COMPOSITION": "service_composition",
-    }
     assert FrameworkToolName.FETCH_MORE.value == "fetch_more"
-
-
-def test_host_source_ref_exports_are_canonical_contracts() -> None:
-    """Host 包根导出的 source ref 类型必须直接来自 ``dayu.contracts``。"""
-
-    assert ToolBundleSourceKind is ContractToolBundleSourceKind
-    assert ToolBundleSourceRef is ContractToolBundleSourceRef
 
 
 def test_default_framework_tool_policy_view_reserves_fetch_more_only() -> None:

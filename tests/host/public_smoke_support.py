@@ -82,11 +82,10 @@ from dayu.host import (
     ResolveWaitRequest,
     RunStatus,
     SubmitFollowupRequest,
-    ToolBundleSourceKind,
-    ToolBundleSourceRef,
     WaitAdapterKey,
     WaitResolutionSource,
 )
+from dayu.contracts.tool_source import ToolBundleSourceKind, ToolBundleSourceRef
 from dayu.host.api import AuthorizationClaim
 from dayu.host.durable.connection import open_host_durable_store
 from dayu.host.durable.options import (
