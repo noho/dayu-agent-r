@@ -2243,17 +2243,24 @@ class HostDispatchScheduler:
                 exc.repair_request.reason
                 is MemoryRepairReason.SNAPSHOT_LAG_OVER_THRESHOLD
             ):
-                _LOGGER.warning(
-                    "dispatch memory projection lag repair still required; "
-                    "skipping without terminal closeout run_id=%s "
-                    "attempt_id=%s execution_id=%s reason=%s",
-                    record.run_id,
-                    record.attempt_id,
-                    record.execution_id,
-                    exc.repair_request.reason.value,
-                )
-                await _safe_release_lane_token(token)
-                return "skipped"
+                try:
+                    _LOGGER.warning(
+                        "dispatch memory projection lag repair still required; "
+                        "closing run run_id=%s attempt_id=%s execution_id=%s "
+                        "reason=%s",
+                        record.run_id,
+                        record.attempt_id,
+                        record.execution_id,
+                        exc.repair_request.reason.value,
+                    )
+                    self._safe_closeout_worker_startup_timeout(
+                        record,
+                        reason=_MEMORY_PROJECTION_REPAIR_REQUIRED_REASON,
+                        original_error=exc,
+                    )
+                finally:
+                    await _safe_release_lane_token(token)
+                return "timed_out"
             try:
                 _LOGGER.warning(
                     "dispatch memory projection repair required; closing run "

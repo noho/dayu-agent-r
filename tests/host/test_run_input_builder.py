@@ -512,16 +512,16 @@ def test_durable_memory_provider_uses_covered_snapshot(tmp_path: Path) -> None:
 
         assert contents[0] == _expected_system_content()
         assert contents[1].startswith("Memory user goals and constraints:")
-        assert contents[2].startswith("Memory confirmed subjects and methodology:")
-        assert contents[3].startswith("Memory evidence-backed facts:")
-        assert "claim_text=Revenue increased year over year" in contents[3]
-        assert "evidence_refs=evidence:memory-tool" in contents[3]
-        assert "evidence_kind=observed_value" in contents[3]
-        assert "extraction_operation_ref=event:event-memory-episode" in contents[3]
-        assert "event_id=event-memory-episode" in contents[3]
-        assert "event_sequence=5" in contents[3]
-        assert "digest_ref=" not in contents[3]
-        assert "fact_summary=" not in contents[3]
+        assert contents[2].startswith("Memory evidence-backed facts:")
+        assert "claim_text=Revenue increased year over year" in contents[2]
+        assert "evidence_refs=evidence:memory-tool" in contents[2]
+        assert "evidence_kind=observed_value" in contents[2]
+        assert "extraction_operation_ref=event:event-memory-episode" in contents[2]
+        assert "event_id=event-memory-episode" in contents[2]
+        assert "event_sequence=5" in contents[2]
+        assert "digest_ref=" not in contents[2]
+        assert "fact_summary=" not in contents[2]
+        assert contents[3].startswith("Memory confirmed subjects and methodology:")
         assert contents[4].startswith("Memory open questions and working assumptions:")
         assert contents[5] == "recent raw user"
         assert contents[6] == "recent assistant conclusion"
@@ -576,6 +576,48 @@ def test_memory_provider_applies_stable_layer_budget(tmp_path: Path) -> None:
         assert any(
             diagnostic.reason is MemoryDiagnosticReason.BUDGET_LIMIT_REACHED
             and diagnostic.item_id == "stable:evidence_backed_facts"
+            for diagnostic in memory_view.diagnostics
+        )
+
+
+def test_stable_budget_prioritizes_evidence_backed_facts_over_subjects(
+    tmp_path: Path,
+) -> None:
+    """stable 预算紧张时 confirmed subjects 不能饿死 evidence-backed facts。"""
+
+    policy = _memory_policy(stable_layer_size_units=512)
+    with open_host_durable_store(_options(tmp_path)) as store:
+        session_id = _ensure_session_id(store.transaction_runner)
+        _append_rich_memory_source_events(store.transaction_runner, session_id)
+        seeded = _seed_current_run(
+            store,
+            session_id=session_id,
+            payload=_user_input_payload("current prompt"),
+        )
+        cursor = _required_memory_cursor(store.transaction_runner, seeded)
+        snapshot = _stable_budget_pressure_snapshot(session_id, policy, cursor)
+        _write_memory_snapshot(store.transaction_runner, snapshot)
+
+        request = _build_request_with_memory(store, seeded, policy)
+        current_facts = DurableCurrentRunFactProvider(
+            store.transaction_runner
+        ).load_current_run_facts(_attempt_snapshot(seeded))
+        memory_view = DurableMemorySnapshotProvider(
+            store.transaction_runner, policy
+        ).load_memory_snapshot(_attempt_snapshot(seeded), current_facts)
+        contents = tuple(_message_content(message) for message in request.messages)
+
+        assert any(
+            content.startswith("Memory evidence-backed facts:")
+            for content in contents
+        )
+        assert all(
+            not content.startswith("Memory confirmed subjects and methodology:")
+            for content in contents
+        )
+        assert any(
+            diagnostic.reason is MemoryDiagnosticReason.BUDGET_LIMIT_REACHED
+            and diagnostic.item_id == "stable:subjects"
             for diagnostic in memory_view.diagnostics
         )
 
@@ -1598,6 +1640,43 @@ def _rich_memory_snapshot(
         built_at=snapshot_without_digest.built_at,
         snapshot_digest=calculate_memory_snapshot_digest(snapshot_without_digest),
     )
+
+
+def _stable_budget_pressure_snapshot(
+    session_id: str,
+    policy: MemoryProjectionPolicy,
+    cursor: MemorySnapshotCursor,
+) -> ConversationMemorySnapshot:
+    """构造 subjects 大于预算但 fact 可独立放入的 snapshot。
+
+    :param session_id: Session id。
+    :param policy: memory projection policy。
+    :param cursor: snapshot cursor。
+    :returns: memory snapshot。
+    """
+
+    snapshot = _rich_memory_snapshot(session_id, policy, cursor)
+    subjects = tuple(
+        OpaqueMemoryRef(
+            ref_kind=HostNeutralRefKind.SUBJECT,
+            ref_id=f"subject:budget-pressure-{index}",
+            digest=_DIGEST_A,
+        )
+        for index in range(12)
+    )
+    pinned_state = replace(
+        snapshot.pinned_state,
+        current_goal=None,
+        confirmed_subjects=subjects,
+        user_constraints=(),
+        open_questions=(),
+    )
+    updated = replace(
+        snapshot,
+        pinned_state=pinned_state,
+        working_assumptions=(),
+    )
+    return replace(updated, snapshot_digest=calculate_memory_snapshot_digest(updated))
 
 
 def _current_input_memory_snapshot(

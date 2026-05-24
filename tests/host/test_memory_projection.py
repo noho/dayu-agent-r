@@ -1224,6 +1224,41 @@ def test_memory_diagnostic_contract_round_trips_through_durable_store(
         assert read_back.session_id == _SESSION_ID
 
 
+@pytest.mark.parametrize(
+    "reason",
+    (
+        MemoryDiagnosticReason.EVIDENCE_BACKED_FACT_SUPERSEDED,
+        MemoryDiagnosticReason.MINIMUM_PRESERVE_ITEM_COVERED,
+    ),
+)
+def test_new_memory_diagnostic_reasons_are_persistable(
+    tmp_path: Path, reason: MemoryDiagnosticReason
+) -> None:
+    """新增 memory diagnostic reason 必须通过 SQLite CHECK 并可读回。"""
+
+    diagnostic = MemoryDiagnostic(
+        diagnostic_id=f"diagnostic-{reason.value}",
+        reason=reason,
+        message=f"{reason.value} persisted",
+        event_sequence=1,
+        item_id="memory-item:test",
+        policy_digest=digest_memory_projection_policy(_policy()),
+        recorded_at=_NOW,
+    )
+
+    with open_host_durable_store(_options(tmp_path)) as store:
+        written = store.transaction_runner.run_write(
+            _WriteDiagnosticOperation(diagnostic)
+        )
+        read_back = store.transaction_runner.run_read(
+            _ReadDiagnosticOperation(diagnostic.diagnostic_id)
+        )
+
+        assert written.diagnostic.reason is reason
+        assert read_back is not None
+        assert read_back.diagnostic.reason is reason
+
+
 def test_snapshot_digest_ignores_nondeterministic_diagnostic_fields() -> None:
     """snapshot digest 不受 diagnostic_id 与 recorded_at 影响。"""
 

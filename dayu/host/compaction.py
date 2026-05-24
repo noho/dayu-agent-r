@@ -64,6 +64,7 @@ class CompactQualityIssue(StrEnum):
     CURRENT_USER_INPUT_MISSING = "current_user_input_missing"
     ACCEPTED_EVIDENCE_REFS_MISSING = "canonical_evidence_refs_missing"
     SUMMARY_PRETENDS_EVIDENCE_BACKED_FACT = "summary_pretends_evidence_backed_fact"
+    EVIDENCE_LABELS_MISSING = "evidence_labels_missing"
     PRESERVATION_EVIDENCE_MISSING = "preservation_evidence_missing"
     EVIDENCE_ANCHOR_NOT_RETAINED = "evidence_anchor_not_retained"
     PINNED_PATCH_TRI_STATE_INVALID = "pinned_patch_tri_state_invalid"

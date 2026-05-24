@@ -142,6 +142,8 @@ class RunInputMaterialBlock:
     :param tool_result_event_ref: evidence block 对应 TOOL_RESULT_ACCEPTED ref。
     :param tool_call_event_ref: evidence block 对应 TOOL_CALL_REQUESTED ref。
     :param payload_refs: evidence payload / artifact refs。
+    :param artifact_refs: evidence artifact refs。
+    :param source_locator_refs: evidence source locator refs。
     :param readable_tool_name: evidence block 的可读工具名。
     :param readable_query_text: evidence block 的可读查询文本。
     :param readable_source_text: evidence block 的可读来源文本。
@@ -163,6 +165,8 @@ class RunInputMaterialBlock:
     tool_result_event_ref: str | None = None
     tool_call_event_ref: str | None = None
     payload_refs: tuple[str, ...] = ()
+    artifact_refs: tuple[str, ...] = ()
+    source_locator_refs: tuple[OpaqueEvidenceRef, ...] = ()
     readable_tool_name: str | None = None
     readable_query_text: str | None = None
     readable_source_text: str | None = None
@@ -208,6 +212,13 @@ class RunInputMaterialBlock:
             "RunInputMaterialBlock.tool_call_event_ref",
         )
         _require_string_tuple(self.payload_refs, "RunInputMaterialBlock.payload_refs")
+        _require_string_tuple(
+            self.artifact_refs, "RunInputMaterialBlock.artifact_refs"
+        )
+        _require_opaque_evidence_ref_tuple(
+            self.source_locator_refs,
+            "RunInputMaterialBlock.source_locator_refs",
+        )
         _require_optional_text(
             self.readable_tool_name,
             "RunInputMaterialBlock.readable_tool_name",
@@ -472,6 +483,8 @@ def run_input_material_block(
     tool_result_event_ref: str | None = None,
     tool_call_event_ref: str | None = None,
     payload_refs: tuple[str, ...] = (),
+    artifact_refs: tuple[str, ...] = (),
+    source_locator_refs: tuple[OpaqueEvidenceRef, ...] = (),
     readable_tool_name: str | None = None,
     readable_query_text: str | None = None,
     readable_source_text: str | None = None,
@@ -492,6 +505,8 @@ def run_input_material_block(
     :param tool_result_event_ref: evidence block 的 TOOL_RESULT_ACCEPTED ref。
     :param tool_call_event_ref: evidence block 的 TOOL_CALL_REQUESTED ref。
     :param payload_refs: payload / artifact refs。
+    :param artifact_refs: artifact refs。
+    :param source_locator_refs: source locator refs。
     :param readable_tool_name: evidence block 可读工具名。
     :param readable_query_text: evidence block 可读查询文本。
     :param readable_source_text: evidence block 可读来源文本。
@@ -518,6 +533,8 @@ def run_input_material_block(
         tool_result_event_ref=tool_result_event_ref,
         tool_call_event_ref=tool_call_event_ref,
         payload_refs=payload_refs,
+        artifact_refs=artifact_refs,
+        source_locator_refs=source_locator_refs,
         readable_tool_name=readable_tool_name,
         readable_query_text=readable_query_text,
         readable_source_text=readable_source_text,
@@ -1627,8 +1644,8 @@ def _provenance_from_evidence_blocks(
                         "RunInputMaterialBlock.tool_call_event_ref",
                     ),
                     payload_refs=source.payload_refs,
-                    artifact_refs=(),
-                    source_locator_refs=(),
+                    artifact_refs=source.artifact_refs,
+                    source_locator_refs=source.source_locator_refs,
                     chunk_parent_label=chunk.parent_label,
                     chunk_ordinal=chunk.chunk_ordinal,
                 )
@@ -1792,6 +1809,24 @@ def _require_string_tuple(value: tuple[str, ...], field_name: str) -> None:
         raise TypeError(f"{field_name} must be tuple")
     for item in value:
         _require_non_empty_text(item, field_name)
+
+
+def _require_opaque_evidence_ref_tuple(
+    value: tuple[OpaqueEvidenceRef, ...], field_name: str
+) -> None:
+    """校验 OpaqueEvidenceRef tuple。
+
+    :param value: 待校验 tuple。
+    :param field_name: 字段名。
+    :returns: ``None``。
+    :raises TypeError: 字段不是 tuple 或元素类型不正确时抛出。
+    """
+
+    if not isinstance(value, tuple):
+        raise TypeError(f"{field_name} must be tuple")
+    for item in value:
+        if not isinstance(item, OpaqueEvidenceRef):
+            raise TypeError(f"{field_name} items must be OpaqueEvidenceRef")
 
 
 def _require_optional_text(value: str | None, field_name: str) -> None:

@@ -9,7 +9,7 @@ from pathlib import Path
 import pytest
 
 from dayu.contracts.json_value import JsonValue
-from dayu.host.api import EnsureSessionRequest
+from dayu.host.api import EnsureSessionRequest, HostPayloadRef
 from dayu.host._event_payload import payload_object
 from dayu.host.durable.codec import sha256_digest_json
 from dayu.host.durable.connection import open_host_durable_store
@@ -200,6 +200,33 @@ def test_tool_result_accepted_payload_carries_accepted_evidence_envelope(
         assert envelope.locator_refs == ()
         assert payload["raw_tool_outcome"] == candidate.raw_tool_outcome
         assert "result_preview" not in payload
+
+
+def test_accept_rejects_missing_payload_descriptor_before_writing_events(
+    tmp_path: Path,
+) -> None:
+    """accept barrier 在写 accepted events 前拒绝缺失 payload descriptor。"""
+
+    with open_host_durable_store(_options(tmp_path)) as store:
+        seeded = _seed_active_run(store.transaction_runner)
+        payload_digest = sha256_digest_json({"payload": "missing-descriptor"})
+        candidate = replace(
+            _completed_candidate(seeded, tool_call_id="tool-call-missing-payload"),
+            payload_digest=payload_digest,
+            payload_ref=HostPayloadRef(
+                payload_ref="payload:missing-descriptor",
+                payload_digest=payload_digest,
+            ),
+        )
+        accept_port = DefaultHostToolFactAcceptPort(
+            transaction_runner=store.transaction_runner
+        )
+
+        result = accept_port.accept_tool_fact(candidate)
+
+        assert isinstance(result, ToolFactRejectedAck)
+        assert result.reason_code is ToolAcceptRejectReason.PAYLOAD_REFERENCE_INVALID
+        assert _tool_events(store.transaction_runner) == ()
 
 
 def test_accepted_evidence_envelope_codec_rejects_partial_object() -> None:

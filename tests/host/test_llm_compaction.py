@@ -655,7 +655,7 @@ async def test_llm_context_compactor_rejects_truncated_final_output(
 async def test_llm_context_compactor_applies_runner_timeout(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """compactor 单次 runner 调用必须受 RunnerSpec timeout 边界约束。"""
+    """compactor timeout 必须转为稳定 proposal error 并写入取消 token。"""
 
     async def _hanging_run(request: AgentRunRequest) -> AgentRunResult:
         """模拟不返回的 Engine public runner。
@@ -674,9 +674,13 @@ async def test_llm_context_compactor_applies_runner_timeout(
         runner_spec=_runner_spec(default_timeout_seconds=0.01),
         runner_options=_runner_options(),
     )
+    cancellation_token = StubCancellationToken()
 
-    with pytest.raises(TimeoutError):
-        await compactor.compact(_request(), StubCancellationToken())
+    with pytest.raises(LLMCompactionProposalError, match="proposal timed out"):
+        await compactor.compact(_request(), cancellation_token)
+
+    assert cancellation_token.is_cancelled() is True
+    assert cancellation_token.cancel_reason() == "compactor_proposal_timeout"
 
 
 @pytest.mark.asyncio
@@ -756,6 +760,48 @@ async def test_llm_context_compactor_preserves_host_owned_refs_and_evidence(
     assert candidate.pinned_state_patch_candidate.current_goal.evidence_refs == (
         evidence.evidence_id,
     )
+
+
+@pytest.mark.asyncio
+async def test_range_endpoint_label_with_multiple_refs_is_rejected(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Range endpoint label 映射多个 canonical refs 时必须 fail closed。"""
+
+    request = _request()
+    material_pack = _material_pack_with_history_refs(("input-2", "input-2b"))
+    request = replace(request, material_pack=material_pack)
+    monkeypatch.setattr(
+        "dayu.host.llm_compaction.run_agent_and_wait",
+        _fake_run_factory(_final(_proposal_json())),
+    )
+
+    with pytest.raises(LLMCompactionProposalError, match="exactly one"):
+        await _llm_compactor(
+            runner_spec=_runner_spec(),
+            runner_options=_runner_options(),
+        ).compact(request, StubCancellationToken())
+
+
+@pytest.mark.asyncio
+async def test_range_endpoint_label_without_ref_is_rejected(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Range endpoint label 没有 canonical ref 时必须 fail closed。"""
+
+    request = _request()
+    material_pack = _material_pack_with_history_refs(())
+    request = replace(request, material_pack=material_pack)
+    monkeypatch.setattr(
+        "dayu.host.llm_compaction.run_agent_and_wait",
+        _fake_run_factory(_final(_proposal_json())),
+    )
+
+    with pytest.raises(LLMCompactionProposalError, match="no canonical source refs"):
+        await _llm_compactor(
+            runner_spec=_runner_spec(),
+            runner_options=_runner_options(),
+        ).compact(request, StubCancellationToken())
 
 
 @pytest.mark.asyncio
@@ -839,7 +885,7 @@ def _request(
     )
 
 
-def _material_pack(raw_tool_content: str):
+def _material_pack(raw_tool_content: str) -> CompactMaterialPack:
     """构造测试 material pack。
 
     :param raw_tool_content: raw evidence 文本。
@@ -870,6 +916,26 @@ def _material_pack(raw_tool_content: str):
             ),
         ),
     )
+
+
+def _material_pack_with_history_refs(
+    canonical_source_refs: tuple[str, ...],
+) -> CompactMaterialPack:
+    """构造替换 H1 provenance refs 的 material pack。
+
+    :param canonical_source_refs: H1 对应 canonical source refs。
+    :returns: compact material pack。
+    """
+
+    pack = _material_pack("Revenue grew 12% year over year.")
+    provenance = dict(pack.provenance_map)
+    history_entry = provenance["H1"]
+    provenance["H1"] = replace(
+        history_entry,
+        canonical_source_refs=canonical_source_refs,
+        source_event_refs=canonical_source_refs,
+    )
+    return replace(pack, provenance_map=provenance)
 
 
 def _proposal_json(

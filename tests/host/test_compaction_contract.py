@@ -364,6 +364,20 @@ async def test_quality_rejects_summary_confirmed_fact_ref_to_evidence_label() ->
 
 
 @pytest.mark.asyncio
+async def test_quality_rejects_known_fact_refs_without_evidence_labels() -> None:
+    """有 evidence-backed fact refs 但无 evidence labels 时必须 fail closed。"""
+
+    request = _request()
+    candidate = await FakeContextCompactor().compact(request, StubCancellationToken())
+    request = replace(request, material_pack=_material_pack_without_evidence())
+
+    result = check_compaction_candidate(request, candidate)
+
+    assert result.accepted is False
+    assert CompactQualityIssue.EVIDENCE_LABELS_MISSING in result.rejection_reasons
+
+
+@pytest.mark.asyncio
 async def test_quality_rejects_fact_candidate_referencing_non_evidence_ref() -> None:
     """Fact candidate 不能引用 user / assistant / summary 等非 evidence refs。
 
@@ -702,6 +716,26 @@ def _material_pack():
                 payload_refs=("payload:accepted-2",),
             ),
         ),
+    )
+
+
+def _material_pack_without_evidence() -> CompactMaterialPack:
+    """构造不含 evidence labels 的 material pack。
+
+    :returns: compact material pack。
+    """
+
+    return build_initial_material_pack(
+        current_input_ref="event-current",
+        current_input_text="分析 A 公司 2025 年年报",
+        history_materials=(
+            InitialHistoryMaterial(
+                canonical_source_ref="event-old",
+                text="上一轮回答摘要",
+                kind=CompactMaterialBlockKind.RAW_ASSISTANT_TURN,
+            ),
+        ),
+        evidence_materials=(),
     )
 
 

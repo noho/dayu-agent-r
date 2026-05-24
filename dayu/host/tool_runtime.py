@@ -77,6 +77,7 @@ from dayu.host.durable.idempotency import (
     IdempotencyScope,
     IdempotencyStore,
 )
+from dayu.host.durable.payload import read_payload_descriptor
 from dayu.host.durable.state import (
     AttemptRow,
     DispatchRecordRow,
@@ -2022,6 +2023,13 @@ class DefaultHostToolFactAcceptPort:
                 "tool fact accept precondition failed",
                 retryable=False,
             )
+        if not _candidate_payload_descriptor_exists(transaction, candidate):
+            return _rejected_ack(
+                candidate,
+                ToolAcceptRejectReason.PAYLOAD_REFERENCE_INVALID,
+                "tool fact payload descriptor is missing",
+                retryable=False,
+            )
 
         event_plan = _tool_accept_event_plan(candidate)
         requested = self._event_log_store.append_event(
@@ -3326,6 +3334,25 @@ def _invalid_accept_context_reason(
     ):
         return ToolAcceptRejectReason.INVALID_ATTEMPT
     return None
+
+
+def _candidate_payload_descriptor_exists(
+    transaction: HostTransaction, candidate: ToolFactAcceptCandidate
+) -> bool:
+    """校验 candidate 的 payload descriptor 已持久化。
+
+    :param transaction: 当前 Host transaction。
+    :param candidate: 工具事实候选。
+    :returns: 无 payload ref 或 descriptor 存在时返回 ``True``。
+    """
+
+    if candidate.payload_ref is None:
+        return True
+    descriptor = read_payload_descriptor(
+        transaction,
+        candidate.payload_ref.payload_ref,
+    )
+    return descriptor is not None
 
 
 def _tool_accept_event_plan(candidate: ToolFactAcceptCandidate) -> _ToolAcceptEventPlan:

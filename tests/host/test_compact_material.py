@@ -21,6 +21,7 @@ from dayu.host.compaction import (
     CompactMaterialSection,
     CompactSegmentTrigger,
 )
+from dayu.host.evidence import OpaqueEvidenceRef
 from dayu.host.memory import (
     CONVERSATION_MEMORY_CONSUMER_ID,
     ConversationContinuityView,
@@ -294,6 +295,10 @@ def test_evidence_labels_are_prompt_local_and_map_to_canonical_evidence() -> Non
         event_sequence=3,
         text="digest checked raw evidence",
         payload_refs=("payload:evidence-map",),
+        artifact_refs=("artifact:evidence-map",),
+        source_locator_refs=(
+            OpaqueEvidenceRef(ref_kind="locator", ref_id="evidence-map", digest=None),
+        ),
     )
     selection = select_compact_segment(
         trigger_source=CompactSegmentTrigger.PROACTIVE,
@@ -319,6 +324,10 @@ def test_evidence_labels_are_prompt_local_and_map_to_canonical_evidence() -> Non
     assert evidence_map["E1"].tool_result_event_ref == "tool-result:evidence-map"
     assert evidence_map["E1"].tool_call_event_ref == "tool-call:evidence-map"
     assert evidence_map["E1"].payload_refs == ("payload:evidence-map",)
+    assert evidence_map["E1"].artifact_refs == ("artifact:evidence-map",)
+    assert evidence_map["E1"].source_locator_refs == (
+        OpaqueEvidenceRef(ref_kind="locator", ref_id="evidence-map", digest=None),
+    )
 
 
 def test_single_large_evidence_block_is_chunked_under_same_provenance() -> None:
@@ -395,6 +404,8 @@ def _evidence_block(
     event_sequence: int,
     text: str,
     payload_refs: tuple[str, ...] = ("payload:test",),
+    artifact_refs: tuple[str, ...] = (),
+    source_locator_refs: tuple[OpaqueEvidenceRef, ...] = (),
 ) -> RunInputMaterialBlock:
     """构造 evidence material block。
 
@@ -402,6 +413,8 @@ def _evidence_block(
     :param event_sequence: event sequence。
     :param text: raw evidence 文本。
     :param payload_refs: payload / artifact refs。
+    :param artifact_refs: artifact refs。
+    :param source_locator_refs: source locator refs。
     :returns: RunInputMaterialBlock。
     """
 
@@ -416,6 +429,8 @@ def _evidence_block(
         tool_result_event_ref=f"tool-result:{block_id}",
         tool_call_event_ref=f"tool-call:{block_id}",
         payload_refs=payload_refs,
+        artifact_refs=artifact_refs,
+        source_locator_refs=source_locator_refs,
         readable_tool_name="read_tool",
         readable_query_text="query",
         readable_source_text="source",

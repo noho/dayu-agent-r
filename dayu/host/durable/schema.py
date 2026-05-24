@@ -795,7 +795,9 @@ CREATE TABLE IF NOT EXISTS {TABLE_HOST_MEMORY_DIAGNOSTICS} (
       'unsupported_event_type',
       'snapshot_lag_over_threshold',
       'budget_limit_reached',
-      'empty_event_log_snapshot'
+      'empty_event_log_snapshot',
+      'evidence_backed_fact_superseded',
+      'minimum_preserve_item_covered'
     )
   ),
   event_sequence INTEGER NULL CHECK (

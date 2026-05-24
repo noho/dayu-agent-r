@@ -1172,6 +1172,8 @@ def build_accepted_tool_evidence_material_blocks(
                 tool_result_event_ref=material.tool_result_event_ref,
                 tool_call_event_ref=material.tool_call_event_ref,
                 payload_refs=material.payload_refs,
+                artifact_refs=material.artifact_refs,
+                source_locator_refs=material.source_locator_refs,
                 readable_tool_name=material.readable_tool_name,
                 readable_query_text=material.readable_query_text,
                 readable_source_text=material.readable_source_text,
@@ -1915,9 +1917,6 @@ def _memory_stable_blocks(
     goals = _memory_goal_and_constraint_message(snapshot, render_scope)
     if goals is not None:
         blocks.append(_MemoryStableBlock(block_id="stable:goals", message=goals))
-    subjects = _memory_subject_message(snapshot)
-    if subjects is not None:
-        blocks.append(_MemoryStableBlock(block_id="stable:subjects", message=subjects))
     facts = _memory_evidence_backed_fact_message(snapshot.evidence_backed_facts)
     if facts is not None:
         blocks.append(
@@ -1926,6 +1925,9 @@ def _memory_stable_blocks(
                 message=facts,
             )
         )
+    subjects = _memory_subject_message(snapshot)
+    if subjects is not None:
+        blocks.append(_MemoryStableBlock(block_id="stable:subjects", message=subjects))
     assumptions = _memory_question_and_assumption_message(snapshot)
     if assumptions is not None:
         blocks.append(

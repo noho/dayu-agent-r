@@ -798,6 +798,43 @@ class _LagRepairRunInputBuilder:
         )
 
 
+class _PersistentLagRepairRunInputBuilder:
+    """每次 build 都抛出大滞后 repair。"""
+
+    def __init__(self) -> None:
+        """初始化调用计数。
+
+        :returns: ``None``。
+        """
+
+        self.calls = 0
+
+    def build(self, snapshot: AttemptDispatchSnapshot) -> AgentRunRequest:
+        """构造测试 Engine request，始终模拟 snapshot 大滞后。
+
+        :param snapshot: dispatch snapshot。
+        :returns: 不会返回。
+        :raises MemoryProjectionRepairRequired: 始终抛出 lag repair。
+        """
+
+        self.calls += 1
+        policy = default_memory_projection_policy()
+        raise MemoryProjectionRepairRequired(
+            MemoryRepairRequest(
+                session_id=snapshot.session_id,
+                reason=MemoryRepairReason.SNAPSHOT_LAG_OVER_THRESHOLD,
+                required_event_sequence=20,
+                observed_cursor=MemorySnapshotCursor(
+                    consumer_id=CONVERSATION_MEMORY_CONSUMER_ID,
+                    checkpoint_event_sequence=0,
+                    checkpoint_event_id=None,
+                    session_id=snapshot.session_id,
+                ),
+                policy_digest=digest_memory_projection_policy(policy),
+            )
+        )
+
+
 class _SnapshotEventHandle(_FakeHandle):
     """按 dispatch snapshot 生成单个 EngineEvent 的 handle。"""
 
@@ -1328,6 +1365,72 @@ async def test_memory_lag_pre_dispatch_failure_does_not_enter_recovering(
             assert _run_status(store.transaction_runner, seeded.run_id) == (
                 RunStatus.RUNNING
             )
+        finally:
+            await scheduler.close()
+
+
+@pytest.mark.asyncio
+async def test_persistent_memory_lag_repair_failure_closes_starting_run(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """worker startup memory lag 修复失败不得遗留 running / dispatching 状态。"""
+
+    factory = _FakeWorkerFactory(accepted_handle=_ControlledBlockingHandle())
+    builder = _PersistentLagRepairRunInputBuilder()
+    with open_host_durable_store(_options(tmp_path)) as store:
+        seeded = _seed_current_run(store)
+        scheduler = await _open_scheduler(tmp_path, store, factory)
+
+        def _noop_catch_up(record: PendingDispatchRecord) -> None:
+            """跳过 catch-up 以触发 builder lag repair 分支。
+
+            :param record: pending dispatch 摘要。
+            :returns: ``None``。
+            """
+
+            del record
+
+        def _fake_builder_for_dispatch(
+            *,
+            snapshot: AttemptDispatchSnapshot,
+            policy_snapshot: PolicySnapshot,
+            selected_business_tool_names: frozenset[str] | None,
+        ) -> _PersistentLagRepairRunInputBuilder:
+            """返回持续 lag repair 的测试 builder。
+
+            :param snapshot: dispatch snapshot。
+            :param policy_snapshot: policy snapshot。
+            :param selected_business_tool_names: 业务工具名集合。
+            :returns: 测试 builder。
+            """
+
+            del snapshot, policy_snapshot, selected_business_tool_names
+            return builder
+
+        monkeypatch.setattr(
+            scheduler,
+            "_catch_up_memory_projection_before_worker",
+            _noop_catch_up,
+        )
+        monkeypatch.setattr(
+            scheduler,
+            "_run_input_builder_for_dispatch",
+            _fake_builder_for_dispatch,
+        )
+        try:
+            scheduler.wake_dispatch(_pending_dispatch(seeded))
+            result = await scheduler.drain_once()
+
+            run, attempt, dispatch_record = _read_rows(
+                store.transaction_runner, seeded
+            )
+            assert result.timed_out == 1
+            assert builder.calls == 2
+            assert factory.created == 0
+            assert run.status == RunStatus.FAILED
+            assert attempt.status == AttemptStatus.FAILED
+            assert dispatch_record.status == DispatchRecordStatus.CANCELLED
+            assert dispatch_record.cancelled_event_id is not None
         finally:
             await scheduler.close()
 

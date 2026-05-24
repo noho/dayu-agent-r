@@ -68,6 +68,8 @@ def check_compaction_candidate(
         issue_collector.add(CompactQualityIssue.CURRENT_USER_INPUT_MISSING)
     if not canonical_evidence_refs_retained:
         issue_collector.add(CompactQualityIssue.ACCEPTED_EVIDENCE_REFS_MISSING)
+    if _evidence_labels_missing_for_known_facts(request):
+        issue_collector.add(CompactQualityIssue.EVIDENCE_LABELS_MISSING)
     if _summary_pretends_evidence_backed_fact(request, candidate):
         issue_collector.add(
             CompactQualityIssue.SUMMARY_PRETENDS_EVIDENCE_BACKED_FACT
@@ -206,6 +208,19 @@ def _summary_pretends_evidence_backed_fact(
         return True
     allowed_fact_refs = set(request.evidence_backed_fact_refs)
     return not set(summary.confirmed_fact_refs).issubset(allowed_fact_refs)
+
+
+def _evidence_labels_missing_for_known_facts(request: CompactionRequest) -> bool:
+    """判断 evidence-backed fact refs 存在但 prompt-local evidence labels 缺失。
+
+    :param request: compaction 请求。
+    :returns: 需要 fail-closed 时返回 ``True``。
+    """
+
+    return (
+        len(request.evidence_backed_fact_refs) > 0
+        and len(request.material_pack.evidence_labels) == 0
+    )
 
 
 def _evidence_ids(evidence_items: tuple[PreservationEvidence, ...]) -> set[str]:

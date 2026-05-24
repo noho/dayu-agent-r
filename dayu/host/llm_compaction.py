@@ -15,7 +15,7 @@ import re
 from collections.abc import Mapping
 from json import JSONDecodeError
 from math import ceil
-from typing import cast
+from typing import Protocol, cast, runtime_checkable
 from uuid import uuid4
 
 from dayu.contracts.cancellation import CancellationToken
@@ -74,6 +74,8 @@ _ASSIGNMENT_SECRET_PATTERN = re.compile(
 )
 _SAFE_ERROR_CODE_PATTERN = re.compile(r"^[a-z][a-z0-9_-]{0,63}$")
 _COMPACTION_REQUEST_PLACEHOLDER = "<<compaction_request>>"
+_COMPACTOR_PROPOSAL_TIMEOUT_MESSAGE = "compactor proposal timed out"
+_COMPACTOR_PROPOSAL_TIMEOUT_CANCEL_REASON = "compactor_proposal_timeout"
 _POST_COMPACT_SYSTEM_PROMPT_ESTIMATE = (
     "Host post-compact run context includes compact summary, pinned state, "
     "current input, preserved refs, evidence-backed facts, and continuity items."
@@ -97,6 +99,20 @@ _MATERIAL_LABEL_SECTIONS = (
     CompactMaterialSection.EVIDENCE_INPUT,
     CompactMaterialSection.CURRENT_INPUT_ANCHOR,
 )
+
+
+@runtime_checkable
+class _CancellationSignalToken(CancellationToken, Protocol):
+    """Host 内部可写取消 token 协议。"""
+
+    def request_cancel(self, reason: str) -> None:
+        """请求取消底层 Engine runner。
+
+        :param reason: 结构化取消原因。
+        :returns: ``None``。
+        """
+
+        ...
 
 
 class LLMCompactionProposalError(RuntimeError):
@@ -200,18 +216,24 @@ class LLMContextCompactor(ContextCompactor):
 
         if not isinstance(request, CompactionRequest):
             raise TypeError("request must be CompactionRequest")
-        outcome = await _run_agent_request(
-            _agent_request(
-                request,
-                self._runner_spec,
-                self._runner_options,
-                self._agent_policy,
-                self._system_prompt,
-                self._user_prompt_template,
-                cancellation_token,
-            ),
-            timeout_seconds=self._runner_spec.default_timeout_seconds,
-        )
+        try:
+            outcome = await _run_agent_request(
+                _agent_request(
+                    request,
+                    self._runner_spec,
+                    self._runner_options,
+                    self._agent_policy,
+                    self._system_prompt,
+                    self._user_prompt_template,
+                    cancellation_token,
+                ),
+                timeout_seconds=self._runner_spec.default_timeout_seconds,
+            )
+        except TimeoutError as exc:
+            _signal_timeout_cancellation(cancellation_token)
+            raise LLMCompactionProposalError(
+                _COMPACTOR_PROPOSAL_TIMEOUT_MESSAGE
+            ) from exc
         if not isinstance(outcome, EngineRunOutcomeFinalAnswer):
             raise LLMCompactionProposalError(_non_final_outcome_message(outcome))
         if outcome.finish_reason is FinishReason.LENGTH:
@@ -274,6 +296,17 @@ async def _run_agent_request(
     """
 
     return await asyncio.wait_for(run_agent_and_wait(request), timeout=timeout_seconds)
+
+
+def _signal_timeout_cancellation(cancellation_token: CancellationToken) -> None:
+    """在 compactor timeout 时尽量通知 Host 可写取消 token。
+
+    :param cancellation_token: Host 注入 Engine 的取消 token。
+    :returns: ``None``。
+    """
+
+    if isinstance(cancellation_token, _CancellationSignalToken):
+        cancellation_token.request_cancel(_COMPACTOR_PROPOSAL_TIMEOUT_CANCEL_REASON)
 
 
 def _non_final_outcome_message(outcome: AgentRunResult) -> str:
@@ -756,11 +789,19 @@ def _range_tuple(
             (_required_string(data, "end_material_label"),),
             field_name=f"{key}[{index}].end_material_label",
         )
+        start_ref = _single_range_endpoint_ref(
+            start_refs,
+            field_name=f"{key}[{index}].start_material_label",
+        )
+        end_ref = _single_range_endpoint_ref(
+            end_refs,
+            field_name=f"{key}[{index}].end_material_label",
+        )
         ranges.append(
             CompactInputRange(
                 range_ref=_required_string(data, "range_ref"),
-                start_input_ref=start_refs[0],
-                end_input_ref=end_refs[0],
+                start_input_ref=start_ref,
+                end_input_ref=end_ref,
             )
         )
     return tuple(ranges)
@@ -793,6 +834,22 @@ def _canonical_refs_for_labels(
             raise ValueError(f"{field_name} label has no canonical source refs: {label}")
         refs.extend(entry.canonical_source_refs)
     return tuple(dict.fromkeys(refs))
+
+
+def _single_range_endpoint_ref(refs: tuple[str, ...], *, field_name: str) -> str:
+    """校验 range endpoint label 精确解析到一个 canonical source ref。
+
+    :param refs: label 解析得到的 canonical refs。
+    :param field_name: 错误字段名。
+    :returns: 唯一 canonical source ref。
+    :raises ValueError: endpoint 无 ref 或对应多个 refs 时抛出。
+    """
+
+    if len(refs) != 1:
+        raise ValueError(
+            f"{field_name} must resolve to exactly one canonical source ref"
+        )
+    return refs[0]
 
 
 def _canonical_evidence_refs_for_labels(
@@ -1124,10 +1181,18 @@ def _optional_input_range(
         (_required_string(data, "end_material_label"),),
         field_name=f"{field_name}.end_material_label",
     )
+    start_ref = _single_range_endpoint_ref(
+        start_refs,
+        field_name=f"{field_name}.start_material_label",
+    )
+    end_ref = _single_range_endpoint_ref(
+        end_refs,
+        field_name=f"{field_name}.end_material_label",
+    )
     return CompactInputRange(
         range_ref=_required_string(data, "range_ref"),
-        start_input_ref=start_refs[0],
-        end_input_ref=end_refs[0],
+        start_input_ref=start_ref,
+        end_input_ref=end_ref,
     )
 
 
