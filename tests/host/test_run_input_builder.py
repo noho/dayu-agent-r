@@ -88,7 +88,12 @@ from dayu.host.durable.state import (
 )
 from dayu.host.durable.errors import HostDurableError
 from dayu.host.durable.transaction import HostRow, HostTransaction, HostTransactionRunner
-from dayu.host.compaction import EvidenceBackedFactKind, MinimumPreserveReason
+from dayu.host.compaction import (
+    CompactMaterialBlockKind,
+    CompactMaterialSection,
+    EvidenceBackedFactKind,
+    MinimumPreserveReason,
+)
 from dayu.host.memory_repair import catch_up_conversation_memory_projection
 from dayu.host.run_input import (
     DurableCurrentRunFactProvider,
@@ -601,6 +606,32 @@ def test_noop_memory_snapshot_provider_returns_empty_typed_view(
         assert view.memory_snapshot_cursor is None
         assert view.policy_digest is None
         assert view.diagnostics == ()
+
+
+def test_run_input_builder_exposes_shared_material_block_source(
+    tmp_path: Path,
+) -> None:
+    """RunInputBuilder 暴露与 compact builder 共用的 ordinary material view。"""
+
+    with open_host_durable_store(_options(tmp_path)) as store:
+        session_id = _ensure_session_id(store.transaction_runner)
+        seeded = _seed_current_run(
+            store,
+            session_id=session_id,
+            payload=_user_input_payload("current prompt"),
+        )
+        builder = create_no_tool_run_input_builder(
+            transaction_runner=store.transaction_runner,
+            policy_snapshot=_policy_snapshot(),
+        )
+
+        blocks = builder.build_material_blocks(_attempt_snapshot(seeded))
+
+        assert len(blocks) == 1
+        assert blocks[0].section is CompactMaterialSection.CURRENT_INPUT_ANCHOR
+        assert blocks[0].kind is CompactMaterialBlockKind.CURRENT_INPUT_ANCHOR
+        assert blocks[0].text == "current prompt"
+        assert blocks[0].canonical_source_refs == ("event-current-input",)
 
 
 def test_covered_memory_snapshot_filters_current_user_input(

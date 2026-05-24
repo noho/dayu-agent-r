@@ -43,6 +43,14 @@ from dayu.host._event_payload import (
 from dayu.host.api import AttemptDispatchSnapshot
 from dayu.host.api import AttemptStatus, RunStatus
 from dayu.host.context_events import CONTEXT_COMPACTED
+from dayu.host.compact_material import (
+    RunInputMaterialBlock,
+    run_input_material_block,
+)
+from dayu.host.compaction import (
+    CompactMaterialBlockKind,
+    CompactMaterialSection,
+)
 from dayu.host.durable.event_log import (
     EventClass,
     EventLogRow,
@@ -120,6 +128,16 @@ _PAYLOAD_FIELD_OPEN_QUESTIONS = "open_questions"
 _PAYLOAD_FIELD_USER_CONSTRAINTS = "user_constraints"
 _NO_TOOL_CANCEL_MESSAGE = "tools are disabled for this attempt"
 _COMPACT_SUMMARY_MAX_CHARS = 1200
+_MEMORY_USER_GOALS_HEADER = "Memory user goals and constraints:"
+_MEMORY_CONFIRMED_SUBJECTS_HEADER = (
+    "Memory confirmed subjects and methodology:"
+)
+_MEMORY_EVIDENCE_BACKED_FACTS_HEADER = "Memory evidence-backed facts:"
+_MEMORY_QUESTIONS_AND_ASSUMPTIONS_HEADER = (
+    "Memory open questions and working assumptions:"
+)
+_MEMORY_MINIMUM_PRESERVE_HEADER = "Memory minimum preserve continuity:"
+_MEMORY_EPISODE_SUMMARIES_HEADER = "Memory episode summaries:"
 _MEMORY_EVENT_TYPES = frozenset(
     (
         _EVENT_TYPE_USER_INPUT_ACCEPTED,
@@ -1353,6 +1371,39 @@ class RunInputBuilder:
             cancellation_token=attempt_snapshot.cancellation_token,
         )
 
+    def build_material_blocks(
+        self, attempt_snapshot: AttemptDispatchSnapshot
+    ) -> tuple[RunInputMaterialBlock, ...]:
+        """构造与 ordinary Run input 同源的 compact material block view。
+
+        本方法是 Host internal helper，供 Context Governance / compact builder
+        复用 RunInputBuilder 的普通输入 material source；它不改变
+        ``AgentRunRequest`` public shape。
+
+        :param attempt_snapshot: Attempt dispatch snapshot。
+        :returns: ordinary input material blocks。
+        :raises HostDurableError: durable facts 缺失或 provider 读取失败时抛出。
+        """
+
+        current_facts = self._current_run_provider.load_current_run_facts(
+            attempt_snapshot
+        )
+        continuity = self._session_continuity_provider.load_session_continuity(
+            attempt_snapshot, current_facts
+        )
+        memory = self._memory_snapshot_provider.load_memory_snapshot(
+            attempt_snapshot, current_facts
+        )
+        compact = self._compact_artifact_provider.load_compact_artifact(
+            attempt_snapshot, current_facts
+        )
+        return build_run_input_material_blocks(
+            current_facts=current_facts,
+            memory=memory,
+            compact=compact,
+            continuity=continuity,
+        )
+
 
 def create_no_tool_run_input_builder(
     *,
@@ -1685,7 +1736,7 @@ def _memory_goal_and_constraint_message(
     :returns: system message；无内容时返回 ``None``。
     """
 
-    lines: list[str] = ["Memory user goals and constraints:"]
+    lines: list[str] = [_MEMORY_USER_GOALS_HEADER]
     if (
         snapshot.pinned_state.current_goal is not None
         and snapshot.pinned_state.current_goal != render_scope.user_prompt
@@ -1714,7 +1765,7 @@ def _memory_subject_message(
 
     if not snapshot.pinned_state.confirmed_subjects:
         return None
-    lines = ["Memory confirmed subjects and methodology:"]
+    lines = [_MEMORY_CONFIRMED_SUBJECTS_HEADER]
     for ref in snapshot.pinned_state.confirmed_subjects:
         lines.append(f"confirmed_subject={_opaque_ref_text(ref)}")
     return SystemMessage(
@@ -1734,7 +1785,7 @@ def _memory_evidence_backed_fact_message(
 
     if not facts:
         return None
-    lines = ["Memory evidence-backed facts:"]
+    lines = [_MEMORY_EVIDENCE_BACKED_FACTS_HEADER]
     for fact in facts:
         lines.append(
             "fact="
@@ -1760,7 +1811,7 @@ def _memory_question_and_assumption_message(
     :returns: system message；无内容时返回 ``None``。
     """
 
-    lines: list[str] = ["Memory open questions and working assumptions:"]
+    lines: list[str] = [_MEMORY_QUESTIONS_AND_ASSUMPTIONS_HEADER]
     for question in snapshot.pinned_state.open_questions:
         lines.append(f"open_question={question}")
     for assumption in snapshot.working_assumptions:
@@ -1835,7 +1886,7 @@ def _memory_minimum_preserve_message(
     )
     if not preserve_items:
         return None
-    lines = ["Memory minimum preserve continuity:"]
+    lines = [_MEMORY_MINIMUM_PRESERVE_HEADER]
     for item in preserve_items:
         lines.append(
             "continuity_item="
@@ -1869,7 +1920,7 @@ def _memory_episode_summary_message(
     )
     if not episode_items:
         return None
-    lines = ["Memory episode summaries:"]
+    lines = [_MEMORY_EPISODE_SUMMARIES_HEADER]
     for item in episode_items:
         lines.append(f"episode_summary={_continuity_item_text(item)}")
     return SystemMessage(
@@ -1919,6 +1970,167 @@ def _is_current_run_user_input_memory_item(
     if item.event_id == render_scope.user_input_event_id:
         return True
     return False
+
+
+def build_run_input_material_blocks(
+    *,
+    current_facts: CurrentRunFacts,
+    memory: MemorySnapshotView,
+    compact: CompactArtifactView,
+    continuity: SessionContinuityView,
+) -> tuple[RunInputMaterialBlock, ...]:
+    """构造 ordinary Run input 的共享 material block list。
+
+    :param current_facts: 当前 Run durable facts。
+    :param memory: memory snapshot provider view。
+    :param compact: compact artifact provider view。
+    :param continuity: session continuity provider view。
+    :returns: RunInputBuilder 与 compact builder 共用的 material blocks。
+    """
+
+    blocks: list[RunInputMaterialBlock] = []
+    for index, message in enumerate(memory.messages):
+        content = _run_input_message_content(message)
+        blocks.append(
+            run_input_material_block(
+                block_id=f"memory:{index}",
+                section=_material_section_for_message(message),
+                kind=_memory_material_kind(message),
+                text=content,
+                canonical_source_refs=(_memory_material_source_ref(memory),),
+                event_sequence=None,
+                event_sub_index=index,
+            )
+        )
+    compact_source_ref = _compact_material_source_ref(compact)
+    for index, message in enumerate(compact.messages):
+        blocks.append(
+            run_input_material_block(
+                block_id=f"compact:{index}",
+                section=CompactMaterialSection.HISTORY_INPUT,
+                kind=CompactMaterialBlockKind.EPISODE_SUMMARY,
+                text=_run_input_message_content(message),
+                canonical_source_refs=(compact_source_ref,),
+                event_sequence=None,
+                event_sub_index=index,
+                already_represented=True,
+            )
+        )
+    for index, message in enumerate(continuity.messages):
+        blocks.append(
+            run_input_material_block(
+                block_id=f"continuity:{index}",
+                section=CompactMaterialSection.HISTORY_INPUT,
+                kind=_history_material_kind(message),
+                text=_run_input_message_content(message),
+                canonical_source_refs=(f"message:continuity:{index}",),
+                event_sequence=None,
+                event_sub_index=index,
+            )
+        )
+    blocks.append(
+        run_input_material_block(
+            block_id=f"current:{current_facts.user_input_event.event_id}",
+            section=CompactMaterialSection.CURRENT_INPUT_ANCHOR,
+            kind=CompactMaterialBlockKind.CURRENT_INPUT_ANCHOR,
+            text=current_facts.user_prompt,
+            canonical_source_refs=(current_facts.user_input_event.event_id,),
+            event_sequence=current_facts.user_input_event.event_sequence,
+        )
+    )
+    return tuple(blocks)
+
+
+def _run_input_message_content(message: AgentMessage) -> str:
+    """读取 AgentMessage 文本内容。
+
+    :param message: Agent message。
+    :returns: message content。
+    :raises TypeError: message 类型非法时抛出。
+    """
+
+    if isinstance(message, SystemMessage):
+        return message.content
+    if isinstance(message, UserMessage):
+        return message.content
+    if isinstance(message, AssistantMessage):
+        if message.content is None:
+            raise TypeError("assistant material message content must be non-empty")
+        return message.content
+    raise TypeError("unsupported AgentMessage type for material block")
+
+
+def _material_section_for_message(message: AgentMessage) -> CompactMaterialSection:
+    """根据 message role 判断 material section。
+
+    :param message: Agent message。
+    :returns: material section。
+    """
+
+    if isinstance(message, SystemMessage):
+        return CompactMaterialSection.STABLE_INPUT
+    return CompactMaterialSection.HISTORY_INPUT
+
+
+def _memory_material_kind(message: AgentMessage) -> CompactMaterialBlockKind:
+    """根据 memory message 内容选择 material kind。
+
+    :param message: memory message。
+    :returns: material block kind。
+    """
+
+    content = _run_input_message_content(message)
+    if content.startswith(_MEMORY_EVIDENCE_BACKED_FACTS_HEADER):
+        return CompactMaterialBlockKind.EVIDENCE_BACKED_FACT
+    if content.startswith(_MEMORY_QUESTIONS_AND_ASSUMPTIONS_HEADER):
+        return CompactMaterialBlockKind.WORKING_ASSUMPTION
+    if content.startswith(_MEMORY_EPISODE_SUMMARIES_HEADER):
+        return CompactMaterialBlockKind.EPISODE_SUMMARY
+    if isinstance(message, UserMessage):
+        return CompactMaterialBlockKind.RAW_USER_TURN
+    if isinstance(message, AssistantMessage):
+        return CompactMaterialBlockKind.RAW_ASSISTANT_TURN
+    return CompactMaterialBlockKind.PINNED_STATE
+
+
+def _history_material_kind(message: AgentMessage) -> CompactMaterialBlockKind:
+    """根据 continuity message role 选择 history material kind。
+
+    :param message: continuity message。
+    :returns: material block kind。
+    """
+
+    if isinstance(message, UserMessage):
+        return CompactMaterialBlockKind.RAW_USER_TURN
+    if isinstance(message, AssistantMessage):
+        return CompactMaterialBlockKind.RAW_ASSISTANT_TURN
+    return CompactMaterialBlockKind.EPISODE_SUMMARY
+
+
+def _memory_material_source_ref(memory: MemorySnapshotView) -> str:
+    """返回 memory material canonical source ref。
+
+    :param memory: memory snapshot view。
+    :returns: source ref。
+    """
+
+    if memory.memory_snapshot_cursor is not None:
+        return f"memory:{memory.memory_snapshot_cursor}"
+    return "memory:no-snapshot"
+
+
+def _compact_material_source_ref(compact: CompactArtifactView) -> str:
+    """返回 compact artifact material canonical source ref。
+
+    :param compact: compact artifact view。
+    :returns: source ref。
+    """
+
+    if compact.compact_artifact_ref is not None:
+        return f"compact:{compact.compact_artifact_ref}"
+    if compact.compact_artifact_digest is not None:
+        return f"compact:{compact.compact_artifact_digest}"
+    return "compact:no-artifact"
 
 
 def _opaque_ref_text(ref: OpaqueMemoryRef) -> str:
@@ -2562,6 +2774,7 @@ __all__ = [
     "ToolRuntimeSchemaSnapshotProvider",
     "ToolSchemaSnapshot",
     "ToolSchemaSnapshotProvider",
+    "build_run_input_material_blocks",
     "create_no_tool_run_input_builder",
     "create_tool_enabled_run_input_builder",
 ]

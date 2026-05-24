@@ -585,6 +585,7 @@ class CompactSegmentSelection:
     :param memory_snapshot_cursor: memory snapshot cursor。
     :param policy_digest: policy digest。
     :param deterministic_reason_codes: deterministic reason codes。
+    :param excluded_reason_codes: 被排除 block id 到 reason code 的映射。
     :param selection_digest: selection canonical digest。
     """
 
@@ -596,6 +597,7 @@ class CompactSegmentSelection:
     policy_digest: str
     deterministic_reason_codes: tuple[str, ...]
     selection_digest: str
+    excluded_reason_codes: Mapping[str, str] = field(default_factory=dict)
 
     def __post_init__(self) -> None:
         """校验 segment selection。
@@ -630,6 +632,10 @@ class CompactSegmentSelection:
             self.deterministic_reason_codes,
             field_name="CompactSegmentSelection.deterministic_reason_codes",
         )
+        _require_string_mapping(
+            self.excluded_reason_codes,
+            field_name="CompactSegmentSelection.excluded_reason_codes",
+        )
         _require_non_empty(
             self.selection_digest,
             field_name="CompactSegmentSelection.selection_digest",
@@ -650,6 +656,9 @@ class CompactSegmentSelection:
             "policy_digest": self.policy_digest,
             "deterministic_reason_codes": _string_list_json(
                 self.deterministic_reason_codes
+            ),
+            "excluded_reason_codes": _string_mapping_json(
+                self.excluded_reason_codes
             ),
             "selection_digest": self.selection_digest,
         }
@@ -1802,6 +1811,29 @@ def _require_string_tuple(value: tuple[str, ...], *, field_name: str) -> None:
         _require_non_empty(item, field_name=field_name)
 
 
+def _require_string_mapping(
+    value: Mapping[str, str], *, field_name: str
+) -> None:
+    """校验字符串到字符串的只读 mapping。
+
+    :param value: 待校验 mapping。
+    :param field_name: 错误字段名。
+    :returns: ``None``。
+    :raises TypeError: 字段、key 或 value 类型非法时抛出。
+    :raises ValueError: key 或 value 为空时抛出。
+    """
+
+    if not isinstance(value, Mapping):
+        raise TypeError(f"{field_name} must be mapping")
+    for key, item in value.items():
+        if not isinstance(key, str):
+            raise TypeError(f"{field_name} keys must be str")
+        if not isinstance(item, str):
+            raise TypeError(f"{field_name} values must be str")
+        _require_non_empty(key, field_name=field_name)
+        _require_non_empty(item, field_name=field_name)
+
+
 def _require_unique_string_tuple(
     value: tuple[str, ...], *, field_name: str
 ) -> None:
@@ -2126,6 +2158,19 @@ def _string_list_json(values: tuple[str, ...]) -> list[JsonValue]:
     result: list[JsonValue] = []
     for value in values:
         result.append(value)
+    return result
+
+
+def _string_mapping_json(values: Mapping[str, str]) -> JsonValue:
+    """把字符串 mapping 转换为按 key 排序的 JSON object。
+
+    :param values: 字符串 mapping。
+    :returns: JSON object。
+    """
+
+    result: dict[str, JsonValue] = {}
+    for key in sorted(values):
+        result[key] = values[key]
     return result
 
 
