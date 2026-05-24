@@ -601,6 +601,35 @@ def _user_provenance() -> MemoryProvenanceRef:
     )
 
 
+def _working_assumption(
+    *,
+    item_id: str,
+    assumption_summary: str,
+    event_sequence: int,
+) -> WorkingAssumptionView:
+    """构造测试用 working assumption view。
+
+    :param item_id: memory item id。
+    :param assumption_summary: assumption 摘要。
+    :param event_sequence: 来源 EventLog sequence。
+    :returns: working assumption view。
+    """
+
+    return WorkingAssumptionView(
+        item_id=item_id,
+        assumption_summary=assumption_summary,
+        claim_status=MemoryClaimStatus.ASSUMPTION,
+        producer_kind=MemoryProducerKind.ASSISTANT,
+        event_id=f"event-assumption-{event_sequence}",
+        event_sequence=event_sequence,
+        run_id=f"run-assumption-{event_sequence}",
+        subject_refs=(),
+        included_reason=MemoryIncludedReason.WORKING_ASSUMPTION,
+        excluded_reason=None,
+        size_units=MemorySizeUnits(units=1),
+    )
+
+
 class _WriteSnapshotOperation:
     """写入 snapshot 的 transaction operation。
 
@@ -987,13 +1016,130 @@ def test_pinned_state_open_questions_are_not_duplicated() -> None:
     assert "open_questions" not in {
         field.name for field in fields(WorkingAssumptionView)
     }
-    with pytest.raises(ValueError):
-        PinnedStateView(
-            current_goal=None,
-            confirmed_subjects=(),
-            user_constraints=(),
-            open_questions=("question", "question"),
-        )
+
+    normalized_duplicate = PinnedStateView(
+        current_goal=None,
+        confirmed_subjects=(),
+        user_constraints=(),
+        open_questions=("Question", "  question  "),
+    )
+    assert normalized_duplicate.open_questions == ("  question  ",)
+
+
+def test_working_assumptions_deduplicate_normalized_summary_before_limit() -> None:
+    """Working assumptions 先按 normalized summary 去重，再进入预算裁剪。"""
+
+    policy = replace(_policy(), max_working_assumptions=2)
+    policy_digest = digest_memory_projection_policy(policy)
+    base = build_empty_conversation_memory_snapshot(
+        snapshot_id="memory-snapshot-working-assumptions",
+        session_id=_SESSION_ID,
+        consumer_id=_CONSUMER_ID,
+        policy_digest=policy_digest,
+        built_at=_NOW,
+    )
+    previous = replace(
+        base,
+        cursor=MemorySnapshotCursor(
+            consumer_id=_CONSUMER_ID,
+            checkpoint_event_sequence=3,
+            checkpoint_event_id="event-assumption-3",
+            session_id=_SESSION_ID,
+        ),
+        working_assumptions=(
+            _working_assumption(
+                item_id="assumption-cash",
+                assumption_summary="cash runway needs verification",
+                event_sequence=1,
+            ),
+            _working_assumption(
+                item_id="assumption-margin-old",
+                assumption_summary="Verify margin bridge",
+                event_sequence=2,
+            ),
+            _working_assumption(
+                item_id="assumption-margin-new",
+                assumption_summary="  verify   MARGIN bridge  ",
+                event_sequence=3,
+            ),
+        ),
+    )
+
+    snapshot = project_conversation_memory_event(
+        previous_snapshot=previous,
+        event=_memory_event(
+            event_sequence=4,
+            event_id="event-user-after-assumptions",
+            event_type="USER_INPUT_ACCEPTED",
+            payload={"display_text": "continue analysis"},
+            attempt_id=None,
+            execution_id=None,
+        ),
+        policy=policy,
+        built_at=_NOW,
+        consumer_id=_CONSUMER_ID,
+    )
+
+    assert tuple(
+        (item.item_id, item.assumption_summary)
+        for item in snapshot.working_assumptions
+    ) == (
+        ("assumption-cash", "cash runway needs verification"),
+        ("assumption-margin-new", "  verify   MARGIN bridge  "),
+    )
+
+
+def test_open_questions_deduplicate_normalized_text_before_pinned_limit() -> None:
+    """Open questions 先按 normalized text 去重，再进入 pinned 数量裁剪。"""
+
+    snapshot = _build_snapshot(
+        (
+            _memory_event(
+                event_sequence=1,
+                event_id="event-compact-open-question-dedup",
+                event_type="CONTEXT_COMPACTED",
+                payload=_compact_payload(
+                    summary_text="open question dedup summary",
+                    pinned_patch={
+                        "candidate_id": "patch-open-question-dedup",
+                        "current_goal": {
+                            "operation": "missing",
+                            "value": None,
+                            "evidence_refs": [],
+                        },
+                        "confirmed_subjects": {
+                            "operation": "missing",
+                            "value": None,
+                            "evidence_refs": [],
+                        },
+                        "user_constraints": {
+                            "operation": "missing",
+                            "value": None,
+                            "evidence_refs": [],
+                        },
+                        "open_questions": {
+                            "operation": "replace",
+                            "value": [
+                                "what are the covenants?",
+                                "Verify margin bridge",
+                                "  verify   MARGIN bridge  ",
+                            ],
+                            "evidence_refs": ["evidence-1"],
+                        },
+                    },
+                ),
+                run_id="run-compact",
+                attempt_id=None,
+                execution_id=None,
+            ),
+        ),
+        policy=replace(_policy(), max_pinned_items=2),
+    )
+
+    assert snapshot.pinned_state.open_questions == (
+        "what are the covenants?",
+        "  verify   MARGIN bridge  ",
+    )
 
 
 def test_host_neutral_ref_kind_rejects_business_specific_kind() -> None:

@@ -1,9 +1,10 @@
 """Compaction request material 输入读取 helper。
 
-本模块只负责从 bounded EventLog range 中读取 Host-neutral evidence /
-history material 与已存在 evidence-backed fact refs，供 proactive dispatch
-与 reactive engine ingest 构造同语义 ``CompactionRequest``。它不解析财报
-source / locator 语义，不写 EventLog，不更新 memory。
+本模块只负责按 compact material selection 中的 canonical refs 读取
+Host-neutral evidence / history material 与已存在 evidence-backed fact refs，
+供 proactive dispatch 与 reactive engine ingest 构造同语义
+``CompactionRequest``。它不解析财报 source / locator 语义，不写 EventLog，
+不更新 memory。
 """
 
 from __future__ import annotations
@@ -74,9 +75,9 @@ class SelectedEvidenceBlockRef:
 class CompactionRequestEvidenceInputs:
     """Compaction request 的 material 输入视图。
 
-    :param history_materials: compact input range 内 history material。
-    :param evidence_materials: compact input range 内 evidence material。
-    :param evidence_backed_fact_refs: compact input range 内既有 stable fact refs。
+    :param history_materials: selected history material。
+    :param evidence_materials: selected evidence material。
+    :param evidence_backed_fact_refs: selected 既有 stable fact refs。
     """
 
     history_materials: tuple[InitialHistoryMaterial, ...]
@@ -146,62 +147,6 @@ def collect_selected_compaction_request_evidence_inputs(
         history_materials=tuple(history_materials),
         evidence_materials=_deduplicate_evidence_materials(evidence_materials),
         evidence_backed_fact_refs=_deduplicate_texts(fact_refs),
-    )
-
-
-def collect_compaction_request_evidence_inputs(
-    transaction: HostTransaction,
-    event_log_store: EventLogStore,
-    *,
-    session_id: str,
-    start_event_sequence: int,
-    end_event_sequence: int,
-) -> CompactionRequestEvidenceInputs:
-    """从 bounded EventLog range 构造 compaction material 输入。
-
-    :param transaction: 当前 Host transaction。
-    :param event_log_store: EventLog store。
-    :param session_id: 目标 Session id。
-    :param start_event_sequence: compact input 起始 event sequence，闭区间。
-    :param end_event_sequence: compact input 结束 event sequence，闭区间。
-    :returns: compaction request material 输入。
-    :raises HostDurableError: range 非法或 payload 结构损坏时抛出。
-    """
-
-    if start_event_sequence <= 0:
-        raise HostDurableError("compact input start_event_sequence must be positive")
-    if end_event_sequence < start_event_sequence:
-        raise HostDurableError("compact input event range is invalid")
-    rows = event_log_store.read_events_after(
-        transaction,
-        start_event_sequence - 1,
-        limit=end_event_sequence - start_event_sequence + 1,
-    )
-    history_materials: list[InitialHistoryMaterial] = []
-    evidence_materials: list[InitialEvidenceMaterial] = []
-    evidence_backed_fact_refs: list[str] = []
-    for row in rows:
-        if row.event_sequence > end_event_sequence:
-            break
-        if row.session_id != session_id:
-            continue
-        if row.event_class is not EventClass.CANONICAL_FACT:
-            continue
-        if row.event_type == _EVENT_TYPE_TOOL_RESULT_ACCEPTED:
-            envelopes = _accepted_evidence_envelope_from_event(transaction, row)
-            evidence_materials.extend(
-                _tool_result_evidence_materials(transaction, row, envelopes)
-            )
-        elif row.event_type == CONTEXT_COMPACTED:
-            evidence_backed_fact_refs.extend(
-                _evidence_backed_fact_refs_from_compacted_event(transaction, row)
-            )
-        elif row.event_type == _EVENT_TYPE_RUN_SUCCEEDED:
-            history_materials.extend(_assistant_history_materials(transaction, row))
-    return CompactionRequestEvidenceInputs(
-        history_materials=tuple(history_materials),
-        evidence_materials=_deduplicate_evidence_materials(evidence_materials),
-        evidence_backed_fact_refs=_deduplicate_texts(evidence_backed_fact_refs),
     )
 
 
@@ -579,6 +524,5 @@ def _require_non_empty_text(value: str, field_name: str) -> None:
 __all__ = [
     "CompactionRequestEvidenceInputs",
     "SelectedEvidenceBlockRef",
-    "collect_compaction_request_evidence_inputs",
     "collect_selected_compaction_request_evidence_inputs",
 ]

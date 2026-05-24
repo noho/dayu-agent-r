@@ -380,8 +380,11 @@ class PinnedStateView:
         _require_optional_non_empty(self.current_goal, "current_goal")
         _require_non_empty_items(self.user_constraints, "user_constraints")
         _require_non_empty_items(self.open_questions, "open_questions")
-        if len(frozenset(self.open_questions)) != len(self.open_questions):
-            raise ValueError("open_questions must not contain duplicates")
+        object.__setattr__(
+            self,
+            "open_questions",
+            _dedupe_text_tuple_by_normalized_text(self.open_questions),
+        )
 
 
 @dataclass(frozen=True, slots=True)
@@ -2365,13 +2368,18 @@ def _limit_working_assumptions(
     :returns: 限制后的 assumptions 与 budget diagnostics。
     """
 
-    if len(items) <= policy.max_working_assumptions:
-        return items, ()
-    kept = items[-policy.max_working_assumptions :]
+    deduped_items = _dedupe_working_assumptions_by_normalized_summary(items)
+    if len(deduped_items) <= policy.max_working_assumptions:
+        return deduped_items, ()
+    kept = deduped_items[-policy.max_working_assumptions :]
+    kept_ids = frozenset(item.item_id for item in kept)
+    first_dropped = next(
+        item for item in deduped_items if item.item_id not in kept_ids
+    )
     return kept, (
         _budget_diagnostic(
-            event_sequence=items[0].event_sequence,
-            item_id=items[0].item_id,
+            event_sequence=first_dropped.event_sequence,
+            item_id=first_dropped.item_id,
             policy_digest=policy_digest,
             message="working assumptions limited by memory policy",
         ),
@@ -2593,6 +2601,64 @@ def _normalized_text(text: str) -> str:
     """
 
     return " ".join(text.casefold().split())
+
+
+def _dedupe_text_tuple_by_normalized_text(
+    values: tuple[str, ...]
+) -> tuple[str, ...]:
+    """按 normalized text 去重文本 tuple，并保留较新的原始文本。
+
+    :param values: 原始文本 tuple；越靠后的元素视为越新。
+    :returns: 去重后的文本 tuple，保持被保留元素的原始相对顺序。
+    """
+
+    seen: set[str] = set()
+    kept_reversed: list[str] = []
+    for value in reversed(values):
+        normalized = _normalized_text(value)
+        if normalized in seen:
+            continue
+        seen.add(normalized)
+        kept_reversed.append(value)
+    return tuple(reversed(kept_reversed))
+
+
+def _dedupe_working_assumptions_by_normalized_summary(
+    items: tuple[WorkingAssumptionView, ...]
+) -> tuple[WorkingAssumptionView, ...]:
+    """按 normalized assumption summary 去重 working assumptions。
+
+    :param items: 原始 working assumption views。
+    :returns: 去重后的 assumptions；同一 normalized summary 保留 EventLog
+        sequence 更新的 view，并按 committed EventLog 顺序稳定输出。
+    """
+
+    selected_by_summary: dict[str, WorkingAssumptionView] = {}
+    for item in items:
+        normalized = _normalized_text(item.assumption_summary)
+        existing = selected_by_summary.get(normalized)
+        if existing is None or _working_assumption_dedupe_key(
+            item
+        ) > _working_assumption_dedupe_key(existing):
+            selected_by_summary[normalized] = item
+    return tuple(
+        sorted(
+            selected_by_summary.values(),
+            key=lambda item: (item.event_sequence, item.item_id),
+        )
+    )
+
+
+def _working_assumption_dedupe_key(
+    item: WorkingAssumptionView,
+) -> tuple[int, str]:
+    """生成 working assumption normalized 去重优先级。
+
+    :param item: working assumption view。
+    :returns: Python 可比较的优先级；较大值代表更新、更适合保留。
+    """
+
+    return (item.event_sequence, item.item_id)
 
 
 def _text_tokens(text: str) -> frozenset[str]:

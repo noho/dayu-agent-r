@@ -31,7 +31,6 @@ from dayu.host.compaction import (
 )
 from dayu.host.compaction_evidence import (
     SelectedEvidenceBlockRef,
-    collect_compaction_request_evidence_inputs,
     collect_selected_compaction_request_evidence_inputs,
 )
 from dayu.host.compaction_operation import run_compaction_operation
@@ -633,21 +632,21 @@ async def test_reactive_passes_share_operation_attempt_budget() -> None:
     assert result.failure_reason == "max_compaction_attempts_exhausted"
 
 
-def test_compaction_request_evidence_inputs_are_bounded_for_proactive_and_reactive(
+def test_selected_compaction_request_evidence_inputs_read_only_selected_refs(
     tmp_path: Path,
 ) -> None:
-    """共享 helper 只读取 compact input range 内证据与 raw 内容。"""
+    """selected helper 只读取 selection 指定的证据与 raw 内容。"""
 
     session_id = "session-evidence-range"
     outside_session_id = "session-outside"
     with open_host_durable_store(_options(tmp_path)) as store:
         event_log = EventLogStore()
 
-        def append_rows(transaction: HostTransaction) -> int:
+        def append_rows(transaction: HostTransaction) -> None:
             """追加测试 EventLog rows。
 
             :param transaction: Host transaction。
-            :returns: compact input range 结束 event sequence。
+            :returns: ``None``。
             """
 
             inside_event_id = "event-tool-result-inside"
@@ -669,7 +668,7 @@ def test_compaction_request_evidence_inputs_are_bounded_for_proactive_and_reacti
                     },
                 ),
             )
-            end_row = event_log.append_event(
+            event_log.append_event(
                 transaction,
                 _event_request(
                     event_id="event-current-input",
@@ -677,7 +676,7 @@ def test_compaction_request_evidence_inputs_are_bounded_for_proactive_and_reacti
                     event_type="USER_INPUT_ACCEPTED",
                     payload={"display_text": "current input"},
                 ),
-            ).row
+            )
             outside_event_id = "event-tool-result-after-range"
             event_log.append_event(
                 transaction,
@@ -716,9 +715,8 @@ def test_compaction_request_evidence_inputs_are_bounded_for_proactive_and_reacti
                     },
                 ),
             )
-            return end_row.event_sequence
 
-        end_event_sequence = store.transaction_runner.run_write(append_rows)
+        store.transaction_runner.run_write(append_rows)
 
         def read_inputs(
             transaction: HostTransaction,
@@ -729,12 +727,16 @@ def test_compaction_request_evidence_inputs_are_bounded_for_proactive_and_reacti
             :returns: evidence id tuple 与 raw context 摘要。
             """
 
-            inputs = collect_compaction_request_evidence_inputs(
+            inputs = collect_selected_compaction_request_evidence_inputs(
                 transaction,
                 event_log,
                 session_id=session_id,
-                start_event_sequence=1,
-                end_event_sequence=end_event_sequence,
+                selected_evidence_block_refs=(
+                    SelectedEvidenceBlockRef(
+                        block_id="selected-evidence-inside",
+                        tool_result_event_ref="event-tool-result-inside",
+                    ),
+                ),
             )
             return (
                 tuple(
@@ -967,54 +969,30 @@ def test_no_result_preview_field_is_read_or_rendered(tmp_path: Path) -> None:
             )
 
 
-def test_compaction_request_evidence_inputs_allow_empty_when_range_has_no_envelope(
+def test_selected_compaction_request_evidence_inputs_allow_empty_without_envelope(
     tmp_path: Path,
 ) -> None:
-    """range 内没有 accepted_evidence_envelope 时允许显式空 evidence 输入。"""
+    """selected TOOL_RESULT_ACCEPTED 无 envelope 时允许显式空 evidence 输入。"""
 
     session_id = "session-no-evidence"
+    event_id = "event-tool-result-without-envelope"
     with open_host_durable_store(_options(tmp_path)) as store:
         event_log = EventLogStore()
+        _append_event_and_return_sequence(
+            store,
+            event_log,
+            event_id=event_id,
+            session_id=session_id,
+            event_type="TOOL_RESULT_ACCEPTED",
+            payload={"tool_name": "legacy-free"},
+        )
 
-        def append_rows(transaction: HostTransaction) -> int:
-            """追加无 envelope 的 accepted tool result。
-
-            :param transaction: Host transaction。
-            :returns: range 结束 event sequence。
-            """
-
-            return event_log.append_event(
-                transaction,
-                _event_request(
-                    event_id="event-tool-result-without-envelope",
-                    session_id=session_id,
-                    event_type="TOOL_RESULT_ACCEPTED",
-                    payload={"tool_name": "legacy-free"},
-                ),
-            ).row.event_sequence
-
-        end_event_sequence = store.transaction_runner.run_write(append_rows)
-
-        def read_inputs(transaction: HostTransaction) -> tuple[str, ...]:
-            """读取 helper 输出的 evidence ids。
-
-            :param transaction: Host transaction。
-            :returns: evidence id tuple。
-            """
-
-            inputs = collect_compaction_request_evidence_inputs(
-                transaction,
-                event_log,
-                session_id=session_id,
-                start_event_sequence=1,
-                end_event_sequence=end_event_sequence,
-            )
-            return tuple(
-                material.accepted_evidence_id
-                for material in inputs.evidence_materials
-            )
-
-        assert store.transaction_runner.run_read(read_inputs) == ()
+        assert _collect_selected_evidence_ids(
+            store,
+            event_log,
+            session_id=session_id,
+            event_id=event_id,
+        ) == ()
 
 
 def test_compaction_request_evidence_inputs_reject_malformed_envelope(
@@ -1025,21 +1003,22 @@ def test_compaction_request_evidence_inputs_reject_malformed_envelope(
     session_id = "session-malformed-envelope"
     with open_host_durable_store(_options(tmp_path)) as store:
         event_log = EventLogStore()
-        end_event_sequence = _append_event_and_return_sequence(
+        event_id = "event-tool-result-malformed-envelope"
+        _append_event_and_return_sequence(
             store,
             event_log,
-            event_id="event-tool-result-malformed-envelope",
+            event_id=event_id,
             session_id=session_id,
             event_type="TOOL_RESULT_ACCEPTED",
             payload={"accepted_evidence_envelope": {"evidence_id": "evidence:bad"}},
         )
 
         with pytest.raises(HostDurableError, match="canonical evidence envelope"):
-            _collect_evidence_ids(
+            _collect_selected_evidence_ids(
                 store,
                 event_log,
                 session_id=session_id,
-                end_event_sequence=end_event_sequence,
+                event_id=event_id,
             )
 
 
@@ -1052,7 +1031,7 @@ def test_compaction_request_evidence_inputs_reject_missing_raw_tool_outcome(
     with open_host_durable_store(_options(tmp_path)) as store:
         event_log = EventLogStore()
         event_id = "event-tool-result-missing-raw"
-        end_event_sequence = _append_event_and_return_sequence(
+        _append_event_and_return_sequence(
             store,
             event_log,
             event_id=event_id,
@@ -1066,11 +1045,11 @@ def test_compaction_request_evidence_inputs_reject_missing_raw_tool_outcome(
         )
 
         with pytest.raises(HostDurableError, match="raw_tool_outcome"):
-            _collect_evidence_ids(
+            _collect_selected_evidence_ids(
                 store,
                 event_log,
                 session_id=session_id,
-                end_event_sequence=end_event_sequence,
+                event_id=event_id,
             )
 
 
@@ -1082,26 +1061,27 @@ def test_compaction_request_evidence_inputs_reject_envelope_producer_mismatch(
     session_id = "session-envelope-mismatch"
     with open_host_durable_store(_options(tmp_path)) as store:
         event_log = EventLogStore()
-        end_event_sequence = _append_event_and_return_sequence(
+        event_id = "event-tool-result-mismatch"
+        _append_event_and_return_sequence(
             store,
             event_log,
-            event_id="event-tool-result-mismatch",
+            event_id=event_id,
             session_id=session_id,
             event_type="TOOL_RESULT_ACCEPTED",
             payload={
                 "accepted_evidence_envelope": accepted_evidence_envelope_to_json_value(
                     _accepted_evidence_envelope_for_event("event-tool-result-other")
                 ),
-                "raw_tool_outcome": _raw_tool_outcome("event-tool-result-mismatch"),
+                "raw_tool_outcome": _raw_tool_outcome(event_id),
             },
         )
 
         with pytest.raises(HostDurableError, match="producer_event_ref mismatch"):
-            _collect_evidence_ids(
+            _collect_selected_evidence_ids(
                 store,
                 event_log,
                 session_id=session_id,
-                end_event_sequence=end_event_sequence,
+                event_id=event_id,
             )
 
 
@@ -1147,21 +1127,22 @@ def test_compaction_request_evidence_inputs_reject_malformed_compacted_payload(
     session_id = "session-malformed-compacted"
     with open_host_durable_store(_options(tmp_path)) as store:
         event_log = EventLogStore()
-        end_event_sequence = _append_event_and_return_sequence(
+        event_id = "event-context-compacted-malformed"
+        _append_event_and_return_sequence(
             store,
             event_log,
-            event_id="event-context-compacted-malformed",
+            event_id=event_id,
             session_id=session_id,
             event_type="CONTEXT_COMPACTED",
             payload=payload,
         )
 
         with pytest.raises(HostDurableError, match=message):
-            _collect_fact_refs(
+            _collect_selected_fact_refs(
                 store,
                 event_log,
                 session_id=session_id,
-                end_event_sequence=end_event_sequence,
+                event_id=event_id,
             )
 
 
@@ -1237,14 +1218,38 @@ def test_compaction_request_evidence_inputs_deduplicate_accepted_evidence_ids(
                 ),
             ).row.event_sequence
 
-        end_event_sequence = store.transaction_runner.run_write(append_rows)
+        store.transaction_runner.run_write(append_rows)
 
-        assert _collect_evidence_ids(
-            store,
-            event_log,
-            session_id=session_id,
-            end_event_sequence=end_event_sequence,
-        ) == ("evidence:event-tool-result-duplicate-first",)
+        def read_inputs(transaction: HostTransaction) -> tuple[str, ...]:
+            """读取 selected helper 输出的去重 evidence ids。
+
+            :param transaction: Host transaction。
+            :returns: evidence id tuple。
+            """
+
+            inputs = collect_selected_compaction_request_evidence_inputs(
+                transaction,
+                event_log,
+                session_id=session_id,
+                selected_evidence_block_refs=(
+                    SelectedEvidenceBlockRef(
+                        block_id="selected-evidence-first",
+                        tool_result_event_ref="event-tool-result-duplicate-first",
+                    ),
+                    SelectedEvidenceBlockRef(
+                        block_id="selected-evidence-second",
+                        tool_result_event_ref="event-tool-result-duplicate-second",
+                    ),
+                ),
+            )
+            return tuple(
+                material.accepted_evidence_id
+                for material in inputs.evidence_materials
+            )
+
+        assert store.transaction_runner.run_read(read_inputs) == (
+            "evidence:event-tool-result-duplicate-first",
+        )
 
 
 def test_compaction_request_evidence_inputs_collect_run_succeeded_raw_context(
@@ -1256,7 +1261,7 @@ def test_compaction_request_evidence_inputs_collect_run_succeeded_raw_context(
     with open_host_durable_store(_options(tmp_path)) as store:
         event_log = EventLogStore()
         event_id = "event-run-succeeded-summary"
-        end_event_sequence = _append_event_and_return_sequence(
+        _append_event_and_return_sequence(
             store,
             event_log,
             event_id=event_id,
@@ -1274,12 +1279,12 @@ def test_compaction_request_evidence_inputs_collect_run_succeeded_raw_context(
             :returns: history material 摘要 tuple。
             """
 
-            inputs = collect_compaction_request_evidence_inputs(
+            inputs = collect_selected_compaction_request_evidence_inputs(
                 transaction,
                 event_log,
                 session_id=session_id,
-                start_event_sequence=1,
-                end_event_sequence=end_event_sequence,
+                selected_evidence_block_refs=(),
+                selected_history_event_refs=(event_id,),
             )
             return tuple(
                 (
@@ -1308,7 +1313,7 @@ def test_compaction_request_evidence_inputs_use_stable_derived_fact_refs(
     with open_host_durable_store(_options(tmp_path)) as store:
         event_log = EventLogStore()
         compacted_event_id = "event-context-compacted-derived"
-        end_event_sequence = _append_event_and_return_sequence(
+        _append_event_and_return_sequence(
             store,
             event_log,
             event_id=compacted_event_id,
@@ -1327,11 +1332,11 @@ def test_compaction_request_evidence_inputs_use_stable_derived_fact_refs(
             },
         )
 
-        assert _collect_fact_refs(
+        assert _collect_selected_fact_refs(
             store,
             event_log,
             session_id=session_id,
-            end_event_sequence=end_event_sequence,
+            event_id=compacted_event_id,
         ) == (
             "memory-item:evidence_backed_fact:existing:event-old",
             f"memory-item:evidence_backed_fact:fact-new:{compacted_event_id}",
@@ -1606,56 +1611,19 @@ def _collect_selected_evidence_ids(
     return store.transaction_runner.run_read(read_inputs)
 
 
-def _collect_evidence_ids(
+def _collect_selected_fact_refs(
     store: HostDurableStore,
     event_log: EventLogStore,
     *,
     session_id: str,
-    end_event_sequence: int,
+    event_id: str,
 ) -> tuple[str, ...]:
-    """读取共享 helper 输出的 canonical evidence ids。
+    """读取 selected helper 输出的 evidence-backed fact refs。
 
     :param store: Host durable store。
     :param event_log: EventLog store。
     :param session_id: Session id。
-    :param end_event_sequence: compact input range 结束 sequence。
-    :returns: evidence id tuple。
-    """
-
-    def read_inputs(transaction: HostTransaction) -> tuple[str, ...]:
-        """在 transaction 内读取 evidence ids。
-
-        :param transaction: Host transaction。
-        :returns: evidence id tuple。
-        """
-
-        inputs = collect_compaction_request_evidence_inputs(
-            transaction,
-            event_log,
-            session_id=session_id,
-            start_event_sequence=1,
-            end_event_sequence=end_event_sequence,
-        )
-        return tuple(
-            material.accepted_evidence_id for material in inputs.evidence_materials
-        )
-
-    return store.transaction_runner.run_read(read_inputs)
-
-
-def _collect_fact_refs(
-    store: HostDurableStore,
-    event_log: EventLogStore,
-    *,
-    session_id: str,
-    end_event_sequence: int,
-) -> tuple[str, ...]:
-    """读取共享 helper 输出的 evidence-backed fact refs。
-
-    :param store: Host durable store。
-    :param event_log: EventLog store。
-    :param session_id: Session id。
-    :param end_event_sequence: compact input range 结束 sequence。
+    :param event_id: selected CONTEXT_COMPACTED event id。
     :returns: evidence-backed fact refs。
     """
 
@@ -1666,12 +1634,12 @@ def _collect_fact_refs(
         :returns: evidence-backed fact refs。
         """
 
-        inputs = collect_compaction_request_evidence_inputs(
+        inputs = collect_selected_compaction_request_evidence_inputs(
             transaction,
             event_log,
             session_id=session_id,
-            start_event_sequence=1,
-            end_event_sequence=end_event_sequence,
+            selected_evidence_block_refs=(),
+            selected_fact_event_refs=(event_id,),
         )
         return inputs.evidence_backed_fact_refs
 
