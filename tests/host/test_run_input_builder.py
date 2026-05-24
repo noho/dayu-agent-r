@@ -1025,6 +1025,83 @@ def test_gross_margin_followup_uses_post_compaction_evidence_backed_facts(
         assert contents[-1] == "请基于已确认的收入和毛利计算毛利率"
 
 
+def test_run_input_builder_renders_claim_text_and_evidence_refs_not_digest_only(
+    tmp_path: Path,
+) -> None:
+    """RunInputBuilder 渲染 stable facts 时必须包含 claim_text 与 evidence_refs。"""
+
+    policy = _memory_policy()
+    with open_host_durable_store(_options(tmp_path)) as store:
+        session_id = _ensure_session_id(store.transaction_runner)
+        _append_compacted_gross_margin_facts(store.transaction_runner, session_id)
+        seeded = _seed_current_run(
+            store,
+            session_id=session_id,
+            payload=_user_input_payload("继续分析收入质量"),
+        )
+        required_cursor = _required_memory_cursor(store.transaction_runner, seeded)
+        catch_up_conversation_memory_projection(
+            store.transaction_runner,
+            policy=policy,
+            batch_size=16,
+            max_event_sequence=required_cursor.checkpoint_event_sequence,
+        )
+
+        request = _build_request_with_memory(store, seeded, policy)
+        fact_blocks = tuple(
+            _message_content(message)
+            for message in request.messages
+            if _message_content(message).startswith("Memory evidence-backed facts:")
+        )
+
+        assert len(fact_blocks) == 1
+        assert "claim_text=Revenue was 100." in fact_blocks[0]
+        assert "claim_text=Gross profit was 40." in fact_blocks[0]
+        assert "evidence_refs=evidence:memory-tool" in fact_blocks[0]
+        assert "digest_ref=" not in fact_blocks[0]
+        assert "fact_summary=" not in fact_blocks[0]
+
+
+def test_no_compaction_recent_raw_turns_continuity_still_works(
+    tmp_path: Path,
+) -> None:
+    """未发生 compact 时，memory recent raw turns 仍提供连续性。"""
+
+    policy = _memory_policy()
+    with open_host_durable_store(_options(tmp_path)) as store:
+        session_id = _ensure_session_id(store.transaction_runner)
+        _append_prior_user_and_success(
+            store.transaction_runner,
+            session_id=session_id,
+            run_id="run-prior-no-compact",
+            user_text="上轮问题：收入增长来自哪里？",
+            answer_text="上轮回答：收入增长主要来自订阅业务。",
+        )
+        seeded = _seed_current_run(
+            store,
+            session_id=session_id,
+            payload=_user_input_payload("继续说明这个增长因素"),
+        )
+        required_cursor = _required_memory_cursor(store.transaction_runner, seeded)
+        catch_up_conversation_memory_projection(
+            store.transaction_runner,
+            policy=policy,
+            batch_size=16,
+            max_event_sequence=required_cursor.checkpoint_event_sequence,
+        )
+
+        request = _build_request_with_memory(store, seeded, policy)
+        contents = tuple(_message_content(message) for message in request.messages)
+
+        assert "上轮问题：收入增长来自哪里？" in contents
+        assert "上轮回答：收入增长主要来自订阅业务。" in contents
+        assert all(
+            not content.startswith("Memory evidence-backed facts:")
+            for content in contents
+        )
+        assert contents[-1] == "继续说明这个增长因素"
+
+
 def test_compact_artifact_preserved_fact_refs_reads_canonical_evidence_key() -> None:
     """compact artifact message 从 canonical evidence refs 字段读取 refs。"""
 

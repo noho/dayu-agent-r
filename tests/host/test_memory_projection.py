@@ -334,6 +334,7 @@ def _compact_payload(
     pinned_patch: dict[str, JsonValue] | None = None,
     fact_candidates: list[JsonValue] | None = None,
     minimum_preserve_items: list[JsonValue] | None = None,
+    canonical_evidence_refs: tuple[str, ...] = ("evidence-1",),
 ) -> dict[str, JsonValue]:
     """构造测试用 CONTEXT_COMPACTED payload。
 
@@ -342,11 +343,11 @@ def _compact_payload(
     :param pinned_patch: 可选 pinned patch candidate。
     :param fact_candidates: 可选 evidence-backed fact candidates。
     :param minimum_preserve_items: 可选 minimum preserve item candidates。
+    :param canonical_evidence_refs: compact payload 保留的 canonical evidence refs。
     :returns: compacted canonical payload。
     """
 
     patch = pinned_patch if pinned_patch is not None else _missing_pinned_patch()
-    canonical_evidence_refs = ("evidence-1",)
     return {
         "compact_artifact_ref": "compact-artifact:test",
         "compact_artifact_digest": _DIGEST_A,
@@ -1243,6 +1244,52 @@ def test_user_input_never_enters_evidence_backed_facts() -> None:
     )
 
 
+def test_final_answer_user_input_summary_do_not_become_evidence_backed_fact() -> None:
+    """final answer、user input 与 episode summary 都不得升级为 stable fact。"""
+
+    snapshot = _build_snapshot(
+        (
+            _memory_event(
+                event_sequence=1,
+                event_id="event-user-claim-like",
+                event_type="USER_INPUT_ACCEPTED",
+                payload={"display_text": "revenue was 100 according to me"},
+                attempt_id=None,
+                execution_id=None,
+            ),
+            _memory_event(
+                event_sequence=2,
+                event_id="event-final-answer-claim-like",
+                event_type="RUN_SUCCEEDED",
+                payload={"final_answer": "assistant says revenue was 100"},
+                attempt_id=None,
+                execution_id=None,
+            ),
+            _memory_event(
+                event_sequence=3,
+                event_id="event-summary-claim-like",
+                event_type="CONTEXT_COMPACTED",
+                payload=_compact_payload(summary_text="summary says revenue was 100"),
+                run_id="run-compact",
+                attempt_id=None,
+                execution_id=None,
+            ),
+        )
+    )
+
+    assert snapshot.evidence_backed_facts == ()
+    assert any(
+        item.item_kind is ConversationContinuityKind.ASSISTANT_CONCLUSION
+        and item.summary_text == "assistant says revenue was 100"
+        for item in snapshot.conversation_continuity.items
+    )
+    assert any(
+        item.item_kind is ConversationContinuityKind.EPISODE_SUMMARY
+        and item.summary_text == "summary says revenue was 100"
+        for item in snapshot.conversation_continuity.items
+    )
+
+
 def test_current_goal_first_write_wins_and_later_inputs_are_constraints() -> None:
     """多次 USER_INPUT_ACCEPTED 只把第一条写入 current_goal。
 
@@ -1673,6 +1720,236 @@ def test_evidence_backed_fact_budget_keeps_latest_facts_and_records_diagnostic()
     assert any(
         diagnostic.reason is MemoryDiagnosticReason.BUDGET_LIMIT_REACHED
         and diagnostic.message == "evidence-backed facts limited by memory policy"
+        for diagnostic in snapshot.diagnostics
+    )
+
+
+def test_memory_projection_materializes_pinned_state_current_value_not_patch_log() -> None:
+    """compact 后 pinned state 只暴露当前物化值，不保留 patch log。"""
+
+    snapshot = _build_snapshot(
+        (
+            _memory_event(
+                event_sequence=1,
+                event_id="event-compact-goal-one",
+                event_type="CONTEXT_COMPACTED",
+                payload=_compact_payload(
+                    summary_text="first goal compact",
+                    pinned_patch={
+                        "candidate_id": "patch-goal-one",
+                        "current_goal": {
+                            "operation": "replace",
+                            "value": "analyze revenue",
+                            "evidence_refs": ["evidence-1"],
+                        },
+                    },
+                ),
+                run_id="run-compact",
+                attempt_id=None,
+                execution_id=None,
+            ),
+            _memory_event(
+                event_sequence=2,
+                event_id="event-compact-goal-two",
+                event_type="CONTEXT_COMPACTED",
+                payload=_compact_payload(
+                    summary_text="second goal compact",
+                    pinned_patch={
+                        "candidate_id": "patch-goal-two",
+                        "current_goal": {
+                            "operation": "replace",
+                            "value": "analyze margin",
+                            "evidence_refs": ["evidence-1"],
+                        },
+                    },
+                ),
+                run_id="run-compact",
+                attempt_id=None,
+                execution_id=None,
+            ),
+        )
+    )
+
+    assert snapshot.pinned_state.current_goal == "analyze margin"
+    assert snapshot.pinned_state.user_constraints == ()
+    assert all("analyze revenue" != item for item in snapshot.pinned_state.open_questions)
+
+
+def test_evidence_backed_fact_working_set_is_bounded_and_deterministic() -> None:
+    """fact working set 按 dedupe key 去重，并只保留 policy bounded 集合。"""
+
+    snapshot = _build_snapshot(
+        (
+            _memory_event(
+                event_sequence=1,
+                event_id="event-compact-duplicate-old",
+                event_type="CONTEXT_COMPACTED",
+                payload=_compact_payload(
+                    summary_text="old duplicate",
+                    fact_candidates=[
+                        _fact_candidate(
+                            candidate_id="fact-duplicate-old",
+                            claim_text="Revenue   was 100.",
+                            evidence_refs=("evidence-2", "evidence-1"),
+                        )
+                    ],
+                    canonical_evidence_refs=("evidence-1", "evidence-2"),
+                ),
+                run_id="run-compact",
+                attempt_id=None,
+                execution_id=None,
+            ),
+            _memory_event(
+                event_sequence=2,
+                event_id="event-compact-duplicate-new",
+                event_type="CONTEXT_COMPACTED",
+                payload=_compact_payload(
+                    summary_text="new duplicate",
+                    fact_candidates=[
+                        _fact_candidate(
+                            candidate_id="fact-duplicate-new",
+                            claim_text=" revenue was 100. ",
+                            evidence_refs=("evidence-1", "evidence-2"),
+                        )
+                    ],
+                    canonical_evidence_refs=("evidence-1", "evidence-2"),
+                ),
+                run_id="run-compact",
+                attempt_id=None,
+                execution_id=None,
+            ),
+            _memory_event(
+                event_sequence=3,
+                event_id="event-compact-second-fact",
+                event_type="CONTEXT_COMPACTED",
+                payload=_compact_payload(
+                    summary_text="second fact",
+                    fact_candidates=[
+                        _fact_candidate(
+                            candidate_id="fact-second",
+                            claim_text="Gross profit was 40.",
+                        )
+                    ],
+                ),
+                run_id="run-compact",
+                attempt_id=None,
+                execution_id=None,
+            ),
+        ),
+        policy=_small_fact_budget_policy(),
+    )
+
+    assert tuple(fact.candidate_id for fact in snapshot.evidence_backed_facts) == (
+        "fact-duplicate-new",
+        "fact-second",
+    )
+    assert tuple(
+        fact.provenance.event_sequence for fact in snapshot.evidence_backed_facts
+    ) == (2, 3)
+    assert any(
+        diagnostic.reason is MemoryDiagnosticReason.EVIDENCE_BACKED_FACT_SUPERSEDED
+        and diagnostic.item_id is not None
+        and "fact-duplicate-old" in diagnostic.item_id
+        for diagnostic in snapshot.diagnostics
+    )
+
+
+def test_episode_summaries_are_policy_bounded_not_append_only_rendered() -> None:
+    """episode summaries 只保留 policy bounded recent working set。"""
+
+    snapshot = _build_snapshot(
+        (
+            _memory_event(
+                event_sequence=1,
+                event_id="event-compact-summary-one",
+                event_type="CONTEXT_COMPACTED",
+                payload=_compact_payload(summary_text="summary one"),
+                run_id="run-compact",
+                attempt_id=None,
+                execution_id=None,
+            ),
+            _memory_event(
+                event_sequence=2,
+                event_id="event-compact-summary-two",
+                event_type="CONTEXT_COMPACTED",
+                payload=_compact_payload(summary_text="summary two"),
+                run_id="run-compact",
+                attempt_id=None,
+                execution_id=None,
+            ),
+            _memory_event(
+                event_sequence=3,
+                event_id="event-compact-summary-three",
+                event_type="CONTEXT_COMPACTED",
+                payload=_compact_payload(summary_text="summary three"),
+                run_id="run-compact",
+                attempt_id=None,
+                execution_id=None,
+            ),
+            _memory_event(
+                event_sequence=4,
+                event_id="event-compact-summary-four",
+                event_type="CONTEXT_COMPACTED",
+                payload=_compact_payload(summary_text="summary four"),
+                run_id="run-compact",
+                attempt_id=None,
+                execution_id=None,
+            ),
+        )
+    )
+
+    summaries = tuple(
+        item.summary_text
+        for item in snapshot.conversation_continuity.items
+        if item.item_kind is ConversationContinuityKind.EPISODE_SUMMARY
+    )
+    assert summaries == ("summary three", "summary four")
+    assert any(
+        diagnostic.reason is MemoryDiagnosticReason.BUDGET_LIMIT_REACHED
+        for diagnostic in snapshot.diagnostics
+    )
+
+
+def test_minimum_preserve_expires_when_covered_by_stable_or_summary() -> None:
+    """minimum preserve 被后续 summary 覆盖后退出 continuity working set。"""
+
+    snapshot = _build_snapshot(
+        (
+            _memory_event(
+                event_sequence=1,
+                event_id="event-compact-preserve-before-summary",
+                event_type="CONTEXT_COMPACTED",
+                payload=_compact_payload(
+                    summary_text="preserve producer",
+                    minimum_preserve_items=[
+                        _minimum_preserve_item(
+                            item_id="covered-preserve",
+                            source_refs=("event-input",),
+                        )
+                    ],
+                ),
+                run_id="run-compact",
+                attempt_id=None,
+                execution_id=None,
+            ),
+            _memory_event(
+                event_sequence=2,
+                event_id="event-compact-covering-summary",
+                event_type="CONTEXT_COMPACTED",
+                payload=_compact_payload(summary_text="covering summary"),
+                run_id="run-compact",
+                attempt_id=None,
+                execution_id=None,
+            ),
+        )
+    )
+
+    assert all(
+        item.item_kind is not ConversationContinuityKind.MINIMUM_PRESERVE_ITEM
+        for item in snapshot.conversation_continuity.items
+    )
+    assert any(
+        diagnostic.reason is MemoryDiagnosticReason.MINIMUM_PRESERVE_ITEM_COVERED
         for diagnostic in snapshot.diagnostics
     )
 

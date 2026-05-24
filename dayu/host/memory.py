@@ -54,6 +54,7 @@ DEFAULT_MEMORY_MAX_PINNED_ITEMS = 8
 DEFAULT_MEMORY_MAX_EVIDENCE_BACKED_FACTS = 16
 DEFAULT_MEMORY_MAX_WORKING_ASSUMPTIONS = 8
 DEFAULT_MEMORY_RECENT_RAW_TURNS_FLOOR = 2
+DEFAULT_MEMORY_MAX_EPISODE_SUMMARIES_FLOOR = 1
 DEFAULT_MEMORY_CONTEXT_WINDOW_SIZE = 8192
 DEFAULT_MEMORY_RAW_TURN_CONTEXT_RATIO = 0.125
 DEFAULT_MEMORY_RAW_TURN_SIZE_FLOOR = 256
@@ -113,6 +114,7 @@ _PAYLOAD_FIELD_ITEM_ID = "item_id"
 _PAYLOAD_FIELD_LABEL = "label"
 _PAYLOAD_FIELD_TEXT = "text"
 _PAYLOAD_FIELD_SOURCE_REFS = "source_refs"
+_PAYLOAD_FIELD_SOURCE_EVENT_REFS = "source_event_refs"
 _PAYLOAD_FIELD_PRESERVE_REASON = "preserve_reason"
 _EVENT_REF_PREFIX = "event:"
 _SNAPSHOT_ID_DIGEST_PREFIX = "memory-snapshot-"
@@ -210,6 +212,8 @@ class MemoryDiagnosticReason(StrEnum):
     SNAPSHOT_LAG_OVER_THRESHOLD = "snapshot_lag_over_threshold"
     BUDGET_LIMIT_REACHED = "budget_limit_reached"
     EMPTY_EVENT_LOG_SNAPSHOT = "empty_event_log_snapshot"
+    EVIDENCE_BACKED_FACT_SUPERSEDED = "evidence_backed_fact_superseded"
+    MINIMUM_PRESERVE_ITEM_COVERED = "minimum_preserve_item_covered"
 
 
 class MemoryRepairReason(StrEnum):
@@ -1216,10 +1220,14 @@ def project_conversation_memory_event(
         materialized_facts: tuple[EvidenceBackedFactView, ...] = ()
         if fact_candidates_valid:
             materialized_facts = _evidence_backed_facts_from_compacted_event(event)
-            for fact in materialized_facts:
-                evidence_backed_facts = _replace_item_by_id(
-                    evidence_backed_facts, fact
+            evidence_backed_facts, superseded_diagnostics = (
+                _merge_evidence_backed_facts_by_dedupe_key(
+                    existing=evidence_backed_facts,
+                    candidates=materialized_facts,
+                    policy_digest=policy_digest,
                 )
+            )
+            diagnostics = diagnostics + superseded_diagnostics
         _validate_compact_summary_fact_refs(
             event,
             base.evidence_backed_facts,
@@ -1252,6 +1260,15 @@ def project_conversation_memory_event(
         evidence_backed_facts,
         policy=policy,
         policy_digest=policy_digest,
+        pinned_state=limited_pinned_state,
+        continuity_items=continuity_items,
+    )
+    continuity_items, preserve_cover_diagnostics = (
+        _expire_covered_minimum_preserve_items(
+            continuity_items,
+            evidence_backed_facts=limited_evidence_backed_facts,
+            policy_digest=policy_digest,
+        )
     )
     limited_assumptions, assumption_budget_diagnostics = _limit_working_assumptions(
         working_assumptions,
@@ -1288,6 +1305,7 @@ def project_conversation_memory_event(
             diagnostics
             + fact_budget_diagnostics
             + assumption_budget_diagnostics
+            + preserve_cover_diagnostics
             + continuity_budget_diagnostics
         ),
         built_at=built_at,
@@ -1498,6 +1516,128 @@ def _evidence_backed_facts_from_compacted_event(
     return tuple(facts)
 
 
+def _merge_evidence_backed_facts_by_dedupe_key(
+    *,
+    existing: tuple[EvidenceBackedFactView, ...],
+    candidates: tuple[EvidenceBackedFactView, ...],
+    policy_digest: MemoryPolicyDigest,
+) -> tuple[tuple[EvidenceBackedFactView, ...], tuple[MemoryDiagnostic, ...]]:
+    """按 claim / evidence / kind 合并 compact fact candidates。
+
+    :param existing: snapshot 中已有 evidence-backed facts。
+    :param candidates: 当前 compact event 新物化的 fact candidates。
+    :param policy_digest: 当前 memory policy digest。
+    :returns: 合并后的 facts 与 superseded diagnostics。
+    """
+
+    facts = list(existing)
+    diagnostics: list[MemoryDiagnostic] = []
+    for candidate in candidates:
+        duplicate_index = _evidence_backed_fact_duplicate_index(facts, candidate)
+        if duplicate_index is None:
+            facts.append(candidate)
+            continue
+        current = facts[duplicate_index]
+        if _is_newer_or_equal_extraction(candidate, current):
+            facts[duplicate_index] = candidate
+            diagnostics.append(
+                _superseded_fact_diagnostic(
+                    superseded=current,
+                    superseding=candidate,
+                    policy_digest=policy_digest,
+                )
+            )
+            continue
+        diagnostics.append(
+            _superseded_fact_diagnostic(
+                superseded=candidate,
+                superseding=current,
+                policy_digest=policy_digest,
+            )
+        )
+    return tuple(facts), tuple(diagnostics)
+
+
+def _evidence_backed_fact_duplicate_index(
+    facts: list[EvidenceBackedFactView], candidate: EvidenceBackedFactView
+) -> int | None:
+    """查找 evidence-backed fact dedupe key 相同的现有下标。
+
+    :param facts: 已选择的 facts。
+    :param candidate: 待查找的 candidate。
+    :returns: duplicate 下标；不存在时返回 ``None``。
+    """
+
+    candidate_key = _evidence_backed_fact_dedupe_key(candidate)
+    for index, fact in enumerate(facts):
+        if _evidence_backed_fact_dedupe_key(fact) == candidate_key:
+            return index
+    return None
+
+
+def _evidence_backed_fact_dedupe_key(
+    fact: EvidenceBackedFactView,
+) -> tuple[str, tuple[str, ...], EvidenceBackedFactKind]:
+    """生成 evidence-backed fact 去重 key。
+
+    :param fact: evidence-backed fact。
+    :returns: normalized claim、排序后 evidence refs 与 evidence kind。
+    """
+
+    return (
+        _normalized_text(fact.claim_text),
+        tuple(sorted(fact.evidence_refs)),
+        fact.evidence_kind,
+    )
+
+
+def _is_newer_or_equal_extraction(
+    candidate: EvidenceBackedFactView, current: EvidenceBackedFactView
+) -> bool:
+    """判断 candidate 是否来自不早于 current 的 extraction event。
+
+    :param candidate: 新 candidate。
+    :param current: 已存在 fact。
+    :returns: candidate event sequence 不早于 current 时返回 ``True``。
+    """
+
+    if candidate.provenance.event_sequence != current.provenance.event_sequence:
+        return candidate.provenance.event_sequence > current.provenance.event_sequence
+    return candidate.item_id >= current.item_id
+
+
+def _superseded_fact_diagnostic(
+    *,
+    superseded: EvidenceBackedFactView,
+    superseding: EvidenceBackedFactView,
+    policy_digest: MemoryPolicyDigest,
+) -> MemoryDiagnostic:
+    """构造 duplicate fact 被 supersede 的 diagnostic。
+
+    :param superseded: 被替换或被拒绝的 duplicate fact。
+    :param superseding: 保留下来的 fact。
+    :param policy_digest: 当前 memory policy digest。
+    :returns: memory diagnostic。
+    """
+
+    return MemoryDiagnostic(
+        diagnostic_id=_diagnostic_id(
+            MemoryDiagnosticReason.EVIDENCE_BACKED_FACT_SUPERSEDED,
+            event_sequence=superseding.provenance.event_sequence,
+            item_id=superseded.item_id,
+        ),
+        reason=MemoryDiagnosticReason.EVIDENCE_BACKED_FACT_SUPERSEDED,
+        message=(
+            "evidence-backed fact superseded by duplicate dedupe key: "
+            f"superseding_item_id={superseding.item_id}"
+        ),
+        event_sequence=superseding.provenance.event_sequence,
+        item_id=superseded.item_id,
+        policy_digest=policy_digest,
+        recorded_at=None,
+    )
+
+
 def _minimum_preserve_items_from_compacted_event(
     event: MemoryProjectionEvent, *, policy: MemoryProjectionPolicy
 ) -> tuple[ConversationContinuityItem, ...]:
@@ -1680,13 +1820,33 @@ def _compact_episode_summary_from_projection_event(
         run_id=event.run_id,
         summary_text=summary_text,
         label=None,
-        source_refs=(),
+        source_refs=_compact_episode_summary_source_refs(event),
         preserve_reason=None,
         payload_ref=None,
         payload_digest=None,
         included_reason=MemoryIncludedReason.EPISODE_SUMMARY,
         excluded_reason=None,
         size_units=estimate_memory_size_units(summary_text),
+    )
+
+
+def _compact_episode_summary_source_refs(
+    event: MemoryProjectionEvent,
+) -> tuple[str, ...]:
+    """读取 episode summary 可覆盖的 canonical source refs。
+
+    :param event: CONTEXT_COMPACTED projection event。
+    :returns: 去重后的 source refs。
+    """
+
+    summary = _required_payload_mapping(
+        event.payload,
+        _PAYLOAD_FIELD_EPISODE_SUMMARY_CANDIDATE,
+    )
+    return _dedupe_text_tuple(
+        _optional_text_tuple(summary, _PAYLOAD_FIELD_SOURCE_EVENT_REFS)
+        + _optional_text_tuple(summary, _PAYLOAD_FIELD_EVIDENCE_REFS)
+        + _optional_text_tuple(summary, _PAYLOAD_FIELD_CONFIRMED_FACT_REFS)
     )
 
 
@@ -2101,25 +2261,93 @@ def _limit_evidence_backed_facts(
     *,
     policy: MemoryProjectionPolicy,
     policy_digest: MemoryPolicyDigest,
+    pinned_state: PinnedStateView,
+    continuity_items: tuple[ConversationContinuityItem, ...],
 ) -> tuple[tuple[EvidenceBackedFactView, ...], tuple[MemoryDiagnostic, ...]]:
-    """按 policy 限制 evidence-backed facts 数量。
+    """按 policy 选择 evidence-backed fact working set。
 
     :param items: 原始 evidence-backed facts。
     :param policy: memory projection policy。
     :param policy_digest: memory policy digest。
+    :param pinned_state: 当前已物化 pinned state。
+    :param continuity_items: 当前 continuity items，用于 recent reference 排序。
     :returns: 限制后的 facts 与 budget diagnostics。
     """
 
     if len(items) <= policy.max_evidence_backed_facts:
         return items, ()
-    kept = items[-policy.max_evidence_backed_facts :]
+    kept = _select_evidence_backed_fact_working_set(
+        items,
+        policy=policy,
+        pinned_state=pinned_state,
+        continuity_items=continuity_items,
+    )
+    kept_ids = frozenset(item.item_id for item in kept)
+    first_dropped = next(item for item in items if item.item_id not in kept_ids)
     return kept, (
         _budget_diagnostic(
-            event_sequence=items[0].provenance.event_sequence,
-            item_id=items[0].item_id,
+            event_sequence=first_dropped.provenance.event_sequence,
+            item_id=first_dropped.item_id,
             policy_digest=policy_digest,
             message="evidence-backed facts limited by memory policy",
         ),
+    )
+
+
+def _select_evidence_backed_fact_working_set(
+    items: tuple[EvidenceBackedFactView, ...],
+    *,
+    policy: MemoryProjectionPolicy,
+    pinned_state: PinnedStateView,
+    continuity_items: tuple[ConversationContinuityItem, ...],
+) -> tuple[EvidenceBackedFactView, ...]:
+    """按 Host-neutral relevance 选择 bounded fact working set。
+
+    :param items: 已去重 facts。
+    :param policy: memory projection policy。
+    :param pinned_state: 当前 pinned state。
+    :param continuity_items: 当前 continuity items。
+    :returns: 被选中的 facts，按 EventLog 顺序输出。
+    """
+
+    ranked = sorted(
+        items,
+        key=lambda item: _evidence_backed_fact_selection_key(
+            item,
+            pinned_state=pinned_state,
+            continuity_items=continuity_items,
+        ),
+    )
+    selected_ids = frozenset(
+        item.item_id for item in ranked[: policy.max_evidence_backed_facts]
+    )
+    return tuple(item for item in items if item.item_id in selected_ids)
+
+
+def _evidence_backed_fact_selection_key(
+    item: EvidenceBackedFactView,
+    *,
+    pinned_state: PinnedStateView,
+    continuity_items: tuple[ConversationContinuityItem, ...],
+) -> tuple[int, int, int, int, str]:
+    """生成 fact working-set 排序 key。
+
+    :param item: evidence-backed fact。
+    :param pinned_state: 当前 pinned state。
+    :param continuity_items: 当前 continuity items。
+    :returns: Python 升序可用的排序 key。
+    """
+
+    fact_tokens = _text_tokens(item.claim_text)
+    subject_tokens = _pinned_subject_tokens(pinned_state)
+    goal_tokens = _text_tokens(pinned_state.current_goal or "")
+    recent_tokens = _recent_user_reference_tokens(continuity_items)
+    return (
+        -_token_overlap_count(fact_tokens, subject_tokens),
+        -_token_overlap_count(fact_tokens, goal_tokens),
+        -_token_overlap_count(fact_tokens, recent_tokens),
+        -item.provenance.event_sequence,
+        item.item_id,
     )
 
 
@@ -2178,7 +2406,10 @@ def _limit_continuity_items(
         item for item in items if not _is_raw_turn(item) and not _is_episode(item)
     )
     older_raw = tuple(item for item in raw_items if item.item_id not in recent_ids)
-    episode_summaries = tuple(item for item in items if _is_episode(item))
+    episode_summaries = _policy_bounded_recent_episode_summaries(
+        tuple(item for item in items if _is_episode(item)),
+        policy=policy,
+    )
     selected_ids: set[str] = set(item.item_id for item in recent_raw)
     budget_used = _EMPTY_SIZE_UNITS
     for item in reversed(_event_ordered_items(older_raw + primary_pool_items)):
@@ -2207,6 +2438,141 @@ def _limit_continuity_items(
     )
 
 
+def _policy_bounded_recent_episode_summaries(
+    items: tuple[ConversationContinuityItem, ...],
+    *,
+    policy: MemoryProjectionPolicy,
+) -> tuple[ConversationContinuityItem, ...]:
+    """选择 policy 派生上限内的 recent episode summaries。
+
+    :param items: episode summary items。
+    :param policy: memory projection policy。
+    :returns: 最近的 episode summaries。
+    """
+
+    max_items = max(
+        DEFAULT_MEMORY_MAX_EPISODE_SUMMARIES_FLOOR,
+        policy.recent_raw_turns_floor,
+    )
+    return _event_ordered_items(items)[-max_items:]
+
+
+def _expire_covered_minimum_preserve_items(
+    items: tuple[ConversationContinuityItem, ...],
+    *,
+    evidence_backed_facts: tuple[EvidenceBackedFactView, ...],
+    policy_digest: MemoryPolicyDigest,
+) -> tuple[tuple[ConversationContinuityItem, ...], tuple[MemoryDiagnostic, ...]]:
+    """移除已被 stable fact 或更新 episode summary 覆盖的 minimum preserve。
+
+    :param items: continuity items。
+    :param evidence_backed_facts: 当前可见 stable facts。
+    :param policy_digest: memory policy digest。
+    :returns: 过滤后的 continuity items 与 coverage diagnostics。
+    """
+
+    kept: list[ConversationContinuityItem] = []
+    diagnostics: list[MemoryDiagnostic] = []
+    for item in items:
+        if item.item_kind is not ConversationContinuityKind.MINIMUM_PRESERVE_ITEM:
+            kept.append(item)
+            continue
+        if _minimum_preserve_is_covered(
+            item,
+            items=items,
+            evidence_backed_facts=evidence_backed_facts,
+        ):
+            diagnostics.append(
+                _minimum_preserve_covered_diagnostic(
+                    item,
+                    policy_digest=policy_digest,
+                )
+            )
+            continue
+        kept.append(item)
+    return tuple(kept), tuple(diagnostics)
+
+
+def _minimum_preserve_is_covered(
+    item: ConversationContinuityItem,
+    *,
+    items: tuple[ConversationContinuityItem, ...],
+    evidence_backed_facts: tuple[EvidenceBackedFactView, ...],
+) -> bool:
+    """判断 minimum preserve 是否已被后续 stable / summary 覆盖。
+
+    :param item: minimum preserve item。
+    :param items: 全部 continuity items。
+    :param evidence_backed_facts: 当前可见 stable facts。
+    :returns: 已覆盖时返回 ``True``。
+    """
+
+    source_refs = frozenset(item.source_refs)
+    if len(source_refs) == 0:
+        return False
+    for fact in evidence_backed_facts:
+        if fact.provenance.event_sequence <= item.event_sequence:
+            continue
+        if source_refs.issubset(_evidence_backed_fact_cover_refs(fact)):
+            return True
+    for summary in items:
+        if summary.item_kind is not ConversationContinuityKind.EPISODE_SUMMARY:
+            continue
+        if summary.event_sequence <= item.event_sequence:
+            continue
+        if source_refs.issubset(frozenset(summary.source_refs)):
+            return True
+    return False
+
+
+def _evidence_backed_fact_cover_refs(
+    fact: EvidenceBackedFactView,
+) -> frozenset[str]:
+    """汇总 stable fact 可覆盖的 refs。
+
+    :param fact: evidence-backed fact。
+    :returns: refs 集合。
+    """
+
+    refs: set[str] = set(fact.evidence_refs)
+    refs.add(fact.item_id)
+    refs.add(fact.candidate_id)
+    refs.add(fact.provenance.event_id)
+    if fact.compact_artifact_ref is not None:
+        refs.add(fact.compact_artifact_ref)
+    if fact.provenance.payload_ref is not None:
+        refs.add(fact.provenance.payload_ref)
+    return frozenset(refs)
+
+
+def _minimum_preserve_covered_diagnostic(
+    item: ConversationContinuityItem, *, policy_digest: MemoryPolicyDigest
+) -> MemoryDiagnostic:
+    """构造 minimum preserve 被覆盖后的移除 diagnostic。
+
+    :param item: 被移除的 minimum preserve item。
+    :param policy_digest: memory policy digest。
+    :returns: memory diagnostic。
+    """
+
+    return MemoryDiagnostic(
+        diagnostic_id=_diagnostic_id(
+            MemoryDiagnosticReason.MINIMUM_PRESERVE_ITEM_COVERED,
+            event_sequence=item.event_sequence,
+            item_id=item.item_id,
+        ),
+        reason=MemoryDiagnosticReason.MINIMUM_PRESERVE_ITEM_COVERED,
+        message=(
+            "minimum preserve item excluded because a newer stable fact or "
+            "episode summary covers its source refs"
+        ),
+        event_sequence=item.event_sequence,
+        item_id=item.item_id,
+        policy_digest=policy_digest,
+        recorded_at=None,
+    )
+
+
 def _event_ordered_items(
     items: tuple[ConversationContinuityItem, ...],
 ) -> tuple[ConversationContinuityItem, ...]:
@@ -2217,6 +2583,97 @@ def _event_ordered_items(
     """
 
     return tuple(sorted(items, key=lambda item: item.event_sequence))
+
+
+def _normalized_text(text: str) -> str:
+    """按 memory 去重口径规范化文本。
+
+    :param text: 原始文本。
+    :returns: casefold 且压缩空白后的文本。
+    """
+
+    return " ".join(text.casefold().split())
+
+
+def _text_tokens(text: str) -> frozenset[str]:
+    """提取 Host-neutral 文本 token。
+
+    :param text: 原始文本。
+    :returns: token 集合。
+    """
+
+    normalized_chars: list[str] = []
+    for char in text.casefold():
+        if char.isalnum():
+            normalized_chars.append(char)
+        else:
+            normalized_chars.append(" ")
+    return frozenset(token for token in "".join(normalized_chars).split() if token)
+
+
+def _pinned_subject_tokens(pinned_state: PinnedStateView) -> frozenset[str]:
+    """从 pinned subjects 提取排序用 token。
+
+    :param pinned_state: 当前 pinned state。
+    :returns: subject token 集合。
+    """
+
+    tokens: set[str] = set()
+    for ref in pinned_state.confirmed_subjects:
+        tokens.update(_text_tokens(ref.ref_kind.value))
+        tokens.update(_text_tokens(ref.ref_id))
+    return frozenset(tokens)
+
+
+def _recent_user_reference_tokens(
+    items: tuple[ConversationContinuityItem, ...],
+) -> frozenset[str]:
+    """从 recent raw user turns 提取排序用 token。
+
+    :param items: continuity items。
+    :returns: recent user token 集合。
+    """
+
+    tokens: set[str] = set()
+    user_turns = tuple(
+        item
+        for item in items
+        if item.item_kind is ConversationContinuityKind.RAW_USER_TURN
+    )
+    for item in user_turns[-DEFAULT_MEMORY_RECENT_RAW_TURNS_FLOOR:]:
+        if item.summary_text is not None:
+            tokens.update(_text_tokens(item.summary_text))
+    return frozenset(tokens)
+
+
+def _token_overlap_count(
+    left: frozenset[str], right: frozenset[str]
+) -> int:
+    """计算两个 token 集合的交集大小。
+
+    :param left: 左侧 token 集合。
+    :param right: 右侧 token 集合。
+    :returns: 交集 token 数。
+    """
+
+    return len(left.intersection(right))
+
+
+def _dedupe_text_tuple(values: tuple[str, ...]) -> tuple[str, ...]:
+    """按首次出现顺序去重文本 tuple。
+
+    :param values: 原始文本 tuple。
+    :returns: 去重后的文本 tuple。
+    """
+
+    seen: set[str] = set()
+    result: list[str] = []
+    for value in values:
+        if value in seen:
+            continue
+        seen.add(value)
+        result.append(value)
+    return tuple(result)
 
 
 def _replace_item_by_id(
