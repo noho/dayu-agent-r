@@ -82,7 +82,7 @@ _FIELD_DIAGNOSTIC_REFS = "diagnostic_refs"
 _FIELD_BUDGET_AFTER_ATTEMPTED_COMPACT = "budget_after_attempted_compact"
 _FIELD_EVIDENCE_REFS = "evidence_refs"
 _FIELD_EVIDENCE_ID = "evidence_id"
-_FIELD_ACCEPTED_EVIDENCE_REFS = "accepted_evidence_refs"
+_FIELD_CANONICAL_EVIDENCE_REFS = "canonical_evidence_refs"
 _FIELD_EVIDENCE_BACKED_FACT_REFS = "evidence_backed_fact_refs"
 _FIELD_CANDIDATE_ID = "candidate_id"
 _FIELD_ITEM_ID = "item_id"
@@ -108,13 +108,13 @@ _FIELD_CONFIRMED_SUBJECTS = "confirmed_subjects"
 _FIELD_ACCEPTED = "accepted"
 _FIELD_REJECTION_REASONS = "rejection_reasons"
 _FIELD_CURRENT_USER_INPUT_RETAINED = "current_user_input_retained"
-_FIELD_ACCEPTED_EVIDENCE_REFS_RETAINED = "accepted_evidence_refs_retained"
+_FIELD_CANONICAL_EVIDENCE_REFS_RETAINED = "canonical_evidence_refs_retained"
 _FIELD_EVIDENCE_BACKED_FACT_CANDIDATES_ACCEPTED = (
     "evidence_backed_fact_candidates_accepted"
 )
 _FIELD_MINIMUM_PRESERVE_ITEMS_ACCEPTED = "minimum_preserve_items_accepted"
 _FIELD_OPEN_QUESTIONS_RETAINED = "open_questions_retained"
-_FIELD_RETAINED_ACCEPTED_EVIDENCE_REFS = "retained_accepted_evidence_refs"
+_FIELD_RETAINED_CANONICAL_EVIDENCE_REFS = "retained_canonical_evidence_refs"
 
 _REQUESTED_REQUIRED_FIELDS = (
     _FIELD_TRIGGER_SOURCE,
@@ -290,8 +290,8 @@ def build_context_compacted_payload(
             )
         ),
         _FIELD_PRESERVED_FACT_REFS: {
-            _FIELD_ACCEPTED_EVIDENCE_REFS: _string_list_json(
-                accepted_candidate.preserved_accepted_evidence_refs
+            _FIELD_CANONICAL_EVIDENCE_REFS: _string_list_json(
+                accepted_candidate.preserved_canonical_evidence_refs
             ),
             _FIELD_EVIDENCE_BACKED_FACT_REFS: _string_list_json(
                 accepted_candidate.preserved_evidence_backed_fact_refs
@@ -343,13 +343,13 @@ def validate_context_compacted_payload(payload: Mapping[str, JsonValue]) -> None
     _validate_confirmed_subject_patch(patch)
     preserved_fact_refs = _required_mapping(payload, _FIELD_PRESERVED_FACT_REFS)
     _reject_old_preserved_fact_ref_fields(preserved_fact_refs)
-    accepted_evidence_refs = _required_text_list(
-        preserved_fact_refs, _FIELD_ACCEPTED_EVIDENCE_REFS
+    canonical_evidence_refs = _required_text_list(
+        preserved_fact_refs, _FIELD_CANONICAL_EVIDENCE_REFS
     )
     _required_text_list(preserved_fact_refs, _FIELD_EVIDENCE_BACKED_FACT_REFS)
     _validate_fact_candidates(
         payload,
-        accepted_evidence_refs=set(accepted_evidence_refs),
+        canonical_evidence_refs=set(canonical_evidence_refs),
     )
     _validate_minimum_preserve_items(payload)
     _required_list(payload, _FIELD_DROPPED_RANGES)
@@ -357,7 +357,7 @@ def validate_context_compacted_payload(payload: Mapping[str, JsonValue]) -> None
     _required_bool(payload, _FIELD_EVIDENCE_ANCHORS_RETAINED)
     _validate_quality_check_result(
         payload,
-        accepted_evidence_refs=set(accepted_evidence_refs),
+        canonical_evidence_refs=set(canonical_evidence_refs),
     )
     _required_non_negative_int(payload, _FIELD_BUDGET_AFTER_COMPACT)
 
@@ -896,12 +896,12 @@ def _validate_confirmed_subject_item(item: JsonValue) -> None:
 
 
 def _validate_fact_candidates(
-    payload: Mapping[str, JsonValue], *, accepted_evidence_refs: set[str]
+    payload: Mapping[str, JsonValue], *, canonical_evidence_refs: set[str]
 ) -> None:
     """校验 evidence-backed fact candidates JSON 结构。
 
     :param payload: compacted payload。
-    :param accepted_evidence_refs: 已保留 accepted evidence refs。
+    :param canonical_evidence_refs: 已保留 canonical evidence refs。
     :returns: ``None``。
     :raises ValueError: candidates 数量、文本或 refs 非法时抛出。
     """
@@ -922,8 +922,8 @@ def _validate_fact_candidates(
             raise ValueError("evidence-backed fact requires evidence_refs")
         if len(refs) > MAX_EVIDENCE_REFS_PER_FACT:
             raise ValueError("evidence_refs exceeds maximum count")
-        if not set(refs).issubset(accepted_evidence_refs):
-            raise ValueError("evidence-backed fact refs must be accepted evidence")
+        if not set(refs).issubset(canonical_evidence_refs):
+            raise ValueError("evidence-backed fact refs must be canonical evidence")
         attributes = _required_mapping(candidate, _FIELD_ATTRIBUTES)
         attributes_json = canonical_json_dumps(attributes)
         if len(attributes_json) > MAX_EVIDENCE_BACKED_FACT_ATTRIBUTES_JSON_CHARS:
@@ -1022,12 +1022,12 @@ def _allowed_opaque_ref_kinds() -> set[str]:
 
 
 def _validate_quality_check_result(
-    payload: Mapping[str, JsonValue], *, accepted_evidence_refs: set[str]
+    payload: Mapping[str, JsonValue], *, canonical_evidence_refs: set[str]
 ) -> None:
     """校验 ``CONTEXT_COMPACTED`` 只承载 accepted quality result。
 
     :param payload: compacted payload。
-    :param accepted_evidence_refs: accepted evidence refs 集合。
+    :param canonical_evidence_refs: canonical evidence refs 集合。
     :returns: ``None``。
     :raises ValueError: quality result 非 accepted 或 retained evidence 非法时抛出。
     """
@@ -1041,7 +1041,7 @@ def _validate_quality_check_result(
         raise ValueError("accepted quality result must not include rejection reasons")
     for field_name in (
         _FIELD_CURRENT_USER_INPUT_RETAINED,
-        _FIELD_ACCEPTED_EVIDENCE_REFS_RETAINED,
+        _FIELD_CANONICAL_EVIDENCE_REFS_RETAINED,
         _FIELD_EVIDENCE_BACKED_FACT_CANDIDATES_ACCEPTED,
         _FIELD_MINIMUM_PRESERVE_ITEMS_ACCEPTED,
         _FIELD_EVIDENCE_ANCHORS_RETAINED,
@@ -1050,10 +1050,10 @@ def _validate_quality_check_result(
         if not _required_bool(result, field_name):
             raise ValueError(f"{field_name} must be true for accepted compact")
     retained_refs = _required_text_list(
-        result, _FIELD_RETAINED_ACCEPTED_EVIDENCE_REFS
+        result, _FIELD_RETAINED_CANONICAL_EVIDENCE_REFS
     )
-    if not set(retained_refs).issubset(accepted_evidence_refs):
-        raise ValueError("retained accepted evidence refs must exist")
+    if not set(retained_refs).issubset(canonical_evidence_refs):
+        raise ValueError("retained canonical evidence refs must exist")
     _required_list(result, _FIELD_DROPPED_RANGES)
     _required_list(result, _FIELD_SUMMARIZED_RANGES)
 

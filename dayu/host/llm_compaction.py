@@ -42,7 +42,7 @@ from dayu.engine.contracts.messages import (
 from dayu.engine.contracts.runner_spec import RunnerCallOptions, RunnerSpec
 from dayu.host.compaction import (
     CompactInputRange,
-    CompactRawContextItem,
+    CompactMaterialSection,
     CompactionCandidate,
     CompactionRequest,
     ContextCompactor,
@@ -60,7 +60,6 @@ from dayu.host.compaction import (
     PreservationEvidence,
 )
 from dayu.host.context_budget import DEFAULT_ESTIMATOR_CHARS_PER_TOKEN
-from dayu.host.evidence import AcceptedEvidenceEnvelope, OpaqueEvidenceRef
 
 _COMPACTOR_RUN_ID_PREFIX = "context-compactor"
 _MIN_PROPOSAL_LENGTH = 1
@@ -82,9 +81,9 @@ _REQUIRED_PROPOSAL_KEYS = (
     "pinned_state_patch_candidate",
     "evidence_backed_fact_candidates",
     "minimum_preserve_item_candidates",
-    "retained_current_user_input_ref",
-    "preserved_input_event_refs",
-    "preserved_accepted_evidence_refs",
+    "retained_current_input_label",
+    "preserved_material_labels",
+    "preserved_evidence_labels",
     "preserved_evidence_backed_fact_refs",
     "dropped_ranges",
     "summarized_ranges",
@@ -347,90 +346,18 @@ def _compaction_request_prompt_block(request: CompactionRequest) -> str:
     :returns: compaction request prompt 数据块。
     """
 
-    lines = [
-        f"trigger_source: {request.trigger_source.value}",
-        f"session_id: {request.session_id}",
-        f"run_id: {request.run_id}",
-        f"current_user_input_ref: {request.current_message_summary.current_user_input_ref}",
-        f"current_user_input_summary: {request.current_message_summary.summary_text}",
-        f"input_event_refs: {_refs_text(request.input_event_refs)}",
-        f"accepted_evidence_refs: {_refs_text(request.accepted_evidence_refs)}",
-        f"evidence_backed_fact_refs: {_refs_text(request.evidence_backed_fact_refs)}",
-        f"recent_raw_turn_refs: {_refs_text(request.recent_raw_turn_refs)}",
-        f"older_raw_turn_refs: {_refs_text(request.older_raw_turn_refs)}",
-        f"existing_episode_summary_refs: {_refs_text(request.existing_episode_summary_refs)}",
-    ]
-    lines.extend(_accepted_evidence_envelope_lines(request.accepted_evidence_envelopes))
-    lines.extend(_compact_raw_context_lines(request.compact_raw_context_items))
-    return "\n".join(lines)
-
-
-def _accepted_evidence_envelope_lines(
-    envelopes: tuple[AcceptedEvidenceEnvelope, ...],
-) -> list[str]:
-    """格式化 accepted evidence envelopes metadata。
-
-    :param envelopes: Host accepted evidence 信封。
-    :returns: prompt 行列表。
-    """
-
-    if len(envelopes) == 0:
-        return ["accepted_evidence_envelopes: none"]
-    lines = ["accepted_evidence_envelopes:"]
-    for envelope in envelopes:
-        result_ref = envelope.result_ref
-        tool_query = envelope.tool_query
-        lines.extend(
-            [
-                f"- evidence_id: {envelope.evidence_id}",
-                f"  tool_name: {envelope.tool_name}",
-                f"  tool_call_id: {envelope.tool_call_id}",
-                "  query:",
-                (
-                    "    tool_call_requested_event_ref: "
-                    f"{tool_query.tool_call_requested_event_ref or 'none'}"
-                ),
-                (
-                    "    normalized_arguments_digest: "
-                    f"{tool_query.normalized_arguments_digest}"
-                ),
-                f"    semantic_input_digest: {tool_query.semantic_input_digest}",
-                "  result_ref:",
-                f"    payload_ref: {result_ref.payload_ref or 'none'}",
-                f"    payload_digest: {result_ref.payload_digest or 'none'}",
-                f"    outcome_digest: {result_ref.outcome_digest or 'none'}",
-                f"    truncation_applied: {result_ref.truncation_applied}",
-                f"  source_refs: {_opaque_refs_text(envelope.source_refs)}",
-                f"  locator_refs: {_opaque_refs_text(envelope.locator_refs)}",
-            ]
-        )
-    return lines
-
-
-def _compact_raw_context_lines(items: tuple[CompactRawContextItem, ...]) -> list[str]:
-    """格式化 compact range raw transcript 供 LLM 抽取事实。
-
-    :param items: compact raw context items。
-    :returns: prompt 行列表。
-    """
-
-    if len(items) == 0:
-        return ["compact_raw_context: none"]
-    lines = ["compact_raw_context:"]
-    for item in items:
-        lines.extend(
-            [
-                f"- event_ref: {item.event_ref}",
-                f"  content_kind: {item.content_kind.value}",
-                (
-                    "  accepted_evidence_refs: "
-                    f"{_refs_text(item.accepted_evidence_refs)}"
-                ),
-                "  content:",
-                *_indented_content_lines(item.content_text),
-            ]
-        )
-    return lines
+    material_json = json.dumps(
+        request.llm_material_json(),
+        ensure_ascii=False,
+        sort_keys=True,
+    )
+    return "\n".join(
+        [
+            f"trigger_source: {request.trigger_source.value}",
+            "material_pack:",
+            *_indented_content_lines(material_json),
+        ]
+    )
 
 
 def _indented_content_lines(content: str) -> list[str]:
@@ -441,20 +368,6 @@ def _indented_content_lines(content: str) -> list[str]:
     """
 
     return [f"    {line}" for line in content.splitlines()]
-
-
-def _opaque_refs_text(refs: tuple[OpaqueEvidenceRef, ...]) -> str:
-    """格式化 Host opaque evidence refs。
-
-    :param refs: opaque refs。
-    :returns: 可读文本；为空时返回 ``none``。
-    """
-
-    if len(refs) == 0:
-        return "none"
-    return "; ".join(
-        f"{ref.ref_kind}:{ref.ref_id}:digest={ref.digest or 'none'}" for ref in refs
-    )
 
 
 def _refs_text(refs: tuple[str, ...]) -> str:
@@ -491,15 +404,15 @@ def _candidate_from_final_answer(
         fact_candidates = _evidence_backed_fact_candidates(request, proposal)
         preserve_items = _minimum_preserve_item_candidates(request, proposal)
         retained_current_input = _retained_current_user_input_ref(request, proposal)
-        preserved_input_refs = _bounded_known_refs(
-            _required_string_tuple(proposal, "preserved_input_event_refs"),
-            allowed_refs=request.input_event_refs,
-            field_name="preserved_input_event_refs",
+        preserved_material_refs = _canonical_refs_for_labels(
+            request,
+            _required_string_tuple(proposal, "preserved_material_labels"),
+            field_name="preserved_material_labels",
         )
-        preserved_evidence_refs = _bounded_known_refs(
-            _required_string_tuple(proposal, "preserved_accepted_evidence_refs"),
-            allowed_refs=request.accepted_evidence_refs,
-            field_name="preserved_accepted_evidence_refs",
+        preserved_evidence_refs = _canonical_evidence_refs_for_labels(
+            request,
+            _required_string_tuple(proposal, "preserved_evidence_labels"),
+            field_name="preserved_evidence_labels",
         )
         preserved_fact_refs = _bounded_known_refs(
             _required_string_tuple(proposal, "preserved_evidence_backed_fact_refs"),
@@ -509,12 +422,12 @@ def _candidate_from_final_answer(
         dropped_ranges = _range_tuple(
             proposal,
             "dropped_ranges",
-            allowed_refs=request.input_event_refs,
+            request=request,
         )
         summarized_ranges = _range_tuple(
             proposal,
             "summarized_ranges",
-            allowed_refs=request.input_event_refs,
+            request=request,
         )
         return CompactionCandidate(
             candidate_id=f"llm-compact:{request.run_id}",
@@ -524,8 +437,8 @@ def _candidate_from_final_answer(
             evidence_backed_fact_candidates=fact_candidates,
             minimum_preserve_item_candidates=preserve_items,
             retained_current_user_input_ref=retained_current_input,
-            preserved_input_event_refs=preserved_input_refs,
-            preserved_accepted_evidence_refs=preserved_evidence_refs,
+            preserved_material_source_refs=preserved_material_refs,
+            preserved_canonical_evidence_refs=preserved_evidence_refs,
             preserved_evidence_backed_fact_refs=preserved_fact_refs,
             dropped_ranges=dropped_ranges,
             summarized_ranges=summarized_ranges,
@@ -588,8 +501,12 @@ def _episode_summary_candidate(
 
     data = _required_mapping(proposal, "episode_summary_candidate")
     tool_finding_refs = _bounded_known_refs(
-        _optional_string_tuple(data, "tool_finding_refs"),
-        allowed_refs=request.accepted_evidence_refs,
+        _canonical_evidence_refs_for_labels(
+            request,
+            _optional_string_tuple(data, "tool_finding_labels"),
+            field_name="episode_summary_candidate.tool_finding_labels",
+        ),
+        allowed_refs=request.canonical_evidence_refs,
         field_name="episode_summary_candidate.tool_finding_refs",
     )
     confirmed_fact_refs = _bounded_known_refs(
@@ -610,7 +527,7 @@ def _episode_summary_candidate(
         open_questions=_optional_string_tuple(data, "open_questions"),
         next_step=_optional_string_or_none(data, "next_step"),
         tool_finding_refs=tool_finding_refs,
-        source_event_refs=request.input_event_refs,
+        source_event_refs=request.material_source_refs,
         evidence_refs=evidence_refs,
     )
 
@@ -651,7 +568,7 @@ def _evidence_backed_fact_candidates(
     :param request: Host compaction request。
     :param proposal: 已解析 proposal。
     :returns: fact candidate tuple。
-    :raises ValueError: evidence_refs 不在 request accepted evidence refs 内时抛出。
+    :raises ValueError: evidence_refs 不在 request canonical evidence refs 内时抛出。
     """
 
     values = _required_sequence(
@@ -662,9 +579,9 @@ def _evidence_backed_fact_candidates(
     candidates: list[EvidenceBackedFactCandidate] = []
     for index, item in enumerate(values):
         data = _json_mapping(item, f"evidence_backed_fact_candidates[{index}]")
-        evidence_refs = _bounded_known_refs(
-            _required_string_tuple(data, "evidence_refs"),
-            allowed_refs=request.accepted_evidence_refs,
+        evidence_refs = _canonical_evidence_refs_for_labels(
+            request,
+            _required_string_tuple(data, "evidence_labels"),
             field_name=f"evidence_backed_fact_candidates[{index}].evidence_refs",
         )
         candidates.append(
@@ -699,10 +616,10 @@ def _minimum_preserve_item_candidates(
     candidates: list[MinimumPreserveItemCandidate] = []
     for index, item in enumerate(values):
         data = _json_mapping(item, f"minimum_preserve_item_candidates[{index}]")
-        source_refs = _bounded_known_refs(
-            _required_string_tuple(data, "source_refs"),
-            allowed_refs=request.input_event_refs,
-            field_name=f"minimum_preserve_item_candidates[{index}].source_refs",
+        source_refs = _canonical_refs_for_labels(
+            request,
+            _required_string_tuple(data, "source_labels"),
+            field_name=f"minimum_preserve_item_candidates[{index}].source_labels",
         )
         candidates.append(
             MinimumPreserveItemCandidate(
@@ -729,16 +646,16 @@ def _retained_current_user_input_ref(
     :raises ValueError: ref 不属于当前用户输入时抛出。
     """
 
-    value = proposal["retained_current_user_input_ref"]
+    value = proposal["retained_current_input_label"]
     if value is None:
         return None
     if not isinstance(value, str):
-        raise TypeError("retained_current_user_input_ref must be string or null")
-    if value != request.current_message_summary.current_user_input_ref:
+        raise TypeError("retained_current_input_label must be string or null")
+    if value != request.material_pack.current_input_anchor.anchor_label:
         raise ValueError(
-            "retained_current_user_input_ref must match request current input"
+            "retained_current_input_label must match request current input"
         )
-    return value
+    return request.current_input_ref
 
 
 def _text_patch(
@@ -831,36 +748,93 @@ def _range_tuple(
     proposal: Mapping[str, JsonValue],
     key: str,
     *,
-    allowed_refs: tuple[str, ...],
+    request: CompactionRequest,
 ) -> tuple[CompactInputRange, ...]:
     """解析 compact input range tuple。
 
     :param proposal: 已解析 proposal。
     :param key: range 字段名。
-    :param allowed_refs: 允许引用的输入 event refs。
+    :param request: Host compaction request。
     :returns: compact input range tuple。
-    :raises ValueError: range endpoint 不在 request 输入 refs 内时抛出。
+    :raises ValueError: range endpoint label 不在 request material pack 内时抛出。
     """
 
-    values = _required_sequence(proposal, key, max_items=len(allowed_refs))
+    values = _required_sequence(proposal, key, max_items=len(request.material_source_refs))
     ranges: list[CompactInputRange] = []
     for index, item in enumerate(values):
         data = _json_mapping(item, f"{key}[{index}]")
-        start_ref = _required_string(data, "start_input_ref")
-        end_ref = _required_string(data, "end_input_ref")
-        _bounded_known_refs(
-            (start_ref, end_ref),
-            allowed_refs=allowed_refs,
-            field_name=f"{key}[{index}]",
+        start_refs = _canonical_refs_for_labels(
+            request,
+            (_required_string(data, "start_material_label"),),
+            field_name=f"{key}[{index}].start_material_label",
+        )
+        end_refs = _canonical_refs_for_labels(
+            request,
+            (_required_string(data, "end_material_label"),),
+            field_name=f"{key}[{index}].end_material_label",
         )
         ranges.append(
             CompactInputRange(
                 range_ref=_required_string(data, "range_ref"),
-                start_input_ref=start_ref,
-                end_input_ref=end_ref,
+                start_input_ref=start_refs[0],
+                end_input_ref=end_refs[0],
             )
         )
     return tuple(ranges)
+
+
+def _canonical_refs_for_labels(
+    request: CompactionRequest,
+    labels: tuple[str, ...],
+    *,
+    field_name: str,
+) -> tuple[str, ...]:
+    """把 prompt-local material labels 映射为 canonical source refs。
+
+    :param request: Host compaction request。
+    :param labels: prompt-local labels。
+    :param field_name: 错误字段名。
+    :returns: canonical source refs。
+    :raises ValueError: label 未知时抛出。
+    """
+
+    refs: list[str] = []
+    for label in labels:
+        entry = request.material_pack.provenance_map.get(label)
+        if entry is None:
+            raise ValueError(f"{field_name} contains unknown label: {label}")
+        if len(entry.canonical_source_refs) == 0:
+            raise ValueError(f"{field_name} label has no canonical source refs: {label}")
+        refs.extend(entry.canonical_source_refs)
+    return tuple(dict.fromkeys(refs))
+
+
+def _canonical_evidence_refs_for_labels(
+    request: CompactionRequest,
+    labels: tuple[str, ...],
+    *,
+    field_name: str,
+) -> tuple[str, ...]:
+    """把 prompt-local evidence labels 映射为 canonical canonical evidence refs。
+
+    :param request: Host compaction request。
+    :param labels: prompt-local evidence labels。
+    :param field_name: 错误字段名。
+    :returns: canonical canonical evidence refs。
+    :raises ValueError: label 未知或不是 evidence label 时抛出。
+    """
+
+    refs: list[str] = []
+    for label in labels:
+        entry = request.material_pack.provenance_map.get(label)
+        if entry is None:
+            raise ValueError(f"{field_name} contains unknown label: {label}")
+        if entry.section is not CompactMaterialSection.EVIDENCE_INPUT:
+            raise ValueError(f"{field_name} contains non-evidence label: {label}")
+        if entry.accepted_evidence_id is None:
+            raise ValueError(f"{field_name} evidence label has no canonical ref")
+        refs.append(entry.accepted_evidence_id)
+    return tuple(dict.fromkeys(refs))
 
 
 def _required_mapping(
@@ -1065,8 +1039,8 @@ def _preservation_evidence(
     return (
         PreservationEvidence(
             evidence_id=f"llm-evidence:{request.run_id}:primary",
-            input_event_refs=request.input_event_refs,
-            accepted_evidence_refs=request.accepted_evidence_refs,
+            material_source_refs=request.material_source_refs,
+            canonical_evidence_refs=request.canonical_evidence_refs,
             memory_snapshot_cursor=request.memory_snapshot_cursor,
             compact_input_range=_input_range(request),
         ),
@@ -1080,12 +1054,12 @@ def _input_range(request: CompactionRequest) -> CompactInputRange | None:
     :returns: compact input range；无输入时为 ``None``。
     """
 
-    if len(request.input_event_refs) == 0:
+    if len(request.material_source_refs) == 0:
         return None
     return CompactInputRange(
         range_ref=f"llm-range:{request.run_id}:input",
-        start_input_ref=request.input_event_refs[0],
-        end_input_ref=request.input_event_refs[-1],
+        start_input_ref=request.material_source_refs[0],
+        end_input_ref=request.material_source_refs[-1],
     )
 
 
@@ -1205,8 +1179,8 @@ def _estimate_preserved_context_tokens(request: CompactionRequest) -> int:
         _estimate_text_tokens(fragment)
         for fragment in (
             _POST_COMPACT_SYSTEM_PROMPT_ESTIMATE,
-            request.current_message_summary.summary_text,
-            request.current_message_summary.current_user_input_ref,
+            request.current_input_text,
+            request.current_input_ref,
             *_preserved_ref_texts(request),
         )
     )
@@ -1224,9 +1198,9 @@ def _preserved_ref_texts(request: CompactionRequest) -> tuple[str, ...]:
     """
 
     preserved_refs = {
-        request.current_message_summary.current_user_input_ref,
+        request.current_input_ref,
         *request.recent_raw_turn_refs,
-        *request.accepted_evidence_refs,
+        *request.canonical_evidence_refs,
         *request.evidence_backed_fact_refs,
         *request.existing_episode_summary_refs,
     }
@@ -1241,8 +1215,8 @@ def _estimate_preserved_share_from_budget(request: CompactionRequest) -> int:
     """
 
     source_refs = {
-        *request.input_event_refs,
-        *request.accepted_evidence_refs,
+        *request.material_source_refs,
+        *request.canonical_evidence_refs,
         *request.evidence_backed_fact_refs,
         *request.existing_episode_summary_refs,
     }

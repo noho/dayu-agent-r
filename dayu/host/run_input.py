@@ -112,7 +112,7 @@ _PAYLOAD_FIELD_COMPACT_ARTIFACT_REF = "compact_artifact_ref"
 _PAYLOAD_FIELD_COMPACT_ARTIFACT_DIGEST = "compact_artifact_digest"
 _PAYLOAD_FIELD_EPISODE_SUMMARY_CANDIDATE = "episode_summary_candidate"
 _PAYLOAD_FIELD_PRESERVED_FACT_REFS = "preserved_fact_refs"
-_PAYLOAD_FIELD_ACCEPTED_EVIDENCE_REFS = "accepted_evidence_refs"
+_PAYLOAD_FIELD_CANONICAL_EVIDENCE_REFS = "canonical_evidence_refs"
 _PAYLOAD_FIELD_EVIDENCE_BACKED_FACT_REFS = "evidence_backed_fact_refs"
 _PAYLOAD_FIELD_CANDIDATE_ID = "candidate_id"
 _PAYLOAD_FIELD_GOAL = "goal"
@@ -2148,7 +2148,7 @@ def _optional_summary_text_from_compacted_payload(
 
 
 def _preserved_fact_refs_text(payload: Mapping[str, JsonValue]) -> str:
-    """渲染 preserved accepted evidence 与 evidence-backed fact refs。
+    """渲染 preserved canonical evidence 与 evidence-backed fact refs。
 
     :param payload: compacted payload。
     :returns: 稳定文本。
@@ -2157,14 +2157,14 @@ def _preserved_fact_refs_text(payload: Mapping[str, JsonValue]) -> str:
     value = payload.get(_PAYLOAD_FIELD_PRESERVED_FACT_REFS)
     if not isinstance(value, Mapping):
         return ""
-    accepted_evidence_refs = _optional_text_list(
-        value, _PAYLOAD_FIELD_ACCEPTED_EVIDENCE_REFS
+    canonical_evidence_refs = _optional_text_list(
+        value, _PAYLOAD_FIELD_CANONICAL_EVIDENCE_REFS
     )
     evidence_backed_fact_refs = _optional_text_list(
         value, _PAYLOAD_FIELD_EVIDENCE_BACKED_FACT_REFS
     )
     parts = [
-        f"accepted_evidence_refs={','.join(accepted_evidence_refs)}",
+        f"canonical_evidence_refs={','.join(canonical_evidence_refs)}",
         f"evidence_backed_fact_refs={','.join(evidence_backed_fact_refs)}",
     ]
     return "; ".join(parts)

@@ -63,22 +63,22 @@ class FakeContextCompactor(ContextCompactor):
             episode_summary_candidate=EpisodeSummaryCandidate(
                 candidate_id=f"fake-summary:{request.run_id}",
                 episode_title=f"Session {request.session_id} compact summary",
-                goal=request.current_message_summary.summary_text,
+                goal=request.current_input_text,
                 completed_actions=_completed_actions(request),
                 confirmed_fact_refs=request.evidence_backed_fact_refs,
                 confirmed_fact_summaries=_confirmed_fact_summaries(request),
                 user_constraints=_user_constraints(request),
                 open_questions=("continue-current-run",),
                 next_step="preserve current input and accepted tool facts",
-                tool_finding_refs=request.accepted_evidence_refs,
-                source_event_refs=request.input_event_refs,
+                tool_finding_refs=request.canonical_evidence_refs,
+                source_event_refs=request.material_source_refs,
                 evidence_refs=evidence_refs,
             ),
             pinned_state_patch_candidate=PinnedStatePatchCandidate(
                 candidate_id=f"fake-pinned-patch:{request.run_id}",
                 current_goal=PinnedTextFieldPatch(
                     operation=PinnedPatchOperation.REPLACE,
-                    value=request.current_message_summary.summary_text,
+                    value=request.current_input_text,
                     evidence_refs=evidence_refs,
                 ),
                 confirmed_subjects=PinnedStringTupleFieldPatch(
@@ -100,11 +100,9 @@ class FakeContextCompactor(ContextCompactor):
             preservation_evidence=evidence,
             evidence_backed_fact_candidates=_fact_candidates(request),
             minimum_preserve_item_candidates=_minimum_preserve_items(request),
-            retained_current_user_input_ref=(
-                request.current_message_summary.current_user_input_ref
-            ),
-            preserved_input_event_refs=request.input_event_refs,
-            preserved_accepted_evidence_refs=request.accepted_evidence_refs,
+            retained_current_user_input_ref=request.current_input_ref,
+            preserved_material_source_refs=request.material_source_refs,
+            preserved_canonical_evidence_refs=request.canonical_evidence_refs,
             preserved_evidence_backed_fact_refs=request.evidence_backed_fact_refs,
             dropped_ranges=(),
             summarized_ranges=summarized_ranges,
@@ -124,8 +122,8 @@ def _preservation_evidence(
     return (
         PreservationEvidence(
             evidence_id=f"fake-evidence:{request.run_id}:primary",
-            input_event_refs=request.input_event_refs,
-            accepted_evidence_refs=request.accepted_evidence_refs,
+            material_source_refs=request.material_source_refs,
+            canonical_evidence_refs=request.canonical_evidence_refs,
             memory_snapshot_cursor=request.memory_snapshot_cursor,
             compact_input_range=_range_for_request(request),
         ),
@@ -139,12 +137,12 @@ def _range_for_request(request: CompactionRequest) -> CompactInputRange | None:
     :returns: 输入范围；输入为空时为 ``None``。
     """
 
-    if len(request.input_event_refs) == 0:
+    if len(request.material_source_refs) == 0:
         return None
     return CompactInputRange(
         range_ref=f"fake-range:{request.run_id}:all-inputs",
-        start_input_ref=request.input_event_refs[0],
-        end_input_ref=request.input_event_refs[-1],
+        start_input_ref=request.material_source_refs[0],
+        end_input_ref=request.material_source_refs[-1],
     )
 
 
@@ -204,30 +202,32 @@ def _confirmed_subjects(request: CompactionRequest) -> tuple[str, ...]:
         return tuple(
             f"subject:{fact_ref}" for fact_ref in request.evidence_backed_fact_refs
         )
-    return (f"subject:{request.current_message_summary.current_user_input_ref}",)
+    return (f"subject:{request.current_input_ref}",)
 
 
 def _fact_candidates(
     request: CompactionRequest,
 ) -> tuple[EvidenceBackedFactCandidate, ...]:
-    """根据 raw evidence context 内容构造 deterministic fact candidates。
+    """根据 evidence material 内容构造 deterministic fact candidates。
 
     :param request: compaction 请求。
     :returns: fact candidate tuple。
     """
 
     candidates: list[EvidenceBackedFactCandidate] = []
-    for item in request.compact_raw_context_items:
-        for evidence_ref in item.accepted_evidence_refs:
-            candidates.append(
-                EvidenceBackedFactCandidate(
-                    candidate_id=f"fake-fact:{request.run_id}:{len(candidates)}",
-                    claim_text=f"Accepted evidence raw content: {item.content_text}",
-                    evidence_kind=EvidenceBackedFactKind.OBSERVED_VALUE,
-                    evidence_refs=(evidence_ref,),
-                    attributes={},
-                )
+    for block in request.material_pack.evidence_input:
+        entry = request.material_pack.provenance_map[block.evidence_label]
+        if entry.accepted_evidence_id is None:
+            continue
+        candidates.append(
+            EvidenceBackedFactCandidate(
+                candidate_id=f"fake-fact:{request.run_id}:{len(candidates)}",
+                claim_text=f"Canonical evidence material: {block.raw_result_text}",
+                evidence_kind=EvidenceBackedFactKind.OBSERVED_VALUE,
+                evidence_refs=(entry.accepted_evidence_id,),
+                attributes={},
             )
+        )
     return tuple(candidates)
 
 
@@ -244,8 +244,8 @@ def _minimum_preserve_items(
         MinimumPreserveItemCandidate(
             item_id=f"fake-preserve:{request.run_id}:current-input",
             label="current input",
-            text=request.current_message_summary.summary_text,
-            source_refs=(request.current_message_summary.current_user_input_ref,),
+            text=request.current_input_text,
+            source_refs=(request.current_input_ref,),
             preserve_reason=MinimumPreserveReason.NEEDED_FOR_RECENT_REFERENCE,
         ),
     )
@@ -258,7 +258,7 @@ def _user_constraints(request: CompactionRequest) -> tuple[str, ...]:
     :returns: 用户约束摘要。
     """
 
-    return (f"keep-current-input:{request.current_message_summary.current_user_input_ref}",)
+    return (f"keep-current-input:{request.current_input_ref}",)
 
 
 def _budget_after_compact(request: CompactionRequest) -> int:
@@ -271,7 +271,7 @@ def _budget_after_compact(request: CompactionRequest) -> int:
     estimated_budget = (
         request.budget_before_compact.estimated_input_tokens
         + _FAKE_SUMMARY_TOKEN_ESTIMATE
-        + len(request.accepted_evidence_refs)
+        + len(request.canonical_evidence_refs)
         + len(request.evidence_backed_fact_refs)
         + len(_FAKE_COMPACTION_SYSTEM_PROMPT)
     )

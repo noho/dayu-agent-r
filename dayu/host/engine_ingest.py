@@ -56,12 +56,16 @@ from dayu.host.admission import (
 )
 from dayu.host.api import AttemptStatus, RunStatus
 from dayu.host.compact_artifact import CompactArtifactStore, CompactArtifactWriteRequest
+from dayu.host.compact_material import (
+    build_initial_material_pack,
+    initial_segment_selection,
+)
 from dayu.host.compaction import (
     CompactQualityCheckResult,
+    CompactSegmentTrigger,
     CompactionCandidate,
     CompactionRequest,
     ContextCompactor,
-    CurrentMessageSummary,
 )
 from dayu.host.compaction_operation import (
     CompactionAttemptRejected,
@@ -2982,21 +2986,26 @@ def _reactive_compaction_request(
     """
 
     context = pending.context
+    material_pack = build_initial_material_pack(
+        current_input_ref=context.run.input_event_id,
+        current_input_text=pending.display_text,
+        history_materials=pending.evidence_inputs.history_materials,
+        evidence_materials=pending.evidence_inputs.evidence_materials,
+    )
+    segment_selection = initial_segment_selection(
+        trigger_source=CompactSegmentTrigger.REACTIVE,
+        input_cursor=context.run.input_event_sequence,
+        material_pack=material_pack,
+    )
     return CompactionRequest(
         trigger_source=ContextCompactionTriggerSource.REACTIVE,
         session_id=context.run.session_id,
         run_id=context.run.run_id,
         attempt_id=context.attempt.attempt_id,
         execution_id=context.attempt.execution_id,
-        input_event_refs=(context.run.input_event_id,),
         memory_snapshot_cursor=None,
-        current_message_summary=CurrentMessageSummary(
-            current_user_input_ref=context.run.input_event_id,
-            summary_text=pending.display_text,
-            source_event_refs=(context.run.input_event_id,),
-        ),
-        accepted_evidence_envelopes=pending.evidence_inputs.accepted_evidence_envelopes,
-        compact_raw_context_items=pending.evidence_inputs.compact_raw_context_items,
+        material_pack=material_pack,
+        segment_selection=segment_selection,
         evidence_backed_fact_refs=pending.evidence_inputs.evidence_backed_fact_refs,
         recent_raw_turn_refs=(context.run.input_event_id,),
         older_raw_turn_refs=(),

@@ -7,14 +7,20 @@ from typing import cast
 
 import pytest
 
+from dayu.host.compact_material import (
+    InitialEvidenceMaterial,
+    InitialHistoryMaterial,
+    build_initial_material_pack,
+    initial_segment_selection,
+)
 from dayu.host.compaction import (
     CompactInputRange,
+    CompactMaterialBlockKind,
+    CompactMaterialPack,
     CompactQualityCheckResult,
     CompactQualityIssue,
-    CompactRawContextItem,
-    CompactRawContextKind,
+    CompactSegmentTrigger,
     CompactionRequest,
-    CurrentMessageSummary,
     EvidenceBackedFactCandidate,
     EvidenceBackedFactKind,
     MAX_EVIDENCE_BACKED_FACT_CLAIM_TEXT_CHARS,
@@ -70,8 +76,8 @@ async def test_fake_compactor_observes_cancellation_token() -> None:
 
 
 @pytest.mark.asyncio
-async def test_fact_candidates_can_reference_accepted_evidence_envelopes() -> None:
-    """Fact candidates 可以引用 request 中的 accepted evidence envelope。
+async def test_fact_candidates_can_reference_evidence_materials() -> None:
+    """Fact candidates 可以引用 request 中的 evidence material。
 
     :returns: ``None``。
     """
@@ -81,17 +87,19 @@ async def test_fact_candidates_can_reference_accepted_evidence_envelopes() -> No
     result = check_compaction_candidate(request, candidate)
 
     assert result.accepted is True
-    assert tuple(
-        envelope.evidence_id for envelope in request.accepted_evidence_envelopes
-    ) == request.accepted_evidence_refs
+    assert request.material_pack.evidence_labels == ("E1", "E2")
+    assert request.canonical_evidence_refs == (
+        "evidence:accepted-1",
+        "evidence:accepted-2",
+    )
     assert tuple(
         fact.evidence_refs for fact in candidate.evidence_backed_fact_candidates
     ) == (("evidence:accepted-1",), ("evidence:accepted-2",))
     assert tuple(
         fact.claim_text for fact in candidate.evidence_backed_fact_candidates
     ) == (
-        "Accepted evidence raw content: accepted evidence raw content accepted-1",
-        "Accepted evidence raw content: accepted evidence raw content accepted-2",
+        "Canonical evidence material: canonical evidence raw content accepted-1",
+        "Canonical evidence material: canonical evidence raw content accepted-2",
     )
 
 
@@ -135,8 +143,8 @@ async def test_quality_rejects_missing_current_user_input() -> None:
 
 
 @pytest.mark.asyncio
-async def test_quality_rejects_missing_accepted_evidence_refs() -> None:
-    """Quality check 拒绝丢失 accepted evidence refs。
+async def test_quality_rejects_missing_canonical_evidence_refs() -> None:
+    """Quality check 拒绝丢失 canonical evidence refs。
 
     :returns: ``None``。
     """
@@ -144,7 +152,7 @@ async def test_quality_rejects_missing_accepted_evidence_refs() -> None:
     request = _request()
     candidate = replace(
         await FakeContextCompactor().compact(request, StubCancellationToken()),
-        preserved_accepted_evidence_refs=("evidence:accepted-1",),
+        preserved_canonical_evidence_refs=("evidence:accepted-1",),
     )
 
     result = check_compaction_candidate(request, candidate)
@@ -187,7 +195,7 @@ async def test_quality_rejects_missing_evidence_anchor_retention() -> None:
     candidate = await FakeContextCompactor().compact(request, StubCancellationToken())
     evidence = replace(
         candidate.preservation_evidence[0],
-        input_event_refs=("event-old",),
+        material_source_refs=("event-old",),
     )
     candidate = replace(candidate, preservation_evidence=(evidence,))
 
@@ -311,7 +319,7 @@ async def test_quality_rejects_summary_pretending_to_create_evidence_backed_fact
 
 @pytest.mark.asyncio
 async def test_quality_rejects_summary_confirmed_fact_ref_to_accepted_evidence() -> None:
-    """Summary confirmed_fact_refs 不能把 accepted evidence id 当 stable fact ref。
+    """Summary confirmed_fact_refs 不能把 canonical evidence id 当 stable fact ref。
 
     :returns: ``None``。
     """
@@ -357,7 +365,7 @@ async def test_quality_rejects_fact_candidate_referencing_non_evidence_ref() -> 
 
 @pytest.mark.asyncio
 async def test_quality_rejects_missing_fact_candidate_for_accepted_evidence() -> None:
-    """Accepted evidence 没有有效 fact candidate 时只产生诊断拒绝。
+    """Canonical evidence 没有有效 fact candidate 时只产生诊断拒绝。
 
     :returns: ``None``。
     """
@@ -451,7 +459,7 @@ async def test_quality_rejects_minimum_preserve_source_outside_compact_input() -
     candidate = await FakeContextCompactor().compact(request, StubCancellationToken())
     invalid_item = replace(
         candidate.minimum_preserve_item_candidates[0],
-        source_refs=("evidence:accepted-1",),
+        source_refs=("unknown-material-source",),
     )
     candidate = replace(candidate, minimum_preserve_item_candidates=(invalid_item,))
 
@@ -484,16 +492,14 @@ async def test_quality_rejects_compact_range_outside_request() -> None:
     )
 
 
-def test_compaction_request_rejects_wrong_current_message_summary_type() -> None:
-    """CompactionRequest 对非法当前消息摘要类型抛出 TypeError。
+def test_compaction_request_rejects_wrong_material_pack_type() -> None:
+    """CompactionRequest 对非法 material pack 类型抛出 TypeError。
 
     :returns: ``None``。
     """
 
-    invalid_summary = cast(CurrentMessageSummary, "not-current-message-summary")
-
-    with pytest.raises(TypeError, match="current_message_summary"):
-        _request(current_message_summary=invalid_summary)
+    with pytest.raises(TypeError, match="material_pack"):
+        _request(material_pack=cast(CompactMaterialPack, _request().segment_selection))
 
 
 def test_reactive_compaction_request_requires_attempt_and_execution_refs() -> None:
@@ -542,12 +548,12 @@ def test_compact_quality_result_rejects_accepted_with_rejection_reasons() -> Non
             accepted=True,
             rejection_reasons=(CompactQualityIssue.CURRENT_USER_INPUT_MISSING,),
             current_user_input_retained=True,
-            accepted_evidence_refs_retained=True,
+            canonical_evidence_refs_retained=True,
             evidence_backed_fact_candidates_accepted=True,
             minimum_preserve_items_accepted=True,
             evidence_anchors_retained=True,
             open_questions_retained=True,
-            retained_accepted_evidence_refs=(),
+            retained_canonical_evidence_refs=(),
             dropped_ranges=(),
             summarized_ranges=(),
         )
@@ -564,12 +570,12 @@ def test_compact_quality_result_rejects_rejected_without_rejection_reasons() -> 
             accepted=False,
             rejection_reasons=(),
             current_user_input_retained=False,
-            accepted_evidence_refs_retained=True,
+            canonical_evidence_refs_retained=True,
             evidence_backed_fact_candidates_accepted=True,
             minimum_preserve_items_accepted=True,
             evidence_anchors_retained=True,
             open_questions_retained=True,
-            retained_accepted_evidence_refs=(),
+            retained_canonical_evidence_refs=(),
             dropped_ranges=(),
             summarized_ranges=(),
         )
@@ -582,23 +588,30 @@ def _request(
     ),
     attempt_id: str | None = None,
     execution_id: str | None = None,
-    current_message_summary: CurrentMessageSummary | None = None,
+    material_pack: CompactMaterialPack | None = None,
 ) -> CompactionRequest:
     """构造标准 compaction request。
 
     :param trigger_source: compaction 触发来源。
     :param attempt_id: reactive compaction 对应 Attempt id。
     :param execution_id: reactive compaction 对应 execution id。
-    :param current_message_summary: 当前消息摘要；为 ``None`` 时使用默认摘要。
+    :param material_pack: material pack；为 ``None`` 时使用默认 pack。
     :returns: compaction request。
     """
 
-    resolved_current_message_summary = current_message_summary
-    if resolved_current_message_summary is None:
-        resolved_current_message_summary = CurrentMessageSummary(
-            current_user_input_ref="event-current",
-            summary_text="分析 A 公司 2025 年年报",
-            source_event_refs=("event-current",),
+    resolved_material_pack = material_pack
+    if resolved_material_pack is None:
+        resolved_material_pack = _material_pack()
+    segment_selection = initial_segment_selection(
+        trigger_source=CompactSegmentTrigger.PROACTIVE,
+        input_cursor=2,
+        material_pack=_material_pack(),
+    )
+    if material_pack is None:
+        segment_selection = initial_segment_selection(
+            trigger_source=CompactSegmentTrigger.PROACTIVE,
+            input_cursor=2,
+            material_pack=resolved_material_pack,
         )
 
     return CompactionRequest(
@@ -607,27 +620,9 @@ def _request(
         run_id="run-1",
         attempt_id=attempt_id,
         execution_id=execution_id,
-        input_event_refs=("event-old", "event-current"),
         memory_snapshot_cursor=7,
-        current_message_summary=resolved_current_message_summary,
-        accepted_evidence_envelopes=(
-            _accepted_evidence_envelope("accepted-1"),
-            _accepted_evidence_envelope("accepted-2"),
-        ),
-        compact_raw_context_items=(
-            CompactRawContextItem(
-                event_ref="event-tool-result-accepted-1",
-                content_kind=CompactRawContextKind.ACCEPTED_TOOL_RESULT,
-                content_text="accepted evidence raw content accepted-1",
-                accepted_evidence_refs=("evidence:accepted-1",),
-            ),
-            CompactRawContextItem(
-                event_ref="event-tool-result-accepted-2",
-                content_kind=CompactRawContextKind.ACCEPTED_TOOL_RESULT,
-                content_text="accepted evidence raw content accepted-2",
-                accepted_evidence_refs=("evidence:accepted-2",),
-            ),
-        ),
+        material_pack=resolved_material_pack,
+        segment_selection=segment_selection,
         evidence_backed_fact_refs=("fact-existing-1",),
         recent_raw_turn_refs=("event-current",),
         older_raw_turn_refs=("event-old",),
@@ -644,11 +639,54 @@ def _request(
     )
 
 
+def _material_pack():
+    """构造标准 material pack。
+
+    :returns: material pack。
+    """
+
+    return build_initial_material_pack(
+        current_input_ref="event-current",
+        current_input_text="分析 A 公司 2025 年年报",
+        history_materials=(
+            InitialHistoryMaterial(
+                canonical_source_ref="event-old",
+                text="上一轮回答摘要",
+                kind=CompactMaterialBlockKind.RAW_ASSISTANT_TURN,
+            ),
+        ),
+        evidence_materials=(
+            InitialEvidenceMaterial(
+                canonical_source_ref="evidence:accepted-1",
+                accepted_evidence_id="evidence:accepted-1",
+                tool_result_event_ref="event-tool-result-accepted-1",
+                tool_call_event_ref="event-tool-call-accepted-1",
+                readable_tool_name="fins.search",
+                readable_query_text="accepted tool query",
+                raw_result_text="canonical evidence raw content accepted-1",
+                readable_source_text="accepted tool evidence",
+                payload_refs=("payload:accepted-1",),
+            ),
+            InitialEvidenceMaterial(
+                canonical_source_ref="evidence:accepted-2",
+                accepted_evidence_id="evidence:accepted-2",
+                tool_result_event_ref="event-tool-result-accepted-2",
+                tool_call_event_ref="event-tool-call-accepted-2",
+                readable_tool_name="fins.search",
+                readable_query_text="accepted tool query",
+                raw_result_text="canonical evidence raw content accepted-2",
+                readable_source_text="accepted tool evidence",
+                payload_refs=("payload:accepted-2",),
+            ),
+        ),
+    )
+
+
 def _accepted_evidence_envelope(suffix: str) -> AcceptedEvidenceEnvelope:
-    """构造测试用 accepted evidence envelope。
+    """构造测试用 canonical evidence envelope。
 
     :param suffix: evidence 与 producer ref 后缀。
-    :returns: accepted evidence envelope。
+    :returns: canonical evidence envelope。
     """
 
     return AcceptedEvidenceEnvelope(

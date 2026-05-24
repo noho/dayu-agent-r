@@ -12,14 +12,19 @@ from dayu.host.compact_artifact import (
     CompactArtifactWriteRequest,
     compact_artifact_json,
 )
+from dayu.host.compact_material import (
+    InitialEvidenceMaterial,
+    InitialHistoryMaterial,
+    build_initial_material_pack,
+    initial_segment_selection,
+)
 from dayu.host.compaction import (
     CompactQualityIssue,
     CompactQualityCheckResult,
-    CompactRawContextItem,
-    CompactRawContextKind,
+    CompactMaterialBlockKind,
+    CompactSegmentTrigger,
     CompactionCandidate,
     CompactionRequest,
-    CurrentMessageSummary,
 )
 from dayu.host.context_budget import BudgetEstimate
 from dayu.host.context_governance import check_compaction_candidate
@@ -168,12 +173,12 @@ async def test_compact_artifact_write_request_rejects_unaccepted_quality_result(
         accepted=False,
         rejection_reasons=(CompactQualityIssue.CURRENT_USER_INPUT_MISSING,),
         current_user_input_retained=False,
-        accepted_evidence_refs_retained=True,
+        canonical_evidence_refs_retained=True,
         evidence_backed_fact_candidates_accepted=True,
         minimum_preserve_items_accepted=True,
         evidence_anchors_retained=True,
         open_questions_retained=True,
-        retained_accepted_evidence_refs=(),
+        retained_canonical_evidence_refs=(),
         dropped_ranges=(),
         summarized_ranges=(),
     )
@@ -293,30 +298,12 @@ def _request() -> CompactionRequest:
         run_id="run-1",
         attempt_id=None,
         execution_id=None,
-        input_event_refs=("event-old", "event-current"),
         memory_snapshot_cursor=7,
-        current_message_summary=CurrentMessageSummary(
-            current_user_input_ref="event-current",
-            summary_text="分析 A 公司 2025 年年报",
-            source_event_refs=("event-current",),
-        ),
-        accepted_evidence_envelopes=(
-            _accepted_evidence_envelope("accepted-1"),
-            _accepted_evidence_envelope("accepted-2"),
-        ),
-        compact_raw_context_items=(
-            CompactRawContextItem(
-                event_ref="event-tool-result-accepted-1",
-                content_kind=CompactRawContextKind.ACCEPTED_TOOL_RESULT,
-                content_text="accepted evidence raw content accepted-1",
-                accepted_evidence_refs=("evidence:accepted-1",),
-            ),
-            CompactRawContextItem(
-                event_ref="event-tool-result-accepted-2",
-                content_kind=CompactRawContextKind.ACCEPTED_TOOL_RESULT,
-                content_text="accepted evidence raw content accepted-2",
-                accepted_evidence_refs=("evidence:accepted-2",),
-            ),
+        material_pack=_material_pack(),
+        segment_selection=initial_segment_selection(
+            trigger_source=CompactSegmentTrigger.PROACTIVE,
+            input_cursor=2,
+            material_pack=_material_pack(),
         ),
         evidence_backed_fact_refs=("fact-existing-1",),
         recent_raw_turn_refs=("event-current",),
@@ -334,11 +321,54 @@ def _request() -> CompactionRequest:
     )
 
 
+def _material_pack():
+    """构造标准 material pack。
+
+    :returns: material pack。
+    """
+
+    return build_initial_material_pack(
+        current_input_ref="event-current",
+        current_input_text="分析 A 公司 2025 年年报",
+        history_materials=(
+            InitialHistoryMaterial(
+                canonical_source_ref="event-old",
+                text="上一轮回答摘要",
+                kind=CompactMaterialBlockKind.RAW_ASSISTANT_TURN,
+            ),
+        ),
+        evidence_materials=(
+            InitialEvidenceMaterial(
+                canonical_source_ref="evidence:accepted-1",
+                accepted_evidence_id="evidence:accepted-1",
+                tool_result_event_ref="event-tool-result-accepted-1",
+                tool_call_event_ref="event-tool-call-accepted-1",
+                readable_tool_name="fins.search",
+                readable_query_text="accepted tool query",
+                raw_result_text="canonical evidence raw content accepted-1",
+                readable_source_text="accepted tool evidence",
+                payload_refs=("payload:accepted-1",),
+            ),
+            InitialEvidenceMaterial(
+                canonical_source_ref="evidence:accepted-2",
+                accepted_evidence_id="evidence:accepted-2",
+                tool_result_event_ref="event-tool-result-accepted-2",
+                tool_call_event_ref="event-tool-call-accepted-2",
+                readable_tool_name="fins.search",
+                readable_query_text="accepted tool query",
+                raw_result_text="canonical evidence raw content accepted-2",
+                readable_source_text="accepted tool evidence",
+                payload_refs=("payload:accepted-2",),
+            ),
+        ),
+    )
+
+
 def _accepted_evidence_envelope(suffix: str) -> AcceptedEvidenceEnvelope:
-    """构造 compact artifact 测试用 accepted evidence envelope。
+    """构造 compact artifact 测试用 canonical evidence envelope。
 
     :param suffix: evidence 与 producer ref 后缀。
-    :returns: accepted evidence envelope。
+    :returns: canonical evidence envelope。
     """
 
     return AcceptedEvidenceEnvelope(

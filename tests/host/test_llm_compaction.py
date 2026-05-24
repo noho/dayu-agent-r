@@ -6,9 +6,16 @@ import asyncio
 import inspect
 import json
 from collections.abc import Awaitable, Callable
+from dataclasses import replace
 
 import pytest
 
+from dayu.host.compact_material import (
+    InitialEvidenceMaterial,
+    InitialHistoryMaterial,
+    build_initial_material_pack,
+    initial_segment_selection,
+)
 from dayu.engine.contracts.agent_run import (
     AgentRunRequest,
     AgentRunResult,
@@ -19,10 +26,10 @@ from dayu.engine.contracts.agent_policy import AgentPolicy
 from dayu.engine.contracts.finish_reason import FinishReason
 from dayu.engine.contracts.runner_spec import RunnerCallOptions, RunnerSpec
 from dayu.host.compaction import (
-    CompactRawContextItem,
-    CompactRawContextKind,
+    CompactMaterialPack,
+    CompactMaterialBlockKind,
+    CompactSegmentTrigger,
     CompactionRequest,
-    CurrentMessageSummary,
     MAX_EVIDENCE_BACKED_FACT_CLAIM_TEXT_CHARS,
     MAX_MINIMUM_PRESERVE_ITEM_TEXT_CHARS,
 )
@@ -143,7 +150,7 @@ async def test_llm_context_compactor_builds_tool_disabled_request(
 async def test_llm_context_compactor_prompt_contains_raw_evidence_content(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """LLM compactor prompt 使用 raw context 作为 evidence 内容。"""
+    """LLM compactor prompt 只渲染 material pack 内容。"""
 
     seen: list[AgentRunRequest] = []
 
@@ -162,19 +169,12 @@ async def test_llm_context_compactor_prompt_contains_raw_evidence_content(
     user_message = seen[0].messages[1]
     prompt = user_message.content
     assert prompt is not None
-    assert "accepted_evidence_envelopes:" in prompt
-    assert "- evidence_id: evidence:accepted-1" in prompt
-    assert "tool_name: fins.search" in prompt
-    assert "tool_call_id: tool-call-1" in prompt
-    assert "normalized_arguments_digest:" in prompt
-    assert "semantic_input_digest:" in prompt
-    assert "payload_ref: payload:1" in prompt
-    assert "outcome_digest:" in prompt
-    assert "source_refs: none" in prompt
-    assert "locator_refs: none" in prompt
-    assert "compact_raw_context:" in prompt
-    assert "content_kind: accepted_tool_result" in prompt
-    assert "accepted_evidence_refs: evidence:accepted-1" in prompt
+    assert "material_pack:" in prompt
+    assert '"label": "E1"' in prompt
+    assert '"tool_name": "fins.search"' in prompt
+    assert "payload_ref" not in prompt
+    assert "outcome_digest" not in prompt
+    assert "canonical_source_refs" not in prompt
     assert "Revenue grew 12% year over year." in prompt
 
 
@@ -210,7 +210,7 @@ async def test_llm_context_compactor_prompt_keeps_long_raw_evidence_content(
 async def test_llm_context_compactor_prompt_marks_raw_evidence_with_evidence_id(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """raw evidence 内容旁边标注 Host-minted evidence_id 供 LLM 引用。"""
+    """raw evidence 内容旁边只标注 prompt-local evidence label。"""
 
     seen: list[AgentRunRequest] = []
 
@@ -228,16 +228,13 @@ async def test_llm_context_compactor_prompt_marks_raw_evidence_with_evidence_id(
     assert len(seen) == 1
     prompt = seen[0].messages[1].content
     assert prompt is not None
-    raw_context_index = prompt.index("compact_raw_context:")
-    evidence_ref_index = prompt.index(
-        "accepted_evidence_refs: evidence:accepted-1",
-        raw_context_index,
-    )
+    material_index = prompt.index("material_pack:")
+    evidence_ref_index = prompt.index('"label": "E1"', material_index)
     raw_content_index = prompt.index(
         "Revenue grew 12% year over year.",
-        raw_context_index,
+        material_index,
     )
-    assert raw_context_index < evidence_ref_index < raw_content_index
+    assert material_index < evidence_ref_index < raw_content_index
 
 
 @pytest.mark.asyncio
@@ -262,7 +259,7 @@ async def test_llm_context_compactor_maps_final_answer_to_candidate(
     )
     assert len(candidate.evidence_backed_fact_candidates) == 1
     assert candidate.evidence_backed_fact_candidates[0].claim_text == (
-        "Accepted evidence shows revenue growth."
+        "Canonical evidence shows revenue growth."
     )
     assert candidate.evidence_backed_fact_candidates[0].evidence_refs == (
         "evidence:accepted-1",
@@ -272,8 +269,8 @@ async def test_llm_context_compactor_maps_final_answer_to_candidate(
         "Current user asked to keep the financial analysis context."
     )
     assert candidate.retained_current_user_input_ref == "input-1"
-    assert candidate.preserved_input_event_refs == ("input-1", "input-2")
-    assert candidate.preserved_accepted_evidence_refs == ("evidence:accepted-1",)
+    assert candidate.preserved_material_source_refs == ("input-1", "input-2")
+    assert candidate.preserved_canonical_evidence_refs == ("evidence:accepted-1",)
     assert candidate.preserved_evidence_backed_fact_refs == ("fact-1",)
     assert candidate.budget_after_compact > 8
 
@@ -450,10 +447,10 @@ async def test_llm_context_compactor_rejects_overlong_structured_text(
 
 
 @pytest.mark.asyncio
-async def test_llm_context_compactor_rejects_non_accepted_evidence_refs(
+async def test_llm_context_compactor_rejects_non_canonical_evidence_refs(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """fact candidate evidence_refs 只能引用 request.accepted_evidence_refs。"""
+    """fact candidate evidence_refs 只能引用 request.canonical_evidence_refs。"""
 
     monkeypatch.setattr(
         "dayu.host.llm_compaction.run_agent_and_wait",
@@ -466,8 +463,47 @@ async def test_llm_context_compactor_rejects_non_accepted_evidence_refs(
         runner_options=_runner_options(),
     )
 
-    with pytest.raises(LLMCompactionProposalError, match="unknown ref"):
+    with pytest.raises(LLMCompactionProposalError, match="unknown label"):
         await compactor.compact(_request(), StubCancellationToken())
+
+
+@pytest.mark.asyncio
+async def test_llm_context_compactor_rejects_empty_canonical_source_refs(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """prompt-local label 映射为空 canonical source refs 时返回明确 schema 错误。"""
+
+    monkeypatch.setattr(
+        "dayu.host.llm_compaction.run_agent_and_wait",
+        _fake_run_factory(_final(_proposal_json(preserved_material_labels=("C1",)))),
+    )
+    request = _request()
+    material_pack = request.material_pack
+    provenance_map = dict(material_pack.provenance_map)
+    provenance_map["H1"] = replace(
+        provenance_map["H1"],
+        canonical_source_refs=(),
+    )
+    invalid_pack = CompactMaterialPack(
+        stable_input=material_pack.stable_input,
+        history_input=material_pack.history_input,
+        evidence_input=material_pack.evidence_input,
+        current_input_anchor=material_pack.current_input_anchor,
+        provenance_map=provenance_map,
+    )
+    compactor = _llm_compactor(
+        runner_spec=_runner_spec(),
+        runner_options=_runner_options(),
+    )
+
+    with pytest.raises(
+        LLMCompactionProposalError,
+        match="has no canonical source refs",
+    ):
+        await compactor.compact(
+            replace(request, material_pack=invalid_pack),
+            StubCancellationToken(),
+        )
 
 
 @pytest.mark.asyncio
@@ -583,8 +619,12 @@ async def test_llm_context_compactor_preserves_host_owned_refs_and_evidence(
     ).compact(_request(), StubCancellationToken())
 
     evidence = candidate.preservation_evidence[0]
-    assert evidence.input_event_refs == ("input-1", "input-2")
-    assert evidence.accepted_evidence_refs == ("evidence:accepted-1",)
+    assert evidence.material_source_refs == (
+        "input-1",
+        "input-2",
+        "evidence:accepted-1",
+    )
+    assert evidence.canonical_evidence_refs == ("evidence:accepted-1",)
     assert candidate.episode_summary_candidate.evidence_refs == (
         evidence.evidence_id,
     )
@@ -651,21 +691,12 @@ def _request(
         run_id="run-1",
         attempt_id=None,
         execution_id=None,
-        input_event_refs=("input-1", "input-2"),
         memory_snapshot_cursor=7,
-        current_message_summary=CurrentMessageSummary(
-            current_user_input_ref="input-1",
-            summary_text="current user text",
-            source_event_refs=("input-1",),
-        ),
-        accepted_evidence_envelopes=(_accepted_evidence_envelope(),),
-        compact_raw_context_items=(
-            CompactRawContextItem(
-                event_ref="event-tool-result-1",
-                content_kind=CompactRawContextKind.ACCEPTED_TOOL_RESULT,
-                content_text=raw_tool_content,
-                accepted_evidence_refs=("evidence:accepted-1",),
-            ),
+        material_pack=_material_pack(raw_tool_content),
+        segment_selection=initial_segment_selection(
+            trigger_source=CompactSegmentTrigger.PROACTIVE,
+            input_cursor=2,
+            material_pack=_material_pack(raw_tool_content),
         ),
         evidence_backed_fact_refs=("fact-1",),
         recent_raw_turn_refs=("input-1",),
@@ -683,19 +714,54 @@ def _request(
     )
 
 
+def _material_pack(raw_tool_content: str):
+    """构造测试 material pack。
+
+    :param raw_tool_content: raw evidence 文本。
+    :returns: material pack。
+    """
+
+    return build_initial_material_pack(
+        current_input_ref="input-1",
+        current_input_text="current user text",
+        history_materials=(
+            InitialHistoryMaterial(
+                canonical_source_ref="input-2",
+                text="previous assistant turn",
+                kind=CompactMaterialBlockKind.RAW_ASSISTANT_TURN,
+            ),
+        ),
+        evidence_materials=(
+            InitialEvidenceMaterial(
+                canonical_source_ref="evidence:accepted-1",
+                accepted_evidence_id="evidence:accepted-1",
+                tool_result_event_ref="event-tool-result-1",
+                tool_call_event_ref="event-tool-call-1",
+                readable_tool_name="fins.search",
+                readable_query_text="accepted tool query",
+                raw_result_text=raw_tool_content,
+                readable_source_text="accepted tool evidence",
+                payload_refs=("payload:accepted-1",),
+            ),
+        ),
+    )
+
+
 def _proposal_json(
     *,
-    claim_text: str = "Accepted evidence shows revenue growth.",
+    claim_text: str = "Canonical evidence shows revenue growth.",
     minimum_preserve_text: str = (
         "Current user asked to keep the financial analysis context."
     ),
-    fact_evidence_refs: tuple[str, ...] = ("evidence:accepted-1",),
+    fact_evidence_refs: tuple[str, ...] = ("E1",),
+    preserved_material_labels: tuple[str, ...] = ("C1", "H1"),
 ) -> str:
     """构造 LLM structured JSON proposal。
 
     :param claim_text: fact candidate claim_text。
     :param minimum_preserve_text: minimum preserve item text。
     :param fact_evidence_refs: fact candidate evidence refs。
+    :param preserved_material_labels: preserved material labels。
     :returns: JSON 文本。
     """
 
@@ -710,7 +776,7 @@ def _proposal_json(
                 "user_constraints": ["keep-current-input:input-1"],
                 "open_questions": ["continue-current-run"],
                 "next_step": "continue with the current user input",
-                "tool_finding_refs": ["evidence:accepted-1"],
+                "tool_finding_labels": ["E1"],
             },
             "pinned_state_patch_candidate": {
                 "current_goal": {
@@ -735,7 +801,7 @@ def _proposal_json(
                     "candidate_id": "fact-candidate-1",
                     "claim_text": claim_text,
                     "evidence_kind": "observed_value",
-                    "evidence_refs": list(fact_evidence_refs),
+                    "evidence_labels": list(fact_evidence_refs),
                     "attributes": {},
                 }
             ],
@@ -744,20 +810,20 @@ def _proposal_json(
                     "item_id": "preserve-current-input",
                     "label": "current input",
                     "text": minimum_preserve_text,
-                    "source_refs": ["input-1"],
+                    "source_labels": ["C1"],
                     "preserve_reason": "needed_for_recent_reference",
                 }
             ],
-            "retained_current_user_input_ref": "input-1",
-            "preserved_input_event_refs": ["input-1", "input-2"],
-            "preserved_accepted_evidence_refs": ["evidence:accepted-1"],
+            "retained_current_input_label": "C1",
+            "preserved_material_labels": list(preserved_material_labels),
+            "preserved_evidence_labels": ["E1"],
             "preserved_evidence_backed_fact_refs": ["fact-1"],
             "dropped_ranges": [],
             "summarized_ranges": [
                 {
                     "range_ref": "range-older-raw-turns",
-                    "start_input_ref": "input-2",
-                    "end_input_ref": "input-2",
+                    "start_material_label": "H1",
+                    "end_material_label": "H1",
                 }
             ],
         },
@@ -766,9 +832,9 @@ def _proposal_json(
 
 
 def _accepted_evidence_envelope() -> AcceptedEvidenceEnvelope:
-    """构造测试用 accepted evidence envelope。
+    """构造测试用 canonical evidence envelope。
 
-    :returns: accepted evidence envelope。
+    :returns: canonical evidence envelope。
     """
 
     return AcceptedEvidenceEnvelope(

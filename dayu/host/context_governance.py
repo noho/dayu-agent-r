@@ -41,11 +41,11 @@ def check_compaction_candidate(
 
     issue_collector = _QualityIssueCollector()
     current_user_input_retained = _current_user_input_retained(request, candidate)
-    accepted_evidence_refs_retained = _accepted_evidence_refs_retained(
+    canonical_evidence_refs_retained = _canonical_evidence_refs_retained(
         request, candidate
     )
     evidence_ids = _evidence_ids(candidate.preservation_evidence)
-    accepted_evidence_ids = set(request.accepted_evidence_refs)
+    accepted_evidence_ids = set(request.canonical_evidence_refs)
     evidence_anchors_retained = _evidence_anchors_retained(request, candidate)
     compact_ranges_from_request = _compact_ranges_from_request(request, candidate)
     fact_candidates_accepted = _fact_candidates_accepted(
@@ -66,7 +66,7 @@ def check_compaction_candidate(
 
     if not current_user_input_retained:
         issue_collector.add(CompactQualityIssue.CURRENT_USER_INPUT_MISSING)
-    if not accepted_evidence_refs_retained:
+    if not canonical_evidence_refs_retained:
         issue_collector.add(CompactQualityIssue.ACCEPTED_EVIDENCE_REFS_MISSING)
     if _summary_pretends_evidence_backed_fact(request, candidate):
         issue_collector.add(
@@ -107,13 +107,13 @@ def check_compaction_candidate(
         accepted=len(reasons) == 0,
         rejection_reasons=reasons,
         current_user_input_retained=current_user_input_retained,
-        accepted_evidence_refs_retained=accepted_evidence_refs_retained,
+        canonical_evidence_refs_retained=canonical_evidence_refs_retained,
         evidence_backed_fact_candidates_accepted=fact_candidates_accepted,
         minimum_preserve_items_accepted=minimum_preserve_items_accepted,
         evidence_anchors_retained=evidence_anchors_retained,
         open_questions_retained=open_questions_retained,
-        retained_accepted_evidence_refs=tuple(
-            sorted(set(candidate.preserved_accepted_evidence_refs))
+        retained_canonical_evidence_refs=tuple(
+            sorted(set(candidate.preserved_canonical_evidence_refs))
         ),
         dropped_ranges=candidate.dropped_ranges,
         summarized_ranges=candidate.summarized_ranges,
@@ -160,25 +160,25 @@ def _current_user_input_retained(
     :returns: 已保留时返回 ``True``。
     """
 
-    current_ref = request.current_message_summary.current_user_input_ref
+    current_ref = request.current_input_ref
     return (
         candidate.retained_current_user_input_ref == current_ref
-        and current_ref in candidate.preserved_input_event_refs
+        and current_ref in candidate.preserved_material_source_refs
     )
 
 
-def _accepted_evidence_refs_retained(
+def _canonical_evidence_refs_retained(
     request: CompactionRequest, candidate: CompactionCandidate
 ) -> bool:
-    """判断 accepted evidence refs 是否全部保留。
+    """判断 canonical evidence refs 是否全部保留。
 
     :param request: compaction 请求。
     :param candidate: compaction candidate。
     :returns: 全部保留时返回 ``True``。
     """
 
-    return set(request.accepted_evidence_refs).issubset(
-        set(candidate.preserved_accepted_evidence_refs)
+    return set(request.canonical_evidence_refs).issubset(
+        set(candidate.preserved_canonical_evidence_refs)
     )
 
 
@@ -229,12 +229,12 @@ def _evidence_anchors_retained(
     )
     if not summary_refs_valid:
         return False
-    current_ref = request.current_message_summary.current_user_input_ref
+    current_ref = request.current_input_ref
     retained_input_refs = _retained_input_refs(candidate.preservation_evidence)
     retained_tool_refs = _retained_tool_refs(candidate.preservation_evidence)
     if current_ref not in retained_input_refs:
         return False
-    if not set(request.accepted_evidence_refs).issubset(retained_tool_refs):
+    if not set(request.canonical_evidence_refs).issubset(retained_tool_refs):
         return False
     for evidence in candidate.preservation_evidence:
         if not _single_evidence_anchor_valid(request, evidence):
@@ -253,17 +253,17 @@ def _single_evidence_anchor_valid(
     """
 
     has_anchor = (
-        len(evidence.input_event_refs) > 0
-        or len(evidence.accepted_evidence_refs) > 0
+        len(evidence.material_source_refs) > 0
+        or len(evidence.canonical_evidence_refs) > 0
         or evidence.memory_snapshot_cursor is not None
         or evidence.compact_input_range is not None
     )
     if not has_anchor:
         return False
-    if not set(evidence.input_event_refs).issubset(set(request.input_event_refs)):
+    if not set(evidence.material_source_refs).issubset(set(request.material_source_refs)):
         return False
-    if not set(evidence.accepted_evidence_refs).issubset(
-        set(request.accepted_evidence_refs)
+    if not set(evidence.canonical_evidence_refs).issubset(
+        set(request.canonical_evidence_refs)
     ):
         return False
     if evidence.memory_snapshot_cursor is not None:
@@ -286,7 +286,7 @@ def _range_refs_from_input(
     :returns: 起止 ref 均来自输入时返回 ``True``。
     """
 
-    input_refs = set(request.input_event_refs)
+    input_refs = set(request.material_source_refs)
     return (
         input_range.start_input_ref in input_refs
         and input_range.end_input_ref in input_refs
@@ -324,22 +324,22 @@ def _retained_input_refs(
 
     retained: set[str] = set()
     for evidence in evidence_items:
-        retained.update(evidence.input_event_refs)
+        retained.update(evidence.material_source_refs)
     return retained
 
 
 def _retained_tool_refs(
     evidence_items: tuple[PreservationEvidence, ...]
 ) -> set[str]:
-    """汇总 evidence 保留的 accepted evidence refs。
+    """汇总 evidence 保留的 canonical evidence refs。
 
     :param evidence_items: preservation evidence tuple。
-    :returns: accepted evidence refs 集合。
+    :returns: canonical evidence refs 集合。
     """
 
     retained: set[str] = set()
     for evidence in evidence_items:
-        retained.update(evidence.accepted_evidence_refs)
+        retained.update(evidence.canonical_evidence_refs)
     return retained
 
 
@@ -353,7 +353,7 @@ def _fact_candidates_accepted(
 
     :param request: compaction 请求。
     :param candidate: compaction candidate。
-    :param accepted_evidence_ids: 请求内 accepted evidence ids。
+    :param accepted_evidence_ids: 请求内 canonical evidence ids。
     :returns: candidates 合法时返回 ``True``。
     """
 
@@ -369,10 +369,10 @@ def _fact_candidates_accepted(
 def _single_fact_candidate_accepted(
     candidate: EvidenceBackedFactCandidate, *, accepted_evidence_ids: set[str]
 ) -> bool:
-    """判断单个 fact candidate 的 evidence refs 是否只指向 accepted evidence。
+    """判断单个 fact candidate 的 evidence refs 是否只指向 canonical evidence。
 
     :param candidate: fact candidate。
-    :param accepted_evidence_ids: 请求内 accepted evidence ids。
+    :param accepted_evidence_ids: 请求内 canonical evidence ids。
     :returns: refs 合法时返回 ``True``。
     """
 
@@ -389,13 +389,13 @@ def _retained_accepted_evidence_with_no_fact_candidate(
     candidate: CompactionCandidate,
     accepted_evidence_ids: set[str],
 ) -> bool:
-    """判断是否存在已保留 accepted evidence 没有任何有效 fact candidate。
+    """判断是否存在已保留 canonical evidence 没有任何有效 fact candidate。
 
     该分支只产生 rejection diagnostic / repair outcome，不构造 fallback fact。
 
     :param request: compaction 请求。
     :param candidate: compaction candidate。
-    :param accepted_evidence_ids: 请求内 accepted evidence ids。
+    :param accepted_evidence_ids: 请求内 canonical evidence ids。
     :returns: 存在缺失时返回 ``True``。
     """
 
@@ -406,7 +406,7 @@ def _retained_accepted_evidence_with_no_fact_candidate(
             fact_candidate, accepted_evidence_ids=accepted_evidence_ids
         ):
             covered.update(fact_candidate.evidence_refs)
-    retained = set(candidate.preserved_accepted_evidence_refs).intersection(
+    retained = set(candidate.preserved_canonical_evidence_refs).intersection(
         accepted_evidence_ids
     )
     return not retained.issubset(covered)
@@ -422,7 +422,7 @@ def _minimum_preserve_items_accepted(
     :returns: candidates 合法时返回 ``True``。
     """
 
-    allowed_source_refs = set(request.input_event_refs)
+    allowed_source_refs = set(request.material_source_refs)
     for item in candidate.minimum_preserve_item_candidates:
         if not _single_minimum_preserve_item_accepted(
             item, allowed_source_refs=allowed_source_refs

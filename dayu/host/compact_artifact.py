@@ -28,7 +28,6 @@ from dayu.host.durable.codec import (
 from dayu.host.durable.errors import HostDurableError
 from dayu.host.durable.payload import PayloadDescriptor, PayloadStore
 from dayu.host.durable.transaction import HostTransaction
-from dayu.host.evidence import accepted_evidence_envelope_to_json_value
 
 _COMPACT_ARTIFACT_MEDIA_TYPE = "application/vnd.dayu.context-compact+json"
 _COMPACT_ARTIFACT_KIND = "context_compaction"
@@ -209,8 +208,8 @@ def compact_artifact_json(request: CompactArtifactWriteRequest) -> JsonValue:
         "dropped_ranges": _range_list_json(candidate.dropped_ranges),
         "summarized_ranges": _range_list_json(candidate.summarized_ranges),
         "preserved_fact_refs": {
-            "accepted_evidence_refs": _string_list_json(
-                candidate.preserved_accepted_evidence_refs
+            "canonical_evidence_refs": _string_list_json(
+                candidate.preserved_canonical_evidence_refs
             ),
             "evidence_backed_fact_refs": _string_list_json(
                 candidate.preserved_evidence_backed_fact_refs
@@ -290,19 +289,14 @@ def _input_snapshot_refs_json(request: CompactionRequest) -> JsonValue:
     """
 
     return {
-        "input_event_refs": _string_list_json(request.input_event_refs),
+        "material_source_refs": _string_list_json(request.material_source_refs),
         "memory_snapshot_cursor": request.memory_snapshot_cursor,
-        "current_user_input_ref": (
-            request.current_message_summary.current_user_input_ref
-        ),
-        "accepted_evidence_refs": _string_list_json(request.accepted_evidence_refs),
-        "accepted_evidence_envelopes": [
-            accepted_evidence_envelope_to_json_value(envelope)
-            for envelope in request.accepted_evidence_envelopes
-        ],
-        "compact_raw_context_items": [
-            item.to_json() for item in request.compact_raw_context_items
-        ],
+        "current_input_ref": request.current_input_ref,
+        "material_pack_digest": request.material_pack.provenance_map[
+            request.material_pack.current_input_anchor.anchor_label
+        ].content_digest,
+        "segment_selection_digest": request.segment_selection.selection_digest,
+        "canonical_evidence_refs": _string_list_json(request.canonical_evidence_refs),
         "evidence_backed_fact_refs": _string_list_json(
             request.evidence_backed_fact_refs
         ),

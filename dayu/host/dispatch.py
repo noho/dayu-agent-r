@@ -121,11 +121,15 @@ from dayu.host.compact_artifact import (
     CompactArtifactStore,
     CompactArtifactWriteRequest,
 )
+from dayu.host.compact_material import (
+    build_initial_material_pack,
+    initial_segment_selection,
+)
 from dayu.host.compaction import (
     CompactQualityCheckResult,
+    CompactSegmentTrigger,
     CompactionCandidate,
     CompactionRequest,
-    CurrentMessageSummary,
 )
 from dayu.host.compaction_operation import (
     CompactionAttemptRejected,
@@ -1365,21 +1369,26 @@ class HostDispatchScheduler:
             start_event_sequence=1,
             end_event_sequence=run.input_event_sequence,
         )
+        material_pack = build_initial_material_pack(
+            current_input_ref=run.input_event_id,
+            current_input_text=display_text,
+            history_materials=evidence_inputs.history_materials,
+            evidence_materials=evidence_inputs.evidence_materials,
+        )
+        segment_selection = initial_segment_selection(
+            trigger_source=CompactSegmentTrigger.PROACTIVE,
+            input_cursor=run.input_event_sequence,
+            material_pack=material_pack,
+        )
         request = CompactionRequest(
             trigger_source=ContextCompactionTriggerSource.PROACTIVE,
             session_id=run.session_id,
             run_id=run.run_id,
             attempt_id=None,
             execution_id=None,
-            input_event_refs=(run.input_event_id,),
             memory_snapshot_cursor=None,
-            current_message_summary=CurrentMessageSummary(
-                current_user_input_ref=run.input_event_id,
-                summary_text=display_text,
-                source_event_refs=(run.input_event_id,),
-            ),
-            accepted_evidence_envelopes=evidence_inputs.accepted_evidence_envelopes,
-            compact_raw_context_items=evidence_inputs.compact_raw_context_items,
+            material_pack=material_pack,
+            segment_selection=segment_selection,
             evidence_backed_fact_refs=evidence_inputs.evidence_backed_fact_refs,
             recent_raw_turn_refs=(run.input_event_id,),
             older_raw_turn_refs=(),

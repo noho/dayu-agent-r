@@ -346,7 +346,7 @@ def _compact_payload(
     """
 
     patch = pinned_patch if pinned_patch is not None else _missing_pinned_patch()
-    accepted_evidence_refs = ("evidence-1",)
+    canonical_evidence_refs = ("evidence-1",)
     return {
         "compact_artifact_ref": "compact-artifact:test",
         "compact_artifact_digest": _DIGEST_A,
@@ -376,15 +376,15 @@ def _compact_payload(
         "preservation_evidence": [
             {
                 "evidence_id": "evidence-1",
-                "input_event_refs": ["event-input"],
-                "accepted_evidence_refs": list(accepted_evidence_refs),
+                "material_source_refs": ["event-input"],
+                "canonical_evidence_refs": list(canonical_evidence_refs),
                 "evidence_backed_fact_refs": list(confirmed_fact_refs),
                 "memory_snapshot_cursor": None,
                 "compact_input_range": None,
             }
         ],
         "preserved_fact_refs": {
-            "accepted_evidence_refs": list(accepted_evidence_refs),
+            "canonical_evidence_refs": list(canonical_evidence_refs),
             "evidence_backed_fact_refs": list(confirmed_fact_refs),
         },
         "dropped_ranges": [],
@@ -394,12 +394,12 @@ def _compact_payload(
             "accepted": True,
             "rejection_reasons": [],
             "current_user_input_retained": True,
-            "accepted_evidence_refs_retained": True,
+            "canonical_evidence_refs_retained": True,
             "evidence_backed_fact_candidates_accepted": True,
             "minimum_preserve_items_accepted": True,
             "evidence_anchors_retained": True,
             "open_questions_retained": True,
-            "retained_accepted_evidence_refs": list(accepted_evidence_refs),
+            "retained_canonical_evidence_refs": list(canonical_evidence_refs),
             "dropped_ranges": [],
             "summarized_ranges": [],
         },
@@ -430,14 +430,14 @@ def _missing_pinned_patch() -> dict[str, JsonValue]:
 def _fact_candidate(
     *,
     candidate_id: str = "fact-candidate-1",
-    claim_text: str = "Accepted evidence supports revenue growth.",
+    claim_text: str = "Canonical evidence supports revenue growth.",
     evidence_refs: tuple[str, ...] = ("evidence-1",),
 ) -> dict[str, JsonValue]:
     """构造 evidence-backed fact candidate JSON。
 
     :param candidate_id: candidate-local id。
     :param claim_text: fact claim 文本。
-    :param evidence_refs: accepted evidence refs。
+    :param evidence_refs: canonical evidence refs。
     :returns: fact candidate JSON。
     """
 
@@ -1502,7 +1502,7 @@ def test_context_compacted_fact_candidates_materialize_evidence_backed_facts() -
                     fact_candidates=[
                         _fact_candidate(
                             candidate_id="candidate-local-only",
-                            claim_text="Revenue increased based on accepted evidence.",
+                            claim_text="Revenue increased based on canonical evidence.",
                         )
                     ],
                 ),
@@ -1515,7 +1515,7 @@ def test_context_compacted_fact_candidates_materialize_evidence_backed_facts() -
 
     assert len(snapshot.evidence_backed_facts) == 1
     fact = snapshot.evidence_backed_facts[0]
-    assert fact.claim_text == "Revenue increased based on accepted evidence."
+    assert fact.claim_text == "Revenue increased based on canonical evidence."
     assert fact.evidence_refs == ("evidence-1",)
     assert fact.evidence_kind is EvidenceBackedFactKind.OBSERVED_VALUE
     assert fact.provenance.event_id == "event-compact-fact"

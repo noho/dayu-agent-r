@@ -10,13 +10,18 @@ import pytest
 
 from dayu.contracts.cancellation import CancellationToken
 from dayu.contracts.json_value import JsonValue
+from dayu.host.compact_material import (
+    InitialEvidenceMaterial,
+    InitialHistoryMaterial,
+    build_initial_material_pack,
+    initial_segment_selection,
+)
 from dayu.host.compaction import (
-    CompactRawContextItem,
-    CompactRawContextKind,
+    CompactMaterialBlockKind,
+    CompactSegmentTrigger,
     CompactionCandidate,
     CompactionRequest,
     ContextCompactor,
-    CurrentMessageSummary,
 )
 from dayu.host.compaction_evidence import (
     collect_compaction_request_evidence_inputs,
@@ -470,34 +475,33 @@ def test_compaction_request_evidence_inputs_are_bounded_for_proactive_and_reacti
             )
             return (
                 tuple(
-                    envelope.evidence_id
-                    for envelope in inputs.accepted_evidence_envelopes
+                    material.accepted_evidence_id
+                    for material in inputs.evidence_materials
                 ),
                 tuple(
                     (
-                        item.event_ref,
-                        item.content_text,
-                        item.accepted_evidence_refs,
+                        item.tool_result_event_ref,
+                        item.raw_result_text,
+                        (item.accepted_evidence_id,),
                     )
-                    for item in inputs.compact_raw_context_items
+                    for item in inputs.evidence_materials
                 ),
             )
 
         assert store.transaction_runner.run_read(read_inputs) == (
             ("evidence:event-tool-result-inside",),
-            (
                 (
-                    "event-tool-result-inside",
                     (
-                        '{"kind":"completed","result":{"meta":null,"ok":true,'
-                        '"value":{"content":"raw content event-tool-result-inside",'
-                        '"event_id":"event-tool-result-inside"}}}'
+                        "event-tool-result-inside",
+                        (
+                            '{"kind":"completed","result":{"meta":null,"ok":true,'
+                            '"value":{"content":"raw content event-tool-result-inside",'
+                            '"event_id":"event-tool-result-inside"}}}'
+                        ),
+                        ("evidence:event-tool-result-inside",),
                     ),
-                    ("evidence:event-tool-result-inside",),
                 ),
-                ("event-current-input", "current input", ()),
-            ),
-        )
+            )
 
 
 def test_compaction_request_evidence_inputs_allow_empty_when_range_has_no_envelope(
@@ -543,8 +547,8 @@ def test_compaction_request_evidence_inputs_allow_empty_when_range_has_no_envelo
                 end_event_sequence=end_event_sequence,
             )
             return tuple(
-                envelope.evidence_id
-                for envelope in inputs.accepted_evidence_envelopes
+                material.accepted_evidence_id
+                for material in inputs.evidence_materials
             )
 
         assert store.transaction_runner.run_read(read_inputs) == ()
@@ -567,7 +571,7 @@ def test_compaction_request_evidence_inputs_reject_malformed_envelope(
             payload={"accepted_evidence_envelope": {"evidence_id": "evidence:bad"}},
         )
 
-        with pytest.raises(HostDurableError, match="accepted evidence envelope"):
+        with pytest.raises(HostDurableError, match="canonical evidence envelope"):
             _collect_evidence_ids(
                 store,
                 event_log,
@@ -579,7 +583,7 @@ def test_compaction_request_evidence_inputs_reject_malformed_envelope(
 def test_compaction_request_evidence_inputs_reject_missing_raw_tool_outcome(
     tmp_path: Path,
 ) -> None:
-    """accepted evidence 对应 raw 工具结果缺失时 fail closed。"""
+    """canonical evidence 对应 raw 工具结果缺失时 fail closed。"""
 
     session_id = "session-missing-raw-tool-outcome"
     with open_host_durable_store(_options(tmp_path)) as store:
@@ -610,7 +614,7 @@ def test_compaction_request_evidence_inputs_reject_missing_raw_tool_outcome(
 def test_compaction_request_evidence_inputs_reject_envelope_producer_mismatch(
     tmp_path: Path,
 ) -> None:
-    """accepted evidence producer_event_ref 必须匹配 EventLog row id。"""
+    """canonical evidence producer_event_ref 必须匹配 EventLog row id。"""
 
     session_id = "session-envelope-mismatch"
     with open_host_durable_store(_options(tmp_path)) as store:
@@ -701,7 +705,7 @@ def test_compaction_request_evidence_inputs_reject_malformed_compacted_payload(
 def test_compaction_request_evidence_inputs_deduplicate_accepted_evidence_ids(
     tmp_path: Path,
 ) -> None:
-    """accepted_evidence_envelopes 按 evidence_id 去重并保留首个。"""
+    """evidence material 按 accepted evidence id 去重并保留首个。"""
 
     session_id = "session-duplicate-evidence"
     with open_host_durable_store(_options(tmp_path)) as store:
@@ -783,7 +787,7 @@ def test_compaction_request_evidence_inputs_deduplicate_accepted_evidence_ids(
 def test_compaction_request_evidence_inputs_collect_run_succeeded_raw_context(
     tmp_path: Path,
 ) -> None:
-    """RUN_SUCCEEDED assistant conclusion 进入 compact raw context。"""
+    """RUN_SUCCEEDED assistant conclusion 进入 history material。"""
 
     session_id = "session-run-succeeded-raw-context"
     with open_host_durable_store(_options(tmp_path)) as store:
@@ -798,13 +802,13 @@ def test_compaction_request_evidence_inputs_collect_run_succeeded_raw_context(
             payload={"final_answer": "本轮回答中的稳定结论摘要"},
         )
 
-        def read_raw_context(
+        def read_history_material(
             transaction: HostTransaction,
-        ) -> tuple[tuple[str, CompactRawContextKind, str, tuple[str, ...]], ...]:
-            """读取共享 helper 输出的 raw context 摘要。
+        ) -> tuple[tuple[str, CompactMaterialBlockKind, str], ...]:
+            """读取共享 helper 输出的 history material 摘要。
 
             :param transaction: Host transaction。
-            :returns: raw context 摘要 tuple。
+            :returns: history material 摘要 tuple。
             """
 
             inputs = collect_compaction_request_evidence_inputs(
@@ -816,20 +820,18 @@ def test_compaction_request_evidence_inputs_collect_run_succeeded_raw_context(
             )
             return tuple(
                 (
-                    item.event_ref,
-                    item.content_kind,
-                    item.content_text,
-                    item.accepted_evidence_refs,
+                    item.canonical_source_ref,
+                    item.kind,
+                    item.text,
                 )
-                for item in inputs.compact_raw_context_items
+                for item in inputs.history_materials
             )
 
-        assert store.transaction_runner.run_read(read_raw_context) == (
+        assert store.transaction_runner.run_read(read_history_material) == (
             (
                 event_id,
-                CompactRawContextKind.ASSISTANT_CONCLUSION,
+                CompactMaterialBlockKind.RAW_ASSISTANT_TURN,
                 "本轮回答中的稳定结论摘要",
-                (),
             ),
         )
 
@@ -892,21 +894,16 @@ def _request(
         run_id="run-operation",
         attempt_id="attempt-operation" if is_reactive else None,
         execution_id="execution-operation" if is_reactive else None,
-        input_event_refs=("input-1", "input-2"),
         memory_snapshot_cursor=7,
-        current_message_summary=CurrentMessageSummary(
-            current_user_input_ref="input-1",
-            summary_text="current user text",
-            source_event_refs=("input-1",),
-        ),
-        accepted_evidence_envelopes=(_accepted_evidence_envelope(),),
-        compact_raw_context_items=(
-            CompactRawContextItem(
-                event_ref="event-tool-result-operation",
-                content_kind=CompactRawContextKind.ACCEPTED_TOOL_RESULT,
-                content_text="operation accepted evidence raw content",
-                accepted_evidence_refs=("evidence:accepted-operation",),
+        material_pack=_material_pack(),
+        segment_selection=initial_segment_selection(
+            trigger_source=(
+                CompactSegmentTrigger.REACTIVE
+                if is_reactive
+                else CompactSegmentTrigger.PROACTIVE
             ),
+            input_cursor=2,
+            material_pack=_material_pack(),
         ),
         evidence_backed_fact_refs=("fact-existing-1",),
         recent_raw_turn_refs=("input-1",),
@@ -924,10 +921,42 @@ def _request(
     )
 
 
-def _accepted_evidence_envelope() -> AcceptedEvidenceEnvelope:
-    """构造测试用 accepted evidence envelope。
+def _material_pack():
+    """构造 compaction operation 测试 material pack。
 
-    :returns: accepted evidence envelope。
+    :returns: material pack。
+    """
+
+    return build_initial_material_pack(
+        current_input_ref="input-1",
+        current_input_text="current user text",
+        history_materials=(
+            InitialHistoryMaterial(
+                canonical_source_ref="input-2",
+                text="previous assistant turn",
+                kind=CompactMaterialBlockKind.RAW_ASSISTANT_TURN,
+            ),
+        ),
+        evidence_materials=(
+            InitialEvidenceMaterial(
+                canonical_source_ref="evidence:accepted-operation",
+                accepted_evidence_id="evidence:accepted-operation",
+                tool_result_event_ref="event-tool-result-operation",
+                tool_call_event_ref="event-tool-call-operation",
+                readable_tool_name="fins.search",
+                readable_query_text="accepted tool query",
+                raw_result_text="operation canonical evidence raw content",
+                readable_source_text="accepted tool evidence",
+                payload_refs=("payload:operation",),
+            ),
+        ),
+    )
+
+
+def _accepted_evidence_envelope() -> AcceptedEvidenceEnvelope:
+    """构造测试用 canonical evidence envelope。
+
+    :returns: canonical evidence envelope。
     """
 
     return AcceptedEvidenceEnvelope(
@@ -954,10 +983,10 @@ def _accepted_evidence_envelope() -> AcceptedEvidenceEnvelope:
 def _accepted_evidence_envelope_for_event(
     event_id: str,
 ) -> AcceptedEvidenceEnvelope:
-    """构造绑定指定 TOOL_RESULT_ACCEPTED event 的 accepted evidence envelope。
+    """构造绑定指定 TOOL_RESULT_ACCEPTED event 的 canonical evidence envelope。
 
     :param event_id: TOOL_RESULT_ACCEPTED event id。
-    :returns: accepted evidence envelope。
+    :returns: canonical evidence envelope。
     """
 
     return AcceptedEvidenceEnvelope(
@@ -1045,7 +1074,7 @@ def _collect_evidence_ids(
     session_id: str,
     end_event_sequence: int,
 ) -> tuple[str, ...]:
-    """读取共享 helper 输出的 accepted evidence ids。
+    """读取共享 helper 输出的 canonical evidence ids。
 
     :param store: Host durable store。
     :param event_log: EventLog store。
@@ -1069,7 +1098,7 @@ def _collect_evidence_ids(
             end_event_sequence=end_event_sequence,
         )
         return tuple(
-            envelope.evidence_id for envelope in inputs.accepted_evidence_envelopes
+            material.accepted_evidence_id for material in inputs.evidence_materials
         )
 
     return store.transaction_runner.run_read(read_inputs)

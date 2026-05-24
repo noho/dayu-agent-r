@@ -98,7 +98,7 @@ Service 可以依赖 Host / Engine public contracts，但不得让 `dayu.runtime
 - `Host event stream`：Host 面向 UI / CLI / Web / GUI 暴露的订阅与补读事件流，来自 EventLog cursor。
 - `ToolBundle`：外部装配好的业务工具声明集合，通过 `HostToolingOptions` 显式传给 Host construction。
 - `ToolRuntime`：Host-owned 工具治理模块，负责工具执行、截断、等待、重复调用治理、诊断与工具事实 accept barrier。
-- `Context Governance`：Host 对上下文预算、compaction、pinned state、tool facts、open questions、assumptions 和 compact 事件的治理 orchestrator。
+- `Context Governance`：Host 对上下文预算、compaction、pinned state、accepted tool evidence、open questions、assumptions 和 compact 事件的治理 orchestrator。
 
 `turn` 不用于描述 Engine / Runner 执行路径；如需表达用户视角的多轮对话，应明确其与 `Session`、`Run` 的关系。`resume` 不表示恢复旧 Agent / Runner / EngineWorker 实例，而是基于 canonical EventLog facts 构造新的 `AgentRunRequest` 并创建新的 Attempt。
 

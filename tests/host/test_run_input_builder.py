@@ -98,6 +98,7 @@ from dayu.host.run_input import (
     NoToolExecutor,
     PolicySnapshot,
     ToolExecutionMode,
+    _preserved_fact_refs_text,
     create_no_tool_run_input_builder,
     create_tool_enabled_run_input_builder,
 )
@@ -993,6 +994,22 @@ def test_gross_margin_followup_uses_post_compaction_evidence_backed_facts(
         assert contents[-1] == "请基于已确认的收入和毛利计算毛利率"
 
 
+def test_compact_artifact_preserved_fact_refs_reads_canonical_evidence_key() -> None:
+    """compact artifact message 从 canonical evidence refs 字段读取 refs。"""
+
+    payload: dict[str, JsonValue] = {
+        "preserved_fact_refs": {
+            "canonical_evidence_refs": ["evidence:memory-tool"],
+            "evidence_backed_fact_refs": ["fact:memory-revenue"],
+        }
+    }
+
+    assert _preserved_fact_refs_text(payload) == (
+        "canonical_evidence_refs=evidence:memory-tool; "
+        "evidence_backed_fact_refs=fact:memory-revenue"
+    )
+
+
 def test_minimum_preserve_resolves_second_factor_without_full_long_input(
     tmp_path: Path,
 ) -> None:
@@ -1759,7 +1776,7 @@ def _append_compacted_gross_margin_facts(
     """
 
     def operation(transaction: HostTransaction) -> None:
-        """追加 accepted evidence 与 compacted fact candidate events。
+        """追加 canonical evidence 与 compacted fact candidate events。
 
         :param transaction: Host transaction。
         :returns: ``None``。
@@ -3136,27 +3153,27 @@ def _compact_payload(
     preservation_evidence: list[JsonValue] = [
         {
             "evidence_id": "evidence-1",
-            "input_event_refs": ["event-memory-raw-user"],
-            "accepted_evidence_refs": ["evidence:memory-tool"],
+            "material_source_refs": ["event-memory-raw-user"],
+            "canonical_evidence_refs": ["evidence:memory-tool"],
             "evidence_backed_fact_refs": [],
             "memory_snapshot_cursor": None,
             "compact_input_range": None,
         }
     ]
     preserved_fact_refs: dict[str, JsonValue] = {
-        "accepted_evidence_refs": ["evidence:memory-tool"],
+        "canonical_evidence_refs": ["evidence:memory-tool"],
         "evidence_backed_fact_refs": [],
     }
     quality_check_result: dict[str, JsonValue] = {
         "accepted": True,
         "rejection_reasons": [],
         "current_user_input_retained": True,
-        "accepted_evidence_refs_retained": True,
+        "canonical_evidence_refs_retained": True,
         "evidence_backed_fact_candidates_accepted": True,
         "minimum_preserve_items_accepted": True,
         "evidence_anchors_retained": True,
         "open_questions_retained": True,
-        "retained_accepted_evidence_refs": ["evidence:memory-tool"],
+        "retained_canonical_evidence_refs": ["evidence:memory-tool"],
         "dropped_ranges": [],
         "summarized_ranges": [],
     }
