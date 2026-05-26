@@ -991,7 +991,25 @@ python utils/smoke_host_public_conversation_memory.py --log-level VERBOSE
 
 脚本固定四轮：第一轮调用 mock tool 确认事实，第二轮禁用工具并加入上下文压力，第三轮切换问题制造干扰，第四轮禁用工具核对 marker、`1.88%` 和 `-0.14pct`。stdout 会打印每轮 terminal 摘要、final answer 预览、工具调用次数、compact pressure 计划和 compact artifact 路径；通过时输出 `SMOKE PASS public Host conversation memory finance continuity`。
 
-### 5.3 Engine provider smoke
+### 5.3 Host public 财报对话记忆场景 smoke
+
+`utils/smoke_host_public_conversation_memory_scenarios.py` 用于人工验证同一个 Host public session 中，多组 mock 财报事实在干扰、上下文压力和长轮次下的 public answer continuity。脚本默认运行 `--suite core`；`--suite long` 需要显式指定，用于长轮次稳定性观察；`--suite all` 会同时运行 core 与 long 场景。
+
+```bash
+source .venv/bin/activate
+python utils/smoke_host_public_conversation_memory_scenarios.py --suite core --log-level VERBOSE
+```
+
+长轮次 smoke 需要显式开启：
+
+```bash
+source .venv/bin/activate
+python utils/smoke_host_public_conversation_memory_scenarios.py --suite long --long-rounds 25 --log-level VERBOSE
+```
+
+该脚本只通过 public Host handle 观察行为，不读取 durable DB、EventLog、memory 表或 compact payload 内容。脚本只注入 `manual-smoke` mock finance tool，不调用真实 Fins 工具；stdout 输出每个 scenario 的 terminal 摘要、final answer 预览、工具调用次数、pressure 计划和 compact artifact 路径。通过时输出 `SMOKE PASS public Host conversation memory scenario smoke`。
+
+### 5.4 Engine provider smoke
 
 `utils/smoke_async_agent_providers.py` 用于人工验证 OpenAI-compatible provider 的基础 Agent 主链路。它不属于生产入口，也不读取 Host 配置。
 
