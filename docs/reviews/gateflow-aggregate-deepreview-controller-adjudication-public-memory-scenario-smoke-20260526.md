@@ -21,7 +21,7 @@
 ## Controller 验证
 
 - `source .venv/bin/activate && pytest tests/runtime/test_scene_assets_migration.py tests/runtime/test_smoke_host_public_conversation_memory_scenarios_assembly.py -q`：17 passed
-- `source .venv/bin/activate && python utils/smoke_host_public_conversation_memory_scenarios.py --suite core --pressure-mode off`：`SMOKE PASS public Host conversation memory scenario smoke`
+- `source .venv/bin/activate && python utils/smoke_host_public_conversation_memory_scenarios.py --suite all --pressure-mode off`：`SMOKE PASS public Host conversation memory scenario smoke`
 - `source .venv/bin/activate && pyright`：0 errors, 0 warnings, 0 informations
 - `git diff --check`：passed
 
