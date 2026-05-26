@@ -153,6 +153,69 @@ def test_recent_heartbeat_owner_is_still_live_without_process_probe() -> None:
     assert result.reason == "owner_heartbeat_recent"
 
 
+def test_stopped_owner_is_positive_orphan_proof_without_process_probe() -> None:
+    """owner 已正常 STOPPED 时可直接证明 active dispatch orphan。
+
+    :returns: ``None``。
+    :raises AssertionError: 回归断言失败时由 pytest 抛出。
+    """
+
+    result = classify_orphan_candidate(
+        _candidate(
+            _row(
+                heartbeat_age_seconds=5,
+                status=HostInstanceStatus.STOPPED,
+            )
+        ),
+        None,
+        _policy(),
+    )
+    assert isinstance(result, PositiveOrphanProof)
+    assert result.reason == "owner_liveness_stopped"
+
+
+def test_stopping_owner_with_recent_heartbeat_is_not_taken_over() -> None:
+    """owner 仍处 STOPPING 且 heartbeat 新鲜时不能被 recovery 接管。
+
+    :returns: ``None``。
+    :raises AssertionError: 回归断言失败时由 pytest 抛出。
+    """
+
+    result = classify_orphan_candidate(
+        _candidate(
+            _row(
+                heartbeat_age_seconds=5,
+                status=HostInstanceStatus.STOPPING,
+            )
+        ),
+        None,
+        _policy(),
+    )
+    assert isinstance(result, OwnerStillLive)
+    assert result.reason == "owner_heartbeat_recent"
+
+
+def test_stopping_owner_with_missing_pid_is_positive_orphan_proof() -> None:
+    """STOPPING owner stale 且 pid 缺失时可证明 graceful close 中断 orphan。
+
+    :returns: ``None``。
+    :raises AssertionError: 回归断言失败时由 pytest 抛出。
+    """
+
+    result = classify_orphan_candidate(
+        _candidate(
+            _row(
+                heartbeat_age_seconds=60,
+                status=HostInstanceStatus.STOPPING,
+            )
+        ),
+        _evidence(exists=False),
+        _policy(),
+    )
+    assert isinstance(result, PositiveOrphanProof)
+    assert result.reason == "owner_pid_missing"
+
+
 def test_stale_heartbeat_alone_is_not_positive_orphan_proof() -> None:
     """heartbeat stale 但缺进程证据时不能证明 orphan。
 

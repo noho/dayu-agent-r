@@ -249,7 +249,7 @@ class _FakeHandle:
         if False:
             yield _unreachable_engine_event()
 
-    def cancel(self, reason: str) -> None:
+    def on_cancel(self, reason: str) -> None:
         """记录取消请求。
 
         :param reason: 取消原因。
@@ -447,7 +447,7 @@ class _CloseFailingHandle(_FakeHandle):
         if False:
             yield _unreachable_engine_event()
 
-    def cancel(self, reason: str) -> None:
+    def on_cancel(self, reason: str) -> None:
         """模拟 handle cancel 异常。
 
         :param reason: 取消原因。
@@ -491,7 +491,7 @@ class _CloseCountingHandle(_FakeHandle):
         if False:
             yield _unreachable_engine_event()
 
-    def cancel(self, reason: str) -> None:
+    def on_cancel(self, reason: str) -> None:
         """记录取消请求。
 
         :param reason: 取消原因。
@@ -541,7 +541,7 @@ class _ControlledBlockingHandle(_FakeHandle):
         if False:
             yield _unreachable_engine_event()
 
-    def cancel(self, reason: str) -> None:
+    def on_cancel(self, reason: str) -> None:
         """记录取消请求。
 
         :param reason: 取消原因。
@@ -1169,7 +1169,7 @@ class _FailingCloseWorkerHandle:
 
         raise RuntimeError("worker close failed")
 
-    def cancel(self, reason: str) -> None:
+    def on_cancel(self, reason: str) -> None:
         """忽略取消请求。
 
         :param reason: 取消原因。
@@ -2222,7 +2222,7 @@ async def test_scheduler_close_suppresses_handle_close_exception(
         assert result.dispatched == 1
         with caplog.at_level("WARNING", logger="dayu.host.dispatch"):
             await scheduler.close()
-        assert "active worker cancel failed; continuing" in caplog.text
+        assert "active worker cancel hook failed; continuing" in caplog.text
 
 
 @pytest.mark.asyncio
@@ -2232,7 +2232,7 @@ async def test_scheduler_close_lets_active_task_own_handle_close(
     """scheduler close 只发 cancel，handle close 由 active task finally 执行一次。"""
 
     handle = _CloseCountingHandle()
-    factory = _FakeWorkerFactory(worker=_HandleWorker(handle))
+    factory = _FakeWorkerFactory(accepted_handle=handle)
     with open_host_durable_store(_options(tmp_path)) as store:
         seeded = _seed_current_run(store)
         scheduler = await _open_scheduler(tmp_path, store, factory)
@@ -2253,7 +2253,7 @@ async def test_scheduler_close_during_active_events_releases_all_resources(
 
     handle = _ControlledBlockingHandle()
     registry = ActiveWorkerRegistry()
-    factory = _FakeWorkerFactory(worker=_HandleWorker(handle))
+    factory = _FakeWorkerFactory(accepted_handle=handle)
     lane_db_path = tmp_path / "lane-close-active.sqlite3"
     with open_host_durable_store(_options(tmp_path)) as store:
         seeded = _seed_current_run(store)
@@ -2269,8 +2269,14 @@ async def test_scheduler_close_during_active_events_releases_all_resources(
         await handle.events_started.wait()
 
         assert result.dispatched == 1
+        assert len(factory.accepted_requests) == 1
         await scheduler.close()
 
+        assert factory.accepted_requests[0].cancellation_token.is_cancelled()
+        assert (
+            factory.accepted_requests[0].cancellation_token.cancel_reason()
+            == "scheduler_close"
+        )
         assert handle.cancel_count == 1
         assert handle.close_count == 1
         assert handle.events_finalized.is_set()

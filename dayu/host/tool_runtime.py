@@ -79,6 +79,11 @@ from dayu.host.durable.idempotency import (
     IdempotencyStore,
 )
 from dayu.host.durable.payload import read_payload_descriptor
+from dayu.host.durable.payload import (
+    PayloadStore,
+    SQLitePayloadFormat,
+    SQLitePayloadWriteRequest,
+)
 from dayu.host.durable.state import (
     AttemptRow,
     DispatchRecordRow,
@@ -159,6 +164,8 @@ _EVENT_TYPE_TOOL_CALL_GOVERNED = "TOOL_CALL_GOVERNED"
 _EVENT_TYPE_TOOL_RESULT_ACCEPTED = "TOOL_RESULT_ACCEPTED"
 _PAYLOAD_FIELD_ACCEPTED_EVIDENCE_ENVELOPE = "accepted_evidence_envelope"
 _PAYLOAD_FIELD_RAW_TOOL_OUTCOME = "raw_tool_outcome"
+_TOOL_RESULT_PAYLOAD_REF_PREFIX = "payload-tool-result"
+_TOOL_RESULT_SQLITE_PAYLOAD_ID_PREFIX = "sqlite-payload-tool-result"
 _TOOL_ACCEPT_EVENT_ACTOR = "host.tool_runtime"
 _TOOL_ACCEPT_EVENT_SOURCE = "host.tool_runtime.accept"
 _MIN_ACCEPT_RETRY_ATTEMPTS = 1
@@ -3199,6 +3206,19 @@ class _ToolAcceptEventPlan:
     result_id: str
 
 
+@dataclass(frozen=True, slots=True)
+class _ToolResultPayloadPlan:
+    """``TOOL_RESULT_ACCEPTED`` 的冷热 payload 写入计划。
+
+    :param inline_payload: 写入 EventLog ``payload_json`` 的热 payload。
+    :param payload_ref: EventLog row 需要挂载的冷 payload descriptor；无则为
+        ``None``。
+    """
+
+    inline_payload: Mapping[str, JsonValue]
+    payload_ref: HostPayloadRef | None
+
+
 def _log_tool_fact_accept_result(
     candidate: ToolFactAcceptCandidate, result: ToolFactAcceptResult
 ) -> None:
@@ -3499,14 +3519,22 @@ def _append_tool_result_if_needed(
 
     if candidate.tool_fact_kind is ToolFactKind.REUSE:
         return None
-    payload_ref = candidate.payload_ref.payload_ref if candidate.payload_ref else None
-    payload_digest = (
-        candidate.payload_ref.payload_digest if candidate.payload_ref else None
-    )
-    accepted_evidence_envelope = _accepted_evidence_envelope(
+    payload_plan = _tool_result_payload_plan(
+        transaction=transaction,
         candidate=candidate,
         result_event_id=event_id,
         requested=requested,
+        governed=governed,
+    )
+    payload_ref = (
+        payload_plan.payload_ref.payload_ref
+        if payload_plan.payload_ref is not None
+        else None
+    )
+    payload_digest = (
+        payload_plan.payload_ref.payload_digest
+        if payload_plan.payload_ref is not None
+        else None
     )
     return event_log_store.append_event(
         transaction,
@@ -3516,56 +3544,216 @@ def _append_tool_result_if_needed(
             event_type=_EVENT_TYPE_TOOL_RESULT_ACCEPTED,
             policy_decision=_policy_decision_json(candidate.policy_decision),
             reason=_policy_reason_json(candidate.policy_decision),
-            payload={
-                "session_id": candidate.session_id,
-                "run_id": candidate.run_id,
-                "attempt_id": candidate.attempt_id,
-                "execution_id": candidate.execution_id,
-                "iteration_id": candidate.iteration_id,
-                "tool_call_id": candidate.tool_call_id,
-                "tool_name": candidate.tool_name,
-                "tool_fact_kind": candidate.tool_fact_kind.value,
-                "tool_schema_digest": candidate.tool_schema_digest,
-                "tool_identity_digest": candidate.tool_identity_digest,
-                "normalized_arguments_digest": candidate.normalized_arguments_digest,
-                "outcome_digest": candidate.outcome_digest,
-                "payload_digest": candidate.payload_digest,
-                "payload_ref": _payload_ref_json(candidate.payload_ref),
-                "truncation": _truncation_json(candidate.truncation),
-                "duplicate_key": candidate.duplicate_key,
-                "duplicate_decision": (
-                    candidate.duplicate_decision.value
-                    if candidate.duplicate_decision is not None
-                    else None
-                ),
-                "policy_decision": _policy_decision_json(
-                    candidate.policy_decision
-                ),
-                "tool_idempotency_key": candidate.tool_idempotency_key,
-                "diagnostic_refs": [
-                    _diagnostic_ref_json(ref) for ref in candidate.diagnostic_refs
-                ],
-                "tool_call_requested_event_ref": _event_ref_json(
-                    _event_ref_from_row(requested)
-                ),
-                "tool_call_governed_event_ref": (
-                    _event_ref_json(_event_ref_from_row(governed))
-                    if governed is not None
-                    else None
-                ),
-                "accept_idempotency_key": candidate.accept_idempotency_key,
-                "semantic_input_digest": candidate.semantic_input_digest,
-                _PAYLOAD_FIELD_RAW_TOOL_OUTCOME: candidate.raw_tool_outcome,
-                _PAYLOAD_FIELD_ACCEPTED_EVIDENCE_ENVELOPE: (
-                    accepted_evidence_envelope_to_json_value(
-                        accepted_evidence_envelope
-                    )
-                ),
-            },
+            payload=payload_plan.inline_payload,
             payload_ref=payload_ref,
             payload_digest=payload_digest,
         ),
     ).row
+
+
+def _tool_result_payload_plan(
+    *,
+    transaction: HostTransaction,
+    candidate: ToolFactAcceptCandidate,
+    result_event_id: str,
+    requested: EventLogRow,
+    governed: EventLogRow | None,
+) -> _ToolResultPayloadPlan:
+    """为 ``TOOL_RESULT_ACCEPTED`` 准备冷热 payload。
+
+    小 payload 直接完整写入 EventLog inline；超过 durable inline 阈值时，
+    完整 payload 写入 SQLite payload descriptor，EventLog inline 只保留可
+    索引的热元数据与冷 payload 引用。
+
+    :param transaction: 当前 Host transaction。
+    :param candidate: 工具事实候选。
+    :param result_event_id: 即将写入的 ``TOOL_RESULT_ACCEPTED`` event id。
+    :param requested: 已写入的 ``TOOL_CALL_REQUESTED`` row。
+    :param governed: 已写入的 ``TOOL_CALL_GOVERNED`` row；无则为 ``None``。
+    :returns: EventLog payload 写入计划。
+    """
+
+    inline_payload = _tool_result_payload(
+        candidate=candidate,
+        result_event_id=result_event_id,
+        requested=requested,
+        governed=governed,
+        event_payload_ref=candidate.payload_ref,
+        evidence_payload_ref=(
+            candidate.payload_ref.payload_ref
+            if candidate.payload_ref is not None
+            else None
+        ),
+        evidence_payload_digest=(
+            candidate.payload_ref.payload_digest
+            if candidate.payload_ref is not None
+            else candidate.payload_digest
+        ),
+        include_raw_tool_outcome=True,
+    )
+    if (
+        candidate.payload_ref is not None
+        or _payload_size_bytes(inline_payload)
+        <= transaction.payload_inline_threshold_bytes
+    ):
+        return _ToolResultPayloadPlan(
+            inline_payload=inline_payload,
+            payload_ref=candidate.payload_ref,
+        )
+
+    payload_ref = _tool_result_payload_ref(result_event_id)
+    cold_payload = _tool_result_payload(
+        candidate=candidate,
+        result_event_id=result_event_id,
+        requested=requested,
+        governed=governed,
+        event_payload_ref=None,
+        evidence_payload_ref=payload_ref,
+        evidence_payload_digest=None,
+        include_raw_tool_outcome=True,
+    )
+    descriptor = PayloadStore().write_sqlite_payload(
+        transaction,
+        SQLitePayloadWriteRequest(
+            payload_ref=payload_ref,
+            payload_id=_tool_result_sqlite_payload_id(result_event_id),
+            payload_format=SQLitePayloadFormat.CANONICAL_JSON,
+            payload_json=cold_payload,
+            media_type="application/json",
+            metadata={
+                "event_type": _EVENT_TYPE_TOOL_RESULT_ACCEPTED,
+                "event_id": result_event_id,
+                "tool_name": candidate.tool_name,
+                "tool_call_id": candidate.tool_call_id,
+            },
+            expected_digest=None,
+        ),
+    )
+    event_payload_ref = HostPayloadRef(
+        payload_ref=descriptor.payload_ref,
+        payload_digest=descriptor.payload_digest,
+    )
+    hot_payload = _tool_result_payload(
+        candidate=candidate,
+        result_event_id=result_event_id,
+        requested=requested,
+        governed=governed,
+        event_payload_ref=event_payload_ref,
+        evidence_payload_ref=descriptor.payload_ref,
+        evidence_payload_digest=None,
+        include_raw_tool_outcome=False,
+    )
+    return _ToolResultPayloadPlan(
+        inline_payload=hot_payload,
+        payload_ref=event_payload_ref,
+    )
+
+
+def _tool_result_payload(
+    *,
+    candidate: ToolFactAcceptCandidate,
+    result_event_id: str,
+    requested: EventLogRow,
+    governed: EventLogRow | None,
+    event_payload_ref: HostPayloadRef | None,
+    evidence_payload_ref: str | None,
+    evidence_payload_digest: str | None,
+    include_raw_tool_outcome: bool,
+) -> Mapping[str, JsonValue]:
+    """构造 ``TOOL_RESULT_ACCEPTED`` payload。
+
+    :param candidate: 工具事实候选。
+    :param result_event_id: 即将写入的 ``TOOL_RESULT_ACCEPTED`` event id。
+    :param requested: 已写入的 ``TOOL_CALL_REQUESTED`` row。
+    :param governed: 已写入的 ``TOOL_CALL_GOVERNED`` row；无则为 ``None``。
+    :param event_payload_ref: EventLog 热 payload 中暴露的冷 payload 引用。
+    :param evidence_payload_ref: accepted evidence result ref 中的 payload ref。
+    :param evidence_payload_digest: accepted evidence result ref 中的 payload digest。
+    :param include_raw_tool_outcome: 是否包含完整 raw 工具 outcome。
+    :returns: 可写入 EventLog 或 SQLite payload descriptor 的 JSON object。
+    """
+
+    accepted_evidence_envelope = _accepted_evidence_envelope(
+        candidate=candidate,
+        result_event_id=result_event_id,
+        requested=requested,
+        payload_ref=evidence_payload_ref,
+        payload_digest=evidence_payload_digest,
+    )
+    payload: dict[str, JsonValue] = {
+        "session_id": candidate.session_id,
+        "run_id": candidate.run_id,
+        "attempt_id": candidate.attempt_id,
+        "execution_id": candidate.execution_id,
+        "iteration_id": candidate.iteration_id,
+        "tool_call_id": candidate.tool_call_id,
+        "tool_name": candidate.tool_name,
+        "tool_fact_kind": candidate.tool_fact_kind.value,
+        "tool_schema_digest": candidate.tool_schema_digest,
+        "tool_identity_digest": candidate.tool_identity_digest,
+        "normalized_arguments_digest": candidate.normalized_arguments_digest,
+        "outcome_digest": candidate.outcome_digest,
+        "payload_digest": candidate.payload_digest,
+        "payload_ref": _payload_ref_json(event_payload_ref),
+        "truncation": _truncation_json(candidate.truncation),
+        "duplicate_key": candidate.duplicate_key,
+        "duplicate_decision": (
+            candidate.duplicate_decision.value
+            if candidate.duplicate_decision is not None
+            else None
+        ),
+        "policy_decision": _policy_decision_json(candidate.policy_decision),
+        "tool_idempotency_key": candidate.tool_idempotency_key,
+        "diagnostic_refs": [
+            _diagnostic_ref_json(ref) for ref in candidate.diagnostic_refs
+        ],
+        "tool_call_requested_event_ref": _event_ref_json(
+            _event_ref_from_row(requested)
+        ),
+        "tool_call_governed_event_ref": (
+            _event_ref_json(_event_ref_from_row(governed))
+            if governed is not None
+            else None
+        ),
+        "accept_idempotency_key": candidate.accept_idempotency_key,
+        "semantic_input_digest": candidate.semantic_input_digest,
+        _PAYLOAD_FIELD_ACCEPTED_EVIDENCE_ENVELOPE: (
+            accepted_evidence_envelope_to_json_value(accepted_evidence_envelope)
+        ),
+    }
+    if include_raw_tool_outcome:
+        payload[_PAYLOAD_FIELD_RAW_TOOL_OUTCOME] = candidate.raw_tool_outcome
+    return payload
+
+
+def _payload_size_bytes(payload: Mapping[str, JsonValue]) -> int:
+    """计算 payload canonical JSON 的 UTF-8 字节数。
+
+    :param payload: JSON payload。
+    :returns: canonical JSON UTF-8 字节数。
+    """
+
+    return len(canonical_json_dumps(payload).encode("utf-8"))
+
+
+def _tool_result_payload_ref(result_event_id: str) -> str:
+    """派生 ``TOOL_RESULT_ACCEPTED`` 冷 payload descriptor ref。
+
+    :param result_event_id: ``TOOL_RESULT_ACCEPTED`` event id。
+    :returns: 稳定 payload descriptor ref。
+    """
+
+    return f"{_TOOL_RESULT_PAYLOAD_REF_PREFIX}-{result_event_id}"
+
+
+def _tool_result_sqlite_payload_id(result_event_id: str) -> str:
+    """派生 ``TOOL_RESULT_ACCEPTED`` SQLite payload row id。
+
+    :param result_event_id: ``TOOL_RESULT_ACCEPTED`` event id。
+    :returns: 稳定 SQLite payload id。
+    """
+
+    return f"{_TOOL_RESULT_SQLITE_PAYLOAD_ID_PREFIX}-{result_event_id}"
 
 
 def _accepted_evidence_envelope(
@@ -3573,12 +3761,16 @@ def _accepted_evidence_envelope(
     candidate: ToolFactAcceptCandidate,
     result_event_id: str,
     requested: EventLogRow,
+    payload_ref: str | None,
+    payload_digest: str | None,
 ) -> AcceptedEvidenceEnvelope:
     """构造 accepted tool result 的 Host 中立证据信封。
 
     :param candidate: 工具事实候选。
     :param result_event_id: 即将写入的 ``TOOL_RESULT_ACCEPTED`` event id。
     :param requested: 已写入的 ``TOOL_CALL_REQUESTED`` row。
+    :param payload_ref: 可选 payload descriptor ref。
+    :param payload_digest: 可选 payload digest。
     :returns: accepted evidence envelope。
     """
 
@@ -3593,12 +3785,8 @@ def _accepted_evidence_envelope(
             semantic_input_digest=candidate.semantic_input_digest,
         ),
         result_ref=AcceptedEvidenceResultRef(
-            payload_ref=(
-                candidate.payload_ref.payload_ref
-                if candidate.payload_ref is not None
-                else None
-            ),
-            payload_digest=candidate.payload_digest,
+            payload_ref=payload_ref,
+            payload_digest=payload_digest,
             outcome_digest=candidate.outcome_digest,
             truncation_applied=(
                 candidate.truncation.applied

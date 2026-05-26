@@ -62,6 +62,7 @@ from dayu.host.compaction import (
     PreservationEvidence,
 )
 from dayu.host.context_budget import DEFAULT_ESTIMATOR_CHARS_PER_TOKEN
+from dayu.host.opaque_ref import validate_host_neutral_opaque_ref_text
 
 _COMPACTOR_RUN_ID_PREFIX = "context-compactor"
 _MIN_PROPOSAL_LENGTH = 1
@@ -565,7 +566,7 @@ def _pinned_state_patch_candidate(
     return PinnedStatePatchCandidate(
         candidate_id=f"llm-pinned-patch:{run_id}",
         current_goal=_text_patch(data, "current_goal", evidence_refs),
-        confirmed_subjects=_string_tuple_patch(
+        confirmed_subjects=_confirmed_subjects_patch(
             data, "confirmed_subjects", evidence_refs
         ),
         user_constraints=_string_tuple_patch(
@@ -720,6 +721,34 @@ def _string_tuple_patch(
         value=value,
         evidence_refs=_evidence_refs_for_patch(operation, evidence_refs),
     )
+
+
+def _confirmed_subjects_patch(
+    source: Mapping[str, JsonValue],
+    key: str,
+    evidence_refs: tuple[str, ...],
+) -> PinnedStringTupleFieldPatch:
+    """解析并校验 confirmed subjects patch。
+
+    ``confirmed_subjects`` 是 Host 中立 opaque ref 集合，不接受自由业务文本；
+    非法值必须在 LLM proposal accept 前 fail closed，避免写 canonical event
+    transaction 时才暴露校验异常。
+
+    :param source: JSON object。
+    :param key: patch 字段名。
+    :param evidence_refs: Host-owned evidence refs。
+    :returns: confirmed subjects patch。
+    :raises ValueError: replace 值不是 Host 中立 opaque ref 时抛出。
+    """
+
+    patch = _string_tuple_patch(source, key, evidence_refs)
+    if patch.operation is not PinnedPatchOperation.REPLACE:
+        return patch
+    if patch.value is None:
+        return patch
+    for item in patch.value:
+        validate_host_neutral_opaque_ref_text(item)
+    return patch
 
 
 def _validate_patch_value(
@@ -904,11 +933,53 @@ def _provenance_entry_for_label(
 
     entry = request.material_pack.provenance_map.get(label)
     if entry is None:
+        entry = _evidence_parent_entry_for_label(
+            request,
+            label,
+            allowed_sections=allowed_sections,
+        )
+    if entry is None:
         raise ValueError(f"{field_name} contains unknown label: {label}")
     if entry.section not in allowed_sections:
         raise ValueError(f"{field_name} label section mismatch: {label}")
     validate_material_label(label, entry.section)
     return entry
+
+
+def _evidence_parent_entry_for_label(
+    request: CompactionRequest,
+    label: str,
+    *,
+    allowed_sections: tuple[CompactMaterialSection, ...],
+) -> PromptLocalProvenanceEntry | None:
+    """按 chunk parent label 解析 evidence provenance entry。
+
+    大 accepted tool evidence 会渲染为 ``E1.1`` / ``E1.2`` 等 chunk label；
+    compactor 可用父标签 ``E1`` 表达同一个 canonical evidence。该 helper 只在
+    调用方允许 evidence section 时启用，并返回父标签下第一个 chunk 的
+    provenance，因为同一父标签下所有 chunk 共享 canonical evidence id。
+
+    :param request: Host compaction request。
+    :param label: prompt-local evidence 父标签。
+    :param allowed_sections: 允许引用的 material section 集合。
+    :returns: 解析到的 provenance entry；无法解析时返回 ``None``。
+    """
+
+    if CompactMaterialSection.EVIDENCE_INPUT not in allowed_sections:
+        return None
+    try:
+        validate_material_label(label, CompactMaterialSection.EVIDENCE_INPUT)
+    except (TypeError, ValueError):
+        return None
+    matches = tuple(
+        entry
+        for entry in request.material_pack.provenance_map.values()
+        if entry.section is CompactMaterialSection.EVIDENCE_INPUT
+        and entry.chunk_parent_label == label
+    )
+    if len(matches) == 0:
+        return None
+    return matches[0]
 
 
 def _required_mapping(

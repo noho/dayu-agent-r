@@ -550,6 +550,60 @@ async def test_parser_rejects_unknown_or_cross_section_labels(
 
 
 @pytest.mark.asyncio
+async def test_parser_accepts_parent_label_for_chunked_evidence(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Chunked evidence 允许用父标签引用同一个 canonical evidence。"""
+
+    monkeypatch.setattr(
+        "dayu.host.llm_compaction.run_agent_and_wait",
+        _fake_run_factory(_final(_proposal_json())),
+    )
+    compactor = _llm_compactor(
+        runner_spec=_runner_spec(),
+        runner_options=_runner_options(),
+    )
+
+    candidate = await compactor.compact(
+        _request(raw_tool_content="large evidence " * 500),
+        StubCancellationToken(),
+    )
+
+    assert candidate.evidence_backed_fact_candidates[0].evidence_refs == (
+        "evidence:accepted-1",
+    )
+    assert candidate.preserved_canonical_evidence_refs == ("evidence:accepted-1",)
+
+
+@pytest.mark.asyncio
+async def test_parser_rejects_free_form_confirmed_subject_patch(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """confirmed_subjects patch 不接受没有 Host-neutral kind 的自由文本。"""
+
+    proposal = json.loads(_proposal_json())
+    pinned_patch = proposal["pinned_state_patch_candidate"]
+    assert isinstance(pinned_patch, dict)
+    confirmed_subjects = pinned_patch["confirmed_subjects"]
+    assert isinstance(confirmed_subjects, dict)
+    confirmed_subjects["value"] = ["DAYU_MEMORY_ALPHA"]
+    monkeypatch.setattr(
+        "dayu.host.llm_compaction.run_agent_and_wait",
+        _fake_run_factory(_final(json.dumps(proposal))),
+    )
+    compactor = _llm_compactor(
+        runner_spec=_runner_spec(),
+        runner_options=_runner_options(),
+    )
+
+    with pytest.raises(
+        LLMCompactionProposalError,
+        match="opaque ref text requires kind prefix",
+    ):
+        await compactor.compact(_request(), StubCancellationToken())
+
+
+@pytest.mark.asyncio
 async def test_fact_candidate_without_evidence_label_rejected(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:

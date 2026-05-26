@@ -143,7 +143,7 @@ class BlockingFinalAnswerHandle:
 
         return None
 
-    def cancel(self, reason: str) -> None:
+    def on_cancel(self, reason: str) -> None:
         """忽略取消请求。
 
         :param reason: 取消原因。
@@ -297,7 +297,7 @@ class AsyncControlledFinalAnswerHandle:
 
         return None
 
-    def cancel(self, reason: str) -> None:
+    def on_cancel(self, reason: str) -> None:
         """忽略取消请求。
 
         :param reason: 取消原因。

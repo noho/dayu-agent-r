@@ -123,7 +123,7 @@ class _SequencedHandle:
 
         return None
 
-    def cancel(self, reason: str) -> None:
+    def on_cancel(self, reason: str) -> None:
         """记录取消原因。
 
         :param reason: 取消原因。

@@ -94,7 +94,7 @@ class _ImmediateFinalAnswerHandle:
 
         return None
 
-    def cancel(self, reason: str) -> None:
+    def on_cancel(self, reason: str) -> None:
         """记录取消请求。
 
         :param reason: 取消原因。
@@ -147,7 +147,7 @@ class _BlockingFinalAnswerHandle:
 
         return None
 
-    def cancel(self, reason: str) -> None:
+    def on_cancel(self, reason: str) -> None:
         """记录取消请求。
 
         :param reason: 取消原因。
@@ -206,7 +206,7 @@ class _FailedHandle:
 
         return None
 
-    def cancel(self, reason: str) -> None:
+    def on_cancel(self, reason: str) -> None:
         """忽略取消请求。
 
         :param reason: 取消原因。
@@ -265,7 +265,7 @@ class _EmptyFinalAnswerHandle:
 
         return None
 
-    def cancel(self, reason: str) -> None:
+    def on_cancel(self, reason: str) -> None:
         """忽略取消请求。
 
         :param reason: 取消原因。

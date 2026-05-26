@@ -20,6 +20,7 @@ _PROCESS_PROBE_ERROR_UNEXPECTED_OS_ERROR = "unexpected_os_error"
 _ORPHAN_REASON_PID_MISSING = "owner_pid_missing"
 _ORPHAN_REASON_START_TOKEN_MISMATCH = "owner_pid_reused_start_token_mismatch"
 _ORPHAN_REASON_BOOT_ID_MISMATCH = "owner_pid_reused_boot_id_mismatch"
+_ORPHAN_REASON_OWNER_STOPPED = "owner_liveness_stopped"
 _LIVE_REASON_HEARTBEAT_RECENT = "owner_heartbeat_recent"
 _LIVE_REASON_PROCESS_IDENTITY_MATCHED = "owner_process_identity_matched"
 _INCONCLUSIVE_REASON_MISSING_OWNER = "missing_owner_host_instance_id"
@@ -229,7 +230,16 @@ def classify_orphan_candidate(
             probe_error_code=None,
         )
     row = candidate.owner_liveness
-    if row.status is not HostInstanceStatus.RUNNING:
+    if row.status is HostInstanceStatus.STOPPED:
+        return PositiveOrphanProof(
+            owner_host_instance_id=candidate.owner_host_instance_id,
+            pid=row.pid,
+            reason=_ORPHAN_REASON_OWNER_STOPPED,
+            heartbeat_at=row.heartbeat_at,
+            observed_start_token=None,
+            observed_boot_id=None,
+        )
+    if row.status not in (HostInstanceStatus.RUNNING, HostInstanceStatus.STOPPING):
         return OrphanProofInconclusive(
             reason=_INCONCLUSIVE_REASON_OWNER_NOT_RUNNING,
             owner_host_instance_id=candidate.owner_host_instance_id,

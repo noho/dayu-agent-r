@@ -36,6 +36,7 @@ from dayu.host.durable.options import (
     PayloadStoragePolicy,
 )
 from dayu.host.durable.errors import HostDurableError
+from dayu.host.durable.liveness import HostInstanceStatus
 from dayu.host.durable.run_transition import (
     AcceptWorkerRunningInput,
     CancelActiveAttemptInput,
@@ -1626,6 +1627,91 @@ def test_startup_orphan_closeout_cas_rechecks_owner_heartbeat(
         )
 
 
+def test_startup_orphan_closeout_accepts_stopped_owner_lifecycle_proof(
+    tmp_path: Path,
+) -> None:
+    """owner 已 STOPPED 时 startup orphan closeout 不要求 heartbeat stale。"""
+
+    with open_host_durable_store(_options(tmp_path)) as store:
+        seeded = _seed_running_run(store, tmp_path)
+
+        def operation(transaction: HostTransaction) -> tuple[str, str, int]:
+            """用 STOPPED owner 验证 graceful close recovery CAS。
+
+            :param transaction: Host transaction。
+            :returns: mutation 状态、Run 状态与 ATTEMPT_LOST 事件数。
+            """
+
+            _mark_dispatching_tx(transaction, seeded.attempt_id)
+            _set_host_instance_status_tx(transaction, HostInstanceStatus.STOPPED)
+            result = close_startup_orphan_attempt_in_transaction(
+                transaction,
+                EventLogStore(),
+                _startup_orphan_input(
+                    expected_run_status=RunStatus.RUNNING,
+                    expected_attempt_status=AttemptStatus.STARTING,
+                    recoverable=True,
+                    reason="startup_orphan_attempt_lost",
+                    owner_heartbeat_at="2026-05-14T01:02:03.000000Z",
+                ),
+            )
+            assert result.run is not None
+            return (
+                result.status.value,
+                result.run.status.value,
+                _count_events(transaction, _EVENT_TYPE_ATTEMPT_LOST),
+            )
+
+        assert store.transaction_runner.run_write(operation) == (
+            StateMutationStatus.UPDATED.value,
+            RunStatus.RECOVERING.value,
+            1,
+        )
+
+
+def test_startup_orphan_closeout_accepts_stopping_owner_stale_proof(
+    tmp_path: Path,
+) -> None:
+    """owner 为 STOPPING 时 startup orphan closeout 仍要求 heartbeat stale。"""
+
+    with open_host_durable_store(_options(tmp_path)) as store:
+        seeded = _seed_running_run(store, tmp_path)
+
+        def operation(transaction: HostTransaction) -> tuple[str, str, int]:
+            """用 STOPPING stale owner 验证 graceful close 中断 recovery CAS。
+
+            :param transaction: Host transaction。
+            :returns: mutation 状态、Run 状态与 ATTEMPT_LOST 事件数。
+            """
+
+            _mark_dispatching_tx(transaction, seeded.attempt_id)
+            _set_host_instance_status_tx(transaction, HostInstanceStatus.STOPPING)
+            _make_host_instance_stale_tx(transaction)
+            result = close_startup_orphan_attempt_in_transaction(
+                transaction,
+                EventLogStore(),
+                _startup_orphan_input(
+                    expected_run_status=RunStatus.RUNNING,
+                    expected_attempt_status=AttemptStatus.STARTING,
+                    recoverable=True,
+                    reason="startup_orphan_attempt_lost",
+                    owner_heartbeat_at="2026-05-14T01:01:00.000000Z",
+                ),
+            )
+            assert result.run is not None
+            return (
+                result.status.value,
+                result.run.status.value,
+                _count_events(transaction, _EVENT_TYPE_ATTEMPT_LOST),
+            )
+
+        assert store.transaction_runner.run_write(operation) == (
+            StateMutationStatus.UPDATED.value,
+            RunStatus.RECOVERING.value,
+            1,
+        )
+
+
 def test_startup_orphan_closeout_preserves_fractional_stale_threshold(
     tmp_path: Path,
 ) -> None:
@@ -2033,6 +2119,27 @@ def _set_host_instance_heartbeat_tx(
         WHERE host_instance_id = ?
         """,
         (heartbeat_at, "host-instance-1"),
+    )
+
+
+def _set_host_instance_status_tx(
+    transaction: HostTransaction,
+    status: HostInstanceStatus,
+) -> None:
+    """设置测试 Host instance lifecycle status。
+
+    :param transaction: Host transaction。
+    :param status: 目标 status。
+    :returns: ``None``。
+    """
+
+    transaction.execute(
+        """
+        UPDATE host_instances
+        SET status = ?
+        WHERE host_instance_id = ?
+        """,
+        (status.value, "host-instance-1"),
     )
 
 

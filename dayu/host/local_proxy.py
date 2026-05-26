@@ -133,11 +133,11 @@ class _DefaultLocalWorkerHandle:
         )
         return self._event_stream
 
-    def cancel(self, reason: str) -> None:
-        """向本地 worker 发起 best-effort 取消。
+    def on_cancel(self, reason: str) -> None:
+        """接收 Host active cancel 已触发的通知。
 
-        Phase 5 当前只通过 Host cancellation token 观察取消；本方法保留
-        handle 边界，不把 dispatch record 或 lane token 当 worker truth。
+        默认本地 Engine 通过 ``AgentRunRequest.cancellation_token`` 观察取消；
+        handle hook 只为非默认 worker 的额外 transport 打断保留。
 
         :param reason: 取消原因。
         :returns: ``None``。

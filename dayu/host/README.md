@@ -75,7 +75,7 @@ Host 内部职责按语义分层：
 - `resolve_wait(wait_id, request)`：接收外部 wait result，并由 Host 恢复或收口 Run。
 - `close_session(session_id, request)`：关闭 Session 的新输入入口，不取消既有 Run。
 - `watch_session_events(session_id)`：订阅 Session-level Host-owned typed events。
-- `close()`：关闭当前 opener runtime，不写 cancel / failed terminal facts。
+- `close()`：关闭当前 opener runtime，向 active worker 传播 lifecycle cancel，但不写用户 cancel / failed terminal facts。
 
 `purge_session`、`PurgeSessionRequest` 与 `PurgeSessionResult` 仍属于包根 deferred 契约；当前语义是 structured unsupported：返回 `UNSUPPORTED_OPERATION`，不追加 EventLog，不写幂等记录，也不删除 Host durable facts。
 
@@ -95,7 +95,7 @@ Host 内部职责按语义分层：
 - memory projection catch-up port，供 dispatch 前与 close 阶段追平 memory projection。
 - Host-owned LLM compactor baseline，包含 runner 配置、compactor AgentPolicy、compact artifact root、Service 按 execution profile compactor scene 装配的 system prompt，以及 Service 按 compactor baseline prompt asset 读取的 user prompt template，供 Context Governance 执行 compact。
 
-调用方不传入也不依赖 Host runtime 诊断 id，不直接持有 scheduler、durable store、active registry、compactor port 或 wakeup port。`Host.close()` 与 async context manager 退出只关闭当前 opener runtime；关闭顺序是 public lifecycle guard、scheduler、memory projection flush、durable store。重复关闭幂等；关闭后的 public handle 方法抛出 `HostClosedError`。
+调用方不传入也不依赖 Host runtime 诊断 id，不直接持有 scheduler、durable store、active registry、compactor port 或 wakeup port。`Host.close()` 与 async context manager 退出只关闭当前 opener runtime；关闭时 scheduler 通过 active registry 先触发 Host 注入 Engine 的 cancellation token，再通知 `LocalWorkerHandle.on_cancel(reason)` hook，随后停止 active task 与本地资源。该流程不写用户 cancel facts；已 accepted 但未 terminal 的 Run 由下次 startup recovery 基于 Host instance lifecycle proof 或 stale `STOPPING` owner 的进程证据接管。重复关闭幂等；关闭后的 public handle 方法抛出 `HostClosedError`。
 
 ## Session 契约
 
@@ -180,7 +180,7 @@ submit_followup(queue)
 
 runtime lane 只表达资源容量，不表达 Host ownership、lease、fencing、EventLog ordering 或 recovery proof。worker accept 前后都要依赖 durable recheck 与 Host state transition；worker stream 的 finally 路径负责 active registry 注销、worker handle close 与 lane release。
 
-Dispatch scheduler 打开时会注册当前 Host instance liveness row：`host_instance_id` 使用当前 opener runtime 诊断 id，`process_start_token` 是独立高熵随机值，不从 handle id、pid 或时间派生。后台 heartbeat 只刷新当前 scheduler 自己的 instance row；关闭时 best-effort 标记 `STOPPING` / `STOPPED`，这些状态只服务 lifecycle 诊断和 recovery 输入，不是 lease、fencing 或 takeover proof。`dayu.host.recovery_process` 提供只读 orphan proof classifier：只有 durable owner、stale heartbeat、进程证据与策略时间共同满足 positive proof 时才输出可接管证明；heartbeat stale 单独不构成 proof，classifier 不写数据库、不推进 Run / Attempt 状态。`dayu.host.recovery` 的 startup scanner 读取 durable Run / Attempt / dispatch / liveness truth；`ACCEPTED`、`QUEUED`、`WAITING` 保持原状态，其中 `ACCEPTED` 与 `QUEUED` 会在 scan 事务提交后唤醒 queue promotion，让 pre-start governance 重新接管；`RUNNING` / `CANCELLING` 只有 positive orphan proof 与 CAS recheck 同时成立才收口旧 Attempt；可恢复的 `RUNNING` orphan 或既有 `RECOVERING` Run 会在 recovery dispatch count 未超限时创建新的 Attempt / execution / dispatch record 并唤醒 scheduler，超限或不可恢复时转为 `LOST`。
+Dispatch scheduler 打开时会注册当前 Host instance liveness row：`host_instance_id` 使用当前 opener runtime 诊断 id，`process_start_token` 是独立高熵随机值，不从 handle id、pid 或时间派生。后台 heartbeat 只刷新当前 scheduler 自己的 instance row；关闭时 best-effort 标记 `STOPPING` / `STOPPED`，这些状态只服务 lifecycle 诊断和 recovery 输入，不是 lease、fencing 或 takeover proof。`dayu.host.recovery_process` 提供只读 orphan proof classifier：`STOPPED` owner 可直接证明当前 active dispatch 已 orphan；`STOPPING` owner 必须继续满足 stale heartbeat 与 pid missing / identity mismatch 等进程证据，避免抢正在关闭的旧 Host；heartbeat stale 单独不构成 proof，classifier 不写数据库、不推进 Run / Attempt 状态。`dayu.host.recovery` 的 startup scanner 读取 durable Run / Attempt / dispatch / liveness truth；`ACCEPTED`、`QUEUED`、`WAITING` 保持原状态，其中 `ACCEPTED` 与 `QUEUED` 会在 scan 事务提交后唤醒 queue promotion，让 pre-start governance 重新接管；`RUNNING` / `CANCELLING` 只有 positive orphan proof 与 CAS recheck 同时成立才收口旧 Attempt；可恢复的 `RUNNING` orphan 或既有 `RECOVERING` Run 会在 recovery dispatch count 未超限时创建新的 Attempt / execution / dispatch record 并唤醒 scheduler，超限或不可恢复时转为 `LOST`。
 
 worker startup timeout、worker accept failure、worker stream crash 和未知 terminal 都由 Host closeout 为结构化终态或 diagnostic。worker stream 在 Host 已请求 active cancel 后 clean EOF 时，Host 以 cancel terminal 收口；非取消 clean EOF 仍按 lost closeout 处理。terminal closeout 后会触发同 Session queued Run promotion。
 
@@ -215,6 +215,7 @@ ToolRuntime 的稳定语义：
 - side-effect 或付费工具必须具备工具级幂等依据；缺失时不调用实际 callable。
 - `ToolTruncateSpec` 是 declaration/effective 分离契约：工具声明允许启用截断但省略策略 limit 或 TTL，层中立 runtime helper 按 policy defaults 补齐 effective spec 后交给 ToolRuntime 消费。
 - ToolRuntime 只在显式 truncation spec 或 truncation manager 存在时改写 LLM 可见工具结果；durable payload inline threshold 不作为 LLM inline result 限制。
+- `TOOL_RESULT_ACCEPTED` 的 durable payload 超过 inline threshold 时，由 ToolRuntime accept barrier 在同一 transaction 中写 SQLite payload descriptor；EventLog hot payload 只保留 evidence envelope、status、metadata 与 payload ref，不内联完整 raw tool outcome。
 - truncation cursor 是 run-scoped、短生命周期、单次使用的本地补读引用；一次 `fetch_more` 成功后同一 cursor 即失效。
 - `fetch_more` 是 framework tool 预留名，默认保留但不启用；业务工具不得占用预留 framework tool 名。
 
@@ -259,7 +260,7 @@ LLM compactor 只提出 structured candidate；Host 负责 prompt-local label �
 
 ## Payload 与 Terminal Continuity
 
-Host payload descriptor 用于把较大或需要引用的 payload 从 EventLog inline JSON 中分离出来。当前 helper 支持按 EventLog payload ref 解析 SQLite payload descriptor，并校验 descriptor、digest 与 JSON object 形状。
+Host payload descriptor 用于把较大或需要引用的 payload 从 EventLog inline JSON 中分离出来。当前 helper 支持按 EventLog payload ref 解析 SQLite payload descriptor，并校验 descriptor、digest 与 JSON object 形状。ToolRuntime accept barrier 是工具结果冷热分离的 owner；工具实现只返回语义 outcome，不负责判断 EventLog inline threshold。
 
 terminal summary continuity 的稳定语义是：RunInputBuilder 和 memory projection 可以从 terminal summary 或 `RUN_SUCCEEDED` payload 中按策略提取 assistant summary，形成后继输入 continuity。该 helper 只读取受控字段，不从 UI 临时文本、provider raw payload 或未持久化上下文恢复回答。
 
@@ -282,7 +283,7 @@ terminal summary continuity 的稳定语义是：RunInputBuilder 和 memory proj
 ## 扩展点
 
 - 新业务工具：在 Host 外部装配 `ToolBundle`，通过 `HostToolingOptions` 传入 Host construction；不要让 Host 扫描业务包或导入具体财报工具。
-- 新本地执行适配：实现 `LocalEngineWorkerFactory` / `LocalEngineWorker` / `LocalWorkerHandle`，通过 `OpenHostOptions.worker_factory` 装配。
+- 新本地执行适配：实现 `LocalEngineWorkerFactory` / `LocalEngineWorker` / `LocalWorkerHandle`，通过 `OpenHostOptions.worker_factory` 装配；`LocalWorkerHandle.on_cancel(reason)` 只处理 Host 已发出取消信号后的额外 worker hook，默认本地 Engine 取消以注入的 cancellation token 为准。
 - 新 Engine runner baseline：通过 `OrdinaryRunExecutionBaseline` 或 per-run typed override 提供完整 `RunnerSpec`、`RunnerCallOptions` 和 `AgentPolicy`。
 - 新 context compaction 能力：通过 `ContextBudgetPolicy` 与 `CompactorRunnerBaseline` 装配 Host-owned compactor，不把 compact 生命周期放入 Service 或 UI。
 - 新 memory projection policy：扩展 Host-neutral memory policy 与 projection consumer，仍以 committed EventLog facts 为输入。

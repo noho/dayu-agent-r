@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+from collections.abc import Mapping
 from dataclasses import dataclass, replace
 from datetime import UTC, datetime
 from pathlib import Path
@@ -44,6 +45,7 @@ from dayu.host.durable.state import (
 )
 from dayu.host.durable.transaction import HostTransaction, HostTransactionRunner
 from dayu.host.evidence import accepted_evidence_envelope_from_json_value
+from dayu.host.payload_resolution import event_payload_object
 from dayu.host.memory import (
     CONVERSATION_MEMORY_CONSUMER_ID,
     default_memory_projection_policy,
@@ -69,6 +71,8 @@ from dayu.runtime.log_levels import VERBOSE_LOG_LEVEL
 
 _NOW = datetime(2026, 5, 15, 1, 2, 3, tzinfo=UTC)
 _CALL_CONTEXT_DIGEST = sha256_digest_json({"context": "tool-accept-test"})
+_PAYLOAD_FIELD_ACCEPTED_EVIDENCE_ENVELOPE = "accepted_evidence_envelope"
+_PAYLOAD_FIELD_RAW_TOOL_OUTCOME = "raw_tool_outcome"
 
 
 @dataclass(frozen=True, slots=True)
@@ -200,6 +204,52 @@ def test_tool_result_accepted_payload_carries_accepted_evidence_envelope(
         assert envelope.locator_refs == ()
         assert payload["raw_tool_outcome"] == candidate.raw_tool_outcome
         assert "result_preview" not in payload
+
+
+def test_tool_result_accepted_large_payload_uses_sqlite_payload_descriptor(
+    tmp_path: Path,
+) -> None:
+    """大工具结果冷热分离，EventLog inline 只保留热元数据与 descriptor ref。"""
+
+    with open_host_durable_store(
+        _options(tmp_path, payload_inline_threshold_bytes=4096)
+    ) as store:
+        seeded = _seed_active_run(store.transaction_runner)
+        candidate = replace(
+            _completed_candidate(seeded, tool_call_id="tool-call-large-payload"),
+            raw_tool_outcome=_large_raw_tool_outcome("tool-call-large-payload"),
+            outcome_digest=sha256_digest_json({"outcome": "tool-call-large-payload"}),
+            payload_digest=sha256_digest_json({"payload": "tool-call-large-payload"}),
+        )
+        accept_port = DefaultHostToolFactAcceptPort(
+            transaction_runner=store.transaction_runner
+        )
+
+        result = accept_port.accept_tool_fact(candidate)
+        result_rows = _tool_result_events(store.transaction_runner)
+
+        assert isinstance(result, ToolFactAcceptedAck)
+        assert result.tool_result_event_ref is not None
+        assert result.result_payload_ref is not None
+        assert len(result_rows) == 1
+        row = result_rows[0]
+        assert row.payload_ref == result.result_payload_ref.payload_ref
+        assert row.payload_digest == result.result_payload_ref.payload_digest
+        inline_payload = payload_object(row)
+        assert _PAYLOAD_FIELD_RAW_TOOL_OUTCOME not in inline_payload
+        assert inline_payload["payload_ref"] == {
+            "payload_ref": row.payload_ref,
+            "payload_digest": row.payload_digest,
+        }
+
+        cold_payload = _read_event_payload(store.transaction_runner, row)
+        envelope = accepted_evidence_envelope_from_json_value(
+            cold_payload[_PAYLOAD_FIELD_ACCEPTED_EVIDENCE_ENVELOPE]
+        )
+        assert cold_payload[_PAYLOAD_FIELD_RAW_TOOL_OUTCOME] == candidate.raw_tool_outcome
+        assert envelope.result_ref.payload_ref == row.payload_ref
+        assert envelope.result_ref.payload_digest is None
+        assert envelope.result_ref.outcome_digest == candidate.outcome_digest
 
 
 def test_accept_rejects_missing_payload_descriptor_before_writing_events(
@@ -524,16 +574,22 @@ def test_accept_retry_policy_and_timeout_guard_invalid_values() -> None:
         )
 
 
-def _options(tmp_path: Path) -> HostDurableStoreOptions:
+def _options(
+    tmp_path: Path, *, payload_inline_threshold_bytes: int = 65536
+) -> HostDurableStoreOptions:
     """构造测试 durable store options。
 
     :param tmp_path: pytest 临时目录。
+    :param payload_inline_threshold_bytes: payload inline 阈值。
     :returns: Host durable store options。
     """
 
     return HostDurableStoreOptions(
         db_path=tmp_path / "durable.sqlite3",
-        payload_policy=PayloadStoragePolicy(artifact_root=tmp_path / "artifacts"),
+        payload_policy=PayloadStoragePolicy(
+            artifact_root=tmp_path / "artifacts",
+            payload_inline_threshold_bytes=payload_inline_threshold_bytes,
+        ),
         sqlite_policy=HostSQLiteStoragePolicy(
             busy_timeout_seconds=0.25,
             write_busy_retry_count=3,
@@ -812,6 +868,52 @@ def _raw_tool_outcome(tool_call_id: str) -> JsonValue:
             "meta": None,
         },
     }
+
+
+def _large_raw_tool_outcome(tool_call_id: str) -> JsonValue:
+    """构造超过 inline 阈值的 raw tool outcome。
+
+    :param tool_call_id: 工具调用 id。
+    :returns: 大 raw outcome JSON。
+    """
+
+    return {
+        "kind": "completed",
+        "result": {
+            "ok": True,
+            "value": {
+                "tool_call_id": tool_call_id,
+                "large_text": "X" * 10000,
+            },
+            "meta": None,
+        },
+    }
+
+
+def _read_event_payload(
+    transaction_runner: HostTransactionRunner, row: EventLogRow
+) -> Mapping[str, JsonValue]:
+    """读取 EventLog row 的完整 payload，必要时跟随 descriptor。
+
+    :param transaction_runner: Host transaction runner。
+    :param row: EventLog row。
+    :returns: 完整 payload JSON object。
+    """
+
+    def _operation(transaction: HostTransaction) -> Mapping[str, JsonValue]:
+        """读取完整 payload。
+
+        :param transaction: Host transaction。
+        :returns: 完整 payload JSON object。
+        """
+
+        return event_payload_object(
+            transaction,
+            row,
+            payload_label="TOOL_RESULT_ACCEPTED",
+        )
+
+    return transaction_runner.run_read(_operation)
 
 
 def _tool_events(transaction_runner: HostTransactionRunner) -> tuple[EventLogRow, ...]:

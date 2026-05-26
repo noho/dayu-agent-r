@@ -649,12 +649,12 @@ class LocalWorkerHandle(Protocol):
 
         ...
 
-    def cancel(self, reason: str) -> None:
-        """向 worker 发起 best-effort 取消。
+    def on_cancel(self, reason: str) -> None:
+        """在 Host 已发出取消信号后通知 worker handle。
 
         :param reason: 取消原因。
         :returns: ``None``。
-        :raises RuntimeError: 具体实现取消失败时可抛出运行时错误。
+        :raises RuntimeError: 具体实现处理取消通知失败时可抛出运行时错误。
         """
 
         ...

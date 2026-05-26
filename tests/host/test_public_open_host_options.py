@@ -74,7 +74,7 @@ class _WorkerHandle:
 
         return None
 
-    def cancel(self, reason: str) -> None:
+    def on_cancel(self, reason: str) -> None:
         """取消测试 worker。
 
         :param reason: 取消原因。

@@ -113,7 +113,7 @@ class _FinalAnswerHandle:
 
         return None
 
-    def cancel(self, reason: str) -> None:
+    def on_cancel(self, reason: str) -> None:
         """记录取消请求。
 
         :param reason: 取消原因。
@@ -233,7 +233,7 @@ class _ControlledFinalAnswerHandle:
 
         return None
 
-    def cancel(self, reason: str) -> None:
+    def on_cancel(self, reason: str) -> None:
         """记录取消请求。
 
         :param reason: 取消原因。
@@ -409,6 +409,45 @@ async def test_open_host_startup_recovery_dispatches_interrupted_run_and_watch_o
         session_id = session.session_id
 
     _mark_current_dispatch_owner_as_stale_running(options, run_id)
+
+    recovery_factory = _ControlledFinalAnswerWorkerFactory()
+    async with open_host(replace(options, worker_factory=recovery_factory)) as host:
+        watcher = host.watch_session_events(session_id)
+        await asyncio.wait_for(recovery_factory.accepted_event.wait(), timeout=1)
+        terminal_task = asyncio.create_task(_next_terminal(watcher))
+        recovery_factory.release_event.set()
+        terminal = await asyncio.wait_for(terminal_task, timeout=1)
+        await _close_iterator(watcher)
+        final_run = await _wait_for_run_status(host, run_id, RunStatus.SUCCEEDED)
+
+    assert terminal.kind is HostEventKind.SUCCEEDED
+    assert terminal.final_answer is not None
+    assert terminal.final_answer.content == f"recovered:{run_id}"
+    assert final_run.status is RunStatus.SUCCEEDED
+    assert len(recovery_factory.accepted_snapshots) == 1
+    assert recovery_factory.accepted_snapshots[0].run_id == run_id
+    assert recovery_factory.accepted_snapshots[0].attempt_id != (
+        interrupted_factory.accepted_snapshots[0].attempt_id
+    )
+
+
+@pytest.mark.asyncio
+async def test_open_host_startup_recovery_dispatches_gracefully_closed_run(
+    tmp_path: pathlib.Path,
+) -> None:
+    """open_host 正常 close 后重启恢复已接受但未终态的 Run。"""
+
+    interrupted_factory = _ControlledFinalAnswerWorkerFactory()
+    options = _options(tmp_path, interrupted_factory)
+    async with open_host(options) as host:
+        session = await host.ensure_session(_ensure_request())
+        followup = await host.submit_followup(
+            session.session_id,
+            _followup_request(session.session_id, "followup-graceful-close"),
+        )
+        await asyncio.wait_for(interrupted_factory.accepted_event.wait(), timeout=1)
+        run_id = followup.accepted_run_id
+        session_id = session.session_id
 
     recovery_factory = _ControlledFinalAnswerWorkerFactory()
     async with open_host(replace(options, worker_factory=recovery_factory)) as host:

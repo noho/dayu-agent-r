@@ -33,6 +33,11 @@ from dayu.host.compaction import (
 from dayu.host.context_budget import ContextBudgetDecision
 from dayu.host.context_policy import ContextCompactionTriggerSource
 from dayu.host.durable.codec import canonical_json_dumps, is_sha256_digest
+from dayu.host.opaque_ref import (
+    host_neutral_opaque_ref_kinds,
+    validate_host_neutral_opaque_ref_kind,
+    validate_host_neutral_opaque_ref_text,
+)
 
 CONTEXT_COMPACTION_REQUESTED = "CONTEXT_COMPACTION_REQUESTED"
 """Context compaction requested canonical event type。"""
@@ -994,13 +999,7 @@ def _validate_opaque_ref_text(value: str) -> None:
     :raises ValueError: 文本不是 opaque ref 时抛出。
     """
 
-    _require_non_empty_text_value(value, "opaque ref")
-    if ":" not in value:
-        raise ValueError("opaque ref text requires kind prefix")
-    kind, ref_id = value.split(":", 1)
-    _validate_opaque_ref_kind(kind)
-    if ref_id.strip() == "":
-        raise ValueError("opaque ref id is required")
+    validate_host_neutral_opaque_ref_text(value)
 
 
 def _validate_opaque_ref_kind(kind: str) -> None:
@@ -1011,8 +1010,7 @@ def _validate_opaque_ref_kind(kind: str) -> None:
     :raises ValueError: kind 不在 Host-neutral ref 集合内时抛出。
     """
 
-    if kind not in _allowed_opaque_ref_kinds():
-        raise ValueError("opaque ref kind is invalid")
+    validate_host_neutral_opaque_ref_kind(kind)
 
 
 def _allowed_opaque_ref_kinds() -> set[str]:
@@ -1021,16 +1019,7 @@ def _allowed_opaque_ref_kinds() -> set[str]:
     :returns: ref kind 集合。
     """
 
-    return {
-        "source",
-        "chunk",
-        "entity",
-        "subject",
-        "topic",
-        "evidence",
-        "payload",
-        "external",
-    }
+    return set(host_neutral_opaque_ref_kinds())
 
 
 def _validate_quality_check_result(

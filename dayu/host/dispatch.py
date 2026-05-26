@@ -216,6 +216,7 @@ _COMPACTION_CANCEL_REASON_INPUT_CHANGED = "run_input_event_sequence_changed"
 _COMPACTION_CANCEL_REASON_STATUS_PREFIX = "run_status_changed"
 _COMPACTION_CANCEL_REASON_DURABLE_UNAVAILABLE = "durable_unavailable"
 _HOST_INSTANCE_HEARTBEAT_INTERVAL_SECONDS = 1.0
+_SCHEDULER_CLOSE_REASON = "scheduler_close"
 _LOG_DRAIN_LOOP_IDLE = (
     "dispatch.drain_loop.idle host_handle_id=%s interval_seconds=%s"
 )
@@ -422,7 +423,7 @@ class ActiveWorkerRegistry:
             self._entries.pop((attempt_id, execution_id), None)
 
     def cancel(self, message: ActiveCancelMessage) -> bool:
-        """向 active worker best-effort 传播 cancel。
+        """向 active worker best-effort 传播取消。
 
         :param message: 最小取消消息。
         :returns: 找到匹配 active worker 时返回 ``True``。
@@ -432,20 +433,60 @@ class ActiveWorkerRegistry:
             entry = self._entries.get((message.attempt_id, message.execution_id))
         if entry is None or entry.run_id != message.run_id:
             return False
-        entry.cancellation_token.request_cancel(message.reason)
-        try:
-            entry.handle.cancel(message.reason)
-        except Exception as exc:
-            _LOGGER.warning(
-                "active worker cancel failed; continuing attempt_id=%s "
-                "execution_id=%s run_id=%s error_type=%s",
-                message.attempt_id,
-                message.execution_id,
-                message.run_id,
-                exc.__class__.__name__,
-            )
-            return True
+        _propagate_active_worker_cancel(message, entry)
         return True
+
+    def cancel_all(self, reason: str) -> int:
+        """向所有当前 active worker best-effort 传播取消。
+
+        :param reason: 取消原因。
+        :returns: 已找到并传播取消的 active worker 数量。
+        """
+
+        with self._lock:
+            entries = tuple(
+                (
+                    ActiveCancelMessage(
+                        run_id=entry.run_id,
+                        attempt_id=attempt_id,
+                        execution_id=execution_id,
+                        reason=reason,
+                    ),
+                    entry,
+                )
+                for (attempt_id, execution_id), entry in self._entries.items()
+            )
+        for message, entry in entries:
+            _propagate_active_worker_cancel(message, entry)
+        return len(entries)
+
+
+def _propagate_active_worker_cancel(
+    message: ActiveCancelMessage,
+    entry: _ActiveWorkerEntry,
+) -> None:
+    """通过统一 active entry 向 worker 传播取消。
+
+    Host 注入 Engine 的 cancellation token 是本地执行的主取消通道；
+    worker handle 的 ``on_cancel`` 只作为补充的 best-effort 边界 hook。
+
+    :param message: 最小取消消息。
+    :param entry: 已注册的 active worker entry。
+    :returns: ``None``。
+    """
+
+    entry.cancellation_token.request_cancel(message.reason)
+    try:
+        entry.handle.on_cancel(message.reason)
+    except Exception as exc:
+        _LOGGER.warning(
+            "active worker cancel hook failed; continuing attempt_id=%s "
+            "execution_id=%s run_id=%s error_type=%s",
+            message.attempt_id,
+            message.execution_id,
+            message.run_id,
+            exc.__class__.__name__,
+        )
 
 
 class _HostCancellationToken(CancellationToken):
@@ -1706,7 +1747,7 @@ class HostDispatchScheduler:
         if self._closed:
             return
         self._closed = True
-        self._best_effort_mark_host_instance_stopping("scheduler_close")
+        self._best_effort_mark_host_instance_stopping(_SCHEDULER_CLOSE_REASON)
         _LOGGER.info(
             "dispatch.scheduler.close_start host_handle_id=%s active_tasks=%s "
             "active_handles=%s",
@@ -1726,14 +1767,13 @@ class HostDispatchScheduler:
         if promotion_task is not None:
             promotion_task.cancel()
             await _suppress_task_cancel(promotion_task)
-        for handle in tuple(self._active_handles):
-            _safe_cancel_worker_handle(handle, "scheduler_close")
+        self._active_registry.cancel_all(_SCHEDULER_CLOSE_REASON)
         for active_task in tuple(self._active_tasks):
             active_task.cancel()
             await _suppress_task_cancel(active_task)
-        await self._lane_controller.close(reason="scheduler_close")
+        await self._lane_controller.close(reason=_SCHEDULER_CLOSE_REASON)
         self._duplicate_governance_registry.clear_all()
-        self._best_effort_mark_host_instance_stopped("scheduler_close")
+        self._best_effort_mark_host_instance_stopped(_SCHEDULER_CLOSE_REASON)
         _LOGGER.info(
             "dispatch.scheduler.close_done host_handle_id=%s",
             self._host_handle_id,
@@ -3533,25 +3573,6 @@ def _new_dispatch_host_instance_identity(
         process_start_token=uuid4().hex,
         boot_id=None,
     )
-
-
-def _safe_cancel_worker_handle(handle: LocalWorkerHandle, reason: str) -> None:
-    """best-effort 取消 worker handle，避免清理路径被 handle 异常打断。
-
-    :param handle: worker handle。
-    :param reason: 取消原因。
-    :returns: ``None``。
-    """
-
-    try:
-        handle.cancel(reason)
-    except Exception as exc:
-        _LOGGER.warning(
-            "active worker cancel failed; continuing reason=%s error_type=%s",
-            reason,
-            exc.__class__.__name__,
-        )
-        return
 
 
 async def _safe_close_worker_handle(handle: LocalWorkerHandle) -> None:

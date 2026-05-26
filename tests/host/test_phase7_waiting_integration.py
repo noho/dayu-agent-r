@@ -197,7 +197,7 @@ class _HoldingWorkerHandle:
         if False:
             yield _unreachable_engine_event()
 
-    def cancel(self, reason: str) -> None:
+    def on_cancel(self, reason: str) -> None:
         """记录取消请求。
 
         :param reason: 取消原因。

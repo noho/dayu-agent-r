@@ -141,7 +141,7 @@ class _CancelAwareHandle:
                 metadata=None,
             )
 
-    def cancel(self, reason: str) -> None:
+    def on_cancel(self, reason: str) -> None:
         """记录取消请求并唤醒事件流。
 
         :param reason: 取消原因。
