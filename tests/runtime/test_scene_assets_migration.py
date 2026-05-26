@@ -27,6 +27,7 @@ _OLD_SCENE_MAX_ITERATIONS: Final[Mapping[str, int]] = {
     "regenerate": 24,
     "repair": 16,
     "smoke_host_public_conversation_memory": 20,
+    "smoke_host_public_conversation_memory_scenarios": 32,
     "smoke_host_public_multiturn": 20,
     "wechat": 16,
     "write": 24,
