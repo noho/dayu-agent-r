@@ -1,0 +1,50 @@
+{
+  "schema_version": 1,
+  "scene": "smoke_host_public_conversation_memory",
+  "version": "v1",
+  "description": "Host public 财报对话记忆 smoke 场景",
+  "capability_tags": [
+    "smoke_host_public_conversation_memory"
+  ],
+  "extends": [],
+  "model": {
+    "default_model_id": "mimo-v2.5-pro-plan",
+    "runner_option_hint_id": "interactive"
+  },
+  "agent_policy": {
+    "max_iterations": 20,
+    "allow_tool_calls": true
+  },
+  "tool_selection": {
+    "mode": "select",
+    "tool_names": [],
+    "tool_tags_any": [
+      "manual-smoke"
+    ],
+    "allow_empty": false
+  },
+  "defaults": {
+    "missing_required_fragment": "fail_closed"
+  },
+  "fragments": [
+    {
+      "id": "base_agents",
+      "path": "base/agents.md",
+      "order": 100,
+      "required": true
+    },
+    {
+      "id": "base_fact_rules",
+      "path": "base/fact_rules.md",
+      "order": 200,
+      "required": true
+    },
+    {
+      "id": "smoke_host_public_conversation_memory_scene",
+      "path": "scenes/smoke_host_public_conversation_memory.md",
+      "order": 300,
+      "required": true
+    }
+  ],
+  "context_slots": []
+}

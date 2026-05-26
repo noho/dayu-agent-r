@@ -980,7 +980,18 @@ python utils/smoke_host_public_multiturn.py --log-level DEBUG
 
 该脚本不是 pytest，不断言模型固定回答。它会在调用 Host 前打印 assembly diagnostics，包括 config overlay、prompt root、scene manifest root、Host runtime id、execution profile id、model id、runner option hint id、lane name、tool provider report、tool selection、policy refs、compact pressure 摘要和 provider extension DSL 映射状态。运行后会打印 Session / Run / terminal HostEvent 摘要、final answer 预览、compact artifact 路径；terminal failed 时只打印错误码、短消息、reason、诊断引用等失败摘要。脚本不输出 API key、headers、完整 prompt 或 provider payload。
 
-### 5.2 Engine provider smoke
+### 5.2 Host public 财报对话记忆 smoke
+
+`utils/smoke_host_public_conversation_memory.py` 用于人工验证同一个 Host public session 中，mock 财报工具确认过的招商银行 2024H1 息差事实能在后续禁用工具的轮次中保持一致。脚本只使用 public Host handle，不读取 durable store、EventLog、memory 表或 compact payload 内容；mock tool 为 `get_mock_finance_facts`，不会调用真实 Fins 工具。
+
+```bash
+source .venv/bin/activate
+python utils/smoke_host_public_conversation_memory.py --log-level VERBOSE
+```
+
+脚本固定四轮：第一轮调用 mock tool 确认事实，第二轮禁用工具并加入上下文压力，第三轮切换问题制造干扰，第四轮禁用工具核对 marker、`1.88%` 和 `-0.14pct`。stdout 会打印每轮 terminal 摘要、final answer 预览、工具调用次数、compact pressure 计划和 compact artifact 路径；通过时输出 `SMOKE PASS public Host conversation memory finance continuity`。
+
+### 5.3 Engine provider smoke
 
 `utils/smoke_async_agent_providers.py` 用于人工验证 OpenAI-compatible provider 的基础 Agent 主链路。它不属于生产入口，也不读取 Host 配置。
 
