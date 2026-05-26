@@ -117,6 +117,7 @@ from dayu.host.durable.run_transition import (
     FailUnstartedRunInput,
     fail_unstarted_run_in_transaction,
 )
+from dayu.host.durable.liveness import HostInstanceIdentity, register_current_instance
 from dayu.host.durable.session_lifecycle import ensure_session
 from dayu.host.durable.state import (
     AttemptRow,
@@ -1779,9 +1780,21 @@ async def test_dispatching_after_recheck_requires_waiting_for_lane(
     """scheduler durable recheck 只接受已进入 waiting_for_lane 的 dispatch。"""
 
     factory = _FakeWorkerFactory()
+    host_identity = HostInstanceIdentity(
+        host_instance_id="host-instance-dispatch-recheck",
+        pid=1,
+        process_start_token="process-token-dispatch-recheck",
+        boot_id=None,
+    )
     with open_host_durable_store(_options(tmp_path)) as store:
         seeded = _seed_current_run(store)
-        scheduler = await _open_scheduler(tmp_path, store, factory)
+        scheduler = await _open_scheduler(
+            tmp_path,
+            store,
+            factory,
+            host_handle_id="host-handle-dispatch-recheck",
+            host_instance_identity=host_identity,
+        )
         claim = await scheduler._lane_controller.acquire(
             _LANE_NAME,
             timeout_seconds=0,
@@ -1791,6 +1804,8 @@ async def test_dispatching_after_recheck_requires_waiting_for_lane(
             wait_row = scheduler._mark_waiting_for_lane(_pending_dispatch(seeded))
             assert wait_row is not None
             assert wait_row.status == DispatchRecordStatus.WAITING_FOR_LANE
+            assert wait_row.owner_host_instance_id == scheduler.host_instance_id
+            assert wait_row.owner_host_instance_id != "host-handle-dispatch-recheck"
             dispatch_record = scheduler._mark_dispatching_after_recheck(
                 _pending_dispatch(seeded),
                 claim.token,
@@ -1801,6 +1816,11 @@ async def test_dispatching_after_recheck_requires_waiting_for_lane(
             assert dispatch_record.waiting_for_lane_at is not None
             assert dispatch_record.lane_name == _LANE_NAME
             assert dispatch_record.lane_claim_id == claim.token.claim_id
+            assert dispatch_record.owner_host_instance_id == scheduler.host_instance_id
+            assert (
+                dispatch_record.owner_host_instance_id
+                != "host-handle-dispatch-recheck"
+            )
         finally:
             await claim.token.release()
             await scheduler.close()
@@ -2562,6 +2582,56 @@ async def test_pre_start_governance_soft_threshold_compacts_before_attempt(
 
 
 @pytest.mark.asyncio
+async def test_governed_start_sets_dispatch_owner_immediately(
+    tmp_path: Path,
+) -> None:
+    """标准 governed start 在创建 dispatch record 时立即写入 owner。
+
+    :param tmp_path: pytest 临时目录。
+    :returns: ``None``。
+    :raises AssertionError: dispatch record owner 未立即写入 scheduler
+        instance id 时抛出。
+    """
+
+    host_identity = HostInstanceIdentity(
+        host_instance_id="host-instance-governed-start",
+        pid=1,
+        process_start_token="process-token-governed-start",
+        boot_id=None,
+    )
+    with open_host_durable_store(_options(tmp_path)) as store:
+        seeded = _seed_accepted_run(
+            store,
+            run_id="run-governed-owner",
+            display_text="需要分析当前季度收入。",
+        )
+        scheduler = await _open_scheduler(
+            tmp_path,
+            store,
+            _FakeWorkerFactory(),
+            host_handle_id="host-handle-governed-start",
+            host_instance_identity=host_identity,
+        )
+        try:
+            run = _read_run(store.transaction_runner, seeded.run_id)
+            pending = _start_governed_for_test(
+                store.transaction_runner, scheduler, run
+            )
+            dispatch_record = _read_dispatch_record_by_attempt_id(
+                store.transaction_runner, pending.attempt_id
+            )
+
+            assert dispatch_record.owner_host_instance_id == scheduler.host_instance_id
+            assert dispatch_record.owner_host_instance_id is not None
+            assert (
+                dispatch_record.owner_host_instance_id
+                != "host-handle-governed-start"
+            )
+        finally:
+            await scheduler.close()
+
+
+@pytest.mark.asyncio
 async def test_proactive_compaction_uses_selected_material_not_session_start_range(
     tmp_path: Path,
 ) -> None:
@@ -3262,6 +3332,7 @@ async def _open_scheduler(
     context_compactor: ContextCompactor | None = None,
     compact_artifact_root: Path | None = None,
     host_handle_id: str = "host-test",
+    host_instance_identity: HostInstanceIdentity | None = None,
 ) -> HostDispatchScheduler:
     """打开测试 scheduler。
 
@@ -3279,37 +3350,89 @@ async def _open_scheduler(
     :param context_compactor: 可选 context compactor。
     :param compact_artifact_root: 可选 compact artifact 根目录。
     :param host_handle_id: scheduler 使用的 Host handle id。
+    :param host_instance_identity: 可选 Host instance 身份；用于测试 handle
+        与 instance id 不同的 owner 写入路径。
     :returns: scheduler。
+    :raises Exception: lane controller 或 durable host instance 注册失败时透传。
     """
 
-    return await HostDispatchScheduler.open(
-        transaction_runner=store.transaction_runner,
-        local_execution=HostLocalExecutionOptions(
-            lane_db_path=lane_db_path if lane_db_path is not None else tmp_path / "lane.sqlite3",
-            lane_name=_LANE_NAME,
-            lane_capacity=1,
-            lane_default_timeout_seconds=lane_default_timeout_seconds,
-            lane_claim_ttl_seconds=1.0,
-            lane_heartbeat_interval_seconds=0.1,
-            worker_startup_timeout_seconds=worker_startup_timeout_seconds,
-            dispatch_poll_interval_seconds=0.01,
-            runner_spec=_runner_spec(),
-            runner_options=RunnerCallOptions(
-                temperature=None, max_tokens=None, top_p=None, stream=False
-            ),
-            agent_policy=(
-                agent_policy if agent_policy is not None else _agent_policy(False)
-            ),
-            worker_factory=factory,
-            tooling_options=tooling_options,
-            context_budget_policy=context_budget_policy,
-            context_compactor=context_compactor,
-            compact_artifact_root=compact_artifact_root,
+    local_execution = HostLocalExecutionOptions(
+        lane_db_path=(
+            lane_db_path if lane_db_path is not None else tmp_path / "lane.sqlite3"
         ),
+        lane_name=_LANE_NAME,
+        lane_capacity=1,
+        lane_default_timeout_seconds=lane_default_timeout_seconds,
+        lane_claim_ttl_seconds=1.0,
+        lane_heartbeat_interval_seconds=0.1,
+        worker_startup_timeout_seconds=worker_startup_timeout_seconds,
+        dispatch_poll_interval_seconds=0.01,
+        runner_spec=_runner_spec(),
+        runner_options=RunnerCallOptions(
+            temperature=None, max_tokens=None, top_p=None, stream=False
+        ),
+        agent_policy=agent_policy if agent_policy is not None else _agent_policy(False),
+        worker_factory=factory,
+        tooling_options=tooling_options,
+        context_budget_policy=context_budget_policy,
+        context_compactor=context_compactor,
+        compact_artifact_root=compact_artifact_root,
+    )
+    if host_instance_identity is None:
+        return await HostDispatchScheduler.open(
+            transaction_runner=store.transaction_runner,
+            local_execution=local_execution,
+            host_handle_id=host_handle_id,
+            active_registry=active_registry,
+            projection_catchup_port=projection_catchup,
+        )
+    _register_host_instance(store.transaction_runner, host_instance_identity)
+    lane_controller = await LaneController.open(
+        [
+            LaneConfig(
+                name=local_execution.lane_name,
+                capacity=local_execution.lane_capacity,
+                default_timeout_seconds=local_execution.lane_default_timeout_seconds,
+                claim_ttl_seconds=local_execution.lane_claim_ttl_seconds,
+                heartbeat_interval_seconds=(
+                    local_execution.lane_heartbeat_interval_seconds
+                ),
+            )
+        ],
+        coordinator=SQLiteLaneCoordinatorConfig(db_path=local_execution.lane_db_path),
+        owner=LaneOwner(
+            owner_id=f"lane-owner-{host_handle_id}",
+            pid=host_instance_identity.pid,
+            process_start_token=host_instance_identity.process_start_token,
+        ),
+    )
+    return HostDispatchScheduler(
+        transaction_runner=store.transaction_runner,
+        event_log_store=EventLogStore(),
+        local_execution=local_execution,
+        lane_controller=lane_controller,
         host_handle_id=host_handle_id,
+        host_instance_identity=host_instance_identity,
         active_registry=active_registry,
         projection_catchup_port=projection_catchup,
     )
+
+
+def _register_host_instance(
+    transaction_runner: HostTransactionRunner, identity: HostInstanceIdentity
+) -> None:
+    """注册测试 scheduler 的 Host instance row。
+
+    :param transaction_runner: Host transaction runner。
+    :param identity: 待注册的 Host instance 身份。
+    :returns: ``None``。
+    :raises Exception: durable host instance 注册失败时透传。
+    """
+
+    def _operation(transaction: HostTransaction) -> None:
+        register_current_instance(transaction, identity)
+
+    transaction_runner.run_write(_operation)
 
 
 def _runner_spec() -> RunnerSpec:
@@ -3789,6 +3912,64 @@ def _read_rows(
         return run, attempt, dispatch_record
 
     return transaction_runner.run_read(_operation)
+
+
+def _read_run(transaction_runner: HostTransactionRunner, run_id: str) -> RunRow:
+    """读取指定 Run row。
+
+    :param transaction_runner: transaction runner。
+    :param run_id: Run id。
+    :returns: Run row。
+    :raises AssertionError: Run 缺失时抛出。
+    """
+
+    def _operation(transaction: HostTransaction) -> RunRow:
+        row = read_run_by_id(transaction, run_id)
+        assert row is not None
+        return row
+
+    return transaction_runner.run_read(_operation)
+
+
+def _read_dispatch_record_by_attempt_id(
+    transaction_runner: HostTransactionRunner, attempt_id: str
+) -> DispatchRecordRow:
+    """读取指定 Attempt 对应的 dispatch record。
+
+    :param transaction_runner: transaction runner。
+    :param attempt_id: Attempt id。
+    :returns: Dispatch record row。
+    :raises AssertionError: dispatch record 缺失时抛出。
+    """
+
+    def _operation(transaction: HostTransaction) -> DispatchRecordRow:
+        row = read_dispatch_record_by_attempt_id(transaction, attempt_id)
+        assert row is not None
+        return row
+
+    return transaction_runner.run_read(_operation)
+
+
+def _start_governed_for_test(
+    transaction_runner: HostTransactionRunner,
+    scheduler: HostDispatchScheduler,
+    run: RunRow,
+) -> PendingDispatchRecord:
+    """在测试事务内执行标准 governed start。
+
+    :param transaction_runner: transaction runner。
+    :param scheduler: 待测试的 scheduler。
+    :param run: 待启动 Run row。
+    :returns: 新创建的 pending dispatch 摘要。
+    :raises AssertionError: governed start CAS 未创建 dispatch 时抛出。
+    """
+
+    def _operation(transaction: HostTransaction) -> PendingDispatchRecord | None:
+        return scheduler._start_governed_in_transaction(transaction, run)
+
+    pending = transaction_runner.run_write(_operation)
+    assert pending is not None
+    return pending
 
 
 def _run_status(transaction_runner: HostTransactionRunner, run_id: str) -> RunStatus:

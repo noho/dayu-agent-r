@@ -1257,7 +1257,9 @@ class HostDispatchScheduler:
                     else RunStartReason.QUEUE_PROMOTION
                 ),
                 worker_kind=WorkerKind.LOCAL,
-                owner_host_instance_id=None,
+                owner_host_instance_id=(
+                    self._host_instance_identity.host_instance_id
+                ),
             ),
         )
         if result.status != StateMutationStatus.UPDATED:
@@ -2111,7 +2113,9 @@ class HostDispatchScheduler:
             result = mark_dispatch_waiting_for_lane_row(
                 transaction,
                 attempt_id=record.attempt_id,
-                owner_host_instance_id=self._host_handle_id,
+                owner_host_instance_id=(
+                    self._host_instance_identity.host_instance_id
+                ),
                 lane_name=self._local_execution.lane_name,
                 waiting_for_lane_at=format_utc_timestamp(datetime.now(UTC)),
             )
@@ -2168,7 +2172,9 @@ class HostDispatchScheduler:
             result = mark_dispatching_after_lane_row(
                 transaction,
                 attempt_id=record.attempt_id,
-                owner_host_instance_id=self._host_handle_id,
+                owner_host_instance_id=(
+                    self._host_instance_identity.host_instance_id
+                ),
                 lane_name=token.name,
                 lane_claim_id=token.claim_id,
                 lane_owner_id=token.owner.owner_id,
